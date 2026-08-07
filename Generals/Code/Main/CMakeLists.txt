@@ -10,6 +10,8 @@ endif()
 target_link_libraries(g_generals PRIVATE
     binkstub
     comctl32
+    core_debug
+    core_profile_legacy
     dinput8
     dxguid
     g_gameengine
