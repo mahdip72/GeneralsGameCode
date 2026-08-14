@@ -38,6 +38,10 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 # Contains internal libraries
 add_subdirectory(Libraries)
 
+target_link_libraries(corei_always INTERFACE
+    core_task_runtime
+)
+
 # Base GameEngine library
 add_subdirectory(GameEngine)
 

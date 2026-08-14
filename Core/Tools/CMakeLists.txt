@@ -8,6 +8,7 @@ endif()
 
 # Build less useful tool/test binaries.
 if(RTS_BUILD_CORE_EXTRAS)
+    add_subdirectory(TaskRuntimeTest)
     add_subdirectory(assetcull)
     add_subdirectory(Babylon)
     add_subdirectory(buildVersionUpdate)
