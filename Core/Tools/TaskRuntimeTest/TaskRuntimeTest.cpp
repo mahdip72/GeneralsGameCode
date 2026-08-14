@@ -15,7 +15,8 @@ enum TaskRuntimeTestEvent
 	TASK_RUNTIME_TEST_WORKER_JOINED = 2,
 	TASK_RUNTIME_TEST_FAIL_STATE_ALLOCATION = 3,
 	TASK_RUNTIME_TEST_FAIL_THREAD_RESERVE = 4,
-	TASK_RUNTIME_TEST_FAIL_QUEUE_PUSH = 5
+	TASK_RUNTIME_TEST_FAIL_QUEUE_PUSH = 5,
+	TASK_RUNTIME_TEST_FAIL_SYNC_INITIALIZATION = 6
 };
 
 typedef void (*TaskRuntimeTestObserver)(unsigned event);
@@ -544,6 +545,84 @@ static int testBatchAdmissionIsAllOrNothing()
 	return result;
 }
 
+static int testDuplicateBatchIsRejectedWithoutPublishing()
+{
+	const char *testName = "testDuplicateBatchIsRejectedWithoutPublishing";
+	Gate *gate = new Gate;
+	TaskRecord *gateRecord = new TaskRecord;
+	TaskRecord *duplicateRecord = new TaskRecord;
+	TaskRecord *recoveryRecord = new TaskRecord;
+	rts::TaskRuntime *runtime = new rts::TaskRuntime;
+	rts::Task *gateTask = new GateTask(gate, gateRecord);
+	rts::Task *duplicateTask = new RecordingTask(duplicateRecord, 0);
+	rts::Task *duplicateTasks[2];
+	rts::Task *recoveryTask;
+	bool started;
+	bool gateAccepted;
+	bool duplicateAccepted;
+	unsigned pendingAfterDuplicate;
+	bool recoveryAccepted;
+	int result = 0;
+
+	duplicateTasks[0] = duplicateTask;
+	duplicateTasks[1] = duplicateTask;
+	started = runtime->start(1, 2);
+	gateAccepted = started && runtime->trySubmit(gateTask);
+	if (!started || !gateAccepted)
+	{
+		if (!gateAccepted)
+		{
+			delete gateTask;
+		}
+		runtime->shutdown();
+		delete runtime;
+		delete duplicateTask;
+		delete gate;
+		delete gateRecord;
+		delete duplicateRecord;
+		delete recoveryRecord;
+		return check(false, testName, "runtime start and gate submission");
+	}
+
+	gate->waitForEntry();
+	duplicateAccepted = runtime->trySubmitBatch(duplicateTasks, 2);
+	pendingAfterDuplicate = runtime->pendingTaskCount();
+	if (duplicateAccepted || pendingAfterDuplicate != 0)
+	{
+		/*
+		 * Leave the held worker and duplicate task allocated on this failure
+		 * path.  Releasing the gate or destroying the runtime would make a
+		 * broken implementation delete the same Task twice.  The test process
+		 * owns these allocations until process teardown, so no duplicate delete
+		 * is deliberately invoked just to demonstrate the regression.
+		 */
+		return check(false, testName, "duplicate batch is rejected without publishing tasks");
+	}
+
+	delete duplicateTask;
+	recoveryTask = new RecordingTask(recoveryRecord, 0);
+	recoveryAccepted = runtime->trySubmit(recoveryTask);
+	if (!recoveryAccepted)
+	{
+		delete recoveryTask;
+	}
+	gate->open();
+	runtime->shutdown();
+	result |= check(recoveryAccepted, testName, "runtime.trySubmit(recoveryTask) after duplicate rejection");
+	result |= check(gateRecord->executions == 1, testName, "gateRecord->executions == 1");
+	result |= check(gateRecord->destructions == 1, testName, "gateRecord->destructions == 1");
+	result |= check(duplicateRecord->executions == 0, testName, "duplicateRecord->executions == 0");
+	result |= check(duplicateRecord->destructions == 1, testName, "duplicateRecord->destructions == 1");
+	result |= check(recoveryRecord->executions == 1, testName, "recoveryRecord->executions == 1");
+	result |= check(recoveryRecord->destructions == 1, testName, "recoveryRecord->destructions == 1");
+	delete runtime;
+	delete gate;
+	delete gateRecord;
+	delete duplicateRecord;
+	delete recoveryRecord;
+	return result;
+}
+
 static int testQueueBackpressure()
 {
 	const char *testName = "testQueueBackpressure";
@@ -652,6 +731,54 @@ static int testStateAllocationFailureLeavesRuntimeUsable()
 	runtime.shutdown();
 	result |= check(started, testName, "runtime.start(1, 1) after state allocation fault");
 	result |= check(acceptedSubmission, testName, "runtime.trySubmit(acceptedTask) after state allocation fault");
+	result |= check(acceptedRecord.executions == 1, testName, "acceptedRecord.executions == 1");
+	result |= check(acceptedRecord.destructions == 1, testName, "acceptedRecord.destructions == 1");
+	return result;
+}
+
+static int testSyncInitializationFailureLeavesRuntimeUsable()
+{
+	const char *testName = "testSyncInitializationFailureLeavesRuntimeUsable";
+	TaskRecord rejectedRecord;
+	TaskRecord acceptedRecord;
+	rts::TaskRuntime runtime;
+	rts::Task *rejectedTask;
+	rts::Task *acceptedTask;
+	bool failedStart;
+	bool rejectedSubmission;
+	bool started;
+	bool acceptedSubmission;
+	int result = 0;
+
+	rts_task_runtime_set_test_allocation_fault(TASK_RUNTIME_TEST_FAIL_SYNC_INITIALIZATION, 1);
+	failedStart = runtime.start(1, 1);
+	rts_task_runtime_set_test_allocation_fault(0, 0);
+	result |= check(!failedStart, testName, "!runtime.start(1, 1) after sync initialization fault");
+	result |= check(!runtime.isRunning(), testName, "!runtime.isRunning() after sync initialization fault");
+	result |= check(runtime.workerCount() == 0, testName, "runtime.workerCount() == 0 after sync initialization fault");
+	result |= check(runtime.pendingTaskCount() == 0, testName, "runtime.pendingTaskCount() == 0 after sync initialization fault");
+	runtime.waitUntilIdle();
+
+	rejectedTask = new RecordingTask(&rejectedRecord, 0);
+	rejectedSubmission = runtime.trySubmit(rejectedTask);
+	if (!rejectedSubmission)
+	{
+		delete rejectedTask;
+	}
+	result |= check(!rejectedSubmission, testName, "!runtime.trySubmit(rejectedTask) without state");
+	result |= check(rejectedRecord.executions == 0, testName, "rejectedRecord.executions == 0");
+	result |= check(rejectedRecord.destructions == 1, testName, "rejectedRecord.destructions == 1");
+
+	started = runtime.start(1, 1);
+	acceptedTask = new RecordingTask(&acceptedRecord, 0);
+	acceptedSubmission = started && runtime.trySubmit(acceptedTask);
+	if (!acceptedSubmission)
+	{
+		delete acceptedTask;
+	}
+	runtime.shutdown();
+	result |= check(started, testName, "runtime.start(1, 1) after sync initialization fault");
+	result |= check(acceptedSubmission, testName, "runtime.trySubmit(acceptedTask) after sync initialization fault");
 	result |= check(acceptedRecord.executions == 1, testName, "acceptedRecord.executions == 1");
 	result |= check(acceptedRecord.destructions == 1, testName, "acceptedRecord.destructions == 1");
 	return result;
@@ -795,10 +922,12 @@ int main()
 	result |= testExactlyOnceAtOneAndFourWorkers();
 	result |= testFifoDequeueAtOneWorker();
 	result |= testBatchAdmissionIsAllOrNothing();
+	result |= testDuplicateBatchIsRejectedWithoutPublishing();
 	result |= testQueueBackpressure();
 	result |= testShutdownDrainsAcceptedTasks();
 	result |= testRuntimeCanRestartAfterShutdown();
 	result |= testStateAllocationFailureLeavesRuntimeUsable();
+	result |= testSyncInitializationFailureLeavesRuntimeUsable();
 	result |= testThreadReserveFailureLeavesRuntimeRestartable();
 	result |= testQueueAppendFailureRollsBackBatch();
 	result |= testDestructorDrainsAndJoins();

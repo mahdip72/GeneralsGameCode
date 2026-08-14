@@ -18,7 +18,8 @@ enum TaskRuntimeTestEvent
 	TASK_RUNTIME_TEST_WORKER_JOINED = 2,
 	TASK_RUNTIME_TEST_FAIL_STATE_ALLOCATION = 3,
 	TASK_RUNTIME_TEST_FAIL_THREAD_RESERVE = 4,
-	TASK_RUNTIME_TEST_FAIL_QUEUE_PUSH = 5
+	TASK_RUNTIME_TEST_FAIL_QUEUE_PUSH = 5,
+	TASK_RUNTIME_TEST_FAIL_SYNC_INITIALIZATION = 6
 };
 
 typedef void (*TaskRuntimeTestObserver)(unsigned event);
@@ -82,6 +83,9 @@ public:
 		  m_activeTaskCount(0),
 		  m_accepting(false),
 		  m_stopping(false)
+#if defined(RTS_BUILD_CORE_EXTRAS)
+		  , m_syncInitializationFaulted(false)
+#endif
 #if defined(_WIN32)
 		  , m_workAvailable(0),
 		  m_idle(0),
@@ -109,6 +113,12 @@ public:
 					m_idleConditionInitialized = true;
 				}
 			}
+		}
+#endif
+#if defined(RTS_BUILD_CORE_EXTRAS)
+		if (consumeTaskRuntimeTestAllocationFault(TASK_RUNTIME_TEST_FAIL_SYNC_INITIALIZATION))
+		{
+			m_syncInitializationFaulted = true;
 		}
 #endif
 	}
@@ -236,6 +246,7 @@ public:
 	bool trySubmitBatch(Task *const *tasks, unsigned taskCount)
 	{
 		unsigned taskIndex;
+		unsigned previousTaskIndex;
 		bool accepted = false;
 
 		if (!syncReady())
@@ -253,6 +264,18 @@ public:
 				if (tasks[taskIndex] == 0)
 				{
 					accepted = false;
+					break;
+				}
+				for (previousTaskIndex = 0; previousTaskIndex < taskIndex; ++previousTaskIndex)
+				{
+					if (tasks[previousTaskIndex] == tasks[taskIndex])
+					{
+						accepted = false;
+						break;
+					}
+				}
+				if (!accepted)
+				{
 					break;
 				}
 			}
@@ -399,11 +422,19 @@ public:
 	}
 
 private:
+	friend class TaskRuntime;
+
 	State(const State &);
 	State &operator=(const State &);
 
 	bool syncReady() const
 	{
+#if defined(RTS_BUILD_CORE_EXTRAS)
+		if (m_syncInitializationFaulted)
+		{
+			return false;
+		}
+#endif
 #if defined(_WIN32)
 		return m_syncReady;
 #else
@@ -599,6 +630,9 @@ private:
 	unsigned m_activeTaskCount;
 	bool m_accepting;
 	bool m_stopping;
+#if defined(RTS_BUILD_CORE_EXTRAS)
+	bool m_syncInitializationFaulted;
+#endif
 #if defined(_WIN32)
 	mutable CRITICAL_SECTION m_mutex;
 	HANDLE m_workAvailable;
@@ -651,6 +685,11 @@ bool TaskRuntime::start(unsigned workerCount, unsigned queueCapacity)
 		}
 		if (state == 0)
 		{
+			return false;
+		}
+		if (!state->syncReady())
+		{
+			delete state;
 			return false;
 		}
 		m_state = state;
