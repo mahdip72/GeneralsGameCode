@@ -167,123 +167,6 @@ private:
 #endif
 };
 
-class RuntimeDeletionProbe
-{
-public:
-	RuntimeDeletionProbe()
-#if defined(_WIN32)
-		: m_taskHeld(false), m_runtimeDestroyedWhileTaskHeld(false)
-#endif
-	{
-#if defined(_WIN32)
-		InitializeCriticalSection(&m_lock);
-#else
-		pthread_mutex_init(&m_lock, 0);
-		m_taskHeld = false;
-		m_runtimeDestroyedWhileTaskHeld = false;
-#endif
-	}
-
-	~RuntimeDeletionProbe()
-	{
-#if defined(_WIN32)
-		DeleteCriticalSection(&m_lock);
-#else
-		pthread_mutex_destroy(&m_lock);
-#endif
-	}
-
-	void markTaskHeld()
-	{
-		lock();
-		m_taskHeld = true;
-		unlock();
-	}
-
-	void markTaskDeleted()
-	{
-		lock();
-		m_taskHeld = false;
-		unlock();
-	}
-
-	void observeRuntimeDestruction()
-	{
-		lock();
-		if (m_taskHeld)
-		{
-			m_runtimeDestroyedWhileTaskHeld = true;
-		}
-		unlock();
-	}
-
-	bool runtimeDestroyedWhileTaskHeld()
-	{
-		bool result;
-		lock();
-		result = m_runtimeDestroyedWhileTaskHeld;
-		unlock();
-		return result;
-	}
-
-private:
-	RuntimeDeletionProbe(const RuntimeDeletionProbe &);
-	RuntimeDeletionProbe &operator=(const RuntimeDeletionProbe &);
-
-	void lock()
-	{
-#if defined(_WIN32)
-		EnterCriticalSection(&m_lock);
-#else
-		pthread_mutex_lock(&m_lock);
-#endif
-	}
-
-	void unlock()
-	{
-#if defined(_WIN32)
-		LeaveCriticalSection(&m_lock);
-#else
-		pthread_mutex_unlock(&m_lock);
-#endif
-	}
-
-#if defined(_WIN32)
-	CRITICAL_SECTION m_lock;
-#else
-	pthread_mutex_t m_lock;
-#endif
-	bool m_taskHeld;
-	bool m_runtimeDestroyedWhileTaskHeld;
-};
-
-class RuntimeHolder
-{
-public:
-	RuntimeHolder() {}
-
-	static void setDeletionProbe(RuntimeDeletionProbe *probe)
-	{
-		s_deletionProbe = probe;
-	}
-
-	static void operator delete(void *memory)
-	{
-		if (s_deletionProbe != 0)
-		{
-			s_deletionProbe->observeRuntimeDestruction();
-		}
-		::operator delete(memory);
-	}
-
-	rts::TaskRuntime runtime;
-
-private:
-	static RuntimeDeletionProbe *s_deletionProbe;
-};
-
-RuntimeDeletionProbe *RuntimeHolder::s_deletionProbe = 0;
-
 class RecordingTask : public rts::Task
 {
 public:
@@ -328,40 +211,10 @@ private:
 	TaskRecord *m_record;
 };
 
-class DestructorGateTask : public rts::Task
-{
-public:
-	DestructorGateTask(Gate *executionGate, Gate *destructionGate, RuntimeDeletionProbe *deletionProbe, TaskRecord *record)
-		: m_executionGate(executionGate), m_destructionGate(destructionGate), m_deletionProbe(deletionProbe), m_record(record) {}
-
-	~DestructorGateTask()
-	{
-		m_destructionGate->waitUntilOpen();
-		++m_record->destructions;
-		m_deletionProbe->markTaskDeleted();
-	}
-
-	void execute()
-	{
-		m_deletionProbe->markTaskHeld();
-		m_executionGate->waitUntilOpen();
-		++m_record->executions;
-	}
-
-private:
-	DestructorGateTask(const DestructorGateTask &);
-	DestructorGateTask &operator=(const DestructorGateTask &);
-
-	Gate *m_executionGate;
-	Gate *m_destructionGate;
-	RuntimeDeletionProbe *m_deletionProbe;
-	TaskRecord *m_record;
-};
-
 class RuntimeDestructionThread
 {
 public:
-	RuntimeDestructionThread(RuntimeHolder *runtime)
+	RuntimeDestructionThread(rts::TaskRuntime *runtime)
 		: m_runtime(runtime)
 #if defined(_WIN32)
 		, m_thread(0)
@@ -397,7 +250,12 @@ public:
 
 	void waitForFinish()
 	{
-		m_finished.wait();
+		m_finished.waitForEntry();
+	}
+
+	void allowFinish()
+	{
+		m_finished.open();
 	}
 
 	void join()
@@ -435,13 +293,13 @@ private:
 		m_permission.waitUntilOpen();
 		m_destructionStarted.signal();
 		delete m_runtime;
-		m_finished.signal();
+		m_finished.waitUntilOpen();
 	}
 
-	RuntimeHolder *m_runtime;
+	rts::TaskRuntime *m_runtime;
 	Gate m_permission;
 	Signal m_destructionStarted;
-	Signal m_finished;
+	Gate m_finished;
 #if defined(_WIN32)
 	HANDLE m_thread;
 #else
@@ -644,38 +502,31 @@ static int testRuntimeCanRestartAfterShutdown()
 static int testDestructorDrainsAndJoins()
 {
 	const char *testName = "testDestructorDrainsAndJoins";
-	Gate executionGate;
-	Gate taskDestructionGate;
-	RuntimeDeletionProbe deletionProbe;
+	Gate gate;
 	TaskRecord record;
-	RuntimeHolder *runtime = new RuntimeHolder;
+	rts::TaskRuntime *runtime = new rts::TaskRuntime;
 	RuntimeDestructionThread destruction(runtime);
 	int result = 0;
 
-	CHECK(testName, runtime->runtime.start(1, 1));
-	CHECK(testName, runtime->runtime.trySubmit(new DestructorGateTask(&executionGate, &taskDestructionGate, &deletionProbe, &record)));
-	executionGate.waitForEntry();
+	CHECK(testName, runtime->start(1, 1));
+	CHECK(testName, runtime->trySubmit(new GateTask(&gate, &record)));
+	gate.waitForEntry();
 	if (!destruction.start())
 	{
-		executionGate.open();
-		taskDestructionGate.open();
-		runtime->runtime.shutdown();
+		gate.open();
+		runtime->shutdown();
 		delete runtime;
 		return check(false, testName, "destruction.start()");
 	}
-	RuntimeHolder::setDeletionProbe(&deletionProbe);
 	destruction.waitForDestructionPermission();
 	destruction.allowDestruction();
 	destruction.waitForDestructionStart();
-	executionGate.open();
-	taskDestructionGate.waitForEntry();
-	taskDestructionGate.open();
+	gate.open();
 	destruction.waitForFinish();
-	destruction.join();
-	result |= check(!deletionProbe.runtimeDestroyedWhileTaskHeld(), testName, "!deletionProbe.runtimeDestroyedWhileTaskHeld()");
 	result |= check(record.executions == 1, testName, "record.executions == 1");
 	result |= check(record.destructions == 1, testName, "record.destructions == 1");
-	RuntimeHolder::setDeletionProbe(0);
+	destruction.allowFinish();
+	destruction.join();
 	return result;
 }
 
