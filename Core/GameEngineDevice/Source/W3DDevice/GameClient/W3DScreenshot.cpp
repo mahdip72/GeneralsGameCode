@@ -28,7 +28,6 @@
 #include "rts/profile.h"
 #include <stb_image_write.h>
 #include <limits.h>
-#include <new>
 
 struct ScreenshotWrittenMessage
 {
@@ -44,6 +43,21 @@ static void deleteScreenshotWrittenMessages(ScreenshotWrittenMessage* message)
 		ScreenshotWrittenMessage* next = message->next;
 		delete message;
 		message = next;
+	}
+}
+
+// VC6 has no nothrow overload for array new. Keep this allocation local so the
+// owner-thread capture path can report allocation failure on every supported
+// toolchain without introducing a global operator-new overload.
+static unsigned char* allocateScreenshotBuffer(size_t size)
+{
+	try
+	{
+		return new unsigned char[size];
+	}
+	catch (...)
+	{
+		return 0;
 	}
 }
 
@@ -208,8 +222,15 @@ public:
 
 		for (index = 0; index < taskCount; ++index)
 		{
-			tasks[index] = new (std::nothrow) ScreenshotConvertTask(batch,
-				ranges[index].yBegin, ranges[index].yEnd);
+			try
+			{
+				tasks[index] = new ScreenshotConvertTask(batch,
+					ranges[index].yBegin, ranges[index].yEnd);
+			}
+			catch (...)
+			{
+				tasks[index] = 0;
+			}
 			if (tasks[index] == 0)
 			{
 				DEBUG_LOG(("Dropped screenshot %s because its conversion tasks could not be allocated", batch->leafname()));
@@ -364,9 +385,17 @@ void W3D_TakeCompressedScreenshot(ScreenshotFormat format, Int jpegQuality)
 
 	const size_t pixelDataSize = (size_t)pitch * height;
 	const size_t imageSize = 3 * width * height;
-	unsigned char* pixelData = new (std::nothrow) unsigned char[pixelDataSize];
-	unsigned char* image = new (std::nothrow) unsigned char[imageSize];
-	ScreenshotWrittenMessage* completion = new (std::nothrow) ScreenshotWrittenMessage;
+	unsigned char* pixelData = allocateScreenshotBuffer(pixelDataSize);
+	unsigned char* image = allocateScreenshotBuffer(imageSize);
+	ScreenshotWrittenMessage* completion = 0;
+	try
+	{
+		completion = new ScreenshotWrittenMessage;
+	}
+	catch (...)
+	{
+		completion = 0;
+	}
 
 	if (pixelData == 0 || image == 0 || completion == 0)
 	{
@@ -385,10 +414,18 @@ void W3D_TakeCompressedScreenshot(ScreenshotFormat format, Int jpegQuality)
 	surfaceCopy->Release_Ref();
 	surfaceCopy = 0;
 
-	ScreenshotBatch* batch = new (std::nothrow) ScreenshotBatch(pixelData, image, completion,
-		surfaceDesc.Width, surfaceDesc.Height, pitch,
-		is16Bit ? SCREENSHOT_SOURCE_RGB565 : SCREENSHOT_SOURCE_ARGB32,
-		outputDirectory, outputPath, leafname, jpegQuality, format);
+	ScreenshotBatch* batch = 0;
+	try
+	{
+		batch = new ScreenshotBatch(pixelData, image, completion,
+			surfaceDesc.Width, surfaceDesc.Height, pitch,
+			is16Bit ? SCREENSHOT_SOURCE_RGB565 : SCREENSHOT_SOURCE_ARGB32,
+			outputDirectory, outputPath, leafname, jpegQuality, format);
+	}
+	catch (...)
+	{
+		batch = 0;
+	}
 	if (batch == 0)
 	{
 		DEBUG_LOG(("Dropped screenshot %s because its batch could not be allocated", leafname));
