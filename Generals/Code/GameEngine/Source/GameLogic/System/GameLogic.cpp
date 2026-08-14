@@ -36,6 +36,7 @@
 #include "Common/FramePacer.h"
 #include "Common/GameAudio.h"
 #include "Common/GameEngine.h"
+#include "Common/GameThreadOwnership.h"
 #include "Common/GameState.h"
 #include "Common/GameUtility.h"
 #include "Common/INI.h"
@@ -3169,6 +3170,7 @@ extern __int64 Total_Load_3D_Assets;
 // ------------------------------------------------------------------------------------------------
 void GameLogic::update()
 {
+	ASSERT_GAME_THREAD("GameLogic::update");
 	USE_PERF_TIMER(GameLogic_update)
 	PROFILER_SECTION_COLOR(0x4CAF50);
 

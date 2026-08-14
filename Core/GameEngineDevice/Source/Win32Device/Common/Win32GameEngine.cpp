@@ -33,6 +33,9 @@
 
 #include "Win32Device/Common/Win32GameEngine.h"
 #include "Common/PerfTimer.h"
+#include "Common/GameThreadOwnership.h"
+
+#include "rts/profile.h"
 
 #include "GameNetwork/LANAPICallbacks.h"
 
@@ -133,6 +136,8 @@ void Win32GameEngine::update()
 //-------------------------------------------------------------------------------------------------
 void Win32GameEngine::serviceWindowsOS()
 {
+	ASSERT_GAME_THREAD("Win32GameEngine::serviceWindowsOS");
+	PROFILER_SECTION_NAME("Platform.Win32Messages");
 	MSG msg;
   Int returnValue;
 

@@ -55,6 +55,7 @@ set(GAMEENGINE_SRC
 #    Include/Common/GameState.h
 #    Include/Common/GameStateMap.h
     Include/Common/GameType.h
+    Include/Common/GameThreadOwnership.h
     Include/Common/GameUtility.h
 #    Include/Common/Geometry.h
 #    Include/Common/GlobalData.h
@@ -579,6 +580,7 @@ set(GAMEENGINE_SRC
     Source/Common/DiscreteCircle.cpp
     Source/Common/FramePacer.cpp
     Source/Common/FrameRateLimit.cpp
+    Source/Common/GameThreadOwnership.cpp
 #    Source/Common/GameEngine.cpp
 #    Source/Common/GameLOD.cpp
 #    Source/Common/GameMain.cpp
