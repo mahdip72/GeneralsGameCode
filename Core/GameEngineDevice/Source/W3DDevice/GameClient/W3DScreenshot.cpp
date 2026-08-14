@@ -17,41 +17,18 @@
 */
 
 #include "W3DDevice/GameClient/W3DScreenshot.h"
+#include "W3DDevice/GameClient/W3DScreenshotCodec.h"
 #include "Common/GlobalData.h"
 #include "GameClient/GameText.h"
 #include "GameClient/InGameUI.h"
+#include "Lib/TaskRuntime.h"
 #include "WW3D2/dx8wrapper.h"
 #include "WW3D2/surfaceclass.h"
 #include "WWLib/mpsc_intrusive_queue.h"
 #include <stb_image_write.h>
+#include <limits.h>
+#include <new>
 
-struct ScreenshotThreadData
-{
-	ScreenshotThreadData()
-		: pixelData(nullptr)
-	{
-	}
-
-	~ScreenshotThreadData()
-	{
-		delete[] pixelData;
-	}
-
-	unsigned char* pixelData; // is owner
-	unsigned int width;
-	unsigned int height;
-	unsigned int pitch;
-	bool is16Bit;
-	char userDataDirectory[_MAX_PATH];
-	char leafname[_MAX_FNAME];
-	int quality;
-	ScreenshotFormat format;
-};
-
-// TheInGameUI is not thread safe, so the screenshot threads cannot show the success message
-// themselves. Each thread pushes the written filename onto this queue and the main thread
-// shows all pending messages in W3D_UpdateScreenshotMessages, so no message is lost when
-// multiple screenshot threads finish within the same frame.
 struct ScreenshotWrittenMessage
 {
 	ScreenshotWrittenMessage* next;
@@ -59,89 +36,151 @@ struct ScreenshotWrittenMessage
 };
 static MPSCIntrusiveQueue<ScreenshotWrittenMessage> s_screenshotWrittenQueue;
 
-static DWORD WINAPI screenshotThreadFunc(LPVOID param)
+static void deleteScreenshotWrittenMessages(ScreenshotWrittenMessage* message)
 {
-	ScreenshotThreadData* data = static_cast<ScreenshotThreadData*>(param);
-
-	// TheSuperHackers @feature bobtista 08/07/2026 Save screenshots into a Screenshots subfolder
-	// to keep the user data root folder tidy.
-	char pathname[_MAX_PATH];
-	strlcpy(pathname, data->userDataDirectory, ARRAY_SIZE(pathname));
-	strlcat(pathname, "Screenshots\\", ARRAY_SIZE(pathname));
-	CreateDirectory(pathname, nullptr);
-	strlcat(pathname, data->leafname, ARRAY_SIZE(pathname));
-
-	const unsigned int width = data->width;
-	const unsigned int height = data->height;
-
-	// Convert to R8G8B8 for stb_image_write.
-	unsigned char* image = new unsigned char[3 * width * height];
-
-	if (!data->is16Bit)
+	while (message != 0)
 	{
-		// Convert A8R8G8B8/X8R8G8B8 to R8G8B8
-		for (unsigned int y = 0; y < height; ++y)
-		{
-			const unsigned int* srcLine = reinterpret_cast<const unsigned int*>(data->pixelData + y * data->pitch);
-			for (unsigned int x = 0; x < width; ++x)
-			{
-				const unsigned int argb = srcLine[x];
-				const unsigned int index = 3 * (x + y * width);
-				image[index + 0] = (unsigned char)(argb >> 16); // r
-				image[index + 1] = (unsigned char)(argb >> 8);  // g
-				image[index + 2] = (unsigned char)(argb >> 0);  // b
-			}
-		}
+		ScreenshotWrittenMessage* next = message->next;
+		delete message;
+		message = next;
 	}
-	else
-	{
-		// Convert R5G6B5 to R8G8B8
-		for (unsigned int y = 0; y < height; ++y)
-		{
-			const unsigned short* srcLine = reinterpret_cast<const unsigned short*>(data->pixelData + y * data->pitch);
-			for (unsigned int x = 0; x < width; ++x)
-			{
-				const unsigned short rgb = srcLine[x];
-				const unsigned int index = 3 * (x + y * width);
-				image[index + 0] = (unsigned char)((rgb & 0xF800) >> 8); // r
-				image[index + 1] = (unsigned char)((rgb & 0x07E0) >> 3); // g
-				image[index + 2] = (unsigned char)((rgb & 0x001F) << 3); // b
-			}
-		}
-	}
-
-	int success = 0;
-	switch (data->format)
-	{
-		case SCREENSHOT_JPEG:
-			success = stbi_write_jpg(pathname, width, height, 3, image, data->quality);
-			break;
-		case SCREENSHOT_PNG:
-			success = stbi_write_png(pathname, width, height, 3, image, width * 3);
-			break;
-	}
-
-	if (success)
-	{
-		ScreenshotWrittenMessage* message = new ScreenshotWrittenMessage;
-		strlcpy(message->leafname, data->leafname, ARRAY_SIZE(message->leafname));
-		s_screenshotWrittenQueue.Push(message);
-	}
-	else
-	{
-		DEBUG_LOG(("Failed to write screenshot %s", pathname));
-	}
-
-	delete[] image;
-	delete data;
-
-	return success;
 }
+
+class ScreenshotEncodeTask : public rts::Task
+{
+public:
+	ScreenshotEncodeTask(unsigned char* pixelData, unsigned char* image,
+		ScreenshotWrittenMessage* completion, unsigned width, unsigned height,
+		unsigned pitch, ScreenshotSourceFormat sourceFormat, const char* outputDirectory,
+		const char* outputPath, const char* leafname, int quality, ScreenshotFormat format)
+		: m_pixelData(pixelData),
+		  m_image(image),
+		  m_completion(completion),
+		  m_quality(quality),
+		  m_format(format)
+	{
+		m_source.pixels = pixelData;
+		m_source.width = width;
+		m_source.height = height;
+		m_source.pitch = pitch;
+		m_source.format = sourceFormat;
+		strlcpy(m_outputDirectory, outputDirectory, ARRAY_SIZE(m_outputDirectory));
+		strlcpy(m_outputPath, outputPath, ARRAY_SIZE(m_outputPath));
+		strlcpy(m_leafname, leafname, ARRAY_SIZE(m_leafname));
+		strlcpy(m_completion->leafname, leafname, ARRAY_SIZE(m_completion->leafname));
+	}
+
+	virtual ~ScreenshotEncodeTask()
+	{
+		delete[] m_pixelData;
+		delete[] m_image;
+		delete m_completion;
+	}
+
+	virtual void execute()
+	{
+		int success = 0;
+
+		ConvertScreenshotRows(m_source, 0, m_source.height, m_image);
+		CreateDirectory(m_outputDirectory, 0);
+
+		switch (m_format)
+		{
+			case SCREENSHOT_JPEG:
+				success = stbi_write_jpg(m_outputPath, (int)m_source.width, (int)m_source.height,
+					3, m_image, m_quality);
+				break;
+			case SCREENSHOT_PNG:
+				success = stbi_write_png(m_outputPath, (int)m_source.width, (int)m_source.height,
+					3, m_image, (int)(m_source.width * 3));
+				break;
+		}
+
+		if (success)
+		{
+			s_screenshotWrittenQueue.Push(m_completion);
+			m_completion = 0;
+		}
+		else
+		{
+			DEBUG_LOG(("Failed to write screenshot %s", m_outputPath));
+		}
+	}
+
+	const char* leafname() const
+	{
+		return m_leafname;
+	}
+
+private:
+	unsigned char* m_pixelData;
+	unsigned char* m_image;
+	ScreenshotWrittenMessage* m_completion;
+	ScreenshotPixelSource m_source;
+	char m_outputDirectory[_MAX_PATH];
+	char m_outputPath[_MAX_PATH];
+	char m_leafname[_MAX_FNAME];
+	int m_quality;
+	ScreenshotFormat m_format;
+};
+
+class ScreenshotTaskService
+{
+public:
+	void submit(ScreenshotEncodeTask* task)
+	{
+		if (!m_runtime.isRunning())
+		{
+			SYSTEM_INFO systemInfo;
+			GetSystemInfo(&systemInfo);
+
+			unsigned workerCount = (unsigned)systemInfo.dwNumberOfProcessors;
+			if (workerCount < 1)
+			{
+				workerCount = 1;
+			}
+			else if (workerCount > 2)
+			{
+				workerCount = 2;
+			}
+
+			if (!m_runtime.start(workerCount, 4) &&
+				(workerCount == 1 || !m_runtime.start(1, 4)))
+			{
+				DEBUG_LOG(("Dropped screenshot %s because the screenshot task service could not start", task->leafname()));
+				delete task;
+				return;
+			}
+		}
+
+		if (!m_runtime.trySubmit(task))
+		{
+			DEBUG_LOG(("Dropped screenshot %s because the screenshot task queue is full", task->leafname()));
+			delete task;
+		}
+	}
+
+	void shutdown()
+	{
+		m_runtime.shutdown();
+	}
+
+private:
+	rts::TaskRuntime m_runtime;
+};
+
+static ScreenshotTaskService s_screenshotTaskService;
 
 void W3D_UpdateScreenshotMessages()
 {
 	ScreenshotWrittenMessage* message = s_screenshotWrittenQueue.Flush();
-	while (message != nullptr)
+	if (TheInGameUI == 0)
+	{
+		deleteScreenshotWrittenMessages(message);
+		return;
+	}
+
+	while (message != 0)
 	{
 		UnicodeString ufileName;
 		ufileName.translate(message->leafname);
@@ -152,10 +191,22 @@ void W3D_UpdateScreenshotMessages()
 	}
 }
 
+void W3D_ShutdownScreenshotTasks()
+{
+	s_screenshotTaskService.shutdown();
+	deleteScreenshotWrittenMessages(s_screenshotWrittenQueue.Flush());
+}
+
 void W3D_TakeCompressedScreenshot(ScreenshotFormat format, Int jpegQuality)
 {
 	static constexpr const char* const ScreenshotFormatExtensions[] = { "jpg", "png" };
 	static_assert(ARRAY_SIZE(ScreenshotFormatExtensions) == SCREENSHOT_FORMAT_COUNT, "Incorrect array size");
+
+	if ((unsigned)format >= ARRAY_SIZE(ScreenshotFormatExtensions))
+	{
+		DEBUG_LOG(("Screenshot format %d is invalid", (int)format));
+		return;
+	}
 
 	// The filename is created here so the timestamp matches the capture time.
 	char leafname[_MAX_FNAME];
@@ -165,6 +216,14 @@ void W3D_TakeCompressedScreenshot(ScreenshotFormat format, Int jpegQuality)
 	GetLocalTime(&st);
 	sprintf(leafname, "sshot_%04d%02d%02d_%02d%02d%02d_%03d.%s",
 		st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, extension);
+
+	// The path is captured on the frame thread so workers never read global game data.
+	char outputDirectory[_MAX_PATH];
+	char outputPath[_MAX_PATH];
+	strlcpy(outputDirectory, TheGlobalData->getPath_UserData().str(), ARRAY_SIZE(outputDirectory));
+	strlcat(outputDirectory, "Screenshots\\", ARRAY_SIZE(outputDirectory));
+	strlcpy(outputPath, outputDirectory, ARRAY_SIZE(outputPath));
+	strlcat(outputPath, leafname, ARRAY_SIZE(outputPath));
 
 	// TheSuperHackers @bugfix xezon 21/05/2025 Get the back buffer and create a copy of the surface.
 	// Originally this code took the front buffer and tried to lock it. This does not work when the
@@ -185,6 +244,17 @@ void W3D_TakeCompressedScreenshot(ScreenshotFormat format, Int jpegQuality)
 		return;
 	}
 
+	const unsigned bytesPerPixel = is16Bit ? 2 : 4;
+	if (surfaceDesc.Width == 0 || surfaceDesc.Height == 0 ||
+		surfaceDesc.Width > (unsigned)INT_MAX / 3 ||
+		surfaceDesc.Height > (unsigned)INT_MAX ||
+		surfaceDesc.Width > UINT_MAX / bytesPerPixel)
+	{
+		DEBUG_LOG(("Screenshot dimensions %u x %u are invalid", surfaceDesc.Width, surfaceDesc.Height));
+		surface->Release_Ref();
+		return;
+	}
+
 	SurfaceClass* surfaceCopy = NEW_REF(SurfaceClass, (DX8Wrapper::_Create_DX8_Surface(surfaceDesc.Width, surfaceDesc.Height, surfaceDesc.Format)));
 	DX8Wrapper::_Copy_DX8_Rects(surface->Peek_D3D_Surface(), nullptr, 0, surfaceCopy->Peek_D3D_Surface(), nullptr);
 
@@ -198,39 +268,61 @@ void W3D_TakeCompressedScreenshot(ScreenshotFormat format, Int jpegQuality)
 	} lrect;
 
 	lrect.pBits = surfaceCopy->Lock(&lrect.Pitch);
-	if (lrect.pBits == nullptr)
+	if (lrect.pBits == 0)
 	{
 		surfaceCopy->Release_Ref();
 		return;
 	}
 
-	ScreenshotThreadData* threadData = new ScreenshotThreadData();
-	threadData->width = surfaceDesc.Width;
-	threadData->height = surfaceDesc.Height;
-	threadData->pitch = lrect.Pitch;
-	threadData->is16Bit = is16Bit;
-	threadData->quality = jpegQuality;
-	threadData->format = format;
-	strlcpy(threadData->userDataDirectory, TheGlobalData->getPath_UserData().str(), ARRAY_SIZE(threadData->userDataDirectory));
-	strlcpy(threadData->leafname, leafname, ARRAY_SIZE(threadData->leafname));
+	const unsigned pitch = (unsigned)lrect.Pitch;
+	const size_t maxAllocation = (size_t)-1;
+	const size_t width = (size_t)surfaceDesc.Width;
+	const size_t height = (size_t)surfaceDesc.Height;
+	if (lrect.Pitch <= 0 || pitch < surfaceDesc.Width * bytesPerPixel ||
+		height > maxAllocation / pitch || width > maxAllocation / height ||
+		width * height > maxAllocation / 3)
+	{
+		DEBUG_LOG(("Screenshot surface dimensions or pitch overflow an allocation"));
+		surfaceCopy->Unlock();
+		surfaceCopy->Release_Ref();
+		return;
+	}
 
-	// Copy the locked surface with a single memcpy, including any row padding. The pixel
-	// conversion and all file operations are done on the screenshot thread to keep the
-	// main thread cheap.
-	threadData->pixelData = new unsigned char[threadData->pitch * threadData->height];
-	memcpy(threadData->pixelData, lrect.pBits, threadData->pitch * threadData->height);
+	const size_t pixelDataSize = (size_t)pitch * height;
+	const size_t imageSize = 3 * width * height;
+	unsigned char* pixelData = new (std::nothrow) unsigned char[pixelDataSize];
+	unsigned char* image = new (std::nothrow) unsigned char[imageSize];
+	ScreenshotWrittenMessage* completion = new (std::nothrow) ScreenshotWrittenMessage;
+
+	if (pixelData == 0 || image == 0 || completion == 0)
+	{
+		DEBUG_LOG(("Dropped screenshot %s because its buffers could not be allocated", leafname));
+		delete[] pixelData;
+		delete[] image;
+		delete completion;
+		surfaceCopy->Unlock();
+		surfaceCopy->Release_Ref();
+		return;
+	}
+
+	memcpy(pixelData, lrect.pBits, pixelDataSize);
 
 	surfaceCopy->Unlock();
 	surfaceCopy->Release_Ref();
-	surfaceCopy = nullptr;
+	surfaceCopy = 0;
 
-	const HANDLE hThread = CreateThread(nullptr, 0, screenshotThreadFunc, threadData, 0, nullptr);
-	if (hThread)
+	ScreenshotEncodeTask* task = new (std::nothrow) ScreenshotEncodeTask(pixelData, image, completion,
+		surfaceDesc.Width, surfaceDesc.Height, pitch,
+		is16Bit ? SCREENSHOT_SOURCE_RGB565 : SCREENSHOT_SOURCE_ARGB32,
+		outputDirectory, outputPath, leafname, jpegQuality, format);
+	if (task == 0)
 	{
-		CloseHandle(hThread);
+		DEBUG_LOG(("Dropped screenshot %s because its task could not be allocated", leafname));
+		delete[] pixelData;
+		delete[] image;
+		delete completion;
+		return;
 	}
-	else
-	{
-		delete threadData;
-	}
+
+	s_screenshotTaskService.submit(task);
 }

@@ -30,6 +30,11 @@ static int checkBytes(const unsigned char *actual, const unsigned char *expected
 	return 0;
 }
 
+static void convertFullImage(const ScreenshotPixelSource &source, unsigned char *destination)
+{
+	ConvertScreenshotRows(source, 0, source.height, destination);
+}
+
 static int testArgb32SerialConversionUsesPitch()
 {
 	const char *testName = "testArgb32SerialConversionUsesPitch";
@@ -52,7 +57,7 @@ static int testArgb32SerialConversionUsesPitch()
 	source.height = 3;
 	source.pitch = 4 * sizeof(unsigned int);
 	source.format = SCREENSHOT_SOURCE_ARGB32;
-	ConvertScreenshotRows(source, 0, source.height, converted);
+	convertFullImage(source, converted);
 	CHECK(testName, checkBytes(converted, expected, 3 * pixelCount, testName) == 0);
 	return 0;
 }
@@ -79,7 +84,7 @@ static int testRgb565SerialConversionUsesPitch()
 	source.height = 3;
 	source.pitch = 4 * sizeof(unsigned short);
 	source.format = SCREENSHOT_SOURCE_RGB565;
-	ConvertScreenshotRows(source, 0, source.height, converted);
+	convertFullImage(source, converted);
 	CHECK(testName, checkBytes(converted, expected, 3 * pixelCount, testName) == 0);
 	return 0;
 }

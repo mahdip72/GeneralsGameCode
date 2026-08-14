@@ -21,8 +21,9 @@
 #include "GameClient/Display.h"
 
 void W3D_TakeCompressedScreenshot(ScreenshotFormat format, Int jpegQuality);
+void W3D_ShutdownScreenshotTasks();
 
 // Called once per frame on the main thread to show messages for screenshots
-// that the screenshot thread has finished writing.
+// that screenshot worker tasks have finished writing.
 void W3D_UpdateScreenshotMessages();
 
