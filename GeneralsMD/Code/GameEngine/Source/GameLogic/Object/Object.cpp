@@ -2459,8 +2459,19 @@ void Object::pauseAllSpecialPowers( const Bool disabling ) const
 //-------------------------------------------------------------------------------------------------
 void Object::updateTriggerAreaFlags()
 {
+	Int j = 0;
 	// Update the flags, and remove any trigger areas that this object isn't inside.
-	m_numTriggerAreasActive = m_triggerInfo.clearTransitionsAndRemoveExited(m_numTriggerAreasActive);
+	for (Int i=0; i<m_numTriggerAreasActive; i++)
+	{
+		if (!m_triggerInfo[j].isInside)
+			continue;
+		m_triggerInfo[j].entered = false;
+		m_triggerInfo[j].exited = false;
+		m_triggerInfo[j].isInside = m_triggerInfo[i].isInside;
+		m_triggerInfo[j].pTrigger = m_triggerInfo[i].pTrigger;
+		j++;
+	}
+	m_numTriggerAreasActive = j;
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -2726,7 +2737,7 @@ void Object::setTriggerAreaFlagsForChangeInPosition()
 			continue;
 		if (pTrig->pointInTrigger(m_iPos))
 		{
-			if (m_triggerInfo.resize(m_numTriggerAreasActive + 1))
+			if (m_numTriggerAreasActive < MAX_TRIGGER_AREA_INFOS)
 			{
 				m_triggerInfo[m_numTriggerAreasActive].isInside = true;
 				m_triggerInfo[m_numTriggerAreasActive].entered = true;
@@ -4330,9 +4341,6 @@ void Object::xfer( Xfer *xfer )
 	if (m_numTriggerAreasActive<0 || m_numTriggerAreasActive>MAX_TRIGGER_AREA_INFOS) {
 		DEBUG_CRASH(("Invalid m_numTriggerAreasActive = %d, max is %d", m_numTriggerAreasActive,
 			MAX_TRIGGER_AREA_INFOS));
-		throw SC_INVALID_DATA;
-	}
-	if (!m_triggerInfo.resize(m_numTriggerAreasActive)) {
 		throw SC_INVALID_DATA;
 	}
 	for (i=0; i<m_numTriggerAreasActive; i++) {
