@@ -19,5 +19,9 @@ set_target_properties(core_screenshot_codec_tests PROPERTIES
     CXX_EXTENSIONS NO
 )
 
+if(MINGW)
+    target_link_options(core_screenshot_codec_tests PRIVATE -mconsole)
+endif()
+
 add_test(NAME core_screenshot_codec_tests COMMAND core_screenshot_codec_tests)
 set_tests_properties(core_screenshot_codec_tests PROPERTIES TIMEOUT 30)

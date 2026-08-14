@@ -26,5 +26,9 @@ if(UNIX)
     )
 endif()
 
+if(MINGW)
+    target_link_options(core_task_runtime_tests PRIVATE -mconsole)
+endif()
+
 add_test(NAME core_task_runtime_tests COMMAND core_task_runtime_tests)
 set_tests_properties(core_task_runtime_tests PROPERTIES TIMEOUT 30)
