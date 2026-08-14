@@ -145,3 +145,63 @@ bool CopyTextureMipData(const unsigned char* source, const TextureMipLayout& sou
 
 	return true;
 }
+
+TextureMipBuffer::TextureMipBuffer()
+	: m_data(0)
+{
+	m_layout.rowPitch = 0;
+	m_layout.rowCount = 0;
+	m_layout.slicePitch = 0;
+	m_layout.dataSize = 0;
+}
+
+TextureMipBuffer::~TextureMipBuffer()
+{
+	reset();
+}
+
+bool TextureMipBuffer::allocate(WW3DFormat format, unsigned width, unsigned height, unsigned depth)
+{
+	TextureMipLayout layout;
+	unsigned char* data;
+
+	if (!CalculateTextureMipLayout(format, width, height, depth, layout))
+	{
+		return false;
+	}
+
+	try
+	{
+		data = new unsigned char[layout.dataSize];
+	}
+	catch (...)
+	{
+		data = 0;
+	}
+
+	if (data == 0)
+	{
+		return false;
+	}
+
+	reset();
+	m_data = data;
+	m_layout = layout;
+	return true;
+}
+
+bool TextureMipBuffer::copyFrom(const unsigned char* source,
+	const TextureMipLayout& sourceLayout, unsigned depth)
+{
+	return CopyTextureMipData(source, sourceLayout, m_data, m_layout, depth);
+}
+
+void TextureMipBuffer::reset()
+{
+	delete[] m_data;
+	m_data = 0;
+	m_layout.rowPitch = 0;
+	m_layout.rowCount = 0;
+	m_layout.slicePitch = 0;
+	m_layout.dataSize = 0;
+}

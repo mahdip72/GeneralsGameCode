@@ -39,12 +39,16 @@
 
 #pragma once
 
+#include "texturemipbuffer.h"
+
 #include "WWLib/always.h"
 #include "texture.h"
 
 class StringClass;
 struct IDirect3DTexture8;
 class TextureLoadTaskClass;
+class DDSFileClass;
+class Targa;
 class TextureLoadTaskListClass;
 
 class TextureLoader
@@ -243,6 +247,10 @@ class TextureLoadTaskClass : public TextureLoadTaskListNodeClass
 
 		virtual bool			Load_Compressed_Mipmap	();
 		virtual bool			Load_Uncompressed_Mipmap();
+		virtual bool			Allocate_Prepared_Surfaces();
+		virtual bool			Create_D3D_Texture		();
+		virtual bool			Upload_Prepared_Surfaces();
+		virtual void			Release_Prepared_Surfaces();
 
 		virtual void			Lock_Surfaces				();
 		virtual void			Unlock_Surfaces			();
@@ -258,6 +266,15 @@ class TextureLoadTaskClass : public TextureLoadTaskListNodeClass
 		unsigned	int			MipLevelCount;
 		unsigned	int			Reduction;
 		Vector3					HSVShift;
+		WW3DFormat				SourceFormat;
+		unsigned int			SourceBytesPerPixel;
+		bool					CompressionAllowed;
+		bool					LoadSucceeded;
+		char					Filename[_MAX_PATH];
+		DDSFileClass*			DDSFile;
+		Targa*					TargaFile;
+		char					TargaPalette[256 * 4];
+		TextureMipBuffer		PreparedSurface[MIP_LEVELS_MAX];
 
 		unsigned char *		LockedSurfacePtr[MIP_LEVELS_MAX];
 		unsigned	int			LockedSurfacePitch[MIP_LEVELS_MAX];
@@ -281,6 +298,10 @@ protected:
 	virtual bool			Begin_Uncompressed_Load	() override;
 
 	virtual bool			Load_Compressed_Mipmap	() override;
+	virtual bool			Allocate_Prepared_Surfaces() override;
+	virtual bool			Create_D3D_Texture		() override;
+	virtual bool			Upload_Prepared_Surfaces() override;
+	virtual void			Release_Prepared_Surfaces() override;
 //	virtual bool			Load_Uncompressed_Mipmap() override;
 
 	virtual void			Lock_Surfaces				() override;
@@ -294,6 +315,7 @@ private:
 
 	unsigned char*			LockedCubeSurfacePtr[6][MIP_LEVELS_MAX];
 	unsigned int			LockedCubeSurfacePitch[6][MIP_LEVELS_MAX];
+	TextureMipBuffer		PreparedCubeSurface[6][MIP_LEVELS_MAX];
 };
 
 class VolumeTextureLoadTaskClass : public TextureLoadTaskClass
@@ -309,6 +331,9 @@ protected:
 	virtual bool			Begin_Uncompressed_Load	() override;
 
 	virtual bool			Load_Compressed_Mipmap	() override;
+	virtual bool			Allocate_Prepared_Surfaces() override;
+	virtual bool			Create_D3D_Texture		() override;
+	virtual bool			Upload_Prepared_Surfaces() override;
 //	virtual bool			Load_Uncompressed_Mipmap() override;
 
 	virtual void			Lock_Surfaces				() override;

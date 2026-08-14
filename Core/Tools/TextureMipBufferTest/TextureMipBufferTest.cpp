@@ -1,4 +1,5 @@
 #include "WW3D2/texturemipbuffer.h"
+#include "Lib/TaskRuntime.h"
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
@@ -134,12 +135,70 @@ static void testPaddedCopyPreservesGuards()
 		"trailing guard bytes are unchanged");
 }
 
+class MipCopyTask : public rts::Task
+{
+public:
+	MipCopyTask(const unsigned char* source, const TextureMipLayout& sourceLayout,
+		TextureMipBuffer* destination)
+		: m_source(source), m_sourceLayout(sourceLayout), m_destination(destination)
+	{
+	}
+
+	virtual void execute()
+	{
+		m_destination->copyFrom(m_source, m_sourceLayout, 1);
+	}
+
+private:
+	const unsigned char* m_source;
+	TextureMipLayout m_sourceLayout;
+	TextureMipBuffer* m_destination;
+};
+
+static void testTwoWorkerOwnedBuffersAreIndependent()
+{
+	static const unsigned char sourceOne[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+	static const unsigned char sourceTwo[8] = { 21, 22, 23, 24, 25, 26, 27, 28 };
+	TextureMipLayout sourceLayout;
+	TextureMipBuffer destinationOne;
+	TextureMipBuffer destinationTwo;
+	rts::TaskRuntime runtime;
+	rts::Task* tasks[2];
+	unsigned i;
+
+	sourceLayout.rowPitch = 4;
+	sourceLayout.rowCount = 2;
+	sourceLayout.slicePitch = 8;
+	sourceLayout.dataSize = 8;
+
+	expectTrue(destinationOne.allocate(WW3D_FORMAT_R5G6B5, 2, 2, 1),
+		"first owned buffer allocates");
+	expectTrue(destinationTwo.allocate(WW3D_FORMAT_R5G6B5, 2, 2, 1),
+		"second owned buffer allocates");
+	expectTrue(runtime.start(2, 2), "two-worker runtime starts");
+
+	tasks[0] = new MipCopyTask(sourceOne, sourceLayout, &destinationOne);
+	tasks[1] = new MipCopyTask(sourceTwo, sourceLayout, &destinationTwo);
+	expectTrue(runtime.trySubmitBatch(tasks, 2), "both owned buffer tasks are accepted atomically");
+	runtime.waitUntilIdle();
+	runtime.shutdown();
+
+	for (i = 0; i < 8; ++i)
+	{
+		expectTrue(destinationOne.data()[i] == sourceOne[i],
+			"first worker output matches its source");
+		expectTrue(destinationTwo.data()[i] == sourceTwo[i],
+			"second worker output matches its source");
+	}
+}
+
 int main()
 {
 	testUncompressedLayouts();
 	testCompressedLayouts();
 	testInvalidLayouts();
 	testPaddedCopyPreservesGuards();
+	testTwoWorkerOwnedBuffersAreIndependent();
 
 	if (s_failures != 0)
 	{

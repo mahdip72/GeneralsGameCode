@@ -26,3 +26,25 @@ bool CalculateTextureMipLayout(WW3DFormat format, unsigned width, unsigned heigh
 
 bool CopyTextureMipData(const unsigned char* source, const TextureMipLayout& sourceLayout,
 	unsigned char* destination, const TextureMipLayout& destinationLayout, unsigned depth);
+
+class TextureMipBuffer
+{
+public:
+	TextureMipBuffer();
+	~TextureMipBuffer();
+
+	bool allocate(WW3DFormat format, unsigned width, unsigned height, unsigned depth);
+	bool copyFrom(const unsigned char* source, const TextureMipLayout& sourceLayout, unsigned depth);
+	void reset();
+
+	unsigned char* data() { return m_data; }
+	const unsigned char* data() const { return m_data; }
+	const TextureMipLayout& layout() const { return m_layout; }
+
+private:
+	TextureMipBuffer(const TextureMipBuffer&);
+	TextureMipBuffer& operator=(const TextureMipBuffer&);
+
+	unsigned char* m_data;
+	TextureMipLayout m_layout;
+};
