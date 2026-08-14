@@ -13,6 +13,7 @@ target_link_libraries(core_texture_mip_buffer_tests PRIVATE
     core_config
     core_task_runtime
     core_utility
+    core_wwstub
 )
 
 if(MINGW)

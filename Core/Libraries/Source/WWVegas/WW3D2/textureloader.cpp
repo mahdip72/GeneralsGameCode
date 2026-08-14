@@ -228,19 +228,19 @@ static rts::TaskRuntime _TexturePrepareRuntime;
 class TexturePrepareRuntimeTask : public rts::Task
 {
 public:
-	explicit TexturePrepareRuntimeTask(TextureLoadTaskClass *task) : Task(task) {}
+	explicit TexturePrepareRuntimeTask(TextureLoadTaskClass *task) : m_task(task) {}
 
 	virtual void execute()
 	{
-		WWASSERT(Task != nullptr);
-		WWASSERT(Task->Get_Type() == TextureLoadTaskClass::TASK_LOAD);
-		WWASSERT(Task->Get_State() == TextureLoadTaskClass::STATE_LOAD_BEGUN);
-		Task->Load();
-		_ForegroundQueue.Push_Back(Task);
+		WWASSERT(m_task != nullptr);
+		WWASSERT(m_task->Get_Type() == TextureLoadTaskClass::TASK_LOAD);
+		WWASSERT(m_task->Get_State() == TextureLoadTaskClass::STATE_LOAD_BEGUN);
+		m_task->Load();
+		_ForegroundQueue.Push_Back(m_task);
 	}
 
 private:
-	TextureLoadTaskClass *Task;
+	TextureLoadTaskClass *m_task;
 };
 
 static unsigned Get_Texture_Prepare_Worker_Count()
