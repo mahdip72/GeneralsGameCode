@@ -331,11 +331,11 @@ Leave `W3D_UpdateScreenshotMessages` as the only location that calls `TheInGameU
 
 - [ ] **Step 5: Add explicit display teardown**
 
-Declare `W3D_ShutdownScreenshotTasks()` in the screenshot header. Invoke it at the start of both `W3DDisplay` destructors, before freeing display, asset, UI, or DX8 objects. It drains/join workers, then frees any completion records without invoking the UI.
+Declare `W3D_ShutdownScreenshotTasks()` in the screenshot header. Invoke it at the start of both `W3DDisplay` destructors, before freeing display, asset, renderer, or DX8 objects. In the existing title teardown order, UI has already been destroyed by this point; the function must drain/join workers and free completion records without invoking the UI.
 
 - [ ] **Step 6: Build and run focused checks**
 
-Run both task runtime and screenshot codec CTest targets. Build modern Zero Hour debug and the available VC6 release-log target. Confirm no `CreateThread` remains in `W3DScreenshot.cpp` and no worker task contains `The`, `DX8`, `WW3D`, or `TheInGameUI` references.
+Run both task runtime and screenshot codec CTest targets. Build modern Zero Hour and Generals debug targets, plus the available VC6 release-log target. Confirm no `CreateThread` remains in `W3DScreenshot.cpp` and no worker task contains `The`, `DX8`, `WW3D`, or `TheInGameUI` references.
 
 - [ ] **Step 7: Commit Stage 2**
 
