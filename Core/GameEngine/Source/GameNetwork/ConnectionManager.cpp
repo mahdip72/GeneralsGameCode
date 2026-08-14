@@ -45,6 +45,7 @@
 #include "GameNetwork/ConnectionManager.h"
 #include "GameNetwork/LANAPICallbacks.h"
 #include "GameNetwork/NAT.h"
+#include "GameNetwork/NetCommandValidation.h"
 #include "GameNetwork/NetCommandWrapperList.h"
 #include "GameNetwork/networkutil.h"
 #include "GameLogic/GameLogic.h"
@@ -517,17 +518,16 @@ Bool ConnectionManager::processNetCommand(NetCommandRef *ref) {
 	NetCommandMsg *msg = ref->getCommand();
 	NetCommandType cmdType = msg->getNetCommandType();
 
-	// Handle ACK commands first (before connection validation)
+	// Every command path below indexes player-owned state or relay bits.
+	if (msg->getPlayerID() >= MAX_SLOTS) {
+		return TRUE;
+	}
+
 	if ((cmdType == NETCOMMANDTYPE_ACKSTAGE1) ||
 			(cmdType == NETCOMMANDTYPE_ACKSTAGE2) ||
 			(cmdType == NETCOMMANDTYPE_ACKBOTH)) {
 		processAck(msg);
 		return FALSE;
-	}
-
-	// Early validation checks
-	if (msg->getPlayerID() >= MAX_SLOTS) {
-		return TRUE;
 	}
 
 	if ((m_connections[msg->getPlayerID()] == nullptr) && (msg->getPlayerID() != m_localSlot)) {
@@ -666,11 +666,11 @@ void ConnectionManager::processWrapper(NetCommandRef *ref)
 	DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::processWrapper() - origProgress[%d] == %d for command %d",
 		m_localSlot, origProgress, commandID));
 
-	m_netCommandWrapperList->processWrapper(ref);
+	const Bool accepted = m_netCommandWrapperList->processWrapper(ref);
 
-	if (fcIt != s_fileCommandMap.end())
+	if (accepted && fcIt != s_fileCommandMap.end())
 	{
-		Int newProgress = m_netCommandWrapperList->getPercentComplete(commandID);
+		Int newProgress = m_netCommandWrapperList->getPercentComplete(wrapperMsg->getPlayerID(), commandID);
 		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::processWrapper() - newProgress[%d] == %d for command %d",
 			m_localSlot, newProgress, commandID));
 		if (newProgress > origProgress && newProgress < 100)
@@ -781,6 +781,11 @@ void ConnectionManager::processChat(NetChatCommandMsg *msg)
 
 void ConnectionManager::processFile(NetFileCommandMsg *msg)
 {
+	if (msg->getFileLength() == 0)
+	{
+		DEBUG_LOG(("Ignoring empty network file transfer"));
+		return;
+	}
 #ifdef DEBUG_LOGGING
 	UnicodeString log;
 	log.format(L"Saw file transfer: '%hs' of %d bytes from %d", msg->getPortableFilename().str(), msg->getFileLength(), msg->getPlayerID());
@@ -1009,6 +1014,8 @@ void ConnectionManager::processAckStage2(NetCommandMsg *msg) {
 	} else {
 		return;
 	}
+	if (playerID >= MAX_SLOTS || msg->getPlayerID() >= MAX_SLOTS)
+		return;
 
 	NetCommandRef *ref = m_pendingCommands->findMessage(commandID, playerID);
 	if (ref != nullptr) {
@@ -1067,11 +1074,15 @@ void ConnectionManager::processAck(NetCommandMsg *msg) {
  */
 PlayerLeaveCode ConnectionManager::processPlayerLeave(NetPlayerLeaveCommandMsg *msg) {
 	UnsignedByte playerID = msg->getLeavingPlayerID();
+	if (playerID >= MAX_SLOTS)
+		return PLAYERLEAVECODE_UNKNOWN;
+
 	if ((playerID != m_localSlot) && (m_connections[playerID] != nullptr)) {
 		DEBUG_LOG(("ConnectionManager::processPlayerLeave() - setQuitting() on player %d on frame %d", playerID, TheGameLogic->getFrame()));
 		m_connections[playerID]->setQuitting();
 	}
-	DEBUG_ASSERTCRASH(m_frameData[playerID]->getIsQuitting() == FALSE, ("Player %d is already quitting", playerID));
+	DEBUG_ASSERTCRASH(m_frameData[playerID] == nullptr || m_frameData[playerID]->getIsQuitting() == FALSE,
+		("Player %d is already quitting", playerID));
 	if ((playerID != m_localSlot) && (m_frameData[playerID] != nullptr) && (m_frameData[playerID]->getIsQuitting() == FALSE)) {
 		DEBUG_LOG(("ConnectionManager::processPlayerLeave - setQuitFrame on player %d for frame %d", playerID, TheGameLogic->getFrame()+1));
 		m_frameData[playerID]->setQuitFrame(TheGameLogic->getFrame() + FRAMES_TO_KEEP + 1);
@@ -1463,7 +1474,8 @@ void ConnectionManager::updateRunAhead(Int oldRunAhead, Int frameRate, Bool didS
 
 			msg->detach();
 			msg2->detach();
-		} else {
+		} else if (IsValidPacketRouterSlot(m_packetRouterSlot) &&
+			m_connections[m_packetRouterSlot] != nullptr) {
 			// We are not the packet router, send our metrics info to the packet router.
 			NetRunAheadMetricsCommandMsg *msg = newInstance(NetRunAheadMetricsCommandMsg);
 			msg->setPlayerID(m_localSlot);
@@ -1485,6 +1497,8 @@ void ConnectionManager::updateRunAhead(Int oldRunAhead, Int frameRate, Bool didS
 			}
 			m_connections[m_packetRouterSlot]->sendNetCommandMsg(msg, 1 << m_packetRouterSlot);
 			msg->detach();
+		} else {
+			DEBUG_LOG(("ConnectionManager::updateRunAhead - no valid packet router connection"));
 		}
 		lasttimesent = curTime;
 	}
@@ -1840,6 +1854,9 @@ PlayerLeaveCode ConnectionManager::disconnectPlayer(Int slot) {
 		return PLAYERLEAVECODE_UNKNOWN;
 	}
 
+	if (m_netCommandWrapperList != nullptr)
+		m_netCommandWrapperList->removeForPlayer(static_cast<UnsignedByte>(slot));
+
 	if (TheGameInfo)
 	{
 		GameSlot *gSlot = TheGameInfo->getSlot( slot );
@@ -1878,12 +1895,7 @@ PlayerLeaveCode ConnectionManager::disconnectPlayer(Int slot) {
 //	}
 
 	if (slot == m_packetRouterSlot) {
-		Int index = 0;
-		while ((index < (MAX_SLOTS-1)) && (m_packetRouterFallback[index] != m_packetRouterSlot)) {
-			++index;
-		}
-		++index;
-		m_packetRouterSlot = m_packetRouterFallback[index];
+		m_packetRouterSlot = getNextPacketRouterSlot(m_packetRouterSlot);
 		DEBUG_LOG(("Packet router left.  New packet router is slot %d", m_packetRouterSlot));
 		retval = PLAYERLEAVECODE_PACKETROUTER;
 	}
@@ -2551,12 +2563,7 @@ void ConnectionManager::sendSingleFrameToPlayer(UnsignedInt playerID, UnsignedIn
 }
 
 UnsignedInt ConnectionManager::getNextPacketRouterSlot(UnsignedInt playerID) {
-	Int index = 0;
-	while ((index < (MAX_SLOTS-1)) && (m_packetRouterFallback[index] != playerID)) {
-		++index;
-	}
-	++index;
-	return m_packetRouterFallback[index];
+	return FindNextPacketRouterSlot(m_packetRouterFallback, playerID);
 }
 
 void ConnectionManager::requestFrameDataResend(Int playerID, UnsignedInt frame) {

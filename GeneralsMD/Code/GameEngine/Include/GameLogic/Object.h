@@ -133,14 +133,13 @@ struct TTriggerInfo
 	Byte									entered;	///< True if the object entered this trigger area this frame.
 	Byte									exited;		///< True if the object entered this trigger area this frame.
 	Byte									isInside;	///< True if the object is inside this trigger area this frame.
-	Byte									padding;	///< unused.
+	Byte									padding;		///< unused.
 
 	TTriggerInfo() : entered(false), exited(false), isInside(false), padding(false), pTrigger(nullptr) { }
 
 };
 
 //----------------------------------------------------
-
 
 enum CrushSquishTestType CPP_11(: Int)
 {
