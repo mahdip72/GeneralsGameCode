@@ -39,6 +39,7 @@
  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 #include "textureloader.h"
+#include "Lib/TaskRuntime.h"
 #include "WWLib/mutex.h"
 #include "WWLib/thread.h"
 #include "WWDebug/wwdebug.h"
@@ -213,30 +214,45 @@ void SynchronizedTextureLoadTaskListClass::Remove(TextureLoadTaskClass *task)
 // since one thread can never hold two at once.
 
 static FastCriticalSectionClass					_ForegroundCriticalSection;
-static FastCriticalSectionClass					_BackgroundCriticalSection;
-
 // Lists
 
 static SynchronizedTextureLoadTaskListClass	_ForegroundQueue;
-static SynchronizedTextureLoadTaskListClass	_BackgroundQueue;
 
 static TextureLoadTaskListClass					_TexLoadFreeList;
 static TextureLoadTaskListClass					_CubeTexLoadFreeList;
 static TextureLoadTaskListClass					_VolTexLoadFreeList;
 
 
-// The background texture loading thread.
-static class LoaderThreadClass : public ThreadClass
+static rts::TaskRuntime _TexturePrepareRuntime;
+
+class TexturePrepareRuntimeTask : public rts::Task
 {
 public:
-#ifdef Exception_Handler
-	LoaderThreadClass(const char *thread_name = "Texture loader thread") : ThreadClass(thread_name, &Exception_Handler) {}
-#else
-	LoaderThreadClass(const char *thread_name = "Texture loader thread") : ThreadClass(thread_name) {}
-#endif
+	explicit TexturePrepareRuntimeTask(TextureLoadTaskClass *task) : Task(task) {}
 
-	virtual void Thread_Function() override;
-} _TextureLoadThread;
+	virtual void execute()
+	{
+		WWASSERT(Task != nullptr);
+		WWASSERT(Task->Get_Type() == TextureLoadTaskClass::TASK_LOAD);
+		WWASSERT(Task->Get_State() == TextureLoadTaskClass::STATE_LOAD_BEGUN);
+		Task->Load();
+		_ForegroundQueue.Push_Back(Task);
+	}
+
+private:
+	TextureLoadTaskClass *Task;
+};
+
+static unsigned Get_Texture_Prepare_Worker_Count()
+{
+#if defined(_WIN32)
+	SYSTEM_INFO systemInfo;
+	GetSystemInfo(&systemInfo);
+	return systemInfo.dwNumberOfProcessors > 1 ? 2u : 1u;
+#else
+	return 1u;
+#endif
+}
 
 
 // TODO: Legacy - remove this call!
@@ -319,20 +335,33 @@ static bool Is_Format_Compressed(WW3DFormat texture_format,bool allow_compressio
 
 void TextureLoader::Init()
 {
-	WWASSERT(!_TextureLoadThread.Is_Running());
+	WWASSERT(!_TexturePrepareRuntime.isRunning());
 
 	ThumbnailManagerClass::Init();
 
-	_TextureLoadThread.Execute();
-	_TextureLoadThread.Set_Priority(-4);
+	_TexturePrepareRuntime.start(Get_Texture_Prepare_Worker_Count(), 8);
 	TextureInactiveOverrideTime = 0;
 }
 
 
 void TextureLoader::Deinit()
 {
-	FastCriticalSectionClass::LockClass lock(_BackgroundCriticalSection);
-	_TextureLoadThread.Stop();
+	_TexturePrepareRuntime.shutdown();
+
+	TextureLoadTaskClass *task = nullptr;
+	while ((task = _ForegroundQueue.Pop_Front()) != nullptr)
+	{
+		switch (task->Get_Type())
+		{
+			case TextureLoadTaskClass::TASK_THUMBNAIL:
+				Process_Foreground_Thumbnail(task);
+				break;
+
+			case TextureLoadTaskClass::TASK_LOAD:
+				Process_Foreground_Load(task);
+				break;
+		}
+	}
 
 	ThumbnailManagerClass::Deinit();
 	TextureLoadTaskClass::Delete_Free_Pool();
@@ -731,15 +760,10 @@ void TextureLoader::Request_Foreground_Loading(TextureBaseClass *tc)
 		}
 
 		if (task) {
-			// we need to remove the task from any queue, since we're going
-			// to finish it up right now.
-
-			// halt background thread. After we're holding this lock,
-			// we know the background thread cannot begin loading
-			// mipmap levels for this texture.
-			FastCriticalSectionClass::LockClass background_lock(_BackgroundCriticalSection);
+			// Wait for any owned CPU preparation to finish before taking the
+			// task back for immediate render-thread upload.
+			_TexturePrepareRuntime.waitUntilIdle();
 			_ForegroundQueue.Remove(task);
-			_BackgroundQueue.Remove(task);
 		} else {
 			// Since the task manages all the state associated with loading
 			// a texture, we temporarily create one.
@@ -754,11 +778,6 @@ void TextureLoader::Request_Foreground_Loading(TextureBaseClass *tc)
 		// we are not in the DX8 thread. We need to add a high-priority loading
 		// task to the foreground queue.
 
-		// Grab the background lock. After we're holding this lock, we
-		// know the background thread cannot begin loading mipmap levels
-		// for this texture.
-		FastCriticalSectionClass::LockClass background_lock(_BackgroundCriticalSection);
-
 		// if we have a thumbnail task, we should cancel it. Since we are not
 		// the foreground thread, we are not allowed to call Destroy(). Instead,
 		// leave it queued in the completed state so it will be destroyed by Update().
@@ -767,18 +786,9 @@ void TextureLoader::Request_Foreground_Loading(TextureBaseClass *tc)
 		}
 
 		if (task) {
-			// if a load task is waiting on the background queue, we need to
-			// move it to the foreground queue.
-			if (task->Get_List() == &_BackgroundQueue) {
-
-				// remove task from list
-				_BackgroundQueue.Remove(task);
-
-				// add to foreground queue.
-				_ForegroundQueue.Push_Back(task);
-			}
-
-			// upgrade the task priority
+			// A task already owned by the bounded runtime cannot be stolen.
+			// Marking it high priority makes the render thread upload it as
+			// soon as its completion reaches the foreground queue.
 			task->Set_Priority(TextureLoadTaskClass::PRIORITY_HIGH);
 
 		} else {
@@ -802,32 +812,11 @@ void TextureLoader::Flush_Pending_Load_Tasks()
 	WWASSERT(Is_DX8_Thread());
 
 	for (;;) {
-		bool done = false;
-
-		{
-			// we have no pending load tasks when both queues are empty
-			// and the background thread is not processing a texture.
-
-			// Grab the background lock. Once we're holding it, we
-			// know that the background thread is not processing any
-			// textures.
-
-			// NOTE: It's important that we do only hold on to the background
-			// lock while we check for completion. Otherwise, we will either
-			// violate the lock order when we call Update() (which grabs
-			// the foreground lock) or never give the background thread
-			// a chance to empty its queue.
-			FastCriticalSectionClass::LockClass background_lock(_BackgroundCriticalSection);
-			done = _BackgroundQueue.Is_Empty() && _ForegroundQueue.Is_Empty();
-		}
-
-		// exit loop if no entries in list
-		if (done) {
+		_TexturePrepareRuntime.waitUntilIdle();
+		if (_ForegroundQueue.Is_Empty()) {
 			break;
 		}
-
 		Update();
-		ThreadClass::Switch_Thread();
 	}
 }
 
@@ -933,16 +922,25 @@ void TextureLoader::Begin_Load_And_Queue(TextureLoadTaskClass *task)
 	WWASSERT(Is_DX8_Thread());
 
 	if (task->Begin_Load()) {
-		// add to front of background queue. This means the
-		// background load thread will service tasks in LIFO
-		// (last in, first out) order.
+		TexturePrepareRuntimeTask *runtimeTask = nullptr;
+		try
+		{
+			runtimeTask = new TexturePrepareRuntimeTask(task);
+		}
+		catch (...)
+		{
+			runtimeTask = nullptr;
+		}
 
-		// NOTE: this was how the old code did it, with a
-		// comment that mentioned good reasons for doing so,
-		// without actually listing the reasons. I suspect
-		// it has something to do with visually important textures,
-		// like those in the foreground, starting their load last.
-		_BackgroundQueue.Push_Front(task);
+		if (runtimeTask != nullptr && _TexturePrepareRuntime.trySubmit(runtimeTask))
+		{
+			return;
+		}
+
+		delete runtimeTask;
+		task->Load();
+		task->End_Load();
+		task->Destroy();
 	} else {
 		// unable to load.
 		task->Apply_Missing_Texture();
@@ -968,35 +966,6 @@ void TextureLoader::Load_Thumbnail(TextureBaseClass *tc)
 	// release our reference to thumbnail texture
 	d3d_texture->Release();
 	d3d_texture = nullptr;
-}
-
-
-void LoaderThreadClass::Thread_Function()
-{
-	while (running) {
-		// if there are no tasks on the background queue, no need to grab background lock.
-		if (!_BackgroundQueue.Is_Empty()) {
-			// Grab background load so other threads know we could be
-			// loading a texture.
-			FastCriticalSectionClass::LockClass lock(_BackgroundCriticalSection);
-
-			// try to remove a task from the background queue. This could fail
-			// if another thread modified the queue between our test above and
-			// grabbing the lock.
-			TextureLoadTaskClass* task = _BackgroundQueue.Pop_Front();
-			if (task) {
-				// verify task is in proper state for background processing.
-				WWASSERT(task->Get_Type() == TextureLoadTaskClass::TASK_LOAD);
-				WWASSERT(task->Get_State() == TextureLoadTaskClass::STATE_LOAD_BEGUN);
-
-				// load mip map levels and return to foreground queue for final step.
-				task->Load();
-				_ForegroundQueue.Push_Back(task);
-			}
-		}
-
-		Switch_Thread();
-	}
 }
 
 
