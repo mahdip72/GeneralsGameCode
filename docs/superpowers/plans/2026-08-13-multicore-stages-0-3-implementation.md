@@ -440,17 +440,17 @@ Stage 2: JPEG/PNG capture, rapid captures, rejection/backpressure, map return, a
 
 Stage 3: 1080p/4K JPEG/PNG capture, color/seam comparison, active gameplay responsiveness, alt-tab, device reset, and exit with conversion active.
 
-- [ ] **Step 5: Create a complete review package and dispatch reviewers**
+- [ ] **Step 5: Open the unmerged pull request**
 
-Use the merge-base from `ae07b29f4f9df14b2266fc40444d3b1b17b1872e`, include the full diff/stat/log and validation evidence, and dispatch independent subagents for concurrency/lifetime, build/VC6 portability, and gameplay/DirectX boundary review. Treat every Critical or Important finding as a fix-loop blocker.
+After fresh final verification, push `codex/multicore-upgrade-plan` to `mahdip72/GeneralsGameCode` and create a non-draft pull request. Its title and commits use conventional format. Its body discloses AI-generated code, lists the four stages, documents replay/manual validation status, explicitly states that it must not be merged yet, and asks reviewers to focus on lifecycle, VC6, and determinism boundaries.
 
-- [ ] **Step 6: Fix review findings through scoped re-review**
+- [ ] **Step 6: Create a complete review package and dispatch multiple review rounds**
+
+Use the merge-base from `ae07b29f4f9df14b2266fc40444d3b1b17b1872e`, include the full diff/stat/log and validation evidence, and dispatch independent subagents for concurrency/lifetime, build/VC6 portability, and gameplay/DirectX boundary review. After the first round is clean or fixed, dispatch a fresh holistic second round. Treat every Critical or Important finding as a fix-loop blocker.
+
+- [ ] **Step 7: Fix review findings through scoped re-review**
 
 For every Critical or Important finding, add a failing test when the issue is testable, implement the smallest fix, rerun the covering test and affected build, and request a scoped re-review of only the fix range. Repeat until no Critical or Important findings remain or a genuine user decision is required.
-
-- [ ] **Step 7: Open the unmerged pull request**
-
-After fresh final verification, push `codex/multicore-upgrade-plan` and create a non-draft pull request. Its title and commits use conventional format. Its body discloses AI-generated code, lists the four stages, documents replay/manual validation status, explicitly states that it must not be merged yet, and asks reviewers to focus on lifecycle, VC6, and determinism boundaries.
 
 ## Plan self-review
 
