@@ -15,6 +15,7 @@
 #include "GameNetwork/GameSpy/ThreadUtils.h"
 #include "Common/FrameRateLimit.h"
 #include "Common/GameMemory.h"
+#include "GameLogic/SkirmishAILiveness.h"
 
 #include <stdio.h>
 #include <windows.h>
@@ -365,6 +366,31 @@ static void TestFrameRateLimitWaitCalculation()
 	CHECK(FrameRateLimit::calculateCoarseWaitTicks(-1, 200) == 0);
 }
 
+static void TestSkirmishAILivenessPolicies()
+{
+	CHECK(GetPathQueueRetryDelay(true) == 0);
+	CHECK(GetPathQueueRetryDelay(false) == 1);
+
+	CHECK(IsSkirmishWaypointCandidateBetter(false, 0, false, 0.0f, 0, false, 0.0f));
+	CHECK(IsSkirmishWaypointCandidateBetter(true, 0, false, 100.0f, 2, true, 400.0f));
+	CHECK(!IsSkirmishWaypointCandidateBetter(true, 2, true, 400.0f, 0, false, 100.0f));
+	CHECK(IsSkirmishWaypointCandidateBetter(true, 2, true, 400.0f, 2, true, 100.0f));
+	CHECK(IsSkirmishWaypointCandidateBetter(true, 0, false, 100.0f, 1, false, 400.0f));
+	CHECK(GetSkirmishWaypointFallbackPriority(false, false, 1) == 2);
+	CHECK(GetSkirmishWaypointFallbackPriority(true, true, 1) == 1);
+	CHECK(GetSkirmishWaypointFallbackPriority(true, true, 2) == 0);
+	CHECK(GetSkirmishWaypointFallbackPriority(true, false, 0) == 0);
+
+	CHECK(IsWorkOrderFactoryQueueValid(true, true, 1));
+	CHECK(!IsWorkOrderFactoryQueueValid(false, true, 1));
+	CHECK(!IsWorkOrderFactoryQueueValid(true, false, 1));
+	CHECK(!IsWorkOrderFactoryQueueValid(true, true, 0));
+
+	CHECK(IsUsableSupplyCenter(true, false));
+	CHECK(!IsUsableSupplyCenter(false, false));
+	CHECK(!IsUsableSupplyCenter(true, true));
+}
+
 int main()
 {
 	initMemoryManager();
@@ -377,6 +403,7 @@ int main()
 	TestNetworkReceiveBudget();
 	TestStringConversionAndZeroLengthReads();
 	TestFrameRateLimitWaitCalculation();
+	TestSkirmishAILivenessPolicies();
 	TestFrameRateLimitCpuUsage();
 
 	if (s_failures != 0)
