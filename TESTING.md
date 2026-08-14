@@ -63,3 +63,26 @@ Run the Stage 2 focused build and CTest commands again. The screenshot codec tes
 In a profile build on a machine with at least two logical processors, capture 720p or larger JPEG and PNG screenshots while connected to Tracy. Each large capture should show multiple `Screenshot.Convert` worker zones followed by exactly one `Screenshot.Encode` zone. Captures shorter than 128 rows and one-worker fallback runs should show one conversion zone. No conversion task may wait for another task.
 
 Repeat the rapid-capture and immediate-quit manual checks for both games. Compare every output image against the displayed frame for missing, duplicated, or corrupted horizontal bands, with particular attention to rows around stripe boundaries. Successful capture messages must still be delivered from the main thread, and shutdown must drain accepted batches without a hang or access violation.
+
+# Stage 4 background texture preparation checks
+
+Configure a modern x86 Debug build with both games and Core extras, then build the games and all multicore-focused tests:
+
+```
+cmake --preset win32-debug -DRTS_BUILD_GENERALS=ON -DRTS_BUILD_ZEROHOUR=ON -DRTS_BUILD_CORE_EXTRAS=ON
+cmake --build build/win32-debug --config Debug --target g_generals z_generals core_task_runtime_tests core_screenshot_codec_tests core_texture_mip_buffer_tests
+ctest --test-dir build/win32-debug -C Debug -R "^core_(task_runtime|screenshot_codec|texture_mip_buffer)_tests$" --output-on-failure
+```
+
+The three CTest targets must pass. The texture mip-buffer suite covers uncompressed and DXT layouts, odd and sub-block dimensions, padded source/destination pitches, overflow rejection, owned-buffer lifetime, and two-worker byte-identical preparation. Confirm that the legacy detached texture loader and its background queue are gone, and that the bounded worker body only prepares CPU data and publishes completion:
+
+```
+rg -n "LoaderThreadClass|_TextureLoadThread|_BackgroundQueue|_BackgroundCriticalSection" Core/Libraries/Source/WWVegas/WW3D2/textureloader.cpp
+rg -U -P "(?ms)^class TexturePrepareRuntimeTask.*?^};" Core/Libraries/Source/WWVegas/WW3D2/textureloader.cpp | rg -n "DX8|D3D|Texture->|Apply|Lock_Surfaces|Unlock_Surfaces|Create_D3D"
+```
+
+Both source-audit commands must produce no matches. Build both games with VC6 as well as modern Win32. Run the optimized `vc6-releaselog` replay command documented in Stage 0 and require a zero exit code with no CRC or ownership failure; Stage 4 must not modify gameplay, replay, network, save, RNG, or serialization state.
+
+For Tracy validation, use a profile build on a machine with at least two logical processors and load texture-heavy maps in both games. The capture should show up to two concurrent `Texture.Prepare` worker zones, with their corresponding `Texture.Upload` zones on the render owner thread. No worker may call Direct3D, dereference a live texture, wait for another worker, or access engine globals.
+
+Manually test Zero Hour and Generals by loading several skirmish maps and armies, moving the camera quickly across previously unseen terrain and units, returning to the shell, loading another map, alt-tabbing during map loading, and quitting during or immediately after a load. Verify that terrain, unit, effect, UI, cube-map, and volume textures have no missing-texture placeholders, corruption, delayed permanent blur, device loss, hang, or access violation. Also repeat screenshot capture and save/load smoke tests to guard the earlier multicore stages.
