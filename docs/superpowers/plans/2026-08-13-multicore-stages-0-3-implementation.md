@@ -205,6 +205,7 @@ For debug presets choose `Debug`; for non-multi-config VC6 omit `-C`. Guard the 
 - Modify: `Core/Libraries/Source/TaskRuntime/TaskRuntime.cpp`
 - Modify: `Core/Libraries/Source/TaskRuntime/CMakeLists.txt`
 - Modify: `Core/Tools/TaskRuntimeTest/TaskRuntimeTest.cpp`
+- Modify: `Core/Tools/TaskRuntimeTest/CMakeLists.txt`
 
 **Interfaces:**
 - Consumes exactly the `TaskRuntime.h` API from Task 2.
@@ -214,9 +215,13 @@ For debug presets choose `Debug`; for non-multi-config VC6 omit `-C`. Guard the 
 
 Keep these members private in `TaskRuntime::State`: bounded `std::deque<Task*>`, configured capacity, worker count, active task count, acceptance flag, stop flag, and native synchronization/thread-handle storage. Set idle only when queue and active counts are both zero.
 
+`TaskRuntime` construction itself must be allocation-free. Allocate `State` lazily in `start()` with `std::nothrow`, catch construction failures, and leave every forwarding method safe when no state exists. Any `std::vector` reserve under the native lock must catch and unlock before returning `false`; do not publish a partially started state.
+
 - [ ] **Step 2: Implement atomic admission**
 
 Under the native mutex/critical section, reject when runtime is stopped, a null task is supplied, the task count is zero, or the full requested batch exceeds remaining queue capacity. On success append every task in call order, clear idle, and signal worker availability. Do not transfer any task on batch rejection.
+
+If a container allocation fails during admission, roll back every pointer appended by that batch before releasing the lock, then return `false`; the worker cannot observe the provisional entries and the caller retains every task. Do not let allocation exceptions escape `start()` or either submit method.
 
 - [ ] **Step 3: Implement the Windows worker loop**
 
@@ -231,6 +236,8 @@ Use `pthread_create`, `pthread_join`, `pthread_mutex_t`, and `pthread_cond_t`. W
 `waitUntilIdle()` blocks the owning caller until the queue and active count are zero. `shutdown()` is idempotent and leaves the object ready for a later `start()`. The destructor calls `shutdown()`. Do not allow a task to invoke `shutdown()` or wait on child work.
 
 Under a private test-build compile definition enabled only for `RTS_BUILD_CORE_EXTRAS`, add an implementation-local observer used by `TaskRuntimeTest.cpp` to record destructor entry and each successful native worker join. Keep it out of `TaskRuntime.h` and retail builds. Strengthen `testDestructorDrainsAndJoins` with that observer: it must see destructor entry before the test releases its held task, and exactly one successful join after the task is executed and destroyed. This is the only scheduler-proof way to distinguish a missing native join without changing the public runtime contract.
+
+Use the same extras-only implementation-local test boundary to inject one-shot allocation failures before lazy state creation, thread-storage reserve, and a selected queue append. Add tests proving the methods return `false`, release their native lock, preserve rejected task ownership, and permit a later successful start/submit/shutdown. Set both runtime/test targets to C++98 and give the runtime CTest a finite timeout so a regressed stranded-lock test fails diagnostically instead of hanging CI.
 
 - [ ] **Step 6: Run the TDD green checks**
 
