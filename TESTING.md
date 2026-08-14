@@ -51,7 +51,15 @@ The two CTest targets must pass. Confirm the screenshot implementation has no un
 
 ```
 rg -n "CreateThread|ThreadClass" Core/GameEngineDevice/Source/W3DDevice/GameClient/W3DScreenshot.cpp
-rg -U -P "(?ms)^class ScreenshotEncodeTask.*?^};" Core/GameEngineDevice/Source/W3DDevice/GameClient/W3DScreenshot.cpp | rg -n "The[A-Z]|DX8|WW3D|SurfaceClass|GameText|InGameUI"
+rg -U -P "(?ms)^class (ScreenshotBatch|ScreenshotConvertTask).*?^};" Core/GameEngineDevice/Source/W3DDevice/GameClient/W3DScreenshot.cpp | rg -n "The[A-Z]|DX8|WW3D|SurfaceClass|GameText|InGameUI|waitUntilIdle"
 ```
 
 Both source-audit commands must produce no matches. Manually verify JPEG and PNG captures in each game: issue several rapid captures, confirm successful `GUI:ScreenCapture` messages and files under the user-data `Screenshots` folder, then quit immediately after a capture to exercise draining teardown.
+
+# Stage 3 parallel screenshot conversion checks
+
+Run the Stage 2 focused build and CTest commands again. The screenshot codec test now starts a two-worker task runtime and verifies that striped conversion is byte-identical to serial conversion for padded, odd-sized ARGB32 and RGB565 images. It also covers the 128-row parallel threshold and deterministic full-image range coverage.
+
+In a profile build on a machine with at least two logical processors, capture 720p or larger JPEG and PNG screenshots while connected to Tracy. Each large capture should show multiple `Screenshot.Convert` worker zones followed by exactly one `Screenshot.Encode` zone. Captures shorter than 128 rows and one-worker fallback runs should show one conversion zone. No conversion task may wait for another task.
+
+Repeat the rapid-capture and immediate-quit manual checks for both games. Compare every output image against the displayed frame for missing, duplicated, or corrupted horizontal bands, with particular attention to rows around stripe boundaries. Successful capture messages must still be delivered from the main thread, and shutdown must drain accepted batches without a hang or access violation.

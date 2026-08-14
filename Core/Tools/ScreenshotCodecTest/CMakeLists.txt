@@ -9,6 +9,10 @@ target_include_directories(core_screenshot_codec_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/Core/GameEngineDevice/Include
 )
 
+target_link_libraries(core_screenshot_codec_tests PRIVATE
+    core_task_runtime
+)
+
 set_target_properties(core_screenshot_codec_tests PROPERTIES
     CXX_STANDARD 98
     CXX_STANDARD_REQUIRED YES
@@ -20,3 +24,4 @@ if(WIN32 OR "${CMAKE_SYSTEM}" MATCHES "Windows")
 endif()
 
 add_test(NAME core_screenshot_codec_tests COMMAND core_screenshot_codec_tests)
+set_tests_properties(core_screenshot_codec_tests PROPERTIES TIMEOUT 30)

@@ -18,6 +18,47 @@
 
 #include "W3DDevice/GameClient/W3DScreenshotCodec.h"
 
+#include <limits.h>
+
+unsigned BuildScreenshotRowRanges(unsigned height, unsigned workerCount,
+	ScreenshotRowRange *ranges, unsigned rangeCapacity)
+{
+	unsigned rangeCount = 1;
+	unsigned rowsPerRange;
+	unsigned remainder;
+	unsigned y = 0;
+	unsigned index;
+
+	if (ranges == 0 || rangeCapacity == 0 || height == 0)
+	{
+		return 0;
+	}
+
+	if (workerCount > 1 && height >= 128)
+	{
+		const unsigned rangesForWorkers = workerCount > UINT_MAX / 2
+			? UINT_MAX : workerCount * 2;
+		const unsigned rangesForRows = height / 64 + (height % 64 != 0 ? 1 : 0);
+		rangeCount = rangesForWorkers < rangesForRows ? rangesForWorkers : rangesForRows;
+		if (rangeCount > rangeCapacity)
+		{
+			rangeCount = rangeCapacity;
+		}
+	}
+
+	rowsPerRange = height / rangeCount;
+	remainder = height % rangeCount;
+	for (index = 0; index < rangeCount; ++index)
+	{
+		const unsigned rowCount = rowsPerRange + (index < remainder ? 1 : 0);
+		ranges[index].yBegin = y;
+		y += rowCount;
+		ranges[index].yEnd = y;
+	}
+
+	return rangeCount;
+}
+
 void ConvertScreenshotRows(const ScreenshotPixelSource &source,
 	unsigned yBegin, unsigned yEnd, unsigned char *rgbDestination)
 {

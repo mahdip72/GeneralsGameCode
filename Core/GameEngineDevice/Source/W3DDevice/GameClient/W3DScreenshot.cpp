@@ -25,6 +25,7 @@
 #include "WW3D2/dx8wrapper.h"
 #include "WW3D2/surfaceclass.h"
 #include "WWLib/mpsc_intrusive_queue.h"
+#include "rts/profile.h"
 #include <stb_image_write.h>
 #include <limits.h>
 #include <new>
@@ -46,10 +47,10 @@ static void deleteScreenshotWrittenMessages(ScreenshotWrittenMessage* message)
 	}
 }
 
-class ScreenshotEncodeTask : public rts::Task
+class ScreenshotBatch
 {
 public:
-	ScreenshotEncodeTask(unsigned char* pixelData, unsigned char* image,
+	ScreenshotBatch(unsigned char* pixelData, unsigned char* image,
 		ScreenshotWrittenMessage* completion, unsigned width, unsigned height,
 		unsigned pitch, ScreenshotSourceFormat sourceFormat, const char* outputDirectory,
 		const char* outputPath, const char* leafname, int quality, ScreenshotFormat format)
@@ -57,7 +58,8 @@ public:
 		  m_image(image),
 		  m_completion(completion),
 		  m_quality(quality),
-		  m_format(format)
+		  m_format(format),
+		  m_remainingTasks(0)
 	{
 		m_source.pixels = pixelData;
 		m_source.width = width;
@@ -70,30 +72,62 @@ public:
 		strlcpy(m_completion->leafname, leafname, ARRAY_SIZE(m_completion->leafname));
 	}
 
-	virtual ~ScreenshotEncodeTask()
+	~ScreenshotBatch()
 	{
 		delete[] m_pixelData;
 		delete[] m_image;
 		delete m_completion;
 	}
 
-	virtual void execute()
+	void setTaskCount(unsigned taskCount)
+	{
+		m_remainingTasks = (LONG)taskCount;
+	}
+
+	void convert(unsigned yBegin, unsigned yEnd)
+	{
+		{
+			PROFILER_SECTION_NAME("Screenshot.Convert");
+			ConvertScreenshotRows(m_source, yBegin, yEnd, m_image);
+		}
+
+		if (InterlockedDecrement(&m_remainingTasks) == 0)
+		{
+			encodeAndReport();
+			delete this;
+		}
+	}
+
+	const char* leafname() const
+	{
+		return m_leafname;
+	}
+
+	unsigned height() const
+	{
+		return m_source.height;
+	}
+
+private:
+	void encodeAndReport()
 	{
 		int success = 0;
 
-		ConvertScreenshotRows(m_source, 0, m_source.height, m_image);
-		CreateDirectory(m_outputDirectory, 0);
-
-		switch (m_format)
 		{
-			case SCREENSHOT_JPEG:
-				success = stbi_write_jpg(m_outputPath, (int)m_source.width, (int)m_source.height,
-					3, m_image, m_quality);
-				break;
-			case SCREENSHOT_PNG:
-				success = stbi_write_png(m_outputPath, (int)m_source.width, (int)m_source.height,
-					3, m_image, (int)(m_source.width * 3));
-				break;
+			PROFILER_SECTION_NAME("Screenshot.Encode");
+			CreateDirectory(m_outputDirectory, 0);
+
+			switch (m_format)
+			{
+				case SCREENSHOT_JPEG:
+					success = stbi_write_jpg(m_outputPath, (int)m_source.width, (int)m_source.height,
+						3, m_image, m_quality);
+					break;
+				case SCREENSHOT_PNG:
+					success = stbi_write_png(m_outputPath, (int)m_source.width, (int)m_source.height,
+						3, m_image, (int)(m_source.width * 3));
+					break;
+			}
 		}
 
 		if (success)
@@ -106,13 +140,6 @@ public:
 			DEBUG_LOG(("Failed to write screenshot %s", m_outputPath));
 		}
 	}
-
-	const char* leafname() const
-	{
-		return m_leafname;
-	}
-
-private:
 	unsigned char* m_pixelData;
 	unsigned char* m_image;
 	ScreenshotWrittenMessage* m_completion;
@@ -122,12 +149,32 @@ private:
 	char m_leafname[_MAX_FNAME];
 	int m_quality;
 	ScreenshotFormat m_format;
+	LONG m_remainingTasks;
+};
+
+class ScreenshotConvertTask : public rts::Task
+{
+public:
+	ScreenshotConvertTask(ScreenshotBatch* batch, unsigned yBegin, unsigned yEnd)
+		: m_batch(batch), m_yBegin(yBegin), m_yEnd(yEnd)
+	{
+	}
+
+	virtual void execute()
+	{
+		m_batch->convert(m_yBegin, m_yEnd);
+	}
+
+private:
+	ScreenshotBatch* m_batch;
+	unsigned m_yBegin;
+	unsigned m_yEnd;
 };
 
 class ScreenshotTaskService
 {
 public:
-	void submit(ScreenshotEncodeTask* task)
+	void submit(ScreenshotBatch* batch)
 	{
 		if (!m_runtime.isRunning())
 		{
@@ -147,16 +194,43 @@ public:
 			if (!m_runtime.start(workerCount, 4) &&
 				(workerCount == 1 || !m_runtime.start(1, 4)))
 			{
-				DEBUG_LOG(("Dropped screenshot %s because the screenshot task service could not start", task->leafname()));
-				delete task;
+				DEBUG_LOG(("Dropped screenshot %s because the screenshot task service could not start", batch->leafname()));
+				delete batch;
 				return;
 			}
 		}
 
-		if (!m_runtime.trySubmit(task))
+		ScreenshotRowRange ranges[4];
+		rts::Task* tasks[4];
+		const unsigned taskCount = BuildScreenshotRowRanges(batch->height(),
+			m_runtime.workerCount(), ranges, ARRAY_SIZE(ranges));
+		unsigned index;
+
+		for (index = 0; index < taskCount; ++index)
 		{
-			DEBUG_LOG(("Dropped screenshot %s because the screenshot task queue is full", task->leafname()));
-			delete task;
+			tasks[index] = new (std::nothrow) ScreenshotConvertTask(batch,
+				ranges[index].yBegin, ranges[index].yEnd);
+			if (tasks[index] == 0)
+			{
+				DEBUG_LOG(("Dropped screenshot %s because its conversion tasks could not be allocated", batch->leafname()));
+				while (index > 0)
+				{
+					delete tasks[--index];
+				}
+				delete batch;
+				return;
+			}
+		}
+
+		batch->setTaskCount(taskCount);
+		if (!m_runtime.trySubmitBatch(tasks, taskCount))
+		{
+			DEBUG_LOG(("Dropped screenshot %s because the screenshot task queue is full", batch->leafname()));
+			for (index = 0; index < taskCount; ++index)
+			{
+				delete tasks[index];
+			}
+			delete batch;
 		}
 	}
 
@@ -311,18 +385,18 @@ void W3D_TakeCompressedScreenshot(ScreenshotFormat format, Int jpegQuality)
 	surfaceCopy->Release_Ref();
 	surfaceCopy = 0;
 
-	ScreenshotEncodeTask* task = new (std::nothrow) ScreenshotEncodeTask(pixelData, image, completion,
+	ScreenshotBatch* batch = new (std::nothrow) ScreenshotBatch(pixelData, image, completion,
 		surfaceDesc.Width, surfaceDesc.Height, pitch,
 		is16Bit ? SCREENSHOT_SOURCE_RGB565 : SCREENSHOT_SOURCE_ARGB32,
 		outputDirectory, outputPath, leafname, jpegQuality, format);
-	if (task == 0)
+	if (batch == 0)
 	{
-		DEBUG_LOG(("Dropped screenshot %s because its task could not be allocated", leafname));
+		DEBUG_LOG(("Dropped screenshot %s because its batch could not be allocated", leafname));
 		delete[] pixelData;
 		delete[] image;
 		delete completion;
 		return;
 	}
 
-	s_screenshotTaskService.submit(task);
+	s_screenshotTaskService.submit(batch);
 }

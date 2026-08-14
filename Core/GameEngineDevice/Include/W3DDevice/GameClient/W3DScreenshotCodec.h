@@ -34,6 +34,15 @@ struct ScreenshotPixelSource
 	ScreenshotSourceFormat format;
 };
 
+struct ScreenshotRowRange
+{
+	unsigned yBegin;
+	unsigned yEnd;
+};
+
+unsigned BuildScreenshotRowRanges(unsigned height, unsigned workerCount,
+	ScreenshotRowRange *ranges, unsigned rangeCapacity);
+
 void ConvertScreenshotRows(const ScreenshotPixelSource &source,
 	unsigned yBegin, unsigned yEnd, unsigned char *rgbDestination);
 
