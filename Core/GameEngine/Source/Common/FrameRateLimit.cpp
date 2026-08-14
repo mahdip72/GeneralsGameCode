@@ -23,6 +23,10 @@
 namespace
 {
 	typedef HANDLE (WINAPI *CreateWaitableTimerExWFunction)(LPSECURITY_ATTRIBUTES, LPCWSTR, DWORD, DWORD);
+	typedef HANDLE (WINAPI *CreateWaitableTimerAFunction)(LPSECURITY_ATTRIBUTES, BOOL, LPCSTR);
+	typedef VOID (CALLBACK *FrameRateTimerCallback)(LPVOID, DWORD, DWORD);
+	typedef BOOL (WINAPI *SetWaitableTimerFunction)(HANDLE, const LARGE_INTEGER *, LONG,
+		FrameRateTimerCallback, LPVOID, BOOL);
 
 	HANDLE CreateFrameRateTimer()
 	{
@@ -40,10 +44,31 @@ namespace
 			}
 		}
 
-		if (timer == nullptr)
-			timer = CreateWaitableTimer(nullptr, FALSE, nullptr);
+		if (timer == nullptr && kernel32 != nullptr)
+		{
+			CreateWaitableTimerAFunction createWaitableTimerA =
+				reinterpret_cast<CreateWaitableTimerAFunction>(GetProcAddress(kernel32, "CreateWaitableTimerA"));
+			if (createWaitableTimerA != nullptr)
+				timer = createWaitableTimerA(nullptr, FALSE, nullptr);
+		}
 
 		return timer;
+	}
+
+	SetWaitableTimerFunction ResolveSetWaitableTimer()
+	{
+		HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+		if (kernel32 == nullptr)
+			return nullptr;
+
+		return reinterpret_cast<SetWaitableTimerFunction>(GetProcAddress(kernel32, "SetWaitableTimer"));
+	}
+
+	Bool ArmFrameRateTimer(HANDLE timer, const LARGE_INTEGER *dueTime)
+	{
+		static SetWaitableTimerFunction setWaitableTimer = ResolveSetWaitableTimer();
+		return setWaitableTimer != nullptr &&
+			setWaitableTimer(timer, dueTime, 0, nullptr, nullptr, FALSE);
 	}
 }
 
@@ -101,7 +126,7 @@ Real FrameRateLimit::wait(UnsignedInt maxFps)
 		{
 			LARGE_INTEGER dueTime;
 			dueTime.QuadPart = -((coarseWaitTicks * 10000000 + m_freq - 1) / m_freq);
-			if (SetWaitableTimer(static_cast<HANDLE>(m_waitableTimer), &dueTime, 0, nullptr, nullptr, FALSE))
+			if (ArmFrameRateTimer(static_cast<HANDLE>(m_waitableTimer), &dueTime))
 				waited = WaitForSingleObject(static_cast<HANDLE>(m_waitableTimer), INFINITE) == WAIT_OBJECT_0;
 		}
 

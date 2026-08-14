@@ -91,6 +91,40 @@ inline Bool IsValidRunAheadFrameRate(UnsignedInt frameRate)
 	return frameRate > 0;
 }
 
+inline Bool IsValidPacketRouterSlot(UnsignedInt slot)
+{
+	return slot < MAX_SLOTS;
+}
+
+inline UnsignedInt FindNextPacketRouterSlot(const UnsignedInt *fallback, UnsignedInt currentSlot)
+{
+	const UnsignedInt invalidSlot = static_cast<UnsignedInt>(-1);
+	if (fallback == nullptr || currentSlot >= MAX_SLOTS)
+		return invalidSlot;
+
+	UnsignedInt currentIndex = MAX_SLOTS;
+	for (UnsignedInt i = 0; i < MAX_SLOTS; ++i)
+	{
+		if (fallback[i] == currentSlot)
+		{
+			currentIndex = i;
+			break;
+		}
+	}
+
+	if (currentIndex == MAX_SLOTS)
+		return invalidSlot;
+
+	for (UnsignedInt offset = 1; offset < MAX_SLOTS; ++offset)
+	{
+		const UnsignedInt candidate = fallback[(currentIndex + offset) % MAX_SLOTS];
+		if (candidate < MAX_SLOTS && candidate != currentSlot)
+			return candidate;
+	}
+
+	return invalidSlot;
+}
+
 inline size_t GetGameMessageArgumentSize(GameMessageArgumentDataType type)
 {
 	switch (type)

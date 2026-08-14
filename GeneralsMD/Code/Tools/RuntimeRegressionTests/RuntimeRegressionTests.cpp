@@ -29,7 +29,9 @@ DWORD TheMessageTime = 0;
 const Char *g_strFile = "data\\Generals.str";
 const Char *g_csfFile = "data\\%s\\Generals.csf";
 const char *gAppPrefix = "";
+#if !defined(RTS_DEBUG)
 ICoord2D TheMousePos = { 0, 0 };
+#endif
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 {
@@ -107,6 +109,29 @@ static void TestNetworkValidation()
 	CHECK(!TryAccumulateGameMessageArguments(ARGUMENTDATATYPE_INTEGER, 6, totalArguments, payloadBytes));
 	CHECK(!TryAccumulateGameMessageArguments(ARGUMENTDATATYPE_UNKNOWN, 1, totalArguments, payloadBytes));
 	CHECK(!TryAccumulateGameMessageArguments(ARGUMENTDATATYPE_INTEGER, 0, totalArguments, payloadBytes));
+}
+
+static void TestPacketRouterFallbackSelection()
+{
+	UnsignedInt fallback[MAX_SLOTS];
+	for (UnsignedInt i = 0; i < MAX_SLOTS; ++i)
+		fallback[i] = static_cast<UnsignedInt>(-1);
+
+	fallback[0] = 1;
+	fallback[1] = 3;
+	fallback[2] = 6;
+	CHECK(FindNextPacketRouterSlot(fallback, 1) == 3);
+	CHECK(FindNextPacketRouterSlot(fallback, 3) == 6);
+	CHECK(FindNextPacketRouterSlot(fallback, 6) == 1);
+	CHECK(FindNextPacketRouterSlot(fallback, 4) == static_cast<UnsignedInt>(-1));
+
+	fallback[1] = static_cast<UnsignedInt>(-1);
+	fallback[2] = static_cast<UnsignedInt>(-1);
+	CHECK(FindNextPacketRouterSlot(fallback, 1) == static_cast<UnsignedInt>(-1));
+
+	CHECK(IsValidPacketRouterSlot(1));
+	CHECK(!IsValidPacketRouterSlot(MAX_SLOTS));
+	CHECK(!IsValidPacketRouterSlot(static_cast<UnsignedInt>(-1)));
 }
 
 static void TestGameCommandParsing()
@@ -373,6 +398,7 @@ int main()
 	initMemoryManager();
 
 	TestNetworkValidation();
+	TestPacketRouterFallbackSelection();
 	TestGameCommandParsing();
 	TestMalformedGameCommandDeserialization();
 	TestWrapperLifecycle();

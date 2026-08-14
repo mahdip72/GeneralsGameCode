@@ -45,6 +45,7 @@
 #include "GameNetwork/ConnectionManager.h"
 #include "GameNetwork/LANAPICallbacks.h"
 #include "GameNetwork/NAT.h"
+#include "GameNetwork/NetCommandValidation.h"
 #include "GameNetwork/NetCommandWrapperList.h"
 #include "GameNetwork/networkutil.h"
 #include "GameLogic/GameLogic.h"
@@ -1473,7 +1474,8 @@ void ConnectionManager::updateRunAhead(Int oldRunAhead, Int frameRate, Bool didS
 
 			msg->detach();
 			msg2->detach();
-		} else {
+		} else if (IsValidPacketRouterSlot(m_packetRouterSlot) &&
+			m_connections[m_packetRouterSlot] != nullptr) {
 			// We are not the packet router, send our metrics info to the packet router.
 			NetRunAheadMetricsCommandMsg *msg = newInstance(NetRunAheadMetricsCommandMsg);
 			msg->setPlayerID(m_localSlot);
@@ -1495,6 +1497,8 @@ void ConnectionManager::updateRunAhead(Int oldRunAhead, Int frameRate, Bool didS
 			}
 			m_connections[m_packetRouterSlot]->sendNetCommandMsg(msg, 1 << m_packetRouterSlot);
 			msg->detach();
+		} else {
+			DEBUG_LOG(("ConnectionManager::updateRunAhead - no valid packet router connection"));
 		}
 		lasttimesent = curTime;
 	}
@@ -1891,11 +1895,7 @@ PlayerLeaveCode ConnectionManager::disconnectPlayer(Int slot) {
 //	}
 
 	if (slot == m_packetRouterSlot) {
-		Int index = 0;
-		while ((index < (MAX_SLOTS-1)) && (m_packetRouterFallback[index] != m_packetRouterSlot)) {
-			++index;
-		}
-		m_packetRouterSlot = index < MAX_SLOTS - 1 ? m_packetRouterFallback[index + 1] : MAX_SLOTS;
+		m_packetRouterSlot = getNextPacketRouterSlot(m_packetRouterSlot);
 		DEBUG_LOG(("Packet router left.  New packet router is slot %d", m_packetRouterSlot));
 		retval = PLAYERLEAVECODE_PACKETROUTER;
 	}
@@ -2563,12 +2563,7 @@ void ConnectionManager::sendSingleFrameToPlayer(UnsignedInt playerID, UnsignedIn
 }
 
 UnsignedInt ConnectionManager::getNextPacketRouterSlot(UnsignedInt playerID) {
-	Int index = 0;
-	while ((index < (MAX_SLOTS-1)) && (m_packetRouterFallback[index] != playerID)) {
-		++index;
-	}
-	++index;
-	return m_packetRouterFallback[index];
+	return FindNextPacketRouterSlot(m_packetRouterFallback, playerID);
 }
 
 void ConnectionManager::requestFrameDataResend(Int playerID, UnsignedInt frame) {
