@@ -9,6 +9,15 @@
 #include <pthread.h>
 #endif
 
+enum TaskRuntimeTestEvent
+{
+	TASK_RUNTIME_TEST_DESTRUCTOR_ENTRY = 1,
+	TASK_RUNTIME_TEST_WORKER_JOINED = 2
+};
+
+typedef void (*TaskRuntimeTestObserver)(unsigned event);
+extern "C" void rts_task_runtime_set_test_observer(TaskRuntimeTestObserver observer);
+
 struct TaskRecord
 {
 	TaskRecord() : executions(0), destructions(0), order(0) {}
@@ -167,6 +176,110 @@ private:
 #endif
 };
 
+class RuntimeJoinObserver
+{
+public:
+	RuntimeJoinObserver() : m_destructorEntries(0), m_workerJoins(0)
+	{
+#if defined(_WIN32)
+		InitializeCriticalSection(&m_mutex);
+#else
+		pthread_mutex_init(&m_mutex, 0);
+#endif
+	}
+
+	~RuntimeJoinObserver()
+	{
+#if defined(_WIN32)
+		DeleteCriticalSection(&m_mutex);
+#else
+		pthread_mutex_destroy(&m_mutex);
+#endif
+	}
+
+	void record(unsigned event)
+	{
+		lock();
+		if (event == TASK_RUNTIME_TEST_DESTRUCTOR_ENTRY)
+		{
+			++m_destructorEntries;
+		}
+		else if (event == TASK_RUNTIME_TEST_WORKER_JOINED)
+		{
+			++m_workerJoins;
+		}
+		unlock();
+		if (event == TASK_RUNTIME_TEST_DESTRUCTOR_ENTRY)
+		{
+			m_destructorEntered.signal();
+		}
+	}
+
+	void waitForDestructorEntry()
+	{
+		m_destructorEntered.wait();
+	}
+
+	unsigned destructorEntryCount()
+	{
+		unsigned result;
+		lock();
+		result = m_destructorEntries;
+		unlock();
+		return result;
+	}
+
+	unsigned workerJoinCount()
+	{
+		unsigned result;
+		lock();
+		result = m_workerJoins;
+		unlock();
+		return result;
+	}
+
+private:
+	RuntimeJoinObserver(const RuntimeJoinObserver &);
+	RuntimeJoinObserver &operator=(const RuntimeJoinObserver &);
+
+	void lock()
+	{
+#if defined(_WIN32)
+		EnterCriticalSection(&m_mutex);
+#else
+		pthread_mutex_lock(&m_mutex);
+#endif
+	}
+
+	void unlock()
+	{
+#if defined(_WIN32)
+		LeaveCriticalSection(&m_mutex);
+#else
+		pthread_mutex_unlock(&m_mutex);
+#endif
+	}
+
+	Signal m_destructorEntered;
+	unsigned m_destructorEntries;
+	unsigned m_workerJoins;
+#if defined(_WIN32)
+	CRITICAL_SECTION m_mutex;
+#else
+	pthread_mutex_t m_mutex;
+#endif
+};
+
+static RuntimeJoinObserver *s_runtimeJoinObserver = 0;
+
+static void recordTaskRuntimeEvent(unsigned event)
+{
+	if (s_runtimeJoinObserver != 0)
+	{
+		s_runtimeJoinObserver->record(event);
+	}
+}
+
 class RecordingTask : public rts::Task
 {
 public:
@@ -243,11 +356,6 @@ public:
 		m_permission.open();
 	}
 
-	void waitForDestructionStart()
-	{
-		m_destructionStarted.wait();
-	}
-
 	void waitForFinish()
 	{
 		m_finished.waitForEntry();
@@ -291,14 +399,12 @@ private:
 	void run()
 	{
 		m_permission.waitUntilOpen();
-		m_destructionStarted.signal();
 		delete m_runtime;
 		m_finished.waitUntilOpen();
 	}
 
 	rts::TaskRuntime *m_runtime;
 	Gate m_permission;
-	Signal m_destructionStarted;
 	Gate m_finished;
 #if defined(_WIN32)
 	HANDLE m_thread;
@@ -506,6 +612,7 @@ static int testDestructorDrainsAndJoins()
 	TaskRecord record;
 	rts::TaskRuntime *runtime = new rts::TaskRuntime;
 	RuntimeDestructionThread destruction(runtime);
+	RuntimeJoinObserver observer;
 	int result = 0;
 
 	CHECK(testName, runtime->start(1, 1));
@@ -519,14 +626,21 @@ static int testDestructorDrainsAndJoins()
 		return check(false, testName, "destruction.start()");
 	}
 	destruction.waitForDestructionPermission();
+	s_runtimeJoinObserver = &observer;
+	rts_task_runtime_set_test_observer(recordTaskRuntimeEvent);
 	destruction.allowDestruction();
-	destruction.waitForDestructionStart();
+	observer.waitForDestructorEntry();
+	result |= check(observer.destructorEntryCount() == 1, testName, "observer.destructorEntryCount() == 1");
+	result |= check(observer.workerJoinCount() == 0, testName, "observer.workerJoinCount() == 0");
 	gate.open();
 	destruction.waitForFinish();
 	result |= check(record.executions == 1, testName, "record.executions == 1");
 	result |= check(record.destructions == 1, testName, "record.destructions == 1");
+	result |= check(observer.workerJoinCount() == 1, testName, "observer.workerJoinCount() == 1");
 	destruction.allowFinish();
 	destruction.join();
+	rts_task_runtime_set_test_observer(0);
+	s_runtimeJoinObserver = 0;
 	return result;
 }
 

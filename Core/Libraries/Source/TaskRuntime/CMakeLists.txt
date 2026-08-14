@@ -12,6 +12,12 @@ target_link_libraries(core_task_runtime PRIVATE
     core_config
 )
 
+if(RTS_BUILD_CORE_EXTRAS)
+    target_compile_definitions(core_task_runtime PRIVATE
+        RTS_BUILD_CORE_EXTRAS
+    )
+endif()
+
 if(UNIX)
     find_package(Threads REQUIRED)
     target_link_libraries(core_task_runtime PRIVATE
