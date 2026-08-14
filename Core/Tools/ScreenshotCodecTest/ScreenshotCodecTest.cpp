@@ -4,6 +4,35 @@
 #include <stdio.h>
 #include <string.h>
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <pthread.h>
+#include <sys/time.h>
+#include <time.h>
+#endif
+
+enum
+{
+	TWO_WORKER_GATE_TIMEOUT_MS = 5000
+};
+
+#if !defined(_WIN32)
+static void deadlineAfter(unsigned timeoutMilliseconds, struct timespec &deadline)
+{
+	struct timeval now;
+	gettimeofday(&now, 0);
+	deadline.tv_sec = now.tv_sec + timeoutMilliseconds / 1000;
+	deadline.tv_nsec = now.tv_usec * 1000 +
+		(timeoutMilliseconds % 1000) * 1000000;
+	if (deadline.tv_nsec >= 1000000000)
+	{
+		++deadline.tv_sec;
+		deadline.tv_nsec -= 1000000000;
+	}
+}
+#endif
+
 static int check(bool value, const char *testName, const char *expression)
 {
 	if (!value)
@@ -36,6 +65,122 @@ static void convertFullImage(const ScreenshotPixelSource &source, unsigned char 
 {
 	ConvertScreenshotRows(source, 0, source.height, destination);
 }
+
+class TwoWorkerGate
+{
+public:
+	TwoWorkerGate()
+#if defined(_WIN32)
+		: m_twoEntered(CreateEvent(0, TRUE, FALSE, 0)),
+		  m_open(CreateEvent(0, TRUE, FALSE, 0)),
+		  m_enteredCount(0)
+#endif
+	{
+#if !defined(_WIN32)
+		pthread_mutex_init(&m_mutex, 0);
+		pthread_cond_init(&m_condition, 0);
+		m_enteredCount = 0;
+		m_open = false;
+#endif
+	}
+
+	~TwoWorkerGate()
+	{
+#if defined(_WIN32)
+		if (m_twoEntered != 0)
+		{
+			CloseHandle(m_twoEntered);
+		}
+		if (m_open != 0)
+		{
+			CloseHandle(m_open);
+		}
+#else
+		pthread_cond_destroy(&m_condition);
+		pthread_mutex_destroy(&m_mutex);
+#endif
+	}
+
+	void enterAndWait()
+	{
+#if defined(_WIN32)
+		if (InterlockedIncrement(&m_enteredCount) >= 2 && m_twoEntered != 0)
+		{
+			SetEvent(m_twoEntered);
+		}
+		if (m_open != 0)
+		{
+			WaitForSingleObject(m_open, TWO_WORKER_GATE_TIMEOUT_MS);
+		}
+		InterlockedDecrement(&m_enteredCount);
+#else
+		struct timespec deadline;
+		int waitResult = 0;
+		deadlineAfter(TWO_WORKER_GATE_TIMEOUT_MS, deadline);
+		pthread_mutex_lock(&m_mutex);
+		++m_enteredCount;
+		pthread_cond_broadcast(&m_condition);
+		while (!m_open && waitResult == 0)
+		{
+			waitResult = pthread_cond_timedwait(&m_condition, &m_mutex, &deadline);
+		}
+		--m_enteredCount;
+		pthread_mutex_unlock(&m_mutex);
+#endif
+	}
+
+	bool waitForTwoEntries(unsigned timeoutMilliseconds)
+	{
+#if defined(_WIN32)
+		return m_twoEntered != 0 && m_open != 0 &&
+			WaitForSingleObject(m_twoEntered, timeoutMilliseconds) == WAIT_OBJECT_0;
+#else
+		struct timespec deadline;
+		int waitResult = 0;
+		bool reached;
+
+		deadlineAfter(timeoutMilliseconds, deadline);
+		pthread_mutex_lock(&m_mutex);
+		while (m_enteredCount < 2 && waitResult == 0)
+		{
+			waitResult = pthread_cond_timedwait(&m_condition, &m_mutex, &deadline);
+		}
+		reached = m_enteredCount >= 2;
+		pthread_mutex_unlock(&m_mutex);
+		return reached;
+#endif
+	}
+
+	void open()
+	{
+#if defined(_WIN32)
+		if (m_open != 0)
+		{
+			SetEvent(m_open);
+		}
+#else
+		pthread_mutex_lock(&m_mutex);
+		m_open = true;
+		pthread_cond_broadcast(&m_condition);
+		pthread_mutex_unlock(&m_mutex);
+#endif
+	}
+
+private:
+	TwoWorkerGate(const TwoWorkerGate &);
+	TwoWorkerGate &operator=(const TwoWorkerGate &);
+
+#if defined(_WIN32)
+	HANDLE m_twoEntered;
+	HANDLE m_open;
+	LONG m_enteredCount;
+#else
+	pthread_mutex_t m_mutex;
+	pthread_cond_t m_condition;
+	unsigned m_enteredCount;
+	bool m_open;
+#endif
+};
 
 static int checkRanges(unsigned height, unsigned workerCount, unsigned expectedCount,
 	const char *testName)
@@ -81,13 +226,14 @@ class ConvertRangeTask : public rts::Task
 {
 public:
 	ConvertRangeTask(const ScreenshotPixelSource &source, const ScreenshotRowRange &range,
-		unsigned char *destination)
-		: m_source(source), m_range(range), m_destination(destination)
+		unsigned char *destination, TwoWorkerGate *gate)
+		: m_source(source), m_range(range), m_destination(destination), m_gate(gate)
 	{
 	}
 
 	virtual void execute()
 	{
+		m_gate->enterAndWait();
 		ConvertScreenshotRows(m_source, m_range.yBegin, m_range.yEnd, m_destination);
 	}
 
@@ -95,6 +241,7 @@ private:
 	ScreenshotPixelSource m_source;
 	ScreenshotRowRange m_range;
 	unsigned char *m_destination;
+	TwoWorkerGate *m_gate;
 };
 
 static int checkParallelConversion(const ScreenshotPixelSource &source, const char *testName)
@@ -105,6 +252,7 @@ static int checkParallelConversion(const ScreenshotPixelSource &source, const ch
 	unsigned char *serial = new unsigned char[byteCount];
 	unsigned char *striped = new unsigned char[byteCount];
 	rts::TaskRuntime runtime;
+	TwoWorkerGate gate;
 	unsigned rangeCount;
 	unsigned index;
 	int result = 0;
@@ -123,7 +271,7 @@ static int checkParallelConversion(const ScreenshotPixelSource &source, const ch
 			ranges, sizeof(ranges) / sizeof(ranges[0]));
 		for (index = 0; index < rangeCount; ++index)
 		{
-			tasks[index] = new ConvertRangeTask(source, ranges[index], striped);
+			tasks[index] = new ConvertRangeTask(source, ranges[index], striped, &gate);
 		}
 		if (!runtime.trySubmitBatch(tasks, rangeCount))
 		{
@@ -136,8 +284,11 @@ static int checkParallelConversion(const ScreenshotPixelSource &source, const ch
 		}
 		else
 		{
+			const bool usedTwoWorkers = gate.waitForTwoEntries(TWO_WORKER_GATE_TIMEOUT_MS);
+			gate.open();
 			runtime.waitUntilIdle();
-			result = checkBytes(striped, serial, byteCount, testName);
+			result |= check(usedTwoWorkers, testName, "two conversion tasks entered concurrently");
+			result |= checkBytes(striped, serial, byteCount, testName);
 		}
 		runtime.shutdown();
 	}
