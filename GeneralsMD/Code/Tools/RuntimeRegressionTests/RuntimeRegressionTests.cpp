@@ -373,9 +373,10 @@ static void TestFrameRateLimitCpuUsage()
 	}
 
 	const double wallSeconds = static_cast<double>(wallEnd.QuadPart - wallStart.QuadPart) / frequency.QuadPart;
-	const double cpuSeconds = static_cast<double>(
-		FileTimeToTicks(kernelEnd) - FileTimeToTicks(kernelStart) +
-		FileTimeToTicks(userEnd) - FileTimeToTicks(userStart)) / 10000000.0;
+	const Int64 cpuTicks =
+		static_cast<Int64>(FileTimeToTicks(kernelEnd)) - static_cast<Int64>(FileTimeToTicks(kernelStart)) +
+		static_cast<Int64>(FileTimeToTicks(userEnd)) - static_cast<Int64>(FileTimeToTicks(userStart));
+	const double cpuSeconds = static_cast<double>(cpuTicks) / 10000000.0;
 	const double cpuRatio = cpuSeconds / wallSeconds;
 	printf("Frame limiter CPU ratio at 480 FPS: %.3f\n", cpuRatio);
 	CHECK(wallSeconds >= 0.45);
