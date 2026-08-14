@@ -208,12 +208,21 @@ static void testVerticalMipTailGeneratesPixels()
 
 static void testGenericMipTailsPreservePitches()
 {
+	unsigned pairAverage = BitmapHandlerClass::Combine_A8R8G8B8(
+		0xff101010U, 0xff303030U, 0xff101010U, 0xff303030U);
+	unsigned char averageBytes[4] = { 0x20, 0x20, 0x20, 0xfc };
+	unsigned char convertedAverage[3] = { 0, 0, 0 };
 	unsigned char horizontalSource[8] = {
 		0x10, 0x10, 0x10, 0x30, 0x30, 0x30, 0xcd, 0xcd
 	};
 	unsigned horizontalDestination[2] = { 0xcdcdcdcdU, 0xcdcdcdcdU };
 	unsigned char verticalSource[16];
 	unsigned verticalDestination[4];
+	expectTrue(pairAverage == 0xfc202020U, "pair averaging is deterministic");
+	BitmapHandlerClass::Write_B8G8R8A8(
+		convertedAverage, WW3D_FORMAT_R8G8B8, averageBytes);
+	expectTrue(convertedAverage[0] == 0x20 && convertedAverage[1] == 0x20 &&
+		convertedAverage[2] == 0x20, "generic pixel conversion is deterministic");
 
 	BitmapHandlerClass::Copy_Image(
 		reinterpret_cast<unsigned char *>(horizontalDestination), 2, 1, 8, WW3D_FORMAT_A8R8G8B8,
@@ -222,6 +231,13 @@ static void testGenericMipTailsPreservePitches()
 	expectTrue(horizontalDestination[0] == 0xff101010U &&
 		horizontalDestination[1] == 0xff303030U,
 		"generic two by one level copies converted pixels");
+	if (horizontalSource[0] != 0x20 || horizontalSource[1] != 0x20 ||
+		horizontalSource[2] != 0x20 || horizontalSource[6] != 0xcd || horizontalSource[7] != 0xcd)
+	{
+		printf("generic horizontal bytes: %02x %02x %02x | %02x %02x\n",
+			horizontalSource[0], horizontalSource[1], horizontalSource[2],
+			horizontalSource[6], horizontalSource[7]);
+	}
 	expectTrue(horizontalSource[0] == 0x20 && horizontalSource[1] == 0x20 &&
 		horizontalSource[2] == 0x20 && horizontalSource[6] == 0xcd && horizontalSource[7] == 0xcd,
 		"generic horizontal tail generates its successor without touching padding");
@@ -237,6 +253,14 @@ static void testGenericMipTailsPreservePitches()
 	expectTrue(verticalDestination[0] == 0xff101010U &&
 		verticalDestination[2] == 0xff303030U,
 		"generic one by two level honors destination pitch");
+	if (verticalSource[0] != 0x20 || verticalSource[1] != 0x20 ||
+		verticalSource[2] != 0x20 || verticalSource[3] != 0xcd ||
+		verticalSource[7] != 0xcd || verticalSource[11] != 0xcd)
+	{
+		printf("generic vertical bytes: %02x %02x %02x | %02x %02x %02x\n",
+			verticalSource[0], verticalSource[1], verticalSource[2],
+			verticalSource[3], verticalSource[7], verticalSource[11]);
+	}
 	expectTrue(verticalSource[0] == 0x20 && verticalSource[1] == 0x20 &&
 		verticalSource[2] == 0x20 && verticalSource[3] == 0xcd &&
 		verticalSource[7] == 0xcd && verticalSource[11] == 0xcd,

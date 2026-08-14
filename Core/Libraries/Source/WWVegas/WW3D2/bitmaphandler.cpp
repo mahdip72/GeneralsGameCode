@@ -144,6 +144,84 @@ void BitmapHandlerClass::Copy_Image_Generate_Mipmap(
 //
 // ----------------------------------------------------------------------------
 
+// VC6's optimizer corrupts the in-place generic one-dimensional mip write.
+// Keep only this rare rectangular tail helper unoptimized on that compiler.
+#if defined(_MSC_VER) && _MSC_VER == 1200
+#pragma optimize("", off)
+#pragma auto_inline(off)
+#endif
+static void Copy_One_Dimensional_Mip_Generic(
+	unsigned char* dest_surface,
+	unsigned dest_surface_width,
+	unsigned dest_surface_height,
+	unsigned dest_surface_pitch,
+	WW3DFormat dest_surface_format,
+	unsigned char* src_surface,
+	unsigned src_surface_pitch,
+	WW3DFormat src_surface_format,
+	const unsigned char* src_palette,
+	unsigned src_palette_bpp,
+	const Vector3& hsv_shift)
+{
+	unsigned dest_bpp=Get_Bytes_Per_Pixel(dest_surface_format);
+	unsigned src_bpp=Get_Bytes_Per_Pixel(src_surface_format);
+	bool has_hsv_shift=hsv_shift[0]!=0.0f || hsv_shift[1]!=0.0f || hsv_shift[2]!=0.0f;
+	unsigned char* dest_ptr=dest_surface;
+	unsigned char* src_ptr=src_surface;
+	unsigned char* mip_ptr=src_surface;
+
+	if (dest_surface_height==1) {
+		for (unsigned x=0;x<dest_surface_width/2;++x) {
+			unsigned b8g8r8a8_0;
+			unsigned b8g8r8a8_1;
+			unsigned b8g8r8a8;
+			BitmapHandlerClass::Read_B8G8R8A8(
+				b8g8r8a8_0,src_ptr,src_surface_format,src_palette,src_palette_bpp);
+			BitmapHandlerClass::Read_B8G8R8A8(
+				b8g8r8a8_1,src_ptr+src_bpp,src_surface_format,src_palette,src_palette_bpp);
+			if (has_hsv_shift) {
+				Recolor(b8g8r8a8_0,hsv_shift);
+				Recolor(b8g8r8a8_1,hsv_shift);
+			}
+			b8g8r8a8=BitmapHandlerClass::Combine_A8R8G8B8(
+				b8g8r8a8_0,b8g8r8a8_1,b8g8r8a8_0,b8g8r8a8_1);
+			BitmapHandlerClass::Write_B8G8R8A8(mip_ptr,src_surface_format,b8g8r8a8);
+			BitmapHandlerClass::Write_B8G8R8A8(dest_ptr,dest_surface_format,b8g8r8a8_0);
+			BitmapHandlerClass::Write_B8G8R8A8(dest_ptr+dest_bpp,dest_surface_format,b8g8r8a8_1);
+			dest_ptr+=2*dest_bpp;
+			src_ptr+=2*src_bpp;
+			mip_ptr+=src_bpp;
+		}
+	} else {
+		for (unsigned y=0;y<dest_surface_height/2;++y) {
+			unsigned b8g8r8a8_0;
+			unsigned b8g8r8a8_1;
+			unsigned b8g8r8a8;
+			BitmapHandlerClass::Read_B8G8R8A8(
+				b8g8r8a8_0,src_ptr,src_surface_format,src_palette,src_palette_bpp);
+			BitmapHandlerClass::Read_B8G8R8A8(
+				b8g8r8a8_1,src_ptr+src_surface_pitch,src_surface_format,src_palette,src_palette_bpp);
+			if (has_hsv_shift) {
+				Recolor(b8g8r8a8_0,hsv_shift);
+				Recolor(b8g8r8a8_1,hsv_shift);
+			}
+			b8g8r8a8=BitmapHandlerClass::Combine_A8R8G8B8(
+				b8g8r8a8_0,b8g8r8a8_0,b8g8r8a8_1,b8g8r8a8_1);
+			BitmapHandlerClass::Write_B8G8R8A8(mip_ptr,src_surface_format,b8g8r8a8);
+			BitmapHandlerClass::Write_B8G8R8A8(dest_ptr,dest_surface_format,b8g8r8a8_0);
+			BitmapHandlerClass::Write_B8G8R8A8(
+				dest_ptr+dest_surface_pitch,dest_surface_format,b8g8r8a8_1);
+			dest_ptr+=2*dest_surface_pitch;
+			src_ptr+=2*src_surface_pitch;
+			mip_ptr+=src_surface_pitch;
+		}
+	}
+}
+#if defined(_MSC_VER) && _MSC_VER == 1200
+#pragma auto_inline(on)
+#pragma optimize("", on)
+#endif
+
 void BitmapHandlerClass::Copy_Image(
 	unsigned char* dest_surface,
 	unsigned dest_surface_width,
@@ -406,51 +484,11 @@ void BitmapHandlerClass::Copy_Image(
 				}
 				Write_B8G8R8A8(dest_ptr,dest_surface_format,b8g8r8a8);
 			}
-			else if (dest_surface_height==1) {
-				unsigned char* dest_ptr=dest_surface;
-				unsigned char* src_ptr=src_surface;
-				unsigned char* mip_ptr=src_surface;
-				for (unsigned x=0;x<dest_surface_width/2;++x) {
-					unsigned b8g8r8a8_0;
-					unsigned b8g8r8a8_1;
-					Read_B8G8R8A8(b8g8r8a8_0,src_ptr,src_surface_format,src_palette,src_palette_bpp);
-					Read_B8G8R8A8(b8g8r8a8_1,src_ptr+src_bpp,src_surface_format,src_palette,src_palette_bpp);
-					if (has_hsv_shift) {
-						Recolor(b8g8r8a8_0,hsv_shift);
-						Recolor(b8g8r8a8_1,hsv_shift);
-					}
-					Write_B8G8R8A8(dest_ptr,dest_surface_format,b8g8r8a8_0);
-					Write_B8G8R8A8(dest_ptr+dest_bpp,dest_surface_format,b8g8r8a8_1);
-					unsigned b8g8r8a8=Combine_A8R8G8B8(
-						b8g8r8a8_0,b8g8r8a8_1,b8g8r8a8_0,b8g8r8a8_1);
-					Write_B8G8R8A8(mip_ptr,src_surface_format,b8g8r8a8);
-					dest_ptr+=2*dest_bpp;
-					src_ptr+=2*src_bpp;
-					mip_ptr+=src_bpp;
-				}
-			}
-			else if (dest_surface_width==1) {
-				unsigned char* dest_ptr=dest_surface;
-				unsigned char* src_ptr=src_surface;
-				unsigned char* mip_ptr=src_surface;
-				for (unsigned y=0;y<dest_surface_height/2;++y) {
-					unsigned b8g8r8a8_0;
-					unsigned b8g8r8a8_1;
-					Read_B8G8R8A8(b8g8r8a8_0,src_ptr,src_surface_format,src_palette,src_palette_bpp);
-					Read_B8G8R8A8(b8g8r8a8_1,src_ptr+src_surface_pitch,src_surface_format,src_palette,src_palette_bpp);
-					if (has_hsv_shift) {
-						Recolor(b8g8r8a8_0,hsv_shift);
-						Recolor(b8g8r8a8_1,hsv_shift);
-					}
-					Write_B8G8R8A8(dest_ptr,dest_surface_format,b8g8r8a8_0);
-					Write_B8G8R8A8(dest_ptr+dest_surface_pitch,dest_surface_format,b8g8r8a8_1);
-					unsigned b8g8r8a8=Combine_A8R8G8B8(
-						b8g8r8a8_0,b8g8r8a8_0,b8g8r8a8_1,b8g8r8a8_1);
-					Write_B8G8R8A8(mip_ptr,src_surface_format,b8g8r8a8);
-					dest_ptr+=2*dest_surface_pitch;
-					src_ptr+=2*src_surface_pitch;
-					mip_ptr+=src_surface_pitch;
-				}
+			else if (dest_surface_height==1 || dest_surface_width==1) {
+				Copy_One_Dimensional_Mip_Generic(
+					dest_surface,dest_surface_width,dest_surface_height,dest_surface_pitch,
+					dest_surface_format,src_surface,src_surface_pitch,src_surface_format,
+					src_palette,src_palette_bpp,hsv_shift);
 			}
 			else {
 				for (unsigned y=0;y<dest_surface_height/2;++y) {
