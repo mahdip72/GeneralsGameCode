@@ -16,14 +16,34 @@
 **	along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#pragma once
+#ifndef W3DSCREENSHOTCODEC_H
+#define W3DSCREENSHOTCODEC_H
 
-#include "GameClient/Display.h"
+enum ScreenshotSourceFormat
+{
+	SCREENSHOT_SOURCE_ARGB32,
+	SCREENSHOT_SOURCE_RGB565
+};
 
-void W3D_TakeCompressedScreenshot(ScreenshotFormat format, Int jpegQuality);
-void W3D_ShutdownScreenshotTasks();
+struct ScreenshotPixelSource
+{
+	const unsigned char *pixels;
+	unsigned width;
+	unsigned height;
+	unsigned pitch;
+	ScreenshotSourceFormat format;
+};
 
-// Called once per frame on the main thread to show messages for screenshots
-// that screenshot worker tasks have finished writing.
-void W3D_UpdateScreenshotMessages();
+struct ScreenshotRowRange
+{
+	unsigned yBegin;
+	unsigned yEnd;
+};
 
+unsigned BuildScreenshotRowRanges(unsigned height, unsigned workerCount,
+	ScreenshotRowRange *ranges, unsigned rangeCapacity);
+
+void ConvertScreenshotRows(const ScreenshotPixelSource &source,
+	unsigned yBegin, unsigned yEnd, unsigned char *rgbDestination);
+
+#endif

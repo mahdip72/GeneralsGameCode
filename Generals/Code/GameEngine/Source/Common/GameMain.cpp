@@ -30,6 +30,7 @@
 
 #include "Common/FramePacer.h"
 #include "Common/GameEngine.h"
+#include "Common/GameThreadOwnership.h"
 #include "Common/ReplaySimulation.h"
 
 
@@ -38,6 +39,7 @@
  */
 Int GameMain()
 {
+	GameThreadOwnership::AttachCurrentThread();
 	int exitcode = 0;
 	// initialize the game engine using factory function
 	TheFramePacer = new FramePacer();
@@ -60,6 +62,7 @@ Int GameMain()
 	TheFramePacer = nullptr;
 	delete TheGameEngine;
 	TheGameEngine = nullptr;
+	GameThreadOwnership::DetachCurrentThread();
 
 	return exitcode;
 }

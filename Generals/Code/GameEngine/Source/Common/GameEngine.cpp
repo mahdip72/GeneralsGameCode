@@ -33,6 +33,7 @@
 #include "Common/BuildAssistant.h"
 #include "Common/CRCDebug.h"
 #include "Common/FramePacer.h"
+#include "Common/GameThreadOwnership.h"
 #include "Common/Radar.h"
 #include "Common/PlayerTemplate.h"
 #include "Common/Team.h"
@@ -58,6 +59,8 @@
 #include "Common/Science.h"
 #include "Common/FunctionLexicon.h"
 #include "Common/CommandLine.h"
+
+#include "rts/profile.h"
 #include "Common/DamageFX.h"
 #include "Common/MultiplayerSettings.h"
 #include "Common/Recorder.h"
@@ -346,6 +349,7 @@ Bool GameEngine::isGameHalted()
  */
 void GameEngine::init()
 {
+	ASSERT_GAME_THREAD("GameEngine::init");
 	try {
 		//create an INI object to use for loading stuff
 		INI ini;
@@ -609,6 +613,7 @@ void GameEngine::init()
 	*/
 void GameEngine::reset()
 {
+	ASSERT_GAME_THREAD("GameEngine::reset");
 
 	WindowLayout *background = TheWindowManager->winCreateLayout("Menus/BlankWindow.wnd");
 	DEBUG_ASSERTCRASH(background,("We Couldn't Load Menus/BlankWindow.wnd"));
@@ -728,33 +733,54 @@ DECLARE_PERF_TIMER(GameEngine_update)
  */
 void GameEngine::update()
 {
+	ASSERT_GAME_THREAD("GameEngine::update");
+	PROFILER_SECTION_NAME("Engine.Update");
 	USE_PERF_TIMER(GameEngine_update)
 	{
 		{
 			// VERIFY CRC needs to be in this code block.  Please to not pull TheGameLogic->update() inside this block.
 			VERIFY_CRC
 
-			TheRadar->UPDATE();
+			{
+				PROFILER_SECTION_NAME("Engine.Update.Radar");
+				TheRadar->UPDATE();
+			}
 
 			/// @todo Move audio init, update, etc, into GameClient update
 
-			TheAudio->UPDATE();
-			TheGameClient->UPDATE();
-			TheMessageStream->propagateMessages();
-
-			if (TheNetwork != nullptr)
 			{
-				TheNetwork->UPDATE();
+				PROFILER_SECTION_NAME("Engine.Update.Audio");
+				TheAudio->UPDATE();
+			}
+			{
+				PROFILER_SECTION_NAME("Engine.Update.Client");
+				TheGameClient->UPDATE();
+			}
+			{
+				PROFILER_SECTION_NAME("Engine.Update.MessageStream");
+				TheMessageStream->propagateMessages();
+			}
+
+			{
+				PROFILER_SECTION_NAME("Engine.Update.Network");
+				if (TheNetwork != nullptr)
+				{
+					TheNetwork->UPDATE();
+				}
 			}
 		}
 
 		// TheSuperHackers @info Ignores frozen time because the script engine needs updating in the logic update regardless.
 		if (canUpdateGameLogic(FramePacer::IgnoreFrozenTime))
 		{
-			TheGameLogic->UPDATE();
+			{
+				PROFILER_SECTION_NAME("Engine.Update.GameLogic");
+				TheGameLogic->UPDATE();
+			}
 
 			if (!TheFramePacer->isTimeFrozen())
 			{
+				PROFILER_SECTION_NAME("Engine.Update.ClientStep");
 				TheGameClient->step();
 			}
 		}
@@ -770,6 +796,7 @@ extern HWND ApplicationHWnd;
  */
 void GameEngine::execute()
 {
+	ASSERT_GAME_THREAD("GameEngine::execute");
 #if defined(RTS_DEBUG)
 	DWORD startTime = timeGetTime() / 1000;
 #endif
@@ -838,7 +865,10 @@ void GameEngine::execute()
 				}
 			}
 
-			TheFramePacer->update();
+			{
+				PROFILER_SECTION_NAME("Engine.FramePacer");
+				TheFramePacer->update();
+			}
 		}
 
 #ifdef PERF_TIMERS

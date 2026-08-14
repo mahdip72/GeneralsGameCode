@@ -371,6 +371,8 @@ W3DDisplay::W3DDisplay()
 //=============================================================================
 W3DDisplay::~W3DDisplay()
 {
+	W3D_ShutdownScreenshotTasks();
+
 #ifdef PROFILER_ENABLED
 	delete m_profilerFrameCapture;
 	m_profilerFrameCapture = nullptr;

@@ -1,6 +1,6 @@
 /*
 **	Command & Conquer Generals Zero Hour(tm)
-**	Copyright 2025 TheSuperHackers
+**	Copyright 2025 Electronic Arts Inc.
 **
 **	This program is free software: you can redistribute it and/or modify
 **	it under the terms of the GNU General Public License as published by
@@ -18,12 +18,18 @@
 
 #pragma once
 
-#include "GameClient/Display.h"
+class GameThreadOwnership
+{
+public:
+	static void AttachCurrentThread();
+	static void DetachCurrentThread();
+	static bool IsAttached();
+	static bool IsCurrentThread();
+	static void AssertCurrentThread(const char *boundary);
+};
 
-void W3D_TakeCompressedScreenshot(ScreenshotFormat format, Int jpegQuality);
-void W3D_ShutdownScreenshotTasks();
-
-// Called once per frame on the main thread to show messages for screenshots
-// that screenshot worker tasks have finished writing.
-void W3D_UpdateScreenshotMessages();
-
+#if defined(DEBUG_CRASHING)
+#define ASSERT_GAME_THREAD(boundary) GameThreadOwnership::AssertCurrentThread(boundary)
+#else
+#define ASSERT_GAME_THREAD(boundary) ((void)0)
+#endif

@@ -191,6 +191,17 @@ jobs:
           & $test.FullName
           exit $LASTEXITCODE
 
+      - name: Run Core extras tests for ${{ inputs.game }} with ${{ inputs.preset }}
+        if: inputs.extras
+        shell: pwsh
+        run: |
+          $arguments = @('--test-dir', "build\${{ inputs.preset }}", '--output-on-failure')
+          if ('${{ inputs.preset }}' -like 'win32*') {
+            $configuration = if ('${{ inputs.preset }}' -match 'debug') { 'Debug' } else { 'Release' }
+            $arguments += @('-C', $configuration)
+          }
+          & ctest @arguments
+
       - name: Save vcpkg binary cache
         # Only one job should save to avoid "Unable to reserve cache" conflicts.
         if: ${{ contains(inputs.preset, 'vcpkg') && steps.vcpkg_cache.outputs.cache-hit != 'true' && inputs.game == 'Generals' && inputs.preset == 'win32-vcpkg-debug' }}

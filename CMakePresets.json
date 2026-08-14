@@ -41,6 +41,7 @@
             "inherits": "vc6",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreadedDLL",
                 "RTS_BUILD_OPTION_DEBUG": "ON"
             }
         },
