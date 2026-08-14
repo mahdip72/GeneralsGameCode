@@ -304,6 +304,7 @@ Register `core_screenshot_codec_tests` with CTest under Core extras. Run it in t
 **Files:**
 - Modify: `Core/GameEngineDevice/Include/W3DDevice/GameClient/W3DScreenshot.h`
 - Modify: `Core/GameEngineDevice/Source/W3DDevice/GameClient/W3DScreenshot.cpp`
+- Modify: `Core/Tools/ScreenshotCodecTest/ScreenshotCodecTest.cpp`
 - Modify: `Generals/Code/GameEngineDevice/Source/W3DDevice/GameClient/W3DDisplay.cpp`
 - Modify: `GeneralsMD/Code/GameEngineDevice/Source/W3DDevice/GameClient/W3DDisplay.cpp`
 - Modify: `TESTING.md`
