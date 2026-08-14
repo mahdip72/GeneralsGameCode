@@ -240,6 +240,9 @@ class TextureLoadTaskClass : public TextureLoadTaskListNodeClass
 		void						End_Load						();
 		void						Finish_Load					();
 		void						Apply_Missing_Texture	();
+		bool						Begin_Async_Prepare		();
+		void						Complete_Async_Prepare	();
+		void						Wait_For_Async_Prepare	();
 
 	protected:
 		virtual bool			Begin_Compressed_Load	();
@@ -273,6 +276,7 @@ class TextureLoadTaskClass : public TextureLoadTaskListNodeClass
 		char					Filename[_MAX_PATH];
 		DDSFileClass*			DDSFile;
 		Targa*					TargaFile;
+		void*					PrepareCompleteEvent;
 		char					TargaPalette[256 * 4];
 		TextureMipBuffer		PreparedSurface[MIP_LEVELS_MAX];
 

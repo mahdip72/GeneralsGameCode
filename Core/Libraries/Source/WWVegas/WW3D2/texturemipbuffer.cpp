@@ -74,9 +74,9 @@ bool CalculateTextureMipLayout(WW3DFormat format, unsigned width, unsigned heigh
 	if (format >= WW3D_FORMAT_DXT1 && format <= WW3D_FORMAT_DXT5)
 	{
 		const size_t blockSize = format == WW3D_FORMAT_DXT1 ? 8 : 16;
-		const size_t blockWidth = ((size_t)width + 3) / 4;
+		const size_t blockWidth = (size_t)width / 4 + (width % 4 != 0 ? 1 : 0);
 
-		rowCount = ((size_t)height + 3) / 4;
+		rowCount = (size_t)height / 4 + (height % 4 != 0 ? 1 : 0);
 		if (!checkedMultiply(blockWidth, blockSize, rowPitch))
 		{
 			return false;
@@ -103,6 +103,28 @@ bool CalculateTextureMipLayout(WW3DFormat format, unsigned width, unsigned heigh
 	layout.slicePitch = slicePitch;
 	layout.dataSize = dataSize;
 	return true;
+}
+
+unsigned CalculateTextureMipLevelCount(unsigned width, unsigned height)
+{
+	unsigned levelCount = 0;
+
+	if (width == 0 || height == 0)
+	{
+		return 0;
+	}
+
+	for (;;)
+	{
+		++levelCount;
+		if (width == 1 && height == 1)
+		{
+			return levelCount;
+		}
+
+		width = width > 1 ? width >> 1 : 1;
+		height = height > 1 ? height >> 1 : 1;
+	}
 }
 
 bool CopyTextureMipData(const unsigned char* source, const TextureMipLayout& sourceLayout,

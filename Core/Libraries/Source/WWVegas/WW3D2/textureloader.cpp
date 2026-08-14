@@ -179,11 +179,6 @@ void SynchronizedTextureLoadTaskListClass::Push_Back(TextureLoadTaskClass *task)
 
 TextureLoadTaskClass *SynchronizedTextureLoadTaskListClass::Pop_Front()
 {
-	// this duplicates code inside base class, but saves us an unnecessary lock.
-	if (Is_Empty()) {
-		return nullptr;
-	}
-
 	FastCriticalSectionClass::LockClass lock(CriticalSection);
 	return TextureLoadTaskListClass::Pop_Front();
 
@@ -191,11 +186,6 @@ TextureLoadTaskClass *SynchronizedTextureLoadTaskListClass::Pop_Front()
 
 TextureLoadTaskClass *SynchronizedTextureLoadTaskListClass::Pop_Back()
 {
-	// this duplicates code inside base class, but saves us an unnecessary lock.
-	if (Is_Empty()) {
-		return nullptr;
-	}
-
 	FastCriticalSectionClass::LockClass lock(CriticalSection);
 	return TextureLoadTaskListClass::Pop_Back();
 }
@@ -214,6 +204,7 @@ void SynchronizedTextureLoadTaskListClass::Remove(TextureLoadTaskClass *task)
 // since one thread can never hold two at once.
 
 static FastCriticalSectionClass					_ForegroundCriticalSection;
+static bool _AcceptingTextureRequests = false;
 // Lists
 
 static SynchronizedTextureLoadTaskListClass	_ForegroundQueue;
@@ -237,6 +228,7 @@ public:
 		WWASSERT(m_task->Get_State() == TextureLoadTaskClass::STATE_LOAD_BEGUN);
 		m_task->Load();
 		_ForegroundQueue.Push_Back(m_task);
+		m_task->Complete_Async_Prepare();
 	}
 
 private:
@@ -339,13 +331,25 @@ void TextureLoader::Init()
 
 	ThumbnailManagerClass::Init();
 
-	_TexturePrepareRuntime.start(Get_Texture_Prepare_Worker_Count(), 8);
+	const unsigned workerCount = Get_Texture_Prepare_Worker_Count();
+	if (!_TexturePrepareRuntime.start(workerCount, 8) && workerCount > 1)
+	{
+		_TexturePrepareRuntime.start(1, 8);
+	}
+	{
+		FastCriticalSectionClass::LockClass lock(_ForegroundCriticalSection);
+		_AcceptingTextureRequests = true;
+	}
 	TextureInactiveOverrideTime = 0;
 }
 
 
 void TextureLoader::Deinit()
 {
+	{
+		FastCriticalSectionClass::LockClass lock(_ForegroundCriticalSection);
+		_AcceptingTextureRequests = false;
+	}
 	_TexturePrepareRuntime.shutdown();
 
 	TextureLoadTaskClass *task = nullptr;
@@ -665,6 +669,10 @@ void TextureLoader::Request_Thumbnail(TextureBaseClass *tc)
 	// from retiring any tasks related to this texture. It also
 	// serializes calls to Request_Thumbnail from multiple threads.
 	FastCriticalSectionClass::LockClass lock(_ForegroundCriticalSection);
+	if (!_AcceptingTextureRequests)
+	{
+		return;
+	}
 
 	// Has a Direct3D texture already been loaded?
 	if (tc->Peek_D3D_Base_Texture()) {
@@ -690,7 +698,7 @@ void TextureLoader::Request_Thumbnail(TextureBaseClass *tc)
 		// background load near completion. (a background load waiting
 		// to be applied will be ready at the same time as a queued thumbnail.
 		// Why do the extra work?)
-		if (!task && (!load_task || load_task->Get_State() < TextureLoadTaskClass::STATE_LOAD_MIPMAP)) {
+		if (!task && !load_task) {
 
 			// create a thumbnail load task and add to foreground queue.
 			task = TextureLoadTaskClass::Create(tc, TextureLoadTaskClass::TASK_THUMBNAIL, TextureLoadTaskClass::PRIORITY_LOW);
@@ -708,6 +716,10 @@ void TextureLoader::Request_Background_Loading(TextureBaseClass *tc)
 	// serializes calls to Request_Background_Loading from other
 	// threads.
 	FastCriticalSectionClass::LockClass foreground_lock(_ForegroundCriticalSection);
+	if (!_AcceptingTextureRequests)
+	{
+		return;
+	}
 
 	// Has the texture already been loaded?
 	if (tc->Is_Initialized()) {
@@ -739,6 +751,10 @@ void TextureLoader::Request_Foreground_Loading(TextureBaseClass *tc)
 	// serializes calls to Request_Foreground_Loading from other
 	// threads.
 	FastCriticalSectionClass::LockClass foreground_lock(_ForegroundCriticalSection);
+	if (!_AcceptingTextureRequests)
+	{
+		return;
+	}
 
 	// Has the texture already been loaded?
 	if (tc->Is_Initialized()) {
@@ -760,9 +776,9 @@ void TextureLoader::Request_Foreground_Loading(TextureBaseClass *tc)
 		}
 
 		if (task) {
-			// Wait for any owned CPU preparation to finish before taking the
-			// task back for immediate render-thread upload.
-			_TexturePrepareRuntime.waitUntilIdle();
+			// Wait only for this texture's owned CPU preparation. Unrelated
+			// queued textures must not become a render-thread barrier.
+			task->Wait_For_Async_Prepare();
 			_ForegroundQueue.Remove(task);
 		} else {
 			// Since the task manages all the state associated with loading
@@ -932,13 +948,15 @@ void TextureLoader::Begin_Load_And_Queue(TextureLoadTaskClass *task)
 			runtimeTask = nullptr;
 		}
 
-		if (runtimeTask != nullptr && _TexturePrepareRuntime.trySubmit(runtimeTask))
+		if (runtimeTask != nullptr && task->Begin_Async_Prepare() &&
+			_TexturePrepareRuntime.trySubmit(runtimeTask))
 		{
 			return;
 		}
 
 		delete runtimeTask;
 		task->Load();
+		task->Complete_Async_Prepare();
 		task->End_Load();
 		task->Destroy();
 	} else {
@@ -989,6 +1007,7 @@ TextureLoadTaskClass::TextureLoadTaskClass()
 	LoadSucceeded	(false),
 	DDSFile			(nullptr),
 	TargaFile		(nullptr),
+	PrepareCompleteEvent(nullptr),
 	Type				(TASK_NONE),
 	Priority			(PRIORITY_LOW),
 	State				(STATE_NONE),
@@ -1009,6 +1028,41 @@ TextureLoadTaskClass::TextureLoadTaskClass()
 TextureLoadTaskClass::~TextureLoadTaskClass()
 {
 	Deinit();
+	if (PrepareCompleteEvent != nullptr)
+	{
+		CloseHandle((HANDLE)PrepareCompleteEvent);
+		PrepareCompleteEvent = nullptr;
+	}
+}
+
+
+bool TextureLoadTaskClass::Begin_Async_Prepare()
+{
+	if (PrepareCompleteEvent == nullptr)
+	{
+		PrepareCompleteEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+		return PrepareCompleteEvent != nullptr;
+	}
+
+	return ResetEvent((HANDLE)PrepareCompleteEvent) != FALSE;
+}
+
+
+void TextureLoadTaskClass::Complete_Async_Prepare()
+{
+	if (PrepareCompleteEvent != nullptr)
+	{
+		SetEvent((HANDLE)PrepareCompleteEvent);
+	}
+}
+
+
+void TextureLoadTaskClass::Wait_For_Async_Prepare()
+{
+	if (PrepareCompleteEvent != nullptr)
+	{
+		WaitForSingleObject((HANDLE)PrepareCompleteEvent, INFINITE);
+	}
 }
 
 
@@ -1058,10 +1112,10 @@ void TextureLoadTaskClass::Delete_Free_Pool()
 		delete task;
 	}
 	while (TextureLoadTaskClass *task = _CubeTexLoadFreeList.Pop_Front()) {
-		delete task;
+		delete static_cast<CubeTextureLoadTaskClass *>(task);
 	}
 	while (TextureLoadTaskClass *task = _VolTexLoadFreeList.Pop_Front()) {
-		delete task;
+		delete static_cast<VolumeTextureLoadTaskClass *>(task);
 	}
 }
 
@@ -1632,12 +1686,7 @@ bool TextureLoadTaskClass::Begin_Uncompressed_Load()
 		Format = Get_Valid_Texture_Format(Format, false);
 	}
 
-	unsigned int availableMipLevels = 0;
-	for (unsigned int mipWidth = Width, mipHeight = Height;
-		mipWidth > 0 && mipHeight > 0; mipWidth >>= 1, mipHeight >>= 1)
-	{
-		++availableMipLevels;
-	}
+	const unsigned int availableMipLevels = CalculateTextureMipLevelCount(Width, Height);
 	if (MipLevelCount == MIP_LEVELS_ALL || MipLevelCount > availableMipLevels)
 	{
 		MipLevelCount = availableMipLevels;
@@ -2626,6 +2675,10 @@ bool VolumeTextureLoadTaskClass::Load_Compressed_Mipmap()
 	for (unsigned int level=0; level<Get_Mip_Level_Count(); level++)
 	{
 		WWASSERT(width >= MinTextureDim && height >= MinTextureDim && depth >= MinTextureDepth);
+		if (dds_file.Get_Volume_Memory_Pointer(level) == nullptr)
+		{
+			return false;
+		}
 
 		// get volume
 		dds_file.Copy_Volume_Level_To_Surface

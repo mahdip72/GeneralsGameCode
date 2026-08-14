@@ -90,6 +90,16 @@ static void testInvalidLayouts()
 		"zero depth is rejected");
 	expectTrue(!CalculateTextureMipLayout(WW3D_FORMAT_A8R8G8B8, UINT_MAX, 2, 1, layout),
 		"row pitch overflow is rejected");
+	expectTrue(!CalculateTextureMipLayout(WW3D_FORMAT_DXT5, UINT_MAX, UINT_MAX, UINT_MAX, layout),
+		"compressed dimension overflow is rejected");
+}
+
+static void testMipLevelCounts()
+{
+	expectSize(CalculateTextureMipLevelCount(1, 1), 1, "one by one has one mip level");
+	expectSize(CalculateTextureMipLevelCount(8, 4), 4, "rectangular texture reaches one by one");
+	expectSize(CalculateTextureMipLevelCount(1, 8), 4, "single-width texture reaches one by one");
+	expectSize(CalculateTextureMipLevelCount(0, 8), 0, "zero-width texture has no mip levels");
 }
 
 static void testPaddedCopyPreservesGuards()
@@ -197,6 +207,7 @@ int main()
 	testUncompressedLayouts();
 	testCompressedLayouts();
 	testInvalidLayouts();
+	testMipLevelCounts();
 	testPaddedCopyPreservesGuards();
 	testTwoWorkerOwnedBuffersAreIndependent();
 

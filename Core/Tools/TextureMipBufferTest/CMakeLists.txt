@@ -16,6 +16,12 @@ target_link_libraries(core_texture_mip_buffer_tests PRIVATE
     core_wwstub
 )
 
+set_target_properties(core_texture_mip_buffer_tests PROPERTIES
+    CXX_STANDARD 98
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+)
+
 if(MINGW)
     target_link_options(core_texture_mip_buffer_tests PRIVATE -mconsole)
 endif()

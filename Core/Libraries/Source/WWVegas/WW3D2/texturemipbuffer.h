@@ -24,6 +24,8 @@ struct TextureMipLayout
 bool CalculateTextureMipLayout(WW3DFormat format, unsigned width, unsigned height,
 	unsigned depth, TextureMipLayout& layout);
 
+unsigned CalculateTextureMipLevelCount(unsigned width, unsigned height);
+
 bool CopyTextureMipData(const unsigned char* source, const TextureMipLayout& sourceLayout,
 	unsigned char* destination, const TextureMipLayout& destinationLayout, unsigned depth);
 
