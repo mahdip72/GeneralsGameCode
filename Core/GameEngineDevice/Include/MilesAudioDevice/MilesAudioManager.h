@@ -205,6 +205,7 @@ class MilesAudioManager : public AudioManager
 		virtual Bool isObjectPlayingVoice( UnsignedInt objID ) const override;
 		Bool killLowestPrioritySoundImmediately( AudioEventRTS *event );
 		AudioEventRTS* findLowestPrioritySound( AudioEventRTS *event );
+		PlayingAudio *find3DChannelReplacement( AudioEventRTS *event );
 
 		virtual void adjustVolumeOfPlayingAudio(AsciiString eventName, Real newVolume) override;
 
@@ -331,6 +332,9 @@ class MilesAudioManager : public AudioManager
 		UnsignedInt m_num2DSamples;
 		UnsignedInt m_num3DSamples;
 		UnsignedInt m_numStreams;
+		UnsignedInt m_requested3DSamples;
+		UnsignedInt m_num3DChannelReplacements;
+		UnsignedInt m_num3DChannelRejections;
 
 #if defined(RTS_DEBUG)
 		typedef std::set<AsciiString> SetAsciiString;

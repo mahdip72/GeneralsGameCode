@@ -1,5 +1,6 @@
 set(GAMEENGINEDEVICE_SRC
     Include/MilesAudioDevice/MilesAudioManager.h
+    Include/MilesAudioDevice/AudioChannelPolicy.h
     Include/VideoDevice/Bink/BinkVideoPlayer.h
     Include/W3DDevice/Common/W3DConvert.h
     Include/W3DDevice/Common/W3DFunctionLexicon.h
@@ -73,6 +74,7 @@ set(GAMEENGINEDEVICE_SRC
     Include/W3DDevice/GameClient/W3DTreeBuffer.h
     Include/W3DDevice/GameClient/W3DVideoBuffer.h
     Include/W3DDevice/GameClient/W3DView.h
+    Include/W3DDevice/GameClient/TerrainDrawSizing.h
     Include/W3DDevice/GameClient/W3DScreenshot.h
     Include/W3DDevice/GameClient/W3DScreenshotCodec.h
 #    Include/W3DDevice/GameClient/W3DVolumetricShadow.h
@@ -93,6 +95,7 @@ set(GAMEENGINEDEVICE_SRC
     #Include/Win32Device/GameClient/Win32DIMouse.h
     Include/Win32Device/GameClient/Win32Mouse.h
     Source/MilesAudioDevice/MilesAudioManager.cpp
+    Source/MilesAudioDevice/AudioChannelPolicy.cpp
     Source/VideoDevice/Bink/BinkVideoPlayer.cpp
     Source/W3DDevice/Common/System/W3DFunctionLexicon.cpp
     Source/W3DDevice/Common/System/W3DRadar.cpp
@@ -177,6 +180,7 @@ set(GAMEENGINEDEVICE_SRC
     Source/W3DDevice/GameClient/W3DTreeBuffer.cpp
     Source/W3DDevice/GameClient/W3DVideoBuffer.cpp
     Source/W3DDevice/GameClient/W3DView.cpp
+    Source/W3DDevice/GameClient/TerrainDrawSizing.cpp
     Source/W3DDevice/GameClient/W3DScreenshot.cpp
     Source/W3DDevice/GameClient/W3DScreenshotCodec.cpp
     Source/W3DDevice/GameClient/stb_image_write_impl.cpp
