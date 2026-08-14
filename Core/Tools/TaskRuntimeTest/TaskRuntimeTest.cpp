@@ -12,11 +12,15 @@
 enum TaskRuntimeTestEvent
 {
 	TASK_RUNTIME_TEST_DESTRUCTOR_ENTRY = 1,
-	TASK_RUNTIME_TEST_WORKER_JOINED = 2
+	TASK_RUNTIME_TEST_WORKER_JOINED = 2,
+	TASK_RUNTIME_TEST_FAIL_STATE_ALLOCATION = 3,
+	TASK_RUNTIME_TEST_FAIL_THREAD_RESERVE = 4,
+	TASK_RUNTIME_TEST_FAIL_QUEUE_PUSH = 5
 };
 
 typedef void (*TaskRuntimeTestObserver)(unsigned event);
 extern "C" void rts_task_runtime_set_test_observer(TaskRuntimeTestObserver observer);
+extern "C" void rts_task_runtime_set_test_allocation_fault(unsigned event, unsigned occurrence);
 
 struct TaskRecord
 {
@@ -605,6 +609,146 @@ static int testRuntimeCanRestartAfterShutdown()
 	return 0;
 }
 
+static int testStateAllocationFailureLeavesRuntimeUsable()
+{
+	const char *testName = "testStateAllocationFailureLeavesRuntimeUsable";
+	TaskRecord rejectedRecord;
+	TaskRecord acceptedRecord;
+	rts::TaskRuntime runtime;
+	rts::Task *rejectedTask;
+	rts::Task *acceptedTask;
+	bool failedStart;
+	bool rejectedSubmission;
+	bool started;
+	bool acceptedSubmission;
+	int result = 0;
+
+	rts_task_runtime_set_test_allocation_fault(TASK_RUNTIME_TEST_FAIL_STATE_ALLOCATION, 1);
+	failedStart = runtime.start(1, 1);
+	rts_task_runtime_set_test_allocation_fault(0, 0);
+	result |= check(!failedStart, testName, "!runtime.start(1, 1) after state allocation fault");
+	result |= check(!runtime.isRunning(), testName, "!runtime.isRunning() after state allocation fault");
+	result |= check(runtime.workerCount() == 0, testName, "runtime.workerCount() == 0 after state allocation fault");
+	result |= check(runtime.pendingTaskCount() == 0, testName, "runtime.pendingTaskCount() == 0 after state allocation fault");
+	runtime.waitUntilIdle();
+
+	rejectedTask = new RecordingTask(&rejectedRecord, 0);
+	rejectedSubmission = runtime.trySubmit(rejectedTask);
+	if (!rejectedSubmission)
+	{
+		delete rejectedTask;
+	}
+	result |= check(!rejectedSubmission, testName, "!runtime.trySubmit(rejectedTask) without state");
+	result |= check(rejectedRecord.executions == 0, testName, "rejectedRecord.executions == 0");
+	result |= check(rejectedRecord.destructions == 1, testName, "rejectedRecord.destructions == 1");
+
+	started = runtime.start(1, 1);
+	acceptedTask = new RecordingTask(&acceptedRecord, 0);
+	acceptedSubmission = started && runtime.trySubmit(acceptedTask);
+	if (!acceptedSubmission)
+	{
+		delete acceptedTask;
+	}
+	runtime.shutdown();
+	result |= check(started, testName, "runtime.start(1, 1) after state allocation fault");
+	result |= check(acceptedSubmission, testName, "runtime.trySubmit(acceptedTask) after state allocation fault");
+	result |= check(acceptedRecord.executions == 1, testName, "acceptedRecord.executions == 1");
+	result |= check(acceptedRecord.destructions == 1, testName, "acceptedRecord.destructions == 1");
+	return result;
+}
+
+static int testThreadReserveFailureLeavesRuntimeRestartable()
+{
+	const char *testName = "testThreadReserveFailureLeavesRuntimeRestartable";
+	TaskRecord record;
+	rts::TaskRuntime runtime;
+	rts::Task *task;
+	bool failedStart;
+	bool started;
+	bool submitted;
+	int result = 0;
+
+	rts_task_runtime_set_test_allocation_fault(TASK_RUNTIME_TEST_FAIL_THREAD_RESERVE, 1);
+	failedStart = runtime.start(1, 1);
+	rts_task_runtime_set_test_allocation_fault(0, 0);
+	result |= check(!failedStart, testName, "!runtime.start(1, 1) after thread reserve fault");
+	result |= check(!runtime.isRunning(), testName, "!runtime.isRunning() after thread reserve fault");
+	result |= check(runtime.workerCount() == 0, testName, "runtime.workerCount() == 0 after thread reserve fault");
+	result |= check(runtime.pendingTaskCount() == 0, testName, "runtime.pendingTaskCount() == 0 after thread reserve fault");
+	runtime.waitUntilIdle();
+
+	started = runtime.start(1, 1);
+	task = new RecordingTask(&record, 0);
+	submitted = started && runtime.trySubmit(task);
+	if (!submitted)
+	{
+		delete task;
+	}
+	runtime.shutdown();
+	result |= check(started, testName, "runtime.start(1, 1) after thread reserve fault");
+	result |= check(submitted, testName, "runtime.trySubmit(task) after thread reserve fault");
+	result |= check(record.executions == 1, testName, "record.executions == 1");
+	result |= check(record.destructions == 1, testName, "record.destructions == 1");
+	return result;
+}
+
+static int testQueueAppendFailureRollsBackBatch()
+{
+	const char *testName = "testQueueAppendFailureRollsBackBatch";
+	Gate gate;
+	TaskRecord gateRecord;
+	TaskRecord rejectedRecords[3];
+	TaskRecord acceptedRecord;
+	rts::TaskRuntime runtime;
+	rts::Task *rejectedTasks[3];
+	rts::Task *acceptedTask;
+	bool rejected;
+	bool accepted;
+	unsigned pendingAfterFailure;
+	unsigned taskIndex;
+	int result = 0;
+
+	CHECK(testName, runtime.start(1, 3));
+	CHECK(testName, runtime.trySubmit(new GateTask(&gate, &gateRecord)));
+	gate.waitForEntry();
+	for (taskIndex = 0; taskIndex < 3; ++taskIndex)
+	{
+		rejectedTasks[taskIndex] = new RecordingTask(&rejectedRecords[taskIndex], 0);
+	}
+	rts_task_runtime_set_test_allocation_fault(TASK_RUNTIME_TEST_FAIL_QUEUE_PUSH, 2);
+	rejected = runtime.trySubmitBatch(rejectedTasks, 3);
+	rts_task_runtime_set_test_allocation_fault(0, 0);
+	pendingAfterFailure = runtime.pendingTaskCount();
+	acceptedTask = new RecordingTask(&acceptedRecord, 0);
+	accepted = runtime.trySubmit(acceptedTask);
+	gate.open();
+	runtime.shutdown();
+
+	if (!rejected && pendingAfterFailure == 0)
+	{
+		for (taskIndex = 0; taskIndex < 3; ++taskIndex)
+		{
+			delete rejectedTasks[taskIndex];
+		}
+	}
+	if (!accepted)
+	{
+		delete acceptedTask;
+	}
+	result |= check(!rejected, testName, "!runtime.trySubmitBatch(rejectedTasks, 3) after second queue push fault");
+	result |= check(pendingAfterFailure == 0, testName, "runtime.pendingTaskCount() == 0 after queue push fault");
+	result |= check(accepted, testName, "runtime.trySubmit(acceptedTask) after queue push fault");
+	result |= check(gateRecord.executions == 1, testName, "gateRecord.executions == 1");
+	result |= check(acceptedRecord.executions == 1, testName, "acceptedRecord.executions == 1");
+	result |= check(acceptedRecord.destructions == 1, testName, "acceptedRecord.destructions == 1");
+	for (taskIndex = 0; taskIndex < 3; ++taskIndex)
+	{
+		result |= check(rejectedRecords[taskIndex].executions == 0, testName, "rejectedRecords[taskIndex].executions == 0");
+		result |= check(rejectedRecords[taskIndex].destructions == 1, testName, "rejectedRecords[taskIndex].destructions == 1");
+	}
+	return result;
+}
+
 static int testDestructorDrainsAndJoins()
 {
 	const char *testName = "testDestructorDrainsAndJoins";
@@ -654,6 +798,9 @@ int main()
 	result |= testQueueBackpressure();
 	result |= testShutdownDrainsAcceptedTasks();
 	result |= testRuntimeCanRestartAfterShutdown();
+	result |= testStateAllocationFailureLeavesRuntimeUsable();
+	result |= testThreadReserveFailureLeavesRuntimeRestartable();
+	result |= testQueueAppendFailureRollsBackBatch();
 	result |= testDestructorDrainsAndJoins();
 	return result;
 }

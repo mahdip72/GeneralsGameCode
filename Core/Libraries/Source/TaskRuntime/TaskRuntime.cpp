@@ -1,6 +1,7 @@
 #include "Lib/TaskRuntime.h"
 
 #include <deque>
+#include <new>
 #include <vector>
 
 #if defined(_WIN32)
@@ -14,15 +15,26 @@
 enum TaskRuntimeTestEvent
 {
 	TASK_RUNTIME_TEST_DESTRUCTOR_ENTRY = 1,
-	TASK_RUNTIME_TEST_WORKER_JOINED = 2
+	TASK_RUNTIME_TEST_WORKER_JOINED = 2,
+	TASK_RUNTIME_TEST_FAIL_STATE_ALLOCATION = 3,
+	TASK_RUNTIME_TEST_FAIL_THREAD_RESERVE = 4,
+	TASK_RUNTIME_TEST_FAIL_QUEUE_PUSH = 5
 };
 
 typedef void (*TaskRuntimeTestObserver)(unsigned event);
 static TaskRuntimeTestObserver s_taskRuntimeTestObserver = 0;
+static unsigned s_taskRuntimeTestAllocationFault = 0;
+static unsigned s_taskRuntimeTestAllocationFaultOccurrence = 0;
 
 extern "C" void rts_task_runtime_set_test_observer(TaskRuntimeTestObserver observer)
 {
 	s_taskRuntimeTestObserver = observer;
+}
+
+extern "C" void rts_task_runtime_set_test_allocation_fault(unsigned event, unsigned occurrence)
+{
+	s_taskRuntimeTestAllocationFault = event;
+	s_taskRuntimeTestAllocationFaultOccurrence = occurrence;
 }
 
 static void notifyTaskRuntimeTestObserver(unsigned event)
@@ -31,6 +43,23 @@ static void notifyTaskRuntimeTestObserver(unsigned event)
 	{
 		s_taskRuntimeTestObserver(event);
 	}
+}
+
+static bool consumeTaskRuntimeTestAllocationFault(unsigned event)
+{
+	if (s_taskRuntimeTestAllocationFault != event || s_taskRuntimeTestAllocationFaultOccurrence == 0)
+	{
+		return false;
+	}
+
+	--s_taskRuntimeTestAllocationFaultOccurrence;
+	if (s_taskRuntimeTestAllocationFaultOccurrence != 0)
+	{
+		return false;
+	}
+
+	s_taskRuntimeTestAllocationFault = 0;
+	return true;
 }
 #endif
 
@@ -128,20 +157,45 @@ public:
 			return false;
 		}
 
-		m_threads.reserve(workerCount);
+		try
+		{
+#if defined(RTS_BUILD_CORE_EXTRAS)
+			if (consumeTaskRuntimeTestAllocationFault(TASK_RUNTIME_TEST_FAIL_THREAD_RESERVE))
+			{
+				throw std::bad_alloc();
+			}
+#endif
+			m_threads.reserve(workerCount);
 #if defined(_WIN32)
-		m_threadIds.reserve(workerCount);
+			m_threadIds.reserve(workerCount);
+		}
+		catch (...)
+		{
+			unlock();
+			return false;
+		}
 		ResetEvent(m_workAvailable);
 		SetEvent(m_idle);
+#else
+		}
+		catch (...)
+		{
+			unlock();
+			return false;
+		}
 #endif
 		m_queueCapacity = queueCapacity;
 		m_workerCount = workerCount;
 		m_activeTaskCount = 0;
-		m_accepting = true;
+		m_accepting = false;
 		m_stopping = false;
 
 		for (workerIndex = 0; workerIndex < workerCount; ++workerIndex)
 		{
+			if (!hasThreadStorageForOneMoreUnlocked())
+			{
+				break;
+			}
 #if defined(_WIN32)
 			unsigned threadId = 0;
 			HANDLE thread = (HANDLE)_beginthreadex(0, 0, workerEntry, this, 0, &threadId);
@@ -163,6 +217,7 @@ public:
 
 		if (workerIndex == workerCount)
 		{
+			m_accepting = true;
 			unlock();
 			return true;
 		}
@@ -204,9 +259,30 @@ public:
 
 			if (accepted)
 			{
-				for (taskIndex = 0; taskIndex < taskCount; ++taskIndex)
+				unsigned appendedTaskCount = 0;
+				try
 				{
-					m_tasks.push_back(tasks[taskIndex]);
+					for (taskIndex = 0; taskIndex < taskCount; ++taskIndex)
+					{
+#if defined(RTS_BUILD_CORE_EXTRAS)
+						if (consumeTaskRuntimeTestAllocationFault(TASK_RUNTIME_TEST_FAIL_QUEUE_PUSH))
+						{
+							throw std::bad_alloc();
+						}
+#endif
+						m_tasks.push_back(tasks[taskIndex]);
+						++appendedTaskCount;
+					}
+				}
+				catch (...)
+				{
+					while (appendedTaskCount != 0)
+					{
+						m_tasks.pop_back();
+						--appendedTaskCount;
+					}
+					unlock();
+					return false;
 				}
 #if defined(_WIN32)
 				ResetEvent(m_idle);
@@ -387,6 +463,21 @@ private:
 		return false;
 	}
 
+	bool hasThreadStorageForOneMoreUnlocked() const
+	{
+		if (m_threads.size() >= m_threads.capacity())
+		{
+			return false;
+		}
+#if defined(_WIN32)
+		if (m_threadIds.size() >= m_threadIds.capacity())
+		{
+			return false;
+		}
+#endif
+		return true;
+	}
+
 	void joinWorkers()
 	{
 		unsigned workerIndex;
@@ -526,7 +617,7 @@ private:
 #endif
 };
 
-TaskRuntime::TaskRuntime() : m_state(new State)
+TaskRuntime::TaskRuntime() : m_state(0)
 {
 }
 
@@ -535,47 +626,84 @@ TaskRuntime::~TaskRuntime()
 #if defined(RTS_BUILD_CORE_EXTRAS)
 	notifyTaskRuntimeTestObserver(TASK_RUNTIME_TEST_DESTRUCTOR_ENTRY);
 #endif
-	m_state->shutdown();
+	shutdown();
 	delete m_state;
 }
 
 bool TaskRuntime::start(unsigned workerCount, unsigned queueCapacity)
 {
+	if (m_state == 0)
+	{
+		State *state = 0;
+		try
+		{
+#if defined(RTS_BUILD_CORE_EXTRAS)
+			if (consumeTaskRuntimeTestAllocationFault(TASK_RUNTIME_TEST_FAIL_STATE_ALLOCATION))
+			{
+				throw std::bad_alloc();
+			}
+#endif
+			state = new (std::nothrow) State;
+		}
+		catch (...)
+		{
+			return false;
+		}
+		if (state == 0)
+		{
+			return false;
+		}
+		m_state = state;
+	}
 	return m_state->start(workerCount, queueCapacity);
 }
 
 bool TaskRuntime::trySubmit(Task *task)
 {
+	if (m_state == 0)
+	{
+		return false;
+	}
 	return m_state->trySubmitBatch(&task, 1);
 }
 
 bool TaskRuntime::trySubmitBatch(Task *const *tasks, unsigned taskCount)
 {
+	if (m_state == 0)
+	{
+		return false;
+	}
 	return m_state->trySubmitBatch(tasks, taskCount);
 }
 
 void TaskRuntime::waitUntilIdle()
 {
-	m_state->waitUntilIdle();
+	if (m_state != 0)
+	{
+		m_state->waitUntilIdle();
+	}
 }
 
 void TaskRuntime::shutdown()
 {
-	m_state->shutdown();
+	if (m_state != 0)
+	{
+		m_state->shutdown();
+	}
 }
 
 bool TaskRuntime::isRunning() const
 {
-	return m_state->isRunning();
+	return m_state != 0 && m_state->isRunning();
 }
 
 unsigned TaskRuntime::workerCount() const
 {
-	return m_state->workerCount();
+	return m_state != 0 ? m_state->workerCount() : 0;
 }
 
 unsigned TaskRuntime::pendingTaskCount() const
 {
-	return m_state->pendingTaskCount();
+	return m_state != 0 ? m_state->pendingTaskCount() : 0;
 }
 }

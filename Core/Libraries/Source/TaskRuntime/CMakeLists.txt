@@ -9,7 +9,13 @@ target_include_directories(core_task_runtime PUBLIC
 )
 
 target_link_libraries(core_task_runtime PRIVATE
-    core_config
+    $<LINK_ONLY:core_config>
+)
+
+set_target_properties(core_task_runtime PROPERTIES
+    CXX_STANDARD 98
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
 )
 
 if(RTS_BUILD_CORE_EXTRAS)
