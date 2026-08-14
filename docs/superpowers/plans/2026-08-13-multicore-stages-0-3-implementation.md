@@ -173,6 +173,8 @@ testDestructorDrainsAndJoins();
 
 Use a platform test gate for the backpressure test. The gate waits on a Win32 event or pthread condition and is opened explicitly by the test; it never uses a sleep to manufacture a race.
 
+For `testDestructorDrainsAndJoins`, Task 2 verifies the observable drain postcondition (one accepted held task executes and is destroyed before the helper can finish). A scheduler-proof assertion that the native join itself occurred is deferred to Task 3: without implementation-side instrumentation, a nonjoining destructor can be preempted after return and is indistinguishable from a joining destructor until the held task is released. Do not add a public API or a global allocation override to work around that boundary.
+
 - [ ] **Step 4: Add the empty runtime translation unit and run the test target before implementation**
 
 Create `TaskRuntime.cpp` containing only its include so the static target is valid but exposes no method definitions. Configure the debug build, then run:
@@ -227,6 +229,8 @@ Use `pthread_create`, `pthread_join`, `pthread_mutex_t`, and `pthread_cond_t`. W
 - [ ] **Step 5: Complete lifecycle methods**
 
 `waitUntilIdle()` blocks the owning caller until the queue and active count are zero. `shutdown()` is idempotent and leaves the object ready for a later `start()`. The destructor calls `shutdown()`. Do not allow a task to invoke `shutdown()` or wait on child work.
+
+Under a private test-build compile definition enabled only for `RTS_BUILD_CORE_EXTRAS`, add an implementation-local observer used by `TaskRuntimeTest.cpp` to record destructor entry and each successful native worker join. Keep it out of `TaskRuntime.h` and retail builds. Strengthen `testDestructorDrainsAndJoins` with that observer: it must see destructor entry before the test releases its held task, and exactly one successful join after the task is executed and destroyed. This is the only scheduler-proof way to distinguish a missing native join without changing the public runtime contract.
 
 - [ ] **Step 6: Run the TDD green checks**
 
