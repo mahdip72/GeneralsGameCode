@@ -951,6 +951,13 @@ void TextureLoader::Process_Foreground_Thumbnail(TextureLoadTaskClass *task)
 {
 	switch (task->Get_State()) {
 		case TextureLoadTaskClass::STATE_NONE:
+			// A full load can complete inline if worker admission fails after this
+			// thumbnail was queued. Do not replace that full texture afterward.
+			if (task->Peek_Texture()->Peek_D3D_Base_Texture())
+			{
+				task->Destroy();
+				break;
+			}
 			Load_Thumbnail(task->Peek_Texture());
 			FALLTHROUGH; // NOTE: fall-through is intentional
 

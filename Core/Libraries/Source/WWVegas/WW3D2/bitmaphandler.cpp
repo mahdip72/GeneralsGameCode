@@ -263,10 +263,48 @@ void BitmapHandlerClass::Copy_Image(
 		if (dest_surface_width==src_surface_width && dest_surface_height==src_surface_height) {
 			// Generate the next mip level while copying the current surface?
 			if (generate_mip_level) {
-				if (dest_surface_width==1) {
+				if (dest_surface_width==1 && dest_surface_height==1) {
 					unsigned b8g8r8a8=*(unsigned*)src_surface;
 					if (has_hsv_shift) Recolor(b8g8r8a8,hsv_shift);
 					*(unsigned*)dest_surface=b8g8r8a8;
+				}
+				else if (dest_surface_height==1) {
+					unsigned* dest_ptr=(unsigned*)dest_surface;
+					unsigned* src_ptr=(unsigned*)src_surface;
+					unsigned* mip_ptr=src_ptr;
+					for (unsigned x=0;x<dest_surface_width/2;++x) {
+						unsigned b8g8r8a8_0=src_ptr[0];
+						unsigned b8g8r8a8_1=src_ptr[1];
+						if (has_hsv_shift) {
+							Recolor(b8g8r8a8_0,hsv_shift);
+							Recolor(b8g8r8a8_1,hsv_shift);
+						}
+						*dest_ptr++=b8g8r8a8_0;
+						*dest_ptr++=b8g8r8a8_1;
+						*mip_ptr++=Combine_A8R8G8B8(
+							b8g8r8a8_0,b8g8r8a8_1,b8g8r8a8_0,b8g8r8a8_1);
+						src_ptr+=2;
+					}
+				}
+				else if (dest_surface_width==1) {
+					unsigned* dest_ptr=(unsigned*)dest_surface;
+					unsigned* src_ptr=(unsigned*)src_surface;
+					unsigned* mip_ptr=src_ptr;
+					for (unsigned y=0;y<dest_surface_height/2;++y) {
+						unsigned b8g8r8a8_0=src_ptr[0];
+						unsigned b8g8r8a8_1=src_ptr[src_surface_pitch];
+						if (has_hsv_shift) {
+							Recolor(b8g8r8a8_0,hsv_shift);
+							Recolor(b8g8r8a8_1,hsv_shift);
+						}
+						dest_ptr[0]=b8g8r8a8_0;
+						dest_ptr[dest_surface_pitch]=b8g8r8a8_1;
+						mip_ptr[0]=Combine_A8R8G8B8(
+							b8g8r8a8_0,b8g8r8a8_0,b8g8r8a8_1,b8g8r8a8_1);
+						dest_ptr+=2*dest_surface_pitch;
+						src_ptr+=2*src_surface_pitch;
+						mip_ptr+=src_surface_pitch;
+					}
 				}
 				else {
 					for (unsigned y=0;y<dest_surface_height/2;++y) {
@@ -358,7 +396,7 @@ void BitmapHandlerClass::Copy_Image(
 		// Generate the next mip level while copying the current surface?
 		if (generate_mip_level) {
 			WWASSERT(src_surface_format!=WW3D_FORMAT_P8);	// Paletted textures can't be mipmapped
-			if (dest_surface_width==1) {
+			if (dest_surface_width==1 && dest_surface_height==1) {
 				unsigned char* dest_ptr=dest_surface;
 				unsigned char* src_ptr=src_surface;
 				unsigned b8g8r8a8;
@@ -367,6 +405,52 @@ void BitmapHandlerClass::Copy_Image(
 					Recolor(b8g8r8a8,hsv_shift);
 				}
 				Write_B8G8R8A8(dest_ptr,dest_surface_format,b8g8r8a8);
+			}
+			else if (dest_surface_height==1) {
+				unsigned char* dest_ptr=dest_surface;
+				unsigned char* src_ptr=src_surface;
+				unsigned char* mip_ptr=src_surface;
+				for (unsigned x=0;x<dest_surface_width/2;++x) {
+					unsigned b8g8r8a8_0;
+					unsigned b8g8r8a8_1;
+					Read_B8G8R8A8(b8g8r8a8_0,src_ptr,src_surface_format,src_palette,src_palette_bpp);
+					Read_B8G8R8A8(b8g8r8a8_1,src_ptr+src_bpp,src_surface_format,src_palette,src_palette_bpp);
+					if (has_hsv_shift) {
+						Recolor(b8g8r8a8_0,hsv_shift);
+						Recolor(b8g8r8a8_1,hsv_shift);
+					}
+					Write_B8G8R8A8(dest_ptr,dest_surface_format,b8g8r8a8_0);
+					Write_B8G8R8A8(dest_ptr+dest_bpp,dest_surface_format,b8g8r8a8_1);
+					unsigned b8g8r8a8=Combine_A8R8G8B8(
+						b8g8r8a8_0,b8g8r8a8_1,b8g8r8a8_0,b8g8r8a8_1);
+					Write_B8G8R8A8(mip_ptr,src_surface_format,b8g8r8a8);
+					dest_ptr+=2*dest_bpp;
+					src_ptr+=2*src_bpp;
+					mip_ptr+=src_bpp;
+				}
+			}
+			else if (dest_surface_width==1) {
+				unsigned char* dest_ptr=dest_surface;
+				unsigned char* src_ptr=src_surface;
+				unsigned char* mip_ptr=src_surface;
+				for (unsigned y=0;y<dest_surface_height/2;++y) {
+					unsigned b8g8r8a8_0;
+					unsigned b8g8r8a8_1;
+					Read_B8G8R8A8(b8g8r8a8_0,src_ptr,src_surface_format,src_palette,src_palette_bpp);
+					Read_B8G8R8A8(b8g8r8a8_1,src_ptr+src_surface_pitch,src_surface_format,src_palette,src_palette_bpp);
+					if (has_hsv_shift) {
+						Recolor(b8g8r8a8_0,hsv_shift);
+						Recolor(b8g8r8a8_1,hsv_shift);
+					}
+					Write_B8G8R8A8(dest_ptr,dest_surface_format,b8g8r8a8_0);
+					Write_B8G8R8A8(dest_ptr+dest_surface_pitch,dest_surface_format,b8g8r8a8_1);
+					unsigned b8g8r8a8=Combine_A8R8G8B8(
+						b8g8r8a8_0,b8g8r8a8_0,b8g8r8a8_1,b8g8r8a8_1);
+					Write_B8G8R8A8(mip_ptr,src_surface_format,b8g8r8a8);
+					dest_ptr+=2*dest_surface_pitch;
+					src_ptr+=2*src_surface_pitch;
+					mip_ptr+=src_surface_pitch;
+				}
 			}
 			else {
 				for (unsigned y=0;y<dest_surface_height/2;++y) {

@@ -118,7 +118,8 @@ Add a D3D-free Core extra test for the mip-layout and upload-copy helper. It cov
 - padded destination pitches and volume slice pitches;
 - overflow and invalid-format rejection;
 - byte-identical serial and two-worker preparation copies;
-- exact source/destination guard bytes around every copy.
+- exact guard bytes around a padded multi-slice copy;
+- horizontal and vertical one-dimensional mip-tail pixel generation.
 
 Run tests and builds sequentially:
 

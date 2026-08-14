@@ -506,10 +506,27 @@ static int testQueuedTaskCanBeTakenWithoutTakingActiveTask()
 	bool activeTaken;
 	int result = 0;
 
-	CHECK(testName, runtime.start(1, 2));
-	CHECK(testName, runtime.trySubmit(activeTask));
+	if (!runtime.start(1, 2))
+	{
+		delete activeTask;
+		delete queuedTask;
+		return check(false, testName, "runtime starts");
+	}
+	if (!runtime.trySubmit(activeTask))
+	{
+		delete activeTask;
+		delete queuedTask;
+		runtime.shutdown();
+		return check(false, testName, "active task is accepted");
+	}
 	gate.waitForEntry();
-	CHECK(testName, runtime.trySubmit(queuedTask));
+	if (!runtime.trySubmit(queuedTask))
+	{
+		delete queuedTask;
+		gate.open();
+		runtime.shutdown();
+		return check(false, testName, "queued task is accepted");
+	}
 	queuedTaken = runtime.tryTake(queuedTask);
 	activeTaken = runtime.tryTake(activeTask);
 	if (queuedTaken)
