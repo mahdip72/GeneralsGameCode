@@ -25,6 +25,7 @@ bool CalculateTextureMipLayout(WW3DFormat format, unsigned width, unsigned heigh
 	unsigned depth, TextureMipLayout& layout);
 
 unsigned CalculateTextureMipLevelCount(unsigned width, unsigned height);
+void ReduceTextureMipDimensions(unsigned& width, unsigned& height);
 
 bool CopyTextureMipData(const unsigned char* source, const TextureMipLayout& sourceLayout,
 	unsigned char* destination, const TextureMipLayout& destinationLayout, unsigned depth);

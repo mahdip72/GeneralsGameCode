@@ -127,6 +127,12 @@ unsigned CalculateTextureMipLevelCount(unsigned width, unsigned height)
 	}
 }
 
+void ReduceTextureMipDimensions(unsigned& width, unsigned& height)
+{
+	width = width > 1 ? width >> 1 : 1;
+	height = height > 1 ? height >> 1 : 1;
+}
+
 bool CopyTextureMipData(const unsigned char* source, const TextureMipLayout& sourceLayout,
 	unsigned char* destination, const TextureMipLayout& destinationLayout, unsigned depth)
 {

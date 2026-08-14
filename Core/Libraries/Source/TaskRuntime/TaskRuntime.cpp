@@ -317,6 +317,49 @@ public:
 		return accepted;
 	}
 
+	bool tryTake(Task *task)
+	{
+		std::deque<Task *>::iterator taskIterator;
+		bool taken = false;
+
+		if (!syncReady() || task == 0)
+		{
+			return false;
+		}
+
+		lock();
+		if (m_accepting && !m_stopping)
+		{
+			for (taskIterator = m_tasks.begin(); taskIterator != m_tasks.end(); ++taskIterator)
+			{
+				if (*taskIterator == task)
+				{
+					m_tasks.erase(taskIterator);
+					taken = true;
+					break;
+				}
+			}
+		}
+
+		if (taken && m_tasks.empty())
+		{
+#if defined(_WIN32)
+			ResetEvent(m_workAvailable);
+			if (m_activeTaskCount == 0)
+			{
+				SetEvent(m_idle);
+			}
+#else
+			if (m_activeTaskCount == 0)
+			{
+				pthread_cond_broadcast(&m_idleCondition);
+			}
+#endif
+		}
+		unlock();
+		return taken;
+	}
+
 	void waitUntilIdle()
 	{
 		if (!syncReady())
@@ -713,6 +756,15 @@ bool TaskRuntime::trySubmitBatch(Task *const *tasks, unsigned taskCount)
 		return false;
 	}
 	return m_state->trySubmitBatch(tasks, taskCount);
+}
+
+bool TaskRuntime::tryTake(Task *task)
+{
+	if (m_state == 0)
+	{
+		return false;
+	}
+	return m_state->tryTake(task);
 }
 
 void TaskRuntime::waitUntilIdle()

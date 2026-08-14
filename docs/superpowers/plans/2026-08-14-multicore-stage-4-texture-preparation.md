@@ -109,7 +109,7 @@ Make `Load_Compressed_Mipmap()` and `Load_Uncompressed_Mipmap()` consume only st
 
 - [ ] **Step 6: Upload only on the render owner**
 
-In `End_Load()`, assert the DX8 owner, create the correct regular/cube/volume D3D resource, lock it, copy prepared rows/slices through `CopyTextureMipData`, unlock, apply, and release staged data. Add `Texture.Upload` profiling. On failure, release partial resources and apply the existing missing texture.
+In `End_Load()`, assert the DX8 owner, create supported regular/cube D3D resources, lock them, copy prepared rows through `CopyTextureMipData`, unlock, apply, and release staged data. Add `Texture.Upload` profiling. The shipped DDS volume accessor is a null stub, so reject that path through the existing missing-texture fallback instead of uploading undefined data. On failure, release partial resources and apply the existing missing texture.
 
 - [ ] **Step 7: Verify focused tests and both modern game builds**
 
@@ -137,7 +137,7 @@ git commit -m "refactor(texture): Stage mip data outside Direct3D"
 - Modify: `Core/Tools/TextureMipBufferTest/TextureMipBufferTest.cpp`
 
 **Interfaces:**
-- Consumes: `rts::TaskRuntime::start`, `trySubmit`, and `shutdown`.
+- Consumes: `rts::TaskRuntime::start`, `trySubmit`, `tryTake`, and `shutdown`.
 - Produces: private `TexturePrepareTask` whose `execute()` calls only worker-safe preparation and publishes completion.
 - Produces: synchronous owner fallback for runtime-start, allocation, and queue-admission failure.
 - Produces: joined shutdown followed by owner-thread completion draining.
@@ -156,7 +156,7 @@ Remove the legacy loader thread and background queue. Add a private `TaskRuntime
 
 - [ ] **Step 4: Implement bounded fallback and completion**
 
-If wrapper allocation or `trySubmit` fails, run `Load()` synchronously and finish the texture on the owner. Accepted workers publish the opaque texture task to `_ForegroundQueue`; owner processing calls `End_Load()` and recycles it. Preserve high-priority synchronous behavior.
+If wrapper allocation or `trySubmit` fails, run `Load()` synchronously and finish the texture on the owner. Accepted workers atomically publish completion and the opaque texture task to `_ForegroundQueue`; owner processing calls `End_Load()` and recycles it. A foreground request uses `tryTake` to reclaim queued work immediately, or waits only when that texture is already active.
 
 - [ ] **Step 5: Implement deterministic teardown**
 

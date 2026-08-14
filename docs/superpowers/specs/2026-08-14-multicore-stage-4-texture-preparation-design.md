@@ -64,8 +64,8 @@ The worker may not dereference `TextureBaseClass`, call DX8/D3D, consult engine 
 2. `Begin_Load()` selects compressed DDS or uncompressed TGA using the existing rules. On the owner thread it loads the complete source into an owned object, computes final metadata, and allocates tightly packed CPU output surfaces.
 3. A low-priority request is wrapped in one `rts::Task` and submitted to a private `TaskRuntime` with `min(2, logicalProcessorCount)` workers and a fixed capacity of eight queued tasks.
 4. The worker runs the existing DDS conversion or TGA conversion/mipmap algorithms against CPU output buffers. It records success and pushes the owning texture task back to the synchronized foreground queue.
-5. The render owner consumes the completion, creates the appropriate 2D, cube, or volume D3D texture, locks each destination surface, copies rows or slices from the CPU buffers, unlocks, applies the result, and releases all staged memory.
-6. High-priority requests keep the synchronous `Finish_Load()` path, using the same staged preparation and upload functions entirely on the owner thread.
+5. The render owner consumes the completion, creates the appropriate supported 2D or cube D3D texture, locks each destination surface, copies rows from the CPU buffers, unlocks, applies the result, and releases all staged memory.
+6. A foreground request takes its wrapper back when it is still queued and finishes preparation synchronously; if its worker is already active, it waits only for that texture. Upload remains entirely on the owner thread.
 
 The final pixel bytes are produced by the same `DDSFileClass` and `BitmapHandlerClass` conversion functions as before. Only their destination changes from a D3D lock pointer to an owned CPU buffer.
 
@@ -86,9 +86,9 @@ All multiplication is overflow-checked before allocation. Upload copies only mea
 
 - Regular 2D DDS and TGA textures use staged CPU mip buffers.
 - DDS cube textures use six independent face/mip buffers.
-- DDS volume textures use mip buffers with explicit row and slice pitches.
+- The layout/copy helper supports explicit volume row and slice pitches, but the shipped DDS backends return no volume-level source pointer. Stage 4 therefore rejects DDS volume preparation through the existing missing-texture path rather than uploading undefined bytes.
 - Unsupported or malformed sources retain the existing missing-texture behavior.
-- Existing uncompressed cube/volume behavior is not expanded; Stage 4 preserves the formats the loader already accepts.
+- Existing uncompressed cube/volume behavior is not expanded.
 
 ## Backpressure and failure behavior
 

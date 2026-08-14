@@ -96,10 +96,25 @@ static void testInvalidLayouts()
 
 static void testMipLevelCounts()
 {
+	unsigned width = 8;
+	unsigned height = 4;
+
 	expectSize(CalculateTextureMipLevelCount(1, 1), 1, "one by one has one mip level");
 	expectSize(CalculateTextureMipLevelCount(8, 4), 4, "rectangular texture reaches one by one");
 	expectSize(CalculateTextureMipLevelCount(1, 8), 4, "single-width texture reaches one by one");
 	expectSize(CalculateTextureMipLevelCount(0, 8), 0, "zero-width texture has no mip levels");
+	ReduceTextureMipDimensions(width, height);
+	expectSize(width, 4, "first rectangular reduction width");
+	expectSize(height, 2, "first rectangular reduction height");
+	ReduceTextureMipDimensions(width, height);
+	expectSize(width, 2, "second rectangular reduction width");
+	expectSize(height, 1, "second rectangular reduction clamps height");
+	ReduceTextureMipDimensions(width, height);
+	expectSize(width, 1, "rectangular reduction reaches one-wide");
+	expectSize(height, 1, "rectangular reduction remains one-high");
+	ReduceTextureMipDimensions(width, height);
+	expectSize(width, 1, "one-wide stays clamped");
+	expectSize(height, 1, "one-high stays clamped");
 }
 
 static void testPaddedCopyPreservesGuards()
@@ -149,20 +164,21 @@ class MipCopyTask : public rts::Task
 {
 public:
 	MipCopyTask(const unsigned char* source, const TextureMipLayout& sourceLayout,
-		TextureMipBuffer* destination)
-		: m_source(source), m_sourceLayout(sourceLayout), m_destination(destination)
+		TextureMipBuffer* destination, bool* copied)
+		: m_source(source), m_sourceLayout(sourceLayout), m_destination(destination), m_copied(copied)
 	{
 	}
 
 	virtual void execute()
 	{
-		m_destination->copyFrom(m_source, m_sourceLayout, 1);
+		*m_copied = m_destination->copyFrom(m_source, m_sourceLayout, 1);
 	}
 
 private:
 	const unsigned char* m_source;
 	TextureMipLayout m_sourceLayout;
 	TextureMipBuffer* m_destination;
+	bool* m_copied;
 };
 
 static void testTwoWorkerOwnedBuffersAreIndependent()
@@ -172,8 +188,12 @@ static void testTwoWorkerOwnedBuffersAreIndependent()
 	TextureMipLayout sourceLayout;
 	TextureMipBuffer destinationOne;
 	TextureMipBuffer destinationTwo;
+	TextureMipBuffer serialOne;
+	TextureMipBuffer serialTwo;
 	rts::TaskRuntime runtime;
 	rts::Task* tasks[2];
+	bool copiedOne = false;
+	bool copiedTwo = false;
 	unsigned i;
 
 	sourceLayout.rowPitch = 4;
@@ -185,20 +205,25 @@ static void testTwoWorkerOwnedBuffersAreIndependent()
 		"first owned buffer allocates");
 	expectTrue(destinationTwo.allocate(WW3D_FORMAT_R5G6B5, 2, 2, 1),
 		"second owned buffer allocates");
+	expectTrue(serialOne.allocate(WW3D_FORMAT_R5G6B5, 2, 2, 1) &&
+		serialOne.copyFrom(sourceOne, sourceLayout, 1), "first serial baseline prepares");
+	expectTrue(serialTwo.allocate(WW3D_FORMAT_R5G6B5, 2, 2, 1) &&
+		serialTwo.copyFrom(sourceTwo, sourceLayout, 1), "second serial baseline prepares");
 	expectTrue(runtime.start(2, 2), "two-worker runtime starts");
 
-	tasks[0] = new MipCopyTask(sourceOne, sourceLayout, &destinationOne);
-	tasks[1] = new MipCopyTask(sourceTwo, sourceLayout, &destinationTwo);
+	tasks[0] = new MipCopyTask(sourceOne, sourceLayout, &destinationOne, &copiedOne);
+	tasks[1] = new MipCopyTask(sourceTwo, sourceLayout, &destinationTwo, &copiedTwo);
 	expectTrue(runtime.trySubmitBatch(tasks, 2), "both owned buffer tasks are accepted atomically");
 	runtime.waitUntilIdle();
 	runtime.shutdown();
+	expectTrue(copiedOne && copiedTwo, "both worker copies report success");
 
 	for (i = 0; i < 8; ++i)
 	{
-		expectTrue(destinationOne.data()[i] == sourceOne[i],
-			"first worker output matches its source");
-		expectTrue(destinationTwo.data()[i] == sourceTwo[i],
-			"second worker output matches its source");
+		expectTrue(destinationOne.data()[i] == serialOne.data()[i],
+			"first worker output matches serial preparation");
+		expectTrue(destinationTwo.data()[i] == serialTwo.data()[i],
+			"second worker output matches serial preparation");
 	}
 }
 

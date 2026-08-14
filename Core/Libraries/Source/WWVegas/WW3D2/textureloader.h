@@ -50,6 +50,11 @@ class TextureLoadTaskClass;
 class DDSFileClass;
 class Targa;
 class TextureLoadTaskListClass;
+namespace rts
+{
+	class Task;
+	class TaskRuntime;
+}
 
 class TextureLoader
 {
@@ -164,9 +169,14 @@ class SynchronizedTextureLoadTaskListClass : public TextureLoadTaskListClass
 		// See comments above for description of member functions.
 		void									Push_Front	(TextureLoadTaskClass *task);
 		void									Push_Back	(TextureLoadTaskClass *task);
+		void									Publish_Completed(TextureLoadTaskClass *task);
+		void									Publish_Thumbnail(TextureLoadTaskClass *task, TextureLoadTaskClass *loadTask);
+		rts::Task*							Take_Prepare_Task(TextureLoadTaskClass *task,
+			rts::TaskRuntime& runtime, bool& wasSubmitted);
 		TextureLoadTaskClass *			Pop_Front	();
 		TextureLoadTaskClass *			Pop_Back		();
 		void									Remove		(TextureLoadTaskClass *task);
+		bool									Is_Empty		();
 
 	private:
 		FastCriticalSectionClass		CriticalSection;
@@ -242,7 +252,10 @@ class TextureLoadTaskClass : public TextureLoadTaskListNodeClass
 		void						Apply_Missing_Texture	();
 		bool						Begin_Async_Prepare		();
 		void						Complete_Async_Prepare	();
+		bool						Is_Async_Prepare_Complete();
 		void						Wait_For_Async_Prepare	();
+		void						Set_Prepare_Runtime_Task(void* task) { PrepareRuntimeTask = task; }
+		void*						Get_Prepare_Runtime_Task() const { return PrepareRuntimeTask; }
 
 	protected:
 		virtual bool			Begin_Compressed_Load	();
@@ -277,6 +290,7 @@ class TextureLoadTaskClass : public TextureLoadTaskListNodeClass
 		DDSFileClass*			DDSFile;
 		Targa*					TargaFile;
 		void*					PrepareCompleteEvent;
+		void*					PrepareRuntimeTask;
 		char					TargaPalette[256 * 4];
 		TextureMipBuffer		PreparedSurface[MIP_LEVELS_MAX];
 
