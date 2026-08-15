@@ -88,3 +88,22 @@ Both source-audit commands must produce no matches. Build both games with VC6 as
 For Tracy validation, use a profile build on a machine with at least two logical processors and load texture-heavy maps in both games. The capture should show up to two concurrent `Texture.Prepare` worker zones, with their corresponding `Texture.Upload` zones on the render owner thread. No worker may call Direct3D, dereference a live texture, wait for another worker, or access engine globals.
 
 Manually test Zero Hour and Generals by loading several skirmish maps and armies, moving the camera quickly across previously unseen terrain and units, returning to the shell, loading another map, alt-tabbing during map loading, and quitting during or immediately after a load. Verify that terrain, unit, effect, UI, and cube-map textures have no missing-texture placeholders, corruption, delayed permanent blur, device loss, hang, or access violation. The shipped DDS backends do not expose volume-level memory, so Stage 4 rejects DDS volume preparation through the existing missing-texture path instead of uploading uninitialized data; volume rendering is not claimed as supported. Also repeat screenshot capture and save/load smoke tests to guard the earlier multicore stages.
+
+# Miles completion callback checks
+
+The Miles EOS callbacks must only publish a fixed-size `{handle, type, generation}` record. They must not enter `TheAudio`, call Miles APIs, allocate, or take the audio-cache mutex. The owner-thread `MilesAudioManager::update()` drains one queue snapshot per frame; reset and shutdown close admission before unregistering callbacks and releasing handles, then clear queued generations. On overflow, the owner drains status-visible stopped handles and uses the compatibility fallback rather than waiting in a callback.
+
+Build and run the bounded queue test with Core extras enabled:
+
+```
+cmake --build build/win32-debug --config Debug --target core_miles_audio_completion_tests
+ctest --test-dir build/win32-debug -C Debug -R "^core_miles_audio_completion_tests$" --output-on-failure
+```
+
+The test covers FIFO delivery, concurrent producers, bounded overflow/recovery, snapshot draining, close/reopen admission, reset generations, and exact-once records. A source audit must show no callback-to-manager call:
+
+```
+rg -n "set(Sample|3DSample|Stream)Completed|TheAudio->notifyOfAudioCompletion" Core/GameEngineDevice/Source/MilesAudioDevice/MilesAudioManager.cpp
+```
+
+The callback declarations/definitions may match, but the callback bodies must contain only `tryPublish`; all `notifyOfAudioCompletion` calls must be on the owner-thread drain/recovery path. During manual gameplay, stress dense combat and rapid sound effects, reset/return to shell, alt-tab, and exit while sounds are active. The game must remain responsive and must not show the previous audio hang; no callback-thread stack may contain `ScopedMutex::Lock` or `AudioFileCache` operations.

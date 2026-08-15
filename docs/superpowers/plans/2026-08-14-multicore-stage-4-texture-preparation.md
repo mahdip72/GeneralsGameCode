@@ -16,6 +16,7 @@
 - Preserve C++98 and VC6 compatibility; do not use `std::thread`, lambdas, atomics, `std::nothrow` array new, or post-C++98 library APIs.
 - Preserve texture bytes by reusing `DDSFileClass` and `BitmapHandlerClass` conversion code.
 - The texture-preparation implementation must not modify simulation, pathfinding, networking, replay/save serialization, RNG, map parsing, or state layout. The post-Stage-4 replay epoch is a base-integration exception required to preserve retail replay determinism after PR #3; it must not change live-game AI behavior.
+- Miles audio completion callbacks must publish only fixed-size records to the bounded preallocated ring. They must not allocate, wait, call Miles APIs, or enter `MilesAudioManager`; the owner drains and recovers completions during `update()`.
 - Run heavy validation sequentially and only after focused tests are stable.
 - Stage 5 remains out of scope until the user manually accepts Stage 4.
 

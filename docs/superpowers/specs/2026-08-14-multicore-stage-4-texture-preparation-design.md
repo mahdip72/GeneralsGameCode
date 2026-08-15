@@ -6,6 +6,14 @@ Move texture pixel conversion and mip preparation onto a bounded two-worker runt
 
 Stage 4 is one independently testable rendering-asset slice. Its texture-preparation implementation does not change simulation, pathfinding, networking, replay serialization, random-number generation, map parsing, or save data. The later replay-epoch commit is a base-integration exception required after PR #3 changed deterministic skirmish decisions; it preserves retail and future replay behavior without changing live-game AI behavior. Stage 5 remains undefined until Stage 4 is manually accepted.
 
+The same PR also hardens the Miles completion boundary exposed by the new
+multicore work. Miles callbacks publish only a fixed-size, preallocated
+completion record. The owner thread drains records during `update()`, applies
+generation and duplicate checks, and performs overflow recovery. Callback code
+must not enter the audio manager, call Miles APIs, allocate, or wait on a
+mutex. Reset and shutdown close callback admission before handles are stopped
+or released.
+
 ## Existing architecture and problem
 
 `TextureLoader` currently has one legacy `LoaderThreadClass`. The render thread calls `Begin_Load()`, creates a D3D texture, locks all mip surfaces, and places a `TextureLoadTaskClass` on a background queue. The legacy worker dereferences the live `TextureBaseClass`, reads DDS or TGA data, and writes pixels directly through D3D lock pointers. The render thread later unlocks and applies the texture.
