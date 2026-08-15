@@ -256,6 +256,8 @@ class TextureLoadTaskClass : public TextureLoadTaskListNodeClass
 		void						Wait_For_Async_Prepare	();
 		void						Set_Prepare_Runtime_Task(void* task) { PrepareRuntimeTask = task; }
 		void*						Get_Prepare_Runtime_Task() const { return PrepareRuntimeTask; }
+		bool						Reserve_Prepare_Memory();
+		void						Release_Prepare_Memory_Reservation();
 
 	protected:
 		virtual bool			Begin_Compressed_Load	();
@@ -267,6 +269,7 @@ class TextureLoadTaskClass : public TextureLoadTaskListNodeClass
 		virtual bool			Create_D3D_Texture		();
 		virtual bool			Upload_Prepared_Surfaces();
 		virtual void			Release_Prepared_Surfaces();
+		virtual size_t			Get_Prepare_Memory_Byte_Count() const;
 
 		virtual void			Lock_Surfaces				();
 		virtual void			Unlock_Surfaces			();
@@ -291,6 +294,7 @@ class TextureLoadTaskClass : public TextureLoadTaskListNodeClass
 		Targa*					TargaFile;
 		void*					PrepareCompleteEvent;
 		void*					PrepareRuntimeTask;
+		size_t					PrepareMemoryReservation;
 		char					TargaPalette[256 * 4];
 		TextureMipBuffer		PreparedSurface[MIP_LEVELS_MAX];
 
@@ -320,6 +324,7 @@ protected:
 	virtual bool			Create_D3D_Texture		() override;
 	virtual bool			Upload_Prepared_Surfaces() override;
 	virtual void			Release_Prepared_Surfaces() override;
+	virtual size_t			Get_Prepare_Memory_Byte_Count() const override;
 //	virtual bool			Load_Uncompressed_Mipmap() override;
 
 	virtual void			Lock_Surfaces				() override;

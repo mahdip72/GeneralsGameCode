@@ -15,7 +15,7 @@
 - Workers must not dereference `TextureBaseClass`, call DX8/D3D, access `_TheFileFactory`, access thumbnail/global engine state, or wait for other tasks.
 - Preserve C++98 and VC6 compatibility; do not use `std::thread`, lambdas, atomics, `std::nothrow` array new, or post-C++98 library APIs.
 - Preserve texture bytes by reusing `DDSFileClass` and `BitmapHandlerClass` conversion code.
-- Do not modify simulation, pathfinding, networking, replay/save serialization, RNG, map parsing, or state layout.
+- The texture-preparation implementation must not modify simulation, pathfinding, networking, replay/save serialization, RNG, map parsing, or state layout. The post-Stage-4 replay epoch is a base-integration exception required to preserve retail replay determinism after PR #3; it must not change live-game AI behavior.
 - Run heavy validation sequentially and only after focused tests are stable.
 - Stage 5 remains out of scope until the user manually accepts Stage 4.
 
@@ -139,7 +139,7 @@ git commit -m "refactor(texture): Stage mip data outside Direct3D"
 **Interfaces:**
 - Consumes: `rts::TaskRuntime::start`, `trySubmit`, `tryTake`, and `shutdown`.
 - Produces: private `TexturePrepareTask` whose `execute()` calls only worker-safe preparation and publishes completion.
-- Produces: synchronous owner fallback for runtime-start, allocation, and queue-admission failure.
+- Produces: synchronous owner fallback for runtime-start, allocation, queue-admission, and 64 MiB retained-staging admission failure.
 - Produces: joined shutdown followed by owner-thread completion draining.
 
 - [ ] **Step 1: Add failing runtime ownership tests**
@@ -152,11 +152,11 @@ Verify the test fails because the texture preparation service behavior is absent
 
 - [ ] **Step 3: Replace `LoaderThreadClass` execution**
 
-Remove the legacy loader thread and background queue. Add a private `TaskRuntime` service started with `min(2, logicalProcessorCount)` workers and queue capacity eight. Wrap each low-priority prepared texture in one `TexturePrepareTask`.
+Remove the legacy loader thread and background queue. Add a private `TaskRuntime` service started with `min(2, logicalProcessorCount)` workers and queue capacity eight. Wrap each low-priority prepared texture in one `TexturePrepareTask`. Before submission, reserve its exact retained DDS/TGA source, prepared mip buffers, and possible TGA conversion scratch against a 64 MiB owner-managed asynchronous budget; include all six cube faces.
 
 - [ ] **Step 4: Implement bounded fallback and completion**
 
-If wrapper allocation or `trySubmit` fails, run `Load()` synchronously and finish the texture on the owner. Accepted workers atomically publish completion and the opaque texture task to `_ForegroundQueue`; owner processing calls `End_Load()` and recycles it. A foreground request uses `tryTake` to reclaim queued work immediately, or waits only when that texture is already active.
+If wrapper allocation, byte-budget reservation, or `trySubmit` fails, run `Load()` synchronously and finish the texture on the owner. Accepted workers atomically publish completion and the opaque texture task to `_ForegroundQueue`; owner processing calls `End_Load()` and recycles it. A foreground request uses `tryTake` to reclaim queued work immediately, or waits only when that texture is already active.
 
 - [ ] **Step 5: Implement deterministic teardown**
 

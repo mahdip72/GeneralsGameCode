@@ -32,6 +32,7 @@
 DDSFileClass::DDSFileClass(const char* name,unsigned reduction_factor)
 	:
 	DDSMemory(nullptr),
+	DDSMemorySize(0),
 	Width(0),
 	Height(0),
 	Depth(0),
@@ -296,6 +297,7 @@ bool DDSFileClass::Load()
 	{
 		// Allocate memory for the data excluding the headers
 		DDSMemory=MSGW3DNEWARRAY("DDSMemory") unsigned char[size];
+		DDSMemorySize=size;
 		// Read data
 		unsigned read_size=file->Read(DDSMemory,size);
 		// Verify we got all the data

@@ -174,6 +174,33 @@ bool CopyTextureMipData(const unsigned char* source, const TextureMipLayout& sou
 	return true;
 }
 
+TexturePrepareMemoryBudget::TexturePrepareMemoryBudget(size_t limit)
+	: m_limit(limit), m_used(0)
+{
+}
+
+bool TexturePrepareMemoryBudget::tryReserve(size_t bytes)
+{
+	if (bytes > m_limit || m_used > m_limit - bytes)
+	{
+		return false;
+	}
+
+	m_used += bytes;
+	return true;
+}
+
+bool TexturePrepareMemoryBudget::release(size_t bytes)
+{
+	if (bytes > m_used)
+	{
+		return false;
+	}
+
+	m_used -= bytes;
+	return true;
+}
+
 TextureMipBuffer::TextureMipBuffer()
 	: m_data(0)
 {

@@ -46,13 +46,11 @@
 #include "Common/RandomValue.h"
 #include "Common/CRCDebug.h"
 #include "Common/OptionPreferences.h"
+#include "Common/SkirmishAIReplayEpoch.h"
 #include "Common/version.h"
 
 constexpr const char s_genrep[] = "GENREP";
 constexpr const UnsignedInt replayBufferBytes = 8192;
-// The build-time field is variable length and ignored by compatibility checks, so a suffix records
-// deterministic AI behavior without changing the retail replay header layout.
-static const WideChar s_skirmishAILivenessReplayMarker[] = L" [SkirmishAILiveness=1]";
 
 Int REPLAY_CRC_INTERVAL = 100;
 
@@ -85,11 +83,6 @@ static void writeAtOffset(File* file, Int offset, const void* data, Int dataSize
 	MAYBE_UNUSED Int res = file->seek(fileSize, File::seekMode::START);
 	(void)res;
 	DEBUG_ASSERTCRASH(res == fileSize, ("Could not seek to end of file!"));
-}
-
-static Bool replayVersionUsesSkirmishAILivenessRecovery(const UnicodeString& versionTimeString)
-{
-	return versionTimeString.endsWith(s_skirmishAILivenessReplayMarker);
 }
 
 #if defined(RTS_DEBUG)
@@ -582,7 +575,9 @@ void RecorderClass::startRecording(GameDifficulty diff, Int originalGameMode, In
 	// write out version info
 	UnicodeString versionString = TheVersion->getUnicodeVersion();
 	UnicodeString versionTimeString = TheVersion->getUnicodeBuildTime();
-	versionTimeString.concat(s_skirmishAILivenessReplayMarker);
+	// The build-time field is variable length and ignored by compatibility checks, so a suffix records
+	// deterministic AI behavior without changing the retail replay header layout.
+	MarkReplayVersionForSkirmishAILivenessRecovery(versionTimeString);
 	UnsignedInt versionNumber = TheVersion->getVersionNumber();
 	m_file->writeFormat(L"%s", versionString.str());
 	m_file->writeChar(L"\0");
@@ -1107,12 +1102,16 @@ Bool RecorderClass::playbackFile(AsciiString filename)
 	{
 		return FALSE;
 	}
-	m_replayUsesSkirmishAILivenessRecovery = replayVersionUsesSkirmishAILivenessRecovery(header.versionTimeString);
+	m_replayUsesSkirmishAILivenessRecovery = ReplayVersionUsesSkirmishAILivenessRecovery(header.versionTimeString);
+	if (!m_replayUsesSkirmishAILivenessRecovery)
+	{
+		DEBUG_LOG(("RecorderClass::playbackFile() - unmarked replay uses legacy skirmish AI behavior"));
+	}
 
 #ifdef DEBUG_CRASHING
 	Bool versionStringDiff = header.versionString != TheVersion->getUnicodeVersion();
 	UnicodeString markedVersionTimeString = TheVersion->getUnicodeBuildTime();
-	markedVersionTimeString.concat(s_skirmishAILivenessReplayMarker);
+	MarkReplayVersionForSkirmishAILivenessRecovery(markedVersionTimeString);
 	Bool versionTimeStringDiff = header.versionTimeString != TheVersion->getUnicodeBuildTime()
 		&& header.versionTimeString != markedVersionTimeString;
 	Bool versionNumberDiff = header.versionNumber != TheVersion->getVersionNumber();

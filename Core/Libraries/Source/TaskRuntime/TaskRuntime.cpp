@@ -243,7 +243,7 @@ public:
 		return false;
 	}
 
-	bool trySubmitBatch(Task *const *tasks, unsigned taskCount)
+	bool trySubmitBatch(Task *const *tasks, unsigned taskCount, bool submitFront)
 	{
 		unsigned taskIndex;
 		unsigned previousTaskIndex;
@@ -293,7 +293,14 @@ public:
 							throw std::bad_alloc();
 						}
 #endif
-						m_tasks.push_back(tasks[taskIndex]);
+						if (submitFront)
+						{
+							m_tasks.push_front(tasks[taskIndex]);
+						}
+						else
+						{
+							m_tasks.push_back(tasks[taskIndex]);
+						}
 						++appendedTaskCount;
 					}
 				}
@@ -301,7 +308,14 @@ public:
 				{
 					while (appendedTaskCount != 0)
 					{
-						m_tasks.pop_back();
+						if (submitFront)
+						{
+							m_tasks.pop_front();
+						}
+						else
+						{
+							m_tasks.pop_back();
+						}
 						--appendedTaskCount;
 					}
 					unlock();
@@ -746,7 +760,16 @@ bool TaskRuntime::trySubmit(Task *task)
 	{
 		return false;
 	}
-	return m_state->trySubmitBatch(&task, 1);
+	return m_state->trySubmitBatch(&task, 1, false);
+}
+
+bool TaskRuntime::trySubmitFront(Task *task)
+{
+	if (m_state == 0)
+	{
+		return false;
+	}
+	return m_state->trySubmitBatch(&task, 1, true);
 }
 
 bool TaskRuntime::trySubmitBatch(Task *const *tasks, unsigned taskCount)
@@ -755,7 +778,7 @@ bool TaskRuntime::trySubmitBatch(Task *const *tasks, unsigned taskCount)
 	{
 		return false;
 	}
-	return m_state->trySubmitBatch(tasks, taskCount);
+	return m_state->trySubmitBatch(tasks, taskCount, false);
 }
 
 bool TaskRuntime::tryTake(Task *task)

@@ -15,9 +15,11 @@
 #include "GameNetwork/GameSpy/ThreadUtils.h"
 #include "Common/FrameRateLimit.h"
 #include "Common/GameMemory.h"
+#include "Common/SkirmishAIReplayEpoch.h"
 #include "GameLogic/SkirmishAILiveness.h"
 
 #include <stdio.h>
+#include <string.h>
 #include <windows.h>
 
 
@@ -395,9 +397,40 @@ static void TestSkirmishAILivenessPolicies()
 	CHECK(!IsUsableSupplyCenter(true, true));
 }
 
-int main()
+static void TestSkirmishAIReplayEpoch()
+{
+	UnicodeString unmarked = L"Aug 14 2026 21:00:00";
+	CHECK(!ReplayVersionUsesSkirmishAILivenessRecovery(unmarked));
+
+	UnicodeString marked = unmarked;
+	MarkReplayVersionForSkirmishAILivenessRecovery(marked);
+	CHECK(marked.compare(L"Aug 14 2026 21:00:00 [SkirmishAILiveness=1]") == 0);
+	CHECK(ReplayVersionUsesSkirmishAILivenessRecovery(marked));
+
+	UnicodeString parsedHeader = marked;
+	CHECK(ReplayVersionUsesSkirmishAILivenessRecovery(parsedHeader));
+
+	UnicodeString unrelatedSuffix = L"Aug 14 2026 21:00:00 [SkirmishAILiveness=2]";
+	CHECK(!ReplayVersionUsesSkirmishAILivenessRecovery(unrelatedSuffix));
+}
+
+int main(int argc, char **argv)
 {
 	initMemoryManager();
+	if (argc == 2 && strcmp(argv[1], "--skirmish-ai-replay-epoch") == 0)
+	{
+		TestSkirmishAILivenessPolicies();
+		TestSkirmishAIReplayEpoch();
+		if (s_failures != 0)
+		{
+			printf("%d skirmish AI replay epoch test(s) failed.\n", s_failures);
+			shutdownMemoryManager();
+			return 1;
+		}
+		printf("All skirmish AI replay epoch tests passed.\n");
+		shutdownMemoryManager();
+		return 0;
+	}
 
 	TestNetworkValidation();
 	TestPacketRouterFallbackSelection();

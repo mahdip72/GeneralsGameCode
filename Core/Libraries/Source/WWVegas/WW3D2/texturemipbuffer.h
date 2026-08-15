@@ -30,6 +30,20 @@ void ReduceTextureMipDimensions(unsigned& width, unsigned& height);
 bool CopyTextureMipData(const unsigned char* source, const TextureMipLayout& sourceLayout,
 	unsigned char* destination, const TextureMipLayout& destinationLayout, unsigned depth);
 
+class TexturePrepareMemoryBudget
+{
+public:
+	explicit TexturePrepareMemoryBudget(size_t limit);
+
+	bool tryReserve(size_t bytes);
+	bool release(size_t bytes);
+	size_t used() const { return m_used; }
+
+private:
+	size_t m_limit;
+	size_t m_used;
+};
+
 class TextureMipBuffer
 {
 public:

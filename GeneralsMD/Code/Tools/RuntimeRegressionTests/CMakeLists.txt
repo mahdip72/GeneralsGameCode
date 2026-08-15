@@ -21,3 +21,6 @@ target_link_libraries(z_runtime_regression_tests PRIVATE
 	z_gameenginedevice
 	zi_always
 )
+
+add_test(NAME z_skirmish_ai_replay_epoch_tests COMMAND z_runtime_regression_tests --skirmish-ai-replay-epoch)
+set_tests_properties(z_skirmish_ai_replay_epoch_tests PROPERTIES TIMEOUT 30)

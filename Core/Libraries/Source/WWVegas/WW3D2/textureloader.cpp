@@ -254,6 +254,7 @@ static TextureLoadTaskListClass					_VolTexLoadFreeList;
 
 
 static rts::TaskRuntime _TexturePrepareRuntime;
+static TexturePrepareMemoryBudget _TexturePrepareMemoryBudget(64u * 1024u * 1024u);
 
 class TexturePrepareRuntimeTask : public rts::Task
 {
@@ -1015,20 +1016,24 @@ void TextureLoader::Begin_Load_And_Queue(TextureLoadTaskClass *task)
 	WWASSERT(Is_DX8_Thread());
 
 	if (task->Begin_Load()) {
+		const bool retainForRuntime = task->Reserve_Prepare_Memory();
 		TexturePrepareRuntimeTask *runtimeTask = nullptr;
-		try
+		if (retainForRuntime)
 		{
-			runtimeTask = new TexturePrepareRuntimeTask(task);
-		}
-		catch (...)
-		{
-			runtimeTask = nullptr;
+			try
+			{
+				runtimeTask = new TexturePrepareRuntimeTask(task);
+			}
+			catch (...)
+			{
+				runtimeTask = nullptr;
+			}
 		}
 
 		if (runtimeTask != nullptr && task->Begin_Async_Prepare())
 		{
 			task->Set_Prepare_Runtime_Task(runtimeTask);
-			if (_TexturePrepareRuntime.trySubmit(runtimeTask))
+			if (_TexturePrepareRuntime.trySubmitFront(runtimeTask))
 			{
 				return;
 			}
@@ -1090,6 +1095,7 @@ TextureLoadTaskClass::TextureLoadTaskClass()
 	TargaFile		(nullptr),
 	PrepareCompleteEvent(nullptr),
 	PrepareRuntimeTask(nullptr),
+	PrepareMemoryReservation(0),
 	Type				(TASK_NONE),
 	Priority			(PRIORITY_LOW),
 	State				(STATE_NONE),
@@ -1249,6 +1255,7 @@ void TextureLoadTaskClass::Init(TextureBaseClass* tc, TaskType type, PriorityTyp
 	DDSFile			= nullptr;
 	TargaFile		= nullptr;
 	PrepareRuntimeTask = nullptr;
+	WWASSERT(PrepareMemoryReservation == 0);
 	if (PrepareCompleteEvent != nullptr)
 	{
 		ResetEvent((HANDLE)PrepareCompleteEvent);
@@ -1290,6 +1297,7 @@ void TextureLoadTaskClass::Deinit()
 	delete TargaFile;
 	TargaFile = nullptr;
 	PrepareRuntimeTask = nullptr;
+	Release_Prepare_Memory_Reservation();
 
 	for (int i = 0; i < MIP_LEVELS_MAX; ++i) {
 		WWASSERT(LockedSurfacePtr[i] == nullptr);
@@ -1339,6 +1347,98 @@ bool TextureLoadTaskClass::Begin_Load()
 	State = STATE_LOAD_BEGUN;
 
 	return true;
+}
+
+static bool Add_Prepare_Memory_Bytes(size_t& total, size_t bytes)
+{
+	if (bytes > (size_t)-1 - total)
+	{
+		return false;
+	}
+	total += bytes;
+	return true;
+}
+
+size_t TextureLoadTaskClass::Get_Prepare_Memory_Byte_Count() const
+{
+	size_t total = 0;
+	unsigned int level;
+	for (level = 0; level < MIP_LEVELS_MAX; ++level)
+	{
+		if (!Add_Prepare_Memory_Bytes(total, PreparedSurface[level].layout().dataSize))
+		{
+			return (size_t)-1;
+		}
+	}
+
+	if (DDSFile != nullptr)
+	{
+		if (!Add_Prepare_Memory_Bytes(total, DDSFile->Get_Retained_Memory_Size()))
+		{
+			return (size_t)-1;
+		}
+	}
+	else if (TargaFile != nullptr)
+	{
+		size_t sourceBytes = (size_t)TargaFile->Header.Width;
+		if (TargaFile->Header.Height != 0 &&
+			sourceBytes > (size_t)-1 / (size_t)TargaFile->Header.Height)
+		{
+			return (size_t)-1;
+		}
+		sourceBytes *= (size_t)TargaFile->Header.Height;
+		if (SourceBytesPerPixel != 0 && sourceBytes > (size_t)-1 / SourceBytesPerPixel)
+		{
+			return (size_t)-1;
+		}
+		sourceBytes *= SourceBytesPerPixel;
+		if (!Add_Prepare_Memory_Bytes(total, sourceBytes))
+		{
+			return (size_t)-1;
+		}
+
+		// TGA conversion can temporarily retain a full A8R8G8B8 surface while
+		// the source image and prepared mip chain remain live on the worker.
+		size_t conversionBytes = (size_t)Width;
+		if (Height != 0 && conversionBytes > (size_t)-1 / Height)
+		{
+			return (size_t)-1;
+		}
+		conversionBytes *= Height;
+		if (conversionBytes > (size_t)-1 / 4)
+		{
+			return (size_t)-1;
+		}
+		if (!Add_Prepare_Memory_Bytes(total, conversionBytes * 4))
+		{
+			return (size_t)-1;
+		}
+	}
+
+	return total;
+}
+
+bool TextureLoadTaskClass::Reserve_Prepare_Memory()
+{
+	WWASSERT(PrepareMemoryReservation == 0);
+	const size_t bytes = Get_Prepare_Memory_Byte_Count();
+	if (bytes == 0 || !_TexturePrepareMemoryBudget.tryReserve(bytes))
+	{
+		return false;
+	}
+	PrepareMemoryReservation = bytes;
+	return true;
+}
+
+void TextureLoadTaskClass::Release_Prepare_Memory_Reservation()
+{
+	if (PrepareMemoryReservation != 0)
+	{
+		const bool released = _TexturePrepareMemoryBudget.release(PrepareMemoryReservation);
+		WWASSERT(released);
+		(void)released;
+		PrepareMemoryReservation = 0;
+	}
 }
 
 
@@ -1885,6 +1985,7 @@ void TextureLoadTaskClass::Release_Prepared_Surfaces()
 	{
 		PreparedSurface[level].reset();
 	}
+	Release_Prepare_Memory_Reservation();
 }
 
 
@@ -2196,6 +2297,8 @@ void CubeTextureLoadTaskClass::Init(TextureBaseClass* tc, TaskType type, Priorit
 	LoadSucceeded	= false;
 	DDSFile			= nullptr;
 	TargaFile		= nullptr;
+	PrepareRuntimeTask = nullptr;
+	WWASSERT(PrepareMemoryReservation == 0);
 	strlcpy(Filename, Texture->Get_Full_Path().str(), ARRAY_SIZE(Filename));
 
 
@@ -2235,6 +2338,8 @@ void CubeTextureLoadTaskClass::Deinit()
 	DDSFile = nullptr;
 	delete TargaFile;
 	TargaFile = nullptr;
+	PrepareRuntimeTask = nullptr;
+	Release_Prepare_Memory_Reservation();
 
 	for (int f=0; f<6; f++)
 	{
@@ -2448,6 +2553,34 @@ bool CubeTextureLoadTaskClass::Allocate_Prepared_Surfaces()
 	return true;
 }
 
+size_t CubeTextureLoadTaskClass::Get_Prepare_Memory_Byte_Count() const
+{
+	size_t total = 0;
+	unsigned int face;
+	unsigned int level;
+	for (face = 0; face < 6; ++face)
+	{
+		for (level = 0; level < MIP_LEVELS_MAX; ++level)
+		{
+			if (!Add_Prepare_Memory_Bytes(total,
+				PreparedCubeSurface[face][level].layout().dataSize))
+			{
+				return (size_t)-1;
+			}
+		}
+	}
+
+	if (DDSFile != nullptr)
+	{
+		if (!Add_Prepare_Memory_Bytes(total, DDSFile->Get_Retained_Memory_Size()))
+		{
+			return (size_t)-1;
+		}
+	}
+
+	return total;
+}
+
 
 bool CubeTextureLoadTaskClass::Create_D3D_Texture()
 {
@@ -2497,6 +2630,7 @@ void CubeTextureLoadTaskClass::Release_Prepared_Surfaces()
 			PreparedCubeSurface[face][level].reset();
 		}
 	}
+	Release_Prepare_Memory_Reservation();
 }
 
 unsigned char*	CubeTextureLoadTaskClass::Get_Locked_CubeMap_Surface_Pointer(unsigned int face, unsigned int level)

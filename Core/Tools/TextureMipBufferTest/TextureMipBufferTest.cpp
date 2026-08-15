@@ -511,6 +511,26 @@ static void testTwoWorkerOwnedBuffersAreIndependent()
 	}
 }
 
+static void testPrepareMemoryBudget()
+{
+	TexturePrepareMemoryBudget budget(64);
+
+	expectSize(budget.used(), 0, "prepare memory budget starts empty");
+	expectTrue(budget.tryReserve(24), "prepare memory budget accepts first reservation");
+	expectTrue(budget.tryReserve(40), "prepare memory budget accepts exact limit");
+	expectSize(budget.used(), 64, "prepare memory budget tracks retained bytes");
+	expectTrue(!budget.tryReserve(1), "prepare memory budget rejects over limit");
+	expectSize(budget.used(), 64, "rejected reservation does not change retained bytes");
+	expectTrue(budget.release(24), "prepare memory budget releases valid reservation");
+	expectSize(budget.used(), 40, "prepare memory budget releases exact reservation");
+	expectTrue(!budget.release(41), "prepare memory budget rejects over-release");
+	expectSize(budget.used(), 40, "over-release rejection preserves retained bytes");
+	expectTrue(!budget.tryReserve((size_t)-1), "prepare memory budget rejects overflowing reservation");
+	expectSize(budget.used(), 40, "overflow rejection preserves retained bytes");
+	expectTrue(budget.release(40), "prepare memory budget releases final reservation");
+	expectSize(budget.used(), 0, "prepare memory budget returns to empty");
+}
+
 static void testRejectedPreparationRunsOnCaller()
 {
 	static const unsigned char activeSource[8] = { 31, 32, 33, 34, 35, 36, 37, 38 };
@@ -605,6 +625,7 @@ int main()
 	testUncompressedLayouts();
 	testCompressedLayouts();
 	testInvalidLayouts();
+	testPrepareMemoryBudget();
 	testMipLevelCounts();
 	testPaddedCopyPreservesGuards();
 	testHorizontalMipTailGeneratesPixels();

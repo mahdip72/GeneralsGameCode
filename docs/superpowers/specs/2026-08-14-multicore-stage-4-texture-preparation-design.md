@@ -4,7 +4,7 @@
 
 Move texture pixel conversion and mip preparation onto a bounded two-worker runtime while keeping every Direct3D operation, texture reference change, and engine-global access on the render-owner thread.
 
-Stage 4 is one independently testable rendering-asset slice. It does not change simulation, pathfinding, networking, replay serialization, random-number generation, map parsing, or save data. Stage 5 remains undefined until Stage 4 is manually accepted.
+Stage 4 is one independently testable rendering-asset slice. Its texture-preparation implementation does not change simulation, pathfinding, networking, replay serialization, random-number generation, map parsing, or save data. The later replay-epoch commit is a base-integration exception required after PR #3 changed deterministic skirmish decisions; it preserves retail and future replay behavior without changing live-game AI behavior. Stage 5 remains undefined until Stage 4 is manually accepted.
 
 ## Existing architecture and problem
 
@@ -62,7 +62,7 @@ The worker may not dereference `TextureBaseClass`, call DX8/D3D, consult engine 
 
 1. The render owner creates or reuses a `TextureLoadTaskClass` and copies all immutable fields needed by preparation.
 2. `Begin_Load()` selects compressed DDS or uncompressed TGA using the existing rules. On the owner thread it loads the complete source into an owned object, computes final metadata, and allocates tightly packed CPU output surfaces.
-3. A low-priority request is wrapped in one `rts::Task` and submitted to a private `TaskRuntime` with `min(2, logicalProcessorCount)` workers and a fixed capacity of eight queued tasks.
+3. A low-priority request is wrapped in one `rts::Task` and front-submitted to a private `TaskRuntime` with `min(2, logicalProcessorCount)` workers and a fixed capacity of eight queued tasks. Newest-first preparation preserves the legacy loader's visual-priority policy. Owner-managed admission also caps retained asynchronous source, prepared mip, and TGA conversion memory at 64 MiB; DDS accounting uses the exact loaded payload and cube accounting includes all six faces.
 4. The worker runs the existing DDS conversion or TGA conversion/mipmap algorithms against CPU output buffers. It records success and pushes the owning texture task back to the synchronized foreground queue.
 5. The render owner consumes the completion, creates the appropriate supported 2D or cube D3D texture, locks each destination surface, copies rows from the CPU buffers, unlocks, applies the result, and releases all staged memory.
 6. A foreground request takes its wrapper back when it is still queued and finishes preparation synchronously; if its worker is already active, it waits only for that texture. Upload remains entirely on the owner thread.
@@ -92,7 +92,7 @@ All multiplication is overflow-checked before allocation. Upload copies only mea
 
 ## Backpressure and failure behavior
 
-The runtime starts during `TextureLoader::Init()`. It tries two workers, then one worker. If startup fails, the loader remains functional through synchronous owner-thread preparation.
+The runtime starts during `TextureLoader::Init()`. It tries two workers, then one worker. If startup fails, the loader remains functional through synchronous owner-thread preparation. If retaining another staged texture would exceed the 64 MiB asynchronous memory budget, that texture uses the same synchronous owner fallback instead of entering the worker queue. The cap bounds accumulated asynchronous staging; one texture still has to be staged transiently to load it.
 
 Low-priority submission is non-blocking. If the bounded queue rejects a task or its wrapper cannot be allocated, the owner immediately completes that already-staged request synchronously. Rejection never produces a missing texture and never transfers ambiguous ownership.
 

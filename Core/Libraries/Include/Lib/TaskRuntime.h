@@ -44,6 +44,8 @@ public:
 
 	// Ownership transfers only when this method returns true. Rejected tasks remain caller-owned.
 	bool trySubmit(Task *task);
+	// As trySubmit, but admitted work is placed ahead of already queued tasks.
+	bool trySubmitFront(Task *task);
 	// Ownership of every task transfers only when this method returns true. Rejected tasks remain caller-owned.
 	bool trySubmitBatch(Task *const *tasks, unsigned taskCount);
 	// Removes a task that has not started. Ownership transfers back to the caller only on success.

@@ -493,6 +493,31 @@ static int testFifoDequeueAtOneWorker()
 	return 0;
 }
 
+static int testFrontSubmissionPrecedesQueuedWork()
+{
+	const char *testName = "testFrontSubmissionPrecedesQueuedWork";
+	Gate gate;
+	TaskRecord activeRecord;
+	TaskRecord olderRecord;
+	TaskRecord newerRecord;
+	unsigned nextOrder = 0;
+	rts::TaskRuntime runtime;
+
+	CHECK(testName, runtime.start(1, 3));
+	CHECK(testName, runtime.trySubmit(new GateTask(&gate, &activeRecord)));
+	gate.waitForEntry();
+	CHECK(testName, runtime.trySubmit(new RecordingTask(&olderRecord, &nextOrder)));
+	CHECK(testName, runtime.trySubmitFront(new RecordingTask(&newerRecord, &nextOrder)));
+	gate.open();
+	runtime.waitUntilIdle();
+	runtime.shutdown();
+	CHECK(testName, newerRecord.order == 0);
+	CHECK(testName, olderRecord.order == 1);
+	CHECK(testName, newerRecord.executions == 1 && newerRecord.destructions == 1);
+	CHECK(testName, olderRecord.executions == 1 && olderRecord.destructions == 1);
+	return 0;
+}
+
 static int testQueuedTaskCanBeTakenWithoutTakingActiveTask()
 {
 	const char *testName = "testQueuedTaskCanBeTakenWithoutTakingActiveTask";
@@ -977,6 +1002,7 @@ int main()
 	result |= testInvalidStartArguments();
 	result |= testExactlyOnceAtOneAndFourWorkers();
 	result |= testFifoDequeueAtOneWorker();
+	result |= testFrontSubmissionPrecedesQueuedWork();
 	result |= testQueuedTaskCanBeTakenWithoutTakingActiveTask();
 	result |= testBatchAdmissionIsAllOrNothing();
 	result |= testDuplicateBatchIsRejectedWithoutPublishing();
