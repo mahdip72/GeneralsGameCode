@@ -40,6 +40,7 @@
 
 #include <dsound.h>
 #include "Lib/BaseType.h"
+#include "MilesAudioDevice/AudioChannelPolicy.h"
 #include "MilesAudioDevice/MilesAudioManager.h"
 
 #include "Common/AudioAffect.h"
@@ -91,6 +92,9 @@ MilesAudioManager::MilesAudioManager() :
 	m_num2DSamples(0),
 	m_num3DSamples(0),
 	m_numStreams(0),
+	m_requested3DSamples(0),
+	m_num3DChannelReplacements(0),
+	m_num3DChannelRejections(0),
 	m_delayFilter(nullptr),
 	m_binkHandle(nullptr),
 	m_pref3DProvider(AsciiString::TheEmptyString),
@@ -165,8 +169,12 @@ void MilesAudioManager::audioDebugDisplay(DebugDisplayInterface *dd, void *, FIL
 		dd->printf("Speech: %s    ", (isOn(AudioAffect_Speech) ? "Yes" : "No"));
 		dd->printf("Music: %s\n", (isOn(AudioAffect_Music) ? "Yes" : "No"));
 		dd->printf("Channels Available: ");
-		dd->printf("%u Sounds    ", getNumAvailable2DSamples());
-		dd->printf("%u 3D Sounds\n", getNumAvailable3DSamples());
+		dd->printf("%u Sounds\n", getNumAvailable2DSamples());
+		dd->printf("3D channels: requested %u, allocated %u, active %u, available %u\n",
+			m_requested3DSamples, getNum3DSamples(),
+			getNum3DSamples() - getNumAvailable3DSamples(), getNumAvailable3DSamples());
+		dd->printf("3D saturation: %u replacements, %u rejected requests\n",
+			m_num3DChannelReplacements, m_num3DChannelRejections);
 		dd->printf("Volume: ");
 		dd->printf("Sound: %d    ", REAL_TO_INT(m_soundVolume * 100.0f));
 		dd->printf("3DSound: %d    ", REAL_TO_INT(m_sound3DVolume * 100.0f));
@@ -194,9 +202,12 @@ void MilesAudioManager::audioDebugDisplay(DebugDisplayInterface *dd, void *, FIL
 		fprintf( fp, "3DSound: %s    ", (isOn(AudioAffect_Sound3D) ? "Yes" : "No") );
 		fprintf( fp, "Speech: %s    ", (isOn(AudioAffect_Speech) ? "Yes" : "No") );
 		fprintf( fp, "Music: %s\n", (isOn(AudioAffect_Music) ? "Yes" : "No") );
-		fprintf( fp, "Channels Available: " );
-		fprintf( fp, "%u Sounds    ", getNumAvailable2DSamples() );
-		fprintf( fp, "%u 3D Sounds\n", getNumAvailable3DSamples() );
+		fprintf( fp, "Channels Available: %u Sounds\n", getNumAvailable2DSamples() );
+		fprintf( fp, "3D channels: requested %u, allocated %u, active %u, available %u\n",
+			m_requested3DSamples, getNum3DSamples(),
+			getNum3DSamples() - getNumAvailable3DSamples(), getNumAvailable3DSamples() );
+		fprintf( fp, "3D saturation: %u replacements, %u rejected requests\n",
+			m_num3DChannelReplacements, m_num3DChannelRejections );
 		fprintf( fp, "Volume: ");
 		fprintf( fp, "Sound: %d    ", REAL_TO_INT(m_soundVolume * 100.0f) );
 		fprintf( fp, "3DSound: %d    ", REAL_TO_INT(m_sound3DVolume * 100.0f) );
@@ -221,7 +232,7 @@ void MilesAudioManager::audioDebugDisplay(DebugDisplayInterface *dd, void *, FIL
 	AsciiString filenameNoSlashes;
 
 	const Int maxChannels = 64;
-	PlayingAudio *playingArray[maxChannels] = { nullptr };
+	PlayingAudio *playingArray[maxChannels + 1] = { nullptr };
 
 	// 2-D Sounds
 	if( dd )
@@ -230,7 +241,11 @@ void MilesAudioManager::audioDebugDisplay(DebugDisplayInterface *dd, void *, FIL
 		channelCount = TheAudio->getNum2DSamples();
 		for (it = m_playingSounds.begin(); it != m_playingSounds.end(); ++it) {
 			playing = *it;
-			playingArray[(int)AIL_sample_user_data(playing->m_sample, 0)] = playing;
+			const int slot = (int)AIL_sample_user_data(playing->m_sample, 0);
+			if (slot > 0 && slot <= maxChannels)
+			{
+				playingArray[slot] = playing;
+			}
 		}
 
 		for (Int i = 1; i <= maxChannels && i <= channelCount; ++i) {
@@ -285,7 +300,11 @@ void MilesAudioManager::audioDebugDisplay(DebugDisplayInterface *dd, void *, FIL
 		channelCount = TheAudio->getNum3DSamples();
 		for (it = m_playing3DSounds.begin(); it != m_playing3DSounds.end(); ++it) {
 			playing = *it;
-			playingArray[(int)AIL_3D_user_data(playing->m_3DSample, 0)] = playing;
+			const int slot = (int)AIL_3D_user_data(playing->m_3DSample, 0);
+			if (slot > 0 && slot <= maxChannels)
+			{
+				playingArray[slot] = playing;
+			}
 		}
 
 		for (Int i = 1; i <= maxChannels && i <= channelCount; ++i)
@@ -749,6 +768,10 @@ void MilesAudioManager::playAudioEvent( AudioRequest* req )
 
 				if( !audio->m_file )
 				{
+					if (!sample3D)
+					{
+						++m_num3DChannelRejections;
+					}
 					#ifdef INTENSIVE_AUDIO_DEBUG
 						DEBUG_LOG((" Killed (no handles available)"));
 					#endif
@@ -1217,6 +1240,21 @@ H3DSAMPLE MilesAudioManager::getAvailable3DSample( AudioEventRTS *event )
 		H3DSAMPLE retSample = m_available3DSamples.back();
 		m_available3DSamples.pop_back();
 		return retSample;
+	}
+
+	// Miles shares its sample budget with 2-D samples and streamed audio. Grow only
+	// when positional audio is saturated, while preserving those reserved handles.
+	if (isValidProvider() && rts::ShouldGrow3DChannelPool(
+			static_cast<UnsignedInt>(m_available3DSamples.size()),
+			m_num3DSamples,
+			m_requested3DSamples,
+			m_num2DSamples + m_numStreams)) {
+		H3DSAMPLE retSample = AIL_allocate_3D_sample_handle(m_provider3D[m_selectedProvider].id);
+		if (retSample) {
+			AIL_set_3D_user_data(retSample, 0, (void *)(m_num3DSamples + 1));
+			++m_num3DSamples;
+			return retSample;
+		}
 	}
 
 	// Find the first sample of lower priority than my augmented priority that is interruptible and take its handle
@@ -1956,6 +1994,48 @@ AudioEventRTS* MilesAudioManager::findLowestPrioritySound( AudioEventRTS *event 
 }
 
 //-------------------------------------------------------------------------------------------------
+PlayingAudio *MilesAudioManager::find3DChannelReplacement( AudioEventRTS *event )
+{
+	const AudioEventInfo *incomingInfo = event->getAudioEventInfo();
+	const Bool incomingInterrupt = BitIsSet(incomingInfo->m_control, AC_INTERRUPT);
+	PlayingAudio *replacement = nullptr;
+	int replacementPriority = AP_COUNT;
+
+	std::list<PlayingAudio *>::iterator it;
+	for (it = m_playing3DSounds.begin(); it != m_playing3DSounds.end(); ++it)
+	{
+		PlayingAudio *playing = *it;
+		if (playing->m_status != PS_Playing || !playing->m_audioEventRTS)
+		{
+			continue;
+		}
+
+		const AudioEventInfo *victimInfo = playing->m_audioEventRTS->getAudioEventInfo();
+		if (!victimInfo)
+		{
+			continue;
+		}
+
+		if (rts::CanReplace3DChannel(
+			incomingInterrupt != FALSE,
+			(int)incomingInfo->m_priority,
+			(int)victimInfo->m_priority,
+			victimInfo->m_priority == AP_CRITICAL,
+			BitIsSet(victimInfo->m_type, ST_VOICE),
+			BitIsSet(victimInfo->m_type, ST_UI),
+			BitIsSet(victimInfo->m_type, ST_GLOBAL),
+			BitIsSet(victimInfo->m_control, AC_LOOP)) &&
+			rts::IsPreferred3DChannelReplacement((int)victimInfo->m_priority, replacementPriority))
+		{
+			replacement = playing;
+			replacementPriority = (int)victimInfo->m_priority;
+		}
+	}
+
+	return replacement;
+}
+
+//-------------------------------------------------------------------------------------------------
 Bool MilesAudioManager::isPlayingLowerPriority( AudioEventRTS *event ) const
 {
 	//We don't actually want to do anything to this CONST function. Remember, we're
@@ -1979,8 +2059,16 @@ Bool MilesAudioManager::isPlayingLowerPriority( AudioEventRTS *event ) const
 	} else {
 		// 3-D
 		for ( it = m_playing3DSounds.begin(); it != m_playing3DSounds.end(); ++it ) {
-			if ((*it)->m_audioEventRTS->getAudioEventInfo()->m_priority < priority) {
-				//event->setHandleToKill((*it)->m_audioEventRTS->getPlayingHandle());
+			const AudioEventInfo *victimInfo = (*it)->m_audioEventRTS->getAudioEventInfo();
+			if (victimInfo && rts::CanReplace3DChannel(
+				false,
+				(int)priority,
+				(int)victimInfo->m_priority,
+				victimInfo->m_priority == AP_CRITICAL,
+				BitIsSet(victimInfo->m_type, ST_VOICE),
+				BitIsSet(victimInfo->m_type, ST_UI),
+				BitIsSet(victimInfo->m_type, ST_GLOBAL),
+				BitIsSet(victimInfo->m_control, AC_LOOP))) {
 				return true;
 			}
 		}
@@ -1992,36 +2080,34 @@ Bool MilesAudioManager::isPlayingLowerPriority( AudioEventRTS *event ) const
 //-------------------------------------------------------------------------------------------------
 Bool MilesAudioManager::killLowestPrioritySoundImmediately( AudioEventRTS *event )
 {
+	if (event->isPositionalAudio())
+	{
+		PlayingAudio *playing = find3DChannelReplacement(event);
+		if (playing)
+		{
+			// Release the oldest eligible 3D channel immediately for the incoming combat cue.
+			stopPlayingAudio(playing);
+			++m_num3DChannelReplacements;
+			return TRUE;
+		}
+
+		return FALSE;
+	}
+
 	//Actually, we want to kill the LOWEST PRIORITY SOUND, not the first "lower" priority
 	//sound we find, because it could easily be
 	AudioEventRTS *lowestPriorityEvent = findLowestPrioritySound( event );
 	if( lowestPriorityEvent )
 	{
 		std::list<PlayingAudio *>::iterator it;
-		if( event->isPositionalAudio() )
+		for( it = m_playingSounds.begin(); it != m_playingSounds.end(); ++it )
 		{
-			for( it = m_playing3DSounds.begin(); it != m_playing3DSounds.end(); ++it )
+			PlayingAudio *playing = (*it);
+			if( playing->m_audioEventRTS.Peek() == lowestPriorityEvent )
 			{
-				PlayingAudio *playing = (*it);
-				if( playing->m_audioEventRTS.Peek() == lowestPriorityEvent )
-				{
-					//Release this 3D sound channel immediately because we are going to play another sound in it's place.
-					stopPlayingAudio(playing);
-					return TRUE;
-				}
-			}
-		}
-		else
-		{
-			for( it = m_playingSounds.begin(); it != m_playingSounds.end(); ++it )
-			{
-				PlayingAudio *playing = (*it);
-				if( playing->m_audioEventRTS.Peek() == lowestPriorityEvent )
-				{
-					//Release this sound channel immediately because we are going to play another sound in it's place.
-					stopPlayingAudio(playing);
-					return TRUE;
-				}
+				//Release this sound channel immediately because we are going to play another sound in it's place.
+				stopPlayingAudio(playing);
+				return TRUE;
 			}
 		}
 	}
@@ -2782,7 +2868,9 @@ void MilesAudioManager::initSamplePools()
 	}
 
 	m_availableSamples.reserve(getAudioSettings()->m_sampleCount2D);
-	m_available3DSamples.reserve(getAudioSettings()->m_sampleCount3D);
+	m_requested3DSamples = rts::GetAdaptive3DChannelTarget(getAudioSettings()->m_sampleCount3D);
+	m_available3DSamples.reserve(m_requested3DSamples);
+	m_numStreams = getAudioSettings()->m_streamCount;
 
 	int i = 0;
 	for (i = 0; i < getAudioSettings()->m_sampleCount2D; ++i) {
@@ -2798,16 +2886,19 @@ void MilesAudioManager::initSamplePools()
 
 	for (i = 0; i < getAudioSettings()->m_sampleCount3D; ++i) {
 		H3DSAMPLE sample = AIL_allocate_3D_sample_handle(m_provider3D[m_selectedProvider].id);
-		DEBUG_ASSERTCRASH(sample, ("Couldn't get %d 3D samples", i + 1));
-		if (sample) {
-			AIL_set_3D_user_data(sample, 0, (void *)(i + 1));
-			m_available3DSamples.push_back(sample);
-			++m_num3DSamples;
+		if (!sample)
+		{
+			break;
 		}
+
+		AIL_set_3D_user_data(sample, 0, (void *)(i + 1));
+		m_available3DSamples.push_back(sample);
+		++m_num3DSamples;
 	}
 
-	// Streams are basically free, so we can just allocate the appropriate number
-	m_numStreams = getAudioSettings()->m_streamCount;
+	DEBUG_LOG(("Miles 3D channels: configured=%d requested=%u allocated=%u",
+		getAudioSettings()->m_sampleCount3D, m_requested3DSamples, m_num3DSamples));
+
 }
 
 //-------------------------------------------------------------------------------------------------
