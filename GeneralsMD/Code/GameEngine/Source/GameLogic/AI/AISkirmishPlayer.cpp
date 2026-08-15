@@ -38,6 +38,7 @@
 #include "Common/BuildAssistant.h"
 #include "Common/SpecialPower.h"
 #include "Common/ThingTemplate.h"
+#include "Common/Upgrade.h"
 #include "Common/WellKnownKeys.h"
 #include "Common/Xfer.h"
 #include "GameLogic/GameLogic.h"
@@ -54,11 +55,89 @@
 #include "GameLogic/PartitionManager.h"
 #include "GameLogic/ScriptEngine.h"
 #include "GameLogic/SkirmishAIDecision.h"
+#include "GameLogic/Weapon.h"
+#include "GameLogic/WeaponSet.h"
 #include "GameLogic/Module/ProductionUpdate.h"
 #include "GameClient/TerrainVisual.h"
 
 
 #define USE_DOZER 1
+
+struct SkirmishProductionCandidate
+{
+	TeamPrototype *prototype;
+	SkirmishAICostRange costRange;
+	Int factoryWaitFrames;
+};
+
+struct SkirmishFactoryProjection
+{
+	Object *factory;
+	Int projectedFrames;
+	Bool usedByCandidate;
+};
+
+static Int getSkirmishProductionEntryFrames(
+	const ProductionEntry *entry, Player *player, Bool firstEntry)
+{
+	if (!entry)
+		return 0;
+	Int buildFrames = 0;
+	if (entry->getProductionObject())
+		buildFrames = entry->getProductionObject()->calcTimeToBuild(player);
+	else if (entry->getProductionUpgrade())
+		buildFrames = entry->getProductionUpgrade()->calcTimeToBuild(player);
+	if (buildFrames <= 0)
+		return 0;
+
+	return GetSkirmishAIProductionEntryWaitFrames(
+		buildFrames,
+		entry->getPercentComplete(),
+		firstEntry,
+		entry->getProductionQuantityRemaining());
+}
+
+static Bool appendSkirmishProductionOrder(
+	std::vector<SkirmishFactoryProjection> &factories,
+	Player *player,
+	const ThingTemplate *thing,
+	Int unitCount,
+	Int *productionCost)
+{
+	if (unitCount <= 0)
+		return true;
+
+	std::vector<Int> projectedLoads;
+	std::vector<Int> compatibleFactories;
+	for (std::vector<SkirmishFactoryProjection>::iterator factory = factories.begin();
+		factory != factories.end(); ++factory) {
+		projectedLoads.push_back(factory->projectedFrames);
+		compatibleFactories.push_back(
+			TheBuildAssistant->isPossibleToMakeUnit(factory->factory, thing) ? 1 : 0);
+	}
+
+	Int candidateFrames = thing->calcTimeToBuild(player);
+	Int unitsRemaining = unitCount;
+	while (unitsRemaining > 0) {
+		Int selectedFactory = GetSkirmishAILeastLoadedFactoryIndex(
+			projectedLoads.empty() ? nullptr : &projectedLoads[0],
+			compatibleFactories.empty() ? nullptr : &compatibleFactories[0],
+			(Int)factories.size());
+		if (selectedFactory < 0)
+			return false;
+		Int productionQuantity = ProductionUpdate::getProductionQuantityForUnitFromObject(
+			factories[selectedFactory].factory, thing);
+		*productionCost = AddSkirmishAICostValue(
+			*productionCost, thing->calcCostToBuild(player), 1);
+		factories[selectedFactory].projectedFrames = AddSkirmishAIFrameValue(
+			factories[selectedFactory].projectedFrames, candidateFrames);
+		factories[selectedFactory].usedByCandidate = true;
+		projectedLoads[selectedFactory] = factories[selectedFactory].projectedFrames;
+		unitsRemaining = GetSkirmishAIUnitsRemainingAfterProductionEntry(
+			unitsRemaining, productionQuantity);
+	}
+	return true;
+}
 
 
 
@@ -195,6 +274,13 @@ void AISkirmishPlayer::processBaseBuilding()
 			}
 			// Make sure it is safe to build here.
 			if (!isLocationSafe(info->getLocation(), curPlan)) {
+				continue;
+			}
+			if (!ShouldSkirmishAIConsiderRebuild(
+				info->isAutomaticBuild(),
+				info->isPriorityBuild(),
+				curPlan->isKindOf(KINDOF_FS_POWER) && !curPlan->isKindOf(KINDOF_CASH_GENERATOR),
+				isUnderPowered)) {
 				continue;
 			}
 			if (info->isPriorityBuild()) {
@@ -396,12 +482,437 @@ Bool AISkirmishPlayer::selectTeamToReinforce( Int minPriority )
 	return AIPlayer::selectTeamToReinforce(minPriority);
 }
 
+Bool AISkirmishPlayer::isAdaptiveProductionCandidate(
+	TeamPrototype *proto, SkirmishAICostRange *costRange, Int *factoryWaitFrames)
+{
+	if (!proto || !costRange || !factoryWaitFrames || !proto->evaluateProductionCondition())
+		return false;
+	if (proto->countTeamInstances() >= proto->getTemplateInfo()->m_maxInstances)
+		return false;
+	for (DLINK_ITERATOR<TeamInQueue> iter = iterate_TeamBuildQueue(); !iter.done(); iter.advance()) {
+		TeamInQueue *team = iter.cur();
+		if (team && team->m_team && team->m_team->getPrototype() == proto)
+			return false;
+	}
+
+	Bool anyIdleFactory = false;
+	const TeamTemplateInfo *info = proto->getTemplateInfo();
+	for (Int i = 0; i < info->m_numUnitsInfo; ++i) {
+		const TCreateUnitsInfo *unitInfo = &info->m_unitsInfo[i];
+		const ThingTemplate *thing = TheThingFactory->findTemplate(unitInfo->unitThingName);
+		if (!thing)
+			continue;
+		if (!findFactory(thing, true))
+			return false;
+		if (findFactory(thing, false))
+			anyIdleFactory = true;
+	}
+	if (!anyIdleFactory)
+		return false;
+
+	*costRange = MakeSkirmishAICostRange();
+	Int ignoredCompletionFrames = 0;
+	if (!estimateTeamProduction(
+		proto, false, &costRange->minimumCost, &ignoredCompletionFrames))
+		return false;
+	if (!estimateTeamProduction(
+		proto, true, &costRange->plannedCost, factoryWaitFrames))
+		return false;
+
+	return true;
+}
+
+Int AISkirmishPlayer::getCriticalRebuildReserve(Bool *canStartNow)
+{
+	if (canStartNow)
+		*canStartNow = false;
+	Int cheapestCost = 0;
+	Bool isUnderPowered = !m_player->getEnergy()->hasSufficientPower();
+	for (BuildListInfo *info = m_player->getBuildList(); info; info = info->getNext()) {
+		const ThingTemplate *plan = TheThingFactory->findTemplate(info->getTemplateName());
+		if (!plan)
+			continue;
+		Bool critical = plan->isKindOf(KINDOF_COMMANDCENTER) ||
+			plan->isKindOf(KINDOF_FS_POWER) ||
+			plan->isKindOf(KINDOF_FS_SUPPLY_CENTER) ||
+			plan->isKindOf(KINDOF_FS_FACTORY) ||
+			plan->isKindOf(KINDOF_FS_BARRACKS) ||
+			plan->isKindOf(KINDOF_FS_WARFACTORY) ||
+			plan->isKindOf(KINDOF_FS_AIRFIELD);
+		if (!critical || !info->isBuildable() ||
+			!ShouldSkirmishAIConsiderRebuild(
+				info->isAutomaticBuild(),
+				info->isPriorityBuild(),
+				plan->isKindOf(KINDOF_FS_POWER) && !plan->isKindOf(KINDOF_CASH_GENERATOR),
+				isUnderPowered))
+			continue;
+
+		Object *object = TheGameLogic->findObjectByID(info->getObjectID());
+		if (object && object->getControllingPlayer() == m_player)
+			continue;
+
+		Int cost = plan->calcCostToBuild(m_player);
+		if (cost > 0 && (cheapestCost == 0 || cost < cheapestCost))
+			cheapestCost = cost;
+		if (canStartNow && !*canStartNow && canStartCriticalRebuildNow(info, plan))
+			*canStartNow = true;
+	}
+	return cheapestCost;
+}
+
+Bool AISkirmishPlayer::canStartCriticalRebuildNow(
+	BuildListInfo *info, const ThingTemplate *plan)
+{
+	Bool rebuildReady = info->getObjectTimestamp() == 0 ||
+		info->getObjectTimestamp() +
+			TheAI->getAiData()->m_rebuildDelaySeconds * LOGICFRAMES_PER_SECOND <=
+			TheGameLogic->getFrame();
+	if (rebuildReady)
+		rebuildReady = isLocationSafe(info->getLocation(), plan);
+
+	Object *dozer = findDozer(info->getLocation());
+	Bool hasDozer = dozer != nullptr;
+	Bool canMake = hasDozer && TheBuildAssistant->canMakeUnit(dozer, plan) == CANMAKE_OK;
+	Bool hasAI = hasDozer && dozer->getAIUpdateInterface() != nullptr;
+	Bool clearOfEnemies = false;
+	if (canMake && hasAI && rebuildReady) {
+		Coord3D position = *info->getLocation();
+		position.z += TheTerrainLogic->getGroundHeight(position.x, position.y);
+		clearOfEnemies = TheBuildAssistant->isLocationLegalToBuild(
+			&position,
+			plan,
+			info->getAngle(),
+			BuildAssistant::NO_ENEMY_OBJECT_OVERLAP,
+			dozer,
+			m_player) == LBC_OK;
+		TheTerrainVisual->removeAllBibs();
+	}
+	return IsSkirmishAICriticalRebuildStartable(
+		hasDozer, canMake, hasAI, rebuildReady, clearOfEnemies);
+}
+
+Bool AISkirmishPlayer::estimateTeamProduction(
+	TeamPrototype *proto, Bool planned, Int *productionCost, Int *completionFrames)
+{
+	*productionCost = 0;
+	*completionFrames = 0;
+	std::vector<SkirmishFactoryProjection> factories;
+	for (BuildListInfo *build = m_player->getBuildList(); build; build = build->getNext()) {
+		Object *factory = TheGameLogic->findObjectByID(build->getObjectID());
+		if (!factory || factory->getControllingPlayer() != m_player ||
+			factory->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) ||
+			factory->testStatus(OBJECT_STATUS_SOLD))
+			continue;
+		ProductionUpdateInterface *production = factory->getProductionUpdateInterface();
+		if (!production)
+			continue;
+
+		Bool duplicate = false;
+		for (std::vector<SkirmishFactoryProjection>::iterator existing = factories.begin();
+			existing != factories.end(); ++existing) {
+			if (existing->factory == factory) {
+				duplicate = true;
+				break;
+			}
+		}
+		if (duplicate)
+			continue;
+
+		SkirmishFactoryProjection projection;
+		projection.factory = factory;
+		projection.projectedFrames = 0;
+		projection.usedByCandidate = false;
+		Bool firstEntry = true;
+		for (const ProductionEntry *entry = production->firstProduction(); entry;
+			entry = production->nextProduction(entry)) {
+			projection.projectedFrames = AddSkirmishAIFrameValue(
+				projection.projectedFrames,
+				getSkirmishProductionEntryFrames(entry, m_player, firstEntry));
+			firstEntry = false;
+		}
+		factories.push_back(projection);
+	}
+
+	const TeamTemplateInfo *info = proto->getTemplateInfo();
+	for (Int phase = 0; phase < (planned ? 2 : 1); ++phase) {
+		for (Int i = info->m_numUnitsInfo - 1; i >= 0; --i) {
+			const TCreateUnitsInfo *unitInfo = &info->m_unitsInfo[i];
+			Int unitCount = phase == 0 ? unitInfo->minUnits :
+				unitInfo->maxUnits - unitInfo->minUnits;
+			if (unitCount <= 0)
+				continue;
+			const ThingTemplate *thing = TheThingFactory->findTemplate(unitInfo->unitThingName);
+			if (!thing)
+				continue;
+			if (!appendSkirmishProductionOrder(
+				factories, m_player, thing, unitCount, productionCost))
+				return false;
+		}
+	}
+
+	for (std::vector<SkirmishFactoryProjection>::iterator factory = factories.begin();
+		factory != factories.end(); ++factory) {
+		if (factory->usedByCandidate && factory->projectedFrames > *completionFrames)
+			*completionFrames = factory->projectedFrames;
+	}
+	return true;
+}
+
+void AISkirmishPlayer::getVisibleEnemyComposition(
+	Int *aircraftValue, Int *vehicleValue, Int *infantryValue,
+	Coord3D *routeTarget, Bool *hasRouteTarget)
+{
+	*aircraftValue = 0;
+	*vehicleValue = 0;
+	*infantryValue = 0;
+	*hasRouteTarget = false;
+	routeTarget->zero();
+	Player *enemy = getAiEnemy();
+	if (!enemy)
+		return;
+
+	for (Object *object = TheGameLogic->getFirstObject(); object; object = object->getNextObject()) {
+		if (object->getControllingPlayer() != enemy || object->isEffectivelyDead())
+			continue;
+		ObjectShroudStatus shroud = object->getShroudedStatus(m_player->getPlayerIndex());
+		if (shroud != OBJECTSHROUD_CLEAR && shroud != OBJECTSHROUD_PARTIAL_CLEAR)
+			continue;
+		if (object->testStatus(OBJECT_STATUS_STEALTHED) &&
+			!object->testStatus(OBJECT_STATUS_DETECTED))
+			continue;
+		if (object->isKindOf(KINDOF_STRUCTURE))
+			continue;
+
+		Int value = object->getTemplate()->calcCostToBuild(enemy);
+		if (object->isKindOf(KINDOF_AIRCRAFT))
+			*aircraftValue = AddSkirmishAICostValue(*aircraftValue, value, 1);
+		else if (object->isKindOf(KINDOF_VEHICLE))
+			*vehicleValue = AddSkirmishAICostValue(*vehicleValue, value, 1);
+		else if (object->isKindOf(KINDOF_INFANTRY))
+			*infantryValue = AddSkirmishAICostValue(*infantryValue, value, 1);
+		else
+			continue;
+		if (!*hasRouteTarget && IsSkirmishAIGroundRouteTarget(
+			object->isKindOf(KINDOF_STRUCTURE),
+			object->isKindOf(KINDOF_AIRCRAFT),
+			object->isKindOf(KINDOF_VEHICLE),
+			object->isKindOf(KINDOF_INFANTRY))) {
+			*routeTarget = *object->getPosition();
+			*hasRouteTarget = true;
+		}
+	}
+}
+
+Int AISkirmishPlayer::getCandidateCounterFit(
+	TeamPrototype *proto, Int aircraftValue, Int vehicleValue, Int infantryValue)
+{
+	Int plannedValue = 0;
+	Int antiAircraftValue = 0;
+	Int antiVehicleValue = 0;
+	Int antiInfantryValue = 0;
+	const TeamTemplateInfo *info = proto->getTemplateInfo();
+	for (Int i = 0; i < info->m_numUnitsInfo; ++i) {
+		const TCreateUnitsInfo *unitInfo = &info->m_unitsInfo[i];
+		const ThingTemplate *thing = TheThingFactory->findTemplate(unitInfo->unitThingName);
+		if (!thing || unitInfo->maxUnits <= 0)
+			continue;
+		Int value = AddSkirmishAICostValue(0, thing->calcCostToBuild(m_player), unitInfo->maxUnits);
+		plannedValue = AddSkirmishAICostValue(plannedValue, value, 1);
+
+		Bool attacksAircraft = false;
+		Bool attacksGround = false;
+		Bool prefersVehicle = false;
+		Bool prefersInfantry = false;
+		WeaponSetFlags flags;
+		flags.clear();
+		const WeaponTemplateSet *weaponSet = thing->findWeaponTemplateSet(flags);
+		if (weaponSet) {
+			for (Int slot = 0; slot < WEAPONSLOT_COUNT; ++slot) {
+				const WeaponTemplate *weapon = weaponSet->getNth((WeaponSlotType)slot);
+				if (!weapon)
+					continue;
+				Int antiMask = weapon->getAntiMask();
+				if (antiMask & (WEAPON_ANTI_AIRBORNE_VEHICLE | WEAPON_ANTI_AIRBORNE_INFANTRY))
+					attacksAircraft = true;
+				if (antiMask & WEAPON_ANTI_GROUND)
+					attacksGround = true;
+				const KindOfMaskType &preferred = weaponSet->getNthPreferredAgainstMask((WeaponSlotType)slot);
+				if (preferred.test(KINDOF_AIRCRAFT))
+					attacksAircraft = true;
+				if (preferred.test(KINDOF_VEHICLE))
+					prefersVehicle = true;
+				if (preferred.test(KINDOF_INFANTRY))
+					prefersInfantry = true;
+			}
+		}
+		if (attacksAircraft)
+			antiAircraftValue = AddSkirmishAICostValue(antiAircraftValue, value, 1);
+		if (attacksGround || prefersVehicle)
+			antiVehicleValue = AddSkirmishAICostValue(antiVehicleValue, value, 1);
+		if (attacksGround || prefersInfantry)
+			antiInfantryValue = AddSkirmishAICostValue(antiInfantryValue, value, 1);
+	}
+	return GetSkirmishAICounterFitScore(
+		aircraftValue, vehicleValue, infantryValue,
+		plannedValue, antiAircraftValue, antiVehicleValue, antiInfantryValue);
+}
+
+SkirmishAIRouteClass AISkirmishPlayer::classifyTeamRoute(
+	TeamPrototype *proto, const Coord3D *routeTarget, Bool hasRouteTarget)
+{
+	Bool hasGround = false;
+	Bool hasAir = false;
+	const TeamTemplateInfo *info = proto->getTemplateInfo();
+	for (Int i = 0; i < info->m_numUnitsInfo; ++i) {
+		if (info->m_unitsInfo[i].maxUnits <= 0)
+			continue;
+		const ThingTemplate *thing = TheThingFactory->findTemplate(info->m_unitsInfo[i].unitThingName);
+		if (!thing)
+			continue;
+		if (thing->isKindOf(KINDOF_AIRCRAFT))
+			hasAir = true;
+		else if (thing->isKindOf(KINDOF_VEHICLE) || thing->isKindOf(KINDOF_INFANTRY))
+			hasGround = true;
+	}
+	if (!hasGround || !hasRouteTarget)
+		return SKIRMISH_AI_ROUTE_UNKNOWN;
+
+	Object *representative = nullptr;
+	for (Object *object = TheGameLogic->getFirstObject(); object; object = object->getNextObject()) {
+		if (object->getControllingPlayer() == m_player && !object->isEffectivelyDead() &&
+			!object->isKindOf(KINDOF_STRUCTURE) && !object->isKindOf(KINDOF_AIRCRAFT) &&
+			object->getAIUpdateInterface()) {
+			representative = object;
+			break;
+		}
+	}
+	if (!representative)
+		return SKIRMISH_AI_ROUTE_UNKNOWN;
+	if (TheAI->pathfinder()->clientSafeQuickDoesPathExist(
+		representative->getAIUpdateInterface()->getLocomotorSet(),
+		representative->getPosition(), routeTarget))
+		return SKIRMISH_AI_ROUTE_GROUND_REACHABLE;
+	return hasAir ? SKIRMISH_AI_ROUTE_MIXED_UNREACHABLE : SKIRMISH_AI_ROUTE_GROUND_UNREACHABLE;
+}
+
+SkirmishAIDecisionDifficulty AISkirmishPlayer::getDecisionDifficulty() const
+{
+	if (m_difficulty == DIFFICULTY_EASY)
+		return SKIRMISH_AI_DIFFICULTY_EASY;
+	if (m_difficulty == DIFFICULTY_NORMAL)
+		return SKIRMISH_AI_DIFFICULTY_NORMAL;
+	return SKIRMISH_AI_DIFFICULTY_HARD;
+}
+
 /**
  * Determine the next team to build.  Return true if one was selected.
  */
 Bool AISkirmishPlayer::selectTeamToBuild()
 {
-	return AIPlayer::selectTeamToBuild();
+	Bool hasCandidate = false;
+	Int highestPriority = (-2147483647 - 1);
+	std::vector<SkirmishProductionCandidate> candidates;
+	Player::PlayerTeamList::const_iterator teamIt;
+	for (teamIt = m_player->getPlayerTeams()->begin(); teamIt != m_player->getPlayerTeams()->end(); ++teamIt) {
+		SkirmishProductionCandidate candidate;
+		candidate.prototype = *teamIt;
+		if (!isAdaptiveProductionCandidate(
+			candidate.prototype, &candidate.costRange, &candidate.factoryWaitFrames))
+			continue;
+		candidates.push_back(candidate);
+		Int priority = candidate.prototype->getTemplateInfo()->m_productionPriority;
+		if (ShouldReplaceSkirmishAIHighestPriority(hasCandidate, priority, highestPriority))
+			highestPriority = priority;
+		hasCandidate = true;
+	}
+
+	if (selectTeamToReinforce(highestPriority))
+		return true;
+	if (!hasCandidate)
+		return false;
+
+	Bool criticalRebuildCanStart = false;
+	Int rebuildReserve = getCriticalRebuildReserve(&criticalRebuildCanStart);
+	Int poorReserve = TheAI->getAiData()->m_resourcesPoor;
+	Int reserve = GetSkirmishAIReserve(poorReserve, rebuildReserve);
+	Bool rebuildReserveApplied = reserve > GetSkirmishAIReserve(poorReserve, 0);
+	Int resources = m_player->getMoney()->countMoney();
+	SkirmishAIDecisionDifficulty difficulty = getDecisionDifficulty();
+
+	Int enemyAircraftValue;
+	Int enemyVehicleValue;
+	Int enemyInfantryValue;
+	Coord3D routeTarget;
+	Bool hasRouteTarget;
+	getVisibleEnemyComposition(
+		&enemyAircraftValue, &enemyVehicleValue, &enemyInfantryValue, &routeTarget, &hasRouteTarget);
+
+	std::vector<TeamPrototype *> bestTeams;
+	__int64 bestScore = 0;
+	Bool hasBestScore = false;
+	for (Int pass = 0; pass < 2; ++pass) {
+		bestTeams.clear();
+		hasBestScore = false;
+		for (std::vector<SkirmishProductionCandidate>::iterator candidateIt = candidates.begin();
+			candidateIt != candidates.end(); ++candidateIt) {
+			TeamPrototype *prototype = candidateIt->prototype;
+			Int priority = prototype->getTemplateInfo()->m_productionPriority;
+			if (!IsSkirmishAIPriorityAdmitted(priority, highestPriority, difficulty) ||
+				!IsSkirmishAIAffordable(resources, candidateIt->costRange.minimumCost, reserve))
+				continue;
+
+			SkirmishAITeamScoreInput input;
+			input.configuredPriority = priority;
+			input.counterFitScore = getCandidateCounterFit(
+				prototype, enemyAircraftValue, enemyVehicleValue, enemyInfantryValue);
+			input.resources = resources;
+			input.minimumCost = candidateIt->costRange.minimumCost;
+			input.plannedCost = candidateIt->costRange.plannedCost;
+			input.reserve = reserve;
+			input.factoryWaitFrames = candidateIt->factoryWaitFrames;
+			input.logicFramesPerSecond = LOGICFRAMES_PER_SECOND;
+			input.routeClass = classifyTeamRoute(prototype, &routeTarget, hasRouteTarget);
+			input.recentLossCount = 0;
+			input.recentPathFailureCount = 0;
+			input.difficulty = difficulty;
+			SkirmishAITeamScoreResult score = ScoreSkirmishAITeam(input);
+
+			if (TheGlobalData->m_debugAI) {
+				AsciiString message;
+				message.format("AI team %s score=%I64d pri=%d counter=%d econ=%d wait=%d route=%d loss=%d path=%d reserve=%d min=%d planned=%d",
+					prototype->getName().str(), score.finalScore, priority, score.counterFitScore,
+					score.economyScore, score.factoryWaitScore, score.routeScore,
+					score.lossScore, score.pathFailureScore, reserve,
+					candidateIt->costRange.minimumCost, candidateIt->costRange.plannedCost);
+				TheScriptEngine->AppendDebugMessage(message, false);
+			}
+
+			if (!hasBestScore || score.finalScore > bestScore) {
+				bestScore = score.finalScore;
+				hasBestScore = true;
+				bestTeams.clear();
+				bestTeams.push_back(prototype);
+			} else if (IsSkirmishAITeamScoreTie(score.finalScore, bestScore)) {
+				bestTeams.push_back(prototype);
+			}
+		}
+
+		if (!bestTeams.empty())
+			break;
+		if (!ShouldRetrySkirmishAIReserve(
+			criticalRebuildCanStart, rebuildReserveApplied, false))
+			break;
+		reserve = GetSkirmishAIReserve(poorReserve, 0);
+		rebuildReserveApplied = false;
+	}
+
+	if (bestTeams.empty())
+		return false;
+	Int selected = 0;
+	if (bestTeams.size() > 1)
+		selected = GetSkirmishAITieSelectionIndex(
+			(Int)bestTeams.size(), GameLogicRandomValue(0, (Int)bestTeams.size() - 1));
+	return queueSelectedTeam(bestTeams[selected]);
 }
 
 /**

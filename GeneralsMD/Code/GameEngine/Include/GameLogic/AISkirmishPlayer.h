@@ -30,6 +30,7 @@
 
 #include "Common/GameMemory.h"
 #include "GameLogic/AIPlayer.h"
+#include "GameLogic/SkirmishAIDecision.h"
 
 class BuildListInfo;
 class SpecialPowerTemplate;
@@ -100,6 +101,17 @@ protected:
 	void adjustBuildList(BuildListInfo *list);
 	Int getMyEnemyPlayerIndex();
 	void acquireEnemy();
+	Bool isAdaptiveProductionCandidate( TeamPrototype *proto, SkirmishAICostRange *costRange,
+		Int *factoryWaitFrames );
+	Int getCriticalRebuildReserve( Bool *canStartNow );
+	Bool canStartCriticalRebuildNow( BuildListInfo *info, const ThingTemplate *plan );
+	Bool estimateTeamProduction( TeamPrototype *proto, Bool planned,
+		Int *productionCost, Int *completionFrames );
+	void getVisibleEnemyComposition( Int *aircraftValue, Int *vehicleValue, Int *infantryValue,
+		Coord3D *routeTarget, Bool *hasRouteTarget );
+	Int getCandidateCounterFit( TeamPrototype *proto, Int aircraftValue, Int vehicleValue, Int infantryValue );
+	SkirmishAIRouteClass classifyTeamRoute( TeamPrototype *proto, const Coord3D *routeTarget, Bool hasRouteTarget );
+	SkirmishAIDecisionDifficulty getDecisionDifficulty() const;
 
 protected:
 	Int m_curFrontBaseDefense; // First is 0.

@@ -192,6 +192,8 @@ public:
 	// virtual destructor prototype provided by MemoryPoolObject
 
 	static Int getInterfaceMask() { return UpdateModule::getInterfaceMask() | (MODULEINTERFACE_DIE); }
+	static Int getProductionQuantityForUnitFromObject(
+		Object *object, const ThingTemplate *unitType );
 
 	// Disabled conditions to process (AI will still process held status)
 	virtual DisabledMaskType getDisabledTypesToProcess() const override { return getProductionUpdateModuleData()->m_disabledTypesToProcess; }
@@ -212,6 +214,7 @@ public:
 	virtual void cancelUpgrade( const UpgradeTemplate *upgrade ) override;				///< cancel upgrade "research"
 	virtual Bool isUpgradeInQueue( const UpgradeTemplate *upgrade ) const override;		///< is the upgrade in our production queue already
 	virtual UnsignedInt countUnitTypeInQueue( const ThingTemplate *unitType ) const override;  ///< count number of units with matching unit type in the production queue
+	Int getProductionQuantityForUnit( const ThingTemplate *unitType ) const;
 
 	virtual Bool queueCreateUnit( const ThingTemplate *unitType, ProductionID productionID ) override;					///< queue unit to be produced
 	virtual void cancelUnitCreate( ProductionID productionID ) override;		      ///< cancel construction of unit with matching production ID
