@@ -56,6 +56,7 @@
 #include "GameLogic/Module/DozerAIUpdate.h"
 #include "GameLogic/Module/UpdateModule.h"
 #include "GameLogic/ScriptEngine.h"
+#include "GameLogic/SkirmishAILiveness.h"
 #include "GameLogic/Module/ProductionUpdate.h"
 #include "GameLogic/Module/RebuildHoleBehavior.h"
 #include "GameLogic/Module/SupplyTruckAIUpdate.h"
@@ -363,7 +364,8 @@ void AIPlayer::queueSupplyTruck()
 							{
 								// This thinks he is a gatherer, but doesn't have a preferred dock id.
 								Object *center = TheGameLogic->findObjectByID(info->getObjectID());
-								if (center) {
+								Bool isRebuildHole = center && center->isKindOf(KINDOF_REBUILD_HOLE);
+								if (IsUsableSupplyCenter(center != nullptr, isRebuildHole)) {
 									info->setCurrentGatherers(info->getCurrentGatherers()+1);
 									// Note - although this is the ai, we are sending in CMD_FROM_PLAYER.
 									// This causes the dock object to stick in the docking interface.
@@ -3741,7 +3743,10 @@ void WorkOrder::validateFactory( Player *thisPlayer )
 		m_factoryID = INVALID_ID;
 		return;
 	}
-	if (factory->getControllingPlayer()!=thisPlayer) {
+	Bool sameOwner = factory->getControllingPlayer() == thisPlayer;
+	ProductionUpdateInterface *production = sameOwner ? factory->getProductionUpdateInterface() : nullptr;
+	UnsignedInt queuedUnitCount = production ? production->countUnitTypeInQueue(m_thing) : 0;
+	if (!IsWorkOrderFactoryQueueValid(sameOwner, production != nullptr, queuedUnitCount)) {
 		m_factoryID = INVALID_ID;
 	}
 

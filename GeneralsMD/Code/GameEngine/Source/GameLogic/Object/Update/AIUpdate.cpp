@@ -67,6 +67,7 @@
 #include "GameLogic/PartitionManager.h"
 #include "GameLogic/PolygonTrigger.h"
 #include "GameLogic/ScriptEngine.h"
+#include "GameLogic/SkirmishAILiveness.h"
 #include "GameLogic/TurretAI.h"
 #include "GameLogic/Weapon.h"
 #include "Common/Radar.h"									// For TheRadar
@@ -476,6 +477,13 @@ void AIUpdateInterface::doPathfind( PathfindServicesInterface *pathfinder )
 pathfinder (air units just move point to point) it generates the path immediately.  Otherwise the path
 will be processed when we get to the front of the pathfind queue. jba */
 //-------------------------------------------------------------------------------------------------
+void AIUpdateInterface::tryQueueForPath()
+{
+	Bool queued = TheAI->pathfinder()->queueForPath(getObject()->getID());
+	setQueueForPathTime(GetPathQueueRetryDelay(queued));
+}
+
+//-------------------------------------------------------------------------------------------------
 void AIUpdateInterface::requestPath( Coord3D *destination, Bool isFinalGoal )
 {
 
@@ -512,7 +520,7 @@ void AIUpdateInterface::requestPath( Coord3D *destination, Bool isFinalGoal )
 		}
 		return;
 	}
-	TheAI->pathfinder()->queueForPath(getObject()->getID());
+	tryQueueForPath();
 
 }
 
@@ -536,7 +544,7 @@ void AIUpdateInterface::requestAttackPath( ObjectID victimID, const Coord3D* vic
 		setLocomotorGoalNone();
 		return;
 	}
-	TheAI->pathfinder()->queueForPath(getObject()->getID());
+	tryQueueForPath();
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -559,7 +567,7 @@ void AIUpdateInterface::requestApproachPath( Coord3D *destination )
 		setQueueForPathTime(2*LOGICFRAMES_PER_SECOND);
 		return;
 	}
-	TheAI->pathfinder()->queueForPath(getObject()->getID());
+	tryQueueForPath();
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -583,7 +591,7 @@ void AIUpdateInterface::requestSafePath( ObjectID repulsor )
 		setQueueForPathTime(2*LOGICFRAMES_PER_SECOND);
 		return;
 	}
-	TheAI->pathfinder()->queueForPath(getObject()->getID());
+	tryQueueForPath();
 }
 
 enum {WAYPOINT_PATH_LIMIT=1024};
@@ -1066,8 +1074,9 @@ UpdateSleepTime AIUpdateInterface::update()
 	{
 		if (now >= m_queueForPathFrame)
 		{
-			TheAI->pathfinder()->queueForPath(getObject()->getID());
-			setQueueForPathTime(0);
+			tryQueueForPath();
+			if (m_queueForPathFrame != 0 && UPDATE_SLEEP(1) < subMachineSleep)
+				subMachineSleep = UPDATE_SLEEP(1);
 		}
 		else
 		{
