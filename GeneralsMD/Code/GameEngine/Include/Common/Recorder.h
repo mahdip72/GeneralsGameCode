@@ -138,6 +138,7 @@ public:
 
 	RecorderModeType getMode();												///< Returns the current operating mode.
 	Bool isPlaybackMode() const { return m_mode == RECORDERMODETYPE_PLAYBACK || m_mode == RECORDERMODETYPE_SIMULATION_PLAYBACK; }
+	Bool replayUsesSkirmishAILivenessRecovery() const { return m_replayUsesSkirmishAILivenessRecovery; }
 	void initControls();															///< Show or Hide the Replay controls
 
 	static AsciiString getReplayDir();								///< Returns the directory that holds the replay files.
@@ -194,6 +195,7 @@ protected:
 
 	Bool m_doingAnalysis;
 	Bool m_archiveReplays;														///< if true, each replay is archived to the replay archive folder after recording
+	Bool m_replayUsesSkirmishAILivenessRecovery;
 
 	Int m_originalGameMode; // valid in replays
 

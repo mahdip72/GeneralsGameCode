@@ -39,6 +39,7 @@
 #include "Common/Player.h"
 #include "Common/PlayerList.h"
 #include "Common/RandomValue.h"
+#include "Common/Recorder.h"
 #include "Common/Team.h"
 #include "Common/ThingFactory.h"
 #include "Common/ThingTemplate.h"
@@ -520,7 +521,10 @@ void AIUpdateInterface::requestPath( Coord3D *destination, Bool isFinalGoal )
 		}
 		return;
 	}
-	tryQueueForPath();
+	if (ShouldUseSkirmishAILivenessRecovery(TheGameLogic->isInReplayGame(), TheRecorder && TheRecorder->replayUsesSkirmishAILivenessRecovery()))
+		tryQueueForPath();
+	else
+		TheAI->pathfinder()->queueForPath(getObject()->getID());
 
 }
 
@@ -544,7 +548,10 @@ void AIUpdateInterface::requestAttackPath( ObjectID victimID, const Coord3D* vic
 		setLocomotorGoalNone();
 		return;
 	}
-	tryQueueForPath();
+	if (ShouldUseSkirmishAILivenessRecovery(TheGameLogic->isInReplayGame(), TheRecorder && TheRecorder->replayUsesSkirmishAILivenessRecovery()))
+		tryQueueForPath();
+	else
+		TheAI->pathfinder()->queueForPath(getObject()->getID());
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -567,7 +574,10 @@ void AIUpdateInterface::requestApproachPath( Coord3D *destination )
 		setQueueForPathTime(2*LOGICFRAMES_PER_SECOND);
 		return;
 	}
-	tryQueueForPath();
+	if (ShouldUseSkirmishAILivenessRecovery(TheGameLogic->isInReplayGame(), TheRecorder && TheRecorder->replayUsesSkirmishAILivenessRecovery()))
+		tryQueueForPath();
+	else
+		TheAI->pathfinder()->queueForPath(getObject()->getID());
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -591,7 +601,10 @@ void AIUpdateInterface::requestSafePath( ObjectID repulsor )
 		setQueueForPathTime(2*LOGICFRAMES_PER_SECOND);
 		return;
 	}
-	tryQueueForPath();
+	if (ShouldUseSkirmishAILivenessRecovery(TheGameLogic->isInReplayGame(), TheRecorder && TheRecorder->replayUsesSkirmishAILivenessRecovery()))
+		tryQueueForPath();
+	else
+		TheAI->pathfinder()->queueForPath(getObject()->getID());
 }
 
 enum {WAYPOINT_PATH_LIMIT=1024};
@@ -1074,9 +1087,14 @@ UpdateSleepTime AIUpdateInterface::update()
 	{
 		if (now >= m_queueForPathFrame)
 		{
-			tryQueueForPath();
-			if (m_queueForPathFrame != 0 && UPDATE_SLEEP(1) < subMachineSleep)
-				subMachineSleep = UPDATE_SLEEP(1);
+			if (ShouldUseSkirmishAILivenessRecovery(TheGameLogic->isInReplayGame(), TheRecorder && TheRecorder->replayUsesSkirmishAILivenessRecovery())) {
+				tryQueueForPath();
+				if (m_queueForPathFrame != 0 && UPDATE_SLEEP(1) < subMachineSleep)
+					subMachineSleep = UPDATE_SLEEP(1);
+			} else {
+				TheAI->pathfinder()->queueForPath(getObject()->getID());
+				setQueueForPathTime(0);
+			}
 		}
 		else
 		{

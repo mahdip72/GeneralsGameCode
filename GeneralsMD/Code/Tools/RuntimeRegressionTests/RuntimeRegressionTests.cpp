@@ -368,6 +368,10 @@ static void TestFrameRateLimitWaitCalculation()
 
 static void TestSkirmishAILivenessPolicies()
 {
+	CHECK(ShouldUseSkirmishAILivenessRecovery(false, false));
+	CHECK(!ShouldUseSkirmishAILivenessRecovery(true, false));
+	CHECK(ShouldUseSkirmishAILivenessRecovery(true, true));
+
 	CHECK(GetPathQueueRetryDelay(true) == 0);
 	CHECK(GetPathQueueRetryDelay(false) == 1);
 

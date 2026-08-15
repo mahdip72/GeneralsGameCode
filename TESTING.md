@@ -13,6 +13,8 @@ PAUSE
 ```
 It will run the game in the background and check that each replay is compatible. You need to use a VC6 build with optimizations and RTS_BUILD_OPTION_DEBUG = OFF, otherwise the game won't be compatible.
 
+Zero Hour records the skirmish-AI behavior epoch as a suffix in the replay header's existing variable-length build-time field. Unmarked retail replays use the legacy AI behavior, while marked replays use the liveness recovery that was active while recording. Replays made by intermediate builds from `15a1b135` through the addition of this marker are unmarked despite using the new behavior and cannot be distinguished from retail recordings; those transitional recordings are unsupported.
+
 # Stage 0 ownership and profiling checks
 
 Use an optimized VC6 release-log build for the replay and CRC diagnostic:
@@ -81,7 +83,7 @@ rg -n "LoaderThreadClass|_TextureLoadThread|_BackgroundQueue|_BackgroundCritical
 rg -U -P "(?ms)^class TexturePrepareRuntimeTask.*?^};" Core/Libraries/Source/WWVegas/WW3D2/textureloader.cpp | rg -n "DX8|D3D|Texture->|Apply|Lock_Surfaces|Unlock_Surfaces|Create_D3D"
 ```
 
-Both source-audit commands must produce no matches. Build both games with VC6 as well as modern Win32. Run the optimized `vc6-releaselog` replay command documented in Stage 0 and require a zero exit code with no CRC or ownership failure; Stage 4 must not modify gameplay, replay, network, save, RNG, or serialization state.
+Both source-audit commands must produce no matches. Build both games with VC6 as well as modern Win32. Run the optimized `vc6-releaselog` replay command documented in Stage 0 and require a zero exit code with no CRC or ownership failure; the Stage 4 texture-preparation changes must not modify gameplay, replay, network, save, RNG, or serialization state.
 
 For Tracy validation, use a profile build on a machine with at least two logical processors and load texture-heavy maps in both games. The capture should show up to two concurrent `Texture.Prepare` worker zones, with their corresponding `Texture.Upload` zones on the render owner thread. No worker may call Direct3D, dereference a live texture, wait for another worker, or access engine globals.
 

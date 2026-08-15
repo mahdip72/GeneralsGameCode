@@ -50,6 +50,9 @@
 
 constexpr const char s_genrep[] = "GENREP";
 constexpr const UnsignedInt replayBufferBytes = 8192;
+// The build-time field is variable length and ignored by compatibility checks, so a suffix records
+// deterministic AI behavior without changing the retail replay header layout.
+static const WideChar s_skirmishAILivenessReplayMarker[] = L" [SkirmishAILiveness=1]";
 
 Int REPLAY_CRC_INTERVAL = 100;
 
@@ -82,6 +85,11 @@ static void writeAtOffset(File* file, Int offset, const void* data, Int dataSize
 	MAYBE_UNUSED Int res = file->seek(fileSize, File::seekMode::START);
 	(void)res;
 	DEBUG_ASSERTCRASH(res == fileSize, ("Could not seek to end of file!"));
+}
+
+static Bool replayVersionUsesSkirmishAILivenessRecovery(const UnicodeString& versionTimeString)
+{
+	return versionTimeString.endsWith(s_skirmishAILivenessReplayMarker);
 }
 
 #if defined(RTS_DEBUG)
@@ -378,6 +386,7 @@ void RecorderClass::init() {
 	m_wasDesync = FALSE;
 	m_doingAnalysis = FALSE;
 	m_playbackFrameCount = 0;
+	m_replayUsesSkirmishAILivenessRecovery = FALSE;
 
 	OptionPreferences optionPref;
 	m_archiveReplays = optionPref.getArchiveReplaysEnabled();
@@ -573,6 +582,7 @@ void RecorderClass::startRecording(GameDifficulty diff, Int originalGameMode, In
 	// write out version info
 	UnicodeString versionString = TheVersion->getUnicodeVersion();
 	UnicodeString versionTimeString = TheVersion->getUnicodeBuildTime();
+	versionTimeString.concat(s_skirmishAILivenessReplayMarker);
 	UnsignedInt versionNumber = TheVersion->getVersionNumber();
 	m_file->writeFormat(L"%s", versionString.str());
 	m_file->writeChar(L"\0");
@@ -1079,6 +1089,8 @@ Bool RecorderClass::replayMatchesGameVersion(const ReplayHeader& header)
  */
 Bool RecorderClass::playbackFile(AsciiString filename)
 {
+	m_replayUsesSkirmishAILivenessRecovery = FALSE;
+
 	if (!m_doingAnalysis)
 	{
 		if (TheGameLogic->isInGame())
@@ -1095,10 +1107,14 @@ Bool RecorderClass::playbackFile(AsciiString filename)
 	{
 		return FALSE;
 	}
+	m_replayUsesSkirmishAILivenessRecovery = replayVersionUsesSkirmishAILivenessRecovery(header.versionTimeString);
 
 #ifdef DEBUG_CRASHING
 	Bool versionStringDiff = header.versionString != TheVersion->getUnicodeVersion();
-	Bool versionTimeStringDiff = header.versionTimeString != TheVersion->getUnicodeBuildTime();
+	UnicodeString markedVersionTimeString = TheVersion->getUnicodeBuildTime();
+	markedVersionTimeString.concat(s_skirmishAILivenessReplayMarker);
+	Bool versionTimeStringDiff = header.versionTimeString != TheVersion->getUnicodeBuildTime()
+		&& header.versionTimeString != markedVersionTimeString;
 	Bool versionNumberDiff = header.versionNumber != TheVersion->getVersionNumber();
 	Bool exeCRCDiff = header.exeCRC != TheGlobalData->m_exeCRC;
 	Bool exeDifferent = versionStringDiff || versionTimeStringDiff || versionNumberDiff || exeCRCDiff;

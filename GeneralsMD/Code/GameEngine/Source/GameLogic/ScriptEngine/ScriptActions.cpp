@@ -39,6 +39,7 @@
 #include "Common/PlayerList.h"
 #include "Common/PlayerTemplate.h"
 #include "Common/Radar.h"									// For TheRadar
+#include "Common/Recorder.h"
 #include "Common/SpecialPower.h"
 #include "Common/ThingFactory.h"
 #include "Common/ThingTemplate.h"
@@ -1793,6 +1794,7 @@ void ScriptActions::doTeamFollowSkirmishApproachPath(const AsciiString& teamName
 
 	Object *firstUnit=nullptr;
 	Object *pathingUnit=nullptr;
+	Bool useLivenessRecovery = ShouldUseSkirmishAILivenessRecovery(TheGameLogic->isInReplayGame(), TheRecorder && TheRecorder->replayUsesSkirmishAILivenessRecovery());
 	// Get the center point for the team
 	for (DLINK_ITERATOR<Object> iter = theTeam->iterate_TeamMemberList(); !iter.done(); iter.advance())
 	{
@@ -1805,9 +1807,11 @@ void ScriptActions::doTeamFollowSkirmishApproachPath(const AsciiString& teamName
 		if (firstUnit==nullptr) {
 			firstUnit = obj;
 		}
-		AIUpdateInterface *ai = obj->getAIUpdateInterface();
-		if (pathingUnit == nullptr && ai && (ai->getLocomotorSet().getValidSurfaces() & LOCOMOTORSURFACE_GROUND)) {
-			pathingUnit = obj;
+		if (useLivenessRecovery) {
+			AIUpdateInterface *ai = obj->getAIUpdateInterface();
+			if (pathingUnit == nullptr && ai && (ai->getLocomotorSet().getValidSurfaces() & LOCOMOTORSURFACE_GROUND)) {
+				pathingUnit = obj;
+			}
 		}
 	}
 	if (count==0) return; // empty team.
@@ -1821,14 +1825,16 @@ void ScriptActions::doTeamFollowSkirmishApproachPath(const AsciiString& teamName
 
 	AsciiString pathLabel;
 	pathLabel.format("%s%d", waypointPathLabel.str(), mpNdx);
-	Waypoint *way = getBestSkirmishApproachWaypoint(pos, pathLabel, pathingUnit);
+	Waypoint *way = useLivenessRecovery ?
+		getBestSkirmishApproachWaypoint(pos, pathLabel, pathingUnit) :
+		TheTerrainLogic->getClosestWaypointOnPath(&pos, pathLabel);
 	if (!way) {
 		return;
 	}
 
 	Player *aiPlayer = TheScriptEngine->getCurrentPlayer();
 	if (aiPlayer && firstUnit) {
-		aiPlayer->checkBridges(pathingUnit ? pathingUnit : firstUnit, way);
+		aiPlayer->checkBridges(useLivenessRecovery && pathingUnit ? pathingUnit : firstUnit, way);
 	}
 
 	DEBUG_ASSERTLOG(TheTerrainLogic->isPurposeOfPath(way, pathLabel), ("***Wrong waypoint purpose. Make jba fix this."));
@@ -1863,6 +1869,7 @@ void ScriptActions::doTeamMoveToSkirmishApproachPath(const AsciiString& teamName
 	Coord3D pos;
 	pos.x=pos.y=pos.z=0;
 	Object *pathingUnit=nullptr;
+	Bool useLivenessRecovery = ShouldUseSkirmishAILivenessRecovery(TheGameLogic->isInReplayGame(), TheRecorder && TheRecorder->replayUsesSkirmishAILivenessRecovery());
 
 	// Get the center point for the team
 	for (DLINK_ITERATOR<Object> iter = theTeam->iterate_TeamMemberList(); !iter.done(); iter.advance())
@@ -1873,9 +1880,11 @@ void ScriptActions::doTeamMoveToSkirmishApproachPath(const AsciiString& teamName
 		pos.y += objPos.y;
 		pos.z += objPos.z; // Not actually used by getClosestWaypointOnPath, but hey, might as well be correct.
 		count++;
-		AIUpdateInterface *ai = obj->getAIUpdateInterface();
-		if (pathingUnit == nullptr && ai && (ai->getLocomotorSet().getValidSurfaces() & LOCOMOTORSURFACE_GROUND)) {
-			pathingUnit = obj;
+		if (useLivenessRecovery) {
+			AIUpdateInterface *ai = obj->getAIUpdateInterface();
+			if (pathingUnit == nullptr && ai && (ai->getLocomotorSet().getValidSurfaces() & LOCOMOTORSURFACE_GROUND)) {
+				pathingUnit = obj;
+			}
 		}
 	}
 	if (count==0) return; // empty team.
@@ -1889,7 +1898,9 @@ void ScriptActions::doTeamMoveToSkirmishApproachPath(const AsciiString& teamName
 
 	AsciiString pathLabel;
 	pathLabel.format("%s%d", waypointPathLabel.str(), mpNdx);
-	Waypoint *way = getBestSkirmishApproachWaypoint(pos, pathLabel, pathingUnit);
+	Waypoint *way = useLivenessRecovery ?
+		getBestSkirmishApproachWaypoint(pos, pathLabel, pathingUnit) :
+		TheTerrainLogic->getClosestWaypointOnPath(&pos, pathLabel);
 	if (!way) {
 		return;
 	}
