@@ -339,32 +339,9 @@ private:
 class VolumeTextureLoadTaskClass : public TextureLoadTaskClass
 {
 public:
-	VolumeTextureLoadTaskClass();
-
 	virtual void			Destroy						() override;
-	virtual void			Init							(TextureBaseClass *tc, TaskType type, PriorityType priority) override;
 
 protected:
 	virtual bool			Begin_Compressed_Load	() override;
 	virtual bool			Begin_Uncompressed_Load	() override;
-
-	virtual bool			Load_Compressed_Mipmap	() override;
-	virtual bool			Allocate_Prepared_Surfaces() override;
-	virtual bool			Create_D3D_Texture		() override;
-	virtual bool			Upload_Prepared_Surfaces() override;
-//	virtual bool			Load_Uncompressed_Mipmap() override;
-
-	virtual void			Lock_Surfaces				() override;
-	virtual void			Unlock_Surfaces			() override;
-
-private:
-	unsigned char*			Get_Locked_Volume_Pointer(unsigned int level);
-	unsigned int			Get_Locked_Volume_Row_Pitch(unsigned int level);
-	unsigned int			Get_Locked_Volume_Slice_Pitch(unsigned int level);
-
-	IDirect3DVolumeTexture8*	Peek_D3D_Volume_Texture()				{ return (IDirect3DVolumeTexture8*)D3DTexture;		}
-
-	unsigned	int			LockedSurfaceSlicePitch[MIP_LEVELS_MAX];
-
-	unsigned int		Depth;
 };

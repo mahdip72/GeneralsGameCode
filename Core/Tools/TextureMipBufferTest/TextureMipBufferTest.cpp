@@ -5,7 +5,124 @@
 #include <stdio.h>
 #include <string.h>
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
+
 static int s_failures = 0;
+
+#if defined(_WIN32)
+typedef DWORD TestThreadId;
+
+static TestThreadId currentThreadId()
+{
+	return GetCurrentThreadId();
+}
+
+static bool sameThread(TestThreadId left, TestThreadId right)
+{
+	return left == right;
+}
+#else
+typedef pthread_t TestThreadId;
+
+static TestThreadId currentThreadId()
+{
+	return pthread_self();
+}
+
+static bool sameThread(TestThreadId left, TestThreadId right)
+{
+	return pthread_equal(left, right) != 0;
+}
+#endif
+
+class WorkerGate
+{
+public:
+	WorkerGate()
+#if defined(_WIN32)
+		: m_entered(CreateEvent(0, TRUE, FALSE, 0)), m_open(CreateEvent(0, TRUE, FALSE, 0))
+#endif
+	{
+#if !defined(_WIN32)
+		pthread_mutex_init(&m_mutex, 0);
+		pthread_cond_init(&m_condition, 0);
+		m_entered = false;
+		m_open = false;
+#endif
+	}
+
+	~WorkerGate()
+	{
+#if defined(_WIN32)
+		CloseHandle(m_entered);
+		CloseHandle(m_open);
+#else
+		pthread_cond_destroy(&m_condition);
+		pthread_mutex_destroy(&m_mutex);
+#endif
+	}
+
+	void enterAndWait()
+	{
+#if defined(_WIN32)
+		SetEvent(m_entered);
+		WaitForSingleObject(m_open, INFINITE);
+#else
+		pthread_mutex_lock(&m_mutex);
+		m_entered = true;
+		pthread_cond_broadcast(&m_condition);
+		while (!m_open)
+		{
+			pthread_cond_wait(&m_condition, &m_mutex);
+		}
+		pthread_mutex_unlock(&m_mutex);
+#endif
+	}
+
+	void waitForEntry()
+	{
+#if defined(_WIN32)
+		WaitForSingleObject(m_entered, INFINITE);
+#else
+		pthread_mutex_lock(&m_mutex);
+		while (!m_entered)
+		{
+			pthread_cond_wait(&m_condition, &m_mutex);
+		}
+		pthread_mutex_unlock(&m_mutex);
+#endif
+	}
+
+	void open()
+	{
+#if defined(_WIN32)
+		SetEvent(m_open);
+#else
+		pthread_mutex_lock(&m_mutex);
+		m_open = true;
+		pthread_cond_broadcast(&m_condition);
+		pthread_mutex_unlock(&m_mutex);
+#endif
+	}
+
+private:
+	WorkerGate(const WorkerGate&);
+	WorkerGate& operator=(const WorkerGate&);
+
+#if defined(_WIN32)
+	HANDLE m_entered;
+	HANDLE m_open;
+#else
+	pthread_mutex_t m_mutex;
+	pthread_cond_t m_condition;
+	bool m_entered;
+	bool m_open;
+#endif
+};
 
 unsigned Get_Bytes_Per_Pixel(WW3DFormat format)
 {
@@ -271,13 +388,35 @@ class MipCopyTask : public rts::Task
 {
 public:
 	MipCopyTask(const unsigned char* source, const TextureMipLayout& sourceLayout,
-		TextureMipBuffer* destination, bool* copied)
-		: m_source(source), m_sourceLayout(sourceLayout), m_destination(destination), m_copied(copied)
+		TextureMipBuffer* destination, bool* copied, WorkerGate* gate = 0,
+		TestThreadId* threadId = 0, unsigned* executions = 0, unsigned* destructions = 0)
+		: m_source(source), m_sourceLayout(sourceLayout), m_destination(destination), m_copied(copied),
+		  m_gate(gate), m_threadId(threadId), m_executions(executions), m_destructions(destructions)
 	{
+	}
+
+	virtual ~MipCopyTask()
+	{
+		if (m_destructions != 0)
+		{
+			++*m_destructions;
+		}
 	}
 
 	virtual void execute()
 	{
+		if (m_threadId != 0)
+		{
+			*m_threadId = currentThreadId();
+		}
+		if (m_executions != 0)
+		{
+			++*m_executions;
+		}
+		if (m_gate != 0)
+		{
+			m_gate->enterAndWait();
+		}
 		*m_copied = m_destination->copyFrom(m_source, m_sourceLayout, 1);
 	}
 
@@ -286,6 +425,10 @@ private:
 	TextureMipLayout m_sourceLayout;
 	TextureMipBuffer* m_destination;
 	bool* m_copied;
+	WorkerGate* m_gate;
+	TestThreadId* m_threadId;
+	unsigned* m_executions;
+	unsigned* m_destructions;
 };
 
 static void testTwoWorkerOwnedBuffersAreIndependent()
@@ -299,8 +442,17 @@ static void testTwoWorkerOwnedBuffersAreIndependent()
 	TextureMipBuffer serialTwo;
 	rts::TaskRuntime runtime;
 	rts::Task* tasks[2];
+	WorkerGate firstGate;
+	WorkerGate secondGate;
+	TestThreadId callerThread = currentThreadId();
+	TestThreadId firstWorker;
+	TestThreadId secondWorker;
 	bool copiedOne = false;
 	bool copiedTwo = false;
+	unsigned firstExecutions = 0;
+	unsigned secondExecutions = 0;
+	unsigned firstDestructions = 0;
+	unsigned secondDestructions = 0;
 	unsigned i;
 
 	sourceLayout.rowPitch = 4;
@@ -316,14 +468,39 @@ static void testTwoWorkerOwnedBuffersAreIndependent()
 		serialOne.copyFrom(sourceOne, sourceLayout, 1), "first serial baseline prepares");
 	expectTrue(serialTwo.allocate(WW3D_FORMAT_R5G6B5, 2, 2, 1) &&
 		serialTwo.copyFrom(sourceTwo, sourceLayout, 1), "second serial baseline prepares");
-	expectTrue(runtime.start(2, 2), "two-worker runtime starts");
+	if (!runtime.start(2, 2))
+	{
+		expectTrue(false, "two-worker runtime starts");
+		return;
+	}
 
-	tasks[0] = new MipCopyTask(sourceOne, sourceLayout, &destinationOne, &copiedOne);
-	tasks[1] = new MipCopyTask(sourceTwo, sourceLayout, &destinationTwo, &copiedTwo);
-	expectTrue(runtime.trySubmitBatch(tasks, 2), "both owned buffer tasks are accepted atomically");
+	tasks[0] = new MipCopyTask(sourceOne, sourceLayout, &destinationOne, &copiedOne,
+		&firstGate, &firstWorker, &firstExecutions, &firstDestructions);
+	tasks[1] = new MipCopyTask(sourceTwo, sourceLayout, &destinationTwo, &copiedTwo,
+		&secondGate, &secondWorker, &secondExecutions, &secondDestructions);
+	if (!runtime.trySubmitBatch(tasks, 2))
+	{
+		expectTrue(false, "both owned buffer tasks are accepted atomically");
+		delete tasks[0];
+		delete tasks[1];
+		runtime.shutdown();
+		return;
+	}
+	firstGate.waitForEntry();
+	secondGate.waitForEntry();
+	expectTrue(!sameThread(firstWorker, callerThread) && !sameThread(secondWorker, callerThread),
+		"accepted preparation executes on worker threads");
+	expectTrue(!sameThread(firstWorker, secondWorker),
+		"two accepted preparations occupy distinct workers concurrently");
+	firstGate.open();
+	secondGate.open();
 	runtime.waitUntilIdle();
 	runtime.shutdown();
 	expectTrue(copiedOne && copiedTwo, "both worker copies report success");
+	expectTrue(firstExecutions == 1 && secondExecutions == 1,
+		"accepted preparation tasks execute exactly once");
+	expectTrue(firstDestructions == 1 && secondDestructions == 1,
+		"accepted preparation tasks are destroyed exactly once");
 
 	for (i = 0; i < 8; ++i)
 	{
@@ -332,6 +509,95 @@ static void testTwoWorkerOwnedBuffersAreIndependent()
 		expectTrue(destinationTwo.data()[i] == serialTwo.data()[i],
 			"second worker output matches serial preparation");
 	}
+}
+
+static void testRejectedPreparationRunsOnCaller()
+{
+	static const unsigned char activeSource[8] = { 31, 32, 33, 34, 35, 36, 37, 38 };
+	static const unsigned char queuedSource[8] = { 41, 42, 43, 44, 45, 46, 47, 48 };
+	static const unsigned char rejectedSource[8] = { 51, 52, 53, 54, 55, 56, 57, 58 };
+	TextureMipLayout sourceLayout;
+	TextureMipBuffer activeDestination;
+	TextureMipBuffer queuedDestination;
+	TextureMipBuffer rejectedDestination;
+	rts::TaskRuntime runtime;
+	WorkerGate activeGate;
+	TestThreadId callerThread = currentThreadId();
+	TestThreadId rejectedThread;
+	bool activeCopied = false;
+	bool queuedCopied = false;
+	bool rejectedCopied = false;
+	bool rejectedAccepted;
+	unsigned rejectedExecutions = 0;
+	unsigned rejectedDestructions = 0;
+	rts::Task* activeTask;
+	rts::Task* queuedTask;
+	MipCopyTask* rejectedTask;
+	unsigned i;
+
+	sourceLayout.rowPitch = 4;
+	sourceLayout.rowCount = 2;
+	sourceLayout.slicePitch = 8;
+	sourceLayout.dataSize = 8;
+	expectTrue(activeDestination.allocate(WW3D_FORMAT_R5G6B5, 2, 2, 1),
+		"active fallback fixture allocates");
+	expectTrue(queuedDestination.allocate(WW3D_FORMAT_R5G6B5, 2, 2, 1),
+		"queued fallback fixture allocates");
+	expectTrue(rejectedDestination.allocate(WW3D_FORMAT_R5G6B5, 2, 2, 1),
+		"rejected fallback fixture allocates");
+	if (!runtime.start(1, 1))
+	{
+		expectTrue(false, "single-worker fallback runtime starts");
+		return;
+	}
+
+	activeTask = new MipCopyTask(activeSource, sourceLayout, &activeDestination,
+		&activeCopied, &activeGate);
+	if (!runtime.trySubmit(activeTask))
+	{
+		expectTrue(false, "active preparation task is accepted");
+		delete activeTask;
+		runtime.shutdown();
+		return;
+	}
+	activeGate.waitForEntry();
+	queuedTask = new MipCopyTask(queuedSource, sourceLayout, &queuedDestination, &queuedCopied);
+	if (!runtime.trySubmit(queuedTask))
+	{
+		expectTrue(false, "queued preparation task is accepted");
+		delete queuedTask;
+		activeGate.open();
+		runtime.shutdown();
+		return;
+	}
+	rejectedTask = new MipCopyTask(rejectedSource, sourceLayout, &rejectedDestination,
+		&rejectedCopied, 0, &rejectedThread, &rejectedExecutions, &rejectedDestructions);
+	rejectedAccepted = runtime.trySubmit(rejectedTask);
+	expectTrue(!rejectedAccepted,
+		"saturated preparation queue rejects without taking ownership");
+	if (rejectedAccepted)
+	{
+		activeGate.open();
+		runtime.shutdown();
+		return;
+	}
+	rejectedTask->execute();
+	delete rejectedTask;
+	expectTrue(sameThread(rejectedThread, callerThread),
+		"rejected preparation executes synchronously on the caller");
+	expectTrue(rejectedExecutions == 1 && rejectedDestructions == 1,
+		"caller-owned rejected preparation executes and destroys exactly once");
+	expectTrue(rejectedCopied, "rejected preparation copies its owned buffer");
+	for (i = 0; i < 8; ++i)
+	{
+		expectTrue(rejectedDestination.data()[i] == rejectedSource[i],
+			"rejected caller output matches its source bytes");
+	}
+
+	activeGate.open();
+	runtime.shutdown();
+	expectTrue(activeCopied && queuedCopied,
+		"shutdown drains accepted preparation tasks after caller fallback");
 }
 
 int main()
@@ -345,6 +611,7 @@ int main()
 	testVerticalMipTailGeneratesPixels();
 	testGenericMipTailsPreservePitches();
 	testTwoWorkerOwnedBuffersAreIndependent();
+	testRejectedPreparationRunsOnCaller();
 
 	if (s_failures != 0)
 	{

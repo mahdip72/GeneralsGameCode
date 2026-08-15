@@ -855,10 +855,19 @@ void TextureLoader::Request_Foreground_Loading(TextureBaseClass *tc)
 		}
 
 		if (task) {
-			// A task already owned by the bounded runtime cannot be stolen.
-			// Marking it high priority makes the render thread upload it as
-			// soon as its completion reaches the foreground queue.
 			task->Set_Priority(TextureLoadTaskClass::PRIORITY_HIGH);
+			// Reclaim queued preparation immediately so the render owner can
+			// finish it ahead of unrelated FIFO work. An active worker keeps
+			// ownership and will publish the task normally; this caller must not
+			// block while holding the foreground lock.
+			bool wasSubmitted = false;
+			rts::Task *runtimeTask = _ForegroundQueue.Take_Prepare_Task(
+				task, _TexturePrepareRuntime, wasSubmitted);
+			if (runtimeTask != nullptr)
+			{
+				delete runtimeTask;
+				_ForegroundQueue.Push_Back(task);
+			}
 
 		} else {
 			// allocate high priority load task
@@ -1574,7 +1583,6 @@ static void Validate_Reduction(const TextureBaseClass* texture, unsigned& reduct
 
 // Will not present textures smaller than 4 pixels wide or high.
 static constexpr const unsigned MinTextureDim = 4u;
-static constexpr const unsigned MinTextureDepth = 1u;
 
 // If the size doesn't match, try and see if texture reduction would help...
 // (mainly for cases where loaded texture is larger than hardware limit)
@@ -1600,33 +1608,6 @@ static void Apply_Dim_Reduction(unsigned& width, unsigned& height, unsigned& red
 		}
 	}
 }
-
-// If the size doesn't match, try and see if texture reduction would help...
-// (mainly for cases where loaded texture is larger than hardware limit)
-static void Apply_Dim_Reduction_With_Depth(unsigned& width, unsigned& height, unsigned& depth, unsigned& reduction, unsigned mip_count)
-{
-	for (unsigned r = reduction; r < mip_count; ++r)
-	{
-		unsigned w = max(width >> r, MinTextureDim);
-		unsigned h = max(height >> r, MinTextureDim);
-		unsigned d = max(depth >> r, MinTextureDepth);
-		unsigned tmp_w = w;
-		unsigned tmp_h = h;
-		unsigned tmp_d = d;
-
-		TextureLoader::Validate_Texture_Size(w, h, d);
-
-		if (w == tmp_w && h == tmp_h && d == tmp_d)
-		{
-			width = w;
-			height = h;
-			depth = d;
-			reduction = r;
-			break;
-		}
-	}
-}
-
 
 static void Apply_Mip_Reduction(unsigned& mip_level_count, unsigned reduction, unsigned width, unsigned height, unsigned mip_count)
 {
@@ -2539,21 +2520,6 @@ unsigned int CubeTextureLoadTaskClass::Get_Locked_CubeMap_Surface_Pitch(unsigned
 
 
 // VolumeTextureLoadTaskClass
-VolumeTextureLoadTaskClass::VolumeTextureLoadTaskClass()
-:	TextureLoadTaskClass()
-{
-	// because texture load tasks are pooled, the constructor and destructor
-	// don't need to do much. The work of attaching a task to a texture is
-	// is done by Init() and Deinit().
-
-	for (int i = 0; i < MIP_LEVELS_MAX; ++i)
-	{
-		LockedSurfacePtr[i]			= nullptr;
-		LockedSurfacePitch[i]		= 0;
-		LockedSurfaceSlicePitch[i]	= 0;
-	}
-}
-
 void VolumeTextureLoadTaskClass::Destroy()
 {
 	// detach the task from its texture, and return to free pool.
@@ -2561,302 +2527,16 @@ void VolumeTextureLoadTaskClass::Destroy()
 	_VolTexLoadFreeList.Push_Front(this);
 }
 
-void VolumeTextureLoadTaskClass::Init(TextureBaseClass* tc, TaskType type, PriorityType priority)
-{
-	WWASSERT(tc);
-
-	// NOTE: we must be in the main thread to avoid corrupting the texture's refcount.
-	WWASSERT(TextureLoader::Is_DX8_Thread());
-	REF_PTR_SET(Texture, tc);
-
-	// Make sure texture has a filename.
-	WWASSERT(!Texture->Get_Full_Path().Is_Empty());
-
-	Type				= type;
-	Priority			= priority;
-	State				= STATE_NONE;
-
-	D3DTexture		= nullptr;
-
-	VolumeTextureClass* tex=Texture->As_VolumeTextureClass();
-
-	if (tex)
-	{
-		Format			= tex->Get_Texture_Format(); // don't assume format yet KM
-	}
-	else
-	{
-		Format			= WW3D_FORMAT_UNKNOWN;
-	}
-
-	Width				= 0;
-	Height			= 0;
-	Depth				= 0;
-	MipLevelCount	= Texture->MipLevelCount;
-	Reduction		= Texture->Get_Reduction();
-	HSVShift			= Texture->Get_HSV_Shift();
-	SourceFormat		= WW3D_FORMAT_UNKNOWN;
-	SourceBytesPerPixel = 0;
-	CompressionAllowed = Texture->Is_Compression_Allowed();
-	LoadSucceeded	= false;
-	DDSFile			= nullptr;
-	TargaFile		= nullptr;
-	strlcpy(Filename, Texture->Get_Full_Path().str(), ARRAY_SIZE(Filename));
-
-
-	for (int i = 0; i < MIP_LEVELS_MAX; ++i)
-	{
-		LockedSurfacePtr[i]			= nullptr;
-		LockedSurfacePitch[i]		= 0;
-		LockedSurfaceSlicePitch[i]	= 0;
-	}
-
-	switch (Type)
-	{
-	case TASK_THUMBNAIL:
-		WWASSERT(Texture->ThumbnailLoadTask == nullptr);
-		Texture->ThumbnailLoadTask = this;
-		break;
-
-	case TASK_LOAD:
-		WWASSERT(Texture->TextureLoadTask == nullptr);
-		Texture->TextureLoadTask = this;
-		break;
-	}
-}
-
-void VolumeTextureLoadTaskClass::Lock_Surfaces()
-{
-	for (unsigned int i=0; i<MipLevelCount; i++)
-	{
-		D3DLOCKED_BOX locked_box;
-		DX8_ErrorCode
-		(
-			Peek_D3D_Volume_Texture()->LockBox
-			(
-				i,
-				&locked_box,
-				nullptr,
-				0
-			)
-		);
-		LockedSurfacePtr[i]			= (unsigned char *)locked_box.pBits;
-		LockedSurfacePitch[i]		= locked_box.RowPitch;
-		LockedSurfaceSlicePitch[i]	= locked_box.SlicePitch;
-	}
-}
-
-
-void VolumeTextureLoadTaskClass::Unlock_Surfaces()
-{
-	for (unsigned int i = 0; i < MipLevelCount; ++i)
-	{
-		if (LockedSurfacePtr[i])
-		{
-			WWASSERT(ThreadClass::_Get_Current_Thread_ID() == DX8Wrapper::_Get_Main_Thread_ID());
-			DX8_ErrorCode
-			(
-				Peek_D3D_Volume_Texture()->UnlockBox(i)
-			);
-		}
-		LockedSurfacePtr[i] = nullptr;
-	}
-
-#ifndef USE_MANAGED_TEXTURES
-	IDirect3DTexture8* tex = DX8Wrapper::_Create_DX8_Volume_Texture(Width, Height, Depth, Format, Texture->MipLevelCount,D3DPOOL_DEFAULT);
-	DX8CALL(UpdateTexture(Peek_D3D_Volume_Texture(),tex));
-	Peek_D3D_Volume_Texture()->Release();
-	D3DTexture=tex;
-	WWDEBUG_SAY(("Created non-managed texture (%s)",Texture->Get_Full_Path()));
-#endif
-
-}
-
-
-
 bool VolumeTextureLoadTaskClass::Begin_Compressed_Load()
 {
-	unsigned orig_width,orig_height,orig_depth,orig_mip_count,orig_reduction;
-	WW3DFormat orig_format;
-	if (!Get_Texture_Information
-		  (
-				Filename,
-				orig_reduction,
-				orig_width,
-				orig_height,
-				orig_depth,
-				orig_format,
-				orig_mip_count,
-				true
-		  )
-		)
-	{
-		return false;
-	}
-
-	Format = Get_Valid_Texture_Format(orig_format, Texture->Is_Compression_Allowed());
-
-	Reduction = orig_reduction;
-	Validate_Reduction(Texture, Reduction, orig_mip_count);
-
-	Width = orig_width;
-	Height = orig_height;
-	Depth = orig_depth;
-	Apply_Dim_Reduction_With_Depth(Width, Height, Depth, Reduction, orig_mip_count);
-
-	Apply_Mip_Reduction(MipLevelCount, Reduction, Width, Height, orig_mip_count);
-
-	try
-	{
-		DDSFile = new DDSFileClass(Filename, Reduction);
-	}
-	catch (...)
-	{
-		DDSFile = nullptr;
-	}
-	if (DDSFile == nullptr || !DDSFile->Is_Available() || !DDSFile->Load())
-	{
-		delete DDSFile;
-		DDSFile = nullptr;
-		return false;
-	}
-
-	if (!Allocate_Prepared_Surfaces())
-	{
-		delete DDSFile;
-		DDSFile = nullptr;
-		return false;
-	}
-
-	return true;
+	// Neither shipped DDS backend exposes volume-level source memory. Reject
+	// before reading the source, allocating prepared slices, or submitting a
+	// worker task so the existing owner-thread missing-texture fallback applies.
+	return false;
 }
 
 bool VolumeTextureLoadTaskClass::Begin_Uncompressed_Load()
 {
 	// The legacy loader has no defined TGA-to-volume source layout.
 	return false;
-}
-
-bool VolumeTextureLoadTaskClass::Load_Compressed_Mipmap()
-{
-	if (DDSFile == nullptr)
-	{
-		return false;
-	}
-	DDSFileClass& dds_file = *DDSFile;
-
-	// load volume
-	unsigned int width = Get_Width();
-	unsigned int height = Get_Height();
-	unsigned int depth = Depth;
-
-	for (unsigned int level=0; level<Get_Mip_Level_Count(); level++)
-	{
-		WWASSERT(width >= MinTextureDim && height >= MinTextureDim && depth >= MinTextureDepth);
-		if (dds_file.Get_Volume_Memory_Pointer(level) == nullptr)
-		{
-			return false;
-		}
-
-		// get volume
-		dds_file.Copy_Volume_Level_To_Surface
-		(
-			level,
-			depth,
-			Get_Format(),
-			width,
-			height,
-			Get_Locked_Volume_Pointer(level),
-			Get_Locked_Volume_Row_Pitch(level),
-			Get_Locked_Volume_Slice_Pitch(level),
-			HSVShift
-		);
-
-		width >>= 1;
-		height >>= 1;
-		depth = max(depth >> 1, MinTextureDepth);
-	}
-
-	return true;
-}
-
-
-bool VolumeTextureLoadTaskClass::Allocate_Prepared_Surfaces()
-{
-	unsigned int width = Width;
-	unsigned int height = Height;
-	unsigned int depth = Depth;
-
-	for (unsigned int level = 0; level < MipLevelCount; ++level)
-	{
-		if (!PreparedSurface[level].allocate(Format, width, height, depth))
-		{
-			Release_Prepared_Surfaces();
-			return false;
-		}
-		width = max(width >> 1, 1u);
-		height = max(height >> 1, 1u);
-		depth = max(depth >> 1, MinTextureDepth);
-	}
-	return true;
-}
-
-
-bool VolumeTextureLoadTaskClass::Create_D3D_Texture()
-{
-	D3DTexture = DX8Wrapper::_Create_DX8_Volume_Texture
-	(
-		Width,
-		Height,
-		Depth,
-		Format,
-		(MipCountType)MipLevelCount,
-#ifdef USE_MANAGED_TEXTURES
-		D3DPOOL_MANAGED
-#else
-		D3DPOOL_SYSTEMMEM
-#endif
-	);
-	return D3DTexture != nullptr;
-}
-
-
-bool VolumeTextureLoadTaskClass::Upload_Prepared_Surfaces()
-{
-	unsigned int depth = Depth;
-	for (unsigned int level = 0; level < MipLevelCount; ++level)
-	{
-		const TextureMipLayout& sourceLayout = PreparedSurface[level].layout();
-		TextureMipLayout destinationLayout;
-		if (!Build_Upload_Layout(sourceLayout, LockedSurfacePitch[level],
-			LockedSurfaceSlicePitch[level], depth, destinationLayout) ||
-			!CopyTextureMipData(PreparedSurface[level].data(), sourceLayout,
-				LockedSurfacePtr[level], destinationLayout, depth))
-		{
-			return false;
-		}
-		depth = max(depth >> 1, MinTextureDepth);
-	}
-	return true;
-}
-
-unsigned char* VolumeTextureLoadTaskClass::Get_Locked_Volume_Pointer(unsigned int level)
-{
-	WWASSERT(level<MipLevelCount);
-	WWASSERT(PreparedSurface[level].data());
-	return PreparedSurface[level].data();
-}
-
-unsigned int VolumeTextureLoadTaskClass::Get_Locked_Volume_Row_Pitch(unsigned int level)
-{
-	WWASSERT(level<MipLevelCount);
-	WWASSERT(PreparedSurface[level].layout().rowPitch);
-	return (unsigned int)PreparedSurface[level].layout().rowPitch;
-}
-
-unsigned int VolumeTextureLoadTaskClass::Get_Locked_Volume_Slice_Pitch(unsigned int level)
-{
-	WWASSERT(level<MipLevelCount);
-	WWASSERT(PreparedSurface[level].layout().slicePitch);
-	return (unsigned int)PreparedSurface[level].layout().slicePitch;
 }
