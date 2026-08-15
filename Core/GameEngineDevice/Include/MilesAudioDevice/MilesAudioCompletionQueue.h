@@ -32,7 +32,11 @@ inline long load(volatile long *value)
 inline long exchange(volatile long *value, long replacement)
 {
 #if defined(_WIN32)
+	#if defined(_MSC_VER) && _MSC_VER < 1300
+	return InterlockedExchange(const_cast<long *>(value), replacement);
+	#else
 	return InterlockedExchange(value, replacement);
+	#endif
 #else
 	return __sync_lock_test_and_set(value, replacement);
 #endif
@@ -41,7 +45,11 @@ inline long exchange(volatile long *value, long replacement)
 inline long increment(volatile long *value)
 {
 #if defined(_WIN32)
+	#if defined(_MSC_VER) && _MSC_VER < 1300
+	return InterlockedIncrement(const_cast<long *>(value));
+	#else
 	return InterlockedIncrement(value);
+	#endif
 #else
 	return __sync_add_and_fetch(value, 1);
 #endif
@@ -50,7 +58,11 @@ inline long increment(volatile long *value)
 inline long decrement(volatile long *value)
 {
 #if defined(_WIN32)
+	#if defined(_MSC_VER) && _MSC_VER < 1300
+	return InterlockedDecrement(const_cast<long *>(value));
+	#else
 	return InterlockedDecrement(value);
+	#endif
 #else
 	return __sync_sub_and_fetch(value, 1);
 #endif
@@ -69,7 +81,7 @@ inline void memoryBarrier()
 {
 #if defined(_WIN32)
 	#if defined(_MSC_VER) && _MSC_VER < 1300
-		volatile long barrier = 0;
+		long barrier = 0;
 		InterlockedExchange(&barrier, 0);
 	#else
 	MemoryBarrier();
