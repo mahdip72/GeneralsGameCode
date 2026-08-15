@@ -158,12 +158,13 @@ static void testConcurrentProducers()
 	queue.reset(41);
 	const unsigned producerCount = 4;
 	const unsigned recordsPerProducer = 8;
+	unsigned i;
 
 #if defined(_WIN32)
 	HANDLE start = CreateEvent(0, TRUE, FALSE, 0);
 	HANDLE threads[producerCount];
 	ProducerContext contexts[producerCount];
-	for (unsigned i = 0; i < producerCount; ++i)
+	for (i = 0; i < producerCount; ++i)
 	{
 		contexts[i].queue = &queue;
 		contexts[i].producer = i + 1;
@@ -175,7 +176,7 @@ static void testConcurrentProducers()
 	}
 	SetEvent(start);
 	WaitForMultipleObjects(producerCount, threads, TRUE, INFINITE);
-	for (unsigned i = 0; i < producerCount; ++i)
+	for (i = 0; i < producerCount; ++i)
 	{
 		CloseHandle(threads[i]);
 	}
@@ -185,7 +186,7 @@ static void testConcurrentProducers()
 	pthread_barrier_init(&start, 0, producerCount);
 	pthread_t threads[producerCount];
 	ProducerContext contexts[producerCount];
-	for (unsigned i = 0; i < producerCount; ++i)
+	for (i = 0; i < producerCount; ++i)
 	{
 		contexts[i].queue = &queue;
 		contexts[i].producer = i + 1;
@@ -195,7 +196,7 @@ static void testConcurrentProducers()
 		check(pthread_create(&threads[i], 0, producerEntry, &contexts[i]) == 0,
 			"producer thread starts");
 	}
-	for (unsigned i = 0; i < producerCount; ++i)
+	for (i = 0; i < producerCount; ++i)
 	{
 		pthread_join(threads[i], 0);
 	}
@@ -221,7 +222,7 @@ static void testConcurrentProducers()
 	}
 	check(drained == producerCount * recordsPerProducer, "all concurrent records drain");
 	check(!queue.consumeOverflow(), "concurrent producers do not overflow capacity");
-	for (unsigned i = 0; i < producerCount; ++i)
+	for (i = 0; i < producerCount; ++i)
 	{
 		check(contexts[i].accepted == recordsPerProducer,
 			"concurrent producer completion is accepted");
