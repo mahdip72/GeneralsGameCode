@@ -80,6 +80,7 @@
 
 #include "W3DDevice/Common/W3DConvert.h"
 #include "W3DDevice/GameClient/HeightMap.h"
+#include "W3DDevice/GameClient/TerrainDrawSizing.h"
 #include "W3DDevice/GameClient/WorldHeightMap.h"
 #include "W3DDevice/GameClient/W3DAssetManager.h"
 #include "W3DDevice/GameClient/W3DDisplay.h"
@@ -3722,13 +3723,42 @@ bool W3DView::getDesiredTerrainDrawSize(ICoord2D &dimensions) const
 
 	const Real cameraPitch = asin(fabs(m_3DCamera->Get_Forward_Dir().Z));
 
-	if (cameraPitch > ViewDefaultLowPitchRadians || !m_isUserControlled)
+	if (!m_isUserControlled)
 	{
 		// TheSuperHackers @info The scripted camera always uses the regular draw sizes
 		// and uses terrain oversize if it needs to enlarge.
 		dimensions.x = WorldHeightMap::NORMAL_DRAW_WIDTH;
 		dimensions.y = WorldHeightMap::NORMAL_DRAW_HEIGHT;
 		return true;
+	}
+
+	if (TheTerrainRenderObject)
+	{
+		const WorldHeightMap *heightMap = TheTerrainRenderObject->getMap();
+		if (heightMap)
+		{
+			const Vector3 cameraPosition = m_3DCamera->Get_Position();
+			const Real cameraToPivotX = cameraPosition.X - m_pos.x;
+			const Real cameraToPivotY = cameraPosition.Y - m_pos.y;
+			rts::TerrainDrawSizingInput input;
+			input.cameraHeight = cameraPosition.Z - TheTerrainRenderObject->getMinHeight();
+			input.cameraToPivotDistance = sqrt(
+				cameraToPivotX * cameraToPivotX + cameraToPivotY * cameraToPivotY);
+			input.pitchRadians = cameraPitch;
+			input.horizontalFovRadians = m_3DCamera->Get_Horizontal_FOV();
+			input.verticalFovRadians = m_3DCamera->Get_Vertical_FOV();
+			input.worldUnitsPerCell = MAP_XY_FACTOR;
+			input.mapWidth = heightMap->getXExtent();
+			input.mapHeight = heightMap->getYExtent();
+			input.minimumWidth = WorldHeightMap::NORMAL_DRAW_WIDTH;
+			input.minimumHeight = WorldHeightMap::NORMAL_DRAW_HEIGHT;
+			input.tileLength = VERTEX_BUFFER_TILE_LENGTH;
+
+			if (rts::CalculateTerrainDrawSize(input, dimensions.x, dimensions.y))
+			{
+				return true;
+			}
+		}
 	}
 
 	// TheSuperHackers @tweak xezon 31/12/2025 Increases visible terrain area when lowering the camera pitch.
