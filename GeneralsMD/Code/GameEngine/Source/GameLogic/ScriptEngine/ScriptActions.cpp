@@ -82,6 +82,7 @@
 #include "GameLogic/PolygonTrigger.h"
 #include "GameLogic/ScriptActions.h"
 #include "GameLogic/ScriptEngine.h"
+#include "GameLogic/SkirmishAILiveness.h"
 #include "GameLogic/Weapon.h"
 #include "GameLogic/VictoryConditions.h"
 #include "GameLogic/AIPathfind.h"
@@ -89,6 +90,82 @@
 
 // Kind of hacky, but we need to dance on the guts of the terrain.
 extern void oversizeTheTerrain(Int amount);
+
+static Bool isWaypointOnPath(const Waypoint *way, const AsciiString& pathLabel)
+{
+	return pathLabel.compareNoCase(way->getPathLabel1()) == 0 ||
+		pathLabel.compareNoCase(way->getPathLabel2()) == 0 ||
+		pathLabel.compareNoCase(way->getPathLabel3()) == 0;
+}
+
+static Bool waypointHasIncomingPathLink(const Waypoint *candidate, const AsciiString& pathLabel)
+{
+	for (Waypoint *way = TheTerrainLogic->getFirstWaypoint(); way; way = way->getNext())
+	{
+		if (way == candidate || !isWaypointOnPath(way, pathLabel))
+			continue;
+		for (Int linkIndex = 0; linkIndex < way->getNumLinks(); ++linkIndex)
+		{
+			if (way->getLink(linkIndex) == candidate)
+				return true;
+		}
+	}
+	return false;
+}
+
+static UnsignedInt countWaypointLinksOnPath(const Waypoint *candidate, const AsciiString& pathLabel)
+{
+	UnsignedInt count = 0;
+	for (Int linkIndex = 0; linkIndex < candidate->getNumLinks(); ++linkIndex)
+	{
+		Waypoint *link = candidate->getLink(linkIndex);
+		if (link && isWaypointOnPath(link, pathLabel))
+			++count;
+	}
+	return count;
+}
+
+static Waypoint *getBestSkirmishApproachWaypoint(const Coord3D& teamPosition, const AsciiString& pathLabel, Object *pathingUnit)
+{
+	AIUpdateInterface *ai = pathingUnit ? pathingUnit->getAIUpdateInterface() : nullptr;
+	if (!ai || !(ai->getLocomotorSet().getValidSurfaces() & LOCOMOTORSURFACE_GROUND))
+		return TheTerrainLogic->getClosestWaypointOnPath(&teamPosition, pathLabel);
+
+	Waypoint *best = nullptr;
+	Int bestPriority = 0;
+	Bool bestPassable = false;
+	Real bestDistanceSqr = 0.0f;
+	LocomotorSurfaceTypeMask surfaces = ai->getLocomotorSet().getValidSurfaces();
+
+	for (Waypoint *way = TheTerrainLogic->getFirstWaypoint(); way; way = way->getNext())
+	{
+		if (!isWaypointOnPath(way, pathLabel))
+			continue;
+
+		const Coord3D *wayPosition = way->getLocation();
+		Real dx = wayPosition->x - teamPosition.x;
+		Real dy = wayPosition->y - teamPosition.y;
+		Real distanceSqr = dx * dx + dy * dy;
+		Bool passable = TheAI->pathfinder()->isLinePassable(
+			pathingUnit, surfaces, pathingUnit->getLayer(), *pathingUnit->getPosition(), *wayPosition, false, true);
+		Int priority = passable ? 3 : GetSkirmishWaypointFallbackPriority(
+			waypointHasIncomingPathLink(way, pathLabel),
+			way->getBiDirectional(),
+			countWaypointLinksOnPath(way, pathLabel));
+
+		if (IsSkirmishWaypointCandidateBetter(
+			best != nullptr, bestPriority, bestPassable, bestDistanceSqr,
+			priority, passable, distanceSqr))
+		{
+			best = way;
+			bestPriority = priority;
+			bestPassable = passable;
+			bestDistanceSqr = distanceSqr;
+		}
+	}
+
+	return best;
+}
 
 //-------------------------------------------------------------------------------------------------
 //-------------------------------------------------------------------------------------------------
@@ -1715,6 +1792,7 @@ void ScriptActions::doTeamFollowSkirmishApproachPath(const AsciiString& teamName
 	pos.x=pos.y=pos.z=0;
 
 	Object *firstUnit=nullptr;
+	Object *pathingUnit=nullptr;
 	// Get the center point for the team
 	for (DLINK_ITERATOR<Object> iter = theTeam->iterate_TeamMemberList(); !iter.done(); iter.advance())
 	{
@@ -1726,6 +1804,10 @@ void ScriptActions::doTeamFollowSkirmishApproachPath(const AsciiString& teamName
 		count++;
 		if (firstUnit==nullptr) {
 			firstUnit = obj;
+		}
+		AIUpdateInterface *ai = obj->getAIUpdateInterface();
+		if (pathingUnit == nullptr && ai && (ai->getLocomotorSet().getValidSurfaces() & LOCOMOTORSURFACE_GROUND)) {
+			pathingUnit = obj;
 		}
 	}
 	if (count==0) return; // empty team.
@@ -1739,14 +1821,14 @@ void ScriptActions::doTeamFollowSkirmishApproachPath(const AsciiString& teamName
 
 	AsciiString pathLabel;
 	pathLabel.format("%s%d", waypointPathLabel.str(), mpNdx);
-	Waypoint *way = TheTerrainLogic->getClosestWaypointOnPath( &pos, pathLabel );
+	Waypoint *way = getBestSkirmishApproachWaypoint(pos, pathLabel, pathingUnit);
 	if (!way) {
 		return;
 	}
 
 	Player *aiPlayer = TheScriptEngine->getCurrentPlayer();
 	if (aiPlayer && firstUnit) {
-		aiPlayer->checkBridges(firstUnit, way);
+		aiPlayer->checkBridges(pathingUnit ? pathingUnit : firstUnit, way);
 	}
 
 	DEBUG_ASSERTLOG(TheTerrainLogic->isPurposeOfPath(way, pathLabel), ("***Wrong waypoint purpose. Make jba fix this."));
@@ -1780,6 +1862,7 @@ void ScriptActions::doTeamMoveToSkirmishApproachPath(const AsciiString& teamName
 	Int count = 0;
 	Coord3D pos;
 	pos.x=pos.y=pos.z=0;
+	Object *pathingUnit=nullptr;
 
 	// Get the center point for the team
 	for (DLINK_ITERATOR<Object> iter = theTeam->iterate_TeamMemberList(); !iter.done(); iter.advance())
@@ -1790,6 +1873,10 @@ void ScriptActions::doTeamMoveToSkirmishApproachPath(const AsciiString& teamName
 		pos.y += objPos.y;
 		pos.z += objPos.z; // Not actually used by getClosestWaypointOnPath, but hey, might as well be correct.
 		count++;
+		AIUpdateInterface *ai = obj->getAIUpdateInterface();
+		if (pathingUnit == nullptr && ai && (ai->getLocomotorSet().getValidSurfaces() & LOCOMOTORSURFACE_GROUND)) {
+			pathingUnit = obj;
+		}
 	}
 	if (count==0) return; // empty team.
 	pos.x /= count;
@@ -1802,7 +1889,7 @@ void ScriptActions::doTeamMoveToSkirmishApproachPath(const AsciiString& teamName
 
 	AsciiString pathLabel;
 	pathLabel.format("%s%d", waypointPathLabel.str(), mpNdx);
-	Waypoint *way = TheTerrainLogic->getClosestWaypointOnPath( &pos, pathLabel );
+	Waypoint *way = getBestSkirmishApproachWaypoint(pos, pathLabel, pathingUnit);
 	if (!way) {
 		return;
 	}
