@@ -34,6 +34,7 @@
 #include "Common/GlobalData.h"
 #include "Common/PerfTimer.h"
 #include "Common/Player.h"
+#include "Common/Recorder.h"
 #include "Common/SpecialPower.h"
 #include "Common/Team.h"
 #include "Common/ThingFactory.h"
@@ -364,8 +365,12 @@ void AIPlayer::queueSupplyTruck()
 							{
 								// This thinks he is a gatherer, but doesn't have a preferred dock id.
 								Object *center = TheGameLogic->findObjectByID(info->getObjectID());
-								Bool isRebuildHole = center && center->isKindOf(KINDOF_REBUILD_HOLE);
-								if (IsUsableSupplyCenter(center != nullptr, isRebuildHole)) {
+								Bool usableCenter = center != nullptr;
+								if (ShouldUseSkirmishAILivenessRecovery(TheGameLogic->isInReplayGame(), TheRecorder && TheRecorder->replayUsesSkirmishAILivenessRecovery())) {
+									Bool isRebuildHole = center && center->isKindOf(KINDOF_REBUILD_HOLE);
+									usableCenter = IsUsableSupplyCenter(usableCenter, isRebuildHole);
+								}
+								if (usableCenter) {
 									info->setCurrentGatherers(info->getCurrentGatherers()+1);
 									// Note - although this is the ai, we are sending in CMD_FROM_PLAYER.
 									// This causes the dock object to stick in the docking interface.
@@ -3743,11 +3748,16 @@ void WorkOrder::validateFactory( Player *thisPlayer )
 		m_factoryID = INVALID_ID;
 		return;
 	}
-	Bool sameOwner = factory->getControllingPlayer() == thisPlayer;
-	ProductionUpdateInterface *production = sameOwner ? factory->getProductionUpdateInterface() : nullptr;
-	UnsignedInt queuedUnitCount = production ? production->countUnitTypeInQueue(m_thing) : 0;
-	if (!IsWorkOrderFactoryQueueValid(sameOwner, production != nullptr, queuedUnitCount)) {
+	if (factory->getControllingPlayer() != thisPlayer) {
 		m_factoryID = INVALID_ID;
+		return;
+	}
+	if (ShouldUseSkirmishAILivenessRecovery(TheGameLogic->isInReplayGame(), TheRecorder && TheRecorder->replayUsesSkirmishAILivenessRecovery())) {
+		ProductionUpdateInterface *production = factory->getProductionUpdateInterface();
+		UnsignedInt queuedUnitCount = production ? production->countUnitTypeInQueue(m_thing) : 0;
+		if (!IsWorkOrderFactoryQueueValid(true, production != nullptr, queuedUnitCount)) {
+			m_factoryID = INVALID_ID;
+		}
 	}
 
 }

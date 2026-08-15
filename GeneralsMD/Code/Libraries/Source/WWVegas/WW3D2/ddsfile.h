@@ -183,6 +183,7 @@ class DDSFileClass
 	unsigned long DateTime;
 	unsigned ReductionFactor;
 	unsigned char* DDSMemory;
+	unsigned DDSMemorySize;
 	WW3DFormat Format;
 	DDSType	Type;
 	unsigned* LevelSizes;
@@ -210,6 +211,7 @@ public:
 	unsigned Get_Mip_Level_Count() const { return MipLevels; }
 	const unsigned char* Get_Memory_Pointer(unsigned level) const;
 	unsigned Get_Level_Size(unsigned level) const;
+	unsigned Get_Retained_Memory_Size() const { return DDSMemorySize; }
 	WW3DFormat Get_Format() const { return Format; }
 
 	DDSType Get_Type() const { return Type; }

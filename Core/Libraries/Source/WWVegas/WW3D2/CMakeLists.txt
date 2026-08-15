@@ -210,6 +210,8 @@ set(WW3D2_SRC
     texturefilter.h
     textureloader.cpp
     textureloader.h
+    texturemipbuffer.cpp
+    texturemipbuffer.h
     texturethumbnail.cpp
     texturethumbnail.h
     #vertmaterial.cpp

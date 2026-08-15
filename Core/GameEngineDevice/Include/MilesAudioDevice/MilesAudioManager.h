@@ -65,7 +65,7 @@ struct PlayingAudio
 	RefCountPtr<DynamicAudioEventRTS> m_audioEventRTS;
 	void *m_file; // The file that was opened to play this
 	PlayingAudioType m_type;
-	volatile PlayingStatus m_status; // This member is adjusted by another running thread.
+	volatile PlayingStatus m_status; // Atomically advanced by owner-thread lifecycle paths.
 	Short m_framesFaded;
 	Bool m_fade;
 	volatile Bool m_rerequestOnNextUpdate;
@@ -176,7 +176,7 @@ class MilesAudioManager : public AudioManager
 		///< NOTE NOTE NOTE !!DO NOT USE THIS IN FOR GAMELOGIC PURPOSES!! NOTE NOTE NOTE
 		virtual Bool isCurrentlyPlaying( AudioHandle handle ) override;
 
-		virtual void notifyOfAudioCompletion( UnsignedInt handle, UnsignedInt flags ) override; ///< Is called on MSS Timer thread
+		virtual void notifyOfAudioCompletion( UnsignedInt handle, UnsignedInt flags ) override; ///< Must run on the owner thread
 		virtual PlayingAudio *findPlayingAudioFrom( UnsignedInt handle, UnsignedInt flags );
 
 		virtual UnsignedInt getProviderCount() const override;
@@ -277,6 +277,8 @@ class MilesAudioManager : public AudioManager
 		void releasePlayingAudioInListIfStopped(std::list<PlayingAudio *> &list, CriticalSectionClass &cs);
 		void stopAllAudioImmediately();
 		void freeAllMilesHandles();
+		void drainAudioCompletions();
+		void recoverAudioCompletions();
 
 		HSAMPLE getAvailable2DSample( AudioEventRTS *event );
 		H3DSAMPLE getAvailable3DSample( AudioEventRTS *event );

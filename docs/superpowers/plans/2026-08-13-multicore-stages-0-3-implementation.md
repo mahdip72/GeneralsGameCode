@@ -142,6 +142,7 @@ Create `TaskRuntime.h` with `rts::Task`, private copy constructors/assignments, 
 ```cpp
 bool start(unsigned workerCount, unsigned queueCapacity);
 bool trySubmit(Task *task);
+bool trySubmitFront(Task *task);
 bool trySubmitBatch(Task *const *tasks, unsigned taskCount);
 void waitUntilIdle();
 void shutdown();

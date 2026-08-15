@@ -493,6 +493,87 @@ static int testFifoDequeueAtOneWorker()
 	return 0;
 }
 
+static int testFrontSubmissionPrecedesQueuedWork()
+{
+	const char *testName = "testFrontSubmissionPrecedesQueuedWork";
+	Gate gate;
+	TaskRecord activeRecord;
+	TaskRecord olderRecord;
+	TaskRecord newerRecord;
+	unsigned nextOrder = 0;
+	rts::TaskRuntime runtime;
+
+	CHECK(testName, runtime.start(1, 3));
+	CHECK(testName, runtime.trySubmit(new GateTask(&gate, &activeRecord)));
+	gate.waitForEntry();
+	CHECK(testName, runtime.trySubmit(new RecordingTask(&olderRecord, &nextOrder)));
+	CHECK(testName, runtime.trySubmitFront(new RecordingTask(&newerRecord, &nextOrder)));
+	gate.open();
+	runtime.waitUntilIdle();
+	runtime.shutdown();
+	CHECK(testName, newerRecord.order == 0);
+	CHECK(testName, olderRecord.order == 1);
+	CHECK(testName, newerRecord.executions == 1 && newerRecord.destructions == 1);
+	CHECK(testName, olderRecord.executions == 1 && olderRecord.destructions == 1);
+	return 0;
+}
+
+static int testQueuedTaskCanBeTakenWithoutTakingActiveTask()
+{
+	const char *testName = "testQueuedTaskCanBeTakenWithoutTakingActiveTask";
+	Gate gate;
+	TaskRecord activeRecord;
+	TaskRecord queuedRecord;
+	rts::TaskRuntime runtime;
+	rts::Task *activeTask = new GateTask(&gate, &activeRecord);
+	rts::Task *queuedTask = new RecordingTask(&queuedRecord, 0);
+	bool queuedTaken;
+	bool activeTaken;
+	int result = 0;
+
+	if (!runtime.start(1, 2))
+	{
+		delete activeTask;
+		delete queuedTask;
+		return check(false, testName, "runtime starts");
+	}
+	if (!runtime.trySubmit(activeTask))
+	{
+		delete activeTask;
+		delete queuedTask;
+		runtime.shutdown();
+		return check(false, testName, "active task is accepted");
+	}
+	gate.waitForEntry();
+	if (!runtime.trySubmit(queuedTask))
+	{
+		delete queuedTask;
+		gate.open();
+		runtime.shutdown();
+		return check(false, testName, "queued task is accepted");
+	}
+	queuedTaken = runtime.tryTake(queuedTask);
+	activeTaken = runtime.tryTake(activeTask);
+	if (queuedTaken)
+	{
+		delete queuedTask;
+	}
+	gate.open();
+	runtime.shutdown();
+	if (activeTaken)
+	{
+		delete activeTask;
+	}
+
+	result |= check(queuedTaken, testName, "queued task ownership returns to caller");
+	result |= check(!activeTaken, testName, "active task remains runtime owned");
+	result |= check(activeRecord.executions == 1, testName, "active task executes once");
+	result |= check(activeRecord.destructions == 1, testName, "active task is destroyed once");
+	result |= check(queuedRecord.executions == 0, testName, "taken task does not execute");
+	result |= check(queuedRecord.destructions == 1, testName, "taken task is destroyed once");
+	return result;
+}
+
 static int testBatchAdmissionIsAllOrNothing()
 {
 	const char *testName = "testBatchAdmissionIsAllOrNothing";
@@ -921,6 +1002,8 @@ int main()
 	result |= testInvalidStartArguments();
 	result |= testExactlyOnceAtOneAndFourWorkers();
 	result |= testFifoDequeueAtOneWorker();
+	result |= testFrontSubmissionPrecedesQueuedWork();
+	result |= testQueuedTaskCanBeTakenWithoutTakingActiveTask();
 	result |= testBatchAdmissionIsAllOrNothing();
 	result |= testDuplicateBatchIsRejectedWithoutPublishing();
 	result |= testQueueBackpressure();

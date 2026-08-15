@@ -97,6 +97,7 @@ public:
 
 	bool start(unsigned workerCount, unsigned queueCapacity);
 	bool trySubmit(Task *task);
+	bool trySubmitFront(Task *task);
 	bool trySubmitBatch(Task *const *tasks, unsigned taskCount);
 	void waitUntilIdle();
 	void shutdown();
@@ -121,7 +122,7 @@ Ownership rules:
 - `trySubmitBatch` transfers all tasks only when it returns `true`; a rejection transfers none.
 - The runtime deletes every accepted task after `execute()` returns.
 - Rejected tasks remain caller-owned and must be deleted by the caller.
-- FIFO dequeue is guaranteed; completion order is intentionally unspecified with more than one worker.
+- Normal submission has FIFO dequeue; the explicit single-task `trySubmitFront()` path places latency-sensitive work ahead of queued FIFO work. Completion order is intentionally unspecified with more than one worker.
 - `shutdown()` rejects future work, drains accepted work, joins workers, and is idempotent. It is called only by the owner, never by a task.
 - A task is finite, does not throw across `execute()`, and does not wait for tasks it created.
 
@@ -135,7 +136,7 @@ Ownership rules:
 
 ### Tests
 
-Add a `core_task_runtime_tests` console target under Core extras and register it with CTest. It verifies invalid start parameters, exact-once execution, single-worker FIFO behavior, atomic batch admission, queue rejection, drain shutdown, reuse after shutdown, and destructor drain/join. The test uses explicit platform events or condition variables for blocking; it never uses sleeps as synchronization.
+Add a `core_task_runtime_tests` console target under Core extras and register it with CTest. It verifies invalid start parameters, exact-once execution, single-worker FIFO behavior, explicit front submission, atomic batch admission, queue rejection, drain shutdown, reuse after shutdown, and destructor drain/join. The test uses explicit platform events or condition variables for blocking; it never uses sleeps as synchronization.
 
 The reusable CI build workflow runs CTest after every Core-extras build with the correct single- or multi-config arguments.
 

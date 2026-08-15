@@ -41,6 +41,7 @@
 #include <dsound.h>
 #include "Lib/BaseType.h"
 #include "MilesAudioDevice/AudioChannelPolicy.h"
+#include "MilesAudioDevice/MilesAudioCompletionQueue.h"
 #include "MilesAudioDevice/MilesAudioManager.h"
 
 #include "Common/AudioAffect.h"
@@ -77,6 +78,121 @@ static void AILCALLBACK setSampleCompleted( HSAMPLE sampleCompleted );
 static void AILCALLBACK set3DSampleCompleted( H3DSAMPLE sample3DCompleted );
 static void AILCALLBACK setStreamCompleted( HSTREAM streamCompleted );
 
+static rts::AudioCompletionRing<256> s_audioCompletionQueue;
+static UnsignedInt s_audioCompletionGeneration = 0;
+
+static UnsignedInt nextAudioCompletionGeneration()
+{
+	++s_audioCompletionGeneration;
+	if (s_audioCompletionGeneration == 0)
+	{
+		s_audioCompletionGeneration = 1;
+	}
+	return s_audioCompletionGeneration;
+}
+
+// The open-source Miles compatibility header intentionally exposes only the
+// subset needed by the game. Resolve the status queries lazily so the owner
+// thread can recover dropped callbacks when the installed MSS DLL provides
+// them, while keeping the stub/headless build linkable.
+enum
+{
+	MILES_SAMPLE_DONE = 0x0002,
+	MILES_SAMPLE_STOPPED = 0x0008
+};
+
+#if defined(_WIN32)
+typedef U32 (AILCALLBACK *MilesSampleStatusProc)(HSAMPLE);
+typedef U32 (AILCALLBACK *Miles3DSampleStatusProc)(H3DSAMPLE);
+typedef U32 (AILCALLBACK *MilesStreamStatusProc)(HSTREAM);
+
+template <typename Proc>
+static Proc resolveMilesStatusProc(const char *decoratedName, const char *plainName)
+{
+	HMODULE module = GetModuleHandleA("mss32.dll");
+	if (!module)
+	{
+		return 0;
+	}
+
+	FARPROC proc = GetProcAddress(module, decoratedName);
+	if (!proc)
+	{
+		proc = GetProcAddress(module, plainName);
+	}
+	return reinterpret_cast<Proc>(proc);
+}
+
+static Bool isMilesSampleFinished(HSAMPLE sample, Bool *known)
+{
+	static MilesSampleStatusProc statusProc = 0;
+	if (!statusProc)
+	{
+		statusProc = resolveMilesStatusProc<MilesSampleStatusProc>(
+			"_AIL_sample_status@4", "AIL_sample_status");
+	}
+	if (!statusProc)
+	{
+		*known = false;
+		return false;
+	}
+	*known = true;
+	return (statusProc(sample) & (MILES_SAMPLE_DONE | MILES_SAMPLE_STOPPED)) != 0;
+}
+
+static Bool isMiles3DSampleFinished(H3DSAMPLE sample, Bool *known)
+{
+	static Miles3DSampleStatusProc statusProc = 0;
+	if (!statusProc)
+	{
+		statusProc = resolveMilesStatusProc<Miles3DSampleStatusProc>(
+			"_AIL_3D_sample_status@4", "AIL_3D_sample_status");
+	}
+	if (!statusProc)
+	{
+		*known = false;
+		return false;
+	}
+	*known = true;
+	return (statusProc(sample) & (MILES_SAMPLE_DONE | MILES_SAMPLE_STOPPED)) != 0;
+}
+
+static Bool isMilesStreamFinished(HSTREAM stream, Bool *known)
+{
+	static MilesStreamStatusProc statusProc = 0;
+	if (!statusProc)
+	{
+		statusProc = resolveMilesStatusProc<MilesStreamStatusProc>(
+			"_AIL_stream_status@4", "AIL_stream_status");
+	}
+	if (!statusProc)
+	{
+		*known = false;
+		return false;
+	}
+	*known = true;
+	return (statusProc(stream) & (MILES_SAMPLE_DONE | MILES_SAMPLE_STOPPED)) != 0;
+}
+#else
+static Bool isMilesSampleFinished(HSAMPLE, Bool *known)
+{
+	*known = false;
+	return false;
+}
+
+static Bool isMiles3DSampleFinished(H3DSAMPLE, Bool *known)
+{
+	*known = false;
+	return false;
+}
+
+static Bool isMilesStreamFinished(HSTREAM, Bool *known)
+{
+	*known = false;
+	return false;
+}
+#endif
+
 static U32 AILCALLBACK streamingFileOpen(char const *fileName, void **file_handle);
 static void AILCALLBACK streamingFileClose(void *fileHandle);
 static S32 AILCALLBACK streamingFileSeek(void *fileHandle, S32 offset, U32 type);
@@ -107,6 +223,9 @@ MilesAudioManager::MilesAudioManager() :
 MilesAudioManager::~MilesAudioManager()
 {
 	DEBUG_ASSERTCRASH(m_binkHandle == nullptr, ("Leaked a Bink handle. Chuybregts"));
+	// releaseHandleForBink also unregisters/stops a live sample, so close
+	// callback admission before touching that handle during destruction.
+	s_audioCompletionQueue.close();
 	releaseHandleForBink();
 	closeDevice();
 	delete m_audioCache;
@@ -440,6 +559,7 @@ void MilesAudioManager::audioDebugDisplay(DebugDisplayInterface *dd, void *, FIL
 void MilesAudioManager::init()
 {
 	AudioManager::init();
+	s_audioCompletionQueue.reset(nextAudioCompletionGeneration());
 #ifdef INTENSE_DEBUG
 	DEBUG_LOG(("Sound has temporarily been disabled in debug builds only. jkmcd"));
 	// for now, RTS_DEBUG builds only should have no sound. ask jkmcd or srj about this.
@@ -463,6 +583,10 @@ void MilesAudioManager::postProcessLoad()
 //-------------------------------------------------------------------------------------------------
 void MilesAudioManager::reset()
 {
+	// Stop callback admission before any reset operation can unregister, stop,
+	// or recycle a Miles handle. The next generation drops completions from the
+	// old device/session and reopens admission only after owner state is ready.
+	s_audioCompletionQueue.close();
 #if defined(RTS_DEBUG)
 	dumpAllAssetsUsed();
 	m_allEventsLoaded.clear();
@@ -474,16 +598,129 @@ void MilesAudioManager::reset()
   // This must come after stopAllAudioImmediately() and removeAllAudioRequests(), to ensure that
   // sounds pointing to the temporary AudioEventInfo handles are deleted before their info is deleted
   removeLevelSpecificAudioEventInfos();
+	s_audioCompletionQueue.reset(nextAudioCompletionGeneration());
 }
 
 //-------------------------------------------------------------------------------------------------
 void MilesAudioManager::update()
 {
+	drainAudioCompletions();
 	AudioManager::update();
 	setDeviceListenerPosition();
 	processRequestList();
 	processPlayingList();
 	processFadingList();
+}
+
+//-------------------------------------------------------------------------------------------------
+void MilesAudioManager::drainAudioCompletions()
+{
+	const unsigned long snapshotPosition = s_audioCompletionQueue.snapshot();
+	const UnsignedInt generation = s_audioCompletionQueue.currentGeneration();
+	rts::AudioCompletionRecord completion;
+
+	while (s_audioCompletionQueue.tryPop(&completion, snapshotPosition))
+	{
+		if (completion.generation != generation)
+		{
+			continue;
+		}
+
+		if (completion.type != PAT_Sample &&
+			completion.type != PAT_3DSample &&
+			completion.type != PAT_Stream)
+		{
+			continue;
+		}
+
+		notifyOfAudioCompletion(completion.handle, completion.type);
+	}
+
+	if (s_audioCompletionQueue.consumeOverflow())
+	{
+		recoverAudioCompletions();
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
+void MilesAudioManager::recoverAudioCompletions()
+{
+	// A full ring means at least one EOS callback was dropped. Querying status
+	// is deliberately done here, on the owner thread; MSS status calls must not
+	// be made from its callback thread. The installed retail DLL exports these
+	// queries, while the open-source stub does not.
+	Bool hadPlayingAudio = false;
+	Bool statusKnownForAll = true;
+	std::list<PlayingAudio *>::iterator it;
+
+	for (it = m_playingSounds.begin(); it != m_playingSounds.end(); ++it)
+	{
+		PlayingAudio *playing = *it;
+		if (playing->m_status != PS_Playing)
+		{
+			continue;
+		}
+		hadPlayingAudio = true;
+		Bool known = false;
+		if (!isMilesSampleFinished(playing->m_sample, &known))
+		{
+			if (!known)
+			{
+				statusKnownForAll = false;
+			}
+			continue;
+		}
+		notifyOfAudioCompletion((UnsignedInt)playing->m_sample, PAT_Sample);
+	}
+
+	for (it = m_playing3DSounds.begin(); it != m_playing3DSounds.end(); ++it)
+	{
+		PlayingAudio *playing = *it;
+		if (playing->m_status != PS_Playing)
+		{
+			continue;
+		}
+		hadPlayingAudio = true;
+		Bool known = false;
+		if (!isMiles3DSampleFinished(playing->m_3DSample, &known))
+		{
+			if (!known)
+			{
+				statusKnownForAll = false;
+			}
+			continue;
+		}
+		notifyOfAudioCompletion((UnsignedInt)playing->m_3DSample, PAT_3DSample);
+	}
+
+	for (it = m_playingStreams.begin(); it != m_playingStreams.end(); ++it)
+	{
+		PlayingAudio *playing = *it;
+		if (playing->m_status != PS_Playing)
+		{
+			continue;
+		}
+		hadPlayingAudio = true;
+		Bool known = false;
+		if (!isMilesStreamFinished(playing->m_stream, &known))
+		{
+			if (!known)
+			{
+				statusKnownForAll = false;
+			}
+			continue;
+		}
+		notifyOfAudioCompletion((UnsignedInt)playing->m_stream, PAT_Stream);
+	}
+
+	if (hadPlayingAudio && !statusKnownForAll)
+	{
+		// The compatibility stub has no status exports. It is safer to stop and
+		// release the affected handles than to leave a dropped EOS completion
+		// permanently blocking a list or reusing a stale callback handle.
+		DEBUG_LOG(("MILES completion queue overflow: status API unavailable; stopping active audio"));
+		stopAllAudioImmediately();
+	}
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -1442,9 +1679,13 @@ void MilesAudioManager::openDevice()
 //-------------------------------------------------------------------------------------------------
 void MilesAudioManager::closeDevice()
 {
+	// Close admission before unregistering callbacks and releasing handles. The
+	// callback itself never waits, allocates, or enters the audio manager.
+	s_audioCompletionQueue.close();
 	freeAllMilesHandles();
 	unselectProvider();
 	AIL_shutdown();
+	s_audioCompletionQueue.clear();
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -1492,7 +1733,11 @@ void MilesAudioManager::notifyOfAudioCompletion( UnsignedInt handle, UnsignedInt
 {
 	PlayingAudio *playing = findPlayingAudioFrom(handle, flags);
 	if (!playing) {
-		DEBUG_CRASH(("Audio has completed playing, but we can't seem to find it. - jkmcd"));
+		// A completion can legitimately arrive after reset/close, or be a
+		// duplicate left in the bounded queue while a handle is being recycled.
+		// Treat it as stale instead of entering the old callback-thread crash
+		// path; the owner will continue releasing the live handle normally.
+		DEBUG_LOG(("Discarding stale or duplicate Miles completion (handle=%u, type=%u)", handle, flags));
 		return;
 	}
 
@@ -3013,19 +3258,19 @@ void MilesAudioManager::friend_forcePlayAudioEventRTS(const AudioEventRTS* event
 //-------------------------------------------------------------------------------------------------
 void AILCALLBACK setSampleCompleted( HSAMPLE sampleCompleted )
 {
-	TheAudio->notifyOfAudioCompletion((UnsignedInt) sampleCompleted, PAT_Sample);
+	s_audioCompletionQueue.tryPublish((UnsignedInt) sampleCompleted, PAT_Sample);
 }
 
 //-------------------------------------------------------------------------------------------------
 void AILCALLBACK set3DSampleCompleted( H3DSAMPLE sample3DCompleted )
 {
-	TheAudio->notifyOfAudioCompletion((UnsignedInt) sample3DCompleted, PAT_3DSample);
+	s_audioCompletionQueue.tryPublish((UnsignedInt) sample3DCompleted, PAT_3DSample);
 }
 
 //-------------------------------------------------------------------------------------------------
 void AILCALLBACK setStreamCompleted( HSTREAM streamCompleted )
 {
-	TheAudio->notifyOfAudioCompletion((UnsignedInt) streamCompleted, PAT_Stream);
+	s_audioCompletionQueue.tryPublish((UnsignedInt) streamCompleted, PAT_Stream);
 }
 
 //-------------------------------------------------------------------------------------------------

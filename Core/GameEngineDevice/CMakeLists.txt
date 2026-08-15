@@ -1,5 +1,6 @@
 set(GAMEENGINEDEVICE_SRC
     Include/MilesAudioDevice/MilesAudioManager.h
+    Include/MilesAudioDevice/MilesAudioCompletionQueue.h
     Include/MilesAudioDevice/AudioChannelPolicy.h
     Include/VideoDevice/Bink/BinkVideoPlayer.h
     Include/W3DDevice/Common/W3DConvert.h

@@ -10,6 +10,11 @@
 
 #pragma once
 
+inline bool ShouldUseSkirmishAILivenessRecovery(bool isReplayGame, bool replayRecordedWithRecovery)
+{
+	return !isReplayGame || replayRecordedWithRecovery;
+}
+
 inline int GetPathQueueRetryDelay(bool queued)
 {
 	return queued ? 0 : 1;

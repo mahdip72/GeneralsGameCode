@@ -39,13 +39,22 @@
 
 #pragma once
 
+#include "texturemipbuffer.h"
+
 #include "WWLib/always.h"
 #include "texture.h"
 
 class StringClass;
 struct IDirect3DTexture8;
 class TextureLoadTaskClass;
+class DDSFileClass;
+class Targa;
 class TextureLoadTaskListClass;
+namespace rts
+{
+	class Task;
+	class TaskRuntime;
+}
 
 class TextureLoader
 {
@@ -160,9 +169,14 @@ class SynchronizedTextureLoadTaskListClass : public TextureLoadTaskListClass
 		// See comments above for description of member functions.
 		void									Push_Front	(TextureLoadTaskClass *task);
 		void									Push_Back	(TextureLoadTaskClass *task);
+		void									Publish_Completed(TextureLoadTaskClass *task);
+		void									Publish_Thumbnail(TextureLoadTaskClass *task, TextureLoadTaskClass *loadTask);
+		rts::Task*							Take_Prepare_Task(TextureLoadTaskClass *task,
+			rts::TaskRuntime& runtime, bool& wasSubmitted);
 		TextureLoadTaskClass *			Pop_Front	();
 		TextureLoadTaskClass *			Pop_Back		();
 		void									Remove		(TextureLoadTaskClass *task);
+		bool									Is_Empty		();
 
 	private:
 		FastCriticalSectionClass		CriticalSection;
@@ -236,6 +250,14 @@ class TextureLoadTaskClass : public TextureLoadTaskListNodeClass
 		void						End_Load						();
 		void						Finish_Load					();
 		void						Apply_Missing_Texture	();
+		bool						Begin_Async_Prepare		();
+		void						Complete_Async_Prepare	();
+		bool						Is_Async_Prepare_Complete();
+		void						Wait_For_Async_Prepare	();
+		void						Set_Prepare_Runtime_Task(void* task) { PrepareRuntimeTask = task; }
+		void*						Get_Prepare_Runtime_Task() const { return PrepareRuntimeTask; }
+		bool						Reserve_Prepare_Memory();
+		void						Release_Prepare_Memory_Reservation();
 
 	protected:
 		virtual bool			Begin_Compressed_Load	();
@@ -243,6 +265,11 @@ class TextureLoadTaskClass : public TextureLoadTaskListNodeClass
 
 		virtual bool			Load_Compressed_Mipmap	();
 		virtual bool			Load_Uncompressed_Mipmap();
+		virtual bool			Allocate_Prepared_Surfaces();
+		virtual bool			Create_D3D_Texture		();
+		virtual bool			Upload_Prepared_Surfaces();
+		virtual void			Release_Prepared_Surfaces();
+		virtual size_t			Get_Prepare_Memory_Byte_Count() const;
 
 		virtual void			Lock_Surfaces				();
 		virtual void			Unlock_Surfaces			();
@@ -258,6 +285,18 @@ class TextureLoadTaskClass : public TextureLoadTaskListNodeClass
 		unsigned	int			MipLevelCount;
 		unsigned	int			Reduction;
 		Vector3					HSVShift;
+		WW3DFormat				SourceFormat;
+		unsigned int			SourceBytesPerPixel;
+		bool					CompressionAllowed;
+		bool					LoadSucceeded;
+		char					Filename[_MAX_PATH];
+		DDSFileClass*			DDSFile;
+		Targa*					TargaFile;
+		void*					PrepareCompleteEvent;
+		void*					PrepareRuntimeTask;
+		size_t					PrepareMemoryReservation;
+		char					TargaPalette[256 * 4];
+		TextureMipBuffer		PreparedSurface[MIP_LEVELS_MAX];
 
 		unsigned char *		LockedSurfacePtr[MIP_LEVELS_MAX];
 		unsigned	int			LockedSurfacePitch[MIP_LEVELS_MAX];
@@ -281,6 +320,11 @@ protected:
 	virtual bool			Begin_Uncompressed_Load	() override;
 
 	virtual bool			Load_Compressed_Mipmap	() override;
+	virtual bool			Allocate_Prepared_Surfaces() override;
+	virtual bool			Create_D3D_Texture		() override;
+	virtual bool			Upload_Prepared_Surfaces() override;
+	virtual void			Release_Prepared_Surfaces() override;
+	virtual size_t			Get_Prepare_Memory_Byte_Count() const override;
 //	virtual bool			Load_Uncompressed_Mipmap() override;
 
 	virtual void			Lock_Surfaces				() override;
@@ -294,34 +338,15 @@ private:
 
 	unsigned char*			LockedCubeSurfacePtr[6][MIP_LEVELS_MAX];
 	unsigned int			LockedCubeSurfacePitch[6][MIP_LEVELS_MAX];
+	TextureMipBuffer		PreparedCubeSurface[6][MIP_LEVELS_MAX];
 };
 
 class VolumeTextureLoadTaskClass : public TextureLoadTaskClass
 {
 public:
-	VolumeTextureLoadTaskClass();
-
 	virtual void			Destroy						() override;
-	virtual void			Init							(TextureBaseClass *tc, TaskType type, PriorityType priority) override;
 
 protected:
 	virtual bool			Begin_Compressed_Load	() override;
 	virtual bool			Begin_Uncompressed_Load	() override;
-
-	virtual bool			Load_Compressed_Mipmap	() override;
-//	virtual bool			Load_Uncompressed_Mipmap() override;
-
-	virtual void			Lock_Surfaces				() override;
-	virtual void			Unlock_Surfaces			() override;
-
-private:
-	unsigned char*			Get_Locked_Volume_Pointer(unsigned int level);
-	unsigned int			Get_Locked_Volume_Row_Pitch(unsigned int level);
-	unsigned int			Get_Locked_Volume_Slice_Pitch(unsigned int level);
-
-	IDirect3DVolumeTexture8*	Peek_D3D_Volume_Texture()				{ return (IDirect3DVolumeTexture8*)D3DTexture;		}
-
-	unsigned	int			LockedSurfaceSlicePitch[MIP_LEVELS_MAX];
-
-	unsigned int		Depth;
 };
