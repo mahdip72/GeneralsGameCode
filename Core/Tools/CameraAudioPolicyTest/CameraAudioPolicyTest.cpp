@@ -75,6 +75,13 @@ static void TestAudioChannelPolicy()
 	CHECK(rts::GetAdaptive3DChannelTarget(64) == 64);
 	CHECK(rts::GetAdaptive3DChannelTarget(80) == 80);
 
+	CHECK(rts::ShouldGrow3DChannelPool(0, 25, 64, 7));
+	CHECK(!rts::ShouldGrow3DChannelPool(1, 25, 64, 7));
+	CHECK(rts::ShouldGrow3DChannelPool(0, 56, 64, 7));
+	CHECK(!rts::ShouldGrow3DChannelPool(0, 57, 64, 7));
+	CHECK(!rts::ShouldGrow3DChannelPool(0, 64, 64, 7));
+	CHECK(!rts::ShouldGrow3DChannelPool(0, 80, 64, 7));
+
 	CHECK(rts::CanReplace3DChannel(false, 2, 1, false, false, false, false, false));
 	CHECK(!rts::CanReplace3DChannel(false, 2, 2, false, false, false, false, false));
 	CHECK(rts::CanReplace3DChannel(true, 2, 2, false, false, false, false, false));

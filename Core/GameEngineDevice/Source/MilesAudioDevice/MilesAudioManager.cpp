@@ -1242,6 +1242,21 @@ H3DSAMPLE MilesAudioManager::getAvailable3DSample( AudioEventRTS *event )
 		return retSample;
 	}
 
+	// Miles shares its sample budget with 2-D samples and streamed audio. Grow only
+	// when positional audio is saturated, while preserving those reserved handles.
+	if (isValidProvider() && rts::ShouldGrow3DChannelPool(
+			static_cast<UnsignedInt>(m_available3DSamples.size()),
+			m_num3DSamples,
+			m_requested3DSamples,
+			m_num2DSamples + m_numStreams)) {
+		H3DSAMPLE retSample = AIL_allocate_3D_sample_handle(m_provider3D[m_selectedProvider].id);
+		if (retSample) {
+			AIL_set_3D_user_data(retSample, 0, (void *)(m_num3DSamples + 1));
+			++m_num3DSamples;
+			return retSample;
+		}
+	}
+
 	// Find the first sample of lower priority than my augmented priority that is interruptible and take its handle
 	return nullptr;
 }
@@ -2855,6 +2870,7 @@ void MilesAudioManager::initSamplePools()
 	m_availableSamples.reserve(getAudioSettings()->m_sampleCount2D);
 	m_requested3DSamples = rts::GetAdaptive3DChannelTarget(getAudioSettings()->m_sampleCount3D);
 	m_available3DSamples.reserve(m_requested3DSamples);
+	m_numStreams = getAudioSettings()->m_streamCount;
 
 	int i = 0;
 	for (i = 0; i < getAudioSettings()->m_sampleCount2D; ++i) {
@@ -2868,7 +2884,7 @@ void MilesAudioManager::initSamplePools()
 		}
 	}
 
-	for (i = 0; i < (int)m_requested3DSamples; ++i) {
+	for (i = 0; i < getAudioSettings()->m_sampleCount3D; ++i) {
 		H3DSAMPLE sample = AIL_allocate_3D_sample_handle(m_provider3D[m_selectedProvider].id);
 		if (!sample)
 		{
@@ -2883,8 +2899,6 @@ void MilesAudioManager::initSamplePools()
 	DEBUG_LOG(("Miles 3D channels: configured=%d requested=%u allocated=%u",
 		getAudioSettings()->m_sampleCount3D, m_requested3DSamples, m_num3DSamples));
 
-	// Streams are basically free, so we can just allocate the appropriate number
-	m_numStreams = getAudioSettings()->m_streamCount;
 }
 
 //-------------------------------------------------------------------------------------------------

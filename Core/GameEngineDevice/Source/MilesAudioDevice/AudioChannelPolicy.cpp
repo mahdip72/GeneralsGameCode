@@ -8,6 +8,16 @@ namespace rts
 		return configuredCount < recommendedChannelCount ? recommendedChannelCount : configuredCount;
 	}
 
+	bool ShouldGrow3DChannelPool(
+		unsigned int availableCount,
+		unsigned int allocatedCount,
+		unsigned int requestedCount,
+		unsigned int reservedCount)
+	{
+		return availableCount == 0 && allocatedCount < requestedCount
+			&& reservedCount < requestedCount - allocatedCount;
+	}
+
 	bool CanReplace3DChannel(
 		bool incomingInterrupt,
 		int incomingPriority,

@@ -13,6 +13,11 @@
 namespace rts
 {
 	unsigned int GetAdaptive3DChannelTarget(unsigned int configuredCount);
+	bool ShouldGrow3DChannelPool(
+		unsigned int availableCount,
+		unsigned int allocatedCount,
+		unsigned int requestedCount,
+		unsigned int reservedCount);
 
 	bool CanReplace3DChannel(
 		bool incomingInterrupt,
