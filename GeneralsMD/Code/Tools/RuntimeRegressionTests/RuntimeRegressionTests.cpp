@@ -575,6 +575,73 @@ static void TestSkirmishAIProductionPolicies()
 	CHECK(GetSkirmishAITieSelectionIndex(3, 2) == 2);
 }
 
+static void TestSkirmishAITargetingPolicies()
+{
+	CHECK(IsSkirmishAIIntelEligible(true, true, false, false, false, false));
+	CHECK(IsSkirmishAIIntelEligible(true, false, true, false, false, false));
+	CHECK(!IsSkirmishAIIntelEligible(true, false, false, false, false, false));
+	CHECK(IsSkirmishAIIntelEligible(false, true, false, false, false, false));
+	CHECK(!IsSkirmishAIIntelEligible(false, false, true, false, false, false));
+	CHECK(!IsSkirmishAIIntelEligible(false, true, false, true, false, false));
+	CHECK(IsSkirmishAIIntelEligible(false, true, false, true, true, false));
+	CHECK(!IsSkirmishAIIntelEligible(false, true, false, false, true, true));
+	CHECK(!IsSkirmishAIKnownCrippled(false, false, false));
+	CHECK(IsSkirmishAIKnownCrippled(true, false, false));
+	CHECK(!IsSkirmishAIKnownCrippled(true, true, false));
+	CHECK(!IsSkirmishAIKnownCrippled(true, false, true));
+
+	CHECK(GetSkirmishAIKnownAssetScore(0, 1000) == 0);
+	CHECK(GetSkirmishAIKnownAssetScore(500, 1000) == 150);
+	CHECK(GetSkirmishAIKnownAssetScore(1000, 1000) == 300);
+	CHECK(GetSkirmishAIKnownAssetScore(1000, 0) == 0);
+	CHECK(GetSkirmishAIDistanceScore(100, 100, 500) == 0);
+	CHECK(GetSkirmishAIDistanceScore(300, 100, 500) == -150);
+	CHECK(GetSkirmishAIDistanceScore(500, 100, 500) == -300);
+	CHECK(GetSkirmishAIDistanceScore(100, 100, 100) == 0);
+
+	SkirmishAIEnemyScoreInput input;
+	input.knownAssetScore = 225;
+	input.targetingThisAI = true;
+	input.routeClass = SKIRMISH_AI_TARGET_ROUTE_REACHABLE;
+	input.alliedAIsTargeting = 2;
+	input.distanceScore = -120;
+	input.crippled = false;
+	SkirmishAIEnemyScoreResult score = ScoreSkirmishAIEnemy(input);
+	CHECK(score.knownAssetScore == 225);
+	CHECK(score.retaliationScore == 250);
+	CHECK(score.routeScore == 150);
+	CHECK(score.allyTargetScore == -300);
+	CHECK(score.distanceScore == -120);
+	CHECK(score.crippledScore == 0);
+	CHECK(score.totalScore == 205);
+	input.alliedAIsTargeting = 10;
+	input.routeClass = SKIRMISH_AI_TARGET_ROUTE_UNREACHABLE;
+	input.crippled = true;
+	score = ScoreSkirmishAIEnemy(input);
+	CHECK(score.allyTargetScore == -450);
+	CHECK(score.routeScore == -150);
+	CHECK(score.crippledScore == -600);
+
+	CHECK(ShouldReplaceSkirmishAITargetCandidate(false, 0, 7, 0, 2));
+	CHECK(ShouldReplaceSkirmishAITargetCandidate(true, 101, 7, 100, 2));
+	CHECK(ShouldReplaceSkirmishAITargetCandidate(true, 100, 2, 100, 7));
+	CHECK(!ShouldReplaceSkirmishAITargetCandidate(true, 100, 7, 100, 2));
+	CHECK(!ShouldSwitchSkirmishAITarget(true, true, 100, 299));
+	CHECK(ShouldSwitchSkirmishAITarget(true, true, 100, 300));
+	CHECK(ShouldSwitchSkirmishAITarget(false, true, 100, -1000));
+	CHECK(!ShouldSwitchSkirmishAITarget(false, false, 100, 1000));
+	CHECK(ShouldEvaluateSkirmishAITarget(false, 150, 150, true));
+	CHECK(ShouldEvaluateSkirmishAITarget(true, 100, 150, true));
+	CHECK(!ShouldEvaluateSkirmishAITarget(true, 150, 150, false));
+
+	SkirmishAITargetSnapshotState oldState = GetSkirmishAITargetSnapshotState(1, 5, 900);
+	CHECK(oldState.enemyPlayerIndex == -1);
+	CHECK(oldState.nextEvaluationFrame == 0);
+	SkirmishAITargetSnapshotState newState = GetSkirmishAITargetSnapshotState(2, 5, 900);
+	CHECK(newState.enemyPlayerIndex == 5);
+	CHECK(newState.nextEvaluationFrame == 900);
+}
+
 int main(int argc, char **argv)
 {
 	initMemoryManager();
@@ -604,6 +671,7 @@ int main(int argc, char **argv)
 	TestSkirmishAILivenessPolicies();
 	TestSkirmishAICorrectnessPolicies();
 	TestSkirmishAIProductionPolicies();
+	TestSkirmishAITargetingPolicies();
 	TestFrameRateLimitCpuUsage();
 
 	if (s_failures != 0)

@@ -180,6 +180,7 @@ public: // AIPlayer interface, may be overridden by AISkirmishPlayer.  jba.
 
 	virtual Bool isSkirmishAI() {return false;}
 	virtual Player *getAiEnemy() {return nullptr;}	///< Solo AI attacks based on scripting.  Only skirmish auto-acquires an enemy at this point.  jba.
+	virtual Player *getCachedAiEnemy() const {return nullptr;}	///< Return the current target without triggering target evaluation.
 	virtual Bool checkBridges(Object *unit, Waypoint *way) {return false;}
 	virtual void repairStructure(ObjectID structure);
 

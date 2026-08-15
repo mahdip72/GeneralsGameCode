@@ -72,6 +72,7 @@ public:	// AIPlayer interface methods.
 	virtual Bool checkBridges(Object *unit, Waypoint *way) override;
 
 	virtual Player *getAiEnemy() override;	///< Solo AI attacks based on scripting.  Only skirmish auto-acquires an enemy at this point.  jba.
+	virtual Player *getCachedAiEnemy() const override { return m_currentEnemy; }
 
 protected:
 
@@ -111,6 +112,13 @@ protected:
 		Coord3D *routeTarget, Bool *hasRouteTarget );
 	Int getCandidateCounterFit( TeamPrototype *proto, Int aircraftValue, Int vehicleValue, Int infantryValue );
 	SkirmishAIRouteClass classifyTeamRoute( TeamPrototype *proto, const Coord3D *routeTarget, Bool hasRouteTarget );
+	Bool getKnownEnemyPosition( Player *enemy, Coord3D *position ) const;
+	Int getKnownEnemyAssetValue( Player *enemy, Bool *hasKnownObject,
+		Bool *hasKnownUnit, Bool *hasKnownBuildFacility ) const;
+	Object *findEnemyRouteRepresentative() const;
+	SkirmishAITargetRouteClass classifyEnemyRoute(
+		Object *representative, const Coord3D *enemyPosition, Bool hasEnemyPosition ) const;
+	Int countAlliedSkirmishAIsTargeting( Player *enemy ) const;
 	SkirmishAIDecisionDifficulty getDecisionDifficulty() const;
 
 protected:
@@ -125,5 +133,6 @@ protected:
 
 	UnsignedInt m_frameToCheckEnemy;
 	Player			*m_currentEnemy;
+	Int m_currentEnemyPlayerIndex;
 
 };
