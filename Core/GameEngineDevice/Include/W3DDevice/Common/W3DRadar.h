@@ -126,6 +126,7 @@ protected:
 	Bool m_shroudBatchActive;									///< begin/end batch is active
 	Bool m_shroudBatchFallback;								///< direct owner fallback for this batch
 	Bool m_shroudBatchFolded;								///< output contains cleared command chunks
+	Bool m_shroudBatchPendingCommit;						///< retain a complete CPU image until upload succeeds
 
 	Int m_textureWidth;														///< width for all radar textures
 	Int m_textureHeight;													///< height for all radar textures

@@ -147,8 +147,10 @@ void W3DRadar::deleteResources()
 	 * any caller-owned batch before releasing the texture it targets. */
 	if( m_shroudBatchActive || m_shroudSurface != nullptr )
 		endSetShroudLevel();
-	else
-		m_shroudOverlayBatch.reset();
+	/* Resource deletion invalidates even a deferred complete CPU image. */
+	m_shroudOverlayBatch.reset();
+	m_shroudBatchPendingCommit = FALSE;
+	m_shroudBatchFolded = FALSE;
 
 	//
 	// delete terrain resources used
@@ -1006,6 +1008,8 @@ void W3DRadar::updateObjectTexture(TextureClass *texture)
 		localObjectCount <= UINT_MAX - objectCount )
 	{
 		commandCapacity = objectCount + localObjectCount;
+		if( commandCapacity == 0 )
+			return;
 		surface = texture->Get_Surface_Level();
 		if( surface != nullptr )
 		{
@@ -1036,6 +1040,8 @@ void W3DRadar::updateObjectTexture(TextureClass *texture)
 					if( captureObjectOverlayList( m_localObjectList, player,
 						batch, surfaceDesc.Format ) )
 					{
+						if( batch.commandCount() == 0 )
+							return;
 						RadarTerrainPrepareService &prepareService =
 							GetRadarTerrainPrepareService();
 						RadarOverlayPrepareLease lease( prepareService, 2 );
@@ -1345,6 +1351,7 @@ W3DRadar::W3DRadar()
 	m_shroudBatchActive = FALSE;
 	m_shroudBatchFallback = FALSE;
 	m_shroudBatchFolded = FALSE;
+	m_shroudBatchPendingCommit = FALSE;
 
 	m_textureWidth = RADAR_CELL_WIDTH;
 	m_textureHeight = RADAR_CELL_HEIGHT;
@@ -1473,8 +1480,10 @@ void W3DRadar::reset()
 {
 	if( m_shroudBatchActive || m_shroudSurface != nullptr )
 		endSetShroudLevel();
-	else
-		m_shroudOverlayBatch.reset();
+	/* Reset clears the target texture below, so no deferred image may survive. */
+	m_shroudOverlayBatch.reset();
+	m_shroudBatchPendingCommit = FALSE;
+	m_shroudBatchFolded = FALSE;
 
 	// extending functionality, call base class
 	Radar::reset();
@@ -2099,6 +2108,14 @@ void W3DRadar::clearShroud()
 	if (!TheGlobalData->m_shroudOn)
 		return;
 #endif
+	if( !m_shroudBatchActive && m_shroudSurface == nullptr )
+	{
+		/* A clear supersedes any full CPU image retained after a transient
+		 * upload failure; it must not be resurrected by the next batch. */
+		m_shroudOverlayBatch.reset();
+		m_shroudBatchPendingCommit = FALSE;
+		m_shroudBatchFolded = FALSE;
+	}
 
 	SurfaceClass *surface = m_shroudTexture->Get_Surface_Level();
 
@@ -2278,6 +2295,16 @@ void W3DRadar::beginSetShroudLevel()
 
 	m_shroudBatchActive = TRUE;
 	m_shroudBatchFallback = FALSE;
+	if( m_shroudBatchPendingCommit && m_shroudOverlayBatch.isAllocated() )
+	{
+		/* A prior D3D commit failed after the complete ordered image was
+		 * prepared.  Keep that image as this batch's base and merge new
+		 * commands into it until an owner-thread upload succeeds. */
+		m_shroudBatchFolded = TRUE;
+		m_shroudOverlayBatch.clearCommands();
+		return;
+	}
+	m_shroudBatchPendingCommit = FALSE;
 	m_shroudBatchFolded = FALSE;
 	m_shroudOverlayBatch.reset();
 	m_shroudSurfaceBits = nullptr;
@@ -2347,43 +2374,52 @@ void W3DRadar::endSetShroudLevel()
 	DEBUG_ASSERTCRASH( m_shroudSurface != nullptr || m_shroudBatchActive,
 		("W3DRadar::endSetShroudLevel: no shroud batch is active") );
 
+	Bool retainPendingCommit = FALSE;
 	if( m_shroudBatchActive && !m_shroudBatchFallback &&
 		m_shroudOverlayBatch.isAllocated() &&
-		m_shroudOverlayBatch.commandCount() != 0 )
+		(m_shroudOverlayBatch.commandCount() != 0 || m_shroudBatchFolded) )
 	{
 		RadarTerrainPrepareService &prepareService =
 			GetRadarTerrainPrepareService();
 		RadarOverlayPrepareLease lease( prepareService, 3 );
-		Bool prepared = RunRadarShroudOverlayBatch( m_shroudOverlayBatch,
-			lease ) ? TRUE : FALSE;
-		if( prepared )
+		Bool outputReady = TRUE;
+		if( m_shroudOverlayBatch.commandCount() != 0 )
 		{
-			if( !uploadPreparedRadarShroudOverlay( m_shroudTexture,
-				m_shroudOverlayBatch.snapshot() ) )
+			outputReady = RunRadarShroudOverlayBatch( m_shroudOverlayBatch,
+				lease ) ? TRUE : FALSE;
+			if( !outputReady )
 			{
-				Bool recovered = FALSE;
-				if( m_shroudBatchFolded )
-				{
-					/* Only the full CPU image contains every folded prefix. */
-					recovered = uploadPreparedRadarShroudOverlay(
-						m_shroudTexture, m_shroudOverlayBatch.snapshot() );
-				}
-				else
-				{
-					recovered = replayRadarShroudOverlayCommands(
-						m_shroudTexture, m_shroudOverlayBatch.snapshot() );
-				}
-				if( !recovered )
-				{
-					DEBUG_CRASH(("W3DRadar: unable to commit shroud overlay batch"));
-				}
+				/* Runtime rejection/failure must remain a complete owner path,
+				 * including batches whose earlier chunks are already folded. */
+				outputReady = PackRadarShroudRows(
+					m_shroudOverlayBatch.snapshot(), 0,
+					m_shroudOverlayBatch.snapshot().height ) ? TRUE : FALSE;
 			}
 		}
-		else if( m_shroudBatchFolded ||
-			!replayRadarShroudOverlayCommands( m_shroudTexture,
-				m_shroudOverlayBatch.snapshot() ) )
+
+		Bool committed = outputReady && uploadPreparedRadarShroudOverlay(
+			m_shroudTexture, m_shroudOverlayBatch.snapshot() );
+		if( !committed && !m_shroudBatchFolded )
 		{
-			DEBUG_CRASH(("W3DRadar: unable to replay shroud overlay batch"));
+			committed = replayRadarShroudOverlayCommands( m_shroudTexture,
+				m_shroudOverlayBatch.snapshot() );
+		}
+		if( !committed )
+		{
+			if( outputReady )
+			{
+				/* Do not discard a complete image on a transient D3D failure.
+				 * The next begin/end cycle retries it before accepting loss. */
+				m_shroudOverlayBatch.clearCommands();
+				m_shroudBatchFolded = TRUE;
+				m_shroudBatchPendingCommit = TRUE;
+				retainPendingCommit = TRUE;
+			}
+			DEBUG_CRASH(("W3DRadar: shroud overlay commit deferred"));
+		}
+		else
+		{
+			m_shroudBatchPendingCommit = FALSE;
 		}
 		lease.release();
 	}
@@ -2397,10 +2433,13 @@ void W3DRadar::endSetShroudLevel()
 		m_shroudSurfacePixelSize = 0;
 	}
 	REF_PTR_RELEASE(m_shroudSurface);
-	m_shroudOverlayBatch.reset();
+	if( !retainPendingCommit )
+	{
+		m_shroudOverlayBatch.reset();
+		m_shroudBatchFolded = FALSE;
+	}
 	m_shroudBatchActive = FALSE;
 	m_shroudBatchFallback = FALSE;
-	m_shroudBatchFolded = FALSE;
 }
 
 //-------------------------------------------------------------------------------------------------

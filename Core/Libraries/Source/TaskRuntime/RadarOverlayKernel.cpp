@@ -152,13 +152,13 @@ static bool radarOverlayObjectCoordinate(Int base, unsigned offset,
 static void radarOverlayWriteObjectPoint(
 	const RadarObjectOverlaySnapshot &snapshot,
 	const RadarObjectOverlayCommand &command, unsigned offsetX,
-	unsigned offsetY, unsigned assignedRow)
+	unsigned offsetY, unsigned rowBegin, unsigned rowEnd)
 {
 	unsigned x;
 	unsigned y;
 	if (radarOverlayObjectCoordinate(command.x, offsetX, snapshot.width, &x) &&
 		radarOverlayObjectCoordinate(command.y, offsetY, snapshot.height, &y) &&
-		y == assignedRow)
+		y >= rowBegin && y < rowEnd)
 	{
 		radarOverlayWritePixel(command.packedColor,
 			snapshot.bytesPerPixel, snapshot.output, snapshot.rowBytes, x, y);
@@ -180,27 +180,25 @@ static bool radarOverlayCoordinateInRange(unsigned coordinate, Int minimum,
 bool PackRadarObjectRows(const RadarObjectOverlaySnapshot &snapshot,
 	unsigned rowBegin, unsigned rowEnd)
 {
-	unsigned row;
-
 	if (!radarOverlayValidateObjectSnapshot(snapshot, rowBegin, rowEnd))
 	{
 		return false;
 	}
 
-	for (row = rowBegin; row < rowEnd; ++row)
+	/* Each worker owns disjoint rows.  Walk the ordered command stream once per
+	 * stripe rather than once per row, preserving last-writer-wins while keeping
+	 * preparation proportional to commands times workers, not image height. */
+	unsigned commandIndex;
+	for (commandIndex = 0; commandIndex < snapshot.commandCount;
+		++commandIndex)
 	{
-		unsigned commandIndex;
-		for (commandIndex = 0; commandIndex < snapshot.commandCount;
-			++commandIndex)
-		{
-			const RadarObjectOverlayCommand &command =
-				snapshot.commands[commandIndex];
-			/* Keep the four writes in the exact owner order. */
-			radarOverlayWriteObjectPoint(snapshot, command, 0, 0, row);
-			radarOverlayWriteObjectPoint(snapshot, command, 0, 1, row);
-			radarOverlayWriteObjectPoint(snapshot, command, 1, 1, row);
-			radarOverlayWriteObjectPoint(snapshot, command, 1, 0, row);
-		}
+		const RadarObjectOverlayCommand &command =
+			snapshot.commands[commandIndex];
+		/* Keep the four writes in the exact owner order. */
+		radarOverlayWriteObjectPoint(snapshot, command, 0, 0, rowBegin, rowEnd);
+		radarOverlayWriteObjectPoint(snapshot, command, 0, 1, rowBegin, rowEnd);
+		radarOverlayWriteObjectPoint(snapshot, command, 1, 1, rowBegin, rowEnd);
+		radarOverlayWriteObjectPoint(snapshot, command, 1, 0, rowBegin, rowEnd);
 	}
 
 	return true;
