@@ -13,7 +13,7 @@ PAUSE
 ```
 It will run the game in the background and check that each replay is compatible. You need to use a VC6 build with optimizations and RTS_BUILD_OPTION_DEBUG = OFF, otherwise the game won't be compatible.
 
-Zero Hour records the skirmish-AI behavior epoch as a suffix in the replay header's existing variable-length build-time field. Unmarked retail replays use the legacy AI behavior, while marked replays use the liveness recovery that was active while recording. Replays made by intermediate builds from `15a1b135` through the addition of this marker are unmarked despite using the new behavior and cannot be distinguished from retail recordings; those transitional recordings are unsupported.
+Zero Hour records the skirmish-AI behavior epoch as a suffix in the replay header's existing variable-length build-time field. Unmarked retail replays use the legacy AI behavior. Replays marked `[SkirmishAILiveness=1]` use only the PR6 liveness fixes, and new recordings marked `[SkirmishAIEpoch=2]` use the current PR7-PR9 AI behavior as well. Unknown, malformed, mixed, or duplicate markers fall back to legacy behavior. Replays produced by transitional PR7-PR9 builds carried only the older liveness marker despite using later AI behavior; those recordings cannot be identified reliably and are unsupported.
 
 # Stage 0 ownership and profiling checks
 

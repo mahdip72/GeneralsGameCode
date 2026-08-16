@@ -90,7 +90,10 @@ void RecordSkirmishAIPathFailureForObject(
 	Team *team = object ? object->getTeam() : nullptr;
 	const TeamPrototype *prototype = team ? team->getPrototype() : nullptr;
 	Player *owner = prototype ? prototype->getControllingPlayer() : nullptr;
-	if (!prototype || !ShouldRecordSkirmishAIPathFailure(
+	Bool useCurrentSkirmishAIBehavior = ShouldUseSkirmishAICurrentBehavior(
+		TheGameLogic && TheGameLogic->isInReplayGame(),
+		TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() : SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+	if (!prototype || !useCurrentSkirmishAIBehavior || !ShouldRecordSkirmishAIPathFailure(
 		owner && owner->isSkirmishAIPlayer(),
 		isGroundMovement,
 		isFinalPath,

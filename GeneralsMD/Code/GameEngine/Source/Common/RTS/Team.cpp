@@ -36,6 +36,7 @@
 #include "Common/Player.h"
 #include "Common/PlayerList.h"
 #include "Common/PlayerTemplate.h"
+#include "Common/Recorder.h"
 #include "Common/ThingTemplate.h"
 #include "Common/WellKnownKeys.h"
 #include "Common/Xfer.h"
@@ -57,6 +58,13 @@
 
 // GLOBALS ////////////////////////////////////////////////////////////////////
 TeamFactory *TheTeamFactory = nullptr;
+
+static Bool ShouldUseCurrentSkirmishAIFeedback()
+{
+	return ShouldUseSkirmishAICurrentBehavior(
+		TheGameLogic && TheGameLogic->isInReplayGame(),
+		TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() : SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+}
 
 // ------------------------------------------------------------------------------------------------
 // ------------------------------------------------------------------------------------------------
@@ -1014,7 +1022,8 @@ void TeamPrototype::decreaseAIPriorityForFailure() const
 // ------------------------------------------------------------------------
 void TeamPrototype::decaySkirmishAIFeedback(UnsignedInt currentFrame) const
 {
-	if (!m_owningPlayer || !m_owningPlayer->isSkirmishAIPlayer())
+	if (!ShouldUseCurrentSkirmishAIFeedback() ||
+		!m_owningPlayer || !m_owningPlayer->isSkirmishAIPlayer())
 		return;
 	SkirmishAIFeedbackState state = GetSkirmishAIFeedbackSnapshotState(
 		2,
@@ -1037,7 +1046,8 @@ void TeamPrototype::decaySkirmishAIFeedback(UnsignedInt currentFrame) const
 // ------------------------------------------------------------------------
 void TeamPrototype::recordSkirmishAILoss(UnsignedInt currentFrame) const
 {
-	if (!m_owningPlayer || !m_owningPlayer->isSkirmishAIPlayer())
+	if (!ShouldUseCurrentSkirmishAIFeedback() ||
+		!m_owningPlayer || !m_owningPlayer->isSkirmishAIPlayer())
 		return;
 	decaySkirmishAIFeedback(currentFrame);
 	SkirmishAIFeedbackState state = GetSkirmishAIFeedbackSnapshotState(
@@ -1061,7 +1071,8 @@ void TeamPrototype::recordSkirmishAILoss(UnsignedInt currentFrame) const
 // ------------------------------------------------------------------------
 void TeamPrototype::recordSkirmishAIPathFailure(UnsignedInt currentFrame) const
 {
-	if (!m_owningPlayer || !m_owningPlayer->isSkirmishAIPlayer())
+	if (!ShouldUseCurrentSkirmishAIFeedback() ||
+		!m_owningPlayer || !m_owningPlayer->isSkirmishAIPlayer())
 		return;
 	decaySkirmishAIFeedback(currentFrame);
 	SkirmishAIFeedbackState state = GetSkirmishAIFeedbackSnapshotState(
@@ -1088,7 +1099,8 @@ void TeamPrototype::recordSkirmishAIPathFailure(UnsignedInt currentFrame) const
 // ------------------------------------------------------------------------
 void TeamPrototype::recordSkirmishAISuccess(UnsignedInt currentFrame) const
 {
-	if (!m_owningPlayer || !m_owningPlayer->isSkirmishAIPlayer())
+	if (!ShouldUseCurrentSkirmishAIFeedback() ||
+		!m_owningPlayer || !m_owningPlayer->isSkirmishAIPlayer())
 		return;
 	decaySkirmishAIFeedback(currentFrame);
 	SkirmishAIFeedbackState state = GetSkirmishAIFeedbackSnapshotState(
@@ -2083,7 +2095,7 @@ void Team::notifyTeamOfObjectDeath()
 		return;
 	}
 	Player *owner = m_proto->getControllingPlayer();
-	if (ShouldRecordSkirmishAITeamLoss(
+	if (ShouldUseCurrentSkirmishAIFeedback() && ShouldRecordSkirmishAITeamLoss(
 		owner && owner->isSkirmishAIPlayer(),
 		m_active,
 		m_skirmishAILossFeedbackEligible,

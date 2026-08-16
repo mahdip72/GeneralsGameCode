@@ -379,7 +379,7 @@ void RecorderClass::init() {
 	m_wasDesync = FALSE;
 	m_doingAnalysis = FALSE;
 	m_playbackFrameCount = 0;
-	m_replayUsesSkirmishAILivenessRecovery = FALSE;
+	m_skirmishAIReplayEpoch = SKIRMISH_AI_REPLAY_EPOCH_LEGACY;
 
 	OptionPreferences optionPref;
 	m_archiveReplays = optionPref.getArchiveReplaysEnabled();
@@ -577,7 +577,7 @@ void RecorderClass::startRecording(GameDifficulty diff, Int originalGameMode, In
 	UnicodeString versionTimeString = TheVersion->getUnicodeBuildTime();
 	// The build-time field is variable length and ignored by compatibility checks, so a suffix records
 	// deterministic AI behavior without changing the retail replay header layout.
-	MarkReplayVersionForSkirmishAILivenessRecovery(versionTimeString);
+	MarkReplayVersionForSkirmishAICurrentEpoch(versionTimeString);
 	UnsignedInt versionNumber = TheVersion->getVersionNumber();
 	m_file->writeFormat(L"%s", versionString.str());
 	m_file->writeChar(L"\0");
@@ -1084,7 +1084,7 @@ Bool RecorderClass::replayMatchesGameVersion(const ReplayHeader& header)
  */
 Bool RecorderClass::playbackFile(AsciiString filename)
 {
-	m_replayUsesSkirmishAILivenessRecovery = FALSE;
+	m_skirmishAIReplayEpoch = SKIRMISH_AI_REPLAY_EPOCH_LEGACY;
 
 	if (!m_doingAnalysis)
 	{
@@ -1102,18 +1102,21 @@ Bool RecorderClass::playbackFile(AsciiString filename)
 	{
 		return FALSE;
 	}
-	m_replayUsesSkirmishAILivenessRecovery = ReplayVersionUsesSkirmishAILivenessRecovery(header.versionTimeString);
-	if (!m_replayUsesSkirmishAILivenessRecovery)
+	m_skirmishAIReplayEpoch = GetSkirmishAIReplayEpoch(header.versionTimeString);
+	if (m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_LEGACY)
 	{
 		DEBUG_LOG(("RecorderClass::playbackFile() - unmarked replay uses legacy skirmish AI behavior"));
 	}
 
 #ifdef DEBUG_CRASHING
 	Bool versionStringDiff = header.versionString != TheVersion->getUnicodeVersion();
-	UnicodeString markedVersionTimeString = TheVersion->getUnicodeBuildTime();
-	MarkReplayVersionForSkirmishAILivenessRecovery(markedVersionTimeString);
+	UnicodeString livenessMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
+	MarkReplayVersionForSkirmishAILivenessRecovery(livenessMarkedVersionTimeString);
+	UnicodeString currentMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
+	MarkReplayVersionForSkirmishAICurrentEpoch(currentMarkedVersionTimeString);
 	Bool versionTimeStringDiff = header.versionTimeString != TheVersion->getUnicodeBuildTime()
-		&& header.versionTimeString != markedVersionTimeString;
+		&& header.versionTimeString != livenessMarkedVersionTimeString
+		&& header.versionTimeString != currentMarkedVersionTimeString;
 	Bool versionNumberDiff = header.versionNumber != TheVersion->getVersionNumber();
 	Bool exeCRCDiff = header.exeCRC != TheGlobalData->m_exeCRC;
 	Bool exeDifferent = versionStringDiff || versionTimeStringDiff || versionNumberDiff || exeCRCDiff;
