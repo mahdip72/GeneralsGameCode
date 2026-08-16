@@ -16,6 +16,25 @@
 class W3DRadar;
 
 /*
+ * Owner-stack work adapter for one synchronous render-preparation batch.  A
+ * worker may call only this immutable-range operation; the owner keeps the
+ * adapter and every buffer it references alive until the service returns.
+ */
+class RadarPrepareRowWork
+{
+	public:
+	virtual ~RadarPrepareRowWork();
+	virtual bool executeRows(unsigned rowBegin, unsigned rowEnd) = 0;
+
+protected:
+	RadarPrepareRowWork();
+
+	private:
+	RadarPrepareRowWork(const RadarPrepareRowWork &);
+	RadarPrepareRowWork &operator=(const RadarPrepareRowWork &);
+};
+
+/*
  * Owner-side storage for one complete radar terrain preparation batch.
  *
  * The owner allocates and fills the cells, then keeps this object alive until
@@ -100,6 +119,14 @@ public:
 	/* Returns true only when both row tasks completed successfully. */
 	bool runRows(RadarTerrainSnapshot *snapshot, unsigned char *output,
 		unsigned rowBegin, unsigned rowEnd);
+	/* Generic row operation shared by later render-preparation consumers. */
+	bool runRows(RadarPrepareRowWork *work, unsigned rowBegin,
+		unsigned rowEnd);
+	bool runRows(RadarPrepareRowWork &work, unsigned rowBegin,
+		unsigned rowEnd)
+	{
+		return runRows(&work, rowBegin, rowEnd);
+	}
 
 	void release(unsigned consumerId);
 	void shutdown();
@@ -116,8 +143,8 @@ private:
 	RadarTerrainPrepareService &operator=(const RadarTerrainPrepareService &);
 
 	bool startRuntime(unsigned workerCount);
-	bool runAttempt(RadarTerrainSnapshot *snapshot,
-		unsigned char *output, unsigned rowBegin, unsigned rowEnd,
+	bool runAttempt(RadarPrepareRowWork *work, unsigned rowBegin,
+		unsigned rowEnd,
 		unsigned workerCount);
 	void stopIdleRuntime();
 

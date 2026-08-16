@@ -902,6 +902,93 @@ static int testPrepareServiceSuccessfulLeaseAndRows()
 	return 0;
 }
 
+class RadarPrepareRowWorkProbe : public RadarPrepareRowWork
+{
+public:
+	RadarPrepareRowWorkProbe(unsigned rowCount, unsigned char *rows,
+		bool fail)
+		: m_rowCount(rowCount), m_rows(rows), m_fail(fail)
+	{
+		m_ranges[0][0] = 0;
+		m_ranges[0][1] = 0;
+		m_ranges[1][0] = 0;
+		m_ranges[1][1] = 0;
+	}
+
+	virtual bool executeRows(unsigned rowBegin, unsigned rowEnd)
+	{
+		unsigned row;
+		const unsigned rangeIndex = rowBegin == 0 ? 0 : 1;
+		m_ranges[rangeIndex][0] = rowBegin;
+		m_ranges[rangeIndex][1] = rowEnd;
+		if (rowBegin > rowEnd || rowEnd > m_rowCount)
+			return false;
+		for (row = rowBegin; row < rowEnd; ++row)
+			m_rows[row] = static_cast<unsigned char>(row + 1);
+		return !m_fail;
+	}
+
+	unsigned m_ranges[2][2];
+
+private:
+	unsigned m_rowCount;
+	unsigned char *m_rows;
+	bool m_fail;
+};
+
+static int testPrepareServiceGenericRowWork()
+{
+	const char *testName = "testPrepareServiceGenericRowWork";
+	unsigned char rows[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+	RadarPrepareRowWorkProbe work(8, rows, false);
+	RadarTerrainPrepareService service;
+	unsigned row;
+
+	CHECK(testName, service.initialize(2, 2));
+	CHECK(testName, service.tryAcquire(7));
+	CHECK(testName, !service.tryAcquire(8));
+	CHECK(testName, service.runRows(&work, 0, 8));
+	CHECK(testName, work.m_ranges[0][0] == 0);
+	CHECK(testName, work.m_ranges[0][1] == 4);
+	CHECK(testName, work.m_ranges[1][0] == 4);
+	CHECK(testName, work.m_ranges[1][1] == 8);
+	for (row = 0; row < 8; ++row)
+		CHECK(testName, rows[row] == row + 1);
+#if defined(RTS_BUILD_CORE_EXTRAS)
+	CHECK(testName, service.pendingTaskCount() == 0);
+#endif
+	service.release(7);
+	CHECK(testName, service.tryAcquire(8));
+	service.release(8);
+	service.shutdown();
+	CHECK(testName, !service.hasLease());
+#if defined(RTS_BUILD_CORE_EXTRAS)
+	CHECK(testName, service.pendingTaskCount() == 0);
+#endif
+	return 0;
+}
+
+static int testPrepareServiceGenericRowWorkFailureJoinsTasks()
+{
+	const char *testName =
+		"testPrepareServiceGenericRowWorkFailureJoinsTasks";
+	unsigned char rows[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+	RadarPrepareRowWorkProbe work(8, rows, true);
+	RadarTerrainPrepareService service;
+
+	CHECK(testName, service.initialize(2, 2));
+	CHECK(testName, service.tryAcquire(11));
+	CHECK(testName, !service.runRows(&work, 0, 8));
+#if defined(RTS_BUILD_CORE_EXTRAS)
+	CHECK(testName, service.pendingTaskCount() == 0);
+#endif
+	service.release(11);
+	service.shutdown();
+	CHECK(testName, !service.isInitialized());
+	CHECK(testName, !service.hasLease());
+	return 0;
+}
+
 static int testPrepareServiceStartFailureRetriesOneWorker()
 {
 	const char *testName = "testPrepareServiceStartFailureRetriesOneWorker";
@@ -1289,8 +1376,8 @@ static int testWorkerSourceAudit()
 		"..\\..\\GameEngineDevice\\Source\\W3DDevice\\Common\\System\\RadarTerrainPrepare.cpp"));
 	CHECK(testName, makeSourcePathNearTest(kernelPath, sizeof(kernelPath),
 		"..\\..\\Libraries\\Source\\TaskRuntime\\RadarTerrainKernel.cpp"));
-	result |= auditSourceRange(preparePath, "class RadarTerrainRowTask",
-		"static RadarTerrainRowTask *radarTerrainAllocateRowTask",
+	result |= auditSourceRange(preparePath, "class RadarPrepareRowTask",
+		"static RadarPrepareRowTask *radarPrepareAllocateRowTask",
 		workerForbidden,
 		sizeof(workerForbidden) / sizeof(workerForbidden[0]), testName);
 	/* Audit the complete worker-reachable kernel, including its private
@@ -1367,6 +1454,8 @@ int main()
 	result |= testOwnerBatchCapturePreflight();
 	result |= testRowSplitCoversRequestedRowsExactlyOnce();
 	result |= testPrepareServiceSuccessfulLeaseAndRows();
+	result |= testPrepareServiceGenericRowWork();
+	result |= testPrepareServiceGenericRowWorkFailureJoinsTasks();
 	result |= testPrepareServiceStartFailureRetriesOneWorker();
 	result |= testPrepareServiceTaskAllocationRetriesOneWorker();
 	result |= testPrepareServiceQueueBackpressureFallsBackToSerial();
