@@ -50,11 +50,14 @@
 #include "GameClient/TerrainVisual.h"
 #include "GameClient/Water.h"
 #include "W3DDevice/Common/W3DRadar.h"
+#include "W3DDevice/Common/RadarTerrainPrepare.h"
 #include "W3DDevice/GameClient/HeightMap.h"
 #include "W3DDevice/GameClient/W3DShroud.h"
 #include "WW3D2/texture.h"
 #include "WW3D2/dx8caps.h"
 #include "WWMath/vector2i.h"
+
+#include <string.h>
 
 
 
@@ -697,6 +700,7 @@ void W3DRadar::renderObjectList( const RadarObject *listHead, TextureClass *text
 
 	SurfaceClass::SurfaceDescription surfaceDesc;
 	surface->Get_Description(surfaceDesc);
+
 	int pitch;
 	void *pBits = surface->Lock(&pitch);
 	const unsigned int bytesPerPixel = Get_Bytes_Per_Pixel(surfaceDesc.Format);
@@ -1047,6 +1051,159 @@ void W3DRadar::newMap( TerrainLogic *terrain )
 }
 
 // ------------------------------------------------------------------------------------------------
+// Copy all live terrain/radar inputs needed by the D3D-free raster kernel.
+// This remains on the owner thread; the resulting batch contains no engine
+// pointers and is complete before any future worker task is admitted.
+// ------------------------------------------------------------------------------------------------
+Bool W3DRadar::captureTerrainBatch( TerrainLogic *terrain,
+	RadarTerrainBatch *batch, const RGBColor &waterColor )
+{
+	if( terrain == nullptr || batch == nullptr )
+		return FALSE;
+
+	RadarTerrainSnapshot &snapshot = batch->snapshot();
+	RadarTerrainCellInput *cells = batch->cells();
+	const unsigned width = snapshot.width;
+	const unsigned height = snapshot.height;
+	unsigned y;
+
+	if( !batch->isAllocated() ||
+		width != static_cast<unsigned>(m_textureWidth) ||
+		height != static_cast<unsigned>(m_textureHeight) ||
+		width != RADAR_CELL_WIDTH || height != RADAR_CELL_HEIGHT ||
+		cells == nullptr )
+	{
+		return FALSE;
+	}
+
+	snapshot.terrainAverageZ = getTerrainAverageZ();
+	snapshot.mapHighZ = m_mapExtent.hi.z;
+	snapshot.mapLowZ = m_mapExtent.lo.z;
+	snapshot.waterColor.red = waterColor.red;
+	snapshot.waterColor.green = waterColor.green;
+	snapshot.waterColor.blue = waterColor.blue;
+
+	for( y = 0; y < height; ++y )
+	{
+		unsigned x;
+		for( x = 0; x < width; ++x )
+		{
+			RadarTerrainCellInput &cell = cells[y * width + x];
+			ICoord2D radarPoint;
+			Coord3D worldPoint;
+			Coord3D groundPoint;
+			Bridge *bridge;
+			Bool workingBridge = FALSE;
+
+			/* Every field is initialized, including values unused by this branch. */
+			memset( &cell, 0, sizeof( cell ) );
+
+			radarPoint.x = x;
+			radarPoint.y = y;
+			if( !radarToWorld2D( &radarPoint, &worldPoint ) )
+				return FALSE;
+
+			cell.worldX = worldPoint.x;
+			cell.worldY = worldPoint.y;
+
+			/* Preserve the legacy center bridge lookup and body-state test first. */
+			bridge = TheTerrainLogic->findBridgeAt( &worldPoint );
+			if( bridge != nullptr )
+			{
+				Object *obj = TheGameLogic->findObjectByID(
+					bridge->peekBridgeInfo()->bridgeObjectID );
+
+				if( obj != nullptr )
+				{
+					BodyModuleInterface *body = obj->getBodyModule();
+					if( body != nullptr && body->getDamageState() != BODY_RUBBLE )
+						workingBridge = TRUE;
+				}
+			}
+			cell.workingBridge = workingBridge ? 1 : 0;
+
+			/* Bridge wins over water, just as in the legacy owner loop. */
+			if( !workingBridge )
+			{
+				Real waterZ = 0.0f;
+				if( terrain->isUnderwater( worldPoint.x, worldPoint.y, &waterZ ) )
+				{
+					cell.centerUnderwater = 1;
+					cell.centerWaterSurfaceZ = waterZ;
+				}
+			}
+
+			/* radarToWorld supplies ground z through TheTerrainLogic. */
+			if( !radarToWorld( &radarPoint, &groundPoint ) )
+				return FALSE;
+			cell.groundZ = groundPoint.z;
+
+			/* Preserve the neighbor overload and its terrain-z output. */
+			{
+				Real underwaterZ = 0.0f;
+				if( terrain->isUnderwater( worldPoint.x, worldPoint.y,
+					nullptr, &underwaterZ ) )
+				{
+					cell.neighborUnderwater = 1;
+					cell.neighborWaterBottomZ = underwaterZ;
+				}
+			}
+
+			/*
+			 * The visual implementation normally writes all three values.  Start
+			 * from the same zero value used by the height-map implementation when
+			 * a visual has no backing map, and retain the resulting scalar color.
+			 */
+			{
+				RGBColor terrainColor;
+				terrainColor.red = 0.0f;
+				terrainColor.green = 0.0f;
+				terrainColor.blue = 0.0f;
+				TheTerrainVisual->getTerrainColorAt( groundPoint.x, groundPoint.y,
+					&terrainColor );
+				cell.terrainColor.red = terrainColor.red;
+				cell.terrainColor.green = terrainColor.green;
+				cell.terrainColor.blue = terrainColor.blue;
+			}
+
+			if( workingBridge )
+			{
+				AsciiString bridgeTName = bridge->getBridgeTemplateName();
+				TerrainRoadType *bridgeTemplate = TheTerrainRoads->findBridge( bridgeTName );
+
+				DEBUG_ASSERTCRASH( bridgeTemplate,
+					("W3DRadar::buildTerrainTexture - Can't find bridge template for '%s'",
+					bridgeTName.str()) );
+
+				if( bridgeTemplate != nullptr )
+				{
+					RGBColor bridgeColor = bridgeTemplate->getRadarColor();
+					cell.bridgeColor.red = bridgeColor.red;
+					cell.bridgeColor.green = bridgeColor.green;
+					cell.bridgeColor.blue = bridgeColor.blue;
+				}
+				else
+				{
+					RGBColor white;
+					white.setFromInt( 0xffffffff );
+					cell.bridgeColor.red = white.red;
+					cell.bridgeColor.green = white.green;
+					cell.bridgeColor.blue = white.blue;
+				}
+
+				/* Keep the legacy left-to-right four-corner expression order. */
+				cell.bridgeHeight = (bridge->peekBridgeInfo()->fromLeft.z +
+					bridge->peekBridgeInfo()->fromRight.z +
+					bridge->peekBridgeInfo()->toLeft.z +
+					bridge->peekBridgeInfo()->toRight.z) / 4.0f;
+			}
+		}
+	}
+
+	return TRUE;
+}
+
+// ------------------------------------------------------------------------------------------------
 // ------------------------------------------------------------------------------------------------
 void W3DRadar::buildTerrainTexture( TerrainLogic *terrain )
 {
@@ -1076,6 +1233,41 @@ void W3DRadar::buildTerrainTexture( TerrainLogic *terrain )
 
 	SurfaceClass::SurfaceDescription surfaceDesc;
 	surface->Get_Description(surfaceDesc);
+
+	/*
+	 * Stage the complete owner snapshot before locking the D3D surface.  A
+	 * failed allocation, capture, or kernel validation deliberately falls
+	 * through to the unchanged allocation-free owner loop below.
+	 */
+	RadarTerrainBatch batch;
+	const unsigned formatCode = static_cast<unsigned>(surfaceDesc.Format);
+	if( surfaceDesc.Width == static_cast<unsigned>(m_textureWidth) &&
+		surfaceDesc.Height == static_cast<unsigned>(m_textureHeight) &&
+		batch.initialize( static_cast<unsigned>(m_textureWidth),
+			static_cast<unsigned>(m_textureHeight), formatCode ) &&
+		captureTerrainBatch( terrain, &batch, waterColor ) &&
+		ShadeRadarRows( batch.snapshot(), batch.output(), 0,
+			batch.snapshot().height ) )
+	{
+		int stagedPitch = 0;
+		void *stagedBits = surface->Lock( &stagedPitch );
+		if( stagedBits != nullptr )
+		{
+			unsigned stagedY;
+			for( stagedY = 0; stagedY < batch.snapshot().height; ++stagedY )
+			{
+				unsigned char *destination = static_cast<unsigned char *>(stagedBits) +
+					stagedY * stagedPitch;
+				const unsigned char *source = batch.output() +
+					stagedY * batch.snapshot().rowBytes;
+				memcpy( destination, source, batch.snapshot().rowBytes );
+			}
+			surface->Unlock();
+			REF_PTR_RELEASE(surface);
+			return;
+		}
+	}
+
 	int pitch;
 	void *pBits = surface->Lock(&pitch);
 	const unsigned int bytesPerPixel = Get_Bytes_Per_Pixel(surfaceDesc.Format);

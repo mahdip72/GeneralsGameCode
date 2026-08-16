@@ -2,10 +2,15 @@ add_executable(radar_terrain_prepare_tests)
 
 target_sources(radar_terrain_prepare_tests PRIVATE
     RadarTerrainPrepareTest.cpp
+    ../../GameEngineDevice/Source/W3DDevice/Common/System/RadarTerrainPrepare.cpp
 )
 
 target_link_libraries(radar_terrain_prepare_tests PRIVATE
     core_task_runtime
+)
+
+target_include_directories(radar_terrain_prepare_tests PRIVATE
+    ../../GameEngineDevice/Include
 )
 
 set_target_properties(radar_terrain_prepare_tests PROPERTIES

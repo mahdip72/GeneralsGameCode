@@ -1,4 +1,5 @@
 #include "Lib/RadarTerrainKernel.h"
+#include "W3DDevice/Common/RadarTerrainPrepare.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -427,6 +428,36 @@ static int testInvalidRangesAndSizesDoNotWrite()
 	return 0;
 }
 
+static int testOwnerBatchStorageIsBoundedAndSingleOwned()
+{
+	const char *testName = "testOwnerBatchStorageIsBoundedAndSingleOwned";
+	RadarTerrainBatch batch;
+	CHECK(testName, batch.initialize(2, 2, RADAR_TERRAIN_FORMAT_R8G8B8));
+	CHECK(testName, batch.isAllocated());
+	CHECK(testName, batch.snapshot().width == 2);
+	CHECK(testName, batch.snapshot().height == 2);
+	CHECK(testName, batch.snapshot().bytesPerPixel == 3);
+	CHECK(testName, batch.snapshot().rowBytes == 6);
+	CHECK(testName, batch.snapshot().cells == batch.cells());
+	CHECK(testName, batch.output() != 0);
+	CHECK(testName, !batch.isComplete());
+	batch.markComplete();
+	CHECK(testName, batch.isComplete());
+	batch.reset();
+	CHECK(testName, !batch.isAllocated());
+	CHECK(testName, !batch.isComplete());
+	CHECK(testName, batch.snapshot().cells == 0);
+	CHECK(testName, batch.output() == 0);
+
+	CHECK(testName, !batch.initialize(2, 2, RADAR_TERRAIN_FORMAT_A8R8G8B8));
+	CHECK(testName, !batch.initialize(0, 2, RADAR_TERRAIN_FORMAT_R8G8B8));
+	CHECK(testName, !batch.initialize(2, 0, RADAR_TERRAIN_FORMAT_R8G8B8));
+	CHECK(testName, !batch.initialize(512, 512, RADAR_TERRAIN_FORMAT_R8G8B8));
+	CHECK(testName, !batch.initialize(0xFFFFFFFFu, 2,
+		RADAR_TERRAIN_FORMAT_R8G8B8));
+	return 0;
+}
+
 int main()
 {
 	int result = 0;
@@ -438,5 +469,6 @@ int main()
 	result |= testHandAuthoredClippedAveragesAndBridgePrecedence();
 	result |= testSerialAndTwoRangeOutputsAreByteExact();
 	result |= testInvalidRangesAndSizesDoNotWrite();
+	result |= testOwnerBatchStorageIsBoundedAndSingleOwned();
 	return result;
 }

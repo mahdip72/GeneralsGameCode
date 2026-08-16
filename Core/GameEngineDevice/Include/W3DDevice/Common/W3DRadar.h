@@ -39,6 +39,7 @@
 class TextureClass;
 class SurfaceClass;
 class TerrainLogic;
+class RadarTerrainBatch;
 
 // PROTOTYPES /////////////////////////////////////////////////////////////////////////////////////
 //-------------------------------------------------------------------------------------------------
@@ -84,6 +85,8 @@ protected:
 	void drawHeroIcon( Int pixelX, Int pixelY, Int width, Int height, const Coord3D *pos );	//< draw a hero icon
 	void drawViewBox( Int pixelX, Int pixelY, Int width, Int height );  ///< draw view box
 	void buildTerrainTexture( TerrainLogic *terrain );	 ///< create the terrain texture of the radar
+	Bool captureTerrainBatch( TerrainLogic *terrain, RadarTerrainBatch *batch,
+		const RGBColor &waterColor );
 	void drawIcons( Int pixelX, Int pixelY, Int width, Int height );	///< draw all of the radar icons
 	void updateObjectTexture(TextureClass *texture);
 	static Bool canRenderObject( const RadarObject *rObj, const Player *localPlayer );
