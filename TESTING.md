@@ -137,9 +137,9 @@ First run the source hygiene check and focused modern build/test targets:
 
 ```powershell
 git diff --check
-cmake --preset win32-debug
-cmake --build build/win32-debug --target radar_terrain_prepare_tests core_task_runtime_tests core_texture_mip_buffer_tests g_generals z_generals --parallel 2
-ctest --test-dir build/win32-debug -R "^(radar_terrain_prepare|core_task_runtime|core_texture_mip_buffer)_tests$" --output-on-failure
+cmake --preset win32-debug -DRTS_BUILD_GENERALS=ON -DRTS_BUILD_ZEROHOUR=ON -DRTS_BUILD_CORE_EXTRAS=ON
+cmake --build build/win32-debug --config Debug --target radar_terrain_prepare_tests core_task_runtime_tests core_texture_mip_buffer_tests g_generals z_generals --parallel 2
+ctest --test-dir build/win32-debug -C Debug -R "^(radar_terrain_prepare|core_task_runtime|core_texture_mip_buffer)_tests$" --output-on-failure
 ```
 
 The radar target is expected to exercise serial-versus-two-range byte parity,
@@ -154,7 +154,7 @@ Then run the legacy compatibility lane using an actual optimized VC6 build;
 do not substitute a modern Win32 executable for replay evidence:
 
 ```powershell
-cmake --preset vc6
+cmake --preset vc6 -DRTS_BUILD_GENERALS=ON -DRTS_BUILD_ZEROHOUR=ON -DRTS_BUILD_CORE_EXTRAS=ON
 cmake --build build/vc6 --target radar_terrain_prepare_tests core_task_runtime_tests core_texture_mip_buffer_tests g_generals z_generals --parallel 2
 ```
 

@@ -367,6 +367,302 @@ static int testHandAuthoredClippedAveragesAndBridgePrecedence()
 	return 0;
 }
 
+/*
+ * Keep a deliberately independent legacy-style rasterizer in this test.  It
+ * is an oracle, not a second production helper: it does not call any radar
+ * kernel function, and its neighborhood traversal, interpolation, and byte
+ * packing are written out separately so that a shared defect cannot make the
+ * production and expected buffers agree.
+ */
+static void legacyRadarReferenceInterpolate(RadarTerrainRgb *color,
+	Real height, Real hiZ, Real midZ, Real loZ)
+{
+	const Real howBright = 0.95f;
+	const Real howDark = 0.60f;
+	Real t;
+	RadarTerrainRgb target;
+
+	if (hiZ == midZ)
+	{
+		hiZ = midZ + 0.1f;
+	}
+	if (midZ == loZ)
+	{
+		loZ = midZ - 0.1f;
+	}
+	if (hiZ == loZ)
+	{
+		hiZ = loZ + 0.2f;
+	}
+
+	if (height >= midZ)
+	{
+		t = (height - midZ) / (hiZ - midZ);
+		target.red = color->red + (1.0f - color->red) * howBright;
+		target.green = color->green + (1.0f - color->green) * howBright;
+		target.blue = color->blue + (1.0f - color->blue) * howBright;
+	}
+	else
+	{
+		t = (midZ - height) / (midZ - loZ);
+		target.red = color->red + (0.0f - color->red) * howDark;
+		target.green = color->green + (0.0f - color->green) * howDark;
+		target.blue = color->blue + (0.0f - color->blue) * howDark;
+	}
+
+	color->red = color->red + (target.red - color->red) * t;
+	color->green = color->green + (target.green - color->green) * t;
+	color->blue = color->blue + (target.blue - color->blue) * t;
+	if (color->red < 0.0f)
+	{
+		color->red = 0.0f;
+	}
+	if (color->red > 1.0f)
+	{
+		color->red = 1.0f;
+	}
+	if (color->green < 0.0f)
+	{
+		color->green = 0.0f;
+	}
+	if (color->green > 1.0f)
+	{
+		color->green = 1.0f;
+	}
+	if (color->blue < 0.0f)
+	{
+		color->blue = 0.0f;
+	}
+	if (color->blue > 1.0f)
+	{
+		color->blue = 1.0f;
+	}
+}
+
+static void legacyRadarReferenceWrite(RadarTerrainSnapshot const &snapshot,
+	RadarTerrainRgb const &color, unsigned char *destination)
+{
+	const unsigned red = static_cast<unsigned>(static_cast<unsigned char>(
+		color.red * 255.0f));
+	const unsigned green = static_cast<unsigned>(static_cast<unsigned char>(
+		color.green * 255.0f));
+	const unsigned blue = static_cast<unsigned>(static_cast<unsigned char>(
+		color.blue * 255.0f));
+	unsigned packed;
+	unsigned byteIndex;
+
+	/* These are the four production surface formats, kept explicit here. */
+	switch (snapshot.formatCode)
+	{
+	case RADAR_TERRAIN_FORMAT_R8G8B8:
+		packed = (red << 16) | (green << 8) | blue;
+		break;
+	case RADAR_TERRAIN_FORMAT_X8R8G8B8:
+		packed = (0xFFu << 24) | (red << 16) | (green << 8) | blue;
+		break;
+	case RADAR_TERRAIN_FORMAT_R5G6B5:
+		packed = ((red >> 3) << 11) | ((green >> 2) << 5) |
+			(blue >> 3);
+		break;
+	case RADAR_TERRAIN_FORMAT_X1R5G5B5:
+		packed = (1u << 15) | ((red >> 3) << 10) |
+			((green >> 3) << 5) | (blue >> 3);
+		break;
+	default:
+		packed = 0;
+		break;
+	}
+
+	for (byteIndex = 0; byteIndex < snapshot.bytesPerPixel; ++byteIndex)
+	{
+		destination[byteIndex] = static_cast<unsigned char>(
+			(packed >> (byteIndex * 8)) & 0xFFu);
+	}
+}
+
+static bool legacyRadarReferenceRasterize(
+	RadarTerrainSnapshot const &snapshot, unsigned char *output)
+{
+	unsigned y;
+
+	if (output == 0 || snapshot.cells == 0 || snapshot.width == 0 ||
+		snapshot.height == 0)
+	{
+		return false;
+	}
+
+	for (y = 0; y < snapshot.height; ++y)
+	{
+		unsigned x;
+		for (x = 0; x < snapshot.width; ++x)
+		{
+			const RadarTerrainCellInput *center =
+				&snapshot.cells[y * snapshot.width + x];
+			RadarTerrainRgb sum;
+			unsigned samples = 0;
+			int dy;
+
+			sum.red = 0.0f;
+			sum.green = 0.0f;
+			sum.blue = 0.0f;
+
+			for (dy = -1; dy <= 1; ++dy)
+			{
+				int dx;
+				const int sourceY = static_cast<int>(y) + dy;
+				if (sourceY < 0 || sourceY >= static_cast<int>(snapshot.height))
+				{
+					continue;
+				}
+
+				for (dx = -1; dx <= 1; ++dx)
+				{
+					const int sourceX = static_cast<int>(x) + dx;
+					RadarTerrainRgb sample;
+					const RadarTerrainCellInput *neighbor;
+
+					if (sourceX < 0 ||
+						sourceX >= static_cast<int>(snapshot.width))
+					{
+						continue;
+					}
+					neighbor = &snapshot.cells[sourceY * snapshot.width + sourceX];
+
+					if (center->workingBridge)
+					{
+						sample = center->bridgeColor;
+						legacyRadarReferenceInterpolate(&sample,
+							center->bridgeHeight, snapshot.terrainAverageZ,
+							snapshot.mapHighZ, snapshot.mapLowZ);
+					}
+					else if (center->centerUnderwater)
+					{
+						if (!neighbor->neighborUnderwater)
+						{
+							continue;
+						}
+						sample = snapshot.waterColor;
+						legacyRadarReferenceInterpolate(&sample,
+							neighbor->neighborWaterBottomZ,
+							center->centerWaterSurfaceZ,
+							center->centerWaterSurfaceZ, snapshot.mapLowZ);
+					}
+					else
+					{
+						sample = neighbor->terrainColor;
+						legacyRadarReferenceInterpolate(&sample, neighbor->groundZ,
+							snapshot.terrainAverageZ, snapshot.mapHighZ,
+							snapshot.mapLowZ);
+					}
+
+					sum.red += sample.red;
+					sum.green += sample.green;
+					sum.blue += sample.blue;
+					++samples;
+				}
+			}
+
+			if (samples == 0)
+			{
+				samples = 1;
+			}
+			sum.red /= static_cast<Real>(samples);
+			sum.green /= static_cast<Real>(samples);
+			sum.blue /= static_cast<Real>(samples);
+			legacyRadarReferenceWrite(snapshot, sum,
+				output + y * snapshot.rowBytes + x * snapshot.bytesPerPixel);
+		}
+	}
+	return true;
+}
+
+static void makeLegacyReferenceFixture(RadarTerrainCellInput *cells,
+	unsigned width, unsigned height)
+{
+	unsigned y;
+	for (y = 0; y < height; ++y)
+	{
+		unsigned x;
+		for (x = 0; x < width; ++x)
+		{
+			const unsigned index = y * width + x;
+			setCell(cells[index], static_cast<Real>(x), static_cast<Real>(y));
+			cells[index].groundZ = 2.0f + (Real)(x * 3 + y * 2);
+			setRgb(cells[index].terrainColor,
+				0.12f + 0.07f * (Real)x,
+				0.18f + 0.06f * (Real)y,
+				0.10f + 0.04f * (Real)(x + y));
+		}
+	}
+
+	/* Top-left bridge and top-edge water exercise clipped neighborhoods. */
+	cells[0].workingBridge = 1;
+	cells[0].bridgeHeight = 24.0f;
+	setRgb(cells[0].bridgeColor, 0.95f, 0.20f, 0.05f);
+	cells[1].centerUnderwater = 1;
+	cells[1].centerWaterSurfaceZ = 16.0f;
+	cells[1].neighborWaterBottomZ = 3.0f;
+
+	/* Interior water and a second corner bridge cover non-clipped traversal. */
+	cells[1 + width * 2].centerUnderwater = 1;
+	cells[1 + width * 2].centerWaterSurfaceZ = 22.0f;
+	cells[1 + width * 2].neighborWaterBottomZ = 6.0f;
+	cells[width * height - 1].workingBridge = 1;
+	cells[width * height - 1].bridgeHeight = 8.0f;
+	setRgb(cells[width * height - 1].bridgeColor, 0.05f, 0.75f, 0.95f);
+}
+
+static int testIndependentReferenceRasterizerMatchesAllFormats()
+{
+	const char *testName =
+		"testIndependentReferenceRasterizerMatchesAllFormats";
+	const unsigned width = 5;
+	const unsigned height = 4;
+	const unsigned guard = 3;
+	const unsigned formatCodes[] = {
+		RADAR_TERRAIN_FORMAT_R8G8B8,
+		RADAR_TERRAIN_FORMAT_X8R8G8B8,
+		RADAR_TERRAIN_FORMAT_R5G6B5,
+		RADAR_TERRAIN_FORMAT_X1R5G5B5
+	};
+	const unsigned bytesPerPixel[] = { 3, 4, 2, 2 };
+	RadarTerrainCellInput cells[width * height];
+	RadarTerrainSnapshot snapshot;
+	unsigned char actual[128];
+	unsigned char expected[128];
+	unsigned formatIndex;
+
+	makeLegacyReferenceFixture(cells, width, height);
+	snapshot = makeSnapshot(cells, width, height, bytesPerPixel[0],
+		formatCodes[0], width * bytesPerPixel[0] + guard * 2);
+	snapshot.terrainAverageZ = 12.0f;
+	snapshot.mapHighZ = 30.0f;
+	snapshot.mapLowZ = -5.0f;
+	setRgb(snapshot.waterColor, 0.05f, 0.55f, 0.95f);
+
+	for (formatIndex = 0;
+		formatIndex < sizeof(formatCodes) / sizeof(formatCodes[0]);
+		++formatIndex)
+	{
+		const unsigned payloadBytes = width * bytesPerPixel[formatIndex];
+		const unsigned rowBytes = payloadBytes + guard * 2;
+		const unsigned storageSize = guard + rowBytes * height + guard;
+		snapshot.formatCode = formatCodes[formatIndex];
+		snapshot.bytesPerPixel = bytesPerPixel[formatIndex];
+		snapshot.rowBytes = rowBytes;
+		memset(actual, 0xA5, sizeof(actual));
+		memset(expected, 0xA5, sizeof(expected));
+		CHECK(testName, ShadeRadarRows(snapshot, actual + guard, 0, height));
+		CHECK(testName, legacyRadarReferenceRasterize(snapshot,
+			expected + guard));
+		CHECK(testName, checkBytes(actual, expected, storageSize,
+			testName) == 0);
+		CHECK(testName, checkGuards(actual, storageSize, rowBytes,
+			payloadBytes, height, guard, testName) == 0);
+	}
+	return 0;
+}
+
 static int testSerialAndTwoRangeOutputsAreByteExact()
 {
 	const char *testName = "testSerialAndTwoRangeOutputsAreByteExact";
@@ -903,7 +1199,7 @@ static int auditSourceRange(const char *path, const char *startMarker,
 	{
 		return check(false, testName, "startMarker != 0");
 	}
-	end = strstr(start, endMarker);
+	end = endMarker == 0 ? source + sourceLength : strstr(start, endMarker);
 	if (end == 0)
 	{
 		return check(false, testName, "endMarker != 0");
@@ -915,6 +1211,47 @@ static int auditSourceRange(const char *path, const char *startMarker,
 		{
 			fprintf(stderr, "%s: forbidden source token '%s'\n", testName,
 				forbidden[index]);
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static int auditSourceMarkers(const char *path,
+	const char *const *required, unsigned requiredCount, const char *testName)
+{
+	FILE *sourceFile = fopen(path, "rb");
+	char source[65536];
+	long sourceLength;
+	unsigned index;
+
+	if (sourceFile == 0)
+	{
+		return check(false, testName, "sourceFile != 0");
+	}
+	fseek(sourceFile, 0, SEEK_END);
+	sourceLength = ftell(sourceFile);
+	fseek(sourceFile, 0, SEEK_SET);
+	if (sourceLength <= 0 || sourceLength >= static_cast<long>(sizeof(source)))
+	{
+		fclose(sourceFile);
+		return check(false, testName, "sourceLength fits audit buffer");
+	}
+	if (fread(source, 1, static_cast<size_t>(sourceLength), sourceFile) !=
+		static_cast<size_t>(sourceLength))
+	{
+		fclose(sourceFile);
+		return check(false, testName, "fread(source) == sourceLength");
+	}
+	fclose(sourceFile);
+	source[sourceLength] = '\0';
+
+	for (index = 0; index < requiredCount; ++index)
+	{
+		if (strstr(source, required[index]) == 0)
+		{
+			fprintf(stderr, "%s: required source token '%s' was absent\n",
+				testName, required[index]);
 			return 1;
 		}
 	}
@@ -933,6 +1270,17 @@ static int testWorkerSourceAudit()
 		"D3D", "The", "new ", "delete ", "wait", "rand", "RNG",
 		"replay", "save", "network"
 	};
+	const char *const kernelHelpers[] = {
+		"static unsigned radarTerrainBytesPerPixelForFormat",
+		"unsigned RadarTerrainBytesPerPixel",
+		"void InterpolateRadarColorForHeight",
+		"static unsigned radarTerrainColorByte",
+		"static unsigned radarTerrainPackColor",
+		"static void radarTerrainWritePixel",
+		"static void radarTerrainAddSample",
+		"void ShadeRadarPixel",
+		"bool ShadeRadarRows"
+	};
 	char preparePath[1024];
 	char kernelPath[1024];
 	int result = 0;
@@ -945,9 +1293,14 @@ static int testWorkerSourceAudit()
 		"static RadarTerrainRowTask *radarTerrainAllocateRowTask",
 		workerForbidden,
 		sizeof(workerForbidden) / sizeof(workerForbidden[0]), testName);
-	result |= auditSourceRange(kernelPath, "void ShadeRadarPixel",
-		"bool ShadeRadarRows", kernelForbidden,
+	/* Audit the complete worker-reachable kernel, including its private
+	 * color/packing/write/add helpers, not only the two public shade bodies. */
+	result |= auditSourceRange(kernelPath,
+		"static unsigned radarTerrainBytesPerPixelForFormat", 0,
+		kernelForbidden,
 		sizeof(kernelForbidden) / sizeof(kernelForbidden[0]), testName);
+	result |= auditSourceMarkers(kernelPath, kernelHelpers,
+		sizeof(kernelHelpers) / sizeof(kernelHelpers[0]), testName);
 	return result;
 }
 
@@ -1007,6 +1360,7 @@ int main()
 	result |= testOnlySupportedTerrainFormatSizes();
 	result |= testUnsupportedFormatsRejectWithoutWriting();
 	result |= testHandAuthoredClippedAveragesAndBridgePrecedence();
+	result |= testIndependentReferenceRasterizerMatchesAllFormats();
 	result |= testSerialAndTwoRangeOutputsAreByteExact();
 	result |= testInvalidRangesAndSizesDoNotWrite();
 	result |= testOwnerBatchStorageIsBoundedAndSingleOwned();
