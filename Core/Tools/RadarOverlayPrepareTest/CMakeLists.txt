@@ -2,6 +2,8 @@ add_executable(radar_overlay_prepare_tests)
 
 target_sources(radar_overlay_prepare_tests PRIVATE
     RadarOverlayPrepareTest.cpp
+    ../../GameEngineDevice/Source/W3DDevice/Common/System/RadarOverlayPrepare.cpp
+    ../../GameEngineDevice/Source/W3DDevice/Common/System/RadarTerrainPrepare.cpp
 )
 
 target_link_libraries(radar_overlay_prepare_tests PRIVATE
@@ -10,6 +12,7 @@ target_link_libraries(radar_overlay_prepare_tests PRIVATE
 
 target_include_directories(radar_overlay_prepare_tests PRIVATE
     ../../Libraries/Include
+    ../../GameEngineDevice/Include
 )
 
 set_target_properties(radar_overlay_prepare_tests PROPERTIES

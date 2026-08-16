@@ -1,4 +1,5 @@
 #include "Lib/RadarOverlayKernel.h"
+#include "W3DDevice/Common/RadarOverlayPrepare.h"
 
 #include <limits.h>
 #include <stdio.h>
@@ -603,6 +604,240 @@ static int testEmptyCommandsPreserveExistingBytes()
 	return 0;
 }
 
+static int testObjectBatchStorageTracksCountAndCapacity()
+{
+	const char *testName = "testObjectBatchStorageTracksCountAndCapacity";
+	RadarObjectOverlayBatch batch;
+	RadarObjectOverlayCommand first;
+	RadarObjectOverlayCommand second;
+	const RadarObjectOverlaySnapshot *snapshot;
+
+	first.x = 1;
+	first.y = 2;
+	first.packedColor = 0x11223344u;
+	second.x = -1;
+	second.y = 3;
+	second.packedColor = 0xAABBCCDDu;
+
+	CHECK(testName, batch.initialize(4, 4,
+		RADAR_OVERLAY_FORMAT_A8R8G8B8, 2));
+	CHECK(testName, batch.isAllocated());
+	snapshot = &batch.snapshot();
+	CHECK(testName, snapshot->width == 4);
+	CHECK(testName, snapshot->height == 4);
+	CHECK(testName, snapshot->bytesPerPixel == 4);
+	CHECK(testName, snapshot->rowBytes == 16);
+	CHECK(testName, snapshot->commandCount == 0);
+	CHECK(testName, snapshot->commandCapacity == 2);
+	CHECK(testName, snapshot->commands != 0);
+	CHECK(testName, snapshot->output != 0);
+	CHECK(testName, batch.append(first));
+	CHECK(testName, batch.append(second));
+	CHECK(testName, !batch.append(first));
+	memset(batch.output(), 0xCC, 4 * 4 * 4);
+	CHECK(testName, PackRadarObjectRows(batch.snapshot(), 0, 4));
+	CHECK(testName, pixel(batch.output(), 16, 4, 1, 2)[0] == 0x44);
+	snapshot = &batch.snapshot();
+	CHECK(testName, snapshot->commandCount == 2);
+	CHECK(testName, snapshot->commandCapacity == 2);
+	CHECK(testName, snapshot->commands[0].x == first.x);
+	CHECK(testName, snapshot->commands[1].packedColor == second.packedColor);
+	batch.reset();
+	CHECK(testName, !batch.isAllocated());
+	CHECK(testName, batch.snapshot().commandCount == 0);
+	CHECK(testName, batch.snapshot().commandCapacity == 0);
+	CHECK(testName, batch.snapshot().commands == 0);
+	CHECK(testName, batch.snapshot().output == 0);
+	return 0;
+}
+
+static int testShroudBatchStorageAllowsEmptyBoundedOutput()
+{
+	const char *testName = "testShroudBatchStorageAllowsEmptyBoundedOutput";
+	RadarShroudOverlayBatch batch;
+	RadarShroudOverlayBatch serialBatch;
+	RadarShroudOverlayCommand command;
+
+	command.minX = 0;
+	command.minY = 0;
+	command.maxX = 1;
+	command.maxY = 1;
+	command.packedColor = 0x55667788u;
+	CHECK(testName, batch.initialize(3, 2,
+		RADAR_OVERLAY_FORMAT_A4R4G4B4, 0));
+	CHECK(testName, batch.isAllocated());
+	CHECK(testName, batch.snapshot().commandCount == 0);
+	CHECK(testName, batch.snapshot().commandCapacity == 0);
+	CHECK(testName, batch.snapshot().commands == 0);
+	CHECK(testName, batch.snapshot().rowBytes == 6);
+	CHECK(testName, !batch.append(command));
+	CHECK(testName, serialBatch.initialize(3, 2,
+		RADAR_OVERLAY_FORMAT_A4R4G4B4, 1));
+	CHECK(testName, serialBatch.append(command));
+	memset(serialBatch.output(), 0xB1, 12);
+	CHECK(testName, PackRadarShroudRows(serialBatch.snapshot(), 0, 2));
+	CHECK(testName, pixel(serialBatch.output(), 6, 2, 1, 1)[0] == 0x88);
+	batch.reset();
+	serialBatch.reset();
+	CHECK(testName, !batch.isAllocated());
+	return 0;
+}
+
+static int testOverlayBatchStorageRejectsCheckedOverflow()
+{
+	const char *testName = "testOverlayBatchStorageRejectsCheckedOverflow";
+	RadarObjectOverlayBatch object;
+	RadarShroudOverlayBatch shroud;
+
+	CHECK(testName, !object.initialize(0, 4,
+		RADAR_OVERLAY_FORMAT_A8R8G8B8, 1));
+	CHECK(testName, !object.initialize(4, 4,
+		RADAR_OVERLAY_FORMAT_UNKNOWN, 1));
+	CHECK(testName, !object.initialize(0xFFFFFFFFu, 0xFFFFFFFFu,
+		RADAR_OVERLAY_FORMAT_A8R8G8B8, 1));
+	CHECK(testName, !object.initialize(4, 4,
+		RADAR_OVERLAY_FORMAT_A8R8G8B8, 0xFFFFFFFFu));
+	CHECK(testName, !shroud.initialize(4, 4,
+		RADAR_OVERLAY_FORMAT_A4R4G4B4, 0xFFFFFFFFu));
+	CHECK(testName, !object.isAllocated());
+	CHECK(testName, !shroud.isAllocated());
+	return 0;
+}
+
+static int testObjectBatchServiceSuccessAndSerialFallback()
+{
+	const char *testName =
+		"testObjectBatchServiceSuccessAndSerialFallback";
+	RadarObjectOverlayBatch batch;
+	RadarTerrainPrepareService service;
+	unsigned char expected[64];
+
+	CHECK(testName, batch.initialize(4, 4,
+		RADAR_OVERLAY_FORMAT_A8R8G8B8, 2));
+	CHECK(testName, batch.append(0, 0, 0x10203040u));
+	CHECK(testName, batch.append(2, 2, 0xA0B0C0D0u));
+	memset(batch.output(), 0x91, sizeof(expected));
+	memcpy(expected, batch.output(), sizeof(expected));
+	CHECK(testName, PackRadarObjectRows(batch.snapshot(), 0, 4));
+	memcpy(expected, batch.output(), sizeof(expected));
+
+	memset(batch.output(), 0x91, sizeof(expected));
+	CHECK(testName, service.initialize(2, 2));
+	CHECK(testName, RunRadarObjectOverlayBatch(batch, service, 41));
+	CHECK(testName, memcmp(batch.output(), expected, sizeof(expected)) == 0);
+	CHECK(testName, !service.hasLease());
+#if defined(RTS_BUILD_CORE_EXTRAS)
+	CHECK(testName, service.pendingTaskCount() == 0);
+#endif
+	service.shutdown();
+
+	memset(batch.output(), 0x91, sizeof(expected));
+	CHECK(testName, RunRadarObjectOverlayBatch(batch, service, 42));
+	CHECK(testName, memcmp(batch.output(), expected, sizeof(expected)) == 0);
+	CHECK(testName, !service.hasLease());
+	return 0;
+}
+
+static int testShroudBatchServiceSuccessAndLeaseDenial()
+{
+	const char *testName =
+		"testShroudBatchServiceSuccessAndLeaseDenial";
+	RadarShroudOverlayBatch batch;
+	RadarTerrainPrepareService service;
+	unsigned char expected[64];
+
+	CHECK(testName, batch.initialize(4, 4,
+		RADAR_OVERLAY_FORMAT_A8R8G8B8, 2));
+	CHECK(testName, batch.append(0, 0, 2, 2, 0x10203040u));
+	CHECK(testName, batch.append(1, 1, 3, 3, 0xA0B0C0D0u));
+	memset(batch.output(), 0x72, sizeof(expected));
+	memcpy(expected, batch.output(), sizeof(expected));
+	CHECK(testName, PackRadarShroudRows(batch.snapshot(), 0, 4));
+	memcpy(expected, batch.output(), sizeof(expected));
+
+	CHECK(testName, service.initialize(2, 2));
+	memset(batch.output(), 0x72, sizeof(expected));
+	CHECK(testName, RunRadarShroudOverlayBatch(batch, service, 51));
+	CHECK(testName, memcmp(batch.output(), expected, sizeof(expected)) == 0);
+	CHECK(testName, !service.hasLease());
+
+	CHECK(testName, service.tryAcquire(61));
+	memset(batch.output(), 0x72, sizeof(expected));
+	CHECK(testName, RunRadarShroudOverlayBatch(batch, service, 62));
+	CHECK(testName, memcmp(batch.output(), expected, sizeof(expected)) == 0);
+	CHECK(testName, service.hasLease());
+	CHECK(testName, service.activeConsumer() == 61);
+	service.release(61);
+	CHECK(testName, !service.hasLease());
+	service.shutdown();
+	return 0;
+}
+
+#if defined(RTS_BUILD_CORE_EXTRAS)
+enum RadarOverlayPrepareTaskRuntimeFaultEvent
+{
+	RADAR_OVERLAY_TASK_RUNTIME_FAIL_THREAD_RESERVE = 4,
+	RADAR_OVERLAY_TASK_RUNTIME_FAIL_QUEUE_PUSH = 5
+};
+
+extern "C" void rts_task_runtime_set_test_allocation_fault(
+	unsigned event, unsigned occurrence);
+
+static int testOverlayBatchServiceFailureFallbacks()
+{
+	const char *testName = "testOverlayBatchServiceFailureFallbacks";
+	RadarObjectOverlayBatch batch;
+	RadarTerrainPrepareService service;
+	unsigned char expected[64];
+
+	CHECK(testName, batch.initialize(4, 4,
+		RADAR_OVERLAY_FORMAT_A8R8G8B8, 1));
+	CHECK(testName, batch.append(1, 1, 0xCAFEBABEu));
+	memset(batch.output(), 0xA7, sizeof(expected));
+	memcpy(expected, batch.output(), sizeof(expected));
+	CHECK(testName, PackRadarObjectRows(batch.snapshot(), 0, 4));
+	memcpy(expected, batch.output(), sizeof(expected));
+
+	/* A failed first start retries one worker and remains byte-equivalent. */
+	CHECK(testName, service.initialize(2, 2));
+	rts_task_runtime_set_test_allocation_fault(
+		RADAR_OVERLAY_TASK_RUNTIME_FAIL_THREAD_RESERVE, 1);
+	memset(batch.output(), 0xA7, sizeof(expected));
+	CHECK(testName, RunRadarObjectOverlayBatch(batch, service, 71));
+	rts_task_runtime_set_test_allocation_fault(0, 0);
+	CHECK(testName, memcmp(batch.output(), expected, sizeof(expected)) == 0);
+	CHECK(testName, !service.hasLease());
+	CHECK(testName, service.pendingTaskCount() == 0);
+	service.shutdown();
+
+	/* A queue of one rejects both required row tasks; the helper serializes. */
+	CHECK(testName, service.initialize(2, 1));
+	memset(batch.output(), 0xA7, sizeof(expected));
+	CHECK(testName, RunRadarObjectOverlayBatch(batch, service, 72));
+	CHECK(testName, memcmp(batch.output(), expected, sizeof(expected)) == 0);
+	CHECK(testName, !service.hasLease());
+	CHECK(testName, service.pendingTaskCount() == 0);
+	service.shutdown();
+
+	/* Force both task-allocation attempts to fail, then require serial output. */
+	CHECK(testName, service.initialize(2, 2));
+	rts_task_runtime_set_test_allocation_fault(
+		RADAR_OVERLAY_TASK_RUNTIME_FAIL_QUEUE_PUSH, 2);
+	rts_radar_terrain_prepare_set_test_fault(
+		RADAR_TERRAIN_PREPARE_TEST_FAIL_TASK_ALLOCATION, 3);
+	memset(batch.output(), 0xA7, sizeof(expected));
+	CHECK(testName, RunRadarObjectOverlayBatch(batch, service, 73));
+	rts_task_runtime_set_test_allocation_fault(0, 0);
+	rts_radar_terrain_prepare_set_test_fault(0, 0);
+	CHECK(testName, memcmp(batch.output(), expected, sizeof(expected)) == 0);
+	CHECK(testName, !service.hasLease());
+	CHECK(testName, service.pendingTaskCount() == 0);
+	service.shutdown();
+
+	return 0;
+}
+#endif
+
 int main()
 {
 	int result = 0;
@@ -620,5 +855,13 @@ int main()
 	result |= testInvalidSnapshotsDoNotWrite();
 	result |= testEmptyCommandsPreserveExistingBytes();
 	result |= testKernelsWriteOnlyAssignedRows();
+	result |= testObjectBatchStorageTracksCountAndCapacity();
+	result |= testShroudBatchStorageAllowsEmptyBoundedOutput();
+	result |= testOverlayBatchStorageRejectsCheckedOverflow();
+	result |= testObjectBatchServiceSuccessAndSerialFallback();
+	result |= testShroudBatchServiceSuccessAndLeaseDenial();
+#if defined(RTS_BUILD_CORE_EXTRAS)
+	result |= testOverlayBatchServiceFailureFallbacks();
+#endif
 	return result;
 }
