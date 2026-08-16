@@ -142,3 +142,12 @@ bool RadarTerrainBatch::isAllocated() const
 	return m_cells != 0 && m_output != 0;
 }
 
+bool RadarTerrainBatchCapturePreflight(const RadarTerrainBatch &batch,
+	unsigned expectedWidth, unsigned expectedHeight, Real xSample, Real ySample)
+{
+	const RadarTerrainSnapshot &snapshot = batch.snapshot();
+	return batch.isAllocated() && expectedWidth != 0 && expectedHeight != 0 &&
+		xSample != 0.0f && ySample != 0.0f &&
+		snapshot.width == expectedWidth && snapshot.height == expectedHeight &&
+		snapshot.cells == batch.cells();
+}

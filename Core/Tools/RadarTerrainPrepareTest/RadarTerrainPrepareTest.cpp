@@ -441,8 +441,6 @@ static int testOwnerBatchStorageIsBoundedAndSingleOwned()
 	CHECK(testName, batch.snapshot().cells == batch.cells());
 	CHECK(testName, batch.output() != 0);
 	CHECK(testName, !batch.isComplete());
-	batch.markComplete();
-	CHECK(testName, batch.isComplete());
 	batch.reset();
 	CHECK(testName, !batch.isAllocated());
 	CHECK(testName, !batch.isComplete());
@@ -458,6 +456,31 @@ static int testOwnerBatchStorageIsBoundedAndSingleOwned()
 	return 0;
 }
 
+static int testOwnerBatchCapturePreflight()
+{
+	const char *testName = "testOwnerBatchCapturePreflight";
+	RadarTerrainBatch batch;
+
+	CHECK(testName, !RadarTerrainBatchCapturePreflight(batch, 2, 2,
+		1.0f, 1.0f));
+	CHECK(testName, batch.initialize(2, 2, RADAR_TERRAIN_FORMAT_R8G8B8));
+	CHECK(testName, RadarTerrainBatchCapturePreflight(batch, 2, 2,
+		1.0f, 1.0f));
+	CHECK(testName, !RadarTerrainBatchCapturePreflight(batch, 2, 2,
+		0.0f, 1.0f));
+	CHECK(testName, !RadarTerrainBatchCapturePreflight(batch, 2, 2,
+		1.0f, 0.0f));
+	CHECK(testName, !RadarTerrainBatchCapturePreflight(batch, 3, 2,
+		1.0f, 1.0f));
+	CHECK(testName, !RadarTerrainBatchCapturePreflight(batch, 2, 3,
+		1.0f, 1.0f));
+	CHECK(testName, !batch.isComplete());
+	batch.reset();
+	CHECK(testName, !batch.isAllocated());
+	CHECK(testName, !batch.isComplete());
+	return 0;
+}
+
 int main()
 {
 	int result = 0;
@@ -470,5 +493,6 @@ int main()
 	result |= testSerialAndTwoRangeOutputsAreByteExact();
 	result |= testInvalidRangesAndSizesDoNotWrite();
 	result |= testOwnerBatchStorageIsBoundedAndSingleOwned();
+	result |= testOwnerBatchCapturePreflight();
 	return result;
 }

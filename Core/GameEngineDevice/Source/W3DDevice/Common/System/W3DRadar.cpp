@@ -700,7 +700,6 @@ void W3DRadar::renderObjectList( const RadarObject *listHead, TextureClass *text
 
 	SurfaceClass::SurfaceDescription surfaceDesc;
 	surface->Get_Description(surfaceDesc);
-
 	int pitch;
 	void *pBits = surface->Lock(&pitch);
 	const unsigned int bytesPerPixel = Get_Bytes_Per_Pixel(surfaceDesc.Format);
@@ -1061,20 +1060,21 @@ Bool W3DRadar::captureTerrainBatch( TerrainLogic *terrain,
 	if( terrain == nullptr || batch == nullptr )
 		return FALSE;
 
-	RadarTerrainSnapshot &snapshot = batch->snapshot();
-	RadarTerrainCellInput *cells = batch->cells();
-	const unsigned width = snapshot.width;
-	const unsigned height = snapshot.height;
-	unsigned y;
-
-	if( !batch->isAllocated() ||
-		width != static_cast<unsigned>(m_textureWidth) ||
-		height != static_cast<unsigned>(m_textureHeight) ||
-		width != RADAR_CELL_WIDTH || height != RADAR_CELL_HEIGHT ||
-		cells == nullptr )
+	const RadarTerrainBatch &validatedBatch = *batch;
+	if( !RadarTerrainBatchCapturePreflight( validatedBatch,
+		static_cast<unsigned>(m_textureWidth),
+		static_cast<unsigned>(m_textureHeight), m_xSample, m_ySample ) ||
+		validatedBatch.snapshot().width != RADAR_CELL_WIDTH ||
+		validatedBatch.snapshot().height != RADAR_CELL_HEIGHT )
 	{
 		return FALSE;
 	}
+
+	RadarTerrainSnapshot &snapshot = batch->mutableSnapshot();
+	RadarTerrainCellInput *cells = batch->mutableCells();
+	const unsigned width = snapshot.width;
+	const unsigned height = snapshot.height;
+	unsigned y;
 
 	snapshot.terrainAverageZ = getTerrainAverageZ();
 	snapshot.mapHighZ = m_mapExtent.hi.z;
@@ -1200,6 +1200,7 @@ Bool W3DRadar::captureTerrainBatch( TerrainLogic *terrain,
 		}
 	}
 
+	batch->markComplete();
 	return TRUE;
 }
 
@@ -1246,6 +1247,7 @@ void W3DRadar::buildTerrainTexture( TerrainLogic *terrain )
 		batch.initialize( static_cast<unsigned>(m_textureWidth),
 			static_cast<unsigned>(m_textureHeight), formatCode ) &&
 		captureTerrainBatch( terrain, &batch, waterColor ) &&
+		batch.isComplete() &&
 		ShadeRadarRows( batch.snapshot(), batch.output(), 0,
 			batch.snapshot().height ) )
 	{
@@ -1253,18 +1255,24 @@ void W3DRadar::buildTerrainTexture( TerrainLogic *terrain )
 		void *stagedBits = surface->Lock( &stagedPitch );
 		if( stagedBits != nullptr )
 		{
-			unsigned stagedY;
-			for( stagedY = 0; stagedY < batch.snapshot().height; ++stagedY )
+			if( stagedPitch > 0 &&
+				static_cast<unsigned>(stagedPitch) >= batch.snapshot().rowBytes )
 			{
-				unsigned char *destination = static_cast<unsigned char *>(stagedBits) +
-					stagedY * stagedPitch;
-				const unsigned char *source = batch.output() +
-					stagedY * batch.snapshot().rowBytes;
-				memcpy( destination, source, batch.snapshot().rowBytes );
+				const unsigned stagedRowBytes = static_cast<unsigned>(stagedPitch);
+				unsigned stagedY;
+				for( stagedY = 0; stagedY < batch.snapshot().height; ++stagedY )
+				{
+					unsigned char *destination = static_cast<unsigned char *>(stagedBits) +
+						stagedY * stagedRowBytes;
+					const unsigned char *source = batch.output() +
+						stagedY * batch.snapshot().rowBytes;
+					memcpy( destination, source, batch.snapshot().rowBytes );
+				}
+				surface->Unlock();
+				REF_PTR_RELEASE(surface);
+				return;
 			}
 			surface->Unlock();
-			REF_PTR_RELEASE(surface);
-			return;
 		}
 	}
 

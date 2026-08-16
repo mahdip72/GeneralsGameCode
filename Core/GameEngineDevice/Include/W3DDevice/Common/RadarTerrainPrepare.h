@@ -12,6 +12,8 @@
 
 #include "Lib/RadarTerrainKernel.h"
 
+class W3DRadar;
+
 /*
  * Owner-side storage for one complete radar terrain preparation batch.
  *
@@ -38,16 +40,19 @@ public:
 
 	bool isAllocated() const;
 	bool isComplete() const { return m_complete; }
-	void markComplete() { m_complete = true; }
 
-	RadarTerrainSnapshot &snapshot() { return m_snapshot; }
 	const RadarTerrainSnapshot &snapshot() const { return m_snapshot; }
-	RadarTerrainCellInput *cells() { return m_cells; }
 	const RadarTerrainCellInput *cells() const { return m_cells; }
 	unsigned char *output() { return m_output; }
 	const unsigned char *output() const { return m_output; }
 
 private:
+	friend class W3DRadar;
+
+	RadarTerrainSnapshot &mutableSnapshot() { return m_snapshot; }
+	RadarTerrainCellInput *mutableCells() { return m_cells; }
+	void markComplete() { m_complete = true; }
+
 	RadarTerrainBatch(const RadarTerrainBatch &);
 	RadarTerrainBatch &operator=(const RadarTerrainBatch &);
 
@@ -57,3 +62,6 @@ private:
 	bool m_complete;
 };
 
+/* Pure owner-capture validation; it does not inspect engine or D3D state. */
+bool RadarTerrainBatchCapturePreflight(const RadarTerrainBatch &batch,
+	unsigned expectedWidth, unsigned expectedHeight, Real xSample, Real ySample);
