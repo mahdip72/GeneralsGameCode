@@ -723,7 +723,11 @@ static int testObjectBatchServiceSuccessAndSerialFallback()
 
 	memset(batch.output(), 0x91, sizeof(expected));
 	CHECK(testName, service.initialize(2, 2));
-	CHECK(testName, RunRadarObjectOverlayBatch(batch, service, 41));
+	{
+		RadarOverlayPrepareLease lease(service, 41);
+		CHECK(testName, RunRadarObjectOverlayBatch(batch, lease));
+		CHECK(testName, lease.isActive());
+	}
 	CHECK(testName, memcmp(batch.output(), expected, sizeof(expected)) == 0);
 	CHECK(testName, !service.hasLease());
 #if defined(RTS_BUILD_CORE_EXTRAS)
@@ -732,7 +736,11 @@ static int testObjectBatchServiceSuccessAndSerialFallback()
 	service.shutdown();
 
 	memset(batch.output(), 0x91, sizeof(expected));
-	CHECK(testName, RunRadarObjectOverlayBatch(batch, service, 42));
+	{
+		RadarOverlayPrepareLease lease(service, 42);
+		CHECK(testName, RunRadarObjectOverlayBatch(batch, lease));
+		CHECK(testName, !lease.isActive());
+	}
 	CHECK(testName, memcmp(batch.output(), expected, sizeof(expected)) == 0);
 	CHECK(testName, !service.hasLease());
 	return 0;
@@ -757,13 +765,21 @@ static int testShroudBatchServiceSuccessAndLeaseDenial()
 
 	CHECK(testName, service.initialize(2, 2));
 	memset(batch.output(), 0x72, sizeof(expected));
-	CHECK(testName, RunRadarShroudOverlayBatch(batch, service, 51));
+	{
+		RadarOverlayPrepareLease lease(service, 51);
+		CHECK(testName, RunRadarShroudOverlayBatch(batch, lease));
+		CHECK(testName, lease.isActive());
+	}
 	CHECK(testName, memcmp(batch.output(), expected, sizeof(expected)) == 0);
 	CHECK(testName, !service.hasLease());
 
 	CHECK(testName, service.tryAcquire(61));
 	memset(batch.output(), 0x72, sizeof(expected));
-	CHECK(testName, RunRadarShroudOverlayBatch(batch, service, 62));
+	{
+		RadarOverlayPrepareLease lease(service, 62);
+		CHECK(testName, RunRadarShroudOverlayBatch(batch, lease));
+		CHECK(testName, !lease.isActive());
+	}
 	CHECK(testName, memcmp(batch.output(), expected, sizeof(expected)) == 0);
 	CHECK(testName, service.hasLease());
 	CHECK(testName, service.activeConsumer() == 61);
@@ -803,7 +819,10 @@ static int testOverlayBatchServiceFailureFallbacks()
 	rts_task_runtime_set_test_allocation_fault(
 		RADAR_OVERLAY_TASK_RUNTIME_FAIL_THREAD_RESERVE, 1);
 	memset(batch.output(), 0xA7, sizeof(expected));
-	CHECK(testName, RunRadarObjectOverlayBatch(batch, service, 71));
+	{
+		RadarOverlayPrepareLease lease(service, 71);
+		CHECK(testName, RunRadarObjectOverlayBatch(batch, lease));
+	}
 	rts_task_runtime_set_test_allocation_fault(0, 0);
 	CHECK(testName, memcmp(batch.output(), expected, sizeof(expected)) == 0);
 	CHECK(testName, !service.hasLease());
@@ -813,7 +832,10 @@ static int testOverlayBatchServiceFailureFallbacks()
 	/* A queue of one rejects both required row tasks; the helper serializes. */
 	CHECK(testName, service.initialize(2, 1));
 	memset(batch.output(), 0xA7, sizeof(expected));
-	CHECK(testName, RunRadarObjectOverlayBatch(batch, service, 72));
+	{
+		RadarOverlayPrepareLease lease(service, 72);
+		CHECK(testName, RunRadarObjectOverlayBatch(batch, lease));
+	}
 	CHECK(testName, memcmp(batch.output(), expected, sizeof(expected)) == 0);
 	CHECK(testName, !service.hasLease());
 	CHECK(testName, service.pendingTaskCount() == 0);
@@ -826,7 +848,10 @@ static int testOverlayBatchServiceFailureFallbacks()
 	rts_radar_terrain_prepare_set_test_fault(
 		RADAR_TERRAIN_PREPARE_TEST_FAIL_TASK_ALLOCATION, 3);
 	memset(batch.output(), 0xA7, sizeof(expected));
-	CHECK(testName, RunRadarObjectOverlayBatch(batch, service, 73));
+	{
+		RadarOverlayPrepareLease lease(service, 73);
+		CHECK(testName, RunRadarObjectOverlayBatch(batch, lease));
+	}
 	rts_task_runtime_set_test_allocation_fault(0, 0);
 	rts_radar_terrain_prepare_set_test_fault(0, 0);
 	CHECK(testName, memcmp(batch.output(), expected, sizeof(expected)) == 0);

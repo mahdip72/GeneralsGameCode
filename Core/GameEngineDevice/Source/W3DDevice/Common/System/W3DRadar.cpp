@@ -50,6 +50,7 @@
 #include "GameClient/Line2D.h"
 #include "GameClient/TerrainVisual.h"
 #include "GameClient/Water.h"
+#include "W3DDevice/Common/RadarOverlayPrepare.h"
 #include "W3DDevice/Common/W3DRadar.h"
 #include "W3DDevice/Common/RadarTerrainPrepare.h"
 #include "W3DDevice/GameClient/HeightMap.h"
@@ -620,16 +621,224 @@ void W3DRadar::drawIcons( Int pixelX, Int pixelY, Int width, Int height )
 	}
 }
 
+static Bool mapRadarOverlayFormat( WW3DFormat surfaceFormat,
+	unsigned *kernelFormat )
+{
+	if( kernelFormat == nullptr )
+		return FALSE;
+
+	switch( surfaceFormat )
+	{
+	case WW3D_FORMAT_A8R8G8B8:
+		*kernelFormat = RADAR_OVERLAY_FORMAT_A8R8G8B8;
+		return TRUE;
+	case WW3D_FORMAT_A4R4G4B4:
+		*kernelFormat = RADAR_OVERLAY_FORMAT_A4R4G4B4;
+		return TRUE;
+	default:
+		*kernelFormat = RADAR_OVERLAY_FORMAT_UNKNOWN;
+		return FALSE;
+	}
+}
+
+static Bool countRadarObjectOverlayList( const RadarObject *listHead,
+	unsigned *count )
+{
+	if( count == nullptr )
+		return FALSE;
+
+	*count = 0;
+	for( const RadarObject *rObj = listHead; rObj;
+		rObj = rObj->friend_getNext() )
+	{
+		if( *count == UINT_MAX )
+			return FALSE;
+		++*count;
+	}
+	return TRUE;
+}
+
+static Bool captureRadarObjectOverlaySurface( SurfaceClass *surface,
+	const SurfaceClass::SurfaceDescription &surfaceDesc,
+	const RadarObjectOverlaySnapshot &snapshot )
+{
+	unsigned surfaceFormatCode;
+	if( surface == nullptr || snapshot.output == nullptr ||
+		snapshot.width == 0 || snapshot.height == 0 ||
+		snapshot.rowBytes == 0 ||
+		!mapRadarOverlayFormat( surfaceDesc.Format, &surfaceFormatCode ) ||
+		surfaceFormatCode != snapshot.formatCode ||
+		surfaceDesc.Width != snapshot.width ||
+		surfaceDesc.Height != snapshot.height ||
+		Get_Bytes_Per_Pixel( surfaceDesc.Format ) != snapshot.bytesPerPixel ||
+		RadarOverlayBytesPerPixel( snapshot.formatCode ) !=
+			snapshot.bytesPerPixel )
+	{
+		return FALSE;
+	}
+
+	int pitch = 0;
+	void *bits = surface->Lock( &pitch );
+	if( bits == nullptr )
+		return FALSE;
+
+	const unsigned unsignedPitch = pitch > 0 ?
+		static_cast<unsigned>(pitch) : 0;
+	const Bool pitchValid = pitch > 0 &&
+		unsignedPitch >= snapshot.rowBytes &&
+		(snapshot.height <= 1 ||
+			unsignedPitch <= UINT_MAX / (snapshot.height - 1));
+
+	if( pitchValid )
+	{
+		unsigned y;
+		for( y = 0; y < snapshot.height; ++y )
+		{
+			unsigned char *destination = snapshot.output +
+				y * snapshot.rowBytes;
+			const unsigned char *source =
+				static_cast<const unsigned char *>( bits ) + y * unsignedPitch;
+			memcpy( destination, source, snapshot.rowBytes );
+		}
+	}
+
+	/* A successful Lock is always paired with exactly one Unlock. */
+	surface->Unlock();
+	return pitchValid;
+}
+
+static Bool uploadPreparedRadarObjectOverlay( TextureClass *texture,
+	const RadarObjectOverlaySnapshot &snapshot )
+{
+	if( texture == nullptr || snapshot.output == nullptr ||
+		snapshot.width == 0 || snapshot.height == 0 ||
+		snapshot.rowBytes == 0 )
+	{
+		return FALSE;
+	}
+
+	SurfaceClass *surface = texture->Get_Surface_Level();
+	if( surface == nullptr )
+		return FALSE;
+
+	SurfaceClass::SurfaceDescription surfaceDesc;
+	surface->Get_Description( surfaceDesc );
+	unsigned surfaceFormatCode;
+	Bool uploaded = FALSE;
+	if( mapRadarOverlayFormat( surfaceDesc.Format, &surfaceFormatCode ) &&
+		surfaceFormatCode == snapshot.formatCode &&
+		surfaceDesc.Width == snapshot.width &&
+		surfaceDesc.Height == snapshot.height &&
+		Get_Bytes_Per_Pixel( surfaceDesc.Format ) == snapshot.bytesPerPixel &&
+		RadarOverlayBytesPerPixel( snapshot.formatCode ) ==
+			snapshot.bytesPerPixel )
+	{
+		int pitch = 0;
+		void *bits = surface->Lock( &pitch );
+		if( bits != nullptr )
+		{
+			const unsigned unsignedPitch = pitch > 0 ?
+				static_cast<unsigned>(pitch) : 0;
+			const Bool pitchValid = pitch > 0 &&
+				unsignedPitch >= snapshot.rowBytes &&
+				(snapshot.height <= 1 ||
+					unsignedPitch <= UINT_MAX / (snapshot.height - 1));
+
+			if( pitchValid )
+			{
+				unsigned y;
+				for( y = 0; y < snapshot.height; ++y )
+				{
+					unsigned char *destination =
+						static_cast<unsigned char *>( bits ) +
+						y * unsignedPitch;
+					const unsigned char *source = snapshot.output +
+						y * snapshot.rowBytes;
+					memcpy( destination, source, snapshot.rowBytes );
+				}
+				uploaded = TRUE;
+			}
+
+			/* Pair every non-null Lock result with exactly one Unlock. */
+			surface->Unlock();
+		}
+	}
+
+	REF_PTR_RELEASE( surface );
+	return uploaded;
+}
+
 //-------------------------------------------------------------------------------------------------
 //-------------------------------------------------------------------------------------------------
 void W3DRadar::updateObjectTexture(TextureClass *texture)
 {
+	ASSERT_GAME_THREAD("W3DRadar::updateObjectTexture radar preparation");
+
 	// reset the overlay texture
 	SurfaceClass *surface = texture->Get_Surface_Level();
 	surface->Clear();
 	REF_PTR_RELEASE(surface);
 
-	// rebuild the object overlay
+	RadarObjectOverlayBatch batch;
+	Bool prepared = FALSE;
+	unsigned objectCount = 0;
+	unsigned localObjectCount = 0;
+	unsigned commandCapacity = 0;
+
+	if( countRadarObjectOverlayList( m_objectList, &objectCount ) &&
+		countRadarObjectOverlayList( m_localObjectList, &localObjectCount ) &&
+		localObjectCount <= UINT_MAX - objectCount )
+	{
+		commandCapacity = objectCount + localObjectCount;
+		surface = texture->Get_Surface_Level();
+		if( surface != nullptr )
+		{
+			SurfaceClass::SurfaceDescription surfaceDesc;
+			surface->Get_Description( surfaceDesc );
+			unsigned formatCode = RADAR_OVERLAY_FORMAT_UNKNOWN;
+			Bool captured = FALSE;
+
+			if( surfaceDesc.Width == static_cast<unsigned>(m_textureWidth) &&
+				surfaceDesc.Height == static_cast<unsigned>(m_textureHeight) &&
+				mapRadarOverlayFormat( surfaceDesc.Format, &formatCode ) &&
+				batch.initialize( static_cast<unsigned>(m_textureWidth),
+					static_cast<unsigned>(m_textureHeight), formatCode,
+					commandCapacity ) )
+			{
+				captured = captureRadarObjectOverlaySurface( surface,
+					surfaceDesc, batch.snapshot() );
+			}
+			REF_PTR_RELEASE( surface );
+
+			if( captured )
+			{
+				Player *player = rts::getObservedOrLocalPlayer();
+				if( captureObjectOverlayList( m_objectList, player, batch,
+						surfaceDesc.Format ) )
+				{
+					player = rts::getObservedOrLocalPlayer();
+					if( captureObjectOverlayList( m_localObjectList, player,
+						batch, surfaceDesc.Format ) )
+					{
+						RadarTerrainPrepareService &prepareService =
+							GetRadarTerrainPrepareService();
+						RadarOverlayPrepareLease lease( prepareService, 2 );
+						if( RunRadarObjectOverlayBatch( batch, lease ) &&
+							uploadPreparedRadarObjectOverlay( texture,
+							batch.snapshot() ) )
+						{
+							prepared = TRUE;
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if( prepared )
+		return;
+
+	// Keep the complete owner-only reference path after the one clear above.
 	renderObjectList( m_objectList, texture );
 	renderObjectList( m_localObjectList, texture );
 }
@@ -680,6 +889,57 @@ Bool W3DRadar::canRenderObject( const RadarObject *rObj, const Player *localPlay
 	}
 
 	return true;
+}
+
+Bool W3DRadar::captureObjectOverlayList( const RadarObject *listHead,
+	const Player *localPlayer, RadarObjectOverlayBatch &batch,
+	WW3DFormat surfaceFormat )
+{
+	if( listHead == nullptr )
+		return TRUE;
+	if( localPlayer == nullptr )
+		return FALSE;
+
+	for( const RadarObject *rObj = listHead; rObj;
+		rObj = rObj->friend_getNext() )
+	{
+		if( !canRenderObject( rObj, localPlayer ) )
+			continue;
+
+		const Object *obj = rObj->friend_getObject();
+		const Coord3D *pos = obj->getPosition();
+		ICoord2D radarPoint;
+		radarPoint.x = pos->x / (m_mapExtent.width() / RADAR_CELL_WIDTH);
+		radarPoint.y = pos->y / (m_mapExtent.height() / RADAR_CELL_HEIGHT);
+
+		Color argbColor = rObj->getColor();
+		if( obj->testStatus( OBJECT_STATUS_STEALTHED ) )
+		{
+			UnsignedByte r, g, b, a;
+			GameGetColorComponents( argbColor, &r, &g, &b, &a );
+
+			const UnsignedInt framesForTransition = LOGICFRAMES_PER_SECOND;
+			const UnsignedByte minAlpha = 32;
+
+			Real alphaScale = INT_TO_REAL(
+				TheGameLogic->getFrame() % framesForTransition ) /
+				(framesForTransition / 2.0f);
+			if( alphaScale > 0.0f )
+				a = REAL_TO_UNSIGNEDBYTE(
+					((alphaScale - 1.0f) * (255.0f - minAlpha)) + minAlpha );
+			else
+				a = REAL_TO_UNSIGNEDBYTE(
+					(alphaScale * (255.0f - minAlpha)) + minAlpha );
+			argbColor = GameMakeColor( r, g, b, a );
+		}
+
+		const unsigned int pixelColor =
+			ARGB_Color_To_WW3D_Color( surfaceFormat, argbColor );
+		if( !batch.append( radarPoint.x, radarPoint.y, pixelColor ) )
+			return FALSE;
+	}
+
+	return TRUE;
 }
 
 //-------------------------------------------------------------------------------------------------

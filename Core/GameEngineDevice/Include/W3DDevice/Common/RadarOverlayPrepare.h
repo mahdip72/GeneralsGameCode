@@ -127,18 +127,31 @@ private:
 	const RadarShroudOverlaySnapshot *m_snapshot;
 };
 
-/*
- * Run one owner-owned row batch through an injected existing service.  Lease
- * denial, runtime/task failure, and submission failure all execute the same
- * complete serial row operation before returning to the caller.
- */
-bool RunRadarOverlayRows(RadarPrepareRowWork &work,
-	RadarTerrainPrepareService &service, unsigned consumerId,
-	unsigned rowBegin, unsigned rowEnd);
+/* Caller-owned lease remains active until the prepared output is consumed. */
+class RadarOverlayPrepareLease
+{
+public:
+	RadarOverlayPrepareLease(RadarTerrainPrepareService &service,
+		unsigned consumerId);
+	~RadarOverlayPrepareLease();
+
+	bool runRows(RadarPrepareRowWork &work, unsigned rowBegin,
+		unsigned rowEnd);
+	void release();
+	bool isActive() const { return m_active; }
+
+private:
+	RadarOverlayPrepareLease(const RadarOverlayPrepareLease &);
+	RadarOverlayPrepareLease &operator=(const RadarOverlayPrepareLease &);
+
+	RadarTerrainPrepareService *m_service;
+	unsigned m_consumerId;
+	bool m_active;
+};
 
 /* Full-height object and shroud helpers used by the owner integration. */
 bool RunRadarObjectOverlayBatch(RadarObjectOverlayBatch &batch,
-	RadarTerrainPrepareService &service, unsigned consumerId);
+	RadarOverlayPrepareLease &lease);
 
 bool RunRadarShroudOverlayBatch(RadarShroudOverlayBatch &batch,
-	RadarTerrainPrepareService &service, unsigned consumerId);
+	RadarOverlayPrepareLease &lease);

@@ -40,6 +40,7 @@ class TextureClass;
 class SurfaceClass;
 class TerrainLogic;
 class RadarTerrainBatch;
+class RadarObjectOverlayBatch;
 
 // PROTOTYPES /////////////////////////////////////////////////////////////////////////////////////
 //-------------------------------------------------------------------------------------------------
@@ -90,6 +91,9 @@ protected:
 	void drawIcons( Int pixelX, Int pixelY, Int width, Int height );	///< draw all of the radar icons
 	void updateObjectTexture(TextureClass *texture);
 	static Bool canRenderObject( const RadarObject *rObj, const Player *localPlayer );
+	Bool captureObjectOverlayList( const RadarObject *listHead,
+		const Player *localPlayer, RadarObjectOverlayBatch &batch,
+		WW3DFormat surfaceFormat );
 	void renderObjectList( const RadarObject *listHead, TextureClass *texture );
 	void interpolateColorForHeight( RGBColor *color,
 																	Real height,

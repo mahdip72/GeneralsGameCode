@@ -393,70 +393,46 @@ bool RadarShroudOverlayRowWork::executeRows(unsigned rowBegin,
 		PackRadarShroudRows(*m_snapshot, rowBegin, rowEnd);
 }
 
-namespace
+RadarOverlayPrepareLease::RadarOverlayPrepareLease(
+	RadarTerrainPrepareService &service, unsigned consumerId)
+	: m_service(&service), m_consumerId(consumerId), m_active(false)
 {
+}
 
-class RadarOverlayLeaseGuard
+RadarOverlayPrepareLease::~RadarOverlayPrepareLease()
 {
-public:
-	RadarOverlayLeaseGuard(RadarTerrainPrepareService &service,
-		unsigned consumerId)
-		: m_service(&service), m_consumerId(consumerId), m_active(false)
-	{
-	}
+	release();
+}
 
-	~RadarOverlayLeaseGuard()
-	{
-		release();
-	}
-
-	bool acquire()
-	{
-		if (!m_active)
-		{
-			m_active = m_service->tryAcquire(m_consumerId);
-		}
-		return m_active;
-	}
-
-	void release()
-	{
-		if (m_active)
-		{
-			m_service->release(m_consumerId);
-			m_active = false;
-		}
-	}
-
-private:
-	RadarOverlayLeaseGuard(const RadarOverlayLeaseGuard &);
-	RadarOverlayLeaseGuard &operator=(const RadarOverlayLeaseGuard &);
-
-	RadarTerrainPrepareService *m_service;
-	unsigned m_consumerId;
-	bool m_active;
-};
-
-} // namespace
-
-bool RunRadarOverlayRows(RadarPrepareRowWork &work,
-	RadarTerrainPrepareService &service, unsigned consumerId,
+bool RadarOverlayPrepareLease::runRows(RadarPrepareRowWork &work,
 	unsigned rowBegin, unsigned rowEnd)
 {
-	RadarOverlayLeaseGuard lease(service, consumerId);
+	if (!m_active)
+	{
+		m_active = m_service->tryAcquire(m_consumerId);
+	}
 
-	if (lease.acquire() && service.runRows(&work, rowBegin, rowEnd))
+	if (m_active && m_service->runRows(&work, rowBegin, rowEnd))
 	{
 		return true;
 	}
 
 	/* Do not retain a failed/denied lease while executing the serial oracle. */
-	lease.release();
+	release();
 	return work.executeRows(rowBegin, rowEnd);
 }
 
+void RadarOverlayPrepareLease::release()
+{
+	if (m_active)
+	{
+		m_service->release(m_consumerId);
+		m_active = false;
+	}
+}
+
 bool RunRadarObjectOverlayBatch(RadarObjectOverlayBatch &batch,
-	RadarTerrainPrepareService &service, unsigned consumerId)
+	RadarOverlayPrepareLease &lease)
 {
 	if (!batch.isAllocated() || batch.snapshot().height == 0)
 	{
@@ -464,12 +440,11 @@ bool RunRadarObjectOverlayBatch(RadarObjectOverlayBatch &batch,
 	}
 
 	RadarObjectOverlayRowWork work(batch.snapshot());
-	return RunRadarOverlayRows(work, service, consumerId, 0,
-		batch.snapshot().height);
+	return lease.runRows(work, 0, batch.snapshot().height);
 }
 
 bool RunRadarShroudOverlayBatch(RadarShroudOverlayBatch &batch,
-	RadarTerrainPrepareService &service, unsigned consumerId)
+	RadarOverlayPrepareLease &lease)
 {
 	if (!batch.isAllocated() || batch.snapshot().height == 0)
 	{
@@ -477,6 +452,5 @@ bool RunRadarShroudOverlayBatch(RadarShroudOverlayBatch &batch,
 	}
 
 	RadarShroudOverlayRowWork work(batch.snapshot());
-	return RunRadarOverlayRows(work, service, consumerId, 0,
-		batch.snapshot().height);
+	return lease.runRows(work, 0, batch.snapshot().height);
 }
