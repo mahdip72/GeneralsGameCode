@@ -240,6 +240,7 @@ protected:
 
 protected:
 	Bool isPossibleToBuildTeam( TeamPrototype *proto, Bool requireIdleFactory, Bool &needMoney );		///< return true if team can be considered for building
+	Bool queueSelectedTeam( TeamPrototype *teamProto ); ///< Queue an automatically selected team and reset production timers.
 	Object *buildStructureNow(const ThingTemplate *bldgPlan, BuildListInfo *info );		///< Build a base buiding.
 	Object *buildStructureWithDozer(const ThingTemplate *bldgPlan, BuildListInfo *info );		///< Build a base buiding.
 	void clearTeamsInQueue();			///< Delete all teams in the build queue.

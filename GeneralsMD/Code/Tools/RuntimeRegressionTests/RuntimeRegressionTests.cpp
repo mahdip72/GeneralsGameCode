@@ -438,6 +438,143 @@ static void TestSkirmishAICorrectnessPolicies()
 	CHECK(!HasSkirmishRallyOffset(-1.0f, 1.0f));
 }
 
+static void TestSkirmishAIProductionPolicies()
+{
+	SkirmishAICostRange costs = MakeSkirmishAICostRange();
+	costs = AddSkirmishAIUnitCost(costs, 800, 2, 5);
+	costs = AddSkirmishAIUnitCost(costs, 300, 1, 3);
+	CHECK(costs.minimumCost == 1900);
+	CHECK(costs.plannedCost == 4900);
+
+	CHECK(GetSkirmishAIPriorityBandWidth(100, SKIRMISH_AI_DIFFICULTY_EASY) == 0);
+	CHECK(GetSkirmishAIPriorityBandWidth(100, SKIRMISH_AI_DIFFICULTY_NORMAL) == 5);
+	CHECK(GetSkirmishAIPriorityBandWidth(100, SKIRMISH_AI_DIFFICULTY_HARD) == 10);
+	CHECK(GetSkirmishAIPriorityBandWidth(-5, SKIRMISH_AI_DIFFICULTY_NORMAL) == 1);
+	CHECK(GetSkirmishAIPriorityBandWidth(-5, SKIRMISH_AI_DIFFICULTY_HARD) == 2);
+	CHECK(IsSkirmishAIPriorityAdmitted(95, 100, SKIRMISH_AI_DIFFICULTY_NORMAL));
+	CHECK(!IsSkirmishAIPriorityAdmitted(94, 100, SKIRMISH_AI_DIFFICULTY_NORMAL));
+	CHECK(!IsSkirmishAIPriorityAdmitted(99, 100, SKIRMISH_AI_DIFFICULTY_EASY));
+	CHECK(IsSkirmishAIPriorityAdmitted(
+		(-2147483647 - 1), (-2147483647 - 1), SKIRMISH_AI_DIFFICULTY_HARD));
+	CHECK(ShouldReplaceSkirmishAIHighestPriority(false, -99999, -99999));
+	CHECK(ShouldReplaceSkirmishAIHighestPriority(false, (-2147483647 - 1), (-2147483647 - 1)));
+	CHECK(!ShouldReplaceSkirmishAIHighestPriority(true, -100000, -99999));
+
+	CHECK(GetSkirmishAIReserve(1200, 900) == 1200);
+	CHECK(GetSkirmishAIReserve(1200, 1800) == 1800);
+	CHECK(IsSkirmishAIAffordable(5000, 1900, 1200));
+	CHECK(!IsSkirmishAIAffordable(3000, 1900, 1200));
+	CHECK(ShouldRetrySkirmishAIReserve(false, true, false));
+	CHECK(!ShouldRetrySkirmishAIReserve(true, true, false));
+	CHECK(!ShouldRetrySkirmishAIReserve(false, false, false));
+	CHECK(!ShouldRetrySkirmishAIReserve(false, true, true));
+	CHECK(IsSkirmishAICriticalRebuildStartable(true, true, true, true, true));
+	CHECK(!IsSkirmishAICriticalRebuildStartable(true, true, true, false, true));
+	CHECK(!IsSkirmishAICriticalRebuildStartable(true, true, true, true, false));
+	CHECK(ShouldSkirmishAIConsiderRebuild(true, false, false, false));
+	CHECK(ShouldSkirmishAIConsiderRebuild(false, true, false, false));
+	CHECK(ShouldSkirmishAIConsiderRebuild(false, false, true, true));
+	CHECK(!ShouldSkirmishAIConsiderRebuild(false, false, true, false));
+	CHECK(!ShouldSkirmishAIConsiderRebuild(false, false, false, true));
+
+	CHECK(GetSkirmishAIProductionEntryWaitFrames(900, 25.0f, true, 4) == 675);
+	CHECK(GetSkirmishAIProductionEntryWaitFrames(900, 25.0f, false, 4) == 900);
+	CHECK(GetSkirmishAIUnitsRemainingAfterProductionEntry(0, 4) == 0);
+	CHECK(GetSkirmishAIUnitsRemainingAfterProductionEntry(4, 4) == 0);
+	CHECK(GetSkirmishAIUnitsRemainingAfterProductionEntry(5, 4) == 1);
+	CHECK(GetSkirmishAIUnitsRemainingAfterProductionEntry(5, 0) == 4);
+	Int batchWorkOrderEntries = 0;
+	Int requiredUnitsRemaining = 1;
+	Int optionalUnitsRemaining = 3;
+	while (requiredUnitsRemaining > 0) {
+		requiredUnitsRemaining = GetSkirmishAIUnitsRemainingAfterProductionEntry(
+			requiredUnitsRemaining, 4);
+		batchWorkOrderEntries++;
+	}
+	while (optionalUnitsRemaining > 0) {
+		optionalUnitsRemaining = GetSkirmishAIUnitsRemainingAfterProductionEntry(
+			optionalUnitsRemaining, 4);
+		batchWorkOrderEntries++;
+	}
+	CHECK(batchWorkOrderEntries == 2);
+	Int projectedLoads[2] = { 100, 100 };
+	Int compatibleFactories[2] = { 1, 1 };
+	CHECK(GetSkirmishAILeastLoadedFactoryIndex(projectedLoads, compatibleFactories, 2) == 0);
+	projectedLoads[0] = AddSkirmishAIFrameValue(projectedLoads[0], 300);
+	CHECK(GetSkirmishAILeastLoadedFactoryIndex(projectedLoads, compatibleFactories, 2) == 1);
+	compatibleFactories[1] = 0;
+	CHECK(GetSkirmishAILeastLoadedFactoryIndex(projectedLoads, compatibleFactories, 2) == 0);
+	CHECK(GetSkirmishAILeastLoadedFactoryIndex(projectedLoads, compatibleFactories, 0) == -1);
+
+	CHECK(!IsSkirmishAIGroundRouteTarget(true, false, false, false));
+	CHECK(!IsSkirmishAIGroundRouteTarget(false, true, false, false));
+	CHECK(IsSkirmishAIGroundRouteTarget(false, false, true, false));
+	CHECK(IsSkirmishAIGroundRouteTarget(false, false, false, true));
+
+	CHECK(GetSkirmishAICounterFitScore(1000, 0, 0, 1000, 1000, 0, 0) == 300);
+	CHECK(GetSkirmishAICounterFitScore(1000, 0, 0, 1000, 500, 0, 0) == 150);
+	CHECK(GetSkirmishAICounterFitScore(1000, 1000, 0, 2000, 1000, 0, 0) == 75);
+	CHECK(GetSkirmishAICounterFitScore(0, 0, 0, 1000, 1000, 1000, 1000) == 0);
+
+	SkirmishAITeamScoreInput input;
+	input.configuredPriority = 10;
+	input.counterFitScore = 300;
+	input.resources = 6000;
+	input.minimumCost = 2000;
+	input.plannedCost = 4000;
+	input.reserve = 1000;
+	input.factoryWaitFrames = 15 * 30;
+	input.logicFramesPerSecond = 30;
+	input.routeClass = SKIRMISH_AI_ROUTE_GROUND_REACHABLE;
+	input.recentLossCount = 1;
+	input.recentPathFailureCount = 1;
+
+	input.difficulty = SKIRMISH_AI_DIFFICULTY_HARD;
+	SkirmishAITeamScoreResult hard = ScoreSkirmishAITeam(input);
+	CHECK(hard.economyScore == 100);
+	CHECK(hard.factoryWaitScore == -125);
+	CHECK(hard.routeScore == 50);
+	CHECK(hard.lossScore == -75);
+	CHECK(hard.pathFailureScore == -100);
+	CHECK(hard.rawContextScore == 150);
+	CHECK(hard.finalScore == 10150);
+
+	input.difficulty = SKIRMISH_AI_DIFFICULTY_NORMAL;
+	CHECK(ScoreSkirmishAITeam(input).finalScore == 10075);
+	input.difficulty = SKIRMISH_AI_DIFFICULTY_EASY;
+	CHECK(ScoreSkirmishAITeam(input).finalScore == 10037);
+	input.resources = 4500;
+	CHECK(ScoreSkirmishAITeam(input).economyScore == -150);
+	input.resources = 2500;
+	CHECK(ScoreSkirmishAITeam(input).economyScore == -350);
+
+	input.counterFitScore = 3000;
+	input.resources = 0;
+	input.recentLossCount = 20;
+	input.recentPathFailureCount = 20;
+	input.factoryWaitFrames = 300 * 30;
+	input.routeClass = SKIRMISH_AI_ROUTE_GROUND_UNREACHABLE;
+	input.difficulty = SKIRMISH_AI_DIFFICULTY_HARD;
+	CHECK(ScoreSkirmishAITeam(input).counterFitScore == 300);
+	CHECK(ScoreSkirmishAITeam(input).factoryWaitScore == -250);
+	CHECK(ScoreSkirmishAITeam(input).lossScore == -225);
+	CHECK(ScoreSkirmishAITeam(input).pathFailureScore == -300);
+	CHECK(ScoreSkirmishAITeam(input).rawContextScore == -1000);
+
+	CHECK(GetSkirmishAIRouteScore(SKIRMISH_AI_ROUTE_GROUND_REACHABLE) == 50);
+	CHECK(GetSkirmishAIRouteScore(SKIRMISH_AI_ROUTE_UNKNOWN) == 0);
+	CHECK(GetSkirmishAIRouteScore(SKIRMISH_AI_ROUTE_MIXED_UNREACHABLE) == -125);
+	CHECK(GetSkirmishAIRouteScore(SKIRMISH_AI_ROUTE_GROUND_UNREACHABLE) == -250);
+	CHECK(IsSkirmishAITeamScoreTie(1200, 1200));
+	CHECK(!IsSkirmishAITeamScoreTie(1200, 1199));
+	CHECK(GetSkirmishAIFinalScore(2147483647, 1000, 100) ==
+		(__int64)2147483647 * 1000 + 1000);
+	CHECK(!IsSkirmishAITeamScoreTie(
+		(__int64)2147483647 * 1000, (__int64)2147483646 * 1000));
+	CHECK(GetSkirmishAITieSelectionIndex(1, 99) == 0);
+	CHECK(GetSkirmishAITieSelectionIndex(3, 2) == 2);
+}
+
 int main(int argc, char **argv)
 {
 	initMemoryManager();
@@ -466,6 +603,7 @@ int main(int argc, char **argv)
 	TestFrameRateLimitWaitCalculation();
 	TestSkirmishAILivenessPolicies();
 	TestSkirmishAICorrectnessPolicies();
+	TestSkirmishAIProductionPolicies();
 	TestFrameRateLimitCpuUsage();
 
 	if (s_failures != 0)

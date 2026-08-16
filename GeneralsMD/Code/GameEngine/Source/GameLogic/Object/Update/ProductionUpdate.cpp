@@ -380,8 +380,6 @@ void ProductionUpdate::cancelUpgrade( const UpgradeTemplate *upgrade )
 //-------------------------------------------------------------------------------------------------
 Bool ProductionUpdate::queueCreateUnit( const ThingTemplate *unitType, ProductionID productionID )
 {
-	const ProductionUpdateModuleData *data = getProductionUpdateModuleData();
-
 	// if we can't create the unit do nothing
 	if( TheBuildAssistant->canMakeUnit( getObject(), unitType ) != CANMAKE_OK )
 		return FALSE;
@@ -430,17 +428,8 @@ Bool ProductionUpdate::queueCreateUnit( const ThingTemplate *unitType, Productio
 	// and it has a modifier, we build that number of objects instead of just one. A good example is the Chinese
 	// barracks building redguards -- they are built 4 at a time, but the user or script only pays for one and
 	// builds four for that price!
-	production->m_productionQuantityTotal = 1;
+	production->m_productionQuantityTotal = getProductionQuantityForUnit(unitType);
 	production->m_productionQuantityProduced = 0;
-	for( std::vector<QuantityModifier>::const_iterator it = data->m_quantityModifiers.begin(); it != data->m_quantityModifiers.end(); ++it )
-  {
-		const ThingTemplate* productionTemplate = TheThingFactory->findTemplate( it->m_templateName );
-		if( productionTemplate && productionTemplate->isEquivalentTo( unitType ) )
-		{
-			production->m_productionQuantityTotal = it->m_quantity;
-			break;
-		}
-	}
 
 	// assign production entry data
 	production->m_type = PRODUCTION_UNIT;
@@ -453,6 +442,34 @@ Bool ProductionUpdate::queueCreateUnit( const ThingTemplate *unitType, Productio
 
 	return TRUE;  // unit queued
 
+}
+
+//-------------------------------------------------------------------------------------------------
+/** Return the number of units emitted by one paid production entry for this factory. */
+//-------------------------------------------------------------------------------------------------
+Int ProductionUpdate::getProductionQuantityForUnit(const ThingTemplate *unitType) const
+{
+	const ProductionUpdateModuleData *data = getProductionUpdateModuleData();
+	for (std::vector<QuantityModifier>::const_iterator it = data->m_quantityModifiers.begin();
+		it != data->m_quantityModifiers.end(); ++it) {
+		const ThingTemplate *productionTemplate = TheThingFactory->findTemplate(it->m_templateName);
+		if (productionTemplate && productionTemplate->isEquivalentTo(unitType))
+			return it->m_quantity;
+	}
+	return 1;
+}
+
+//-------------------------------------------------------------------------------------------------
+/** Return a factory's per-entry output count without extending the production interface vtable. */
+//-------------------------------------------------------------------------------------------------
+/*static*/ Int ProductionUpdate::getProductionQuantityForUnitFromObject(
+	Object *object, const ThingTemplate *unitType)
+{
+	ProductionUpdateInterface *production = getProductionUpdateInterfaceFromObject(object);
+	if (!production)
+		return 1;
+	Int quantity = static_cast<ProductionUpdate *>(production)->getProductionQuantityForUnit(unitType);
+	return quantity > 0 ? quantity : 1;
 }
 
 //-------------------------------------------------------------------------------------------------

@@ -1731,25 +1731,33 @@ Bool AIPlayer::selectTeamToBuild()
 
 		i++;
 	}
-	if (teamProto) {
-		if (!teamProto->getTemplateInfo()->m_hasHomeLocation && !isSkirmishAI()) {
-			AsciiString teamStr = "Error : team '";
-			teamStr.concat(teamProto->getName());
-			teamStr.concat("' has no Home Position (or Origin).");
-			TheScriptEngine->AppendDebugMessage(teamStr, false);
-		}
-		// Build it at low priority, as we have selected it automagically.
-		buildSpecificAITeam(teamProto, false);
-		m_readyToBuildTeam = false;
-		m_teamTimer = m_teamSeconds*LOGICFRAMES_PER_SECOND;
-		if (m_player->getMoney()->countMoney() < TheAI->getAiData()->m_resourcesPoor) {
-			m_teamTimer = m_teamTimer/TheAI->getAiData()->m_teamPoorMod;
-		}	else if (m_player->getMoney()->countMoney() > TheAI->getAiData()->m_resourcesWealthy) {
-			m_teamTimer = m_teamTimer/TheAI->getAiData()->m_teamWealthyMod;
-		}
-		return true;
+	return queueSelectedTeam(teamProto);
+}
+
+// ------------------------------------------------------------------------------------------------
+/** Queue an automatically selected team and apply the common production delay policy. */
+// ------------------------------------------------------------------------------------------------
+Bool AIPlayer::queueSelectedTeam( TeamPrototype *teamProto )
+{
+	if (!teamProto)
+		return false;
+
+	if (!teamProto->getTemplateInfo()->m_hasHomeLocation && !isSkirmishAI()) {
+		AsciiString teamStr = "Error : team '";
+		teamStr.concat(teamProto->getName());
+		teamStr.concat("' has no Home Position (or Origin).");
+		TheScriptEngine->AppendDebugMessage(teamStr, false);
 	}
-	return false;
+	// Build it at low priority, as we have selected it automagically.
+	buildSpecificAITeam(teamProto, false);
+	m_readyToBuildTeam = false;
+	m_teamTimer = m_teamSeconds*LOGICFRAMES_PER_SECOND;
+	if (m_player->getMoney()->countMoney() < TheAI->getAiData()->m_resourcesPoor) {
+		m_teamTimer = m_teamTimer/TheAI->getAiData()->m_teamPoorMod;
+	}	else if (m_player->getMoney()->countMoney() > TheAI->getAiData()->m_resourcesWealthy) {
+		m_teamTimer = m_teamTimer/TheAI->getAiData()->m_teamWealthyMod;
+	}
+	return true;
 }
 
 // ------------------------------------------------------------------------------------------------
