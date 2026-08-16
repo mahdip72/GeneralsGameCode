@@ -2,6 +2,7 @@ add_library(core_task_runtime STATIC)
 
 target_sources(core_task_runtime PRIVATE
     TaskRuntime.cpp
+    RadarTerrainKernel.cpp
 )
 
 target_include_directories(core_task_runtime PUBLIC
@@ -10,6 +11,10 @@ target_include_directories(core_task_runtime PUBLIC
 
 target_link_libraries(core_task_runtime PRIVATE
     $<LINK_ONLY:core_config>
+)
+
+target_link_libraries(core_task_runtime PUBLIC
+    core_utility_no_pch
 )
 
 set_target_properties(core_task_runtime PROPERTIES

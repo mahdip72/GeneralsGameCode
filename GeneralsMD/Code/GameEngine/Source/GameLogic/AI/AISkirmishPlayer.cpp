@@ -33,6 +33,7 @@
 #include "Common/GlobalData.h"
 #include "Common/Player.h"
 #include "Common/PlayerList.h"
+#include "Common/Recorder.h"
 #include "Common/Team.h"
 #include "Common/ThingFactory.h"
 #include "Common/BuildAssistant.h"
@@ -63,6 +64,13 @@
 
 
 #define USE_DOZER 1
+
+static Bool ShouldUseCurrentSkirmishAIBehavior()
+{
+	return ShouldUseSkirmishAICurrentBehavior(
+		TheGameLogic->isInReplayGame(),
+		TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() : SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+}
 
 struct SkirmishProductionCandidate
 {
@@ -293,7 +301,7 @@ void AISkirmishPlayer::processBaseBuilding()
 			if (!isLocationSafe(info->getLocation(), curPlan)) {
 				continue;
 			}
-			if (!ShouldSkirmishAIConsiderRebuild(
+			if (ShouldUseCurrentSkirmishAIBehavior() && !ShouldSkirmishAIConsiderRebuild(
 				info->isAutomaticBuild(),
 				info->isPriorityBuild(),
 				curPlan->isKindOf(KINDOF_FS_POWER) && !curPlan->isKindOf(KINDOF_CASH_GENERATOR),
@@ -692,16 +700,24 @@ void AISkirmishPlayer::getVisibleEnemyComposition(
 		if (object->getControllingPlayer() != enemy || object->isEffectivelyDead())
 			continue;
 		ObjectShroudStatus shroud = object->getShroudedStatus(m_player->getPlayerIndex());
-		Bool visible = shroud == OBJECTSHROUD_CLEAR || shroud == OBJECTSHROUD_PARTIAL_CLEAR;
-		Bool fogged = shroud == OBJECTSHROUD_FOGGED;
-		if (!IsSkirmishAIIntelEligible(
-			object->isKindOf(KINDOF_STRUCTURE),
-			visible,
-			fogged,
-			object->testStatus(OBJECT_STATUS_STEALTHED),
-			object->testStatus(OBJECT_STATUS_DETECTED),
-			object->testStatus(OBJECT_STATUS_MASKED)))
-			continue;
+		if (ShouldUseCurrentSkirmishAIBehavior()) {
+			Bool visible = shroud == OBJECTSHROUD_CLEAR || shroud == OBJECTSHROUD_PARTIAL_CLEAR;
+			Bool fogged = shroud == OBJECTSHROUD_FOGGED;
+			if (!IsSkirmishAIIntelEligible(
+				object->isKindOf(KINDOF_STRUCTURE),
+				visible,
+				fogged,
+				object->testStatus(OBJECT_STATUS_STEALTHED),
+				object->testStatus(OBJECT_STATUS_DETECTED),
+				object->testStatus(OBJECT_STATUS_MASKED)))
+				continue;
+		} else {
+			if (shroud != OBJECTSHROUD_CLEAR && shroud != OBJECTSHROUD_PARTIAL_CLEAR)
+				continue;
+			if (object->testStatus(OBJECT_STATUS_STEALTHED) &&
+				!object->testStatus(OBJECT_STATUS_DETECTED))
+				continue;
+		}
 		if (object->isKindOf(KINDOF_STRUCTURE))
 			continue;
 
@@ -978,6 +994,9 @@ SkirmishAIDecisionDifficulty AISkirmishPlayer::getDecisionDifficulty() const
  */
 Bool AISkirmishPlayer::selectTeamToBuild()
 {
+	if (!ShouldUseCurrentSkirmishAIBehavior())
+		return AIPlayer::selectTeamToBuild();
+
 	Bool hasCandidate = false;
 	Int highestPriority = (-2147483647 - 1);
 	std::vector<SkirmishProductionCandidate> candidates;
@@ -1156,6 +1175,77 @@ Int AISkirmishPlayer::getMyEnemyPlayerIndex() {
 }
 
 /**
+	Preserve the retail target selection and evaluation schedule for legacy
+	replays and the PR6 liveness epoch.  This is intentionally kept separate
+	from the current scoring implementation so replay compatibility does not
+	depend on the current AI's observations or tie-breaking rules.
+*/
+void AISkirmishPlayer::acquireEnemyLegacy()
+{
+	Player *bestEnemy = nullptr;
+	Real bestDistanceSqr = HUGE_DIST*HUGE_DIST;
+
+	if (m_currentEnemy) {
+		Bool inBadShape = !m_currentEnemy->hasAnyUnits() || !m_currentEnemy->hasAnyBuildFacility();
+		if (!inBadShape) return;
+	}
+
+	// look for the closest enemy.
+	Int i;
+	for (i=0; i<ThePlayerList->getPlayerCount(); i++) {
+		Player *curPlayer = ThePlayerList->getNthPlayer(i);
+		if (m_player->getRelationship(curPlayer->getDefaultTeam()) == ENEMIES) {
+			if (curPlayer->hasAnyObjects()==false) continue; // not much of an enemy.
+			// ok, we got an enemy;
+			// If a player is out of units, or out of build facilities, we can lower his priority.
+			Bool inBadShape = !curPlayer->hasAnyUnits() || !curPlayer->hasAnyBuildFacility();
+
+			Coord3D enemyPos = m_baseCenter;
+			Region2D bounds;
+			getPlayerStructureBounds(&bounds, i);
+			enemyPos.x = bounds.lo.x + bounds.width()/2;
+			enemyPos.y = bounds.lo.y + bounds.height()/2;
+			Real curDistSqr = sqr(enemyPos.x-m_baseCenter.x) + sqr(enemyPos.y-m_baseCenter.y);
+
+			//Fudge for in bad shape.  If an enemy is crippled, concentrate on the other ones.
+			if (inBadShape) {
+				curDistSqr = HUGE_DIST*HUGE_DIST*0.5f;
+			}
+			// See if other ai's are attacking this target.
+			// We don't want the ai's to gang up on one enemy.
+			Int k;
+			for (k=0; k<ThePlayerList->getPlayerCount(); k++) {
+				if (k==i) continue;  // don't count self.
+				Player *somePlayer = ThePlayerList->getNthPlayer(k);
+				if (somePlayer->isSkirmishAIPlayer() && (somePlayer->getCurrentEnemy()==curPlayer)) {
+					// Some ai is already targeting this guy.  Add a distance penalty.
+					curDistSqr += (500*500);
+				}
+			}
+			if (ShouldPreferSkirmishRetaliation(curPlayer->isSkirmishAIPlayer(), curPlayer->getCurrentEnemy()==m_player)) {
+				// He is attacking me.  So I will (gently) prefer to attack him.
+				curDistSqr -= (25*25);
+				if (curDistSqr<0) curDistSqr = 0;
+			}
+
+			// Ai enemy - will take if we don't get a better offer.
+			if (curDistSqr<bestDistanceSqr) {
+				bestEnemy = curPlayer;
+				bestDistanceSqr = curDistSqr;
+			}
+		}
+	}
+	if (bestEnemy!=nullptr && (bestEnemy!=m_currentEnemy)) {
+		m_currentEnemy = bestEnemy;
+		m_currentEnemyPlayerIndex = m_currentEnemy->getPlayerIndex();
+		AsciiString msg = TheNameKeyGenerator->keyToName(m_player->getPlayerNameKey());
+		msg.concat(" acquiring target enemy player: ");
+		msg.concat(TheNameKeyGenerator->keyToName(m_currentEnemy->getPlayerNameKey()));
+		TheScriptEngine->AppendDebugMessage( msg, false);
+	}
+}
+
+/**
 	Get the AI's enemy.  Recalc if it has been a while (5 seconds.)
 */
 void AISkirmishPlayer::acquireEnemy()
@@ -1271,6 +1361,14 @@ void AISkirmishPlayer::acquireEnemy()
 */
 Player *AISkirmishPlayer::getAiEnemy()
 {
+	if (!ShouldUseCurrentSkirmishAIBehavior()) {
+		if (TheGameLogic->getFrame()>=m_frameToCheckEnemy) {
+			m_frameToCheckEnemy = TheGameLogic->getFrame() + 5*LOGICFRAMES_PER_SECOND;
+			acquireEnemyLegacy();
+		}
+		return m_currentEnemy;
+	}
+
 	Bool currentEnemyInvalid = m_currentEnemy &&
 		(m_player->getRelationship(m_currentEnemy->getDefaultTeam()) != ENEMIES ||
 		 !m_currentEnemy->hasAnyObjects());
@@ -1680,7 +1778,8 @@ void AISkirmishPlayer::doTeamBuilding()
  */
 void AISkirmishPlayer::update()
 {
-	getAiEnemy();
+	if (ShouldUseCurrentSkirmishAIBehavior())
+		getAiEnemy();
 	AIPlayer::update();
 }
 

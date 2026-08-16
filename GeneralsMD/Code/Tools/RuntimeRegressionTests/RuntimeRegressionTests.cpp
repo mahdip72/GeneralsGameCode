@@ -401,18 +401,46 @@ static void TestSkirmishAILivenessPolicies()
 static void TestSkirmishAIReplayEpoch()
 {
 	UnicodeString unmarked = L"Aug 14 2026 21:00:00";
+	CHECK(GetSkirmishAIReplayEpoch(unmarked) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	CHECK(!ReplayVersionUsesSkirmishAILivenessRecovery(unmarked));
+	CHECK(ShouldUseSkirmishAICurrentBehavior(false, SKIRMISH_AI_REPLAY_EPOCH_LEGACY));
+	CHECK(!ShouldUseSkirmishAICurrentBehavior(true, SKIRMISH_AI_REPLAY_EPOCH_LEGACY));
 
-	UnicodeString marked = unmarked;
-	MarkReplayVersionForSkirmishAILivenessRecovery(marked);
-	CHECK(marked.compare(L"Aug 14 2026 21:00:00 [SkirmishAILiveness=1]") == 0);
-	CHECK(ReplayVersionUsesSkirmishAILivenessRecovery(marked));
+	UnicodeString livenessOnly = unmarked;
+	MarkReplayVersionForSkirmishAILivenessRecovery(livenessOnly);
+	CHECK(livenessOnly.compare(L"Aug 14 2026 21:00:00 [SkirmishAILiveness=1]") == 0);
+	CHECK(GetSkirmishAIReplayEpoch(livenessOnly) == SKIRMISH_AI_REPLAY_EPOCH_PR6_LIVENESS);
+	CHECK(ReplayVersionUsesSkirmishAILivenessRecovery(livenessOnly));
+	CHECK(!ShouldUseSkirmishAICurrentBehavior(true, SKIRMISH_AI_REPLAY_EPOCH_PR6_LIVENESS));
 
-	UnicodeString parsedHeader = marked;
-	CHECK(ReplayVersionUsesSkirmishAILivenessRecovery(parsedHeader));
+	UnicodeString currentEpoch = unmarked;
+	MarkReplayVersionForSkirmishAICurrentEpoch(currentEpoch);
+	CHECK(currentEpoch.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=2]") == 0);
+	CHECK(GetSkirmishAIReplayEpoch(currentEpoch) == SKIRMISH_AI_REPLAY_EPOCH_CURRENT);
+	CHECK(ReplayVersionUsesSkirmishAILivenessRecovery(currentEpoch));
+	CHECK(ShouldUseSkirmishAICurrentBehavior(true, SKIRMISH_AI_REPLAY_EPOCH_CURRENT));
+	MarkReplayVersionForSkirmishAICurrentEpoch(currentEpoch);
+	CHECK(currentEpoch.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=2]") == 0);
 
 	UnicodeString unrelatedSuffix = L"Aug 14 2026 21:00:00 [SkirmishAILiveness=2]";
+	CHECK(GetSkirmishAIReplayEpoch(unrelatedSuffix) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	CHECK(!ReplayVersionUsesSkirmishAILivenessRecovery(unrelatedSuffix));
+	UnicodeString futureEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3]";
+	CHECK(GetSkirmishAIReplayEpoch(futureEpoch) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+	UnicodeString malformedEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=x]";
+	CHECK(GetSkirmishAIReplayEpoch(malformedEpoch) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+	UnicodeString mixedMarkers = L"Aug 14 2026 21:00:00 [SkirmishAILiveness=1] [SkirmishAIEpoch=2]";
+	CHECK(GetSkirmishAIReplayEpoch(mixedMarkers) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+	UnicodeString duplicateMarkers = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=2] [SkirmishAIEpoch=2]";
+	CHECK(GetSkirmishAIReplayEpoch(duplicateMarkers) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+	UnicodeString unknownThenCurrent = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3] [SkirmishAIEpoch=2]";
+	CHECK(GetSkirmishAIReplayEpoch(unknownThenCurrent) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+	UnicodeString malformedThenLiveness = L"Aug 14 2026 21:00:00 [SkirmishAILiveness=x] [SkirmishAILiveness=1]";
+	CHECK(GetSkirmishAIReplayEpoch(malformedThenLiveness) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+	UnicodeString unknownWriterInput = futureEpoch;
+	MarkReplayVersionForSkirmishAICurrentEpoch(unknownWriterInput);
+	CHECK(unknownWriterInput.compare(futureEpoch) == 0);
+	CHECK(!ShouldUseSkirmishAICurrentBehavior(true, 3));
 }
 
 static void TestSkirmishAICorrectnessPolicies()

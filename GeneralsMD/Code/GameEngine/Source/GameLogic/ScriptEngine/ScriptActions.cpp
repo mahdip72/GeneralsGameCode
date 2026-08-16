@@ -2564,7 +2564,10 @@ void ScriptActions::doTeamIncreasePriority(const AsciiString& teamName)
 		return;
 	}
 	theTeamProto->increaseAIPriorityForSuccess();
-	theTeamProto->recordSkirmishAISuccess(TheGameLogic->getFrame());
+	if (ShouldUseSkirmishAICurrentBehavior(
+		TheGameLogic && TheGameLogic->isInReplayGame(),
+		TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() : SKIRMISH_AI_REPLAY_EPOCH_LEGACY))
+		theTeamProto->recordSkirmishAISuccess(TheGameLogic->getFrame());
 	AsciiString msg;
 	msg.format("Team '%s' priority increased to %d for success.", teamName.str(), theTeamProto->getTemplateInfo()->m_productionPriority);
 	TheScriptEngine->AppendDebugMessage(msg, false);

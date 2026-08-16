@@ -13,7 +13,7 @@ PAUSE
 ```
 It will run the game in the background and check that each replay is compatible. You need to use a VC6 build with optimizations and RTS_BUILD_OPTION_DEBUG = OFF, otherwise the game won't be compatible.
 
-Zero Hour records the skirmish-AI behavior epoch as a suffix in the replay header's existing variable-length build-time field. Unmarked retail replays use the legacy AI behavior, while marked replays use the liveness recovery that was active while recording. Replays made by intermediate builds from `15a1b135` through the addition of this marker are unmarked despite using the new behavior and cannot be distinguished from retail recordings; those transitional recordings are unsupported.
+Zero Hour records the skirmish-AI behavior epoch as a suffix in the replay header's existing variable-length build-time field. Unmarked retail replays use the legacy AI behavior. Replays marked `[SkirmishAILiveness=1]` use only the PR6 liveness fixes, and new recordings marked `[SkirmishAIEpoch=2]` use the current PR7-PR9 AI behavior as well. Unknown, malformed, mixed, or duplicate markers fall back to legacy behavior. Replays produced by transitional PR7-PR9 builds carried only the older liveness marker despite using later AI behavior; those recordings cannot be identified reliably and are unsupported.
 
 # Stage 0 ownership and profiling checks
 
@@ -88,6 +88,103 @@ Both source-audit commands must produce no matches. Build both games with VC6 as
 For Tracy validation, use a profile build on a machine with at least two logical processors and load texture-heavy maps in both games. The capture should show up to two concurrent `Texture.Prepare` worker zones, with their corresponding `Texture.Upload` zones on the render owner thread. No worker may call Direct3D, dereference a live texture, wait for another worker, or access engine globals.
 
 Manually test Zero Hour and Generals by loading several skirmish maps and armies, moving the camera quickly across previously unseen terrain and units, returning to the shell, loading another map, alt-tabbing during map loading, and quitting during or immediately after a load. Verify that terrain, unit, effect, UI, and cube-map textures have no missing-texture placeholders, corruption, delayed permanent blur, device loss, hang, or access violation. The shipped DDS backends do not expose volume-level memory, so Stage 4 rejects DDS volume preparation through the existing missing-texture path instead of uploading uninitialized data; volume rendering is not claimed as supported. Also repeat screenshot capture and save/load smoke tests to guard the earlier multicore stages.
+
+# Stage 5 radar terrain preparation checks
+
+Stage 5 moves only the CPU preparation of the radar terrain raster into a
+synchronous, bounded fork-join.  The owner thread still reads live terrain,
+bridge, water, and visual state, owns the immutable POD batch, and performs
+all Direct3D surface access and the final row upload.  Worker tasks receive no
+engine pointer or global and only shade their assigned rows.  This stage does
+not parallelize simulation, AI, pathfinding, replay/save/network state, or
+radar map mutation.
+
+The following implementation and test coverage is present in the committed
+Stage 5 source.  These checkmarks describe source/test evidence only; they do
+not claim that the commands below have run successfully:
+
+- [x] The D3D-free kernel preserves the legacy center-branch order, clipped
+  3x3 traversal, interpolation guards and argument order, averaging, and
+  format bytes.  Serial and split-row calls are compared byte-for-byte,
+  including guarded 24-bit rows and the supported 16/32-bit formats.
+- [x] The owner batch uses checked sizes and a fixed staging budget, owns the
+  cell/output storage, and rejects incomplete or unsupported batches without
+  writing output.
+- [x] The service admits one consumer, submits exactly two disjoint row
+  ranges, and covers two-worker success, one-worker retry, queue rejection,
+  submission rollback, task-allocation failure, serial-oracle fallback,
+  release, shutdown, and clean restart cases.
+- [x] Source audits cover the worker/kernel prohibition on Direct3D, globals,
+  live engine pointers, allocation, waits, RNG, replay/save/network calls.
+- [x] Both title display variants initialize the service after their display
+  prerequisites and shut it down before render teardown, with game-thread
+  assertions.  `W3DRadar` keeps acquisition, join/fallback, surface lock,
+  upload, unlock, and release on the owner thread.
+- [ ] Focused tests, the modern x86 title builds, and the VC6 compatibility
+  build have not yet been executed for the final Stage 5 head.
+- [ ] The ten-review-lens code review has not yet been completed.
+- [ ] The optimized VC6 replay gate has not yet been executed.
+- [ ] Interactive manual acceptance is intentionally deferred until the
+  complete Stage 5--8 stack is ready; do not launch this intermediate stage.
+
+## Stage 5 focused validation
+
+Run from a clean, repository-relative build directory.  Do not record local
+machine paths, profile paths, build-tree paths, or replay logs in repository
+documentation or PR text.
+
+First run the source hygiene check and focused modern build/test targets:
+
+```powershell
+git diff --check
+cmake --preset win32-debug -DRTS_BUILD_GENERALS=ON -DRTS_BUILD_ZEROHOUR=ON -DRTS_BUILD_CORE_EXTRAS=ON
+cmake --build build/win32-debug --config Debug --target radar_terrain_prepare_tests core_task_runtime_tests core_texture_mip_buffer_tests g_generals z_generals --parallel 2
+ctest --test-dir build/win32-debug -C Debug -R "^(radar_terrain_prepare|core_task_runtime|core_texture_mip_buffer)_tests$" --output-on-failure
+```
+
+The radar target is expected to exercise serial-versus-two-range byte parity,
+edge/clipping and zero-sample behavior, bridge/water/regular branches,
+equal-height interpolation guards, supported format packing, row ownership,
+bounded owner storage, exclusive leases, two-worker admission, one-worker
+retry, queue/backpressure and rollback fallback, shutdown/restart, and the
+worker/owner source audits.  A test/build result must be captured before any
+checkmark is added to the execution items above.
+
+Then run the legacy compatibility lane using an actual optimized VC6 build;
+do not substitute a modern Win32 executable for replay evidence:
+
+```powershell
+cmake --preset vc6 -DRTS_BUILD_GENERALS=ON -DRTS_BUILD_ZEROHOUR=ON -DRTS_BUILD_CORE_EXTRAS=ON
+cmake --build build/vc6 --target radar_terrain_prepare_tests core_task_runtime_tests core_texture_mip_buffer_tests g_generals z_generals --parallel 2
+```
+
+If the VC6 toolchain or required game data is unavailable, report that exact
+external prerequisite and leave the replay gate pending.
+
+## Stage 5 replay gate
+
+After focused/build validation, use the repository's ten distinct replay
+fixtures without modifying the live profile.  The corpus must contain several
+2v2 matches, one 2v6 Hard-AI stress match, one 2v2v2 match, one 3v3 match, the
+golden/reference replay, and two additional corpus replays.  Run the nine
+non-stress replays once and the 2v6 stress replay three times in separate CRC
+output directories: twelve replay process executions across ten unique
+replays.
+
+Each execution must exit with code 0 and have no CRC mismatch, ownership
+failure, assertion, crash, or missing-map error.  The three stress executions
+must produce identical CRC file sets and byte-for-byte hashes.  `-jobs 4`
+starts independent replay processes; it is not an in-process worker-count
+switch.  Record only repository-relative commands and aggregate results, not
+machine-specific paths or logs.
+
+The ten review lenses for the final Stage 5 head are: owner boundary,
+complete immutable snapshot, legacy byte parity, disjoint row ownership,
+private-runtime wait isolation, deterministic fallback behavior, bounded
+memory and lifetime, both-display lifecycle, C++98/VC6 plus replay evidence,
+and scoped delivery/privacy hygiene.  All ten review passes and any resulting
+fix/retest cycle must complete before Stage 5 is considered ready for the
+stacked-stage handoff.
 
 # Miles completion callback checks
 

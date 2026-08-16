@@ -102,6 +102,7 @@ protected:
 	void adjustBuildList(BuildListInfo *list);
 	Int getMyEnemyPlayerIndex();
 	void acquireEnemy();
+	void acquireEnemyLegacy();
 	Bool isAdaptiveProductionCandidate( TeamPrototype *proto, SkirmishAICostRange *costRange,
 		Int *factoryWaitFrames );
 	Int getCriticalRebuildReserve( Bool *canStartNow );
