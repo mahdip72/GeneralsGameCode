@@ -67,11 +67,22 @@ private:
 bool RadarTerrainBatchCapturePreflight(const RadarTerrainBatch &batch,
 	unsigned expectedWidth, unsigned expectedHeight, Real xSample, Real ySample);
 
+struct RadarTerrainRowRange
+{
+	unsigned begin;
+	unsigned end;
+};
+
+/* Pure balanced split used by both owner-created row tasks. */
+bool SplitRadarTerrainRowRanges(unsigned rowBegin, unsigned rowEnd,
+	RadarTerrainRowRange ranges[2]);
+
 /*
  * One private, synchronous render-preparation runtime.  The service owns no
  * raster data: a caller-owned snapshot and output buffer remain valid until
- * runRows returns.  A consumer must acquire before calling runRows and release
- * only after it has consumed the completed output on the owner thread.
+ * runRows returns.  Every lifecycle, lease, and run method is owner-thread
+ * only and calls must never overlap.  A consumer must acquire before calling
+ * runRows and release only after it has consumed the completed output.
  */
 class RadarTerrainPrepareService
 {
@@ -79,7 +90,10 @@ public:
 	RadarTerrainPrepareService();
 	~RadarTerrainPrepareService();
 
-	/* Worker count is capped at two; capacity below two forces serial fallback. */
+	/*
+	 * Production requests two workers.  One is an intentional degraded/test
+	 * configuration; capacity below two forces the serial fallback.
+	 */
 	bool initialize(unsigned workerCount, unsigned queueCapacity);
 	bool tryAcquire(unsigned consumerId);
 
@@ -93,6 +107,9 @@ public:
 	bool isInitialized() const { return m_initialized; }
 	bool hasLease() const { return m_leaseActive; }
 	unsigned activeConsumer() const { return m_activeConsumer; }
+#if defined(RTS_BUILD_CORE_EXTRAS)
+	unsigned pendingTaskCount() const;
+#endif
 
 private:
 	RadarTerrainPrepareService(const RadarTerrainPrepareService &);

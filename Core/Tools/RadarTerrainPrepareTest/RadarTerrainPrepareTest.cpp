@@ -515,6 +515,64 @@ static void makeServiceFixture(RadarTerrainCellInput *cells,
 	ShadeRadarRows(*snapshot, serialOutput, 0, snapshot->height);
 }
 
+static int testRowSplitCoversRequestedRowsExactlyOnce()
+{
+	const char *testName = "testRowSplitCoversRequestedRowsExactlyOnce";
+	struct SplitCase
+	{
+		unsigned begin;
+		unsigned end;
+		unsigned firstEnd;
+	};
+	const SplitCase cases[] = {
+		{ 0, 1, 1 },
+		{ 0, 2, 1 },
+		{ 2, 7, 5 },
+		{ 3, 9, 6 },
+		{ 6, 7, 7 },
+		{ 4, 4, 4 }
+	};
+	unsigned caseIndex;
+	for (caseIndex = 0; caseIndex < sizeof(cases) / sizeof(cases[0]);
+		++caseIndex)
+	{
+		RadarTerrainRowRange ranges[2];
+		unsigned coverage[12];
+		unsigned rangeIndex;
+		unsigned row;
+		memset(coverage, 0, sizeof(coverage));
+		CHECK(testName, SplitRadarTerrainRowRanges(cases[caseIndex].begin,
+			cases[caseIndex].end, ranges));
+		CHECK(testName, ranges[0].begin == cases[caseIndex].begin);
+		CHECK(testName, ranges[0].end == cases[caseIndex].firstEnd);
+		CHECK(testName, ranges[1].begin == cases[caseIndex].firstEnd);
+		CHECK(testName, ranges[1].end == cases[caseIndex].end);
+		CHECK(testName, ranges[0].end == ranges[1].begin);
+		CHECK(testName, ranges[0].begin <= ranges[0].end);
+		CHECK(testName, ranges[1].begin <= ranges[1].end);
+		for (rangeIndex = 0; rangeIndex < 2; ++rangeIndex)
+		{
+			for (row = ranges[rangeIndex].begin;
+				row < ranges[rangeIndex].end; ++row)
+			{
+				CHECK(testName, row < sizeof(coverage) / sizeof(coverage[0]));
+				++coverage[row];
+			}
+		}
+		for (row = 0; row < sizeof(coverage) / sizeof(coverage[0]); ++row)
+		{
+			const unsigned expected = row >= cases[caseIndex].begin &&
+				row < cases[caseIndex].end ? 1 : 0;
+			CHECK(testName, coverage[row] == expected);
+		}
+	}
+	{
+		RadarTerrainRowRange ranges[2];
+		CHECK(testName, !SplitRadarTerrainRowRanges(2, 1, ranges));
+	}
+	return 0;
+}
+
 static int testPrepareServiceSuccessfulLeaseAndRows()
 {
 	const char *testName = "testPrepareServiceSuccessfulLeaseAndRows";
@@ -665,10 +723,16 @@ static int testPrepareServiceBothAttemptsFailUseSerialOracle()
 	CHECK(testName, service.initialize(2, 2));
 	CHECK(testName, service.tryAcquire(1));
 #if defined(RTS_BUILD_CORE_EXTRAS)
+	rts_task_runtime_set_test_allocation_fault(
+		RADAR_TASK_RUNTIME_TEST_FAIL_THREAD_RESERVE, 2);
 	rts_radar_terrain_prepare_set_test_fault(
-		RADAR_TERRAIN_PREPARE_TEST_FAIL_TASK_ALLOCATION, 2);
+		RADAR_TERRAIN_PREPARE_TEST_FAIL_TASK_ALLOCATION, 1);
 #endif
 	CHECK(testName, !service.runRows(&snapshot, output, 0, snapshot.height));
+#if defined(RTS_BUILD_CORE_EXTRAS)
+	rts_task_runtime_set_test_allocation_fault(0, 0);
+	rts_radar_terrain_prepare_set_test_fault(0, 0);
+#endif
 	CHECK(testName, ShadeRadarRows(snapshot, output, 0, snapshot.height));
 	CHECK(testName, compareServiceOutput(output, serialOutput,
 		snapshot.rowBytes * snapshot.height, testName) == 0);
@@ -689,6 +753,85 @@ static int testPrepareServiceShutdownClosesLease()
 	CHECK(testName, !service.hasLease());
 	CHECK(testName, !service.tryAcquire(1));
 	service.release(1);
+	service.shutdown();
+	return 0;
+}
+
+static int testPrepareServiceShutdownAfterRunRestartsCleanly()
+{
+	const char *testName = "testPrepareServiceShutdownAfterRunRestartsCleanly";
+	RadarTerrainCellInput cells[12];
+	RadarTerrainSnapshot snapshot;
+	unsigned char serialOutput[36];
+	unsigned char output[36];
+	RadarTerrainPrepareService service;
+
+	makeServiceFixture(cells, &snapshot, serialOutput);
+	memset(output, 0xA5, sizeof(output));
+	CHECK(testName, service.initialize(2, 2));
+	CHECK(testName, service.tryAcquire(1));
+	CHECK(testName, service.runRows(&snapshot, output, 0, snapshot.height));
+	CHECK(testName, service.pendingTaskCount() == 0);
+	service.shutdown();
+	CHECK(testName, !service.isInitialized());
+	CHECK(testName, !service.hasLease());
+	CHECK(testName, service.pendingTaskCount() == 0);
+
+	memset(output, 0xA5, sizeof(output));
+	CHECK(testName, service.initialize(2, 2));
+	CHECK(testName, service.tryAcquire(2));
+	CHECK(testName, service.runRows(&snapshot, output, 0, snapshot.height));
+	CHECK(testName, compareServiceOutput(output, serialOutput,
+		snapshot.rowBytes * snapshot.height, testName) == 0);
+	CHECK(testName, service.pendingTaskCount() == 0);
+	service.release(2);
+	service.shutdown();
+	return 0;
+}
+
+static int testPrepareServiceRollbackThenRetryAllocationFailureIsClean()
+{
+	const char *testName =
+		"testPrepareServiceRollbackThenRetryAllocationFailureIsClean";
+	RadarTerrainCellInput cells[12];
+	RadarTerrainSnapshot snapshot;
+	unsigned char serialOutput[36];
+	unsigned char output[36];
+	RadarTerrainPrepareService service;
+
+	makeServiceFixture(cells, &snapshot, serialOutput);
+	memset(output, 0xA5, sizeof(output));
+	CHECK(testName, service.initialize(2, 2));
+	CHECK(testName, service.tryAcquire(1));
+#if defined(RTS_BUILD_CORE_EXTRAS)
+	rts_task_runtime_set_test_allocation_fault(
+		RADAR_TASK_RUNTIME_TEST_FAIL_QUEUE_PUSH, 2);
+	rts_radar_terrain_prepare_set_test_fault(
+		RADAR_TERRAIN_PREPARE_TEST_FAIL_TASK_ALLOCATION, 3);
+#endif
+	CHECK(testName, !service.runRows(&snapshot, output, 0, snapshot.height));
+	CHECK(testName, service.pendingTaskCount() == 0);
+	CHECK(testName, ShadeRadarRows(snapshot, output, 0, snapshot.height));
+	CHECK(testName, compareServiceOutput(output, serialOutput,
+		snapshot.rowBytes * snapshot.height, testName) == 0);
+	service.shutdown();
+	CHECK(testName, !service.isInitialized());
+	CHECK(testName, !service.hasLease());
+	CHECK(testName, service.pendingTaskCount() == 0);
+
+	/* One worker is an intentional degraded/test configuration. */
+	memset(output, 0xA5, sizeof(output));
+	CHECK(testName, service.initialize(1, 2));
+	CHECK(testName, service.tryAcquire(2));
+	CHECK(testName, service.runRows(&snapshot, output, 0, snapshot.height));
+	CHECK(testName, compareServiceOutput(output, serialOutput,
+		snapshot.rowBytes * snapshot.height, testName) == 0);
+	CHECK(testName, service.pendingTaskCount() == 0);
+#if defined(RTS_BUILD_CORE_EXTRAS)
+	rts_task_runtime_set_test_allocation_fault(0, 0);
+	rts_radar_terrain_prepare_set_test_fault(0, 0);
+#endif
+	service.release(2);
 	service.shutdown();
 	return 0;
 }
@@ -821,6 +964,7 @@ int main()
 	result |= testInvalidRangesAndSizesDoNotWrite();
 	result |= testOwnerBatchStorageIsBoundedAndSingleOwned();
 	result |= testOwnerBatchCapturePreflight();
+	result |= testRowSplitCoversRequestedRowsExactlyOnce();
 	result |= testPrepareServiceSuccessfulLeaseAndRows();
 	result |= testPrepareServiceStartFailureRetriesOneWorker();
 	result |= testPrepareServiceTaskAllocationRetriesOneWorker();
@@ -828,6 +972,8 @@ int main()
 	result |= testPrepareServiceSubmissionRollbackRetriesOneWorker();
 	result |= testPrepareServiceBothAttemptsFailUseSerialOracle();
 	result |= testPrepareServiceShutdownClosesLease();
+	result |= testPrepareServiceShutdownAfterRunRestartsCleanly();
+	result |= testPrepareServiceRollbackThenRetryAllocationFailureIsClean();
 	result |= testWorkerSourceAudit();
 	return result;
 }

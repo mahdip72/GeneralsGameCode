@@ -32,6 +32,7 @@
 #include "Common/AudioEventRTS.h"
 #include "Common/Debug.h"
 #include "Common/GlobalData.h"
+#include "Common/GameThreadOwnership.h"
 #include "Common/GameUtility.h"
 #include "Common/Player.h"
 #include "Common/PlayerList.h"
@@ -1241,6 +1242,7 @@ void W3DRadar::buildTerrainTexture( TerrainLogic *terrain )
 	 * through to the unchanged allocation-free owner loop below.
 	 */
 	RadarTerrainBatch batch;
+	ASSERT_GAME_THREAD("W3DRadar::buildTerrainTexture radar preparation");
 	RadarTerrainPrepareService &prepareService =
 		GetRadarTerrainPrepareService();
 	bool radarLease = false;
