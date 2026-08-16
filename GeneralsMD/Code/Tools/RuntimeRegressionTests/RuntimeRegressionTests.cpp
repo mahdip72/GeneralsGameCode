@@ -16,6 +16,7 @@
 #include "Common/FrameRateLimit.h"
 #include "Common/GameMemory.h"
 #include "Common/SkirmishAIReplayEpoch.h"
+#include "GameLogic/SkirmishAIDecision.h"
 #include "GameLogic/SkirmishAILiveness.h"
 
 #include <stdio.h>
@@ -414,6 +415,29 @@ static void TestSkirmishAIReplayEpoch()
 	CHECK(!ReplayVersionUsesSkirmishAILivenessRecovery(unrelatedSuffix));
 }
 
+static void TestSkirmishAICorrectnessPolicies()
+{
+	const Int currentPlanToken = 1;
+	const Int previousPlanToken = 2;
+	const Int *currentPlan = &currentPlanToken;
+	const Int *previousPlan = &previousPlanToken;
+	CHECK(GetSkirmishAutomaticConstructionPlan(currentPlan, previousPlan) == currentPlan);
+	CHECK(GetSkirmishAutomaticConstructionPlan(static_cast<const Int *>(nullptr), previousPlan) == nullptr);
+
+	CHECK(GetSupplyDefenseMemoryFrames(30) == 300);
+
+	CHECK(ShouldPreferSkirmishRetaliation(true, true));
+	CHECK(!ShouldPreferSkirmishRetaliation(false, true));
+	CHECK(!ShouldPreferSkirmishRetaliation(true, false));
+
+	CHECK(HasSkirmishRallyOffset(1.01f, 0.0f));
+	CHECK(HasSkirmishRallyOffset(-1.01f, 0.0f));
+	CHECK(HasSkirmishRallyOffset(0.0f, 1.01f));
+	CHECK(HasSkirmishRallyOffset(0.0f, -1.01f));
+	CHECK(!HasSkirmishRallyOffset(1.0f, -1.0f));
+	CHECK(!HasSkirmishRallyOffset(-1.0f, 1.0f));
+}
+
 int main(int argc, char **argv)
 {
 	initMemoryManager();
@@ -441,6 +465,7 @@ int main(int argc, char **argv)
 	TestStringConversionAndZeroLengthReads();
 	TestFrameRateLimitWaitCalculation();
 	TestSkirmishAILivenessPolicies();
+	TestSkirmishAICorrectnessPolicies();
 	TestFrameRateLimitCpuUsage();
 
 	if (s_failures != 0)

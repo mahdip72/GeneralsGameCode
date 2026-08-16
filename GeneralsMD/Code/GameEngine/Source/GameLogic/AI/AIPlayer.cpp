@@ -57,6 +57,7 @@
 #include "GameLogic/Module/DozerAIUpdate.h"
 #include "GameLogic/Module/UpdateModule.h"
 #include "GameLogic/ScriptEngine.h"
+#include "GameLogic/SkirmishAIDecision.h"
 #include "GameLogic/SkirmishAILiveness.h"
 #include "GameLogic/Module/ProductionUpdate.h"
 #include "GameLogic/Module/RebuildHoleBehavior.h"
@@ -501,10 +502,7 @@ Object *AIPlayer::buildStructureNow(const ThingTemplate *bldgPlan, BuildListInfo
 		if( exitInterface )
 		{
 			Coord3D rallyPoint;
-			Bool gotOffset = false;
-			if (fabs(info->getRallyOffset()->x) > 1.0f || fabs(info->getRallyOffset()->y)>1.0f) {
-				gotOffset;
-			}
+			Bool gotOffset = HasSkirmishRallyOffset(info->getRallyOffset()->x, info->getRallyOffset()->y);
 			if (!exitInterface->getNaturalRallyPoint(rallyPoint)) {
 				rallyPoint = *info->getLocation();
 			}
@@ -681,10 +679,7 @@ Object *AIPlayer::buildStructureWithDozer(const ThingTemplate *bldgPlan, BuildLi
 		if( exitInterface )
 		{
 			Coord3D rallyPoint;
-			Bool gotOffset = false;
-			if (fabs(info->getRallyOffset()->x) > 1.0f || fabs(info->getRallyOffset()->y)>1.0f) {
-				gotOffset;
-			}
+			Bool gotOffset = HasSkirmishRallyOffset(info->getRallyOffset()->x, info->getRallyOffset()->y);
 			if (!exitInterface->getNaturalRallyPoint(rallyPoint)) {
 				rallyPoint = *info->getLocation();
 			}
@@ -942,7 +937,7 @@ void AIPlayer::guardSupplyCenter( Team *team, Int minSupplies )
 //-------------------------------------------------------------------------------------------------
 Bool AIPlayer::isSupplySourceAttacked()
 {
-	const Int SCAN_RATE = 10; // don't scan more often than every 10 seconds.
+	const Int SCAN_RATE = GetSupplyDefenseMemoryFrames(LOGICFRAMES_PER_SECOND);
 	UnsignedInt curFrame = TheGameLogic->getFrame();
 	if (curFrame==0) {
 		m_supplySourceAttackCheckFrame = curFrame+SCAN_RATE;

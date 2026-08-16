@@ -53,6 +53,7 @@
 #include "GameLogic/Module/UpdateModule.h"
 #include "GameLogic/PartitionManager.h"
 #include "GameLogic/ScriptEngine.h"
+#include "GameLogic/SkirmishAIDecision.h"
 #include "GameLogic/Module/ProductionUpdate.h"
 #include "GameClient/TerrainVisual.h"
 
@@ -222,7 +223,7 @@ void AISkirmishPlayer::processBaseBuilding()
 				}
 				continue;
 			}
-			if (TheBuildAssistant->canMakeUnit(dozer, bldgPlan)!=CANMAKE_OK) {
+			if (TheBuildAssistant->canMakeUnit(dozer, GetSkirmishAutomaticConstructionPlan(curPlan, bldgPlan))!=CANMAKE_OK) {
 				if (info->isBuildable()) {
 					AsciiString bldgName = info->getTemplateName();
 					bldgName.concat(" - Dozer unable to build - money or technology missing.");
@@ -517,11 +518,11 @@ void AISkirmishPlayer::acquireEnemy()
 					// Some ai is already targeting this guy.  Add a distance penalty.
 					curDistSqr += (500*500);
 				}
-				if (somePlayer->isSkirmishAIPlayer() && (somePlayer->getCurrentEnemy()==m_player)) {
-					// he is attacking me.  So I will (gently) prefer to attack him.
-					curDistSqr -= (25*25);
-					if (curDistSqr<0) curDistSqr = 0;
-				}
+			}
+			if (ShouldPreferSkirmishRetaliation(curPlayer->isSkirmishAIPlayer(), curPlayer->getCurrentEnemy()==m_player)) {
+				// He is attacking me.  So I will (gently) prefer to attack him.
+				curDistSqr -= (25*25);
+				if (curDistSqr<0) curDistSqr = 0;
 			}
 
 			// Ai enemy - will take if we don't get a better offer.
