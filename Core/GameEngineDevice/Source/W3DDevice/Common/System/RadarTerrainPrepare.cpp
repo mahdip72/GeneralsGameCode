@@ -151,3 +151,384 @@ bool RadarTerrainBatchCapturePreflight(const RadarTerrainBatch &batch,
 		snapshot.width == expectedWidth && snapshot.height == expectedHeight &&
 		snapshot.cells == batch.cells();
 }
+
+namespace
+{
+
+#if defined(RTS_BUILD_CORE_EXTRAS)
+unsigned s_radarTerrainPrepareTestFault = 0;
+unsigned s_radarTerrainPrepareTestFaultOccurrence = 0;
+
+static bool consumeRadarTerrainPrepareTestFault(unsigned fault)
+{
+	if (s_radarTerrainPrepareTestFault != fault ||
+		s_radarTerrainPrepareTestFaultOccurrence == 0)
+	{
+		return false;
+	}
+
+	--s_radarTerrainPrepareTestFaultOccurrence;
+	if (s_radarTerrainPrepareTestFaultOccurrence == 0)
+	{
+		s_radarTerrainPrepareTestFault = 0;
+	}
+	return true;
+}
+#endif
+
+static bool radarTerrainPrepareCheckedMultiply(unsigned left, unsigned right,
+	unsigned *result)
+{
+	if (result == 0 || (right != 0 && left > UINT_MAX / right))
+	{
+		return false;
+	}
+	*result = left * right;
+	return true;
+}
+
+static bool radarTerrainPrepareCheckedAdd(unsigned left, unsigned right,
+	unsigned *result)
+{
+	if (result == 0 || left > UINT_MAX - right)
+	{
+		return false;
+	}
+	*result = left + right;
+	return true;
+}
+
+static bool radarTerrainPrepareRowsAreValid(
+	const RadarTerrainSnapshot *snapshot, const unsigned char *output,
+	unsigned rowBegin, unsigned rowEnd)
+{
+	unsigned requiredRowBytes;
+	unsigned cellCount;
+	unsigned cellBytes;
+	unsigned stagedBytes;
+	unsigned outputBytes;
+	const unsigned taskAndBookkeepingBudget = 1024;
+	if (snapshot == 0 || output == 0 || snapshot->cells == 0 ||
+		snapshot->width == 0 || snapshot->height == 0 || rowBegin > rowEnd ||
+		rowEnd > snapshot->height ||
+		RadarTerrainBytesPerPixel(snapshot->formatCode) == 0 ||
+		snapshot->bytesPerPixel !=
+			RadarTerrainBytesPerPixel(snapshot->formatCode))
+	{
+		return false;
+	}
+
+	if (!radarTerrainPrepareCheckedMultiply(snapshot->width,
+		snapshot->bytesPerPixel, &requiredRowBytes) ||
+		snapshot->rowBytes < requiredRowBytes ||
+		!radarTerrainPrepareCheckedMultiply(snapshot->width,
+			snapshot->height, &cellCount) ||
+		!radarTerrainPrepareCheckedMultiply(cellCount,
+			static_cast<unsigned>(sizeof(RadarTerrainCellInput)), &cellBytes) ||
+		!radarTerrainPrepareCheckedMultiply(snapshot->rowBytes,
+			snapshot->height, &outputBytes) ||
+		!radarTerrainPrepareCheckedAdd(cellBytes, outputBytes, &stagedBytes) ||
+		stagedBytes > RadarTerrainBatch::MAX_BYTES -
+			taskAndBookkeepingBudget)
+	{
+		return false;
+	}
+
+	return true;
+}
+
+/*
+ * A worker borrows this owner-stack view only through the joined call.  The
+ * view contains no live engine pointer; its two result bytes are disjoint.
+ */
+struct RadarTerrainTaskBatch
+{
+	const RadarTerrainSnapshot *snapshot;
+	unsigned char *output;
+	unsigned char results[2];
+};
+
+/* A task owns only this batch view pointer and its exclusive row range. */
+class RadarTerrainRowTask : public rts::Task
+{
+public:
+	RadarTerrainRowTask(RadarTerrainTaskBatch *batch, unsigned rowBegin,
+		unsigned rowEnd, unsigned resultIndex)
+		: m_batch(batch), m_rowBegin(rowBegin), m_rowEnd(rowEnd),
+		  m_resultIndex(resultIndex)
+	{
+		if (m_batch != 0 && m_resultIndex < 2)
+		{
+			m_batch->results[m_resultIndex] = 0;
+		}
+	}
+
+	virtual ~RadarTerrainRowTask()
+	{
+	}
+
+	virtual void execute()
+	{
+		const bool completed = m_batch != 0 && m_batch->snapshot != 0 &&
+			m_batch->output != 0 && ShadeRadarRows(*m_batch->snapshot,
+			m_batch->output, m_rowBegin, m_rowEnd);
+		if (m_batch != 0 && m_resultIndex < 2)
+		{
+			m_batch->results[m_resultIndex] = completed ? 1 : 0;
+		}
+	}
+
+private:
+	RadarTerrainRowTask(const RadarTerrainRowTask &);
+	RadarTerrainRowTask &operator=(const RadarTerrainRowTask &);
+
+	RadarTerrainTaskBatch *m_batch;
+	unsigned m_rowBegin;
+	unsigned m_rowEnd;
+	unsigned m_resultIndex;
+};
+
+static RadarTerrainRowTask *radarTerrainAllocateRowTask(
+	RadarTerrainTaskBatch *batch, unsigned rowBegin, unsigned rowEnd,
+	unsigned resultIndex)
+{
+#if defined(RTS_BUILD_CORE_EXTRAS)
+	if (consumeRadarTerrainPrepareTestFault(
+		RADAR_TERRAIN_PREPARE_TEST_FAIL_TASK_ALLOCATION))
+	{
+		return 0;
+	}
+#endif
+
+	RadarTerrainRowTask *task = 0;
+	try
+	{
+		task = new RadarTerrainRowTask(batch, rowBegin, rowEnd, resultIndex);
+	}
+	catch (...)
+	{
+		task = 0;
+	}
+	return task;
+}
+
+} // namespace
+
+#if defined(RTS_BUILD_CORE_EXTRAS)
+extern "C" void rts_radar_terrain_prepare_set_test_fault(
+	unsigned fault, unsigned occurrence)
+{
+	s_radarTerrainPrepareTestFault = fault;
+	s_radarTerrainPrepareTestFaultOccurrence = occurrence;
+}
+#endif
+
+RadarTerrainPrepareService::RadarTerrainPrepareService()
+	: m_requestedWorkers(0), m_queueCapacity(0), m_activeConsumer(0),
+	  m_initialized(false), m_stopping(false), m_leaseActive(false)
+{
+}
+
+RadarTerrainPrepareService::~RadarTerrainPrepareService()
+{
+	shutdown();
+}
+
+bool RadarTerrainPrepareService::initialize(unsigned workerCount,
+	unsigned queueCapacity)
+{
+	if (workerCount == 0 || queueCapacity == 0)
+	{
+		return false;
+	}
+
+	if (workerCount > 2)
+	{
+		workerCount = 2;
+	}
+
+	if (m_initialized && !m_stopping)
+	{
+		/* Do not silently replace an active display's private runtime. */
+		return m_requestedWorkers == workerCount &&
+			m_queueCapacity == queueCapacity;
+	}
+
+	if (m_leaseActive)
+	{
+		return false;
+	}
+
+	/* shutdown() leaves the private TaskRuntime restartable and idle. */
+	m_runtime.shutdown();
+	m_requestedWorkers = workerCount;
+	m_queueCapacity = queueCapacity;
+	m_activeConsumer = 0;
+	m_initialized = true;
+	m_stopping = false;
+	m_leaseActive = false;
+	return true;
+}
+
+bool RadarTerrainPrepareService::tryAcquire(unsigned consumerId)
+{
+	if (!m_initialized || m_stopping || consumerId == 0 || m_leaseActive)
+	{
+		return false;
+	}
+
+	m_activeConsumer = consumerId;
+	m_leaseActive = true;
+	return true;
+}
+
+bool RadarTerrainPrepareService::startRuntime(unsigned workerCount)
+{
+	if (workerCount == 0 || workerCount > 2 || m_queueCapacity == 0)
+	{
+		return false;
+	}
+
+	if (m_runtime.isRunning())
+	{
+		if (m_runtime.workerCount() == workerCount)
+		{
+			return true;
+		}
+		stopIdleRuntime();
+	}
+
+	return m_runtime.start(workerCount, m_queueCapacity);
+}
+
+void RadarTerrainPrepareService::stopIdleRuntime()
+{
+	/* Only the owner calls this, and every accepted task is joined first. */
+	m_runtime.waitUntilIdle();
+	m_runtime.shutdown();
+}
+
+bool RadarTerrainPrepareService::runAttempt(RadarTerrainSnapshot *snapshot,
+	unsigned char *output, unsigned rowBegin, unsigned rowEnd,
+	unsigned workerCount)
+{
+	const unsigned rowCount = rowEnd - rowBegin;
+	const unsigned firstRowEnd = rowBegin + rowCount / 2;
+	RadarTerrainRowTask *tasks[2] = { 0, 0 };
+	RadarTerrainTaskBatch taskBatch;
+	bool submitted;
+	taskBatch.snapshot = snapshot;
+	taskBatch.output = output;
+	taskBatch.results[0] = 0;
+	taskBatch.results[1] = 0;
+
+	if (!startRuntime(workerCount))
+	{
+		return false;
+	}
+
+	/* Always construct exactly two disjoint wrappers for one batch. */
+	tasks[0] = radarTerrainAllocateRowTask(&taskBatch, rowBegin,
+		firstRowEnd, 0);
+	if (tasks[0] == 0)
+	{
+		stopIdleRuntime();
+		return false;
+	}
+
+	tasks[1] = radarTerrainAllocateRowTask(&taskBatch, firstRowEnd,
+		rowEnd, 1);
+	if (tasks[1] == 0)
+	{
+		delete tasks[0];
+		stopIdleRuntime();
+		return false;
+	}
+
+	{
+		rts::Task *submittedTasks[2];
+		submittedTasks[0] = tasks[0];
+		submittedTasks[1] = tasks[1];
+		submitted = m_runtime.trySubmitBatch(submittedTasks, 2);
+	}
+	if (!submitted)
+	{
+		/* Rejected wrappers remain caller-owned by TaskRuntime contract. */
+		delete tasks[0];
+		delete tasks[1];
+		stopIdleRuntime();
+		return false;
+	}
+
+	/* Ownership transferred; wait only on this private runtime. */
+	m_runtime.waitUntilIdle();
+	return taskBatch.results[0] != 0 && taskBatch.results[1] != 0;
+}
+
+bool RadarTerrainPrepareService::runRows(RadarTerrainSnapshot *snapshot,
+	unsigned char *output, unsigned rowBegin, unsigned rowEnd)
+{
+	if (!m_initialized || m_stopping || !m_leaseActive ||
+		!radarTerrainPrepareRowsAreValid(snapshot, output, rowBegin, rowEnd) ||
+		rowBegin == rowEnd)
+	{
+		return false;
+	}
+
+	/* A previous one-worker recovery is not retained: prefer two next time. */
+	if (m_runtime.isRunning() && m_runtime.workerCount() != 2)
+	{
+		stopIdleRuntime();
+	}
+
+	if (runAttempt(snapshot, output, rowBegin, rowEnd, m_requestedWorkers))
+	{
+		return true;
+	}
+
+	/* A failed two-worker attempt must be idle before the one-worker retry. */
+	stopIdleRuntime();
+	if (m_requestedWorkers > 1 &&
+		runAttempt(snapshot, output, rowBegin, rowEnd, 1))
+	{
+		return true;
+	}
+
+	stopIdleRuntime();
+	return false;
+}
+
+void RadarTerrainPrepareService::release(unsigned consumerId)
+{
+	if (m_leaseActive && m_activeConsumer == consumerId)
+	{
+		m_leaseActive = false;
+		m_activeConsumer = 0;
+	}
+}
+
+void RadarTerrainPrepareService::shutdown()
+{
+	if (!m_initialized && !m_leaseActive)
+	{
+		m_runtime.shutdown();
+		return;
+	}
+
+	/* Stop admission first, then synchronously drain and join accepted work. */
+	m_stopping = true;
+	m_runtime.waitUntilIdle();
+	m_runtime.shutdown();
+	m_leaseActive = false;
+	m_activeConsumer = 0;
+	m_initialized = false;
+	m_requestedWorkers = 0;
+	m_queueCapacity = 0;
+	m_stopping = false;
+}
+
+RadarTerrainPrepareService &GetRadarTerrainPrepareService()
+{
+	static RadarTerrainPrepareService service;
+	return service;
+}

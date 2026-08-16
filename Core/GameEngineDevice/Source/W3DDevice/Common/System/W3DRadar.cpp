@@ -1241,39 +1241,69 @@ void W3DRadar::buildTerrainTexture( TerrainLogic *terrain )
 	 * through to the unchanged allocation-free owner loop below.
 	 */
 	RadarTerrainBatch batch;
+	RadarTerrainPrepareService &prepareService =
+		GetRadarTerrainPrepareService();
+	bool radarLease = false;
 	const unsigned formatCode = static_cast<unsigned>(surfaceDesc.Format);
 	if( surfaceDesc.Width == static_cast<unsigned>(m_textureWidth) &&
 		surfaceDesc.Height == static_cast<unsigned>(m_textureHeight) &&
 		batch.initialize( static_cast<unsigned>(m_textureWidth),
 			static_cast<unsigned>(m_textureHeight), formatCode ) &&
 		captureTerrainBatch( terrain, &batch, waterColor ) &&
-		batch.isComplete() &&
-		ShadeRadarRows( batch.snapshot(), batch.output(), 0,
-			batch.snapshot().height ) )
+		batch.isComplete() )
 	{
-		int stagedPitch = 0;
-		void *stagedBits = surface->Lock( &stagedPitch );
-		if( stagedBits != nullptr )
+		RadarTerrainSnapshot &preparedSnapshot = batch.mutableSnapshot();
+		bool prepared = false;
+		radarLease = prepareService.tryAcquire( 1 );
+		if( radarLease )
 		{
-			if( stagedPitch > 0 &&
-				static_cast<unsigned>(stagedPitch) >= batch.snapshot().rowBytes )
+			prepared = prepareService.runRows( &preparedSnapshot,
+				batch.output(), 0, preparedSnapshot.height );
+		}
+		else
+		{
+			/* The service is intentionally serial until display lifecycle init. */
+			prepared = ShadeRadarRows( preparedSnapshot, batch.output(), 0,
+				preparedSnapshot.height );
+		}
+
+		if( !prepared )
+		{
+			/* Every post-capture failure uses the same pure serial oracle. */
+			prepared = ShadeRadarRows( preparedSnapshot, batch.output(), 0,
+				preparedSnapshot.height );
+		}
+
+		if( prepared )
+		{
+			int stagedPitch = 0;
+			void *stagedBits = surface->Lock( &stagedPitch );
+			if( stagedBits != nullptr )
 			{
-				const unsigned stagedRowBytes = static_cast<unsigned>(stagedPitch);
-				unsigned stagedY;
-				for( stagedY = 0; stagedY < batch.snapshot().height; ++stagedY )
+				if( stagedPitch > 0 &&
+					static_cast<unsigned>(stagedPitch) >= preparedSnapshot.rowBytes )
 				{
-					unsigned char *destination = static_cast<unsigned char *>(stagedBits) +
-						stagedY * stagedRowBytes;
-					const unsigned char *source = batch.output() +
-						stagedY * batch.snapshot().rowBytes;
-					memcpy( destination, source, batch.snapshot().rowBytes );
+					const unsigned stagedRowBytes = static_cast<unsigned>(stagedPitch);
+					unsigned stagedY;
+					for( stagedY = 0; stagedY < preparedSnapshot.height; ++stagedY )
+					{
+						unsigned char *destination = static_cast<unsigned char *>(stagedBits) +
+							stagedY * stagedRowBytes;
+						const unsigned char *source = batch.output() +
+							stagedY * preparedSnapshot.rowBytes;
+						memcpy( destination, source, preparedSnapshot.rowBytes );
+					}
+					surface->Unlock();
+					if( radarLease )
+						prepareService.release( 1 );
+					REF_PTR_RELEASE(surface);
+					return;
 				}
 				surface->Unlock();
-				REF_PTR_RELEASE(surface);
-				return;
 			}
-			surface->Unlock();
 		}
+		if( radarLease )
+			prepareService.release( 1 );
 	}
 
 	int pitch;

@@ -4,6 +4,19 @@
 #include <stdio.h>
 #include <string.h>
 
+#if defined(RTS_BUILD_CORE_EXTRAS)
+enum RadarTerrainPrepareTaskRuntimeTestEvent
+{
+	RADAR_TASK_RUNTIME_TEST_FAIL_THREAD_RESERVE = 4,
+	RADAR_TASK_RUNTIME_TEST_FAIL_QUEUE_PUSH = 5
+};
+
+extern "C" void rts_task_runtime_set_test_allocation_fault(
+	unsigned event, unsigned occurrence);
+extern "C" void rts_radar_terrain_prepare_set_test_fault(
+	unsigned fault, unsigned occurrence);
+#endif
+
 static int check(bool value, const char *testName, const char *expression)
 {
 	if (!value)
@@ -481,6 +494,320 @@ static int testOwnerBatchCapturePreflight()
 	return 0;
 }
 
+static int compareServiceOutput(const unsigned char *actual,
+	const unsigned char *expected, unsigned count, const char *testName)
+{
+	return checkBytes(actual, expected, count, testName);
+}
+
+static void makeServiceFixture(RadarTerrainCellInput *cells,
+	RadarTerrainSnapshot *snapshot, unsigned char *serialOutput)
+{
+	fillCells(cells, 3, 4);
+	cells[0].workingBridge = 1;
+	cells[1].centerUnderwater = 1;
+	cells[1].neighborWaterBottomZ = 0.0f;
+	cells[7].centerUnderwater = 1;
+	cells[7].neighborWaterBottomZ = 0.0f;
+	*snapshot = makeSnapshot(cells, 3, 4, 3,
+		RADAR_TERRAIN_FORMAT_R8G8B8, 9);
+	memset(serialOutput, 0xA5, 36);
+	ShadeRadarRows(*snapshot, serialOutput, 0, snapshot->height);
+}
+
+static int testPrepareServiceSuccessfulLeaseAndRows()
+{
+	const char *testName = "testPrepareServiceSuccessfulLeaseAndRows";
+	RadarTerrainCellInput cells[12];
+	RadarTerrainSnapshot snapshot;
+	unsigned char serialOutput[36];
+	unsigned char output[36];
+	RadarTerrainPrepareService service;
+
+	makeServiceFixture(cells, &snapshot, serialOutput);
+	memset(output, 0xA5, sizeof(output));
+	CHECK(testName, service.initialize(2, 2));
+	CHECK(testName, service.tryAcquire(1));
+	CHECK(testName, !service.tryAcquire(2));
+	CHECK(testName, service.runRows(&snapshot, output, 0, snapshot.height));
+	CHECK(testName, compareServiceOutput(output, serialOutput,
+		snapshot.rowBytes * snapshot.height, testName) == 0);
+	CHECK(testName, service.hasLease());
+	service.release(1);
+	CHECK(testName, !service.hasLease());
+	CHECK(testName, !service.runRows(&snapshot, output, 0, snapshot.height));
+	CHECK(testName, service.tryAcquire(2));
+	memset(output, 0xA5, sizeof(output));
+	CHECK(testName, service.runRows(&snapshot, output, 0, snapshot.height));
+	CHECK(testName, compareServiceOutput(output, serialOutput,
+		snapshot.rowBytes * snapshot.height, testName) == 0);
+	service.release(2);
+	service.shutdown();
+	CHECK(testName, !service.isInitialized());
+	CHECK(testName, !service.tryAcquire(3));
+	return 0;
+}
+
+static int testPrepareServiceStartFailureRetriesOneWorker()
+{
+	const char *testName = "testPrepareServiceStartFailureRetriesOneWorker";
+	RadarTerrainCellInput cells[12];
+	RadarTerrainSnapshot snapshot;
+	unsigned char serialOutput[36];
+	unsigned char output[36];
+	RadarTerrainPrepareService service;
+
+	makeServiceFixture(cells, &snapshot, serialOutput);
+	memset(output, 0xA5, sizeof(output));
+	CHECK(testName, service.initialize(2, 2));
+	CHECK(testName, service.tryAcquire(1));
+#if defined(RTS_BUILD_CORE_EXTRAS)
+	rts_task_runtime_set_test_allocation_fault(
+		RADAR_TASK_RUNTIME_TEST_FAIL_THREAD_RESERVE, 1);
+#endif
+	CHECK(testName, service.runRows(&snapshot, output, 0, snapshot.height));
+#if defined(RTS_BUILD_CORE_EXTRAS)
+	rts_task_runtime_set_test_allocation_fault(0, 0);
+#endif
+	CHECK(testName, compareServiceOutput(output, serialOutput,
+		snapshot.rowBytes * snapshot.height, testName) == 0);
+	service.release(1);
+	service.shutdown();
+	return 0;
+}
+
+static int testPrepareServiceTaskAllocationRetriesOneWorker()
+{
+	const char *testName = "testPrepareServiceTaskAllocationRetriesOneWorker";
+	RadarTerrainCellInput cells[12];
+	RadarTerrainSnapshot snapshot;
+	unsigned char serialOutput[36];
+	unsigned char output[36];
+	RadarTerrainPrepareService service;
+
+	makeServiceFixture(cells, &snapshot, serialOutput);
+	memset(output, 0xA5, sizeof(output));
+	CHECK(testName, service.initialize(2, 2));
+	CHECK(testName, service.tryAcquire(1));
+#if defined(RTS_BUILD_CORE_EXTRAS)
+	rts_radar_terrain_prepare_set_test_fault(
+		RADAR_TERRAIN_PREPARE_TEST_FAIL_TASK_ALLOCATION, 1);
+#endif
+	CHECK(testName, service.runRows(&snapshot, output, 0, snapshot.height));
+	CHECK(testName, compareServiceOutput(output, serialOutput,
+		snapshot.rowBytes * snapshot.height, testName) == 0);
+	service.release(1);
+	service.shutdown();
+	return 0;
+}
+
+static int testPrepareServiceQueueBackpressureFallsBackToSerial()
+{
+	const char *testName = "testPrepareServiceQueueBackpressureFallsBackToSerial";
+	RadarTerrainCellInput cells[12];
+	RadarTerrainSnapshot snapshot;
+	unsigned char serialOutput[36];
+	unsigned char output[36];
+	RadarTerrainPrepareService service;
+
+	makeServiceFixture(cells, &snapshot, serialOutput);
+	memset(output, 0xA5, sizeof(output));
+	CHECK(testName, service.initialize(2, 1));
+	CHECK(testName, service.tryAcquire(1));
+	CHECK(testName, !service.runRows(&snapshot, output, 0, snapshot.height));
+	CHECK(testName, ShadeRadarRows(snapshot, output, 0, snapshot.height));
+	CHECK(testName, compareServiceOutput(output, serialOutput,
+		snapshot.rowBytes * snapshot.height, testName) == 0);
+	service.release(1);
+	service.shutdown();
+	return 0;
+}
+
+static int testPrepareServiceSubmissionRollbackRetriesOneWorker()
+{
+	const char *testName = "testPrepareServiceSubmissionRollbackRetriesOneWorker";
+	RadarTerrainCellInput cells[12];
+	RadarTerrainSnapshot snapshot;
+	unsigned char serialOutput[36];
+	unsigned char output[36];
+	RadarTerrainPrepareService service;
+
+	makeServiceFixture(cells, &snapshot, serialOutput);
+	memset(output, 0xA5, sizeof(output));
+	CHECK(testName, service.initialize(2, 2));
+	CHECK(testName, service.tryAcquire(1));
+#if defined(RTS_BUILD_CORE_EXTRAS)
+	rts_task_runtime_set_test_allocation_fault(
+		RADAR_TASK_RUNTIME_TEST_FAIL_QUEUE_PUSH, 2);
+#endif
+	CHECK(testName, service.runRows(&snapshot, output, 0, snapshot.height));
+#if defined(RTS_BUILD_CORE_EXTRAS)
+	rts_task_runtime_set_test_allocation_fault(0, 0);
+#endif
+	CHECK(testName, compareServiceOutput(output, serialOutput,
+		snapshot.rowBytes * snapshot.height, testName) == 0);
+	service.release(1);
+	service.shutdown();
+	return 0;
+}
+
+static int testPrepareServiceBothAttemptsFailUseSerialOracle()
+{
+	const char *testName = "testPrepareServiceBothAttemptsFailUseSerialOracle";
+	RadarTerrainCellInput cells[12];
+	RadarTerrainSnapshot snapshot;
+	unsigned char serialOutput[36];
+	unsigned char output[36];
+	RadarTerrainPrepareService service;
+
+	makeServiceFixture(cells, &snapshot, serialOutput);
+	memset(output, 0xA5, sizeof(output));
+	CHECK(testName, service.initialize(2, 2));
+	CHECK(testName, service.tryAcquire(1));
+#if defined(RTS_BUILD_CORE_EXTRAS)
+	rts_radar_terrain_prepare_set_test_fault(
+		RADAR_TERRAIN_PREPARE_TEST_FAIL_TASK_ALLOCATION, 2);
+#endif
+	CHECK(testName, !service.runRows(&snapshot, output, 0, snapshot.height));
+	CHECK(testName, ShadeRadarRows(snapshot, output, 0, snapshot.height));
+	CHECK(testName, compareServiceOutput(output, serialOutput,
+		snapshot.rowBytes * snapshot.height, testName) == 0);
+	service.release(1);
+	service.shutdown();
+	return 0;
+}
+
+static int testPrepareServiceShutdownClosesLease()
+{
+	const char *testName = "testPrepareServiceShutdownClosesLease";
+	RadarTerrainPrepareService service;
+
+	CHECK(testName, service.initialize(2, 2));
+	CHECK(testName, service.tryAcquire(1));
+	service.shutdown();
+	CHECK(testName, !service.isInitialized());
+	CHECK(testName, !service.hasLease());
+	CHECK(testName, !service.tryAcquire(1));
+	service.release(1);
+	service.shutdown();
+	return 0;
+}
+
+static bool makeSourcePathNearTest(char *path, unsigned pathSize,
+	const char *relativePath)
+{
+	const char *testFile = __FILE__;
+	const char *slash = strrchr(testFile, '\\');
+	const char *forwardSlash = strrchr(testFile, '/');
+	unsigned directoryLength;
+	unsigned relativeLength;
+
+	if (forwardSlash != 0 && (slash == 0 || forwardSlash > slash))
+	{
+		slash = forwardSlash;
+	}
+	if (slash == 0)
+	{
+		return false;
+	}
+
+	directoryLength = static_cast<unsigned>(slash - testFile);
+	relativeLength = static_cast<unsigned>(strlen(relativePath));
+	if (directoryLength + 1 + relativeLength + 1 > pathSize)
+	{
+		return false;
+	}
+	memcpy(path, testFile, directoryLength);
+	path[directoryLength] = '\\';
+	memcpy(path + directoryLength + 1, relativePath, relativeLength + 1);
+	return true;
+}
+
+static int auditSourceRange(const char *path, const char *startMarker,
+	const char *endMarker, const char *const *forbidden,
+	unsigned forbiddenCount, const char *testName)
+{
+	FILE *sourceFile = fopen(path, "rb");
+	char source[65536];
+	long sourceLength;
+	char *start;
+	char *end;
+	unsigned index;
+
+	if (sourceFile == 0)
+	{
+		return check(false, testName, "sourceFile != 0");
+	}
+	fseek(sourceFile, 0, SEEK_END);
+	sourceLength = ftell(sourceFile);
+	fseek(sourceFile, 0, SEEK_SET);
+	if (sourceLength <= 0 || sourceLength >= static_cast<long>(sizeof(source)))
+	{
+		fclose(sourceFile);
+		return check(false, testName, "sourceLength fits audit buffer");
+	}
+	if (fread(source, 1, static_cast<size_t>(sourceLength), sourceFile) !=
+		static_cast<size_t>(sourceLength))
+	{
+		fclose(sourceFile);
+		return check(false, testName, "fread(source) == sourceLength");
+	}
+	fclose(sourceFile);
+	source[sourceLength] = '\0';
+
+	start = strstr(source, startMarker);
+	if (start == 0)
+	{
+		return check(false, testName, "startMarker != 0");
+	}
+	end = strstr(start, endMarker);
+	if (end == 0)
+	{
+		return check(false, testName, "endMarker != 0");
+	}
+	*end = '\0';
+	for (index = 0; index < forbiddenCount; ++index)
+	{
+		if (strstr(start, forbidden[index]) != 0)
+		{
+			fprintf(stderr, "%s: forbidden source token '%s'\n", testName,
+				forbidden[index]);
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static int testWorkerSourceAudit()
+{
+	const char *testName = "testWorkerSourceAudit";
+	const char *const workerForbidden[] = {
+		"D3D", "The", "TerrainLogic", "TerrainVisual", "Object",
+		"Bridge", "new ", "delete ", "wait", "rand", "RNG",
+		"replay", "save", "network"
+	};
+	const char *const kernelForbidden[] = {
+		"D3D", "The", "new ", "delete ", "wait", "rand", "RNG",
+		"replay", "save", "network"
+	};
+	char preparePath[1024];
+	char kernelPath[1024];
+	int result = 0;
+
+	CHECK(testName, makeSourcePathNearTest(preparePath, sizeof(preparePath),
+		"..\\..\\GameEngineDevice\\Source\\W3DDevice\\Common\\System\\RadarTerrainPrepare.cpp"));
+	CHECK(testName, makeSourcePathNearTest(kernelPath, sizeof(kernelPath),
+		"..\\..\\Libraries\\Source\\TaskRuntime\\RadarTerrainKernel.cpp"));
+	result |= auditSourceRange(preparePath, "class RadarTerrainRowTask",
+		"static RadarTerrainRowTask *radarTerrainAllocateRowTask",
+		workerForbidden,
+		sizeof(workerForbidden) / sizeof(workerForbidden[0]), testName);
+	result |= auditSourceRange(kernelPath, "void ShadeRadarPixel",
+		"bool ShadeRadarRows", kernelForbidden,
+		sizeof(kernelForbidden) / sizeof(kernelForbidden[0]), testName);
+	return result;
+}
+
 int main()
 {
 	int result = 0;
@@ -494,5 +821,13 @@ int main()
 	result |= testInvalidRangesAndSizesDoNotWrite();
 	result |= testOwnerBatchStorageIsBoundedAndSingleOwned();
 	result |= testOwnerBatchCapturePreflight();
+	result |= testPrepareServiceSuccessfulLeaseAndRows();
+	result |= testPrepareServiceStartFailureRetriesOneWorker();
+	result |= testPrepareServiceTaskAllocationRetriesOneWorker();
+	result |= testPrepareServiceQueueBackpressureFallsBackToSerial();
+	result |= testPrepareServiceSubmissionRollbackRetriesOneWorker();
+	result |= testPrepareServiceBothAttemptsFailUseSerialOracle();
+	result |= testPrepareServiceShutdownClosesLease();
+	result |= testWorkerSourceAudit();
 	return result;
 }
