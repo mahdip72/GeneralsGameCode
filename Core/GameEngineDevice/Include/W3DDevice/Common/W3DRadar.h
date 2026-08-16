@@ -33,6 +33,7 @@
 
 // INCLUDES ///////////////////////////////////////////////////////////////////////////////////////
 #include "Common/Radar.h"
+#include "W3DDevice/Common/RadarOverlayPrepare.h"
 #include "WW3D2/ww3dformat.h"
 
 // FORWARD REFERENCES /////////////////////////////////////////////////////////////////////////////
@@ -121,6 +122,10 @@ protected:
 	int m_shroudSurfacePitch;											///< shroud surface pitch
 	WW3DFormat m_shroudSurfaceFormat;							///< shroud surface format
 	UnsignedInt m_shroudSurfacePixelSize;					///< shroud surface pixel size
+	RadarShroudOverlayBatch m_shroudOverlayBatch;				///< persistent staged shroud batch
+	Bool m_shroudBatchActive;									///< begin/end batch is active
+	Bool m_shroudBatchFallback;								///< direct owner fallback for this batch
+	Bool m_shroudBatchFolded;								///< output contains cleared command chunks
 
 	Int m_textureWidth;														///< width for all radar textures
 	Int m_textureHeight;													///< height for all radar textures

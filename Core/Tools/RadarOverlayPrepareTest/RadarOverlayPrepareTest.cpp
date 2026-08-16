@@ -683,6 +683,78 @@ static int testShroudBatchStorageAllowsEmptyBoundedOutput()
 	return 0;
 }
 
+static int testShroudBatchAutomaticCapacityUsesRemainingBudget()
+{
+	const char *testName =
+		"testShroudBatchAutomaticCapacityUsesRemainingBudget";
+	const unsigned width = 64;
+	const unsigned height = 64;
+	const unsigned formatCode = RADAR_OVERLAY_FORMAT_A8R8G8B8;
+	const unsigned outputBytes = width * height * 4;
+	const unsigned expectedCapacity =
+		(RadarShroudOverlayBatch::MAX_BYTES - outputBytes) /
+		static_cast<unsigned>(sizeof(RadarShroudOverlayCommand));
+	RadarShroudOverlayBatch batch;
+
+	CHECK(testName, batch.initialize(width, height, formatCode));
+	CHECK(testName, batch.isAllocated());
+	CHECK(testName, batch.commandCapacity() == expectedCapacity);
+	CHECK(testName, batch.snapshot().commandCapacity == expectedCapacity);
+	CHECK(testName, expectedCapacity > 0);
+	return 0;
+}
+
+static int testShroudBatchOverflowPreservesPrefixAndOrder()
+{
+	const char *testName = "testShroudBatchOverflowPreservesPrefixAndOrder";
+	RadarShroudOverlayBatch batch;
+	RadarShroudOverlayCommand first;
+	RadarShroudOverlayCommand second;
+	RadarShroudOverlayCommand overflow;
+
+	first.minX = 0;
+	first.minY = 0;
+	first.maxX = 1;
+	first.maxY = 1;
+	first.packedColor = 0x10203040u;
+	second.minX = 0;
+	second.minY = 0;
+	second.maxX = 1;
+	second.maxY = 1;
+	second.packedColor = 0xA0B0C0D0u;
+	overflow.minX = 0;
+	overflow.minY = 0;
+	overflow.maxX = 1;
+	overflow.maxY = 1;
+	overflow.packedColor = 0x55667788u;
+
+	CHECK(testName, batch.initialize(2, 2,
+		RADAR_OVERLAY_FORMAT_A8R8G8B8, 2));
+	CHECK(testName, batch.append(first));
+	CHECK(testName, batch.append(second));
+	CHECK(testName, batch.isFull());
+	CHECK(testName, !batch.append(overflow));
+	CHECK(testName, batch.commandCount() == 2);
+	CHECK(testName, batch.snapshot().commands[0].packedColor ==
+		first.packedColor);
+	CHECK(testName, batch.snapshot().commands[1].packedColor ==
+		second.packedColor);
+	memset(batch.output(), 0, 16);
+	CHECK(testName, PackRadarShroudRows(batch.snapshot(), 0, 2));
+	CHECK(testName, pixel(batch.output(), 8, 4, 0, 0)[0] == 0xD0);
+	CHECK(testName, pixel(batch.output(), 8, 4, 0, 0)[1] == 0xC0);
+	CHECK(testName, pixel(batch.output(), 8, 4, 0, 0)[2] == 0xB0);
+	CHECK(testName, pixel(batch.output(), 8, 4, 0, 0)[3] == 0xA0);
+	batch.clearCommands();
+	CHECK(testName, batch.commandCount() == 0);
+	CHECK(testName, batch.commandCapacity() == 2);
+	CHECK(testName, batch.isAllocated());
+	CHECK(testName, batch.append(overflow));
+	CHECK(testName, PackRadarShroudRows(batch.snapshot(), 0, 2));
+	CHECK(testName, pixel(batch.output(), 8, 4, 0, 0)[0] == 0x88);
+	return 0;
+}
+
 static int testOverlayBatchStorageRejectsCheckedOverflow()
 {
 	const char *testName = "testOverlayBatchStorageRejectsCheckedOverflow";
@@ -882,6 +954,8 @@ int main()
 	result |= testKernelsWriteOnlyAssignedRows();
 	result |= testObjectBatchStorageTracksCountAndCapacity();
 	result |= testShroudBatchStorageAllowsEmptyBoundedOutput();
+	result |= testShroudBatchAutomaticCapacityUsesRemainingBudget();
+	result |= testShroudBatchOverflowPreservesPrefixAndOrder();
 	result |= testOverlayBatchStorageRejectsCheckedOverflow();
 	result |= testObjectBatchServiceSuccessAndSerialFallback();
 	result |= testShroudBatchServiceSuccessAndLeaseDenial();

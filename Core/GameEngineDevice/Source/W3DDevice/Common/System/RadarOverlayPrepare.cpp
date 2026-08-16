@@ -90,8 +90,15 @@ static bool radarOverlayPrepareCheckLayout(unsigned width, unsigned height,
 	const unsigned bytesPerPixel = RadarOverlayBytesPerPixel(formatCode);
 	unsigned totalBytes;
 
-	if (width == 0 || height == 0 || bytesPerPixel == 0 || rowBytes == 0 ||
-		outputBytes == 0 ||
+	if (rowBytes == 0 || outputBytes == 0)
+	{
+		return false;
+	}
+	*rowBytes = 0;
+	*outputBytes = 0;
+
+	if (width == 0 || height == 0 || width > INT_MAX || height > INT_MAX ||
+		bytesPerPixel == 0 ||
 		!radarOverlayPrepareCheckedMultiply(width, bytesPerPixel, rowBytes) ||
 		!radarOverlayPrepareCheckedMultiply(*rowBytes, height, outputBytes) ||
 		!radarOverlayPrepareCheckedMultiply(commandCapacity, commandBytes,
@@ -102,6 +109,25 @@ static bool radarOverlayPrepareCheckLayout(unsigned width, unsigned height,
 		return false;
 	}
 
+	return true;
+}
+
+static bool radarOverlayPrepareGetMaxCommandCapacity(unsigned width,
+	unsigned height, unsigned formatCode, unsigned commandBytes,
+	unsigned maxBytes, unsigned *commandCapacity)
+{
+	unsigned rowBytes;
+	unsigned outputBytes;
+
+	if (commandCapacity == 0 || commandBytes == 0 ||
+		!radarOverlayPrepareCheckLayout(width, height, formatCode, 0,
+			commandBytes, &rowBytes, &outputBytes, maxBytes) ||
+		outputBytes > maxBytes)
+	{
+		return false;
+	}
+
+	*commandCapacity = (maxBytes - outputBytes) / commandBytes;
 	return true;
 }
 
@@ -244,6 +270,20 @@ RadarShroudOverlayBatch::~RadarShroudOverlayBatch()
 }
 
 bool RadarShroudOverlayBatch::initialize(unsigned width, unsigned height,
+	unsigned formatCode)
+{
+	unsigned commandCapacity;
+	if (!radarOverlayPrepareGetMaxCommandCapacity(width, height, formatCode,
+		static_cast<unsigned>(sizeof(RadarShroudOverlayCommand)), MAX_BYTES,
+		&commandCapacity))
+	{
+		return false;
+	}
+
+	return initialize(width, height, formatCode, commandCapacity);
+}
+
+bool RadarShroudOverlayBatch::initialize(unsigned width, unsigned height,
 	unsigned formatCode, unsigned commandCapacity)
 {
 	const unsigned commandBytes =
@@ -321,6 +361,14 @@ bool RadarShroudOverlayBatch::append(Int minX, Int minY, Int maxX, Int maxY,
 	command.maxY = maxY;
 	command.packedColor = packedColor;
 	return append(command);
+}
+
+void RadarShroudOverlayBatch::clearCommands()
+{
+	if (m_initialized)
+	{
+		m_snapshot.commandCount = 0;
+	}
 }
 
 bool RadarShroudOverlayBatch::isAllocated() const

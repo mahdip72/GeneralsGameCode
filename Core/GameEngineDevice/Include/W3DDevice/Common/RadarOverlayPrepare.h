@@ -66,6 +66,8 @@ public:
 	RadarShroudOverlayBatch();
 	~RadarShroudOverlayBatch();
 
+	/* Allocate the largest command array that fits the fixed batch budget. */
+	bool initialize(unsigned width, unsigned height, unsigned formatCode);
 	bool initialize(unsigned width, unsigned height, unsigned formatCode,
 		unsigned commandCapacity);
 	void reset();
@@ -73,6 +75,8 @@ public:
 	bool append(const RadarShroudOverlayCommand &command);
 	bool append(Int minX, Int minY, Int maxX, Int maxY,
 		unsigned packedColor);
+	/* Retain output/capacity while starting the next ordered command chunk. */
+	void clearCommands();
 
 	bool isAllocated() const;
 	bool isFull() const;
