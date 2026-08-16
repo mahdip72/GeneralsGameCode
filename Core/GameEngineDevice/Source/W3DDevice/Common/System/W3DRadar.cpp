@@ -65,7 +65,11 @@
 
 
 // PRIVATE DATA ///////////////////////////////////////////////////////////////////////////////////
-enum { OVERLAY_REFRESH_RATE = 6 };  ///< over updates once this many frames
+enum
+{
+	OVERLAY_REFRESH_RATE = 6,  ///< over updates once this many frames
+	MIN_PARALLEL_OBJECT_COMMANDS = 512
+};
 
 //-------------------------------------------------------------------------------------------------
 /** Is the point legal, that is, inside the resolution of the radar cells */
@@ -1010,6 +1014,14 @@ void W3DRadar::updateObjectTexture(TextureClass *texture)
 		commandCapacity = objectCount + localObjectCount;
 		if( commandCapacity == 0 )
 			return;
+		/* Below this point four direct pixels per node are cheaper than a
+		 * complete surface upload plus worker admission and synchronization. */
+		if( commandCapacity < MIN_PARALLEL_OBJECT_COMMANDS )
+		{
+			renderObjectList( m_objectList, texture );
+			renderObjectList( m_localObjectList, texture );
+			return;
+		}
 		surface = texture->Get_Surface_Level();
 		if( surface != nullptr )
 		{
@@ -2231,6 +2243,31 @@ void W3DRadar::setShroudLevel(Int shroudX, Int shroudY, CellShroudStatus setting
 			DEBUG_CRASH(("W3DRadar: unable to fold or replay shroud batch"));
 			return;
 		}
+	}
+	if( !m_shroudBatchActive && m_shroudBatchPendingCommit )
+	{
+		/* The retained image is the only complete copy of a previously failed
+		 * batch.  Merge this direct update into it and retry the whole image;
+		 * never replace the history with only the newest rectangle. */
+		const unsigned pendingColor = ARGB_Color_To_WW3D_Color(
+			m_shroudSurfaceFormat, GameMakeColor( 0, 0, 0, alpha ) );
+		if( m_shroudOverlayBatch.append( radarMinX, radarMinY, radarMaxX,
+			radarMaxY, pendingColor ) &&
+			PackRadarShroudRows( m_shroudOverlayBatch.snapshot(), 0,
+				m_shroudOverlayBatch.snapshot().height ) )
+		{
+			m_shroudOverlayBatch.clearCommands();
+			if( uploadPreparedRadarShroudOverlay( m_shroudTexture,
+				m_shroudOverlayBatch.snapshot() ) )
+			{
+				m_shroudOverlayBatch.reset();
+				m_shroudBatchPendingCommit = FALSE;
+				m_shroudBatchFolded = FALSE;
+			}
+			return;
+		}
+		DEBUG_CRASH(("W3DRadar: unable to extend deferred shroud image"));
+		return;
 	}
 
 	if (m_shroudSurface == nullptr)
