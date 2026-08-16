@@ -42,6 +42,7 @@ static void drawFramerateBar();
 
 // USER INCLUDES //////////////////////////////////////////////////////////////
 #include "Common/FramePacer.h"
+#include "Common/GameThreadOwnership.h"
 #include "Common/ThingFactory.h"
 #include "Common/GlobalData.h"
 #include "Common/PerfTimer.h"
@@ -66,6 +67,7 @@ static void drawFramerateBar();
 #include "Common/ModelState.h"
 #include "Lib/BaseType.h"
 #include "W3DDevice/Common/W3DConvert.h"
+#include "W3DDevice/Common/RadarTerrainPrepare.h"
 #include "W3DDevice/GameClient/W3DAssetManager.h"
 #include "W3DDevice/GameClient/W3DGameClient.h"
 #include "W3DDevice/GameClient/W3DFileSystem.h"
@@ -371,6 +373,8 @@ W3DDisplay::W3DDisplay()
 //=============================================================================
 W3DDisplay::~W3DDisplay()
 {
+	ASSERT_GAME_THREAD("W3DDisplay::~W3DDisplay radar preparation");
+	GetRadarTerrainPrepareService().shutdown();
 	W3D_ShutdownScreenshotTasks();
 
 #ifdef PROFILER_ENABLED
@@ -915,6 +919,11 @@ void W3DDisplay::init()
 
 		DX8WebBrowser::Initialize();
 	}
+
+	// Keep radar preparation synchronous and owner-bound.  A failed start leaves
+	// W3DRadar's serial path as the compatibility fallback.
+	ASSERT_GAME_THREAD("W3DDisplay::init radar preparation");
+	GetRadarTerrainPrepareService().initialize(2, 2);
 
 	// we're now online
 	m_initialized = true;
