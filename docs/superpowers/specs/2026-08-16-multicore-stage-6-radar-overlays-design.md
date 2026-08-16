@@ -231,8 +231,10 @@ The kernels must:
 - scan commands from index 0 through `commandCount - 1` for every assigned row;
 - apply object offsets in the exact four-write sequence and use the same legal
   coordinate predicate as the legacy code;
-- apply shroud rectangles inclusively, clipping only to the valid output
-  rectangle in a way equivalent to `Draw_Pixel` clipping;
+- apply shroud rectangles inclusively and defensively clip malformed synthetic
+  bounds to the valid output rectangle.  Production parity still comes from
+  the owner-side `worldToRadar` clamp because legacy `Draw_Pixel` itself does
+  not perform clipping;
 - write exactly `bytesPerPixel` bytes using a D3D-free little-endian helper;
 - perform no allocation, wait, lock, log, global read, RNG, or exception path.
 
