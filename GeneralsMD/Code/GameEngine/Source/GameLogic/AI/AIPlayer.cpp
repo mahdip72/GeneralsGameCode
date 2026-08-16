@@ -3518,7 +3518,7 @@ TeamInQueue::~TeamInQueue()
 		deleteInstance(order);
 	}
 	// If we have a team, activate it.  If it is empty, Team.cpp will remove empty active teams.
-	if (m_team) m_team->setActive();
+	if (m_team) m_team->setActiveWithoutSkirmishAIFeedback();
 	m_workOrders = nullptr;
 }
 
@@ -3716,6 +3716,8 @@ void TeamInQueue::xfer( Xfer *xfer )
 	xfer->xferBool( &m_stopQueueing );
 	xfer->xferBool( &m_reinforcement );
 	xfer->xferObjectID( &m_reinforcementID );
+	if (xfer->getXferMode() == XFER_LOAD && m_team && !m_reinforcement)
+		m_team->beginSkirmishAIFormation();
 
 }
 

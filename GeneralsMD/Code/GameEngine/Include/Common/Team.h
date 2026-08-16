@@ -152,6 +152,12 @@ public:
 	mutable Int				m_productionPriority;					///< Production priority.
 	Int								m_productionPrioritySuccessIncrease; ///< Production priority increase on success.
 	Int								m_productionPriorityFailureDecrease; ///< Production priority decrease on failure.
+	mutable Int				m_recentSkirmishAILossCount;
+	mutable Int				m_recentSkirmishAIPathFailureCount;
+	mutable UnsignedInt	m_lastSkirmishAILossFrame;
+	mutable UnsignedInt	m_lastSkirmishAIPathFailureFrame;
+	mutable UnsignedInt	m_nextSkirmishAIFeedbackDecayFrame;
+	mutable Bool			m_hasSkirmishAIPathFailureFrame;
 	AttitudeType			m_initialTeamAttitude;				///< The initial team attitude
 
 	AsciiString				m_transportUnitType;					///< Unit used to transport the team.
@@ -199,6 +205,7 @@ private:
 	Bool					m_enteredOrExited;  ///< True if a team member entered or exited a trigger area this frame.
 	Bool					m_active;						///< True if a team is complete.  False while members are being added.
 	Bool					m_created;					///< True when first activated.
+	Bool					m_skirmishAILossFeedbackEligible;
 
 	// Enemy sighted & All Clear:
 	Bool					m_checkEnemySighted;///< True if we have an on enemy sighted or all clear script.
@@ -306,7 +313,16 @@ public:
 	/**
 		Set the team as active.  A team is considered created when set active.
 	*/
-	void setActive() {if (!m_active) { m_created = true;m_active = true;}}
+	void setActive()
+	{
+		if (!m_active) { m_created = true; m_active = true; }
+		m_skirmishAILossFeedbackEligible = true;
+	}
+	void setActiveWithoutSkirmishAIFeedback()
+	{
+		if (!m_active) { m_created = true; m_active = true; }
+	}
+	void beginSkirmishAIFormation() { m_skirmishAILossFeedbackEligible = false; }
 
 	/**
 		Is this team active?
@@ -628,6 +644,19 @@ public:
 	void increaseAIPriorityForSuccess() const;
 	// Make a team less likely to be selected by the ai for building due to failure.
 	void decreaseAIPriorityForFailure() const;
+
+	void decaySkirmishAIFeedback(UnsignedInt currentFrame) const;
+	void recordSkirmishAILoss(UnsignedInt currentFrame) const;
+	void recordSkirmishAIPathFailure(UnsignedInt currentFrame) const;
+	void recordSkirmishAISuccess(UnsignedInt currentFrame) const;
+	Int getRecentSkirmishAILossCount() const
+	{
+		return m_teamTemplate.m_recentSkirmishAILossCount;
+	}
+	Int getRecentSkirmishAIPathFailureCount() const
+	{
+		return m_teamTemplate.m_recentSkirmishAIPathFailureCount;
+	}
 
 	void setAttackPriorityName(const AsciiString &name) { m_attackPriorityName = name;}
 	AsciiString getAttackPriorityName() const { return m_attackPriorityName;}

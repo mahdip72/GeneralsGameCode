@@ -642,6 +642,136 @@ static void TestSkirmishAITargetingPolicies()
 	CHECK(newState.nextEvaluationFrame == 900);
 }
 
+static void TestSkirmishAIFeedbackPolicies()
+{
+	const UnsignedInt decayFrames = 30 * 30;
+	const UnsignedInt pathRateLimitFrames = 5 * 30;
+	SkirmishAIFeedbackState state = MakeSkirmishAIFeedbackState();
+	CHECK(state.recentLossCount == 0);
+	CHECK(state.recentPathFailureCount == 0);
+	CHECK(state.lastLossFrame == 0);
+	CHECK(state.lastPathFailureFrame == 0);
+	CHECK(state.nextDecayFrame == 0);
+	CHECK(!state.hasPathFailureFrame);
+
+	state = RecordSkirmishAILoss(state, 0, decayFrames);
+	state = RecordSkirmishAILoss(state, 1, decayFrames);
+	state = RecordSkirmishAILoss(state, 2, decayFrames);
+	state = RecordSkirmishAILoss(state, 3, decayFrames);
+	CHECK(state.recentLossCount == 3);
+	CHECK(state.lastLossFrame == 3);
+	CHECK(state.nextDecayFrame == decayFrames);
+
+	state = RecordSkirmishAIPathFailure(state, 0, pathRateLimitFrames, decayFrames);
+	CHECK(state.recentPathFailureCount == 1);
+	state = RecordSkirmishAIPathFailure(state, pathRateLimitFrames - 1,
+		pathRateLimitFrames, decayFrames);
+	CHECK(state.recentPathFailureCount == 1);
+	state = RecordSkirmishAIPathFailure(state, pathRateLimitFrames,
+		pathRateLimitFrames, decayFrames);
+	CHECK(state.recentPathFailureCount == 2);
+	state = RecordSkirmishAIPathFailure(state, 2 * pathRateLimitFrames,
+		pathRateLimitFrames, decayFrames);
+	state = RecordSkirmishAIPathFailure(state, 3 * pathRateLimitFrames,
+		pathRateLimitFrames, decayFrames);
+	CHECK(state.recentPathFailureCount == 3);
+	CHECK(state.lastPathFailureFrame == 3 * pathRateLimitFrames);
+
+	SkirmishAIFeedbackState beforeDecay = DecaySkirmishAIFeedback(
+		state, decayFrames - 1, decayFrames);
+	CHECK(beforeDecay.recentLossCount == 3);
+	CHECK(beforeDecay.recentPathFailureCount == 3);
+	state = DecaySkirmishAIFeedback(state, decayFrames, decayFrames);
+	CHECK(state.recentLossCount == 2);
+	CHECK(state.recentPathFailureCount == 2);
+	state = DecaySkirmishAIFeedback(state, 3 * decayFrames, decayFrames);
+	CHECK(state.recentLossCount == 0);
+	CHECK(state.recentPathFailureCount == 0);
+	CHECK(state.nextDecayFrame == 0);
+
+	state = MakeSkirmishAIFeedbackState();
+	state = RecordSkirmishAILoss(state, 100, decayFrames);
+	state = RecordSkirmishAIPathFailure(state, 100, pathRateLimitFrames, decayFrames);
+	state = ApplySkirmishAITeamSuccess(state, 101, decayFrames);
+	CHECK(state.recentLossCount == 0);
+	CHECK(state.recentPathFailureCount == 0);
+	CHECK(state.nextDecayFrame == 0);
+	state = RecordSkirmishAIPathFailure(state, 101, pathRateLimitFrames, decayFrames);
+	CHECK(state.recentPathFailureCount == 0);
+	state = RecordSkirmishAIPathFailure(state, 100 + pathRateLimitFrames,
+		pathRateLimitFrames, decayFrames);
+	CHECK(state.recentPathFailureCount == 1);
+	CHECK(state.nextDecayFrame == 100 + pathRateLimitFrames + decayFrames);
+
+	state = MakeSkirmishAIFeedbackState();
+	state = RecordSkirmishAIPathFailure(state, 0, pathRateLimitFrames, decayFrames);
+	state = ApplySkirmishAITeamSuccess(state, 1, decayFrames);
+	state = RecordSkirmishAIPathFailure(state, 1, pathRateLimitFrames, decayFrames);
+	CHECK(state.recentPathFailureCount == 0);
+	CHECK(state.hasPathFailureFrame);
+	state = RecordSkirmishAIPathFailure(state, pathRateLimitFrames,
+		pathRateLimitFrames, decayFrames);
+	CHECK(state.recentPathFailureCount == 1);
+
+	UnsignedInt wrapStartFrame = 0 - decayFrames;
+	state = MakeSkirmishAIFeedbackState();
+	state = RecordSkirmishAILoss(state, wrapStartFrame, decayFrames);
+	CHECK(state.nextDecayFrame == 0);
+	state = DecaySkirmishAIFeedback(state, (UnsignedInt)-1, decayFrames);
+	CHECK(state.recentLossCount == 1);
+	state = DecaySkirmishAIFeedback(state, 0, decayFrames);
+	CHECK(state.recentLossCount == 0);
+	CHECK(state.nextDecayFrame == 0);
+
+	state = MakeSkirmishAIFeedbackState();
+	state = RecordSkirmishAILoss(state, 50, decayFrames);
+	state = RecordSkirmishAIPathFailure(state, 50,
+		pathRateLimitFrames, decayFrames);
+	SkirmishAIFeedbackState unchangedOwner =
+		ResetSkirmishAIFeedbackForOwnerChange(state, false);
+	CHECK(unchangedOwner.recentLossCount == 1);
+	CHECK(unchangedOwner.recentPathFailureCount == 1);
+	SkirmishAIFeedbackState changedOwner =
+		ResetSkirmishAIFeedbackForOwnerChange(state, true);
+	CHECK(changedOwner.recentLossCount == 0);
+	CHECK(changedOwner.recentPathFailureCount == 0);
+	CHECK(changedOwner.lastLossFrame == 0);
+	CHECK(changedOwner.lastPathFailureFrame == 0);
+	CHECK(changedOwner.nextDecayFrame == 0);
+	CHECK(!changedOwner.hasPathFailureFrame);
+
+	CHECK(ShouldRecordSkirmishAITeamLoss(true, true, true, false));
+	CHECK(!ShouldRecordSkirmishAITeamLoss(false, true, true, false));
+	CHECK(!ShouldRecordSkirmishAITeamLoss(true, false, true, false));
+	CHECK(!ShouldRecordSkirmishAITeamLoss(true, true, false, false));
+	CHECK(!ShouldRecordSkirmishAITeamLoss(true, true, true, true));
+	CHECK(ShouldRecordSkirmishAIPathFailure(true, true, true, false, false, false, false));
+	CHECK(ShouldRecordSkirmishAIPathFailure(true, true, false, true, false, false, false));
+	CHECK(!ShouldRecordSkirmishAIPathFailure(false, true, true, false, false, false, false));
+	CHECK(!ShouldRecordSkirmishAIPathFailure(true, false, true, false, false, false, false));
+	CHECK(!ShouldRecordSkirmishAIPathFailure(true, true, false, false, false, false, false));
+	CHECK(!ShouldRecordSkirmishAIPathFailure(true, true, true, false, true, false, false));
+	CHECK(!ShouldRecordSkirmishAIPathFailure(true, true, true, false, false, true, false));
+	CHECK(!ShouldRecordSkirmishAIPathFailure(true, true, true, false, false, false, true));
+
+	SkirmishAIFeedbackState oldState = GetSkirmishAIFeedbackSnapshotState(
+		1, 3, 2, 10, 20, 30, true);
+	CHECK(oldState.recentLossCount == 0);
+	CHECK(oldState.recentPathFailureCount == 0);
+	CHECK(oldState.lastLossFrame == 0);
+	CHECK(oldState.lastPathFailureFrame == 0);
+	CHECK(oldState.nextDecayFrame == 0);
+	CHECK(!oldState.hasPathFailureFrame);
+	SkirmishAIFeedbackState newState = GetSkirmishAIFeedbackSnapshotState(
+		2, 3, 2, 10, 20, 30, true);
+	CHECK(newState.recentLossCount == 3);
+	CHECK(newState.recentPathFailureCount == 2);
+	CHECK(newState.lastLossFrame == 10);
+	CHECK(newState.lastPathFailureFrame == 20);
+	CHECK(newState.nextDecayFrame == 30);
+	CHECK(newState.hasPathFailureFrame);
+}
+
 int main(int argc, char **argv)
 {
 	initMemoryManager();
@@ -672,6 +802,7 @@ int main(int argc, char **argv)
 	TestSkirmishAICorrectnessPolicies();
 	TestSkirmishAIProductionPolicies();
 	TestSkirmishAITargetingPolicies();
+	TestSkirmishAIFeedbackPolicies();
 	TestFrameRateLimitCpuUsage();
 
 	if (s_failures != 0)

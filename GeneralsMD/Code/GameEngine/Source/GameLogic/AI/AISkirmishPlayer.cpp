@@ -985,6 +985,7 @@ Bool AISkirmishPlayer::selectTeamToBuild()
 	for (teamIt = m_player->getPlayerTeams()->begin(); teamIt != m_player->getPlayerTeams()->end(); ++teamIt) {
 		SkirmishProductionCandidate candidate;
 		candidate.prototype = *teamIt;
+		candidate.prototype->decaySkirmishAIFeedback(TheGameLogic->getFrame());
 		if (!isAdaptiveProductionCandidate(
 			candidate.prototype, &candidate.costRange, &candidate.factoryWaitFrames))
 			continue;
@@ -1041,8 +1042,8 @@ Bool AISkirmishPlayer::selectTeamToBuild()
 			input.factoryWaitFrames = candidateIt->factoryWaitFrames;
 			input.logicFramesPerSecond = LOGICFRAMES_PER_SECOND;
 			input.routeClass = classifyTeamRoute(prototype, &routeTarget, hasRouteTarget);
-			input.recentLossCount = 0;
-			input.recentPathFailureCount = 0;
+			input.recentLossCount = prototype->getRecentSkirmishAILossCount();
+			input.recentPathFailureCount = prototype->getRecentSkirmishAIPathFailureCount();
 			input.difficulty = difficulty;
 			SkirmishAITeamScoreResult score = ScoreSkirmishAITeam(input);
 

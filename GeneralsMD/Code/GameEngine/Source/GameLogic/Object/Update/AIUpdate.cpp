@@ -68,12 +68,42 @@
 #include "GameLogic/PartitionManager.h"
 #include "GameLogic/PolygonTrigger.h"
 #include "GameLogic/ScriptEngine.h"
+#include "GameLogic/SkirmishAIDecision.h"
 #include "GameLogic/SkirmishAILiveness.h"
 #include "GameLogic/TurretAI.h"
 #include "GameLogic/Weapon.h"
 #include "Common/Radar.h"									// For TheRadar
 
 #define SLEEPY_AI
+
+namespace
+{
+void RecordSkirmishAIPathFailureForObject(
+	Object *object,
+	Bool isGroundMovement,
+	Bool isFinalPath,
+	Bool isApproachPath,
+	Bool isSafePath,
+	Bool isAttackPathFallback,
+	Bool pathFound)
+{
+	Team *team = object ? object->getTeam() : nullptr;
+	const TeamPrototype *prototype = team ? team->getPrototype() : nullptr;
+	Player *owner = prototype ? prototype->getControllingPlayer() : nullptr;
+	if (!prototype || !ShouldRecordSkirmishAIPathFailure(
+		owner && owner->isSkirmishAIPlayer(),
+		isGroundMovement,
+		isFinalPath,
+		isApproachPath,
+		isSafePath,
+		isAttackPathFallback,
+		pathFound))
+	{
+		return;
+	}
+	prototype->recordSkirmishAIPathFailure(TheGameLogic->getFrame());
+}
+}
 
 
 //-------------------------------------------------------------------------------------------------
@@ -428,12 +458,15 @@ void AIUpdateInterface::doPathfind( PathfindServicesInterface *pathfinder )
 		destroyPath();
 		m_path = pathfinder->findClosestPath(getObject(), m_locomotorSet, getObject()->getPosition(),
 			&m_requestedDestination, m_isBlockedAndStuck, 0.2f, FALSE );
+		RecordSkirmishAIPathFailureForObject(
+			getObject(), isDoingGroundMovement(), m_isFinalGoal, TRUE, FALSE, FALSE, m_path != nullptr);
 		if (isDoingGroundMovement() && getPath()) {
 			TheAI->pathfinder()->updateGoal(getObject(), getPath()->getLastNode()->getPosition(),
 				getPath()->getLastNode()->getLayer());
 		}
 		return;
 	}
+	Bool attackPathFallback = m_isAttackPath;
 	if (m_isAttackPath) {
 		Object *victim = nullptr;
 		if (m_requestedVictimID != INVALID_ID) {
@@ -457,7 +490,10 @@ void AIUpdateInterface::doPathfind( PathfindServicesInterface *pathfinder )
 			ignoreObstacle(victim);
 		}
 	}
-	computePath(pathfinder, &m_requestedDestination);
+	Bool pathFound = computePath(pathfinder, &m_requestedDestination);
+	RecordSkirmishAIPathFailureForObject(
+		getObject(), isDoingGroundMovement(), m_isFinalGoal, FALSE, FALSE,
+		attackPathFallback, pathFound);
 	if (m_isFinalGoal && isDoingGroundMovement() && getPath()) {
 		TheAI->pathfinder()->updateGoal(getObject(), getPath()->getLastNode()->getPosition(),
 			getPath()->getLastNode()->getLayer());

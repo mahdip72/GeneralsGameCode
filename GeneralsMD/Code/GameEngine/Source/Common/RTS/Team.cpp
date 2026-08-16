@@ -49,6 +49,7 @@
 #include "GameLogic/Module/AIUpdate.h"
 #include "GameLogic/PartitionManager.h"
 #include "GameLogic/ScriptActions.h"
+#include "GameLogic/SkirmishAIDecision.h"
 #include "GameLogic/ScriptEngine.h"
 
 
@@ -340,6 +341,7 @@ Team *TeamFactory::createInactiveTeam(const AsciiString& name)
 	{
 		t = tp->getFirstItemIn_TeamInstanceList();
 		if (t) {
+			t->beginSkirmishAIFormation();
 			if (tp->getTemplateInfo()->m_executeActions) {
 				const Script *script = TheScriptEngine->findScriptByName(tp->getTemplateInfo()->m_productionCondition);
 				if (script) {
@@ -367,7 +369,9 @@ Team *TeamFactory::createTeam(const AsciiString& name)
 	Team *t = createInactiveTeam(name);
 
 	if (t)
+	{
 		t->setActive();
+	}
 
 	return t;
 }
@@ -383,7 +387,10 @@ Team *TeamFactory::createTeamOnPrototype( TeamPrototype *prototype )
 	{
 		t = prototype->getFirstItemIn_TeamInstanceList();
 		if( t )
+		{
+			t->setActive();
 			return t;
+		}
 	}
 	t = newInstance(Team)( prototype, ++m_uniqueTeamID );
 	t->setActive();
@@ -614,7 +621,13 @@ fclose( fp );
 // ------------------------------------------------------------------------
 // ------------------------------------------------------------------------
 TeamTemplateInfo::TeamTemplateInfo(Dict *d) :
-	m_numUnitsInfo(0)
+	m_numUnitsInfo(0),
+	m_recentSkirmishAILossCount(0),
+	m_recentSkirmishAIPathFailureCount(0),
+	m_lastSkirmishAILossFrame(0),
+	m_lastSkirmishAIPathFailureFrame(0),
+	m_nextSkirmishAIFeedbackDecayFrame(0),
+	m_hasSkirmishAIPathFailureFrame(false)
 {
 	Bool exists;
 	Int min, max;
@@ -771,18 +784,47 @@ void TeamTemplateInfo::crc( Xfer *xfer )
 // ------------------------------------------------------------------------
 /** Xfer method
 	* Version Info:
-	* 1: Initial version */
+	* 1: Initial version
+	* 2: Persist bounded skirmish AI outcome and path feedback. */
 // ------------------------------------------------------------------------
 void TeamTemplateInfo::xfer( Xfer *xfer )
 {
 
 	// version
-	XferVersion currentVersion = 1;
+	XferVersion currentVersion = 2;
 	XferVersion version = currentVersion;
 	xfer->xferVersion( &version, currentVersion );
 
 	// xfer the production priority
 	xfer->xferInt( &m_productionPriority );
+
+	if (version >= 2)
+	{
+		xfer->xferInt(&m_recentSkirmishAILossCount);
+		xfer->xferInt(&m_recentSkirmishAIPathFailureCount);
+		xfer->xferUnsignedInt(&m_lastSkirmishAILossFrame);
+		xfer->xferUnsignedInt(&m_lastSkirmishAIPathFailureFrame);
+		xfer->xferUnsignedInt(&m_nextSkirmishAIFeedbackDecayFrame);
+		xfer->xferBool(&m_hasSkirmishAIPathFailureFrame);
+	}
+
+	if (xfer->getXferMode() == XFER_LOAD)
+	{
+		SkirmishAIFeedbackState state = GetSkirmishAIFeedbackSnapshotState(
+			version,
+			m_recentSkirmishAILossCount,
+			m_recentSkirmishAIPathFailureCount,
+			m_lastSkirmishAILossFrame,
+			m_lastSkirmishAIPathFailureFrame,
+			m_nextSkirmishAIFeedbackDecayFrame,
+			m_hasSkirmishAIPathFailureFrame);
+		m_recentSkirmishAILossCount = state.recentLossCount;
+		m_recentSkirmishAIPathFailureCount = state.recentPathFailureCount;
+		m_lastSkirmishAILossFrame = state.lastLossFrame;
+		m_lastSkirmishAIPathFailureFrame = state.lastPathFailureFrame;
+		m_nextSkirmishAIFeedbackDecayFrame = state.nextDecayFrame;
+		m_hasSkirmishAIPathFailureFrame = state.hasPathFailureFrame;
+	}
 
 }
 
@@ -883,6 +925,7 @@ void TeamPrototype::setControllingPlayer(Player *newController)
 	if (!newController) {
 		return;
 	}
+	Bool ownerChanged = m_owningPlayer != newController;
 
 	if (m_owningPlayer)
 		m_owningPlayer->removeTeamFromList(this);
@@ -891,6 +934,22 @@ void TeamPrototype::setControllingPlayer(Player *newController)
 
 	// impossible to get here with a nullptr pointer.
 	m_owningPlayer->addTeamToList(this);
+
+	SkirmishAIFeedbackState state = GetSkirmishAIFeedbackSnapshotState(
+		2,
+		m_teamTemplate.m_recentSkirmishAILossCount,
+		m_teamTemplate.m_recentSkirmishAIPathFailureCount,
+		m_teamTemplate.m_lastSkirmishAILossFrame,
+		m_teamTemplate.m_lastSkirmishAIPathFailureFrame,
+		m_teamTemplate.m_nextSkirmishAIFeedbackDecayFrame,
+		m_teamTemplate.m_hasSkirmishAIPathFailureFrame);
+	state = ResetSkirmishAIFeedbackForOwnerChange(state, ownerChanged);
+	m_teamTemplate.m_recentSkirmishAILossCount = state.recentLossCount;
+	m_teamTemplate.m_recentSkirmishAIPathFailureCount = state.recentPathFailureCount;
+	m_teamTemplate.m_lastSkirmishAILossFrame = state.lastLossFrame;
+	m_teamTemplate.m_lastSkirmishAIPathFailureFrame = state.lastPathFailureFrame;
+	m_teamTemplate.m_nextSkirmishAIFeedbackDecayFrame = state.nextDecayFrame;
+	m_teamTemplate.m_hasSkirmishAIPathFailureFrame = state.hasPathFailureFrame;
 }
 
 // ------------------------------------------------------------------------
@@ -950,6 +1009,104 @@ void TeamPrototype::increaseAIPriorityForSuccess() const
 void TeamPrototype::decreaseAIPriorityForFailure() const
 {
 	m_teamTemplate.m_productionPriority -= m_teamTemplate.m_productionPriorityFailureDecrease;
+}
+
+// ------------------------------------------------------------------------
+void TeamPrototype::decaySkirmishAIFeedback(UnsignedInt currentFrame) const
+{
+	if (!m_owningPlayer || !m_owningPlayer->isSkirmishAIPlayer())
+		return;
+	SkirmishAIFeedbackState state = GetSkirmishAIFeedbackSnapshotState(
+		2,
+		m_teamTemplate.m_recentSkirmishAILossCount,
+		m_teamTemplate.m_recentSkirmishAIPathFailureCount,
+		m_teamTemplate.m_lastSkirmishAILossFrame,
+		m_teamTemplate.m_lastSkirmishAIPathFailureFrame,
+		m_teamTemplate.m_nextSkirmishAIFeedbackDecayFrame,
+		m_teamTemplate.m_hasSkirmishAIPathFailureFrame);
+	state = DecaySkirmishAIFeedback(
+		state, currentFrame, 30 * LOGICFRAMES_PER_SECOND);
+	m_teamTemplate.m_recentSkirmishAILossCount = state.recentLossCount;
+	m_teamTemplate.m_recentSkirmishAIPathFailureCount = state.recentPathFailureCount;
+	m_teamTemplate.m_lastSkirmishAILossFrame = state.lastLossFrame;
+	m_teamTemplate.m_lastSkirmishAIPathFailureFrame = state.lastPathFailureFrame;
+	m_teamTemplate.m_nextSkirmishAIFeedbackDecayFrame = state.nextDecayFrame;
+	m_teamTemplate.m_hasSkirmishAIPathFailureFrame = state.hasPathFailureFrame;
+}
+
+// ------------------------------------------------------------------------
+void TeamPrototype::recordSkirmishAILoss(UnsignedInt currentFrame) const
+{
+	if (!m_owningPlayer || !m_owningPlayer->isSkirmishAIPlayer())
+		return;
+	decaySkirmishAIFeedback(currentFrame);
+	SkirmishAIFeedbackState state = GetSkirmishAIFeedbackSnapshotState(
+		2,
+		m_teamTemplate.m_recentSkirmishAILossCount,
+		m_teamTemplate.m_recentSkirmishAIPathFailureCount,
+		m_teamTemplate.m_lastSkirmishAILossFrame,
+		m_teamTemplate.m_lastSkirmishAIPathFailureFrame,
+		m_teamTemplate.m_nextSkirmishAIFeedbackDecayFrame,
+		m_teamTemplate.m_hasSkirmishAIPathFailureFrame);
+	state = RecordSkirmishAILoss(
+		state, currentFrame, 30 * LOGICFRAMES_PER_SECOND);
+	m_teamTemplate.m_recentSkirmishAILossCount = state.recentLossCount;
+	m_teamTemplate.m_recentSkirmishAIPathFailureCount = state.recentPathFailureCount;
+	m_teamTemplate.m_lastSkirmishAILossFrame = state.lastLossFrame;
+	m_teamTemplate.m_lastSkirmishAIPathFailureFrame = state.lastPathFailureFrame;
+	m_teamTemplate.m_nextSkirmishAIFeedbackDecayFrame = state.nextDecayFrame;
+	m_teamTemplate.m_hasSkirmishAIPathFailureFrame = state.hasPathFailureFrame;
+}
+
+// ------------------------------------------------------------------------
+void TeamPrototype::recordSkirmishAIPathFailure(UnsignedInt currentFrame) const
+{
+	if (!m_owningPlayer || !m_owningPlayer->isSkirmishAIPlayer())
+		return;
+	decaySkirmishAIFeedback(currentFrame);
+	SkirmishAIFeedbackState state = GetSkirmishAIFeedbackSnapshotState(
+		2,
+		m_teamTemplate.m_recentSkirmishAILossCount,
+		m_teamTemplate.m_recentSkirmishAIPathFailureCount,
+		m_teamTemplate.m_lastSkirmishAILossFrame,
+		m_teamTemplate.m_lastSkirmishAIPathFailureFrame,
+		m_teamTemplate.m_nextSkirmishAIFeedbackDecayFrame,
+		m_teamTemplate.m_hasSkirmishAIPathFailureFrame);
+	state = RecordSkirmishAIPathFailure(
+		state,
+		currentFrame,
+		5 * LOGICFRAMES_PER_SECOND,
+		30 * LOGICFRAMES_PER_SECOND);
+	m_teamTemplate.m_recentSkirmishAILossCount = state.recentLossCount;
+	m_teamTemplate.m_recentSkirmishAIPathFailureCount = state.recentPathFailureCount;
+	m_teamTemplate.m_lastSkirmishAILossFrame = state.lastLossFrame;
+	m_teamTemplate.m_lastSkirmishAIPathFailureFrame = state.lastPathFailureFrame;
+	m_teamTemplate.m_nextSkirmishAIFeedbackDecayFrame = state.nextDecayFrame;
+	m_teamTemplate.m_hasSkirmishAIPathFailureFrame = state.hasPathFailureFrame;
+}
+
+// ------------------------------------------------------------------------
+void TeamPrototype::recordSkirmishAISuccess(UnsignedInt currentFrame) const
+{
+	if (!m_owningPlayer || !m_owningPlayer->isSkirmishAIPlayer())
+		return;
+	decaySkirmishAIFeedback(currentFrame);
+	SkirmishAIFeedbackState state = GetSkirmishAIFeedbackSnapshotState(
+		2,
+		m_teamTemplate.m_recentSkirmishAILossCount,
+		m_teamTemplate.m_recentSkirmishAIPathFailureCount,
+		m_teamTemplate.m_lastSkirmishAILossFrame,
+		m_teamTemplate.m_lastSkirmishAIPathFailureFrame,
+		m_teamTemplate.m_nextSkirmishAIFeedbackDecayFrame,
+		m_teamTemplate.m_hasSkirmishAIPathFailureFrame);
+	state = ApplySkirmishAITeamSuccess(
+		state, currentFrame, 30 * LOGICFRAMES_PER_SECOND);
+	m_teamTemplate.m_recentSkirmishAILossCount = state.recentLossCount;
+	m_teamTemplate.m_recentSkirmishAIPathFailureCount = state.recentPathFailureCount;
+	m_teamTemplate.m_lastSkirmishAILossFrame = state.lastLossFrame;
+	m_teamTemplate.m_lastSkirmishAIPathFailureFrame = state.lastPathFailureFrame;
+	m_teamTemplate.m_nextSkirmishAIFeedbackDecayFrame = state.nextDecayFrame;
+	m_teamTemplate.m_hasSkirmishAIPathFailureFrame = state.hasPathFailureFrame;
 }
 
 // ------------------------------------------------------------------------
@@ -1307,6 +1464,7 @@ Team::Team(TeamPrototype *proto, TeamID id ) :
 	m_proto(proto),
 	m_enteredOrExited(false),
 	m_active(false),
+	m_skirmishAILossFeedbackEligible(false),
 	m_seeEnemy(false),
 	m_prevSeeEnemy(false),
 	m_checkEnemySighted(false),
@@ -1923,6 +2081,18 @@ void Team::notifyTeamOfObjectDeath()
 	const TeamTemplateInfo *pInfo = m_proto->getTemplateInfo();
 	if (!pInfo) {
 		return;
+	}
+	Player *owner = m_proto->getControllingPlayer();
+	if (ShouldRecordSkirmishAITeamLoss(
+		owner && owner->isSkirmishAIPlayer(),
+		m_active,
+		m_skirmishAILossFeedbackEligible,
+		hasAnyObjects()))
+	{
+		// Consume eligibility before recording because die modules can recurse through
+		// same-team spawned or contained objects.
+		m_skirmishAILossFeedbackEligible = false;
+		m_proto->recordSkirmishAILoss(TheGameLogic->getFrame());
 	}
 
 	if (pInfo->m_scriptOnUnitDestroyed.isEmpty()) {
@@ -2566,13 +2736,14 @@ void Team::crc( Xfer *xfer )
 // ------------------------------------------------------------------------------------------------
 /** Xfer Method
 	* Version Info:
-	* 1: Initial version */
+	* 1: Initial version
+	* 2: Persist the per-formation skirmish AI loss latch. */
 // ------------------------------------------------------------------------------------------------
 void Team::xfer( Xfer *xfer )
 {
 
 	// version
-	XferVersion currentVersion = 1;
+	XferVersion currentVersion = 2;
 	XferVersion version = currentVersion;
 	xfer->xferVersion( &version, currentVersion );
 
@@ -2641,6 +2812,10 @@ void Team::xfer( Xfer *xfer )
 
 	// active status
 	xfer->xferBool( &m_active );
+	if (version >= 2)
+		xfer->xferBool(&m_skirmishAILossFeedbackEligible);
+	else if (xfer->getXferMode() == XFER_LOAD)
+		m_skirmishAILossFeedbackEligible = m_active;
 
 	// created flag
 	xfer->xferBool( &m_created );

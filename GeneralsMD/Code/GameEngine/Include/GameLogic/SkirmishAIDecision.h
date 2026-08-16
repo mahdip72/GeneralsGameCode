@@ -93,6 +93,16 @@ struct SkirmishAITargetSnapshotState
 	unsigned int nextEvaluationFrame;
 };
 
+struct SkirmishAIFeedbackState
+{
+	int recentLossCount;
+	int recentPathFailureCount;
+	unsigned int lastLossFrame;
+	unsigned int lastPathFailureFrame;
+	unsigned int nextDecayFrame;
+	bool hasPathFailureFrame;
+};
+
 inline int ClampSkirmishAIDecisionValue(int value, int minimum, int maximum)
 {
 	if (value < minimum)
@@ -207,6 +217,169 @@ inline SkirmishAITargetSnapshotState GetSkirmishAITargetSnapshotState(
 		result.nextEvaluationFrame = storedNextEvaluationFrame;
 	}
 	return result;
+}
+
+inline SkirmishAIFeedbackState MakeSkirmishAIFeedbackState()
+{
+	SkirmishAIFeedbackState result;
+	result.recentLossCount = 0;
+	result.recentPathFailureCount = 0;
+	result.lastLossFrame = 0;
+	result.lastPathFailureFrame = 0;
+	result.nextDecayFrame = 0;
+	result.hasPathFailureFrame = false;
+	return result;
+}
+
+inline bool HasSkirmishAIFrameArrived(unsigned int currentFrame, unsigned int targetFrame)
+{
+	return (int)(currentFrame - targetFrame) >= 0;
+}
+
+inline SkirmishAIFeedbackState GetSkirmishAIFeedbackSnapshotState(
+	int snapshotVersion,
+	int storedLossCount,
+	int storedPathFailureCount,
+	unsigned int storedLastLossFrame,
+	unsigned int storedLastPathFailureFrame,
+	unsigned int storedNextDecayFrame,
+	bool storedHasPathFailureFrame)
+{
+	if (snapshotVersion < 2)
+		return MakeSkirmishAIFeedbackState();
+
+	SkirmishAIFeedbackState result;
+	result.recentLossCount = ClampSkirmishAIDecisionValue(storedLossCount, 0, 3);
+	result.recentPathFailureCount = ClampSkirmishAIDecisionValue(
+		storedPathFailureCount, 0, 3);
+	result.lastLossFrame = storedLastLossFrame;
+	result.lastPathFailureFrame = storedLastPathFailureFrame;
+	result.nextDecayFrame = storedNextDecayFrame;
+	result.hasPathFailureFrame = storedHasPathFailureFrame;
+	return result;
+}
+
+inline SkirmishAIFeedbackState DecaySkirmishAIFeedback(
+	SkirmishAIFeedbackState state,
+	unsigned int currentFrame,
+	unsigned int decayIntervalFrames)
+{
+	if (decayIntervalFrames == 0)
+		return state;
+
+	if (state.recentLossCount <= 0 && state.recentPathFailureCount <= 0)
+	{
+		state.recentLossCount = 0;
+		state.recentPathFailureCount = 0;
+		if (state.nextDecayFrame != 0 &&
+			HasSkirmishAIFrameArrived(currentFrame, state.nextDecayFrame))
+		{
+			state.nextDecayFrame = 0;
+		}
+		return state;
+	}
+
+	if (!HasSkirmishAIFrameArrived(currentFrame, state.nextDecayFrame))
+		return state;
+
+	unsigned int elapsedFrames = currentFrame - state.nextDecayFrame;
+	unsigned int decaySteps = 1 + elapsedFrames / decayIntervalFrames;
+	if (decaySteps > 3)
+		decaySteps = 3;
+	state.recentLossCount -= (int)decaySteps;
+	state.recentPathFailureCount -= (int)decaySteps;
+	if (state.recentLossCount < 0)
+		state.recentLossCount = 0;
+	if (state.recentPathFailureCount < 0)
+		state.recentPathFailureCount = 0;
+	if (state.recentLossCount == 0 && state.recentPathFailureCount == 0)
+		state.nextDecayFrame = 0;
+	else
+		state.nextDecayFrame += decaySteps * decayIntervalFrames;
+	return state;
+}
+
+inline SkirmishAIFeedbackState RecordSkirmishAILoss(
+	SkirmishAIFeedbackState state,
+	unsigned int currentFrame,
+	unsigned int decayIntervalFrames)
+{
+	state = DecaySkirmishAIFeedback(state, currentFrame, decayIntervalFrames);
+	bool hadFeedback = state.recentLossCount > 0 ||
+		state.recentPathFailureCount > 0;
+	state.recentLossCount = ClampSkirmishAIDecisionValue(
+		state.recentLossCount + 1, 0, 3);
+	state.lastLossFrame = currentFrame;
+	if (!hadFeedback && decayIntervalFrames != 0)
+		state.nextDecayFrame = currentFrame + decayIntervalFrames;
+	return state;
+}
+
+inline SkirmishAIFeedbackState RecordSkirmishAIPathFailure(
+	SkirmishAIFeedbackState state,
+	unsigned int currentFrame,
+	unsigned int rateLimitFrames,
+	unsigned int decayIntervalFrames)
+{
+	state = DecaySkirmishAIFeedback(state, currentFrame, decayIntervalFrames);
+	if (state.hasPathFailureFrame && rateLimitFrames != 0 &&
+		currentFrame - state.lastPathFailureFrame < rateLimitFrames)
+	{
+		return state;
+	}
+	bool hadFeedback = state.recentLossCount > 0 ||
+		state.recentPathFailureCount > 0;
+	state.recentPathFailureCount = ClampSkirmishAIDecisionValue(
+		state.recentPathFailureCount + 1, 0, 3);
+	state.lastPathFailureFrame = currentFrame;
+	state.hasPathFailureFrame = true;
+	if (!hadFeedback && decayIntervalFrames != 0)
+		state.nextDecayFrame = currentFrame + decayIntervalFrames;
+	return state;
+}
+
+inline SkirmishAIFeedbackState ApplySkirmishAITeamSuccess(
+	SkirmishAIFeedbackState state,
+	unsigned int currentFrame,
+	unsigned int decayIntervalFrames)
+{
+	state = DecaySkirmishAIFeedback(state, currentFrame, decayIntervalFrames);
+	if (state.recentLossCount > 0)
+		--state.recentLossCount;
+	if (state.recentPathFailureCount > 0)
+		--state.recentPathFailureCount;
+	if (state.recentLossCount == 0 && state.recentPathFailureCount == 0)
+		state.nextDecayFrame = 0;
+	return state;
+}
+
+inline SkirmishAIFeedbackState ResetSkirmishAIFeedbackForOwnerChange(
+	SkirmishAIFeedbackState state, bool ownerChanged)
+{
+	return ownerChanged ? MakeSkirmishAIFeedbackState() : state;
+}
+
+inline bool ShouldRecordSkirmishAITeamLoss(
+	bool isSkirmishOwner,
+	bool isActiveTeam,
+	bool isFeedbackEligible,
+	bool hasRemainingObjects)
+{
+	return isSkirmishOwner && isActiveTeam && isFeedbackEligible &&
+		!hasRemainingObjects;
+}
+
+inline bool ShouldRecordSkirmishAIPathFailure(
+	bool isSkirmishOwner,
+	bool isGroundMovement,
+	bool isFinalPath,
+	bool isApproachPath,
+	bool isSafePath,
+	bool isAttackPathFallback,
+	bool pathFound)
+{
+	return isSkirmishOwner && isGroundMovement && !pathFound && !isSafePath &&
+		!isAttackPathFallback && (isFinalPath || isApproachPath);
 }
 
 inline int AddSkirmishAICostValue(int total, int unitCost, int count)
