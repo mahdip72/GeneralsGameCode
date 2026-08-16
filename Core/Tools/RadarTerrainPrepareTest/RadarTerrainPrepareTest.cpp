@@ -951,6 +951,53 @@ static int testWorkerSourceAudit()
 	return result;
 }
 
+/*
+ * The owner-flow seam is deliberately source-level: constructing W3DRadar
+ * would require a live D3D device and title globals.  Keep the assertions
+ * focused on the safety boundary that can be checked without that runtime.
+ */
+static int testOwnerFlowSourceAudit()
+{
+	const char *testName = "testOwnerFlowSourceAudit";
+	char radarPath[1024];
+	static char source[131072];
+	FILE *sourceFile;
+	long sourceLength;
+	const char *const required[] = {
+		"static Bool mapRadarTerrainFormat( WW3DFormat surfaceFormat",
+		"case WW3D_FORMAT_R8G8B8:",
+		"case WW3D_FORMAT_X8R8G8B8:",
+		"case WW3D_FORMAT_R5G6B5:",
+		"case WW3D_FORMAT_X1R5G5B5:",
+		"*kernelFormat = RADAR_TERRAIN_FORMAT_UNKNOWN;",
+		"class RadarTerrainLeaseGuard",
+		"radarLease.acquire();",
+		"mapRadarTerrainFormat( surfaceDesc.Format, &formatCode )",
+		"static Bool uploadPreparedRadarTerrain( SurfaceClass *surface",
+		"unsignedPitch >= snapshot.rowBytes",
+		"surface->Unlock();"
+	};
+	unsigned index;
+
+	CHECK(testName, makeSourcePathNearTest(radarPath, sizeof(radarPath),
+		"..\\..\\GameEngineDevice\\Source\\W3DDevice\\Common\\System\\W3DRadar.cpp"));
+	sourceFile = fopen(radarPath, "rb");
+	CHECK(testName, sourceFile != 0);
+	fseek(sourceFile, 0, SEEK_END);
+	sourceLength = ftell(sourceFile);
+	fseek(sourceFile, 0, SEEK_SET);
+	CHECK(testName, sourceLength > 0 &&
+		sourceLength < static_cast<long>(sizeof(source)));
+	CHECK(testName, fread(source, 1, static_cast<size_t>(sourceLength),
+		sourceFile) == static_cast<size_t>(sourceLength));
+	fclose(sourceFile);
+	source[sourceLength] = '\0';
+
+	for(index = 0; index < sizeof(required) / sizeof(required[0]); ++index)
+		CHECK(testName, strstr(source, required[index]) != 0);
+	return 0;
+}
+
 int main()
 {
 	int result = 0;
@@ -975,5 +1022,6 @@ int main()
 	result |= testPrepareServiceShutdownAfterRunRestartsCleanly();
 	result |= testPrepareServiceRollbackThenRetryAllocationFailureIsClean();
 	result |= testWorkerSourceAudit();
+	result |= testOwnerFlowSourceAudit();
 	return result;
 }

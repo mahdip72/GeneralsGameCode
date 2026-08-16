@@ -58,6 +58,7 @@
 #include "WW3D2/dx8caps.h"
 #include "WWMath/vector2i.h"
 
+#include <limits.h>
 #include <string.h>
 
 
@@ -1050,6 +1051,120 @@ void W3DRadar::newMap( TerrainLogic *terrain )
 
 }
 
+// Map the owner-visible surface enum explicitly.  The radar kernel has its
+// own D3D-free format codes; relying on matching enum ordinals would make a
+// future WW3DFormat insertion silently change the bytes written by workers.
+static Bool mapRadarTerrainFormat( WW3DFormat surfaceFormat,
+	unsigned *kernelFormat )
+{
+	if( kernelFormat == nullptr )
+		return FALSE;
+
+	switch( surfaceFormat )
+	{
+	case WW3D_FORMAT_R8G8B8:
+		*kernelFormat = RADAR_TERRAIN_FORMAT_R8G8B8;
+		return TRUE;
+	case WW3D_FORMAT_X8R8G8B8:
+		*kernelFormat = RADAR_TERRAIN_FORMAT_X8R8G8B8;
+		return TRUE;
+	case WW3D_FORMAT_R5G6B5:
+		*kernelFormat = RADAR_TERRAIN_FORMAT_R5G6B5;
+		return TRUE;
+	case WW3D_FORMAT_X1R5G5B5:
+		*kernelFormat = RADAR_TERRAIN_FORMAT_X1R5G5B5;
+		return TRUE;
+	default:
+		*kernelFormat = RADAR_TERRAIN_FORMAT_UNKNOWN;
+		return FALSE;
+	}
+}
+
+// A staged upload is an owner-only operation.  Locking, pitch validation,
+// copying, and unlocking are kept together so a rejected pitch cannot expose
+// partially prepared rows or leave a successful lock held.
+static Bool uploadPreparedRadarTerrain( SurfaceClass *surface,
+	const RadarTerrainSnapshot &snapshot, const unsigned char *output )
+{
+	if( surface == nullptr || output == nullptr || snapshot.width == 0 ||
+		snapshot.height == 0 || snapshot.rowBytes == 0 )
+	{
+		return FALSE;
+	}
+
+	int pitch = 0;
+	void *bits = surface->Lock( &pitch );
+	if( bits == nullptr )
+		return FALSE;
+
+	const unsigned unsignedPitch = pitch > 0 ? static_cast<unsigned>(pitch) : 0;
+	const Bool pitchValid = pitch > 0 &&
+		unsignedPitch >= snapshot.rowBytes &&
+		(snapshot.height <= 1 ||
+			unsignedPitch <= UINT_MAX / (snapshot.height - 1));
+
+	if( pitchValid )
+	{
+		unsigned y;
+		for( y = 0; y < snapshot.height; ++y )
+		{
+			unsigned char *destination = static_cast<unsigned char *>(bits) +
+				y * unsignedPitch;
+			const unsigned char *source = output + y * snapshot.rowBytes;
+			memcpy( destination, source, snapshot.rowBytes );
+		}
+	}
+
+	// Every non-null Lock result is paired with exactly one Unlock, including
+	// invalid/negative pitches.  A rejected pitch falls through to legacy code.
+	surface->Unlock();
+	return pitchValid;
+}
+
+class RadarTerrainLeaseGuard
+{
+public:
+	RadarTerrainLeaseGuard( RadarTerrainPrepareService &service,
+		unsigned consumerId )
+		: m_service( &service ), m_consumerId( consumerId ), m_active( FALSE )
+	{
+	}
+
+	~RadarTerrainLeaseGuard()
+	{
+		release();
+	}
+
+	Bool acquire()
+	{
+		if( !m_active )
+			m_active = m_service->tryAcquire( m_consumerId ) ? TRUE : FALSE;
+		return m_active;
+	}
+
+	Bool isActive() const
+	{
+		return m_active;
+	}
+
+	void release()
+	{
+		if( m_active )
+		{
+			m_service->release( m_consumerId );
+			m_active = FALSE;
+		}
+	}
+
+private:
+	RadarTerrainLeaseGuard( const RadarTerrainLeaseGuard & );
+	RadarTerrainLeaseGuard &operator=( const RadarTerrainLeaseGuard & );
+
+	RadarTerrainPrepareService *m_service;
+	unsigned m_consumerId;
+	Bool m_active;
+};
+
 // ------------------------------------------------------------------------------------------------
 // Copy all live terrain/radar inputs needed by the D3D-free raster kernel.
 // This remains on the owner thread; the resulting batch contains no engine
@@ -1245,10 +1360,11 @@ void W3DRadar::buildTerrainTexture( TerrainLogic *terrain )
 	ASSERT_GAME_THREAD("W3DRadar::buildTerrainTexture radar preparation");
 	RadarTerrainPrepareService &prepareService =
 		GetRadarTerrainPrepareService();
-	bool radarLease = false;
-	const unsigned formatCode = static_cast<unsigned>(surfaceDesc.Format);
+	RadarTerrainLeaseGuard radarLease( prepareService, 1 );
+	unsigned formatCode = RADAR_TERRAIN_FORMAT_UNKNOWN;
 	if( surfaceDesc.Width == static_cast<unsigned>(m_textureWidth) &&
 		surfaceDesc.Height == static_cast<unsigned>(m_textureHeight) &&
+		mapRadarTerrainFormat( surfaceDesc.Format, &formatCode ) &&
 		batch.initialize( static_cast<unsigned>(m_textureWidth),
 			static_cast<unsigned>(m_textureHeight), formatCode ) &&
 		captureTerrainBatch( terrain, &batch, waterColor ) &&
@@ -1256,8 +1372,8 @@ void W3DRadar::buildTerrainTexture( TerrainLogic *terrain )
 	{
 		RadarTerrainSnapshot &preparedSnapshot = batch.mutableSnapshot();
 		bool prepared = false;
-		radarLease = prepareService.tryAcquire( 1 );
-		if( radarLease )
+		radarLease.acquire();
+		if( radarLease.isActive() )
 		{
 			prepared = prepareService.runRows( &preparedSnapshot,
 				batch.output(), 0, preparedSnapshot.height );
@@ -1278,34 +1394,13 @@ void W3DRadar::buildTerrainTexture( TerrainLogic *terrain )
 
 		if( prepared )
 		{
-			int stagedPitch = 0;
-			void *stagedBits = surface->Lock( &stagedPitch );
-			if( stagedBits != nullptr )
+			if( uploadPreparedRadarTerrain( surface, preparedSnapshot,
+				batch.output() ) )
 			{
-				if( stagedPitch > 0 &&
-					static_cast<unsigned>(stagedPitch) >= preparedSnapshot.rowBytes )
-				{
-					const unsigned stagedRowBytes = static_cast<unsigned>(stagedPitch);
-					unsigned stagedY;
-					for( stagedY = 0; stagedY < preparedSnapshot.height; ++stagedY )
-					{
-						unsigned char *destination = static_cast<unsigned char *>(stagedBits) +
-							stagedY * stagedRowBytes;
-						const unsigned char *source = batch.output() +
-							stagedY * preparedSnapshot.rowBytes;
-						memcpy( destination, source, preparedSnapshot.rowBytes );
-					}
-					surface->Unlock();
-					if( radarLease )
-						prepareService.release( 1 );
-					REF_PTR_RELEASE(surface);
-					return;
-				}
-				surface->Unlock();
+				REF_PTR_RELEASE(surface);
+				return;
 			}
 		}
-		if( radarLease )
-			prepareService.release( 1 );
 	}
 
 	int pitch;
