@@ -203,7 +203,7 @@ static int testRequiredFormatBytes()
 	return result;
 }
 
-static int testAllSurfaceFormatSizes()
+static int testOnlySupportedTerrainFormatSizes()
 {
 	struct FormatSize
 	{
@@ -213,37 +213,143 @@ static int testAllSurfaceFormatSizes()
 	const FormatSize formats[] = {
 		{ RADAR_TERRAIN_FORMAT_UNKNOWN, 0 },
 		{ RADAR_TERRAIN_FORMAT_R8G8B8, 3 },
-		{ RADAR_TERRAIN_FORMAT_A8R8G8B8, 4 },
+		{ RADAR_TERRAIN_FORMAT_A8R8G8B8, 0 },
 		{ RADAR_TERRAIN_FORMAT_X8R8G8B8, 4 },
 		{ RADAR_TERRAIN_FORMAT_R5G6B5, 2 },
 		{ RADAR_TERRAIN_FORMAT_X1R5G5B5, 2 },
-		{ RADAR_TERRAIN_FORMAT_A1R5G5B5, 2 },
-		{ RADAR_TERRAIN_FORMAT_A4R4G4B4, 2 },
-		{ RADAR_TERRAIN_FORMAT_R3G3B2, 1 },
-		{ RADAR_TERRAIN_FORMAT_A8, 1 },
-		{ RADAR_TERRAIN_FORMAT_A8R3G3B2, 2 },
-		{ RADAR_TERRAIN_FORMAT_X4R4G4B4, 2 },
-		{ RADAR_TERRAIN_FORMAT_A8P8, 2 },
-		{ RADAR_TERRAIN_FORMAT_P8, 1 },
-		{ RADAR_TERRAIN_FORMAT_L8, 1 },
-		{ RADAR_TERRAIN_FORMAT_A8L8, 2 },
-		{ RADAR_TERRAIN_FORMAT_A4L4, 1 },
-		{ RADAR_TERRAIN_FORMAT_U8V8, 2 },
-		{ RADAR_TERRAIN_FORMAT_L6V5U5, 2 },
-		{ RADAR_TERRAIN_FORMAT_X8L8V8U8, 4 },
+		{ RADAR_TERRAIN_FORMAT_A1R5G5B5, 0 },
+		{ RADAR_TERRAIN_FORMAT_A4R4G4B4, 0 },
+		{ RADAR_TERRAIN_FORMAT_R3G3B2, 0 },
+		{ RADAR_TERRAIN_FORMAT_A8, 0 },
+		{ RADAR_TERRAIN_FORMAT_A8R3G3B2, 0 },
+		{ RADAR_TERRAIN_FORMAT_X4R4G4B4, 0 },
+		{ RADAR_TERRAIN_FORMAT_A8P8, 0 },
+		{ RADAR_TERRAIN_FORMAT_P8, 0 },
+		{ RADAR_TERRAIN_FORMAT_L8, 0 },
+		{ RADAR_TERRAIN_FORMAT_A8L8, 0 },
+		{ RADAR_TERRAIN_FORMAT_A4L4, 0 },
+		{ RADAR_TERRAIN_FORMAT_U8V8, 0 },
+		{ RADAR_TERRAIN_FORMAT_L6V5U5, 0 },
+		{ RADAR_TERRAIN_FORMAT_X8L8V8U8, 0 },
 		{ RADAR_TERRAIN_FORMAT_DXT1, 0 },
 		{ RADAR_TERRAIN_FORMAT_DXT2, 0 },
 		{ RADAR_TERRAIN_FORMAT_DXT3, 0 },
 		{ RADAR_TERRAIN_FORMAT_DXT4, 0 },
 		{ RADAR_TERRAIN_FORMAT_DXT5, 0 }
 	};
-	const char *testName = "testAllSurfaceFormatSizes";
+	const char *testName = "testOnlySupportedTerrainFormatSizes";
 	unsigned index;
 	for (index = 0; index < sizeof(formats) / sizeof(formats[0]); ++index)
 	{
 		CHECK(testName, RadarTerrainBytesPerPixel(formats[index].formatCode) ==
 			formats[index].bytesPerPixel);
 	}
+	return 0;
+}
+
+static int testUnsupportedFormatsRejectWithoutWriting()
+{
+	const unsigned unsupported[] = {
+		RADAR_TERRAIN_FORMAT_UNKNOWN,
+		RADAR_TERRAIN_FORMAT_A8R8G8B8,
+		RADAR_TERRAIN_FORMAT_A1R5G5B5,
+		RADAR_TERRAIN_FORMAT_A4R4G4B4,
+		RADAR_TERRAIN_FORMAT_R3G3B2,
+		RADAR_TERRAIN_FORMAT_A8,
+		RADAR_TERRAIN_FORMAT_A8R3G3B2,
+		RADAR_TERRAIN_FORMAT_X4R4G4B4,
+		RADAR_TERRAIN_FORMAT_A8P8,
+		RADAR_TERRAIN_FORMAT_P8,
+		RADAR_TERRAIN_FORMAT_L8,
+		RADAR_TERRAIN_FORMAT_A8L8,
+		RADAR_TERRAIN_FORMAT_A4L4,
+		RADAR_TERRAIN_FORMAT_U8V8,
+		RADAR_TERRAIN_FORMAT_L6V5U5,
+		RADAR_TERRAIN_FORMAT_X8L8V8U8,
+		RADAR_TERRAIN_FORMAT_DXT1,
+		RADAR_TERRAIN_FORMAT_DXT2,
+		RADAR_TERRAIN_FORMAT_DXT3,
+		RADAR_TERRAIN_FORMAT_DXT4,
+		RADAR_TERRAIN_FORMAT_DXT5
+	};
+	const char *testName = "testUnsupportedFormatsRejectWithoutWriting";
+	RadarTerrainCellInput cell;
+	RadarTerrainSnapshot snapshot;
+	unsigned char output[8];
+	unsigned char expected[8];
+	unsigned index;
+
+	setCell(cell, 0.0f, 0.0f);
+	snapshot = makeSnapshot(&cell, 1, 1, 4,
+		RADAR_TERRAIN_FORMAT_A8R8G8B8, 4);
+	memset(expected, 0xA5, sizeof(expected));
+	for (index = 0; index < sizeof(unsupported) / sizeof(unsupported[0]); ++index)
+	{
+		snapshot.formatCode = unsupported[index];
+		memset(output, 0xA5, sizeof(output));
+		CHECK(testName, RadarTerrainBytesPerPixel(snapshot.formatCode) == 0);
+		CHECK(testName, !ShadeRadarRows(snapshot, output, 0, 1));
+		CHECK(testName, checkBytes(output, expected, sizeof(output),
+			testName) == 0);
+	}
+	return 0;
+}
+
+static int testHandAuthoredClippedAveragesAndBridgePrecedence()
+{
+	const char *testName =
+		"testHandAuthoredClippedAveragesAndBridgePrecedence";
+	const unsigned char cornerExpected[] = { 0x19, 0x7F, 0x85 };
+	const unsigned char edgeExpected[] = { 0x3F, 0x72, 0x59 };
+	const unsigned char centerExpected[] = { 0x46, 0x72, 0x6B };
+	const unsigned char bridgeExpected[] = { 0x00, 0x00, 0xFF };
+	RadarTerrainCellInput cells[9];
+	RadarTerrainSnapshot snapshot;
+	unsigned char output[27];
+
+	fillCells(cells, 3, 3);
+	setRgb(cells[0].terrainColor, 1.0f, 0.0f, 0.0f);
+	cells[0].groundZ = 10.0f;
+	setRgb(cells[1].terrainColor, 0.0f, 1.0f, 0.0f);
+	cells[1].groundZ = 20.0f;
+	setRgb(cells[2].terrainColor, 0.0f, 0.0f, 1.0f);
+	cells[2].groundZ = 0.0f;
+	setRgb(cells[3].terrainColor, 1.0f, 1.0f, 0.0f);
+	cells[3].groundZ = 20.0f;
+	setRgb(cells[4].terrainColor, 1.0f, 0.0f, 1.0f);
+	cells[4].groundZ = 0.0f;
+	setRgb(cells[5].terrainColor, 0.0f, 1.0f, 1.0f);
+	cells[5].groundZ = 10.0f;
+	setRgb(cells[6].terrainColor, 1.0f, 1.0f, 1.0f);
+	cells[6].groundZ = 20.0f;
+	setRgb(cells[7].terrainColor, 0.0f, 0.0f, 0.0f);
+	cells[7].groundZ = 0.0f;
+	setRgb(cells[8].terrainColor, 1.0f, 0.5f, 0.0f);
+	cells[8].groundZ = 10.0f;
+
+	snapshot = makeSnapshot(cells, 3, 3, 3,
+		RADAR_TERRAIN_FORMAT_R8G8B8, 9);
+	snapshot.terrainAverageZ = 10.0f;
+	snapshot.mapHighZ = 20.0f;
+	snapshot.mapLowZ = 0.0f;
+	memset(output, 0xA5, sizeof(output));
+	CHECK(testName, ShadeRadarRows(snapshot, output, 0, 3));
+	CHECK(testName, checkBytes(output, cornerExpected, 3, testName) == 0);
+	CHECK(testName, checkBytes(output + 3, edgeExpected, 3, testName) == 0);
+	CHECK(testName, checkBytes(output + 4 * 3, centerExpected, 3,
+		testName) == 0);
+
+	/* A center that is both underwater and on a live bridge must use bridge. */
+	fillCells(cells, 3, 3);
+	setRgb(snapshot.waterColor, 0.0f, 0.0f, 1.0f);
+	cells[4].workingBridge = 1;
+	cells[4].centerUnderwater = 1;
+	cells[4].bridgeHeight = 20.0f;
+	setRgb(cells[4].bridgeColor, 1.0f, 0.0f, 0.0f);
+	memset(output, 0xA5, sizeof(output));
+	CHECK(testName, ShadeRadarRows(snapshot, output, 0, 3));
+	CHECK(testName, checkBytes(output + 4 * 3, bridgeExpected, 3,
+		testName) == 0);
 	return 0;
 }
 
@@ -327,7 +433,9 @@ int main()
 	result |= testInterpolationKeepsLegacyArgumentOrderAndGuards();
 	result |= testCenterBranchAndFormatBytes();
 	result |= testRequiredFormatBytes();
-	result |= testAllSurfaceFormatSizes();
+	result |= testOnlySupportedTerrainFormatSizes();
+	result |= testUnsupportedFormatsRejectWithoutWriting();
+	result |= testHandAuthoredClippedAveragesAndBridgePrecedence();
 	result |= testSerialAndTwoRangeOutputsAreByteExact();
 	result |= testInvalidRangesAndSizesDoNotWrite();
 	return result;
