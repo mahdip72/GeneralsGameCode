@@ -59,6 +59,7 @@
 #include "GameLogic/WeaponSet.h"
 #include "GameLogic/Module/ProductionUpdate.h"
 #include "GameClient/TerrainVisual.h"
+#include "GameNetwork/GameInfo.h"
 
 
 #define USE_DOZER 1
@@ -75,6 +76,21 @@ struct SkirmishFactoryProjection
 	Object *factory;
 	Int projectedFrames;
 	Bool usedByCandidate;
+};
+
+struct SkirmishEnemyCandidate
+{
+	Player *player;
+	Int playerIndex;
+	Int knownAssetValue;
+	Bool hasKnownObject;
+	Bool hasKnownUnit;
+	Bool hasKnownBuildFacility;
+	Coord3D knownPosition;
+	Bool hasKnownPosition;
+	Int distance;
+	SkirmishAITargetRouteClass routeClass;
+	Int score;
 };
 
 static Int getSkirmishProductionEntryFrames(
@@ -155,7 +171,8 @@ m_curLeftFlankRightDefenseAngle(0),
 m_curRightFlankLeftDefenseAngle(0),
 m_curRightFlankRightDefenseAngle(0),
 m_frameToCheckEnemy(0),
-m_currentEnemy(nullptr)
+m_currentEnemy(nullptr),
+m_currentEnemyPlayerIndex(-1)
 
 {
 	m_frameLastBuildingBuilt = TheGameLogic->getFrame();
@@ -675,10 +692,15 @@ void AISkirmishPlayer::getVisibleEnemyComposition(
 		if (object->getControllingPlayer() != enemy || object->isEffectivelyDead())
 			continue;
 		ObjectShroudStatus shroud = object->getShroudedStatus(m_player->getPlayerIndex());
-		if (shroud != OBJECTSHROUD_CLEAR && shroud != OBJECTSHROUD_PARTIAL_CLEAR)
-			continue;
-		if (object->testStatus(OBJECT_STATUS_STEALTHED) &&
-			!object->testStatus(OBJECT_STATUS_DETECTED))
+		Bool visible = shroud == OBJECTSHROUD_CLEAR || shroud == OBJECTSHROUD_PARTIAL_CLEAR;
+		Bool fogged = shroud == OBJECTSHROUD_FOGGED;
+		if (!IsSkirmishAIIntelEligible(
+			object->isKindOf(KINDOF_STRUCTURE),
+			visible,
+			fogged,
+			object->testStatus(OBJECT_STATUS_STEALTHED),
+			object->testStatus(OBJECT_STATUS_DETECTED),
+			object->testStatus(OBJECT_STATUS_MASKED)))
 			continue;
 		if (object->isKindOf(KINDOF_STRUCTURE))
 			continue;
@@ -793,6 +815,153 @@ SkirmishAIRouteClass AISkirmishPlayer::classifyTeamRoute(
 		representative->getPosition(), routeTarget))
 		return SKIRMISH_AI_ROUTE_GROUND_REACHABLE;
 	return hasAir ? SKIRMISH_AI_ROUTE_MIXED_UNREACHABLE : SKIRMISH_AI_ROUTE_GROUND_UNREACHABLE;
+}
+
+Bool AISkirmishPlayer::getKnownEnemyPosition(Player *enemy, Coord3D *position) const
+{
+	if (!enemy || !position)
+		return false;
+	Int slotIndex = ThePlayerList->getSlotIndex(enemy->getPlayerIndex());
+	if (TheGameInfo && slotIndex >= 0) {
+		const GameSlot *slot = TheGameInfo->getConstSlot(slotIndex);
+		if (slot && slot->getStartPos() >= 0) {
+			AsciiString waypointName;
+			waypointName.format("Player_%d_Start", slot->getStartPos() + 1);
+			Waypoint *waypoint = TheTerrainLogic->getWaypointByName(waypointName);
+			if (waypoint) {
+				*position = *waypoint->getLocation();
+				return true;
+			}
+		}
+	}
+
+	Object *knownObject = nullptr;
+	for (Object *object = TheGameLogic->getFirstObject(); object; object = object->getNextObject()) {
+		if (object->getControllingPlayer() != enemy || object->isEffectivelyDead())
+			continue;
+		ObjectShroudStatus shroud = object->getShroudedStatus(m_player->getPlayerIndex());
+		Bool visible = shroud == OBJECTSHROUD_CLEAR || shroud == OBJECTSHROUD_PARTIAL_CLEAR;
+		Bool fogged = shroud == OBJECTSHROUD_FOGGED;
+		if (!IsSkirmishAIIntelEligible(
+			object->isKindOf(KINDOF_STRUCTURE),
+			visible,
+			fogged,
+			object->testStatus(OBJECT_STATUS_STEALTHED),
+			object->testStatus(OBJECT_STATUS_DETECTED),
+			object->testStatus(OBJECT_STATUS_MASKED)))
+			continue;
+		if (!knownObject || object->getID() < knownObject->getID())
+			knownObject = object;
+	}
+	if (!knownObject)
+		return false;
+	*position = *knownObject->getPosition();
+	return true;
+}
+
+Int AISkirmishPlayer::getKnownEnemyAssetValue(Player *enemy, Bool *hasKnownObject,
+	Bool *hasKnownUnit, Bool *hasKnownBuildFacility) const
+{
+	Int value = 0;
+	*hasKnownObject = false;
+	*hasKnownUnit = false;
+	*hasKnownBuildFacility = false;
+	for (Object *object = TheGameLogic->getFirstObject(); object; object = object->getNextObject()) {
+		if (object->getControllingPlayer() != enemy || object->isEffectivelyDead())
+			continue;
+		ObjectShroudStatus shroud = object->getShroudedStatus(m_player->getPlayerIndex());
+		Bool visible = shroud == OBJECTSHROUD_CLEAR || shroud == OBJECTSHROUD_PARTIAL_CLEAR;
+		Bool fogged = shroud == OBJECTSHROUD_FOGGED;
+		if (!IsSkirmishAIIntelEligible(
+			object->isKindOf(KINDOF_STRUCTURE),
+			visible,
+			fogged,
+			object->testStatus(OBJECT_STATUS_STEALTHED),
+			object->testStatus(OBJECT_STATUS_DETECTED),
+			object->testStatus(OBJECT_STATUS_MASKED)))
+			continue;
+		*hasKnownObject = true;
+		if (!object->isKindOf(KINDOF_STRUCTURE) &&
+			!object->isKindOf(KINDOF_PROJECTILE) &&
+			!object->isKindOf(KINDOF_MINE))
+			*hasKnownUnit = true;
+		if (object->getTemplate()->isBuildFacility())
+			*hasKnownBuildFacility = true;
+		value = AddSkirmishAICostValue(value, object->getTemplate()->calcCostToBuild(enemy), 1);
+	}
+	return value;
+}
+
+Object *AISkirmishPlayer::findEnemyRouteRepresentative() const
+{
+	Object *representative = nullptr;
+	for (Object *object = TheGameLogic->getFirstObject(); object; object = object->getNextObject()) {
+		if (object->getControllingPlayer() != m_player || object->isEffectivelyDead() ||
+			object->isKindOf(KINDOF_STRUCTURE) || object->isKindOf(KINDOF_AIRCRAFT) ||
+			!object->getAIUpdateInterface())
+			continue;
+		if (!representative || object->getID() < representative->getID())
+			representative = object;
+	}
+	return representative;
+}
+
+SkirmishAITargetRouteClass AISkirmishPlayer::classifyEnemyRoute(
+	Object *representative, const Coord3D *enemyPosition, Bool hasEnemyPosition) const
+{
+	if (!representative || !hasEnemyPosition || !enemyPosition || !TheAI || !TheAI->pathfinder())
+		return SKIRMISH_AI_TARGET_ROUTE_UNKNOWN;
+	AIUpdateInterface *ai = representative->getAIUpdateInterface();
+	if (!ai)
+		return SKIRMISH_AI_TARGET_ROUTE_UNKNOWN;
+
+	Coord3D targets[5];
+	targets[0] = *enemyPosition;
+	Real dx = representative->getPosition()->x - enemyPosition->x;
+	Real dy = representative->getPosition()->y - enemyPosition->y;
+	Real length = sqrt(dx * dx + dy * dy);
+	Real xDirection = 1.0f;
+	Real yDirection = 0.0f;
+	if (length > 1.0f) {
+		xDirection = dx / length;
+		yDirection = dy / length;
+	}
+	const Real approachDistance = 200.0f;
+	targets[1] = *enemyPosition;
+	targets[1].x += xDirection * approachDistance;
+	targets[1].y += yDirection * approachDistance;
+	targets[2] = *enemyPosition;
+	targets[2].x -= yDirection * approachDistance;
+	targets[2].y += xDirection * approachDistance;
+	targets[3] = *enemyPosition;
+	targets[3].x += yDirection * approachDistance;
+	targets[3].y -= xDirection * approachDistance;
+	targets[4] = *enemyPosition;
+	targets[4].x -= xDirection * approachDistance;
+	targets[4].y -= yDirection * approachDistance;
+
+	for (Int i = 0; i < 5; ++i) {
+		targets[i].z = TheTerrainLogic->getGroundHeight(targets[i].x, targets[i].y);
+		if (TheAI->pathfinder()->clientSafeQuickDoesPathExist(
+			ai->getLocomotorSet(), representative->getPosition(), &targets[i]))
+			return SKIRMISH_AI_TARGET_ROUTE_REACHABLE;
+	}
+	return SKIRMISH_AI_TARGET_ROUTE_UNREACHABLE;
+}
+
+Int AISkirmishPlayer::countAlliedSkirmishAIsTargeting(Player *enemy) const
+{
+	Int count = 0;
+	for (Int i = 0; i < ThePlayerList->getPlayerCount(); ++i) {
+		Player *other = ThePlayerList->getNthPlayer(i);
+		if (!other || other == m_player || !other->isSkirmishAIPlayer())
+			continue;
+		if (m_player->getRelationship(other->getDefaultTeam()) != ALLIES)
+			continue;
+		if (other->getCachedCurrentEnemy() == enemy)
+			++count;
+	}
+	return count;
 }
 
 SkirmishAIDecisionDifficulty AISkirmishPlayer::getDecisionDifficulty() const
@@ -990,65 +1159,107 @@ Int AISkirmishPlayer::getMyEnemyPlayerIndex() {
 */
 void AISkirmishPlayer::acquireEnemy()
 {
-	Player *bestEnemy = nullptr;
-	Real bestDistanceSqr = HUGE_DIST*HUGE_DIST;
+	std::vector<SkirmishEnemyCandidate> candidates;
+	Int maximumKnownAssetValue = 0;
+	Int minimumDistance = 2147483647;
+	Int maximumDistance = 0;
+	Bool hasKnownDistance = false;
+	Object *representative = findEnemyRouteRepresentative();
+	for (Int i = 0; i < ThePlayerList->getPlayerCount(); ++i) {
+		Player *candidatePlayer = ThePlayerList->getNthPlayer(i);
+		if (!candidatePlayer ||
+			m_player->getRelationship(candidatePlayer->getDefaultTeam()) != ENEMIES ||
+			!candidatePlayer->hasAnyObjects())
+			continue;
 
-	if (m_currentEnemy) {
-		Bool inBadShape = !m_currentEnemy->hasAnyUnits() || !m_currentEnemy->hasAnyBuildFacility();
-		if (!inBadShape) return;
+		SkirmishEnemyCandidate candidate;
+		candidate.player = candidatePlayer;
+		candidate.playerIndex = candidatePlayer->getPlayerIndex();
+		candidate.knownAssetValue = getKnownEnemyAssetValue(
+			candidatePlayer,
+			&candidate.hasKnownObject,
+			&candidate.hasKnownUnit,
+			&candidate.hasKnownBuildFacility);
+		candidate.hasKnownPosition = getKnownEnemyPosition(candidatePlayer, &candidate.knownPosition);
+		candidate.distance = 0;
+		if (candidate.hasKnownPosition) {
+			double dx = (double)candidate.knownPosition.x - (double)m_baseCenter.x;
+			double dy = (double)candidate.knownPosition.y - (double)m_baseCenter.y;
+			double distance = sqrt(dx * dx + dy * dy);
+			candidate.distance = distance >= 2147483647.0 ? 2147483647 : (Int)(distance + 0.5);
+			if (candidate.distance < minimumDistance)
+				minimumDistance = candidate.distance;
+			if (candidate.distance > maximumDistance)
+				maximumDistance = candidate.distance;
+			hasKnownDistance = true;
+		}
+		candidate.routeClass = classifyEnemyRoute(
+			representative, &candidate.knownPosition, candidate.hasKnownPosition);
+		candidate.score = 0;
+		if (candidate.knownAssetValue > maximumKnownAssetValue)
+			maximumKnownAssetValue = candidate.knownAssetValue;
+		candidates.push_back(candidate);
 	}
 
-	// look for the closest enemy.
-	Int i;
-	for (i=0; i<ThePlayerList->getPlayerCount(); i++) {
-		Player *curPlayer = ThePlayerList->getNthPlayer(i);
-		if (m_player->getRelationship(curPlayer->getDefaultTeam()) == ENEMIES) {
-			if (curPlayer->hasAnyObjects()==false) continue; // not much of an enemy.
-			// ok, we got an enemy;
-			// If a player is out of units, or out of build facilities, we can lower his priority.
-			Bool inBadShape = !curPlayer->hasAnyUnits() || !curPlayer->hasAnyBuildFacility();
-
-			Coord3D enemyPos = m_baseCenter;
-			Region2D bounds;
-			getPlayerStructureBounds(&bounds, i);
-			enemyPos.x = bounds.lo.x + bounds.width()/2;
-			enemyPos.y = bounds.lo.y + bounds.height()/2;
-			Real curDistSqr = sqr(enemyPos.x-m_baseCenter.x) + sqr(enemyPos.y-m_baseCenter.y);
-
-			//Fudge for in bad shape.	 If an enemy is crippled, concentrate on the other ones.
-			if (inBadShape) {
-				curDistSqr = HUGE_DIST*HUGE_DIST*0.5f;
-			}
-			// See if other ai's are attacking this target.
-			// We don't want the ai's to gang up on one enemy.
-			Int k;
-			for (k=0; k<ThePlayerList->getPlayerCount(); k++) {
-				if (k==i) continue;  // don't count self.
-				Player *somePlayer = ThePlayerList->getNthPlayer(k);
-				if (somePlayer->isSkirmishAIPlayer() && (somePlayer->getCurrentEnemy()==curPlayer)) {
-					// Some ai is already targeting this guy.  Add a distance penalty.
-					curDistSqr += (500*500);
-				}
-			}
-			if (ShouldPreferSkirmishRetaliation(curPlayer->isSkirmishAIPlayer(), curPlayer->getCurrentEnemy()==m_player)) {
-				// He is attacking me.  So I will (gently) prefer to attack him.
-				curDistSqr -= (25*25);
-				if (curDistSqr<0) curDistSqr = 0;
-			}
-
-			// Ai enemy - will take if we don't get a better offer.
-			if (curDistSqr<bestDistanceSqr) {
-				bestEnemy = curPlayer;
-				bestDistanceSqr = curDistSqr;
-			}
+	Bool hasBest = false;
+	SkirmishEnemyCandidate *best = nullptr;
+	SkirmishEnemyCandidate *current = nullptr;
+	for (std::vector<SkirmishEnemyCandidate>::iterator candidate = candidates.begin();
+		candidate != candidates.end(); ++candidate) {
+		SkirmishAIEnemyScoreInput input;
+		input.knownAssetScore = GetSkirmishAIKnownAssetScore(
+			candidate->knownAssetValue, maximumKnownAssetValue);
+		input.targetingThisAI = candidate->player->getCachedCurrentEnemy() == m_player;
+		input.routeClass = candidate->routeClass;
+		input.alliedAIsTargeting = countAlliedSkirmishAIsTargeting(candidate->player);
+		input.distanceScore = candidate->hasKnownPosition && hasKnownDistance ?
+			GetSkirmishAIDistanceScore(candidate->distance, minimumDistance, maximumDistance) : 0;
+		input.crippled = IsSkirmishAIKnownCrippled(
+			candidate->hasKnownObject,
+			candidate->hasKnownUnit,
+			candidate->hasKnownBuildFacility);
+		SkirmishAIEnemyScoreResult result = ScoreSkirmishAIEnemy(input);
+		candidate->score = result.totalScore;
+		if (candidate->player == m_currentEnemy)
+			current = &(*candidate);
+		if (ShouldReplaceSkirmishAITargetCandidate(
+			hasBest,
+			candidate->score,
+			candidate->playerIndex,
+			best ? best->score : 0,
+			best ? best->playerIndex : 0)) {
+			best = &(*candidate);
+			hasBest = true;
+		}
+		if (TheGlobalData->m_debugAI) {
+			DEBUG_LOG(("AI target score player %d: assets %d retaliation %d route %d allies %d distance %d crippled %d total %d",
+				candidate->playerIndex,
+				result.knownAssetScore,
+				result.retaliationScore,
+				result.routeScore,
+				result.allyTargetScore,
+				result.distanceScore,
+				result.crippledScore,
+				result.totalScore));
 		}
 	}
-	if (bestEnemy!=nullptr && (bestEnemy!=m_currentEnemy)) {
-		m_currentEnemy = bestEnemy;
-		AsciiString msg = TheNameKeyGenerator->keyToName(m_player->getPlayerNameKey());
-		msg.concat(" acquiring target enemy player: ");
-		msg.concat(TheNameKeyGenerator->keyToName(m_currentEnemy->getPlayerNameKey()));
-		TheScriptEngine->AppendDebugMessage( msg, false);
+
+	Player *newEnemy = m_currentEnemy;
+	if (!current)
+		newEnemy = best ? best->player : nullptr;
+	else if (best && best->player != current->player &&
+		ShouldSwitchSkirmishAITarget(true, true, current->score, best->score))
+		newEnemy = best->player;
+
+	if (newEnemy != m_currentEnemy) {
+		m_currentEnemy = newEnemy;
+		m_currentEnemyPlayerIndex = m_currentEnemy ? m_currentEnemy->getPlayerIndex() : -1;
+		if (m_currentEnemy) {
+			AsciiString msg = TheNameKeyGenerator->keyToName(m_player->getPlayerNameKey());
+			msg.concat(" acquiring target enemy player: ");
+			msg.concat(TheNameKeyGenerator->keyToName(m_currentEnemy->getPlayerNameKey()));
+			TheScriptEngine->AppendDebugMessage(msg, false);
+		}
 	}
 }
 
@@ -1059,7 +1270,11 @@ void AISkirmishPlayer::acquireEnemy()
 */
 Player *AISkirmishPlayer::getAiEnemy()
 {
-	if (TheGameLogic->getFrame()>=m_frameToCheckEnemy) {
+	Bool currentEnemyInvalid = m_currentEnemy &&
+		(m_player->getRelationship(m_currentEnemy->getDefaultTeam()) != ENEMIES ||
+		 !m_currentEnemy->hasAnyObjects());
+	if (ShouldEvaluateSkirmishAITarget(
+		currentEnemyInvalid, TheGameLogic->getFrame(), m_frameToCheckEnemy, true)) {
 		m_frameToCheckEnemy = TheGameLogic->getFrame() + 5*LOGICFRAMES_PER_SECOND;
 		acquireEnemy();
 	}
@@ -1464,6 +1679,7 @@ void AISkirmishPlayer::doTeamBuilding()
  */
 void AISkirmishPlayer::update()
 {
+	getAiEnemy();
 	AIPlayer::update();
 }
 
@@ -1698,13 +1914,14 @@ void AISkirmishPlayer::crc( Xfer *xfer )
 // ------------------------------------------------------------------------------------------------
 /** Xfer method
 	* Version Info;
-	* 1: Initial version */
+	* 1: Initial version
+	* 2: Current enemy and next enemy evaluation frame */
 // ------------------------------------------------------------------------------------------------
 void AISkirmishPlayer::xfer( Xfer *xfer )
 {
 
 	// version
-	XferVersion currentVersion = 1;
+	XferVersion currentVersion = 2;
 	XferVersion version = currentVersion;
 	xfer->xferVersion( &version, currentVersion );
 
@@ -1735,6 +1952,21 @@ void AISkirmishPlayer::xfer( Xfer *xfer )
 	// right flank right defense angle
 	xfer->xferReal( &m_curRightFlankRightDefenseAngle );
 
+	if (xfer->getXferMode() == XFER_SAVE)
+		m_currentEnemyPlayerIndex = m_currentEnemy ? m_currentEnemy->getPlayerIndex() : -1;
+	UnsignedInt nextEvaluationFrame = m_frameToCheckEnemy;
+	if (version >= 2) {
+		xfer->xferInt(&m_currentEnemyPlayerIndex);
+		xfer->xferUnsignedInt(&nextEvaluationFrame);
+	}
+	if (xfer->getXferMode() == XFER_LOAD) {
+		SkirmishAITargetSnapshotState state = GetSkirmishAITargetSnapshotState(
+			version, m_currentEnemyPlayerIndex, nextEvaluationFrame);
+		m_currentEnemy = nullptr;
+		m_currentEnemyPlayerIndex = state.enemyPlayerIndex;
+		m_frameToCheckEnemy = state.nextEvaluationFrame;
+	}
+
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1742,6 +1974,15 @@ void AISkirmishPlayer::xfer( Xfer *xfer )
 // ------------------------------------------------------------------------------------------------
 void AISkirmishPlayer::loadPostProcess()
 {
-
+	m_currentEnemy = nullptr;
+	for (Int i = 0; i < ThePlayerList->getPlayerCount(); ++i) {
+		Player *player = ThePlayerList->getNthPlayer(i);
+		if (player && player->getPlayerIndex() == m_currentEnemyPlayerIndex) {
+			m_currentEnemy = player;
+			break;
+		}
+	}
+	if (!m_currentEnemy)
+		m_currentEnemyPlayerIndex = -1;
 }
 

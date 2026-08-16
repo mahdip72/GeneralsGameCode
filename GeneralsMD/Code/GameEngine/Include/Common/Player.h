@@ -446,6 +446,7 @@ public:
 
 	/// Get the enemy an ai player is currently focused on.  NOTE - Can be nullptr.
 	Player  *getCurrentEnemy();
+	Player  *getCachedCurrentEnemy() const;
 
 	/// Is this player a skirmish ai player?
 	Bool isSkirmishAIPlayer();

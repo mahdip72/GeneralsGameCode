@@ -25,6 +25,13 @@ enum SkirmishAIRouteClass
 	SKIRMISH_AI_ROUTE_GROUND_UNREACHABLE
 };
 
+enum SkirmishAITargetRouteClass
+{
+	SKIRMISH_AI_TARGET_ROUTE_UNKNOWN = 0,
+	SKIRMISH_AI_TARGET_ROUTE_REACHABLE,
+	SKIRMISH_AI_TARGET_ROUTE_UNREACHABLE
+};
+
 struct SkirmishAICostRange
 {
 	int minimumCost;
@@ -59,6 +66,33 @@ struct SkirmishAITeamScoreResult
 	__int64 finalScore;
 };
 
+struct SkirmishAIEnemyScoreInput
+{
+	int knownAssetScore;
+	bool targetingThisAI;
+	SkirmishAITargetRouteClass routeClass;
+	int alliedAIsTargeting;
+	int distanceScore;
+	bool crippled;
+};
+
+struct SkirmishAIEnemyScoreResult
+{
+	int knownAssetScore;
+	int retaliationScore;
+	int routeScore;
+	int allyTargetScore;
+	int distanceScore;
+	int crippledScore;
+	int totalScore;
+};
+
+struct SkirmishAITargetSnapshotState
+{
+	int enemyPlayerIndex;
+	unsigned int nextEvaluationFrame;
+};
+
 inline int ClampSkirmishAIDecisionValue(int value, int minimum, int maximum)
 {
 	if (value < minimum)
@@ -66,6 +100,113 @@ inline int ClampSkirmishAIDecisionValue(int value, int minimum, int maximum)
 	if (value > maximum)
 		return maximum;
 	return value;
+}
+
+inline bool IsSkirmishAIIntelEligible(
+	bool isStructure, bool isVisible, bool isFogged, bool isStealthed, bool isDetected,
+	bool isMasked)
+{
+	if (isMasked)
+		return false;
+	if (isStealthed && !isDetected)
+		return false;
+	if (isStructure)
+		return isVisible || isFogged;
+	return isVisible;
+}
+
+inline bool IsSkirmishAIKnownCrippled(
+	bool hasKnownObject, bool hasKnownUnit, bool hasKnownBuildFacility)
+{
+	// Hidden forces must not change targeting.  Only classify a player as
+	// crippled when the available intel shows assets but no known way to fight
+	// or produce replacements.
+	return hasKnownObject && !hasKnownUnit && !hasKnownBuildFacility;
+}
+
+inline int GetSkirmishAIKnownAssetScore(int knownAssetValue, int maximumKnownAssetValue)
+{
+	if (knownAssetValue <= 0 || maximumKnownAssetValue <= 0)
+		return 0;
+	if (knownAssetValue >= maximumKnownAssetValue)
+		return 300;
+	return ClampSkirmishAIDecisionValue(
+		(int)(300.0 * (double)knownAssetValue / (double)maximumKnownAssetValue + 0.5), 0, 300);
+}
+
+inline int GetSkirmishAIDistanceScore(int distance, int minimumDistance, int maximumDistance)
+{
+	if (maximumDistance <= minimumDistance || distance <= minimumDistance)
+		return 0;
+	if (distance >= maximumDistance)
+		return -300;
+	return -ClampSkirmishAIDecisionValue(
+		(int)(300.0 * (double)(distance - minimumDistance) /
+			(double)(maximumDistance - minimumDistance) + 0.5), 0, 300);
+}
+
+inline int GetSkirmishAITargetRouteScore(SkirmishAITargetRouteClass routeClass)
+{
+	if (routeClass == SKIRMISH_AI_TARGET_ROUTE_REACHABLE)
+		return 150;
+	if (routeClass == SKIRMISH_AI_TARGET_ROUTE_UNREACHABLE)
+		return -150;
+	return 0;
+}
+
+inline SkirmishAIEnemyScoreResult ScoreSkirmishAIEnemy(const SkirmishAIEnemyScoreInput &input)
+{
+	SkirmishAIEnemyScoreResult result;
+	result.knownAssetScore = ClampSkirmishAIDecisionValue(input.knownAssetScore, 0, 300);
+	result.retaliationScore = input.targetingThisAI ? 250 : 0;
+	result.routeScore = GetSkirmishAITargetRouteScore(input.routeClass);
+	result.allyTargetScore = -150 * ClampSkirmishAIDecisionValue(input.alliedAIsTargeting, 0, 3);
+	result.distanceScore = ClampSkirmishAIDecisionValue(input.distanceScore, -300, 0);
+	result.crippledScore = input.crippled ? -600 : 0;
+	result.totalScore = result.knownAssetScore + result.retaliationScore + result.routeScore +
+		result.allyTargetScore + result.distanceScore + result.crippledScore;
+	return result;
+}
+
+inline bool ShouldReplaceSkirmishAITargetCandidate(
+	bool hasBest, int candidateScore, int candidatePlayerIndex, int bestScore, int bestPlayerIndex)
+{
+	return !hasBest || candidateScore > bestScore ||
+		(candidateScore == bestScore && candidatePlayerIndex < bestPlayerIndex);
+}
+
+inline bool ShouldSwitchSkirmishAITarget(
+	bool currentValid, bool challengerValid, int currentScore, int challengerScore)
+{
+	if (!challengerValid)
+		return false;
+	if (!currentValid)
+		return true;
+	return (double)challengerScore - (double)currentScore >= 200.0;
+}
+
+inline bool ShouldEvaluateSkirmishAITarget(
+	bool currentInvalid, unsigned int currentFrame, unsigned int nextEvaluationFrame,
+	bool evaluationAllowed)
+{
+	return evaluationAllowed && (currentInvalid || currentFrame >= nextEvaluationFrame);
+}
+
+inline SkirmishAITargetSnapshotState GetSkirmishAITargetSnapshotState(
+	int snapshotVersion, int storedEnemyPlayerIndex, unsigned int storedNextEvaluationFrame)
+{
+	SkirmishAITargetSnapshotState result;
+	if (snapshotVersion < 2)
+	{
+		result.enemyPlayerIndex = -1;
+		result.nextEvaluationFrame = 0;
+	}
+	else
+	{
+		result.enemyPlayerIndex = storedEnemyPlayerIndex;
+		result.nextEvaluationFrame = storedNextEvaluationFrame;
+	}
+	return result;
 }
 
 inline int AddSkirmishAICostValue(int total, int unitCost, int count)

@@ -1176,6 +1176,14 @@ Player  *Player::getCurrentEnemy()
 }
 
 //-------------------------------------------------------------------------------------------------
+/** Get this player's cached current enemy without triggering skirmish target evaluation. */
+//-------------------------------------------------------------------------------------------------
+Player *Player::getCachedCurrentEnemy() const
+{
+	return m_ai ? m_ai->getCachedAiEnemy() : nullptr;
+}
+
+//-------------------------------------------------------------------------------------------------
 // PlayerObjectFindInfo is used to find a player's object. For example, we iterate through
 // to find a player's command center, or a specific building capable of firing the specified
 // special power.
