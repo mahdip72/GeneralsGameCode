@@ -935,6 +935,142 @@ static int testOverlayBatchServiceFailureFallbacks()
 }
 #endif
 
+static bool makeSourcePathNearOverlayTest(char *path, unsigned pathSize,
+	const char *relativePath)
+{
+	const char *testFile = __FILE__;
+	const char *slash = strrchr(testFile, '\\');
+	const char *forwardSlash = strrchr(testFile, '/');
+	unsigned directoryLength;
+	unsigned relativeLength;
+
+	if (forwardSlash != 0 && (slash == 0 || forwardSlash > slash))
+	{
+		slash = forwardSlash;
+	}
+	if (slash == 0)
+	{
+		return false;
+	}
+	directoryLength = static_cast<unsigned>(slash - testFile);
+	relativeLength = static_cast<unsigned>(strlen(relativePath));
+	if (directoryLength + 1 + relativeLength + 1 > pathSize)
+	{
+		return false;
+	}
+	memcpy(path, testFile, directoryLength);
+	path[directoryLength] = '\\';
+	memcpy(path + directoryLength + 1, relativePath, relativeLength + 1);
+	return true;
+}
+
+static int auditOverlaySourceRange(const char *path, const char *startMarker,
+	const char *endMarker, const char *const *forbidden,
+	unsigned forbiddenCount, const char *testName)
+{
+	FILE *sourceFile = fopen(path, "rb");
+	char source[65536];
+	long sourceLength;
+	char *start;
+	char *end;
+	unsigned index;
+
+	CHECK(testName, sourceFile != 0);
+	fseek(sourceFile, 0, SEEK_END);
+	sourceLength = ftell(sourceFile);
+	fseek(sourceFile, 0, SEEK_SET);
+	CHECK(testName, sourceLength > 0 &&
+		sourceLength < static_cast<long>(sizeof(source)));
+	CHECK(testName, fread(source, 1, static_cast<size_t>(sourceLength),
+		sourceFile) == static_cast<size_t>(sourceLength));
+	fclose(sourceFile);
+	source[sourceLength] = '\0';
+
+	start = strstr(source, startMarker);
+	CHECK(testName, start != 0);
+	end = endMarker == 0 ? source + sourceLength : strstr(start, endMarker);
+	CHECK(testName, end != 0);
+	*end = '\0';
+	for (index = 0; index < forbiddenCount; ++index)
+	{
+		if (strstr(start, forbidden[index]) != 0)
+		{
+			fprintf(stderr, "%s: forbidden source token '%s'\n", testName,
+				forbidden[index]);
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static int testOverlayWorkerSourceAudit()
+{
+	const char *testName = "testOverlayWorkerSourceAudit";
+	const char *const forbidden[] = {
+		"D3D", "DX8", "The", "Texture", "Surface", "new ", "delete ",
+		"wait", "rand", "RNG", "replay", "save", "network"
+	};
+	char preparePath[1024];
+	char kernelPath[1024];
+	int result = 0;
+
+	CHECK(testName, makeSourcePathNearOverlayTest(preparePath,
+		sizeof(preparePath),
+		"..\\..\\GameEngineDevice\\Source\\W3DDevice\\Common\\System\\RadarOverlayPrepare.cpp"));
+	CHECK(testName, makeSourcePathNearOverlayTest(kernelPath,
+		sizeof(kernelPath),
+		"..\\..\\Libraries\\Source\\TaskRuntime\\RadarOverlayKernel.cpp"));
+	result |= auditOverlaySourceRange(preparePath,
+		"bool RadarObjectOverlayRowWork::executeRows",
+		"RadarOverlayPrepareLease::RadarOverlayPrepareLease", forbidden,
+		sizeof(forbidden) / sizeof(forbidden[0]), testName);
+	result |= auditOverlaySourceRange(kernelPath,
+		"static unsigned radarOverlayBytesPerPixelForFormat", 0, forbidden,
+		sizeof(forbidden) / sizeof(forbidden[0]), testName);
+	return result;
+}
+
+static int testOverlayOwnerFlowSourceAudit()
+{
+	const char *testName = "testOverlayOwnerFlowSourceAudit";
+	const char *const required[] = {
+		"ASSERT_GAME_THREAD(\"W3DRadar::updateObjectTexture radar preparation\")",
+		"captureObjectOverlayList( m_objectList",
+		"RunRadarObjectOverlayBatch( batch, lease )",
+		"uploadPreparedRadarObjectOverlay( texture",
+		"ASSERT_GAME_THREAD(\"W3DRadar::beginSetShroudLevel radar preparation\")",
+		"captureRadarShroudOverlaySurface( surface, surfaceDesc",
+		"RunRadarShroudOverlayBatch( m_shroudOverlayBatch",
+		"uploadPreparedRadarShroudOverlay( m_shroudTexture",
+		"m_shroudBatchPendingCommit = TRUE"
+	};
+	char radarPath[1024];
+	static char source[262144];
+	FILE *sourceFile;
+	long sourceLength;
+	unsigned index;
+
+	CHECK(testName, makeSourcePathNearOverlayTest(radarPath,
+		sizeof(radarPath),
+		"..\\..\\GameEngineDevice\\Source\\W3DDevice\\Common\\System\\W3DRadar.cpp"));
+	sourceFile = fopen(radarPath, "rb");
+	CHECK(testName, sourceFile != 0);
+	fseek(sourceFile, 0, SEEK_END);
+	sourceLength = ftell(sourceFile);
+	fseek(sourceFile, 0, SEEK_SET);
+	CHECK(testName, sourceLength > 0 &&
+		sourceLength < static_cast<long>(sizeof(source)));
+	CHECK(testName, fread(source, 1, static_cast<size_t>(sourceLength),
+		sourceFile) == static_cast<size_t>(sourceLength));
+	fclose(sourceFile);
+	source[sourceLength] = '\0';
+	for (index = 0; index < sizeof(required) / sizeof(required[0]); ++index)
+	{
+		CHECK(testName, strstr(source, required[index]) != 0);
+	}
+	return 0;
+}
+
 int main()
 {
 	int result = 0;
@@ -962,5 +1098,7 @@ int main()
 #if defined(RTS_BUILD_CORE_EXTRAS)
 	result |= testOverlayBatchServiceFailureFallbacks();
 #endif
+	result |= testOverlayWorkerSourceAudit();
+	result |= testOverlayOwnerFlowSourceAudit();
 	return result;
 }

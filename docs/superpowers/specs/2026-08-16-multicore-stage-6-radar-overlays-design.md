@@ -1,7 +1,7 @@
 # Stage 6: Radar Object and Shroud Overlay Preparation Design
 
-**Date:** 2026-08-16  
-**Status:** Design for implementation  
+**Date:** 2026-08-16
+**Status:** Design for implementation
 **Scope:** Radar object-overlay and batched shroud-overlay CPU preparation,
 stacked on the completed Stage 5 terrain preparation boundary
 
