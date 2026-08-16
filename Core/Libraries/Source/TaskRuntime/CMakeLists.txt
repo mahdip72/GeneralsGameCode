@@ -3,6 +3,7 @@ add_library(core_task_runtime STATIC)
 target_sources(core_task_runtime PRIVATE
     TaskRuntime.cpp
     RadarTerrainKernel.cpp
+    RadarOverlayKernel.cpp
 )
 
 target_include_directories(core_task_runtime PUBLIC

@@ -50,6 +50,7 @@
 #include "GameClient/Line2D.h"
 #include "GameClient/TerrainVisual.h"
 #include "GameClient/Water.h"
+#include "W3DDevice/Common/RadarOverlayPrepare.h"
 #include "W3DDevice/Common/W3DRadar.h"
 #include "W3DDevice/Common/RadarTerrainPrepare.h"
 #include "W3DDevice/GameClient/HeightMap.h"
@@ -64,7 +65,11 @@
 
 
 // PRIVATE DATA ///////////////////////////////////////////////////////////////////////////////////
-enum { OVERLAY_REFRESH_RATE = 6 };  ///< over updates once this many frames
+enum
+{
+	OVERLAY_REFRESH_RATE = 6,  ///< over updates once this many frames
+	MIN_PARALLEL_OBJECT_COMMANDS = 512
+};
 
 //-------------------------------------------------------------------------------------------------
 /** Is the point legal, that is, inside the resolution of the radar cells */
@@ -142,6 +147,14 @@ void W3DRadar::initializeTextureFormats()
 //-------------------------------------------------------------------------------------------------
 void W3DRadar::deleteResources()
 {
+	/* A batched shroud owns no lock across its worker/command phase.  Finish
+	 * any caller-owned batch before releasing the texture it targets. */
+	if( m_shroudBatchActive || m_shroudSurface != nullptr )
+		endSetShroudLevel();
+	/* Resource deletion invalidates even a deferred complete CPU image. */
+	m_shroudOverlayBatch.reset();
+	m_shroudBatchPendingCommit = FALSE;
+	m_shroudBatchFolded = FALSE;
 
 	//
 	// delete terrain resources used
@@ -620,16 +633,446 @@ void W3DRadar::drawIcons( Int pixelX, Int pixelY, Int width, Int height )
 	}
 }
 
+static Bool mapRadarOverlayFormat( WW3DFormat surfaceFormat,
+	unsigned *kernelFormat )
+{
+	if( kernelFormat == nullptr )
+		return FALSE;
+
+	switch( surfaceFormat )
+	{
+	case WW3D_FORMAT_A8R8G8B8:
+		*kernelFormat = RADAR_OVERLAY_FORMAT_A8R8G8B8;
+		return TRUE;
+	case WW3D_FORMAT_A4R4G4B4:
+		*kernelFormat = RADAR_OVERLAY_FORMAT_A4R4G4B4;
+		return TRUE;
+	default:
+		*kernelFormat = RADAR_OVERLAY_FORMAT_UNKNOWN;
+		return FALSE;
+	}
+}
+
+static Bool countRadarObjectOverlayList( const RadarObject *listHead,
+	unsigned *count )
+{
+	if( count == nullptr )
+		return FALSE;
+
+	*count = 0;
+	for( const RadarObject *rObj = listHead; rObj;
+		rObj = rObj->friend_getNext() )
+	{
+		if( *count == UINT_MAX )
+			return FALSE;
+		++*count;
+	}
+	return TRUE;
+}
+
+static Bool captureRadarObjectOverlaySurface( SurfaceClass *surface,
+	const SurfaceClass::SurfaceDescription &surfaceDesc,
+	const RadarObjectOverlaySnapshot &snapshot )
+{
+	unsigned surfaceFormatCode;
+	if( surface == nullptr || snapshot.output == nullptr ||
+		snapshot.width == 0 || snapshot.height == 0 ||
+		snapshot.rowBytes == 0 ||
+		!mapRadarOverlayFormat( surfaceDesc.Format, &surfaceFormatCode ) ||
+		surfaceFormatCode != snapshot.formatCode ||
+		surfaceDesc.Width != snapshot.width ||
+		surfaceDesc.Height != snapshot.height ||
+		Get_Bytes_Per_Pixel( surfaceDesc.Format ) != snapshot.bytesPerPixel ||
+		RadarOverlayBytesPerPixel( snapshot.formatCode ) !=
+			snapshot.bytesPerPixel )
+	{
+		return FALSE;
+	}
+
+	int pitch = 0;
+	void *bits = surface->Lock( &pitch );
+	if( bits == nullptr )
+		return FALSE;
+
+	const unsigned unsignedPitch = pitch > 0 ?
+		static_cast<unsigned>(pitch) : 0;
+	const Bool pitchValid = pitch > 0 &&
+		unsignedPitch >= snapshot.rowBytes &&
+		(snapshot.height <= 1 ||
+			unsignedPitch <= UINT_MAX / (snapshot.height - 1));
+
+	if( pitchValid )
+	{
+		unsigned y;
+		for( y = 0; y < snapshot.height; ++y )
+		{
+			unsigned char *destination = snapshot.output +
+				y * snapshot.rowBytes;
+			const unsigned char *source =
+				static_cast<const unsigned char *>( bits ) + y * unsignedPitch;
+			memcpy( destination, source, snapshot.rowBytes );
+		}
+	}
+
+	/* A successful Lock is always paired with exactly one Unlock. */
+	surface->Unlock();
+	return pitchValid;
+}
+
+static Bool uploadPreparedRadarObjectOverlay( TextureClass *texture,
+	const RadarObjectOverlaySnapshot &snapshot )
+{
+	if( texture == nullptr || snapshot.output == nullptr ||
+		snapshot.width == 0 || snapshot.height == 0 ||
+		snapshot.rowBytes == 0 )
+	{
+		return FALSE;
+	}
+
+	SurfaceClass *surface = texture->Get_Surface_Level();
+	if( surface == nullptr )
+		return FALSE;
+
+	SurfaceClass::SurfaceDescription surfaceDesc;
+	surface->Get_Description( surfaceDesc );
+	unsigned surfaceFormatCode;
+	Bool uploaded = FALSE;
+	if( mapRadarOverlayFormat( surfaceDesc.Format, &surfaceFormatCode ) &&
+		surfaceFormatCode == snapshot.formatCode &&
+		surfaceDesc.Width == snapshot.width &&
+		surfaceDesc.Height == snapshot.height &&
+		Get_Bytes_Per_Pixel( surfaceDesc.Format ) == snapshot.bytesPerPixel &&
+		RadarOverlayBytesPerPixel( snapshot.formatCode ) ==
+			snapshot.bytesPerPixel )
+	{
+		int pitch = 0;
+		void *bits = surface->Lock( &pitch );
+		if( bits != nullptr )
+		{
+			const unsigned unsignedPitch = pitch > 0 ?
+				static_cast<unsigned>(pitch) : 0;
+			const Bool pitchValid = pitch > 0 &&
+				unsignedPitch >= snapshot.rowBytes &&
+				(snapshot.height <= 1 ||
+					unsignedPitch <= UINT_MAX / (snapshot.height - 1));
+
+			if( pitchValid )
+			{
+				unsigned y;
+				for( y = 0; y < snapshot.height; ++y )
+				{
+					unsigned char *destination =
+						static_cast<unsigned char *>( bits ) +
+						y * unsignedPitch;
+					const unsigned char *source = snapshot.output +
+						y * snapshot.rowBytes;
+					memcpy( destination, source, snapshot.rowBytes );
+				}
+				uploaded = TRUE;
+			}
+
+			/* Pair every non-null Lock result with exactly one Unlock. */
+			surface->Unlock();
+		}
+	}
+
+	REF_PTR_RELEASE( surface );
+	return uploaded;
+}
+
+static Bool captureRadarShroudOverlaySurface( SurfaceClass *surface,
+	const SurfaceClass::SurfaceDescription &surfaceDesc,
+	const RadarShroudOverlaySnapshot &snapshot )
+{
+	unsigned surfaceFormatCode;
+	if( surface == nullptr || snapshot.output == nullptr ||
+		snapshot.width == 0 || snapshot.height == 0 ||
+		snapshot.rowBytes == 0 ||
+		!mapRadarOverlayFormat( surfaceDesc.Format, &surfaceFormatCode ) ||
+		surfaceFormatCode != snapshot.formatCode ||
+		surfaceDesc.Width != snapshot.width ||
+		surfaceDesc.Height != snapshot.height ||
+		Get_Bytes_Per_Pixel( surfaceDesc.Format ) != snapshot.bytesPerPixel ||
+		RadarOverlayBytesPerPixel( snapshot.formatCode ) !=
+			snapshot.bytesPerPixel )
+	{
+		return FALSE;
+	}
+
+	int pitch = 0;
+	void *bits = surface->Lock( &pitch );
+	if( bits == nullptr )
+		return FALSE;
+
+	const unsigned unsignedPitch = pitch > 0 ?
+		static_cast<unsigned>(pitch) : 0;
+	const Bool pitchValid = pitch > 0 &&
+		unsignedPitch >= snapshot.rowBytes &&
+		(snapshot.height <= 1 ||
+			unsignedPitch <= UINT_MAX / (snapshot.height - 1)) &&
+		(snapshot.height <= 1 ||
+			snapshot.rowBytes <= UINT_MAX / (snapshot.height - 1));
+
+	if( pitchValid )
+	{
+		unsigned y;
+		for( y = 0; y < snapshot.height; ++y )
+		{
+			unsigned char *destination = snapshot.output +
+				y * snapshot.rowBytes;
+			const unsigned char *source =
+				static_cast<const unsigned char *>( bits ) +
+				y * unsignedPitch;
+			memcpy( destination, source, snapshot.rowBytes );
+		}
+	}
+
+	/* A successful Lock is always paired with exactly one Unlock. */
+	surface->Unlock();
+	return pitchValid;
+}
+
+static Bool uploadRadarShroudOverlaySurface( SurfaceClass *surface,
+	const RadarShroudOverlaySnapshot &snapshot )
+{
+	if( surface == nullptr || snapshot.output == nullptr ||
+		snapshot.width == 0 || snapshot.height == 0 ||
+		snapshot.rowBytes == 0 )
+	{
+		return FALSE;
+	}
+
+	SurfaceClass::SurfaceDescription surfaceDesc;
+	surface->Get_Description( surfaceDesc );
+	unsigned surfaceFormatCode;
+	if( !mapRadarOverlayFormat( surfaceDesc.Format, &surfaceFormatCode ) ||
+		surfaceFormatCode != snapshot.formatCode ||
+		surfaceDesc.Width != snapshot.width ||
+		surfaceDesc.Height != snapshot.height ||
+		Get_Bytes_Per_Pixel( surfaceDesc.Format ) != snapshot.bytesPerPixel ||
+		RadarOverlayBytesPerPixel( snapshot.formatCode ) !=
+			snapshot.bytesPerPixel )
+	{
+		return FALSE;
+	}
+
+	int pitch = 0;
+	void *bits = surface->Lock( &pitch );
+	if( bits == nullptr )
+		return FALSE;
+
+	const unsigned unsignedPitch = pitch > 0 ?
+		static_cast<unsigned>(pitch) : 0;
+	const Bool pitchValid = pitch > 0 &&
+		unsignedPitch >= snapshot.rowBytes &&
+		(snapshot.height <= 1 ||
+			unsignedPitch <= UINT_MAX / (snapshot.height - 1)) &&
+		(snapshot.height <= 1 ||
+			snapshot.rowBytes <= UINT_MAX / (snapshot.height - 1));
+	if( pitchValid )
+	{
+		unsigned y;
+		for( y = 0; y < snapshot.height; ++y )
+		{
+			unsigned char *destination =
+				static_cast<unsigned char *>( bits ) + y * unsignedPitch;
+			const unsigned char *source = snapshot.output +
+				y * snapshot.rowBytes;
+			memcpy( destination, source, snapshot.rowBytes );
+		}
+	}
+
+	/* Pair every non-null Lock result with exactly one Unlock. */
+	surface->Unlock();
+	return pitchValid;
+}
+
+static Bool uploadPreparedRadarShroudOverlay( TextureClass *texture,
+	const RadarShroudOverlaySnapshot &snapshot )
+{
+	if( texture == nullptr )
+		return FALSE;
+
+	SurfaceClass *surface = texture->Get_Surface_Level();
+	if( surface == nullptr )
+		return FALSE;
+
+	const Bool uploaded = uploadRadarShroudOverlaySurface( surface, snapshot );
+	REF_PTR_RELEASE( surface );
+	return uploaded;
+}
+
+static Bool replayRadarShroudOverlayCommands( TextureClass *texture,
+	const RadarShroudOverlaySnapshot &snapshot )
+{
+	if( texture == nullptr || snapshot.commands == nullptr ||
+		snapshot.commandCount == 0 )
+	{
+		return snapshot.commandCount == 0;
+	}
+
+	SurfaceClass *surface = texture->Get_Surface_Level();
+	if( surface == nullptr )
+		return FALSE;
+
+	SurfaceClass::SurfaceDescription surfaceDesc;
+	surface->Get_Description( surfaceDesc );
+	unsigned surfaceFormatCode;
+	const unsigned bytesPerPixel = Get_Bytes_Per_Pixel( surfaceDesc.Format );
+	if( !mapRadarOverlayFormat( surfaceDesc.Format, &surfaceFormatCode ) ||
+		surfaceFormatCode != snapshot.formatCode ||
+		surfaceDesc.Width != snapshot.width ||
+		surfaceDesc.Height != snapshot.height ||
+		bytesPerPixel != snapshot.bytesPerPixel ||
+		RadarOverlayBytesPerPixel( snapshot.formatCode ) != bytesPerPixel )
+	{
+		REF_PTR_RELEASE( surface );
+		return FALSE;
+	}
+
+	int pitch = 0;
+	void *bits = surface->Lock( &pitch );
+	if( bits == nullptr )
+	{
+		REF_PTR_RELEASE( surface );
+		return FALSE;
+	}
+
+	const unsigned unsignedPitch = pitch > 0 ?
+		static_cast<unsigned>(pitch) : 0;
+	const Bool pitchValid = pitch > 0 &&
+		unsignedPitch >= snapshot.rowBytes &&
+		(snapshot.height <= 1 ||
+			unsignedPitch <= UINT_MAX / (snapshot.height - 1)) &&
+		(snapshot.height <= 1 ||
+			snapshot.rowBytes <= UINT_MAX / (snapshot.height - 1));
+	if( pitchValid )
+	{
+		unsigned commandIndex;
+		for( commandIndex = 0; commandIndex < snapshot.commandCount;
+			++commandIndex )
+		{
+			const RadarShroudOverlayCommand &command =
+				snapshot.commands[commandIndex];
+			if( command.minX > command.maxX ||
+				command.minY > command.maxY || command.maxX < 0 ||
+				command.maxY < 0 || command.minX >=
+					static_cast<Int>( snapshot.width ) ||
+				command.minY >= static_cast<Int>( snapshot.height ) )
+			{
+				continue;
+			}
+
+			const unsigned xBegin = command.minX < 0 ? 0u :
+				static_cast<unsigned>( command.minX );
+			const unsigned yBegin = command.minY < 0 ? 0u :
+				static_cast<unsigned>( command.minY );
+			const unsigned xEnd = command.maxX >=
+				static_cast<Int>( snapshot.width ) ? snapshot.width - 1 :
+				static_cast<unsigned>( command.maxX );
+			const unsigned yEnd = command.maxY >=
+				static_cast<Int>( snapshot.height ) ? snapshot.height - 1 :
+				static_cast<unsigned>( command.maxY );
+			unsigned y;
+			for( y = yBegin; y <= yEnd; ++y )
+			{
+				unsigned x;
+				for( x = xBegin; x <= xEnd; ++x )
+					surface->Draw_Pixel( static_cast<Int>( x ),
+						static_cast<Int>( y ), command.packedColor,
+						bytesPerPixel, bits, pitch );
+			}
+		}
+	}
+
+	surface->Unlock();
+	REF_PTR_RELEASE( surface );
+	return pitchValid;
+}
+
 //-------------------------------------------------------------------------------------------------
 //-------------------------------------------------------------------------------------------------
 void W3DRadar::updateObjectTexture(TextureClass *texture)
 {
+	ASSERT_GAME_THREAD("W3DRadar::updateObjectTexture radar preparation");
+
 	// reset the overlay texture
 	SurfaceClass *surface = texture->Get_Surface_Level();
 	surface->Clear();
 	REF_PTR_RELEASE(surface);
 
-	// rebuild the object overlay
+	RadarObjectOverlayBatch batch;
+	Bool prepared = FALSE;
+	unsigned objectCount = 0;
+	unsigned localObjectCount = 0;
+	unsigned commandCapacity = 0;
+
+	if( countRadarObjectOverlayList( m_objectList, &objectCount ) &&
+		countRadarObjectOverlayList( m_localObjectList, &localObjectCount ) &&
+		localObjectCount <= UINT_MAX - objectCount )
+	{
+		commandCapacity = objectCount + localObjectCount;
+		if( commandCapacity == 0 )
+			return;
+		/* Below this point four direct pixels per node are cheaper than a
+		 * complete surface upload plus worker admission and synchronization. */
+		if( commandCapacity < MIN_PARALLEL_OBJECT_COMMANDS )
+		{
+			renderObjectList( m_objectList, texture );
+			renderObjectList( m_localObjectList, texture );
+			return;
+		}
+		surface = texture->Get_Surface_Level();
+		if( surface != nullptr )
+		{
+			SurfaceClass::SurfaceDescription surfaceDesc;
+			surface->Get_Description( surfaceDesc );
+			unsigned formatCode = RADAR_OVERLAY_FORMAT_UNKNOWN;
+			Bool captured = FALSE;
+
+			if( surfaceDesc.Width == static_cast<unsigned>(m_textureWidth) &&
+				surfaceDesc.Height == static_cast<unsigned>(m_textureHeight) &&
+				mapRadarOverlayFormat( surfaceDesc.Format, &formatCode ) &&
+				batch.initialize( static_cast<unsigned>(m_textureWidth),
+					static_cast<unsigned>(m_textureHeight), formatCode,
+					commandCapacity ) )
+			{
+				captured = captureRadarObjectOverlaySurface( surface,
+					surfaceDesc, batch.snapshot() );
+			}
+			REF_PTR_RELEASE( surface );
+
+			if( captured )
+			{
+				Player *player = rts::getObservedOrLocalPlayer();
+				if( captureObjectOverlayList( m_objectList, player, batch,
+						surfaceDesc.Format ) )
+				{
+					player = rts::getObservedOrLocalPlayer();
+					if( captureObjectOverlayList( m_localObjectList, player,
+						batch, surfaceDesc.Format ) )
+					{
+						if( batch.commandCount() == 0 )
+							return;
+						RadarTerrainPrepareService &prepareService =
+							GetRadarTerrainPrepareService();
+						RadarOverlayPrepareLease lease( prepareService, 2 );
+						if( RunRadarObjectOverlayBatch( batch, lease ) &&
+							uploadPreparedRadarObjectOverlay( texture,
+							batch.snapshot() ) )
+						{
+							prepared = TRUE;
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if( prepared )
+		return;
+
+	// Keep the complete owner-only reference path after the one clear above.
 	renderObjectList( m_objectList, texture );
 	renderObjectList( m_localObjectList, texture );
 }
@@ -680,6 +1123,57 @@ Bool W3DRadar::canRenderObject( const RadarObject *rObj, const Player *localPlay
 	}
 
 	return true;
+}
+
+Bool W3DRadar::captureObjectOverlayList( const RadarObject *listHead,
+	const Player *localPlayer, RadarObjectOverlayBatch &batch,
+	WW3DFormat surfaceFormat )
+{
+	if( listHead == nullptr )
+		return TRUE;
+	if( localPlayer == nullptr )
+		return FALSE;
+
+	for( const RadarObject *rObj = listHead; rObj;
+		rObj = rObj->friend_getNext() )
+	{
+		if( !canRenderObject( rObj, localPlayer ) )
+			continue;
+
+		const Object *obj = rObj->friend_getObject();
+		const Coord3D *pos = obj->getPosition();
+		ICoord2D radarPoint;
+		radarPoint.x = pos->x / (m_mapExtent.width() / RADAR_CELL_WIDTH);
+		radarPoint.y = pos->y / (m_mapExtent.height() / RADAR_CELL_HEIGHT);
+
+		Color argbColor = rObj->getColor();
+		if( obj->testStatus( OBJECT_STATUS_STEALTHED ) )
+		{
+			UnsignedByte r, g, b, a;
+			GameGetColorComponents( argbColor, &r, &g, &b, &a );
+
+			const UnsignedInt framesForTransition = LOGICFRAMES_PER_SECOND;
+			const UnsignedByte minAlpha = 32;
+
+			Real alphaScale = INT_TO_REAL(
+				TheGameLogic->getFrame() % framesForTransition ) /
+				(framesForTransition / 2.0f);
+			if( alphaScale > 0.0f )
+				a = REAL_TO_UNSIGNEDBYTE(
+					((alphaScale - 1.0f) * (255.0f - minAlpha)) + minAlpha );
+			else
+				a = REAL_TO_UNSIGNEDBYTE(
+					(alphaScale * (255.0f - minAlpha)) + minAlpha );
+			argbColor = GameMakeColor( r, g, b, a );
+		}
+
+		const unsigned int pixelColor =
+			ARGB_Color_To_WW3D_Color( surfaceFormat, argbColor );
+		if( !batch.append( radarPoint.x, radarPoint.y, pixelColor ) )
+			return FALSE;
+	}
+
+	return TRUE;
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -866,6 +1360,10 @@ W3DRadar::W3DRadar()
 	m_shroudSurfacePitch = 0;
 	m_shroudSurfaceFormat = WW3D_FORMAT_UNKNOWN;
 	m_shroudSurfacePixelSize = 0;
+	m_shroudBatchActive = FALSE;
+	m_shroudBatchFallback = FALSE;
+	m_shroudBatchFolded = FALSE;
+	m_shroudBatchPendingCommit = FALSE;
 
 	m_textureWidth = RADAR_CELL_WIDTH;
 	m_textureHeight = RADAR_CELL_HEIGHT;
@@ -992,6 +1490,12 @@ void W3DRadar::init()
 //-------------------------------------------------------------------------------------------------
 void W3DRadar::reset()
 {
+	if( m_shroudBatchActive || m_shroudSurface != nullptr )
+		endSetShroudLevel();
+	/* Reset clears the target texture below, so no deferred image may survive. */
+	m_shroudOverlayBatch.reset();
+	m_shroudBatchPendingCommit = FALSE;
+	m_shroudBatchFolded = FALSE;
 
 	// extending functionality, call base class
 	Radar::reset();
@@ -1616,6 +2120,14 @@ void W3DRadar::clearShroud()
 	if (!TheGlobalData->m_shroudOn)
 		return;
 #endif
+	if( !m_shroudBatchActive && m_shroudSurface == nullptr )
+	{
+		/* A clear supersedes any full CPU image retained after a transient
+		 * upload failure; it must not be resurrected by the next batch. */
+		m_shroudOverlayBatch.reset();
+		m_shroudBatchPendingCommit = FALSE;
+		m_shroudBatchFolded = FALSE;
+	}
 
 	SurfaceClass *surface = m_shroudTexture->Get_Surface_Level();
 
@@ -1639,6 +2151,7 @@ void W3DRadar::clearShroud()
 //-------------------------------------------------------------------------------------------------
 void W3DRadar::setShroudLevel(Int shroudX, Int shroudY, CellShroudStatus setting)
 {
+	ASSERT_GAME_THREAD("W3DRadar::setShroudLevel radar preparation");
 #if ENABLE_CONFIGURABLE_SHROUD
 	if (!TheGlobalData->m_shroudOn)
 		return;
@@ -1685,15 +2198,96 @@ void W3DRadar::setShroudLevel(Int shroudX, Int shroudY, CellShroudStatus setting
 	else
 		alpha = 0;
 
+	if( m_shroudBatchActive && !m_shroudBatchFallback )
+	{
+		if( m_shroudOverlayBatch.append( radarMinX, radarMinY, radarMaxX,
+			radarMaxY, ARGB_Color_To_WW3D_Color(
+				m_shroudSurfaceFormat,
+				GameMakeColor( 0, 0, 0, alpha ) ) ) )
+		{
+			return;
+		}
+
+		/* Fold a full prefix into the owner CPU image without touching D3D,
+		 * then retain the same bounded storage for the next ordered chunk. */
+		if( PackRadarShroudRows( m_shroudOverlayBatch.snapshot(), 0,
+			m_shroudOverlayBatch.snapshot().height ) )
+		{
+			m_shroudBatchFolded = TRUE;
+			m_shroudOverlayBatch.clearCommands();
+			if( m_shroudOverlayBatch.append( radarMinX, radarMinY, radarMaxX,
+				radarMaxY, ARGB_Color_To_WW3D_Color(
+					m_shroudSurfaceFormat,
+					GameMakeColor( 0, 0, 0, alpha ) ) ) )
+			{
+				return;
+			}
+		}
+
+		/* A validated allocated batch should always fold and re-append.  Keep
+		 * the retained prefix for diagnosis, and use the guarded owner path. */
+		Bool prefixCommitted = TRUE;
+		if( m_shroudBatchFolded )
+		{
+			prefixCommitted = uploadPreparedRadarShroudOverlay(
+				m_shroudTexture, m_shroudOverlayBatch.snapshot() );
+		}
+		if( prefixCommitted && replayRadarShroudOverlayCommands(
+			m_shroudTexture, m_shroudOverlayBatch.snapshot() ) )
+		{
+			m_shroudOverlayBatch.reset();
+			m_shroudBatchFallback = TRUE;
+		}
+		else
+		{
+			DEBUG_CRASH(("W3DRadar: unable to fold or replay shroud batch"));
+			return;
+		}
+	}
+	if( !m_shroudBatchActive && m_shroudBatchPendingCommit )
+	{
+		/* The retained image is the only complete copy of a previously failed
+		 * batch.  Merge this direct update into it and retry the whole image;
+		 * never replace the history with only the newest rectangle. */
+		const unsigned pendingColor = ARGB_Color_To_WW3D_Color(
+			m_shroudSurfaceFormat, GameMakeColor( 0, 0, 0, alpha ) );
+		if( m_shroudOverlayBatch.append( radarMinX, radarMinY, radarMaxX,
+			radarMaxY, pendingColor ) &&
+			PackRadarShroudRows( m_shroudOverlayBatch.snapshot(), 0,
+				m_shroudOverlayBatch.snapshot().height ) )
+		{
+			m_shroudOverlayBatch.clearCommands();
+			if( uploadPreparedRadarShroudOverlay( m_shroudTexture,
+				m_shroudOverlayBatch.snapshot() ) )
+			{
+				m_shroudOverlayBatch.reset();
+				m_shroudBatchPendingCommit = FALSE;
+				m_shroudBatchFolded = FALSE;
+			}
+			return;
+		}
+		DEBUG_CRASH(("W3DRadar: unable to extend deferred shroud image"));
+		return;
+	}
+
 	if (m_shroudSurface == nullptr)
 	{
 		// This is expensive.
+		if( m_shroudTexture == nullptr )
+			return;
 		SurfaceClass* surface = m_shroudTexture->Get_Surface_Level();
 		DEBUG_ASSERTCRASH( surface, ("W3DRadar: Can't get surface for Shroud texture") );
+		if( surface == nullptr )
+			return;
 		SurfaceClass::SurfaceDescription surfaceDesc;
 		surface->Get_Description(surfaceDesc);
 		int pitch;
 		void *pBits = surface->Lock(&pitch);
+		if( pBits == nullptr )
+		{
+			REF_PTR_RELEASE(surface);
+			return;
+		}
 		const unsigned int bytesPerPixel = Get_Bytes_Per_Pixel(surfaceDesc.Format);
 		const Color argbColor = GameMakeColor( 0, 0, 0, alpha );
 		const unsigned int pixelColor = ARGB_Color_To_WW3D_Color(surfaceDesc.Format, argbColor);
@@ -1730,20 +2324,143 @@ void W3DRadar::setShroudLevel(Int shroudX, Int shroudY, CellShroudStatus setting
 
 void W3DRadar::beginSetShroudLevel()
 {
-	DEBUG_ASSERTCRASH( m_shroudSurface == nullptr, ("W3DRadar::beginSetShroudLevel: m_shroudSurface is expected null") );
-	m_shroudSurface = m_shroudTexture->Get_Surface_Level();
-	DEBUG_ASSERTCRASH( m_shroudSurface != nullptr, ("W3DRadar::beginSetShroudLevel: Can't get surface for Shroud texture") );
+	ASSERT_GAME_THREAD("W3DRadar::beginSetShroudLevel radar preparation");
+	DEBUG_ASSERTCRASH( m_shroudSurface == nullptr && !m_shroudBatchActive,
+		("W3DRadar::beginSetShroudLevel: a shroud batch is already active") );
+	if( m_shroudSurface != nullptr || m_shroudBatchActive )
+		return;
+
+	m_shroudBatchActive = TRUE;
+	m_shroudBatchFallback = FALSE;
+	if( m_shroudBatchPendingCommit && m_shroudOverlayBatch.isAllocated() )
+	{
+		/* A prior D3D commit failed after the complete ordered image was
+		 * prepared.  Keep that image as this batch's base and merge new
+		 * commands into it until an owner-thread upload succeeds. */
+		m_shroudBatchFolded = TRUE;
+		m_shroudOverlayBatch.clearCommands();
+		return;
+	}
+	m_shroudBatchPendingCommit = FALSE;
+	m_shroudBatchFolded = FALSE;
+	m_shroudOverlayBatch.reset();
+	m_shroudSurfaceBits = nullptr;
+	m_shroudSurfacePitch = 0;
+	m_shroudSurfaceFormat = WW3D_FORMAT_UNKNOWN;
+	m_shroudSurfacePixelSize = 0;
+
+	SurfaceClass *surface = m_shroudTexture != nullptr ?
+		m_shroudTexture->Get_Surface_Level() : nullptr;
+	if( surface == nullptr )
+	{
+		m_shroudBatchFallback = TRUE;
+		return;
+	}
 
 	SurfaceClass::SurfaceDescription surfaceDesc;
-	m_shroudSurface->Get_Description(surfaceDesc);
-	m_shroudSurfaceBits = m_shroudSurface->Lock(&m_shroudSurfacePitch);
-	m_shroudSurfaceFormat = surfaceDesc.Format;
-	m_shroudSurfacePixelSize = Get_Bytes_Per_Pixel(surfaceDesc.Format);
+	surface->Get_Description( surfaceDesc );
+	unsigned formatCode = RADAR_OVERLAY_FORMAT_UNKNOWN;
+	const Bool validSurface =
+		surfaceDesc.Width == static_cast<unsigned>( m_textureWidth ) &&
+		surfaceDesc.Height == static_cast<unsigned>( m_textureHeight ) &&
+		mapRadarOverlayFormat( surfaceDesc.Format, &formatCode ) &&
+		m_shroudOverlayBatch.initialize( static_cast<unsigned>( m_textureWidth ),
+			static_cast<unsigned>( m_textureHeight ), formatCode );
+	if( validSurface )
+	{
+		m_shroudSurfaceFormat = surfaceDesc.Format;
+		m_shroudSurfacePixelSize = Get_Bytes_Per_Pixel( surfaceDesc.Format );
+		if( captureRadarShroudOverlaySurface( surface, surfaceDesc,
+			m_shroudOverlayBatch.snapshot() ) )
+		{
+			REF_PTR_RELEASE( surface );
+			return;
+		}
+	}
+
+	REF_PTR_RELEASE( surface );
+	m_shroudOverlayBatch.reset();
+	m_shroudBatchFallback = TRUE;
+
+	/* Preserve the legacy one-lock batched path when CPU capture/allocation is
+	 * unavailable.  No worker is admitted while this lock is held. */
+	m_shroudSurface = m_shroudTexture != nullptr ?
+		m_shroudTexture->Get_Surface_Level() : nullptr;
+	if( m_shroudSurface != nullptr )
+	{
+		SurfaceClass::SurfaceDescription legacyDesc;
+		m_shroudSurface->Get_Description( legacyDesc );
+		m_shroudSurfaceBits = m_shroudSurface->Lock( &m_shroudSurfacePitch );
+		if( m_shroudSurfaceBits != nullptr )
+		{
+			m_shroudSurfaceFormat = legacyDesc.Format;
+			m_shroudSurfacePixelSize = Get_Bytes_Per_Pixel( legacyDesc.Format );
+			return;
+		}
+		REF_PTR_RELEASE( m_shroudSurface );
+	}
+	m_shroudSurfaceBits = nullptr;
+	m_shroudSurfacePitch = 0;
+	m_shroudSurfaceFormat = WW3D_FORMAT_UNKNOWN;
+	m_shroudSurfacePixelSize = 0;
 }
 
 void W3DRadar::endSetShroudLevel()
 {
-	DEBUG_ASSERTCRASH( m_shroudSurface != nullptr, ("W3DRadar::endSetShroudLevel: m_shroudSurface is not expected null") );
+	ASSERT_GAME_THREAD("W3DRadar::endSetShroudLevel radar preparation");
+	DEBUG_ASSERTCRASH( m_shroudSurface != nullptr || m_shroudBatchActive,
+		("W3DRadar::endSetShroudLevel: no shroud batch is active") );
+
+	Bool retainPendingCommit = FALSE;
+	if( m_shroudBatchActive && !m_shroudBatchFallback &&
+		m_shroudOverlayBatch.isAllocated() &&
+		(m_shroudOverlayBatch.commandCount() != 0 || m_shroudBatchFolded) )
+	{
+		RadarTerrainPrepareService &prepareService =
+			GetRadarTerrainPrepareService();
+		RadarOverlayPrepareLease lease( prepareService, 3 );
+		Bool outputReady = TRUE;
+		if( m_shroudOverlayBatch.commandCount() != 0 )
+		{
+			outputReady = RunRadarShroudOverlayBatch( m_shroudOverlayBatch,
+				lease ) ? TRUE : FALSE;
+			if( !outputReady )
+			{
+				/* Runtime rejection/failure must remain a complete owner path,
+				 * including batches whose earlier chunks are already folded. */
+				outputReady = PackRadarShroudRows(
+					m_shroudOverlayBatch.snapshot(), 0,
+					m_shroudOverlayBatch.snapshot().height ) ? TRUE : FALSE;
+			}
+		}
+
+		Bool committed = outputReady && uploadPreparedRadarShroudOverlay(
+			m_shroudTexture, m_shroudOverlayBatch.snapshot() );
+		if( !committed && !m_shroudBatchFolded )
+		{
+			committed = replayRadarShroudOverlayCommands( m_shroudTexture,
+				m_shroudOverlayBatch.snapshot() );
+		}
+		if( !committed )
+		{
+			if( outputReady )
+			{
+				/* Do not discard a complete image on a transient D3D failure.
+				 * The next begin/end cycle retries it before accepting loss. */
+				m_shroudOverlayBatch.clearCommands();
+				m_shroudBatchFolded = TRUE;
+				m_shroudBatchPendingCommit = TRUE;
+				retainPendingCommit = TRUE;
+			}
+			DEBUG_CRASH(("W3DRadar: shroud overlay commit deferred"));
+		}
+		else
+		{
+			m_shroudBatchPendingCommit = FALSE;
+		}
+		lease.release();
+	}
+
 	if (m_shroudSurfaceBits != nullptr)
 	{
 		m_shroudSurface->Unlock();
@@ -1753,6 +2470,13 @@ void W3DRadar::endSetShroudLevel()
 		m_shroudSurfacePixelSize = 0;
 	}
 	REF_PTR_RELEASE(m_shroudSurface);
+	if( !retainPendingCommit )
+	{
+		m_shroudOverlayBatch.reset();
+		m_shroudBatchFolded = FALSE;
+	}
+	m_shroudBatchActive = FALSE;
+	m_shroudBatchFallback = FALSE;
 }
 
 //-------------------------------------------------------------------------------------------------

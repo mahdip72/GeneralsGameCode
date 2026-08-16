@@ -13,6 +13,14 @@
 #include <limits.h>
 #include <string.h>
 
+RadarPrepareRowWork::RadarPrepareRowWork()
+{
+}
+
+RadarPrepareRowWork::~RadarPrepareRowWork()
+{
+}
+
 static bool radarTerrainCheckedMultiply(unsigned left, unsigned right,
 	unsigned *result)
 {
@@ -169,6 +177,30 @@ bool SplitRadarTerrainRowRanges(unsigned rowBegin, unsigned rowEnd,
 	return true;
 }
 
+/*
+ * The terrain adapter is owner-stack state.  RadarTerrainPrepareService
+ * joins both tasks before this object can leave scope.
+ */
+class RadarTerrainRowWorkAdapter : public RadarPrepareRowWork
+{
+public:
+	RadarTerrainRowWorkAdapter(RadarTerrainSnapshot *snapshot,
+		unsigned char *output)
+		: m_snapshot(snapshot), m_output(output)
+	{
+	}
+
+	virtual bool executeRows(unsigned rowBegin, unsigned rowEnd)
+	{
+		return m_snapshot != 0 && m_output != 0 &&
+			ShadeRadarRows(*m_snapshot, m_output, rowBegin, rowEnd);
+	}
+
+private:
+	RadarTerrainSnapshot *m_snapshot;
+	unsigned char *m_output;
+};
+
 namespace
 {
 
@@ -261,16 +293,15 @@ static bool radarTerrainPrepareRowsAreValid(
  */
 struct RadarTerrainTaskBatch
 {
-	const RadarTerrainSnapshot *snapshot;
-	unsigned char *output;
+	RadarPrepareRowWork *work;
 	unsigned char results[2];
 };
 
 /* A task owns only this batch view pointer and its exclusive row range. */
-class RadarTerrainRowTask : public rts::Task
+class RadarPrepareRowTask : public rts::Task
 {
 public:
-	RadarTerrainRowTask(RadarTerrainTaskBatch *batch, unsigned rowBegin,
+	RadarPrepareRowTask(RadarTerrainTaskBatch *batch, unsigned rowBegin,
 		unsigned rowEnd, unsigned resultIndex)
 		: m_batch(batch), m_rowBegin(rowBegin), m_rowEnd(rowEnd),
 		  m_resultIndex(resultIndex)
@@ -281,15 +312,14 @@ public:
 		}
 	}
 
-	virtual ~RadarTerrainRowTask()
+	virtual ~RadarPrepareRowTask()
 	{
 	}
 
 	virtual void execute()
 	{
-		const bool completed = m_batch != 0 && m_batch->snapshot != 0 &&
-			m_batch->output != 0 && ShadeRadarRows(*m_batch->snapshot,
-			m_batch->output, m_rowBegin, m_rowEnd);
+		const bool completed = m_batch != 0 && m_batch->work != 0 &&
+			m_batch->work->executeRows(m_rowBegin, m_rowEnd);
 		if (m_batch != 0 && m_resultIndex < 2)
 		{
 			m_batch->results[m_resultIndex] = completed ? 1 : 0;
@@ -297,8 +327,8 @@ public:
 	}
 
 private:
-	RadarTerrainRowTask(const RadarTerrainRowTask &);
-	RadarTerrainRowTask &operator=(const RadarTerrainRowTask &);
+	RadarPrepareRowTask(const RadarPrepareRowTask &);
+	RadarPrepareRowTask &operator=(const RadarPrepareRowTask &);
 
 	RadarTerrainTaskBatch *m_batch;
 	unsigned m_rowBegin;
@@ -306,7 +336,7 @@ private:
 	unsigned m_resultIndex;
 };
 
-static RadarTerrainRowTask *radarTerrainAllocateRowTask(
+static RadarPrepareRowTask *radarPrepareAllocateRowTask(
 	RadarTerrainTaskBatch *batch, unsigned rowBegin, unsigned rowEnd,
 	unsigned resultIndex)
 {
@@ -318,10 +348,10 @@ static RadarTerrainRowTask *radarTerrainAllocateRowTask(
 	}
 #endif
 
-	RadarTerrainRowTask *task = 0;
+	RadarPrepareRowTask *task = 0;
 	try
 	{
-		task = new RadarTerrainRowTask(batch, rowBegin, rowEnd, resultIndex);
+		task = new RadarPrepareRowTask(batch, rowBegin, rowEnd, resultIndex);
 	}
 	catch (...)
 	{
@@ -426,16 +456,15 @@ void RadarTerrainPrepareService::stopIdleRuntime()
 	m_runtime.shutdown();
 }
 
-bool RadarTerrainPrepareService::runAttempt(RadarTerrainSnapshot *snapshot,
-	unsigned char *output, unsigned rowBegin, unsigned rowEnd,
+bool RadarTerrainPrepareService::runAttempt(RadarPrepareRowWork *work,
+	unsigned rowBegin, unsigned rowEnd,
 	unsigned workerCount)
 {
 	RadarTerrainRowRange ranges[2];
-	RadarTerrainRowTask *tasks[2] = { 0, 0 };
+	RadarPrepareRowTask *tasks[2] = { 0, 0 };
 	RadarTerrainTaskBatch taskBatch;
 	bool submitted;
-	taskBatch.snapshot = snapshot;
-	taskBatch.output = output;
+	taskBatch.work = work;
 	taskBatch.results[0] = 0;
 	taskBatch.results[1] = 0;
 	if (!SplitRadarTerrainRowRanges(rowBegin, rowEnd, ranges))
@@ -449,7 +478,7 @@ bool RadarTerrainPrepareService::runAttempt(RadarTerrainSnapshot *snapshot,
 	}
 
 	/* Always construct exactly two disjoint wrappers for one batch. */
-	tasks[0] = radarTerrainAllocateRowTask(&taskBatch, ranges[0].begin,
+	tasks[0] = radarPrepareAllocateRowTask(&taskBatch, ranges[0].begin,
 		ranges[0].end, 0);
 	if (tasks[0] == 0)
 	{
@@ -457,7 +486,7 @@ bool RadarTerrainPrepareService::runAttempt(RadarTerrainSnapshot *snapshot,
 		return false;
 	}
 
-	tasks[1] = radarTerrainAllocateRowTask(&taskBatch, ranges[1].begin,
+	tasks[1] = radarPrepareAllocateRowTask(&taskBatch, ranges[1].begin,
 		ranges[1].end, 1);
 	if (tasks[1] == 0)
 	{
@@ -486,12 +515,11 @@ bool RadarTerrainPrepareService::runAttempt(RadarTerrainSnapshot *snapshot,
 	return taskBatch.results[0] != 0 && taskBatch.results[1] != 0;
 }
 
-bool RadarTerrainPrepareService::runRows(RadarTerrainSnapshot *snapshot,
-	unsigned char *output, unsigned rowBegin, unsigned rowEnd)
+bool RadarTerrainPrepareService::runRows(RadarPrepareRowWork *work,
+	unsigned rowBegin, unsigned rowEnd)
 {
 	if (!m_initialized || m_stopping || !m_leaseActive ||
-		!radarTerrainPrepareRowsAreValid(snapshot, output, rowBegin, rowEnd) ||
-		rowBegin == rowEnd)
+		work == 0 || rowBegin == rowEnd || rowBegin > rowEnd)
 	{
 		return false;
 	}
@@ -503,7 +531,7 @@ bool RadarTerrainPrepareService::runRows(RadarTerrainSnapshot *snapshot,
 		stopIdleRuntime();
 	}
 
-	if (runAttempt(snapshot, output, rowBegin, rowEnd, m_requestedWorkers))
+	if (runAttempt(work, rowBegin, rowEnd, m_requestedWorkers))
 	{
 		return true;
 	}
@@ -511,13 +539,26 @@ bool RadarTerrainPrepareService::runRows(RadarTerrainSnapshot *snapshot,
 	/* A failed two-worker attempt must be idle before the one-worker retry. */
 	stopIdleRuntime();
 	if (m_requestedWorkers > 1 &&
-		runAttempt(snapshot, output, rowBegin, rowEnd, 1))
+		runAttempt(work, rowBegin, rowEnd, 1))
 	{
 		return true;
 	}
 
 	stopIdleRuntime();
 	return false;
+}
+
+bool RadarTerrainPrepareService::runRows(RadarTerrainSnapshot *snapshot,
+	unsigned char *output, unsigned rowBegin, unsigned rowEnd)
+{
+	if (!radarTerrainPrepareRowsAreValid(snapshot, output, rowBegin, rowEnd) ||
+		rowBegin == rowEnd)
+	{
+		return false;
+	}
+
+	RadarTerrainRowWorkAdapter work(snapshot, output);
+	return runRows(&work, rowBegin, rowEnd);
 }
 
 void RadarTerrainPrepareService::release(unsigned consumerId)

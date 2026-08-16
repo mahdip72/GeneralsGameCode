@@ -186,6 +186,45 @@ and scoped delivery/privacy hygiene.  All ten review passes and any resulting
 fix/retest cycle must complete before Stage 5 is considered ready for the
 stacked-stage handoff.
 
+# Stage 6 radar overlay preparation checks
+
+Stage 6 keeps radar object/shroud capture and every Direct3D operation on the
+owner thread.  Workers receive only immutable ordered commands plus owned CPU
+pixels, write disjoint row ranges, and join before owner upload.  Small object
+lists stay on the direct owner path; large object lists use command-major row
+work.  Shroud overflow folds ordered chunks into the owned image, and failed
+worker/upload attempts retain a complete image until an owner commit succeeds
+or clear/reset/teardown explicitly supersedes it.
+
+Run the repository-relative hygiene, focused, and both-title checks:
+
+```powershell
+git diff --check
+cmake --preset win32-debug -DRTS_BUILD_GENERALS=ON -DRTS_BUILD_ZEROHOUR=ON -DRTS_BUILD_CORE_EXTRAS=ON
+cmake --build build/win32-debug --config Debug --target radar_overlay_prepare_tests radar_terrain_prepare_tests core_task_runtime_tests g_generals z_generals --parallel 2
+ctest --test-dir build/win32-debug -C Debug -R "^(radar_overlay_prepare|radar_terrain_prepare|core_task_runtime)_tests$" --output-on-failure
+```
+
+The overlay test must cover both supported formats, clipping, inclusive shroud
+rectangles, exact object/shroud command order, last-writer-wins, row guards,
+serial-versus-split bytes, checked storage limits, lease denial, queue/task
+failure fallback, and worker/owner source audits.  Build the same targets with
+the optimized VC6 preset before replay validation; a modern executable is not
+a substitute for the compatibility lane.
+
+For the Stage 6 replay gate, use the same ten distinct fixtures defined above:
+run the nine non-stress replays once and the 2v6 Hard-AI replay three times.
+All twelve executions must exit successfully without CRC mismatch, assertion,
+crash, missing map, or ownership failure, and the three stress CRC trees must
+be byte-identical.  Keep replay state isolated from the playable profile and
+record no personal machine paths in commits, documentation, or PR text.
+
+Manual acceptance remains deferred to the user.  When requested, test Stage 5
+first and Stage 6 second, checking radar terrain, object markers, stealth
+alpha, shroud/fog transitions, radar clears, map return/reload, Alt-Tab/device
+reset, dense battles, and clean exit.  Do not start Stage 7 before both manual
+test rounds are complete.
+
 # Miles completion callback checks
 
 The Miles EOS callbacks must only publish a fixed-size `{handle, type, generation}` record. They must not enter `TheAudio`, call Miles APIs, allocate, or take the audio-cache mutex. The owner-thread `MilesAudioManager::update()` drains one queue snapshot per frame; reset and shutdown close admission before unregistering callbacks and releasing handles, then clear queued generations. On overflow, the owner drains status-visible stopped handles and uses the compatibility fallback rather than waiting in a callback.

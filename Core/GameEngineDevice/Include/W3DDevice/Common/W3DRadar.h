@@ -33,6 +33,7 @@
 
 // INCLUDES ///////////////////////////////////////////////////////////////////////////////////////
 #include "Common/Radar.h"
+#include "W3DDevice/Common/RadarOverlayPrepare.h"
 #include "WW3D2/ww3dformat.h"
 
 // FORWARD REFERENCES /////////////////////////////////////////////////////////////////////////////
@@ -40,6 +41,7 @@ class TextureClass;
 class SurfaceClass;
 class TerrainLogic;
 class RadarTerrainBatch;
+class RadarObjectOverlayBatch;
 
 // PROTOTYPES /////////////////////////////////////////////////////////////////////////////////////
 //-------------------------------------------------------------------------------------------------
@@ -90,6 +92,9 @@ protected:
 	void drawIcons( Int pixelX, Int pixelY, Int width, Int height );	///< draw all of the radar icons
 	void updateObjectTexture(TextureClass *texture);
 	static Bool canRenderObject( const RadarObject *rObj, const Player *localPlayer );
+	Bool captureObjectOverlayList( const RadarObject *listHead,
+		const Player *localPlayer, RadarObjectOverlayBatch &batch,
+		WW3DFormat surfaceFormat );
 	void renderObjectList( const RadarObject *listHead, TextureClass *texture );
 	void interpolateColorForHeight( RGBColor *color,
 																	Real height,
@@ -117,6 +122,11 @@ protected:
 	int m_shroudSurfacePitch;											///< shroud surface pitch
 	WW3DFormat m_shroudSurfaceFormat;							///< shroud surface format
 	UnsignedInt m_shroudSurfacePixelSize;					///< shroud surface pixel size
+	RadarShroudOverlayBatch m_shroudOverlayBatch;				///< persistent staged shroud batch
+	Bool m_shroudBatchActive;									///< begin/end batch is active
+	Bool m_shroudBatchFallback;								///< direct owner fallback for this batch
+	Bool m_shroudBatchFolded;								///< output contains cleared command chunks
+	Bool m_shroudBatchPendingCommit;						///< retain a complete CPU image until upload succeeds
 
 	Int m_textureWidth;														///< width for all radar textures
 	Int m_textureHeight;													///< height for all radar textures
