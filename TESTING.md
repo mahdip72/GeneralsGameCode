@@ -225,6 +225,54 @@ alpha, shroud/fog transitions, radar clears, map return/reload, Alt-Tab/device
 reset, dense battles, and clean exit.  Do not start Stage 7 before both manual
 test rounds are complete.
 
+# Stage 7 static terrain geometry preparation checks
+
+Stage 7 parallelizes only CPU preparation of max-LOD static terrain vertices
+and static lighting.  The owner captures map and light state, owns all Direct3D
+and backup publication, joins workers synchronously, validates the complete
+output, and falls back to the unchanged serial path on any failure.  Simulation,
+AI, pathfinding, networking, replay and save state, RNG, camera behavior,
+terrain mutation, lower LODs, and dynamic lighting remain serial.
+
+Run the repository-relative hygiene, focused, and both-title checks from clean,
+isolated build trees:
+
+```powershell
+git diff --check
+cmake --preset win32-debug -DRTS_BUILD_GENERALS=ON -DRTS_BUILD_ZEROHOUR=ON -DRTS_BUILD_CORE_EXTRAS=ON
+cmake --build build/win32-debug --config Debug --target height_map_terrain_prepare_tests radar_terrain_prepare_tests radar_overlay_prepare_tests core_task_runtime_tests core_texture_mip_buffer_tests core_screenshot_codec_tests core_miles_audio_completion_tests core_camera_audio_policy_tests g_generals z_generals --parallel 2
+ctest --test-dir build/win32-debug -C Debug -R "^(height_map_terrain_prepare|radar_terrain_prepare|radar_overlay_prepare|core_task_runtime|core_texture_mip_buffer|core_screenshot_codec|core_miles_audio_completion|core_camera_audio_policy)_tests$" --output-on-failure
+```
+
+Repeat the focused targets and both game targets with `win32-profile` using the
+Release configuration.  Build and run the same targets with the VC6 preset;
+disable precompiled headers if required by the legacy compiler.  A modern
+executable is not a substitute for the VC6 compatibility lane.
+
+The terrain suite must cover exact serial-versus-partitioned byte parity,
+normals, flip/UV/alpha, origin and border capture, static-light branches, depth
+fade, layout and guard bytes, checked bounds, complete output validation,
+worker admission, join/fallback, cleanup, shutdown, and restart.  Source review
+must confirm that workers access no D3D/DX8 object, live map/light/global
+pointer, allocation, wait, logging, RNG, replay/save/network state, or
+title-specific API.  Both titles must retain correct shared-service
+initialization and shutdown ordering.
+
+After focused checks, both-title builds, and ten review rounds, run the ten
+distinct replay fixtures defined above.  Execute the nine non-stress fixtures
+once and the 2v6 Hard-AI stress fixture three times: twelve isolated executions
+total.  Every run must exit successfully without crash, assertion, ownership
+failure, missing map, CRC mismatch, or desync.  The three stress runs must
+produce byte-identical CRC file sets.  Run three fresh AI-vs-AI headless smoke
+games when the established runner is available.
+
+Use a VC6-compatible artifact from the exact final commit and an isolated
+disposable runtime and profile.  Do not use the live profile or playable
+installation.  Record only repository-relative commands and aggregate results;
+never commit machine paths, personal profile paths, or local build/log paths.
+Do not mark Stage 7 ready until all focused tests, both-title modern and VC6
+builds, ten review rounds, and the full replay gate have passed.
+
 # Miles completion callback checks
 
 The Miles EOS callbacks must only publish a fixed-size `{handle, type, generation}` record. They must not enter `TheAudio`, call Miles APIs, allocate, or take the audio-cache mutex. The owner-thread `MilesAudioManager::update()` drains one queue snapshot per frame; reset and shutdown close admission before unregistering callbacks and releasing handles, then clear queued generations. On overflow, the owner drains status-visible stopped handles and uses the compatibility fallback rather than waiting in a callback.

@@ -46,9 +46,11 @@
 //         Includes
 //-----------------------------------------------------------------------------
 #include "W3DDevice/GameClient/HeightMap.h"
+#include "W3DDevice/Common/HeightMapTerrainPrepare.h"
 
 #ifndef USE_FLAT_HEIGHT_MAP // Flat height map uses flattened textures. jba. [3/20/2003]
 
+#include <stddef.h>
 #include <stdlib.h>
 #include <WW3D2/assetmgr.h>
 #include <WW3D2/texture.h>
@@ -111,6 +113,30 @@ static ShaderClass detailOpaqueShader(SC_DETAIL_BLEND);
 
 #define ADJUST_FROM_INDEX_TO_REAL(k) ((k-m_map->getBorderSizeInline())*MAP_XY_FACTOR)
 inline Int IABS(Int x) {	if (x>=0) return x; return -x;};
+
+class RadarTerrainConsumerLeaseScope
+{
+public:
+	RadarTerrainConsumerLeaseScope(RadarTerrainPrepareService &service,
+		Bool &held)
+		: m_service(service), m_held(held)
+	{
+	}
+
+	~RadarTerrainConsumerLeaseScope()
+	{
+		if (m_held)
+			m_service.release(4);
+	}
+
+private:
+	RadarTerrainConsumerLeaseScope(const RadarTerrainConsumerLeaseScope &);
+	RadarTerrainConsumerLeaseScope &operator=(
+		const RadarTerrainConsumerLeaseScope &);
+
+	RadarTerrainPrepareService &m_service;
+	Bool &m_held;
+};
 
 //-----------------------------------------------------------------------------
 //         Private Functions
@@ -301,7 +327,313 @@ data is expected to be an array same dimensions as current heightmap
 mapped into this VB.
 */
 //=============================================================================
-Int HeightMapRenderObjClass::updateVB(DX8VertexBufferClass	*pVB, VERTEX_FORMAT *data, Int x0, Int y0, Int x1, Int y1, Int originX, Int originY, WorldHeightMap *pMap, RefRenderObjListIterator *pLightsIterator)
+void HeightMapRenderObjClass::applyHeightMapTerrainDiagnostics(
+	HeightMapTerrainVertex *vertices, Int mapX, Int mapY, Int xCoord, Int yCoord,
+	WorldHeightMap *pMap)
+{
+	if (!vertices || !pMap || !m_showImpassableAreas)
+		return;
+
+	DEBUG_ASSERTCRASH(PATHFIND_CELL_SIZE_F == MAP_XY_FACTOR, ("Pathfind must be terrain cell size, or this code needs reworking.  John A."));
+	Real borderHiX = (pMap->getXExtent()-2*pMap->getBorderSizeInline())*MAP_XY_FACTOR;
+	Real borderHiY = (pMap->getYExtent()-2*pMap->getBorderSizeInline())*MAP_XY_FACTOR;
+	Bool border = vertices[0].x == -MAP_XY_FACTOR || vertices[0].y == -MAP_XY_FACTOR;
+	Bool cliffMapped = pMap->isCliffMappedTexture(mapX, mapY);
+	if (vertices[0].x == borderHiX)
+		border = true;
+	if (vertices[0].y == borderHiY)
+		border = true;
+	Bool isCliff = pMap->getCliffState(xCoord, yCoord) || showAsVisibleCliff(xCoord, yCoord);
+
+	if (isCliff || border || cliffMapped)
+	{
+		Int cellX, cellY;
+		for (cellX=0; cellX<2; cellX++)
+		{
+			for (cellY=0; cellY<2; cellY++)
+			{
+				Int vertex = cellX+2*cellY;
+				if (border)
+				{
+					Bool doBorder = false;
+					if (vertices[vertex].y >= 0 && vertices[vertex].y <= borderHiY)
+					{
+						if (vertices[vertex].x == 0 || vertices[vertex].x == borderHiX)
+							doBorder = true;
+					}
+					if (vertices[vertex].x >= 0 && vertices[vertex].x <= borderHiX)
+					{
+						if (vertices[vertex].y == 0 || vertices[vertex].y == borderHiY)
+							doBorder = true;
+					}
+					if (doBorder)
+						vertices[vertex].diffuse &= 0xFF0000ff;
+				}
+				else if (isCliff)
+				{
+					vertices[vertex].diffuse &= 0xFFFF0000;
+				}
+				if (cliffMapped && vertex==0)
+				{
+					vertices[vertex].diffuse &= 0xFF000000;
+					vertices[vertex].diffuse |= 0xff00;
+				}
+			}
+		}
+	}
+}
+
+Bool HeightMapRenderObjClass::captureHeightMapTerrainBatch(
+	HeightMapTerrainBatch &batch, Int x0, Int y0, Int x1, Int y1,
+	Int originX, Int originY, WorldHeightMap *pMap,
+	RefRenderObjListIterator *pLightsIterator)
+{
+	unsigned sceneLightCount = 0;
+	Int globalLightCount;
+	unsigned cellIndex = 0;
+	unsigned sceneLightIndex = 0;
+	Int j;
+	HeightMapTerrainRgb terrainAmbient;
+
+	if (!pMap || !TheGlobalData || x0 >= x1 || y0 >= y1 ||
+		x0 < originX || y0 < originY ||
+		x1 > originX + VERTEX_BUFFER_TILE_LENGTH ||
+		y1 > originY + VERTEX_BUFFER_TILE_LENGTH)
+		return false;
+
+	if (pLightsIterator)
+	{
+		for (pLightsIterator->First(); !pLightsIterator->Is_Done();
+			pLightsIterator->Next())
+		{
+			if (sceneLightCount == UINT_MAX)
+				return false;
+			++sceneLightCount;
+		}
+	}
+
+	globalLightCount = TheGlobalData->m_numGlobalLights;
+	if (globalLightCount < 0 || globalLightCount > HEIGHTMAP_TERRAIN_MAX_GLOBAL_LIGHTS ||
+		!batch.initialize(static_cast<unsigned>(x1-x0),
+			static_cast<unsigned>(y1-y0), static_cast<unsigned>(globalLightCount),
+			sceneLightCount))
+		return false;
+
+	terrainAmbient.red = TheGlobalData->m_terrainAmbient[0].red;
+	terrainAmbient.green = TheGlobalData->m_terrainAmbient[0].green;
+	terrainAmbient.blue = TheGlobalData->m_terrainAmbient[0].blue;
+	if (!batch.setParameters(MAP_XY_FACTOR, MAP_HEIGHT_SCALE,
+		terrainAmbient, m_useDepthFade ? 1 : 0,
+		m_depthFade.X, m_depthFade.Y, m_depthFade.Z,
+		TheGlobalData->m_waterPositionZ))
+	{
+		return false;
+	}
+	for (Int lightIndex=0; lightIndex<globalLightCount; ++lightIndex)
+	{
+		const Coord3D &lightPos = TheGlobalData->m_terrainLightPos[lightIndex];
+		batch.globalLights()[lightIndex].rayX = -lightPos.x;
+		batch.globalLights()[lightIndex].rayY = -lightPos.y;
+		batch.globalLights()[lightIndex].rayZ = -lightPos.z;
+		batch.globalLights()[lightIndex].diffuse.red =
+			TheGlobalData->m_terrainDiffuse[lightIndex].red;
+		batch.globalLights()[lightIndex].diffuse.green =
+			TheGlobalData->m_terrainDiffuse[lightIndex].green;
+		batch.globalLights()[lightIndex].diffuse.blue =
+			TheGlobalData->m_terrainDiffuse[lightIndex].blue;
+	}
+
+	if (pLightsIterator)
+	{
+		pLightsIterator->First();
+		while (!pLightsIterator->Is_Done())
+		{
+			LightClass *pLight = (LightClass *)pLightsIterator->Peek_Obj();
+			HeightMapTerrainSceneLight *captured;
+			Vector3 position;
+			Vector3 direction;
+			Vector3 diffuse;
+			Vector3 ambient;
+			if (!pLight || sceneLightIndex >= sceneLightCount)
+				return false;
+			captured = &batch.sceneLights()[sceneLightIndex];
+			captured->type = static_cast<unsigned>(pLight->Get_Type());
+			position = pLight->Get_Position();
+			captured->positionX = position.X;
+			captured->positionY = position.Y;
+			captured->positionZ = position.Z;
+			direction = pLight->Get_Transform().Get_Z_Vector();
+			captured->directionX = direction.X;
+			captured->directionY = direction.Y;
+			captured->directionZ = direction.Z;
+			captured->range = 0.0;
+			captured->midRange = 0.0;
+			if (captured->type == HEIGHTMAP_TERRAIN_LIGHT_POINT ||
+				captured->type == HEIGHTMAP_TERRAIN_LIGHT_SPOT)
+			{
+				pLight->Get_Far_Attenuation_Range(captured->midRange,
+					captured->range);
+			}
+			pLight->Get_Diffuse(&diffuse);
+			pLight->Get_Ambient(&ambient);
+			captured->diffuse.red = diffuse.X;
+			captured->diffuse.green = diffuse.Y;
+			captured->diffuse.blue = diffuse.Z;
+			captured->ambient.red = ambient.X;
+			captured->ambient.green = ambient.Y;
+			captured->ambient.blue = ambient.Z;
+			++sceneLightIndex;
+			pLightsIterator->Next();
+		}
+	}
+	if (sceneLightIndex != sceneLightCount)
+		return false;
+
+	for (j=y0; j<y1; ++j)
+	{
+		const Int mapY = getYWithOrigin(j);
+		Int topY = mapY-1;
+		if (topY < -pMap->getDrawOrgY())
+			topY = -pMap->getDrawOrgY();
+		Int bottomY = getYWithOrigin(j+1)+1;
+		if (bottomY >= pMap->getYExtent()-pMap->getDrawOrgY())
+			bottomY = pMap->getYExtent()-pMap->getDrawOrgY()-1;
+		for (Int i=x0; i<x1; ++i)
+		{
+			const Int mapX = getXWithOrigin(i);
+			Int leftX = mapX-1;
+			if (leftX < -pMap->getDrawOrgX())
+				leftX = -pMap->getDrawOrgX();
+			Int rightX = getXWithOrigin(i+1)+1;
+			if (rightX >= pMap->getXExtent()-pMap->getDrawOrgX())
+				rightX = pMap->getXExtent()-pMap->getDrawOrgX()-1;
+			Real U[4], V[4], UA[4], VA[4];
+			UnsignedByte alpha[4];
+			Bool flipForBlend = false;
+			pMap->getUVData(mapX, mapY, U, V);
+			pMap->getAlphaUVData(mapX, mapY, UA, VA, alpha,
+				&flipForBlend);
+			if (!CaptureHeightMapTerrainCellInput(batch.cells()[cellIndex],
+					pMap->getDataPtr(), static_cast<unsigned>(pMap->getXExtent()),
+					static_cast<unsigned>(pMap->getYExtent()),
+					pMap->getDrawOrgX(), pMap->getDrawOrgY(), mapX, mapY,
+					leftX, rightX, topY, bottomY,
+					mapX + pMap->getDrawOrgX(), mapY + pMap->getDrawOrgY(),
+					pMap->getBorderSizeInline(), MAP_XY_FACTOR,
+					U, V, UA, VA, alpha, flipForBlend ? 1 : 0))
+				return false;
+			++cellIndex;
+		}
+	}
+	return cellIndex == batch.snapshot().cellCount && batch.markComplete();
+}
+
+Int HeightMapRenderObjClass::updateVB(
+	DX8VertexBufferClass *pVB, VERTEX_FORMAT *data, Int x0, Int y0,
+	Int x1, Int y1, Int originX, Int originY, WorldHeightMap *pMap,
+	RefRenderObjListIterator *pLightsIterator)
+{
+	return updateVBSerial(pVB, data, x0, y0, x1, y1, originX, originY,
+		pMap, pLightsIterator);
+}
+
+Int HeightMapRenderObjClass::updateVBWithTerrainPreparation(
+	DX8VertexBufferClass *pVB, VERTEX_FORMAT *data, Int x0, Int y0, Int x1,
+	Int y1, Int originX, Int originY, WorldHeightMap *pMap,
+	RefRenderObjListIterator *pLightsIterator,
+	RadarTerrainPrepareService *service, Bool *leaseHeld)
+{
+	HeightMapTerrainBatch batch;
+	const unsigned width = x1 > x0 ? static_cast<unsigned>(x1-x0) : 0;
+	const unsigned height = y1 > y0 ? static_cast<unsigned>(y1-y0) : 0;
+	const unsigned destinationRowStrideBytes =
+		VERTEX_BUFFER_TILE_LENGTH * HEIGHTMAP_TERRAIN_VERTEX_COUNT *
+		static_cast<unsigned>(sizeof(VERTEX_FORMAT));
+	const unsigned destinationCapacityBytes =
+		VERTEX_BUFFER_TILE_LENGTH * VERTEX_BUFFER_TILE_LENGTH *
+		HEIGHTMAP_TERRAIN_VERTEX_COUNT *
+		static_cast<unsigned>(sizeof(VERTEX_FORMAT));
+	Bool hardwareReady = false;
+	bool ranParallel = false;
+	if (sizeof(VERTEX_FORMAT) != sizeof(HeightMapTerrainVertex) ||
+		offsetof(VERTEX_FORMAT, x) != offsetof(HeightMapTerrainVertex, x) ||
+		offsetof(VERTEX_FORMAT, y) != offsetof(HeightMapTerrainVertex, y) ||
+		offsetof(VERTEX_FORMAT, z) != offsetof(HeightMapTerrainVertex, z) ||
+		offsetof(VERTEX_FORMAT, diffuse) !=
+			offsetof(HeightMapTerrainVertex, diffuse) ||
+		offsetof(VERTEX_FORMAT, u1) != offsetof(HeightMapTerrainVertex, u1) ||
+		offsetof(VERTEX_FORMAT, v1) != offsetof(HeightMapTerrainVertex, v1) ||
+		offsetof(VERTEX_FORMAT, u2) != offsetof(HeightMapTerrainVertex, u2) ||
+		offsetof(VERTEX_FORMAT, v2) != offsetof(HeightMapTerrainVertex, v2))
+		return updateVBSerial(pVB, data, x0, y0, x1, y1, originX, originY,
+			pMap, pLightsIterator);
+	REF_PTR_SET(m_map, pMap);
+	if (!service || !leaseHeld || width == 0 || height < 2 ||
+		width * height < 512 || !captureHeightMapTerrainBatch(batch, x0, y0,
+			x1, y1, originX, originY, pMap, pLightsIterator))
+	{
+		return updateVBSerial(pVB, data, x0, y0, x1, y1, originX, originY,
+			pMap, pLightsIterator);
+	}
+	if (!*leaseHeld)
+	{
+		if (!service->tryAcquire(4))
+			return updateVBSerial(pVB, data, x0, y0, x1, y1, originX,
+				originY, pMap, pLightsIterator);
+		*leaseHeld = true;
+	}
+	if (!RunHeightMapTerrainBatch(batch, *service, true, &ranParallel) ||
+		!ranParallel)
+	{
+		return updateVBSerial(pVB, data, x0, y0, x1, y1, originX, originY,
+			pMap, pLightsIterator);
+	}
+
+	HeightMapTerrainVertex *staged = batch.output();
+	for (unsigned row=0; row<height; ++row)
+	{
+		HeightMapTerrainVertex *destination = staged +
+			row * width * HEIGHTMAP_TERRAIN_VERTEX_COUNT;
+		for (unsigned column=0; column<width; ++column)
+		{
+			const Int cellX = x0 + static_cast<Int>(column);
+			const Int cellY = y0 + static_cast<Int>(row);
+			const Int mapX = getXWithOrigin(cellX);
+			const Int mapY = getYWithOrigin(cellY);
+			applyHeightMapTerrainDiagnostics(destination +
+				column * HEIGHTMAP_TERRAIN_VERTEX_COUNT, mapX, mapY,
+				mapX + pMap->getDrawOrgX(), mapY + pMap->getDrawOrgY(), pMap);
+		}
+	}
+	if (!ValidatePreparedHeightMapTerrainOutput(batch.snapshot(), staged))
+	{
+		return updateVBSerial(pVB, data, x0, y0, x1, y1, originX, originY,
+			pMap, pLightsIterator);
+	}
+
+	if (pVB && data)
+	{
+		DX8VertexBufferClass::WriteLockClass lockVtxBuffer(pVB);
+		void *hardware = lockVtxBuffer.Get_Vertex_Array();
+		if (hardware)
+		{
+			hardwareReady = ScatterPreparedHeightMapTerrainRows(
+				batch.snapshot(), staged,
+				static_cast<unsigned>(y0-originY),
+				static_cast<unsigned>(x0-originX) *
+					HEIGHTMAP_TERRAIN_VERTEX_COUNT *
+					static_cast<unsigned>(sizeof(VERTEX_FORMAT)),
+				destinationRowStrideBytes, data, destinationCapacityBytes,
+				hardware, destinationCapacityBytes);
+		}
+	}
+	if (!hardwareReady)
+		return updateVBSerial(pVB, data, x0, y0, x1, y1, originX, originY,
+			pMap, pLightsIterator);
+	return 0;
+}
+
+Int HeightMapRenderObjClass::updateVBSerial(DX8VertexBufferClass	*pVB, VERTEX_FORMAT *data, Int x0, Int y0, Int x1, Int y1, Int originX, Int originY, WorldHeightMap *pMap, RefRenderObjListIterator *pLightsIterator)
 {
 	Int i,j;
 	Vector3 lightRay[MAX_GLOBAL_LIGHTS];
@@ -982,6 +1314,10 @@ Int HeightMapRenderObjClass::updateBlock(Int x0, Int y0, Int x1, Int y1,  WorldH
 
 	Int i,j;
 	Int originX,originY;
+	RadarTerrainPrepareService &terrainService = GetRadarTerrainPrepareService();
+	Bool terrainLeaseHeld = false;
+	RadarTerrainConsumerLeaseScope terrainLease(terrainService,
+		terrainLeaseHeld);
 	//step through each vertex buffer that needs updating
 	for (j=0; j<m_numVBTilesY; j++)
 	{
@@ -1007,7 +1343,18 @@ Int HeightMapRenderObjClass::updateBlock(Int x0, Int y0, Int x1, Int y1,  WorldH
 			}
 			DX8VertexBufferClass *pVB = getVertexBufferTile(i, j);
 			VERTEX_FORMAT *pData = getVertexBufferBackup(i, j);
-			updateVB(pVB, pData, xMin, yMin, xMax, yMax, originX, originY, pMap, pLightsIterator);
+			if (terrainLeaseHeld)
+			{
+				updateVBWithTerrainPreparation(pVB, pData, xMin, yMin, xMax,
+					yMax, originX, originY, pMap, pLightsIterator,
+					&terrainService, &terrainLeaseHeld);
+			}
+			else
+			{
+				updateVBWithTerrainPreparation(pVB, pData, xMin, yMin, xMax,
+					yMax, originX, originY, pMap, pLightsIterator,
+					&terrainService, &terrainLeaseHeld);
+			}
 		}
 	}
 

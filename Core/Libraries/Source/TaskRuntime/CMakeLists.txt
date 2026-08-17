@@ -4,6 +4,7 @@ target_sources(core_task_runtime PRIVATE
     TaskRuntime.cpp
     RadarTerrainKernel.cpp
     RadarOverlayKernel.cpp
+    HeightMapTerrainKernel.cpp
 )
 
 target_include_directories(core_task_runtime PUBLIC

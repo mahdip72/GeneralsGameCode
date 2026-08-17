@@ -3,6 +3,7 @@
 #include <stdio.h>
 
 #if defined(_WIN32)
+#include <float.h>
 #include <process.h>
 #include <windows.h>
 #else
@@ -180,6 +181,41 @@ private:
 	bool m_signaled;
 #endif
 };
+
+#if defined(_WIN32) && !defined(_WIN64)
+class FloatingPointControlGuard
+{
+public:
+	FloatingPointControlGuard() : m_controlWord(_controlfp(0, 0)) {}
+	~FloatingPointControlGuard()
+	{
+		_controlfp(m_controlWord, _MCW_PC | _MCW_RC);
+	}
+
+private:
+	FloatingPointControlGuard(const FloatingPointControlGuard &);
+	FloatingPointControlGuard &operator=(const FloatingPointControlGuard &);
+
+	unsigned m_controlWord;
+};
+
+class FloatingPointProbeTask : public rts::Task
+{
+public:
+	explicit FloatingPointProbeTask(unsigned *controlWord) :
+		m_controlWord(controlWord)
+	{
+	}
+
+	virtual void execute()
+	{
+		*m_controlWord = _controlfp(0, 0);
+	}
+
+private:
+	unsigned *m_controlWord;
+};
+#endif
 
 class RuntimeJoinObserver
 {
@@ -769,6 +805,49 @@ static int testRuntimeCanRestartAfterShutdown()
 	return 0;
 }
 
+#if defined(_WIN32) && !defined(_WIN64)
+static int testWorkersUseDeterministicFloatingPointMode()
+{
+	const char *testName = "testWorkersUseDeterministicFloatingPointMode";
+	const unsigned modeMask = _MCW_PC | _MCW_RC;
+	const unsigned expectedMode = (_PC_24 | _RC_NEAR) & modeMask;
+	const unsigned originalMode = _controlfp(0, 0) & modeMask;
+	unsigned workerMode = 0;
+	TaskRecord gateRecord;
+	Gate gate;
+	rts::TaskRuntime runtime;
+	FloatingPointProbeTask *probe;
+	bool submitted;
+	int result = 0;
+
+	{
+		FloatingPointControlGuard guard;
+		_controlfp(_PC_64 | _RC_DOWN, modeMask);
+		CHECK(testName, runtime.start(1, 2));
+		CHECK(testName, runtime.trySubmit(new GateTask(&gate, &gateRecord)));
+		gate.waitForEntry();
+		_controlfp(_PC_24 | _RC_NEAR, modeMask);
+		gate.open();
+		probe = new FloatingPointProbeTask(&workerMode);
+		submitted = runtime.trySubmit(probe);
+		if (!submitted)
+		{
+			delete probe;
+		}
+		runtime.shutdown();
+		result |= check(submitted, testName,
+			"runtime.trySubmit(floatingPointProbe)");
+		result |= check(gateRecord.executions == 1, testName,
+			"gateRecord.executions == 1");
+		result |= check((workerMode & modeMask) == expectedMode, testName,
+			"worker floating-point mode is _PC_24 | _RC_NEAR");
+	}
+	result |= check((_controlfp(0, 0) & modeMask) == originalMode, testName,
+		"caller floating-point mode is restored");
+	return result;
+}
+#endif
+
 static int testStateAllocationFailureLeavesRuntimeUsable()
 {
 	const char *testName = "testStateAllocationFailureLeavesRuntimeUsable";
@@ -1009,6 +1088,9 @@ int main()
 	result |= testQueueBackpressure();
 	result |= testShutdownDrainsAcceptedTasks();
 	result |= testRuntimeCanRestartAfterShutdown();
+#if defined(_WIN32) && !defined(_WIN64)
+	result |= testWorkersUseDeterministicFloatingPointMode();
+#endif
 	result |= testStateAllocationFailureLeavesRuntimeUsable();
 	result |= testSyncInitializationFailureLeavesRuntimeUsable();
 	result |= testThreadReserveFailureLeavesRuntimeRestartable();
