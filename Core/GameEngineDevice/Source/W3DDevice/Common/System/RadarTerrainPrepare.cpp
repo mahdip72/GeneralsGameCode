@@ -430,6 +430,12 @@ bool RadarTerrainPrepareService::tryAcquire(unsigned consumerId)
 	return true;
 }
 
+bool RadarTerrainPrepareService::warmup()
+{
+	return m_initialized && !m_stopping && !m_leaseActive &&
+		startRuntime(m_requestedWorkers);
+}
+
 bool RadarTerrainPrepareService::startRuntime(unsigned workerCount)
 {
 	if (workerCount == 0 || workerCount > 2 || m_queueCapacity == 0)

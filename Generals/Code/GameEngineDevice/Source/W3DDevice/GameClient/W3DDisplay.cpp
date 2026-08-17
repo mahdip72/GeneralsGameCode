@@ -923,7 +923,14 @@ void W3DDisplay::init()
 	// Keep radar preparation synchronous and owner-bound.  A failed start leaves
 	// W3DRadar's serial path as the compatibility fallback.
 	ASSERT_GAME_THREAD("W3DDisplay::init radar preparation");
-	GetRadarTerrainPrepareService().initialize(2, 2);
+	RadarTerrainPrepareService &radarPrepareService =
+		GetRadarTerrainPrepareService();
+	radarPrepareService.initialize(2, 2);
+	/* Headless replay never renders terrain.  Defer worker creation until the
+	 * first owner-side preparation so replay teardown does not retain an idle
+	 * thread pool that the renderer never used. */
+	if (!TheGlobalData->m_headless)
+		radarPrepareService.warmup();
 
 	// we're now online
 	m_initialized = true;

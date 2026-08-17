@@ -114,6 +114,9 @@ public:
 	 * configuration; capacity below two forces the serial fallback.
 	 */
 	bool initialize(unsigned workerCount, unsigned queueCapacity);
+	/* Start private workers during interactive display initialization to avoid
+	 * a first-use hitch; headless replay defers this until first use. */
+	bool warmup();
 	bool tryAcquire(unsigned consumerId);
 
 	/* Returns true only when both row tasks completed successfully. */

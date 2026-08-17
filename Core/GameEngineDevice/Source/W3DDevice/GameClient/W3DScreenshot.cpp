@@ -73,7 +73,8 @@ public:
 		  m_completion(completion),
 		  m_quality(quality),
 		  m_format(format),
-		  m_remainingTasks(0)
+		  m_remainingTasks(0),
+		  m_failed(0)
 	{
 		m_source.pixels = pixelData;
 		m_source.width = width;
@@ -96,22 +97,55 @@ public:
 	void setTaskCount(unsigned taskCount)
 	{
 		m_remainingTasks = (LONG)taskCount;
+		m_failed = 0;
 	}
 
 	void convert(unsigned yBegin, unsigned yEnd)
 	{
+		bool converted = true;
+		try
 		{
 			PROFILER_SECTION_NAME("Screenshot.Convert");
 			ConvertScreenshotRows(m_source, yBegin, yEnd, m_image);
 		}
+		catch (...)
+		{
+			converted = false;
+		}
 
+		if (!converted)
+		{
+#if defined(_WIN32) && defined(_MSC_VER) && _MSC_VER < 1300
+			InterlockedExchange(const_cast<LONG *>(&m_failed), 1);
+#else
+			InterlockedExchange(&m_failed, 1);
+#endif
+		}
+
+		finish();
+	}
+
+	private:
+	void finish()
+	{
 		if (InterlockedDecrement(&m_remainingTasks) == 0)
 		{
-			encodeAndReport();
+			if (m_failed == 0)
+			{
+				try
+				{
+					encodeAndReport();
+				}
+				catch (...)
+				{
+					DEBUG_LOG(("Failed to encode screenshot %s", m_outputPath));
+				}
+			}
 			delete this;
 		}
 	}
 
+	public:
 	const char* leafname() const
 	{
 		return m_leafname;
@@ -164,6 +198,7 @@ private:
 	int m_quality;
 	ScreenshotFormat m_format;
 	LONG m_remainingTasks;
+	volatile LONG m_failed;
 };
 
 class ScreenshotConvertTask : public rts::Task
