@@ -26,6 +26,7 @@
 
 #include "Common/MessageStream.h"
 #include "Common/SkirmishAIReplayEpoch.h"
+#include "Common/PathfindQueueReplayEpoch.h"
 #include "GameNetwork/GameInfo.h"
 
 class File;
@@ -142,6 +143,8 @@ public:
 	Int getSkirmishAIReplayEpoch() const { return m_skirmishAIReplayEpoch; }
 	Bool replayUsesSkirmishAILivenessRecovery() const { return m_skirmishAIReplayEpoch >= SKIRMISH_AI_REPLAY_EPOCH_PR6_LIVENESS; }
 	Bool replayUsesSkirmishAICurrentBehavior() const { return m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_CURRENT; }
+	Int getPathfindQueueReplayEpoch() const { return m_pathfindQueueReplayEpoch; }
+	Bool replayUsesPathfindQueueCapacity() const { return m_pathfindQueueReplayEpoch == PATHFIND_QUEUE_REPLAY_EPOCH_CURRENT; }
 	void initControls();															///< Show or Hide the Replay controls
 
 	static AsciiString getReplayDir();								///< Returns the directory that holds the replay files.
@@ -199,6 +202,7 @@ protected:
 	Bool m_doingAnalysis;
 	Bool m_archiveReplays;														///< if true, each replay is archived to the replay archive folder after recording
 	Int m_skirmishAIReplayEpoch;
+	Int m_pathfindQueueReplayEpoch;
 
 	Int m_originalGameMode; // valid in replays
 

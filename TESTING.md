@@ -273,6 +273,51 @@ never commit machine paths, personal profile paths, or local build/log paths.
 Do not mark Stage 7 ready until all focused tests, both-title modern and VC6
 builds, ten review rounds, and the full replay gate have passed.
 
+# Pathfinding capacity checks
+
+The pathfinding-capacity change addresses the observed eight-player ground-unit
+freeze by expanding only the Zero Hour `PathfindCellInfo` pool for live games
+and recordings carrying `[PathfindQueueEpoch=1]`. The legacy 30,000-record pool
+remains selected for unmarked replay playback, preserving the historical
+allocation behavior. The 150,000-record pool is a bounded 32-bit allocation;
+it does not change the path request ring, per-frame cell budget, queue order,
+simulation serialization, or network commands. The pool is selected again at
+map activation after replay metadata has been read, because the AI subsystem is
+constructed before the recorder during engine startup.
+
+Run the focused policy and title checks from isolated modern x86 build trees:
+
+```powershell
+cmake --preset win32-profile -DRTS_BUILD_GENERALS=OFF -DRTS_BUILD_ZEROHOUR=ON -DRTS_BUILD_CORE_EXTRAS=ON -DRTS_BUILD_ZEROHOUR_EXTRAS=ON
+cmake --build build/win32-profile --config Release --target z_runtime_regression_tests z_generals
+ctest --test-dir build/win32-profile -C Release -R "^z_skirmish_ai_replay_epoch_tests$" --output-on-failure
+```
+
+Build the Generals title separately with `RTS_BUILD_GENERALS=ON` and
+`RTS_BUILD_ZEROHOUR=OFF`; the shared pathfinding source must compile in both
+title configurations. The replay-epoch regression test must cover unmarked,
+current, combined Skirmish/pathfinding markers, duplicate/unknown markers,
+idempotent writing, and live-versus-replay policy selection.
+The test intentionally exercises the pure capacity-policy helper; actual pool
+allocation and map-activation behavior remain covered by both title builds and
+the isolated replay gate below.
+
+For diagnostic profiling only, define `PATHFIND_DIAGNOSTICS` and enable
+`RTS_DEBUG_LOGGING=ON` in an isolated profile build. Review aggregate
+`PATHFIND_STATS` records for queue depth,
+queue-full events, pool high-water, and allocation failures. Diagnostics must
+not bypass replay version/CRC checks and must never be used as the compatibility
+replay artifact. The target stress run should show pool failures at the legacy
+limit but no failures with the 150,000-record live pool; queue saturation is a
+separate signal and must not be inferred from pool pressure.
+
+After the final VC6 optimized build, run the complete replay gate described
+above: ten distinct fixtures and twelve executions, with the 2v6 Hard-AI
+fixture executed three times and its CRC traces byte-identical. Require zero
+exit status and no CRC mismatch, assertion, crash, missing map, or ownership
+failure. Keep replay state isolated and do not record machine-specific paths in
+commits, documentation, or pull-request text.
+
 # Miles completion callback checks
 
 The Miles EOS callbacks must only publish a fixed-size `{handle, type, generation}` record. They must not enter `TheAudio`, call Miles APIs, allocate, or take the audio-cache mutex. The owner-thread `MilesAudioManager::update()` drains one queue snapshot per frame; reset and shutdown close admission before unregistering callbacks and releasing handles, then clear queued generations. On overflow, the owner drains status-visible stopped handles and uses the compatibility fallback rather than waiting in a callback.

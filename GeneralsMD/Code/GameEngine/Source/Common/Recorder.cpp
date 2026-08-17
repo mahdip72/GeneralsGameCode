@@ -380,6 +380,7 @@ void RecorderClass::init() {
 	m_doingAnalysis = FALSE;
 	m_playbackFrameCount = 0;
 	m_skirmishAIReplayEpoch = SKIRMISH_AI_REPLAY_EPOCH_LEGACY;
+	m_pathfindQueueReplayEpoch = PATHFIND_QUEUE_REPLAY_EPOCH_LEGACY;
 
 	OptionPreferences optionPref;
 	m_archiveReplays = optionPref.getArchiveReplaysEnabled();
@@ -575,8 +576,10 @@ void RecorderClass::startRecording(GameDifficulty diff, Int originalGameMode, In
 	// write out version info
 	UnicodeString versionString = TheVersion->getUnicodeVersion();
 	UnicodeString versionTimeString = TheVersion->getUnicodeBuildTime();
-	// The build-time field is variable length and ignored by compatibility checks, so a suffix records
-	// deterministic AI behavior without changing the retail replay header layout.
+	// The build-time field is variable length and ignored by compatibility checks, so suffixes record
+	// deterministic behavior without changing the retail replay header layout. Keep the existing
+	// SkirmishAI marker last because its parser intentionally requires a final suffix.
+	MarkReplayVersionForPathfindQueueCurrentEpoch(versionTimeString);
 	MarkReplayVersionForSkirmishAICurrentEpoch(versionTimeString);
 	UnsignedInt versionNumber = TheVersion->getVersionNumber();
 	m_file->writeFormat(L"%s", versionString.str());
@@ -1085,6 +1088,7 @@ Bool RecorderClass::replayMatchesGameVersion(const ReplayHeader& header)
 Bool RecorderClass::playbackFile(AsciiString filename)
 {
 	m_skirmishAIReplayEpoch = SKIRMISH_AI_REPLAY_EPOCH_LEGACY;
+	m_pathfindQueueReplayEpoch = PATHFIND_QUEUE_REPLAY_EPOCH_LEGACY;
 
 	if (!m_doingAnalysis)
 	{
@@ -1103,6 +1107,7 @@ Bool RecorderClass::playbackFile(AsciiString filename)
 		return FALSE;
 	}
 	m_skirmishAIReplayEpoch = GetSkirmishAIReplayEpoch(header.versionTimeString);
+	m_pathfindQueueReplayEpoch = GetPathfindQueueReplayEpoch(header.versionTimeString);
 	if (m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_LEGACY)
 	{
 		DEBUG_LOG(("RecorderClass::playbackFile() - unmarked replay uses legacy skirmish AI behavior"));
@@ -1110,12 +1115,23 @@ Bool RecorderClass::playbackFile(AsciiString filename)
 
 #ifdef DEBUG_CRASHING
 	Bool versionStringDiff = header.versionString != TheVersion->getUnicodeVersion();
+	UnicodeString pathMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
+	MarkReplayVersionForPathfindQueueCurrentEpoch(pathMarkedVersionTimeString);
 	UnicodeString livenessMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
 	MarkReplayVersionForSkirmishAILivenessRecovery(livenessMarkedVersionTimeString);
+	UnicodeString pathLivenessMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
+	MarkReplayVersionForPathfindQueueCurrentEpoch(pathLivenessMarkedVersionTimeString);
+	MarkReplayVersionForSkirmishAILivenessRecovery(pathLivenessMarkedVersionTimeString);
+	UnicodeString legacyCurrentMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
+	MarkReplayVersionForSkirmishAICurrentEpoch(legacyCurrentMarkedVersionTimeString);
 	UnicodeString currentMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
+	MarkReplayVersionForPathfindQueueCurrentEpoch(currentMarkedVersionTimeString);
 	MarkReplayVersionForSkirmishAICurrentEpoch(currentMarkedVersionTimeString);
 	Bool versionTimeStringDiff = header.versionTimeString != TheVersion->getUnicodeBuildTime()
+		&& header.versionTimeString != pathMarkedVersionTimeString
 		&& header.versionTimeString != livenessMarkedVersionTimeString
+		&& header.versionTimeString != pathLivenessMarkedVersionTimeString
+		&& header.versionTimeString != legacyCurrentMarkedVersionTimeString
 		&& header.versionTimeString != currentMarkedVersionTimeString;
 	Bool versionNumberDiff = header.versionNumber != TheVersion->getVersionNumber();
 	Bool exeCRCDiff = header.exeCRC != TheGlobalData->m_exeCRC;

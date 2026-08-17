@@ -214,6 +214,7 @@ public:
 #endif
 	static void allocateCellInfos();
 	static void releaseCellInfos();
+	static Bool hasCellInfos() { return s_infoArray != nullptr; }
 
 	static PathfindCellInfo * getACellInfo(PathfindCell *cell, const ICoord2D &pos);
 	static void releaseACellInfo(PathfindCellInfo *theInfo);
