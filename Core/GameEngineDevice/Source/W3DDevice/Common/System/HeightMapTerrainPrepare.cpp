@@ -58,6 +58,59 @@ static bool heightMapTerrainPrepareRangesOverlap(size_t firstBegin,
 	return firstBegin < secondEnd && secondBegin < firstEnd;
 }
 
+static bool heightMapTerrainPrepareDestinationOverlapsInput(
+	const HeightMapTerrainSnapshot &snapshot, size_t destinationBegin,
+	size_t destinationEnd)
+{
+	unsigned inputBytes;
+	size_t inputBegin;
+	size_t inputEnd;
+
+	if (!heightMapTerrainPrepareCheckedAddressRange(&snapshot,
+		static_cast<unsigned>(sizeof(snapshot)), &inputBegin, &inputEnd) ||
+		heightMapTerrainPrepareRangesOverlap(destinationBegin, destinationEnd,
+			inputBegin, inputEnd) ||
+		!heightMapTerrainPrepareCheckedMultiply(snapshot.cellRowStrideBytes,
+			snapshot.height, &inputBytes) ||
+		!heightMapTerrainPrepareCheckedAddressRange(snapshot.cells, inputBytes,
+			&inputBegin, &inputEnd) ||
+		heightMapTerrainPrepareRangesOverlap(destinationBegin, destinationEnd,
+			inputBegin, inputEnd))
+	{
+		return true;
+	}
+
+	if (snapshot.globalLightCount != 0)
+	{
+		if (!heightMapTerrainPrepareCheckedMultiply(snapshot.globalLightCount,
+				static_cast<unsigned>(sizeof(HeightMapTerrainGlobalLight)),
+				&inputBytes) ||
+			!heightMapTerrainPrepareCheckedAddressRange(snapshot.globalLights,
+				inputBytes, &inputBegin, &inputEnd) ||
+			heightMapTerrainPrepareRangesOverlap(destinationBegin,
+				destinationEnd, inputBegin, inputEnd))
+		{
+			return true;
+		}
+	}
+
+	if (snapshot.sceneLightCount != 0)
+	{
+		if (!heightMapTerrainPrepareCheckedMultiply(snapshot.sceneLightCount,
+				static_cast<unsigned>(sizeof(HeightMapTerrainSceneLight)),
+				&inputBytes) ||
+			!heightMapTerrainPrepareCheckedAddressRange(snapshot.sceneLights,
+				inputBytes, &inputBegin, &inputEnd) ||
+			heightMapTerrainPrepareRangesOverlap(destinationBegin,
+				destinationEnd, inputBegin, inputEnd))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
 static HeightMapTerrainCellInput *heightMapTerrainPrepareAllocateCells(
 	unsigned count)
 {
@@ -191,7 +244,11 @@ bool ScatterPreparedHeightMapTerrainRows(
 		heightMapTerrainPrepareRangesOverlap(sourceBegin, sourceEnd,
 			hardwareBegin, hardwareEnd) ||
 		heightMapTerrainPrepareRangesOverlap(backupBegin, backupEnd,
-			hardwareBegin, hardwareEnd))
+			hardwareBegin, hardwareEnd) ||
+		heightMapTerrainPrepareDestinationOverlapsInput(snapshot, backupBegin,
+			backupEnd) ||
+		heightMapTerrainPrepareDestinationOverlapsInput(snapshot, hardwareBegin,
+			hardwareEnd))
 	{
 		return false;
 	}
@@ -218,6 +275,8 @@ static bool heightMapTerrainCaptureHeight(const UnsignedByte *heightData,
 {
 	Int64 actualX;
 	Int64 actualY;
+	unsigned rowOffset;
+	unsigned index;
 	if (heightData == 0 || value == 0 || heightWidth == 0 ||
 		heightHeight == 0)
 	{
@@ -231,8 +290,14 @@ static bool heightMapTerrainCaptureHeight(const UnsignedByte *heightData,
 	{
 		return false;
 	}
-	*value = heightData[static_cast<unsigned>(actualY) * heightWidth +
-		static_cast<unsigned>(actualX)];
+	if (!heightMapTerrainPrepareCheckedMultiply(
+			static_cast<unsigned>(actualY), heightWidth, &rowOffset) ||
+		!heightMapTerrainPrepareCheckedAdd(rowOffset,
+			static_cast<unsigned>(actualX), &index))
+	{
+		return false;
+	}
+	*value = heightData[index];
 	return true;
 }
 

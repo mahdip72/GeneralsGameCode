@@ -5,6 +5,7 @@
 #include <vector>
 
 #if defined(_WIN32)
+#include <float.h>
 #include <process.h>
 #include <windows.h>
 #else
@@ -669,6 +670,13 @@ private:
 	static unsigned __stdcall workerEntry(void *context)
 	{
 		State *state = (State *)context;
+#if !defined(_WIN64)
+		/* The legacy owner thread uses this x87 mode.  Each worker has its
+		 * own control word, so establish the same deterministic arithmetic
+		 * contract before running byte-parity-sensitive preparation tasks. */
+		_fpreset();
+		_controlfp(_PC_24 | _RC_NEAR, _MCW_PC | _MCW_RC);
+#endif
 		state->workerLoop();
 		return 0;
 	}

@@ -64,6 +64,12 @@ struct TerrainFixture
 	HeightMapTerrainSceneLight sceneLights[4];
 };
 
+union CellAliasStorage
+{
+	HeightMapTerrainCellInput aligned[8];
+	unsigned char bytes[1024];
+};
+
 static void setRgb(HeightMapTerrainRgb *rgb, Real red, Real green, Real blue)
 {
 	rgb->red = red;
@@ -751,6 +757,12 @@ static int testOwnerCaptureCellSeam()
 		cell.backForwardHeightDelta[1] == 154 &&
 		cell.backForwardHeightDelta[2] == 138 &&
 		cell.backForwardHeightDelta[3] == 149);
+
+	/* On the 32-bit retail target, row-offset arithmetic must reject a
+	 * dimension product that wraps before indexing the caller's storage. */
+	CHECK(testName, !CaptureHeightMapTerrainCellInput(cell, source,
+		UINT_MAX, UINT_MAX, 0, 0, 3, 1, 2, 4, 0, 2, 4, 5, 0, 1.0f,
+		u1, v1, u2, v2, alpha, 0));
 	return 0;
 }
 
@@ -1027,6 +1039,8 @@ static int testPreparedRowScatter()
 	unsigned char beforeHardware[DESTINATION_BYTES];
 	unsigned char overlap[OVERLAP_BYTES];
 	unsigned char beforeOverlap[OVERLAP_BYTES];
+	CellAliasStorage cellAlias;
+	CellAliasStorage beforeCellAlias;
 	const unsigned rowBytes = 2 * HEIGHTMAP_TERRAIN_VERTEX_COUNT *
 		sizeof(HeightMapTerrainVertex);
 	const unsigned requiredEnd = (DESTINATION_FIRST_ROW + 1) *
@@ -1090,6 +1104,20 @@ static int testPreparedRowScatter()
 		DESTINATION_COLUMN_BYTES, DESTINATION_STRIDE, overlap,
 		DESTINATION_BYTES, overlap + 32, DESTINATION_BYTES));
 	CHECK(testName, memcmp(overlap, beforeOverlap, sizeof(overlap)) == 0);
+
+	/* Renderer destinations may not overwrite immutable captured inputs. */
+	memset(&cellAlias, 0x3C, sizeof(cellAlias));
+	memcpy(cellAlias.aligned, fixture.cells,
+		fixture.snapshot.cellCount * sizeof(HeightMapTerrainCellInput));
+	memcpy(&beforeCellAlias, &cellAlias, sizeof(cellAlias));
+	invalid = fixture.snapshot;
+	invalid.cells = cellAlias.aligned;
+	CHECK(testName, !ScatterPreparedHeightMapTerrainRows(invalid,
+		outputVertices(&storage), DESTINATION_FIRST_ROW,
+		DESTINATION_COLUMN_BYTES, DESTINATION_STRIDE, cellAlias.bytes,
+		sizeof(cellAlias), hardware, sizeof(hardware)));
+	CHECK(testName, memcmp(&cellAlias, &beforeCellAlias,
+		sizeof(cellAlias)) == 0);
 
 	/* Null and overflowing placement metadata fail before either write. */
 	CHECK(testName, !ScatterPreparedHeightMapTerrainRows(fixture.snapshot,
