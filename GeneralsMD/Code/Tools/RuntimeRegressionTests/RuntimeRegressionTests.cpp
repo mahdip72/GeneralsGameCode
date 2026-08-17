@@ -16,6 +16,7 @@
 #include "Common/FrameRateLimit.h"
 #include "Common/GameMemory.h"
 #include "Common/SkirmishAIReplayEpoch.h"
+#include "Common/PathfindQueueReplayEpoch.h"
 #include "GameLogic/SkirmishAIDecision.h"
 #include "GameLogic/SkirmishAILiveness.h"
 
@@ -443,6 +444,50 @@ static void TestSkirmishAIReplayEpoch()
 	CHECK(!ShouldUseSkirmishAICurrentBehavior(true, 3));
 }
 
+static void TestPathfindQueueReplayEpoch()
+{
+	UnicodeString unmarked = L"Aug 14 2026 21:00:00";
+	CHECK(GetPathfindQueueReplayEpoch(unmarked) == PATHFIND_QUEUE_REPLAY_EPOCH_LEGACY);
+	CHECK(!ReplayVersionUsesPathfindQueueCapacity(unmarked));
+
+	UnicodeString marked = unmarked;
+	MarkReplayVersionForPathfindQueueCurrentEpoch(marked);
+	CHECK(GetPathfindQueueReplayEpoch(marked) == PATHFIND_QUEUE_REPLAY_EPOCH_CURRENT);
+	CHECK(ReplayVersionUsesPathfindQueueCapacity(marked));
+	CHECK(GetSkirmishAIReplayEpoch(marked) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+	CHECK(ShouldUsePathfindQueueCapacity(false, false));
+	CHECK(!ShouldUsePathfindQueueCapacity(true, false));
+	CHECK(ShouldUsePathfindQueueCapacity(true, true));
+	CHECK(GetPathfindCellInfoCapacityForPolicy(false, false, false) == PATHFIND_CELL_INFO_LEGACY_CAPACITY);
+	CHECK(GetPathfindCellInfoCapacityForPolicy(true, true, false) == PATHFIND_CELL_INFO_LEGACY_CAPACITY);
+	CHECK(GetPathfindCellInfoCapacityForPolicy(true, true, true) == PATHFIND_CELL_INFO_CURRENT_CAPACITY);
+	CHECK(GetPathfindCellInfoCapacityForPolicy(true, false, false) == PATHFIND_CELL_INFO_CURRENT_CAPACITY);
+
+	UnicodeString combined = unmarked;
+	MarkReplayVersionForPathfindQueueCurrentEpoch(combined);
+	MarkReplayVersionForSkirmishAICurrentEpoch(combined);
+	CHECK(GetPathfindQueueReplayEpoch(combined) == PATHFIND_QUEUE_REPLAY_EPOCH_CURRENT);
+	CHECK(GetSkirmishAIReplayEpoch(combined) == SKIRMISH_AI_REPLAY_EPOCH_CURRENT);
+
+	UnicodeString pathLiveness = unmarked;
+	MarkReplayVersionForPathfindQueueCurrentEpoch(pathLiveness);
+	MarkReplayVersionForSkirmishAILivenessRecovery(pathLiveness);
+	CHECK(GetPathfindQueueReplayEpoch(pathLiveness) == PATHFIND_QUEUE_REPLAY_EPOCH_CURRENT);
+	CHECK(GetSkirmishAIReplayEpoch(pathLiveness) == SKIRMISH_AI_REPLAY_EPOCH_PR6_LIVENESS);
+
+	UnicodeString duplicate = marked;
+	duplicate.concat(GetPathfindQueueReplayMarker());
+	CHECK(GetPathfindQueueReplayEpoch(duplicate) == PATHFIND_QUEUE_REPLAY_EPOCH_LEGACY);
+
+	UnicodeString unknown = unmarked;
+	unknown.concat(L" [PathfindQueueEpoch=2]");
+	CHECK(GetPathfindQueueReplayEpoch(unknown) == PATHFIND_QUEUE_REPLAY_EPOCH_LEGACY);
+
+	UnicodeString idempotent = marked;
+	MarkReplayVersionForPathfindQueueCurrentEpoch(idempotent);
+	CHECK(idempotent == marked);
+}
+
 static void TestSkirmishAICorrectnessPolicies()
 {
 	const Int currentPlanToken = 1;
@@ -807,6 +852,7 @@ int main(int argc, char **argv)
 	{
 		TestSkirmishAILivenessPolicies();
 		TestSkirmishAIReplayEpoch();
+		TestPathfindQueueReplayEpoch();
 		if (s_failures != 0)
 		{
 			printf("%d skirmish AI replay epoch test(s) failed.\n", s_failures);

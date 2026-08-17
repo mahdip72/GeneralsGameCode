@@ -49,6 +49,9 @@
 #include "GameLogic/PartitionManager.h"
 #include "GameLogic/TerrainLogic.h"
 #include "GameLogic/Weapon.h"
+#if RTS_ZEROHOUR
+#include "Common/Recorder.h"
+#endif
 #if RETAIL_COMPATIBLE_PATHFINDING
 #include "GameClient/InGameUI.h"
 #include "GameClient/GameText.h"
@@ -117,7 +120,60 @@ constexpr const UnsignedInt MAX_ADJUSTMENT_CELL_COUNT = 400;
 constexpr const UnsignedInt MAX_SAFE_PATH_CELL_COUNT = 2000;
 
 constexpr const UnsignedInt PATHFIND_CELLS_PER_FRAME = 5000; // Number of cells we will search pathfinding per frame.
+#if RTS_ZEROHOUR
+constexpr const UnsignedInt CELL_INFOS_TO_ALLOCATE = PATHFIND_CELL_INFO_LEGACY_CAPACITY;
+constexpr const UnsignedInt CURRENT_PATHFIND_CELL_INFO_CAPACITY = PATHFIND_CELL_INFO_CURRENT_CAPACITY;
+#else
 constexpr const UnsignedInt CELL_INFOS_TO_ALLOCATE = 30000;
+constexpr const UnsignedInt CURRENT_PATHFIND_CELL_INFO_CAPACITY = 150000;
+#endif
+
+// Keep the original pool for legacy replay playback. Live Zero Hour games and
+// recordings carrying the pathfinding-capacity epoch use the larger bounded pool
+// to leave modern eight-player matches room for transient A* records.
+static UnsignedInt s_cellInfosToAllocate = CELL_INFOS_TO_ALLOCATE;
+
+static UnsignedInt GetPathfindCellInfoCapacity()
+{
+#if RTS_ZEROHOUR
+	// The AI subsystem is constructed before GameLogic/Recorder during engine
+	// startup.  Keep that bootstrap allocation on the legacy pool; new-game or
+	// replay metadata is available by the time Pathfinder::newMap() runs.
+	if (TheGameLogic == nullptr || TheRecorder == nullptr)
+		return CELL_INFOS_TO_ALLOCATE;
+	return GetPathfindCellInfoCapacityForPolicy(
+		true,
+		TheGameLogic && TheGameLogic->isInReplayGame(),
+		TheRecorder && TheRecorder->replayUsesPathfindQueueCapacity());
+#else
+	return CELL_INFOS_TO_ALLOCATE;
+#endif
+}
+
+#if defined(RTS_DEBUG) || defined(PATHFIND_DIAGNOSTICS)
+// Diagnostics intentionally live outside Pathfinder's serialized state. They
+// expose capacity pressure without changing replay CRCs, save data, or queue
+// ordering in non-diagnostic builds.
+static UnsignedInt s_pathfindQueueEnqueueCount = 0;
+static UnsignedInt s_pathfindQueueDuplicateCount = 0;
+static UnsignedInt s_pathfindQueueFullCount = 0;
+static UnsignedInt s_pathfindQueueDequeueCount = 0;
+static UnsignedInt s_pathfindQueueHighWater = 0;
+static UnsignedInt s_pathfindMapDeferCount = 0;
+static UnsignedInt s_pathfindZoneDeferCount = 0;
+static UnsignedInt s_pathfindCellInfoInUse = 0;
+static UnsignedInt s_pathfindCellInfoHighWater = 0;
+static UnsignedInt s_pathfindCellInfoAllocationFailureCount = 0;
+static UnsignedInt s_pathfindStatsLastReportFrame = 0;
+
+static Int GetPathfindQueueDepth(Int head, Int tail)
+{
+	Int depth = tail - head;
+	if (depth < 0)
+		depth += PATHFIND_QUEUE_LEN;
+	return depth;
+}
+#endif
 
 //-----------------------------------------------------------------------------------
 PathNode::PathNode() :
@@ -1115,7 +1171,7 @@ Bool s_forceCleanCells = false;
 
 void PathfindCellInfo::forceCleanPathFindCellInfos()
 {
-	for (Int i = 0; i < CELL_INFOS_TO_ALLOCATE - 1; i++) {
+	for (UnsignedInt i = 0; i < s_cellInfosToAllocate; i++) {
 		s_infoArray[i].m_nextOpen = nullptr;
 		s_infoArray[i].m_prevOpen = nullptr;
 		s_infoArray[i].m_open = FALSE;
@@ -1158,15 +1214,59 @@ void Pathfinder::forceCleanCells()
  */
 void PathfindCellInfo::allocateCellInfos()
 {
-	releaseCellInfos();
-	s_infoArray = MSGNEW("PathfindCellInfo") PathfindCellInfo[CELL_INFOS_TO_ALLOCATE];	// pool[]ify
-	s_infoArray[CELL_INFOS_TO_ALLOCATE-1].m_pathParent = nullptr;
-	s_infoArray[CELL_INFOS_TO_ALLOCATE-1].m_isFree = true;
-	s_firstFree = s_infoArray;
-	for (Int i=0; i<CELL_INFOS_TO_ALLOCATE-1; i++) {
-		s_infoArray[i].m_pathParent = &s_infoArray[i+1];
-		s_infoArray[i].m_isFree = true;
+	const UnsignedInt desiredCapacity = GetPathfindCellInfoCapacity();
+	PathfindCellInfo *oldInfoArray = s_infoArray;
+	PathfindCellInfo *oldFirstFree = s_firstFree;
+	const UnsignedInt oldCapacity = s_cellInfosToAllocate;
+	if (oldInfoArray != nullptr) {
+		UnsignedInt freeCount = 0;
+		Bool oldPoolIsFree = true;
+		PathfindCellInfo *oldFree = oldFirstFree;
+		// Bound the validation by the known pool size.  A duplicate release can
+		// otherwise create a self-link and make this owner-thread scan spin
+		// forever while trying to resize the pool.
+		while (oldFree != nullptr && freeCount < oldCapacity) {
+			++freeCount;
+			if (!oldFree->m_isFree)
+				oldPoolIsFree = false;
+			oldFree = oldFree->m_pathParent;
+		}
+		if (!oldPoolIsFree || freeCount != oldCapacity || oldFree != nullptr) {
+			DEBUG_CRASH(("Cannot replace pathfind cell pool while records are in use."));
+			return;
+		}
 	}
+
+	// Prepare the replacement before releasing the current pool.  The title
+	// allocator reports OOM by throwing; preserve an existing pool when a
+	// resize cannot be completed, while retaining the original startup failure
+	// behavior if the first pool itself cannot be created.
+	PathfindCellInfo *newInfoArray = nullptr;
+	try {
+		newInfoArray = MSGNEW("PathfindCellInfo") PathfindCellInfo[desiredCapacity];
+		newInfoArray[desiredCapacity-1].m_pathParent = nullptr;
+		newInfoArray[desiredCapacity-1].m_isFree = true;
+		for (UnsignedInt i=0; i<desiredCapacity-1; i++) {
+			newInfoArray[i].m_pathParent = &newInfoArray[i+1];
+			newInfoArray[i].m_isFree = true;
+		}
+	} catch (...) {
+		if (oldInfoArray != nullptr) {
+			DEBUG_LOG(("Unable to resize pathfind cell pool; retaining the existing pool."));
+			return;
+		}
+		throw;
+	}
+
+	s_infoArray = newInfoArray;
+	s_firstFree = newInfoArray;
+	s_cellInfosToAllocate = desiredCapacity;
+	delete[] oldInfoArray;
+#if defined(RTS_DEBUG) || defined(PATHFIND_DIAGNOSTICS)
+	s_pathfindCellInfoInUse = 0;
+	s_pathfindCellInfoHighWater = 0;
+	s_pathfindCellInfoAllocationFailureCount = 0;
+#endif
 }
 
 /**
@@ -1183,10 +1283,13 @@ void PathfindCellInfo::releaseCellInfos()
 		DEBUG_ASSERTCRASH(s_firstFree->m_isFree, ("Should be freed."));
 		s_firstFree = s_firstFree->m_pathParent;
 	}
-	DEBUG_ASSERTCRASH(count==CELL_INFOS_TO_ALLOCATE, ("Error - Allocated cellinfos."));
+	DEBUG_ASSERTCRASH(count==s_cellInfosToAllocate, ("Error - Allocated cellinfos."));
 	delete[] s_infoArray;
 	s_infoArray = nullptr;
 	s_firstFree = nullptr;
+#if defined(RTS_DEBUG) || defined(PATHFIND_DIAGNOSTICS)
+	s_pathfindCellInfoInUse = 0;
+#endif
 }
 
 /**
@@ -1216,7 +1319,25 @@ PathfindCellInfo *PathfindCellInfo::getACellInfo(PathfindCell *cell,const ICoord
 		info->m_obstacleIsFence = false;
 		info->m_obstacleIsTransparent = false;
 		info->m_blockedByAlly = false;
+#if defined(RTS_DEBUG) || defined(PATHFIND_DIAGNOSTICS)
+		++s_pathfindCellInfoInUse;
+		if (s_pathfindCellInfoInUse > s_pathfindCellInfoHighWater)
+			s_pathfindCellInfoHighWater = s_pathfindCellInfoInUse;
+#endif
 	}
+#if defined(RTS_DEBUG) || defined(PATHFIND_DIAGNOSTICS)
+	else
+	{
+		++s_pathfindCellInfoAllocationFailureCount;
+		if (s_pathfindCellInfoAllocationFailureCount == 1 ||
+			(s_pathfindCellInfoAllocationFailureCount & 1023) == 0)
+		{
+			DEBUG_LOG(("PATHFIND_CELL_INFO_EXHAUSTED failures %u in_use %u",
+				s_pathfindCellInfoAllocationFailureCount,
+				s_pathfindCellInfoInUse));
+		}
+	}
+#endif
 	return info;
 }
 
@@ -1231,6 +1352,10 @@ void PathfindCellInfo::releaseACellInfo(PathfindCellInfo *theInfo)
 	theInfo->m_pathParent = s_firstFree;
 	s_firstFree = theInfo;
 	s_firstFree->m_isFree = true;
+#if defined(RTS_DEBUG) || defined(PATHFIND_DIAGNOSTICS)
+	if (s_pathfindCellInfoInUse > 0)
+		--s_pathfindCellInfoInUse;
+#endif
 }
 
 //-----------------------------------------------------------------------------------
@@ -4041,6 +4166,19 @@ Pathfinder::~Pathfinder()
 void Pathfinder::reset()
 {
 	frameToShowObstacles = 0;
+	#if defined(RTS_DEBUG) || defined(PATHFIND_DIAGNOSTICS)
+	s_pathfindQueueEnqueueCount = 0;
+	s_pathfindQueueDuplicateCount = 0;
+	s_pathfindQueueFullCount = 0;
+	s_pathfindQueueDequeueCount = 0;
+	s_pathfindQueueHighWater = 0;
+	s_pathfindMapDeferCount = 0;
+	s_pathfindZoneDeferCount = 0;
+	s_pathfindStatsLastReportFrame = 0;
+	s_pathfindCellInfoInUse = 0;
+	s_pathfindCellInfoHighWater = 0;
+	s_pathfindCellInfoAllocationFailureCount = 0;
+	#endif
 	DEBUG_LOG(("Pathfind cell is %d bytes, PathfindCellInfo is %d bytes", sizeof(PathfindCell), sizeof(PathfindCellInfo)));
 
 	delete [] m_blockOfMapCells;
@@ -4735,6 +4873,13 @@ void Pathfinder::classifyMapCell( Int i, Int j , PathfindCell *cell)
  */
 void Pathfinder::newMap()
 {
+	const UnsignedInt desiredCellInfoCapacity = GetPathfindCellInfoCapacity();
+	if ((desiredCellInfoCapacity != s_cellInfosToAllocate || !PathfindCellInfo::hasCellInfos()) &&
+		m_map == nullptr && m_blockOfMapCells == nullptr)
+		PathfindCellInfo::allocateCellInfos();
+	else if (desiredCellInfoCapacity != s_cellInfosToAllocate || !PathfindCellInfo::hasCellInfos())
+		DEBUG_CRASH(("Cannot resize pathfind cell pool while the map is active."));
+
 	m_wallHeight = TheAI->getAiData()->m_wallHeight; // may be updated by map.ini.
 	Region3D terrainExtent;
 	TheTerrainLogic->getMaximumPathfindExtent( &terrainExtent );
@@ -5832,6 +5977,9 @@ Bool Pathfinder::queueForPath(ObjectID id)
 	Int slot = m_queuePRHead;
 	while (slot != m_queuePRTail) {
 		if (m_queuedPathfindRequests[slot] == id) {
+#if defined(RTS_DEBUG) || defined(PATHFIND_DIAGNOSTICS)
+			++s_pathfindQueueDuplicateCount;
+#endif
 			return true;
 		}
 		slot++;
@@ -5846,11 +5994,28 @@ Bool Pathfinder::queueForPath(ObjectID id)
 		nextSlot = 0;
 	}
 	if (nextSlot==m_queuePRHead) {
+#if defined(RTS_DEBUG) || defined(PATHFIND_DIAGNOSTICS)
+		++s_pathfindQueueFullCount;
+		if (s_pathfindQueueFullCount == 1 || (s_pathfindQueueFullCount & 255) == 0)
+		{
+			DEBUG_LOG(("PATHFIND_QUEUE_FULL frame %u id %d depth %d full_count %u",
+				TheGameLogic ? TheGameLogic->getFrame() : 0u,
+				id,
+				GetPathfindQueueDepth(m_queuePRHead, m_queuePRTail),
+				s_pathfindQueueFullCount));
+		}
+#endif
 		DEBUG_CRASH(("Ran out of pathfind queue slots."));
 		return false;
 	}
 	m_queuedPathfindRequests[m_queuePRTail] = id;
 	m_queuePRTail = nextSlot;
+#if defined(RTS_DEBUG) || defined(PATHFIND_DIAGNOSTICS)
+	++s_pathfindQueueEnqueueCount;
+	const UnsignedInt depth = static_cast<UnsignedInt>(GetPathfindQueueDepth(m_queuePRHead, m_queuePRTail));
+	if (depth > s_pathfindQueueHighWater)
+		s_pathfindQueueHighWater = depth;
+#endif
 	return true;
 }
 
@@ -6045,6 +6210,9 @@ void Pathfinder::processPathfindQueue()
 {
 	//USE_PERF_TIMER(processPathfindQueue)
 	if (!m_isMapReady) {
+	#if defined(RTS_DEBUG) || defined(PATHFIND_DIAGNOSTICS)
+		++s_pathfindMapDeferCount;
+	#endif
 		return;
 	}
 #ifdef DEBUG_QPF
@@ -6060,6 +6228,9 @@ void Pathfinder::processPathfindQueue()
 
 	if (m_zoneManager.needToCalculateZones()) {
 		m_zoneManager.calculateZones(m_map, m_layers, m_extent);
+	#if defined(RTS_DEBUG) || defined(PATHFIND_DIAGNOSTICS)
+		++s_pathfindZoneDeferCount;
+	#endif
 		return;
 	}
 
@@ -6088,6 +6259,9 @@ void Pathfinder::processPathfindQueue()
 				pathsFound++;
 			}
 		}
+#if defined(RTS_DEBUG) || defined(PATHFIND_DIAGNOSTICS)
+	++s_pathfindQueueDequeueCount;
+#endif
 		m_queuePRHead = m_queuePRHead+1;
 		if (m_queuePRHead >= PATHFIND_QUEUE_LEN) {
 			m_queuePRHead = 0;
@@ -6097,6 +6271,29 @@ void Pathfinder::processPathfindQueue()
 		PROFILER_PLOT("PathfindCells", (double)m_cumulativeCellsAllocated);
 		PROFILER_PLOT("PathfindPaths", (double)pathsFound);
 	}
+#if (defined(RTS_DEBUG) || defined(PATHFIND_DIAGNOSTICS)) && defined(DEBUG_LOGGING)
+	const UnsignedInt currentFrame = TheGameLogic->getFrame();
+	if (s_pathfindStatsLastReportFrame == 0 || currentFrame >= s_pathfindStatsLastReportFrame + 300)
+	{
+		DEBUG_LOG(("PATHFIND_STATS frame %u queue_depth %d queue_high_water %u enqueues %u duplicates %u full %u dequeues %u map_defers %u zone_defers %u cell_info_capacity %u cell_info_in_use %u cell_info_high_water %u cell_info_alloc_failures %u cells_cumulative %d paths_found_this_frame %d",
+			currentFrame,
+			GetPathfindQueueDepth(m_queuePRHead, m_queuePRTail),
+			s_pathfindQueueHighWater,
+			s_pathfindQueueEnqueueCount,
+			s_pathfindQueueDuplicateCount,
+			s_pathfindQueueFullCount,
+			s_pathfindQueueDequeueCount,
+			s_pathfindMapDeferCount,
+			s_pathfindZoneDeferCount,
+			s_cellInfosToAllocate,
+			s_pathfindCellInfoInUse,
+			s_pathfindCellInfoHighWater,
+			s_pathfindCellInfoAllocationFailureCount,
+			m_cumulativeCellsAllocated,
+			pathsFound));
+		s_pathfindStatsLastReportFrame = currentFrame;
+	}
+#endif
 #ifdef DEBUG_QPF
 	if (pathsFound>0) {
 #ifdef DEBUG_LOGGING
@@ -7561,7 +7758,17 @@ void Pathfinder::processHierarchicalCell( const ICoord2D &scanCell, const ICoord
 			return;
 		}
 
-		newCell->allocateInfo(scanCell);
+		const Bool newCellNeedsInfo = !newCell->hasInfo();
+		if (!newCell->allocateInfo(scanCell)) {
+			// Pool exhaustion is a bounded-search miss, not a reason to
+			// dereference the absent record or leave a partial list entry.
+			return;
+		}
+		if (!adjNewCell->allocateInfo(adjacentCell)) {
+			if (newCellNeedsInfo)
+				newCell->releaseInfo();
+			return;
+		}
 #if RETAIL_COMPATIBLE_PATHFINDING
 		if (!s_useFixedPathfinding)
 		{
@@ -7577,7 +7784,6 @@ void Pathfinder::processHierarchicalCell( const ICoord2D &scanCell, const ICoord
 			}
 		}
 
-		adjNewCell->allocateInfo(adjacentCell);
 		if( adjNewCell->hasInfo() )
 		{
 
