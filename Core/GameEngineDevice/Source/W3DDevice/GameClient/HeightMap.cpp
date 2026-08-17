@@ -47,6 +47,7 @@
 //-----------------------------------------------------------------------------
 #include "W3DDevice/GameClient/HeightMap.h"
 #include "W3DDevice/Common/HeightMapTerrainPrepare.h"
+#include "W3DDevice/Common/HeightMapDynamicLightPrepare.h"
 
 #ifndef USE_FLAT_HEIGHT_MAP // Flat height map uses flattened textures. jba. [3/20/2003]
 
@@ -172,6 +173,7 @@ void HeightMapRenderObjClass::freeIndexVertexBuffers()
 Int HeightMapRenderObjClass::freeMapResources()
 {
 	BaseHeightMapRenderObjClass::freeMapResources();
+	m_dynamicLightBatch.reset();
 	freeIndexVertexBuffers();
 
 	return 0;
@@ -1195,6 +1197,237 @@ Int HeightMapRenderObjClass::updateVBForLightOptimized(DX8VertexBufferClass	*pVB
 	return -1;
 }
 
+Bool HeightMapRenderObjClass::captureDynamicLightBatch(
+	HeightMapDynamicLightBatch &batch, VERTEX_FORMAT *data, Int x0, Int y0,
+	Int x1, Int y1, Int originX, Int originY, W3DDynamicLight *pLights[],
+	Int numLights)
+{
+	const unsigned width = x1 > x0 ? static_cast<unsigned>(x1 - x0) : 0;
+	const unsigned height = y1 > y0 ? static_cast<unsigned>(y1 - y0) : 0;
+	const unsigned verticesPerRow = VERTEX_BUFFER_TILE_LENGTH * 4;
+	unsigned lightIndex;
+	unsigned cellIndex = 0;
+
+	if (!data || !m_map || !pLights || width == 0 || height == 0 ||
+		x0 < originX || y0 < originY ||
+		x1 > originX + VERTEX_BUFFER_TILE_LENGTH ||
+		y1 > originY + VERTEX_BUFFER_TILE_LENGTH || numLights < 0 ||
+		numLights > MAX_ENABLED_DYNAMIC_LIGHTS ||
+		!batch.initialize(width, height, static_cast<unsigned>(numLights)))
+		return false;
+
+	for (lightIndex = 0; lightIndex < static_cast<unsigned>(numLights);
+		++lightIndex)
+	{
+		W3DDynamicLight *light = pLights[lightIndex];
+		HeightMapDynamicLightSceneLight &captured =
+			batch.lights()[lightIndex];
+		Vector3 position;
+		Vector3 direction;
+		Vector3 diffuse;
+		Vector3 ambient;
+		Int lightType;
+		double range;
+		double midRange;
+
+		if (!light)
+			return false;
+		lightType = light->Get_Type();
+		if (lightType == LightClass::POINT)
+			captured.type = HEIGHTMAP_DYNAMIC_LIGHT_POINT;
+		else if (lightType == LightClass::SPOT)
+			captured.type = HEIGHTMAP_DYNAMIC_LIGHT_SPOT;
+		else if (lightType == LightClass::DIRECTIONAL)
+			captured.type = HEIGHTMAP_DYNAMIC_LIGHT_DIRECTIONAL;
+		else
+			return false;
+
+		captured.enabled = light->isEnabled() ? 1 : 0;
+		position = light->Get_Position();
+		captured.positionX = position.X;
+		captured.positionY = position.Y;
+		captured.positionZ = position.Z;
+		light->Get_Spot_Direction(direction);
+		captured.directionX = direction.X;
+		captured.directionY = direction.Y;
+		captured.directionZ = direction.Z;
+		light->Get_Far_Attenuation_Range(midRange, range);
+		captured.range = range;
+		captured.midRange = midRange;
+		light->Get_Diffuse(&diffuse);
+		light->Get_Ambient(&ambient);
+		captured.diffuseRed = diffuse.X;
+		captured.diffuseGreen = diffuse.Y;
+		captured.diffuseBlue = diffuse.Z;
+		captured.ambientRed = ambient.X;
+		captured.ambientGreen = ambient.Y;
+		captured.ambientBlue = ambient.Z;
+	}
+
+	for (Int row = y0; row < y1; ++row)
+	{
+		const Int mapY = getYWithOrigin(row);
+		Int previousY = mapY - 1;
+		Int nextY = getYWithOrigin(row + 1) + 1;
+		if (previousY < -m_map->getDrawOrgY())
+			previousY = -m_map->getDrawOrgY();
+		if (nextY >= m_map->getYExtent() - m_map->getDrawOrgY())
+			nextY = m_map->getYExtent() - m_map->getDrawOrgY() - 1;
+
+		for (Int column = x0; column < x1; ++column)
+		{
+			const Int mapX = getXWithOrigin(column);
+			const Int yCoord = mapY + m_map->getDrawOrgY() -
+				m_map->getBorderSizeInline();
+			const Int xCoord = mapX + m_map->getDrawOrgX() -
+				m_map->getBorderSizeInline();
+			Bool intersects = false;
+			Int maskIndex;
+			Int previousX = mapX - 1;
+			Int nextX = getXWithOrigin(column + 1) + 1;
+			const Int sourceOffset = (row - originY) * verticesPerRow +
+				4 * (column - originX);
+			HeightMapDynamicLightVertex *captured = batch.inputVertices() +
+				cellIndex * HEIGHTMAP_DYNAMIC_LIGHT_VERTEX_COUNT;
+			if (previousX < -m_map->getDrawOrgX())
+				previousX = -m_map->getDrawOrgX();
+			if (nextX >= m_map->getXExtent() - m_map->getDrawOrgX())
+				nextX = m_map->getXExtent() - m_map->getDrawOrgX() - 1;
+			for (maskIndex = 0; maskIndex < numLights; ++maskIndex)
+			{
+				W3DDynamicLight *light = pLights[maskIndex];
+				if ((light->m_minX <= xCoord + 1 &&
+					light->m_maxX >= xCoord &&
+					light->m_minY <= yCoord + 1 &&
+					light->m_maxY >= yCoord) ||
+					(light->m_prevMinX <= xCoord + 1 &&
+					light->m_prevMaxX >= xCoord &&
+					light->m_prevMinY <= yCoord + 1 &&
+					light->m_prevMaxY >= yCoord))
+				{
+					intersects = true;
+					break;
+				}
+			}
+
+			for (unsigned corner = 0; corner <
+				HEIGHTMAP_DYNAMIC_LIGHT_VERTEX_COUNT; ++corner)
+			{
+				const VERTEX_FORMAT &source = data[sourceOffset + corner];
+				Vector3 leftToRight;
+				Vector3 backToForward;
+				Vector3 normal;
+				captured[corner].x = source.x;
+				captured[corner].y = source.y;
+				captured[corner].z = source.z;
+				captured[corner].diffuse = source.diffuse;
+				captured[corner].applyLighting = intersects ? 1 : 0;
+				if (!intersects)
+				{
+					captured[corner].normalX = 0.0f;
+					captured[corner].normalY = 0.0f;
+					captured[corner].normalZ = 1.0f;
+					continue;
+				}
+
+				switch (corner)
+				{
+				case 0:
+					leftToRight.Set(2 * MAP_XY_FACTOR, 0,
+						MAP_HEIGHT_SCALE * (m_map->getDisplayHeight(mapX + 1,
+							mapY) - m_map->getDisplayHeight(previousX, mapY)));
+					backToForward.Set(0, 2 * MAP_XY_FACTOR,
+						MAP_HEIGHT_SCALE * (m_map->getDisplayHeight(mapX, mapY + 1) -
+							m_map->getDisplayHeight(mapX, previousY)));
+					break;
+				case 1:
+					leftToRight.Set(2 * MAP_XY_FACTOR, 0,
+						MAP_HEIGHT_SCALE * (m_map->getDisplayHeight(nextX, mapY) -
+							m_map->getDisplayHeight(mapX, mapY)));
+					backToForward.Set(0, 2 * MAP_XY_FACTOR,
+						MAP_HEIGHT_SCALE * (m_map->getDisplayHeight(mapX + 1,
+							mapY + 1) - m_map->getDisplayHeight(mapX + 1,
+							previousY)));
+					break;
+				case 2:
+					leftToRight.Set(2 * MAP_XY_FACTOR, 0,
+						MAP_HEIGHT_SCALE * (m_map->getDisplayHeight(nextX, mapY + 1) -
+							m_map->getDisplayHeight(mapX, mapY + 1)));
+					backToForward.Set(0, 2 * MAP_XY_FACTOR,
+						MAP_HEIGHT_SCALE * (m_map->getDisplayHeight(mapX + 1,
+							nextY) - m_map->getDisplayHeight(mapX + 1, mapY)));
+					break;
+				default:
+					leftToRight.Set(2 * MAP_XY_FACTOR, 0,
+						MAP_HEIGHT_SCALE * (m_map->getDisplayHeight(mapX + 1,
+							mapY + 1) - m_map->getDisplayHeight(previousX,
+							mapY + 1)));
+					backToForward.Set(0, 2 * MAP_XY_FACTOR,
+						MAP_HEIGHT_SCALE * (m_map->getDisplayHeight(mapX, nextY) -
+							m_map->getDisplayHeight(mapX, mapY)));
+					break;
+				}
+				Vector3::Normalized_Cross_Product(leftToRight, backToForward,
+					&normal);
+				captured[corner].normalX = normal.X;
+				captured[corner].normalY = normal.Y;
+				captured[corner].normalZ = normal.Z;
+			}
+			++cellIndex;
+		}
+	}
+
+	return cellIndex == batch.snapshot().width * batch.snapshot().height;
+}
+
+Int HeightMapRenderObjClass::updateVBForLightWithPreparation(
+	DX8VertexBufferClass *pVB, VERTEX_FORMAT *data, Int x0, Int y0, Int x1,
+	Int y1, Int originX, Int originY, W3DDynamicLight *pLights[],
+	Int numLights, RadarTerrainPrepareService *service)
+{
+	HeightMapDynamicLightBatch &batch = m_dynamicLightBatch;
+	const unsigned width = x1 > x0 ? static_cast<unsigned>(x1 - x0) : 0;
+	const unsigned height = y1 > y0 ? static_cast<unsigned>(y1 - y0) : 0;
+	if (!service || !pVB || !data || width == 0 || height == 0 ||
+		!captureDynamicLightBatch(batch, data, x0, y0, x1, y1, originX,
+			originY, pLights, numLights) || !batch.run(*service))
+		return updateVBForLight(pVB, data, x0, y0, x1, y1, originX, originY,
+			pLights, numLights);
+
+	Bool published = false;
+	{
+		DX8VertexBufferClass::WriteLockClass lockVtxBuffer(pVB);
+		VERTEX_FORMAT *hardware = (VERTEX_FORMAT *)lockVtxBuffer.Get_Vertex_Array();
+		const unsigned verticesPerRow = VERTEX_BUFFER_TILE_LENGTH * 4;
+		if (hardware)
+		{
+			for (unsigned row = 0; row < height; ++row)
+			{
+				for (unsigned column = 0; column < width; ++column)
+				{
+					const unsigned stagedOffset = (row * width + column) * 4;
+					const Int destinationOffset =
+						(static_cast<Int>(row) + y0 - originY) * verticesPerRow +
+						4 * (static_cast<Int>(column) + x0 - originX);
+					for (unsigned corner = 0; corner < 4; ++corner)
+					{
+						const HeightMapDynamicLightVertex &staged =
+							batch.outputVertices()[stagedOffset + corner];
+						if (staged.applyLighting)
+							hardware[destinationOffset + corner].diffuse =
+								staged.diffuse;
+					}
+				}
+			}
+			published = true;
+		}
+	}
+	if (!published)
+		return updateVBForLight(pVB, data, x0, y0, x1, y1, originX,
+			originY, pLights, numLights);
+	return 0;
+}
+
 
 
 //=============================================================================
@@ -1868,7 +2101,32 @@ void HeightMapRenderObjClass::On_Frame_Update()
 				}
 				DX8VertexBufferClass *pVB = getVertexBufferTile(i, j);
 				VERTEX_FORMAT *pData = getVertexBufferBackup(i, j);
-				updateVBForLight(pVB, pData, xMin, yMin, xMax, yMax, originX,originY, enabledLights, numDynaLights);
+				RadarTerrainPrepareService &lightService =
+					GetRadarTerrainPrepareService();
+				Bool lightLeaseHeld = false;
+#if (OPTIMIZED_HEIGHTMAP_LIGHTING)
+				updateVBForLight(pVB, pData, xMin, yMin, xMax, yMax, originX,
+					originY, enabledLights, numDynaLights);
+#elif defined(USE_NORMALS)
+				/* Normal-mapped builds keep the legacy no-diffuse path. */
+				updateVBForLight(pVB, pData, xMin, yMin, xMax, yMax, originX,
+					originY, enabledLights, numDynaLights);
+#else
+				if (lightService.tryAcquire(5))
+				{
+					lightLeaseHeld = true;
+					updateVBForLightWithPreparation(pVB, pData, xMin, yMin,
+						xMax, yMax, originX, originY, enabledLights,
+						numDynaLights, &lightService);
+				}
+				else
+				{
+					updateVBForLight(pVB, pData, xMin, yMin, xMax, yMax,
+						originX, originY, enabledLights, numDynaLights);
+				}
+#endif
+				if (lightLeaseHeld)
+					lightService.release(5);
 			}
 		}
 	}

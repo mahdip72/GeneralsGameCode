@@ -170,6 +170,7 @@ class SynchronizedTextureLoadTaskListClass : public TextureLoadTaskListClass
 		void									Push_Front	(TextureLoadTaskClass *task);
 		void									Push_Back	(TextureLoadTaskClass *task);
 		void									Publish_Completed(TextureLoadTaskClass *task);
+		void									Publish_Failed	(TextureLoadTaskClass *task);
 		void									Publish_Thumbnail(TextureLoadTaskClass *task, TextureLoadTaskClass *loadTask);
 		rts::Task*							Take_Prepare_Task(TextureLoadTaskClass *task,
 			rts::TaskRuntime& runtime, bool& wasSubmitted);
@@ -252,6 +253,7 @@ class TextureLoadTaskClass : public TextureLoadTaskListNodeClass
 		void						Apply_Missing_Texture	();
 		bool						Begin_Async_Prepare		();
 		void						Complete_Async_Prepare	();
+		void						Fail_Async_Prepare		();
 		bool						Is_Async_Prepare_Complete();
 		void						Wait_For_Async_Prepare	();
 		void						Set_Prepare_Runtime_Task(void* task) { PrepareRuntimeTask = task; }

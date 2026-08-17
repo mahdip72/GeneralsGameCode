@@ -649,8 +649,23 @@ private:
 #endif
 			unlock();
 
-			task->execute();
-			delete task;
+			/* A preparation task must not tear down the worker or strand the
+			 * active-task counter.  Owner-side callers observe the failed batch
+			 * result and take their existing serial fallback. */
+			try
+			{
+				task->execute();
+			}
+			catch (...)
+			{
+			}
+			try
+			{
+				delete task;
+			}
+			catch (...)
+			{
+			}
 
 			lock();
 			--m_activeTaskCount;

@@ -185,6 +185,14 @@ void SynchronizedTextureLoadTaskListClass::Publish_Completed(TextureLoadTaskClas
 	task->Complete_Async_Prepare();
 }
 
+void SynchronizedTextureLoadTaskListClass::Publish_Failed(TextureLoadTaskClass *task)
+{
+	FastCriticalSectionClass::LockClass lock(CriticalSection);
+	task->Set_Prepare_Runtime_Task(nullptr);
+	TextureLoadTaskListClass::Push_Back(task);
+	task->Fail_Async_Prepare();
+}
+
 void SynchronizedTextureLoadTaskListClass::Publish_Thumbnail(
 	TextureLoadTaskClass *task, TextureLoadTaskClass *loadTask)
 {
@@ -256,6 +264,23 @@ static TextureLoadTaskListClass					_VolTexLoadFreeList;
 static rts::TaskRuntime _TexturePrepareRuntime;
 static TexturePrepareMemoryBudget _TexturePrepareMemoryBudget(64u * 1024u * 1024u);
 
+static bool Try_Load_For_Owner(TextureLoadTaskClass *task)
+{
+	try
+	{
+		return task->Load();
+	}
+	catch (...)
+	{
+		// Owner-side fallbacks must still publish a failed preparation so the
+		// existing End_Load path applies the missing texture and releases all
+		// staged resources. Worker execution keeps its separate catch/publication
+		// path below so worker ownership is unchanged.
+		task->Fail_Async_Prepare();
+		return false;
+	}
+}
+
 class TexturePrepareRuntimeTask : public rts::Task
 {
 public:
@@ -266,7 +291,18 @@ public:
 		WWASSERT(m_task != nullptr);
 		WWASSERT(m_task->Get_Type() == TextureLoadTaskClass::TASK_LOAD);
 		WWASSERT(m_task->Get_State() == TextureLoadTaskClass::STATE_LOAD_BEGUN);
-		m_task->Load();
+		try
+		{
+			m_task->Load();
+		}
+		catch (...)
+		{
+			// TaskRuntime contains the exception after execute returns, but the
+			// texture owner still needs a completion publication so it can apply
+			// the missing texture and release the task's staged resources.
+			_ForegroundQueue.Publish_Failed(m_task);
+			return;
+		}
 		_ForegroundQueue.Publish_Completed(m_task);
 	}
 
@@ -825,7 +861,7 @@ void TextureLoader::Request_Foreground_Loading(TextureBaseClass *tc)
 				if (runtimeTask != nullptr)
 				{
 					delete runtimeTask;
-					task->Load();
+					Try_Load_For_Owner(task);
 					task->Complete_Async_Prepare();
 				}
 				else if (wasSubmitted)
@@ -1041,7 +1077,7 @@ void TextureLoader::Begin_Load_And_Queue(TextureLoadTaskClass *task)
 		}
 
 		delete runtimeTask;
-		task->Load();
+		Try_Load_For_Owner(task);
 		task->Complete_Async_Prepare();
 		task->End_Load();
 		task->Destroy();
@@ -1142,6 +1178,14 @@ void TextureLoadTaskClass::Complete_Async_Prepare()
 	{
 		SetEvent((HANDLE)PrepareCompleteEvent);
 	}
+}
+
+
+void TextureLoadTaskClass::Fail_Async_Prepare()
+{
+	LoadSucceeded = false;
+	State = STATE_LOAD_MIPMAP;
+	Complete_Async_Prepare();
 }
 
 
@@ -1522,7 +1566,7 @@ void TextureLoadTaskClass::Finish_Load()
 			FALLTHROUGH;
 
 		case STATE_LOAD_BEGUN:
-			Load();
+			Try_Load_For_Owner(this);
 			FALLTHROUGH;
 
 		case STATE_LOAD_MIPMAP:

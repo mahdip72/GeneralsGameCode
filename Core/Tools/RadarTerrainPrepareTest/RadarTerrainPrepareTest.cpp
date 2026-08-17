@@ -881,6 +881,7 @@ static int testPrepareServiceSuccessfulLeaseAndRows()
 	makeServiceFixture(cells, &snapshot, serialOutput);
 	memset(output, 0xA5, sizeof(output));
 	CHECK(testName, service.initialize(2, 2));
+	CHECK(testName, service.warmup());
 	CHECK(testName, service.tryAcquire(1));
 	CHECK(testName, !service.tryAcquire(2));
 	CHECK(testName, service.runRows(&snapshot, output, 0, snapshot.height));

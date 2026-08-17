@@ -345,6 +345,25 @@ private:
 	unsigned *m_nextOrder;
 };
 
+class ThrowingTask : public rts::Task
+{
+public:
+	explicit ThrowingTask(TaskRecord *record) : m_record(record) {}
+	~ThrowingTask() { ++m_record->destructions; }
+
+	void execute()
+	{
+		++m_record->executions;
+		throw 1;
+	}
+
+private:
+	ThrowingTask(const ThrowingTask &);
+	ThrowingTask &operator=(const ThrowingTask &);
+
+	TaskRecord *m_record;
+};
+
 class GateTask : public rts::Task
 {
 public:
@@ -504,6 +523,25 @@ static int testExactlyOnceAtOneAndFourWorkers()
 			CHECK(testName, records[taskIndex].destructions == 1);
 		}
 	}
+	return 0;
+}
+
+static int testWorkerExceptionStillSignalsIdle()
+{
+	const char *testName = "testWorkerExceptionStillSignalsIdle";
+	rts::TaskRuntime runtime;
+	TaskRecord throwingRecord;
+	TaskRecord followingRecord;
+
+	CHECK(testName, runtime.start(1, 2));
+	CHECK(testName, runtime.trySubmit(new ThrowingTask(&throwingRecord)));
+	CHECK(testName, runtime.trySubmit(new RecordingTask(&followingRecord, 0)));
+	runtime.waitUntilIdle();
+	CHECK(testName, throwingRecord.executions == 1);
+	CHECK(testName, throwingRecord.destructions == 1);
+	CHECK(testName, followingRecord.executions == 1);
+	CHECK(testName, followingRecord.destructions == 1);
+	runtime.shutdown();
 	return 0;
 }
 
@@ -1080,6 +1118,7 @@ int main()
 	int result = 0;
 	result |= testInvalidStartArguments();
 	result |= testExactlyOnceAtOneAndFourWorkers();
+	result |= testWorkerExceptionStillSignalsIdle();
 	result |= testFifoDequeueAtOneWorker();
 	result |= testFrontSubmissionPrecedesQueuedWork();
 	result |= testQueuedTaskCanBeTakenWithoutTakingActiveTask();

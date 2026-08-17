@@ -121,7 +121,7 @@ not claim that the commands below have run successfully:
   assertions.  `W3DRadar` keeps acquisition, join/fallback, surface lock,
   upload, unlock, and release on the owner thread.
 - [ ] Focused tests, the modern x86 title builds, and the VC6 compatibility
-  build have not yet been executed for the final Stage 5 head.
+  build have not yet been executed for the current Stage 5 source.
 - [ ] The ten-review-lens code review has not yet been completed.
 - [ ] The optimized VC6 replay gate has not yet been executed.
 - [ ] Interactive manual acceptance is intentionally deferred until the
@@ -178,13 +178,58 @@ starts independent replay processes; it is not an in-process worker-count
 switch.  Record only repository-relative commands and aggregate results, not
 machine-specific paths or logs.
 
-The ten review lenses for the final Stage 5 head are: owner boundary,
+# Stage 8 dynamic terrain-light preparation checks
+
+Stage 8 moves only the CPU portion of the existing dynamic terrain-light pass
+to the shared bounded preparation service.  The owner still discovers lights,
+captures map-derived normals and per-cell current/previous bounds, owns the
+immutable backup baseline, locks and updates Direct3D buffers, and runs the
+serial updater whenever capture, worker execution, validation, or publication
+is not safe.  Optimized-lighting builds remain on their unchanged serial path;
+the default non-optimized layout has no shared hardware vertices.
+
+Run the repository-relative focused build and CTest target:
+
+```powershell
+cmake --preset win32-debug -DRTS_BUILD_GENERALS=ON -DRTS_BUILD_ZEROHOUR=ON -DRTS_BUILD_CORE_EXTRAS=ON
+cmake --build build/win32-debug --config Debug --target height_map_dynamic_light_prepare_tests --parallel 2
+ctest --test-dir build/win32-debug -C Debug -R "^height_map_dynamic_light_prepare_tests$" --output-on-failure
+```
+
+The focused core-extra test covers directional, point, spot, disabled,
+attenuated, alpha-preserving, bounds-masked, and tiny-batch serial-cutoff
+execution,
+NaN/range rejection, overlap and alignment rejection, and unchanged output on
+failure.  The existing RadarTerrain service tests cover the shared runtime's
+worker identity, rejection ownership, retry, lease, and shutdown behavior.
+The owner validates the staged structure without replaying the lighting loop;
+the focused kernel checks the complete serial lighting oracle separately.
+Interactive display initialization warms the private workers; headless replay
+defers worker creation because it never renders terrain. One-row and other
+tiny batches use the owner serial cutoff to avoid empty-stripe task overhead.
+Point/spot vertices exactly coincident with a light use the documented finite
+ambient-only fallback instead of reproducing the legacy divide-by-zero NaN.
+The worker source audit must find no D3D, `The*` global, live map/light,
+allocation, logging, replay, network, or UI access in the kernel or row task.
+The shared runtime contains unexpected worker exceptions after bookkeeping;
+texture preparation publishes an owner-visible failure for normal missing-texture
+cleanup, and screenshot batches mark conversion/encoding failure before their
+owned buffers are released.
+
+The automated Stage 8 gates require both title builds, the complete ten-replay
+/ twelve-execution deterministic gate, and all ten review lenses.  These
+automated gates are complete for the current exact head.  A live
+dynamic-light stress map remains intentionally deferred to manual approval on
+the owner-preserving candidate.  Do not promote the candidate or launch the
+canonical install before that manual approval.
+
+The ten review lenses for the Stage 8 head are: owner boundary,
 complete immutable snapshot, legacy byte parity, disjoint row ownership,
 private-runtime wait isolation, deterministic fallback behavior, bounded
 memory and lifetime, both-display lifecycle, C++98/VC6 plus replay evidence,
-and scoped delivery/privacy hygiene.  All ten review passes and any resulting
-fix/retest cycle must complete before Stage 5 is considered ready for the
-stacked-stage handoff.
+and scoped delivery/privacy hygiene.  All ten review passes and the resulting
+fix/retest cycle are complete for the current head.  Repeat them after any
+subsequent source change before accepting a new stacked-stage handoff.
 
 # Stage 6 radar overlay preparation checks
 
@@ -240,8 +285,8 @@ isolated build trees:
 ```powershell
 git diff --check
 cmake --preset win32-debug -DRTS_BUILD_GENERALS=ON -DRTS_BUILD_ZEROHOUR=ON -DRTS_BUILD_CORE_EXTRAS=ON
-cmake --build build/win32-debug --config Debug --target height_map_terrain_prepare_tests radar_terrain_prepare_tests radar_overlay_prepare_tests core_task_runtime_tests core_texture_mip_buffer_tests core_screenshot_codec_tests core_miles_audio_completion_tests core_camera_audio_policy_tests g_generals z_generals --parallel 2
-ctest --test-dir build/win32-debug -C Debug -R "^(height_map_terrain_prepare|radar_terrain_prepare|radar_overlay_prepare|core_task_runtime|core_texture_mip_buffer|core_screenshot_codec|core_miles_audio_completion|core_camera_audio_policy)_tests$" --output-on-failure
+cmake --build build/win32-debug --config Debug --target height_map_terrain_prepare_tests radar_terrain_prepare_tests radar_overlay_prepare_tests height_map_dynamic_light_prepare_tests core_task_runtime_tests core_texture_mip_buffer_tests core_screenshot_codec_tests core_miles_audio_completion_tests core_camera_audio_policy_tests g_generals z_generals --parallel 2
+ctest --test-dir build/win32-debug -C Debug -R "^(height_map_terrain_prepare|radar_terrain_prepare|radar_overlay_prepare|height_map_dynamic_light_prepare|core_task_runtime|core_texture_mip_buffer|core_screenshot_codec|core_miles_audio_completion|core_camera_audio_policy)_tests$" --output-on-failure
 ```
 
 Repeat the focused targets and both game targets with `win32-profile` using the
