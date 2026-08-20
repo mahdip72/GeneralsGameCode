@@ -218,7 +218,7 @@ int testLegacyShaderBitDecoder()
 		state.fogMode == rts::render::RENDER_FOG_SCALE_FRAGMENT &&
 		state.textureStages[0].colorOperation == rts::render::RENDER_TEXTURE_OP_BUMP_ENVIRONMENT &&
 		state.textureStages[0].alphaOperation == rts::render::RENDER_TEXTURE_OP_DISABLE,
-		"disabled color writes and bump mapping retain the D3D8 effective state");
+		"disabled color writes and bump mapping retain the legacy effective state");
 
 	const unsigned int inverseSourceAlpha = makeLegacyShaderBits(3, 0, 1,
 		3, 0, 3, 5, 0, 1, 1, 1, 12, 3) | (1U << 17);
@@ -242,6 +242,16 @@ int testLegacyShaderBitDecoder()
 		makeLegacyShaderBits(3, 1, 1, 1, 7, 0, 7, 0, 1, 0, 1, 15, 7),
 		&state) && state.shaderBits == 0,
 		"reserved legacy encodings fail closed to deterministic defaults");
+	rts::render::TrackLegacyShaderBits(opaque);
+	result |= check(rts::render::GetTrackedLegacyPipelineState(&state) &&
+		state.shaderBits == opaque &&
+		state.textureStages[0].colorOperation == rts::render::RENDER_TEXTURE_OP_MODULATE,
+		"legacy bridge publishes the last valid shader state to the neutral boundary");
+	rts::render::TrackLegacyShaderBits(makeLegacyShaderBits(3, 1, 1,
+		1, 7, 0, 7, 0, 1, 0, 1, 15, 7));
+	result |= check(!rts::render::GetTrackedLegacyPipelineState(&state) &&
+		!rts::render::GetTrackedLegacyPipelineState(0),
+		"legacy bridge never publishes invalid or null state");
 	return result;
 }
 

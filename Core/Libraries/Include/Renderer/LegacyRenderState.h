@@ -324,6 +324,8 @@ LegacyShaderKey BuildLegacyShaderKey(const LegacyPipelineState &state,
 	unsigned int vertexFormat, unsigned int texturePresenceMask);
 bool DecodeLegacyShaderBits(unsigned int shaderBits,
 	LegacyPipelineState *state);
+void TrackLegacyShaderBits(unsigned int shaderBits);
+bool GetTrackedLegacyPipelineState(LegacyPipelineState *state);
 }
 }
 

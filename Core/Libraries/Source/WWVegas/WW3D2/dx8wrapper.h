@@ -57,6 +57,7 @@
 #include "dx8vertexbuffer.h"
 #include "dx8indexbuffer.h"
 #include "WW3D2/vertmaterial.h"
+#include "Renderer/LegacyRenderState.h"
 
 /*
 ** Registry value names
@@ -1185,6 +1186,7 @@ WWINLINE void DX8Wrapper::Set_Shader(const ShaderClass& shader)
 		return;
 	}
 	render_state.shader=shader;
+	rts::render::TrackLegacyShaderBits(shader.Get_Bits());
 	render_state_changed|=SHADER_CHANGED;
 #ifdef MESH_RENDER_SNAPSHOT_ENABLED
 	StringClass str;

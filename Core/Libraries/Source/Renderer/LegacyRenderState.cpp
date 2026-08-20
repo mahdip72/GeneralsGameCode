@@ -4,6 +4,12 @@ namespace rts
 {
 namespace render
 {
+namespace
+{
+LegacyPipelineState g_trackedPipelineState;
+bool g_trackedPipelineStateValid = false;
+}
+
 RenderFloat4::RenderFloat4() : x(0.0f), y(0.0f), z(0.0f), w(0.0f) {}
 
 RenderFloat4::RenderFloat4(float xValue, float yValue, float zValue,
@@ -371,6 +377,22 @@ bool DecodeLegacyShaderBits(unsigned int shaderBits,
 			detail->colorOperation = RENDER_TEXTURE_OP_SELECT_ARGUMENT_2;
 		}
 	}
+	return true;
+}
+
+void TrackLegacyShaderBits(unsigned int shaderBits)
+{
+	g_trackedPipelineStateValid = DecodeLegacyShaderBits(shaderBits,
+		&g_trackedPipelineState);
+}
+
+bool GetTrackedLegacyPipelineState(LegacyPipelineState *state)
+{
+	if (state == 0 || !g_trackedPipelineStateValid)
+	{
+		return false;
+	}
+	*state = g_trackedPipelineState;
 	return true;
 }
 }
