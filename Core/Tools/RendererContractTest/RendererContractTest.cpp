@@ -1194,8 +1194,7 @@ int testD3D11LegacyBlendFactors()
 			if (stateResult != rts::render::RENDER_RESULT_OK)
 			{
 				fprintf(stderr,
-					"legacy blend case %s returned RenderResult %u; "
-					"CreateBlendState rejected the alpha factor\n",
+					"legacy blend case %s failed to bind with RenderResult %u\n",
 					cases[index].name, static_cast<unsigned int>(stateResult));
 			}
 			char message[128];
