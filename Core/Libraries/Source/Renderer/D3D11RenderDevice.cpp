@@ -1021,18 +1021,20 @@ public:
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
-		const bool textured = texturePresenceMask != 0;
-		if ((!textured && vertexFormat != RENDER_VERTEX_POSITION3_COLOR) ||
-			(textured && vertexFormat !=
+		const bool hasTextures = texturePresenceMask != 0;
+		const bool useFullPipeline = hasTextures || vertexFormat ==
+			RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1;
+		if ((!useFullPipeline && vertexFormat != RENDER_VERTEX_POSITION3_COLOR) ||
+			(useFullPipeline && vertexFormat !=
 				RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1))
 		{
 			return RENDER_RESULT_UNSUPPORTED;
 		}
-		if (!textured && state.pipeline.lightingEnable)
+		if (!useFullPipeline && state.pipeline.lightingEnable)
 		{
 			return RENDER_RESULT_UNSUPPORTED;
 		}
-		for (unsigned int stage = 0; textured &&
+		for (unsigned int stage = 0; useFullPipeline &&
 			stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
 		{
 			if (state.pipeline.textureStages[stage].colorOperation >
@@ -1044,7 +1046,7 @@ public:
 			}
 		}
 		const HRESULT transformResult = updateTransformConstants(state,
-			textured ? 0x0bU : 0x02U);
+			useFullPipeline ? 0x0bU : 0x02U, texturePresenceMask);
 		if (FAILED(transformResult))
 		{
 			return TranslateResult(transformResult);
@@ -1129,7 +1131,7 @@ public:
 			return TranslateResult(result);
 		}
 		ID3D11SamplerState *samplerStates[LEGACY_TEXTURE_STAGE_COUNT] = { 0 };
-		if (textured)
+		if (hasTextures)
 		{
 			for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT;
 				++stage)
@@ -1171,13 +1173,13 @@ public:
 		m_context->OMSetDepthStencilState(depthState,
 			state.pipeline.depthStencil.stencilReference);
 		m_context->RSSetState(rasterizerState);
-		m_context->IASetInputLayout(textured ? m_texturedLayout :
+		m_context->IASetInputLayout(useFullPipeline ? m_texturedLayout :
 			m_positionColorLayout);
-		m_context->VSSetShader(textured ? m_texturedVertexShader : m_vertexShader,
+		m_context->VSSetShader(useFullPipeline ? m_texturedVertexShader : m_vertexShader,
 			0, 0);
-		m_context->PSSetShader(textured ? m_texturedPixelShader : m_pixelShader,
+		m_context->PSSetShader(useFullPipeline ? m_texturedPixelShader : m_pixelShader,
 			0, 0);
-		if (textured)
+		if (hasTextures)
 		{
 			m_context->PSSetSamplers(0, LEGACY_TEXTURE_STAGE_COUNT, samplerStates);
 		}
@@ -1220,7 +1222,7 @@ public:
 				}
 			}
 			const HRESULT constantsResult = updateTransformConstants(state,
-				layoutFlags);
+				layoutFlags, texturePresenceMask);
 			if (FAILED(constantsResult))
 			{
 				return TranslateResult(constantsResult);
@@ -1584,7 +1586,7 @@ private:
 	}
 
 	HRESULT updateTransformConstants(const LegacyLogicalState &state,
-		unsigned int vertexLayoutFlags)
+		unsigned int vertexLayoutFlags, unsigned int texturePresenceMask)
 	{
 		LegacyTransformConstants shaderConstants;
 		MultiplyMatrices(state.constants.world.values, state.constants.view.values,
@@ -1734,7 +1736,7 @@ private:
 		shaderConstants.lightingParameters[1] =
 			state.pipeline.normalizeNormals ? 1U : 0U;
 		shaderConstants.lightingParameters[2] = 0;
-		shaderConstants.lightingParameters[3] = 0;
+		shaderConstants.lightingParameters[3] = texturePresenceMask;
 		shaderConstants.vertexLayoutParameters[0] =
 			(vertexLayoutFlags & 1U) != 0 ? 1U : 0U;
 		shaderConstants.vertexLayoutParameters[1] =

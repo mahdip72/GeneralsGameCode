@@ -328,6 +328,10 @@ float4 GetTextureCoordinate(TexturedVertexOutput input, uint index)
 
 float4 SampleLegacyTexture(uint stage, float4 coordinate)
 {
+	if ((LightingParameters.w & (1U << stage)) == 0)
+	{
+		return float4(1.0f, 1.0f, 1.0f, 1.0f);
+	}
 	const float denominator = abs(coordinate.w) > 0.000001f ? coordinate.w : 1.0f;
 	const float2 uv = coordinate.xy / denominator;
 	switch (stage)

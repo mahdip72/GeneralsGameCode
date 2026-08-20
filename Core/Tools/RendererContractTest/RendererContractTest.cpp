@@ -913,6 +913,29 @@ int testD3D11HiddenSwapChain()
 			"texture stage one selects UV1 instead of repeating UV0");
 		logicalState.pipeline.textureStages[1] =
 			rts::render::LegacyTextureStageState();
+		logicalState.pipeline.textureStages[0].colorOperation =
+			rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_2;
+		logicalState.pipeline.textureStages[0].colorArgument2 =
+			rts::render::RENDER_TEXTURE_ARG_DIFFUSE;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyStateForLayout(logicalState, flexibleLayout, 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(flexibleVertexBuffer,
+				sizeof(FlexibleVertex), 0) == rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"D3D11 parity pipeline accepts untextured flexible vertex layouts");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[0] > 240 && center[1] > 240 && center[2] > 240,
+			"untextured flexible layouts preserve vertex diffuse color");
 		logicalState.pipeline.lightingEnable = true;
 		logicalState.constants.material.ambient = rts::render::RenderFloat4();
 		logicalState.constants.material.emissive = rts::render::RenderFloat4();
