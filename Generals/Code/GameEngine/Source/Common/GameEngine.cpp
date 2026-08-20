@@ -59,6 +59,7 @@
 #include "Common/Science.h"
 #include "Common/FunctionLexicon.h"
 #include "Common/CommandLine.h"
+#include "Lib/JobSystem.h"
 
 #include "rts/profile.h"
 #include "Common/DamageFX.h"
@@ -298,6 +299,9 @@ GameEngine::~GameEngine()
 
 	Drawable::killStaticImages();
 
+	// Compute jobs must be drained after all owning subsystems have shut down.
+	rts::JobSystem::instance().shutdown();
+
 	_Module.Term();
 
 #ifdef PERF_TIMERS
@@ -351,6 +355,11 @@ void GameEngine::init()
 {
 	ASSERT_GAME_THREAD("GameEngine::init");
 	try {
+		if (!rts::JobSystem::instance().ensureStarted())
+		{
+			DEBUG_LOG(("JobSystem startup failed; parallel consumers will use their serial fallback."));
+		}
+
 		//create an INI object to use for loading stuff
 		INI ini;
 

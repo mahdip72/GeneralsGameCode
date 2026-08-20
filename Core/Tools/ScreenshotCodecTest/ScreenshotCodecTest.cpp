@@ -1,5 +1,5 @@
 #include "W3DDevice/GameClient/W3DScreenshotCodec.h"
-#include "Lib/TaskRuntime.h"
+#include "Lib/JobSystem.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -213,6 +213,7 @@ static int testRowRangePlanning()
 	CHECK(testName, checkRanges(127, 2, 1, testName) == 0);
 	CHECK(testName, checkRanges(128, 2, 2, testName) == 0);
 	CHECK(testName, checkRanges(1080, 2, 4, testName) == 0);
+	CHECK(testName, checkRanges(1080, 8, 16, testName) == 0);
 	CHECK(testName, checkRanges(1080, 1, 1, testName) == 0);
 	CHECK(testName, BuildScreenshotRowRanges(1080, 2, &range, 1) == 1);
 	CHECK(testName, range.yBegin == 0 && range.yEnd == 1080);
@@ -222,7 +223,7 @@ static int testRowRangePlanning()
 	return 0;
 }
 
-class ConvertRangeTask : public rts::Task
+class ConvertRangeTask : public rts::Job
 {
 public:
 	ConvertRangeTask(const ScreenshotPixelSource &source, const ScreenshotRowRange &range,
@@ -231,7 +232,7 @@ public:
 	{
 	}
 
-	virtual void execute()
+	virtual void execute(rts::JobContext &)
 	{
 		m_gate->enterAndWait();
 		ConvertScreenshotRows(m_source, m_range.yBegin, m_range.yEnd, m_destination);
@@ -247,11 +248,13 @@ private:
 static int checkParallelConversion(const ScreenshotPixelSource &source, const char *testName)
 {
 	ScreenshotRowRange ranges[16];
-	rts::Task *tasks[16];
+	rts::Job *tasks[16];
+	rts::JobSubmission submissions[16];
+	rts::JobHandle handles[16];
 	const unsigned byteCount = source.width * source.height * 3;
 	unsigned char *serial = new unsigned char[byteCount];
 	unsigned char *striped = new unsigned char[byteCount];
-	rts::TaskRuntime runtime;
+	rts::JobSystem &system = rts::JobSystem::instance();
 	TwoWorkerGate gate;
 	unsigned rangeCount;
 	unsigned index;
@@ -260,20 +263,30 @@ static int checkParallelConversion(const ScreenshotPixelSource &source, const ch
 	memset(serial, 0, byteCount);
 	memset(striped, 0xCD, byteCount);
 	convertFullImage(source, serial);
-	if (!runtime.start(2, 16))
+	system.shutdown();
+	rts::JobSystemConfig config;
+	config.workerCount = 2;
+	config.queueCapacity = 16;
+	config.scratchBytesPerWorker = 4096;
+	config.pinWorkers = false;
+	if (!system.start(config))
 	{
 		fprintf(stderr, "%s: failed to start task runtime\n", testName);
 		result = 1;
 	}
 	else
 	{
-		rangeCount = BuildScreenshotRowRanges(source.height, runtime.workerCount(),
+		rangeCount = BuildScreenshotRowRanges(source.height, system.workerCount(),
 			ranges, sizeof(ranges) / sizeof(ranges[0]));
+		rts::JobGroup group = system.createGroup();
 		for (index = 0; index < rangeCount; ++index)
 		{
 			tasks[index] = new ConvertRangeTask(source, ranges[index], striped, &gate);
+			submissions[index].job = tasks[index];
+			submissions[index].priority = rts::JOB_PRIORITY_BACKGROUND;
 		}
-		if (!runtime.trySubmitBatch(tasks, rangeCount))
+		if (!group.isValid() || !system.trySubmitBatch(submissions, rangeCount,
+			group, handles))
 		{
 			fprintf(stderr, "%s: failed to submit conversion batch\n", testName);
 			for (index = 0; index < rangeCount; ++index)
@@ -286,11 +299,11 @@ static int checkParallelConversion(const ScreenshotPixelSource &source, const ch
 		{
 			const bool usedTwoWorkers = gate.waitForTwoEntries(TWO_WORKER_GATE_TIMEOUT_MS);
 			gate.open();
-			runtime.waitUntilIdle();
+			system.wait(group);
 			result |= check(usedTwoWorkers, testName, "two conversion tasks entered concurrently");
 			result |= checkBytes(striped, serial, byteCount, testName);
 		}
-		runtime.shutdown();
+		system.shutdown();
 	}
 
 	delete[] serial;

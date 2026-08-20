@@ -52,8 +52,7 @@ class Targa;
 class TextureLoadTaskListClass;
 namespace rts
 {
-	class Task;
-	class TaskRuntime;
+	class Job;
 }
 
 class TextureLoader
@@ -172,8 +171,7 @@ class SynchronizedTextureLoadTaskListClass : public TextureLoadTaskListClass
 		void									Publish_Completed(TextureLoadTaskClass *task);
 		void									Publish_Failed	(TextureLoadTaskClass *task);
 		void									Publish_Thumbnail(TextureLoadTaskClass *task, TextureLoadTaskClass *loadTask);
-		rts::Task*							Take_Prepare_Task(TextureLoadTaskClass *task,
-			rts::TaskRuntime& runtime, bool& wasSubmitted);
+		bool								Has_Prepare_Job(TextureLoadTaskClass *task);
 		TextureLoadTaskClass *			Pop_Front	();
 		TextureLoadTaskClass *			Pop_Back		();
 		void									Remove		(TextureLoadTaskClass *task);
