@@ -22,6 +22,7 @@ namespace render
 namespace
 {
 const unsigned int RESOURCE_CAPACITY = 4096;
+const unsigned int TRANSFORM_CONSTANT_BUFFER_COUNT = 64;
 
 enum ResourceKind
 {
@@ -194,6 +195,28 @@ struct ResourceSlot
 	std::vector<unsigned char> shadow;
 };
 
+struct LegacyTransformConstants
+{
+	float worldViewProjection[16];
+};
+
+void MultiplyMatrices(const float *left, const float *right, float *product)
+{
+	for (unsigned int row = 0; row < 4; ++row)
+	{
+		for (unsigned int column = 0; column < 4; ++column)
+		{
+			float value = 0.0f;
+			for (unsigned int component = 0; component < 4; ++component)
+			{
+				value += left[row * 4 + component] *
+					right[component * 4 + column];
+			}
+			product[row * 4 + column] = value;
+		}
+	}
+}
+
 class D3D11RenderDevice : public IRenderDevice, public IRenderContext
 {
 public:
@@ -205,8 +228,9 @@ public:
 		m_handles(0), m_ownerThread(0), m_initialized(false),
 		m_frameOpen(false), m_pipelineBound(false), m_vertexBufferBound(false),
 		m_indexBufferBound(false), m_topologyBound(false),
-		m_enableVsync(true), m_width(0), m_height(0)
+		m_enableVsync(true), m_transformConstantCursor(0), m_width(0), m_height(0)
 	{
+		memset(m_transformConstants, 0, sizeof(m_transformConstants));
 	}
 
 	virtual ~D3D11RenderDevice()
@@ -685,6 +709,11 @@ public:
 		{
 			return RENDER_RESULT_UNSUPPORTED;
 		}
+		const HRESULT transformResult = updateTransformConstants(state.constants);
+		if (FAILED(transformResult))
+		{
+			return TranslateResult(transformResult);
+		}
 
 		D3D11_BLEND_DESC blendDescriptor;
 		memset(&blendDescriptor, 0, sizeof(blendDescriptor));
@@ -1072,7 +1101,25 @@ private:
 
 	HRESULT createPipelineResources()
 	{
-		HRESULT result = m_device->CreateVertexShader(g_LegacyFixedFunctionVS,
+		D3D11_BUFFER_DESC constantDescriptor;
+		memset(&constantDescriptor, 0, sizeof(constantDescriptor));
+		constantDescriptor.ByteWidth = sizeof(LegacyTransformConstants);
+		constantDescriptor.Usage = D3D11_USAGE_DYNAMIC;
+		constantDescriptor.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		constantDescriptor.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		HRESULT result = S_OK;
+		for (unsigned int index = 0; index < TRANSFORM_CONSTANT_BUFFER_COUNT;
+			++index)
+		{
+			result = m_device->CreateBuffer(&constantDescriptor, 0,
+				&m_transformConstants[index]);
+			if (FAILED(result))
+			{
+				return result;
+			}
+		}
+		m_transformConstantCursor = 0;
+		result = m_device->CreateVertexShader(g_LegacyFixedFunctionVS,
 			sizeof(g_LegacyFixedFunctionVS), 0, &m_vertexShader);
 		if (FAILED(result))
 		{
@@ -1123,6 +1170,30 @@ private:
 		return m_device->CreateInputLayout(texturedElements,
 			static_cast<UINT>(sizeof(texturedElements) / sizeof(texturedElements[0])),
 			g_LegacyTexturedVS, sizeof(g_LegacyTexturedVS), &m_texturedLayout);
+	}
+
+	HRESULT updateTransformConstants(const LegacyFixedFunctionConstants &constants)
+	{
+		float worldView[16];
+		LegacyTransformConstants shaderConstants;
+		MultiplyMatrices(constants.world.values, constants.view.values, worldView);
+		MultiplyMatrices(worldView, constants.projection.values,
+			shaderConstants.worldViewProjection);
+		ID3D11Buffer *constantBuffer =
+			m_transformConstants[m_transformConstantCursor];
+		m_transformConstantCursor = (m_transformConstantCursor + 1) %
+			TRANSFORM_CONSTANT_BUFFER_COUNT;
+		D3D11_MAPPED_SUBRESOURCE mapped;
+		const HRESULT result = m_context->Map(constantBuffer, 0,
+			D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+		if (FAILED(result))
+		{
+			return result;
+		}
+		memcpy(mapped.pData, &shaderConstants, sizeof(shaderConstants));
+		m_context->Unmap(constantBuffer, 0);
+		m_context->VSSetConstantBuffers(0, 1, &constantBuffer);
+		return S_OK;
 	}
 
 	HRESULT createBackBufferTargets()
@@ -1473,6 +1544,16 @@ private:
 			m_samplerStates[index].state->Release();
 		}
 		m_samplerStates.clear();
+		for (unsigned int index = 0; index < TRANSFORM_CONSTANT_BUFFER_COUNT;
+			++index)
+		{
+			if (m_transformConstants[index] != 0)
+			{
+				m_transformConstants[index]->Release();
+				m_transformConstants[index] = 0;
+			}
+		}
+		m_transformConstantCursor = 0;
 		if (m_texturedLayout != 0)
 		{
 			m_texturedLayout->Release();
@@ -1530,6 +1611,7 @@ private:
 	ID3D11RenderTargetView *m_renderTarget;
 	ID3D11Texture2D *m_depthTexture;
 	ID3D11DepthStencilView *m_depthStencil;
+	ID3D11Buffer *m_transformConstants[TRANSFORM_CONSTANT_BUFFER_COUNT];
 	ID3D11VertexShader *m_vertexShader;
 	ID3D11PixelShader *m_pixelShader;
 	ID3D11InputLayout *m_positionColorLayout;
@@ -1550,6 +1632,7 @@ private:
 	bool m_indexBufferBound;
 	bool m_topologyBound;
 	bool m_enableVsync;
+	unsigned int m_transformConstantCursor;
 	unsigned int m_width;
 	unsigned int m_height;
 };

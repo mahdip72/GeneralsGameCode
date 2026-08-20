@@ -409,6 +409,36 @@ int testD3D11HiddenSwapChain()
 		result |= check(center[2] > 240 && center[0] < 16,
 			"captured indexed triangle preserves the indexed draw result");
 
+		logicalState.constants.world.values[0] = 0.4f;
+		logicalState.constants.world.values[5] = 0.4f;
+		logicalState.constants.world.values[12] = 0.5f;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyState(logicalState,
+				rts::render::RENDER_VERTEX_POSITION3_COLOR, 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(vertexBuffer, sizeof(TestVertex), 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setIndexBuffer(indexBuffer,
+				rts::render::RENDER_FORMAT_R16_UINT, 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->drawIndexed(3, 0, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"D3D11 parity pipeline uploads fixed-function transforms");
+		center = &pixels[4 * (32 * 64 + 32)];
+		const unsigned char *shiftedCenter = &pixels[4 * (32 * 64 + 48)];
+		result |= check(center[0] > 240 && center[2] < 16 &&
+			shiftedCenter[2] > 240 && shiftedCenter[0] < 16,
+			"captured triangle follows the neutral world transform");
+		logicalState.constants.world.setIdentity();
+
 		struct TexturedVertex
 		{
 			float position[3];
