@@ -271,6 +271,28 @@ int testLegacyShaderBitDecoder()
 			rts::render::LEGACY_TRANSFORM_WORLD, 0) &&
 		!rts::render::GetTrackedLegacyLogicalState(0),
 		"legacy transform bridge rejects invalid slots and null storage");
+	rts::render::LegacyMaterialState material;
+	material.diffuse = rts::render::RenderFloat4(0.25f, 0.5f, 0.75f, 1.0f);
+	rts::render::TrackLegacyMaterial(material);
+	rts::render::LegacyLightState light;
+	light.enabled = true;
+	light.type = rts::render::RENDER_LIGHT_POINT;
+	light.range = 64.0f;
+	rts::render::LegacyFogConstants fog;
+	fog.enabled = true;
+	fog.end = 512.0f;
+	rts::render::TrackLegacyFog(fog);
+	rts::render::TrackLegacyGlobalAmbient(
+		rts::render::RenderFloat4(0.1f, 0.2f, 0.3f, 1.0f));
+	result |= check(rts::render::TrackLegacyLight(0, light) &&
+		!rts::render::TrackLegacyLight(rts::render::LEGACY_LIGHT_COUNT, light) &&
+		rts::render::GetTrackedLegacyLogicalState(&logicalState) &&
+		logicalState.constants.material.diffuse.z == 0.75f &&
+		logicalState.constants.lights[0].enabled &&
+		logicalState.constants.lights[0].range == 64.0f &&
+		logicalState.constants.fog.end == 512.0f &&
+		logicalState.constants.globalAmbient.y == 0.2f,
+		"legacy bridge publishes material, light, fog, and ambient constants");
 	return result;
 }
 

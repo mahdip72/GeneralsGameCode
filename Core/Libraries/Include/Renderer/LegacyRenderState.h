@@ -343,6 +343,10 @@ bool DecodeLegacyShaderBits(unsigned int shaderBits,
 void TrackLegacyShaderBits(unsigned int shaderBits);
 bool GetTrackedLegacyPipelineState(LegacyPipelineState *state);
 bool TrackLegacyTransform(LegacyTransformSlot slot, const float *values);
+void TrackLegacyMaterial(const LegacyMaterialState &material);
+bool TrackLegacyLight(unsigned int index, const LegacyLightState &light);
+void TrackLegacyFog(const LegacyFogConstants &fog);
+void TrackLegacyGlobalAmbient(const RenderFloat4 &ambient);
 bool GetTrackedLegacyLogicalState(LegacyLogicalState *state);
 }
 }

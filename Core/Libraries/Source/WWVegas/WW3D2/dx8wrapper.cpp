@@ -2945,13 +2945,36 @@ void DX8Wrapper::Compute_Caps(WW3DFormat display_format)
 
 void DX8Wrapper::Set_Light(unsigned index, const D3DLIGHT8* light)
 {
+	rts::render::LegacyLightState neutralLight;
 	if (light) {
 		render_state.Lights[index]=*light;
 		render_state.LightEnable[index]=true;
+		neutralLight.enabled = true;
+		neutralLight.type = light->Type == D3DLIGHT_POINT ?
+			rts::render::RENDER_LIGHT_POINT : (light->Type == D3DLIGHT_SPOT ?
+			rts::render::RENDER_LIGHT_SPOT : rts::render::RENDER_LIGHT_DIRECTIONAL);
+		neutralLight.diffuse = rts::render::RenderFloat4(light->Diffuse.r,
+			light->Diffuse.g, light->Diffuse.b, light->Diffuse.a);
+		neutralLight.specular = rts::render::RenderFloat4(light->Specular.r,
+			light->Specular.g, light->Specular.b, light->Specular.a);
+		neutralLight.ambient = rts::render::RenderFloat4(light->Ambient.r,
+			light->Ambient.g, light->Ambient.b, light->Ambient.a);
+		neutralLight.position = rts::render::RenderFloat4(light->Position.x,
+			light->Position.y, light->Position.z, 1.0f);
+		neutralLight.direction = rts::render::RenderFloat4(light->Direction.x,
+			light->Direction.y, light->Direction.z, 0.0f);
+		neutralLight.range = light->Range;
+		neutralLight.falloff = light->Falloff;
+		neutralLight.attenuation0 = light->Attenuation0;
+		neutralLight.attenuation1 = light->Attenuation1;
+		neutralLight.attenuation2 = light->Attenuation2;
+		neutralLight.theta = light->Theta;
+		neutralLight.phi = light->Phi;
 	}
 	else {
 		render_state.LightEnable[index]=false;
 	}
+	rts::render::TrackLegacyLight(index, neutralLight);
 	render_state_changed|=(LIGHT0_CHANGED<<index);
 }
 

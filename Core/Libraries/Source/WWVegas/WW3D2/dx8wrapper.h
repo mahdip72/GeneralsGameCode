@@ -801,6 +801,12 @@ WWINLINE void DX8Wrapper::Set_Fog(bool enable, const Vector3 &color, float start
 	// Set global states
 	FogEnable = enable;
 	FogColor = Convert_Color(color,0.0f);
+	rts::render::LegacyFogConstants neutralFog;
+	neutralFog.enabled = enable;
+	neutralFog.color = rts::render::RenderFloat4(color.X, color.Y, color.Z, 1.0f);
+	neutralFog.start = start;
+	neutralFog.end = end;
+	rts::render::TrackLegacyFog(neutralFog);
 
 	// Invalidate the current shader (since the renderstates set by the shader
 	// depend on the global fog settings as well as the actual shader settings)
@@ -815,6 +821,8 @@ WWINLINE void DX8Wrapper::Set_Fog(bool enable, const Vector3 &color, float start
 WWINLINE void DX8Wrapper::Set_Ambient(const Vector3& color)
 {
 	Ambient_Color=color;
+	rts::render::TrackLegacyGlobalAmbient(
+		rts::render::RenderFloat4(color.X, color.Y, color.Z, 1.0f));
 	Set_DX8_Render_State(D3DRS_AMBIENT, DX8Wrapper::Convert_Color(color,0.0f));
 }
 
@@ -1166,6 +1174,24 @@ WWINLINE void DX8Wrapper::Set_Texture(unsigned stage,TextureBaseClass* texture)
 
 WWINLINE void DX8Wrapper::Set_Material(const VertexMaterialClass* material)
 {
+	rts::render::LegacyMaterialState neutralMaterial;
+	if (material != nullptr) {
+		Vector3 color;
+		material->Get_Diffuse(&color);
+		neutralMaterial.diffuse = rts::render::RenderFloat4(color.X, color.Y,
+			color.Z, material->Get_Opacity());
+		material->Get_Ambient(&color);
+		neutralMaterial.ambient = rts::render::RenderFloat4(color.X, color.Y,
+			color.Z, 1.0f);
+		material->Get_Specular(&color);
+		neutralMaterial.specular = rts::render::RenderFloat4(color.X, color.Y,
+			color.Z, 1.0f);
+		material->Get_Emissive(&color);
+		neutralMaterial.emissive = rts::render::RenderFloat4(color.X, color.Y,
+			color.Z, 1.0f);
+		neutralMaterial.specularPower = material->Get_Shininess();
+	}
+	rts::render::TrackLegacyMaterial(neutralMaterial);
 /*	if (material && render_state.material &&
 		// !stricmp(material->Get_Name(),render_state.material->Get_Name())) {
 		material->Get_CRC()!=render_state.material->Get_CRC()) {

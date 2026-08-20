@@ -428,6 +428,31 @@ bool TrackLegacyTransform(LegacyTransformSlot slot, const float *values)
 	return true;
 }
 
+void TrackLegacyMaterial(const LegacyMaterialState &material)
+{
+	g_trackedLogicalState.constants.material = material;
+}
+
+bool TrackLegacyLight(unsigned int index, const LegacyLightState &light)
+{
+	if (index >= LEGACY_LIGHT_COUNT)
+	{
+		return false;
+	}
+	g_trackedLogicalState.constants.lights[index] = light;
+	return true;
+}
+
+void TrackLegacyFog(const LegacyFogConstants &fog)
+{
+	g_trackedLogicalState.constants.fog = fog;
+}
+
+void TrackLegacyGlobalAmbient(const RenderFloat4 &ambient)
+{
+	g_trackedLogicalState.constants.globalAmbient = ambient;
+}
+
 bool GetTrackedLegacyLogicalState(LegacyLogicalState *state)
 {
 	if (state == 0 || !g_trackedPipelineStateValid)
