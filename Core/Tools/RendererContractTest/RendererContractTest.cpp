@@ -147,6 +147,104 @@ int testLegacyLogicalState()
 	return result;
 }
 
+unsigned int makeLegacyShaderBits(unsigned int depthCompare,
+	unsigned int depthWrite, unsigned int colorWrite,
+	unsigned int sourceBlend, unsigned int destinationBlend,
+	unsigned int fog, unsigned int primaryGradient,
+	unsigned int secondaryGradient, unsigned int texturing,
+	unsigned int alphaTest, unsigned int cull,
+	unsigned int detailColor, unsigned int detailAlpha)
+{
+	return (depthCompare << 0) | (depthWrite << 3) |
+		(colorWrite << 4) | (destinationBlend << 5) | (fog << 8) |
+		(primaryGradient << 10) | (secondaryGradient << 13) |
+		(sourceBlend << 14) | (texturing << 16) |
+		(alphaTest << 18) | (cull << 19) |
+		(detailColor << 20) | (detailAlpha << 24);
+}
+
+int testLegacyShaderBitDecoder()
+{
+	int result = 0;
+	rts::render::LegacyPipelineState state;
+	result |= check(!rts::render::DecodeLegacyShaderBits(0, 0),
+		"legacy shader decoder rejects a null destination");
+
+	const unsigned int opaque = makeLegacyShaderBits(3, 1, 1, 1, 0,
+		0, 1, 0, 1, 0, 1, 0, 0);
+	result |= check(rts::render::DecodeLegacyShaderBits(opaque, &state) &&
+		state.shaderBits == opaque && state.depthStencil.depthEnable &&
+		state.depthStencil.depthWrite &&
+		state.depthStencil.depthFunction == rts::render::RENDER_COMPARE_LESS_EQUAL &&
+		!state.blend.blendEnable && state.blend.colorWriteMask == 0x0fU &&
+		state.rasterizer.cullMode == rts::render::RENDER_CULL_BACK &&
+		state.textureStages[0].colorOperation == rts::render::RENDER_TEXTURE_OP_MODULATE &&
+		state.textureStages[0].colorArgument1 == rts::render::RENDER_TEXTURE_ARG_TEXTURE &&
+		state.textureStages[0].colorArgument2 == rts::render::RENDER_TEXTURE_ARG_DIFFUSE &&
+		state.textureStages[1].colorOperation == rts::render::RENDER_TEXTURE_OP_DISABLE,
+		"opaque preset decodes to the legacy depth, blend, cull, and texture state");
+
+	const unsigned int alphaTested = makeLegacyShaderBits(7, 0, 1, 2, 5,
+		0, 0, 0, 1, 1, 0, 0, 0);
+	result |= check(rts::render::DecodeLegacyShaderBits(alphaTested, &state) &&
+		state.depthStencil.depthEnable && !state.depthStencil.depthWrite &&
+		state.blend.blendEnable &&
+		state.blend.sourceColor == rts::render::RENDER_BLEND_SOURCE_ALPHA &&
+		state.blend.destinationColor == rts::render::RENDER_BLEND_INVERSE_SOURCE_ALPHA &&
+		state.alphaTestEnable && state.alphaReference == 0x60U &&
+		state.alphaFunction == rts::render::RENDER_COMPARE_GREATER_EQUAL &&
+		state.rasterizer.cullMode == rts::render::RENDER_CULL_NONE &&
+		state.textureStages[0].colorOperation == rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_1,
+		"alpha-tested 2D preset decodes blending, alpha reference, and disabled depth");
+
+	const unsigned int additive = makeLegacyShaderBits(3, 0, 1, 1, 1,
+		1, 1, 1, 1, 0, 1, 4, 2);
+	result |= check(rts::render::DecodeLegacyShaderBits(additive, &state) &&
+		state.blend.blendEnable &&
+		state.blend.sourceColor == rts::render::RENDER_BLEND_ONE &&
+		state.blend.destinationColor == rts::render::RENDER_BLEND_ONE &&
+		state.fogMode == rts::render::RENDER_FOG_LINEAR &&
+		state.secondaryGradientEnable &&
+		state.textureStages[1].colorOperation == rts::render::RENDER_TEXTURE_OP_ADD &&
+		state.textureStages[1].alphaOperation == rts::render::RENDER_TEXTURE_OP_MODULATE,
+		"additive fogged detail preset preserves secondary gradient and combiners");
+
+	const unsigned int multiplicativeNoColor = makeLegacyShaderBits(3, 0, 0,
+		0, 2, 2, 3, 0, 1, 0, 1, 0, 0);
+	result |= check(rts::render::DecodeLegacyShaderBits(multiplicativeNoColor, &state) &&
+		state.blend.blendEnable && state.blend.colorWriteMask == 0 &&
+		state.blend.sourceColor == rts::render::RENDER_BLEND_ZERO &&
+		state.blend.destinationColor == rts::render::RENDER_BLEND_ONE &&
+		state.fogMode == rts::render::RENDER_FOG_SCALE_FRAGMENT &&
+		state.textureStages[0].colorOperation == rts::render::RENDER_TEXTURE_OP_BUMP_ENVIRONMENT &&
+		state.textureStages[0].alphaOperation == rts::render::RENDER_TEXTURE_OP_DISABLE,
+		"disabled color writes and bump mapping retain the D3D8 effective state");
+
+	const unsigned int inverseSourceAlpha = makeLegacyShaderBits(3, 0, 1,
+		3, 0, 3, 5, 0, 1, 1, 1, 12, 3) | (1U << 17);
+	result |= check(rts::render::DecodeLegacyShaderBits(inverseSourceAlpha, &state) &&
+		state.blend.sourceColor == rts::render::RENDER_BLEND_DESTINATION_COLOR &&
+		state.alphaReference == 0x60U &&
+		state.alphaFunction == rts::render::RENDER_COMPARE_GREATER_EQUAL &&
+		state.fogMode == rts::render::RENDER_FOG_WHITE && state.nPatchEnable &&
+		state.textureStages[0].colorOperation == rts::render::RENDER_TEXTURE_OP_MODULATE_2X &&
+		state.textureStages[1].colorOperation == rts::render::RENDER_TEXTURE_OP_MODULATE_ALPHA_ADD_COLOR &&
+		state.textureStages[1].alphaOperation == rts::render::RENDER_TEXTURE_OP_ADD_SMOOTH,
+		"unusual legacy blend and detail encodings are decoded without reinterpretation");
+	const unsigned int untextured = makeLegacyShaderBits(3, 1, 1,
+		1, 0, 0, 1, 0, 0, 0, 1, 0, 0);
+	result |= check(rts::render::DecodeLegacyShaderBits(untextured, &state) &&
+		state.textureStages[0].colorOperation == rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_2 &&
+		state.textureStages[0].colorArgument2 == rts::render::RENDER_TEXTURE_ARG_DIFFUSE &&
+		state.textureStages[1].colorOperation == rts::render::RENDER_TEXTURE_OP_DISABLE,
+		"untextured gradient selects vertex diffuse and disables detail stages");
+	result |= check(!rts::render::DecodeLegacyShaderBits(
+		makeLegacyShaderBits(3, 1, 1, 1, 7, 0, 7, 0, 1, 0, 1, 15, 7),
+		&state) && state.shaderBits == 0,
+		"reserved legacy encodings fail closed to deterministic defaults");
+	return result;
+}
+
 #if defined(RTS_RENDERER_HAS_D3D11)
 struct CrossThreadProbe
 {
@@ -409,6 +507,7 @@ int main()
 	result |= testGenerationSafeHandles();
 	result |= testNeutralDescriptorDefaults();
 	result |= testLegacyLogicalState();
+	result |= testLegacyShaderBitDecoder();
 #if defined(RTS_RENDERER_HAS_D3D11)
 	result |= testD3D11HeadlessDevice();
 	result |= testD3D11HiddenSwapChain();

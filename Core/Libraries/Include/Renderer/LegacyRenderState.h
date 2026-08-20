@@ -112,6 +112,8 @@ enum RenderTextureOperation
 	RENDER_TEXTURE_OP_ADD_SMOOTH,
 	RENDER_TEXTURE_OP_BLEND_DIFFUSE_ALPHA,
 	RENDER_TEXTURE_OP_BLEND_TEXTURE_ALPHA,
+	RENDER_TEXTURE_OP_BLEND_CURRENT_ALPHA,
+	RENDER_TEXTURE_OP_MODULATE_ALPHA_ADD_COLOR,
 	RENDER_TEXTURE_OP_DOT_PRODUCT_3,
 	RENDER_TEXTURE_OP_BUMP_ENVIRONMENT,
 	RENDER_TEXTURE_OP_BUMP_ENVIRONMENT_LUMINANCE
@@ -232,6 +234,8 @@ struct LegacyPipelineState
 	LegacyRasterizerState rasterizer;
 	LegacyTextureStageState textureStages[LEGACY_TEXTURE_STAGE_COUNT];
 	RenderFogMode fogMode;
+	bool secondaryGradientEnable;
+	bool nPatchEnable;
 	bool lightingEnable;
 	bool normalizeNormals;
 	bool alphaTestEnable;
@@ -318,6 +322,8 @@ struct LegacyShaderKey
 
 LegacyShaderKey BuildLegacyShaderKey(const LegacyPipelineState &state,
 	unsigned int vertexFormat, unsigned int texturePresenceMask);
+bool DecodeLegacyShaderBits(unsigned int shaderBits,
+	LegacyPipelineState *state);
 }
 }
 

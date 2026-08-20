@@ -76,7 +76,8 @@ LegacyTextureStageState::LegacyTextureStageState() :
 
 LegacyPipelineState::LegacyPipelineState() :
 	shaderBits(0), blend(), depthStencil(), rasterizer(),
-	fogMode(RENDER_FOG_DISABLED), lightingEnable(false),
+	fogMode(RENDER_FOG_DISABLED), secondaryGradientEnable(false),
+	nPatchEnable(false), lightingEnable(false),
 	normalizeNormals(false), alphaTestEnable(false),
 	alphaFunction(RENDER_COMPARE_ALWAYS), alphaReference(0), textureFactor(0)
 {
@@ -160,15 +161,217 @@ LegacyShaderKey BuildLegacyShaderKey(const LegacyPipelineState &state,
 		const LegacyTextureStageState &textureStage = state.textureStages[stage];
 		key.words[3 + stage] =
 			static_cast<unsigned int>(textureStage.colorOperation) |
-			(static_cast<unsigned int>(textureStage.colorArgument1) << 4) |
-			(static_cast<unsigned int>(textureStage.colorArgument2) << 7) |
-			(static_cast<unsigned int>(textureStage.alphaOperation) << 10) |
-			(static_cast<unsigned int>(textureStage.alphaArgument1) << 14) |
-			(static_cast<unsigned int>(textureStage.alphaArgument2) << 17) |
-			((textureStage.textureCoordinateIndex & 0x0fU) << 20) |
-			(static_cast<unsigned int>(textureStage.projectedCoordinates) << 24);
+			(static_cast<unsigned int>(textureStage.colorArgument1) << 5) |
+			(static_cast<unsigned int>(textureStage.colorArgument2) << 8) |
+			(static_cast<unsigned int>(textureStage.alphaOperation) << 11) |
+			(static_cast<unsigned int>(textureStage.alphaArgument1) << 16) |
+			(static_cast<unsigned int>(textureStage.alphaArgument2) << 19) |
+			((textureStage.textureCoordinateIndex & 0x0fU) << 22) |
+			(static_cast<unsigned int>(textureStage.projectedCoordinates) << 26);
 	}
+	key.words[2] |= static_cast<unsigned int>(state.secondaryGradientEnable) << 22;
+	key.words[2] |= static_cast<unsigned int>(state.nPatchEnable) << 23;
 	return key;
+}
+
+namespace
+{
+unsigned int legacyField(unsigned int bits, unsigned int shift,
+	unsigned int mask)
+{
+	return (bits >> shift) & mask;
+}
+
+void setTextureOperation(LegacyTextureStageState *stage,
+	RenderTextureOperation colorOperation, RenderTextureArgument colorArgument1,
+	RenderTextureArgument colorArgument2,
+	RenderTextureOperation alphaOperation, RenderTextureArgument alphaArgument1,
+	RenderTextureArgument alphaArgument2)
+{
+	stage->colorOperation = colorOperation;
+	stage->colorArgument1 = colorArgument1;
+	stage->colorArgument2 = colorArgument2;
+	stage->alphaOperation = alphaOperation;
+	stage->alphaArgument1 = alphaArgument1;
+	stage->alphaArgument2 = alphaArgument2;
+}
+}
+
+bool DecodeLegacyShaderBits(unsigned int shaderBits,
+	LegacyPipelineState *state)
+{
+	if (state == 0)
+	{
+		return false;
+	}
+
+	const unsigned int depthCompare = legacyField(shaderBits, 0, 7);
+	const unsigned int depthWrite = legacyField(shaderBits, 3, 1);
+	const unsigned int colorWrite = legacyField(shaderBits, 4, 1);
+	const unsigned int destinationBlend = legacyField(shaderBits, 5, 7);
+	const unsigned int fog = legacyField(shaderBits, 8, 3);
+	const unsigned int primaryGradient = legacyField(shaderBits, 10, 7);
+	const unsigned int secondaryGradient = legacyField(shaderBits, 13, 1);
+	const unsigned int sourceBlend = legacyField(shaderBits, 14, 3);
+	const unsigned int texturing = legacyField(shaderBits, 16, 1);
+	const unsigned int nPatch = legacyField(shaderBits, 17, 1);
+	const unsigned int alphaTest = legacyField(shaderBits, 18, 1);
+	const unsigned int cull = legacyField(shaderBits, 19, 1);
+	const unsigned int detailColor = legacyField(shaderBits, 20, 15);
+	const unsigned int detailAlpha = legacyField(shaderBits, 24, 7);
+	if (destinationBlend > 5 || primaryGradient > 5 ||
+		detailColor > 12 || detailAlpha > 3)
+	{
+		*state = LegacyPipelineState();
+		return false;
+	}
+
+	*state = LegacyPipelineState();
+	state->shaderBits = shaderBits;
+	state->depthStencil.depthFunction =
+		static_cast<RenderCompareFunction>(depthCompare);
+	state->depthStencil.depthWrite = depthWrite != 0;
+	state->rasterizer.cullMode = cull != 0 ? RENDER_CULL_BACK : RENDER_CULL_NONE;
+	state->secondaryGradientEnable = secondaryGradient != 0;
+	state->nPatchEnable = nPatch != 0;
+
+	static const RenderBlendFactor sourceBlendFactors[4] = {
+		RENDER_BLEND_ZERO, RENDER_BLEND_ONE, RENDER_BLEND_SOURCE_ALPHA,
+		RENDER_BLEND_DESTINATION_COLOR
+	};
+	static const RenderBlendFactor destinationBlendFactors[6] = {
+		RENDER_BLEND_ZERO, RENDER_BLEND_ONE, RENDER_BLEND_SOURCE_COLOR,
+		RENDER_BLEND_INVERSE_SOURCE_COLOR, RENDER_BLEND_SOURCE_ALPHA,
+		RENDER_BLEND_INVERSE_SOURCE_ALPHA
+	};
+	state->blend.sourceColor = sourceBlendFactors[sourceBlend];
+	state->blend.destinationColor = destinationBlendFactors[destinationBlend];
+	if (colorWrite == 0)
+	{
+		state->blend.sourceColor = RENDER_BLEND_ZERO;
+		state->blend.destinationColor = RENDER_BLEND_ONE;
+		state->blend.colorWriteMask = 0;
+	}
+	state->blend.sourceAlpha = state->blend.sourceColor;
+	state->blend.destinationAlpha = state->blend.destinationColor;
+	state->blend.blendEnable = state->blend.sourceColor != RENDER_BLEND_ONE ||
+		state->blend.destinationColor != RENDER_BLEND_ZERO;
+
+	state->alphaTestEnable = alphaTest != 0;
+	if (state->alphaTestEnable)
+	{
+		state->alphaReference = 0x60U;
+		state->alphaFunction = RENDER_COMPARE_GREATER_EQUAL;
+	}
+
+	switch (fog)
+	{
+	case 1: state->fogMode = RENDER_FOG_LINEAR; break;
+	case 2: state->fogMode = RENDER_FOG_SCALE_FRAGMENT; break;
+	case 3: state->fogMode = RENDER_FOG_WHITE; break;
+	default: state->fogMode = RENDER_FOG_DISABLED; break;
+	}
+
+	LegacyTextureStageState *primary = &state->textureStages[0];
+	if (texturing != 0)
+	{
+		switch (primaryGradient)
+		{
+		case 0:
+			setTextureOperation(primary, RENDER_TEXTURE_OP_SELECT_ARGUMENT_1,
+				RENDER_TEXTURE_ARG_TEXTURE, RENDER_TEXTURE_ARG_CURRENT,
+				RENDER_TEXTURE_OP_SELECT_ARGUMENT_1,
+				RENDER_TEXTURE_ARG_TEXTURE, RENDER_TEXTURE_ARG_CURRENT);
+			break;
+		case 2:
+			setTextureOperation(primary, RENDER_TEXTURE_OP_ADD,
+				RENDER_TEXTURE_ARG_TEXTURE, RENDER_TEXTURE_ARG_DIFFUSE,
+				RENDER_TEXTURE_OP_MODULATE,
+				RENDER_TEXTURE_ARG_TEXTURE, RENDER_TEXTURE_ARG_DIFFUSE);
+			break;
+		case 3:
+			setTextureOperation(primary, RENDER_TEXTURE_OP_BUMP_ENVIRONMENT,
+				RENDER_TEXTURE_ARG_TEXTURE, RENDER_TEXTURE_ARG_DIFFUSE,
+				RENDER_TEXTURE_OP_DISABLE,
+				RENDER_TEXTURE_ARG_TEXTURE, RENDER_TEXTURE_ARG_CURRENT);
+			break;
+		case 4:
+			setTextureOperation(primary,
+				RENDER_TEXTURE_OP_BUMP_ENVIRONMENT_LUMINANCE,
+				RENDER_TEXTURE_ARG_TEXTURE, RENDER_TEXTURE_ARG_DIFFUSE,
+				RENDER_TEXTURE_OP_DISABLE,
+				RENDER_TEXTURE_ARG_TEXTURE, RENDER_TEXTURE_ARG_CURRENT);
+			break;
+		case 5:
+			setTextureOperation(primary, RENDER_TEXTURE_OP_MODULATE_2X,
+				RENDER_TEXTURE_ARG_TEXTURE, RENDER_TEXTURE_ARG_DIFFUSE,
+				RENDER_TEXTURE_OP_MODULATE,
+				RENDER_TEXTURE_ARG_TEXTURE, RENDER_TEXTURE_ARG_DIFFUSE);
+			break;
+		default:
+			setTextureOperation(primary, RENDER_TEXTURE_OP_MODULATE,
+				RENDER_TEXTURE_ARG_TEXTURE, RENDER_TEXTURE_ARG_DIFFUSE,
+				RENDER_TEXTURE_OP_MODULATE,
+				RENDER_TEXTURE_ARG_TEXTURE, RENDER_TEXTURE_ARG_DIFFUSE);
+			break;
+		}
+	}
+	else if (primaryGradient == 0)
+	{
+		setTextureOperation(primary, RENDER_TEXTURE_OP_DISABLE,
+			RENDER_TEXTURE_ARG_TEXTURE, RENDER_TEXTURE_ARG_CURRENT,
+			RENDER_TEXTURE_OP_DISABLE,
+			RENDER_TEXTURE_ARG_TEXTURE, RENDER_TEXTURE_ARG_CURRENT);
+	}
+	else
+	{
+		setTextureOperation(primary, RENDER_TEXTURE_OP_SELECT_ARGUMENT_2,
+			RENDER_TEXTURE_ARG_TEXTURE, RENDER_TEXTURE_ARG_DIFFUSE,
+			RENDER_TEXTURE_OP_SELECT_ARGUMENT_2,
+			RENDER_TEXTURE_ARG_TEXTURE, RENDER_TEXTURE_ARG_DIFFUSE);
+	}
+
+	LegacyTextureStageState *detail = &state->textureStages[1];
+	if (texturing != 0)
+	{
+		static const RenderTextureOperation detailColorOperations[13] = {
+			RENDER_TEXTURE_OP_DISABLE, RENDER_TEXTURE_OP_SELECT_ARGUMENT_1,
+			RENDER_TEXTURE_OP_MODULATE, RENDER_TEXTURE_OP_ADD_SMOOTH,
+			RENDER_TEXTURE_OP_ADD, RENDER_TEXTURE_OP_SUBTRACT,
+			RENDER_TEXTURE_OP_SUBTRACT, RENDER_TEXTURE_OP_BLEND_TEXTURE_ALPHA,
+			RENDER_TEXTURE_OP_BLEND_CURRENT_ALPHA, RENDER_TEXTURE_OP_ADD_SIGNED,
+			RENDER_TEXTURE_OP_ADD_SIGNED_2X, RENDER_TEXTURE_OP_MODULATE_2X,
+			RENDER_TEXTURE_OP_MODULATE_ALPHA_ADD_COLOR
+		};
+		static const RenderTextureOperation detailAlphaOperations[4] = {
+			RENDER_TEXTURE_OP_DISABLE, RENDER_TEXTURE_OP_SELECT_ARGUMENT_1,
+			RENDER_TEXTURE_OP_MODULATE, RENDER_TEXTURE_OP_ADD_SMOOTH
+		};
+		detail->colorOperation = detailColorOperations[detailColor];
+		detail->colorArgument1 = detailColor == 6 ?
+			RENDER_TEXTURE_ARG_CURRENT : RENDER_TEXTURE_ARG_TEXTURE;
+		detail->colorArgument2 = detailColor == 6 ?
+			RENDER_TEXTURE_ARG_TEXTURE : RENDER_TEXTURE_ARG_CURRENT;
+		if (detailColor == 12)
+		{
+			detail->colorArgument1 = RENDER_TEXTURE_ARG_CURRENT;
+			detail->colorArgument2 = RENDER_TEXTURE_ARG_TEXTURE;
+		}
+		detail->alphaOperation = detailAlphaOperations[detailAlpha];
+		detail->alphaArgument1 = RENDER_TEXTURE_ARG_TEXTURE;
+		detail->alphaArgument2 = RENDER_TEXTURE_ARG_CURRENT;
+		if (detail->colorOperation != RENDER_TEXTURE_OP_DISABLE &&
+			detail->alphaOperation == RENDER_TEXTURE_OP_DISABLE)
+		{
+			detail->alphaOperation = RENDER_TEXTURE_OP_SELECT_ARGUMENT_2;
+		}
+		else if (detail->colorOperation == RENDER_TEXTURE_OP_DISABLE &&
+			detail->alphaOperation != RENDER_TEXTURE_OP_DISABLE)
+		{
+			detail->colorOperation = RENDER_TEXTURE_OP_SELECT_ARGUMENT_2;
+		}
+	}
+	return true;
 }
 }
 }
