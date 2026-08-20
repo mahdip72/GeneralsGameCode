@@ -979,7 +979,20 @@ bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int
 
 	if (bits != -1)		BitDepth = bits;
 	if (windowed != -1)	IsWindowed = (windowed != 0);
+	if (_UseD3D11Backend && !IsWindowed)
+	{
+		MONITORINFO monitor_info = { sizeof(MONITORINFO) };
+		if (GetMonitorInfo(MonitorFromWindow(_Hwnd, MONITOR_DEFAULTTOPRIMARY),
+			&monitor_info))
+		{
+			ResolutionWidth = monitor_info.rcMonitor.right -
+				monitor_info.rcMonitor.left;
+			ResolutionHeight = monitor_info.rcMonitor.bottom -
+				monitor_info.rcMonitor.top;
+		}
+	}
 	DX8Wrapper_IsWindowed = IsWindowed;
+	const bool presentation_windowed = IsWindowed || _UseD3D11Backend;
 
 	WWDEBUG_SAY(("Attempting Set_Render_Device: name: %s (%s:%s), width: %d, height: %d, windowed: %d",
 		_RenderDeviceNameTable[CurRenderDevice].str(),_RenderDeviceDescriptionTable[CurRenderDevice].Get_Driver_Name(),
@@ -1005,12 +1018,12 @@ bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int
 
 	_PresentParameters.BackBufferWidth = ResolutionWidth;
 	_PresentParameters.BackBufferHeight = ResolutionHeight;
-	_PresentParameters.BackBufferCount = IsWindowed ? 1 : 2;
+	_PresentParameters.BackBufferCount = presentation_windowed ? 1 : 2;
 
 	//I changed this to discard all the time (even when full-screen) since that the most efficient. 07-16-03 MW:
 	_PresentParameters.SwapEffect = D3DSWAPEFFECT_DISCARD;//IsWindowed ? D3DSWAPEFFECT_DISCARD : D3DSWAPEFFECT_FLIP;		// Shouldn't this be D3DSWAPEFFECT_FLIP?
 	_PresentParameters.hDeviceWindow = _Hwnd;
-	_PresentParameters.Windowed = IsWindowed;
+	_PresentParameters.Windowed = presentation_windowed;
 
 	_PresentParameters.EnableAutoDepthStencil = TRUE;				// Driver will attempt to match Z-buffer depth
 	_PresentParameters.Flags=0;											// We're not going to lock the backbuffer
@@ -1023,7 +1036,7 @@ bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int
 	** - if in windowed mode, the backbuffer must use the current display format.
 	** - the depth buffer must use
 	*/
-	if (IsWindowed) {
+	if (presentation_windowed) {
 
 		D3DDISPLAYMODE desktop_mode;
 		::ZeroMemory(&desktop_mode, sizeof(D3DDISPLAYMODE));
@@ -1100,7 +1113,7 @@ bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int
 			CurRenderDevice,
 			D3DDEVTYPE_HAL,
 			_PresentParameters.BackBufferFormat,
-			IsWindowed,
+			presentation_windowed,
 			MultiSampleAntiAliasing
 		);
 
@@ -1108,7 +1121,7 @@ bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int
 			CurRenderDevice,
 			D3DDEVTYPE_HAL,
 			_PresentParameters.AutoDepthStencilFormat,
-			IsWindowed,
+			presentation_windowed,
 			MultiSampleAntiAliasing
 		);
 
