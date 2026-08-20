@@ -197,7 +197,7 @@ TextureSubresourceData::TextureSubresourceData() :
 }
 
 TextureDescriptor::TextureDescriptor() :
-	width(0), height(0), mipCount(1), arrayCount(1),
+	width(0), height(0), mipCount(1), arrayCount(1), dimension(RENDER_TEXTURE_2D),
 	format(RENDER_FORMAT_UNKNOWN), binding(RENDER_TEXTURE_SHADER_RESOURCE),
 	usage(RENDER_USAGE_IMMUTABLE)
 {

@@ -86,6 +86,12 @@ enum TextureBinding
 	RENDER_TEXTURE_DEPTH_STENCIL = 4
 };
 
+enum RenderTextureDimension
+{
+	RENDER_TEXTURE_2D,
+	RENDER_TEXTURE_CUBE
+};
+
 struct RenderDeviceParameters
 {
 	RenderDeviceParameters();
@@ -125,6 +131,7 @@ struct TextureDescriptor
 	unsigned int height;
 	unsigned int mipCount;
 	unsigned int arrayCount;
+	RenderTextureDimension dimension;
 	RenderFormat format;
 	unsigned int binding;
 	RenderUsage usage;

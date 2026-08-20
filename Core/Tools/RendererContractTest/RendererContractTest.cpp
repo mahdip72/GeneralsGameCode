@@ -735,6 +735,32 @@ int testD3D11HeadlessDevice()
 	result |= check(device->destroyResource(buffer) &&
 		!device->destroyResource(buffer),
 		"D3D11 resource destruction rejects stale handles");
+	unsigned int cubePixels[6] = {
+		0xff0000ffU, 0xff00ff00U, 0xffff0000U,
+		0xffffff00U, 0xff00ffffU, 0xffff00ffU
+	};
+	rts::render::TextureSubresourceData cubeData[6];
+	for (unsigned int face = 0; face < 6; ++face)
+	{
+		cubeData[face].data = &cubePixels[face];
+		cubeData[face].rowPitch = sizeof(unsigned int);
+		cubeData[face].slicePitch = sizeof(unsigned int);
+	}
+	rts::render::TextureDescriptor cubeDescriptor;
+	cubeDescriptor.width = 1;
+	cubeDescriptor.height = 1;
+	cubeDescriptor.arrayCount = 6;
+	cubeDescriptor.dimension = rts::render::RENDER_TEXTURE_CUBE;
+	cubeDescriptor.format = rts::render::RENDER_FORMAT_R8G8B8A8_UNORM;
+	rts::render::GpuHandle cubeTexture;
+	result |= check(device->createTexture(cubeDescriptor, cubeData, 6,
+		&cubeTexture) == rts::render::RENDER_RESULT_OK &&
+		device->destroyResource(cubeTexture),
+		"D3D11 creates generation-safe cube-map shader resources");
+	cubeDescriptor.width = 2;
+	result |= check(device->createTexture(cubeDescriptor, cubeData, 6,
+		&cubeTexture) == rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+		"cube-map descriptors require square faces");
 	rts::render::BufferDescriptor immutableDescriptor;
 	immutableDescriptor.byteCount = 16;
 	rts::render::GpuHandle invalidBuffer;

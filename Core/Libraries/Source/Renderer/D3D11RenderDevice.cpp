@@ -442,6 +442,13 @@ public:
 		if (!isOwner() || texture == 0 || descriptor.width == 0 ||
 			descriptor.height == 0 || descriptor.mipCount == 0 ||
 			descriptor.arrayCount == 0 || format == DXGI_FORMAT_UNKNOWN ||
+			(descriptor.dimension != RENDER_TEXTURE_2D &&
+				descriptor.dimension != RENDER_TEXTURE_CUBE) ||
+			(descriptor.dimension == RENDER_TEXTURE_CUBE &&
+				(descriptor.width != descriptor.height ||
+				descriptor.arrayCount < 6 || (descriptor.arrayCount % 6) != 0 ||
+				(descriptor.binding & (RENDER_TEXTURE_RENDER_TARGET |
+					RENDER_TEXTURE_DEPTH_STENCIL)) != 0)) ||
 			descriptor.binding == 0 ||
 			(initialData == 0 && initialDataCount != 0) ||
 			(initialData != 0 && initialDataCount != subresourceCount) ||
@@ -459,6 +466,10 @@ public:
 		nativeDescriptor.ArraySize = descriptor.arrayCount;
 		nativeDescriptor.Format = format;
 		nativeDescriptor.SampleDesc.Count = 1;
+		if (descriptor.dimension == RENDER_TEXTURE_CUBE)
+		{
+			nativeDescriptor.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
+		}
 		if ((descriptor.binding & RENDER_TEXTURE_SHADER_RESOURCE) != 0)
 		{
 			nativeDescriptor.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
@@ -521,8 +532,31 @@ public:
 		slot.byteCount = 0;
 		if ((descriptor.binding & RENDER_TEXTURE_SHADER_RESOURCE) != 0)
 		{
+			D3D11_SHADER_RESOURCE_VIEW_DESC viewDescriptor;
+			D3D11_SHADER_RESOURCE_VIEW_DESC *viewDescriptorPointer = 0;
+			if (descriptor.dimension == RENDER_TEXTURE_CUBE)
+			{
+				memset(&viewDescriptor, 0, sizeof(viewDescriptor));
+				viewDescriptor.Format = format;
+				if (descriptor.arrayCount == 6)
+				{
+					viewDescriptor.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
+					viewDescriptor.TextureCube.MostDetailedMip = 0;
+					viewDescriptor.TextureCube.MipLevels = descriptor.mipCount;
+				}
+				else
+				{
+					viewDescriptor.ViewDimension =
+						D3D11_SRV_DIMENSION_TEXTURECUBEARRAY;
+					viewDescriptor.TextureCubeArray.MostDetailedMip = 0;
+					viewDescriptor.TextureCubeArray.MipLevels = descriptor.mipCount;
+					viewDescriptor.TextureCubeArray.First2DArrayFace = 0;
+					viewDescriptor.TextureCubeArray.NumCubes = descriptor.arrayCount / 6;
+				}
+				viewDescriptorPointer = &viewDescriptor;
+			}
 			const HRESULT viewResult = m_device->CreateShaderResourceView(
-				nativeTexture, 0, &slot.view);
+				nativeTexture, viewDescriptorPointer, &slot.view);
 			if (FAILED(viewResult))
 			{
 				releaseSlot(handle, slot);
