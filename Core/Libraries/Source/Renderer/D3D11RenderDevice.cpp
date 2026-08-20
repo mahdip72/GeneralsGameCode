@@ -1013,7 +1013,7 @@ public:
 			samplerDescriptor.BorderColor[1] = sampler.borderColor.y;
 			samplerDescriptor.BorderColor[2] = sampler.borderColor.z;
 			samplerDescriptor.BorderColor[3] = sampler.borderColor.w;
-			samplerDescriptor.MinLOD = 0.0f;
+			samplerDescriptor.MinLOD = static_cast<float>(sampler.maximumMipLevel);
 			samplerDescriptor.MaxLOD = D3D11_FLOAT32_MAX;
 			result = findOrCreateSamplerState(samplerDescriptor, &samplerState);
 			if (FAILED(result))

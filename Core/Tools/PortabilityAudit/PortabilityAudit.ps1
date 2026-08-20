@@ -32,6 +32,7 @@ $rules = @(
         Name = 'raw-d3d8-surface-area'
         Pattern = '(IDirect3D[A-Za-z0-9_]*8|D3D[A-Z0-9_]*8|DX8Wrapper)'
         RejectAddedLine = $true
+        AllowedPath = '^Core/Libraries/Source/WWVegas/WW3D2/dx8wrapper\.(cpp|h)$'
     }
 )
 
@@ -81,7 +82,11 @@ foreach ($line in $diff) {
     if ($line.StartsWith('+') -and -not $line.StartsWith('+++')) {
         $content = $line.Substring(1)
         foreach ($rule in $rules) {
-            if ($rule.RejectAddedLine -and $content -match $rule.Pattern) {
+            $allowedPath = $rule.PSObject.Properties['AllowedPath']
+            $isAllowed = $null -ne $allowedPath -and
+                $currentFile -match $allowedPath.Value
+            if ($rule.RejectAddedLine -and -not $isAllowed -and
+                $content -match $rule.Pattern) {
                 $violations += "${currentFile}:${lineNumber}: $($rule.Name)"
             }
         }

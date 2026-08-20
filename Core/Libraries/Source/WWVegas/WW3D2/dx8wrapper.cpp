@@ -2942,6 +2942,155 @@ void DX8Wrapper::Compute_Caps(WW3DFormat display_format)
 	CurrentCaps=new DX8Caps(_Get_D3D8(),D3DDevice,display_format,Get_Current_Adapter_Identifier());
 }
 
+namespace
+{
+bool Convert_Texture_Operation(unsigned int value,
+	rts::render::RenderTextureOperation *operation)
+{
+	if (operation == nullptr) return false;
+	switch (value) {
+	case D3DTOP_DISABLE: *operation = rts::render::RENDER_TEXTURE_OP_DISABLE; break;
+	case D3DTOP_SELECTARG1: *operation = rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_1; break;
+	case D3DTOP_SELECTARG2: *operation = rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_2; break;
+	case D3DTOP_MODULATE: *operation = rts::render::RENDER_TEXTURE_OP_MODULATE; break;
+	case D3DTOP_MODULATE2X: *operation = rts::render::RENDER_TEXTURE_OP_MODULATE_2X; break;
+	case D3DTOP_MODULATE4X: *operation = rts::render::RENDER_TEXTURE_OP_MODULATE_4X; break;
+	case D3DTOP_ADD: *operation = rts::render::RENDER_TEXTURE_OP_ADD; break;
+	case D3DTOP_ADDSIGNED: *operation = rts::render::RENDER_TEXTURE_OP_ADD_SIGNED; break;
+	case D3DTOP_ADDSIGNED2X: *operation = rts::render::RENDER_TEXTURE_OP_ADD_SIGNED_2X; break;
+	case D3DTOP_SUBTRACT: *operation = rts::render::RENDER_TEXTURE_OP_SUBTRACT; break;
+	case D3DTOP_ADDSMOOTH: *operation = rts::render::RENDER_TEXTURE_OP_ADD_SMOOTH; break;
+	case D3DTOP_BLENDDIFFUSEALPHA: *operation = rts::render::RENDER_TEXTURE_OP_BLEND_DIFFUSE_ALPHA; break;
+	case D3DTOP_BLENDTEXTUREALPHA: *operation = rts::render::RENDER_TEXTURE_OP_BLEND_TEXTURE_ALPHA; break;
+	case D3DTOP_BLENDFACTORALPHA: *operation = rts::render::RENDER_TEXTURE_OP_BLEND_TEXTURE_FACTOR_ALPHA; break;
+	case D3DTOP_BLENDTEXTUREALPHAPM: *operation = rts::render::RENDER_TEXTURE_OP_BLEND_TEXTURE_ALPHA_PREMULTIPLIED; break;
+	case D3DTOP_BLENDCURRENTALPHA: *operation = rts::render::RENDER_TEXTURE_OP_BLEND_CURRENT_ALPHA; break;
+	case D3DTOP_PREMODULATE: *operation = rts::render::RENDER_TEXTURE_OP_PREMODULATE; break;
+	case D3DTOP_MODULATEALPHA_ADDCOLOR: *operation = rts::render::RENDER_TEXTURE_OP_MODULATE_ALPHA_ADD_COLOR; break;
+	case D3DTOP_MODULATECOLOR_ADDALPHA: *operation = rts::render::RENDER_TEXTURE_OP_MODULATE_COLOR_ADD_ALPHA; break;
+	case D3DTOP_MODULATEINVALPHA_ADDCOLOR: *operation = rts::render::RENDER_TEXTURE_OP_MODULATE_INVERSE_ALPHA_ADD_COLOR; break;
+	case D3DTOP_MODULATEINVCOLOR_ADDALPHA: *operation = rts::render::RENDER_TEXTURE_OP_MODULATE_INVERSE_COLOR_ADD_ALPHA; break;
+	case D3DTOP_BUMPENVMAP: *operation = rts::render::RENDER_TEXTURE_OP_BUMP_ENVIRONMENT; break;
+	case D3DTOP_BUMPENVMAPLUMINANCE: *operation = rts::render::RENDER_TEXTURE_OP_BUMP_ENVIRONMENT_LUMINANCE; break;
+	case D3DTOP_DOTPRODUCT3: *operation = rts::render::RENDER_TEXTURE_OP_DOT_PRODUCT_3; break;
+	case D3DTOP_MULTIPLYADD: *operation = rts::render::RENDER_TEXTURE_OP_MULTIPLY_ADD; break;
+	case D3DTOP_LERP: *operation = rts::render::RENDER_TEXTURE_OP_LINEAR_INTERPOLATE; break;
+	default: return false;
+	}
+	return true;
+}
+
+bool Convert_Texture_Argument(unsigned int value,
+	rts::render::RenderTextureArgument *argument, bool *complement,
+	bool *alphaReplicate)
+{
+	if (argument == nullptr || complement == nullptr || alphaReplicate == nullptr) return false;
+	switch (value & D3DTA_SELECTMASK) {
+	case D3DTA_CURRENT: *argument = rts::render::RENDER_TEXTURE_ARG_CURRENT; break;
+	case D3DTA_DIFFUSE: *argument = rts::render::RENDER_TEXTURE_ARG_DIFFUSE; break;
+	case D3DTA_TEXTURE: *argument = rts::render::RENDER_TEXTURE_ARG_TEXTURE; break;
+	case D3DTA_TFACTOR: *argument = rts::render::RENDER_TEXTURE_ARG_TEXTURE_FACTOR; break;
+	case D3DTA_SPECULAR: *argument = rts::render::RENDER_TEXTURE_ARG_SPECULAR; break;
+	case D3DTA_TEMP: *argument = rts::render::RENDER_TEXTURE_ARG_TEMP; break;
+	default: return false;
+	}
+	*complement = (value & D3DTA_COMPLEMENT) != 0;
+	*alphaReplicate = (value & D3DTA_ALPHAREPLICATE) != 0;
+	return true;
+}
+
+bool Convert_Texture_Address(unsigned int value,
+	rts::render::RenderTextureAddressMode *address)
+{
+	if (address == nullptr) return false;
+	switch (value) {
+	case D3DTADDRESS_WRAP: *address = rts::render::RENDER_TEXTURE_ADDRESS_WRAP; break;
+	case D3DTADDRESS_MIRROR: *address = rts::render::RENDER_TEXTURE_ADDRESS_MIRROR; break;
+	case D3DTADDRESS_CLAMP: *address = rts::render::RENDER_TEXTURE_ADDRESS_CLAMP; break;
+	case D3DTADDRESS_BORDER: *address = rts::render::RENDER_TEXTURE_ADDRESS_BORDER; break;
+	default: return false;
+	}
+	return true;
+}
+
+bool Convert_Texture_Filter(unsigned int value,
+	rts::render::RenderTextureFilter *filter)
+{
+	if (filter == nullptr) return false;
+	switch (value) {
+	case D3DTEXF_NONE: *filter = rts::render::RENDER_TEXTURE_FILTER_NONE; break;
+	case D3DTEXF_POINT: *filter = rts::render::RENDER_TEXTURE_FILTER_POINT; break;
+	case D3DTEXF_LINEAR: *filter = rts::render::RENDER_TEXTURE_FILTER_LINEAR; break;
+	case D3DTEXF_ANISOTROPIC: *filter = rts::render::RENDER_TEXTURE_FILTER_ANISOTROPIC; break;
+	default: return false;
+	}
+	return true;
+}
+
+float Texture_State_Float(unsigned int value)
+{
+	float result = 0.0f;
+	memcpy(&result, &value, sizeof(result));
+	return result;
+}
+}
+
+void DX8Wrapper::Publish_Texture_Stage_State(unsigned stage,
+	D3DTEXTURESTAGESTATETYPE state, unsigned value)
+{
+	rts::render::LegacyTextureStageState neutral;
+	if (!rts::render::GetTrackedLegacyTextureStage(stage, &neutral)) return;
+	switch (state) {
+	case D3DTSS_COLOROP: Convert_Texture_Operation(value, &neutral.colorOperation); break;
+	case D3DTSS_COLORARG0: Convert_Texture_Argument(value, &neutral.colorArgument0,
+		&neutral.colorArgument0Complement, &neutral.colorArgument0AlphaReplicate); break;
+	case D3DTSS_COLORARG1: Convert_Texture_Argument(value, &neutral.colorArgument1,
+		&neutral.colorArgument1Complement, &neutral.colorArgument1AlphaReplicate); break;
+	case D3DTSS_COLORARG2: Convert_Texture_Argument(value, &neutral.colorArgument2,
+		&neutral.colorArgument2Complement, &neutral.colorArgument2AlphaReplicate); break;
+	case D3DTSS_ALPHAOP: Convert_Texture_Operation(value, &neutral.alphaOperation); break;
+	case D3DTSS_ALPHAARG0: Convert_Texture_Argument(value, &neutral.alphaArgument0,
+		&neutral.alphaArgument0Complement, &neutral.alphaArgument0AlphaReplicate); break;
+	case D3DTSS_ALPHAARG1: Convert_Texture_Argument(value, &neutral.alphaArgument1,
+		&neutral.alphaArgument1Complement, &neutral.alphaArgument1AlphaReplicate); break;
+	case D3DTSS_ALPHAARG2: Convert_Texture_Argument(value, &neutral.alphaArgument2,
+		&neutral.alphaArgument2Complement, &neutral.alphaArgument2AlphaReplicate); break;
+	case D3DTSS_RESULTARG: {
+		bool ignoredComplement = false;
+		bool ignoredAlphaReplicate = false;
+		Convert_Texture_Argument(value, &neutral.resultArgument,
+			&ignoredComplement, &ignoredAlphaReplicate);
+		break;
+	}
+	case D3DTSS_TEXCOORDINDEX: neutral.textureCoordinateIndex = value & 0xffffU; break;
+	case D3DTSS_TEXTURETRANSFORMFLAGS:
+		neutral.projectedCoordinates = (value & D3DTTFF_PROJECTED) != 0; break;
+	case D3DTSS_ADDRESSU: Convert_Texture_Address(value, &neutral.sampler.addressU); break;
+	case D3DTSS_ADDRESSV: Convert_Texture_Address(value, &neutral.sampler.addressV); break;
+	case D3DTSS_ADDRESSW: Convert_Texture_Address(value, &neutral.sampler.addressW); break;
+	case D3DTSS_MINFILTER: Convert_Texture_Filter(value, &neutral.sampler.minification); break;
+	case D3DTSS_MAGFILTER: Convert_Texture_Filter(value, &neutral.sampler.magnification); break;
+	case D3DTSS_MIPFILTER: Convert_Texture_Filter(value, &neutral.sampler.mipmapping); break;
+	case D3DTSS_MAXANISOTROPY: neutral.sampler.maximumAnisotropy = value; break;
+	case D3DTSS_MAXMIPLEVEL: neutral.sampler.maximumMipLevel = value; break;
+	case D3DTSS_MIPMAPLODBIAS: neutral.sampler.mipLodBias = Texture_State_Float(value); break;
+	case D3DTSS_BORDERCOLOR:
+		neutral.sampler.borderColor = rts::render::RenderFloat4(
+			static_cast<float>((value >> 16) & 0xffU) / 255.0f,
+			static_cast<float>((value >> 8) & 0xffU) / 255.0f,
+			static_cast<float>(value & 0xffU) / 255.0f,
+			static_cast<float>((value >> 24) & 0xffU) / 255.0f); break;
+	case D3DTSS_BUMPENVMAT00: neutral.bumpEnvironmentMatrix00 = Texture_State_Float(value); break;
+	case D3DTSS_BUMPENVMAT01: neutral.bumpEnvironmentMatrix01 = Texture_State_Float(value); break;
+	case D3DTSS_BUMPENVMAT10: neutral.bumpEnvironmentMatrix10 = Texture_State_Float(value); break;
+	case D3DTSS_BUMPENVMAT11: neutral.bumpEnvironmentMatrix11 = Texture_State_Float(value); break;
+	case D3DTSS_BUMPENVLSCALE: neutral.bumpEnvironmentLuminanceScale = Texture_State_Float(value); break;
+	case D3DTSS_BUMPENVLOFFSET: neutral.bumpEnvironmentLuminanceOffset = Texture_State_Float(value); break;
+	default: return;
+	}
+	rts::render::TrackLegacyTextureStage(stage, neutral);
+}
+
 
 void DX8Wrapper::Set_Light(unsigned index, const D3DLIGHT8* light)
 {

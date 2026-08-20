@@ -336,6 +336,8 @@ public:
 	static void Set_DX8_Render_State(D3DRENDERSTATETYPE state, unsigned value);
 	static void Set_DX8_Clip_Plane(DWORD Index, CONST float* pPlane);
 	static void Set_DX8_Texture_Stage_State(unsigned stage, D3DTEXTURESTAGESTATETYPE state, unsigned value);
+	static void Publish_Texture_Stage_State(unsigned stage,
+		D3DTEXTURESTAGESTATETYPE state, unsigned value);
 	static void Set_DX8_Texture(unsigned int stage, IDirect3DBaseTexture8* texture);
 	static void Set_Light_Environment(LightEnvironmentClass* light_env);
 	static LightEnvironmentClass* Get_Light_Environment() { return Light_Environment; }
@@ -905,6 +907,7 @@ WWINLINE void DX8Wrapper::Set_DX8_Texture_Stage_State(unsigned stage, D3DTEXTURE
 #endif
 
 	TextureStageStates[stage][(unsigned int)state]=value;
+	Publish_Texture_Stage_State(stage, state, value);
 	DX8CALL(SetTextureStageState( stage, state, value ));
 	DX8_RECORD_TEXTURE_STAGE_STATE_CHANGE();
 }
@@ -916,6 +919,7 @@ WWINLINE void DX8Wrapper::Set_DX8_Texture(unsigned int stage, IDirect3DBaseTextu
   		return;
   	}
 
+	rts::render::TrackLegacyTexturePresence(stage, texture != nullptr);
 	if (Textures[stage]==texture) return;
 
 	SNAPSHOT_SAY(("DX8 - SetTexture(%x) ",texture));
@@ -1167,6 +1171,7 @@ WWINLINE void DX8Wrapper::Get_Shader(ShaderClass& shader)
 WWINLINE void DX8Wrapper::Set_Texture(unsigned stage,TextureBaseClass* texture)
 {
 	WWASSERT(stage<(unsigned int)CurrentCaps->Get_Max_Textures_Per_Pass());
+	rts::render::TrackLegacyTexturePresence(stage, texture != nullptr);
 	if (texture==render_state.Textures[stage]) return;
 	REF_PTR_SET(render_state.Textures[stage],texture);
 	render_state_changed|=(TEXTURE0_CHANGED<<stage);

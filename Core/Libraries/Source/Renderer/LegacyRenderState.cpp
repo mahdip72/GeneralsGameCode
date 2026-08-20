@@ -65,18 +65,30 @@ LegacySamplerState::LegacySamplerState() :
 	minification(RENDER_TEXTURE_FILTER_LINEAR),
 	magnification(RENDER_TEXTURE_FILTER_LINEAR),
 	mipmapping(RENDER_TEXTURE_FILTER_LINEAR), maximumAnisotropy(1),
-	mipLodBias(0.0f), borderColor()
+	maximumMipLevel(0), mipLodBias(0.0f), borderColor()
 {
 }
 
 LegacyTextureStageState::LegacyTextureStageState() :
 	colorOperation(RENDER_TEXTURE_OP_DISABLE),
+	colorArgument0(RENDER_TEXTURE_ARG_CURRENT),
 	colorArgument1(RENDER_TEXTURE_ARG_TEXTURE),
 	colorArgument2(RENDER_TEXTURE_ARG_DIFFUSE),
 	alphaOperation(RENDER_TEXTURE_OP_DISABLE),
+	alphaArgument0(RENDER_TEXTURE_ARG_CURRENT),
 	alphaArgument1(RENDER_TEXTURE_ARG_TEXTURE),
-	alphaArgument2(RENDER_TEXTURE_ARG_DIFFUSE), textureCoordinateIndex(0),
-	projectedCoordinates(false), sampler()
+	alphaArgument2(RENDER_TEXTURE_ARG_DIFFUSE),
+	colorArgument0Complement(false), colorArgument0AlphaReplicate(false),
+	colorArgument1Complement(false), colorArgument1AlphaReplicate(false),
+	colorArgument2Complement(false), colorArgument2AlphaReplicate(false),
+	alphaArgument0Complement(false), alphaArgument0AlphaReplicate(false),
+	alphaArgument1Complement(false), alphaArgument1AlphaReplicate(false),
+	alphaArgument2Complement(false), alphaArgument2AlphaReplicate(false),
+	resultArgument(RENDER_TEXTURE_ARG_CURRENT), textureCoordinateIndex(0),
+	projectedCoordinates(false), bumpEnvironmentMatrix00(1.0f),
+	bumpEnvironmentMatrix01(0.0f), bumpEnvironmentMatrix10(0.0f),
+	bumpEnvironmentMatrix11(1.0f), bumpEnvironmentLuminanceScale(1.0f),
+	bumpEnvironmentLuminanceOffset(0.0f), sampler()
 {
 }
 
@@ -122,7 +134,8 @@ LegacyFixedFunctionConstants::LegacyFixedFunctionConstants() :
 {
 }
 
-LegacyLogicalState::LegacyLogicalState() : pipeline(), constants() {}
+LegacyLogicalState::LegacyLogicalState() :
+	pipeline(), constants(), texturePresenceMask(0) {}
 
 LegacyShaderKey::LegacyShaderKey()
 {
@@ -165,15 +178,32 @@ LegacyShaderKey BuildLegacyShaderKey(const LegacyPipelineState &state,
 	for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
 	{
 		const LegacyTextureStageState &textureStage = state.textureStages[stage];
-		key.words[3 + stage] =
+		const unsigned int firstWord = 3 + (stage * 2);
+		key.words[firstWord] =
 			static_cast<unsigned int>(textureStage.colorOperation) |
-			(static_cast<unsigned int>(textureStage.colorArgument1) << 5) |
-			(static_cast<unsigned int>(textureStage.colorArgument2) << 8) |
-			(static_cast<unsigned int>(textureStage.alphaOperation) << 11) |
-			(static_cast<unsigned int>(textureStage.alphaArgument1) << 16) |
-			(static_cast<unsigned int>(textureStage.alphaArgument2) << 19) |
-			((textureStage.textureCoordinateIndex & 0x0fU) << 22) |
-			(static_cast<unsigned int>(textureStage.projectedCoordinates) << 26);
+			(static_cast<unsigned int>(textureStage.colorArgument0) << 5) |
+			(static_cast<unsigned int>(textureStage.colorArgument1) << 8) |
+			(static_cast<unsigned int>(textureStage.colorArgument2) << 11) |
+			(static_cast<unsigned int>(textureStage.alphaOperation) << 14) |
+			(static_cast<unsigned int>(textureStage.alphaArgument0) << 19) |
+			(static_cast<unsigned int>(textureStage.alphaArgument1) << 22) |
+			(static_cast<unsigned int>(textureStage.alphaArgument2) << 25) |
+			((textureStage.textureCoordinateIndex & 0x0fU) << 28);
+		key.words[firstWord + 1] =
+			static_cast<unsigned int>(textureStage.projectedCoordinates) |
+			(static_cast<unsigned int>(textureStage.colorArgument0Complement) << 1) |
+			(static_cast<unsigned int>(textureStage.colorArgument0AlphaReplicate) << 2) |
+			(static_cast<unsigned int>(textureStage.colorArgument1Complement) << 3) |
+			(static_cast<unsigned int>(textureStage.colorArgument1AlphaReplicate) << 4) |
+			(static_cast<unsigned int>(textureStage.colorArgument2Complement) << 5) |
+			(static_cast<unsigned int>(textureStage.colorArgument2AlphaReplicate) << 6) |
+			(static_cast<unsigned int>(textureStage.alphaArgument0Complement) << 7) |
+			(static_cast<unsigned int>(textureStage.alphaArgument0AlphaReplicate) << 8) |
+			(static_cast<unsigned int>(textureStage.alphaArgument1Complement) << 9) |
+			(static_cast<unsigned int>(textureStage.alphaArgument1AlphaReplicate) << 10) |
+			(static_cast<unsigned int>(textureStage.alphaArgument2Complement) << 11) |
+			(static_cast<unsigned int>(textureStage.alphaArgument2AlphaReplicate) << 12) |
+			(static_cast<unsigned int>(textureStage.resultArgument) << 13);
 	}
 	key.words[2] |= static_cast<unsigned int>(state.secondaryGradientEnable) << 22;
 	key.words[2] |= static_cast<unsigned int>(state.nPatchEnable) << 23;
@@ -382,8 +412,18 @@ bool DecodeLegacyShaderBits(unsigned int shaderBits,
 
 void TrackLegacyShaderBits(unsigned int shaderBits)
 {
-	g_trackedPipelineStateValid = DecodeLegacyShaderBits(shaderBits,
-		&g_trackedLogicalState.pipeline);
+	LegacyPipelineState decoded;
+	g_trackedPipelineStateValid = DecodeLegacyShaderBits(shaderBits, &decoded);
+	if (!g_trackedPipelineStateValid)
+	{
+		return;
+	}
+	for (unsigned int index = 0; index < LEGACY_TEXTURE_STAGE_COUNT; ++index)
+	{
+		decoded.textureStages[index] =
+			g_trackedLogicalState.pipeline.textureStages[index];
+	}
+	g_trackedLogicalState.pipeline = decoded;
 }
 
 bool GetTrackedLegacyPipelineState(LegacyPipelineState *state)
@@ -440,6 +480,46 @@ bool TrackLegacyLight(unsigned int index, const LegacyLightState &light)
 		return false;
 	}
 	g_trackedLogicalState.constants.lights[index] = light;
+	return true;
+}
+
+bool TrackLegacyTextureStage(unsigned int index,
+	const LegacyTextureStageState &textureStage)
+{
+	if (index >= LEGACY_TEXTURE_STAGE_COUNT)
+	{
+		return false;
+	}
+	g_trackedLogicalState.pipeline.textureStages[index] = textureStage;
+	return true;
+}
+
+bool GetTrackedLegacyTextureStage(unsigned int index,
+	LegacyTextureStageState *textureStage)
+{
+	if (index >= LEGACY_TEXTURE_STAGE_COUNT || textureStage == 0)
+	{
+		return false;
+	}
+	*textureStage = g_trackedLogicalState.pipeline.textureStages[index];
+	return true;
+}
+
+bool TrackLegacyTexturePresence(unsigned int index, bool present)
+{
+	if (index >= LEGACY_TEXTURE_STAGE_COUNT)
+	{
+		return false;
+	}
+	const unsigned int bit = 1U << index;
+	if (present)
+	{
+		g_trackedLogicalState.texturePresenceMask |= bit;
+	}
+	else
+	{
+		g_trackedLogicalState.texturePresenceMask &= ~bit;
+	}
 	return true;
 }
 

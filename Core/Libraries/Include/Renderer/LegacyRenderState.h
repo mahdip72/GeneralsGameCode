@@ -116,7 +116,15 @@ enum RenderTextureOperation
 	RENDER_TEXTURE_OP_MODULATE_ALPHA_ADD_COLOR,
 	RENDER_TEXTURE_OP_DOT_PRODUCT_3,
 	RENDER_TEXTURE_OP_BUMP_ENVIRONMENT,
-	RENDER_TEXTURE_OP_BUMP_ENVIRONMENT_LUMINANCE
+	RENDER_TEXTURE_OP_BUMP_ENVIRONMENT_LUMINANCE,
+	RENDER_TEXTURE_OP_BLEND_TEXTURE_ALPHA_PREMULTIPLIED,
+	RENDER_TEXTURE_OP_BLEND_TEXTURE_FACTOR_ALPHA,
+	RENDER_TEXTURE_OP_PREMODULATE,
+	RENDER_TEXTURE_OP_MODULATE_COLOR_ADD_ALPHA,
+	RENDER_TEXTURE_OP_MODULATE_INVERSE_ALPHA_ADD_COLOR,
+	RENDER_TEXTURE_OP_MODULATE_INVERSE_COLOR_ADD_ALPHA,
+	RENDER_TEXTURE_OP_MULTIPLY_ADD,
+	RENDER_TEXTURE_OP_LINEAR_INTERPOLATE
 };
 
 enum RenderTextureArgument
@@ -139,6 +147,7 @@ enum RenderTextureAddressMode
 
 enum RenderTextureFilter
 {
+	RENDER_TEXTURE_FILTER_NONE,
 	RENDER_TEXTURE_FILTER_POINT,
 	RENDER_TEXTURE_FILTER_LINEAR,
 	RENDER_TEXTURE_FILTER_ANISOTROPIC
@@ -205,6 +214,7 @@ struct LegacySamplerState
 	RenderTextureFilter magnification;
 	RenderTextureFilter mipmapping;
 	unsigned int maximumAnisotropy;
+	unsigned int maximumMipLevel;
 	float mipLodBias;
 	RenderFloat4 borderColor;
 };
@@ -214,13 +224,34 @@ struct LegacyTextureStageState
 	LegacyTextureStageState();
 
 	RenderTextureOperation colorOperation;
+	RenderTextureArgument colorArgument0;
 	RenderTextureArgument colorArgument1;
 	RenderTextureArgument colorArgument2;
 	RenderTextureOperation alphaOperation;
+	RenderTextureArgument alphaArgument0;
 	RenderTextureArgument alphaArgument1;
 	RenderTextureArgument alphaArgument2;
+	bool colorArgument0Complement;
+	bool colorArgument0AlphaReplicate;
+	bool colorArgument1Complement;
+	bool colorArgument1AlphaReplicate;
+	bool colorArgument2Complement;
+	bool colorArgument2AlphaReplicate;
+	bool alphaArgument0Complement;
+	bool alphaArgument0AlphaReplicate;
+	bool alphaArgument1Complement;
+	bool alphaArgument1AlphaReplicate;
+	bool alphaArgument2Complement;
+	bool alphaArgument2AlphaReplicate;
+	RenderTextureArgument resultArgument;
 	unsigned int textureCoordinateIndex;
 	bool projectedCoordinates;
+	float bumpEnvironmentMatrix00;
+	float bumpEnvironmentMatrix01;
+	float bumpEnvironmentMatrix10;
+	float bumpEnvironmentMatrix11;
+	float bumpEnvironmentLuminanceScale;
+	float bumpEnvironmentLuminanceOffset;
 	LegacySamplerState sampler;
 };
 
@@ -306,6 +337,7 @@ struct LegacyLogicalState
 
 	LegacyPipelineState pipeline;
 	LegacyFixedFunctionConstants constants;
+	unsigned int texturePresenceMask;
 };
 
 enum LegacyTransformSlot
@@ -326,7 +358,7 @@ enum LegacyTransformSlot
 
 struct LegacyShaderKey
 {
-	enum { WORD_COUNT = 11 };
+	enum { WORD_COUNT = 19 };
 
 	LegacyShaderKey();
 
@@ -345,6 +377,11 @@ bool GetTrackedLegacyPipelineState(LegacyPipelineState *state);
 bool TrackLegacyTransform(LegacyTransformSlot slot, const float *values);
 void TrackLegacyMaterial(const LegacyMaterialState &material);
 bool TrackLegacyLight(unsigned int index, const LegacyLightState &light);
+bool TrackLegacyTextureStage(unsigned int index,
+	const LegacyTextureStageState &textureStage);
+bool GetTrackedLegacyTextureStage(unsigned int index,
+	LegacyTextureStageState *textureStage);
+bool TrackLegacyTexturePresence(unsigned int index, bool present);
 void TrackLegacyFog(const LegacyFogConstants &fog);
 void TrackLegacyGlobalAmbient(const RenderFloat4 &ambient);
 bool GetTrackedLegacyLogicalState(LegacyLogicalState *state);

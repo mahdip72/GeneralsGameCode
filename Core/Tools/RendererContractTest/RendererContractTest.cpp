@@ -142,8 +142,12 @@ int testLegacyLogicalState()
 	state.pipeline.fogMode = rts::render::RENDER_FOG_LINEAR;
 	const rts::render::LegacyShaderKey fogKey =
 		rts::render::BuildLegacyShaderKey(state.pipeline, 0x11223344U, 1U);
-	result |= check(combinerKey != baseline && fogKey != combinerKey,
-		"shader key distinguishes texture combiner and fog variants");
+	state.pipeline.textureStages[0].colorArgument1Complement = true;
+	const rts::render::LegacyShaderKey modifierKey =
+		rts::render::BuildLegacyShaderKey(state.pipeline, 0x11223344U, 1U);
+	result |= check(combinerKey != baseline && fogKey != combinerKey &&
+		modifierKey != fogKey,
+		"shader key distinguishes texture combiner, fog, and argument modifiers");
 	return result;
 }
 
@@ -293,6 +297,40 @@ int testLegacyShaderBitDecoder()
 		logicalState.constants.fog.end == 512.0f &&
 		logicalState.constants.globalAmbient.y == 0.2f,
 		"legacy bridge publishes material, light, fog, and ambient constants");
+	rts::render::LegacyTextureStageState textureStage;
+	textureStage.colorOperation = rts::render::RENDER_TEXTURE_OP_ADD;
+	textureStage.sampler.addressU = rts::render::RENDER_TEXTURE_ADDRESS_CLAMP;
+	textureStage.sampler.minification =
+		rts::render::RENDER_TEXTURE_FILTER_ANISOTROPIC;
+	textureStage.sampler.maximumAnisotropy = 8;
+	result |= check(rts::render::TrackLegacyTextureStage(1, textureStage) &&
+		!rts::render::TrackLegacyTextureStage(
+			rts::render::LEGACY_TEXTURE_STAGE_COUNT, textureStage) &&
+		rts::render::GetTrackedLegacyTextureStage(1, &textureStage) &&
+		!rts::render::GetTrackedLegacyTextureStage(
+			rts::render::LEGACY_TEXTURE_STAGE_COUNT, &textureStage) &&
+		!rts::render::GetTrackedLegacyTextureStage(1, 0) &&
+		rts::render::TrackLegacyTexturePresence(1, true) &&
+		!rts::render::TrackLegacyTexturePresence(
+			rts::render::LEGACY_TEXTURE_STAGE_COUNT, true) &&
+		rts::render::GetTrackedLegacyLogicalState(&logicalState) &&
+		logicalState.pipeline.textureStages[1].colorOperation ==
+			rts::render::RENDER_TEXTURE_OP_ADD &&
+		logicalState.pipeline.textureStages[1].sampler.addressU ==
+			rts::render::RENDER_TEXTURE_ADDRESS_CLAMP &&
+		logicalState.pipeline.textureStages[1].sampler.maximumAnisotropy == 8 &&
+		logicalState.texturePresenceMask == 2,
+		"legacy bridge publishes texture-stage, sampler, and binding state");
+	rts::render::TrackLegacyShaderBits(opaque);
+	result |= check(rts::render::GetTrackedLegacyLogicalState(&logicalState) &&
+		logicalState.pipeline.textureStages[1].colorOperation ==
+			rts::render::RENDER_TEXTURE_OP_ADD &&
+		logicalState.pipeline.textureStages[1].sampler.addressU ==
+			rts::render::RENDER_TEXTURE_ADDRESS_CLAMP &&
+		logicalState.pipeline.textureStages[1].sampler.maximumAnisotropy == 8 &&
+		logicalState.texturePresenceMask == 2,
+		"shader publication preserves independently tracked texture and sampler state");
+	rts::render::TrackLegacyTexturePresence(1, false);
 	return result;
 }
 
