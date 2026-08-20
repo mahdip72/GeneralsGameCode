@@ -771,6 +771,9 @@ int testD3D11HeadlessDevice()
 	result |= check(device->createBuffer(descriptor, 0, 0, &buffer) ==
 		rts::render::RENDER_RESULT_OK && buffer.isValid(),
 		"D3D11 dynamic buffer receives a logical handle");
+	result |= check(device->recoverDevice() ==
+		rts::render::RENDER_RESULT_UNSUPPORTED,
+		"D3D11 recovery refuses to invalidate live logical resources");
 	unsigned int values[4] = { 1, 2, 3, 4 };
 	result |= check(device->immediateContext()->beginFrame() ==
 		rts::render::RENDER_RESULT_OK &&
@@ -817,6 +820,10 @@ int testD3D11HeadlessDevice()
 		"immutable D3D11 resources require complete initial data");
 	result |= check(device->present() == rts::render::RENDER_RESULT_OK,
 		"headless presentation is a successful no-op");
+	result |= check(device->recoverDevice() == rts::render::RENDER_RESULT_OK &&
+		device->immediateContext() != 0 &&
+		device->present() == rts::render::RENDER_RESULT_OK,
+		"headless D3D11 device recreates at an empty frame boundary");
 	device->shutdown();
 	device->shutdown();
 	delete device;

@@ -375,6 +375,7 @@ public:
 			return TranslateResult(result);
 		}
 		m_initialized = true;
+		m_parameters = parameters;
 		return RENDER_RESULT_OK;
 	}
 
@@ -663,6 +664,21 @@ public:
 			}
 		}
 		return releaseSlot(resource, slot);
+	}
+
+	virtual RenderResult recoverDevice()
+	{
+		if (!isOwner() || m_frameOpen)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		if (m_handles != 0 && m_handles->liveCount() != 0)
+		{
+			return RENDER_RESULT_UNSUPPORTED;
+		}
+		const RenderDeviceParameters parameters = m_parameters;
+		shutdownInternal();
+		return initialize(parameters);
 	}
 
 	virtual RenderResult resize(unsigned int width, unsigned int height)
@@ -1942,6 +1958,7 @@ private:
 	unsigned int m_transformConstantCursor;
 	unsigned int m_width;
 	unsigned int m_height;
+	RenderDeviceParameters m_parameters;
 };
 }
 

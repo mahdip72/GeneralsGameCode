@@ -205,6 +205,7 @@ public:
 		const TextureSubresourceData *initialData,
 		unsigned int initialDataCount, GpuHandle *texture) = 0;
 	virtual bool destroyResource(GpuHandle resource) = 0;
+	virtual RenderResult recoverDevice() = 0;
 	virtual RenderResult resize(unsigned int width, unsigned int height) = 0;
 	virtual RenderResult present() = 0;
 	virtual RenderResult captureBackBuffer(void *destination,
