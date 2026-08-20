@@ -2,6 +2,7 @@
 #include "Renderer/LegacyRenderState.h"
 
 #include <stdio.h>
+#include <vector>
 
 #if defined(RTS_RENDERER_HAS_D3D11)
 #include <windows.h>
@@ -195,10 +196,133 @@ int testD3D11HiddenSwapChain()
 		parameters.width = 64;
 		parameters.height = 64;
 		parameters.enableVsync = false;
+		parameters.enableDebugLayer = true;
 		result |= check(device->initialize(parameters) ==
 			rts::render::RENDER_RESULT_OK,
 			"flip-model D3D11 swap chain initializes while hidden");
-		result |= check(device->present() == rts::render::RENDER_RESULT_OK &&
+
+		struct TestVertex
+		{
+			float x;
+			float y;
+			float z;
+			unsigned int color;
+		};
+		const TestVertex vertices[3] = {
+			{ -0.8f, -0.8f, 0.0f, 0xff0000ffU },
+			{ 0.0f, 0.8f, 0.0f, 0xff0000ffU },
+			{ 0.8f, -0.8f, 0.0f, 0xff0000ffU }
+		};
+		rts::render::BufferDescriptor vertexDescriptor;
+		vertexDescriptor.byteCount = sizeof(vertices);
+		vertexDescriptor.stride = sizeof(TestVertex);
+		rts::render::GpuHandle vertexBuffer;
+		result |= check(device->createBuffer(vertexDescriptor, vertices,
+			sizeof(vertices), &vertexBuffer) == rts::render::RENDER_RESULT_OK,
+			"D3D11 parity probe creates an immutable vertex buffer");
+
+		rts::render::IRenderContext *context = device->immediateContext();
+		rts::render::LegacyLogicalState logicalState;
+		const rts::render::RenderFloat4 clearColor(0.0f, 0.0f, 1.0f, 1.0f);
+		result |= check(context != 0 &&
+			context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyState(logicalState,
+				rts::render::RENDER_VERTEX_POSITION3_COLOR, 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(vertexBuffer, sizeof(TestVertex), 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK,
+			"D3D11 parity pipeline clears and draws through logical state");
+
+		std::vector<unsigned char> pixels(64 * 64 * 4);
+		rts::render::RenderFormat captureFormat =
+			rts::render::RENDER_FORMAT_UNKNOWN;
+		result |= check(device->captureBackBuffer(&pixels[0], pixels.size(),
+			64 * 4, &captureFormat) == rts::render::RENDER_RESULT_OK &&
+			captureFormat == rts::render::RENDER_FORMAT_B8G8R8A8_UNORM,
+			"D3D11 back buffer is available for deterministic capture");
+		const unsigned char *corner = &pixels[4 * (2 * 64 + 2)];
+		const unsigned char *center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(corner[0] > 240 && corner[2] < 16 &&
+			center[2] > 240 && center[0] < 16,
+			"captured D3D11 triangle preserves clear and vertex colors");
+
+		struct TexturedVertex
+		{
+			float position[3];
+			float normal[3];
+			unsigned int color;
+			float texture[2];
+		};
+		const TexturedVertex texturedVertices[3] = {
+			{ { -0.8f, -0.8f, 0.0f }, { 0.0f, 0.0f, -1.0f },
+				0xffffffffU, { 0.0f, 1.0f } },
+			{ { 0.0f, 0.8f, 0.0f }, { 0.0f, 0.0f, -1.0f },
+				0xffffffffU, { 0.5f, 0.0f } },
+			{ { 0.8f, -0.8f, 0.0f }, { 0.0f, 0.0f, -1.0f },
+				0xffffffffU, { 1.0f, 1.0f } }
+		};
+		rts::render::BufferDescriptor texturedVertexDescriptor;
+		texturedVertexDescriptor.byteCount = sizeof(texturedVertices);
+		texturedVertexDescriptor.stride = sizeof(TexturedVertex);
+		rts::render::GpuHandle texturedVertexBuffer;
+		result |= check(device->createBuffer(texturedVertexDescriptor,
+			texturedVertices, sizeof(texturedVertices), &texturedVertexBuffer) ==
+			rts::render::RENDER_RESULT_OK,
+			"D3D11 parity probe creates a textured vertex buffer");
+		const unsigned int greenPixels[4] = {
+			0xff00ff00U, 0xff00ff00U, 0xff00ff00U, 0xff00ff00U
+		};
+		rts::render::TextureDescriptor textureDescriptor;
+		textureDescriptor.width = 2;
+		textureDescriptor.height = 2;
+		textureDescriptor.format = rts::render::RENDER_FORMAT_R8G8B8A8_UNORM;
+		rts::render::TextureSubresourceData textureData;
+		textureData.data = greenPixels;
+		textureData.rowPitch = 2 * sizeof(unsigned int);
+		textureData.slicePitch = sizeof(greenPixels);
+		rts::render::GpuHandle texture;
+		result |= check(device->createTexture(textureDescriptor, &textureData, 1,
+			&texture) == rts::render::RENDER_RESULT_OK,
+			"D3D11 parity probe creates an immutable shader texture");
+		logicalState.pipeline.textureStages[0].colorOperation =
+			rts::render::RENDER_TEXTURE_OP_MODULATE;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyState(logicalState,
+				rts::render::RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1, 1) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(texturedVertexBuffer,
+				sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(0, texture) == rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"D3D11 logical texture state draws through a shader-resource handle");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[1] > 240 && center[0] < 16 && center[2] < 16,
+			"captured D3D11 textured triangle preserves sampled color");
+		unsigned int debugErrorCount = 0xffffffffU;
+		result |= check(device->getDebugValidationErrorCount(&debugErrorCount) ==
+			rts::render::RENDER_RESULT_OK && debugErrorCount == 0,
+			"D3D11 debug layer reports no validation errors");
+		result |= check(device->destroyResource(vertexBuffer) &&
+			device->destroyResource(texturedVertexBuffer) &&
+			device->destroyResource(texture) &&
+			device->present() == rts::render::RENDER_RESULT_OK &&
 			device->resize(96, 80) == rts::render::RENDER_RESULT_OK &&
 			device->present() == rts::render::RENDER_RESULT_OK,
 			"hidden flip-model swap chain presents and resizes");

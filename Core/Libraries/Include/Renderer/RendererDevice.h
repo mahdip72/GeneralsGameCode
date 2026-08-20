@@ -2,6 +2,7 @@
 #define RTS_RENDERER_RENDERERDEVICE_H
 
 #include <stddef.h>
+#include "Renderer/LegacyRenderState.h"
 
 namespace rts
 {
@@ -139,6 +140,20 @@ enum RenderResult
 	RENDER_RESULT_FAILED
 };
 
+enum LegacyVertexFormat
+{
+	RENDER_VERTEX_POSITION3_COLOR = 1,
+	RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1 = 2
+};
+
+enum RenderPrimitiveTopology
+{
+	RENDER_PRIMITIVE_TRIANGLE_LIST,
+	RENDER_PRIMITIVE_TRIANGLE_STRIP,
+	RENDER_PRIMITIVE_LINE_LIST,
+	RENDER_PRIMITIVE_LINE_STRIP
+};
+
 class IRenderContext
 {
 public:
@@ -146,6 +161,18 @@ public:
 	virtual RenderResult beginFrame() = 0;
 	virtual RenderResult updateBuffer(GpuHandle buffer, const void *data,
 		size_t byteCount, size_t destinationOffset) = 0;
+	virtual RenderResult clear(const RenderFloat4 &color, float depth,
+		unsigned int stencil) = 0;
+	virtual RenderResult setViewport(float x, float y, float width,
+		float height, float minimumDepth, float maximumDepth) = 0;
+	virtual RenderResult setLegacyState(const LegacyLogicalState &state,
+		LegacyVertexFormat vertexFormat, unsigned int texturePresenceMask) = 0;
+	virtual RenderResult setVertexBuffer(GpuHandle buffer, unsigned int stride,
+		unsigned int offset) = 0;
+	virtual RenderResult setTexture(unsigned int stage, GpuHandle texture) = 0;
+	virtual RenderResult setPrimitiveTopology(RenderPrimitiveTopology topology) = 0;
+	virtual RenderResult draw(unsigned int vertexCount,
+		unsigned int startVertex) = 0;
 	virtual RenderResult endFrame() = 0;
 };
 
@@ -165,6 +192,10 @@ public:
 	virtual bool destroyResource(GpuHandle resource) = 0;
 	virtual RenderResult resize(unsigned int width, unsigned int height) = 0;
 	virtual RenderResult present() = 0;
+	virtual RenderResult captureBackBuffer(void *destination,
+		size_t destinationBytes, size_t destinationRowPitch,
+		RenderFormat *format) = 0;
+	virtual RenderResult getDebugValidationErrorCount(unsigned int *count) const = 0;
 };
 
 IRenderDevice *CreateD3D11RenderDevice();

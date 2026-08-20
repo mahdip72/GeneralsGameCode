@@ -4,8 +4,60 @@ add_library(core_renderer STATIC
 )
 
 if(WIN32 AND NOT IS_VS6_BUILD)
+    find_program(RTS_FXC_EXECUTABLE NAMES fxc.exe fxc REQUIRED)
+    set(renderer_generated_dir "${CMAKE_CURRENT_BINARY_DIR}/Generated")
+    set(renderer_shader_source "${CMAKE_CURRENT_SOURCE_DIR}/Shaders/LegacyFixedFunction.hlsl")
+    set(renderer_vertex_shader_header "${renderer_generated_dir}/LegacyFixedFunctionVS.h")
+    set(renderer_pixel_shader_header "${renderer_generated_dir}/LegacyFixedFunctionPS.h")
+    set(renderer_textured_vertex_shader_header "${renderer_generated_dir}/LegacyTexturedVS.h")
+    set(renderer_textured_pixel_shader_header "${renderer_generated_dir}/LegacyTexturedPS.h")
+
+    add_custom_command(
+        OUTPUT "${renderer_vertex_shader_header}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${renderer_generated_dir}"
+        COMMAND "${RTS_FXC_EXECUTABLE}" /nologo /T vs_5_0 /E VSMain
+            /Fh "${renderer_vertex_shader_header}"
+            /Vn g_LegacyFixedFunctionVS "${renderer_shader_source}"
+        DEPENDS "${renderer_shader_source}"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${renderer_pixel_shader_header}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${renderer_generated_dir}"
+        COMMAND "${RTS_FXC_EXECUTABLE}" /nologo /T ps_5_0 /E PSMain
+            /Fh "${renderer_pixel_shader_header}"
+            /Vn g_LegacyFixedFunctionPS "${renderer_shader_source}"
+        DEPENDS "${renderer_shader_source}"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${renderer_textured_vertex_shader_header}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${renderer_generated_dir}"
+        COMMAND "${RTS_FXC_EXECUTABLE}" /nologo /T vs_5_0 /E VSTextured
+            /Fh "${renderer_textured_vertex_shader_header}"
+            /Vn g_LegacyTexturedVS "${renderer_shader_source}"
+        DEPENDS "${renderer_shader_source}"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${renderer_textured_pixel_shader_header}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${renderer_generated_dir}"
+        COMMAND "${RTS_FXC_EXECUTABLE}" /nologo /T ps_5_0 /E PSTextured
+            /Fh "${renderer_textured_pixel_shader_header}"
+            /Vn g_LegacyTexturedPS "${renderer_shader_source}"
+        DEPENDS "${renderer_shader_source}"
+        VERBATIM
+    )
+
     target_sources(core_renderer PRIVATE
         D3D11RenderDevice.cpp
+        "${renderer_vertex_shader_header}"
+        "${renderer_pixel_shader_header}"
+        "${renderer_textured_vertex_shader_header}"
+        "${renderer_textured_pixel_shader_header}"
+    )
+    target_include_directories(core_renderer PRIVATE
+        "${renderer_generated_dir}"
     )
     target_compile_definitions(core_renderer PUBLIC
         RTS_RENDERER_HAS_D3D11=1

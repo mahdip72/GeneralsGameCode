@@ -2,7 +2,13 @@
 
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d11sdklayers.h>
 #include <dxgi1_2.h>
+
+#include "LegacyFixedFunctionPS.h"
+#include "LegacyFixedFunctionVS.h"
+#include "LegacyTexturedPS.h"
+#include "LegacyTexturedVS.h"
 
 #include <limits.h>
 #include <new>
@@ -70,16 +76,120 @@ DXGI_FORMAT TranslateFormat(RenderFormat format)
 	}
 }
 
+D3D11_COMPARISON_FUNC TranslateComparison(RenderCompareFunction function)
+{
+	static const D3D11_COMPARISON_FUNC values[] = {
+		D3D11_COMPARISON_NEVER, D3D11_COMPARISON_LESS,
+		D3D11_COMPARISON_EQUAL, D3D11_COMPARISON_LESS_EQUAL,
+		D3D11_COMPARISON_GREATER, D3D11_COMPARISON_NOT_EQUAL,
+		D3D11_COMPARISON_GREATER_EQUAL, D3D11_COMPARISON_ALWAYS
+	};
+	return values[static_cast<unsigned int>(function) < 8 ? function : 0];
+}
+
+D3D11_BLEND TranslateBlend(RenderBlendFactor factor)
+{
+	static const D3D11_BLEND values[] = {
+		D3D11_BLEND_ZERO, D3D11_BLEND_ONE, D3D11_BLEND_SRC_COLOR,
+		D3D11_BLEND_INV_SRC_COLOR, D3D11_BLEND_SRC_ALPHA,
+		D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_DEST_ALPHA,
+		D3D11_BLEND_INV_DEST_ALPHA, D3D11_BLEND_DEST_COLOR,
+		D3D11_BLEND_INV_DEST_COLOR
+	};
+	return values[static_cast<unsigned int>(factor) < 10 ? factor : 0];
+}
+
+D3D11_BLEND_OP TranslateBlendOperation(RenderBlendOperation operation)
+{
+	static const D3D11_BLEND_OP values[] = {
+		D3D11_BLEND_OP_ADD, D3D11_BLEND_OP_SUBTRACT,
+		D3D11_BLEND_OP_REV_SUBTRACT, D3D11_BLEND_OP_MIN,
+		D3D11_BLEND_OP_MAX
+	};
+	return values[static_cast<unsigned int>(operation) < 5 ? operation : 0];
+}
+
+D3D11_STENCIL_OP TranslateStencilOperation(RenderStencilOperation operation)
+{
+	static const D3D11_STENCIL_OP values[] = {
+		D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_ZERO,
+		D3D11_STENCIL_OP_REPLACE, D3D11_STENCIL_OP_INCR_SAT,
+		D3D11_STENCIL_OP_DECR_SAT, D3D11_STENCIL_OP_INVERT,
+		D3D11_STENCIL_OP_INCR, D3D11_STENCIL_OP_DECR
+	};
+	return values[static_cast<unsigned int>(operation) < 8 ? operation : 0];
+}
+
+D3D11_TEXTURE_ADDRESS_MODE TranslateAddressMode(RenderTextureAddressMode mode)
+{
+	static const D3D11_TEXTURE_ADDRESS_MODE values[] = {
+		D3D11_TEXTURE_ADDRESS_WRAP, D3D11_TEXTURE_ADDRESS_MIRROR,
+		D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_BORDER
+	};
+	return values[static_cast<unsigned int>(mode) < 4 ? mode : 0];
+}
+
+D3D11_FILTER TranslateFilter(const LegacySamplerState &sampler)
+{
+	if (sampler.minification == RENDER_TEXTURE_FILTER_ANISOTROPIC ||
+		sampler.magnification == RENDER_TEXTURE_FILTER_ANISOTROPIC ||
+		sampler.mipmapping == RENDER_TEXTURE_FILTER_ANISOTROPIC)
+	{
+		return D3D11_FILTER_ANISOTROPIC;
+	}
+	const unsigned int bits =
+		(sampler.minification == RENDER_TEXTURE_FILTER_LINEAR ? 4U : 0U) |
+		(sampler.magnification == RENDER_TEXTURE_FILTER_LINEAR ? 2U : 0U) |
+		(sampler.mipmapping == RENDER_TEXTURE_FILTER_LINEAR ? 1U : 0U);
+	static const D3D11_FILTER values[] = {
+		D3D11_FILTER_MIN_MAG_MIP_POINT,
+		D3D11_FILTER_MIN_MAG_POINT_MIP_LINEAR,
+		D3D11_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT,
+		D3D11_FILTER_MIN_POINT_MAG_MIP_LINEAR,
+		D3D11_FILTER_MIN_LINEAR_MAG_MIP_POINT,
+		D3D11_FILTER_MIN_LINEAR_MAG_POINT_MIP_LINEAR,
+		D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT,
+		D3D11_FILTER_MIN_MAG_MIP_LINEAR
+	};
+	return values[bits];
+}
+
+struct BlendStateEntry
+{
+	D3D11_BLEND_DESC descriptor;
+	ID3D11BlendState *state;
+};
+
+struct DepthStencilStateEntry
+{
+	D3D11_DEPTH_STENCIL_DESC descriptor;
+	ID3D11DepthStencilState *state;
+};
+
+struct RasterizerStateEntry
+{
+	D3D11_RASTERIZER_DESC descriptor;
+	ID3D11RasterizerState *state;
+};
+
+struct SamplerStateEntry
+{
+	D3D11_SAMPLER_DESC descriptor;
+	ID3D11SamplerState *state;
+};
+
 struct ResourceSlot
 {
-	ResourceSlot() : resource(0), kind(RESOURCE_NONE),
-		usage(RENDER_USAGE_DEFAULT), byteCount(0)
+	ResourceSlot() : resource(0), view(0), kind(RESOURCE_NONE),
+		usage(RENDER_USAGE_DEFAULT), binding(0), byteCount(0)
 	{
 	}
 
 	ID3D11Resource *resource;
+	ID3D11ShaderResourceView *view;
 	ResourceKind kind;
 	RenderUsage usage;
+	unsigned int binding;
 	size_t byteCount;
 	std::vector<unsigned char> shadow;
 };
@@ -88,8 +198,14 @@ class D3D11RenderDevice : public IRenderDevice, public IRenderContext
 {
 public:
 	D3D11RenderDevice() : m_device(0), m_context(0), m_swapChain(0),
+		m_renderTarget(0), m_depthTexture(0), m_depthStencil(0),
+		m_vertexShader(0), m_pixelShader(0), m_positionColorLayout(0),
+		m_texturedVertexShader(0), m_texturedPixelShader(0),
+		m_texturedLayout(0),
 		m_handles(0), m_ownerThread(0), m_initialized(false),
-		m_frameOpen(false), m_enableVsync(true), m_width(0), m_height(0)
+		m_frameOpen(false), m_pipelineBound(false), m_vertexBufferBound(false),
+		m_topologyBound(false),
+		m_enableVsync(true), m_width(0), m_height(0)
 	{
 	}
 
@@ -170,6 +286,18 @@ public:
 				shutdownInternal();
 				return TranslateResult(result);
 			}
+			result = createBackBufferTargets();
+			if (FAILED(result))
+			{
+				shutdownInternal();
+				return TranslateResult(result);
+			}
+		}
+		result = createPipelineResources();
+		if (FAILED(result))
+		{
+			shutdownInternal();
+			return TranslateResult(result);
 		}
 		m_initialized = true;
 		return RENDER_RESULT_OK;
@@ -243,6 +371,7 @@ public:
 		slot.resource = nativeBuffer;
 		slot.kind = RESOURCE_BUFFER;
 		slot.usage = descriptor.usage;
+		slot.binding = descriptor.binding;
 		slot.byteCount = descriptor.byteCount;
 		if (descriptor.usage == RENDER_USAGE_DYNAMIC)
 		{
@@ -354,7 +483,18 @@ public:
 		slot.resource = nativeTexture;
 		slot.kind = RESOURCE_TEXTURE;
 		slot.usage = descriptor.usage;
+		slot.binding = descriptor.binding;
 		slot.byteCount = 0;
+		if ((descriptor.binding & RENDER_TEXTURE_SHADER_RESOURCE) != 0)
+		{
+			const HRESULT viewResult = m_device->CreateShaderResourceView(
+				nativeTexture, 0, &slot.view);
+			if (FAILED(viewResult))
+			{
+				releaseSlot(handle, slot);
+				return TranslateResult(viewResult);
+			}
+		}
 		*texture = handle;
 		return RENDER_RESULT_OK;
 	}
@@ -365,7 +505,22 @@ public:
 		{
 			return false;
 		}
-		return releaseSlot(resource, m_resources[resource.index()]);
+		ResourceSlot &slot = m_resources[resource.index()];
+		if (slot.kind == RESOURCE_TEXTURE)
+		{
+			ID3D11ShaderResourceView *emptyViews[LEGACY_TEXTURE_STAGE_COUNT] = { 0 };
+			m_context->PSSetShaderResources(0, LEGACY_TEXTURE_STAGE_COUNT,
+				emptyViews);
+		}
+		else if (slot.kind == RESOURCE_BUFFER &&
+			(slot.binding & RENDER_BUFFER_VERTEX) != 0)
+		{
+			ID3D11Buffer *emptyBuffer = 0;
+			const UINT zero = 0;
+			m_context->IASetVertexBuffers(0, 1, &emptyBuffer, &zero, &zero);
+			m_vertexBufferBound = false;
+		}
+		return releaseSlot(resource, slot);
 	}
 
 	virtual RenderResult resize(unsigned int width, unsigned int height)
@@ -376,8 +531,18 @@ public:
 		}
 		if (m_swapChain != 0)
 		{
-			const HRESULT result = m_swapChain->ResizeBuffers(0, width, height,
+			m_context->OMSetRenderTargets(0, 0, 0);
+			releaseBackBufferTargets();
+			HRESULT result = m_swapChain->ResizeBuffers(0, width, height,
 				DXGI_FORMAT_UNKNOWN, 0);
+			if (FAILED(result))
+			{
+				createBackBufferTargets();
+				return TranslateResult(result);
+			}
+			m_width = width;
+			m_height = height;
+			result = createBackBufferTargets();
 			if (FAILED(result))
 			{
 				return TranslateResult(result);
@@ -404,6 +569,13 @@ public:
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
+		if (m_renderTarget != 0)
+		{
+			m_context->OMSetRenderTargets(1, &m_renderTarget, m_depthStencil);
+		}
+		m_pipelineBound = false;
+		m_vertexBufferBound = false;
+		m_topologyBound = false;
 		m_frameOpen = true;
 		return RENDER_RESULT_OK;
 	}
@@ -452,6 +624,268 @@ public:
 		return RENDER_RESULT_OK;
 	}
 
+	virtual RenderResult clear(const RenderFloat4 &color, float depth,
+		unsigned int stencil)
+	{
+		if (!isOwner() || !m_frameOpen || m_renderTarget == 0 ||
+			depth < 0.0f || depth > 1.0f)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		const float nativeColor[4] = { color.x, color.y, color.z, color.w };
+		m_context->ClearRenderTargetView(m_renderTarget, nativeColor);
+		if (m_depthStencil != 0)
+		{
+			m_context->ClearDepthStencilView(m_depthStencil,
+				D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, depth,
+				static_cast<UINT8>(stencil));
+		}
+		return RENDER_RESULT_OK;
+	}
+
+	virtual RenderResult setViewport(float x, float y, float width,
+		float height, float minimumDepth, float maximumDepth)
+	{
+		if (!isOwner() || !m_frameOpen || width <= 0.0f || height <= 0.0f ||
+			minimumDepth < 0.0f || maximumDepth > 1.0f ||
+			minimumDepth > maximumDepth)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		D3D11_VIEWPORT viewport;
+		viewport.TopLeftX = x;
+		viewport.TopLeftY = y;
+		viewport.Width = width;
+		viewport.Height = height;
+		viewport.MinDepth = minimumDepth;
+		viewport.MaxDepth = maximumDepth;
+		m_context->RSSetViewports(1, &viewport);
+		return RENDER_RESULT_OK;
+	}
+
+	virtual RenderResult setLegacyState(const LegacyLogicalState &state,
+		LegacyVertexFormat vertexFormat, unsigned int texturePresenceMask)
+	{
+		if (!isOwner() || !m_frameOpen)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		const bool textured = texturePresenceMask != 0;
+		if ((!textured && vertexFormat != RENDER_VERTEX_POSITION3_COLOR) ||
+			(textured && (texturePresenceMask != 1 ||
+				vertexFormat != RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1)))
+		{
+			return RENDER_RESULT_UNSUPPORTED;
+		}
+
+		D3D11_BLEND_DESC blendDescriptor;
+		memset(&blendDescriptor, 0, sizeof(blendDescriptor));
+		D3D11_RENDER_TARGET_BLEND_DESC &target = blendDescriptor.RenderTarget[0];
+		target.BlendEnable = state.pipeline.blend.blendEnable;
+		target.SrcBlend = TranslateBlend(state.pipeline.blend.sourceColor);
+		target.DestBlend = TranslateBlend(state.pipeline.blend.destinationColor);
+		target.BlendOp = TranslateBlendOperation(state.pipeline.blend.colorOperation);
+		target.SrcBlendAlpha = TranslateBlend(state.pipeline.blend.sourceAlpha);
+		target.DestBlendAlpha = TranslateBlend(state.pipeline.blend.destinationAlpha);
+		target.BlendOpAlpha = TranslateBlendOperation(
+			state.pipeline.blend.alphaOperation);
+		target.RenderTargetWriteMask =
+			static_cast<UINT8>(state.pipeline.blend.colorWriteMask & 0x0fU);
+		ID3D11BlendState *blendState = 0;
+		HRESULT result = findOrCreateBlendState(blendDescriptor, &blendState);
+		if (FAILED(result))
+		{
+			return TranslateResult(result);
+		}
+
+		D3D11_DEPTH_STENCIL_DESC depthDescriptor;
+		memset(&depthDescriptor, 0, sizeof(depthDescriptor));
+		depthDescriptor.DepthEnable = state.pipeline.depthStencil.depthEnable;
+		depthDescriptor.DepthWriteMask = state.pipeline.depthStencil.depthWrite ?
+			D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
+		depthDescriptor.DepthFunc = TranslateComparison(
+			state.pipeline.depthStencil.depthFunction);
+		depthDescriptor.StencilEnable = state.pipeline.depthStencil.stencilEnable;
+		depthDescriptor.StencilReadMask = static_cast<UINT8>(
+			state.pipeline.depthStencil.stencilReadMask);
+		depthDescriptor.StencilWriteMask = static_cast<UINT8>(
+			state.pipeline.depthStencil.stencilWriteMask);
+		depthDescriptor.FrontFace.StencilFunc = TranslateComparison(
+			state.pipeline.depthStencil.stencilFunction);
+		depthDescriptor.FrontFace.StencilFailOp = TranslateStencilOperation(
+			state.pipeline.depthStencil.stencilFail);
+		depthDescriptor.FrontFace.StencilDepthFailOp = TranslateStencilOperation(
+			state.pipeline.depthStencil.stencilDepthFail);
+		depthDescriptor.FrontFace.StencilPassOp = TranslateStencilOperation(
+			state.pipeline.depthStencil.stencilPass);
+		depthDescriptor.BackFace = depthDescriptor.FrontFace;
+		ID3D11DepthStencilState *depthState = 0;
+		result = findOrCreateDepthState(depthDescriptor, &depthState);
+		if (FAILED(result))
+		{
+			return TranslateResult(result);
+		}
+
+		D3D11_RASTERIZER_DESC rasterizerDescriptor;
+		memset(&rasterizerDescriptor, 0, sizeof(rasterizerDescriptor));
+		rasterizerDescriptor.FillMode = state.pipeline.rasterizer.fillMode ==
+			RENDER_FILL_WIREFRAME ? D3D11_FILL_WIREFRAME : D3D11_FILL_SOLID;
+		switch (state.pipeline.rasterizer.cullMode)
+		{
+		case RENDER_CULL_NONE:
+			rasterizerDescriptor.CullMode = D3D11_CULL_NONE;
+			break;
+		case RENDER_CULL_FRONT:
+			rasterizerDescriptor.CullMode = D3D11_CULL_FRONT;
+			break;
+		default:
+			rasterizerDescriptor.CullMode = D3D11_CULL_BACK;
+			break;
+		}
+		rasterizerDescriptor.FrontCounterClockwise =
+			state.pipeline.rasterizer.frontCounterClockwise;
+		rasterizerDescriptor.DepthBias = state.pipeline.rasterizer.depthBias;
+		rasterizerDescriptor.SlopeScaledDepthBias =
+			state.pipeline.rasterizer.slopeScaledDepthBias;
+		rasterizerDescriptor.DepthClipEnable = true;
+		rasterizerDescriptor.ScissorEnable =
+			state.pipeline.rasterizer.scissorEnable;
+		ID3D11RasterizerState *rasterizerState = 0;
+		result = findOrCreateRasterizerState(rasterizerDescriptor, &rasterizerState);
+		if (FAILED(result))
+		{
+			return TranslateResult(result);
+		}
+		ID3D11SamplerState *samplerState = 0;
+		if (textured)
+		{
+			const LegacySamplerState &sampler =
+				state.pipeline.textureStages[0].sampler;
+			D3D11_SAMPLER_DESC samplerDescriptor;
+			memset(&samplerDescriptor, 0, sizeof(samplerDescriptor));
+			samplerDescriptor.Filter = TranslateFilter(sampler);
+			samplerDescriptor.AddressU = TranslateAddressMode(sampler.addressU);
+			samplerDescriptor.AddressV = TranslateAddressMode(sampler.addressV);
+			samplerDescriptor.AddressW = TranslateAddressMode(sampler.addressW);
+			samplerDescriptor.MipLODBias = sampler.mipLodBias;
+			samplerDescriptor.MaxAnisotropy = sampler.maximumAnisotropy == 0 ? 1 :
+				sampler.maximumAnisotropy;
+		if (samplerDescriptor.MaxAnisotropy > 16)
+		{
+			samplerDescriptor.MaxAnisotropy = 16;
+		}
+			samplerDescriptor.ComparisonFunc = D3D11_COMPARISON_NEVER;
+			samplerDescriptor.BorderColor[0] = sampler.borderColor.x;
+			samplerDescriptor.BorderColor[1] = sampler.borderColor.y;
+			samplerDescriptor.BorderColor[2] = sampler.borderColor.z;
+			samplerDescriptor.BorderColor[3] = sampler.borderColor.w;
+			samplerDescriptor.MinLOD = 0.0f;
+			samplerDescriptor.MaxLOD = D3D11_FLOAT32_MAX;
+			result = findOrCreateSamplerState(samplerDescriptor, &samplerState);
+			if (FAILED(result))
+			{
+				return TranslateResult(result);
+			}
+		}
+
+		const float blendFactor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+		m_context->OMSetBlendState(blendState, blendFactor, 0xffffffffU);
+		m_context->OMSetDepthStencilState(depthState,
+			state.pipeline.depthStencil.stencilReference);
+		m_context->RSSetState(rasterizerState);
+		m_context->IASetInputLayout(textured ? m_texturedLayout :
+			m_positionColorLayout);
+		m_context->VSSetShader(textured ? m_texturedVertexShader : m_vertexShader,
+			0, 0);
+		m_context->PSSetShader(textured ? m_texturedPixelShader : m_pixelShader,
+			0, 0);
+		if (textured)
+		{
+			m_context->PSSetSamplers(0, 1, &samplerState);
+		}
+		m_pipelineBound = true;
+		return RENDER_RESULT_OK;
+	}
+
+	virtual RenderResult setVertexBuffer(GpuHandle buffer, unsigned int stride,
+		unsigned int offset)
+	{
+		if (!isOwner() || !m_frameOpen || stride == 0 ||
+			!m_handles->isLive(buffer))
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		ResourceSlot &slot = m_resources[buffer.index()];
+		if (slot.kind != RESOURCE_BUFFER ||
+			(slot.binding & RENDER_BUFFER_VERTEX) == 0 || offset >= slot.byteCount)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		ID3D11Buffer *nativeBuffer = static_cast<ID3D11Buffer *>(slot.resource);
+		const UINT nativeStride = stride;
+		const UINT nativeOffset = offset;
+		m_context->IASetVertexBuffers(0, 1, &nativeBuffer, &nativeStride,
+			&nativeOffset);
+		m_vertexBufferBound = true;
+		return RENDER_RESULT_OK;
+	}
+
+	virtual RenderResult setTexture(unsigned int stage, GpuHandle texture)
+	{
+		if (!isOwner() || !m_frameOpen || stage >= LEGACY_TEXTURE_STAGE_COUNT ||
+			!m_handles->isLive(texture))
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		ResourceSlot &slot = m_resources[texture.index()];
+		if (slot.kind != RESOURCE_TEXTURE || slot.view == 0)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		m_context->PSSetShaderResources(stage, 1, &slot.view);
+		return RENDER_RESULT_OK;
+	}
+
+	virtual RenderResult setPrimitiveTopology(RenderPrimitiveTopology topology)
+	{
+		if (!isOwner() || !m_frameOpen)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		D3D11_PRIMITIVE_TOPOLOGY nativeTopology;
+		switch (topology)
+		{
+		case RENDER_PRIMITIVE_TRIANGLE_LIST:
+			nativeTopology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+			break;
+		case RENDER_PRIMITIVE_TRIANGLE_STRIP:
+			nativeTopology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
+			break;
+		case RENDER_PRIMITIVE_LINE_LIST:
+			nativeTopology = D3D11_PRIMITIVE_TOPOLOGY_LINELIST;
+			break;
+		case RENDER_PRIMITIVE_LINE_STRIP:
+			nativeTopology = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP;
+			break;
+		default:
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		m_context->IASetPrimitiveTopology(nativeTopology);
+		m_topologyBound = true;
+		return RENDER_RESULT_OK;
+	}
+
+	virtual RenderResult draw(unsigned int vertexCount, unsigned int startVertex)
+	{
+		if (!isOwner() || !m_frameOpen || !m_pipelineBound || !m_topologyBound ||
+			!m_vertexBufferBound || vertexCount == 0)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		m_context->Draw(vertexCount, startVertex);
+		return RENDER_RESULT_OK;
+	}
+
 	virtual RenderResult endFrame()
 	{
 		if (!isOwner() || !m_frameOpen)
@@ -459,6 +893,111 @@ public:
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		m_frameOpen = false;
+		return RENDER_RESULT_OK;
+	}
+
+	virtual RenderResult captureBackBuffer(void *destination,
+		size_t destinationBytes, size_t destinationRowPitch,
+		RenderFormat *format)
+	{
+		const size_t requiredRowBytes = static_cast<size_t>(m_width) * 4;
+		const size_t maximumSize = static_cast<size_t>(-1);
+		if (!isOwner() || m_frameOpen || m_swapChain == 0 || destination == 0 ||
+			format == 0 || destinationRowPitch < requiredRowBytes ||
+			(m_height != 0 && destinationRowPitch > maximumSize / m_height) ||
+			destinationBytes < destinationRowPitch * m_height)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		ID3D11Texture2D *backBuffer = 0;
+		HRESULT result = m_swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D),
+			reinterpret_cast<void **>(&backBuffer));
+		if (FAILED(result))
+		{
+			return TranslateResult(result);
+		}
+		D3D11_TEXTURE2D_DESC descriptor;
+		backBuffer->GetDesc(&descriptor);
+		descriptor.BindFlags = 0;
+		descriptor.MiscFlags = 0;
+		descriptor.Usage = D3D11_USAGE_STAGING;
+		descriptor.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		ID3D11Texture2D *staging = 0;
+		result = m_device->CreateTexture2D(&descriptor, 0, &staging);
+		if (SUCCEEDED(result))
+		{
+			m_context->CopyResource(staging, backBuffer);
+			D3D11_MAPPED_SUBRESOURCE mapped;
+			result = m_context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped);
+			if (SUCCEEDED(result))
+			{
+				unsigned char *output = static_cast<unsigned char *>(destination);
+				const unsigned char *input =
+					static_cast<const unsigned char *>(mapped.pData);
+				for (unsigned int row = 0; row < m_height; ++row)
+				{
+					memcpy(output + row * destinationRowPitch,
+						input + row * mapped.RowPitch, requiredRowBytes);
+				}
+				m_context->Unmap(staging, 0);
+				*format = RENDER_FORMAT_B8G8R8A8_UNORM;
+			}
+		}
+		if (staging != 0)
+		{
+			staging->Release();
+		}
+		backBuffer->Release();
+		return TranslateResult(result);
+	}
+
+	virtual RenderResult getDebugValidationErrorCount(unsigned int *count) const
+	{
+		if (!isOwner() || count == 0)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		ID3D11InfoQueue *queue = 0;
+		const HRESULT queryResult = m_device->QueryInterface(
+			__uuidof(ID3D11InfoQueue), reinterpret_cast<void **>(&queue));
+		if (FAILED(queryResult))
+		{
+			return RENDER_RESULT_UNSUPPORTED;
+		}
+		*count = 0;
+		const UINT64 messageCount = queue->GetNumStoredMessagesAllowedByRetrievalFilter();
+		for (UINT64 index = 0; index < messageCount; ++index)
+		{
+			SIZE_T messageBytes = 0;
+			if (FAILED(queue->GetMessage(index, 0, &messageBytes)))
+			{
+				queue->Release();
+				return RENDER_RESULT_FAILED;
+			}
+			std::vector<unsigned char> storage;
+			try
+			{
+				storage.resize(messageBytes);
+			}
+			catch (...)
+			{
+				queue->Release();
+				return RENDER_RESULT_OUT_OF_MEMORY;
+			}
+			D3D11_MESSAGE *message =
+				reinterpret_cast<D3D11_MESSAGE *>(&storage[0]);
+			if (FAILED(queue->GetMessage(index, message, &messageBytes)))
+			{
+				queue->Release();
+				return RENDER_RESULT_FAILED;
+			}
+			if (message->Severity == D3D11_MESSAGE_SEVERITY_CORRUPTION ||
+				message->Severity == D3D11_MESSAGE_SEVERITY_ERROR)
+			{
+				++*count;
+			}
+		}
+		queue->Release();
 		return RENDER_RESULT_OK;
 	}
 
@@ -485,6 +1024,274 @@ private:
 			*nativeUsage = D3D11_USAGE_DEFAULT;
 			break;
 		}
+	}
+
+	HRESULT createPipelineResources()
+	{
+		HRESULT result = m_device->CreateVertexShader(g_LegacyFixedFunctionVS,
+			sizeof(g_LegacyFixedFunctionVS), 0, &m_vertexShader);
+		if (FAILED(result))
+		{
+			return result;
+		}
+		result = m_device->CreatePixelShader(g_LegacyFixedFunctionPS,
+			sizeof(g_LegacyFixedFunctionPS), 0, &m_pixelShader);
+		if (FAILED(result))
+		{
+			return result;
+		}
+		const D3D11_INPUT_ELEMENT_DESC elements[] = {
+			{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
+				D3D11_INPUT_PER_VERTEX_DATA, 0 },
+			{ "COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 12,
+				D3D11_INPUT_PER_VERTEX_DATA, 0 }
+		};
+		result = m_device->CreateInputLayout(elements,
+			static_cast<UINT>(sizeof(elements) / sizeof(elements[0])),
+			g_LegacyFixedFunctionVS, sizeof(g_LegacyFixedFunctionVS),
+			&m_positionColorLayout);
+		if (FAILED(result))
+		{
+			return result;
+		}
+		result = m_device->CreateVertexShader(g_LegacyTexturedVS,
+			sizeof(g_LegacyTexturedVS), 0, &m_texturedVertexShader);
+		if (FAILED(result))
+		{
+			return result;
+		}
+		result = m_device->CreatePixelShader(g_LegacyTexturedPS,
+			sizeof(g_LegacyTexturedPS), 0, &m_texturedPixelShader);
+		if (FAILED(result))
+		{
+			return result;
+		}
+		const D3D11_INPUT_ELEMENT_DESC texturedElements[] = {
+			{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
+				D3D11_INPUT_PER_VERTEX_DATA, 0 },
+			{ "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12,
+				D3D11_INPUT_PER_VERTEX_DATA, 0 },
+			{ "COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 24,
+				D3D11_INPUT_PER_VERTEX_DATA, 0 },
+			{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 28,
+				D3D11_INPUT_PER_VERTEX_DATA, 0 }
+		};
+		return m_device->CreateInputLayout(texturedElements,
+			static_cast<UINT>(sizeof(texturedElements) / sizeof(texturedElements[0])),
+			g_LegacyTexturedVS, sizeof(g_LegacyTexturedVS), &m_texturedLayout);
+	}
+
+	HRESULT createBackBufferTargets()
+	{
+		if (m_swapChain == 0)
+		{
+			return E_INVALIDARG;
+		}
+		ID3D11Texture2D *backBuffer = 0;
+		HRESULT result = m_swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D),
+			reinterpret_cast<void **>(&backBuffer));
+		if (SUCCEEDED(result))
+		{
+			result = m_device->CreateRenderTargetView(backBuffer, 0,
+				&m_renderTarget);
+		}
+		if (backBuffer != 0)
+		{
+			backBuffer->Release();
+		}
+		if (FAILED(result))
+		{
+			return result;
+		}
+
+		D3D11_TEXTURE2D_DESC depthDescriptor;
+		memset(&depthDescriptor, 0, sizeof(depthDescriptor));
+		depthDescriptor.Width = m_width;
+		depthDescriptor.Height = m_height;
+		depthDescriptor.MipLevels = 1;
+		depthDescriptor.ArraySize = 1;
+		depthDescriptor.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+		depthDescriptor.SampleDesc.Count = 1;
+		depthDescriptor.Usage = D3D11_USAGE_DEFAULT;
+		depthDescriptor.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+		result = m_device->CreateTexture2D(&depthDescriptor, 0, &m_depthTexture);
+		if (SUCCEEDED(result))
+		{
+			result = m_device->CreateDepthStencilView(m_depthTexture, 0,
+				&m_depthStencil);
+		}
+		if (FAILED(result))
+		{
+			releaseBackBufferTargets();
+		}
+		return result;
+	}
+
+	void releaseBackBufferTargets()
+	{
+		if (m_depthStencil != 0)
+		{
+			m_depthStencil->Release();
+			m_depthStencil = 0;
+		}
+		if (m_depthTexture != 0)
+		{
+			m_depthTexture->Release();
+			m_depthTexture = 0;
+		}
+		if (m_renderTarget != 0)
+		{
+			m_renderTarget->Release();
+			m_renderTarget = 0;
+		}
+	}
+
+	HRESULT findOrCreateBlendState(const D3D11_BLEND_DESC &descriptor,
+		ID3D11BlendState **state)
+	{
+		for (unsigned int index = 0; index < m_blendStates.size(); ++index)
+		{
+			if (memcmp(&m_blendStates[index].descriptor, &descriptor,
+				sizeof(descriptor)) == 0)
+			{
+				*state = m_blendStates[index].state;
+				return S_OK;
+			}
+		}
+		if (m_blendStates.size() >= 256)
+		{
+			return E_OUTOFMEMORY;
+		}
+		BlendStateEntry entry;
+		entry.descriptor = descriptor;
+		entry.state = 0;
+		HRESULT result = m_device->CreateBlendState(&descriptor, &entry.state);
+		if (FAILED(result))
+		{
+			return result;
+		}
+		try
+		{
+			m_blendStates.push_back(entry);
+		}
+		catch (...)
+		{
+			entry.state->Release();
+			return E_OUTOFMEMORY;
+		}
+		*state = entry.state;
+		return S_OK;
+	}
+
+	HRESULT findOrCreateDepthState(const D3D11_DEPTH_STENCIL_DESC &descriptor,
+		ID3D11DepthStencilState **state)
+	{
+		for (unsigned int index = 0; index < m_depthStates.size(); ++index)
+		{
+			if (memcmp(&m_depthStates[index].descriptor, &descriptor,
+				sizeof(descriptor)) == 0)
+			{
+				*state = m_depthStates[index].state;
+				return S_OK;
+			}
+		}
+		if (m_depthStates.size() >= 256)
+		{
+			return E_OUTOFMEMORY;
+		}
+		DepthStencilStateEntry entry;
+		entry.descriptor = descriptor;
+		entry.state = 0;
+		HRESULT result = m_device->CreateDepthStencilState(&descriptor, &entry.state);
+		if (FAILED(result))
+		{
+			return result;
+		}
+		try
+		{
+			m_depthStates.push_back(entry);
+		}
+		catch (...)
+		{
+			entry.state->Release();
+			return E_OUTOFMEMORY;
+		}
+		*state = entry.state;
+		return S_OK;
+	}
+
+	HRESULT findOrCreateRasterizerState(const D3D11_RASTERIZER_DESC &descriptor,
+		ID3D11RasterizerState **state)
+	{
+		for (unsigned int index = 0; index < m_rasterizerStates.size(); ++index)
+		{
+			if (memcmp(&m_rasterizerStates[index].descriptor, &descriptor,
+				sizeof(descriptor)) == 0)
+			{
+				*state = m_rasterizerStates[index].state;
+				return S_OK;
+			}
+		}
+		if (m_rasterizerStates.size() >= 256)
+		{
+			return E_OUTOFMEMORY;
+		}
+		RasterizerStateEntry entry;
+		entry.descriptor = descriptor;
+		entry.state = 0;
+		HRESULT result = m_device->CreateRasterizerState(&descriptor, &entry.state);
+		if (FAILED(result))
+		{
+			return result;
+		}
+		try
+		{
+			m_rasterizerStates.push_back(entry);
+		}
+		catch (...)
+		{
+			entry.state->Release();
+			return E_OUTOFMEMORY;
+		}
+		*state = entry.state;
+		return S_OK;
+	}
+
+	HRESULT findOrCreateSamplerState(const D3D11_SAMPLER_DESC &descriptor,
+		ID3D11SamplerState **state)
+	{
+		for (unsigned int index = 0; index < m_samplerStates.size(); ++index)
+		{
+			if (memcmp(&m_samplerStates[index].descriptor, &descriptor,
+				sizeof(descriptor)) == 0)
+			{
+				*state = m_samplerStates[index].state;
+				return S_OK;
+			}
+		}
+		if (m_samplerStates.size() >= 256)
+		{
+			return E_OUTOFMEMORY;
+		}
+		SamplerStateEntry entry;
+		entry.descriptor = descriptor;
+		entry.state = 0;
+		HRESULT result = m_device->CreateSamplerState(&descriptor, &entry.state);
+		if (FAILED(result))
+		{
+			return result;
+		}
+		try
+		{
+			m_samplerStates.push_back(entry);
+		}
+		catch (...)
+		{
+			entry.state->Release();
+			return E_OUTOFMEMORY;
+		}
+		*state = entry.state;
+		return S_OK;
 	}
 
 	HRESULT createSwapChain(HWND window)
@@ -540,13 +1347,19 @@ private:
 
 	bool releaseSlot(GpuHandle handle, ResourceSlot &slot)
 	{
+		if (slot.view != 0)
+		{
+			slot.view->Release();
+		}
 		if (slot.resource != 0)
 		{
 			slot.resource->Release();
 		}
 		slot.resource = 0;
+		slot.view = 0;
 		slot.kind = RESOURCE_NONE;
 		slot.usage = RENDER_USAGE_DEFAULT;
+		slot.binding = 0;
 		slot.byteCount = 0;
 		slot.shadow.clear();
 		return m_handles->release(handle);
@@ -555,11 +1368,19 @@ private:
 	void shutdownInternal()
 	{
 		m_frameOpen = false;
+		m_pipelineBound = false;
+		m_vertexBufferBound = false;
+		m_topologyBound = false;
 		if (m_handles != 0)
 		{
 			for (unsigned int i = 0; i < m_resources.size(); ++i)
 			{
 				ResourceSlot &slot = m_resources[i];
+				if (slot.view != 0)
+				{
+					slot.view->Release();
+					slot.view = 0;
+				}
 				if (slot.resource != 0)
 				{
 					slot.resource->Release();
@@ -576,11 +1397,67 @@ private:
 			m_context->ClearState();
 			m_context->Flush();
 		}
+		releasePipelineResources();
+		releaseBackBufferTargets();
 		releaseDeviceObjects();
 		m_ownerThread = 0;
 		m_initialized = false;
 		m_width = 0;
 		m_height = 0;
+	}
+
+	void releasePipelineResources()
+	{
+		for (unsigned int index = 0; index < m_blendStates.size(); ++index)
+		{
+			m_blendStates[index].state->Release();
+		}
+		m_blendStates.clear();
+		for (unsigned int index = 0; index < m_depthStates.size(); ++index)
+		{
+			m_depthStates[index].state->Release();
+		}
+		m_depthStates.clear();
+		for (unsigned int index = 0; index < m_rasterizerStates.size(); ++index)
+		{
+			m_rasterizerStates[index].state->Release();
+		}
+		m_rasterizerStates.clear();
+		for (unsigned int index = 0; index < m_samplerStates.size(); ++index)
+		{
+			m_samplerStates[index].state->Release();
+		}
+		m_samplerStates.clear();
+		if (m_texturedLayout != 0)
+		{
+			m_texturedLayout->Release();
+			m_texturedLayout = 0;
+		}
+		if (m_texturedPixelShader != 0)
+		{
+			m_texturedPixelShader->Release();
+			m_texturedPixelShader = 0;
+		}
+		if (m_texturedVertexShader != 0)
+		{
+			m_texturedVertexShader->Release();
+			m_texturedVertexShader = 0;
+		}
+		if (m_positionColorLayout != 0)
+		{
+			m_positionColorLayout->Release();
+			m_positionColorLayout = 0;
+		}
+		if (m_pixelShader != 0)
+		{
+			m_pixelShader->Release();
+			m_pixelShader = 0;
+		}
+		if (m_vertexShader != 0)
+		{
+			m_vertexShader->Release();
+			m_vertexShader = 0;
+		}
 	}
 
 	void releaseDeviceObjects()
@@ -605,11 +1482,27 @@ private:
 	ID3D11Device *m_device;
 	ID3D11DeviceContext *m_context;
 	IDXGISwapChain1 *m_swapChain;
+	ID3D11RenderTargetView *m_renderTarget;
+	ID3D11Texture2D *m_depthTexture;
+	ID3D11DepthStencilView *m_depthStencil;
+	ID3D11VertexShader *m_vertexShader;
+	ID3D11PixelShader *m_pixelShader;
+	ID3D11InputLayout *m_positionColorLayout;
+	ID3D11VertexShader *m_texturedVertexShader;
+	ID3D11PixelShader *m_texturedPixelShader;
+	ID3D11InputLayout *m_texturedLayout;
 	GpuHandleAllocator *m_handles;
 	std::vector<ResourceSlot> m_resources;
+	std::vector<BlendStateEntry> m_blendStates;
+	std::vector<DepthStencilStateEntry> m_depthStates;
+	std::vector<RasterizerStateEntry> m_rasterizerStates;
+	std::vector<SamplerStateEntry> m_samplerStates;
 	DWORD m_ownerThread;
 	bool m_initialized;
 	bool m_frameOpen;
+	bool m_pipelineBound;
+	bool m_vertexBufferBound;
+	bool m_topologyBound;
 	bool m_enableVsync;
 	unsigned int m_width;
 	unsigned int m_height;
