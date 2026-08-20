@@ -1002,8 +1002,8 @@ int testD3D11HeadlessDevice()
 		rts::render::RENDER_RESULT_OK && buffer.isValid(),
 		"D3D11 dynamic buffer receives a logical handle");
 	result |= check(device->recoverDevice() ==
-		rts::render::RENDER_RESULT_UNSUPPORTED,
-		"D3D11 recovery refuses to invalidate live logical resources");
+		rts::render::RENDER_RESULT_OK,
+		"D3D11 recovery recreates live logical resources without changing handles");
 	unsigned int values[4] = { 1, 2, 3, 4 };
 	result |= check(device->immediateContext()->beginFrame() ==
 		rts::render::RENDER_RESULT_OK &&
@@ -1012,6 +1012,16 @@ int testD3D11HeadlessDevice()
 		device->immediateContext()->endFrame() ==
 			rts::render::RENDER_RESULT_OK,
 		"owner context maps and updates dynamic buffers");
+	values[0] = 9;
+	result |= check(device->recoverDevice() ==
+		rts::render::RENDER_RESULT_OK &&
+		device->immediateContext()->beginFrame() ==
+			rts::render::RENDER_RESULT_OK &&
+		device->immediateContext()->updateBuffer(buffer, values,
+			sizeof(values), 0) == rts::render::RENDER_RESULT_OK &&
+		device->immediateContext()->endFrame() ==
+			rts::render::RENDER_RESULT_OK,
+		"recreated dynamic buffers retain their logical handle and update path");
 	result |= check(device->destroyResource(buffer) &&
 		!device->destroyResource(buffer),
 		"D3D11 resource destruction rejects stale handles");

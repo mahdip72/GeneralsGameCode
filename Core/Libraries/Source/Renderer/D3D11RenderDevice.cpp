@@ -243,7 +243,12 @@ struct ResourceSlot
 	RenderUsage usage;
 	unsigned int binding;
 	size_t byteCount;
+	BufferDescriptor bufferDescriptor;
+	TextureDescriptor textureDescriptor;
 	std::vector<unsigned char> shadow;
+	std::vector<size_t> subresourceOffsets;
+	std::vector<size_t> subresourceRowPitches;
+	std::vector<size_t> subresourceSlicePitches;
 };
 
 struct LegacyTransformConstants
@@ -327,59 +332,11 @@ public:
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 
-		UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-		if (parameters.enableDebugLayer)
-		{
-			flags |= D3D11_CREATE_DEVICE_DEBUG;
-		}
-		const D3D_FEATURE_LEVEL requestedLevel = D3D_FEATURE_LEVEL_11_0;
-		D3D_FEATURE_LEVEL obtainedLevel = D3D_FEATURE_LEVEL_9_1;
-		IDXGIAdapter1 *selectedAdapter = 0;
-		if (parameters.adapterIndex != UINT_MAX)
-		{
-			IDXGIFactory1 *factory = 0;
-			HRESULT adapterResult = CreateDXGIFactory1(__uuidof(IDXGIFactory1),
-				reinterpret_cast<void **>(&factory));
-			if (SUCCEEDED(adapterResult))
-			{
-				adapterResult = factory->EnumAdapters1(parameters.adapterIndex,
-					&selectedAdapter);
-				factory->Release();
-			}
-			if (FAILED(adapterResult) || selectedAdapter == 0)
-			{
-				if (selectedAdapter != 0)
-				{
-					selectedAdapter->Release();
-				}
-				return RENDER_RESULT_INVALID_ARGUMENT;
-			}
-		}
-		const D3D_DRIVER_TYPE driverType = selectedAdapter == 0 ?
-			D3D_DRIVER_TYPE_HARDWARE : D3D_DRIVER_TYPE_UNKNOWN;
-		HRESULT result = D3D11CreateDevice(selectedAdapter, driverType, 0,
-			flags, &requestedLevel, 1, D3D11_SDK_VERSION, &m_device,
-			&obtainedLevel, &m_context);
-		if (selectedAdapter != 0)
-		{
-			selectedAdapter->Release();
-		}
-		if (FAILED(result) && parameters.adapterIndex == UINT_MAX &&
-			parameters.allowSoftwareFallback)
-		{
-			result = D3D11CreateDevice(0, D3D_DRIVER_TYPE_WARP, 0,
-				flags, &requestedLevel, 1, D3D11_SDK_VERSION, &m_device,
-				&obtainedLevel, &m_context);
-		}
+		HRESULT result = createNativeDevice(parameters);
 		if (FAILED(result))
 		{
 			releaseDeviceObjects();
 			return TranslateResult(result);
-		}
-		if (obtainedLevel != D3D_FEATURE_LEVEL_11_0)
-		{
-			releaseDeviceObjects();
-			return RENDER_RESULT_UNSUPPORTED;
 		}
 
 		try
@@ -502,21 +459,19 @@ public:
 		slot.usage = descriptor.usage;
 		slot.binding = descriptor.binding;
 		slot.byteCount = descriptor.byteCount;
-		if (descriptor.usage == RENDER_USAGE_DYNAMIC)
+		slot.bufferDescriptor = descriptor;
+		try
 		{
-			try
+			slot.shadow.assign(descriptor.byteCount, 0);
+			if (initialData != 0)
 			{
-				slot.shadow.assign(descriptor.byteCount, 0);
-				if (initialData != 0)
-				{
-					memcpy(&slot.shadow[0], initialData, descriptor.byteCount);
-				}
+				memcpy(&slot.shadow[0], initialData, descriptor.byteCount);
 			}
-			catch (...)
-			{
-				releaseSlot(handle, slot);
-				return RENDER_RESULT_OUT_OF_MEMORY;
-			}
+		}
+		catch (...)
+		{
+			releaseSlot(handle, slot);
+			return RENDER_RESULT_OUT_OF_MEMORY;
 		}
 		*buffer = handle;
 		return RENDER_RESULT_OK;
@@ -624,6 +579,7 @@ public:
 		slot.usage = descriptor.usage;
 		slot.binding = descriptor.binding;
 		slot.byteCount = 0;
+		slot.textureDescriptor = descriptor;
 		if ((descriptor.binding & RENDER_TEXTURE_SHADER_RESOURCE) != 0)
 		{
 			D3D11_SHADER_RESOURCE_VIEW_DESC viewDescriptor;
@@ -677,6 +633,52 @@ public:
 				return TranslateResult(viewResult);
 			}
 		}
+		if (initialData != 0)
+		{
+			try
+			{
+				size_t totalBytes = 0;
+				slot.subresourceOffsets.resize(initialDataCount);
+				slot.subresourceRowPitches.resize(initialDataCount);
+				slot.subresourceSlicePitches.resize(initialDataCount);
+				for (unsigned int i = 0; i < initialDataCount; ++i)
+				{
+					const unsigned int mip = i % descriptor.mipCount;
+					const unsigned int mipHeight = descriptor.height >> mip;
+					const size_t rowCount = mipHeight == 0 ? 1 : mipHeight;
+					if (initialData[i].rowPitch > static_cast<size_t>(-1) / rowCount)
+					{
+						releaseSlot(handle, slot);
+						return RENDER_RESULT_INVALID_ARGUMENT;
+					}
+					const size_t minimumBytes = initialData[i].rowPitch * rowCount;
+					const size_t copyBytes = initialData[i].slicePitch > minimumBytes ?
+						initialData[i].slicePitch : minimumBytes;
+					if (copyBytes > static_cast<size_t>(-1) - totalBytes)
+					{
+						releaseSlot(handle, slot);
+						return RENDER_RESULT_INVALID_ARGUMENT;
+					}
+					slot.subresourceOffsets[i] = totalBytes;
+					slot.subresourceRowPitches[i] = initialData[i].rowPitch;
+					slot.subresourceSlicePitches[i] = initialData[i].slicePitch;
+					totalBytes += copyBytes;
+				}
+				slot.shadow.resize(totalBytes);
+				for (unsigned int i = 0; i < initialDataCount; ++i)
+				{
+					const size_t nextOffset = i + 1 < initialDataCount ?
+						slot.subresourceOffsets[i + 1] : totalBytes;
+					memcpy(&slot.shadow[slot.subresourceOffsets[i]],
+						initialData[i].data, nextOffset - slot.subresourceOffsets[i]);
+				}
+			}
+			catch (...)
+			{
+				releaseSlot(handle, slot);
+				return RENDER_RESULT_OUT_OF_MEMORY;
+			}
+		}
 		*texture = handle;
 		return RENDER_RESULT_OK;
 	}
@@ -725,13 +727,60 @@ public:
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
-		if (m_handles != 0 && m_handles->liveCount() != 0)
+		m_context->ClearState();
+		m_context->Flush();
+		for (unsigned int i = 0; i < m_resources.size(); ++i)
 		{
-			return RENDER_RESULT_UNSUPPORTED;
+			releaseNativeSlot(m_resources[i]);
 		}
-		const RenderDeviceParameters parameters = m_parameters;
-		shutdownInternal();
-		return initialize(parameters);
+		releasePipelineResources();
+		releaseBackBufferTargets();
+		releaseDeviceObjects();
+		HRESULT result = createNativeDevice(m_parameters);
+		if (SUCCEEDED(result) && m_parameters.window != 0)
+		{
+			result = createSwapChain(static_cast<HWND>(m_parameters.window));
+			if (SUCCEEDED(result))
+			{
+				result = createBackBufferTargets();
+			}
+		}
+		if (SUCCEEDED(result))
+		{
+			result = createPipelineResources();
+		}
+		for (unsigned int i = 0; SUCCEEDED(result) &&
+			i < m_resources.size(); ++i)
+		{
+			ResourceSlot &slot = m_resources[i];
+			if (slot.kind == RESOURCE_BUFFER)
+			{
+				result = recreateBuffer(slot);
+			}
+			else if (slot.kind == RESOURCE_TEXTURE)
+			{
+				result = recreateTexture(slot);
+			}
+		}
+		if (FAILED(result))
+		{
+			for (unsigned int i = 0; i < m_resources.size(); ++i)
+			{
+				releaseNativeSlot(m_resources[i]);
+			}
+			releasePipelineResources();
+			releaseBackBufferTargets();
+			releaseDeviceObjects();
+			m_initialized = false;
+			return TranslateResult(result);
+		}
+		m_activeRenderTarget = m_renderTarget;
+		m_activeDepthStencil = m_depthStencil;
+		m_pipelineBound = false;
+		m_vertexBufferBound = false;
+		m_indexBufferBound = false;
+		m_topologyBound = false;
+		return RENDER_RESULT_OK;
 	}
 
 	virtual RenderResult resize(unsigned int width, unsigned int height)
@@ -812,9 +861,9 @@ public:
 		{
 			return RENDER_RESULT_UNSUPPORTED;
 		}
+		memcpy(&slot.shadow[destinationOffset], data, byteCount);
 		if (slot.usage == RENDER_USAGE_DYNAMIC)
 		{
-			memcpy(&slot.shadow[destinationOffset], data, byteCount);
 			D3D11_MAPPED_SUBRESOURCE mapped;
 			const HRESULT result = m_context->Map(slot.resource, 0,
 				D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -1670,6 +1719,164 @@ private:
 		return S_OK;
 	}
 
+	void releaseNativeSlot(ResourceSlot &slot)
+	{
+		if (slot.depthStencil != 0)
+		{
+			slot.depthStencil->Release();
+			slot.depthStencil = 0;
+		}
+		if (slot.renderTarget != 0)
+		{
+			slot.renderTarget->Release();
+			slot.renderTarget = 0;
+		}
+		if (slot.view != 0)
+		{
+			slot.view->Release();
+			slot.view = 0;
+		}
+		if (slot.resource != 0)
+		{
+			slot.resource->Release();
+			slot.resource = 0;
+		}
+	}
+
+	HRESULT recreateBuffer(ResourceSlot &slot)
+	{
+		const BufferDescriptor &descriptor = slot.bufferDescriptor;
+		D3D11_BUFFER_DESC nativeDescriptor;
+		memset(&nativeDescriptor, 0, sizeof(nativeDescriptor));
+		nativeDescriptor.ByteWidth = static_cast<UINT>(descriptor.byteCount);
+		if ((descriptor.binding & RENDER_BUFFER_VERTEX) != 0)
+		{
+			nativeDescriptor.BindFlags |= D3D11_BIND_VERTEX_BUFFER;
+		}
+		if ((descriptor.binding & RENDER_BUFFER_INDEX) != 0)
+		{
+			nativeDescriptor.BindFlags |= D3D11_BIND_INDEX_BUFFER;
+		}
+		if ((descriptor.binding & RENDER_BUFFER_CONSTANT) != 0)
+		{
+			nativeDescriptor.BindFlags |= D3D11_BIND_CONSTANT_BUFFER;
+		}
+		setNativeUsage(descriptor.usage, &nativeDescriptor.Usage,
+			&nativeDescriptor.CPUAccessFlags);
+		D3D11_SUBRESOURCE_DATA initialData;
+		memset(&initialData, 0, sizeof(initialData));
+		initialData.pSysMem = slot.shadow.empty() ? 0 : &slot.shadow[0];
+		return m_device->CreateBuffer(&nativeDescriptor,
+			initialData.pSysMem == 0 ? 0 : &initialData,
+			reinterpret_cast<ID3D11Buffer **>(&slot.resource));
+	}
+
+	HRESULT recreateTexture(ResourceSlot &slot)
+	{
+		const TextureDescriptor &descriptor = slot.textureDescriptor;
+		const DXGI_FORMAT format = TranslateFormat(descriptor.format);
+		D3D11_TEXTURE2D_DESC nativeDescriptor;
+		memset(&nativeDescriptor, 0, sizeof(nativeDescriptor));
+		nativeDescriptor.Width = descriptor.width;
+		nativeDescriptor.Height = descriptor.height;
+		nativeDescriptor.MipLevels = descriptor.mipCount;
+		nativeDescriptor.ArraySize = descriptor.arrayCount;
+		nativeDescriptor.Format = format;
+		nativeDescriptor.SampleDesc.Count = 1;
+		if (descriptor.dimension == RENDER_TEXTURE_CUBE)
+		{
+			nativeDescriptor.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
+		}
+		if ((descriptor.binding & RENDER_TEXTURE_SHADER_RESOURCE) != 0)
+		{
+			nativeDescriptor.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
+		}
+		if ((descriptor.binding & RENDER_TEXTURE_RENDER_TARGET) != 0)
+		{
+			nativeDescriptor.BindFlags |= D3D11_BIND_RENDER_TARGET;
+		}
+		if ((descriptor.binding & RENDER_TEXTURE_DEPTH_STENCIL) != 0)
+		{
+			nativeDescriptor.BindFlags |= D3D11_BIND_DEPTH_STENCIL;
+		}
+		setNativeUsage(descriptor.usage, &nativeDescriptor.Usage,
+			&nativeDescriptor.CPUAccessFlags);
+		std::vector<D3D11_SUBRESOURCE_DATA> initialData;
+		if (!slot.subresourceOffsets.empty())
+		{
+			try
+			{
+				initialData.resize(slot.subresourceOffsets.size());
+			}
+			catch (...)
+			{
+				return E_OUTOFMEMORY;
+			}
+			for (unsigned int i = 0; i < initialData.size(); ++i)
+			{
+				initialData[i].pSysMem = &slot.shadow[slot.subresourceOffsets[i]];
+				initialData[i].SysMemPitch =
+					static_cast<UINT>(slot.subresourceRowPitches[i]);
+				initialData[i].SysMemSlicePitch =
+					static_cast<UINT>(slot.subresourceSlicePitches[i]);
+			}
+		}
+		ID3D11Texture2D *nativeTexture = 0;
+		HRESULT result = m_device->CreateTexture2D(&nativeDescriptor,
+			initialData.empty() ? 0 : &initialData[0], &nativeTexture);
+		if (FAILED(result))
+		{
+			return result;
+		}
+		slot.resource = nativeTexture;
+		if ((descriptor.binding & RENDER_TEXTURE_SHADER_RESOURCE) != 0)
+		{
+			D3D11_SHADER_RESOURCE_VIEW_DESC viewDescriptor;
+			D3D11_SHADER_RESOURCE_VIEW_DESC *viewDescriptorPointer = 0;
+			if (descriptor.dimension == RENDER_TEXTURE_CUBE)
+			{
+				memset(&viewDescriptor, 0, sizeof(viewDescriptor));
+				viewDescriptor.Format = format;
+				if (descriptor.arrayCount == 6)
+				{
+					viewDescriptor.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
+					viewDescriptor.TextureCube.MostDetailedMip = 0;
+					viewDescriptor.TextureCube.MipLevels = descriptor.mipCount;
+				}
+				else
+				{
+					viewDescriptor.ViewDimension =
+						D3D11_SRV_DIMENSION_TEXTURECUBEARRAY;
+					viewDescriptor.TextureCubeArray.MostDetailedMip = 0;
+					viewDescriptor.TextureCubeArray.MipLevels = descriptor.mipCount;
+					viewDescriptor.TextureCubeArray.First2DArrayFace = 0;
+					viewDescriptor.TextureCubeArray.NumCubes =
+						descriptor.arrayCount / 6;
+				}
+				viewDescriptorPointer = &viewDescriptor;
+			}
+			result = m_device->CreateShaderResourceView(nativeTexture,
+				viewDescriptorPointer, &slot.view);
+		}
+		if (SUCCEEDED(result) &&
+			(descriptor.binding & RENDER_TEXTURE_RENDER_TARGET) != 0)
+		{
+			result = m_device->CreateRenderTargetView(nativeTexture, 0,
+				&slot.renderTarget);
+		}
+		if (SUCCEEDED(result) &&
+			(descriptor.binding & RENDER_TEXTURE_DEPTH_STENCIL) != 0)
+		{
+			result = m_device->CreateDepthStencilView(nativeTexture, 0,
+				&slot.depthStencil);
+		}
+		if (FAILED(result))
+		{
+			releaseNativeSlot(slot);
+		}
+		return result;
+	}
+
 	HRESULT createBackBufferTargets()
 	{
 		if (m_swapChain == 0)
@@ -2125,6 +2332,60 @@ private:
 		return result;
 	}
 
+	HRESULT createNativeDevice(const RenderDeviceParameters &parameters)
+	{
+		UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+		if (parameters.enableDebugLayer)
+		{
+			flags |= D3D11_CREATE_DEVICE_DEBUG;
+		}
+		const D3D_FEATURE_LEVEL requestedLevel = D3D_FEATURE_LEVEL_11_0;
+		D3D_FEATURE_LEVEL obtainedLevel = D3D_FEATURE_LEVEL_9_1;
+		IDXGIAdapter1 *selectedAdapter = 0;
+		if (parameters.adapterIndex != UINT_MAX)
+		{
+			IDXGIFactory1 *factory = 0;
+			HRESULT adapterResult = CreateDXGIFactory1(__uuidof(IDXGIFactory1),
+				reinterpret_cast<void **>(&factory));
+			if (SUCCEEDED(adapterResult))
+			{
+				adapterResult = factory->EnumAdapters1(parameters.adapterIndex,
+					&selectedAdapter);
+				factory->Release();
+			}
+			if (FAILED(adapterResult) || selectedAdapter == 0)
+			{
+				if (selectedAdapter != 0)
+				{
+					selectedAdapter->Release();
+				}
+				return E_INVALIDARG;
+			}
+		}
+		const D3D_DRIVER_TYPE driverType = selectedAdapter == 0 ?
+			D3D_DRIVER_TYPE_HARDWARE : D3D_DRIVER_TYPE_UNKNOWN;
+		HRESULT result = D3D11CreateDevice(selectedAdapter, driverType, 0,
+			flags, &requestedLevel, 1, D3D11_SDK_VERSION, &m_device,
+			&obtainedLevel, &m_context);
+		if (selectedAdapter != 0)
+		{
+			selectedAdapter->Release();
+		}
+		if (FAILED(result) && parameters.adapterIndex == UINT_MAX &&
+			parameters.allowSoftwareFallback)
+		{
+			result = D3D11CreateDevice(0, D3D_DRIVER_TYPE_WARP, 0,
+				flags, &requestedLevel, 1, D3D11_SDK_VERSION, &m_device,
+				&obtainedLevel, &m_context);
+		}
+		if (SUCCEEDED(result) && obtainedLevel != D3D_FEATURE_LEVEL_11_0)
+		{
+			releaseDeviceObjects();
+			return DXGI_ERROR_UNSUPPORTED;
+		}
+		return result;
+	}
+
 	bool releaseSlot(GpuHandle handle, ResourceSlot &slot)
 	{
 		if (slot.depthStencil != 0)
@@ -2152,6 +2413,9 @@ private:
 		slot.binding = 0;
 		slot.byteCount = 0;
 		slot.shadow.clear();
+		slot.subresourceOffsets.clear();
+		slot.subresourceRowPitches.clear();
+		slot.subresourceSlicePitches.clear();
 		return m_handles->release(handle);
 	}
 
