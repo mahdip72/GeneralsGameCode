@@ -373,6 +373,42 @@ int testD3D11HiddenSwapChain()
 		rts::render::IRenderContext *context = device->immediateContext();
 		rts::render::LegacyLogicalState logicalState;
 		const rts::render::RenderFloat4 clearColor(0.0f, 0.0f, 1.0f, 1.0f);
+		rts::render::TextureDescriptor offscreenColorDescriptor;
+		offscreenColorDescriptor.width = 16;
+		offscreenColorDescriptor.height = 16;
+		offscreenColorDescriptor.format =
+			rts::render::RENDER_FORMAT_R8G8B8A8_UNORM;
+		offscreenColorDescriptor.binding =
+			rts::render::RENDER_TEXTURE_RENDER_TARGET |
+			rts::render::RENDER_TEXTURE_SHADER_RESOURCE;
+		offscreenColorDescriptor.usage = rts::render::RENDER_USAGE_DEFAULT;
+		rts::render::GpuHandle offscreenColor;
+		rts::render::TextureDescriptor offscreenDepthDescriptor;
+		offscreenDepthDescriptor.width = 16;
+		offscreenDepthDescriptor.height = 16;
+		offscreenDepthDescriptor.format =
+			rts::render::RENDER_FORMAT_D24_UNORM_S8_UINT;
+		offscreenDepthDescriptor.binding =
+			rts::render::RENDER_TEXTURE_DEPTH_STENCIL;
+		offscreenDepthDescriptor.usage = rts::render::RENDER_USAGE_DEFAULT;
+		rts::render::GpuHandle offscreenDepth;
+		result |= check(device->createTexture(offscreenColorDescriptor, 0, 0,
+			&offscreenColor) == rts::render::RENDER_RESULT_OK &&
+			device->createTexture(offscreenDepthDescriptor, 0, 0,
+				&offscreenDepth) == rts::render::RENDER_RESULT_OK &&
+			context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->setRenderTargets(offscreenColor, offscreenDepth) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->clear(rts::render::RenderFloat4(0.25f, 0.5f, 0.75f, 1.0f),
+				1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setRenderTargets(rts::render::GpuHandle(), offscreenDepth) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->clear(rts::render::RenderFloat4(), 1.0f, 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setRenderTargets(rts::render::GpuHandle(),
+				rts::render::GpuHandle()) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK,
+			"D3D11 parity pipeline binds color/depth and depth-only targets before restoring the swap chain");
 		result |= check(context != 0 &&
 			context->beginFrame() == rts::render::RENDER_RESULT_OK &&
 			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
@@ -634,6 +670,8 @@ int testD3D11HiddenSwapChain()
 			device->destroyResource(indexBuffer) &&
 			device->destroyResource(texturedVertexBuffer) &&
 			device->destroyResource(texture) &&
+			device->destroyResource(offscreenColor) &&
+			device->destroyResource(offscreenDepth) &&
 			device->present() == rts::render::RENDER_RESULT_OK &&
 			device->resize(96, 80) == rts::render::RENDER_RESULT_OK &&
 			device->present() == rts::render::RENDER_RESULT_OK,

@@ -181,13 +181,16 @@ struct SamplerStateEntry
 
 struct ResourceSlot
 {
-	ResourceSlot() : resource(0), view(0), kind(RESOURCE_NONE),
+	ResourceSlot() : resource(0), view(0), renderTarget(0), depthStencil(0),
+		kind(RESOURCE_NONE),
 		usage(RENDER_USAGE_DEFAULT), binding(0), byteCount(0)
 	{
 	}
 
 	ID3D11Resource *resource;
 	ID3D11ShaderResourceView *view;
+	ID3D11RenderTargetView *renderTarget;
+	ID3D11DepthStencilView *depthStencil;
 	ResourceKind kind;
 	RenderUsage usage;
 	unsigned int binding;
@@ -229,6 +232,7 @@ class D3D11RenderDevice : public IRenderDevice, public IRenderContext
 public:
 	D3D11RenderDevice() : m_device(0), m_context(0), m_swapChain(0),
 		m_renderTarget(0), m_depthTexture(0), m_depthStencil(0),
+		m_activeRenderTarget(0), m_activeDepthStencil(0),
 		m_vertexShader(0), m_pixelShader(0), m_positionColorLayout(0),
 		m_texturedVertexShader(0), m_texturedPixelShader(0),
 		m_texturedLayout(0),
@@ -496,7 +500,6 @@ public:
 					static_cast<UINT>(initialData[i].slicePitch);
 			}
 		}
-
 		ID3D11Texture2D *nativeTexture = 0;
 		const HRESULT result = m_device->CreateTexture2D(&nativeDescriptor,
 			nativeInitialData.empty() ? 0 : &nativeInitialData[0], &nativeTexture);
@@ -526,6 +529,26 @@ public:
 				return TranslateResult(viewResult);
 			}
 		}
+		if ((descriptor.binding & RENDER_TEXTURE_RENDER_TARGET) != 0)
+		{
+			const HRESULT viewResult = m_device->CreateRenderTargetView(
+				nativeTexture, 0, &slot.renderTarget);
+			if (FAILED(viewResult))
+			{
+				releaseSlot(handle, slot);
+				return TranslateResult(viewResult);
+			}
+		}
+		if ((descriptor.binding & RENDER_TEXTURE_DEPTH_STENCIL) != 0)
+		{
+			const HRESULT viewResult = m_device->CreateDepthStencilView(
+				nativeTexture, 0, &slot.depthStencil);
+			if (FAILED(viewResult))
+			{
+				releaseSlot(handle, slot);
+				return TranslateResult(viewResult);
+			}
+		}
 		*texture = handle;
 		return RENDER_RESULT_OK;
 	}
@@ -542,6 +565,13 @@ public:
 			ID3D11ShaderResourceView *emptyViews[LEGACY_TEXTURE_STAGE_COUNT] = { 0 };
 			m_context->PSSetShaderResources(0, LEGACY_TEXTURE_STAGE_COUNT,
 				emptyViews);
+			if (slot.renderTarget == m_activeRenderTarget ||
+				slot.depthStencil == m_activeDepthStencil)
+			{
+				m_context->OMSetRenderTargets(1, &m_renderTarget, m_depthStencil);
+				m_activeRenderTarget = m_renderTarget;
+				m_activeDepthStencil = m_depthStencil;
+			}
 		}
 		else if (slot.kind == RESOURCE_BUFFER)
 		{
@@ -611,6 +641,8 @@ public:
 		{
 			m_context->OMSetRenderTargets(1, &m_renderTarget, m_depthStencil);
 		}
+		m_activeRenderTarget = m_renderTarget;
+		m_activeDepthStencil = m_depthStencil;
 		m_pipelineBound = false;
 		m_vertexBufferBound = false;
 		m_indexBufferBound = false;
@@ -666,19 +698,75 @@ public:
 	virtual RenderResult clear(const RenderFloat4 &color, float depth,
 		unsigned int stencil)
 	{
-		if (!isOwner() || !m_frameOpen || m_renderTarget == 0 ||
+		if (!isOwner() || !m_frameOpen ||
+			(m_activeRenderTarget == 0 && m_activeDepthStencil == 0) ||
 			depth < 0.0f || depth > 1.0f)
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		const float nativeColor[4] = { color.x, color.y, color.z, color.w };
-		m_context->ClearRenderTargetView(m_renderTarget, nativeColor);
-		if (m_depthStencil != 0)
+		if (m_activeRenderTarget != 0)
 		{
-			m_context->ClearDepthStencilView(m_depthStencil,
+			m_context->ClearRenderTargetView(m_activeRenderTarget, nativeColor);
+		}
+		if (m_activeDepthStencil != 0)
+		{
+			m_context->ClearDepthStencilView(m_activeDepthStencil,
 				D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, depth,
 				static_cast<UINT8>(stencil));
 		}
+		return RENDER_RESULT_OK;
+	}
+
+	virtual RenderResult setRenderTargets(GpuHandle colorTarget,
+		GpuHandle depthTarget)
+	{
+		if (!isOwner() || !m_frameOpen)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		if (!colorTarget.isValid() && !depthTarget.isValid())
+		{
+			if (m_renderTarget == 0)
+			{
+				return RENDER_RESULT_UNSUPPORTED;
+			}
+			m_context->OMSetRenderTargets(1, &m_renderTarget, m_depthStencil);
+			m_activeRenderTarget = m_renderTarget;
+			m_activeDepthStencil = m_depthStencil;
+			return RENDER_RESULT_OK;
+		}
+		if ((colorTarget.isValid() && !m_handles->isLive(colorTarget)) ||
+			(depthTarget.isValid() && !m_handles->isLive(depthTarget)))
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		ID3D11RenderTargetView *colorView = 0;
+		if (colorTarget.isValid())
+		{
+			ResourceSlot &colorSlot = m_resources[colorTarget.index()];
+			if (colorSlot.kind != RESOURCE_TEXTURE || colorSlot.renderTarget == 0)
+			{
+				return RENDER_RESULT_INVALID_ARGUMENT;
+			}
+			colorView = colorSlot.renderTarget;
+		}
+		ID3D11DepthStencilView *depthView = 0;
+		if (depthTarget.isValid())
+		{
+			ResourceSlot &depthSlot = m_resources[depthTarget.index()];
+			if (depthSlot.kind != RESOURCE_TEXTURE || depthSlot.depthStencil == 0)
+			{
+				return RENDER_RESULT_INVALID_ARGUMENT;
+			}
+			depthView = depthSlot.depthStencil;
+		}
+		ID3D11ShaderResourceView *emptyViews[LEGACY_TEXTURE_STAGE_COUNT] = { 0 };
+		m_context->PSSetShaderResources(0, LEGACY_TEXTURE_STAGE_COUNT, emptyViews);
+		m_context->OMSetRenderTargets(colorView == 0 ? 0 : 1,
+			colorView == 0 ? 0 : &colorView, depthView);
+		m_activeRenderTarget = colorView;
+		m_activeDepthStencil = depthView;
 		return RENDER_RESULT_OK;
 	}
 
@@ -1523,6 +1611,14 @@ private:
 
 	bool releaseSlot(GpuHandle handle, ResourceSlot &slot)
 	{
+		if (slot.depthStencil != 0)
+		{
+			slot.depthStencil->Release();
+		}
+		if (slot.renderTarget != 0)
+		{
+			slot.renderTarget->Release();
+		}
 		if (slot.view != 0)
 		{
 			slot.view->Release();
@@ -1533,6 +1629,8 @@ private:
 		}
 		slot.resource = 0;
 		slot.view = 0;
+		slot.renderTarget = 0;
+		slot.depthStencil = 0;
 		slot.kind = RESOURCE_NONE;
 		slot.usage = RENDER_USAGE_DEFAULT;
 		slot.binding = 0;
@@ -1553,6 +1651,16 @@ private:
 			for (unsigned int i = 0; i < m_resources.size(); ++i)
 			{
 				ResourceSlot &slot = m_resources[i];
+				if (slot.depthStencil != 0)
+				{
+					slot.depthStencil->Release();
+					slot.depthStencil = 0;
+				}
+				if (slot.renderTarget != 0)
+				{
+					slot.renderTarget->Release();
+					slot.renderTarget = 0;
+				}
 				if (slot.view != 0)
 				{
 					slot.view->Release();
@@ -1578,6 +1686,8 @@ private:
 		releaseBackBufferTargets();
 		releaseDeviceObjects();
 		m_ownerThread = 0;
+		m_activeRenderTarget = 0;
+		m_activeDepthStencil = 0;
 		m_initialized = false;
 		m_width = 0;
 		m_height = 0;
@@ -1672,6 +1782,8 @@ private:
 	ID3D11RenderTargetView *m_renderTarget;
 	ID3D11Texture2D *m_depthTexture;
 	ID3D11DepthStencilView *m_depthStencil;
+	ID3D11RenderTargetView *m_activeRenderTarget;
+	ID3D11DepthStencilView *m_activeDepthStencil;
 	ID3D11Buffer *m_transformConstants[TRANSFORM_CONSTANT_BUFFER_COUNT];
 	ID3D11VertexShader *m_vertexShader;
 	ID3D11PixelShader *m_pixelShader;

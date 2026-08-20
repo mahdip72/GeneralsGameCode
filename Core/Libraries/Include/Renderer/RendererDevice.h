@@ -163,6 +163,8 @@ public:
 		size_t byteCount, size_t destinationOffset) = 0;
 	virtual RenderResult clear(const RenderFloat4 &color, float depth,
 		unsigned int stencil) = 0;
+	virtual RenderResult setRenderTargets(GpuHandle colorTarget,
+		GpuHandle depthTarget) = 0;
 	virtual RenderResult setViewport(float x, float y, float width,
 		float height, float minimumDepth, float maximumDepth) = 0;
 	virtual RenderResult setLegacyState(const LegacyLogicalState &state,
