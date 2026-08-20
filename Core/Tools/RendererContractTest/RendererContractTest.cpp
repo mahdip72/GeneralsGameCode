@@ -721,6 +721,18 @@ int testD3D11HiddenSwapChain()
 int testD3D11HeadlessDevice()
 {
 	int result = 0;
+	rts::render::IRenderDevice *invalidAdapterDevice =
+		rts::render::CreateD3D11RenderDevice();
+	rts::render::RenderDeviceParameters invalidAdapterParameters;
+	invalidAdapterParameters.backend = rts::render::RENDER_BACKEND_D3D11;
+	invalidAdapterParameters.width = 64;
+	invalidAdapterParameters.height = 64;
+	invalidAdapterParameters.adapterIndex = 0xfffffffeU;
+	result |= check(invalidAdapterDevice != 0 &&
+		invalidAdapterDevice->initialize(invalidAdapterParameters) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+		"D3D11 explicit adapter selection rejects nonexistent adapters");
+	delete invalidAdapterDevice;
 	rts::render::IRenderDevice *device =
 		rts::render::CreateD3D11RenderDevice();
 	result |= check(device != 0, "D3D11 factory returns a device");

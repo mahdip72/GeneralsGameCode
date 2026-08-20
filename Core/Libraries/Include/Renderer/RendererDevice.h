@@ -100,8 +100,10 @@ struct RenderDeviceParameters
 	void *window;
 	unsigned int width;
 	unsigned int height;
+	unsigned int adapterIndex;
 	bool enableDebugLayer;
 	bool enableVsync;
+	bool allowSoftwareFallback;
 };
 
 struct BufferDescriptor

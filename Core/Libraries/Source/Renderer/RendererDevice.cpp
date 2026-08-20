@@ -181,7 +181,8 @@ unsigned int GpuHandleAllocator::liveCount() const
 
 RenderDeviceParameters::RenderDeviceParameters() :
 	backend(RENDER_BACKEND_DX8), window(0), width(0), height(0),
-	enableDebugLayer(false), enableVsync(true)
+	adapterIndex(UINT_MAX), enableDebugLayer(false), enableVsync(true),
+	allowSoftwareFallback(true)
 {
 }
 

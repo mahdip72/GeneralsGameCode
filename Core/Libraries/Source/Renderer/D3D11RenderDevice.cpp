@@ -281,10 +281,38 @@ public:
 		}
 		const D3D_FEATURE_LEVEL requestedLevel = D3D_FEATURE_LEVEL_11_0;
 		D3D_FEATURE_LEVEL obtainedLevel = D3D_FEATURE_LEVEL_9_1;
-		HRESULT result = D3D11CreateDevice(0, D3D_DRIVER_TYPE_HARDWARE, 0,
+		IDXGIAdapter1 *selectedAdapter = 0;
+		if (parameters.adapterIndex != UINT_MAX)
+		{
+			IDXGIFactory1 *factory = 0;
+			HRESULT adapterResult = CreateDXGIFactory1(__uuidof(IDXGIFactory1),
+				reinterpret_cast<void **>(&factory));
+			if (SUCCEEDED(adapterResult))
+			{
+				adapterResult = factory->EnumAdapters1(parameters.adapterIndex,
+					&selectedAdapter);
+				factory->Release();
+			}
+			if (FAILED(adapterResult) || selectedAdapter == 0)
+			{
+				if (selectedAdapter != 0)
+				{
+					selectedAdapter->Release();
+				}
+				return RENDER_RESULT_INVALID_ARGUMENT;
+			}
+		}
+		const D3D_DRIVER_TYPE driverType = selectedAdapter == 0 ?
+			D3D_DRIVER_TYPE_HARDWARE : D3D_DRIVER_TYPE_UNKNOWN;
+		HRESULT result = D3D11CreateDevice(selectedAdapter, driverType, 0,
 			flags, &requestedLevel, 1, D3D11_SDK_VERSION, &m_device,
 			&obtainedLevel, &m_context);
-		if (FAILED(result))
+		if (selectedAdapter != 0)
+		{
+			selectedAdapter->Release();
+		}
+		if (FAILED(result) && parameters.adapterIndex == UINT_MAX &&
+			parameters.allowSoftwareFallback)
 		{
 			result = D3D11CreateDevice(0, D3D_DRIVER_TYPE_WARP, 0,
 				flags, &requestedLevel, 1, D3D11_SDK_VERSION, &m_device,
