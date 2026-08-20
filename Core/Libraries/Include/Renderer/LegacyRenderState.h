@@ -308,6 +308,22 @@ struct LegacyLogicalState
 	LegacyFixedFunctionConstants constants;
 };
 
+enum LegacyTransformSlot
+{
+	LEGACY_TRANSFORM_WORLD,
+	LEGACY_TRANSFORM_VIEW,
+	LEGACY_TRANSFORM_PROJECTION,
+	LEGACY_TRANSFORM_TEXTURE0,
+	LEGACY_TRANSFORM_TEXTURE1,
+	LEGACY_TRANSFORM_TEXTURE2,
+	LEGACY_TRANSFORM_TEXTURE3,
+	LEGACY_TRANSFORM_TEXTURE4,
+	LEGACY_TRANSFORM_TEXTURE5,
+	LEGACY_TRANSFORM_TEXTURE6,
+	LEGACY_TRANSFORM_TEXTURE7,
+	LEGACY_TRANSFORM_COUNT
+};
+
 struct LegacyShaderKey
 {
 	enum { WORD_COUNT = 11 };
@@ -326,6 +342,8 @@ bool DecodeLegacyShaderBits(unsigned int shaderBits,
 	LegacyPipelineState *state);
 void TrackLegacyShaderBits(unsigned int shaderBits);
 bool GetTrackedLegacyPipelineState(LegacyPipelineState *state);
+bool TrackLegacyTransform(LegacyTransformSlot slot, const float *values);
+bool GetTrackedLegacyLogicalState(LegacyLogicalState *state);
 }
 }
 

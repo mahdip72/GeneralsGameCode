@@ -1182,11 +1182,11 @@ WWINLINE void DX8Wrapper::Set_Material(const VertexMaterialClass* material)
 
 WWINLINE void DX8Wrapper::Set_Shader(const ShaderClass& shader)
 {
+	rts::render::TrackLegacyShaderBits(shader.Get_Bits());
 	if (!ShaderClass::ShaderDirty && ((unsigned&)shader==(unsigned&)render_state.shader)) {
 		return;
 	}
 	render_state.shader=shader;
-	rts::render::TrackLegacyShaderBits(shader.Get_Bits());
 	render_state_changed|=SHADER_CHANGED;
 #ifdef MESH_RENDER_SNAPSHOT_ENABLED
 	StringClass str;
@@ -1206,9 +1206,14 @@ WWINLINE void DX8Wrapper::Set_Projection_Transform_With_Z_Bias(const Matrix4x4& 
 		tmp_zbias*=(1.0f/16.0f);
 		tmp_zbias*=1.0f / (ZFar - ZNear);
 		tmp.m[2][2]-=tmp_zbias*tmp.m[3][2];
+		rts::render::TrackLegacyTransform(
+			rts::render::LEGACY_TRANSFORM_PROJECTION, &tmp.m[0][0]);
 		DX8CALL(SetTransform(D3DTS_PROJECTION,&tmp));
 	}
 	else {
+		rts::render::TrackLegacyTransform(
+			rts::render::LEGACY_TRANSFORM_PROJECTION,
+			&ProjectionMatrix.m[0][0]);
 		DX8CALL(SetTransform(D3DTS_PROJECTION,&ProjectionMatrix));
 	}
 }
@@ -1218,17 +1223,24 @@ WWINLINE void DX8Wrapper::Set_Transform(D3DTRANSFORMSTATETYPE transform,const Ma
 	switch ((int)transform) {
 	case D3DTS_WORLD:
 		render_state.world=To_D3DMATRIX(m);
+		rts::render::TrackLegacyTransform(rts::render::LEGACY_TRANSFORM_WORLD,
+			&render_state.world.m[0][0]);
 		render_state_changed|=(unsigned)WORLD_CHANGED;
 		render_state_changed&=~(unsigned)WORLD_IDENTITY;
 		break;
 	case D3DTS_VIEW:
 		render_state.view=To_D3DMATRIX(m);
+		rts::render::TrackLegacyTransform(rts::render::LEGACY_TRANSFORM_VIEW,
+			&render_state.view.m[0][0]);
 		render_state_changed|=(unsigned)VIEW_CHANGED;
 		render_state_changed&=~(unsigned)VIEW_IDENTITY;
 		break;
 	case D3DTS_PROJECTION:
 		{
 			D3DMATRIX ProjectionMatrix=To_D3DMATRIX(m);
+			rts::render::TrackLegacyTransform(
+				rts::render::LEGACY_TRANSFORM_PROJECTION,
+				&ProjectionMatrix.m[0][0]);
 			ZFar=0.0f;
 			ZNear=0.0f;
 			DX8CALL(SetTransform(D3DTS_PROJECTION,&ProjectionMatrix));
@@ -1237,6 +1249,12 @@ WWINLINE void DX8Wrapper::Set_Transform(D3DTRANSFORMSTATETYPE transform,const Ma
 	default:
 		DX8_RECORD_MATRIX_CHANGE();
 		D3DMATRIX dxm=To_D3DMATRIX(m);
+		if (transform >= D3DTS_TEXTURE0 && transform <= D3DTS_TEXTURE7) {
+			rts::render::TrackLegacyTransform(
+				static_cast<rts::render::LegacyTransformSlot>(
+					rts::render::LEGACY_TRANSFORM_TEXTURE0 +
+					(transform - D3DTS_TEXTURE0)), &dxm.m[0][0]);
+		}
 		DX8CALL(SetTransform(transform,&dxm));
 		break;
 	}
@@ -1247,17 +1265,27 @@ WWINLINE void DX8Wrapper::Set_Transform(D3DTRANSFORMSTATETYPE transform,const Ma
 	switch ((int)transform) {
 	case D3DTS_WORLD:
 		render_state.world=To_D3DMATRIX(m);
+		rts::render::TrackLegacyTransform(rts::render::LEGACY_TRANSFORM_WORLD,
+			&render_state.world.m[0][0]);
 		render_state_changed|=(unsigned)WORLD_CHANGED;
 		render_state_changed&=~(unsigned)WORLD_IDENTITY;
 		break;
 	case D3DTS_VIEW:
 		render_state.view=To_D3DMATRIX(m);
+		rts::render::TrackLegacyTransform(rts::render::LEGACY_TRANSFORM_VIEW,
+			&render_state.view.m[0][0]);
 		render_state_changed|=(unsigned)VIEW_CHANGED;
 		render_state_changed&=~(unsigned)VIEW_IDENTITY;
 		break;
 	default:
 		DX8_RECORD_MATRIX_CHANGE();
 		D3DMATRIX dxm=To_D3DMATRIX(m);
+		if (transform >= D3DTS_TEXTURE0 && transform <= D3DTS_TEXTURE7) {
+			rts::render::TrackLegacyTransform(
+				static_cast<rts::render::LegacyTransformSlot>(
+					rts::render::LEGACY_TRANSFORM_TEXTURE0 +
+					(transform - D3DTS_TEXTURE0)), &dxm.m[0][0]);
+		}
 		DX8CALL(SetTransform(transform,&dxm));
 		break;
 	}

@@ -6,7 +6,7 @@ namespace render
 {
 namespace
 {
-LegacyPipelineState g_trackedPipelineState;
+LegacyLogicalState g_trackedLogicalState;
 bool g_trackedPipelineStateValid = false;
 }
 
@@ -383,7 +383,7 @@ bool DecodeLegacyShaderBits(unsigned int shaderBits,
 void TrackLegacyShaderBits(unsigned int shaderBits)
 {
 	g_trackedPipelineStateValid = DecodeLegacyShaderBits(shaderBits,
-		&g_trackedPipelineState);
+		&g_trackedLogicalState.pipeline);
 }
 
 bool GetTrackedLegacyPipelineState(LegacyPipelineState *state)
@@ -392,7 +392,49 @@ bool GetTrackedLegacyPipelineState(LegacyPipelineState *state)
 	{
 		return false;
 	}
-	*state = g_trackedPipelineState;
+	*state = g_trackedLogicalState.pipeline;
+	return true;
+}
+
+bool TrackLegacyTransform(LegacyTransformSlot slot, const float *values)
+{
+	if (values == 0 || slot < LEGACY_TRANSFORM_WORLD ||
+		slot >= LEGACY_TRANSFORM_COUNT)
+	{
+		return false;
+	}
+	RenderMatrix4 *target = 0;
+	if (slot == LEGACY_TRANSFORM_WORLD)
+	{
+		target = &g_trackedLogicalState.constants.world;
+	}
+	else if (slot == LEGACY_TRANSFORM_VIEW)
+	{
+		target = &g_trackedLogicalState.constants.view;
+	}
+	else if (slot == LEGACY_TRANSFORM_PROJECTION)
+	{
+		target = &g_trackedLogicalState.constants.projection;
+	}
+	else
+	{
+		target = &g_trackedLogicalState.constants.textureTransforms[
+			static_cast<unsigned int>(slot) - LEGACY_TRANSFORM_TEXTURE0];
+	}
+	for (unsigned int index = 0; index < 16; ++index)
+	{
+		target->values[index] = values[index];
+	}
+	return true;
+}
+
+bool GetTrackedLegacyLogicalState(LegacyLogicalState *state)
+{
+	if (state == 0 || !g_trackedPipelineStateValid)
+	{
+		return false;
+	}
+	*state = g_trackedLogicalState;
 	return true;
 }
 }

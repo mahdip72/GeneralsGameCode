@@ -252,6 +252,25 @@ int testLegacyShaderBitDecoder()
 	result |= check(!rts::render::GetTrackedLegacyPipelineState(&state) &&
 		!rts::render::GetTrackedLegacyPipelineState(0),
 		"legacy bridge never publishes invalid or null state");
+	rts::render::TrackLegacyShaderBits(opaque);
+	float transform[16];
+	for (unsigned int index = 0; index < 16; ++index)
+	{
+		transform[index] = static_cast<float>(index + 1);
+	}
+	rts::render::LegacyLogicalState logicalState;
+	result |= check(rts::render::TrackLegacyTransform(
+		rts::render::LEGACY_TRANSFORM_WORLD, transform) &&
+		rts::render::GetTrackedLegacyLogicalState(&logicalState) &&
+		logicalState.constants.world.values[0] == 1.0f &&
+		logicalState.constants.world.values[15] == 16.0f,
+		"legacy bridge publishes fixed-function transforms with shader state");
+	result |= check(!rts::render::TrackLegacyTransform(
+		rts::render::LEGACY_TRANSFORM_COUNT, transform) &&
+		!rts::render::TrackLegacyTransform(
+			rts::render::LEGACY_TRANSFORM_WORLD, 0) &&
+		!rts::render::GetTrackedLegacyLogicalState(0),
+		"legacy transform bridge rejects invalid slots and null storage");
 	return result;
 }
 
