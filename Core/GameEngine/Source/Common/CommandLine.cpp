@@ -474,8 +474,8 @@ Int parseWorkerCount(char *args[], int num)
 		char *end = nullptr;
 		errno = 0;
 		const unsigned long workerCount = strtoul(args[1], &end, 10);
-		if (errno != 0 || end == args[1] || *end != '\0' ||
-			workerCount == 0 || workerCount > UINT_MAX)
+		if (args[1][0] == '-' || errno != 0 || end == args[1] || *end != '\0' ||
+			workerCount == 0 || workerCount >= UINT_MAX)
 		{
 			printf("Invalid worker count: %s\n", args[1]);
 			exit(1);

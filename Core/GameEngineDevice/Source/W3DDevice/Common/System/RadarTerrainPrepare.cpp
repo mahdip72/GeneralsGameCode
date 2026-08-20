@@ -471,8 +471,12 @@ bool RadarTerrainPrepareService::warmup()
 
 bool RadarTerrainPrepareService::runAttempt(RadarPrepareRowWork *work,
 	unsigned rowBegin, unsigned rowEnd,
-	unsigned desiredRangeCount)
+	unsigned desiredRangeCount, bool *ranParallel)
 {
+	if (ranParallel != 0)
+	{
+		*ranParallel = false;
+	}
 	if (work == 0 || rowBegin >= rowEnd || desiredRangeCount == 0)
 	{
 		return false;
@@ -584,12 +588,20 @@ bool RadarTerrainPrepareService::runAttempt(RadarPrepareRowWork *work,
 	delete [] submissions;
 	delete [] tasks;
 	delete [] ranges;
+	if (completed && ranParallel != 0)
+	{
+		*ranParallel = rangeCount > 1;
+	}
 	return completed;
 }
 
 bool RadarTerrainPrepareService::runRows(RadarPrepareRowWork *work,
-	unsigned rowBegin, unsigned rowEnd)
+	unsigned rowBegin, unsigned rowEnd, bool *ranParallel)
 {
+	if (ranParallel != 0)
+	{
+		*ranParallel = false;
+	}
 	if (!m_initialized || m_stopping || !m_leaseActive ||
 		work == 0 || rowBegin == rowEnd || rowBegin > rowEnd)
 	{
@@ -597,19 +609,25 @@ bool RadarTerrainPrepareService::runRows(RadarPrepareRowWork *work,
 	}
 
 	rts::JobSystem &system = rts::JobSystem::instance();
+	if (system.isWorkerThread())
+	{
+		system.recordSerialFallback();
+		return false;
+	}
 	const unsigned workerCount = system.ensureStarted() ? system.workerCount() : 0;
 	unsigned desiredRangeCount = workerCount;
-	if (desiredRangeCount != 0 && desiredRangeCount <= UINT_MAX / 2)
+	if (desiredRangeCount > 1 && desiredRangeCount <= UINT_MAX / 2)
 	{
 		desiredRangeCount *= 2;
 	}
-	if (runAttempt(work, rowBegin, rowEnd, desiredRangeCount))
+	if (runAttempt(work, rowBegin, rowEnd, desiredRangeCount, ranParallel))
 	{
 		return true;
 	}
 
 	/* Preserve a one-range reference/recovery path after admission failures. */
-	if (desiredRangeCount > 1 && runAttempt(work, rowBegin, rowEnd, 1))
+	if (desiredRangeCount > 1 && runAttempt(work, rowBegin, rowEnd, 1,
+		ranParallel))
 	{
 		system.recordSerialFallback();
 		return true;
@@ -620,7 +638,8 @@ bool RadarTerrainPrepareService::runRows(RadarPrepareRowWork *work,
 }
 
 bool RadarTerrainPrepareService::runRows(RadarTerrainSnapshot *snapshot,
-	unsigned char *output, unsigned rowBegin, unsigned rowEnd)
+	unsigned char *output, unsigned rowBegin, unsigned rowEnd,
+	bool *ranParallel)
 {
 	if (!radarTerrainPrepareRowsAreValid(snapshot, output, rowBegin, rowEnd) ||
 		rowBegin == rowEnd)
@@ -629,7 +648,7 @@ bool RadarTerrainPrepareService::runRows(RadarTerrainSnapshot *snapshot,
 	}
 
 	RadarTerrainRowWorkAdapter work(snapshot, output);
-	return runRows(&work, rowBegin, rowEnd);
+	return runRows(&work, rowBegin, rowEnd, ranParallel);
 }
 
 void RadarTerrainPrepareService::release(unsigned consumerId)

@@ -10,7 +10,7 @@ $sourceRootPath = (Resolve-Path -LiteralPath $SourceRoot).Path
 $rules = @(
     [pscustomobject]@{
         Name = 'pointer-to-32-bit-cast'
-        Pattern = 'reinterpret_cast\s*<\s*(Int|UnsignedInt|int|unsigned|DWORD|LONG)\s*>'
+        Pattern = '(reinterpret_cast\s*<\s*(Int|UnsignedInt|int|unsigned|DWORD|LONG)\s*>|\(\s*(Int|UnsignedInt|int|unsigned|DWORD|LONG)\s*\)\s*([A-Za-z_][A-Za-z0-9_]*(Ptr|Pointer|Address)|this)\b)'
         RejectAddedLine = $true
     },
     [pscustomobject]@{
@@ -25,13 +25,13 @@ $rules = @(
     },
     [pscustomobject]@{
         Name = 'pointer-bearing-window-message'
-        Pattern = '(WindowMsgData|WM_[A-Z0-9_]+)[^\r\n]*(void\s*\*|reinterpret_cast|\(Int\)|\(UnsignedInt\))'
+        Pattern = '(WindowMsgData|WM_[A-Z0-9_]+|LPARAM|WPARAM)[^\r\n]*(void\s*\*|reinterpret_cast|\(Int\)|\(UnsignedInt\))'
         RejectAddedLine = $true
     },
     [pscustomobject]@{
         Name = 'raw-d3d8-surface-area'
         Pattern = '(IDirect3D[A-Za-z0-9_]*8|D3D[A-Z0-9_]*8|DX8Wrapper)'
-        RejectAddedLine = $false
+        RejectAddedLine = $true
     }
 )
 

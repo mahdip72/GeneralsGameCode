@@ -188,6 +188,7 @@ public:
 	bool ensureStarted();
 	void shutdown();
 	bool isRunning() const;
+	bool isWorkerThread() const;
 	unsigned workerCount() const;
 	unsigned outstandingJobCount() const;
 	JobSystemMetrics metrics() const;

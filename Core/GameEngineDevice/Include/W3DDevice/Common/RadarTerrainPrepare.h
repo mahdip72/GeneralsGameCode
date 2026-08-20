@@ -126,14 +126,14 @@ public:
 
 	/* Returns true only when both row tasks completed successfully. */
 	bool runRows(RadarTerrainSnapshot *snapshot, unsigned char *output,
-		unsigned rowBegin, unsigned rowEnd);
+		unsigned rowBegin, unsigned rowEnd, bool *ranParallel = 0);
 	/* Generic row operation shared by later render-preparation consumers. */
 	bool runRows(RadarPrepareRowWork *work, unsigned rowBegin,
-		unsigned rowEnd);
+		unsigned rowEnd, bool *ranParallel = 0);
 	bool runRows(RadarPrepareRowWork &work, unsigned rowBegin,
-		unsigned rowEnd)
+		unsigned rowEnd, bool *ranParallel = 0)
 	{
-		return runRows(&work, rowBegin, rowEnd);
+		return runRows(&work, rowBegin, rowEnd, ranParallel);
 	}
 
 	void release(unsigned consumerId);
@@ -152,7 +152,7 @@ private:
 
 	bool runAttempt(RadarPrepareRowWork *work, unsigned rowBegin,
 		unsigned rowEnd,
-		unsigned desiredRangeCount);
+		unsigned desiredRangeCount, bool *ranParallel);
 
 	unsigned m_requestedWorkers;
 	unsigned m_queueCapacity;

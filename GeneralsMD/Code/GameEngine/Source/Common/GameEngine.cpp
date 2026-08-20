@@ -275,6 +275,8 @@ GameEngine::~GameEngine()
 	// TheSuperHackers @fix helmutbuhler 03/06/2025
 	// Reset all subsystems before deletion to prevent crashing due to cross dependencies.
 	reset();
+	// Drain compute jobs and owner completions while their subsystem owners are alive.
+	rts::JobSystem::instance().shutdown();
 
 	TheSubsystemList->shutdownAll();
 	delete TheSubsystemList;
@@ -302,9 +304,6 @@ GameEngine::~GameEngine()
 	TheGameLODManager = nullptr;
 
 	Drawable::killStaticImages();
-
-	// Compute jobs must be drained after all owning subsystems have shut down.
-	rts::JobSystem::instance().shutdown();
 
 	_Module.Term();
 
@@ -359,7 +358,8 @@ void GameEngine::init()
 {
 	ASSERT_GAME_THREAD("GameEngine::init");
 	try {
-		if (!rts::JobSystem::instance().ensureStarted())
+		if (!TheGlobalData->m_headless &&
+			!rts::JobSystem::instance().ensureStarted())
 		{
 			DEBUG_LOG(("JobSystem startup failed; parallel consumers will use their serial fallback."));
 		}

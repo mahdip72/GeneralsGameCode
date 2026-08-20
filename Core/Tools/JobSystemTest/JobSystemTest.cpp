@@ -1,5 +1,6 @@
 #include "Lib/JobSystem.h"
 
+#include <limits.h>
 #include <stdio.h>
 
 #if !defined(_MSC_VER) || _MSC_VER >= 1300
@@ -19,7 +20,8 @@ enum JobSystemTestFault
 	JOB_SYSTEM_TEST_FAIL_GROUP_ALLOCATION = 4,
 	JOB_SYSTEM_TEST_FAIL_JOB_ALLOCATION = 5,
 	JOB_SYSTEM_TEST_FAIL_QUEUE_PUSH = 6,
-	JOB_SYSTEM_TEST_FAIL_COMPLETION_PUSH = 7
+	JOB_SYSTEM_TEST_FAIL_COMPLETION_PUSH = 7,
+	JOB_SYSTEM_TEST_FAIL_PROMOTION_PUSH = 8
 };
 
 extern "C" void rts_job_system_set_test_fault(unsigned fault,
@@ -101,6 +103,48 @@ int testBasicStartSubmitWaitShutdown()
 
 	system.shutdown();
 	result |= check(!system.isRunning(), "shutdown stops the job system");
+	result |= check(system.start(config), "job system restarts for dependency validation");
+	result |= check(system.metrics().submittedJobCount == 0 &&
+		system.metrics().executedJobCount == 0,
+		"restart resets scheduler-generation metrics");
+	rts::JobGroup restartedGroup = system.createGroup();
+	rts::Job *staleJob = new CountJob(&executions);
+	rts::JobHandle staleDependent = system.trySubmitAfter(staleJob,
+		rts::JOB_PRIORITY_NORMAL, restartedGroup, &handle, 1);
+	if (!staleDependent.isValid())
+	{
+		delete staleJob;
+	}
+	result |= check(!staleDependent.isValid(),
+		"dependency handles from a previous generation are rejected");
+	rts::Job *freshJob = new CountJob(&executions);
+	rts::JobHandle fresh = system.trySubmit(freshJob,
+		rts::JOB_PRIORITY_NORMAL, restartedGroup);
+	if (!fresh.isValid())
+	{
+		delete freshJob;
+	}
+	rts::JobHandle duplicates[2] = { fresh, fresh };
+	rts::Job *duplicateJob = new CountJob(&executions);
+	rts::JobHandle duplicateDependent = system.trySubmitAfter(duplicateJob,
+		rts::JOB_PRIORITY_NORMAL, restartedGroup, duplicates, 2);
+	if (!duplicateDependent.isValid())
+	{
+		delete duplicateJob;
+	}
+	result |= check(fresh.isValid() && !duplicateDependent.isValid(),
+		"duplicate dependency handles are rejected");
+	result |= check(system.wait(restartedGroup),
+		"dependency validation group remains drainable");
+	system.shutdown();
+	rts::JobSystemConfig invalidConfig = config;
+	invalidConfig.scratchBytesPerWorker = 0;
+	result |= check(!system.start(invalidConfig),
+		"zero scratch capacity is rejected consistently");
+	invalidConfig = config;
+	invalidConfig.workerPolicy = static_cast<rts::JobWorkerPolicy>(99);
+	result |= check(!system.start(invalidConfig),
+		"unknown worker policy is rejected consistently");
 	return result;
 }
 
@@ -132,8 +176,13 @@ int testDeterministicWorkerCounts()
 
 		rts::JobSystem &system = rts::JobSystem::instance();
 		result |= check(system.start(config), "configured worker count starts");
+#if defined(_MSC_VER) && _MSC_VER < 1300
+		result |= check(system.workerCount() == 1,
+			"VC6 reference adapter reports its single execution lane");
+#else
 		result |= check(system.workerCount() == workerCounts[workerIndex],
 			"configured worker count has no product cap");
+#endif
 		rts::JobGroup group = system.createGroup();
 		for (index = 0; index < jobCount; ++index)
 		{
@@ -166,10 +215,11 @@ class Gate
 public:
 	Gate() : m_entered(false), m_open(false) {}
 
-	void waitForEntry()
+	bool waitForEntry()
 	{
 		std::unique_lock<std::mutex> lock(m_mutex);
-		m_condition.wait(lock, [this]() { return m_entered; });
+		return m_condition.wait_for(lock, std::chrono::seconds(5),
+			[this]() { return m_entered; });
 	}
 
 	void waitUntilOpen()
@@ -317,11 +367,12 @@ class WorkerWaitJob : public rts::Job
 {
 public:
 	WorkerWaitJob(rts::JobSystem *system, const rts::JobGroup &group,
-		bool *waitResult)
-		: m_system(system), m_group(group), m_waitResult(waitResult) {}
+		bool *waitResult, bool *childExecuted)
+		: m_system(system), m_group(group), m_waitResult(waitResult),
+		  m_childExecuted(childExecuted) {}
 	virtual void execute(rts::JobContext &context)
 	{
-		rts::Job *child = new MarkJob(&m_childExecuted);
+		rts::Job *child = new MarkJob(m_childExecuted);
 		rts::JobHandle handle = m_system->trySubmit(child,
 			rts::JOB_PRIORITY_NORMAL, m_group);
 		if (!handle.isValid())
@@ -336,7 +387,7 @@ private:
 	rts::JobSystem *m_system;
 	rts::JobGroup m_group;
 	bool *m_waitResult;
-	bool m_childExecuted = false;
+	bool *m_childExecuted;
 };
 
 struct CompletionRecord
@@ -382,7 +433,7 @@ int testPrioritiesAndWorkStealing()
 		rts::JobHandle blocker = system.trySubmit(new GateJob(&gate),
 			rts::JOB_PRIORITY_NORMAL, group);
 		result |= check(blocker.isValid(), "priority blocker accepted");
-		gate.waitForEntry();
+		result |= check(gate.waitForEntry(), "priority blocker enters before timeout");
 		OrderedJob *backgroundJob = new OrderedJob(&sequence, &backgroundOrder);
 		rts::JobHandle background = system.trySubmit(
 			backgroundJob,
@@ -419,7 +470,7 @@ int testPrioritiesAndWorkStealing()
 				&startGate),
 			rts::JOB_PRIORITY_NORMAL, group);
 		result |= check(fanOut.isValid(), "worker fan-out accepted");
-		startGate.waitForEntry();
+		result |= check(startGate.waitForEntry(), "fan-out job enters before timeout");
 		startGate.open();
 		result |= check(system.wait(group), "fan-out group completes");
 		const rts::JobSystemMetrics metrics = system.metrics();
@@ -432,6 +483,38 @@ int testPrioritiesAndWorkStealing()
 			"execution telemetry includes fan-out work");
 		result |= check(metrics.maximumActiveWorkers >= 3,
 			"fan-out workload executes concurrently beyond two workers");
+		system.shutdown();
+	}
+
+	{
+		rts::JobSystemConfig config;
+		config.workerCount = 1;
+		config.queueCapacity = 8;
+		config.scratchBytesPerWorker = 4096;
+		config.pinWorkers = false;
+		result |= check(system.start(config), "promotion-fault test starts");
+		rts::JobGroup group = system.createGroup();
+		Gate gate;
+		bool queuedJobExecuted = false;
+		rts::JobHandle blocker = system.trySubmit(new GateJob(&gate),
+			rts::JOB_PRIORITY_NORMAL, group);
+		result |= check(gate.waitForEntry(), "promotion-fault blocker enters before timeout");
+		rts::Job *queuedJob = new MarkJob(&queuedJobExecuted);
+		rts::JobHandle queued = system.trySubmit(queuedJob,
+			rts::JOB_PRIORITY_BACKGROUND, group);
+		result |= check(blocker.isValid() && queued.isValid(),
+			"promotion-fault jobs accepted");
+#if defined(RTS_BUILD_CORE_EXTRAS)
+		rts_job_system_set_test_fault(JOB_SYSTEM_TEST_FAIL_PROMOTION_PUSH, 1);
+#endif
+		result |= check(!system.tryPromote(queuedJob,
+			rts::JOB_PRIORITY_FRAME_CRITICAL),
+			"promotion allocation failure preserves the source queue");
+		gate.open();
+		result |= check(system.wait(group),
+			"promotion allocation failure leaves the group drainable");
+		result |= check(queued.succeeded() && queuedJobExecuted,
+			"promotion allocation failure does not strand the job");
 		system.shutdown();
 	}
 	return result;
@@ -459,7 +542,7 @@ int testDependenciesContinuationsAndFailurePropagation()
 			new GateOrderedJob(&gate, &sequence, &prerequisiteOrder),
 			rts::JOB_PRIORITY_NORMAL, group);
 		result |= check(prerequisite.isValid(), "prerequisite accepted");
-		gate.waitForEntry();
+		result |= check(gate.waitForEntry(), "dependency prerequisite enters before timeout");
 		rts::Job *dependentJob = new OrderedJob(&sequence, &dependentOrder);
 		rts::JobHandle dependent = system.trySubmitAfter(dependentJob,
 			rts::JOB_PRIORITY_FRAME_CRITICAL, group, &prerequisite, 1);
@@ -505,6 +588,31 @@ int testDependenciesContinuationsAndFailurePropagation()
 		result |= check(group.failed(), "group records propagated failure");
 	}
 
+	{
+		rts::JobGroup group = system.createGroup();
+		Gate gate;
+		bool continuationExecuted = false;
+		rts::JobHandle prerequisite = system.trySubmit(new GateJob(&gate),
+			rts::JOB_PRIORITY_NORMAL, group);
+		result |= check(gate.waitForEntry(), "continuation prerequisite enters before timeout");
+		{
+			rts::Job *continuationJob = new MarkJob(&continuationExecuted);
+			rts::JobHandle discarded = system.then(prerequisite,
+				continuationJob, rts::JOB_PRIORITY_NORMAL, group);
+			if (!discarded.isValid())
+			{
+				delete continuationJob;
+			}
+			result |= check(discarded.isValid(),
+				"fire-and-forget continuation accepted");
+		}
+		gate.open();
+		result |= check(system.wait(group),
+			"discarded continuation handle does not strand its group");
+		result |= check(continuationExecuted,
+			"fire-and-forget continuation executes");
+	}
+
 	system.shutdown();
 	return result;
 }
@@ -529,7 +637,7 @@ int testCancellationOwnerHelpingAndCompletions()
 		rts::JobHandle blocker = system.trySubmit(new GateJob(&gate),
 			rts::JOB_PRIORITY_NORMAL, blockedGroup);
 		result |= check(blocker.isValid(), "owner-help blocker accepted");
-		gate.waitForEntry();
+		result |= check(gate.waitForEntry(), "owner-help blocker enters before timeout");
 		rts::JobHandle helped = system.trySubmit(new MarkJob(&helpedJobExecuted),
 			rts::JOB_PRIORITY_FRAME_CRITICAL, helpedGroup);
 		result |= check(helped.isValid(), "owner-help job accepted");
@@ -557,7 +665,7 @@ int testCancellationOwnerHelpingAndCompletions()
 		bool queuedJobExecuted = false;
 		rts::JobHandle active = system.trySubmit(new GateJob(&gate),
 			rts::JOB_PRIORITY_NORMAL, group);
-		gate.waitForEntry();
+		result |= check(gate.waitForEntry(), "cancellation blocker enters before timeout");
 		rts::JobHandle queued = system.trySubmit(new MarkJob(&queuedJobExecuted),
 			rts::JOB_PRIORITY_NORMAL, group);
 		result |= check(active.isValid() && queued.isValid(),
@@ -796,13 +904,16 @@ int testBatchAdmissionAndWorkerWaitRejection()
 	{
 		rts::JobGroup group = system.createGroup();
 		bool workerWaitResult = true;
+		bool childExecuted = false;
 		rts::JobHandle parent = system.trySubmit(
-			new WorkerWaitJob(&system, group, &workerWaitResult),
+			new WorkerWaitJob(&system, group, &workerWaitResult, &childExecuted),
 			rts::JOB_PRIORITY_NORMAL, group);
 		result |= check(parent.isValid(), "worker-wait parent accepted");
 		result |= check(system.wait(group), "worker-wait group completes");
 		result |= check(!workerWaitResult,
 			"compute worker cannot block waiting for a child");
+		result |= check(childExecuted,
+			"worker-wait child completes before test storage is released");
 		result |= check(system.metrics().workerWaitRejectionCount > 0,
 			"worker-wait rejection telemetry is recorded");
 	}
@@ -816,6 +927,35 @@ int testBatchAdmissionAndWorkerWaitRejection()
 		"queue latency telemetry is recorded");
 
 	system.shutdown();
+	return result;
+}
+
+int testLifecycleOwnershipAndResourceLimits()
+{
+	int result = 0;
+	rts::JobSystem &system = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 2;
+	config.queueCapacity = 16;
+	config.scratchBytesPerWorker = 4096;
+	config.pinWorkers = false;
+	result |= check(system.start(config), "lifecycle ownership test starts");
+	std::thread nonOwnerShutdown([&system]() { system.shutdown(); });
+	nonOwnerShutdown.join();
+	result |= check(system.isRunning() && system.workerCount() == 2,
+		"non-owner shutdown cannot tear down owner wait state");
+	rts::JobGroup group = system.createGroup();
+	bool executed = false;
+	rts::JobHandle handle = system.trySubmit(new MarkJob(&executed),
+		rts::JOB_PRIORITY_NORMAL, group);
+	result |= check(handle.isValid() && system.wait(group) &&
+		executed,
+		"scheduler remains usable after rejected non-owner shutdown");
+	system.shutdown();
+
+	config.workerCount = UINT_MAX;
+	result |= check(!system.start(config) && !system.isRunning(),
+		"topology-derived resource limit rejects pathological worker counts");
 	return result;
 }
 #endif
@@ -835,6 +975,7 @@ int main()
 	result |= testFaultInjectionAndRecovery();
 #endif
 	result |= testBatchAdmissionAndWorkerWaitRejection();
+	result |= testLifecycleOwnershipAndResourceLimits();
 #endif
 	if (result == 0)
 	{

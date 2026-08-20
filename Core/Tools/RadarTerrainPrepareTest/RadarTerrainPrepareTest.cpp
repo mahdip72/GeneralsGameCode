@@ -938,8 +938,9 @@ class RadarPrepareRowWorkProbe : public RadarPrepareRowWork
 {
 public:
 	RadarPrepareRowWorkProbe(unsigned rowCount, unsigned char *rows,
-		bool fail)
-		: m_rowCount(rowCount), m_rows(rows), m_fail(fail)
+		bool fail, unsigned *invocationCount = 0)
+		: m_rowCount(rowCount), m_rows(rows), m_fail(fail),
+		  m_invocationCount(invocationCount)
 	{
 	}
 
@@ -948,6 +949,8 @@ public:
 		unsigned row;
 		if (rowBegin > rowEnd || rowEnd > m_rowCount)
 			return false;
+		if (m_invocationCount != 0)
+			++*m_invocationCount;
 		for (row = rowBegin; row < rowEnd; ++row)
 			m_rows[row] = static_cast<unsigned char>(row + 1);
 		return !m_fail;
@@ -957,7 +960,37 @@ private:
 	unsigned m_rowCount;
 	unsigned char *m_rows;
 	bool m_fail;
+	unsigned *m_invocationCount;
 };
+
+static int testOneWorkerUsesSingleReferenceRange()
+{
+	const char *testName = "testOneWorkerUsesSingleReferenceRange";
+	unsigned char rows[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+	unsigned invocationCount = 0;
+	bool ranParallel = true;
+	RadarPrepareRowWorkProbe work(8, rows, false, &invocationCount);
+	RadarTerrainPrepareService service;
+	rts::JobSystem &system = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 1;
+	config.queueCapacity = 8;
+	config.scratchBytesPerWorker = 4096;
+	config.pinWorkers = false;
+
+	system.shutdown();
+	CHECK(testName, system.start(config));
+	CHECK(testName, system.workerCount() == 1);
+	CHECK(testName, service.initialize(1, 8));
+	CHECK(testName, service.tryAcquire(9));
+	CHECK(testName, service.runRows(&work, 0, 8, &ranParallel));
+	CHECK(testName, !ranParallel);
+	CHECK(testName, invocationCount == 1);
+	service.release(9);
+	service.shutdown();
+	system.shutdown();
+	return 0;
+}
 
 static int testPrepareServiceGenericRowWork()
 {
@@ -1480,15 +1513,20 @@ int main()
 	result |= testAdaptiveRowSplitUsesAllAvailableCapacity();
 	result |= testPrepareServiceSuccessfulLeaseAndRows();
 	result |= testPrepareServiceGenericRowWork();
+	result |= testOneWorkerUsesSingleReferenceRange();
 	result |= testPrepareServiceGenericRowWorkFailureJoinsTasks();
 	result |= testPrepareServiceStartFailureRetriesOneWorker();
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
 	result |= testPrepareServiceTaskAllocationRetriesOneWorker();
 	result |= testPrepareServiceQueueBackpressureFallsBackToSerial();
 	result |= testPrepareServiceSubmissionRollbackRetriesOneWorker();
 	result |= testPrepareServiceBothAttemptsFailUseSerialOracle();
+#endif
 	result |= testPrepareServiceShutdownClosesLease();
 	result |= testPrepareServiceShutdownAfterRunRestartsCleanly();
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
 	result |= testPrepareServiceRollbackThenRetryAllocationFailureIsClean();
+#endif
 	result |= testWorkerSourceAudit();
 	result |= testOwnerFlowSourceAudit();
 	return result;

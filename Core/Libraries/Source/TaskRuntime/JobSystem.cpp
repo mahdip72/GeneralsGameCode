@@ -3,12 +3,14 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <new>
+#include <shared_mutex>
 #include <thread>
 #include <vector>
 
@@ -24,6 +26,7 @@
 
 #if defined(_WIN32) && !defined(_WIN64)
 #include <float.h>
+#include <xmmintrin.h>
 #endif
 
 namespace rts
@@ -52,8 +55,8 @@ struct JobRecord
 	JobRecord()
 		: job(0), priority(JOB_PRIORITY_NORMAL), complete(false),
 		  failed(false), cancelled(false), owner(0), generation(0),
-		  unresolvedDependencies(0), dependencyFailed(false),
-		  accepted(false), queued(false), completion(0)
+		  unresolvedDependencies(0), dependencyFailed(false), finalizing(false),
+		  accepted(false), queued(false), executing(false), completion(0)
 	{
 	}
 
@@ -73,12 +76,14 @@ struct JobRecord
 	unsigned generation;
 	std::atomic<unsigned> unresolvedDependencies;
 	std::atomic<bool> dependencyFailed;
+	std::atomic<bool> finalizing;
 	std::atomic<bool> accepted;
 	std::atomic<bool> queued;
+	std::atomic<bool> executing;
 	OwnerCompletion *completion;
 	std::chrono::steady_clock::time_point readyAt;
 	std::mutex dependentsMutex;
-	std::vector<std::weak_ptr<JobRecord> > dependents;
+	std::vector<std::shared_ptr<JobRecord> > dependents;
 	std::mutex mutex;
 	std::condition_variable completed;
 };
@@ -116,6 +121,30 @@ bool consumeJobSystemTestFault(unsigned fault)
 	}
 	return false;
 }
+#endif
+
+#if defined(_WIN32) && !defined(_WIN64)
+class DeterministicFloatingPointScope
+{
+public:
+	DeterministicFloatingPointScope()
+		: m_controlWord(_controlfp(0, 0)), m_mxcsr(_mm_getcsr())
+	{
+		_fpreset();
+		_controlfp(_PC_24 | _RC_NEAR, _MCW_PC | _MCW_RC);
+		_mm_setcsr(0x1f80u);
+	}
+
+	~DeterministicFloatingPointScope()
+	{
+		_controlfp(m_controlWord, _MCW_PC | _MCW_RC);
+		_mm_setcsr(m_mxcsr);
+	}
+
+private:
+	unsigned int m_controlWord;
+	unsigned int m_mxcsr;
+};
 #endif
 
 bool equalsAsciiNoCase(const char *left, const char *right)
@@ -200,6 +229,26 @@ std::vector<JobCpuSetInfo> enumerateSystemCpuSets()
 	return result;
 }
 #endif
+
+unsigned processAvailableCpuCount()
+{
+#if defined(_WIN32)
+	DWORD_PTR processMask = 0;
+	DWORD_PTR systemMask = 0;
+	if (GetProcessAffinityMask(GetCurrentProcess(), &processMask, &systemMask) &&
+		processMask != 0)
+	{
+		unsigned count = 0;
+		while (processMask != 0)
+		{
+			count += static_cast<unsigned>(processMask & 1);
+			processMask >>= 1;
+		}
+		return count;
+	}
+#endif
+	return std::thread::hardware_concurrency();
+}
 }
 
 #if defined(RTS_BUILD_CORE_EXTRAS)
@@ -363,6 +412,8 @@ struct JobSystem::State
 		}
 		if (record)
 		{
+			record->executing.store(true, std::memory_order_release);
+			record->queued.store(false, std::memory_order_release);
 			readyCount.fetch_sub(1, std::memory_order_acq_rel);
 		}
 		return record;
@@ -396,6 +447,13 @@ struct JobSystem::State
 		if (!record->queued.compare_exchange_strong(expected, true,
 			std::memory_order_acq_rel, std::memory_order_acquire))
 		{
+			return false;
+		}
+		if (record->finalizing.load(std::memory_order_acquire) ||
+			record->executing.load(std::memory_order_acquire) ||
+			record->complete.load(std::memory_order_acquire))
+		{
+			record->queued.store(false, std::memory_order_release);
 			return false;
 		}
 
@@ -451,14 +509,13 @@ struct JobSystem::State
 	void releaseDependents(const std::shared_ptr<JobRecord> &record,
 		bool dependencyDidFail)
 	{
-		std::vector<std::weak_ptr<JobRecord> > dependents;
+		std::vector<std::shared_ptr<JobRecord> > dependents;
 		{
 			std::lock_guard<std::mutex> lock(record->dependentsMutex);
 			dependents.swap(record->dependents);
 		}
-		for (const std::weak_ptr<JobRecord> &weakDependent : dependents)
+		for (const std::shared_ptr<JobRecord> &dependent : dependents)
 		{
-			const std::shared_ptr<JobRecord> dependent = weakDependent.lock();
 			if (!dependent)
 			{
 				continue;
@@ -483,8 +540,26 @@ struct JobSystem::State
 	}
 
 	void finish(const std::shared_ptr<JobRecord> &record, bool failed,
-		bool cancelled)
+		bool cancelled, bool executionOwner = false)
 	{
+		bool expected = false;
+		if (!record->finalizing.compare_exchange_strong(expected, true,
+			std::memory_order_acq_rel, std::memory_order_acquire))
+		{
+			return;
+		}
+		/* Enqueue and finalization use queued/finalizing as a two-way claim.
+		 * If an enqueue won first, its caller owns eventual execution. */
+		if (record->queued.load(std::memory_order_acquire) ||
+			(!executionOwner && record->executing.load(std::memory_order_acquire)))
+		{
+			record->finalizing.store(false, std::memory_order_release);
+			return;
+		}
+		if (executionOwner)
+		{
+			record->executing.store(false, std::memory_order_release);
+		}
 		if (record->completion != 0)
 		{
 			bool queuedCompletion = false;
@@ -575,20 +650,27 @@ struct JobSystem::State
 				std::memory_order_relaxed))
 		{
 		}
-		const unsigned active = activeWorkers.fetch_add(1,
-			std::memory_order_acq_rel) + 1;
-		unsigned observedMaximum = maximumActiveWorkers.load(
-			std::memory_order_relaxed);
-		while (active > observedMaximum &&
-			!maximumActiveWorkers.compare_exchange_weak(observedMaximum, active,
-				std::memory_order_relaxed, std::memory_order_relaxed))
+		const bool poolWorker = worker.index < configuredWorkerCount;
+		unsigned active = 0;
+		if (poolWorker)
 		{
+			active = activeWorkers.fetch_add(1, std::memory_order_acq_rel) + 1;
+			unsigned observedMaximum = maximumActiveWorkers.load(
+				std::memory_order_relaxed);
+			while (active > observedMaximum &&
+				!maximumActiveWorkers.compare_exchange_weak(observedMaximum, active,
+					std::memory_order_relaxed, std::memory_order_relaxed))
+			{
+			}
 		}
 		bool cancelled = record->group->cancelled.load(
 			std::memory_order_acquire);
 		bool failed = record->dependencyFailed.load(std::memory_order_acquire);
 		if (!cancelled && !failed)
 		{
+#if defined(_WIN32) && !defined(_WIN64)
+			DeterministicFloatingPointScope floatingPointScope;
+#endif
 			JobContext::State contextState(record->group.get(),
 				worker.scratch.empty() ? 0 : &worker.scratch[0],
 				static_cast<unsigned>(worker.scratch.size()));
@@ -608,8 +690,11 @@ struct JobSystem::State
 
 		delete record->job;
 		record->job = 0;
-		activeWorkers.fetch_sub(1, std::memory_order_acq_rel);
-		finish(record, failed, cancelled);
+		if (poolWorker)
+		{
+			activeWorkers.fetch_sub(1, std::memory_order_acq_rel);
+		}
+		finish(record, failed, cancelled, true);
 	}
 
 	void workerLoop(Worker *worker)
@@ -662,6 +747,7 @@ struct JobSystem::State
 		s_currentJobSystemWorker = 0;
 	}
 
+	mutable std::shared_mutex lifecycleMutex;
 	mutable std::mutex mutex;
 	std::condition_variable workAvailable;
 	std::condition_variable capacityAvailable;
@@ -890,7 +976,7 @@ bool JobGroup::wasCancelled() const
 	return isValid() && m_state->record->cancelled.load(std::memory_order_acquire);
 }
 
-JobSystem::JobSystem() : m_state(0)
+JobSystem::JobSystem() : m_state(new (std::nothrow) State)
 {
 }
 
@@ -1039,6 +1125,11 @@ bool JobSystem::start(const JobSystemConfig &config)
 	{
 		return false;
 	}
+	if (m_state == 0)
+	{
+		return false;
+	}
+	std::unique_lock<std::shared_mutex> lifecycleLock(m_state->lifecycleMutex);
 	std::vector<JobCpuSetInfo> cpuSets;
 #if defined(_WIN32)
 	try
@@ -1060,11 +1151,24 @@ bool JobSystem::start(const JobSystemConfig &config)
 	}
 	if (eligibleCpuCount == 0)
 	{
-		eligibleCpuCount = std::thread::hardware_concurrency();
+		eligibleCpuCount = processAvailableCpuCount();
+	}
+	if (eligibleCpuCount == 0)
+	{
+		eligibleCpuCount = 1;
 	}
 	const unsigned effectiveWorkerCount = chooseWorkerCount(eligibleCpuCount,
 		config.workerPolicy, config.workerCount);
 	if (effectiveWorkerCount == 0)
+	{
+		return false;
+	}
+	const unsigned minimumExplicitLimit = 32;
+	const unsigned topologyMultiplier = 4;
+	const unsigned topologyLimit = eligibleCpuCount > UINT_MAX / topologyMultiplier ?
+		UINT_MAX : eligibleCpuCount * topologyMultiplier;
+	const unsigned explicitLimit = std::max(minimumExplicitLimit, topologyLimit);
+	if (config.workerCount != 0 && effectiveWorkerCount > explicitLimit)
 	{
 		return false;
 	}
@@ -1085,15 +1189,6 @@ bool JobSystem::start(const JobSystemConfig &config)
 			selectedCpuSetIds.clear();
 		}
 	}
-	if (m_state == 0)
-	{
-		m_state = new (std::nothrow) State;
-		if (m_state == 0)
-		{
-			return false;
-		}
-	}
-
 	{
 		std::lock_guard<std::mutex> lock(m_state->mutex);
 		if (m_state->running || m_state->stopping || !m_state->workers.empty())
@@ -1132,8 +1227,11 @@ bool JobSystem::start(const JobSystemConfig &config)
 			}
 #endif
 			worker->scratch.resize(config.scratchBytesPerWorker);
-			State::Worker *workerPointer = worker.get();
 			m_state->workers.push_back(std::move(worker));
+		}
+		for (unsigned index = 0; index < effectiveWorkerCount; ++index)
+		{
+			State::Worker *workerPointer = m_state->workers[index].get();
 #if defined(RTS_BUILD_CORE_EXTRAS)
 			if (consumeJobSystemTestFault(3))
 			{
@@ -1186,11 +1284,18 @@ void JobSystem::shutdown()
 	{
 		return;
 	}
+	std::unique_lock<std::shared_mutex> lifecycleLock(m_state->lifecycleMutex);
 	{
 		std::lock_guard<std::mutex> lock(m_state->mutex);
+		if ((m_state->running || m_state->stopping) &&
+			std::this_thread::get_id() != m_state->ownerThread)
+		{
+			return;
+		}
 		m_state->running = false;
 		m_state->stopping = true;
 	}
+	lifecycleLock.unlock();
 	m_state->workAvailable.notify_all();
 	for (std::unique_ptr<State::Worker> &worker : m_state->workers)
 	{
@@ -1202,7 +1307,27 @@ void JobSystem::shutdown()
 	m_state->workers.clear();
 	if (std::this_thread::get_id() == m_state->ownerThread)
 	{
-		pumpOwnerCompletions(~0u);
+		for (;;)
+		{
+			State::CompletionItem item;
+			{
+				std::lock_guard<std::mutex> lock(m_state->completionMutex);
+				if (m_state->ownerCompletions.empty())
+				{
+					break;
+				}
+				item = m_state->ownerCompletions.front();
+				m_state->ownerCompletions.pop_front();
+			}
+			try
+			{
+				item.completion->complete(item.succeeded, item.cancelled);
+			}
+			catch (...)
+			{
+			}
+			delete item.completion;
+		}
 	}
 	{
 		std::lock_guard<std::mutex> completionLock(m_state->completionMutex);
@@ -1215,6 +1340,7 @@ void JobSystem::shutdown()
 	m_state->ownerHelper.reset();
 	m_state->selectedCpuSetIds.clear();
 	m_state->pinWorkers = false;
+	lifecycleLock.lock();
 	{
 		std::lock_guard<std::mutex> lock(m_state->mutex);
 		for (unsigned priority = 0; priority < JOB_PRIORITY_COUNT; ++priority)
@@ -1238,6 +1364,11 @@ bool JobSystem::isRunning() const
 	}
 	std::lock_guard<std::mutex> lock(m_state->mutex);
 	return m_state->running;
+}
+
+bool JobSystem::isWorkerThread() const
+{
+	return m_state != 0 && s_currentJobSystemWorker == m_state;
 }
 
 unsigned JobSystem::workerCount() const
@@ -1322,6 +1453,7 @@ JobGroup JobSystem::createGroup()
 	{
 		return JobGroup();
 	}
+	std::shared_lock<std::shared_mutex> lifecycleLock(m_state->lifecycleMutex);
 	std::lock_guard<std::mutex> lock(m_state->mutex);
 	if (!m_state->running || m_state->stopping)
 	{
@@ -1375,6 +1507,7 @@ JobHandle JobSystem::trySubmitAfter(Job *job, JobPriority priority,
 	{
 		return JobHandle();
 	}
+	std::shared_lock<std::shared_mutex> lifecycleLock(m_state->lifecycleMutex);
 	const std::shared_ptr<GroupRecord> groupRecord = group.m_state->record;
 	if (groupRecord->owner != m_state ||
 		groupRecord->generation != m_state->generation ||
@@ -1530,6 +1663,7 @@ bool JobSystem::trySubmitBatch(const JobSubmission *submissions,
 	{
 		return false;
 	}
+	std::shared_lock<std::shared_mutex> lifecycleLock(m_state->lifecycleMutex);
 	const std::shared_ptr<GroupRecord> groupRecord = group.m_state->record;
 	if (groupRecord->owner != m_state ||
 		groupRecord->generation != m_state->generation ||
@@ -1854,11 +1988,17 @@ bool JobSystem::trySubmitBatch(const JobSubmission *submissions,
 		handles[index].m_state = handleStates[index];
 		handleStates[index] = 0;
 	}
-	m_state->workAvailable.notify_all();
+	const unsigned wakeCount = std::min(static_cast<unsigned>(readyRecords.size()),
+		m_state->configuredWorkerCount);
+	for (unsigned wakeIndex = 0; wakeIndex < wakeCount; ++wakeIndex)
+	{
+		m_state->workAvailable.notify_one();
+	}
 
 	for (const std::shared_ptr<JobRecord> &record : records)
 	{
-		if (!record->queued.load(std::memory_order_acquire) &&
+		if (!record->complete.load(std::memory_order_acquire) &&
+			!record->queued.load(std::memory_order_acquire) &&
 			record->unresolvedDependencies.load(std::memory_order_acquire) == 0)
 		{
 			if (!m_state->enqueueReady(record) &&
@@ -1878,6 +2018,14 @@ bool JobSystem::tryPromote(Job *job, JobPriority priority)
 	{
 		return false;
 	}
+	std::shared_lock<std::shared_mutex> lifecycleLock(m_state->lifecycleMutex);
+	{
+		std::lock_guard<std::mutex> lock(m_state->mutex);
+		if (!m_state->running || m_state->stopping)
+		{
+			return false;
+		}
+	}
 	auto promoteInQueues = [job, priority](
 		std::deque<std::shared_ptr<JobRecord> > *queues) {
 		for (unsigned lane = 0; lane < JOB_PRIORITY_COUNT; ++lane)
@@ -1887,9 +2035,26 @@ bool JobSystem::tryPromote(Job *job, JobPriority priority)
 				if ((*it)->job == job)
 				{
 					std::shared_ptr<JobRecord> record = *it;
-					queues[lane].erase(it);
+					if (lane == static_cast<unsigned>(priority))
+					{
+						return true;
+					}
+					try
+					{
+#if defined(RTS_BUILD_CORE_EXTRAS)
+						if (consumeJobSystemTestFault(8))
+						{
+							throw std::bad_alloc();
+						}
+#endif
+						queues[priority].push_front(record);
+					}
+					catch (...)
+					{
+						return false;
+					}
 					record->priority = priority;
-					queues[priority].push_front(record);
+					queues[lane].erase(it);
 					return true;
 				}
 			}
@@ -1990,6 +2155,7 @@ bool JobSystem::cancel(const JobGroup &group)
 	{
 		return false;
 	}
+	std::shared_lock<std::shared_mutex> lifecycleLock(m_state->lifecycleMutex);
 	group.m_state->record->cancelled.store(true, std::memory_order_release);
 	m_state->workAvailable.notify_all();
 	return true;

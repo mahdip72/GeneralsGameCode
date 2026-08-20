@@ -1,9 +1,14 @@
 #include "Lib/JobSystem.h"
 
 #include <deque>
+#include <limits.h>
 #include <new>
 #include <string.h>
 #include <vector>
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 namespace rts
 {
@@ -73,6 +78,35 @@ bool equalsAsciiNoCaseLegacy(const char *left, const char *right)
 
 unsigned s_startupWorkerCountLegacy = 0;
 JobWorkerPolicy s_startupWorkerPolicyLegacy = JOB_WORKER_POLICY_AUTO;
+
+#if defined(RTS_BUILD_CORE_EXTRAS)
+unsigned s_jobSystemTestFaultLegacy = 0;
+unsigned s_jobSystemTestFaultOccurrenceLegacy = 0;
+
+bool consumeJobSystemTestFaultLegacy(unsigned fault)
+{
+	if (s_jobSystemTestFaultLegacy != fault ||
+		s_jobSystemTestFaultOccurrenceLegacy == 0) return false;
+	--s_jobSystemTestFaultOccurrenceLegacy;
+	if (s_jobSystemTestFaultOccurrenceLegacy != 0) return false;
+	s_jobSystemTestFaultLegacy = 0;
+	return true;
+}
+#endif
+
+unsigned legacyExplicitWorkerLimit()
+{
+	unsigned cpuCount = 1;
+#if defined(_WIN32)
+	SYSTEM_INFO information;
+	GetSystemInfo(&information);
+	if (information.dwNumberOfProcessors != 0)
+		cpuCount = information.dwNumberOfProcessors;
+#endif
+	const unsigned topologyLimit = cpuCount > UINT_MAX / 4 ?
+		UINT_MAX : cpuCount * 4;
+	return topologyLimit > 32 ? topologyLimit : 32;
+}
 }
 
 struct JobContext::State
@@ -327,9 +361,18 @@ JobSystemConfig JobSystem::startupConfig()
 
 bool JobSystem::start(const JobSystemConfig &config)
 {
-	if (m_state == 0 || m_state->running || config.queueCapacity == 0) return false;
-	const unsigned count = chooseWorkerCount(1, config.workerPolicy,
-		config.workerCount);
+#if defined(RTS_BUILD_CORE_EXTRAS)
+	if (consumeJobSystemTestFaultLegacy(1)) return false;
+#endif
+	if (m_state == 0 || m_state->running || config.queueCapacity == 0 ||
+		config.scratchBytesPerWorker == 0 ||
+		(config.workerPolicy != JOB_WORKER_POLICY_AUTO &&
+		 config.workerPolicy != JOB_WORKER_POLICY_ALL) ||
+		(config.workerCount != 0 &&
+		 config.workerCount > legacyExplicitWorkerLimit())) return false;
+	/* This adapter is the VC6 differential oracle: it executes inline and
+	 * must report the one lane it actually owns, not the requested count. */
+	const unsigned count = 1;
 	try
 	{
 		m_state->scratch.resize(config.scratchBytesPerWorker);
@@ -338,6 +381,7 @@ bool JobSystem::start(const JobSystemConfig &config)
 	++m_state->generation;
 	m_state->configuredWorkerCount = count;
 	m_state->queueCapacity = config.queueCapacity;
+	m_state->metrics = JobSystemMetrics();
 	m_state->running = true;
 	m_state->stopping = false;
 	return true;
@@ -357,6 +401,7 @@ void JobSystem::shutdown()
 }
 bool JobSystem::isRunning() const { return m_state != 0 && m_state->running; }
 unsigned JobSystem::workerCount() const { return isRunning() ? m_state->configuredWorkerCount : 0; }
+bool JobSystem::isWorkerThread() const { return false; }
 unsigned JobSystem::outstandingJobCount() const { return 0; }
 JobSystemMetrics JobSystem::metrics() const { return m_state != 0 ? m_state->metrics : JobSystemMetrics(); }
 void JobSystem::resetMetrics() { if (m_state != 0) m_state->metrics = JobSystemMetrics(); }
@@ -407,8 +452,17 @@ JobHandle JobSystem::trySubmitAfter(Job *job, JobPriority priority,
 	unsigned index;
 	for (index = 0; index < dependencyCount; ++index)
 	{
-		if (!dependencies[index].isValid() || !dependencies[index].isComplete())
+		if (!dependencies[index].isValid() || !dependencies[index].isComplete() ||
+			dependencies[index].m_state->record->group == 0 ||
+			dependencies[index].m_state->record->group->owner != m_state ||
+			dependencies[index].m_state->record->group->generation != m_state->generation)
 			return JobHandle();
+		unsigned previous;
+		for (previous = 0; previous < index; ++previous)
+		{
+			if (dependencies[previous].m_state->record ==
+				dependencies[index].m_state->record) return JobHandle();
+		}
 		if (dependencies[index].failed() || dependencies[index].wasCancelled())
 			dependencyFailed = true;
 	}
@@ -485,6 +539,9 @@ bool JobSystem::trySubmitBatch(const JobSubmission *submissions,
 	unsigned index;
 	for (index = 0; index < submissionCount; ++index)
 	{
+#if defined(RTS_BUILD_CORE_EXTRAS)
+		if (consumeJobSystemTestFaultLegacy(6)) return false;
+#endif
 		if (submissions[index].job == 0 ||
 			submissions[index].priority < JOB_PRIORITY_FRAME_CRITICAL ||
 			submissions[index].priority >= JOB_PRIORITY_COUNT ||
@@ -500,9 +557,20 @@ bool JobSystem::trySubmitBatch(const JobSubmission *submissions,
 			dependencyIndex < submissions[index].dependencyCount;
 			++dependencyIndex)
 		{
-			if (!submissions[index].dependencies[dependencyIndex].isValid() ||
-				!submissions[index].dependencies[dependencyIndex].isComplete())
+			const JobHandle &dependency =
+				submissions[index].dependencies[dependencyIndex];
+			if (!dependency.isValid() || !dependency.isComplete() ||
+				dependency.m_state->record->group == 0 ||
+				dependency.m_state->record->group->owner != m_state ||
+				dependency.m_state->record->group->generation != m_state->generation)
 				return false;
+			unsigned previousDependency;
+			for (previousDependency = 0;
+				previousDependency < dependencyIndex; ++previousDependency)
+			{
+				if (submissions[index].dependencies[previousDependency].m_state->record ==
+					dependency.m_state->record) return false;
+			}
 		}
 	}
 
@@ -647,4 +715,13 @@ unsigned JobSystem::pendingOwnerCompletionCount() const
 {
 	return m_state != 0 ? (unsigned)m_state->completions.size() : 0;
 }
+
+#if defined(RTS_BUILD_CORE_EXTRAS)
+extern "C" void rts_job_system_set_test_fault(unsigned fault,
+	unsigned occurrence)
+{
+	s_jobSystemTestFaultOccurrenceLegacy = occurrence;
+	s_jobSystemTestFaultLegacy = fault;
+}
+#endif
 }
