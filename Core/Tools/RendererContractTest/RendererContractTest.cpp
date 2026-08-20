@@ -692,6 +692,81 @@ int testD3D11HiddenSwapChain()
 		center = &pixels[4 * (32 * 64 + 32)];
 		result |= check(center[0] > 240 && center[1] > 240 && center[2] > 240,
 			"select-argument-2 uses diffuse color instead of sampled texture");
+		logicalState.pipeline.textureStages[0].colorOperation =
+			rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_1;
+		logicalState.pipeline.textureStages[0].colorArgument1 =
+			rts::render::RENDER_TEXTURE_ARG_TEXTURE;
+		logicalState.pipeline.textureStages[0].colorArgument1Complement = true;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyState(logicalState,
+				rts::render::RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1, 1) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(texturedVertexBuffer,
+				sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(0, texture) == rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"D3D11 texture combiners accept legacy argument modifiers");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[0] > 240 && center[1] < 16 && center[2] > 240,
+			"texture complement produces the hand-derived magenta result");
+		logicalState.pipeline.textureStages[0].colorArgument1Complement = false;
+
+		const unsigned int redPixels[4] = {
+			0xff0000ffU, 0xff0000ffU, 0xff0000ffU, 0xff0000ffU
+		};
+		rts::render::TextureSubresourceData secondTextureData;
+		secondTextureData.data = redPixels;
+		secondTextureData.rowPitch = 2 * sizeof(unsigned int);
+		secondTextureData.slicePitch = sizeof(redPixels);
+		rts::render::GpuHandle secondTexture;
+		result |= check(device->createTexture(textureDescriptor,
+			&secondTextureData, 1, &secondTexture) ==
+			rts::render::RENDER_RESULT_OK,
+			"D3D11 parity probe creates a second texture stage resource");
+		logicalState.pipeline.textureStages[1].colorOperation =
+			rts::render::RENDER_TEXTURE_OP_ADD;
+		logicalState.pipeline.textureStages[1].colorArgument1 =
+			rts::render::RENDER_TEXTURE_ARG_TEXTURE;
+		logicalState.pipeline.textureStages[1].colorArgument2 =
+			rts::render::RENDER_TEXTURE_ARG_CURRENT;
+		logicalState.pipeline.textureStages[1].alphaOperation =
+			rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_2;
+		logicalState.pipeline.textureStages[1].alphaArgument2 =
+			rts::render::RENDER_TEXTURE_ARG_CURRENT;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyState(logicalState,
+				rts::render::RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1, 3) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(texturedVertexBuffer,
+				sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(0, texture) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(1, secondTexture) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"D3D11 parity pipeline executes two fixed-function texture stages");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[0] < 16 && center[1] > 240 && center[2] > 240,
+			"two-stage add combines green and red into yellow deterministically");
+		logicalState.pipeline.textureStages[1] =
+			rts::render::LegacyTextureStageState();
 		logicalState.pipeline.lightingEnable = true;
 		logicalState.constants.material.ambient = rts::render::RenderFloat4();
 		logicalState.constants.material.emissive = rts::render::RenderFloat4();
@@ -732,9 +807,9 @@ int testD3D11HiddenSwapChain()
 		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
 			context->setLegacyState(logicalState,
 				rts::render::RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1, 1) ==
-				rts::render::RENDER_RESULT_UNSUPPORTED &&
+				rts::render::RENDER_RESULT_OK &&
 			context->endFrame() == rts::render::RENDER_RESULT_OK,
-			"D3D11 parity boundary rejects unimplemented bump combiners explicitly");
+			"D3D11 parity boundary accepts legacy bump-environment combiners");
 		unsigned int debugErrorCount = 0xffffffffU;
 		result |= check(device->getDebugValidationErrorCount(&debugErrorCount) ==
 			rts::render::RENDER_RESULT_OK && debugErrorCount == 0,
@@ -743,6 +818,7 @@ int testD3D11HiddenSwapChain()
 			device->destroyResource(indexBuffer) &&
 			device->destroyResource(texturedVertexBuffer) &&
 			device->destroyResource(texture) &&
+			device->destroyResource(secondTexture) &&
 			device->destroyResource(offscreenColor) &&
 			device->destroyResource(offscreenDepth) &&
 			device->present() == rts::render::RENDER_RESULT_OK &&

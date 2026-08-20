@@ -205,10 +205,14 @@ struct LegacyTransformConstants
 	float fogColor[4];
 	float fogParameters[4];
 	unsigned int alphaTestParameters[4];
-	unsigned int textureColorParameters[4];
-	unsigned int textureAlphaParameters[4];
+	unsigned int textureColorParameters[LEGACY_TEXTURE_STAGE_COUNT][4];
+	unsigned int textureAlphaParameters[LEGACY_TEXTURE_STAGE_COUNT][4];
+	unsigned int textureModifierParameters[LEGACY_TEXTURE_STAGE_COUNT][4];
+	float textureBumpParameters0[LEGACY_TEXTURE_STAGE_COUNT][4];
+	float textureBumpParameters1[LEGACY_TEXTURE_STAGE_COUNT][4];
 	float textureFactor[4];
 	float world[16];
+	float textureTransforms[LEGACY_TEXTURE_STAGE_COUNT][16];
 	float materialDiffuse[4];
 	float materialAmbient[4];
 	float materialEmissive[4];
@@ -889,8 +893,8 @@ public:
 		}
 		const bool textured = texturePresenceMask != 0;
 		if ((!textured && vertexFormat != RENDER_VERTEX_POSITION3_COLOR) ||
-			(textured && (texturePresenceMask != 1 ||
-				vertexFormat != RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1)))
+			(textured && vertexFormat !=
+				RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1))
 		{
 			return RENDER_RESULT_UNSUPPORTED;
 		}
@@ -898,13 +902,16 @@ public:
 		{
 			return RENDER_RESULT_UNSUPPORTED;
 		}
-		if (textured &&
-			(state.pipeline.textureStages[0].colorOperation >
-				RENDER_TEXTURE_OP_DOT_PRODUCT_3 ||
-			state.pipeline.textureStages[0].alphaOperation >
-				RENDER_TEXTURE_OP_DOT_PRODUCT_3))
+		for (unsigned int stage = 0; textured &&
+			stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
 		{
-			return RENDER_RESULT_UNSUPPORTED;
+			if (state.pipeline.textureStages[stage].colorOperation >
+					RENDER_TEXTURE_OP_LINEAR_INTERPOLATE ||
+				state.pipeline.textureStages[stage].alphaOperation >
+					RENDER_TEXTURE_OP_LINEAR_INTERPOLATE)
+			{
+				return RENDER_RESULT_UNSUPPORTED;
+			}
 		}
 		const HRESULT transformResult = updateTransformConstants(state);
 		if (FAILED(transformResult))
@@ -990,35 +997,41 @@ public:
 		{
 			return TranslateResult(result);
 		}
-		ID3D11SamplerState *samplerState = 0;
+		ID3D11SamplerState *samplerStates[LEGACY_TEXTURE_STAGE_COUNT] = { 0 };
 		if (textured)
 		{
-			const LegacySamplerState &sampler =
-				state.pipeline.textureStages[0].sampler;
-			D3D11_SAMPLER_DESC samplerDescriptor;
-			memset(&samplerDescriptor, 0, sizeof(samplerDescriptor));
-			samplerDescriptor.Filter = TranslateFilter(sampler);
-			samplerDescriptor.AddressU = TranslateAddressMode(sampler.addressU);
-			samplerDescriptor.AddressV = TranslateAddressMode(sampler.addressV);
-			samplerDescriptor.AddressW = TranslateAddressMode(sampler.addressW);
-			samplerDescriptor.MipLODBias = sampler.mipLodBias;
-			samplerDescriptor.MaxAnisotropy = sampler.maximumAnisotropy == 0 ? 1 :
-				sampler.maximumAnisotropy;
-		if (samplerDescriptor.MaxAnisotropy > 16)
-		{
-			samplerDescriptor.MaxAnisotropy = 16;
-		}
-			samplerDescriptor.ComparisonFunc = D3D11_COMPARISON_NEVER;
-			samplerDescriptor.BorderColor[0] = sampler.borderColor.x;
-			samplerDescriptor.BorderColor[1] = sampler.borderColor.y;
-			samplerDescriptor.BorderColor[2] = sampler.borderColor.z;
-			samplerDescriptor.BorderColor[3] = sampler.borderColor.w;
-			samplerDescriptor.MinLOD = static_cast<float>(sampler.maximumMipLevel);
-			samplerDescriptor.MaxLOD = D3D11_FLOAT32_MAX;
-			result = findOrCreateSamplerState(samplerDescriptor, &samplerState);
-			if (FAILED(result))
+			for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT;
+				++stage)
 			{
-				return TranslateResult(result);
+				const LegacySamplerState &sampler =
+					state.pipeline.textureStages[stage].sampler;
+				D3D11_SAMPLER_DESC samplerDescriptor;
+				memset(&samplerDescriptor, 0, sizeof(samplerDescriptor));
+				samplerDescriptor.Filter = TranslateFilter(sampler);
+				samplerDescriptor.AddressU = TranslateAddressMode(sampler.addressU);
+				samplerDescriptor.AddressV = TranslateAddressMode(sampler.addressV);
+				samplerDescriptor.AddressW = TranslateAddressMode(sampler.addressW);
+				samplerDescriptor.MipLODBias = sampler.mipLodBias;
+				samplerDescriptor.MaxAnisotropy =
+					sampler.maximumAnisotropy == 0 ? 1 : sampler.maximumAnisotropy;
+				if (samplerDescriptor.MaxAnisotropy > 16)
+				{
+					samplerDescriptor.MaxAnisotropy = 16;
+				}
+				samplerDescriptor.ComparisonFunc = D3D11_COMPARISON_NEVER;
+				samplerDescriptor.BorderColor[0] = sampler.borderColor.x;
+				samplerDescriptor.BorderColor[1] = sampler.borderColor.y;
+				samplerDescriptor.BorderColor[2] = sampler.borderColor.z;
+				samplerDescriptor.BorderColor[3] = sampler.borderColor.w;
+				samplerDescriptor.MinLOD =
+					static_cast<float>(sampler.maximumMipLevel);
+				samplerDescriptor.MaxLOD = D3D11_FLOAT32_MAX;
+				result = findOrCreateSamplerState(samplerDescriptor,
+					&samplerStates[stage]);
+				if (FAILED(result))
+				{
+					return TranslateResult(result);
+				}
 			}
 		}
 
@@ -1035,7 +1048,7 @@ public:
 			0, 0);
 		if (textured)
 		{
-			m_context->PSSetSamplers(0, 1, &samplerState);
+			m_context->PSSetSamplers(0, LEGACY_TEXTURE_STAGE_COUNT, samplerStates);
 		}
 		m_pipelineBound = true;
 		return RENDER_RESULT_OK;
@@ -1362,6 +1375,20 @@ private:
 			{ "COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 24,
 				D3D11_INPUT_PER_VERTEX_DATA, 0 },
 			{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 28,
+				D3D11_INPUT_PER_VERTEX_DATA, 0 },
+			{ "TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT, 0, 28,
+				D3D11_INPUT_PER_VERTEX_DATA, 0 },
+			{ "TEXCOORD", 2, DXGI_FORMAT_R32G32_FLOAT, 0, 28,
+				D3D11_INPUT_PER_VERTEX_DATA, 0 },
+			{ "TEXCOORD", 3, DXGI_FORMAT_R32G32_FLOAT, 0, 28,
+				D3D11_INPUT_PER_VERTEX_DATA, 0 },
+			{ "TEXCOORD", 4, DXGI_FORMAT_R32G32_FLOAT, 0, 28,
+				D3D11_INPUT_PER_VERTEX_DATA, 0 },
+			{ "TEXCOORD", 5, DXGI_FORMAT_R32G32_FLOAT, 0, 28,
+				D3D11_INPUT_PER_VERTEX_DATA, 0 },
+			{ "TEXCOORD", 6, DXGI_FORMAT_R32G32_FLOAT, 0, 28,
+				D3D11_INPUT_PER_VERTEX_DATA, 0 },
+			{ "TEXCOORD", 7, DXGI_FORMAT_R32G32_FLOAT, 0, 28,
 				D3D11_INPUT_PER_VERTEX_DATA, 0 }
 		};
 		return m_device->CreateInputLayout(texturedElements,
@@ -1396,22 +1423,65 @@ private:
 			state.pipeline.alphaReference > 255 ? 255 :
 			state.pipeline.alphaReference;
 		shaderConstants.alphaTestParameters[3] = 0;
-		const LegacyTextureStageState &textureStage =
-			state.pipeline.textureStages[0];
-		shaderConstants.textureColorParameters[0] =
-			static_cast<unsigned int>(textureStage.colorOperation);
-		shaderConstants.textureColorParameters[1] =
-			static_cast<unsigned int>(textureStage.colorArgument1);
-		shaderConstants.textureColorParameters[2] =
-			static_cast<unsigned int>(textureStage.colorArgument2);
-		shaderConstants.textureColorParameters[3] =
-			static_cast<unsigned int>(textureStage.alphaOperation);
-		shaderConstants.textureAlphaParameters[0] =
-			static_cast<unsigned int>(textureStage.alphaArgument1);
-		shaderConstants.textureAlphaParameters[1] =
-			static_cast<unsigned int>(textureStage.alphaArgument2);
-		shaderConstants.textureAlphaParameters[2] = 0;
-		shaderConstants.textureAlphaParameters[3] = 0;
+		for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
+		{
+			const LegacyTextureStageState &textureStage =
+				state.pipeline.textureStages[stage];
+			shaderConstants.textureColorParameters[stage][0] =
+				static_cast<unsigned int>(textureStage.colorOperation);
+			shaderConstants.textureColorParameters[stage][1] =
+				static_cast<unsigned int>(textureStage.colorArgument0);
+			shaderConstants.textureColorParameters[stage][2] =
+				static_cast<unsigned int>(textureStage.colorArgument1);
+			shaderConstants.textureColorParameters[stage][3] =
+				static_cast<unsigned int>(textureStage.colorArgument2);
+			shaderConstants.textureAlphaParameters[stage][0] =
+				static_cast<unsigned int>(textureStage.alphaOperation);
+			shaderConstants.textureAlphaParameters[stage][1] =
+				static_cast<unsigned int>(textureStage.alphaArgument0);
+			shaderConstants.textureAlphaParameters[stage][2] =
+				static_cast<unsigned int>(textureStage.alphaArgument1);
+			shaderConstants.textureAlphaParameters[stage][3] =
+				static_cast<unsigned int>(textureStage.alphaArgument2);
+			shaderConstants.textureModifierParameters[stage][0] =
+				(static_cast<unsigned int>(textureStage.colorArgument0Complement) << 0) |
+				(static_cast<unsigned int>(textureStage.colorArgument0AlphaReplicate) << 1) |
+				(static_cast<unsigned int>(textureStage.colorArgument1Complement) << 2) |
+				(static_cast<unsigned int>(textureStage.colorArgument1AlphaReplicate) << 3) |
+				(static_cast<unsigned int>(textureStage.colorArgument2Complement) << 4) |
+				(static_cast<unsigned int>(textureStage.colorArgument2AlphaReplicate) << 5);
+			shaderConstants.textureModifierParameters[stage][1] =
+				(static_cast<unsigned int>(textureStage.alphaArgument0Complement) << 0) |
+				(static_cast<unsigned int>(textureStage.alphaArgument0AlphaReplicate) << 1) |
+				(static_cast<unsigned int>(textureStage.alphaArgument1Complement) << 2) |
+				(static_cast<unsigned int>(textureStage.alphaArgument1AlphaReplicate) << 3) |
+				(static_cast<unsigned int>(textureStage.alphaArgument2Complement) << 4) |
+				(static_cast<unsigned int>(textureStage.alphaArgument2AlphaReplicate) << 5);
+			shaderConstants.textureModifierParameters[stage][2] =
+				(textureStage.textureCoordinateIndex & 7U) |
+				(textureStage.resultArgument == RENDER_TEXTURE_ARG_TEMP ? 0x100U : 0U);
+			shaderConstants.textureModifierParameters[stage][3] =
+				textureStage.projectedCoordinates ? 1U : 0U;
+			shaderConstants.textureBumpParameters0[stage][0] =
+				textureStage.bumpEnvironmentMatrix00;
+			shaderConstants.textureBumpParameters0[stage][1] =
+				textureStage.bumpEnvironmentMatrix01;
+			shaderConstants.textureBumpParameters0[stage][2] =
+				textureStage.bumpEnvironmentMatrix10;
+			shaderConstants.textureBumpParameters0[stage][3] =
+				textureStage.bumpEnvironmentMatrix11;
+			shaderConstants.textureBumpParameters1[stage][0] =
+				textureStage.bumpEnvironmentLuminanceScale;
+			shaderConstants.textureBumpParameters1[stage][1] =
+				textureStage.bumpEnvironmentLuminanceOffset;
+			shaderConstants.textureBumpParameters1[stage][2] = 0.0f;
+			shaderConstants.textureBumpParameters1[stage][3] = 0.0f;
+			for (unsigned int component = 0; component < 16; ++component)
+			{
+				shaderConstants.textureTransforms[stage][component] =
+					state.constants.textureTransforms[stage].values[component];
+			}
+		}
 		const unsigned int textureFactor = state.pipeline.textureFactor;
 		shaderConstants.textureFactor[0] =
 			static_cast<float>((textureFactor >> 16) & 0xffU) / 255.0f;
