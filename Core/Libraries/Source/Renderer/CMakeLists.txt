@@ -1,4 +1,5 @@
 add_library(core_renderer STATIC
+    LegacyRenderState.cpp
     RendererDevice.cpp
 )
 

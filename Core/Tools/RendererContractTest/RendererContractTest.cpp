@@ -1,4 +1,5 @@
 #include "Renderer/RendererDevice.h"
+#include "Renderer/LegacyRenderState.h"
 
 #include <stdio.h>
 
@@ -87,6 +88,61 @@ int testNeutralDescriptorDefaults()
 		texture.format == rts::render::RENDER_FORMAT_UNKNOWN &&
 		texture.binding == rts::render::RENDER_TEXTURE_SHADER_RESOURCE,
 		"texture descriptor has deterministic defaults");
+	return result;
+}
+
+int testLegacyLogicalState()
+{
+	int result = 0;
+	rts::render::LegacyLogicalState state;
+	result |= check(state.pipeline.depthStencil.depthEnable &&
+		state.pipeline.depthStencil.depthWrite &&
+		state.pipeline.depthStencil.depthFunction ==
+			rts::render::RENDER_COMPARE_LESS_EQUAL &&
+		!state.pipeline.blend.blendEnable &&
+		state.pipeline.rasterizer.cullMode == rts::render::RENDER_CULL_BACK,
+		"legacy logical state starts with deterministic depth and raster defaults");
+	result |= check(state.constants.world.values[0] == 1.0f &&
+		state.constants.world.values[5] == 1.0f &&
+		state.constants.world.values[10] == 1.0f &&
+		state.constants.world.values[15] == 1.0f &&
+		state.constants.material.diffuse.w == 1.0f,
+		"legacy transforms and material use identity/opaque defaults");
+	result |= check(!state.constants.lights[0].enabled &&
+		!state.constants.fog.enabled &&
+		state.pipeline.textureStages[0].colorOperation ==
+			rts::render::RENDER_TEXTURE_OP_MODULATE &&
+		state.pipeline.textureStages[1].colorOperation ==
+			rts::render::RENDER_TEXTURE_OP_DISABLE,
+		"legacy lights, fog, and texture stages have stable defaults");
+
+	const rts::render::LegacyShaderKey baseline =
+		rts::render::BuildLegacyShaderKey(state.pipeline, 0x11223344U, 1U);
+	const rts::render::LegacyShaderKey repeated =
+		rts::render::BuildLegacyShaderKey(state.pipeline, 0x11223344U, 1U);
+	if (baseline != repeated)
+	{
+		for (unsigned int word = 0;
+			word < rts::render::LegacyShaderKey::WORD_COUNT; ++word)
+		{
+			if (baseline.words[word] != repeated.words[word])
+			{
+				fprintf(stderr, "Shader key word %u differs: %08x != %08x\n",
+					word, baseline.words[word], repeated.words[word]);
+			}
+		}
+	}
+	result |= check(baseline == repeated,
+		"identical logical states produce identical shader keys");
+	state.pipeline.textureStages[0].colorOperation =
+		rts::render::RENDER_TEXTURE_OP_ADD_SIGNED_2X;
+	const rts::render::LegacyShaderKey combinerKey =
+		rts::render::BuildLegacyShaderKey(state.pipeline, 0x11223344U, 1U);
+	state.pipeline.fogMode = rts::render::RENDER_FOG_LINEAR;
+	const rts::render::LegacyShaderKey fogKey =
+		rts::render::BuildLegacyShaderKey(state.pipeline, 0x11223344U, 1U);
+	result |= check(combinerKey != baseline && fogKey != combinerKey,
+		"shader key distinguishes texture combiner and fog variants");
 	return result;
 }
 
@@ -228,6 +284,7 @@ int main()
 	result |= testBackendNames();
 	result |= testGenerationSafeHandles();
 	result |= testNeutralDescriptorDefaults();
+	result |= testLegacyLogicalState();
 #if defined(RTS_RENDERER_HAS_D3D11)
 	result |= testD3D11HeadlessDevice();
 	result |= testD3D11HiddenSwapChain();
