@@ -362,6 +362,53 @@ int testD3D11HiddenSwapChain()
 			center[2] > 240 && center[0] < 16,
 			"captured D3D11 triangle preserves clear and vertex colors");
 
+		const unsigned short indices[3] = { 0, 1, 2 };
+		rts::render::BufferDescriptor indexDescriptor;
+		indexDescriptor.byteCount = sizeof(indices);
+		indexDescriptor.stride = sizeof(indices[0]);
+		indexDescriptor.binding = rts::render::RENDER_BUFFER_INDEX;
+		rts::render::GpuHandle indexBuffer;
+		result |= check(device->createBuffer(indexDescriptor, indices,
+			sizeof(indices), &indexBuffer) == rts::render::RENDER_RESULT_OK,
+			"D3D11 parity probe creates an immutable index buffer");
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->setIndexBuffer(vertexBuffer,
+				rts::render::RENDER_FORMAT_R16_UINT, 0) ==
+				rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+			context->setIndexBuffer(indexBuffer,
+				rts::render::RENDER_FORMAT_UNKNOWN, 0) ==
+				rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+			context->setIndexBuffer(indexBuffer,
+				rts::render::RENDER_FORMAT_R16_UINT, 1) ==
+				rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+			context->drawIndexed(3, 0, 0) ==
+				rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK,
+			"D3D11 indexed drawing rejects wrong bindings, formats, alignment, and state");
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyState(logicalState,
+				rts::render::RENDER_VERTEX_POSITION3_COLOR, 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(vertexBuffer, sizeof(TestVertex), 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setIndexBuffer(indexBuffer,
+				rts::render::RENDER_FORMAT_R16_UINT, 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->drawIndexed(3, 0, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"D3D11 parity pipeline binds and draws indexed geometry");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[2] > 240 && center[0] < 16,
+			"captured indexed triangle preserves the indexed draw result");
+
 		struct TexturedVertex
 		{
 			float position[3];
@@ -428,6 +475,7 @@ int testD3D11HiddenSwapChain()
 			rts::render::RENDER_RESULT_OK && debugErrorCount == 0,
 			"D3D11 debug layer reports no validation errors");
 		result |= check(device->destroyResource(vertexBuffer) &&
+			device->destroyResource(indexBuffer) &&
 			device->destroyResource(texturedVertexBuffer) &&
 			device->destroyResource(texture) &&
 			device->present() == rts::render::RENDER_RESULT_OK &&

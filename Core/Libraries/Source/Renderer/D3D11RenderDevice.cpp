@@ -204,7 +204,7 @@ public:
 		m_texturedLayout(0),
 		m_handles(0), m_ownerThread(0), m_initialized(false),
 		m_frameOpen(false), m_pipelineBound(false), m_vertexBufferBound(false),
-		m_topologyBound(false),
+		m_indexBufferBound(false), m_topologyBound(false),
 		m_enableVsync(true), m_width(0), m_height(0)
 	{
 	}
@@ -512,13 +512,20 @@ public:
 			m_context->PSSetShaderResources(0, LEGACY_TEXTURE_STAGE_COUNT,
 				emptyViews);
 		}
-		else if (slot.kind == RESOURCE_BUFFER &&
-			(slot.binding & RENDER_BUFFER_VERTEX) != 0)
+		else if (slot.kind == RESOURCE_BUFFER)
 		{
-			ID3D11Buffer *emptyBuffer = 0;
-			const UINT zero = 0;
-			m_context->IASetVertexBuffers(0, 1, &emptyBuffer, &zero, &zero);
-			m_vertexBufferBound = false;
+			if ((slot.binding & RENDER_BUFFER_VERTEX) != 0)
+			{
+				ID3D11Buffer *emptyBuffer = 0;
+				const UINT zero = 0;
+				m_context->IASetVertexBuffers(0, 1, &emptyBuffer, &zero, &zero);
+				m_vertexBufferBound = false;
+			}
+			if ((slot.binding & RENDER_BUFFER_INDEX) != 0)
+			{
+				m_context->IASetIndexBuffer(0, DXGI_FORMAT_UNKNOWN, 0);
+				m_indexBufferBound = false;
+			}
 		}
 		return releaseSlot(resource, slot);
 	}
@@ -575,6 +582,7 @@ public:
 		}
 		m_pipelineBound = false;
 		m_vertexBufferBound = false;
+		m_indexBufferBound = false;
 		m_topologyBound = false;
 		m_frameOpen = true;
 		return RENDER_RESULT_OK;
@@ -830,6 +838,30 @@ public:
 		return RENDER_RESULT_OK;
 	}
 
+	virtual RenderResult setIndexBuffer(GpuHandle buffer, RenderFormat format,
+		unsigned int offset)
+	{
+		const DXGI_FORMAT nativeFormat = TranslateFormat(format);
+		const unsigned int indexSize = format == RENDER_FORMAT_R16_UINT ? 2U :
+			(format == RENDER_FORMAT_R32_UINT ? 4U : 0U);
+		if (!isOwner() || !m_frameOpen || indexSize == 0 ||
+			nativeFormat == DXGI_FORMAT_UNKNOWN || !m_handles->isLive(buffer))
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		ResourceSlot &slot = m_resources[buffer.index()];
+		if (slot.kind != RESOURCE_BUFFER ||
+			(slot.binding & RENDER_BUFFER_INDEX) == 0 || offset >= slot.byteCount ||
+			(offset % indexSize) != 0)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		ID3D11Buffer *nativeBuffer = static_cast<ID3D11Buffer *>(slot.resource);
+		m_context->IASetIndexBuffer(nativeBuffer, nativeFormat, offset);
+		m_indexBufferBound = true;
+		return RENDER_RESULT_OK;
+	}
+
 	virtual RenderResult setTexture(unsigned int stage, GpuHandle texture)
 	{
 		if (!isOwner() || !m_frameOpen || stage >= LEGACY_TEXTURE_STAGE_COUNT ||
@@ -883,6 +915,18 @@ public:
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		m_context->Draw(vertexCount, startVertex);
+		return RENDER_RESULT_OK;
+	}
+
+	virtual RenderResult drawIndexed(unsigned int indexCount,
+		unsigned int startIndex, int baseVertex)
+	{
+		if (!isOwner() || !m_frameOpen || !m_pipelineBound || !m_topologyBound ||
+			!m_vertexBufferBound || !m_indexBufferBound || indexCount == 0)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		m_context->DrawIndexed(indexCount, startIndex, baseVertex);
 		return RENDER_RESULT_OK;
 	}
 
@@ -1370,6 +1414,7 @@ private:
 		m_frameOpen = false;
 		m_pipelineBound = false;
 		m_vertexBufferBound = false;
+		m_indexBufferBound = false;
 		m_topologyBound = false;
 		if (m_handles != 0)
 		{
@@ -1502,6 +1547,7 @@ private:
 	bool m_frameOpen;
 	bool m_pipelineBound;
 	bool m_vertexBufferBound;
+	bool m_indexBufferBound;
 	bool m_topologyBound;
 	bool m_enableVsync;
 	unsigned int m_width;

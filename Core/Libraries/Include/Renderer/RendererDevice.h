@@ -169,10 +169,14 @@ public:
 		LegacyVertexFormat vertexFormat, unsigned int texturePresenceMask) = 0;
 	virtual RenderResult setVertexBuffer(GpuHandle buffer, unsigned int stride,
 		unsigned int offset) = 0;
+	virtual RenderResult setIndexBuffer(GpuHandle buffer, RenderFormat format,
+		unsigned int offset) = 0;
 	virtual RenderResult setTexture(unsigned int stage, GpuHandle texture) = 0;
 	virtual RenderResult setPrimitiveTopology(RenderPrimitiveTopology topology) = 0;
 	virtual RenderResult draw(unsigned int vertexCount,
 		unsigned int startVertex) = 0;
+	virtual RenderResult drawIndexed(unsigned int indexCount,
+		unsigned int startIndex, int baseVertex) = 0;
 	virtual RenderResult endFrame() = 0;
 };
 
