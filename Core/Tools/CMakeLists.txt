@@ -8,6 +8,16 @@ endif()
 
 # Build less useful tool/test binaries.
 if(RTS_BUILD_CORE_EXTRAS)
+    add_subdirectory(JobSystemTest)
+
+    if(WIN32)
+        add_test(NAME core_portability_audit
+            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/PortabilityAudit/PortabilityAudit.ps1"
+                -SourceRoot "${CMAKE_SOURCE_DIR}"
+        )
+        set_tests_properties(core_portability_audit PROPERTIES TIMEOUT 120)
+    endif()
     add_subdirectory(TaskRuntimeTest)
     add_subdirectory(RadarTerrainPrepareTest)
     add_subdirectory(HeightMapTerrainPrepareTest)

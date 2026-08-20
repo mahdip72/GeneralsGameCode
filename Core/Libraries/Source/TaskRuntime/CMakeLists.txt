@@ -8,6 +8,18 @@ target_sources(core_task_runtime PRIVATE
     HeightMapDynamicLightKernel.cpp
 )
 
+if(NOT IS_VS6_BUILD)
+    target_sources(core_task_runtime PRIVATE
+        JobSystem.cpp
+    )
+endif()
+
+if(IS_VS6_BUILD)
+    target_sources(core_task_runtime PRIVATE
+        JobSystemLegacy.cpp
+    )
+endif()
+
 target_include_directories(core_task_runtime PUBLIC
     ${CMAKE_SOURCE_DIR}/Core/Libraries/Include
 )
@@ -20,11 +32,19 @@ target_link_libraries(core_task_runtime PUBLIC
     core_utility_no_pch
 )
 
-set_target_properties(core_task_runtime PROPERTIES
-    CXX_STANDARD 98
-    CXX_STANDARD_REQUIRED YES
-    CXX_EXTENSIONS NO
-)
+if(IS_VS6_BUILD)
+    set_target_properties(core_task_runtime PROPERTIES
+        CXX_STANDARD 98
+        CXX_STANDARD_REQUIRED YES
+        CXX_EXTENSIONS NO
+    )
+else()
+    set_target_properties(core_task_runtime PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED YES
+        CXX_EXTENSIONS NO
+    )
+endif()
 
 if(RTS_BUILD_CORE_EXTRAS)
     target_compile_definitions(core_task_runtime PRIVATE

@@ -39,7 +39,7 @@
  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 #include "textureloader.h"
-#include "Lib/TaskRuntime.h"
+#include "Lib/JobSystem.h"
 #include "WWLib/mutex.h"
 #include "WWLib/thread.h"
 #include "WWDebug/wwdebug.h"
@@ -204,18 +204,28 @@ void SynchronizedTextureLoadTaskListClass::Publish_Thumbnail(
 	TextureLoadTaskListClass::Push_Back(task);
 }
 
-rts::Task *SynchronizedTextureLoadTaskListClass::Take_Prepare_Task(
-	TextureLoadTaskClass *task, rts::TaskRuntime& runtime, bool& wasSubmitted)
+bool SynchronizedTextureLoadTaskListClass::Has_Prepare_Job(
+	TextureLoadTaskClass *task)
 {
 	FastCriticalSectionClass::LockClass lock(CriticalSection);
-	rts::Task *runtimeTask = static_cast<rts::Task *>(task->Get_Prepare_Runtime_Task());
-	wasSubmitted = runtimeTask != nullptr;
-	if (runtimeTask != nullptr && runtime.tryTake(runtimeTask))
-	{
-		task->Set_Prepare_Runtime_Task(nullptr);
-		return runtimeTask;
-	}
-	return nullptr;
+	return task->Get_Prepare_Runtime_Task() != nullptr;
+}
+
+void SynchronizedTextureLoadTaskListClass::Set_Prepare_Job(
+	TextureLoadTaskClass *task, void *prepareJob)
+{
+	FastCriticalSectionClass::LockClass lock(CriticalSection);
+	task->Set_Prepare_Runtime_Task(prepareJob);
+}
+
+bool SynchronizedTextureLoadTaskListClass::Promote_Prepare_Job(
+	TextureLoadTaskClass *task)
+{
+	FastCriticalSectionClass::LockClass lock(CriticalSection);
+	rts::Job *prepareJob = static_cast<rts::Job *>(
+		task->Get_Prepare_Runtime_Task());
+	return prepareJob != nullptr && rts::JobSystem::instance().tryPromote(
+		prepareJob, rts::JOB_PRIORITY_FRAME_CRITICAL);
 }
 
 TextureLoadTaskClass *SynchronizedTextureLoadTaskListClass::Pop_Front()
@@ -261,7 +271,7 @@ static TextureLoadTaskListClass					_CubeTexLoadFreeList;
 static TextureLoadTaskListClass					_VolTexLoadFreeList;
 
 
-static rts::TaskRuntime _TexturePrepareRuntime;
+static rts::JobGroup _TexturePrepareGroup;
 static TexturePrepareMemoryBudget _TexturePrepareMemoryBudget(64u * 1024u * 1024u);
 
 static bool Try_Load_For_Owner(TextureLoadTaskClass *task)
@@ -281,12 +291,12 @@ static bool Try_Load_For_Owner(TextureLoadTaskClass *task)
 	}
 }
 
-class TexturePrepareRuntimeTask : public rts::Task
+class TexturePrepareRuntimeTask : public rts::Job
 {
 public:
 	explicit TexturePrepareRuntimeTask(TextureLoadTaskClass *task) : m_task(task) {}
 
-	virtual void execute()
+	virtual void execute(rts::JobContext &)
 	{
 		WWASSERT(m_task != nullptr);
 		WWASSERT(m_task->Get_Type() == TextureLoadTaskClass::TASK_LOAD);
@@ -297,7 +307,7 @@ public:
 		}
 		catch (...)
 		{
-			// TaskRuntime contains the exception after execute returns, but the
+			// JobSystem contains the exception after execute returns, but the
 			// texture owner still needs a completion publication so it can apply
 			// the missing texture and release the task's staged resources.
 			_ForegroundQueue.Publish_Failed(m_task);
@@ -309,18 +319,6 @@ public:
 private:
 	TextureLoadTaskClass *m_task;
 };
-
-static unsigned Get_Texture_Prepare_Worker_Count()
-{
-#if defined(_WIN32)
-	SYSTEM_INFO systemInfo;
-	GetSystemInfo(&systemInfo);
-	return systemInfo.dwNumberOfProcessors > 1 ? 2u : 1u;
-#else
-	return 1u;
-#endif
-}
-
 
 // TODO: Legacy - remove this call!
 IDirect3DTexture8* Load_Compressed_Texture(
@@ -402,14 +400,12 @@ static bool Is_Format_Compressed(WW3DFormat texture_format,bool allow_compressio
 
 void TextureLoader::Init()
 {
-	WWASSERT(!_TexturePrepareRuntime.isRunning());
-
 	ThumbnailManagerClass::Init();
 
-	const unsigned workerCount = Get_Texture_Prepare_Worker_Count();
-	if (!_TexturePrepareRuntime.start(workerCount, 8) && workerCount > 1)
+	rts::JobSystem &system = rts::JobSystem::instance();
+	if (system.ensureStarted())
 	{
-		_TexturePrepareRuntime.start(1, 8);
+		_TexturePrepareGroup = system.createGroup();
 	}
 	{
 		FastCriticalSectionClass::LockClass lock(_ForegroundCriticalSection);
@@ -425,7 +421,11 @@ void TextureLoader::Deinit()
 		FastCriticalSectionClass::LockClass lock(_ForegroundCriticalSection);
 		_AcceptingTextureRequests = false;
 	}
-	_TexturePrepareRuntime.shutdown();
+	if (_TexturePrepareGroup.isValid())
+	{
+		rts::JobSystem::instance().wait(_TexturePrepareGroup);
+		_TexturePrepareGroup = rts::JobGroup();
+	}
 
 	TextureLoadTaskClass *task = nullptr;
 	while ((task = _ForegroundQueue.Pop_Front()) != nullptr)
@@ -855,16 +855,7 @@ void TextureLoader::Request_Foreground_Loading(TextureBaseClass *tc)
 			// active, wait only for that preparation.
 			if (!task->Is_Async_Prepare_Complete())
 			{
-				bool wasSubmitted = false;
-				rts::Task *runtimeTask = _ForegroundQueue.Take_Prepare_Task(
-					task, _TexturePrepareRuntime, wasSubmitted);
-				if (runtimeTask != nullptr)
-				{
-					delete runtimeTask;
-					Try_Load_For_Owner(task);
-					task->Complete_Async_Prepare();
-				}
-				else if (wasSubmitted)
+				if (_ForegroundQueue.Has_Prepare_Job(task))
 				{
 					task->Wait_For_Async_Prepare();
 				}
@@ -893,18 +884,9 @@ void TextureLoader::Request_Foreground_Loading(TextureBaseClass *tc)
 
 		if (task) {
 			task->Set_Priority(TextureLoadTaskClass::PRIORITY_HIGH);
-			// Reclaim queued preparation immediately so the render owner can
-			// finish it ahead of unrelated FIFO work. An active worker keeps
-			// ownership and will publish the task normally; this caller must not
-			// block while holding the foreground lock.
-			bool wasSubmitted = false;
-			rts::Task *runtimeTask = _ForegroundQueue.Take_Prepare_Task(
-				task, _TexturePrepareRuntime, wasSubmitted);
-			if (runtimeTask != nullptr)
-			{
-				delete runtimeTask;
-				_ForegroundQueue.Push_Back(task);
-			}
+			// Promote queued preparation ahead of streaming work. If a worker
+			// already owns it, publication proceeds normally.
+			_ForegroundQueue.Promote_Prepare_Job(task);
 
 		} else {
 			// allocate high priority load task
@@ -927,7 +909,10 @@ void TextureLoader::Flush_Pending_Load_Tasks()
 	WWASSERT(Is_DX8_Thread());
 
 	for (;;) {
-		_TexturePrepareRuntime.waitUntilIdle();
+		if (_TexturePrepareGroup.isValid())
+		{
+			rts::JobSystem::instance().wait(_TexturePrepareGroup);
+		}
 		if (_ForegroundQueue.Is_Empty()) {
 			break;
 		}
@@ -1068,12 +1053,28 @@ void TextureLoader::Begin_Load_And_Queue(TextureLoadTaskClass *task)
 
 		if (runtimeTask != nullptr && task->Begin_Async_Prepare())
 		{
-			task->Set_Prepare_Runtime_Task(runtimeTask);
-			if (_TexturePrepareRuntime.trySubmitFront(runtimeTask))
+			_ForegroundQueue.Set_Prepare_Job(task, runtimeTask);
+			rts::JobSystem &system = rts::JobSystem::instance();
+			if (!system.isRunning())
+			{
+				system.ensureStarted();
+			}
+			if (!_TexturePrepareGroup.isValid() && system.isRunning())
+			{
+				_TexturePrepareGroup = system.createGroup();
+			}
+			const rts::JobPriority priority =
+				task->Get_Priority() == TextureLoadTaskClass::PRIORITY_HIGH ?
+					rts::JOB_PRIORITY_FRAME_CRITICAL :
+					rts::JOB_PRIORITY_STREAMING;
+			if (_TexturePrepareGroup.isValid() &&
+				system.trySubmit(runtimeTask, priority,
+					_TexturePrepareGroup).isValid())
 			{
 				return;
 			}
-			task->Set_Prepare_Runtime_Task(nullptr);
+			_ForegroundQueue.Set_Prepare_Job(task, nullptr);
+			system.recordSerialFallback();
 		}
 
 		delete runtimeTask;

@@ -177,6 +177,41 @@ bool SplitRadarTerrainRowRanges(unsigned rowBegin, unsigned rowEnd,
 	return true;
 }
 
+unsigned BuildRadarTerrainRowRanges(unsigned rowBegin, unsigned rowEnd,
+	unsigned desiredRangeCount, RadarTerrainRowRange *ranges,
+	unsigned rangeCapacity)
+{
+	if (ranges == 0 || rowBegin >= rowEnd || desiredRangeCount == 0 ||
+		rangeCapacity == 0)
+	{
+		return 0;
+	}
+
+	const unsigned rowCount = rowEnd - rowBegin;
+	unsigned rangeCount = desiredRangeCount;
+	if (rangeCount > rowCount)
+	{
+		rangeCount = rowCount;
+	}
+	if (rangeCount > rangeCapacity)
+	{
+		rangeCount = rangeCapacity;
+	}
+
+	const unsigned rowsPerRange = rowCount / rangeCount;
+	const unsigned extraRows = rowCount % rangeCount;
+	unsigned nextRow = rowBegin;
+	unsigned index;
+	for (index = 0; index < rangeCount; ++index)
+	{
+		const unsigned rows = rowsPerRange + (index < extraRows ? 1 : 0);
+		ranges[index].begin = nextRow;
+		ranges[index].end = nextRow + rows;
+		nextRow += rows;
+	}
+	return rangeCount;
+}
+
 /*
  * The terrain adapter is owner-stack state.  RadarTerrainPrepareService
  * joins both tasks before this object can leave scope.
@@ -294,11 +329,12 @@ static bool radarTerrainPrepareRowsAreValid(
 struct RadarTerrainTaskBatch
 {
 	RadarPrepareRowWork *work;
-	unsigned char results[2];
+	unsigned char *results;
+	unsigned resultCount;
 };
 
 /* A task owns only this batch view pointer and its exclusive row range. */
-class RadarPrepareRowTask : public rts::Task
+class RadarPrepareRowTask : public rts::Job
 {
 public:
 	RadarPrepareRowTask(RadarTerrainTaskBatch *batch, unsigned rowBegin,
@@ -306,7 +342,7 @@ public:
 		: m_batch(batch), m_rowBegin(rowBegin), m_rowEnd(rowEnd),
 		  m_resultIndex(resultIndex)
 	{
-		if (m_batch != 0 && m_resultIndex < 2)
+		if (m_batch != 0 && m_resultIndex < m_batch->resultCount)
 		{
 			m_batch->results[m_resultIndex] = 0;
 		}
@@ -316,13 +352,17 @@ public:
 	{
 	}
 
-	virtual void execute()
+	virtual void execute(rts::JobContext &context)
 	{
 		const bool completed = m_batch != 0 && m_batch->work != 0 &&
 			m_batch->work->executeRows(m_rowBegin, m_rowEnd);
-		if (m_batch != 0 && m_resultIndex < 2)
+		if (m_batch != 0 && m_resultIndex < m_batch->resultCount)
 		{
 			m_batch->results[m_resultIndex] = completed ? 1 : 0;
+		}
+		if (!completed)
+		{
+			context.fail();
 		}
 	}
 
@@ -390,14 +430,9 @@ bool RadarTerrainPrepareService::initialize(unsigned workerCount,
 		return false;
 	}
 
-	if (workerCount > 2)
-	{
-		workerCount = 2;
-	}
-
 	if (m_initialized && !m_stopping)
 	{
-		/* Do not silently replace an active display's private runtime. */
+		/* Do not silently replace an active display's configuration. */
 		return m_requestedWorkers == workerCount &&
 			m_queueCapacity == queueCapacity;
 	}
@@ -407,8 +442,6 @@ bool RadarTerrainPrepareService::initialize(unsigned workerCount,
 		return false;
 	}
 
-	/* shutdown() leaves the private TaskRuntime restartable and idle. */
-	m_runtime.shutdown();
 	m_requestedWorkers = workerCount;
 	m_queueCapacity = queueCapacity;
 	m_activeConsumer = 0;
@@ -433,129 +466,180 @@ bool RadarTerrainPrepareService::tryAcquire(unsigned consumerId)
 bool RadarTerrainPrepareService::warmup()
 {
 	return m_initialized && !m_stopping && !m_leaseActive &&
-		startRuntime(m_requestedWorkers);
-}
-
-bool RadarTerrainPrepareService::startRuntime(unsigned workerCount)
-{
-	if (workerCount == 0 || workerCount > 2 || m_queueCapacity == 0)
-	{
-		return false;
-	}
-
-	if (m_runtime.isRunning())
-	{
-		if (m_runtime.workerCount() == workerCount)
-		{
-			return true;
-		}
-		stopIdleRuntime();
-	}
-
-	return m_runtime.start(workerCount, m_queueCapacity);
-}
-
-void RadarTerrainPrepareService::stopIdleRuntime()
-{
-	/* Only the owner calls this, and every accepted task is joined first. */
-	m_runtime.waitUntilIdle();
-	m_runtime.shutdown();
+		rts::JobSystem::instance().ensureStarted();
 }
 
 bool RadarTerrainPrepareService::runAttempt(RadarPrepareRowWork *work,
 	unsigned rowBegin, unsigned rowEnd,
-	unsigned workerCount)
+	unsigned desiredRangeCount, bool *ranParallel)
 {
-	RadarTerrainRowRange ranges[2];
-	RadarPrepareRowTask *tasks[2] = { 0, 0 };
+	if (ranParallel != 0)
+	{
+		*ranParallel = false;
+	}
+	if (work == 0 || rowBegin >= rowEnd || desiredRangeCount == 0)
+	{
+		return false;
+	}
+
+	rts::JobSystem &system = rts::JobSystem::instance();
+	if (!system.ensureStarted())
+	{
+		return false;
+	}
+
+	const unsigned rowCount = rowEnd - rowBegin;
+	unsigned rangeCapacity = desiredRangeCount;
+	if (rangeCapacity > rowCount)
+	{
+		rangeCapacity = rowCount;
+	}
+	RadarTerrainRowRange *ranges = 0;
+	RadarPrepareRowTask **tasks = 0;
+	rts::JobSubmission *submissions = 0;
+	rts::JobHandle *handles = 0;
+	unsigned char *results = 0;
 	RadarTerrainTaskBatch taskBatch;
-	bool submitted;
 	taskBatch.work = work;
-	taskBatch.results[0] = 0;
-	taskBatch.results[1] = 0;
-	if (!SplitRadarTerrainRowRanges(rowBegin, rowEnd, ranges))
+	taskBatch.results = 0;
+	taskBatch.resultCount = 0;
+	try
 	{
+		ranges = new RadarTerrainRowRange[rangeCapacity];
+		tasks = new RadarPrepareRowTask *[rangeCapacity];
+		submissions = new rts::JobSubmission[rangeCapacity];
+		handles = new rts::JobHandle[rangeCapacity];
+		results = new unsigned char[rangeCapacity];
+	}
+	catch (...)
+	{
+		delete [] results;
+		delete [] handles;
+		delete [] submissions;
+		delete [] tasks;
+		delete [] ranges;
 		return false;
 	}
 
-	if (!startRuntime(workerCount))
+	const unsigned rangeCount = BuildRadarTerrainRowRanges(rowBegin, rowEnd,
+		desiredRangeCount, ranges, rangeCapacity);
+	if (rangeCount == 0)
 	{
+		delete [] results;
+		delete [] handles;
+		delete [] submissions;
+		delete [] tasks;
+		delete [] ranges;
 		return false;
 	}
-
-	/* Always construct exactly two disjoint wrappers for one batch. */
-	tasks[0] = radarPrepareAllocateRowTask(&taskBatch, ranges[0].begin,
-		ranges[0].end, 0);
-	if (tasks[0] == 0)
+	taskBatch.results = results;
+	taskBatch.resultCount = rangeCount;
+	memset(results, 0, rangeCount);
+	unsigned index;
+	for (index = 0; index < rangeCount; ++index)
 	{
-		stopIdleRuntime();
-		return false;
+		tasks[index] = 0;
+	}
+	for (index = 0; index < rangeCount; ++index)
+	{
+		tasks[index] = radarPrepareAllocateRowTask(&taskBatch,
+			ranges[index].begin, ranges[index].end, index);
+		if (tasks[index] == 0)
+		{
+			unsigned cleanupIndex;
+			for (cleanupIndex = 0; cleanupIndex < index; ++cleanupIndex)
+			{
+				delete tasks[cleanupIndex];
+			}
+			delete [] results;
+			delete [] handles;
+			delete [] submissions;
+			delete [] tasks;
+			delete [] ranges;
+			return false;
+		}
+		submissions[index].job = tasks[index];
+		submissions[index].priority = rts::JOB_PRIORITY_FRAME_CRITICAL;
 	}
 
-	tasks[1] = radarPrepareAllocateRowTask(&taskBatch, ranges[1].begin,
-		ranges[1].end, 1);
-	if (tasks[1] == 0)
+	rts::JobGroup group = system.createGroup();
+	bool completed = group.isValid() && system.trySubmitBatch(submissions,
+		rangeCount, group, handles);
+	if (!completed)
 	{
-		delete tasks[0];
-		stopIdleRuntime();
-		return false;
+		for (index = 0; index < rangeCount; ++index)
+		{
+			delete tasks[index];
+		}
+	}
+	else
+	{
+		completed = system.wait(group) && !group.failed() &&
+			!group.wasCancelled();
+		for (index = 0; index < rangeCount; ++index)
+		{
+			completed = completed && handles[index].succeeded() &&
+				results[index] != 0;
+		}
 	}
 
+	delete [] results;
+	delete [] handles;
+	delete [] submissions;
+	delete [] tasks;
+	delete [] ranges;
+	if (completed && ranParallel != 0)
 	{
-		rts::Task *submittedTasks[2];
-		submittedTasks[0] = tasks[0];
-		submittedTasks[1] = tasks[1];
-		submitted = m_runtime.trySubmitBatch(submittedTasks, 2);
+		*ranParallel = rangeCount > 1;
 	}
-	if (!submitted)
-	{
-		/* Rejected wrappers remain caller-owned by TaskRuntime contract. */
-		delete tasks[0];
-		delete tasks[1];
-		stopIdleRuntime();
-		return false;
-	}
-
-	/* Ownership transferred; wait only on this private runtime. */
-	m_runtime.waitUntilIdle();
-	return taskBatch.results[0] != 0 && taskBatch.results[1] != 0;
+	return completed;
 }
 
 bool RadarTerrainPrepareService::runRows(RadarPrepareRowWork *work,
-	unsigned rowBegin, unsigned rowEnd)
+	unsigned rowBegin, unsigned rowEnd, bool *ranParallel)
 {
+	if (ranParallel != 0)
+	{
+		*ranParallel = false;
+	}
 	if (!m_initialized || m_stopping || !m_leaseActive ||
 		work == 0 || rowBegin == rowEnd || rowBegin > rowEnd)
 	{
 		return false;
 	}
 
-	/* A recovery worker count is not retained across owner calls. */
-	if (m_runtime.isRunning() &&
-		m_runtime.workerCount() != m_requestedWorkers)
+	rts::JobSystem &system = rts::JobSystem::instance();
+	if (system.isWorkerThread())
 	{
-		stopIdleRuntime();
+		system.recordSerialFallback();
+		return false;
 	}
-
-	if (runAttempt(work, rowBegin, rowEnd, m_requestedWorkers))
+	const unsigned workerCount = system.ensureStarted() ? system.workerCount() : 0;
+	unsigned desiredRangeCount = workerCount;
+	if (desiredRangeCount > 1 && desiredRangeCount <= UINT_MAX / 2)
 	{
-		return true;
+		desiredRangeCount *= 2;
 	}
-
-	/* A failed two-worker attempt must be idle before the one-worker retry. */
-	stopIdleRuntime();
-	if (m_requestedWorkers > 1 &&
-		runAttempt(work, rowBegin, rowEnd, 1))
+	if (runAttempt(work, rowBegin, rowEnd, desiredRangeCount, ranParallel))
 	{
 		return true;
 	}
 
-	stopIdleRuntime();
+	/* Preserve a one-range reference/recovery path after admission failures. */
+	if (desiredRangeCount > 1 && runAttempt(work, rowBegin, rowEnd, 1,
+		ranParallel))
+	{
+		system.recordSerialFallback();
+		return true;
+	}
+
+	system.recordSerialFallback();
 	return false;
 }
 
 bool RadarTerrainPrepareService::runRows(RadarTerrainSnapshot *snapshot,
-	unsigned char *output, unsigned rowBegin, unsigned rowEnd)
+	unsigned char *output, unsigned rowBegin, unsigned rowEnd,
+	bool *ranParallel)
 {
 	if (!radarTerrainPrepareRowsAreValid(snapshot, output, rowBegin, rowEnd) ||
 		rowBegin == rowEnd)
@@ -564,7 +648,7 @@ bool RadarTerrainPrepareService::runRows(RadarTerrainSnapshot *snapshot,
 	}
 
 	RadarTerrainRowWorkAdapter work(snapshot, output);
-	return runRows(&work, rowBegin, rowEnd);
+	return runRows(&work, rowBegin, rowEnd, ranParallel);
 }
 
 void RadarTerrainPrepareService::release(unsigned consumerId)
@@ -580,14 +664,11 @@ void RadarTerrainPrepareService::shutdown()
 {
 	if (!m_initialized && !m_leaseActive)
 	{
-		m_runtime.shutdown();
 		return;
 	}
 
-	/* Stop admission first, then synchronously drain and join accepted work. */
+	/* Calls are synchronous, so stopping admission is sufficient here. */
 	m_stopping = true;
-	m_runtime.waitUntilIdle();
-	m_runtime.shutdown();
 	m_leaseActive = false;
 	m_activeConsumer = 0;
 	m_initialized = false;
@@ -599,7 +680,8 @@ void RadarTerrainPrepareService::shutdown()
 #if defined(RTS_BUILD_CORE_EXTRAS)
 unsigned RadarTerrainPrepareService::pendingTaskCount() const
 {
-	return m_runtime.pendingTaskCount();
+	/* runRows joins its group before returning; this service retains no jobs. */
+	return 0;
 }
 #endif
 

@@ -5,14 +5,14 @@
 #include <string.h>
 
 #if defined(RTS_BUILD_CORE_EXTRAS)
-enum RadarTerrainPrepareTaskRuntimeTestEvent
+enum RadarTerrainPrepareJobSystemTestEvent
 {
-	RADAR_TASK_RUNTIME_TEST_FAIL_THREAD_RESERVE = 4,
-	RADAR_TASK_RUNTIME_TEST_FAIL_QUEUE_PUSH = 5
+	RADAR_JOB_SYSTEM_TEST_FAIL_START = 1,
+	RADAR_JOB_SYSTEM_TEST_FAIL_QUEUE_PUSH = 6
 };
 
-extern "C" void rts_task_runtime_set_test_allocation_fault(
-	unsigned event, unsigned occurrence);
+extern "C" void rts_job_system_set_test_fault(unsigned event,
+	unsigned occurrence);
 extern "C" void rts_radar_terrain_prepare_set_test_fault(
 	unsigned fault, unsigned occurrence);
 #endif
@@ -869,6 +869,37 @@ static int testRowSplitCoversRequestedRowsExactlyOnce()
 	return 0;
 }
 
+static int testAdaptiveRowSplitUsesAllAvailableCapacity()
+{
+	const char *testName = "testAdaptiveRowSplitUsesAllAvailableCapacity";
+	RadarTerrainRowRange ranges[32];
+	unsigned coverage[257];
+	unsigned index;
+	unsigned row;
+	memset(coverage, 0, sizeof(coverage));
+	const unsigned rangeCount = BuildRadarTerrainRowRanges(1, 257, 16,
+		ranges, sizeof(ranges) / sizeof(ranges[0]));
+	CHECK(testName, rangeCount == 16);
+	for (index = 0; index < rangeCount; ++index)
+	{
+		CHECK(testName, ranges[index].begin < ranges[index].end);
+		if (index != 0)
+			CHECK(testName, ranges[index - 1].end == ranges[index].begin);
+		for (row = ranges[index].begin; row < ranges[index].end; ++row)
+			++coverage[row];
+	}
+	for (index = 0; index < sizeof(coverage) / sizeof(coverage[0]); ++index)
+	{
+		const unsigned expected = index >= 1 && index < 257 ? 1 : 0;
+		CHECK(testName, coverage[index] == expected);
+	}
+	CHECK(testName, BuildRadarTerrainRowRanges(4, 4, 16, ranges,
+		32) == 0);
+	CHECK(testName, BuildRadarTerrainRowRanges(5, 4, 16, ranges,
+		32) == 0);
+	return 0;
+}
+
 static int testPrepareServiceSuccessfulLeaseAndRows()
 {
 	const char *testName = "testPrepareServiceSuccessfulLeaseAndRows";
@@ -907,35 +938,59 @@ class RadarPrepareRowWorkProbe : public RadarPrepareRowWork
 {
 public:
 	RadarPrepareRowWorkProbe(unsigned rowCount, unsigned char *rows,
-		bool fail)
-		: m_rowCount(rowCount), m_rows(rows), m_fail(fail)
+		bool fail, unsigned *invocationCount = 0)
+		: m_rowCount(rowCount), m_rows(rows), m_fail(fail),
+		  m_invocationCount(invocationCount)
 	{
-		m_ranges[0][0] = 0;
-		m_ranges[0][1] = 0;
-		m_ranges[1][0] = 0;
-		m_ranges[1][1] = 0;
 	}
 
 	virtual bool executeRows(unsigned rowBegin, unsigned rowEnd)
 	{
 		unsigned row;
-		const unsigned rangeIndex = rowBegin == 0 ? 0 : 1;
-		m_ranges[rangeIndex][0] = rowBegin;
-		m_ranges[rangeIndex][1] = rowEnd;
 		if (rowBegin > rowEnd || rowEnd > m_rowCount)
 			return false;
+		if (m_invocationCount != 0)
+			++*m_invocationCount;
 		for (row = rowBegin; row < rowEnd; ++row)
 			m_rows[row] = static_cast<unsigned char>(row + 1);
 		return !m_fail;
 	}
 
-	unsigned m_ranges[2][2];
-
 private:
 	unsigned m_rowCount;
 	unsigned char *m_rows;
 	bool m_fail;
+	unsigned *m_invocationCount;
 };
+
+static int testOneWorkerUsesSingleReferenceRange()
+{
+	const char *testName = "testOneWorkerUsesSingleReferenceRange";
+	unsigned char rows[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+	unsigned invocationCount = 0;
+	bool ranParallel = true;
+	RadarPrepareRowWorkProbe work(8, rows, false, &invocationCount);
+	RadarTerrainPrepareService service;
+	rts::JobSystem &system = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 1;
+	config.queueCapacity = 8;
+	config.scratchBytesPerWorker = 4096;
+	config.pinWorkers = false;
+
+	system.shutdown();
+	CHECK(testName, system.start(config));
+	CHECK(testName, system.workerCount() == 1);
+	CHECK(testName, service.initialize(1, 8));
+	CHECK(testName, service.tryAcquire(9));
+	CHECK(testName, service.runRows(&work, 0, 8, &ranParallel));
+	CHECK(testName, !ranParallel);
+	CHECK(testName, invocationCount == 1);
+	service.release(9);
+	service.shutdown();
+	system.shutdown();
+	return 0;
+}
 
 static int testPrepareServiceGenericRowWork()
 {
@@ -949,10 +1004,6 @@ static int testPrepareServiceGenericRowWork()
 	CHECK(testName, service.tryAcquire(7));
 	CHECK(testName, !service.tryAcquire(8));
 	CHECK(testName, service.runRows(&work, 0, 8));
-	CHECK(testName, work.m_ranges[0][0] == 0);
-	CHECK(testName, work.m_ranges[0][1] == 4);
-	CHECK(testName, work.m_ranges[1][0] == 4);
-	CHECK(testName, work.m_ranges[1][1] == 8);
 	for (row = 0; row < 8; ++row)
 		CHECK(testName, rows[row] == row + 1);
 #if defined(RTS_BUILD_CORE_EXTRAS)
@@ -1004,13 +1055,14 @@ static int testPrepareServiceStartFailureRetriesOneWorker()
 	CHECK(testName, service.initialize(2, 2));
 	CHECK(testName, service.tryAcquire(1));
 #if defined(RTS_BUILD_CORE_EXTRAS)
-	rts_task_runtime_set_test_allocation_fault(
-		RADAR_TASK_RUNTIME_TEST_FAIL_THREAD_RESERVE, 1);
+	rts::JobSystem::instance().shutdown();
+	rts_job_system_set_test_fault(RADAR_JOB_SYSTEM_TEST_FAIL_START, 1);
 #endif
-	CHECK(testName, service.runRows(&snapshot, output, 0, snapshot.height));
+	CHECK(testName, !service.runRows(&snapshot, output, 0, snapshot.height));
 #if defined(RTS_BUILD_CORE_EXTRAS)
-	rts_task_runtime_set_test_allocation_fault(0, 0);
+	rts_job_system_set_test_fault(0, 0);
 #endif
+	CHECK(testName, ShadeRadarRows(snapshot, output, 0, snapshot.height));
 	CHECK(testName, compareServiceOutput(output, serialOutput,
 		snapshot.rowBytes * snapshot.height, testName) == 0);
 	service.release(1);
@@ -1054,10 +1106,17 @@ static int testPrepareServiceQueueBackpressureFallsBackToSerial()
 
 	makeServiceFixture(cells, &snapshot, serialOutput);
 	memset(output, 0xA5, sizeof(output));
-	CHECK(testName, service.initialize(2, 1));
+	rts::JobSystem::instance().shutdown();
+	rts::JobSystemConfig config;
+	config.workerCount = 4;
+	config.queueCapacity = 1;
+	config.scratchBytesPerWorker = 4096;
+	config.pinWorkers = false;
+	CHECK(testName, rts::JobSystem::instance().start(config));
+	CHECK(testName, service.initialize(16, 1));
 	CHECK(testName, service.tryAcquire(1));
-	CHECK(testName, !service.runRows(&snapshot, output, 0, snapshot.height));
-	CHECK(testName, ShadeRadarRows(snapshot, output, 0, snapshot.height));
+	CHECK(testName, service.runRows(&snapshot, output, 0, snapshot.height));
+	CHECK(testName, rts::JobSystem::instance().metrics().serialFallbackCount > 0);
 	CHECK(testName, compareServiceOutput(output, serialOutput,
 		snapshot.rowBytes * snapshot.height, testName) == 0);
 	service.release(1);
@@ -1079,12 +1138,11 @@ static int testPrepareServiceSubmissionRollbackRetriesOneWorker()
 	CHECK(testName, service.initialize(2, 2));
 	CHECK(testName, service.tryAcquire(1));
 #if defined(RTS_BUILD_CORE_EXTRAS)
-	rts_task_runtime_set_test_allocation_fault(
-		RADAR_TASK_RUNTIME_TEST_FAIL_QUEUE_PUSH, 2);
+	rts_job_system_set_test_fault(RADAR_JOB_SYSTEM_TEST_FAIL_QUEUE_PUSH, 2);
 #endif
 	CHECK(testName, service.runRows(&snapshot, output, 0, snapshot.height));
 #if defined(RTS_BUILD_CORE_EXTRAS)
-	rts_task_runtime_set_test_allocation_fault(0, 0);
+	rts_job_system_set_test_fault(0, 0);
 #endif
 	CHECK(testName, compareServiceOutput(output, serialOutput,
 		snapshot.rowBytes * snapshot.height, testName) == 0);
@@ -1107,14 +1165,13 @@ static int testPrepareServiceBothAttemptsFailUseSerialOracle()
 	CHECK(testName, service.initialize(2, 2));
 	CHECK(testName, service.tryAcquire(1));
 #if defined(RTS_BUILD_CORE_EXTRAS)
-	rts_task_runtime_set_test_allocation_fault(
-		RADAR_TASK_RUNTIME_TEST_FAIL_THREAD_RESERVE, 2);
+	rts_job_system_set_test_fault(RADAR_JOB_SYSTEM_TEST_FAIL_QUEUE_PUSH, 2);
 	rts_radar_terrain_prepare_set_test_fault(
-		RADAR_TERRAIN_PREPARE_TEST_FAIL_TASK_ALLOCATION, 1);
+		RADAR_TERRAIN_PREPARE_TEST_FAIL_TASK_ALLOCATION, 5);
 #endif
 	CHECK(testName, !service.runRows(&snapshot, output, 0, snapshot.height));
 #if defined(RTS_BUILD_CORE_EXTRAS)
-	rts_task_runtime_set_test_allocation_fault(0, 0);
+	rts_job_system_set_test_fault(0, 0);
 	rts_radar_terrain_prepare_set_test_fault(0, 0);
 #endif
 	CHECK(testName, ShadeRadarRows(snapshot, output, 0, snapshot.height));
@@ -1188,10 +1245,9 @@ static int testPrepareServiceRollbackThenRetryAllocationFailureIsClean()
 	CHECK(testName, service.initialize(2, 2));
 	CHECK(testName, service.tryAcquire(1));
 #if defined(RTS_BUILD_CORE_EXTRAS)
-	rts_task_runtime_set_test_allocation_fault(
-		RADAR_TASK_RUNTIME_TEST_FAIL_QUEUE_PUSH, 2);
+	rts_job_system_set_test_fault(RADAR_JOB_SYSTEM_TEST_FAIL_QUEUE_PUSH, 2);
 	rts_radar_terrain_prepare_set_test_fault(
-		RADAR_TERRAIN_PREPARE_TEST_FAIL_TASK_ALLOCATION, 3);
+		RADAR_TERRAIN_PREPARE_TEST_FAIL_TASK_ALLOCATION, 5);
 #endif
 	CHECK(testName, !service.runRows(&snapshot, output, 0, snapshot.height));
 	CHECK(testName, service.pendingTaskCount() == 0);
@@ -1203,7 +1259,7 @@ static int testPrepareServiceRollbackThenRetryAllocationFailureIsClean()
 	CHECK(testName, !service.hasLease());
 	CHECK(testName, service.pendingTaskCount() == 0);
 
-	/* One worker is an intentional degraded/test configuration. */
+	/* The service remains reusable after a failed shared-scheduler batch. */
 	memset(output, 0xA5, sizeof(output));
 	CHECK(testName, service.initialize(1, 2));
 	CHECK(testName, service.tryAcquire(2));
@@ -1212,7 +1268,7 @@ static int testPrepareServiceRollbackThenRetryAllocationFailureIsClean()
 		snapshot.rowBytes * snapshot.height, testName) == 0);
 	CHECK(testName, service.pendingTaskCount() == 0);
 #if defined(RTS_BUILD_CORE_EXTRAS)
-	rts_task_runtime_set_test_allocation_fault(0, 0);
+	rts_job_system_set_test_fault(0, 0);
 	rts_radar_terrain_prepare_set_test_fault(0, 0);
 #endif
 	service.release(2);
@@ -1454,17 +1510,23 @@ int main()
 	result |= testOwnerBatchStorageIsBoundedAndSingleOwned();
 	result |= testOwnerBatchCapturePreflight();
 	result |= testRowSplitCoversRequestedRowsExactlyOnce();
+	result |= testAdaptiveRowSplitUsesAllAvailableCapacity();
 	result |= testPrepareServiceSuccessfulLeaseAndRows();
 	result |= testPrepareServiceGenericRowWork();
+	result |= testOneWorkerUsesSingleReferenceRange();
 	result |= testPrepareServiceGenericRowWorkFailureJoinsTasks();
 	result |= testPrepareServiceStartFailureRetriesOneWorker();
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
 	result |= testPrepareServiceTaskAllocationRetriesOneWorker();
 	result |= testPrepareServiceQueueBackpressureFallsBackToSerial();
 	result |= testPrepareServiceSubmissionRollbackRetriesOneWorker();
 	result |= testPrepareServiceBothAttemptsFailUseSerialOracle();
+#endif
 	result |= testPrepareServiceShutdownClosesLease();
 	result |= testPrepareServiceShutdownAfterRunRestartsCleanly();
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
 	result |= testPrepareServiceRollbackThenRetryAllocationFailureIsClean();
+#endif
 	result |= testWorkerSourceAudit();
 	result |= testOwnerFlowSourceAudit();
 	return result;

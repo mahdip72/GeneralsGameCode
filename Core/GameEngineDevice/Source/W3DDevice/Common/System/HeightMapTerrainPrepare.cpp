@@ -652,7 +652,7 @@ bool RunHeightMapTerrainBatch(HeightMapTerrainBatch &batch,
 			service.activeConsumer() == 4) ||
 			(!leaseAlreadyHeld && service.tryAcquire(4))))
 	{
-		ranWorker = service.runRows(work, 0, snapshot.height);
+		ranWorker = service.runRows(work, 0, snapshot.height, ranParallel);
 		acquiredLease = !leaseAlreadyHeld;
 	}
 	if (acquiredLease)
@@ -660,8 +660,6 @@ bool RunHeightMapTerrainBatch(HeightMapTerrainBatch &batch,
 
 	if (ranWorker)
 	{
-		if (ranParallel != 0)
-			*ranParallel = true;
 		return true;
 	}
 
