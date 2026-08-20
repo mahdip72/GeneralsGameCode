@@ -100,6 +100,23 @@ D3D11_BLEND TranslateBlend(RenderBlendFactor factor)
 	return values[static_cast<unsigned int>(factor) < 10 ? factor : 0];
 }
 
+D3D11_BLEND TranslateAlphaBlend(RenderBlendFactor factor)
+{
+	switch (factor)
+	{
+	case RENDER_BLEND_SOURCE_COLOR:
+		return D3D11_BLEND_SRC_ALPHA;
+	case RENDER_BLEND_INVERSE_SOURCE_COLOR:
+		return D3D11_BLEND_INV_SRC_ALPHA;
+	case RENDER_BLEND_DESTINATION_COLOR:
+		return D3D11_BLEND_DEST_ALPHA;
+	case RENDER_BLEND_INVERSE_DESTINATION_COLOR:
+		return D3D11_BLEND_INV_DEST_ALPHA;
+	default:
+		return TranslateBlend(factor);
+	}
+}
+
 D3D11_BLEND_OP TranslateBlendOperation(RenderBlendOperation operation)
 {
 	static const D3D11_BLEND_OP values[] = {
@@ -1059,8 +1076,10 @@ public:
 		target.SrcBlend = TranslateBlend(state.pipeline.blend.sourceColor);
 		target.DestBlend = TranslateBlend(state.pipeline.blend.destinationColor);
 		target.BlendOp = TranslateBlendOperation(state.pipeline.blend.colorOperation);
-		target.SrcBlendAlpha = TranslateBlend(state.pipeline.blend.sourceAlpha);
-		target.DestBlendAlpha = TranslateBlend(state.pipeline.blend.destinationAlpha);
+		target.SrcBlendAlpha = TranslateAlphaBlend(
+			state.pipeline.blend.sourceAlpha);
+		target.DestBlendAlpha = TranslateAlphaBlend(
+			state.pipeline.blend.destinationAlpha);
 		target.BlendOpAlpha = TranslateBlendOperation(
 			state.pipeline.blend.alphaOperation);
 		target.RenderTargetWriteMask =

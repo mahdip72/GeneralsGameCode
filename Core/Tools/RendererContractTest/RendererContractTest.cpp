@@ -1124,6 +1124,93 @@ int testD3D11HeadlessDevice()
 	delete device;
 	return result;
 }
+
+int testD3D11LegacyBlendFactors()
+{
+	int result = 0;
+	rts::render::IRenderDevice *device =
+		rts::render::CreateD3D11RenderDevice();
+	result |= check(device != 0, "D3D11 blend contract factory returns a device");
+	if (device == 0)
+	{
+		return result;
+	}
+
+	rts::render::RenderDeviceParameters parameters;
+	parameters.backend = rts::render::RENDER_BACKEND_D3D11;
+	parameters.width = 64;
+	parameters.height = 64;
+	parameters.enableVsync = false;
+	parameters.enableDebugLayer = true;
+	result |= check(device->initialize(parameters) == rts::render::RENDER_RESULT_OK,
+		"D3D11 blend contract device initializes");
+	if (device->immediateContext() == 0)
+	{
+		device->shutdown();
+		delete device;
+		return result | check(false, "D3D11 blend contract exposes its context");
+	}
+
+	struct BlendCase
+	{
+		rts::render::RenderBlendFactor source;
+		rts::render::RenderBlendFactor destination;
+		unsigned int colorWriteMask;
+		const char *name;
+	};
+	const BlendCase cases[] = {
+		{ rts::render::RENDER_BLEND_SOURCE_COLOR,
+			rts::render::RENDER_BLEND_ZERO, 0x0fU,
+			"SOURCE_COLOR with ZERO" },
+		{ rts::render::RENDER_BLEND_ZERO,
+			rts::render::RENDER_BLEND_SOURCE_COLOR, 0x0fU,
+			"ZERO with SOURCE_COLOR" },
+		{ rts::render::RENDER_BLEND_ONE,
+			rts::render::RENDER_BLEND_INVERSE_SOURCE_COLOR, 0x0fU,
+			"ONE with INVERSE_SOURCE_COLOR" },
+		{ rts::render::RENDER_BLEND_ZERO,
+			rts::render::RENDER_BLEND_ONE, 0,
+			"color-write-disabled ZERO/ONE" }
+	};
+	const unsigned int caseCount = sizeof(cases) / sizeof(cases[0]);
+	rts::render::IRenderContext *context = device->immediateContext();
+	const bool frameStarted = context->beginFrame() ==
+		rts::render::RENDER_RESULT_OK;
+	result |= check(frameStarted, "D3D11 blend contract begins a frame");
+	if (frameStarted)
+	{
+		for (unsigned int index = 0; index < caseCount; ++index)
+		{
+			rts::render::LegacyLogicalState state;
+			state.pipeline.blend.blendEnable = true;
+			state.pipeline.blend.sourceColor = cases[index].source;
+			state.pipeline.blend.destinationColor = cases[index].destination;
+			state.pipeline.blend.sourceAlpha = cases[index].source;
+			state.pipeline.blend.destinationAlpha = cases[index].destination;
+			state.pipeline.blend.colorWriteMask = cases[index].colorWriteMask;
+			const rts::render::RenderResult stateResult =
+				context->setLegacyState(state,
+					rts::render::RENDER_VERTEX_POSITION3_COLOR, 0);
+			if (stateResult != rts::render::RENDER_RESULT_OK)
+			{
+				fprintf(stderr,
+					"legacy blend case %s returned RenderResult %u; "
+					"CreateBlendState rejected the alpha factor\n",
+					cases[index].name, static_cast<unsigned int>(stateResult));
+			}
+			char message[128];
+			snprintf(message, sizeof(message),
+				"legacy blend state remains bindable: %s", cases[index].name);
+			result |= check(stateResult == rts::render::RENDER_RESULT_OK,
+				message);
+		}
+		result |= check(context->endFrame() == rts::render::RENDER_RESULT_OK,
+			"D3D11 blend contract ends a frame");
+	}
+	device->shutdown();
+	delete device;
+	return result;
+}
 #endif
 }
 
@@ -1137,6 +1224,7 @@ int main()
 	result |= testLegacyShaderBitDecoder();
 #if defined(RTS_RENDERER_HAS_D3D11)
 	result |= testD3D11HeadlessDevice();
+	result |= testD3D11LegacyBlendFactors();
 	result |= testD3D11HiddenSwapChain();
 #endif
 	if (result == 0)

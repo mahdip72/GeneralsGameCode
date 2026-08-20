@@ -119,6 +119,46 @@ bool Build_Vertex_Layout(const FVFInfoClass &fvf_info,
 	return true;
 }
 
+void Append_Layout_Diagnostic(char *message, unsigned int capacity,
+	unsigned int *used, const LegacyVertexLayout &layout)
+{
+	if (message == 0 || used == 0 || capacity == 0 || *used >= capacity)
+	{
+		return;
+	}
+	int written = snprintf(message + *used, capacity - *used, " layout=[");
+	if (written < 0 || static_cast<unsigned int>(written) >= capacity - *used)
+	{
+		message[capacity - 1] = '\0';
+		*used = capacity - 1;
+		return;
+	}
+	*used += static_cast<unsigned int>(written);
+	const unsigned int elementCount = layout.elementCount >
+		LegacyVertexLayout::MAX_ELEMENT_COUNT ?
+		LegacyVertexLayout::MAX_ELEMENT_COUNT : layout.elementCount;
+	for (unsigned int index = 0; index < elementCount; ++index)
+	{
+		const LegacyVertexElement &element = layout.elements[index];
+		written = snprintf(message + *used, capacity - *used,
+			"%s%u,%u,%u", index == 0 ? "" : ";",
+			static_cast<unsigned int>(element.semantic),
+			static_cast<unsigned int>(element.format), element.byteOffset);
+		if (written < 0 || static_cast<unsigned int>(written) >= capacity - *used)
+		{
+			message[capacity - 1] = '\0';
+			*used = capacity - 1;
+			return;
+		}
+		*used += static_cast<unsigned int>(written);
+	}
+	if (*used < capacity - 1)
+	{
+		message[(*used)++] = ']';
+		message[*used] = '\0';
+	}
+}
+
 unsigned int Primitive_Index_Count(unsigned int primitive_type,
 	unsigned int primitive_count)
 {
@@ -917,10 +957,24 @@ bool D3D11LegacyBridge::Draw(VertexBufferClass *vertex_buffer,
 			texture_mask |= 1U << stage;
 		}
 	}
-	if (m_impl->context->setLegacyStateForLayout(state, layout, texture_mask) !=
-		rts::render::RENDER_RESULT_OK)
+	const RenderResult state_result =
+		m_impl->context->setLegacyStateForLayout(state, layout, texture_mask);
+	if (state_result != rts::render::RENDER_RESULT_OK)
 	{
-		return m_impl->Fail("draw failure: D3D11 legacy state or input layout");
+		char message[384];
+		unsigned int used = static_cast<unsigned int>(snprintf(message,
+			sizeof(message),
+			"draw failure: D3D11 state/layout result=%u fvf=0x%08x stride=%u elements=%u textures=0x%02x",
+			static_cast<unsigned int>(state_result),
+			vertex_buffer->FVF_Info().Get_FVF(), layout.stride,
+			layout.elementCount, texture_mask));
+		if (used >= sizeof(message))
+		{
+			used = sizeof(message) - 1;
+			message[used] = '\0';
+		}
+		Append_Layout_Diagnostic(message, sizeof(message), &used, layout);
+		return m_impl->Fail(message);
 	}
 	if (m_impl->context->setVertexBuffer(vertex_handle, layout.stride, 0) !=
 		rts::render::RENDER_RESULT_OK)
