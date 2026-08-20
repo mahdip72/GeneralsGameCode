@@ -72,7 +72,7 @@ Additional compatibility checks passed:
 
 ## Commit SHA
 
-`PENDING_FINAL_AMEND`
+`e86c99627`
 
 ## Self-review
 
