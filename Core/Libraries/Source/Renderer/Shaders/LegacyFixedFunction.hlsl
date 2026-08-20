@@ -5,6 +5,9 @@ cbuffer LegacyTransformConstants : register(b0)
 	float4 FogColor;
 	float4 FogParameters;
 	uint4 AlphaTestParameters;
+	uint4 TextureColorParameters;
+	uint4 TextureAlphaParameters;
+	float4 TextureFactor;
 };
 
 bool PassesAlphaTest(float alpha)
@@ -57,6 +60,49 @@ float4 ApplyLegacyPixelState(float4 color, float fogDepth)
 	}
 	const float fogFactor = CalculateFogFactor(abs(fogDepth));
 	return saturate(lerp(FogColor, color, fogFactor));
+}
+
+float4 SelectTextureArgument(uint argument, float4 current, float4 diffuse,
+	float4 textureSample)
+{
+	switch (argument)
+	{
+	case 0: return current;
+	case 1: return diffuse;
+	case 2: return textureSample;
+	case 3: return TextureFactor;
+	case 4: return 0.0f;
+	case 5: return 0.0f;
+	default: return current;
+	}
+}
+
+float4 ApplyTextureOperation(uint operation, float4 argument1,
+	float4 argument2, float4 current, float4 diffuse, float4 textureSample)
+{
+	switch (operation)
+	{
+	case 0: return current;
+	case 1: return argument1;
+	case 2: return argument2;
+	case 3: return argument1 * argument2;
+	case 4: return 2.0f * argument1 * argument2;
+	case 5: return 4.0f * argument1 * argument2;
+	case 6: return argument1 + argument2;
+	case 7: return argument1 + argument2 - 0.5f;
+	case 8: return 2.0f * (argument1 + argument2 - 0.5f);
+	case 9: return argument1 - argument2;
+	case 10: return argument1 + argument2 * (1.0f - argument1);
+	case 11: return lerp(argument2, argument1, diffuse.a);
+	case 12: return lerp(argument2, argument1, textureSample.a);
+	case 13: return lerp(argument2, argument1, current.a);
+	case 14: return argument1 * argument1.a + argument2;
+	case 15:
+		const float dotProduct = 4.0f * dot(argument1.rgb - 0.5f,
+			argument2.rgb - 0.5f);
+		return float4(dotProduct, dotProduct, dotProduct, dotProduct);
+	default: return current;
+	}
 }
 
 struct VertexInput
@@ -119,7 +165,23 @@ SamplerState LegacySampler0 : register(s0);
 
 float4 PSTextured(TexturedVertexOutput input) : SV_TARGET
 {
-	const float4 color = input.color *
+	const float4 textureSample =
 		LegacyTexture0.Sample(LegacySampler0, input.textureCoordinate);
+	const float4 current = input.color;
+	const float4 colorArgument1 = SelectTextureArgument(TextureColorParameters.y,
+		current, input.color, textureSample);
+	const float4 colorArgument2 = SelectTextureArgument(TextureColorParameters.z,
+		current, input.color, textureSample);
+	float4 color = ApplyTextureOperation(TextureColorParameters.x,
+		colorArgument1, colorArgument2, current, input.color, textureSample);
+	if (TextureColorParameters.w != 0)
+	{
+		const float4 alphaArgument1 = SelectTextureArgument(
+			TextureAlphaParameters.x, current, input.color, textureSample);
+		const float4 alphaArgument2 = SelectTextureArgument(
+			TextureAlphaParameters.y, current, input.color, textureSample);
+		color.a = ApplyTextureOperation(TextureColorParameters.w, alphaArgument1,
+			alphaArgument2, current, input.color, textureSample).a;
+	}
 	return ApplyLegacyPixelState(color, input.fogDepth);
 }

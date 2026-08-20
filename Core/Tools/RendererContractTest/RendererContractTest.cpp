@@ -554,6 +554,37 @@ int testD3D11HiddenSwapChain()
 		center = &pixels[4 * (32 * 64 + 32)];
 		result |= check(center[1] > 240 && center[0] < 16 && center[2] < 16,
 			"captured D3D11 textured triangle preserves sampled color");
+		logicalState.pipeline.textureStages[0].colorOperation =
+			rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_2;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyState(logicalState,
+				rts::render::RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1, 1) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(texturedVertexBuffer,
+				sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(0, texture) == rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"D3D11 parity pipeline applies the logical texture combiner");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[0] > 240 && center[1] > 240 && center[2] > 240,
+			"select-argument-2 uses diffuse color instead of sampled texture");
+		logicalState.pipeline.textureStages[0].colorOperation =
+			rts::render::RENDER_TEXTURE_OP_BUMP_ENVIRONMENT;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->setLegacyState(logicalState,
+				rts::render::RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1, 1) ==
+				rts::render::RENDER_RESULT_UNSUPPORTED &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK,
+			"D3D11 parity boundary rejects unimplemented bump combiners explicitly");
 		unsigned int debugErrorCount = 0xffffffffU;
 		result |= check(device->getDebugValidationErrorCount(&debugErrorCount) ==
 			rts::render::RENDER_RESULT_OK && debugErrorCount == 0,

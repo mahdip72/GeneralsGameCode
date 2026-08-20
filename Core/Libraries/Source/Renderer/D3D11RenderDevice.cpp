@@ -202,6 +202,9 @@ struct LegacyTransformConstants
 	float fogColor[4];
 	float fogParameters[4];
 	unsigned int alphaTestParameters[4];
+	unsigned int textureColorParameters[4];
+	unsigned int textureAlphaParameters[4];
+	float textureFactor[4];
 };
 
 void MultiplyMatrices(const float *left, const float *right, float *product)
@@ -713,6 +716,14 @@ public:
 		{
 			return RENDER_RESULT_UNSUPPORTED;
 		}
+		if (textured &&
+			(state.pipeline.textureStages[0].colorOperation >
+				RENDER_TEXTURE_OP_DOT_PRODUCT_3 ||
+			state.pipeline.textureStages[0].alphaOperation >
+				RENDER_TEXTURE_OP_DOT_PRODUCT_3))
+		{
+			return RENDER_RESULT_UNSUPPORTED;
+		}
 		const HRESULT transformResult = updateTransformConstants(state);
 		if (FAILED(transformResult))
 		{
@@ -1203,6 +1214,31 @@ private:
 			state.pipeline.alphaReference > 255 ? 255 :
 			state.pipeline.alphaReference;
 		shaderConstants.alphaTestParameters[3] = 0;
+		const LegacyTextureStageState &textureStage =
+			state.pipeline.textureStages[0];
+		shaderConstants.textureColorParameters[0] =
+			static_cast<unsigned int>(textureStage.colorOperation);
+		shaderConstants.textureColorParameters[1] =
+			static_cast<unsigned int>(textureStage.colorArgument1);
+		shaderConstants.textureColorParameters[2] =
+			static_cast<unsigned int>(textureStage.colorArgument2);
+		shaderConstants.textureColorParameters[3] =
+			static_cast<unsigned int>(textureStage.alphaOperation);
+		shaderConstants.textureAlphaParameters[0] =
+			static_cast<unsigned int>(textureStage.alphaArgument1);
+		shaderConstants.textureAlphaParameters[1] =
+			static_cast<unsigned int>(textureStage.alphaArgument2);
+		shaderConstants.textureAlphaParameters[2] = 0;
+		shaderConstants.textureAlphaParameters[3] = 0;
+		const unsigned int textureFactor = state.pipeline.textureFactor;
+		shaderConstants.textureFactor[0] =
+			static_cast<float>((textureFactor >> 16) & 0xffU) / 255.0f;
+		shaderConstants.textureFactor[1] =
+			static_cast<float>((textureFactor >> 8) & 0xffU) / 255.0f;
+		shaderConstants.textureFactor[2] =
+			static_cast<float>(textureFactor & 0xffU) / 255.0f;
+		shaderConstants.textureFactor[3] =
+			static_cast<float>((textureFactor >> 24) & 0xffU) / 255.0f;
 		ID3D11Buffer *constantBuffer =
 			m_transformConstants[m_transformConstantCursor];
 		m_transformConstantCursor = (m_transformConstantCursor + 1) %
