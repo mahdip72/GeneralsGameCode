@@ -211,6 +211,23 @@ bool SynchronizedTextureLoadTaskListClass::Has_Prepare_Job(
 	return task->Get_Prepare_Runtime_Task() != nullptr;
 }
 
+void SynchronizedTextureLoadTaskListClass::Set_Prepare_Job(
+	TextureLoadTaskClass *task, void *prepareJob)
+{
+	FastCriticalSectionClass::LockClass lock(CriticalSection);
+	task->Set_Prepare_Runtime_Task(prepareJob);
+}
+
+bool SynchronizedTextureLoadTaskListClass::Promote_Prepare_Job(
+	TextureLoadTaskClass *task)
+{
+	FastCriticalSectionClass::LockClass lock(CriticalSection);
+	rts::Job *prepareJob = static_cast<rts::Job *>(
+		task->Get_Prepare_Runtime_Task());
+	return prepareJob != nullptr && rts::JobSystem::instance().tryPromote(
+		prepareJob, rts::JOB_PRIORITY_FRAME_CRITICAL);
+}
+
 TextureLoadTaskClass *SynchronizedTextureLoadTaskListClass::Pop_Front()
 {
 	FastCriticalSectionClass::LockClass lock(CriticalSection);
@@ -869,13 +886,7 @@ void TextureLoader::Request_Foreground_Loading(TextureBaseClass *tc)
 			task->Set_Priority(TextureLoadTaskClass::PRIORITY_HIGH);
 			// Promote queued preparation ahead of streaming work. If a worker
 			// already owns it, publication proceeds normally.
-			rts::Job *prepareJob = static_cast<rts::Job *>(
-				task->Get_Prepare_Runtime_Task());
-			if (prepareJob != nullptr)
-			{
-				rts::JobSystem::instance().tryPromote(prepareJob,
-					rts::JOB_PRIORITY_FRAME_CRITICAL);
-			}
+			_ForegroundQueue.Promote_Prepare_Job(task);
 
 		} else {
 			// allocate high priority load task
@@ -1042,7 +1053,7 @@ void TextureLoader::Begin_Load_And_Queue(TextureLoadTaskClass *task)
 
 		if (runtimeTask != nullptr && task->Begin_Async_Prepare())
 		{
-			task->Set_Prepare_Runtime_Task(runtimeTask);
+			_ForegroundQueue.Set_Prepare_Job(task, runtimeTask);
 			rts::JobSystem &system = rts::JobSystem::instance();
 			if (!system.isRunning())
 			{
@@ -1062,7 +1073,7 @@ void TextureLoader::Begin_Load_And_Queue(TextureLoadTaskClass *task)
 			{
 				return;
 			}
-			task->Set_Prepare_Runtime_Task(nullptr);
+			_ForegroundQueue.Set_Prepare_Job(task, nullptr);
 			system.recordSerialFallback();
 		}
 

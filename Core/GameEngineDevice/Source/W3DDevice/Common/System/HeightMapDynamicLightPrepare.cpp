@@ -225,10 +225,8 @@ bool HeightMapDynamicLightBatch::run(RadarTerrainPrepareService &service,
 			0, m_snapshot.height) &&
 			ValidatePreparedHeightMapDynamicLightStructure(m_snapshot,
 				m_outputVertices);
-	if (!service.runRows(work, 0, m_snapshot.height))
+	if (!service.runRows(work, 0, m_snapshot.height, ranParallel))
 		return false;
-	if (ranParallel != 0)
-		*ranParallel = true;
 	return ValidatePreparedHeightMapDynamicLightStructure(m_snapshot,
 		m_outputVertices);
 }

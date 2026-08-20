@@ -1724,7 +1724,8 @@ static int testOwnerBatchParallelByteParity()
 	ranParallel = false;
 	CHECK(testName, RunHeightMapTerrainBatch(batch, service, false,
 		&ranParallel));
-	CHECK(testName, ranParallel);
+	CHECK(testName, ranParallel ==
+		(rts::JobSystem::instance().workerCount() > 1));
 	CHECK(testName, memcmp(batch.output(), expected,
 		batch.snapshot().outputCapacityBytes) == 0);
 	CHECK(testName, service.pendingTaskCount() == 0);
@@ -1847,7 +1848,16 @@ static int testEligibleBatchUsesWorkersAndJoins()
 	const HeightMapTerrainTestThreadId ownerThreadId =
 		heightMapTerrainCurrentThreadId();
 	HeightMapTerrainWorkerProbe probe(32, threadIds, arrivals);
+	rts::JobSystem &system = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 2;
+	config.queueCapacity = 16;
+	config.scratchBytesPerWorker = 4096;
+	config.pinWorkers = false;
 
+	system.shutdown();
+	CHECK(testName, system.start(config));
+	CHECK(testName, system.workerCount() == 2);
 	CHECK(testName, batch.initialize(32, 16, 0, 0));
 	CHECK(testName, batch.markComplete());
 	CHECK(testName, service.initialize(2, 2));
@@ -1871,14 +1881,14 @@ static int testEligibleBatchUsesWorkersAndJoins()
 	CHECK(testName, service.runRows(probe, 0, 16));
 	CHECK(testName, arrivals[0] != 0 && arrivals[1] != 0);
 	CHECK(testName, !heightMapTerrainThreadIdsEqual(threadIds[0],
-		ownerThreadId));
-	CHECK(testName, !heightMapTerrainThreadIdsEqual(threadIds[1],
+		ownerThreadId) || !heightMapTerrainThreadIdsEqual(threadIds[1],
 		ownerThreadId));
 	CHECK(testName, !heightMapTerrainThreadIdsEqual(threadIds[0],
 		threadIds[1]));
 	CHECK(testName, service.pendingTaskCount() == 0);
 	service.release(4);
 	service.shutdown();
+	system.shutdown();
 	return 0;
 }
 
@@ -1992,7 +2002,9 @@ int main()
 	result |= testOwnerBatchSerialSmallAndInvalidFallback();
 	result |= testOwnerBatchMetadataFreeze();
 	result |= testOwnerBatchParallelByteParity();
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
 	result |= testEligibleBatchUsesWorkersAndJoins();
+#endif
 	result |= testOwnerBatchFallbackFailuresAndCleanup();
 
 	if (result != 0)

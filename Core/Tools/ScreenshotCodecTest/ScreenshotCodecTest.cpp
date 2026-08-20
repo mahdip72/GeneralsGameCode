@@ -66,14 +66,14 @@ static void convertFullImage(const ScreenshotPixelSource &source, unsigned char 
 	ConvertScreenshotRows(source, 0, source.height, destination);
 }
 
-class TwoWorkerGate
+class WorkerGate
 {
 public:
-	TwoWorkerGate()
+	explicit WorkerGate(unsigned targetCount)
 #if defined(_WIN32)
-		: m_twoEntered(CreateEvent(0, TRUE, FALSE, 0)),
+		: m_targetEntered(CreateEvent(0, TRUE, FALSE, 0)),
 		  m_open(CreateEvent(0, TRUE, FALSE, 0)),
-		  m_enteredCount(0)
+		  m_enteredCount(0), m_targetCount(targetCount)
 #endif
 	{
 #if !defined(_WIN32)
@@ -81,15 +81,16 @@ public:
 		pthread_cond_init(&m_condition, 0);
 		m_enteredCount = 0;
 		m_open = false;
+		m_targetCount = targetCount;
 #endif
 	}
 
-	~TwoWorkerGate()
+	~WorkerGate()
 	{
 #if defined(_WIN32)
-		if (m_twoEntered != 0)
+		if (m_targetEntered != 0)
 		{
-			CloseHandle(m_twoEntered);
+			CloseHandle(m_targetEntered);
 		}
 		if (m_open != 0)
 		{
@@ -104,9 +105,10 @@ public:
 	void enterAndWait()
 	{
 #if defined(_WIN32)
-		if (InterlockedIncrement(&m_enteredCount) >= 2 && m_twoEntered != 0)
+		if (InterlockedIncrement(&m_enteredCount) >= (LONG)m_targetCount &&
+			m_targetEntered != 0)
 		{
-			SetEvent(m_twoEntered);
+			SetEvent(m_targetEntered);
 		}
 		if (m_open != 0)
 		{
@@ -129,11 +131,11 @@ public:
 #endif
 	}
 
-	bool waitForTwoEntries(unsigned timeoutMilliseconds)
+	bool waitForTargetEntries(unsigned timeoutMilliseconds)
 	{
 #if defined(_WIN32)
-		return m_twoEntered != 0 && m_open != 0 &&
-			WaitForSingleObject(m_twoEntered, timeoutMilliseconds) == WAIT_OBJECT_0;
+		return m_targetEntered != 0 && m_open != 0 &&
+			WaitForSingleObject(m_targetEntered, timeoutMilliseconds) == WAIT_OBJECT_0;
 #else
 		struct timespec deadline;
 		int waitResult = 0;
@@ -141,11 +143,11 @@ public:
 
 		deadlineAfter(timeoutMilliseconds, deadline);
 		pthread_mutex_lock(&m_mutex);
-		while (m_enteredCount < 2 && waitResult == 0)
+		while (m_enteredCount < m_targetCount && waitResult == 0)
 		{
 			waitResult = pthread_cond_timedwait(&m_condition, &m_mutex, &deadline);
 		}
-		reached = m_enteredCount >= 2;
+		reached = m_enteredCount >= m_targetCount;
 		pthread_mutex_unlock(&m_mutex);
 		return reached;
 #endif
@@ -167,18 +169,20 @@ public:
 	}
 
 private:
-	TwoWorkerGate(const TwoWorkerGate &);
-	TwoWorkerGate &operator=(const TwoWorkerGate &);
+	WorkerGate(const WorkerGate &);
+	WorkerGate &operator=(const WorkerGate &);
 
 #if defined(_WIN32)
-	HANDLE m_twoEntered;
+	HANDLE m_targetEntered;
 	HANDLE m_open;
 	LONG m_enteredCount;
+	unsigned m_targetCount;
 #else
 	pthread_mutex_t m_mutex;
 	pthread_cond_t m_condition;
 	unsigned m_enteredCount;
 	bool m_open;
+	unsigned m_targetCount;
 #endif
 };
 
@@ -227,7 +231,7 @@ class ConvertRangeTask : public rts::Job
 {
 public:
 	ConvertRangeTask(const ScreenshotPixelSource &source, const ScreenshotRowRange &range,
-		unsigned char *destination, TwoWorkerGate *gate)
+		unsigned char *destination, WorkerGate *gate)
 		: m_source(source), m_range(range), m_destination(destination), m_gate(gate)
 	{
 	}
@@ -242,7 +246,7 @@ private:
 	ScreenshotPixelSource m_source;
 	ScreenshotRowRange m_range;
 	unsigned char *m_destination;
-	TwoWorkerGate *m_gate;
+	WorkerGate *m_gate;
 };
 
 static int checkParallelConversion(const ScreenshotPixelSource &source, const char *testName)
@@ -255,28 +259,46 @@ static int checkParallelConversion(const ScreenshotPixelSource &source, const ch
 	unsigned char *serial = new unsigned char[byteCount];
 	unsigned char *striped = new unsigned char[byteCount];
 	rts::JobSystem &system = rts::JobSystem::instance();
-	TwoWorkerGate gate;
+	const unsigned workerCounts[] = { 1, 2, 4, 8, 16 };
 	unsigned rangeCount;
 	unsigned index;
+	unsigned workerIndex;
 	int result = 0;
 
 	memset(serial, 0, byteCount);
-	memset(striped, 0xCD, byteCount);
 	convertFullImage(source, serial);
 	system.shutdown();
-	rts::JobSystemConfig config;
-	config.workerCount = 2;
-	config.queueCapacity = 16;
-	config.scratchBytesPerWorker = 4096;
-	config.pinWorkers = false;
-	if (!system.start(config))
+	for (workerIndex = 0;
+		workerIndex < sizeof(workerCounts) / sizeof(workerCounts[0]);
+		++workerIndex)
 	{
-		fprintf(stderr, "%s: failed to start task runtime\n", testName);
-		result = 1;
-	}
-	else
-	{
-		rangeCount = BuildScreenshotRowRanges(source.height, system.workerCount(),
+		memset(striped, 0xCD, byteCount);
+		rts::JobSystemConfig config;
+		config.workerCount = workerCounts[workerIndex];
+		config.queueCapacity = 16;
+		config.scratchBytesPerWorker = 4096;
+		config.pinWorkers = false;
+		if (!system.start(config))
+		{
+			fprintf(stderr, "%s: failed to start %u-worker runtime\n",
+				testName, workerCounts[workerIndex]);
+			result = 1;
+			continue;
+		}
+		const unsigned actualWorkerCount = system.workerCount();
+		const unsigned observedTarget = actualWorkerCount > 3 ?
+			3 : actualWorkerCount;
+		WorkerGate gate(observedTarget);
+		result |= check(actualWorkerCount != 0 &&
+			actualWorkerCount <= workerCounts[workerIndex], testName,
+			"screenshot worker count respects the requested upper bound");
+		if (actualWorkerCount == 1)
+		{
+			/* The VC6 oracle and forced-reference mode execute submissions
+			 * synchronously, so their single range must not wait on its caller. */
+			gate.open();
+		}
+		rangeCount = BuildScreenshotRowRanges(source.height, actualWorkerCount,
 			ranges, sizeof(ranges) / sizeof(ranges[0]));
 		rts::JobGroup group = system.createGroup();
 		for (index = 0; index < rangeCount; ++index)
@@ -297,10 +319,24 @@ static int checkParallelConversion(const ScreenshotPixelSource &source, const ch
 		}
 		else
 		{
-			const bool usedTwoWorkers = gate.waitForTwoEntries(TWO_WORKER_GATE_TIMEOUT_MS);
+			const bool reachedConfiguredConcurrency =
+				gate.waitForTargetEntries(TWO_WORKER_GATE_TIMEOUT_MS);
 			gate.open();
-			system.wait(group);
-			result |= check(usedTwoWorkers, testName, "two conversion tasks entered concurrently");
+			const bool waited = system.wait(group);
+			bool handlesSucceeded = true;
+			for (index = 0; index < rangeCount; ++index)
+			{
+				handlesSucceeded = handlesSucceeded && handles[index].isValid() &&
+					handles[index].succeeded();
+			}
+			result |= check(waited && !group.failed() && !group.wasCancelled() &&
+				handlesSucceeded, testName,
+				"conversion scheduler group and handles complete successfully");
+			result |= check(reachedConfiguredConcurrency, testName,
+				"conversion tasks use the configured worker-count matrix");
+			result |= check(system.metrics().maximumActiveWorkers >= observedTarget,
+				testName,
+				"screenshot telemetry observes configured concurrency");
 			result |= checkBytes(striped, serial, byteCount, testName);
 		}
 		system.shutdown();

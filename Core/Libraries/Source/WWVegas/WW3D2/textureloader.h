@@ -172,6 +172,8 @@ class SynchronizedTextureLoadTaskListClass : public TextureLoadTaskListClass
 		void									Publish_Failed	(TextureLoadTaskClass *task);
 		void									Publish_Thumbnail(TextureLoadTaskClass *task, TextureLoadTaskClass *loadTask);
 		bool								Has_Prepare_Job(TextureLoadTaskClass *task);
+		void								Set_Prepare_Job(TextureLoadTaskClass *task, void *prepareJob);
+		bool								Promote_Prepare_Job(TextureLoadTaskClass *task);
 		TextureLoadTaskClass *			Pop_Front	();
 		TextureLoadTaskClass *			Pop_Back		();
 		void									Remove		(TextureLoadTaskClass *task);

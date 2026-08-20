@@ -1880,7 +1880,7 @@ void W3DRadar::buildTerrainTexture( TerrainLogic *terrain )
 		if( radarLease.isActive() )
 		{
 			prepared = prepareService.runRows( &preparedSnapshot,
-				batch.output(), 0, preparedSnapshot.height );
+				batch.output(), 0, preparedSnapshot.height, 0 );
 		}
 		else
 		{
