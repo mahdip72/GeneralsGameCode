@@ -654,6 +654,41 @@ int testD3D11HiddenSwapChain()
 		center = &pixels[4 * (32 * 64 + 32)];
 		result |= check(center[0] > 240 && center[1] > 240 && center[2] > 240,
 			"select-argument-2 uses diffuse color instead of sampled texture");
+		logicalState.pipeline.lightingEnable = true;
+		logicalState.constants.material.ambient = rts::render::RenderFloat4();
+		logicalState.constants.material.emissive = rts::render::RenderFloat4();
+		logicalState.constants.material.diffuse =
+			rts::render::RenderFloat4(1.0f, 1.0f, 1.0f, 1.0f);
+		logicalState.constants.globalAmbient = rts::render::RenderFloat4();
+		logicalState.constants.lights[0].enabled = true;
+		logicalState.constants.lights[0].type =
+			rts::render::RENDER_LIGHT_DIRECTIONAL;
+		logicalState.constants.lights[0].diffuse =
+			rts::render::RenderFloat4(0.0f, 1.0f, 0.0f, 1.0f);
+		logicalState.constants.lights[0].direction =
+			rts::render::RenderFloat4(0.0f, 0.0f, 1.0f, 0.0f);
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyState(logicalState,
+				rts::render::RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1, 1) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(texturedVertexBuffer,
+				sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(0, texture) == rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"D3D11 parity pipeline evaluates fixed-function directional lighting");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[1] > 240 && center[0] < 16 && center[2] < 16,
+			"directional lighting modulates diffuse vertex color deterministically");
+		logicalState.pipeline.lightingEnable = false;
 		logicalState.pipeline.textureStages[0].colorOperation =
 			rts::render::RENDER_TEXTURE_OP_BUMP_ENVIRONMENT;
 		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&

@@ -208,6 +208,18 @@ struct LegacyTransformConstants
 	unsigned int textureColorParameters[4];
 	unsigned int textureAlphaParameters[4];
 	float textureFactor[4];
+	float world[16];
+	float materialDiffuse[4];
+	float materialAmbient[4];
+	float materialEmissive[4];
+	float globalAmbient[4];
+	float lightDiffuse[LEGACY_LIGHT_COUNT][4];
+	float lightAmbient[LEGACY_LIGHT_COUNT][4];
+	float lightPositionAndType[LEGACY_LIGHT_COUNT][4];
+	float lightDirectionAndEnabled[LEGACY_LIGHT_COUNT][4];
+	float lightAttenuation[LEGACY_LIGHT_COUNT][4];
+	float lightSpotParameters[LEGACY_LIGHT_COUNT][4];
+	unsigned int lightingParameters[4];
 };
 
 void MultiplyMatrices(const float *left, const float *right, float *product)
@@ -838,6 +850,10 @@ public:
 		{
 			return RENDER_RESULT_UNSUPPORTED;
 		}
+		if (!textured && state.pipeline.lightingEnable)
+		{
+			return RENDER_RESULT_UNSUPPORTED;
+		}
 		if (textured &&
 			(state.pipeline.textureStages[0].colorOperation >
 				RENDER_TEXTURE_OP_DOT_PRODUCT_3 ||
@@ -1361,6 +1377,62 @@ private:
 			static_cast<float>(textureFactor & 0xffU) / 255.0f;
 		shaderConstants.textureFactor[3] =
 			static_cast<float>((textureFactor >> 24) & 0xffU) / 255.0f;
+		for (unsigned int component = 0; component < 16; ++component)
+		{
+			shaderConstants.world[component] = state.constants.world.values[component];
+		}
+		const RenderFloat4 materialValues[] = {
+			state.constants.material.diffuse, state.constants.material.ambient,
+			state.constants.material.emissive, state.constants.globalAmbient
+		};
+		float *materialTargets[] = {
+			shaderConstants.materialDiffuse, shaderConstants.materialAmbient,
+			shaderConstants.materialEmissive, shaderConstants.globalAmbient
+		};
+		for (unsigned int valueIndex = 0; valueIndex < 4; ++valueIndex)
+		{
+			materialTargets[valueIndex][0] = materialValues[valueIndex].x;
+			materialTargets[valueIndex][1] = materialValues[valueIndex].y;
+			materialTargets[valueIndex][2] = materialValues[valueIndex].z;
+			materialTargets[valueIndex][3] = materialValues[valueIndex].w;
+		}
+		for (unsigned int lightIndex = 0; lightIndex < LEGACY_LIGHT_COUNT;
+			++lightIndex)
+		{
+			const LegacyLightState &light = state.constants.lights[lightIndex];
+			shaderConstants.lightDiffuse[lightIndex][0] = light.diffuse.x;
+			shaderConstants.lightDiffuse[lightIndex][1] = light.diffuse.y;
+			shaderConstants.lightDiffuse[lightIndex][2] = light.diffuse.z;
+			shaderConstants.lightDiffuse[lightIndex][3] = light.diffuse.w;
+			shaderConstants.lightAmbient[lightIndex][0] = light.ambient.x;
+			shaderConstants.lightAmbient[lightIndex][1] = light.ambient.y;
+			shaderConstants.lightAmbient[lightIndex][2] = light.ambient.z;
+			shaderConstants.lightAmbient[lightIndex][3] = light.ambient.w;
+			shaderConstants.lightPositionAndType[lightIndex][0] = light.position.x;
+			shaderConstants.lightPositionAndType[lightIndex][1] = light.position.y;
+			shaderConstants.lightPositionAndType[lightIndex][2] = light.position.z;
+			shaderConstants.lightPositionAndType[lightIndex][3] =
+				static_cast<float>(light.type);
+			shaderConstants.lightDirectionAndEnabled[lightIndex][0] = light.direction.x;
+			shaderConstants.lightDirectionAndEnabled[lightIndex][1] = light.direction.y;
+			shaderConstants.lightDirectionAndEnabled[lightIndex][2] = light.direction.z;
+			shaderConstants.lightDirectionAndEnabled[lightIndex][3] =
+				light.enabled ? 1.0f : 0.0f;
+			shaderConstants.lightAttenuation[lightIndex][0] = light.range;
+			shaderConstants.lightAttenuation[lightIndex][1] = light.attenuation0;
+			shaderConstants.lightAttenuation[lightIndex][2] = light.attenuation1;
+			shaderConstants.lightAttenuation[lightIndex][3] = light.attenuation2;
+			shaderConstants.lightSpotParameters[lightIndex][0] = light.theta;
+			shaderConstants.lightSpotParameters[lightIndex][1] = light.phi;
+			shaderConstants.lightSpotParameters[lightIndex][2] = light.falloff;
+			shaderConstants.lightSpotParameters[lightIndex][3] = 0.0f;
+		}
+		shaderConstants.lightingParameters[0] =
+			state.pipeline.lightingEnable ? 1U : 0U;
+		shaderConstants.lightingParameters[1] =
+			state.pipeline.normalizeNormals ? 1U : 0U;
+		shaderConstants.lightingParameters[2] = 0;
+		shaderConstants.lightingParameters[3] = 0;
 		ID3D11Buffer *constantBuffer =
 			m_transformConstants[m_transformConstantCursor];
 		m_transformConstantCursor = (m_transformConstantCursor + 1) %

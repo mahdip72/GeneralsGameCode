@@ -8,6 +8,18 @@ cbuffer LegacyTransformConstants : register(b0)
 	uint4 TextureColorParameters;
 	uint4 TextureAlphaParameters;
 	float4 TextureFactor;
+	row_major float4x4 World;
+	float4 MaterialDiffuse;
+	float4 MaterialAmbient;
+	float4 MaterialEmissive;
+	float4 GlobalAmbient;
+	float4 LightDiffuse[4];
+	float4 LightAmbient[4];
+	float4 LightPositionAndType[4];
+	float4 LightDirectionAndEnabled[4];
+	float4 LightAttenuation[4];
+	float4 LightSpotParameters[4];
+	uint4 LightingParameters;
 };
 
 bool PassesAlphaTest(float alpha)
@@ -105,6 +117,71 @@ float4 ApplyTextureOperation(uint operation, float4 argument1,
 	}
 }
 
+float4 ApplyLegacyLighting(float4 vertexColor, float3 objectPosition,
+	float3 objectNormal)
+{
+	if (LightingParameters.x == 0)
+	{
+		return vertexColor;
+	}
+	const float3 worldPosition = mul(float4(objectPosition, 1.0f), World).xyz;
+	float3 worldNormal = mul(objectNormal, (float3x3)World);
+	if (LightingParameters.y != 0)
+	{
+		worldNormal = normalize(worldNormal);
+	}
+	float3 litColor = MaterialEmissive.rgb +
+		MaterialAmbient.rgb * GlobalAmbient.rgb;
+	[unroll]
+	for (uint index = 0; index < 4; ++index)
+	{
+		if (LightDirectionAndEnabled[index].w == 0.0f)
+		{
+			continue;
+		}
+		float3 directionToLight = float3(0.0f, 0.0f, 1.0f);
+		float attenuation = 1.0f;
+		if ((uint)LightPositionAndType[index].w == 0)
+		{
+			directionToLight = normalize(-LightDirectionAndEnabled[index].xyz);
+		}
+		else
+		{
+			const float3 offset = LightPositionAndType[index].xyz - worldPosition;
+			const float distanceToLight = length(offset);
+			if (distanceToLight > LightAttenuation[index].x)
+			{
+				continue;
+			}
+			directionToLight = distanceToLight > 0.000001f ?
+				offset / distanceToLight : float3(0.0f, 0.0f, 1.0f);
+			const float denominator = LightAttenuation[index].y +
+				LightAttenuation[index].z * distanceToLight +
+				LightAttenuation[index].w * distanceToLight * distanceToLight;
+			attenuation = denominator > 0.000001f ? 1.0f / denominator : 1.0f;
+			if ((uint)LightPositionAndType[index].w == 2)
+			{
+				const float cosine = dot(normalize(LightDirectionAndEnabled[index].xyz),
+					-directionToLight);
+				const float innerCosine = cos(0.5f * LightSpotParameters[index].x);
+				const float outerCosine = cos(0.5f * LightSpotParameters[index].y);
+				if (cosine <= outerCosine)
+				{
+					continue;
+				}
+				const float coneRange = max(innerCosine - outerCosine, 0.000001f);
+				const float cone = saturate((cosine - outerCosine) / coneRange);
+				attenuation *= pow(cone, max(LightSpotParameters[index].z, 0.0f));
+			}
+		}
+		litColor += LightAmbient[index].rgb * MaterialAmbient.rgb;
+		litColor += LightDiffuse[index].rgb * MaterialDiffuse.rgb *
+			saturate(dot(worldNormal, directionToLight)) * attenuation;
+	}
+	return float4(saturate(litColor) * vertexColor.rgb,
+		MaterialDiffuse.a * vertexColor.a);
+}
+
 struct VertexInput
 {
 	float3 position : POSITION;
@@ -154,7 +231,7 @@ TexturedVertexOutput VSTextured(TexturedVertexInput input)
 	TexturedVertexOutput output;
 	const float4 objectPosition = float4(input.position, 1.0f);
 	output.position = mul(objectPosition, WorldViewProjection);
-	output.color = input.color;
+	output.color = ApplyLegacyLighting(input.color, input.position, input.normal);
 	output.textureCoordinate = input.textureCoordinate;
 	output.fogDepth = mul(objectPosition, WorldView).z;
 	return output;
