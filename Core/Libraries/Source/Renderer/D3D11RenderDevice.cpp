@@ -198,6 +198,10 @@ struct ResourceSlot
 struct LegacyTransformConstants
 {
 	float worldViewProjection[16];
+	float worldView[16];
+	float fogColor[4];
+	float fogParameters[4];
+	unsigned int alphaTestParameters[4];
 };
 
 void MultiplyMatrices(const float *left, const float *right, float *product)
@@ -709,7 +713,7 @@ public:
 		{
 			return RENDER_RESULT_UNSUPPORTED;
 		}
-		const HRESULT transformResult = updateTransformConstants(state.constants);
+		const HRESULT transformResult = updateTransformConstants(state);
 		if (FAILED(transformResult))
 		{
 			return TranslateResult(transformResult);
@@ -1172,13 +1176,33 @@ private:
 			g_LegacyTexturedVS, sizeof(g_LegacyTexturedVS), &m_texturedLayout);
 	}
 
-	HRESULT updateTransformConstants(const LegacyFixedFunctionConstants &constants)
+	HRESULT updateTransformConstants(const LegacyLogicalState &state)
 	{
-		float worldView[16];
 		LegacyTransformConstants shaderConstants;
-		MultiplyMatrices(constants.world.values, constants.view.values, worldView);
-		MultiplyMatrices(worldView, constants.projection.values,
+		MultiplyMatrices(state.constants.world.values, state.constants.view.values,
+			shaderConstants.worldView);
+		MultiplyMatrices(shaderConstants.worldView,
+			state.constants.projection.values,
 			shaderConstants.worldViewProjection);
+		const RenderFloat4 fogColor = state.pipeline.fogMode == RENDER_FOG_WHITE ?
+			RenderFloat4(1.0f, 1.0f, 1.0f, 1.0f) : state.constants.fog.color;
+		shaderConstants.fogColor[0] = fogColor.x;
+		shaderConstants.fogColor[1] = fogColor.y;
+		shaderConstants.fogColor[2] = fogColor.z;
+		shaderConstants.fogColor[3] = fogColor.w;
+		shaderConstants.fogParameters[0] = state.constants.fog.start;
+		shaderConstants.fogParameters[1] = state.constants.fog.end;
+		shaderConstants.fogParameters[2] = state.constants.fog.density;
+		shaderConstants.fogParameters[3] = state.constants.fog.enabled ?
+			static_cast<float>(state.pipeline.fogMode) : 0.0f;
+		shaderConstants.alphaTestParameters[0] =
+			state.pipeline.alphaTestEnable ? 1U : 0U;
+		shaderConstants.alphaTestParameters[1] =
+			static_cast<unsigned int>(state.pipeline.alphaFunction);
+		shaderConstants.alphaTestParameters[2] =
+			state.pipeline.alphaReference > 255 ? 255 :
+			state.pipeline.alphaReference;
+		shaderConstants.alphaTestParameters[3] = 0;
 		ID3D11Buffer *constantBuffer =
 			m_transformConstants[m_transformConstantCursor];
 		m_transformConstantCursor = (m_transformConstantCursor + 1) %
@@ -1193,6 +1217,7 @@ private:
 		memcpy(mapped.pData, &shaderConstants, sizeof(shaderConstants));
 		m_context->Unmap(constantBuffer, 0);
 		m_context->VSSetConstantBuffers(0, 1, &constantBuffer);
+		m_context->PSSetConstantBuffers(0, 1, &constantBuffer);
 		return S_OK;
 	}
 

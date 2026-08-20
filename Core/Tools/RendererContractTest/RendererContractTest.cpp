@@ -439,6 +439,60 @@ int testD3D11HiddenSwapChain()
 			"captured triangle follows the neutral world transform");
 		logicalState.constants.world.setIdentity();
 
+		logicalState.pipeline.alphaTestEnable = true;
+		logicalState.pipeline.alphaFunction = rts::render::RENDER_COMPARE_GREATER;
+		logicalState.pipeline.alphaReference = 255;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyState(logicalState,
+				rts::render::RENDER_VERTEX_POSITION3_COLOR, 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(vertexBuffer, sizeof(TestVertex), 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"D3D11 parity pipeline applies legacy alpha-test state");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[0] > 240 && center[2] < 16,
+			"alpha-test rejection leaves the clear color untouched");
+		logicalState.pipeline.alphaTestEnable = false;
+
+		logicalState.pipeline.fogMode = rts::render::RENDER_FOG_LINEAR;
+		logicalState.constants.fog.enabled = true;
+		logicalState.constants.fog.color =
+			rts::render::RenderFloat4(0.0f, 1.0f, 0.0f, 1.0f);
+		logicalState.constants.fog.start = -1.0f;
+		logicalState.constants.fog.end = 0.0f;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyState(logicalState,
+				rts::render::RENDER_VERTEX_POSITION3_COLOR, 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(vertexBuffer, sizeof(TestVertex), 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"D3D11 parity pipeline applies legacy fog constants");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[1] > 240 && center[0] < 16 && center[2] < 16,
+			"linear fog reaches the configured fog color");
+		logicalState.pipeline.fogMode = rts::render::RENDER_FOG_DISABLED;
+		logicalState.constants.fog.enabled = false;
+
 		struct TexturedVertex
 		{
 			float position[3];
