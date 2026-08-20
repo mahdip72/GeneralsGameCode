@@ -24,6 +24,7 @@ cbuffer LegacyTransformConstants : register(b0)
 	float4 LightAttenuation[4];
 	float4 LightSpotParameters[4];
 	uint4 LightingParameters;
+	uint4 VertexLayoutParameters;
 };
 
 bool PassesAlphaTest(float alpha)
@@ -243,6 +244,7 @@ struct TexturedVertexInput
 	float3 position : POSITION;
 	float3 normal : NORMAL;
 	float4 color : COLOR0;
+	float4 specular : COLOR1;
 	float4 textureCoordinate0 : TEXCOORD0;
 	float4 textureCoordinate1 : TEXCOORD1;
 	float4 textureCoordinate2 : TEXCOORD2;
@@ -257,6 +259,7 @@ struct TexturedVertexOutput
 {
 	float4 position : SV_POSITION;
 	float4 color : COLOR0;
+	float4 specular : COLOR1;
 	float4 textureCoordinate0 : TEXCOORD0;
 	float4 textureCoordinate1 : TEXCOORD1;
 	float4 textureCoordinate2 : TEXCOORD2;
@@ -273,7 +276,12 @@ TexturedVertexOutput VSTextured(TexturedVertexInput input)
 	TexturedVertexOutput output;
 	const float4 objectPosition = float4(input.position, 1.0f);
 	output.position = mul(objectPosition, WorldViewProjection);
-	output.color = ApplyLegacyLighting(input.color, input.position, input.normal);
+	const float4 diffuse = VertexLayoutParameters.y != 0 ?
+		input.color : float4(1.0f, 1.0f, 1.0f, 1.0f);
+	const float3 normal = VertexLayoutParameters.x != 0 ?
+		input.normal : float3(0.0f, 0.0f, 1.0f);
+	output.color = ApplyLegacyLighting(diffuse, input.position, normal);
+	output.specular = VertexLayoutParameters.z != 0 ? input.specular : 0.0f;
 	output.textureCoordinate0 = input.textureCoordinate0;
 	output.textureCoordinate1 = input.textureCoordinate1;
 	output.textureCoordinate2 = input.textureCoordinate2;
@@ -386,13 +394,13 @@ float4 PSTextured(TexturedVertexOutput input) : SV_TARGET
 		const uint colorModifiers = TextureModifierParameters[stage].x;
 		const float4 colorArgument0 = ApplyTextureArgumentModifiers(
 			SelectTextureArgument(TextureColorParameters[stage].y, current,
-				input.color, 0.0f, textureSample, temporary), colorModifiers, 0);
+				input.color, input.specular, textureSample, temporary), colorModifiers, 0);
 		const float4 colorArgument1 = ApplyTextureArgumentModifiers(
 			SelectTextureArgument(TextureColorParameters[stage].z, current,
-				input.color, 0.0f, textureSample, temporary), colorModifiers, 1);
+				input.color, input.specular, textureSample, temporary), colorModifiers, 1);
 		const float4 colorArgument2 = ApplyTextureArgumentModifiers(
 			SelectTextureArgument(TextureColorParameters[stage].w, current,
-				input.color, 0.0f, textureSample, temporary), colorModifiers, 2);
+				input.color, input.specular, textureSample, temporary), colorModifiers, 2);
 		float4 stageResult = ApplyTextureOperation(colorOperation,
 			colorArgument1, colorArgument2, colorArgument0, current, input.color,
 			textureSample);
@@ -402,13 +410,13 @@ float4 PSTextured(TexturedVertexOutput input) : SV_TARGET
 			const uint alphaModifiers = TextureModifierParameters[stage].y;
 			const float4 alphaArgument0 = ApplyTextureArgumentModifiers(
 				SelectTextureArgument(TextureAlphaParameters[stage].y, current,
-					input.color, 0.0f, textureSample, temporary), alphaModifiers, 0);
+					input.color, input.specular, textureSample, temporary), alphaModifiers, 0);
 			const float4 alphaArgument1 = ApplyTextureArgumentModifiers(
 				SelectTextureArgument(TextureAlphaParameters[stage].z, current,
-					input.color, 0.0f, textureSample, temporary), alphaModifiers, 1);
+					input.color, input.specular, textureSample, temporary), alphaModifiers, 1);
 			const float4 alphaArgument2 = ApplyTextureArgumentModifiers(
 				SelectTextureArgument(TextureAlphaParameters[stage].w, current,
-					input.color, 0.0f, textureSample, temporary), alphaModifiers, 2);
+					input.color, input.specular, textureSample, temporary), alphaModifiers, 2);
 			stageResult.a = ApplyTextureOperation(alphaOperation, alphaArgument1,
 				alphaArgument2, alphaArgument0, current, input.color,
 				textureSample).a;

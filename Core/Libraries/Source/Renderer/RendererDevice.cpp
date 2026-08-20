@@ -203,5 +203,15 @@ TextureDescriptor::TextureDescriptor() :
 	usage(RENDER_USAGE_IMMUTABLE)
 {
 }
+
+LegacyVertexElement::LegacyVertexElement() :
+	semantic(RENDER_VERTEX_SEMANTIC_POSITION), semanticIndex(0),
+	format(RENDER_VERTEX_DATA_FLOAT3), byteOffset(0)
+{
+}
+
+LegacyVertexLayout::LegacyVertexLayout() : stride(0), elementCount(0)
+{
+}
 }
 }

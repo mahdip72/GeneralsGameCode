@@ -767,6 +767,120 @@ int testD3D11HiddenSwapChain()
 			"two-stage add combines green and red into yellow deterministically");
 		logicalState.pipeline.textureStages[1] =
 			rts::render::LegacyTextureStageState();
+
+		struct FlexibleVertex
+		{
+			float position[3];
+			unsigned int color;
+			float texture0[2];
+			float texture1[2];
+		};
+		const FlexibleVertex flexibleVertices[3] = {
+			{ { -0.8f, -0.8f, 0.0f }, 0xffffffffU,
+				{ 0.0f, 0.0f }, { 0.75f, 0.0f } },
+			{ { 0.0f, 0.8f, 0.0f }, 0xffffffffU,
+				{ 0.0f, 0.0f }, { 0.75f, 0.0f } },
+			{ { 0.8f, -0.8f, 0.0f }, 0xffffffffU,
+				{ 0.0f, 0.0f }, { 0.75f, 0.0f } }
+		};
+		rts::render::BufferDescriptor flexibleVertexDescriptor;
+		flexibleVertexDescriptor.byteCount = sizeof(flexibleVertices);
+		flexibleVertexDescriptor.stride = sizeof(FlexibleVertex);
+		rts::render::GpuHandle flexibleVertexBuffer;
+		result |= check(device->createBuffer(flexibleVertexDescriptor,
+			flexibleVertices, sizeof(flexibleVertices), &flexibleVertexBuffer) ==
+			rts::render::RENDER_RESULT_OK,
+			"D3D11 parity probe creates a flexible legacy vertex buffer");
+		const unsigned int uvSelectionPixels[2] = {
+			0xff0000ffU, 0xffff0000U
+		};
+		rts::render::TextureDescriptor uvSelectionDescriptor = textureDescriptor;
+		uvSelectionDescriptor.height = 1;
+		rts::render::TextureSubresourceData uvSelectionData;
+		uvSelectionData.data = uvSelectionPixels;
+		uvSelectionData.rowPitch = sizeof(uvSelectionPixels);
+		uvSelectionData.slicePitch = sizeof(uvSelectionPixels);
+		rts::render::GpuHandle uvSelectionTexture;
+		result |= check(device->createTexture(uvSelectionDescriptor,
+			&uvSelectionData, 1, &uvSelectionTexture) ==
+			rts::render::RENDER_RESULT_OK,
+			"D3D11 parity probe creates a UV-selection texture");
+		rts::render::LegacyVertexLayout flexibleLayout;
+		flexibleLayout.stride = sizeof(FlexibleVertex);
+		flexibleLayout.elementCount = 4;
+		flexibleLayout.elements[0].semantic =
+			rts::render::RENDER_VERTEX_SEMANTIC_POSITION;
+		flexibleLayout.elements[0].format =
+			rts::render::RENDER_VERTEX_DATA_FLOAT3;
+		flexibleLayout.elements[0].byteOffset = 0;
+		flexibleLayout.elements[1].semantic =
+			rts::render::RENDER_VERTEX_SEMANTIC_DIFFUSE;
+		flexibleLayout.elements[1].format =
+			rts::render::RENDER_VERTEX_DATA_COLOR_BGRA8;
+		flexibleLayout.elements[1].byteOffset = 12;
+		flexibleLayout.elements[2].semantic =
+			rts::render::RENDER_VERTEX_SEMANTIC_TEXTURE_COORDINATE;
+		flexibleLayout.elements[2].semanticIndex = 0;
+		flexibleLayout.elements[2].format =
+			rts::render::RENDER_VERTEX_DATA_FLOAT2;
+		flexibleLayout.elements[2].byteOffset = 16;
+		flexibleLayout.elements[3].semantic =
+			rts::render::RENDER_VERTEX_SEMANTIC_TEXTURE_COORDINATE;
+		flexibleLayout.elements[3].semanticIndex = 1;
+		flexibleLayout.elements[3].format =
+			rts::render::RENDER_VERTEX_DATA_FLOAT2;
+		flexibleLayout.elements[3].byteOffset = 24;
+		logicalState.pipeline.textureStages[0].colorOperation =
+			rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_2;
+		logicalState.pipeline.textureStages[0].colorArgument2 =
+			rts::render::RENDER_TEXTURE_ARG_DIFFUSE;
+		logicalState.pipeline.textureStages[1].colorOperation =
+			rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_1;
+		logicalState.pipeline.textureStages[1].colorArgument1 =
+			rts::render::RENDER_TEXTURE_ARG_TEXTURE;
+		logicalState.pipeline.textureStages[1].textureCoordinateIndex = 1;
+		logicalState.pipeline.textureStages[1].sampler.minification =
+			rts::render::RENDER_TEXTURE_FILTER_POINT;
+		logicalState.pipeline.textureStages[1].sampler.magnification =
+			rts::render::RENDER_TEXTURE_FILTER_POINT;
+		logicalState.pipeline.textureStages[1].sampler.mipmapping =
+			rts::render::RENDER_TEXTURE_FILTER_POINT;
+		const bool flexibleFrameStarted = context->beginFrame() ==
+			rts::render::RENDER_RESULT_OK;
+		rts::render::RenderResult flexibleStateResult =
+			rts::render::RENDER_RESULT_FAILED;
+		bool flexibleDrawCompleted = false;
+		if (flexibleFrameStarted)
+		{
+			context->clear(clearColor, 1.0f, 0);
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f);
+			flexibleStateResult = context->setLegacyStateForLayout(logicalState,
+				flexibleLayout, 2);
+			if (flexibleStateResult == rts::render::RENDER_RESULT_OK)
+			{
+				flexibleDrawCompleted = context->setVertexBuffer(
+					flexibleVertexBuffer, sizeof(FlexibleVertex), 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(1, uvSelectionTexture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setPrimitiveTopology(
+						rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->draw(3, 0) == rts::render::RENDER_RESULT_OK;
+			}
+			context->endFrame();
+		}
+		result |= check(flexibleFrameStarted &&
+			flexibleStateResult == rts::render::RENDER_RESULT_OK &&
+			flexibleDrawCompleted &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"D3D11 parity pipeline accepts descriptor-driven legacy vertex layouts");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[0] > 240 && center[1] < 16 && center[2] < 16,
+			"texture stage one selects UV1 instead of repeating UV0");
+		logicalState.pipeline.textureStages[1] =
+			rts::render::LegacyTextureStageState();
 		logicalState.pipeline.lightingEnable = true;
 		logicalState.constants.material.ambient = rts::render::RenderFloat4();
 		logicalState.constants.material.emissive = rts::render::RenderFloat4();
@@ -817,8 +931,10 @@ int testD3D11HiddenSwapChain()
 		result |= check(device->destroyResource(vertexBuffer) &&
 			device->destroyResource(indexBuffer) &&
 			device->destroyResource(texturedVertexBuffer) &&
+			device->destroyResource(flexibleVertexBuffer) &&
 			device->destroyResource(texture) &&
 			device->destroyResource(secondTexture) &&
+			device->destroyResource(uvSelectionTexture) &&
 			device->destroyResource(offscreenColor) &&
 			device->destroyResource(offscreenDepth) &&
 			device->present() == rts::render::RENDER_RESULT_OK &&

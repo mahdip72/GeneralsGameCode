@@ -155,6 +155,45 @@ enum LegacyVertexFormat
 	RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1 = 2
 };
 
+enum LegacyVertexSemantic
+{
+	RENDER_VERTEX_SEMANTIC_POSITION,
+	RENDER_VERTEX_SEMANTIC_NORMAL,
+	RENDER_VERTEX_SEMANTIC_DIFFUSE,
+	RENDER_VERTEX_SEMANTIC_SPECULAR,
+	RENDER_VERTEX_SEMANTIC_TEXTURE_COORDINATE
+};
+
+enum LegacyVertexDataFormat
+{
+	RENDER_VERTEX_DATA_FLOAT1,
+	RENDER_VERTEX_DATA_FLOAT2,
+	RENDER_VERTEX_DATA_FLOAT3,
+	RENDER_VERTEX_DATA_FLOAT4,
+	RENDER_VERTEX_DATA_COLOR_BGRA8
+};
+
+struct LegacyVertexElement
+{
+	LegacyVertexElement();
+
+	LegacyVertexSemantic semantic;
+	unsigned int semanticIndex;
+	LegacyVertexDataFormat format;
+	unsigned int byteOffset;
+};
+
+struct LegacyVertexLayout
+{
+	enum { MAX_ELEMENT_COUNT = 12 };
+
+	LegacyVertexLayout();
+
+	unsigned int stride;
+	unsigned int elementCount;
+	LegacyVertexElement elements[MAX_ELEMENT_COUNT];
+};
+
 enum RenderPrimitiveTopology
 {
 	RENDER_PRIMITIVE_TRIANGLE_LIST,
@@ -178,6 +217,9 @@ public:
 		float height, float minimumDepth, float maximumDepth) = 0;
 	virtual RenderResult setLegacyState(const LegacyLogicalState &state,
 		LegacyVertexFormat vertexFormat, unsigned int texturePresenceMask) = 0;
+	virtual RenderResult setLegacyStateForLayout(const LegacyLogicalState &state,
+		const LegacyVertexLayout &vertexLayout,
+		unsigned int texturePresenceMask) = 0;
 	virtual RenderResult setVertexBuffer(GpuHandle buffer, unsigned int stride,
 		unsigned int offset) = 0;
 	virtual RenderResult setIndexBuffer(GpuHandle buffer, RenderFormat format,

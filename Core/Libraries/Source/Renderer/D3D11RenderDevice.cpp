@@ -179,6 +179,54 @@ struct SamplerStateEntry
 	ID3D11SamplerState *state;
 };
 
+struct InputLayoutEntry
+{
+	LegacyVertexLayout descriptor;
+	ID3D11InputLayout *layout;
+};
+
+DXGI_FORMAT TranslateVertexDataFormat(LegacyVertexDataFormat format)
+{
+	switch (format)
+	{
+	case RENDER_VERTEX_DATA_FLOAT1: return DXGI_FORMAT_R32_FLOAT;
+	case RENDER_VERTEX_DATA_FLOAT2: return DXGI_FORMAT_R32G32_FLOAT;
+	case RENDER_VERTEX_DATA_FLOAT3: return DXGI_FORMAT_R32G32B32_FLOAT;
+	case RENDER_VERTEX_DATA_FLOAT4: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+	case RENDER_VERTEX_DATA_COLOR_BGRA8: return DXGI_FORMAT_B8G8R8A8_UNORM;
+	default: return DXGI_FORMAT_UNKNOWN;
+	}
+}
+
+unsigned int VertexDataByteCount(LegacyVertexDataFormat format)
+{
+	static const unsigned int sizes[] = { 4, 8, 12, 16, 4 };
+	return static_cast<unsigned int>(format) <
+		static_cast<unsigned int>(sizeof(sizes) / sizeof(sizes[0])) ?
+		sizes[format] : 0;
+}
+
+bool EqualVertexLayouts(const LegacyVertexLayout &left,
+	const LegacyVertexLayout &right)
+{
+	if (left.stride != right.stride ||
+		left.elementCount != right.elementCount)
+	{
+		return false;
+	}
+	for (unsigned int index = 0; index < left.elementCount; ++index)
+	{
+		const LegacyVertexElement &a = left.elements[index];
+		const LegacyVertexElement &b = right.elements[index];
+		if (a.semantic != b.semantic || a.semanticIndex != b.semanticIndex ||
+			a.format != b.format || a.byteOffset != b.byteOffset)
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
 struct ResourceSlot
 {
 	ResourceSlot() : resource(0), view(0), renderTarget(0), depthStencil(0),
@@ -224,6 +272,7 @@ struct LegacyTransformConstants
 	float lightAttenuation[LEGACY_LIGHT_COUNT][4];
 	float lightSpotParameters[LEGACY_LIGHT_COUNT][4];
 	unsigned int lightingParameters[4];
+	unsigned int vertexLayoutParameters[4];
 };
 
 void MultiplyMatrices(const float *left, const float *right, float *product)
@@ -913,7 +962,8 @@ public:
 				return RENDER_RESULT_UNSUPPORTED;
 			}
 		}
-		const HRESULT transformResult = updateTransformConstants(state);
+		const HRESULT transformResult = updateTransformConstants(state,
+			textured ? 0x0bU : 0x02U);
 		if (FAILED(transformResult))
 		{
 			return TranslateResult(transformResult);
@@ -1052,6 +1102,51 @@ public:
 		}
 		m_pipelineBound = true;
 		return RENDER_RESULT_OK;
+	}
+
+	virtual RenderResult setLegacyStateForLayout(const LegacyLogicalState &state,
+		const LegacyVertexLayout &vertexLayout,
+		unsigned int texturePresenceMask)
+	{
+		if (!isOwner() || !m_frameOpen)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		ID3D11InputLayout *inputLayout = 0;
+		const HRESULT layoutResult = findOrCreateInputLayout(vertexLayout,
+			&inputLayout);
+		if (FAILED(layoutResult))
+		{
+			return TranslateResult(layoutResult);
+		}
+		const RenderResult stateResult = setLegacyState(state,
+			RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1, texturePresenceMask);
+		if (stateResult == RENDER_RESULT_OK)
+		{
+			unsigned int layoutFlags = 0;
+			for (unsigned int index = 0; index < vertexLayout.elementCount; ++index)
+			{
+				switch (vertexLayout.elements[index].semantic)
+				{
+				case RENDER_VERTEX_SEMANTIC_NORMAL: layoutFlags |= 1U; break;
+				case RENDER_VERTEX_SEMANTIC_DIFFUSE: layoutFlags |= 2U; break;
+				case RENDER_VERTEX_SEMANTIC_SPECULAR: layoutFlags |= 4U; break;
+				case RENDER_VERTEX_SEMANTIC_TEXTURE_COORDINATE:
+					layoutFlags |= 1U << (8 +
+						vertexLayout.elements[index].semanticIndex);
+					break;
+				default: break;
+				}
+			}
+			const HRESULT constantsResult = updateTransformConstants(state,
+				layoutFlags);
+			if (FAILED(constantsResult))
+			{
+				return TranslateResult(constantsResult);
+			}
+			m_context->IASetInputLayout(inputLayout);
+		}
+		return stateResult;
 	}
 
 	virtual RenderResult setVertexBuffer(GpuHandle buffer, unsigned int stride,
@@ -1374,6 +1469,8 @@ private:
 				D3D11_INPUT_PER_VERTEX_DATA, 0 },
 			{ "COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 24,
 				D3D11_INPUT_PER_VERTEX_DATA, 0 },
+			{ "COLOR", 1, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
+				D3D11_INPUT_PER_VERTEX_DATA, 0 },
 			{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 28,
 				D3D11_INPUT_PER_VERTEX_DATA, 0 },
 			{ "TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT, 0, 28,
@@ -1396,7 +1493,8 @@ private:
 			g_LegacyTexturedVS, sizeof(g_LegacyTexturedVS), &m_texturedLayout);
 	}
 
-	HRESULT updateTransformConstants(const LegacyLogicalState &state)
+	HRESULT updateTransformConstants(const LegacyLogicalState &state,
+		unsigned int vertexLayoutFlags)
 	{
 		LegacyTransformConstants shaderConstants;
 		MultiplyMatrices(state.constants.world.values, state.constants.view.values,
@@ -1547,6 +1645,13 @@ private:
 			state.pipeline.normalizeNormals ? 1U : 0U;
 		shaderConstants.lightingParameters[2] = 0;
 		shaderConstants.lightingParameters[3] = 0;
+		shaderConstants.vertexLayoutParameters[0] =
+			(vertexLayoutFlags & 1U) != 0 ? 1U : 0U;
+		shaderConstants.vertexLayoutParameters[1] =
+			(vertexLayoutFlags & 2U) != 0 ? 1U : 0U;
+		shaderConstants.vertexLayoutParameters[2] =
+			(vertexLayoutFlags & 4U) != 0 ? 1U : 0U;
+		shaderConstants.vertexLayoutParameters[3] = vertexLayoutFlags >> 8;
 		ID3D11Buffer *constantBuffer =
 			m_transformConstants[m_transformConstantCursor];
 		m_transformConstantCursor = (m_transformConstantCursor + 1) %
@@ -1778,6 +1883,197 @@ private:
 		return S_OK;
 	}
 
+	HRESULT findOrCreateInputLayout(const LegacyVertexLayout &descriptor,
+		ID3D11InputLayout **layout)
+	{
+		if (layout == 0 || descriptor.stride == 0 ||
+			descriptor.elementCount == 0 ||
+			descriptor.elementCount > LegacyVertexLayout::MAX_ELEMENT_COUNT)
+		{
+			return E_INVALIDARG;
+		}
+		for (unsigned int cached = 0; cached < m_inputLayouts.size(); ++cached)
+		{
+			if (EqualVertexLayouts(m_inputLayouts[cached].descriptor, descriptor))
+			{
+				*layout = m_inputLayouts[cached].layout;
+				return S_OK;
+			}
+		}
+		if (m_inputLayouts.size() >= 256)
+		{
+			return E_OUTOFMEMORY;
+		}
+		D3D11_INPUT_ELEMENT_DESC nativeElements[
+			LegacyVertexLayout::MAX_ELEMENT_COUNT + LEGACY_TEXTURE_STAGE_COUNT + 3];
+		bool hasPosition = false;
+		bool hasNormal = false;
+		bool hasDiffuse = false;
+		bool hasSpecular = false;
+		bool hasTextureCoordinate[LEGACY_TEXTURE_STAGE_COUNT] = { false };
+		unsigned int positionOffset = 0;
+		for (unsigned int index = 0; index < descriptor.elementCount; ++index)
+		{
+			const LegacyVertexElement &element = descriptor.elements[index];
+			const unsigned int byteCount = VertexDataByteCount(element.format);
+			if (byteCount == 0 || element.byteOffset > descriptor.stride ||
+				byteCount > descriptor.stride - element.byteOffset)
+			{
+				return E_INVALIDARG;
+			}
+			const char *semanticName = 0;
+			unsigned int semanticIndex = element.semanticIndex;
+			switch (element.semantic)
+			{
+			case RENDER_VERTEX_SEMANTIC_POSITION:
+				if (hasPosition || semanticIndex != 0 ||
+					(element.format != RENDER_VERTEX_DATA_FLOAT3 &&
+					 element.format != RENDER_VERTEX_DATA_FLOAT4))
+				{
+					return E_INVALIDARG;
+				}
+				hasPosition = true;
+				positionOffset = element.byteOffset;
+				semanticName = "POSITION";
+				break;
+			case RENDER_VERTEX_SEMANTIC_NORMAL:
+				if (hasNormal || semanticIndex != 0 ||
+					element.format != RENDER_VERTEX_DATA_FLOAT3)
+				{
+					return E_INVALIDARG;
+				}
+				hasNormal = true;
+				semanticName = "NORMAL";
+				break;
+			case RENDER_VERTEX_SEMANTIC_DIFFUSE:
+				if (hasDiffuse || semanticIndex != 0 ||
+					element.format != RENDER_VERTEX_DATA_COLOR_BGRA8)
+				{
+					return E_INVALIDARG;
+				}
+				hasDiffuse = true;
+				semanticName = "COLOR";
+				semanticIndex = 0;
+				break;
+			case RENDER_VERTEX_SEMANTIC_SPECULAR:
+				if (hasSpecular || semanticIndex != 0 ||
+					element.format != RENDER_VERTEX_DATA_COLOR_BGRA8)
+				{
+					return E_INVALIDARG;
+				}
+				hasSpecular = true;
+				semanticName = "COLOR";
+				semanticIndex = 1;
+				break;
+			case RENDER_VERTEX_SEMANTIC_TEXTURE_COORDINATE:
+				if (semanticIndex >= LEGACY_TEXTURE_STAGE_COUNT ||
+					hasTextureCoordinate[semanticIndex] ||
+					element.format == RENDER_VERTEX_DATA_COLOR_BGRA8)
+				{
+					return E_INVALIDARG;
+				}
+				hasTextureCoordinate[semanticIndex] = true;
+				semanticName = "TEXCOORD";
+				break;
+			default:
+				return E_INVALIDARG;
+			}
+			for (unsigned int previous = 0; previous < index; ++previous)
+			{
+				if (nativeElements[previous].SemanticIndex == semanticIndex &&
+					strcmp(nativeElements[previous].SemanticName, semanticName) == 0)
+				{
+					return E_INVALIDARG;
+				}
+			}
+			nativeElements[index].SemanticName = semanticName;
+			nativeElements[index].SemanticIndex = semanticIndex;
+			nativeElements[index].Format = TranslateVertexDataFormat(element.format);
+			nativeElements[index].InputSlot = 0;
+			nativeElements[index].AlignedByteOffset = element.byteOffset;
+			nativeElements[index].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+			nativeElements[index].InstanceDataStepRate = 0;
+		}
+		if (!hasPosition)
+		{
+			return E_INVALIDARG;
+		}
+		unsigned int nativeElementCount = descriptor.elementCount;
+		if (!hasNormal)
+		{
+			D3D11_INPUT_ELEMENT_DESC &element =
+				nativeElements[nativeElementCount++];
+			element.SemanticName = "NORMAL";
+			element.SemanticIndex = 0;
+			element.Format = DXGI_FORMAT_R32G32B32_FLOAT;
+			element.InputSlot = 0;
+			element.AlignedByteOffset = positionOffset;
+			element.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+			element.InstanceDataStepRate = 0;
+		}
+		if (!hasDiffuse)
+		{
+			D3D11_INPUT_ELEMENT_DESC &element =
+				nativeElements[nativeElementCount++];
+			element.SemanticName = "COLOR";
+			element.SemanticIndex = 0;
+			element.Format = DXGI_FORMAT_R32G32B32_FLOAT;
+			element.InputSlot = 0;
+			element.AlignedByteOffset = positionOffset;
+			element.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+			element.InstanceDataStepRate = 0;
+		}
+		if (!hasSpecular)
+		{
+			D3D11_INPUT_ELEMENT_DESC &element =
+				nativeElements[nativeElementCount++];
+			element.SemanticName = "COLOR";
+			element.SemanticIndex = 1;
+			element.Format = DXGI_FORMAT_R32G32B32_FLOAT;
+			element.InputSlot = 0;
+			element.AlignedByteOffset = positionOffset;
+			element.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+			element.InstanceDataStepRate = 0;
+		}
+		for (unsigned int coordinate = 0;
+			coordinate < LEGACY_TEXTURE_STAGE_COUNT; ++coordinate)
+		{
+			if (!hasTextureCoordinate[coordinate])
+			{
+				D3D11_INPUT_ELEMENT_DESC &element =
+					nativeElements[nativeElementCount++];
+				element.SemanticName = "TEXCOORD";
+				element.SemanticIndex = coordinate;
+				element.Format = DXGI_FORMAT_R32G32B32_FLOAT;
+				element.InputSlot = 0;
+				element.AlignedByteOffset = positionOffset;
+				element.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+				element.InstanceDataStepRate = 0;
+			}
+		}
+		InputLayoutEntry entry;
+		entry.descriptor = descriptor;
+		entry.layout = 0;
+		HRESULT result = m_device->CreateInputLayout(nativeElements,
+			nativeElementCount, g_LegacyTexturedVS,
+			sizeof(g_LegacyTexturedVS), &entry.layout);
+		if (FAILED(result))
+		{
+			return result;
+		}
+		try
+		{
+			m_inputLayouts.push_back(entry);
+		}
+		catch (...)
+		{
+			entry.layout->Release();
+			return E_OUTOFMEMORY;
+		}
+		*layout = entry.layout;
+		return S_OK;
+	}
+
 	HRESULT createSwapChain(HWND window)
 	{
 		IDXGIDevice *dxgiDevice = 0;
@@ -1915,6 +2211,11 @@ private:
 
 	void releasePipelineResources()
 	{
+		for (unsigned int index = 0; index < m_inputLayouts.size(); ++index)
+		{
+			m_inputLayouts[index].layout->Release();
+		}
+		m_inputLayouts.clear();
 		for (unsigned int index = 0; index < m_blendStates.size(); ++index)
 		{
 			m_blendStates[index].state->Release();
@@ -2017,6 +2318,7 @@ private:
 	std::vector<DepthStencilStateEntry> m_depthStates;
 	std::vector<RasterizerStateEntry> m_rasterizerStates;
 	std::vector<SamplerStateEntry> m_samplerStates;
+	std::vector<InputLayoutEntry> m_inputLayouts;
 	DWORD m_ownerThread;
 	bool m_initialized;
 	bool m_frameOpen;
