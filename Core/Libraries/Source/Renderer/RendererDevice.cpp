@@ -12,6 +12,8 @@ namespace render
 {
 namespace
 {
+RenderBackend g_requestedBackend = RENDER_BACKEND_DX8;
+
 bool EqualIgnoringCase(const char *left, const char *right)
 {
 	while (*left != '\0' && *right != '\0')
@@ -27,6 +29,16 @@ bool EqualIgnoringCase(const char *left, const char *right)
 	}
 	return *left == *right;
 }
+}
+
+void SetRequestedRenderBackend(RenderBackend backend)
+{
+	g_requestedBackend = backend;
+}
+
+RenderBackend RequestedRenderBackend()
+{
+	return g_requestedBackend;
 }
 
 const char *RenderBackendName(RenderBackend backend)

@@ -37,6 +37,7 @@
 #include "GameClient/GameText.h"
 #include "GameNetwork/NetworkDefs.h"
 #include "Lib/JobSystem.h"
+#include "Renderer/RendererDevice.h"
 #include "WWLib/trim.h"
 
 #include <errno.h>
@@ -124,6 +125,27 @@ Int parseWin(char *args[], int)
 {
 	TheWritableGlobalData->m_windowed = true;
 
+	return 1;
+}
+
+//=============================================================================
+//=============================================================================
+Int parseRenderer(char *args[], int argc)
+{
+	if (argc > 1)
+	{
+		rts::render::RenderBackend backend = rts::render::RENDER_BACKEND_DX8;
+		if (rts::render::ParseRenderBackend(args[1], &backend))
+		{
+			rts::render::SetRequestedRenderBackend(backend);
+		}
+		else
+		{
+			DEBUG_CRASH(("Unknown renderer '%s'. Expected dx8 or d3d11.",
+				args[1]));
+		}
+		return 2;
+	}
 	return 1;
 }
 
@@ -1190,6 +1212,7 @@ static CommandLineParam paramsForStartup[] =
 {
 	{ "-win", parseWin },
 	{ "-fullscreen", parseNoWin },
+	{ "-renderer", parseRenderer },
 
 	// TheSuperHackers @feature helmutbuhler 11/04/2025
 	// This runs the game without a window, graphics, input and audio. You can combine this with -replay

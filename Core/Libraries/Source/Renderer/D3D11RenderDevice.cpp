@@ -890,21 +890,53 @@ public:
 	virtual RenderResult clear(const RenderFloat4 &color, float depth,
 		unsigned int stencil)
 	{
-		if (!isOwner() || !m_frameOpen ||
-			(m_activeRenderTarget == 0 && m_activeDepthStencil == 0) ||
-			depth < 0.0f || depth > 1.0f)
+		unsigned int clearFlags = 0;
+		if (m_activeRenderTarget != 0)
+		{
+			clearFlags |= RENDER_CLEAR_COLOR;
+		}
+		if (m_activeDepthStencil != 0)
+		{
+			clearFlags |= RENDER_CLEAR_DEPTH | RENDER_CLEAR_STENCIL;
+		}
+		return clearTargets(clearFlags, color, depth, stencil);
+	}
+
+	virtual RenderResult clearTargets(unsigned int clearFlags,
+		const RenderFloat4 &color, float depth, unsigned int stencil)
+	{
+		const unsigned int validFlags = RENDER_CLEAR_COLOR |
+			RENDER_CLEAR_DEPTH | RENDER_CLEAR_STENCIL;
+		const bool clearColor = (clearFlags & RENDER_CLEAR_COLOR) != 0;
+		const bool clearDepthStencil =
+			(clearFlags & (RENDER_CLEAR_DEPTH | RENDER_CLEAR_STENCIL)) != 0;
+		if (!isOwner() || !m_frameOpen || clearFlags == 0 ||
+			(clearFlags & ~validFlags) != 0 ||
+			(clearColor && m_activeRenderTarget == 0) ||
+			(clearDepthStencil && m_activeDepthStencil == 0) ||
+			((clearFlags & RENDER_CLEAR_DEPTH) != 0 &&
+				(depth < 0.0f || depth > 1.0f)))
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		const float nativeColor[4] = { color.x, color.y, color.z, color.w };
-		if (m_activeRenderTarget != 0)
+		if (clearColor)
 		{
 			m_context->ClearRenderTargetView(m_activeRenderTarget, nativeColor);
 		}
-		if (m_activeDepthStencil != 0)
+		if (clearDepthStencil)
 		{
+			UINT nativeFlags = 0;
+			if ((clearFlags & RENDER_CLEAR_DEPTH) != 0)
+			{
+				nativeFlags |= D3D11_CLEAR_DEPTH;
+			}
+			if ((clearFlags & RENDER_CLEAR_STENCIL) != 0)
+			{
+				nativeFlags |= D3D11_CLEAR_STENCIL;
+			}
 			m_context->ClearDepthStencilView(m_activeDepthStencil,
-				D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, depth,
+				nativeFlags, depth,
 				static_cast<UINT8>(stencil));
 		}
 		return RENDER_RESULT_OK;
@@ -1247,8 +1279,17 @@ public:
 
 	virtual RenderResult setTexture(unsigned int stage, GpuHandle texture)
 	{
-		if (!isOwner() || !m_frameOpen || stage >= LEGACY_TEXTURE_STAGE_COUNT ||
-			!m_handles->isLive(texture))
+		if (!isOwner() || !m_frameOpen || stage >= LEGACY_TEXTURE_STAGE_COUNT)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		if (!texture.isValid())
+		{
+			ID3D11ShaderResourceView *emptyView = 0;
+			m_context->PSSetShaderResources(stage, 1, &emptyView);
+			return RENDER_RESULT_OK;
+		}
+		if (!m_handles->isLive(texture))
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}

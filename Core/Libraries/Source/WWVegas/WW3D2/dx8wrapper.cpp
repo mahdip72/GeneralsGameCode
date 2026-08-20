@@ -80,10 +80,12 @@
 #include "WWDebug/wwprofile.h"
 #include "WWLib/ffactory.h"
 #include "dx8caps.h"
+#include "d3d11legacybridge.h"
 #include "formconv.h"
 #include "dx8texman.h"
 #include "WWLib/bound.h"
 #include "WWLib/DbgHelpGuard.h"
+#include "Renderer/RendererDevice.h"
 
 #include "shdlib.h"
 
@@ -177,6 +179,8 @@ static D3DPRESENT_PARAMETERS								_PresentParameters;
 static DynamicVectorClass<StringClass>					_RenderDeviceNameTable;
 static DynamicVectorClass<StringClass>					_RenderDeviceShortNameTable;
 static DynamicVectorClass<RenderDeviceDescClass>	_RenderDeviceDescriptionTable;
+static bool _UseD3D11Backend = false;
+static D3D11LegacyBridge _D3D11Bridge;
 
 
 typedef IDirect3D8* (WINAPI *Direct3DCreate8Type) (UINT SDKVersion);
@@ -249,6 +253,15 @@ void MoveRectIntoOtherRect(const RECT& inner, const RECT& outer, int* x, int* y)
 bool DX8Wrapper::Init(void * hwnd, bool lite)
 {
 	WWASSERT(!IsInitted);
+	_UseD3D11Backend = rts::render::RequestedRenderBackend() ==
+		rts::render::RENDER_BACKEND_D3D11;
+#if !defined(RTS_RENDERER_HAS_D3D11)
+	if (_UseD3D11Backend)
+	{
+		WWDEBUG_SAY(("The D3D11 renderer is unavailable in this build."));
+		return false;
+	}
+#endif
 
 	// zero memory
 	memset(Textures,0,sizeof(IDirect3DBaseTexture8*)*MAX_TEXTURE_STAGES);
@@ -328,6 +341,7 @@ bool DX8Wrapper::Init(void * hwnd, bool lite)
 
 void DX8Wrapper::Shutdown()
 {
+	_D3D11Bridge.Shutdown();
 	if (D3DDevice) {
 
 		Set_Render_Target ((IDirect3DSurface8 *)nullptr);
@@ -598,6 +612,18 @@ bool DX8Wrapper::Create_Device()
 	** Initialize all subsystems
 	*/
 	Do_Onetime_Device_Dependent_Inits();
+	if (_UseD3D11Backend && !_D3D11Bridge.Initialize(_Hwnd, D3DDevice,
+		ResolutionWidth, ResolutionHeight,
+		_PresentParameters.FullScreen_PresentationInterval !=
+			D3DPRESENT_INTERVAL_IMMEDIATE))
+	{
+		WWDEBUG_SAY(("Failed to initialize the D3D11 renderer backend."));
+		return false;
+	}
+	if (_D3D11Bridge.Is_Active())
+	{
+		WWDEBUG_SAY(("Renderer backend: d3d11"));
+	}
 	return true;
 }
 
@@ -647,6 +673,10 @@ bool DX8Wrapper::Reset_Device(bool reload_assets)
 		Invalidate_Cached_Render_States();
 		Set_Default_Global_Render_States();
 		SHD_INIT_SHADERS;
+		if (_D3D11Bridge.Is_Active())
+		{
+			_D3D11Bridge.Resize(ResolutionWidth, ResolutionHeight);
+		}
 		WWDEBUG_SAY(("Device reset completed"));
 		return true;
 	}
@@ -1659,6 +1689,10 @@ void DX8Wrapper::Begin_Scene()
 #endif
 
 	DX8CALL(BeginScene());
+	if (_D3D11Bridge.Is_Active())
+	{
+		_D3D11Bridge.Begin_Frame();
+	}
 
 	DX8WebBrowser::Update();
 }
@@ -1669,13 +1703,20 @@ void DX8Wrapper::End_Scene(bool flip_frames)
 	DX8CALL(EndScene());
 
 	DX8WebBrowser::Render(0);
+	if (_D3D11Bridge.Is_Active())
+	{
+		_D3D11Bridge.End_Frame(flip_frames);
+	}
 
 	if (flip_frames) {
 		DX8_Assert();
 		HRESULT hr;
-		{
+		if (!_D3D11Bridge.Is_Active()) {
 			WWPROFILE("DX8Device::Present()");
 			hr=_Get_D3D_Device8()->Present(nullptr, nullptr, nullptr, nullptr);
+		}
+		else {
+			hr = D3D_OK;
 		}
 
 		DX8_RECORD_DX8_CALLS();
@@ -1811,6 +1852,11 @@ void DX8Wrapper::Clear(bool clear_color, bool clear_z_stencil, const Vector3 &co
 	if (flags)
 	{
 		DX8CALL(Clear(0, nullptr, flags, Convert_Color(color,dest_alpha), z, stencil));
+		if (_D3D11Bridge.Is_Active() && !IsRenderToTexture)
+		{
+			_D3D11Bridge.Clear(clear_color, clear_z_stencil,
+				color.X, color.Y, color.Z, dest_alpha, z, stencil);
+		}
 	}
 }
 
@@ -1818,6 +1864,10 @@ void DX8Wrapper::Set_Viewport(CONST D3DVIEWPORT8* pViewport)
 {
 	DX8_THREAD_ASSERT();
 	DX8CALL(SetViewport(pViewport));
+	if (_D3D11Bridge.Is_Active() && !IsRenderToTexture && pViewport != nullptr)
+	{
+		_D3D11Bridge.Set_Viewport(*pViewport);
+	}
 }
 
 // ----------------------------------------------------------------------------
@@ -1996,6 +2046,13 @@ void DX8Wrapper::Draw_Sorting_IB_VB(
 		vertex_count,
 		dyn_ib_access.IndexBufferOffset,
 		polygon_count));
+	if (_D3D11Bridge.Is_Active() && !IsRenderToTexture)
+	{
+		_D3D11Bridge.Draw(dyn_vb_access.VertexBuffer,
+			dyn_ib_access.IndexBuffer, primitive_type,
+			dyn_ib_access.IndexBufferOffset, polygon_count,
+			dyn_vb_access.VertexBufferOffset);
+	}
 
 	DX8_RECORD_RENDER(polygon_count,vertex_count,render_state.shader);
 }
@@ -2110,6 +2167,13 @@ void DX8Wrapper::Draw(
 					vertex_count,
 					start_index+render_state.iba_offset,
 					polygon_count));
+				if (_D3D11Bridge.Is_Active() && !IsRenderToTexture)
+				{
+					_D3D11Bridge.Draw(render_state.vertex_buffers[0],
+						render_state.index_buffer, primitive_type,
+						start_index + render_state.iba_offset, polygon_count,
+						render_state.index_base_offset + render_state.vba_offset);
+				}
 			}
 			break;
 		case BUFFER_TYPE_SORTING:

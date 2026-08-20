@@ -32,7 +32,7 @@ $rules = @(
         Name = 'raw-d3d8-surface-area'
         Pattern = '(IDirect3D[A-Za-z0-9_]*8|D3D[A-Z0-9_]*8|DX8Wrapper)'
         RejectAddedLine = $true
-        AllowedPath = '^Core/Libraries/Source/WWVegas/WW3D2/dx8wrapper\.(cpp|h)$'
+        AllowedPath = '^Core/Libraries/Source/WWVegas/WW3D2/(dx8wrapper|d3d11legacybridge)\.(cpp|h)$'
     }
 )
 

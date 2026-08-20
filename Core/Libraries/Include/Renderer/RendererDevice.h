@@ -16,6 +16,8 @@ enum RenderBackend
 
 const char *RenderBackendName(RenderBackend backend);
 bool ParseRenderBackend(const char *name, RenderBackend *backend);
+void SetRequestedRenderBackend(RenderBackend backend);
+RenderBackend RequestedRenderBackend();
 
 class GpuHandle
 {
@@ -202,6 +204,13 @@ enum RenderPrimitiveTopology
 	RENDER_PRIMITIVE_LINE_STRIP
 };
 
+enum RenderClearFlags
+{
+	RENDER_CLEAR_COLOR = 1,
+	RENDER_CLEAR_DEPTH = 2,
+	RENDER_CLEAR_STENCIL = 4
+};
+
 class IRenderContext
 {
 public:
@@ -211,6 +220,8 @@ public:
 		size_t byteCount, size_t destinationOffset) = 0;
 	virtual RenderResult clear(const RenderFloat4 &color, float depth,
 		unsigned int stencil) = 0;
+	virtual RenderResult clearTargets(unsigned int clearFlags,
+		const RenderFloat4 &color, float depth, unsigned int stencil) = 0;
 	virtual RenderResult setRenderTargets(GpuHandle colorTarget,
 		GpuHandle depthTarget) = 0;
 	virtual RenderResult setViewport(float x, float y, float width,

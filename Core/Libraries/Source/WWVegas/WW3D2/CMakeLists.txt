@@ -50,6 +50,8 @@ set(WW3D2_SRC
     dx8indexbuffer.cpp
     dx8indexbuffer.h
     dx8list.h
+    d3d11legacybridge.cpp
+    d3d11legacybridge.h
     dx8polygonrenderer.cpp
     dx8polygonrenderer.h
     dx8renderer.cpp

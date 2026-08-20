@@ -40,6 +40,11 @@ int testBackendNames()
 		rts::render::RenderBackendName(
 		rts::render::RENDER_BACKEND_D3D11)[3] == '1',
 		"backend names are stable command-line values");
+	rts::render::SetRequestedRenderBackend(rts::render::RENDER_BACKEND_D3D11);
+	result |= check(rts::render::RequestedRenderBackend() ==
+		rts::render::RENDER_BACKEND_D3D11,
+		"startup command-line selection reaches the renderer boundary");
+	rts::render::SetRequestedRenderBackend(rts::render::RENDER_BACKEND_DX8);
 	return result;
 }
 
@@ -411,6 +416,33 @@ int testD3D11HiddenSwapChain()
 		rts::render::IRenderContext *context = device->immediateContext();
 		rts::render::LegacyLogicalState logicalState;
 		const rts::render::RenderFloat4 clearColor(0.0f, 0.0f, 1.0f, 1.0f);
+		const bool unbindFrameStarted = context->beginFrame() ==
+			rts::render::RENDER_RESULT_OK;
+		rts::render::RenderResult unbindResult = rts::render::RENDER_RESULT_FAILED;
+		if (unbindFrameStarted)
+		{
+			unbindResult = context->setTexture(0, rts::render::GpuHandle());
+			context->endFrame();
+		}
+		result |= check(unbindFrameStarted &&
+			unbindResult == rts::render::RENDER_RESULT_OK,
+			"D3D11 texture binding accepts an invalid handle as an explicit unbind");
+		const rts::render::RenderFloat4 selectiveColor(1.0f, 0.0f, 0.0f, 1.0f);
+		const rts::render::RenderFloat4 ignoredColor(0.0f, 1.0f, 0.0f, 1.0f);
+		std::vector<unsigned char> selectivePixels(64 * 64 * 4);
+		rts::render::RenderFormat selectiveFormat =
+			rts::render::RENDER_FORMAT_UNKNOWN;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clearTargets(rts::render::RENDER_CLEAR_COLOR,
+				selectiveColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->clearTargets(rts::render::RENDER_CLEAR_DEPTH |
+				rts::render::RENDER_CLEAR_STENCIL, ignoredColor, 0.5f, 7) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&selectivePixels[0], selectivePixels.size(),
+				64 * 4, &selectiveFormat) == rts::render::RENDER_RESULT_OK &&
+			selectivePixels[2] > 240 && selectivePixels[1] < 16,
+			"D3D11 selective depth and stencil clears preserve the color target");
 		rts::render::TextureDescriptor offscreenColorDescriptor;
 		offscreenColorDescriptor.width = 16;
 		offscreenColorDescriptor.height = 16;
