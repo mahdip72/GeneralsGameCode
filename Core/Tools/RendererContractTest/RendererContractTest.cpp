@@ -1,7 +1,11 @@
 #include "Renderer/RendererDevice.h"
+#if defined(RTS_RENDERER_HAS_D3D11)
+#include "../../Libraries/Source/WWVegas/WW3D2/d3d11legacybridge.h"
+#endif
 #include "Renderer/LegacyRenderState.h"
 
 #include <stdio.h>
+#include <type_traits>
 #include <vector>
 
 #if defined(RTS_RENDERER_HAS_D3D11)
@@ -390,7 +394,7 @@ int testD3D11HiddenSwapChain()
 		parameters.enableVsync = false;
 		parameters.enableDebugLayer = true;
 		result |= check(device->initialize(parameters) ==
-			rts::render::RENDER_RESULT_OK,
+				rts::render::RENDER_RESULT_OK,
 			"flip-model D3D11 swap chain initializes while hidden");
 
 		struct TestVertex
@@ -996,6 +1000,38 @@ int testD3D11HiddenSwapChain()
 			device->resize(96, 80) == rts::render::RENDER_RESULT_OK &&
 			device->present() == rts::render::RENDER_RESULT_OK,
 			"hidden flip-model swap chain presents and resizes");
+		std::vector<unsigned char> resizedPixels(96 * 80 * 4);
+		result |= check(device->captureBackBuffer(&resizedPixels[0],
+			resizedPixels.size(), 96 * 4, &captureFormat) ==
+			 rts::render::RENDER_RESULT_OK,
+			"resized D3D11 swap chain captures at its new dimensions");
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(rts::render::RenderFloat4(1.0f, 0.0f, 0.0f, 1.0f),
+				1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&resizedPixels[0], resizedPixels.size(),
+				96 * 4, &captureFormat) == rts::render::RENDER_RESULT_OK &&
+			resizedPixels[4 * (79 * 96 + 95) + 2] > 240 &&
+			resizedPixels[4 * (79 * 96 + 95) + 1] < 16,
+			"resized D3D11 swap chain clears and captures its full dimensions");
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			device->resize(96, 80) ==
+				rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+			device->captureBackBuffer(&resizedPixels[0], resizedPixels.size(),
+				96 * 4, &captureFormat) ==
+				rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK,
+			"D3D11 lifecycle rejects resize and capture while a frame is open");
+		result |= check(device->recoverDevice() ==
+			rts::render::RENDER_RESULT_OK &&
+			context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(rts::render::RenderFloat4(0.0f, 1.0f, 0.0f, 1.0f),
+				1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&resizedPixels[0], resizedPixels.size(),
+				96 * 4, &captureFormat) == rts::render::RENDER_RESULT_OK &&
+			resizedPixels[1] > 240 && resizedPixels[0] < 16,
+			"D3D11 recovery preserves resized back-buffer dimensions and pixels");
 		device->shutdown();
 		delete device;
 	}
@@ -1115,6 +1151,13 @@ int testD3D11HeadlessDevice()
 		"immutable D3D11 resources require complete initial data");
 	result |= check(device->present() == rts::render::RENDER_RESULT_OK,
 		"headless presentation is a successful no-op");
+	std::vector<unsigned char> headlessPixels(64 * 64 * 4);
+	rts::render::RenderFormat headlessFormat =
+		rts::render::RENDER_FORMAT_UNKNOWN;
+	result |= check(device->captureBackBuffer(&headlessPixels[0],
+		headlessPixels.size(), 64 * 4, &headlessFormat) ==
+		rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+		"headless D3D11 devices reject back-buffer capture without a swap chain");
 	result |= check(device->recoverDevice() == rts::render::RENDER_RESULT_OK &&
 		device->immediateContext() != 0 &&
 		device->present() == rts::render::RENDER_RESULT_OK,
@@ -1122,6 +1165,30 @@ int testD3D11HeadlessDevice()
 	device->shutdown();
 	device->shutdown();
 	delete device;
+	return result;
+}
+
+int testD3D11LegacyBridgeLifecycleContract()
+{
+	int result = 0;
+	typedef rts::render::RenderResult (D3D11LegacyBridge::*ExpectedEndFrame)(bool);
+	typedef rts::render::RenderResult (D3D11LegacyBridge::*ExpectedResize)(
+		unsigned int, unsigned int);
+	typedef rts::render::RenderResult (D3D11LegacyBridge::*ExpectedCapture)(
+		void *, size_t, size_t, rts::render::RenderFormat *);
+	typedef void (D3D11LegacyBridge::*ExpectedCaptureRequest)();
+	typedef bool (D3D11LegacyBridge::*ExpectedBeginFrame)();
+	result |= check(std::is_same<decltype(&D3D11LegacyBridge::End_Frame),
+		ExpectedEndFrame>::value &&
+		std::is_same<decltype(&D3D11LegacyBridge::Resize),
+		ExpectedResize>::value &&
+		std::is_same<decltype(&D3D11LegacyBridge::Capture_Back_Buffer),
+		ExpectedCapture>::value &&
+		std::is_same<decltype(&D3D11LegacyBridge::Request_Frame_Capture),
+		ExpectedCaptureRequest>::value &&
+		std::is_same<decltype(&D3D11LegacyBridge::Begin_Frame),
+		ExpectedBeginFrame>::value,
+		"D3D11 bridge exposes result-bearing lifecycle and pre-present capture methods");
 	return result;
 }
 
@@ -1223,6 +1290,7 @@ int main()
 	result |= testLegacyShaderBitDecoder();
 #if defined(RTS_RENDERER_HAS_D3D11)
 	result |= testD3D11HeadlessDevice();
+	result |= testD3D11LegacyBridgeLifecycleContract();
 	result |= testD3D11LegacyBlendFactors();
 	result |= testD3D11HiddenSwapChain();
 #endif

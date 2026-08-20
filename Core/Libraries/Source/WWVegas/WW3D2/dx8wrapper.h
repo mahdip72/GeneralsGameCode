@@ -52,6 +52,7 @@
 #include "WWMath/vector4.h"
 #include "WWLib/cpudetect.h"
 #include "dx8caps.h"
+#include "Renderer/RendererDevice.h"
 
 #include "texture.h"
 #include "dx8vertexbuffer.h"
@@ -291,7 +292,7 @@ public:
 	/*
 	** Rendering
 	*/
-	static void Begin_Scene();
+	static bool Begin_Scene();
 	static void End_Scene(bool flip_frame = true);
 
 	// Flip until the primary buffer is visible.
@@ -422,6 +423,11 @@ public:
 	static IDirect3DSurface8 * _Create_DX8_Surface(const char *filename);
 	static IDirect3DSurface8 * _Get_DX8_Front_Buffer();
 	static SurfaceClass * _Get_DX8_Back_Buffer(unsigned int num=0);
+	static bool Is_D3D11_Backend_Active();
+	static void Request_D3D11_Back_Buffer_Capture();
+	static rts::render::RenderResult Capture_D3D11_Back_Buffer(
+		void *destination, size_t destination_bytes,
+		size_t destination_row_pitch, rts::render::RenderFormat *format);
 
 	static void _Copy_DX8_Rects(
 			IDirect3DSurface8* pSourceSurface,

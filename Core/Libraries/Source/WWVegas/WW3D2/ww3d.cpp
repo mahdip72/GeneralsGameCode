@@ -119,6 +119,8 @@
 #include "static_sort_list.h"
 #include "shdlib.h"
 #include "framgrab.h"
+
+#include <vector>
 #include "Lib/BaseType.h"
 
 
@@ -864,7 +866,11 @@ WW3DErrorType WW3D::Begin_Render(bool clear,bool clearz,const Vector3 & color, f
 	}
 
 	// Notify D3D that we are beginning to render the frame
-	DX8Wrapper::Begin_Scene();
+	if (!DX8Wrapper::Begin_Scene())
+	{
+		IsRendering = false;
+		return WW3D_ERROR_GENERIC;
+	}
 
 	return WW3D_ERROR_OK;
 }
@@ -1363,58 +1369,101 @@ void WW3D::Make_Screen_Shot( const char * filename_base , const float gamma, con
 		gamma_lut[i] = (unsigned char) (256.0f * powf(i / 256.0f, recip));
 	}
 
-	// TheSuperHackers @bugfix xezon 21/05/2025 Get the back buffer and create a copy of the surface.
-	// Originally this code took the front buffer and tried to lock it. This does not work when the
-	// render view clips outside the desktop boundaries. It crashed the game.
-	SurfaceClass* surface = DX8Wrapper::_Get_DX8_Back_Buffer();
-
-	SurfaceClass::SurfaceDescription surfaceDesc;
-	surface->Get_Description(surfaceDesc);
-
-	SurfaceClass* surfaceCopy = NEW_REF(SurfaceClass, (DX8Wrapper::_Create_DX8_Surface(surfaceDesc.Width, surfaceDesc.Height, surfaceDesc.Format)));
-	DX8Wrapper::_Copy_DX8_Rects(surface->Peek_D3D_Surface(), nullptr, 0, surfaceCopy->Peek_D3D_Surface(), nullptr);
-
-	surface->Release_Ref();
-	surface = nullptr;
-
-	struct Rect
-	{
-		int Pitch;
-		void* pBits;
-	} lrect;
-
-	lrect.pBits = surfaceCopy->Lock(&lrect.Pitch);
-	if (lrect.pBits == nullptr)
-	{
-		surfaceCopy->Release_Ref();
-		return;
-	}
-
 	unsigned int x,y,index,index2,width,height;
-
-	width = surfaceDesc.Width;
-	height = surfaceDesc.Height;
-
-	unsigned char *image=W3DNEWARRAY unsigned char[3*width*height];
-
-	for (y=0; y<height; y++)
+	unsigned char *image = nullptr;
+	std::vector<unsigned char> d3d11Pixels;
+	if (DX8Wrapper::Is_D3D11_Backend_Active())
 	{
-		for (x=0; x<width; x++)
+		width = static_cast<unsigned int>(
+			DX8Wrapper::Get_Device_Resolution_Width());
+		height = static_cast<unsigned int>(
+			DX8Wrapper::Get_Device_Resolution_Height());
+		const size_t pixelBytes = static_cast<size_t>(width) * height * 4;
+		try
 		{
-			// index for image
-			index=3*(x+y*width);
-			// index for fb
-			index2=y*lrect.Pitch+4*x;
-
-			image[index]   = gamma_lut[*((unsigned char *) lrect.pBits + index2+2)];
-			image[index+1] = gamma_lut[*((unsigned char *) lrect.pBits + index2+1)];
-			image[index+2] = gamma_lut[*((unsigned char *) lrect.pBits + index2+0)];
+			d3d11Pixels.resize(pixelBytes);
+			image = W3DNEWARRAY unsigned char[3 * width * height];
+		}
+		catch (...)
+		{
+			WWDEBUG_SAY(("D3D11 screenshot capture allocation failed"));
+			return;
+		}
+		rts::render::RenderFormat captureFormat =
+			rts::render::RENDER_FORMAT_UNKNOWN;
+		const rts::render::RenderResult captureResult =
+			DX8Wrapper::Capture_D3D11_Back_Buffer(&d3d11Pixels[0], pixelBytes,
+				static_cast<size_t>(width) * 4, &captureFormat);
+		if (captureResult != rts::render::RENDER_RESULT_OK ||
+			captureFormat != rts::render::RENDER_FORMAT_B8G8R8A8_UNORM)
+		{
+			WWDEBUG_SAY(("D3D11 screenshot capture failed: result=%d format=%d",
+				static_cast<int>(captureResult), static_cast<int>(captureFormat)));
+			delete [] image;
+			return;
+		}
+		for (y = 0; y < height; ++y)
+		{
+			for (x = 0; x < width; ++x)
+			{
+				index = 3 * (x + y * width);
+				index2 = static_cast<unsigned int>(
+					y * static_cast<size_t>(width) * 4 + x * 4);
+				image[index] = gamma_lut[d3d11Pixels[index2 + 2]];
+				image[index + 1] = gamma_lut[d3d11Pixels[index2 + 1]];
+				image[index + 2] = gamma_lut[d3d11Pixels[index2]];
+			}
 		}
 	}
+	else
+	{
+		// TheSuperHackers @bugfix xezon 21/05/2025 Get the back buffer and create a copy of the surface.
+		// Originally this code took the front buffer and tried to lock it. This does not work when the
+		// render view clips outside the desktop boundaries. It crashed the game.
+		SurfaceClass* surface = DX8Wrapper::_Get_DX8_Back_Buffer();
 
-	surfaceCopy->Unlock();
-	surfaceCopy->Release_Ref();
-	surfaceCopy = nullptr;
+		SurfaceClass::SurfaceDescription surfaceDesc;
+		surface->Get_Description(surfaceDesc);
+
+		SurfaceClass* surfaceCopy = NEW_REF(SurfaceClass, (DX8Wrapper::_Create_DX8_Surface(surfaceDesc.Width, surfaceDesc.Height, surfaceDesc.Format)));
+		DX8Wrapper::_Copy_DX8_Rects(surface->Peek_D3D_Surface(), nullptr, 0, surfaceCopy->Peek_D3D_Surface(), nullptr);
+
+		surface->Release_Ref();
+		surface = nullptr;
+
+		struct Rect
+		{
+			int Pitch;
+			void* pBits;
+		} lrect;
+
+		lrect.pBits = surfaceCopy->Lock(&lrect.Pitch);
+		if (lrect.pBits == nullptr)
+		{
+			surfaceCopy->Release_Ref();
+			return;
+		}
+
+		width = surfaceDesc.Width;
+		height = surfaceDesc.Height;
+		image = W3DNEWARRAY unsigned char[3*width*height];
+
+		for (y=0; y<height; y++)
+		{
+			for (x=0; x<width; x++)
+			{
+				index=3*(x+y*width);
+				index2=y*lrect.Pitch+4*x;
+				image[index] = gamma_lut[*((unsigned char *) lrect.pBits + index2+2)];
+				image[index+1] = gamma_lut[*((unsigned char *) lrect.pBits + index2+1)];
+				image[index+2] = gamma_lut[*((unsigned char *) lrect.pBits + index2+0)];
+			}
+		}
+
+		surfaceCopy->Unlock();
+		surfaceCopy->Release_Ref();
+		surfaceCopy = nullptr;
+	}
 
 	switch (format) {
 		case TGA:

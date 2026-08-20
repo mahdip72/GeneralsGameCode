@@ -4,6 +4,7 @@ add_executable(core_renderer_contract_tests
 
 target_link_libraries(core_renderer_contract_tests PRIVATE
     core_renderer
+    d3d8lib
 )
 
 add_test(NAME core_renderer_contract_tests

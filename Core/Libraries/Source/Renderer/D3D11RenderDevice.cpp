@@ -744,6 +744,8 @@ public:
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
+		m_parameters.width = m_width;
+		m_parameters.height = m_height;
 		m_context->ClearState();
 		m_context->Flush();
 		for (unsigned int i = 0; i < m_resources.size(); ++i)
@@ -793,6 +795,10 @@ public:
 		}
 		m_activeRenderTarget = m_renderTarget;
 		m_activeDepthStencil = m_depthStencil;
+		if (m_renderTarget != 0)
+		{
+			m_context->OMSetRenderTargets(1, &m_renderTarget, m_depthStencil);
+		}
 		m_pipelineBound = false;
 		m_vertexBufferBound = false;
 		m_indexBufferBound = false;
@@ -808,13 +814,21 @@ public:
 		}
 		if (m_swapChain != 0)
 		{
+			const unsigned int previousWidth = m_width;
+			const unsigned int previousHeight = m_height;
 			m_context->OMSetRenderTargets(0, 0, 0);
 			releaseBackBufferTargets();
 			HRESULT result = m_swapChain->ResizeBuffers(0, width, height,
 				DXGI_FORMAT_UNKNOWN, 0);
 			if (FAILED(result))
 			{
-				createBackBufferTargets();
+				if (SUCCEEDED(createBackBufferTargets()))
+				{
+					m_activeRenderTarget = m_renderTarget;
+					m_activeDepthStencil = m_depthStencil;
+					m_context->OMSetRenderTargets(1, &m_renderTarget,
+						m_depthStencil);
+				}
 				return TranslateResult(result);
 			}
 			m_width = width;
@@ -822,11 +836,33 @@ public:
 			result = createBackBufferTargets();
 			if (FAILED(result))
 			{
+				releaseBackBufferTargets();
+				m_width = previousWidth;
+				m_height = previousHeight;
+				if (SUCCEEDED(m_swapChain->ResizeBuffers(0, previousWidth,
+					previousHeight, DXGI_FORMAT_UNKNOWN, 0)) &&
+					SUCCEEDED(createBackBufferTargets()))
+				{
+					m_activeRenderTarget = m_renderTarget;
+					m_activeDepthStencil = m_depthStencil;
+					m_context->OMSetRenderTargets(1, &m_renderTarget,
+						m_depthStencil);
+				}
 				return TranslateResult(result);
 			}
+			m_activeRenderTarget = m_renderTarget;
+			m_activeDepthStencil = m_depthStencil;
+			m_context->OMSetRenderTargets(1, &m_renderTarget, m_depthStencil);
+			m_parameters.width = width;
+			m_parameters.height = height;
 		}
-		m_width = width;
-		m_height = height;
+		else
+		{
+			m_width = width;
+			m_height = height;
+			m_parameters.width = width;
+			m_parameters.height = height;
+		}
 		return RENDER_RESULT_OK;
 	}
 

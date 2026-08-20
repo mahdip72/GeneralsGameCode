@@ -149,6 +149,13 @@ Int parseRenderer(char *args[], int argc)
 	return 1;
 }
 
+// Request one installed-runtime TGA after the first completed rendered frame.
+Int parseRendererCaptureFrame(char *args[], int)
+{
+	TheWritableGlobalData->m_rendererCaptureFrame = TRUE;
+	return 1;
+}
+
 //=============================================================================
 //=============================================================================
 Int parseNoMusic(char *args[], int)
@@ -1213,6 +1220,7 @@ static CommandLineParam paramsForStartup[] =
 	{ "-win", parseWin },
 	{ "-fullscreen", parseNoWin },
 	{ "-renderer", parseRenderer },
+	{ "-rendererCaptureFrame", parseRendererCaptureFrame },
 
 	// TheSuperHackers @feature helmutbuhler 11/04/2025
 	// This runs the game without a window, graphics, input and audio. You can combine this with -replay

@@ -121,6 +121,9 @@ public:
 	// Run game without graphics, input or audio.
 	Bool m_headless;
 
+	// One-shot renderer capture requested by the installed-runtime smoke harness.
+	Bool m_rendererCaptureFrame;
+
 	Bool m_windowed;
 	Int m_xResolution;
 	Int m_yResolution;

@@ -675,7 +675,14 @@ bool DX8Wrapper::Reset_Device(bool reload_assets)
 		SHD_INIT_SHADERS;
 		if (_D3D11Bridge.Is_Active())
 		{
-			_D3D11Bridge.Resize(ResolutionWidth, ResolutionHeight);
+			const rts::render::RenderResult bridge_result =
+				_D3D11Bridge.Resize(ResolutionWidth, ResolutionHeight);
+			if (bridge_result != rts::render::RENDER_RESULT_OK)
+			{
+				WWDEBUG_SAY(("D3D11 renderer resize failed during device reset: %d",
+					static_cast<int>(bridge_result)));
+				return false;
+			}
 		}
 		WWDEBUG_SAY(("Device reset completed"));
 		return true;
@@ -1693,7 +1700,7 @@ void DX8_Assert()
 	DX8_THREAD_ASSERT();
 }
 
-void DX8Wrapper::Begin_Scene()
+bool DX8Wrapper::Begin_Scene()
 {
 	DX8_THREAD_ASSERT();
 
@@ -1704,10 +1711,16 @@ void DX8Wrapper::Begin_Scene()
 	DX8CALL(BeginScene());
 	if (_D3D11Bridge.Is_Active())
 	{
-		_D3D11Bridge.Begin_Frame();
+		if (!_D3D11Bridge.Begin_Frame())
+		{
+			DX8CALL(EndScene());
+			WWDEBUG_SAY(("D3D11 renderer begin-frame failed."));
+			return false;
+		}
 	}
 
 	DX8WebBrowser::Update();
+	return true;
 }
 
 void DX8Wrapper::End_Scene(bool flip_frames)
@@ -1716,9 +1729,11 @@ void DX8Wrapper::End_Scene(bool flip_frames)
 	DX8CALL(EndScene());
 
 	DX8WebBrowser::Render(0);
+	rts::render::RenderResult d3d11_frame_result =
+		rts::render::RENDER_RESULT_OK;
 	if (_D3D11Bridge.Is_Active())
 	{
-		_D3D11Bridge.End_Frame(flip_frames);
+		d3d11_frame_result = _D3D11Bridge.End_Frame(flip_frames);
 	}
 
 	if (flip_frames) {
@@ -1729,7 +1744,13 @@ void DX8Wrapper::End_Scene(bool flip_frames)
 			hr=_Get_D3D_Device8()->Present(nullptr, nullptr, nullptr, nullptr);
 		}
 		else {
-			hr = D3D_OK;
+			hr = d3d11_frame_result == rts::render::RENDER_RESULT_OK ?
+				D3D_OK : E_FAIL;
+			if (d3d11_frame_result != rts::render::RENDER_RESULT_OK)
+			{
+				WWDEBUG_SAY(("D3D11 renderer frame failed: %d",
+					static_cast<int>(d3d11_frame_result)));
+			}
 		}
 
 		DX8_RECORD_DX8_CALLS();
@@ -1760,8 +1781,17 @@ void DX8Wrapper::End_Scene(bool flip_frames)
 			}
 		}
 		else {
-			DX8_ErrorCode(hr);
+			if (!_D3D11Bridge.Is_Active())
+			{
+				DX8_ErrorCode(hr);
+			}
 		}
+	}
+	else if (d3d11_frame_result != rts::render::RENDER_RESULT_OK)
+	{
+		WWDEBUG_SAY(("D3D11 renderer frame failed without present: %d",
+			static_cast<int>(d3d11_frame_result)));
+		IsDeviceLost = true;
 	}
 
 	// Each frame, release all of the buffers and textures.
@@ -1871,6 +1901,27 @@ void DX8Wrapper::Clear(bool clear_color, bool clear_z_stencil, const Vector3 &co
 				color.X, color.Y, color.Z, dest_alpha, z, stencil);
 		}
 	}
+}
+
+bool DX8Wrapper::Is_D3D11_Backend_Active()
+{
+	return _D3D11Bridge.Is_Active();
+}
+
+void DX8Wrapper::Request_D3D11_Back_Buffer_Capture()
+{
+	if (_D3D11Bridge.Is_Active())
+	{
+		_D3D11Bridge.Request_Frame_Capture();
+	}
+}
+
+rts::render::RenderResult DX8Wrapper::Capture_D3D11_Back_Buffer(
+	void *destination, size_t destination_bytes, size_t destination_row_pitch,
+	rts::render::RenderFormat *format)
+{
+	return _D3D11Bridge.Capture_Back_Buffer(destination, destination_bytes,
+		destination_row_pitch, format);
 }
 
 void DX8Wrapper::Set_Viewport(CONST D3DVIEWPORT8* pViewport)

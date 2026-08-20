@@ -87,6 +87,7 @@ static void drawFramerateBar();
 #include "WWMath/wwmath.h"
 #include "WWLib/registry.h"
 #include "WW3D2/ww3d.h"
+#include "WW3D2/dx8wrapper.h"
 #include "WW3D2/predlod.h"
 #include "WW3D2/part_emt.h"
 #include "WW3D2/part_ldr.h"
@@ -1754,6 +1755,13 @@ void W3DDisplay::draw()
 
 	if (TheGlobalData->m_headless)
 		return;
+
+	if (TheGlobalData->m_rendererCaptureFrame &&
+		DX8Wrapper::Is_D3D11_Backend_Active())
+	{
+		TheWritableGlobalData->m_rendererCaptureFrame = FALSE;
+		DX8Wrapper::Request_D3D11_Back_Buffer_Capture();
+	}
 
 	// TheSuperHackers @feature bobtista 10/07/2026 Show messages for screenshots finished by the screenshot thread.
 	W3D_UpdateScreenshotMessages();

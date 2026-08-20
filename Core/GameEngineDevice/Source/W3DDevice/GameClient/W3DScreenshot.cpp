@@ -23,6 +23,7 @@
 #include "GameClient/InGameUI.h"
 #include "Lib/JobSystem.h"
 #include "WW3D2/dx8wrapper.h"
+#include "WW3D2/ww3d.h"
 #include "WW3D2/surfaceclass.h"
 #include "WWLib/mpsc_intrusive_queue.h"
 #include "rts/profile.h"
@@ -394,6 +395,93 @@ void W3D_TakeCompressedScreenshot(ScreenshotFormat format, Int jpegQuality)
 	strlcat(outputDirectory, "Screenshots\\", ARRAY_SIZE(outputDirectory));
 	strlcpy(outputPath, outputDirectory, ARRAY_SIZE(outputPath));
 	strlcat(outputPath, leafname, ARRAY_SIZE(outputPath));
+
+	if (DX8Wrapper::Is_D3D11_Backend_Active())
+	{
+		int targetWidth = 0;
+		int targetHeight = 0;
+		int targetBits = 0;
+		bool targetWindowed = false;
+		WW3D::Get_Render_Target_Resolution(targetWidth, targetHeight,
+			targetBits, targetWindowed);
+		const unsigned width = targetWidth > 0 ?
+			static_cast<unsigned>(targetWidth) : 0;
+		const unsigned height = targetHeight > 0 ?
+			static_cast<unsigned>(targetHeight) : 0;
+		const size_t maxAllocation = (size_t)-1;
+		if (width == 0 || height == 0 ||
+			width > UINT_MAX / 4 || height > UINT_MAX ||
+			static_cast<size_t>(width) * 4 > maxAllocation / height ||
+			static_cast<size_t>(width) * height > maxAllocation / 3)
+		{
+			DEBUG_LOG(("D3D11 screenshot dimensions %u x %u are invalid", width,
+				height));
+			return;
+		}
+
+		const unsigned pitch = width * 4;
+		const size_t pixelDataSize = static_cast<size_t>(pitch) * height;
+		const size_t imageSize = static_cast<size_t>(3) * width * height;
+		unsigned char* pixelData = allocateScreenshotBuffer(pixelDataSize);
+		unsigned char* image = allocateScreenshotBuffer(imageSize);
+		ScreenshotWrittenMessage* completion = 0;
+		try
+		{
+			completion = new ScreenshotWrittenMessage;
+		}
+		catch (...)
+		{
+			completion = 0;
+		}
+		if (pixelData == 0 || image == 0 || completion == 0)
+		{
+			DEBUG_LOG(("Dropped D3D11 screenshot %s because its buffers could not be allocated",
+				leafname));
+			delete[] pixelData;
+			delete[] image;
+			delete completion;
+			return;
+		}
+
+		rts::render::RenderFormat captureFormat =
+			rts::render::RENDER_FORMAT_UNKNOWN;
+		const rts::render::RenderResult captureResult =
+			DX8Wrapper::Capture_D3D11_Back_Buffer(pixelData, pixelDataSize,
+				pitch, &captureFormat);
+		if (captureResult != rts::render::RENDER_RESULT_OK ||
+			captureFormat != rts::render::RENDER_FORMAT_B8G8R8A8_UNORM)
+		{
+			DEBUG_LOG(("D3D11 screenshot capture failed: result=%d format=%d",
+				static_cast<int>(captureResult), static_cast<int>(captureFormat)));
+			delete[] pixelData;
+			delete[] image;
+			delete completion;
+			return;
+		}
+
+		ScreenshotBatch* batch = 0;
+		try
+		{
+			batch = new ScreenshotBatch(pixelData, image, completion, width, height,
+				pitch, SCREENSHOT_SOURCE_ARGB32, outputDirectory, outputPath,
+				leafname, jpegQuality, format);
+		}
+		catch (...)
+		{
+			batch = 0;
+		}
+		if (batch == 0)
+		{
+			DEBUG_LOG(("Dropped D3D11 screenshot %s because its batch could not be allocated",
+				leafname));
+			delete[] pixelData;
+			delete[] image;
+			delete completion;
+			return;
+		}
+		s_screenshotTaskService.submit(batch);
+		return;
+	}
 
 	// TheSuperHackers @bugfix xezon 21/05/2025 Get the back buffer and create a copy of the surface.
 	// Originally this code took the front buffer and tried to lock it. This does not work when the

@@ -211,7 +211,12 @@ struct D3D11LegacyBridge::Impl
 	};
 
 	Impl() : device(0), context(0), legacy_device(0), frame_open(false),
-		log_file(0), frame_id(0), draw_count(0), draw_failure_count(0) {}
+		log_file(0), frame_id(0), draw_count(0), draw_failure_count(0),
+		width(0), height(0), capture_requested(false),
+		pending_viewport(false), pending_clear(false),
+		pending_clear_color(false), pending_clear_depth_stencil(false),
+		pending_red(0.0f), pending_green(0.0f), pending_blue(0.0f),
+		pending_alpha(0.0f), pending_depth(1.0f), pending_stencil(0) {}
 
 	IRenderDevice *device;
 	IRenderContext *context;
@@ -221,6 +226,20 @@ struct D3D11LegacyBridge::Impl
 	unsigned int frame_id;
 	unsigned int draw_count;
 	unsigned int draw_failure_count;
+	unsigned int width;
+	unsigned int height;
+	bool capture_requested;
+	bool pending_viewport;
+	D3DVIEWPORT8 viewport;
+	bool pending_clear;
+	bool pending_clear_color;
+	bool pending_clear_depth_stencil;
+	float pending_red;
+	float pending_green;
+	float pending_blue;
+	float pending_alpha;
+	float pending_depth;
+	unsigned int pending_stencil;
 	std::vector<BufferEntry> vertex_buffers;
 	std::vector<BufferEntry> index_buffers;
 	std::vector<TextureEntry> textures;
@@ -724,6 +743,82 @@ struct D3D11LegacyBridge::Impl
 		index_buffers.clear();
 		textures.clear();
 	}
+
+	RenderResult Capture_Requested_Frame()
+	{
+		if (!capture_requested)
+		{
+			return rts::render::RENDER_RESULT_OK;
+		}
+		capture_requested = false;
+		if (width == 0 || height == 0)
+		{
+			Log("D3D11 requested frame capture has invalid dimensions");
+			return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		std::vector<unsigned char> pixels;
+		try
+		{
+			pixels.resize(static_cast<size_t>(width) * height * 4);
+		}
+		catch (...)
+		{
+			Log("D3D11 requested frame capture allocation failed");
+			return rts::render::RENDER_RESULT_OUT_OF_MEMORY;
+		}
+		rts::render::RenderFormat format = rts::render::RENDER_FORMAT_UNKNOWN;
+		const RenderResult capture_result = device->captureBackBuffer(
+			&pixels[0], pixels.size(), static_cast<size_t>(width) * 4, &format);
+		if (capture_result != rts::render::RENDER_RESULT_OK)
+		{
+			Log("D3D11 requested frame capture readback failed");
+			return capture_result;
+		}
+		if (format != rts::render::RENDER_FORMAT_B8G8R8A8_UNORM)
+		{
+			Log("D3D11 requested frame capture returned an unexpected format");
+			return rts::render::RENDER_RESULT_UNSUPPORTED;
+		}
+		FILE *file = fopen("D3D11RendererCapture.tga", "wb");
+		if (file == 0)
+		{
+			Log("D3D11 requested frame capture could not open its output");
+			return rts::render::RENDER_RESULT_FAILED;
+		}
+		unsigned char header[18];
+		memset(header, 0, sizeof(header));
+		header[2] = 2;
+		header[12] = static_cast<unsigned char>(width & 0xff);
+		header[13] = static_cast<unsigned char>((width >> 8) & 0xff);
+		header[14] = static_cast<unsigned char>(height & 0xff);
+		header[15] = static_cast<unsigned char>((height >> 8) & 0xff);
+		header[16] = 24;
+		bool wrote_file = fwrite(header, 1, sizeof(header), file) ==
+			sizeof(header);
+		for (unsigned int row = height; wrote_file && row != 0; --row)
+		{
+			const unsigned char *source = &pixels[
+				static_cast<size_t>(row - 1) * width * 4];
+			for (unsigned int column = 0; column < width; ++column)
+			{
+				const unsigned char *pixel = source + column * 4;
+				const unsigned char bgr[3] = { pixel[0], pixel[1], pixel[2] };
+				if (fwrite(bgr, 1, sizeof(bgr), file) != sizeof(bgr))
+				{
+					wrote_file = false;
+					break;
+				}
+			}
+		}
+		fclose(file);
+		if (!wrote_file)
+		{
+			Log("D3D11 requested frame capture output was truncated");
+			return rts::render::RENDER_RESULT_FAILED;
+		}
+		Log("D3D11 requested frame captured before present");
+		return rts::render::RENDER_RESULT_OK;
+	}
 };
 
 D3D11LegacyBridge::D3D11LegacyBridge() : m_impl(new(std::nothrow) Impl) {}
@@ -781,6 +876,8 @@ bool D3D11LegacyBridge::Initialize(HWND window,
 		return false;
 	}
 	m_impl->context = m_impl->device->immediateContext();
+	m_impl->width = width;
+	m_impl->height = height;
 	m_impl->legacy_device = legacy_device;
 	m_impl->legacy_device->AddRef();
 	m_impl->Log("D3D11 legacy bridge initialized");
@@ -829,6 +926,12 @@ void D3D11LegacyBridge::Shutdown()
 		m_impl->legacy_device->Release();
 		m_impl->legacy_device = 0;
 	}
+	m_impl->frame_open = false;
+	m_impl->width = 0;
+	m_impl->height = 0;
+	m_impl->capture_requested = false;
+	m_impl->pending_viewport = false;
+	m_impl->pending_clear = false;
 }
 
 bool D3D11LegacyBridge::Is_Active() const
@@ -849,34 +952,128 @@ bool D3D11LegacyBridge::Begin_Frame()
 	}
 	m_impl->frame_open = m_impl->context->beginFrame() ==
 		rts::render::RENDER_RESULT_OK;
+	if (!m_impl->frame_open)
+	{
+		m_impl->Log("D3D11 legacy bridge begin-frame failed");
+		return false;
+	}
+	if (m_impl->pending_viewport)
+	{
+		const RenderResult viewport_result = m_impl->context->setViewport(
+			static_cast<float>(m_impl->viewport.X),
+			static_cast<float>(m_impl->viewport.Y),
+			static_cast<float>(m_impl->viewport.Width),
+			static_cast<float>(m_impl->viewport.Height),
+			m_impl->viewport.MinZ, m_impl->viewport.MaxZ);
+		m_impl->pending_viewport = false;
+		if (viewport_result != rts::render::RENDER_RESULT_OK)
+		{
+			m_impl->Log("D3D11 legacy bridge pending viewport failed");
+			m_impl->context->endFrame();
+			m_impl->frame_open = false;
+			return false;
+		}
+	}
+	if (m_impl->pending_clear)
+	{
+		unsigned int clear_flags = 0;
+		if (m_impl->pending_clear_color)
+		{
+			clear_flags |= rts::render::RENDER_CLEAR_COLOR;
+		}
+		if (m_impl->pending_clear_depth_stencil)
+		{
+			clear_flags |= rts::render::RENDER_CLEAR_DEPTH |
+				rts::render::RENDER_CLEAR_STENCIL;
+		}
+		const RenderResult clear_result = m_impl->context->clearTargets(
+			clear_flags, rts::render::RenderFloat4(m_impl->pending_red,
+				m_impl->pending_green, m_impl->pending_blue,
+				m_impl->pending_alpha), m_impl->pending_depth,
+			m_impl->pending_stencil);
+		m_impl->pending_clear = false;
+		if (clear_result != rts::render::RENDER_RESULT_OK)
+		{
+			m_impl->Log("D3D11 legacy bridge pending clear failed");
+			m_impl->context->endFrame();
+			m_impl->frame_open = false;
+			return false;
+		}
+	}
 	return m_impl->frame_open;
 }
 
-void D3D11LegacyBridge::End_Frame(bool present_frame)
+void D3D11LegacyBridge::Request_Frame_Capture()
+{
+	if (Is_Active())
+	{
+		m_impl->capture_requested = true;
+	}
+}
+
+RenderResult D3D11LegacyBridge::End_Frame(bool present_frame)
 {
 	if (!Is_Active() || !m_impl->frame_open)
 	{
-		return;
+		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 	}
-	m_impl->context->endFrame();
+	const RenderResult end_result = m_impl->context->endFrame();
 	m_impl->frame_open = false;
+	if (end_result != rts::render::RENDER_RESULT_OK)
+	{
+		m_impl->Log("D3D11 legacy bridge end-frame failed");
+		return end_result;
+	}
+	// Flip-discard may expose a different/undefined back buffer after Present.
+	// Consume the one-shot request while this completed frame is still visible.
+	const RenderResult capture_result = m_impl->Capture_Requested_Frame();
 	if (present_frame)
 	{
 		const rts::render::RenderResult result = m_impl->device->present();
 		if (result == rts::render::RENDER_RESULT_DEVICE_REMOVED)
 		{
-			m_impl->device->recoverDevice();
+			const RenderResult recovery_result = m_impl->device->recoverDevice();
+			if (recovery_result != rts::render::RENDER_RESULT_OK)
+			{
+				m_impl->Log("D3D11 legacy bridge device recovery failed");
+				return recovery_result;
+			}
+			m_impl->Log("D3D11 legacy bridge recovered the device after present");
+			return capture_result == rts::render::RENDER_RESULT_OK ?
+				result : capture_result;
+		}
+		if (result != rts::render::RENDER_RESULT_OK)
+		{
+			m_impl->Log("D3D11 legacy bridge present failed");
+			return result;
 		}
 	}
+	if (capture_result != rts::render::RENDER_RESULT_OK)
+	{
+		return capture_result;
+	}
+	return rts::render::RENDER_RESULT_OK;
 }
 
 void D3D11LegacyBridge::Clear(bool clear_color, bool clear_depth_stencil,
 	float red, float green, float blue, float alpha, float depth,
 	unsigned int stencil)
 {
-	if (!Is_Active() || !m_impl->frame_open ||
-		(!clear_color && !clear_depth_stencil))
+	if (!Is_Active() || (!clear_color && !clear_depth_stencil))
 	{
+		return;
+	}
+	if (!m_impl->frame_open)
+	{
+		m_impl->pending_clear = true;
+		m_impl->pending_clear_color = clear_color;
+		m_impl->pending_clear_depth_stencil = clear_depth_stencil;
+		m_impl->pending_red = red;
+		m_impl->pending_green = green;
+		m_impl->pending_blue = blue;
+		m_impl->pending_alpha = alpha;
+		m_impl->pending_depth = depth;
+		m_impl->pending_stencil = stencil;
 		return;
 	}
 	unsigned int clear_flags = 0;
@@ -895,7 +1092,17 @@ void D3D11LegacyBridge::Clear(bool clear_color, bool clear_depth_stencil,
 
 void D3D11LegacyBridge::Set_Viewport(const D3DVIEWPORT8 &viewport)
 {
-	if (Is_Active() && m_impl->frame_open)
+	if (!Is_Active())
+	{
+		return;
+	}
+	if (!m_impl->frame_open)
+	{
+		m_impl->viewport = viewport;
+		m_impl->pending_viewport = true;
+		return;
+	}
+	if (m_impl->frame_open)
 	{
 		m_impl->context->setViewport(static_cast<float>(viewport.X),
 			static_cast<float>(viewport.Y), static_cast<float>(viewport.Width),
@@ -1005,10 +1212,40 @@ bool D3D11LegacyBridge::Draw(VertexBufferClass *vertex_buffer,
 	return true;
 }
 
-bool D3D11LegacyBridge::Resize(unsigned int width, unsigned int height)
+RenderResult D3D11LegacyBridge::Resize(unsigned int width, unsigned int height)
 {
-	return Is_Active() && m_impl->device->resize(width, height) ==
-		rts::render::RENDER_RESULT_OK;
+	if (!Is_Active())
+	{
+		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	const RenderResult result = m_impl->device->resize(width, height);
+	if (result != rts::render::RENDER_RESULT_OK)
+	{
+		m_impl->Log("D3D11 legacy bridge resize failed");
+	}
+	else
+	{
+		m_impl->width = width;
+		m_impl->height = height;
+	}
+	return result;
+}
+
+RenderResult D3D11LegacyBridge::Capture_Back_Buffer(void *destination,
+	size_t destination_bytes, size_t destination_row_pitch,
+	rts::render::RenderFormat *format)
+{
+	if (!Is_Active())
+	{
+		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	const RenderResult result = m_impl->device->captureBackBuffer(destination,
+		destination_bytes, destination_row_pitch, format);
+	if (result != rts::render::RENDER_RESULT_OK)
+	{
+		m_impl->Log("D3D11 legacy bridge back-buffer capture failed");
+	}
+	return result;
 }
 
 #else
@@ -1022,12 +1259,24 @@ bool D3D11LegacyBridge::Initialize(HWND, IDirect3DDevice8 *, unsigned int,
 void D3D11LegacyBridge::Shutdown() {}
 bool D3D11LegacyBridge::Is_Active() const { return false; }
 bool D3D11LegacyBridge::Begin_Frame() { return false; }
-void D3D11LegacyBridge::End_Frame(bool) {}
+void D3D11LegacyBridge::Request_Frame_Capture() {}
+rts::render::RenderResult D3D11LegacyBridge::End_Frame(bool)
+{
+	return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+}
 void D3D11LegacyBridge::Clear(bool, bool, float, float, float, float, float,
 	unsigned int) {}
 void D3D11LegacyBridge::Set_Viewport(const D3DVIEWPORT8 &) {}
 bool D3D11LegacyBridge::Draw(VertexBufferClass *, IndexBufferClass *,
 	unsigned int, unsigned int, unsigned int, unsigned int) { return false; }
-bool D3D11LegacyBridge::Resize(unsigned int, unsigned int) { return false; }
+rts::render::RenderResult D3D11LegacyBridge::Resize(unsigned int, unsigned int)
+{
+	return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+}
+rts::render::RenderResult D3D11LegacyBridge::Capture_Back_Buffer(void *, size_t, size_t,
+	rts::render::RenderFormat *)
+{
+	return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+}
 
 #endif

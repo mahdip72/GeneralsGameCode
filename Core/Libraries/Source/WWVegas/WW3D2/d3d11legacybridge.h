@@ -1,6 +1,7 @@
 #pragma once
 
 #include <d3d8.h>
+#include "Renderer/RendererDevice.h"
 
 class IndexBufferClass;
 class VertexBufferClass;
@@ -16,7 +17,8 @@ public:
 	void Shutdown();
 	bool Is_Active() const;
 	bool Begin_Frame();
-	void End_Frame(bool present_frame);
+	void Request_Frame_Capture();
+	rts::render::RenderResult End_Frame(bool present_frame);
 	void Clear(bool clear_color, bool clear_depth_stencil,
 		float red, float green, float blue, float alpha,
 		float depth, unsigned int stencil);
@@ -25,7 +27,10 @@ public:
 		IndexBufferClass *index_buffer, unsigned int primitive_type,
 		unsigned int start_index, unsigned int primitive_count,
 		unsigned int base_vertex);
-	bool Resize(unsigned int width, unsigned int height);
+	rts::render::RenderResult Resize(unsigned int width, unsigned int height);
+	rts::render::RenderResult Capture_Back_Buffer(void *destination,
+		size_t destination_bytes, size_t destination_row_pitch,
+		rts::render::RenderFormat *format);
 
 private:
 	D3D11LegacyBridge(const D3D11LegacyBridge &);
