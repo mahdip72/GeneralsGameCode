@@ -29,6 +29,7 @@
 #include "rts/profile.h"
 #include <stb_image_write.h>
 #include <limits.h>
+#include <string>
 
 static bool checkedScreenshotMultiply(size_t left, size_t right, size_t* result)
 {
@@ -352,6 +353,163 @@ private:
 
 static ScreenshotTaskService s_screenshotTaskService;
 
+// Requests are created on the render owner, while encoding is asynchronous.
+// Keep process-local reservations so two requests from the same millisecond
+// cannot encode to the same path. Reservations intentionally live for the
+// process lifetime; this keeps a cancelled request from reusing a path that a
+// worker may already have observed.
+static std::vector<std::string> s_reservedD3D11ScreenshotPaths;
+
+static bool reserveD3D11ScreenshotName(const char *outputDirectory,
+	const char *initialLeafname, char *leafname, size_t leafnameCapacity,
+	char *outputPath, size_t outputPathCapacity)
+{
+	if (outputDirectory == 0 || initialLeafname == 0 || leafname == 0 ||
+		outputPath == 0 || leafnameCapacity == 0 || outputPathCapacity == 0)
+	{
+		return false;
+	}
+	char baseLeafname[_MAX_FNAME];
+	strlcpy(baseLeafname, initialLeafname, ARRAY_SIZE(baseLeafname));
+	const char *extension = strrchr(baseLeafname, '.');
+	const size_t stemLength = extension == 0 ? strlen(baseLeafname) :
+		static_cast<size_t>(extension - baseLeafname);
+	for (unsigned int suffix = 0; suffix < 1000000; ++suffix)
+	{
+		if (suffix == 0)
+		{
+			strlcpy(leafname, baseLeafname, leafnameCapacity);
+		}
+		else
+		{
+			snprintf(leafname, leafnameCapacity, "%.*s_%u%s",
+				static_cast<int>(stemLength), baseLeafname, suffix,
+				extension == 0 ? "" : extension);
+		}
+		strlcpy(outputPath, outputDirectory, outputPathCapacity);
+		strlcat(outputPath, leafname, outputPathCapacity);
+		bool reserved = false;
+		for (size_t index = 0; index < s_reservedD3D11ScreenshotPaths.size();
+			++index)
+		{
+			if (s_reservedD3D11ScreenshotPaths[index] == outputPath)
+			{
+				reserved = true;
+				break;
+			}
+		}
+		if (reserved)
+		{
+			continue;
+		}
+		try
+		{
+			s_reservedD3D11ScreenshotPaths.push_back(outputPath);
+		}
+		catch (...)
+		{
+			return false;
+		}
+		return true;
+	}
+	return false;
+}
+
+struct D3D11CompressedScreenshotCapture
+{
+	unsigned char* pixelData;
+	unsigned char* image;
+	ScreenshotWrittenMessage* completion;
+	unsigned width;
+	unsigned height;
+	unsigned pitch;
+	char outputDirectory[_MAX_PATH];
+	char outputPath[_MAX_PATH];
+	char leafname[_MAX_FNAME];
+	int quality;
+	ScreenshotFormat format;
+};
+
+static void completeD3D11CompressedScreenshot(void *consumer,
+	const rts::render::RenderCaptureHandle *, unsigned width, unsigned height,
+	size_t rowPitch, rts::render::RenderFormat captureFormat,
+	const void *pixels, size_t pixelBytes)
+{
+	D3D11CompressedScreenshotCapture* capture =
+		static_cast<D3D11CompressedScreenshotCapture *>(consumer);
+	if (capture == 0)
+	{
+		return;
+	}
+	size_t requiredRowBytes = 0;
+	size_t requiredBytes = 0;
+	if (pixels == 0 || captureFormat !=
+		rts::render::RENDER_FORMAT_B8G8R8A8_UNORM ||
+		width != capture->width || height != capture->height ||
+		!checkedScreenshotMultiply(static_cast<size_t>(width), 4,
+			&requiredRowBytes) || rowPitch < requiredRowBytes ||
+		!checkedScreenshotMultiply(rowPitch, static_cast<size_t>(height),
+			&requiredBytes) || pixelBytes < requiredBytes)
+	{
+		DEBUG_LOG(("D3D11 compressed screenshot completion had invalid pixels"));
+		delete[] capture->pixelData;
+		delete[] capture->image;
+		delete capture->completion;
+		delete capture;
+		return;
+	}
+	const unsigned char *source = static_cast<const unsigned char *>(pixels);
+	for (unsigned row = 0; row < height; ++row)
+	{
+		memcpy(capture->pixelData + static_cast<size_t>(row) * capture->pitch,
+			source + static_cast<size_t>(row) * rowPitch, capture->pitch);
+	}
+	ScreenshotBatch* batch = 0;
+	try
+	{
+		batch = new ScreenshotBatch(capture->pixelData, capture->image,
+			capture->completion, capture->width, capture->height, capture->pitch,
+			SCREENSHOT_SOURCE_ARGB32, capture->outputDirectory,
+			capture->outputPath, capture->leafname, capture->quality,
+			capture->format);
+	}
+	catch (...)
+	{
+		batch = 0;
+	}
+	if (batch == 0)
+	{
+		DEBUG_LOG(("Dropped D3D11 screenshot %s because its batch could not be allocated",
+			capture->leafname));
+		delete[] capture->pixelData;
+		delete[] capture->image;
+		delete capture->completion;
+		delete capture;
+		return;
+	}
+	capture->pixelData = 0;
+	capture->image = 0;
+	capture->completion = 0;
+	s_screenshotTaskService.submit(batch);
+	delete capture;
+}
+
+static void cancelD3D11CompressedScreenshot(void *consumer,
+	const rts::render::RenderCaptureHandle *, rts::render::RenderResult reason)
+{
+	D3D11CompressedScreenshotCapture* capture =
+		static_cast<D3D11CompressedScreenshotCapture *>(consumer);
+	if (capture != 0)
+	{
+		DEBUG_LOG(("D3D11 compressed screenshot capture cancelled: %d",
+			static_cast<int>(reason)));
+		delete[] capture->pixelData;
+		delete[] capture->image;
+		delete capture->completion;
+		delete capture;
+	}
+}
+
 void W3D_UpdateScreenshotMessages()
 {
 	ScreenshotWrittenMessage* message = s_screenshotWrittenQueue.Flush();
@@ -408,21 +566,24 @@ void W3D_TakeCompressedScreenshot(ScreenshotFormat format, Int jpegQuality)
 
 	if (DX8Wrapper::Is_D3D11_Backend_Active())
 	{
-		int targetWidth = 0;
-		int targetHeight = 0;
-		int targetBits = 0;
-		bool targetWindowed = false;
-		WW3D::Get_Render_Target_Resolution(targetWidth, targetHeight,
-			targetBits, targetWindowed);
-		const unsigned width = targetWidth > 0 ?
-			static_cast<unsigned>(targetWidth) : 0;
-		const unsigned height = targetHeight > 0 ?
-			static_cast<unsigned>(targetHeight) : 0;
+		if (!reserveD3D11ScreenshotName(outputDirectory, leafname, leafname,
+			ARRAY_SIZE(leafname), outputPath, ARRAY_SIZE(outputPath)))
+		{
+			DEBUG_LOG(("D3D11 screenshot name reservation failed"));
+			return;
+		}
+		rts::render::RenderBackBufferInfo backBufferInfo;
+		const rts::render::RenderResult infoResult =
+			DX8Wrapper::Get_D3D11_Back_Buffer_Info(&backBufferInfo);
+		const unsigned width = backBufferInfo.width;
+		const unsigned height = backBufferInfo.height;
 		size_t pitchSize = 0;
 		size_t pixelCount = 0;
 		size_t pixelDataSize = 0;
 		size_t imageSize = 0;
-		if (width == 0 || height == 0 ||
+		if (infoResult != rts::render::RENDER_RESULT_OK || width == 0 ||
+			height == 0 || backBufferInfo.format !=
+			rts::render::RENDER_FORMAT_B8G8R8A8_UNORM ||
 			!checkedScreenshotMultiply(static_cast<size_t>(width), 4,
 				&pitchSize) ||
 			!checkedScreenshotMultiply(static_cast<size_t>(width),
@@ -463,43 +624,49 @@ void W3D_TakeCompressedScreenshot(ScreenshotFormat format, Int jpegQuality)
 			return;
 		}
 
-		rts::render::RenderFormat captureFormat =
-			rts::render::RENDER_FORMAT_UNKNOWN;
-		const rts::render::RenderResult captureResult =
-			DX8Wrapper::Capture_D3D11_Back_Buffer(pixelData, pixelDataSize,
-				pitch, &captureFormat);
-		if (captureResult != rts::render::RENDER_RESULT_OK ||
-			captureFormat != rts::render::RENDER_FORMAT_B8G8R8A8_UNORM)
-		{
-			DEBUG_LOG(("D3D11 screenshot capture failed: result=%d format=%d",
-				static_cast<int>(captureResult), static_cast<int>(captureFormat)));
-			delete[] pixelData;
-			delete[] image;
-			delete completion;
-			return;
-		}
-
-		ScreenshotBatch* batch = 0;
+		D3D11CompressedScreenshotCapture* capture = 0;
 		try
 		{
-			batch = new ScreenshotBatch(pixelData, image, completion, width, height,
-				pitch, SCREENSHOT_SOURCE_ARGB32, outputDirectory, outputPath,
-				leafname, jpegQuality, format);
+			capture = new D3D11CompressedScreenshotCapture;
 		}
 		catch (...)
 		{
-			batch = 0;
+			capture = 0;
 		}
-		if (batch == 0)
+		if (capture == 0)
 		{
-			DEBUG_LOG(("Dropped D3D11 screenshot %s because its batch could not be allocated",
-				leafname));
 			delete[] pixelData;
 			delete[] image;
 			delete completion;
 			return;
 		}
-		s_screenshotTaskService.submit(batch);
+		capture->pixelData = pixelData;
+		capture->image = image;
+		capture->completion = completion;
+		capture->width = width;
+		capture->height = height;
+		capture->pitch = pitch;
+		capture->quality = jpegQuality;
+		capture->format = format;
+		strlcpy(capture->outputDirectory, outputDirectory,
+			ARRAY_SIZE(capture->outputDirectory));
+		strlcpy(capture->outputPath, outputPath,
+			ARRAY_SIZE(capture->outputPath));
+		strlcpy(capture->leafname, leafname, ARRAY_SIZE(capture->leafname));
+		rts::render::RenderCaptureRequestDescriptor descriptor;
+		descriptor.kind = rts::render::RENDER_CAPTURE_COMPRESSED_SCREENSHOT;
+		descriptor.consumer = capture;
+		descriptor.completed = completeD3D11CompressedScreenshot;
+		descriptor.cancelled = cancelD3D11CompressedScreenshot;
+		rts::render::RenderCaptureHandle handle;
+		const rts::render::RenderResult queueResult =
+			DX8Wrapper::Queue_D3D11_Back_Buffer_Capture(descriptor, &handle);
+		if (queueResult != rts::render::RENDER_RESULT_OK)
+		{
+			DEBUG_LOG(("D3D11 screenshot queue rejected %s: result=%d",
+				leafname, static_cast<int>(queueResult)));
+			cancelD3D11CompressedScreenshot(capture, &handle, queueResult);
+		}
 		return;
 	}
 

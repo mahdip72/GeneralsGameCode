@@ -88,6 +88,19 @@ DXGI_FORMAT TranslateFormat(RenderFormat format)
 	}
 }
 
+RenderFormat TranslateBackBufferFormat(DXGI_FORMAT format)
+{
+	switch (format)
+	{
+	case DXGI_FORMAT_R8G8B8A8_UNORM:
+		return RENDER_FORMAT_R8G8B8A8_UNORM;
+	case DXGI_FORMAT_B8G8R8A8_UNORM:
+		return RENDER_FORMAT_B8G8R8A8_UNORM;
+	default:
+		return RENDER_FORMAT_UNKNOWN;
+	}
+}
+
 D3D11_COMPARISON_FUNC TranslateComparison(RenderCompareFunction function)
 {
 	static const D3D11_COMPARISON_FUNC values[] = {
@@ -915,6 +928,34 @@ public:
 			TranslateResult(m_swapChain->Present(m_enableVsync ? 1 : 0, 0));
 	}
 
+	virtual RenderResult getBackBufferInfo(RenderBackBufferInfo *info) const
+	{
+		if (!isOwner() || info == 0 || m_swapChain == 0)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		ID3D11Texture2D *backBuffer = 0;
+		const HRESULT result = m_swapChain->GetBuffer(0,
+			__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&backBuffer));
+		if (FAILED(result))
+		{
+			return TranslateResult(result);
+		}
+		D3D11_TEXTURE2D_DESC descriptor;
+		backBuffer->GetDesc(&descriptor);
+		backBuffer->Release();
+		const RenderFormat format = TranslateBackBufferFormat(descriptor.Format);
+		if (format == RENDER_FORMAT_UNKNOWN || descriptor.Width == 0 ||
+			descriptor.Height == 0 || descriptor.SampleDesc.Count != 1)
+		{
+			return RENDER_RESULT_UNSUPPORTED;
+		}
+		info->width = descriptor.Width;
+		info->height = descriptor.Height;
+		info->format = format;
+		return RENDER_RESULT_OK;
+	}
+
 	virtual RenderResult beginFrame()
 	{
 		if (!isOwner() || m_frameOpen)
@@ -1486,8 +1527,11 @@ public:
 		}
 		D3D11_TEXTURE2D_DESC descriptor;
 		backBuffer->GetDesc(&descriptor);
+		const RenderFormat captureFormat =
+			TranslateBackBufferFormat(descriptor.Format);
 		if (descriptor.Width != m_width || descriptor.Height != m_height ||
-			descriptor.SampleDesc.Count != 1)
+			descriptor.SampleDesc.Count != 1 || captureFormat ==
+			RENDER_FORMAT_UNKNOWN)
 		{
 			backBuffer->Release();
 			return RENDER_RESULT_FAILED;
@@ -1514,7 +1558,7 @@ public:
 						input + row * mapped.RowPitch, requiredRowBytes);
 				}
 				m_context->Unmap(staging, 0);
-				*format = RENDER_FORMAT_B8G8R8A8_UNORM;
+				*format = captureFormat;
 			}
 		}
 		if (staging != 0)

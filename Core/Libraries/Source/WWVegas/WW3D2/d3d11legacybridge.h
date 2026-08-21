@@ -18,6 +18,13 @@ public:
 	bool Is_Active() const;
 	bool Begin_Frame();
 	void Request_Frame_Capture();
+	rts::render::RenderResult Get_Back_Buffer_Info(
+		rts::render::RenderBackBufferInfo *info) const;
+	rts::render::RenderResult Queue_Back_Buffer_Capture(
+		const rts::render::RenderCaptureRequestDescriptor &descriptor,
+		rts::render::RenderCaptureHandle *handle);
+	unsigned int Cancel_Back_Buffer_Captures(void *consumer,
+		rts::render::RenderResult reason);
 	rts::render::RenderResult End_Frame(bool present_frame);
 	rts::render::RenderResult End_Frame(bool present_frame,
 		rts::render::RenderFrameOutcome *outcome);

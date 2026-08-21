@@ -79,6 +79,7 @@
 
 //#undef STRICT
 #include "WW3D2/ww3d.h"
+#include "WW3D2/dx8wrapper.h"
 
 
 #ifdef RTS_DEBUG
@@ -3109,8 +3110,19 @@ CMainFrame::OnSaveScreenshot ()
 	//
 	bool cursor_shown = GetCurrentDocument ()->Is_Cursor_Shown ();
 	GetCurrentDocument ()->Show_Cursor (false);
-	Get_Graphic_View ()->RepaintView ();
-	WW3D::Make_Screen_Shot (full_path);
+	if (DX8Wrapper::Is_D3D11_Backend_Active())
+	{
+		// D3D11 fulfills the request from End_Render, so enqueue it before the
+		// repaint that produces the frame. The callback then writes the image
+		// after Present on the render owner thread.
+		WW3D::Make_Screen_Shot (full_path);
+		Get_Graphic_View ()->RepaintView ();
+	}
+	else
+	{
+		Get_Graphic_View ()->RepaintView ();
+		WW3D::Make_Screen_Shot (full_path);
+	}
 	GetCurrentDocument ()->Show_Cursor (cursor_shown);
 }
 

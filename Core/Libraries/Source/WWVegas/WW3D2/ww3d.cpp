@@ -136,6 +136,335 @@ bool Checked_Multiply(size_t left, size_t right, size_t *result)
 	*result = left * right;
 	return true;
 }
+
+struct D3D11LegacyScreenshotCapture
+{
+	char filename[80];
+	float gamma;
+	WW3D::ScreenShotFormatEnum format;
+	unsigned int width;
+	unsigned int height;
+};
+
+// A movie owns a fixed-size AVI buffer. Keep that ownership and the
+// dimensions used to allocate it in the queued request rather than passing
+// the raw movie pointer through the asynchronous bridge. This makes a
+// resize, device recovery, or stop deterministic instead of allowing a later
+// frame to write past the old buffer.
+struct D3D11MovieCaptureRequest
+{
+	FrameGrabClass *movie;
+	unsigned int width;
+	unsigned int height;
+};
+
+std::vector<D3D11MovieCaptureRequest *> s_d3d11MovieRequests;
+FrameGrabClass *s_d3d11MovieOwner = 0;
+unsigned int s_d3d11MovieWidth = 0;
+unsigned int s_d3d11MovieHeight = 0;
+bool s_d3d11MovieStopPending = false;
+
+bool Remove_D3D11_Movie_Request(D3D11MovieCaptureRequest *request)
+{
+	for (std::vector<D3D11MovieCaptureRequest *>::iterator it =
+		s_d3d11MovieRequests.begin(); it != s_d3d11MovieRequests.end(); ++it)
+	{
+		if (*it == request)
+		{
+			s_d3d11MovieRequests.erase(it);
+			return true;
+		}
+	}
+	return false;
+}
+
+void Complete_D3D11_Legacy_Screenshot(void *consumer,
+	const rts::render::RenderCaptureHandle *, unsigned int width,
+	unsigned int height, size_t rowPitch, rts::render::RenderFormat format,
+	const void *pixels, size_t pixelBytes)
+{
+	D3D11LegacyScreenshotCapture *capture =
+		static_cast<D3D11LegacyScreenshotCapture *>(consumer);
+	if (capture == 0)
+	{
+		return;
+	}
+	size_t rowBytes = 0;
+	size_t sourceBytes = 0;
+	size_t pixelCount = 0;
+	size_t imageBytes = 0;
+	if (pixels == 0 || format != rts::render::RENDER_FORMAT_B8G8R8A8_UNORM ||
+		width == 0 || height == 0 || width != capture->width ||
+		height != capture->height || !Checked_Multiply(width, 4, &rowBytes) ||
+		rowPitch < rowBytes || !Checked_Multiply(rowPitch, height,
+			&sourceBytes) || pixelBytes < sourceBytes ||
+		!Checked_Multiply(static_cast<size_t>(width), height, &pixelCount) ||
+		!Checked_Multiply(pixelCount, 3, &imageBytes))
+	{
+		WWDEBUG_SAY(("D3D11 legacy screenshot completion had invalid pixels"));
+		delete capture;
+		return;
+	}
+	unsigned char *image = 0;
+	try
+	{
+		image = W3DNEWARRAY unsigned char[imageBytes];
+	}
+	catch (...)
+	{
+		WWDEBUG_SAY(("D3D11 legacy screenshot allocation failed"));
+		delete capture;
+		return;
+	}
+	unsigned char gammaLut[256];
+	float recip = 1.0f;
+	if (capture->gamma > WWMATH_EPSILON)
+	{
+		recip = 1.0f / capture->gamma;
+	}
+	for (unsigned int value = 0; value < 256; ++value)
+	{
+		gammaLut[value] = static_cast<unsigned char>(
+			256.0f * powf(value / 256.0f, recip));
+	}
+	const unsigned char *source = static_cast<const unsigned char *>(pixels);
+	for (unsigned int y = 0; y < height; ++y)
+	{
+		for (unsigned int x = 0; x < width; ++x)
+		{
+			const size_t output = 3 * (static_cast<size_t>(x) +
+				static_cast<size_t>(y) * width);
+			const unsigned char *pixel = source +
+				static_cast<size_t>(y) * rowPitch + static_cast<size_t>(x) * 4;
+			image[output] = gammaLut[pixel[2]];
+			image[output + 1] = gammaLut[pixel[1]];
+			image[output + 2] = gammaLut[pixel[0]];
+		}
+	}
+	if (capture->format == WW3D::TGA)
+	{
+		Targa targ;
+		memset(&targ.Header, 0, sizeof(targ.Header));
+		targ.Header.Width = width;
+		targ.Header.Height = height;
+		targ.Header.PixelDepth = 24;
+		targ.Header.ImageType = TGA_TRUECOLOR;
+		targ.SetImage(reinterpret_cast<char *>(image));
+		targ.YFlip();
+		FileClass *file = _TheWritingFileFactory->Get_File(capture->filename);
+		if (file != 0)
+		{
+			file->Create();
+			file->Close();
+			_TheWritingFileFactory->Return_File(file);
+		}
+		targ.Save(capture->filename, TGAF_IMAGE, false);
+	}
+	else
+	{
+		BITMAPFILEHEADER fileheader;
+		BITMAPINFOHEADER header;
+		size_t unpaddedRowBytes = 0;
+		size_t rowBytes = 0;
+		size_t imageFileBytes = 0;
+		const size_t headerBytes = sizeof(BITMAPFILEHEADER) +
+			sizeof(BITMAPINFOHEADER);
+		if (width > static_cast<unsigned int>(std::numeric_limits<long>::max()) ||
+			height > static_cast<unsigned int>(std::numeric_limits<long>::max()) ||
+			!Checked_Multiply(static_cast<size_t>(width), 3,
+				&unpaddedRowBytes) || unpaddedRowBytes >
+				std::numeric_limits<size_t>::max() - 3)
+		{
+			WWDEBUG_SAY(("D3D11 BMP screenshot dimensions are invalid"));
+			delete[] image;
+			delete capture;
+			return;
+		}
+		rowBytes = (unpaddedRowBytes + 3) & ~static_cast<size_t>(3);
+		if (!Checked_Multiply(rowBytes, static_cast<size_t>(height),
+			&imageFileBytes) || imageFileBytes >
+			std::numeric_limits<size_t>::max() - headerBytes ||
+			headerBytes + imageFileBytes >
+			static_cast<size_t>(std::numeric_limits<unsigned long>::max()))
+		{
+			WWDEBUG_SAY(("D3D11 BMP screenshot file is too large"));
+			delete[] image;
+			delete capture;
+			return;
+		}
+		memset(&header, 0, sizeof(header));
+		header.biSize = sizeof(BITMAPINFOHEADER);
+		header.biWidth = static_cast<LONG>(width);
+		header.biHeight = static_cast<LONG>(height);
+		header.biPlanes = 1;
+		header.biBitCount = 24;
+		header.biCompression = BI_RGB;
+		header.biXPelsPerMeter = 0xB12;
+		header.biYPelsPerMeter = 0xB12;
+		memset(&fileheader, 0, sizeof(fileheader));
+		fileheader.bfType = 19778;
+		fileheader.bfOffBits = sizeof(BITMAPFILEHEADER) +
+			sizeof(BITMAPINFOHEADER);
+		fileheader.bfSize = static_cast<DWORD>(headerBytes + imageFileBytes);
+		FileClass *file = _TheWritingFileFactory->Get_File(capture->filename);
+		if (file != 0)
+		{
+			file->Create();
+			file->Open(FileClass::WRITE);
+			file->Write(&fileheader, sizeof(BITMAPFILEHEADER));
+			file->Write(&header, sizeof(BITMAPINFOHEADER));
+			char *temp = 0;
+			try
+			{
+				temp = new char[rowBytes];
+			}
+			catch (...)
+			{
+				WWDEBUG_SAY(("D3D11 BMP screenshot row allocation failed"));
+				file->Close();
+				_TheWritingFileFactory->Return_File(file);
+				delete[] image;
+				delete capture;
+				return;
+			}
+			memset(temp, 0, rowBytes);
+			for (unsigned int y = 0; y < height; ++y)
+			{
+				memcpy(temp, &image[3 * width * (height - y - 1)],
+					unpaddedRowBytes);
+				for (unsigned int x = 0; x < width; ++x)
+				{
+					char swap = temp[3 * x];
+					temp[3 * x] = temp[3 * x + 2];
+					temp[3 * x + 2] = swap;
+				}
+				file->Write(temp, rowBytes);
+			}
+			delete[] temp;
+			file->Close();
+			_TheWritingFileFactory->Return_File(file);
+		}
+	}
+	delete[] image;
+	delete capture;
+}
+
+void Cancel_D3D11_Legacy_Screenshot(void *consumer,
+	const rts::render::RenderCaptureHandle *, rts::render::RenderResult reason)
+{
+	delete static_cast<D3D11LegacyScreenshotCapture *>(consumer);
+	WWDEBUG_SAY(("D3D11 legacy screenshot capture cancelled: %d",
+		static_cast<int>(reason)));
+}
+
+void Complete_D3D11_Movie(void *consumer,
+	const rts::render::RenderCaptureHandle *, unsigned int width,
+	unsigned int height, size_t rowPitch, rts::render::RenderFormat format,
+	const void *pixels, size_t pixelBytes)
+{
+	D3D11MovieCaptureRequest *request =
+		static_cast<D3D11MovieCaptureRequest *>(consumer);
+	if (request == 0)
+	{
+		return;
+	}
+	// Detach the request before doing any error handling. Stopping the movie
+	// from this owner-thread callback may synchronously cancel the remaining
+	// FIFO entries and mutate the request list.
+	Remove_D3D11_Movie_Request(request);
+	FrameGrabClass *movie = request->movie;
+	const bool dimensionsMatch = width == request->width &&
+		height == request->height;
+	if (movie == 0 || movie != s_d3d11MovieOwner || pixels == 0 ||
+		!dimensionsMatch ||
+		format != rts::render::RENDER_FORMAT_B8G8R8A8_UNORM || width == 0 ||
+		height == 0)
+	{
+		WWDEBUG_SAY(("D3D11 movie capture stopped because the visible frame "
+			"does not match its AVI dimensions"));
+		delete request;
+		if (movie == s_d3d11MovieOwner)
+		{
+			s_d3d11MovieStopPending = true;
+		}
+		return;
+	}
+	size_t rowBytes = 0;
+	size_t requiredBytes = 0;
+	size_t outputRowBytes = 0;
+	size_t aviRowBytes = 0;
+	size_t aviBytes = 0;
+	if (!Checked_Multiply(static_cast<size_t>(width), 4, &rowBytes) ||
+		rowPitch < rowBytes || !Checked_Multiply(rowPitch,
+			static_cast<size_t>(height), &requiredBytes) ||
+		pixelBytes < requiredBytes || !Checked_Multiply(
+			static_cast<size_t>(width), 3, &outputRowBytes) ||
+		outputRowBytes > std::numeric_limits<size_t>::max() - 3)
+	{
+		WWDEBUG_SAY(("D3D11 movie capture completion had invalid pixels"));
+		delete request;
+		if (movie == s_d3d11MovieOwner)
+		{
+			s_d3d11MovieStopPending = true;
+		}
+		return;
+	}
+	aviRowBytes = (outputRowBytes + 3) & ~static_cast<size_t>(3);
+	if (!Checked_Multiply(aviRowBytes, static_cast<size_t>(height),
+		&aviBytes) || aviBytes == 0 || movie->GetBuffer() == 0)
+	{
+		WWDEBUG_SAY(("D3D11 movie capture buffer dimensions are invalid"));
+		delete request;
+		if (movie == s_d3d11MovieOwner)
+		{
+			s_d3d11MovieStopPending = true;
+		}
+		return;
+	}
+	char *image = reinterpret_cast<char *>(movie->GetBuffer());
+	const unsigned char *source = static_cast<const unsigned char *>(pixels);
+	for (unsigned int y = 0; y < height; ++y)
+	{
+		const size_t destinationRow = static_cast<size_t>(height - y - 1);
+		char *destination = image + destinationRow * aviRowBytes;
+		for (unsigned int x = 0; x < width; ++x)
+		{
+			const unsigned char *pixel = source + static_cast<size_t>(y) *
+				rowPitch + static_cast<size_t>(x) * 4;
+			destination[static_cast<size_t>(x) * 3] =
+				static_cast<char>(pixel[0]);
+			destination[static_cast<size_t>(x) * 3 + 1] =
+				static_cast<char>(pixel[1]);
+			destination[static_cast<size_t>(x) * 3 + 2] =
+				static_cast<char>(pixel[2]);
+		}
+		if (aviRowBytes > outputRowBytes)
+		{
+			memset(destination + outputRowBytes, 0,
+				aviRowBytes - outputRowBytes);
+		}
+	}
+	movie->Grab(image);
+	delete request;
+}
+
+void Cancel_D3D11_Movie(void *consumer,
+	const rts::render::RenderCaptureHandle *, rts::render::RenderResult reason)
+{
+	D3D11MovieCaptureRequest *request =
+		static_cast<D3D11MovieCaptureRequest *>(consumer);
+	if (request != 0)
+	{
+		WWDEBUG_SAY(("D3D11 movie capture frame cancelled: %d",
+			static_cast<int>(reason)));
+		Remove_D3D11_Movie_Request(request);
+		if (request->movie == s_d3d11MovieOwner)
+		{
+			s_d3d11MovieStopPending = true;
+		}
+		delete request;
+	}
+}
 }
 
 
@@ -351,7 +680,7 @@ WW3DErrorType WW3D::Shutdown()
 //	WWDEBUG_SAY(("WW3D::Shutdown"));
 
 #ifdef WW3D_DX8
-	if (IsCapturing) {
+	if (IsCapturing || Movie != nullptr || !s_d3d11MovieRequests.empty()) {
 		Stop_Movie_Capture();
 	}
 #endif //WW3D_DX8
@@ -1130,6 +1459,15 @@ WW3DErrorType WW3D::End_Render(bool flip_frame)
 		WWPROFILE("DX8Wrapper::End_Scene");
 		DX8Wrapper::End_Scene(flip_frame);
 	}
+	// D3D11 capture callbacks run from End_Scene after the capture queue has
+	// detached its completed entries. Defer an error-triggered movie stop until
+	// the queue has finished invoking every callback, otherwise the remaining
+	// callbacks would observe a deleted FrameGrabClass.
+	if (s_d3d11MovieStopPending)
+	{
+		s_d3d11MovieStopPending = false;
+		Stop_Movie_Capture();
+	}
 
 	FrameCount++;
 
@@ -1388,67 +1726,54 @@ void WW3D::Make_Screen_Shot( const char * filename_base , const float gamma, con
 	size_t index = 0;
 	size_t index2 = 0;
 	unsigned char *image = nullptr;
-	std::vector<unsigned char> d3d11Pixels;
 	if (DX8Wrapper::Is_D3D11_Backend_Active())
 	{
-		width = static_cast<unsigned int>(
-			DX8Wrapper::Get_Device_Resolution_Width());
-		height = static_cast<unsigned int>(
-			DX8Wrapper::Get_Device_Resolution_Height());
-		const size_t maxAllocation = std::numeric_limits<size_t>::max();
-		size_t pixelCount = 0;
-		size_t pixelBytes = 0;
-		size_t imageBytes = 0;
-		size_t rowPitch = 0;
-		if (width == 0 || height == 0 ||
-			(format == TGA && (width > 65535 || height > 65535)) ||
-			!Checked_Multiply(static_cast<size_t>(width), 4, &rowPitch) ||
-			!Checked_Multiply(static_cast<size_t>(width),
-				static_cast<size_t>(height), &pixelCount) ||
-			!Checked_Multiply(pixelCount, 4, &pixelBytes) ||
-			!Checked_Multiply(pixelCount, 3, &imageBytes) ||
-			pixelBytes > maxAllocation || imageBytes > maxAllocation)
+		rts::render::RenderBackBufferInfo backBufferInfo;
+		const rts::render::RenderResult infoResult =
+			DX8Wrapper::Get_D3D11_Back_Buffer_Info(&backBufferInfo);
+		if (infoResult != rts::render::RENDER_RESULT_OK ||
+			backBufferInfo.format != rts::render::RENDER_FORMAT_B8G8R8A8_UNORM ||
+			backBufferInfo.width == 0 || backBufferInfo.height == 0 ||
+			(format == TGA && (backBufferInfo.width > 65535 ||
+				backBufferInfo.height > 65535)))
 		{
-			WWDEBUG_SAY(("D3D11 screenshot dimensions or allocation size are invalid"));
+			WWDEBUG_SAY(("D3D11 screenshot back-buffer dimensions are invalid"));
 			return;
 		}
+		D3D11LegacyScreenshotCapture *capture = 0;
 		try
 		{
-			d3d11Pixels.resize(pixelBytes);
-			image = W3DNEWARRAY unsigned char[imageBytes];
+			capture = new D3D11LegacyScreenshotCapture;
 		}
 		catch (...)
 		{
-			WWDEBUG_SAY(("D3D11 screenshot capture allocation failed"));
+			capture = 0;
+		}
+		if (capture == 0)
+		{
+			WWDEBUG_SAY(("D3D11 screenshot request allocation failed"));
 			return;
 		}
-		rts::render::RenderFormat captureFormat =
-			rts::render::RENDER_FORMAT_UNKNOWN;
-		const rts::render::RenderResult captureResult =
-			DX8Wrapper::Capture_D3D11_Back_Buffer(&d3d11Pixels[0], pixelBytes,
-				rowPitch, &captureFormat);
-		if (captureResult != rts::render::RENDER_RESULT_OK ||
-			captureFormat != rts::render::RENDER_FORMAT_B8G8R8A8_UNORM)
+		strlcpy(capture->filename, filename, ARRAY_SIZE(capture->filename));
+		capture->gamma = gamma;
+		capture->format = format;
+		capture->width = backBufferInfo.width;
+		capture->height = backBufferInfo.height;
+		rts::render::RenderCaptureRequestDescriptor descriptor;
+		descriptor.kind = rts::render::RENDER_CAPTURE_WW3D_SCREENSHOT;
+		descriptor.consumer = capture;
+		descriptor.completed = Complete_D3D11_Legacy_Screenshot;
+		descriptor.cancelled = Cancel_D3D11_Legacy_Screenshot;
+		rts::render::RenderCaptureHandle handle;
+		const rts::render::RenderResult queueResult =
+			DX8Wrapper::Queue_D3D11_Back_Buffer_Capture(descriptor, &handle);
+		if (queueResult != rts::render::RENDER_RESULT_OK)
 		{
-			WWDEBUG_SAY(("D3D11 screenshot capture failed: result=%d format=%d",
-				static_cast<int>(captureResult), static_cast<int>(captureFormat)));
-			delete [] image;
-			return;
+			WWDEBUG_SAY(("D3D11 screenshot queue rejected: %d",
+				static_cast<int>(queueResult)));
+			Cancel_D3D11_Legacy_Screenshot(capture, &handle, queueResult);
 		}
-		for (y = 0; y < height; ++y)
-		{
-			for (x = 0; x < width; ++x)
-			{
-				index = static_cast<size_t>(3) *
-					(static_cast<size_t>(x) +
-						static_cast<size_t>(y) * width);
-				index2 = static_cast<size_t>(y) * width * 4 +
-					static_cast<size_t>(x) * 4;
-				image[index] = gamma_lut[d3d11Pixels[index2 + 2]];
-				image[index + 1] = gamma_lut[d3d11Pixels[index2 + 1]];
-				image[index + 2] = gamma_lut[d3d11Pixels[index2]];
-			}
-		}
+		return;
 	}
 	else
 	{
@@ -1540,7 +1865,7 @@ void WW3D::Make_Screen_Shot( const char * filename_base , const float gamma, con
 				memset(&fileheader, 0, sizeof(BITMAPFILEHEADER));
 				fileheader.bfType = 19778; // BM
 				fileheader.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
-				fileheader.bfSize = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER) + 3 * len * height * sizeof(char);
+				fileheader.bfSize = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER) + len * height * sizeof(char);
 
 				FileClass *file = _TheWritingFileFactory->Get_File( filename );
 				if ( file ) {
@@ -1551,8 +1876,8 @@ void WW3D::Make_Screen_Shot( const char * filename_base , const float gamma, con
 					WWASSERT(num == sizeof(BITMAPFILEHEADER));
 					num = file->Write(&header, sizeof(BITMAPINFOHEADER));
 					WWASSERT(num == sizeof(BITMAPINFOHEADER));
-					char *temp = new char [3 * len];
-					memset(temp, 0, 3 * len * sizeof(char));
+					char *temp = new char [len];
+					memset(temp, 0, len * sizeof(char));
 					// invert image, pad and swap R and B
 					for (y = 0; y < (int) height; y++) {
 						memcpy(&temp[0], &image[ 3 * width * (height - y - 1)], 3 * width * sizeof(char));
@@ -1592,16 +1917,41 @@ void WW3D::Make_Screen_Shot( const char * filename_base , const float gamma, con
 void WW3D::Start_Movie_Capture( const char * filename_base, float frame_rate )
 {
 #ifdef _WIN32
-	if (IsCapturing) {
+	if (IsCapturing || Movie != nullptr || !s_d3d11MovieRequests.empty()) {
 		Stop_Movie_Capture();
 	}
 	WWASSERT( !IsCapturing);
 	IsCapturing = true;
+	RecordNextFrame = false;
 
-	RECT bounds;
-	GetWindowRect(_Hwnd,&bounds);
-	int height=bounds.bottom-bounds.top;
-	int width=bounds.right-bounds.left;
+	int height = 0;
+	int width = 0;
+	if (DX8Wrapper::Is_D3D11_Backend_Active())
+	{
+		rts::render::RenderBackBufferInfo backBufferInfo;
+		if (DX8Wrapper::Get_D3D11_Back_Buffer_Info(&backBufferInfo) !=
+			rts::render::RENDER_RESULT_OK || backBufferInfo.width == 0 ||
+			backBufferInfo.height == 0 || backBufferInfo.format !=
+			rts::render::RENDER_FORMAT_B8G8R8A8_UNORM ||
+			backBufferInfo.width > static_cast<unsigned int>(
+				std::numeric_limits<int>::max()) ||
+			backBufferInfo.height > static_cast<unsigned int>(
+				std::numeric_limits<int>::max()))
+		{
+			WWDEBUG_SAY(("D3D11 movie capture could not query the back buffer"));
+			IsCapturing = false;
+			return;
+		}
+		width = static_cast<int>(backBufferInfo.width);
+		height = static_cast<int>(backBufferInfo.height);
+	}
+	else
+	{
+		RECT bounds;
+		GetWindowRect(_Hwnd, &bounds);
+		height = bounds.bottom - bounds.top;
+		width = bounds.right - bounds.left;
+	}
 	int depth=24;
 
 	WWASSERT( Movie == nullptr);
@@ -1614,6 +1964,21 @@ void WW3D::Start_Movie_Capture( const char * filename_base, float frame_rate )
 	}
 
 	Movie = W3DNEW FrameGrabClass( filename_base, FrameGrabClass::AVI, width, height, depth, frame_rate);
+	if (Movie == 0 || Movie->GetBuffer() == 0)
+	{
+		WWDEBUG_SAY(("Movie capture could not allocate its AVI buffer"));
+		delete Movie;
+		Movie = nullptr;
+		IsCapturing = false;
+		RecordNextFrame = false;
+		return;
+	}
+	if (DX8Wrapper::Is_D3D11_Backend_Active())
+	{
+		s_d3d11MovieOwner = Movie;
+		s_d3d11MovieWidth = static_cast<unsigned int>(width);
+		s_d3d11MovieHeight = static_cast<unsigned int>(height);
+	}
 
 	WWDEBUG_SAY(( "Starting Movie %s", filename_base ));
 #endif
@@ -1635,11 +2000,37 @@ void WW3D::Start_Movie_Capture( const char * filename_base, float frame_rate )
 void WW3D::Stop_Movie_Capture()
 {
 #ifdef _WIN32
-	if (IsCapturing) {
+	if (IsCapturing || Movie != nullptr || !s_d3d11MovieRequests.empty()) {
 		IsCapturing = false;
+		RecordNextFrame = false;
+		s_d3d11MovieStopPending = false;
 		WWDEBUG_SAY(( "Stopping Movie" ));
 
-		WWASSERT( Movie != nullptr);
+		if (DX8Wrapper::Is_D3D11_Backend_Active())
+		{
+			while (!s_d3d11MovieRequests.empty())
+			{
+				D3D11MovieCaptureRequest *request =
+					s_d3d11MovieRequests.front();
+				DX8Wrapper::Cancel_D3D11_Back_Buffer_Captures(request,
+					rts::render::RENDER_RESULT_FAILED);
+				if (Remove_D3D11_Movie_Request(request))
+				{
+					delete request;
+				}
+			}
+		}
+		while (!s_d3d11MovieRequests.empty())
+		{
+			D3D11MovieCaptureRequest *request =
+				s_d3d11MovieRequests.back();
+			s_d3d11MovieRequests.pop_back();
+			delete request;
+		}
+		s_d3d11MovieOwner = 0;
+		s_d3d11MovieWidth = 0;
+		s_d3d11MovieHeight = 0;
+		s_d3d11MovieStopPending = false;
 		delete Movie;
 		Movie = nullptr;
 	}
@@ -1796,6 +2187,70 @@ void WW3D::Update_Movie_Capture()
 	WWASSERT( IsCapturing);
 	WWPROFILE("WW3D::Update_Movie_Capture");
 	WWDEBUG_SAY(( "Updating"));
+
+	if (DX8Wrapper::Is_D3D11_Backend_Active())
+	{
+		if (Movie == nullptr)
+		{
+			WWDEBUG_SAY(("D3D11 movie capture has no movie consumer"));
+			return;
+		}
+		if (s_d3d11MovieOwner != Movie || s_d3d11MovieWidth == 0 ||
+			s_d3d11MovieHeight == 0)
+		{
+			WWDEBUG_SAY(("D3D11 movie capture has no stable frame dimensions"));
+			Stop_Movie_Capture();
+			return;
+		}
+		D3D11MovieCaptureRequest *request = 0;
+		try
+		{
+			request = new D3D11MovieCaptureRequest;
+		}
+		catch (...)
+		{
+			request = 0;
+		}
+		if (request == 0)
+		{
+			WWDEBUG_SAY(("D3D11 movie capture request allocation failed"));
+			Stop_Movie_Capture();
+			return;
+		}
+		request->movie = Movie;
+		request->width = s_d3d11MovieWidth;
+		request->height = s_d3d11MovieHeight;
+		try
+		{
+			s_d3d11MovieRequests.push_back(request);
+		}
+		catch (...)
+		{
+			delete request;
+			WWDEBUG_SAY(("D3D11 movie capture request list allocation failed"));
+			Stop_Movie_Capture();
+			return;
+		}
+		rts::render::RenderCaptureRequestDescriptor descriptor;
+		descriptor.kind = rts::render::RENDER_CAPTURE_MOVIE;
+		descriptor.consumer = request;
+		descriptor.completed = Complete_D3D11_Movie;
+		descriptor.cancelled = Cancel_D3D11_Movie;
+		rts::render::RenderCaptureHandle handle;
+		const rts::render::RenderResult queueResult =
+			DX8Wrapper::Queue_D3D11_Back_Buffer_Capture(descriptor, &handle);
+		if (queueResult != rts::render::RENDER_RESULT_OK)
+		{
+			WWDEBUG_SAY(("D3D11 movie capture queue rejected: %d",
+				static_cast<int>(queueResult)));
+			if (Remove_D3D11_Movie_Request(request))
+			{
+				delete request;
+			}
+			Stop_Movie_Capture();
+		}
+		return;
+	}
 
 	// TheSuperHackers @bugfix xezon 21/05/2025 Get the back buffer and create a copy of the surface.
 	// Originally this code took the front buffer and tried to lock it. This does not work when the

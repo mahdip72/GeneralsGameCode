@@ -425,6 +425,13 @@ public:
 	static SurfaceClass * _Get_DX8_Back_Buffer(unsigned int num=0);
 	static bool Is_D3D11_Backend_Active();
 	static void Request_D3D11_Back_Buffer_Capture();
+	static rts::render::RenderResult Get_D3D11_Back_Buffer_Info(
+		rts::render::RenderBackBufferInfo *info);
+	static rts::render::RenderResult Queue_D3D11_Back_Buffer_Capture(
+		const rts::render::RenderCaptureRequestDescriptor &descriptor,
+		rts::render::RenderCaptureHandle *handle);
+	static unsigned int Cancel_D3D11_Back_Buffer_Captures(void *consumer,
+		rts::render::RenderResult reason);
 	static rts::render::RenderResult Capture_D3D11_Back_Buffer(
 		void *destination, size_t destination_bytes,
 		size_t destination_row_pitch, rts::render::RenderFormat *format);

@@ -1938,6 +1938,25 @@ void DX8Wrapper::Request_D3D11_Back_Buffer_Capture()
 	}
 }
 
+rts::render::RenderResult DX8Wrapper::Get_D3D11_Back_Buffer_Info(
+	rts::render::RenderBackBufferInfo *info)
+{
+	return _D3D11Bridge.Get_Back_Buffer_Info(info);
+}
+
+rts::render::RenderResult DX8Wrapper::Queue_D3D11_Back_Buffer_Capture(
+	const rts::render::RenderCaptureRequestDescriptor &descriptor,
+	rts::render::RenderCaptureHandle *handle)
+{
+	return _D3D11Bridge.Queue_Back_Buffer_Capture(descriptor, handle);
+}
+
+unsigned int DX8Wrapper::Cancel_D3D11_Back_Buffer_Captures(void *consumer,
+	rts::render::RenderResult reason)
+{
+	return _D3D11Bridge.Cancel_Back_Buffer_Captures(consumer, reason);
+}
+
 rts::render::RenderResult DX8Wrapper::Capture_D3D11_Back_Buffer(
 	void *destination, size_t destination_bytes, size_t destination_row_pitch,
 	rts::render::RenderFormat *format)

@@ -50,6 +50,7 @@
 #include "ViewerScene.h"
 #include "WWLib/INI.h"
 #include "WW3D2/ww3d.h"
+#include "WW3D2/dx8wrapper.h"
 #include "EmitterInstanceList.h"
 #include "WW3D2/mesh.h"
 #include "ScreenCursor.h"
@@ -2394,9 +2395,22 @@ CW3DViewDoc::Make_Movie ()
 				}
 			}
 
+			// D3D11 captures are fulfilled at End_Render, so queue the request
+			// before repainting the target frame. The legacy D3D8 path still
+			// reads the completed back buffer synchronously and must run after
+			// repainting.
+			const bool d3d11_capture = DX8Wrapper::Is_D3D11_Backend_Active();
 			graphic_view->RepaintView (FALSE, ticks);
-			graphic_view->RepaintView (FALSE, 1);
-			WW3D::Update_Movie_Capture ();
+			if (d3d11_capture)
+			{
+				WW3D::Update_Movie_Capture ();
+				graphic_view->RepaintView (FALSE, 1);
+			}
+			else
+			{
+				graphic_view->RepaintView (FALSE, 1);
+				WW3D::Update_Movie_Capture ();
+			}
 
 			if (::GetAsyncKeyState (VK_ESCAPE) < 0) {
 				break;

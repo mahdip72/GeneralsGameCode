@@ -151,6 +151,84 @@ enum RenderResult
 	RENDER_RESULT_FAILED
 };
 
+struct RenderBackBufferInfo
+{
+	RenderBackBufferInfo();
+
+	unsigned int width;
+	unsigned int height;
+	RenderFormat format;
+};
+
+enum RenderCaptureKind
+{
+	RENDER_CAPTURE_COMPRESSED_SCREENSHOT,
+	RENDER_CAPTURE_WW3D_SCREENSHOT,
+	RENDER_CAPTURE_MOVIE,
+	RENDER_CAPTURE_PROFILER,
+	RENDER_CAPTURE_VISUAL_SMOKE
+};
+
+struct RenderCaptureHandle
+{
+	RenderCaptureHandle();
+
+	RenderCaptureKind kind;
+	unsigned int requestId;
+	unsigned int generation;
+};
+
+typedef void (*RenderCaptureCompletedCallback)(void *consumer,
+	const RenderCaptureHandle *handle, unsigned int width,
+	unsigned int height, size_t rowPitch, RenderFormat format,
+	const void *pixels, size_t pixelBytes);
+typedef void (*RenderCaptureCancelledCallback)(void *consumer,
+	const RenderCaptureHandle *handle, RenderResult reason);
+
+struct RenderCaptureRequestDescriptor
+{
+	RenderCaptureRequestDescriptor();
+
+	RenderCaptureKind kind;
+	void *consumer;
+	RenderCaptureCompletedCallback completed;
+	RenderCaptureCancelledCallback cancelled;
+};
+
+// Owner-thread capture requests are bounded and generation-tagged. The
+// renderer supplies one readback to completeVisible(), allowing multiple
+// consumers to share the same visible back-buffer copy.
+class RenderCaptureQueue
+{
+public:
+	explicit RenderCaptureQueue(unsigned int capacity = 8);
+	~RenderCaptureQueue();
+
+	RenderResult enqueue(const RenderCaptureRequestDescriptor &descriptor,
+		RenderCaptureHandle *handle);
+	RenderResult completeVisible(unsigned int width, unsigned int height,
+		size_t rowPitch, RenderFormat format, const void *pixels,
+		size_t pixelBytes);
+	unsigned int cancelStale(RenderResult reason);
+	unsigned int cancelConsumer(void *consumer, RenderResult reason);
+	unsigned int cancelCurrent(RenderResult reason);
+	void shutdown(RenderResult reason);
+	void reset();
+	// Bind the queue to the render-owner thread before first use. All mutable
+	// queue operations reject calls from other threads.
+	bool bindOwnerThread();
+	void advanceGeneration();
+	unsigned int generation() const;
+	unsigned int pendingCount() const;
+
+private:
+	RenderCaptureQueue(const RenderCaptureQueue &);
+	RenderCaptureQueue &operator=(const RenderCaptureQueue &);
+
+	struct Impl;
+	Impl *m_impl;
+};
+
 // Tracks the first command-submission failure in one owner-thread frame. The
 // owner is responsible for calling reset() only after a successful beginFrame.
 class RenderFrameFailureLatch
@@ -345,6 +423,7 @@ public:
 	virtual RenderResult recoverDevice() = 0;
 	virtual RenderResult resize(unsigned int width, unsigned int height) = 0;
 	virtual RenderResult present() = 0;
+	virtual RenderResult getBackBufferInfo(RenderBackBufferInfo *info) const = 0;
 	virtual RenderResult captureBackBuffer(void *destination,
 		size_t destinationBytes, size_t destinationRowPitch,
 		RenderFormat *format) = 0;

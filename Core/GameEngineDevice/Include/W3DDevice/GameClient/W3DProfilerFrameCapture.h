@@ -21,6 +21,7 @@
 #ifdef PROFILER_ENABLED
 
 #include "Lib/BaseType.h"
+#include "Renderer/RendererDevice.h"
 #include <vector>
 
 class W3DProfilerFrameCapture
@@ -33,11 +34,21 @@ public:
 
 private:
 	bool ShouldReuseLastCapture(UnsignedInt currentTimeMs) const;
+	static void Complete_D3D11_Capture(void *consumer,
+		const rts::render::RenderCaptureHandle *handle, unsigned int width,
+		unsigned int height, size_t rowPitch,
+		rts::render::RenderFormat format, const void *pixels,
+		size_t pixelBytes);
+	static void Cancel_D3D11_Capture(void *consumer,
+		const rts::render::RenderCaptureHandle *handle,
+		rts::render::RenderResult reason);
 
 	DWORD m_swizzleShader = 0;
 	UnsignedInt m_lastCaptureTimeMs = 0;
 	UnsignedInt m_lastCaptureHeight = 0;
 	std::vector<UnsignedByte> m_lastCapturePixels;
+	bool m_d3d11CapturePending = false;
+	UnsignedInt m_d3d11PendingTimeMs = 0;
 };
 
 #endif // PROFILER_ENABLED

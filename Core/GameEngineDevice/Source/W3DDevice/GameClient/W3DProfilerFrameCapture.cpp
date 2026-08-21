@@ -25,9 +25,26 @@
 #include "WW3D2/texture.h"
 #include "WW3D2/ww3d.h"
 #include "WW3D2/ww3dformat.h"
+#include "WWDebug/wwdebug.h"
 #include "WWMath/wwmath.h"
 #include <cstring>
+#include <limits>
+#include <stdlib.h>
 #include <d3dx8core.h>
+
+namespace
+{
+bool Checked_Profiler_Multiply(size_t left, size_t right, size_t *result)
+{
+	if (result == 0 || (left != 0 && right >
+		std::numeric_limits<size_t>::max() / left))
+	{
+		return false;
+	}
+	*result = left * right;
+	return true;
+}
+}
 
 W3DProfilerFrameCapture::W3DProfilerFrameCapture()
 {
@@ -35,6 +52,23 @@ W3DProfilerFrameCapture::W3DProfilerFrameCapture()
 
 W3DProfilerFrameCapture::~W3DProfilerFrameCapture()
 {
+	if (m_d3d11CapturePending)
+	{
+		// Capture cancellation invokes the consumer callback synchronously on
+		// the render owner. A zero count while a request is still pending means
+		// destruction was attempted from a different thread (or the bridge was
+		// torn down without first cancelling its consumers); continuing would
+		// leave a callback pointing at this object.
+		const unsigned int cancelled =
+			DX8Wrapper::Cancel_D3D11_Back_Buffer_Captures(this,
+				rts::render::RENDER_RESULT_FAILED);
+		if (cancelled == 0)
+		{
+			WWDEBUG_ERROR(("W3DProfilerFrameCapture destruction must run on the D3D11 render owner"));
+			abort();
+		}
+	}
+	m_d3d11CapturePending = false;
 	if (m_swizzleShader)
 	{
 		DX8Wrapper::_Get_D3D_Device8()->DeletePixelShader(m_swizzleShader);
@@ -49,6 +83,114 @@ bool W3DProfilerFrameCapture::ShouldReuseLastCapture(UnsignedInt currentTimeMs) 
 		&& !m_lastCapturePixels.empty();
 }
 
+void W3DProfilerFrameCapture::Complete_D3D11_Capture(void *consumer,
+	const rts::render::RenderCaptureHandle *, unsigned int width,
+	unsigned int height, size_t rowPitch, rts::render::RenderFormat format,
+	const void *pixels, size_t pixelBytes)
+{
+	W3DProfilerFrameCapture *capture =
+		static_cast<W3DProfilerFrameCapture *>(consumer);
+	if (capture == 0)
+	{
+		return;
+	}
+	capture->m_d3d11CapturePending = false;
+	if (pixels == 0 || width == 0 || height == 0 ||
+		format != rts::render::RENDER_FORMAT_B8G8R8A8_UNORM ||
+		PROFILER_FRAME_IMAGE_SIZE == 0)
+	{
+		WWDEBUG_SAY(("D3D11 profiler capture returned invalid frame data"));
+		return;
+	}
+	size_t sourceRowBytes = 0;
+	size_t sourceBytes = 0;
+	if (!Checked_Profiler_Multiply(static_cast<size_t>(width), 4,
+		&sourceRowBytes) || rowPitch < sourceRowBytes ||
+		!Checked_Profiler_Multiply(rowPitch, static_cast<size_t>(height),
+		&sourceBytes) || pixelBytes < sourceBytes)
+	{
+		WWDEBUG_SAY(("D3D11 profiler capture returned invalid row bounds"));
+		return;
+	}
+	const double scaledHeight = static_cast<double>(PROFILER_FRAME_IMAGE_SIZE) *
+		static_cast<double>(height) / static_cast<double>(width);
+	unsigned int outputHeight = 1;
+	if (scaledHeight >= static_cast<double>(PROFILER_FRAME_IMAGE_SIZE))
+	{
+		outputHeight = PROFILER_FRAME_IMAGE_SIZE;
+	}
+	else if (scaledHeight > 1.0)
+	{
+		outputHeight = static_cast<unsigned int>(scaledHeight + 0.5);
+	}
+	if (outputHeight == 0)
+	{
+		outputHeight = 1;
+	}
+	if (outputHeight > PROFILER_FRAME_IMAGE_SIZE)
+	{
+		outputHeight = PROFILER_FRAME_IMAGE_SIZE;
+	}
+	size_t outputRowBytes = 0;
+	size_t outputBytes = 0;
+	if (!Checked_Profiler_Multiply(PROFILER_FRAME_IMAGE_SIZE, 4,
+		&outputRowBytes) || !Checked_Profiler_Multiply(outputRowBytes,
+		static_cast<size_t>(outputHeight), &outputBytes))
+	{
+		WWDEBUG_SAY(("D3D11 profiler capture output dimensions overflowed"));
+		return;
+	}
+	try
+	{
+		capture->m_lastCapturePixels.resize(outputBytes);
+	}
+	catch (...)
+	{
+		WWDEBUG_SAY(("D3D11 profiler capture allocation failed"));
+		return;
+	}
+	const unsigned char *source = static_cast<const unsigned char *>(pixels);
+	UnsignedByte *destination = capture->m_lastCapturePixels.data();
+	for (unsigned int y = 0; y < outputHeight; ++y)
+	{
+		const unsigned int sourceY = static_cast<unsigned int>(
+			static_cast<size_t>(y) * height / outputHeight);
+		const unsigned char *sourceRow = source +
+			static_cast<size_t>(sourceY) * rowPitch;
+		for (unsigned int x = 0; x < PROFILER_FRAME_IMAGE_SIZE; ++x)
+		{
+			const unsigned int sourceX = static_cast<unsigned int>(
+				static_cast<size_t>(x) * width / PROFILER_FRAME_IMAGE_SIZE);
+			const unsigned char *sourcePixel = sourceRow +
+				static_cast<size_t>(sourceX) * 4;
+			UnsignedByte *destinationPixel = destination +
+				static_cast<size_t>(y) * outputRowBytes +
+				static_cast<size_t>(x) * 4;
+			destinationPixel[0] = sourcePixel[2];
+			destinationPixel[1] = sourcePixel[1];
+			destinationPixel[2] = sourcePixel[0];
+			destinationPixel[3] = sourcePixel[3];
+		}
+	}
+	capture->m_lastCaptureHeight = outputHeight;
+	capture->m_lastCaptureTimeMs = capture->m_d3d11PendingTimeMs;
+	PROFILER_FRAME_IMAGE(capture->m_lastCapturePixels.data(),
+		PROFILER_FRAME_IMAGE_SIZE, capture->m_lastCaptureHeight, 0, false);
+}
+
+void W3DProfilerFrameCapture::Cancel_D3D11_Capture(void *consumer,
+	const rts::render::RenderCaptureHandle *, rts::render::RenderResult reason)
+{
+	W3DProfilerFrameCapture *capture =
+		static_cast<W3DProfilerFrameCapture *>(consumer);
+	if (capture != 0)
+	{
+		capture->m_d3d11CapturePending = false;
+		WWDEBUG_SAY(("D3D11 profiler capture cancelled: %d",
+			static_cast<int>(reason)));
+	}
+}
+
 void W3DProfilerFrameCapture::Capture(UnsignedInt displayWidth, UnsignedInt displayHeight)
 {
 	if (!PROFILER_IS_CONNECTED)
@@ -59,6 +201,42 @@ void W3DProfilerFrameCapture::Capture(UnsignedInt displayWidth, UnsignedInt disp
 	if (ShouldReuseLastCapture(currentTimeMs))
 	{
 		PROFILER_FRAME_IMAGE(m_lastCapturePixels.data(), PROFILER_FRAME_IMAGE_SIZE, m_lastCaptureHeight, 0, false);
+		return;
+	}
+
+	if (DX8Wrapper::Is_D3D11_Backend_Active())
+	{
+		if (m_d3d11CapturePending)
+		{
+			return;
+		}
+		rts::render::RenderBackBufferInfo backBufferInfo;
+		const rts::render::RenderResult infoResult =
+			DX8Wrapper::Get_D3D11_Back_Buffer_Info(&backBufferInfo);
+		if (infoResult != rts::render::RENDER_RESULT_OK ||
+			backBufferInfo.width == 0 || backBufferInfo.height == 0 ||
+			backBufferInfo.format != rts::render::RENDER_FORMAT_B8G8R8A8_UNORM)
+		{
+			WWDEBUG_SAY(("D3D11 profiler capture has no supported back buffer: %d",
+				static_cast<int>(infoResult)));
+			return;
+		}
+		rts::render::RenderCaptureRequestDescriptor descriptor;
+		descriptor.kind = rts::render::RENDER_CAPTURE_PROFILER;
+		descriptor.consumer = this;
+		descriptor.completed = Complete_D3D11_Capture;
+		descriptor.cancelled = Cancel_D3D11_Capture;
+		m_d3d11PendingTimeMs = currentTimeMs;
+		m_d3d11CapturePending = true;
+		rts::render::RenderCaptureHandle handle;
+		const rts::render::RenderResult queueResult =
+			DX8Wrapper::Queue_D3D11_Back_Buffer_Capture(descriptor, &handle);
+		if (queueResult != rts::render::RENDER_RESULT_OK)
+		{
+			m_d3d11CapturePending = false;
+			WWDEBUG_SAY(("D3D11 profiler capture queue rejected: %d",
+				static_cast<int>(queueResult)));
+		}
 		return;
 	}
 

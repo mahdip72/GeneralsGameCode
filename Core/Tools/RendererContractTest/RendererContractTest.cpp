@@ -175,6 +175,229 @@ int testRendererFrameLifecycleState()
 	return result;
 }
 
+struct CaptureQueueProbe
+{
+	unsigned int completed[8];
+	unsigned int cancelled[8];
+	unsigned int completionCount;
+	unsigned int cancellationCount;
+	unsigned int readbackCount;
+	const void *firstPixels;
+	size_t firstPixelBytes;
+	size_t firstRowPitch;
+	bool sharedReadback;
+	rts::render::RenderCaptureQueue *reentryQueue;
+	bool enqueueDuringCancellation;
+};
+
+void captureQueueCompleted(void *consumer,
+	const rts::render::RenderCaptureHandle *handle, unsigned int,
+	unsigned int, size_t rowPitch, rts::render::RenderFormat,
+	const void *pixels, size_t pixelBytes)
+{
+	CaptureQueueProbe *probe = static_cast<CaptureQueueProbe *>(consumer);
+	if (pixels != 0)
+	{
+		++probe->readbackCount;
+		if (probe->firstPixels == 0)
+		{
+			probe->firstPixels = pixels;
+			probe->firstPixelBytes = pixelBytes;
+			probe->firstRowPitch = rowPitch;
+			probe->sharedReadback = true;
+		}
+		else if (probe->firstPixels != pixels ||
+			probe->firstPixelBytes != pixelBytes ||
+			probe->firstRowPitch != rowPitch)
+		{
+			probe->sharedReadback = false;
+		}
+	}
+	if (probe->completionCount < 8)
+	{
+		probe->completed[probe->completionCount++] = handle->requestId;
+	}
+}
+
+void captureQueueCancelled(void *consumer,
+	const rts::render::RenderCaptureHandle *handle,
+	rts::render::RenderResult)
+{
+	CaptureQueueProbe *probe = static_cast<CaptureQueueProbe *>(consumer);
+	if (probe->cancellationCount < 8)
+	{
+		probe->cancelled[probe->cancellationCount++] = handle->requestId;
+	}
+	if (probe->reentryQueue != 0 && probe->enqueueDuringCancellation)
+	{
+		probe->enqueueDuringCancellation = false;
+		rts::render::RenderCaptureRequestDescriptor descriptor;
+		descriptor.kind = rts::render::RENDER_CAPTURE_VISUAL_SMOKE;
+		descriptor.consumer = probe;
+		descriptor.completed = captureQueueCompleted;
+		descriptor.cancelled = captureQueueCancelled;
+		rts::render::RenderCaptureHandle reentryHandle;
+		probe->reentryQueue->enqueue(descriptor, &reentryHandle);
+	}
+}
+
+void captureQueueThrowingCompleted(void *,
+	const rts::render::RenderCaptureHandle *, unsigned int, unsigned int,
+	size_t, rts::render::RenderFormat, const void *, size_t)
+{
+	throw 1;
+}
+
+void captureQueueThrowingCancelled(void *,
+	const rts::render::RenderCaptureHandle *, rts::render::RenderResult)
+{
+	throw 1;
+}
+
+struct CaptureQueueThreadProbe
+{
+	rts::render::RenderCaptureQueue *queue;
+	rts::render::RenderCaptureRequestDescriptor descriptor;
+	rts::render::RenderCaptureHandle handle;
+	rts::render::RenderResult result;
+};
+
+DWORD WINAPI captureQueueWrongThread(void *parameter)
+{
+	CaptureQueueThreadProbe *probe =
+		static_cast<CaptureQueueThreadProbe *>(parameter);
+	probe->result = probe->queue->enqueue(probe->descriptor, &probe->handle);
+	return 0;
+}
+
+DWORD WINAPI captureQueueShutdownWrongThread(void *parameter)
+{
+	CaptureQueueThreadProbe *probe =
+		static_cast<CaptureQueueThreadProbe *>(parameter);
+	probe->queue->shutdown(rts::render::RENDER_RESULT_FAILED);
+	probe->result = rts::render::RENDER_RESULT_OK;
+	return 0;
+}
+
+int testRenderCaptureQueue()
+{
+	int result = 0;
+	CaptureQueueProbe probe = {};
+	rts::render::RenderCaptureQueue queue(2);
+	rts::render::RenderCaptureRequestDescriptor descriptor;
+	descriptor.kind = rts::render::RENDER_CAPTURE_VISUAL_SMOKE;
+	descriptor.consumer = &probe;
+	descriptor.completed = captureQueueCompleted;
+	descriptor.cancelled = captureQueueCancelled;
+	rts::render::RenderCaptureHandle unboundHandle;
+	result |= check(queue.enqueue(descriptor, &unboundHandle) ==
+		rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+		"capture queue rejects mutation before an owner thread is bound");
+	result |= check(queue.bindOwnerThread(),
+		"capture queue binds explicitly before accepting owner-thread work");
+	rts::render::RenderCaptureHandle first;
+	rts::render::RenderCaptureHandle second;
+	result |= check(queue.enqueue(descriptor, &first) ==
+		rts::render::RENDER_RESULT_OK && first.requestId != 0 &&
+		first.generation == queue.generation(),
+		"capture queue assigns stable generation-safe request IDs");
+	descriptor.kind = rts::render::RENDER_CAPTURE_MOVIE;
+	result |= check(queue.enqueue(descriptor, &second) ==
+		rts::render::RENDER_RESULT_OK && second.requestId > first.requestId,
+		"capture queue preserves FIFO request IDs across consumer kinds");
+	CaptureQueueThreadProbe threadProbe = {};
+	threadProbe.queue = &queue;
+	threadProbe.descriptor = descriptor;
+	threadProbe.result = rts::render::RENDER_RESULT_OK;
+	HANDLE wrongThread = CreateThread(0, 0, captureQueueWrongThread,
+		&threadProbe, 0, 0);
+	if (wrongThread != 0)
+	{
+		WaitForSingleObject(wrongThread, INFINITE);
+		CloseHandle(wrongThread);
+	}
+	result |= check(wrongThread != 0 && threadProbe.result ==
+		rts::render::RENDER_RESULT_INVALID_ARGUMENT && queue.pendingCount() == 2,
+		"capture queue rejects cross-thread mutation of owner-thread state");
+	rts::render::RenderCaptureHandle overflow;
+	result |= check(queue.enqueue(descriptor, &overflow) ==
+		rts::render::RENDER_RESULT_OUT_OF_MEMORY &&
+		probe.cancellationCount == 0,
+		"capture queue reports bounded overflow without silently dropping work");
+	std::vector<unsigned char> pixels(640 * 480 * 4, 7);
+	result |= check(queue.completeVisible(640, 480, 2559,
+		rts::render::RENDER_FORMAT_B8G8R8A8_UNORM, &pixels[0], pixels.size()) ==
+		rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+		queue.pendingCount() == 2,
+		"capture queue rejects a row pitch smaller than the actual pixel width");
+	result |= check(queue.completeVisible(640, 480, 2560,
+		rts::render::RENDER_FORMAT_UNKNOWN, &pixels[0], pixels.size()) ==
+		rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+		queue.pendingCount() == 2,
+		"capture queue rejects an unknown back-buffer format before callbacks");
+	result |= check(queue.completeVisible(640, 480, 2560,
+		rts::render::RENDER_FORMAT_B8G8R8A8_UNORM, &pixels[0], pixels.size()) ==
+		rts::render::RENDER_RESULT_OK && probe.completionCount == 2 &&
+		probe.readbackCount == 2 &&
+		probe.sharedReadback &&
+		probe.completed[0] == first.requestId &&
+		probe.completed[1] == second.requestId,
+		"visible capture completion is FIFO and shares one readback batch");
+	result |= check(queue.pendingCount() == 0,
+		"completed visible captures leave no stale requests");
+	rts::render::RenderCaptureHandle stale;
+	result |= check(queue.enqueue(descriptor, &stale) ==
+		rts::render::RENDER_RESULT_OK,
+		"capture queue accepts a request after completion");
+	const unsigned int oldGeneration = queue.generation();
+	probe.reentryQueue = &queue;
+	probe.enqueueDuringCancellation = true;
+	queue.advanceGeneration();
+	result |= check(queue.generation() != oldGeneration &&
+		queue.cancelStale(rts::render::RENDER_RESULT_FAILED) == 1 &&
+		probe.cancellationCount == 1 && queue.pendingCount() == 1,
+		"resize or recovery generation cancellation is deterministic");
+	probe.reentryQueue = 0;
+	queue.shutdown(rts::render::RENDER_RESULT_FAILED);
+	CaptureQueueThreadProbe shutdownProbe = {};
+	shutdownProbe.queue = &queue;
+	shutdownProbe.result = rts::render::RENDER_RESULT_FAILED;
+	HANDLE repeatedShutdown = CreateThread(0, 0,
+		captureQueueShutdownWrongThread, &shutdownProbe, 0, 0);
+	if (repeatedShutdown != 0)
+	{
+		WaitForSingleObject(repeatedShutdown, INFINITE);
+		CloseHandle(repeatedShutdown);
+	}
+	result |= check(queue.pendingCount() == 0 && probe.cancellationCount == 2 &&
+		repeatedShutdown != 0 && queue.bindOwnerThread(),
+		"capture queue shutdown drains once and repeated cross-thread shutdown is inert");
+	queue.reset();
+	result |= check(queue.generation() == 1 && queue.pendingCount() == 0,
+		"capture queue reset reactivates a deliberately shut-down owner queue");
+
+	rts::render::RenderCaptureQueue throwingQueue(1);
+	rts::render::RenderCaptureRequestDescriptor throwingDescriptor;
+	throwingDescriptor.kind = rts::render::RENDER_CAPTURE_PROFILER;
+	throwingDescriptor.consumer = &probe;
+	throwingDescriptor.completed = captureQueueThrowingCompleted;
+	throwingDescriptor.cancelled = captureQueueThrowingCancelled;
+	result |= check(throwingQueue.bindOwnerThread() &&
+		throwingQueue.enqueue(throwingDescriptor, &first) ==
+			rts::render::RENDER_RESULT_OK &&
+		throwingQueue.completeVisible(1, 1, 4,
+			rts::render::RENDER_FORMAT_B8G8R8A8_UNORM, &pixels[0], 4) ==
+		rts::render::RENDER_RESULT_OK && throwingQueue.pendingCount() == 0,
+		"capture queue contains exceptions from completion callbacks");
+	result |= check(throwingQueue.enqueue(throwingDescriptor, &first) ==
+		rts::render::RENDER_RESULT_OK &&
+		throwingQueue.cancelCurrent(rts::render::RENDER_RESULT_FAILED) == 1 &&
+		throwingQueue.pendingCount() == 0,
+		"capture queue contains exceptions from cancellation callbacks");
+	throwingQueue.shutdown(rts::render::RENDER_RESULT_FAILED);
+	return result;
+}
+
 int testLegacyLogicalState()
 {
 	int result = 0;
@@ -470,6 +693,12 @@ int testD3D11HiddenSwapChain()
 		result |= check(device->initialize(parameters) ==
 				rts::render::RENDER_RESULT_OK,
 			"flip-model D3D11 swap chain initializes while hidden");
+	rts::render::RenderBackBufferInfo backBufferInfo;
+	result |= check(device->getBackBufferInfo(&backBufferInfo) ==
+		rts::render::RENDER_RESULT_OK && backBufferInfo.width == 64 &&
+		backBufferInfo.height == 64 &&
+		backBufferInfo.format == rts::render::RENDER_FORMAT_B8G8R8A8_UNORM,
+		"D3D11 back-buffer info reports the actual swap-chain texture");
 
 		struct TestVertex
 		{
@@ -1079,6 +1308,11 @@ int testD3D11HiddenSwapChain()
 		resizedPixels.size(), 96 * 4, &captureFormat) ==
 			 rts::render::RENDER_RESULT_OK,
 		"resized D3D11 swap chain captures at its new dimensions");
+	result |= check(device->getBackBufferInfo(&backBufferInfo) ==
+		rts::render::RENDER_RESULT_OK && backBufferInfo.width == 96 &&
+		backBufferInfo.height == 80 &&
+		backBufferInfo.format == rts::render::RENDER_FORMAT_B8G8R8A8_UNORM,
+		"D3D11 back-buffer info follows the resized swap-chain texture");
 		unsigned char captureProbe = 0;
 		result |= check(device->captureBackBuffer(&captureProbe,
 			static_cast<size_t>(-1), static_cast<size_t>(-1), &captureFormat) ==
@@ -1377,6 +1611,7 @@ int main()
 	result |= testLegacyLogicalState();
 	result |= testLegacyShaderBitDecoder();
 	result |= testRendererFrameLifecycleState();
+	result |= testRenderCaptureQueue();
 #if defined(RTS_RENDERER_HAS_D3D11)
 	result |= testD3D11HeadlessDevice();
 	result |= testD3D11LegacyBridgeLifecycleContract();

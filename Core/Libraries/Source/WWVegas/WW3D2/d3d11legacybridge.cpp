@@ -12,8 +12,13 @@
 #include <limits>
 #include <new>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <vector>
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 namespace
 {
@@ -21,6 +26,18 @@ const unsigned int BUFFER_CACHE_CAPACITY = 1024;
 const unsigned int TEXTURE_CACHE_CAPACITY = 1024;
 const unsigned int CACHE_STALE_FRAME_COUNT = 600;
 const unsigned int MAX_TGA_DIMENSION = 65535;
+const char *const VISUAL_SMOKE_CAPTURE_FILE = "D3D11RendererCapture.tga";
+const char *const VISUAL_SMOKE_CAPTURE_SUCCESS_FILE =
+	"D3D11RendererCapture.complete";
+
+unsigned long Current_D3D11_Bridge_Thread_Id()
+{
+#if defined(_WIN32)
+	return static_cast<unsigned long>(GetCurrentThreadId());
+#else
+	return 1;
+#endif
+}
 
 using rts::render::BufferDescriptor;
 using rts::render::GpuHandle;
@@ -225,7 +242,7 @@ struct D3D11LegacyBridge::Impl
 
 	Impl() : device(0), context(0), legacy_device(0), frame_open(false),
 		log_file(0), frame_id(0), draw_count(0), draw_failure_count(0),
-		width(0), height(0), frame_outcome(), capture_request(),
+		width(0), height(0), owner_thread_id(0), frame_outcome(), capture_queue(8),
 		pending_viewport(false), pending_clear(false),
 		pending_clear_color(false), pending_clear_depth_stencil(false),
 		pending_red(0.0f), pending_green(0.0f), pending_blue(0.0f),
@@ -241,8 +258,9 @@ struct D3D11LegacyBridge::Impl
 	unsigned int draw_failure_count;
 	unsigned int width;
 	unsigned int height;
+	unsigned long owner_thread_id;
 	rts::render::RenderFrameOutcome frame_outcome;
-	rts::render::RenderCaptureRequest capture_request;
+	rts::render::RenderCaptureQueue capture_queue;
 	bool pending_viewport;
 	D3DVIEWPORT8 viewport;
 	bool pending_clear;
@@ -257,6 +275,19 @@ struct D3D11LegacyBridge::Impl
 	std::vector<BufferEntry> vertex_buffers;
 	std::vector<BufferEntry> index_buffers;
 	std::vector<TextureEntry> textures;
+
+	bool Require_Owner_Thread(const char *operation)
+	{
+		if (owner_thread_id == 0 || owner_thread_id ==
+			Current_D3D11_Bridge_Thread_Id())
+		{
+			return true;
+		}
+		Log("D3D11 legacy bridge owner-thread violation");
+		(void)operation;
+		abort();
+		return false;
+	}
 
 	void Log(const char *message)
 	{
@@ -302,6 +333,8 @@ struct D3D11LegacyBridge::Impl
 
 	RenderResult Recover_Device()
 	{
+		capture_queue.advanceGeneration();
+		capture_queue.cancelStale(rts::render::RENDER_RESULT_DEVICE_REMOVED);
 		const RenderResult recovery_result = device->recoverDevice();
 		if (recovery_result != rts::render::RENDER_RESULT_OK)
 		{
@@ -834,79 +867,57 @@ struct D3D11LegacyBridge::Impl
 		textures.clear();
 	}
 
-	RenderResult Capture_Requested_Frame()
+	static void Complete_Visual_Smoke(void *consumer,
+		const rts::render::RenderCaptureHandle *, unsigned int capture_width,
+		unsigned int capture_height, size_t row_pitch,
+		rts::render::RenderFormat format, const void *capture_pixels,
+		size_t pixel_bytes)
 	{
-		if (!capture_request.isRequested())
+		Impl *impl = static_cast<Impl *>(consumer);
+		remove(VISUAL_SMOKE_CAPTURE_SUCCESS_FILE);
+		if (impl == 0 || capture_pixels == 0 || format !=
+			rts::render::RENDER_FORMAT_B8G8R8A8_UNORM || capture_width == 0 ||
+		capture_height == 0 || capture_width > MAX_TGA_DIMENSION ||
+		capture_height > MAX_TGA_DIMENSION)
 		{
-			return rts::render::RENDER_RESULT_OK;
+			remove(VISUAL_SMOKE_CAPTURE_FILE);
+			return;
 		}
-		if (width == 0 || height == 0 || width > MAX_TGA_DIMENSION ||
-			height > MAX_TGA_DIMENSION)
+		size_t required_row_bytes = 0;
+		size_t required_bytes = 0;
+		if (!Checked_Multiply(static_cast<size_t>(capture_width), 4,
+			&required_row_bytes) || row_pitch < required_row_bytes ||
+			!Checked_Multiply(row_pitch, static_cast<size_t>(capture_height),
+			&required_bytes) || pixel_bytes < required_bytes)
 		{
-			Log("D3D11 requested frame capture has invalid TGA dimensions");
-			capture_request.recordFailure();
-			return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+			impl->Log("D3D11 visual smoke capture has invalid pixel bounds");
+			remove(VISUAL_SMOKE_CAPTURE_FILE);
+			return;
 		}
-		size_t row_pitch = 0;
-		size_t pixel_count = 0;
-		size_t pixel_bytes = 0;
-		if (!Checked_Multiply(static_cast<size_t>(width), 4, &row_pitch) ||
-			!Checked_Multiply(static_cast<size_t>(width),
-				static_cast<size_t>(height), &pixel_count) ||
-			!Checked_Multiply(pixel_count, 4, &pixel_bytes))
-		{
-			Log("D3D11 requested frame capture size arithmetic overflow");
-			capture_request.recordFailure();
-			return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
-		}
-		std::vector<unsigned char> pixels;
-		try
-		{
-			pixels.resize(pixel_bytes);
-		}
-		catch (...)
-		{
-			Log("D3D11 requested frame capture allocation failed");
-			capture_request.recordFailure();
-			return rts::render::RENDER_RESULT_OUT_OF_MEMORY;
-		}
-		rts::render::RenderFormat format = rts::render::RENDER_FORMAT_UNKNOWN;
-		const RenderResult capture_result = device->captureBackBuffer(
-			&pixels[0], pixels.size(), row_pitch, &format);
-		if (capture_result != rts::render::RENDER_RESULT_OK)
-		{
-			Log("D3D11 requested frame capture readback failed");
-			capture_request.recordFailure();
-			return capture_result;
-		}
-		if (format != rts::render::RENDER_FORMAT_B8G8R8A8_UNORM)
-		{
-			Log("D3D11 requested frame capture returned an unexpected format");
-			capture_request.recordFailure();
-			return rts::render::RENDER_RESULT_UNSUPPORTED;
-		}
-		FILE *file = fopen("D3D11RendererCapture.tga", "wb");
+		FILE *file = fopen(VISUAL_SMOKE_CAPTURE_FILE, "wb");
 		if (file == 0)
 		{
-			Log("D3D11 requested frame capture could not open its output");
-			capture_request.recordFailure();
-			return rts::render::RENDER_RESULT_FAILED;
+			impl->Log("D3D11 visual smoke capture could not open its output");
+			remove(VISUAL_SMOKE_CAPTURE_FILE);
+			return;
 		}
 		unsigned char header[18];
 		memset(header, 0, sizeof(header));
 		header[2] = 2;
-		header[12] = static_cast<unsigned char>(width & 0xff);
-		header[13] = static_cast<unsigned char>((width >> 8) & 0xff);
-		header[14] = static_cast<unsigned char>(height & 0xff);
-		header[15] = static_cast<unsigned char>((height >> 8) & 0xff);
+		header[12] = static_cast<unsigned char>(capture_width & 0xff);
+		header[13] = static_cast<unsigned char>((capture_width >> 8) & 0xff);
+		header[14] = static_cast<unsigned char>(capture_height & 0xff);
+		header[15] = static_cast<unsigned char>((capture_height >> 8) & 0xff);
 		header[16] = 24;
 		bool wrote_file = fwrite(header, 1, sizeof(header), file) ==
 			sizeof(header);
-		for (unsigned int row = height; wrote_file && row != 0; --row)
+		const unsigned char *pixels =
+			static_cast<const unsigned char *>(capture_pixels);
+		for (unsigned int row = capture_height; wrote_file && row != 0; --row)
 		{
-			const unsigned char *source = &pixels[
-				static_cast<size_t>(row - 1) * row_pitch];
-			for (unsigned int column = 0; column < width; ++column)
+			const unsigned char *source = pixels +
+				static_cast<size_t>(row - 1) * row_pitch;
+			for (unsigned int column = 0; column < capture_width; ++column)
 			{
 				const unsigned char *pixel = source + column * 4;
 				const unsigned char bgr[3] = { pixel[0], pixel[1], pixel[2] };
@@ -927,14 +938,50 @@ struct D3D11LegacyBridge::Impl
 		}
 		if (!wrote_file)
 		{
-			Log("D3D11 requested frame capture output was truncated");
-			remove("D3D11RendererCapture.tga");
-			capture_request.recordFailure();
-			return rts::render::RENDER_RESULT_FAILED;
+			impl->Log("D3D11 visual smoke capture output was truncated");
+			remove(VISUAL_SMOKE_CAPTURE_FILE);
+			remove(VISUAL_SMOKE_CAPTURE_SUCCESS_FILE);
+			return;
 		}
-		capture_request.recordSuccess();
-		Log("D3D11 requested frame captured before present");
-		return rts::render::RENDER_RESULT_OK;
+		FILE *marker = fopen(VISUAL_SMOKE_CAPTURE_SUCCESS_FILE, "wb");
+		if (marker == 0)
+		{
+			impl->Log("D3D11 visual smoke capture success marker could not be opened");
+			remove(VISUAL_SMOKE_CAPTURE_FILE);
+			remove(VISUAL_SMOKE_CAPTURE_SUCCESS_FILE);
+			return;
+		}
+		const char marker_text[] = "D3D11RendererCapture=complete\n";
+		bool marker_written = fwrite(marker_text, 1,
+			sizeof(marker_text) - 1, marker) == sizeof(marker_text) - 1;
+		if (marker_written && fflush(marker) != 0)
+		{
+			marker_written = false;
+		}
+		if (fclose(marker) != 0)
+		{
+			marker_written = false;
+		}
+		if (!marker_written)
+		{
+			impl->Log("D3D11 visual smoke capture success marker was truncated");
+			remove(VISUAL_SMOKE_CAPTURE_FILE);
+			remove(VISUAL_SMOKE_CAPTURE_SUCCESS_FILE);
+			return;
+		}
+		impl->Log("D3D11 visual smoke frame captured from the pre-Present back buffer");
+	}
+
+	static void Cancel_Visual_Smoke(void *consumer,
+		const rts::render::RenderCaptureHandle *, rts::render::RenderResult)
+	{
+		Impl *impl = static_cast<Impl *>(consumer);
+		remove(VISUAL_SMOKE_CAPTURE_SUCCESS_FILE);
+		remove(VISUAL_SMOKE_CAPTURE_FILE);
+		if (impl != 0)
+		{
+			impl->Log("D3D11 visual smoke capture was cancelled");
+		}
 	}
 };
 
@@ -964,6 +1011,14 @@ bool D3D11LegacyBridge::Initialize(HWND window,
 		m_impl->Log("D3D11 legacy bridge rejected initialization while active");
 		return false;
 	}
+	m_impl->owner_thread_id = Current_D3D11_Bridge_Thread_Id();
+	m_impl->capture_queue.shutdown(rts::render::RENDER_RESULT_FAILED);
+	if (!m_impl->capture_queue.bindOwnerThread())
+	{
+		m_impl->Log("D3D11 legacy bridge rejected initialization from a non-owner thread");
+		return false;
+	}
+	m_impl->capture_queue.reset();
 	if (window == 0 || legacy_device == 0 || width == 0 || height == 0)
 	{
 		m_impl->Log("D3D11 legacy bridge rejected invalid initialization state");
@@ -1034,15 +1089,16 @@ void D3D11LegacyBridge::Shutdown()
 	}
 	if (m_impl->device == 0)
 	{
+		m_impl->capture_queue.shutdown(rts::render::RENDER_RESULT_FAILED);
 		if (m_impl->log_file != 0)
 		{
 			fclose(m_impl->log_file);
 			m_impl->log_file = 0;
 		}
-		m_impl->capture_request.clear();
 		m_impl->frame_outcome = rts::render::RenderFrameOutcome();
 		return;
 	}
+	m_impl->Require_Owner_Thread("shutdown");
 	if (m_impl->frame_open)
 	{
 		if (m_impl->context != 0 && m_impl->device->isOperational())
@@ -1051,6 +1107,10 @@ void D3D11LegacyBridge::Shutdown()
 		}
 		m_impl->frame_open = false;
 	}
+	// Complete cancellation while the render owner, bridge log, and consumer
+	// objects are still alive. The queue is owner-thread bound, so this must
+	// happen before releasing the device and before closing the log.
+	m_impl->capture_queue.shutdown(rts::render::RENDER_RESULT_FAILED);
 	if (m_impl->log_file != 0)
 	{
 		fprintf(m_impl->log_file,
@@ -1079,10 +1139,10 @@ void D3D11LegacyBridge::Shutdown()
 	m_impl->frame_open = false;
 	m_impl->width = 0;
 	m_impl->height = 0;
-	m_impl->capture_request.clear();
 	m_impl->frame_outcome = rts::render::RenderFrameOutcome();
 	m_impl->pending_viewport = false;
 	m_impl->pending_clear = false;
+	m_impl->owner_thread_id = 0;
 }
 
 bool D3D11LegacyBridge::Is_Active() const
@@ -1160,8 +1220,54 @@ void D3D11LegacyBridge::Request_Frame_Capture()
 {
 	if (Is_Active())
 	{
-		m_impl->capture_request.request();
+		m_impl->Require_Owner_Thread("frame capture request");
+		remove(VISUAL_SMOKE_CAPTURE_SUCCESS_FILE);
+		remove(VISUAL_SMOKE_CAPTURE_FILE);
+		rts::render::RenderCaptureRequestDescriptor descriptor;
+		descriptor.kind = rts::render::RENDER_CAPTURE_VISUAL_SMOKE;
+		descriptor.consumer = m_impl;
+		descriptor.completed = &Impl::Complete_Visual_Smoke;
+		descriptor.cancelled = &Impl::Cancel_Visual_Smoke;
+		rts::render::RenderCaptureHandle handle;
+		const RenderResult result = m_impl->capture_queue.enqueue(descriptor,
+			&handle);
+		if (result != rts::render::RENDER_RESULT_OK)
+		{
+			m_impl->Log_Result("D3D11 visual smoke capture queue rejected request",
+				result);
+		}
 	}
+}
+
+RenderResult D3D11LegacyBridge::Get_Back_Buffer_Info(
+	rts::render::RenderBackBufferInfo *info) const
+{
+	if (!Is_Active() || info == 0)
+	{
+		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	return m_impl->device->getBackBufferInfo(info);
+}
+
+RenderResult D3D11LegacyBridge::Queue_Back_Buffer_Capture(
+	const rts::render::RenderCaptureRequestDescriptor &descriptor,
+	rts::render::RenderCaptureHandle *handle)
+{
+	if (!Is_Active())
+	{
+		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	return m_impl->capture_queue.enqueue(descriptor, handle);
+}
+
+unsigned int D3D11LegacyBridge::Cancel_Back_Buffer_Captures(void *consumer,
+	rts::render::RenderResult reason)
+{
+	if (m_impl == 0)
+	{
+		return 0;
+	}
+	return m_impl->capture_queue.cancelConsumer(consumer, reason);
 }
 
 RenderResult D3D11LegacyBridge::End_Frame(bool present_frame)
@@ -1216,6 +1322,7 @@ RenderResult D3D11LegacyBridge::End_Frame(bool present_frame,
 	}
 	if (end_result != rts::render::RENDER_RESULT_OK)
 	{
+		m_impl->capture_queue.cancelCurrent(end_result);
 		m_impl->frame_outcome.setOperational(Is_Active());
 		if (outcome != 0)
 		{
@@ -1225,8 +1332,8 @@ RenderResult D3D11LegacyBridge::End_Frame(bool present_frame,
 	}
 	if (!present_frame)
 	{
-		// A render-to-texture or otherwise non-visible pass must not consume the
-		// one-shot diagnostic request.
+		// A render-to-texture or otherwise non-visible pass must not consume a
+		// visible-frame capture request.
 		m_impl->frame_outcome.setOperational(Is_Active());
 		if (outcome != 0)
 		{
@@ -1235,10 +1342,53 @@ RenderResult D3D11LegacyBridge::End_Frame(bool present_frame,
 		return m_impl->frame_outcome.result();
 	}
 	// Flip-discard may expose a different/undefined back buffer after Present.
-	// Capture while the completed visible frame is still current, before Present.
-	// Capture failures are diagnostic-only: the request retries independently and
-	// the rendered frame still returns the presentation result.
-	m_impl->Capture_Requested_Frame();
+	// Capture while the completed visible frame is still current, then fulfill
+	// all queued consumers after Present on this owner thread.
+	rts::render::RenderBackBufferInfo capture_info;
+	std::vector<unsigned char> capture_pixels;
+	bool capture_ready = false;
+	RenderResult info_result = rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	if (m_impl->capture_queue.pendingCount() != 0)
+	{
+		info_result = m_impl->device->getBackBufferInfo(
+			&capture_info);
+		if (info_result == rts::render::RENDER_RESULT_OK &&
+			capture_info.format == rts::render::RENDER_FORMAT_B8G8R8A8_UNORM)
+		{
+			size_t row_pitch = 0;
+			size_t pixel_bytes = 0;
+			if (Checked_Multiply(static_cast<size_t>(capture_info.width), 4,
+				&row_pitch) && Checked_Multiply(row_pitch,
+				static_cast<size_t>(capture_info.height), &pixel_bytes))
+			{
+				try
+				{
+					capture_pixels.resize(pixel_bytes);
+					const RenderResult capture_result =
+						m_impl->device->captureBackBuffer(
+							&capture_pixels[0], capture_pixels.size(), row_pitch,
+							&capture_info.format);
+					capture_ready = capture_result ==
+						rts::render::RENDER_RESULT_OK;
+					if (!capture_ready)
+					{
+						m_impl->Log_Result(
+							"D3D11 visible capture readback failed", capture_result);
+					}
+				}
+				catch (...)
+				{
+					m_impl->Log("D3D11 visible capture allocation failed");
+				}
+			}
+		}
+		if (!capture_ready)
+		{
+			m_impl->capture_queue.cancelCurrent(
+				info_result == rts::render::RENDER_RESULT_OK ?
+					rts::render::RENDER_RESULT_FAILED : info_result);
+		}
+	}
 	const RenderResult present_result = m_impl->device->present();
 	m_impl->frame_outcome.recordPresentation(present_result);
 	if (present_result == rts::render::RENDER_RESULT_DEVICE_REMOVED)
@@ -1268,6 +1418,7 @@ RenderResult D3D11LegacyBridge::End_Frame(bool present_frame,
 	}
 	if (present_result != rts::render::RENDER_RESULT_OK)
 	{
+		m_impl->capture_queue.cancelCurrent(present_result);
 		m_impl->Log_Result("D3D11 legacy bridge present failed", present_result);
 		m_impl->frame_outcome.setOperational(Is_Active());
 		if (outcome != 0)
@@ -1277,6 +1428,20 @@ RenderResult D3D11LegacyBridge::End_Frame(bool present_frame,
 		return m_impl->frame_outcome.result();
 	}
 	m_impl->frame_outcome.markPresented();
+	if (capture_ready)
+	{
+		const size_t row_pitch = static_cast<size_t>(capture_info.width) * 4;
+		const RenderResult completion_result = m_impl->capture_queue.completeVisible(
+			capture_info.width,
+			capture_info.height, row_pitch, capture_info.format,
+			&capture_pixels[0], capture_pixels.size());
+		if (completion_result != rts::render::RENDER_RESULT_OK)
+		{
+			m_impl->capture_queue.cancelCurrent(completion_result);
+			m_impl->Log_Result("D3D11 visible capture completion rejected",
+				completion_result);
+		}
+	}
 	if (m_impl->frame_outcome.hasCommandFailure())
 	{
 		m_impl->Log_Result(
@@ -1464,6 +1629,8 @@ RenderResult D3D11LegacyBridge::Resize(unsigned int width, unsigned int height)
 	{
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 	}
+	m_impl->capture_queue.advanceGeneration();
+	m_impl->capture_queue.cancelStale(rts::render::RENDER_RESULT_FAILED);
 	const RenderResult result = m_impl->device->resize(width, height);
 	if (result != rts::render::RENDER_RESULT_OK)
 	{
@@ -1512,6 +1679,22 @@ void D3D11LegacyBridge::Shutdown() {}
 bool D3D11LegacyBridge::Is_Active() const { return false; }
 bool D3D11LegacyBridge::Begin_Frame() { return false; }
 void D3D11LegacyBridge::Request_Frame_Capture() {}
+rts::render::RenderResult D3D11LegacyBridge::Get_Back_Buffer_Info(
+	rts::render::RenderBackBufferInfo *) const
+{
+	return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+}
+rts::render::RenderResult D3D11LegacyBridge::Queue_Back_Buffer_Capture(
+	const rts::render::RenderCaptureRequestDescriptor &,
+	rts::render::RenderCaptureHandle *)
+{
+	return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+}
+unsigned int D3D11LegacyBridge::Cancel_Back_Buffer_Captures(void *,
+	rts::render::RenderResult)
+{
+	return 0;
+}
 rts::render::RenderResult D3D11LegacyBridge::End_Frame(bool)
 {
 	return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
