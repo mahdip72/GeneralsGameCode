@@ -74,25 +74,45 @@ bool ParseRenderBackend(const char *name, RenderBackend *backend)
 }
 
 RenderFrameFailureLatch::RenderFrameFailureLatch() :
-	m_failed(false), m_result(RENDER_RESULT_OK)
+	m_failed(false), m_deviceRemoved(false), m_result(RENDER_RESULT_OK),
+	m_commandResult(RENDER_RESULT_OK)
 {
 }
 
 bool RenderFrameFailureLatch::record(RenderResult result)
 {
-	if (result == RENDER_RESULT_OK || m_failed)
+	if (result == RENDER_RESULT_OK)
 	{
 		return false;
 	}
-	m_failed = true;
-	m_result = result;
-	return true;
+	bool newlyRecorded = false;
+	if (!m_failed)
+	{
+		m_failed = true;
+		m_result = result;
+		newlyRecorded = true;
+	}
+	if (result == RENDER_RESULT_DEVICE_REMOVED)
+	{
+		if (!m_deviceRemoved)
+		{
+			m_deviceRemoved = true;
+			newlyRecorded = true;
+		}
+	}
+	else if (m_commandResult == RENDER_RESULT_OK)
+	{
+		m_commandResult = result;
+	}
+	return newlyRecorded;
 }
 
 void RenderFrameFailureLatch::reset()
 {
 	m_failed = false;
+	m_deviceRemoved = false;
 	m_result = RENDER_RESULT_OK;
+	m_commandResult = RENDER_RESULT_OK;
 }
 
 bool RenderFrameFailureLatch::hasFailure() const
@@ -100,9 +120,152 @@ bool RenderFrameFailureLatch::hasFailure() const
 	return m_failed;
 }
 
+bool RenderFrameFailureLatch::hasDeviceRemoval() const
+{
+	return m_deviceRemoved;
+}
+
 RenderResult RenderFrameFailureLatch::result() const
 {
-	return m_result;
+	return m_deviceRemoved ? RENDER_RESULT_DEVICE_REMOVED : m_result;
+}
+
+RenderResult RenderFrameFailureLatch::commandResult() const
+{
+	return m_commandResult != RENDER_RESULT_OK ? m_commandResult : m_result;
+}
+
+RenderFrameOutcome::RenderFrameOutcome() :
+	m_commandFailure(), m_endFrameResult(RENDER_RESULT_OK),
+	m_presentationResult(RENDER_RESULT_OK),
+	m_recoveryResult(RENDER_RESULT_OK), m_deviceRemoved(false),
+	m_frameEnded(false), m_presented(false), m_operational(true)
+{
+}
+
+bool RenderFrameOutcome::recordCommandFailure(RenderResult result)
+{
+	if (result == RENDER_RESULT_DEVICE_REMOVED)
+	{
+		m_deviceRemoved = true;
+	}
+	return m_commandFailure.record(result);
+}
+
+void RenderFrameOutcome::recordEndFrame(RenderResult result)
+{
+	m_endFrameResult = result;
+	if (result == RENDER_RESULT_DEVICE_REMOVED)
+	{
+		m_deviceRemoved = true;
+	}
+}
+
+void RenderFrameOutcome::recordPresentation(RenderResult result)
+{
+	m_presentationResult = result;
+	if (result == RENDER_RESULT_DEVICE_REMOVED)
+	{
+		m_deviceRemoved = true;
+	}
+}
+
+void RenderFrameOutcome::recordRecovery(RenderResult result)
+{
+	m_recoveryResult = result;
+	if (result == RENDER_RESULT_DEVICE_REMOVED)
+	{
+		m_deviceRemoved = true;
+	}
+}
+
+void RenderFrameOutcome::markFrameEnded()
+{
+	m_frameEnded = true;
+}
+
+void RenderFrameOutcome::markPresented()
+{
+	m_presented = true;
+}
+
+void RenderFrameOutcome::setOperational(bool operational)
+{
+	m_operational = operational;
+}
+
+bool RenderFrameOutcome::hasCommandFailure() const
+{
+	return m_commandFailure.hasFailure();
+}
+
+bool RenderFrameOutcome::hasLifecycleFailure() const
+{
+	return m_endFrameResult != RENDER_RESULT_OK ||
+		m_presentationResult != RENDER_RESULT_OK ||
+		m_recoveryResult != RENDER_RESULT_OK;
+}
+
+bool RenderFrameOutcome::hasDeviceRemoval() const
+{
+	return m_deviceRemoved || m_commandFailure.hasDeviceRemoval();
+}
+
+bool RenderFrameOutcome::wasPresented() const
+{
+	return m_presented;
+}
+
+bool RenderFrameOutcome::frameEnded() const
+{
+	return m_frameEnded;
+}
+
+bool RenderFrameOutcome::isOperational() const
+{
+	return m_operational;
+}
+
+RenderResult RenderFrameOutcome::commandResult() const
+{
+	return m_commandFailure.hasDeviceRemoval() ?
+		m_commandFailure.commandResult() : m_commandFailure.result();
+}
+
+RenderResult RenderFrameOutcome::endFrameResult() const
+{
+	return m_endFrameResult;
+}
+
+RenderResult RenderFrameOutcome::presentationResult() const
+{
+	return m_presentationResult;
+}
+
+RenderResult RenderFrameOutcome::recoveryResult() const
+{
+	return m_recoveryResult;
+}
+
+RenderResult RenderFrameOutcome::result() const
+{
+	if (hasDeviceRemoval())
+	{
+		return RENDER_RESULT_DEVICE_REMOVED;
+	}
+	if (m_recoveryResult != RENDER_RESULT_OK)
+	{
+		return m_recoveryResult;
+	}
+	if (m_presentationResult != RENDER_RESULT_OK)
+	{
+		return m_presentationResult;
+	}
+	if (m_endFrameResult != RENDER_RESULT_OK)
+	{
+		return m_endFrameResult;
+	}
+	return m_commandFailure.result();
 }
 
 RenderCaptureRequest::RenderCaptureRequest() :

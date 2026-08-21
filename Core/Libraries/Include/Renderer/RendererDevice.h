@@ -161,11 +161,55 @@ public:
 	bool record(RenderResult result);
 	void reset();
 	bool hasFailure() const;
+	bool hasDeviceRemoval() const;
 	RenderResult result() const;
+	RenderResult commandResult() const;
 
 private:
 	bool m_failed;
+	bool m_deviceRemoved;
 	RenderResult m_result;
+	RenderResult m_commandResult;
+};
+
+// Separates owner-thread command failures from frame teardown and presentation
+// state. A command failure may still produce a visible partial frame; callers
+// must use presentationResult()/wasPresented() when deciding whether the
+// presentation path is healthy.
+class RenderFrameOutcome
+{
+public:
+	RenderFrameOutcome();
+
+	bool recordCommandFailure(RenderResult result);
+	void recordEndFrame(RenderResult result);
+	void recordPresentation(RenderResult result);
+	void recordRecovery(RenderResult result);
+	void markFrameEnded();
+	void markPresented();
+	void setOperational(bool operational);
+
+	bool hasCommandFailure() const;
+	bool hasLifecycleFailure() const;
+	bool hasDeviceRemoval() const;
+	bool wasPresented() const;
+	bool frameEnded() const;
+	bool isOperational() const;
+	RenderResult commandResult() const;
+	RenderResult endFrameResult() const;
+	RenderResult presentationResult() const;
+	RenderResult recoveryResult() const;
+	RenderResult result() const;
+
+private:
+	RenderFrameFailureLatch m_commandFailure;
+	RenderResult m_endFrameResult;
+	RenderResult m_presentationResult;
+	RenderResult m_recoveryResult;
+	bool m_deviceRemoved;
+	bool m_frameEnded;
+	bool m_presented;
+	bool m_operational;
 };
 
 // Keeps a diagnostic capture request alive across non-visible frames and
@@ -288,6 +332,7 @@ class IRenderDevice
 public:
 	virtual ~IRenderDevice() {}
 	virtual RenderBackend backend() const = 0;
+	virtual bool isOperational() const = 0;
 	virtual RenderResult initialize(const RenderDeviceParameters &parameters) = 0;
 	virtual void shutdown() = 0;
 	virtual IRenderContext *immediateContext() = 0;

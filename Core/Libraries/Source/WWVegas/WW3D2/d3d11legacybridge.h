@@ -19,6 +19,8 @@ public:
 	bool Begin_Frame();
 	void Request_Frame_Capture();
 	rts::render::RenderResult End_Frame(bool present_frame);
+	rts::render::RenderResult End_Frame(bool present_frame,
+		rts::render::RenderFrameOutcome *outcome);
 	void Clear(bool clear_color, bool clear_depth_stencil,
 		float red, float green, float blue, float alpha,
 		float depth, unsigned int stencil);

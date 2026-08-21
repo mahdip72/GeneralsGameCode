@@ -1733,11 +1733,14 @@ void DX8Wrapper::End_Scene(bool flip_frames)
 	DX8CALL(EndScene());
 
 	DX8WebBrowser::Render(0);
+	const bool d3d11_frame_active = _D3D11Bridge.Is_Active();
 	rts::render::RenderResult d3d11_frame_result =
 		rts::render::RENDER_RESULT_OK;
-	if (_D3D11Bridge.Is_Active())
+	rts::render::RenderFrameOutcome d3d11_frame_outcome;
+	if (d3d11_frame_active)
 	{
-		d3d11_frame_result = _D3D11Bridge.End_Frame(flip_frames);
+		d3d11_frame_result = _D3D11Bridge.End_Frame(flip_frames,
+			&d3d11_frame_outcome);
 	}
 
 	if (flip_frames) {
@@ -1748,12 +1751,18 @@ void DX8Wrapper::End_Scene(bool flip_frames)
 			hr=_Get_D3D_Device8()->Present(nullptr, nullptr, nullptr, nullptr);
 		}
 		else {
-			hr = d3d11_frame_result == rts::render::RENDER_RESULT_OK ?
-				D3D_OK : E_FAIL;
+			hr = d3d11_frame_outcome.wasPresented() &&
+				d3d11_frame_outcome.presentationResult() ==
+					rts::render::RENDER_RESULT_OK ? D3D_OK : E_FAIL;
 			if (d3d11_frame_result != rts::render::RENDER_RESULT_OK)
 			{
 				WWDEBUG_SAY(("D3D11 renderer frame failed: %d",
 					static_cast<int>(d3d11_frame_result)));
+			}
+			if (d3d11_frame_outcome.hasCommandFailure())
+			{
+				WWDEBUG_SAY(("D3D11 renderer command failure was reported after frame completion: %d",
+					static_cast<int>(d3d11_frame_outcome.commandResult())));
 			}
 		}
 
@@ -1791,11 +1800,20 @@ void DX8Wrapper::End_Scene(bool flip_frames)
 			}
 		}
 	}
-	else if (d3d11_frame_result != rts::render::RENDER_RESULT_OK)
+	else if (d3d11_frame_active &&
+		(!d3d11_frame_outcome.isOperational() ||
+			d3d11_frame_outcome.hasDeviceRemoval() ||
+			d3d11_frame_outcome.hasLifecycleFailure()))
 	{
 		WWDEBUG_SAY(("D3D11 renderer frame failed without present: %d",
 			static_cast<int>(d3d11_frame_result)));
 		IsDeviceLost = true;
+	}
+	else if (d3d11_frame_active)
+	{
+		// A non-device command failure is observable in the frame outcome but does
+		// not make the device unavailable for the next visible frame.
+		IsDeviceLost = false;
 	}
 
 	// Each frame, release all of the buffers and textures.

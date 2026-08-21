@@ -225,7 +225,7 @@ struct D3D11LegacyBridge::Impl
 
 	Impl() : device(0), context(0), legacy_device(0), frame_open(false),
 		log_file(0), frame_id(0), draw_count(0), draw_failure_count(0),
-		width(0), height(0), frame_failure(), capture_request(),
+		width(0), height(0), frame_outcome(), capture_request(),
 		pending_viewport(false), pending_clear(false),
 		pending_clear_color(false), pending_clear_depth_stencil(false),
 		pending_red(0.0f), pending_green(0.0f), pending_blue(0.0f),
@@ -241,7 +241,7 @@ struct D3D11LegacyBridge::Impl
 	unsigned int draw_failure_count;
 	unsigned int width;
 	unsigned int height;
-	rts::render::RenderFrameFailureLatch frame_failure;
+	rts::render::RenderFrameOutcome frame_outcome;
 	rts::render::RenderCaptureRequest capture_request;
 	bool pending_viewport;
 	D3DVIEWPORT8 viewport;
@@ -281,18 +281,35 @@ struct D3D11LegacyBridge::Impl
 		{
 			return true;
 		}
-		if (frame_failure.record(result))
+		if (frame_outcome.recordCommandFailure(result))
 		{
 			Log_Result(message, result);
 		}
 		return false;
 	}
 
-	bool Fail(const char *message)
+	bool Fail(RenderResult result, const char *message)
 	{
 		++draw_failure_count;
-		Record_Result(rts::render::RENDER_RESULT_FAILED, message);
+		Record_Result(result, message);
 		return false;
+	}
+
+	bool Fail(const char *message)
+	{
+		return Fail(rts::render::RENDER_RESULT_FAILED, message);
+	}
+
+	RenderResult Recover_Device()
+	{
+		const RenderResult recovery_result = device->recoverDevice();
+		if (recovery_result != rts::render::RENDER_RESULT_OK)
+		{
+			return recovery_result;
+		}
+		context = device->immediateContext();
+		return context == 0 ? rts::render::RENDER_RESULT_FAILED :
+			rts::render::RENDER_RESULT_OK;
 	}
 
 	BufferEntry *Find_Buffer(std::vector<BufferEntry> &entries,
@@ -423,11 +440,13 @@ struct D3D11LegacyBridge::Impl
 			descriptor.stride = vertex_buffer->FVF_Info().Get_FVF_Size();
 			descriptor.binding = rts::render::RENDER_BUFFER_VERTEX;
 			descriptor.usage = rts::render::RENDER_USAGE_DYNAMIC;
-			if (device->createBuffer(descriptor, 0, 0, &new_entry.handle) !=
-				rts::render::RENDER_RESULT_OK)
+			const RenderResult create_result = device->createBuffer(descriptor,
+				0, 0, &new_entry.handle);
+			if (create_result != rts::render::RENDER_RESULT_OK)
 			{
 				new_entry.source->Release();
-				return Fail("draw failure: D3D11 vertex buffer creation");
+				return Fail(create_result,
+					"draw failure: D3D11 vertex buffer creation");
 			}
 			try
 			{
@@ -457,7 +476,8 @@ struct D3D11LegacyBridge::Impl
 		source->Unlock();
 		if (upload_result != rts::render::RENDER_RESULT_OK)
 		{
-			return Fail("draw failure: D3D11 vertex buffer upload");
+			return Fail(upload_result,
+				"draw failure: D3D11 vertex buffer upload");
 		}
 		*handle = entry->handle;
 		return true;
@@ -492,11 +512,13 @@ struct D3D11LegacyBridge::Impl
 			descriptor.stride = sizeof(unsigned short);
 			descriptor.binding = rts::render::RENDER_BUFFER_INDEX;
 			descriptor.usage = rts::render::RENDER_USAGE_DYNAMIC;
-			if (device->createBuffer(descriptor, 0, 0, &new_entry.handle) !=
-				rts::render::RENDER_RESULT_OK)
+			const RenderResult create_result = device->createBuffer(descriptor,
+				0, 0, &new_entry.handle);
+			if (create_result != rts::render::RENDER_RESULT_OK)
 			{
 				new_entry.source->Release();
-				return Fail("draw failure: D3D11 index buffer creation");
+				return Fail(create_result,
+					"draw failure: D3D11 index buffer creation");
 			}
 			try
 			{
@@ -526,7 +548,8 @@ struct D3D11LegacyBridge::Impl
 		source->Unlock();
 		if (upload_result != rts::render::RENDER_RESULT_OK)
 		{
-			return Fail("draw failure: D3D11 index buffer upload");
+			return Fail(upload_result,
+				"draw failure: D3D11 index buffer upload");
 		}
 		*handle = entry->handle;
 		return true;
@@ -576,8 +599,12 @@ struct D3D11LegacyBridge::Impl
 	}
 
 	bool Create_Texture(IDirect3DBaseTexture8 *source, GpuHandle *handle,
-		bool *render_target)
+		bool *render_target, RenderResult *failure_result)
 	{
+		if (failure_result != 0)
+		{
+			*failure_result = rts::render::RENDER_RESULT_FAILED;
+		}
 		if (source == 0 || handle == 0 || render_target == 0)
 		{
 			return false;
@@ -688,9 +715,14 @@ struct D3D11LegacyBridge::Impl
 		{
 			return false;
 		}
-		return device->createTexture(descriptor, &subresources[0],
-			static_cast<unsigned int>(subresources.size()), handle) ==
-			rts::render::RENDER_RESULT_OK;
+		const RenderResult create_result = device->createTexture(descriptor,
+			&subresources[0], static_cast<unsigned int>(subresources.size()),
+			handle);
+		if (failure_result != 0)
+		{
+			*failure_result = create_result;
+		}
+		return create_result == rts::render::RENDER_RESULT_OK;
 	}
 
 	bool Bind_Texture(unsigned int stage, IDirect3DBaseTexture8 *source,
@@ -699,8 +731,12 @@ struct D3D11LegacyBridge::Impl
 		if (source == 0)
 		{
 			*handle = GpuHandle();
-			return context->setTexture(stage, *handle) ==
-				rts::render::RENDER_RESULT_OK;
+			const RenderResult bind_result = context->setTexture(stage, *handle);
+			if (bind_result != rts::render::RENDER_RESULT_OK)
+			{
+				Fail(bind_result, "draw failure: D3D11 texture unbind");
+			}
+			return bind_result == rts::render::RENDER_RESULT_OK;
 		}
 		TextureEntry *entry = 0;
 		for (unsigned int index = 0; index < textures.size(); ++index)
@@ -716,8 +752,11 @@ struct D3D11LegacyBridge::Impl
 		{
 			device->destroyResource(entry->handle);
 			entry->handle = GpuHandle();
-			if (!Create_Texture(source, &entry->handle, &entry->render_target))
+			RenderResult texture_result = rts::render::RENDER_RESULT_FAILED;
+			if (!Create_Texture(source, &entry->handle, &entry->render_target,
+				&texture_result))
 			{
+				Fail(texture_result, "draw failure: D3D11 render-target texture conversion");
 				return false;
 			}
 		}
@@ -731,10 +770,12 @@ struct D3D11LegacyBridge::Impl
 			new_entry.source = source;
 			new_entry.source->AddRef();
 			new_entry.last_used_frame = frame_id;
+			RenderResult texture_result = rts::render::RENDER_RESULT_FAILED;
 			if (!Create_Texture(source, &new_entry.handle,
-				&new_entry.render_target))
+				&new_entry.render_target, &texture_result))
 			{
 				new_entry.source->Release();
+				Fail(texture_result, "draw failure: D3D11 texture conversion");
 				return false;
 			}
 			try
@@ -745,30 +786,47 @@ struct D3D11LegacyBridge::Impl
 			{
 				device->destroyResource(new_entry.handle);
 				new_entry.source->Release();
+				Fail(rts::render::RENDER_RESULT_OUT_OF_MEMORY,
+					"draw failure: texture cache allocation");
 				return false;
 			}
 			entry = &textures.back();
 		}
 		*handle = entry->handle;
-		return context->setTexture(stage, entry->handle) ==
-			rts::render::RENDER_RESULT_OK;
+		const RenderResult bind_result = context->setTexture(stage, entry->handle);
+		if (bind_result != rts::render::RENDER_RESULT_OK)
+		{
+			Fail(bind_result, "draw failure: D3D11 texture binding");
+		}
+		return bind_result == rts::render::RENDER_RESULT_OK;
 	}
 
 	void Release_Caches()
 	{
+		const bool release_native_resources = device != 0 &&
+			device->isOperational();
 		for (unsigned int index = 0; index < vertex_buffers.size(); ++index)
 		{
-			device->destroyResource(vertex_buffers[index].handle);
+			if (release_native_resources)
+			{
+				device->destroyResource(vertex_buffers[index].handle);
+			}
 			vertex_buffers[index].source->Release();
 		}
 		for (unsigned int index = 0; index < index_buffers.size(); ++index)
 		{
-			device->destroyResource(index_buffers[index].handle);
+			if (release_native_resources)
+			{
+				device->destroyResource(index_buffers[index].handle);
+			}
 			index_buffers[index].source->Release();
 		}
 		for (unsigned int index = 0; index < textures.size(); ++index)
 		{
-			device->destroyResource(textures[index].handle);
+			if (release_native_resources)
+			{
+				device->destroyResource(textures[index].handle);
+			}
 			textures[index].source->Release();
 		}
 		vertex_buffers.clear();
@@ -982,12 +1040,12 @@ void D3D11LegacyBridge::Shutdown()
 			m_impl->log_file = 0;
 		}
 		m_impl->capture_request.clear();
-		m_impl->frame_failure.reset();
+		m_impl->frame_outcome = rts::render::RenderFrameOutcome();
 		return;
 	}
 	if (m_impl->frame_open)
 	{
-		if (m_impl->context != 0)
+		if (m_impl->context != 0 && m_impl->device->isOperational())
 		{
 			m_impl->context->endFrame();
 		}
@@ -1022,14 +1080,15 @@ void D3D11LegacyBridge::Shutdown()
 	m_impl->width = 0;
 	m_impl->height = 0;
 	m_impl->capture_request.clear();
-	m_impl->frame_failure.reset();
+	m_impl->frame_outcome = rts::render::RenderFrameOutcome();
 	m_impl->pending_viewport = false;
 	m_impl->pending_clear = false;
 }
 
 bool D3D11LegacyBridge::Is_Active() const
 {
-	return m_impl != 0 && m_impl->device != 0;
+	return m_impl != 0 && m_impl->device != 0 &&
+		m_impl->context != 0 && m_impl->device->isOperational();
 }
 
 bool D3D11LegacyBridge::Begin_Frame()
@@ -1050,7 +1109,7 @@ bool D3D11LegacyBridge::Begin_Frame()
 		m_impl->Log("D3D11 legacy bridge begin-frame failed");
 		return false;
 	}
-	m_impl->frame_failure.reset();
+	m_impl->frame_outcome = rts::render::RenderFrameOutcome();
 	if (m_impl->pending_viewport)
 	{
 		const RenderResult viewport_result = m_impl->context->setViewport(
@@ -1107,52 +1166,129 @@ void D3D11LegacyBridge::Request_Frame_Capture()
 
 RenderResult D3D11LegacyBridge::End_Frame(bool present_frame)
 {
+	return End_Frame(present_frame, 0);
+}
+
+RenderResult D3D11LegacyBridge::End_Frame(bool present_frame,
+	rts::render::RenderFrameOutcome *outcome)
+{
 	if (!Is_Active() || !m_impl->frame_open)
 	{
+		if (outcome != 0)
+		{
+			*outcome = rts::render::RenderFrameOutcome();
+			outcome->setOperational(Is_Active());
+		}
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	const RenderResult end_result = m_impl->context->endFrame();
 	m_impl->frame_open = false;
+	m_impl->frame_outcome.recordEndFrame(end_result);
+	m_impl->frame_outcome.markFrameEnded();
 	if (end_result != rts::render::RENDER_RESULT_OK)
 	{
-		m_impl->Record_Result(end_result,
-			"D3D11 legacy bridge end-frame failed");
-		return m_impl->frame_failure.hasFailure() ?
-			m_impl->frame_failure.result() : end_result;
+		m_impl->Log_Result("D3D11 legacy bridge end-frame failed", end_result);
 	}
-	if (m_impl->frame_failure.hasFailure())
+	if (m_impl->frame_outcome.hasDeviceRemoval())
 	{
-		return m_impl->frame_failure.result();
+		const RenderResult recovery_result = m_impl->Recover_Device();
+		m_impl->frame_outcome.recordRecovery(recovery_result);
+		if (recovery_result != rts::render::RENDER_RESULT_OK)
+		{
+			m_impl->Log_Result(
+				"D3D11 legacy bridge device recovery failed", recovery_result);
+			m_impl->frame_outcome.setOperational(false);
+			const RenderResult frame_result = m_impl->frame_outcome.result();
+			if (outcome != 0)
+			{
+				*outcome = m_impl->frame_outcome;
+			}
+			Shutdown();
+			return frame_result;
+		}
+		m_impl->frame_outcome.setOperational(Is_Active());
+		m_impl->Log("D3D11 legacy bridge recovered after a device-removal command");
+		if (outcome != 0)
+		{
+			*outcome = m_impl->frame_outcome;
+		}
+		return m_impl->frame_outcome.result();
+	}
+	if (end_result != rts::render::RENDER_RESULT_OK)
+	{
+		m_impl->frame_outcome.setOperational(Is_Active());
+		if (outcome != 0)
+		{
+			*outcome = m_impl->frame_outcome;
+		}
+		return m_impl->frame_outcome.result();
 	}
 	if (!present_frame)
 	{
 		// A render-to-texture or otherwise non-visible pass must not consume the
 		// one-shot diagnostic request.
-		return rts::render::RENDER_RESULT_OK;
+		m_impl->frame_outcome.setOperational(Is_Active());
+		if (outcome != 0)
+		{
+			*outcome = m_impl->frame_outcome;
+		}
+		return m_impl->frame_outcome.result();
 	}
 	// Flip-discard may expose a different/undefined back buffer after Present.
 	// Capture while the completed visible frame is still current, before Present.
 	// Capture failures are diagnostic-only: the request retries independently and
 	// the rendered frame still returns the presentation result.
 	m_impl->Capture_Requested_Frame();
-	const rts::render::RenderResult result = m_impl->device->present();
-	if (result == rts::render::RENDER_RESULT_DEVICE_REMOVED)
+	const RenderResult present_result = m_impl->device->present();
+	m_impl->frame_outcome.recordPresentation(present_result);
+	if (present_result == rts::render::RENDER_RESULT_DEVICE_REMOVED)
 	{
-		const RenderResult recovery_result = m_impl->device->recoverDevice();
+		const RenderResult recovery_result = m_impl->Recover_Device();
+		m_impl->frame_outcome.recordRecovery(recovery_result);
 		if (recovery_result != rts::render::RENDER_RESULT_OK)
 		{
-			m_impl->Log("D3D11 legacy bridge device recovery failed");
-			return recovery_result;
+			m_impl->Log_Result(
+				"D3D11 legacy bridge device recovery failed", recovery_result);
+			m_impl->frame_outcome.setOperational(false);
+			const RenderResult frame_result = m_impl->frame_outcome.result();
+			if (outcome != 0)
+			{
+				*outcome = m_impl->frame_outcome;
+			}
+			Shutdown();
+			return frame_result;
 		}
+		m_impl->frame_outcome.setOperational(Is_Active());
 		m_impl->Log("D3D11 legacy bridge recovered the device after present");
-		return result;
+		if (outcome != 0)
+		{
+			*outcome = m_impl->frame_outcome;
+		}
+		return m_impl->frame_outcome.result();
 	}
-	if (result != rts::render::RENDER_RESULT_OK)
+	if (present_result != rts::render::RENDER_RESULT_OK)
 	{
-		m_impl->Log("D3D11 legacy bridge present failed");
-		return result;
+		m_impl->Log_Result("D3D11 legacy bridge present failed", present_result);
+		m_impl->frame_outcome.setOperational(Is_Active());
+		if (outcome != 0)
+		{
+			*outcome = m_impl->frame_outcome;
+		}
+		return m_impl->frame_outcome.result();
 	}
-	return rts::render::RENDER_RESULT_OK;
+	m_impl->frame_outcome.markPresented();
+	if (m_impl->frame_outcome.hasCommandFailure())
+	{
+		m_impl->Log_Result(
+			"D3D11 legacy bridge presented a partial frame after a command failure",
+			m_impl->frame_outcome.commandResult());
+	}
+	m_impl->frame_outcome.setOperational(Is_Active());
+	if (outcome != 0)
+	{
+		*outcome = m_impl->frame_outcome;
+	}
+	return m_impl->frame_outcome.result();
 }
 
 void D3D11LegacyBridge::Clear(bool clear_color, bool clear_depth_stencil,
@@ -1284,28 +1420,35 @@ bool D3D11LegacyBridge::Draw(VertexBufferClass *vertex_buffer,
 			message[used] = '\0';
 		}
 		Append_Layout_Diagnostic(message, sizeof(message), &used, layout);
-		return m_impl->Fail(message);
+		return m_impl->Fail(state_result, message);
 	}
-	if (m_impl->context->setVertexBuffer(vertex_handle, layout.stride, 0) !=
-		rts::render::RENDER_RESULT_OK)
+	const RenderResult vertex_bind_result = m_impl->context->setVertexBuffer(
+		vertex_handle, layout.stride, 0);
+	if (vertex_bind_result != rts::render::RENDER_RESULT_OK)
 	{
-		return m_impl->Fail("draw failure: D3D11 vertex buffer binding");
+		return m_impl->Fail(vertex_bind_result,
+			"draw failure: D3D11 vertex buffer binding");
 	}
-	if (m_impl->context->setIndexBuffer(index_handle,
-		rts::render::RENDER_FORMAT_R16_UINT, 0) !=
-		rts::render::RENDER_RESULT_OK)
+	const RenderResult index_bind_result = m_impl->context->setIndexBuffer(
+		index_handle, rts::render::RENDER_FORMAT_R16_UINT, 0);
+	if (index_bind_result != rts::render::RENDER_RESULT_OK)
 	{
-		return m_impl->Fail("draw failure: D3D11 index buffer binding");
+		return m_impl->Fail(index_bind_result,
+			"draw failure: D3D11 index buffer binding");
 	}
-	if (m_impl->context->setPrimitiveTopology(
-		Translate_Topology(primitive_type)) != rts::render::RENDER_RESULT_OK)
+	const RenderResult topology_result = m_impl->context->setPrimitiveTopology(
+		Translate_Topology(primitive_type));
+	if (topology_result != rts::render::RENDER_RESULT_OK)
 	{
-		return m_impl->Fail("draw failure: D3D11 topology binding");
+		return m_impl->Fail(topology_result,
+			"draw failure: D3D11 topology binding");
 	}
-	if (m_impl->context->drawIndexed(index_count, start_index,
-		static_cast<int>(base_vertex)) != rts::render::RENDER_RESULT_OK)
+	const RenderResult draw_result = m_impl->context->drawIndexed(index_count,
+		start_index, static_cast<int>(base_vertex));
+	if (draw_result != rts::render::RENDER_RESULT_OK)
 	{
-		return m_impl->Fail("draw failure: D3D11 indexed submission");
+		return m_impl->Fail(draw_result,
+			"draw failure: D3D11 indexed submission");
 	}
 	++m_impl->draw_count;
 	if (m_impl->draw_count == 1)
@@ -1324,7 +1467,13 @@ RenderResult D3D11LegacyBridge::Resize(unsigned int width, unsigned int height)
 	const RenderResult result = m_impl->device->resize(width, height);
 	if (result != rts::render::RENDER_RESULT_OK)
 	{
-		m_impl->Log("D3D11 legacy bridge resize failed");
+		m_impl->Log_Result("D3D11 legacy bridge resize failed", result);
+		m_impl->context = m_impl->device->immediateContext();
+		if (!m_impl->device->isOperational() || m_impl->context == 0)
+		{
+			m_impl->Log("D3D11 legacy bridge became inactive after resize failure");
+			Shutdown();
+		}
 	}
 	else
 	{
@@ -1365,6 +1514,16 @@ bool D3D11LegacyBridge::Begin_Frame() { return false; }
 void D3D11LegacyBridge::Request_Frame_Capture() {}
 rts::render::RenderResult D3D11LegacyBridge::End_Frame(bool)
 {
+	return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+}
+rts::render::RenderResult D3D11LegacyBridge::End_Frame(bool,
+	rts::render::RenderFrameOutcome *outcome)
+{
+	if (outcome != 0)
+	{
+		*outcome = rts::render::RenderFrameOutcome();
+		outcome->setOperational(false);
+	}
 	return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 }
 void D3D11LegacyBridge::Clear(bool, bool, float, float, float, float, float,

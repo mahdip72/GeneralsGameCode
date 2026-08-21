@@ -352,6 +352,11 @@ public:
 		return RENDER_BACKEND_D3D11;
 	}
 
+	virtual bool isOperational() const
+	{
+		return m_initialized && m_device != 0 && m_context != 0;
+	}
+
 	virtual RenderResult initialize(const RenderDeviceParameters &parameters)
 	{
 		if (m_initialized || parameters.backend != RENDER_BACKEND_D3D11 ||

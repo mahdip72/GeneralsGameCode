@@ -112,9 +112,11 @@ int testRendererFrameLifecycleState()
 		latch.hasFailure() &&
 		latch.result() == rts::render::RENDER_RESULT_FAILED,
 		"first frame command failure is latched");
-	result |= check(!latch.record(rts::render::RENDER_RESULT_DEVICE_REMOVED) &&
-		latch.result() == rts::render::RENDER_RESULT_FAILED,
-		"first frame failure remains authoritative");
+	result |= check(latch.record(rts::render::RENDER_RESULT_DEVICE_REMOVED) &&
+		latch.result() == rts::render::RENDER_RESULT_DEVICE_REMOVED &&
+		latch.commandResult() == rts::render::RENDER_RESULT_FAILED &&
+		latch.hasDeviceRemoval(),
+		"device removal takes precedence while preserving the command failure");
 	latch.reset();
 	result |= check(!latch.hasFailure() &&
 		latch.result() == rts::render::RENDER_RESULT_OK,
@@ -137,6 +139,39 @@ int testRendererFrameLifecycleState()
 	capture.recordSuccess();
 	result |= check(!capture.isRequested() && capture.failureCount() == 0,
 		"successful visible capture consumes its request");
+
+	rts::render::RenderFrameOutcome partialFrame;
+	result |= check(partialFrame.recordCommandFailure(
+		rts::render::RENDER_RESULT_FAILED),
+		"partial-frame command failure is recorded");
+	partialFrame.recordEndFrame(rts::render::RENDER_RESULT_OK);
+	partialFrame.recordPresentation(rts::render::RENDER_RESULT_OK);
+	partialFrame.markFrameEnded();
+	partialFrame.markPresented();
+	partialFrame.setOperational(true);
+	result |= check(partialFrame.frameEnded() && partialFrame.wasPresented() &&
+		partialFrame.commandResult() == rts::render::RENDER_RESULT_FAILED &&
+		partialFrame.presentationResult() == rts::render::RENDER_RESULT_OK &&
+		partialFrame.result() == rts::render::RENDER_RESULT_FAILED &&
+		!partialFrame.hasLifecycleFailure() && partialFrame.isOperational(),
+		"command failure remains observable after a successful partial-frame present");
+
+	rts::render::RenderFrameOutcome removedFrame;
+	removedFrame.recordCommandFailure(rts::render::RENDER_RESULT_FAILED);
+	removedFrame.recordEndFrame(rts::render::RENDER_RESULT_OK);
+	removedFrame.recordPresentation(
+		rts::render::RENDER_RESULT_DEVICE_REMOVED);
+	removedFrame.recordRecovery(rts::render::RENDER_RESULT_OK);
+	removedFrame.markFrameEnded();
+	removedFrame.setOperational(true);
+	result |= check(removedFrame.result() ==
+		rts::render::RENDER_RESULT_DEVICE_REMOVED &&
+		removedFrame.commandResult() == rts::render::RENDER_RESULT_FAILED &&
+		removedFrame.hasDeviceRemoval() && !removedFrame.wasPresented(),
+		"device removal dominates an earlier command failure and marks the frame unpresented");
+	removedFrame.setOperational(false);
+	result |= check(!removedFrame.isOperational(),
+		"failed recovery can publish an inactive renderer state");
 	return result;
 }
 
@@ -1116,6 +1151,8 @@ int testD3D11HeadlessDevice()
 		"headless D3D11 feature-level-11 device initializes");
 	result |= check(device->immediateContext() != 0,
 		"initialized D3D11 device exposes its owner context");
+	result |= check(device->isOperational(),
+		"initialized D3D11 device reports an operational state");
 	CrossThreadProbe probe = { device, false, false };
 	HANDLE thread = CreateThread(0, 0, probeD3D11FromWrongThread, &probe, 0, 0);
 	result |= check(thread != 0, "D3D11 ownership probe thread starts");
@@ -1137,7 +1174,7 @@ int testD3D11HeadlessDevice()
 		rts::render::RENDER_RESULT_OK && buffer.isValid(),
 		"D3D11 dynamic buffer receives a logical handle");
 	result |= check(device->recoverDevice() ==
-		rts::render::RENDER_RESULT_OK,
+		rts::render::RENDER_RESULT_OK && device->isOperational(),
 		"D3D11 recovery recreates live logical resources without changing handles");
 	unsigned int values[4] = { 1, 2, 3, 4 };
 	result |= check(device->immediateContext()->beginFrame() ==
@@ -1149,7 +1186,7 @@ int testD3D11HeadlessDevice()
 		"owner context maps and updates dynamic buffers");
 	values[0] = 9;
 	result |= check(device->recoverDevice() ==
-		rts::render::RENDER_RESULT_OK &&
+		rts::render::RENDER_RESULT_OK && device->isOperational() &&
 		device->immediateContext()->beginFrame() ==
 			rts::render::RENDER_RESULT_OK &&
 		device->immediateContext()->updateBuffer(buffer, values,
@@ -1203,10 +1240,13 @@ int testD3D11HeadlessDevice()
 		rts::render::RENDER_RESULT_INVALID_ARGUMENT,
 		"headless D3D11 devices reject back-buffer capture without a swap chain");
 	result |= check(device->recoverDevice() == rts::render::RENDER_RESULT_OK &&
+		device->isOperational() &&
 		device->immediateContext() != 0 &&
 		device->present() == rts::render::RENDER_RESULT_OK,
 		"headless D3D11 device recreates at an empty frame boundary");
 	device->shutdown();
+	result |= check(!device->isOperational(),
+		"shutdown D3D11 device reports an inactive state");
 	device->shutdown();
 	delete device;
 	return result;
@@ -1216,14 +1256,18 @@ int testD3D11LegacyBridgeLifecycleContract()
 {
 	int result = 0;
 	typedef rts::render::RenderResult (D3D11LegacyBridge::*ExpectedEndFrame)(bool);
+	typedef rts::render::RenderResult (D3D11LegacyBridge::*ExpectedEndFrameOutcome)(
+		bool, rts::render::RenderFrameOutcome *);
 	typedef rts::render::RenderResult (D3D11LegacyBridge::*ExpectedResize)(
 		unsigned int, unsigned int);
 	typedef rts::render::RenderResult (D3D11LegacyBridge::*ExpectedCapture)(
 		void *, size_t, size_t, rts::render::RenderFormat *);
 	typedef void (D3D11LegacyBridge::*ExpectedCaptureRequest)();
 	typedef bool (D3D11LegacyBridge::*ExpectedBeginFrame)();
-	result |= check(std::is_same<decltype(&D3D11LegacyBridge::End_Frame),
-		ExpectedEndFrame>::value &&
+	result |= check(std::is_same<decltype(static_cast<ExpectedEndFrame>(
+		&D3D11LegacyBridge::End_Frame)), ExpectedEndFrame>::value &&
+		std::is_same<decltype(static_cast<ExpectedEndFrameOutcome>(
+		&D3D11LegacyBridge::End_Frame)), ExpectedEndFrameOutcome>::value &&
 		std::is_same<decltype(&D3D11LegacyBridge::Resize),
 		ExpectedResize>::value &&
 		std::is_same<decltype(&D3D11LegacyBridge::Capture_Back_Buffer),
