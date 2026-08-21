@@ -5,10 +5,10 @@
 #include "Renderer/LegacyRenderState.h"
 
 #include <stdio.h>
-#include <type_traits>
 #include <vector>
 
 #if defined(RTS_RENDERER_HAS_D3D11)
+#include <type_traits>
 #include <windows.h>
 #endif
 
