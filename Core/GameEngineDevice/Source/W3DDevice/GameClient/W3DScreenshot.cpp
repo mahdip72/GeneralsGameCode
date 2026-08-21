@@ -28,6 +28,7 @@
 #include "WWLib/mpsc_intrusive_queue.h"
 #include "rts/profile.h"
 #include <stb_image_write.h>
+#include <io.h>
 #include <limits.h>
 #include <string>
 
@@ -353,12 +354,11 @@ private:
 
 static ScreenshotTaskService s_screenshotTaskService;
 
-// Requests are created on the render owner, while encoding is asynchronous.
-// Keep process-local reservations so two requests from the same millisecond
-// cannot encode to the same path. Reservations intentionally live for the
-// process lifetime; this keeps a cancelled request from reusing a path that a
-// worker may already have observed.
-static std::vector<std::string> s_reservedD3D11ScreenshotPaths;
+// Requests are created on the render owner. A monotonic sequence avoids
+// in-flight name reuse without retaining every historical path for the life
+// of the process. Existing files are skipped so a new process cannot overwrite
+// captures from an earlier run.
+static unsigned int s_d3d11ScreenshotSequence = 0;
 
 static bool reserveD3D11ScreenshotName(const char *outputDirectory,
 	const char *initialLeafname, char *leafname, size_t leafnameCapacity,
@@ -374,8 +374,9 @@ static bool reserveD3D11ScreenshotName(const char *outputDirectory,
 	const char *extension = strrchr(baseLeafname, '.');
 	const size_t stemLength = extension == 0 ? strlen(baseLeafname) :
 		static_cast<size_t>(extension - baseLeafname);
-	for (unsigned int suffix = 0; suffix < 1000000; ++suffix)
+	for (unsigned int attempt = 0; attempt < 1000000; ++attempt)
 	{
+		const unsigned int suffix = s_d3d11ScreenshotSequence++;
 		if (suffix == 0)
 		{
 			strlcpy(leafname, baseLeafname, leafnameCapacity);
@@ -388,27 +389,9 @@ static bool reserveD3D11ScreenshotName(const char *outputDirectory,
 		}
 		strlcpy(outputPath, outputDirectory, outputPathCapacity);
 		strlcat(outputPath, leafname, outputPathCapacity);
-		bool reserved = false;
-		for (size_t index = 0; index < s_reservedD3D11ScreenshotPaths.size();
-			++index)
-		{
-			if (s_reservedD3D11ScreenshotPaths[index] == outputPath)
-			{
-				reserved = true;
-				break;
-			}
-		}
-		if (reserved)
+		if (_access(outputPath, 0) == 0)
 		{
 			continue;
-		}
-		try
-		{
-			s_reservedD3D11ScreenshotPaths.push_back(outputPath);
-		}
-		catch (...)
-		{
-			return false;
 		}
 		return true;
 	}

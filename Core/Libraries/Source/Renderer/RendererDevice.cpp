@@ -6,6 +6,7 @@
 #include <ctype.h>
 #include <limits.h>
 #include <new>
+#include <stdio.h>
 #include <string.h>
 #include <vector>
 
@@ -159,7 +160,7 @@ RenderResult RenderFrameFailureLatch::commandResult() const
 
 RenderFrameOutcome::RenderFrameOutcome() :
 	m_commandFailure(), m_endFrameResult(RENDER_RESULT_OK),
-	m_presentationResult(RENDER_RESULT_OK),
+	m_captureResult(RENDER_RESULT_OK), m_presentationResult(RENDER_RESULT_OK),
 	m_recoveryResult(RENDER_RESULT_OK), m_deviceRemoved(false),
 	m_frameEnded(false), m_presented(false), m_operational(true)
 {
@@ -177,6 +178,15 @@ bool RenderFrameOutcome::recordCommandFailure(RenderResult result)
 void RenderFrameOutcome::recordEndFrame(RenderResult result)
 {
 	m_endFrameResult = result;
+	if (result == RENDER_RESULT_DEVICE_REMOVED)
+	{
+		m_deviceRemoved = true;
+	}
+}
+
+void RenderFrameOutcome::recordCapture(RenderResult result)
+{
+	m_captureResult = result;
 	if (result == RENDER_RESULT_DEVICE_REMOVED)
 	{
 		m_deviceRemoved = true;
@@ -224,6 +234,7 @@ bool RenderFrameOutcome::hasCommandFailure() const
 bool RenderFrameOutcome::hasLifecycleFailure() const
 {
 	return m_endFrameResult != RENDER_RESULT_OK ||
+		m_captureResult != RENDER_RESULT_OK ||
 		m_presentationResult != RENDER_RESULT_OK ||
 		m_recoveryResult != RENDER_RESULT_OK;
 }
@@ -259,6 +270,11 @@ RenderResult RenderFrameOutcome::endFrameResult() const
 	return m_endFrameResult;
 }
 
+RenderResult RenderFrameOutcome::captureResult() const
+{
+	return m_captureResult;
+}
+
 RenderResult RenderFrameOutcome::presentationResult() const
 {
 	return m_presentationResult;
@@ -282,6 +298,10 @@ RenderResult RenderFrameOutcome::result() const
 	if (m_presentationResult != RENDER_RESULT_OK)
 	{
 		return m_presentationResult;
+	}
+	if (m_captureResult != RENDER_RESULT_OK)
+	{
+		return m_captureResult;
 	}
 	if (m_endFrameResult != RENDER_RESULT_OK)
 	{
@@ -317,12 +337,14 @@ struct RenderCaptureQueue::Impl
 	{
 		RenderCaptureRequestDescriptor descriptor;
 		RenderCaptureHandle handle;
+		bool dispatched;
 	};
 
 	Impl(unsigned int requestCapacity) :
 		capacity(requestCapacity == 0 ? 1 : requestCapacity), generation(1),
 		nextRequestId(1), active(true), ownerThread(0), resetting(false),
-		shuttingDown(false)
+		shuttingDown(false), dispatching(false), resetPending(false),
+		cancellationEntries(0), cancellationEntryCount(0)
 	{
 	}
 
@@ -339,7 +361,146 @@ struct RenderCaptureQueue::Impl
 	unsigned long ownerThread;
 	bool resetting;
 	bool shuttingDown;
+	bool dispatching;
+	bool resetPending;
 	std::vector<Entry> entries;
+	std::vector<Entry> dispatchEntries;
+	std::vector<Entry> *cancellationEntries;
+	size_t cancellationEntryCount;
+
+	void cancelEntry(Entry &entry, RenderResult reason)
+	{
+		if (entry.dispatched)
+		{
+			return;
+		}
+		entry.dispatched = true;
+		try
+		{
+			entry.descriptor.cancelled(entry.descriptor.consumer,
+				&entry.handle, reason);
+		}
+		catch (...)
+		{
+		}
+	}
+
+	unsigned int cancelDispatchConsumer(void *consumer, RenderResult reason)
+	{
+		unsigned int count = 0;
+		for (size_t index = 0; index < dispatchEntries.size(); ++index)
+		{
+			Entry &entry = dispatchEntries[index];
+			if (!entry.dispatched && entry.descriptor.consumer == consumer)
+			{
+				++count;
+				cancelEntry(entry, reason);
+			}
+		}
+		return count;
+	}
+
+	unsigned int cancelDispatchStale(RenderResult reason)
+	{
+		unsigned int count = 0;
+		for (size_t index = 0; index < dispatchEntries.size(); ++index)
+		{
+			Entry &entry = dispatchEntries[index];
+			if (!entry.dispatched && entry.handle.generation != generation)
+			{
+				++count;
+				cancelEntry(entry, reason);
+			}
+		}
+		return count;
+	}
+
+	unsigned int cancelDispatchAll(RenderResult reason)
+	{
+		unsigned int count = 0;
+		for (size_t index = 0; index < dispatchEntries.size(); ++index)
+		{
+			Entry &entry = dispatchEntries[index];
+			if (!entry.dispatched)
+			{
+				++count;
+				cancelEntry(entry, reason);
+			}
+		}
+		return count;
+	}
+
+	unsigned int cancelActiveConsumer(void *consumer, RenderResult reason)
+	{
+		unsigned int count = 0;
+		if (cancellationEntries == 0)
+		{
+			return count;
+		}
+		for (size_t index = 0; index < cancellationEntryCount; ++index)
+		{
+			Entry &entry = (*cancellationEntries)[index];
+			if (!entry.dispatched && entry.descriptor.consumer == consumer)
+			{
+				++count;
+				cancelEntry(entry, reason);
+			}
+		}
+		return count;
+	}
+
+	unsigned int cancelActiveStale(RenderResult reason)
+	{
+		unsigned int count = 0;
+		if (cancellationEntries == 0)
+		{
+			return count;
+		}
+		for (size_t index = 0; index < cancellationEntryCount; ++index)
+		{
+			Entry &entry = (*cancellationEntries)[index];
+			if (!entry.dispatched && entry.handle.generation != generation)
+			{
+				++count;
+				cancelEntry(entry, reason);
+			}
+		}
+		return count;
+	}
+
+	unsigned int cancelActiveAll(RenderResult reason)
+	{
+		unsigned int count = 0;
+		if (cancellationEntries == 0)
+		{
+			return count;
+		}
+		for (size_t index = 0; index < cancellationEntryCount; ++index)
+		{
+			Entry &entry = (*cancellationEntries)[index];
+			if (!entry.dispatched)
+			{
+				++count;
+				cancelEntry(entry, reason);
+			}
+		}
+		return count;
+	}
+
+	void finishPendingReset()
+	{
+		if (!resetPending || dispatching || cancellationEntries != 0)
+		{
+			return;
+		}
+		entries.clear();
+		dispatchEntries.clear();
+		generation = 1;
+		nextRequestId = 1;
+		active = true;
+		resetting = false;
+		resetPending = false;
+	}
 };
 
 RenderCaptureQueue::RenderCaptureQueue(unsigned int capacity) :
@@ -349,8 +510,31 @@ RenderCaptureQueue::RenderCaptureQueue(unsigned int capacity) :
 
 RenderCaptureQueue::~RenderCaptureQueue()
 {
-	// Destruction must not call into consumer objects whose lifetime is already
-	// ending. The owner calls shutdown() while consumers are still alive.
+	if (m_impl != 0 && (!m_impl->entries.empty() ||
+		!m_impl->dispatchEntries.empty()))
+	{
+		// Queue ownership is a hard lifetime boundary: every accepted consumer
+		// must receive completion or cancellation before its callback target can
+		// be destroyed. Drain only on the bound owner; fail fast if an off-owner
+		// teardown would otherwise leave dangling callback pointers.
+		if (m_impl->active && m_impl->isOwnerThread())
+		{
+			shutdown(RENDER_RESULT_FAILED);
+		}
+		else
+		{
+			// No callback is safe from the wrong owner. Keep the detached state
+			// inert so its raw consumer pointers can never be invoked later, and
+			// diagnose the ownership violation without terminating the product.
+			fputs("RenderCaptureQueue abandoned pending callbacks off owner thread\n",
+				stderr);
+			m_impl->entries.clear();
+			m_impl->dispatchEntries.clear();
+			delete m_impl;
+			m_impl = 0;
+			return;
+		}
+	}
 	delete m_impl;
 	m_impl = 0;
 }
@@ -374,6 +558,7 @@ RenderResult RenderCaptureQueue::enqueue(
 	RenderCaptureHandle *handle)
 {
 	if (m_impl == 0 || !m_impl->isOwnerThread() || !m_impl->active ||
+		m_impl->resetting || m_impl->shuttingDown ||
 		handle == 0 ||
 		descriptor.completed == 0 || descriptor.cancelled == 0)
 	{
@@ -392,6 +577,7 @@ RenderResult RenderCaptureQueue::enqueue(
 		entry.handle.requestId = m_impl->nextRequestId++;
 	}
 	entry.handle.generation = m_impl->generation;
+	entry.dispatched = false;
 	try
 	{
 		m_impl->entries.push_back(entry);
@@ -411,6 +597,7 @@ RenderResult RenderCaptureQueue::completeVisible(unsigned int width,
 	size_t requiredRowBytes = 0;
 	size_t requiredBytes = 0;
 	if (m_impl == 0 || !m_impl->isOwnerThread() || !m_impl->active ||
+		m_impl->dispatching ||
 		width == 0 || height == 0 ||
 		rowPitch == 0 || pixels == 0 || pixelBytes == 0 ||
 		(format != RENDER_FORMAT_R8G8B8A8_UNORM &&
@@ -422,23 +609,21 @@ RenderResult RenderCaptureQueue::completeVisible(unsigned int width,
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
-	std::vector<RenderCaptureQueue::Impl::Entry> completed;
-	completed.swap(m_impl->entries);
-	for (size_t index = 0; index < completed.size(); ++index)
+	m_impl->dispatching = true;
+	m_impl->dispatchEntries.swap(m_impl->entries);
+	for (size_t index = 0; index < m_impl->dispatchEntries.size(); ++index)
 	{
-		RenderCaptureQueue::Impl::Entry &entry = completed[index];
-		if (entry.handle.generation != m_impl->generation)
+		RenderCaptureQueue::Impl::Entry &entry = m_impl->dispatchEntries[index];
+		if (entry.dispatched)
 		{
-			try
-			{
-				entry.descriptor.cancelled(entry.descriptor.consumer,
-					&entry.handle, RENDER_RESULT_FAILED);
-			}
-			catch (...)
-			{
-			}
 			continue;
 		}
+		if (entry.handle.generation != m_impl->generation)
+		{
+			m_impl->cancelEntry(entry, RENDER_RESULT_FAILED);
+			continue;
+		}
+		entry.dispatched = true;
 		try
 		{
 			entry.descriptor.completed(entry.descriptor.consumer, &entry.handle,
@@ -448,6 +633,9 @@ RenderResult RenderCaptureQueue::completeVisible(unsigned int width,
 		{
 		}
 	}
+	m_impl->dispatchEntries.clear();
+	m_impl->dispatching = false;
+	m_impl->finishPendingReset();
 	return RENDER_RESULT_OK;
 }
 
@@ -457,6 +645,10 @@ unsigned int RenderCaptureQueue::cancelStale(RenderResult reason)
 	{
 		return 0;
 	}
+	unsigned int activeCancelled =
+		m_impl->cancelActiveStale(reason);
+	unsigned int dispatchCancelled =
+		m_impl->cancelDispatchStale(reason);
 	std::vector<RenderCaptureQueue::Impl::Entry> pending;
 	pending.swap(m_impl->entries);
 	size_t cancelledCount = 0;
@@ -488,36 +680,39 @@ unsigned int RenderCaptureQueue::cancelStale(RenderResult reason)
 	catch (...)
 	{
 		m_impl->entries.clear();
+		std::vector<RenderCaptureQueue::Impl::Entry> *previousEntries =
+			m_impl->cancellationEntries;
+		const size_t previousEntryCount = m_impl->cancellationEntryCount;
+		m_impl->cancellationEntries = &pending;
+		m_impl->cancellationEntryCount = pending.size();
 		for (size_t failedIndex = 0; failedIndex < pending.size();
 			++failedIndex)
 		{
-			try
-			{
-				pending[failedIndex].descriptor.cancelled(
-					pending[failedIndex].descriptor.consumer,
-					&pending[failedIndex].handle,
-					RENDER_RESULT_OUT_OF_MEMORY);
-			}
-			catch (...)
-			{
-			}
+			m_impl->cancelEntry(pending[failedIndex],
+				RENDER_RESULT_OUT_OF_MEMORY);
 		}
-		return static_cast<unsigned int>(pending.size());
+		m_impl->cancellationEntries = previousEntries;
+		m_impl->cancellationEntryCount = previousEntryCount;
+		m_impl->finishPendingReset();
+		return activeCancelled + dispatchCancelled +
+			static_cast<unsigned int>(pending.size());
 	}
+	std::vector<RenderCaptureQueue::Impl::Entry> *previousEntries =
+		m_impl->cancellationEntries;
+	const size_t previousEntryCount = m_impl->cancellationEntryCount;
+	m_impl->cancellationEntries = &pending;
+	m_impl->cancellationEntryCount = cancelledCount;
 	for (size_t cancelledIndex = 0; cancelledIndex < cancelledCount;
 		++cancelledIndex)
 	{
 		RenderCaptureQueue::Impl::Entry &entry = pending[cancelledIndex];
-		try
-		{
-			entry.descriptor.cancelled(entry.descriptor.consumer,
-				&entry.handle, reason);
-		}
-		catch (...)
-		{
-		}
+		m_impl->cancelEntry(entry, reason);
 	}
-	return static_cast<unsigned int>(cancelledCount);
+	m_impl->cancellationEntries = previousEntries;
+	m_impl->cancellationEntryCount = previousEntryCount;
+	m_impl->finishPendingReset();
+	return activeCancelled + dispatchCancelled +
+		static_cast<unsigned int>(cancelledCount);
 }
 
 unsigned int RenderCaptureQueue::cancelConsumer(void *consumer,
@@ -527,6 +722,10 @@ unsigned int RenderCaptureQueue::cancelConsumer(void *consumer,
 	{
 		return 0;
 	}
+	unsigned int activeCancelled =
+		m_impl->cancelActiveConsumer(consumer, reason);
+	unsigned int dispatchCancelled =
+		m_impl->cancelDispatchConsumer(consumer, reason);
 	std::vector<RenderCaptureQueue::Impl::Entry> pending;
 	pending.swap(m_impl->entries);
 	size_t cancelledCount = 0;
@@ -557,36 +756,39 @@ unsigned int RenderCaptureQueue::cancelConsumer(void *consumer,
 	catch (...)
 	{
 		m_impl->entries.clear();
+		std::vector<RenderCaptureQueue::Impl::Entry> *previousEntries =
+			m_impl->cancellationEntries;
+		const size_t previousEntryCount = m_impl->cancellationEntryCount;
+		m_impl->cancellationEntries = &pending;
+		m_impl->cancellationEntryCount = pending.size();
 		for (size_t failedIndex = 0; failedIndex < pending.size();
 			++failedIndex)
 		{
-			try
-			{
-				pending[failedIndex].descriptor.cancelled(
-					pending[failedIndex].descriptor.consumer,
-					&pending[failedIndex].handle,
-					RENDER_RESULT_OUT_OF_MEMORY);
-			}
-			catch (...)
-			{
-			}
+			m_impl->cancelEntry(pending[failedIndex],
+				RENDER_RESULT_OUT_OF_MEMORY);
 		}
-		return static_cast<unsigned int>(pending.size());
+		m_impl->cancellationEntries = previousEntries;
+		m_impl->cancellationEntryCount = previousEntryCount;
+		m_impl->finishPendingReset();
+		return activeCancelled + dispatchCancelled +
+			static_cast<unsigned int>(pending.size());
 	}
+	std::vector<RenderCaptureQueue::Impl::Entry> *previousEntries =
+		m_impl->cancellationEntries;
+	const size_t previousEntryCount = m_impl->cancellationEntryCount;
+	m_impl->cancellationEntries = &pending;
+	m_impl->cancellationEntryCount = cancelledCount;
 	for (size_t cancelledIndex = 0; cancelledIndex < cancelledCount;
 		++cancelledIndex)
 	{
 		RenderCaptureQueue::Impl::Entry &entry = pending[cancelledIndex];
-		try
-		{
-			entry.descriptor.cancelled(entry.descriptor.consumer,
-				&entry.handle, reason);
-		}
-		catch (...)
-		{
-		}
+		m_impl->cancelEntry(entry, reason);
 	}
-	return static_cast<unsigned int>(cancelledCount);
+	m_impl->cancellationEntries = previousEntries;
+	m_impl->cancellationEntryCount = previousEntryCount;
+	m_impl->finishPendingReset();
+	return activeCancelled + dispatchCancelled +
+		static_cast<unsigned int>(cancelledCount);
 }
 
 unsigned int RenderCaptureQueue::cancelCurrent(RenderResult reason)
@@ -595,22 +797,36 @@ unsigned int RenderCaptureQueue::cancelCurrent(RenderResult reason)
 	{
 		return 0;
 	}
+	unsigned int activeCancelled = m_impl->cancelActiveAll(reason);
+	if (!m_impl->dispatching)
+	{
+		m_impl->dispatching = true;
+		m_impl->dispatchEntries.swap(m_impl->entries);
+		const unsigned int cancelledCount = static_cast<unsigned int>(
+			m_impl->dispatchEntries.size());
+		m_impl->cancelDispatchAll(reason);
+		m_impl->dispatchEntries.clear();
+		m_impl->dispatching = false;
+		m_impl->finishPendingReset();
+		return activeCancelled + cancelledCount;
+	}
+	unsigned int cancelledCount = m_impl->cancelDispatchAll(reason);
 	std::vector<RenderCaptureQueue::Impl::Entry> pending;
 	pending.swap(m_impl->entries);
-	const unsigned int cancelledCount = static_cast<unsigned int>(pending.size());
+	cancelledCount += static_cast<unsigned int>(pending.size());
+	std::vector<RenderCaptureQueue::Impl::Entry> *previousEntries =
+		m_impl->cancellationEntries;
+	const size_t previousEntryCount = m_impl->cancellationEntryCount;
+	m_impl->cancellationEntries = &pending;
+	m_impl->cancellationEntryCount = pending.size();
 	for (size_t index = 0; index < pending.size(); ++index)
 	{
-		RenderCaptureQueue::Impl::Entry &entry = pending[index];
-		try
-		{
-			entry.descriptor.cancelled(entry.descriptor.consumer,
-				&entry.handle, reason);
-		}
-		catch (...)
-		{
-		}
+		m_impl->cancelEntry(pending[index], reason);
 	}
-	return cancelledCount;
+	m_impl->cancellationEntries = previousEntries;
+	m_impl->cancellationEntryCount = previousEntryCount;
+	m_impl->finishPendingReset();
+	return activeCancelled + cancelledCount;
 }
 
 void RenderCaptureQueue::shutdown(RenderResult reason)
@@ -624,22 +840,35 @@ void RenderCaptureQueue::shutdown(RenderResult reason)
 	}
 	m_impl->active = false;
 	m_impl->shuttingDown = true;
-	std::vector<RenderCaptureQueue::Impl::Entry> pending;
-	pending.swap(m_impl->entries);
-	for (size_t index = 0; index < pending.size(); ++index)
+	m_impl->resetPending = false;
+	m_impl->cancelActiveAll(reason);
+	if (!m_impl->dispatching)
 	{
-		RenderCaptureQueue::Impl::Entry &entry = pending[index];
-		try
+		m_impl->dispatching = true;
+		m_impl->dispatchEntries.swap(m_impl->entries);
+		m_impl->cancelDispatchAll(reason);
+	}
+	else
+	{
+		m_impl->cancelDispatchAll(reason);
+		std::vector<RenderCaptureQueue::Impl::Entry> pending;
+		pending.swap(m_impl->entries);
+		std::vector<RenderCaptureQueue::Impl::Entry> *previousEntries =
+			m_impl->cancellationEntries;
+		const size_t previousEntryCount = m_impl->cancellationEntryCount;
+		m_impl->cancellationEntries = &pending;
+		m_impl->cancellationEntryCount = pending.size();
+		for (size_t index = 0; index < pending.size(); ++index)
 		{
-			entry.descriptor.cancelled(entry.descriptor.consumer,
-				&entry.handle, reason);
+			m_impl->cancelEntry(pending[index], reason);
 		}
-		catch (...)
-		{
-		}
+		m_impl->cancellationEntries = previousEntries;
+		m_impl->cancellationEntryCount = previousEntryCount;
 	}
 	m_impl->shuttingDown = false;
 	m_impl->resetting = false;
+	m_impl->dispatching = false;
+	m_impl->dispatchEntries.clear();
 	m_impl->ownerThread = 0;
 }
 
@@ -652,6 +881,19 @@ void RenderCaptureQueue::reset()
 	}
 	const bool wasActive = m_impl->active;
 	m_impl->resetting = true;
+	if (m_impl->dispatching || m_impl->cancellationEntries != 0)
+	{
+		cancelCurrent(RENDER_RESULT_FAILED);
+		if (!m_impl->active || m_impl->ownerThread == 0 ||
+			m_impl->shuttingDown)
+		{
+			m_impl->resetPending = false;
+			m_impl->resetting = false;
+			return;
+		}
+		m_impl->resetPending = true;
+		return;
+	}
 	if (wasActive && !m_impl->entries.empty())
 	{
 		cancelCurrent(RENDER_RESULT_FAILED);

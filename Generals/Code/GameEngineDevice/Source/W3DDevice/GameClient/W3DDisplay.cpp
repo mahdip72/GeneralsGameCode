@@ -379,6 +379,16 @@ W3DDisplay::~W3DDisplay()
 	W3D_ShutdownScreenshotTasks();
 
 #ifdef PROFILER_ENABLED
+	W3DProfilerFrameCapture *deferredProfilerFrameCapture = nullptr;
+	if (m_profilerFrameCapture != nullptr &&
+		!m_profilerFrameCapture->Shutdown_D3D11_Capture())
+	{
+		WWDEBUG_ERROR(("Profiler frame capture could not drain on the render owner"));
+		// Keep the callback target alive until the renderer drains its queue.
+		// This is safer than deleting an object still referenced by the queue.
+		deferredProfilerFrameCapture = m_profilerFrameCapture;
+		m_profilerFrameCapture = nullptr;
+	}
 	delete m_profilerFrameCapture;
 	m_profilerFrameCapture = nullptr;
 #endif
@@ -429,6 +439,19 @@ W3DDisplay::~W3DDisplay()
 	delete m_assetManager;
 	if (!TheGlobalData->m_headless)
 		WW3D::Shutdown();
+#ifdef PROFILER_ENABLED
+	if (deferredProfilerFrameCapture != nullptr)
+	{
+		if (deferredProfilerFrameCapture->Shutdown_D3D11_Capture())
+		{
+			delete deferredProfilerFrameCapture;
+		}
+		else
+		{
+			WWDEBUG_ERROR(("Profiler frame capture remained owned after renderer shutdown"));
+		}
+	}
+#endif
 	WWMath::Shutdown();
 	if (!TheGlobalData->m_headless)
 		DX8WebBrowser::Shutdown();

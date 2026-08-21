@@ -5,10 +5,13 @@
 #include "Renderer/LegacyRenderState.h"
 
 #include <stdio.h>
+#include <string.h>
 #include <vector>
 
 #if defined(RTS_RENDERER_HAS_D3D11)
 #include <type_traits>
+#endif
+#if defined(_WIN32)
 #include <windows.h>
 #endif
 
@@ -172,6 +175,30 @@ int testRendererFrameLifecycleState()
 	removedFrame.setOperational(false);
 	result |= check(!removedFrame.isOperational(),
 		"failed recovery can publish an inactive renderer state");
+
+	rts::render::RenderFrameOutcome captureRemovedFrame;
+	captureRemovedFrame.recordEndFrame(rts::render::RENDER_RESULT_OK);
+	captureRemovedFrame.recordCapture(
+		rts::render::RENDER_RESULT_DEVICE_REMOVED);
+	captureRemovedFrame.recordRecovery(rts::render::RENDER_RESULT_OK);
+	captureRemovedFrame.markFrameEnded();
+	captureRemovedFrame.setOperational(true);
+	result |= check(captureRemovedFrame.captureResult() ==
+		rts::render::RENDER_RESULT_DEVICE_REMOVED &&
+		captureRemovedFrame.result() ==
+			rts::render::RENDER_RESULT_DEVICE_REMOVED &&
+		captureRemovedFrame.hasDeviceRemoval() &&
+		!captureRemovedFrame.wasPresented(),
+		"capture readback device removal dominates a later presentation path");
+	rts::render::RenderFrameOutcome captureFailedFrame;
+	captureFailedFrame.recordEndFrame(rts::render::RENDER_RESULT_OK);
+	captureFailedFrame.recordCapture(rts::render::RENDER_RESULT_FAILED);
+	captureFailedFrame.recordPresentation(rts::render::RENDER_RESULT_OK);
+	captureFailedFrame.markFrameEnded();
+	captureFailedFrame.markPresented();
+	result |= check(captureFailedFrame.hasLifecycleFailure() &&
+		captureFailedFrame.result() == rts::render::RENDER_RESULT_FAILED,
+		"capture failure is observable even when presentation succeeds");
 	return result;
 }
 
@@ -188,7 +215,23 @@ struct CaptureQueueProbe
 	bool sharedReadback;
 	rts::render::RenderCaptureQueue *reentryQueue;
 	bool enqueueDuringCancellation;
+	bool enqueueDuringCompletion;
+	bool resetDuringCompletion;
+	bool cancelCurrentDuringCompletion;
+	bool shutdownDuringCancellation;
+	bool shutdownReturned;
+	bool observedShutdownReturned;
+	void *additionalEnqueueDuringCompletion;
+	bool *shutdownReturnFlag;
+	void *cancelDuringCompletion;
+	unsigned int reentrantCancellationCount;
+	unsigned int reentrantRequestId;
+	rts::render::RenderResult reentrantEnqueueResult;
 };
+
+void captureQueueCancelled(void *consumer,
+	const rts::render::RenderCaptureHandle *handle,
+	rts::render::RenderResult reason);
 
 void captureQueueCompleted(void *consumer,
 	const rts::render::RenderCaptureHandle *handle, unsigned int,
@@ -217,6 +260,50 @@ void captureQueueCompleted(void *consumer,
 	{
 		probe->completed[probe->completionCount++] = handle->requestId;
 	}
+	if (probe->reentryQueue != 0 && probe->cancelDuringCompletion != 0)
+	{
+		void *consumerToCancel = probe->cancelDuringCompletion;
+		probe->cancelDuringCompletion = 0;
+		probe->reentrantCancellationCount =
+			probe->reentryQueue->cancelConsumer(consumerToCancel,
+				rts::render::RENDER_RESULT_FAILED);
+	}
+	if (probe->reentryQueue != 0 && probe->resetDuringCompletion)
+	{
+		probe->resetDuringCompletion = false;
+		probe->reentryQueue->reset();
+	}
+	if (probe->reentryQueue != 0 && probe->enqueueDuringCompletion)
+	{
+		probe->enqueueDuringCompletion = false;
+		rts::render::RenderCaptureRequestDescriptor descriptor;
+		descriptor.kind = rts::render::RENDER_CAPTURE_VISUAL_SMOKE;
+		descriptor.consumer = probe;
+		descriptor.completed = captureQueueCompleted;
+		descriptor.cancelled = captureQueueCancelled;
+		rts::render::RenderCaptureHandle reentryHandle;
+		probe->reentrantEnqueueResult =
+			probe->reentryQueue->enqueue(descriptor, &reentryHandle);
+		probe->reentrantRequestId = reentryHandle.requestId;
+	}
+	if (probe->reentryQueue != 0 &&
+		probe->additionalEnqueueDuringCompletion != 0)
+	{
+		void *additionalConsumer = probe->additionalEnqueueDuringCompletion;
+		probe->additionalEnqueueDuringCompletion = 0;
+		rts::render::RenderCaptureRequestDescriptor descriptor;
+		descriptor.kind = rts::render::RENDER_CAPTURE_VISUAL_SMOKE;
+		descriptor.consumer = additionalConsumer;
+		descriptor.completed = captureQueueCompleted;
+		descriptor.cancelled = captureQueueCancelled;
+		rts::render::RenderCaptureHandle reentryHandle;
+		probe->reentryQueue->enqueue(descriptor, &reentryHandle);
+	}
+	if (probe->reentryQueue != 0 && probe->cancelCurrentDuringCompletion)
+	{
+		probe->cancelCurrentDuringCompletion = false;
+		probe->reentryQueue->cancelCurrent(rts::render::RENDER_RESULT_FAILED);
+	}
 }
 
 void captureQueueCancelled(void *consumer,
@@ -228,6 +315,24 @@ void captureQueueCancelled(void *consumer,
 	{
 		probe->cancelled[probe->cancellationCount++] = handle->requestId;
 	}
+	if (probe->shutdownReturnFlag != 0 && *probe->shutdownReturnFlag)
+	{
+		probe->observedShutdownReturned = true;
+	}
+	if (probe->reentryQueue != 0 && probe->shutdownDuringCancellation)
+	{
+		probe->shutdownDuringCancellation = false;
+		probe->reentryQueue->shutdown(rts::render::RENDER_RESULT_FAILED);
+		probe->shutdownReturned = true;
+	}
+	if (probe->reentryQueue != 0 && probe->cancelDuringCompletion != 0)
+	{
+		void *consumerToCancel = probe->cancelDuringCompletion;
+		probe->cancelDuringCompletion = 0;
+		probe->reentrantCancellationCount =
+			probe->reentryQueue->cancelConsumer(consumerToCancel,
+				rts::render::RENDER_RESULT_FAILED);
+	}
 	if (probe->reentryQueue != 0 && probe->enqueueDuringCancellation)
 	{
 		probe->enqueueDuringCancellation = false;
@@ -237,7 +342,8 @@ void captureQueueCancelled(void *consumer,
 		descriptor.completed = captureQueueCompleted;
 		descriptor.cancelled = captureQueueCancelled;
 		rts::render::RenderCaptureHandle reentryHandle;
-		probe->reentryQueue->enqueue(descriptor, &reentryHandle);
+		probe->reentrantEnqueueResult =
+			probe->reentryQueue->enqueue(descriptor, &reentryHandle);
 	}
 }
 
@@ -279,10 +385,22 @@ DWORD WINAPI captureQueueShutdownWrongThread(void *parameter)
 	return 0;
 }
 
+DWORD WINAPI captureQueueDeleteWrongThread(void *parameter)
+{
+	CaptureQueueThreadProbe *probe =
+		static_cast<CaptureQueueThreadProbe *>(parameter);
+	delete probe->queue;
+	probe->queue = 0;
+	probe->result = rts::render::RENDER_RESULT_OK;
+	return 0;
+}
+
 int testRenderCaptureQueue()
 {
 	int result = 0;
-	CaptureQueueProbe probe = {};
+	CaptureQueueProbe probe;
+	memset(&probe, 0, sizeof(probe));
+	probe.reentrantEnqueueResult = rts::render::RENDER_RESULT_FAILED;
 	rts::render::RenderCaptureQueue queue(2);
 	rts::render::RenderCaptureRequestDescriptor descriptor;
 	descriptor.kind = rts::render::RENDER_CAPTURE_VISUAL_SMOKE;
@@ -305,7 +423,8 @@ int testRenderCaptureQueue()
 	result |= check(queue.enqueue(descriptor, &second) ==
 		rts::render::RENDER_RESULT_OK && second.requestId > first.requestId,
 		"capture queue preserves FIFO request IDs across consumer kinds");
-	CaptureQueueThreadProbe threadProbe = {};
+	CaptureQueueThreadProbe threadProbe;
+	memset(&threadProbe, 0, sizeof(threadProbe));
 	threadProbe.queue = &queue;
 	threadProbe.descriptor = descriptor;
 	threadProbe.result = rts::render::RENDER_RESULT_OK;
@@ -345,7 +464,122 @@ int testRenderCaptureQueue()
 		"visible capture completion is FIFO and shares one readback batch");
 	result |= check(queue.pendingCount() == 0,
 		"completed visible captures leave no stale requests");
+
+	CaptureQueueProbe firstConsumer;
+	CaptureQueueProbe secondConsumer;
+	memset(&firstConsumer, 0, sizeof(firstConsumer));
+	memset(&secondConsumer, 0, sizeof(secondConsumer));
+	descriptor.kind = rts::render::RENDER_CAPTURE_VISUAL_SMOKE;
+	descriptor.consumer = &firstConsumer;
+	result |= check(queue.enqueue(descriptor, &first) ==
+		rts::render::RENDER_RESULT_OK,
+		"capture queue accepts the first reentrant completion consumer");
+	descriptor.consumer = &secondConsumer;
+	result |= check(queue.enqueue(descriptor, &second) ==
+		rts::render::RENDER_RESULT_OK,
+		"capture queue accepts the second reentrant completion consumer");
+	firstConsumer.reentryQueue = &queue;
+	firstConsumer.cancelDuringCompletion = &secondConsumer;
+	result |= check(queue.completeVisible(640, 480, 2560,
+		rts::render::RENDER_FORMAT_B8G8R8A8_UNORM, &pixels[0], pixels.size()) ==
+		rts::render::RENDER_RESULT_OK &&
+		firstConsumer.completionCount == 1 &&
+		firstConsumer.reentrantCancellationCount == 1 &&
+		secondConsumer.completionCount == 0 &&
+		secondConsumer.cancellationCount == 1 && queue.pendingCount() == 0,
+		"completion callbacks can synchronously cancel a later consumer safely");
+	firstConsumer.reentryQueue = 0;
+
+	CaptureQueueProbe shutdownConsumer;
+	CaptureQueueProbe lateConsumer;
+	memset(&shutdownConsumer, 0, sizeof(shutdownConsumer));
+	memset(&lateConsumer, 0, sizeof(lateConsumer));
+	descriptor.consumer = &shutdownConsumer;
+	result |= check(queue.enqueue(descriptor, &first) ==
+		rts::render::RENDER_RESULT_OK,
+		"capture queue accepts a completion consumer before nested shutdown");
+	descriptor.consumer = &lateConsumer;
+	result |= check(queue.enqueue(descriptor, &second) ==
+		rts::render::RENDER_RESULT_OK,
+		"capture queue accepts a later completion consumer before nested shutdown");
+	shutdownConsumer.reentryQueue = &queue;
+	shutdownConsumer.enqueueDuringCompletion = true;
+	shutdownConsumer.additionalEnqueueDuringCompletion = &lateConsumer;
+	shutdownConsumer.cancelCurrentDuringCompletion = true;
+	shutdownConsumer.shutdownDuringCancellation = true;
+	lateConsumer.reentryQueue = &queue;
+	lateConsumer.shutdownReturnFlag = &shutdownConsumer.shutdownReturned;
+	result |= check(queue.completeVisible(640, 480, 2560,
+		rts::render::RENDER_FORMAT_B8G8R8A8_UNORM, &pixels[0], pixels.size()) ==
+		rts::render::RENDER_RESULT_OK && shutdownConsumer.shutdownReturned &&
+		lateConsumer.cancellationCount >= 1 &&
+		!lateConsumer.observedShutdownReturned && queue.pendingCount() == 0,
+		"nested shutdown drains the active cancellation batch before returning");
+	shutdownConsumer.reentryQueue = 0;
+	lateConsumer.reentryQueue = 0;
+	result |= check(queue.bindOwnerThread(),
+		"capture queue can rebind after nested shutdown");
+	queue.reset();
+	descriptor.consumer = &firstConsumer;
+	result |= check(queue.enqueue(descriptor, &first) ==
+		rts::render::RENDER_RESULT_OK,
+		"capture queue accepts the first reentrant cancellation consumer");
+	descriptor.consumer = &secondConsumer;
+	result |= check(queue.enqueue(descriptor, &second) ==
+		rts::render::RENDER_RESULT_OK,
+		"capture queue accepts the second reentrant cancellation consumer");
+	firstConsumer.reentryQueue = &queue;
+	firstConsumer.cancelDuringCompletion = &secondConsumer;
+	firstConsumer.reentrantCancellationCount = 0;
+	const unsigned int priorSecondCancellations =
+		secondConsumer.cancellationCount;
+	result |= check(queue.cancelCurrent(rts::render::RENDER_RESULT_FAILED) == 2 &&
+		firstConsumer.reentrantCancellationCount == 1 &&
+		secondConsumer.cancellationCount == priorSecondCancellations + 1 &&
+		queue.pendingCount() == 0,
+		"cancellation callbacks can synchronously cancel a later consumer safely");
+	firstConsumer.reentryQueue = 0;
+	descriptor.consumer = &firstConsumer;
+	result |= check(queue.enqueue(descriptor, &first) ==
+		rts::render::RENDER_RESULT_OK,
+		"capture queue accepts the first reset-during-completion consumer");
+	descriptor.consumer = &secondConsumer;
+	result |= check(queue.enqueue(descriptor, &second) ==
+		rts::render::RENDER_RESULT_OK,
+		"capture queue accepts the second reset-during-completion consumer");
+	firstConsumer.reentryQueue = &queue;
+	firstConsumer.resetDuringCompletion = true;
+	firstConsumer.enqueueDuringCompletion = true;
+	secondConsumer.reentryQueue = &queue;
+	secondConsumer.shutdownDuringCancellation = true;
+	firstConsumer.reentrantEnqueueResult = rts::render::RENDER_RESULT_FAILED;
+	firstConsumer.reentrantRequestId = 0;
+	const unsigned int priorResetSecondCompletions =
+		secondConsumer.completionCount;
+	const unsigned int priorResetSecondCancellations =
+		secondConsumer.cancellationCount;
+	result |= check(queue.completeVisible(640, 480, 2560,
+		rts::render::RENDER_FORMAT_B8G8R8A8_UNORM, &pixels[0], pixels.size()) ==
+		rts::render::RENDER_RESULT_OK &&
+		firstConsumer.reentrantEnqueueResult ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+		firstConsumer.reentrantRequestId == 0 &&
+		secondConsumer.completionCount == priorResetSecondCompletions &&
+		secondConsumer.cancellationCount == priorResetSecondCancellations + 1 &&
+		queue.pendingCount() == 0,
+		"nested shutdown wins over reset and rejects reentrant work");
+	firstConsumer.reentryQueue = 0;
+	secondConsumer.reentryQueue = 0;
+	descriptor.consumer = &firstConsumer;
+	result |= check(queue.enqueue(descriptor, &first) ==
+		rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+		"nested shutdown leaves the capture queue inactive after reset returns");
+	result |= check(queue.bindOwnerThread(),
+		"capture queue can rebind after shutdown wins over reset");
+	queue.reset();
+
 	rts::render::RenderCaptureHandle stale;
+	descriptor.consumer = &probe;
 	result |= check(queue.enqueue(descriptor, &stale) ==
 		rts::render::RENDER_RESULT_OK,
 		"capture queue accepts a request after completion");
@@ -358,8 +592,28 @@ int testRenderCaptureQueue()
 		probe.cancellationCount == 1 && queue.pendingCount() == 1,
 		"resize or recovery generation cancellation is deterministic");
 	probe.reentryQueue = 0;
+
+	CaptureQueueThreadProbe deleteProbe;
+	memset(&deleteProbe, 0, sizeof(deleteProbe));
+	deleteProbe.queue = new rts::render::RenderCaptureQueue(1);
+	deleteProbe.descriptor = descriptor;
+	deleteProbe.descriptor.consumer = &probe;
+	result |= check(deleteProbe.queue != 0 &&
+		deleteProbe.queue->bindOwnerThread() &&
+		deleteProbe.queue->enqueue(deleteProbe.descriptor, &deleteProbe.handle) ==
+			rts::render::RENDER_RESULT_OK,
+		"capture queue accepts work before off-owner destruction fallback");
+	HANDLE wrongThreadDelete = CreateThread(0, 0,
+		captureQueueDeleteWrongThread, &deleteProbe, 0, 0);
+	WaitForSingleObject(wrongThreadDelete, INFINITE);
+	CloseHandle(wrongThreadDelete);
+	result |= check(deleteProbe.result == rts::render::RENDER_RESULT_OK &&
+		deleteProbe.queue == 0,
+		"off-owner destruction fails closed without terminating the process");
+
 	queue.shutdown(rts::render::RENDER_RESULT_FAILED);
-	CaptureQueueThreadProbe shutdownProbe = {};
+	CaptureQueueThreadProbe shutdownProbe;
+	memset(&shutdownProbe, 0, sizeof(shutdownProbe));
 	shutdownProbe.queue = &queue;
 	shutdownProbe.result = rts::render::RENDER_RESULT_FAILED;
 	HANDLE repeatedShutdown = CreateThread(0, 0,
@@ -375,6 +629,18 @@ int testRenderCaptureQueue()
 	queue.reset();
 	result |= check(queue.generation() == 1 && queue.pendingCount() == 0,
 		"capture queue reset reactivates a deliberately shut-down owner queue");
+	result |= check(queue.enqueue(descriptor, &stale) ==
+		rts::render::RENDER_RESULT_OK,
+		"capture queue accepts work before an active reset");
+	probe.reentryQueue = &queue;
+	probe.enqueueDuringCancellation = true;
+	probe.reentrantEnqueueResult = rts::render::RENDER_RESULT_OK;
+	queue.reset();
+	result |= check(probe.reentrantEnqueueResult ==
+		rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+		queue.pendingCount() == 0,
+		"capture queue rejects reentrant enqueue while reset drains consumers");
+	probe.reentryQueue = 0;
 
 	rts::render::RenderCaptureQueue throwingQueue(1);
 	rts::render::RenderCaptureRequestDescriptor throwingDescriptor;
@@ -1494,8 +1760,6 @@ int testD3D11LegacyBridgeLifecycleContract()
 		bool, rts::render::RenderFrameOutcome *);
 	typedef rts::render::RenderResult (D3D11LegacyBridge::*ExpectedResize)(
 		unsigned int, unsigned int);
-	typedef rts::render::RenderResult (D3D11LegacyBridge::*ExpectedCapture)(
-		void *, size_t, size_t, rts::render::RenderFormat *);
 	typedef void (D3D11LegacyBridge::*ExpectedCaptureRequest)();
 	typedef bool (D3D11LegacyBridge::*ExpectedBeginFrame)();
 	result |= check(std::is_same<decltype(static_cast<ExpectedEndFrame>(
@@ -1504,8 +1768,6 @@ int testD3D11LegacyBridgeLifecycleContract()
 		&D3D11LegacyBridge::End_Frame)), ExpectedEndFrameOutcome>::value &&
 		std::is_same<decltype(&D3D11LegacyBridge::Resize),
 		ExpectedResize>::value &&
-		std::is_same<decltype(&D3D11LegacyBridge::Capture_Back_Buffer),
-		ExpectedCapture>::value &&
 		std::is_same<decltype(&D3D11LegacyBridge::Request_Frame_Capture),
 		ExpectedCaptureRequest>::value &&
 		std::is_same<decltype(&D3D11LegacyBridge::Begin_Frame),

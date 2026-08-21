@@ -31,6 +31,7 @@ public:
 	~W3DProfilerFrameCapture();
 
 	void Capture(UnsignedInt displayWidth, UnsignedInt displayHeight);
+	bool Shutdown_D3D11_Capture();
 
 private:
 	bool ShouldReuseLastCapture(UnsignedInt currentTimeMs) const;

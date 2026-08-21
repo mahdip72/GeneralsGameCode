@@ -261,6 +261,7 @@ public:
 
 	bool recordCommandFailure(RenderResult result);
 	void recordEndFrame(RenderResult result);
+	void recordCapture(RenderResult result);
 	void recordPresentation(RenderResult result);
 	void recordRecovery(RenderResult result);
 	void markFrameEnded();
@@ -275,6 +276,7 @@ public:
 	bool isOperational() const;
 	RenderResult commandResult() const;
 	RenderResult endFrameResult() const;
+	RenderResult captureResult() const;
 	RenderResult presentationResult() const;
 	RenderResult recoveryResult() const;
 	RenderResult result() const;
@@ -282,6 +284,7 @@ public:
 private:
 	RenderFrameFailureLatch m_commandFailure;
 	RenderResult m_endFrameResult;
+	RenderResult m_captureResult;
 	RenderResult m_presentationResult;
 	RenderResult m_recoveryResult;
 	bool m_deviceRemoved;

@@ -37,9 +37,6 @@ public:
 		unsigned int start_index, unsigned int primitive_count,
 		unsigned int base_vertex);
 	rts::render::RenderResult Resize(unsigned int width, unsigned int height);
-	rts::render::RenderResult Capture_Back_Buffer(void *destination,
-		size_t destination_bytes, size_t destination_row_pitch,
-		rts::render::RenderFormat *format);
 
 private:
 	D3D11LegacyBridge(const D3D11LegacyBridge &);

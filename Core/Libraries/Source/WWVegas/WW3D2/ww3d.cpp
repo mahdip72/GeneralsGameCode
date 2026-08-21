@@ -2190,6 +2190,12 @@ void WW3D::Update_Movie_Capture()
 
 	if (DX8Wrapper::Is_D3D11_Backend_Active())
 	{
+		if (DX8Wrapper::Is_Render_To_Texture())
+		{
+			// Offscreen passes do not present. Queueing here would accumulate
+			// duplicate requests that all consume the next visible back buffer.
+			return;
+		}
 		if (Movie == nullptr)
 		{
 			WWDEBUG_SAY(("D3D11 movie capture has no movie consumer"));

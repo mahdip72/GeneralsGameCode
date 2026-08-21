@@ -1957,14 +1957,6 @@ unsigned int DX8Wrapper::Cancel_D3D11_Back_Buffer_Captures(void *consumer,
 	return _D3D11Bridge.Cancel_Back_Buffer_Captures(consumer, reason);
 }
 
-rts::render::RenderResult DX8Wrapper::Capture_D3D11_Back_Buffer(
-	void *destination, size_t destination_bytes, size_t destination_row_pitch,
-	rts::render::RenderFormat *format)
-{
-	return _D3D11Bridge.Capture_Back_Buffer(destination, destination_bytes,
-		destination_row_pitch, format);
-}
-
 void DX8Wrapper::Set_Viewport(CONST D3DVIEWPORT8* pViewport)
 {
 	DX8_THREAD_ASSERT();

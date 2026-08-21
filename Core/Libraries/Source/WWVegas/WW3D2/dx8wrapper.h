@@ -432,9 +432,6 @@ public:
 		rts::render::RenderCaptureHandle *handle);
 	static unsigned int Cancel_D3D11_Back_Buffer_Captures(void *consumer,
 		rts::render::RenderResult reason);
-	static rts::render::RenderResult Capture_D3D11_Back_Buffer(
-		void *destination, size_t destination_bytes,
-		size_t destination_row_pitch, rts::render::RenderFormat *format);
 
 	static void _Copy_DX8_Rects(
 			IDirect3DSurface8* pSourceSurface,

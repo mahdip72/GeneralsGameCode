@@ -29,7 +29,6 @@
 #include "WWMath/wwmath.h"
 #include <cstring>
 #include <limits>
-#include <stdlib.h>
 #include <d3dx8core.h>
 
 namespace
@@ -52,23 +51,7 @@ W3DProfilerFrameCapture::W3DProfilerFrameCapture()
 
 W3DProfilerFrameCapture::~W3DProfilerFrameCapture()
 {
-	if (m_d3d11CapturePending)
-	{
-		// Capture cancellation invokes the consumer callback synchronously on
-		// the render owner. A zero count while a request is still pending means
-		// destruction was attempted from a different thread (or the bridge was
-		// torn down without first cancelling its consumers); continuing would
-		// leave a callback pointing at this object.
-		const unsigned int cancelled =
-			DX8Wrapper::Cancel_D3D11_Back_Buffer_Captures(this,
-				rts::render::RENDER_RESULT_FAILED);
-		if (cancelled == 0)
-		{
-			WWDEBUG_ERROR(("W3DProfilerFrameCapture destruction must run on the D3D11 render owner"));
-			abort();
-		}
-	}
-	m_d3d11CapturePending = false;
+	WWASSERT(!m_d3d11CapturePending);
 	if (m_swizzleShader)
 	{
 		DX8Wrapper::_Get_D3D_Device8()->DeletePixelShader(m_swizzleShader);
@@ -81,6 +64,26 @@ bool W3DProfilerFrameCapture::ShouldReuseLastCapture(UnsignedInt currentTimeMs) 
 	return PROFILER_FRAME_IMAGE_INTERVAL_MS > 0
 		&& currentTimeMs - m_lastCaptureTimeMs < PROFILER_FRAME_IMAGE_INTERVAL_MS
 		&& !m_lastCapturePixels.empty();
+}
+
+bool W3DProfilerFrameCapture::Shutdown_D3D11_Capture()
+{
+	if (!m_d3d11CapturePending)
+	{
+		return true;
+	}
+	const unsigned int cancelled =
+		DX8Wrapper::Cancel_D3D11_Back_Buffer_Captures(this,
+			rts::render::RENDER_RESULT_FAILED);
+	if (cancelled == 0 && !DX8Wrapper::Is_D3D11_Backend_Active())
+	{
+		// Once the bridge is inactive there is no queue left that can invoke
+		// this callback target. Clear a stale pending bit so deferred teardown
+		// can reclaim the consumer safely.
+		m_d3d11CapturePending = false;
+		return true;
+	}
+	return cancelled != 0 && !m_d3d11CapturePending;
 }
 
 void W3DProfilerFrameCapture::Complete_D3D11_Capture(void *consumer,
