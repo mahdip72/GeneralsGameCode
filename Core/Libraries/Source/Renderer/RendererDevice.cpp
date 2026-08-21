@@ -73,6 +73,91 @@ bool ParseRenderBackend(const char *name, RenderBackend *backend)
 	return false;
 }
 
+RenderFrameFailureLatch::RenderFrameFailureLatch() :
+	m_failed(false), m_result(RENDER_RESULT_OK)
+{
+}
+
+bool RenderFrameFailureLatch::record(RenderResult result)
+{
+	if (result == RENDER_RESULT_OK || m_failed)
+	{
+		return false;
+	}
+	m_failed = true;
+	m_result = result;
+	return true;
+}
+
+void RenderFrameFailureLatch::reset()
+{
+	m_failed = false;
+	m_result = RENDER_RESULT_OK;
+}
+
+bool RenderFrameFailureLatch::hasFailure() const
+{
+	return m_failed;
+}
+
+RenderResult RenderFrameFailureLatch::result() const
+{
+	return m_result;
+}
+
+RenderCaptureRequest::RenderCaptureRequest() :
+	m_requested(false), m_failureCount(0)
+{
+}
+
+void RenderCaptureRequest::request()
+{
+	m_requested = true;
+	m_failureCount = 0;
+}
+
+void RenderCaptureRequest::clear()
+{
+	m_requested = false;
+	m_failureCount = 0;
+}
+
+bool RenderCaptureRequest::isRequested() const
+{
+	return m_requested;
+}
+
+bool RenderCaptureRequest::shouldAttempt(bool visibleFrame) const
+{
+	return m_requested && visibleFrame;
+}
+
+void RenderCaptureRequest::recordSuccess()
+{
+	clear();
+}
+
+void RenderCaptureRequest::recordFailure()
+{
+	if (!m_requested)
+	{
+		return;
+	}
+	if (m_failureCount < MAX_FAILURES)
+	{
+		++m_failureCount;
+	}
+	if (m_failureCount >= MAX_FAILURES)
+	{
+		m_requested = false;
+	}
+}
+
+unsigned int RenderCaptureRequest::failureCount() const
+{
+	return m_failureCount;
+}
+
 GpuHandle::GpuHandle() : m_index(UINT_MAX), m_generation(0) {}
 
 GpuHandle::GpuHandle(unsigned int index, unsigned int generation) :

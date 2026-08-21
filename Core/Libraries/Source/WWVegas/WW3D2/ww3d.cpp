@@ -121,7 +121,22 @@
 #include "framgrab.h"
 
 #include <vector>
+#include <limits>
 #include "Lib/BaseType.h"
+
+namespace
+{
+bool Checked_Multiply(size_t left, size_t right, size_t *result)
+{
+	if (result == 0 || (left != 0 && right >
+		std::numeric_limits<size_t>::max() / left))
+	{
+		return false;
+	}
+	*result = left * right;
+	return true;
+}
+}
 
 
 const char* DAZZLE_INI_FILENAME="DAZZLE.INI";
@@ -1369,7 +1384,9 @@ void WW3D::Make_Screen_Shot( const char * filename_base , const float gamma, con
 		gamma_lut[i] = (unsigned char) (256.0f * powf(i / 256.0f, recip));
 	}
 
-	unsigned int x,y,index,index2,width,height;
+	unsigned int x, y, width, height;
+	size_t index = 0;
+	size_t index2 = 0;
 	unsigned char *image = nullptr;
 	std::vector<unsigned char> d3d11Pixels;
 	if (DX8Wrapper::Is_D3D11_Backend_Active())
@@ -1378,11 +1395,27 @@ void WW3D::Make_Screen_Shot( const char * filename_base , const float gamma, con
 			DX8Wrapper::Get_Device_Resolution_Width());
 		height = static_cast<unsigned int>(
 			DX8Wrapper::Get_Device_Resolution_Height());
-		const size_t pixelBytes = static_cast<size_t>(width) * height * 4;
+		const size_t maxAllocation = std::numeric_limits<size_t>::max();
+		size_t pixelCount = 0;
+		size_t pixelBytes = 0;
+		size_t imageBytes = 0;
+		size_t rowPitch = 0;
+		if (width == 0 || height == 0 ||
+			(format == TGA && (width > 65535 || height > 65535)) ||
+			!Checked_Multiply(static_cast<size_t>(width), 4, &rowPitch) ||
+			!Checked_Multiply(static_cast<size_t>(width),
+				static_cast<size_t>(height), &pixelCount) ||
+			!Checked_Multiply(pixelCount, 4, &pixelBytes) ||
+			!Checked_Multiply(pixelCount, 3, &imageBytes) ||
+			pixelBytes > maxAllocation || imageBytes > maxAllocation)
+		{
+			WWDEBUG_SAY(("D3D11 screenshot dimensions or allocation size are invalid"));
+			return;
+		}
 		try
 		{
 			d3d11Pixels.resize(pixelBytes);
-			image = W3DNEWARRAY unsigned char[3 * width * height];
+			image = W3DNEWARRAY unsigned char[imageBytes];
 		}
 		catch (...)
 		{
@@ -1393,7 +1426,7 @@ void WW3D::Make_Screen_Shot( const char * filename_base , const float gamma, con
 			rts::render::RENDER_FORMAT_UNKNOWN;
 		const rts::render::RenderResult captureResult =
 			DX8Wrapper::Capture_D3D11_Back_Buffer(&d3d11Pixels[0], pixelBytes,
-				static_cast<size_t>(width) * 4, &captureFormat);
+				rowPitch, &captureFormat);
 		if (captureResult != rts::render::RENDER_RESULT_OK ||
 			captureFormat != rts::render::RENDER_FORMAT_B8G8R8A8_UNORM)
 		{
@@ -1406,9 +1439,11 @@ void WW3D::Make_Screen_Shot( const char * filename_base , const float gamma, con
 		{
 			for (x = 0; x < width; ++x)
 			{
-				index = 3 * (x + y * width);
-				index2 = static_cast<unsigned int>(
-					y * static_cast<size_t>(width) * 4 + x * 4);
+				index = static_cast<size_t>(3) *
+					(static_cast<size_t>(x) +
+						static_cast<size_t>(y) * width);
+				index2 = static_cast<size_t>(y) * width * 4 +
+					static_cast<size_t>(x) * 4;
 				image[index] = gamma_lut[d3d11Pixels[index2 + 2]];
 				image[index + 1] = gamma_lut[d3d11Pixels[index2 + 1]];
 				image[index + 2] = gamma_lut[d3d11Pixels[index2]];

@@ -151,6 +151,45 @@ enum RenderResult
 	RENDER_RESULT_FAILED
 };
 
+// Tracks the first command-submission failure in one owner-thread frame. The
+// owner is responsible for calling reset() only after a successful beginFrame.
+class RenderFrameFailureLatch
+{
+public:
+	RenderFrameFailureLatch();
+
+	bool record(RenderResult result);
+	void reset();
+	bool hasFailure() const;
+	RenderResult result() const;
+
+private:
+	bool m_failed;
+	RenderResult m_result;
+};
+
+// Keeps a diagnostic capture request alive across non-visible frames and
+// transient capture failures, while bounding retries deterministically.
+class RenderCaptureRequest
+{
+public:
+	enum { MAX_FAILURES = 3 };
+
+	RenderCaptureRequest();
+
+	void request();
+	void clear();
+	bool isRequested() const;
+	bool shouldAttempt(bool visibleFrame) const;
+	void recordSuccess();
+	void recordFailure();
+	unsigned int failureCount() const;
+
+private:
+	bool m_requested;
+	unsigned int m_failureCount;
+};
+
 enum LegacyVertexFormat
 {
 	RENDER_VERTEX_POSITION3_COLOR = 1,

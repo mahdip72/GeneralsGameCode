@@ -30,6 +30,16 @@
 #include <stb_image_write.h>
 #include <limits.h>
 
+static bool checkedScreenshotMultiply(size_t left, size_t right, size_t* result)
+{
+	if (result == 0 || (left != 0 && right > (size_t)-1 / left))
+	{
+		return false;
+	}
+	*result = left * right;
+	return true;
+}
+
 struct ScreenshotWrittenMessage
 {
 	ScreenshotWrittenMessage* next;
@@ -408,20 +418,30 @@ void W3D_TakeCompressedScreenshot(ScreenshotFormat format, Int jpegQuality)
 			static_cast<unsigned>(targetWidth) : 0;
 		const unsigned height = targetHeight > 0 ?
 			static_cast<unsigned>(targetHeight) : 0;
-		const size_t maxAllocation = (size_t)-1;
+		size_t pitchSize = 0;
+		size_t pixelCount = 0;
+		size_t pixelDataSize = 0;
+		size_t imageSize = 0;
 		if (width == 0 || height == 0 ||
-			width > UINT_MAX / 4 || height > UINT_MAX ||
-			static_cast<size_t>(width) * 4 > maxAllocation / height ||
-			static_cast<size_t>(width) * height > maxAllocation / 3)
+			!checkedScreenshotMultiply(static_cast<size_t>(width), 4,
+				&pitchSize) ||
+			!checkedScreenshotMultiply(static_cast<size_t>(width),
+				static_cast<size_t>(height), &pixelCount) ||
+			!checkedScreenshotMultiply(pixelCount, 4, &pixelDataSize) ||
+			!checkedScreenshotMultiply(pixelCount, 3, &imageSize))
 		{
 			DEBUG_LOG(("D3D11 screenshot dimensions %u x %u are invalid", width,
 				height));
 			return;
 		}
+		if (pitchSize > UINT_MAX)
+		{
+			DEBUG_LOG(("D3D11 screenshot pitch is too large: %u x %u", width,
+				height));
+			return;
+		}
 
-		const unsigned pitch = width * 4;
-		const size_t pixelDataSize = static_cast<size_t>(pitch) * height;
-		const size_t imageSize = static_cast<size_t>(3) * width * height;
+		const unsigned pitch = static_cast<unsigned>(pitchSize);
 		unsigned char* pixelData = allocateScreenshotBuffer(pixelDataSize);
 		unsigned char* image = allocateScreenshotBuffer(imageSize);
 		ScreenshotWrittenMessage* completion = 0;

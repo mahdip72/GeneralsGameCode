@@ -101,6 +101,45 @@ int testNeutralDescriptorDefaults()
 	return result;
 }
 
+int testRendererFrameLifecycleState()
+{
+	int result = 0;
+	rts::render::RenderFrameFailureLatch latch;
+	result |= check(!latch.hasFailure() &&
+		latch.result() == rts::render::RENDER_RESULT_OK,
+		"frame failure latch starts clear");
+	result |= check(latch.record(rts::render::RENDER_RESULT_FAILED) &&
+		latch.hasFailure() &&
+		latch.result() == rts::render::RENDER_RESULT_FAILED,
+		"first frame command failure is latched");
+	result |= check(!latch.record(rts::render::RENDER_RESULT_DEVICE_REMOVED) &&
+		latch.result() == rts::render::RENDER_RESULT_FAILED,
+		"first frame failure remains authoritative");
+	latch.reset();
+	result |= check(!latch.hasFailure() &&
+		latch.result() == rts::render::RENDER_RESULT_OK,
+		"frame failure latch resets at the next successful frame boundary");
+
+	rts::render::RenderCaptureRequest capture;
+	capture.request();
+	result |= check(capture.isRequested() &&
+		!capture.shouldAttempt(false) && capture.shouldAttempt(true),
+		"capture request waits for a visible frame");
+	capture.recordFailure();
+	result |= check(capture.isRequested() && capture.failureCount() == 1,
+		"capture failure retains a bounded retry request");
+	capture.recordFailure();
+	capture.recordFailure();
+	result |= check(!capture.isRequested() && capture.failureCount() ==
+		rts::render::RenderCaptureRequest::MAX_FAILURES,
+		"capture retry budget is deterministic and bounded");
+	capture.request();
+	capture.recordSuccess();
+	result |= check(!capture.isRequested() && capture.failureCount() == 0,
+		"successful visible capture consumes its request");
+	return result;
+}
+
 int testLegacyLogicalState()
 {
 	int result = 0;
@@ -1000,11 +1039,16 @@ int testD3D11HiddenSwapChain()
 			device->resize(96, 80) == rts::render::RENDER_RESULT_OK &&
 			device->present() == rts::render::RENDER_RESULT_OK,
 			"hidden flip-model swap chain presents and resizes");
-		std::vector<unsigned char> resizedPixels(96 * 80 * 4);
-		result |= check(device->captureBackBuffer(&resizedPixels[0],
-			resizedPixels.size(), 96 * 4, &captureFormat) ==
+	std::vector<unsigned char> resizedPixels(96 * 80 * 4);
+	result |= check(device->captureBackBuffer(&resizedPixels[0],
+		resizedPixels.size(), 96 * 4, &captureFormat) ==
 			 rts::render::RENDER_RESULT_OK,
-			"resized D3D11 swap chain captures at its new dimensions");
+		"resized D3D11 swap chain captures at its new dimensions");
+		unsigned char captureProbe = 0;
+		result |= check(device->captureBackBuffer(&captureProbe,
+			static_cast<size_t>(-1), static_cast<size_t>(-1), &captureFormat) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+			"D3D11 capture rejects overflowing destination size arithmetic");
 		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
 			context->clear(rts::render::RenderFloat4(1.0f, 0.0f, 0.0f, 1.0f),
 				1.0f, 0) == rts::render::RENDER_RESULT_OK &&
@@ -1288,6 +1332,7 @@ int main()
 	result |= testNeutralDescriptorDefaults();
 	result |= testLegacyLogicalState();
 	result |= testLegacyShaderBitDecoder();
+	result |= testRendererFrameLifecycleState();
 #if defined(RTS_RENDERER_HAS_D3D11)
 	result |= testD3D11HeadlessDevice();
 	result |= testD3D11LegacyBridgeLifecycleContract();

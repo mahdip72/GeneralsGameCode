@@ -618,6 +618,10 @@ bool DX8Wrapper::Create_Device()
 			D3DPRESENT_INTERVAL_IMMEDIATE))
 	{
 		WWDEBUG_SAY(("Failed to initialize the D3D11 renderer backend."));
+		_D3D11Bridge.Shutdown();
+		Do_Onetime_Device_Dependent_Shutdowns();
+		D3DDevice->Release();
+		D3DDevice = nullptr;
 		return false;
 	}
 	if (_D3D11Bridge.Is_Active())
@@ -2112,10 +2116,13 @@ void DX8Wrapper::Draw_Sorting_IB_VB(
 		polygon_count));
 	if (_D3D11Bridge.Is_Active() && !IsRenderToTexture)
 	{
-		_D3D11Bridge.Draw(dyn_vb_access.VertexBuffer,
+		if (!_D3D11Bridge.Draw(dyn_vb_access.VertexBuffer,
 			dyn_ib_access.IndexBuffer, primitive_type,
 			dyn_ib_access.IndexBufferOffset, polygon_count,
-			dyn_vb_access.VertexBufferOffset);
+			dyn_vb_access.VertexBufferOffset))
+		{
+			WWDEBUG_SAY(("D3D11 renderer rejected a sorting draw submission."));
+		}
 	}
 
 	DX8_RECORD_RENDER(polygon_count,vertex_count,render_state.shader);
@@ -2233,10 +2240,13 @@ void DX8Wrapper::Draw(
 					polygon_count));
 				if (_D3D11Bridge.Is_Active() && !IsRenderToTexture)
 				{
-					_D3D11Bridge.Draw(render_state.vertex_buffers[0],
+					if (!_D3D11Bridge.Draw(render_state.vertex_buffers[0],
 						render_state.index_buffer, primitive_type,
 						start_index + render_state.iba_offset, polygon_count,
-						render_state.index_base_offset + render_state.vba_offset);
+						render_state.index_base_offset + render_state.vba_offset))
+					{
+						WWDEBUG_SAY(("D3D11 renderer rejected a draw submission."));
+					}
 				}
 			}
 			break;

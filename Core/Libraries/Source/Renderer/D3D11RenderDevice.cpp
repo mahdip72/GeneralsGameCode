@@ -24,6 +24,17 @@ namespace
 const unsigned int RESOURCE_CAPACITY = 4096;
 const unsigned int TRANSFORM_CONSTANT_BUFFER_COUNT = 64;
 
+bool Checked_Multiply(size_t left, size_t right, size_t *result)
+{
+	if (result == 0 || (left != 0 && right >
+		static_cast<size_t>(-1) / left))
+	{
+		return false;
+	}
+	*result = left * right;
+	return true;
+}
+
 enum ResourceKind
 {
 	RESOURCE_NONE,
@@ -388,7 +399,7 @@ public:
 				shutdownInternal();
 				return TranslateResult(result);
 			}
-			result = createBackBufferTargets();
+			result = createBackBufferTargets(m_width, m_height);
 			if (FAILED(result))
 			{
 				shutdownInternal();
@@ -746,6 +757,8 @@ public:
 		}
 		m_parameters.width = m_width;
 		m_parameters.height = m_height;
+		m_activeRenderTarget = 0;
+		m_activeDepthStencil = 0;
 		m_context->ClearState();
 		m_context->Flush();
 		for (unsigned int i = 0; i < m_resources.size(); ++i)
@@ -761,7 +774,7 @@ public:
 			result = createSwapChain(static_cast<HWND>(m_parameters.window));
 			if (SUCCEEDED(result))
 			{
-				result = createBackBufferTargets();
+				result = createBackBufferTargets(m_width, m_height);
 			}
 		}
 		if (SUCCEEDED(result))
@@ -790,7 +803,12 @@ public:
 			releasePipelineResources();
 			releaseBackBufferTargets();
 			releaseDeviceObjects();
-			m_initialized = false;
+			// A failed recovery cannot leave logical slots, allocator state, or
+			// active aliases attached to a dead native device. Return to the same
+			// clean state as shutdown so a later initialize is safe.
+			m_activeRenderTarget = 0;
+			m_activeDepthStencil = 0;
+			shutdownInternal();
 			return TranslateResult(result);
 		}
 		m_activeRenderTarget = m_renderTarget;
@@ -816,40 +834,56 @@ public:
 		{
 			const unsigned int previousWidth = m_width;
 			const unsigned int previousHeight = m_height;
+			m_activeRenderTarget = 0;
+			m_activeDepthStencil = 0;
 			m_context->OMSetRenderTargets(0, 0, 0);
 			releaseBackBufferTargets();
 			HRESULT result = m_swapChain->ResizeBuffers(0, width, height,
 				DXGI_FORMAT_UNKNOWN, 0);
 			if (FAILED(result))
 			{
-				if (SUCCEEDED(createBackBufferTargets()))
+				if (SUCCEEDED(createBackBufferTargets(previousWidth,
+					previousHeight)))
 				{
 					m_activeRenderTarget = m_renderTarget;
 					m_activeDepthStencil = m_depthStencil;
 					m_context->OMSetRenderTargets(1, &m_renderTarget,
 						m_depthStencil);
+				}
+				else
+				{
+					shutdownInternal();
+				}
+				return TranslateResult(result);
+			}
+			result = createBackBufferTargets(width, height);
+			if (FAILED(result))
+			{
+				m_activeRenderTarget = 0;
+				m_activeDepthStencil = 0;
+				releaseBackBufferTargets();
+				if (SUCCEEDED(m_swapChain->ResizeBuffers(0, previousWidth,
+					previousHeight, DXGI_FORMAT_UNKNOWN, 0)) &&
+					SUCCEEDED(createBackBufferTargets(previousWidth,
+						previousHeight)))
+				{
+					m_width = previousWidth;
+					m_height = previousHeight;
+					m_parameters.width = previousWidth;
+					m_parameters.height = previousHeight;
+					m_activeRenderTarget = m_renderTarget;
+					m_activeDepthStencil = m_depthStencil;
+					m_context->OMSetRenderTargets(1, &m_renderTarget,
+						m_depthStencil);
+				}
+				else
+				{
+					shutdownInternal();
 				}
 				return TranslateResult(result);
 			}
 			m_width = width;
 			m_height = height;
-			result = createBackBufferTargets();
-			if (FAILED(result))
-			{
-				releaseBackBufferTargets();
-				m_width = previousWidth;
-				m_height = previousHeight;
-				if (SUCCEEDED(m_swapChain->ResizeBuffers(0, previousWidth,
-					previousHeight, DXGI_FORMAT_UNKNOWN, 0)) &&
-					SUCCEEDED(createBackBufferTargets()))
-				{
-					m_activeRenderTarget = m_renderTarget;
-					m_activeDepthStencil = m_depthStencil;
-					m_context->OMSetRenderTargets(1, &m_renderTarget,
-						m_depthStencil);
-				}
-				return TranslateResult(result);
-			}
 			m_activeRenderTarget = m_renderTarget;
 			m_activeDepthStencil = m_depthStencil;
 			m_context->OMSetRenderTargets(1, &m_renderTarget, m_depthStencil);
@@ -1425,12 +1459,16 @@ public:
 		size_t destinationBytes, size_t destinationRowPitch,
 		RenderFormat *format)
 	{
-		const size_t requiredRowBytes = static_cast<size_t>(m_width) * 4;
-		const size_t maximumSize = static_cast<size_t>(-1);
+		size_t requiredRowBytes = 0;
+		size_t requiredBytes = 0;
+		const bool validSize = Checked_Multiply(static_cast<size_t>(m_width),
+			4, &requiredRowBytes) &&
+			Checked_Multiply(destinationRowPitch, static_cast<size_t>(m_height),
+				&requiredBytes);
 		if (!isOwner() || m_frameOpen || m_swapChain == 0 || destination == 0 ||
-			format == 0 || destinationRowPitch < requiredRowBytes ||
-			(m_height != 0 && destinationRowPitch > maximumSize / m_height) ||
-			destinationBytes < destinationRowPitch * m_height)
+			format == 0 || m_width == 0 || m_height == 0 || !validSize ||
+			destinationRowPitch < requiredRowBytes ||
+			destinationBytes < requiredBytes)
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
@@ -1443,6 +1481,12 @@ public:
 		}
 		D3D11_TEXTURE2D_DESC descriptor;
 		backBuffer->GetDesc(&descriptor);
+		if (descriptor.Width != m_width || descriptor.Height != m_height ||
+			descriptor.SampleDesc.Count != 1)
+		{
+			backBuffer->Release();
+			return RENDER_RESULT_FAILED;
+		}
 		descriptor.BindFlags = 0;
 		descriptor.MiscFlags = 0;
 		descriptor.Usage = D3D11_USAGE_STAGING;
@@ -1975,9 +2019,9 @@ private:
 		return result;
 	}
 
-	HRESULT createBackBufferTargets()
+	HRESULT createBackBufferTargets(unsigned int width, unsigned int height)
 	{
-		if (m_swapChain == 0)
+		if (m_swapChain == 0 || width == 0 || height == 0)
 		{
 			return E_INVALIDARG;
 		}
@@ -2000,8 +2044,8 @@ private:
 
 		D3D11_TEXTURE2D_DESC depthDescriptor;
 		memset(&depthDescriptor, 0, sizeof(depthDescriptor));
-		depthDescriptor.Width = m_width;
-		depthDescriptor.Height = m_height;
+		depthDescriptor.Width = width;
+		depthDescriptor.Height = height;
 		depthDescriptor.MipLevels = 1;
 		depthDescriptor.ArraySize = 1;
 		depthDescriptor.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
@@ -2023,6 +2067,8 @@ private:
 
 	void releaseBackBufferTargets()
 	{
+		m_activeRenderTarget = 0;
+		m_activeDepthStencil = 0;
 		if (m_depthStencil != 0)
 		{
 			m_depthStencil->Release();
