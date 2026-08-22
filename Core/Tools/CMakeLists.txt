@@ -21,6 +21,7 @@ if(RTS_BUILD_CORE_EXTRAS)
     if(NOT IS_VS6_BUILD)
         add_subdirectory(RuntimeEpochContractTest)
         add_subdirectory(NetworkWireContractTest)
+        add_subdirectory(PersistPointerTokenTest)
     endif()
 
     if(WIN32)
