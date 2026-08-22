@@ -124,6 +124,32 @@
             }
         },
         {
+            "name": "x64",
+            "inherits": "default",
+            "hidden": false,
+            "displayName": "Windows x64 Release Foundation",
+            "architecture": {
+                "value": "x64",
+                "strategy": "external"
+            },
+            "cacheVariables": {
+                "RTS_FLAGS": "/W3",
+                "RTS_BUILD_CORE_EXTRAS": "ON",
+                "RTS_BUILD_PRODUCT": "OFF",
+                "RTS_BUILD_GENERALS": "OFF",
+                "RTS_BUILD_ZEROHOUR": "OFF"
+            }
+        },
+        {
+            "name": "x64-debug",
+            "inherits": "x64",
+            "hidden": false,
+            "displayName": "Windows x64 Debug Foundation",
+            "cacheVariables": {
+                "RTS_BUILD_OPTION_DEBUG": "ON"
+            }
+        },
+        {
             "name": "win32-vcpkg",
             "inherits": "default-vcpkg",
             "hidden": false,
@@ -266,6 +292,20 @@
             "configurePreset": "win32-vcpkg-debug",
             "displayName": "Build Windows 32bit VCPKG Debug",
             "description": "Build Windows 32bit VCPKG Debug",
+            "configuration": "Debug"
+        },
+        {
+            "name": "x64",
+            "configurePreset": "x64",
+            "displayName": "Build Windows x64 Release Foundation",
+            "description": "Build Windows x64 Release Foundation",
+            "configuration": "Release"
+        },
+        {
+            "name": "x64-debug",
+            "configurePreset": "x64-debug",
+            "displayName": "Build Windows x64 Debug Foundation",
+            "description": "Build Windows x64 Debug Foundation",
             "configuration": "Debug"
         },
         {

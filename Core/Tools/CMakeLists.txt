@@ -15,6 +15,7 @@ if(RTS_BUILD_CORE_EXTRAS)
         add_subdirectory(NativeW3DRendererTest)
         add_subdirectory(NativeW3DResourcesTest)
         add_subdirectory(NativeW3D2Test)
+        add_subdirectory(X64PortabilityTest)
     endif()
     add_subdirectory(JobSystemTest)
 

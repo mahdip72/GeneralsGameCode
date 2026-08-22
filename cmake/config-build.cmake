@@ -1,6 +1,7 @@
 # Do we want to build extra SDK stuff or just the game binary?
 option(RTS_BUILD_CORE_TOOLS "Build core tools" ON)
 option(RTS_BUILD_CORE_EXTRAS "Build core extra tools/tests" OFF)
+option(RTS_BUILD_PRODUCT "Build at least one game product target" ON)
 option(RTS_BUILD_ZEROHOUR "Build Zero Hour code." ON)
 option(RTS_BUILD_GENERALS "Build Generals code." ON)
 option(RTS_BUILD_OPTION_PROFILE "Build code with the \"Profile\" configuration." OFF)
@@ -10,7 +11,7 @@ option(RTS_BUILD_OPTION_ASAN "Build code with Address Sanitizer." OFF)
 option(RTS_BUILD_OPTION_VC6_FULL_DEBUG "Build VC6 with full debug info." OFF)
 option(RTS_BUILD_OPTION_FFMPEG "Enable FFmpeg support" OFF)
 
-if(NOT RTS_BUILD_ZEROHOUR AND NOT RTS_BUILD_GENERALS)
+if(RTS_BUILD_PRODUCT AND NOT RTS_BUILD_ZEROHOUR AND NOT RTS_BUILD_GENERALS)
     set(RTS_BUILD_ZEROHOUR TRUE)
     message("You must select one project to build, building Zero Hour by default.")
 endif()
