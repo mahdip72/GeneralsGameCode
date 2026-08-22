@@ -3043,8 +3043,8 @@ void D3D11LegacyBridge::Invalidate_Texture(IDirect3DBaseTexture8 *texture)
 		Impl::TextureEntry &entry = *found_entry;
 		// This notification follows a completed D3D8-side write.  Mark the
 		// legacy copy as authoritative, but defer the CPU readback until the
-		// texture is actually consumed by a D3D11 draw (or by the periodic cache
-		// maintenance pass).  Texture loading and terrain/water update paths can
+		// texture is actually consumed by a D3D11 draw. Texture loading and
+		// terrain/water update paths can
 		// publish several notifications in one frame; refreshing here would make
 		// every notification perform a full D3D8 surface readback, even when a
 		// later notification supersedes it.  The dirty bit is intentionally

@@ -220,6 +220,16 @@ RenderResult NativeW3DRenderer::RecoverDevice()
 			m_resources->InvalidateRenderer();
 			m_resources = 0;
 		}
+		// D3D11RenderDevice tears down its native context on failed recovery.
+		// The facade must make the same terminal transition before a caller can
+		// observe it again; retaining m_context would permit a later frame to
+		// call through a released immediate-context object.
+		m_device->shutdown();
+		delete m_device;
+		m_device = 0;
+		m_context = 0;
+		m_ownerThread = 0;
+		m_frameOpen = false;
 		return result;
 	}
 	m_context = m_device->immediateContext();
