@@ -471,8 +471,19 @@ foreach ($line in $diff) {
             $allowedPath = $rule.PSObject.Properties['AllowedPath']
             $isAllowed = $null -ne $allowedPath -and
                 $currentFile -match $allowedPath.Value
+            # A 32-bit compatibility branch must still name the legacy
+            # CONTEXT Eip member.  Allow only this explicitly annotated,
+            # pointer-width conversion in the two crash-path adapters; all
+            # assembly and every other context-register addition remain
+            # fail-closed.
+            $isApprovedX86Context = $rule.Name -eq 'x86-inline-assembly-or-context' -and
+                $currentFile -in @(
+                    'Core/Libraries/Source/debug/debug_except.cpp',
+                    'Core/Libraries/Source/WWVegas/WWLib/Except.cpp'
+                ) -and
+                $content -match '^\s*return static_cast<uintptr_t>\((ctx|context)\.Eip\);\s*// portability-audit: x86-context\s*$'
             if ($rule.RejectAddedLine -and -not $isAllowed -and
-                $content -match $rule.Pattern) {
+                -not $isApprovedX86Context -and $content -match $rule.Pattern) {
                 $violations += "${currentFile}:${lineNumber}: $($rule.Name)"
             }
         }

@@ -78,14 +78,14 @@ protected:
 
     HRESULT Close();
 
-    void OnWaveOutMsg( UINT uMsg, DWORD dwParam1, DWORD dwParam2 );
+    void OnWaveOutMsg( UINT uMsg, DWORD_PTR dwParam1, DWORD_PTR dwParam2 );
 
     static void CALLBACK WaveProc(
                           HWAVEOUT hwo,
                           UINT uMsg,
-                          DWORD dwInstance,
-                          DWORD dwParam1,
-                          DWORD dwParam2 );
+                          DWORD_PTR dwInstance,
+                          DWORD_PTR dwParam1,
+                          DWORD_PTR dwParam2 );
 
     HRESULT AddWaveHeader( LPWAVEHDR pwh );
     void    RemoveWaveHeaders();

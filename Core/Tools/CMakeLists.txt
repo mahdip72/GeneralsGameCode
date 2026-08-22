@@ -18,6 +18,9 @@ if(RTS_BUILD_CORE_EXTRAS)
         add_subdirectory(X64PortabilityTest)
     endif()
     add_subdirectory(JobSystemTest)
+    if(NOT IS_VS6_BUILD)
+        add_subdirectory(RuntimeEpochContractTest)
+    endif()
 
     if(WIN32)
         add_test(NAME core_portability_audit
