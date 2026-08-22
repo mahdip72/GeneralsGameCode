@@ -51,11 +51,16 @@ public:
 
 	RenderResult Initialize(void *window,
 		const NativeW3DRendererDescriptor &descriptor);
-	void Shutdown();
+	// The facade and its immediate context are render-owner objects.  Shutdown,
+	// recovery, resize, and submission reject calls from another thread rather
+	// than releasing backend state from an arbitrary caller.
+	RenderResult Shutdown();
 	RenderResult BeginFrame();
 	RenderResult Submit(const LegacyLogicalState &state,
 		const NativeDrawPacket &packet);
 	RenderResult EndFrame(bool present);
+	RenderResult RecoverDevice();
+	RenderResult Resize(unsigned int width, unsigned int height);
 	bool IsInitialized() const;
 	bool IsFrameOpen() const;
 
@@ -65,7 +70,10 @@ private:
 
 	IRenderDevice *m_device;
 	IRenderContext *m_context;
+	unsigned long m_ownerThread;
 	bool m_frameOpen;
+
+	bool IsOwnerThread() const;
 };
 }
 }

@@ -1,6 +1,7 @@
 #include "Renderer/NativeW3DRenderer.h"
 
 #include <limits.h>
+#include <windows.h>
 
 namespace rts
 {
@@ -23,13 +24,16 @@ NativeDrawPacket::NativeDrawPacket() :
 }
 
 NativeW3DRenderer::NativeW3DRenderer() :
-	m_device(0), m_context(0), m_frameOpen(false)
+	m_device(0), m_context(0), m_ownerThread(0), m_frameOpen(false)
 {
 }
 
 NativeW3DRenderer::~NativeW3DRenderer()
 {
-	Shutdown();
+	if (m_device != 0 && IsOwnerThread())
+	{
+		Shutdown();
+	}
 }
 
 RenderResult NativeW3DRenderer::Initialize(void *window,
@@ -70,11 +74,20 @@ RenderResult NativeW3DRenderer::Initialize(void *window,
 	}
 	m_device = device;
 	m_context = context;
+	m_ownerThread = GetCurrentThreadId();
 	return RENDER_RESULT_OK;
 }
 
-void NativeW3DRenderer::Shutdown()
+RenderResult NativeW3DRenderer::Shutdown()
 {
+	if (m_device == 0)
+	{
+		return RENDER_RESULT_OK;
+	}
+	if (!IsOwnerThread())
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
 	if (m_device != 0)
 	{
 		m_device->shutdown();
@@ -82,12 +95,14 @@ void NativeW3DRenderer::Shutdown()
 	}
 	m_device = 0;
 	m_context = 0;
+	m_ownerThread = 0;
 	m_frameOpen = false;
+	return RENDER_RESULT_OK;
 }
 
 RenderResult NativeW3DRenderer::BeginFrame()
 {
-	if (m_context == 0 || m_frameOpen)
+	if (m_context == 0 || m_frameOpen || !IsOwnerThread())
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
@@ -102,7 +117,8 @@ RenderResult NativeW3DRenderer::BeginFrame()
 RenderResult NativeW3DRenderer::Submit(const LegacyLogicalState &state,
 	const NativeDrawPacket &packet)
 {
-	if (m_context == 0 || !m_frameOpen || !packet.vertexBuffer.isValid() ||
+	if (m_context == 0 || !m_frameOpen || !IsOwnerThread() ||
+		!packet.vertexBuffer.isValid() ||
 		packet.vertexStride == 0 || packet.vertexCount == 0)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
@@ -153,7 +169,7 @@ RenderResult NativeW3DRenderer::Submit(const LegacyLogicalState &state,
 
 RenderResult NativeW3DRenderer::EndFrame(bool present)
 {
-	if (m_context == 0 || !m_frameOpen)
+	if (m_context == 0 || !m_frameOpen || !IsOwnerThread())
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
@@ -166,6 +182,30 @@ RenderResult NativeW3DRenderer::EndFrame(bool present)
 	return m_device->present();
 }
 
+RenderResult NativeW3DRenderer::RecoverDevice()
+{
+	if (m_device == 0 || m_frameOpen || !IsOwnerThread())
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	const RenderResult result = m_device->recoverDevice();
+	if (result != RENDER_RESULT_OK)
+	{
+		return result;
+	}
+	m_context = m_device->immediateContext();
+	return m_context == 0 ? RENDER_RESULT_FAILED : RENDER_RESULT_OK;
+}
+
+RenderResult NativeW3DRenderer::Resize(unsigned int width, unsigned int height)
+{
+	if (m_device == 0 || m_frameOpen || !IsOwnerThread())
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	return m_device->resize(width, height);
+}
+
 bool NativeW3DRenderer::IsInitialized() const
 {
 	return m_device != 0 && m_device->isOperational();
@@ -174,6 +214,11 @@ bool NativeW3DRenderer::IsInitialized() const
 bool NativeW3DRenderer::IsFrameOpen() const
 {
 	return m_frameOpen;
+}
+
+bool NativeW3DRenderer::IsOwnerThread() const
+{
+	return m_ownerThread != 0 && m_ownerThread == GetCurrentThreadId();
 }
 }
 }

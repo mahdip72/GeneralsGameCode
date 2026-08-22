@@ -88,7 +88,7 @@ test(renderer): Verify x64 D3D11 core availability
 
 **Interfaces:**
 - Consumes: `rts::render::IRenderDevice`, `LegacyLogicalState`, `RenderPrimitiveTopology`, `GpuHandle`.
-- Produces: `rts::render::NativeW3DRenderer::Initialize(void *, const NativeW3DRendererDescriptor&)`, `BeginFrame()`, `Submit(const LegacyLogicalState&, const NativeDrawPacket&)`, and `EndFrame(bool)`. The existing renderer boundary uses `void *` for the native window so the public facade does not need a platform graphics header.
+- Produces: `rts::render::NativeW3DRenderer::Initialize(void *, const NativeW3DRendererDescriptor&)`, owner-thread-only `Shutdown()`, `BeginFrame()`, `Submit(const LegacyLogicalState&, const NativeDrawPacket&)`, `EndFrame(bool)`, `RecoverDevice()`, and `Resize()`. The existing renderer boundary uses `void *` for the native window so the public facade does not need a platform graphics header.
 
 - [ ] **Step 1: Write the failing facade lifecycle test**
 
