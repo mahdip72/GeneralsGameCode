@@ -75,7 +75,12 @@ else()
 endif()
 
 if(RTS_BUILD_OPTION_PROFILE)
-    target_compile_definitions(core_config INTERFACE RTS_PROFILE_LEGACY)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+        target_compile_definitions(core_config INTERFACE RTS_PROFILE_LEGACY)
+        message(STATUS "Legacy function-entry profiling enabled for 32-bit profile build")
+    else()
+        message(STATUS "Legacy function-entry profiling disabled for ${CMAKE_SIZEOF_VOID_P}-byte pointer profile build; portable high-level profiling remains enabled")
+    endif()
 endif()
 
 # Define a dummy Tracy target when the build option is disabled.
