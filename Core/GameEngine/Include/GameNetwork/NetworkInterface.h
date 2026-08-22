@@ -35,12 +35,9 @@
 
 // forward declarations
 
-struct CommandPacket;
 class GameMessage;
 class GameInfo;
 
-void ClearCommandPacket(UnsignedInt frame);										///< ClearCommandPacket clears the command packet at the start of the frame.
-CommandPacket *GetCommandPacket();											///< TheNetwork calls GetCommandPacket to get commands to send.
 
 
 

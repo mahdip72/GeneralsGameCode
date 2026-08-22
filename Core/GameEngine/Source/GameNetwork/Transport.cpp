@@ -452,7 +452,7 @@ Bool Transport::isGeneralsPacket( TransportMessage *msg )
 	if (!msg)
 		return false;
 
-	if (msg->length < 0 || msg->length > MAX_NETWORK_MESSAGE_LEN)
+	if (msg->length < 0 || msg->length > MAX_PACKET_SIZE)
 		return false;
 
 	CRC crc;

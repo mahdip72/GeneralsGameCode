@@ -20,6 +20,7 @@ if(RTS_BUILD_CORE_EXTRAS)
     add_subdirectory(JobSystemTest)
     if(NOT IS_VS6_BUILD)
         add_subdirectory(RuntimeEpochContractTest)
+        add_subdirectory(NetworkWireContractTest)
     endif()
 
     if(WIN32)

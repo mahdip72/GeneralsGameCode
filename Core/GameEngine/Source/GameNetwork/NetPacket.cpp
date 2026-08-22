@@ -32,6 +32,7 @@
 #include "GameNetwork/networkutil.h"
 #include "GameNetwork/GameMessageParser.h"
 #include "GameNetwork/NetPacketStructs.h"
+#include "Lib/NetworkWireContract.h"
 
 
 static size_t constructNetCommandRef(NetCommandRef *&ref, SmallNetPacketCommandBase::CommandBase &base, NetPacketBuf buf)
@@ -50,6 +51,12 @@ static size_t constructNetCommandRef(NetCommandRef *&ref, SmallNetPacketCommandB
 // This function assumes that all of the fields are either of default value or are
 // present in the raw data.
 NetCommandRef *NetPacket::ConstructNetCommandMsgFromRawData(const UnsignedByte *data, UnsignedInt dataLength) {
+	if (data == nullptr || dataLength == 0U || dataLength > MAX_WRAPPED_COMMAND_SIZE)
+	{
+		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("NetPacket::ConstructNetCommandMsgFromRawData - invalid raw command length"));
+		return nullptr;
+	}
+
 	SmallNetPacketCommandBase::CommandBase commandBase;
 	commandBase.commandType.commandType = static_cast<UnsignedByte>(NETCOMMANDTYPE_GAMECOMMAND);
 	commandBase.relay.relay = 0;
@@ -83,7 +90,13 @@ NetCommandList *NetPacket::ConstructBigCommandList(NetCommandRef *ref)
 		return nullptr;
 	}
 
-	UnsignedInt bufferSize = msg->getSizeForNetPacket();
+	UnsignedInt bufferSize = 0;
+	if (!rts::network_wire::TryConvertSizeToUnsignedInt(msg->getSizeForNetPacket(), bufferSize) ||
+		bufferSize == 0U || bufferSize > MAX_WRAPPED_COMMAND_SIZE)
+	{
+		DEBUG_CRASH(("Wrapped command has an invalid wire size"));
+		return nullptr;
+	}
 	UnsignedByte* bigPacketData = NEW UnsignedByte[bufferSize];
 
 	// create the buffer for the huge message and fill the buffer with that message.
@@ -92,12 +105,20 @@ NetCommandList *NetPacket::ConstructBigCommandList(NetCommandRef *ref)
 	// create the wrapper command message we'll be using.
 	NetWrapperCommandMsg *wrapperMsg = newInstance(NetWrapperCommandMsg);
 	// get the amount of space needed for the wrapper message, not including the wrapped command data.
-	UnsignedInt wrapperSize = wrapperMsg->getSizeForNetPacket();
-	UnsignedInt maxDataSizePerPacket = MAX_PACKET_SIZE - wrapperSize;
-
-	UnsignedInt numChunks = bufferSize / maxDataSizePerPacket;
-	if ((bufferSize % maxDataSizePerPacket) > 0) {
-		++numChunks;
+	UnsignedInt maxDataSizePerPacket = 0;
+	UnsignedInt numChunks = 0;
+	if (!rts::network_wire::TryGetWrapperChunkCapacity(
+		static_cast<size_t>(MAX_PACKET_SIZE), maxDataSizePerPacket,
+		wrapperMsg->getSizeForNetPacket()) ||
+		!rts::network_wire::TryGetWrapperChunkCount(
+		bufferSize, static_cast<size_t>(MAX_PACKET_SIZE), numChunks,
+		wrapperMsg->getSizeForNetPacket()) ||
+		numChunks > MAX_WRAPPED_COMMAND_CHUNKS)
+	{
+		DEBUG_CRASH(("Wrapped command exceeds the network wire contract"));
+		wrapperMsg->detach();
+		delete[] bigPacketData;
+		return nullptr;
 	}
 
 	NetCommandList* commandList = newInstance(NetCommandList);
@@ -167,8 +188,13 @@ NetPacket::NetPacket() {
 NetPacket::NetPacket(const TransportMessage& msg) {
 	init();
 
+	if (msg.length < 0 || msg.length > MAX_PACKET_SIZE)
+	{
+		DEBUG_LOG(("NetPacket::NetPacket - invalid transport payload length %d", msg.length));
+		return;
+	}
 	m_packetLen = msg.length;
-	memcpy(m_packet, msg.data, MAX_PACKET_SIZE);
+	memcpy(m_packet, msg.data, static_cast<size_t>(m_packetLen));
 	m_numCommands = -1;
 	m_addr = msg.addr;
 	m_port = msg.port;
