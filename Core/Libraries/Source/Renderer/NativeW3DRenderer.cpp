@@ -1,8 +1,9 @@
 #include "Renderer/NativeW3DRenderer.h"
 #include "Renderer/NativeW3DResources.h"
+#include "Renderer/NativeW3DRenderState.h"
 
+#include <assert.h>
 #include <limits.h>
-#include <windows.h>
 
 namespace rts
 {
@@ -25,14 +26,19 @@ NativeDrawPacket::NativeDrawPacket() :
 }
 
 NativeW3DRenderer::NativeW3DRenderer() :
-	m_device(0), m_context(0), m_resources(0), m_ownerThread(0), m_frameOpen(false)
+	m_state(0), m_frameOpen(false)
 {
 }
 
 NativeW3DRenderer::~NativeW3DRenderer()
 {
-	if (m_device != 0 && IsOwnerThread())
+	if (m_state != 0)
 	{
+		assert(IsOwnerThread());
+		if (!IsOwnerThread())
+		{
+			return;
+		}
 		Shutdown();
 	}
 }
@@ -40,7 +46,7 @@ NativeW3DRenderer::~NativeW3DRenderer()
 RenderResult NativeW3DRenderer::Initialize(void *window,
 	const NativeW3DRendererDescriptor &descriptor)
 {
-	if (m_device != 0 || window == 0 || descriptor.width == 0 ||
+	if (m_state != 0 || window == 0 || descriptor.width == 0 ||
 		descriptor.height == 0)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
@@ -73,15 +79,28 @@ RenderResult NativeW3DRenderer::Initialize(void *window,
 		delete device;
 		return RENDER_RESULT_FAILED;
 	}
-	m_device = device;
-	m_context = context;
-	m_ownerThread = GetCurrentThreadId();
+	NativeW3DRenderState *state = NativeW3DRenderState::Create();
+	if (state == 0)
+	{
+		device->shutdown();
+		delete device;
+		return RENDER_RESULT_OUT_OF_MEMORY;
+	}
+	if (state->BindOwner() != RENDER_RESULT_OK ||
+		state->AttachBackend(device, context) != RENDER_RESULT_OK)
+	{
+		state->Release();
+		device->shutdown();
+		delete device;
+		return RENDER_RESULT_FAILED;
+	}
+	m_state = state;
 	return RENDER_RESULT_OK;
 }
 
 RenderResult NativeW3DRenderer::Shutdown()
 {
-	if (m_device == 0)
+	if (m_state == 0)
 	{
 		return RENDER_RESULT_OK;
 	}
@@ -89,30 +108,40 @@ RenderResult NativeW3DRenderer::Shutdown()
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
-	if (m_device != 0)
+	const RenderResult admissionResult = m_state->BeginShutdown();
+	unsigned int drained = 0;
+	const RenderResult cleanupResult = admissionResult == RENDER_RESULT_OK ?
+		m_state->DrainCleanup(0, &drained) : admissionResult;
+	IRenderDevice *device = m_state->Device();
+	if (device != 0)
 	{
-		if (m_resources != 0)
-		{
-			m_resources->InvalidateRenderer();
-			m_resources = 0;
-		}
-		m_device->shutdown();
-		delete m_device;
+		device->shutdown();
+		delete device;
 	}
-	m_device = 0;
-	m_context = 0;
-	m_ownerThread = 0;
+	m_state->DetachBackend();
+	m_state->Release();
+	m_state = 0;
 	m_frameOpen = false;
-	return RENDER_RESULT_OK;
+	return cleanupResult;
 }
 
 RenderResult NativeW3DRenderer::BeginFrame()
 {
-	if (m_context == 0 || m_frameOpen || !IsOwnerThread())
+	IRenderContext *context = m_state == 0 ? 0 : m_state->Context();
+	if (context == 0 || m_frameOpen || !IsOwnerThread())
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
-	const RenderResult result = m_context->beginFrame();
+	// Producer-side destruction is bounded so a worker burst cannot consume an
+	// entire render frame.  Shutdown drains the remaining accepted work before
+	// releasing the backend.
+	unsigned int drained = 0;
+	const RenderResult cleanupResult = m_state->DrainCleanup(64, &drained);
+	if (cleanupResult != RENDER_RESULT_OK)
+	{
+		return cleanupResult;
+	}
+	const RenderResult result = context->beginFrame();
 	if (result == RENDER_RESULT_OK)
 	{
 		m_frameOpen = true;
@@ -124,7 +153,8 @@ RenderResult NativeW3DRenderer::Submit(const NativeW3DResources &resources,
 	const LegacyLogicalState &state,
 	const NativeDrawPacket &packet)
 {
-	if (m_context == 0 || !m_frameOpen || !IsOwnerThread() || !resources.IsBoundTo(this) ||
+	IRenderContext *context = m_state == 0 ? 0 : m_state->Context();
+	if (context == 0 || !m_frameOpen || !IsOwnerThread() || !resources.IsBoundTo(this) ||
 		!packet.vertexBuffer.isValid() ||
 		packet.vertexStride == 0 || packet.vertexLayout.stride != packet.vertexStride ||
 		packet.vertexCount == 0)
@@ -152,13 +182,13 @@ RenderResult NativeW3DRenderer::Submit(const NativeW3DResources &resources,
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 	}
-	RenderResult result = m_context->setLegacyStateForLayout(state,
+	RenderResult result = context->setLegacyStateForLayout(state,
 		packet.vertexLayout, packet.texturePresenceMask);
 	if (result != RENDER_RESULT_OK)
 	{
 		return result;
 	}
-	result = m_context->setVertexBuffer(packet.vertexBuffer,
+	result = context->setVertexBuffer(packet.vertexBuffer,
 		packet.vertexStride, packet.vertexOffset);
 	if (result != RENDER_RESULT_OK)
 	{
@@ -166,88 +196,105 @@ RenderResult NativeW3DRenderer::Submit(const NativeW3DResources &resources,
 	}
 	for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
 	{
-		result = m_context->setTexture(stage, packet.textures[stage]);
+		result = context->setTexture(stage, packet.textures[stage]);
 		if (result != RENDER_RESULT_OK)
 		{
 			return result;
 		}
 	}
-	result = m_context->setPrimitiveTopology(packet.topology);
+	result = context->setPrimitiveTopology(packet.topology);
 	if (result != RENDER_RESULT_OK)
 	{
 		return result;
 	}
 	if (!packet.indexed)
 	{
-		return m_context->draw(packet.vertexCount, packet.startVertex);
+		return context->draw(packet.vertexCount, packet.startVertex);
 	}
-	result = m_context->setIndexBuffer(packet.indexBuffer, packet.indexFormat,
+	result = context->setIndexBuffer(packet.indexBuffer, packet.indexFormat,
 		packet.indexOffset);
 	if (result != RENDER_RESULT_OK)
 	{
 		return result;
 	}
-	return m_context->drawIndexed(packet.indexCount, packet.startIndex,
+	return context->drawIndexed(packet.indexCount, packet.startIndex,
 		packet.baseVertex);
 }
 
 RenderResult NativeW3DRenderer::EndFrame(bool present)
 {
-	if (m_context == 0 || !m_frameOpen || !IsOwnerThread())
+	IRenderContext *context = m_state == 0 ? 0 : m_state->Context();
+	if (context == 0 || !m_frameOpen || !IsOwnerThread())
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	m_frameOpen = false;
-	const RenderResult endResult = m_context->endFrame();
+	const RenderResult endResult = context->endFrame();
 	if (endResult != RENDER_RESULT_OK || !present)
 	{
 		return endResult;
 	}
-	return m_device->present();
+	IRenderDevice *device = m_state->Device();
+	return device == 0 ? RENDER_RESULT_FAILED : device->present();
 }
 
 RenderResult NativeW3DRenderer::RecoverDevice()
 {
-	if (m_device == 0 || m_frameOpen || !IsOwnerThread())
+	IRenderDevice *device = m_state == 0 ? 0 : m_state->Device();
+	if (device == 0 || m_frameOpen || !IsOwnerThread())
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
-	const RenderResult result = m_device->recoverDevice();
+	const RenderResult result = device->recoverDevice();
 	if (result != RENDER_RESULT_OK)
 	{
-		if (m_resources != 0)
-		{
-			m_resources->InvalidateRenderer();
-			m_resources = 0;
-		}
 		// D3D11RenderDevice tears down its native context on failed recovery.
 		// The facade must make the same terminal transition before a caller can
 		// observe it again; retaining m_context would permit a later frame to
 		// call through a released immediate-context object.
-		m_device->shutdown();
-		delete m_device;
-		m_device = 0;
-		m_context = 0;
-		m_ownerThread = 0;
+		m_state->BeginShutdown();
+		unsigned int drained = 0;
+		m_state->DrainCleanup(0, &drained);
+		device->shutdown();
+		delete device;
+		m_state->DetachBackend();
+		m_state->Release();
+		m_state = 0;
 		m_frameOpen = false;
 		return result;
 	}
-	m_context = m_device->immediateContext();
-	return m_context == 0 ? RENDER_RESULT_FAILED : RENDER_RESULT_OK;
+	IRenderContext *context = device->immediateContext();
+	if (context == 0)
+	{
+		m_state->BeginShutdown();
+		unsigned int drained = 0;
+		m_state->DrainCleanup(0, &drained);
+		device->shutdown();
+		delete device;
+		m_state->DetachBackend();
+		m_state->Release();
+		m_state = 0;
+		m_frameOpen = false;
+		return RENDER_RESULT_FAILED;
+	}
+	return m_state->ReplaceContext(context);
 }
 
 RenderResult NativeW3DRenderer::Resize(unsigned int width, unsigned int height)
 {
-	if (m_device == 0 || m_frameOpen || !IsOwnerThread())
+	IRenderDevice *device = m_state == 0 ? 0 : m_state->Device();
+	if (device == 0 || m_frameOpen || !IsOwnerThread())
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
-	return m_device->resize(width, height);
+	return device->resize(width, height);
 }
 
 bool NativeW3DRenderer::IsInitialized() const
 {
-	return m_device != 0 && m_device->isOperational();
+	IRenderDevice *device = m_state == 0 ? 0 : m_state->Device();
+	return m_state != 0 && m_state->IsOperational() && device != 0 &&
+		device->isOperational();
 }
 
 bool NativeW3DRenderer::IsFrameOpen() const
@@ -255,9 +302,14 @@ bool NativeW3DRenderer::IsFrameOpen() const
 	return m_frameOpen;
 }
 
+unsigned int NativeW3DRenderer::PendingCleanup() const
+{
+	return m_state == 0 ? 0 : m_state->PendingCleanup();
+}
+
 bool NativeW3DRenderer::IsOwnerThread() const
 {
-	return m_ownerThread != 0 && m_ownerThread == GetCurrentThreadId();
+	return m_state != 0 && m_state->IsOwnerThread();
 }
 }
 }

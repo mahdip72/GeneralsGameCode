@@ -1,5 +1,7 @@
 #include "Renderer/NativeW3DResources.h"
+#include "Renderer/NativeW3DRenderState.h"
 
+#include <new>
 #include <vector>
 
 namespace rts
@@ -18,10 +20,37 @@ struct NativeW3DResources::Slot
 
 struct NativeW3DResources::Impl
 {
-	Impl(unsigned int capacity) : renderer(0), slots(capacity) {}
-	NativeW3DRenderer *renderer;
+	Impl(unsigned int capacity) : state(0), generation(0), slots(capacity) {}
+	NativeW3DRenderState *state;
+	unsigned int generation;
 	std::vector<Slot> slots;
 };
+
+namespace
+{
+struct DeferredDestroyRequest
+{
+	// The resource table retains the state until EnqueueCleanup atomically
+	// accepts or rejects this request.  Once accepted, NativeW3DRenderer keeps
+	// its owner reference until it closes admission and drains the queue, so a
+	// request intentionally does not retain its own containing state.
+	DeferredDestroyRequest(NativeW3DRenderState *requestedState,
+		const std::vector<GpuHandle> &requestedHandles) :
+		state(requestedState), handles(requestedHandles)
+	{
+	}
+
+	NativeW3DRenderState *state;
+	std::vector<GpuHandle> handles;
+};
+
+void ReleaseDeferredResources(void *context)
+{
+	DeferredDestroyRequest *request = static_cast<DeferredDestroyRequest *>(context);
+	delete request;
+}
+
+}
 
 NativeW3DResources::NativeW3DResources(unsigned int capacity) : m_impl(0)
 {
@@ -41,18 +70,40 @@ NativeW3DResources::NativeW3DResources(unsigned int capacity) : m_impl(0)
 
 NativeW3DResources::~NativeW3DResources()
 {
-	if (m_impl != 0 && m_impl->renderer != 0 &&
-		m_impl->renderer->IsOwnerThread())
+	if (m_impl == 0 || m_impl->state == 0)
 	{
-		Shutdown();
+		delete m_impl;
+		return;
 	}
-	// Do not leave a non-owning facade pointer behind when destruction is
-	// requested from the wrong thread or a release operation failed.  Backend
-	// mutation remains owner-only; this only severs the C++ association.
-	if (m_impl != 0 && m_impl->renderer != 0)
+	bool released = false;
+	if (m_impl->state->IsOwnerThread() && m_impl->state->IsOperational())
 	{
-		m_impl->renderer->m_resources = 0;
-		m_impl->renderer = 0;
+		released = Shutdown() == RENDER_RESULT_OK;
+	}
+	if (!released && m_impl->state != 0)
+	{
+		std::vector<GpuHandle> handles;
+		try
+		{
+			for (size_t index = 0; index < m_impl->slots.size(); ++index)
+			{
+				if (m_impl->slots[index].handle.isValid())
+				{
+					handles.push_back(m_impl->slots[index].handle);
+				}
+			}
+			EnqueueDeferredResources(m_impl->state, handles);
+		}
+		catch (...)
+		{
+			// Terminal device teardown owns the bounded allocation-failure fallback.
+		}
+		if (m_impl->state != 0)
+		{
+			m_impl->state->Release();
+			m_impl->state = 0;
+			m_impl->generation = 0;
+		}
 	}
 	delete m_impl;
 }
@@ -63,14 +114,15 @@ RenderResult NativeW3DResources::Bind(NativeW3DRenderer *renderer)
 	{
 		return RENDER_RESULT_OUT_OF_MEMORY;
 	}
-	if (renderer == 0 || m_impl->renderer != 0 || renderer->m_resources != 0 || !renderer->IsInitialized() ||
-		!renderer->IsOwnerThread())
+	if (renderer == 0 || m_impl->state != 0 || renderer->m_state == 0 ||
+		!renderer->IsInitialized() || !renderer->IsOwnerThread())
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
-	m_impl->renderer = renderer;
-	renderer->m_resources = this;
-	return RENDER_RESULT_OK;
+	m_impl->state = renderer->m_state;
+	m_impl->state->AddRef();
+	m_impl->generation = m_impl->state->Generation();
+	return m_impl->generation == 0 ? RENDER_RESULT_FAILED : RENDER_RESULT_OK;
 }
 
 RenderResult NativeW3DResources::Shutdown()
@@ -79,28 +131,33 @@ RenderResult NativeW3DResources::Shutdown()
 	{
 		return RENDER_RESULT_OUT_OF_MEMORY;
 	}
-	if (m_impl->renderer == 0)
+	if (m_impl->state == 0)
 	{
 		return RENDER_RESULT_OK;
 	}
-	if (!m_impl->renderer->IsOwnerThread())
+	if (!m_impl->state->IsOwnerThread())
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
-	for (size_t index = 0; index < m_impl->slots.size(); ++index)
+	if (m_impl->state->IsOperational() && m_impl->generation == m_impl->state->Generation())
 	{
-		Slot &slot = m_impl->slots[index];
-		if (slot.handle.isValid())
+		IRenderDevice *device = m_impl->state->Device();
+		for (size_t index = 0; index < m_impl->slots.size(); ++index)
 		{
-			if (!m_impl->renderer->m_device->destroyResource(slot.handle))
+			Slot &slot = m_impl->slots[index];
+			if (slot.handle.isValid())
 			{
-				return RENDER_RESULT_FAILED;
+				if (device == 0 || !device->destroyResource(slot.handle))
+				{
+					return RENDER_RESULT_FAILED;
+				}
+				slot = Slot();
 			}
-			slot = Slot();
 		}
 	}
-	m_impl->renderer->m_resources = 0;
-	m_impl->renderer = 0;
+	m_impl->state->Release();
+	m_impl->state = 0;
+	m_impl->generation = 0;
 	return RENDER_RESULT_OK;
 }
 
@@ -116,26 +173,26 @@ RenderResult NativeW3DResources::CreateBuffer(const BufferDescriptor &descriptor
 	{
 		return RENDER_RESULT_OUT_OF_MEMORY;
 	}
-	if (m_impl->renderer == 0 || !m_impl->renderer->IsOwnerThread())
+	IRenderDevice *device = m_impl->state == 0 ? 0 : m_impl->state->Device();
+	if (device == 0 || !m_impl->state->IsOperational() || m_impl->generation != m_impl->state->Generation())
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	GpuHandle created;
-	const RenderResult result = m_impl->renderer->m_device->createBuffer(
-		descriptor, initialData, initialDataBytes, &created);
+	const RenderResult result = device->createBuffer(descriptor, initialData, initialDataBytes, &created);
 	if (result != RENDER_RESULT_OK)
 	{
 		return result;
 	}
 	if (created.index() >= m_impl->slots.size())
 	{
-		m_impl->renderer->m_device->destroyResource(created);
+		device->destroyResource(created);
 		return RENDER_RESULT_OUT_OF_MEMORY;
 	}
 	Slot &slot = m_impl->slots[created.index()];
 	if (slot.handle.isValid())
 	{
-		m_impl->renderer->m_device->destroyResource(created);
+		device->destroyResource(created);
 		return RENDER_RESULT_FAILED;
 	}
 	slot.handle = created;
@@ -148,8 +205,7 @@ RenderResult NativeW3DResources::CreateBuffer(const BufferDescriptor &descriptor
 }
 
 RenderResult NativeW3DResources::CreateTexture(const TextureDescriptor &descriptor,
-	const TextureSubresourceData *initialData, unsigned int initialDataCount,
-	GpuHandle *handle)
+	const TextureSubresourceData *initialData, unsigned int initialDataCount, GpuHandle *handle)
 {
 	if (handle == 0)
 	{
@@ -160,26 +216,26 @@ RenderResult NativeW3DResources::CreateTexture(const TextureDescriptor &descript
 	{
 		return RENDER_RESULT_OUT_OF_MEMORY;
 	}
-	if (m_impl->renderer == 0 || !m_impl->renderer->IsOwnerThread())
+	IRenderDevice *device = m_impl->state == 0 ? 0 : m_impl->state->Device();
+	if (device == 0 || !m_impl->state->IsOperational() || m_impl->generation != m_impl->state->Generation())
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	GpuHandle created;
-	const RenderResult result = m_impl->renderer->m_device->createTexture(
-		descriptor, initialData, initialDataCount, &created);
+	const RenderResult result = device->createTexture(descriptor, initialData, initialDataCount, &created);
 	if (result != RENDER_RESULT_OK)
 	{
 		return result;
 	}
 	if (created.index() >= m_impl->slots.size())
 	{
-		m_impl->renderer->m_device->destroyResource(created);
+		device->destroyResource(created);
 		return RENDER_RESULT_OUT_OF_MEMORY;
 	}
 	Slot &slot = m_impl->slots[created.index()];
 	if (slot.handle.isValid())
 	{
-		m_impl->renderer->m_device->destroyResource(created);
+		device->destroyResource(created);
 		return RENDER_RESULT_FAILED;
 	}
 	slot.handle = created;
@@ -191,12 +247,13 @@ RenderResult NativeW3DResources::CreateTexture(const TextureDescriptor &descript
 bool NativeW3DResources::Destroy(GpuHandle handle)
 {
 	Slot *slot = Find(handle);
-	if (slot == 0 || m_impl->renderer == 0 ||
-		!m_impl->renderer->IsOwnerThread())
+	IRenderDevice *device = m_impl == 0 || m_impl->state == 0 ? 0 : m_impl->state->Device();
+	if (slot == 0 || device == 0 || !m_impl->state->IsOperational() ||
+		m_impl->generation != m_impl->state->Generation())
 	{
 		return false;
 	}
-	if (!m_impl->renderer->m_device->destroyResource(handle))
+	if (!device->destroyResource(handle))
 	{
 		return false;
 	}
@@ -206,8 +263,8 @@ bool NativeW3DResources::Destroy(GpuHandle handle)
 
 bool NativeW3DResources::IsValid(GpuHandle handle) const
 {
-	return m_impl != 0 && m_impl->renderer != 0 &&
-		m_impl->renderer->IsOwnerThread() && Find(handle) != 0;
+	return m_impl != 0 && m_impl->state != 0 && m_impl->state->IsOperational() &&
+		m_impl->generation == m_impl->state->Generation() && Find(handle) != 0;
 }
 
 NativeW3DResources::Slot *NativeW3DResources::Find(GpuHandle handle)
@@ -234,8 +291,7 @@ bool NativeW3DResources::IsVertexRangeValid(GpuHandle handle, unsigned int strid
 	unsigned int offset, unsigned int startVertex, unsigned int vertexCount) const
 {
 	const Slot *slot = Find(handle);
-	if (slot == 0 || slot->kind != 1 || (slot->binding & RENDER_BUFFER_VERTEX) == 0 ||
-		stride == 0 || vertexCount == 0)
+	if (slot == 0 || slot->kind != 1 || (slot->binding & RENDER_BUFFER_VERTEX) == 0 || stride == 0 || vertexCount == 0)
 	{
 		return false;
 	}
@@ -247,11 +303,9 @@ bool NativeW3DResources::IsVertexRangeValid(GpuHandle handle, unsigned int strid
 bool NativeW3DResources::IsIndexRangeValid(GpuHandle handle, RenderFormat format,
 	unsigned int offset, unsigned int startIndex, unsigned int indexCount) const
 {
-	const unsigned int indexSize = format == RENDER_FORMAT_R16_UINT ? 2U :
-		(format == RENDER_FORMAT_R32_UINT ? 4U : 0U);
+	const unsigned int indexSize = format == RENDER_FORMAT_R16_UINT ? 2U : (format == RENDER_FORMAT_R32_UINT ? 4U : 0U);
 	const Slot *slot = Find(handle);
-	if (slot == 0 || slot->kind != 1 || (slot->binding & RENDER_BUFFER_INDEX) == 0 ||
-		indexSize == 0 || indexCount == 0)
+	if (slot == 0 || slot->kind != 1 || (slot->binding & RENDER_BUFFER_INDEX) == 0 || indexSize == 0 || indexCount == 0)
 	{
 		return false;
 	}
@@ -265,22 +319,53 @@ bool NativeW3DResources::IsTextureValidOrEmpty(GpuHandle handle) const
 	return !handle.isValid() || (Find(handle) != 0 && Find(handle)->kind == 2);
 }
 
-bool NativeW3DResources::IsBoundTo(const NativeW3DRenderer *renderer) const
+bool NativeW3DResources::EnqueueDeferredResources(NativeW3DRenderState *state,
+	const std::vector<GpuHandle> &handles)
 {
-	return m_impl != 0 && m_impl->renderer == renderer;
+	if (state == 0 || handles.empty() || !state->IsAcceptingCleanup())
+	{
+		return false;
+	}
+	DeferredDestroyRequest *request = 0;
+	try
+	{
+		request = new DeferredDestroyRequest(state, handles);
+	}
+	catch (...)
+	{
+		return false;
+	}
+	NativeW3DOwnerToken *token = NativeW3DOwnerToken::Create(request,
+		ReleaseDeferredResources);
+	if (token == 0)
+	{
+		delete request;
+		return false;
+	}
+	const RenderResult result = state->EnqueueCleanup(DestroyDeferredResources,
+		token);
+	token->Release();
+	return result == RENDER_RESULT_OK;
 }
 
-void NativeW3DResources::InvalidateRenderer()
+void NativeW3DResources::DestroyDeferredResources(void *context)
 {
-	if (m_impl == 0)
+	DeferredDestroyRequest *request = static_cast<DeferredDestroyRequest *>(context);
+	IRenderDevice *device = request->state->Device();
+	if (device == 0)
 	{
 		return;
 	}
-	for (size_t index = 0; index < m_impl->slots.size(); ++index)
+	for (size_t index = 0; index < request->handles.size(); ++index)
 	{
-		m_impl->slots[index] = Slot();
+		device->destroyResource(request->handles[index]);
 	}
-	m_impl->renderer = 0;
+}
+
+bool NativeW3DResources::IsBoundTo(const NativeW3DRenderer *renderer) const
+{
+	return m_impl != 0 && m_impl->state != 0 && renderer != 0 && m_impl->state == renderer->m_state &&
+		m_impl->state->IsOperational() && m_impl->generation == m_impl->state->Generation();
 }
 }
 }

@@ -237,6 +237,7 @@ struct NativeW3DOwnerQueue::Impl
 		tail(0),
 		count(0),
 		ownerBound(false),
+		accepting(true),
 		owner()
 	{
 		if (capacity != 0)
@@ -260,6 +261,7 @@ struct NativeW3DOwnerQueue::Impl
 	unsigned int tail;
 	unsigned int count;
 	bool ownerBound;
+	bool accepting;
 	QueueThreadId owner;
 	QueueLock lock;
 };
@@ -336,7 +338,7 @@ RenderResult NativeW3DOwnerQueue::Enqueue(NativeW3DOwnerCommand command,
 	}
 
 	ScopedQueueLock lock(m_impl->lock);
-	if (!m_impl->ownerBound)
+	if (!m_impl->ownerBound || !m_impl->accepting)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
@@ -350,6 +352,22 @@ RenderResult NativeW3DOwnerQueue::Enqueue(NativeW3DOwnerCommand command,
 	m_impl->entries[m_impl->tail].token = token;
 	m_impl->tail = (m_impl->tail + 1) % m_impl->capacity;
 	++m_impl->count;
+	return RENDER_RESULT_OK;
+}
+
+RenderResult NativeW3DOwnerQueue::Close()
+{
+	if (m_impl == 0 || !m_impl->lock.IsInitialized())
+	{
+		return RENDER_RESULT_OUT_OF_MEMORY;
+	}
+	const QueueThreadId currentThread = CurrentQueueThreadId();
+	ScopedQueueLock lock(m_impl->lock);
+	if (!m_impl->ownerBound || !SameQueueThread(m_impl->owner, currentThread))
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	m_impl->accepting = false;
 	return RENDER_RESULT_OK;
 }
 
@@ -434,6 +452,16 @@ bool NativeW3DOwnerQueue::IsBound() const
 	}
 	ScopedQueueLock lock(m_impl->lock);
 	return m_impl->ownerBound;
+}
+
+bool NativeW3DOwnerQueue::IsAccepting() const
+{
+	if (m_impl == 0 || !m_impl->lock.IsInitialized())
+	{
+		return false;
+	}
+	ScopedQueueLock lock(m_impl->lock);
+	return m_impl->ownerBound && m_impl->accepting;
 }
 
 unsigned int NativeW3DOwnerQueue::Capacity() const

@@ -1,0 +1,7 @@
+add_executable(core_native_w3d_render_state_tests
+    NativeW3DRenderStateTest.cpp
+)
+target_link_libraries(core_native_w3d_render_state_tests PRIVATE core_renderer)
+add_test(NAME core_native_w3d_render_state_tests
+    COMMAND core_native_w3d_render_state_tests
+)

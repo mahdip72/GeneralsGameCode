@@ -43,6 +43,19 @@ struct NativeVertex
 	unsigned int color;
 };
 
+struct DestroyResourcesRequest
+{
+	rts::render::NativeW3DResources *resources;
+};
+
+DWORD WINAPI DestroyResourcesFromWorker(void *parameter)
+{
+	DestroyResourcesRequest *request = static_cast<DestroyResourcesRequest *>(parameter);
+	delete request->resources;
+	request->resources = 0;
+	return 0;
+}
+
 void ConfigurePacket(rts::render::NativeDrawPacket *packet,
 	rts::render::GpuHandle vertexBuffer)
 {
@@ -125,6 +138,37 @@ int main()
 			"native WW3D2 preserves logical resources through device recovery");
 		result |= Check(w3d.Renderer().EndFrame(true) == rts::render::RENDER_RESULT_OK,
 			"native WW3D2 presents after device recovery");
+
+		rts::render::NativeW3DResources *deferredResources =
+			new rts::render::NativeW3DResources(2);
+		result |= Check(deferredResources != 0 &&
+			deferredResources->Bind(&w3d.Renderer()) == rts::render::RENDER_RESULT_OK,
+			"a detached resource table binds to the shared native render state");
+		if (deferredResources != 0)
+		{
+			rts::render::GpuHandle deferredBuffer;
+			result |= Check(deferredResources->CreateBuffer(bufferDescriptor, vertices,
+				sizeof(vertices), &deferredBuffer) == rts::render::RENDER_RESULT_OK,
+				"detached resources create owner-thread handles before worker teardown");
+			DestroyResourcesRequest destroyRequest;
+			destroyRequest.resources = deferredResources;
+			HANDLE destroyThread = CreateThread(0, 0, DestroyResourcesFromWorker,
+				&destroyRequest, 0, 0);
+			result |= Check(destroyThread != 0,
+				"resource teardown worker starts");
+			if (destroyThread != 0)
+			{
+				WaitForSingleObject(destroyThread, INFINITE);
+				CloseHandle(destroyThread);
+				result |= Check(destroyRequest.resources == 0 &&
+					w3d.Renderer().PendingCleanup() == 1,
+					"off-owner resource teardown queues one owner cleanup packet");
+				result |= Check(w3d.Renderer().BeginFrame() == rts::render::RENDER_RESULT_OK &&
+					w3d.Renderer().EndFrame(false) == rts::render::RENDER_RESULT_OK &&
+					w3d.Renderer().PendingCleanup() == 0,
+					"the next render frame drains detached resource cleanup on its owner");
+			}
+		}
 	}
 	result |= Check(w3d.Shutdown() == rts::render::RENDER_RESULT_OK,
 		"native WW3D2 shuts down after a presented frame");

@@ -62,6 +62,11 @@ public:
 	RenderResult Enqueue(NativeW3DOwnerCommand command,
 		NativeW3DOwnerToken *token);
 
+	// Closing is owner-only and atomic with respect to producers.  Accepted
+	// entries stay drainable, while later producers are rejected before they
+	// can retain a backend-lifetime token.
+	RenderResult Close();
+
 	// Only the bound owner may drain.  drained must be non-null and receives the
 	// number of callbacks removed from the queue, including callbacks that fail
 	// through a C++ exception.  Callback exceptions are contained and reported
@@ -70,6 +75,7 @@ public:
 
 	bool IsOwnerThread() const;
 	bool IsBound() const;
+	bool IsAccepting() const;
 	unsigned int Capacity() const;
 	unsigned int Size() const;
 

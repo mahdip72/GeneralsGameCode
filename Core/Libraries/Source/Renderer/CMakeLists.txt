@@ -1,6 +1,7 @@
 add_library(core_renderer STATIC
     LegacyRenderState.cpp
     NativeW3DOwnerQueue.cpp
+    NativeW3DRenderState.cpp
     NativeW3DRenderer.cpp
     NativeW3DResources.cpp
     RendererDevice.cpp

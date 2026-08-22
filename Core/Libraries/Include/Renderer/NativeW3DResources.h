@@ -3,6 +3,8 @@
 
 #include "Renderer/NativeW3DRenderer.h"
 
+#include <vector>
+
 namespace rts
 {
 namespace render
@@ -39,7 +41,9 @@ private:
 		unsigned int indexCount) const;
 	bool IsTextureValidOrEmpty(GpuHandle handle) const;
 	bool IsBoundTo(const NativeW3DRenderer *renderer) const;
-	void InvalidateRenderer();
+	static bool EnqueueDeferredResources(NativeW3DRenderState *state,
+		const std::vector<GpuHandle> &handles);
+	static void DestroyDeferredResources(void *context);
 
 	struct Impl;
 	Impl *m_impl;
