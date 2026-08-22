@@ -88,13 +88,14 @@ test(renderer): Verify x64 D3D11 core availability
 
 **Interfaces:**
 - Consumes: `rts::render::IRenderDevice`, `LegacyLogicalState`, `RenderPrimitiveTopology`, `GpuHandle`.
-- Produces: `rts::render::NativeW3DRenderer::Initialize(HWND, const RenderDeviceDescriptor&)`, `BeginFrame()`, `Submit(const LegacyLogicalState&, const NativeDrawPacket&)`, and `EndFrame(bool)`.
+- Produces: `rts::render::NativeW3DRenderer::Initialize(void *, const NativeW3DRendererDescriptor&)`, `BeginFrame()`, `Submit(const LegacyLogicalState&, const NativeDrawPacket&)`, and `EndFrame(bool)`. The existing renderer boundary uses `void *` for the native window so the public facade does not need a platform graphics header.
 
 - [ ] **Step 1: Write the failing facade lifecycle test**
 
 ```cpp
 rts::render::NativeW3DRenderer renderer;
-Check(!renderer.BeginFrame(), "cannot begin before initialize");
+Check(renderer.BeginFrame() == rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+      "cannot begin before initialize");
 Check(renderer.Initialize(nullptr, descriptor) == rts::render::RENDER_RESULT_INVALID_ARGUMENT,
       "invalid window is rejected without creating a D3D8 device");
 ```
@@ -108,9 +109,9 @@ Expected: compile failure because `NativeW3DRenderer` does not exist.
 - [ ] **Step 3: Implement the facade with no D3D8 includes**
 
 ```cpp
-class NativeW3DRenderer final {
+class NativeW3DRenderer {
 public:
-    RenderResult Initialize(HWND window, const RenderDeviceDescriptor &descriptor);
+    RenderResult Initialize(void *window, const NativeW3DRendererDescriptor &descriptor);
     RenderResult BeginFrame();
     RenderResult Submit(const LegacyLogicalState &state, const NativeDrawPacket &packet);
     RenderResult EndFrame(bool present);

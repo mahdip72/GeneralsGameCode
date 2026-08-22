@@ -10,6 +10,7 @@ endif()
 if(RTS_BUILD_CORE_EXTRAS)
     if(CMAKE_SIZEOF_VOID_P EQUAL 8)
         add_subdirectory(NativeRendererGraphTest)
+        add_subdirectory(NativeW3DRendererTest)
     endif()
     add_subdirectory(JobSystemTest)
 
@@ -38,6 +39,18 @@ if(RTS_BUILD_CORE_EXTRAS)
                 -SelfTest
         )
         set_tests_properties(core_renderer_bypass_audit_self_test PROPERTIES TIMEOUT 120)
+        add_test(NAME core_native_renderer_boundary_audit
+            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeRendererBoundaryAudit/NativeRendererBoundaryAudit.ps1"
+                -SourceRoot "${CMAKE_SOURCE_DIR}"
+        )
+        set_tests_properties(core_native_renderer_boundary_audit PROPERTIES TIMEOUT 30)
+        add_test(NAME core_native_renderer_boundary_audit_self_test
+            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeRendererBoundaryAudit/NativeRendererBoundaryAudit.ps1"
+                -SelfTest
+        )
+        set_tests_properties(core_native_renderer_boundary_audit_self_test PROPERTIES TIMEOUT 30)
         add_test(NAME core_legacy_d3dx_service_audit
             COMMAND powershell -NoProfile -ExecutionPolicy Bypass
                 -File "${CMAKE_CURRENT_SOURCE_DIR}/LegacyD3DXServiceAudit/LegacyD3DXServiceAudit.ps1"
