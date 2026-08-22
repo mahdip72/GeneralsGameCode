@@ -13,4 +13,4 @@ set_target_properties(core_native_w3d2_tests PROPERTIES
 )
 
 add_test(NAME core_native_w3d2_tests COMMAND core_native_w3d2_tests)
-set_tests_properties(core_native_w3d2_tests PROPERTIES TIMEOUT 30)
+set_tests_properties(core_native_w3d2_tests PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
