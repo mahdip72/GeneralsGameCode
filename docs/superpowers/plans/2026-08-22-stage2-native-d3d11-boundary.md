@@ -22,19 +22,16 @@
 
 ---
 
-### Task 1: Make the target graph state explicit
+### Task 1: Establish the core-backend boundary without overclaiming product readiness
 
 **Files:**
-- Modify: `CMakeLists.txt:54-58`
-- Modify: `Core/GameEngine/CMakeLists.txt:1174-1211`
-- Modify: `Core/GameEngineDevice/CMakeLists.txt:240-252`
 - Create: `Core/Tools/NativeRendererGraphTest/CMakeLists.txt`
 - Create: `Core/Tools/NativeRendererGraphTest/NativeRendererGraphTest.cpp`
 - Modify: `Core/Tools/CMakeLists.txt`
 
 **Interfaces:**
-- Consumes: `RTS_BUILD_PRODUCT`, `CMAKE_SIZEOF_VOID_P`, `core_renderer`.
-- Produces: `RTS_RENDERER_D3D11_NATIVE` and a CTest proving the x64 native graph has no D3D8/Miles/Bink link item.
+- Consumes: `CMAKE_SIZEOF_VOID_P`, `core_renderer`.
+- Produces: a CTest proving the x64 core renderer exposes the D3D11 factory. This is deliberately **not** a product-native claim.
 
 - [ ] **Step 1: Write the failing graph test**
 
@@ -42,10 +39,11 @@
 // NativeRendererGraphTest.cpp
 int main()
 {
-#if !defined(RTS_RENDERER_D3D11_NATIVE)
+#if !defined(RTS_RENDERER_HAS_D3D11)
     return 1;
 #endif
-    return 0;
+    IRenderDevice *device = CreateD3D11RenderDevice();
+    return device == 0;
 }
 ```
 
@@ -53,29 +51,29 @@ int main()
 
 Run: `cmake --build <x64-core-build> --target core_native_renderer_graph_tests && ctest --test-dir <x64-core-build> -R ^core_native_renderer_graph_tests$ --output-on-failure`
 
-Expected: compile failure because the native graph definition is absent.
+Expected: failure because the D3D11 capability is not yet propagated through the tested core target.
 
-- [ ] **Step 3: Add an architecture selector, not a dependency alias**
+- [ ] **Step 3: Link the test to the actual D3D11-capable core target**
 
 ```cmake
-set(RTS_RENDERER_D3D11_NATIVE OFF)
-if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-    set(RTS_RENDERER_D3D11_NATIVE ON)
-endif()
+target_link_libraries(core_native_renderer_graph_tests PRIVATE core_renderer)
 ```
 
-Apply this only to new native interfaces. Keep `rts_d3d8lib`, `milesstub`, and `binkstub` on the existing 32-bit targets; do not make their declarations visible to the native interfaces.
+The test must consume `RTS_RENDERER_HAS_D3D11` as a public property of the real
+renderer target; it must not inject a manually supplied "native product" macro.
+`RTS_RENDERER_D3D11_NATIVE` remains reserved for Task 5, after the x64 product
+graph has no D3D8/Miles/Bink dependency.
 
 - [ ] **Step 4: Run the graph test and configure both architectures**
 
 Run: `cmake --build <x64-core-build> --target core_native_renderer_graph_tests && ctest --test-dir <x64-core-build> -R ^core_native_renderer_graph_tests$ --output-on-failure`
 
-Expected: PASS. Also configure the existing Win32 build and verify its D3D8 product targets remain generated.
+Expected: PASS. Also configure the existing Win32 build and verify its D3D8 product targets remain generated. Record that the x64 game product is still intentionally unavailable: it retains source-level D3D8, Miles, and Bink dependencies until Tasks 2-5 and Stage 3 service replacement work are complete.
 
 - [ ] **Step 5: Commit**
 
 ```text
-build(renderer): Define native D3D11 target graph
+test(renderer): Verify x64 D3D11 core availability
 ```
 
 ### Task 2: Introduce the native WW3D facade contract

@@ -8,6 +8,9 @@ endif()
 
 # Build less useful tool/test binaries.
 if(RTS_BUILD_CORE_EXTRAS)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+        add_subdirectory(NativeRendererGraphTest)
+    endif()
     add_subdirectory(JobSystemTest)
 
     if(WIN32)
