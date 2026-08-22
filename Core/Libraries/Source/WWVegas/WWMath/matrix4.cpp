@@ -44,7 +44,19 @@
 #include <assert.h>
 
 #include "WWLib/win.h"
-#include <d3d8types.h>
+// Matrix conversion only needs the Direct3D matrix layout.  That layout is
+// supplied by the supported Windows SDK; it does not require the retired
+// DirectX 8 SDK header, which is unavailable to native x64 builds.  The
+// overload macro preserves the m[row][column] member used by this adapter.
+#ifndef D3D_OVERLOADS
+#define D3D_OVERLOADS
+#define RTS_UNDEF_D3D_OVERLOADS 1
+#endif
+#include <d3dtypes.h>
+#ifdef RTS_UNDEF_D3D_OVERLOADS
+#undef RTS_UNDEF_D3D_OVERLOADS
+#undef D3D_OVERLOADS
+#endif
 
 /***********************************************************************************************
  * Matrix4x4::Multiply -- Multiply two Matrix4x4's together                                        *
