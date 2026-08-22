@@ -8,8 +8,9 @@ endif()
 
 # Build less useful tool/test binaries.
 if(RTS_BUILD_CORE_EXTRAS)
-    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD)
         add_subdirectory(NativeRendererGraphTest)
+        add_subdirectory(NativeW3DOwnerQueueTest)
         add_subdirectory(NativeW3DRendererTest)
         add_subdirectory(NativeW3DResourcesTest)
         add_subdirectory(NativeW3D2Test)
