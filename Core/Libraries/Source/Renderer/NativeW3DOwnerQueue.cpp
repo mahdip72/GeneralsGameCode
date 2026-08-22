@@ -120,6 +120,106 @@ private:
 
 	QueueLock &m_lock;
 };
+
+#ifdef _WIN32
+long IncrementTokenReference(volatile long *references)
+{
+	return InterlockedIncrement(references);
+}
+
+long DecrementTokenReference(volatile long *references)
+{
+	return InterlockedDecrement(references);
+}
+#else
+long IncrementTokenReference(volatile long *references)
+{
+	return __sync_add_and_fetch(references, 1);
+}
+
+long DecrementTokenReference(volatile long *references)
+{
+	return __sync_sub_and_fetch(references, 1);
+}
+#endif
+}
+
+struct NativeW3DOwnerToken::Impl
+{
+	Impl(void *requestedContext, NativeW3DOwnerContextRelease requestedRelease) :
+		references(1), context(requestedContext), release(requestedRelease)
+	{
+	}
+
+	volatile long references;
+	void *context;
+	NativeW3DOwnerContextRelease release;
+};
+
+NativeW3DOwnerToken::NativeW3DOwnerToken() : m_impl(0)
+{
+}
+
+NativeW3DOwnerToken::~NativeW3DOwnerToken()
+{
+	delete m_impl;
+	m_impl = 0;
+}
+
+NativeW3DOwnerToken *NativeW3DOwnerToken::Create(void *context,
+	NativeW3DOwnerContextRelease release)
+{
+	NativeW3DOwnerToken *token =
+		new (std::nothrow) NativeW3DOwnerToken();
+	if (token == 0)
+	{
+		return 0;
+	}
+	token->m_impl = new (std::nothrow) Impl(context, release);
+	if (token->m_impl == 0)
+	{
+		delete token;
+		return 0;
+	}
+	return token;
+}
+
+void NativeW3DOwnerToken::AddRef()
+{
+	if (m_impl != 0)
+	{
+		IncrementTokenReference(&m_impl->references);
+	}
+}
+
+void NativeW3DOwnerToken::Release()
+{
+	if (m_impl == 0 ||
+		DecrementTokenReference(&m_impl->references) != 0)
+	{
+		return;
+	}
+
+	NativeW3DOwnerContextRelease release = m_impl->release;
+	void *context = m_impl->context;
+	delete this;
+	if (release != 0)
+	{
+		try
+		{
+			release(context);
+		}
+		catch (...)
+		{
+			// Release callbacks are cleanup notifications.  They must not let a
+			// queue drain or a token destructor propagate an exception.
+		}
+	}
+}
+
+void *NativeW3DOwnerToken::Context() const
+{
+	return m_impl == 0 ? 0 : m_impl->context;
 }
 
 struct NativeW3DOwnerQueue::Impl
@@ -127,7 +227,7 @@ struct NativeW3DOwnerQueue::Impl
 	struct Entry
 	{
 		NativeW3DOwnerCommand command;
-		void *context;
+		NativeW3DOwnerToken *token;
 	};
 
 	Impl(unsigned int requestedCapacity) :
@@ -177,10 +277,28 @@ NativeW3DOwnerQueue::~NativeW3DOwnerQueue()
 	}
 	if (m_impl->lock.IsInitialized())
 	{
-		ScopedQueueLock lock(m_impl->lock);
-		m_impl->count = 0;
-		m_impl->head = 0;
-		m_impl->tail = 0;
+		// Release queue-owned token references outside the lock.  A release
+		// callback is caller code and may re-enter unrelated queue state.
+		while (true)
+		{
+			NativeW3DOwnerToken *token = 0;
+			{
+				ScopedQueueLock lock(m_impl->lock);
+				if (m_impl->count == 0)
+				{
+					break;
+				}
+				token = m_impl->entries[m_impl->head].token;
+				m_impl->entries[m_impl->head].command = 0;
+				m_impl->entries[m_impl->head].token = 0;
+				m_impl->head = (m_impl->head + 1) % m_impl->capacity;
+				--m_impl->count;
+			}
+			if (token != 0)
+			{
+				token->Release();
+			}
+		}
 	}
 	delete m_impl;
 	m_impl = 0;
@@ -206,9 +324,9 @@ RenderResult NativeW3DOwnerQueue::BindOwner()
 }
 
 RenderResult NativeW3DOwnerQueue::Enqueue(NativeW3DOwnerCommand command,
-	void *context)
+	NativeW3DOwnerToken *token)
 {
-	if (command == 0)
+	if (command == 0 || token == 0)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
@@ -228,7 +346,8 @@ RenderResult NativeW3DOwnerQueue::Enqueue(NativeW3DOwnerCommand command,
 	}
 
 	m_impl->entries[m_impl->tail].command = command;
-	m_impl->entries[m_impl->tail].context = context;
+	token->AddRef();
+	m_impl->entries[m_impl->tail].token = token;
 	m_impl->tail = (m_impl->tail + 1) % m_impl->capacity;
 	++m_impl->count;
 	return RENDER_RESULT_OK;
@@ -267,7 +386,7 @@ RenderResult NativeW3DOwnerQueue::Drain(unsigned int maxCommands,
 	while (*drained < budget)
 	{
 		NativeW3DOwnerCommand command = 0;
-		void *context = 0;
+		NativeW3DOwnerToken *token = 0;
 		{
 			ScopedQueueLock lock(m_impl->lock);
 			if (m_impl->count == 0)
@@ -275,21 +394,22 @@ RenderResult NativeW3DOwnerQueue::Drain(unsigned int maxCommands,
 				break;
 			}
 			command = m_impl->entries[m_impl->head].command;
-			context = m_impl->entries[m_impl->head].context;
+			token = m_impl->entries[m_impl->head].token;
 			m_impl->entries[m_impl->head].command = 0;
-			m_impl->entries[m_impl->head].context = 0;
+			m_impl->entries[m_impl->head].token = 0;
 			m_impl->head = (m_impl->head + 1) % m_impl->capacity;
 			--m_impl->count;
 		}
 
 		try
 		{
-			command(context);
+			command(token->Context());
 		}
 		catch (...)
 		{
 			result = RENDER_RESULT_FAILED;
 		}
+		token->Release();
 		++*drained;
 	}
 	return result;
