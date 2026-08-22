@@ -37,7 +37,9 @@ if ($SelfTest) {
 $root = (Resolve-Path -LiteralPath $SourceRoot).Path
 $relativePaths = @(
     'Core/Libraries/Include/Renderer/NativeW3DRenderer.h',
-    'Core/Libraries/Source/Renderer/NativeW3DRenderer.cpp'
+    'Core/Libraries/Source/Renderer/NativeW3DRenderer.cpp',
+    'Core/Libraries/Include/Renderer/NativeW3DResources.h',
+    'Core/Libraries/Source/Renderer/NativeW3DResources.cpp'
 )
 $violations = @()
 foreach ($relativePath in $relativePaths) {

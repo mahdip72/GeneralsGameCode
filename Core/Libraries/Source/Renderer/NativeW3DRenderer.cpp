@@ -1,4 +1,5 @@
 #include "Renderer/NativeW3DRenderer.h"
+#include "Renderer/NativeW3DResources.h"
 
 #include <limits.h>
 #include <windows.h>
@@ -24,7 +25,7 @@ NativeDrawPacket::NativeDrawPacket() :
 }
 
 NativeW3DRenderer::NativeW3DRenderer() :
-	m_device(0), m_context(0), m_ownerThread(0), m_frameOpen(false)
+	m_device(0), m_context(0), m_resources(0), m_ownerThread(0), m_frameOpen(false)
 {
 }
 
@@ -90,6 +91,11 @@ RenderResult NativeW3DRenderer::Shutdown()
 	}
 	if (m_device != 0)
 	{
+		if (m_resources != 0)
+		{
+			m_resources->InvalidateRenderer();
+			m_resources = 0;
+		}
 		m_device->shutdown();
 		delete m_device;
 	}
@@ -114,22 +120,39 @@ RenderResult NativeW3DRenderer::BeginFrame()
 	return result;
 }
 
-RenderResult NativeW3DRenderer::Submit(const LegacyLogicalState &state,
+RenderResult NativeW3DRenderer::Submit(const NativeW3DResources &resources,
+	const LegacyLogicalState &state,
 	const NativeDrawPacket &packet)
 {
-	if (m_context == 0 || !m_frameOpen || !IsOwnerThread() ||
+	if (m_context == 0 || !m_frameOpen || !IsOwnerThread() || !resources.IsBoundTo(this) ||
 		!packet.vertexBuffer.isValid() ||
 		packet.vertexStride == 0 || packet.vertexCount == 0)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
-	if (packet.indexed && (!packet.indexBuffer.isValid() ||
-		packet.indexCount == 0))
+	if (!resources.IsVertexRangeValid(packet.vertexBuffer, packet.vertexStride,
+		packet.vertexOffset, packet.startVertex, packet.vertexCount) ||
+		(packet.indexed && (!resources.IsIndexRangeValid(packet.indexBuffer,
+		packet.indexFormat, packet.indexOffset, packet.startIndex,
+		packet.indexCount))))
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
-	RenderResult result = m_context->setLegacyState(state,
-		packet.vertexFormat, packet.texturePresenceMask);
+	if ((packet.texturePresenceMask & ~((1U << LEGACY_TEXTURE_STAGE_COUNT) - 1U)) != 0)
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
+	{
+		const bool expected = (packet.texturePresenceMask & (1U << stage)) != 0;
+		const bool supplied = packet.textures[stage].isValid();
+		if (expected != supplied || !resources.IsTextureValidOrEmpty(packet.textures[stage]))
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+	}
+	RenderResult result = m_context->setLegacyStateForLayout(state,
+		packet.vertexLayout, packet.texturePresenceMask);
 	if (result != RENDER_RESULT_OK)
 	{
 		return result;

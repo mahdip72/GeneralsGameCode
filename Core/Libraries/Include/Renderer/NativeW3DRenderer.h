@@ -7,6 +7,7 @@ namespace rts
 {
 namespace render
 {
+class NativeW3DResources;
 // Native facade inputs are intentionally logical and handle-based.  Game code
 // never receives a backend COM pointer or a legacy-adapter header.
 struct NativeW3DRendererDescriptor
@@ -33,6 +34,7 @@ struct NativeDrawPacket
 	unsigned int indexOffset;
 	RenderFormat indexFormat;
 	LegacyVertexFormat vertexFormat;
+	LegacyVertexLayout vertexLayout;
 	RenderPrimitiveTopology topology;
 	unsigned int texturePresenceMask;
 	unsigned int vertexCount;
@@ -56,7 +58,8 @@ public:
 	// than releasing backend state from an arbitrary caller.
 	RenderResult Shutdown();
 	RenderResult BeginFrame();
-	RenderResult Submit(const LegacyLogicalState &state,
+	RenderResult Submit(const NativeW3DResources &resources,
+		const LegacyLogicalState &state,
 		const NativeDrawPacket &packet);
 	RenderResult EndFrame(bool present);
 	RenderResult RecoverDevice();
@@ -65,11 +68,13 @@ public:
 	bool IsFrameOpen() const;
 
 private:
+	friend class NativeW3DResources;
 	NativeW3DRenderer(const NativeW3DRenderer &);
 	NativeW3DRenderer &operator=(const NativeW3DRenderer &);
 
 	IRenderDevice *m_device;
 	IRenderContext *m_context;
+	NativeW3DResources *m_resources;
 	unsigned long m_ownerThread;
 	bool m_frameOpen;
 

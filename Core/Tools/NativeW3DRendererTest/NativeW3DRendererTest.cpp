@@ -1,4 +1,5 @@
 #include "Renderer/NativeW3DRenderer.h"
+#include "Renderer/NativeW3DResources.h"
 
 #include <cstdio>
 
@@ -19,6 +20,7 @@ int main()
 {
 	int result = 0;
 	rts::render::NativeW3DRenderer renderer;
+	rts::render::NativeW3DResources resources;
 	rts::render::NativeW3DRendererDescriptor descriptor;
 	rts::render::NativeDrawPacket packet;
 	rts::render::LegacyLogicalState state;
@@ -27,7 +29,7 @@ int main()
 		"cannot begin a native frame before initialization");
 	result |= Check(renderer.EndFrame(false) == rts::render::RENDER_RESULT_INVALID_ARGUMENT,
 		"cannot end a native frame before initialization");
-	result |= Check(renderer.Submit(state, packet) == rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+	result |= Check(renderer.Submit(resources, state, packet) == rts::render::RENDER_RESULT_INVALID_ARGUMENT,
 		"cannot submit a native draw before initialization");
 	descriptor.width = 640;
 	descriptor.height = 480;
@@ -40,5 +42,8 @@ int main()
 		"recovery and resize reject an uninitialized native facade");
 	result |= Check(renderer.Shutdown() == rts::render::RENDER_RESULT_OK,
 		"shutdown is idempotent before native initialization");
+	result |= Check(resources.Bind(0) == rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+		!resources.Destroy(packet.vertexBuffer),
+		"native resource tables reject an unbound renderer and stale handles");
 	return result;
 }
