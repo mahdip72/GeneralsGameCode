@@ -46,6 +46,14 @@ NativeW3DResources::~NativeW3DResources()
 	{
 		Shutdown();
 	}
+	// Do not leave a non-owning facade pointer behind when destruction is
+	// requested from the wrong thread or a release operation failed.  Backend
+	// mutation remains owner-only; this only severs the C++ association.
+	if (m_impl != 0 && m_impl->renderer != 0)
+	{
+		m_impl->renderer->m_resources = 0;
+		m_impl->renderer = 0;
+	}
 	delete m_impl;
 }
 
@@ -198,7 +206,8 @@ bool NativeW3DResources::Destroy(GpuHandle handle)
 
 bool NativeW3DResources::IsValid(GpuHandle handle) const
 {
-	return Find(handle) != 0;
+	return m_impl != 0 && m_impl->renderer != 0 &&
+		m_impl->renderer->IsOwnerThread() && Find(handle) != 0;
 }
 
 NativeW3DResources::Slot *NativeW3DResources::Find(GpuHandle handle)

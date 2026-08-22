@@ -126,7 +126,8 @@ RenderResult NativeW3DRenderer::Submit(const NativeW3DResources &resources,
 {
 	if (m_context == 0 || !m_frameOpen || !IsOwnerThread() || !resources.IsBoundTo(this) ||
 		!packet.vertexBuffer.isValid() ||
-		packet.vertexStride == 0 || packet.vertexCount == 0)
+		packet.vertexStride == 0 || packet.vertexLayout.stride != packet.vertexStride ||
+		packet.vertexCount == 0)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
@@ -214,6 +215,11 @@ RenderResult NativeW3DRenderer::RecoverDevice()
 	const RenderResult result = m_device->recoverDevice();
 	if (result != RENDER_RESULT_OK)
 	{
+		if (m_resources != 0)
+		{
+			m_resources->InvalidateRenderer();
+			m_resources = 0;
+		}
 		return result;
 	}
 	m_context = m_device->immediateContext();
