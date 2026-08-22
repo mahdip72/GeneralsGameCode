@@ -38,6 +38,7 @@
 #include "W3DDevice/GameClient/W3DShaderManager.h"
 #include "WW3D2/assetmgr.h"
 #include "W3DDevice/GameClient/W3DShroud.h"
+#include "W3DDevice/Common/W3DShroudRenderPolicy.h"
 #include "WW3D2/textureloader.h"
 #include "Common/GlobalData.h"
 #include "GameLogic/PartitionManager.h"
@@ -257,6 +258,7 @@ Bool W3DShroud::ReAcquireResources()
 		m_pDstTexture->Get_Filter().Set_V_Addr_Mode(TextureFilterClass::TEXTURE_ADDRESS_CLAMP);
 		m_pDstTexture->Get_Filter().Set_Mip_Mapping(TextureFilterClass::FILTER_TYPE_NONE);
 		m_clearDstTexture = TRUE;	//force clearing of destination texture first time it's used.
+		m_srcTextureDirty = TRUE;	//the recreated destination needs a fresh source copy after reset.
 
 		return TRUE;
 }
@@ -660,6 +662,7 @@ void W3DShroud::render(CameraClass *cam)
 	}
 
 #endif //LOAD_DUMMY_SHROUD
+	const Bool sourceDirtyBeforeSync = m_srcTextureDirty;
 	if (!syncSourceTexture())
 		return;
 
@@ -749,8 +752,18 @@ void W3DShroud::render(CameraClass *cam)
 	//interpolate current shroud state to the final one
 	interpolateFogLevels(&srcRect);
 #endif
+	const Bool sourceDirtyAfterInterpolation = m_srcTextureDirty;
+	if (sourceDirtyAfterInterpolation && !syncSourceTexture())
+		return;
 
-	if (m_clearDstTexture)
+	const Bool destinationBorderDirty = m_clearDstTexture;
+	const rts::render::W3DShroudDestinationUpdateDecision updateDecision =
+		rts::render::EvaluateW3DShroudDestinationUpdate(
+			sourceDirtyBeforeSync,
+			sourceDirtyAfterInterpolation,
+			destinationBorderDirty);
+
+	if (destinationBorderDirty)
 	{	//we need to clear unused parts of the destination texture to a known
 		//color in order to keep map border in the state we want.
 		m_clearDstTexture=FALSE;
@@ -758,6 +771,7 @@ void W3DShroud::render(CameraClass *cam)
 		fillBorderShroudData(m_boderShroudLevel, pDestSurface);
 	}
 
+	if (updateDecision.copySource)
 	{
 		//USE_PERF_TIMER(shroudCopy)
 		DX8Wrapper::_Copy_DX8_Rects(
@@ -767,8 +781,11 @@ void W3DShroud::render(CameraClass *cam)
 				pDestSurface->Peek_D3D_Surface(),
 				&dstPoint);
 	}
-	Notify_Render_Texture_Changed(
-		m_pDstTexture->Peek_D3D_Base_Texture());
+	if (updateDecision.notifyTexture)
+	{
+		Notify_Render_Texture_Changed(
+			m_pDstTexture->Peek_D3D_Base_Texture());
+	}
 
 	REF_PTR_RELEASE (pDestSurface);
 }
