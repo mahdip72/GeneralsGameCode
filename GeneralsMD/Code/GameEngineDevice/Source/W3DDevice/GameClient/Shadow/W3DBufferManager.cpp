@@ -52,6 +52,9 @@ static int FVFTypeIndexList[W3DBufferManager::MAX_FVF]=
 
 Int W3DBufferManager::getDX8Format(VBM_FVF_TYPES format)
 {
+	DEBUG_ASSERTCRASH(format >= 0 && format < MAX_FVF, ("Invalid shadow vertex format"));
+	if (format < 0 || format >= MAX_FVF)
+		return 0;
 	return FVFTypeIndexList[format];
 }
 
@@ -216,6 +219,9 @@ Bool W3DBufferManager::ReAcquireResources()
 W3DBufferManager::W3DVertexBufferSlot *W3DBufferManager::getSlot(VBM_FVF_TYPES fvfType, Int size)
 {
 	W3DVertexBufferSlot *vbSlot=nullptr;
+	DEBUG_ASSERTCRASH(fvfType >= 0 && fvfType < MAX_FVF, ("Invalid shadow vertex format"));
+	if (fvfType < 0 || fvfType >= MAX_FVF)
+		return nullptr;
 
 	//round size to next multiple of minimum slot size.
 	//should help avoid fragmentation.
@@ -263,6 +269,9 @@ W3DBufferManager::W3DVertexBufferSlot * W3DBufferManager::allocateSlotStorage(VB
 
 	W3DVertexBuffer *pVB;
 	W3DVertexBufferSlot *vbSlot;
+	DEBUG_ASSERTCRASH(fvfType >= 0 && fvfType < MAX_FVF, ("Invalid shadow vertex format"));
+	if (fvfType < 0 || fvfType >= MAX_FVF)
+		return nullptr;
 //	Int sizeIndex = (size >> MIN_SLOT_SIZE_SHIFT)-1;
 
 	DEBUG_ASSERTCRASH(m_numEmptySlotsAllocated < MAX_NUMBER_SLOTS, ("No more VB Slots"));

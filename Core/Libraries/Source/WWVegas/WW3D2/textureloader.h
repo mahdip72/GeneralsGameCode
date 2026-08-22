@@ -274,7 +274,7 @@ class TextureLoadTaskClass : public TextureLoadTaskListNodeClass
 		virtual void			Release_Prepared_Surfaces();
 		virtual size_t			Get_Prepare_Memory_Byte_Count() const;
 
-		virtual void			Lock_Surfaces				();
+		virtual bool			Lock_Surfaces				();
 		virtual void			Unlock_Surfaces			();
 
 		void						Apply							(bool initialize);
@@ -330,7 +330,7 @@ protected:
 	virtual size_t			Get_Prepare_Memory_Byte_Count() const override;
 //	virtual bool			Load_Uncompressed_Mipmap() override;
 
-	virtual void			Lock_Surfaces				() override;
+	virtual bool			Lock_Surfaces				() override;
 	virtual void			Unlock_Surfaces			() override;
 
 private:

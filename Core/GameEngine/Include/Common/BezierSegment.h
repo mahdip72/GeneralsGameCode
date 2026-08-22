@@ -29,7 +29,6 @@
 
 #pragma once
 
-#include <d3dx8math.h>
 #include "Common/STLTypedefs.h"
 
 #define USUAL_TOLERANCE 1.0f
@@ -37,7 +36,11 @@
 class BezierSegment
 {
 	protected:
-		static const D3DXMATRIX s_bezBasisMatrix;
+		// The legacy implementation used D3DXMATRIX only as a four-by-four
+		// coefficient table.  Keep the table in engine-native storage so the
+		// Bezier code has no dependency on the renderer math ABI.
+		static const float s_bezBasisMatrix[4][4];
+		static void transformBasis(const float input[4], float output[4]);
 		Coord3D m_controlPoints[4];
 
 	public:	// Constructors

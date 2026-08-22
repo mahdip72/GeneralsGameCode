@@ -76,6 +76,7 @@ W3DShroud::W3DShroud()
 	m_pDstTexture=nullptr;
 	m_srcTextureData=nullptr;
 	m_srcTexturePitch=0;
+	m_srcTextureDirty=FALSE;
 	m_dstTextureWidth=m_numMaxVisibleCellsX=0;
 	m_dstTextureHeight=m_numMaxVisibleCellsY=0;
 	m_boderShroudLevel = (W3DShroudLevel)TheGlobalData->m_shroudAlpha;	//assume border is black
@@ -95,6 +96,7 @@ W3DShroud::~W3DShroud()
 
 	if (m_pSrcTexture)
 		m_pSrcTexture->Release();
+	delete [] static_cast<Byte *>(m_srcTextureData);
 
 	delete [] m_finalFogData;
 	delete [] m_currentFogData;
@@ -164,20 +166,16 @@ void W3DShroud::init(WorldHeightMap *pMap, Real worldCellSizeX, Real worldCellSi
 
 	DEBUG_ASSERTCRASH( m_pSrcTexture != nullptr, ("Failed to Allocate Shroud Src Surface"));
 
-	D3DLOCKED_RECT rect;
-
-	//Get a pointer to source surface pixels.
-	HRESULT res = m_pSrcTexture->LockRect(&rect,nullptr,D3DLOCK_NO_DIRTY_UPDATE);
-	m_pSrcTexture->UnlockRect();
-
-	DEBUG_ASSERTCRASH( res == D3D_OK, ("Failed to lock shroud src surface"));
-	res = 0;// just to avoid compiler warnings
-
-	m_srcTextureData=rect.pBits;
-	m_srcTexturePitch=rect.Pitch;
-
-	//clear entire texture to black
+	// Keep the logical source image in CPU-owned memory.  The old code retained
+	// rect.pBits after UnlockRect(), which is not a valid pointer lifetime for
+	// either the legacy surface implementation or the modern bridge.
+	m_srcTexturePitch=srcWidth*sizeof(UnsignedShort);
+	m_srcTextureData=new Byte[m_srcTexturePitch*srcHeight];
+	DEBUG_ASSERTCRASH(m_srcTextureData != nullptr, ("Failed to allocate shroud source data"));
+	if (!m_srcTextureData)
+		return;
 	memset(m_srcTextureData,0,m_srcTexturePitch*srcHeight);
+	m_srcTextureDirty=TRUE;
 
 #if defined(RTS_DEBUG)
 	if (TheGlobalData && TheGlobalData->m_fogOfWarOn)
@@ -208,6 +206,10 @@ void W3DShroud::reset()
 		m_pSrcTexture->Release();
 		m_pSrcTexture=nullptr;
 	}
+	delete [] static_cast<Byte *>(m_srcTextureData);
+	m_srcTextureData=nullptr;
+	m_srcTexturePitch=0;
+	m_srcTextureDirty=FALSE;
 
 	delete [] m_finalFogData;
 	m_finalFogData=nullptr;
@@ -260,6 +262,39 @@ Bool W3DShroud::ReAcquireResources()
 }
 
 //-----------------------------------------------------------------------------
+// Upload the CPU-owned source image while the legacy surface is locked. The
+// surface pointer is deliberately scoped to this operation; callers never
+// retain D3DLOCKED_RECT::pBits after UnlockRect().
+Bool W3DShroud::syncSourceTexture()
+{
+	if (!m_srcTextureDirty || !m_pSrcTexture || !m_srcTextureData)
+		return TRUE;
+
+	D3DLOCKED_RECT rect;
+	HRESULT res=m_pSrcTexture->LockRect(&rect,nullptr,D3DLOCK_NO_DIRTY_UPDATE);
+	if (res != D3D_OK || rect.pBits == nullptr || rect.Pitch < (Int)m_srcTexturePitch)
+	{
+		if (res == D3D_OK)
+			m_pSrcTexture->UnlockRect();
+		return FALSE;
+	}
+
+	const UnsignedInt srcHeight=(UnsignedInt)m_numCellsY+1;
+	Byte *source=(Byte *)m_srcTextureData;
+	Byte *destination=(Byte *)rect.pBits;
+	for (UnsignedInt y=0; y<srcHeight; ++y)
+	{
+		memcpy(destination,source,m_srcTexturePitch);
+		destination+=rect.Pitch;
+		source+=m_srcTexturePitch;
+	}
+
+	m_pSrcTexture->UnlockRect();
+	m_srcTextureDirty=FALSE;
+	return TRUE;
+}
+
+//-----------------------------------------------------------------------------
 W3DShroudLevel W3DShroud::getShroudLevel(Int x, Int y)
 {
 	DEBUG_ASSERTCRASH( m_pSrcTexture != nullptr, ("Reading empty shroud"));
@@ -288,7 +323,7 @@ void W3DShroud::setShroudLevel(Int x, Int y, W3DShroudLevel level, Bool textureO
 	if (!m_pSrcTexture)
 		return;
 
-	if (x < m_numCellsX && y < m_numCellsY)
+	if (x >= 0 && y >= 0 && x < m_numCellsX && y < m_numCellsY)
 	{
 		if (level < TheGlobalData->m_shroudAlpha)
 			level = TheGlobalData->m_shroudAlpha;
@@ -343,6 +378,7 @@ void W3DShroud::setShroudLevel(Int x, Int y, W3DShroudLevel level, Bool textureO
 
 			*texel = ( ((bluepixel&0xf8) >> 3) | ((greenpixel&0xfc)<<3) | ((redpixel&0xf8)<<8));
 		}
+		m_srcTextureDirty=TRUE;
 		return;
 	}
 }
@@ -411,10 +447,15 @@ void W3DShroud::fillShroudData(W3DShroudLevel level)
 		ptr	+= pitch;
 	}
 #endif
+	m_srcTextureDirty=TRUE;
 }
 
 void W3DShroud::fillBorderShroudData(W3DShroudLevel level, SurfaceClass* pDestSurface)
 {
+	if (!pDestSurface || m_numCellsX <= 0 ||
+		m_dstTextureWidth <= 0 || m_dstTextureHeight <= 0)
+		return;
+
 	Int x,y;
 	UnsignedShort pixel;
 
@@ -454,6 +495,9 @@ void W3DShroud::fillBorderShroudData(W3DShroudLevel level, SurfaceClass* pDestSu
 	//Fill unused texels with border color
 	for (x=0; x<m_numCellsX; x++)
 			ptr[x]=pixel;
+	m_srcTextureDirty=TRUE;
+	if (!syncSourceTexture())
+		return;
 
 	//Fill destination texture with border color
 
@@ -526,7 +570,7 @@ void W3DShroud::render(CameraClass *cam)
 	if (!m_pSrcTexture)
 		return; //nothing to update from.  Must be in reset state.
 
-	if (DX8Wrapper::_Get_D3D_Device8() && (DX8Wrapper::_Get_D3D_Device8()->TestCooperativeLevel()) != D3D_OK)
+	if (!DX8Wrapper::Is_Initted() || DX8Wrapper::Is_Device_Lost())
 		return;	//device not ready to render anything
 
 #if defined(RTS_DEBUG)
@@ -611,10 +655,13 @@ void W3DShroud::render(CameraClass *cam)
 		REF_PTR_RELEASE (pSurface);
 		REF_PTR_RELEASE (DummyTexture);
 
+		m_srcTextureDirty=TRUE;
 		doInit=0;
 	}
 
 #endif //LOAD_DUMMY_SHROUD
+	if (!syncSourceTexture())
+		return;
 
 
 	WorldHeightMap *hm=TheTerrainRenderObject->getMap();
@@ -687,6 +734,8 @@ void W3DShroud::render(CameraClass *cam)
 	{
 		pDestSurface=m_pDstTexture->Get_Surface_Level(0);
 	}
+	if (!pDestSurface)
+		return;
 
 	RECT	srcRect;
 	POINT	dstPoint={1,1};	//first row/column is reserved for border.
@@ -718,6 +767,8 @@ void W3DShroud::render(CameraClass *cam)
 				pDestSurface->Peek_D3D_Surface(),
 				&dstPoint);
 	}
+	Notify_Render_Texture_Changed(
+		m_pDstTexture->Peek_D3D_Base_Texture());
 
 	REF_PTR_RELEASE (pDestSurface);
 }

@@ -2,14 +2,18 @@
 
 #if defined(RTS_RENDERER_HAS_D3D11)
 
+#include "dx8wrapper.h"
 #include "dx8fvf.h"
 #include "dx8indexbuffer.h"
 #include "dx8vertexbuffer.h"
+#include "surfaceblit.h"
+#include "Renderer/LegacyBridgeCache.h"
+#include "Renderer/LegacyBridgeValidation.h"
 #include "Renderer/LegacyRenderState.h"
 #include "Renderer/RendererDevice.h"
 
-#include <d3dx8tex.h>
 #include <limits>
+#include <math.h>
 #include <new>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +29,9 @@ namespace
 const unsigned int BUFFER_CACHE_CAPACITY = 1024;
 const unsigned int TEXTURE_CACHE_CAPACITY = 1024;
 const unsigned int CACHE_STALE_FRAME_COUNT = 600;
+const size_t PRIMITIVE_UP_BUFFER_CAPACITY = 256 * 1024;
+const unsigned int MAX_TEXTURE_REFRESH_SUBRESOURCES = 4096;
+const size_t MAX_TEXTURE_REFRESH_BYTES = 256U * 1024U * 1024U;
 const unsigned int MAX_TGA_DIMENSION = 65535;
 const char *const VISUAL_SMOKE_CAPTURE_FILE = "D3D11RendererCapture.tga";
 const char *const VISUAL_SMOKE_CAPTURE_SUCCESS_FILE =
@@ -48,6 +55,7 @@ using rts::render::LegacyVertexDataFormat;
 using rts::render::LegacyVertexElement;
 using rts::render::LegacyVertexLayout;
 using rts::render::RenderResult;
+using rts::render::RenderTargetBinding;
 using rts::render::TextureDescriptor;
 using rts::render::TextureSubresourceData;
 
@@ -99,10 +107,17 @@ bool Build_Vertex_Layout(const FVFInfoClass &fvf_info,
 	*layout = LegacyVertexLayout();
 	layout->stride = fvf_info.Get_FVF_Size();
 	const unsigned int fvf = fvf_info.Get_FVF();
-	if ((fvf & D3DFVF_POSITION_MASK) != D3DFVF_XYZ ||
-		!Append_Element(layout, rts::render::RENDER_VERTEX_SEMANTIC_POSITION,
-			0, rts::render::RENDER_VERTEX_DATA_FLOAT3,
-			fvf_info.Get_Location_Offset()))
+	const unsigned int position_format = fvf & D3DFVF_POSITION_MASK;
+	if (position_format != D3DFVF_XYZ && position_format != D3DFVF_XYZRHW)
+	{
+		return false;
+	}
+	layout->preTransformed = position_format == D3DFVF_XYZRHW;
+	if (!Append_Element(layout, rts::render::RENDER_VERTEX_SEMANTIC_POSITION,
+		0, layout->preTransformed ?
+			rts::render::RENDER_VERTEX_DATA_FLOAT4 :
+			rts::render::RENDER_VERTEX_DATA_FLOAT3,
+		fvf_info.Get_Location_Offset()))
 	{
 		return false;
 	}
@@ -156,7 +171,8 @@ void Append_Layout_Diagnostic(char *message, unsigned int capacity,
 	{
 		return;
 	}
-	int written = snprintf(message + *used, capacity - *used, " layout=[");
+	int written = snprintf(message + *used, capacity - *used,
+		" pretransformed=%u layout=[", layout.preTransformed ? 1U : 0U);
 	if (written < 0 || static_cast<unsigned int>(written) >= capacity - *used)
 	{
 		message[capacity - 1] = '\0';
@@ -189,64 +205,95 @@ void Append_Layout_Diagnostic(char *message, unsigned int capacity,
 	}
 }
 
-unsigned int Primitive_Index_Count(unsigned int primitive_type,
-	unsigned int primitive_count)
+bool Primitive_Index_Count(unsigned int primitive_type,
+	unsigned int primitive_count, unsigned int *index_count)
 {
+	return rts::render::Checked_D3D8_Primitive_Index_Count(primitive_type,
+		primitive_count, index_count);
+}
+
+bool Primitive_Up_Vertex_Count(unsigned int primitive_type,
+	unsigned int primitive_count, size_t *vertex_count)
+{
+	if (vertex_count == 0)
+	{
+		return false;
+	}
 	switch (primitive_type)
 	{
-	case D3DPT_TRIANGLELIST: return primitive_count * 3;
-	case D3DPT_TRIANGLESTRIP: return primitive_count + 2;
-	case D3DPT_LINELIST: return primitive_count * 2;
-	case D3DPT_LINESTRIP: return primitive_count + 1;
-	default: return 0;
+	case D3DPT_TRIANGLELIST:
+		return Checked_Multiply(static_cast<size_t>(primitive_count), 3,
+			vertex_count);
+	case D3DPT_TRIANGLESTRIP:
+		if (primitive_count > std::numeric_limits<size_t>::max() - 2)
+		{
+			return false;
+		}
+		*vertex_count = static_cast<size_t>(primitive_count) + 2;
+		return true;
+	case D3DPT_LINESTRIP:
+		if (primitive_count > std::numeric_limits<size_t>::max() - 1)
+		{
+			return false;
+		}
+		*vertex_count = static_cast<size_t>(primitive_count) + 1;
+		return true;
+	case D3DPT_LINELIST:
+		return Checked_Multiply(static_cast<size_t>(primitive_count), 2,
+			vertex_count);
+	default:
+		return false;
 	}
 }
 
-rts::render::RenderPrimitiveTopology Translate_Topology(
-	unsigned int primitive_type)
-{
-	switch (primitive_type)
-	{
-	case D3DPT_TRIANGLESTRIP:
-		return rts::render::RENDER_PRIMITIVE_TRIANGLE_STRIP;
-	case D3DPT_LINELIST:
-		return rts::render::RENDER_PRIMITIVE_LINE_LIST;
-	case D3DPT_LINESTRIP:
-		return rts::render::RENDER_PRIMITIVE_LINE_STRIP;
-	default:
-		return rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST;
-	}
-}
 }
 
 struct D3D11LegacyBridge::Impl
 {
 	struct BufferEntry
 	{
-		BufferEntry() : source(0), byte_count(0), last_used_frame(0), handle() {}
+		BufferEntry() : source(0), byte_count(0), source_generation(0),
+			source_dirty(true),
+			last_used_frame(0), handle() {}
 		IUnknown *source;
 		size_t byte_count;
+		unsigned int source_generation;
+		bool source_dirty;
 		unsigned int last_used_frame;
 		GpuHandle handle;
 	};
 
 	struct TextureEntry
 	{
-		TextureEntry() : source(0), render_target(false), last_used_frame(0),
-			handle() {}
+		TextureEntry() : source(0), render_target(false), depth_stencil(false),
+			d3d11_authority(false), d3d8_dirty(false),
+			last_used_frame(0), handle() {}
 		IDirect3DBaseTexture8 *source;
 		bool render_target;
+		bool depth_stencil;
+		bool d3d11_authority;
+		bool d3d8_dirty;
 		unsigned int last_used_frame;
 		GpuHandle handle;
 	};
 
 	Impl() : device(0), context(0), legacy_device(0), frame_open(false),
 		log_file(0), frame_id(0), draw_count(0), draw_failure_count(0),
+		raw_indexed_draw_count(0),
+		counter_clockwise_draw_count(0), unculled_draw_count(0),
+		color_write_draw_count(0), depth_never_draw_count(0),
+		clear_count(0), viewport_count(0), frame_draw_count(0),
+		dynamic_texture_refresh_count(0), dynamic_texture_in_place_count(0),
+		dynamic_texture_recreate_count(0), capture_draw_logged(false),
 		width(0), height(0), owner_thread_id(0), frame_outcome(), capture_queue(8),
 		pending_viewport(false), pending_clear(false),
 		pending_clear_color(false), pending_clear_depth_stencil(false),
 		pending_red(0.0f), pending_green(0.0f), pending_blue(0.0f),
-		pending_alpha(0.0f), pending_depth(1.0f), pending_stencil(0) {}
+		pending_alpha(0.0f), pending_depth(1.0f), pending_stencil(0),
+		active_target(), pending_target(), pending_target_change(false),
+		target_transition_failed(false), primitive_up_vertex_buffer(),
+		primitive_up_vertex_capacity(0), vertex_buffer_index(),
+		index_buffer_index(), texture_index(), cache_counters() {}
 
 	IRenderDevice *device;
 	IRenderContext *context;
@@ -256,6 +303,18 @@ struct D3D11LegacyBridge::Impl
 	unsigned int frame_id;
 	unsigned int draw_count;
 	unsigned int draw_failure_count;
+	unsigned int raw_indexed_draw_count;
+	unsigned int counter_clockwise_draw_count;
+	unsigned int unculled_draw_count;
+	unsigned int color_write_draw_count;
+	unsigned int depth_never_draw_count;
+	unsigned int clear_count;
+	unsigned int viewport_count;
+	unsigned int frame_draw_count;
+	unsigned int dynamic_texture_refresh_count;
+	unsigned int dynamic_texture_in_place_count;
+	unsigned int dynamic_texture_recreate_count;
+	bool capture_draw_logged;
 	unsigned int width;
 	unsigned int height;
 	unsigned long owner_thread_id;
@@ -272,9 +331,19 @@ struct D3D11LegacyBridge::Impl
 	float pending_alpha;
 	float pending_depth;
 	unsigned int pending_stencil;
+	RenderTargetBinding active_target;
+	RenderTargetBinding pending_target;
+	bool pending_target_change;
+	bool target_transition_failed;
+	GpuHandle primitive_up_vertex_buffer;
+	size_t primitive_up_vertex_capacity;
 	std::vector<BufferEntry> vertex_buffers;
 	std::vector<BufferEntry> index_buffers;
 	std::vector<TextureEntry> textures;
+	rts::render::LegacyBridgePointerIndex vertex_buffer_index;
+	rts::render::LegacyBridgePointerIndex index_buffer_index;
+	rts::render::LegacyBridgePointerIndex texture_index;
+	rts::render::LegacyBridgeCacheCounters cache_counters;
 
 	bool Require_Owner_Thread(const char *operation)
 	{
@@ -333,33 +402,97 @@ struct D3D11LegacyBridge::Impl
 
 	RenderResult Recover_Device()
 	{
+		// A target transition requested while no frame was open is deliberately
+		// deferred until Begin_Frame. Preserve that newer request across device
+		// recovery instead of falling back to the previously active target.
+		const bool restore_pending_target = pending_target_change;
+		const RenderTargetBinding target_to_restore = restore_pending_target ?
+			pending_target : active_target;
 		capture_queue.advanceGeneration();
 		capture_queue.cancelStale(rts::render::RENDER_RESULT_DEVICE_REMOVED);
 		const RenderResult recovery_result = device->recoverDevice();
 		if (recovery_result != rts::render::RENDER_RESULT_OK)
 		{
+			target_transition_failed = true;
 			return recovery_result;
 		}
 		context = device->immediateContext();
-		return context == 0 ? rts::render::RENDER_RESULT_FAILED :
-			rts::render::RENDER_RESULT_OK;
+		if (context == 0)
+		{
+			target_transition_failed = true;
+			return rts::render::RENDER_RESULT_FAILED;
+		}
+		// Recovery recreates the swap-chain target.  Reapply the target that was
+		// active before recovery at the next Begin_Frame; logical GPU handles are
+		// recreated by the render device in place.
+		active_target = RenderTargetBinding();
+		pending_target = target_to_restore;
+		pending_target_change = true;
+		target_transition_failed = false;
+		return rts::render::RENDER_RESULT_OK;
 	}
 
 	BufferEntry *Find_Buffer(std::vector<BufferEntry> &entries,
-		IUnknown *source)
+		rts::render::LegacyBridgePointerIndex &cache_index,
+		IUnknown *source, bool touch = true)
 	{
-		for (unsigned int index = 0; index < entries.size(); ++index)
+		if (source == 0)
 		{
-			if (entries[index].source == source)
+			return 0;
+		}
+		unsigned int found_index = 0;
+		bool hit = cache_index.Find(source, &found_index) &&
+			found_index < entries.size() &&
+			entries[found_index].source == source;
+		if (!hit)
+		{
+			// The index is maintained at every vector insertion/erase.  Keep a
+			// cold repair path so a stale cache cannot create a duplicate COM
+			// entry after an exceptional allocation or future recovery change.
+			cache_index.Erase(source);
+			for (unsigned int index = 0; index < entries.size(); ++index)
 			{
-				entries[index].last_used_frame = frame_id;
-				return &entries[index];
+				if (entries[index].source == source)
+				{
+					found_index = index;
+					cache_index.Insert(source, index);
+					hit = true;
+					break;
+				}
 			}
 		}
-		return 0;
+		cache_counters.RecordBufferLookup(hit);
+		if (!hit)
+		{
+			return 0;
+		}
+		if (touch)
+		{
+			entries[found_index].last_used_frame = frame_id;
+		}
+		return &entries[found_index];
 	}
 
-	void Evict_Oldest_Buffer(std::vector<BufferEntry> &entries)
+	void Remove_Buffer_Entry(std::vector<BufferEntry> &entries,
+		rts::render::LegacyBridgePointerIndex &cache_index,
+		unsigned int index)
+	{
+		if (index >= entries.size())
+		{
+			return;
+		}
+		IUnknown *source = entries[index].source;
+		device->destroyResource(entries[index].handle);
+		cache_index.EraseAt(source, index);
+		if (source != 0)
+		{
+			source->Release();
+		}
+		entries.erase(entries.begin() + index);
+	}
+
+	void Evict_Oldest_Buffer(std::vector<BufferEntry> &entries,
+		rts::render::LegacyBridgePointerIndex &cache_index)
 	{
 		if (entries.empty())
 		{
@@ -373,28 +506,86 @@ struct D3D11LegacyBridge::Impl
 				oldest = index;
 			}
 		}
-		device->destroyResource(entries[oldest].handle);
-		entries[oldest].source->Release();
-		entries.erase(entries.begin() + oldest);
+		Remove_Buffer_Entry(entries, cache_index, oldest);
 	}
 
-	void Evict_Oldest_Texture()
+	bool Is_Target_Handle_Pinned(const GpuHandle &handle,
+		const RenderTargetBinding &binding) const
+	{
+		if (!handle.isValid())
+		{
+			return false;
+		}
+		return (binding.hasColor && binding.color.resource == handle) ||
+			(binding.hasDepth && binding.depth.resource == handle);
+	}
+
+	bool Is_Texture_Entry_Pinned(const TextureEntry &entry) const
+	{
+		// A target binding owns the corresponding D3D11 resource until the
+		// context transitions away from it.  Producer authority is metadata, not
+		// a permanent residency lease: an unbound render target can be recreated
+		// deterministically from its D3D8 source when the cache needs space.
+		const bool active_target_pinned =
+			Is_Target_Handle_Pinned(entry.handle, active_target);
+		const bool pending_target_pinned = pending_target_change &&
+			Is_Target_Handle_Pinned(entry.handle, pending_target);
+		return active_target_pinned || pending_target_pinned;
+	}
+
+	void Release_Unbound_Texture_Authority(const RenderTargetBinding &binding)
+	{
+		for (unsigned int index = 0; index < textures.size(); ++index)
+		{
+			TextureEntry &entry = textures[index];
+			if (entry.d3d11_authority &&
+				!Is_Target_Handle_Pinned(entry.handle, binding))
+			{
+				entry.d3d11_authority = false;
+			}
+		}
+	}
+
+	bool Remove_Texture_Entry(unsigned int index)
+	{
+		if (index >= textures.size() ||
+			Is_Texture_Entry_Pinned(textures[index]))
+		{
+			return false;
+		}
+		TextureEntry &entry = textures[index];
+		if (entry.handle.isValid() && !device->destroyResource(entry.handle))
+		{
+			return false;
+		}
+		IDirect3DBaseTexture8 *source = entry.source;
+		texture_index.EraseAt(source, index);
+		if (source != 0)
+		{
+			source->Release();
+		}
+		textures.erase(textures.begin() + index);
+		return true;
+	}
+
+	bool Evict_Oldest_Texture()
 	{
 		if (textures.empty())
 		{
-			return;
+			return false;
 		}
-		unsigned int oldest = 0;
-		for (unsigned int index = 1; index < textures.size(); ++index)
+		unsigned int oldest = static_cast<unsigned int>(textures.size());
+		for (unsigned int index = 0; index < textures.size(); ++index)
 		{
-			if (textures[index].last_used_frame < textures[oldest].last_used_frame)
+			if (!Is_Texture_Entry_Pinned(textures[index]) &&
+				(oldest == textures.size() ||
+					textures[index].last_used_frame <
+						textures[oldest].last_used_frame))
 			{
 				oldest = index;
 			}
 		}
-		device->destroyResource(textures[oldest].handle);
-		textures[oldest].source->Release();
-		textures.erase(textures.begin() + oldest);
+		return oldest != textures.size() && Remove_Texture_Entry(oldest);
 	}
 
 	void Prune_Stale_Caches()
@@ -404,9 +595,7 @@ struct D3D11LegacyBridge::Impl
 			if (vertex_buffers[index].last_used_frame + CACHE_STALE_FRAME_COUNT <
 				frame_id)
 			{
-				device->destroyResource(vertex_buffers[index].handle);
-				vertex_buffers[index].source->Release();
-				vertex_buffers.erase(vertex_buffers.begin() + index);
+				Remove_Buffer_Entry(vertex_buffers, vertex_buffer_index, index);
 			}
 			else
 			{
@@ -418,9 +607,7 @@ struct D3D11LegacyBridge::Impl
 			if (index_buffers[index].last_used_frame + CACHE_STALE_FRAME_COUNT <
 				frame_id)
 			{
-				device->destroyResource(index_buffers[index].handle);
-				index_buffers[index].source->Release();
-				index_buffers.erase(index_buffers.begin() + index);
+				Remove_Buffer_Entry(index_buffers, index_buffer_index, index);
 			}
 			else
 			{
@@ -429,11 +616,47 @@ struct D3D11LegacyBridge::Impl
 		}
 		for (unsigned int index = 0; index < textures.size();)
 		{
+			if (textures[index].d3d8_dirty &&
+				!Is_Target_Handle_Pinned(textures[index].handle, active_target) &&
+				(!pending_target_change ||
+					!Is_Target_Handle_Pinned(textures[index].handle,
+						pending_target)))
+			{
+				const RenderResult refresh_result =
+					Refresh_Texture(textures[index]);
+				if (refresh_result == rts::render::RENDER_RESULT_OK)
+				{
+					textures[index].d3d8_dirty = false;
+					++dynamic_texture_refresh_count;
+					++dynamic_texture_in_place_count;
+					cache_counters.RecordTextureRefresh();
+					++index;
+					continue;
+				}
+				if (refresh_result == rts::render::RENDER_RESULT_UNSUPPORTED)
+				{
+					if (Remove_Texture_Entry(index))
+					{
+						++dynamic_texture_refresh_count;
+						++dynamic_texture_recreate_count;
+						cache_counters.RecordTextureRefresh();
+						continue;
+					}
+				}
+				++index;
+				continue;
+			}
+			if (Is_Texture_Entry_Pinned(textures[index]))
+			{
+				++index;
+				continue;
+			}
 			if (textures[index].last_used_frame + CACHE_STALE_FRAME_COUNT < frame_id)
 			{
-				device->destroyResource(textures[index].handle);
-				textures[index].source->Release();
-				textures.erase(textures.begin() + index);
+				if (!Remove_Texture_Entry(index))
+				{
+					++index;
+				}
 			}
 			else
 			{
@@ -456,17 +679,20 @@ struct D3D11LegacyBridge::Impl
 		const size_t byte_count = static_cast<size_t>(
 			vertex_buffer->Get_Vertex_Count()) *
 			vertex_buffer->FVF_Info().Get_FVF_Size();
-		BufferEntry *entry = Find_Buffer(vertex_buffers, source);
+		const unsigned int source_generation = vertex_buffer->Get_Generation();
+		BufferEntry *entry = Find_Buffer(vertex_buffers, vertex_buffer_index,
+			source);
 		if (entry == 0)
 		{
 			if (vertex_buffers.size() >= BUFFER_CACHE_CAPACITY)
 			{
-				Evict_Oldest_Buffer(vertex_buffers);
+				Evict_Oldest_Buffer(vertex_buffers, vertex_buffer_index);
 			}
 			BufferEntry new_entry;
 			new_entry.source = source;
 			new_entry.source->AddRef();
 			new_entry.byte_count = byte_count;
+			new_entry.source_generation = 0;
 			new_entry.last_used_frame = frame_id;
 			BufferDescriptor descriptor;
 			descriptor.byteCount = byte_count;
@@ -491,7 +717,25 @@ struct D3D11LegacyBridge::Impl
 				new_entry.source->Release();
 				return Fail("draw failure: vertex buffer cache allocation");
 			}
+			if (!vertex_buffer_index.Insert(static_cast<IUnknown *>(source),
+				static_cast<unsigned int>(vertex_buffers.size() - 1)))
+			{
+				device->destroyResource(vertex_buffers.back().handle);
+				vertex_buffers.back().source->Release();
+				vertex_buffers.pop_back();
+				return Fail("draw failure: vertex buffer cache index allocation");
+			}
 			entry = &vertex_buffers.back();
+		}
+		else if (entry->byte_count != byte_count)
+		{
+			return Fail("draw failure: vertex buffer size changed");
+		}
+		if (!rts::render::LegacyBridgeTypedBufferNeedsUpload(
+			entry->source_generation, source_generation))
+		{
+			*handle = entry->handle;
+			return true;
 		}
 		unsigned char *data = 0;
 		HRESULT result = source->Lock(0, static_cast<UINT>(byte_count),
@@ -512,6 +756,8 @@ struct D3D11LegacyBridge::Impl
 			return Fail(upload_result,
 				"draw failure: D3D11 vertex buffer upload");
 		}
+		cache_counters.RecordBufferUpload();
+		entry->source_generation = source_generation;
 		*handle = entry->handle;
 		return true;
 	}
@@ -528,17 +774,20 @@ struct D3D11LegacyBridge::Impl
 			index_buffer)->Get_DX8_Index_Buffer();
 		const size_t byte_count = static_cast<size_t>(
 			index_buffer->Get_Index_Count()) * sizeof(unsigned short);
-		BufferEntry *entry = Find_Buffer(index_buffers, source);
+		const unsigned int source_generation = index_buffer->Get_Generation();
+		BufferEntry *entry = Find_Buffer(index_buffers, index_buffer_index,
+			source);
 		if (entry == 0)
 		{
 			if (index_buffers.size() >= BUFFER_CACHE_CAPACITY)
 			{
-				Evict_Oldest_Buffer(index_buffers);
+				Evict_Oldest_Buffer(index_buffers, index_buffer_index);
 			}
 			BufferEntry new_entry;
 			new_entry.source = source;
 			new_entry.source->AddRef();
 			new_entry.byte_count = byte_count;
+			new_entry.source_generation = 0;
 			new_entry.last_used_frame = frame_id;
 			BufferDescriptor descriptor;
 			descriptor.byteCount = byte_count;
@@ -563,7 +812,25 @@ struct D3D11LegacyBridge::Impl
 				new_entry.source->Release();
 				return Fail("draw failure: index buffer cache allocation");
 			}
+			if (!index_buffer_index.Insert(static_cast<IUnknown *>(source),
+				static_cast<unsigned int>(index_buffers.size() - 1)))
+			{
+				device->destroyResource(index_buffers.back().handle);
+				index_buffers.back().source->Release();
+				index_buffers.pop_back();
+				return Fail("draw failure: index buffer cache index allocation");
+			}
 			entry = &index_buffers.back();
+		}
+		else if (entry->byte_count != byte_count)
+		{
+			return Fail("draw failure: index buffer size changed");
+		}
+		if (!rts::render::LegacyBridgeTypedBufferNeedsUpload(
+			entry->source_generation, source_generation))
+		{
+			*handle = entry->handle;
+			return true;
 		}
 		unsigned char *data = 0;
 		HRESULT result = source->Lock(0, static_cast<UINT>(byte_count),
@@ -584,70 +851,524 @@ struct D3D11LegacyBridge::Impl
 			return Fail(upload_result,
 				"draw failure: D3D11 index buffer upload");
 		}
+		cache_counters.RecordBufferUpload();
+		entry->source_generation = source_generation;
 		*handle = entry->handle;
+		return true;
+	}
+
+	bool Upload_Raw_Vertex_Buffer(IDirect3DVertexBuffer8 *source,
+		GpuHandle *handle, size_t *byte_count)
+	{
+		if (source == 0 || handle == 0 || byte_count == 0)
+		{
+			return Fail(rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+				"raw draw failure: invalid vertex buffer");
+		}
+		D3DVERTEXBUFFER_DESC descriptor8;
+		memset(&descriptor8, 0, sizeof(descriptor8));
+		if (FAILED(source->GetDesc(&descriptor8)) || descriptor8.Size == 0)
+		{
+			return Fail("raw draw failure: vertex buffer description");
+		}
+		*byte_count = static_cast<size_t>(descriptor8.Size);
+		BufferEntry *entry = Find_Buffer(vertex_buffers, vertex_buffer_index,
+			source);
+		if (entry == 0)
+		{
+			if (vertex_buffers.size() >= BUFFER_CACHE_CAPACITY)
+			{
+				Evict_Oldest_Buffer(vertex_buffers, vertex_buffer_index);
+			}
+			BufferEntry new_entry;
+			new_entry.source = source;
+			new_entry.source->AddRef();
+			new_entry.byte_count = *byte_count;
+			new_entry.last_used_frame = frame_id;
+			BufferDescriptor buffer_descriptor;
+			buffer_descriptor.byteCount = *byte_count;
+			buffer_descriptor.stride = 1;
+			buffer_descriptor.binding = rts::render::RENDER_BUFFER_VERTEX;
+			buffer_descriptor.usage = rts::render::RENDER_USAGE_DYNAMIC;
+			const RenderResult create_result = device->createBuffer(
+				buffer_descriptor, 0, 0, &new_entry.handle);
+			if (create_result != rts::render::RENDER_RESULT_OK)
+			{
+				new_entry.source->Release();
+				return Fail(create_result,
+					"raw draw failure: D3D11 vertex buffer creation");
+			}
+			try
+			{
+				vertex_buffers.push_back(new_entry);
+			}
+			catch (...)
+			{
+				device->destroyResource(new_entry.handle);
+				new_entry.source->Release();
+				return Fail("raw draw failure: vertex buffer cache allocation");
+			}
+			if (!vertex_buffer_index.Insert(static_cast<IUnknown *>(source),
+				static_cast<unsigned int>(vertex_buffers.size() - 1)))
+			{
+				device->destroyResource(vertex_buffers.back().handle);
+				vertex_buffers.back().source->Release();
+				vertex_buffers.pop_back();
+				return Fail("raw draw failure: vertex buffer cache index allocation");
+			}
+			entry = &vertex_buffers.back();
+		}
+		else if (entry->byte_count != *byte_count)
+		{
+			return Fail("raw draw failure: vertex buffer size changed");
+		}
+		if (!rts::render::LegacyBridgeRawBufferNeedsUpload(
+			entry->source_dirty))
+		{
+			*handle = entry->handle;
+			return true;
+		}
+
+		unsigned char *data = 0;
+		HRESULT result = source->Lock(0, descriptor8.Size, &data,
+			D3DLOCK_READONLY);
+		if (FAILED(result))
+		{
+			result = source->Lock(0, descriptor8.Size, &data, 0);
+		}
+		if (FAILED(result) || data == 0)
+		{
+			return Fail("raw draw failure: vertex buffer lock");
+		}
+		const RenderResult upload_result = context->updateBuffer(entry->handle,
+			data, *byte_count, 0);
+		source->Unlock();
+		if (upload_result != rts::render::RENDER_RESULT_OK)
+		{
+			return Fail(upload_result,
+				"raw draw failure: D3D11 vertex buffer upload");
+		}
+		cache_counters.RecordBufferUpload();
+		entry->source_dirty = false;
+		*handle = entry->handle;
+		return true;
+	}
+
+	bool Upload_Raw_Index_Buffer(IDirect3DIndexBuffer8 *source,
+		GpuHandle *handle, size_t *byte_count)
+	{
+		if (source == 0 || handle == 0 || byte_count == 0)
+		{
+			return Fail(rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+				"raw draw failure: invalid index buffer");
+		}
+		D3DINDEXBUFFER_DESC descriptor8;
+		memset(&descriptor8, 0, sizeof(descriptor8));
+		if (FAILED(source->GetDesc(&descriptor8)) || descriptor8.Size == 0)
+		{
+			return Fail("raw draw failure: index buffer description");
+		}
+		if (descriptor8.Format != D3DFMT_INDEX16)
+		{
+			return Fail(rts::render::RENDER_RESULT_UNSUPPORTED,
+				"raw draw failure: index buffer is not 16-bit");
+		}
+		*byte_count = static_cast<size_t>(descriptor8.Size);
+		BufferEntry *entry = Find_Buffer(index_buffers, index_buffer_index,
+			source);
+		if (entry == 0)
+		{
+			if (index_buffers.size() >= BUFFER_CACHE_CAPACITY)
+			{
+				Evict_Oldest_Buffer(index_buffers, index_buffer_index);
+			}
+			BufferEntry new_entry;
+			new_entry.source = source;
+			new_entry.source->AddRef();
+			new_entry.byte_count = *byte_count;
+			new_entry.last_used_frame = frame_id;
+			BufferDescriptor buffer_descriptor;
+			buffer_descriptor.byteCount = *byte_count;
+			buffer_descriptor.stride = sizeof(unsigned short);
+			buffer_descriptor.binding = rts::render::RENDER_BUFFER_INDEX;
+			buffer_descriptor.usage = rts::render::RENDER_USAGE_DYNAMIC;
+			const RenderResult create_result = device->createBuffer(
+				buffer_descriptor, 0, 0, &new_entry.handle);
+			if (create_result != rts::render::RENDER_RESULT_OK)
+			{
+				new_entry.source->Release();
+				return Fail(create_result,
+					"raw draw failure: D3D11 index buffer creation");
+			}
+			try
+			{
+				index_buffers.push_back(new_entry);
+			}
+			catch (...)
+			{
+				device->destroyResource(new_entry.handle);
+				new_entry.source->Release();
+				return Fail("raw draw failure: index buffer cache allocation");
+			}
+			if (!index_buffer_index.Insert(static_cast<IUnknown *>(source),
+				static_cast<unsigned int>(index_buffers.size() - 1)))
+			{
+				device->destroyResource(index_buffers.back().handle);
+				index_buffers.back().source->Release();
+				index_buffers.pop_back();
+				return Fail("raw draw failure: index buffer cache index allocation");
+			}
+			entry = &index_buffers.back();
+		}
+		else if (entry->byte_count != *byte_count)
+		{
+			return Fail("raw draw failure: index buffer size changed");
+		}
+		if (!rts::render::LegacyBridgeRawBufferNeedsUpload(
+			entry->source_dirty))
+		{
+			*handle = entry->handle;
+			return true;
+		}
+
+		unsigned char *data = 0;
+		HRESULT result = source->Lock(0, descriptor8.Size, &data,
+			D3DLOCK_READONLY);
+		if (FAILED(result))
+		{
+			result = source->Lock(0, descriptor8.Size, &data, 0);
+		}
+		if (FAILED(result) || data == 0)
+		{
+			return Fail("raw draw failure: index buffer lock");
+		}
+		const RenderResult upload_result = context->updateBuffer(entry->handle,
+			data, *byte_count, 0);
+		source->Unlock();
+		if (upload_result != rts::render::RENDER_RESULT_OK)
+		{
+			return Fail(upload_result,
+				"raw draw failure: D3D11 index buffer upload");
+		}
+		cache_counters.RecordBufferUpload();
+		entry->source_dirty = false;
+		*handle = entry->handle;
+		return true;
+	}
+
+	bool Submit_Indexed_Draw(GpuHandle vertex_handle,
+		GpuHandle index_handle, const LegacyVertexLayout &layout,
+		unsigned int fvf, unsigned int primitive_type,
+		unsigned int index_count, unsigned int start_index,
+		unsigned int primitive_count, unsigned int base_vertex,
+		bool raw_draw)
+	{
+		if (!Can_Submit_D3D11_Legacy_Draw())
+		{
+			return Fail(rts::render::RENDER_RESULT_FAILED,
+				"draw failure: neutral texture stage state publication was rejected");
+		}
+		LegacyLogicalState state;
+		if (!rts::render::GetTrackedLegacyLogicalState(&state))
+		{
+			return Fail("draw failure: unavailable legacy logical state");
+		}
+		if (state.pipeline.rasterizer.frontCounterClockwise)
+		{
+			++counter_clockwise_draw_count;
+		}
+		if (state.pipeline.rasterizer.cullMode == rts::render::RENDER_CULL_NONE)
+		{
+			++unculled_draw_count;
+		}
+		if (state.pipeline.blend.colorWriteMask != 0)
+		{
+			++color_write_draw_count;
+		}
+		if (state.pipeline.depthStencil.depthFunction ==
+			rts::render::RENDER_COMPARE_NEVER)
+		{
+			++depth_never_draw_count;
+		}
+		if (!capture_draw_logged && capture_queue.pendingCount() != 0)
+		{
+			D3DMATRIX actual_world;
+			D3DMATRIX actual_view;
+			D3DMATRIX actual_projection;
+			float maximum_difference[3] = { 0.0f, 0.0f, 0.0f };
+			if (SUCCEEDED(legacy_device->GetTransform(D3DTS_WORLD,
+					&actual_world)) && SUCCEEDED(legacy_device->GetTransform(
+					D3DTS_VIEW, &actual_view)) && SUCCEEDED(
+					legacy_device->GetTransform(D3DTS_PROJECTION,
+						&actual_projection)))
+			{
+				const float *actual_matrices[] = { &actual_world.m[0][0],
+					&actual_view.m[0][0], &actual_projection.m[0][0] };
+				const float *tracked_matrices[] = { state.constants.world.values,
+					state.constants.view.values, state.constants.projection.values };
+				for (unsigned int matrix = 0; matrix < 3; ++matrix)
+				{
+					for (unsigned int component = 0; component < 16; ++component)
+					{
+						const float difference = static_cast<float>(fabs(
+							actual_matrices[matrix][component] -
+							tracked_matrices[matrix][component]));
+						if (difference > maximum_difference[matrix])
+						{
+							maximum_difference[matrix] = difference;
+						}
+					}
+				}
+			}
+			D3DVIEWPORT8 actual_viewport;
+			memset(&actual_viewport, 0, sizeof(actual_viewport));
+			legacy_device->GetViewport(&actual_viewport);
+			char state_message[320];
+			snprintf(state_message, sizeof(state_message),
+				"capture first draw fvf=0x%08x primitives=%u start=%u base=%u cull=%u ccw=%u color_mask=0x%x depth=%u matrix_diff=%g,%g,%g viewport=%u,%u,%u,%u,%g,%g",
+				fvf, primitive_count, start_index, base_vertex,
+				static_cast<unsigned int>(state.pipeline.rasterizer.cullMode),
+				state.pipeline.rasterizer.frontCounterClockwise ? 1U : 0U,
+				state.pipeline.blend.colorWriteMask,
+				static_cast<unsigned int>(state.pipeline.depthStencil.depthFunction),
+				maximum_difference[0], maximum_difference[1], maximum_difference[2],
+				actual_viewport.X, actual_viewport.Y,
+				actual_viewport.Width, actual_viewport.Height, actual_viewport.MinZ,
+				actual_viewport.MaxZ);
+			Log(state_message);
+			capture_draw_logged = true;
+		}
+		unsigned int texture_mask = 0;
+		for (unsigned int stage = 0;
+			stage < rts::render::LEGACY_TEXTURE_STAGE_COUNT; ++stage)
+		{
+			GpuHandle texture_handle;
+			IDirect3DBaseTexture8 *source =
+				DX8Wrapper::Get_Tracked_DX8_Texture(stage);
+			if (!Bind_Texture(stage, source, &texture_handle))
+			{
+				return Fail("draw failure: texture conversion or binding");
+			}
+			if (texture_handle.isValid())
+			{
+				texture_mask |= 1U << stage;
+			}
+		}
+		const RenderResult state_result = context->setLegacyStateForLayout(
+			state, layout, texture_mask);
+		if (state_result != rts::render::RENDER_RESULT_OK)
+		{
+			char message[384];
+			unsigned int used = static_cast<unsigned int>(snprintf(message,
+				sizeof(message),
+				"draw failure: D3D11 state/layout result=%u fvf=0x%08x stride=%u elements=%u textures=0x%02x",
+				static_cast<unsigned int>(state_result), fvf, layout.stride,
+				layout.elementCount, texture_mask));
+			if (used >= sizeof(message))
+			{
+				used = sizeof(message) - 1;
+				message[used] = '\0';
+			}
+			Append_Layout_Diagnostic(message, sizeof(message), &used, layout);
+			return Fail(state_result, message);
+		}
+		const RenderResult vertex_bind_result = context->setVertexBuffer(
+			vertex_handle, layout.stride, 0);
+		if (vertex_bind_result != rts::render::RENDER_RESULT_OK)
+		{
+			return Fail(vertex_bind_result,
+				"draw failure: D3D11 vertex buffer binding");
+		}
+		const RenderResult index_bind_result = context->setIndexBuffer(
+			index_handle, rts::render::RENDER_FORMAT_R16_UINT, 0);
+		if (index_bind_result != rts::render::RENDER_RESULT_OK)
+		{
+			return Fail(index_bind_result,
+				"draw failure: D3D11 index buffer binding");
+		}
+		rts::render::RenderPrimitiveTopology topology;
+		if (!Try_Translate_D3D8_Primitive_Topology(primitive_type, &topology))
+		{
+			return Fail(rts::render::RENDER_RESULT_UNSUPPORTED,
+				"draw failure: unsupported indexed primitive topology");
+		}
+		const RenderResult topology_result = context->setPrimitiveTopology(
+			topology);
+		if (topology_result != rts::render::RENDER_RESULT_OK)
+		{
+			return Fail(topology_result,
+				"draw failure: D3D11 topology binding");
+		}
+		const RenderResult draw_result = context->drawIndexed(index_count,
+			start_index, static_cast<int>(base_vertex));
+		if (draw_result != rts::render::RENDER_RESULT_OK)
+		{
+			return Fail(draw_result,
+				"draw failure: D3D11 indexed submission");
+		}
+		++draw_count;
+		++frame_draw_count;
+		if (raw_draw)
+		{
+			++raw_indexed_draw_count;
+		}
+		if (draw_count == 1)
+		{
+			Log(raw_draw ? "first D3D11 raw indexed draw submitted" :
+				"first D3D11 legacy draw submitted");
+		}
+		return true;
+	}
+
+	bool Ensure_Primitive_Up_Buffer(size_t required_bytes,
+		GpuHandle *handle)
+	{
+		if (handle == 0 || required_bytes == 0 ||
+			required_bytes > PRIMITIVE_UP_BUFFER_CAPACITY)
+		{
+			return Fail(rts::render::RENDER_RESULT_UNSUPPORTED,
+				"draw failure: DrawPrimitiveUP byte budget exceeded");
+		}
+		if (primitive_up_vertex_buffer.isValid() &&
+			primitive_up_vertex_capacity >= required_bytes)
+		{
+			*handle = primitive_up_vertex_buffer;
+			return true;
+		}
+		if (primitive_up_vertex_buffer.isValid())
+		{
+			if (!device->destroyResource(primitive_up_vertex_buffer))
+			{
+				return Fail("draw failure: DrawPrimitiveUP buffer replacement");
+			}
+			primitive_up_vertex_buffer = GpuHandle();
+			primitive_up_vertex_capacity = 0;
+		}
+		size_t allocation_bytes = 256;
+		while (allocation_bytes < required_bytes &&
+			allocation_bytes < PRIMITIVE_UP_BUFFER_CAPACITY)
+		{
+			allocation_bytes *= 2;
+		}
+		if (allocation_bytes > PRIMITIVE_UP_BUFFER_CAPACITY)
+		{
+			allocation_bytes = PRIMITIVE_UP_BUFFER_CAPACITY;
+		}
+		BufferDescriptor descriptor;
+		descriptor.byteCount = allocation_bytes;
+		descriptor.stride = 1;
+		descriptor.binding = rts::render::RENDER_BUFFER_VERTEX;
+		descriptor.usage = rts::render::RENDER_USAGE_DYNAMIC;
+		const RenderResult create_result = device->createBuffer(descriptor,
+			0, 0, &primitive_up_vertex_buffer);
+		if (create_result != rts::render::RENDER_RESULT_OK)
+		{
+			primitive_up_vertex_buffer = GpuHandle();
+			return Fail(create_result,
+				"draw failure: DrawPrimitiveUP buffer creation");
+		}
+		primitive_up_vertex_capacity = allocation_bytes;
+		*handle = primitive_up_vertex_buffer;
+		return true;
+	}
+
+	bool Upload_Primitive_Up(const void *vertex_data, size_t byte_count,
+		GpuHandle *handle)
+	{
+		if (vertex_data == 0 || handle == 0 || byte_count == 0)
+		{
+			return Fail(rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+				"draw failure: invalid DrawPrimitiveUP data");
+		}
+		if (!Ensure_Primitive_Up_Buffer(byte_count, handle))
+		{
+			return false;
+		}
+		const RenderResult upload_result = context->updateBuffer(*handle,
+			vertex_data, byte_count, 0);
+		if (upload_result != rts::render::RENDER_RESULT_OK)
+		{
+			return Fail(upload_result,
+				"draw failure: DrawPrimitiveUP buffer upload");
+		}
+		cache_counters.RecordBufferUpload();
 		return true;
 	}
 
 	bool Copy_Surface(IDirect3DSurface8 *source, unsigned int width,
 		unsigned int height, std::vector<unsigned char> *pixels)
 	{
-		IDirect3DSurface8 *staging = 0;
-		if (FAILED(legacy_device->CreateImageSurface(width, height,
-			D3DFMT_A8R8G8B8, &staging)))
+		return SUCCEEDED(SurfaceBlit_Copy_Surface_To_A8R8G8B8(
+			source, width, height, pixels));
+	}
+
+	bool Copy_V8U8_Surface(IDirect3DSurface8 *source, unsigned int width,
+		unsigned int height, std::vector<unsigned char> *pixels)
+	{
+		if (source == 0 || pixels == 0 || width == 0 || height == 0)
 		{
 			return false;
 		}
-		HRESULT result = D3DXLoadSurfaceFromSurface(staging, 0, 0, source,
-			0, 0, D3DX_FILTER_NONE, 0);
-		D3DLOCKED_RECT locked;
-		if (SUCCEEDED(result))
+		size_t rowBytes = 0;
+		size_t totalBytes = 0;
+		if (!Checked_Multiply(static_cast<size_t>(width), 2, &rowBytes) ||
+			!Checked_Multiply(rowBytes, static_cast<size_t>(height),
+				&totalBytes) || totalBytes > MAX_TEXTURE_REFRESH_BYTES)
 		{
-			result = staging->LockRect(&locked, 0, D3DLOCK_READONLY);
+			return false;
 		}
-		if (FAILED(result))
+		D3DLOCKED_RECT locked;
+		if (FAILED(source->LockRect(&locked, 0, D3DLOCK_READONLY)))
 		{
-			staging->Release();
+			return false;
+		}
+		if (locked.pBits == 0 || locked.Pitch < static_cast<int>(rowBytes))
+		{
+			source->UnlockRect();
 			return false;
 		}
 		try
 		{
-			pixels->resize(static_cast<size_t>(width) * height * 4);
+			pixels->resize(totalBytes);
 			for (unsigned int row = 0; row < height; ++row)
 			{
-				memcpy(&(*pixels)[static_cast<size_t>(row) * width * 4],
+				memcpy(&(*pixels)[static_cast<size_t>(row) * rowBytes],
 					static_cast<const unsigned char *>(locked.pBits) +
 						static_cast<size_t>(row) * locked.Pitch,
-					static_cast<size_t>(width) * 4);
+					rowBytes);
 			}
 		}
 		catch (...)
 		{
-			staging->UnlockRect();
-			staging->Release();
+			source->UnlockRect();
 			return false;
 		}
-		staging->UnlockRect();
-		staging->Release();
-		return true;
+		return SUCCEEDED(source->UnlockRect());
 	}
 
-	bool Create_Texture(IDirect3DBaseTexture8 *source, GpuHandle *handle,
-		bool *render_target, RenderResult *failure_result)
+	bool Collect_Texture_Data(IDirect3DBaseTexture8 *source,
+		TextureDescriptor *descriptor_out,
+		std::vector<std::vector<unsigned char> > *pixels_out,
+		std::vector<TextureSubresourceData> *subresources_out,
+		bool for_render_target, RenderResult *failure_result)
 	{
 		if (failure_result != 0)
 		{
 			*failure_result = rts::render::RENDER_RESULT_FAILED;
 		}
-		if (source == 0 || handle == 0 || render_target == 0)
+		if (source == 0 || descriptor_out == 0 || pixels_out == 0 ||
+			subresources_out == 0)
 		{
 			return false;
 		}
-		TextureDescriptor descriptor;
+		TextureDescriptor &descriptor = *descriptor_out;
+		std::vector<std::vector<unsigned char> > &pixels = *pixels_out;
+		std::vector<TextureSubresourceData> &subresources = *subresources_out;
 		descriptor.format = rts::render::RENDER_FORMAT_B8G8R8A8_UNORM;
-		descriptor.binding = rts::render::RENDER_TEXTURE_SHADER_RESOURCE;
-		descriptor.usage = rts::render::RENDER_USAGE_IMMUTABLE;
-		std::vector<std::vector<unsigned char> > pixels;
-		std::vector<TextureSubresourceData> subresources;
+		descriptor.binding = rts::render::RENDER_TEXTURE_SHADER_RESOURCE |
+			(for_render_target ? rts::render::RENDER_TEXTURE_RENDER_TARGET : 0);
+		descriptor.usage = for_render_target ? rts::render::RENDER_USAGE_DEFAULT :
+			rts::render::RENDER_USAGE_IMMUTABLE;
 		if (source->GetType() == D3DRTYPE_TEXTURE)
 		{
 			IDirect3DTexture8 *texture = static_cast<IDirect3DTexture8 *>(source);
@@ -657,9 +1378,29 @@ struct D3D11LegacyBridge::Impl
 			{
 				return false;
 			}
+			const bool signed_bump = level_zero.Format == D3DFMT_V8U8;
+			if (signed_bump)
+			{
+				if (for_render_target)
+				{
+					if (failure_result != 0)
+						*failure_result = rts::render::RENDER_RESULT_UNSUPPORTED;
+					return false;
+				}
+				descriptor.format = rts::render::RENDER_FORMAT_R8G8_SNORM;
+			}
 			descriptor.width = level_zero.Width;
 			descriptor.height = level_zero.Height;
-			*render_target = (level_zero.Usage & D3DUSAGE_RENDERTARGET) != 0;
+			// Track the capabilities of the D3D11 allocation, not merely the
+			// usage flags carried by its D3D8 source. A texture first uploaded for
+			// sampling has no RTV and must be recreated when it later becomes a
+			// render target.
+			if (descriptor.mipCount > MAX_TEXTURE_REFRESH_SUBRESOURCES)
+			{
+				if (failure_result != 0)
+					*failure_result = rts::render::RENDER_RESULT_UNSUPPORTED;
+				return false;
+			}
 			try
 			{
 				pixels.resize(descriptor.mipCount);
@@ -679,15 +1420,18 @@ struct D3D11LegacyBridge::Impl
 					if (surface != 0) surface->Release();
 					return false;
 				}
-				const bool copied = Copy_Surface(surface, level.Width, level.Height,
-					&pixels[mip]);
+				const bool copied = signed_bump ?
+					Copy_V8U8_Surface(surface, level.Width, level.Height,
+						&pixels[mip]) :
+					Copy_Surface(surface, level.Width, level.Height, &pixels[mip]);
 				surface->Release();
 				if (!copied)
 				{
 					return false;
 				}
 				subresources[mip].data = &pixels[mip][0];
-				subresources[mip].rowPitch = static_cast<size_t>(level.Width) * 4;
+				subresources[mip].rowPitch = static_cast<size_t>(level.Width) *
+					(signed_bump ? 2 : 4);
 				subresources[mip].slicePitch = pixels[mip].size();
 			}
 		}
@@ -705,7 +1449,12 @@ struct D3D11LegacyBridge::Impl
 			}
 			descriptor.width = level_zero.Width;
 			descriptor.height = level_zero.Height;
-			*render_target = false;
+			if (descriptor.mipCount > MAX_TEXTURE_REFRESH_SUBRESOURCES / 6)
+			{
+				if (failure_result != 0)
+					*failure_result = rts::render::RENDER_RESULT_UNSUPPORTED;
+				return false;
+			}
 			const unsigned int count = descriptor.mipCount * 6;
 			try
 			{
@@ -746,8 +1495,56 @@ struct D3D11LegacyBridge::Impl
 		}
 		else
 		{
+			if (failure_result != 0)
+				*failure_result = rts::render::RENDER_RESULT_UNSUPPORTED;
 			return false;
 		}
+		if (failure_result != 0)
+		{
+			*failure_result = rts::render::RENDER_RESULT_OK;
+		}
+		return true;
+	}
+
+	bool Create_Texture(IDirect3DBaseTexture8 *source, GpuHandle *handle,
+		bool *render_target, RenderResult *failure_result,
+		bool for_render_target = false)
+	{
+		if (failure_result != 0)
+		{
+			*failure_result = rts::render::RENDER_RESULT_FAILED;
+		}
+		if (source == 0 || handle == 0 || render_target == 0)
+		{
+			return false;
+		}
+		// Preserve D3D8 render-target capability when a texture is first seen as
+		// a shader source.  Smudge/background textures are created by the legacy
+		// device with D3DUSAGE_RENDERTARGET, and the D3D11 copy path needs an RTV
+		// capable destination without forcing a readback through D3D8.
+		if (!for_render_target && source->GetType() == D3DRTYPE_TEXTURE)
+		{
+			D3DSURFACE_DESC level_zero;
+			IDirect3DTexture8 *texture = static_cast<IDirect3DTexture8 *>(source);
+			if (SUCCEEDED(texture->GetLevelDesc(0, &level_zero)) &&
+				(level_zero.Usage & D3DUSAGE_RENDERTARGET) != 0)
+			{
+				for_render_target = true;
+			}
+		}
+		TextureDescriptor descriptor;
+		std::vector<std::vector<unsigned char> > pixels;
+		std::vector<TextureSubresourceData> subresources;
+		RenderResult collect_result = rts::render::RENDER_RESULT_FAILED;
+		if (!Collect_Texture_Data(source, &descriptor, &pixels, &subresources,
+			for_render_target, &collect_result))
+		{
+			if (failure_result != 0)
+				*failure_result = collect_result;
+			return false;
+		}
+		*render_target = (descriptor.binding &
+			rts::render::RENDER_TEXTURE_RENDER_TARGET) != 0;
 		const RenderResult create_result = device->createTexture(descriptor,
 			&subresources[0], static_cast<unsigned int>(subresources.size()),
 			handle);
@@ -756,6 +1553,26 @@ struct D3D11LegacyBridge::Impl
 			*failure_result = create_result;
 		}
 		return create_result == rts::render::RENDER_RESULT_OK;
+	}
+
+	RenderResult Refresh_Texture(TextureEntry &entry)
+	{
+		if (entry.source == 0 || entry.depth_stencil ||
+			!entry.handle.isValid())
+		{
+			return rts::render::RENDER_RESULT_UNSUPPORTED;
+		}
+		TextureDescriptor descriptor;
+		std::vector<std::vector<unsigned char> > pixels;
+		std::vector<TextureSubresourceData> subresources;
+		RenderResult collect_result = rts::render::RENDER_RESULT_FAILED;
+		if (!Collect_Texture_Data(entry.source, &descriptor, &pixels,
+			&subresources, entry.render_target, &collect_result))
+		{
+			return collect_result;
+		}
+		return device->refreshTexture(entry.handle, descriptor,
+			&subresources[0], static_cast<unsigned int>(subresources.size()));
 	}
 
 	bool Bind_Texture(unsigned int stage, IDirect3DBaseTexture8 *source,
@@ -771,37 +1588,61 @@ struct D3D11LegacyBridge::Impl
 			}
 			return bind_result == rts::render::RENDER_RESULT_OK;
 		}
-		TextureEntry *entry = 0;
-		for (unsigned int index = 0; index < textures.size(); ++index)
+		unsigned int entry_index = 0;
+		TextureEntry *entry = Find_Texture_Entry(source, &entry_index);
+		if (entry != 0)
 		{
-			if (textures[index].source == source)
+			if (entry->d3d8_dirty)
 			{
-				entry = &textures[index];
-				entry->last_used_frame = frame_id;
-				break;
+				const bool target_pinned =
+					Is_Target_Handle_Pinned(entry->handle, active_target) ||
+					(pending_target_change &&
+						Is_Target_Handle_Pinned(entry->handle, pending_target));
+				if (target_pinned)
+				{
+					return Fail(rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+						"draw failure: dirty texture is still a render target");
+				}
+				const RenderResult refresh_result = Refresh_Texture(*entry);
+				if (refresh_result == rts::render::RENDER_RESULT_OK)
+				{
+					entry->d3d8_dirty = false;
+					++dynamic_texture_refresh_count;
+					++dynamic_texture_in_place_count;
+					cache_counters.RecordTextureRefresh();
+				}
+				else if (refresh_result ==
+					rts::render::RENDER_RESULT_UNSUPPORTED)
+				{
+					if (!Remove_Texture_Entry(entry_index))
+					{
+						return Fail(rts::render::RENDER_RESULT_FAILED,
+							"draw failure: dirty texture refresh");
+					}
+					++dynamic_texture_refresh_count;
+					++dynamic_texture_recreate_count;
+					cache_counters.RecordTextureRefresh();
+					entry = 0;
+				}
+				else
+				{
+					return Fail(refresh_result,
+						"draw failure: dirty texture refresh");
+				}
 			}
 		}
-		if (entry != 0 && entry->render_target)
+		if (entry == 0)
 		{
-			device->destroyResource(entry->handle);
-			entry->handle = GpuHandle();
-			RenderResult texture_result = rts::render::RENDER_RESULT_FAILED;
-			if (!Create_Texture(source, &entry->handle, &entry->render_target,
-				&texture_result))
+			if (textures.size() >= TEXTURE_CACHE_CAPACITY &&
+				!Evict_Oldest_Texture())
 			{
-				Fail(texture_result, "draw failure: D3D11 render-target texture conversion");
-				return false;
-			}
-		}
-		else if (entry == 0)
-		{
-			if (textures.size() >= TEXTURE_CACHE_CAPACITY)
-			{
-				Evict_Oldest_Texture();
+				return Fail(rts::render::RENDER_RESULT_OUT_OF_MEMORY,
+					"draw failure: texture cache is pinned");
 			}
 			TextureEntry new_entry;
 			new_entry.source = source;
 			new_entry.source->AddRef();
+			new_entry.d3d11_authority = false;
 			new_entry.last_used_frame = frame_id;
 			RenderResult texture_result = rts::render::RENDER_RESULT_FAILED;
 			if (!Create_Texture(source, &new_entry.handle,
@@ -823,6 +1664,16 @@ struct D3D11LegacyBridge::Impl
 					"draw failure: texture cache allocation");
 				return false;
 			}
+			if (!texture_index.Insert(source,
+				static_cast<unsigned int>(textures.size() - 1)))
+			{
+				device->destroyResource(textures.back().handle);
+				textures.back().source->Release();
+				textures.pop_back();
+				Fail(rts::render::RENDER_RESULT_OUT_OF_MEMORY,
+					"draw failure: texture cache index allocation");
+				return false;
+			}
 			entry = &textures.back();
 		}
 		*handle = entry->handle;
@@ -832,6 +1683,442 @@ struct D3D11LegacyBridge::Impl
 			Fail(bind_result, "draw failure: D3D11 texture binding");
 		}
 		return bind_result == rts::render::RENDER_RESULT_OK;
+	}
+
+	RenderResult Copy_Active_Color_Target_To_Texture(
+		IDirect3DBaseTexture8 *destination)
+	{
+		if (destination == 0 || !frame_open || context == 0)
+		{
+			return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+		}
+
+		// A legacy render-target texture may have been cached earlier as a
+		// sampling-only resource. Upgrade it through the normal target path so
+		// the neutral destination has an RTV before issuing CopyResource.
+		TextureEntry *existing = Find_Texture_Entry(destination);
+		if (existing != 0 && !existing->render_target &&
+			destination->GetType() == D3DRTYPE_TEXTURE)
+		{
+			IDirect3DSurface8 *surface = 0;
+			IDirect3DTexture8 *texture = static_cast<IDirect3DTexture8 *>(destination);
+			if (FAILED(texture->GetSurfaceLevel(0, &surface)) || surface == 0)
+			{
+				if (surface != 0) surface->Release();
+				return rts::render::RENDER_RESULT_UNSUPPORTED;
+			}
+			GpuHandle upgraded_handle;
+			RenderResult upgrade_result = rts::render::RENDER_RESULT_FAILED;
+			const bool upgraded = Ensure_Render_Target(surface, &upgraded_handle,
+				&upgrade_result);
+			surface->Release();
+			if (!upgraded)
+			{
+				return upgrade_result;
+			}
+		}
+
+		GpuHandle handle;
+		if (!Bind_Texture(0, destination, &handle))
+		{
+			const RenderResult bind_result = frame_outcome.hasCommandFailure() ?
+				frame_outcome.commandResult() : rts::render::RENDER_RESULT_FAILED;
+			if (!frame_outcome.hasCommandFailure())
+			{
+				Log_Result("D3D11 active color-target texture preparation failed",
+					bind_result);
+			}
+			return bind_result;
+		}
+		const RenderResult copy_result = device->copyActiveColorTargetToTexture(
+			handle);
+		// Bind_Texture is used only to obtain/create the logical resource. Leave
+		// the stage explicitly unbound so callers' subsequent state setup cannot
+		// accidentally sample the destination while it is still being used as a
+		// copy target.
+		const RenderResult unbind_result = context->setTexture(0, GpuHandle());
+		if (copy_result != rts::render::RENDER_RESULT_OK)
+		{
+			// Smudge capture is an optional visual pass.  A stale or incompatible
+			// destination must be observable, but it must not discard the whole
+			// frame.  Device removal remains fatal so End_Frame can run recovery.
+			if (copy_result == rts::render::RENDER_RESULT_DEVICE_REMOVED)
+			{
+				Record_Result(copy_result,
+					"D3D11 active color-target texture copy failed");
+			}
+			else
+			{
+				Log_Result("D3D11 active color-target texture copy failed",
+					copy_result);
+			}
+			return copy_result;
+		}
+		if (unbind_result != rts::render::RENDER_RESULT_OK)
+		{
+			if (unbind_result == rts::render::RENDER_RESULT_DEVICE_REMOVED)
+			{
+				Record_Result(unbind_result,
+					"D3D11 active color-target texture unbind failed");
+			}
+			else
+			{
+				Log_Result("D3D11 active color-target texture unbind failed",
+					unbind_result);
+			}
+			return unbind_result;
+		}
+		TextureEntry *entry = Find_Texture_Entry(destination);
+		if (entry != 0)
+		{
+			entry->d3d11_authority = true;
+			entry->d3d8_dirty = false;
+			entry->last_used_frame = frame_id;
+		}
+		return rts::render::RENDER_RESULT_OK;
+	}
+
+	TextureEntry *Find_Texture_Entry(IDirect3DBaseTexture8 *source,
+		unsigned int *index_out = 0, bool touch = true)
+	{
+		if (source == 0)
+		{
+			return 0;
+		}
+		unsigned int found_index = 0;
+		bool hit = texture_index.Find(source, &found_index) &&
+			found_index < textures.size() &&
+			textures[found_index].source == source;
+		if (!hit)
+		{
+			// Keep a cold repair path for an index invariant violation.  Normal
+			// draws never scan the texture vector.
+			texture_index.Erase(source);
+			for (unsigned int index = 0; index < textures.size(); ++index)
+			{
+				if (textures[index].source == source)
+				{
+					found_index = index;
+					texture_index.Insert(source, index);
+					hit = true;
+					break;
+				}
+			}
+		}
+		cache_counters.RecordTextureLookup(hit);
+		if (!hit)
+		{
+			return 0;
+		}
+		if (index_out != 0)
+		{
+			*index_out = found_index;
+		}
+		if (touch)
+		{
+			textures[found_index].last_used_frame = frame_id;
+		}
+		return &textures[found_index];
+	}
+
+	bool Ensure_Render_Target(IDirect3DSurface8 *surface,
+		GpuHandle *handle, RenderResult *failure_result)
+	{
+		if (failure_result != 0)
+		{
+			*failure_result = rts::render::RENDER_RESULT_FAILED;
+		}
+		if (surface == 0 || handle == 0)
+		{
+			return false;
+		}
+		IDirect3DTexture8 *parent_texture = 0;
+		if (FAILED(surface->GetContainer(IID_IDirect3DTexture8,
+			reinterpret_cast<void **>(&parent_texture))) || parent_texture == 0 ||
+			parent_texture->GetType() != D3DRTYPE_TEXTURE)
+		{
+			if (parent_texture != 0) parent_texture->Release();
+			if (failure_result != 0)
+			{
+				*failure_result = rts::render::RENDER_RESULT_UNSUPPORTED;
+			}
+			return false;
+		}
+		IDirect3DBaseTexture8 *parent = parent_texture;
+		TextureEntry *entry = Find_Texture_Entry(parent);
+		if (entry != 0 && entry->d3d8_dirty)
+		{
+			const bool target_pinned =
+				Is_Target_Handle_Pinned(entry->handle, active_target) ||
+				(pending_target_change &&
+					Is_Target_Handle_Pinned(entry->handle, pending_target));
+			if (target_pinned)
+			{
+				parent->Release();
+				if (failure_result != 0)
+					*failure_result = rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+				return false;
+			}
+			// A sampling-only entry cannot gain RTV capability in place.  Let the
+			// normal target path recreate it with the required binding shape.
+			const RenderResult refresh_result =
+				entry->render_target && !entry->depth_stencil ?
+				Refresh_Texture(*entry) : rts::render::RENDER_RESULT_UNSUPPORTED;
+			if (refresh_result == rts::render::RENDER_RESULT_OK)
+			{
+				entry->d3d8_dirty = false;
+				entry->d3d11_authority = true;
+				++dynamic_texture_refresh_count;
+				++dynamic_texture_in_place_count;
+				cache_counters.RecordTextureRefresh();
+			}
+			else if (refresh_result != rts::render::RENDER_RESULT_UNSUPPORTED)
+			{
+				parent->Release();
+				if (failure_result != 0)
+					*failure_result = refresh_result;
+				return false;
+			}
+			else
+			{
+				const unsigned int index = static_cast<unsigned int>(entry -
+					&textures[0]);
+				if (!Remove_Texture_Entry(index))
+				{
+					parent->Release();
+					if (failure_result != 0)
+						*failure_result = rts::render::RENDER_RESULT_FAILED;
+					return false;
+				}
+				++dynamic_texture_refresh_count;
+				++dynamic_texture_recreate_count;
+				cache_counters.RecordTextureRefresh();
+				entry = 0;
+			}
+		}
+		if (entry != 0 && entry->render_target && !entry->depth_stencil &&
+			entry->handle.isValid())
+		{
+			entry->d3d11_authority = true;
+			*handle = entry->handle;
+			parent->Release();
+			return true;
+		}
+		if (entry != 0)
+		{
+			const unsigned int index = static_cast<unsigned int>(entry -
+				&textures[0]);
+			if (!Remove_Texture_Entry(index))
+			{
+				parent->Release();
+				if (failure_result != 0)
+					*failure_result = rts::render::RENDER_RESULT_OUT_OF_MEMORY;
+				return false;
+			}
+		}
+		if (textures.size() >= TEXTURE_CACHE_CAPACITY &&
+			!Evict_Oldest_Texture())
+		{
+			parent->Release();
+			if (failure_result != 0)
+				*failure_result = rts::render::RENDER_RESULT_OUT_OF_MEMORY;
+			return false;
+		}
+		TextureEntry new_entry;
+		new_entry.source = parent;
+		new_entry.source->AddRef();
+		new_entry.render_target = true;
+		new_entry.d3d11_authority = true;
+		new_entry.last_used_frame = frame_id;
+		RenderResult texture_result = rts::render::RENDER_RESULT_FAILED;
+		if (!Create_Texture(parent, &new_entry.handle,
+			&new_entry.render_target, &texture_result, true))
+		{
+			new_entry.source->Release();
+			parent->Release();
+			if (failure_result != 0) *failure_result = texture_result;
+			return false;
+		}
+		try
+		{
+			textures.push_back(new_entry);
+		}
+		catch (...)
+		{
+			device->destroyResource(new_entry.handle);
+			new_entry.source->Release();
+			parent->Release();
+			if (failure_result != 0)
+				*failure_result = rts::render::RENDER_RESULT_OUT_OF_MEMORY;
+			return false;
+		}
+		if (!texture_index.Insert(parent,
+			static_cast<unsigned int>(textures.size() - 1)))
+		{
+			device->destroyResource(textures.back().handle);
+			textures.back().source->Release();
+			textures.pop_back();
+			parent->Release();
+			if (failure_result != 0)
+				*failure_result = rts::render::RENDER_RESULT_OUT_OF_MEMORY;
+			return false;
+		}
+		*handle = new_entry.handle;
+		parent->Release();
+		if (failure_result != 0)
+			*failure_result = rts::render::RENDER_RESULT_OK;
+		return true;
+	}
+
+	bool Ensure_Depth_Target(IDirect3DSurface8 *surface,
+		GpuHandle *handle, RenderResult *failure_result)
+	{
+		if (failure_result != 0)
+			*failure_result = rts::render::RENDER_RESULT_FAILED;
+		if (surface == 0 || handle == 0)
+			return false;
+		IDirect3DTexture8 *parent_texture = 0;
+		if (FAILED(surface->GetContainer(IID_IDirect3DTexture8,
+			reinterpret_cast<void **>(&parent_texture))) || parent_texture == 0 ||
+			parent_texture->GetType() != D3DRTYPE_TEXTURE)
+		{
+			if (parent_texture != 0) parent_texture->Release();
+			if (failure_result != 0)
+				*failure_result = rts::render::RENDER_RESULT_UNSUPPORTED;
+			return false;
+		}
+		IDirect3DBaseTexture8 *parent = parent_texture;
+		TextureEntry *entry = Find_Texture_Entry(parent);
+		if (entry != 0 && entry->depth_stencil && entry->handle.isValid())
+		{
+			*handle = entry->handle;
+			parent->Release();
+			return true;
+		}
+		if (entry != 0)
+		{
+			const unsigned int index = static_cast<unsigned int>(entry -
+				&textures[0]);
+			if (!Remove_Texture_Entry(index))
+			{
+				parent->Release();
+				if (failure_result != 0)
+					*failure_result = rts::render::RENDER_RESULT_OUT_OF_MEMORY;
+				return false;
+			}
+		}
+		if (textures.size() >= TEXTURE_CACHE_CAPACITY &&
+			!Evict_Oldest_Texture())
+		{
+			parent->Release();
+			if (failure_result != 0)
+				*failure_result = rts::render::RENDER_RESULT_OUT_OF_MEMORY;
+			return false;
+		}
+		D3DSURFACE_DESC surface_desc;
+		if (FAILED(surface->GetDesc(&surface_desc)))
+		{
+			parent->Release();
+			if (failure_result != 0)
+				*failure_result = rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+			return false;
+		}
+		rts::render::RenderFormat format;
+		switch (surface_desc.Format)
+		{
+		case D3DFMT_D24S8:
+			format = rts::render::RENDER_FORMAT_D24_UNORM_S8_UINT;
+			break;
+		default:
+			parent->Release();
+			if (failure_result != 0)
+				*failure_result = rts::render::RENDER_RESULT_UNSUPPORTED;
+			return false;
+		}
+		TextureDescriptor descriptor;
+		descriptor.width = surface_desc.Width;
+		descriptor.height = surface_desc.Height;
+		descriptor.mipCount = 1;
+		descriptor.arrayCount = 1;
+		descriptor.dimension = rts::render::RENDER_TEXTURE_2D;
+		descriptor.format = format;
+		descriptor.binding = rts::render::RENDER_TEXTURE_DEPTH_STENCIL;
+		descriptor.usage = rts::render::RENDER_USAGE_DEFAULT;
+		const RenderResult create_result = device->createTexture(descriptor,
+			0, 0, handle);
+		if (create_result != rts::render::RENDER_RESULT_OK)
+		{
+			parent->Release();
+			if (failure_result != 0) *failure_result = create_result;
+			return false;
+		}
+		TextureEntry new_entry;
+		new_entry.source = parent;
+		new_entry.source->AddRef();
+		new_entry.depth_stencil = true;
+		new_entry.last_used_frame = frame_id;
+		new_entry.handle = *handle;
+		try
+		{
+			textures.push_back(new_entry);
+		}
+		catch (...)
+		{
+			device->destroyResource(*handle);
+			new_entry.source->Release();
+			parent->Release();
+			*handle = GpuHandle();
+			if (failure_result != 0)
+				*failure_result = rts::render::RENDER_RESULT_OUT_OF_MEMORY;
+			return false;
+		}
+		if (!texture_index.Insert(parent,
+			static_cast<unsigned int>(textures.size() - 1)))
+		{
+			device->destroyResource(textures.back().handle);
+			textures.back().source->Release();
+			textures.pop_back();
+			parent->Release();
+			*handle = GpuHandle();
+			if (failure_result != 0)
+				*failure_result = rts::render::RENDER_RESULT_OUT_OF_MEMORY;
+			return false;
+		}
+		parent->Release();
+		if (failure_result != 0)
+			*failure_result = rts::render::RENDER_RESULT_OK;
+		return true;
+	}
+
+	RenderResult Apply_Target(const RenderTargetBinding &binding)
+	{
+		if (!frame_open)
+		{
+			// No D3D11 output is bound between frames.  Replacing a deferred
+			// transition therefore releases the previous producer lease before
+			// the next frame can allocate another render target.
+			Release_Unbound_Texture_Authority(binding);
+			pending_target = binding;
+			pending_target_change = true;
+			target_transition_failed = false;
+			return rts::render::RENDER_RESULT_OK;
+		}
+		const RenderResult result = context->setRenderTargets(binding);
+		if (result == rts::render::RENDER_RESULT_OK)
+		{
+			target_transition_failed = false;
+			active_target = binding;
+			Release_Unbound_Texture_Authority(binding);
+		}
+		else
+		{
+			target_transition_failed = true;
+			// Ensure_Render_Target may have created a new RTV before the context
+			// rejected this transition.  It is not bound and must not pin the
+			// cache after a failed transition.
+			Release_Unbound_Texture_Authority(active_target);
+		}
+		return result;
 	}
 
 	void Release_Caches()
@@ -862,9 +2149,18 @@ struct D3D11LegacyBridge::Impl
 			}
 			textures[index].source->Release();
 		}
+		if (primitive_up_vertex_buffer.isValid() && release_native_resources)
+		{
+			device->destroyResource(primitive_up_vertex_buffer);
+		}
+		primitive_up_vertex_buffer = GpuHandle();
+		primitive_up_vertex_capacity = 0;
 		vertex_buffers.clear();
 		index_buffers.clear();
 		textures.clear();
+		vertex_buffer_index.Clear();
+		index_buffer_index.Clear();
+		texture_index.Clear();
 	}
 
 	static void Complete_Visual_Smoke(void *consumer,
@@ -1041,7 +2337,11 @@ bool D3D11LegacyBridge::Initialize(HWND window,
 	parameters.width = width;
 	parameters.height = height;
 	parameters.enableVsync = enable_vsync;
+#ifdef _DEBUG
+	parameters.enableDebugLayer = true;
+#else
 	parameters.enableDebugLayer = false;
+#endif
 	const RenderResult initialize_result =
 		m_impl->device->initialize(parameters);
 	if (initialize_result != rts::render::RENDER_RESULT_OK)
@@ -1062,6 +2362,10 @@ bool D3D11LegacyBridge::Initialize(HWND window,
 	m_impl->height = height;
 	m_impl->legacy_device = legacy_device;
 	m_impl->legacy_device->AddRef();
+	m_impl->active_target = RenderTargetBinding();
+	m_impl->pending_target = RenderTargetBinding();
+	m_impl->pending_target_change = false;
+	m_impl->target_transition_failed = false;
 	m_impl->Log("D3D11 legacy bridge initialized");
 	if (m_impl->context == 0)
 	{
@@ -1091,6 +2395,10 @@ void D3D11LegacyBridge::Shutdown()
 			m_impl->log_file = 0;
 		}
 		m_impl->frame_outcome = rts::render::RenderFrameOutcome();
+		m_impl->active_target = RenderTargetBinding();
+		m_impl->pending_target = RenderTargetBinding();
+		m_impl->pending_target_change = false;
+		m_impl->target_transition_failed = true;
 		m_impl->owner_thread_id = 0;
 		return;
 	}
@@ -1110,8 +2418,19 @@ void D3D11LegacyBridge::Shutdown()
 	if (m_impl->log_file != 0)
 	{
 		fprintf(m_impl->log_file,
-			"draws=%u failures=%u vertex_buffers=%u index_buffers=%u textures=%u\n",
+			"draws=%u failures=%u ccw_front=%u unculled=%u color_write=%u depth_never=%u clears=%u viewports=%u buffer_lookups=%u buffer_hits=%u texture_lookups=%u texture_hits=%u buffer_uploads=%u dynamic_texture_refreshes=%u dynamic_texture_in_place=%u dynamic_texture_recreates=%u vertex_buffers=%u index_buffers=%u textures=%u\n",
 			m_impl->draw_count, m_impl->draw_failure_count,
+			m_impl->counter_clockwise_draw_count, m_impl->unculled_draw_count,
+			m_impl->color_write_draw_count, m_impl->depth_never_draw_count,
+			m_impl->clear_count, m_impl->viewport_count,
+			m_impl->cache_counters.bufferLookups,
+			m_impl->cache_counters.bufferHits,
+			m_impl->cache_counters.textureLookups,
+			m_impl->cache_counters.textureHits,
+			m_impl->cache_counters.bufferUploads,
+			m_impl->dynamic_texture_refresh_count,
+			m_impl->dynamic_texture_in_place_count,
+			m_impl->dynamic_texture_recreate_count,
 			static_cast<unsigned int>(m_impl->vertex_buffers.size()),
 			static_cast<unsigned int>(m_impl->index_buffers.size()),
 			static_cast<unsigned int>(m_impl->textures.size()));
@@ -1138,6 +2457,10 @@ void D3D11LegacyBridge::Shutdown()
 	m_impl->frame_outcome = rts::render::RenderFrameOutcome();
 	m_impl->pending_viewport = false;
 	m_impl->pending_clear = false;
+	m_impl->active_target = RenderTargetBinding();
+	m_impl->pending_target = RenderTargetBinding();
+	m_impl->pending_target_change = false;
+	m_impl->target_transition_failed = true;
 	m_impl->owner_thread_id = 0;
 }
 
@@ -1154,6 +2477,8 @@ bool D3D11LegacyBridge::Begin_Frame()
 		return false;
 	}
 	++m_impl->frame_id;
+	m_impl->frame_draw_count = 0;
+	m_impl->capture_draw_logged = false;
 	if (m_impl->frame_id % 120 == 0)
 	{
 		m_impl->Prune_Stale_Caches();
@@ -1166,6 +2491,25 @@ bool D3D11LegacyBridge::Begin_Frame()
 		return false;
 	}
 	m_impl->frame_outcome = rts::render::RenderFrameOutcome();
+	// D3D11RenderDevice::beginFrame starts from the swap-chain target.  Reapply
+	// the last target every frame, using the newer pending transition when one
+	// was recorded while the frame was closed.
+	const RenderTargetBinding frame_target = m_impl->pending_target_change ?
+		m_impl->pending_target : m_impl->active_target;
+	const RenderResult target_result = m_impl->context->setRenderTargets(
+		frame_target);
+	if (!m_impl->Record_Result(target_result,
+		"D3D11 legacy bridge render-target transition failed"))
+	{
+		m_impl->target_transition_failed = true;
+		m_impl->context->endFrame();
+		m_impl->frame_open = false;
+		return false;
+	}
+	m_impl->active_target = frame_target;
+	m_impl->pending_target_change = false;
+	m_impl->target_transition_failed = false;
+	m_impl->Release_Unbound_Texture_Authority(frame_target);
 	if (m_impl->pending_viewport)
 	{
 		const RenderResult viewport_result = m_impl->context->setViewport(
@@ -1330,6 +2674,24 @@ RenderResult D3D11LegacyBridge::End_Frame(bool present_frame,
 		}
 		return m_impl->frame_outcome.result();
 	}
+	if (m_impl->frame_outcome.hasCommandFailure())
+	{
+		// Keep the last complete visible frame. Presenting the commands that
+		// succeeded before a rejected draw/state transition causes one-frame
+		// holes and unstable object flicker.
+		const RenderResult command_result =
+			m_impl->frame_outcome.commandResult();
+		m_impl->capture_queue.cancelCurrent(command_result);
+		m_impl->Log_Result(
+			"D3D11 legacy bridge dropped an incomplete frame after a command failure",
+			command_result);
+		m_impl->frame_outcome.setOperational(Is_Active());
+		if (outcome != 0)
+		{
+			*outcome = m_impl->frame_outcome;
+		}
+		return m_impl->frame_outcome.result();
+	}
 	if (!present_frame)
 	{
 		// A render-to-texture or otherwise non-visible pass must not consume a
@@ -1351,6 +2713,11 @@ RenderResult D3D11LegacyBridge::End_Frame(bool present_frame,
 	RenderResult capture_result = rts::render::RENDER_RESULT_OK;
 	if (present_frame && m_impl->capture_queue.pendingCount() != 0)
 	{
+		char frame_message[160];
+		snprintf(frame_message, sizeof(frame_message),
+			"D3D11 visual capture frame=%u draws=%u",
+			m_impl->frame_id, m_impl->frame_draw_count);
+		m_impl->Log(frame_message);
 		info_result = m_impl->device->getBackBufferInfo(
 			&capture_info);
 		capture_result = info_result;
@@ -1478,12 +2845,6 @@ RenderResult D3D11LegacyBridge::End_Frame(bool present_frame,
 				completion_result);
 		}
 	}
-	if (m_impl->frame_outcome.hasCommandFailure())
-	{
-		m_impl->Log_Result(
-			"D3D11 legacy bridge presented a partial frame after a command failure",
-			m_impl->frame_outcome.commandResult());
-	}
 	m_impl->frame_outcome.setOperational(Is_Active());
 	if (outcome != 0)
 	{
@@ -1500,6 +2861,7 @@ void D3D11LegacyBridge::Clear(bool clear_color, bool clear_depth_stencil,
 	{
 		return;
 	}
+	++m_impl->clear_count;
 	if (!m_impl->frame_open)
 	{
 		m_impl->pending_clear = true;
@@ -1534,6 +2896,7 @@ void D3D11LegacyBridge::Set_Viewport(const D3DVIEWPORT8 &viewport)
 	{
 		return;
 	}
+	++m_impl->viewport_count;
 	if (!m_impl->frame_open)
 	{
 		m_impl->viewport = viewport;
@@ -1550,6 +2913,172 @@ void D3D11LegacyBridge::Set_Viewport(const D3DVIEWPORT8 &viewport)
 	}
 }
 
+bool D3D11LegacyBridge::Is_Render_Target_Operational() const
+{
+	return Is_Active() && m_impl != 0 &&
+		!m_impl->target_transition_failed;
+}
+
+void D3D11LegacyBridge::Record_Visible_Submission_Failure()
+{
+	if (!Is_Active() || m_impl == 0)
+	{
+		return;
+	}
+	m_impl->Record_Result(rts::render::RENDER_RESULT_FAILED,
+		"D3D11 visible submission suppressed because its target is unavailable");
+}
+
+rts::render::RenderResult D3D11LegacyBridge::Set_Render_Target_Default()
+{
+	if (!Is_Active())
+	{
+		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	m_impl->Require_Owner_Thread("default render-target transition");
+	RenderTargetBinding binding;
+	const RenderResult result = m_impl->Apply_Target(binding);
+	if (result != rts::render::RENDER_RESULT_OK)
+	{
+		m_impl->Log_Result("D3D11 default render-target transition failed", result);
+	}
+	return result;
+}
+
+rts::render::RenderResult D3D11LegacyBridge::Copy_Active_Color_Target_To_Texture(
+	IDirect3DBaseTexture8 *destination)
+{
+	if (!Is_Active() || destination == 0)
+	{
+		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	m_impl->Require_Owner_Thread("active color-target texture copy");
+	return m_impl->Copy_Active_Color_Target_To_Texture(destination);
+}
+
+rts::render::RenderResult D3D11LegacyBridge::Set_Render_Target_Surfaces(
+	IDirect3DSurface8 *color_surface, IDirect3DSurface8 *depth_surface,
+	bool use_default_depth)
+{
+	if (!Is_Active())
+	{
+		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	m_impl->Require_Owner_Thread("render-target transition");
+	if (color_surface == 0)
+	{
+		return Set_Render_Target_Default();
+	}
+	RenderTargetBinding binding;
+	binding.useBackBufferColor = false;
+	binding.hasColor = true;
+	RenderResult target_result = rts::render::RENDER_RESULT_FAILED;
+	if (!m_impl->Ensure_Render_Target(color_surface,
+		&binding.color.resource, &target_result))
+	{
+		m_impl->target_transition_failed = true;
+		m_impl->Release_Unbound_Texture_Authority(m_impl->active_target);
+		m_impl->Log_Result("D3D11 color render-target creation failed",
+			target_result);
+		return target_result;
+	}
+	// The DX8 render-to-texture path historically passes the surface returned by
+	// GetDepthStencilSurface explicitly.  That surface is the swap-chain depth
+	// buffer, not a texture-backed depth target.  Do not send it through
+	// Ensure_Depth_Target: a swap-chain depth surface has no texture container
+	// and must map to the D3D11 device's back-buffer depth view instead.
+	//
+	// Keep this identity check in the bridge as a defensive boundary as well as
+	// in DX8Wrapper's tracked state.  It covers legacy callers which still pass
+	// the default surface through the two-surface overload while preserving
+	// texture-backed custom depth surfaces.
+	bool effective_default_depth = use_default_depth;
+	if (!effective_default_depth && depth_surface != 0 &&
+		m_impl->legacy_device != 0)
+	{
+		IDirect3DSurface8 *bound_depth_surface = 0;
+		if (SUCCEEDED(m_impl->legacy_device->GetDepthStencilSurface(
+			&bound_depth_surface)))
+		{
+			effective_default_depth = bound_depth_surface == depth_surface;
+			bound_depth_surface->Release();
+		}
+	}
+	if (effective_default_depth)
+	{
+		binding.useBackBufferDepth = true;
+	}
+	else if (depth_surface != 0)
+	{
+		binding.useBackBufferDepth = false;
+		binding.hasDepth = true;
+		if (!m_impl->Ensure_Depth_Target(depth_surface,
+			&binding.depth.resource, &target_result))
+		{
+			m_impl->target_transition_failed = true;
+			m_impl->Release_Unbound_Texture_Authority(m_impl->active_target);
+			m_impl->Log_Result("D3D11 depth render-target creation failed",
+				target_result);
+			return target_result;
+		}
+	}
+	else
+	{
+		binding.useBackBufferDepth = false;
+	}
+	const RenderResult result = m_impl->Apply_Target(binding);
+	if (result != rts::render::RENDER_RESULT_OK)
+	{
+		m_impl->Log_Result("D3D11 render-target transition failed", result);
+	}
+	return result;
+}
+
+void D3D11LegacyBridge::Invalidate_Buffer(IUnknown *buffer)
+{
+	if (!Is_Active() || buffer == 0)
+	{
+		return;
+	}
+	Impl::BufferEntry *vertex_entry = m_impl->Find_Buffer(
+		m_impl->vertex_buffers, m_impl->vertex_buffer_index, buffer, false);
+	if (vertex_entry != 0)
+	{
+		vertex_entry->source_dirty = true;
+	}
+	Impl::BufferEntry *index_entry = m_impl->Find_Buffer(
+		m_impl->index_buffers, m_impl->index_buffer_index, buffer, false);
+	if (index_entry != 0)
+	{
+		index_entry->source_dirty = true;
+	}
+}
+
+void D3D11LegacyBridge::Invalidate_Texture(IDirect3DBaseTexture8 *texture)
+{
+	if (!Is_Active() || texture == 0)
+	{
+		return;
+	}
+	Impl::TextureEntry *found_entry = m_impl->Find_Texture_Entry(
+		texture, 0, false);
+	if (found_entry != 0)
+	{
+		Impl::TextureEntry &entry = *found_entry;
+		// This notification follows a completed D3D8-side write.  Mark the
+		// legacy copy as authoritative, but defer the CPU readback until the
+		// texture is actually consumed by a D3D11 draw (or by the periodic cache
+		// maintenance pass).  Texture loading and terrain/water update paths can
+		// publish several notifications in one frame; refreshing here would make
+		// every notification perform a full D3D8 surface readback, even when a
+		// later notification supersedes it.  The dirty bit is intentionally
+		// idempotent, so consecutive notifications coalesce into one refresh.
+		entry.d3d11_authority = false;
+		entry.d3d8_dirty = true;
+		entry.last_used_frame = m_impl->frame_id;
+	}
+}
+
 bool D3D11LegacyBridge::Draw(VertexBufferClass *vertex_buffer,
 	IndexBufferClass *index_buffer, unsigned int primitive_type,
 	unsigned int start_index, unsigned int primitive_count,
@@ -1560,11 +3089,21 @@ bool D3D11LegacyBridge::Draw(VertexBufferClass *vertex_buffer,
 	{
 		return Is_Active() ? m_impl->Fail("draw failure: invalid draw state") : false;
 	}
-	const unsigned int index_count = Primitive_Index_Count(primitive_type,
-		primitive_count);
-	if (index_count == 0)
+	if (!Can_Submit_D3D11_Legacy_Draw())
 	{
-		return m_impl->Fail("draw failure: unsupported primitive topology");
+		return m_impl->Fail(rts::render::RENDER_RESULT_FAILED,
+			"draw failure: neutral texture stage state publication was rejected");
+	}
+	unsigned int index_count = 0;
+	if (!Primitive_Index_Count(primitive_type, primitive_count, &index_count))
+	{
+		return m_impl->Fail("draw failure: indexed primitive count overflow or unsupported topology");
+	}
+	if (!rts::render::Is_D3D8_Indexed_Range_Valid(
+		static_cast<unsigned long>(index_buffer->Get_Index_Count()),
+		start_index, index_count))
+	{
+		return m_impl->Fail("draw failure: indexed range exceeds buffer");
 	}
 	GpuHandle vertex_handle;
 	GpuHandle index_handle;
@@ -1583,18 +3122,83 @@ bool D3D11LegacyBridge::Draw(VertexBufferClass *vertex_buffer,
 	{
 		return m_impl->Fail("draw failure: unavailable legacy logical state");
 	}
+	if (state.pipeline.rasterizer.frontCounterClockwise)
+	{
+		++m_impl->counter_clockwise_draw_count;
+	}
+	if (state.pipeline.rasterizer.cullMode == rts::render::RENDER_CULL_NONE)
+	{
+		++m_impl->unculled_draw_count;
+	}
+	if (state.pipeline.blend.colorWriteMask != 0)
+	{
+		++m_impl->color_write_draw_count;
+	}
+	if (state.pipeline.depthStencil.depthFunction ==
+		rts::render::RENDER_COMPARE_NEVER)
+	{
+		++m_impl->depth_never_draw_count;
+	}
+	if (!m_impl->capture_draw_logged && m_impl->capture_queue.pendingCount() != 0)
+	{
+		D3DMATRIX actual_world;
+		D3DMATRIX actual_view;
+		D3DMATRIX actual_projection;
+		float maximum_difference[3] = { 0.0f, 0.0f, 0.0f };
+		if (SUCCEEDED(m_impl->legacy_device->GetTransform(D3DTS_WORLD,
+				&actual_world)) && SUCCEEDED(m_impl->legacy_device->GetTransform(
+				D3DTS_VIEW, &actual_view)) && SUCCEEDED(
+				m_impl->legacy_device->GetTransform(D3DTS_PROJECTION,
+					&actual_projection)))
+		{
+			const float *actual_matrices[] = { &actual_world.m[0][0],
+				&actual_view.m[0][0], &actual_projection.m[0][0] };
+			const float *tracked_matrices[] = { state.constants.world.values,
+				state.constants.view.values, state.constants.projection.values };
+			for (unsigned int matrix = 0; matrix < 3; ++matrix)
+			{
+				for (unsigned int component = 0; component < 16; ++component)
+				{
+					const float difference = static_cast<float>(fabs(
+						actual_matrices[matrix][component] -
+						tracked_matrices[matrix][component]));
+					if (difference > maximum_difference[matrix])
+					{
+						maximum_difference[matrix] = difference;
+					}
+				}
+			}
+		}
+		D3DVIEWPORT8 actual_viewport;
+		memset(&actual_viewport, 0, sizeof(actual_viewport));
+		m_impl->legacy_device->GetViewport(&actual_viewport);
+		char state_message[320];
+		snprintf(state_message, sizeof(state_message),
+			"capture first draw fvf=0x%08x primitives=%u start=%u base=%u cull=%u ccw=%u color_mask=0x%x depth=%u matrix_diff=%g,%g,%g viewport=%u,%u,%u,%u,%g,%g",
+			vertex_buffer->FVF_Info().Get_FVF(), primitive_count, start_index,
+			base_vertex, static_cast<unsigned int>(
+				state.pipeline.rasterizer.cullMode),
+			state.pipeline.rasterizer.frontCounterClockwise ? 1U : 0U,
+			state.pipeline.blend.colorWriteMask,
+			static_cast<unsigned int>(state.pipeline.depthStencil.depthFunction),
+			maximum_difference[0], maximum_difference[1], maximum_difference[2],
+			actual_viewport.X, actual_viewport.Y,
+			actual_viewport.Width, actual_viewport.Height, actual_viewport.MinZ,
+			actual_viewport.MaxZ);
+		m_impl->Log(state_message);
+		m_impl->capture_draw_logged = true;
+	}
 	unsigned int texture_mask = 0;
 	for (unsigned int stage = 0;
 		stage < rts::render::LEGACY_TEXTURE_STAGE_COUNT; ++stage)
 	{
 		GpuHandle texture_handle;
-		IDirect3DBaseTexture8 *source = 0;
-		m_impl->legacy_device->GetTexture(stage, &source);
+		// DX8Wrapper owns and maintains this shadow.  Reading it avoids the
+		// eight per-draw GetTexture/AddRef/Release round trips and keeps the
+		// D3D11 bridge from asking the legacy device for mutable state.
+		IDirect3DBaseTexture8 *source =
+			DX8Wrapper::Get_Tracked_DX8_Texture(stage);
 		const bool bound = m_impl->Bind_Texture(stage, source, &texture_handle);
-		if (source != 0)
-		{
-			source->Release();
-		}
 		if (!bound)
 		{
 			return m_impl->Fail("draw failure: texture conversion or binding");
@@ -1637,8 +3241,14 @@ bool D3D11LegacyBridge::Draw(VertexBufferClass *vertex_buffer,
 		return m_impl->Fail(index_bind_result,
 			"draw failure: D3D11 index buffer binding");
 	}
+	rts::render::RenderPrimitiveTopology topology;
+	if (!Try_Translate_D3D8_Primitive_Topology(primitive_type, &topology))
+	{
+		return m_impl->Fail(rts::render::RENDER_RESULT_UNSUPPORTED,
+			"draw failure: unsupported indexed primitive topology");
+	}
 	const RenderResult topology_result = m_impl->context->setPrimitiveTopology(
-		Translate_Topology(primitive_type));
+		topology);
 	if (topology_result != rts::render::RENDER_RESULT_OK)
 	{
 		return m_impl->Fail(topology_result,
@@ -1652,11 +3262,276 @@ bool D3D11LegacyBridge::Draw(VertexBufferClass *vertex_buffer,
 			"draw failure: D3D11 indexed submission");
 	}
 	++m_impl->draw_count;
+	++m_impl->frame_draw_count;
 	if (m_impl->draw_count == 1)
 	{
 		m_impl->Log("first D3D11 legacy draw submitted");
 	}
 	return true;
+}
+
+bool D3D11LegacyBridge::Draw(IDirect3DVertexBuffer8 *vertex_buffer,
+	unsigned int fvf, unsigned int vertex_stride,
+	IDirect3DIndexBuffer8 *index_buffer, unsigned int primitive_type,
+	unsigned int min_vertex_index, unsigned int vertex_count,
+	unsigned int start_index, unsigned int primitive_count,
+	unsigned int base_vertex)
+{
+	if (!Is_Active() || m_impl == 0 || !m_impl->frame_open ||
+		vertex_buffer == 0 || index_buffer == 0)
+	{
+		return Is_Active() ? m_impl->Fail(
+			"raw draw failure: invalid draw state") : false;
+	}
+	if (!Can_Submit_D3D11_Legacy_Draw())
+	{
+		return m_impl->Fail(rts::render::RENDER_RESULT_FAILED,
+			"raw draw failure: neutral texture stage state publication was rejected");
+	}
+	unsigned int index_count = 0;
+	if (!Primitive_Index_Count(primitive_type, primitive_count, &index_count))
+	{
+		return m_impl->Fail("raw draw failure: indexed primitive count overflow or unsupported topology");
+	}
+	if (base_vertex > static_cast<unsigned int>(
+		std::numeric_limits<int>::max()))
+	{
+		return m_impl->Fail(rts::render::RENDER_RESULT_UNSUPPORTED,
+			"raw draw failure: base vertex exceeds D3D11 range");
+	}
+	D3DVERTEXBUFFER_DESC vertex_desc;
+	D3DINDEXBUFFER_DESC index_desc;
+	memset(&vertex_desc, 0, sizeof(vertex_desc));
+	memset(&index_desc, 0, sizeof(index_desc));
+	if (FAILED(vertex_buffer->GetDesc(&vertex_desc)) ||
+		vertex_desc.Size == 0)
+	{
+		return m_impl->Fail("raw draw failure: vertex buffer description");
+	}
+	if (FAILED(index_buffer->GetDesc(&index_desc)) || index_desc.Size == 0)
+	{
+		return m_impl->Fail("raw draw failure: index buffer description");
+	}
+	if (index_desc.Format != D3DFMT_INDEX16)
+	{
+		return m_impl->Fail(rts::render::RENDER_RESULT_UNSUPPORTED,
+			"raw draw failure: index buffer is not 16-bit");
+	}
+	if (!rts::render::Is_D3D8_Indexed_Range_Valid(
+		static_cast<unsigned long>(index_desc.Size / sizeof(unsigned short)),
+		start_index, index_count))
+	{
+		return m_impl->Fail("raw draw failure: indexed range exceeds buffer");
+	}
+	if (vertex_stride == 0)
+	{
+		return m_impl->Fail(rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+			"raw draw failure: zero vertex stride");
+	}
+	const FVFInfoClass fvf_info(fvf);
+	if (fvf_info.Get_FVF_Size() == 0 ||
+		vertex_stride < fvf_info.Get_FVF_Size())
+	{
+		return m_impl->Fail(rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+			"raw draw failure: vertex stride is smaller than its FVF");
+	}
+	LegacyVertexLayout layout;
+	if (!Build_Vertex_Layout(fvf_info, &layout))
+	{
+		return m_impl->Fail("raw draw failure: unsupported legacy vertex layout");
+	}
+	layout.stride = vertex_stride;
+	const size_t index_start = static_cast<size_t>(start_index) *
+		sizeof(unsigned short);
+	const size_t index_bytes = static_cast<size_t>(index_count) *
+		sizeof(unsigned short);
+	if (index_start > static_cast<size_t>(index_desc.Size) ||
+		index_bytes > static_cast<size_t>(index_desc.Size) - index_start)
+	{
+		return m_impl->Fail("raw draw failure: indexed range exceeds buffer");
+	}
+	const size_t first_vertex = static_cast<size_t>(base_vertex) +
+		static_cast<size_t>(min_vertex_index);
+	if (first_vertex > static_cast<size_t>(-1) - vertex_count ||
+		(first_vertex + vertex_count) >
+		(static_cast<size_t>(vertex_desc.Size) / vertex_stride))
+	{
+		return m_impl->Fail("raw draw failure: vertex range exceeds buffer");
+	}
+	GpuHandle vertex_handle;
+	GpuHandle index_handle;
+	size_t uploaded_vertex_bytes = 0;
+	size_t uploaded_index_bytes = 0;
+	if (!m_impl->Upload_Raw_Vertex_Buffer(vertex_buffer, &vertex_handle,
+		&uploaded_vertex_bytes) ||
+		!m_impl->Upload_Raw_Index_Buffer(index_buffer, &index_handle,
+		&uploaded_index_bytes))
+	{
+		return false;
+	}
+	(void)uploaded_vertex_bytes;
+	(void)uploaded_index_bytes;
+	return m_impl->Submit_Indexed_Draw(vertex_handle, index_handle, layout,
+		fvf, primitive_type, index_count, start_index, primitive_count,
+		base_vertex, true);
+}
+
+unsigned int D3D11LegacyBridge::Get_Raw_Indexed_Draw_Count() const
+{
+	return m_impl == 0 ? 0 : m_impl->raw_indexed_draw_count;
+}
+
+void D3D11LegacyBridge::Get_Cache_Stats(
+	D3D11LegacyBridgeCacheStats *stats) const
+{
+	if (stats == 0)
+	{
+		return;
+	}
+	memset(stats, 0, sizeof(*stats));
+	if (m_impl == 0)
+	{
+		return;
+	}
+	stats->bufferLookups = m_impl->cache_counters.bufferLookups;
+	stats->bufferHits = m_impl->cache_counters.bufferHits;
+	stats->textureLookups = m_impl->cache_counters.textureLookups;
+	stats->textureHits = m_impl->cache_counters.textureHits;
+	stats->bufferUploads = m_impl->cache_counters.bufferUploads;
+	stats->textureRefreshes = m_impl->cache_counters.textureRefreshes;
+}
+
+RenderResult D3D11LegacyBridge::Draw_Primitive_UP(
+	unsigned int fvf, unsigned int primitive_type, unsigned int primitive_count,
+	const void *vertex_data, unsigned int vertex_stride)
+{
+	if (!Is_Active() || m_impl == 0 || !m_impl->frame_open)
+	{
+		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	m_impl->Require_Owner_Thread("DrawPrimitiveUP");
+	if (!Can_Submit_D3D11_Legacy_Draw())
+	{
+		m_impl->Fail(rts::render::RENDER_RESULT_FAILED,
+			"draw failure: neutral texture stage state publication was rejected");
+		return rts::render::RENDER_RESULT_FAILED;
+	}
+	if (primitive_count == 0)
+	{
+		return rts::render::RENDER_RESULT_OK;
+	}
+	if (vertex_data == 0 || vertex_stride == 0)
+	{
+		m_impl->Fail(rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+			"draw failure: invalid DrawPrimitiveUP arguments");
+		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	size_t vertex_count = 0;
+	if (!Primitive_Up_Vertex_Count(primitive_type, primitive_count,
+		&vertex_count) || vertex_count > UINT_MAX)
+	{
+		m_impl->Fail(rts::render::RENDER_RESULT_UNSUPPORTED,
+			"draw failure: unsupported DrawPrimitiveUP topology or count");
+		return rts::render::RENDER_RESULT_UNSUPPORTED;
+	}
+	const FVFInfoClass fvf_info(fvf);
+	const unsigned int fvf_stride = fvf_info.Get_FVF_Size();
+	if (fvf_stride == 0 || vertex_stride < fvf_stride)
+	{
+		m_impl->Fail(rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+			"draw failure: DrawPrimitiveUP stride is smaller than its FVF");
+		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	size_t byte_count = 0;
+	if (!Checked_Multiply(vertex_count, static_cast<size_t>(vertex_stride),
+		&byte_count) || byte_count > PRIMITIVE_UP_BUFFER_CAPACITY)
+	{
+		m_impl->Fail(rts::render::RENDER_RESULT_UNSUPPORTED,
+			"draw failure: DrawPrimitiveUP byte budget exceeded");
+		return rts::render::RENDER_RESULT_UNSUPPORTED;
+	}
+	LegacyVertexLayout layout;
+	if (!Build_Vertex_Layout(fvf_info, &layout))
+	{
+		m_impl->Fail(rts::render::RENDER_RESULT_UNSUPPORTED,
+			"draw failure: unsupported DrawPrimitiveUP FVF");
+		return rts::render::RENDER_RESULT_UNSUPPORTED;
+	}
+	layout.stride = vertex_stride;
+	GpuHandle vertex_handle;
+	if (!m_impl->Upload_Primitive_Up(vertex_data, byte_count,
+		&vertex_handle))
+	{
+		return rts::render::RENDER_RESULT_FAILED;
+	}
+	LegacyLogicalState state;
+	if (!rts::render::GetTrackedLegacyLogicalState(&state))
+	{
+		m_impl->Fail("draw failure: unavailable legacy logical state");
+		return rts::render::RENDER_RESULT_FAILED;
+	}
+	unsigned int texture_mask = 0;
+	for (unsigned int stage = 0;
+		stage < rts::render::LEGACY_TEXTURE_STAGE_COUNT; ++stage)
+	{
+		GpuHandle texture_handle;
+		IDirect3DBaseTexture8 *source =
+			DX8Wrapper::Get_Tracked_DX8_Texture(stage);
+		if (!m_impl->Bind_Texture(stage, source, &texture_handle))
+		{
+			m_impl->Fail("draw failure: DrawPrimitiveUP texture binding");
+			return rts::render::RENDER_RESULT_FAILED;
+		}
+		if (texture_handle.isValid())
+		{
+			texture_mask |= 1U << stage;
+		}
+	}
+	const RenderResult state_result = m_impl->context->setLegacyStateForLayout(
+		state, layout, texture_mask);
+	if (state_result != rts::render::RENDER_RESULT_OK)
+	{
+		m_impl->Fail(state_result,
+			"draw failure: DrawPrimitiveUP state/layout binding");
+		return state_result;
+	}
+	const RenderResult vertex_bind_result = m_impl->context->setVertexBuffer(
+		vertex_handle, vertex_stride, 0);
+	if (vertex_bind_result != rts::render::RENDER_RESULT_OK)
+	{
+		m_impl->Fail(vertex_bind_result,
+			"draw failure: DrawPrimitiveUP vertex binding");
+		return vertex_bind_result;
+	}
+	rts::render::RenderPrimitiveTopology topology;
+	if (!Try_Translate_D3D8_Primitive_Topology(primitive_type, &topology))
+	{
+		m_impl->Fail(rts::render::RENDER_RESULT_UNSUPPORTED,
+			"draw failure: unsupported DrawPrimitiveUP topology");
+		return rts::render::RENDER_RESULT_UNSUPPORTED;
+	}
+	const RenderResult topology_result =
+		m_impl->context->setPrimitiveTopology(topology);
+	if (topology_result != rts::render::RENDER_RESULT_OK)
+	{
+		m_impl->Fail(topology_result,
+			"draw failure: DrawPrimitiveUP topology binding");
+		return topology_result;
+	}
+	const RenderResult draw_result = m_impl->context->draw(
+		static_cast<unsigned int>(vertex_count), 0);
+	if (draw_result != rts::render::RENDER_RESULT_OK)
+	{
+		m_impl->Fail(draw_result, "draw failure: DrawPrimitiveUP submission");
+		return draw_result;
+	}
+	++m_impl->draw_count;
+	++m_impl->frame_draw_count;
+	if (m_impl->draw_count == 1)
+	{
+		m_impl->Log("first D3D11 legacy DrawPrimitiveUP submitted");
+	}
+	return rts::render::RENDER_RESULT_OK;
 }
 
 RenderResult D3D11LegacyBridge::Resize(unsigned int width, unsigned int height)
@@ -1667,7 +3542,34 @@ RenderResult D3D11LegacyBridge::Resize(unsigned int width, unsigned int height)
 	}
 	m_impl->capture_queue.advanceGeneration();
 	m_impl->capture_queue.cancelStale(rts::render::RENDER_RESULT_FAILED);
-	const RenderResult result = m_impl->device->resize(width, height);
+	RenderResult result = m_impl->device->resize(width, height);
+	if (result == rts::render::RENDER_RESULT_DEVICE_REMOVED)
+	{
+		// ResizeBuffers can be the first call to report a removed, reset, or
+		// hung device.  The render device normally recovers and retries this
+		// operation itself; keep this bridge-level retry for failures surfaced
+		// by the second attempt (or by a backend implementation that reports
+		// the removal without doing its own recovery).  Recover_Device preserves
+		// the bridge's logical target binding and the renderer's generation-safe
+		// handles before the requested size is applied again.
+		const RenderResult recovery_result = m_impl->Recover_Device();
+		if (recovery_result == rts::render::RENDER_RESULT_OK)
+		{
+			m_impl->context = m_impl->device->immediateContext();
+			if (m_impl->context != 0)
+			{
+				result = m_impl->device->resize(width, height);
+			}
+			else
+			{
+				result = rts::render::RENDER_RESULT_FAILED;
+			}
+		}
+		else
+		{
+			result = recovery_result;
+		}
+	}
 	if (result != rts::render::RENDER_RESULT_OK)
 	{
 		m_impl->Log_Result("D3D11 legacy bridge resize failed", result);
@@ -1678,8 +3580,12 @@ RenderResult D3D11LegacyBridge::Resize(unsigned int width, unsigned int height)
 			Shutdown();
 		}
 	}
-	else
+	else if (width != 0 && height != 0)
 	{
+		// D3D11RenderDevice deliberately treats a minimized 0x0 resize as a
+		// successful no-op so its last valid swap-chain targets survive.  Mirror
+		// that contract here instead of replacing the bridge's usable dimensions
+		// with zero and making the later restore path appear invalid.
 		m_impl->width = width;
 		m_impl->height = height;
 	}
@@ -1731,8 +3637,51 @@ rts::render::RenderResult D3D11LegacyBridge::End_Frame(bool,
 void D3D11LegacyBridge::Clear(bool, bool, float, float, float, float, float,
 	unsigned int) {}
 void D3D11LegacyBridge::Set_Viewport(const D3DVIEWPORT8 &) {}
+bool D3D11LegacyBridge::Is_Render_Target_Operational() const { return false; }
+void D3D11LegacyBridge::Record_Visible_Submission_Failure() {}
+rts::render::RenderResult D3D11LegacyBridge::Set_Render_Target_Surfaces(
+	IDirect3DSurface8 *, IDirect3DSurface8 *, bool)
+{
+	return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+}
+rts::render::RenderResult D3D11LegacyBridge::Set_Render_Target_Default()
+{
+	return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+}
+rts::render::RenderResult D3D11LegacyBridge::Copy_Active_Color_Target_To_Texture(
+	IDirect3DBaseTexture8 *)
+{
+	return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+}
+void D3D11LegacyBridge::Invalidate_Buffer(IUnknown *) {}
+void D3D11LegacyBridge::Invalidate_Texture(IDirect3DBaseTexture8 *) {}
 bool D3D11LegacyBridge::Draw(VertexBufferClass *, IndexBufferClass *,
 	unsigned int, unsigned int, unsigned int, unsigned int) { return false; }
+bool D3D11LegacyBridge::Draw(IDirect3DVertexBuffer8 *, unsigned int,
+	unsigned int, IDirect3DIndexBuffer8 *, unsigned int, unsigned int,
+	unsigned int, unsigned int, unsigned int, unsigned int) { return false; }
+unsigned int D3D11LegacyBridge::Get_Raw_Indexed_Draw_Count() const
+{
+	return 0;
+}
+void D3D11LegacyBridge::Get_Cache_Stats(
+	D3D11LegacyBridgeCacheStats *stats) const
+{
+	if (stats != 0)
+	{
+		stats->bufferLookups = 0;
+		stats->bufferHits = 0;
+		stats->textureLookups = 0;
+		stats->textureHits = 0;
+		stats->bufferUploads = 0;
+		stats->textureRefreshes = 0;
+	}
+}
+rts::render::RenderResult D3D11LegacyBridge::Draw_Primitive_UP(
+	unsigned int, unsigned int, unsigned int, const void *, unsigned int)
+{
+	return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+}
 rts::render::RenderResult D3D11LegacyBridge::Resize(unsigned int, unsigned int)
 {
 	return rts::render::RENDER_RESULT_INVALID_ARGUMENT;

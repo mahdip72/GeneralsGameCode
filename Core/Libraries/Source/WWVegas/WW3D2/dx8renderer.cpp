@@ -75,6 +75,17 @@ static MultiListClass<MeshModelClass>			_RegisteredMeshList;
 static TextureCategoryList							texture_category_delete_list;
 static FVFCategoryList								fvf_category_container_delete_list;
 
+// D3D11 consumes the legacy draw stream through d3d11legacybridge.  It has no
+// D3D8 fixed-function N-patch stage, so do not mark the bridge's ordinary
+// triangle buffers as D3DUSAGE_NPATCHES or set the legacy N-patch shader bit
+// merely because the compatibility D3D8 device advertises that capability.
+// The native D3D8 path keeps its historical capability-based behavior.
+static bool Supports_NPatch_Geometry()
+{
+	return !DX8Wrapper::Is_D3D11_Backend_Active() &&
+		DX8Wrapper::Get_Current_Caps()->Support_NPatches();
+}
+
 // helper data structure
 class PolyRemover : public MultiListObjectClass
 {
@@ -858,7 +869,7 @@ public:
 		npatch_enable(false),
 		allocated_polygon_array(false)
 	{
-		if (DX8Wrapper::Get_Current_Caps()->Support_NPatches() && mmc->Needs_Vertex_Normals()) {
+		if (Supports_NPatch_Geometry() && mmc->Needs_Vertex_Normals()) {
 			if (mmc->Get_Flag(MeshGeometryClass::ALLOW_NPATCHES)) {
 				npatch_enable=true;
 			}
@@ -1012,7 +1023,7 @@ void DX8RigidFVFCategoryContainer::Add_Mesh(MeshModelClass* mmc_)
 			vertex_buffer=NEW_REF(DX8VertexBufferClass,(
 				FVF,
 				vb_size,
-				(DX8Wrapper::Get_Current_Caps()->Support_NPatches() && WW3D::Get_NPatches_Level()>1) ? DX8VertexBufferClass::USAGE_NPATCHES : DX8VertexBufferClass::USAGE_DEFAULT));
+				(Supports_NPatch_Geometry() && WW3D::Get_NPatches_Level()>1) ? DX8VertexBufferClass::USAGE_NPATCHES : DX8VertexBufferClass::USAGE_DEFAULT));
 		}
 	}
 
@@ -1210,7 +1221,7 @@ void DX8FVFCategoryContainer::Generate_Texture_Categories(Vertex_Split_Table& sp
 		else {
 			index_buffer=NEW_REF(DX8IndexBufferClass,(
 				ib_size,
-				(DX8Wrapper::Get_Current_Caps()->Support_NPatches() && WW3D::Get_NPatches_Level()>1) ? DX8IndexBufferClass::USAGE_NPATCHES : DX8IndexBufferClass::USAGE_DEFAULT));
+				(Supports_NPatch_Geometry() && WW3D::Get_NPatches_Level()>1) ? DX8IndexBufferClass::USAGE_NPATCHES : DX8IndexBufferClass::USAGE_DEFAULT));
 		}
 	}
 

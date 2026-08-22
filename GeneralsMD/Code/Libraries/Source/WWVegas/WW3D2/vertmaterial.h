@@ -44,16 +44,10 @@
 #include "WW3D2/w3derr.h"
 #include "mapper.h"
 #include "WWLib/wwstring.h"
+#include "Renderer/LegacyRenderState.h"
 
 class ChunkLoadClass;
 class ChunkSaveClass;
-
-#define DYN_MAT8
-#ifdef DYN_MAT8
-class DynD3DMATERIAL8;
-#else
-struct _D3DMATERIAL8;
-#endif
 
 /**
 ** VertexMaterialClass
@@ -86,9 +80,9 @@ public:
 	};
 
 	enum ColorSourceType {
-		MATERIAL = 0,				// D3DMCS_MATERIAL - the color source should be taken from the material setting
-		COLOR1,						// D3DMCS_COLOR1 - the color should be taken from per-vertex color array 1 (aka D3DFVF_DIFFUSE)
-		COLOR2,						// D3DMCS_COLOR2 - the color should be taken from per-vertex color array 2 (aka D3DFVF_SPECULAR)
+		MATERIAL = 0,				// Use the material's color.
+		COLOR1,						// Use the first per-vertex color array.
+		COLOR2,						// Use the second per-vertex color array.
 	};
 
 	enum PresetType
@@ -160,6 +154,7 @@ public:
 
 	void			Set_Lighting(bool lighting) { CRCDirty=true; UseLighting=lighting; };
 	bool			Get_Lighting() const { return UseLighting; };
+	const rts::render::LegacyMaterialState &Get_Renderer_Material_State() const { return Material; }
 
 	/*
 	** Color source control.  Note that if you set one of the sources to be one of
@@ -234,17 +229,13 @@ public:
 	void Make_Unique();
 
 private:
-	// We're using the pointer instead of the actual structure
-	// so we don't have to include the d3d header - HY
-#ifdef DYN_MAT8
-	DynD3DMATERIAL8 *			MaterialDyn;
-#else
-	_D3DMATERIAL8 *				MaterialOld;
-#endif
+	// Keep material data in the renderer-neutral contract.  The compatibility
+	// wrapper owns conversion to the legacy backend descriptor at submission.
+	rts::render::LegacyMaterialState Material;
 	unsigned int					Flags;
-	unsigned int					AmbientColorSource;
-	unsigned int					EmissiveColorSource;
-	unsigned int					DiffuseColorSource;
+	rts::render::RenderMaterialSource AmbientColorSource;
+	rts::render::RenderMaterialSource EmissiveColorSource;
+	rts::render::RenderMaterialSource DiffuseColorSource;
 	StringClass						Name;
 	TextureMapperClass *	Mapper[MeshBuilderClass::MAX_STAGES];
 	unsigned int					UVSource[MeshBuilderClass::MAX_STAGES];

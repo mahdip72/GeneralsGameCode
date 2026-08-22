@@ -105,6 +105,7 @@ static void drawFramerateBar();
 #include "WW3D2/meshmdl.h"
 #include "WW3D2/rddesc.h"
 #include "WWLib/TARGA.h"
+#include "Renderer/RenderSubmissionPolicy.h"
 
 #include "GameLogic/ScriptEngine.h"		// For TheScriptEngine - jkmcd
 #include "GameLogic/GameLogic.h"
@@ -1849,11 +1850,14 @@ void W3DDisplay::draw()
 	if (TheGlobalData->m_headless)
 		return;
 
-	if (TheGlobalData->m_rendererCaptureFrame &&
-		DX8Wrapper::Is_D3D11_Backend_Active())
+	static rts::render::RenderCaptureFrameGate rendererCaptureFrameGate;
+	if (!TheGlobalData->m_rendererCaptureFrame)
 	{
-		TheWritableGlobalData->m_rendererCaptureFrame = FALSE;
-		DX8Wrapper::Request_D3D11_Back_Buffer_Capture();
+		rendererCaptureFrameGate.clear();
+	}
+	else
+	{
+		rendererCaptureFrameGate.request();
 	}
 
 	// TheSuperHackers @feature bobtista 10/07/2026 Show messages for screenshots finished by the screenshot thread.
@@ -1991,7 +1995,11 @@ AGAIN:
 	do {
 
 		// update all views of the world - recomputes data which will affect drawing
-		if (DX8Wrapper::_Get_D3D_Device8() && (DX8Wrapper::_Get_D3D_Device8()->TestCooperativeLevel()) == D3D_OK)
+		// The D3D8 device is intentionally absent when the D3D11 compatibility
+		// backend owns presentation.  Use the wrapper lifecycle state here so
+		// view preparation is not accidentally skipped (or tied to a raw D3D8
+		// cooperative-level query) on the modern path.
+		if (DX8Wrapper::Is_Initted() && !DX8Wrapper::Is_Device_Lost())
 		{	//Checking if we have the device before updating views because the heightmap crashes otherwise while
 			//trying to refresh the visible terrain geometry.
 //			if(TheGlobalData->m_loadScreenRender != TRUE)
@@ -2038,7 +2046,18 @@ AGAIN:
 					TheInGameUI->draw();
 					if( TheMouse )
 						TheMouse->draw();	//keep applying the current cursor style so it remains hidden if needed.
+					const bool captureArmed = rendererCaptureFrameGate.arm(
+						DX8Wrapper::Is_D3D11_Backend_Active());
+					const unsigned long captureFrameCount = captureArmed ?
+						DX8Wrapper::Get_FrameCount() : 0;
+					if (captureArmed)
+						DX8Wrapper::Request_D3D11_Back_Buffer_Capture();
 					WW3D::End_Render();
+					if (captureArmed && rendererCaptureFrameGate.complete(
+						DX8Wrapper::Get_FrameCount() != captureFrameCount))
+					{
+						TheWritableGlobalData->m_rendererCaptureFrame = FALSE;
+					}
 					continue;
 				}
 				couldRender = true;
@@ -2129,7 +2148,18 @@ AGAIN:
 				}
 #endif
 				// render is all done!
+				const bool captureArmed = rendererCaptureFrameGate.arm(
+					DX8Wrapper::Is_D3D11_Backend_Active());
+				const unsigned long captureFrameCount = captureArmed ?
+					DX8Wrapper::Get_FrameCount() : 0;
+				if (captureArmed)
+					DX8Wrapper::Request_D3D11_Back_Buffer_Capture();
 				WW3D::End_Render();
+				if (captureArmed && rendererCaptureFrameGate.complete(
+					DX8Wrapper::Get_FrameCount() != captureFrameCount))
+				{
+					TheWritableGlobalData->m_rendererCaptureFrame = FALSE;
+				}
 			}
 			else
 			{

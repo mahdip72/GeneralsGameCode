@@ -1,5 +1,7 @@
 #include "Renderer/LegacyRenderState.h"
 
+#include <math.h>
+
 namespace rts
 {
 namespace render
@@ -8,6 +10,7 @@ namespace
 {
 LegacyLogicalState g_trackedLogicalState;
 bool g_trackedPipelineStateValid = false;
+bool g_legacyStatePublicationFailed = false;
 }
 
 RenderFloat4::RenderFloat4() : x(0.0f), y(0.0f), z(0.0f), w(0.0f) {}
@@ -85,7 +88,10 @@ LegacyTextureStageState::LegacyTextureStageState() :
 	alphaArgument1Complement(false), alphaArgument1AlphaReplicate(false),
 	alphaArgument2Complement(false), alphaArgument2AlphaReplicate(false),
 	resultArgument(RENDER_TEXTURE_ARG_CURRENT), textureCoordinateIndex(0),
-	projectedCoordinates(false), bumpEnvironmentMatrix00(1.0f),
+	cameraSpacePosition(false), cameraSpaceNormal(false),
+	cameraSpaceReflectionVector(false), textureTransformEnable(false),
+	projectedCoordinates(false), textureTransformCount(0),
+	bumpEnvironmentMatrix00(1.0f),
 	bumpEnvironmentMatrix01(0.0f), bumpEnvironmentMatrix10(0.0f),
 	bumpEnvironmentMatrix11(1.0f), bumpEnvironmentLuminanceScale(1.0f),
 	bumpEnvironmentLuminanceOffset(0.0f), sampler()
@@ -93,11 +99,18 @@ LegacyTextureStageState::LegacyTextureStageState() :
 }
 
 LegacyPipelineState::LegacyPipelineState() :
-	shaderBits(0), blend(), depthStencil(), rasterizer(),
+	shaderBits(0), pixelProgram(RENDER_LEGACY_PIXEL_FIXED_FUNCTION),
+	vertexProgram(RENDER_LEGACY_VERTEX_FIXED_FUNCTION), blend(),
+	depthStencil(), rasterizer(),
 	fogMode(RENDER_FOG_DISABLED), secondaryGradientEnable(false),
 	nPatchEnable(false), lightingEnable(false),
 	normalizeNormals(false), alphaTestEnable(false),
-	alphaFunction(RENDER_COMPARE_ALWAYS), alphaReference(0), textureFactor(0)
+	alphaFunction(RENDER_COMPARE_ALWAYS), alphaReference(0), textureFactor(0),
+	clipPlaneEnableMask(0),
+	ambientMaterialSource(RENDER_MATERIAL_SOURCE_MATERIAL),
+	diffuseMaterialSource(RENDER_MATERIAL_SOURCE_COLOR1),
+	emissiveMaterialSource(RENDER_MATERIAL_SOURCE_MATERIAL),
+	specularMaterialSource(RENDER_MATERIAL_SOURCE_COLOR2)
 {
 	textureStages[0].colorOperation = RENDER_TEXTURE_OP_MODULATE;
 	textureStages[0].alphaOperation = RENDER_TEXTURE_OP_MODULATE;
@@ -112,6 +125,19 @@ LegacyMaterialState::LegacyMaterialState() :
 	ambient(1.0f, 1.0f, 1.0f, 1.0f), specular(), emissive(),
 	specularPower(0.0f)
 {
+}
+
+LegacyVertexMaterialState::LegacyVertexMaterialState() :
+	material(), lightingEnable(false),
+	ambientMaterialSource(RENDER_MATERIAL_SOURCE_MATERIAL),
+	diffuseMaterialSource(RENDER_MATERIAL_SOURCE_MATERIAL),
+	emissiveMaterialSource(RENDER_MATERIAL_SOURCE_MATERIAL),
+	textureStageResetMask(0)
+{
+	for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
+	{
+		textureCoordinateIndex[stage] = stage;
+	}
 }
 
 LegacyLightState::LegacyLightState() :
@@ -132,6 +158,13 @@ LegacyFixedFunctionConstants::LegacyFixedFunctionConstants() :
 	world(), view(), projection(), material(), fog(),
 	globalAmbient(0.0f, 0.0f, 0.0f, 1.0f)
 {
+	// Keep an uninitialized-but-enabled D3D8 clip plane on the accepted side
+	// of the plane. This prevents a neutral state from clipping the whole
+	// frame before the caller supplies its equation.
+	for (unsigned int index = 0; index < LEGACY_CLIP_PLANE_COUNT; ++index)
+	{
+		clipPlanes[index] = RenderFloat4(0.0f, 0.0f, 0.0f, 1.0f);
+	}
 }
 
 LegacyLogicalState::LegacyLogicalState() :
@@ -173,7 +206,9 @@ LegacyShaderKey BuildLegacyShaderKey(const LegacyPipelineState &state,
 		(static_cast<unsigned int>(state.lightingEnable) << 12) |
 		(static_cast<unsigned int>(state.normalizeNormals) << 13) |
 		(static_cast<unsigned int>(state.alphaTestEnable) << 14) |
-		(static_cast<unsigned int>(state.alphaFunction) << 15);
+		(static_cast<unsigned int>(state.alphaFunction) << 15) |
+		(static_cast<unsigned int>(state.pixelProgram) << 24);
+	key.words[19] = static_cast<unsigned int>(state.vertexProgram);
 
 	for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
 	{
@@ -203,7 +238,13 @@ LegacyShaderKey BuildLegacyShaderKey(const LegacyPipelineState &state,
 			(static_cast<unsigned int>(textureStage.alphaArgument1AlphaReplicate) << 10) |
 			(static_cast<unsigned int>(textureStage.alphaArgument2Complement) << 11) |
 			(static_cast<unsigned int>(textureStage.alphaArgument2AlphaReplicate) << 12) |
-			(static_cast<unsigned int>(textureStage.resultArgument) << 13);
+			(static_cast<unsigned int>(textureStage.resultArgument) << 13) |
+			(static_cast<unsigned int>(textureStage.textureTransformEnable) << 14) |
+			(static_cast<unsigned int>(textureStage.cameraSpacePosition) << 15) |
+			(static_cast<unsigned int>(textureStage.cameraSpaceNormal) << 16) |
+			(static_cast<unsigned int>(
+				textureStage.cameraSpaceReflectionVector) << 17) |
+			((textureStage.textureTransformCount & 7U) << 18);
 	}
 	key.words[2] |= static_cast<unsigned int>(state.secondaryGradientEnable) << 22;
 	key.words[2] |= static_cast<unsigned int>(state.nPatchEnable) << 23;
@@ -273,7 +314,7 @@ bool DecodeLegacyShaderBits(unsigned int shaderBits,
 
 	static const RenderBlendFactor sourceBlendFactors[4] = {
 		RENDER_BLEND_ZERO, RENDER_BLEND_ONE, RENDER_BLEND_SOURCE_ALPHA,
-		RENDER_BLEND_DESTINATION_COLOR
+		RENDER_BLEND_INVERSE_SOURCE_ALPHA
 	};
 	static const RenderBlendFactor destinationBlendFactors[6] = {
 		RENDER_BLEND_ZERO, RENDER_BLEND_ONE, RENDER_BLEND_SOURCE_COLOR,
@@ -410,8 +451,38 @@ bool DecodeLegacyShaderBits(unsigned int shaderBits,
 	return true;
 }
 
+void ResetTrackedLegacyState()
+{
+	g_trackedLogicalState = LegacyLogicalState();
+	g_trackedPipelineStateValid = false;
+	g_legacyStatePublicationFailed = false;
+}
+
+void SeedTrackedLegacyPipelineState()
+{
+	g_trackedLogicalState.pipeline = LegacyPipelineState();
+	g_trackedPipelineStateValid = true;
+}
+
+void ResetLegacyStatePublicationFailure()
+{
+	g_legacyStatePublicationFailed = false;
+}
+
+void MarkLegacyStatePublicationFailure()
+{
+	g_legacyStatePublicationFailed = true;
+}
+
+bool HasLegacyStatePublicationFailure()
+{
+	return g_legacyStatePublicationFailed;
+}
+
 void TrackLegacyShaderBits(unsigned int shaderBits)
 {
+	const bool frontCounterClockwise =
+		g_trackedLogicalState.pipeline.rasterizer.frontCounterClockwise;
 	LegacyPipelineState decoded;
 	g_trackedPipelineStateValid = DecodeLegacyShaderBits(shaderBits, &decoded);
 	if (!g_trackedPipelineStateValid)
@@ -423,7 +494,49 @@ void TrackLegacyShaderBits(unsigned int shaderBits)
 		decoded.textureStages[index] =
 			g_trackedLogicalState.pipeline.textureStages[index];
 	}
+	// Shader bits only enable or disable culling. The actual legacy winding is
+	// process state and may be unchanged when the legacy cache suppresses the
+	// corresponding SetRenderState call.
+	decoded.rasterizer.frontCounterClockwise = frontCounterClockwise;
+	decoded.pixelProgram = g_trackedLogicalState.pipeline.pixelProgram;
+	decoded.vertexProgram = g_trackedLogicalState.pipeline.vertexProgram;
 	g_trackedLogicalState.pipeline = decoded;
+}
+
+void TrackLegacyPixelProgram(RenderLegacyPixelProgram program)
+{
+	if (program < RENDER_LEGACY_PIXEL_FIXED_FUNCTION ||
+		program > RENDER_LEGACY_PIXEL_PROFILER_SWIZZLE)
+	{
+		program = RENDER_LEGACY_PIXEL_FIXED_FUNCTION;
+	}
+	g_trackedLogicalState.pipeline.pixelProgram = program;
+	g_trackedPipelineStateValid = true;
+}
+
+void TrackLegacyVertexProgram(RenderLegacyVertexProgram program)
+{
+	if (program < RENDER_LEGACY_VERTEX_FIXED_FUNCTION ||
+		program > RENDER_LEGACY_VERTEX_WATER_SEA)
+	{
+		program = RENDER_LEGACY_VERTEX_FIXED_FUNCTION;
+	}
+	g_trackedLogicalState.pipeline.vertexProgram = program;
+	g_trackedPipelineStateValid = true;
+}
+
+void TrackLegacyCullState(bool enabled, bool frontCounterClockwise)
+{
+	g_trackedLogicalState.pipeline.rasterizer.cullMode = enabled ?
+		RENDER_CULL_BACK : RENDER_CULL_NONE;
+	g_trackedLogicalState.pipeline.rasterizer.frontCounterClockwise =
+		frontCounterClockwise;
+}
+
+void TrackLegacyPipelineState(const LegacyPipelineState &state)
+{
+	g_trackedLogicalState.pipeline = state;
+	g_trackedPipelineStateValid = true;
 }
 
 bool GetTrackedLegacyPipelineState(LegacyPipelineState *state)
@@ -468,6 +581,50 @@ bool TrackLegacyTransform(LegacyTransformSlot slot, const float *values)
 	return true;
 }
 
+bool TrackLegacyVertexShaderConstants(unsigned int startRegister,
+	const float *values, unsigned int registerCount)
+{
+	if (values == 0 || registerCount == 0 ||
+		startRegister >= LEGACY_VERTEX_CONSTANT_COUNT ||
+		registerCount > LEGACY_VERTEX_CONSTANT_COUNT - startRegister)
+	{
+		return false;
+	}
+	for (unsigned int index = 0; index < registerCount; ++index)
+	{
+		RenderFloat4 &target =
+			g_trackedLogicalState.constants.vertexShaderConstants[
+				startRegister + index];
+		target.x = values[index * 4 + 0];
+		target.y = values[index * 4 + 1];
+		target.z = values[index * 4 + 2];
+		target.w = values[index * 4 + 3];
+	}
+	return true;
+}
+
+bool TrackLegacyPixelShaderConstants(unsigned int startRegister,
+	const float *values, unsigned int registerCount)
+{
+	if (values == 0 || registerCount == 0 ||
+		startRegister >= LEGACY_PIXEL_CONSTANT_COUNT ||
+		registerCount > LEGACY_PIXEL_CONSTANT_COUNT - startRegister)
+	{
+		return false;
+	}
+	for (unsigned int index = 0; index < registerCount; ++index)
+	{
+		RenderFloat4 &target =
+			g_trackedLogicalState.constants.pixelShaderConstants[
+				startRegister + index];
+		target.x = values[index * 4 + 0];
+		target.y = values[index * 4 + 1];
+		target.z = values[index * 4 + 2];
+		target.w = values[index * 4 + 3];
+	}
+	return true;
+}
+
 void TrackLegacyMaterial(const LegacyMaterialState &material)
 {
 	g_trackedLogicalState.constants.material = material;
@@ -486,7 +643,10 @@ bool TrackLegacyLight(unsigned int index, const LegacyLightState &light)
 bool TrackLegacyTextureStage(unsigned int index,
 	const LegacyTextureStageState &textureStage)
 {
-	if (index >= LEGACY_TEXTURE_STAGE_COUNT)
+	if (index >= LEGACY_TEXTURE_STAGE_COUNT ||
+		!IsLegacyProjectedTextureTransformValid(
+			textureStage.textureTransformCount,
+			textureStage.projectedCoordinates))
 	{
 		return false;
 	}
@@ -528,6 +688,29 @@ void TrackLegacyFog(const LegacyFogConstants &fog)
 	g_trackedLogicalState.constants.fog = fog;
 }
 
+bool TrackLegacyClipPlane(unsigned int index, const float *plane)
+{
+	if (plane == 0 || index >= LEGACY_CLIP_PLANE_COUNT)
+	{
+		return false;
+	}
+	RenderFloat4 &target = g_trackedLogicalState.constants.clipPlanes[index];
+	target.x = plane[0];
+	target.y = plane[1];
+	target.z = plane[2];
+	target.w = plane[3];
+	return true;
+}
+
+RenderFloat4 DecodeLegacyD3D8Ambient(unsigned int color)
+{
+	return RenderFloat4(
+		static_cast<float>((color >> 16) & 0xffU) / 255.0f,
+		static_cast<float>((color >> 8) & 0xffU) / 255.0f,
+		static_cast<float>(color & 0xffU) / 255.0f,
+		1.0f);
+}
+
 void TrackLegacyGlobalAmbient(const RenderFloat4 &ambient)
 {
 	g_trackedLogicalState.constants.globalAmbient = ambient;
@@ -541,6 +724,126 @@ bool GetTrackedLegacyLogicalState(LegacyLogicalState *state)
 	}
 	*state = g_trackedLogicalState;
 	return true;
+}
+
+bool IsLegacyTextureTransformCountValid(unsigned int count)
+{
+	return count <= 4U;
+}
+
+bool IsLegacyProjectedTextureTransformValid(unsigned int count,
+	bool projected)
+{
+	if (!IsLegacyTextureTransformCountValid(count))
+	{
+		return false;
+	}
+	// D3D8 projection is defined for COUNT2/COUNT3/COUNT4.  COUNT1 has no
+	// homogeneous divisor and D3DTTFF_PROJECTED must not be accepted with it.
+	return !projected || count >= 2U;
+}
+
+float LegacyProjectedTextureDenominator(unsigned int count,
+	const RenderFloat4 &coordinate)
+{
+	switch (count)
+	{
+	case 2: return coordinate.y;
+	case 3: return coordinate.z;
+	case 4: return coordinate.w;
+	default: return 1.0f;
+	}
+}
+
+bool BuildLegacyInverseTransposeNormalMatrix(const RenderMatrix4 &transform,
+	float *normalMatrix)
+{
+	if (normalMatrix == 0)
+	{
+		return false;
+	}
+	for (unsigned int index = 0; index < 12; ++index)
+	{
+		normalMatrix[index] = 0.0f;
+	}
+
+	const float a00 = transform.values[0];
+	const float a01 = transform.values[1];
+	const float a02 = transform.values[2];
+	const float a10 = transform.values[4];
+	const float a11 = transform.values[5];
+	const float a12 = transform.values[6];
+	const float a20 = transform.values[8];
+	const float a21 = transform.values[9];
+	const float a22 = transform.values[10];
+	const float c00 = a11 * a22 - a12 * a21;
+	const float c01 = a02 * a21 - a01 * a22;
+	const float c02 = a01 * a12 - a02 * a11;
+	const float c10 = a12 * a20 - a10 * a22;
+	const float c11 = a00 * a22 - a02 * a20;
+	const float c12 = a02 * a10 - a00 * a12;
+	const float c20 = a10 * a21 - a11 * a20;
+	const float c21 = a01 * a20 - a00 * a21;
+	const float c22 = a00 * a11 - a01 * a10;
+	const float determinant = a00 * c00 + a01 * c10 + a02 * c20;
+	if (fabs(determinant) <= 0.000001f)
+	{
+		return false;
+	}
+
+	const float reciprocalDeterminant = 1.0f / determinant;
+	// The cofactors above are the entries of the ordinary inverse when laid
+	// out by row.  The shader consumes row-vector mul(), so transpose that
+	// inverse here to upload the inverse-transpose normal matrix.
+	normalMatrix[0] = c00 * reciprocalDeterminant;
+	normalMatrix[1] = c10 * reciprocalDeterminant;
+	normalMatrix[2] = c20 * reciprocalDeterminant;
+	normalMatrix[4] = c01 * reciprocalDeterminant;
+	normalMatrix[5] = c11 * reciprocalDeterminant;
+	normalMatrix[6] = c21 * reciprocalDeterminant;
+	normalMatrix[8] = c02 * reciprocalDeterminant;
+	normalMatrix[9] = c12 * reciprocalDeterminant;
+	normalMatrix[10] = c22 * reciprocalDeterminant;
+	return true;
+}
+
+RenderFloat4 TransformLegacyCameraNormal(const RenderMatrix4 &worldView,
+	const RenderFloat4 &objectNormal, bool hasNormal, bool preTransformed,
+	bool normalizeNormal)
+{
+	if (!hasNormal || preTransformed)
+	{
+		return RenderFloat4(0.0f, 0.0f, 1.0f, 0.0f);
+	}
+
+	float normalMatrix[12];
+	if (!BuildLegacyInverseTransposeNormalMatrix(worldView, normalMatrix))
+	{
+		return RenderFloat4(0.0f, 0.0f, 1.0f, 0.0f);
+	}
+
+	float x = objectNormal.x * normalMatrix[0] +
+		objectNormal.y * normalMatrix[4] +
+		objectNormal.z * normalMatrix[8];
+	float y = objectNormal.x * normalMatrix[1] +
+		objectNormal.y * normalMatrix[5] +
+		objectNormal.z * normalMatrix[9];
+	float z = objectNormal.x * normalMatrix[2] +
+		objectNormal.y * normalMatrix[6] +
+		objectNormal.z * normalMatrix[10];
+	if (normalizeNormal)
+	{
+		const float length = static_cast<float>(sqrt(
+			x * x + y * y + z * z));
+		if (length <= 0.000001f)
+		{
+			return RenderFloat4(0.0f, 0.0f, 1.0f, 0.0f);
+		}
+		x /= length;
+		y /= length;
+		z /= length;
+	}
+	return RenderFloat4(x, y, z, 0.0f);
 }
 }
 }

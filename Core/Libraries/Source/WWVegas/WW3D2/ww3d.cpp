@@ -1157,7 +1157,13 @@ WW3DErrorType WW3D::Begin_Render(bool clear,bool clearz,const Vector3 & color, f
 	SNAPSHOT_SAY(("========== WW3D::Begin_Render ============"));
 	SNAPSHOT_SAY(("==========================================\n"));
 
-	if (DX8Wrapper::_Get_D3D_Device8() && (hr=DX8Wrapper::_Get_D3D_Device8()->TestCooperativeLevel()) != D3D_OK)
+	// The compatibility D3D8 device is a differential oracle while the D3D11
+	// bridge owns visible presentation. Its cooperative state must not suppress
+	// a D3D11 frame (which otherwise leaves audio running against a black or
+	// stale window).
+	if (!DX8Wrapper::Is_D3D11_Backend_Active() &&
+		DX8Wrapper::_Get_D3D_Device8() &&
+		(hr=DX8Wrapper::_Get_D3D_Device8()->TestCooperativeLevel()) != D3D_OK)
 	{
         // If the device was lost, do not render until we get it back
         if( D3DERR_DEVICELOST == hr )

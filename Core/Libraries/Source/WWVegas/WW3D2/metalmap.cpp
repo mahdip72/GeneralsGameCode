@@ -48,6 +48,7 @@
 
 #include "metalmap.h"
 #include "texture.h"
+#include "dx8wrapper.h"
 #include "ww3dformat.h"
 #include "ww3d.h"
 #include <WWMath/vp.h>
@@ -340,6 +341,8 @@ void MetalMapManagerClass::Update_Textures()
 		}
 		metal_map_surface->Unlock();
 		REF_PTR_RELEASE(metal_map_surface);
+		Notify_Render_Texture_Changed(
+			Textures[i]->Peek_D3D_Base_Texture());
 	}
 }
 

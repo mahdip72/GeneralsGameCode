@@ -37,6 +37,8 @@
 #include "WW3D2/camera.h"
 #include "WW3D2/light.h"
 #include "WW3D2/dx8wrapper.h"
+#include "WW3D2/dx8vertexbuffer.h"
+#include "WW3D2/dx8indexbuffer.h"
 #include "WW3D2/hlod.h"
 #include "WW3D2/mesh.h"
 #include "WW3D2/meshmdl.h"
@@ -45,7 +47,6 @@
 #include "WW3D2/dx8renderer.h"
 #include "Lib/BaseType.h"
 #include "W3DDevice/GameClient/HeightMap.h"
-#include "d3dx8math.h"
 #include "Common/GlobalData.h"
 #include "W3DDevice/GameClient/W3DProjectedShadow.h"
 #include "WW3D2/statistics.h"
@@ -78,6 +79,8 @@ W3DProjectedShadowManager *TheW3DProjectedShadowManager=nullptr;	//global single
 ProjectedShadowManager	*TheProjectedShadowManager;				//global singleton with simpler interface.
 extern const FrustumClass *shadowCameraFrustum;	//defined in W3DShadow.
 ///@todo: Externs from volumetric shadow renderer - these need to be moved into W3DBufferManager
+// These are bridge-facing aliases. The owning DX8 wrapper objects live in
+// W3DVolumetricShadow.cpp so a reset can release each resource exactly once.
 extern LPDIRECT3DVERTEXBUFFER8 shadowVertexBufferD3D;		///<D3D vertex buffer
 extern LPDIRECT3DINDEXBUFFER8	shadowIndexBufferD3D;	///<D3D index buffer
 extern int nShadowVertsInBuf;	//model vetices in vertex buffer
@@ -97,8 +100,10 @@ struct SHADOW_DECAL_VERTEX	//vertex structure passed to D3D
 
 #define SHADOW_DECAL_FVF	D3DFVF_XYZ|D3DFVF_TEX1|D3DFVF_DIFFUSE
 
-LPDIRECT3DVERTEXBUFFER8 shadowDecalVertexBufferD3D=nullptr;		///<D3D vertex buffer
-LPDIRECT3DINDEXBUFFER8	shadowDecalIndexBufferD3D=nullptr;	///<D3D index buffer
+LPDIRECT3DVERTEXBUFFER8 shadowDecalVertexBufferD3D=nullptr;		///<bridge-facing D3D vertex-buffer handle
+LPDIRECT3DINDEXBUFFER8	shadowDecalIndexBufferD3D=nullptr;	///<bridge-facing D3D index-buffer handle
+DX8VertexBufferClass *shadowDecalVertexBufferOwner=nullptr;
+DX8IndexBufferClass *shadowDecalIndexBufferOwner=nullptr;
 int nShadowDecalVertsInBuf=0;	//model vetices in vertex buffer
 int nShadowDecalStartBatchVertex=0;
 int nShadowDecalIndicesInBuf=0;	//model vetices in vertex buffer
@@ -270,33 +275,39 @@ Bool W3DProjectedShadowManager::ReAcquireResources()
 			m_dynamicRenderTarget=DX8Wrapper::Create_Render_Target (DEFAULT_RENDER_TARGET_WIDTH, DEFAULT_RENDER_TARGET_HEIGHT);
 	}
 
-	LPDIRECT3DDEVICE8 m_pDev=DX8Wrapper::_Get_D3D_Device8();
-
-	DEBUG_ASSERTCRASH(m_pDev, ("Trying to ReAcquireResources on W3DProjectedShadowManager without device"));
-	DEBUG_ASSERTCRASH(shadowDecalIndexBufferD3D == nullptr && shadowDecalIndexBufferD3D == nullptr, ("ReAcquireResources not released in W3DProjectedShadowManager"));
-
-	if (FAILED(m_pDev->CreateIndexBuffer
-	(
-		SHADOW_DECAL_INDEX_SIZE*sizeof(WORD),
-		D3DUSAGE_WRITEONLY|D3DUSAGE_DYNAMIC,
-		D3DFMT_INDEX16,
-		D3DPOOL_DEFAULT,
-		&shadowDecalIndexBufferD3D
-	)))
+	if (!DX8Wrapper::Is_Initted())
 		return FALSE;
 
-	if (shadowDecalVertexBufferD3D == nullptr)
-	{	// Create vertex buffer
+	DEBUG_ASSERTCRASH(shadowDecalIndexBufferD3D == nullptr && shadowDecalIndexBufferOwner == nullptr &&
+		shadowDecalVertexBufferD3D == nullptr && shadowDecalVertexBufferOwner == nullptr,
+		("ReAcquireResources not released in W3DProjectedShadowManager"));
 
-		if (FAILED(m_pDev->CreateVertexBuffer
-		(
-			SHADOW_DECAL_VERTEX_SIZE*sizeof(SHADOW_DECAL_VERTEX),
-			D3DUSAGE_WRITEONLY|D3DUSAGE_DYNAMIC,
-			0,
-			D3DPOOL_DEFAULT,
-			&shadowDecalVertexBufferD3D
-		)))
-			return FALSE;
+	// Keep the legacy-facing handles only as aliases to wrapper-owned
+	// resources. The decal index count is one below the historical 65536
+	// allocation because DX8IndexBufferClass stores its count as an unsigned
+	// short; the largest generated decal (103*103*6 indices) remains below it.
+	shadowDecalIndexBufferOwner=NEW_REF(DX8IndexBufferClass,
+		(static_cast<unsigned short>(SHADOW_DECAL_INDEX_SIZE-1),
+		DX8IndexBufferClass::USAGE_DYNAMIC));
+	if (shadowDecalIndexBufferOwner == nullptr ||
+		(shadowDecalIndexBufferD3D=shadowDecalIndexBufferOwner->Get_DX8_Index_Buffer()) == nullptr)
+	{
+		REF_PTR_RELEASE(shadowDecalIndexBufferOwner);
+		shadowDecalIndexBufferD3D=nullptr;
+		return FALSE;
+	}
+
+	shadowDecalVertexBufferOwner=NEW_REF(DX8VertexBufferClass,
+		(SHADOW_DECAL_FVF, static_cast<unsigned short>(SHADOW_DECAL_VERTEX_SIZE),
+		DX8VertexBufferClass::USAGE_DYNAMIC));
+	if (shadowDecalVertexBufferOwner == nullptr ||
+		(shadowDecalVertexBufferD3D=shadowDecalVertexBufferOwner->Get_DX8_Vertex_Buffer()) == nullptr)
+	{
+		REF_PTR_RELEASE(shadowDecalVertexBufferOwner);
+		REF_PTR_RELEASE(shadowDecalIndexBufferOwner);
+		shadowDecalVertexBufferD3D=nullptr;
+		shadowDecalIndexBufferD3D=nullptr;
+		return FALSE;
 	}
 
 	return TRUE;
@@ -306,10 +317,8 @@ void W3DProjectedShadowManager::ReleaseResources()
 {
 	invalidateCachedLightPositions();	//textures need to be updated
 	REF_PTR_RELEASE(m_dynamicRenderTarget);	//need to create a new render target
-	if (shadowDecalIndexBufferD3D)
-		shadowDecalIndexBufferD3D->Release();
-	if (shadowDecalVertexBufferD3D)
-		shadowDecalVertexBufferD3D->Release();
+	REF_PTR_RELEASE(shadowDecalIndexBufferOwner);
+	REF_PTR_RELEASE(shadowDecalVertexBufferOwner);
 	shadowDecalIndexBufferD3D=nullptr;
 	shadowDecalVertexBufferD3D=nullptr;
 }
@@ -368,9 +377,8 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 		Real mapScaleInv=1.0f/MAP_XY_FACTOR;
 		SHADOW_VOLUME_VERTEX* pvVertices;
 		UnsignedShort *pvIndices;
-		LPDIRECT3DDEVICE8 m_pDev=DX8Wrapper::_Get_D3D_Device8();
-
-		if (!m_pDev)	return 0;
+		if (!DX8Wrapper::Is_Initted())
+			return 0;
 
 		//Get terrain cell index for area with shadow
 		Int startX=REAL_TO_INT_FLOOR(((cx - dx)*mapScaleInv));
@@ -422,6 +430,7 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 		}
 
 		shadowVertexBufferD3D->Unlock();
+		Notify_Render_Buffer_Changed(shadowVertexBufferD3D);
 
 		Int numIndex=(endX - startX) * (endY-startY)*6;	//6 indices per terrain cell (2 triangles).
 
@@ -482,42 +491,46 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 		}
 
 		shadowIndexBufferD3D->Unlock();
+		Notify_Render_Buffer_Changed(shadowIndexBufferD3D);
 
-		m_pDev->SetIndices(shadowIndexBufferD3D,nShadowStartBatchVertex);
+		DX8Wrapper::Set_DX8_Index_Buffer(shadowIndexBufferD3D,
+			nShadowStartBatchVertex);
 
-		m_pDev->SetTransform(D3DTS_WORLD,(_D3DMATRIX *)&mWorld);
+		DX8Wrapper::_Set_DX8_Transform(D3DTS_WORLD, *(_D3DMATRIX *)&mWorld);
 
-		m_pDev->SetStreamSource(0,shadowVertexBufferD3D,sizeof(SHADOW_VOLUME_VERTEX));
-		m_pDev->SetVertexShader(SHADOW_VOLUME_FVF);
+		DX8Wrapper::Set_DX8_Vertex_Buffer(shadowVertexBufferD3D,
+			sizeof(SHADOW_VOLUME_VERTEX), SHADOW_VOLUME_FVF);
+		DX8Wrapper::Set_Vertex_Shader(SHADOW_VOLUME_FVF);
 
 		Int numPolys = (endX - startX)*(endY - startY)*2;	//2 triangles per cell
 
-		m_pDev->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);	//should reject background pixels
-		m_pDev->SetRenderState( D3DRS_STENCILENABLE, TRUE );
-		m_pDev->SetRenderState( D3DRS_STENCILFUNC,     D3DCMP_ALWAYS );
-		m_pDev->SetRenderState( D3DRS_STENCILREF,      0x1 );
-		m_pDev->SetRenderState( D3DRS_STENCILMASK,     0xffffffff );
-		m_pDev->SetRenderState( D3DRS_STENCILWRITEMASK,0xffffffff );
-		m_pDev->SetRenderState( D3DRS_STENCILZFAIL, D3DSTENCILOP_KEEP );
-		m_pDev->SetRenderState( D3DRS_STENCILFAIL,  D3DSTENCILOP_KEEP );
-		m_pDev->SetRenderState( D3DRS_STENCILPASS,  D3DSTENCILOP_INCR );
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHATESTENABLE, TRUE);	//should reject background pixels
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILENABLE, TRUE );
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILFUNC,     D3DCMP_ALWAYS );
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILREF,      0x1 );
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILMASK,     0xffffffff );
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILWRITEMASK,0xffffffff );
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILZFAIL, D3DSTENCILOP_KEEP );
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILFAIL,  D3DSTENCILOP_KEEP );
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILPASS,  D3DSTENCILOP_INCR );
 
 //    m_pDev->SetRenderState( D3DRS_ALPHABLENDENABLE, FALSE );	//useful to see bounds
-		m_pDev->SetRenderState( D3DRS_LIGHTING, FALSE);
-		m_pDev->SetRenderState( D3DRS_SRCBLEND,  D3DBLEND_DESTCOLOR);
-		m_pDev->SetRenderState( D3DRS_DESTBLEND, D3DBLEND_ZERO );
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_LIGHTING, FALSE);
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_SRCBLEND,  D3DBLEND_DESTCOLOR);
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_DESTBLEND, D3DBLEND_ZERO );
 
 
 		if (DX8Wrapper::_Is_Triangle_Draw_Enabled())
 		{
 			Debug_Statistics::Record_DX8_Polys_And_Vertices(numPolys,numVerts,ShaderClass::_PresetOpaqueShader);
-			m_pDev->DrawIndexedPrimitive(D3DPT_TRIANGLELIST,0,numVerts,nShadowStartBatchIndex,numPolys);
+			DX8Wrapper::Draw_DX8_Indexed_Primitive(D3DPT_TRIANGLELIST, 0,
+				numVerts, nShadowStartBatchIndex, numPolys);
 		}
 
-		m_pDev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);	//should reject background pixels
-		m_pDev->SetRenderState( D3DRS_STENCILENABLE, FALSE );
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHATESTENABLE, FALSE);	//should reject background pixels
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILENABLE, FALSE );
 //    m_pDev->SetRenderState( D3DRS_ALPHABLENDENABLE, TRUE );
-		m_pDev->SetRenderState( D3DRS_LIGHTING, TRUE);
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_LIGHTING, TRUE);
 
 		nShadowVertsInBuf += numVerts;
 		nShadowStartBatchVertex=nShadowVertsInBuf;
@@ -682,8 +695,8 @@ void W3DProjectedShadowManager::flushDecals(W3DShadowTexture *texture, ShadowTyp
 		return;
 	}
 
-	LPDIRECT3DDEVICE8 m_pDev=DX8Wrapper::_Get_D3D_Device8();
-	if (!m_pDev)	return;	//no D3D Device to render
+	if (!DX8Wrapper::Is_Initted())
+		return;	//no render device to render
 
 	VertexMaterialClass *vmat=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
 	DX8Wrapper::Set_Material(vmat);
@@ -714,22 +727,24 @@ void W3DProjectedShadowManager::flushDecals(W3DShadowTexture *texture, ShadowTyp
 //	m_pDev->SetRenderState( D3DRS_SRCBLEND,  D3DBLEND_SRCALPHA );
 //	m_pDev->SetRenderState( D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA  );
 /*	UnsignedInt color=TheW3DShadowManager->getShadowColor();
-	m_pDev->SetRenderState( D3DRS_TEXTUREFACTOR, 0xff000000 | color);
-	m_pDev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
-	m_pDev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-	m_pDev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_TFACTOR);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_TEXTUREFACTOR, 0xff000000 | color);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_COLORARG2, D3DTA_TFACTOR);
 
-	m_pDev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
-	m_pDev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
-	m_pDev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_TFACTOR);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_ALPHAARG2, D3DTA_TFACTOR);
 */
 
 
-	m_pDev->SetIndices(shadowDecalIndexBufferD3D,nShadowDecalStartBatchVertex);
-	m_pDev->SetTransform(D3DTS_WORLD,(_D3DMATRIX *)&mWorld);
+	DX8Wrapper::Set_DX8_Index_Buffer(shadowDecalIndexBufferD3D,
+		nShadowDecalStartBatchVertex);
+	DX8Wrapper::_Set_DX8_Transform(D3DTS_WORLD, *(_D3DMATRIX *)&mWorld);
 
-	m_pDev->SetStreamSource(0,shadowDecalVertexBufferD3D,sizeof(SHADOW_DECAL_VERTEX));
-	m_pDev->SetVertexShader(SHADOW_DECAL_FVF);
+	DX8Wrapper::Set_DX8_Vertex_Buffer(shadowDecalVertexBufferD3D,
+		sizeof(SHADOW_DECAL_VERTEX), SHADOW_DECAL_FVF);
+	DX8Wrapper::Set_Vertex_Shader(SHADOW_DECAL_FVF);
 
 //Hard Shadows using stencil
 /*	m_pDev->SetRenderState( D3DRS_SRCBLEND,  D3DBLEND_ZERO);
@@ -750,7 +765,9 @@ void W3DProjectedShadowManager::flushDecals(W3DShadowTexture *texture, ShadowTyp
 	if (DX8Wrapper::_Is_Triangle_Draw_Enabled())
 	{
 		Debug_Statistics::Record_DX8_Polys_And_Vertices(nShadowDecalPolysInBatch,nShadowDecalVertsInBatch,ShaderClass::_PresetOpaqueShader);
-		m_pDev->DrawIndexedPrimitive(D3DPT_TRIANGLELIST,0,nShadowDecalVertsInBatch,nShadowDecalStartBatchIndex,nShadowDecalPolysInBatch);
+		DX8Wrapper::Draw_DX8_Indexed_Primitive(D3DPT_TRIANGLELIST, 0,
+			nShadowDecalVertsInBatch, nShadowDecalStartBatchIndex,
+			nShadowDecalPolysInBatch);
 	}
 
 //	m_pDev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);	//should reject background pixels
@@ -816,9 +833,8 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 
 	if (TheTerrainRenderObject)
 	{
-		LPDIRECT3DDEVICE8 m_pDev=DX8Wrapper::_Get_D3D_Device8();
-
-		if (!m_pDev)	return;	//no D3D Device to render
+		if (!DX8Wrapper::Is_Initted())
+			return;	//no render device to render
 
 		WorldHeightMap *hmap=TheTerrainRenderObject->getMap();
 		borderSize=hmap->getBorderSizeInline();
@@ -1070,6 +1086,7 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 		}
 
 		shadowDecalVertexBufferD3D->Unlock();
+		Notify_Render_Buffer_Changed(shadowDecalVertexBufferD3D);
 
 		if (nShadowDecalIndicesInBuf > (SHADOW_DECAL_INDEX_SIZE-numIndex))	//check if room for model verts
 		{	//flush the buffer by drawing the contents and re-locking again
@@ -1118,6 +1135,7 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 		}
 
 		shadowDecalIndexBufferD3D->Unlock();
+		Notify_Render_Buffer_Changed(shadowDecalIndexBufferD3D);
 
 		Int numPolys = (endX - startX)*(endY - startY)*2;	//2 triangles per cell
 		nShadowDecalPolysInBatch += numPolys;
@@ -1147,9 +1165,8 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 
 	if (TheTerrainRenderObject)
 	{
-		LPDIRECT3DDEVICE8 m_pDev=DX8Wrapper::_Get_D3D_Device8();
-
-		if (!m_pDev)	return;	//no D3D Device to render
+		if (!DX8Wrapper::Is_Initted())
+			return;	//no render device to render
 
 		objPos=shadow->m_robj->Get_Position();
 		objXform=shadow->m_robj->Get_Transform();
@@ -1231,6 +1248,7 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 		}
 
 		shadowDecalVertexBufferD3D->Unlock();
+		Notify_Render_Buffer_Changed(shadowDecalVertexBufferD3D);
 
 		if (nShadowDecalIndicesInBuf > (SHADOW_DECAL_INDEX_SIZE-numIndex))	//check if room for model verts
 		{	//flush the buffer by drawing the contents and re-locking again
@@ -1260,6 +1278,7 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 		}
 
 		shadowDecalIndexBufferD3D->Unlock();
+		Notify_Render_Buffer_Changed(shadowDecalIndexBufferD3D);
 
 		Int numPolys = 2;	//2 triangles per decal
 		nShadowDecalPolysInBatch += numPolys;
@@ -2146,6 +2165,11 @@ void W3DProjectedShadow::updateTexture(Vector3 &lightPos)
 
 		//Copy shadow from temporary video-memory surface into a permanent texture
 		oldSurface->Copy(0,0,0,0,DEFAULT_RENDER_TARGET_WIDTH,DEFAULT_RENDER_TARGET_HEIGHT,newSurface);
+		// The permanent shadow texture is retained across frames.  The legacy
+		// surface copy updates its legacy storage in place, so invalidate the
+		// corresponding D3D11 upload before the next mirrored draw.
+		Notify_Render_Texture_Changed(
+			m_shadowTexture[0]->getTexture()->Peek_D3D_Base_Texture());
 		REF_PTR_RELEASE(newSurface);
 		REF_PTR_RELEASE(oldSurface);
 		m_shadowTexture[0]->updateBounds(TheW3DShadowManager->getLightPosWorld(0),m_robj);	//update local shadow bounds

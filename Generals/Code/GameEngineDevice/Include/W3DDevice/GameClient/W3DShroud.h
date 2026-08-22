@@ -107,8 +107,9 @@ protected:
 	Real m_cellHeight;						///<spacing between adjacent cells
 	Byte *m_shroudData;						///<holds amount of shroud per cell.
 	IDirect3DSurface8 *m_pSrcTexture;		///<stores sysmem copy of visible shroud.
-	void *m_srcTextureData;					///<pointer to shroud data
+	void *m_srcTextureData;					///<CPU-owned shroud data backing store
 	UnsignedInt m_srcTexturePitch;			///<width (in bytes) of shroud data buffer.
+	Bool m_srcTextureDirty;							///<CPU backing store needs to be uploaded to m_pSrcTexture
 	TextureClass *m_pDstTexture;			///<stores vidmem copy of visible shroud.
 	Int m_dstTextureWidth;					///<dimensions of m_pDstTexture
 	Int m_dstTextureHeight;					///<dimensions of m_pDstTexture
@@ -120,6 +121,7 @@ protected:
 	W3DShroudLevel m_boderShroudLevel;			///<color used to clear the shroud border
 	W3DShroudLevel *m_finalFogData;			///<copy of logical shroud in an easier to access array.
 	W3DShroudLevel *m_currentFogData;		///<copy of intermediate logical shroud while it's interpolated.
+	Bool syncSourceTexture();							///<upload the CPU backing store while the source surface is locked
 	void interpolateFogLevels(RECT *rect);		///<fade current fog levels to actual logic side levels.
 	void fillBorderShroudData(W3DShroudLevel level, SurfaceClass* pDestSurface);	///<fill the destination texture with a known value
 };

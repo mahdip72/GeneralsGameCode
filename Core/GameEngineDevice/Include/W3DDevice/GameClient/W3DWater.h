@@ -46,6 +46,7 @@
 #define CV_ONE 1
 #define CV_WORLDVIEWPROJ_0 2
 #define CV_TEXPROJ_0 6
+#define CV_SEA_WAVE_WORLDVIEW_0 7
 #define CV_PATCH_SCALE_OFFSET 10
 
 class PolygonTrigger;

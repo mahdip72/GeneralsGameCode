@@ -61,6 +61,8 @@ public:
 	void Copy(unsigned short* indices,unsigned start_index,unsigned index_count);
 
 	unsigned short Get_Index_Count() const { return index_count; }
+	unsigned int Get_Generation() const { return generation; }
+	void Mark_Changed();
 
 	unsigned Type() const { return type; }
 
@@ -98,6 +100,7 @@ protected:
 	mutable int					engine_refs;
 	unsigned short				index_count;		// number of indices
 	unsigned						type;
+	unsigned int					generation;
 };
 
 

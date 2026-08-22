@@ -7,6 +7,9 @@ namespace render
 {
 const unsigned int LEGACY_TEXTURE_STAGE_COUNT = 8;
 const unsigned int LEGACY_LIGHT_COUNT = 4;
+const unsigned int LEGACY_CLIP_PLANE_COUNT = 6;
+const unsigned int LEGACY_VERTEX_CONSTANT_COUNT = 34;
+const unsigned int LEGACY_PIXEL_CONSTANT_COUNT = 8;
 
 struct RenderFloat4
 {
@@ -85,6 +88,46 @@ enum RenderFillMode
 {
 	RENDER_FILL_WIREFRAME,
 	RENDER_FILL_SOLID
+};
+
+// D3DMCS_MATERIAL/COLOR1/COLOR2 are deliberately represented by the same
+// ordinal values.  The neutral renderer does not include the D3D8 headers,
+// but the DX8 bridge can therefore publish the values without lossy remapping.
+enum RenderMaterialSource
+{
+	RENDER_MATERIAL_SOURCE_MATERIAL,
+	RENDER_MATERIAL_SOURCE_COLOR1,
+	RENDER_MATERIAL_SOURCE_COLOR2
+};
+
+enum RenderLegacyPixelProgram
+{
+	RENDER_LEGACY_PIXEL_FIXED_FUNCTION,
+	RENDER_LEGACY_PIXEL_WATER_FLAT,
+	RENDER_LEGACY_PIXEL_WATER_RIVER,
+	RENDER_LEGACY_PIXEL_TERRAIN_BASE,
+	RENDER_LEGACY_PIXEL_TERRAIN_NOISE,
+	RENDER_LEGACY_PIXEL_TERRAIN_NOISE2,
+	RENDER_LEGACY_PIXEL_ROAD_NOISE2,
+	RENDER_LEGACY_PIXEL_FLAT_TERRAIN_BASE0,
+	RENDER_LEGACY_PIXEL_FLAT_TERRAIN_BASE,
+	RENDER_LEGACY_PIXEL_FLAT_TERRAIN_NOISE,
+	RENDER_LEGACY_PIXEL_FLAT_TERRAIN_NOISE2,
+	RENDER_LEGACY_PIXEL_MONOCHROME,
+	// The legacy GeForce3 sea path uses a dedicated wave vertex/pixel pair. Keep
+	// this appended so the existing program values embedded in shader code do
+	// not change while the migration is in progress.
+	RENDER_LEGACY_PIXEL_WATER_SEA,
+	// The profiler's D3D8 ps_1_4 shader swaps the sampled B/R channels. Keep
+	// this appended as well so all existing program values remain stable.
+	RENDER_LEGACY_PIXEL_PROFILER_SWIZZLE
+};
+
+enum RenderLegacyVertexProgram
+{
+	RENDER_LEGACY_VERTEX_FIXED_FUNCTION,
+	RENDER_LEGACY_VERTEX_TREES,
+	RENDER_LEGACY_VERTEX_WATER_SEA
 };
 
 enum RenderFogMode
@@ -245,7 +288,15 @@ struct LegacyTextureStageState
 	bool alphaArgument2AlphaReplicate;
 	RenderTextureArgument resultArgument;
 	unsigned int textureCoordinateIndex;
+	bool cameraSpacePosition;
+	bool cameraSpaceNormal;
+	bool cameraSpaceReflectionVector;
+	bool textureTransformEnable;
 	bool projectedCoordinates;
+	// D3DTTFF_COUNT1..COUNT4 are values, not independent flags.  Keep the
+	// selected component count in the neutral state so the D3D11 sampler can
+	// reproduce D3D8's projected-coordinate denominator (Y, Z, or W).
+	unsigned int textureTransformCount;
 	float bumpEnvironmentMatrix00;
 	float bumpEnvironmentMatrix01;
 	float bumpEnvironmentMatrix10;
@@ -260,6 +311,8 @@ struct LegacyPipelineState
 	LegacyPipelineState();
 
 	unsigned int shaderBits;
+	RenderLegacyPixelProgram pixelProgram;
+	RenderLegacyVertexProgram vertexProgram;
 	LegacyBlendState blend;
 	LegacyDepthStencilState depthStencil;
 	LegacyRasterizerState rasterizer;
@@ -273,6 +326,11 @@ struct LegacyPipelineState
 	RenderCompareFunction alphaFunction;
 	unsigned int alphaReference;
 	unsigned int textureFactor;
+	unsigned int clipPlaneEnableMask;
+	RenderMaterialSource ambientMaterialSource;
+	RenderMaterialSource diffuseMaterialSource;
+	RenderMaterialSource emissiveMaterialSource;
+	RenderMaterialSource specularMaterialSource;
 };
 
 struct LegacyMaterialState
@@ -284,6 +342,25 @@ struct LegacyMaterialState
 	RenderFloat4 specular;
 	RenderFloat4 emissive;
 	float specularPower;
+};
+
+// The vertex-material portion of the old fixed-function API is kept as a
+// renderer-neutral value object.  The compatibility wrapper owns conversion
+// to the legacy backend ABI, so game/runtime code does not need to mention
+// backend descriptor types or state constants.
+struct LegacyVertexMaterialState
+{
+	LegacyVertexMaterialState();
+
+	LegacyMaterialState material;
+	bool lightingEnable;
+	RenderMaterialSource ambientMaterialSource;
+	RenderMaterialSource diffuseMaterialSource;
+	RenderMaterialSource emissiveMaterialSource;
+	unsigned int textureCoordinateIndex[LEGACY_TEXTURE_STAGE_COUNT];
+	// Bit i requests the default coordinate/transform state for stage i.
+	// Mapper implementations overwrite their own stage after this baseline.
+	unsigned int textureStageResetMask;
 };
 
 struct LegacyLightState
@@ -329,6 +406,9 @@ struct LegacyFixedFunctionConstants
 	LegacyLightState lights[LEGACY_LIGHT_COUNT];
 	LegacyFogConstants fog;
 	RenderFloat4 globalAmbient;
+	RenderFloat4 clipPlanes[LEGACY_CLIP_PLANE_COUNT];
+	RenderFloat4 vertexShaderConstants[LEGACY_VERTEX_CONSTANT_COUNT];
+	RenderFloat4 pixelShaderConstants[LEGACY_PIXEL_CONSTANT_COUNT];
 };
 
 struct LegacyLogicalState
@@ -358,7 +438,7 @@ enum LegacyTransformSlot
 
 struct LegacyShaderKey
 {
-	enum { WORD_COUNT = 19 };
+	enum { WORD_COUNT = 20 };
 
 	LegacyShaderKey();
 
@@ -372,9 +452,28 @@ LegacyShaderKey BuildLegacyShaderKey(const LegacyPipelineState &state,
 	unsigned int vertexFormat, unsigned int texturePresenceMask);
 bool DecodeLegacyShaderBits(unsigned int shaderBits,
 	LegacyPipelineState *state);
+void ResetTrackedLegacyState();
+// Re-enable the neutral pipeline after a deliberate state reset.  Callers
+// use this before publishing ordinary render states that precede the first
+// shader in a frame.
+void SeedTrackedLegacyPipelineState();
+// A failed legacy-to-neutral state conversion poisons the current frame.  The
+// D3D11 bridge must reject the next draw instead of reusing the prior state;
+// the owner clears this latch at the start of the next frame.
+void ResetLegacyStatePublicationFailure();
+void MarkLegacyStatePublicationFailure();
+bool HasLegacyStatePublicationFailure();
 void TrackLegacyShaderBits(unsigned int shaderBits);
+void TrackLegacyPixelProgram(RenderLegacyPixelProgram program);
+void TrackLegacyVertexProgram(RenderLegacyVertexProgram program);
+void TrackLegacyCullState(bool enabled, bool frontCounterClockwise);
+void TrackLegacyPipelineState(const LegacyPipelineState &state);
 bool GetTrackedLegacyPipelineState(LegacyPipelineState *state);
 bool TrackLegacyTransform(LegacyTransformSlot slot, const float *values);
+bool TrackLegacyVertexShaderConstants(unsigned int startRegister,
+	const float *values, unsigned int registerCount);
+bool TrackLegacyPixelShaderConstants(unsigned int startRegister,
+	const float *values, unsigned int registerCount);
 void TrackLegacyMaterial(const LegacyMaterialState &material);
 bool TrackLegacyLight(unsigned int index, const LegacyLightState &light);
 bool TrackLegacyTextureStage(unsigned int index,
@@ -383,8 +482,28 @@ bool GetTrackedLegacyTextureStage(unsigned int index,
 	LegacyTextureStageState *textureStage);
 bool TrackLegacyTexturePresence(unsigned int index, bool present);
 void TrackLegacyFog(const LegacyFogConstants &fog);
+bool TrackLegacyClipPlane(unsigned int index, const float *plane);
+RenderFloat4 DecodeLegacyD3D8Ambient(unsigned int color);
 void TrackLegacyGlobalAmbient(const RenderFloat4 &ambient);
 bool GetTrackedLegacyLogicalState(LegacyLogicalState *state);
+
+// Shared contract helpers for the fixed-function texture-transform and
+// camera-space-normal paths.  These remain C++98-compatible and are also used
+// by the offscreen renderer contract tests.
+bool IsLegacyTextureTransformCountValid(unsigned int count);
+bool IsLegacyProjectedTextureTransformValid(unsigned int count,
+	bool projected);
+float LegacyProjectedTextureDenominator(unsigned int count,
+	const RenderFloat4 &coordinate);
+// Writes a row-major 3x3 inverse-transpose matrix into three float4 rows.
+// Singular transforms are zero-filled and return false so shader consumers
+// can retain the safe default-normal fallback without doing per-vertex matrix
+// inversion.
+bool BuildLegacyInverseTransposeNormalMatrix(const RenderMatrix4 &transform,
+	float *normalMatrix);
+RenderFloat4 TransformLegacyCameraNormal(const RenderMatrix4 &worldView,
+	const RenderFloat4 &objectNormal, bool hasNormal, bool preTransformed,
+	bool normalizeNormal);
 }
 }
 

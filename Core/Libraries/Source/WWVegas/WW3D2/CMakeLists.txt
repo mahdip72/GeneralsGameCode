@@ -66,6 +66,8 @@ set(WW3D2_SRC
     dx8webbrowser.h
     dx8wrapper.cpp
     dx8wrapper.h
+    legacytexturecompat.cpp
+    legacytexturecompat.h
     dynamesh.cpp
     dynamesh.h
     font3d.cpp
@@ -202,6 +204,8 @@ set(WW3D2_SRC
     stripoptimizer.h
     surfaceclass.cpp
     surfaceclass.h
+    surfaceblit.cpp
+    surfaceblit.h
     texproject.cpp
     texproject.h
     #textdraw.cpp # unused
@@ -214,6 +218,8 @@ set(WW3D2_SRC
     textureloader.h
     texturemipbuffer.cpp
     texturemipbuffer.h
+    texturemipgenerator.cpp
+    texturemipgenerator.h
     texturethumbnail.cpp
     texturethumbnail.h
     #vertmaterial.cpp
@@ -248,6 +254,8 @@ target_include_directories(corei_ww3d2 INTERFACE
 if (MSVC AND NOT IS_VS6_BUILD)
     target_link_libraries(corei_ww3d2 INTERFACE
         comsuppw
+        ole32
+        windowscodecs
     )
 endif()
 

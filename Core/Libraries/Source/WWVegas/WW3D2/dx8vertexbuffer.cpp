@@ -45,7 +45,6 @@
 #include "dx8caps.h"
 #include "WWLib/thread.h"
 #include "WWDebug/wwmemlog.h"
-#include <d3dx8core.h>
 
 #define DEFAULT_VB_SIZE 5000
 
@@ -78,7 +77,8 @@ VertexBufferClass::VertexBufferClass(unsigned type_, unsigned FVF, unsigned shor
 	:
 	VertexCount(vertex_count_),
 	type(type_),
-	engine_refs(0)
+	engine_refs(0),
+	generation(1)
 {
 	WWMEMLOG(MEM_RENDERER);
 	WWASSERT(VertexCount);
@@ -147,6 +147,15 @@ void VertexBufferClass::Release_Engine_Ref() const
 	WWASSERT(engine_refs>=0);
 }
 
+void VertexBufferClass::Mark_Changed()
+{
+	++generation;
+	if (generation == 0)
+	{
+		++generation;
+	}
+}
+
 // ----------------------------------------------------------------------------
 //
 //
@@ -208,6 +217,7 @@ VertexBufferClass::WriteLockClass::~WriteLockClass()
 		WWASSERT(0);
 		break;
 	}
+	VertexBuffer->Mark_Changed();
 	VertexBuffer->Release_Ref();
 }
 
@@ -274,6 +284,7 @@ VertexBufferClass::AppendLockClass::~AppendLockClass()
 		WWASSERT(0);
 		break;
 	}
+	VertexBuffer->Mark_Changed();
 	VertexBuffer->Release_Ref();
 }
 
@@ -887,6 +898,7 @@ DynamicVBAccessClass::WriteLockClass::~WriteLockClass()
 		WWASSERT(0);
 		break;
 	}
+	DynamicVBAccess->VertexBuffer->Mark_Changed();
 }
 
 // ----------------------------------------------------------------------------

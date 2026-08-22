@@ -2396,7 +2396,7 @@ CW3DViewDoc::Make_Movie ()
 			}
 
 			// D3D11 captures are fulfilled at End_Render, so queue the request
-			// before repainting the target frame. The legacy D3D8 path still
+			// before repainting the target frame. The legacy path still
 			// reads the completed back buffer synchronously and must run after
 			// repainting.
 			const bool d3d11_capture = DX8Wrapper::Is_D3D11_Backend_Active();

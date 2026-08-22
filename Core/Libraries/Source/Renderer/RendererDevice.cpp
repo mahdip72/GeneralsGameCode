@@ -1128,13 +1128,25 @@ TextureDescriptor::TextureDescriptor() :
 {
 }
 
+RenderTargetSubresource::RenderTargetSubresource() :
+	resource(), mip(0), arraySlice(0)
+{
+}
+
+RenderTargetBinding::RenderTargetBinding() :
+	useBackBufferColor(true), useBackBufferDepth(true),
+	hasColor(false), hasDepth(false), color(), depth()
+{
+}
+
 LegacyVertexElement::LegacyVertexElement() :
 	semantic(RENDER_VERTEX_SEMANTIC_POSITION), semanticIndex(0),
 	format(RENDER_VERTEX_DATA_FLOAT3), byteOffset(0)
 {
 }
 
-LegacyVertexLayout::LegacyVertexLayout() : stride(0), elementCount(0)
+LegacyVertexLayout::LegacyVertexLayout() : stride(0), elementCount(0),
+	preTransformed(false)
 {
 }
 }

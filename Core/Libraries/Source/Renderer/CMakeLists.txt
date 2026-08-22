@@ -9,6 +9,10 @@ if(WIN32 AND NOT IS_VS6_BUILD)
     set(renderer_shader_source "${CMAKE_CURRENT_SOURCE_DIR}/Shaders/LegacyFixedFunction.hlsl")
     set(renderer_vertex_shader_header "${renderer_generated_dir}/LegacyFixedFunctionVS.h")
     set(renderer_pixel_shader_header "${renderer_generated_dir}/LegacyFixedFunctionPS.h")
+    set(renderer_water_flat_pixel_shader_header "${renderer_generated_dir}/LegacyWaterFlatPS.h")
+    set(renderer_water_river_pixel_shader_header "${renderer_generated_dir}/LegacyWaterRiverPS.h")
+    set(renderer_sea_wave_vertex_shader_header "${renderer_generated_dir}/LegacySeaWaveVS.h")
+    set(renderer_sea_wave_pixel_shader_header "${renderer_generated_dir}/LegacySeaWavePS.h")
     set(renderer_textured_vertex_shader_header "${renderer_generated_dir}/LegacyTexturedVS.h")
     set(renderer_textured_pixel_shader_header "${renderer_generated_dir}/LegacyTexturedPS.h")
 
@@ -27,6 +31,42 @@ if(WIN32 AND NOT IS_VS6_BUILD)
         COMMAND "${RTS_FXC_EXECUTABLE}" /nologo /T ps_5_0 /E PSMain
             /Fh "${renderer_pixel_shader_header}"
             /Vn g_LegacyFixedFunctionPS "${renderer_shader_source}"
+        DEPENDS "${renderer_shader_source}"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${renderer_water_flat_pixel_shader_header}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${renderer_generated_dir}"
+        COMMAND "${RTS_FXC_EXECUTABLE}" /nologo /T ps_5_0 /E PSWaterFlat
+            /Fh "${renderer_water_flat_pixel_shader_header}"
+            /Vn g_LegacyWaterFlatPS "${renderer_shader_source}"
+        DEPENDS "${renderer_shader_source}"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${renderer_water_river_pixel_shader_header}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${renderer_generated_dir}"
+        COMMAND "${RTS_FXC_EXECUTABLE}" /nologo /T ps_5_0 /E PSWaterRiver
+            /Fh "${renderer_water_river_pixel_shader_header}"
+            /Vn g_LegacyWaterRiverPS "${renderer_shader_source}"
+        DEPENDS "${renderer_shader_source}"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${renderer_sea_wave_vertex_shader_header}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${renderer_generated_dir}"
+        COMMAND "${RTS_FXC_EXECUTABLE}" /nologo /T vs_5_0 /E VSSeaWave
+            /Fh "${renderer_sea_wave_vertex_shader_header}"
+            /Vn g_LegacySeaWaveVS "${renderer_shader_source}"
+        DEPENDS "${renderer_shader_source}"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${renderer_sea_wave_pixel_shader_header}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${renderer_generated_dir}"
+        COMMAND "${RTS_FXC_EXECUTABLE}" /nologo /T ps_5_0 /E PSSeaWave
+            /Fh "${renderer_sea_wave_pixel_shader_header}"
+            /Vn g_LegacySeaWavePS "${renderer_shader_source}"
         DEPENDS "${renderer_shader_source}"
         VERBATIM
     )
@@ -53,6 +93,10 @@ if(WIN32 AND NOT IS_VS6_BUILD)
         D3D11RenderDevice.cpp
         "${renderer_vertex_shader_header}"
         "${renderer_pixel_shader_header}"
+        "${renderer_water_flat_pixel_shader_header}"
+        "${renderer_water_river_pixel_shader_header}"
+        "${renderer_sea_wave_vertex_shader_header}"
+        "${renderer_sea_wave_pixel_shader_header}"
         "${renderer_textured_vertex_shader_header}"
         "${renderer_textured_pixel_shader_header}"
     )

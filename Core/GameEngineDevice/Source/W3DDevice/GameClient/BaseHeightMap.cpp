@@ -54,7 +54,6 @@
 #include <WW3D2/coltest.h>
 #include <WW3D2/rinfo.h>
 #include <WW3D2/camera.h>
-#include <d3dx8core.h>
 
 #include "Common/GlobalData.h"
 #include "Common/PerfTimer.h"
@@ -1746,6 +1745,8 @@ void BaseHeightMapRenderObjClass::initDestAlphaLUT()
 				pData++;
 			}
 			surf->Unlock();
+			Notify_Render_Texture_Changed(
+				m_destAlphaTexture->Peek_D3D_Base_Texture());
 		}
 
 		m_destAlphaTexture->Get_Filter().Set_U_Addr_Mode(TextureFilterClass::TEXTURE_ADDRESS_CLAMP);

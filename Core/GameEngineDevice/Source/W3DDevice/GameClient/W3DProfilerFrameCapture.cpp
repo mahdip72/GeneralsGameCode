@@ -25,11 +25,11 @@
 #include "WW3D2/texture.h"
 #include "WW3D2/ww3d.h"
 #include "WW3D2/ww3dformat.h"
+#include "W3DDevice/Common/LegacyPixelShaderBytecode.h"
 #include "WWDebug/wwdebug.h"
 #include "WWMath/wwmath.h"
 #include <cstring>
 #include <limits>
-#include <d3dx8core.h>
 
 namespace
 {
@@ -54,7 +54,7 @@ W3DProfilerFrameCapture::~W3DProfilerFrameCapture()
 	WWASSERT(!m_d3d11CapturePending);
 	if (m_swizzleShader)
 	{
-		DX8Wrapper::_Get_D3D_Device8()->DeletePixelShader(m_swizzleShader);
+		DX8Wrapper::Delete_Pixel_Shader(m_swizzleShader);
 		m_swizzleShader = 0;
 	}
 }
@@ -243,30 +243,27 @@ void W3DProfilerFrameCapture::Capture(UnsignedInt displayWidth, UnsignedInt disp
 		return;
 	}
 
-	// compile swizzle shader convert BGRA to RGBA
+	// Initialize the legacy swizzle shader that converts BGRA to RGBA.
 	// TheSuperHackers @todo In DX9 with ps2.0 this shader will be much simpler
 	if (!m_swizzleShader)
 	{
-		ID3DXBuffer *compiledShader = nullptr;
-		const char *shader =
-			"ps.1.4\n"
-			"texld r0, t0\n"
-			"mov r1.a, r0.r\n"
-			"mov r2.a, r0.g\n"
-			"mov r3.a, r0.b\n"
-			"mul r0.rgb, r3.a, c0\n"
-			"mad r0.rgb, r2.a, c1, r0\n"
-			"mad r0.rgb, r1.a, c2, r0\n";
-
-		HRESULT hr = D3DXAssembleShader(shader, strlen(shader), 0, nullptr, &compiledShader, nullptr);
-		if (FAILED(hr))
+		if (!DX8Wrapper::Is_Initted())
 			return;
 
-		hr = DX8Wrapper::_Get_D3D_Device8()->CreatePixelShader((DWORD *)compiledShader->GetBufferPointer(), &m_swizzleShader);
-		compiledShader->Release();
+		const LegacyPixelShaderBytecode::Stream &shader =
+			LegacyPixelShaderBytecode::Get(LegacyPixelShaderBytecode::PROFILER_SWIZZLE);
+		if (!LegacyPixelShaderBytecode::IsValid(shader))
+			return;
+
+		HRESULT hr = DX8Wrapper::Create_Pixel_Shader(
+			reinterpret_cast<const DWORD *>(shader.words), &m_swizzleShader);
 
 		if (FAILED(hr))
 			return;
+	}
+	if (displayWidth == 0 || displayHeight == 0)
+	{
+		return;
 	}
 
 	// allocate render target
@@ -277,6 +274,10 @@ void W3DProfilerFrameCapture::Capture(UnsignedInt displayWidth, UnsignedInt disp
 	// allocate surface class
 	const Real aspectRatio = (Real)displayHeight / (Real)displayWidth;
 	unsigned int profilerImageHeight = min((int)WWMath::Round(PROFILER_FRAME_IMAGE_SIZE * aspectRatio), PROFILER_FRAME_IMAGE_SIZE);
+	if (profilerImageHeight == 0)
+	{
+		profilerImageHeight = 1;
+	}
 	SurfaceClass *surfaceClass = NEW_REF(SurfaceClass, (PROFILER_FRAME_IMAGE_SIZE, profilerImageHeight, WW3D_FORMAT_A8R8G8B8));
 	if (!surfaceClass)
 	{
@@ -363,14 +364,26 @@ void W3DProfilerFrameCapture::Capture(UnsignedInt displayWidth, UnsignedInt disp
 	viewport.MaxZ = 1.0f;
 	DX8Wrapper::Set_Viewport(&viewport);
 
+	// The D3D8 path below binds a private ps_1_4 shader. Publish the equivalent
+	// neutral program for D3D11 and force the ordinary fixed-function vertex
+	// path for the pre-transformed quad; otherwise the previous scene pass can
+	// leave a terrain/water program selected for this draw.
+	rts::render::LegacyLogicalState previousLogicalState;
+	const bool restoreLegacyPrograms =
+		rts::render::GetTrackedLegacyLogicalState(&previousLogicalState);
+	DX8Wrapper::Set_Legacy_Vertex_Program(
+		rts::render::RENDER_LEGACY_VERTEX_FIXED_FUNCTION);
+	DX8Wrapper::Set_Legacy_Pixel_Program(
+		rts::render::RENDER_LEGACY_PIXEL_PROFILER_SWIZZLE);
+
 	// bind swizzle shader
 	DX8Wrapper::Set_Pixel_Shader(m_swizzleShader);
 	static const Real kMaskR[4] = {1.0f, 0.0f, 0.0f, 0.0f};
 	static const Real kMaskG[4] = {0.0f, 1.0f, 0.0f, 0.0f};
 	static const Real kMaskB[4] = {0.0f, 0.0f, 1.0f, 0.0f};
-	device->SetPixelShaderConstant(0, kMaskR, 1);
-	device->SetPixelShaderConstant(1, kMaskG, 1);
-	device->SetPixelShaderConstant(2, kMaskB, 1);
+	DX8Wrapper::Set_Pixel_Shader_Constant(0, kMaskR, 1);
+	DX8Wrapper::Set_Pixel_Shader_Constant(1, kMaskG, 1);
+	DX8Wrapper::Set_Pixel_Shader_Constant(2, kMaskB, 1);
 
 	// draw texture scaled-down onto a small surface
 	struct QuadVertex
@@ -388,7 +401,21 @@ void W3DProfilerFrameCapture::Capture(UnsignedInt displayWidth, UnsignedInt disp
 	vtx[3] = {left,  top,    0.0f, 1.0f, 0.0f, 0.0f};
 	DX8Wrapper::Set_DX8_Texture(0, intermediateTexture);
 	DX8Wrapper::Set_Vertex_Shader(D3DFVF_XYZRHW | D3DFVF_TEX1);
-	device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, vtx, sizeof(QuadVertex));
+	DX8Wrapper::Draw_Primitive_UP(D3DPT_TRIANGLESTRIP, 2, vtx, sizeof(QuadVertex));
+	if (restoreLegacyPrograms)
+	{
+		DX8Wrapper::Set_Legacy_Vertex_Program(
+			previousLogicalState.pipeline.vertexProgram);
+		DX8Wrapper::Set_Legacy_Pixel_Program(
+			previousLogicalState.pipeline.pixelProgram);
+	}
+	else
+	{
+		DX8Wrapper::Set_Legacy_Vertex_Program(
+			rts::render::RENDER_LEGACY_VERTEX_FIXED_FUNCTION);
+		DX8Wrapper::Set_Legacy_Pixel_Program(
+			rts::render::RENDER_LEGACY_PIXEL_FIXED_FUNCTION);
+	}
 	DX8Wrapper::Set_Pixel_Shader(0);
 	DX8Wrapper::Set_DX8_Texture(0, nullptr);
 	DX8Wrapper::Set_Viewport(&restoreViewport);

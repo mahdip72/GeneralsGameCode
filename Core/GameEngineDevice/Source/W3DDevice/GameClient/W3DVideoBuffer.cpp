@@ -46,6 +46,7 @@
 //----------------------------------------------------------------------------
 
 #include "Common/GameMemory.h"
+#include "WW3D2/dx8wrapper.h"
 #include "WW3D2/texture.h"
 #include "WW3D2/textureloader.h"
 #include "W3DDevice/GameClient/W3DVideoBuffer.h"
@@ -168,6 +169,11 @@ void*		W3DVideoBuffer::lock()
 {
 	void *mem = nullptr;
 
+	if ( m_texture == nullptr )
+	{
+		return nullptr;
+	}
+
 	if ( m_surface != nullptr )
 	{
 		unlock();
@@ -194,6 +200,13 @@ void		W3DVideoBuffer::unlock()
 		m_surface->Unlock();
 		m_surface->Release_Ref();
 		m_surface = nullptr;
+		// Decoded frames update the same managed legacy texture in place. Discard
+		// the D3D11 conversion so the next video draw uploads the new frame.
+		if ( m_texture != nullptr )
+		{
+			Notify_Render_Texture_Changed(
+				m_texture->Peek_D3D_Base_Texture());
+		}
 	}
 }
 

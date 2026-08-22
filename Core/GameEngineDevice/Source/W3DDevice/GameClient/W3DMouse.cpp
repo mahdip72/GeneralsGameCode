@@ -88,7 +88,10 @@ W3DMouse::W3DMouse()
 	for (Int i=0; i<NUM_MOUSE_CURSORS; i++)
 	{
 		for (Int j=0; j<MAX_2D_CURSOR_ANIM_FRAMES; j++)
+		{
 			cursorTextures[i][j]=nullptr;
+			m_currentD3DSurface[j]=nullptr;
+		}
 		cursorModels[i]=nullptr;
 		cursorAnims[i]=nullptr;
 	}
@@ -108,18 +111,21 @@ W3DMouse::W3DMouse()
 
 W3DMouse::~W3DMouse()
 {
-	LPDIRECT3DDEVICE8 m_pDev=DX8Wrapper::_Get_D3D_Device8();
+	// Stop the refresh thread before releasing the surfaces and textures it can
+	// observe.  This matters for D3D11 as the configured hardware-cursor mode is
+	// normalized during initialization and can otherwise race teardown.
+	thread.Stop();
 
-	if (m_pDev)
+	// Keep the existing final Win32 cursor reset, but only touch the legacy
+	// hardware cursor while that mode is actually in use.
+	if (m_currentRedrawMode == RM_DX8 && !DX8Wrapper::Is_D3D11_Backend_Active())
 	{
-		m_pDev->ShowCursor(FALSE);	//kill DX8 cursor
-		Win32Mouse::setCursor(ARROW); //enable default windows cursor
+		DX8Wrapper::Set_Cursor_Visible(false);
 	}
+	Win32Mouse::setCursor(ARROW); //enable default windows cursor
 
 	freeD3DAssets();
 	freeW3DAssets();
-
-	thread.Stop();
 
 }
 
@@ -193,16 +199,28 @@ Bool W3DMouse::loadD3DCursorTextures(MouseCursor cursor)
 	{	//single animation frame without trailing numbers
 		snprintf(FrameName, ARRAY_SIZE(FrameName), "%s.tga", baseName);
 		cursorTextures[cursor][0]=	am->Get_Texture(FrameName);
-		m_currentD3DSurface[0]=cursorTextures[cursor][0]->Get_Surface_Level();
-		m_currentFrames = 1;
+		if (cursorTextures[cursor][0] != nullptr)
+		{
+			m_currentD3DSurface[0]=cursorTextures[cursor][0]->Get_Surface_Level();
+			if (m_currentD3DSurface[0] != nullptr)
+				m_currentFrames = 1;
+		}
 	}
 	else
 	for (Int i=0; i<animFrames; i++)
 	{
 		snprintf(FrameName, ARRAY_SIZE(FrameName), "%s%04d.tga", baseName, i);
 		if ((cursorTextures[cursor][i]=am->Get_Texture(FrameName)) != nullptr)
-		{	m_currentD3DSurface[m_currentFrames]=cursorTextures[cursor][i]->Get_Surface_Level();
-			m_currentFrames++;
+		{
+			m_currentD3DSurface[m_currentFrames]=cursorTextures[cursor][i]->Get_Surface_Level();
+			if (m_currentD3DSurface[m_currentFrames] != nullptr)
+			{
+				m_currentFrames++;
+			}
+			else
+			{
+				REF_PTR_RELEASE(cursorTextures[cursor][i]);
+			}
 		}
 	}
 	return TRUE;
@@ -333,6 +351,16 @@ void W3DMouse::init()
 
 	//check if system already initialized and texture assets loaded.
 	Win32Mouse::init();
+	// The legacy INI can request RM_DX8, but D3D11 presents from a different
+	// device and cannot display a cursor owned by the hidden legacy device.
+	const RedrawMode configuredRedrawMode = m_currentRedrawMode;
+	m_currentRedrawMode = resolveHardwareCursorMode(
+		m_currentRedrawMode, !DX8Wrapper::Is_D3D11_Backend_Active());
+	if (configuredRedrawMode != m_currentRedrawMode)
+	{
+		freeD3DAssets();
+		initPolygonAssets();
+	}
 	setCursor(ARROW);	//set default starting cursor image
 
 	WWASSERT(!thread.Is_Running());
@@ -363,6 +391,14 @@ void W3DMouse::setCursor( MouseCursor cursor )
 {
 
 	CriticalSectionClass::LockClass m(mutex);
+	if (m_currentRedrawMode == RM_DX8 &&
+		DX8Wrapper::Is_D3D11_Backend_Active())
+	{
+		// A mode change can be requested before the device transition has
+		// completed.  Do not let that transient state call into the hidden DX8
+		// cursor device; the polygon path is the visible fallback.
+		m_currentRedrawMode = RM_POLYGON;
+	}
 
 	m_directionFrame=0;
 	if (m_currentRedrawMode == RM_WINDOWS)
@@ -481,7 +517,9 @@ void W3DMouse::draw()
 	//make sure the correct cursor image is selected
 	setCursor(m_currentCursor);
 
-	if (m_currentRedrawMode == RM_DX8 && m_currentD3DCursor != NONE)
+	if (m_currentRedrawMode == RM_DX8 &&
+		!DX8Wrapper::Is_D3D11_Backend_Active() &&
+		m_currentD3DCursor != NONE)
 	{
 		//called from update thread or rendering loop.  Tells D3D where
 		//to draw the mouse cursor.
@@ -593,6 +631,9 @@ void W3DMouse::draw()
 
 void W3DMouse::setRedrawMode(RedrawMode mode)
 {
+	mode = resolveHardwareCursorMode(mode, !DX8Wrapper::Is_D3D11_Backend_Active());
+	m_currentRedrawMode = resolveHardwareCursorMode(
+		m_currentRedrawMode, !DX8Wrapper::Is_D3D11_Backend_Active());
 	MouseCursor cursor = getMouseCursor();
 
 	//Turn off the previous cursor mode

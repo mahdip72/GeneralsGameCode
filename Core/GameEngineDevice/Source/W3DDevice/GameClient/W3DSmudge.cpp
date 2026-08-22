@@ -80,11 +80,33 @@ void W3DSmudgeManager::ReAcquireResources()
 {
 	ReleaseResources();
 
-	SurfaceClass *surface=DX8Wrapper::_Get_DX8_Back_Buffer();
 	SurfaceClass::SurfaceDescription surface_desc;
-
-	surface->Get_Description(surface_desc);
-	REF_PTR_RELEASE(surface);
+	if (DX8Wrapper::Is_D3D11_Backend_Active())
+	{
+		rts::render::RenderBackBufferInfo back_buffer_info;
+		if (DX8Wrapper::Get_Render_Back_Buffer_Info(&back_buffer_info) !=
+			rts::render::RENDER_RESULT_OK || back_buffer_info.width == 0 ||
+			back_buffer_info.height == 0 || back_buffer_info.format !=
+			rts::render::RENDER_FORMAT_B8G8R8A8_UNORM)
+		{
+			return;
+		}
+		surface_desc.Width = back_buffer_info.width;
+		surface_desc.Height = back_buffer_info.height;
+		// The legacy texture remains the sampling object, while its renderer
+		// mirror is created with the swap-chain's B8G8R8A8-compatible format.
+		surface_desc.Format = WW3D_FORMAT_A8R8G8B8;
+	}
+	else
+	{
+		SurfaceClass *surface=DX8Wrapper::_Get_DX8_Back_Buffer();
+		if (!surface)
+		{
+			return;
+		}
+		surface->Get_Description(surface_desc);
+		REF_PTR_RELEASE(surface);
+	}
 
 	m_backgroundTexture = MSGNEW("TextureClass") TextureClass(surface_desc.Width,surface_desc.Height,surface_desc.Format,MIP_LEVELS_1,TextureClass::POOL_DEFAULT, true);
 
@@ -132,6 +154,13 @@ void W3DSmudgeManager::ReAcquireResources()
 /*Copies a portion of the current render target into a specified buffer*/
 Int copyRect(unsigned char *buf, Int bufSize, int oX, int oY, int width, int height)
 {
+	if (DX8Wrapper::Is_D3D11_Backend_Active())
+	{
+		// This helper reads a legacy surface. D3D11 smudge capture uses the
+		// renderer-owned copy path instead, so never probe the hidden DX8 target.
+		return 0;
+	}
+
  	IDirect3DSurface8 *surface=nullptr;	///<previous render target
  	IDirect3DSurface8 *tempSurface=nullptr;
 	Int result = 0;
@@ -204,6 +233,16 @@ Bool W3DSmudgeManager::testHardwareSupport()
 {
 	if (m_hardwareSupportStatus == SMUDGE_SUPPORT_UNKNOWN)
 	{	//we have not done the test yet.
+		if (DX8Wrapper::Is_D3D11_Backend_Active())
+		{
+			// The D3D11 path validates the actual copy during render.  Its
+			// capability probe must not draw/read a hidden legacy back buffer, since
+			// that target is no longer authoritative for the visible frame.
+			m_hardwareSupportStatus = m_backgroundTexture != nullptr &&
+				m_backgroundTexture->Peek_D3D_Base_Texture() != nullptr ?
+				SMUDGE_SUPPORT_YES : SMUDGE_SUPPORT_NO;
+			return m_hardwareSupportStatus == SMUDGE_SUPPORT_YES;
+		}
 
 		IDirect3DTexture8 *backTexture=W3DShaderManager::getRenderTexture();
 		if (!backTexture || !W3DShaderManager::isRenderingToTexture())
@@ -260,13 +299,11 @@ Bool W3DSmudgeManager::testHardwareSupport()
 		v[2].color = UNIQUE_COLOR;
 		v[3].color = UNIQUE_COLOR;
 
-		LPDIRECT3DDEVICE8 pDev=DX8Wrapper::_Get_D3D_Device8();
-
 		//draw polygons like this is very inefficient but for only 2 triangles, it's
 		//not worth bothering with index/vertex buffers.
-		pDev->SetVertexShader(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+		DX8Wrapper::Set_Vertex_Shader(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
 
-		pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
+		DX8Wrapper::Draw_Primitive_UP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
 
 		DWORD refData[BLOCK_SIZE*BLOCK_SIZE];
 		memset(refData,0,sizeof(refData));
@@ -287,7 +324,7 @@ Bool W3DSmudgeManager::testHardwareSupport()
 		v[2].color = 0xffffffff;
 		v[3].color = 0xffffffff;
 
-		pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
+		DX8Wrapper::Draw_Primitive_UP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
 		bufSize=copyRect((unsigned char *)testData,sizeof(testData),0,0,BLOCK_SIZE,BLOCK_SIZE);
 
 		if (!bufSize)
@@ -314,21 +351,37 @@ void W3DSmudgeManager::render(RenderInfoClass &rinfo)
 	if (!testHardwareSupport())
 		return;
 
-	SurfaceClass *backBuffer = DX8Wrapper::_Get_DX8_Back_Buffer();
-
-	if (!backBuffer)
-		return;
-
-	SurfaceClass *background=m_backgroundTexture ? m_backgroundTexture->Get_Surface_Level() : nullptr;
-
-	if (!background)
-	{
-		REF_PTR_RELEASE(backBuffer);
-		return;
-	}
-
+	const bool d3d11_active = DX8Wrapper::Is_D3D11_Backend_Active();
+	SurfaceClass *backBuffer = nullptr;
+	SurfaceClass *background = nullptr;
 	SurfaceClass::SurfaceDescription surface_desc;
-	backBuffer->Get_Description(surface_desc);
+	if (d3d11_active)
+	{
+		rts::render::RenderBackBufferInfo back_buffer_info;
+		if (DX8Wrapper::Get_Render_Back_Buffer_Info(&back_buffer_info) !=
+			rts::render::RENDER_RESULT_OK || back_buffer_info.width == 0 ||
+			back_buffer_info.height == 0)
+		{
+			return;
+		}
+		surface_desc.Width = back_buffer_info.width;
+		surface_desc.Height = back_buffer_info.height;
+		surface_desc.Format = WW3D_FORMAT_A8R8G8B8;
+	}
+	else
+	{
+		backBuffer = DX8Wrapper::_Get_DX8_Back_Buffer();
+		if (!backBuffer)
+			return;
+		background = m_backgroundTexture ?
+			m_backgroundTexture->Get_Surface_Level() : nullptr;
+		if (!background)
+		{
+			REF_PTR_RELEASE(backBuffer);
+			return;
+		}
+		backBuffer->Get_Description(surface_desc);
+	}
 
 	CameraClass &camera=rinfo.Camera;
 	Vector3 vsVert;
@@ -433,8 +486,30 @@ void W3DSmudgeManager::render(RenderInfoClass &rinfo)
 		return;	//nothing to render.
 	}
 
-	//Copy the area of backbuffer occupied by smudges into an alternate buffer.
-	background->Copy(0,0,0,0,surface_desc.Width,surface_desc.Height,backBuffer);
+	// Copy the visible color target into an alternate buffer. D3D11 must use a
+	// GPU copy from its active target; the legacy path retains its legacy copy and
+	// invalidation behavior for the differential renderer.
+	if (d3d11_active)
+	{
+		if (m_backgroundTexture == nullptr ||
+			m_backgroundTexture->Peek_D3D_Base_Texture() == nullptr)
+		{
+			return;
+		}
+		const rts::render::RenderResult copy_result =
+			DX8Wrapper::Copy_Active_Render_Target_To_Texture(
+				m_backgroundTexture->Peek_D3D_Base_Texture());
+		if (copy_result != rts::render::RENDER_RESULT_OK)
+		{
+			return;
+		}
+	}
+	else
+	{
+		background->Copy(0,0,0,0,surface_desc.Width,surface_desc.Height,backBuffer);
+		Notify_Render_Texture_Changed(
+			m_backgroundTexture->Peek_D3D_Base_Texture());
+	}
 
 	REF_PTR_RELEASE(background);
 	REF_PTR_RELEASE(backBuffer);

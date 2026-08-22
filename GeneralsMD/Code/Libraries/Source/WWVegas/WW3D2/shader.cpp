@@ -380,7 +380,7 @@ const Blend srcBlendLUT[ShaderClass::SRCBLEND_MAX] =
 	Blend(D3DBLEND_ZERO, false),
 	Blend(D3DBLEND_ONE, false),
 	Blend(D3DBLEND_SRCALPHA, true),
- 	Blend(D3DBLEND_DESTCOLOR, true)
+	Blend(D3DBLEND_INVSRCALPHA, true)
 };
 
 const Blend dstBlendLUT[ShaderClass::DSTBLEND_MAX] =
@@ -949,16 +949,15 @@ void ShaderClass::Apply()
 				DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_ALPHAOP,D3DTOP_SELECTARG1);
 				DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_ALPHAARG1,tex_arg);
 
-				// set stage 2 to do the diffuse op
-				// bypass the wrapper since it only supports 2 texture stages
-				DX8CALL(SetTextureStageState(2,D3DTSS_COLOROP,PricOp));
-				DX8CALL(SetTextureStageState(2,D3DTSS_COLORARG1,D3DTA_CURRENT));
-				DX8CALL(SetTextureStageState(2,D3DTSS_COLORARG2,D3DTA_DIFFUSE));
-				DX8CALL(SetTextureStageState(2,D3DTSS_ALPHAOP,PriaOp));
-				DX8CALL(SetTextureStageState(2,D3DTSS_ALPHAARG1,D3DTA_CURRENT));
-				DX8CALL(SetTextureStageState(2,D3DTSS_ALPHAARG2,D3DTA_DIFFUSE));
-				DX8CALL(SetTextureStageState(2,D3DTSS_TEXCOORDINDEX,D3DTSS_TCI_PASSTHRU));
-				DX8CALL(SetTexture(2,nullptr));
+				// Stage 2 is part of the renderer-neutral state contract as well.
+				DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_COLOROP,PricOp);
+				DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_COLORARG1,D3DTA_CURRENT);
+				DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_COLORARG2,D3DTA_DIFFUSE);
+				DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_ALPHAOP,PriaOp);
+				DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_ALPHAARG1,D3DTA_CURRENT);
+				DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_ALPHAARG2,D3DTA_DIFFUSE);
+				DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_TEXCOORDINDEX,D3DTSS_TCI_PASSTHRU);
+				DX8Wrapper::Set_DX8_Texture(2,nullptr);
 				kill_stage_2=false;
 				ShaderDirty=true;
 			}
@@ -995,21 +994,19 @@ void ShaderClass::Apply()
 		diff &= ~(ShaderClass::MASK_TEXTURING);
 	}
 
-	// Make sure to disable stage 2 for voodoos since we don't have state tracking for
-	// stage 2
-	// bypass the wrapper since it only supports 2 texture stages
+	// Make sure to disable stage 2 for voodoos when the third stage is not used.
 	if (voodoo3 && kill_stage_2) {
 		if ((SeccOp!=D3DTOP_DISABLE)&&(SecaOp!=D3DTOP_DISABLE)) {
-			DX8CALL(SetTextureStageState(2,D3DTSS_COLOROP,D3DTOP_SELECTARG1));
-			DX8CALL(SetTextureStageState(2,D3DTSS_COLORARG1,D3DTA_CURRENT));
-			DX8CALL(SetTextureStageState(2,D3DTSS_ALPHAOP,D3DTOP_SELECTARG1));
-			DX8CALL(SetTextureStageState(2,D3DTSS_ALPHAARG1,D3DTA_CURRENT));
+			DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_COLOROP,D3DTOP_SELECTARG1);
+			DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_COLORARG1,D3DTA_CURRENT);
+			DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_ALPHAOP,D3DTOP_SELECTARG1);
+			DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_ALPHAARG1,D3DTA_CURRENT);
 		} else {
-			DX8CALL(SetTextureStageState(2,D3DTSS_COLOROP,D3DTOP_DISABLE));
-			DX8CALL(SetTextureStageState(2,D3DTSS_ALPHAOP,D3DTOP_DISABLE));
+			DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_COLOROP,D3DTOP_DISABLE);
+			DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_ALPHAOP,D3DTOP_DISABLE);
 		}
-		DX8CALL(SetTextureStageState(2,D3DTSS_TEXCOORDINDEX,D3DTSS_TCI_PASSTHRU));
-		DX8CALL(SetTexture(2,nullptr));
+		DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_TEXCOORDINDEX,D3DTSS_TCI_PASSTHRU);
+		DX8Wrapper::Set_DX8_Texture(2,nullptr);
 	}
 
 	if(!diff)

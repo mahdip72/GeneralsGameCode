@@ -71,7 +71,8 @@ IndexBufferClass::IndexBufferClass(unsigned type_, unsigned short index_count_)
 	:
 	index_count(index_count_),
 	type(type_),
-	engine_refs(0)
+	engine_refs(0),
+	generation(1)
 {
 	WWASSERT(type==BUFFER_TYPE_DX8 || type==BUFFER_TYPE_SORTING);
 	WWASSERT(index_count);
@@ -126,6 +127,15 @@ void IndexBufferClass::Release_Engine_Ref() const
 {
 	engine_refs--;
 	WWASSERT(engine_refs>=0);
+}
+
+void IndexBufferClass::Mark_Changed()
+{
+	++generation;
+	if (generation == 0)
+	{
+		++generation;
+	}
 }
 
 // ----------------------------------------------------------------------------
@@ -225,6 +235,7 @@ IndexBufferClass::WriteLockClass::~WriteLockClass()
 		WWASSERT(0);
 		break;
 	}
+	index_buffer->Mark_Changed();
 	index_buffer->Release_Ref();
 }
 
@@ -273,6 +284,7 @@ IndexBufferClass::AppendLockClass::~AppendLockClass()
 		WWASSERT(0);
 		break;
 	}
+	index_buffer->Mark_Changed();
 	index_buffer->Release_Ref();
 }
 
@@ -461,6 +473,7 @@ DynamicIBAccessClass::WriteLockClass::~WriteLockClass()
 		WWASSERT(0);
 		break;
 	}
+	DynamicIBAccess->IndexBuffer->Mark_Changed();
 	DynamicIBAccess->IndexBuffer->Release_Ref();
 }
 

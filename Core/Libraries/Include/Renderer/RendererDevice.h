@@ -78,7 +78,11 @@ enum RenderFormat
 	RENDER_FORMAT_B8G8R8A8_UNORM,
 	RENDER_FORMAT_D24_UNORM_S8_UINT,
 	RENDER_FORMAT_R16_UINT,
-	RENDER_FORMAT_R32_UINT
+	RENDER_FORMAT_R32_UINT,
+	// Signed two-channel normalized data used by the legacy V8U8 sea bump map.
+	// Keep this distinct from the packed color formats: the shader relies on
+	// hardware signed-normalized sampling rather than unsigned byte decoding.
+	RENDER_FORMAT_R8G8_SNORM
 };
 
 enum TextureBinding
@@ -139,6 +143,31 @@ struct TextureDescriptor
 	RenderFormat format;
 	unsigned int binding;
 	RenderUsage usage;
+};
+
+// A render-target binding is explicit about whether each attachment is the
+// swap-chain target or a logical texture resource.  The old two-handle API
+// could not represent a custom color target using the default depth buffer,
+// which is a common DX8 render-to-texture pattern.
+struct RenderTargetSubresource
+{
+	RenderTargetSubresource();
+
+	GpuHandle resource;
+	unsigned int mip;
+	unsigned int arraySlice;
+};
+
+struct RenderTargetBinding
+{
+	RenderTargetBinding();
+
+	bool useBackBufferColor;
+	bool useBackBufferDepth;
+	bool hasColor;
+	bool hasDepth;
+	RenderTargetSubresource color;
+	RenderTargetSubresource depth;
 };
 
 enum RenderResult
@@ -251,9 +280,9 @@ private:
 };
 
 // Separates owner-thread command failures from frame teardown and presentation
-// state. A command failure may still produce a visible partial frame; callers
-// must use presentationResult()/wasPresented() when deciding whether the
-// presentation path is healthy.
+// state. Backends must not present a frame after a command failure; callers use
+// presentationResult()/wasPresented() to distinguish a deliberately dropped
+// frame from a presentation or device-lifecycle failure.
 class RenderFrameOutcome
 {
 public:
@@ -357,6 +386,9 @@ struct LegacyVertexLayout
 
 	unsigned int stride;
 	unsigned int elementCount;
+	// Legacy XYZRHW/POSITIONT data is already in viewport space and must not be
+	// transformed by the world/view/projection matrices.
+	bool preTransformed;
 	LegacyVertexElement elements[MAX_ELEMENT_COUNT];
 };
 
@@ -386,6 +418,8 @@ public:
 		unsigned int stencil) = 0;
 	virtual RenderResult clearTargets(unsigned int clearFlags,
 		const RenderFloat4 &color, float depth, unsigned int stencil) = 0;
+	virtual RenderResult setRenderTargets(
+		const RenderTargetBinding &binding) = 0;
 	virtual RenderResult setRenderTargets(GpuHandle colorTarget,
 		GpuHandle depthTarget) = 0;
 	virtual RenderResult setViewport(float x, float y, float width,
@@ -422,8 +456,23 @@ public:
 	virtual RenderResult createTexture(const TextureDescriptor &descriptor,
 		const TextureSubresourceData *initialData,
 		unsigned int initialDataCount, GpuHandle *texture) = 0;
+	// Refreshes every texture subresource in place when the existing resource
+	// has compatible shape, format, binding, and update capability.  A
+	// RENDER_RESULT_UNSUPPORTED result means callers may recreate the resource;
+	// stale handles and active output hazards remain invalid arguments.
+	virtual RenderResult refreshTexture(GpuHandle texture,
+		const TextureDescriptor &descriptor,
+		const TextureSubresourceData *data,
+		unsigned int dataCount) = 0;
+	// Copies the currently bound color target into a compatible texture while a
+	// frame is open.  This is an owner-thread GPU copy: it never reads through
+	// the legacy device or exposes native backend resources to game code.
+	virtual RenderResult copyActiveColorTargetToTexture(GpuHandle texture) = 0;
 	virtual bool destroyResource(GpuHandle resource) = 0;
 	virtual RenderResult recoverDevice() = 0;
+	// A zero dimension represents a minimized window.  Keep the last valid
+	// swap-chain targets and treat this notification as a successful no-op;
+	// callers can submit the next non-zero size when the window is restored.
 	virtual RenderResult resize(unsigned int width, unsigned int height) = 0;
 	virtual RenderResult present() = 0;
 	virtual RenderResult getBackBufferInfo(RenderBackBufferInfo *info) const = 0;
@@ -431,6 +480,11 @@ public:
 		size_t destinationBytes, size_t destinationRowPitch,
 		RenderFormat *format) = 0;
 	virtual RenderResult getDebugValidationErrorCount(unsigned int *count) const = 0;
+	// Requests the D3D11 debug-layer live-object report while the device is
+	// still alive. The report is emitted through the normal graphics-debug
+	// output channel; retail devices without the optional SDK layer return
+	// RENDER_RESULT_UNSUPPORTED and remain fully operational.
+	virtual RenderResult reportDebugLiveObjects() = 0;
 };
 
 IRenderDevice *CreateD3D11RenderDevice();

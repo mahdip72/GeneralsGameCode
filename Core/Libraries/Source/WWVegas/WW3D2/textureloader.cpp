@@ -53,7 +53,6 @@
 #include "dx8caps.h"
 #include "missingtexture.h"
 #include "WWLib/TARGA.h"
-#include <d3dx8tex.h>
 #include "WWDebug/wwmemlog.h"
 #include "formconv.h"
 #include "texturethumbnail.h"
@@ -375,11 +374,21 @@ IDirect3DTexture8* Load_Compressed_Texture(
 		dest_format,
 		(MipCountType)mips
 	);
+	if (d3d_texture == nullptr)
+	{
+		return nullptr;
+	}
 
 	for (unsigned level=0;level<mips;++level) {
 		IDirect3DSurface8* d3d_surface=nullptr;
-		WWASSERT(d3d_texture);
-		DX8_ErrorCode(d3d_texture->GetSurfaceLevel(level/*-reduction_factor*/,&d3d_surface));
+		const HRESULT surface_result = d3d_texture->GetSurfaceLevel(
+			level/*-reduction_factor*/, &d3d_surface);
+		DX8_ErrorCode(surface_result);
+		if (FAILED(surface_result) || d3d_surface == nullptr)
+		{
+			d3d_texture->Release();
+			return nullptr;
+		}
 		dds_file.Copy_Level_To_Surface(level,d3d_surface);
 		d3d_surface->Release();
 	}
@@ -586,21 +595,41 @@ IDirect3DTexture8* TextureLoader::Load_Thumbnail(const StringClass& filename, co
 #ifdef USE_MANAGED_TEXTURES
 		D3DPOOL_MANAGED);
 #else
-		D3DPOOL_SYSTEMMEM);
+	D3DPOOL_SYSTEMMEM);
 #endif
+	if (sysmem_texture == nullptr)
+	{
+		return MissingTexture::_Get_Missing_Texture();
+	}
 
 	unsigned level=0;
 	D3DLOCKED_RECT locked_rects[12]={0};
-	WWASSERT(sysmem_texture->GetLevelCount()<=12);
+	const unsigned levelCount = sysmem_texture->GetLevelCount();
+	if (levelCount == 0 || levelCount > 12)
+	{
+		sysmem_texture->Release();
+		return MissingTexture::_Get_Missing_Texture();
+	}
 
 	// Lock all surfaces
-	for (level=0;level<sysmem_texture->GetLevelCount();++level) {
-		DX8_ErrorCode(
-			sysmem_texture->LockRect(
-				level,
-				&locked_rects[level],
-				nullptr,
-				0));
+	for (level=0; level<levelCount; ++level) {
+		const HRESULT lock_result = sysmem_texture->LockRect(
+			level, &locked_rects[level], nullptr, 0);
+		DX8_ErrorCode(lock_result);
+		if (FAILED(lock_result) || locked_rects[level].pBits == nullptr ||
+			locked_rects[level].Pitch <= 0)
+		{
+			if (SUCCEEDED(lock_result))
+			{
+				DX8_ErrorCode(sysmem_texture->UnlockRect(level));
+			}
+			for (unsigned unlockLevel = 0; unlockLevel < level; ++unlockLevel)
+			{
+				DX8_ErrorCode(sysmem_texture->UnlockRect(unlockLevel));
+			}
+			sysmem_texture->Release();
+			return MissingTexture::_Get_Missing_Texture();
+		}
 	}
 
 	unsigned char* src_surface=thumb->Peek_Bitmap();
@@ -609,7 +638,7 @@ IDirect3DTexture8* TextureLoader::Load_Thumbnail(const StringClass& filename, co
 	unsigned height=thumb->Get_Height();
 
 	Vector3 hsv=hsv_shift;
-	for (level=0;level<sysmem_texture->GetLevelCount()-1;++level) {
+	for (level=0; level + 1 < levelCount; ++level) {
 		BitmapHandlerClass::Copy_Image_Generate_Mipmap(
 			width,
 			height,
@@ -627,12 +656,12 @@ IDirect3DTexture8* TextureLoader::Load_Thumbnail(const StringClass& filename, co
 		src_format=dest_format;
 		src_surface=(unsigned char*)locked_rects[level].pBits;
 		src_pitch=locked_rects[level].Pitch;
-		width>>=1;
-		height>>=1;
+		width = width > 1 ? width >> 1 : 1;
+		height = height > 1 ? height >> 1 : 1;
 	}
 
 	// Unlock all surfaces
-	for (level=0;level<sysmem_texture->GetLevelCount();++level) {
+	for (level=0; level < levelCount; ++level) {
 		DX8_ErrorCode(sysmem_texture->UnlockRect(level));
 	}
 #ifdef USE_MANAGED_TEXTURES
@@ -673,9 +702,14 @@ IDirect3DSurface8* TextureLoader::Load_Surface_Immediate(
 		IDirect3DTexture8* comp_tex=Load_Compressed_Texture(filename,0,MIP_LEVELS_1,WW3D_FORMAT_UNKNOWN);
 		if (comp_tex) {
 			IDirect3DSurface8* d3d_surface=nullptr;
-			DX8_ErrorCode(comp_tex->GetSurfaceLevel(0,&d3d_surface));
+			const HRESULT surface_result = comp_tex->GetSurfaceLevel(
+				0, &d3d_surface);
+			DX8_ErrorCode(surface_result);
 			comp_tex->Release();
-			return d3d_surface;
+			if (SUCCEEDED(surface_result) && d3d_surface != nullptr)
+			{
+				return d3d_surface;
+			}
 		}
 	}
 
@@ -738,13 +772,26 @@ IDirect3DSurface8* TextureLoader::Load_Surface_Immediate(
 	unsigned src_pitch=src_width*src_bpp;
 
 	IDirect3DSurface8* d3d_surface = DX8Wrapper::_Create_DX8_Surface(width,height,dest_format);
-	WWASSERT(d3d_surface);
-	D3DLOCKED_RECT locked_rect;
-	DX8_ErrorCode(
-		d3d_surface->LockRect(
-			&locked_rect,
-			nullptr,
-			0));
+	if (d3d_surface == nullptr)
+	{
+		delete[] converted_surface;
+		return MissingTexture::_Create_Missing_Surface();
+	}
+	D3DLOCKED_RECT locked_rect = {0};
+	const HRESULT lock_result = d3d_surface->LockRect(
+		&locked_rect, nullptr, 0);
+	DX8_ErrorCode(lock_result);
+	if (FAILED(lock_result) || locked_rect.pBits == nullptr ||
+		locked_rect.Pitch <= 0)
+	{
+		if (SUCCEEDED(lock_result))
+		{
+			DX8_ErrorCode(d3d_surface->UnlockRect());
+		}
+		d3d_surface->Release();
+		delete[] converted_surface;
+		return MissingTexture::_Create_Missing_Surface();
+	}
 
 	BitmapHandlerClass::Copy_Image(
 		(unsigned char*)locked_rect.pBits,
@@ -1598,8 +1645,8 @@ void TextureLoadTaskClass::End_Load()
 	{
 		PROFILER_SECTION_NAME("Texture.Upload");
 
-		Lock_Surfaces();
-		const bool uploaded = Upload_Prepared_Surfaces();
+		const bool locked = Lock_Surfaces();
+		const bool uploaded = locked && Upload_Prepared_Surfaces();
 		Unlock_Surfaces();
 		if (uploaded)
 		{
@@ -2107,26 +2154,43 @@ void TextureLoadTaskClass::Release_Prepared_Surfaces()
 }
 
 
-void TextureLoadTaskClass::Lock_Surfaces()
+bool TextureLoadTaskClass::Lock_Surfaces()
 {
 	WWASSERT(MipLevelCount == D3DTexture->GetLevelCount());
+	bool locked_all = true;
 
 	for (unsigned int i = 0; i < MipLevelCount; ++i)
 	{
-		D3DLOCKED_RECT locked_rect;
-		DX8_ErrorCode
-		(
-			Peek_D3D_Texture()->LockRect
-			(
-				i,
-				&locked_rect,
-				nullptr,
-				0
-			)
-		);
-		LockedSurfacePtr[i]		= (unsigned char *)locked_rect.pBits;
-		LockedSurfacePitch[i]	= locked_rect.Pitch;
+		D3DLOCKED_RECT locked_rect = {0};
+		const HRESULT result = Peek_D3D_Texture()->LockRect(
+			i, &locked_rect, nullptr, 0);
+		DX8_ErrorCode(result);
+		if (FAILED(result) || locked_rect.pBits == nullptr ||
+			locked_rect.Pitch <= 0)
+		{
+			locked_all = false;
+			LockedSurfacePtr[i] = nullptr;
+			LockedSurfacePitch[i] = 0;
+			break;
+		}
+		LockedSurfacePtr[i] = (unsigned char *)locked_rect.pBits;
+		LockedSurfacePitch[i] = locked_rect.Pitch;
 	}
+	if (!locked_all)
+	{
+		// Unlock any earlier levels before the failed upload is published.  A
+		// failed LockRect must never leave a stale pointer in the task object.
+		for (unsigned int i = 0; i < MipLevelCount; ++i)
+		{
+			if (LockedSurfacePtr[i] != nullptr)
+			{
+				DX8_ErrorCode(Peek_D3D_Texture()->UnlockRect(i));
+				LockedSurfacePtr[i] = nullptr;
+				LockedSurfacePitch[i] = 0;
+			}
+		}
+	}
+	return locked_all;
 }
 
 
@@ -2141,12 +2205,18 @@ void TextureLoadTaskClass::Unlock_Surfaces()
 		}
 		LockedSurfacePtr[i] = nullptr;
 	}
+	// Managed texture uploads are performed through the legacy API object.
+	// Publish the write to the compatibility bridge before the texture is
+	// attached to its TextureClass, so a previously cached source cannot be
+	// reused if the resource address is recycled.
+	Notify_Render_Texture_Changed(Peek_D3D_Texture());
 
 #ifndef USE_MANAGED_TEXTURES
 	IDirect3DTexture8* tex = DX8Wrapper::_Create_DX8_Texture(Width, Height, Format, Texture->MipLevelCount,D3DPOOL_DEFAULT);
 	DX8CALL(UpdateTexture(Peek_D3D_Texture(),tex));
 	Peek_D3D_Texture()->Release();
 	D3DTexture=tex;
+	Notify_Render_Texture_Changed(Peek_D3D_Texture());
 	WWDEBUG_SAY(("Created non-managed texture (%s)",Texture->Get_Full_Path()));
 #endif
 
@@ -2488,28 +2558,50 @@ void CubeTextureLoadTaskClass::Deinit()
 	}
 }
 
-void CubeTextureLoadTaskClass::Lock_Surfaces()
+bool CubeTextureLoadTaskClass::Lock_Surfaces()
 {
+	bool locked_all = true;
 	for (unsigned int f=0; f<6; f++)
 	{
 		for (unsigned int i=0; i<MipLevelCount; i++)
 		{
-			D3DLOCKED_RECT locked_rect;
-			DX8_ErrorCode
-			(
-				Peek_D3D_Cube_Texture()->LockRect
-				(
-					(D3DCUBEMAP_FACES)f,
-					i,
-					&locked_rect,
-					nullptr,
-					0
-				)
-			);
-			LockedCubeSurfacePtr[f][i]	 = (unsigned char *)locked_rect.pBits;
-			LockedCubeSurfacePitch[f][i]= locked_rect.Pitch;
+			D3DLOCKED_RECT locked_rect = {0};
+			const HRESULT result = Peek_D3D_Cube_Texture()->LockRect(
+				(D3DCUBEMAP_FACES)f, i, &locked_rect, nullptr, 0);
+			DX8_ErrorCode(result);
+			if (FAILED(result) || locked_rect.pBits == nullptr ||
+				locked_rect.Pitch <= 0)
+			{
+				locked_all = false;
+				LockedCubeSurfacePtr[f][i] = nullptr;
+				LockedCubeSurfacePitch[f][i] = 0;
+				break;
+			}
+			LockedCubeSurfacePtr[f][i] = (unsigned char *)locked_rect.pBits;
+			LockedCubeSurfacePitch[f][i] = locked_rect.Pitch;
+		}
+		if (!locked_all)
+		{
+			break;
 		}
 	}
+	if (!locked_all)
+	{
+		for (unsigned int f = 0; f < 6; ++f)
+		{
+			for (unsigned int i = 0; i < MipLevelCount; ++i)
+			{
+				if (LockedCubeSurfacePtr[f][i] != nullptr)
+				{
+					DX8_ErrorCode(Peek_D3D_Cube_Texture()->UnlockRect(
+						(D3DCUBEMAP_FACES)f, i));
+					LockedCubeSurfacePtr[f][i] = nullptr;
+					LockedCubeSurfacePitch[f][i] = 0;
+				}
+			}
+		}
+	}
+	return locked_all;
 }
 
 void CubeTextureLoadTaskClass::Unlock_Surfaces()
@@ -2529,6 +2621,7 @@ void CubeTextureLoadTaskClass::Unlock_Surfaces()
 			LockedCubeSurfacePtr[f][i] = nullptr;
 		}
 	}
+	Notify_Render_Texture_Changed(Peek_D3D_Cube_Texture());
 
 #ifndef USE_MANAGED_TEXTURES
 	IDirect3DCubeTexture8* tex = DX8Wrapper::_Create_DX8_Cube_Texture
@@ -2539,9 +2632,10 @@ void CubeTextureLoadTaskClass::Unlock_Surfaces()
 		Texture->MipLevelCount,
 		D3DPOOL_DEFAULT
 	);
-	DX8CALL(UpdateTexture(Peek_D3D_Volume_Texture(),tex));
-	Peek_D3D_Volume_Texture()->Release();
+	DX8Wrapper::_Update_Texture(Peek_D3D_Cube_Texture(), tex);
+	Peek_D3D_Cube_Texture()->Release();
 	D3DTexture=tex;
+	Notify_Render_Texture_Changed(Peek_D3D_Cube_Texture());
 	WWDEBUG_SAY(("Created non-managed texture (%s)",Texture->Get_Full_Path()));
 #endif
 

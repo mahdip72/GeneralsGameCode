@@ -203,6 +203,9 @@ public:
 protected:
 
 	void Load_Locked_Surface();
+	// Release the owned legacy resource in one place so all lifecycle paths keep
+	// the pointer/ref-count transition identical.
+	void Release_D3D_Texture();
 	void Poke_Texture(IDirect3DBaseTexture8* tex) { D3DTexture = tex; }
 
 	bool Initialized;

@@ -653,6 +653,15 @@ static Bool mapRadarOverlayFormat( WW3DFormat surfaceFormat,
 	}
 }
 
+/* Surface locks and CopyRects update the legacy texture storage directly.
+ * Tell the D3D11 bridge only after the complete owner-thread write is done so
+ * it cannot sample a partially updated radar image. */
+static void notifyRadarTextureChanged( TextureClass *texture )
+{
+	if( texture != nullptr )
+		Notify_Render_Texture_Changed(texture);
+}
+
 static Bool countRadarObjectOverlayList( const RadarObject *listHead,
 	unsigned *count )
 {
@@ -777,6 +786,8 @@ static Bool uploadPreparedRadarObjectOverlay( TextureClass *texture,
 	}
 
 	REF_PTR_RELEASE( surface );
+	if( uploaded )
+		notifyRadarTextureChanged( texture );
 	return uploaded;
 }
 
@@ -899,6 +910,8 @@ static Bool uploadPreparedRadarShroudOverlay( TextureClass *texture,
 
 	const Bool uploaded = uploadRadarShroudOverlaySurface( surface, snapshot );
 	REF_PTR_RELEASE( surface );
+	if( uploaded )
+		notifyRadarTextureChanged( texture );
 	return uploaded;
 }
 
@@ -987,6 +1000,8 @@ static Bool replayRadarShroudOverlayCommands( TextureClass *texture,
 
 	surface->Unlock();
 	REF_PTR_RELEASE( surface );
+	if( pitchValid )
+		notifyRadarTextureChanged( texture );
 	return pitchValid;
 }
 
@@ -1000,6 +1015,7 @@ void W3DRadar::updateObjectTexture(TextureClass *texture)
 	SurfaceClass *surface = texture->Get_Surface_Level();
 	surface->Clear();
 	REF_PTR_RELEASE(surface);
+	notifyRadarTextureChanged( texture );
 
 	RadarObjectOverlayBatch batch;
 	Bool prepared = FALSE;
@@ -1020,6 +1036,7 @@ void W3DRadar::updateObjectTexture(TextureClass *texture)
 		{
 			renderObjectList( m_objectList, texture );
 			renderObjectList( m_localObjectList, texture );
+			notifyRadarTextureChanged( texture );
 			return;
 		}
 		surface = texture->Get_Surface_Level();
@@ -1075,6 +1092,7 @@ void W3DRadar::updateObjectTexture(TextureClass *texture)
 	// Keep the complete owner-only reference path after the one clear above.
 	renderObjectList( m_objectList, texture );
 	renderObjectList( m_localObjectList, texture );
+	notifyRadarTextureChanged( texture );
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -1508,6 +1526,7 @@ void W3DRadar::reset()
 	{
 		surface->Clear();
 		REF_PTR_RELEASE(surface);
+		notifyRadarTextureChanged( m_terrainTexture );
 	}
 
 	surface = m_overlayTexture->Get_Surface_Level();
@@ -1515,6 +1534,7 @@ void W3DRadar::reset()
 	{
 		surface->Clear();
 		REF_PTR_RELEASE(surface);
+		notifyRadarTextureChanged( m_overlayTexture );
 	}
 
 	// don't call Clear(); that wips to transparent. do this instead.
@@ -1901,6 +1921,7 @@ void W3DRadar::buildTerrainTexture( TerrainLogic *terrain )
 			if( uploadPreparedRadarTerrain( surface, preparedSnapshot,
 				batch.output() ) )
 			{
+				notifyRadarTextureChanged( m_terrainTexture );
 				REF_PTR_RELEASE(surface);
 				return;
 			}
@@ -2109,6 +2130,7 @@ void W3DRadar::buildTerrainTexture( TerrainLogic *terrain )
 	// all done with the surface
 	surface->Unlock();
 	REF_PTR_RELEASE(surface);
+	notifyRadarTextureChanged( m_terrainTexture );
 
 }
 
@@ -2145,6 +2167,7 @@ void W3DRadar::clearShroud()
 
 	surface->Unlock();
 	REF_PTR_RELEASE(surface);
+	notifyRadarTextureChanged( m_shroudTexture );
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -2302,6 +2325,7 @@ void W3DRadar::setShroudLevel(Int shroudX, Int shroudY, CellShroudStatus setting
 
 		surface->Unlock();
 		REF_PTR_RELEASE(surface);
+		notifyRadarTextureChanged( m_shroudTexture );
 	}
 	else
 	{
@@ -2464,6 +2488,7 @@ void W3DRadar::endSetShroudLevel()
 	if (m_shroudSurfaceBits != nullptr)
 	{
 		m_shroudSurface->Unlock();
+		notifyRadarTextureChanged( m_shroudTexture );
 		m_shroudSurfaceBits = nullptr;
 		m_shroudSurfacePitch = 0;
 		m_shroudSurfaceFormat = WW3D_FORMAT_UNKNOWN;

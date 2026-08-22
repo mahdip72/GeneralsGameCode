@@ -27,8 +27,6 @@
 #include "Common/BezierSegment.h"
 #include "Common/BezFwdIterator.h"
 
-#include <d3dx8math.h>
-
 //-------------------------------------------------------------------------------------------------
 BezierSegment::BezierSegment()
 {
@@ -102,18 +100,23 @@ void BezierSegment::evaluateBezSegmentAtT(Real tValue, Coord3D *outResult) const
 	if (!outResult)
 		return;
 
-	D3DXVECTOR4	tVec(tValue * tValue * tValue, tValue * tValue, tValue, 1);
+	const float tSquared = tValue * tValue;
+	const float tVector[4] = { tValue * tSquared, tSquared, tValue, 1.0f };
+	float tResult[4];
+	transformBasis(tVector, tResult);
 
-	D3DXVECTOR4 xCoords(m_controlPoints[0].x, m_controlPoints[1].x, m_controlPoints[2].x, m_controlPoints[3].x);
-	D3DXVECTOR4 yCoords(m_controlPoints[0].y, m_controlPoints[1].y, m_controlPoints[2].y, m_controlPoints[3].y);
-	D3DXVECTOR4 zCoords(m_controlPoints[0].z, m_controlPoints[1].z, m_controlPoints[2].z, m_controlPoints[3].z);
-
-	D3DXVECTOR4 tResult;
-	D3DXVec4Transform(&tResult, &tVec, &BezierSegment::s_bezBasisMatrix);
-
-	outResult->x = D3DXVec4Dot(&xCoords, &tResult);
-	outResult->y = D3DXVec4Dot(&yCoords, &tResult);
-	outResult->z = D3DXVec4Dot(&zCoords, &tResult);
+	outResult->x = m_controlPoints[0].x * tResult[0]
+		+ m_controlPoints[1].x * tResult[1]
+		+ m_controlPoints[2].x * tResult[2]
+		+ m_controlPoints[3].x * tResult[3];
+	outResult->y = m_controlPoints[0].y * tResult[0]
+		+ m_controlPoints[1].y * tResult[1]
+		+ m_controlPoints[2].y * tResult[2]
+		+ m_controlPoints[3].y * tResult[3];
+	outResult->z = m_controlPoints[0].z * tResult[0]
+		+ m_controlPoints[1].z * tResult[1]
+		+ m_controlPoints[2].z * tResult[2]
+		+ m_controlPoints[3].z * tResult[3];
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -238,9 +241,22 @@ void BezierSegment::splitSegmentAtT(Real tValue, BezierSegment &outSeg1, BezierS
 
 //-------------------------------------------------------------------------------------------------
 // The Basis Matrix for a bezier segment
-const D3DXMATRIX BezierSegment::s_bezBasisMatrix(
-	-1.0f,  3.0f, -3.0f,  1.0f,
-	 3.0f, -6.0f,  3.0f,  0.0f,
-	-3.0f,  3.0f,  0.0f,  0.0f,
-	 1.0f,  0.0f,  0.0f,  0.0f
-);
+const float BezierSegment::s_bezBasisMatrix[4][4] = {
+	{ -1.0f,  3.0f, -3.0f, 1.0f },
+	{  3.0f, -6.0f,  3.0f, 0.0f },
+	{ -3.0f,  3.0f,  0.0f, 0.0f },
+	{  1.0f,  0.0f,  0.0f, 0.0f }
+};
+
+void BezierSegment::transformBasis(const float input[4], float output[4])
+{
+	// D3DXVec4Transform treats the input as a row vector and writes one
+	// output component from each matrix column.  Preserve that convention
+	// exactly while keeping the operation independent of D3DX.
+	for (int column = 0; column < 4; ++column) {
+		output[column] = input[0] * s_bezBasisMatrix[0][column]
+			+ input[1] * s_bezBasisMatrix[1][column]
+			+ input[2] * s_bezBasisMatrix[2][column]
+			+ input[3] * s_bezBasisMatrix[3][column];
+	}
+}

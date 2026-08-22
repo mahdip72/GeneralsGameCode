@@ -19,8 +19,8 @@
 // 08/05/02 KM Texture class redesign
 #include "missingtexture.h"
 #include "texture.h"
+#include "texturemipgenerator.h"
 #include "dx8wrapper.h"
-#include <d3dx8core.h>
 
 static unsigned missing_image_width=128;
 static unsigned missing_image_height=128;
@@ -97,24 +97,10 @@ void MissingTexture::_Init()
 
 	DX8_ErrorCode(tex->UnlockRect(0));
 
-	for (unsigned i=1;i<tex->GetLevelCount();++i) {
-		IDirect3DSurface8 *src,*dst;
-		DX8_ErrorCode(tex->GetSurfaceLevel(i-1,&src));
-		DX8_ErrorCode(tex->GetSurfaceLevel(i,&dst));
-
-		DX8_ErrorCode(D3DXLoadSurfaceFromSurface(
-			dst,
-			nullptr,	// palette
-			nullptr,	// rect
-			src,
-			nullptr,	// palette
-			nullptr,	// rect
-			D3DX_FILTER_BOX,	// box is good for 2:1 filtering
-			0));
-
-		src->Release();
-		dst->Release();
-	}
+	// The missing texture is always A8R8G8B8 with power-of-two levels.  The
+	// internal generator is characterized against the legacy box filter for
+	// this exact 2:1 path and keeps mip generation inside the engine boundary.
+	DX8_ErrorCode(Generate_DX8_Texture_Mip_Levels(tex));
 
 	_MissingTexture=tex;
 /*

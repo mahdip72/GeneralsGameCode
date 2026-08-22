@@ -52,7 +52,8 @@
 #include "W3DDevice/GameClient/TileData.h"
 #include "Common/GlobalData.h"
 #include "WW3D2/dx8wrapper.h"
-#include "d3dx8tex.h"
+#include "Renderer/LegacyD3DMath.h"
+#include "WW3D2/texturemipgenerator.h"
 
 /******************************************************************************
 						TerrainTextureClass
@@ -195,7 +196,8 @@ int TerrainTextureClass::update(WorldHeightMap *htMap)
 	}
 	surface_level->UnlockRect();
 	surface_level->Release();
-	DX8_ErrorCode(D3DXFilterTexture(Peek_D3D_Texture(), nullptr, 0, D3DX_FILTER_BOX));
+	DX8_ErrorCode(Generate_DX8_Texture_Mip_Levels(Peek_D3D_Texture()));
+	Notify_Render_Texture_Changed(Peek_D3D_Base_Texture());
 	if (WW3D::Get_Texture_Reduction()) {
 		Peek_D3D_Texture()->SetLOD(WW3D::Get_Texture_Reduction());
 	}
@@ -352,7 +354,7 @@ int TerrainTextureClass::update(WorldHeightMap *htMap)
 	}
 	surface_level->UnlockRect();
 	surface_level->Release();
-	DX8_ErrorCode(D3DXFilterTexture(D3DTexture, nullptr, 0, D3DX_FILTER_BOX));
+	DX8_ErrorCode(Generate_DX8_Texture_Mip_Levels(D3DTexture));
 	return(surface_desc.Height);
 }
 #endif
@@ -425,7 +427,8 @@ Bool TerrainTextureClass::updateFlat(WorldHeightMap *htMap, Int xCell, Int yCell
 
 	surface_level->UnlockRect();
 	surface_level->Release();
-	DX8_ErrorCode(D3DXFilterTexture(Peek_D3D_Texture(), nullptr, 0, D3DX_FILTER_BOX));
+	DX8_ErrorCode(Generate_DX8_Texture_Mip_Levels(Peek_D3D_Texture()));
+	Notify_Render_Texture_Changed(Peek_D3D_Base_Texture());
 	return(surface_desc.Height);
 }
 
@@ -711,16 +714,16 @@ void LightMapTerrainTextureClass::Apply(unsigned int stage)
 	DX8Wrapper::Set_DX8_Texture_Stage_State( stage, D3DTSS_ADDRESSU, D3DTADDRESS_WRAP);
 	DX8Wrapper::Set_DX8_Texture_Stage_State( stage, D3DTSS_ADDRESSV, D3DTADDRESS_WRAP);
 
-	D3DXMATRIX curView;
+	D3DMATRIX curView;
 	DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, curView);
 
-	D3DXMATRIX inv;
+	D3DMATRIX inv;
 	float det;
-	D3DXMatrixInverse(&inv, &det, &curView);
+	LegacyD3DMatrixInverse(&inv, &det, &curView);
 
-	D3DXMATRIX scale;
-	D3DXMatrixScaling(&scale, STRETCH_FACTOR, STRETCH_FACTOR,1);
-	inv *=scale;
+	D3DMATRIX scale;
+	LegacyD3DMatrixScaling(&scale, STRETCH_FACTOR, STRETCH_FACTOR,1);
+	LegacyD3DMatrixMultiply(&inv, &inv, &scale);
 	if (stage==0) {
 		DX8Wrapper::_Set_DX8_Transform(D3DTS_TEXTURE0, inv);
 	}	if (stage==1) {
@@ -837,7 +840,8 @@ int AlphaEdgeTextureClass::update(WorldHeightMap *htMap)
 	}
 	surface_level->UnlockRect();
 	surface_level->Release();
-	DX8_ErrorCode(D3DXFilterTexture(Peek_D3D_Texture(), nullptr, 0, D3DX_FILTER_BOX));
+	DX8_ErrorCode(Generate_DX8_Texture_Mip_Levels(Peek_D3D_Texture()));
+	Notify_Render_Texture_Changed(Peek_D3D_Base_Texture());
 	return(surface_desc.Height);
 }
 
@@ -965,17 +969,17 @@ void CloudMapTerrainTextureClass::Apply(unsigned int stage)
 	DX8Wrapper::Set_DX8_Texture_Stage_State( stage,  D3DTSS_ADDRESSU, D3DTADDRESS_WRAP);
 	DX8Wrapper::Set_DX8_Texture_Stage_State( stage,  D3DTSS_ADDRESSV, D3DTADDRESS_WRAP);
 
-	D3DXMATRIX curView;
+	D3DMATRIX curView;
 	DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, curView);
 
-	D3DXMATRIX inv;
+	D3DMATRIX inv;
 	float det;
-	D3DXMatrixInverse(&inv, &det, &curView);
+	LegacyD3DMatrixInverse(&inv, &det, &curView);
 
-	D3DXMATRIX scale;
-	D3DXMatrixScaling(&scale, STRETCH_FACTOR, STRETCH_FACTOR,1);
-	inv *=scale;
-	D3DXMATRIX offset;
+	D3DMATRIX scale;
+	LegacyD3DMatrixScaling(&scale, STRETCH_FACTOR, STRETCH_FACTOR,1);
+	LegacyD3DMatrixMultiply(&inv, &inv, &scale);
+	D3DMATRIX offset;
 
 	Int delta = m_curTick;
 	m_curTick = ::GetTickCount();
@@ -989,9 +993,9 @@ void CloudMapTerrainTextureClass::Apply(unsigned int stage)
 	if (m_yOffset < -1) m_yOffset += 1;
 
 
-	D3DXMatrixTranslation(&offset, m_xOffset, m_yOffset,0);
+	LegacyD3DMatrixTranslation(&offset, m_xOffset, m_yOffset,0);
 
-	inv *= offset;
+	LegacyD3DMatrixMultiply(&inv, &inv, &offset);
 
 	if (stage==0) {
 		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG1, D3DTA_TEXTURE );

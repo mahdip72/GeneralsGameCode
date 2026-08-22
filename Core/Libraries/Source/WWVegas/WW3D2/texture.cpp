@@ -42,7 +42,6 @@
 #include "texture.h"
 
 #include <d3d8.h>
-#include <d3dx8core.h>
 #include "dx8wrapper.h"
 #include "WWLib/TARGA.h"
 #include <WWLib/nstrdup.h>
@@ -119,13 +118,18 @@ TextureBaseClass::~TextureBaseClass()
 	delete ThumbnailLoadTask;
 	ThumbnailLoadTask=nullptr;
 
-	if (D3DTexture)
+	Release_D3D_Texture();
+
+	DX8TextureManagerClass::Remove(this);
+}
+
+void TextureBaseClass::Release_D3D_Texture()
+{
+	if (D3DTexture != nullptr)
 	{
 		D3DTexture->Release();
 		D3DTexture = nullptr;
 	}
-
-	DX8TextureManagerClass::Remove(this);
 }
 
 
@@ -201,11 +205,7 @@ void TextureBaseClass::Invalidate()
 		return;
 	}
 
-	if (D3DTexture)
-	{
-		D3DTexture->Release();
-		D3DTexture = nullptr;
-	}
+	Release_D3D_Texture();
 
 	Initialized=false;
 
@@ -284,8 +284,7 @@ void TextureBaseClass::Set_D3D_Base_Texture(IDirect3DBaseTexture8* tex)
 void TextureBaseClass::Load_Locked_Surface()
 {
 	WWPROFILE(("TextureClass::Load_Locked_Surface()"));
-	if (D3DTexture) D3DTexture->Release();
-	D3DTexture=nullptr;
+	Release_D3D_Texture();
 	TextureLoader::Request_Thumbnail(this);
 	Initialized=false;
 }
@@ -886,12 +885,14 @@ void TextureClass::Apply_New_Surface
 	bool disable_auto_invalidation
 )
 {
-	IDirect3DBaseTexture8* d3d_tex=Peek_D3D_Base_Texture();
+	if (d3d_texture == nullptr)
+	{
+		Release_D3D_Texture();
+		Initialized = false;
+		return;
+	}
 
-	if (d3d_tex) d3d_tex->Release();
-
-	Poke_Texture(d3d_texture);//TextureLoadTask->Peek_D3D_Texture();
-	d3d_texture->AddRef();
+	Set_D3D_Base_Texture(d3d_texture);
 
 	if (initialized) Initialized=true;
 	if (disable_auto_invalidation) InactivationTime = 0;
