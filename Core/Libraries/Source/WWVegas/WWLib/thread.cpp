@@ -47,14 +47,22 @@ ThreadClass::~ThreadClass()
 	Stop();
 }
 
+#ifdef _WIN32
+unsigned __stdcall ThreadClass::Internal_Thread_Function(void* params)
+#else
 void __cdecl ThreadClass::Internal_Thread_Function(void* params)
+#endif
 {
 	ThreadClass* tc=reinterpret_cast<ThreadClass*>(params);
-	tc->running=true;
-	tc->ThreadID = GetCurrentThreadId();
+	#ifdef _WIN32
+	InterlockedExchange(&tc->running, 1);
+	#else
+	tc->running = true;
+	#endif
 
 #ifdef _WIN32
-	Register_Thread_ID(tc->ThreadID, tc->ThreadName);
+	const unsigned current_thread_id = GetCurrentThreadId();
+	Register_Thread_ID(current_thread_id, tc->ThreadName);
 
 #if defined(_MSC_VER)
 	// MSVC supports structured exception handling (__try/__except)
@@ -78,22 +86,47 @@ void __cdecl ThreadClass::Internal_Thread_Function(void* params)
 #endif //_WIN32
 
 #ifdef _WIN32
-	Unregister_Thread_ID(tc->ThreadID, tc->ThreadName);
+	Unregister_Thread_ID(current_thread_id, tc->ThreadName);
 #endif // _WIN32
-	tc->handle=0;
-	tc->ThreadID = 0;
+	#ifdef _WIN32
+	InterlockedExchange(&tc->running, 0);
+	#else
+	tc->running = false;
+	#endif
+	#ifdef _WIN32
+	return 0;
+	#endif
 }
 
 void ThreadClass::Execute()
 {
-	WWASSERT(!handle);	// Only one thread at a time!
 	#ifdef _UNIX
 		// assert(0);
 		return;
 	#else
-		handle=_beginthread(&Internal_Thread_Function,0,this);
-		SetThreadPriority((HANDLE)handle,THREAD_PRIORITY_NORMAL+thread_priority);
-		WWDEBUG_SAY(("ThreadClass::Execute: Started thread %s, thread ID is %X", ThreadName, handle));
+	if (handle && WaitForSingleObject(reinterpret_cast<HANDLE>(handle), 0) == WAIT_OBJECT_0)
+	{
+		CloseHandle(reinterpret_cast<HANDLE>(handle));
+		handle = 0;
+		ThreadID = 0;
+	}
+	WWASSERT(!handle);	// Only one thread at a time!
+		WWASSERT(!running);
+		InterlockedExchange(&running, 1);
+		unsigned thread_id = 0;
+		const size_t new_handle = _beginthreadex(0, 0,
+			&Internal_Thread_Function, this, 0, &thread_id);
+		if (new_handle == 0)
+		{
+			InterlockedExchange(&running, 0);
+			WWDEBUG_SAY(("ThreadClass::Execute: Failed to start thread %s", ThreadName));
+			return;
+		}
+		handle = new_handle;
+		ThreadID = thread_id;
+		::SetThreadPriority(reinterpret_cast<HANDLE>(handle),
+			THREAD_PRIORITY_NORMAL+thread_priority);
+		WWDEBUG_SAY(("ThreadClass::Execute: Started thread %s, thread ID is %X", ThreadName, ThreadID));
 	#endif
 }
 
@@ -104,7 +137,7 @@ void ThreadClass::Set_Priority(int priority)
 		return;
 	#else
 		thread_priority=priority;
-		if (handle) SetThreadPriority((HANDLE)handle,THREAD_PRIORITY_NORMAL+thread_priority);
+		if (handle) ::SetThreadPriority(reinterpret_cast<HANDLE>(handle),THREAD_PRIORITY_NORMAL+thread_priority);
 	#endif
 }
 
@@ -114,16 +147,20 @@ void ThreadClass::Stop(unsigned ms)
 		// assert(0);
 		return;
 	#else
-		running=false;
-		unsigned time=TIMEGETTIME();
-		while (handle) {
-			if ((TIMEGETTIME()-time)>ms) {
-				int res=TerminateThread((HANDLE)handle,0);
-				res;	// just to silence compiler warnings
-				WWASSERT(res);	// Thread still not killed!
-				handle=0;
-			}
-			Sleep(0);
+		if (!handle) return;
+		InterlockedExchange(&running, 0);
+		HANDLE native_handle = reinterpret_cast<HANDLE>(handle);
+		DWORD wait_result = WaitForSingleObject(native_handle, ms);
+		if (wait_result == WAIT_TIMEOUT) {
+			int res=TerminateThread(native_handle,0);
+			res;	// just to silence compiler warnings
+			WWASSERT(res);	// Thread still not killed!
+			wait_result = WaitForSingleObject(native_handle, INFINITE);
+		}
+		if (wait_result == WAIT_OBJECT_0) {
+			CloseHandle(native_handle);
+			handle=0;
+			ThreadID = 0;
 		}
 	#endif
 }
@@ -160,5 +197,9 @@ unsigned ThreadClass::_Get_Current_Thread_ID()
 
 bool ThreadClass::Is_Running()
 {
-	return !!handle;
+	#ifdef _WIN32
+	return InterlockedCompareExchange(&running, 0, 0) != 0;
+	#else
+	return running != 0;
+	#endif
 }
