@@ -12,6 +12,7 @@ if(RTS_BUILD_CORE_EXTRAS)
         add_subdirectory(NativeRendererGraphTest)
         add_subdirectory(NativeW3DRendererTest)
         add_subdirectory(NativeW3DResourcesTest)
+        add_subdirectory(NativeW3D2Test)
     endif()
     add_subdirectory(JobSystemTest)
 

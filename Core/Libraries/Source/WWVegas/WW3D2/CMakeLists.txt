@@ -264,3 +264,23 @@ target_link_libraries(corei_ww3d2 INTERFACE
     core_wwlib
     core_wwmath
 )
+
+# The native runtime path is deliberately a separate target.  It must never
+# inherit the D3D8 compatibility PCH or the legacy WW3D source list.
+if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD)
+    add_library(core_ww3d2_native STATIC
+        nativew3d2.cpp
+        nativew3d2.h
+    )
+    target_include_directories(core_ww3d2_native PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    target_link_libraries(core_ww3d2_native PUBLIC
+        core_renderer
+    )
+    set_target_properties(core_ww3d2_native PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED YES
+        CXX_EXTENSIONS NO
+    )
+endif()
