@@ -614,44 +614,20 @@ struct D3D11LegacyBridge::Impl
 				++index;
 			}
 		}
-		for (unsigned int index = 0; index < textures.size();)
+	for (unsigned int index = 0; index < textures.size();)
+	{
+		if (Is_Texture_Entry_Pinned(textures[index]))
 		{
-			if (textures[index].d3d8_dirty &&
-				!Is_Target_Handle_Pinned(textures[index].handle, active_target) &&
-				(!pending_target_change ||
-					!Is_Target_Handle_Pinned(textures[index].handle,
-						pending_target)))
-			{
-				const RenderResult refresh_result =
-					Refresh_Texture(textures[index]);
-				if (refresh_result == rts::render::RENDER_RESULT_OK)
-				{
-					textures[index].d3d8_dirty = false;
-					++dynamic_texture_refresh_count;
-					++dynamic_texture_in_place_count;
-					cache_counters.RecordTextureRefresh();
-					++index;
-					continue;
-				}
-				if (refresh_result == rts::render::RENDER_RESULT_UNSUPPORTED)
-				{
-					if (Remove_Texture_Entry(index))
-					{
-						++dynamic_texture_refresh_count;
-						++dynamic_texture_recreate_count;
-						cache_counters.RecordTextureRefresh();
-						continue;
-					}
-				}
-				++index;
-				continue;
-			}
-			if (Is_Texture_Entry_Pinned(textures[index]))
-			{
-				++index;
-				continue;
-			}
-			if (textures[index].last_used_frame + CACHE_STALE_FRAME_COUNT < frame_id)
+			++index;
+			continue;
+		}
+		// A dirty source is deliberately refreshed at Bind_Texture(), not by
+		// periodic eviction.  Cache maintenance otherwise performs a complete
+		// D3D8 LockRect/readback for textures that may never be sampled again,
+		// creating regular menu hitches and flicker under animated UI churn.
+		// Stale entries can be dropped safely: the next real use creates a
+		// current D3D11 copy from the D3D8 source.
+		if (textures[index].last_used_frame + CACHE_STALE_FRAME_COUNT < frame_id)
 			{
 				if (!Remove_Texture_Entry(index))
 				{
