@@ -150,6 +150,16 @@
             }
         },
         {
+            "name": "x64-profile",
+            "inherits": "x64",
+            "hidden": false,
+            "displayName": "Windows x64 Profile Foundation",
+            "cacheVariables": {
+                "RTS_BUILD_OPTION_PROFILE": "ON",
+                "RTS_BUILD_OPTION_PROFILE_TRACY": "ON"
+            }
+        },
+        {
             "name": "win32-vcpkg",
             "inherits": "default-vcpkg",
             "hidden": false,
@@ -309,6 +319,13 @@
             "configuration": "Debug"
         },
         {
+            "name": "x64-profile",
+            "configurePreset": "x64-profile",
+            "displayName": "Build Windows x64 Profile Foundation",
+            "description": "Build Windows x64 Profile Foundation",
+            "configuration": "Release"
+        },
+        {
             "name": "unix",
             "configurePreset": "unix",
             "displayName": "Build Unix 32bit VCPKG Release",
@@ -436,6 +453,45 @@
                 {
                     "type": "build",
                     "name": "win32-debug"
+                }
+            ]
+        },
+        {
+            "name": "x64",
+            "steps": [
+                {
+                    "type": "configure",
+                    "name": "x64"
+                },
+                {
+                    "type": "build",
+                    "name": "x64"
+                }
+            ]
+        },
+        {
+            "name": "x64-debug",
+            "steps": [
+                {
+                    "type": "configure",
+                    "name": "x64-debug"
+                },
+                {
+                    "type": "build",
+                    "name": "x64-debug"
+                }
+            ]
+        },
+        {
+            "name": "x64-profile",
+            "steps": [
+                {
+                    "type": "configure",
+                    "name": "x64-profile"
+                },
+                {
+                    "type": "build",
+                    "name": "x64-profile"
                 }
             ]
         },
