@@ -7,8 +7,7 @@ target_compile_definitions(core_wwcommon INTERFACE
 )
 
 target_link_libraries(core_wwcommon INTERFACE
-    rts_d3d8lib
-    milesstub
+    rts_legacy_product_runtime
     stlport
 )
 

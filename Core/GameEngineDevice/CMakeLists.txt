@@ -246,10 +246,8 @@ target_link_libraries(corei_gameenginedevice_private INTERFACE
 )
 
 target_link_libraries(corei_gameenginedevice_public INTERFACE
-    binkstub
     corei_gameengine_public
-    rts_d3d8lib
-    milesstub
+    rts_legacy_product_runtime
 )
 
 if(RTS_BUILD_OPTION_FFMPEG)

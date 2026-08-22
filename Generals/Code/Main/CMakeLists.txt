@@ -8,15 +8,12 @@ else()
 endif()
 
 target_link_libraries(g_generals PRIVATE
-    binkstub
     comctl32
-    dinput8
-    dxguid
     g_gameengine
     g_gameenginedevice
     gi_always
     imm32
-    milesstub
+    rts_legacy_product_runtime
     vfw32
     winmm
 )

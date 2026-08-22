@@ -8,14 +8,11 @@ else()
 endif()
 
 target_link_libraries(z_generals PRIVATE
-    binkstub
     comctl32
     core_debug
     core_profile_legacy
-    dinput8
-    dxguid
     imm32
-    milesstub
+    rts_legacy_product_runtime
     vfw32
     winmm
     z_gameengine

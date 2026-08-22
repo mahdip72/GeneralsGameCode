@@ -1202,7 +1202,7 @@ target_link_libraries(corei_gameengine_public INTERFACE
     core_compression
     core_browserdispatch
     #core_wwvegas
-    rts_d3d8lib
+    rts_legacy_product_runtime
     gamespy::gamespy
     stlport
 )

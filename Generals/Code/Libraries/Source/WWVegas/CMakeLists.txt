@@ -3,8 +3,7 @@ add_library(g_wwcommon INTERFACE)
 
 target_link_libraries(g_wwcommon INTERFACE
     core_wwcommon
-    rts_d3d8lib
-    milesstub
+    rts_legacy_product_runtime
     stlport
 )
 
