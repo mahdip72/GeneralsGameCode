@@ -754,7 +754,10 @@ void W3DShroud::render(CameraClass *cam)
 #endif
 	const Bool sourceDirtyAfterInterpolation = m_srcTextureDirty;
 	if (sourceDirtyAfterInterpolation && !syncSourceTexture())
+	{
+		REF_PTR_RELEASE (pDestSurface);
 		return;
+	}
 
 	const Bool destinationBorderDirty = m_clearDstTexture;
 	const rts::render::W3DShroudDestinationUpdateDecision updateDecision =
