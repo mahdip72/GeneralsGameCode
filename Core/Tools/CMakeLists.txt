@@ -22,6 +22,7 @@ if(RTS_BUILD_CORE_EXTRAS)
         add_subdirectory(RuntimeEpochContractTest)
         add_subdirectory(NetworkWireContractTest)
         add_subdirectory(PersistPointerTokenTest)
+        add_subdirectory(ChunkIOValueReadTest)
     endif()
 
     if(WIN32)
