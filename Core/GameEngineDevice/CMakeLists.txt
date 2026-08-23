@@ -280,19 +280,34 @@ if(RTS_BUILD_OPTION_FFMPEG)
         )
         target_compile_features(rts_ffmpeg_audio_decoder PUBLIC cxx_std_20)
 
-        target_sources(corei_gameenginedevice_private INTERFACE
+        add_library(rts_ffmpeg_movie_playback STATIC
             Include/VideoDevice/FFmpeg/FFmpegFile.h
-            Include/VideoDevice/FFmpeg/FFmpegVideoPlayer.h
+            Include/VideoDevice/FFmpeg/FFmpegMoviePlayback.h
             Source/VideoDevice/FFmpeg/FFmpegFile.cpp
-            Source/VideoDevice/FFmpeg/FFmpegVideoPlayer.cpp
+            Source/VideoDevice/FFmpeg/FFmpegMoviePlayback.cpp
         )
-        target_link_libraries(corei_gameenginedevice_private INTERFACE
+        target_include_directories(rts_ffmpeg_movie_playback PUBLIC Include)
+        target_link_libraries(rts_ffmpeg_movie_playback PUBLIC
+            corei_gameengine_include
+            corei_libraries_include
+            core_utility_no_pch
             rts_ffmpeg_audio_decoder
             FFMPEG::avcodec
             FFMPEG::avformat
             FFMPEG::avutil
             FFMPEG::swresample
             FFMPEG::swscale
+        )
+        target_compile_features(rts_ffmpeg_movie_playback PUBLIC cxx_std_20)
+        target_precompile_headers(rts_ffmpeg_movie_playback PRIVATE <type_traits>)
+
+        target_sources(corei_gameenginedevice_private INTERFACE
+            Include/VideoDevice/FFmpeg/FFmpegFile.h
+            Include/VideoDevice/FFmpeg/FFmpegVideoPlayer.h
+            Source/VideoDevice/FFmpeg/FFmpegVideoPlayer.cpp
+        )
+        target_link_libraries(corei_gameenginedevice_private INTERFACE
+            rts_ffmpeg_movie_playback
         )
         target_compile_definitions(corei_gameenginedevice_public INTERFACE RTS_HAS_FFMPEG)
     endif()
@@ -317,10 +332,12 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32)
         Include/XAudio2AudioDevice/XAudio2AudioService.h
         Include/XAudio2AudioDevice/XAudio2CallbackGate.h
         Include/XAudio2AudioDevice/XAudio2FailurePublication.h
+        Include/XAudio2AudioDevice/XAudio2MoviePcmSink.h
         Include/XAudio2AudioDevice/XAudio2NativeAudioEngine.h
         Source/XAudio2AudioDevice/XAudio2AudioService.cpp
         Source/XAudio2AudioDevice/XAudio2CallbackGate.cpp
         Source/XAudio2AudioDevice/XAudio2FailurePublication.cpp
+        Source/XAudio2AudioDevice/XAudio2MoviePcmSink.cpp
         Source/XAudio2AudioDevice/XAudio2NativeAudioEngine.cpp
     )
     target_include_directories(rts_xaudio2_audio_service PUBLIC Include)

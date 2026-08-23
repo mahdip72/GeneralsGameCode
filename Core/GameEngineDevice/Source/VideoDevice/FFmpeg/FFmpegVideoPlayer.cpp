@@ -32,14 +32,18 @@
 
 #include "Lib/BaseType.h"
 #include "VideoDevice/FFmpeg/FFmpegVideoPlayer.h"
-#include "Common/AudioAffect.h"
-#include "Common/GameAudio.h"
 #include "Common/GameMemory.h"
 #include "Common/GlobalData.h"
 #include "Common/Registry.h"
 #include "Common/FileSystem.h"
 
 #include "VideoDevice/FFmpeg/FFmpegFile.h"
+#include "VideoDevice/FFmpeg/FFmpegMoviePlayback.h"
+
+#if defined(_WIN64)
+#include "XAudio2AudioDevice/XAudio2AudioService.h"
+#include "XAudio2AudioDevice/XAudio2MoviePcmSink.h"
+#endif
 
 extern "C" {
 	#include <libavcodec/avcodec.h>
@@ -134,6 +138,15 @@ void	FFmpegVideoPlayer::init()
 {
 	// Need to load the stuff from the ini file.
 	VideoPlayer::init();
+#if defined(_WIN64)
+	if (m_audioService == nullptr) {
+		m_audioService = NEW XAudio2AudioService();
+		if (m_audioService != nullptr && !m_audioService->open()) {
+			delete m_audioService;
+			m_audioService = nullptr;
+		}
+	}
+#endif
 
 }
 
@@ -144,6 +157,13 @@ void	FFmpegVideoPlayer::init()
 void FFmpegVideoPlayer::deinit()
 {
 	closeAllStreams();
+#if defined(_WIN64)
+	if (m_audioService != nullptr) {
+		m_audioService->shutdown();
+		delete m_audioService;
+		m_audioService = nullptr;
+	}
+#endif
 	VideoPlayer::deinit();
 }
 
@@ -162,8 +182,17 @@ void	FFmpegVideoPlayer::reset()
 
 void	FFmpegVideoPlayer::update()
 {
+#if defined(_WIN64)
+	if (m_audioService != nullptr) {
+		m_audioService->serviceVoices();
+	}
+#endif
 	VideoPlayer::update();
-
+#if defined(_WIN64)
+	if (m_audioService != nullptr) {
+		m_audioService->serviceVoices();
+	}
+#endif
 }
 
 //============================================================================
@@ -203,8 +232,21 @@ VideoStreamInterface* FFmpegVideoPlayer::createStream( File* file )
 		return nullptr;
 	}
 
-	FFmpegVideoStream *stream = NEW FFmpegVideoStream(ffmpegHandle);
+	AudioPcmSink *audioSink = nullptr;
+#if defined(_WIN64)
+	if (m_audioService != nullptr && m_audioService->isOpen()) {
+		XAudio2MoviePcmSink *movieSink = NEW XAudio2MoviePcmSink(*m_audioService);
+		if (movieSink != nullptr && movieSink->isReady()) {
+			audioSink = movieSink;
+		} else {
+			delete movieSink;
+		}
+	}
+#endif
+
+	FFmpegVideoStream *stream = NEW FFmpegVideoStream(ffmpegHandle, audioSink);
 	if (stream == nullptr) {
+		delete audioSink;
 		delete ffmpegHandle;
 		return nullptr;
 	}
@@ -220,13 +262,7 @@ VideoStreamInterface* FFmpegVideoPlayer::createStream( File* file )
 		stream->m_player = this;
 		m_firstStream = stream;
 
-		// never let volume go to 0, as Bink will interpret that as "play at full volume".
-		Int mod = (Int) ((TheAudio->getVolume(AudioAffect_Speech) * 0.8f) * 100) + 1;
-		[[maybe_unused]]  Int volume = (32768 * mod) / 100;
-		DEBUG_LOG(("FFmpegVideoPlayer::createStream() - About to set volume (%g -> %d -> %d",
-			TheAudio->getVolume(AudioAffect_Speech), mod, volume));
-		//BinkSetVolume( stream->m_handle,0, volume);
-		DEBUG_LOG(("FFmpegVideoPlayer::createStream() - set volume"));
+		DEBUG_LOG(("FFmpegVideoPlayer::createStream() - typed movie audio sink selected"));
 	}
 
 	return stream;
@@ -295,15 +331,26 @@ void FFmpegVideoPlayer::notifyVideoPlayerOfNewProvider( Bool nowHasValid )
 // FFmpegVideoStream::FFmpegVideoStream
 //============================================================================
 
-FFmpegVideoStream::FFmpegVideoStream(FFmpegFile* file)
-: m_ffmpegFile(file)
+FFmpegVideoStream::FFmpegVideoStream(FFmpegFile* file, AudioPcmSink *audioSink)
+: m_ffmpegFile(file), m_audioSink(audioSink)
 {
-	m_ffmpegFile->setFrameCallback(onFrame);
-	m_ffmpegFile->setUserData(this);
+	if (m_ffmpegFile == nullptr) {
+		m_good = false;
+		return;
+	}
+	FFmpegMoviePlaybackOptions options;
+	options.mode = FFmpegMoviePlaybackMode::SHOW_LAST_FRAME;
+	m_playback = NEW FFmpegMoviePlayback(*m_ffmpegFile, m_audioSink, options);
+	if (m_playback == nullptr) {
+		m_good = false;
+		return;
+	}
+	m_playback->setVideoCallback(
+		static_cast<void (*)(const AVFrame *, const FFmpegFrameMetadata &, void *)>(&FFmpegVideoStream::onFrame), this);
 
 	// Decode until we have our first video frame
 	while (m_good && m_gotFrame == false)
-		m_good = m_ffmpegFile->decodePacket();
+		m_good = m_playback->pump(64);
 
 	m_startTime = getMonotonicMilliseconds();
 }
@@ -316,13 +363,21 @@ FFmpegVideoStream::~FFmpegVideoStream()
 {
 	av_frame_free(&m_frame);
 	sws_freeContext(m_swsContext);
+	if (m_audioSink != nullptr) {
+		m_audioSink->reset(m_playback != nullptr ? m_playback->generation() : 0);
+#if defined(_WIN64)
+		static_cast<XAudio2MoviePcmSink *>(m_audioSink)->close();
+#endif
+	}
+	delete m_playback;
+	delete m_audioSink;
 	delete m_ffmpegFile;
 }
 
-void FFmpegVideoStream::onFrame(AVFrame *frame, int stream_idx, int stream_type, void *user_data)
+void FFmpegVideoStream::onFrame(const AVFrame *frame, const FFmpegFrameMetadata &metadata, void *user_data)
 {
 	FFmpegVideoStream *videoStream = static_cast<FFmpegVideoStream *>(user_data);
-	if (stream_type == AVMEDIA_TYPE_VIDEO) {
+	if (videoStream != nullptr && metadata.streamType == AVMEDIA_TYPE_VIDEO) {
 		AVFrame *cloned_frame = av_frame_clone(frame);
 		if (cloned_frame != nullptr) {
 			av_frame_free(&videoStream->m_frame);
@@ -339,7 +394,12 @@ void FFmpegVideoStream::onFrame(AVFrame *frame, int stream_idx, int stream_type,
 
 void FFmpegVideoStream::update()
 {
-	//BinkWait( m_handle );
+	if (!m_good || m_playback == nullptr || m_playback->isTerminal()) {
+		return;
+	}
+	if (!m_playback->pump(32) && !m_playback->isTerminal()) {
+		m_good = false;
+	}
 }
 
 //============================================================================
@@ -348,10 +408,7 @@ void FFmpegVideoStream::update()
 
 Bool FFmpegVideoStream::isFrameReady()
 {
-	const UnsignedInt64 time = getMonotonicMilliseconds();
-	const UnsignedInt64 elapsed = time >= m_startTime ? time - m_startTime : 0;
-	const UnsignedInt64 target = static_cast<UnsignedInt64>(m_ffmpegFile->getFrameTime()) * frameIndex();
-	return m_gotFrame && elapsed >= target;
+	return m_good && m_playback != nullptr && m_gotFrame && m_playback->isFrameReady();
 
 	//return !BinkWait( m_handle );
 }
@@ -445,16 +502,29 @@ void FFmpegVideoStream::frameRender( VideoBuffer *buffer )
 
 void FFmpegVideoStream::frameNext()
 {
+	if (!m_good || m_playback == nullptr) {
+		return;
+	}
+	if (m_playback->isTerminal()) {
+		m_gotFrame = m_playback->hasCurrentFrame();
+		return;
+	}
+	const Int previousFrame = m_playback->frameIndex();
 	m_gotFrame = false;
-	// Decode until we have our next video frame
-	while (m_good && m_gotFrame == false)
-		m_good = m_ffmpegFile->decodePacket();
-
-	if (!m_good && !m_gotFrame && m_ffmpegFile->isAtEnd() && m_ffmpegFile->seekFrame(0)) {
-		m_good = true;
-		while (m_good && !m_gotFrame)
-			m_good = m_ffmpegFile->decodePacket();
-		m_startTime = getMonotonicMilliseconds();
+	for (std::size_t attempts = 0; attempts < 256 && !m_playback->isTerminal(); ++attempts) {
+		if (!m_playback->pump(32)) {
+			if (!m_playback->isTerminal()) {
+				m_good = false;
+			}
+			break;
+		}
+		if (m_playback->hasCurrentFrame() && m_playback->frameIndex() != previousFrame) {
+			m_gotFrame = true;
+			break;
+		}
+	}
+	if (!m_gotFrame && m_playback->isTerminal()) {
+		m_gotFrame = m_playback->hasCurrentFrame();
 	}
 }
 
@@ -489,7 +559,7 @@ void FFmpegVideoStream::frameGoto( Int index )
 		index = 0;
 	}
 
-	if (!m_ffmpegFile->seekFrame(index)) {
+	if (m_playback == nullptr || !m_playback->seekFrame(index)) {
 		av_frame_free(&m_frame);
 		m_gotFrame = false;
 		m_good = false;
@@ -499,12 +569,18 @@ void FFmpegVideoStream::frameGoto( Int index )
 	av_frame_free(&m_frame);
 	m_gotFrame = false;
 	m_good = true;
-	while (m_good && !m_gotFrame)
-		m_good = m_ffmpegFile->decodePacket();
+	for (std::size_t attempts = 0; attempts < 256 && m_good && !m_gotFrame; ++attempts) {
+		const Int targetFrame = index;
+		if (!m_playback->pump(32)) {
+			m_good = m_playback->isTerminal();
+			break;
+		}
+		if (m_playback->hasCurrentFrame() && m_playback->frameIndex() >= targetFrame) {
+			m_gotFrame = true;
+		}
+	}
 
-	const UnsignedInt64 now = getMonotonicMilliseconds();
-	const UnsignedInt64 elapsed = static_cast<UnsignedInt64>(m_ffmpegFile->getFrameTime()) * frameIndex();
-	m_startTime = now >= elapsed ? now - elapsed : 0;
+	m_startTime = getMonotonicMilliseconds();
 }
 
 //============================================================================

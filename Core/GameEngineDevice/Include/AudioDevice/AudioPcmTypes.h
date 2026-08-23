@@ -12,7 +12,8 @@ enum class AudioPcmFormat : std::uint8_t
 enum class AudioPcmSubmitResult : std::uint8_t
 {
 	ACCEPTED,
-	DROPPED
+	DROPPED,
+	FAILED
 };
 
 struct AudioPcmChunk
@@ -32,7 +33,15 @@ class AudioPcmSink
 {
 public:
 	virtual ~AudioPcmSink() = default;
-	// Submission always consumes the chunk. A bounded sink reports DROPPED instead of asking the decoder to retry consumed input.
+	// Submission always consumes the chunk. A bounded sink reports DROPPED
+	// instead of asking the decoder to retry consumed input; FAILED is terminal.
 	virtual AudioPcmSubmitResult submit(AudioPcmChunk &&chunk) = 0;
 	virtual void reset(std::uint64_t generation) = 0;
+	// Optional owner-provided playback position for audio-master video timing.
+	// Sinks without a hardware/playback clock use the injected monotonic fallback.
+	virtual bool getPlayedSample(std::int64_t &sample) const noexcept
+	{
+		(void)sample;
+		return false;
+	}
 };

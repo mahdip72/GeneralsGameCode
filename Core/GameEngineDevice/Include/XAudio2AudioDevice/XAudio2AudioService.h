@@ -74,6 +74,7 @@ public:
 	bool isVoiceOpen(XAudio2PcmVoiceHandle handle) const noexcept;
 	bool isVoiceFailed(XAudio2PcmVoiceHandle handle) const noexcept;
 	HRESULT getVoiceLastError(XAudio2PcmVoiceHandle handle) const noexcept;
+	bool getVoicePlayedSample(XAudio2PcmVoiceHandle handle, std::int64_t &sample) const noexcept;
 
 private:
 	struct VoiceRecord

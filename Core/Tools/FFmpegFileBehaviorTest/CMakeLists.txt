@@ -6,21 +6,10 @@ endif()
 
 add_executable(core_ffmpeg_file_behavior_test
     FFmpegFileBehaviorTest.cpp
-    ${CMAKE_SOURCE_DIR}/Core/GameEngineDevice/Source/VideoDevice/FFmpeg/FFmpegFile.cpp
-)
-
-target_include_directories(core_ffmpeg_file_behavior_test BEFORE PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/Support
-    ${CMAKE_SOURCE_DIR}/Core/GameEngineDevice/Include
 )
 
 target_link_libraries(core_ffmpeg_file_behavior_test PRIVATE
-    corei_gameengine_include
-    corei_libraries_include
-    core_utility_no_pch
-    FFMPEG::avcodec
-    FFMPEG::avformat
-    FFMPEG::avutil
+    rts_ffmpeg_movie_playback
 )
 
 set_target_properties(core_ffmpeg_file_behavior_test PROPERTIES

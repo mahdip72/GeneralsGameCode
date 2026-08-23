@@ -257,6 +257,25 @@ void testValidationAndClosedAdmission()
 	check(backend.submitCalls == 0, "closed submissions do not call the backend");
 }
 
+void testPlayedSampleClockAndGeneration()
+{
+	FakePcmVoiceBackend backend;
+	XAudio2PcmVoice voice(backend);
+	check(voice.open(), "clock test voice opens");
+	std::int64_t playedSample = 0;
+	check(!voice.getPlayedSample(playedSample), "clock is unavailable before a buffer completes");
+	check(voice.submit(makeChunk(0, 0, 7)) == AudioPcmSubmitResult::ACCEPTED,
+		"clock test admits its buffer");
+	voice.service();
+	check(!voice.getPlayedSample(playedSample), "clock remains unavailable while the buffer is queued");
+	backend.complete(0);
+	check(voice.getPlayedSample(playedSample) && playedSample == 2,
+		"buffer completion publishes the played sample position");
+	voice.reset(1);
+	check(!voice.getPlayedSample(playedSample), "generation reset rebases the played sample clock");
+	voice.close();
+}
+
 void testResetBarrierAndGenerationActivation()
 {
 	FakePcmVoiceBackend backend;
@@ -444,6 +463,7 @@ int main()
 	testFixedFormatAndBoundedAdmission();
 	testOwnedStorageAndOwnerOnlyReclaim();
 	testValidationAndClosedAdmission();
+	testPlayedSampleClockAndGeneration();
 	testResetBarrierAndGenerationActivation();
 	testSameGenerationResetBarrier();
 	testTerminalFailures();

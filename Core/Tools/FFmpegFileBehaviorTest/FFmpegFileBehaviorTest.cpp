@@ -1,4 +1,3 @@
-#include "Common/File.h"
 #include "VideoDevice/FFmpeg/FFmpegFile.h"
 
 extern "C" {
@@ -13,7 +12,7 @@ extern "C" {
 #include <iterator>
 #include <vector>
 
-class MemoryTestFile final : public File
+class MemoryTestFile final : public FFmpegFileSource
 {
 public:
 	explicit MemoryTestFile(const char *path)
@@ -37,7 +36,7 @@ public:
 		return static_cast<Int>(count);
 	}
 
-	Int seek(Int offset, seekMode mode) override
+	Int64 seek(Int64 offset, FFmpegFileSeekMode mode) override
 	{
 		++m_seekCount;
 		if (m_closed) {
@@ -46,12 +45,12 @@ public:
 
 		Int64 base = 0;
 		switch (mode) {
-			case START:
+			case FFmpegFileSeekMode::START:
 				break;
-			case CURRENT:
+			case FFmpegFileSeekMode::CURRENT:
 				base = static_cast<Int64>(m_position);
 				break;
-			case END:
+			case FFmpegFileSeekMode::END:
 				base = static_cast<Int64>(m_data.size());
 				break;
 		}
@@ -61,10 +60,10 @@ public:
 			return -1;
 		}
 		m_position = static_cast<size_t>(target);
-		return static_cast<Int>(m_position);
+		return static_cast<Int64>(m_position);
 	}
 
-	Int size() override { return static_cast<Int>(m_data.size()); }
+	Int64 size() const override { return static_cast<Int64>(m_data.size()); }
 	void close() override
 	{
 		++m_closeCount;
@@ -94,9 +93,9 @@ struct DecodeState
 	std::vector<Int64> timestamps;
 };
 
-static void onFrame(AVFrame *frame, int, int stream_type, void *user_data)
+static void onFrame(const AVFrame *frame, const FFmpegFrameMetadata &metadata, void *user_data)
 {
-	if (stream_type != AVMEDIA_TYPE_VIDEO) {
+	if (metadata.streamType != AVMEDIA_TYPE_VIDEO) {
 		return;
 	}
 
@@ -131,7 +130,7 @@ int main(int argc, char **argv)
 		DecodeState state { &decoder };
 		decoder.setFrameCallback(onFrame);
 		decoder.setUserData(&state);
-		if (!decoder.open(&file)) {
+		if (!decoder.open(file)) {
 			std::fputs("FFmpegFile failed to open the generated movie.\n", stderr);
 			return 1;
 		}

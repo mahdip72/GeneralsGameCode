@@ -311,6 +311,10 @@ bool FFmpegAudioDecoder::submitSamples(std::uint32_t capacity, const std::uint8_
 	}
 	const std::int64_t next_sample = start_sample + chunk.frameCount;
 	const AudioPcmSubmitResult result = sink.submit(std::move(chunk));
+	if (result == AudioPcmSubmitResult::FAILED) {
+		m_failed = true;
+		return false;
+	}
 
 	++m_sequence;
 	m_nextSample = next_sample;

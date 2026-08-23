@@ -50,6 +50,7 @@ public:
 
 	AudioPcmSubmitResult submit(AudioPcmChunk &&chunk) override;
 	void reset(std::uint64_t generation) override;
+	bool getPlayedSample(std::int64_t &sample) const noexcept override;
 
 	void STDMETHODCALLTYPE OnVoiceProcessingPassStart(UINT32 BytesRequired) override;
 	void STDMETHODCALLTYPE OnVoiceProcessingPassEnd() override;
@@ -98,6 +99,8 @@ private:
 	std::atomic<bool> m_callbackError;
 	std::atomic<HRESULT> m_callbackErrorCode;
 	std::atomic<HRESULT> m_lastError;
+	std::atomic<std::int64_t> m_playedSample;
+	std::atomic<std::uint64_t> m_playedGeneration;
 	std::uint64_t m_requestedGeneration;
 	std::uint64_t m_activeGeneration;
 	bool m_resetPending;

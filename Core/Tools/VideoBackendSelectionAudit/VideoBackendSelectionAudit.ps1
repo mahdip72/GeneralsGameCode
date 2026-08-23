@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)]
-    [string]$SourceRoot
+    [string]$SourceRoot,
+    [switch]$SelfTest
 )
 
 $ErrorActionPreference = 'Stop'
@@ -16,6 +17,46 @@ function Assert-TokenCount {
     if ([regex]::Matches($Content, $Pattern).Count -ne $ExpectedCount) {
         throw $FailureMessage
     }
+}
+
+function Assert-ExactConditionalBlock {
+    param(
+        [string]$Content,
+        [string]$Open,
+        [string]$Body,
+        [string]$Close,
+        [string]$FailureMessage
+    )
+
+    $normalized = $Content -replace "`r`n", "`n"
+    $pattern = '(?m)^' + [regex]::Escape($Open) + "`n" + [regex]::Escape($Body) + "`n" + [regex]::Escape($Close) + '$'
+    if ([regex]::Matches($normalized, $pattern).Count -ne 1) {
+        throw $FailureMessage
+    }
+}
+
+if ($SelfTest) {
+    $valid = "    if(NOT RTS_BUILD_OPTION_FFMPEG)`n        include(cmake/bink.cmake)`n    endif()"
+    Assert-ExactConditionalBlock $valid '    if(NOT RTS_BUILD_OPTION_FFMPEG)' '        include(cmake/bink.cmake)' '    endif()' 'Valid conditional block was rejected.'
+
+    $wrongCondition = "    if(RTS_BUILD_OPTION_FFMPEG)`n        include(cmake/bink.cmake)`n    endif()"
+    try {
+        Assert-ExactConditionalBlock $wrongCondition '    if(NOT RTS_BUILD_OPTION_FFMPEG)' '        include(cmake/bink.cmake)' '    endif()' 'Malformed condition was accepted.'
+        throw 'Negative conditional self-test did not reject a wrong condition.'
+    } catch {
+        if ($_.Exception.Message -eq 'Negative conditional self-test did not reject a wrong condition.') { throw }
+    }
+
+    $duplicate = $valid + "`n" + $valid
+    try {
+        Assert-ExactConditionalBlock $duplicate '    if(NOT RTS_BUILD_OPTION_FFMPEG)' '        include(cmake/bink.cmake)' '    endif()' 'Duplicate conditional block was accepted.'
+        throw 'Negative conditional self-test did not reject a duplicate block.'
+    } catch {
+        if ($_.Exception.Message -eq 'Negative conditional self-test did not reject a duplicate block.') { throw }
+    }
+
+    Write-Output 'Video backend selection audit negative self-test passed.'
+    exit 0
 }
 
 $headers = @(
@@ -46,6 +87,7 @@ $runtimeCMake = Get-Content -LiteralPath (Join-Path $SourceRoot 'cmake/legacy-pr
 if ($runtimeCMake -notmatch '(?ms)^    if\(NOT RTS_BUILD_OPTION_FFMPEG\)\s*^        target_link_libraries\(rts_legacy_product_runtime INTERFACE binkstub\)\s*^    endif\(\)') {
     throw 'Bink link ownership is not conditional on the FFmpeg backend option.'
 }
+Assert-ExactConditionalBlock $runtimeCMake '    if(NOT RTS_BUILD_OPTION_FFMPEG)' '        target_link_libraries(rts_legacy_product_runtime INTERFACE binkstub)' '    endif()' 'Bink link conditional block is not exact.'
 Assert-TokenCount $runtimeCMake 'binkstub' 1 'Bink runtime link ownership is ambiguous.'
 
 $rootCMake = Get-Content -LiteralPath (Join-Path $SourceRoot 'CMakeLists.txt') -Raw
@@ -57,6 +99,7 @@ if ($configIndex -lt 0 -or $binkIndex -lt 0 -or $configIndex -ge $binkIndex) {
 if ($rootCMake -notmatch '(?ms)^    if\(NOT RTS_BUILD_OPTION_FFMPEG\)\s*^        include\(cmake/bink\.cmake\)\s*^    endif\(\)') {
     throw 'Bink dependency fetch is not conditional on the FFmpeg backend option.'
 }
+Assert-ExactConditionalBlock $rootCMake '    if(NOT RTS_BUILD_OPTION_FFMPEG)' '        include(cmake/bink.cmake)' '    endif()' 'Bink fetch conditional block is not exact.'
 Assert-TokenCount $rootCMake 'include\(cmake/bink\.cmake\)' 1 'Bink dependency fetch ownership is ambiguous.'
 
 $runtimeTestsCMake = Get-Content -LiteralPath (Join-Path $SourceRoot 'GeneralsMD/Code/Tools/RuntimeRegressionTests/CMakeLists.txt') -Raw

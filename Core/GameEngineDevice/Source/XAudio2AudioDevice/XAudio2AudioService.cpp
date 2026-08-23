@@ -420,6 +420,13 @@ HRESULT XAudio2AudioService::getVoiceLastError(XAudio2PcmVoiceHandle handle) con
 	return isHandleOwnedLocked(handle) ? m_voices[handle.index].voice->getLastError() : E_HANDLE;
 }
 
+bool XAudio2AudioService::getVoicePlayedSample(XAudio2PcmVoiceHandle handle,
+	std::int64_t &sample) const noexcept
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	return isHandleOwnedLocked(handle) && m_voices[handle.index].voice->getPlayedSample(sample);
+}
+
 void XAudio2AudioService::serviceVoices() noexcept
 {
 	std::lock_guard<std::mutex> lock(m_mutex);

@@ -26,6 +26,8 @@
 // Stephan Vedder, April 2025
 /////////////////////////////////////////////////
 
+#include <Utility/CppMacros.h>
+
 #include "VideoDevice/FFmpeg/FFmpegFile.h"
 #include "Common/Debug.h"
 #include "Common/File.h"
@@ -41,6 +43,56 @@ extern "C" {
 #include <cmath>
 #include <limits>
 
+namespace
+{
+class GameFileSource final : public FFmpegFileSource
+{
+public:
+	explicit GameFileSource(File *file) : m_file(file) {}
+
+	Int read(void *buffer, Int bytes) override
+	{
+		return m_file == nullptr ? -1 : m_file->read(buffer, bytes);
+	}
+
+	Int64 seek(Int64 offset, FFmpegFileSeekMode mode) override
+	{
+		if (m_file == nullptr || offset < (std::numeric_limits<Int>::min)()
+			|| offset > (std::numeric_limits<Int>::max)()) {
+			return -1;
+		}
+		File::seekMode fileMode = File::CURRENT;
+		switch (mode) {
+			case FFmpegFileSeekMode::START:
+				fileMode = File::START;
+				break;
+			case FFmpegFileSeekMode::CURRENT:
+				fileMode = File::CURRENT;
+				break;
+			case FFmpegFileSeekMode::END:
+				fileMode = File::END;
+				break;
+		}
+		return m_file->seek(static_cast<Int>(offset), fileMode);
+	}
+
+	Int64 size() const override
+	{
+		return m_file == nullptr ? -1 : m_file->size();
+	}
+
+	void close() override
+	{
+		if (m_file != nullptr) {
+			m_file->close();
+			m_file = nullptr;
+		}
+	}
+
+private:
+	File *m_file;
+};
+}
 
 FFmpegFile::FFmpegFile() {}
 
@@ -56,9 +108,18 @@ FFmpegFile::~FFmpegFile()
 
 Bool FFmpegFile::open(File *file)
 {
-	DEBUG_ASSERTCRASH(m_file == nullptr, ("already open"));
 	DEBUG_ASSERTCRASH(file != nullptr, ("null file pointer"));
-	if (m_file != nullptr || file == nullptr) {
+	if (file == nullptr || m_source != nullptr || m_fmtCtx != nullptr) {
+		return false;
+	}
+	m_ownedSource = std::make_unique<GameFileSource>(file);
+	return open(*m_ownedSource);
+}
+
+Bool FFmpegFile::open(FFmpegFileSource &source)
+{
+	DEBUG_ASSERTCRASH(m_source == nullptr, ("already open"));
+	if (m_source != nullptr || m_fmtCtx != nullptr) {
 		return false;
 	}
 #if LOGGING_LEVEL != LOGLEVEL_NONE
@@ -70,7 +131,7 @@ Bool FFmpegFile::open(File *file)
 	av_register_all();
 #endif
 
-	m_file = file;
+	m_source = &source;
 
 	// FFmpeg setup
 	m_fmtCtx = avformat_alloc_context();
@@ -88,7 +149,7 @@ Bool FFmpegFile::open(File *file)
 		return false;
 	}
 
-	m_avioCtx = avio_alloc_context(buffer, avio_ctx_buffer_size, 0, file, &readPacket, nullptr, &seekPacket);
+	m_avioCtx = avio_alloc_context(buffer, avio_ctx_buffer_size, 0, &source, &readPacket, nullptr, &seekPacket);
 	if (m_avioCtx == nullptr) {
 		DEBUG_LOG(("Failed to alloc AVIOContext"));
 		av_free(buffer);
@@ -147,6 +208,8 @@ Bool FFmpegFile::open(File *file)
 		output_stream.codec = input_codec;
 		output_stream.stream_type = input_codec->type;
 		output_stream.stream_idx = stream_idx;
+		output_stream.time_base_num = av_stream->time_base.num;
+		output_stream.time_base_den = av_stream->time_base.den;
 
 		AVCodecContext *codec_ctx = avcodec_alloc_context3(input_codec);
 		if (codec_ctx == nullptr) {
@@ -222,11 +285,11 @@ Bool FFmpegFile::open(File *file)
  */
 int FFmpegFile::readPacket(void *opaque, uint8_t *buf, int buf_size)
 {
-	File *file = static_cast<File *>(opaque);
-	if (file == nullptr || buf == nullptr || buf_size <= 0) {
+	FFmpegFileSource *source = static_cast<FFmpegFileSource *>(opaque);
+	if (source == nullptr || buf == nullptr || buf_size <= 0) {
 		return AVERROR(EINVAL);
 	}
-	const int read = file->read(buf, buf_size);
+	const int read = source->read(buf, buf_size);
 
 	// Streaming protocol requires us to return real errors - when we read less equal 0 we're at EOF
 	if (read < 0)
@@ -239,36 +302,32 @@ int FFmpegFile::readPacket(void *opaque, uint8_t *buf, int buf_size)
 
 Int64 FFmpegFile::seekPacket(void *opaque, Int64 offset, Int whence)
 {
-	File *file = static_cast<File *>(opaque);
-	if (file == nullptr) {
+	FFmpegFileSource *source = static_cast<FFmpegFileSource *>(opaque);
+	if (source == nullptr) {
 		return AVERROR(EINVAL);
 	}
 
 	if ((whence & AVSEEK_SIZE) == AVSEEK_SIZE) {
-		return file->size();
+		return source->size();
 	}
 
 	whence &= ~AVSEEK_FORCE;
-	File::seekMode mode;
+	FFmpegFileSeekMode mode;
 	switch (whence) {
 		case SEEK_SET:
-			mode = File::START;
+			mode = FFmpegFileSeekMode::START;
 			break;
 		case SEEK_CUR:
-			mode = File::CURRENT;
+			mode = FFmpegFileSeekMode::CURRENT;
 			break;
 		case SEEK_END:
-			mode = File::END;
+			mode = FFmpegFileSeekMode::END;
 			break;
 		default:
 			return AVERROR(EINVAL);
 	}
 
-	if (offset < INT_MIN || offset > INT_MAX) {
-		return AVERROR(EINVAL);
-	}
-
-	const Int position = file->seek(static_cast<Int>(offset), mode);
+	const Int64 position = source->seek(offset, mode);
 	return position < 0 ? AVERROR(EIO) : position;
 }
 
@@ -310,10 +369,11 @@ void FFmpegFile::close()
 	m_seekStreamIndex = -1;
 	m_seekTargetTimestamp = 0;
 
-	if (m_file != nullptr) {
-		m_file->close();
-		m_file = nullptr;
+	if (m_source != nullptr) {
+		m_source->close();
+		m_source = nullptr;
 	}
+	m_ownedSource.reset();
 }
 
 Bool FFmpegFile::decodePacket()
@@ -495,7 +555,19 @@ FFmpegFile::ReceiveResult FFmpegFile::receiveFrame(FFmpegStream &stream)
 		++m_videoFramesDelivered;
 	}
 	if (m_frameCallback != nullptr) {
-		m_frameCallback(stream.frame, stream.stream_idx, stream.stream_type, m_userData);
+		FFmpegFrameMetadata metadata;
+		metadata.streamIndex = stream.stream_idx;
+		metadata.streamType = stream.stream_type;
+		metadata.timeBaseNumerator = stream.time_base_num;
+		metadata.timeBaseDenominator = stream.time_base_den;
+		metadata.presentationTimestamp = stream.frame->best_effort_timestamp;
+		if (metadata.presentationTimestamp == AV_NOPTS_VALUE) {
+			metadata.presentationTimestamp = stream.frame->pts;
+		}
+		if (metadata.presentationTimestamp == AV_NOPTS_VALUE) {
+			metadata.presentationTimestamp = stream.frame->pkt_dts;
+		}
+		m_frameCallback(stream.frame, metadata, m_userData);
 	}
 	av_frame_unref(stream.frame);
 	return ReceiveResult::FRAME_READY;
@@ -695,4 +767,14 @@ UnsignedInt FFmpegFile::getFrameTime() const
 	}
 	return static_cast<UnsignedInt>(std::clamp(
 		std::round(frame_time), 1.0, static_cast<double>(std::numeric_limits<UnsignedInt>::max())));
+}
+
+FFmpegFrameRate FFmpegFile::getVideoFrameRate() const
+{
+	const FFmpegStream *stream = findMatch(AVMEDIA_TYPE_VIDEO);
+	if (m_fmtCtx == nullptr || stream == nullptr || m_fmtCtx->streams[stream->stream_idx] == nullptr) {
+		return {};
+	}
+	const AVRational frame_rate = m_fmtCtx->streams[stream->stream_idx]->avg_frame_rate;
+	return { frame_rate.num, frame_rate.den };
 }

@@ -29,6 +29,8 @@ XAudio2PcmVoice::XAudio2PcmVoice(IXAudio2PcmVoiceBackend &backend) :
 	m_callbackError(false),
 	m_callbackErrorCode(S_OK),
 	m_lastError(S_OK),
+	m_playedSample(-1),
+	m_playedGeneration(0),
 	m_requestedGeneration(0),
 	m_activeGeneration(0),
 	m_resetPending(false),
@@ -81,6 +83,8 @@ bool XAudio2PcmVoice::open()
 	m_callbackError.store(false, std::memory_order_release);
 	m_callbackErrorCode.store(S_OK, std::memory_order_release);
 	m_lastError.store(S_OK, std::memory_order_release);
+	m_playedSample.store(-1, std::memory_order_release);
+	m_playedGeneration.store(m_requestedGeneration, std::memory_order_release);
 	const HRESULT result = m_backend.create(pcmFormat(), this);
 	if (FAILED(result)) {
 		m_lastError.store(result, std::memory_order_release);
@@ -281,7 +285,19 @@ void XAudio2PcmVoice::close()
 	m_activeGeneration = m_requestedGeneration;
 	m_callbackError.store(false, std::memory_order_release);
 	m_callbackErrorCode.store(S_OK, std::memory_order_release);
+	m_playedSample.store(-1, std::memory_order_release);
+	m_playedGeneration.store(m_requestedGeneration, std::memory_order_release);
 	m_failed.store(false, std::memory_order_release);
+}
+
+bool XAudio2PcmVoice::getPlayedSample(std::int64_t &sample) const noexcept
+{
+	const std::int64_t played = m_playedSample.load(std::memory_order_acquire);
+	if (played < 0) {
+		return false;
+	}
+	sample = played;
+	return true;
 }
 
 bool XAudio2PcmVoice::isOpen() const noexcept
@@ -343,6 +359,8 @@ void XAudio2PcmVoice::reset(std::uint64_t generation)
 	std::lock_guard<std::mutex> lock(m_mutex);
 	const bool repeatedPendingReset = m_resetPending && m_requestedGeneration == generation;
 	m_requestedGeneration = generation;
+	m_playedSample.store(-1, std::memory_order_release);
+	m_playedGeneration.store(generation, std::memory_order_release);
 	if (!m_open.load(std::memory_order_acquire)) {
 		m_activeGeneration = generation;
 		m_resetPending = false;
@@ -387,6 +405,17 @@ void STDMETHODCALLTYPE XAudio2PcmVoice::OnBufferEnd(void *pBufferContext)
 {
 	for (Slot &slot : m_slots) {
 		if (pBufferContext == static_cast<void *>(&slot)) {
+			if (slot.generation != m_playedGeneration.load(std::memory_order_acquire)) {
+				slot.callbackComplete.store(true, std::memory_order_release);
+				return;
+			}
+			const std::int64_t endSample = slot.chunk.startSample
+				+ static_cast<std::int64_t>(slot.chunk.frameCount);
+			std::int64_t previousSample = m_playedSample.load(std::memory_order_acquire);
+			while (previousSample < endSample
+				&& !m_playedSample.compare_exchange_weak(previousSample, endSample,
+					std::memory_order_release, std::memory_order_acquire)) {
+			}
 			slot.callbackComplete.store(true, std::memory_order_release);
 			return;
 		}

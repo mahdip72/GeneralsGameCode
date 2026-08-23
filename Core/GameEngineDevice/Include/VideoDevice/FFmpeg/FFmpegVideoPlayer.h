@@ -39,8 +39,15 @@
 //----------------------------------------------------------------------------
 
 class FFmpegFile;
+class FFmpegMoviePlayback;
+class AudioPcmSink;
 struct AVFrame;
 struct SwsContext;
+struct FFmpegFrameMetadata;
+
+#if defined(_WIN64)
+class XAudio2AudioService;
+#endif
 
 //----------------------------------------------------------------------------
 //           Type Defines
@@ -60,13 +67,15 @@ class FFmpegVideoStream : public VideoStream
 		AVFrame 		*m_frame = nullptr;		///< Current frame
 		SwsContext 		*m_swsContext = nullptr;///< SWSContext for scaling
 		FFmpegFile		*m_ffmpegFile;			///< The AVUI abstraction											///< Bink streaming handle;
+		FFmpegMoviePlayback *m_playback = nullptr;
+		AudioPcmSink		*m_audioSink = nullptr;
 		Char			*m_memFile;				///< Pointer to memory resident file
 		UnsignedInt64	m_startTime = 0;		///< Time the stream started
 
-		FFmpegVideoStream(FFmpegFile* file);																///< only BinkVideoPlayer can create these
 		virtual ~FFmpegVideoStream();
+		FFmpegVideoStream(FFmpegFile* file, AudioPcmSink *audioSink);
 
-		static void onFrame(AVFrame *frame, int stream_idx, int stream_type, void *user_data);
+		static void onFrame(const AVFrame *frame, const FFmpegFrameMetadata &metadata, void *user_data);
 	public:
 
 		virtual void update();											///< Update bink stream
@@ -120,6 +129,15 @@ class FFmpegVideoPlayer : public VideoPlayer
 		virtual VideoStreamInterface*	load( AsciiString movieTitle );	///< Load video file in to memory for playback
 
 		virtual void notifyVideoPlayerOfNewProvider( Bool nowHasValid );
+
+#if defined(_WIN64)
+		XAudio2AudioService *audioService() const noexcept { return m_audioService; }
+#endif
+
+	private:
+#if defined(_WIN64)
+		XAudio2AudioService *m_audioService = nullptr;
+#endif
 };
 
 

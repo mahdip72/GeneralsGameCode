@@ -26,6 +26,13 @@ if(RTS_BUILD_CORE_EXTRAS)
             add_subdirectory(FFmpegContractTest)
             add_subdirectory(FFmpegFileBehaviorTest)
             add_subdirectory(FFmpegAudioDecoderTest)
+            add_subdirectory(FFmpegMoviePlaybackTest)
+            add_test(NAME core_ffmpeg_movie_playback_audit
+                COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                    -File "${CMAKE_CURRENT_SOURCE_DIR}/FFmpegMoviePlaybackAudit/FFmpegMoviePlaybackAudit.ps1"
+                    -SourceRoot "${CMAKE_SOURCE_DIR}"
+            )
+            set_tests_properties(core_ffmpeg_movie_playback_audit PROPERTIES TIMEOUT 30)
         endif()
     endif()
     add_subdirectory(JobSystemTest)
@@ -153,6 +160,13 @@ if(WIN32)
             -SourceRoot "${CMAKE_SOURCE_DIR}"
     )
     set_tests_properties(core_video_backend_selection_audit PROPERTIES TIMEOUT 30)
+    add_test(NAME core_video_backend_selection_audit_self_test
+        COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/VideoBackendSelectionAudit/VideoBackendSelectionAudit.ps1"
+            -SourceRoot "${CMAKE_SOURCE_DIR}"
+            -SelfTest
+    )
+    set_tests_properties(core_video_backend_selection_audit_self_test PROPERTIES TIMEOUT 30)
     if(MSVC AND NOT IS_VS6_BUILD)
         add_test(NAME core_video_backend_ffmpeg_graph_audit
             COMMAND powershell -NoProfile -ExecutionPolicy Bypass

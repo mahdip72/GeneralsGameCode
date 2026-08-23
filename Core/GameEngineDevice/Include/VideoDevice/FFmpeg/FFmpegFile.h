@@ -30,7 +30,10 @@
 
 #include <Lib/BaseType.h>
 
+#include <cstdint>
 #include <functional>
+#include <limits>
+#include <memory>
 #include <vector>
 
 struct AVFormatContext;
@@ -41,7 +44,42 @@ struct AVFrame;
 struct AVPacket;
 struct File;
 
-using FFmpegFrameCallback = std::function<void(AVFrame *, int, int, void *)>;
+struct FFmpegFrameMetadata
+{
+	Int streamIndex = -1;
+	Int streamType = -1;
+	Int timeBaseNumerator = 0;
+	Int timeBaseDenominator = 1;
+	std::int64_t presentationTimestamp = (std::numeric_limits<std::int64_t>::min)();
+};
+
+struct FFmpegFrameRate
+{
+	Int numerator = 0;
+	Int denominator = 1;
+};
+
+// Neutral byte-source seam used by the device-free FFmpeg graph.  The
+// production File* overload adapts the game's File contract, while tests can
+// provide deterministic bytes without substituting Common/File.h's ABI.
+enum class FFmpegFileSeekMode : std::uint8_t
+{
+	START,
+	CURRENT,
+	END
+};
+
+class FFmpegFileSource
+{
+public:
+	virtual ~FFmpegFileSource() = default;
+	virtual Int read(void *buffer, Int bytes) = 0;
+	virtual Int64 seek(Int64 offset, FFmpegFileSeekMode mode) = 0;
+	virtual Int64 size() const = 0;
+	virtual void close() = 0;
+};
+
+using FFmpegFrameCallback = std::function<void(const AVFrame *, const FFmpegFrameMetadata &, void *)>;
 
 class FFmpegFile
 {
@@ -52,6 +90,9 @@ public:
 	~FFmpegFile();
 
 	Bool open(File *file);
+	// The caller retains source ownership and must keep it alive until this
+	// FFmpegFile is closed or destroyed.
+	Bool open(FFmpegFileSource &source);
 	void close();
 	void setFrameCallback(FFmpegFrameCallback callback) { m_frameCallback = callback; }
 	void setUserData(void *user_data) { m_userData = user_data; }
@@ -75,6 +116,7 @@ public:
 	Int getCurrentFrame() const;
 	Int getPixelFormat() const;
 	UnsignedInt getFrameTime() const;
+	FFmpegFrameRate getVideoFrameRate() const;
 
 private:
 	struct FFmpegStream
@@ -83,6 +125,8 @@ private:
 		const AVCodec *codec = nullptr;
 		Int stream_idx = -1;
 		Int stream_type = -1;
+		Int time_base_num = 0;
+		Int time_base_den = 1;
 		AVFrame *frame = nullptr;
 		Bool drain_sent = false;
 		Bool drained = false;
@@ -107,7 +151,8 @@ private:
 	AVIOContext 				*m_avioCtx = nullptr; ///< IO context for AVFormat
 	AVPacket 					*m_packet = nullptr; ///< Current packet
 	std::vector<FFmpegStream> 	m_streams; ///< List of streams in the file
-	File 						*m_file = nullptr;	///< File handle for the file
+	FFmpegFileSource 			*m_source = nullptr;	///< Active neutral byte source
+	std::unique_ptr<FFmpegFileSource> m_ownedSource;
 	void 						*m_userData = nullptr; ///< User data for the callback
 	Int 						m_receiveStreamIndex = -1; ///< Decoder with frames still pending
 	size_t 					m_drainStreamIndex = 0; ///< Decoder currently being flushed at EOF
