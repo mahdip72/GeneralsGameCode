@@ -2,6 +2,7 @@
 
 #include "AudioDevice/AudioPcmTypes.h"
 #include "XAudio2AudioDevice/IXAudio2AudioEngineBackend.h"
+#include "XAudio2AudioDevice/XAudio2FailurePublication.h"
 
 #include <atomic>
 #include <cstdint>
@@ -84,8 +85,6 @@ private:
 
 	static void criticalErrorThunk(void *context, HRESULT error) noexcept;
 	static HRESULT normalizeFailure(HRESULT error) noexcept;
-	static HRESULT decodePendingFailure(std::uint64_t pending) noexcept;
-	static std::uint64_t encodePendingFailure(HRESULT error) noexcept;
 	bool processPendingFailureLocked() noexcept;
 	bool isHandleOwnedLocked(XAudio2PcmVoiceHandle handle) const noexcept;
 	XAudio2PcmVoiceHandle invalidHandle() const noexcept;
@@ -96,6 +95,6 @@ private:
 	std::uint64_t m_nextHandleGeneration;
 	std::atomic<XAudio2AudioServiceState> m_state;
 	std::atomic<HRESULT> m_lastError;
-	std::atomic<std::uint64_t> m_pendingCriticalFailure;
-	std::atomic<std::uint64_t> m_failureSequence;
+	XAudio2FailurePublication m_failurePublication;
+	bool m_failureHandled = false;
 };

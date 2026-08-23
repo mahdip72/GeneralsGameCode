@@ -9,6 +9,8 @@ $nativeHeader = Get-Content -LiteralPath (Join-Path $SourceRoot 'Core/GameEngine
 $nativeSource = Get-Content -LiteralPath (Join-Path $SourceRoot 'Core/GameEngineDevice/Source/XAudio2AudioDevice/XAudio2NativeAudioEngine.cpp') -Raw
 $gateHeader = Get-Content -LiteralPath (Join-Path $SourceRoot 'Core/GameEngineDevice/Include/XAudio2AudioDevice/XAudio2CallbackGate.h') -Raw
 $gateSource = Get-Content -LiteralPath (Join-Path $SourceRoot 'Core/GameEngineDevice/Source/XAudio2AudioDevice/XAudio2CallbackGate.cpp') -Raw
+$failureHeader = Get-Content -LiteralPath (Join-Path $SourceRoot 'Core/GameEngineDevice/Include/XAudio2AudioDevice/XAudio2FailurePublication.h') -Raw
+$failureSource = Get-Content -LiteralPath (Join-Path $SourceRoot 'Core/GameEngineDevice/Source/XAudio2AudioDevice/XAudio2FailurePublication.cpp') -Raw
 $deviceCMake = Get-Content -LiteralPath (Join-Path $SourceRoot 'Core/GameEngineDevice/CMakeLists.txt') -Raw
 
 foreach ($text in @($serviceHeader, $serviceSource, $nativeHeader)) {
@@ -52,6 +54,19 @@ foreach ($required in @(
         'm_admission.wait')) {
     if (($gateHeader -notmatch [regex]::Escape($required)) -and ($gateSource -notmatch [regex]::Escape($required)) -and ($deviceCMake -notmatch [regex]::Escape($required))) {
         throw "Callback gate boundary is missing required token: $required"
+    }
+}
+
+foreach ($required in @(
+        'XAudio2FailurePublication.h',
+        'XAudio2FailurePublication.cpp',
+        'publish(',
+        'tryCommit(',
+        'FAILURE_MASK')) {
+    if (($failureHeader -notmatch [regex]::Escape($required)) -and
+        ($failureSource -notmatch [regex]::Escape($required)) -and
+        ($deviceCMake -notmatch [regex]::Escape($required))) {
+        throw "Failure publication boundary is missing required token: $required"
     }
 }
 

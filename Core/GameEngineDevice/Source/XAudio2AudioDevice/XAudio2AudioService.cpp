@@ -5,11 +5,6 @@
 
 #include <new>
 
-namespace
-{
-constexpr HRESULT NORMALIZED_FAILURE = E_FAIL;
-}
-
 XAudio2AudioService::XAudio2AudioService() :
 	XAudio2AudioService(std::make_unique<XAudio2NativeAudioEngine>())
 {
@@ -19,9 +14,7 @@ XAudio2AudioService::XAudio2AudioService(std::unique_ptr<IXAudio2AudioEngineBack
 	m_backend(std::move(backend)),
 	m_nextHandleGeneration(1),
 	m_state(XAudio2AudioServiceState::CLOSED),
-	m_lastError(S_OK),
-	m_pendingCriticalFailure(0),
-	m_failureSequence(0)
+	m_lastError(S_OK)
 {
 	if (m_backend == nullptr) {
 		m_backend = std::make_unique<XAudio2NativeAudioEngine>();
@@ -35,17 +28,7 @@ XAudio2AudioService::~XAudio2AudioService()
 
 HRESULT XAudio2AudioService::normalizeFailure(HRESULT error) noexcept
 {
-	return FAILED(error) ? error : NORMALIZED_FAILURE;
-}
-
-std::uint64_t XAudio2AudioService::encodePendingFailure(HRESULT error) noexcept
-{
-	return static_cast<std::uint64_t>(static_cast<std::uint32_t>(normalizeFailure(error)));
-}
-
-HRESULT XAudio2AudioService::decodePendingFailure(std::uint64_t pending) noexcept
-{
-	return normalizeFailure(static_cast<HRESULT>(static_cast<std::uint32_t>(pending)));
+	return XAudio2FailurePublication::normalize(error);
 }
 
 XAudio2PcmVoiceHandle XAudio2AudioService::invalidHandle() const noexcept
@@ -56,78 +39,102 @@ XAudio2PcmVoiceHandle XAudio2AudioService::invalidHandle() const noexcept
 bool XAudio2AudioService::open()
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
-	if (m_state.load(std::memory_order_acquire) == XAudio2AudioServiceState::RUNNING) {
-		return true;
+	const XAudio2AudioServiceState currentState = m_state.load(std::memory_order_acquire);
+	if (currentState == XAudio2AudioServiceState::RUNNING) {
+		if (m_failurePublication.hasFailure()) {
+			processPendingFailureLocked();
+		}
+		return m_state.load(std::memory_order_acquire) == XAudio2AudioServiceState::RUNNING
+			&& !m_failurePublication.hasFailure();
 	}
-	if (m_state.load(std::memory_order_acquire) != XAudio2AudioServiceState::CLOSED) {
+	if (currentState != XAudio2AudioServiceState::CLOSED) {
 		return false;
 	}
 
+	// A previous failed cycle is consumed only after its resources are closed.
+	// Advance past any retained publication before opening a new generation.
+	m_failurePublication.clear();
+	m_failureHandled = false;
 	m_state.store(XAudio2AudioServiceState::OPENING, std::memory_order_release);
-	m_pendingCriticalFailure.store(0, std::memory_order_release);
 	m_lastError.store(S_OK, std::memory_order_release);
 
+	auto unwind = [this](bool engineStarted, HRESULT fallback) noexcept {
+		// Publish a fallback before changing state so a callback racing the owner
+		// cannot publish a later error and make the result ambiguous.
+		m_failurePublication.publish(fallback);
+		m_state.store(XAudio2AudioServiceState::QUIESCING, std::memory_order_release);
+		if (engineStarted) {
+			const HRESULT stopResult = m_backend->stop();
+			if (FAILED(stopResult)) {
+				m_failurePublication.publish(stopResult);
+			}
+		}
+		const HRESULT closeResult = m_backend->close();
+		if (FAILED(closeResult)) {
+			m_failurePublication.publish(closeResult);
+		}
+		const HRESULT firstFailure = m_failurePublication.failure();
+		m_failurePublication.clear();
+		m_failureHandled = false;
+		m_state.store(XAudio2AudioServiceState::CLOSED, std::memory_order_release);
+		m_lastError.store(firstFailure, std::memory_order_release);
+		return false;
+	};
+
 	HRESULT result = m_backend->open(&XAudio2AudioService::criticalErrorThunk, this);
+	if (FAILED(result)) {
+		// Backend failures and callback failures use the same first-writer latch.
+		m_failurePublication.publish(result);
+	}
 	if (FAILED(result)
 		|| m_state.load(std::memory_order_acquire) != XAudio2AudioServiceState::OPENING
-		|| m_pendingCriticalFailure.load(std::memory_order_acquire) != 0) {
-		const std::uint64_t pending = m_pendingCriticalFailure.load(std::memory_order_acquire);
-		const HRESULT originalFailure = pending != 0
-			? decodePendingFailure(pending)
-			: normalizeFailure(result);
-		m_state.store(XAudio2AudioServiceState::QUIESCING, std::memory_order_release);
-		m_backend->close();
-		m_lastError.store(originalFailure, std::memory_order_release);
-		m_pendingCriticalFailure.store(0, std::memory_order_release);
-		m_state.store(XAudio2AudioServiceState::CLOSED, std::memory_order_release);
-		return false;
+		|| m_failurePublication.hasFailure()) {
+		return unwind(false, normalizeFailure(result));
 	}
 
 	result = m_backend->start();
-	const std::uint64_t pending = m_pendingCriticalFailure.load(std::memory_order_acquire);
-	if (FAILED(result) || pending != 0
+	if (FAILED(result)) {
+		m_failurePublication.publish(result);
+	}
+	if (FAILED(result) || m_failurePublication.hasFailure()
 		|| m_state.load(std::memory_order_acquire) != XAudio2AudioServiceState::OPENING) {
-		const HRESULT originalFailure = pending != 0
-			? decodePendingFailure(pending)
-			: normalizeFailure(result);
-		// A failed StartEngine may have partially started the engine.  Stop is
-		// intentionally attempted once before the common close path.
-		m_state.store(XAudio2AudioServiceState::QUIESCING, std::memory_order_release);
-		m_backend->stop();
-		m_backend->close();
-		m_lastError.store(originalFailure, std::memory_order_release);
-		m_pendingCriticalFailure.store(0, std::memory_order_release);
-		m_state.store(XAudio2AudioServiceState::CLOSED, std::memory_order_release);
-		return false;
+		// Start may have partially initialized the backend, so stop before close.
+		return unwind(true, normalizeFailure(result));
+	}
+
+	const std::uint64_t beforeCommit = m_failurePublication.snapshot();
+	std::uint64_t committedPublication = 0;
+	if (!m_failurePublication.tryCommit(beforeCommit, committedPublication)) {
+		return unwind(true, E_FAIL);
 	}
 
 	XAudio2AudioServiceState expectedState = XAudio2AudioServiceState::OPENING;
-	if (m_state.compare_exchange_strong(expectedState, XAudio2AudioServiceState::RUNNING,
+	if (!m_state.compare_exchange_strong(expectedState, XAudio2AudioServiceState::RUNNING,
 			std::memory_order_acq_rel, std::memory_order_acquire)) {
-		return true;
+		return unwind(true, E_FAIL);
 	}
 
-	const std::uint64_t failedOpen = m_pendingCriticalFailure.load(std::memory_order_acquire);
-	const HRESULT originalFailure = failedOpen != 0
-		? decodePendingFailure(failedOpen)
-		: normalizeFailure(m_lastError.load(std::memory_order_acquire));
-	m_state.store(XAudio2AudioServiceState::QUIESCING, std::memory_order_release);
-	m_backend->stop();
-	m_backend->close();
-	m_pendingCriticalFailure.store(0, std::memory_order_release);
-	m_lastError.store(originalFailure, std::memory_order_release);
-	m_state.store(XAudio2AudioServiceState::CLOSED, std::memory_order_release);
-	return false;
+	// The final publication check is the success linearization point.  A
+	// callback that began before this check either won tryCommit above or makes
+	// this validation fail before open returns success.
+	if (m_failurePublication.snapshot() != committedPublication
+		|| m_failurePublication.hasFailure()
+		|| m_state.load(std::memory_order_acquire) != XAudio2AudioServiceState::RUNNING) {
+		return unwind(true, E_FAIL);
+	}
+	return true;
 }
 
 bool XAudio2AudioService::processPendingFailureLocked() noexcept
 {
-	const std::uint64_t pending = m_pendingCriticalFailure.exchange(0, std::memory_order_acq_rel);
-	if (pending == 0) {
+	if (!m_failurePublication.hasFailure() || m_failureHandled) {
 		return false;
 	}
 
-	const HRESULT error = decodePendingFailure(pending);
+	// Do not clear the latch while the service remains FAILED.  Keeping the
+	// first publication prevents a later callback from replacing the error
+	// before shutdown/reopen establishes a new lifecycle generation.
+	const HRESULT error = m_failurePublication.failure();
 	m_lastError.store(error, std::memory_order_release);
 	const XAudio2AudioServiceState currentState = m_state.load(std::memory_order_acquire);
 	if (currentState != XAudio2AudioServiceState::CLOSED
@@ -139,6 +146,7 @@ bool XAudio2AudioService::processPendingFailureLocked() noexcept
 			record.voice->failFromService(error);
 		}
 	}
+	m_failureHandled = true;
 	return true;
 }
 
@@ -153,6 +161,8 @@ void XAudio2AudioService::shutdown()
 	std::lock_guard<std::mutex> lock(m_mutex);
 	const XAudio2AudioServiceState currentState = m_state.load(std::memory_order_acquire);
 	if (currentState == XAudio2AudioServiceState::CLOSED) {
+		m_failurePublication.clear();
+		m_failureHandled = false;
 		return;
 	}
 	if (currentState == XAudio2AudioServiceState::QUIESCING) {
@@ -162,7 +172,9 @@ void XAudio2AudioService::shutdown()
 	processPendingFailureLocked();
 	m_state.store(XAudio2AudioServiceState::QUIESCING, std::memory_order_release);
 
-	HRESULT firstFailure = m_lastError.load(std::memory_order_acquire);
+	HRESULT firstFailure = m_failurePublication.hasFailure()
+		? m_failurePublication.failure()
+		: m_lastError.load(std::memory_order_acquire);
 	for (VoiceRecord &record : m_voices) {
 		if (record.voice != nullptr) {
 			record.voice->close();
@@ -174,22 +186,27 @@ void XAudio2AudioService::shutdown()
 	m_voices.clear();
 
 	const HRESULT stopResult = m_backend->stop();
-	if (SUCCEEDED(firstFailure) && FAILED(stopResult)) {
-		firstFailure = normalizeFailure(stopResult);
+	if (FAILED(stopResult)) {
+		m_failurePublication.publish(stopResult);
 	}
 	const HRESULT closeResult = m_backend->close();
-	if (SUCCEEDED(firstFailure) && FAILED(closeResult)) {
-		firstFailure = normalizeFailure(closeResult);
+	if (FAILED(closeResult)) {
+		m_failurePublication.publish(closeResult);
 	}
 
-	m_pendingCriticalFailure.store(0, std::memory_order_release);
+	if (m_failurePublication.hasFailure()) {
+		firstFailure = m_failurePublication.failure();
+	}
+	m_failurePublication.clear();
+	m_failureHandled = false;
 	m_state.store(XAudio2AudioServiceState::CLOSED, std::memory_order_release);
 	m_lastError.store(firstFailure, std::memory_order_release);
 }
 
 bool XAudio2AudioService::isOpen() const noexcept
 {
-	return m_state.load(std::memory_order_acquire) == XAudio2AudioServiceState::RUNNING;
+	return m_state.load(std::memory_order_acquire) == XAudio2AudioServiceState::RUNNING
+		&& !m_failurePublication.hasFailure();
 }
 
 XAudio2AudioServiceState XAudio2AudioService::state() const noexcept
@@ -216,7 +233,7 @@ XAudio2PcmVoiceHandle XAudio2AudioService::createVoice() noexcept
 	if (m_state.load(std::memory_order_acquire) != XAudio2AudioServiceState::RUNNING) {
 		return invalidHandle();
 	}
-	const std::uint64_t failureSequence = m_failureSequence.load(std::memory_order_acquire);
+	const std::uint64_t beforeCommit = m_failurePublication.snapshot();
 
 	std::unique_ptr<IXAudio2PcmVoiceBackend> backend;
 	const HRESULT backendResult = m_backend->createPcmVoice(backend);
@@ -225,10 +242,10 @@ XAudio2PcmVoiceHandle XAudio2AudioService::createVoice() noexcept
 			backend->destroy();
 			backend.reset();
 		}
-		if (m_pendingCriticalFailure.load(std::memory_order_acquire) != 0) {
+		if (m_failurePublication.hasFailure()) {
 			processPendingFailureLocked();
 		} else {
-			m_lastError.store(FAILED(backendResult) ? backendResult : NORMALIZED_FAILURE,
+			m_lastError.store(FAILED(backendResult) ? backendResult : normalizeFailure(backendResult),
 				std::memory_order_release);
 		}
 		return invalidHandle();
@@ -239,7 +256,11 @@ XAudio2PcmVoiceHandle XAudio2AudioService::createVoice() noexcept
 		voice = std::make_unique<XAudio2PcmVoice>(*backend);
 	} catch (const std::bad_alloc &) {
 		backend->destroy();
-		m_lastError.store(E_OUTOFMEMORY, std::memory_order_release);
+		if (m_failurePublication.hasFailure()) {
+			processPendingFailureLocked();
+		} else {
+			m_lastError.store(E_OUTOFMEMORY, std::memory_order_release);
+		}
 		return invalidHandle();
 	}
 
@@ -249,7 +270,7 @@ XAudio2PcmVoiceHandle XAudio2AudioService::createVoice() noexcept
 		// when create() fails; the service owns this defensive unwind.
 		backend->destroy();
 		backend.reset();
-		if (m_pendingCriticalFailure.load(std::memory_order_acquire) != 0) {
+		if (m_failurePublication.hasFailure()) {
 			processPendingFailureLocked();
 		} else {
 			m_lastError.store(failure, std::memory_order_release);
@@ -271,21 +292,36 @@ XAudio2PcmVoiceHandle XAudio2AudioService::createVoice() noexcept
 	} catch (const std::bad_alloc &) {
 		voice->close();
 		backend.reset();
-		m_lastError.store(E_OUTOFMEMORY, std::memory_order_release);
+		if (m_failurePublication.hasFailure()) {
+			processPendingFailureLocked();
+		} else {
+			m_lastError.store(E_OUTOFMEMORY, std::memory_order_release);
+		}
 		return invalidHandle();
 	}
 
-	const std::uint64_t pending = m_pendingCriticalFailure.load(std::memory_order_acquire);
-	XAudio2AudioServiceState expectedState = XAudio2AudioServiceState::RUNNING;
-	const bool committed = pending == 0
-		&& m_failureSequence.load(std::memory_order_acquire) == failureSequence
-		&& m_state.compare_exchange_strong(expectedState, XAudio2AudioServiceState::RUNNING,
-			std::memory_order_acq_rel, std::memory_order_acquire);
+	std::uint64_t committedPublication = 0;
+	const bool committed = m_state.load(std::memory_order_acquire)
+		== XAudio2AudioServiceState::RUNNING
+		&& !m_failurePublication.hasFailure()
+		&& m_failurePublication.tryCommit(beforeCommit, committedPublication);
 	if (!committed) {
-		if (pending != 0) {
+		if (m_failurePublication.hasFailure()) {
 			processPendingFailureLocked();
-		} else if (expectedState != XAudio2AudioServiceState::FAILED) {
-			m_lastError.store(NORMALIZED_FAILURE, std::memory_order_release);
+		} else {
+			m_lastError.store(normalizeFailure(E_FAIL), std::memory_order_release);
+		}
+		voice->close();
+		backend.reset();
+		return invalidHandle();
+	}
+	if (m_state.load(std::memory_order_acquire) != XAudio2AudioServiceState::RUNNING
+		|| m_failurePublication.hasFailure()
+		|| m_failurePublication.snapshot() != committedPublication) {
+		if (m_failurePublication.hasFailure()) {
+			processPendingFailureLocked();
+		} else {
+			m_lastError.store(normalizeFailure(E_FAIL), std::memory_order_release);
 		}
 		voice->close();
 		backend.reset();
@@ -411,10 +447,18 @@ void XAudio2AudioService::criticalErrorThunk(void *context, HRESULT error) noexc
 		|| currentState == XAudio2AudioServiceState::QUIESCING) {
 		return;
 	}
-	const std::uint64_t encodedFailure = encodePendingFailure(error);
-	std::uint64_t noFailure = 0;
-	service->m_pendingCriticalFailure.compare_exchange_strong(noFailure, encodedFailure,
-		std::memory_order_acq_rel, std::memory_order_acquire);
-	service->m_failureSequence.fetch_add(1, std::memory_order_acq_rel);
-	service->m_state.store(XAudio2AudioServiceState::FAILED, std::memory_order_release);
+	// The publication CAS is the callback's first observable action.  Owner
+	// transactions compete with this same word, so a callback that began before
+	// their commit cannot be lost behind a separate state/sequence read.
+	service->m_failurePublication.publish(error);
+	XAudio2AudioServiceState expectedState = currentState;
+	while (expectedState != XAudio2AudioServiceState::CLOSED
+		&& expectedState != XAudio2AudioServiceState::QUIESCING
+		&& expectedState != XAudio2AudioServiceState::FAILED) {
+		if (service->m_state.compare_exchange_weak(expectedState,
+				XAudio2AudioServiceState::FAILED, std::memory_order_acq_rel,
+				std::memory_order_acquire)) {
+			break;
+		}
+	}
 }

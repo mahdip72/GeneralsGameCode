@@ -1,6 +1,7 @@
 #include "XAudio2AudioDevice/IXAudio2AudioEngineBackend.h"
 #include "XAudio2AudioDevice/XAudio2CallbackGate.h"
 #include "XAudio2AudioDevice/XAudio2AudioService.h"
+#include "XAudio2AudioDevice/XAudio2FailurePublication.h"
 #include "XAudio2AudioDevice/XAudio2PcmVoice.h"
 
 #include <atomic>
@@ -267,6 +268,33 @@ AudioPcmChunk makeChunk(std::uint64_t generation, std::uint64_t sequence)
 	return chunk;
 }
 
+void testFailurePublicationFenceAndOrdering()
+{
+	XAudio2FailurePublication callbackFirst;
+	const std::uint64_t beforeCallback = callbackFirst.snapshot();
+	check(callbackFirst.publish(E_ABORT),
+		"the first callback failure publishes an atomic failure fence");
+	std::uint64_t committed = 0;
+	check(!callbackFirst.tryCommit(beforeCallback, committed),
+		"an owner commit cannot cross a callback publication fence");
+	check(callbackFirst.failure() == E_ABORT,
+		"the callback publication retains its normalized first failure");
+
+	XAudio2FailurePublication backendFirst;
+	const std::uint64_t beforeBackend = backendFirst.snapshot();
+	check(backendFirst.publish(E_FAIL),
+		"a backend HRESULT can publish through the shared failure latch");
+	check(!backendFirst.publish(E_ACCESSDENIED),
+		"a later callback cannot overwrite an earlier backend failure");
+	check(backendFirst.failure() == E_FAIL,
+		"the backend publication retains the first failure");
+
+	XAudio2FailurePublication callbackWins;
+	check(callbackWins.publish(E_ABORT), "callback-first ordering is publishable");
+	check(!callbackWins.publish(E_FAIL), "a later backend error cannot overwrite a callback failure");
+	check(callbackWins.failure() == E_ABORT, "callback-first ordering remains observable");
+}
+
 void testCallbackGateAdmissionDrainAndReopen()
 {
 	XAudio2CallbackGate gate;
@@ -284,8 +312,16 @@ void testCallbackGateAdmissionDrainAndReopen()
 	while (!closeStarted.load(std::memory_order_acquire)) {
 		std::this_thread::yield();
 	}
+	for (;;) {
+		XAudio2CallbackGate::Token probe;
+		if (!gate.tryEnter(probe, firstGeneration)) {
+			break;
+		}
+		gate.leave(probe);
+		std::this_thread::yield();
+	}
 	check(!closeReturned.load(std::memory_order_acquire),
-		"callback gate close waits for an in-flight callback");
+		"callback gate closes admission while an in-flight callback remains held");
 	gate.leave(held);
 	closer.join();
 	check(closeReturned.load(std::memory_order_acquire),
@@ -533,7 +569,11 @@ void testClosedFailedQuiescingAndStaleHandles()
 	backendView->emitCritical(E_ABORT);
 	check(service.state() == XAudio2AudioServiceState::FAILED,
 		"a critical callback atomically publishes FAILED");
+	check(!service.isOpen(),
+		"a latched critical failure makes the service non-open before owner processing");
 	check(service.processPendingFailure(), "the owner observes the pending critical error");
+	check(!service.processPendingFailure(),
+		"the first failure publication is applied once while FAILED");
 	check(service.isVoiceOpen(replacement) && service.isVoiceFailed(replacement),
 		"existing voices observe terminal failure on the owner service");
 	check(!service.createVoice().isValid(), "failed services reject new voices");
@@ -613,6 +653,7 @@ void testRepeatedCyclesRemainDeterministic()
 
 int main()
 {
+	testFailurePublicationFenceAndOrdering();
 	testCallbackGateAdmissionDrainAndReopen();
 	testHandleScopedOperationsAndConcurrentStaleAccess();
 	testPartialBackendFailureIsDestroyedOnce();
