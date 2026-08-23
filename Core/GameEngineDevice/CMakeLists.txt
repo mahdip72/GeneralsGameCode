@@ -213,9 +213,22 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4)
     list(APPEND GAMEENGINEDEVICE_SRC
         Include/MilesAudioDevice/MilesAudioManager.h
         Include/MilesAudioDevice/MilesAudioCompletionQueue.h
-        Include/MilesAudioDevice/AudioChannelPolicy.h
+        Include/AudioDevice/AudioChannelPolicy.h
+        Include/AudioDevice/AudioManagerFactory.h
         Source/MilesAudioDevice/MilesAudioManager.cpp
-        Source/MilesAudioDevice/AudioChannelPolicy.cpp
+        Source/MilesAudioDevice/AudioManagerFactory.cpp
+        Source/AudioDevice/AudioChannelPolicy.cpp
+    )
+else()
+    list(APPEND GAMEENGINEDEVICE_SRC
+        Include/AudioDevice/AudioChannelPolicy.h
+        Source/AudioDevice/AudioChannelPolicy.cpp
+        Include/AudioDevice/AudioManagerFactory.h
+        Include/AudioDevice/NullAudioManager.h
+        Source/AudioDevice/NullAudioManager.cpp
+        Include/XAudio2AudioDevice/XAudio2AudioManager.h
+        Source/XAudio2AudioDevice/XAudio2AudioManager.cpp
+        Source/XAudio2AudioDevice/AudioManagerFactory.cpp
     )
 endif()
 
