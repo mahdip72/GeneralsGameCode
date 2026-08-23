@@ -128,6 +128,14 @@ enum
 	-December 2002
 */
 
+class LegacyVideoAudioInterface
+{
+	public:
+		virtual ~LegacyVideoAudioInterface() {}
+		virtual void *getLegacyVideoDirectSoundHandle() = 0;
+		virtual void releaseLegacyVideoAudioHandle() = 0;
+};
+
 class AudioManager : public SubsystemInterface
 {
 	public:
@@ -245,9 +253,6 @@ class AudioManager : public SubsystemInterface
 		virtual void set3DVolumeAdjustment( Real volumeAdjustment );
 
     virtual Bool has3DSensitiveStreamsPlaying() const = 0;
-
- 		virtual void *getHandleForBink() = 0;
- 		virtual void releaseHandleForBink() = 0;
 
 		// this function will play an audio event rts by loading it into memory. It should not be used
 		// by anything except for the load screens.

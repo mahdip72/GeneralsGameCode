@@ -65,4 +65,50 @@ if ($runtimeTestsCMake -notmatch '(?ms)^if\(NOT RTS_BUILD_OPTION_FFMPEG\)\s*^\s*
 }
 Assert-TokenCount $runtimeTestsCMake 'binkstub' 1 'Zero Hour runtime regression test link ownership is ambiguous.'
 
+$audioContractFiles = @(
+    'Core/GameEngine/Include/Common/GameAudio.h',
+    'Core/GameEngineDevice/Include/MilesAudioDevice/MilesAudioManager.h',
+    'Core/GameEngineDevice/Source/MilesAudioDevice/MilesAudioManager.cpp',
+    'Core/GameEngineDevice/Include/VideoDevice/Bink/BinkVideoPlayer.h',
+    'Core/GameEngineDevice/Source/VideoDevice/Bink/BinkVideoPlayer.cpp',
+    'Core/GameEngineDevice/Include/VideoDevice/FFmpeg/FFmpegVideoPlayer.h',
+    'Core/GameEngineDevice/Source/VideoDevice/FFmpeg/FFmpegVideoPlayer.cpp'
+)
+
+foreach ($relativePath in $audioContractFiles) {
+    $content = Get-Content -LiteralPath (Join-Path $SourceRoot $relativePath) -Raw
+    if ($content -match 'getHandleForBink|releaseHandleForBink|initializeBinkWithMiles') {
+        throw "Legacy Bink-specific audio contract remains in $relativePath"
+    }
+}
+
+$gameAudio = Get-Content -LiteralPath (Join-Path $SourceRoot 'Core/GameEngine/Include/Common/GameAudio.h') -Raw
+if ($gameAudio -notmatch 'class LegacyVideoAudioInterface') {
+    throw 'AudioManager is missing the explicit legacy video audio capability interface.'
+}
+if ($gameAudio -match 'getHandleForVideo') {
+    throw 'AudioManager retains a raw video audio acquisition contract.'
+}
+if ($gameAudio -match 'releaseHandleForVideo') {
+    throw 'AudioManager retains a raw video audio release contract.'
+}
+
+$milesAudio = Get-Content -LiteralPath (Join-Path $SourceRoot 'Core/GameEngineDevice/Include/MilesAudioDevice/MilesAudioManager.h') -Raw
+if ($milesAudio -notmatch 'virtual void \*getLegacyVideoDirectSoundHandle\(\)' -or $milesAudio -notmatch 'virtual void releaseLegacyVideoAudioHandle\(\)') {
+    throw 'Miles fallback does not own the legacy video audio handle contract.'
+}
+if ($milesAudio -notmatch 'void\* getLegacyVideoDirectSoundHandle\(\) override' -or $milesAudio -notmatch 'void releaseLegacyVideoAudioHandle\(\) override') {
+    throw 'Miles headless audio manager does not override the legacy video audio contract.'
+}
+
+$binkPlayer = Get-Content -LiteralPath (Join-Path $SourceRoot 'Core/GameEngineDevice/Source/VideoDevice/Bink/BinkVideoPlayer.cpp') -Raw
+if ($binkPlayer -notmatch 'dynamic_cast<LegacyVideoAudioInterface \*>') {
+    throw 'Bink player does not use the checked legacy video audio capability.'
+}
+
+$ffmpegPlayer = Get-Content -LiteralPath (Join-Path $SourceRoot 'Core/GameEngineDevice/Source/VideoDevice/FFmpeg/FFmpegVideoPlayer.cpp') -Raw
+if ($ffmpegPlayer -match 'RTS_HAS_OPENAL|RTS_USE_OPENAL|OpenALAudioStream|getHandleForVideo|releaseHandleForVideo') {
+    throw 'FFmpeg player retains an unowned legacy or OpenAL audio path.'
+}
+
 Write-Output 'Video backend selection audit passed.'

@@ -213,7 +213,7 @@ MilesAudioManager::MilesAudioManager() :
 	m_num3DChannelReplacements(0),
 	m_num3DChannelRejections(0),
 	m_delayFilter(nullptr),
-	m_binkHandle(nullptr),
+	m_legacyVideoHandle(nullptr),
 	m_pref3DProvider(AsciiString::TheEmptyString),
 	m_prefSpeaker(AsciiString::TheEmptyString)
 {
@@ -223,11 +223,11 @@ MilesAudioManager::MilesAudioManager() :
 //-------------------------------------------------------------------------------------------------
 MilesAudioManager::~MilesAudioManager()
 {
-	DEBUG_ASSERTCRASH(m_binkHandle == nullptr, ("Leaked a Bink handle. Chuybregts"));
-	// releaseHandleForBink also unregisters/stops a live sample, so close
+	DEBUG_ASSERTCRASH(m_legacyVideoHandle == nullptr, ("Leaked a video audio handle. Chuybregts"));
+	// releaseLegacyVideoAudioHandle also unregisters/stops a live sample, so close
 	// callback admission before touching that handle during destruction.
 	s_audioCompletionQueue.close();
-	releaseHandleForBink();
+	releaseLegacyVideoAudioHandle();
 	closeDevice();
 	delete m_audioCache;
 
@@ -3203,11 +3203,11 @@ void MilesAudioManager::processRequest( AudioRequest *req )
 }
 
 //-------------------------------------------------------------------------------------------------
-void *MilesAudioManager::getHandleForBink()
+void *MilesAudioManager::getLegacyVideoDirectSoundHandle()
 {
-	if (m_binkHandle == nullptr) {
+	if (m_legacyVideoHandle == nullptr) {
 		PlayingAudio *aud = allocatePlayingAudio();
-		aud->m_audioEventRTS.Assign_No_Add_Ref(newInstance(DynamicAudioEventRTS)("BinkHandle"));
+		aud->m_audioEventRTS.Assign_No_Add_Ref(newInstance(DynamicAudioEventRTS)("VideoHandle"));
 		getInfoForAudioEvent(aud->m_audioEventRTS.Peek());
 		aud->m_sample = getAvailable2DSample(aud->m_audioEventRTS.Peek());
 		aud->m_type = PAT_Sample;
@@ -3218,21 +3218,21 @@ void *MilesAudioManager::getHandleForBink()
 			return nullptr;
 		}
 
-		m_binkHandle = aud;
+		m_legacyVideoHandle = aud;
 	}
 
 	AILLPDIRECTSOUND lpDS;
-	AIL_get_DirectSound_info(m_binkHandle->m_sample, &lpDS, nullptr);
+	AIL_get_DirectSound_info(m_legacyVideoHandle->m_sample, &lpDS, nullptr);
 	return lpDS;
 }
 
 //-------------------------------------------------------------------------------------------------
-void MilesAudioManager::releaseHandleForBink()
+void MilesAudioManager::releaseLegacyVideoAudioHandle()
 {
-	if (m_binkHandle) {
-		stopPlayingAudio(m_binkHandle);
-		releasePlayingAudio(m_binkHandle);
-		m_binkHandle = nullptr;
+	if (m_legacyVideoHandle) {
+		stopPlayingAudio(m_legacyVideoHandle);
+		releasePlayingAudio(m_legacyVideoHandle);
+		m_legacyVideoHandle = nullptr;
 	}
 }
 

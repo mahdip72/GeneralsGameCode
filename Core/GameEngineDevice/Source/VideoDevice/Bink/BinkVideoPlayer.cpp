@@ -130,7 +130,7 @@ void	BinkVideoPlayer::init()
 	// Need to load the stuff from the ini file.
 	VideoPlayer::init();
 
-	initializeBinkWithMiles();
+	initializeVideoAudio();
 }
 
 //============================================================================
@@ -139,7 +139,10 @@ void	BinkVideoPlayer::init()
 
 void BinkVideoPlayer::deinit()
 {
-	TheAudio->releaseHandleForBink();
+	LegacyVideoAudioInterface *audio = dynamic_cast<LegacyVideoAudioInterface *>(TheAudio);
+	if (audio != nullptr) {
+		audio->releaseLegacyVideoAudioHandle();
+	}
 	VideoPlayer::deinit();
 }
 
@@ -271,19 +274,23 @@ VideoStreamInterface*	BinkVideoPlayer::load( AsciiString movieTitle )
 void BinkVideoPlayer::notifyVideoPlayerOfNewProvider( Bool nowHasValid )
 {
 	if (!nowHasValid) {
-		TheAudio->releaseHandleForBink();
+		LegacyVideoAudioInterface *audio = dynamic_cast<LegacyVideoAudioInterface *>(TheAudio);
+		if (audio != nullptr) {
+			audio->releaseLegacyVideoAudioHandle();
+		}
 		BinkSetSoundTrack(0, nullptr);
 	} else {
-		initializeBinkWithMiles();
+		initializeVideoAudio();
 	}
 }
 
 //============================================================================
 //============================================================================
-void BinkVideoPlayer::initializeBinkWithMiles()
+void BinkVideoPlayer::initializeVideoAudio()
 {
 	Int retVal = 0;
-	void *driver = TheAudio->getHandleForBink();
+	LegacyVideoAudioInterface *audio = dynamic_cast<LegacyVideoAudioInterface *>(TheAudio);
+	void *driver = audio != nullptr ? audio->getLegacyVideoDirectSoundHandle() : nullptr;
 
 	if ( driver )
 	{

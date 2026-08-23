@@ -127,7 +127,7 @@ class BinkVideoPlayer : public VideoPlayer
 		virtual VideoStreamInterface*	load( AsciiString movieTitle ) override;	///< Load video file in to memory for playback
 
 		virtual void notifyVideoPlayerOfNewProvider( Bool nowHasValid ) override;
-		virtual void initializeBinkWithMiles();
+		virtual void initializeVideoAudio();
 };
 
 
