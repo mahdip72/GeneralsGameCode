@@ -43,6 +43,8 @@ include(cmake/debug_strip.cmake)
 
 include(FetchContent)
 
+include(cmake/config.cmake)
+
 # MinGW-w64 specific configuration
 if(MINGW)
     include(cmake/mingw.cmake)
@@ -52,9 +54,15 @@ endif()
 
 # Find/Add build dependencies and stubs shared by all projects
 if((WIN32 OR "${CMAKE_SYSTEM}" MATCHES "Windows") AND ${CMAKE_SIZEOF_VOID_P} EQUAL 4)
-    include(cmake/miles.cmake)
-    include(cmake/bink.cmake)
-    include(cmake/dx8.cmake)
+    if(NOT RTS_VIDEO_BACKEND_GRAPH_AUDIT)
+        include(cmake/miles.cmake)
+    endif()
+    if(NOT RTS_BUILD_OPTION_FFMPEG)
+        include(cmake/bink.cmake)
+    endif()
+    if(NOT RTS_VIDEO_BACKEND_GRAPH_AUDIT)
+        include(cmake/dx8.cmake)
+    endif()
 endif()
 
 # Define a dummy stlport target when not on VC6.
@@ -64,7 +72,6 @@ else()
     add_library(stlport INTERFACE)
 endif()
 
-include(cmake/config.cmake)
 include(cmake/legacy-product-runtime.cmake)
 include(cmake/gamespy.cmake)
 include(cmake/lzhl.cmake)

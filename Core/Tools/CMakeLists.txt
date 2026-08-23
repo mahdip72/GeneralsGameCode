@@ -84,12 +84,6 @@ if(RTS_BUILD_CORE_EXTRAS)
                 -SelfTest
         )
         set_tests_properties(core_legacy_product_runtime_audit_self_test PROPERTIES TIMEOUT 30)
-        add_test(NAME core_video_backend_selection_audit
-            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
-                -File "${CMAKE_CURRENT_SOURCE_DIR}/VideoBackendSelectionAudit/VideoBackendSelectionAudit.ps1"
-                -SourceRoot "${CMAKE_SOURCE_DIR}"
-        )
-        set_tests_properties(core_video_backend_selection_audit PROPERTIES TIMEOUT 30)
     endif()
     add_subdirectory(TaskRuntimeTest)
     add_subdirectory(RadarTerrainPrepareTest)
@@ -124,6 +118,26 @@ if(RTS_BUILD_CORE_EXTRAS)
     add_subdirectory(versionUpdate)
     add_subdirectory(wolSetup)
     add_subdirectory(WW3D)
+endif()
+
+if(WIN32)
+    add_test(NAME core_video_backend_selection_audit
+        COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/VideoBackendSelectionAudit/VideoBackendSelectionAudit.ps1"
+            -SourceRoot "${CMAKE_SOURCE_DIR}"
+    )
+    set_tests_properties(core_video_backend_selection_audit PROPERTIES TIMEOUT 30)
+    if(MSVC AND NOT IS_VS6_BUILD)
+        add_test(NAME core_video_backend_ffmpeg_graph_audit
+            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/VideoBackendSelectionAudit/FFmpegGraphAudit.ps1"
+                -SourceRoot "${CMAKE_SOURCE_DIR}"
+                -BuildRoot "${CMAKE_BINARY_DIR}/Stage3FFmpegGraphAudit"
+                -FFmpegConfigDir "${CMAKE_CURRENT_SOURCE_DIR}/VideoBackendSelectionAudit/FFmpegConfig"
+                -CMakeCommand "${CMAKE_COMMAND}"
+        )
+        set_tests_properties(core_video_backend_ffmpeg_graph_audit PROPERTIES TIMEOUT 120)
+    endif()
 endif()
 
 # Add library interfaces here

@@ -2,7 +2,6 @@ set(GAMEENGINEDEVICE_SRC
     Include/MilesAudioDevice/MilesAudioManager.h
     Include/MilesAudioDevice/MilesAudioCompletionQueue.h
     Include/MilesAudioDevice/AudioChannelPolicy.h
-    Include/VideoDevice/Bink/BinkVideoPlayer.h
     Include/W3DDevice/Common/W3DConvert.h
     Include/W3DDevice/Common/W3DFunctionLexicon.h
     Include/W3DDevice/Common/W3DModuleFactory.h
@@ -103,7 +102,6 @@ set(GAMEENGINEDEVICE_SRC
     Include/Win32Device/GameClient/Win32Mouse.h
     Source/MilesAudioDevice/MilesAudioManager.cpp
     Source/MilesAudioDevice/AudioChannelPolicy.cpp
-    Source/VideoDevice/Bink/BinkVideoPlayer.cpp
     Source/W3DDevice/Common/System/W3DFunctionLexicon.cpp
     Source/W3DDevice/Common/System/RadarOverlayPrepare.cpp
     Source/W3DDevice/Common/System/RadarTerrainPrepare.cpp
@@ -215,6 +213,13 @@ set(GAMEENGINEDEVICE_SRC
     #Source/Win32Device/GameClient/Win32DIMouse.cpp
     Source/Win32Device/GameClient/Win32Mouse.cpp
 )
+
+if(NOT RTS_BUILD_OPTION_FFMPEG)
+    list(APPEND GAMEENGINEDEVICE_SRC
+        Include/VideoDevice/Bink/BinkVideoPlayer.h
+        Source/VideoDevice/Bink/BinkVideoPlayer.cpp
+    )
+endif()
 
 # Add C++ 17 FileSystem implementation for non-VS6 builds
 if(NOT IS_VS6_BUILD)
