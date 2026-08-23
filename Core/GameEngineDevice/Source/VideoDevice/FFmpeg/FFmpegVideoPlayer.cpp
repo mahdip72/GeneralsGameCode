@@ -46,7 +46,17 @@ extern "C" {
 	#include <libswscale/swscale.h>
 }
 
+#include <algorithm>
 #include <chrono>
+
+namespace
+{
+UnsignedInt64 getMonotonicMilliseconds()
+{
+	return std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+}
 
 //----------------------------------------------------------------------------
 //         Externals
@@ -133,6 +143,7 @@ void	FFmpegVideoPlayer::init()
 
 void FFmpegVideoPlayer::deinit()
 {
+	closeAllStreams();
 	VideoPlayer::deinit();
 }
 
@@ -193,6 +204,14 @@ VideoStreamInterface* FFmpegVideoPlayer::createStream( File* file )
 	}
 
 	FFmpegVideoStream *stream = NEW FFmpegVideoStream(ffmpegHandle);
+	if (stream == nullptr) {
+		delete ffmpegHandle;
+		return nullptr;
+	}
+	if (!stream->m_gotFrame) {
+		delete stream;
+		return nullptr;
+	}
 
 	if ( stream )
 	{
@@ -286,7 +305,7 @@ FFmpegVideoStream::FFmpegVideoStream(FFmpegFile* file)
 	while (m_good && m_gotFrame == false)
 		m_good = m_ffmpegFile->decodePacket();
 
-	m_startTime = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+	m_startTime = getMonotonicMilliseconds();
 }
 
 //============================================================================
@@ -304,9 +323,12 @@ void FFmpegVideoStream::onFrame(AVFrame *frame, int stream_idx, int stream_type,
 {
 	FFmpegVideoStream *videoStream = static_cast<FFmpegVideoStream *>(user_data);
 	if (stream_type == AVMEDIA_TYPE_VIDEO) {
-		av_frame_free(&videoStream->m_frame);
-		videoStream->m_frame = av_frame_clone(frame);
-		videoStream->m_gotFrame = true;
+		AVFrame *cloned_frame = av_frame_clone(frame);
+		if (cloned_frame != nullptr) {
+			av_frame_free(&videoStream->m_frame);
+			videoStream->m_frame = cloned_frame;
+			videoStream->m_gotFrame = true;
+		}
 	}
 }
 
@@ -326,9 +348,10 @@ void FFmpegVideoStream::update()
 
 Bool FFmpegVideoStream::isFrameReady()
 {
-	uint64_t time = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-	bool ready = (time - m_startTime) >= m_ffmpegFile->getFrameTime() * frameIndex();
-	return ready;
+	const UnsignedInt64 time = getMonotonicMilliseconds();
+	const UnsignedInt64 elapsed = time >= m_startTime ? time - m_startTime : 0;
+	const UnsignedInt64 target = static_cast<UnsignedInt64>(m_ffmpegFile->getFrameTime()) * frameIndex();
+	return m_gotFrame && elapsed >= target;
 
 	//return !BinkWait( m_handle );
 }
@@ -356,24 +379,29 @@ void FFmpegVideoStream::frameRender( VideoBuffer *buffer )
 		return;
 	}
 
-	if (m_frame->data == nullptr) {
+	if (m_frame->data[0] == nullptr) {
 		return;
 	}
 
 	AVPixelFormat dst_pix_fmt;
+	UnsignedInt bytes_per_pixel;
 
 	switch (buffer->format()) {
 		case VideoBuffer::TYPE_R8G8B8:
 			dst_pix_fmt = AV_PIX_FMT_RGB24;
+			bytes_per_pixel = 3;
 			break;
 		case VideoBuffer::TYPE_X8R8G8B8:
 			dst_pix_fmt = AV_PIX_FMT_BGR0;
+			bytes_per_pixel = 4;
 			break;
 		case VideoBuffer::TYPE_R5G6B5:
 			dst_pix_fmt = AV_PIX_FMT_RGB565;
+			bytes_per_pixel = 2;
 			break;
 		case VideoBuffer::TYPE_X1R5G5B5:
 			dst_pix_fmt = AV_PIX_FMT_RGB555;
+			bytes_per_pixel = 2;
 			break;
 		default:
 			return;
@@ -390,6 +418,10 @@ void FFmpegVideoStream::frameRender( VideoBuffer *buffer )
 		nullptr,
 		nullptr,
 		nullptr);
+	if (m_swsContext == nullptr) {
+		DEBUG_LOG(("Failed to allocate video scaling context"));
+		return;
+	}
 
 	uint8_t *buffer_data = static_cast<uint8_t *>(buffer->lock());
 	if (buffer_data == nullptr) {
@@ -398,7 +430,9 @@ void FFmpegVideoStream::frameRender( VideoBuffer *buffer )
 	}
 
 	int dst_strides[] = { (int)buffer->pitch() };
-	uint8_t *dst_data[] = { buffer_data };
+	uint8_t *dst_data[] = {
+		buffer_data + buffer->yPos() * buffer->pitch() + buffer->xPos() * bytes_per_pixel
+	};
 	[[maybe_unused]] int result =
 		sws_scale(m_swsContext, m_frame->data, m_frame->linesize, 0, height(), dst_data, dst_strides);
 	DEBUG_ASSERTLOG(result >= 0, ("Failed to scale frame"));
@@ -415,6 +449,13 @@ void FFmpegVideoStream::frameNext()
 	// Decode until we have our next video frame
 	while (m_good && m_gotFrame == false)
 		m_good = m_ffmpegFile->decodePacket();
+
+	if (!m_good && !m_gotFrame && m_ffmpegFile->isAtEnd() && m_ffmpegFile->seekFrame(0)) {
+		m_good = true;
+		while (m_good && !m_gotFrame)
+			m_good = m_ffmpegFile->decodePacket();
+		m_startTime = getMonotonicMilliseconds();
+	}
 }
 
 //============================================================================
@@ -441,7 +482,29 @@ Int	FFmpegVideoStream::frameCount()
 
 void FFmpegVideoStream::frameGoto( Int index )
 {
-	m_ffmpegFile->seekFrame(index);
+	const Int frame_count = m_ffmpegFile->getNumFrames();
+	if (frame_count > 0) {
+		index = std::clamp(index, 0, frame_count - 1);
+	} else if (index < 0) {
+		index = 0;
+	}
+
+	if (!m_ffmpegFile->seekFrame(index)) {
+		av_frame_free(&m_frame);
+		m_gotFrame = false;
+		m_good = false;
+		return;
+	}
+
+	av_frame_free(&m_frame);
+	m_gotFrame = false;
+	m_good = true;
+	while (m_good && !m_gotFrame)
+		m_good = m_ffmpegFile->decodePacket();
+
+	const UnsignedInt64 now = getMonotonicMilliseconds();
+	const UnsignedInt64 elapsed = static_cast<UnsignedInt64>(m_ffmpegFile->getFrameTime()) * frameIndex();
+	m_startTime = now >= elapsed ? now - elapsed : 0;
 }
 
 //============================================================================

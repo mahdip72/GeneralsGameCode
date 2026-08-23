@@ -57,7 +57,9 @@ public:
 	void setUserData(void *user_data) { m_userData = user_data; }
 	// Read & decode a packet from the container. Note that we could/should split this step
 	Bool decodePacket();
-	void seekFrame(int frame_idx);
+	Bool seekFrame(int frame_idx);
+	Bool isAtEnd() const { return m_atEnd; }
+	Bool hasError() const { return m_decodeError; }
 	Bool hasAudio() const;
 
 	// Audio specific
@@ -82,9 +84,22 @@ private:
 		Int stream_idx = -1;
 		Int stream_type = -1;
 		AVFrame *frame = nullptr;
+		Bool drain_sent = false;
+		Bool drained = false;
+	};
+
+	enum class ReceiveResult
+	{
+		NEEDS_INPUT,
+		FRAME_SKIPPED,
+		FRAME_READY,
+		FINISHED,
+		FAILED,
 	};
 
 	static Int readPacket(void *opaque, UnsignedByte *buf, Int buf_size);
+	static Int64 seekPacket(void *opaque, Int64 offset, Int whence);
+	ReceiveResult receiveFrame(FFmpegStream &stream);
 	const FFmpegStream *findMatch(int type) const;
 
 	FFmpegFrameCallback 		m_frameCallback = nullptr; ///< Callback for frame processing
@@ -94,4 +109,16 @@ private:
 	std::vector<FFmpegStream> 	m_streams; ///< List of streams in the file
 	File 						*m_file = nullptr;	///< File handle for the file
 	void 						*m_userData = nullptr; ///< User data for the callback
+	Int 						m_receiveStreamIndex = -1; ///< Decoder with frames still pending
+	size_t 					m_drainStreamIndex = 0; ///< Decoder currently being flushed at EOF
+	Int 						m_currentVideoFrame = -1; ///< Zero-based delivered video frame
+	Int 						m_videoFramesDelivered = 0; ///< Video frames delivered since open or seek
+	Int 						m_discoveredVideoFrameCount = 0; ///< Frame total learned after decoder EOF
+	Bool 						m_packetPending = false; ///< Current packet has not been accepted yet
+	Bool 						m_inputEnded = false; ///< Demuxer reached end of input
+	Bool 						m_atEnd = false; ///< Every selected decoder reached clean EOF
+	Bool 						m_decodeError = false; ///< Demux, decode, or seek failed
+	Bool 						m_hasSeekTarget = false; ///< Discard frames before the requested timestamp
+	Int 						m_seekStreamIndex = -1; ///< Video stream owning the seek target
+	Int64 					m_seekTargetTimestamp = 0; ///< Requested timestamp in stream time base
 };
