@@ -236,6 +236,10 @@ Bool FFmpegFile::open(FFmpegFileSource &source)
 			output_stream = FFmpegStream {};
 			continue;
 		}
+		// Do not turn decoder concealment into a successful movie generation.
+		// The playback core must distinguish a corrupt packet from true EOF so a
+		// loop cannot repeatedly restart damaged input.
+		codec_ctx->err_recognition |= AV_EF_EXPLODE;
 
 		result = avcodec_open2(codec_ctx, input_codec, nullptr);
 		if (result < 0) {

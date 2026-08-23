@@ -371,6 +371,10 @@ AudioPcmSubmitResult XAudio2AudioService::submit(XAudio2PcmVoiceHandle handle, A
 		chunk = {};
 		return AudioPcmSubmitResult::DROPPED;
 	}
+	if (currentState == XAudio2AudioServiceState::FAILED) {
+		chunk = {};
+		return AudioPcmSubmitResult::FAILED;
+	}
 	return m_voices[handle.index].voice->submit(std::move(chunk));
 }
 

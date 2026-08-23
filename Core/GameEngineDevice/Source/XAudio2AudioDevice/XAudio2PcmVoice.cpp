@@ -330,8 +330,14 @@ AudioPcmSubmitResult XAudio2PcmVoice::submit(AudioPcmChunk &&chunk)
 		chunk = {};
 		return AudioPcmSubmitResult::DROPPED;
 	};
-	if (!m_open.load(std::memory_order_acquire) || m_failed.load(std::memory_order_acquire)
-		|| chunk.generation != m_requestedGeneration || !isValidChunk(chunk)) {
+	if (!m_open.load(std::memory_order_acquire)) {
+		return drop();
+	}
+	if (m_failed.load(std::memory_order_acquire)) {
+		chunk = {};
+		return AudioPcmSubmitResult::FAILED;
+	}
+	if (chunk.generation != m_requestedGeneration || !isValidChunk(chunk)) {
 		return drop();
 	}
 

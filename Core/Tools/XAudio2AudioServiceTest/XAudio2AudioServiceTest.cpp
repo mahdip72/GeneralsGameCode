@@ -576,6 +576,8 @@ void testClosedFailedQuiescingAndStaleHandles()
 		"the first failure publication is applied once while FAILED");
 	check(service.isVoiceOpen(replacement) && service.isVoiceFailed(replacement),
 		"existing voices observe terminal failure on the owner service");
+	check(service.submit(replacement, makeChunk(replacement.generation, 0)) == AudioPcmSubmitResult::FAILED,
+		"a failed service reports terminal failure for valid voice submissions");
 	check(!service.createVoice().isValid(), "failed services reject new voices");
 
 	service.shutdown();

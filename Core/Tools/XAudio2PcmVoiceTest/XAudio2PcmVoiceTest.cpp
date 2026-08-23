@@ -329,8 +329,8 @@ void testTerminalFailures()
 		voice.service();
 		check(voice.isFailed(), "submit failure enters terminal state");
 		check(backend.startCalls == 0, "failed submit does not start the source voice");
-		check(voice.submit(makeChunk(0, 1, 31)) == AudioPcmSubmitResult::DROPPED,
-			"failed voices drop later submissions");
+		check(voice.submit(makeChunk(0, 1, 31)) == AudioPcmSubmitResult::FAILED,
+			"failed voices report terminal failure for later submissions");
 		voice.close();
 		check(backend.destroyCalls == 1, "submit failure cleanup destroys the voice once");
 	}
@@ -381,8 +381,8 @@ void testTerminalFailures()
 		voice.submit(makeChunk(0, 0, 37));
 		voice.service();
 		backend.voiceError(E_FAIL);
-		check(voice.submit(makeChunk(0, 1, 39)) == AudioPcmSubmitResult::DROPPED,
-			"source voice callback error drops submissions before service observes it");
+		check(voice.submit(makeChunk(0, 1, 39)) == AudioPcmSubmitResult::FAILED,
+			"source voice callback error reports terminal failure before service observes it");
 		voice.service();
 		check(voice.isFailed(), "source voice callback error enters terminal state");
 		voice.close();

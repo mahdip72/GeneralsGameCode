@@ -161,6 +161,14 @@ FFmpegMoviePlayback::~FFmpegMoviePlayback()
 	delete m_silentSink;
 }
 
+void FFmpegMoviePlayback::clearCurrentFrame()
+{
+	av_frame_free(&m_currentFrame);
+	m_currentMetadata = {};
+	m_videoPresentationTimeUs = 0;
+	m_newVideoFrame = false;
+}
+
 void FFmpegMoviePlayback::setVideoCallback(FFmpegMovieVideoCallback callback, void *userData)
 {
 	m_videoCallback = std::move(callback);
@@ -251,16 +259,15 @@ bool FFmpegMoviePlayback::seekFrame(Int frameIndex)
 		return false;
 	}
 	++m_generation;
-	av_frame_free(&m_currentFrame);
-	m_currentMetadata = {};
-	if (frameIndex < 0) {
-		return setFailed();
-	}
+	clearCurrentFrame();
 	if (!resetGeneration(m_generation)) {
-		return setFailed();
+		return setFailed(false);
+	}
+	if (frameIndex < 0) {
+		return setFailed(false);
 	}
 	if (!m_file.seekFrame(frameIndex)) {
-		return setFailed();
+		return setFailed(false);
 	}
 	m_seekTargetUs = targetTimeForFrame(frameIndex);
 	m_audioGateActive = frameIndex > 0;
@@ -334,12 +341,19 @@ bool FFmpegMoviePlayback::handleEndOfInput()
 		return setFailed();
 	}
 	if (m_mode != FFmpegMoviePlaybackMode::LOOP) {
+		if (m_mode == FFmpegMoviePlaybackMode::ONCE) {
+			clearCurrentFrame();
+		}
 		m_state = FFmpegMoviePlaybackState::ENDED;
 		return true;
 	}
 	++m_generation;
-	if (!resetGeneration(m_generation) || !m_file.seekFrame(0)) {
-		return setFailed();
+	clearCurrentFrame();
+	if (!resetGeneration(m_generation)) {
+		return setFailed(false);
+	}
+	if (!m_file.seekFrame(0)) {
+		return setFailed(false);
 	}
 	m_seekTargetUs = 0;
 	m_videoGateActive = false;
@@ -362,8 +376,15 @@ bool FFmpegMoviePlayback::resetGeneration(std::uint64_t generation)
 	return true;
 }
 
-bool FFmpegMoviePlayback::setFailed()
+bool FFmpegMoviePlayback::setFailed(bool resetAudio)
 {
+	if (m_state == FFmpegMoviePlaybackState::FAILED) {
+		return false;
+	}
+	if (resetAudio) {
+		resetGeneration(m_generation);
+	}
+	clearCurrentFrame();
 	m_state = FFmpegMoviePlaybackState::FAILED;
 	return false;
 }

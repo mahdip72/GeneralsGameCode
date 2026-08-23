@@ -83,7 +83,8 @@ private:
 	void handleFrame(const AVFrame *frame, const FFmpegFrameMetadata &metadata);
 	bool handleEndOfInput();
 	bool resetGeneration(std::uint64_t generation);
-	bool setFailed();
+	bool setFailed(bool resetAudio = true);
+	void clearCurrentFrame();
 	bool isAudioFrameAdmitted(const FFmpegFrameMetadata &metadata);
 	std::int64_t timestampToMicroseconds(const FFmpegFrameMetadata &metadata) const;
 	std::int64_t targetTimeForFrame(Int frameIndex) const;
