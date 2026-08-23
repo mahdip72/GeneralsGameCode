@@ -1,7 +1,4 @@
 set(GAMEENGINEDEVICE_SRC
-    Include/MilesAudioDevice/MilesAudioManager.h
-    Include/MilesAudioDevice/MilesAudioCompletionQueue.h
-    Include/MilesAudioDevice/AudioChannelPolicy.h
     Include/W3DDevice/Common/W3DConvert.h
     Include/W3DDevice/Common/W3DFunctionLexicon.h
     Include/W3DDevice/Common/W3DModuleFactory.h
@@ -100,8 +97,6 @@ set(GAMEENGINEDEVICE_SRC
     Include/Win32Device/GameClient/Win32DIKeyboard.h
     #Include/Win32Device/GameClient/Win32DIMouse.h
     Include/Win32Device/GameClient/Win32Mouse.h
-    Source/MilesAudioDevice/MilesAudioManager.cpp
-    Source/MilesAudioDevice/AudioChannelPolicy.cpp
     Source/W3DDevice/Common/System/W3DFunctionLexicon.cpp
     Source/W3DDevice/Common/System/RadarOverlayPrepare.cpp
     Source/W3DDevice/Common/System/RadarTerrainPrepare.cpp
@@ -213,6 +208,21 @@ set(GAMEENGINEDEVICE_SRC
     #Source/Win32Device/GameClient/Win32DIMouse.cpp
     Source/Win32Device/GameClient/Win32Mouse.cpp
 )
+
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    list(APPEND GAMEENGINEDEVICE_SRC
+        Include/MilesAudioDevice/MilesAudioManager.h
+        Include/MilesAudioDevice/MilesAudioCompletionQueue.h
+        Include/MilesAudioDevice/AudioChannelPolicy.h
+        Source/MilesAudioDevice/MilesAudioManager.cpp
+        Source/MilesAudioDevice/AudioChannelPolicy.cpp
+    )
+elseif(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    list(APPEND GAMEENGINEDEVICE_SRC
+        Include/XAudio2AudioDevice/XAudio2AudioService.h
+        Source/XAudio2AudioDevice/XAudio2AudioService.cpp
+    )
+endif()
 
 if(NOT RTS_BUILD_OPTION_FFMPEG)
     list(APPEND GAMEENGINEDEVICE_SRC
