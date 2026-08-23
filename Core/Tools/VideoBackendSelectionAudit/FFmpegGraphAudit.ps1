@@ -52,6 +52,9 @@ $cmakeArguments = @(
     '-DRTS_BUILD_ZEROHOUR_EXTRAS=ON',
     '-DRTS_BUILD_OPTION_FFMPEG=ON',
     '-DRTS_VIDEO_BACKEND_GRAPH_AUDIT=ON',
+    '-DCMAKE_FIND_PACKAGE_PREFER_CONFIG=ON',
+    "-DFETCHCONTENT_SOURCE_DIR_BINK=$(Join-Path $SourceRoot 'Core/Tools/VideoBackendSelectionAudit/BinkForbidden')",
+    '-DFETCHCONTENT_UPDATES_DISCONNECTED=ON',
     "-DFFMPEG_DIR=$FFmpegConfigDir"
 )
 $quotedArguments = ($cmakeArguments | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }) -join ' '
@@ -72,6 +75,16 @@ if ($null -eq $solution) {
 
 if ((Get-Content -LiteralPath $solution.FullName -Raw) -match '(?i)binkstub') {
     throw 'FFmpeg-only CMake graph retains the Bink target.'
+}
+
+$runtimeTestProject = Get-ChildItem -LiteralPath $BuildRoot -Recurse -Filter 'z_runtime_regression_tests.vcxproj' |
+    Select-Object -First 1
+if ($null -eq $runtimeTestProject) {
+    throw 'FFmpeg-only CMake graph did not generate the Zero Hour runtime regression project.'
+}
+$runtimeTestProjectContent = Get-Content -LiteralPath $runtimeTestProject.FullName -Raw
+if ($runtimeTestProjectContent -match '(?i)binkstub|BinkVideoPlayer') {
+    throw 'FFmpeg-only runtime regression utility retains a direct or transitive Bink dependency.'
 }
 
 if ((Get-Content -LiteralPath $solution.FullName -Raw) -notmatch 'z_runtime_regression_tests') {
