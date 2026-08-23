@@ -30,6 +30,7 @@ if(RTS_BUILD_CORE_EXTRAS)
             COMMAND powershell -NoProfile -ExecutionPolicy Bypass
                 -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeAudioGraphAudit/NativeAudioGraphAudit.ps1"
                 -SourceRoot "${CMAKE_SOURCE_DIR}"
+                -BuildRoot "${CMAKE_BINARY_DIR}"
         )
         set_tests_properties(core_native_audio_graph_audit PROPERTIES TIMEOUT 30)
         if(RTS_BUILD_OPTION_FFMPEG)

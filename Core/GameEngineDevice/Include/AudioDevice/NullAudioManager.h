@@ -2,7 +2,10 @@
 
 #include "Common/GameAudio.h"
 
+#include <memory>
+
 class AudioAssetSource;
+class AudioAssetCatalog;
 
 // A deterministic, device-free AudioManager.  It deliberately inherits only
 // AudioManager so headless x64 code cannot acquire a legacy video/audio handle.
@@ -68,7 +71,7 @@ public:
 	Real getFileLengthMS(AsciiString) const override;
 	void closeAnySamplesUsingFile(const void *) override {}
 
-	void setAssetSource(AudioAssetSource *source) { m_assetSource = source; }
+	void setAssetSource(AudioAssetSource *source);
 	AudioAssetSource *getAssetSource() const { return m_assetSource; }
 	UnsignedInt getLifecycleGeneration() const { return m_lifecycleGeneration; }
 
@@ -76,6 +79,7 @@ protected:
 	void setDeviceListenerPosition() override {}
 
 private:
+	std::unique_ptr<AudioAssetCatalog> m_ownedAssetCatalog;
 	AudioAssetSource *m_assetSource;
 	AsciiString m_preferredProvider;
 	AsciiString m_preferredSpeaker;

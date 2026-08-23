@@ -51,11 +51,13 @@
 
 class AsciiString;
 class AudioEventRTS;
+class DynamicAudioEventRTS;
 class DebugDisplayInterface;
 class Drawable;
 class MusicManager;
 class Object;
 class SoundManager;
+template <class T> class RefCountPtr;
 
 
 enum AudioAffect CPP_11(: Int);
@@ -317,6 +319,13 @@ class AudioManager : public SubsystemInterface
 
 		// Should this piece of audio play on the local machine?
 		virtual Bool shouldPlayLocally(const AudioEventRTS *audioEvent);
+
+		// Prepare an event for a backend-owned request without handing it to the
+		// legacy SoundManager/MusicManager.  Native backends use this helper so
+		// admission, event metadata ownership, filename selection, volume
+		// overrides, and local filtering remain identical to the base contract.
+		Bool prepareAudioEventForPlayback(const AudioEventRTS *eventToAdd,
+			RefCountPtr<DynamicAudioEventRTS> &preparedEvent, Bool forced = FALSE);
 
 		// Set the Listening position for the device
 		virtual void setDeviceListenerPosition() = 0;

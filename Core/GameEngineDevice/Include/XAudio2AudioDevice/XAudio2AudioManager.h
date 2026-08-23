@@ -45,6 +45,7 @@ public:
 	AsciiString prevMusicTrack() override;
 	Bool isMusicPlaying() const override;
 	Bool hasMusicTrackCompleted(const AsciiString &trackName, Int numberOfTimes) const override;
+	Bool isCurrentlyPlaying(AudioHandle handle) override;
 
 	void openDevice() override;
 	void closeDevice() override;
@@ -86,7 +87,7 @@ public:
 
 	void setService(XAudio2AudioService *service);
 	XAudio2AudioService *getService() const { return m_service; }
-	void setAssetSource(AudioAssetSource *assetSource) { m_assetSource = assetSource; }
+	void setAssetSource(AudioAssetSource *assetSource);
 	AudioAssetSource *getAssetSource() const { return m_assetSource; }
 	UnsignedInt getLifecycleGeneration() const { return m_lifecycleGeneration; }
 	UnsignedInt getActiveAudioCount() const { return static_cast<UnsignedInt>(m_playing.size()); }
@@ -95,6 +96,13 @@ public:
 		return static_cast<UnsignedInt>(m_audioRequests.size());
 	}
 	Bool isOpen() const { return m_open; }
+
+#if defined(RTS_NATIVE_AUDIO_TEST_HOOK)
+	// Device-free contract hook used only by the isolated native-audio fixture.
+	// It exercises the same voice admission/submission path as a phase without
+	// constructing legacy game-world objects.
+	Bool runInjectedPlaybackProbe(AsciiString fileName);
+#endif
 
 protected:
 	void setDeviceListenerPosition() override {}
@@ -117,6 +125,11 @@ private:
 		Bool stopping = FALSE;
 		Bool forced = FALSE;
 		Bool voiceOpen = FALSE;
+		AsciiString assetFileName;
+		const void *assetIdentity = nullptr;
+		UnsignedInt phaseSubmittedFrames = 0;
+		UnsignedInt phaseCompletedFrames = 0;
+		UnsignedInt phaseTotalFrames = 0;
 	};
 
 	DynamicAudioEventRTS *copyEvent(const AudioEventRTS *eventToCopy);
@@ -132,6 +145,9 @@ private:
 	void releaseVoice(PlayingAudio &playing);
 	Bool ensureVoice(PlayingAudio &playing);
 	Bool submitPhase(PlayingAudio &playing);
+	Bool affectMatches(const PlayingAudio &playing, AudioAffect which) const;
+	Bool requestAffectMatches(const AudioRequest *request, AudioAffect which) const;
+	Bool canReplace(const PlayingAudio &victim, const DynamicAudioEventRTS &incoming) const;
 	Bool isChannelFull(Channel channel) const;
 	UnsignedInt channelCount(Channel channel) const;
 	UnsignedInt channelLimit(Channel channel) const;
@@ -140,9 +156,11 @@ private:
 	PlayingAudio *findLowestPriority(Channel channel, AudioPriority minimumPriority);
 	Real effectiveVolume(const PlayingAudio &playing) const;
 	void recordMusicCompletion(const PlayingAudio &playing);
+	void updatePlayingVolumes();
 	void clearPlaying();
 
 	std::unique_ptr<XAudio2AudioService> m_ownedService;
+	std::unique_ptr<AudioAssetCatalog> m_ownedAssetCatalog;
 	XAudio2AudioService *m_service;
 	AudioAssetSource *m_assetSource;
 	std::vector<PlayingAudio> m_playing;

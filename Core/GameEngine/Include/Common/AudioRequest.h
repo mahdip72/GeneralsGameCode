@@ -52,10 +52,12 @@ public:
 		, m_pendingEvent(nullptr)
 		, m_handleToInteractOn(AHSV_Error)
 		, m_requiresCheckForSample(false)
+		, m_paused(false)
 	{}
 
 	RequestType m_request;
 	RefCountPtr<DynamicAudioEventRTS> m_pendingEvent;
 	AudioHandle m_handleToInteractOn;
 	Bool m_requiresCheckForSample;
+	Bool m_paused;
 };

@@ -381,6 +381,74 @@ void AudioManager::getInfoForAudioEvent( const AudioEventRTS *eventToFindAndFill
 }
 
 //-------------------------------------------------------------------------------------------------
+Bool AudioManager::prepareAudioEventForPlayback(
+	const AudioEventRTS *eventToAdd,
+	RefCountPtr<DynamicAudioEventRTS> &preparedEvent,
+	Bool forced)
+{
+	preparedEvent.Clear();
+	if (eventToAdd == nullptr || eventToAdd->getEventName().isEmpty()
+		|| eventToAdd->getEventName() == "NoSound") {
+		return FALSE;
+	}
+
+	if (!eventToAdd->getAudioEventInfo()) {
+		getInfoForAudioEvent(eventToAdd);
+	}
+	if (!eventToAdd->getAudioEventInfo()) {
+		return FALSE;
+	}
+
+	const AudioEventInfo *eventInfo = eventToAdd->getAudioEventInfo();
+	if (!forced) {
+		switch (eventInfo->m_soundType) {
+			case AT_Music:
+				if (!isOn(AudioAffect_Music)) return FALSE;
+				break;
+			case AT_SoundEffect:
+				if (!isOn(AudioAffect_Sound) || !isOn(AudioAffect_Sound3D)) {
+					return FALSE;
+				}
+				break;
+			case AT_Streaming:
+				if (getDisallowSpeech() || !isOn(AudioAffect_Speech)) return FALSE;
+				break;
+		}
+
+#if RETAIL_COMPATIBLE_CRC
+		const Bool logicalAudio = eventToAdd->getIsLogicalAudio();
+#else
+		const Bool logicalAudio = FALSE;
+#endif
+		if (!logicalAudio && !eventToAdd->getUninterruptible()
+			&& !shouldPlayLocally(eventToAdd)) {
+			return FALSE;
+		}
+	}
+
+	preparedEvent.Assign_No_Add_Ref(newInstance(DynamicAudioEventRTS)(*eventToAdd));
+	preparedEvent->setPlayingHandle(allocateNewHandle());
+	preparedEvent->generateFilename();
+	eventToAdd->setPlayingAudioIndex(preparedEvent->getPlayingAudioIndex());
+	preparedEvent->generatePlayInfo();
+
+	for (std::list<std::pair<AsciiString, Real>>::const_iterator it = m_adjustedVolumes.begin();
+		it != m_adjustedVolumes.end(); ++it) {
+		if (it->first == preparedEvent->getEventName()) {
+			preparedEvent->setVolume(it->second);
+			break;
+		}
+	}
+
+	if (!forced && m_audioSettings != nullptr
+		&& preparedEvent->getVolume() < m_audioSettings->m_minVolume) {
+		preparedEvent.Clear();
+		return FALSE;
+	}
+	return TRUE;
+}
+
+//-------------------------------------------------------------------------------------------------
 AudioHandle AudioManager::addAudioEvent(const AudioEventRTS *eventToAdd)
 {
 	if (eventToAdd->getEventName().isEmpty() || eventToAdd->getEventName() == "NoSound") {

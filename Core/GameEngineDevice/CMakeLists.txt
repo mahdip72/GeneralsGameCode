@@ -278,6 +278,14 @@ target_link_libraries(corei_gameenginedevice_public INTERFACE
     rts_legacy_product_runtime
 )
 
+# Emit the configured native-device source/link closure for the architecture
+# audit.  This is generated from target properties after architecture
+# selection, so the audit cannot pass solely on source-text regexes.
+file(GENERATE
+    OUTPUT "${CMAKE_BINARY_DIR}/native_audio_link_closure.txt"
+    CONTENT "target=corei_gameenginedevice_private\nsources=$<JOIN:$<TARGET_PROPERTY:corei_gameenginedevice_private,INTERFACE_SOURCES>,|>\nlinks=$<JOIN:$<TARGET_PROPERTY:corei_gameenginedevice_private,INTERFACE_LINK_LIBRARIES>,|>\n"
+)
+
 if(RTS_BUILD_OPTION_FFMPEG)
     find_package(FFMPEG REQUIRED)
 

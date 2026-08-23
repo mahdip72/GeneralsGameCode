@@ -1,12 +1,14 @@
 #include "AudioDevice/AudioAssetSource.h"
 
+#include <cstdio>
 #include <cstdlib>
 
 namespace
 {
-void check(bool condition)
+void check(bool condition, const char *message = "catalog assertion failed")
 {
 	if (!condition) {
+		std::fprintf(stderr, "FAIL: %s\n", message);
 		std::abort();
 	}
 }
@@ -15,6 +17,26 @@ void check(bool condition)
 int main()
 {
 	AudioAssetCatalog catalog;
+	Real duration = 0.0f;
+	check(catalog.getDurationMS(AsciiString("attack.wav"), duration) && duration == 100.0f,
+		"factory-neutral attack duration is exact");
+	check(catalog.getDurationMS(AsciiString("main.wav"), duration) && duration == 400.0f,
+		"factory-neutral main duration is exact");
+	check(catalog.getDurationMS(AsciiString("decay.wav"), duration) && duration == 50.0f,
+		"factory-neutral decay duration is exact");
+	AudioPcmChunk defaultPcm;
+	check(catalog.decodePcm(AsciiString("main.wav"), defaultPcm, 3),
+		"duration-only catalog entry produces bounded PCM");
+	check(defaultPcm.frameCount == 3 && defaultPcm.data.size() == 3U * AudioAssetCatalog::BYTES_PER_FRAME,
+		"duration-only PCM allocation is bounded before materialization");
+	AudioPcmChunk continuation;
+	check(catalog.decodePcmAt(AsciiString("main.wav"), continuation, 2, 100),
+		"duration-only catalog entry supports deterministic continuation");
+	check(continuation.frameCount == 2 && continuation.startSample == 100,
+		"continuation preserves its nonzero source frame offset");
+	check(catalog.getFileIdentity(AsciiString("main.wav")) != nullptr,
+		"catalog exposes stable file identity for close notifications");
+
 	catalog.setDurationMS(AsciiString("generals_attack.wav"), 125.0f);
 	catalog.setDurationMS(AsciiString("generals_main.wav"), 350.0f);
 	catalog.setDurationMS(AsciiString("generals_decay.wav"), 75.0f);
@@ -22,7 +44,6 @@ int main()
 	catalog.setDurationMS(AsciiString("zerohour_main.wav"), 20.0f);
 	catalog.setDurationMS(AsciiString("zerohour_decay.wav"), 30.0f);
 
-	Real duration = 0.0f;
 	check(catalog.getDurationMS(AsciiString("generals_attack.wav"), duration));
 	check(duration == 125.0f);
 	check(catalog.lookupDurationMS(AsciiString("generals_main.wav"), duration));

@@ -9,7 +9,8 @@ class View;
 extern View *TheTacticalView;
 
 NullAudioManager::NullAudioManager() :
-	m_assetSource(nullptr),
+	m_ownedAssetCatalog(std::make_unique<AudioAssetCatalog>()),
+	m_assetSource(m_ownedAssetCatalog.get()),
 	m_preferredProvider(AsciiString::TheEmptyString),
 	m_preferredSpeaker(AsciiString::TheEmptyString),
 	m_lifecycleGeneration(1)
@@ -17,6 +18,17 @@ NullAudioManager::NullAudioManager() :
 }
 
 NullAudioManager::~NullAudioManager() = default;
+
+void NullAudioManager::setAssetSource(AudioAssetSource *source)
+{
+	if (source != nullptr) {
+		m_ownedAssetCatalog.reset();
+		m_assetSource = source;
+		return;
+	}
+	m_ownedAssetCatalog = std::make_unique<AudioAssetCatalog>();
+	m_assetSource = m_ownedAssetCatalog.get();
+}
 
 void NullAudioManager::init()
 {

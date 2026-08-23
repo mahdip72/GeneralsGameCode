@@ -20,7 +20,26 @@ set_target_properties(core_native_audio_asset_catalog_compile PROPERTIES
 )
 
 add_executable(core_native_audio_asset_catalog_test
-    NativeAudioAssetCatalogTestRunner.cpp
+	NativeAudioAssetCatalogTest.cpp
+)
+
+target_compile_definitions(core_native_audio_asset_catalog_test PRIVATE DISABLE_GAMEMEMORY)
+
+target_include_directories(core_native_audio_asset_catalog_test PRIVATE
+	${CMAKE_SOURCE_DIR}/Core/GameEngineDevice/Include
+	${CMAKE_SOURCE_DIR}/Core/GameEngine/Include
+	${CMAKE_SOURCE_DIR}/Core/GameEngine/Include/Precompiled
+	${CMAKE_SOURCE_DIR}/Core/Libraries/Include
+	${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas
+	${CMAKE_SOURCE_DIR}/Dependencies/Utility
+)
+
+target_sources(core_native_audio_asset_catalog_test PRIVATE
+	NativeAudioAssetCatalogRuntimeSupport.cpp
+)
+
+target_compile_options(core_native_audio_asset_catalog_test PRIVATE
+	/FI${CMAKE_SOURCE_DIR}/Dependencies/Utility/Utility/CppMacros.h
 )
 
 set_target_properties(core_native_audio_asset_catalog_test PROPERTIES

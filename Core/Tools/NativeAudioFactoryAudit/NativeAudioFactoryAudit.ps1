@@ -30,4 +30,13 @@ if ($deviceCmake -notmatch 'Source/MilesAudioDevice/AudioManagerFactory\.cpp' -o
     throw 'Architecture-specific audio factory implementations are incomplete.'
 }
 
+$managerHeader = Get-Content -LiteralPath (Join-Path $SourceRoot 'Core/GameEngineDevice/Include/XAudio2AudioDevice/XAudio2AudioManager.h') -Raw
+$managerSource = Get-Content -LiteralPath (Join-Path $SourceRoot 'Core/GameEngineDevice/Source/XAudio2AudioDevice/XAudio2AudioManager.cpp') -Raw
+if ($managerHeader -notmatch 'std::unique_ptr<AudioAssetCatalog>\s+m_ownedAssetCatalog') {
+    throw 'The native manager has no owned neutral asset catalog for the default factory path.'
+}
+if ($managerSource -notmatch 'm_ownedAssetCatalog\s*=\s*std::make_unique<AudioAssetCatalog>') {
+    throw 'The native manager default path does not construct the neutral asset catalog.'
+}
+
 Write-Output 'Native audio factory audit passed.'

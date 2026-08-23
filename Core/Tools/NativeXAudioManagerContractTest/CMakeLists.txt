@@ -23,7 +23,36 @@ set_target_properties(core_native_xaudio_manager_contract_compile PROPERTIES
 )
 
 add_executable(core_native_xaudio_manager_contract_test
-    NativeXAudioManagerContractTestRunner.cpp
+	${CMAKE_SOURCE_DIR}/Core/Tools/NativeAudioManagerContractTest/NativeAudioManagerContractTest.cpp
+	${CMAKE_SOURCE_DIR}/Core/Tools/NativeAudioManagerContractTest/NativeAudioManagerRuntimeSupport.cpp
+	${CMAKE_SOURCE_DIR}/Core/Tools/NativeAudioAssetCatalogTest/NativeAudioAssetCatalogRuntimeSupport.cpp
+	${CMAKE_SOURCE_DIR}/Core/GameEngineDevice/Source/XAudio2AudioDevice/XAudio2AudioManager.cpp
+	${CMAKE_SOURCE_DIR}/Core/GameEngineDevice/Source/AudioDevice/NullAudioManager.cpp
+	${CMAKE_SOURCE_DIR}/Core/GameEngineDevice/Source/XAudio2AudioDevice/AudioManagerFactory.cpp
+	${CMAKE_SOURCE_DIR}/Core/GameEngineDevice/Source/AudioDevice/AudioChannelPolicy.cpp
+)
+
+target_compile_definitions(core_native_xaudio_manager_contract_test PRIVATE
+	DISABLE_GAMEMEMORY
+	RTS_NATIVE_AUDIO_TEST_HOOK
+)
+
+target_include_directories(core_native_xaudio_manager_contract_test PRIVATE
+	${CMAKE_SOURCE_DIR}/Core/GameEngineDevice/Include
+	${CMAKE_SOURCE_DIR}/Core/GameEngine/Include
+	${CMAKE_SOURCE_DIR}/Core/GameEngine/Include/Precompiled
+	${CMAKE_SOURCE_DIR}/Core/Libraries/Include
+	${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas
+	${CMAKE_SOURCE_DIR}/Core/Main
+	${CMAKE_SOURCE_DIR}/Dependencies/Utility
+)
+
+target_compile_options(core_native_xaudio_manager_contract_test PRIVATE
+	/FI${CMAKE_SOURCE_DIR}/Dependencies/Utility/Utility/CppMacros.h
+)
+
+target_link_libraries(core_native_xaudio_manager_contract_test PRIVATE
+	rts_xaudio2_audio_service
 )
 
 set_target_properties(core_native_xaudio_manager_contract_test PROPERTIES

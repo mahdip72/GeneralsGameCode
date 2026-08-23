@@ -4,6 +4,9 @@
 #include "Common/AsciiString.h"
 #include "Lib/BaseType.h"
 
+#include <algorithm>
+#include <cstdint>
+#include <list>
 #include <vector>
 
 // Neutral source/decoder seam used by both device-free scripts and native audio.
@@ -16,6 +19,42 @@ public:
 	virtual Bool getDurationMS(const AsciiString &fileName, Real &durationMS) const = 0;
 	virtual Bool decodePcm(const AsciiString &fileName, AudioPcmChunk &chunk,
 		UnsignedInt maxFrames) const = 0;
+
+	// Implementations that can seek should override this to avoid materializing
+	// an entire duration-only asset.  The default remains correct for small
+	// injected sources and keeps the seam source-compatible.
+	virtual Bool decodePcmAt(const AsciiString &fileName, AudioPcmChunk &chunk,
+		UnsignedInt maxFrames, UnsignedInt startFrame) const
+	{
+		if (startFrame == 0) {
+			return decodePcm(fileName, chunk, maxFrames);
+		}
+		AudioPcmChunk whole;
+		if (!decodePcm(fileName, whole, startFrame + maxFrames)) {
+			chunk = {};
+			return FALSE;
+		}
+		const UnsignedInt bytesPerFrame = static_cast<UnsignedInt>(whole.channels) * sizeof(Short);
+		if (whole.channels == 0 || bytesPerFrame == 0 || startFrame >= whole.frameCount) {
+			chunk = {};
+			return FALSE;
+		}
+		const UnsignedInt frameCount = std::min(maxFrames, whole.frameCount - startFrame);
+		chunk = whole;
+		chunk.startSample += static_cast<std::int64_t>(startFrame);
+		chunk.frameCount = frameCount;
+		chunk.data.erase(chunk.data.begin(),
+			chunk.data.begin() + static_cast<std::size_t>(startFrame) * bytesPerFrame);
+		chunk.data.resize(static_cast<std::size_t>(frameCount) * bytesPerFrame);
+		return TRUE;
+	}
+
+	// Optional stable identity used by cache/file-close notifications.  A null
+	// result means the source does not expose an opaque file identity.
+	virtual const void *getFileIdentity(const AsciiString &) const
+	{
+		return nullptr;
+	}
 
 	Bool lookupDurationMS(const AsciiString &fileName, Real &durationMS) const
 	{
@@ -33,6 +72,19 @@ public:
 	static constexpr UnsignedShort DEFAULT_CHANNELS = 2;
 	static constexpr UnsignedInt BYTES_PER_SAMPLE = sizeof(Short);
 	static constexpr UnsignedInt BYTES_PER_FRAME = DEFAULT_CHANNELS * BYTES_PER_SAMPLE;
+
+	AudioAssetCatalog()
+	{
+		// The x64 factory always owns a real neutral decoder/catalog.  These
+		// compact entries keep script timing deterministic before game INI data
+		// registers its real paths and provide device-free PCM for smoke paths.
+		setDurationMS(AsciiString("attack.wav"), 100.0f);
+		setDurationMS(AsciiString("main.wav"), 400.0f);
+		setDurationMS(AsciiString("decay.wav"), 50.0f);
+		setDurationMS(AsciiString("zh_attack.wav"), 10.0f);
+		setDurationMS(AsciiString("zh_main.wav"), 20.0f);
+		setDurationMS(AsciiString("zh_decay.wav"), 30.0f);
+	}
 
 	void setDurationMS(const AsciiString &fileName, Real durationMS)
 	{
@@ -71,6 +123,12 @@ public:
 	Bool decodePcm(const AsciiString &fileName, AudioPcmChunk &chunk,
 		UnsignedInt maxFrames) const override
 	{
+		return decodePcmAt(fileName, chunk, maxFrames, 0);
+	}
+
+	Bool decodePcmAt(const AsciiString &fileName, AudioPcmChunk &chunk,
+		UnsignedInt maxFrames, UnsignedInt startFrame) const override
+	{
 		const Entry *entry = find(fileName);
 		if (entry == nullptr || (!entry->hasPcm && !entry->hasDuration)) {
 			chunk = {};
@@ -94,16 +152,41 @@ public:
 			chunk.channels = DEFAULT_CHANNELS;
 			chunk.format = AudioPcmFormat::SIGNED_16_INTERLEAVED_LITTLE_ENDIAN;
 			const Real frameValue = entry->durationMS * static_cast<Real>(DEFAULT_SAMPLE_RATE) / 1000.0f;
-			chunk.frameCount = frameValue <= 0.0f ? 0U : static_cast<UnsignedInt>(frameValue);
+			const UnsignedInt totalFrames = frameValue <= 0.0f ? 0U
+				: static_cast<UnsignedInt>(frameValue);
+			if (startFrame >= totalFrames) {
+				chunk = {};
+				return FALSE;
+			}
+			chunk.startSample = static_cast<std::int64_t>(startFrame);
+			chunk.frameCount = std::min(maxFrames, totalFrames - startFrame);
 			chunk.data.assign(static_cast<std::size_t>(chunk.frameCount) * BYTES_PER_FRAME, 0U);
 		}
 
-		if (chunk.frameCount > maxFrames) {
-			chunk.frameCount = maxFrames;
+		if (entry->hasPcm && startFrame >= chunk.frameCount) {
+			chunk = {};
+			return FALSE;
 		}
 		const UnsignedInt bytesPerFrame = static_cast<UnsignedInt>(chunk.channels) * BYTES_PER_SAMPLE;
-		chunk.data.resize(static_cast<std::size_t>(chunk.frameCount) * bytesPerFrame);
+		if (entry->hasPcm) {
+			const UnsignedInt availableFrames = chunk.frameCount;
+			const UnsignedInt frameCount = std::min(maxFrames, availableFrames - startFrame);
+			const std::size_t begin = static_cast<std::size_t>(startFrame) * bytesPerFrame;
+			const std::size_t end = begin + static_cast<std::size_t>(frameCount) * bytesPerFrame;
+			std::vector<std::uint8_t> slice(chunk.data.begin() + begin, chunk.data.begin() + end);
+			chunk.data.swap(slice);
+			chunk.startSample += static_cast<std::int64_t>(startFrame);
+			chunk.frameCount = frameCount;
+		} else {
+			chunk.data.resize(static_cast<std::size_t>(chunk.frameCount) * bytesPerFrame);
+		}
 		return TRUE;
+	}
+
+	const void *getFileIdentity(const AsciiString &fileName) const override
+	{
+		const Entry *entry = find(fileName);
+		return entry == nullptr ? nullptr : entry;
 	}
 
 	Bool getEventDurationMS(const AsciiString &attackFile, const AsciiString &mainFile,
@@ -157,5 +240,7 @@ private:
 		return nullptr;
 	}
 
-	std::vector<Entry> m_entries;
+	// Entries are list-backed so the opaque identity returned to a playing
+	// record remains stable when a later INI/catalog registration appends data.
+	std::list<Entry> m_entries;
 };

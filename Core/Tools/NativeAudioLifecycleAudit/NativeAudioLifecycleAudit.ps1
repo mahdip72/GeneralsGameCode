@@ -59,6 +59,9 @@ Require $nullSource 'removeLevelSpecificAudioEventInfos\(\)' 'Null reset does no
 Require $nullSource '\+\+m_lifecycleGeneration' 'Null reset does not advance generation'
 Require $nullSource 'TheTacticalView\s*!=\s*nullptr' 'Null headless update guard missing'
 Require $xaudioSource 'TheTacticalView\s*!=\s*nullptr' 'XAudio headless update guard missing'
+Require $xaudioSource 'prepareAudioEventForPlayback' 'native manager does not reuse neutral admission semantics'
+Require $xaudioSource 'resetVoice\(playing\.voice,\s*playing\.generation\)' 'native manager does not activate voice generation before submit'
+Require $xaudioSource 'if \(reopen\)\s*\{\s*openDevice\(\)' 'native reset does not reopen reusable service admission'
 Require $assetSource 'getEventDurationMS' 'attack/main/decay duration helper missing'
 
 Write-Output 'native audio lifecycle audit passed'
