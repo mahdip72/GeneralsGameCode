@@ -273,6 +273,18 @@ if(RTS_BUILD_OPTION_FFMPEG)
     find_package(FFMPEG REQUIRED)
 
     if(FFMPEG_FOUND)
+        add_library(rts_ffmpeg_audio_decoder STATIC
+            Include/AudioDevice/AudioPcmTypes.h
+            Include/VideoDevice/FFmpeg/FFmpegAudioDecoder.h
+            Source/VideoDevice/FFmpeg/FFmpegAudioDecoder.cpp
+        )
+        target_include_directories(rts_ffmpeg_audio_decoder PUBLIC Include)
+        target_link_libraries(rts_ffmpeg_audio_decoder PUBLIC
+            FFMPEG::avutil
+            FFMPEG::swresample
+        )
+        target_compile_features(rts_ffmpeg_audio_decoder PUBLIC cxx_std_20)
+
         target_sources(corei_gameenginedevice_private INTERFACE
             Include/VideoDevice/FFmpeg/FFmpegFile.h
             Include/VideoDevice/FFmpeg/FFmpegVideoPlayer.h
@@ -280,6 +292,7 @@ if(RTS_BUILD_OPTION_FFMPEG)
             Source/VideoDevice/FFmpeg/FFmpegVideoPlayer.cpp
         )
         target_link_libraries(corei_gameenginedevice_private INTERFACE
+            rts_ffmpeg_audio_decoder
             FFMPEG::avcodec
             FFMPEG::avformat
             FFMPEG::avutil
