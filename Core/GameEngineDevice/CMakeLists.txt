@@ -302,3 +302,18 @@ if(RTS_BUILD_OPTION_FFMPEG)
         target_compile_definitions(corei_gameenginedevice_public INTERFACE RTS_HAS_FFMPEG)
     endif()
 endif()
+
+if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32)
+    add_library(rts_xaudio2_pcm_voice STATIC
+        Include/XAudio2AudioDevice/XAudio2PcmVoice.h
+        Source/XAudio2AudioDevice/XAudio2PcmVoice.cpp
+    )
+    target_include_directories(rts_xaudio2_pcm_voice PUBLIC Include)
+    target_link_libraries(rts_xaudio2_pcm_voice PUBLIC rts_xaudio2)
+    target_compile_features(rts_xaudio2_pcm_voice PUBLIC cxx_std_20)
+    if(RTS_BUILD_OPTION_FFMPEG)
+        target_link_libraries(rts_xaudio2_pcm_voice PRIVATE rts_ffmpeg_audio_decoder)
+        target_compile_definitions(rts_xaudio2_pcm_voice PRIVATE RTS_XAUDIO2_PCM_HAS_FFMPEG)
+    endif()
+    target_link_libraries(corei_gameenginedevice_private INTERFACE rts_xaudio2_pcm_voice)
+endif()

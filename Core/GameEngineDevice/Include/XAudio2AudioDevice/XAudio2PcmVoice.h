@@ -1,0 +1,102 @@
+#pragma once
+
+#include "AudioDevice/AudioPcmTypes.h"
+
+#include <array>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <mutex>
+
+#include <xaudio2.h>
+
+class IXAudio2PcmVoiceBackend
+{
+public:
+	virtual ~IXAudio2PcmVoiceBackend() = default;
+
+	virtual HRESULT create(const WAVEFORMATEX &format, IXAudio2VoiceCallback *callback) noexcept = 0;
+	virtual HRESULT submit(const XAUDIO2_BUFFER &buffer) noexcept = 0;
+	virtual HRESULT start() noexcept = 0;
+	virtual HRESULT stop() noexcept = 0;
+	virtual HRESULT flush() noexcept = 0;
+	virtual HRESULT getCriticalError() const noexcept = 0;
+	virtual void destroy() noexcept = 0;
+};
+
+class XAudio2PcmVoice final : public AudioPcmSink, public IXAudio2VoiceCallback
+{
+public:
+	static constexpr std::size_t SLOT_COUNT = 8;
+
+	explicit XAudio2PcmVoice(IXAudio2PcmVoiceBackend &backend);
+	~XAudio2PcmVoice();
+
+	XAudio2PcmVoice(const XAudio2PcmVoice &) = delete;
+	XAudio2PcmVoice &operator=(const XAudio2PcmVoice &) = delete;
+
+	// These methods are owned by the audio thread. The backend is only touched here.
+	bool open();
+	void service();
+	void close();
+
+	bool isOpen() const noexcept;
+	bool isFailed() const noexcept;
+	HRESULT getLastError() const noexcept;
+
+	AudioPcmSubmitResult submit(AudioPcmChunk &&chunk) override;
+	void reset(std::uint64_t generation) override;
+
+	void STDMETHODCALLTYPE OnVoiceProcessingPassStart(UINT32 BytesRequired) override;
+	void STDMETHODCALLTYPE OnVoiceProcessingPassEnd() override;
+	void STDMETHODCALLTYPE OnStreamEnd() override;
+	void STDMETHODCALLTYPE OnBufferStart(void *pBufferContext) override;
+	void STDMETHODCALLTYPE OnBufferEnd(void *pBufferContext) override;
+	void STDMETHODCALLTYPE OnLoopEnd(void *pBufferContext) override;
+	void STDMETHODCALLTYPE OnVoiceError(void *pBufferContext, HRESULT Error) override;
+
+private:
+	enum class SlotState : std::uint8_t
+	{
+		FREE,
+		PENDING,
+		SUBMITTED
+	};
+
+	struct Slot
+	{
+		AudioPcmChunk chunk;
+		XAUDIO2_BUFFER buffer = {};
+		std::uint64_t generation = 0;
+		std::uint64_t sequence = 0;
+		SlotState state = SlotState::FREE;
+		bool cancelled = false;
+		std::atomic<bool> callbackComplete { false };
+	};
+
+	static WAVEFORMATEX pcmFormat();
+	static bool isValidChunk(const AudioPcmChunk &chunk);
+
+	void clearSlot(Slot &slot);
+	void reclaimCompletedSlots();
+	Slot *findFreeSlot();
+	Slot *findNextPendingSlot();
+	bool hasSubmittedOldSlot() const;
+	bool consumeCallbackError(HRESULT &error);
+	void fail(HRESULT error);
+	bool checkExternalFailure();
+
+	IXAudio2PcmVoiceBackend &m_backend;
+	mutable std::mutex m_mutex;
+	std::array<Slot, SLOT_COUNT> m_slots;
+	std::atomic<bool> m_open;
+	std::atomic<bool> m_failed;
+	std::atomic<bool> m_callbackError;
+	std::atomic<HRESULT> m_callbackErrorCode;
+	std::atomic<HRESULT> m_lastError;
+	std::uint64_t m_requestedGeneration;
+	std::uint64_t m_activeGeneration;
+	bool m_resetPending;
+	bool m_started;
+	bool m_backendCreated;
+};
