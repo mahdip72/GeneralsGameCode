@@ -20,7 +20,8 @@ if ($module -notmatch 'CMAKE_SIZEOF_VOID_P EQUAL 8') {
 if ($module -notmatch 'xaudio2\.lib') {
     throw 'Native XAudio2 module does not resolve the SDK import library.'
 }
-if ($module -notmatch '_WIN32_WINNT=0x0A00' -or $module -notmatch 'WINVER=0x0A00') {
+if ($module -notmatch '_WIN32_WINNT=0x0A00' -or $module -notmatch 'WINVER=0x0A00' -or
+    $module -notmatch 'NTDDI_VERSION=NTDDI_WIN10_19H1') {
     throw 'Native XAudio2 module does not declare the Windows 10 API contract.'
 }
 

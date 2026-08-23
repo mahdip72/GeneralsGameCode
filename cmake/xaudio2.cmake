@@ -44,5 +44,5 @@ target_link_libraries(rts_xaudio2 INTERFACE "${RTS_XAUDIO2_LIBRARY}")
 target_compile_definitions(rts_xaudio2 INTERFACE
     _WIN32_WINNT=0x0A00
     WINVER=0x0A00
-    NTDDI_VERSION=NTDDI_WIN10
+    NTDDI_VERSION=NTDDI_WIN10_19H1
 )
