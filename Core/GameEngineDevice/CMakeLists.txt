@@ -260,6 +260,10 @@ target_link_libraries(corei_gameenginedevice_private INTERFACE
     stb
 )
 
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    target_link_libraries(corei_gameenginedevice_private INTERFACE rts_xaudio2)
+endif()
+
 target_link_libraries(corei_gameenginedevice_public INTERFACE
     corei_gameengine_public
     rts_legacy_product_runtime
