@@ -1,5 +1,6 @@
 #include "AudioDevice/NullAudioManager.h"
 
+#include "AudioDevice/AudioAssetSource.h"
 #include "Common/AudioEventRTS.h"
 #include "Common/AudioRequest.h"
 #include "Common/AudioHandleSpecialValues.h"
@@ -75,6 +76,9 @@ AsciiString NullAudioManager::getProviderName(UnsignedInt) const
 
 Real NullAudioManager::getFileLengthMS(AsciiString fileName) const
 {
-	(void)fileName;
+	Real durationMS = 0.0f;
+	if (m_assetSource != nullptr && m_assetSource->getDurationMS(fileName, durationMS)) {
+		return durationMS;
+	}
 	return 0.0f;
 }

@@ -222,6 +222,7 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4)
 else()
     list(APPEND GAMEENGINEDEVICE_SRC
         Include/AudioDevice/AudioChannelPolicy.h
+        Include/AudioDevice/AudioAssetSource.h
         Source/AudioDevice/AudioChannelPolicy.cpp
         Include/AudioDevice/AudioManagerFactory.h
         Include/AudioDevice/NullAudioManager.h
