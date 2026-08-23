@@ -34,12 +34,24 @@
 #include "Win32Device/Common/Win32GameEngine.h"
 #include "Common/PerfTimer.h"
 #include "Common/GameThreadOwnership.h"
+#include "MilesAudioDevice/MilesAudioManager.h"
 
 #include "rts/profile.h"
 
 #include "GameNetwork/LANAPICallbacks.h"
 
 extern DWORD TheMessageTime;
+
+//-------------------------------------------------------------------------------------------------
+/** Create the legacy Win32 audio backend.  Native backends are selected from
+ *  this implementation seam so that the engine header remains backend-neutral. */
+//-------------------------------------------------------------------------------------------------
+AudioManager *Win32GameEngine::createAudioManager(Bool dummy)
+{
+	if (dummy)
+		return NEW MilesAudioManagerDummy;
+	return NEW MilesAudioManager;
+}
 
 //-------------------------------------------------------------------------------------------------
 /** Constructor for Win32GameEngine */
