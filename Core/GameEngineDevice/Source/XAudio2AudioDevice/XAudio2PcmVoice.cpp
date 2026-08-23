@@ -145,7 +145,7 @@ void XAudio2PcmVoice::reclaimCompletedSlots()
 bool XAudio2PcmVoice::hasSubmittedOldSlot() const
 {
 	for (const Slot &slot : m_slots) {
-		if (slot.state == SlotState::SUBMITTED && slot.generation != m_requestedGeneration) {
+		if (slot.state == SlotState::SUBMITTED && slot.cancelled) {
 			return true;
 		}
 	}
@@ -333,6 +333,7 @@ AudioPcmSubmitResult XAudio2PcmVoice::submit(AudioPcmChunk &&chunk)
 void XAudio2PcmVoice::reset(std::uint64_t generation)
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
+	const bool repeatedPendingReset = m_resetPending && m_requestedGeneration == generation;
 	m_requestedGeneration = generation;
 	if (!m_open.load(std::memory_order_acquire)) {
 		m_activeGeneration = generation;
@@ -344,10 +345,15 @@ void XAudio2PcmVoice::reset(std::uint64_t generation)
 	}
 
 	m_resetPending = true;
+	if (!repeatedPendingReset) {
+		for (Slot &slot : m_slots) {
+			if (slot.state == SlotState::PENDING) {
+				clearSlot(slot);
+			}
+		}
+	}
 	for (Slot &slot : m_slots) {
-		if (slot.state == SlotState::PENDING && slot.generation != generation) {
-			clearSlot(slot);
-		} else if (slot.state == SlotState::SUBMITTED && slot.generation != generation) {
+		if (slot.state == SlotState::SUBMITTED) {
 			slot.cancelled = true;
 		}
 	}
@@ -388,4 +394,5 @@ void STDMETHODCALLTYPE XAudio2PcmVoice::OnVoiceError(void *, HRESULT Error)
 	m_callbackErrorCode.store(Error, std::memory_order_release);
 	m_lastError.store(FAILED(Error) ? Error : E_FAIL, std::memory_order_release);
 	m_callbackError.store(true, std::memory_order_release);
+	m_failed.store(true, std::memory_order_release);
 }

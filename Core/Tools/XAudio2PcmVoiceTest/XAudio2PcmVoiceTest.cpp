@@ -362,6 +362,8 @@ void testTerminalFailures()
 		voice.submit(makeChunk(0, 0, 37));
 		voice.service();
 		backend.voiceError(E_FAIL);
+		check(voice.submit(makeChunk(0, 1, 39)) == AudioPcmSubmitResult::DROPPED,
+			"source voice callback error drops submissions before service observes it");
 		voice.service();
 		check(voice.isFailed(), "source voice callback error enters terminal state");
 		voice.close();
@@ -377,6 +379,36 @@ void testTerminalFailures()
 		check(backend.submitCalls == 0, "critical engine error prevents submission");
 		voice.close();
 	}
+}
+
+void testSameGenerationResetBarrier()
+{
+	FakePcmVoiceBackend backend;
+	XAudio2PcmVoice voice(backend);
+	check(voice.open(), "same-generation reset voice opens");
+	check(voice.submit(makeChunk(0, 0, 45)) == AudioPcmSubmitResult::ACCEPTED,
+		"same-generation old chunk is admitted");
+	voice.service();
+	check(backend.submissions.size() == 1, "same-generation old chunk reaches the backend");
+
+	voice.reset(0);
+	check(voice.submit(makeChunk(0, 1, 46)) == AudioPcmSubmitResult::ACCEPTED,
+		"same-generation new chunk is admitted behind reset");
+	voice.service();
+	check(backend.submissions.size() == 1,
+		"same-generation reset keeps new data behind the old callback barrier");
+	check(backend.stopCalls == 0 && backend.flushCalls == 0,
+		"same-generation reset does not stop or flush before old completion");
+
+	backend.complete(0);
+	voice.service();
+	check(backend.stopCalls == 1 && backend.flushCalls == 1,
+		"same-generation reset requests its barrier after old completion");
+	check(backend.submissions.size() == 2,
+		"same-generation new data reaches the backend after the barrier");
+	check(backend.submissions[1].audio[0] == 46,
+		"same-generation reset submits the new chunk after the old chunk");
+	voice.close();
 }
 
 void testReopenAndRepeatedCleanup()
@@ -413,6 +445,7 @@ int main()
 	testOwnedStorageAndOwnerOnlyReclaim();
 	testValidationAndClosedAdmission();
 	testResetBarrierAndGenerationActivation();
+	testSameGenerationResetBarrier();
 	testTerminalFailures();
 	testReopenAndRepeatedCleanup();
 	if (g_failures != 0) {
