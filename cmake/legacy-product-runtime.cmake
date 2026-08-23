@@ -16,6 +16,7 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4)
         target_link_libraries(rts_legacy_product_runtime INTERFACE binkstub)
     endif()
 elseif(RTS_BUILD_PRODUCT AND (RTS_BUILD_ZEROHOUR OR RTS_BUILD_GENERALS))
+    target_link_libraries(rts_legacy_product_runtime INTERFACE rts_xaudio2)
     message(FATAL_ERROR
         "Native x64 product targets require the Stage 3 D3D11, XAudio2, and FFmpeg runtime replacements. "
         "Configure the x64 foundation preset until those product dependencies are migrated."

@@ -19,6 +19,7 @@ if(RTS_BUILD_CORE_EXTRAS)
         add_subdirectory(ThreadHandleContractTest)
         add_subdirectory(RegistryHandleContractTest)
         add_subdirectory(VersionHandleContractTest)
+        add_subdirectory(XAudio2ContractTest)
     endif()
     add_subdirectory(JobSystemTest)
     if(NOT IS_VS6_BUILD)
@@ -29,6 +30,12 @@ if(RTS_BUILD_CORE_EXTRAS)
     endif()
 
     if(WIN32)
+        add_test(NAME core_native_audio_backend_audit
+            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeAudioBackendAudit/NativeAudioBackendAudit.ps1"
+                -SourceRoot "${CMAKE_SOURCE_DIR}"
+        )
+        set_tests_properties(core_native_audio_backend_audit PROPERTIES TIMEOUT 30)
         add_test(NAME core_portability_audit
             COMMAND powershell -NoProfile -ExecutionPolicy Bypass
                 -File "${CMAKE_CURRENT_SOURCE_DIR}/PortabilityAudit/PortabilityAudit.ps1"

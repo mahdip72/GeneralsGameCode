@@ -1,0 +1,14 @@
+add_executable(core_xaudio2_contract_test
+    XAudio2ContractTest.cpp
+)
+
+target_link_libraries(core_xaudio2_contract_test PRIVATE rts_xaudio2)
+
+set_target_properties(core_xaudio2_contract_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+)
+
+add_test(NAME core_xaudio2_contract_test COMMAND core_xaudio2_contract_test)
+set_tests_properties(core_xaudio2_contract_test PROPERTIES TIMEOUT 30)

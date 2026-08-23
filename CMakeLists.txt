@@ -72,6 +72,7 @@ else()
     add_library(stlport INTERFACE)
 endif()
 
+include(cmake/xaudio2.cmake)
 include(cmake/legacy-product-runtime.cmake)
 include(cmake/gamespy.cmake)
 include(cmake/lzhl.cmake)
