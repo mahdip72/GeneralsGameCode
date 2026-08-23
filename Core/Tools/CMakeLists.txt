@@ -21,6 +21,7 @@ if(RTS_BUILD_CORE_EXTRAS)
         add_subdirectory(VersionHandleContractTest)
         add_subdirectory(XAudio2ContractTest)
         add_subdirectory(XAudio2PcmVoiceTest)
+        add_subdirectory(XAudio2AudioServiceTest)
         if(RTS_BUILD_OPTION_FFMPEG)
             add_subdirectory(FFmpegContractTest)
             add_subdirectory(FFmpegFileBehaviorTest)
@@ -42,6 +43,12 @@ if(RTS_BUILD_CORE_EXTRAS)
                 -SourceRoot "${CMAKE_SOURCE_DIR}"
         )
         set_tests_properties(core_native_audio_backend_audit PROPERTIES TIMEOUT 30)
+        add_test(NAME core_xaudio2_audio_service_audit
+            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/XAudio2AudioServiceAudit/XAudio2AudioServiceAudit.ps1"
+                -SourceRoot "${CMAKE_SOURCE_DIR}"
+        )
+        set_tests_properties(core_xaudio2_audio_service_audit PROPERTIES TIMEOUT 30)
         add_test(NAME core_native_audio_factory_audit
             COMMAND powershell -NoProfile -ExecutionPolicy Bypass
                 -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeAudioFactoryAudit/NativeAudioFactoryAudit.ps1"

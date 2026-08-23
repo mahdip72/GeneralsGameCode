@@ -217,11 +217,6 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4)
         Source/MilesAudioDevice/MilesAudioManager.cpp
         Source/MilesAudioDevice/AudioChannelPolicy.cpp
     )
-elseif(CMAKE_SIZEOF_VOID_P EQUAL 8)
-    list(APPEND GAMEENGINEDEVICE_SRC
-        Include/XAudio2AudioDevice/XAudio2AudioService.h
-        Source/XAudio2AudioDevice/XAudio2AudioService.cpp
-    )
 endif()
 
 if(NOT RTS_BUILD_OPTION_FFMPEG)
@@ -316,4 +311,19 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32)
         target_compile_definitions(rts_xaudio2_pcm_voice PRIVATE RTS_XAUDIO2_PCM_HAS_FFMPEG)
     endif()
     target_link_libraries(corei_gameenginedevice_private INTERFACE rts_xaudio2_pcm_voice)
+
+    add_library(rts_xaudio2_audio_service STATIC
+        Include/XAudio2AudioDevice/IXAudio2AudioEngineBackend.h
+        Include/XAudio2AudioDevice/XAudio2AudioService.h
+        Include/XAudio2AudioDevice/XAudio2NativeAudioEngine.h
+        Source/XAudio2AudioDevice/XAudio2AudioService.cpp
+        Source/XAudio2AudioDevice/XAudio2NativeAudioEngine.cpp
+    )
+    target_include_directories(rts_xaudio2_audio_service PUBLIC Include)
+    target_link_libraries(rts_xaudio2_audio_service PUBLIC
+        rts_xaudio2
+        rts_xaudio2_pcm_voice
+    )
+    target_compile_features(rts_xaudio2_audio_service PUBLIC cxx_std_20)
+    target_link_libraries(corei_gameenginedevice_private INTERFACE rts_xaudio2_audio_service)
 endif()

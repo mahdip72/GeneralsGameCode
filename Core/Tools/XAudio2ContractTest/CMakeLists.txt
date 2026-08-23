@@ -1,13 +1,12 @@
 add_executable(core_xaudio2_contract_test
     XAudio2ContractTest.cpp
-    ${CMAKE_SOURCE_DIR}/Core/GameEngineDevice/Source/XAudio2AudioDevice/XAudio2AudioService.cpp
 )
 
 target_include_directories(core_xaudio2_contract_test PRIVATE
     ${CMAKE_SOURCE_DIR}/Core/GameEngineDevice/Include
 )
 
-target_link_libraries(core_xaudio2_contract_test PRIVATE rts_xaudio2)
+target_link_libraries(core_xaudio2_contract_test PRIVATE rts_xaudio2_audio_service)
 
 set_target_properties(core_xaudio2_contract_test PROPERTIES
     CXX_STANDARD 20

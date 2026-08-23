@@ -299,6 +299,14 @@ HRESULT XAudio2PcmVoice::getLastError() const noexcept
 	return m_lastError.load(std::memory_order_acquire);
 }
 
+void XAudio2PcmVoice::failFromService(HRESULT error) noexcept
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	if (m_open.load(std::memory_order_acquire)) {
+		fail(error);
+	}
+}
+
 AudioPcmSubmitResult XAudio2PcmVoice::submit(AudioPcmChunk &&chunk)
 {
 	std::lock_guard<std::mutex> lock(m_mutex);

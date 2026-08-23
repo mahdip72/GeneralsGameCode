@@ -43,6 +43,10 @@ public:
 	bool isOpen() const noexcept;
 	bool isFailed() const noexcept;
 	HRESULT getLastError() const noexcept;
+	// Called by the owning audio service after it observes an engine-level
+	// critical error.  The service owns the failure transition; callbacks only
+	// publish atomics and never call this method.
+	void failFromService(HRESULT error) noexcept;
 
 	AudioPcmSubmitResult submit(AudioPcmChunk &&chunk) override;
 	void reset(std::uint64_t generation) override;
