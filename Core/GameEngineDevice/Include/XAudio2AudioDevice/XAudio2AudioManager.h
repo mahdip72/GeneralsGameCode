@@ -1,12 +1,29 @@
 #pragma once
 
+#include "AudioDevice/AudioAssetSource.h"
+#include "Common/AudioEventRTS.h"
 #include "Common/GameAudio.h"
+#include "XAudio2AudioDevice/XAudio2AudioService.h"
+
+#include <memory>
+#include <vector>
 
 class XAudio2AudioManager final : public AudioManager
 {
 public:
+	enum class Channel : UnsignedByte
+	{
+		SAMPLE_2D,
+		SAMPLE_3D,
+		STREAM
+	};
+
 	XAudio2AudioManager();
+	XAudio2AudioManager(XAudio2AudioService *service, AudioAssetSource *assetSource);
 	~XAudio2AudioManager() override;
+
+	XAudio2AudioManager(const XAudio2AudioManager &) = delete;
+	XAudio2AudioManager &operator=(const XAudio2AudioManager &) = delete;
 
 #if defined(RTS_DEBUG)
 	void audioDebugDisplay(DebugDisplayInterface *, void *, FILE * = nullptr) override {}
@@ -17,16 +34,17 @@ public:
 	void reset() override;
 	void update() override;
 
-	void stopAudio(AudioAffect) override {}
-	void pauseAudio(AudioAffect) override {}
-	void resumeAudio(AudioAffect) override {}
-	void pauseAmbient(Bool) override {}
-	void killAudioEventImmediately(AudioHandle) override {}
+	AudioHandle addAudioEvent(const AudioEventRTS *eventToAdd) override;
+	void stopAudio(AudioAffect which) override;
+	void pauseAudio(AudioAffect which) override;
+	void resumeAudio(AudioAffect which) override;
+	void pauseAmbient(Bool shouldPause) override;
+	void killAudioEventImmediately(AudioHandle audioEvent) override;
 
 	AsciiString nextMusicTrack() override;
 	AsciiString prevMusicTrack() override;
-	Bool isMusicPlaying() const override { return FALSE; }
-	Bool hasMusicTrackCompleted(const AsciiString &, Int) const override { return FALSE; }
+	Bool isMusicPlaying() const override;
+	Bool hasMusicTrackCompleted(const AsciiString &trackName, Int numberOfTimes) const override;
 
 	void openDevice() override;
 	void closeDevice() override;
@@ -36,38 +54,110 @@ public:
 	UnsignedInt getProviderCount() const override { return 1; }
 	AsciiString getProviderName(UnsignedInt providerNum) const override;
 	UnsignedInt getProviderIndex(AsciiString providerName) const override;
-	void selectProvider(UnsignedInt) override {}
-	void unselectProvider() override {}
-	UnsignedInt getSelectedProvider() const override { return 0; }
-	void setSpeakerType(UnsignedInt) override {}
-	UnsignedInt getSpeakerType() override { return 0; }
+	void selectProvider(UnsignedInt providerNum) override;
+	void unselectProvider() override;
+	UnsignedInt getSelectedProvider() const override { return m_providerSelected ? 0U : PROVIDER_ERROR; }
+	void setSpeakerType(UnsignedInt speakerType) override { m_speakerType = speakerType; }
+	UnsignedInt getSpeakerType() override { return m_speakerType; }
 
-	UnsignedInt getNum2DSamples() const override { return 0; }
-	UnsignedInt getNum3DSamples() const override { return 0; }
-	UnsignedInt getNumStreams() const override { return 0; }
-	UnsignedInt getNumAvailable2DSamples() const override { return 0; }
-	UnsignedInt getNumAvailable3DSamples() const override { return 0; }
+	UnsignedInt getNum2DSamples() const override { return m_num2DSamples; }
+	UnsignedInt getNum3DSamples() const override { return m_num3DSamples; }
+	UnsignedInt getNumStreams() const override { return m_numStreams; }
+	UnsignedInt getNumAvailable2DSamples() const override;
+	UnsignedInt getNumAvailable3DSamples() const override;
 
-	Bool doesViolateLimit(AudioEventRTS *) const override { return FALSE; }
-	Bool isPlayingLowerPriority(AudioEventRTS *) const override { return FALSE; }
-	Bool isPlayingAlready(AudioEventRTS *) const override { return FALSE; }
-	Bool isObjectPlayingVoice(UnsignedInt) const override { return FALSE; }
-	void adjustVolumeOfPlayingAudio(AsciiString, Real) override {}
-	void removePlayingAudio(AsciiString) override {}
-	void removeAllDisabledAudio() override {}
-	Bool has3DSensitiveStreamsPlaying() const override { return FALSE; }
-	void friend_forcePlayAudioEventRTS(const AudioEventRTS *) override {}
+	Bool doesViolateLimit(AudioEventRTS *event) const override;
+	Bool isPlayingLowerPriority(AudioEventRTS *event) const override;
+	Bool isPlayingAlready(AudioEventRTS *event) const override;
+	Bool isObjectPlayingVoice(UnsignedInt objID) const override;
+
+	void adjustVolumeOfPlayingAudio(AsciiString eventName, Real newVolume) override;
+	void removePlayingAudio(AsciiString eventName) override;
+	void removeAllDisabledAudio() override;
+	Bool has3DSensitiveStreamsPlaying() const override;
+	void friend_forcePlayAudioEventRTS(const AudioEventRTS *eventToPlay) override;
 
 	void setPreferredProvider(AsciiString provider) override { m_preferredProvider = provider; }
 	void setPreferredSpeaker(AsciiString speaker) override { m_preferredSpeaker = speaker; }
-	Real getFileLengthMS(AsciiString) const override { return 0.0f; }
-	void closeAnySamplesUsingFile(const void *) override {}
+	Real getFileLengthMS(AsciiString fileName) const override;
+	void closeAnySamplesUsingFile(const void *fileToClose) override;
+
+	void processRequestList() override;
+
+	void setService(XAudio2AudioService *service);
+	XAudio2AudioService *getService() const { return m_service; }
+	void setAssetSource(AudioAssetSource *assetSource) { m_assetSource = assetSource; }
+	AudioAssetSource *getAssetSource() const { return m_assetSource; }
+	UnsignedInt getLifecycleGeneration() const { return m_lifecycleGeneration; }
+	UnsignedInt getActiveAudioCount() const { return static_cast<UnsignedInt>(m_playing.size()); }
+	UnsignedInt getPendingAudioRequestCount() const
+	{
+		return static_cast<UnsignedInt>(m_audioRequests.size());
+	}
+	Bool isOpen() const { return m_open; }
 
 protected:
 	void setDeviceListenerPosition() override {}
 
 private:
+	struct PlayingAudio
+	{
+		RefCountPtr<DynamicAudioEventRTS> event;
+		XAudio2PcmVoiceHandle voice;
+		Channel channel = Channel::SAMPLE_2D;
+		PortionToPlay phase = PP_Done;
+		UnsignedInt generation = 0;
+		std::uint64_t voiceSequence = 0;
+		Real phaseRemainingMS = 0.0f;
+		Real phaseDurationMS = 0.0f;
+		Real volume = 1.0f;
+		Real fadeVolume = 1.0f;
+		Int fadeFrames = 0;
+		Bool paused = FALSE;
+		Bool stopping = FALSE;
+		Bool forced = FALSE;
+		Bool voiceOpen = FALSE;
+	};
+
+	DynamicAudioEventRTS *copyEvent(const AudioEventRTS *eventToCopy);
+	void enqueuePlay(DynamicAudioEventRTS *event, Bool forced);
+	void processPlayRequest(AudioRequest *request);
+	void processStopRequest(AudioHandle handle);
+	void processPauseRequest(AudioHandle handle);
+	void startNextPhase(PlayingAudio &playing);
+	void finishPlaying(PlayingAudio &playing);
+	void drainCompletions();
+	void processActiveAudio();
+	void processFades();
+	void releaseVoice(PlayingAudio &playing);
+	Bool ensureVoice(PlayingAudio &playing);
+	Bool submitPhase(PlayingAudio &playing);
+	Bool isChannelFull(Channel channel) const;
+	UnsignedInt channelCount(Channel channel) const;
+	UnsignedInt channelLimit(Channel channel) const;
+	PlayingAudio *findPlaying(AudioHandle handle);
+	const PlayingAudio *findPlaying(AudioHandle handle) const;
+	PlayingAudio *findLowestPriority(Channel channel, AudioPriority minimumPriority);
+	Real effectiveVolume(const PlayingAudio &playing) const;
+	void recordMusicCompletion(const PlayingAudio &playing);
+	void clearPlaying();
+
+	std::unique_ptr<XAudio2AudioService> m_ownedService;
+	XAudio2AudioService *m_service;
+	AudioAssetSource *m_assetSource;
+	std::vector<PlayingAudio> m_playing;
+	std::vector<AudioHandle> m_forcePlayHandles;
+	std::vector<std::pair<AsciiString, Int>> m_musicCompletions;
+	AsciiString m_activeMusicTrack;
 	AsciiString m_preferredProvider;
 	AsciiString m_preferredSpeaker;
+	UnsignedInt m_lifecycleGeneration;
+	UnsignedInt m_num2DSamples;
+	UnsignedInt m_num3DSamples;
+	UnsignedInt m_numStreams;
+	UnsignedInt m_speakerType;
+	Bool m_providerSelected;
 	Bool m_open;
+	Bool m_admissionOpen;
+	Bool m_ambientPaused;
 };

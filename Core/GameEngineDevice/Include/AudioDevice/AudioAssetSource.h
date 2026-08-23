@@ -106,6 +106,25 @@ public:
 		return TRUE;
 	}
 
+	Bool getEventDurationMS(const AsciiString &attackFile, const AsciiString &mainFile,
+		const AsciiString &decayFile, Real &durationMS) const
+	{
+		durationMS = 0.0f;
+		const AsciiString files[] = { attackFile, mainFile, decayFile };
+		for (const AsciiString &fileName : files) {
+			if (fileName.isEmpty()) {
+				continue;
+			}
+			Real part = 0.0f;
+			if (!getDurationMS(fileName, part)) {
+				durationMS = 0.0f;
+				return FALSE;
+			}
+			durationMS += part;
+		}
+		return TRUE;
+	}
+
 private:
 	struct Entry
 	{

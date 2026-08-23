@@ -226,6 +226,21 @@ public:
 		return m_voice != nullptr ? m_voice->Stop(0, 0) : E_HANDLE;
 	}
 
+	HRESULT pause() noexcept override
+	{
+		return stop();
+	}
+
+	HRESULT resume() noexcept override
+	{
+		return m_voice != nullptr ? m_voice->Start(0, 0) : E_HANDLE;
+	}
+
+	HRESULT setVolume(float volume) noexcept override
+	{
+		return m_voice != nullptr ? m_voice->SetVolume(volume) : E_HANDLE;
+	}
+
 	HRESULT flush() noexcept override
 	{
 		return m_voice != nullptr ? m_voice->FlushSourceBuffers() : E_HANDLE;

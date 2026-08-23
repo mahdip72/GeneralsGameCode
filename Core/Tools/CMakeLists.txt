@@ -22,8 +22,10 @@ if(RTS_BUILD_CORE_EXTRAS)
         add_subdirectory(XAudio2ContractTest)
         add_subdirectory(XAudio2PcmVoiceTest)
         add_subdirectory(XAudio2AudioServiceTest)
+        add_subdirectory(XAudio2AudioControlsTest)
         add_subdirectory(NativeAudioManagerContractTest)
         add_subdirectory(NativeAudioAssetCatalogTest)
+        add_subdirectory(NativeXAudioManagerContractTest)
         add_test(NAME core_native_audio_graph_audit
             COMMAND powershell -NoProfile -ExecutionPolicy Bypass
                 -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeAudioGraphAudit/NativeAudioGraphAudit.ps1"
@@ -76,6 +78,12 @@ if(RTS_BUILD_CORE_EXTRAS)
                 -SourceRoot "${CMAKE_SOURCE_DIR}"
         )
         set_tests_properties(core_native_audio_lifecycle_audit PROPERTIES TIMEOUT 30)
+        add_test(NAME core_native_xaudio_manager_audit
+            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeXAudioManagerAudit/NativeXAudioManagerAudit.ps1"
+                -SourceRoot "${CMAKE_SOURCE_DIR}"
+        )
+        set_tests_properties(core_native_xaudio_manager_audit PROPERTIES TIMEOUT 30)
         add_test(NAME core_portability_audit
             COMMAND powershell -NoProfile -ExecutionPolicy Bypass
                 -File "${CMAKE_CURRENT_SOURCE_DIR}/PortabilityAudit/PortabilityAudit.ps1"

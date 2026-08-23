@@ -18,6 +18,9 @@ int main()
 	catalog.setDurationMS(AsciiString("generals_attack.wav"), 125.0f);
 	catalog.setDurationMS(AsciiString("generals_main.wav"), 350.0f);
 	catalog.setDurationMS(AsciiString("generals_decay.wav"), 75.0f);
+	catalog.setDurationMS(AsciiString("zerohour_attack.wav"), 10.0f);
+	catalog.setDurationMS(AsciiString("zerohour_main.wav"), 20.0f);
+	catalog.setDurationMS(AsciiString("zerohour_decay.wav"), 30.0f);
 
 	Real duration = 0.0f;
 	check(catalog.getDurationMS(AsciiString("generals_attack.wav"), duration));
@@ -25,6 +28,12 @@ int main()
 	check(catalog.lookupDurationMS(AsciiString("generals_main.wav"), duration));
 	check(duration == 350.0f);
 	check(!catalog.getDurationMS(AsciiString("missing.wav"), duration));
+	check(catalog.getEventDurationMS(AsciiString("generals_attack.wav"),
+		AsciiString("generals_main.wav"), AsciiString("generals_decay.wav"), duration));
+	check(duration == 550.0f);
+	check(catalog.getEventDurationMS(AsciiString("zerohour_attack.wav"),
+		AsciiString("zerohour_main.wav"), AsciiString("zerohour_decay.wav"), duration));
+	check(duration == 60.0f);
 
 	AudioPcmChunk pcm;
 	check(catalog.decodePcm(AsciiString("generals_main.wav"), pcm, 4));

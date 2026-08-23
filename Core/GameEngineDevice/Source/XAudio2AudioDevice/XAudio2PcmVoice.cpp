@@ -287,6 +287,11 @@ void XAudio2PcmVoice::close()
 	m_callbackErrorCode.store(S_OK, std::memory_order_release);
 	m_playedSample.store(-1, std::memory_order_release);
 	m_playedGeneration.store(m_requestedGeneration, std::memory_order_release);
+	for (CompletionSlot &completion : m_completions) {
+		completion.ready.store(false, std::memory_order_release);
+	}
+	m_completionRead.store(0, std::memory_order_release);
+	m_completionWrite.store(0, std::memory_order_release);
 	m_failed.store(false, std::memory_order_release);
 }
 
@@ -313,6 +318,101 @@ bool XAudio2PcmVoice::isFailed() const noexcept
 HRESULT XAudio2PcmVoice::getLastError() const noexcept
 {
 	return m_lastError.load(std::memory_order_acquire);
+}
+
+bool XAudio2PcmVoice::setVolume(float volume) noexcept
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	if (!m_open.load(std::memory_order_acquire)
+		|| m_failed.load(std::memory_order_acquire)) {
+		return false;
+	}
+	const HRESULT result = m_backend.setVolume(volume);
+	if (FAILED(result)) {
+		fail(result);
+		return false;
+	}
+	return true;
+}
+
+bool XAudio2PcmVoice::pause() noexcept
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	if (!m_open.load(std::memory_order_acquire)
+		|| m_failed.load(std::memory_order_acquire)) {
+		return false;
+	}
+	const HRESULT result = m_backend.pause();
+	if (FAILED(result)) {
+		fail(result);
+		return false;
+	}
+	m_started = false;
+	return true;
+}
+
+bool XAudio2PcmVoice::resume() noexcept
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	if (!m_open.load(std::memory_order_acquire)
+		|| m_failed.load(std::memory_order_acquire)) {
+		return false;
+	}
+	const HRESULT result = m_backend.resume();
+	if (FAILED(result)) {
+		fail(result);
+		return false;
+	}
+	m_started = true;
+	return true;
+}
+
+bool XAudio2PcmVoice::stop() noexcept
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	if (!m_open.load(std::memory_order_acquire)
+		|| m_failed.load(std::memory_order_acquire)) {
+		return false;
+	}
+	const HRESULT result = m_backend.stop();
+	if (FAILED(result)) {
+		fail(result);
+		return false;
+	}
+	m_started = false;
+	return true;
+}
+
+void XAudio2PcmVoice::publishCompletion(const XAudio2PcmCompletionRecord &completion) noexcept
+{
+	const std::uint32_t write = m_completionWrite.load(std::memory_order_relaxed);
+	const std::uint32_t read = m_completionRead.load(std::memory_order_acquire);
+	if (write - read >= COMPLETION_COUNT) {
+		return;
+	}
+	CompletionSlot &slot = m_completions[write % COMPLETION_COUNT];
+	if (slot.ready.load(std::memory_order_acquire)) {
+		return;
+	}
+	slot.record = completion;
+	slot.ready.store(true, std::memory_order_release);
+	m_completionWrite.store(write + 1, std::memory_order_release);
+}
+
+bool XAudio2PcmVoice::tryPopCompletion(XAudio2PcmCompletionRecord &completion) noexcept
+{
+	const std::uint32_t read = m_completionRead.load(std::memory_order_relaxed);
+	if (read == m_completionWrite.load(std::memory_order_acquire)) {
+		return false;
+	}
+	CompletionSlot &slot = m_completions[read % COMPLETION_COUNT];
+	if (!slot.ready.load(std::memory_order_acquire)) {
+		return false;
+	}
+	completion = slot.record;
+	slot.ready.store(false, std::memory_order_release);
+	m_completionRead.store(read + 1, std::memory_order_release);
+	return true;
 }
 
 void XAudio2PcmVoice::failFromService(HRESULT error) noexcept
@@ -411,12 +511,17 @@ void STDMETHODCALLTYPE XAudio2PcmVoice::OnBufferEnd(void *pBufferContext)
 {
 	for (Slot &slot : m_slots) {
 		if (pBufferContext == static_cast<void *>(&slot)) {
+			const std::int64_t endSample = slot.chunk.startSample
+				+ static_cast<std::int64_t>(slot.chunk.frameCount);
+			publishCompletion(XAudio2PcmCompletionRecord {
+				slot.chunk.generation,
+				slot.chunk.sequence,
+				endSample
+			});
 			if (slot.generation != m_playedGeneration.load(std::memory_order_acquire)) {
 				slot.callbackComplete.store(true, std::memory_order_release);
 				return;
 			}
-			const std::int64_t endSample = slot.chunk.startSample
-				+ static_cast<std::int64_t>(slot.chunk.frameCount);
 			std::int64_t previousSample = m_playedSample.load(std::memory_order_acquire);
 			while (previousSample < endSample
 				&& !m_playedSample.compare_exchange_weak(previousSample, endSample,

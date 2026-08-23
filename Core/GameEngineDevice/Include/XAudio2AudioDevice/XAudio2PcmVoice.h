@@ -21,7 +21,23 @@ public:
 	virtual HRESULT stop() noexcept = 0;
 	virtual HRESULT flush() noexcept = 0;
 	virtual HRESULT getCriticalError() const noexcept = 0;
+	// Optional controls keep older injected backends source-compatible while
+	// exposing typed controls to the native manager.
+	virtual HRESULT setVolume(float volume) noexcept
+	{
+		(void)volume;
+		return E_NOTIMPL;
+	}
+	virtual HRESULT pause() noexcept { return stop(); }
+	virtual HRESULT resume() noexcept { return start(); }
 	virtual void destroy() noexcept = 0;
+};
+
+struct XAudio2PcmCompletionRecord
+{
+	std::uint64_t generation = 0;
+	std::uint64_t sequence = 0;
+	std::int64_t endSample = -1;
 };
 
 class XAudio2PcmVoice final : public AudioPcmSink, public IXAudio2VoiceCallback
@@ -43,6 +59,10 @@ public:
 	bool isOpen() const noexcept;
 	bool isFailed() const noexcept;
 	HRESULT getLastError() const noexcept;
+	bool setVolume(float volume) noexcept;
+	bool pause() noexcept;
+	bool resume() noexcept;
+	bool stop() noexcept;
 	// Called by the owning audio service after it observes an engine-level
 	// critical error.  The service owns the failure transition; callbacks only
 	// publish atomics and never call this method.
@@ -51,6 +71,7 @@ public:
 	AudioPcmSubmitResult submit(AudioPcmChunk &&chunk) override;
 	void reset(std::uint64_t generation) override;
 	bool getPlayedSample(std::int64_t &sample) const noexcept override;
+	bool tryPopCompletion(XAudio2PcmCompletionRecord &completion) noexcept;
 
 	void STDMETHODCALLTYPE OnVoiceProcessingPassStart(UINT32 BytesRequired) override;
 	void STDMETHODCALLTYPE OnVoiceProcessingPassEnd() override;
@@ -79,6 +100,13 @@ private:
 		std::atomic<bool> callbackComplete { false };
 	};
 
+	static constexpr std::size_t COMPLETION_COUNT = 32;
+	struct CompletionSlot
+	{
+		XAudio2PcmCompletionRecord record;
+		std::atomic<bool> ready { false };
+	};
+
 	static WAVEFORMATEX pcmFormat();
 	static bool isValidChunk(const AudioPcmChunk &chunk);
 
@@ -90,10 +118,14 @@ private:
 	bool consumeCallbackError(HRESULT &error);
 	void fail(HRESULT error);
 	bool checkExternalFailure();
+	void publishCompletion(const XAudio2PcmCompletionRecord &completion) noexcept;
 
 	IXAudio2PcmVoiceBackend &m_backend;
 	mutable std::mutex m_mutex;
 	std::array<Slot, SLOT_COUNT> m_slots;
+	std::array<CompletionSlot, COMPLETION_COUNT> m_completions;
+	std::atomic<std::uint32_t> m_completionWrite { 0 };
+	std::atomic<std::uint32_t> m_completionRead { 0 };
 	std::atomic<bool> m_open;
 	std::atomic<bool> m_failed;
 	std::atomic<bool> m_callbackError;

@@ -45,6 +45,16 @@ inline bool operator!=(const XAudio2PcmVoiceHandle &left, const XAudio2PcmVoiceH
 	return !(left == right);
 }
 
+// Fixed-size data published by a voice callback and observed by its owner
+// thread.  It contains no native interface or game-object pointer.
+struct XAudio2AudioCompletion
+{
+	XAudio2PcmVoiceHandle voice;
+	std::uint64_t generation = 0;
+	std::uint64_t sequence = 0;
+	std::int64_t endSample = -1;
+};
+
 class XAudio2AudioService
 {
 public:
@@ -71,10 +81,15 @@ public:
 	AudioPcmSubmitResult submit(XAudio2PcmVoiceHandle handle, AudioPcmChunk &&chunk) noexcept;
 	bool resetVoice(XAudio2PcmVoiceHandle handle, std::uint64_t generation) noexcept;
 	bool serviceVoice(XAudio2PcmVoiceHandle handle) noexcept;
+	bool setVoiceVolume(XAudio2PcmVoiceHandle handle, float volume) noexcept;
+	bool pauseVoice(XAudio2PcmVoiceHandle handle) noexcept;
+	bool resumeVoice(XAudio2PcmVoiceHandle handle) noexcept;
+	bool stopVoice(XAudio2PcmVoiceHandle handle) noexcept;
 	bool isVoiceOpen(XAudio2PcmVoiceHandle handle) const noexcept;
 	bool isVoiceFailed(XAudio2PcmVoiceHandle handle) const noexcept;
 	HRESULT getVoiceLastError(XAudio2PcmVoiceHandle handle) const noexcept;
 	bool getVoicePlayedSample(XAudio2PcmVoiceHandle handle, std::int64_t &sample) const noexcept;
+	bool tryPopCompletion(XAudio2AudioCompletion &completion) noexcept;
 
 private:
 	struct VoiceRecord

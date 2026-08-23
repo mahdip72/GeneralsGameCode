@@ -23,6 +23,7 @@ $gameAudio = Read-Source 'Core/GameEngine/Source/Common/Audio/GameAudio.cpp'
 $nullHeader = Read-Source 'Core/GameEngineDevice/Include/AudioDevice/NullAudioManager.h'
 $nullSource = Read-Source 'Core/GameEngineDevice/Source/AudioDevice/NullAudioManager.cpp'
 $xaudioSource = Read-Source 'Core/GameEngineDevice/Source/XAudio2AudioDevice/XAudio2AudioManager.cpp'
+$assetSource = Read-Source 'Core/GameEngineDevice/Include/AudioDevice/AudioAssetSource.h'
 
 $iniPaths = @(
     'Data\\INI\\AudioSettings',
@@ -58,5 +59,6 @@ Require $nullSource 'removeLevelSpecificAudioEventInfos\(\)' 'Null reset does no
 Require $nullSource '\+\+m_lifecycleGeneration' 'Null reset does not advance generation'
 Require $nullSource 'TheTacticalView\s*!=\s*nullptr' 'Null headless update guard missing'
 Require $xaudioSource 'TheTacticalView\s*!=\s*nullptr' 'XAudio headless update guard missing'
+Require $assetSource 'getEventDurationMS' 'attack/main/decay duration helper missing'
 
 Write-Output 'native audio lifecycle audit passed'
