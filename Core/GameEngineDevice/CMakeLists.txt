@@ -315,8 +315,10 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32)
     add_library(rts_xaudio2_audio_service STATIC
         Include/XAudio2AudioDevice/IXAudio2AudioEngineBackend.h
         Include/XAudio2AudioDevice/XAudio2AudioService.h
+        Include/XAudio2AudioDevice/XAudio2CallbackGate.h
         Include/XAudio2AudioDevice/XAudio2NativeAudioEngine.h
         Source/XAudio2AudioDevice/XAudio2AudioService.cpp
+        Source/XAudio2AudioDevice/XAudio2CallbackGate.cpp
         Source/XAudio2AudioDevice/XAudio2NativeAudioEngine.cpp
     )
     target_include_directories(rts_xaudio2_audio_service PUBLIC Include)

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "AudioDevice/AudioPcmTypes.h"
 #include "XAudio2AudioDevice/IXAudio2AudioEngineBackend.h"
 
 #include <atomic>
@@ -66,8 +67,12 @@ public:
 
 	XAudio2PcmVoiceHandle createVoice() noexcept;
 	bool destroyVoice(XAudio2PcmVoiceHandle handle) noexcept;
-	XAudio2PcmVoice *getVoice(XAudio2PcmVoiceHandle handle) noexcept;
-	const XAudio2PcmVoice *getVoice(XAudio2PcmVoiceHandle handle) const noexcept;
+	AudioPcmSubmitResult submit(XAudio2PcmVoiceHandle handle, AudioPcmChunk &&chunk) noexcept;
+	bool resetVoice(XAudio2PcmVoiceHandle handle, std::uint64_t generation) noexcept;
+	bool serviceVoice(XAudio2PcmVoiceHandle handle) noexcept;
+	bool isVoiceOpen(XAudio2PcmVoiceHandle handle) const noexcept;
+	bool isVoiceFailed(XAudio2PcmVoiceHandle handle) const noexcept;
+	HRESULT getVoiceLastError(XAudio2PcmVoiceHandle handle) const noexcept;
 
 private:
 	struct VoiceRecord
@@ -79,6 +84,8 @@ private:
 
 	static void criticalErrorThunk(void *context, HRESULT error) noexcept;
 	static HRESULT normalizeFailure(HRESULT error) noexcept;
+	static HRESULT decodePendingFailure(std::uint64_t pending) noexcept;
+	static std::uint64_t encodePendingFailure(HRESULT error) noexcept;
 	bool processPendingFailureLocked() noexcept;
 	bool isHandleOwnedLocked(XAudio2PcmVoiceHandle handle) const noexcept;
 	XAudio2PcmVoiceHandle invalidHandle() const noexcept;
@@ -89,6 +96,6 @@ private:
 	std::uint64_t m_nextHandleGeneration;
 	std::atomic<XAudio2AudioServiceState> m_state;
 	std::atomic<HRESULT> m_lastError;
-	std::atomic<bool> m_pendingCriticalError;
-	std::atomic<HRESULT> m_pendingCriticalErrorCode;
+	std::atomic<std::uint64_t> m_pendingCriticalFailure;
+	std::atomic<std::uint64_t> m_failureSequence;
 };

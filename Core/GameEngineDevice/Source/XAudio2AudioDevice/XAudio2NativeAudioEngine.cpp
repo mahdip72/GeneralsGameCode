@@ -1,13 +1,12 @@
 #include "XAudio2AudioDevice/XAudio2NativeAudioEngine.h"
 
+#include "XAudio2AudioDevice/XAudio2CallbackGate.h"
 #include "XAudio2AudioDevice/XAudio2PcmVoice.h"
 
 #include <xaudio2.h>
 
 #include <atomic>
 #include <cstdint>
-#include <condition_variable>
-#include <mutex>
 #include <new>
 
 namespace
@@ -19,39 +18,39 @@ public:
 
 	void setSink(CriticalErrorCallback callback, void *context) noexcept
 	{
+		disableAndWait();
 		m_context.store(context, std::memory_order_release);
 		m_sink.store(callback, std::memory_order_release);
-		m_enabled.store(true, std::memory_order_release);
+		m_generation.store(m_gate.enable(), std::memory_order_release);
 	}
 
 	void disableAndWait() noexcept
 	{
-		m_enabled.store(false, std::memory_order_release);
+		m_gate.disableAndWait();
 		m_sink.store(nullptr, std::memory_order_release);
 		m_context.store(nullptr, std::memory_order_release);
-		std::unique_lock<std::mutex> lock(m_waitMutex);
-		m_waitCv.wait(lock, [this]() {
-			return m_inFlight.load(std::memory_order_acquire) == 0;
-		});
 	}
 
 	void STDMETHODCALLTYPE OnProcessingPassStart() override
 	{
-		if (begin()) {
-			end();
+		XAudio2CallbackGate::Token token;
+		if (begin(token)) {
+			end(token);
 		}
 	}
 
 	void STDMETHODCALLTYPE OnProcessingPassEnd() override
 	{
-		if (begin()) {
-			end();
+		XAudio2CallbackGate::Token token;
+		if (begin(token)) {
+			end(token);
 		}
 	}
 
 	void STDMETHODCALLTYPE OnCriticalError(HRESULT error) override
 	{
-		if (!begin()) {
+		XAudio2CallbackGate::Token token;
+		if (!begin(token)) {
 			return;
 		}
 		CriticalErrorCallback sink = m_sink.load(std::memory_order_acquire);
@@ -59,36 +58,24 @@ public:
 		if (sink != nullptr) {
 			sink(context, error);
 		}
-		end();
+		end(token);
 	}
 
 private:
-	bool begin() noexcept
+	bool begin(XAudio2CallbackGate::Token &token) noexcept
 	{
-		if (!m_enabled.load(std::memory_order_acquire)) {
-			return false;
-		}
-		m_inFlight.fetch_add(1, std::memory_order_acq_rel);
-		if (!m_enabled.load(std::memory_order_acquire)) {
-			end();
-			return false;
-		}
-		return true;
+		return m_gate.tryEnter(token, m_generation.load(std::memory_order_acquire));
 	}
 
-	void end() noexcept
+	void end(XAudio2CallbackGate::Token &token) noexcept
 	{
-		if (m_inFlight.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-			m_waitCv.notify_all();
-		}
+		m_gate.leave(token);
 	}
 
-	std::atomic<bool> m_enabled { false };
-	std::atomic<std::uint32_t> m_inFlight { 0 };
+	XAudio2CallbackGate m_gate;
+	std::atomic<std::uint64_t> m_generation { 0 };
 	std::atomic<CriticalErrorCallback> m_sink { nullptr };
 	std::atomic<void *> m_context { nullptr };
-	std::mutex m_waitMutex;
-	std::condition_variable m_waitCv;
 };
 
 class NativeSourceVoiceCallback final : public IXAudio2VoiceCallback
@@ -96,114 +83,109 @@ class NativeSourceVoiceCallback final : public IXAudio2VoiceCallback
 public:
 	void setSink(IXAudio2VoiceCallback *sink) noexcept
 	{
+		disableAndWait();
 		m_sink.store(sink, std::memory_order_release);
-		m_enabled.store(true, std::memory_order_release);
+		m_generation.store(m_gate.enable(), std::memory_order_release);
 	}
 
 	void disableAndWait() noexcept
 	{
-		m_enabled.store(false, std::memory_order_release);
-		std::unique_lock<std::mutex> lock(m_waitMutex);
-		m_waitCv.wait(lock, [this]() {
-			return m_inFlight.load(std::memory_order_acquire) == 0;
-		});
+		m_gate.disableAndWait();
 		m_sink.store(nullptr, std::memory_order_release);
 	}
 
 	void STDMETHODCALLTYPE OnVoiceProcessingPassStart(UINT32 bytesRequired) override
 	{
 		IXAudio2VoiceCallback *sink = nullptr;
-		if (begin(sink)) {
+		XAudio2CallbackGate::Token token;
+		if (begin(sink, token)) {
 			sink->OnVoiceProcessingPassStart(bytesRequired);
-			end();
+			end(token);
 		}
 	}
 
 	void STDMETHODCALLTYPE OnVoiceProcessingPassEnd() override
 	{
 		IXAudio2VoiceCallback *sink = nullptr;
-		if (begin(sink)) {
+		XAudio2CallbackGate::Token token;
+		if (begin(sink, token)) {
 			sink->OnVoiceProcessingPassEnd();
-			end();
+			end(token);
 		}
 	}
 
 	void STDMETHODCALLTYPE OnStreamEnd() override
 	{
 		IXAudio2VoiceCallback *sink = nullptr;
-		if (begin(sink)) {
+		XAudio2CallbackGate::Token token;
+		if (begin(sink, token)) {
 			sink->OnStreamEnd();
-			end();
+			end(token);
 		}
 	}
 
 	void STDMETHODCALLTYPE OnBufferStart(void *context) override
 	{
 		IXAudio2VoiceCallback *sink = nullptr;
-		if (begin(sink)) {
+		XAudio2CallbackGate::Token token;
+		if (begin(sink, token)) {
 			sink->OnBufferStart(context);
-			end();
+			end(token);
 		}
 	}
 
 	void STDMETHODCALLTYPE OnBufferEnd(void *context) override
 	{
 		IXAudio2VoiceCallback *sink = nullptr;
-		if (begin(sink)) {
+		XAudio2CallbackGate::Token token;
+		if (begin(sink, token)) {
 			sink->OnBufferEnd(context);
-			end();
+			end(token);
 		}
 	}
 
 	void STDMETHODCALLTYPE OnLoopEnd(void *context) override
 	{
 		IXAudio2VoiceCallback *sink = nullptr;
-		if (begin(sink)) {
+		XAudio2CallbackGate::Token token;
+		if (begin(sink, token)) {
 			sink->OnLoopEnd(context);
-			end();
+			end(token);
 		}
 	}
 
 	void STDMETHODCALLTYPE OnVoiceError(void *context, HRESULT error) override
 	{
 		IXAudio2VoiceCallback *sink = nullptr;
-		if (begin(sink)) {
+		XAudio2CallbackGate::Token token;
+		if (begin(sink, token)) {
 			sink->OnVoiceError(context, error);
-			end();
+			end(token);
 		}
 	}
 
 private:
-	bool begin(IXAudio2VoiceCallback *&sink) noexcept
+	bool begin(IXAudio2VoiceCallback *&sink, XAudio2CallbackGate::Token &token) noexcept
 	{
-		if (!m_enabled.load(std::memory_order_acquire)) {
-			return false;
-		}
-		m_inFlight.fetch_add(1, std::memory_order_acq_rel);
-		if (!m_enabled.load(std::memory_order_acquire)) {
-			end();
+		if (!m_gate.tryEnter(token, m_generation.load(std::memory_order_acquire))) {
 			return false;
 		}
 		sink = m_sink.load(std::memory_order_acquire);
 		if (sink == nullptr) {
-			end();
+			m_gate.leave(token);
 			return false;
 		}
 		return true;
 	}
 
-	void end() noexcept
+	void end(XAudio2CallbackGate::Token &token) noexcept
 	{
-		if (m_inFlight.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-			m_waitCv.notify_all();
-		}
+		m_gate.leave(token);
 	}
 
-	std::atomic<bool> m_enabled { false };
-	std::atomic<std::uint32_t> m_inFlight { 0 };
+	XAudio2CallbackGate m_gate;
+	std::atomic<std::uint64_t> m_generation { 0 };
 	std::atomic<IXAudio2VoiceCallback *> m_sink { nullptr };
-	std::mutex m_waitMutex;
-	std::condition_variable m_waitCv;
 };
 
 class NativePcmVoiceBackend final : public IXAudio2PcmVoiceBackend

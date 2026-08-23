@@ -1,4 +1,5 @@
 #include "XAudio2AudioDevice/IXAudio2AudioEngineBackend.h"
+#include "XAudio2AudioDevice/XAudio2CallbackGate.h"
 #include "XAudio2AudioDevice/XAudio2AudioService.h"
 #include "XAudio2AudioDevice/XAudio2PcmVoice.h"
 
@@ -12,6 +13,7 @@
 namespace
 {
 int g_failures = 0;
+std::atomic<int> g_backendUseAfterDestroy { 0 };
 
 void check(bool condition, const char *message)
 {
@@ -38,15 +40,40 @@ public:
 		return m_createResult;
 	}
 
-	HRESULT submit(const XAUDIO2_BUFFER &) noexcept override { return S_OK; }
-	HRESULT start() noexcept override { return S_OK; }
-	HRESULT stop() noexcept override { return S_OK; }
-	HRESULT flush() noexcept override { return S_OK; }
+	HRESULT submit(const XAUDIO2_BUFFER &) noexcept override
+	{
+		if (m_destroyed) {
+			++g_backendUseAfterDestroy;
+		}
+		return S_OK;
+	}
+	HRESULT start() noexcept override
+	{
+		if (m_destroyed) {
+			++g_backendUseAfterDestroy;
+		}
+		return S_OK;
+	}
+	HRESULT stop() noexcept override
+	{
+		if (m_destroyed) {
+			++g_backendUseAfterDestroy;
+		}
+		return S_OK;
+	}
+	HRESULT flush() noexcept override
+	{
+		if (m_destroyed) {
+			++g_backendUseAfterDestroy;
+		}
+		return S_OK;
+	}
 	HRESULT getCriticalError() const noexcept override { return S_OK; }
 
 	void destroy() noexcept override
 	{
 		m_callback = nullptr;
+		m_destroyed = true;
 		++m_destroyCount;
 		m_calls.push_back("voice.destroy");
 	}
@@ -56,6 +83,7 @@ private:
 	int &m_destroyCount;
 	HRESULT m_createResult;
 	IXAudio2VoiceCallback *m_callback = nullptr;
+	bool m_destroyed = false;
 };
 
 class FakeAudioEngine final : public IXAudio2AudioEngineBackend
@@ -66,6 +94,7 @@ public:
 	HRESULT openResult = S_OK;
 	HRESULT startResult = S_OK;
 	HRESULT createVoiceResult = S_OK;
+	bool returnPartialBackendOnCreateFailure = false;
 	HRESULT voiceCreateResult = S_OK;
 	HRESULT stopResult = S_OK;
 	HRESULT closeResult = S_OK;
@@ -79,6 +108,12 @@ public:
 	bool quiescingObserved = false;
 	bool invokeCallbackDuringClose = false;
 	std::atomic<bool> callbackInFlightCompleted { false };
+	bool blockStart = false;
+	std::atomic<bool> startEntered { false };
+	std::atomic<bool> releaseStart { true };
+	bool blockCreateBackend = false;
+	std::atomic<bool> createBackendEntered { false };
+	std::atomic<bool> releaseCreateBackend { true };
 
 	HRESULT open(CriticalErrorCallback callback, void *context) noexcept override
 	{
@@ -95,6 +130,12 @@ public:
 	{
 		++startCalls;
 		calls.push_back("start");
+		if (blockStart) {
+			startEntered.store(true, std::memory_order_release);
+			while (!releaseStart.load(std::memory_order_acquire)) {
+				std::this_thread::yield();
+			}
+		}
 		return startResult;
 	}
 
@@ -102,7 +143,16 @@ public:
 	{
 		++createVoiceCalls;
 		calls.push_back("voice.create.backend");
+		if (blockCreateBackend) {
+			createBackendEntered.store(true, std::memory_order_release);
+			while (!releaseCreateBackend.load(std::memory_order_acquire)) {
+				std::this_thread::yield();
+			}
+		}
 		if (FAILED(createVoiceResult)) {
+			if (returnPartialBackendOnCreateFailure) {
+				voice = std::make_unique<FakePcmVoiceBackend>(calls, voiceDestroyCount, S_OK);
+			}
 			return createVoiceResult;
 		}
 		voice = std::make_unique<FakePcmVoiceBackend>(calls, voiceDestroyCount, voiceCreateResult);
@@ -167,8 +217,8 @@ void testInjectedLifecycleAndIndependentVoices()
 		"service creates three typed voice handles");
 	check(first != second && second != third && first != third,
 		"every source voice receives an independent handle");
-	check(service.getVoice(first) != nullptr && service.getVoice(second) != nullptr
-			&& service.getVoice(third) != nullptr,
+	check(service.isVoiceOpen(first) && service.isVoiceOpen(second)
+			&& service.isVoiceOpen(third),
 		"typed handles resolve to service-owned voices");
 
 	service.shutdown();
@@ -201,6 +251,200 @@ std::size_t lastCall(const std::vector<std::string> &calls, const char *name)
 		}
 	}
 	return calls.size();
+}
+
+AudioPcmChunk makeChunk(std::uint64_t generation, std::uint64_t sequence)
+{
+	AudioPcmChunk chunk;
+	chunk.sampleRate = 48000;
+	chunk.channels = 2;
+	chunk.format = AudioPcmFormat::SIGNED_16_INTERLEAVED_LITTLE_ENDIAN;
+	chunk.frameCount = 2;
+	chunk.startSample = static_cast<std::int64_t>(sequence * chunk.frameCount);
+	chunk.generation = generation;
+	chunk.sequence = sequence;
+	chunk.data.resize(8, static_cast<std::uint8_t>(sequence));
+	return chunk;
+}
+
+void testCallbackGateAdmissionDrainAndReopen()
+{
+	XAudio2CallbackGate gate;
+	const std::uint64_t firstGeneration = gate.enable();
+	XAudio2CallbackGate::Token held;
+	check(gate.tryEnter(held, firstGeneration), "callback gate admits the active generation");
+
+	std::atomic<bool> closeStarted { false };
+	std::atomic<bool> closeReturned { false };
+	std::thread closer([&]() {
+		closeStarted.store(true, std::memory_order_release);
+		gate.disableAndWait();
+		closeReturned.store(true, std::memory_order_release);
+	});
+	while (!closeStarted.load(std::memory_order_acquire)) {
+		std::this_thread::yield();
+	}
+	check(!closeReturned.load(std::memory_order_acquire),
+		"callback gate close waits for an in-flight callback");
+	gate.leave(held);
+	closer.join();
+	check(closeReturned.load(std::memory_order_acquire),
+		"callback gate close returns after the callback leaves");
+
+	const std::uint64_t secondGeneration = gate.enable();
+	check(secondGeneration != firstGeneration, "callback gate increments its reopen generation");
+	XAudio2CallbackGate::Token stale;
+	check(!gate.tryEnter(stale, firstGeneration),
+		"a pre-disable callback token cannot enter after reopen");
+	XAudio2CallbackGate::Token current;
+	check(gate.tryEnter(current, secondGeneration), "the reopened generation admits callbacks");
+	gate.leave(current);
+
+	std::atomic<bool> raceCloseReturned { false };
+	std::atomic<int> admissionsAfterClose { 0 };
+	std::thread entrant([&]() {
+		while (!raceCloseReturned.load(std::memory_order_acquire)) {
+			XAudio2CallbackGate::Token token;
+			if (gate.tryEnter(token, secondGeneration)) {
+				if (raceCloseReturned.load(std::memory_order_acquire)) {
+					++admissionsAfterClose;
+				}
+				gate.leave(token);
+			}
+		}
+	});
+	std::thread raceCloser([&]() {
+		gate.disableAndWait();
+		raceCloseReturned.store(true, std::memory_order_release);
+	});
+	raceCloser.join();
+	entrant.join();
+	check(admissionsAfterClose.load(std::memory_order_acquire) == 0,
+		"a callback cannot check in after close has drained the generation");
+}
+
+void testHandleScopedOperationsAndConcurrentStaleAccess()
+{
+	g_backendUseAfterDestroy.store(0, std::memory_order_release);
+	auto backend = std::make_unique<FakeAudioEngine>();
+	XAudio2AudioService service(std::move(backend));
+	check(service.open(), "handle-operation service opens");
+	const XAudio2PcmVoiceHandle handle = service.createVoice();
+	check(handle.isValid(), "handle-operation service creates a voice");
+	check(service.isVoiceOpen(handle), "valid handles report an open voice");
+	check(service.getVoiceLastError(handle) == S_OK, "valid handles query voice errors");
+	check(service.resetVoice(handle, 1), "valid handles reset their voice");
+	check(service.submit(handle, makeChunk(1, 0)) == AudioPcmSubmitResult::ACCEPTED,
+		"valid handles submit through the service");
+	check(service.serviceVoice(handle), "valid handles service their voice");
+
+	std::atomic<bool> start { false };
+	std::thread destroyer([&]() {
+		while (!start.load(std::memory_order_acquire)) {
+			std::this_thread::yield();
+		}
+		service.destroyVoice(handle);
+	});
+	std::thread staleAccess([&]() {
+		while (!start.load(std::memory_order_acquire)) {
+			std::this_thread::yield();
+		}
+		for (int i = 0; i < 128; ++i) {
+			service.isVoiceOpen(handle);
+			service.isVoiceFailed(handle);
+			service.getVoiceLastError(handle);
+			service.resetVoice(handle, 2);
+			service.serviceVoice(handle);
+			service.submit(handle, makeChunk(2, static_cast<std::uint64_t>(i)));
+		}
+	});
+	start.store(true, std::memory_order_release);
+	destroyer.join();
+	staleAccess.join();
+	check(!service.isVoiceOpen(handle), "stale handle queries are rejected after destruction");
+	check(g_backendUseAfterDestroy.load(std::memory_order_acquire) == 0,
+		"stale handle operations never touch a destroyed backend");
+	service.shutdown();
+}
+
+void testPartialBackendFailureIsDestroyedOnce()
+{
+	auto backend = std::make_unique<FakeAudioEngine>();
+	FakeAudioEngine *backendView = backend.get();
+	backendView->createVoiceResult = E_FAIL;
+	backendView->returnPartialBackendOnCreateFailure = true;
+	XAudio2AudioService service(std::move(backend));
+	check(service.open(), "partial-backend service opens");
+	check(!service.createVoice().isValid(), "partial backend failure returns no handle");
+	check(backendView->voiceDestroyCount == 1,
+		"a non-null backend returned with failure is destroyed exactly once");
+	backendView->createVoiceResult = S_OK;
+	backendView->returnPartialBackendOnCreateFailure = false;
+	check(service.createVoice().isValid(), "service remains usable after partial backend cleanup");
+	service.shutdown();
+}
+
+void testConcurrentTransitionsPreserveFirstFailure()
+{
+	{
+		auto backend = std::make_unique<FakeAudioEngine>();
+		FakeAudioEngine *backendView = backend.get();
+		backendView->blockStart = true;
+		backendView->releaseStart.store(false, std::memory_order_release);
+		XAudio2AudioService service(std::move(backend));
+		std::atomic<bool> opened { true };
+		std::thread opener([&]() { opened.store(service.open(), std::memory_order_release); });
+		while (!backendView->startEntered.load(std::memory_order_acquire)) {
+			std::this_thread::yield();
+		}
+		backendView->emitCritical(E_ABORT);
+		backendView->emitCritical(E_ACCESSDENIED);
+		backendView->releaseStart.store(true, std::memory_order_release);
+		opener.join();
+		check(!opened.load(std::memory_order_acquire),
+			"an asynchronous critical error prevents open from committing RUNNING");
+		check(service.state() == XAudio2AudioServiceState::CLOSED,
+			"a failed open cannot be overwritten by a late RUNNING store");
+		check(service.getLastError() == E_ABORT,
+			"the first competing critical failure is preserved");
+	}
+	{
+		auto backend = std::make_unique<FakeAudioEngine>();
+		FakeAudioEngine *backendView = backend.get();
+		backendView->startResult = E_FAIL;
+		backendView->blockStart = true;
+		backendView->releaseStart.store(false, std::memory_order_release);
+		XAudio2AudioService service(std::move(backend));
+		std::atomic<bool> opened { true };
+		std::thread opener([&]() { opened.store(service.open(), std::memory_order_release); });
+		while (!backendView->startEntered.load(std::memory_order_acquire)) {
+			std::this_thread::yield();
+		}
+		backendView->emitCritical(E_ABORT);
+		backendView->releaseStart.store(true, std::memory_order_release);
+		opener.join();
+		check(!opened.load(std::memory_order_acquire) && service.getLastError() == E_ABORT,
+			"an earlier critical failure wins over a later StartEngine failure");
+	}
+	{
+		auto backend = std::make_unique<FakeAudioEngine>();
+		FakeAudioEngine *backendView = backend.get();
+		backendView->blockCreateBackend = true;
+		backendView->releaseCreateBackend.store(false, std::memory_order_release);
+		XAudio2AudioService service(std::move(backend));
+		check(service.open(), "create-race service opens");
+		std::atomic<bool> created { true };
+		std::thread creator([&]() { created.store(service.createVoice().isValid(), std::memory_order_release); });
+		while (!backendView->createBackendEntered.load(std::memory_order_acquire)) {
+			std::this_thread::yield();
+		}
+		backendView->emitCritical(E_ABORT);
+		backendView->releaseCreateBackend.store(true, std::memory_order_release);
+		creator.join();
+		check(!created.load(std::memory_order_acquire),
+			"a voice creation transaction cannot commit after an asynchronous failure");
+		service.shutdown();
+	}
 }
 
 void testOpenAndStartFailuresUnwindAndReopen()
@@ -255,7 +499,7 @@ void testSourceFailureDoesNotConsumeGeneration()
 	backendView->voiceCreateResult = E_FAIL;
 	const XAudio2PcmVoiceHandle failed = service.createVoice();
 	check(!failed.isValid(), "a source create failure returns an invalid handle");
-	check(service.getVoice(first) != nullptr, "a source create failure preserves existing records");
+	check(service.isVoiceOpen(first), "a source create failure preserves existing records");
 	check(backendView->voiceDestroyCount == 1,
 		"a partially-created source backend is destroyed exactly once");
 
@@ -277,27 +521,27 @@ void testClosedFailedQuiescingAndStaleHandles()
 
 	const XAudio2PcmVoiceHandle first = service.createVoice();
 	check(service.destroyVoice(first), "the first voice can be destroyed");
-	check(!service.getVoice(first) && !service.destroyVoice(first),
+	check(!service.isVoiceOpen(first) && !service.destroyVoice(first),
 		"destroyed handles cannot access or destroy a replacement record");
 	const XAudio2PcmVoiceHandle replacement = service.createVoice();
 	check(replacement.isValid() && replacement.index == first.index
 			&& replacement.generation != first.generation,
 		"reused slots receive a new generation");
-	check(service.getVoice(first) == nullptr && service.getVoice(replacement) != nullptr,
+	check(!service.isVoiceOpen(first) && service.isVoiceOpen(replacement),
 		"stale handles remain rejected after slot reuse");
 
 	backendView->emitCritical(E_ABORT);
 	check(service.state() == XAudio2AudioServiceState::FAILED,
 		"a critical callback atomically publishes FAILED");
 	check(service.processPendingFailure(), "the owner observes the pending critical error");
-	check(service.getVoice(replacement) != nullptr && service.getVoice(replacement)->isFailed(),
+	check(service.isVoiceOpen(replacement) && service.isVoiceFailed(replacement),
 		"existing voices observe terminal failure on the owner service");
 	check(!service.createVoice().isValid(), "failed services reject new voices");
 
 	service.shutdown();
 	check(backendView->quiescingObserved, "shutdown publishes QUIESCING before backend close");
 	check(!service.createVoice().isValid(), "closed services reject new voices after shutdown");
-	check(service.getVoice(replacement) == nullptr, "shutdown invalidates all voice handles");
+	check(!service.isVoiceOpen(replacement), "shutdown invalidates all voice handles");
 
 	const HRESULT errorBeforeLateCallback = service.getLastError();
 	backendView->emitRetainedAfterClose(E_ACCESSDENIED);
@@ -369,6 +613,10 @@ void testRepeatedCyclesRemainDeterministic()
 
 int main()
 {
+	testCallbackGateAdmissionDrainAndReopen();
+	testHandleScopedOperationsAndConcurrentStaleAccess();
+	testPartialBackendFailureIsDestroyedOnce();
+	testConcurrentTransitionsPreserveFirstFailure();
 	testInjectedLifecycleAndIndependentVoices();
 	testOpenAndStartFailuresUnwindAndReopen();
 	testSourceFailureDoesNotConsumeGeneration();
