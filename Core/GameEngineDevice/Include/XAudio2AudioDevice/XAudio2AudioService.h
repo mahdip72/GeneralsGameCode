@@ -25,5 +25,6 @@ private:
 
 	IXAudio2 *m_engine;
 	IXAudio2MasteringVoice *m_masteringVoice;
+	bool m_callbacksRegistered;
 	std::atomic<HRESULT> m_lastError;
 };

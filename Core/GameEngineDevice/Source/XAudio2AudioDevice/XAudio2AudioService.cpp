@@ -3,6 +3,7 @@
 XAudio2AudioService::XAudio2AudioService() :
 	m_engine(nullptr),
 	m_masteringVoice(nullptr),
+	m_callbacksRegistered(false),
 	m_lastError(S_OK)
 {
 }
@@ -27,6 +28,7 @@ bool XAudio2AudioService::open()
 
 	result = m_engine->RegisterForCallbacks(this);
 	if (SUCCEEDED(result)) {
+		m_callbacksRegistered = true;
 		result = m_engine->CreateMasteringVoice(&m_masteringVoice);
 	}
 	if (FAILED(result)) {
@@ -46,7 +48,10 @@ void XAudio2AudioService::shutdown()
 		m_masteringVoice = nullptr;
 	}
 	if (m_engine != nullptr) {
-		m_engine->UnregisterForCallbacks(this);
+		if (m_callbacksRegistered) {
+			m_engine->UnregisterForCallbacks(this);
+			m_callbacksRegistered = false;
+		}
 		m_engine->Release();
 		m_engine = nullptr;
 	}
