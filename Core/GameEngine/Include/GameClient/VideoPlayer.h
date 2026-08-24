@@ -170,7 +170,7 @@ class VideoStreamInterface
 		virtual void	frameNext() = 0;							///< Advance to next frame
 		virtual Int		frameIndex() = 0;							///< Returns zero based index of current frame
 		virtual Int		frameCount() = 0;							///< Returns the total number of frames in the stream
-		virtual void	frameGoto( Int index ) = 0;					///< Go to the spcified frame index
+		virtual Bool	frameGoto( Int index ) = 0;					///< Go to the specified frame index
 		virtual Int		height() = 0;									///< Return the height of the video
 		virtual Int		width() = 0;									///< Return the width of the video
 
@@ -206,7 +206,7 @@ class VideoStream : public VideoStreamInterface
 		virtual void	frameNext() override;									///< Advance to next frame
 		virtual Int		frameIndex() override;									///< Returns zero based index of current frame
 		virtual Int		frameCount() override;									///< Returns the total number of frames in the stream
-		virtual void	frameGoto( Int index ) override;							///< Go to the spcified frame index
+		virtual Bool	frameGoto( Int index ) override;							///< Go to the specified frame index
 		virtual Int		height() override;											///< Return the height of the video
 		virtual Int		width() override;											///< Return the width of the video
 

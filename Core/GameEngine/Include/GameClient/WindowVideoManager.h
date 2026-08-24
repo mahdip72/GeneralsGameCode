@@ -141,6 +141,8 @@ public:
 	Int getWinState( GameWindow *win );			///< return the current state of the window.
 
 private:
+	void handleFinishedMovie(WindowVideo *winVid, GameWindow *win,
+		VideoStreamInterface *videoStream);
 
 	typedef const GameWindow* ConstGameWindowPtr;
 	// use special class for hashing, since std::hash won't compile for arbitrary ptrs

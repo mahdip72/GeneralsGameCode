@@ -584,7 +584,7 @@ Int	FFmpegVideoStream::frameCount()
 // FFmpegVideoStream::frameGoto
 //============================================================================
 
-void FFmpegVideoStream::frameGoto( Int index )
+Bool FFmpegVideoStream::frameGoto( Int index )
 {
 	const Int frame_count = m_ffmpegFile->getNumFrames();
 	if (frame_count > 0) {
@@ -597,7 +597,7 @@ void FFmpegVideoStream::frameGoto( Int index )
 		av_frame_free(&m_frame);
 		m_gotFrame = false;
 		m_good = false;
-		return;
+		return FALSE;
 	}
 
 	av_frame_free(&m_frame);
@@ -615,6 +615,7 @@ void FFmpegVideoStream::frameGoto( Int index )
 	}
 
 	m_startTime = getMonotonicMilliseconds();
+	return m_good && m_gotFrame;
 }
 
 //============================================================================

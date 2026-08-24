@@ -243,19 +243,46 @@ void WindowVideoManager::update()
 						stopMovie(win);
 					else if (winVid->getPlayType() == WINDOW_PLAY_MOVIE_SHOW_LAST_FRAME)
 						pauseMovie(win);
+					else if (winVid->getPlayType() == WINDOW_PLAY_MOVIE_LOOP
+						&& videoStream->isFinished())
+						handleFinishedMovie(winVid, win, videoStream);
 				}
 				else if (videoStream->isFinished())
 				{
-					stopMovie(win);
+					handleFinishedMovie(winVid, win, videoStream);
 				}
 			}
 			else if (videoStream->isFinished())
 			{
-				stopMovie(win);
+				handleFinishedMovie(winVid, win, videoStream);
 			}
 		}
 
 		it++;
+	}
+}
+
+void WindowVideoManager::handleFinishedMovie(WindowVideo *winVid, GameWindow *win,
+	VideoStreamInterface *videoStream)
+{
+	if (winVid == nullptr || win == nullptr || videoStream == nullptr)
+		return;
+
+	switch (winVid->getPlayType())
+	{
+		case WINDOW_PLAY_MOVIE_ONCE:
+			stopMovie(win);
+			break;
+		case WINDOW_PLAY_MOVIE_SHOW_LAST_FRAME:
+			pauseMovie(win);
+			break;
+		case WINDOW_PLAY_MOVIE_LOOP:
+			if (!videoStream->frameGoto(0))
+				stopMovie(win);
+			break;
+		default:
+			stopMovie(win);
+			break;
 	}
 }
 

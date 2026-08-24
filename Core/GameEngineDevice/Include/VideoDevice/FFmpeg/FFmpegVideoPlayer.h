@@ -87,7 +87,7 @@ class FFmpegVideoStream : public VideoStream
 		virtual void	frameNext();									///< Advance to next frame
 		virtual Int		frameIndex();									///< Returns zero based index of current frame
 		virtual Int		frameCount();									///< Returns the total number of frames in the stream
-		virtual void	frameGoto( Int index );							///< Go to the spcified frame index
+		virtual Bool	frameGoto( Int index );							///< Go to the specified frame index
 		virtual Int		height();											///< Return the height of the video
 		virtual Int		width();											///< Return the width of the video
 

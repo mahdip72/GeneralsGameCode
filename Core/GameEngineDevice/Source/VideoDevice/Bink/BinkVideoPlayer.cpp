@@ -433,9 +433,12 @@ Int	BinkVideoStream::frameCount()
 // BinkVideoStream::frameGoto
 //============================================================================
 
-void BinkVideoStream::frameGoto( Int index )
+Bool BinkVideoStream::frameGoto( Int index )
 {
+	if (m_handle == nullptr)
+		return FALSE;
 	BinkGoto(m_handle, index, 0 );
+	return TRUE;
 }
 
 //============================================================================
