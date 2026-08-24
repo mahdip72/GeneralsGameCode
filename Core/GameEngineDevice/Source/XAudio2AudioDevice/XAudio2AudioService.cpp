@@ -249,7 +249,10 @@ XAudio2PcmVoiceHandle XAudio2AudioService::createVoice() noexcept
 	const HRESULT backendResult = m_backend->createPcmVoice(backend);
 	if (FAILED(backendResult) || backend == nullptr) {
 		if (backend != nullptr) {
-			backend->destroy();
+			const HRESULT destroyResult = backend->destroyWithResult();
+			if (SUCCEEDED(backendResult) && FAILED(destroyResult)) {
+				m_lastError.store(destroyResult, std::memory_order_release);
+			}
 			backend.reset();
 		}
 		if (m_failurePublication.hasFailure()) {
@@ -265,9 +268,11 @@ XAudio2PcmVoiceHandle XAudio2AudioService::createVoice() noexcept
 	try {
 		voice = std::make_unique<XAudio2PcmVoice>(*backend);
 	} catch (const std::bad_alloc &) {
-		backend->destroy();
+		const HRESULT destroyResult = backend->destroyWithResult();
 		if (m_failurePublication.hasFailure()) {
 			processPendingFailureLocked();
+		} else if (FAILED(destroyResult)) {
+			m_lastError.store(destroyResult, std::memory_order_release);
 		} else {
 			m_lastError.store(E_OUTOFMEMORY, std::memory_order_release);
 		}
@@ -278,10 +283,14 @@ XAudio2PcmVoiceHandle XAudio2AudioService::createVoice() noexcept
 		const HRESULT failure = normalizeFailure(voice->getLastError());
 		// XAudio2PcmVoice deliberately does not own a partially-created backend
 		// when create() fails; the service owns this defensive unwind.
-		backend->destroy();
+		const HRESULT destroyResult = backend->destroyWithResult();
 		backend.reset();
 		if (m_failurePublication.hasFailure()) {
 			processPendingFailureLocked();
+		} else if (FAILED(failure)) {
+			m_lastError.store(failure, std::memory_order_release);
+		} else if (FAILED(destroyResult)) {
+			m_lastError.store(destroyResult, std::memory_order_release);
 		} else {
 			m_lastError.store(failure, std::memory_order_release);
 		}
@@ -300,10 +309,16 @@ XAudio2PcmVoiceHandle XAudio2AudioService::createVoice() noexcept
 			m_voices.emplace_back();
 		}
 	} catch (const std::bad_alloc &) {
+		const HRESULT voiceFailure = voice->getLastError();
 		voice->close();
+		const HRESULT teardownFailure = voice->getLastError();
 		backend.reset();
 		if (m_failurePublication.hasFailure()) {
 			processPendingFailureLocked();
+		} else if (FAILED(voiceFailure)) {
+			m_lastError.store(voiceFailure, std::memory_order_release);
+		} else if (FAILED(teardownFailure)) {
+			m_lastError.store(teardownFailure, std::memory_order_release);
 		} else {
 			m_lastError.store(E_OUTOFMEMORY, std::memory_order_release);
 		}
@@ -550,15 +565,15 @@ void XAudio2AudioService::criticalErrorThunk(void *context, HRESULT error) noexc
 	if (service == nullptr) {
 		return;
 	}
+	// The publication CAS is the callback's first observable action.  Owner
+	// transactions compete with this same word, so a callback that began before
+	// their commit cannot be lost behind a separate state/sequence read.
+	service->m_failurePublication.publish(error);
 	const XAudio2AudioServiceState currentState = service->m_state.load(std::memory_order_acquire);
 	if (currentState == XAudio2AudioServiceState::CLOSED
 		|| currentState == XAudio2AudioServiceState::QUIESCING) {
 		return;
 	}
-	// The publication CAS is the callback's first observable action.  Owner
-	// transactions compete with this same word, so a callback that began before
-	// their commit cannot be lost behind a separate state/sequence read.
-	service->m_failurePublication.publish(error);
 	XAudio2AudioServiceState expectedState = currentState;
 	while (expectedState != XAudio2AudioServiceState::CLOSED
 		&& expectedState != XAudio2AudioServiceState::QUIESCING

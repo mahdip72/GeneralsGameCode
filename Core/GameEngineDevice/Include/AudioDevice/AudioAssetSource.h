@@ -8,7 +8,9 @@
 #include <cstdint>
 #include <list>
 #include <limits>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 // Neutral source/decoder seam used by both device-free scripts and native audio.
@@ -60,6 +62,15 @@ public:
 	virtual const void *getFileIdentity(const AsciiString &) const
 	{
 		return nullptr;
+	}
+
+	// Legacy callers may hold an identity from a different source ABI.  The
+	// source, which owns the stable identity mapping, is responsible for
+	// deciding whether that caller identity refers to this asset.
+	virtual Bool matchesFileIdentity(const AsciiString &fileName,
+		const void *callerIdentity) const
+	{
+		return callerIdentity != nullptr && callerIdentity == getFileIdentity(fileName);
 	}
 
 	Bool lookupDurationMS(const AsciiString &fileName, Real &durationMS) const
@@ -259,6 +270,7 @@ public:
 	virtual ~AudioVirtualFileSource() = default;
 	virtual Bool readFile(const AsciiString &fileName, std::vector<std::uint8_t> &bytes,
 		std::string &identity) const = 0;
+	virtual Bool matchesIdentity(const AsciiString &, const void *) const { return FALSE; }
 };
 
 // The production-neutral adapter resolves an asset to the current game
@@ -280,9 +292,18 @@ public:
 	Bool decodePcmAt(const AsciiString &fileName, AudioPcmChunk &chunk,
 		UnsignedInt maxFrames, UnsignedInt startFrame) const override;
 	const void *getFileIdentity(const AsciiString &fileName) const override;
+	Bool matchesFileIdentity(const AsciiString &fileName,
+		const void *callerIdentity) const override;
+	AudioVirtualFileSource *getVirtualFileSource() const { return m_virtualSource; }
 	void setVirtualFileSource(AudioVirtualFileSource *virtualSource)
 	{
+		m_ownedVirtualSource.reset();
 		m_virtualSource = virtualSource;
+	}
+	void setOwnedVirtualFileSource(std::shared_ptr<AudioVirtualFileSource> virtualSource)
+	{
+		m_ownedVirtualSource = std::move(virtualSource);
+		m_virtualSource = m_ownedVirtualSource.get();
 	}
 
 	Bool getEventDurationMS(const AsciiString &attackFile, const AsciiString &mainFile,
@@ -294,6 +315,7 @@ private:
 		std::string &identity) const;
 
 	std::string m_rootDirectory;
+	std::shared_ptr<AudioVirtualFileSource> m_ownedVirtualSource;
 	AudioVirtualFileSource *m_virtualSource = nullptr;
 	mutable std::list<std::string> m_identityPaths;
 };

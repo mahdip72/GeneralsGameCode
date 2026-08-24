@@ -1,25 +1,3 @@
-add_library(core_native_audio_manager_contract_compile OBJECT
-    NativeAudioManagerContractTest.cpp
-)
-
-target_include_directories(core_native_audio_manager_contract_compile PRIVATE
-    ${CMAKE_SOURCE_DIR}/Core/GameEngineDevice/Include
-    ${CMAKE_SOURCE_DIR}/Core/GameEngine/Include
-    ${CMAKE_SOURCE_DIR}/Core/GameEngine/Include/Precompiled
-    ${CMAKE_SOURCE_DIR}/Core/Libraries/Include
-    ${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas
-    ${CMAKE_SOURCE_DIR}/Core/Main
-    ${CMAKE_SOURCE_DIR}/Dependencies/Utility
-)
-
-target_compile_options(core_native_audio_manager_contract_compile PRIVATE
-    /FI${CMAKE_SOURCE_DIR}/Dependencies/Utility/Utility/CppMacros.h
-)
-
-target_compile_definitions(core_native_audio_manager_contract_compile PRIVATE
-    RTS_NATIVE_AUDIO_TEST_HOOK
-)
-
 add_executable(core_native_audio_manager_contract_test
 	NativeAudioManagerContractTest.cpp
 	NativeAudioManagerRuntimeSupport.cpp
@@ -49,12 +27,6 @@ target_link_libraries(core_native_audio_manager_contract_test PRIVATE
 	rts_native_audio_manager
 	rts_xaudio2_audio_service
     rts_native_audio_asset_source
-)
-
-set_target_properties(core_native_audio_manager_contract_compile PROPERTIES
-    CXX_STANDARD 20
-    CXX_STANDARD_REQUIRED YES
-    CXX_EXTENSIONS NO
 )
 
 set_target_properties(core_native_audio_manager_contract_test PROPERTIES

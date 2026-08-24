@@ -58,6 +58,17 @@
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
+Bool isAudioEventShroudedForLocalPlayer(const Coord3D *position)
+{
+	if (position == nullptr || ThePartitionManager == nullptr) {
+		return FALSE;
+	}
+	Player *player = rts::getObservedOrLocalPlayer_Safe();
+	return player != nullptr
+		&& ThePartitionManager->getShroudStatusForPlayer(player->getPlayerIndex(), position)
+			!= CELLSHROUD_CLEAR;
+}
+
 //-------------------------------------------------------------------------------------------------
 SoundManager::SoundManager()
 {

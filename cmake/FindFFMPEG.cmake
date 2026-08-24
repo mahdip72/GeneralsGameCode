@@ -61,19 +61,36 @@ find_package_handle_standard_args(FFMPEG
 )
 
 if(FFMPEG_FOUND)
-	# Do not let a library bundle built for the other pointer width enter the
-	# native graph.  The conventional SDK names are the only portable marker
-	# available before link time; the focused configure probes also exercise this
-	# guard with x86/x64 fixture roots.
-	foreach(_FFMPEG_ROOT_HINT IN LISTS _FFMPEG_ROOT_HINTS)
-		string(TOLOWER "${_FFMPEG_ROOT_HINT}" _FFMPEG_ROOT_HINT_LOWER)
-		if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND _FFMPEG_ROOT_HINT_LOWER MATCHES "(x86|win32|i[3-6]86)")
-			message(FATAL_ERROR "The x64 build cannot consume an x86 FFmpeg SDK: ${_FFMPEG_ROOT_HINT}")
+	# Validate the actual COFF machine records from each import library.  Root
+	# directory names are not an architecture contract and are intentionally not
+	# consulted here.
+	if(WIN32)
+		find_program(_RTS_FFMPEG_POWERSHELL NAMES powershell pwsh)
+		if(NOT _RTS_FFMPEG_POWERSHELL)
+			message(FATAL_ERROR "PowerShell is required to validate FFmpeg COFF import-library architecture.")
 		endif()
-		if(CMAKE_SIZEOF_VOID_P EQUAL 4 AND _FFMPEG_ROOT_HINT_LOWER MATCHES "(x64|amd64|win64)")
-			message(FATAL_ERROR "The x86 build cannot consume an x64 FFmpeg SDK: ${_FFMPEG_ROOT_HINT}")
+		if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+			set(_RTS_FFMPEG_EXPECTED_MACHINE 34404)
+		elseif(CMAKE_SIZEOF_VOID_P EQUAL 4)
+			set(_RTS_FFMPEG_EXPECTED_MACHINE 332)
+		else()
+			message(FATAL_ERROR "Unsupported pointer width for FFmpeg COFF validation: ${CMAKE_SIZEOF_VOID_P}")
 		endif()
-	endforeach()
+		foreach(_FFMPEG_COMPONENT IN LISTS _FFMPEG_COMPONENTS)
+			string(TOUPPER "${_FFMPEG_COMPONENT}" _FFMPEG_COMPONENT_UPPER)
+			execute_process(
+				COMMAND "${_RTS_FFMPEG_POWERSHELL}" -NoProfile -NonInteractive
+					-ExecutionPolicy Bypass -File "${CMAKE_CURRENT_LIST_DIR}/ValidateFFmpegCoff.ps1"
+					-Path "${FFMPEG_${_FFMPEG_COMPONENT_UPPER}_LIBRARY}"
+					-ExpectedMachine "${_RTS_FFMPEG_EXPECTED_MACHINE}"
+				RESULT_VARIABLE _RTS_FFMPEG_COFF_RESULT
+				OUTPUT_VARIABLE _RTS_FFMPEG_COFF_OUTPUT
+				ERROR_VARIABLE _RTS_FFMPEG_COFF_ERROR)
+			if(NOT _RTS_FFMPEG_COFF_RESULT EQUAL 0)
+				message(FATAL_ERROR "FFmpeg ${_FFMPEG_COMPONENT} import-library COFF validation failed: ${_RTS_FFMPEG_COFF_OUTPUT}${_RTS_FFMPEG_COFF_ERROR}")
+			endif()
+		endforeach()
+	endif()
 
 	set(FFMPEG_INCLUDE_DIRS "${FFMPEG_INCLUDE_DIR}")
 	set(FFMPEG_LIBRARIES)
@@ -155,7 +172,6 @@ unset(_FFMPEG_FIRST_LIBRARY_DIR)
 unset(_FFMPEG_REQUIRED_VARIABLES)
 unset(_FFMPEG_ROOT_HINTS)
 unset(_FFMPEG_ROOT_HINT)
-unset(_FFMPEG_ROOT_HINT_LOWER)
 unset(_FFMPEG_RUNTIME_LIBRARY)
 unset(_FFMPEG_RUNTIME_LIBRARY_COUNT)
 unset(_FFMPEG_RUNTIME_LIBRARY_PATH)

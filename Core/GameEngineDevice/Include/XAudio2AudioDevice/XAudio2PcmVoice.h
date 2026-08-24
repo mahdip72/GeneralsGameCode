@@ -104,8 +104,9 @@ private:
 		std::uint64_t sequence = 0;
 		std::atomic<SlotState> state { SlotState::FREE };
 		bool cancelled = false;
-		std::atomic<bool> callbackComplete { false };
-		std::atomic<std::uint64_t> callbackToken { 0 };
+		// Callback ownership is claimed before reading the non-atomic metadata;
+		// the owner reclaims only after the callback publishes COMPLETE.
+		std::atomic<std::uint64_t> callbackIdentity { 0 };
 	};
 
 	static constexpr std::size_t COMPLETION_COUNT = 32;
@@ -117,6 +118,10 @@ private:
 
 	static WAVEFORMATEX pcmFormat();
 	static bool isValidChunk(const AudioPcmChunk &chunk);
+	static std::uint64_t encodeCallbackIdentity(std::uint64_t token,
+		std::uint64_t state) noexcept;
+	static std::uint64_t callbackIdentityToken(std::uint64_t identity) noexcept;
+	static std::uint64_t callbackIdentityState(std::uint64_t identity) noexcept;
 
 	void clearSlot(Slot &slot);
 	void reclaimCompletedSlots();

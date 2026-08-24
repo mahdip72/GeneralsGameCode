@@ -12,6 +12,12 @@ constexpr std::uint16_t PCM_CHANNELS = 2;
 constexpr std::uint32_t PCM_SAMPLE_RATE = 48000;
 constexpr std::uint16_t PCM_BITS_PER_SAMPLE = 16;
 constexpr std::size_t PCM_BYTES_PER_FRAME = PCM_CHANNELS * sizeof(std::int16_t);
+constexpr std::uint64_t CALLBACK_STATE_BITS = 3;
+constexpr std::uint64_t CALLBACK_STATE_MASK = (1ULL << CALLBACK_STATE_BITS) - 1ULL;
+constexpr std::uint64_t CALLBACK_STATE_PENDING = 1;
+constexpr std::uint64_t CALLBACK_STATE_SUBMITTED = 2;
+constexpr std::uint64_t CALLBACK_STATE_IN_FLIGHT = 3;
+constexpr std::uint64_t CALLBACK_STATE_COMPLETE = 4;
 
 #if defined(RTS_XAUDIO2_PCM_HAS_FFMPEG)
 constexpr std::uint32_t PCM_MAX_CHUNK_FRAMES = FFmpegAudioDecoder::MAX_CHUNK_FRAMES;
@@ -71,6 +77,22 @@ bool XAudio2PcmVoice::isValidChunk(const AudioPcmChunk &chunk)
 	return chunk.data.size() == static_cast<std::size_t>(chunk.frameCount) * PCM_BYTES_PER_FRAME;
 }
 
+std::uint64_t XAudio2PcmVoice::encodeCallbackIdentity(std::uint64_t token,
+	std::uint64_t state) noexcept
+{
+	return (token << CALLBACK_STATE_BITS) | state;
+}
+
+std::uint64_t XAudio2PcmVoice::callbackIdentityToken(std::uint64_t identity) noexcept
+{
+	return identity >> CALLBACK_STATE_BITS;
+}
+
+std::uint64_t XAudio2PcmVoice::callbackIdentityState(std::uint64_t identity) noexcept
+{
+	return identity & CALLBACK_STATE_MASK;
+}
+
 bool XAudio2PcmVoice::open()
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
@@ -104,13 +126,14 @@ bool XAudio2PcmVoice::open()
 
 void XAudio2PcmVoice::clearSlot(Slot &slot)
 {
+	// Withdraw callback admission before touching the metadata.  Reclamation
+	// only reaches this point after a callback published COMPLETE.
+	slot.callbackIdentity.store(0, std::memory_order_release);
 	slot.buffer = {};
 	slot.chunk = {};
 	slot.generation = 0;
 	slot.sequence = 0;
 	slot.cancelled = false;
-	slot.callbackComplete.store(false, std::memory_order_release);
-	slot.callbackToken.store(0, std::memory_order_release);
 	slot.state.store(SlotState::FREE, std::memory_order_release);
 }
 
@@ -143,7 +166,8 @@ void XAudio2PcmVoice::reclaimCompletedSlots()
 {
 	for (Slot &slot : m_slots) {
 		if (slot.state.load(std::memory_order_acquire) == SlotState::SUBMITTED
-			&& slot.callbackComplete.exchange(false, std::memory_order_acq_rel)) {
+			&& callbackIdentityState(slot.callbackIdentity.load(std::memory_order_acquire))
+				== CALLBACK_STATE_COMPLETE) {
 			clearSlot(slot);
 		}
 	}
@@ -240,8 +264,11 @@ void XAudio2PcmVoice::service()
 		if (slot == nullptr) {
 			return;
 		}
+		const std::uint64_t token = callbackIdentityToken(
+			slot->callbackIdentity.load(std::memory_order_acquire));
+		slot->callbackIdentity.store(encodeCallbackIdentity(token, CALLBACK_STATE_SUBMITTED),
+			std::memory_order_release);
 		slot->state.store(SlotState::SUBMITTED, std::memory_order_release);
-		slot->callbackComplete.store(false, std::memory_order_release);
 		const HRESULT result = m_backend.submit(slot->buffer);
 		if (FAILED(result)) {
 			fail(result);
@@ -277,8 +304,11 @@ void XAudio2PcmVoice::close() noexcept
 	if (destroyBackend) {
 		const HRESULT destroyResult = m_backend.destroyWithResult();
 		if (FAILED(destroyResult)) {
-			m_lastError.store(destroyResult, std::memory_order_release);
-			m_failed.store(true, std::memory_order_release);
+			HRESULT expected = S_OK;
+			if (m_lastError.compare_exchange_strong(expected, destroyResult,
+				std::memory_order_acq_rel, std::memory_order_acquire)) {
+				m_failed.store(true, std::memory_order_release);
+			}
 		}
 	}
 
@@ -475,16 +505,17 @@ AudioPcmSubmitResult XAudio2PcmVoice::submit(AudioPcmChunk &&chunk)
 	slot->buffer = {};
 	slot->buffer.AudioBytes = static_cast<UINT32>(slot->chunk.data.size());
 	slot->buffer.pAudioData = slot->chunk.data.data();
-	if (++m_nextCallbackToken == 0) {
+	if (++m_nextCallbackToken >= (1ULL << (64 - CALLBACK_STATE_BITS))) {
 		m_nextCallbackToken = 1;
 	}
-	slot->callbackToken.store(m_nextCallbackToken, std::memory_order_release);
 	// The callback context is an opaque per-submission token, not a slot
 	// address. This lets the callback reject a stale completion after the owner
 	// has reclaimed and reused the fixed slot.
 	slot->buffer.pContext = reinterpret_cast<void *>(
 		static_cast<std::uintptr_t>(m_nextCallbackToken));
-	slot->callbackComplete.store(false, std::memory_order_release);
+	slot->callbackIdentity.store(
+		encodeCallbackIdentity(m_nextCallbackToken, CALLBACK_STATE_PENDING),
+		std::memory_order_release);
 	slot->cancelled = false;
 	slot->state.store(SlotState::PENDING, std::memory_order_release);
 	return AudioPcmSubmitResult::ACCEPTED;
@@ -540,29 +571,45 @@ void STDMETHODCALLTYPE XAudio2PcmVoice::OnBufferStart(void *)
 void STDMETHODCALLTYPE XAudio2PcmVoice::OnBufferEnd(void *pBufferContext)
 {
 	for (Slot &slot : m_slots) {
-		const std::uint64_t callbackToken = slot.callbackToken.load(std::memory_order_acquire);
-		if (callbackToken != 0
-			&& pBufferContext == reinterpret_cast<void *>(static_cast<std::uintptr_t>(callbackToken))
-			&& slot.state.load(std::memory_order_acquire) == SlotState::SUBMITTED
-			&& !slot.callbackComplete.exchange(true, std::memory_order_acq_rel)) {
-			const std::int64_t endSample = slot.chunk.startSample
-				+ static_cast<std::int64_t>(slot.chunk.frameCount);
-			publishCompletion(XAudio2PcmCompletionRecord {
-				slot.chunk.generation,
-				slot.chunk.sequence,
-				callbackToken,
-				endSample
-			});
-			if (slot.generation != m_playedGeneration.load(std::memory_order_acquire)) {
-				return;
-			}
+		const std::uint64_t observed = slot.callbackIdentity.load(std::memory_order_acquire);
+		const std::uint64_t callbackToken = callbackIdentityToken(observed);
+		if (callbackToken == 0
+			|| pBufferContext != reinterpret_cast<void *>(static_cast<std::uintptr_t>(callbackToken))
+			|| callbackIdentityState(observed) != CALLBACK_STATE_SUBMITTED
+			|| slot.state.load(std::memory_order_acquire) != SlotState::SUBMITTED) {
+			continue;
+		}
+		std::uint64_t expected = observed;
+		if (!slot.callbackIdentity.compare_exchange_strong(expected,
+			encodeCallbackIdentity(callbackToken, CALLBACK_STATE_IN_FLIGHT),
+			std::memory_order_acq_rel, std::memory_order_acquire)) {
+			continue;
+		}
+
+		// The claim above prevents owner-side reclamation. Read and account for
+		// every slot field before publishing COMPLETE to the owner.
+		const std::uint64_t generation = slot.chunk.generation;
+		const std::uint64_t sequence = slot.chunk.sequence;
+		const std::int64_t endSample = slot.chunk.startSample
+			+ static_cast<std::int64_t>(slot.chunk.frameCount);
+		const bool currentGeneration = slot.generation
+			== m_playedGeneration.load(std::memory_order_acquire);
+		if (currentGeneration) {
 			std::int64_t previousSample = m_playedSample.load(std::memory_order_acquire);
 			while (previousSample < endSample
 				&& !m_playedSample.compare_exchange_weak(previousSample, endSample,
 					std::memory_order_release, std::memory_order_acquire)) {
 			}
-			return;
 		}
+		publishCompletion(XAudio2PcmCompletionRecord {
+			generation,
+			sequence,
+			callbackToken,
+			endSample
+		});
+		slot.callbackIdentity.store(encodeCallbackIdentity(callbackToken, CALLBACK_STATE_COMPLETE),
+			std::memory_order_release);
+		return;
 	}
 }
 

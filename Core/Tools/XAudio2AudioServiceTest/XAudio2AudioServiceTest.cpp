@@ -433,8 +433,13 @@ void testConcurrentTransitionsPreserveFirstFailure()
 		while (!backendView->startEntered.load(std::memory_order_acquire)) {
 			std::this_thread::yield();
 		}
+		// Keep the owner transaction paused inside StartEngine while the native
+		// callback publishes its failure.  The shared publication must prevent
+		// the later OPENING -> RUNNING commit from succeeding.
 		backendView->emitCritical(E_ABORT);
 		backendView->emitCritical(E_ACCESSDENIED);
+		check(service.state() == XAudio2AudioServiceState::FAILED,
+			"a paused open transaction observes the callback failure before resume");
 		backendView->releaseStart.store(true, std::memory_order_release);
 		opener.join();
 		check(!opened.load(std::memory_order_acquire),

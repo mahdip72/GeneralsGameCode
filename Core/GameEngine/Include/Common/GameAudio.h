@@ -67,6 +67,12 @@ struct AudioEventInfo;
 struct AudioRequest;
 struct AudioSettings;
 struct MiscAudio;
+struct Coord3D;
+
+// World-aware shroud admission is implemented by the game audio layer.  The
+// device-free native manager uses this narrow seam without importing the full
+// PartitionManager/renderer ABI.
+Bool isAudioEventShroudedForLocalPlayer(const Coord3D *position);
 
 typedef std::hash_map<AsciiString, AudioEventInfo*, rts::hash<AsciiString>, rts::equal_to<AsciiString>/**/> AudioEventInfoHash;
 typedef AudioEventInfoHash::iterator AudioEventInfoHashIt;

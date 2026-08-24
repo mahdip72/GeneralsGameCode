@@ -587,6 +587,13 @@ bool decodeWithFFmpeg(const std::string &path, AudioPcmChunk &chunk,
 	}
 	packet = av_packet_alloc();
 	frame = av_frame_alloc();
+	if (packet == nullptr || frame == nullptr) {
+		av_frame_free(&frame);
+		av_packet_free(&packet);
+		avcodec_free_context(&codecContext);
+		avformat_close_input(&format);
+		return false;
+	}
 	CapturePcmSink sink(startFrame, maxFrames);
 	FFmpegAudioDecoder decoder;
 	decoder.reset(1, sink);
@@ -889,6 +896,19 @@ const void *FileAudioAssetSource::getFileIdentity(const AsciiString &fileName) c
 	}
 	m_identityPaths.push_back(identity);
 	return &m_identityPaths.back();
+}
+
+Bool FileAudioAssetSource::matchesFileIdentity(const AsciiString &fileName,
+	const void *callerIdentity) const
+{
+	if (callerIdentity == nullptr) {
+		return FALSE;
+	}
+	if (callerIdentity == getFileIdentity(fileName)) {
+		return TRUE;
+	}
+	return m_virtualSource != nullptr
+		&& m_virtualSource->matchesIdentity(fileName, callerIdentity);
 }
 
 Bool FileAudioAssetSource::getEventDurationMS(const AsciiString &attackFile,

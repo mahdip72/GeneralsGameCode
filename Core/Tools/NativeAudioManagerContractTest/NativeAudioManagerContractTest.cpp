@@ -25,6 +25,7 @@
 class View;
 extern View *TheTacticalView;
 extern int g_nativeAudioBaseUpdateCalls;
+extern Bool g_nativeAudioShroudedForTest;
 
 static_assert(std::is_base_of<AudioManager, NullAudioManager>::value,
 	"NullAudioManager must implement the common AudioManager contract");
@@ -193,9 +194,11 @@ int main()
 	const std::filesystem::path realAttack = realRoot / "attack.wav";
 	const std::filesystem::path realMain = realRoot / "main.wav";
 	const std::filesystem::path realDecay = realRoot / "decay.wav";
+	const std::filesystem::path realReplacement = realRoot / "replacement.wav";
 	writeWaveFile(realAttack, 100U);
 	writeWaveFile(realMain, 400U);
 	writeWaveFile(realDecay, 50U);
+	writeWaveFile(realReplacement, 100U);
 
 	AudioManager *dummy = AudioManagerFactory::create(true);
 	check(dummy != nullptr && dummy->getDevice() == nullptr,
@@ -280,6 +283,26 @@ int main()
 	manager.setOn(TRUE, AudioAffect_Sound);
 	manager.setAudioSettingsForTest(nullptr);
 	deleteInstance(admissionInfo);
+	AudioEventInfo *shroudedInfo = newInstance(AudioEventInfo);
+	*shroudedInfo = *fixtureInfo;
+	shroudedInfo->m_type = ST_WORLD | ST_SHROUDED;
+	FixtureEvent shroudedEvent(AsciiString("fixture-shrouded"));
+	shroudedEvent.setAudioEventInfo(shroudedInfo);
+	Coord3D shroudedPosition;
+	shroudedPosition.set(10.0f, 0.0f, 0.0f);
+	shroudedEvent.setPosition(&shroudedPosition);
+	g_nativeAudioShroudedForTest = TRUE;
+	check(manager.addAudioEvent(&shroudedEvent) == AHSV_NotForLocal,
+		"shrouded positional admission is culled before consuming a channel");
+	g_nativeAudioShroudedForTest = FALSE;
+	deleteInstance(shroudedInfo);
+	FixtureEvent outOfRangeEvent(AsciiString("fixture-out-of-range"));
+	outOfRangeEvent.setAudioEventInfo(fixtureInfo);
+	Coord3D outOfRangePosition;
+	outOfRangePosition.set(100.0f, 0.0f, 0.0f);
+	outOfRangeEvent.setPosition(&outOfRangePosition);
+	check(manager.addAudioEvent(&outOfRangeEvent) == AHSV_NotForLocal,
+		"maximum-range positional admission is rejected before channel allocation");
 
 	FixtureEvent delayedEvent(AsciiString("fixture-delayed"));
 	delayedEvent.setAudioEventInfo(fixtureInfo);
@@ -525,6 +548,24 @@ int main()
 	deleteInstance(forcedHighInfo);
 	deleteInstance(forcedLowInfo);
 
+	AudioEventInfo *pendingLimitInfo = newInstance(AudioEventInfo);
+	*pendingLimitInfo = *lowInfo;
+	pendingLimitInfo->m_limit = 1;
+	pendingLimitInfo->m_sounds.clear();
+	pendingLimitInfo->m_sounds.push_back(AsciiString("main.wav"));
+	FixtureEvent pendingLimitedFirst(AsciiString("pending-limited"));
+	pendingLimitedFirst.setAudioEventInfo(pendingLimitInfo);
+	pendingLimitedFirst.setDelayForTest(100.0f);
+	const AudioHandle pendingLimitedHandle = manager.addAudioEvent(&pendingLimitedFirst);
+	FixtureEvent pendingLimitedSecond(AsciiString("pending-limited"));
+	pendingLimitedSecond.setAudioEventInfo(pendingLimitInfo);
+	check(pendingLimitedHandle != AHSV_NoSound
+		&& manager.addAudioEvent(&pendingLimitedSecond) == AHSV_NoSound
+		&& manager.getPendingAudioRequestCount() == 1,
+		"pending requests count toward the per-event admission limit");
+	manager.killAudioEventImmediately(pendingLimitedHandle);
+	deleteInstance(pendingLimitInfo);
+
 	catalog.setDurationMS(AsciiString("short.wav"), 1.0f);
 	AudioEventInfo *nonLoopInfo = newInstance(AudioEventInfo);
 	*nonLoopInfo = *lowInfo;
@@ -661,6 +702,18 @@ int main()
 	manager.stopAudio(AudioAffect_Sound3D);
 	manager.update();
 	check(!manager.isCurrentlyPlaying(attenuationHandle), "3D attenuation fixture stops cleanly");
+	settings.m_use3DSoundRangeVolumeFade = FALSE;
+	Coord3D origin;
+	origin.zero();
+	manager.setListenerPosition(&origin, &origin);
+	manager.setAudioEventVolumeOverride(AsciiString("configured-attenuation"), -1.0f);
+	const AudioHandle noFadeHandle = manager.addAudioEvent(&attenuationEvent);
+	manager.update();
+	FakeVoice *noFadeVoice = engine->lastVoice;
+	check(noFadeVoice != nullptr && noFadeVoice->lastVolume > 0.199f
+		&& noFadeVoice->lastVolume < 0.201f,
+		"disabled range fading keeps full volume until the maximum-range cut");
+	manager.killAudioEventImmediately(noFadeHandle);
 
 	AudioEventInfo *fadeInfo = newInstance(AudioEventInfo);
 	*fadeInfo = *musicOneInfo;
@@ -716,10 +769,57 @@ int main()
 	manager.stopAudio(AudioAffect_Speech);
 	manager.update();
 
+	FixtureEvent delayedSpeech(AsciiString("delayed-speech"));
+	delayedSpeech.setAudioEventInfo(speechInfo);
+	delayedSpeech.setDelayForTest(100.0f);
+	const AudioHandle delayedSpeechHandle = manager.addAudioEvent(&delayedSpeech);
+	FixtureEvent delayedTakeover(AsciiString("delayed-takeover"));
+	delayedTakeover.setAudioEventInfo(speechInfo);
+	delayedTakeover.setUninterruptible(TRUE);
+	const AudioHandle delayedTakeoverHandle = manager.addAudioEvent(&delayedTakeover);
+	manager.update();
+	check(!manager.isCurrentlyPlaying(delayedSpeechHandle)
+		&& manager.isCurrentlyPlaying(delayedTakeoverHandle),
+		"uninterruptible speech removes already-pending speech before it can start");
+	manager.killAudioEventImmediately(delayedTakeoverHandle);
+
+	FixtureEvent regularSpeech(AsciiString("regular-speech"));
+	regularSpeech.setAudioEventInfo(speechInfo);
+	const AudioHandle regularSpeechHandle = manager.addAudioEvent(&regularSpeech);
+	manager.update();
+	check(manager.isCurrentlyPlaying(regularSpeechHandle),
+		"a regular speech stream is active before uninterruptible takeover");
+	FixtureEvent takeoverSpeech(AsciiString("takeover-speech"));
+	takeoverSpeech.setAudioEventInfo(speechInfo);
+	takeoverSpeech.setUninterruptible(TRUE);
+	const AudioHandle takeoverSpeechHandle = manager.addAudioEvent(&takeoverSpeech);
+	manager.update();
+	check(!manager.isCurrentlyPlaying(regularSpeechHandle)
+		&& manager.isCurrentlyPlaying(takeoverSpeechHandle)
+		&& manager.getDisallowSpeech(),
+		"starting uninterruptible speech synchronously stops existing speech");
+	manager.killAudioEventImmediately(takeoverSpeechHandle);
+	check(!manager.isCurrentlyPlaying(takeoverSpeechHandle)
+		&& manager.getActiveAudioCount() == 0 && !manager.getDisallowSpeech(),
+		"immediate speech kill synchronously releases the voice and guard");
+
+	manager.setVolume(0.25f, AudioAffect_Speech);
+	FixtureEvent forcedSpeech(AsciiString("forced-speech"));
+	forcedSpeech.setAudioEventInfo(speechInfo);
+	manager.friend_forcePlayAudioEventRTS(&forcedSpeech);
+	manager.update();
+	check(engine->lastVoice != nullptr && engine->lastVoice->lastVolume > 0.24f
+		&& engine->lastVoice->lastVolume < 0.26f,
+		"briefing force-play honors the speech slider for streaming audio");
+	manager.stopAudio(AudioAffect_Speech);
+	manager.update();
+	manager.setVolume(1.0f, AudioAffect_Speech);
+
 	std::unique_ptr<FakeEngine> replacementOwnedEngine = std::make_unique<FakeEngine>();
 	FakeEngine *replacementEngine = replacementOwnedEngine.get();
 	XAudio2AudioService replacementService(std::move(replacementOwnedEngine));
 	XAudio2AudioManager replacementManager(&replacementService, &catalog);
+	FileAudioAssetSource replacementSource(AsciiString(realRoot.string().c_str()));
 	replacementManager.openDevice();
 	AudioAssetCatalog replacementCatalog;
 	replacementCatalog.setDurationMS(AsciiString("replacement.wav"), 100.0f);
@@ -740,6 +840,20 @@ int main()
 	check(replacementManager.isOpen() && replacementManager.getActiveAudioCount() == 0
 		&& !replacementManager.isCurrentlyPlaying(replacementHandle),
 		"replacing the asset source quiesces active records before admission resumes");
+	replacementInfo->m_audioName = AsciiString("replacement-file");
+	replacementInfo->m_sounds.clear();
+	replacementInfo->m_sounds.push_back(AsciiString("replacement.wav"));
+	replacementManager.setAssetSource(&replacementSource);
+	check(replacementSource.getVirtualFileSource() != nullptr,
+		"replacement FileAudioAssetSource receives a manager-owned virtual/BIG provider");
+	FixtureEvent replacementFileEvent(AsciiString("replacement-file"));
+	replacementFileEvent.setAudioEventInfo(replacementInfo);
+	const AudioHandle replacementFileHandle = replacementManager.addAudioEvent(&replacementFileEvent);
+	replacementManager.update();
+	check(replacementManager.getFileLengthMS(AsciiString("replacement.wav")) == 100.0f
+		&& replacementEngine->lastVoice != nullptr
+		&& replacementManager.isCurrentlyPlaying(replacementFileHandle),
+		"replacement FileAudioAssetSource decodes the actual replacement.wav after provider wiring");
 	replacementManager.closeDevice();
 	deleteInstance(replacementInfo);
 

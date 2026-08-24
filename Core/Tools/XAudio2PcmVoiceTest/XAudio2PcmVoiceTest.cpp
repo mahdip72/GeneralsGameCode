@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
+#include <atomic>
 #include <utility>
 #include <vector>
 
@@ -499,6 +501,37 @@ void testStaleCallbackTokenIsIgnoredAfterSlotReuse()
 		"the replacement submission still publishes its own completion");
 	voice.close();
 }
+
+void testCallbackClaimPrecedesOwnerReclamation()
+{
+	FakePcmVoiceBackend backend;
+	XAudio2PcmVoice voice(backend);
+	check(voice.open(), "callback-owner race voice opens");
+	for (std::uint64_t sequence = 0; sequence < 256; ++sequence) {
+		check(voice.submit(makeChunk(0, sequence, static_cast<std::uint8_t>(sequence)))
+				== AudioPcmSubmitResult::ACCEPTED,
+			"callback-owner race admits a chunk");
+		voice.service();
+		const void *context = backend.submissions.back().context;
+		std::atomic<bool> started { false };
+		std::thread callback([&voice, context, &started]() {
+			started.store(true, std::memory_order_release);
+			voice.OnBufferEnd(const_cast<void *>(context));
+		});
+		while (!started.load(std::memory_order_acquire)) {
+			std::this_thread::yield();
+		}
+		// Reclamation may race the callback, but it must not clear metadata until
+		// the callback has finished all reads and accounting.
+		voice.service();
+		callback.join();
+		voice.service();
+		XAudio2PcmCompletionRecord completion;
+		check(voice.tryPopCompletion(completion) && completion.sequence == sequence,
+			"callback-owner race publishes one coherent completion");
+	}
+	voice.close();
+}
 }
 
 int main()
@@ -512,6 +545,7 @@ int main()
 	testTerminalFailures();
 	testReopenAndRepeatedCleanup();
 	testStaleCallbackTokenIsIgnoredAfterSlotReuse();
+	testCallbackClaimPrecedesOwnerReclamation();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "%d XAudio2PcmVoice checks failed\n", g_failures);
 		return 1;

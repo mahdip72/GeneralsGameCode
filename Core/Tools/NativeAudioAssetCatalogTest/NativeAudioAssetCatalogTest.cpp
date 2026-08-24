@@ -29,6 +29,11 @@ public:
 		identity = "archive:" + m_name;
 		return TRUE;
 	}
+	Bool matchesIdentity(const AsciiString &fileName, const void *identity) const override
+	{
+		return fileName.str() != nullptr && std::string(fileName.str()) == m_name
+			&& identity == this;
+	}
 
 private:
 	std::string m_name;
@@ -210,6 +215,9 @@ int main()
 		"archive-backed audio decodes a bounded continuation");
 	check(archiveAwareSource.getFileIdentity(AsciiString("archive\\virtual_main.wav")) != nullptr,
 		"archive-backed audio exposes source-owned identity");
+	check(archiveAwareSource.matchesFileIdentity(
+		AsciiString("archive\\virtual_main.wav"), &archiveSource),
+		"archive source bridges a legacy caller identity through its provider");
 	FileAudioAssetSource realSource;
 	check(realSource.getDurationMS(AsciiString(attackPath.string().c_str()), duration)
 		&& duration == 125.0f, "filesystem source reports exact Generals attack duration");

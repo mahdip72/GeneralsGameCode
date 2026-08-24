@@ -2,6 +2,7 @@
 
 #include "AudioDevice/AudioAssetSource.h"
 #include "Common/AudioEventRTS.h"
+#include "Common/AudioHandleSpecialValues.h"
 #include "Common/GameAudio.h"
 #include "XAudio2AudioDevice/XAudio2AudioService.h"
 
@@ -129,6 +130,8 @@ private:
 		Bool paused = FALSE;
 		Bool stopping = FALSE;
 		Bool forced = FALSE;
+		Bool speechVolumeOverride = FALSE;
+		Bool waitingForGeneratedDelay = FALSE;
 		Bool voiceOpen = FALSE;
 		AsciiString assetFileName;
 		const void *assetIdentity = nullptr;
@@ -155,8 +158,15 @@ private:
 	Bool requestAffectMatches(const AudioRequest *request, AudioAffect which) const;
 	Bool canReplace(const PlayingAudio &victim, const DynamicAudioEventRTS &incoming) const;
 	Bool isChannelFull(Channel channel) const;
+	Bool isChannelFullForEvent(Channel channel, AudioHandle excludeHandle) const;
 	UnsignedInt channelCount(Channel channel) const;
+	UnsignedInt pendingChannelCount(Channel channel, AudioHandle excludeHandle = AHSV_NoSound) const;
 	UnsignedInt channelLimit(Channel channel) const;
+	UnsignedInt pendingEventCount(const AsciiString &eventName,
+		AudioHandle excludeHandle = AHSV_NoSound) const;
+	Bool eventAffectEnabled(const AudioEventRTS &event) const;
+	Bool isAudibleAtAdmission(const AudioEventRTS &event) const;
+	void stopExistingSpeechForUninterruptible(AudioHandle exceptHandle);
 	PlayingAudio *findPlaying(AudioHandle handle);
 	const PlayingAudio *findPlaying(AudioHandle handle) const;
 	PlayingAudio *findLowestPriority(Channel channel, AudioPriority minimumPriority);
@@ -168,7 +178,7 @@ private:
 
 	std::unique_ptr<XAudio2AudioService> m_ownedService;
 	std::unique_ptr<AudioAssetSource> m_ownedAssetSource;
-	std::unique_ptr<AudioVirtualFileSource> m_ownedVirtualFileSource;
+	std::shared_ptr<AudioVirtualFileSource> m_ownedVirtualFileSource;
 	XAudio2AudioService *m_service;
 	Bool m_ownsService;
 	AudioAssetSource *m_assetSource;

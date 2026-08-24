@@ -253,20 +253,33 @@ public:
 
 	void destroy() noexcept override
 	{
+		(void)destroyWithResult();
+	}
+
+	HRESULT destroyWithResult() noexcept override
+	{
 		IXAudio2SourceVoice *voice = m_voice;
 		if (voice == nullptr) {
 			m_callback.disableAndWait();
-			return;
+			return S_OK;
 		}
 
 		// Stop and flush before DestroyVoice.  Delivery is disabled first so a
 		// callback cannot enter the project voice while its owner is tearing down.
 		m_callback.disableAndWait();
-		voice->Stop(0, 0);
-		voice->FlushSourceBuffers();
+		HRESULT firstFailure = S_OK;
+		const HRESULT stopResult = voice->Stop(0, 0);
+		if (FAILED(stopResult)) {
+			firstFailure = stopResult;
+		}
+		const HRESULT flushResult = voice->FlushSourceBuffers();
+		if (SUCCEEDED(firstFailure) && FAILED(flushResult)) {
+			firstFailure = flushResult;
+		}
 		voice->DestroyVoice();
 		m_voice = nullptr;
 		m_callback.disableAndWait();
+		return firstFailure;
 	}
 
 private:

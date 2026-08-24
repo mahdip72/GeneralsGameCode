@@ -406,12 +406,14 @@ Bool AudioManager::prepareAudioEventForPlayback(
 				if (!isOn(AudioAffect_Music)) return FALSE;
 				break;
 			case AT_SoundEffect:
-				if (!isOn(AudioAffect_Sound) || !isOn(AudioAffect_Sound3D)) {
+				if (eventToAdd->isPositionalAudio()
+					? !isOn(AudioAffect_Sound3D) : !isOn(AudioAffect_Sound)) {
 					return FALSE;
 				}
 				break;
 			case AT_Streaming:
-				if (getDisallowSpeech() || !isOn(AudioAffect_Speech)) return FALSE;
+				if ((getDisallowSpeech() && !eventToAdd->getUninterruptible())
+					|| !isOn(AudioAffect_Speech)) return FALSE;
 				break;
 		}
 

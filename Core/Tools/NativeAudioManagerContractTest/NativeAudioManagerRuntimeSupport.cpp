@@ -10,6 +10,11 @@
 #include <algorithm>
 
 AudioManager *TheAudio = nullptr;
+Bool g_nativeAudioShroudedForTest = FALSE;
+Bool isAudioEventShroudedForLocalPlayer(const Coord3D *)
+{
+	return g_nativeAudioShroudedForTest;
+}
 class FileSystem;
 FileSystem *TheFileSystem = nullptr;
 
@@ -148,6 +153,7 @@ void AudioEventRTS::setAudioEventInfo(const AudioEventInfo *info) const { m_even
 const AudioEventInfo *AudioEventRTS::getAudioEventInfo() const { return m_eventInfo; }
 void AudioEventRTS::setPlayingHandle(AudioHandle handle) { m_playingHandle = handle; }
 AudioHandle AudioEventRTS::getPlayingHandle() { return m_playingHandle; }
+void AudioEventRTS::setHandleToKill(AudioHandle handle) { m_killThisHandle = handle; }
 AudioHandle AudioEventRTS::getHandleToKill() const { return m_killThisHandle; }
 Bool AudioEventRTS::getIsLogicalAudio() const { return m_isLogicalAudio; }
 void AudioEventRTS::setObjectID(ObjectID objectID) { m_objectID = objectID; m_ownerType = OT_Object; }
@@ -431,9 +437,11 @@ Bool AudioManager::prepareAudioEventForPlayback(const AudioEventRTS *eventToAdd,
 	if (!forced) {
 		if (info->m_soundType == AT_Music && !isOn(AudioAffect_Music)) return FALSE;
 		if (info->m_soundType == AT_SoundEffect
-			&& (!isOn(AudioAffect_Sound) || !isOn(AudioAffect_Sound3D))) return FALSE;
+			&& (eventToAdd->isPositionalAudio()
+				? !isOn(AudioAffect_Sound3D) : !isOn(AudioAffect_Sound))) return FALSE;
 		if (info->m_soundType == AT_Streaming
-			&& (getDisallowSpeech() || !isOn(AudioAffect_Speech))) return FALSE;
+			&& ((getDisallowSpeech() && !eventToAdd->getUninterruptible())
+				|| !isOn(AudioAffect_Speech))) return FALSE;
 		if (!eventToAdd->getIsLogicalAudio() && !eventToAdd->getUninterruptible()
 			&& !shouldPlayLocally(eventToAdd)) return FALSE;
 	}
