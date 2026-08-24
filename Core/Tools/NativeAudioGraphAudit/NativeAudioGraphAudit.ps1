@@ -51,6 +51,11 @@ if (-not $pointerSizeConfigured) {
 if ($closure -notmatch 'XAudio2AudioDevice[/\\]AudioManagerFactory\.cpp') {
     throw 'The configured x64 device closure does not contain the native factory source.'
 }
+if ($closure -notmatch 'links=.*rts_native_audio_asset_source' -or
+    $closure -notmatch 'links=.*rts_xaudio2_pcm_voice' -or
+    $closure -notmatch 'links=.*rts_xaudio2_audio_service') {
+    throw 'The configured x64 target closure does not retain the native asset, voice, and service targets.'
+}
 if ($closure -match '(?i)mss|MilesAudioDevice|MilesAudioManager|milesstub') {
     throw 'The configured x64 native-device closure contains a legacy Miles source or link.'
 }

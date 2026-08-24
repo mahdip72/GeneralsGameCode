@@ -11,6 +11,7 @@
 AudioManager *TheAudio = nullptr;
 class View;
 View *TheTacticalView = nullptr;
+int g_nativeAudioBaseUpdateCalls = 0;
 const char *const AudioManager::MuteAudioReasonNames[] = { "window-focus" };
 
 SubsystemInterface::SubsystemInterface() = default;
@@ -116,6 +117,11 @@ AudioEventRTS &AudioEventRTS::operator=(const AudioEventRTS &right)
 	m_playerIndex = right.m_playerIndex;
 	m_portionToPlayNext = right.m_portionToPlayNext;
 	m_positionOfAudio = right.m_positionOfAudio;
+	if (m_ownerType == OT_Object) {
+		m_objectID = right.m_objectID;
+	} else if (m_ownerType == OT_Drawable) {
+		m_drawableID = right.m_drawableID;
+	}
 	return *this;
 }
 
@@ -162,10 +168,13 @@ AudioEventInfo::~AudioEventInfo() = default;
 void AudioEventRTS::generateFilename()
 {
 	if (m_eventInfo != nullptr) {
-		if (!m_eventInfo->m_filename.isEmpty()) {
+		if (!m_eventInfo->m_filename.isEmpty()
+			&& (m_eventInfo->m_soundType == AT_Music || m_eventInfo->m_soundType == AT_Streaming)) {
 			m_filenameToLoad = m_eventInfo->m_filename;
 		} else if (!m_eventInfo->m_sounds.empty()) {
-			m_filenameToLoad = m_eventInfo->m_sounds.front();
+			m_playingAudioIndex = (m_playingAudioIndex + 1)
+				% static_cast<Int>(m_eventInfo->m_sounds.size());
+			m_filenameToLoad = m_eventInfo->m_sounds[m_playingAudioIndex];
 		}
 	}
 }
@@ -199,17 +208,51 @@ void AudioEventRTS::advanceNextPlayPortion()
 void AudioManager::init() {}
 void AudioManager::postProcessLoad() {}
 void AudioManager::reset() {}
-void AudioManager::update() {}
+void AudioManager::update()
+{
+	++g_nativeAudioBaseUpdateCalls;
+	m_zoomVolume *= 0.5f;
+	set3DVolumeAdjustment(m_zoomVolume);
+}
 
 AudioHandle AudioManager::addAudioEvent(const AudioEventRTS *) { return AHSV_NoSound; }
 void AudioManager::removeAudioEvent(AudioHandle) {}
 Bool AudioManager::isValidAudioEvent(const AudioEventRTS *) const { return FALSE; }
 Bool AudioManager::isValidAudioEvent(AudioEventRTS *) const { return FALSE; }
 void AudioManager::setAudioEventEnabled(AsciiString, Bool) {}
-void AudioManager::setAudioEventVolumeOverride(AsciiString, Real) {}
+void AudioManager::setAudioEventVolumeOverride(AsciiString eventToAffect, Real newVolume)
+{
+	if (eventToAffect == AsciiString::TheEmptyString) {
+		m_adjustedVolumes.clear();
+		return;
+	}
+	if (newVolume != -1.0f) {
+		adjustVolumeOfPlayingAudio(eventToAffect, newVolume);
+	}
+	for (std::list<std::pair<AsciiString, Real> >::iterator it = m_adjustedVolumes.begin();
+		it != m_adjustedVolumes.end(); ++it) {
+		if (it->first == eventToAffect) {
+			if (newVolume == -1.0f) {
+				m_adjustedVolumes.erase(it);
+			}
+			else {
+				it->second = newVolume;
+			}
+			return;
+		}
+	}
+	if (newVolume != -1.0f) {
+		m_adjustedVolumes.push_front(std::make_pair(eventToAffect, newVolume));
+	}
+}
 void AudioManager::removeAudioEvent(AsciiString) {}
 void AudioManager::removeDisabledEvents() {}
-void AudioManager::getInfoForAudioEvent(const AudioEventRTS *) const {}
+void AudioManager::getInfoForAudioEvent(const AudioEventRTS *event) const
+{
+	if (event != nullptr && event->getAudioEventInfo() == nullptr) {
+		event->setAudioEventInfo(findAudioEventInfo(event->getEventName()));
+	}
+}
 Bool AudioManager::isCurrentlyPlaying(AudioHandle) { return FALSE; }
 
 UnsignedInt AudioManager::translateSpeakerTypeToUnsignedInt(const AsciiString &) { return 0; }
@@ -233,10 +276,26 @@ void AudioManager::setOn(Bool enabled, AudioAffect which)
 
 void AudioManager::setVolume(Real volume, AudioAffect which)
 {
-	if (which & AudioAffect_Music) m_musicVolume = volume;
-	if (which & AudioAffect_Sound) m_soundVolume = volume;
-	if (which & AudioAffect_Sound3D) m_sound3DVolume = volume;
-	if (which & AudioAffect_Speech) m_speechVolume = volume;
+	if (which & AudioAffect_Music) {
+		if (which & AudioAffect_SystemSetting) m_systemMusicVolume = volume;
+		else m_scriptMusicVolume = volume;
+		m_musicVolume = m_scriptMusicVolume * m_systemMusicVolume;
+	}
+	if (which & AudioAffect_Sound) {
+		if (which & AudioAffect_SystemSetting) m_systemSoundVolume = volume;
+		else m_scriptSoundVolume = volume;
+		m_soundVolume = m_scriptSoundVolume * m_systemSoundVolume;
+	}
+	if (which & AudioAffect_Sound3D) {
+		if (which & AudioAffect_SystemSetting) m_systemSound3DVolume = volume;
+		else m_scriptSound3DVolume = volume;
+		m_sound3DVolume = m_scriptSound3DVolume * m_systemSound3DVolume;
+	}
+	if (which & AudioAffect_Speech) {
+		if (which & AudioAffect_SystemSetting) m_systemSpeechVolume = volume;
+		else m_scriptSpeechVolume = volume;
+		m_speechVolume = m_scriptSpeechVolume * m_systemSpeechVolume;
+	}
 }
 
 Real AudioManager::getVolume(AudioAffect which)
@@ -249,7 +308,8 @@ Real AudioManager::getVolume(AudioAffect which)
 
 void AudioManager::set3DVolumeAdjustment(Real volume)
 {
-	m_sound3DVolume = std::max(0.0f, std::min(1.0f, volume));
+	m_sound3DVolume = std::max(0.0f, std::min(1.0f,
+		volume * m_scriptSound3DVolume * m_systemSound3DVolume));
 }
 
 void AudioManager::setListenerPosition(const Coord3D *position, const Coord3D *orientation)
@@ -265,10 +325,28 @@ void AudioManager::releaseAudioRequest(AudioRequest *request) { deleteInstance(r
 void AudioManager::appendAudioRequest(AudioRequest *request) { m_audioRequests.push_back(request); }
 void AudioManager::processRequestList() {}
 
-AudioEventInfo *AudioManager::newAudioEventInfo(AsciiString) { return nullptr; }
-void AudioManager::addAudioEventInfo(AudioEventInfo *) {}
-AudioEventInfo *AudioManager::findAudioEventInfo(AsciiString) const { return nullptr; }
+AudioEventInfo *AudioManager::newAudioEventInfo(AsciiString name)
+{
+	AudioEventInfo *info = newInstance(AudioEventInfo);
+	info->m_audioName = name;
+	m_allAudioEventInfo[name] = info;
+	return info;
+}
+
+void AudioManager::addAudioEventInfo(AudioEventInfo *info)
+{
+	if (info != nullptr) {
+		m_allAudioEventInfo[info->m_audioName] = info;
+	}
+}
+
+AudioEventInfo *AudioManager::findAudioEventInfo(AsciiString name) const
+{
+	AudioEventInfoHash::const_iterator it = m_allAudioEventInfo.find(name);
+	return it == m_allAudioEventInfo.end() ? nullptr : it->second;
+}
 void AudioManager::refreshCachedVariables() {}
+const AudioSettings *AudioManager::getAudioSettings() const { return m_audioSettings; }
 Real AudioManager::getAudioLengthMS(const AudioEventRTS *) { return 0.0f; }
 void AudioManager::findAllAudioEventsOfType(AudioType, std::vector<AudioEventInfo *> &) {}
 
@@ -287,16 +365,58 @@ void AudioManager::removeAllAudioRequests()
 }
 
 void AudioManager::addTrackName(const AsciiString &trackName) { m_musicTracks.push_back(trackName); }
-AsciiString AudioManager::nextTrackName(const AsciiString &) { return m_musicTracks.empty() ? AsciiString::TheEmptyString : m_musicTracks.front(); }
-AsciiString AudioManager::prevTrackName(const AsciiString &) { return m_musicTracks.empty() ? AsciiString::TheEmptyString : m_musicTracks.back(); }
+AsciiString AudioManager::nextTrackName(const AsciiString &currentTrack)
+{
+	if (m_musicTracks.empty()) {
+		return AsciiString::TheEmptyString;
+	}
+	std::vector<AsciiString>::const_iterator it = m_musicTracks.begin();
+	for (; it != m_musicTracks.end(); ++it) {
+		if (*it == currentTrack) {
+			break;
+		}
+	}
+	if (it != m_musicTracks.end()) {
+		++it;
+	}
+	if (it == m_musicTracks.end()) {
+		it = m_musicTracks.begin();
+	}
+	return *it;
+}
+
+AsciiString AudioManager::prevTrackName(const AsciiString &currentTrack)
+{
+	if (m_musicTracks.empty()) {
+		return AsciiString::TheEmptyString;
+	}
+	std::vector<AsciiString>::const_reverse_iterator it = m_musicTracks.rbegin();
+	for (; it != m_musicTracks.rend(); ++it) {
+		if (*it == currentTrack) {
+			break;
+		}
+	}
+	if (it != m_musicTracks.rend()) {
+		++it;
+	}
+	if (it == m_musicTracks.rend()) {
+		it = m_musicTracks.rbegin();
+	}
+	return *it;
+}
 
 Bool AudioManager::prepareAudioEventForPlayback(const AudioEventRTS *eventToAdd,
 	RefCountPtr<DynamicAudioEventRTS> &preparedEvent, Bool forced)
 {
 	preparedEvent.Clear();
 	if (eventToAdd == nullptr || eventToAdd->getEventName().isEmpty()
-		|| eventToAdd->getEventName() == "NoSound"
-		|| eventToAdd->getAudioEventInfo() == nullptr) {
+		|| eventToAdd->getEventName() == "NoSound") {
+		return FALSE;
+	}
+	if (eventToAdd->getAudioEventInfo() == nullptr) {
+		getInfoForAudioEvent(eventToAdd);
+	}
+	if (eventToAdd->getAudioEventInfo() == nullptr) {
 		return FALSE;
 	}
 	const AudioEventInfo *info = eventToAdd->getAudioEventInfo();
@@ -319,6 +439,11 @@ Bool AudioManager::prepareAudioEventForPlayback(const AudioEventRTS *eventToAdd,
 			preparedEvent->setVolume(adjustment.second);
 			break;
 		}
+	}
+	if (!forced && m_audioSettings != nullptr
+		&& preparedEvent->getVolume() < m_audioSettings->m_minVolume) {
+		preparedEvent.Clear();
+		return FALSE;
 	}
 	return TRUE;
 }

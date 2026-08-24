@@ -35,6 +35,7 @@ public:
 	void update() override;
 
 	AudioHandle addAudioEvent(const AudioEventRTS *eventToAdd) override;
+	void removeAudioEvent(AudioHandle audioEvent) override;
 	void stopAudio(AudioAffect which) override;
 	void pauseAudio(AudioAffect which) override;
 	void resumeAudio(AudioAffect which) override;
@@ -102,6 +103,9 @@ public:
 	// It exercises the same voice admission/submission path as a phase without
 	// constructing legacy game-world objects.
 	Bool runInjectedPlaybackProbe(AsciiString fileName);
+	void setChannelLimitsForTest(UnsignedInt samples2D, UnsignedInt samples3D, UnsignedInt streams);
+	void setAudioSettingsForTest(AudioSettings *settings);
+	void setActiveMusicTrackForTest(const AsciiString &track);
 #endif
 
 protected:
@@ -138,7 +142,7 @@ private:
 	void processStopRequest(AudioHandle handle);
 	void processPauseRequest(AudioHandle handle);
 	void startNextPhase(PlayingAudio &playing);
-	void finishPlaying(PlayingAudio &playing);
+	void finishPlaying(PlayingAudio &playing, Bool naturalCompletion = FALSE);
 	void drainCompletions();
 	void processActiveAudio();
 	void processFades();
@@ -157,10 +161,11 @@ private:
 	Real effectiveVolume(const PlayingAudio &playing) const;
 	void recordMusicCompletion(const PlayingAudio &playing);
 	void updatePlayingVolumes();
+	void updateDisallowSpeechGuard();
 	void clearPlaying();
 
 	std::unique_ptr<XAudio2AudioService> m_ownedService;
-	std::unique_ptr<AudioAssetCatalog> m_ownedAssetCatalog;
+	std::unique_ptr<AudioAssetSource> m_ownedAssetSource;
 	XAudio2AudioService *m_service;
 	AudioAssetSource *m_assetSource;
 	std::vector<PlayingAudio> m_playing;

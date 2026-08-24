@@ -54,6 +54,7 @@ target_compile_options(core_native_audio_manager_contract_test PRIVATE
 
 target_link_libraries(core_native_audio_manager_contract_test PRIVATE
 	rts_xaudio2_audio_service
+    rts_native_audio_asset_source
 )
 
 set_target_properties(core_native_audio_manager_contract_compile PROPERTIES

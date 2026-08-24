@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 class View;
 extern View *TheTacticalView;
@@ -38,13 +39,27 @@ Bool isMusic(const AudioEventRTS &event)
 	const AudioEventInfo *info = event.getAudioEventInfo();
 	return info != nullptr && info->m_soundType == AT_Music;
 }
+
+Bool durationToFrames(Real durationMS, UnsignedInt sampleRate, UnsignedInt &frames)
+{
+	frames = 0;
+	if (durationMS <= 0.0f || sampleRate == 0) {
+		return FALSE;
+	}
+	const double frameValue = static_cast<double>(durationMS)
+		* static_cast<double>(sampleRate) / 1000.0;
+	if (!std::isfinite(frameValue) || frameValue < 1.0
+		|| frameValue > static_cast<double>(std::numeric_limits<UnsignedInt>::max())) {
+		return FALSE;
+	}
+	frames = static_cast<UnsignedInt>(std::floor(frameValue + 0.5));
+	return frames != 0;
+}
 }
 
 XAudio2AudioManager::XAudio2AudioManager() :
 	XAudio2AudioManager(nullptr, nullptr)
 {
-	m_ownedAssetCatalog = std::make_unique<AudioAssetCatalog>();
-	m_assetSource = m_ownedAssetCatalog.get();
 }
 
 XAudio2AudioManager::XAudio2AudioManager(XAudio2AudioService *service,
@@ -62,8 +77,8 @@ XAudio2AudioManager::XAudio2AudioManager(XAudio2AudioService *service,
 	m_ambientPaused(FALSE)
 {
 	if (m_assetSource == nullptr) {
-		m_ownedAssetCatalog = std::make_unique<AudioAssetCatalog>();
-		m_assetSource = m_ownedAssetCatalog.get();
+		m_ownedAssetSource = std::make_unique<FileAudioAssetSource>();
+		m_assetSource = m_ownedAssetSource.get();
 	}
 }
 
@@ -91,8 +106,10 @@ Bool XAudio2AudioManager::runInjectedPlaybackProbe(AsciiString fileName)
 	if (!m_assetSource->decodePcmAt(fileName, probe, 1, 0) || probe.sampleRate == 0) {
 		return FALSE;
 	}
-	playing.phaseTotalFrames = static_cast<UnsignedInt>(
-		playing.phaseDurationMS * static_cast<Real>(probe.sampleRate) / 1000.0f);
+	if (!durationToFrames(playing.phaseDurationMS, probe.sampleRate, playing.phaseTotalFrames)) {
+		releaseVoice(playing);
+		return FALSE;
+	}
 	if (!ensureVoice(playing) || !submitPhase(playing)) {
 		releaseVoice(playing);
 		return FALSE;
@@ -102,17 +119,35 @@ Bool XAudio2AudioManager::runInjectedPlaybackProbe(AsciiString fileName)
 	releaseVoice(playing);
 	return accepted;
 }
+
+void XAudio2AudioManager::setChannelLimitsForTest(UnsignedInt samples2D,
+	UnsignedInt samples3D, UnsignedInt streams)
+{
+	m_num2DSamples = samples2D;
+	m_num3DSamples = samples3D;
+	m_numStreams = streams;
+}
+
+void XAudio2AudioManager::setAudioSettingsForTest(AudioSettings *settings)
+{
+	m_audioSettings = settings;
+}
+
+void XAudio2AudioManager::setActiveMusicTrackForTest(const AsciiString &track)
+{
+	m_activeMusicTrack = track;
+}
 #endif
 
 void XAudio2AudioManager::setAssetSource(AudioAssetSource *assetSource)
 {
 	if (assetSource != nullptr) {
-		m_ownedAssetCatalog.reset();
+		m_ownedAssetSource.reset();
 		m_assetSource = assetSource;
 		return;
 	}
-	m_ownedAssetCatalog = std::make_unique<AudioAssetCatalog>();
-	m_assetSource = m_ownedAssetCatalog.get();
+	m_ownedAssetSource = std::make_unique<FileAudioAssetSource>();
+	m_assetSource = m_ownedAssetSource.get();
 }
 
 void XAudio2AudioManager::setService(XAudio2AudioService *service)
@@ -128,6 +163,11 @@ void XAudio2AudioManager::setService(XAudio2AudioService *service)
 void XAudio2AudioManager::init()
 {
 	AudioManager::init();
+	if (m_ownedAssetSource != nullptr && m_audioSettings != nullptr
+		&& !m_audioSettings->m_audioRoot.isEmpty()) {
+		m_ownedAssetSource = std::make_unique<FileAudioAssetSource>(m_audioSettings->m_audioRoot);
+		m_assetSource = m_ownedAssetSource.get();
+	}
 	if (m_audioSettings != nullptr) {
 		m_num2DSamples = static_cast<UnsignedInt>(m_audioSettings->m_sampleCount2D);
 		m_num3DSamples = static_cast<UnsignedInt>(m_audioSettings->m_sampleCount3D);
@@ -161,28 +201,36 @@ void XAudio2AudioManager::reset()
 
 void XAudio2AudioManager::update()
 {
-	if (TheTacticalView != nullptr) {
-		AudioManager::update();
-	} else {
-		m_zoomVolume = 1.0f;
-		set3DVolumeAdjustment(1.0f);
-	}
-
 	// The owner update order is deliberate: callbacks are serviced, records are
-	// drained, then requests and fades are admitted on this same thread.
+	// drained, then the common listener state is updated once, followed by
+	// request admission, active records, fades, and listener-driven controls.
 	if (m_service != nullptr) {
 		m_service->serviceVoices();
 	}
 	drainCompletions();
-	// The native manager keeps headless scripts device-free, but a live game
-	// still owns the listener/zoom update performed by the common manager.
 	if (TheTacticalView != nullptr) {
 		AudioManager::update();
+	} else {
+		// The native manager keeps headless scripts device-free, but a live game
+		// still owns the listener/zoom update performed by the common manager.
+		m_zoomVolume = 1.0f;
+		set3DVolumeAdjustment(1.0f);
 	}
+	processRequestList();
 	processActiveAudio();
 	processFades();
 	updatePlayingVolumes();
-	processRequestList();
+}
+
+void XAudio2AudioManager::removeAudioEvent(AudioHandle audioEvent)
+{
+	if (audioEvent == AHSV_StopTheMusic || audioEvent == AHSV_StopTheMusicFade
+		|| audioEvent >= AHSV_FirstHandle) {
+		AudioRequest *request = allocateAudioRequest();
+		request->m_handleToInteractOn = audioEvent;
+		request->m_request = AR_Stop;
+		appendAudioRequest(request);
+	}
 }
 
 DynamicAudioEventRTS *XAudio2AudioManager::copyEvent(const AudioEventRTS *eventToCopy)
@@ -213,6 +261,38 @@ AudioHandle XAudio2AudioManager::addAudioEvent(const AudioEventRTS *eventToAdd)
 	if (eventToAdd == nullptr || eventToAdd->getEventName().isEmpty()
 		|| eventToAdd->getEventName() == "NoSound" || !m_admissionOpen) {
 		return AHSV_NoSound;
+	}
+	if (eventToAdd->getAudioEventInfo() == nullptr) {
+		getInfoForAudioEvent(eventToAdd);
+		if (eventToAdd->getAudioEventInfo() == nullptr) {
+			return AHSV_Error;
+		}
+	}
+	const AudioEventInfo *eventInfo = eventToAdd->getAudioEventInfo();
+	switch (eventInfo->m_soundType) {
+		case AT_Music:
+			if (!isOn(AudioAffect_Music)) return AHSV_NoSound;
+			break;
+		case AT_SoundEffect:
+			if (!isOn(AudioAffect_Sound) || !isOn(AudioAffect_Sound3D)) return AHSV_NoSound;
+			break;
+		case AT_Streaming:
+			if (getDisallowSpeech() || !isOn(AudioAffect_Speech)) return AHSV_NoSound;
+			break;
+	}
+	if (!eventToAdd->getIsLogicalAudio() && !eventToAdd->getUninterruptible()
+		&& !shouldPlayLocally(eventToAdd)) {
+		return AHSV_NotForLocal;
+	}
+	Real adjustedVolume = eventToAdd->getVolume();
+	for (const std::pair<AsciiString, Real> &adjustment : m_adjustedVolumes) {
+		if (adjustment.first == eventToAdd->getEventName()) {
+			adjustedVolume = adjustment.second;
+			break;
+		}
+	}
+	if (m_audioSettings != nullptr && adjustedVolume < m_audioSettings->m_minVolume) {
+		return AHSV_Muted;
 	}
 	DynamicAudioEventRTS *event = copyEvent(eventToAdd);
 	if (event == nullptr) {
@@ -305,7 +385,7 @@ void XAudio2AudioManager::processPlayRequest(AudioRequest *request)
 		UnsignedInt sameEvent = 0;
 		PlayingAudio *sameEventVictim = nullptr;
 		for (PlayingAudio &candidate : m_playing) {
-			if (candidate.event != nullptr
+			if (!candidate.stopping && candidate.event != nullptr
 				&& candidate.event->getEventName() == event->getEventName()) {
 				++sameEvent;
 				if (sameEventVictim == nullptr
@@ -330,6 +410,7 @@ void XAudio2AudioManager::processPlayRequest(AudioRequest *request)
 
 	m_playing.push_back(playing);
 	startNextPhase(m_playing.back());
+	updateDisallowSpeechGuard();
 }
 
 void XAudio2AudioManager::processStopRequest(AudioHandle handle)
@@ -406,8 +487,11 @@ void XAudio2AudioManager::startNextPhase(PlayingAudio &playing)
 				AudioPcmChunk probe;
 				if (m_assetSource->decodePcmAt(fileName, probe, 1, 0)
 					&& probe.sampleRate != 0) {
-					playing.phaseTotalFrames = static_cast<UnsignedInt>(
-						playing.phaseDurationMS * static_cast<Real>(probe.sampleRate) / 1000.0f);
+					if (!durationToFrames(playing.phaseDurationMS, probe.sampleRate,
+						playing.phaseTotalFrames)) {
+						playing.phaseDurationMS = 0.0f;
+						playing.phaseRemainingMS = 0.0f;
+					}
 				}
 			}
 			if (!ensureVoice(playing)) {
@@ -456,8 +540,10 @@ Bool XAudio2AudioManager::submitPhase(PlayingAudio &playing)
 		if (!m_assetSource->decodePcmAt(fileName, probe, 1, 0) || probe.sampleRate == 0) {
 			return FALSE;
 		}
-		playing.phaseTotalFrames = static_cast<UnsignedInt>(
-			playing.phaseDurationMS * static_cast<Real>(probe.sampleRate) / 1000.0f);
+		if (!durationToFrames(playing.phaseDurationMS, probe.sampleRate,
+			playing.phaseTotalFrames)) {
+			return FALSE;
+		}
 	}
 	if (playing.phaseSubmittedFrames >= playing.phaseTotalFrames) {
 		return TRUE;
@@ -475,10 +561,11 @@ Bool XAudio2AudioManager::submitPhase(PlayingAudio &playing)
 	chunk.generation = playing.generation;
 	chunk.sequence = playing.voiceSequence++;
 	chunk.startSample = static_cast<std::int64_t>(playing.phaseSubmittedFrames);
+	const UnsignedInt submittedFrames = chunk.frameCount;
 	if (m_service->submit(playing.voice, std::move(chunk)) != AudioPcmSubmitResult::ACCEPTED) {
 		return FALSE;
 	}
-	playing.phaseSubmittedFrames += chunk.frameCount;
+	playing.phaseSubmittedFrames += submittedFrames;
 	m_service->setVoiceVolume(playing.voice, effectiveVolume(playing));
 	return TRUE;
 }
@@ -501,6 +588,9 @@ void XAudio2AudioManager::drainCompletions()
 					playing.phaseCompletedFrames = std::min(
 						playing.phaseTotalFrames,
 						static_cast<UnsignedInt>(completion.endSample));
+				}
+				if (playing.paused || playing.stopping) {
+					break;
 				}
 				if (playing.phaseSubmittedFrames < playing.phaseTotalFrames) {
 					submitPhase(playing);
@@ -543,13 +633,15 @@ void XAudio2AudioManager::processActiveAudio()
 		if (playing.phaseRemainingMS <= 0.0f) {
 			playing.event->advanceNextPlayPortion();
 			if (playing.event->getNextPlayPortion() == PP_Done
+				&& playing.event->getAudioEventInfo() != nullptr
+				&& BitIsSet(playing.event->getAudioEventInfo()->m_control, AC_LOOP)
 				&& playing.event->hasMoreLoops()) {
 				playing.event->decreaseLoopCount();
 				playing.event->generateFilename();
 				playing.event->setNextPlayPortion(PP_Sound);
 			}
 			if (playing.event->getNextPlayPortion() == PP_Done) {
-				finishPlaying(playing);
+				finishPlaying(playing, TRUE);
 				m_playing.erase(m_playing.begin() + index);
 				continue;
 			}
@@ -557,6 +649,7 @@ void XAudio2AudioManager::processActiveAudio()
 		}
 		++index;
 	}
+	updateDisallowSpeechGuard();
 }
 
 void XAudio2AudioManager::processFades()
@@ -589,9 +682,11 @@ void XAudio2AudioManager::releaseVoice(PlayingAudio &playing)
 	playing.voice = {};
 }
 
-void XAudio2AudioManager::finishPlaying(PlayingAudio &playing)
+void XAudio2AudioManager::finishPlaying(PlayingAudio &playing, Bool naturalCompletion)
 {
-	recordMusicCompletion(playing);
+	if (naturalCompletion) {
+		recordMusicCompletion(playing);
+	}
 	releaseVoice(playing);
 	playing.phase = PP_Done;
 }
@@ -603,6 +698,7 @@ void XAudio2AudioManager::clearPlaying()
 	}
 	m_playing.clear();
 	m_forcePlayHandles.clear();
+	setDisallowSpeech(FALSE);
 }
 
 void XAudio2AudioManager::stopAudio(AudioAffect which)
@@ -647,6 +743,11 @@ void XAudio2AudioManager::resumeAudio(AudioAffect which)
 			playing.paused = FALSE;
 			if (m_service != nullptr && playing.voiceOpen) {
 				m_service->resumeVoice(playing.voice);
+			}
+			if (playing.phaseSubmittedFrames < playing.phaseTotalFrames) {
+				submitPhase(playing);
+			} else if (playing.phaseCompletedFrames >= playing.phaseTotalFrames) {
+				playing.phaseRemainingMS = 0.0f;
 			}
 		}
 	}
@@ -746,8 +847,7 @@ Bool XAudio2AudioManager::isCurrentlyPlaying(AudioHandle handle)
 	}
 	for (const AudioRequest *request : m_audioRequests) {
 		if (request->m_pendingEvent != nullptr
-			&& request->m_pendingEvent->getPlayingHandle() == handle
-			&& !request->m_paused) {
+			&& request->m_pendingEvent->getPlayingHandle() == handle) {
 			return TRUE;
 		}
 	}
@@ -798,7 +898,7 @@ UnsignedInt XAudio2AudioManager::channelCount(Channel channel) const
 {
 	UnsignedInt count = 0;
 	for (const PlayingAudio &playing : m_playing) {
-		if (playing.channel == channel) {
+		if (playing.channel == channel && !playing.stopping) {
 			++count;
 		}
 	}
@@ -840,7 +940,8 @@ Bool XAudio2AudioManager::doesViolateLimit(AudioEventRTS *event) const
 	const AudioEventInfo *info = event->getAudioEventInfo();
 	UnsignedInt sameEvent = 0;
 	for (const PlayingAudio &playing : m_playing) {
-		if (playing.event != nullptr && playing.event->getEventName() == event->getEventName()) {
+		if (!playing.stopping && playing.event != nullptr
+			&& playing.event->getEventName() == event->getEventName()) {
 			++sameEvent;
 		}
 	}
@@ -855,7 +956,7 @@ Bool XAudio2AudioManager::isPlayingLowerPriority(AudioEventRTS *event) const
 	}
 	const Channel channel = channelFor(*event);
 	for (const PlayingAudio &playing : m_playing) {
-		if (playing.channel == channel && playing.event->getAudioPriority() < event->getAudioPriority()) {
+		if (!playing.stopping && playing.channel == channel && playing.event->getAudioPriority() < event->getAudioPriority()) {
 			return TRUE;
 		}
 	}
@@ -864,13 +965,14 @@ Bool XAudio2AudioManager::isPlayingLowerPriority(AudioEventRTS *event) const
 
 Bool XAudio2AudioManager::isPlayingAlready(AudioEventRTS *event) const
 {
-	return event != nullptr && findPlaying(event->getPlayingHandle()) != nullptr;
+	const PlayingAudio *playing = event == nullptr ? nullptr : findPlaying(event->getPlayingHandle());
+	return playing != nullptr && playing->generation == m_lifecycleGeneration && !playing->stopping;
 }
 
 Bool XAudio2AudioManager::isObjectPlayingVoice(UnsignedInt objID) const
 {
 	for (const PlayingAudio &playing : m_playing) {
-		if (playing.event->getAudioEventInfo() != nullptr
+		if (!playing.stopping && playing.event->getAudioEventInfo() != nullptr
 			&& BitIsSet(playing.event->getAudioEventInfo()->m_type, ST_VOICE)
 			&& playing.event->getObjectID() == objID) {
 			return TRUE;
@@ -912,7 +1014,7 @@ void XAudio2AudioManager::removeAllDisabledAudio()
 Bool XAudio2AudioManager::has3DSensitiveStreamsPlaying() const
 {
 	for (const PlayingAudio &playing : m_playing) {
-		if (playing.channel == Channel::STREAM && playing.event->isPositionalAudio()) {
+		if (!playing.stopping && playing.channel == Channel::STREAM && playing.event->isPositionalAudio()) {
 			return TRUE;
 		}
 	}
@@ -1025,7 +1127,7 @@ XAudio2AudioManager::PlayingAudio *XAudio2AudioManager::findLowestPriority(Chann
 {
 	PlayingAudio *victim = nullptr;
 	for (PlayingAudio &playing : m_playing) {
-		if (playing.channel != channel || playing.event == nullptr
+		if (playing.stopping || playing.channel != channel || playing.event == nullptr
 			|| playing.event->getAudioPriority() > minimumPriority) {
 			continue;
 		}
@@ -1056,15 +1158,21 @@ Real XAudio2AudioManager::effectiveVolume(const PlayingAudio &playing) const
 			&& playing.event->isPositionalAudio()) {
 			const Coord3D *position = playing.event->getCurrentPosition();
 			const AudioEventInfo *info = playing.event->getAudioEventInfo();
-			if (position != nullptr && info != nullptr && info->m_maxDistance > info->m_minDistance) {
+			Real minDistance = info->m_minDistance;
+			Real maxDistance = info->m_maxDistance;
+			if (m_audioSettings != nullptr && BitIsSet(info->m_type, ST_GLOBAL)) {
+				minDistance = static_cast<Real>(m_audioSettings->m_globalMinRange);
+				maxDistance = static_cast<Real>(m_audioSettings->m_globalMaxRange);
+			}
+			if (position != nullptr && info != nullptr && maxDistance > minDistance) {
 				Coord3D distance = *position;
 				distance.sub(m_listenerPosition);
 				const Real length = distance.length();
-				if (length >= info->m_maxDistance) {
+				if (length >= maxDistance) {
 					volume = 0.0f;
-				} else if (length > info->m_minDistance) {
-					Real attenuation = (info->m_maxDistance - length)
-						/ (info->m_maxDistance - info->m_minDistance);
+				} else if (length > minDistance) {
+					Real attenuation = (maxDistance - length)
+						/ (maxDistance - minDistance);
 					if (m_audioSettings != nullptr && m_audioSettings->m_use3DSoundRangeVolumeFade) {
 						attenuation = static_cast<Real>(std::pow(
 							std::max(0.0f, attenuation),
@@ -1087,6 +1195,23 @@ void XAudio2AudioManager::updatePlayingVolumes()
 			m_service->setVoiceVolume(playing.voice, effectiveVolume(playing));
 		}
 	}
+}
+
+void XAudio2AudioManager::updateDisallowSpeechGuard()
+{
+	Bool guarded = FALSE;
+	for (const PlayingAudio &playing : m_playing) {
+		if (playing.stopping || playing.event == nullptr
+			|| playing.event->getAudioEventInfo() == nullptr) {
+			continue;
+		}
+		if (playing.event->getAudioEventInfo()->m_soundType == AT_Streaming
+			&& playing.event->getUninterruptible()) {
+			guarded = TRUE;
+			break;
+		}
+	}
+	setDisallowSpeech(guarded);
 }
 
 void XAudio2AudioManager::recordMusicCompletion(const PlayingAudio &playing)
