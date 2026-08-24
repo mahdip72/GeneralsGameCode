@@ -335,6 +335,32 @@ if(RTS_BUILD_OPTION_FFMPEG)
     endif()
 endif()
 
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    add_library(rts_native_audio_asset_source STATIC
+        Include/AudioDevice/AudioAssetSource.h
+        Source/AudioDevice/AudioAssetSource.cpp
+    )
+    target_include_directories(rts_native_audio_asset_source PUBLIC
+        Include
+        ${CMAKE_SOURCE_DIR}/Core/GameEngine/Include
+        ${CMAKE_SOURCE_DIR}/Core/Libraries/Include
+        ${CMAKE_SOURCE_DIR}/Dependencies/Utility
+    )
+    target_link_libraries(rts_native_audio_asset_source PUBLIC corei_always)
+    target_compile_features(rts_native_audio_asset_source PUBLIC cxx_std_20)
+    if(RTS_BUILD_OPTION_FFMPEG AND FFMPEG_FOUND)
+        target_compile_definitions(rts_native_audio_asset_source PRIVATE RTS_HAS_FFMPEG)
+        target_link_libraries(rts_native_audio_asset_source PRIVATE
+            rts_ffmpeg_audio_decoder
+            FFMPEG::avcodec
+            FFMPEG::avformat
+            FFMPEG::avutil
+            FFMPEG::swresample
+        )
+    endif()
+    target_link_libraries(corei_gameenginedevice_private INTERFACE rts_native_audio_asset_source)
+endif()
+
 if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32)
     add_library(rts_xaudio2_pcm_voice STATIC
         Include/XAudio2AudioDevice/XAudio2PcmVoice.h

@@ -2,6 +2,7 @@
 
 #include "AudioDevice/AudioAssetSource.h"
 #include "Common/AudioEventRTS.h"
+#include "Common/AudioSettings.h"
 #include "Common/AudioRequest.h"
 #include "Common/AudioHandleSpecialValues.h"
 
@@ -9,8 +10,8 @@ class View;
 extern View *TheTacticalView;
 
 NullAudioManager::NullAudioManager() :
-	m_ownedAssetCatalog(std::make_unique<AudioAssetCatalog>()),
-	m_assetSource(m_ownedAssetCatalog.get()),
+	m_ownedAssetSource(std::make_unique<FileAudioAssetSource>()),
+	m_assetSource(m_ownedAssetSource.get()),
 	m_preferredProvider(AsciiString::TheEmptyString),
 	m_preferredSpeaker(AsciiString::TheEmptyString),
 	m_lifecycleGeneration(1)
@@ -22,17 +23,22 @@ NullAudioManager::~NullAudioManager() = default;
 void NullAudioManager::setAssetSource(AudioAssetSource *source)
 {
 	if (source != nullptr) {
-		m_ownedAssetCatalog.reset();
+		m_ownedAssetSource.reset();
 		m_assetSource = source;
 		return;
 	}
-	m_ownedAssetCatalog = std::make_unique<AudioAssetCatalog>();
-	m_assetSource = m_ownedAssetCatalog.get();
+	m_ownedAssetSource = std::make_unique<FileAudioAssetSource>();
+	m_assetSource = m_ownedAssetSource.get();
 }
 
 void NullAudioManager::init()
 {
 	AudioManager::init();
+	if (m_ownedAssetSource != nullptr && m_audioSettings != nullptr
+		&& !m_audioSettings->m_audioRoot.isEmpty()) {
+		m_ownedAssetSource = std::make_unique<FileAudioAssetSource>(m_audioSettings->m_audioRoot);
+		m_assetSource = m_ownedAssetSource.get();
+	}
 }
 
 void NullAudioManager::postProcessLoad()

@@ -5,7 +5,6 @@
 #include <memory>
 
 class AudioAssetSource;
-class AudioAssetCatalog;
 
 // A deterministic, device-free AudioManager.  It deliberately inherits only
 // AudioManager so headless x64 code cannot acquire a legacy video/audio handle.
@@ -79,7 +78,7 @@ protected:
 	void setDeviceListenerPosition() override {}
 
 private:
-	std::unique_ptr<AudioAssetCatalog> m_ownedAssetCatalog;
+	std::unique_ptr<AudioAssetSource> m_ownedAssetSource;
 	AudioAssetSource *m_assetSource;
 	AsciiString m_preferredProvider;
 	AsciiString m_preferredSpeaker;

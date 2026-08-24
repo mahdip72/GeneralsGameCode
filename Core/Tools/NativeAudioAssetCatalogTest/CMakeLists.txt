@@ -24,6 +24,9 @@ add_executable(core_native_audio_asset_catalog_test
 )
 
 target_compile_definitions(core_native_audio_asset_catalog_test PRIVATE DISABLE_GAMEMEMORY)
+if(RTS_BUILD_OPTION_FFMPEG)
+    target_compile_definitions(core_native_audio_asset_catalog_test PRIVATE RTS_NATIVE_AUDIO_HAS_FFMPEG)
+endif()
 
 target_include_directories(core_native_audio_asset_catalog_test PRIVATE
 	${CMAKE_SOURCE_DIR}/Core/GameEngineDevice/Include
@@ -36,6 +39,10 @@ target_include_directories(core_native_audio_asset_catalog_test PRIVATE
 
 target_sources(core_native_audio_asset_catalog_test PRIVATE
 	NativeAudioAssetCatalogRuntimeSupport.cpp
+)
+
+target_link_libraries(core_native_audio_asset_catalog_test PRIVATE
+    rts_native_audio_asset_source
 )
 
 target_compile_options(core_native_audio_asset_catalog_test PRIVATE

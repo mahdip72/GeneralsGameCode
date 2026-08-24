@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <list>
+#include <string>
 #include <vector>
 
 // Neutral source/decoder seam used by both device-free scripts and native audio.
@@ -28,6 +29,10 @@ public:
 	{
 		if (startFrame == 0) {
 			return decodePcm(fileName, chunk, maxFrames);
+		}
+		if (maxFrames == 0 || startFrame > static_cast<UnsignedInt>(-1) - maxFrames) {
+			chunk = {};
+			return FALSE;
 		}
 		AudioPcmChunk whole;
 		if (!decodePcm(fileName, whole, startFrame + maxFrames)) {
@@ -62,8 +67,8 @@ public:
 	}
 };
 
-// A deterministic catalog for tests, headless timing, and the first native
-// decoder adapter.  It intentionally accepts only signed 16-bit interleaved
+// A deterministic catalog for tests, headless timing, and injected sources.
+// It intentionally accepts only signed 16-bit interleaved
 // PCM and clips every returned buffer to the requested frame bound.
 class AudioAssetCatalog final : public AudioAssetSource
 {
@@ -75,15 +80,6 @@ public:
 
 	AudioAssetCatalog()
 	{
-		// The x64 factory always owns a real neutral decoder/catalog.  These
-		// compact entries keep script timing deterministic before game INI data
-		// registers its real paths and provide device-free PCM for smoke paths.
-		setDurationMS(AsciiString("attack.wav"), 100.0f);
-		setDurationMS(AsciiString("main.wav"), 400.0f);
-		setDurationMS(AsciiString("decay.wav"), 50.0f);
-		setDurationMS(AsciiString("zh_attack.wav"), 10.0f);
-		setDurationMS(AsciiString("zh_main.wav"), 20.0f);
-		setDurationMS(AsciiString("zh_decay.wav"), 30.0f);
 	}
 
 	void setDurationMS(const AsciiString &fileName, Real durationMS)
@@ -243,4 +239,33 @@ private:
 	// Entries are list-backed so the opaque identity returned to a playing
 	// record remains stable when a later INI/catalog registration appends data.
 	std::list<Entry> m_entries;
+};
+
+// The production-neutral adapter resolves an asset to the current game
+// directory (or an optional root) and returns bounded 48 kHz stereo s16 PCM.
+// When the FFmpeg backend is configured it accepts every audio container that
+// FFmpeg can decode; the built-in RIFF/WAVE reader remains available for
+// device-free builds and safe fallback handling.
+class FileAudioAssetSource final : public AudioAssetSource
+{
+public:
+	FileAudioAssetSource();
+	explicit FileAudioAssetSource(const AsciiString &rootDirectory);
+	~FileAudioAssetSource() override = default;
+
+	Bool getDurationMS(const AsciiString &fileName, Real &durationMS) const override;
+	Bool decodePcm(const AsciiString &fileName, AudioPcmChunk &chunk,
+		UnsignedInt maxFrames) const override;
+	Bool decodePcmAt(const AsciiString &fileName, AudioPcmChunk &chunk,
+		UnsignedInt maxFrames, UnsignedInt startFrame) const override;
+	const void *getFileIdentity(const AsciiString &fileName) const override;
+
+	Bool getEventDurationMS(const AsciiString &attackFile, const AsciiString &mainFile,
+		const AsciiString &decayFile, Real &durationMS) const;
+
+private:
+	std::string resolvePath(const AsciiString &fileName) const;
+
+	std::string m_rootDirectory;
+	mutable std::list<std::string> m_identityPaths;
 };
