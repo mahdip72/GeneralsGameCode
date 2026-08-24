@@ -53,6 +53,11 @@
 #include "matrixmapper.h"
 #include "dx8wrapper.h"
 
+namespace
+{
+	const uint32 CANONICAL_MAPPER_MATRIX = 0x100u;
+	const uint32 CANONICAL_MAPPER_COMPOSITE_MATRIX = 0x101u;
+}
 
 /***********************************************************************************************
  * MatrixMapperClass::MatrixMapperClass -- Constructor                                         *
@@ -77,6 +82,20 @@ MatrixMapperClass::MatrixMapperClass(int stage) :
 	ViewSpaceProjectionNormal(0.0f, 0.0f, 0.0f),
 	GradientUCoord(0.5f)
 {
+}
+
+unsigned long MatrixMapperClass::Compute_Canonical_Matrix_CRC(unsigned long crc, uint32 type_id) const
+{
+	crc = Append_Canonical_Header(crc, type_id);
+	crc = Append_Canonical_UInt(crc, Flags);
+	crc = Append_Canonical_UInt(crc, static_cast<uint32>(Type));
+	crc = Append_Canonical_Matrix4(crc, ViewToTexture);
+	return Append_Canonical_Float(crc, GradientUCoord);
+}
+
+unsigned long MatrixMapperClass::Compute_Canonical_CRC(unsigned long crc) const
+{
+	return Compute_Canonical_Matrix_CRC(crc, CANONICAL_MAPPER_MATRIX);
 }
 
 /***********************************************************************************************
@@ -359,6 +378,17 @@ CompositeMatrixMapperClass::~CompositeMatrixMapperClass()
 		InternalMapper->Release_Ref();
 		InternalMapper = nullptr;
 	}
+}
+
+unsigned long CompositeMatrixMapperClass::Compute_Canonical_CRC(unsigned long crc) const
+{
+	crc = Compute_Canonical_Matrix_CRC(crc, CANONICAL_MAPPER_COMPOSITE_MATRIX);
+	const uint32 present = InternalMapper ? 1u : 0u;
+	crc = Append_Canonical_UInt(crc, present);
+	if (InternalMapper) {
+		crc = InternalMapper->Compute_Canonical_CRC(crc);
+	}
+	return crc;
 }
 
 /***********************************************************************************************
