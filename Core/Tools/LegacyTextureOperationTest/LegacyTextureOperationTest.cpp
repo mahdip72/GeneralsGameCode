@@ -245,6 +245,11 @@ int CheckShaderSource()
 	std::ostringstream contents;
 	contents << input.rdbuf();
 	const std::string source = contents.str();
+	const std::string::size_type premodulateCase = source.find("case 20:");
+	const std::string::size_type premodulateReturn = source.find(
+		"return argument1;", premodulateCase);
+	const std::string::size_type followingCase = source.find(
+		"case 21:", premodulateCase);
 	int result = 0;
 	result |= Check(source.find("float4 textureSample, bool alphaOperation") !=
 		std::string::npos, "shader combiner must distinguish alpha operations");
@@ -256,8 +261,11 @@ int CheckShaderSource()
 		std::string::npos, "shader MODULATEINVALPHA_ADDCOLOR RGB formula");
 	result |= Check(source.find("(1.0f - argument1.rgb) * argument2.rgb + argument1.a") !=
 		std::string::npos, "shader MODULATEINVCOLOR_ADDALPHA RGB formula");
-	result |= Check(source.find("return argument1;\n\tcase 21:") !=
-		std::string::npos, "shader PREMODULATE must output argument 1");
+	result |= Check(premodulateCase != std::string::npos &&
+		premodulateReturn != std::string::npos &&
+		followingCase != std::string::npos &&
+		premodulateCase < premodulateReturn && premodulateReturn < followingCase,
+		"shader PREMODULATE must output argument 1");
 	result |= Check(source.find("float4(current.rgb, dotProduct)") !=
 		std::string::npos, "shader DOTPRODUCT3 alpha routing");
 	result |= Check(source.find("current * textureSample") !=
