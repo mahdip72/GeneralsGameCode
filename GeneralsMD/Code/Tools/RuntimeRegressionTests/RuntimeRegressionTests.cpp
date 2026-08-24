@@ -216,7 +216,7 @@ static void TestMalformedGameCommandDeserialization()
 
 static void TestWrappedCommandRequiresCompleteWireRecord()
 {
-	UnsignedByte data[sizeof(NetPacketGameCommandBase::CommandBase) + sizeof(Int) + sizeof(UnsignedByte)] = { 0 };
+	UnsignedByte data[sizeof(NetPacketGameCommandBase::CommandBase) + sizeof(Int) + sizeof(UnsignedByte) + 1] = { 0 };
 	NetPacketGameCommandBase::CommandBase base;
 	base.commandType.commandType = static_cast<UnsignedByte>(NETCOMMANDTYPE_GAMECOMMAND);
 	base.frame.frame = 0;
@@ -237,6 +237,18 @@ static void TestWrappedCommandRequiresCompleteWireRecord()
 	CHECK(truncated == nullptr);
 	if (truncated != nullptr)
 		deleteInstance(truncated);
+
+	NetCommandRef *trailing = NetPacket::ConstructNetCommandMsgFromRawData(data, static_cast<UnsignedInt>(size + 1));
+	CHECK(trailing == nullptr);
+	if (trailing != nullptr)
+		deleteInstance(trailing);
+
+	network::writePrimitive(data + sizeof(NetPacketGameCommandBase::CommandBase),
+		static_cast<Int>(GameMessage::MSG_INVALID));
+	NetCommandRef *invalid = NetPacket::ConstructNetCommandMsgFromRawData(data, static_cast<UnsignedInt>(size));
+	CHECK(invalid == nullptr);
+	if (invalid != nullptr)
+		deleteInstance(invalid);
 }
 
 static NetWrapperCommandMsg *CreateWrapperMessage(UnsignedByte playerID, UnsignedShort commandID,

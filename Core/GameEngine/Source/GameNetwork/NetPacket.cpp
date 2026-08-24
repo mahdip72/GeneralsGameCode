@@ -28,6 +28,7 @@
 
 #include "GameNetwork/NetPacket.h"
 #include "GameNetwork/NetCommandMsg.h"
+#include "GameNetwork/NetCommandValidation.h"
 #include "GameNetwork/NetworkDefs.h"
 #include "GameNetwork/networkutil.h"
 #include "GameNetwork/GameMessageParser.h"
@@ -46,6 +47,30 @@ static size_t constructNetCommandRef(NetCommandRef *&ref, SmallNetPacketCommandB
 	}
 
 	return size;
+}
+
+static Bool IsCanonicalWrappedCommand(const NetCommandRef &ref, const UnsignedByte *data,
+	UnsignedInt dataLength, size_t consumedBytes)
+{
+	if (consumedBytes != dataLength)
+		return false;
+
+	const NetCommandMsg *command = ref.getCommand();
+	if (command->getNetCommandType() != NETCOMMANDTYPE_GAMECOMMAND)
+		return command->getSizeForNetPacket() == dataLength;
+
+	const size_t baseSize = sizeof(NetPacketGameCommandBase::CommandBase);
+	if (dataLength < baseSize)
+		return false;
+
+	NetworkGameMessageLayout layout;
+	const size_t payloadSize = static_cast<size_t>(dataLength) - baseSize;
+	if (!TryParseNetworkGameMessageLayout(data + baseSize, payloadSize, layout))
+		return false;
+
+	const size_t expectedPayloadSize = sizeof(Int) + sizeof(UnsignedByte) +
+		layout.descriptorBytes + layout.payloadBytes;
+	return expectedPayloadSize == payloadSize;
 }
 
 // This function assumes that all of the fields are either of default value or are
@@ -68,8 +93,7 @@ NetCommandRef *NetPacket::ConstructNetCommandMsgFromRawData(const UnsignedByte *
 	NetCommandRef *ref = nullptr;
 	const size_t consumedBytes = constructNetCommandRef(ref, commandBase, buf);
 
-	if (ref != nullptr && (consumedBytes != dataLength ||
-		ref->getCommand()->getSizeForNetPacket() != dataLength))
+	if (ref != nullptr && !IsCanonicalWrappedCommand(*ref, data, dataLength, consumedBytes))
 	{
 		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET,
 			("NetPacket::ConstructNetCommandMsgFromRawData - incomplete or non-canonical command record"));
@@ -79,7 +103,6 @@ NetCommandRef *NetPacket::ConstructNetCommandMsgFromRawData(const UnsignedByte *
 
 	if (ref == nullptr)
 	{
-		DEBUG_CRASH(("Unrecognized packet entry, ignoring."));
 		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("NetPacket::ConstructNetCommandMsgFromRawData - Unrecognized packet"));
 		dumpPacketToLog(data, dataLength);
 	}
