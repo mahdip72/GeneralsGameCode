@@ -1,3 +1,6 @@
+# Apply native x64 pointer diagnostics to all Core runtime and test targets.
+link_libraries(core_x64_portability_config)
+
 # i stands for Interface
 add_library(corei_gameengine_include INTERFACE)
 add_library(corei_libraries_include INTERFACE)

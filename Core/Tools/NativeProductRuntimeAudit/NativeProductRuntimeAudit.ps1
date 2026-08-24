@@ -148,17 +148,22 @@ foreach ($product in @(
         throw "Native x64 $($product.Name) product did not resolve FFmpeg runtime DLLs."
     }
     $runtimeDlls = @($runtimeDllMatch.Groups[1].Value.Trim() -split ';')
+    $msvcRuntimeDllMatch = [regex]::Match($cache, '(?m)^RTS_NATIVE_MSVC_RUNTIME_DLLS:INTERNAL=(.+)$')
+    if (-not $msvcRuntimeDllMatch.Success) {
+        throw "Native x64 $($product.Name) product did not resolve app-local MSVC runtime DLLs."
+    }
+    $msvcRuntimeDlls = @($msvcRuntimeDllMatch.Groups[1].Value.Trim() -split ';')
     $runtimeInstallBlockPattern = '(?ms)^\s*file\(INSTALL DESTINATION "' +
         [regex]::Escape($expectedDestination) + '" TYPE FILE FILES(?<Files>[^)]*)\)'
     $runtimeInstallBlocks = [regex]::Matches($installScript, $runtimeInstallBlockPattern)
-    foreach ($runtimeDll in $runtimeDlls) {
+    foreach ($runtimeDll in @($runtimeDlls + $msvcRuntimeDlls)) {
         $runtimeDllName = [IO.Path]::GetFileName($runtimeDll)
         $runtimeDllPattern = '"[^"]*/' + [regex]::Escape($runtimeDllName) + '"'
         $matchingBlock = $runtimeInstallBlocks | Where-Object {
             $_.Groups['Files'].Value -match $runtimeDllPattern
         } | Select-Object -First 1
         if ($null -eq $matchingBlock) {
-            throw "Native x64 $($product.Name) install script is missing FFmpeg runtime $runtimeDllName below CMAKE_INSTALL_PREFIX/$($product.InstallDirectory)."
+            throw "Native x64 $($product.Name) install script is missing runtime $runtimeDllName below CMAKE_INSTALL_PREFIX/$($product.InstallDirectory)."
         }
     }
 
@@ -244,6 +249,13 @@ foreach ($product in @(
         if (-not [NativeProductRuntimeAudit.NativeLoader]::FreeLibrary($module)) {
             $loaderError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
             throw "Native x64 $($product.Name) installed FFmpeg runtime $runtimeDllName failed to unload with Windows error $loaderError."
+        }
+    }
+    foreach ($runtimeDll in $msvcRuntimeDlls) {
+        $runtimeDllName = [IO.Path]::GetFileName($runtimeDll)
+        $installedRuntimeDll = Join-Path $installedTitleRoot $runtimeDllName
+        if (-not (Test-Path -LiteralPath $installedRuntimeDll -PathType Leaf)) {
+            throw "Native x64 $($product.Name) audit did not produce app-local MSVC runtime $runtimeDllName."
         }
     }
 }

@@ -78,6 +78,19 @@ include(cmake/gamespy.cmake)
 include(cmake/lzhl.cmake)
 include(cmake/stb.cmake)
 
+if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    # Native installed runtimes are disposable and must launch without relying
+    # on a machine-wide Visual C++ Redistributable.  Let each title install the
+    # exact compiler runtime DLLs beside its executable.
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_SKIP TRUE)
+    include(InstallRequiredSystemLibraries)
+    set(RTS_NATIVE_MSVC_RUNTIME_DLLS ${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS}
+        CACHE INTERNAL "Resolved app-local MSVC runtime DLLs for native products")
+    if(RTS_BUILD_PRODUCT AND NOT RTS_NATIVE_MSVC_RUNTIME_DLLS)
+        message(FATAL_ERROR "Native x64 product install could not resolve the MSVC runtime DLLs.")
+    endif()
+endif()
+
 if (IS_VS6_BUILD)
     # The original max sdk does not compile against a modern compiler.
     # If there is a desire to make this work, then a fixed max sdk needs to be created.

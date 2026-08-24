@@ -1,3 +1,5 @@
+link_libraries(core_x64_portability_config)
+
 set(UTILITY_SRC
     Utility/compat.h
     Utility/CppMacros.h

@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.25)
 
 project(g_generals LANGUAGES C CXX)
 
+link_libraries(core_x64_portability_config)
+
 if (RTS_BUILD_GENERALS_DOCS)
     find_package(Doxygen REQUIRED)
     doxygen_add_docs(g_docs Code)
@@ -61,6 +63,11 @@ if(_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS)
     if(WIN32 AND RTS_BUILD_OPTION_FFMPEG AND RTS_FFMPEG_RUNTIME_DLLS)
         # Install the exact resolved DLLs, never an unbounded SDK bin directory.
         install(FILES ${RTS_FFMPEG_RUNTIME_DLLS}
+            DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}")
+    endif()
+
+    if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND RTS_NATIVE_MSVC_RUNTIME_DLLS)
+        install(FILES ${RTS_NATIVE_MSVC_RUNTIME_DLLS}
             DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}")
     endif()
 

@@ -67,7 +67,7 @@ if(MSVC)
     # Keep the legacy 32-bit/VC6 oracle unchanged while making modern x64
     # targets fail at compile time if one is reintroduced.
     if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-        target_compile_options(core_config INTERFACE /we4302 /we4311)
+        target_compile_options(core_x64_portability_config INTERFACE /we4302 /we4311)
     endif()
 endif()
 
