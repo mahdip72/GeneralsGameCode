@@ -33,18 +33,26 @@
 
 #include "WWLib/DbgHelpLoader.h"
 
+#include <cstdint>
+
 //*****************************************************************************
 //	Prototypes
 //*****************************************************************************
 BOOL InitSymbolInfo();
+#if defined(_WIN64)
+void MakeStackTrace(const CONTEXT &context, int skipFrames, void (*callback)(const char*));
+#else
 void MakeStackTrace(DWORD myeip,DWORD myesp,DWORD myebp, int skipFrames, void (*callback)(const char*));
-void GetFunctionDetails(void *pointer, char*name, char*filename, unsigned int* linenumber, unsigned int* address);
+#endif
+void GetFunctionDetails(void *pointer, char*name, char*filename, unsigned int* linenumber, std::uintptr_t* address);
 void WriteStackLine(void*address, void (*callback)(const char*));
 
 //*****************************************************************************
 //	Mis-named globals :-)
 //*****************************************************************************
+#if !defined(_WIN64)
 static CONTEXT gsContext;
+#endif
 
 
 //*****************************************************************************
@@ -67,6 +75,11 @@ void StackDump(void (*callback)(const char*))
 	if (!InitSymbolInfo())
 		return;
 
+#if defined(_WIN64)
+	CONTEXT context = {};
+	::RtlCaptureContext(&context);
+	MakeStackTrace(context, 2, callback);
+#else
 	DWORD myeip,myesp,myebp;
 
 #if defined(_MSC_VER)
@@ -95,14 +108,18 @@ MYEIP1:
 	#error "Unsupported compiler or architecture for register capture"
 #endif
 
-
 	MakeStackTrace(myeip,myesp,myebp, 2, callback);
+#endif
 }
 
 
 //*****************************************************************************
 //*****************************************************************************
+#if defined(_WIN64)
+void StackDumpFromContext(const CONTEXT &context, void (*callback)(const char*))
+#else
 void StackDumpFromContext(DWORD eip,DWORD esp,DWORD ebp, void (*callback)(const char*))
+#endif
 {
 	if (callback == nullptr)
 	{
@@ -112,7 +129,11 @@ void StackDumpFromContext(DWORD eip,DWORD esp,DWORD ebp, void (*callback)(const 
 	if (!InitSymbolInfo())
 		return;
 
-	MakeStackTrace(eip,esp,ebp, 0,  callback);
+#if defined(_WIN64)
+	MakeStackTrace(context, 0, callback);
+#else
+	MakeStackTrace(eip,esp,ebp, 0, callback); // portability-audit: x86-context
+#endif
 }
 
 
@@ -155,7 +176,11 @@ BOOL InitSymbolInfo()
 	{
 		// regenerate the name of the app
 		::GetModuleFileName(nullptr, pathname, _MAX_PATH);
+#if defined(_WIN64)
+		if(DbgHelpLoader::symLoadModule64(process, nullptr, pathname, nullptr, 0, 0))
+#else
 		if(DbgHelpLoader::symLoadModule(process, nullptr, pathname, nullptr, 0, 0))
+#endif
 		{
 				//Load any other relevant modules (ie dlls) here
 				atexit(DbgHelpLoader::unload);
@@ -170,6 +195,40 @@ BOOL InitSymbolInfo()
 
 //*****************************************************************************
 //*****************************************************************************
+#if defined(_WIN64)
+void MakeStackTrace(const CONTEXT &context, int skipFrames, void (*callback)(const char*))
+{
+	CONTEXT walkContext = context;
+	STACKFRAME64 stackFrame = {};
+	stackFrame.AddrPC.Mode = AddrModeFlat;
+	stackFrame.AddrPC.Offset = walkContext.Rip;
+	stackFrame.AddrStack.Mode = AddrModeFlat;
+	stackFrame.AddrStack.Offset = walkContext.Rsp;
+	stackFrame.AddrFrame.Mode = AddrModeFlat;
+	stackFrame.AddrFrame.Offset = walkContext.Rbp;
+
+	HANDLE thread = GetCurrentThread();
+	HANDLE process = GetCurrentProcess();
+	callback("Call Stack\n**********\n");
+
+	unsigned int remaining = 30 + static_cast<unsigned int>(skipFrames);
+	while (remaining-- != 0) {
+		const BOOL walked = DbgHelpLoader::stackWalk64(IMAGE_FILE_MACHINE_AMD64,
+			process, thread, &stackFrame, &walkContext, nullptr,
+			DbgHelpLoader::symFunctionTableAccess64,
+			DbgHelpLoader::symGetModuleBase64, nullptr);
+		if (!walked || stackFrame.AddrPC.Offset == 0) {
+			break;
+		}
+		if (skipFrames > 0) {
+			--skipFrames;
+			continue;
+		}
+		WriteStackLine(reinterpret_cast<void *>(
+			static_cast<std::uintptr_t>(stackFrame.AddrPC.Offset)), callback);
+	}
+}
+#else
 void MakeStackTrace(DWORD myeip,DWORD myesp,DWORD myebp, int skipFrames, void (*callback)(const char*))
 {
 STACKFRAME      stack_frame;
@@ -240,12 +299,12 @@ stack_frame.AddrFrame.Offset = myebp;
 					skip--;
 			}
 	}
-}
+#endif
 
 
 //*****************************************************************************
 //*****************************************************************************
-void GetFunctionDetails(void *pointer, char*name, char*filename, unsigned int* linenumber, unsigned int* address)
+void GetFunctionDetails(void *pointer, char*name, char*filename, unsigned int* linenumber, std::uintptr_t* address)
 {
 	if (!InitSymbolInfo())
 		return;
@@ -264,9 +323,33 @@ void GetFunctionDetails(void *pointer, char*name, char*filename, unsigned int* l
 	}
 	if (address)
 	{
-		*address = 0xFFFFFFFF;
+		*address = static_cast<std::uintptr_t>(-1);
 	}
 
+#if defined(_WIN64)
+	DWORD64 displacement = 0;
+	HANDLE process = ::GetCurrentProcess();
+	char symbolBuffer[sizeof(SYMBOL_INFO) + 512] = {};
+	PSYMBOL_INFO symbol = reinterpret_cast<PSYMBOL_INFO>(symbolBuffer);
+	symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+	symbol->MaxNameLen = 512;
+	const DWORD64 pointerAddress = static_cast<DWORD64>(reinterpret_cast<std::uintptr_t>(pointer));
+	if (DbgHelpLoader::symFromAddr(process, pointerAddress, &displacement, symbol)) {
+		if (name) {
+			strcpy(name, symbol->Name);
+			strcat(name, "();");
+		}
+		IMAGEHLP_LINE64 line = {};
+		line.SizeOfStruct = sizeof(line);
+		DWORD lineDisplacement = 0;
+		if (DbgHelpLoader::symGetLineFromAddr64(process, pointerAddress,
+				&lineDisplacement, &line)) {
+			if (filename) strcpy(filename, line.FileName);
+			if (linenumber) *linenumber = static_cast<unsigned int>(line.LineNumber);
+			if (address) *address = static_cast<std::uintptr_t>(line.Address);
+		}
+	}
+#else
 	ULONG displacement = 0;
 
     HANDLE process = ::GetCurrentProcess();
@@ -308,6 +391,7 @@ void GetFunctionDetails(void *pointer, char*name, char*filename, unsigned int* l
 			}
 		}
 	}
+#endif
 }
 
 
@@ -318,6 +402,18 @@ void FillStackAddresses(void**addresses, unsigned int count, unsigned int skip)
 {
 	if (!InitSymbolInfo())
 		return;
+
+#if defined(_WIN64)
+	const unsigned int requested = count;
+	const ULONG framesToSkip = skip + 1;
+	const ULONG framesToCapture = count > USHRT_MAX ? USHRT_MAX : count;
+	const USHORT captured = ::CaptureStackBackTrace(framesToSkip, framesToCapture,
+		addresses, nullptr);
+	for (unsigned int index = captured; index < requested; ++index) {
+		addresses[index] = nullptr;
+	}
+	return;
+#else
 
 	STACKFRAME	stack_frame;
 
@@ -429,6 +525,7 @@ stack_frame.AddrFrame.Offset = myebp;
 		memset(addresses,nullptr,count*sizeof(void*));
 	}
 */
+#endif
 }
 
 
@@ -459,11 +556,11 @@ AsciiString g_LastErrorDump;
 //*****************************************************************************
 void WriteStackLine(void*address, void (*callback)(const char*))
 {
-	static char line[MAX_PATH];
-	static char function_name[512];
-	static char filename[MAX_PATH];
+	char line[MAX_PATH];
+	char function_name[512];
+	char filename[MAX_PATH];
 	unsigned int linenumber;
-	unsigned int addr;
+	std::uintptr_t addr;
 
 	GetFunctionDetails(address, function_name, filename, &linenumber, &addr);
     sprintf(line, "  %s(%d) : %s 0x%08p", filename, linenumber, function_name, address);
@@ -543,7 +640,7 @@ void DumpExceptionInfo( unsigned int u, EXCEPTION_POINTERS* e_info )
 	** The following are set for access violation only
 	*/
 	int access_read_write=-1;
-	unsigned long access_address = 0;
+	ULONG_PTR access_address = 0;
 	AsciiString msg;
 
 // DOUBLE_DEBUG does a DEBUG_LOG, and concats to g_LastErrorDump.  jba.
@@ -559,8 +656,8 @@ void DumpExceptionInfo( unsigned int u, EXCEPTION_POINTERS* e_info )
 	{
 		DOUBLE_DEBUG (("Exception code is %x", e_info->ExceptionRecord->ExceptionCode));
 	}
-	Int *winMainAddr = (Int *)WinMain;
-	DOUBLE_DEBUG(("WinMain at %x", winMainAddr));
+	const std::uintptr_t winMainAddress = reinterpret_cast<std::uintptr_t>(&WinMain);
+	DOUBLE_DEBUG(("WinMain at %p", reinterpret_cast<void *>(winMainAddress)));
 	/*
 	** Match the exception type with the error string and print it out
 	*/
@@ -580,16 +677,20 @@ void DumpExceptionInfo( unsigned int u, EXCEPTION_POINTERS* e_info )
 	{
 		if ( access_read_write )
 		{
-			DOUBLE_DEBUG( ("Access address:%08X was written to.", access_address));
+			DOUBLE_DEBUG( ("Access address:%p was written to.", reinterpret_cast<void *>(access_address)));
 		}
 		else
 		{
-			DOUBLE_DEBUG( ("Access address:%08X was read from.", access_address));
+			DOUBLE_DEBUG( ("Access address:%p was read from.", reinterpret_cast<void *>(access_address)));
 		}
 	}
 
 	DOUBLE_DEBUG (("\nStack Dump:"));
+#if defined(_WIN64)
+	StackDumpFromContext(*context, nullptr);
+#else
 	StackDumpFromContext(context->Eip, context->Esp, context->Ebp, nullptr);
+#endif
 
 	DOUBLE_DEBUG (("\nDetails:"));
 
@@ -598,9 +699,15 @@ void DumpExceptionInfo( unsigned int u, EXCEPTION_POINTERS* e_info )
 	/*
 	** Dump the registers.
 	*/
+#if defined(_WIN64)
+	DOUBLE_DEBUG ( ( "Rip:%016llX\tRsp:%016llX\tRbp:%016llX", context->Rip, context->Rsp, context->Rbp));
+	DOUBLE_DEBUG ( ( "Rax:%016llX\tRbx:%016llX\tRcx:%016llX", context->Rax, context->Rbx, context->Rcx));
+	DOUBLE_DEBUG ( ( "Rdx:%016llX\tRsi:%016llX\tRdi:%016llX", context->Rdx, context->Rsi, context->Rdi));
+#else
 	DOUBLE_DEBUG ( ( "Eip:%08X\tEsp:%08X\tEbp:%08X", context->Eip, context->Esp, context->Ebp));
 	DOUBLE_DEBUG ( ( "Eax:%08X\tEbx:%08X\tEcx:%08X", context->Eax, context->Ebx, context->Ecx));
 	DOUBLE_DEBUG ( ( "Edx:%08X\tEsi:%08X\tEdi:%08X", context->Edx, context->Esi, context->Edi));
+#endif
 	DOUBLE_DEBUG ( ( "EFlags:%08X ", context->EFlags));
 	DOUBLE_DEBUG ( ( "CS:%04x  SS:%04x  DS:%04x  ES:%04x  FS:%04x  GS:%04x", context->SegCs, context->SegSs, context->SegDs, context->SegEs, context->SegFs, context->SegGs));
 
@@ -609,9 +716,15 @@ void DumpExceptionInfo( unsigned int u, EXCEPTION_POINTERS* e_info )
 	*/
 	char scrap[512];
 	DOUBLE_DEBUG ( ("EIP bytes dump..."));
-	wsprintf (scrap, "\nBytes at CS:EIP (%08X)  : ", context->Eip);
+#if defined(_WIN64)
+	const std::uintptr_t instructionPointer = static_cast<std::uintptr_t>(context->Rip);
+#else
+	const std::uintptr_t instructionPointer = static_cast<std::uintptr_t>(context->Eip); // portability-audit: x86-context
+#endif
+	_snprintf(scrap, ARRAY_SIZE(scrap), "\nBytes at instruction pointer (%p)  : ",
+		reinterpret_cast<void *>(instructionPointer));
 
-	unsigned char *eip_ptr = (unsigned char *) (context->Eip);
+	unsigned char *eip_ptr = reinterpret_cast<unsigned char *>(instructionPointer);
 	char bytestr[32];
 
 	for (int c = 0 ; c < 32 ; c++)

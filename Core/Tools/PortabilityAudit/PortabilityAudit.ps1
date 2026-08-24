@@ -479,9 +479,13 @@ foreach ($line in $diff) {
             $isApprovedX86Context = $rule.Name -eq 'x86-inline-assembly-or-context' -and
                 $currentFile -in @(
                     'Core/Libraries/Source/debug/debug_except.cpp',
-                    'Core/Libraries/Source/WWVegas/WWLib/Except.cpp'
+                    'Core/Libraries/Source/WWVegas/WWLib/Except.cpp',
+                    'Generals/Code/GameEngine/Source/Common/System/StackDump.cpp',
+                    'GeneralsMD/Code/GameEngine/Source/Common/System/StackDump.cpp'
                 ) -and
-                $content -match '^\s*return static_cast<uintptr_t>\((ctx|context)\.Eip\);\s*// portability-audit: x86-context\s*$'
+                ($content -match '^\s*return static_cast<uintptr_t>\((ctx|context)\.Eip\);\s*// portability-audit: x86-context\s*$' -or
+                 $content -match '^\s*MakeStackTrace\(eip,esp,ebp, 0, callback\);\s*// portability-audit: x86-context\s*$' -or
+                 $content -match '^\s*const std::uintptr_t instructionPointer = static_cast<std::uintptr_t>\(context->Eip\);\s*// portability-audit: x86-context\s*$')
             if ($rule.RejectAddedLine -and -not $isAllowed -and
                 -not $isApprovedX86Context -and $content -match $rule.Pattern) {
                 $violations += "${currentFile}:${lineNumber}: $($rule.Name)"

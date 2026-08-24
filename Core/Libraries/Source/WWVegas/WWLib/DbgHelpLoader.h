@@ -66,7 +66,7 @@ public:
 	static BOOL WINAPI symCleanup(
 		HANDLE hProcess);
 
-	static BOOL WINAPI symLoadModule(
+	static DWORD WINAPI symLoadModule(
 		HANDLE hProcess,
 		HANDLE hFile,
 		LPSTR ImageName,
@@ -112,6 +112,30 @@ public:
 		PGET_MODULE_BASE_ROUTINE GetModuleBaseRoutine,
 		PTRANSLATE_ADDRESS_ROUTINE TranslateAddress);
 
+#if defined(_WIN64)
+	static DWORD64 WINAPI symLoadModule64(
+		HANDLE hProcess,
+		HANDLE hFile,
+		PCSTR ImageName,
+		PCSTR ModuleName,
+		DWORD64 BaseOfDll,
+		DWORD SizeOfDll);
+
+	static DWORD64 WINAPI symGetModuleBase64(HANDLE hProcess, DWORD64 Address);
+	static BOOL WINAPI symUnloadModule64(HANDLE hProcess, DWORD64 BaseOfDll);
+	static BOOL WINAPI symFromAddr(HANDLE hProcess, DWORD64 Address,
+		PDWORD64 Displacement, PSYMBOL_INFO Symbol);
+	static BOOL WINAPI symGetLineFromAddr64(HANDLE hProcess, DWORD64 Address,
+		PDWORD Displacement, PIMAGEHLP_LINE64 Line);
+	static PVOID WINAPI symFunctionTableAccess64(HANDLE hProcess, DWORD64 Address);
+	static BOOL WINAPI stackWalk64(DWORD MachineType, HANDLE hProcess, HANDLE hThread,
+		LPSTACKFRAME64 StackFrame, PVOID ContextRecord,
+		PREAD_PROCESS_MEMORY_ROUTINE64 ReadMemoryRoutine,
+		PFUNCTION_TABLE_ACCESS_ROUTINE64 FunctionTableAccessRoutine,
+		PGET_MODULE_BASE_ROUTINE64 GetModuleBaseRoutine,
+		PTRANSLATE_ADDRESS_ROUTINE64 TranslateAddress);
+#endif
+
 #ifdef RTS_ENABLE_CRASHDUMP
 	static BOOL WINAPI miniDumpWriteDump(
 		HANDLE hProcess,
@@ -135,7 +159,7 @@ private:
 	typedef BOOL (WINAPI *SymCleanup_t) (
 		HANDLE hProcess);
 
-	typedef BOOL (WINAPI *SymLoadModule_t) (
+	typedef DWORD (WINAPI *SymLoadModule_t) (
 		HANDLE hProcess,
 		HANDLE hFile,
 		LPSTR ImageName,
@@ -181,6 +205,18 @@ private:
 		PGET_MODULE_BASE_ROUTINE GetModuleBaseRoutine,
 		PTRANSLATE_ADDRESS_ROUTINE TranslateAddress);
 
+#if defined(_WIN64)
+	typedef DWORD64 (WINAPI *SymLoadModule64_t)(HANDLE, HANDLE, PCSTR, PCSTR, DWORD64, DWORD);
+	typedef DWORD64 (WINAPI *SymGetModuleBase64_t)(HANDLE, DWORD64);
+	typedef BOOL (WINAPI *SymUnloadModule64_t)(HANDLE, DWORD64);
+	typedef BOOL (WINAPI *SymFromAddr_t)(HANDLE, DWORD64, PDWORD64, PSYMBOL_INFO);
+	typedef BOOL (WINAPI *SymGetLineFromAddr64_t)(HANDLE, DWORD64, PDWORD, PIMAGEHLP_LINE64);
+	typedef PVOID (WINAPI *SymFunctionTableAccess64_t)(HANDLE, DWORD64);
+	typedef BOOL (WINAPI *StackWalk64_t)(DWORD, HANDLE, HANDLE, LPSTACKFRAME64, PVOID,
+		PREAD_PROCESS_MEMORY_ROUTINE64, PFUNCTION_TABLE_ACCESS_ROUTINE64,
+		PGET_MODULE_BASE_ROUTINE64, PTRANSLATE_ADDRESS_ROUTINE64);
+#endif
+
 #ifdef RTS_ENABLE_CRASHDUMP
 	typedef BOOL(WINAPI* MiniDumpWriteDump_t)(
 		HANDLE hProcess,
@@ -202,6 +238,15 @@ private:
 	SymSetOptions_t m_symSetOptions;
 	SymFunctionTableAccess_t m_symFunctionTableAccess;
 	StackWalk_t m_stackWalk;
+#if defined(_WIN64)
+	SymLoadModule64_t m_symLoadModule64;
+	SymGetModuleBase64_t m_symGetModuleBase64;
+	SymUnloadModule64_t m_symUnloadModule64;
+	SymFromAddr_t m_symFromAddr;
+	SymGetLineFromAddr64_t m_symGetLineFromAddr64;
+	SymFunctionTableAccess64_t m_symFunctionTableAccess64;
+	StackWalk64_t m_stackWalk64;
+#endif
 #ifdef RTS_ENABLE_CRASHDUMP
 	MiniDumpWriteDump_t m_miniDumpWriteDump;
 #endif

@@ -22,7 +22,7 @@ extern "C" {
 #include <utility>
 #include <vector>
 
-static_assert(sizeof(void *) == 8, "The native FFmpeg movie playback contract is x64-only.");
+static_assert(UINTPTR_MAX == UINT64_MAX, "The native FFmpeg movie playback contract is x64-only.");
 
 static std::size_t g_capturedAvLogMessages = 0;
 

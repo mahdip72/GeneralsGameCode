@@ -14,7 +14,7 @@ extern "C" {
 #include <utility>
 #include <vector>
 
-static_assert(sizeof(void *) == 8, "The native FFmpeg audio contract must be tested as x64.");
+static_assert(UINTPTR_MAX == UINT64_MAX, "The native FFmpeg audio contract must be tested as x64.");
 
 class CapturingSink final : public AudioPcmSink
 {

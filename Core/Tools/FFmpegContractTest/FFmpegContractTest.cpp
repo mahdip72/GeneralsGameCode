@@ -7,8 +7,9 @@ extern "C" {
 }
 
 #include <cstdio>
+#include <cstdint>
 
-static_assert(sizeof(void *) == 8, "The native FFmpeg contract must be compiled for x64.");
+static_assert(UINTPTR_MAX == UINT64_MAX, "The native FFmpeg contract must be compiled for x64.");
 
 int main()
 {

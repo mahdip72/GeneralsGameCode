@@ -191,9 +191,12 @@ void copy() { __asm mov eax, ebx; }
     Set-FixtureFile $fixtureRoot 'Core/Libraries/Source/debug/debug_except.cpp' @'
 int Existing();
 '@
-    Invoke-FixtureGit $fixtureRoot @('add', 'Core/Libraries/Source/debug/debug_except.cpp') | Out-Null
+    Set-FixtureFile $fixtureRoot 'Generals/Code/GameEngine/Source/Common/System/StackDump.cpp' @'
+int ExistingStackDump();
+'@
+    Invoke-FixtureGit $fixtureRoot @('add', 'Core/Libraries/Source/debug/debug_except.cpp', 'Generals/Code/GameEngine/Source/Common/System/StackDump.cpp') | Out-Null
     Invoke-FixtureGit $fixtureRoot @('commit', '--quiet', '-m', 'add debug exception fixture') | Out-Null
-    $annotatedBaseline = (Invoke-FixtureGit $fixtureRoot @('rev-parse', 'HEAD'))[0]
+    $annotatedBaseline = (@(Invoke-FixtureGit $fixtureRoot @('rev-parse', 'HEAD'))[0]).Trim()
     Set-FixtureFile $fixtureRoot 'Core/Libraries/Source/debug/debug_except.cpp' @'
 uintptr_t Current(const CONTEXT &ctx)
 {
@@ -203,6 +206,21 @@ uintptr_t Current(const CONTEXT &ctx)
     $annotated = Invoke-Audit $fixtureRoot $annotatedBaseline
     Assert-Fixture ($annotated.ExitCode -ne 0) 'unrelated fixture violations must still fail before annotation isolation'
     Assert-Fixture ($annotated.Output -notmatch 'debug_except\.cpp:.*x86-inline-assembly-or-context') 'approved x86 context adapter must not be reported'
+
+    Set-FixtureFile $fixtureRoot 'Generals/Code/GameEngine/Source/Common/System/StackDump.cpp' @'
+void Current(CONTEXT *context, void (*callback)(const char *))
+{
+  StackDumpFromContext(context->Eip, context->Esp, context->Ebp, nullptr);
+  MakeStackTrace(eip,esp,ebp, 0, callback); // portability-audit: x86-context
+  const std::uintptr_t instructionPointer = static_cast<std::uintptr_t>(context->Eip); // portability-audit: x86-context
+}
+'@
+    $stackAnnotated = Invoke-Audit $fixtureRoot $annotatedBaseline
+    Assert-Fixture ($stackAnnotated.Output -match 'StackDump\.cpp:4: x86-inline-assembly-or-context') 'unannotated x86 context use in StackDump must remain rejected'
+    Assert-Fixture ($stackAnnotated.Output -notmatch 'StackDump\.cpp:(5|6): x86-inline-assembly-or-context') 'approved StackDump x86 compatibility lines must not be reported'
+    Set-FixtureFile $fixtureRoot 'Generals/Code/GameEngine/Source/Common/System/StackDump.cpp' @'
+int ExistingStackDump();
+'@
 
     Set-FixtureFile $fixtureRoot 'Core/Libraries/Source/WWVegas/WW3D2/W3DWater.cpp' @'
 // A commented D3DFVF_XYZ token must not be a way to hide a D3D8 dependency.
