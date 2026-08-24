@@ -134,10 +134,15 @@
             },
             "cacheVariables": {
                 "RTS_FLAGS": "/W3",
+                "RTS_BUILD_CORE_TOOLS": "OFF",
                 "RTS_BUILD_CORE_EXTRAS": "ON",
                 "RTS_BUILD_PRODUCT": "ON",
                 "RTS_BUILD_GENERALS": "ON",
                 "RTS_BUILD_ZEROHOUR": "ON",
+                "RTS_BUILD_GENERALS_TOOLS": "OFF",
+                "RTS_BUILD_ZEROHOUR_TOOLS": "OFF",
+                "RTS_BUILD_GENERALS_EXTRAS": "ON",
+                "RTS_BUILD_ZEROHOUR_EXTRAS": "ON",
                 "RTS_BUILD_OPTION_FFMPEG": "ON"
             }
         },
