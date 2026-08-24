@@ -229,6 +229,13 @@ endif()
 # Add library interfaces here
 if(RTS_BUILD_GENERALS_EXTRAS OR RTS_BUILD_ZEROHOUR_EXTRAS)
     add_subdirectory(Autorun)
-    add_subdirectory(Launcher)
     add_subdirectory(PATCHGET)
+endif()
+
+# Native x64 product builds always need the shared launcher implementation,
+# even when the optional extras preset is disabled.  Keep Autorun/PATCHGET
+# Win32 and extras-only so this does not widen the legacy option behavior.
+if(RTS_BUILD_GENERALS_EXTRAS OR RTS_BUILD_ZEROHOUR_EXTRAS OR
+        (CMAKE_SIZEOF_VOID_P EQUAL 8 AND RTS_BUILD_PRODUCT))
+    add_subdirectory(Launcher)
 endif()
