@@ -61,6 +61,11 @@ public:
 	void attachTransport(Transport *transport);
 
 	void parseUserList(const GameInfo *game);
+	// Native x64 peers must complete the NET3 compatibility exchange before
+	// synchronized frame data may be consumed.  The legacy Win32/VC6 path
+	// reports ready and retains its existing wire behavior.
+	Bool isNetworkHelloReady() const;
+	Bool hasNetworkHelloFailure() const;
 	void sendChat(UnicodeString text, Int playerMask, UnsignedInt executionFrame);
 	void sendDisconnectChat(UnicodeString text);
 	void sendLocalCommand(NetCommandMsg *msg, UnsignedByte relay = 0xff);		///< Send command to the players specified in the relay, goes through packet router.
@@ -148,6 +153,7 @@ public:
 
 private:
 	void doRelay();
+	void processTransportMessage(const TransportMessage &message);
 	void doKeepAlive();
 	void sendRemoteCommand(NetCommandRef *msg);
 	void ackCommand(NetCommandRef *ref, UnsignedInt localSlot);
@@ -168,6 +174,22 @@ private:
 	void processFile(NetFileCommandMsg *ref);
 	void processFileAnnounce(NetFileAnnounceCommandMsg *ref);
 	void processFileProgress(NetFileProgressCommandMsg *ref);
+
+#if defined(_WIN64)
+	void beginNetworkHello();
+	void serviceNetworkHello();
+	Bool sendNetworkHello(Int slot);
+	Bool sendNetworkHelloAck(Int slot);
+	Bool processNetworkHello(const TransportMessage &message, Bool enforceFailure);
+	Bool isNetworkHelloCandidate(const TransportMessage &message) const;
+	void deferNetworkMessage(const TransportMessage &message);
+	Bool queueNetworkHelloCommand(NetCommandMsg *msg, UnsignedByte relay);
+	void drainNetworkHelloPendingCommands();
+	void clearNetworkHelloPendingCommands();
+	void rejectNetworkHello(Int slot, const char *reason);
+	Int findNetworkHelloSlot(UnsignedInt senderSlot, UnsignedInt recipientSlot) const;
+#endif
+	void sendLocalCommandImmediate(NetCommandMsg *msg, UnsignedByte relay);
 
 	//	void doPerFrameMetrics(UnsignedInt frame);
 	void getMinimumFps(Int &minFps, Int &minFpsPlayer);			///< Returns the smallest FPS in the m_fpsAverages list.
@@ -213,4 +235,20 @@ private:
 	FileMaskMap s_fileRecipientMaskMap;
 	FileProgressMap s_fileProgressMap[MAX_SLOTS];
 	// -----------------------------------------------------------------------------
+
+#if defined(_WIN64)
+	Bool m_networkHelloStarted;
+	Bool m_networkHelloRequired;
+	Bool m_networkHelloFailed;
+	Bool m_networkHelloValidated[MAX_SLOTS];
+	Bool m_networkHelloAckReceived[MAX_SLOTS];
+	UnsignedInt m_networkHelloExpectedSlots;
+	UnsignedInt m_networkHelloStartTime;
+	UnsignedInt m_networkHelloLastSend;
+	UnsignedInt m_networkHelloAttempts;
+	TransportMessage m_networkHelloDeferred[MAX_MESSAGES];
+	UnsignedInt m_networkHelloDeferredCount;
+	NetCommandList *m_networkHelloPendingCommands;
+	UnsignedInt m_networkHelloPendingCommandCount;
+#endif
 };

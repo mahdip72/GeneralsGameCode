@@ -57,21 +57,52 @@ static Bool doFileTransfer( AsciiString filename, MapTransferLoadScreen *ls, Int
 
 		UnsignedShort fileCommandID = 0;
 		Bool sentFile = FALSE;
-		if (TheGameInfo->amIHost())
+		const Bool isHost = TheGameInfo->amIHost();
+		Bool announcedFile = !isHost;
+		// Preserve the legacy Win32 transfer ordering and pacing.  The x64
+		// path deliberately defers this announce until the NET3 handshake has
+		// completed below.
+#if !defined(_WIN64)
+		if (isHost)
 		{
 			Sleep(500);
 			fileCommandID = TheNetwork->sendFileAnnounce(filename, mask);
+			announcedFile = TRUE;
 		}
-		else
-		{
+#endif
+		if (!isHost)
 			sentFile = TRUE;
-		}
 
 		DEBUG_LOG(("Starting file transfer loop"));
 
 		while (!fileTransferDone)
 		{
-			if (!sentFile && TheNetwork->areAllQueuesEmpty())
+			// The x64 runtime exchanges NET3 before any file command is
+			// allowed onto the shared transport.  Keep servicing the existing
+			// load-screen/network pump while that non-blocking state machine is
+			// pending; a failed or timed-out exchange aborts this transfer.
+#if defined(_WIN64)
+			if (TheNetwork != nullptr && !TheNetwork->isNetworkHelloReady())
+			{
+				if (TheNetwork->hasNetworkHelloFailure())
+					return FALSE;
+
+				Int now = timeGetTime();
+				if (now > startTime + timeoutPeriod)
+					break;
+				ls->processTimeout((startTime + timeoutPeriod - now)/1000);
+				ls->update(0);
+				continue;
+			}
+#endif
+
+			if (isHost && !announcedFile && TheNetwork->areAllQueuesEmpty())
+			{
+				fileCommandID = TheNetwork->sendFileAnnounce(filename, mask);
+				announcedFile = TRUE;
+			}
+
+			if (isHost && announcedFile && !sentFile && TheNetwork->areAllQueuesEmpty())
 			{
 				TheNetwork->sendFile(filename, mask, fileCommandID);
 				sentFile = TRUE;
