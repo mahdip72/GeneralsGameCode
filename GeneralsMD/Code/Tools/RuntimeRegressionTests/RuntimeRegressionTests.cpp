@@ -251,6 +251,28 @@ static void TestWrappedCommandRequiresCompleteWireRecord()
 		deleteInstance(invalid);
 }
 
+static void TestWrappedCommandRejectsMalformedHeader()
+{
+	const UnsignedByte unexpectedField[] = { '?' };
+	NetCommandRef *unexpected = NetPacket::ConstructNetCommandMsgFromRawData(
+		unexpectedField, static_cast<UnsignedInt>(sizeof(unexpectedField)));
+	CHECK(unexpected == nullptr);
+	if (unexpected != nullptr)
+		deleteInstance(unexpected);
+
+	UnsignedByte unknownCommand[sizeof(NetPacketCommandTypeField) + sizeof(NetPacketDataField)] = { 0 };
+	NetPacketCommandTypeField commandType;
+	commandType.commandType = static_cast<UnsignedByte>(NETCOMMANDTYPE_UNKNOWN);
+	NetPacketDataField dataHeader;
+	size_t size = network::writeObject(unknownCommand, commandType);
+	size += network::writeObject(unknownCommand + size, dataHeader);
+	NetCommandRef *unknown = NetPacket::ConstructNetCommandMsgFromRawData(
+		unknownCommand, static_cast<UnsignedInt>(size));
+	CHECK(unknown == nullptr);
+	if (unknown != nullptr)
+		deleteInstance(unknown);
+}
+
 static NetWrapperCommandMsg *CreateWrapperMessage(UnsignedByte playerID, UnsignedShort commandID,
 	UnsignedInt chunkNumber, UnsignedInt numChunks, UnsignedInt totalLength, UnsignedInt dataOffset)
 {
@@ -1007,6 +1029,7 @@ int main(int argc, char **argv)
 	TestGameCommandParsing();
 	TestMalformedGameCommandDeserialization();
 	TestWrappedCommandRequiresCompleteWireRecord();
+	TestWrappedCommandRejectsMalformedHeader();
 	TestWrapperLifecycle();
 	TestNetworkReceiveBudget();
 	TestStringConversionAndZeroLengthReads();
