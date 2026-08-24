@@ -111,12 +111,16 @@ foreach ($product in @(
         throw "Native x64 $($product.Name) product did not resolve FFmpeg runtime DLLs."
     }
     $runtimeDlls = @($runtimeDllMatch.Groups[1].Value.Trim() -split ';')
+    $runtimeInstallBlockPattern = '(?ms)^\s*file\(INSTALL DESTINATION "' +
+        [regex]::Escape($expectedDestination) + '" TYPE FILE FILES(?<Files>[^)]*)\)'
+    $runtimeInstallBlocks = [regex]::Matches($installScript, $runtimeInstallBlockPattern)
     foreach ($runtimeDll in $runtimeDlls) {
         $runtimeDllName = [IO.Path]::GetFileName($runtimeDll)
-        $runtimeInstallPattern = 'file\(INSTALL DESTINATION "' +
-            [regex]::Escape($expectedDestination) + '" TYPE FILE FILES(?s:.*?)"[^"]*/' +
-            [regex]::Escape($runtimeDllName) + '"(?s:.*?)\)'
-        if ($installScript -notmatch $runtimeInstallPattern) {
+        $runtimeDllPattern = '"[^"]*/' + [regex]::Escape($runtimeDllName) + '"'
+        $matchingBlock = $runtimeInstallBlocks | Where-Object {
+            $_.Groups['Files'].Value -match $runtimeDllPattern
+        } | Select-Object -First 1
+        if ($null -eq $matchingBlock) {
             throw "Native x64 $($product.Name) install script is missing FFmpeg runtime $runtimeDllName below CMAKE_INSTALL_PREFIX/$($product.InstallDirectory)."
         }
     }
