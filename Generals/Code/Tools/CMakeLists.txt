@@ -10,7 +10,7 @@ if(RTS_BUILD_GENERALS_TOOLS)
 endif()
 
 # Build less useful tool/test binaries.
-if(RTS_BUILD_GENERALS_EXTRAS)
+if(RTS_BUILD_GENERALS_EXTRAS AND CMAKE_SIZEOF_VOID_P EQUAL 4)
     add_subdirectory(Autorun)
     add_subdirectory(PATCHGET)
 endif()

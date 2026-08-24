@@ -11,7 +11,9 @@ target_include_directories(z_wwcommon INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-add_subdirectory(WWAudio)
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    add_subdirectory(WWAudio)
+endif()
 add_subdirectory(WW3D2)
 add_subdirectory(WWDownload)
 
