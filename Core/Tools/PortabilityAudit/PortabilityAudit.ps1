@@ -405,11 +405,42 @@ $rules = @(
     }
 )
 
+$stackDumpAddressContracts = @(
+    [pscustomobject]@{
+        Path = 'Generals/Code/GameEngine/Include/Common/StackDump.h'
+        ExpectedCount = 2
+    },
+    [pscustomobject]@{
+        Path = 'GeneralsMD/Code/GameEngine/Include/Common/StackDump.h'
+        ExpectedCount = 2
+    },
+    [pscustomobject]@{
+        Path = 'Generals/Code/GameEngine/Source/Common/System/StackDump.cpp'
+        ExpectedCount = 2
+    },
+    [pscustomobject]@{
+        Path = 'GeneralsMD/Code/GameEngine/Source/Common/System/StackDump.cpp'
+        ExpectedCount = 2
+    }
+)
+$stackDumpAddressPattern = '(?m)^\s*(?:__inline\s+)?void\s+GetFunctionDetails\([^\r\n]*\b(?:std::)?uintptr_t\s*\*\s*address\s*\)'
+
 Test-BaselineAncestry $sourceRootPath $Baseline
 $files = Get-SourceFiles $sourceRootPath
 $untrackedFiles = Get-UntrackedSourceFiles $sourceRootPath
 
 $violations = @()
+foreach ($contract in $stackDumpAddressContracts) {
+    $path = Join-Path $sourceRootPath ($contract.Path -replace '/', '\')
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        continue
+    }
+    $count = Get-RegexMatchCount ([IO.File]::ReadAllText($path)) $stackDumpAddressPattern
+    if ($count -ne $contract.ExpectedCount) {
+        $violations += ('{0}: stackdump-address-width expected={1} current={2}' -f
+            $contract.Path, $contract.ExpectedCount, $count)
+    }
+}
 $rawD3D8Rule = $rules | Where-Object { $_.Name -eq $rawD3D8RuleName }
 $baselineRawCounts = Get-BaselineRegexMatchCounts $sourceRootPath $Baseline $rawD3D8Rule.Pattern
 $currentRawTotal = 0
@@ -501,8 +532,14 @@ foreach ($line in $diff) {
                 ($content -match '^\s*return static_cast<uintptr_t>\((ctx|context)\.Eip\);\s*// portability-audit: x86-context\s*$' -or
                  $content -match '^\s*MakeStackTrace\(eip,esp,ebp, 0, callback\);\s*// portability-audit: x86-context\s*$' -or
                  $content -match '^\s*const std::uintptr_t instructionPointer = static_cast<std::uintptr_t>\(context->Eip\);\s*// portability-audit: x86-context\s*$')
+            $isApprovedWindowMessageBoundary =
+                $rule.Name -eq 'pointer-bearing-window-message' -and
+                $currentFile -eq 'Core/GameEngine/Include/GameClient/GameWindow.h' -and
+                $content -match '^\s*inline\s+WindowMsgData\s+WindowMsgDataFromPointer\(const\s+void\s*\*\s*value\)\s*$'
             if ($rule.RejectAddedLine -and -not $isAllowed -and
-                -not $isApprovedX86Context -and $content -match $rule.Pattern) {
+                -not $isApprovedX86Context -and
+                -not $isApprovedWindowMessageBoundary -and
+                $content -match $rule.Pattern) {
                 $violations += "${currentFile}:${lineNumber}: $($rule.Name)"
             }
         }

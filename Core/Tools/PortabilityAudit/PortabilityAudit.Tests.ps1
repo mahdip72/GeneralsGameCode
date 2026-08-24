@@ -132,6 +132,9 @@ DX8Wrapper *wrapper;
 // Authoring tools are intentionally outside the product-runtime audit scope.
 D3DFVF_XYZ;
 '@
+    Set-FixtureFile $fixtureRoot 'Core/GameEngine/Include/GameClient/GameWindow.h' @'
+int ExistingGameWindow();
+'@
     Invoke-FixtureGit $fixtureRoot @('add', '--', '.') | Out-Null
     Invoke-FixtureGit $fixtureRoot @('commit', '--quiet', '-m', 'baseline') | Out-Null
     $baseline = (@(Invoke-FixtureGit $fixtureRoot @('rev-parse', 'HEAD'))[0]).Trim()
@@ -183,6 +186,16 @@ void callback(WindowMsgData mData1, WindowMsgData mData2)
   GameWindow *control = (GameWindow *)mData1;
 }
 '@
+    Set-FixtureFile $fixtureRoot 'Core/GameEngine/Include/GameClient/GameWindow.h' @'
+inline WindowMsgData WindowMsgDataFromPointer(const void *value)
+{
+  return reinterpret_cast<WindowMsgData>(value);
+}
+'@
+    Set-FixtureFile $fixtureRoot 'Generals/Code/GameEngine/Include/Common/StackDump.h' @'
+void GetFunctionDetails(void *pointer, char *name, char *filename, unsigned int *lineNumber, unsigned int *address);
+__inline void GetFunctionDetails(void *pointer, char *name, char *filename, unsigned int *lineNumber, unsigned int *address) {}
+'@
 
     $failure = Invoke-Audit $fixtureRoot $baseline
     Assert-Fixture ($failure.ExitCode -ne 0) 'growth fixture must fail closed'
@@ -196,6 +209,8 @@ void callback(WindowMsgData mData1, WindowMsgData mData2)
     Assert-Fixture ($failure.Output -match 'untracked-asm\.cpp: x86-inline-assembly-or-context') 'untracked inline-assembly sources must be rejected'
     Assert-Fixture ($failure.Output -match 'untracked-window-message\.cpp: window-message-implicit-narrowing') 'untracked WindowMsgData scalar narrowing must be rejected'
     Assert-Fixture ($failure.Output -match 'untracked-window-message\.cpp: window-message-raw-pointer-cast') 'untracked raw WindowMsgData pointer casts must be rejected'
+    Assert-Fixture ($failure.Output -notmatch 'GameWindow\.h:.*pointer-bearing-window-message') 'the explicit pointer-width message boundary must remain allowed'
+    Assert-Fixture ($failure.Output -match 'StackDump\.h: stackdump-address-width expected=2 current=0') '32-bit stack-dump output declarations must be rejected'
 
     Set-FixtureFile $fixtureRoot 'Core/Libraries/Source/debug/debug_except.cpp' @'
 int Existing();
@@ -228,7 +243,8 @@ void Current(CONTEXT *context, void (*callback)(const char *))
     Assert-Fixture ($stackAnnotated.Output -match 'StackDump\.cpp:4: x86-inline-assembly-or-context') 'unannotated x86 context use in StackDump must remain rejected'
     Assert-Fixture ($stackAnnotated.Output -notmatch 'StackDump\.cpp:(5|6): x86-inline-assembly-or-context') 'approved StackDump x86 compatibility lines must not be reported'
     Set-FixtureFile $fixtureRoot 'Generals/Code/GameEngine/Source/Common/System/StackDump.cpp' @'
-int ExistingStackDump();
+void GetFunctionDetails(void *pointer, char *name, char *filename, unsigned int *lineNumber, std::uintptr_t *address);
+void GetFunctionDetails(void *pointer, char *name, char *filename, unsigned int *lineNumber, std::uintptr_t *address) {}
 '@
 
     Set-FixtureFile $fixtureRoot 'Core/Libraries/Source/WWVegas/WW3D2/W3DWater.cpp' @'
@@ -259,6 +275,7 @@ DX8Wrapper *wrapper;
     Remove-Item -LiteralPath (Join-Path $fixtureRoot 'untracked-serialization.cpp') -Force
     Remove-Item -LiteralPath (Join-Path $fixtureRoot 'untracked-asm.cpp') -Force
     Remove-Item -LiteralPath (Join-Path $fixtureRoot 'untracked-window-message.cpp') -Force
+    Remove-Item -LiteralPath (Join-Path $fixtureRoot 'Generals/Code/GameEngine/Include/Common/StackDump.h') -Force
     Remove-Item -LiteralPath (Join-Path $fixtureRoot 'Core/Libraries/Source/WWVegas/WW3D2/W3DWater.cpp') -Force
     Remove-Item -LiteralPath (Join-Path $fixtureRoot 'Core/GameEngine/CMakeLists.txt') -Force
 
