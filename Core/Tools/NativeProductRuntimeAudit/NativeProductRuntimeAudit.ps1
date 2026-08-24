@@ -52,12 +52,44 @@ foreach ($line in $environmentLines) {
     }
 }
 
+if (-not ('NativeProductRuntimeAudit.NativeLoader' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace NativeProductRuntimeAudit
+{
+    public static class NativeLoader
+    {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "LoadLibraryExW", SetLastError = true)]
+        public static extern IntPtr LoadLibraryEx(string fileName, IntPtr file, uint flags);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool FreeLibrary(IntPtr module);
+    }
+}
+'@
+}
+
+$loaderSearchDllDirectory = [uint32] 0x00000100
+$loaderSearchSystem32 = [uint32] 0x00000800
+$loaderFlags = $loaderSearchDllDirectory -bor $loaderSearchSystem32
+
 foreach ($product in @(
-    @{ Name = 'Generals'; Generals = 'ON'; ZeroHour = 'OFF'; TitleDirectory = 'Generals'; InstallDirectory = 'Generals'; Executables = @('generalsv.exe', 'launcher.exe') },
-    @{ Name = 'ZeroHour'; Generals = 'OFF'; ZeroHour = 'ON'; TitleDirectory = 'GeneralsMD'; InstallDirectory = 'ZeroHour'; Executables = @('generalszh.exe', 'launcher.exe', 'z_runtime_regression_tests.exe') }
+    @{ Name = 'Generals'; Generals = 'ON'; ZeroHour = 'OFF'; TitleDirectory = 'Generals'; InstallDirectory = 'Generals'; Targets = @('g_generals', 'g_launcher'); Executables = @('generalsv.exe', 'launcher.exe'); LauncherCommand = 'generalsv.exe' },
+    @{ Name = 'ZeroHour'; Generals = 'OFF'; ZeroHour = 'ON'; TitleDirectory = 'GeneralsMD'; InstallDirectory = 'ZeroHour'; Targets = @('z_generals', 'z_launcher', 'z_runtime_regression_tests'); Executables = @('generalszh.exe', 'launcher.exe', 'z_runtime_regression_tests.exe'); LauncherCommand = 'generalszh.exe' }
 )) {
     $productBuildRoot = Join-Path $BuildRoot $product.Name
     $installRoot = Join-Path $productBuildRoot 'InstallRoot'
+    $resolvedProductBuildRoot = [IO.Path]::GetFullPath($productBuildRoot).TrimEnd('\')
+    $resolvedInstallRoot = [IO.Path]::GetFullPath($installRoot)
+    if (-not $resolvedInstallRoot.StartsWith($resolvedProductBuildRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Native x64 $($product.Name) install root escaped its audit build root."
+    }
+    if (Test-Path -LiteralPath $resolvedInstallRoot) {
+        Remove-Item -LiteralPath $resolvedInstallRoot -Recurse -Force
+    }
     $arguments = @(
         '--fresh',
         '-S', $SourceRoot,
@@ -102,6 +134,11 @@ foreach ($product in @(
         if ($installScript -notmatch $executableInstallPattern) {
             throw "Native x64 $($product.Name) install script is missing $executable below CMAKE_INSTALL_PREFIX/$($product.InstallDirectory)."
         }
+    }
+    $launcherConfigInstallPattern = 'file\(INSTALL DESTINATION "' +
+        [regex]::Escape($expectedDestination) + '" TYPE FILE FILES "[^"]*/launcher\.lcf"\)'
+    if ($installScript -notmatch $launcherConfigInstallPattern) {
+        throw "Native x64 $($product.Name) install script is missing launcher.lcf."
     }
 
     $cachePath = Join-Path $productBuildRoot 'CMakeCache.txt'
@@ -157,6 +194,58 @@ foreach ($product in @(
             throw "Native x64 $($product.Name) product did not select the browser-safe no-op implementation."
         }
     }
+
+    $buildArguments = @(
+        '--build', $productBuildRoot,
+        '--config', 'Release',
+        '--parallel', '4',
+        '--target'
+    ) + $product.Targets
+    & cmake @buildArguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Native x64 $($product.Name) exact product target build failed."
+    }
+
+    & cmake --install $productBuildRoot --config Release --prefix $installRoot
+    if ($LASTEXITCODE -ne 0) {
+        throw "Native x64 $($product.Name) installed-runtime generation failed."
+    }
+
+    $installedTitleRoot = Join-Path $installRoot $product.InstallDirectory
+    foreach ($executable in $product.Executables) {
+        $installedExecutable = Join-Path $installedTitleRoot $executable
+        if (-not (Test-Path -LiteralPath $installedExecutable -PathType Leaf)) {
+            throw "Native x64 $($product.Name) audit did not produce installed executable $executable."
+        }
+    }
+    $installedLauncherConfig = Join-Path $installedTitleRoot 'launcher.lcf'
+    if (-not (Test-Path -LiteralPath $installedLauncherConfig -PathType Leaf)) {
+        throw "Native x64 $($product.Name) audit did not produce launcher.lcf."
+    }
+    $expectedLauncherConfig = "RUN = . $($product.LauncherCommand)"
+    if ((Get-Content -LiteralPath $installedLauncherConfig -Raw).Trim() -cne $expectedLauncherConfig) {
+        throw "Native x64 $($product.Name) launcher.lcf does not select $($product.LauncherCommand)."
+    }
+    foreach ($runtimeDll in $runtimeDlls) {
+        $runtimeDllName = [IO.Path]::GetFileName($runtimeDll)
+        $installedRuntimeDll = Join-Path $installedTitleRoot $runtimeDllName
+        if (-not (Test-Path -LiteralPath $installedRuntimeDll -PathType Leaf)) {
+            throw "Native x64 $($product.Name) audit did not produce installed FFmpeg runtime $runtimeDllName."
+        }
+
+        $module = [NativeProductRuntimeAudit.NativeLoader]::LoadLibraryEx(
+            $installedRuntimeDll,
+            [IntPtr]::Zero,
+            $loaderFlags)
+        if ($module -eq [IntPtr]::Zero) {
+            $loaderError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            throw "Native x64 $($product.Name) installed FFmpeg runtime $runtimeDllName failed clean dependency loading with Windows error $loaderError."
+        }
+        if (-not [NativeProductRuntimeAudit.NativeLoader]::FreeLibrary($module)) {
+            $loaderError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            throw "Native x64 $($product.Name) installed FFmpeg runtime $runtimeDllName failed to unload with Windows error $loaderError."
+        }
+    }
 }
 
-Write-Output 'Native x64 Generals and Zero Hour product runtime graph audits passed.'
+Write-Output 'Native x64 Generals and Zero Hour exact product build, install, and runtime dependency audits passed.'

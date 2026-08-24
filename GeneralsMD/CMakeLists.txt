@@ -67,6 +67,7 @@ if(_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR)
     if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND TARGET z_launcher)
         install(TARGETS z_launcher RUNTIME DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}")
         install(FILES $<TARGET_PDB_FILE:z_launcher> DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}" OPTIONAL)
+        install(FILES launcher.lcf DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}")
     endif()
 
     # Keep the native runtime-test utility with the disposable x64 product

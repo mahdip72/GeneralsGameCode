@@ -27,6 +27,7 @@ if(RTS_BUILD_CORE_EXTRAS)
         add_subdirectory(NativeAudioManagerContractTest)
         add_subdirectory(NativeAudioAssetCatalogTest)
         add_subdirectory(NativeXAudioManagerContractTest)
+        add_subdirectory(LauncherProcessContractTest)
         add_test(NAME core_native_audio_graph_audit
             COMMAND powershell -NoProfile -ExecutionPolicy Bypass
                 -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeAudioGraphAudit/NativeAudioGraphAudit.ps1"
@@ -59,7 +60,7 @@ if(RTS_BUILD_CORE_EXTRAS)
                 -ManifestTool "${CMAKE_MT}"
                 -FFmpegRoot "${FFMPEG_ROOT}"
         )
-        set_tests_properties(core_native_product_runtime_audit PROPERTIES TIMEOUT 240)
+        set_tests_properties(core_native_product_runtime_audit PROPERTIES TIMEOUT 1200)
         if(RTS_BUILD_OPTION_FFMPEG)
             add_subdirectory(FFmpegContractTest)
             add_subdirectory(FFmpegFileBehaviorTest)
