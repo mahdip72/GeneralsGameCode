@@ -45,7 +45,11 @@ void ProfileResultFileCSV::WriteThread(ProfileFuncLevel::Thread &thread)
 {
   char help[40];
 
+#if defined(_WIN64)
+  sprintf(help,"prof%p-all.csv",thread.GetId());
+#else
   sprintf(help,"prof%08x-all.csv",thread.GetId());
+#endif
   FILE *f=fopen(help,"wt");
 
   // CSV file header

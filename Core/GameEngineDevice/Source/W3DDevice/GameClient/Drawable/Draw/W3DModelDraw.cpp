@@ -1208,10 +1208,10 @@ void W3DModelDrawModuleData::buildFieldParse(MultiIniFieldParse& p)
 		{ "ParticlesAttachedToAnimatedBones",	INI::parseBool, nullptr, offsetof(W3DModelDrawModuleData, m_particlesAttachedToAnimatedBones) },
 		{ "MinLODRequired",		INI::parseStaticGameLODLevel,	nullptr,	offsetof(W3DModelDrawModuleData, m_minLODRequired) },
 		{ "ProjectileBoneFeedbackEnabledSlots", INI::parseBitString32, TheWeaponSlotTypeNames, offsetof(W3DModelDrawModuleData, m_projectileBoneFeedbackEnabledSlots) },
-		{ "DefaultConditionState", W3DModelDrawModuleData::parseConditionState, (void*)PARSE_DEFAULT, 0 },
-		{ "ConditionState", W3DModelDrawModuleData::parseConditionState, (void*)PARSE_NORMAL, 0 },
-		{ "AliasConditionState", W3DModelDrawModuleData::parseConditionState, (void*)PARSE_ALIAS, 0 },
-		{ "TransitionState", W3DModelDrawModuleData::parseConditionState, (void*)PARSE_TRANSITION, 0 },
+		{ "DefaultConditionState", W3DModelDrawModuleData::parseConditionState, reinterpret_cast<void *>(static_cast<uintptr_t>(PARSE_DEFAULT)), 0 },
+		{ "ConditionState", W3DModelDrawModuleData::parseConditionState, reinterpret_cast<void *>(static_cast<uintptr_t>(PARSE_NORMAL)), 0 },
+		{ "AliasConditionState", W3DModelDrawModuleData::parseConditionState, reinterpret_cast<void *>(static_cast<uintptr_t>(PARSE_ALIAS)), 0 },
+		{ "TransitionState", W3DModelDrawModuleData::parseConditionState, reinterpret_cast<void *>(static_cast<uintptr_t>(PARSE_TRANSITION)), 0 },
 		{ "TrackMarks", parseAsciiStringLC, nullptr, offsetof(W3DModelDrawModuleData, m_trackFile) },
 		{ "ExtraPublicBone", INI::parseAsciiStringVectorAppend, nullptr, offsetof(W3DModelDrawModuleData, m_extraPublicBones) },
 		{ "AttachToBoneInAnotherModule", parseAsciiStringLC, nullptr, offsetof(W3DModelDrawModuleData, m_attachToDrawableBone) },
@@ -1233,7 +1233,7 @@ enum AnimParseType CPP_11(: Int)
 //-------------------------------------------------------------------------------------------------
 static void parseAnimation(INI* ini, void *instance, void * /*store*/, const void* userData)
 {
-	AnimParseType animType = (AnimParseType)(UnsignedInt)userData;
+	AnimParseType animType = static_cast<AnimParseType>(reinterpret_cast<uintptr_t>(userData));
 
 	AsciiString animName = ini->getNextAsciiString();
 	animName.toLower();
@@ -1434,8 +1434,8 @@ void W3DModelDrawModuleData::parseConditionState(INI* ini, void *instance, void 
 		{ "WeaponMuzzleFlash", parseWeaponBoneName, nullptr, offsetof(ModelConditionInfo, m_weaponMuzzleFlashName[0]) },
 		{ "WeaponLaunchBone", parseWeaponBoneName, nullptr, offsetof(ModelConditionInfo, m_weaponProjectileLaunchBoneName[0]) },
 		{ "WeaponHideShowBone", parseWeaponBoneName, nullptr, offsetof(ModelConditionInfo, m_weaponProjectileHideShowName[0]) },
-		{ "Animation", parseAnimation, (void*)ANIM_NORMAL, offsetof(ModelConditionInfo, m_animations) },
-		{ "IdleAnimation", parseAnimation, (void*)ANIM_IDLE, offsetof(ModelConditionInfo, m_animations) },
+		{ "Animation", parseAnimation, reinterpret_cast<void *>(static_cast<uintptr_t>(ANIM_NORMAL)), offsetof(ModelConditionInfo, m_animations) },
+		{ "IdleAnimation", parseAnimation, reinterpret_cast<void *>(static_cast<uintptr_t>(ANIM_IDLE)), offsetof(ModelConditionInfo, m_animations) },
 		{ "AnimationMode", INI::parseIndexList, TheAnimModeNames, offsetof(ModelConditionInfo, m_mode) },
 		{ "TransitionKey", parseLowercaseNameKey, nullptr, offsetof(ModelConditionInfo, m_transitionKey) },
 		{ "WaitForStateToFinishIfPossible", parseLowercaseNameKey, nullptr, offsetof(ModelConditionInfo, m_allowToFinishKey) },
@@ -1447,7 +1447,7 @@ void W3DModelDrawModuleData::parseConditionState(INI* ini, void *instance, void 
 
 	ModelConditionInfo info;
 	W3DModelDrawModuleData* self = (W3DModelDrawModuleData*)instance;
-	ParseCondStateType cst = (ParseCondStateType)(UnsignedInt)userData;
+	ParseCondStateType cst = static_cast<ParseCondStateType>(reinterpret_cast<uintptr_t>(userData));
 	switch (cst)
 	{
 		case PARSE_DEFAULT:

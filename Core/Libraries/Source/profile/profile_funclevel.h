@@ -180,10 +180,17 @@ public:
 
       \return profile thread ID
     */
+#if defined(_WIN64)
+    const void *GetId() const
+    {
+      return m_threadID;
+    }
+#else
     unsigned GetId() const
     {
       return unsigned(m_threadID);
     }
+#endif
 
   private:
     /// internal thread ID
