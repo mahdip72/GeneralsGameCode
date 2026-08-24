@@ -53,10 +53,11 @@ foreach ($line in $environmentLines) {
 }
 
 foreach ($product in @(
-    @{ Name = 'Generals'; Generals = 'ON'; ZeroHour = 'OFF' },
-    @{ Name = 'ZeroHour'; Generals = 'OFF'; ZeroHour = 'ON' }
+    @{ Name = 'Generals'; Generals = 'ON'; ZeroHour = 'OFF'; TitleDirectory = 'Generals'; InstallDirectory = 'Generals'; Executable = 'generalsv.exe' },
+    @{ Name = 'ZeroHour'; Generals = 'OFF'; ZeroHour = 'ON'; TitleDirectory = 'GeneralsMD'; InstallDirectory = 'ZeroHour'; Executable = 'generalszh.exe' }
 )) {
     $productBuildRoot = Join-Path $BuildRoot $product.Name
+    $installRoot = Join-Path $productBuildRoot 'InstallRoot'
     $arguments = @(
         '--fresh',
         '-S', $SourceRoot,
@@ -66,6 +67,7 @@ foreach ($product in @(
         "-DCMAKE_CXX_COMPILER=$CxxCompiler",
         "-DCMAKE_RC_COMPILER=$RcCompiler",
         "-DCMAKE_MT=$ManifestTool",
+        "-DCMAKE_INSTALL_PREFIX=$($installRoot.Replace('\', '/'))",
         '-DRTS_BUILD_PRODUCT=ON',
         "-DRTS_BUILD_ZEROHOUR=$($product.ZeroHour)",
         "-DRTS_BUILD_GENERALS=$($product.Generals)",
@@ -85,6 +87,19 @@ foreach ($product in @(
     & cmake @arguments
     if ($LASTEXITCODE -ne 0) {
         throw "Native x64 $($product.Name) product graph generation failed."
+    }
+
+    $installScriptPath = Join-Path $productBuildRoot "$($product.TitleDirectory)/cmake_install.cmake"
+    if (-not (Test-Path -LiteralPath $installScriptPath)) {
+        throw "Native x64 $($product.Name) title install script was not generated."
+    }
+    $installScript = (Get-Content -LiteralPath $installScriptPath -Raw).Replace('\', '/')
+    $expectedDestination = '${CMAKE_INSTALL_PREFIX}/' + $product.InstallDirectory
+    $executableInstallPattern = 'file\(INSTALL DESTINATION "' +
+        [regex]::Escape($expectedDestination) + '" TYPE EXECUTABLE FILES "[^"]*/' +
+        [regex]::Escape($product.Executable) + '"\)'
+    if ($installScript -notmatch $executableInstallPattern) {
+        throw "Native x64 $($product.Name) product is not installable below CMAKE_INSTALL_PREFIX/$($product.InstallDirectory)."
     }
 
     $closurePath = Join-Path $productBuildRoot 'native_product_runtime_link_closure.txt'

@@ -47,6 +47,13 @@ if("${CMAKE_HOST_SYSTEM}" MATCHES "Windows" AND "${CMAKE_SYSTEM}" MATCHES "Windo
     endif()
 endif()
 
+# Native products have no compatible retail registry location.  Keep an
+# explicit title prefix authoritative, otherwise install below the standard
+# CMake prefix so presets and --prefix remain portable.
+if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT _RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR)
+    set(_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR "ZeroHour")
+endif()
+
 if(_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR)
     install(TARGETS z_generals RUNTIME DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}")
     install(FILES $<TARGET_PDB_FILE:z_generals> DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}" OPTIONAL)
