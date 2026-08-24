@@ -218,8 +218,13 @@ int main(int argc, char **argv)
 		}
 	}
 
+	if (file.isClosed() || file.getCloseCount() != 0) {
+		std::fputs("Decoder destructor closed a caller-owned source.\n", stderr);
+		return 1;
+	}
+	file.close();
 	if (!file.isClosed() || file.getCloseCount() != 1) {
-		std::fputs("Decoder destructor did not close its owned file exactly once.\n", stderr);
+		std::fputs("Caller-owned source did not retain explicit close ownership.\n", stderr);
 		return 1;
 	}
 

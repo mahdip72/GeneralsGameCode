@@ -642,7 +642,8 @@ void PlayMovieAndBlock(AsciiString movieTitle)
 
 	GameWindow *movieWindow = s_blankLayout->getFirstWindow();
 	TheWritableGlobalData->m_loadScreenRender = TRUE;
-	while (videoStream->frameIndex() < videoStream->frameCount() - 1)
+	while (videoStream->frameIndex() < videoStream->frameCount() - 1
+		&& !videoStream->isFinished())
 	{
 		// TheSuperHackers @feature User can now skip video by pressing ESC
 		if (TheKeyboard)
@@ -660,6 +661,11 @@ void PlayMovieAndBlock(AsciiString movieTitle)
 
 		if(!videoStream->isFrameReady())
 		{
+			videoStream->update();
+			if (videoStream->isFinished())
+			{
+				break;
+			}
 			Sleep(1);
 			continue;
 		}

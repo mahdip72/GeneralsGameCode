@@ -343,6 +343,11 @@ Bool BinkVideoStream::isFrameReady()
 	return !BinkWait( m_handle );
 }
 
+Bool BinkVideoStream::isFinished() const
+{
+	return m_handle == nullptr || m_handle->FrameNum - 1 >= m_handle->Frames - 1;
+}
+
 //============================================================================
 // BinkVideoStream::frameDecompress
 //============================================================================

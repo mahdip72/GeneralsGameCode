@@ -1,3 +1,4 @@
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
 add_executable(z_runtime_regression_tests)
 
 target_sources(z_runtime_regression_tests PRIVATE
@@ -21,7 +22,7 @@ target_link_libraries(z_runtime_regression_tests PRIVATE
 	zi_always
 )
 
-if(NOT RTS_BUILD_OPTION_FFMPEG)
+if(CMAKE_SIZEOF_VOID_P EQUAL 4 AND NOT RTS_BUILD_OPTION_FFMPEG)
 	target_link_libraries(z_runtime_regression_tests PRIVATE binkstub)
 endif()
 
@@ -30,3 +31,4 @@ set_tests_properties(z_skirmish_ai_replay_epoch_tests PROPERTIES TIMEOUT 30)
 
 add_test(NAME z_skirmish_ai_runner_contract_tests COMMAND z_runtime_regression_tests --skirmish-ai-runner-contract)
 set_tests_properties(z_skirmish_ai_runner_contract_tests PROPERTIES TIMEOUT 30)
+endif()

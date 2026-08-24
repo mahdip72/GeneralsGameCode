@@ -16,8 +16,9 @@ $cmake = Get-Content -LiteralPath (Join-Path $SourceRoot 'Core/GameEngineDevice/
 if ($cmake -notmatch 'Source/XAudio2AudioDevice/AudioManagerFactory\.cpp') {
     throw 'The x64 device graph does not select the native audio factory implementation.'
 }
-if ($cmake -notmatch 'Source/AudioDevice/AudioChannelPolicy\.cpp') {
-    throw 'The neutral audio channel policy is not in the device graph.'
+if ($cmake -notmatch 'Source/AudioDevice/AudioChannelPolicy\.cpp' -or
+	$cmake -notmatch 'rts_native_audio_manager') {
+	throw 'The native manager production target is not in the device graph.'
 }
 
 $tools = Get-Content -LiteralPath (Join-Path $SourceRoot 'Core/Tools/CMakeLists.txt') -Raw
@@ -48,13 +49,15 @@ if (-not $pointerSizeConfigured) {
 if (-not $pointerSizeConfigured) {
     throw 'The native x64 graph audit was not run against an 8-byte configured target graph.'
 }
-if ($closure -notmatch 'XAudio2AudioDevice[/\\]AudioManagerFactory\.cpp') {
+if ($closure -notmatch 'XAudio2AudioDevice[/\\]AudioManagerFactory\.cpp' -and
+	$closure -notmatch 'links=.*rts_native_audio_manager') {
     throw 'The configured x64 device closure does not contain the native factory source.'
 }
 if ($closure -notmatch 'links=.*rts_native_audio_asset_source' -or
     $closure -notmatch 'links=.*rts_xaudio2_pcm_voice' -or
-    $closure -notmatch 'links=.*rts_xaudio2_audio_service') {
-    throw 'The configured x64 target closure does not retain the native asset, voice, and service targets.'
+    $closure -notmatch 'links=.*rts_xaudio2_audio_service' -or
+    $closure -notmatch 'links=.*rts_native_audio_manager') {
+	throw 'The configured x64 target closure does not retain the native asset, voice, service, and manager targets.'
 }
 if ($closure -match '(?i)mss|MilesAudioDevice|MilesAudioManager|milesstub') {
     throw 'The configured x64 native-device closure contains a legacy Miles source or link.'

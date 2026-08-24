@@ -220,20 +220,11 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4)
         Source/AudioDevice/AudioChannelPolicy.cpp
     )
 else()
-    list(APPEND GAMEENGINEDEVICE_SRC
-        Include/AudioDevice/AudioChannelPolicy.h
-        Include/AudioDevice/AudioAssetSource.h
-        Source/AudioDevice/AudioChannelPolicy.cpp
-        Include/AudioDevice/AudioManagerFactory.h
-        Include/AudioDevice/NullAudioManager.h
-        Source/AudioDevice/NullAudioManager.cpp
-        Include/XAudio2AudioDevice/XAudio2AudioManager.h
-        Source/XAudio2AudioDevice/XAudio2AudioManager.cpp
-        Source/XAudio2AudioDevice/AudioManagerFactory.cpp
-    )
+    # Native x64 audio manager sources are owned by rts_native_audio_manager
+    # below so runtime and contract tests consume one production target.
 endif()
 
-if(NOT RTS_BUILD_OPTION_FFMPEG)
+if(CMAKE_SIZEOF_VOID_P EQUAL 4 AND NOT RTS_BUILD_OPTION_FFMPEG)
     list(APPEND GAMEENGINEDEVICE_SRC
         Include/VideoDevice/Bink/BinkVideoPlayer.h
         Source/VideoDevice/Bink/BinkVideoPlayer.cpp
@@ -269,7 +260,7 @@ target_link_libraries(corei_gameenginedevice_private INTERFACE
     stb
 )
 
-if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32)
     target_link_libraries(corei_gameenginedevice_private INTERFACE rts_xaudio2)
 endif()
 
@@ -395,4 +386,44 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32)
     )
     target_compile_features(rts_xaudio2_audio_service PUBLIC cxx_std_20)
     target_link_libraries(corei_gameenginedevice_private INTERFACE rts_xaudio2_audio_service)
+endif()
+
+if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32)
+    add_library(rts_native_audio_manager STATIC
+        Include/AudioDevice/AudioChannelPolicy.h
+        Include/AudioDevice/AudioManagerFactory.h
+        Include/AudioDevice/AudioAssetSource.h
+        Include/AudioDevice/NullAudioManager.h
+        Include/XAudio2AudioDevice/XAudio2AudioManager.h
+        Source/AudioDevice/AudioChannelPolicy.cpp
+        Source/AudioDevice/NullAudioManager.cpp
+        Source/XAudio2AudioDevice/AudioManagerFactory.cpp
+        Source/XAudio2AudioDevice/XAudio2AudioManager.cpp
+    )
+    target_include_directories(rts_native_audio_manager PUBLIC
+        Include
+        ${CMAKE_SOURCE_DIR}/Core/GameEngine/Include
+        ${CMAKE_SOURCE_DIR}/Core/Libraries/Include
+        ${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas
+        ${CMAKE_SOURCE_DIR}/Core/Main
+        ${CMAKE_SOURCE_DIR}/Dependencies/Utility
+    )
+    target_compile_features(rts_native_audio_manager PUBLIC cxx_std_20)
+    target_compile_definitions(rts_native_audio_manager PRIVATE
+        RTS_NATIVE_AUDIO_ENGINE_FILESYSTEM
+        RTS_NATIVE_AUDIO_TEST_HOOK
+    )
+    target_link_libraries(rts_native_audio_manager PUBLIC
+        corei_always
+        rts_native_audio_asset_source
+        rts_xaudio2_audio_service
+    )
+    target_link_libraries(corei_gameenginedevice_private INTERFACE
+        rts_native_audio_manager
+    )
+endif()
+
+if(WIN32 AND RTS_BUILD_OPTION_FFMPEG AND RTS_FFMPEG_RUNTIME_DLLS)
+    # Install the exact resolved DLLs, never an unbounded SDK bin directory.
+    install(FILES ${RTS_FFMPEG_RUNTIME_DLLS} DESTINATION .)
 endif()

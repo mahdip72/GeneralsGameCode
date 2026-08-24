@@ -82,11 +82,13 @@ namespace
 	class FakeVoice final : public IXAudio2PcmVoiceBackend
 	{
 	public:
-		FakeVoice(Bool failCreate, Bool failSubmit, Bool failStop, Bool failFlush) :
+		FakeVoice(Bool failCreate, Bool failSubmit, Bool failStop, Bool failFlush,
+			int *totalSubmitCalls) :
 			m_failCreate(failCreate),
 			m_failSubmit(failSubmit),
 			m_failStop(failStop),
-			m_failFlush(failFlush)
+			m_failFlush(failFlush),
+			m_totalSubmitCalls(totalSubmitCalls)
 		{
 		}
 		HRESULT create(const WAVEFORMATEX &, IXAudio2VoiceCallback *callback) noexcept override
@@ -104,6 +106,9 @@ namespace
 			}
 			m_lastContext = buffer.pContext;
 			++submitCalls;
+			if (m_totalSubmitCalls != nullptr) {
+				++(*m_totalSubmitCalls);
+			}
 			return S_OK;
 		}
 		HRESULT start() noexcept override { return S_OK; }
@@ -138,6 +143,7 @@ namespace
 		Bool m_failSubmit;
 		Bool m_failStop;
 		Bool m_failFlush;
+		int *m_totalSubmitCalls;
 		IXAudio2VoiceCallback *m_callback = nullptr;
 		void *m_lastContext = nullptr;
 	};
@@ -153,7 +159,7 @@ namespace
 				return E_FAIL;
 			}
 			std::unique_ptr<FakeVoice> created = std::make_unique<FakeVoice>(
-				failVoiceCreate, failSubmit, failStop, failFlush);
+				failVoiceCreate, failSubmit, failStop, failFlush, &totalSubmitCalls);
 			lastVoice = created.get();
 			voices.push_back(lastVoice);
 			voice = std::move(created);
@@ -168,6 +174,7 @@ namespace
 		Bool failSubmit = FALSE;
 		Bool failStop = FALSE;
 		Bool failFlush = FALSE;
+		int totalSubmitCalls = 0;
 	};
 
 	class FixtureEvent final : public AudioEventRTS
@@ -234,7 +241,7 @@ int main()
 	TheTacticalView = nullptr;
 	check(manager.runInjectedPlaybackProbe(AsciiString("main.wav")),
 		"manager submits an injected phase through its generation-reset path");
-	check(engine->lastVoice != nullptr && engine->lastVoice->submitCalls == 1,
+	check(engine->totalSubmitCalls == 1,
 		"fake service observes one bounded manager PCM submission");
 
 	AudioEventInfo *fixtureInfo = newInstance(AudioEventInfo);
@@ -709,6 +716,33 @@ int main()
 	manager.stopAudio(AudioAffect_Speech);
 	manager.update();
 
+	std::unique_ptr<FakeEngine> replacementOwnedEngine = std::make_unique<FakeEngine>();
+	FakeEngine *replacementEngine = replacementOwnedEngine.get();
+	XAudio2AudioService replacementService(std::move(replacementOwnedEngine));
+	XAudio2AudioManager replacementManager(&replacementService, &catalog);
+	replacementManager.openDevice();
+	AudioAssetCatalog replacementCatalog;
+	replacementCatalog.setDurationMS(AsciiString("replacement.wav"), 100.0f);
+	AudioEventInfo *replacementInfo = newInstance(AudioEventInfo);
+	*replacementInfo = *lowInfo;
+	replacementInfo->m_audioName = AsciiString("replacement-source");
+	replacementInfo->m_sounds.clear();
+	replacementInfo->m_sounds.push_back(AsciiString("main.wav"));
+	FixtureEvent replacementEvent(AsciiString("replacement-source"));
+	replacementEvent.setAudioEventInfo(replacementInfo);
+	const AudioHandle replacementHandle = replacementManager.addAudioEvent(&replacementEvent);
+	replacementManager.update();
+	check(replacementEngine->lastVoice != nullptr
+		&& replacementManager.isCurrentlyPlaying(replacementHandle)
+		&& replacementManager.getActiveAudioCount() == 1,
+		"source replacement fixture starts with an active native record");
+	replacementManager.setAssetSource(&replacementCatalog);
+	check(replacementManager.isOpen() && replacementManager.getActiveAudioCount() == 0
+		&& !replacementManager.isCurrentlyPlaying(replacementHandle),
+		"replacing the asset source quiesces active records before admission resumes");
+	replacementManager.closeDevice();
+	deleteInstance(replacementInfo);
+
 	std::unique_ptr<FakeEngine> failureOwnedEngine = std::make_unique<FakeEngine>();
 	FakeEngine *failureEngine = failureOwnedEngine.get();
 	XAudio2AudioService failureService(std::move(failureOwnedEngine));
@@ -760,8 +794,8 @@ int main()
 	failureEngine->failSubmit = TRUE;
 	const AudioHandle failureSubmitHandle = failureManager.addAudioEvent(&failureSubmit);
 	failureManager.update();
-	check(failureManager.isCurrentlyPlaying(failureSubmitHandle),
-		"submit-failure fixture reaches the typed voice submission boundary");
+	check(!failureManager.isCurrentlyPlaying(failureSubmitHandle),
+		"submit-failure fixture is terminal at the typed voice submission boundary");
 	failureManager.update();
 	check(!failureManager.isCurrentlyPlaying(failureSubmitHandle)
 		&& failureManager.getActiveAudioCount() == 0,

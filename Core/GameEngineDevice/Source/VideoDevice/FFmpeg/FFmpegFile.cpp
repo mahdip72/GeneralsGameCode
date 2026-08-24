@@ -132,6 +132,7 @@ Bool FFmpegFile::open(FFmpegFileSource &source)
 #endif
 
 	m_source = &source;
+	m_ownsSource = m_ownedSource.get() == &source;
 
 	// FFmpeg setup
 	m_fmtCtx = avformat_alloc_context();
@@ -300,6 +301,8 @@ int FFmpegFile::readPacket(void *opaque, uint8_t *buf, int buf_size)
 		return AVERROR(EIO);
 	if (read == 0)
 		return AVERROR_EOF;
+	if (read > buf_size)
+		return AVERROR(EIO);
 
 	return read;
 }
@@ -373,10 +376,11 @@ void FFmpegFile::close()
 	m_seekStreamIndex = -1;
 	m_seekTargetTimestamp = 0;
 
-	if (m_source != nullptr) {
+	if (m_source != nullptr && m_ownsSource) {
 		m_source->close();
-		m_source = nullptr;
 	}
+	m_source = nullptr;
+	m_ownsSource = FALSE;
 	m_ownedSource.reset();
 }
 
@@ -520,6 +524,10 @@ Bool FFmpegFile::decodePacket()
 
 FFmpegFile::ReceiveResult FFmpegFile::receiveFrame(FFmpegStream &stream)
 {
+	if (stream.codec_ctx == nullptr || stream.frame == nullptr) {
+		DEBUG_LOG(("Decoder frame storage is unavailable"));
+		return ReceiveResult::FAILED;
+	}
 	const int result = avcodec_receive_frame(stream.codec_ctx, stream.frame);
 	if (result == AVERROR(EAGAIN)) {
 		return ReceiveResult::NEEDS_INPUT;

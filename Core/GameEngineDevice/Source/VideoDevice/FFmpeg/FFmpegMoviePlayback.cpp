@@ -96,6 +96,26 @@ public:
 		m_sink.reset(generation);
 	}
 
+	void endOfStream() noexcept override
+	{
+		m_sink.endOfStream();
+	}
+
+	bool isDrained() const noexcept override
+	{
+		return m_sink.isDrained();
+	}
+
+	bool serviceSink() noexcept override
+	{
+		return m_sink.serviceSink();
+	}
+
+	void close() noexcept override
+	{
+		m_sink.close();
+	}
+
 	bool getPlayedSample(std::int64_t &sample) const noexcept override
 	{
 		return m_sink.getPlayedSample(sample);
@@ -114,6 +134,7 @@ FFmpegMoviePlayback::FFmpegMoviePlayback(FFmpegFile &file, AudioPcmSink *sink,
 	m_gainSink(nullptr),
 	m_audioSink(nullptr),
 	m_audioDecoder(new FFmpegAudioDecoder()),
+	m_audioEnabled(options.audioEnabled && file.hasAudio() && sink != nullptr),
 	m_mode(options.mode),
 	m_state(FFmpegMoviePlaybackState::ACTIVE),
 	m_clock(options.clock ? options.clock : &FFmpegMoviePlayback::defaultClock),
@@ -134,7 +155,7 @@ FFmpegMoviePlayback::FFmpegMoviePlayback(FFmpegFile &file, AudioPcmSink *sink,
 	m_audioGateActive(false),
 	m_newVideoFrame(false)
 {
-	const bool useExternalAudio = options.audioEnabled && file.hasAudio() && sink != nullptr;
+	const bool useExternalAudio = m_audioEnabled;
 	m_audioSink = useExternalAudio ? sink : m_silentSink;
 	m_gainSink = new GainSink(*m_audioSink, options.gain);
 	m_audioSink = m_gainSink;
@@ -150,9 +171,12 @@ FFmpegMoviePlayback::~FFmpegMoviePlayback()
 	// invalid so a later file seek/decode cannot call back into freed playback.
 	m_file.setFrameCallback(nullptr);
 	m_file.setUserData(nullptr);
-	// The sink is reset before decoder/file state is released. The x64 adapter uses
-	// this owner-side point to close its typed movie voice first.
-	if (m_audioSink != nullptr) {
+	// Abort teardown resets the active generation before the sink closes. A
+	// normally completed stream has already drained and must close without a
+	// reset; seek/loop/failure paths perform their own generation reset.
+	if (m_audioSink != nullptr
+		&& m_state != FFmpegMoviePlaybackState::ENDED
+		&& m_state != FFmpegMoviePlaybackState::FAILED) {
 		m_audioSink->reset(m_generation);
 	}
 	delete m_audioDecoder;
@@ -218,6 +242,12 @@ bool FFmpegMoviePlayback::pump(std::size_t maxDecodeCalls)
 	if (maxDecodeCalls == 0 || isTerminal()) {
 		return false;
 	}
+	if (m_state == FFmpegMoviePlaybackState::DRAINING) {
+		if (m_audioSink == nullptr || !m_audioSink->serviceSink()) {
+			return setFailed();
+		}
+		return completeDrain();
+	}
 	bool progressed = false;
 	for (std::size_t call = 0; call < maxDecodeCalls; ++call) {
 		m_newVideoFrame = false;
@@ -248,7 +278,9 @@ bool FFmpegMoviePlayback::pump(std::size_t maxDecodeCalls)
 bool FFmpegMoviePlayback::finish(std::size_t maxPumpCalls)
 {
 	for (std::size_t call = 0; call < maxPumpCalls && !isTerminal(); ++call) {
-		pump(64);
+		if (!pump(64) && m_state != FFmpegMoviePlaybackState::DRAINING) {
+			break;
+		}
 	}
 	return m_state == FFmpegMoviePlaybackState::ENDED;
 }
@@ -275,7 +307,7 @@ bool FFmpegMoviePlayback::seekFrame(Int frameIndex)
 	m_clockRebased = false;
 	m_audioClockRebased = false;
 	m_newVideoFrame = false;
-	m_state = (m_externalSink != nullptr && m_file.hasAudio()
+	m_state = (m_audioEnabled
 		? FFmpegMoviePlaybackState::ACTIVE : FFmpegMoviePlaybackState::SILENT_AUDIO);
 	return true;
 }
@@ -340,6 +372,16 @@ bool FFmpegMoviePlayback::handleEndOfInput()
 	if (!m_audioDecoder->drain(*m_audioSink)) {
 		return setFailed();
 	}
+	m_audioSink->endOfStream();
+	return completeDrain();
+}
+
+bool FFmpegMoviePlayback::completeDrain()
+{
+	if (m_state != FFmpegMoviePlaybackState::DRAINING
+		|| m_audioSink == nullptr || !m_audioSink->isDrained()) {
+		return m_state == FFmpegMoviePlaybackState::DRAINING;
+	}
 	if (m_mode != FFmpegMoviePlaybackMode::LOOP) {
 		if (m_mode == FFmpegMoviePlaybackMode::ONCE) {
 			clearCurrentFrame();
@@ -360,7 +402,7 @@ bool FFmpegMoviePlayback::handleEndOfInput()
 	m_audioGateActive = false;
 	m_clockRebased = false;
 	m_audioClockRebased = false;
-	m_state = (m_externalSink != nullptr && m_file.hasAudio()
+	m_state = (m_audioEnabled
 		? FFmpegMoviePlaybackState::ACTIVE : FFmpegMoviePlaybackState::SILENT_AUDIO);
 	return true;
 }

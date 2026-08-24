@@ -178,6 +178,10 @@ void XAudio2AudioService::shutdown()
 	for (VoiceRecord &record : m_voices) {
 		if (record.voice != nullptr) {
 			record.voice->close();
+			const HRESULT voiceFailure = record.voice->getLastError();
+			if (SUCCEEDED(firstFailure) && FAILED(voiceFailure)) {
+				firstFailure = voiceFailure;
+			}
 			record.voice.reset();
 		}
 		record.backend.reset();
@@ -188,13 +192,19 @@ void XAudio2AudioService::shutdown()
 	const HRESULT stopResult = m_backend->stop();
 	if (FAILED(stopResult)) {
 		m_failurePublication.publish(stopResult);
+		if (SUCCEEDED(firstFailure)) {
+			firstFailure = stopResult;
+		}
 	}
 	const HRESULT closeResult = m_backend->close();
 	if (FAILED(closeResult)) {
 		m_failurePublication.publish(closeResult);
+		if (SUCCEEDED(firstFailure)) {
+			firstFailure = closeResult;
+		}
 	}
 
-	if (m_failurePublication.hasFailure()) {
+	if (SUCCEEDED(firstFailure) && m_failurePublication.hasFailure()) {
 		firstFailure = m_failurePublication.failure();
 	}
 	m_failurePublication.clear();
@@ -354,9 +364,14 @@ bool XAudio2AudioService::destroyVoice(XAudio2PcmVoiceHandle handle) noexcept
 
 	VoiceRecord &record = m_voices[handle.index];
 	record.voice->close();
+	const HRESULT voiceFailure = record.voice->getLastError();
 	record.voice.reset();
 	record.backend.reset();
 	record.generation = 0;
+	if (FAILED(voiceFailure)) {
+		m_lastError.store(voiceFailure, std::memory_order_release);
+		return false;
+	}
 	return true;
 }
 
@@ -468,6 +483,12 @@ bool XAudio2AudioService::isVoiceFailed(XAudio2PcmVoiceHandle handle) const noex
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
 	return isHandleOwnedLocked(handle) && m_voices[handle.index].voice->isFailed();
+}
+
+bool XAudio2AudioService::isVoiceDrained(XAudio2PcmVoiceHandle handle) const noexcept
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	return isHandleOwnedLocked(handle) && m_voices[handle.index].voice->isDrained();
 }
 
 HRESULT XAudio2AudioService::getVoiceLastError(XAudio2PcmVoiceHandle handle) const noexcept

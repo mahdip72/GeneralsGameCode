@@ -82,6 +82,7 @@ private:
 
 	void handleFrame(const AVFrame *frame, const FFmpegFrameMetadata &metadata);
 	bool handleEndOfInput();
+	bool completeDrain();
 	bool resetGeneration(std::uint64_t generation);
 	bool setFailed(bool resetAudio = true);
 	void clearCurrentFrame();
@@ -97,6 +98,7 @@ private:
 	GainSink *m_gainSink;
 	AudioPcmSink *m_audioSink;
 	FFmpegAudioDecoder *m_audioDecoder;
+	bool m_audioEnabled;
 	FFmpegMoviePlaybackMode m_mode;
 	FFmpegMoviePlaybackState m_state;
 	FFmpegMovieClock m_clock;

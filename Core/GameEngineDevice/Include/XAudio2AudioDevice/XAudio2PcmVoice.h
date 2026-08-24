@@ -31,12 +31,18 @@ public:
 	virtual HRESULT pause() noexcept { return stop(); }
 	virtual HRESULT resume() noexcept { return start(); }
 	virtual void destroy() noexcept = 0;
+	virtual HRESULT destroyWithResult() noexcept
+	{
+		destroy();
+		return S_OK;
+	}
 };
 
 struct XAudio2PcmCompletionRecord
 {
 	std::uint64_t generation = 0;
 	std::uint64_t sequence = 0;
+	std::uint64_t callbackToken = 0;
 	std::int64_t endSample = -1;
 };
 
@@ -54,10 +60,11 @@ public:
 	// These methods are owned by the audio thread. The backend is only touched here.
 	bool open();
 	void service();
-	void close();
+	void close() noexcept override;
 
 	bool isOpen() const noexcept;
 	bool isFailed() const noexcept;
+	bool isDrained() const noexcept;
 	HRESULT getLastError() const noexcept;
 	bool setVolume(float volume) noexcept;
 	bool pause() noexcept;
@@ -95,9 +102,10 @@ private:
 		XAUDIO2_BUFFER buffer = {};
 		std::uint64_t generation = 0;
 		std::uint64_t sequence = 0;
-		SlotState state = SlotState::FREE;
+		std::atomic<SlotState> state { SlotState::FREE };
 		bool cancelled = false;
 		std::atomic<bool> callbackComplete { false };
+		std::atomic<std::uint64_t> callbackToken { 0 };
 	};
 
 	static constexpr std::size_t COMPLETION_COUNT = 32;
@@ -135,6 +143,7 @@ private:
 	std::atomic<std::uint64_t> m_playedGeneration;
 	std::uint64_t m_requestedGeneration;
 	std::uint64_t m_activeGeneration;
+	std::uint64_t m_nextCallbackToken;
 	bool m_resetPending;
 	bool m_started;
 	bool m_backendCreated;

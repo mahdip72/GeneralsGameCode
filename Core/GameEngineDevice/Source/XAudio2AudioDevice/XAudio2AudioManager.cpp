@@ -5,12 +5,17 @@
 #include "Common/AudioHandleSpecialValues.h"
 #include "Common/AudioRequest.h"
 #include "Common/AudioSettings.h"
+#if defined(RTS_NATIVE_AUDIO_ENGINE_FILESYSTEM)
+#include "Common/FileSystem.h"
+#endif
 #include "Common/GameCommon.h"
 #include "AudioDevice/AudioChannelPolicy.h"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <string>
+#include <vector>
 
 class View;
 extern View *TheTacticalView;
@@ -22,6 +27,66 @@ constexpr UnsignedInt DEFAULT_2D_CHANNELS = 32;
 constexpr UnsignedInt DEFAULT_3D_CHANNELS = 32;
 constexpr UnsignedInt DEFAULT_STREAM_CHANNELS = 8;
 constexpr UnsignedInt PCM_MAX_FRAMES = 48000;
+constexpr std::size_t MAX_VIRTUAL_AUDIO_BYTES = 64U * 1024U * 1024U;
+
+class EngineVirtualAudioSource final : public AudioVirtualFileSource
+{
+public:
+	Bool readFile(const AsciiString &fileName, std::vector<std::uint8_t> &bytes,
+		std::string &identity) const override
+	{
+		bytes.clear();
+		identity.clear();
+#if !defined(RTS_NATIVE_AUDIO_ENGINE_FILESYSTEM)
+		(void)fileName;
+		return FALSE;
+#else
+		if (TheFileSystem == nullptr || fileName.isEmpty()) {
+			return FALSE;
+		}
+		File *file = TheFileSystem->openFile(fileName.str(), File::READ | File::BINARY);
+		if (file == nullptr) {
+			return FALSE;
+		}
+		auto closeFile = [&file]() {
+			File *closing = file;
+			file = nullptr;
+			if (closing != nullptr) {
+				closing->close();
+			}
+		};
+		const Int fileSize = file->size();
+		if (fileSize <= 0 || static_cast<std::size_t>(fileSize) > MAX_VIRTUAL_AUDIO_BYTES) {
+			closeFile();
+			return FALSE;
+		}
+		bytes.resize(static_cast<std::size_t>(fileSize));
+		std::size_t offset = 0;
+		while (offset < bytes.size()) {
+			const Int remaining = static_cast<Int>(std::min<std::size_t>(
+				bytes.size() - offset, static_cast<std::size_t>((std::numeric_limits<Int>::max)())));
+			const Int read = file->read(bytes.data() + offset, remaining);
+			if (read <= 0 || read > remaining) {
+				bytes.clear();
+				closeFile();
+				return FALSE;
+			}
+			offset += static_cast<std::size_t>(read);
+		}
+		closeFile();
+		identity = fileName.str();
+		return TRUE;
+#endif
+	}
+};
+
+void configureVirtualAssetSource(FileAudioAssetSource *source,
+	AudioVirtualFileSource *virtualSource)
+{
+	if (source != nullptr) {
+		source->setVirtualFileSource(virtualSource);
+	}
+}
 
 XAudio2AudioManager::Channel channelFor(const AudioEventRTS &event)
 {
@@ -65,6 +130,7 @@ XAudio2AudioManager::XAudio2AudioManager() :
 XAudio2AudioManager::XAudio2AudioManager(XAudio2AudioService *service,
 	AudioAssetSource *assetSource) :
 	m_service(service),
+	m_ownsService(FALSE),
 	m_assetSource(assetSource),
 	m_lifecycleGeneration(1),
 	m_num2DSamples(DEFAULT_2D_CHANNELS),
@@ -80,6 +146,9 @@ XAudio2AudioManager::XAudio2AudioManager(XAudio2AudioService *service,
 		m_ownedAssetSource = std::make_unique<FileAudioAssetSource>();
 		m_assetSource = m_ownedAssetSource.get();
 	}
+	m_ownedVirtualFileSource = std::make_unique<EngineVirtualAudioSource>();
+	configureVirtualAssetSource(dynamic_cast<FileAudioAssetSource *>(m_assetSource),
+		m_ownedVirtualFileSource.get());
 }
 
 XAudio2AudioManager::~XAudio2AudioManager()
@@ -141,13 +210,30 @@ void XAudio2AudioManager::setActiveMusicTrackForTest(const AsciiString &track)
 
 void XAudio2AudioManager::setAssetSource(AudioAssetSource *assetSource)
 {
+	if (assetSource != nullptr && assetSource == m_assetSource) {
+		return;
+	}
+	const Bool reopen = m_open;
+	// A source owns the bytes and stable identities used by active records.  A
+	// replacement is therefore a generation barrier: close admission, release
+	// every voice/pending request, and only then publish the new source.
+	closeDevice();
+	++m_lifecycleGeneration;
+	if (m_lifecycleGeneration == 0) {
+		m_lifecycleGeneration = 1;
+	}
 	if (assetSource != nullptr) {
 		m_ownedAssetSource.reset();
 		m_assetSource = assetSource;
-		return;
+	} else {
+		m_ownedAssetSource = std::make_unique<FileAudioAssetSource>();
+		m_assetSource = m_ownedAssetSource.get();
+		configureVirtualAssetSource(dynamic_cast<FileAudioAssetSource *>(m_assetSource),
+			m_ownedVirtualFileSource.get());
 	}
-	m_ownedAssetSource = std::make_unique<FileAudioAssetSource>();
-	m_assetSource = m_ownedAssetSource.get();
+	if (reopen) {
+		openDevice();
+	}
 }
 
 void XAudio2AudioManager::setService(XAudio2AudioService *service)
@@ -158,6 +244,7 @@ void XAudio2AudioManager::setService(XAudio2AudioService *service)
 	closeDevice();
 	m_ownedService.reset();
 	m_service = service;
+	m_ownsService = FALSE;
 }
 
 void XAudio2AudioManager::init()
@@ -167,6 +254,8 @@ void XAudio2AudioManager::init()
 		&& !m_audioSettings->m_audioRoot.isEmpty()) {
 		m_ownedAssetSource = std::make_unique<FileAudioAssetSource>(m_audioSettings->m_audioRoot);
 		m_assetSource = m_ownedAssetSource.get();
+		configureVirtualAssetSource(dynamic_cast<FileAudioAssetSource *>(m_assetSource),
+			m_ownedVirtualFileSource.get());
 	}
 	if (m_audioSettings != nullptr) {
 		m_num2DSamples = static_cast<UnsignedInt>(m_audioSettings->m_sampleCount2D);
@@ -206,6 +295,15 @@ void XAudio2AudioManager::update()
 	// request admission, active records, fades, and listener-driven controls.
 	if (m_service != nullptr) {
 		m_service->serviceVoices();
+		if (!m_service->isOpen() || m_service->state() == XAudio2AudioServiceState::FAILED) {
+			// A failed service closes admission and discards queued/active records
+			// in the same owner tick. Reopening is an explicit lifecycle action.
+			m_open = FALSE;
+			m_admissionOpen = FALSE;
+			removeAllAudioRequests();
+			clearPlaying();
+			return;
+		}
 		for (PlayingAudio &playing : m_playing) {
 			if (playing.voiceOpen && m_service->isVoiceFailed(playing.voice)) {
 				failPlaying(playing);
@@ -476,37 +574,35 @@ void XAudio2AudioManager::startNextPhase(PlayingAudio &playing)
 
 		playing.phaseDurationMS = 0.0f;
 		if (m_assetSource == nullptr
-			|| !m_assetSource->getDurationMS(fileName, playing.phaseDurationMS)) {
-			// Unknown assets are not fabricated.  A known catalog entry is required
-			// for native PCM, while logical metadata still remains deterministic.
-			playing.phaseDurationMS = 0.0f;
+			|| !m_assetSource->getDurationMS(fileName, playing.phaseDurationMS)
+			|| playing.phaseDurationMS <= 0.0f) {
+			// Unreadable assets are terminal failures, never fabricated zero-length
+			// phases that silently advance or loop forever.
+			failPlaying(playing);
+			return;
 		}
 		playing.phaseRemainingMS = playing.phaseDurationMS;
-		if (playing.phaseDurationMS > 0.0f) {
+		{
 			playing.assetFileName = fileName;
 			playing.assetIdentity = m_assetSource == nullptr
 				? nullptr : m_assetSource->getFileIdentity(fileName);
 			playing.phaseSubmittedFrames = 0;
 			playing.phaseCompletedFrames = 0;
 			playing.phaseTotalFrames = 0;
-			if (m_assetSource != nullptr) {
-				AudioPcmChunk probe;
-				if (m_assetSource->decodePcmAt(fileName, probe, 1, 0)
-					&& probe.sampleRate != 0) {
-					if (!durationToFrames(playing.phaseDurationMS, probe.sampleRate,
-						playing.phaseTotalFrames)) {
-						playing.phaseDurationMS = 0.0f;
-						playing.phaseRemainingMS = 0.0f;
-					}
-				}
+			playing.phaseFirstSequence = playing.voiceSequence;
+			AudioPcmChunk probe;
+			if (!m_assetSource->decodePcmAt(fileName, probe, 1, 0)
+				|| probe.sampleRate == 0
+				|| !durationToFrames(playing.phaseDurationMS, probe.sampleRate,
+					playing.phaseTotalFrames)) {
+				failPlaying(playing);
+				return;
 			}
 			if (!ensureVoice(playing) || !submitPhase(playing)) {
 				failPlaying(playing);
 			}
 			return;
 		}
-		playing.event->advanceNextPlayPortion();
-		playing.phase = playing.event->getNextPlayPortion();
 	}
 }
 
@@ -586,7 +682,8 @@ void XAudio2AudioManager::drainCompletions()
 		for (PlayingAudio &playing : m_playing) {
 			if (playing.voiceOpen && playing.voice == completion.voice
 				&& playing.generation == completion.generation
-				&& completion.sequence + 1 >= playing.voiceSequence) {
+				&& completion.sequence >= playing.phaseFirstSequence
+				&& completion.sequence < playing.voiceSequence) {
 				if (completion.endSample >= 0) {
 					playing.phaseCompletedFrames = std::min(
 						playing.phaseTotalFrames,
@@ -694,8 +791,14 @@ void XAudio2AudioManager::processFades()
 void XAudio2AudioManager::releaseVoice(PlayingAudio &playing)
 {
 	if (m_service != nullptr && playing.voiceOpen) {
-		m_service->stopVoice(playing.voice);
-		m_service->destroyVoice(playing.voice);
+		if (!m_service->stopVoice(playing.voice)) {
+			m_open = FALSE;
+			m_admissionOpen = FALSE;
+		}
+		if (!m_service->destroyVoice(playing.voice)) {
+			m_open = FALSE;
+			m_admissionOpen = FALSE;
+		}
 	}
 	playing.voiceOpen = FALSE;
 	playing.voice = {};
@@ -889,16 +992,18 @@ void XAudio2AudioManager::openDevice()
 	if (m_service == nullptr) {
 		m_ownedService = std::make_unique<XAudio2AudioService>();
 		m_service = m_ownedService.get();
+		m_ownsService = TRUE;
 	}
-	m_open = m_service->open();
+	m_open = m_service->isOpen() || m_service->open();
 	m_admissionOpen = m_open;
 }
 
 void XAudio2AudioManager::closeDevice()
 {
 	m_admissionOpen = FALSE;
+	removeAllAudioRequests();
 	clearPlaying();
-	if (m_service != nullptr) {
+	if (m_service != nullptr && m_ownsService) {
 		m_service->shutdown();
 	}
 	m_open = FALSE;

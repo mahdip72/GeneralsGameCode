@@ -81,6 +81,7 @@ class FFmpegVideoStream : public VideoStream
 		virtual void update();											///< Update bink stream
 
 		virtual Bool	isFrameReady();								///< Is the frame ready to be displayed
+		virtual Bool	isFinished() const;
 		virtual void	frameDecompress();						///< Render current frame in to buffer
 		virtual void	frameRender( VideoBuffer *buffer ); ///< Render current frame in to buffer
 		virtual void	frameNext();									///< Advance to next frame

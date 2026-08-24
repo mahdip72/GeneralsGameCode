@@ -4,11 +4,19 @@
 #include "Common/AudioRequest.h"
 #include "Common/AudioSettings.h"
 #include "Common/GameAudio.h"
+#include "Common/FileSystem.h"
 #include "Common/SubsystemInterface.h"
 
 #include <algorithm>
 
 AudioManager *TheAudio = nullptr;
+class FileSystem;
+FileSystem *TheFileSystem = nullptr;
+
+File *FileSystem::openFile(const Char *, Int, size_t, FileInstance)
+{
+	return nullptr;
+}
 class View;
 View *TheTacticalView = nullptr;
 int g_nativeAudioBaseUpdateCalls = 0;

@@ -539,7 +539,8 @@ void SinglePlayerLoadScreen::init( GameInfo *game )
 
 		Int progressUpdateCount = m_videoStream->frameCount() / FRAME_FUDGE_ADD;
 		Int shiftedPercent = -FRAME_FUDGE_ADD + 1;
-		while (m_videoStream->frameIndex() < m_videoStream->frameCount() - 1 )
+		while (m_videoStream->frameIndex() < m_videoStream->frameCount() - 1
+			&& !m_videoStream->isFinished())
 		{
 			if (GameClient::isMovieAbortRequested())
 			{
@@ -548,6 +549,10 @@ void SinglePlayerLoadScreen::init( GameInfo *game )
 
 			if(!m_videoStream->isFrameReady())
 			{
+				m_videoStream->update();
+				if (m_videoStream->isFinished()) {
+					break;
+				}
 				Sleep(1);
 				continue;
 			}
@@ -595,8 +600,14 @@ void SinglePlayerLoadScreen::init( GameInfo *game )
 #if RTS_GENERALS
 		// if we're min speced
 		m_videoStream->frameGoto(m_videoStream->frameCount()); // zero based
-		while(!m_videoStream->isFrameReady())
+		while(!m_videoStream->isFrameReady() && !m_videoStream->isFinished())
+		{
+			m_videoStream->update();
 			Sleep(1);
+		}
+		if (!m_videoStream->isFrameReady()) {
+			return;
+		}
 		m_videoStream->frameDecompress();
 		m_videoStream->frameRender(m_videoBuffer);
 		if(m_videoBuffer)
@@ -1050,7 +1061,8 @@ void ChallengeLoadScreen::init( GameInfo *game )
 
 		Int progressUpdateCount = m_videoStream->frameCount() / FRAME_FUDGE_ADD;
 		Int shiftedPercent = -FRAME_FUDGE_ADD + 1;
-		while (m_videoStream->frameIndex() < m_videoStream->frameCount() - 1 )
+		while (m_videoStream->frameIndex() < m_videoStream->frameCount() - 1
+			&& !m_videoStream->isFinished())
 		{
 			if (GameClient::isMovieAbortRequested())
 			{
@@ -1059,6 +1071,10 @@ void ChallengeLoadScreen::init( GameInfo *game )
 
 			if(!m_videoStream->isFrameReady())
 			{
+				m_videoStream->update();
+				if (m_videoStream->isFinished()) {
+					break;
+				}
 				Sleep(1);
 				continue;
 			}
@@ -1097,13 +1113,17 @@ void ChallengeLoadScreen::init( GameInfo *game )
 	{
 		// if we're min speced
 		m_videoStream->frameGoto(m_videoStream->frameCount()); // zero based
-		while(!m_videoStream->isFrameReady())
+		while(!m_videoStream->isFrameReady() && !m_videoStream->isFinished())
 		{
+			m_videoStream->update();
 			if (GameClient::isMovieAbortRequested())
 			{
 				return;
 			}
 			Sleep(1);
+		}
+		if (!m_videoStream->isFrameReady()) {
+			return;
 		}
 		m_videoStream->frameDecompress();
 		m_videoStream->frameRender(m_videoBuffer);

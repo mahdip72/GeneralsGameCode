@@ -77,7 +77,7 @@ foreach ($relativePath in $headers) {
 }
 
 $deviceCMake = Get-Content -LiteralPath (Join-Path $SourceRoot 'Core/GameEngineDevice/CMakeLists.txt') -Raw
-if ($deviceCMake -notmatch '(?ms)^if\(NOT RTS_BUILD_OPTION_FFMPEG\)\s*^    list\(APPEND GAMEENGINEDEVICE_SRC\s*^        Include/VideoDevice/Bink/BinkVideoPlayer\.h\s*^        Source/VideoDevice/Bink/BinkVideoPlayer\.cpp\s*^    \)\s*^endif\(\)') {
+if ($deviceCMake -notmatch '(?ms)^if\(CMAKE_SIZEOF_VOID_P EQUAL 4 AND NOT RTS_BUILD_OPTION_FFMPEG\)\s*^    list\(APPEND GAMEENGINEDEVICE_SRC\s*^        Include/VideoDevice/Bink/BinkVideoPlayer\.h\s*^        Source/VideoDevice/Bink/BinkVideoPlayer\.cpp\s*^    \)\s*^endif\(\)') {
     throw 'Bink source ownership is not conditional on the FFmpeg backend option.'
 }
 Assert-TokenCount $deviceCMake 'BinkVideoPlayer\.h' 1 'Bink header source ownership is ambiguous.'
@@ -103,7 +103,7 @@ Assert-ExactConditionalBlock $rootCMake '    if(NOT RTS_BUILD_OPTION_FFMPEG)' ' 
 Assert-TokenCount $rootCMake 'include\(cmake/bink\.cmake\)' 1 'Bink dependency fetch ownership is ambiguous.'
 
 $runtimeTestsCMake = Get-Content -LiteralPath (Join-Path $SourceRoot 'GeneralsMD/Code/Tools/RuntimeRegressionTests/CMakeLists.txt') -Raw
-if ($runtimeTestsCMake -notmatch '(?ms)^if\(NOT RTS_BUILD_OPTION_FFMPEG\)\s*^\s*target_link_libraries\(z_runtime_regression_tests PRIVATE binkstub\)\s*^endif\(\)') {
+if ($runtimeTestsCMake -notmatch '(?ms)^if\(CMAKE_SIZEOF_VOID_P EQUAL 4\).*?^if\(CMAKE_SIZEOF_VOID_P EQUAL 4 AND NOT RTS_BUILD_OPTION_FFMPEG\)\s*^\s*target_link_libraries\(z_runtime_regression_tests PRIVATE binkstub\)\s*^endif\(\)') {
     throw 'Zero Hour runtime regression tests link Bink outside the fallback backend.'
 }
 Assert-TokenCount $runtimeTestsCMake 'binkstub' 1 'Zero Hour runtime regression test link ownership is ambiguous.'

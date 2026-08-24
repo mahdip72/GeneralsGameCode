@@ -1854,10 +1854,14 @@ void InGameUI::update()
 			m_videoStream->frameDecompress();
 			m_videoStream->frameRender( m_videoBuffer );
 			m_videoStream->frameNext();
-			if ( m_videoStream->frameIndex() == 0 )
+			if ( m_videoStream->frameIndex() == 0 || m_videoStream->isFinished() )
 			{
 				stopMovie();
 			}
+		}
+		else if (m_videoStream->isFinished())
+		{
+			stopMovie();
 		}
 	}
 

@@ -96,11 +96,11 @@ add_subdirectory(resources)
 add_subdirectory(Core)
 
 # Add main build targets
-if(RTS_BUILD_ZEROHOUR)
+if(RTS_BUILD_PRODUCT AND RTS_BUILD_ZEROHOUR)
     add_subdirectory(GeneralsMD)
 endif()
 
-if(RTS_BUILD_GENERALS)
+if(RTS_BUILD_PRODUCT AND RTS_BUILD_GENERALS)
     add_subdirectory(Generals)
 endif()
 

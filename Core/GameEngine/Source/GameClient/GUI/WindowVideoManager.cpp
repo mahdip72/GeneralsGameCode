@@ -244,6 +244,14 @@ void WindowVideoManager::update()
 					else if (winVid->getPlayType() == WINDOW_PLAY_MOVIE_SHOW_LAST_FRAME)
 						pauseMovie(win);
 				}
+				else if (videoStream->isFinished())
+				{
+					stopMovie(win);
+				}
+			}
+			else if (videoStream->isFinished())
+			{
+				stopMovie(win);
 			}
 		}
 

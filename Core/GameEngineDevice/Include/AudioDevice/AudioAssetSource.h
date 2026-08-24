@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <list>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -89,12 +90,19 @@ public:
 		entry.hasDuration = TRUE;
 	}
 
-	void setPcm(const AsciiString &fileName, const AudioPcmChunk &source,
+	Bool setPcm(const AsciiString &fileName, const AudioPcmChunk &source,
 		Real durationMS = -1.0f)
 	{
+		if (source.sampleRate != DEFAULT_SAMPLE_RATE
+			|| source.channels != DEFAULT_CHANNELS
+			|| source.format != AudioPcmFormat::SIGNED_16_INTERLEAVED_LITTLE_ENDIAN
+			|| source.frameCount == 0
+			|| source.frameCount > (std::numeric_limits<std::size_t>::max)() / BYTES_PER_FRAME
+			|| source.data.size() != static_cast<std::size_t>(source.frameCount) * BYTES_PER_FRAME) {
+			return FALSE;
+		}
 		Entry &entry = findOrCreate(fileName);
 		entry.pcm = source;
-		entry.pcm.format = AudioPcmFormat::SIGNED_16_INTERLEAVED_LITTLE_ENDIAN;
 		entry.hasPcm = TRUE;
 		if (durationMS >= 0.0f) {
 			entry.durationMS = durationMS;
@@ -104,6 +112,7 @@ public:
 				/ static_cast<Real>(source.sampleRate);
 			entry.hasDuration = TRUE;
 		}
+		return TRUE;
 	}
 
 	Bool getDurationMS(const AsciiString &fileName, Real &durationMS) const override
@@ -241,6 +250,17 @@ private:
 	std::list<Entry> m_entries;
 };
 
+// Optional engine-file adapter.  A production implementation can read loose
+// files and BIG/archive entries through the engine FileSystem without making
+// the device-free catalog depend on the legacy filesystem ABI.
+class AudioVirtualFileSource
+{
+public:
+	virtual ~AudioVirtualFileSource() = default;
+	virtual Bool readFile(const AsciiString &fileName, std::vector<std::uint8_t> &bytes,
+		std::string &identity) const = 0;
+};
+
 // The production-neutral adapter resolves an asset to the current game
 // directory (or an optional root) and returns bounded 48 kHz stereo s16 PCM.
 // When the FFmpeg backend is configured it accepts every audio container that
@@ -251,6 +271,7 @@ class FileAudioAssetSource final : public AudioAssetSource
 public:
 	FileAudioAssetSource();
 	explicit FileAudioAssetSource(const AsciiString &rootDirectory);
+	FileAudioAssetSource(const AsciiString &rootDirectory, AudioVirtualFileSource *virtualSource);
 	~FileAudioAssetSource() override = default;
 
 	Bool getDurationMS(const AsciiString &fileName, Real &durationMS) const override;
@@ -259,13 +280,20 @@ public:
 	Bool decodePcmAt(const AsciiString &fileName, AudioPcmChunk &chunk,
 		UnsignedInt maxFrames, UnsignedInt startFrame) const override;
 	const void *getFileIdentity(const AsciiString &fileName) const override;
+	void setVirtualFileSource(AudioVirtualFileSource *virtualSource)
+	{
+		m_virtualSource = virtualSource;
+	}
 
 	Bool getEventDurationMS(const AsciiString &attackFile, const AsciiString &mainFile,
 		const AsciiString &decayFile, Real &durationMS) const;
 
 private:
 	std::string resolvePath(const AsciiString &fileName) const;
+	Bool readVirtualFile(const AsciiString &fileName, std::vector<std::uint8_t> &bytes,
+		std::string &identity) const;
 
 	std::string m_rootDirectory;
+	AudioVirtualFileSource *m_virtualSource = nullptr;
 	mutable std::list<std::string> m_identityPaths;
 };

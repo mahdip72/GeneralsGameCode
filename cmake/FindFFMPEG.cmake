@@ -61,9 +61,24 @@ find_package_handle_standard_args(FFMPEG
 )
 
 if(FFMPEG_FOUND)
-    set(FFMPEG_INCLUDE_DIRS "${FFMPEG_INCLUDE_DIR}")
-    set(FFMPEG_LIBRARIES)
-    set(FFMPEG_LIBRARY_DIRS)
+	# Do not let a library bundle built for the other pointer width enter the
+	# native graph.  The conventional SDK names are the only portable marker
+	# available before link time; the focused configure probes also exercise this
+	# guard with x86/x64 fixture roots.
+	foreach(_FFMPEG_ROOT_HINT IN LISTS _FFMPEG_ROOT_HINTS)
+		string(TOLOWER "${_FFMPEG_ROOT_HINT}" _FFMPEG_ROOT_HINT_LOWER)
+		if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND _FFMPEG_ROOT_HINT_LOWER MATCHES "(x86|win32|i[3-6]86)")
+			message(FATAL_ERROR "The x64 build cannot consume an x86 FFmpeg SDK: ${_FFMPEG_ROOT_HINT}")
+		endif()
+		if(CMAKE_SIZEOF_VOID_P EQUAL 4 AND _FFMPEG_ROOT_HINT_LOWER MATCHES "(x64|amd64|win64)")
+			message(FATAL_ERROR "The x86 build cannot consume an x64 FFmpeg SDK: ${_FFMPEG_ROOT_HINT}")
+		endif()
+	endforeach()
+
+	set(FFMPEG_INCLUDE_DIRS "${FFMPEG_INCLUDE_DIR}")
+	set(FFMPEG_LIBRARIES)
+	set(FFMPEG_LIBRARY_DIRS)
+	set(RTS_FFMPEG_RUNTIME_DLLS)
 
     if(WIN32 AND NOT FFMPEG_RUNTIME_DIR)
         get_filename_component(_FFMPEG_FIRST_LIBRARY_DIR "${FFMPEG_AVCODEC_LIBRARY}" DIRECTORY)
@@ -90,15 +105,19 @@ if(FFMPEG_FOUND)
                     INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_INCLUDE_DIR}"
                 )
 
-                if(FFMPEG_RUNTIME_DIR)
+				if(FFMPEG_RUNTIME_DIR)
                     file(GLOB _FFMPEG_RUNTIME_LIBRARY LIST_DIRECTORIES FALSE
                         "${FFMPEG_RUNTIME_DIR}/${_FFMPEG_COMPONENT}-*.dll")
                     list(LENGTH _FFMPEG_RUNTIME_LIBRARY _FFMPEG_RUNTIME_LIBRARY_COUNT)
-                    if(_FFMPEG_RUNTIME_LIBRARY_COUNT EQUAL 1)
-                        list(GET _FFMPEG_RUNTIME_LIBRARY 0 _FFMPEG_RUNTIME_LIBRARY_PATH)
-                        set_property(TARGET FFMPEG::${_FFMPEG_COMPONENT} PROPERTY
-                            IMPORTED_LOCATION "${_FFMPEG_RUNTIME_LIBRARY_PATH}")
-                    endif()
+					if(_FFMPEG_RUNTIME_LIBRARY_COUNT EQUAL 1)
+						list(GET _FFMPEG_RUNTIME_LIBRARY 0 _FFMPEG_RUNTIME_LIBRARY_PATH)
+						set_property(TARGET FFMPEG::${_FFMPEG_COMPONENT} PROPERTY
+							IMPORTED_LOCATION "${_FFMPEG_RUNTIME_LIBRARY_PATH}")
+						list(APPEND RTS_FFMPEG_RUNTIME_DLLS "${_FFMPEG_RUNTIME_LIBRARY_PATH}")
+					else()
+						message(FATAL_ERROR
+							"FFmpeg runtime directory must contain exactly one ${_FFMPEG_COMPONENT}-*.dll: ${FFMPEG_RUNTIME_DIR}")
+					endif()
                 endif()
             else()
                 add_library(FFMPEG::${_FFMPEG_COMPONENT} UNKNOWN IMPORTED)
@@ -110,7 +129,10 @@ if(FFMPEG_FOUND)
         endif()
     endforeach()
 
-    list(REMOVE_DUPLICATES FFMPEG_LIBRARY_DIRS)
+	list(REMOVE_DUPLICATES FFMPEG_LIBRARY_DIRS)
+	list(REMOVE_DUPLICATES RTS_FFMPEG_RUNTIME_DLLS)
+	set(RTS_FFMPEG_RUNTIME_DLLS "${RTS_FFMPEG_RUNTIME_DLLS}" CACHE INTERNAL
+		"Exact FFmpeg runtime DLLs selected for installation")
 endif()
 
 mark_as_advanced(
@@ -132,6 +154,8 @@ unset(_FFMPEG_LIBRARY_DIR)
 unset(_FFMPEG_FIRST_LIBRARY_DIR)
 unset(_FFMPEG_REQUIRED_VARIABLES)
 unset(_FFMPEG_ROOT_HINTS)
+unset(_FFMPEG_ROOT_HINT)
+unset(_FFMPEG_ROOT_HINT_LOWER)
 unset(_FFMPEG_RUNTIME_LIBRARY)
 unset(_FFMPEG_RUNTIME_LIBRARY_COUNT)
 unset(_FFMPEG_RUNTIME_LIBRARY_PATH)

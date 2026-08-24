@@ -162,6 +162,9 @@ class VideoStreamInterface
 		virtual void close() = 0;										///< Close and free stream
 
 		virtual Bool	isFrameReady() = 0;						///< Is the frame ready to be displayed
+		// Legacy backends have no separate audio-drain state. Native FFmpeg
+		// streams override this to expose ENDED/FAILED to host loops.
+		virtual Bool	isFinished() const { return FALSE; }
 		virtual void	frameDecompress() = 0;				///< Render current frame in to buffer
 		virtual void	frameRender( VideoBuffer *buffer ) = 0; ///< Render current frame in to buffer
 		virtual void	frameNext() = 0;							///< Advance to next frame

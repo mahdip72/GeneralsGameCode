@@ -36,6 +36,7 @@ public:
 	HRESULT startResult = S_OK;
 	HRESULT stopResult = S_OK;
 	HRESULT flushResult = S_OK;
+	HRESULT destroyResult = S_OK;
 	HRESULT criticalError = S_OK;
 	int createCalls = 0;
 	int submitCalls = 0;
@@ -98,6 +99,13 @@ public:
 		++destroyCalls;
 		callLog.emplace_back("destroy");
 		callback = nullptr;
+	}
+	HRESULT destroyWithResult() noexcept override
+	{
+		++destroyCalls;
+		callLog.emplace_back("destroy-result");
+		callback = nullptr;
+		return destroyResult;
 	}
 
 	void complete(std::size_t index)
@@ -398,6 +406,15 @@ void testTerminalFailures()
 		check(backend.submitCalls == 0, "critical engine error prevents submission");
 		voice.close();
 	}
+	{
+		FakePcmVoiceBackend backend;
+		backend.destroyResult = E_FAIL;
+		XAudio2PcmVoice voice(backend);
+		check(voice.open(), "destroy failure voice opens");
+		voice.close();
+		check(voice.getLastError() == E_FAIL,
+			"close preserves the first actionable backend destroy failure");
+	}
 }
 
 void testSameGenerationResetBarrier()
@@ -456,6 +473,32 @@ void testReopenAndRepeatedCleanup()
 	voice.close();
 	check(backend.destroyCalls == 2, "reopen has one additional destroy");
 }
+
+void testStaleCallbackTokenIsIgnoredAfterSlotReuse()
+{
+	FakePcmVoiceBackend backend;
+	XAudio2PcmVoice voice(backend);
+	check(voice.open(), "stale callback voice opens");
+	check(voice.submit(makeChunk(0, 0, 50)) == AudioPcmSubmitResult::ACCEPTED,
+		"stale callback first buffer is admitted");
+	voice.service();
+	void *oldContext = backend.submissions.front().context;
+	backend.complete(0);
+	XAudio2PcmCompletionRecord completion;
+	check(voice.tryPopCompletion(completion) && completion.sequence == 0,
+		"stale callback first completion is observed once");
+	voice.service();
+	check(voice.submit(makeChunk(0, 1, 51)) == AudioPcmSubmitResult::ACCEPTED,
+		"stale callback slot is reused only by the owner");
+	voice.service();
+	voice.OnBufferEnd(oldContext);
+	check(!voice.tryPopCompletion(completion),
+		"a callback token from a reclaimed submission cannot complete its replacement");
+	backend.complete(1);
+	check(voice.tryPopCompletion(completion) && completion.sequence == 1,
+		"the replacement submission still publishes its own completion");
+	voice.close();
+}
 }
 
 int main()
@@ -468,6 +511,7 @@ int main()
 	testSameGenerationResetBarrier();
 	testTerminalFailures();
 	testReopenAndRepeatedCleanup();
+	testStaleCallbackTokenIsIgnoredAfterSlotReuse();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "%d XAudio2PcmVoice checks failed\n", g_failures);
 		return 1;

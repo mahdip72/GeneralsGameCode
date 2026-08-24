@@ -79,6 +79,7 @@ class BinkVideoStream : public VideoStream
 		virtual void update() override;											///< Update bink stream
 
 		virtual Bool	isFrameReady() override;								///< Is the frame ready to be displayed
+		virtual Bool	isFinished() const override;
 		virtual void	frameDecompress() override;						///< Render current frame in to buffer
 		virtual void	frameRender( VideoBuffer *buffer ) override; ///< Render current frame in to buffer
 		virtual void	frameNext() override;									///< Advance to next frame

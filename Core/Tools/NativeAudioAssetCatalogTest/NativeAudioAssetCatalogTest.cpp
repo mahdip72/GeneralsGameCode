@@ -5,10 +5,35 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <utility>
 
 namespace
 {
 void check(bool condition, const char *message = "catalog assertion failed");
+
+class MemoryVirtualAudioSource final : public AudioVirtualFileSource
+{
+public:
+	MemoryVirtualAudioSource(std::string name, std::vector<std::uint8_t> bytes) :
+		m_name(std::move(name)), m_bytes(std::move(bytes))
+	{
+	}
+
+	Bool readFile(const AsciiString &fileName, std::vector<std::uint8_t> &bytes,
+		std::string &identity) const override
+	{
+		if (fileName.str() == nullptr || std::string(fileName.str()) != m_name) {
+			return FALSE;
+		}
+		bytes = m_bytes;
+		identity = "archive:" + m_name;
+		return TRUE;
+	}
+
+private:
+	std::string m_name;
+	std::vector<std::uint8_t> m_bytes;
+};
 
 void writeWaveFile(const std::filesystem::path &path, UnsignedInt durationMS,
 	UnsignedInt sampleRate = 48000, UnsignedShort channels = 2)
@@ -46,6 +71,19 @@ void writeWaveFile(const std::filesystem::path &path, UnsignedInt durationMS,
 		}
 	}
 	check(output.good(), "real fixture is fully written");
+}
+
+std::vector<std::uint8_t> readBinaryFile(const std::filesystem::path &path)
+{
+	std::ifstream input(path, std::ios::binary | std::ios::ate);
+	check(input.good(), "binary fixture opens for reading");
+	const std::streamsize size = input.tellg();
+	check(size > 0, "binary fixture has content");
+	input.seekg(0, std::ios::beg);
+	std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
+	input.read(reinterpret_cast<char *>(bytes.data()), size);
+	check(input.good(), "binary fixture is fully read");
+	return bytes;
 }
 }
 
@@ -117,14 +155,22 @@ int main()
 	source.channels = 1;
 	source.frameCount = 8;
 	source.data.assign(8U * 2U, 0x7fU);
-	catalog.setPcm(AsciiString("voice.wav"), source, 12.0f);
+	check(!catalog.setPcm(AsciiString("voice.wav"), source, 12.0f),
+		"catalog rejects non-shipping PCM instead of rewriting its format");
+	source.sampleRate = AudioAssetCatalog::DEFAULT_SAMPLE_RATE;
+	source.channels = AudioAssetCatalog::DEFAULT_CHANNELS;
+	source.frameCount = 8;
+	source.data.assign(8U * AudioAssetCatalog::BYTES_PER_FRAME, 0x7fU);
+	source.format = AudioPcmFormat::SIGNED_16_INTERLEAVED_LITTLE_ENDIAN;
+	check(catalog.setPcm(AsciiString("voice.wav"), source, 12.0f),
+		"catalog accepts the bounded shipping PCM format");
 	check(catalog.decodePcm(AsciiString("voice.wav"), pcm, 3));
-	check(pcm.sampleRate == 22050);
-	check(pcm.channels == 1);
+	check(pcm.sampleRate == AudioAssetCatalog::DEFAULT_SAMPLE_RATE);
+	check(pcm.channels == AudioAssetCatalog::DEFAULT_CHANNELS);
 	check(pcm.frameCount == 3);
-	check(pcm.data.size() == 3U * 2U);
+	check(pcm.data.size() == 3U * AudioAssetCatalog::BYTES_PER_FRAME);
 	check(pcm.data[0] == 0x7fU);
-	check(pcm.data[5] == 0x7fU);
+	check(pcm.data[7] == 0x7fU);
 
 	const std::filesystem::path root = std::filesystem::temp_directory_path()
 		/ "rts-native-audio-real-source";
@@ -135,6 +181,35 @@ int main()
 	writeWaveFile(attackPath, 125U);
 	writeWaveFile(mainPath, 350U);
 	writeWaveFile(decayPath, 75U);
+	FileAudioAssetSource rootedSource(AsciiString((root / "Audio").string().c_str()));
+	std::filesystem::create_directories(root / "Audio");
+	writeWaveFile(root / "Audio" / "generated_attack.wav", 125U);
+	check(rootedSource.getDurationMS(
+		AsciiString("Audio\\generated_attack.wav"), duration)
+		&& duration == 125.0f,
+		"generated Audio root is not duplicated when resolving a virtual asset name");
+	const std::filesystem::path virtualPath = root / "virtual_main.wav";
+	writeWaveFile(virtualPath, 350U);
+	std::ifstream virtualInput(virtualPath, std::ios::binary | std::ios::ate);
+	check(virtualInput.good(), "archive fixture opens for reading");
+	const std::streamsize virtualSize = virtualInput.tellg();
+	virtualInput.seekg(0, std::ios::beg);
+	std::vector<std::uint8_t> virtualBytes(static_cast<std::size_t>(virtualSize));
+	virtualInput.read(reinterpret_cast<char *>(virtualBytes.data()), virtualSize);
+	check(virtualInput.good(), "archive fixture is fully read");
+	virtualInput.close();
+	MemoryVirtualAudioSource archiveSource("archive\\virtual_main.wav", std::move(virtualBytes));
+	FileAudioAssetSource archiveAwareSource(AsciiString(root.string().c_str()), &archiveSource);
+	check(archiveAwareSource.getDurationMS(AsciiString("archive\\virtual_main.wav"), duration)
+		&& duration == 350.0f,
+		"archive-backed audio is resolved when no loose file exists");
+	AudioPcmChunk archiveChunk;
+	check(archiveAwareSource.decodePcmAt(AsciiString("archive\\virtual_main.wav"),
+		archiveChunk, 3U, 7U)
+		&& archiveChunk.frameCount == 3U && archiveChunk.startSample == 7,
+		"archive-backed audio decodes a bounded continuation");
+	check(archiveAwareSource.getFileIdentity(AsciiString("archive\\virtual_main.wav")) != nullptr,
+		"archive-backed audio exposes source-owned identity");
 	FileAudioAssetSource realSource;
 	check(realSource.getDurationMS(AsciiString(attackPath.string().c_str()), duration)
 		&& duration == 125.0f, "filesystem source reports exact Generals attack duration");
@@ -182,6 +257,23 @@ int main()
 		"filesystem source safely rejects corrupt assets");
 
 #if defined(RTS_NATIVE_AUDIO_HAS_FFMPEG)
+	const std::filesystem::path adpcmPath = root / "adpcm.wav";
+	const std::string adpcmCommand = "ffmpeg -y -v error -i \""
+		+ mainPath.string() + "\" -c:a adpcm_ima_wav \"" + adpcmPath.string() + "\"";
+	check(std::system(adpcmCommand.c_str()) == 0,
+		"FFmpeg creates a deterministic IMA ADPCM fixture");
+	MemoryVirtualAudioSource adpcmArchive("archive\\adpcm.wav", readBinaryFile(adpcmPath));
+	FileAudioAssetSource adpcmSource(AsciiString(root.string().c_str()), &adpcmArchive);
+	check(adpcmSource.getDurationMS(AsciiString("archive\\adpcm.wav"), duration)
+		&& duration == 350.0f, "archive ADPCM duration remains exact");
+	AudioPcmChunk adpcmChunk;
+	check(adpcmSource.decodePcmAt(AsciiString("archive\\adpcm.wav"), adpcmChunk, 3U, 7U),
+		"archive ADPCM decodes through the audio-only FFmpeg provider path");
+	check(adpcmChunk.sampleRate == 48000U && adpcmChunk.channels == 2U
+		&& adpcmChunk.frameCount == 3U && adpcmChunk.startSample == 7
+		&& adpcmChunk.data.size() == 3U * 2U * sizeof(Short),
+		"archive ADPCM PCM remains bounded 48 kHz stereo s16");
+
 	const std::filesystem::path genericPath = root / "main.aiff";
 	const std::string ffmpegCommand = "ffmpeg -y -v error -i \""
 		+ mainPath.string() + "\" -c:a pcm_s16le \"" + genericPath.string() + "\"";

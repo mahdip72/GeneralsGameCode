@@ -1,8 +1,5 @@
 add_library(core_native_audio_manager_contract_compile OBJECT
     NativeAudioManagerContractTest.cpp
-    ${CMAKE_SOURCE_DIR}/Core/GameEngineDevice/Source/AudioDevice/NullAudioManager.cpp
-    ${CMAKE_SOURCE_DIR}/Core/GameEngineDevice/Source/XAudio2AudioDevice/AudioManagerFactory.cpp
-    ${CMAKE_SOURCE_DIR}/Core/GameEngineDevice/Source/XAudio2AudioDevice/XAudio2AudioManager.cpp
 )
 
 target_include_directories(core_native_audio_manager_contract_compile PRIVATE
@@ -26,10 +23,6 @@ target_compile_definitions(core_native_audio_manager_contract_compile PRIVATE
 add_executable(core_native_audio_manager_contract_test
 	NativeAudioManagerContractTest.cpp
 	NativeAudioManagerRuntimeSupport.cpp
-	${CMAKE_SOURCE_DIR}/Core/GameEngineDevice/Source/XAudio2AudioDevice/XAudio2AudioManager.cpp
-	${CMAKE_SOURCE_DIR}/Core/GameEngineDevice/Source/AudioDevice/NullAudioManager.cpp
-	${CMAKE_SOURCE_DIR}/Core/GameEngineDevice/Source/XAudio2AudioDevice/AudioManagerFactory.cpp
-	${CMAKE_SOURCE_DIR}/Core/GameEngineDevice/Source/AudioDevice/AudioChannelPolicy.cpp
 	${CMAKE_SOURCE_DIR}/Core/Tools/NativeAudioAssetCatalogTest/NativeAudioAssetCatalogRuntimeSupport.cpp
 )
 
@@ -53,6 +46,7 @@ target_compile_options(core_native_audio_manager_contract_test PRIVATE
 )
 
 target_link_libraries(core_native_audio_manager_contract_test PRIVATE
+	rts_native_audio_manager
 	rts_xaudio2_audio_service
     rts_native_audio_asset_source
 )

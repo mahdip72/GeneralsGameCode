@@ -37,6 +37,16 @@ public:
 	// instead of asking the decoder to retry consumed input; FAILED is terminal.
 	virtual AudioPcmSubmitResult submit(AudioPcmChunk &&chunk) = 0;
 	virtual void reset(std::uint64_t generation) = 0;
+	// Owner-side teardown hook.  The default keeps device-free sinks source
+	// compatible; native sinks use it to quiesce producer/voice state.
+	virtual void close() noexcept {}
+	// End-of-stream is separate from reset/close: accepted PCM may still be
+	// queued in a hardware sink after the decoder reaches EOF.
+	virtual void endOfStream() noexcept {}
+	virtual bool isDrained() const noexcept { return true; }
+	// Owner-side service point for sinks whose completion state is callback
+	// driven. Device-free sinks have nothing to service.
+	virtual bool serviceSink() noexcept { return true; }
 	// Optional owner-provided playback position for audio-master video timing.
 	// Sinks without a hardware/playback clock use the injected monotonic fallback.
 	virtual bool getPlayedSample(std::int64_t &sample) const noexcept

@@ -133,7 +133,7 @@ private:
     bool m_closed = false;
 };
 
-class RecordingSink final : public AudioPcmSink
+class RecordingSink : public AudioPcmSink
 {
 public:
     AudioPcmSubmitResult submit(AudioPcmChunk &&chunk) override
@@ -158,12 +158,28 @@ public:
         return AudioPcmSubmitResult::ACCEPTED;
     }
 
-    void reset(std::uint64_t generation) override
-    {
-        currentGeneration = generation;
+	void reset(std::uint64_t generation) override
+	{
+		currentGeneration = generation;
         ++resetCalls;
-        events.push_back("reset:" + std::to_string(generation));
-    }
+		 events.push_back("reset:" + std::to_string(generation));
+	}
+
+	void endOfStream() noexcept override
+	{
+		++endOfStreamCalls;
+	}
+
+	bool isDrained() const noexcept override
+	{
+		return !holdDrain || drainReleased;
+	}
+
+	bool serviceSink() noexcept override
+	{
+		++serviceCalls;
+		return true;
+	}
 
     bool getPlayedSample(std::int64_t &sample) const noexcept override
     {
@@ -181,13 +197,17 @@ public:
     std::vector<AudioPcmChunk> rejected;
     std::vector<std::string> events;
     std::int64_t playedSample = -1;
-    std::size_t submitCalls = 0;
-    std::size_t resetCalls = 0;
+	std::size_t submitCalls = 0;
+	std::size_t resetCalls = 0;
+	std::size_t endOfStreamCalls = 0;
+	std::size_t serviceCalls = 0;
     bool dropNext = false;
     bool dropAll = false;
     bool failNext = false;
-    bool rejectStale = true;
-    bool clockEnabled = false;
+	bool rejectStale = true;
+	bool clockEnabled = false;
+	bool holdDrain = false;
+	bool drainReleased = false;
 };
 
 class ManualClock
@@ -274,9 +294,9 @@ static bool testIntegratedAudioVideoAndDrain(const char *audioPath)
     if (!runToEnd(audioPath, run, options)) {
         return false;
     }
-    if (run.video.frames.size() != 12 || run.sink.accepted.empty() || run.totalSamples != 19200
-        || run.drainCalls != 1 || run.resetCount != 1) {
-        return false;
+	if (run.video.frames.size() != 12 || run.sink.accepted.empty() || run.totalSamples != 26400
+		|| run.drainCalls != 1 || run.resetCount != 1) {
+		return false;
     }
     if (run.sink.accepted.front().sampleRate != 48000 || run.sink.accepted.front().channels != 2
         || run.sink.accepted.front().format != AudioPcmFormat::SIGNED_16_INTERLEAVED_LITTLE_ENDIAN) {
@@ -304,7 +324,49 @@ static bool testIntegratedAudioVideoAndDrain(const char *audioPath)
             return false;
         }
     }
-    return true;
+	return true;
+}
+
+static bool testAcceptedAudioWaitsForSinkDrain(const char *audioPath)
+{
+	MemoryTestFile input(audioPath);
+	FFmpegFile file;
+	if (!openFile(audioPath, input, file)) {
+		return false;
+	}
+	RecordingSink sink;
+	sink.holdDrain = true;
+	VideoTrace trace;
+	FFmpegMoviePlaybackOptions options;
+	options.mode = FFmpegMoviePlaybackMode::SHOW_LAST_FRAME;
+	FFmpegMoviePlayback playback(file, &sink, options);
+	playback.setVideoCallback(captureVideo, &trace);
+	for (std::size_t i = 0; i < 256 && playback.state() != FFmpegMoviePlaybackState::DRAINING;
+		++i) {
+		if (!playback.pump(32)) {
+			return false;
+		}
+	}
+	if (playback.state() != FFmpegMoviePlaybackState::DRAINING
+		|| trace.frames.size() != 12 || !playback.hasCurrentFrame()
+		|| sink.endOfStreamCalls != 1 || sink.accepted.empty()) {
+		return false;
+	}
+	for (std::size_t i = 0; i < 3; ++i) {
+		if (!playback.pump(1) || playback.state() != FFmpegMoviePlaybackState::DRAINING) {
+			return false;
+		}
+	}
+	sink.drainReleased = true;
+	if (!playback.pump(1) || playback.state() != FFmpegMoviePlaybackState::ENDED
+		|| !playback.hasCurrentFrame() || sink.endOfStreamCalls != 1) {
+		return false;
+	}
+	std::int64_t acceptedFrames = 0;
+	for (const AudioPcmChunk &chunk : sink.accepted) {
+		acceptedFrames += chunk.frameCount;
+	}
+	return acceptedFrames > 19200 && sink.serviceCalls >= 4;
 }
 
 static bool testCallbackDetachesBeforeFileReuse(const char *audioPath)
@@ -395,7 +457,51 @@ static bool testDropsAndBoundedCompletion(const char *audioPath)
         || permanent.sink.submitCalls != permanent.sink.dropped.size()) {
         return false;
     }
-    return true;
+	return true;
+}
+
+static bool testTerminalResetOwnership(const char *audioPath)
+{
+	RecordingSink normalSink;
+	{
+		MemoryTestFile input(audioPath);
+		FFmpegFile file;
+		if (!openFile(audioPath, input, file)) {
+			return false;
+		}
+		FFmpegMoviePlaybackOptions options;
+		options.mode = FFmpegMoviePlaybackMode::ONCE;
+		FFmpegMoviePlayback playback(file, &normalSink, options);
+		for (std::size_t i = 0; i < 256 && !playback.isTerminal(); ++i) {
+			playback.pump(32);
+		}
+		if (playback.state() != FFmpegMoviePlaybackState::ENDED || normalSink.resetCalls != 1) {
+			return false;
+		}
+	}
+	if (normalSink.resetCalls != 1) {
+		return false;
+	}
+
+	RecordingSink failedSink;
+	{
+		MemoryTestFile input(audioPath);
+		FFmpegFile file;
+		if (!openFile(audioPath, input, file)) {
+			return false;
+		}
+		failedSink.failNext = true;
+		FFmpegMoviePlaybackOptions options;
+		options.mode = FFmpegMoviePlaybackMode::LOOP;
+		FFmpegMoviePlayback playback(file, &failedSink, options);
+		for (std::size_t i = 0; i < 256 && !playback.isTerminal(); ++i) {
+			playback.pump(32);
+		}
+		if (playback.state() != FFmpegMoviePlaybackState::FAILED || failedSink.resetCalls != 2) {
+			return false;
+		}
+	}
+	return failedSink.resetCalls == 2;
 }
 
 static bool testGainAndMute(const char *audioPath)
@@ -788,6 +894,8 @@ int main(int argc, char **argv)
     struct TestCase { const char *name; bool (*run)(const char *, const char *); };
     const TestCase tests[] = {
         { "integrated audio/video and drain", [](const char *audio, const char *) { return testIntegratedAudioVideoAndDrain(audio); } },
+        { "accepted audio waits for sink drain", [](const char *audio, const char *) { return testAcceptedAudioWaitsForSinkDrain(audio); } },
+        { "terminal reset ownership", [](const char *audio, const char *) { return testTerminalResetOwnership(audio); } },
         { "callback detaches before file reuse", [](const char *audio, const char *) { return testCallbackDetachesBeforeFileReuse(audio); } },
         { "silent video fallback", [](const char *, const char *video) { return testSilentVideoFallback(video); } },
         { "disabled audio fallback", [](const char *audio, const char *) { return testDisabledAudio(audio); } },

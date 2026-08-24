@@ -153,6 +153,7 @@ private:
 	std::vector<FFmpegStream> 	m_streams; ///< List of streams in the file
 	FFmpegFileSource 			*m_source = nullptr;	///< Active neutral byte source
 	std::unique_ptr<FFmpegFileSource> m_ownedSource;
+	Bool 						m_ownsSource = FALSE;
 	void 						*m_userData = nullptr; ///< User data for the callback
 	Int 						m_receiveStreamIndex = -1; ///< Decoder with frames still pending
 	size_t 					m_drainStreamIndex = 0; ///< Decoder currently being flushed at EOF

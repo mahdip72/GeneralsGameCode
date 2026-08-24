@@ -120,6 +120,7 @@ private:
 		PortionToPlay phase = PP_Done;
 		UnsignedInt generation = 0;
 		std::uint64_t voiceSequence = 0;
+		std::uint64_t phaseFirstSequence = 0;
 		Real phaseRemainingMS = 0.0f;
 		Real phaseDurationMS = 0.0f;
 		Real volume = 1.0f;
@@ -167,7 +168,9 @@ private:
 
 	std::unique_ptr<XAudio2AudioService> m_ownedService;
 	std::unique_ptr<AudioAssetSource> m_ownedAssetSource;
+	std::unique_ptr<AudioVirtualFileSource> m_ownedVirtualFileSource;
 	XAudio2AudioService *m_service;
+	Bool m_ownsService;
 	AudioAssetSource *m_assetSource;
 	std::vector<PlayingAudio> m_playing;
 	std::vector<AudioHandle> m_forcePlayHandles;

@@ -348,9 +348,14 @@ FFmpegVideoStream::FFmpegVideoStream(FFmpegFile* file, AudioPcmSink *audioSink)
 	m_playback->setVideoCallback(
 		static_cast<void (*)(const AVFrame *, const FFmpegFrameMetadata &, void *)>(&FFmpegVideoStream::onFrame), this);
 
-	// Decode until we have our first video frame
-	while (m_good && m_gotFrame == false)
+	// Decode until we have our first video frame, but keep open-time work
+	// bounded just like frameNext/frameGoto and the destructor finish path.
+	for (std::size_t attempts = 0; attempts < 256 && m_good && !m_gotFrame; ++attempts) {
 		m_good = m_playback->pump(64);
+	}
+	if (m_good && !m_gotFrame) {
+		m_good = false;
+	}
 
 	m_startTime = getMonotonicMilliseconds();
 }
@@ -361,15 +366,18 @@ FFmpegVideoStream::FFmpegVideoStream(FFmpegFile* file, AudioPcmSink *audioSink)
 
 FFmpegVideoStream::~FFmpegVideoStream()
 {
+	if (m_playback != nullptr && !m_playback->isTerminal()) {
+		// Drain decoder/resampler tail while the sink is still alive.  This is
+		// bounded and owner-side; callbacks never close the native voice.
+		m_playback->finish(256);
+	}
 	av_frame_free(&m_frame);
 	sws_freeContext(m_swsContext);
-	if (m_audioSink != nullptr) {
-		m_audioSink->reset(m_playback != nullptr ? m_playback->generation() : 0);
-#if defined(_WIN64)
-		static_cast<XAudio2MoviePcmSink *>(m_audioSink)->close();
-#endif
-	}
 	delete m_playback;
+	m_playback = nullptr;
+	if (m_audioSink != nullptr) {
+		m_audioSink->close();
+	}
 	delete m_audioSink;
 	delete m_ffmpegFile;
 }
@@ -394,12 +402,30 @@ void FFmpegVideoStream::onFrame(const AVFrame *frame, const FFmpegFrameMetadata 
 
 void FFmpegVideoStream::update()
 {
-	if (!m_good || m_playback == nullptr || m_playback->isTerminal()) {
+	if (!m_good || m_playback == nullptr) {
+		return;
+	}
+	if (m_playback->state() == FFmpegMoviePlaybackState::ENDED) {
+		m_gotFrame = m_playback->hasCurrentFrame();
+		return;
+	}
+	if (m_playback->state() == FFmpegMoviePlaybackState::FAILED) {
+		m_good = false;
+		m_gotFrame = false;
 		return;
 	}
 	if (!m_playback->pump(32) && !m_playback->isTerminal()) {
 		m_good = false;
 	}
+	if (m_playback->state() == FFmpegMoviePlaybackState::FAILED) {
+		m_good = false;
+		m_gotFrame = false;
+	}
+}
+
+Bool FFmpegVideoStream::isFinished() const
+{
+	return !m_good || m_playback == nullptr || m_playback->isTerminal();
 }
 
 //============================================================================
@@ -506,7 +532,11 @@ void FFmpegVideoStream::frameNext()
 		return;
 	}
 	if (m_playback->isTerminal()) {
-		m_gotFrame = m_playback->hasCurrentFrame();
+		m_gotFrame = m_playback->state() == FFmpegMoviePlaybackState::ENDED
+			&& m_playback->hasCurrentFrame();
+		if (m_playback->state() == FFmpegMoviePlaybackState::FAILED) {
+			m_good = false;
+		}
 		return;
 	}
 	const Int previousFrame = m_playback->frameIndex();
@@ -524,7 +554,11 @@ void FFmpegVideoStream::frameNext()
 		}
 	}
 	if (!m_gotFrame && m_playback->isTerminal()) {
-		m_gotFrame = m_playback->hasCurrentFrame();
+		m_gotFrame = m_playback->state() == FFmpegMoviePlaybackState::ENDED
+			&& m_playback->hasCurrentFrame();
+		if (m_playback->state() == FFmpegMoviePlaybackState::FAILED) {
+			m_good = false;
+		}
 	}
 }
 
@@ -572,7 +606,7 @@ void FFmpegVideoStream::frameGoto( Int index )
 	for (std::size_t attempts = 0; attempts < 256 && m_good && !m_gotFrame; ++attempts) {
 		const Int targetFrame = index;
 		if (!m_playback->pump(32)) {
-			m_good = m_playback->isTerminal();
+			m_good = m_playback->state() == FFmpegMoviePlaybackState::ENDED;
 			break;
 		}
 		if (m_playback->hasCurrentFrame() && m_playback->frameIndex() >= targetFrame) {
