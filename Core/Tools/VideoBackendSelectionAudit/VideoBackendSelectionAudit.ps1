@@ -35,6 +35,24 @@ function Assert-ExactConditionalBlock {
     }
 }
 
+function Assert-EffectiveRuntimeInstall {
+    param(
+        [string]$Content,
+        [string]$EffectivePrefix,
+        [string]$FailureMessage
+    )
+
+    $normalized = $Content -replace "`r`n", "`n"
+    $pattern = '(?ms)^    if\(WIN32 AND RTS_BUILD_OPTION_FFMPEG AND RTS_FFMPEG_RUNTIME_DLLS\)\s*' +
+        '^        # Install the exact resolved DLLs, never an unbounded SDK bin directory\.\s*' +
+        '^        install\(FILES \$\{RTS_FFMPEG_RUNTIME_DLLS\}\s*' +
+        '^            DESTINATION "\$\{' + [regex]::Escape($EffectivePrefix) + '\}"\)\s*' +
+        '^    endif\(\)'
+    if ([regex]::Matches($normalized, $pattern).Count -ne 1) {
+        throw $FailureMessage
+    }
+}
+
 if ($SelfTest) {
     $valid = "    if(`${CMAKE_SIZEOF_VOID_P} EQUAL 4 AND NOT RTS_BUILD_OPTION_FFMPEG)`n        include(cmake/bink.cmake)`n    endif()"
     Assert-ExactConditionalBlock $valid '    if(${CMAKE_SIZEOF_VOID_P} EQUAL 4 AND NOT RTS_BUILD_OPTION_FFMPEG)' '        include(cmake/bink.cmake)' '    endif()' 'Valid conditional block was rejected.'
@@ -53,6 +71,23 @@ if ($SelfTest) {
         throw 'Negative conditional self-test did not reject a duplicate block.'
     } catch {
         if ($_.Exception.Message -eq 'Negative conditional self-test did not reject a duplicate block.') { throw }
+    }
+
+    $validInstall = @'
+    if(WIN32 AND RTS_BUILD_OPTION_FFMPEG AND RTS_FFMPEG_RUNTIME_DLLS)
+        # Install the exact resolved DLLs, never an unbounded SDK bin directory.
+        install(FILES ${RTS_FFMPEG_RUNTIME_DLLS}
+            DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}")
+    endif()
+'@
+    Assert-EffectiveRuntimeInstall $validInstall '_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS' 'Valid effective-prefix install was rejected.'
+    $rawInstall = $validInstall.Replace('_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS',
+        'RTS_INSTALL_PREFIX_GENERALS')
+    try {
+        Assert-EffectiveRuntimeInstall $rawInstall '_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS' 'Raw-prefix install was accepted.'
+        throw 'Negative effective-prefix self-test did not reject a raw prefix.'
+    } catch {
+        if ($_.Exception.Message -eq 'Negative effective-prefix self-test did not reject a raw prefix.') { throw }
     }
 
     Write-Output 'Video backend selection audit negative self-test passed.'
@@ -83,11 +118,17 @@ if ($deviceCMake -notmatch '(?ms)^if\(CMAKE_SIZEOF_VOID_P EQUAL 4 AND NOT RTS_BU
 Assert-TokenCount $deviceCMake 'BinkVideoPlayer\.h' 1 'Bink header source ownership is ambiguous.'
 Assert-TokenCount $deviceCMake 'BinkVideoPlayer\.cpp' 1 'Bink implementation source ownership is ambiguous.'
 
-if ($deviceCMake -notmatch '(?ms)^if\(WIN32 AND RTS_BUILD_OPTION_FFMPEG AND RTS_FFMPEG_RUNTIME_DLLS\)\s*^    # Install the exact resolved DLLs, never an unbounded SDK bin directory\.\s*^    if\(RTS_INSTALL_PREFIX_GENERALS\)\s*^        install\(FILES \$\{RTS_FFMPEG_RUNTIME_DLLS\} DESTINATION "\$\{RTS_INSTALL_PREFIX_GENERALS\}"\)\s*^    endif\(\)\s*^    if\(RTS_INSTALL_PREFIX_ZEROHOUR\)\s*^        install\(FILES \$\{RTS_FFMPEG_RUNTIME_DLLS\} DESTINATION "\$\{RTS_INSTALL_PREFIX_ZEROHOUR\}"\)\s*^    endif\(\)\s*^endif\(\)') {
-    throw 'FFmpeg runtime DLLs are not installed beside both native title executables.'
+if ($deviceCMake -match 'install\(FILES \$\{RTS_FFMPEG_RUNTIME_DLLS\}') {
+    throw 'FFmpeg runtime installation must be owned by each title effective-prefix boundary.'
 }
-if ($deviceCMake -match 'install\(FILES \$\{RTS_FFMPEG_RUNTIME_DLLS\} DESTINATION \.\)') {
-    throw 'FFmpeg runtime DLLs still use the unrelated global CMake install prefix.'
+
+foreach ($title in @(
+    @{ Path = 'Generals/CMakeLists.txt'; Prefix = '_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS' },
+    @{ Path = 'GeneralsMD/CMakeLists.txt'; Prefix = '_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR' }
+)) {
+    $titleCMake = Get-Content -LiteralPath (Join-Path $SourceRoot $title.Path) -Raw
+    Assert-EffectiveRuntimeInstall $titleCMake $title.Prefix `
+        "FFmpeg runtime DLLs are not installed through the effective prefix in $($title.Path)"
 }
 
 $runtimeCMake = Get-Content -LiteralPath (Join-Path $SourceRoot 'cmake/legacy-product-runtime.cmake') -Raw

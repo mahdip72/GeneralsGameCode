@@ -422,13 +422,3 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32)
         rts_native_audio_manager
     )
 endif()
-
-if(WIN32 AND RTS_BUILD_OPTION_FFMPEG AND RTS_FFMPEG_RUNTIME_DLLS)
-    # Install the exact resolved DLLs, never an unbounded SDK bin directory.
-    if(RTS_INSTALL_PREFIX_GENERALS)
-        install(FILES ${RTS_FFMPEG_RUNTIME_DLLS} DESTINATION "${RTS_INSTALL_PREFIX_GENERALS}")
-    endif()
-    if(RTS_INSTALL_PREFIX_ZEROHOUR)
-        install(FILES ${RTS_FFMPEG_RUNTIME_DLLS} DESTINATION "${RTS_INSTALL_PREFIX_ZEROHOUR}")
-    endif()
-endif()
