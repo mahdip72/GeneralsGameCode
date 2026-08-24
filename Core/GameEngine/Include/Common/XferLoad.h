@@ -32,6 +32,10 @@
 // USER INCLUDES //////////////////////////////////////////////////////////////////////////////////
 #include "Common/Xfer.h"
 
+#ifdef _WIN64
+#include <cstdint>
+#endif
+
 // FOWARD REFERNCES ///////////////////////////////////////////////////////////////////////////////
 class Snapshot;
 
@@ -57,10 +61,22 @@ public:
 	virtual void xferAsciiString( AsciiString *asciiStringData ) override;  ///< xfer ascii string (need our own)
 	virtual void xferUnicodeString( UnicodeString *unicodeStringData ) override;	///< xfer unicode string (need our own);
 
+#ifdef _WIN64
+	// Native x64 saves use a fixed, validated container header.  The legacy
+	// Xfer payload remains intentionally unchanged behind this boundary.
+	void setRuntimeEpochIdentity( std::uint32_t executableCrc, std::uint32_t iniCrc );
+#endif
+
 protected:
 
 	virtual void xferImplementation( void *data, Int dataSize ) override;		///< the xfer implementation
 
 	FILE * m_fileFP;																					///< pointer to file
+
+#ifdef _WIN64
+	std::uint32_t m_runtimeEpochExecutableCrc;
+	std::uint32_t m_runtimeEpochIniCrc;
+	Bool m_runtimeEpochIdentityConfigured;
+#endif
 
 };

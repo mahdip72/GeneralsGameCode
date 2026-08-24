@@ -32,12 +32,20 @@
 // USER INCLUDES //////////////////////////////////////////////////////////////////////////////////
 #include "Common/Xfer.h"
 
+#ifdef _WIN64
+#include <cstdint>
+#endif
+
 // FORWARD REFERENCES /////////////////////////////////////////////////////////////////////////////
 class XferBlockData;
 class Snapshot;
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
+#ifdef _WIN64
+typedef std::int64_t XferFilePos;
+#else
 typedef long XferFilePos;
+#endif
 
 //-------------------------------------------------------------------------------------------------
 //-------------------------------------------------------------------------------------------------
@@ -62,11 +70,25 @@ public:
 	virtual void xferAsciiString( AsciiString *asciiStringData ) override;  ///< xfer ascii string (need our own)
 	virtual void xferUnicodeString( UnicodeString *unicodeStringData ) override;	///< xfer unicode string (need our own);
 
+#ifdef _WIN64
+	// Native x64 saves use a fixed, validated container header.  The legacy
+	// Xfer payload remains intentionally unchanged behind this boundary.
+	void setRuntimeEpochIdentity( std::uint32_t executableCrc, std::uint32_t iniCrc );
+	void finalizeRuntimeEpoch();
+#endif
+
 protected:
 
 	virtual void xferImplementation( void *data, Int dataSize ) override;		///< the xfer implementation
 
 	FILE * m_fileFP;																			///< pointer to file
 	XferBlockData *m_blockStack;													///< stack of block data
+
+#ifdef _WIN64
+	std::uint32_t m_runtimeEpochExecutableCrc;
+	std::uint32_t m_runtimeEpochIniCrc;
+	Bool m_runtimeEpochIdentityConfigured;
+	Bool m_runtimeEpochFinalized;
+#endif
 
 };

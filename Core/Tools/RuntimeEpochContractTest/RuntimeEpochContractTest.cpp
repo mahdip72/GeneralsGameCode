@@ -176,10 +176,76 @@ int TestReplayAndNetworkHeaders()
 	return result;
 }
 
+int TestReplayContainerValidation()
+{
+	using namespace rts::runtime_epoch;
+	const std::array<Byte, 8> payload = {{'G', 'E', 'N', 'R', 'E', 'P', '0', 0U}};
+
+	ReplayHeader expected;
+	expected.buildCompatibilityId = BuildCompatibilityIdFromExecutableCrc(0x13572468U);
+	expected.contentHash = ContentHashFromIniCrc(0x24681357U);
+	expected.payloadByteCount = payload.size();
+	expected.payloadChecksum = CalculatePayloadChecksum(payload.data(), payload.size());
+	const std::array<Byte, kHeaderSize> encoded = Encode(expected);
+
+	ValidationOptions options;
+	options.expectedBuildCompatibilityId = expected.buildCompatibilityId;
+	options.expectedContentHash = expected.contentHash;
+	options.requireBuildCompatibilityMatch = true;
+	options.requireContentHashMatch = true;
+	options.maxPayloadByteCount = payload.size();
+
+	ReplayHeader decoded;
+	int result = 0;
+	result |= Check(DecodeAndValidate(encoded.data(), encoded.size(), payload.data(), payload.size(),
+		options, &decoded).ok(), "complete RPL3 container validates before payload use");
+	result |= CheckCommonHeader(decoded, expected);
+
+	std::array<Byte, kHeaderSize> legacy = encoded;
+	legacy[0] = 'G';
+	result |= Check(DecodeAndValidate(legacy.data(), legacy.size(), payload.data(), payload.size(),
+		options, &decoded).error == ValidationError::InvalidMagic,
+		"legacy GENREP magic is rejected as an x64 container");
+
+	std::array<Byte, 8> corruptPayload = payload;
+	corruptPayload[6] ^= 0x01U;
+	result |= Check(DecodeAndValidate(encoded.data(), encoded.size(), corruptPayload.data(),
+		corruptPayload.size(), options, &decoded).error == ValidationError::PayloadChecksumMismatch,
+		"corrupt replay payload is rejected before playback");
+	result |= Check(DecodeAndValidate(encoded.data(), encoded.size(), payload.data(), payload.size() - 1U,
+		options, &decoded).error == ValidationError::PayloadSizeMismatch,
+		"truncated replay payload is rejected before playback");
+	return result;
+}
+
+int TestStreamingChecksum()
+{
+	using namespace rts::runtime_epoch;
+	const std::array<Byte, 9> payload = {{0x10U, 0x20U, 0x30U, 0x40U, 0x50U,
+		0x60U, 0x70U, 0x80U, 0x90U}};
+
+	PayloadChecksumAccumulator accumulator;
+	accumulator.update(payload.data(), 2U);
+	accumulator.update(payload.data() + 2U, 3U);
+	accumulator.update(payload.data() + 5U, payload.size() - 5U);
+
+	int result = 0;
+	result |= Check(accumulator.byteCount() == payload.size(),
+		"streaming checksum counts every payload byte");
+	result |= Check(accumulator.finish() == CalculatePayloadChecksum(payload.data(), payload.size()),
+		"streaming checksum matches one-shot checksum");
+	result |= Check(BuildCompatibilityIdFromExecutableCrc(0x11223344U) == UINT64_C(0x11223344),
+		"executable CRC maps to a fixed-width build identity");
+	result |= Check(ContentHashFromIniCrc(0xaabbccddU) == UINT64_C(0xaabbccdd),
+		"INI CRC maps to a fixed-width content identity");
+	return result;
+}
+
 } // namespace
 
 int main()
 {
 	static_assert(rts::runtime_epoch::kHeaderSize == 40U, "runtime epoch wire size is contractual");
-	return TestSaveHeader() | TestReplayAndNetworkHeaders();
+	return TestSaveHeader() | TestReplayAndNetworkHeaders() | TestReplayContainerValidation() |
+		TestStreamingChecksum();
 }

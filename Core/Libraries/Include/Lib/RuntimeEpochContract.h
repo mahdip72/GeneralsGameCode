@@ -22,6 +22,20 @@ constexpr std::array<Byte, 4> kSaveMagic = {{'S', 'A', 'V', '3'}};
 constexpr std::array<Byte, 4> kReplayMagic = {{'R', 'P', 'L', '3'}};
 constexpr std::array<Byte, 4> kNetworkMagic = {{'N', 'E', 'T', '3'}};
 
+// The product still exposes its executable and important-INI identities as
+// explicit 32-bit CRCs.  The new wire contract stores those values in
+// pointer-independent 64-bit slots so the container layout is fixed on every
+// supported build.
+constexpr std::uint64_t BuildCompatibilityIdFromExecutableCrc(std::uint32_t executableCrc)
+{
+	return static_cast<std::uint64_t>(executableCrc);
+}
+
+constexpr std::uint64_t ContentHashFromIniCrc(std::uint32_t iniCrc)
+{
+	return static_cast<std::uint64_t>(iniCrc);
+}
+
 struct SaveHeader
 {
 	std::uint32_t schemaVersion = kCurrentSchemaVersion;
@@ -90,6 +104,20 @@ struct ValidationResult
 
 // The checksum is CRC-32/ISO-HDLC over the payload bytes.  It is deliberately
 // defined here rather than relying on a compiler, platform, or object layout.
+class PayloadChecksumAccumulator
+{
+public:
+	PayloadChecksumAccumulator();
+
+	void update(const Byte *payload, std::size_t payloadSize);
+	std::uint32_t finish() const;
+	std::uint64_t byteCount() const { return m_byteCount; }
+
+private:
+	std::uint32_t m_crc;
+	std::uint64_t m_byteCount;
+};
+
 std::uint32_t CalculatePayloadChecksum(const Byte *payload, std::size_t payloadSize);
 
 ValidationResult Validate(const SaveHeader &header, const ValidationOptions &options);

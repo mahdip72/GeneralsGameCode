@@ -185,22 +185,39 @@ ValidationResult ValidatePayloadFields(const Header &header,
 
 std::uint32_t CalculatePayloadChecksum(const Byte *payload, std::size_t payloadSize)
 {
+	PayloadChecksumAccumulator accumulator;
+	accumulator.update(payload, payloadSize);
+	return accumulator.finish();
+}
+
+PayloadChecksumAccumulator::PayloadChecksumAccumulator()
+	: m_crc(0xffffffffU),
+	  m_byteCount(0U)
+{
+}
+
+void PayloadChecksumAccumulator::update(const Byte *payload, std::size_t payloadSize)
+{
 	if (payload == nullptr && payloadSize != 0U)
 	{
-		return 0U;
+		return;
 	}
 
-	std::uint32_t checksum = 0xffffffffU;
 	for (std::size_t index = 0; index < payloadSize; ++index)
 	{
-		checksum ^= payload[index];
+		m_crc ^= payload[index];
 		for (unsigned bit = 0U; bit < 8U; ++bit)
 		{
-			const std::uint32_t mask = 0U - (checksum & 1U);
-			checksum = (checksum >> 1U) ^ (0xedb88320U & mask);
+			const std::uint32_t mask = 0U - (m_crc & 1U);
+			m_crc = (m_crc >> 1U) ^ (0xedb88320U & mask);
 		}
 	}
-	return ~checksum;
+	m_byteCount += static_cast<std::uint64_t>(payloadSize);
+}
+
+std::uint32_t PayloadChecksumAccumulator::finish() const
+{
+	return ~m_crc;
 }
 
 ValidationResult Validate(const SaveHeader &header, const ValidationOptions &options)

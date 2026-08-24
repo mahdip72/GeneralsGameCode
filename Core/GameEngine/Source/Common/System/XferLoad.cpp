@@ -34,6 +34,104 @@
 #include "Common/Snapshot.h"
 #include "Common/XferLoad.h"
 
+#ifdef _WIN64
+#include "Lib/RuntimeEpochContract.h"
+
+#include <array>
+#include <limits>
+
+namespace
+{
+
+void ValidateNativeRuntimeEpochSave(FILE *file,
+	std::uint32_t executableCrc,
+	std::uint32_t iniCrc)
+{
+	std::array<rts::runtime_epoch::Byte, rts::runtime_epoch::kHeaderSize> encoded = {{}};
+	if( fread( encoded.data(), 1, encoded.size(), file ) != encoded.size() )
+	{
+		DEBUG_CRASH(( "XferLoad - Native x64 save header is truncated" ));
+		throw XFER_READ_ERROR;
+	}
+
+	rts::runtime_epoch::SaveHeader header;
+	if( !rts::runtime_epoch::Decode( encoded.data(), encoded.size(), &header ) )
+	{
+		DEBUG_CRASH(( "XferLoad - Native x64 save header is invalid" ));
+		throw XFER_INVALID_PARAMETERS;
+	}
+
+	const __int64 fileEnd = _fseeki64( file, 0, SEEK_END ) == 0 ? _ftelli64( file ) : -1;
+	if( fileEnd < static_cast<__int64>(rts::runtime_epoch::kHeaderSize) )
+	{
+		DEBUG_CRASH(( "XferLoad - Native x64 save file is truncated" ));
+		throw XFER_READ_ERROR;
+	}
+
+	const std::uint64_t payloadFileSize = static_cast<std::uint64_t>(
+		fileEnd - static_cast<__int64>(rts::runtime_epoch::kHeaderSize));
+	if( payloadFileSize > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) )
+	{
+		DEBUG_CRASH(( "XferLoad - Native x64 save payload is too large" ));
+		throw XFER_INVALID_PARAMETERS;
+	}
+
+	rts::runtime_epoch::ValidationOptions options;
+	options.expectedBuildCompatibilityId =
+		rts::runtime_epoch::BuildCompatibilityIdFromExecutableCrc(executableCrc);
+	options.expectedContentHash =
+		rts::runtime_epoch::ContentHashFromIniCrc(iniCrc);
+	options.maxPayloadByteCount = payloadFileSize;
+	options.requireBuildCompatibilityMatch = true;
+	options.requireContentHashMatch = true;
+	const rts::runtime_epoch::ValidationResult headerResult =
+		rts::runtime_epoch::Validate( header, options );
+	if( !headerResult.ok() || header.payloadByteCount != payloadFileSize )
+	{
+		DEBUG_CRASH(( "XferLoad - Native x64 save header does not match the file" ));
+		throw XFER_INVALID_PARAMETERS;
+	}
+
+	if( _fseeki64( file, static_cast<__int64>(rts::runtime_epoch::kHeaderSize), SEEK_SET ) != 0 )
+	{
+		DEBUG_CRASH(( "XferLoad - Native x64 save payload cannot be positioned" ));
+		throw XFER_READ_ERROR;
+	}
+
+	rts::runtime_epoch::PayloadChecksumAccumulator checksum;
+	std::array<rts::runtime_epoch::Byte, 64U * 1024U> buffer = {{}};
+	std::uint64_t remaining = payloadFileSize;
+	while( remaining != 0U )
+	{
+		const std::size_t requested = static_cast<std::size_t>(
+			remaining < buffer.size() ? remaining : buffer.size());
+		const std::size_t read = fread( buffer.data(), 1, requested, file );
+		if( read != requested )
+		{
+			DEBUG_CRASH(( "XferLoad - Native x64 save payload is truncated" ));
+			throw XFER_READ_ERROR;
+		}
+		checksum.update( buffer.data(), read );
+		remaining -= static_cast<std::uint64_t>(read);
+	}
+
+	if( checksum.byteCount() != header.payloadByteCount ||
+		checksum.finish() != header.payloadChecksum )
+	{
+		DEBUG_CRASH(( "XferLoad - Native x64 save payload checksum mismatch" ));
+		throw XFER_INVALID_PARAMETERS;
+	}
+
+	if( _fseeki64( file, static_cast<__int64>(rts::runtime_epoch::kHeaderSize), SEEK_SET ) != 0 )
+	{
+		DEBUG_CRASH(( "XferLoad - Native x64 save payload cannot be rewound" ));
+		throw XFER_READ_ERROR;
+	}
+}
+
+} // namespace
+#endif
+
 //-------------------------------------------------------------------------------------------------
 //-------------------------------------------------------------------------------------------------
 XferLoad::XferLoad()
@@ -41,6 +139,12 @@ XferLoad::XferLoad()
 
 	m_xferMode = XFER_LOAD;
 	m_fileFP = nullptr;
+
+#ifdef _WIN64
+	m_runtimeEpochExecutableCrc = 0U;
+	m_runtimeEpochIniCrc = 0U;
+	m_runtimeEpochIdentityConfigured = FALSE;
+#endif
 
 }
 
@@ -61,6 +165,21 @@ XferLoad::~XferLoad()
 }
 
 //-------------------------------------------------------------------------------------------------
+#ifdef _WIN64
+void XferLoad::setRuntimeEpochIdentity( std::uint32_t executableCrc, std::uint32_t iniCrc )
+{
+	if( m_fileFP != nullptr )
+	{
+		DEBUG_CRASH(( "XferLoad::setRuntimeEpochIdentity - file is already open" ));
+		throw XFER_FILE_ALREADY_OPEN;
+	}
+
+	m_runtimeEpochExecutableCrc = executableCrc;
+	m_runtimeEpochIniCrc = iniCrc;
+	m_runtimeEpochIdentityConfigured = TRUE;
+}
+#endif
+
 /** Open file 'identifier' for reading */
 //-------------------------------------------------------------------------------------------------
 void XferLoad::open( AsciiString identifier )
@@ -88,6 +207,30 @@ void XferLoad::open( AsciiString identifier )
 		throw XFER_FILE_NOT_FOUND;
 
 	}
+
+#ifdef _WIN64
+	if( m_runtimeEpochIdentityConfigured == FALSE )
+	{
+		fclose( m_fileFP );
+		m_fileFP = nullptr;
+		m_identifier.clear();
+		DEBUG_CRASH(( "XferLoad::open - Native x64 identity was not configured" ));
+		throw XFER_INVALID_PARAMETERS;
+	}
+
+	try
+	{
+		ValidateNativeRuntimeEpochSave(
+			m_fileFP, m_runtimeEpochExecutableCrc, m_runtimeEpochIniCrc);
+	}
+	catch( ... )
+	{
+		fclose( m_fileFP );
+		m_fileFP = nullptr;
+		m_identifier.clear();
+		throw;
+	}
+#endif
 
 }
 
@@ -163,7 +306,13 @@ void XferLoad::skip( Int dataSize )
 										 dataSize) );
 
 	// skip datasize in the file from the current position
-	if( fseek( m_fileFP, dataSize, SEEK_CUR ) != 0 )
+	int seekResult;
+#ifdef _WIN64
+	seekResult = _fseeki64( m_fileFP, static_cast<__int64>( dataSize ), SEEK_CUR );
+#else
+	seekResult = fseek( m_fileFP, dataSize, SEEK_CUR );
+#endif
+	if( seekResult != 0 )
 		throw XFER_SKIP_ERROR;
 
 }

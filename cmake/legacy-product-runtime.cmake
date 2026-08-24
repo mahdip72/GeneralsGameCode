@@ -20,6 +20,7 @@ elseif(RTS_BUILD_PRODUCT AND (RTS_BUILD_ZEROHOUR OR RTS_BUILD_GENERALS))
         message(FATAL_ERROR "Native x64 product targets require the FFmpeg video backend.")
     endif()
     target_link_libraries(rts_legacy_product_runtime INTERFACE
+        core_runtime_epoch_contract
         rts_d3d8_headers
         rts_xaudio2
         d3d11

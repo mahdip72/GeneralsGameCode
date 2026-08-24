@@ -33,6 +33,13 @@
 #include "Common/Snapshot.h"
 #include "Common/GameMemory.h"
 
+#ifdef _WIN64
+#include "Lib/RuntimeEpochContract.h"
+
+#include <array>
+#include <limits>
+#endif
+
 // PRIVATE TYPES //////////////////////////////////////////////////////////////////////////////////
 class XferBlockData : public MemoryPoolObject
 {
@@ -58,6 +65,13 @@ XferSave::XferSave()
 	m_xferMode = XFER_SAVE;
 	m_fileFP = nullptr;
 	m_blockStack = nullptr;
+
+#ifdef _WIN64
+	m_runtimeEpochExecutableCrc = 0U;
+	m_runtimeEpochIniCrc = 0U;
+	m_runtimeEpochIdentityConfigured = FALSE;
+	m_runtimeEpochFinalized = FALSE;
+#endif
 
 }
 
@@ -129,7 +143,135 @@ void XferSave::open( AsciiString identifier )
 
 	}
 
+#ifdef _WIN64
+	if( m_runtimeEpochIdentityConfigured == FALSE )
+	{
+		fclose( m_fileFP );
+		m_fileFP = nullptr;
+		m_identifier.clear();
+		DEBUG_CRASH(( "XferSave::open - Native x64 identity was not configured" ));
+		throw XFER_INVALID_PARAMETERS;
+	}
+
+	// Reserve the fixed header immediately.  A save that exits before
+	// finalizeRuntimeEpoch() therefore retains an intentionally impossible
+	// payload length and cannot be mistaken for a complete file.
+	rts::runtime_epoch::SaveHeader header;
+	header.buildCompatibilityId = rts::runtime_epoch::BuildCompatibilityIdFromExecutableCrc(
+		m_runtimeEpochExecutableCrc);
+	header.contentHash = rts::runtime_epoch::ContentHashFromIniCrc(m_runtimeEpochIniCrc);
+	header.payloadByteCount = std::numeric_limits<std::uint64_t>::max();
+	header.payloadChecksum = 0U;
+	const std::array<rts::runtime_epoch::Byte, rts::runtime_epoch::kHeaderSize> encoded =
+		rts::runtime_epoch::Encode(header);
+	if( fwrite( encoded.data(), 1, encoded.size(), m_fileFP ) != encoded.size() )
+	{
+		fclose( m_fileFP );
+		m_fileFP = nullptr;
+		m_identifier.clear();
+		DEBUG_CRASH(( "XferSave::open - Error writing native x64 save header" ));
+		throw XFER_WRITE_ERROR;
+	}
+	m_runtimeEpochFinalized = FALSE;
+#endif
+
 }
+
+#ifdef _WIN64
+void XferSave::setRuntimeEpochIdentity( std::uint32_t executableCrc, std::uint32_t iniCrc )
+{
+	if( m_fileFP != nullptr )
+	{
+		DEBUG_CRASH(( "XferSave::setRuntimeEpochIdentity - file is already open" ));
+		throw XFER_FILE_ALREADY_OPEN;
+	}
+
+	m_runtimeEpochExecutableCrc = executableCrc;
+	m_runtimeEpochIniCrc = iniCrc;
+	m_runtimeEpochIdentityConfigured = TRUE;
+}
+
+void XferSave::finalizeRuntimeEpoch()
+{
+	if( m_fileFP == nullptr )
+	{
+		DEBUG_CRASH(( "XferSave::finalizeRuntimeEpoch - file is not open" ));
+		throw XFER_FILE_NOT_OPEN;
+	}
+	if( m_runtimeEpochIdentityConfigured == FALSE )
+	{
+		DEBUG_CRASH(( "XferSave::finalizeRuntimeEpoch - identity was not configured" ));
+		throw XFER_INVALID_PARAMETERS;
+	}
+	if( m_runtimeEpochFinalized != FALSE )
+	{
+		DEBUG_CRASH(( "XferSave::finalizeRuntimeEpoch - file was already finalized" ));
+		throw XFER_INVALID_PARAMETERS;
+	}
+	if( m_blockStack != nullptr )
+	{
+		DEBUG_CRASH(( "XferSave::finalizeRuntimeEpoch - an Xfer block is still open" ));
+		throw XFER_BEGIN_END_MISMATCH;
+	}
+	if( fflush( m_fileFP ) != 0 )
+	{
+		DEBUG_CRASH(( "XferSave::finalizeRuntimeEpoch - flush failed" ));
+		throw XFER_WRITE_ERROR;
+	}
+
+	const __int64 fileEnd = _ftelli64( m_fileFP );
+	if( fileEnd < static_cast<__int64>(rts::runtime_epoch::kHeaderSize) )
+	{
+		DEBUG_CRASH(( "XferSave::finalizeRuntimeEpoch - invalid file position" ));
+		throw XFER_WRITE_ERROR;
+	}
+
+	const std::uint64_t payloadSize = static_cast<std::uint64_t>(
+		fileEnd - static_cast<__int64>(rts::runtime_epoch::kHeaderSize));
+	if( _fseeki64( m_fileFP, static_cast<__int64>(rts::runtime_epoch::kHeaderSize), SEEK_SET ) != 0 )
+	{
+		DEBUG_CRASH(( "XferSave::finalizeRuntimeEpoch - unable to seek to payload" ));
+		throw XFER_WRITE_ERROR;
+	}
+
+	rts::runtime_epoch::PayloadChecksumAccumulator checksum;
+	std::array<rts::runtime_epoch::Byte, 64U * 1024U> buffer = {{}};
+	std::uint64_t remaining = payloadSize;
+	while( remaining != 0U )
+	{
+		const std::size_t requested = static_cast<std::size_t>(
+			remaining < buffer.size() ? remaining : buffer.size());
+		const std::size_t read = fread( buffer.data(), 1, requested, m_fileFP );
+		if( read != requested )
+		{
+			DEBUG_CRASH(( "XferSave::finalizeRuntimeEpoch - unable to read payload for checksum" ));
+			throw XFER_READ_ERROR;
+		}
+		checksum.update( buffer.data(), read );
+		remaining -= static_cast<std::uint64_t>(read);
+	}
+
+	rts::runtime_epoch::SaveHeader header;
+	header.buildCompatibilityId = rts::runtime_epoch::BuildCompatibilityIdFromExecutableCrc(
+		m_runtimeEpochExecutableCrc);
+	header.contentHash = rts::runtime_epoch::ContentHashFromIniCrc(m_runtimeEpochIniCrc);
+	header.payloadByteCount = checksum.byteCount();
+	header.payloadChecksum = checksum.finish();
+	const std::array<rts::runtime_epoch::Byte, rts::runtime_epoch::kHeaderSize> encoded =
+		rts::runtime_epoch::Encode(header);
+
+	if( _fseeki64( m_fileFP, 0, SEEK_SET ) != 0 ||
+		fwrite( encoded.data(), 1, encoded.size(), m_fileFP ) != encoded.size() ||
+		fflush( m_fileFP ) != 0 ||
+		_fseeki64( m_fileFP, fileEnd, SEEK_SET ) != 0 )
+	{
+		DEBUG_CRASH(( "XferSave::finalizeRuntimeEpoch - unable to publish header" ));
+		throw XFER_WRITE_ERROR;
+	}
+
+	m_runtimeEpochFinalized = TRUE;
+}
+#endif
 
 //-------------------------------------------------------------------------------------------------
 /** Close our current file */
@@ -170,7 +312,12 @@ Int XferSave::beginBlock()
 										 m_identifier.str()) );
 
 	// get the current file position so we can back up here for the next end block call
-	XferFilePos filePos = ftell( m_fileFP );
+	XferFilePos filePos;
+#ifdef _WIN64
+	filePos = static_cast<XferFilePos>( _ftelli64( m_fileFP ) );
+#else
+	filePos = ftell( m_fileFP );
+#endif
 
 	// write a placeholder
 	XferBlockSize blockSize = 0;
@@ -224,14 +371,23 @@ void XferSave::endBlock()
 	}
 
 	// save our current file position
-	XferFilePos currentFilePos = ftell( m_fileFP );
+	XferFilePos currentFilePos;
+#ifdef _WIN64
+	currentFilePos = static_cast<XferFilePos>( _ftelli64( m_fileFP ) );
+#else
+	currentFilePos = ftell( m_fileFP );
+#endif
 
 	// pop the block descriptor off the top of the block stack
 	XferBlockData *top = m_blockStack;
 	m_blockStack = m_blockStack->next;
 
 	// rewind the file to the block position
+#ifdef _WIN64
+	_fseeki64( m_fileFP, static_cast<__int64>( top->filePos ), SEEK_SET );
+#else
 	fseek( m_fileFP, top->filePos, SEEK_SET );
+#endif
 
 	// write the size in bytes between the block position and what is our current file position
 	XferBlockSize blockSize = currentFilePos - top->filePos - sizeof( XferBlockSize );
@@ -244,7 +400,11 @@ void XferSave::endBlock()
 	}
 
 	// place the file pointer back to the current position
+#ifdef _WIN64
+	_fseeki64( m_fileFP, static_cast<__int64>( currentFilePos ), SEEK_SET );
+#else
 	fseek( m_fileFP, currentFilePos, SEEK_SET );
+#endif
 
 	// delete the block data as it's all used up now
 	deleteInstance(top);
@@ -263,7 +423,11 @@ void XferSave::skip( Int dataSize )
 
 
 	// skip forward dataSize bytes
+#ifdef _WIN64
+	_fseeki64( m_fileFP, static_cast<__int64>( dataSize ), SEEK_CUR );
+#else
 	fseek( m_fileFP, dataSize, SEEK_CUR );
+#endif
 
 }
 

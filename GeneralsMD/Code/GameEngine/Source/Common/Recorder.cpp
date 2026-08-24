@@ -49,6 +49,12 @@
 #include "Common/SkirmishAIReplayEpoch.h"
 #include "Common/version.h"
 
+#if defined(_WIN64)
+#include "Lib/RuntimeEpochContract.h"
+#include <array>
+#include <cstdint>
+#endif
+
 constexpr const char s_genrep[] = "GENREP";
 constexpr const UnsignedInt replayBufferBytes = 8192;
 
@@ -72,11 +78,173 @@ static const UnsignedInt desyncOffset = frameCountOffset + sizeof(UnsignedInt);
 static const UnsignedInt quitEarlyOffset = desyncOffset + sizeof(Bool);
 static const UnsignedInt disconOffset = quitEarlyOffset + sizeof(Bool);
 
+#if defined(_WIN64)
+static constexpr Int kNativeReplayPayloadBase = static_cast<Int>(rts::runtime_epoch::kHeaderSize);
+static constexpr Int kNativeReplayChecksumChunkSize = 64 * 1024;
+
+static Bool scanNativeReplayPayload(File* file,
+	Int payloadBase,
+	Int fileSize,
+	rts::runtime_epoch::PayloadChecksumAccumulator& checksum)
+{
+	if (file == nullptr || payloadBase < 0 || fileSize < payloadBase)
+	{
+		return FALSE;
+	}
+
+	if (file->seek(payloadBase, File::seekMode::START) != payloadBase)
+	{
+		return FALSE;
+	}
+
+	std::array<rts::runtime_epoch::Byte, kNativeReplayChecksumChunkSize> buffer = {{}};
+	Int remaining = fileSize - payloadBase;
+	while (remaining > 0)
+	{
+		const Int chunkSize = remaining < static_cast<Int>(buffer.size())
+			? remaining
+			: static_cast<Int>(buffer.size());
+		const Int bytesRead = file->read(buffer.data(), chunkSize);
+		if (bytesRead != chunkSize)
+		{
+			return FALSE;
+		}
+		checksum.update(buffer.data(), static_cast<std::size_t>(bytesRead));
+		remaining -= bytesRead;
+	}
+
+	return file->position() == fileSize;
+}
+
+static Bool writeNativeReplayContainerHeader(File* file,
+	const rts::runtime_epoch::ReplayHeader& header)
+{
+	if (file == nullptr)
+	{
+		return FALSE;
+	}
+
+	const std::array<rts::runtime_epoch::Byte, rts::runtime_epoch::kHeaderSize> bytes =
+		rts::runtime_epoch::Encode(header);
+	if (file->seek(0, File::seekMode::START) != 0 ||
+		file->write(bytes.data(), static_cast<Int>(bytes.size())) != static_cast<Int>(bytes.size()))
+	{
+		return FALSE;
+	}
+	return file->flush();
+}
+
+static Bool beginNativeReplayContainer(File* file)
+{
+	// The RPL3 header is the new compatibility boundary.  The legacy GENREP
+	// payload remains unchanged and is intentionally not claimed to be a
+	// canonical x64 replay schema by this slice.
+	rts::runtime_epoch::ReplayHeader header;
+	header.buildCompatibilityId = rts::runtime_epoch::BuildCompatibilityIdFromExecutableCrc(
+		TheGlobalData->m_exeCRC);
+	header.contentHash = rts::runtime_epoch::ContentHashFromIniCrc(TheGlobalData->m_iniCRC);
+	// An unfinished recording must never validate as a complete container.
+	header.payloadByteCount = UINT64_MAX;
+	header.payloadChecksum = 0U;
+	return writeNativeReplayContainerHeader(file, header);
+}
+
+static Bool finalizeNativeReplayContainer(File* file)
+{
+	if (file == nullptr || !file->flush())
+	{
+		return FALSE;
+	}
+
+	const Int fileSize = file->size();
+	if (fileSize < kNativeReplayPayloadBase)
+	{
+		return FALSE;
+	}
+
+	rts::runtime_epoch::PayloadChecksumAccumulator checksum;
+	if (!scanNativeReplayPayload(file, kNativeReplayPayloadBase, fileSize, checksum))
+	{
+		return FALSE;
+	}
+
+	rts::runtime_epoch::ReplayHeader header;
+	header.buildCompatibilityId = rts::runtime_epoch::BuildCompatibilityIdFromExecutableCrc(
+		TheGlobalData->m_exeCRC);
+	header.contentHash = rts::runtime_epoch::ContentHashFromIniCrc(TheGlobalData->m_iniCRC);
+	header.payloadByteCount = checksum.byteCount();
+	header.payloadChecksum = checksum.finish();
+	if (!writeNativeReplayContainerHeader(file, header))
+	{
+		return FALSE;
+	}
+
+	return file->seek(fileSize, File::seekMode::START) == fileSize;
+}
+
+static Bool validateNativeReplayContainer(File* file)
+{
+	if (file == nullptr || TheGlobalData == nullptr)
+	{
+		return FALSE;
+	}
+
+	const Int fileSize = file->size();
+	if (fileSize < kNativeReplayPayloadBase)
+	{
+		return FALSE;
+	}
+
+	std::array<rts::runtime_epoch::Byte, rts::runtime_epoch::kHeaderSize> bytes = {{}};
+	if (file->seek(0, File::seekMode::START) != 0 ||
+		file->read(bytes.data(), static_cast<Int>(bytes.size())) != static_cast<Int>(bytes.size()))
+	{
+		return FALSE;
+	}
+
+	rts::runtime_epoch::ReplayHeader header;
+	if (!rts::runtime_epoch::Decode(bytes.data(), bytes.size(), &header))
+	{
+		return FALSE;
+	}
+
+	rts::runtime_epoch::ValidationOptions options;
+	options.expectedBuildCompatibilityId =
+		rts::runtime_epoch::BuildCompatibilityIdFromExecutableCrc(TheGlobalData->m_exeCRC);
+	options.expectedContentHash =
+		rts::runtime_epoch::ContentHashFromIniCrc(TheGlobalData->m_iniCRC);
+	options.maxPayloadByteCount = static_cast<std::uint64_t>(fileSize - kNativeReplayPayloadBase);
+	options.requireBuildCompatibilityMatch = true;
+	options.requireContentHashMatch = true;
+	if (!rts::runtime_epoch::Validate(header, options).ok())
+	{
+		return FALSE;
+	}
+
+	rts::runtime_epoch::PayloadChecksumAccumulator checksum;
+	if (!scanNativeReplayPayload(file, kNativeReplayPayloadBase, fileSize, checksum) ||
+		header.payloadByteCount != checksum.byteCount() ||
+		header.payloadChecksum != checksum.finish())
+	{
+		return FALSE;
+	}
+
+	// Leave the stream at the first byte of the legacy replay payload.  Every
+	// subsequent GENREP read is therefore relative to the validated container.
+	return file->seek(kNativeReplayPayloadBase, File::seekMode::START) == kNativeReplayPayloadBase;
+}
+#endif
+
 static void writeAtOffset(File* file, Int offset, const void* data, Int dataSize)
 {
 	UnsignedInt fileSize = file->size();
-	DEBUG_ASSERTCRASH((UnsignedInt)(offset + dataSize) <= fileSize, ("writeAtOffset would exceed file size!"));
-	if (file->seek(offset, File::seekMode::START) == offset)
+	#if defined(_WIN64)
+	const Int absoluteOffset = kNativeReplayPayloadBase + offset;
+	#else
+	const Int absoluteOffset = offset;
+	#endif
+	DEBUG_ASSERTCRASH((UnsignedInt)(absoluteOffset + dataSize) <= fileSize, ("writeAtOffset would exceed file size!"));
+	if (file->seek(absoluteOffset, File::seekMode::START) == absoluteOffset)
 	{
 		file->write(data, dataSize);
 	}
@@ -534,11 +702,24 @@ void RecorderClass::startRecording(GameDifficulty diff, Int originalGameMode, In
 	m_fileName = getLastReplayFileName();
 	m_fileName.concat(getReplayExtention());
 	filepath.concat(m_fileName);
+	#if defined(_WIN64)
+	m_file = TheFileSystem->openFile(filepath.str(), File::READWRITE | File::BINARY | File::TRUNCATE);
+	#else
 	m_file = TheFileSystem->openFile(filepath.str(), File::WRITE | File::BINARY);
+	#endif
 	if (m_file == nullptr) {
 		DEBUG_ASSERTCRASH(m_file != nullptr, ("Failed to create replay file"));
 		return;
 	}
+	#if defined(_WIN64)
+	if (!beginNativeReplayContainer(m_file))
+	{
+		DEBUG_LOG(("RecorderClass::startRecording - failed to write RPL3 container header"));
+		m_file->close();
+		m_file = nullptr;
+		return;
+	}
+	#endif
 	// TheSuperHackers @info the null terminator needs to be ignored to maintain retail replay file layout
 	m_file->writeFormat("%s", s_genrep);
 
@@ -699,6 +880,12 @@ void RecorderClass::startRecording(GameDifficulty diff, Int originalGameMode, In
  */
 void RecorderClass::stopRecording() {
 	logGameEnd();
+	#if defined(_WIN64)
+	if (m_file != nullptr && !finalizeNativeReplayContainer(m_file))
+	{
+		DEBUG_LOG(("RecorderClass::stopRecording - failed to finalize RPL3 container"));
+	}
+	#endif
 	if (TheNetwork)
 	{
 		//if (TheLAN)
@@ -869,6 +1056,16 @@ Bool RecorderClass::readReplayHeader(ReplayHeader& header)
 		DEBUG_LOG(("Can't open %s (%s)", filepath.str(), header.filename.str()));
 		return FALSE;
 	}
+
+	#if defined(_WIN64)
+	if (!validateNativeReplayContainer(m_file))
+	{
+		DEBUG_LOG(("RecorderClass::readReplayHeader - invalid RPL3 replay container"));
+		m_file->close();
+		m_file = nullptr;
+		return FALSE;
+	}
+	#endif
 
 	// Read the GENREP header.
 	char genrep[sizeof(s_genrep) - 1] = {0};
