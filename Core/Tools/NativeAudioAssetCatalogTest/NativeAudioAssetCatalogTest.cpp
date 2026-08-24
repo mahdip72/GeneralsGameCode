@@ -193,6 +193,12 @@ int main()
 		AsciiString("Audio\\generated_attack.wav"), duration)
 		&& duration == 125.0f,
 		"generated Audio root is not duplicated when resolving a virtual asset name");
+	check(!rootedSource.getDurationMS(AsciiString("..\\main.wav"), duration),
+		"configured audio root rejects parent traversal");
+	check(!rootedSource.getDurationMS(AsciiString("Audio\\..\\main.wav"), duration),
+		"configured audio root rejects traversal through its virtual prefix");
+	check(!rootedSource.getDurationMS(AsciiString(mainPath.string().c_str()), duration),
+		"configured audio root rejects absolute paths");
 	const std::filesystem::path virtualPath = root / "virtual_main.wav";
 	writeWaveFile(virtualPath, 350U);
 	std::ifstream virtualInput(virtualPath, std::ios::binary | std::ios::ate);

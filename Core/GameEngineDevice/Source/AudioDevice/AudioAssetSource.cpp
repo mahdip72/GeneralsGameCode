@@ -35,6 +35,37 @@ struct WaveInfo
 	UnsignedShort bitsPerSample = 0;
 };
 
+bool pathComponentEqualsIgnoreCase(const std::filesystem::path &left,
+	const std::filesystem::path &right)
+{
+	const std::string leftText = left.string();
+	const std::string rightText = right.string();
+	if (leftText.size() != rightText.size()) {
+		return false;
+	}
+	for (std::size_t index = 0; index < leftText.size(); ++index) {
+		if (std::tolower(static_cast<unsigned char>(leftText[index]))
+			!= std::tolower(static_cast<unsigned char>(rightText[index]))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool isPathWithinRoot(const std::filesystem::path &root,
+	const std::filesystem::path &candidate)
+{
+	auto rootPart = root.begin();
+	auto candidatePart = candidate.begin();
+	for (; rootPart != root.end(); ++rootPart, ++candidatePart) {
+		if (candidatePart == candidate.end()
+			|| !pathComponentEqualsIgnoreCase(*rootPart, *candidatePart)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 bool readExact(std::ifstream &input, char *buffer, std::streamsize size)
 {
 	input.read(buffer, size);
@@ -750,27 +781,20 @@ std::string FileAudioAssetSource::resolvePath(const AsciiString &fileName) const
 {
 	try {
 		std::filesystem::path path(fileName.str() == nullptr ? "" : fileName.str());
-		if (!path.is_absolute() && !m_rootDirectory.empty()) {
-			const std::filesystem::path root(m_rootDirectory);
+		const bool hasRoot = !m_rootDirectory.empty();
+		std::filesystem::path root;
+		if (hasRoot) {
+			if (path.is_absolute()) {
+				return std::string();
+			}
+			root = std::filesystem::path(m_rootDirectory);
 			std::filesystem::path::const_iterator first = path.begin();
 			const std::string rootName = root.filename().string();
 			const std::string firstName = first == path.end() ? std::string() : first->string();
-			const auto equalsIgnoreCase = [](const std::string &left, const std::string &right) {
-				if (left.size() != right.size()) {
-					return false;
-				}
-				for (std::size_t index = 0; index < left.size(); ++index) {
-					if (std::tolower(static_cast<unsigned char>(left[index]))
-						!= std::tolower(static_cast<unsigned char>(right[index]))) {
-						return false;
-					}
-				}
-				return true;
-			};
 			// Audio settings commonly provide `Audio` as the root while generated
 			// event names already carry the `Audio\\` virtual prefix.  Joining both
 			// would silently turn every production lookup into `Audio\\Audio\\...`.
-			if (!rootName.empty() && equalsIgnoreCase(rootName, firstName)) {
+			if (!rootName.empty() && pathComponentEqualsIgnoreCase(rootName, firstName)) {
 				path = root.parent_path() / path;
 			} else {
 				path = root / path;
@@ -782,7 +806,23 @@ std::string FileAudioAssetSource::resolvePath(const AsciiString &fileName) const
 			error.clear();
 			path = std::filesystem::absolute(path, error);
 		}
-		return path.lexically_normal().string();
+		if (error) {
+			return std::string();
+		}
+		path = path.lexically_normal();
+
+		if (hasRoot) {
+			std::error_code rootError;
+			root = std::filesystem::weakly_canonical(root, rootError);
+			if (rootError) {
+				rootError.clear();
+				root = std::filesystem::absolute(root, rootError);
+			}
+			if (rootError || !isPathWithinRoot(root.lexically_normal(), path)) {
+				return std::string();
+			}
+		}
+		return path.string();
 	} catch (...) {
 		return std::string();
 	}
