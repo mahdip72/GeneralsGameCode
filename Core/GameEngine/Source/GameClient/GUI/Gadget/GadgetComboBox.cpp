@@ -322,7 +322,7 @@ WindowMsgHandledType GadgetComboBoxSystem( GameWindow *window, UnsignedInt msg,
 		// ------------------------------------------------------------------------
 		case GGM_SET_LABEL:
 		{
-			instData->setText(*(UnicodeString*)mData1);
+			instData->setText(*static_cast<UnicodeString *>(WindowMsgDataToPointer(mData1)));
 			break;
 
 		}
@@ -331,7 +331,7 @@ WindowMsgHandledType GadgetComboBoxSystem( GameWindow *window, UnsignedInt msg,
 		case GCM_GET_TEXT:
 		{
 			if(comboData->editBox)
-				*(UnicodeString*)mData2 = GadgetTextEntryGetText(comboData->editBox);
+				*static_cast<UnicodeString *>(WindowMsgDataToPointer(mData2)) = GadgetTextEntryGetText(comboData->editBox);
 			break;
 		}
 
@@ -339,7 +339,7 @@ WindowMsgHandledType GadgetComboBoxSystem( GameWindow *window, UnsignedInt msg,
 		case GCM_SET_TEXT:
 		{
 			if (comboData->editBox)
-				GadgetTextEntrySetText(comboData->editBox,*(const UnicodeString*)mData1);
+				GadgetTextEntrySetText(comboData->editBox,*static_cast<const UnicodeString *>(WindowMsgDataToPointer(mData1)));
 			break;
 
 		}
@@ -362,7 +362,7 @@ WindowMsgHandledType GadgetComboBoxSystem( GameWindow *window, UnsignedInt msg,
 		// if we get sent an edit done message from the text box, lets notify the parent
 		case GEM_EDIT_DONE:
 		{
-			if ((GameWindow *)mData1 == comboData->editBox)
+			if (static_cast<GameWindow *>(WindowMsgDataToPointer(mData1)) == comboData->editBox)
 			{
 				HideListBox(window);
 				TheWindowManager->winSendSystemMsg( window->winGetOwner(),
@@ -380,10 +380,10 @@ WindowMsgHandledType GadgetComboBoxSystem( GameWindow *window, UnsignedInt msg,
 			GameWindow *listBox = GadgetComboBoxGetListBox(window);
 			if(listBox)
 			{
-				if( !listBox->winIsHidden() && mData2 == TRUE )
+				if( !listBox->winIsHidden() && WindowMsgDataToInt(mData2) != 0 )
 					comboData->dontHide = TRUE;
 
-				GadgetListBoxSetSelected(listBox, (Int)mData1);
+				GadgetListBoxSetSelected(listBox, WindowMsgDataToInt(mData1));
 			}
 			break;
 		}
@@ -392,11 +392,12 @@ WindowMsgHandledType GadgetComboBoxSystem( GameWindow *window, UnsignedInt msg,
 		case GCM_GET_SELECTION:
 		{
 			if(comboData->listBox)
-				GadgetListBoxGetSelected(comboData->listBox, (Int *)mData2);
+				GadgetListBoxGetSelected(comboData->listBox,
+					static_cast<Int *>(WindowMsgDataToPointer(mData2)));
 			else
 			{
 				DEBUG_CRASH(("We don't have a listbox as part of the combo box"));
-				*(Int *)mData2 = -1;
+				*(Int *)WindowMsgDataToPointer(mData2) = -1;
 			}
 			break;
 		}
@@ -406,7 +407,7 @@ WindowMsgHandledType GadgetComboBoxSystem( GameWindow *window, UnsignedInt msg,
 		{
 			if(comboData->listBox)
 			{
-				GadgetListBoxSetItemData(comboData->listBox, (void *)mData2, (Int)mData1 );
+				GadgetListBoxSetItemData(comboData->listBox, WindowMsgDataToPointer(mData2), WindowMsgDataToInt(mData1) );
 			}
 
 			break;
@@ -417,7 +418,8 @@ WindowMsgHandledType GadgetComboBoxSystem( GameWindow *window, UnsignedInt msg,
 		{
 			if(comboData->listBox)
 			{
-				*(void **)mData2 = GadgetListBoxGetItemData(comboData->listBox, (Int) mData1, 0);
+				*(void **)WindowMsgDataToPointer(mData2) = GadgetListBoxGetItemData(
+					comboData->listBox, WindowMsgDataToInt(mData1), 0);
 			}
 			break;
 		}
@@ -425,7 +427,7 @@ WindowMsgHandledType GadgetComboBoxSystem( GameWindow *window, UnsignedInt msg,
 		// Pass onto the parent window the selection the listbox just made
 		case GLM_SELECTED:
 		{
-				if((GameWindow *) mData1 == comboData->listBox)
+				if(static_cast<GameWindow *>(WindowMsgDataToPointer(mData1)) == comboData->listBox)
 				{
 					if( comboData->dontHide == TRUE )
 					{
@@ -435,7 +437,7 @@ WindowMsgHandledType GadgetComboBoxSystem( GameWindow *window, UnsignedInt msg,
 						HideListBox(window);
 
 					// Nothing was actually selected, so we just want to
-					if( mData2 == -1)
+					if( WindowMsgDataToInt(mData2) == -1)
 					{
 						break;
 					}
@@ -443,7 +445,8 @@ WindowMsgHandledType GadgetComboBoxSystem( GameWindow *window, UnsignedInt msg,
 					//Grab the text that was selected
 					UnicodeString tempUString;
 					Color color;
-					tempUString = GadgetListBoxGetTextAndColor( comboData->listBox, &color, mData2, 0 );
+					tempUString = GadgetListBoxGetTextAndColor(
+						comboData->listBox, &color, WindowMsgDataToInt(mData2), 0 );
 
 					GadgetTextEntrySetTextColor(comboData->editBox, color);
 
@@ -508,7 +511,9 @@ WindowMsgHandledType GadgetComboBoxSystem( GameWindow *window, UnsignedInt msg,
 				if(comboData->entryCount >= listData->listLength)
 					GadgetListBoxSetListLength(listBox,listData->listLength * 2);
 				//Add the entry to the Listbox
-				addedIndex = GadgetListBoxAddEntryText( listBox, *(UnicodeString*)mData1, mData2, -1, 0 );
+				addedIndex = GadgetListBoxAddEntryText(
+					listBox, *(UnicodeString*)WindowMsgDataToPointer(mData1),
+					WindowMsgDataToInt(mData2), -1, 0 );
 
 				// Now resize the list box
 				ICoord2D winSize;
@@ -560,8 +565,8 @@ WindowMsgHandledType GadgetComboBoxSystem( GameWindow *window, UnsignedInt msg,
 		// ------------------------------------------------------------------------
 		case GGM_RESIZED:
 		{
-			Int width = (Int)mData1;
-			Int height = (Int)mData2;
+			Int width = WindowMsgDataToInt(mData1);
+			Int height = WindowMsgDataToInt(mData2);
 			ICoord2D dropDownSize;
 
 			// get needed window sizes
@@ -623,9 +628,10 @@ WindowMsgHandledType GadgetComboBoxSystem( GameWindow *window, UnsignedInt msg,
 			Bool wantsFocus = FALSE;
 			GameWindow *editBox = GadgetComboBoxGetEditBox(window);
 			// we need to tell the text entry box to take the focus.
-			TheWindowManager->winSendSystemMsg( editBox, GWM_INPUT_FOCUS, mData1, (WindowMsgData)&wantsFocus );
+			TheWindowManager->winSendSystemMsg( editBox, GWM_INPUT_FOCUS, mData1,
+				WindowMsgDataFromPointer(&wantsFocus) );
 
-			*(Bool*)mData2 = TRUE;
+			*static_cast<Bool *>(WindowMsgDataToPointer(mData2)) = TRUE;
 			break;
 
 		}
@@ -634,7 +640,7 @@ WindowMsgHandledType GadgetComboBoxSystem( GameWindow *window, UnsignedInt msg,
 		case GBM_SELECTED:
 		{
 			// See if the drop down button was selected
-			if( (GameWindow *)mData1 == comboData->dropDownButton )
+			if( static_cast<GameWindow *>(WindowMsgDataToPointer(mData1)) == comboData->dropDownButton )
 			{
 				ICoord2D winSize;
 				//ICoord2D winPosition;
@@ -925,7 +931,8 @@ Int GadgetComboBoxAddEntry( GameWindow *comboBox, UnicodeString text, Color colo
 	// sanity
 	if( comboBox == nullptr )
 		return -1;
-	return (Int)TheWindowManager->winSendSystemMsg( comboBox, GCM_ADD_ENTRY, (WindowMsgData)&text, color );
+	return WindowMsgDataToInt(TheWindowManager->winSendSystemMsg(
+			comboBox, GCM_ADD_ENTRY, WindowMsgDataFromPointer(&text), WindowMsgDataFromInt(color) ));
 }
 // GadgetComboBoxReset =======================================================
 /** Convenience wrapper function for resetting the Combo Box entries */
@@ -1053,7 +1060,8 @@ void GadgetComboBoxGetSelectedPos( GameWindow *comboBox, Int *selectedIndex )
 		return;
 
 	// get selected indices via system message
-	TheWindowManager->winSendSystemMsg( comboBox, GCM_GET_SELECTION, 0, (WindowMsgData)selectedIndex );
+	TheWindowManager->winSendSystemMsg( comboBox, GCM_GET_SELECTION, 0,
+		WindowMsgDataFromPointer(selectedIndex) );
 }
 
 // GadgetComboBoxSetSelectedPos ===============================================
@@ -1068,7 +1076,8 @@ void GadgetComboBoxSetSelectedPos( GameWindow *comboBox, Int selectedIndex, Bool
 		return;
 
 	// get selected indices via system message
-	TheWindowManager->winSendSystemMsg( comboBox, GCM_SET_SELECTION, selectedIndex, dontHide );
+	TheWindowManager->winSendSystemMsg( comboBox, GCM_SET_SELECTION,
+		WindowMsgDataFromInt(selectedIndex), WindowMsgDataFromInt(dontHide) );
 }
 // GadgetComboBoxSetItemData ==================================================
 /** Convenience wrapper function for setting the Item data for the listbox under the combo box */
@@ -1076,7 +1085,9 @@ void GadgetComboBoxSetSelectedPos( GameWindow *comboBox, Int selectedIndex, Bool
 void GadgetComboBoxSetItemData( GameWindow *comboBox, Int index, void *data )
 {
 	if (comboBox)
-		TheWindowManager->winSendSystemMsg( comboBox, GCM_SET_ITEM_DATA, index, (WindowMsgData)data);
+		TheWindowManager->winSendSystemMsg( comboBox, GCM_SET_ITEM_DATA,
+			WindowMsgDataFromInt(index),
+			WindowMsgDataFromPointer(data));
 }
 // GadgetComboBoxGetItemData ==================================================
 /** Convenience wrapper function for getting the Item data from the listbox under the combo Box */
@@ -1087,7 +1098,8 @@ void *GadgetComboBoxGetItemData( GameWindow *comboBox, Int index )
 
 	if (comboBox)
 	{
-		TheWindowManager->winSendSystemMsg( comboBox, GCM_GET_ITEM_DATA, index, (WindowMsgData)&data);
+		TheWindowManager->winSendSystemMsg( comboBox, GCM_GET_ITEM_DATA,
+			WindowMsgDataFromInt(index), WindowMsgDataFromPointer(&data));
 	}
 	return (data);
 }

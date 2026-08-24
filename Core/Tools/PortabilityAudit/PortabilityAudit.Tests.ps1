@@ -176,6 +176,13 @@ void save(void *value) { xfer(value, sizeof(void*)); }
     Set-FixtureFile $fixtureRoot 'untracked-asm.cpp' @'
 void copy() { __asm mov eax, ebx; }
 '@
+    Set-FixtureFile $fixtureRoot 'untracked-window-message.cpp' @'
+void callback(WindowMsgData mData1, WindowMsgData mData2)
+{
+  UnsignedByte key = mData1;
+  GameWindow *control = (GameWindow *)mData1;
+}
+'@
 
     $failure = Invoke-Audit $fixtureRoot $baseline
     Assert-Fixture ($failure.ExitCode -ne 0) 'growth fixture must fail closed'
@@ -187,6 +194,8 @@ void copy() { __asm mov eax, ebx; }
     Assert-Fixture ($failure.Output -match 'untracked-pointer\.cpp: pointer-to-32-bit-cast') 'untracked pointer-cast sources must be rejected'
     Assert-Fixture ($failure.Output -match 'untracked-serialization\.cpp: pointer-sized-serialization') 'untracked serialization sources must be rejected'
     Assert-Fixture ($failure.Output -match 'untracked-asm\.cpp: x86-inline-assembly-or-context') 'untracked inline-assembly sources must be rejected'
+    Assert-Fixture ($failure.Output -match 'untracked-window-message\.cpp: window-message-implicit-narrowing') 'untracked WindowMsgData scalar narrowing must be rejected'
+    Assert-Fixture ($failure.Output -match 'untracked-window-message\.cpp: window-message-raw-pointer-cast') 'untracked raw WindowMsgData pointer casts must be rejected'
 
     Set-FixtureFile $fixtureRoot 'Core/Libraries/Source/debug/debug_except.cpp' @'
 int Existing();
@@ -249,6 +258,7 @@ DX8Wrapper *wrapper;
     Remove-Item -LiteralPath (Join-Path $fixtureRoot 'untracked-pointer.cpp') -Force
     Remove-Item -LiteralPath (Join-Path $fixtureRoot 'untracked-serialization.cpp') -Force
     Remove-Item -LiteralPath (Join-Path $fixtureRoot 'untracked-asm.cpp') -Force
+    Remove-Item -LiteralPath (Join-Path $fixtureRoot 'untracked-window-message.cpp') -Force
     Remove-Item -LiteralPath (Join-Path $fixtureRoot 'Core/Libraries/Source/WWVegas/WW3D2/W3DWater.cpp') -Force
     Remove-Item -LiteralPath (Join-Path $fixtureRoot 'Core/GameEngine/CMakeLists.txt') -Force
 

@@ -719,24 +719,24 @@ Bool CommandButton::isValidObjectTarget(const Drawable* source, const Drawable* 
 const FieldParse CommandSet::m_commandSetFieldParseTable[] =
 {
 
-	{ "1",			CommandSet::parseCommandButton, (void *)nullptr,		offsetof( CommandSet, m_command ) },
-	{ "2",			CommandSet::parseCommandButton, (void *)1,		offsetof( CommandSet, m_command ) },
-	{ "3",			CommandSet::parseCommandButton, (void *)2,		offsetof( CommandSet, m_command ) },
-	{ "4",			CommandSet::parseCommandButton, (void *)3,		offsetof( CommandSet, m_command ) },
-	{ "5",			CommandSet::parseCommandButton, (void *)4,		offsetof( CommandSet, m_command ) },
-	{ "6",			CommandSet::parseCommandButton, (void *)5,		offsetof( CommandSet, m_command ) },
-	{ "7",			CommandSet::parseCommandButton, (void *)6,		offsetof( CommandSet, m_command ) },
-	{ "8",			CommandSet::parseCommandButton, (void *)7,		offsetof( CommandSet, m_command ) },
-	{ "9",			CommandSet::parseCommandButton, (void *)8,		offsetof( CommandSet, m_command ) },
-	{ "10",			CommandSet::parseCommandButton, (void *)9,		offsetof( CommandSet, m_command ) },
-	{ "11",			CommandSet::parseCommandButton, (void *)10,		offsetof( CommandSet, m_command ) },
-	{ "12",			CommandSet::parseCommandButton, (void *)11,		offsetof( CommandSet, m_command ) },
-	{ "13",			CommandSet::parseCommandButton, (void *)12,		offsetof( CommandSet, m_command ) },
-	{ "14",			CommandSet::parseCommandButton, (void *)13,		offsetof( CommandSet, m_command ) },
-	{ "15",			CommandSet::parseCommandButton, (void *)14,		offsetof( CommandSet, m_command ) },
-	{ "16",			CommandSet::parseCommandButton, (void *)15,		offsetof( CommandSet, m_command ) },
-	{ "17",			CommandSet::parseCommandButton, (void *)16,		offsetof( CommandSet, m_command ) },
-	{ "18",			CommandSet::parseCommandButton, (void *)17,		offsetof( CommandSet, m_command ) },
+	{ "1",			CommandSet::parseCommandButton, nullptr,		offsetof( CommandSet, m_command ) },
+	{ "2",			CommandSet::parseCommandButton, reinterpret_cast<const void *>(static_cast<uintptr_t>(1)),		offsetof( CommandSet, m_command ) },
+	{ "3",			CommandSet::parseCommandButton, reinterpret_cast<const void *>(static_cast<uintptr_t>(2)),		offsetof( CommandSet, m_command ) },
+	{ "4",			CommandSet::parseCommandButton, reinterpret_cast<const void *>(static_cast<uintptr_t>(3)),		offsetof( CommandSet, m_command ) },
+	{ "5",			CommandSet::parseCommandButton, reinterpret_cast<const void *>(static_cast<uintptr_t>(4)),		offsetof( CommandSet, m_command ) },
+	{ "6",			CommandSet::parseCommandButton, reinterpret_cast<const void *>(static_cast<uintptr_t>(5)),		offsetof( CommandSet, m_command ) },
+	{ "7",			CommandSet::parseCommandButton, reinterpret_cast<const void *>(static_cast<uintptr_t>(6)),		offsetof( CommandSet, m_command ) },
+	{ "8",			CommandSet::parseCommandButton, reinterpret_cast<const void *>(static_cast<uintptr_t>(7)),		offsetof( CommandSet, m_command ) },
+	{ "9",			CommandSet::parseCommandButton, reinterpret_cast<const void *>(static_cast<uintptr_t>(8)),		offsetof( CommandSet, m_command ) },
+	{ "10",			CommandSet::parseCommandButton, reinterpret_cast<const void *>(static_cast<uintptr_t>(9)),		offsetof( CommandSet, m_command ) },
+	{ "11",			CommandSet::parseCommandButton, reinterpret_cast<const void *>(static_cast<uintptr_t>(10)),		offsetof( CommandSet, m_command ) },
+	{ "12",			CommandSet::parseCommandButton, reinterpret_cast<const void *>(static_cast<uintptr_t>(11)),		offsetof( CommandSet, m_command ) },
+	{ "13",			CommandSet::parseCommandButton, reinterpret_cast<const void *>(static_cast<uintptr_t>(12)),		offsetof( CommandSet, m_command ) },
+	{ "14",			CommandSet::parseCommandButton, reinterpret_cast<const void *>(static_cast<uintptr_t>(13)),		offsetof( CommandSet, m_command ) },
+	{ "15",			CommandSet::parseCommandButton, reinterpret_cast<const void *>(static_cast<uintptr_t>(14)),		offsetof( CommandSet, m_command ) },
+	{ "16",			CommandSet::parseCommandButton, reinterpret_cast<const void *>(static_cast<uintptr_t>(15)),		offsetof( CommandSet, m_command ) },
+	{ "17",			CommandSet::parseCommandButton, reinterpret_cast<const void *>(static_cast<uintptr_t>(16)),		offsetof( CommandSet, m_command ) },
+	{ "18",			CommandSet::parseCommandButton, reinterpret_cast<const void *>(static_cast<uintptr_t>(17)),		offsetof( CommandSet, m_command ) },
 	{ nullptr,			nullptr,														 nullptr,				0	}
 
 };
@@ -823,7 +823,7 @@ void CommandSet::parseCommandButton( INI* ini, void *instance, void *store, cons
 
 	// get the index to store the command at, and the command array itself
 	const CommandButton **buttonArray = (const CommandButton **)store;
-	Int buttonIndex = (Int)userData;
+	Int buttonIndex = static_cast<Int>(reinterpret_cast<uintptr_t>(userData));
 
 	// sanity
 	DEBUG_ASSERTCRASH( buttonIndex < MAX_COMMANDS_PER_SET, ("parseCommandButton: button index '%d' out of range",

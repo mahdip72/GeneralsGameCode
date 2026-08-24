@@ -909,8 +909,8 @@ WindowMsgHandledType MainMenuInput( GameWindow *window, UnsignedInt msg,
 			if (!doShow)
 			{
 				ICoord2D mouse;
-				mouse.x = mData1 & 0xFFFF;
-				mouse.y = mData1 >> 16;
+				mouse.x = static_cast<Int>(WindowMsgDataToUnsignedInt(mData1) & 0xFFFF);
+				mouse.y = static_cast<Int>(WindowMsgDataToUnsignedInt(mData1) >> 16);
 
 				static Int mousePosX = mouse.x;
 				static Int mousePosY = mouse.y;

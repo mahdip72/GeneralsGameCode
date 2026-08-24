@@ -127,7 +127,7 @@ WindowMsgHandledType GadgetStaticTextSystem( GameWindow *window, UnsignedInt msg
 		{
 			TextData *tData = (TextData *)window->winGetUserData();
 			if (tData && tData->text)
-				*(UnicodeString*)mData2 = tData->text->getText();
+				*static_cast<UnicodeString *>(WindowMsgDataToPointer(mData2)) = tData->text->getText();
 			break;
 
 		}
@@ -139,7 +139,7 @@ WindowMsgHandledType GadgetStaticTextSystem( GameWindow *window, UnsignedInt msg
 			{
 				TextData *tData = (TextData *)window->winGetUserData();
 				if (tData && tData->text)
-					tData->text->setText( *(UnicodeString*)mData1 );
+					tData->text->setText( *static_cast<UnicodeString *>(WindowMsgDataToPointer(mData1)) );
 			}
 
       break;

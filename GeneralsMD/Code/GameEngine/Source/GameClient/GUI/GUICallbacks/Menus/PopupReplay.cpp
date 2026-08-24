@@ -196,8 +196,8 @@ WindowMsgHandledType PopupReplayInput( GameWindow *window, UnsignedInt msg, Wind
 		// --------------------------------------------------------------------------------------------
 		case GWM_CHAR:
 		{
-			UnsignedByte key = mData1;
-			UnsignedByte state = mData2;
+			UnsignedByte key = static_cast<UnsignedByte>(WindowMsgDataToUnsignedInt(mData1));
+			UnsignedByte state = static_cast<UnsignedByte>(WindowMsgDataToUnsignedInt(mData2));
 
 			switch( key )
 			{
@@ -372,7 +372,7 @@ WindowMsgHandledType PopupReplaySystem( GameWindow *window, UnsignedInt msg,
 		// --------------------------------------------------------------------------------------------
 		case GLM_SELECTED:
 		{
-			GameWindow *control = (GameWindow *)mData1;
+			GameWindow *control = static_cast<GameWindow *>(WindowMsgDataToPointer(mData1));
 
 			GameWindow *listboxGames = TheWindowManager->winGetWindowFromId( window, listboxGamesKey );
 			DEBUG_ASSERTCRASH( listboxGames != nullptr, ("PopupReplaySystem - Unable to find games listbox") );
@@ -383,7 +383,7 @@ WindowMsgHandledType PopupReplaySystem( GameWindow *window, UnsignedInt msg,
 			//
 			if( control == listboxGames )
 			{
-				int rowSelected = mData2;
+				int rowSelected = WindowMsgDataToInt(mData2);
 				if (rowSelected >= 0)
 				{
 					UnicodeString filename;
@@ -401,7 +401,7 @@ WindowMsgHandledType PopupReplaySystem( GameWindow *window, UnsignedInt msg,
     //---------------------------------------------------------------------------------------------
 		case GEM_EDIT_DONE:
 		{
-			GameWindow *control = (GameWindow *)mData1;
+			GameWindow *control = static_cast<GameWindow *>(WindowMsgDataToPointer(mData1));
 			Int controlID = control->winGetWindowId();
 
       if( controlID == textEntryReplayNameKey )
@@ -420,7 +420,7 @@ WindowMsgHandledType PopupReplaySystem( GameWindow *window, UnsignedInt msg,
     //---------------------------------------------------------------------------------------------
 		case GBM_SELECTED:
 		{
-			GameWindow *control = (GameWindow *)mData1;
+			GameWindow *control = static_cast<GameWindow *>(WindowMsgDataToPointer(mData1));
 			Int controlID = control->winGetWindowId();
 
       if( controlID == buttonSaveKey )

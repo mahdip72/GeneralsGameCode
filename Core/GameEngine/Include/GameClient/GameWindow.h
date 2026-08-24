@@ -78,6 +78,61 @@ enum { WIN_COLOR_UNDEFINED = GAME_COLOR_UNDEFINED };
 // pointer round-trips correct on native x64 builds.
 typedef uintptr_t WindowMsgData;
 
+// Keep the two representations explicit at this ABI boundary.  In
+// particular, converting a 32-bit gameplay scalar directly to void * is
+// ill-formed on x64 and converting a pointer directly to Int truncates its
+// high bits.  These helpers retain the old bit pattern on Win32 while making
+// the intended pointer-width conversion explicit for native x64 builds.
+inline WindowMsgData WindowMsgDataFromInt(Int value)
+{
+	return static_cast<WindowMsgData>(static_cast<intptr_t>(value));
+}
+
+inline Int WindowMsgDataToInt(WindowMsgData value)
+{
+	return static_cast<Int>(static_cast<intptr_t>(value));
+}
+
+inline WindowMsgData WindowMsgDataFromUnsignedInt(UnsignedInt value)
+{
+	return static_cast<WindowMsgData>(static_cast<uintptr_t>(value));
+}
+
+inline UnsignedInt WindowMsgDataToUnsignedInt(WindowMsgData value)
+{
+	return static_cast<UnsignedInt>(static_cast<uintptr_t>(value));
+}
+
+inline WindowMsgData WindowMsgDataFromPointer(const void *value)
+{
+	return reinterpret_cast<WindowMsgData>(value);
+}
+
+inline void *WindowMsgDataToPointer(WindowMsgData value)
+{
+	return reinterpret_cast<void *>(value);
+}
+
+inline void *GadgetItemDataFromInt(Int value)
+{
+	return WindowMsgDataToPointer(WindowMsgDataFromInt(value));
+}
+
+inline Int GadgetItemDataToInt(const void *value)
+{
+	return WindowMsgDataToInt(WindowMsgDataFromPointer(value));
+}
+
+inline void *GadgetItemDataFromUnsignedInt(UnsignedInt value)
+{
+	return WindowMsgDataToPointer(WindowMsgDataFromUnsignedInt(value));
+}
+
+inline UnsignedInt GadgetItemDataToUnsignedInt(const void *value)
+{
+	return WindowMsgDataToUnsignedInt(WindowMsgDataFromPointer(value));
+}
+
 //-----------------------------------------------------------------------------
 enum WindowMsgHandledType CPP_11(: Int) { MSG_IGNORED, MSG_HANDLED };
 

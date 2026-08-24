@@ -147,7 +147,7 @@ WindowMsgHandledType GadgetHorizontalSliderInput( GameWindow *window, UnsignedIn
 		case GWM_LEFT_UP:
 		{
 			Int x, y;
-			Int mousex = mData1 & 0xFFFF;
+			Int mousex = static_cast<Int>(WindowMsgDataToUnsignedInt(mData1) & 0xFFFF);
 //			Int mousey = mData1 >> 16;
 
 			GameWindow *child = window->winGetChild();
@@ -302,7 +302,7 @@ WindowMsgHandledType GadgetHorizontalSliderSystem( GameWindow *window, UnsignedI
 		// ------------------------------------------------------------------------
 		case GGM_LEFT_DRAG:
 		{
-			Int mousex = mData2 & 0xFFFF;
+			Int mousex = static_cast<Int>(WindowMsgDataToUnsignedInt(mData2) & 0xFFFF);
 //			Int mousey = mData2 >> 16;
 			Int x, y, delta;
 			GameWindow *child = window->winGetChild();
@@ -391,7 +391,7 @@ WindowMsgHandledType GadgetHorizontalSliderSystem( GameWindow *window, UnsignedI
 		// ------------------------------------------------------------------------
 		case GSM_SET_SLIDER:
 		{
-			Int newPos = (Int)mData1;
+			Int newPos = WindowMsgDataToInt(mData1);
 			GameWindow *child = window->winGetChild();
 
 			// TheSuperHackers @fix No longer reject out of bounds positions to prevent
@@ -416,8 +416,8 @@ WindowMsgHandledType GadgetHorizontalSliderSystem( GameWindow *window, UnsignedI
 
 			window->winGetSize( &size.x, &size.y );
 
-			s->minVal = (Int)mData1;
-			s->maxVal = (Int)mData2;
+			s->minVal = WindowMsgDataToInt(mData1);
+			s->maxVal = WindowMsgDataToInt(mData2);
 			s->numTicks = (Real)(size.x - HORIZONTAL_SLIDER_THUMB_WIDTH)/(Real)(s->maxVal - s->minVal);
 			s->position = s->minVal;
 
@@ -452,7 +452,7 @@ WindowMsgHandledType GadgetHorizontalSliderSystem( GameWindow *window, UnsignedI
 																					mData1,
 																					window->winGetWindowId() );
 
-			*(Bool*)mData2 = TRUE;
+			*static_cast<Bool *>(WindowMsgDataToPointer(mData2)) = TRUE;
 			break;
 
 		}
@@ -461,7 +461,7 @@ WindowMsgHandledType GadgetHorizontalSliderSystem( GameWindow *window, UnsignedI
 		case GGM_RESIZED:
 		{
 //			Int width = (Int)mData1;
-			Int height = (Int)mData2;
+			Int height = WindowMsgDataToInt(mData2);
 			GameWindow *thumb = window->winGetChild();
 
 			if( thumb )

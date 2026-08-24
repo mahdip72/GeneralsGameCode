@@ -313,8 +313,8 @@ WindowMsgHandledType SaveLoadMenuInput( GameWindow *window, UnsignedInt msg, Win
 		// --------------------------------------------------------------------------------------------
 		case GWM_CHAR:
 		{
-			UnsignedByte key = mData1;
-			UnsignedByte state = mData2;
+			UnsignedByte key = static_cast<UnsignedByte>(WindowMsgDataToUnsignedInt(mData1));
+			UnsignedByte state = static_cast<UnsignedByte>(WindowMsgDataToUnsignedInt(mData2));
 
 			switch( key )
 			{
@@ -542,12 +542,12 @@ WindowMsgHandledType SaveLoadMenuSystem( GameWindow *window, UnsignedInt msg,
     //----------------------------------------------------------------------------------------------
 		case GLM_DOUBLE_CLICKED:
 			{
-				GameWindow *control = (GameWindow *)mData1;
+				GameWindow *control = static_cast<GameWindow *>(WindowMsgDataToPointer(mData1));
 				GameWindow *listboxGames = TheWindowManager->winGetWindowFromId( window, listboxGamesKey );
 				DEBUG_ASSERTCRASH( listboxGames != nullptr, ("SaveLoadMenuInit - Unable to find games listbox") );
 
 				if (listboxGames != nullptr) {
-					int rowSelected = mData2;
+					int rowSelected = WindowMsgDataToInt(mData2);
 					GadgetListBoxSetSelected(listboxGames, rowSelected);
 
 					if (control == listboxGames)
@@ -561,7 +561,7 @@ WindowMsgHandledType SaveLoadMenuSystem( GameWindow *window, UnsignedInt msg,
 		// --------------------------------------------------------------------------------------------
 		case GLM_SELECTED:
 		{
-			GameWindow *control = (GameWindow *)mData1;
+			GameWindow *control = static_cast<GameWindow *>(WindowMsgDataToPointer(mData1));
 
 			GameWindow *listboxGames = TheWindowManager->winGetWindowFromId( window, listboxGamesKey );
 			DEBUG_ASSERTCRASH( listboxGames != nullptr, ("SaveLoadMenuInit - Unable to find games listbox") );
@@ -580,7 +580,7 @@ WindowMsgHandledType SaveLoadMenuSystem( GameWindow *window, UnsignedInt msg,
     //---------------------------------------------------------------------------------------------
 		case GBM_SELECTED:
 		{
-			GameWindow *control = (GameWindow *)mData1;
+			GameWindow *control = static_cast<GameWindow *>(WindowMsgDataToPointer(mData1));
 			Int controlID = control->winGetWindowId();
 
       if( controlID == buttonLoadKey )

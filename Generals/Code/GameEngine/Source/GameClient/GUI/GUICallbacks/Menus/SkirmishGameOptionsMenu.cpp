@@ -842,7 +842,7 @@ static void handlePlayerSelection(int index)
 	Int playerType, selIndex;
 	GadgetComboBoxGetSelectedPos(combo, &selIndex);
   UnicodeString title = GadgetComboBoxGetText(combo);
-	playerType = (Int)GadgetComboBoxGetItemData(combo, selIndex);
+	playerType = GadgetItemDataToInt(GadgetComboBoxGetItemData(combo, selIndex));
 	GameInfo *myGame = TheSkirmishGameInfo;
 
 	if (myGame)
@@ -861,7 +861,7 @@ static void handleColorSelection(int index)
 	GameWindow *combo = comboBoxColor[index];
 	Int color, selIndex;
 	GadgetComboBoxGetSelectedPos(combo, &selIndex);
-	color = (Int)GadgetComboBoxGetItemData(combo, selIndex);
+	color = GadgetItemDataToInt(GadgetComboBoxGetItemData(combo, selIndex));
 
 	GameInfo *myGame = TheSkirmishGameInfo;
 
@@ -901,7 +901,7 @@ static void handlePlayerTemplateSelection(int index)
 	GameWindow *combo = comboBoxPlayerTemplate[index];
 	Int playerTemplate, selIndex;
 	GadgetComboBoxGetSelectedPos(combo, &selIndex);
-	playerTemplate = (Int)GadgetComboBoxGetItemData(combo, selIndex);
+	playerTemplate = GadgetItemDataToInt(GadgetComboBoxGetItemData(combo, selIndex));
 	GameInfo *myGame = TheSkirmishGameInfo;
 
 	if (myGame)
@@ -954,7 +954,7 @@ static void handleTeamSelection(int index)
 	GameWindow *combo = comboBoxTeam[index];
 	Int team, selIndex;
 	GadgetComboBoxGetSelectedPos(combo, &selIndex);
-	team = (Int)GadgetComboBoxGetItemData(combo, selIndex);
+	team = GadgetItemDataToInt(GadgetComboBoxGetItemData(combo, selIndex));
 	GameInfo *myGame = TheSkirmishGameInfo;
 
 	if (myGame)
@@ -1032,15 +1032,15 @@ void InitSkirmishGameGadgets()
 		else
 		{
       GadgetComboBoxAddEntry(comboBoxPlayer[i],TheGameText->fetch("GUI:Open"),white);  // leave this first
-      GadgetComboBoxSetItemData(comboBoxPlayer[i], 0, (void *)SLOT_OPEN);
+      GadgetComboBoxSetItemData(comboBoxPlayer[i], 0, GadgetItemDataFromInt(SLOT_OPEN));
 			GadgetComboBoxAddEntry(comboBoxPlayer[i],TheGameText->fetch("GUI:Closed"),white);  // leave this first
-      GadgetComboBoxSetItemData(comboBoxPlayer[i], 1, (void *)SLOT_CLOSED);
+      GadgetComboBoxSetItemData(comboBoxPlayer[i], 1, GadgetItemDataFromInt(SLOT_CLOSED));
 			GadgetComboBoxAddEntry(comboBoxPlayer[i],TheGameText->fetch("GUI:EasyAI"),white);
-      GadgetComboBoxSetItemData(comboBoxPlayer[i], 2, (void *)SLOT_EASY_AI);
+      GadgetComboBoxSetItemData(comboBoxPlayer[i], 2, GadgetItemDataFromInt(SLOT_EASY_AI));
 			GadgetComboBoxAddEntry(comboBoxPlayer[i],TheGameText->fetch("GUI:MediumAI"),white);
-      GadgetComboBoxSetItemData(comboBoxPlayer[i], 3, (void *)SLOT_MED_AI);
+      GadgetComboBoxSetItemData(comboBoxPlayer[i], 3, GadgetItemDataFromInt(SLOT_MED_AI));
 			GadgetComboBoxAddEntry(comboBoxPlayer[i],TheGameText->fetch("GUI:HardAI"),white);
-      GadgetComboBoxSetItemData(comboBoxPlayer[i], 4, (void *)SLOT_BRUTAL_AI);
+      GadgetComboBoxSetItemData(comboBoxPlayer[i], 4, GadgetItemDataFromInt(SLOT_BRUTAL_AI));
 			GadgetComboBoxSetSelectedPos(comboBoxPlayer[i],0);
 
 		}
@@ -1485,7 +1485,7 @@ WindowMsgHandledType SkirmishGameOptionsMenuSystem( GameWindow *window, Unsigned
 		case GSM_SLIDER_TRACK:
 		{
 			GameWindow *control = (GameWindow *)mData1;
-			Int sliderPos = (Int)mData2;
+			Int sliderPos = WindowMsgDataToInt(mData2);
 			Int controlID = control->winGetWindowId();
 			if(controlID == sliderGameSpeedID)
 			{

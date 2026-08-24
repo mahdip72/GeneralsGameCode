@@ -209,7 +209,7 @@ static void gameTooltip(GameWindow *window,
 		return;
 	}
 
-	Int gameID = (Int)GadgetListBoxGetItemData(window, row, 0);
+	Int gameID = GadgetItemDataToInt(GadgetListBoxGetItemData(window, row, 0));
 	GameSpyStagingRoom *room = TheGameSpyInfo->findStagingRoomByID(gameID);
 	if (!room)
 	{
@@ -570,7 +570,7 @@ static Int insertGame( GameWindow *win, GameSpyStagingRoom *game, Bool showMap )
 
 
 	Int index = GadgetListBoxAddEntryText(win, game->getGameName(), gameColor, -1, COLUMN_NAME);
-	GadgetListBoxSetItemData(win, (void *)game->getID(), index);
+	GadgetListBoxSetItemData(win, GadgetItemDataFromInt(game->getID()), index);
 
 	UnicodeString s;
 
@@ -696,7 +696,7 @@ void RefreshGameListBox( GameWindow *win, Bool showMap )
 	GadgetListBoxGetSelected(win, &selectedIndex);
 	if (selectedIndex != -1 )
 	{
-		selectedID = (Int)GadgetListBoxGetItemData(win, selectedIndex);
+		selectedID = GadgetItemDataToInt(GadgetListBoxGetItemData(win, selectedIndex));
 	}
 	int prevPos = GadgetListBoxGetTopVisibleEntry( win );
 
@@ -887,7 +887,7 @@ void playerTemplateComboBoxTooltip(GameWindow *wndComboBox, WinInstanceData *ins
 {
 	Int index = 0;
 	GadgetComboBoxGetSelectedPos(wndComboBox, &index);
-	Int templateNum = (Int)GadgetComboBoxGetItemData(wndComboBox, index);
+	Int templateNum = GadgetItemDataToInt(GadgetComboBoxGetItemData(wndComboBox, index));
 	UnicodeString ustringTooltip;
 	if (templateNum == -1)
 	{
@@ -918,7 +918,7 @@ void playerTemplateListBoxTooltip(GameWindow *wndListBox, WinInstanceData *instD
 	if (row == -1 || col == -1)
 		return;
 
-	Int templateNum = (Int)GadgetListBoxGetItemData(wndListBox, row, col);
+	Int templateNum = GadgetItemDataToInt(GadgetListBoxGetItemData(wndListBox, row, col));
 	UnicodeString ustringTooltip;
 	if (templateNum == -1)
 	{

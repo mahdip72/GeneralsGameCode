@@ -157,8 +157,8 @@ WindowMsgHandledType CreditsMenuInput( GameWindow *window, UnsignedInt msg,
 		// --------------------------------------------------------------------------------------------
 		case GWM_CHAR:
 		{
-			UnsignedByte key = mData1;
-			UnsignedByte state = mData2;
+			UnsignedByte key = static_cast<UnsignedByte>(WindowMsgDataToUnsignedInt(mData1));
+			UnsignedByte state = static_cast<UnsignedByte>(WindowMsgDataToUnsignedInt(mData2));
 
 			switch( key )
 			{

@@ -209,8 +209,8 @@ WindowMsgHandledType LanMapSelectMenuInput( GameWindow *window, UnsignedInt msg,
 		// --------------------------------------------------------------------------------------------
 		case GWM_CHAR:
 		{
-			UnsignedByte key = mData1;
-			UnsignedByte state = mData2;
+			UnsignedByte key = static_cast<UnsignedByte>(WindowMsgDataToUnsignedInt(mData1));
+			UnsignedByte state = static_cast<UnsignedByte>(WindowMsgDataToUnsignedInt(mData2));
 
 			switch( key )
 			{
@@ -295,11 +295,11 @@ WindowMsgHandledType LanMapSelectMenuSystem( GameWindow *window, UnsignedInt msg
 		//---------------------------------------------------------------------------------------------
 		case GLM_DOUBLE_CLICKED:
 			{
-				GameWindow *control = (GameWindow *)mData1;
+				GameWindow *control = static_cast<GameWindow *>(WindowMsgDataToPointer(mData1));
 				Int controlID = control->winGetWindowId();
 				if( controlID == listboxMap )
 				{
-					int rowSelected = mData2;
+					int rowSelected = WindowMsgDataToInt(mData2);
 
 					if (rowSelected >= 0)
 					{
@@ -315,7 +315,7 @@ WindowMsgHandledType LanMapSelectMenuSystem( GameWindow *window, UnsignedInt msg
 		//---------------------------------------------------------------------------------------------
 		case GBM_SELECTED:
 		{
-			GameWindow *control = (GameWindow *)mData1;
+			GameWindow *control = static_cast<GameWindow *>(WindowMsgDataToPointer(mData1));
 			Int controlID = control->winGetWindowId();
 
 			if ( controlID == radioButtonSystemMapsID )
@@ -412,11 +412,11 @@ WindowMsgHandledType LanMapSelectMenuSystem( GameWindow *window, UnsignedInt msg
 		case GLM_SELECTED:
 			{
 
-				GameWindow *control = (GameWindow *)mData1;
+				GameWindow *control = static_cast<GameWindow *>(WindowMsgDataToPointer(mData1));
 				Int controlID = control->winGetWindowId();
 				if( controlID == listboxMap )
 				{
-					int rowSelected = mData2;
+					int rowSelected = WindowMsgDataToInt(mData2);
 					if( rowSelected < 0 )
 					{
 						positionStartSpots( AsciiString::TheEmptyString, buttonMapStartPosition, winMapPreview);

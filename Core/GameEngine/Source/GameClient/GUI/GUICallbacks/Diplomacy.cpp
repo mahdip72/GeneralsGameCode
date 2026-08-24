@@ -349,7 +349,7 @@ WindowMsgHandledType DiplomacyInput( GameWindow *window, UnsignedInt msg,
 		// --------------------------------------------------------------------------------------------
 		case GWM_CHAR:
 		{
-			UnsignedByte key = mData1;
+			UnsignedByte key = static_cast<UnsignedByte>(WindowMsgDataToUnsignedInt(mData1));
 //			UnsignedByte state = mData2;
 
 			switch( key )
@@ -399,7 +399,7 @@ WindowMsgHandledType DiplomacySystem( GameWindow *window, UnsignedInt msg,
 		{
 			// if we're given the opportunity to take the keyboard focus we must say we don't want it
 			if( mData1 == TRUE )
-				*(Bool *)mData2 = FALSE;
+				*static_cast<Bool *>(WindowMsgDataToPointer(mData2)) = FALSE;
 
 			return MSG_HANDLED;
 		}
@@ -407,7 +407,7 @@ WindowMsgHandledType DiplomacySystem( GameWindow *window, UnsignedInt msg,
 		//---------------------------------------------------------------------------------------------
 		case GBM_SELECTED:
 		{
-			GameWindow *control = (GameWindow *)mData1;
+			GameWindow *control = static_cast<GameWindow *>(WindowMsgDataToPointer(mData1));
 			NameKeyType controlID = (NameKeyType)control->winGetWindowId();
 			static NameKeyType buttonHideID = NAMEKEY( "Diplomacy.wnd:ButtonHide" );
 			if (controlID == buttonHideID)

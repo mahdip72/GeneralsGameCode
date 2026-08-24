@@ -328,7 +328,7 @@ WindowMsgHandledType GadgetRadioButtonSystem( GameWindow *window, UnsignedInt ms
 			{
 
 				// do we want to send a selected message?
-				if( (Bool)mData1 == TRUE )
+				if( WindowMsgDataToInt(mData1) != 0 )
 				{
 
 					TheWindowManager->winSendSystemMsg( window->winGetOwner(),
@@ -358,7 +358,7 @@ WindowMsgHandledType GadgetRadioButtonSystem( GameWindow *window, UnsignedInt ms
 		case GGM_SET_LABEL:
 		{
 
-			window->winSetText( *(UnicodeString*)mData1 );
+			window->winSetText( *static_cast<UnicodeString *>(WindowMsgDataToPointer(mData1)) );
 			break;
 
 		}
@@ -390,7 +390,7 @@ WindowMsgHandledType GadgetRadioButtonSystem( GameWindow *window, UnsignedInt ms
 																					mData1,
 																					window->winGetWindowId() );
 
-			*(Bool*)mData2 = TRUE;
+			*static_cast<Bool *>(WindowMsgDataToPointer(mData2)) = TRUE;
 			break;
 
 		}

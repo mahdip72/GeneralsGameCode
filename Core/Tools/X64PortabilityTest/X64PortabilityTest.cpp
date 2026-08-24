@@ -23,10 +23,42 @@ int check(bool condition, const char *name)
 	}
 	return 0;
 }
+
+int checkUiScalarConversions()
+{
+	const Int signedValues[] = { 0, 1, -1, INT32_MIN, INT32_MAX };
+	for (UnsignedInt index = 0; index < sizeof(signedValues) / sizeof(signedValues[0]); ++index)
+	{
+		const Int value = signedValues[index];
+		if (check(GadgetItemDataToInt(GadgetItemDataFromInt(value)) == value,
+			"signed gadget item data must round-trip through a pointer-sized value") != 0)
+			return 1;
+		if (check(WindowMsgDataToInt(WindowMsgDataFromInt(value)) == value,
+			"signed window message data must round-trip through a pointer-sized value") != 0)
+			return 1;
+	}
+
+	const UnsignedInt unsignedValues[] = { 0U, 1U, UINT32_MAX };
+	for (UnsignedInt index = 0; index < sizeof(unsignedValues) / sizeof(unsignedValues[0]); ++index)
+	{
+		const UnsignedInt value = unsignedValues[index];
+		if (check(GadgetItemDataToUnsignedInt(GadgetItemDataFromUnsignedInt(value)) == value,
+			"unsigned gadget item data must round-trip through a pointer-sized value") != 0)
+			return 1;
+		if (check(WindowMsgDataToUnsignedInt(WindowMsgDataFromUnsignedInt(value)) == value,
+			"unsigned window message data must round-trip through a pointer-sized value") != 0)
+			return 1;
+	}
+
+	return 0;
+}
 }
 
 int main()
 {
+	if (checkUiScalarConversions() != 0)
+		return 1;
+
 	const uintptr_t syntheticAddress = UINT64_C(0x0000000100001234);
 	void *pointer = reinterpret_cast<void *>(syntheticAddress);
 	const uintptr_t pointerBits = reinterpret_cast<uintptr_t>(pointer);

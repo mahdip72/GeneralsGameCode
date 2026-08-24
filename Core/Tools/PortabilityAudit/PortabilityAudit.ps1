@@ -377,6 +377,21 @@ $rules = @(
         RejectAddedLine = $true
     },
     [pscustomobject]@{
+        Name = 'window-message-implicit-narrowing'
+        # WindowMsgData is pointer-sized on x64.  Scalar payloads must pass
+        # through an explicit width-preserving helper before being assigned to
+        # the legacy 8/16/32-bit gameplay types.
+        Pattern = '(?<![A-Za-z0-9_])(?:UnsignedByte|Byte|char|WideChar|Int|int|UnsignedInt|unsigned|Bool|Color|UnsignedShort|short|long|float|double|NameKeyType)\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*mData[123]\b'
+        RejectAddedLine = $true
+    },
+    [pscustomobject]@{
+        Name = 'window-message-raw-pointer-cast'
+        # A C-style cast hides the ABI boundary and makes accidental pointer
+        # truncation easy to reintroduce.  Use WindowMsgDataToPointer instead.
+        Pattern = '\(\s*(?:const\s+)?[A-Za-z_][A-Za-z0-9_:<>]*\s*\*+\s*\)\s*mData[123]\b'
+        RejectAddedLine = $true
+    },
+    [pscustomobject]@{
         Name = $rawD3D8RuleName
         # The wrapper is the temporary migration facade; calling it is not a
         # raw D3D8 dependency. Ratchet only legacy API types/constants that
