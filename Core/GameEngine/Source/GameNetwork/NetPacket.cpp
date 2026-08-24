@@ -66,7 +66,16 @@ NetCommandRef *NetPacket::ConstructNetCommandMsgFromRawData(const UnsignedByte *
 
 	NetPacketBuf buf(data, dataLength);
 	NetCommandRef *ref = nullptr;
-	constructNetCommandRef(ref, commandBase, buf);
+	const size_t consumedBytes = constructNetCommandRef(ref, commandBase, buf);
+
+	if (ref != nullptr && (consumedBytes != dataLength ||
+		ref->getCommand()->getSizeForNetPacket() != dataLength))
+	{
+		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET,
+			("NetPacket::ConstructNetCommandMsgFromRawData - incomplete or non-canonical command record"));
+		deleteInstance(ref);
+		ref = nullptr;
+	}
 
 	if (ref == nullptr)
 	{

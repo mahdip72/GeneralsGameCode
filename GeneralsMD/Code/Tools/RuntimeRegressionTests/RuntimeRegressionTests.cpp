@@ -10,6 +10,7 @@
 
 #include "GameNetwork/NetCommandValidation.h"
 #include "GameNetwork/NetCommandWrapperList.h"
+#include "GameNetwork/NetPacket.h"
 #include "GameNetwork/NetPacketStructs.h"
 #include "GameNetwork/NetCommandRef.h"
 #include "GameNetwork/GameSpy/ThreadUtils.h"
@@ -211,6 +212,31 @@ static void TestMalformedGameCommandDeserialization()
 	CHECK(NetPacketGameCommandData::readMessage(ref, NetPacketBuf(truncatedDescriptors, size)) == size);
 	CHECK(msg.getPlayerID() == MAX_SLOTS);
 	CHECK(msg.getGameMessageType() == GameMessage::MSG_INVALID);
+}
+
+static void TestWrappedCommandRequiresCompleteWireRecord()
+{
+	UnsignedByte data[sizeof(NetPacketGameCommandBase::CommandBase) + sizeof(Int) + sizeof(UnsignedByte)] = { 0 };
+	NetPacketGameCommandBase::CommandBase base;
+	base.commandType.commandType = static_cast<UnsignedByte>(NETCOMMANDTYPE_GAMECOMMAND);
+	base.frame.frame = 0;
+	base.relay.relay = 0;
+	base.playerId.playerId = 0;
+	base.commandId.commandId = 1;
+
+	size_t size = network::writeObject(data, base);
+	size += network::writePrimitive(data + size, static_cast<Int>(GameMessage::MSG_SELECTED_GROUP_COMMAND));
+	size += network::writePrimitive(data + size, static_cast<UnsignedByte>(0));
+
+	NetCommandRef *valid = NetPacket::ConstructNetCommandMsgFromRawData(data, static_cast<UnsignedInt>(size));
+	CHECK(valid != nullptr);
+	if (valid != nullptr)
+		deleteInstance(valid);
+
+	NetCommandRef *truncated = NetPacket::ConstructNetCommandMsgFromRawData(data, static_cast<UnsignedInt>(size - 1));
+	CHECK(truncated == nullptr);
+	if (truncated != nullptr)
+		deleteInstance(truncated);
 }
 
 static NetWrapperCommandMsg *CreateWrapperMessage(UnsignedByte playerID, UnsignedShort commandID,
@@ -968,6 +994,7 @@ int main(int argc, char **argv)
 	TestPacketRouterFallbackSelection();
 	TestGameCommandParsing();
 	TestMalformedGameCommandDeserialization();
+	TestWrappedCommandRequiresCompleteWireRecord();
 	TestWrapperLifecycle();
 	TestNetworkReceiveBudget();
 	TestStringConversionAndZeroLengthReads();
