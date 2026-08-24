@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <thread>
 #include <atomic>
@@ -258,6 +259,10 @@ void testValidationAndClosedAdmission()
 		"chunks over the decoder bound are dropped");
 	check(voice.submit(makeChunk(1, 0, 2)) == AudioPcmSubmitResult::DROPPED,
 		"stale generations are dropped");
+	invalid = makeChunk(0, 0, 2);
+	invalid.startSample = (std::numeric_limits<std::int64_t>::max)();
+	check(voice.submit(std::move(invalid)) == AudioPcmSubmitResult::DROPPED,
+		"chunks whose absolute end sample overflows are dropped");
 	check(backend.submitCalls == 0 && backend.criticalErrorCalls == 0,
 		"invalid and stale submissions do not call the backend");
 
@@ -283,6 +288,46 @@ void testPlayedSampleClockAndGeneration()
 		"buffer completion publishes the played sample position");
 	voice.reset(1);
 	check(!voice.getPlayedSample(playedSample), "generation reset rebases the played sample clock");
+	voice.close();
+}
+
+void testPlayedSampleClockIgnoresTimelineGaps()
+{
+	FakePcmVoiceBackend backend;
+	XAudio2PcmVoice voice(backend);
+	check(voice.open(), "discontinuity clock voice opens");
+	AudioPcmChunk first = makeChunk(0, 0, 10);
+	AudioPcmChunk afterGap = makeChunk(0, 1, 20);
+	afterGap.startSample = 1000;
+	afterGap.discontinuity = true;
+	check(voice.submit(std::move(first)) == AudioPcmSubmitResult::ACCEPTED
+			&& voice.submit(std::move(afterGap)) == AudioPcmSubmitResult::ACCEPTED,
+		"discontinuity clock admits both chunks");
+	voice.service();
+	backend.complete(0);
+	backend.complete(1);
+	std::int64_t playedSample = -1;
+	check(voice.getPlayedSample(playedSample) && playedSample == 4,
+		"played clock counts audible frames instead of absolute timeline gaps");
+	voice.close();
+}
+
+void testSameGenerationResetRejectsStaleClockCompletion()
+{
+	FakePcmVoiceBackend backend;
+	XAudio2PcmVoice voice(backend);
+	check(voice.open(), "same-generation clock reset voice opens");
+	check(voice.submit(makeChunk(0, 0, 30)) == AudioPcmSubmitResult::ACCEPTED,
+		"same-generation clock reset admits the old chunk");
+	voice.service();
+	voice.reset(0);
+	backend.complete(0);
+	std::int64_t playedSample = -1;
+	check(!voice.getPlayedSample(playedSample),
+		"same-generation reset keeps a stale completion out of the rebased clock");
+	voice.service();
+	check(!voice.getPlayedSample(playedSample),
+		"clock stays unavailable until new-generation audio completes");
 	voice.close();
 }
 
@@ -559,6 +604,8 @@ int main()
 	testOwnedStorageAndOwnerOnlyReclaim();
 	testValidationAndClosedAdmission();
 	testPlayedSampleClockAndGeneration();
+	testPlayedSampleClockIgnoresTimelineGaps();
+	testSameGenerationResetRejectsStaleClockCompletion();
 	testResetBarrierAndGenerationActivation();
 	testSameGenerationResetBarrier();
 	testTerminalFailures();

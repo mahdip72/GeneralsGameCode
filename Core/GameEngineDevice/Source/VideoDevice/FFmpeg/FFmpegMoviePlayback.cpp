@@ -437,7 +437,14 @@ bool FFmpegMoviePlayback::isAudioFrameAdmitted(const FFmpegFrameMetadata &metada
 		return true;
 	}
 	const std::int64_t timestampUs = timestampToMicroseconds(metadata);
-	if (timestampUs == INVALID_TIMESTAMP || timestampUs < m_seekTargetUs) {
+	if (timestampUs == INVALID_TIMESTAMP) {
+		// The file seek already established the new decode generation. Streams
+		// without timestamps cannot be compared with the video target, so admit
+		// their first post-seek frame instead of leaving audio gated forever.
+		m_audioGateActive = false;
+		return true;
+	}
+	if (timestampUs < m_seekTargetUs) {
 		return false;
 	}
 	m_audioGateActive = false;

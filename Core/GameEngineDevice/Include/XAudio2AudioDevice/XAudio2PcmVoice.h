@@ -157,6 +157,7 @@ private:
 	std::atomic<HRESULT> m_lastError;
 	std::atomic<std::int64_t> m_playedSample;
 	std::atomic<std::uint64_t> m_playedGeneration;
+	std::atomic<bool> m_clockPublicationEnabled;
 	std::uint64_t m_requestedGeneration;
 	std::uint64_t m_activeGeneration;
 	std::uint64_t m_nextCallbackToken;

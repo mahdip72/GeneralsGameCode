@@ -74,6 +74,8 @@ public:
 	std::int64_t videoPresentationTimeUs() const { return m_videoPresentationTimeUs; }
 
 private:
+	friend class FFmpegMoviePlaybackTestAccess;
+
 	class SilentSink;
 	class GainSink;
 

@@ -37,6 +37,7 @@ XAudio2PcmVoice::XAudio2PcmVoice(IXAudio2PcmVoiceBackend &backend) :
 	m_lastError(S_OK),
 	m_playedSample(-1),
 	m_playedGeneration(0),
+	m_clockPublicationEnabled(false),
 	m_requestedGeneration(0),
 	m_activeGeneration(0),
 	m_nextCallbackToken(1),
@@ -68,7 +69,8 @@ bool XAudio2PcmVoice::isValidChunk(const AudioPcmChunk &chunk)
 {
 	if (chunk.sampleRate != PCM_SAMPLE_RATE || chunk.channels != PCM_CHANNELS
 		|| chunk.format != AudioPcmFormat::SIGNED_16_INTERLEAVED_LITTLE_ENDIAN
-		|| chunk.frameCount == 0 || chunk.frameCount > PCM_MAX_CHUNK_FRAMES || chunk.startSample < 0) {
+		|| chunk.frameCount == 0 || chunk.frameCount > PCM_MAX_CHUNK_FRAMES || chunk.startSample < 0
+		|| chunk.startSample > (std::numeric_limits<std::int64_t>::max)() - chunk.frameCount) {
 		return false;
 	}
 	if (chunk.frameCount > (std::numeric_limits<std::size_t>::max)() / PCM_BYTES_PER_FRAME) {
@@ -108,6 +110,7 @@ bool XAudio2PcmVoice::open()
 	m_lastError.store(S_OK, std::memory_order_release);
 	m_playedSample.store(-1, std::memory_order_release);
 	m_playedGeneration.store(m_requestedGeneration, std::memory_order_release);
+	m_clockPublicationEnabled.store(true, std::memory_order_release);
 	const HRESULT result = m_backend.create(pcmFormat(), this);
 	if (FAILED(result)) {
 		m_lastError.store(result, std::memory_order_release);
@@ -268,6 +271,9 @@ void XAudio2PcmVoice::service()
 		m_started = false;
 		m_activeGeneration = m_requestedGeneration;
 		m_resetPending = false;
+		m_playedSample.store(-1, std::memory_order_release);
+		m_playedGeneration.store(m_activeGeneration, std::memory_order_release);
+		m_clockPublicationEnabled.store(true, std::memory_order_release);
 	}
 
 	for (;;) {
@@ -308,6 +314,7 @@ void XAudio2PcmVoice::close() noexcept
 	{
 		std::lock_guard<std::mutex> lock(m_mutex);
 		m_open.store(false, std::memory_order_release);
+		m_clockPublicationEnabled.store(false, std::memory_order_release);
 		destroyBackend = m_backendCreated;
 	}
 
@@ -345,6 +352,9 @@ void XAudio2PcmVoice::close() noexcept
 
 bool XAudio2PcmVoice::getPlayedSample(std::int64_t &sample) const noexcept
 {
+	if (!m_clockPublicationEnabled.load(std::memory_order_acquire)) {
+		return false;
+	}
 	const std::int64_t played = m_playedSample.load(std::memory_order_acquire);
 	if (played < 0) {
 		return false;
@@ -558,11 +568,13 @@ void XAudio2PcmVoice::reset(std::uint64_t generation)
 	std::lock_guard<std::mutex> lock(m_mutex);
 	const bool repeatedPendingReset = m_resetPending && m_requestedGeneration == generation;
 	m_requestedGeneration = generation;
-	m_playedSample.store(-1, std::memory_order_release);
-	m_playedGeneration.store(generation, std::memory_order_release);
+	m_clockPublicationEnabled.store(false, std::memory_order_release);
 	if (!m_open.load(std::memory_order_acquire)) {
 		m_activeGeneration = generation;
 		m_resetPending = false;
+		m_playedSample.store(-1, std::memory_order_release);
+		m_playedGeneration.store(generation, std::memory_order_release);
+		m_clockPublicationEnabled.store(true, std::memory_order_release);
 		return;
 	}
 	if (m_failed.load(std::memory_order_acquire)) {
@@ -624,13 +636,22 @@ void STDMETHODCALLTYPE XAudio2PcmVoice::OnBufferEnd(void *pBufferContext)
 		const std::uint64_t sequence = slot.chunk.sequence;
 		const std::int64_t endSample = slot.chunk.startSample
 			+ static_cast<std::int64_t>(slot.chunk.frameCount);
-		const bool currentGeneration = slot.generation
-			== m_playedGeneration.load(std::memory_order_acquire);
+		const bool currentGeneration = m_clockPublicationEnabled.load(std::memory_order_acquire)
+			&& slot.generation == m_playedGeneration.load(std::memory_order_acquire);
 		if (currentGeneration) {
 			std::int64_t previousSample = m_playedSample.load(std::memory_order_acquire);
-			while (previousSample < endSample
-				&& !m_playedSample.compare_exchange_weak(previousSample, endSample,
-					std::memory_order_release, std::memory_order_acquire)) {
+			for (;;) {
+				const std::int64_t completedFrames = static_cast<std::int64_t>(slot.chunk.frameCount);
+				if (previousSample > (std::numeric_limits<std::int64_t>::max)() - completedFrames) {
+					publishCallbackError(HRESULT_FROM_WIN32(ERROR_ARITHMETIC_OVERFLOW));
+					break;
+				}
+				const std::int64_t nextPlayedSample = previousSample < 0
+					? completedFrames : previousSample + completedFrames;
+				if (m_playedSample.compare_exchange_weak(previousSample, nextPlayedSample,
+						std::memory_order_release, std::memory_order_acquire)) {
+					break;
+				}
 			}
 		}
 		publishCompletion(XAudio2PcmCompletionRecord {

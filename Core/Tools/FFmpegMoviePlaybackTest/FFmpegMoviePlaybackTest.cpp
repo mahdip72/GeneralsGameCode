@@ -22,6 +22,15 @@ extern "C" {
 #include <utility>
 #include <vector>
 
+class FFmpegMoviePlaybackTestAccess
+{
+public:
+	static bool admitAudioFrame(FFmpegMoviePlayback &playback, const FFmpegFrameMetadata &metadata)
+	{
+		return playback.isAudioFrameAdmitted(metadata);
+	}
+};
+
 static_assert(UINTPTR_MAX == UINT64_MAX, "The native FFmpeg movie playback contract is x64-only.");
 
 static std::size_t g_capturedAvLogMessages = 0;
@@ -733,6 +742,27 @@ static bool testSeekAndGeneration(const char *audioPath)
     return playback.drainCount() == 1;
 }
 
+static bool testSeekAdmitsTimestampLessAudio(const char *audioPath)
+{
+	MemoryTestFile input(audioPath);
+	FFmpegFile file;
+	if (!openFile(audioPath, input, file)) {
+		return false;
+	}
+	RecordingSink sink;
+	FFmpegMoviePlayback playback(file, &sink);
+	if (!playback.seekFrame(6)) {
+		return false;
+	}
+	FFmpegFrameMetadata metadata;
+	metadata.streamType = AVMEDIA_TYPE_AUDIO;
+	metadata.timeBaseNumerator = 1;
+	metadata.timeBaseDenominator = 48000;
+	metadata.presentationTimestamp = (std::numeric_limits<std::int64_t>::min)();
+	return FFmpegMoviePlaybackTestAccess::admitAudioFrame(playback, metadata)
+		&& FFmpegMoviePlaybackTestAccess::admitAudioFrame(playback, metadata);
+}
+
 static bool testExplicitEndModesAndLoop(const char *audioPath)
 {
     PlaybackRun once;
@@ -906,6 +936,7 @@ int main(int argc, char **argv)
         { "terminal sink failure", [](const char *audio, const char *) { return testTerminalSinkFailure(audio); } },
         { "audio master clock", [](const char *audio, const char *) { return testAudioMasterClock(audio); } },
         { "seek and generation", [](const char *audio, const char *) { return testSeekAndGeneration(audio); } },
+        { "seek admits timestamp-less audio", [](const char *audio, const char *) { return testSeekAdmitsTimestampLessAudio(audio); } },
         { "explicit end modes and loop", [](const char *audio, const char *) { return testExplicitEndModesAndLoop(audio); } },
         { "loop reset clears frame before new generation", [](const char *audio, const char *) { return testLoopResetClearsFrameBeforeNewGeneration(audio); } },
         { "clock boundaries", [](const char *, const char *video) { return testClockBoundaries(video); } },
