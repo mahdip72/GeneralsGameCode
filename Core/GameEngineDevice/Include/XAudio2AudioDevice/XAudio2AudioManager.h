@@ -143,6 +143,7 @@ private:
 	void processPauseRequest(AudioHandle handle);
 	void startNextPhase(PlayingAudio &playing);
 	void finishPlaying(PlayingAudio &playing, Bool naturalCompletion = FALSE);
+	void failPlaying(PlayingAudio &playing);
 	void drainCompletions();
 	void processActiveAudio();
 	void processFades();

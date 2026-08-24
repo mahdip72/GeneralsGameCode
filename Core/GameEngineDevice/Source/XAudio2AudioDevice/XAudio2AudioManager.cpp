@@ -206,6 +206,11 @@ void XAudio2AudioManager::update()
 	// request admission, active records, fades, and listener-driven controls.
 	if (m_service != nullptr) {
 		m_service->serviceVoices();
+		for (PlayingAudio &playing : m_playing) {
+			if (playing.voiceOpen && m_service->isVoiceFailed(playing.voice)) {
+				failPlaying(playing);
+			}
+		}
 	}
 	drainCompletions();
 	if (TheTacticalView != nullptr) {
@@ -361,6 +366,7 @@ void XAudio2AudioManager::processPlayRequest(AudioRequest *request)
 	playing.channel = channelFor(*event);
 	playing.phase = event->getNextPlayPortion();
 	playing.generation = m_lifecycleGeneration;
+	playing.volume = event->getVolume();
 	std::vector<AudioHandle>::iterator forced = std::find(m_forcePlayHandles.begin(),
 		m_forcePlayHandles.end(), event->getPlayingHandle());
 	playing.forced = forced != m_forcePlayHandles.end();
@@ -385,7 +391,7 @@ void XAudio2AudioManager::processPlayRequest(AudioRequest *request)
 		UnsignedInt sameEvent = 0;
 		PlayingAudio *sameEventVictim = nullptr;
 		for (PlayingAudio &candidate : m_playing) {
-			if (!candidate.stopping && candidate.event != nullptr
+			if (!candidate.forced && !candidate.stopping && candidate.event != nullptr
 				&& candidate.event->getEventName() == event->getEventName()) {
 				++sameEvent;
 				if (sameEventVictim == nullptr
@@ -449,7 +455,7 @@ void XAudio2AudioManager::processPauseRequest(AudioHandle handle)
 void XAudio2AudioManager::startNextPhase(PlayingAudio &playing)
 {
 	if (playing.event == nullptr) {
-		playing.phase = PP_Done;
+		failPlaying(playing);
 		return;
 	}
 	playing.phase = playing.event->getNextPlayPortion();
@@ -494,11 +500,8 @@ void XAudio2AudioManager::startNextPhase(PlayingAudio &playing)
 					}
 				}
 			}
-			if (!ensureVoice(playing)) {
-				playing.voiceOpen = FALSE;
-			}
-			if (playing.voiceOpen) {
-				submitPhase(playing);
+			if (!ensureVoice(playing) || !submitPhase(playing)) {
+				failPlaying(playing);
 			}
 			return;
 		}
@@ -589,11 +592,17 @@ void XAudio2AudioManager::drainCompletions()
 						playing.phaseTotalFrames,
 						static_cast<UnsignedInt>(completion.endSample));
 				}
+				if (playing.fadeFrames > 0) {
+					playing.stopping = TRUE;
+					break;
+				}
 				if (playing.paused || playing.stopping) {
 					break;
 				}
 				if (playing.phaseSubmittedFrames < playing.phaseTotalFrames) {
-					submitPhase(playing);
+					if (!submitPhase(playing)) {
+						failPlaying(playing);
+					}
 				} else {
 					playing.phaseRemainingMS = 0.0f;
 				}
@@ -624,6 +633,11 @@ void XAudio2AudioManager::processActiveAudio()
 			++index;
 			continue;
 		}
+		if (playing.fadeFrames > 0 && playing.phaseRemainingMS <= 0.0f) {
+			finishPlaying(playing, FALSE);
+			m_playing.erase(m_playing.begin() + index);
+			continue;
+		}
 		if (!playing.stopping && playing.phaseRemainingMS <= 0.0f
 			&& playing.event->getDelay() > 0.0f) {
 			playing.event->decrementDelay(LOGIC_FRAME_MS);
@@ -646,6 +660,11 @@ void XAudio2AudioManager::processActiveAudio()
 				continue;
 			}
 			startNextPhase(playing);
+			if (playing.stopping) {
+				finishPlaying(playing, FALSE);
+				m_playing.erase(m_playing.begin() + index);
+				continue;
+			}
 		}
 		++index;
 	}
@@ -682,9 +701,18 @@ void XAudio2AudioManager::releaseVoice(PlayingAudio &playing)
 	playing.voice = {};
 }
 
+void XAudio2AudioManager::failPlaying(PlayingAudio &playing)
+{
+	playing.stopping = TRUE;
+	playing.phase = PP_Done;
+	playing.phaseRemainingMS = 0.0f;
+	playing.phaseDurationMS = 0.0f;
+	releaseVoice(playing);
+}
+
 void XAudio2AudioManager::finishPlaying(PlayingAudio &playing, Bool naturalCompletion)
 {
-	if (naturalCompletion) {
+	if (naturalCompletion && !playing.stopping && playing.fadeFrames <= 0) {
 		recordMusicCompletion(playing);
 	}
 	releaseVoice(playing);
@@ -745,7 +773,9 @@ void XAudio2AudioManager::resumeAudio(AudioAffect which)
 				m_service->resumeVoice(playing.voice);
 			}
 			if (playing.phaseSubmittedFrames < playing.phaseTotalFrames) {
-				submitPhase(playing);
+				if (!submitPhase(playing)) {
+					failPlaying(playing);
+				}
 			} else if (playing.phaseCompletedFrames >= playing.phaseTotalFrames) {
 				playing.phaseRemainingMS = 0.0f;
 			}
@@ -898,7 +928,7 @@ UnsignedInt XAudio2AudioManager::channelCount(Channel channel) const
 {
 	UnsignedInt count = 0;
 	for (const PlayingAudio &playing : m_playing) {
-		if (playing.channel == channel && !playing.stopping) {
+		if (!playing.forced && playing.channel == channel && !playing.stopping) {
 			++count;
 		}
 	}
@@ -940,7 +970,7 @@ Bool XAudio2AudioManager::doesViolateLimit(AudioEventRTS *event) const
 	const AudioEventInfo *info = event->getAudioEventInfo();
 	UnsignedInt sameEvent = 0;
 	for (const PlayingAudio &playing : m_playing) {
-		if (!playing.stopping && playing.event != nullptr
+		if (!playing.forced && !playing.stopping && playing.event != nullptr
 			&& playing.event->getEventName() == event->getEventName()) {
 			++sameEvent;
 		}
@@ -956,7 +986,8 @@ Bool XAudio2AudioManager::isPlayingLowerPriority(AudioEventRTS *event) const
 	}
 	const Channel channel = channelFor(*event);
 	for (const PlayingAudio &playing : m_playing) {
-		if (!playing.stopping && playing.channel == channel && playing.event->getAudioPriority() < event->getAudioPriority()) {
+		if (!playing.forced && !playing.stopping && playing.channel == channel
+			&& playing.event->getAudioPriority() < event->getAudioPriority()) {
 			return TRUE;
 		}
 	}
@@ -1005,7 +1036,7 @@ void XAudio2AudioManager::removePlayingAudio(AsciiString eventName)
 void XAudio2AudioManager::removeAllDisabledAudio()
 {
 	for (PlayingAudio &playing : m_playing) {
-		if (playing.event->getVolume() <= 0.0f) {
+		if (playing.volume <= 0.0f) {
 			playing.stopping = TRUE;
 		}
 	}
@@ -1079,7 +1110,7 @@ Bool XAudio2AudioManager::requestAffectMatches(const AudioRequest *request, Audi
 Bool XAudio2AudioManager::canReplace(const PlayingAudio &victim,
 	const DynamicAudioEventRTS &incoming) const
 {
-	if (victim.event == nullptr || victim.event->getAudioEventInfo() == nullptr
+	if (victim.forced || victim.event == nullptr || victim.event->getAudioEventInfo() == nullptr
 		|| victim.event->getUninterruptible()) {
 		return FALSE;
 	}
@@ -1127,7 +1158,7 @@ XAudio2AudioManager::PlayingAudio *XAudio2AudioManager::findLowestPriority(Chann
 {
 	PlayingAudio *victim = nullptr;
 	for (PlayingAudio &playing : m_playing) {
-		if (playing.stopping || playing.channel != channel || playing.event == nullptr
+		if (playing.forced || playing.stopping || playing.channel != channel || playing.event == nullptr
 			|| playing.event->getAudioPriority() > minimumPriority) {
 			continue;
 		}
@@ -1142,7 +1173,6 @@ Real XAudio2AudioManager::effectiveVolume(const PlayingAudio &playing) const
 {
 	Real volume = playing.volume * playing.fadeVolume;
 	if (playing.event != nullptr) {
-		volume *= playing.event->getVolume();
 		volume *= playing.event->getVolumeShift();
 	}
 	if (playing.event != nullptr && playing.event->getAudioEventInfo() != nullptr) {
@@ -1153,7 +1183,6 @@ Real XAudio2AudioManager::effectiveVolume(const PlayingAudio &playing) const
 		else volume *= m_soundVolume;
 	}
 	if (playing.channel == Channel::SAMPLE_3D) {
-		volume *= getZoomVolume();
 		if (playing.event != nullptr && playing.event->getAudioEventInfo() != nullptr
 			&& playing.event->isPositionalAudio()) {
 			const Coord3D *position = playing.event->getCurrentPosition();
@@ -1171,12 +1200,12 @@ Real XAudio2AudioManager::effectiveVolume(const PlayingAudio &playing) const
 				if (length >= maxDistance) {
 					volume = 0.0f;
 				} else if (length > minDistance) {
-					Real attenuation = (maxDistance - length)
-						/ (maxDistance - minDistance);
+					const Real normalized = std::max(0.0f, std::min(1.0f,
+						(length - minDistance) / (maxDistance - minDistance)));
+					Real attenuation = 1.0f - normalized;
 					if (m_audioSettings != nullptr && m_audioSettings->m_use3DSoundRangeVolumeFade) {
-						attenuation = static_cast<Real>(std::pow(
-							std::max(0.0f, attenuation),
-							m_audioSettings->m_3DSoundRangeVolumeFadeExponent));
+						attenuation = 1.0f - static_cast<Real>(std::pow(
+							normalized, m_audioSettings->m_3DSoundRangeVolumeFadeExponent));
 					}
 					volume *= attenuation;
 				}

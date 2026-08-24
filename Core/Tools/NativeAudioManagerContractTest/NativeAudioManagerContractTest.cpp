@@ -82,20 +82,33 @@ namespace
 	class FakeVoice final : public IXAudio2PcmVoiceBackend
 	{
 	public:
+		FakeVoice(Bool failCreate, Bool failSubmit, Bool failStop, Bool failFlush) :
+			m_failCreate(failCreate),
+			m_failSubmit(failSubmit),
+			m_failStop(failStop),
+			m_failFlush(failFlush)
+		{
+		}
 		HRESULT create(const WAVEFORMATEX &, IXAudio2VoiceCallback *callback) noexcept override
 		{
+			if (m_failCreate) {
+				return E_FAIL;
+			}
 			m_callback = callback;
 			return S_OK;
 		}
 		HRESULT submit(const XAUDIO2_BUFFER &buffer) noexcept override
 		{
+			if (m_failSubmit) {
+				return E_FAIL;
+			}
 			m_lastContext = buffer.pContext;
 			++submitCalls;
 			return S_OK;
 		}
 		HRESULT start() noexcept override { return S_OK; }
-		HRESULT stop() noexcept override { return S_OK; }
-		HRESULT flush() noexcept override { return S_OK; }
+		HRESULT stop() noexcept override { return m_failStop ? E_FAIL : S_OK; }
+		HRESULT flush() noexcept override { return m_failFlush ? E_FAIL : S_OK; }
 		HRESULT setVolume(float volume) noexcept override
 		{
 			lastVolume = volume;
@@ -121,6 +134,10 @@ namespace
 		int volumeCalls = 0;
 
 	private:
+		Bool m_failCreate;
+		Bool m_failSubmit;
+		Bool m_failStop;
+		Bool m_failFlush;
 		IXAudio2VoiceCallback *m_callback = nullptr;
 		void *m_lastContext = nullptr;
 	};
@@ -132,7 +149,11 @@ namespace
 		HRESULT start() noexcept override { return S_OK; }
 		HRESULT createPcmVoice(std::unique_ptr<IXAudio2PcmVoiceBackend> &voice) noexcept override
 		{
-			std::unique_ptr<FakeVoice> created = std::make_unique<FakeVoice>();
+			if (failCreateVoice) {
+				return E_FAIL;
+			}
+			std::unique_ptr<FakeVoice> created = std::make_unique<FakeVoice>(
+				failVoiceCreate, failSubmit, failStop, failFlush);
 			lastVoice = created.get();
 			voices.push_back(lastVoice);
 			voice = std::move(created);
@@ -142,6 +163,11 @@ namespace
 		HRESULT close() noexcept override { return S_OK; }
 		FakeVoice *lastVoice = nullptr;
 		std::vector<FakeVoice *> voices;
+		Bool failCreateVoice = FALSE;
+		Bool failVoiceCreate = FALSE;
+		Bool failSubmit = FALSE;
+		Bool failStop = FALSE;
+		Bool failFlush = FALSE;
 	};
 
 	class FixtureEvent final : public AudioEventRTS
@@ -438,6 +464,60 @@ int main()
 	manager.stopAudio(AudioAffect_Sound3D);
 	manager.update();
 
+	manager.setChannelLimitsForTest(1U, 1U, 1U);
+	Coord3D forcedPosition;
+	forcedPosition.set(14.0f, 0.0f, 0.0f);
+	FixtureEvent forcedFiller(AsciiString("policy-forced-filler"));
+	forcedFiller.setAudioEventInfo(lowInfo);
+	forcedFiller.setAudioPriority(AP_LOW);
+	forcedFiller.setPosition(&forcedPosition);
+	const AudioHandle forcedFillerHandle = manager.addAudioEvent(&forcedFiller);
+	manager.update();
+	check(manager.isCurrentlyPlaying(forcedFillerHandle),
+		"forced-admission fixture fills the configured 3D channel pool");
+	AudioEventInfo *forcedInfo = newInstance(AudioEventInfo);
+	*forcedInfo = *lowInfo;
+	forcedInfo->m_audioName = AsciiString("policy-forced-voice");
+	forcedInfo->m_type = ST_WORLD | ST_VOICE;
+	FixtureEvent forcedEvent(AsciiString("policy-forced-voice"));
+	forcedEvent.setAudioEventInfo(forcedInfo);
+	forcedEvent.setPosition(&forcedPosition);
+	forcedEvent.setObjectID(static_cast<ObjectID>(99U));
+	manager.friend_forcePlayAudioEventRTS(&forcedEvent);
+	manager.update();
+	check(manager.isObjectPlayingVoice(99U),
+		"force-play admits a protected voice while its normal channel is full");
+	AudioEventInfo *forcedHighInfo = newInstance(AudioEventInfo);
+	*forcedHighInfo = *lowInfo;
+	forcedHighInfo->m_audioName = AsciiString("policy-after-force-high");
+	forcedHighInfo->m_priority = AP_HIGH;
+	FixtureEvent forcedHigh(AsciiString("policy-after-force-high"));
+	forcedHigh.setAudioEventInfo(forcedHighInfo);
+	forcedHigh.setAudioPriority(AP_HIGH);
+	forcedHigh.setPosition(&forcedPosition);
+	const AudioHandle forcedHighHandle = manager.addAudioEvent(&forcedHigh);
+	manager.update();
+	check(manager.isObjectPlayingVoice(99U) && manager.isCurrentlyPlaying(forcedHighHandle),
+		"normal high-priority admission cannot evict a forced record");
+	AudioEventInfo *forcedLowInfo = newInstance(AudioEventInfo);
+	*forcedLowInfo = *lowInfo;
+	forcedLowInfo->m_audioName = AsciiString("policy-after-force-low");
+	FixtureEvent forcedLow(AsciiString("policy-after-force-low"));
+	forcedLow.setAudioEventInfo(forcedLowInfo);
+	forcedLow.setAudioPriority(AP_LOW);
+	forcedLow.setPosition(&forcedPosition);
+	const AudioHandle forcedLowHandle = manager.addAudioEvent(&forcedLow);
+	manager.update();
+	check(manager.isObjectPlayingVoice(99U) && !manager.isCurrentlyPlaying(forcedLowHandle),
+		"normal lower-priority admission leaves the forced record protected");
+	manager.stopAudio(AudioAffect_Sound3D);
+	manager.update();
+	check(!manager.isObjectPlayingVoice(99U) && manager.getActiveAudioCount() == 0,
+		"affect stop cleans up forced and normal records together");
+	deleteInstance(forcedInfo);
+	deleteInstance(forcedHighInfo);
+	deleteInstance(forcedLowInfo);
+
 	catalog.setDurationMS(AsciiString("short.wav"), 1.0f);
 	AudioEventInfo *nonLoopInfo = newInstance(AudioEventInfo);
 	*nonLoopInfo = *lowInfo;
@@ -552,15 +632,25 @@ int main()
 	manager.update();
 	manager.update();
 	FakeVoice *attenuationVoice = engine->lastVoice;
-	check(attenuationVoice != nullptr && attenuationVoice->lastVolume > 0.04f
-		&& attenuationVoice->lastVolume < 0.06f,
+	check(attenuationVoice != nullptr && attenuationVoice->lastVolume > 0.149f
+		&& attenuationVoice->lastVolume < 0.151f,
 		"effective volume applies event shifts, category volume, and configured global attenuation");
+	TheTacticalView = reinterpret_cast<View *>(static_cast<std::uintptr_t>(1));
+	g_nativeAudioBaseUpdateCalls = 0;
+	manager.update();
+	TheTacticalView = nullptr;
+	check(g_nativeAudioBaseUpdateCalls == 1 && attenuationVoice->lastVolume > 0.074f
+		&& attenuationVoice->lastVolume < 0.076f,
+		"active 3D volume applies the base zoom adjustment exactly once");
 	Coord3D listenerPosition;
 	listenerPosition.set(55.0f, 0.0f, 0.0f);
 	manager.setListenerPosition(&listenerPosition, nullptr);
 	manager.update();
 	check(attenuationVoice->lastVolume > 0.19f && attenuationVoice->lastVolume < 0.21f,
 		"listener movement updates active 3D attenuation on the owner thread");
+	manager.setAudioEventVolumeOverride(AsciiString("configured-attenuation"), 0.4f);
+	check(attenuationVoice->lastVolume > 0.099f && attenuationVoice->lastVolume < 0.101f,
+		"active event volume override replaces the event volume exactly once");
 	manager.stopAudio(AudioAffect_Sound3D);
 	manager.update();
 	check(!manager.isCurrentlyPlaying(attenuationHandle), "3D attenuation fixture stops cleanly");
@@ -579,6 +669,12 @@ int main()
 	check(fadeVoice != nullptr && fadeVoice->lastVolume > 0.0f
 		&& fadeVoice->lastVolume < fadeStartVolume,
 		"configured fade frame count reduces volume before stopping");
+	check(fadeVoice != nullptr && fadeVoice->completeLastBuffer(),
+		"fake backend completes a fade-pending music buffer");
+	manager.update();
+	check(!manager.isCurrentlyPlaying(fadeHandle)
+		&& !manager.hasMusicTrackCompleted(AsciiString("fade-music"), 1),
+		"completion observed during a pending fade is treated as an intentional stop");
 	manager.update();
 	manager.update();
 	manager.update();
@@ -612,6 +708,69 @@ int main()
 		"speech admission resumes after the uninterruptible stream ends");
 	manager.stopAudio(AudioAffect_Speech);
 	manager.update();
+
+	std::unique_ptr<FakeEngine> failureOwnedEngine = std::make_unique<FakeEngine>();
+	FakeEngine *failureEngine = failureOwnedEngine.get();
+	XAudio2AudioService failureService(std::move(failureOwnedEngine));
+	XAudio2AudioManager failureManager(&failureService, &catalog);
+	failureManager.openDevice();
+	AudioEventInfo *failureMusicInfo = newInstance(AudioEventInfo);
+	*failureMusicInfo = *lowInfo;
+	failureMusicInfo->m_audioName = AsciiString("failure-create-music");
+	failureMusicInfo->m_soundType = AT_Music;
+	failureMusicInfo->m_type = 0;
+	failureMusicInfo->m_sounds.clear();
+	failureMusicInfo->m_sounds.push_back(AsciiString("short.wav"));
+	FixtureEvent failureMusic(AsciiString("failure-create-music"));
+	failureMusic.setAudioEventInfo(failureMusicInfo);
+	failureEngine->failCreateVoice = TRUE;
+	const AudioHandle failureCreateHandle = failureManager.addAudioEvent(&failureMusic);
+	failureManager.update();
+	check(failureCreateHandle != AHSV_NoSound && !failureManager.isCurrentlyPlaying(failureCreateHandle)
+		&& failureManager.getActiveAudioCount() == 0
+		&& !failureManager.hasMusicTrackCompleted(AsciiString("failure-create-music"), 1),
+		"voice-create failure releases the music handle without false natural completion");
+
+	AudioEventInfo *failureResetInfo = newInstance(AudioEventInfo);
+	*failureResetInfo = *speechInfo;
+	failureResetInfo->m_audioName = AsciiString("failure-reset-speech");
+	FixtureEvent failureReset(AsciiString("failure-reset-speech"));
+	failureReset.setAudioEventInfo(failureResetInfo);
+	failureReset.setUninterruptible(TRUE);
+	failureEngine->failCreateVoice = FALSE;
+	failureEngine->failStop = TRUE;
+	const AudioHandle failureResetHandle = failureManager.addAudioEvent(&failureReset);
+	failureManager.update();
+	check(failureManager.isCurrentlyPlaying(failureResetHandle)
+		&& failureManager.getDisallowSpeech(),
+		"reset-failure fixture first raises the native speech guard");
+	failureManager.update();
+	check(!failureManager.isCurrentlyPlaying(failureResetHandle)
+		&& failureManager.getActiveAudioCount() == 0 && !failureManager.getDisallowSpeech(),
+		"voice-reset failure deterministically releases the speech guard and active handle");
+
+	AudioEventInfo *failureSubmitInfo = newInstance(AudioEventInfo);
+	*failureSubmitInfo = *lowInfo;
+	failureSubmitInfo->m_audioName = AsciiString("failure-submit");
+	failureSubmitInfo->m_sounds.clear();
+	failureSubmitInfo->m_sounds.push_back(AsciiString("short.wav"));
+	FixtureEvent failureSubmit(AsciiString("failure-submit"));
+	failureSubmit.setAudioEventInfo(failureSubmitInfo);
+	failureEngine->failStop = FALSE;
+	failureEngine->failSubmit = TRUE;
+	const AudioHandle failureSubmitHandle = failureManager.addAudioEvent(&failureSubmit);
+	failureManager.update();
+	check(failureManager.isCurrentlyPlaying(failureSubmitHandle),
+		"submit-failure fixture reaches the typed voice submission boundary");
+	failureManager.update();
+	check(!failureManager.isCurrentlyPlaying(failureSubmitHandle)
+		&& failureManager.getActiveAudioCount() == 0,
+		"voice-submit failure releases the active handle without waiting forever");
+	failureManager.closeDevice();
+	deleteInstance(failureMusicInfo);
+	deleteInstance(failureResetInfo);
+	deleteInstance(failureSubmitInfo);
+
 	deleteInstance(lowInfo);
 	deleteInstance(highInfo);
 	deleteInstance(protectedInfo);
