@@ -36,8 +36,8 @@ function Assert-ExactConditionalBlock {
 }
 
 if ($SelfTest) {
-    $valid = "    if(NOT RTS_BUILD_OPTION_FFMPEG)`n        include(cmake/bink.cmake)`n    endif()"
-    Assert-ExactConditionalBlock $valid '    if(NOT RTS_BUILD_OPTION_FFMPEG)' '        include(cmake/bink.cmake)' '    endif()' 'Valid conditional block was rejected.'
+    $valid = "    if(`${CMAKE_SIZEOF_VOID_P} EQUAL 4 AND NOT RTS_BUILD_OPTION_FFMPEG)`n        include(cmake/bink.cmake)`n    endif()"
+    Assert-ExactConditionalBlock $valid '    if(${CMAKE_SIZEOF_VOID_P} EQUAL 4 AND NOT RTS_BUILD_OPTION_FFMPEG)' '        include(cmake/bink.cmake)' '    endif()' 'Valid conditional block was rejected.'
 
     $wrongCondition = "    if(RTS_BUILD_OPTION_FFMPEG)`n        include(cmake/bink.cmake)`n    endif()"
     try {
@@ -83,6 +83,13 @@ if ($deviceCMake -notmatch '(?ms)^if\(CMAKE_SIZEOF_VOID_P EQUAL 4 AND NOT RTS_BU
 Assert-TokenCount $deviceCMake 'BinkVideoPlayer\.h' 1 'Bink header source ownership is ambiguous.'
 Assert-TokenCount $deviceCMake 'BinkVideoPlayer\.cpp' 1 'Bink implementation source ownership is ambiguous.'
 
+if ($deviceCMake -notmatch '(?ms)^if\(WIN32 AND RTS_BUILD_OPTION_FFMPEG AND RTS_FFMPEG_RUNTIME_DLLS\)\s*^    # Install the exact resolved DLLs, never an unbounded SDK bin directory\.\s*^    if\(RTS_INSTALL_PREFIX_GENERALS\)\s*^        install\(FILES \$\{RTS_FFMPEG_RUNTIME_DLLS\} DESTINATION "\$\{RTS_INSTALL_PREFIX_GENERALS\}"\)\s*^    endif\(\)\s*^    if\(RTS_INSTALL_PREFIX_ZEROHOUR\)\s*^        install\(FILES \$\{RTS_FFMPEG_RUNTIME_DLLS\} DESTINATION "\$\{RTS_INSTALL_PREFIX_ZEROHOUR\}"\)\s*^    endif\(\)\s*^endif\(\)') {
+    throw 'FFmpeg runtime DLLs are not installed beside both native title executables.'
+}
+if ($deviceCMake -match 'install\(FILES \$\{RTS_FFMPEG_RUNTIME_DLLS\} DESTINATION \.\)') {
+    throw 'FFmpeg runtime DLLs still use the unrelated global CMake install prefix.'
+}
+
 $runtimeCMake = Get-Content -LiteralPath (Join-Path $SourceRoot 'cmake/legacy-product-runtime.cmake') -Raw
 if ($runtimeCMake -notmatch '(?ms)^    if\(NOT RTS_BUILD_OPTION_FFMPEG\)\s*^        target_link_libraries\(rts_legacy_product_runtime INTERFACE binkstub\)\s*^    endif\(\)') {
     throw 'Bink link ownership is not conditional on the FFmpeg backend option.'
@@ -96,14 +103,14 @@ $binkIndex = $rootCMake.IndexOf('include(cmake/bink.cmake)', [System.StringCompa
 if ($configIndex -lt 0 -or $binkIndex -lt 0 -or $configIndex -ge $binkIndex) {
     throw 'Build configuration must be available before selecting video backend dependencies.'
 }
-if ($rootCMake -notmatch '(?ms)^    if\(NOT RTS_BUILD_OPTION_FFMPEG\)\s*^        include\(cmake/bink\.cmake\)\s*^    endif\(\)') {
+if ($rootCMake -notmatch '(?ms)^    if\(\$\{CMAKE_SIZEOF_VOID_P\} EQUAL 4 AND NOT RTS_BUILD_OPTION_FFMPEG\)\s*^        include\(cmake/bink\.cmake\)\s*^    endif\(\)') {
     throw 'Bink dependency fetch is not conditional on the FFmpeg backend option.'
 }
-Assert-ExactConditionalBlock $rootCMake '    if(NOT RTS_BUILD_OPTION_FFMPEG)' '        include(cmake/bink.cmake)' '    endif()' 'Bink fetch conditional block is not exact.'
+Assert-ExactConditionalBlock $rootCMake '    if(${CMAKE_SIZEOF_VOID_P} EQUAL 4 AND NOT RTS_BUILD_OPTION_FFMPEG)' '        include(cmake/bink.cmake)' '    endif()' 'Bink fetch conditional block is not exact.'
 Assert-TokenCount $rootCMake 'include\(cmake/bink\.cmake\)' 1 'Bink dependency fetch ownership is ambiguous.'
 
 $runtimeTestsCMake = Get-Content -LiteralPath (Join-Path $SourceRoot 'GeneralsMD/Code/Tools/RuntimeRegressionTests/CMakeLists.txt') -Raw
-if ($runtimeTestsCMake -notmatch '(?ms)^if\(CMAKE_SIZEOF_VOID_P EQUAL 4\).*?^if\(CMAKE_SIZEOF_VOID_P EQUAL 4 AND NOT RTS_BUILD_OPTION_FFMPEG\)\s*^\s*target_link_libraries\(z_runtime_regression_tests PRIVATE binkstub\)\s*^endif\(\)') {
+if ($runtimeTestsCMake -notmatch '(?ms)^if\(CMAKE_SIZEOF_VOID_P EQUAL 4\).*?^\s*if\(NOT RTS_BUILD_OPTION_FFMPEG\)\s*^\s*target_link_libraries\(z_runtime_regression_tests PRIVATE binkstub\)\s*^\s*endif\(\)') {
     throw 'Zero Hour runtime regression tests link Bink outside the fallback backend.'
 }
 Assert-TokenCount $runtimeTestsCMake 'binkstub' 1 'Zero Hour runtime regression test link ownership is ambiguous.'
