@@ -53,8 +53,8 @@ foreach ($line in $environmentLines) {
 }
 
 foreach ($product in @(
-    @{ Name = 'Generals'; Generals = 'ON'; ZeroHour = 'OFF'; TitleDirectory = 'Generals'; InstallDirectory = 'Generals'; Executable = 'generalsv.exe' },
-    @{ Name = 'ZeroHour'; Generals = 'OFF'; ZeroHour = 'ON'; TitleDirectory = 'GeneralsMD'; InstallDirectory = 'ZeroHour'; Executable = 'generalszh.exe' }
+    @{ Name = 'Generals'; Generals = 'ON'; ZeroHour = 'OFF'; TitleDirectory = 'Generals'; InstallDirectory = 'Generals'; Executables = @('generalsv.exe', 'launcher.exe') },
+    @{ Name = 'ZeroHour'; Generals = 'OFF'; ZeroHour = 'ON'; TitleDirectory = 'GeneralsMD'; InstallDirectory = 'ZeroHour'; Executables = @('generalszh.exe', 'launcher.exe', 'z_runtime_regression_tests.exe') }
 )) {
     $productBuildRoot = Join-Path $BuildRoot $product.Name
     $installRoot = Join-Path $productBuildRoot 'InstallRoot'
@@ -95,11 +95,30 @@ foreach ($product in @(
     }
     $installScript = (Get-Content -LiteralPath $installScriptPath -Raw).Replace('\', '/')
     $expectedDestination = '${CMAKE_INSTALL_PREFIX}/' + $product.InstallDirectory
-    $executableInstallPattern = 'file\(INSTALL DESTINATION "' +
-        [regex]::Escape($expectedDestination) + '" TYPE EXECUTABLE FILES "[^"]*/' +
-        [regex]::Escape($product.Executable) + '"\)'
-    if ($installScript -notmatch $executableInstallPattern) {
-        throw "Native x64 $($product.Name) product is not installable below CMAKE_INSTALL_PREFIX/$($product.InstallDirectory)."
+    foreach ($executable in $product.Executables) {
+        $executableInstallPattern = 'file\(INSTALL DESTINATION "' +
+            [regex]::Escape($expectedDestination) + '" TYPE EXECUTABLE FILES "[^"]*/' +
+            [regex]::Escape($executable) + '"\)'
+        if ($installScript -notmatch $executableInstallPattern) {
+            throw "Native x64 $($product.Name) install script is missing $executable below CMAKE_INSTALL_PREFIX/$($product.InstallDirectory)."
+        }
+    }
+
+    $cachePath = Join-Path $productBuildRoot 'CMakeCache.txt'
+    $cache = Get-Content -LiteralPath $cachePath -Raw
+    $runtimeDllMatch = [regex]::Match($cache, '(?m)^RTS_FFMPEG_RUNTIME_DLLS:INTERNAL=(.+)$')
+    if (-not $runtimeDllMatch.Success) {
+        throw "Native x64 $($product.Name) product did not resolve FFmpeg runtime DLLs."
+    }
+    $runtimeDlls = @($runtimeDllMatch.Groups[1].Value.Trim() -split ';')
+    foreach ($runtimeDll in $runtimeDlls) {
+        $runtimeDllName = [IO.Path]::GetFileName($runtimeDll)
+        $runtimeInstallPattern = 'file\(INSTALL DESTINATION "' +
+            [regex]::Escape($expectedDestination) + '" TYPE FILE FILES(?s:.*?)"[^"]*/' +
+            [regex]::Escape($runtimeDllName) + '"(?s:.*?)\)'
+        if ($installScript -notmatch $runtimeInstallPattern) {
+            throw "Native x64 $($product.Name) install script is missing FFmpeg runtime $runtimeDllName below CMAKE_INSTALL_PREFIX/$($product.InstallDirectory)."
+        }
     }
 
     $closurePath = Join-Path $productBuildRoot 'native_product_runtime_link_closure.txt'
