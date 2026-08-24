@@ -22,6 +22,7 @@ elseif(RTS_BUILD_PRODUCT AND (RTS_BUILD_ZEROHOUR OR RTS_BUILD_GENERALS))
     target_link_libraries(rts_legacy_product_runtime INTERFACE
         core_runtime_epoch_contract
         rts_d3d8_headers
+        rts_native_d3d8_compat_boundary
         rts_xaudio2
         bcrypt
         d3d11

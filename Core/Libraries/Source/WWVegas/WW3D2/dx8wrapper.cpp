@@ -194,6 +194,35 @@ static rts::render::WindowPresentationState _D3D11WindowPresentationState;
 
 namespace
 {
+HINSTANCE Load_D3D8_Runtime()
+{
+#if defined(_WIN64)
+	wchar_t module_path[32768];
+	const DWORD module_path_length = GetModuleFileNameW(nullptr, module_path,
+		static_cast<DWORD>(sizeof(module_path) / sizeof(module_path[0])));
+	if (module_path_length == 0 ||
+		module_path_length >= sizeof(module_path) / sizeof(module_path[0]))
+	{
+		return nullptr;
+	}
+
+	wchar_t *const file_name = wcsrchr(module_path, L'\\');
+	static const wchar_t runtime_name[] = L"d3d8.dll";
+	if (file_name == nullptr ||
+		(file_name - module_path) +
+			sizeof(runtime_name) / sizeof(runtime_name[0]) >=
+			sizeof(module_path) / sizeof(module_path[0]))
+	{
+		return nullptr;
+	}
+	memcpy(file_name + 1, runtime_name, sizeof(runtime_name));
+	return LoadLibraryExW(module_path, nullptr,
+		LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+#else
+	return LoadLibrary("D3D8.DLL");
+#endif
+}
+
 bool Get_D3D11_Monitor_Rect(RECT *monitor_rect)
 {
 	if (monitor_rect == nullptr || _Hwnd == nullptr)
@@ -370,12 +399,16 @@ bool DX8Wrapper::Init(void * hwnd, bool lite)
 	Invalidate_Cached_Render_States();
 
 	if (!lite) {
-		D3D8Lib = LoadLibrary("D3D8.DLL");
+		D3D8Lib = Load_D3D8_Runtime();
 
 		if (D3D8Lib == nullptr) return false;	// Return false at this point if init failed
 
 		Direct3DCreate8Ptr = (Direct3DCreate8Type) GetProcAddress(D3D8Lib, "Direct3DCreate8");
-		if (Direct3DCreate8Ptr == nullptr) return false;
+		if (Direct3DCreate8Ptr == nullptr) {
+			FreeLibrary(D3D8Lib);
+			D3D8Lib = nullptr;
+			return false;
+		}
 
 		/*
 		** Create the D3D interface object
@@ -389,6 +422,9 @@ bool DX8Wrapper::Init(void * hwnd, bool lite)
 			D3DInterface = Direct3DCreate8Ptr(D3D_SDK_VERSION);		// TODO: handle failure cases...
 		}
 		if (D3DInterface == nullptr) {
+			Direct3DCreate8Ptr = nullptr;
+			FreeLibrary(D3D8Lib);
+			D3D8Lib = nullptr;
 			return(false);
 		}
 		IsInitted = true;

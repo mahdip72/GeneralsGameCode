@@ -62,6 +62,10 @@ if(WIN32 OR "${CMAKE_SYSTEM}" MATCHES "Windows")
     endif()
     if(NOT RTS_VIDEO_BACKEND_GRAPH_AUDIT)
         include(cmake/dx8.cmake)
+        if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND
+            (RTS_BUILD_PRODUCT OR RTS_BUILD_CORE_EXTRAS))
+            include(cmake/native-d3d8-compat.cmake)
+        endif()
     endif()
 endif()
 

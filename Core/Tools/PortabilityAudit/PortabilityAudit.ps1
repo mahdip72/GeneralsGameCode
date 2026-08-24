@@ -31,7 +31,8 @@ $rawD3D8BoundaryPaths = @(
     'Core/Tools/SurfaceBlitTest/SurfaceBlitTest.cpp',
     'Core/Tools/TextureMipGeneratorTest/TextureMipGeneratorTest.cpp',
     'Core/Tools/LegacyTextureCreationTest/LegacyTextureCreationTest.cpp',
-    'Core/Tools/RendererContractTest/RendererContractTest.cpp'
+    'Core/Tools/RendererContractTest/RendererContractTest.cpp',
+    'Core/Tools/NativeD3D8CompatibilityTest/NativeD3D8CompatibilityTest.cpp'
 )
 
 # These are the only product-runtime files allowed to mention the legacy

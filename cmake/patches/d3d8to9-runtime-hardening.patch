@@ -1,0 +1,165 @@
+diff --git a/source/d3d8to9.cpp b/source/d3d8to9.cpp
+index ca41930..f716803 100644
+--- a/source/d3d8to9.cpp
++++ b/source/d3d8to9.cpp
+@@ -9,6 +9,61 @@
+ PFN_D3DXAssembleShader D3DXAssembleShader = nullptr;
+ PFN_D3DXDisassembleShader D3DXDisassembleShader = nullptr;
+ PFN_D3DXLoadSurfaceFromSurface D3DXLoadSurfaceFromSurface = nullptr;
++static HMODULE D3DXModule = nullptr;
++static unsigned int D3DXObjectCount = 0;
++
++void RetainAppLocalD3DX()
++{
++	++D3DXObjectCount;
++}
++
++void ReleaseAppLocalD3DX()
++{
++	if (D3DXObjectCount == 0)
++		return;
++
++	--D3DXObjectCount;
++	if (D3DXObjectCount != 0)
++		return;
++
++	// Clear every function pointer before dropping the module reference. The
++	// final Direct3D8 COM release calls this on the owner thread, outside
++	// DllMain, so unloading never runs under the loader lock.
++	D3DXAssembleShader = nullptr;
++	D3DXDisassembleShader = nullptr;
++	D3DXLoadSurfaceFromSurface = nullptr;
++	const HMODULE module = D3DXModule;
++	D3DXModule = nullptr;
++	if (module != nullptr)
++		FreeLibrary(module);
++}
++
++static HMODULE LoadAppLocalD3DX()
++{
++	HMODULE thisModule = nullptr;
++	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++		GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++		reinterpret_cast<LPCWSTR>(&D3DXAssembleShader), &thisModule))
++		return nullptr;
++
++	wchar_t modulePath[32768];
++	const DWORD modulePathLength = GetModuleFileNameW(thisModule, modulePath,
++		static_cast<DWORD>(sizeof(modulePath) / sizeof(modulePath[0])));
++	if (modulePathLength == 0 ||
++		modulePathLength >= sizeof(modulePath) / sizeof(modulePath[0]))
++		return nullptr;
++
++	wchar_t *const fileName = wcsrchr(modulePath, L'\\');
++	static const wchar_t runtimeName[] = L"d3dx9_43.dll";
++	if (fileName == nullptr ||
++		(fileName - modulePath) + sizeof(runtimeName) / sizeof(runtimeName[0]) >=
++			sizeof(modulePath) / sizeof(modulePath[0]))
++		return nullptr;
++
++	memcpy(fileName + 1, runtimeName, sizeof(runtimeName));
++	return LoadLibraryExW(modulePath, nullptr,
++		LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
++}
+ 
+ #ifndef D3D8TO9NOLOG
+  // Very simple logging for the purpose of debugging only.
+@@ -159,13 +187,14 @@ extern "C" IDirect3D8 *WINAPI Direct3DCreate8(UINT SDKVersion)
+ 	// Load D3DX
+ 	if (!D3DXAssembleShader || !D3DXDisassembleShader || !D3DXLoadSurfaceFromSurface)
+ 	{
+-		const HMODULE module = LoadLibrary(TEXT("d3dx9_43.dll"));
++		if (D3DXModule == nullptr)
++			D3DXModule = LoadAppLocalD3DX();
+ 
+-		if (module != nullptr)
++		if (D3DXModule != nullptr)
+ 		{
+-			D3DXAssembleShader = reinterpret_cast<PFN_D3DXAssembleShader>(GetProcAddress(module, "D3DXAssembleShader"));
+-			D3DXDisassembleShader = reinterpret_cast<PFN_D3DXDisassembleShader>(GetProcAddress(module, "D3DXDisassembleShader"));
+-			D3DXLoadSurfaceFromSurface = reinterpret_cast<PFN_D3DXLoadSurfaceFromSurface>(GetProcAddress(module, "D3DXLoadSurfaceFromSurface"));
++			D3DXAssembleShader = reinterpret_cast<PFN_D3DXAssembleShader>(GetProcAddress(D3DXModule, "D3DXAssembleShader"));
++			D3DXDisassembleShader = reinterpret_cast<PFN_D3DXDisassembleShader>(GetProcAddress(D3DXModule, "D3DXDisassembleShader"));
++			D3DXLoadSurfaceFromSurface = reinterpret_cast<PFN_D3DXLoadSurfaceFromSurface>(GetProcAddress(D3DXModule, "D3DXLoadSurfaceFromSurface"));
+ 		}
+ 		else
+ 		{
+@@ -218,3 +218,5 @@
+ 
+-	return new Direct3D8(d3d);
++	Direct3D8 *const result = new Direct3D8(d3d);
++	RetainAppLocalD3DX();
++	return result;
+ }
+diff --git a/source/d3d8to9.hpp b/source/d3d8to9.hpp
+index bce4dbe..b002f78 100644
+--- a/source/d3d8to9.hpp
++++ b/source/d3d8to9.hpp
+@@ -17,3 +17,6 @@ struct VertexShaderInfo
+ 	IDirect3DVertexDeclaration9 *Declaration = nullptr;
+ };
++
++void RetainAppLocalD3DX();
++void ReleaseAppLocalD3DX();
+ 
+@@ -180,7 +180,14 @@ private:
+ 
+ 		const DWORD candidate = nextHandle;
+ 		nextHandle = candidate == lastHandle ? 0 : candidate + 1;
+-		return handles.emplace(candidate, object).second ? candidate : 0;
++		try
++		{
++			return handles.emplace(candidate, object).second ? candidate : 0;
++		}
++		catch (...)
++		{
++			return 0;
++		}
+ 	}
+ 
+ 	Direct3D8 *const D3D;
+diff --git a/source/d3d8to9_base.cpp b/source/d3d8to9_base.cpp
+index 035bd75..70bd198 100644
+--- a/source/d3d8to9_base.cpp
++++ b/source/d3d8to9_base.cpp
+@@ -38,2 +38,3 @@ Direct3D8::~Direct3D8()
+ {
++	ReleaseAppLocalD3DX();
+ }
+@@ -174,6 +174,11 @@ HRESULT STDMETHODCALLTYPE Direct3D8::CreateDevice(UINT Adapter, D3DDEVTYPE Devic
+ 
+ 	if (pPresentationParameters == nullptr || ppReturnedDeviceInterface == nullptr)
+ 		return D3DERR_INVALIDCALL;
++	// The Generals compatibility bridge is owner-threaded. Refuse the D3D9
++	// multithreaded contract because the D3D8 opaque-handle tables are not a
++	// general-purpose concurrent COM implementation.
++	if ((BehaviorFlags & D3DCREATE_MULTITHREADED) != 0)
++		return D3DERR_INVALIDCALL;
+ 
+ 	*ppReturnedDeviceInterface = nullptr;
+ 
+diff --git a/source/d3d8to9_device.cpp b/source/d3d8to9_device.cpp
+index 2afdcff..8a7b5cf 100644
+--- a/source/d3d8to9_device.cpp
++++ b/source/d3d8to9_device.cpp
+@@ -192,14 +192,12 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::Reset(D3DPRESENT_PARAMETERS8 *pPresen
+ 
+ 	ZBiasRenderState = 0;
+ 
+-	const HRESULT deviceState = ProxyInterface->TestCooperativeLevel();
+-
+-	if (deviceState == D3DERR_DEVICENOTRESET) {
+-		while (!StateBlockTokens.empty())
+-		{
+-			DWORD Token = StateBlockTokens.begin()->first;
+-			DeleteStateBlock(Token);
+-		}
++	// D3D9 requires state blocks to be released before every Reset, including
++	// an explicit reset while the device is otherwise operational.
++	while (!StateBlockTokens.empty())
++	{
++		DWORD Token = StateBlockTokens.begin()->first;
++		DeleteStateBlock(Token);
+ 	}
+ 
+ 	D3DPRESENT_PARAMETERS PresentParams;

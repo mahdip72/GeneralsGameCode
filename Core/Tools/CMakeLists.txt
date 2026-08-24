@@ -6,6 +6,13 @@ if(RTS_BUILD_CORE_TOOLS)
     add_subdirectory(ParticleEditor)
 endif()
 
+# Build the installed-runtime compatibility probe for native products as well
+# as the broader core-extras test lane.
+if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD AND
+    TARGET d3d8to9 AND (RTS_BUILD_PRODUCT OR RTS_BUILD_CORE_EXTRAS))
+    add_subdirectory(NativeD3D8CompatibilityTest)
+endif()
+
 # Build less useful tool/test binaries.
 if(RTS_BUILD_CORE_EXTRAS)
     if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD)

@@ -204,9 +204,22 @@ function Get-GeneratedLinkCommandTexts {
                 break
             }
 
-            $blockText = $block -join "`n"
-            if ($blockText -match '(?im)^\s*LINK_LIBRARIES\s*=') {
-                $texts += $blockText
+            for ($blockIndex = 0; $blockIndex -lt $block.Count; $blockIndex++) {
+                if ($block[$blockIndex] -notmatch '(?i)^\s*LINK_LIBRARIES\s*=') {
+                    continue
+                }
+
+                $linkLibraryLines = @($block[$blockIndex])
+                for ($continuationIndex = $blockIndex + 1;
+                    $continuationIndex -lt $block.Count;
+                    $continuationIndex++) {
+                    if ($block[$continuationIndex] -match '^\s*[A-Z_]+\s*=') {
+                        break
+                    }
+                    $linkLibraryLines += $block[$continuationIndex]
+                }
+                $texts += ($linkLibraryLines -join "`n")
+                break
             }
         }
     }
