@@ -191,8 +191,11 @@ private:
 class NativePcmVoiceBackend final : public IXAudio2PcmVoiceBackend
 {
 public:
-	explicit NativePcmVoiceBackend(IXAudio2 *engine) :
-		m_engine(engine)
+	NativePcmVoiceBackend(IXAudio2 *engine, IXAudio2MasteringVoice *masteringVoice,
+		UINT32 destinationChannels) :
+		m_engine(engine),
+		m_masteringVoice(masteringVoice),
+		m_destinationChannels(destinationChannels)
 	{
 	}
 
@@ -207,6 +210,8 @@ public:
 		if (FAILED(result)) {
 			m_callback.disableAndWait();
 			m_voice = nullptr;
+		} else {
+			m_sourceChannels = format.nChannels;
 		}
 		return result;
 	}
@@ -239,6 +244,19 @@ public:
 	HRESULT setVolume(float volume) noexcept override
 	{
 		return m_voice != nullptr ? m_voice->SetVolume(volume) : E_HANDLE;
+	}
+
+	HRESULT setOutputMatrix(UINT32 sourceChannels, UINT32 destinationChannels,
+		const float *matrix) noexcept override
+	{
+		if (m_voice == nullptr || m_masteringVoice == nullptr || matrix == nullptr) {
+			return E_HANDLE;
+		}
+		if (sourceChannels != m_sourceChannels || destinationChannels != m_destinationChannels) {
+			return E_INVALIDARG;
+		}
+		return m_voice->SetOutputMatrix(m_masteringVoice, sourceChannels,
+			destinationChannels, matrix, XAUDIO2_COMMIT_NOW);
 	}
 
 	HRESULT flush() noexcept override
@@ -284,7 +302,10 @@ public:
 
 private:
 	IXAudio2 *m_engine;
+	IXAudio2MasteringVoice *m_masteringVoice;
 	IXAudio2SourceVoice *m_voice = nullptr;
+	UINT32 m_sourceChannels = 0;
+	UINT32 m_destinationChannels;
 	NativeSourceVoiceCallback m_callback;
 	std::atomic<HRESULT> m_criticalError { S_OK };
 };
@@ -323,6 +344,17 @@ public:
 			close();
 			return result;
 		}
+		XAUDIO2_VOICE_DETAILS details = {};
+		m_masteringVoice->GetVoiceDetails(&details);
+		DWORD channelMask = 0;
+		result = m_masteringVoice->GetChannelMask(&channelMask);
+		if (FAILED(result) || details.InputChannels == 0
+			|| details.InputChannels > XAUDIO2_MAX_AUDIO_CHANNELS || channelMask == 0) {
+			close();
+			return FAILED(result) ? result : E_INVALIDARG;
+		}
+		m_outputDetails.channelMask = channelMask;
+		m_outputDetails.channelCount = details.InputChannels;
 		m_stopIssued = false;
 		return S_OK;
 	}
@@ -341,11 +373,23 @@ public:
 		if (m_engine == nullptr || m_masteringVoice == nullptr) {
 			return E_HANDLE;
 		}
-		NativePcmVoiceBackend *nativeVoice = new (std::nothrow) NativePcmVoiceBackend(m_engine);
+		NativePcmVoiceBackend *nativeVoice = new (std::nothrow) NativePcmVoiceBackend(
+			m_engine, m_masteringVoice, m_outputDetails.channelCount);
 		if (nativeVoice == nullptr) {
 			return E_OUTOFMEMORY;
 		}
 		voice.reset(nativeVoice);
+		return S_OK;
+	}
+
+	HRESULT getOutputDetails(XAudio2OutputDetails &details) const noexcept
+	{
+		if (m_engine == nullptr || m_masteringVoice == nullptr
+			|| m_outputDetails.channelCount == 0 || m_outputDetails.channelMask == 0) {
+			details = {};
+			return E_HANDLE;
+		}
+		details = m_outputDetails;
 		return S_OK;
 	}
 
@@ -379,6 +423,7 @@ public:
 		}
 		m_engine->Release();
 		m_engine = nullptr;
+		m_outputDetails = {};
 		m_stopIssued = true;
 		return S_OK;
 	}
@@ -386,6 +431,7 @@ public:
 private:
 	IXAudio2 *m_engine = nullptr;
 	IXAudio2MasteringVoice *m_masteringVoice = nullptr;
+	XAudio2OutputDetails m_outputDetails;
 	NativeEngineCallback m_callback;
 	bool m_callbacksRegistered = false;
 	bool m_stopIssued = true;
@@ -411,6 +457,11 @@ HRESULT XAudio2NativeAudioEngine::start() noexcept
 HRESULT XAudio2NativeAudioEngine::createPcmVoice(std::unique_ptr<IXAudio2PcmVoiceBackend> &voice) noexcept
 {
 	return m_impl->createPcmVoice(voice);
+}
+
+HRESULT XAudio2NativeAudioEngine::getOutputDetails(XAudio2OutputDetails &details) const noexcept
+{
+	return m_impl->getOutputDetails(details);
 }
 
 HRESULT XAudio2NativeAudioEngine::stop() noexcept

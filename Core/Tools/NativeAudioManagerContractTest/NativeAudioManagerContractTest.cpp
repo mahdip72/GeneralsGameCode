@@ -16,6 +16,7 @@
 
 #include <cstdio>
 #include <cstdint>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -121,6 +122,15 @@ namespace
 			++volumeCalls;
 			return S_OK;
 		}
+		HRESULT setOutputMatrix(UINT32 sourceChannels, UINT32 destinationChannels,
+			const float *matrix) noexcept override
+		{
+			matrixSourceChannels = sourceChannels;
+			matrixDestinationChannels = destinationChannels;
+			lastMatrix.assign(matrix, matrix + sourceChannels * destinationChannels);
+			++matrixCalls;
+			return S_OK;
+		}
 		HRESULT pause() noexcept override { return S_OK; }
 		HRESULT resume() noexcept override { return S_OK; }
 		HRESULT getCriticalError() const noexcept override { return S_OK; }
@@ -138,6 +148,10 @@ namespace
 		int submitCalls = 0;
 		float lastVolume = 0.0f;
 		int volumeCalls = 0;
+		UINT32 matrixSourceChannels = 0;
+		UINT32 matrixDestinationChannels = 0;
+		int matrixCalls = 0;
+		std::vector<float> lastMatrix;
 
 	private:
 		Bool m_failCreate;
@@ -152,8 +166,20 @@ namespace
 	class FakeEngine final : public IXAudio2AudioEngineBackend
 	{
 	public:
-		HRESULT open(CriticalErrorCallback, void *) noexcept override { return S_OK; }
-		HRESULT start() noexcept override { return S_OK; }
+		HRESULT open(CriticalErrorCallback callback, void *context) noexcept override
+		{
+			++openCalls;
+			m_callback = callback;
+			m_context = context;
+			return S_OK;
+		}
+		HRESULT start() noexcept override { ++startCalls; return S_OK; }
+		HRESULT getOutputDetails(XAudio2OutputDetails &details) const noexcept override
+		{
+			details.channelMask = SPEAKER_STEREO;
+			details.channelCount = 2;
+			return S_OK;
+		}
 		HRESULT createPcmVoice(std::unique_ptr<IXAudio2PcmVoiceBackend> &voice) noexcept override
 		{
 			if (failCreateVoice) {
@@ -166,8 +192,14 @@ namespace
 			voice = std::move(created);
 			return S_OK;
 		}
-		HRESULT stop() noexcept override { return S_OK; }
-		HRESULT close() noexcept override { return S_OK; }
+		HRESULT stop() noexcept override { ++stopCalls; return S_OK; }
+		HRESULT close() noexcept override { ++closeCalls; return S_OK; }
+		void emitCritical(HRESULT error) noexcept
+		{
+			if (m_callback != nullptr) {
+				m_callback(m_context, error);
+			}
+		}
 		FakeVoice *lastVoice = nullptr;
 		std::vector<FakeVoice *> voices;
 		Bool failCreateVoice = FALSE;
@@ -176,6 +208,14 @@ namespace
 		Bool failStop = FALSE;
 		Bool failFlush = FALSE;
 		int totalSubmitCalls = 0;
+		int openCalls = 0;
+		int startCalls = 0;
+		int stopCalls = 0;
+		int closeCalls = 0;
+
+	private:
+		CriticalErrorCallback m_callback = nullptr;
+		void *m_context = nullptr;
 	};
 
 	class FixtureEvent final : public AudioEventRTS
@@ -662,6 +702,7 @@ int main()
 	settings.m_globalMinRange = 10;
 	settings.m_globalMaxRange = 100;
 	settings.m_fadeAudioFrames = 3;
+	settings.m_minVolume = 0.0f;
 	manager.setAudioSettingsForTest(&settings);
 	manager.setVolume(0.5f, AudioAffect_Sound3D);
 	AudioEventInfo *attenuationInfo = newInstance(AudioEventInfo);
@@ -683,6 +724,13 @@ int main()
 	check(attenuationVoice != nullptr && attenuationVoice->lastVolume > 0.149f
 		&& attenuationVoice->lastVolume < 0.151f,
 		"effective volume applies event shifts, category volume, and configured global attenuation");
+	check(attenuationVoice != nullptr && attenuationVoice->matrixCalls > 0
+		&& attenuationVoice->matrixSourceChannels == 2
+		&& attenuationVoice->matrixDestinationChannels == 2
+		&& attenuationVoice->lastMatrix.size() == 4
+		&& attenuationVoice->lastMatrix[2] + attenuationVoice->lastMatrix[3]
+			> attenuationVoice->lastMatrix[0] + attenuationVoice->lastMatrix[1],
+		"positional audio applies a right-biased stereo X3DAudio matrix");
 	TheTacticalView = reinterpret_cast<View *>(static_cast<std::uintptr_t>(1));
 	g_nativeAudioBaseUpdateCalls = 0;
 	manager.update();
@@ -696,12 +744,35 @@ int main()
 	manager.update();
 	check(attenuationVoice->lastVolume > 0.19f && attenuationVoice->lastVolume < 0.21f,
 		"listener movement updates active 3D attenuation on the owner thread");
+	check(attenuationVoice->lastMatrix.size() == 4
+		&& std::abs((attenuationVoice->lastMatrix[0] + attenuationVoice->lastMatrix[1])
+			- (attenuationVoice->lastMatrix[2] + attenuationVoice->lastMatrix[3])) < 0.001f,
+		"coincident listener and emitter produce a centered stereo matrix");
+	Coord3D listenerBeyond;
+	listenerBeyond.set(110.0f, 0.0f, 0.0f);
+	manager.setListenerPosition(&listenerBeyond, nullptr);
+	manager.update();
+	check(attenuationVoice->lastMatrix.size() == 4
+		&& attenuationVoice->lastMatrix[0] + attenuationVoice->lastMatrix[1]
+			> attenuationVoice->lastMatrix[2] + attenuationVoice->lastMatrix[3],
+		"mirrored listener position produces a left-biased stereo matrix");
+	manager.setListenerPosition(&listenerPosition, nullptr);
+	manager.update();
 	manager.setAudioEventVolumeOverride(AsciiString("configured-attenuation"), 0.4f);
 	check(attenuationVoice->lastVolume > 0.099f && attenuationVoice->lastVolume < 0.101f,
 		"active event volume override replaces the event volume exactly once");
 	manager.stopAudio(AudioAffect_Sound3D);
 	manager.update();
 	check(!manager.isCurrentlyPlaying(attenuationHandle), "3D attenuation fixture stops cleanly");
+	FixtureEvent matrix2DEvent(AsciiString("matrix-2d"));
+	matrix2DEvent.setAudioEventInfo(lowInfo);
+	const AudioHandle matrix2DHandle = manager.addAudioEvent(&matrix2DEvent);
+	manager.update();
+	FakeVoice *matrix2DVoice = engine->lastVoice;
+	check(manager.isCurrentlyPlaying(matrix2DHandle) && matrix2DVoice != nullptr
+		&& matrix2DVoice->matrixCalls == 0,
+		"non-positional audio does not receive an X3DAudio output matrix");
+	manager.killAudioEventImmediately(matrix2DHandle);
 	settings.m_use3DSoundRangeVolumeFade = FALSE;
 	Coord3D origin;
 	origin.zero();
@@ -918,6 +989,48 @@ int main()
 	deleteInstance(failureMusicInfo);
 	deleteInstance(failureResetInfo);
 	deleteInstance(failureSubmitInfo);
+
+	std::unique_ptr<FakeEngine> recoveryOwnedEngine = std::make_unique<FakeEngine>();
+	FakeEngine *recoveryEngine = recoveryOwnedEngine.get();
+	auto recoveryService = std::make_unique<XAudio2AudioService>(std::move(recoveryOwnedEngine));
+	XAudio2AudioManager recoveryManager(nullptr, &catalog);
+	recoveryManager.setOwnedServiceForTest(std::move(recoveryService));
+	recoveryManager.openDevice();
+	const UnsignedInt recoveryGeneration = recoveryManager.getLifecycleGeneration();
+	check(recoveryManager.runInjectedPlaybackProbe(AsciiString("short.wav")),
+		"owned recovery fixture submits before a critical failure");
+	recoveryEngine->emitCritical(E_ABORT);
+	recoveryManager.update();
+	check(recoveryManager.isOpen()
+		&& recoveryManager.getLifecycleGeneration() != recoveryGeneration
+		&& recoveryEngine->stopCalls == 1 && recoveryEngine->closeCalls == 1
+		&& recoveryEngine->openCalls == 2 && recoveryEngine->startCalls == 2,
+		"owned manager quiesces and reopens its service after a critical failure");
+	check(recoveryManager.runInjectedPlaybackProbe(AsciiString("short.wav")),
+		"owned manager admits fresh playback after critical-error recovery");
+	recoveryManager.closeDevice();
+
+	std::unique_ptr<FakeEngine> injectedFailureEngine = std::make_unique<FakeEngine>();
+	FakeEngine *injectedFailureEngineView = injectedFailureEngine.get();
+	XAudio2AudioService injectedFailureService(std::move(injectedFailureEngine));
+	XAudio2AudioManager injectedFailureManager(&injectedFailureService, &catalog);
+	injectedFailureManager.openDevice();
+	injectedFailureEngineView->emitCritical(E_ABORT);
+	injectedFailureManager.update();
+	check(!injectedFailureManager.isOpen()
+		&& injectedFailureService.state() == XAudio2AudioServiceState::FAILED
+		&& injectedFailureEngineView->stopCalls == 0 && injectedFailureEngineView->closeCalls == 0,
+		"injected manager leaves failed-service teardown to its external owner");
+	injectedFailureManager.openDevice();
+	check(!injectedFailureManager.isOpen() && injectedFailureEngineView->openCalls == 1,
+		"injected manager cannot reopen a failed externally owned service");
+	injectedFailureService.shutdown();
+	check(injectedFailureService.open(), "external owner reopens its injected service after shutdown");
+	injectedFailureManager.openDevice();
+	check(injectedFailureManager.isOpen(),
+		"injected manager resumes only after the external owner completes recovery");
+	injectedFailureManager.closeDevice();
+	injectedFailureService.shutdown();
 
 	deleteInstance(lowInfo);
 	deleteInstance(highInfo);

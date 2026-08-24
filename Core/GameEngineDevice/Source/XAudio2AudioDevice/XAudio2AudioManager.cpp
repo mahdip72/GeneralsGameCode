@@ -120,6 +120,42 @@ Bool durationToFrames(Real durationMS, UnsignedInt sampleRate, UnsignedInt &fram
 	frames = static_cast<UnsignedInt>(std::floor(frameValue + 0.5));
 	return frames != 0;
 }
+
+XAudio2SpatializationPose makeSpatialPose(const Coord3D &position, const Coord3D &orientation)
+{
+	XAudio2SpatializationPose pose;
+	pose.position[0] = position.x;
+	pose.position[1] = position.z;
+	pose.position[2] = position.y;
+	float front[3] = { orientation.x, orientation.z, orientation.y };
+	float frontLength = std::sqrt(front[0] * front[0] + front[1] * front[1]
+		+ front[2] * front[2]);
+	if (!std::isfinite(frontLength) || frontLength <= 0.0001f) {
+		front[0] = 0.0f;
+		front[1] = 0.0f;
+		front[2] = 1.0f;
+		frontLength = 1.0f;
+	}
+	for (int component = 0; component < 3; ++component) {
+		pose.front[component] = front[component] / frontLength;
+	}
+	float top[3] = { 0.0f, 1.0f, 0.0f };
+	if (std::abs(pose.front[1]) > 0.99f) {
+		top[0] = 0.0f;
+		top[1] = 0.0f;
+		top[2] = 1.0f;
+	}
+	const float projection = top[0] * pose.front[0] + top[1] * pose.front[1]
+		+ top[2] * pose.front[2];
+	for (int component = 0; component < 3; ++component) {
+		top[component] -= projection * pose.front[component];
+	}
+	const float topLength = std::sqrt(top[0] * top[0] + top[1] * top[1] + top[2] * top[2]);
+	for (int component = 0; component < 3; ++component) {
+		pose.top[component] = top[component] / topLength;
+	}
+	return pose;
+}
 }
 
 XAudio2AudioManager::XAudio2AudioManager() :
@@ -149,6 +185,7 @@ XAudio2AudioManager::XAudio2AudioManager(XAudio2AudioService *service,
 	m_ownedVirtualFileSource = std::make_shared<EngineVirtualAudioSource>();
 	configureVirtualAssetSource(dynamic_cast<FileAudioAssetSource *>(m_assetSource),
 		m_ownedVirtualFileSource);
+	setDeviceListenerPosition();
 }
 
 XAudio2AudioManager::~XAudio2AudioManager()
@@ -205,6 +242,14 @@ void XAudio2AudioManager::setAudioSettingsForTest(AudioSettings *settings)
 void XAudio2AudioManager::setActiveMusicTrackForTest(const AsciiString &track)
 {
 	m_activeMusicTrack = track;
+}
+
+void XAudio2AudioManager::setOwnedServiceForTest(std::unique_ptr<XAudio2AudioService> service)
+{
+	closeDevice();
+	m_ownedService = std::move(service);
+	m_service = m_ownedService.get();
+	m_ownsService = m_service != nullptr;
 }
 #endif
 
@@ -314,9 +359,26 @@ void XAudio2AudioManager::update()
 	// request admission, active records, fades, and listener-driven controls.
 	if (m_service != nullptr) {
 		m_service->serviceVoices();
-		if (!m_service->isOpen() || m_service->state() == XAudio2AudioServiceState::FAILED) {
-			// A failed service closes admission and discards queued/active records
-			// in the same owner tick. Reopening is an explicit lifecycle action.
+		if (m_service->state() == XAudio2AudioServiceState::FAILED) {
+			// The owner must fully quiesce a failed native service before beginning
+			// a new callback generation. Injected services remain externally owned.
+			m_open = FALSE;
+			m_admissionOpen = FALSE;
+			removeAllAudioRequests();
+			clearPlaying();
+			++m_lifecycleGeneration;
+			if (m_lifecycleGeneration == 0) {
+				m_lifecycleGeneration = 1;
+			}
+			if (m_ownsService) {
+				m_service->shutdown();
+				m_open = m_service->state() == XAudio2AudioServiceState::CLOSED
+					&& m_service->open();
+				m_admissionOpen = m_open;
+			}
+			return;
+		}
+		if (!m_service->isOpen()) {
 			m_open = FALSE;
 			m_admissionOpen = FALSE;
 			removeAllAudioRequests();
@@ -338,6 +400,7 @@ void XAudio2AudioManager::update()
 		m_zoomVolume = 1.0f;
 		set3DVolumeAdjustment(1.0f);
 	}
+	setDeviceListenerPosition();
 	processRequestList();
 	processActiveAudio();
 	processFades();
@@ -1129,6 +1192,18 @@ void XAudio2AudioManager::openDevice()
 		m_service = m_ownedService.get();
 		m_ownsService = TRUE;
 	}
+	if (m_service->state() == XAudio2AudioServiceState::FAILED) {
+		if (!m_ownsService) {
+			m_open = FALSE;
+			m_admissionOpen = FALSE;
+			return;
+		}
+		m_service->shutdown();
+		++m_lifecycleGeneration;
+		if (m_lifecycleGeneration == 0) {
+			m_lifecycleGeneration = 1;
+		}
+	}
 	m_open = m_service->isOpen() || m_service->open();
 	m_admissionOpen = m_open;
 }
@@ -1585,9 +1660,27 @@ void XAudio2AudioManager::updatePlayingVolumes()
 {
 	for (PlayingAudio &playing : m_playing) {
 		if (playing.voiceOpen && m_service != nullptr) {
+			if (playing.channel == Channel::SAMPLE_3D && playing.event != nullptr
+				&& playing.event->isPositionalAudio()) {
+				const Coord3D *position = playing.event->getCurrentPosition();
+				if (position != nullptr) {
+					const XAudio2SpatializationPose emitterPose = makeSpatialPose(
+						*position, m_listenerOrientation);
+					if (!m_service->setVoiceSpatialization(playing.voice,
+							m_listenerPose, emitterPose)) {
+						failPlaying(playing);
+						continue;
+					}
+				}
+			}
 			m_service->setVoiceVolume(playing.voice, effectiveVolume(playing));
 		}
 	}
+}
+
+void XAudio2AudioManager::setDeviceListenerPosition()
+{
+	m_listenerPose = makeSpatialPose(m_listenerPosition, m_listenerOrientation);
 }
 
 void XAudio2AudioManager::updateDisallowSpeechGuard()

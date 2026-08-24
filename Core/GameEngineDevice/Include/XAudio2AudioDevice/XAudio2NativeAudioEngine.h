@@ -16,6 +16,7 @@ public:
 	HRESULT open(CriticalErrorCallback callback, void *context) noexcept override;
 	HRESULT start() noexcept override;
 	HRESULT createPcmVoice(std::unique_ptr<IXAudio2PcmVoiceBackend> &voice) noexcept override;
+	HRESULT getOutputDetails(XAudio2OutputDetails &details) const noexcept override;
 	HRESULT stop() noexcept override;
 	HRESULT close() noexcept override;
 

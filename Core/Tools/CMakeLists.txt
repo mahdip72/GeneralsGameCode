@@ -82,36 +82,38 @@ if(RTS_BUILD_CORE_EXTRAS)
     endif()
 
     if(WIN32)
-        add_test(NAME core_native_audio_backend_audit
-            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
-                -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeAudioBackendAudit/NativeAudioBackendAudit.ps1"
-                -SourceRoot "${CMAKE_SOURCE_DIR}"
-        )
-        set_tests_properties(core_native_audio_backend_audit PROPERTIES TIMEOUT 30)
-        add_test(NAME core_xaudio2_audio_service_audit
-            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
-                -File "${CMAKE_CURRENT_SOURCE_DIR}/XAudio2AudioServiceAudit/XAudio2AudioServiceAudit.ps1"
-                -SourceRoot "${CMAKE_SOURCE_DIR}"
-        )
-        set_tests_properties(core_xaudio2_audio_service_audit PROPERTIES TIMEOUT 30)
-        add_test(NAME core_native_audio_factory_audit
-            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
-                -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeAudioFactoryAudit/NativeAudioFactoryAudit.ps1"
-                -SourceRoot "${CMAKE_SOURCE_DIR}"
-        )
-        set_tests_properties(core_native_audio_factory_audit PROPERTIES TIMEOUT 30)
-        add_test(NAME core_native_audio_lifecycle_audit
-            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
-                -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeAudioLifecycleAudit/NativeAudioLifecycleAudit.ps1"
-                -SourceRoot "${CMAKE_SOURCE_DIR}"
-        )
-        set_tests_properties(core_native_audio_lifecycle_audit PROPERTIES TIMEOUT 30)
-        add_test(NAME core_native_xaudio_manager_audit
-            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
-                -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeXAudioManagerAudit/NativeXAudioManagerAudit.ps1"
-                -SourceRoot "${CMAKE_SOURCE_DIR}"
-        )
-        set_tests_properties(core_native_xaudio_manager_audit PROPERTIES TIMEOUT 30)
+        if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT IS_VS6_BUILD)
+            add_test(NAME core_native_audio_backend_audit
+                COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                    -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeAudioBackendAudit/NativeAudioBackendAudit.ps1"
+                    -SourceRoot "${CMAKE_SOURCE_DIR}"
+            )
+            set_tests_properties(core_native_audio_backend_audit PROPERTIES TIMEOUT 30)
+            add_test(NAME core_xaudio2_audio_service_audit
+                COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                    -File "${CMAKE_CURRENT_SOURCE_DIR}/XAudio2AudioServiceAudit/XAudio2AudioServiceAudit.ps1"
+                    -SourceRoot "${CMAKE_SOURCE_DIR}"
+            )
+            set_tests_properties(core_xaudio2_audio_service_audit PROPERTIES TIMEOUT 30)
+            add_test(NAME core_native_audio_factory_audit
+                COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                    -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeAudioFactoryAudit/NativeAudioFactoryAudit.ps1"
+                    -SourceRoot "${CMAKE_SOURCE_DIR}"
+            )
+            set_tests_properties(core_native_audio_factory_audit PROPERTIES TIMEOUT 30)
+            add_test(NAME core_native_audio_lifecycle_audit
+                COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                    -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeAudioLifecycleAudit/NativeAudioLifecycleAudit.ps1"
+                    -SourceRoot "${CMAKE_SOURCE_DIR}"
+            )
+            set_tests_properties(core_native_audio_lifecycle_audit PROPERTIES TIMEOUT 30)
+            add_test(NAME core_native_xaudio_manager_audit
+                COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                    -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeXAudioManagerAudit/NativeXAudioManagerAudit.ps1"
+                    -SourceRoot "${CMAKE_SOURCE_DIR}"
+            )
+            set_tests_properties(core_native_xaudio_manager_audit PROPERTIES TIMEOUT 30)
+        endif()
         add_test(NAME core_portability_audit
             COMMAND powershell -NoProfile -ExecutionPolicy Bypass
                 -File "${CMAKE_CURRENT_SOURCE_DIR}/PortabilityAudit/PortabilityAudit.ps1"

@@ -532,6 +532,25 @@ void testCallbackClaimPrecedesOwnerReclamation()
 	}
 	voice.close();
 }
+
+void testCompletionOverflowFailsClosed()
+{
+	FakePcmVoiceBackend backend;
+	XAudio2PcmVoice voice(backend);
+	check(voice.open(), "completion overflow voice opens");
+	for (std::uint64_t sequence = 0; sequence <= 32; ++sequence) {
+		check(voice.submit(makeChunk(0, sequence, static_cast<std::uint8_t>(sequence)))
+				== AudioPcmSubmitResult::ACCEPTED,
+			"completion overflow cycle admits one chunk");
+		voice.service();
+		backend.complete(static_cast<std::size_t>(sequence));
+		voice.service();
+	}
+	check(voice.isFailed(), "completion overflow enters a terminal state instead of stranding playback");
+	check(voice.getLastError() == HRESULT_FROM_WIN32(ERROR_BUFFER_OVERFLOW),
+		"completion overflow publishes an actionable error");
+	voice.close();
+}
 }
 
 int main()
@@ -546,6 +565,7 @@ int main()
 	testReopenAndRepeatedCleanup();
 	testStaleCallbackTokenIsIgnoredAfterSlotReuse();
 	testCallbackClaimPrecedesOwnerReclamation();
+	testCompletionOverflowFailsClosed();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "%d XAudio2PcmVoice checks failed\n", g_failures);
 		return 1;

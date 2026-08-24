@@ -11,6 +11,8 @@
 #include <mutex>
 #include <vector>
 
+#include <x3daudio.h>
+
 class XAudio2PcmVoice;
 
 enum class XAudio2AudioServiceState : std::uint8_t
@@ -55,6 +57,13 @@ struct XAudio2AudioCompletion
 	std::int64_t endSample = -1;
 };
 
+struct XAudio2SpatializationPose
+{
+	float position[3] = { 0.0f, 0.0f, 0.0f };
+	float front[3] = { 0.0f, 0.0f, 1.0f };
+	float top[3] = { 0.0f, 1.0f, 0.0f };
+};
+
 class XAudio2AudioService
 {
 public:
@@ -82,6 +91,9 @@ public:
 	bool resetVoice(XAudio2PcmVoiceHandle handle, std::uint64_t generation) noexcept;
 	bool serviceVoice(XAudio2PcmVoiceHandle handle) noexcept;
 	bool setVoiceVolume(XAudio2PcmVoiceHandle handle, float volume) noexcept;
+	bool setVoiceSpatialization(XAudio2PcmVoiceHandle handle,
+		const XAudio2SpatializationPose &listener,
+		const XAudio2SpatializationPose &emitter) noexcept;
 	bool pauseVoice(XAudio2PcmVoiceHandle handle) noexcept;
 	bool resumeVoice(XAudio2PcmVoiceHandle handle) noexcept;
 	bool stopVoice(XAudio2PcmVoiceHandle handle) noexcept;
@@ -114,4 +126,7 @@ private:
 	std::atomic<HRESULT> m_lastError;
 	XAudio2FailurePublication m_failurePublication;
 	bool m_failureHandled = false;
+	X3DAUDIO_HANDLE m_x3dHandle = {};
+	XAudio2OutputDetails m_outputDetails;
+	bool m_spatializationReady = false;
 };

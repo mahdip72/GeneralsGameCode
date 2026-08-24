@@ -107,10 +107,11 @@ public:
 	void setChannelLimitsForTest(UnsignedInt samples2D, UnsignedInt samples3D, UnsignedInt streams);
 	void setAudioSettingsForTest(AudioSettings *settings);
 	void setActiveMusicTrackForTest(const AsciiString &track);
+	void setOwnedServiceForTest(std::unique_ptr<XAudio2AudioService> service);
 #endif
 
 protected:
-	void setDeviceListenerPosition() override {}
+	void setDeviceListenerPosition() override;
 
 private:
 	struct PlayingAudio
@@ -197,4 +198,5 @@ private:
 	Bool m_open;
 	Bool m_admissionOpen;
 	Bool m_ambientPaused;
+	XAudio2SpatializationPose m_listenerPose;
 };

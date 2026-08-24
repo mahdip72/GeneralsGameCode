@@ -195,6 +195,17 @@ bool XAudio2PcmVoice::consumeCallbackError(HRESULT &error)
 	return true;
 }
 
+void XAudio2PcmVoice::publishCallbackError(HRESULT error) noexcept
+{
+	if (SUCCEEDED(error)) {
+		error = E_FAIL;
+	}
+	m_callbackErrorCode.store(error, std::memory_order_release);
+	m_lastError.store(error, std::memory_order_release);
+	m_callbackError.store(true, std::memory_order_release);
+	m_failed.store(true, std::memory_order_release);
+}
+
 void XAudio2PcmVoice::fail(HRESULT error)
 {
 	if (SUCCEEDED(error)) {
@@ -387,6 +398,25 @@ bool XAudio2PcmVoice::setVolume(float volume) noexcept
 	return true;
 }
 
+bool XAudio2PcmVoice::setOutputMatrix(UINT32 sourceChannels, UINT32 destinationChannels,
+	const float *matrix) noexcept
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	if (!m_open.load(std::memory_order_acquire)
+		|| m_failed.load(std::memory_order_acquire) || matrix == nullptr) {
+		return false;
+	}
+	const HRESULT result = m_backend.setOutputMatrix(sourceChannels, destinationChannels, matrix);
+	if (result == E_NOTIMPL) {
+		return true;
+	}
+	if (FAILED(result)) {
+		fail(result);
+		return false;
+	}
+	return true;
+}
+
 bool XAudio2PcmVoice::pause() noexcept
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
@@ -440,10 +470,12 @@ void XAudio2PcmVoice::publishCompletion(const XAudio2PcmCompletionRecord &comple
 	const std::uint32_t write = m_completionWrite.load(std::memory_order_relaxed);
 	const std::uint32_t read = m_completionRead.load(std::memory_order_acquire);
 	if (write - read >= COMPLETION_COUNT) {
+		publishCallbackError(HRESULT_FROM_WIN32(ERROR_BUFFER_OVERFLOW));
 		return;
 	}
 	CompletionSlot &slot = m_completions[write % COMPLETION_COUNT];
 	if (slot.ready.load(std::memory_order_acquire)) {
+		publishCallbackError(HRESULT_FROM_WIN32(ERROR_BUFFER_OVERFLOW));
 		return;
 	}
 	slot.record = completion;
@@ -619,8 +651,5 @@ void STDMETHODCALLTYPE XAudio2PcmVoice::OnLoopEnd(void *)
 
 void STDMETHODCALLTYPE XAudio2PcmVoice::OnVoiceError(void *, HRESULT Error)
 {
-	m_callbackErrorCode.store(Error, std::memory_order_release);
-	m_lastError.store(FAILED(Error) ? Error : E_FAIL, std::memory_order_release);
-	m_callbackError.store(true, std::memory_order_release);
-	m_failed.store(true, std::memory_order_release);
+	publishCallbackError(Error);
 }

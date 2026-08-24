@@ -28,6 +28,14 @@ public:
 		(void)volume;
 		return E_NOTIMPL;
 	}
+	virtual HRESULT setOutputMatrix(UINT32 sourceChannels, UINT32 destinationChannels,
+		const float *matrix) noexcept
+	{
+		(void)sourceChannels;
+		(void)destinationChannels;
+		(void)matrix;
+		return E_NOTIMPL;
+	}
 	virtual HRESULT pause() noexcept { return stop(); }
 	virtual HRESULT resume() noexcept { return start(); }
 	virtual void destroy() noexcept = 0;
@@ -67,6 +75,8 @@ public:
 	bool isDrained() const noexcept;
 	HRESULT getLastError() const noexcept;
 	bool setVolume(float volume) noexcept;
+	bool setOutputMatrix(UINT32 sourceChannels, UINT32 destinationChannels,
+		const float *matrix) noexcept;
 	bool pause() noexcept;
 	bool resume() noexcept;
 	bool stop() noexcept;
@@ -129,6 +139,7 @@ private:
 	Slot *findNextPendingSlot();
 	bool hasSubmittedOldSlot() const;
 	bool consumeCallbackError(HRESULT &error);
+	void publishCallbackError(HRESULT error) noexcept;
 	void fail(HRESULT error);
 	bool checkExternalFailure();
 	void publishCompletion(const XAudio2PcmCompletionRecord &completion) noexcept;

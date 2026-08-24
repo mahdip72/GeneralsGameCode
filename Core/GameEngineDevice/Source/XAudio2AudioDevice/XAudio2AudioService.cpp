@@ -3,7 +3,25 @@
 #include "XAudio2AudioDevice/XAudio2NativeAudioEngine.h"
 #include "XAudio2AudioDevice/XAudio2PcmVoice.h"
 
+#include <array>
+#include <cmath>
 #include <new>
+
+namespace
+{
+X3DAUDIO_VECTOR makeVector(const float values[3]) noexcept
+{
+	return X3DAUDIO_VECTOR { values[0], values[1], values[2] };
+}
+
+bool isFinitePose(const XAudio2SpatializationPose &pose) noexcept
+{
+	for (float value : pose.position) if (!std::isfinite(value)) return false;
+	for (float value : pose.front) if (!std::isfinite(value)) return false;
+	for (float value : pose.top) if (!std::isfinite(value)) return false;
+	return true;
+}
+}
 
 XAudio2AudioService::XAudio2AudioService() :
 	XAudio2AudioService(std::make_unique<XAudio2NativeAudioEngine>())
@@ -55,6 +73,8 @@ bool XAudio2AudioService::open()
 	// Advance past any retained publication before opening a new generation.
 	m_failurePublication.clear();
 	m_failureHandled = false;
+	m_spatializationReady = false;
+	m_outputDetails = {};
 	m_state.store(XAudio2AudioServiceState::OPENING, std::memory_order_release);
 	m_lastError.store(S_OK, std::memory_order_release);
 
@@ -74,6 +94,8 @@ bool XAudio2AudioService::open()
 			m_failurePublication.publish(closeResult);
 		}
 		const HRESULT firstFailure = m_failurePublication.failure();
+		m_spatializationReady = false;
+		m_outputDetails = {};
 		m_failurePublication.clear();
 		m_failureHandled = false;
 		m_state.store(XAudio2AudioServiceState::CLOSED, std::memory_order_release);
@@ -90,6 +112,24 @@ bool XAudio2AudioService::open()
 		|| m_state.load(std::memory_order_acquire) != XAudio2AudioServiceState::OPENING
 		|| m_failurePublication.hasFailure()) {
 		return unwind(false, normalizeFailure(result));
+	}
+
+	XAudio2OutputDetails outputDetails;
+	result = m_backend->getOutputDetails(outputDetails);
+	if (result == E_NOTIMPL) {
+		result = S_OK;
+	} else if (FAILED(result) || outputDetails.channelMask == 0
+		|| outputDetails.channelCount == 0
+		|| outputDetails.channelCount > XAUDIO2_MAX_AUDIO_CHANNELS) {
+		return unwind(false, FAILED(result) ? result : E_INVALIDARG);
+	} else {
+		result = X3DAudioInitialize(outputDetails.channelMask,
+			X3DAUDIO_SPEED_OF_SOUND, m_x3dHandle);
+		if (FAILED(result)) {
+			return unwind(false, result);
+		}
+		m_outputDetails = outputDetails;
+		m_spatializationReady = true;
 	}
 
 	result = m_backend->start();
@@ -209,6 +249,8 @@ void XAudio2AudioService::shutdown()
 	}
 	m_failurePublication.clear();
 	m_failureHandled = false;
+	m_spatializationReady = false;
+	m_outputDetails = {};
 	m_state.store(XAudio2AudioServiceState::CLOSED, std::memory_order_release);
 	m_lastError.store(firstFailure, std::memory_order_release);
 }
@@ -447,6 +489,63 @@ bool XAudio2AudioService::setVoiceVolume(XAudio2PcmVoiceHandle handle, float vol
 		return false;
 	}
 	return m_voices[handle.index].voice->setVolume(volume);
+}
+
+bool XAudio2AudioService::setVoiceSpatialization(XAudio2PcmVoiceHandle handle,
+	const XAudio2SpatializationPose &listenerPose,
+	const XAudio2SpatializationPose &emitterPose) noexcept
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	processPendingFailureLocked();
+	if (m_state.load(std::memory_order_acquire) != XAudio2AudioServiceState::RUNNING
+		|| !isHandleOwnedLocked(handle)) {
+		return false;
+	}
+	if (!m_spatializationReady) {
+		return true;
+	}
+	if (!isFinitePose(listenerPose) || !isFinitePose(emitterPose)) {
+		return false;
+	}
+
+	X3DAUDIO_LISTENER listener = {};
+	listener.Position = makeVector(listenerPose.position);
+	listener.OrientFront = makeVector(listenerPose.front);
+	listener.OrientTop = makeVector(listenerPose.top);
+
+	float channelAzimuths[2] = { 0.0f, 0.0f };
+	X3DAUDIO_DISTANCE_CURVE_POINT unityPoints[2] = {
+		{ 0.0f, 1.0f },
+		{ 1.0f, 1.0f }
+	};
+	X3DAUDIO_DISTANCE_CURVE unityCurve = { unityPoints, 2 };
+	X3DAUDIO_EMITTER emitter = {};
+	emitter.Position = makeVector(emitterPose.position);
+	emitter.OrientFront = makeVector(emitterPose.front);
+	emitter.OrientTop = makeVector(emitterPose.top);
+	emitter.ChannelCount = 2;
+	emitter.ChannelRadius = 0.0f;
+	emitter.pChannelAzimuths = channelAzimuths;
+	emitter.pVolumeCurve = &unityCurve;
+	emitter.CurveDistanceScaler = 1.0f;
+	emitter.DopplerScaler = 1.0f;
+
+	std::array<float, 2 * XAUDIO2_MAX_AUDIO_CHANNELS> matrix = {};
+	X3DAUDIO_DSP_SETTINGS settings = {};
+	settings.SrcChannelCount = 2;
+	settings.DstChannelCount = m_outputDetails.channelCount;
+	settings.pMatrixCoefficients = matrix.data();
+	X3DAudioCalculate(m_x3dHandle, &listener, &emitter,
+		X3DAUDIO_CALCULATE_MATRIX, &settings);
+	const std::size_t coefficientCount = static_cast<std::size_t>(settings.SrcChannelCount)
+		* settings.DstChannelCount;
+	for (std::size_t index = 0; index < coefficientCount; ++index) {
+		if (!std::isfinite(matrix[index])) {
+			return false;
+		}
+	}
+	return m_voices[handle.index].voice->setOutputMatrix(settings.SrcChannelCount,
+		settings.DstChannelCount, matrix.data());
 }
 
 bool XAudio2AudioService::pauseVoice(XAudio2PcmVoiceHandle handle) noexcept
