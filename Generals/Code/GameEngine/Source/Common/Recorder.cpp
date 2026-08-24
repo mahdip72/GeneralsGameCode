@@ -47,6 +47,7 @@
 #include "Common/CRCDebug.h"
 #include "Common/OptionPreferences.h"
 #include "Common/version.h"
+#include "Lib/ReplayFieldReader.h"
 
 #if defined(_WIN64)
 #include "Lib/RuntimeEpochContract.h"
@@ -687,8 +688,6 @@ void RecorderClass::startRecording(GameDifficulty diff, Int originalGameMode, In
 
 	reset();
 
-	m_mode = RECORDERMODETYPE_RECORD;
-
 	AsciiString filepath = getReplayDir();
 
 	// We have to make sure the replay dir exists.
@@ -704,6 +703,7 @@ void RecorderClass::startRecording(GameDifficulty diff, Int originalGameMode, In
 	#endif
 	if (m_file == nullptr) {
 		DEBUG_ASSERTCRASH(m_file != nullptr, ("Failed to create replay file"));
+		m_fileName.clear();
 		return;
 	}
 	#if defined(_WIN64)
@@ -712,9 +712,13 @@ void RecorderClass::startRecording(GameDifficulty diff, Int originalGameMode, In
 		DEBUG_LOG(("RecorderClass::startRecording - failed to write RPL3 container header"));
 		m_file->close();
 		m_file = nullptr;
+		if (!DeleteFile(filepath.str()))
+			DEBUG_LOG(("RecorderClass::startRecording - failed to remove incomplete RPL3 replay"));
+		m_fileName.clear();
 		return;
 	}
 	#endif
+	m_mode = RECORDERMODETYPE_RECORD;
 	// TheSuperHackers @info the null terminator needs to be ignored to maintain retail replay file layout
 	m_file->writeFormat("%s", s_genrep);
 
@@ -870,10 +874,15 @@ void RecorderClass::startRecording(GameDifficulty diff, Int originalGameMode, In
  */
 void RecorderClass::stopRecording() {
 	logGameEnd();
+	Bool replayFinalized = TRUE;
 	#if defined(_WIN64)
-	if (m_file != nullptr && !finalizeNativeReplayContainer(m_file))
+	if (m_file != nullptr)
 	{
-		DEBUG_LOG(("RecorderClass::stopRecording - failed to finalize RPL3 container"));
+		replayFinalized = finalizeNativeReplayContainer(m_file);
+		if (!replayFinalized)
+		{
+			DEBUG_LOG(("RecorderClass::stopRecording - failed to finalize RPL3 container"));
+		}
 	}
 	#endif
 	if (TheNetwork)
@@ -889,8 +898,16 @@ void RecorderClass::stopRecording() {
 		m_file->close();
 		m_file = nullptr;
 
-		if (m_archiveReplays)
+		if (replayFinalized && m_archiveReplays)
 			archiveReplay(m_fileName);
+		else if (!replayFinalized)
+		{
+			AsciiString invalidReplayPath = getReplayDir();
+			invalidReplayPath.concat(m_fileName);
+			if (!DeleteFile(invalidReplayPath.str()))
+				DEBUG_LOG(("RecorderClass::stopRecording - failed to remove incomplete RPL3 replay"));
+			m_mode = RECORDERMODETYPE_NONE;
+		}
 	}
 	m_fileName.clear();
 }
@@ -1059,8 +1076,8 @@ Bool RecorderClass::readReplayHeader(ReplayHeader& header)
 
 	// Read the GENREP header.
 	char genrep[sizeof(s_genrep) - 1] = {0};
-	m_file->read( &genrep, sizeof(s_genrep) - 1 );
-	if ( strncmp(genrep, s_genrep, sizeof(s_genrep) - 1 ) != 0 ) {
+	if (!readExact(&genrep, sizeof(genrep)) ||
+		strncmp(genrep, s_genrep, sizeof(s_genrep) - 1 ) != 0 ) {
 		DEBUG_LOG(("RecorderClass::readReplayHeader - replay file did not have GENREP at the start."));
 		m_file->close();
 		m_file = nullptr;
@@ -1069,35 +1086,84 @@ Bool RecorderClass::readReplayHeader(ReplayHeader& header)
 
 	// read in some stats
 	replay_time_t tmp;
-	m_file->read(&tmp, sizeof(tmp));
+	if (!readExact(&tmp, sizeof(tmp)))
+	{
+		DEBUG_LOG(("RecorderClass::readReplayHeader - replay statistics are truncated."));
+		m_file->close();
+		m_file = nullptr;
+		return FALSE;
+	}
 	header.startTime = tmp;
-	m_file->read(&tmp, sizeof(tmp));
+	if (!readExact(&tmp, sizeof(tmp)))
+	{
+		DEBUG_LOG(("RecorderClass::readReplayHeader - replay statistics are truncated."));
+		m_file->close();
+		m_file = nullptr;
+		return FALSE;
+	}
 	header.endTime = tmp;
 
-	m_file->read(&header.frameCount, sizeof(header.frameCount));
-
-	m_file->read(&header.desyncGame, sizeof(header.desyncGame));
-	m_file->read(&header.quitEarly, sizeof(header.quitEarly));
+	Bool fixedFieldsValid = readExact(&header.frameCount, sizeof(header.frameCount)) &&
+		readExact(&header.desyncGame, sizeof(header.desyncGame)) &&
+		readExact(&header.quitEarly, sizeof(header.quitEarly));
 	for (Int i=0; i<MAX_SLOTS; ++i)
 	{
-		m_file->read(&(header.playerDiscons[i]), sizeof(Bool));
+		if (!readExact(&(header.playerDiscons[i]), sizeof(Bool)))
+			fixedFieldsValid = FALSE;
+	}
+	if (!fixedFieldsValid)
+	{
+		DEBUG_LOG(("RecorderClass::readReplayHeader - replay statistics are truncated."));
+		m_file->close();
+		m_file = nullptr;
+		return FALSE;
 	}
 
 	// Read the Replay Name.  We don't actually do anything with it.  Oh well.
-	header.replayName = readUnicodeString();
+	if (!readUnicodeString(header.replayName))
+	{
+		DEBUG_LOG(("RecorderClass::readReplayHeader - replay name is malformed."));
+		m_file->close();
+		m_file = nullptr;
+		return FALSE;
+	}
 
 	// Read the date and time.  We don't really do anything with this either. Oh well.
-	m_file->read(&header.timeVal, sizeof(header.timeVal));
+	if (!readExact(&header.timeVal, sizeof(header.timeVal)) ||
+		!readUnicodeString(header.versionString) ||
+		!readUnicodeString(header.versionTimeString) ||
+		!readExact(&header.versionNumber, sizeof(header.versionNumber)) ||
+		!readExact(&header.exeCRC, sizeof(header.exeCRC)) ||
+		!readExact(&header.iniCRC, sizeof(header.iniCRC)))
+	{
+		DEBUG_LOG(("RecorderClass::readReplayHeader - replay version fields are malformed."));
+		m_file->close();
+		m_file = nullptr;
+		return FALSE;
+	}
 
 	// Read in the Version info
-	header.versionString = readUnicodeString();
-	header.versionTimeString = readUnicodeString();
-	m_file->read(&header.versionNumber, sizeof(header.versionNumber));
-	m_file->read(&header.exeCRC, sizeof(header.exeCRC));
-	m_file->read(&header.iniCRC, sizeof(header.iniCRC));
+	AsciiString playerIndex;
+	if (!readAsciiString(header.gameOptions) || !readAsciiString(playerIndex))
+	{
+		DEBUG_LOG(("RecorderClass::readReplayHeader - replay game fields are malformed."));
+		m_file->close();
+		m_file = nullptr;
+		return FALSE;
+	}
+	char *playerIndexEnd = nullptr;
+	const long parsedPlayerIndex = strtol(playerIndex.str(), &playerIndexEnd, 10);
+	if (playerIndexEnd == playerIndex.str() || *playerIndexEnd != '\0' ||
+		parsedPlayerIndex < -1 || parsedPlayerIndex >= MAX_SLOTS)
+	{
+		DEBUG_LOG(("RecorderClass::readReplayHeader - invalid local slot number."));
+		m_file->close();
+		m_file = nullptr;
+		return FALSE;
+	}
+	header.localPlayerIndex = static_cast<Int>(parsedPlayerIndex);
 
-	// Read in the GameInfo
-	header.gameOptions = readAsciiString();
+	// Read in the GameInfo.
 	m_gameInfo.reset();
 	m_gameInfo.enterGame();
 	DEBUG_LOG(("RecorderClass::readReplayHeader - GameInfo = %s", header.gameOptions.str()));
@@ -1110,17 +1176,6 @@ Bool RecorderClass::readReplayHeader(ReplayHeader& header)
 	}
 	m_gameInfo.startGame(0);
 
-	AsciiString playerIndex = readAsciiString();
-	header.localPlayerIndex = atoi(playerIndex.str());
-	if (header.localPlayerIndex < -1 || header.localPlayerIndex >= MAX_SLOTS)
-	{
-		DEBUG_LOG(("RecorderClass::readReplayHeader - invalid local slot number."));
-		m_gameInfo.endGame();
-		m_gameInfo.reset();
-		m_file->close();
-		m_file = nullptr;
-		return FALSE;
-	}
 	if (header.localPlayerIndex >= 0)
 	{
 		Int localIP = m_gameInfo.getSlot(header.localPlayerIndex)->getIP();
@@ -1338,6 +1393,22 @@ Bool RecorderClass::playbackFile(AsciiString filename)
 	DEBUG_ASSERTCRASH(!exeDifferent && !iniDifferent, (debugString.str()));
 #endif
 
+	Int difficulty = 0;
+	Int rankPoints = 0;
+	Int maxFPS = 0;
+	if (!readExact(&difficulty, sizeof(difficulty)) ||
+		!readExact(&m_originalGameMode, sizeof(m_originalGameMode)) ||
+		!readExact(&rankPoints, sizeof(rankPoints)) ||
+		!readExact(&maxFPS, sizeof(maxFPS)))
+	{
+		DEBUG_LOG(("RecorderClass::playbackFile - replay launch fields are truncated."));
+		m_gameInfo.endGame();
+		m_gameInfo.reset();
+		m_file->close();
+		m_file = nullptr;
+		return FALSE;
+	}
+
 #ifdef DEBUG_LOGGING
 	if (header.localPlayerIndex >= 0)
 	{
@@ -1350,17 +1421,6 @@ Bool RecorderClass::playbackFile(AsciiString filename)
 	m_crcInfo = CRCInfo(header.localPlayerIndex, isMultiplayer);
 	REPLAY_CRC_INTERVAL = m_gameInfo.getCRCInterval();
 	DEBUG_LOG(("Player index is %d, replay CRC interval is %d", m_crcInfo.getLocalPlayer(), REPLAY_CRC_INTERVAL));
-
-	Int difficulty = 0;
-	m_file->read(&difficulty, sizeof(difficulty));
-
-	m_file->read(&m_originalGameMode, sizeof(m_originalGameMode));
-
-	Int rankPoints = 0;
-	m_file->read(&rankPoints, sizeof(rankPoints));
-
-	Int maxFPS = 0;
-	m_file->read(&maxFPS, sizeof(maxFPS));
 
 	DEBUG_LOG(("RecorderClass::playbackFile() - original game was mode %d", m_originalGameMode));
 
@@ -1405,60 +1465,39 @@ Bool RecorderClass::playbackFile(AsciiString filename)
 	return TRUE;
 }
 
-/**
- * Read a unicode string from the current file position. The string is assumed to be 0-terminated.
- */
-UnicodeString RecorderClass::readUnicodeString() {
-	WideChar str[1024] = L"";
-	Int index = 0;
-
-	Int c = m_file->readWideChar();
-	if (c == EOF) {
-		str[index] = 0;
-	}
-	str[index] = c;
-
-	while (index < 1024 && str[index] != 0) {
-		++index;
-		Int c = m_file->readWideChar();
-		if (c == EOF) {
-			str[index] = 0;
-			break;
-		}
-		str[index] = c;
-	}
-	str[1023] = L'\0';
-
-	UnicodeString retval(str);
-	return retval;
+Bool RecorderClass::readExact(void *data, Int dataSize)
+{
+	return m_file != nullptr && rts::replay::ReadExact(*m_file, data, dataSize);
 }
 
 /**
- * Read an ascii string from the current file position. The string is assumed to be 0-terminated.
+ * Read a bounded, null-terminated Unicode string from the current file position.
  */
-AsciiString RecorderClass::readAsciiString() {
+Bool RecorderClass::readUnicodeString(UnicodeString &value)
+{
+	WideChar str[1024] = L"";
+	if (m_file == nullptr || !rts::replay::ReadWideString(*m_file, str, ARRAY_SIZE(str)))
+	{
+		value.clear();
+		return FALSE;
+	}
+	value = str;
+	return TRUE;
+}
+
+/**
+ * Read a bounded, null-terminated ASCII string from the current file position.
+ */
+Bool RecorderClass::readAsciiString(AsciiString &value)
+{
 	char str[1024] = "";
-	Int index = 0;
-
-	Int c =	m_file->readChar();
-	if (c == EOF) {
-		str[index] = 0;
+	if (m_file == nullptr || !rts::replay::ReadAsciiString(*m_file, str, ARRAY_SIZE(str)))
+	{
+		value.clear();
+		return FALSE;
 	}
-	str[index] = c;
-
-	while (index < 1024 && str[index] != 0) {
-		++index;
-		Int c = m_file->readChar();
-		if (c == EOF) {
-			str[index] = 0;
-			break;
-		}
-		str[index] = c;
-	}
-	str[1023] = '\0';
-
-	AsciiString retval(str);
-	return retval;
+	value = str;
+	return TRUE;
 }
 
 /**

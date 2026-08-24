@@ -16,6 +16,7 @@ if(RTS_BUILD_CORE_EXTRAS)
         add_subdirectory(NativeW3DResourcesTest)
         add_subdirectory(NativeW3D2Test)
         add_subdirectory(X64PortabilityTest)
+        add_subdirectory(ReplayFieldReaderTest)
         add_subdirectory(ThreadHandleContractTest)
         add_subdirectory(RegistryHandleContractTest)
         add_subdirectory(VersionHandleContractTest)
@@ -33,6 +34,18 @@ if(RTS_BUILD_CORE_EXTRAS)
                 -BuildRoot "${CMAKE_BINARY_DIR}"
         )
         set_tests_properties(core_native_audio_graph_audit PROPERTIES TIMEOUT 30)
+        add_test(NAME core_replay_recorder_integration_audit
+            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/ReplayRecorderIntegrationAudit/ReplayRecorderIntegrationAudit.ps1"
+                -SourceRoot "${CMAKE_SOURCE_DIR}"
+        )
+        set_tests_properties(core_replay_recorder_integration_audit PROPERTIES TIMEOUT 30)
+        add_test(NAME core_replay_recorder_integration_audit_self_test
+            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/ReplayRecorderIntegrationAudit/ReplayRecorderIntegrationAudit.ps1"
+                -SelfTest
+        )
+        set_tests_properties(core_replay_recorder_integration_audit_self_test PROPERTIES TIMEOUT 30)
         add_test(NAME core_native_product_runtime_audit
             COMMAND powershell -NoProfile -ExecutionPolicy Bypass
                 -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeProductRuntimeAudit/NativeProductRuntimeAudit.ps1"

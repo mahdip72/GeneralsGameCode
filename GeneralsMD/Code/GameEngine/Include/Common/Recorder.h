@@ -175,8 +175,9 @@ protected:
 	void logGameStart(AsciiString options);
 	void logGameEnd();
 
-	AsciiString readAsciiString();										///< Read the next string from m_file using ascii characters.
-	UnicodeString readUnicodeString();								///< Read the next string from m_file using unicode characters.
+	Bool readExact(void *data, Int dataSize);						///< Read one complete fixed-width replay field.
+	Bool readAsciiString(AsciiString &value);					///< Read a bounded, terminated ASCII replay field.
+	Bool readUnicodeString(UnicodeString &value);			///< Read a bounded, terminated Unicode replay field.
 	void readNextFrame();															///< Read the next frame number to execute a command on.
 	void appendNextCommand();													///< Read the next GameMessage and append it to TheCommandList.
 	void writeArgument(GameMessageArgumentDataType type, const GameMessageArgumentType arg);
