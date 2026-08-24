@@ -93,17 +93,26 @@ int TestNetworkHelloContract()
 
 	constexpr std::uint32_t executableCrc = 0x11223344U;
 	constexpr std::uint32_t iniCrc = 0xaabbccddU;
+	constexpr std::uint64_t sessionToken = 0x0123456789abcdefULL;
 	const std::array<rts::runtime_epoch::Byte, kNetworkHelloWireSize> encoded =
-		EncodeNetworkHello(executableCrc, iniCrc, 2U, 5U);
+		EncodeNetworkHello(executableCrc, iniCrc, 2U, 5U, sessionToken);
 
 	int result = 0;
-	result |= Check(kNetworkHelloWireSize == 52U, "NET3 hello uses the fixed 52-byte wire size");
+	result |= Check(kNetworkHelloWireSize == 60U, "NET3 hello uses the fixed 60-byte wire size");
 	result |= Check(HasNetworkHelloMagic(encoded.data(), encoded.size()),
 		"NET3 hello carries its independent wire magic");
 	result |= Check(!HasNetworkHelloMagic(encoded.data(), encoded.size() - 1U),
 		"NET3 classification requires the exact wire size");
 	result |= Check(!HasNetworkHelloMagic(encoded.data(), 4U),
 		"a normal payload prefix is not classified as NET3");
+	result |= Check(HasNetworkHelloPrefix(encoded.data(), 4U),
+		"NET3 prefix classification quarantines unsupported record sizes");
+	std::array<rts::runtime_epoch::Byte, 52U> obsoleteRecord = {{}};
+	for (std::size_t index = 0; index < obsoleteRecord.size(); ++index)
+		obsoleteRecord[index] = encoded[index];
+	result |= Check(HasNetworkHelloPrefix(obsoleteRecord.data(), obsoleteRecord.size()) &&
+		!HasNetworkHelloMagic(obsoleteRecord.data(), obsoleteRecord.size()),
+		"obsolete 52-byte NET3 records cannot enter gameplay packet parsing");
 	result |= Check(encoded[4] == 0x01U && encoded[5] == 0x00U &&
 		encoded[6] == 0x00U && encoded[7] == 0x00U,
 		"NET3 schema version is little endian");
@@ -119,21 +128,24 @@ int TestNetworkHelloContract()
 		"NET3 Hello kind is fixed-width little endian");
 	result |= Check(ReadNetworkHelloKind(encoded.data()) == NetworkHelloKind::Hello,
 		"NET3 Hello record kind decodes explicitly");
+	result |= Check(ReadNetworkHelloSessionToken(encoded.data()) == sessionToken,
+		"NET3 session token is fixed-width little endian");
 
 	const std::array<rts::runtime_epoch::Byte, kNetworkHelloWireSize> ackEncoded =
-		EncodeNetworkHello(executableCrc, iniCrc, 5U, 2U, NetworkHelloKind::Ack);
+		EncodeNetworkHello(executableCrc, iniCrc, 5U, 2U, sessionToken, NetworkHelloKind::Ack);
 	rts::runtime_epoch::NetworkHello decoded;
 	result |= Check(ReadNetworkHelloKind(ackEncoded.data()) == NetworkHelloKind::Ack,
 		"NET3 Ack record kind decodes explicitly");
-	std::array<rts::runtime_epoch::Byte, kNetworkHelloWireSize> unknownKind = encoded;
-	WriteLittleEndian32(unknownKind.data() + kNetworkHelloKindOffset, 99U);
+	const std::array<rts::runtime_epoch::Byte, kNetworkHelloWireSize> unknownKind =
+		EncodeNetworkHello(executableCrc, iniCrc, 2U, 5U, sessionToken,
+			static_cast<NetworkHelloKind>(99U));
 	NetworkHelloKind decodedUnknownKind = NetworkHelloKind::Hello;
 	NetworkHelloIdentity unknownKindIdentity;
 	result |= Check(!DecodeNetworkHelloRecord(unknownKind.data(), unknownKind.size(),
 		&decodedUnknownKind, &unknownKindIdentity),
 		"NET3 unknown record kinds are rejected before dispatch");
 	result |= Check(DecodeAndValidateNetworkHello(unknownKind.data(), unknownKind.size(),
-		executableCrc, iniCrc, 2U, 5U, static_cast<NetworkHelloKind>(99U), &decoded).error ==
+		executableCrc, iniCrc, 2U, 5U, static_cast<NetworkHelloKind>(99U), sessionToken, &decoded).error ==
 		rts::runtime_epoch::ValidationError::NetworkKindMismatch,
 		"NET3 unknown record kinds fail validation");
 	NetworkHelloKind decodedKind = NetworkHelloKind::Hello;
@@ -145,46 +157,80 @@ int TestNetworkHelloContract()
 
 	rts::network_epoch::NetworkHelloIdentity identity;
 	result |= Check(DecodeAndValidateNetworkHello(encoded.data(), encoded.size(),
-		executableCrc, iniCrc, 2U, 5U, &decoded, &identity).ok(),
+		executableCrc, iniCrc, 2U, 5U, sessionToken, &decoded, &identity).ok(),
 		"matching NET3 hello validates");
+	result |= Check(DecodeAndValidateNetworkHello(encoded.data(), encoded.size(),
+		executableCrc, iniCrc, 2U, 5U, kAnyNetworkHelloSessionToken, &decoded).ok(),
+		"a first Hello accepts any nonzero fresh session token");
 	result |= Check(identity.senderSlot == 2U && identity.recipientSlot == 5U,
 		"NET3 carries stable sender and recipient slot identity");
 	result |= Check(IsPlausibleNetworkHelloIdentity(encoded.data(), encoded.size(), 5U, 8U),
 		"NET3 candidate identity names the local slot and an active slot range");
-	result |= Check(decoded.payloadByteCount == 0U && decoded.payloadChecksum == 0U,
-		"NET3 hello has no implicit object-layout payload");
+	result |= Check(decoded.payloadByteCount == kNetworkHelloPayloadSize &&
+		decoded.payloadChecksum == CalculatePayloadChecksum(
+			encoded.data() + kNetworkHelloKindOffset, kNetworkHelloPayloadSize),
+		"NET3 checksum covers kind, identity, and session token payload");
 
 	std::array<rts::runtime_epoch::Byte, kNetworkHelloWireSize> malformed = encoded;
 	malformed[0] = 'X';
 	result |= Check(DecodeAndValidateNetworkHello(malformed.data(), malformed.size(),
-		executableCrc, iniCrc, 2U, 5U, &decoded).error == rts::runtime_epoch::ValidationError::InvalidMagic,
+		executableCrc, iniCrc, 2U, 5U, sessionToken, &decoded).error == rts::runtime_epoch::ValidationError::InvalidMagic,
 		"NET3 wrong magic is rejected");
 
 	std::array<rts::runtime_epoch::Byte, kNetworkHelloWireSize> wrongBuild = encoded;
 	wrongBuild[12] ^= 0x01U;
 	result |= Check(DecodeAndValidateNetworkHello(wrongBuild.data(), wrongBuild.size(),
-		executableCrc, iniCrc, 2U, 5U, &decoded).error == rts::runtime_epoch::ValidationError::BuildCompatibilityMismatch,
+		executableCrc, iniCrc, 2U, 5U, sessionToken, &decoded).error == rts::runtime_epoch::ValidationError::BuildCompatibilityMismatch,
 		"NET3 incompatible build identity is rejected");
 
 	std::array<rts::runtime_epoch::Byte, kNetworkHelloWireSize> wrongContent = encoded;
 	wrongContent[20] ^= 0x01U;
 	result |= Check(DecodeAndValidateNetworkHello(wrongContent.data(), wrongContent.size(),
-		executableCrc, iniCrc, 2U, 5U, &decoded).error == rts::runtime_epoch::ValidationError::ContentHashMismatch,
+		executableCrc, iniCrc, 2U, 5U, sessionToken, &decoded).error == rts::runtime_epoch::ValidationError::ContentHashMismatch,
 		"NET3 incompatible content identity is rejected");
 
 	std::array<rts::runtime_epoch::Byte, kNetworkHelloWireSize> wrongIdentity = encoded;
 	wrongIdentity[kNetworkHelloSenderSlotOffset] ^= 0x01U;
 	result |= Check(DecodeAndValidateNetworkHello(wrongIdentity.data(), wrongIdentity.size(),
-		executableCrc, iniCrc, 2U, 5U, &decoded).error == rts::runtime_epoch::ValidationError::NetworkIdentityMismatch,
+		executableCrc, iniCrc, 2U, 5U, sessionToken, &decoded).error ==
+		rts::runtime_epoch::ValidationError::PayloadChecksumMismatch,
+		"NET3 rejects identity mutation before trusting the claimed slot");
+
+	const std::array<rts::runtime_epoch::Byte, kNetworkHelloWireSize> validWrongIdentity =
+		EncodeNetworkHello(executableCrc, iniCrc, 3U, 5U, sessionToken);
+	result |= Check(DecodeAndValidateNetworkHello(validWrongIdentity.data(), validWrongIdentity.size(),
+		executableCrc, iniCrc, 2U, 5U, sessionToken, &decoded).error ==
+		rts::runtime_epoch::ValidationError::NetworkIdentityMismatch,
 		"NET3 sender identity is validated independently of endpoint address");
 
 	result |= Check(DecodeAndValidateNetworkHello(ackEncoded.data(), ackEncoded.size(),
-		executableCrc, iniCrc, 5U, 2U, NetworkHelloKind::Ack, &decoded).ok(),
+		executableCrc, iniCrc, 5U, 2U, NetworkHelloKind::Ack, sessionToken, &decoded).ok(),
 		"matching NET3 Ack validates");
 	result |= Check(DecodeAndValidateNetworkHello(ackEncoded.data(), ackEncoded.size(),
-		executableCrc, iniCrc, 5U, 2U, NetworkHelloKind::Hello, &decoded).error ==
+		executableCrc, iniCrc, 5U, 2U, NetworkHelloKind::Hello, sessionToken, &decoded).error ==
 		rts::runtime_epoch::ValidationError::NetworkKindMismatch,
 		"NET3 Hello and Ack kinds cannot be interchanged");
+	result |= Check(DecodeAndValidateNetworkHello(ackEncoded.data(), ackEncoded.size(),
+		executableCrc, iniCrc, 5U, 2U, NetworkHelloKind::Ack, sessionToken + 1U, &decoded).error ==
+		rts::runtime_epoch::ValidationError::NetworkSessionMismatch,
+		"NET3 rejects an Ack replayed from a stale session");
+	result |= Check(IsNetworkHelloSessionTokenAccepted(NetworkHelloKind::Hello,
+		sessionToken, sessionToken + 1U),
+		"a current Hello can replace a stale remembered peer token");
+	result |= Check(IsNetworkHelloSessionTokenAccepted(NetworkHelloKind::Ack,
+		sessionToken, sessionToken) &&
+		!IsNetworkHelloSessionTokenAccepted(NetworkHelloKind::Ack,
+			sessionToken, sessionToken + 1U),
+		"Ack acceptance requires the current local session token");
+	result |= Check(EncodeNetworkHello(executableCrc, iniCrc, 2U, 5U, sessionToken) == encoded,
+		"Hello retries preserve the same session challenge");
+
+	const std::array<rts::runtime_epoch::Byte, kNetworkHelloWireSize> zeroToken =
+		EncodeNetworkHello(executableCrc, iniCrc, 2U, 5U, 0U);
+	result |= Check(DecodeAndValidateNetworkHello(zeroToken.data(), zeroToken.size(),
+		executableCrc, iniCrc, 2U, 5U, kAnyNetworkHelloSessionToken, &decoded).error ==
+		rts::runtime_epoch::ValidationError::NetworkSessionMismatch,
+		"NET3 rejects an absent session challenge");
 
 	std::array<rts::runtime_epoch::Byte, kNetworkHelloWireSize> unrelatedPrefix = encoded;
 	WriteLittleEndian32(unrelatedPrefix.data() + kNetworkHelloSenderSlotOffset, 99U);
@@ -192,7 +238,7 @@ int TestNetworkHelloContract()
 		"NET3-sized unrelated payloads are not handshake candidates");
 
 	result |= Check(DecodeAndValidateNetworkHello(encoded.data(), encoded.size() - 1U,
-		executableCrc, iniCrc, 2U, 5U, &decoded).error == rts::runtime_epoch::ValidationError::InvalidSize,
+		executableCrc, iniCrc, 2U, 5U, sessionToken, &decoded).error == rts::runtime_epoch::ValidationError::InvalidSize,
 		"NET3 truncated records are rejected");
 	result |= Check(IsNetworkHelloRetryDue(kNetworkHelloRetryIntervalMs, 0U),
 		"NET3 retry policy has a deterministic retry boundary");

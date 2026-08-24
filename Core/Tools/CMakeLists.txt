@@ -205,6 +205,21 @@ if(RTS_BUILD_CORE_EXTRAS)
     add_subdirectory(WW3D)
 endif()
 
+if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    add_test(NAME core_network_session_token_audit
+        COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/NetworkSessionTokenAudit/NetworkSessionTokenAudit.ps1"
+            -SourceRoot "${CMAKE_SOURCE_DIR}"
+    )
+    set_tests_properties(core_network_session_token_audit PROPERTIES TIMEOUT 30)
+    add_test(NAME core_network_session_token_audit_self_test
+        COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/NetworkSessionTokenAudit/NetworkSessionTokenAudit.ps1"
+            -SelfTest
+    )
+    set_tests_properties(core_network_session_token_audit_self_test PROPERTIES TIMEOUT 30)
+endif()
+
 if(WIN32)
     add_test(NAME core_video_backend_selection_audit
         COMMAND powershell -NoProfile -ExecutionPolicy Bypass

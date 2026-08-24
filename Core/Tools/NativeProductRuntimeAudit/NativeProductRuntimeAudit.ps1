@@ -93,7 +93,7 @@ foreach ($product in @(
     }
 
     $closure = Get-Content -LiteralPath $closurePath -Raw
-    foreach ($required in @('rts_xaudio2', 'rts_d3d8_headers', 'd3d11', 'dxgi', 'dinput8', 'dxguid')) {
+    foreach ($required in @('rts_xaudio2', 'rts_d3d8_headers', 'bcrypt', 'd3d11', 'dxgi', 'dinput8', 'dxguid')) {
         if ($closure -notmatch ("\b" + [regex]::Escape($required) + "\b")) {
             throw "Native x64 $($product.Name) product is missing required dependency '$required'."
         }

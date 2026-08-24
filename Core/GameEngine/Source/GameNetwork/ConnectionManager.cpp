@@ -49,6 +49,7 @@
 #include "GameNetwork/NetCommandWrapperList.h"
 #if defined(_WIN64)
 #include "Lib/NetworkEpochHandshake.h"
+#include <bcrypt.h>
 #endif
 #include "GameNetwork/networkutil.h"
 #include "GameLogic/GameLogic.h"
@@ -101,6 +102,25 @@ enum TransferFileType
 	TransferFileType_Wak,
 	TransferFileType_Count
 };
+
+#if defined(_WIN64)
+static Bool generateNetworkHelloToken(std::uint64_t *token)
+{
+	if (token == nullptr)
+		return FALSE;
+
+	*token = 0U;
+	const NTSTATUS status = BCryptGenRandom(nullptr,
+		reinterpret_cast<PUCHAR>(token), static_cast<ULONG>(sizeof(*token)),
+		BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+	if (status != 0 || *token == 0U)
+	{
+		*token = 0U;
+		return FALSE;
+	}
+	return TRUE;
+}
+#endif
 
 struct TransferFileRule
 {
@@ -277,12 +297,14 @@ ConnectionManager::ConnectionManager()
 	m_networkHelloStartTime = 0U;
 	m_networkHelloLastSend = 0U;
 	m_networkHelloAttempts = 0U;
+	m_networkHelloLocalToken = 0U;
 	m_networkHelloDeferredCount = 0U;
 	m_networkHelloPendingCommands = nullptr;
 	m_networkHelloPendingCommandCount = 0U;
 	for (Int i = 0; i < MAX_SLOTS; ++i) {
 		m_networkHelloValidated[i] = FALSE;
 		m_networkHelloAckReceived[i] = FALSE;
+		m_networkHelloRemoteToken[i] = 0U;
 	}
 	m_networkHelloExpectedSlots = 0U;
 	for (Int i = 0; i < MAX_MESSAGES; ++i) {
@@ -313,10 +335,12 @@ void ConnectionManager::init()
 	m_networkHelloStartTime = 0U;
 	m_networkHelloLastSend = 0U;
 	m_networkHelloAttempts = 0U;
+	m_networkHelloLocalToken = 0U;
 	m_networkHelloDeferredCount = 0U;
 	for (i = 0; i < MAX_SLOTS; ++i) {
 		m_networkHelloValidated[i] = FALSE;
 		m_networkHelloAckReceived[i] = FALSE;
+		m_networkHelloRemoteToken[i] = 0U;
 	}
 	m_networkHelloExpectedSlots = 0U;
 	for (i = 0; i < MAX_MESSAGES; ++i) {
@@ -444,10 +468,12 @@ void ConnectionManager::reset()
 	m_networkHelloStartTime = 0U;
 	m_networkHelloLastSend = 0U;
 	m_networkHelloAttempts = 0U;
+	m_networkHelloLocalToken = 0U;
 	m_networkHelloDeferredCount = 0U;
 	for (i = 0; i < MAX_SLOTS; ++i) {
 		m_networkHelloValidated[i] = FALSE;
 		m_networkHelloAckReceived[i] = FALSE;
+		m_networkHelloRemoteToken[i] = 0U;
 	}
 	m_networkHelloExpectedSlots = 0U;
 	for (i = 0; i < MAX_MESSAGES; ++i) {
@@ -529,6 +555,7 @@ void ConnectionManager::beginNetworkHello()
 	m_networkHelloStartTime = 0U;
 	m_networkHelloLastSend = 0U;
 	m_networkHelloAttempts = 0U;
+	m_networkHelloLocalToken = 0U;
 	m_networkHelloExpectedSlots = 0U;
 
 	Bool hasRemotePeer = FALSE;
@@ -536,6 +563,7 @@ void ConnectionManager::beginNetworkHello()
 	{
 		m_networkHelloValidated[i] = FALSE;
 		m_networkHelloAckReceived[i] = FALSE;
+		m_networkHelloRemoteToken[i] = 0U;
 		if (m_connections[i] != nullptr)
 		{
 			hasRemotePeer = TRUE;
@@ -545,6 +573,11 @@ void ConnectionManager::beginNetworkHello()
 
 	if (!hasRemotePeer)
 		return;
+	if (!generateNetworkHelloToken(&m_networkHelloLocalToken))
+	{
+		rejectNetworkHello(-1, "NET3 session token generation failed");
+		return;
+	}
 
 	// parseUserList is called after the LAN/GameSpy transport has been
 	// initialized.  Keep the compatibility exchange on that common transport
@@ -638,7 +671,8 @@ Bool ConnectionManager::sendNetworkHello(Int slot)
 
 	const std::array<rts::runtime_epoch::Byte, rts::network_epoch::kNetworkHelloWireSize> encoded =
 		rts::network_epoch::EncodeNetworkHello(TheGlobalData->m_exeCRC, TheGlobalData->m_iniCRC,
-		static_cast<UnsignedInt>(m_localSlot), static_cast<UnsignedInt>(slot));
+		static_cast<UnsignedInt>(m_localSlot), static_cast<UnsignedInt>(slot),
+		m_networkHelloLocalToken);
 	User *user = m_connections[slot]->getUser();
 	if (m_transport->queueSend(user->GetIPAddr(), user->GetPort(), encoded.data(),
 		static_cast<Int>(encoded.size())))
@@ -654,12 +688,14 @@ Bool ConnectionManager::sendNetworkHello(Int slot)
 Bool ConnectionManager::sendNetworkHelloAck(Int slot)
 {
 	if (m_transport == nullptr || slot < 0 || slot >= MAX_SLOTS ||
-		m_connections[slot] == nullptr || m_connections[slot]->getUser() == nullptr)
+		m_connections[slot] == nullptr || m_connections[slot]->getUser() == nullptr ||
+		m_networkHelloRemoteToken[slot] == 0U)
 		return FALSE;
 
 	const std::array<rts::runtime_epoch::Byte, rts::network_epoch::kNetworkHelloWireSize> encoded =
 		rts::network_epoch::EncodeNetworkHello(TheGlobalData->m_exeCRC, TheGlobalData->m_iniCRC,
 		static_cast<UnsignedInt>(m_localSlot), static_cast<UnsignedInt>(slot),
+		m_networkHelloRemoteToken[slot],
 		rts::network_epoch::NetworkHelloKind::Ack);
 	User *user = m_connections[slot]->getUser();
 	if (m_transport->queueSend(user->GetIPAddr(), user->GetPort(), encoded.data(),
@@ -687,6 +723,9 @@ void ConnectionManager::rejectNetworkHello(Int slot, const char *reason)
 {
 	m_networkHelloFailed = TRUE;
 	clearNetworkHelloPendingCommands();
+	for (UnsignedInt index = 0; index < m_networkHelloDeferredCount; ++index)
+		m_networkHelloDeferred[index].length = 0;
+	m_networkHelloDeferredCount = 0U;
 	DEBUG_LOG(("ConnectionManager::rejectNetworkHello - rejecting slot %d: %s",
 		slot, reason != nullptr ? reason : "invalid NET3 record"));
 	if (slot >= 0 && slot < MAX_SLOTS && m_connections[slot] != nullptr)
@@ -791,13 +830,19 @@ Bool ConnectionManager::processNetworkHello(const TransportMessage &message, Boo
 {
 	rts::network_epoch::NetworkHelloKind kind;
 	rts::network_epoch::NetworkHelloIdentity identity;
-	if (!rts::network_epoch::DecodeNetworkHelloRecord(message.data,
-		static_cast<std::size_t>(message.length), &kind, &identity))
+	std::uint64_t receivedSessionToken = 0U;
+	rts::runtime_epoch::NetworkHello hello;
+	const rts::runtime_epoch::ValidationResult result =
+		rts::network_epoch::DecodeAndValidateNetworkHelloRecord(
+			message.data, static_cast<std::size_t>(message.length),
+			TheGlobalData->m_exeCRC, TheGlobalData->m_iniCRC,
+			&hello, &kind, &identity, &receivedSessionToken);
+	if (!result.ok())
 	{
 		if (enforceFailure)
-			rejectNetworkHello(-1, "invalid NET3 identity");
+			rejectNetworkHello(-1, "malformed or incompatible NET3 record");
 		else
-			DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::processNetworkHello - ignoring invalid late NET3 identity"));
+			DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::processNetworkHello - ignoring malformed late NET3 record"));
 		return FALSE;
 	}
 
@@ -811,25 +856,22 @@ Bool ConnectionManager::processNetworkHello(const TransportMessage &message, Boo
 		return FALSE;
 	}
 
-	rts::runtime_epoch::NetworkHello hello;
-	const rts::runtime_epoch::ValidationResult result =
-		rts::network_epoch::DecodeAndValidateNetworkHello(
-		message.data, static_cast<std::size_t>(message.length),
-		TheGlobalData->m_exeCRC, TheGlobalData->m_iniCRC,
-		identity.senderSlot, identity.recipientSlot, kind, &hello, nullptr);
-	if (!result.ok())
+	if (!rts::network_epoch::IsNetworkHelloSessionTokenAccepted(
+		kind, m_networkHelloLocalToken, receivedSessionToken))
 	{
-		if (enforceFailure)
-			rejectNetworkHello(slot, "malformed or incompatible NET3 record");
-		else
-			DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::processNetworkHello - ignoring malformed late NET3 record from slot %d", slot));
+		// A delayed record from an earlier exchange must not disconnect the
+		// current peer. Keep the gate closed and let the current Hello retry or
+		// the bounded timeout resolve the exchange.
+		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::processNetworkHello - ignoring stale NET3 token from slot %d", slot));
 		return FALSE;
 	}
 
 	if (kind == rts::network_epoch::NetworkHelloKind::Hello)
 	{
+		m_networkHelloRemoteToken[slot] = receivedSessionToken;
 		m_networkHelloValidated[slot] = TRUE;
-		// A duplicate Hello is deliberately answered again. This makes the
+		// A duplicate or newer Hello replaces the remembered peer challenge and
+		// is deliberately answered again. This makes the
 		// exchange recover when the first Ack was lost or the send queue was
 		// temporarily full.
 		sendNetworkHelloAck(slot);
@@ -896,6 +938,14 @@ void ConnectionManager::processTransportMessage(const TransportMessage &message)
 
 void ConnectionManager::doRelay() {
 	#if defined(_WIN64)
+	if (m_networkHelloFailed)
+	{
+		// Compatibility or CSPRNG failure is terminal for this network
+		// instance. Never allow queued gameplay traffic to bypass the gate.
+		for (size_t i = 0; i < ARRAY_SIZE(m_transport->m_inBuffer); ++i)
+			m_transport->m_inBuffer[i].length = 0;
+		return;
+	}
 	if (!m_networkHelloRequired && m_networkHelloDeferredCount > 0U)
 	{
 		for (UnsignedInt index = 0; index < m_networkHelloDeferredCount; ++index)
@@ -914,8 +964,14 @@ void ConnectionManager::doRelay() {
 #if defined(_WIN64)
 		TransportMessage &message = m_transport->m_inBuffer[i];
 		const std::size_t messageLength = static_cast<std::size_t>(message.length);
-		if (rts::network_epoch::HasNetworkHelloMagic(message.data, messageLength))
+		if (rts::network_epoch::HasNetworkHelloPrefix(message.data, messageLength))
 		{
+			if (!rts::network_epoch::HasNetworkHelloMagic(message.data, messageLength))
+			{
+				DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::doRelay - discarding unsupported NET3 record size"));
+				message.length = 0;
+				continue;
+			}
 			if (!m_networkHelloStarted)
 			{
 				// A peer may finish sending while this process is still building

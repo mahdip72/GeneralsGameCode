@@ -29,6 +29,10 @@
 
 #pragma once
 
+#if defined(_WIN64)
+#include <cstdint>
+#endif
+
 #include "GameNetwork/Connection.h"
 #include "GameNetwork/NetCommandList.h"
 #include "GameNetwork/Transport.h"
@@ -242,6 +246,8 @@ private:
 	Bool m_networkHelloFailed;
 	Bool m_networkHelloValidated[MAX_SLOTS];
 	Bool m_networkHelloAckReceived[MAX_SLOTS];
+	std::uint64_t m_networkHelloLocalToken;
+	std::uint64_t m_networkHelloRemoteToken[MAX_SLOTS];
 	UnsignedInt m_networkHelloExpectedSlots;
 	UnsignedInt m_networkHelloStartTime;
 	UnsignedInt m_networkHelloLastSend;

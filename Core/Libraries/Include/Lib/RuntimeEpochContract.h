@@ -91,7 +91,8 @@ enum class ValidationError : std::uint8_t
 	PayloadTooLarge,
 	PayloadChecksumMismatch,
 	NetworkIdentityMismatch,
-	NetworkKindMismatch
+	NetworkKindMismatch,
+	NetworkSessionMismatch
 };
 
 struct ValidationResult
