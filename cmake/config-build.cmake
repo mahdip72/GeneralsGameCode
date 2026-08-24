@@ -62,6 +62,13 @@ endif()
 # This disables a lot of warnings steering developers to use windows only functions/function names.
 if(MSVC)
     target_compile_definitions(core_config INTERFACE _CRT_NONSTDC_NO_WARNINGS _CRT_SECURE_NO_WARNINGS $<$<CONFIG:DEBUG>:_DEBUG_CRT>)
+
+    # Pointer truncation is always a correctness defect in native x64 code.
+    # Keep the legacy 32-bit/VC6 oracle unchanged while making modern x64
+    # targets fail at compile time if one is reintroduced.
+    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+        target_compile_options(core_config INTERFACE /we4302 /we4311)
+    endif()
 endif()
 
 if(UNIX)
