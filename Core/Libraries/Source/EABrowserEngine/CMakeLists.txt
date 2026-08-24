@@ -1,6 +1,6 @@
 add_library(core_browserengine INTERFACE)
 
-if(WIN32 OR "${CMAKE_SYSTEM}" MATCHES "Windows")
+if((WIN32 OR "${CMAKE_SYSTEM}" MATCHES "Windows") AND CMAKE_SIZEOF_VOID_P EQUAL 4)
     if(MINGW AND IDL_COMPILER_FOUND)
         # Use widl for MinGW builds
         add_idl_file(browserengine_idl "${CMAKE_CURRENT_LIST_DIR}/BrowserEngine.idl")

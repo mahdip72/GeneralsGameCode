@@ -33,6 +33,20 @@ if(RTS_BUILD_CORE_EXTRAS)
                 -BuildRoot "${CMAKE_BINARY_DIR}"
         )
         set_tests_properties(core_native_audio_graph_audit PROPERTIES TIMEOUT 30)
+        add_test(NAME core_native_product_runtime_audit
+            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeProductRuntimeAudit/NativeProductRuntimeAudit.ps1"
+                -SourceRoot "${CMAKE_SOURCE_DIR}"
+                -BuildRoot "${CMAKE_BINARY_DIR}/Stage3NativeProductGraphAudit"
+                -Generator "${CMAKE_GENERATOR}"
+                -GeneratorPlatform "${CMAKE_GENERATOR_PLATFORM}"
+                -CCompiler "${CMAKE_C_COMPILER}"
+                -CxxCompiler "${CMAKE_CXX_COMPILER}"
+                -RcCompiler "${CMAKE_RC_COMPILER}"
+                -ManifestTool "${CMAKE_MT}"
+                -FFmpegRoot "${FFMPEG_ROOT}"
+        )
+        set_tests_properties(core_native_product_runtime_audit PROPERTIES TIMEOUT 240)
         if(RTS_BUILD_OPTION_FFMPEG)
             add_subdirectory(FFmpegContractTest)
             add_subdirectory(FFmpegFileBehaviorTest)

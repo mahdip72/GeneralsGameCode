@@ -188,8 +188,8 @@ set(WW3D2_SRC
     sortingrenderer.cpp
     sortingrenderer.h
     soundlibrarybridge.h
-    soundrobj.cpp
-    soundrobj.h
+    # The legacy sound render object owns WWAudio/Miles objects and is used by
+    # authoring tools, not by the game runtime. It is appended for x86 below.
     sphereobj.cpp
     sphereobj.h
     static_sort_list.cpp
@@ -243,6 +243,13 @@ set(WW3D2_SRC
     ww3dtrig.h
 )
 
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    list(APPEND WW3D2_SRC
+        soundrobj.cpp
+        soundrobj.h
+    )
+endif()
+
 add_library(corei_ww3d2 INTERFACE)
 
 target_sources(corei_ww3d2 INTERFACE ${WW3D2_SRC})
@@ -250,6 +257,16 @@ target_sources(corei_ww3d2 INTERFACE ${WW3D2_SRC})
 target_include_directories(corei_ww3d2 INTERFACE
     "${CMAKE_CURRENT_SOURCE_DIR}"
 )
+
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    target_compile_definitions(corei_ww3d2 INTERFACE
+        RTS_ENABLE_LEGACY_EMBEDDED_BROWSER=1
+    )
+else()
+    target_compile_definitions(corei_ww3d2 INTERFACE
+        RTS_ENABLE_LEGACY_EMBEDDED_BROWSER=0
+    )
+endif()
 
 if (MSVC AND NOT IS_VS6_BUILD)
     target_link_libraries(corei_ww3d2 INTERFACE

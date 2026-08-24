@@ -16,9 +16,20 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4)
         target_link_libraries(rts_legacy_product_runtime INTERFACE binkstub)
     endif()
 elseif(RTS_BUILD_PRODUCT AND (RTS_BUILD_ZEROHOUR OR RTS_BUILD_GENERALS))
-    target_link_libraries(rts_legacy_product_runtime INTERFACE rts_xaudio2)
-    message(FATAL_ERROR
-        "Native x64 product targets require the Stage 3 D3D11, XAudio2, and FFmpeg runtime replacements. "
-        "Configure the x64 foundation preset until those product dependencies are migrated."
+    if(NOT RTS_BUILD_OPTION_FFMPEG)
+        message(FATAL_ERROR "Native x64 product targets require the FFmpeg video backend.")
+    endif()
+    target_link_libraries(rts_legacy_product_runtime INTERFACE
+        rts_d3d8_headers
+        rts_xaudio2
+        d3d11
+        dxgi
+        dinput8
+        dxguid
     )
 endif()
+
+file(GENERATE
+    OUTPUT "${CMAKE_BINARY_DIR}/native_product_runtime_link_closure.txt"
+    CONTENT "target=rts_legacy_product_runtime\nlinks=$<JOIN:$<TARGET_PROPERTY:rts_legacy_product_runtime,INTERFACE_LINK_LIBRARIES>,|>\n"
+)

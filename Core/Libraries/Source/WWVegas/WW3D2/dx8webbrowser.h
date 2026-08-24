@@ -33,16 +33,16 @@
 #pragma once
 
 #include <windows.h>
-#include "d3d8.h"
 
 // ***********************************
 // Set this to 0 to remove all embedded browser code.
 //
-#define ENABLE_EMBEDDED_BROWSER		1
+#ifndef RTS_ENABLE_LEGACY_EMBEDDED_BROWSER
+#define RTS_ENABLE_LEGACY_EMBEDDED_BROWSER 1
+#endif
+#define ENABLE_EMBEDDED_BROWSER RTS_ENABLE_LEGACY_EMBEDDED_BROWSER
 //
 // ***********************************
-
-#if ENABLE_EMBEDDED_BROWSER
 
 // These options must match the browser option bits defined in the BrowserEngine code.
 // Look in febrowserengine.h
@@ -86,5 +86,3 @@ private:
 	// The window handle of the application.  This is initialized by Initialize().
 	static				HWND						hWnd;
 };
-
-#endif
