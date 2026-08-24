@@ -428,7 +428,7 @@ bit8 Wstring::replace(const char *replaceThis, const char *withThis)
     foundStr = strstr(src, replaceThis);
     if(foundStr)
     {
-      len = (uint32)foundStr - (uint32)src;
+      len = static_cast<uint32>(foundStr - src);
       if(len)
       {
         if(!dest.cat(len, src))
