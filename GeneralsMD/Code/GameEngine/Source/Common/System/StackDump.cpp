@@ -299,6 +299,7 @@ stack_frame.AddrFrame.Offset = myebp;
 					skip--;
 			}
 	}
+}
 #endif
 
 
