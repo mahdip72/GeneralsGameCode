@@ -32,6 +32,7 @@ public:
 
 	HANDLE entered;
 	HANDLE release;
+	unsigned threadId() const { return ThreadID; }
 
 protected:
 	void Thread_Function() override
@@ -53,6 +54,19 @@ int main()
 	}
 
 	const bool reportedRunning = thread.Is_Running();
+	const unsigned firstThreadId = thread.threadId();
+#ifdef NDEBUG
+	thread.Execute();
+	const bool preservedThreadId = thread.threadId() == firstThreadId;
+#else
+	const bool preservedThreadId = true;
+#endif
+	if (!preservedThreadId)
+	{
+		std::puts("Execute replaced an unsignaled native thread in a release build.");
+		std::fflush(stdout);
+		ExitProcess(1);
+	}
 	SetEvent(thread.release);
 	thread.Stop();
 	if (!reportedRunning)

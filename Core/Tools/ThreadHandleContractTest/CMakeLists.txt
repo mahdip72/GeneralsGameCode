@@ -10,6 +10,8 @@ target_include_directories(core_thread_handle_contract_tests PRIVATE
 
 target_link_libraries(core_thread_handle_contract_tests PRIVATE
     core_wwlib
+    core_wwdebug
+    core_wwstub
     winmm
 )
 
