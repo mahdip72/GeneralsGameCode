@@ -176,6 +176,27 @@ function Test-NativeX64CMakeContract {
         throw 'Native x64 CI workflow audit failed: x64-vcpkg does not inherit the product and dependency contracts'
     }
 
+    $unixPreset = @($parsedPresets.configurePresets | Where-Object {
+        $_.name -eq 'unix'
+    })
+    if ($unixPreset.Count -ne 1) {
+        throw 'Native x64 CI workflow audit failed: unix configure preset is missing or ambiguous'
+    }
+    if ($null -eq $unixPreset[0].cacheVariables) {
+        throw 'Native x64 CI workflow audit failed: unix preset does not define a device-free cache contract'
+    }
+    foreach ($optionName in @(
+        'RTS_BUILD_PRODUCT',
+        'RTS_BUILD_CORE_EXTRAS',
+        'RTS_BUILD_GENERALS',
+        'RTS_BUILD_ZEROHOUR'
+    )) {
+        $option = $unixPreset[0].cacheVariables.PSObject.Properties[$optionName]
+        if ($null -eq $option -or $option.Value -ne 'OFF') {
+            throw "Native x64 CI workflow audit failed: unix preset does not disable $optionName"
+        }
+    }
+
     Assert-Contains $CoreToolsCMake '\$ENV\{RUNNER_TEMP\}' `
         'the nested native product audit is not redirected to runner-owned scratch storage'
     Assert-Contains $CoreToolsCMake '_native_product_runtime_audit_fallback_root' `
@@ -275,7 +296,7 @@ if: inputs.game == 'Generals' && inputs.preset == 'x64-vcpkg'
           if-no-files-found: error
 '@
     $goodPresets = @'
-{"configurePresets":[{"name":"x64-vcpkg","inherits":["x64","default-vcpkg"]}]}
+{"configurePresets":[{"name":"x64-vcpkg","inherits":["x64","default-vcpkg"]},{"name":"unix","cacheVariables":{"RTS_BUILD_PRODUCT":"OFF","RTS_BUILD_CORE_EXTRAS":"OFF","RTS_BUILD_GENERALS":"OFF","RTS_BUILD_ZEROHOUR":"OFF"}}]}
 '@
     $goodCoreToolsCMake = @'
 set(audit_root "$ENV{RUNNER_TEMP}/GeneralsGameCode")
@@ -427,6 +448,23 @@ $arguments += "-DFFMPEG_RUNTIME_DIR=$FFmpegRuntimeDir"
     }
     if (-not $caughtCheckoutAuditRoot) {
         throw 'Native x64 CI workflow audit self-test failed to reject checkout-local audit storage'
+    }
+
+    $caughtUnixProductGraph = $false
+    try {
+        Test-NativeX64CMakeContract `
+            -Presets ($goodPresets -replace '"RTS_BUILD_PRODUCT":"OFF"', '"RTS_BUILD_PRODUCT":"ON"') `
+            -CoreToolsCMake $goodCoreToolsCMake `
+            -FindFFmpegCMake $goodFindFFmpegCMake `
+            -CompressionCMake $goodCompressionCMake `
+            -GeneralsCMake $goodGeneralsCMake `
+            -ZeroHourCMake $goodZeroHourCMake `
+            -NativeProductRuntimeAudit $goodNativeProductRuntimeAudit
+    } catch {
+        $caughtUnixProductGraph = $true
+    }
+    if (-not $caughtUnixProductGraph) {
+        throw 'Native x64 CI workflow audit self-test failed to reject a Unix product graph'
     }
 
     $caughtSharedConfigurationRoot = $false
