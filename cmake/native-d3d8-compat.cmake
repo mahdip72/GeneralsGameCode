@@ -43,6 +43,14 @@ FetchContent_Declare(
         "-DPATCH_SENTINEL_FILE_4=source/d3d8to9_device.cpp"
         "-DPATCH_SENTINEL_TEXT_4=D3D9 requires state blocks"
         -P "${CMAKE_SOURCE_DIR}/cmake/ApplyGitPatch.cmake"
+        COMMAND "${CMAKE_COMMAND}"
+        "-DPATCH_GIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        "-DPATCH_SOURCE_DIR=<SOURCE_DIR>"
+        "-DPATCH_FILE=${CMAKE_SOURCE_DIR}/cmake/patches/d3d8to9-relwithdebinfo-release-crt.patch"
+        -DPATCH_SENTINEL_COUNT=1
+        "-DPATCH_SENTINEL_FILE_1=CMakeLists.txt"
+        "-DPATCH_SENTINEL_TEXT_1=D3D8TO9_RELWITHDEBINFO_RELEASE_CRT"
+        -P "${CMAKE_SOURCE_DIR}/cmake/ApplyGitPatch.cmake"
 )
 
 set(D3D8TO9_STATIC OFF CACHE BOOL "Build the native D3D8 bridge as an app-local DLL" FORCE)
