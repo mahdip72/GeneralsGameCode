@@ -39,6 +39,18 @@
 /*---------------------------------------------------------------------------*/
 
 #include <dsound.h>
+
+// The VC6-era DirectSound header predates these speaker configurations.
+#ifndef DSSPEAKER_DIRECTOUT
+#define DSSPEAKER_DIRECTOUT 0x00000000
+#endif
+#ifndef DSSPEAKER_5POINT1
+#define DSSPEAKER_5POINT1 0x00000006
+#endif
+#ifndef DSSPEAKER_7POINT1
+#define DSSPEAKER_7POINT1 0x00000007
+#endif
+
 #include "Lib/BaseType.h"
 #include "MilesAudioDevice/AudioChannelPolicy.h"
 #include "MilesAudioDevice/MilesAudioCompletionQueue.h"

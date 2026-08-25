@@ -39,7 +39,7 @@
 #if defined(_WIN32)
 
 #include "win.h"
-#include <cstdint>
+#include <Utility/stdint_adapter.h>
 /*
 ** Forward Declarations
 */

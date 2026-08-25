@@ -27,6 +27,7 @@
 
 #ifdef _WIN32
 #include <process.h>
+#include <Utility/interlocked_adapter.h>
 #include <windows.h>
 #endif
 

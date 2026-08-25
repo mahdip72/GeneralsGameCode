@@ -26,6 +26,25 @@ if(NOT _rts_windows_sdk_version)
     string(REGEX REPLACE "[\\\\/]+$" "" _rts_windows_sdk_version "${_rts_windows_sdk_version}")
 endif()
 
+# Ninja generators do not populate the Visual Studio target-platform variable,
+# and ordinary terminals do not provide WindowsSDKVersion. Resolve the newest
+# complete installed SDK in that case so native x64 configuration does not
+# depend on an implicit Developer Command Prompt environment.
+if(_rts_windows_kits_dir AND NOT _rts_windows_sdk_version)
+    file(GLOB _rts_windows_sdk_include_dirs LIST_DIRECTORIES true
+        "${_rts_windows_kits_dir}/Include/10.*")
+    list(SORT _rts_windows_sdk_include_dirs COMPARE NATURAL ORDER DESCENDING)
+    foreach(_rts_windows_sdk_include_dir IN LISTS _rts_windows_sdk_include_dirs)
+        get_filename_component(_rts_windows_sdk_candidate
+            "${_rts_windows_sdk_include_dir}" NAME)
+        if(EXISTS "${_rts_windows_sdk_include_dir}/um/xaudio2.h" AND
+                EXISTS "${_rts_windows_kits_dir}/Lib/${_rts_windows_sdk_candidate}/um/x64/xaudio2.lib")
+            set(_rts_windows_sdk_version "${_rts_windows_sdk_candidate}")
+            break()
+        endif()
+    endforeach()
+endif()
+
 if(NOT _rts_windows_kits_dir OR NOT _rts_windows_sdk_version)
     message(FATAL_ERROR
         "Native XAudio2 requires a Windows 10 SDK with a resolved root and version.")

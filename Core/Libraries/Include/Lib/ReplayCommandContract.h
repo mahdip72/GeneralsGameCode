@@ -83,6 +83,7 @@ enum class ReplayCommandError : std::uint8_t
 	InvalidArgumentCount,
 	ArgumentCountMismatch,
 	PayloadSizeMismatch,
+	InvalidFrame,
 	OutputTooSmall,
 };
 
@@ -104,6 +105,10 @@ struct BuildResult
 };
 
 std::size_t GetReplayArgumentWireSize(ReplayArgumentType type);
+
+bool IsCanonicalReplayFrameTransitionValid(std::uint32_t previousFrame,
+	std::uint32_t nextFrame,
+	std::uint32_t finalFrame);
 
 ParseResult ParseCanonicalReplayCommand(const Byte *bytes, std::size_t availableBytes);
 

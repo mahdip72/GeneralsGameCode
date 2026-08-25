@@ -96,6 +96,11 @@ inline bool IsNetworkFramePublicationAllowed(bool failureHandled, bool exchangeF
 	return !failureHandled && !exchangeFailed;
 }
 
+inline bool ShouldHandleNetworkHelloFailure(bool failureHandled, bool exchangeFailed)
+{
+	return !failureHandled && exchangeFailed;
+}
+
 inline void WriteLittleEndian32(runtime_epoch::Byte *output, std::uint32_t value)
 {
 	for (std::size_t index = 0; index < sizeof(value); ++index)

@@ -532,13 +532,23 @@ foreach ($line in $diff) {
                 ) -and
                 ($content -match '^\s*return static_cast<uintptr_t>\((ctx|context)\.Eip\);\s*// portability-audit: x86-context\s*$' -or
                  $content -match '^\s*MakeStackTrace\(eip,esp,ebp, 0, callback\);\s*// portability-audit: x86-context\s*$' -or
-                 $content -match '^\s*const std::uintptr_t instructionPointer = static_cast<std::uintptr_t>\(context->Eip\);\s*// portability-audit: x86-context\s*$')
+                 $content -match '^\s*const (?:std::)?uintptr_t instructionPointer = static_cast<(?:std::)?uintptr_t>\(context->Eip\);\s*// portability-audit: x86-context\s*$')
+            # VC6 has no intrinsic/header for obtaining the caller return
+            # address. Permit only the explicitly annotated instruction in
+            # the legacy compatibility branch; every other added assembly
+            # line, including an unannotated line in this file, still fails.
+            $isApprovedVC6CallerAddress =
+                $rule.Name -eq 'x86-inline-assembly-or-context' -and
+                $currentFile -eq 'Core/Libraries/Source/debug/debug_debug.cpp' -and
+                ($content -match '^\s*_asm\s*// portability-audit: vc6-caller-address\s*$' -or
+                 $content -match '^\s*mov eax,\[ebp\+4\]\s*// portability-audit: vc6-caller-address\s*$')
             $isApprovedWindowMessageBoundary =
                 $rule.Name -eq 'pointer-bearing-window-message' -and
                 $currentFile -eq 'Core/GameEngine/Include/GameClient/GameWindow.h' -and
                 $content -match '^\s*inline\s+WindowMsgData\s+WindowMsgDataFromPointer\(const\s+void\s*\*\s*value\)\s*$'
             if ($rule.RejectAddedLine -and -not $isAllowed -and
                 -not $isApprovedX86Context -and
+                -not $isApprovedVC6CallerAddress -and
                 -not $isApprovedWindowMessageBoundary -and
                 $content -match $rule.Pattern) {
                 $violations += "${currentFile}:${lineNumber}: $($rule.Name)"

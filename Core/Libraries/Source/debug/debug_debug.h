@@ -29,7 +29,7 @@
 
 #pragma once
 
-#include <cstdint>
+#include <Utility/stdint_adapter.h>
 
 /**
   \class Debug debug.h <rts/debug.h>

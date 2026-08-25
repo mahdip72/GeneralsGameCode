@@ -37,10 +37,11 @@ if(NOT TARGET rts_d3d8lib)
     )
 
     if(MSVC)
-        target_link_libraries(rts_d3d8lib INTERFACE legacy_stdio_definitions)
         target_link_options(rts_d3d8lib INTERFACE /NODEFAULTLIB:libci.lib)
 
-        if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "12.0.8804")
+        if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER "12.0.8804")
+            target_link_libraries(rts_d3d8lib INTERFACE legacy_stdio_definitions)
+        else()
             target_include_directories(rts_d3d8lib INTERFACE
                 ${dx8_SOURCE_DIR}/extra
             )

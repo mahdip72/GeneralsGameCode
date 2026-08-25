@@ -32,8 +32,9 @@
 #include <windows.h>
 #include "WWLib/stringex.h"
 #include <imagehlp.h>
-#include <cstdint>
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
 #include <mutex>
+#endif
 
 // imagehlp aliases StackWalk to StackWalk64 on x64.  This source owns a
 // DebugStackwalk::StackWalk member with the legacy name, so keep that macro
@@ -68,18 +69,18 @@ static char const *const DebughelpFunctionNames[] =
 #undef DBGHELP
 
 #if defined(_WIN64)
-using DebugDwordAddress = DWORD64;
-using DebugDisplacement = DWORD64;
-using DebugSymbol = IMAGEHLP_SYMBOL64;
-using DebugLine = IMAGEHLP_LINE64;
+typedef DWORD64 DebugDwordAddress;
+typedef DWORD64 DebugDisplacement;
+typedef IMAGEHLP_SYMBOL64 DebugSymbol;
+typedef IMAGEHLP_LINE64 DebugLine;
 #define DEBUG_SYM_GET_MODULE_BASE gDbg._SymGetModuleBase64
 #define DEBUG_SYM_GET_SYMBOL gDbg._SymGetSymFromAddr64
 #define DEBUG_SYM_GET_LINE gDbg._SymGetLineFromAddr64
 #else
-using DebugDwordAddress = DWORD;
-using DebugDisplacement = DWORD;
-using DebugSymbol = IMAGEHLP_SYMBOL;
-using DebugLine = IMAGEHLP_LINE;
+typedef DWORD DebugDwordAddress;
+typedef DWORD DebugDisplacement;
+typedef IMAGEHLP_SYMBOL DebugSymbol;
+typedef IMAGEHLP_LINE DebugLine;
 #define DEBUG_SYM_GET_MODULE_BASE gDbg._SymGetModuleBase
 #define DEBUG_SYM_GET_SYMBOL gDbg._SymGetSymFromAddr
 #define DEBUG_SYM_GET_LINE gDbg._SymGetLineFromAddr
@@ -96,8 +97,13 @@ static bool g_oldDbghelp;
 // that use the loaded entry points. A recursive mutex also prevents an
 // exception path from deadlocking if it re-enters stack reporting on the
 // same thread while a symbol operation is in progress.
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
 static std::once_flag g_dbghelpInitOnce;
 static std::recursive_mutex g_dbghelpMutex;
+#define DEBUG_DBGHELP_LOCK() std::lock_guard<std::recursive_mutex> dbghelpLock(g_dbghelpMutex)
+#else
+#define DEBUG_DBGHELP_LOCK()
+#endif
 
 static void InitDbghelpOnce()
 {
@@ -155,7 +161,11 @@ static void InitDbghelpOnce()
 
 static void InitDbghelp()
 {
+#if defined(_MSC_VER) && _MSC_VER < 1300
+  InitDbghelpOnce();
+#else
   std::call_once(g_dbghelpInitOnce, InitDbghelpOnce);
+#endif
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -187,7 +197,7 @@ void DebugStackwalk::Signature::GetSymbol(Address addr, char *buf, unsigned bufS
   DFAIL_IF(bufSize<64||bufSize>=0x80000000) return;
 
   InitDbghelp();
-  std::lock_guard<std::recursive_mutex> dbghelpLock(g_dbghelpMutex);
+  DEBUG_DBGHELP_LOCK();
 
   if (!g_dbghelp || !DEBUG_SYM_GET_MODULE_BASE || !DEBUG_SYM_GET_SYMBOL || !DEBUG_SYM_GET_LINE)
     return;
@@ -269,7 +279,7 @@ void DebugStackwalk::Signature::GetSymbol(Address addr,
                                           char *bufFile, unsigned sizeFile, unsigned *linePtr, unsigned *relLine)
 {
   InitDbghelp();
-  std::lock_guard<std::recursive_mutex> dbghelpLock(g_dbghelpMutex);
+  DEBUG_DBGHELP_LOCK();
 
   if (bufMod) *bufMod=0;
   if (relMod) *relMod=0;
@@ -398,7 +408,7 @@ bool DebugStackwalk::IsOldDbghelp()
 int DebugStackwalk::StackWalk(Signature &sig, struct _CONTEXT *ctx)
 {
   InitDbghelp();
-  std::lock_guard<std::recursive_mutex> dbghelpLock(g_dbghelpMutex);
+  DEBUG_DBGHELP_LOCK();
 
   sig.m_numAddr=0;
 

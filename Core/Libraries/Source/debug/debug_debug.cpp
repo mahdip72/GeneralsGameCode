@@ -35,7 +35,7 @@
 #include <windows.h>
 #include <WWLib/WWCommon.h>
 #include <new>      // needed for placement new prototype
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && _MSC_VER >= 1300
 #include <intrin.h>
 #endif
 
@@ -309,7 +309,13 @@ bool Debug::SkipNext()
   // Do not implement this function inline: the caller address is the
   // stable key for the assertion/check/log site.
   uintptr_t help;
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && _MSC_VER < 1300
+  _asm // portability-audit: vc6-caller-address
+  {
+    mov eax,[ebp+4] // portability-audit: vc6-caller-address
+    mov help,eax
+  };
+#elif defined(_MSC_VER)
   help=reinterpret_cast<uintptr_t>(_ReturnAddress());
 #elif defined(__GNUC__) || defined(__clang__)
   help=reinterpret_cast<uintptr_t>(__builtin_return_address(0));
@@ -427,7 +433,9 @@ bool Debug::AssertDone()
           }
           break;
         case IDRETRY:
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && _MSC_VER < 1300
+          _asm int 0x03
+#elif defined(_MSC_VER)
           __debugbreak();
 #elif defined(__GNUC__)
           __builtin_trap();
@@ -701,7 +709,9 @@ bool Debug::CrashDone(bool die)
             }
             break;
           case IDRETRY:
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && _MSC_VER < 1300
+            _asm int 0x03
+#elif defined(_MSC_VER)
             __debugbreak();
 #elif defined(__GNUC__)
             __builtin_trap();
@@ -892,8 +902,13 @@ Debug& Debug::operator<<(const void *ptr)
   (*this) << "ptr:";
   if (ptr)
   {
+#if defined(_MSC_VER) && _MSC_VER < 1300
+    char help[9];
+    (*this) << "0x" << _ultoa((unsigned long)ptr,help,16);
+#else
     char help[2*sizeof(uintptr_t)+1];
     (*this) << "0x" << _ui64toa(static_cast<unsigned __int64>(reinterpret_cast<uintptr_t>(ptr)),help,16);
+#endif
   }
   else
     (*this) << "null";
@@ -924,9 +939,14 @@ Debug& Debug::operator<<(const MemDump &dump)
   for (unsigned i=0;i<dump.m_numItems;i+=itemPerLine,cur+=itemPerLine*dump.m_bytePerItem)
   {
     // address
+#if defined(_MSC_VER) && _MSC_VER < 1300
+    char buf[9];
+    sprintf(buf,"%08x",dump.m_absAddr?unsigned(cur):cur-dump.m_startPtr);
+#else
     char buf[2*sizeof(uintptr_t)+1];
     sprintf(buf,"%0*llx",static_cast<int>(2*sizeof(uintptr_t)),
             static_cast<unsigned long long>(dump.m_absAddr?reinterpret_cast<uintptr_t>(cur):cur-dump.m_startPtr));
+#endif
     operator<<(buf);
 
     // items

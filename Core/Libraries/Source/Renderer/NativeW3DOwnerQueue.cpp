@@ -1,4 +1,5 @@
 #include "Renderer/NativeW3DOwnerQueue.h"
+#include <Utility/interlocked_adapter.h>
 
 #ifdef _WIN32
 #include <windows.h>

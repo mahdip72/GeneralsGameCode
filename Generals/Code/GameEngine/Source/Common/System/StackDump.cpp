@@ -33,7 +33,7 @@
 
 #include "WWLib/DbgHelpLoader.h"
 
-#include <cstdint>
+#include "Utility/stdint_adapter.h"
 
 //*****************************************************************************
 //	Prototypes
@@ -44,7 +44,7 @@ void MakeStackTrace(const CONTEXT &context, int skipFrames, void (*callback)(con
 #else
 void MakeStackTrace(DWORD myeip,DWORD myesp,DWORD myebp, int skipFrames, void (*callback)(const char*));
 #endif
-void GetFunctionDetails(void *pointer, char*name, char*filename, unsigned int* linenumber, std::uintptr_t* address);
+void GetFunctionDetails(void *pointer, char*name, char*filename, unsigned int* linenumber, uintptr_t* address);
 void WriteStackLine(void*address, void (*callback)(const char*));
 
 //*****************************************************************************
@@ -225,7 +225,7 @@ void MakeStackTrace(const CONTEXT &context, int skipFrames, void (*callback)(con
 			continue;
 		}
 		WriteStackLine(reinterpret_cast<void *>(
-			static_cast<std::uintptr_t>(stackFrame.AddrPC.Offset)), callback);
+			static_cast<uintptr_t>(stackFrame.AddrPC.Offset)), callback);
 	}
 }
 #else
@@ -305,7 +305,7 @@ stack_frame.AddrFrame.Offset = myebp;
 
 //*****************************************************************************
 //*****************************************************************************
-void GetFunctionDetails(void *pointer, char*name, char*filename, unsigned int* linenumber, std::uintptr_t* address)
+void GetFunctionDetails(void *pointer, char*name, char*filename, unsigned int* linenumber, uintptr_t* address)
 {
 	if (!InitSymbolInfo())
 		return;
@@ -324,7 +324,7 @@ void GetFunctionDetails(void *pointer, char*name, char*filename, unsigned int* l
 	}
 	if (address)
 	{
-		*address = static_cast<std::uintptr_t>(-1);
+		*address = static_cast<uintptr_t>(-1);
 	}
 
 #if defined(_WIN64)
@@ -334,7 +334,7 @@ void GetFunctionDetails(void *pointer, char*name, char*filename, unsigned int* l
 	PSYMBOL_INFO symbol = reinterpret_cast<PSYMBOL_INFO>(symbolBuffer);
 	symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
 	symbol->MaxNameLen = 512;
-	const DWORD64 pointerAddress = static_cast<DWORD64>(reinterpret_cast<std::uintptr_t>(pointer));
+	const DWORD64 pointerAddress = static_cast<DWORD64>(reinterpret_cast<uintptr_t>(pointer));
 	if (DbgHelpLoader::symFromAddr(process, pointerAddress, &displacement, symbol)) {
 		if (name) {
 			strcpy(name, symbol->Name);
@@ -347,7 +347,7 @@ void GetFunctionDetails(void *pointer, char*name, char*filename, unsigned int* l
 				&lineDisplacement, &line)) {
 			if (filename) strcpy(filename, line.FileName);
 			if (linenumber) *linenumber = static_cast<unsigned int>(line.LineNumber);
-			if (address) *address = static_cast<std::uintptr_t>(line.Address);
+			if (address) *address = static_cast<uintptr_t>(line.Address);
 		}
 	}
 #else
@@ -561,7 +561,7 @@ void WriteStackLine(void*address, void (*callback)(const char*))
 	char function_name[512];
 	char filename[MAX_PATH];
 	unsigned int linenumber;
-	std::uintptr_t addr;
+	uintptr_t addr;
 
 	GetFunctionDetails(address, function_name, filename, &linenumber, &addr);
     sprintf(line, "  %s(%d) : %s 0x%08p", filename, linenumber, function_name, address);
@@ -641,7 +641,7 @@ void DumpExceptionInfo( unsigned int u, EXCEPTION_POINTERS* e_info )
 	** The following are set for access violation only
 	*/
 	int access_read_write=-1;
-	ULONG_PTR access_address = 0;
+	uintptr_t access_address = 0;
 	AsciiString msg;
 
 // DOUBLE_DEBUG does a DEBUG_LOG, and concats to g_LastErrorDump.  jba.
@@ -657,7 +657,7 @@ void DumpExceptionInfo( unsigned int u, EXCEPTION_POINTERS* e_info )
 	{
 		DOUBLE_DEBUG (("Exception code is %x", e_info->ExceptionRecord->ExceptionCode));
 	}
-	const std::uintptr_t winMainAddress = reinterpret_cast<std::uintptr_t>(&WinMain);
+	const uintptr_t winMainAddress = reinterpret_cast<uintptr_t>(&WinMain);
 	DOUBLE_DEBUG(("WinMain at %p", reinterpret_cast<void *>(winMainAddress)));
 	/*
 	** Match the exception type with the error string and print it out
@@ -718,9 +718,9 @@ void DumpExceptionInfo( unsigned int u, EXCEPTION_POINTERS* e_info )
 	char scrap[512];
 	DOUBLE_DEBUG ( ("EIP bytes dump..."));
 #if defined(_WIN64)
-	const std::uintptr_t instructionPointer = static_cast<std::uintptr_t>(context->Rip);
+	const uintptr_t instructionPointer = static_cast<uintptr_t>(context->Rip);
 #else
-	const std::uintptr_t instructionPointer = static_cast<std::uintptr_t>(context->Eip); // portability-audit: x86-context
+	const uintptr_t instructionPointer = static_cast<uintptr_t>(context->Eip); // portability-audit: x86-context
 #endif
 	_snprintf(scrap, ARRAY_SIZE(scrap), "\nBytes at instruction pointer (%p)  : ",
 		reinterpret_cast<void *>(instructionPointer));

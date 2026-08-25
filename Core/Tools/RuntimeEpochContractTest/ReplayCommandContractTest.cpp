@@ -226,6 +226,24 @@ int TestBuilderRejectsInvalidInput()
 	return result;
 }
 
+int TestReplayFramesAreMonotonicAndBounded()
+{
+	int result = 0;
+	result |= Check(IsCanonicalReplayFrameTransitionValid(0U, 0U, 0U),
+		"frame zero is valid for a zero-frame replay");
+	result |= Check(IsCanonicalReplayFrameTransitionValid(17U, 17U, 42U),
+		"multiple commands may share one frame");
+	result |= Check(IsCanonicalReplayFrameTransitionValid(17U, 42U, 42U),
+		"commands may advance through the declared final frame");
+	result |= Check(!IsCanonicalReplayFrameTransitionValid(17U, 16U, 42U),
+		"a replay command cannot move backward in time");
+	result |= Check(!IsCanonicalReplayFrameTransitionValid(17U, 43U, 42U),
+		"a replay command cannot exceed the declared final frame");
+	result |= Check(!IsCanonicalReplayFrameTransitionValid(17U, UINT32_MAX, UINT32_MAX),
+		"the playback EOF sentinel is never a command frame");
+	return result;
+}
+
 } // namespace
 
 int main()
@@ -233,5 +251,6 @@ int main()
 	return TestBuildAndParseUsesCanonicalLittleEndianBytes() |
 		TestAllArgumentTypesAndEmptyCommand() |
 		TestMalformedRecordsAreRejected() |
-		TestBuilderRejectsInvalidInput();
+		TestBuilderRejectsInvalidInput() |
+		TestReplayFramesAreMonotonicAndBounded();
 }

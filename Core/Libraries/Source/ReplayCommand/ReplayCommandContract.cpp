@@ -85,6 +85,14 @@ std::size_t GetReplayArgumentWireSize(ReplayArgumentType type)
 	}
 }
 
+bool IsCanonicalReplayFrameTransitionValid(std::uint32_t previousFrame,
+	std::uint32_t nextFrame,
+	std::uint32_t finalFrame)
+{
+	return nextFrame != std::numeric_limits<std::uint32_t>::max() &&
+		nextFrame >= previousFrame && nextFrame <= finalFrame;
+}
+
 ParseResult ParseCanonicalReplayCommand(const Byte *bytes, std::size_t availableBytes)
 {
 	ParseResult result;

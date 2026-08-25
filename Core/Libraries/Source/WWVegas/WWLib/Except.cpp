@@ -64,7 +64,7 @@
 #include	<conio.h>
 #include	<imagehlp.h>
 #include <crtdbg.h>
-#include <cstdint>
+#include <Utility/stdint_adapter.h>
 
 #ifdef WWDEBUG
 #define DebugString 	WWDebug_Printf
@@ -151,15 +151,15 @@ static SymFunctionTableAccessType	_SymFunctionTableAccess = nullptr;
 static SymGetModuleBaseType				_SymGetModuleBase = nullptr;
 
 #if defined(_WIN64)
-using ExceptAddress = DWORD64;
-using ExceptDisplacement = DWORD64;
-using ExceptSymbol = IMAGEHLP_SYMBOL64;
-using ExceptFrame = STACKFRAME64;
+typedef DWORD64 ExceptAddress;
+typedef DWORD64 ExceptDisplacement;
+typedef IMAGEHLP_SYMBOL64 ExceptSymbol;
+typedef STACKFRAME64 ExceptFrame;
 #else
-using ExceptAddress = DWORD;
-using ExceptDisplacement = DWORD;
-using ExceptSymbol = IMAGEHLP_SYMBOL;
-using ExceptFrame = STACKFRAME;
+typedef DWORD ExceptAddress;
+typedef DWORD ExceptDisplacement;
+typedef IMAGEHLP_SYMBOL ExceptSymbol;
+typedef STACKFRAME ExceptFrame;
 #endif
 
 static uintptr_t ExceptionInstructionPointer(const CONTEXT &context)

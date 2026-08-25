@@ -793,10 +793,16 @@ void Network::liteupdate() {
 		} else {
 			m_conMgr->update(TRUE);
 		}
-		if (m_localStatus == NETLOCALSTATUS_PREGAME &&
-			m_conMgr->hasNetworkHelloFailure()) {
+		#if defined(_WIN64)
+		if (rts::network_epoch::ShouldHandleNetworkHelloFailure(
+				m_networkHelloFailureHandled, m_conMgr->hasNetworkHelloFailure())) {
 			handleNetworkHelloFailure();
 		}
+		#else
+		if (m_localStatus == NETLOCALSTATUS_PREGAME && m_conMgr->hasNetworkHelloFailure()) {
+			handleNetworkHelloFailure();
+		}
+		#endif
 	}
 }
 
@@ -807,7 +813,7 @@ void Network::handleNetworkHelloFailure()
 		return;
 
 	m_networkHelloFailureHandled = TRUE;
-	DEBUG_LOG(("Network::handleNetworkHelloFailure - NET3 compatibility exchange failed; leaving pregame"));
+	DEBUG_LOG(("Network::handleNetworkHelloFailure - NET3 compatibility exchange failed; leaving network game"));
 	if (m_conMgr != nullptr)
 		m_conMgr->quitGame();
 	if (TheGameLogic != nullptr)

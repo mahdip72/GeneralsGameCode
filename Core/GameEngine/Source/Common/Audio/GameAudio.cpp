@@ -434,10 +434,11 @@ Bool AudioManager::prepareAudioEventForPlayback(
 	eventToAdd->setPlayingAudioIndex(preparedEvent->getPlayingAudioIndex());
 	preparedEvent->generatePlayInfo();
 
-	for (std::list<std::pair<AsciiString, Real>>::const_iterator it = m_adjustedVolumes.begin();
-		it != m_adjustedVolumes.end(); ++it) {
-		if (it->first == preparedEvent->getEventName()) {
-			preparedEvent->setVolume(it->second);
+	std::list<std::pair<AsciiString, Real>/**/>::const_iterator adjustedVolumeIt;
+	for (adjustedVolumeIt = m_adjustedVolumes.begin(); adjustedVolumeIt != m_adjustedVolumes.end();
+		++adjustedVolumeIt) {
+		if (adjustedVolumeIt->first == preparedEvent->getEventName()) {
+			preparedEvent->setVolume(adjustedVolumeIt->second);
 			break;
 		}
 	}

@@ -120,6 +120,10 @@ target_include_directories(core_renderer PUBLIC
     ${CMAKE_SOURCE_DIR}/Core/Libraries/Include
 )
 
+target_link_libraries(core_renderer PRIVATE
+    core_utility_no_pch
+)
+
 if(IS_VS6_BUILD)
     set_target_properties(core_renderer PROPERTIES
         CXX_STANDARD 98

@@ -33,6 +33,7 @@
 #pragma once
 
 #include <windows.h>
+#include <oaidl.h>
 
 // ***********************************
 // Set this to 0 to remove all embedded browser code.

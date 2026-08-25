@@ -1967,6 +1967,8 @@ Bool RecorderClass::playbackFile(AsciiString filename)
 	// Otherwise a crc message remains and messes up the crc calculation on the restarted replay.
 	TheCommandList->reset();
 
+	m_playbackFrameCount = header.frameCount;
+	m_nextFrame = 0U;
 	readNextFrame();
 	// readNextFrame() closes m_file via stopPlayback() if the first frame cannot be read.
 	if(m_file == nullptr)
@@ -1999,7 +2001,6 @@ Bool RecorderClass::playbackFile(AsciiString filename)
 	m_mode = RECORDERMODETYPE_PLAYBACK;
 
 	m_currentReplayFilename = filename;
-	m_playbackFrameCount = header.frameCount;
 	return TRUE;
 }
 
@@ -2256,7 +2257,14 @@ void RecorderClass::readNextFrame() {
 			failNativeReplayRead(m_nativeReplayParsed.error, start);
 			return;
 		}
-		m_nextFrame = m_nativeReplayParsed.view.frame;
+		const std::uint32_t nextFrame = m_nativeReplayParsed.view.frame;
+		if (!rts::replay_command::IsCanonicalReplayFrameTransitionValid(
+				m_nextFrame, nextFrame, m_playbackFrameCount))
+		{
+			failNativeReplayRead(rts::replay_command::ReplayCommandError::InvalidFrame, start);
+			return;
+		}
+		m_nextFrame = nextFrame;
 		return;
 	}
 #endif

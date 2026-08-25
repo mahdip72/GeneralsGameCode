@@ -74,7 +74,7 @@ class ObjectPoolClass
 public:
 
 #if !(defined(_MSC_VER) && _MSC_VER < 1300)
-	static_assert(sizeof(T) >= sizeof(void *),
+	static_assert(sizeof(T) >= sizeof(uintptr_t),
 		"ObjectPoolClass elements must hold a free-list pointer");
 	static_assert(alignof(T) <= alignof(void *),
 		"ObjectPoolClass does not support over-aligned elements");
@@ -289,7 +289,7 @@ T * ObjectPoolClass<T,BLOCK_SIZE>::Allocate_Object_Memory()
 
 		// No free objects, allocate another block
 		void ** tmp_block_head = BlockListHead;
-		BlockListHead = (void **)::operator new( sizeof(T) * BLOCK_SIZE + sizeof(void *));
+		BlockListHead = (void **)::operator new( sizeof(T) * BLOCK_SIZE + sizeof(uintptr_t));
 		// Link this block into the block list
 		*BlockListHead = tmp_block_head;
 

@@ -42,7 +42,9 @@
 #include "WWDebug/wwdebug.h"
 #include "saveload.h"
 #include "persist.h"
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
 #include "pointertoken.h"
+#endif
 
 /*
 ** PersistFactoryClass
@@ -103,6 +105,12 @@ SimplePersistFactoryClass<T,CHUNKID>::Load(ChunkLoadClass & cload) const
 	T * new_obj = W3DNEW T;
 	T * old_obj = nullptr;
 
+#if defined(_MSC_VER) && _MSC_VER < 1300
+	cload.Open_Chunk();
+	WWASSERT(cload.Cur_Chunk_ID() == SIMPLEFACTORY_CHUNKID_OBJPOINTER);
+	cload.Read(&old_obj,sizeof(T *));
+	cload.Close_Chunk();
+#else
 	if (!cload.Open_Chunk() ||
 		cload.Cur_Chunk_ID() != SIMPLEFACTORY_CHUNKID_OBJPOINTER)
 	{
@@ -124,13 +132,19 @@ SimplePersistFactoryClass<T,CHUNKID>::Load(ChunkLoadClass & cload) const
 	}
 	old_obj = reinterpret_cast<T *>(old_token);
 	cload.Close_Chunk();
+#endif
 
+#if defined(_MSC_VER) && _MSC_VER < 1300
+	cload.Open_Chunk();
+	WWASSERT(cload.Cur_Chunk_ID() == SIMPLEFACTORY_CHUNKID_OBJDATA);
+#else
 	if (!cload.Open_Chunk() || cload.Cur_Chunk_ID() != SIMPLEFACTORY_CHUNKID_OBJDATA)
 	{
 		WWASSERT(0);
 		delete new_obj;
 		return nullptr;
 	}
+#endif
 	new_obj->Load(cload);
 	cload.Close_Chunk();
 
@@ -142,6 +156,12 @@ SimplePersistFactoryClass<T,CHUNKID>::Load(ChunkLoadClass & cload) const
 template<class T, int CHUNKID> void
 SimplePersistFactoryClass<T,CHUNKID>::Save(ChunkSaveClass & csave,PersistClass * obj) const
 {
+#if defined(_MSC_VER) && _MSC_VER < 1300
+	uint32 objptr = (uint32)obj;
+	csave.Begin_Chunk(SIMPLEFACTORY_CHUNKID_OBJPOINTER);
+	csave.Write(&objptr,sizeof(uint32));
+	csave.End_Chunk();
+#else
 	uint8 token_bytes[PERSIST_POINTER_TOKEN_CURRENT_SIZE] = {};
 	const uint32 token_size = Persist_Pointer_Token_Size();
 	WWASSERT(Encode_Persist_Pointer_Token(reinterpret_cast<std::uintptr_t>(obj), token_bytes,
@@ -149,6 +169,7 @@ SimplePersistFactoryClass<T,CHUNKID>::Save(ChunkSaveClass & csave,PersistClass *
 	csave.Begin_Chunk(SIMPLEFACTORY_CHUNKID_OBJPOINTER);
 	csave.Write(token_bytes, token_size);
 	csave.End_Chunk();
+#endif
 
 	csave.Begin_Chunk(SIMPLEFACTORY_CHUNKID_OBJDATA);
 	obj->Save(csave);

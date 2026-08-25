@@ -30,7 +30,7 @@
 #include "internal_except.h"
 #include <windows.h>
 #include <commctrl.h>
-#include <cstdint>
+#include <Utility/stdint_adapter.h>
 
 static uintptr_t GetInstructionPointer(const CONTEXT &ctx)
 {
@@ -253,7 +253,11 @@ static char regInfo[1024],verInfo[256];
 // and this saves us from doing a stack walk twice
 static DebugStackwalk::Signature sig;
 
+#if defined(_MSC_VER) && _MSC_VER < 1300
+static BOOL CALLBACK ExceptionDlgProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+#else
 static INT_PTR CALLBACK ExceptionDlgProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+#endif
 {
   switch(uMsg)
   {

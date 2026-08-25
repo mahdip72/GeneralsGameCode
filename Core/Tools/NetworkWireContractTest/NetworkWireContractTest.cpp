@@ -278,10 +278,24 @@ int TestNetworkFramePublicationGate()
 	return result;
 }
 
+int TestNetworkHelloFailureHandlingPolicy()
+{
+	using namespace rts::network_epoch;
+	int result = 0;
+	result |= Check(!ShouldHandleNetworkHelloFailure(false, false),
+		"NET3 failure handling stays idle while no failure exists");
+	result |= Check(ShouldHandleNetworkHelloFailure(false, true),
+		"an unhandled NET3 failure is handled in every network state");
+	result |= Check(!ShouldHandleNetworkHelloFailure(true, true),
+		"a NET3 failure is handled only once");
+	return result;
+}
+
 } // namespace
 
 int main()
 {
 	return TestFixedSizes() | TestSizeConversion() | TestWrapperCapacity() |
-		TestNetworkHelloContract() | TestNetworkFramePublicationGate();
+		TestNetworkHelloContract() | TestNetworkFramePublicationGate() |
+		TestNetworkHelloFailureHandlingPolicy();
 }

@@ -29,7 +29,7 @@
 
 #pragma once
 
-#include <cstdint>
+#include <Utility/stdint_adapter.h>
 
 /// \brief stack walker class (singleton)
 class DebugStackwalk
@@ -49,7 +49,7 @@ public:
   class Signature
   {
   public:
-    using Address = uintptr_t;
+    typedef uintptr_t Address;
 
   private:
     // makes life easier :)
