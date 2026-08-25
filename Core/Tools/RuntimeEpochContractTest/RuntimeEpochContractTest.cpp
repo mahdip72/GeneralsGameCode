@@ -191,6 +191,7 @@ int TestReplayContainerValidation()
 	ValidationOptions options;
 	options.expectedBuildCompatibilityId = expected.buildCompatibilityId;
 	options.expectedContentHash = expected.contentHash;
+	options.expectedSchemaVersion = kCurrentReplaySchemaVersion;
 	options.requireBuildCompatibilityMatch = true;
 	options.requireContentHashMatch = true;
 	options.maxPayloadByteCount = payload.size();

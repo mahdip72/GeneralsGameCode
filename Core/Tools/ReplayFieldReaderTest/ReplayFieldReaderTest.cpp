@@ -125,6 +125,7 @@ int TestValidatedOuterContainerRejectsMalformedInnerField()
 	header.payloadChecksum = CalculatePayloadChecksum(payload.data(), payload.size());
 	const std::array<Byte, kHeaderSize> encoded = Encode(header);
 	ValidationOptions options;
+	options.expectedSchemaVersion = kCurrentReplaySchemaVersion;
 	ReplayHeader decoded;
 	int result = Check(DecodeAndValidate(encoded.data(), encoded.size(), payload.data(), payload.size(),
 		options, &decoded).ok(), "the outer replay container accepts its exact checked payload");

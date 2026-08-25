@@ -61,9 +61,13 @@ int ReplaySimulation::simulateReplaysInThisProcess(const std::vector<AsciiString
 		// If we are not in headless mode, we need to run the replay in the engine.
 		for (; s_replayIndex < s_replayCount; ++s_replayIndex)
 		{
-			TheRecorder->playbackFile(filenames[s_replayIndex]);
+			if (!TheRecorder->playbackFile(filenames[s_replayIndex]))
+			{
+				numErrors++;
+				continue;
+			}
 			TheGameEngine->execute();
-			if (TheRecorder->sawCRCMismatch())
+			if (TheRecorder->sawCRCMismatch() || TheRecorder->hasReplayReadError())
 				numErrors++;
 			if (!s_isRunning)
 				break;
@@ -84,6 +88,14 @@ int ReplaySimulation::simulateReplaysInThisProcess(const std::vector<AsciiString
 		DWORD startTimeMillis = GetTickCount();
 		if (TheRecorder->simulateReplay(filename))
 		{
+			Bool replayFailed = FALSE;
+			if (TheRecorder->hasReplayReadError())
+			{
+				printf("REPLAY_FAIL reason=malformed_command\n");
+				fflush(stdout);
+				numErrors++;
+				continue;
+			}
 			UnsignedInt totalTimeSec = TheRecorder->getPlaybackFrameCount() / LOGICFRAMES_PER_SECOND;
 			while (TheRecorder->isPlaybackInProgress())
 			{
@@ -98,17 +110,34 @@ int ReplaySimulation::simulateReplaysInThisProcess(const std::vector<AsciiString
 					fflush(stdout);
 				}
 				TheGameLogic->UPDATE();
+				if (TheRecorder->hasReplayReadError())
+				{
+					printf("REPLAY_FAIL reason=malformed_command\n");
+					fflush(stdout);
+					numErrors++;
+					replayFailed = TRUE;
+					break;
+				}
 				if (TheRecorder->sawCRCMismatch())
 				{
 					numErrors++;
+					replayFailed = TRUE;
 					break;
 				}
 			}
+			if (replayFailed)
+				continue;
 			UnsignedInt gameTimeSec = TheGameLogic->getFrame() / LOGICFRAMES_PER_SECOND;
 			UnsignedInt realTimeSec = (GetTickCount()-startTimeMillis) / 1000;
 			printf("Elapsed Time: %02d:%02d Game Time: %02d:%02d/%02d:%02d\n",
 					realTimeSec/60, realTimeSec%60, gameTimeSec/60, gameTimeSec%60, totalTimeSec/60, totalTimeSec%60);
 			fflush(stdout);
+		}
+		else if (TheRecorder->hasReplayReadError())
+		{
+			printf("REPLAY_FAIL reason=malformed_command\n");
+			fflush(stdout);
+			numErrors++;
 		}
 		else
 		{

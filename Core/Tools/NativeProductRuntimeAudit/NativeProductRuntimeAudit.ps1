@@ -15,12 +15,18 @@ param(
     [Parameter(Mandatory = $true)]
     [string] $ManifestTool,
     [Parameter(Mandatory = $true)]
-    [string] $FFmpegRoot
+    [string] $FFmpegRoot,
+    [ValidateSet('Release', 'Debug', 'RelWithDebInfo', 'MinSizeRel')]
+    [string] $Configuration = 'Release',
+    [string] $OutputSuffix = ''
 )
 
 $ErrorActionPreference = 'Stop'
 
-$selectedConfiguration = 'Release'
+$selectedConfiguration = $Configuration
+if ($OutputSuffix -match '[\\/:;]') {
+    throw 'OutputSuffix must not contain path or list separators.'
+}
 
 function Get-CanonicalPath([string] $Path, [string] $Description) {
     if ([string]::IsNullOrWhiteSpace($Path)) {
@@ -250,8 +256,8 @@ function Assert-SameFile([string] $ExpectedPath, [string] $InstalledPath,
 }
 
 foreach ($product in @(
-    @{ Name = 'Generals'; Generals = 'ON'; ZeroHour = 'OFF'; TitleDirectory = 'Generals'; InstallDirectory = 'Generals'; Targets = @('g_generals', 'g_launcher', 'core_native_d3d8_compatibility_test'); Executables = @('generalsv.exe', 'launcher.exe'); LauncherCommand = 'generalsv.exe' },
-    @{ Name = 'ZeroHour'; Generals = 'OFF'; ZeroHour = 'ON'; TitleDirectory = 'GeneralsMD'; InstallDirectory = 'ZeroHour'; Targets = @('z_generals', 'z_launcher', 'z_runtime_regression_tests', 'core_native_d3d8_compatibility_test'); Executables = @('generalszh.exe', 'launcher.exe', 'z_runtime_regression_tests.exe'); LauncherCommand = 'generalszh.exe' }
+    @{ Name = 'Generals'; Generals = 'ON'; ZeroHour = 'OFF'; TitleDirectory = 'Generals'; InstallDirectory = 'Generals'; Targets = @('g_generals', 'g_launcher', 'core_native_d3d8_compatibility_test'); Executables = @("generalsv$OutputSuffix.exe", 'launcher.exe'); LauncherCommand = "generalsv$OutputSuffix.exe" },
+    @{ Name = 'ZeroHour'; Generals = 'OFF'; ZeroHour = 'ON'; TitleDirectory = 'GeneralsMD'; InstallDirectory = 'ZeroHour'; Targets = @('z_generals', 'z_launcher', 'z_runtime_regression_tests', 'core_native_d3d8_compatibility_test'); Executables = @("generalszh$OutputSuffix.exe", 'launcher.exe', 'z_runtime_regression_tests.exe'); LauncherCommand = "generalszh$OutputSuffix.exe" }
 )) {
     $productBuildRoot = Join-Path $BuildRoot $product.Name
     $installRoot = Join-Path $productBuildRoot 'InstallRoot'
@@ -287,6 +293,7 @@ foreach ($product in @(
         '-DRTS_BUILD_CORE_TOOLS=OFF',
         '-DRTS_BUILD_CORE_EXTRAS=OFF',
         '-DRTS_BUILD_OPTION_FFMPEG=ON',
+        "-DRTS_BUILD_OUTPUT_SUFFIX=$OutputSuffix",
         "-DFFMPEG_ROOT=$FFmpegRoot"
     )
     if (-not [string]::IsNullOrWhiteSpace($GeneratorPlatform)) {
@@ -325,7 +332,14 @@ foreach ($product in @(
         throw "Native x64 $($product.Name) product did not resolve FFmpeg runtime DLLs."
     }
     $runtimeDlls = @($runtimeDllMatch.Groups[1].Value.Trim() -split ';')
-    $msvcRuntimeDllMatch = [regex]::Match($cache, '(?m)^RTS_NATIVE_MSVC_RUNTIME_DLLS:INTERNAL=(.+)$')
+    $msvcRuntimeCacheName = if ($selectedConfiguration -eq 'Debug') {
+        'RTS_NATIVE_MSVC_RUNTIME_DLLS_DEBUG'
+    }
+    else {
+        'RTS_NATIVE_MSVC_RUNTIME_DLLS_RELEASE'
+    }
+    $msvcRuntimeDllMatch = [regex]::Match($cache,
+        '(?m)^' + [regex]::Escape($msvcRuntimeCacheName) + ':INTERNAL=(.+)$')
     if (-not $msvcRuntimeDllMatch.Success) {
         throw "Native x64 $($product.Name) product did not resolve app-local MSVC runtime DLLs."
     }

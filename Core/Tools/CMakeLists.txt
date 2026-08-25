@@ -35,6 +35,20 @@ if(RTS_BUILD_CORE_EXTRAS)
         add_subdirectory(NativeAudioAssetCatalogTest)
         add_subdirectory(NativeXAudioManagerContractTest)
         add_subdirectory(LauncherProcessContractTest)
+        if(MSVC)
+            add_test(NAME core_native_product_runtime_packaging_tests
+                COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                    -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeProductRuntimeAudit/NativeProductRuntimePackaging.Tests.ps1"
+                    -ScratchRoot "${CMAKE_BINARY_DIR}/TestScratch/NativeProductRuntimePackaging"
+            )
+            set_tests_properties(core_native_product_runtime_packaging_tests PROPERTIES TIMEOUT 60)
+        endif()
+        add_test(NAME core_asan_runtime_packaging_tests
+            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/AsanRuntimeAudit/AsanRuntimePackaging.Tests.ps1"
+                -ScratchRoot "${CMAKE_BINARY_DIR}/TestScratch/AsanRuntimePackaging"
+        )
+        set_tests_properties(core_asan_runtime_packaging_tests PROPERTIES TIMEOUT 60)
         add_test(NAME core_native_audio_graph_audit
             COMMAND powershell -NoProfile -ExecutionPolicy Bypass
                 -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeAudioGraphAudit/NativeAudioGraphAudit.ps1"
@@ -85,6 +99,7 @@ if(RTS_BUILD_CORE_EXTRAS)
     if(NOT IS_VS6_BUILD)
         add_subdirectory(RuntimeEpochContractTest)
         add_subdirectory(NetworkWireContractTest)
+        add_subdirectory(FileTransferTimeoutTest)
         add_subdirectory(PersistPointerTokenTest)
         add_subdirectory(ChunkIOValueReadTest)
     endif()

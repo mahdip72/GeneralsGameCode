@@ -1089,6 +1089,10 @@ target_link_libraries(g_gameengine PRIVATE
     gi_always
 )
 
+if(NOT IS_VS6_BUILD)
+    target_link_libraries(g_gameengine PRIVATE core_replay_command_contract)
+endif()
+
 target_link_libraries(g_gameengine PUBLIC
     corei_gameengine_public
     g_wwvegas

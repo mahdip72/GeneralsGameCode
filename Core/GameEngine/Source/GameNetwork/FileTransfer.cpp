@@ -34,6 +34,7 @@
 #include "GameClient/Shell.h"
 #include "GameNetwork/FileTransfer.h"
 #include "GameNetwork/networkutil.h"
+#include "Lib/FileTransferTimeout.h"
 
 //-------------------------------------------------------------------------------------
 //-------------------------------------------------------------------------------------
@@ -87,10 +88,11 @@ static Bool doFileTransfer( AsciiString filename, MapTransferLoadScreen *ls, Int
 				if (TheNetwork->hasNetworkHelloFailure())
 					return FALSE;
 
-				Int now = timeGetTime();
-				if (now > startTime + timeoutPeriod)
+				const UnsignedInt now = timeGetTime();
+				if (rts::file_transfer::IsTimedOut(now, startTime, timeoutPeriod))
 					break;
-				ls->processTimeout((startTime + timeoutPeriod - now)/1000);
+				ls->processTimeout(static_cast<Int>(rts::file_transfer::RemainingSeconds(
+					now, startTime, timeoutPeriod)));
 				ls->update(0);
 				continue;
 			}
@@ -140,15 +142,16 @@ static Bool doFileTransfer( AsciiString filename, MapTransferLoadScreen *ls, Int
 				ls->processProgress(0, fileTransferPercent, "MapTransfer:Done");
 			}
 
-			Int now = timeGetTime();
-			if (now > startTime + timeoutPeriod) // bail if we don't finish in a reasonable amount of time
+			const UnsignedInt now = timeGetTime();
+			if (rts::file_transfer::IsTimedOut(now, startTime, timeoutPeriod)) // bail if we don't finish in a reasonable amount of time
 			{
 				DEBUG_LOG(("Timing out file transfer"));
 				break;
 			}
 			else
 			{
-				ls->processTimeout((startTime + timeoutPeriod - now)/1000);
+				ls->processTimeout(static_cast<Int>(rts::file_transfer::RemainingSeconds(
+					now, startTime, timeoutPeriod)));
 			}
 
 			ls->update(fileTransferPercent);

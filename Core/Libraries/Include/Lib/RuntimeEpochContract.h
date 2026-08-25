@@ -16,6 +16,10 @@ using Byte = std::uint8_t;
 // of a deliberate format/compatibility revision.
 constexpr std::uint32_t kCurrentSchemaVersion = 1U;
 constexpr std::uint32_t kCurrentEngineEpoch = 1U;
+// Replay schema 2 adds the canonical, explicitly framed native command
+// stream.  Save and network headers retain the shared schema value above until
+// their own wire revisions are cut over.
+constexpr std::uint32_t kCurrentReplaySchemaVersion = 2U;
 constexpr std::size_t kHeaderSize = 40U;
 
 constexpr std::array<Byte, 4> kSaveMagic = {{'S', 'A', 'V', '3'}};
@@ -48,7 +52,7 @@ struct SaveHeader
 
 struct ReplayHeader
 {
-	std::uint32_t schemaVersion = kCurrentSchemaVersion;
+	std::uint32_t schemaVersion = kCurrentReplaySchemaVersion;
 	std::uint32_t engineEpoch = kCurrentEngineEpoch;
 	std::uint64_t buildCompatibilityId = 0U;
 	std::uint64_t contentHash = 0U;

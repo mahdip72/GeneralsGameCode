@@ -1,3 +1,13 @@
+# Product title graphs call this helper in every configuration.  Define the
+# no-op boundary before the ASan-only configure path returns so Release and
+# Profile configuration cannot fail with an unknown CMake command.
+function(rts_install_asan_runtime destination)
+    if(RTS_BUILD_OPTION_ASAN AND RTS_NATIVE_ASAN_RUNTIME_DLLS)
+        install(FILES ${RTS_NATIVE_ASAN_RUNTIME_DLLS}
+            DESTINATION "${destination}")
+    endif()
+endfunction()
+
 if(NOT RTS_BUILD_OPTION_ASAN OR NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     return()
 endif()
@@ -19,7 +29,9 @@ if(NOT _rts_native_asan_runtime_dll)
 endif()
 
 set(RTS_NATIVE_ASAN_RUNTIME_DLLS "${_rts_native_asan_runtime_dll}"
-    CACHE INTERNAL "Resolved app-local MSVC AddressSanitizer runtime DLLs")
+    CACHE INTERNAL "Resolved app-local MSVC AddressSanitizer runtime DLLs" FORCE)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${_rts_native_asan_runtime_dll}")
 
 # All source-owned executables in a product subtree share its configured
 # runtime output directory. Stage the DLL during configure so direct launches

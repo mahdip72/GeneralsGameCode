@@ -265,10 +265,23 @@ int TestNetworkHelloContract()
 	return result;
 }
 
+int TestNetworkFramePublicationGate()
+{
+	using namespace rts::network_epoch;
+	int result = 0;
+	result |= Check(IsNetworkFramePublicationAllowed(false, false),
+		"network frames remain publishable when NET3 has not failed");
+	result |= Check(!IsNetworkFramePublicationAllowed(true, false),
+		"a handled NET3 failure blocks same-update frame publication");
+	result |= Check(!IsNetworkFramePublicationAllowed(false, true),
+		"an observed NET3 failure blocks same-update frame publication");
+	return result;
+}
+
 } // namespace
 
 int main()
 {
 	return TestFixedSizes() | TestSizeConversion() | TestWrapperCapacity() |
-		TestNetworkHelloContract();
+		TestNetworkHelloContract() | TestNetworkFramePublicationGate();
 }

@@ -45,6 +45,7 @@ include(FetchContent)
 
 include(cmake/config.cmake)
 include(cmake/asan.cmake)
+include(cmake/native-product-packaging.cmake)
 
 # MinGW-w64 specific configuration
 if(MINGW)
@@ -85,14 +86,26 @@ include(cmake/stb.cmake)
 
 if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     # Native installed runtimes are disposable and must launch without relying
-    # on a machine-wide Visual C++ Redistributable.  Let each title install the
-    # exact compiler runtime DLLs beside its executable.
-    set(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_SKIP TRUE)
-    include(InstallRequiredSystemLibraries)
-    set(RTS_NATIVE_MSVC_RUNTIME_DLLS ${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS}
-        CACHE INTERNAL "Resolved app-local MSVC runtime DLLs for native products")
-    if(RTS_BUILD_PRODUCT AND NOT RTS_NATIVE_MSVC_RUNTIME_DLLS)
-        message(FATAL_ERROR "Native x64 product install could not resolve the MSVC runtime DLLs.")
+    # on a machine-wide Visual C++ Redistributable.  Collect both sets because
+    # Debug and ASan binaries link the debug CRT and ucrtbased.dll, while the
+    # release configurations must retain only the release CRT.
+    rts_collect_native_msvc_runtime_dlls()
+    set(RTS_NATIVE_MSVC_RUNTIME_DLLS_RELEASE
+        "${RTS_NATIVE_MSVC_RUNTIME_DLLS_RELEASE}"
+        CACHE INTERNAL "Resolved release MSVC runtime DLLs for native products" FORCE)
+    set(RTS_NATIVE_MSVC_RUNTIME_DLLS_DEBUG
+        "${RTS_NATIVE_MSVC_RUNTIME_DLLS_DEBUG}"
+        CACHE INTERNAL "Resolved debug MSVC runtime DLLs for native products" FORCE)
+    # Keep the old cache name as a release-only compatibility alias for tools
+    # that have not yet switched to the configuration-specific contract.
+    set(RTS_NATIVE_MSVC_RUNTIME_DLLS
+        "${RTS_NATIVE_MSVC_RUNTIME_DLLS_RELEASE}"
+        CACHE INTERNAL "Resolved release MSVC runtime DLLs for native products" FORCE)
+    if(RTS_BUILD_PRODUCT AND
+            (NOT RTS_NATIVE_MSVC_RUNTIME_DLLS_RELEASE OR
+             NOT RTS_NATIVE_MSVC_RUNTIME_DLLS_DEBUG))
+        message(FATAL_ERROR
+            "Native x64 product install could not resolve both MSVC runtime sets.")
     endif()
 endif()
 
@@ -123,11 +136,19 @@ if(RTS_BUILD_PRODUCT AND RTS_BUILD_GENERALS)
 endif()
 
 if(RTS_BUILD_OPTION_ASAN AND MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(_rts_asan_deployment_audit_product_args)
+    if(RTS_BUILD_GENERALS)
+        list(APPEND _rts_asan_deployment_audit_product_args -ExpectGenerals)
+    endif()
+    if(RTS_BUILD_ZEROHOUR)
+        list(APPEND _rts_asan_deployment_audit_product_args -ExpectZeroHour)
+    endif()
     add_test(NAME core_asan_runtime_deployment_audit
         COMMAND powershell -NoProfile -ExecutionPolicy Bypass
             -File "${CMAKE_SOURCE_DIR}/Core/Tools/AsanRuntimeAudit/AsanRuntimeDeploymentAudit.ps1"
             -BuildRoot "${CMAKE_BINARY_DIR}"
-            -RuntimeDll "${RTS_NATIVE_ASAN_RUNTIME_DLLS}")
+            -RuntimeDll "${RTS_NATIVE_ASAN_RUNTIME_DLLS}"
+            ${_rts_asan_deployment_audit_product_args})
     set_tests_properties(core_asan_runtime_deployment_audit PROPERTIES TIMEOUT 30)
 endif()
 

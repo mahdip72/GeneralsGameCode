@@ -2,7 +2,9 @@ param(
     [Parameter(Mandatory = $true)]
     [string] $BuildRoot,
     [Parameter(Mandatory = $true)]
-    [string] $RuntimeDll
+    [string] $RuntimeDll,
+    [switch] $ExpectGenerals,
+    [switch] $ExpectZeroHour
 )
 
 $ErrorActionPreference = 'Stop'
@@ -37,16 +39,11 @@ finally {
 $runtimeRoots = @('Core', 'Generals', 'GeneralsMD') | ForEach-Object {
     Join-Path $resolvedBuildRoot $_
 } | Where-Object { Test-Path -LiteralPath $_ -PathType Container }
-$configurationDirectories = @(foreach ($runtimeRoot in $runtimeRoots) {
-    Get-ChildItem -LiteralPath $runtimeRoot -Directory -ErrorAction SilentlyContinue | Where-Object {
-        Test-Path -LiteralPath (Join-Path $_.FullName $runtimeName) -PathType Leaf
-    }
-})
-$builtExecutables = @($configurationDirectories | ForEach-Object {
-    Get-ChildItem -LiteralPath $_.FullName -File -Filter '*.exe' -ErrorAction SilentlyContinue
+$builtExecutables = @(foreach ($runtimeRoot in $runtimeRoots) {
+    Get-ChildItem -LiteralPath $runtimeRoot -Recurse -File -Filter '*.exe' -ErrorAction SilentlyContinue
 })
 if ($builtExecutables.Count -eq 0) {
-    throw "No ASan executable was found in a staged runtime output directory below '$resolvedBuildRoot'."
+    throw "No ASan executable was found below '$resolvedBuildRoot'."
 }
 
 foreach ($executable in $builtExecutables) {
@@ -69,9 +66,16 @@ foreach ($executable in $builtExecutables) {
 }
 
 $installScripts = @(Get-ChildItem -LiteralPath $resolvedBuildRoot -Recurse -File -Filter 'cmake_install.cmake' -ErrorAction SilentlyContinue)
-foreach ($title in @('Generals', 'GeneralsMD')) {
+foreach ($expectation in @(
+    @{ Title = 'Generals'; Required = $ExpectGenerals.IsPresent },
+    @{ Title = 'GeneralsMD'; Required = $ExpectZeroHour.IsPresent }
+)) {
+    $title = $expectation.Title
     $installScript = $installScripts | Where-Object { $_.DirectoryName -eq (Join-Path $resolvedBuildRoot $title) } | Select-Object -First 1
     if ($null -eq $installScript) {
+        if ($expectation.Required) {
+            throw "$title install script is missing from the ASan product graph."
+        }
         continue
     }
     $installText = Get-Content -LiteralPath $installScript.FullName -Raw

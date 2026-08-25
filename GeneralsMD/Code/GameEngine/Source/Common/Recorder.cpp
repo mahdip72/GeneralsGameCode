@@ -52,8 +52,10 @@
 
 #if defined(_WIN64)
 #include "Lib/RuntimeEpochContract.h"
+#include "Lib/ReplayCommandContract.h"
 #include <array>
 #include <cstdint>
+#include <cstring>
 #endif
 
 constexpr const char s_genrep[] = "GENREP";
@@ -75,13 +77,28 @@ static time_t startTime;
 static const UnsignedInt startTimeOffset = 6;
 static const UnsignedInt endTimeOffset = startTimeOffset + sizeof(replay_time_t);
 static const UnsignedInt frameCountOffset = endTimeOffset + sizeof(replay_time_t);
+#if defined(_WIN64)
+static const UnsignedInt desyncOffset = frameCountOffset + 4U;
+static const UnsignedInt quitEarlyOffset = desyncOffset + 1U;
+static const UnsignedInt disconOffset = quitEarlyOffset + 1U;
+#else
 static const UnsignedInt desyncOffset = frameCountOffset + sizeof(UnsignedInt);
 static const UnsignedInt quitEarlyOffset = desyncOffset + sizeof(Bool);
 static const UnsignedInt disconOffset = quitEarlyOffset + sizeof(Bool);
+#endif
 
 #if defined(_WIN64)
 static constexpr Int kNativeReplayPayloadBase = static_cast<Int>(rts::runtime_epoch::kHeaderSize);
 static constexpr Int kNativeReplayChecksumChunkSize = 64 * 1024;
+
+static_assert(static_cast<std::int32_t>(GameMessage::MSG_CLEAR_GAME_DATA) ==
+	 rts::replay_command::kClearGameDataMessageType, "native replay clear-data ID must remain stable");
+static_assert(static_cast<std::int32_t>(GameMessage::MSG_BEGIN_NETWORK_MESSAGES) ==
+	 rts::replay_command::kBeginNetworkMessageType, "native replay network ID must remain stable");
+static_assert(static_cast<std::int32_t>(GameMessage::MSG_END_NETWORK_MESSAGES) ==
+	 rts::replay_command::kEndNetworkMessageType, "native replay network end ID must remain stable");
+static_assert(MAX_SLOTS - 1 == rts::replay_command::kMaxReplayPlayerIndex,
+	"native replay player range must remain stable");
 
 static Bool scanNativeReplayPayload(File* file,
 	Int payloadBase,
@@ -137,9 +154,8 @@ static Bool writeNativeReplayContainerHeader(File* file,
 
 static Bool beginNativeReplayContainer(File* file)
 {
-	// The RPL3 header is the new compatibility boundary.  The legacy GENREP
-	// payload remains unchanged and is intentionally not claimed to be a
-	// canonical x64 replay schema by this slice.
+	// The RPL3 header is the native replay compatibility boundary.  Schema 2
+	// uses canonical, explicitly framed command records after the GENREP fields.
 	rts::runtime_epoch::ReplayHeader header;
 	header.buildCompatibilityId = rts::runtime_epoch::BuildCompatibilityIdFromExecutableCrc(
 		TheGlobalData->m_exeCRC);
@@ -183,7 +199,7 @@ static Bool finalizeNativeReplayContainer(File* file)
 	return file->seek(fileSize, File::seekMode::START) == fileSize;
 }
 
-static Bool validateNativeReplayContainer(File* file)
+static Bool validateNativeReplayContainer(File* file, Int* payloadEnd)
 {
 	if (file == nullptr || TheGlobalData == nullptr)
 	{
@@ -214,6 +230,7 @@ static Bool validateNativeReplayContainer(File* file)
 		rts::runtime_epoch::BuildCompatibilityIdFromExecutableCrc(TheGlobalData->m_exeCRC);
 	options.expectedContentHash =
 		rts::runtime_epoch::ContentHashFromIniCrc(TheGlobalData->m_iniCRC);
+	options.expectedSchemaVersion = rts::runtime_epoch::kCurrentReplaySchemaVersion;
 	options.maxPayloadByteCount = static_cast<std::uint64_t>(fileSize - kNativeReplayPayloadBase);
 	options.requireBuildCompatibilityMatch = true;
 	options.requireContentHashMatch = true;
@@ -232,27 +249,337 @@ static Bool validateNativeReplayContainer(File* file)
 
 	// Leave the stream at the first byte of the legacy replay payload.  Every
 	// subsequent GENREP read is therefore relative to the validated container.
+	if (header.payloadByteCount > static_cast<std::uint64_t>(fileSize - kNativeReplayPayloadBase) ||
+		header.payloadByteCount > static_cast<std::uint64_t>(INT_MAX - kNativeReplayPayloadBase))
+	{
+		return FALSE;
+	}
+	if (payloadEnd != nullptr)
+		*payloadEnd = kNativeReplayPayloadBase + static_cast<Int>(header.payloadByteCount);
 	return file->seek(kNativeReplayPayloadBase, File::seekMode::START) == kNativeReplayPayloadBase;
 }
 #endif
 
-static void writeAtOffset(File* file, Int offset, const void* data, Int dataSize)
+#if defined(_WIN64)
+static void writeNativeReplayU16(rts::replay_command::Byte *output, std::uint16_t value)
 {
+	output[0] = static_cast<rts::replay_command::Byte>(value & 0xffU);
+	output[1] = static_cast<rts::replay_command::Byte>((value >> 8U) & 0xffU);
+}
+
+static void writeNativeReplayU32(rts::replay_command::Byte *output, std::uint32_t value)
+{
+	output[0] = static_cast<rts::replay_command::Byte>(value & 0xffU);
+	output[1] = static_cast<rts::replay_command::Byte>((value >> 8U) & 0xffU);
+	output[2] = static_cast<rts::replay_command::Byte>((value >> 16U) & 0xffU);
+	output[3] = static_cast<rts::replay_command::Byte>((value >> 24U) & 0xffU);
+}
+
+static std::uint16_t readNativeReplayU16(const rts::replay_command::Byte *input)
+{
+	return static_cast<std::uint16_t>(input[0]) |
+		static_cast<std::uint16_t>(static_cast<std::uint16_t>(input[1]) << 8U);
+}
+
+static std::uint32_t readNativeReplayU32(const rts::replay_command::Byte *input)
+{
+	return static_cast<std::uint32_t>(input[0]) |
+		(static_cast<std::uint32_t>(input[1]) << 8U) |
+		(static_cast<std::uint32_t>(input[2]) << 16U) |
+		(static_cast<std::uint32_t>(input[3]) << 24U);
+}
+
+static Bool mapNativeReplayArgumentType(GameMessageArgumentDataType input,
+	rts::replay_command::ReplayArgumentType *output)
+{
+	if (output == nullptr)
+		return FALSE;
+	switch (input)
+	{
+	case ARGUMENTDATATYPE_INTEGER: *output = rts::replay_command::ReplayArgumentType::Integer; return TRUE;
+	case ARGUMENTDATATYPE_REAL: *output = rts::replay_command::ReplayArgumentType::Real; return TRUE;
+	case ARGUMENTDATATYPE_BOOLEAN: *output = rts::replay_command::ReplayArgumentType::Boolean; return TRUE;
+	case ARGUMENTDATATYPE_OBJECTID: *output = rts::replay_command::ReplayArgumentType::ObjectId; return TRUE;
+	case ARGUMENTDATATYPE_DRAWABLEID: *output = rts::replay_command::ReplayArgumentType::DrawableId; return TRUE;
+	case ARGUMENTDATATYPE_TEAMID: *output = rts::replay_command::ReplayArgumentType::TeamId; return TRUE;
+	case ARGUMENTDATATYPE_LOCATION: *output = rts::replay_command::ReplayArgumentType::Location; return TRUE;
+	case ARGUMENTDATATYPE_PIXEL: *output = rts::replay_command::ReplayArgumentType::Pixel; return TRUE;
+	case ARGUMENTDATATYPE_PIXELREGION: *output = rts::replay_command::ReplayArgumentType::PixelRegion; return TRUE;
+	case ARGUMENTDATATYPE_TIMESTAMP: *output = rts::replay_command::ReplayArgumentType::Timestamp; return TRUE;
+	case ARGUMENTDATATYPE_WIDECHAR: *output = rts::replay_command::ReplayArgumentType::WideChar; return TRUE;
+	default: return FALSE;
+	}
+}
+
+static Bool appendNativeReplayBytes(rts::replay_command::Byte *payload,
+	std::size_t payloadCapacity,
+	std::size_t *payloadOffset,
+	const rts::replay_command::Byte *bytes,
+	std::size_t byteCount)
+{
+	if (payload == nullptr || payloadOffset == nullptr || bytes == nullptr ||
+		*payloadOffset > payloadCapacity || byteCount > payloadCapacity - *payloadOffset)
+	{
+		return FALSE;
+	}
+	for (std::size_t i = 0U; i < byteCount; ++i)
+		payload[*payloadOffset + i] = bytes[i];
+	*payloadOffset += byteCount;
+	return TRUE;
+}
+
+static Bool appendNativeReplayArgument(GameMessageArgumentDataType type,
+	const GameMessageArgumentType &arg,
+	rts::replay_command::Byte *payload,
+	std::size_t payloadCapacity,
+	std::size_t *payloadOffset)
+{
+	std::uint32_t bits = 0U;
+	std::array<rts::replay_command::Byte, 16U> bytes = {{}};
+	std::size_t byteCount = 0U;
+	switch (type)
+	{
+	case ARGUMENTDATATYPE_INTEGER:
+		writeNativeReplayU32(bytes.data(), static_cast<std::uint32_t>(arg.integer)); byteCount = 4U; break;
+	case ARGUMENTDATATYPE_REAL:
+		std::memcpy(&bits, &arg.real, sizeof(bits)); writeNativeReplayU32(bytes.data(), bits); byteCount = 4U; break;
+	case ARGUMENTDATATYPE_BOOLEAN:
+		bytes[0] = arg.boolean ? 1U : 0U; byteCount = 1U; break;
+	case ARGUMENTDATATYPE_OBJECTID:
+		writeNativeReplayU32(bytes.data(), static_cast<std::uint32_t>(arg.objectID)); byteCount = 4U; break;
+	case ARGUMENTDATATYPE_DRAWABLEID:
+		writeNativeReplayU32(bytes.data(), static_cast<std::uint32_t>(arg.drawableID)); byteCount = 4U; break;
+	case ARGUMENTDATATYPE_TEAMID:
+		writeNativeReplayU32(bytes.data(), static_cast<std::uint32_t>(arg.teamID)); byteCount = 4U; break;
+	case ARGUMENTDATATYPE_LOCATION:
+		std::memcpy(&bits, &arg.location.x, sizeof(bits)); writeNativeReplayU32(bytes.data(), bits);
+		std::memcpy(&bits, &arg.location.y, sizeof(bits)); writeNativeReplayU32(bytes.data() + 4U, bits);
+		std::memcpy(&bits, &arg.location.z, sizeof(bits)); writeNativeReplayU32(bytes.data() + 8U, bits);
+		byteCount = 12U; break;
+	case ARGUMENTDATATYPE_PIXEL:
+		writeNativeReplayU32(bytes.data(), static_cast<std::uint32_t>(arg.pixel.x));
+		writeNativeReplayU32(bytes.data() + 4U, static_cast<std::uint32_t>(arg.pixel.y));
+		byteCount = 8U; break;
+	case ARGUMENTDATATYPE_PIXELREGION:
+		writeNativeReplayU32(bytes.data(), static_cast<std::uint32_t>(arg.pixelRegion.lo.x));
+		writeNativeReplayU32(bytes.data() + 4U, static_cast<std::uint32_t>(arg.pixelRegion.lo.y));
+		writeNativeReplayU32(bytes.data() + 8U, static_cast<std::uint32_t>(arg.pixelRegion.hi.x));
+		writeNativeReplayU32(bytes.data() + 12U, static_cast<std::uint32_t>(arg.pixelRegion.hi.y));
+		byteCount = 16U; break;
+	case ARGUMENTDATATYPE_TIMESTAMP:
+		writeNativeReplayU32(bytes.data(), static_cast<std::uint32_t>(arg.timestamp)); byteCount = 4U; break;
+	case ARGUMENTDATATYPE_WIDECHAR:
+		writeNativeReplayU16(bytes.data(), static_cast<std::uint16_t>(arg.wChar)); byteCount = 2U; break;
+	default:
+		return FALSE;
+	}
+	return appendNativeReplayBytes(payload, payloadCapacity, payloadOffset, bytes.data(), byteCount);
+}
+
+static Bool buildNativeReplayCommand(GameMessage *msg,
+	std::array<rts::replay_command::Byte, rts::replay_command::kMaxReplayCommandBytes> &record,
+	std::size_t *recordBytes)
+{
+	if (msg == nullptr || recordBytes == nullptr)
+		return FALSE;
+
+	std::array<rts::replay_command::ReplayCommandDescriptor, rts::replay_command::kMaxReplayDescriptors> descriptors = {{}};
+	std::size_t descriptorCount = 0U;
+	const std::size_t argumentCount = msg->getArgumentCount();
+	for (std::size_t i = 0U; i < argumentCount; ++i)
+	{
+		const GameMessageArgumentDataType type = msg->getArgumentDataType(static_cast<Int>(i));
+		rts::replay_command::ReplayArgumentType wireType;
+		if (!mapNativeReplayArgumentType(type, &wireType))
+			return FALSE;
+		if (descriptorCount == 0U || descriptors[descriptorCount - 1U].argumentType != wireType)
+		{
+			if (descriptorCount >= descriptors.size())
+				return FALSE;
+			descriptors[descriptorCount] = {wireType, 1U};
+			++descriptorCount;
+		}
+		else
+		{
+			if (descriptors[descriptorCount - 1U].argumentCount == rts::replay_command::kMaxReplayArguments)
+				return FALSE;
+			++descriptors[descriptorCount - 1U].argumentCount;
+		}
+	}
+
+	std::array<rts::replay_command::Byte, rts::replay_command::kMaxReplayCommandBytes> payload = {{}};
+	std::size_t payloadBytes = 0U;
+	for (std::size_t i = 0U; i < argumentCount; ++i)
+	{
+		if (!appendNativeReplayArgument(msg->getArgumentDataType(static_cast<Int>(i)),
+			*msg->getArgument(static_cast<Int>(i)), payload.data(), payload.size(), &payloadBytes))
+		{
+			return FALSE;
+		}
+	}
+
+	const rts::replay_command::ReplayCommandInput input{
+		static_cast<std::uint32_t>(TheGameLogic->getFrame()),
+		static_cast<std::int32_t>(msg->getType()),
+		static_cast<std::int32_t>(msg->getPlayerIndex()),
+		std::span<const rts::replay_command::ReplayCommandDescriptor>(descriptors.data(), descriptorCount),
+		std::span<const rts::replay_command::Byte>(payload.data(), payloadBytes),
+	};
+	const rts::replay_command::BuildResult built =
+		rts::replay_command::BuildCanonicalReplayCommand(input, record);
+	if (!built.ok())
+		return FALSE;
+	*recordBytes = built.bytesWritten;
+	return TRUE;
+}
+
+static Bool writeNativeReplayExact(File *file, const void *data, std::size_t byteCount)
+{
+	return file != nullptr && data != nullptr && byteCount <= static_cast<std::size_t>(INT_MAX) &&
+		file->write(data, static_cast<Int>(byteCount)) == static_cast<Int>(byteCount);
+}
+
+static Bool writeNativeReplayU16Field(File *file, std::uint16_t value)
+{
+	std::array<rts::replay_command::Byte, 2U> bytes = {{}};
+	writeNativeReplayU16(bytes.data(), value);
+	return writeNativeReplayExact(file, bytes.data(), bytes.size());
+}
+
+static Bool writeNativeReplayU32Field(File *file, std::uint32_t value)
+{
+	std::array<rts::replay_command::Byte, 4U> bytes = {{}};
+	writeNativeReplayU32(bytes.data(), value);
+	return writeNativeReplayExact(file, bytes.data(), bytes.size());
+}
+
+static Bool writeNativeReplayBoolField(File *file, Bool value)
+{
+	const rts::replay_command::Byte byte = value ? 1U : 0U;
+	return writeNativeReplayExact(file, &byte, sizeof(byte));
+}
+
+static Bool writeNativeReplayAsciiString(File *file, const char *value)
+{
+	if (value == nullptr)
+		return FALSE;
+	const std::size_t length = std::strlen(value) + 1U;
+	return writeNativeReplayExact(file, value, length);
+}
+
+static Bool writeNativeReplayWideString(File *file, const WideChar *value)
+{
+	if (value == nullptr)
+		return FALSE;
+	for (std::size_t i = 0U;; ++i)
+	{
+		const std::uint16_t character = static_cast<std::uint16_t>(value[i]);
+		if (!writeNativeReplayU16Field(file, character))
+			return FALSE;
+		if (character == 0U)
+			return TRUE;
+	}
+}
+
+static Bool writeNativeReplaySystemTime(File *file, const SYSTEMTIME &value)
+{
+	return writeNativeReplayU16Field(file, value.wYear) &&
+		writeNativeReplayU16Field(file, value.wMonth) &&
+		writeNativeReplayU16Field(file, value.wDayOfWeek) &&
+		writeNativeReplayU16Field(file, value.wDay) &&
+		writeNativeReplayU16Field(file, value.wHour) &&
+		writeNativeReplayU16Field(file, value.wMinute) &&
+		writeNativeReplayU16Field(file, value.wSecond) &&
+		writeNativeReplayU16Field(file, value.wMilliseconds);
+}
+
+static Bool readNativeReplayU16Field(File *file, std::uint16_t *value)
+{
+	std::array<rts::replay_command::Byte, 2U> bytes = {{}};
+	if (file == nullptr || value == nullptr ||
+		file->read(bytes.data(), static_cast<Int>(bytes.size())) != static_cast<Int>(bytes.size()))
+	{
+		return FALSE;
+	}
+	*value = readNativeReplayU16(bytes.data());
+	return TRUE;
+}
+
+static Bool readNativeReplayU32Field(File *file, std::uint32_t *value)
+{
+	std::array<rts::replay_command::Byte, 4U> bytes = {{}};
+	if (file == nullptr || value == nullptr ||
+		file->read(bytes.data(), static_cast<Int>(bytes.size())) != static_cast<Int>(bytes.size()))
+	{
+		return FALSE;
+	}
+	*value = readNativeReplayU32(bytes.data());
+	return TRUE;
+}
+
+static Bool readNativeReplayBoolField(File *file, Bool *value)
+{
+	rts::replay_command::Byte byte = 0U;
+	if (file == nullptr || value == nullptr || file->read(&byte, 1) != 1 || byte > 1U)
+		return FALSE;
+	*value = byte != 0U;
+	return TRUE;
+}
+
+static Bool readNativeReplaySystemTime(File *file, SYSTEMTIME *value)
+{
+	return value != nullptr &&
+		readNativeReplayU16Field(file, &value->wYear) &&
+		readNativeReplayU16Field(file, &value->wMonth) &&
+		readNativeReplayU16Field(file, &value->wDayOfWeek) &&
+		readNativeReplayU16Field(file, &value->wDay) &&
+		readNativeReplayU16Field(file, &value->wHour) &&
+		readNativeReplayU16Field(file, &value->wMinute) &&
+		readNativeReplayU16Field(file, &value->wSecond) &&
+		readNativeReplayU16Field(file, &value->wMilliseconds);
+}
+#endif
+
+static Bool writeAtOffset(File* file, Int offset, const void* data, Int dataSize)
+{
+	if (file == nullptr || data == nullptr || offset < 0 || dataSize < 0)
+		return FALSE;
 	UnsignedInt fileSize = file->size();
 	#if defined(_WIN64)
 	const Int absoluteOffset = kNativeReplayPayloadBase + offset;
 	#else
 	const Int absoluteOffset = offset;
 	#endif
-	DEBUG_ASSERTCRASH((UnsignedInt)(absoluteOffset + dataSize) <= fileSize, ("writeAtOffset would exceed file size!"));
+	if (absoluteOffset < 0 || static_cast<UnsignedInt>(absoluteOffset) > fileSize ||
+		static_cast<UnsignedInt>(dataSize) > fileSize - static_cast<UnsignedInt>(absoluteOffset))
+	{
+		return FALSE;
+	}
+	Bool writeSucceeded = FALSE;
 	if (file->seek(absoluteOffset, File::seekMode::START) == absoluteOffset)
 	{
-		file->write(data, dataSize);
+		writeSucceeded = file->write(data, dataSize) == dataSize;
 	}
 	MAYBE_UNUSED Int res = file->seek(fileSize, File::seekMode::START);
 	(void)res;
 	DEBUG_ASSERTCRASH(res == fileSize, ("Could not seek to end of file!"));
+	return writeSucceeded && res == static_cast<Int>(fileSize);
 }
+
+#if defined(_WIN64)
+static Bool writeNativeReplayU32AtOffset(File *file, Int offset, std::uint32_t value)
+{
+	std::array<rts::replay_command::Byte, 4U> bytes = {{}};
+	writeNativeReplayU32(bytes.data(), value);
+	return writeAtOffset(file, offset, bytes.data(), static_cast<Int>(bytes.size()));
+}
+
+static Bool writeNativeReplayBoolAtOffset(File *file, Int offset, Bool value)
+{
+	const rts::replay_command::Byte byte = value ? 1U : 0U;
+	return writeAtOffset(file, offset, &byte, sizeof(byte));
+}
+#endif
 
 #if defined(RTS_DEBUG)
 static FILE* openStatsLogFile()
@@ -321,7 +648,13 @@ void RecorderClass::logGameStart(AsciiString options)
 
 	time(&startTime);
 	replay_time_t tmp = (replay_time_t)startTime;
+#if defined(_WIN64)
+	if (!writeNativeReplayU32AtOffset(m_file, startTimeOffset,
+		static_cast<std::uint32_t>(static_cast<std::int32_t>(tmp))))
+		m_replayWriteError = TRUE;
+#else
 	writeAtOffset(m_file, startTimeOffset, &tmp, sizeof(tmp));
+#endif
 
 #if defined(RTS_DEBUG)
 	if (TheNetwork && TheGlobalData->m_saveStats)
@@ -354,8 +687,14 @@ void RecorderClass::logPlayerDisconnect(UnicodeString player, Int slot)
 		return;
 	}
 	Bool flag = TRUE;
+#if defined(_WIN64)
+	Int playerSlotDisconOffset = disconOffset + slot;
+	if (!writeNativeReplayBoolAtOffset(m_file, playerSlotDisconOffset, flag))
+		m_replayWriteError = TRUE;
+#else
 	Int playerSlotDisconOffset = disconOffset + slot * sizeof(Bool);
 	writeAtOffset(m_file, playerSlotDisconOffset, &flag, sizeof(flag));
+#endif
 
 #if defined(RTS_DEBUG)
 	if (TheGlobalData->m_saveStats)
@@ -379,7 +718,12 @@ void RecorderClass::logCRCMismatch()
 		return;
 
 	Bool flag = TRUE;
+#if defined(_WIN64)
+	if (!writeNativeReplayBoolAtOffset(m_file, desyncOffset, flag))
+		m_replayWriteError = TRUE;
+#else
 	writeAtOffset(m_file, desyncOffset, &flag, sizeof(flag));
+#endif
 
 #if defined(RTS_DEBUG)
 	if (TheGlobalData->m_saveStats)
@@ -407,8 +751,18 @@ void RecorderClass::logGameEnd()
 	time(&t);
 	UnsignedInt frameCount = TheGameLogic->getFrame();
 	replay_time_t tmp = (replay_time_t)t;
+#if defined(_WIN64)
+	if (!writeNativeReplayU32AtOffset(m_file, endTimeOffset,
+			static_cast<std::uint32_t>(static_cast<std::int32_t>(tmp))) ||
+		!writeNativeReplayU32AtOffset(m_file, frameCountOffset,
+			static_cast<std::uint32_t>(frameCount)))
+	{
+		m_replayWriteError = TRUE;
+	}
+#else
 	writeAtOffset(m_file, endTimeOffset, &tmp, sizeof(tmp));
 	writeAtOffset(m_file, frameCountOffset, &frameCount, sizeof(frameCount));
+#endif
 
 #if defined(RTS_DEBUG)
 	if (TheNetwork && TheGlobalData->m_saveStats)
@@ -515,6 +869,13 @@ RecorderClass::RecorderClass()
 	m_doingAnalysis = FALSE;
 	m_archiveReplays = FALSE;
 	m_nextFrame = 0;
+	m_replayReadError = FALSE;
+	m_replayWriteError = FALSE;
+#if defined(_WIN64)
+	m_nativeReplayContainer = FALSE;
+	m_nativeReplayPayloadEnd = 0;
+	m_nativeReplayRecordBytes = 0U;
+#endif
 	m_wasDesync = FALSE;
 	init(); // just for the heck of it.
 }
@@ -548,6 +909,13 @@ void RecorderClass::init() {
 	m_wasDesync = FALSE;
 	m_doingAnalysis = FALSE;
 	m_playbackFrameCount = 0;
+	m_replayReadError = FALSE;
+	m_replayWriteError = FALSE;
+#if defined(_WIN64)
+	m_nativeReplayContainer = FALSE;
+	m_nativeReplayPayloadEnd = 0;
+	m_nativeReplayRecordBytes = 0U;
+#endif
 	m_skirmishAIReplayEpoch = SKIRMISH_AI_REPLAY_EPOCH_LEGACY;
 	m_pathfindQueueReplayEpoch = PATHFIND_QUEUE_REPLAY_EPOCH_LEGACY;
 
@@ -614,7 +982,11 @@ void RecorderClass::updatePlayback() {
 	// While there are commands to be queued up for this frame, do it.
 	while (m_nextFrame == curFrame) {
 		appendNextCommand();	// append the next command to TheCommandQueue
+		if (m_replayReadError)
+			return;
 		readNextFrame();	// Read the next command's frame number for playback.
+		if (m_replayReadError)
+			return;
 	}
 }
 
@@ -628,6 +1000,11 @@ void RecorderClass::stopPlayback() {
 		m_file = nullptr;
 	}
 	m_fileName.clear();
+	#if defined(_WIN64)
+	m_nativeReplayContainer = FALSE;
+	m_nativeReplayPayloadEnd = 0;
+	m_nativeReplayRecordBytes = 0U;
+	#endif
 
 	if (!m_doingAnalysis)
 	{
@@ -731,39 +1108,69 @@ void RecorderClass::startRecording(GameDifficulty diff, Int originalGameMode, In
 	}
 	#endif
 	m_mode = RECORDERMODETYPE_RECORD;
+	#if defined(_WIN64)
+	Bool nativeHeaderWriteOk = writeNativeReplayExact(m_file, s_genrep, sizeof(s_genrep) - 1U);
+	#else
 	// TheSuperHackers @info the null terminator needs to be ignored to maintain retail replay file layout
 	m_file->writeFormat("%s", s_genrep);
+	#endif
 
 	//
 	// save space for stats to be filled in.
 	//
 	// **** if this changes, change the LAN code above ****
 	//
+	#if defined(_WIN64)
+	nativeHeaderWriteOk = writeNativeReplayU32Field(m_file, 0U) && nativeHeaderWriteOk;
+	nativeHeaderWriteOk = writeNativeReplayU32Field(m_file, 0U) && nativeHeaderWriteOk;
+	#else
 	replay_time_t time = 0;
 	m_file->write(&time, sizeof(time));	// reserve space for start time
 	m_file->write(&time, sizeof(time));	// reserve space for end time
+	#endif
 
+	#if defined(_WIN64)
+	nativeHeaderWriteOk = writeNativeReplayU32Field(m_file, 0U) && nativeHeaderWriteOk;
+	#else
 	UnsignedInt frames = 0;
 	m_file->write(&frames, sizeof(frames));	// reserve space for duration in frames
+	#endif
 
 	Bool flag = FALSE;
+	#if defined(_WIN64)
+	nativeHeaderWriteOk = writeNativeReplayBoolField(m_file, flag) && nativeHeaderWriteOk;
+	nativeHeaderWriteOk = writeNativeReplayBoolField(m_file, flag) && nativeHeaderWriteOk;
+	#else
 	m_file->write(&flag, sizeof(flag));	// reserve space for flag (true if we desync)
 	m_file->write(&flag, sizeof(flag));	// reserve space for flag (true if we quit early)
+	#endif
 	for (Int i=0; i<MAX_SLOTS; ++i)
 	{
+		#if defined(_WIN64)
+		nativeHeaderWriteOk = writeNativeReplayBoolField(m_file, flag) && nativeHeaderWriteOk;
+		#else
 		m_file->write(&flag, sizeof(flag));	// reserve space for flag (true if player i disconnects)
+		#endif
 	}
 
 	// Print out the name of the replay.
 	UnicodeString replayName;
 	replayName = TheGameText->fetch("GUI:LastReplay");
+	#if defined(_WIN64)
+	nativeHeaderWriteOk = writeNativeReplayWideString(m_file, replayName.str()) && nativeHeaderWriteOk;
+	#else
 	m_file->writeFormat(L"%s", replayName.str());
 	m_file->writeChar(L"\0");
+	#endif
 
 	// Date and Time
 	SYSTEMTIME systemTime;
 	GetLocalTime( &systemTime );
+	#if defined(_WIN64)
+	nativeHeaderWriteOk = writeNativeReplaySystemTime(m_file, systemTime) && nativeHeaderWriteOk;
+	#else
 	m_file->write(&systemTime, sizeof(systemTime));
+	#endif
 
 	// write out version info
 	UnicodeString versionString = TheVersion->getUnicodeVersion();
@@ -774,6 +1181,13 @@ void RecorderClass::startRecording(GameDifficulty diff, Int originalGameMode, In
 	MarkReplayVersionForPathfindQueueCurrentEpoch(versionTimeString);
 	MarkReplayVersionForSkirmishAICurrentEpoch(versionTimeString);
 	UnsignedInt versionNumber = TheVersion->getVersionNumber();
+	#if defined(_WIN64)
+	nativeHeaderWriteOk = writeNativeReplayWideString(m_file, versionString.str()) && nativeHeaderWriteOk;
+	nativeHeaderWriteOk = writeNativeReplayWideString(m_file, versionTimeString.str()) && nativeHeaderWriteOk;
+	nativeHeaderWriteOk = writeNativeReplayU32Field(m_file, versionNumber) && nativeHeaderWriteOk;
+	nativeHeaderWriteOk = writeNativeReplayU32Field(m_file, TheGlobalData->m_exeCRC) && nativeHeaderWriteOk;
+	nativeHeaderWriteOk = writeNativeReplayU32Field(m_file, TheGlobalData->m_iniCRC) && nativeHeaderWriteOk;
+	#else
 	m_file->writeFormat(L"%s", versionString.str());
 	m_file->writeChar(L"\0");
 	m_file->writeFormat(L"%s", versionTimeString.str());
@@ -781,6 +1195,7 @@ void RecorderClass::startRecording(GameDifficulty diff, Int originalGameMode, In
 	m_file->write(&versionNumber, sizeof(versionNumber));
 	m_file->write(&(TheGlobalData->m_exeCRC), sizeof(TheGlobalData->m_exeCRC));
 	m_file->write(&(TheGlobalData->m_iniCRC), sizeof(TheGlobalData->m_iniCRC));
+	#endif
 
 	// Number of players
 	/*
@@ -834,11 +1249,18 @@ void RecorderClass::startRecording(GameDifficulty diff, Int originalGameMode, In
 	DEBUG_LOG(("RecorderClass::startRecording - theSlotList = %s", theSlotList.str()));
 
 	// write slot list (starting spots, color, alliances, etc
+	#if defined(_WIN64)
+	nativeHeaderWriteOk = writeNativeReplayAsciiString(m_file, theSlotList.str()) && nativeHeaderWriteOk;
+	AsciiString localIndexString;
+	localIndexString.format("%d", localIndex);
+	nativeHeaderWriteOk = writeNativeReplayAsciiString(m_file, localIndexString.str()) && nativeHeaderWriteOk;
+	#else
 	m_file->writeFormat("%s", theSlotList.str());
 	m_file->writeChar("\0");
 
 	m_file->writeFormat("%d", localIndex);
 	m_file->writeChar("\0");
+	#endif
 
 	/*
 	/// @todo fix this to use starting spots and player alliances when those are put in the game.
@@ -863,6 +1285,21 @@ void RecorderClass::startRecording(GameDifficulty diff, Int originalGameMode, In
 	*/
 
 	// Write the game difficulty.
+	#if defined(_WIN64)
+	nativeHeaderWriteOk = writeNativeReplayU32Field(m_file,
+		static_cast<std::uint32_t>(static_cast<std::int32_t>(diff))) && nativeHeaderWriteOk;
+	nativeHeaderWriteOk = writeNativeReplayU32Field(m_file,
+		static_cast<std::uint32_t>(originalGameMode)) && nativeHeaderWriteOk;
+	nativeHeaderWriteOk = writeNativeReplayU32Field(m_file,
+		static_cast<std::uint32_t>(rankPoints)) && nativeHeaderWriteOk;
+	nativeHeaderWriteOk = writeNativeReplayU32Field(m_file,
+		static_cast<std::uint32_t>(maxFPS)) && nativeHeaderWriteOk;
+	if (!nativeHeaderWriteOk)
+	{
+		m_replayWriteError = TRUE;
+		DEBUG_LOG(("RecorderClass::startRecording - failed to write canonical replay fields"));
+	}
+	#else
 	m_file->write(&diff, sizeof(diff));
 
 	// Write original game mode
@@ -873,6 +1310,7 @@ void RecorderClass::startRecording(GameDifficulty diff, Int originalGameMode, In
 
 	// Write maxFPS chosen
 	m_file->write(&maxFPS, sizeof(maxFPS));
+	#endif
 
 	DEBUG_LOG(("RecorderClass::startRecording() - diff=%d, mode=%d, FPS=%d", diff, originalGameMode, maxFPS));
 
@@ -891,9 +1329,9 @@ void RecorderClass::startRecording(GameDifficulty diff, Int originalGameMode, In
  */
 void RecorderClass::stopRecording() {
 	logGameEnd();
-	Bool replayFinalized = TRUE;
+	Bool replayFinalized = !m_replayWriteError;
 	#if defined(_WIN64)
-	if (m_file != nullptr)
+	if (replayFinalized && m_file != nullptr)
 	{
 		replayFinalized = finalizeNativeReplayContainer(m_file);
 		if (!replayFinalized)
@@ -962,6 +1400,17 @@ void RecorderClass::archiveReplay(AsciiString fileName)
  * Write this game message to the record file. This also writes the game message's execution frame.
  */
 void RecorderClass::writeToFile(GameMessage * msg) {
+#if defined(_WIN64)
+	std::array<rts::replay_command::Byte, rts::replay_command::kMaxReplayCommandBytes> record = {{}};
+	std::size_t recordBytes = 0U;
+	if (!buildNativeReplayCommand(msg, record, &recordBytes) || m_file == nullptr ||
+		m_file->write(record.data(), static_cast<Int>(recordBytes)) != static_cast<Int>(recordBytes))
+	{
+		m_replayWriteError = TRUE;
+		DEBUG_LOG(("RecorderClass::writeToFile - failed to write canonical replay command"));
+	}
+	return;
+#else
 	// Write the frame number for this command.
 	UnsignedInt frame = TheGameLogic->getFrame();
 	m_file->write(&frame, sizeof(frame));
@@ -1016,7 +1465,7 @@ void RecorderClass::writeToFile(GameMessage * msg) {
 
 	deleteInstance(parser);
 	parser = nullptr;
-
+#endif
 }
 
 void RecorderClass::writeArgument(GameMessageArgumentDataType type, const GameMessageArgumentType arg) {
@@ -1082,13 +1531,12 @@ Bool RecorderClass::readReplayHeader(ReplayHeader& header)
 	}
 
 	#if defined(_WIN64)
-	if (!validateNativeReplayContainer(m_file))
+	if (!validateNativeReplayContainer(m_file, &m_nativeReplayPayloadEnd))
 	{
 		DEBUG_LOG(("RecorderClass::readReplayHeader - invalid RPL3 replay container"));
-		m_file->close();
-		m_file = nullptr;
-		return FALSE;
+		return failReplayHeaderRead();
 	}
+	m_nativeReplayContainer = TRUE;
 	#endif
 
 	// Read the GENREP header.
@@ -1096,67 +1544,91 @@ Bool RecorderClass::readReplayHeader(ReplayHeader& header)
 	if (!readExact(&genrep, sizeof(genrep)) ||
 		strncmp(genrep, s_genrep, sizeof(s_genrep) - 1 ) != 0 ) {
 		DEBUG_LOG(("RecorderClass::readReplayHeader - replay file did not have GENREP at the start."));
-		m_file->close();
-		m_file = nullptr;
-		return FALSE;
+		return failReplayHeaderRead();
 	}
 
 	// read in some stats
 	replay_time_t tmp;
+	#if defined(_WIN64)
+	std::uint32_t nativeValue = 0U;
+	if (!readNativeReplayU32Field(m_file, &nativeValue))
+	#else
 	if (!readExact(&tmp, sizeof(tmp)))
+	#endif
 	{
 		DEBUG_LOG(("RecorderClass::readReplayHeader - replay statistics are truncated."));
-		m_file->close();
-		m_file = nullptr;
-		return FALSE;
+		return failReplayHeaderRead();
 	}
+	#if defined(_WIN64)
+	tmp = static_cast<replay_time_t>(static_cast<std::int32_t>(nativeValue));
+	#endif
 	header.startTime = tmp;
+	#if defined(_WIN64)
+	if (!readNativeReplayU32Field(m_file, &nativeValue))
+	#else
 	if (!readExact(&tmp, sizeof(tmp)))
+	#endif
 	{
 		DEBUG_LOG(("RecorderClass::readReplayHeader - replay statistics are truncated."));
-		m_file->close();
-		m_file = nullptr;
-		return FALSE;
+		return failReplayHeaderRead();
 	}
+	#if defined(_WIN64)
+	tmp = static_cast<replay_time_t>(static_cast<std::int32_t>(nativeValue));
+	#endif
 	header.endTime = tmp;
 
+	#if defined(_WIN64)
+	Bool fixedFieldsValid = readNativeReplayU32Field(m_file, &nativeValue);
+	header.frameCount = nativeValue;
+	fixedFieldsValid = readNativeReplayBoolField(m_file, &header.desyncGame) && fixedFieldsValid;
+	fixedFieldsValid = readNativeReplayBoolField(m_file, &header.quitEarly) && fixedFieldsValid;
+	#else
 	Bool fixedFieldsValid = readExact(&header.frameCount, sizeof(header.frameCount)) &&
 		readExact(&header.desyncGame, sizeof(header.desyncGame)) &&
 		readExact(&header.quitEarly, sizeof(header.quitEarly));
+	#endif
 	for (Int i=0; i<MAX_SLOTS; ++i)
 	{
+		#if defined(_WIN64)
+		if (!readNativeReplayBoolField(m_file, &(header.playerDiscons[i])))
+		#else
 		if (!readExact(&(header.playerDiscons[i]), sizeof(Bool)))
+		#endif
 			fixedFieldsValid = FALSE;
 	}
 	if (!fixedFieldsValid)
 	{
 		DEBUG_LOG(("RecorderClass::readReplayHeader - replay statistics are truncated."));
-		m_file->close();
-		m_file = nullptr;
-		return FALSE;
+		return failReplayHeaderRead();
 	}
 
 	// Read the Replay Name.  We don't actually do anything with it.  Oh well.
 	if (!readUnicodeString(header.replayName))
 	{
 		DEBUG_LOG(("RecorderClass::readReplayHeader - replay name is malformed."));
-		m_file->close();
-		m_file = nullptr;
-		return FALSE;
+		return failReplayHeaderRead();
 	}
 
 	// Read the date and time.  We don't really do anything with this either. Oh well.
-	if (!readExact(&header.timeVal, sizeof(header.timeVal)) ||
-		!readUnicodeString(header.versionString) ||
-		!readUnicodeString(header.versionTimeString) ||
-		!readExact(&header.versionNumber, sizeof(header.versionNumber)) ||
-		!readExact(&header.exeCRC, sizeof(header.exeCRC)) ||
-		!readExact(&header.iniCRC, sizeof(header.iniCRC)))
+	#if defined(_WIN64)
+	Bool versionFieldsValid = readNativeReplaySystemTime(m_file, &header.timeVal) &&
+		readUnicodeString(header.versionString) &&
+		readUnicodeString(header.versionTimeString) &&
+		readNativeReplayU32Field(m_file, &header.versionNumber) &&
+		readNativeReplayU32Field(m_file, &header.exeCRC) &&
+		readNativeReplayU32Field(m_file, &header.iniCRC);
+	#else
+	Bool versionFieldsValid = readExact(&header.timeVal, sizeof(header.timeVal)) &&
+		readUnicodeString(header.versionString) &&
+		readUnicodeString(header.versionTimeString) &&
+		readExact(&header.versionNumber, sizeof(header.versionNumber)) &&
+		readExact(&header.exeCRC, sizeof(header.exeCRC)) &&
+		readExact(&header.iniCRC, sizeof(header.iniCRC));
+	#endif
+	if (!versionFieldsValid)
 	{
 		DEBUG_LOG(("RecorderClass::readReplayHeader - replay version fields are malformed."));
-		m_file->close();
-		m_file = nullptr;
-		return FALSE;
+		return failReplayHeaderRead();
 	}
 
 	// Read in the Version info
@@ -1164,9 +1636,7 @@ Bool RecorderClass::readReplayHeader(ReplayHeader& header)
 	if (!readAsciiString(header.gameOptions) || !readAsciiString(playerIndex))
 	{
 		DEBUG_LOG(("RecorderClass::readReplayHeader - replay game fields are malformed."));
-		m_file->close();
-		m_file = nullptr;
-		return FALSE;
+		return failReplayHeaderRead();
 	}
 	char *playerIndexEnd = nullptr;
 	const long parsedPlayerIndex = strtol(playerIndex.str(), &playerIndexEnd, 10);
@@ -1174,9 +1644,7 @@ Bool RecorderClass::readReplayHeader(ReplayHeader& header)
 		parsedPlayerIndex < -1 || parsedPlayerIndex >= MAX_SLOTS)
 	{
 		DEBUG_LOG(("RecorderClass::readReplayHeader - invalid local slot number."));
-		m_file->close();
-		m_file = nullptr;
-		return FALSE;
+		return failReplayHeaderRead();
 	}
 	header.localPlayerIndex = static_cast<Int>(parsedPlayerIndex);
 
@@ -1187,13 +1655,11 @@ Bool RecorderClass::readReplayHeader(ReplayHeader& header)
 	if (!ParseAsciiStringToGameInfo(&m_gameInfo, header.gameOptions))
 	{
 		DEBUG_LOG(("RecorderClass::readReplayHeader - replay file did not have a valid GameInfo string."));
-		m_file->close();
-		m_file = nullptr;
-		return FALSE;
+		return failReplayHeaderRead();
 	}
 	m_gameInfo.startGame(0);
 
-	if (header.localPlayerIndex >= 0)
+	if (header.localPlayerIndex >= 0 && header.localPlayerIndex < MAX_SLOTS)
 	{
 		Int localIP = m_gameInfo.getSlot(header.localPlayerIndex)->getIP();
 		m_gameInfo.setLocalIP(localIP);
@@ -1205,6 +1671,11 @@ Bool RecorderClass::readReplayHeader(ReplayHeader& header)
 		m_gameInfo.reset();
 		m_file->close();
 		m_file = nullptr;
+		#if defined(_WIN64)
+		m_nativeReplayContainer = FALSE;
+		m_nativeReplayPayloadEnd = 0;
+		m_nativeReplayRecordBytes = 0U;
+		#endif
 	}
 
 	return TRUE;
@@ -1213,9 +1684,9 @@ Bool RecorderClass::readReplayHeader(ReplayHeader& header)
 Bool RecorderClass::simulateReplay(AsciiString filename)
 {
 	Bool success = playbackFile(filename);
-	if (success)
+	if (success && !m_replayReadError)
 		m_mode = RECORDERMODETYPE_SIMULATION_PLAYBACK;
-	return success;
+	return success && !m_replayReadError;
 }
 
 #if defined(RTS_DEBUG)
@@ -1346,6 +1817,11 @@ Bool RecorderClass::replayMatchesGameVersion(const ReplayHeader& header)
  */
 Bool RecorderClass::playbackFile(AsciiString filename)
 {
+	m_replayReadError = FALSE;
+#if defined(_WIN64)
+	m_nativeReplayContainer = FALSE;
+	m_nativeReplayRecordBytes = 0U;
+#endif
 	m_skirmishAIReplayEpoch = SKIRMISH_AI_REPLAY_EPOCH_LEGACY;
 	m_pathfindQueueReplayEpoch = PATHFIND_QUEUE_REPLAY_EPOCH_LEGACY;
 
@@ -1440,17 +1916,31 @@ Bool RecorderClass::playbackFile(AsciiString filename)
 	Int difficulty = 0;
 	Int rankPoints = 0;
 	Int maxFPS = 0;
-	if (!readExact(&difficulty, sizeof(difficulty)) ||
-		!readExact(&m_originalGameMode, sizeof(m_originalGameMode)) ||
-		!readExact(&rankPoints, sizeof(rankPoints)) ||
-		!readExact(&maxFPS, sizeof(maxFPS)))
+	#if defined(_WIN64)
+	std::uint32_t difficultyWire = 0U;
+	std::uint32_t gameModeWire = 0U;
+	std::uint32_t rankPointsWire = 0U;
+	std::uint32_t maxFPSWire = 0U;
+	Bool launchFieldsValid = readNativeReplayU32Field(m_file, &difficultyWire) &&
+		readNativeReplayU32Field(m_file, &gameModeWire) &&
+		readNativeReplayU32Field(m_file, &rankPointsWire) &&
+		readNativeReplayU32Field(m_file, &maxFPSWire);
+	difficulty = static_cast<Int>(static_cast<std::int32_t>(difficultyWire));
+	m_originalGameMode = static_cast<Int>(static_cast<std::int32_t>(gameModeWire));
+	rankPoints = static_cast<Int>(static_cast<std::int32_t>(rankPointsWire));
+	maxFPS = static_cast<Int>(static_cast<std::int32_t>(maxFPSWire));
+	#else
+	Bool launchFieldsValid = readExact(&difficulty, sizeof(difficulty)) &&
+		readExact(&m_originalGameMode, sizeof(m_originalGameMode)) &&
+		readExact(&rankPoints, sizeof(rankPoints)) &&
+		readExact(&maxFPS, sizeof(maxFPS));
+	#endif
+	if (!launchFieldsValid)
 	{
 		DEBUG_LOG(("RecorderClass::playbackFile - replay launch fields are truncated."));
 		m_gameInfo.endGame();
 		m_gameInfo.reset();
-		m_file->close();
-		m_file = nullptr;
-		return FALSE;
+		return failReplayHeaderRead();
 	}
 
 #ifdef DEBUG_LOGGING
@@ -1461,8 +1951,12 @@ Bool RecorderClass::playbackFile(AsciiString filename)
 	}
 #endif
 
-	Bool isMultiplayer = m_gameInfo.getSlot(header.localPlayerIndex)->getIP() != 0;
-	m_crcInfo = CRCInfo(header.localPlayerIndex, isMultiplayer);
+	const Int safeLocalPlayer = (header.localPlayerIndex >= 0 && header.localPlayerIndex < MAX_SLOTS)
+		? header.localPlayerIndex
+		: 0;
+	const Bool isMultiplayer = header.localPlayerIndex >= 0 && header.localPlayerIndex < MAX_SLOTS &&
+		m_gameInfo.getSlot(header.localPlayerIndex)->getIP() != 0;
+	m_crcInfo = CRCInfo(static_cast<UnsignedInt>(safeLocalPlayer), isMultiplayer);
 	REPLAY_CRC_INTERVAL = m_gameInfo.getCRCInterval();
 	DEBUG_LOG(("Player index is %d, replay CRC interval is %d", m_crcInfo.getLocalPlayer(), REPLAY_CRC_INTERVAL));
 
@@ -1514,12 +2008,46 @@ Bool RecorderClass::readExact(void *data, Int dataSize)
 	return m_file != nullptr && rts::replay::ReadExact(*m_file, data, dataSize);
 }
 
+Bool RecorderClass::failReplayHeaderRead()
+{
+	if (m_file != nullptr)
+	{
+		m_file->close();
+		m_file = nullptr;
+	}
+#if defined(_WIN64)
+	m_nativeReplayContainer = FALSE;
+	m_nativeReplayPayloadEnd = 0;
+	m_nativeReplayRecordBytes = 0U;
+#endif
+	return FALSE;
+}
+
 /**
  * Read a bounded, null-terminated Unicode string from the current file position.
  */
 Bool RecorderClass::readUnicodeString(UnicodeString &value)
 {
 	WideChar str[1024] = L"";
+	#if defined(_WIN64)
+	for (std::size_t i = 0U; i < ARRAY_SIZE(str); ++i)
+	{
+		std::uint16_t character = 0U;
+		if (!readNativeReplayU16Field(m_file, &character))
+		{
+			value.clear();
+			return FALSE;
+		}
+		str[i] = static_cast<WideChar>(character);
+		if (character == 0U)
+		{
+			value = str;
+			return TRUE;
+		}
+	}
+	value.clear();
+	return FALSE;
+	#else
 	if (m_file == nullptr || !rts::replay::ReadWideString(*m_file, str, ARRAY_SIZE(str)))
 	{
 		value.clear();
@@ -1527,6 +2055,7 @@ Bool RecorderClass::readUnicodeString(UnicodeString &value)
 	}
 	value = str;
 	return TRUE;
+	#endif
 }
 
 /**
@@ -1544,11 +2073,193 @@ Bool RecorderClass::readAsciiString(AsciiString &value)
 	return TRUE;
 }
 
+#if defined(_WIN64)
+void RecorderClass::failNativeReplayRead(rts::replay_command::ReplayCommandError error, Int offset)
+{
+	if (m_replayReadError)
+		return;
+	m_replayReadError = TRUE;
+	m_nextFrame = static_cast<UnsignedInt>(-1);
+	DEBUG_LOG(("REPLAY_FAIL reason=malformed_command offset=%d code=%d", offset, static_cast<Int>(error)));
+	stopPlayback();
+}
+
+Bool RecorderClass::readNativeReplayArgument(rts::replay_command::ReplayArgumentType type,
+	const rts::replay_command::Byte *payload,
+	std::size_t payloadSize,
+	std::size_t &payloadOffset,
+	GameMessage *message)
+{
+	if (payload == nullptr || message == nullptr || payloadOffset > payloadSize)
+		return FALSE;
+	const std::size_t byteCount = rts::replay_command::GetReplayArgumentWireSize(type);
+	if (byteCount == 0U || byteCount > payloadSize - payloadOffset)
+		return FALSE;
+	const rts::replay_command::Byte *value = payload + payloadOffset;
+	const std::uint32_t u32 = byteCount >= 4U ? readNativeReplayU32(value) : 0U;
+	std::uint32_t bits = 0U;
+	Real realValue = 0.0f;
+	switch (type)
+	{
+	case rts::replay_command::ReplayArgumentType::Integer:
+		message->appendIntegerArgument(static_cast<Int>(u32));
+		break;
+	case rts::replay_command::ReplayArgumentType::Real:
+		bits = u32;
+		std::memcpy(&realValue, &bits, sizeof(realValue));
+		message->appendRealArgument(realValue);
+		break;
+	case rts::replay_command::ReplayArgumentType::Boolean:
+		if (value[0] > 1U)
+			return FALSE;
+		message->appendBooleanArgument(value[0] != 0U);
+		break;
+	case rts::replay_command::ReplayArgumentType::ObjectId:
+		message->appendObjectIDArgument(static_cast<ObjectID>(u32));
+		break;
+	case rts::replay_command::ReplayArgumentType::DrawableId:
+		message->appendDrawableIDArgument(static_cast<DrawableID>(u32));
+		break;
+	case rts::replay_command::ReplayArgumentType::TeamId:
+		message->appendTeamIDArgument(u32);
+		break;
+	case rts::replay_command::ReplayArgumentType::Location:
+	{
+		Coord3D location;
+		bits = readNativeReplayU32(value); std::memcpy(&location.x, &bits, sizeof(location.x));
+		bits = readNativeReplayU32(value + 4U); std::memcpy(&location.y, &bits, sizeof(location.y));
+		bits = readNativeReplayU32(value + 8U); std::memcpy(&location.z, &bits, sizeof(location.z));
+		message->appendLocationArgument(location);
+		break;
+	}
+	case rts::replay_command::ReplayArgumentType::Pixel:
+	{
+		ICoord2D pixel;
+		pixel.x = static_cast<Int>(readNativeReplayU32(value));
+		pixel.y = static_cast<Int>(readNativeReplayU32(value + 4U));
+		message->appendPixelArgument(pixel);
+		break;
+	}
+	case rts::replay_command::ReplayArgumentType::PixelRegion:
+	{
+		IRegion2D region;
+		region.lo.x = static_cast<Int>(readNativeReplayU32(value));
+		region.lo.y = static_cast<Int>(readNativeReplayU32(value + 4U));
+		region.hi.x = static_cast<Int>(readNativeReplayU32(value + 8U));
+		region.hi.y = static_cast<Int>(readNativeReplayU32(value + 12U));
+		message->appendPixelRegionArgument(region);
+		break;
+	}
+	case rts::replay_command::ReplayArgumentType::Timestamp:
+		message->appendTimestampArgument(u32);
+		break;
+	case rts::replay_command::ReplayArgumentType::WideChar:
+		message->appendWideCharArgument(static_cast<WideChar>(readNativeReplayU16(value)));
+		break;
+	default:
+		return FALSE;
+	}
+	payloadOffset += byteCount;
+	return TRUE;
+}
+
+Bool RecorderClass::appendNativeReplayCommand()
+{
+	if (!m_nativeReplayParsed.ok())
+		return FALSE;
+	const rts::replay_command::ReplayCommandView &view = m_nativeReplayParsed.view;
+	GameMessage *message = newInstance(GameMessage)(static_cast<GameMessage::Type>(view.messageType));
+	message->friend_setPlayerIndex(view.playerIndex);
+	std::size_t payloadOffset = 0U;
+	for (std::uint8_t i = 0U; i < view.descriptorCount; ++i)
+	{
+		for (std::uint16_t j = 0U; j < view.descriptors[i].argumentCount; ++j)
+		{
+			if (!readNativeReplayArgument(view.descriptors[i].argumentType,
+				view.payload.data(), view.payload.size(), payloadOffset, message))
+			{
+				deleteInstance(message);
+				failNativeReplayRead(rts::replay_command::ReplayCommandError::PayloadSizeMismatch,
+					m_file != nullptr ? m_file->position() : 0);
+				return FALSE;
+			}
+		}
+	}
+	if (payloadOffset != view.payload.size())
+	{
+		deleteInstance(message);
+		failNativeReplayRead(rts::replay_command::ReplayCommandError::PayloadSizeMismatch,
+			m_file != nullptr ? m_file->position() : 0);
+		return FALSE;
+	}
+	if (view.messageType != static_cast<std::int32_t>(GameMessage::MSG_CLEAR_GAME_DATA) &&
+		view.messageType != static_cast<std::int32_t>(GameMessage::MSG_BEGIN_NETWORK_MESSAGES) &&
+		!m_doingAnalysis)
+		TheCommandList->appendMessage(message);
+	else
+		deleteInstance(message);
+	return TRUE;
+}
+#endif
+
 /**
  * Read the frame number for the next command in the playback file. If the end of the file is reached, the playback
  * is stopped and the next frame is said to be -1.
  */
 void RecorderClass::readNextFrame() {
+#if defined(_WIN64)
+	if (m_nativeReplayContainer)
+	{
+		if (m_file == nullptr)
+			return;
+		const Int start = m_file->position();
+		if (start == m_nativeReplayPayloadEnd)
+		{
+			m_nextFrame = static_cast<UnsignedInt>(-1);
+			stopPlayback();
+			return;
+		}
+		if (start < kNativeReplayPayloadBase || start > m_nativeReplayPayloadEnd)
+		{
+			failNativeReplayRead(rts::replay_command::ReplayCommandError::InvalidLength, start);
+			return;
+		}
+		std::array<rts::replay_command::Byte, sizeof(std::uint32_t)> prefix = {{}};
+		if (m_file->read(prefix.data(), static_cast<Int>(prefix.size())) != static_cast<Int>(prefix.size()))
+		{
+			failNativeReplayRead(rts::replay_command::ReplayCommandError::Truncated, start);
+			return;
+		}
+		const std::uint32_t recordBytes = readNativeReplayU32(prefix.data());
+		if (recordBytes < rts::replay_command::kCanonicalReplayCommandHeaderBytes ||
+			recordBytes > rts::replay_command::kMaxReplayCommandBytes ||
+			recordBytes > static_cast<std::uint32_t>(m_nativeReplayPayloadEnd - start))
+		{
+			failNativeReplayRead(recordBytes > rts::replay_command::kMaxReplayCommandBytes
+				? rts::replay_command::ReplayCommandError::TooLarge
+				: rts::replay_command::ReplayCommandError::InvalidLength, start);
+			return;
+		}
+		for (std::size_t i = 0U; i < prefix.size(); ++i)
+			m_nativeReplayRecord[i] = prefix[i];
+		const Int remaining = static_cast<Int>(recordBytes - prefix.size());
+		if (m_file->read(m_nativeReplayRecord.data() + prefix.size(), remaining) != remaining)
+		{
+			failNativeReplayRead(rts::replay_command::ReplayCommandError::Truncated, start);
+			return;
+		}
+		m_nativeReplayRecordBytes = recordBytes;
+		m_nativeReplayParsed = rts::replay_command::ParseCanonicalReplayCommand(
+			m_nativeReplayRecord.data(), m_nativeReplayRecordBytes);
+		if (!m_nativeReplayParsed.ok())
+		{
+			failNativeReplayRead(m_nativeReplayParsed.error, start);
+			return;
+		}
+		m_nextFrame = m_nativeReplayParsed.view.frame;
+		return;
+	}
+#endif
 	Int bytesRead = m_file->read(&m_nextFrame, sizeof(m_nextFrame));
 	if (bytesRead != sizeof(m_nextFrame)) {
 		DEBUG_LOG(("RecorderClass::readNextFrame - read failed on frame %d", TheGameLogic->getFrame()));
@@ -1561,6 +2272,13 @@ void RecorderClass::readNextFrame() {
  * This reads the next command from the replay file and appends it to TheCommandList.
  */
 void RecorderClass::appendNextCommand() {
+#if defined(_WIN64)
+	if (m_nativeReplayContainer)
+	{
+		appendNativeReplayCommand();
+		return;
+	}
+#endif
 	GameMessage::Type type;
 	Int bytesRead = m_file->read(&type, sizeof(type));
 	if (bytesRead != sizeof(type)) {

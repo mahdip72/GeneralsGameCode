@@ -38,6 +38,9 @@
 #include "Common/PlayerList.h"
 #include "GameNetwork/NetworkInterface.h"
 #include "GameNetwork/NetCommandValidation.h"
+#if defined(_WIN64)
+#include "Lib/NetworkEpochHandshake.h"
+#endif
 #include "GameNetwork/udp.h"
 #include "GameNetwork/Transport.h"
 #include "WWLib/strtok_r.h"
@@ -747,6 +750,15 @@ void Network::update()
 	}
 
 	liteupdate();
+
+#if defined(_WIN64)
+	if (!rts::network_epoch::IsNetworkFramePublicationAllowed(
+		m_networkHelloFailureHandled,
+		m_conMgr != nullptr && m_conMgr->hasNetworkHelloFailure()))
+	{
+		return;
+	}
+#endif
 
 	if (m_localStatus == NETLOCALSTATUS_LEFT) {// || (m_localStatus == NETLOCALSTATUS_LEAVING)) {
 		endOfGameCheck();

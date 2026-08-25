@@ -18,6 +18,13 @@ endif()
 # Add main build targets
 add_subdirectory(Code)
 
+if(TARGET z_launcher)
+    set(_RTS_GENERATED_LAUNCHER_LCF_ZEROHOUR
+        "${CMAKE_CURRENT_BINARY_DIR}/launcher.lcf")
+    rts_generate_launcher_lcf(z_generals
+        "${_RTS_GENERATED_LAUNCHER_LCF_ZEROHOUR}")
+endif()
+
 # Keep registry discovery isolated from the user-controlled install prefix.
 # Only the legacy Win32 path may use the registry value as a fallback.
 set(_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR "${RTS_INSTALL_PREFIX_ZEROHOUR}")
@@ -69,15 +76,19 @@ if(_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR)
             DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}")
     endif()
 
-    if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND RTS_NATIVE_MSVC_RUNTIME_DLLS)
-        install(FILES ${RTS_NATIVE_MSVC_RUNTIME_DLLS}
-            DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}")
+    if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND RTS_NATIVE_MSVC_RUNTIME_DLLS_RELEASE)
+        install(FILES ${RTS_NATIVE_MSVC_RUNTIME_DLLS_RELEASE}
+            DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}"
+            CONFIGURATIONS Release RelWithDebInfo MinSizeRel)
     endif()
 
-    if(RTS_BUILD_OPTION_ASAN AND RTS_NATIVE_ASAN_RUNTIME_DLLS)
-        install(FILES ${RTS_NATIVE_ASAN_RUNTIME_DLLS}
-            DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}")
+    if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND RTS_NATIVE_MSVC_RUNTIME_DLLS_DEBUG)
+        install(FILES ${RTS_NATIVE_MSVC_RUNTIME_DLLS_DEBUG}
+            DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}"
+            CONFIGURATIONS Debug)
     endif()
+
+    rts_install_asan_runtime("${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}")
 
     if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND TARGET d3d8to9)
         install(TARGETS d3d8to9
@@ -94,7 +105,8 @@ if(_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR)
     if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND TARGET z_launcher)
         install(TARGETS z_launcher RUNTIME DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}")
         install(FILES $<TARGET_PDB_FILE:z_launcher> DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}" OPTIONAL)
-        install(FILES launcher.lcf DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}")
+        install(FILES "${_RTS_GENERATED_LAUNCHER_LCF_ZEROHOUR}"
+            DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}")
     endif()
 
     # Keep the native runtime-test utility with the disposable x64 product
