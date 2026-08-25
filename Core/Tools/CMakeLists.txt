@@ -250,6 +250,14 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
 endif()
 
 if(WIN32)
+    if(NOT IS_VS6_BUILD)
+        add_test(NAME core_windows_sdk_tool_discovery_test
+            COMMAND "${CMAKE_COMMAND}"
+                -DRTS_SOURCE_ROOT=${CMAKE_SOURCE_DIR}
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/WindowsSdkToolDiscoveryTest/WindowsSdkToolDiscoveryTest.cmake"
+        )
+        set_tests_properties(core_windows_sdk_tool_discovery_test PROPERTIES TIMEOUT 30)
+    endif()
     add_test(NAME core_video_backend_selection_audit
         COMMAND powershell -NoProfile -ExecutionPolicy Bypass
             -File "${CMAKE_CURRENT_SOURCE_DIR}/VideoBackendSelectionAudit/VideoBackendSelectionAudit.ps1"

@@ -21,3 +21,11 @@ endif()
 if(RTS_BUILD_GENERALS_EXTRAS OR (CMAKE_SIZEOF_VOID_P EQUAL 8 AND RTS_BUILD_PRODUCT))
     add_subdirectory(Launcher)
 endif()
+
+# Exercise the shared native runtime contracts through the Generals title
+# graph as well as Zero Hour. The utility remains outside the legacy Win32
+# product so the retail differential-oracle dependencies stay unchanged.
+if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND
+        (RTS_BUILD_GENERALS_EXTRAS OR RTS_BUILD_PRODUCT))
+    add_subdirectory(RuntimeRegressionTests)
+endif()

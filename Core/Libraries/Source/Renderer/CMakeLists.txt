@@ -8,7 +8,8 @@ add_library(core_renderer STATIC
 )
 
 if(WIN32 AND NOT IS_VS6_BUILD)
-    find_program(RTS_FXC_EXECUTABLE NAMES fxc.exe fxc REQUIRED)
+    include(windows-sdk-tools)
+    rts_find_windows_sdk_program(RTS_FXC_EXECUTABLE NAMES fxc.exe fxc)
     set(renderer_generated_dir "${CMAKE_CURRENT_BINARY_DIR}/Generated")
     set(renderer_shader_source "${CMAKE_CURRENT_SOURCE_DIR}/Shaders/LegacyFixedFunction.hlsl")
     set(renderer_vertex_shader_header "${renderer_generated_dir}/LegacyFixedFunctionVS.h")
