@@ -11,6 +11,9 @@ endif()
 
 # Set where the build results will end up
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+if(COMMAND rts_stage_asan_runtime)
+    rts_stage_asan_runtime("${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+endif()
 
 # Add main build targets
 add_subdirectory(Code)
@@ -68,6 +71,11 @@ if(_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR)
 
     if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND RTS_NATIVE_MSVC_RUNTIME_DLLS)
         install(FILES ${RTS_NATIVE_MSVC_RUNTIME_DLLS}
+            DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}")
+    endif()
+
+    if(RTS_BUILD_OPTION_ASAN AND RTS_NATIVE_ASAN_RUNTIME_DLLS)
+        install(FILES ${RTS_NATIVE_ASAN_RUNTIME_DLLS}
             DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}")
     endif()
 

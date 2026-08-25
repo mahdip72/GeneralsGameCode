@@ -44,6 +44,7 @@ include(cmake/debug_strip.cmake)
 include(FetchContent)
 
 include(cmake/config.cmake)
+include(cmake/asan.cmake)
 
 # MinGW-w64 specific configuration
 if(MINGW)
@@ -119,6 +120,15 @@ endif()
 
 if(RTS_BUILD_PRODUCT AND RTS_BUILD_GENERALS)
     add_subdirectory(Generals)
+endif()
+
+if(RTS_BUILD_OPTION_ASAN AND MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    add_test(NAME core_asan_runtime_deployment_audit
+        COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_SOURCE_DIR}/Core/Tools/AsanRuntimeAudit/AsanRuntimeDeploymentAudit.ps1"
+            -BuildRoot "${CMAKE_BINARY_DIR}"
+            -RuntimeDll "${RTS_NATIVE_ASAN_RUNTIME_DLLS}")
+    set_tests_properties(core_asan_runtime_deployment_audit PROPERTIES TIMEOUT 30)
 endif()
 
 feature_summary(WHAT ENABLED_FEATURES DESCRIPTION "Enabled features:")

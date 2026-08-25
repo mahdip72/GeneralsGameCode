@@ -37,6 +37,9 @@ target_link_libraries(corei_always_no_pch INTERFACE
 
 # Set where the build results will end up
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+if(COMMAND rts_stage_asan_runtime)
+    rts_stage_asan_runtime("${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+endif()
 
 # Contains internal libraries
 add_subdirectory(Libraries)
