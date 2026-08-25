@@ -221,6 +221,7 @@
             "displayName": "Unix Device-Free VCPKG Release",
             "cacheVariables": {
                 "RTS_BUILD_PRODUCT": "OFF",
+                "RTS_BUILD_CORE_TOOLS": "OFF",
                 "RTS_BUILD_CORE_EXTRAS": "OFF",
                 "RTS_BUILD_GENERALS": "OFF",
                 "RTS_BUILD_ZEROHOUR": "OFF"

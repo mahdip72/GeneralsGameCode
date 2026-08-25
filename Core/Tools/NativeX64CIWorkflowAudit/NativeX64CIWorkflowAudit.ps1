@@ -187,6 +187,7 @@ function Test-NativeX64CMakeContract {
     }
     foreach ($optionName in @(
         'RTS_BUILD_PRODUCT',
+        'RTS_BUILD_CORE_TOOLS',
         'RTS_BUILD_CORE_EXTRAS',
         'RTS_BUILD_GENERALS',
         'RTS_BUILD_ZEROHOUR'
@@ -296,7 +297,7 @@ if: inputs.game == 'Generals' && inputs.preset == 'x64-vcpkg'
           if-no-files-found: error
 '@
     $goodPresets = @'
-{"configurePresets":[{"name":"x64-vcpkg","inherits":["x64","default-vcpkg"]},{"name":"unix","cacheVariables":{"RTS_BUILD_PRODUCT":"OFF","RTS_BUILD_CORE_EXTRAS":"OFF","RTS_BUILD_GENERALS":"OFF","RTS_BUILD_ZEROHOUR":"OFF"}}]}
+{"configurePresets":[{"name":"x64-vcpkg","inherits":["x64","default-vcpkg"]},{"name":"unix","cacheVariables":{"RTS_BUILD_PRODUCT":"OFF","RTS_BUILD_CORE_TOOLS":"OFF","RTS_BUILD_CORE_EXTRAS":"OFF","RTS_BUILD_GENERALS":"OFF","RTS_BUILD_ZEROHOUR":"OFF"}}]}
 '@
     $goodCoreToolsCMake = @'
 set(audit_root "$ENV{RUNNER_TEMP}/GeneralsGameCode")
