@@ -119,6 +119,8 @@ function Test-NativeX64CIWorkflow {
         'native dependency builds retain the legacy 30-minute timeout'
 
     $testStep = Get-StepBody -Workflow $BuildWorkflow -StepNamePrefix 'Run Core extras tests'
+    Assert-Contains $testStep '(?m)^        if: inputs\.extras\r?$' `
+        'the CTest step is not bound to the extras-enabled job predicate'
     Assert-Contains $testStep "-like 'win32\*' -or '[^']*' -like 'x64\*'" `
         'the CTest step is not x64 multi-config aware'
     Assert-Contains $testStep "'--no-tests=error'" `
@@ -139,6 +141,14 @@ function Test-NativeX64CIWorkflow {
         'the artifact collector has no native x64 installed-runtime branch'
     Assert-Contains $artifactStep '\$installedRuntime' `
         'the native x64 artifact is collected from build outputs instead of the installed runtime'
+    Assert-Contains $artifactStep 'Copy-Item -Path \(Join-Path \$installedRuntime ''\*''\)' `
+        'the native x64 artifact copy is not bound to the installed runtime'
+
+    $uploadStep = Get-StepBody -Workflow $BuildWorkflow -StepNamePrefix 'Upload '
+    Assert-Contains $uploadStep '(?m)^          path: build\\\$\{\{ inputs\.preset \}\}\\\$\{\{ inputs\.game \}\}\\artifacts\r?$' `
+        'the uploaded artifact is not bound to the collected artifact directory'
+    Assert-Contains $uploadStep '(?m)^          if-no-files-found: error\r?$' `
+        'the artifact upload can silently accept an empty native runtime'
 }
 
 function Test-NativeX64CMakeContract {
@@ -168,6 +178,18 @@ function Test-NativeX64CMakeContract {
         'the nested native product audit is not redirected to runner-owned scratch storage'
     Assert-Contains $CoreToolsCMake '_native_product_runtime_audit_fallback_root' `
         'local preset audits have no external fallback scratch root'
+    Assert-Contains $CoreToolsCMake '\$\{CMAKE_SOURCE_DIR\}\|\$\{CMAKE_BINARY_DIR\}' `
+        'concurrent build trees share the nested native product audit root'
+    Assert-Contains $CoreToolsCMake '\$\{_native_product_runtime_audit_configuration\}' `
+        'concurrent configurations share the nested native product audit root'
+    Assert-Contains $CoreToolsCMake '_native_product_runtime_audit_source_hash\}/\$\{_native_product_runtime_audit_configuration\}' `
+        'the nested native product audit root is not partitioned by configuration'
+    Assert-Contains $CoreToolsCMake '-Configuration "\$\{_native_product_runtime_audit_configuration\}"' `
+        'the nested native product audit does not validate the selected test configuration'
+    Assert-Contains $CoreToolsCMake 'string\(LENGTH "\$\{_native_product_runtime_audit_budget_root\}"' `
+        'the nested native product audit has no Windows path-length budget check'
+    Assert-Contains $CoreToolsCMake '(?m)^\s*if\([A-Za-z0-9_]+ GREATER 80\)\r?$' `
+        'the nested native product audit does not enforce the 80-character path budget'
     Assert-Contains $CoreToolsCMake '-FFmpegRoot "\$\{FFMPEG_SDK_ROOT\}"' `
         'the nested native product audit does not receive the resolved FFmpeg SDK root'
     Assert-Contains $CoreToolsCMake '-ToolchainFile "\$\{CMAKE_TOOLCHAIN_FILE\}"' `
@@ -215,6 +237,7 @@ arch: ${{ startsWith(inputs.preset, 'x64') && 'x64' || 'x86' }}
 timeout-minutes: ${{ startsWith(inputs.preset, 'x64') && 90 || 30 }}
 if: inputs.game == 'Generals' && inputs.preset == 'x64-vcpkg'
       - name: Run Core extras tests for game
+        if: inputs.extras
         run: |
           $arguments = @('--no-tests=error')
           if ('preset' -like 'win32*' -or 'preset' -like 'x64*') {}
@@ -226,7 +249,15 @@ if: inputs.game == 'Generals' && inputs.preset == 'x64-vcpkg'
           cmake --install build
       - name: Collect game Artifact
         run: |
-          if ('preset' -like 'x64*') { $installedRuntime = 'installed' }
+          if ('preset' -like 'x64*') {
+            $installedRuntime = 'installed'
+            Copy-Item -Path (Join-Path $installedRuntime '*') -Destination artifacts
+          }
+      - name: Upload game Artifact
+        uses: actions/upload-artifact@sha
+        with:
+          path: build\${{ inputs.preset }}\${{ inputs.game }}\artifacts
+          if-no-files-found: error
 '@
     $goodPresets = @'
 {"configurePresets":[{"name":"x64-vcpkg","inherits":["x64","default-vcpkg"]}]}
@@ -234,7 +265,13 @@ if: inputs.game == 'Generals' && inputs.preset == 'x64-vcpkg'
     $goodCoreToolsCMake = @'
 set(audit_root "$ENV{RUNNER_TEMP}/GeneralsGameCode")
 set(_native_product_runtime_audit_fallback_root "sibling")
+string(SHA256 _native_product_runtime_audit_source_hash "${CMAKE_SOURCE_DIR}|${CMAKE_BINARY_DIR}")
+set(audit_root "${_native_product_runtime_audit_source_hash}/${_native_product_runtime_audit_configuration}")
+string(LENGTH "${_native_product_runtime_audit_budget_root}" audit_root_length)
+if(audit_root_length GREATER 80)
+endif()
 -FFmpegRoot "${FFMPEG_SDK_ROOT}"
+-Configuration "${_native_product_runtime_audit_configuration}"
 -ToolchainFile "${CMAKE_TOOLCHAIN_FILE}"
 '@
     $goodFindFFmpegCMake = 'set(FFMPEG_SDK_ROOT "resolved" CACHE PATH "root")'
@@ -313,6 +350,30 @@ set(_native_product_runtime_audit_fallback_root "sibling")
         throw 'Native x64 CI workflow audit self-test failed to reject Win32-only handling'
     }
 
+    $caughtSkippedCTest = $false
+    try {
+        Test-NativeX64CIWorkflow `
+            -CIWorkflow $goodCI `
+            -BuildWorkflow ($goodBuild -replace '        if: inputs\.extras\r?\n', '')
+    } catch {
+        $caughtSkippedCTest = $true
+    }
+    if (-not $caughtSkippedCTest) {
+        throw 'Native x64 CI workflow audit self-test failed to reject an unbound CTest predicate'
+    }
+
+    $caughtRawBuildArtifact = $false
+    try {
+        Test-NativeX64CIWorkflow `
+            -CIWorkflow $goodCI `
+            -BuildWorkflow ($goodBuild -replace '\(Join-Path \$installedRuntime ''\*''\)', "'build\\raw\\*'")
+    } catch {
+        $caughtRawBuildArtifact = $true
+    }
+    if (-not $caughtRawBuildArtifact) {
+        throw 'Native x64 CI workflow audit self-test failed to reject raw build artifact collection'
+    }
+
     $caughtCheckoutAuditRoot = $false
     try {
         Test-NativeX64CMakeContract `
@@ -329,6 +390,57 @@ set(_native_product_runtime_audit_fallback_root "sibling")
     }
     if (-not $caughtCheckoutAuditRoot) {
         throw 'Native x64 CI workflow audit self-test failed to reject checkout-local audit storage'
+    }
+
+    $caughtSharedConfigurationRoot = $false
+    try {
+        Test-NativeX64CMakeContract `
+            -Presets $goodPresets `
+            -CoreToolsCMake ($goodCoreToolsCMake -replace '_native_product_runtime_audit_source_hash\}/\$\{_native_product_runtime_audit_configuration\}', '_native_product_runtime_audit_source_hash}/shared') `
+            -FindFFmpegCMake $goodFindFFmpegCMake `
+            -CompressionCMake $goodCompressionCMake `
+            -GeneralsCMake $goodGeneralsCMake `
+            -ZeroHourCMake $goodZeroHourCMake `
+            -NativeProductRuntimeAudit $goodNativeProductRuntimeAudit
+    } catch {
+        $caughtSharedConfigurationRoot = $true
+    }
+    if (-not $caughtSharedConfigurationRoot) {
+        throw 'Native x64 CI workflow audit self-test failed to reject a shared configuration audit root'
+    }
+
+    $caughtMissingConfiguration = $false
+    try {
+        Test-NativeX64CMakeContract `
+            -Presets $goodPresets `
+            -CoreToolsCMake ($goodCoreToolsCMake -replace '-Configuration "\$\{_native_product_runtime_audit_configuration\}"', '') `
+            -FindFFmpegCMake $goodFindFFmpegCMake `
+            -CompressionCMake $goodCompressionCMake `
+            -GeneralsCMake $goodGeneralsCMake `
+            -ZeroHourCMake $goodZeroHourCMake `
+            -NativeProductRuntimeAudit $goodNativeProductRuntimeAudit
+    } catch {
+        $caughtMissingConfiguration = $true
+    }
+    if (-not $caughtMissingConfiguration) {
+        throw 'Native x64 CI workflow audit self-test failed to reject missing configuration propagation'
+    }
+
+    $caughtMissingPathBudget = $false
+    try {
+        Test-NativeX64CMakeContract `
+            -Presets $goodPresets `
+            -CoreToolsCMake ($goodCoreToolsCMake -replace 'if\(audit_root_length GREATER 80\)', 'if(audit_root_length GREATER 800)') `
+            -FindFFmpegCMake $goodFindFFmpegCMake `
+            -CompressionCMake $goodCompressionCMake `
+            -GeneralsCMake $goodGeneralsCMake `
+            -ZeroHourCMake $goodZeroHourCMake `
+            -NativeProductRuntimeAudit $goodNativeProductRuntimeAudit
+    } catch {
+        $caughtMissingPathBudget = $true
+    }
+    if (-not $caughtMissingPathBudget) {
+        throw 'Native x64 CI workflow audit self-test failed to reject a missing path-length budget'
     }
 
     Write-Host 'Native x64 CI workflow audit self-test passed.'

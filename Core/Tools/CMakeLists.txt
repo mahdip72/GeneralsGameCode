@@ -68,18 +68,32 @@ if(RTS_BUILD_CORE_EXTRAS)
                 -SelfTest
         )
         set_tests_properties(core_replay_recorder_integration_audit_self_test PROPERTIES TIMEOUT 30)
-        string(SHA256 _native_product_runtime_audit_source_hash "${CMAKE_SOURCE_DIR}")
+        set(_native_product_runtime_audit_configuration "Release")
+        if(CMAKE_CONFIGURATION_TYPES)
+            set(_native_product_runtime_audit_configuration "$<CONFIG>")
+        elseif(CMAKE_BUILD_TYPE)
+            set(_native_product_runtime_audit_configuration "${CMAKE_BUILD_TYPE}")
+        endif()
+        string(SHA256 _native_product_runtime_audit_source_hash
+            "${CMAKE_SOURCE_DIR}|${CMAKE_BINARY_DIR}")
         string(SUBSTRING "${_native_product_runtime_audit_source_hash}" 0 16
             _native_product_runtime_audit_source_hash)
         get_filename_component(_native_product_runtime_audit_fallback_root
             "${CMAKE_SOURCE_DIR}" DIRECTORY)
         set(_native_product_runtime_audit_build_root
-            "${_native_product_runtime_audit_fallback_root}/.gga/${_native_product_runtime_audit_source_hash}/n")
+            "${_native_product_runtime_audit_fallback_root}/.gga/${_native_product_runtime_audit_source_hash}/${_native_product_runtime_audit_configuration}")
         if(DEFINED ENV{RUNNER_TEMP} AND NOT "$ENV{RUNNER_TEMP}" STREQUAL "")
             set(_native_product_runtime_audit_build_root
-                "$ENV{RUNNER_TEMP}/gga/${_native_product_runtime_audit_source_hash}/n")
+                "$ENV{RUNNER_TEMP}/gga/${_native_product_runtime_audit_source_hash}/${_native_product_runtime_audit_configuration}")
         endif()
-        string(LENGTH "${_native_product_runtime_audit_build_root}"
+        set(_native_product_runtime_audit_budget_root
+            "${_native_product_runtime_audit_build_root}")
+        if(CMAKE_CONFIGURATION_TYPES)
+            string(REPLACE "$<CONFIG>" "RelWithDebInfo"
+                _native_product_runtime_audit_budget_root
+                "${_native_product_runtime_audit_budget_root}")
+        endif()
+        string(LENGTH "${_native_product_runtime_audit_budget_root}"
             _native_product_runtime_audit_build_root_length)
         if(_native_product_runtime_audit_build_root_length GREATER 80)
             message(FATAL_ERROR
@@ -91,13 +105,17 @@ if(RTS_BUILD_CORE_EXTRAS)
                 -SourceRoot "${CMAKE_SOURCE_DIR}"
                 -BuildRoot "${_native_product_runtime_audit_build_root}"
                 -Generator "${CMAKE_GENERATOR}"
-                -GeneratorPlatform "${CMAKE_GENERATOR_PLATFORM}"
                 -CCompiler "${CMAKE_C_COMPILER}"
                 -CxxCompiler "${CMAKE_CXX_COMPILER}"
                 -RcCompiler "${CMAKE_RC_COMPILER}"
                 -ManifestTool "${CMAKE_MT}"
                 -FFmpegRoot "${FFMPEG_SDK_ROOT}"
+                -Configuration "${_native_product_runtime_audit_configuration}"
         )
+        if(CMAKE_GENERATOR_PLATFORM)
+            list(APPEND _native_product_runtime_audit_command
+                -GeneratorPlatform "${CMAKE_GENERATOR_PLATFORM}")
+        endif()
         if(CMAKE_TOOLCHAIN_FILE)
             list(APPEND _native_product_runtime_audit_command
                 -ToolchainFile "${CMAKE_TOOLCHAIN_FILE}")
@@ -118,8 +136,10 @@ if(RTS_BUILD_CORE_EXTRAS)
             COMMAND ${_native_product_runtime_audit_command})
         set_tests_properties(core_native_product_runtime_audit PROPERTIES TIMEOUT 1200)
         unset(_native_product_runtime_audit_command)
+        unset(_native_product_runtime_audit_budget_root)
         unset(_native_product_runtime_audit_build_root)
         unset(_native_product_runtime_audit_build_root_length)
+        unset(_native_product_runtime_audit_configuration)
         unset(_native_product_runtime_audit_fallback_root)
         unset(_native_product_runtime_audit_source_hash)
         add_test(NAME core_native_x64_ci_workflow_audit
