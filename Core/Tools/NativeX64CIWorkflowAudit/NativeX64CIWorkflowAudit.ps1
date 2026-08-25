@@ -93,6 +93,8 @@ function Test-NativeX64CIWorkflow {
         'stacked pull requests are excluded from CI'
     Assert-Contains $CIWorkflow "(?m)^              - 'vcpkg\.json'\r?$" `
         'vcpkg manifest changes bypass native CI'
+    Assert-Contains $CIWorkflow "(?m)^              - 'vcpkg-lock\.json'\r?$" `
+        'vcpkg lockfile changes bypass native CI'
     Assert-Contains $CIWorkflow "(?m)^              - 'triplets/\*\*'\r?$" `
         'vcpkg triplet changes bypass native CI'
     $pullRequestBlock = [Regex]::Match(
@@ -121,6 +123,8 @@ function Test-NativeX64CIWorkflow {
         'the CTest step is not x64 multi-config aware'
     Assert-Contains $testStep "'--no-tests=error'" `
         'CTest can succeed without registering tests'
+    Assert-Contains $testStep '& ctest @arguments' `
+        'the CTest step does not invoke CTest'
     Assert-Contains $testStep 'exit \$LASTEXITCODE' `
         'CTest failures are not propagated to the workflow result'
 
@@ -144,7 +148,8 @@ function Test-NativeX64CMakeContract {
         [string]$FindFFmpegCMake,
         [string]$CompressionCMake,
         [string]$GeneralsCMake,
-        [string]$ZeroHourCMake
+        [string]$ZeroHourCMake,
+        [string]$NativeProductRuntimeAudit
     )
 
     $parsedPresets = $Presets | ConvertFrom-Json
@@ -165,6 +170,8 @@ function Test-NativeX64CMakeContract {
         'local preset audits have no external fallback scratch root'
     Assert-Contains $CoreToolsCMake '-FFmpegRoot "\$\{FFMPEG_SDK_ROOT\}"' `
         'the nested native product audit does not receive the resolved FFmpeg SDK root'
+    Assert-Contains $CoreToolsCMake '-ToolchainFile "\$\{CMAKE_TOOLCHAIN_FILE\}"' `
+        'the nested native product audit does not inherit the parent dependency toolchain'
     Assert-Contains $FindFFmpegCMake 'set\(FFMPEG_SDK_ROOT ' `
         'FFmpeg discovery does not publish its resolved SDK root'
     Assert-Contains $CompressionCMake 'RTS_NATIVE_ZLIB_RUNTIME_DLLS_RELEASE' `
@@ -173,6 +180,8 @@ function Test-NativeX64CMakeContract {
         'Generals does not install the resolved vcpkg zlib runtime'
     Assert-Contains $ZeroHourCMake 'RTS_NATIVE_ZLIB_RUNTIME_DLLS_RELEASE' `
         'Zero Hour does not install the resolved vcpkg zlib runtime'
+    Assert-Contains $NativeProductRuntimeAudit 'RTS_NATIVE_ZLIB_RUNTIME_DLLS_' `
+        'the installed product audit does not validate the resolved zlib runtime'
 }
 
 if ($SelfTest) {
@@ -181,6 +190,7 @@ on:
   pull_request:
 jobs:
               - 'vcpkg.json'
+              - 'vcpkg-lock.json'
               - 'triplets/**'
   build-generals-x64:
     needs: detect-changes
@@ -208,6 +218,7 @@ if: inputs.game == 'Generals' && inputs.preset == 'x64-vcpkg'
         run: |
           $arguments = @('--no-tests=error')
           if ('preset' -like 'win32*' -or 'preset' -like 'x64*') {}
+          & ctest @arguments
           exit $LASTEXITCODE
       - name: Install native runtime for game
         if: startsWith(inputs.preset, 'x64')
@@ -224,11 +235,13 @@ if: inputs.game == 'Generals' && inputs.preset == 'x64-vcpkg'
 set(audit_root "$ENV{RUNNER_TEMP}/GeneralsGameCode")
 set(_native_product_runtime_audit_fallback_root "sibling")
 -FFmpegRoot "${FFMPEG_SDK_ROOT}"
+-ToolchainFile "${CMAKE_TOOLCHAIN_FILE}"
 '@
     $goodFindFFmpegCMake = 'set(FFMPEG_SDK_ROOT "resolved" CACHE PATH "root")'
     $goodCompressionCMake = 'set(RTS_NATIVE_ZLIB_RUNTIME_DLLS_RELEASE "zlib1.dll")'
     $goodGeneralsCMake = 'install(FILES ${RTS_NATIVE_ZLIB_RUNTIME_DLLS_RELEASE})'
     $goodZeroHourCMake = 'install(FILES ${RTS_NATIVE_ZLIB_RUNTIME_DLLS_RELEASE})'
+    $goodNativeProductRuntimeAudit = '$cacheName = "RTS_NATIVE_ZLIB_RUNTIME_DLLS_$Configuration"'
 
     Test-NativeX64CIWorkflow -CIWorkflow $goodCI -BuildWorkflow $goodBuild
     Test-NativeX64CMakeContract `
@@ -237,7 +250,8 @@ set(_native_product_runtime_audit_fallback_root "sibling")
         -FindFFmpegCMake $goodFindFFmpegCMake `
         -CompressionCMake $goodCompressionCMake `
         -GeneralsCMake $goodGeneralsCMake `
-        -ZeroHourCMake $goodZeroHourCMake
+        -ZeroHourCMake $goodZeroHourCMake `
+        -NativeProductRuntimeAudit $goodNativeProductRuntimeAudit
 
     $caughtMissingTitle = $false
     try {
@@ -308,7 +322,8 @@ set(_native_product_runtime_audit_fallback_root "sibling")
             -FindFFmpegCMake $goodFindFFmpegCMake `
             -CompressionCMake $goodCompressionCMake `
             -GeneralsCMake $goodGeneralsCMake `
-            -ZeroHourCMake $goodZeroHourCMake
+            -ZeroHourCMake $goodZeroHourCMake `
+            -NativeProductRuntimeAudit $goodNativeProductRuntimeAudit
     } catch {
         $caughtCheckoutAuditRoot = $true
     }
@@ -332,6 +347,7 @@ $findFFmpegCMakePath = Join-Path $SourceRoot 'cmake/FindFFMPEG.cmake'
 $compressionCMakePath = Join-Path $SourceRoot 'Core/Libraries/Source/Compression/CMakeLists.txt'
 $generalsCMakePath = Join-Path $SourceRoot 'Generals/CMakeLists.txt'
 $zeroHourCMakePath = Join-Path $SourceRoot 'GeneralsMD/CMakeLists.txt'
+$nativeProductRuntimeAuditPath = Join-Path $SourceRoot 'Core/Tools/NativeProductRuntimeAudit/NativeProductRuntimeAudit.ps1'
 Test-NativeX64CIWorkflow `
     -CIWorkflow (Get-Content -Raw -LiteralPath $ciPath) `
     -BuildWorkflow (Get-Content -Raw -LiteralPath $buildPath)
@@ -341,6 +357,7 @@ Test-NativeX64CMakeContract `
     -FindFFmpegCMake (Get-Content -Raw -LiteralPath $findFFmpegCMakePath) `
     -CompressionCMake (Get-Content -Raw -LiteralPath $compressionCMakePath) `
     -GeneralsCMake (Get-Content -Raw -LiteralPath $generalsCMakePath) `
-    -ZeroHourCMake (Get-Content -Raw -LiteralPath $zeroHourCMakePath)
+    -ZeroHourCMake (Get-Content -Raw -LiteralPath $zeroHourCMakePath) `
+    -NativeProductRuntimeAudit (Get-Content -Raw -LiteralPath $nativeProductRuntimeAuditPath)
 
 Write-Host 'Native x64 CI workflow audit passed.'

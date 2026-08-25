@@ -16,6 +16,10 @@ param(
     [string] $ManifestTool,
     [Parameter(Mandatory = $true)]
     [string] $FFmpegRoot,
+    [string] $ToolchainFile,
+    [string] $VcpkgInstalledDir,
+    [string] $VcpkgTargetTriplet,
+    [string] $VcpkgOverlayTriplets,
     [ValidateSet('Release', 'Debug', 'RelWithDebInfo', 'MinSizeRel')]
     [string] $Configuration = 'Release',
     [string] $OutputSuffix = ''
@@ -144,6 +148,21 @@ $CxxCompiler = $CxxCompiler.Replace('\', '/')
 $RcCompiler = $RcCompiler.Replace('\', '/')
 $ManifestTool = $ManifestTool.Replace('\', '/')
 $FFmpegRoot = $FFmpegRoot.Replace('\', '/')
+$ToolchainFile = $ToolchainFile.Replace('\', '/')
+$VcpkgInstalledDir = $VcpkgInstalledDir.Replace('\', '/')
+$VcpkgOverlayTriplets = $VcpkgOverlayTriplets.Replace('\', '/')
+if (-not [string]::IsNullOrWhiteSpace($ToolchainFile)) {
+    if (-not (Test-Path -LiteralPath $ToolchainFile -PathType Leaf)) {
+        throw "Vcpkg toolchain file '$ToolchainFile' is unavailable."
+    }
+    if ([string]::IsNullOrWhiteSpace($VcpkgInstalledDir) -or
+        -not (Test-Path -LiteralPath $VcpkgInstalledDir -PathType Container)) {
+        throw "Vcpkg installed dependency root '$VcpkgInstalledDir' is unavailable."
+    }
+    if ([string]::IsNullOrWhiteSpace($VcpkgTargetTriplet)) {
+        throw 'VcpkgTargetTriplet is required when ToolchainFile is provided.'
+    }
+}
 
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
 if (-not (Test-Path -LiteralPath $vswhere)) {
@@ -296,6 +315,18 @@ foreach ($product in @(
         "-DRTS_BUILD_OUTPUT_SUFFIX=$OutputSuffix",
         "-DFFMPEG_ROOT=$FFmpegRoot"
     )
+    if (-not [string]::IsNullOrWhiteSpace($ToolchainFile)) {
+        $arguments += "-DCMAKE_TOOLCHAIN_FILE=$ToolchainFile"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($VcpkgInstalledDir)) {
+        $arguments += "-DVCPKG_INSTALLED_DIR=$VcpkgInstalledDir"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($VcpkgTargetTriplet)) {
+        $arguments += "-DVCPKG_TARGET_TRIPLET=$VcpkgTargetTriplet"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($VcpkgOverlayTriplets)) {
+        $arguments += "-DVCPKG_OVERLAY_TRIPLETS=$VcpkgOverlayTriplets"
+    }
     if (-not [string]::IsNullOrWhiteSpace($GeneratorPlatform)) {
         $arguments += @('-A', $GeneratorPlatform)
     }
@@ -344,6 +375,25 @@ foreach ($product in @(
         throw "Native x64 $($product.Name) product did not resolve app-local MSVC runtime DLLs."
     }
     $msvcRuntimeDlls = @($msvcRuntimeDllMatch.Groups[1].Value.Trim() -split ';')
+    $zlibRuntimeCacheName = if ($selectedConfiguration -eq 'Debug') {
+        'RTS_NATIVE_ZLIB_RUNTIME_DLLS_DEBUG'
+    }
+    else {
+        'RTS_NATIVE_ZLIB_RUNTIME_DLLS_RELEASE'
+    }
+    $zlibRuntimeDllMatch = [regex]::Match($cache,
+        '(?m)^' + [regex]::Escape($zlibRuntimeCacheName) + ':INTERNAL=(.+)$')
+    $zlibRuntimeDlls = if ($zlibRuntimeDllMatch.Success) {
+        @($zlibRuntimeDllMatch.Groups[1].Value.Trim() -split ';')
+    }
+    else {
+        @()
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ToolchainFile) -and
+        $VcpkgTargetTriplet -eq 'x64-windows' -and
+        $zlibRuntimeDlls.Count -eq 0) {
+        throw "Native x64 $($product.Name) product did not resolve the dynamic vcpkg zlib runtime."
+    }
     $d3dxRuntimeDllMatch = [regex]::Match($cache, '(?m)^RTS_NATIVE_D3DX_RUNTIME_DLLS:INTERNAL=(.+)$')
     if (-not $d3dxRuntimeDllMatch.Success) {
         throw "Native x64 $($product.Name) product did not resolve app-local D3DX compatibility DLLs."
@@ -352,7 +402,7 @@ foreach ($product in @(
     $runtimeInstallBlockPattern = '(?ms)^[ \t]*file\(INSTALL DESTINATION "' +
         [regex]::Escape($expectedDestination) + '" TYPE FILE FILES(?<Files>.*?)\)[ \t]*\r?$'
     $runtimeInstallBlocks = [regex]::Matches($installScript, $runtimeInstallBlockPattern)
-    foreach ($runtimeDll in @($runtimeDlls + $msvcRuntimeDlls + $d3dxRuntimeDlls)) {
+    foreach ($runtimeDll in @($runtimeDlls + $msvcRuntimeDlls + $zlibRuntimeDlls + $d3dxRuntimeDlls)) {
         $runtimeDllName = [IO.Path]::GetFileName($runtimeDll)
         $runtimeDllPattern = '"[^"]*/' + [regex]::Escape($runtimeDllName) + '"'
         $matchingBlock = $runtimeInstallBlocks | Where-Object {
@@ -493,6 +543,30 @@ foreach ($product in @(
             throw "Native x64 $($product.Name) audit did not produce app-local MSVC runtime $runtimeDllName."
         }
         Assert-SameFile $runtimeDll $installedRuntimeDll "Native x64 $($product.Name) installed MSVC runtime $runtimeDllName"
+    }
+
+    foreach ($runtimeDll in $zlibRuntimeDlls) {
+        $runtimeDllName = [IO.Path]::GetFileName($runtimeDll)
+        $installedRuntimeDll = Join-Path $installedTitleRoot $runtimeDllName
+        if (-not (Test-Path -LiteralPath $installedRuntimeDll -PathType Leaf)) {
+            throw "Native x64 $($product.Name) audit did not produce app-local zlib runtime $runtimeDllName."
+        }
+        Assert-SameFile $runtimeDll $installedRuntimeDll "Native x64 $($product.Name) installed zlib runtime $runtimeDllName"
+        if ((Get-PeMachine $installedRuntimeDll) -ne 0x8664) {
+            throw "Native x64 $($product.Name) zlib runtime $runtimeDllName is not an AMD64 PE image."
+        }
+        $module = [NativeProductRuntimeAudit.NativeLoader]::LoadLibraryEx(
+            $installedRuntimeDll,
+            [IntPtr]::Zero,
+            $loaderFlags)
+        if ($module -eq [IntPtr]::Zero) {
+            $loaderError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            throw "Native x64 $($product.Name) installed zlib runtime $runtimeDllName failed clean dependency loading with Windows error $loaderError."
+        }
+        if (-not [NativeProductRuntimeAudit.NativeLoader]::FreeLibrary($module)) {
+            $loaderError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            throw "Native x64 $($product.Name) installed zlib runtime $runtimeDllName failed to unload with Windows error $loaderError."
+        }
     }
 
     foreach ($runtimeDll in $d3dxRuntimeDlls) {

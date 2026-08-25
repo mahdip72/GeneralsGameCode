@@ -74,13 +74,19 @@ if(RTS_BUILD_CORE_EXTRAS)
         get_filename_component(_native_product_runtime_audit_fallback_root
             "${CMAKE_SOURCE_DIR}" DIRECTORY)
         set(_native_product_runtime_audit_build_root
-            "${_native_product_runtime_audit_fallback_root}/.generalsgamecode-audits/${_native_product_runtime_audit_source_hash}/Stage3NativeProductGraphAudit")
+            "${_native_product_runtime_audit_fallback_root}/.gga/${_native_product_runtime_audit_source_hash}/n")
         if(DEFINED ENV{RUNNER_TEMP} AND NOT "$ENV{RUNNER_TEMP}" STREQUAL "")
             set(_native_product_runtime_audit_build_root
-                "$ENV{RUNNER_TEMP}/GeneralsGameCode/${_native_product_runtime_audit_source_hash}/Stage3NativeProductGraphAudit")
+                "$ENV{RUNNER_TEMP}/gga/${_native_product_runtime_audit_source_hash}/n")
         endif()
-        add_test(NAME core_native_product_runtime_audit
-            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+        string(LENGTH "${_native_product_runtime_audit_build_root}"
+            _native_product_runtime_audit_build_root_length)
+        if(_native_product_runtime_audit_build_root_length GREATER 80)
+            message(FATAL_ERROR
+                "Native product audit root exceeds the Windows-safe 80-character budget: ${_native_product_runtime_audit_build_root}")
+        endif()
+        set(_native_product_runtime_audit_command
+            powershell -NoProfile -ExecutionPolicy Bypass
                 -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeProductRuntimeAudit/NativeProductRuntimeAudit.ps1"
                 -SourceRoot "${CMAKE_SOURCE_DIR}"
                 -BuildRoot "${_native_product_runtime_audit_build_root}"
@@ -92,8 +98,28 @@ if(RTS_BUILD_CORE_EXTRAS)
                 -ManifestTool "${CMAKE_MT}"
                 -FFmpegRoot "${FFMPEG_SDK_ROOT}"
         )
+        if(CMAKE_TOOLCHAIN_FILE)
+            list(APPEND _native_product_runtime_audit_command
+                -ToolchainFile "${CMAKE_TOOLCHAIN_FILE}")
+        endif()
+        if(VCPKG_INSTALLED_DIR)
+            list(APPEND _native_product_runtime_audit_command
+                -VcpkgInstalledDir "${VCPKG_INSTALLED_DIR}")
+        endif()
+        if(VCPKG_TARGET_TRIPLET)
+            list(APPEND _native_product_runtime_audit_command
+                -VcpkgTargetTriplet "${VCPKG_TARGET_TRIPLET}")
+        endif()
+        if(VCPKG_OVERLAY_TRIPLETS)
+            list(APPEND _native_product_runtime_audit_command
+                -VcpkgOverlayTriplets "${VCPKG_OVERLAY_TRIPLETS}")
+        endif()
+        add_test(NAME core_native_product_runtime_audit
+            COMMAND ${_native_product_runtime_audit_command})
         set_tests_properties(core_native_product_runtime_audit PROPERTIES TIMEOUT 1200)
+        unset(_native_product_runtime_audit_command)
         unset(_native_product_runtime_audit_build_root)
+        unset(_native_product_runtime_audit_build_root_length)
         unset(_native_product_runtime_audit_fallback_root)
         unset(_native_product_runtime_audit_source_hash)
         add_test(NAME core_native_x64_ci_workflow_audit
