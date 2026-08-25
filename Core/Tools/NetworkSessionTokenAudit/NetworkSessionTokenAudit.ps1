@@ -11,6 +11,12 @@ function Get-TokenViolations {
         [Parameter(Mandatory = $true)][string]$RuntimeCMake
     )
 
+    # Audit source structure independently of the caller's checkout line-ending
+    # policy. PowerShell here-strings and Windows worktrees commonly use CRLF,
+    # while the exact-line expressions below intentionally operate on LF.
+    $Source = $Source -replace "`r`n", "`n"
+    $RuntimeCMake = $RuntimeCMake -replace "`r`n", "`n"
+
     $violations = New-Object 'System.Collections.Generic.List[string]'
     $start = $Source.IndexOf('static Bool generateNetworkHelloToken(', [StringComparison]::Ordinal)
     $end = if ($start -ge 0) {
@@ -194,6 +200,8 @@ elseif(RTS_BUILD_PRODUCT)
     )
 endif()
 '@
+    $goodSource = $goodSource -replace "`r`n", "`n"
+    $goodCMake = $goodCMake -replace "`r`n", "`n"
     if ((Get-TokenViolations $goodSource $goodCMake).Count -ne 0) {
         throw 'known-good session-token fixture failed'
     }
