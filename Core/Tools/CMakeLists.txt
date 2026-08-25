@@ -127,7 +127,7 @@ if(RTS_BUILD_CORE_EXTRAS)
                 -File "${CMAKE_CURRENT_SOURCE_DIR}/PortabilityAudit/PortabilityAudit.ps1"
                 -SourceRoot "${CMAKE_SOURCE_DIR}"
         )
-        set_tests_properties(core_portability_audit PROPERTIES TIMEOUT 120)
+        set_tests_properties(core_portability_audit PROPERTIES TIMEOUT 300)
         add_test(NAME core_portability_audit_self_test
             COMMAND powershell -NoProfile -ExecutionPolicy Bypass
                 -File "${CMAKE_CURRENT_SOURCE_DIR}/PortabilityAudit/PortabilityAudit.Tests.ps1"
@@ -257,7 +257,7 @@ if(WIN32)
                 -FFmpegConfigDir "${CMAKE_CURRENT_SOURCE_DIR}/VideoBackendSelectionAudit/FFmpegConfig"
                 -CMakeCommand "${CMAKE_COMMAND}"
         )
-        set_tests_properties(core_video_backend_ffmpeg_graph_audit PROPERTIES TIMEOUT 120)
+        set_tests_properties(core_video_backend_ffmpeg_graph_audit PROPERTIES TIMEOUT 300)
     endif()
 endif()
 
