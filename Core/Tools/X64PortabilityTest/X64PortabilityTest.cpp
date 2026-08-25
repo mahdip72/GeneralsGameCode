@@ -1,5 +1,6 @@
 #include "Utility/CppMacros.h"
 #include "GameClient/GameWindow.h"
+#include "WWLib/mempool.h"
 
 #include <windows.h>
 #include <stdio.h>
@@ -14,6 +15,20 @@ static_assert(sizeof(LRESULT) == 8, "Win32 LRESULT must be pointer-sized");
 
 namespace
 {
+struct PoolNode
+{
+	PoolNode() : next(nullptr), payload(0) { ++constructed; }
+	~PoolNode() { ++destroyed; }
+
+	PoolNode *next;
+	uintptr_t payload;
+	static Int constructed;
+	static Int destroyed;
+};
+
+Int PoolNode::constructed = 0;
+Int PoolNode::destroyed = 0;
+
 int check(bool condition, const char *name)
 {
 	if (!condition)
@@ -52,11 +67,25 @@ int checkUiScalarConversions()
 
 	return 0;
 }
+
+int checkObjectPoolPointerWidth()
+{
+	ObjectPoolClass<PoolNode, 4> pool;
+	PoolNode *nodes[9];
+	for (UnsignedInt index = 0; index < sizeof(nodes) / sizeof(nodes[0]); ++index)
+		nodes[index] = pool.Allocate_Object();
+	for (UnsignedInt index = 0; index < sizeof(nodes) / sizeof(nodes[0]); ++index)
+		pool.Free_Object(nodes[index]);
+	return check(PoolNode::constructed == 9 && PoolNode::destroyed == 9,
+		"object-pool construction and destruction must remain balanced");
+}
 }
 
 int main()
 {
 	if (checkUiScalarConversions() != 0)
+		return 1;
+	if (checkObjectPoolPointerWidth() != 0)
 		return 1;
 
 	const uintptr_t syntheticAddress = UINT64_C(0x0000000100001234);

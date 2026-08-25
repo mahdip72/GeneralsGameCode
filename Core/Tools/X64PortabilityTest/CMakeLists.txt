@@ -9,6 +9,8 @@ target_include_directories(core_x64_portability_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/Dependencies/Utility
 )
 
+target_link_libraries(core_x64_portability_tests PRIVATE core_wwdebug)
+
 set_target_properties(core_x64_portability_tests PROPERTIES
     CXX_STANDARD 20
     CXX_STANDARD_REQUIRED YES
