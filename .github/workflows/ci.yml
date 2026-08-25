@@ -42,6 +42,9 @@ jobs:
               - '.github/workflows/**'
               - 'CMakeLists.txt'
               - 'CMakePresets.json'
+              - 'vcpkg.json'
+              - 'vcpkg-lock.json'
+              - 'triplets/**'
               - 'cmake/**'
               - 'Core/**'
               - 'Dependencies/**'
@@ -99,7 +102,7 @@ jobs:
   build-generals-x64:
     name: Build Generals x64
     needs: detect-changes
-    if: ${{ github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.generals == 'true' || needs.detect-changes.outputs.shared == 'true' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.generals == 'true' || needs.detect-changes.outputs.generalsmd == 'true' || needs.detect-changes.outputs.shared == 'true' }}
     uses: ./.github/workflows/build-toolchain.yml
     with:
       game: "Generals"
@@ -174,7 +177,7 @@ jobs:
 
   build-generalsmd-x64:
     name: Build GeneralsMD x64
-    needs: detect-changes
+    needs: [detect-changes, build-generals-x64]
     if: ${{ github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.generalsmd == 'true' || needs.detect-changes.outputs.shared == 'true' }}
     uses: ./.github/workflows/build-toolchain.yml
     with:
