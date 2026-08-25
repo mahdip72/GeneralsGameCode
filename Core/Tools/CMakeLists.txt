@@ -116,6 +116,10 @@ if(RTS_BUILD_CORE_EXTRAS)
             list(APPEND _native_product_runtime_audit_command
                 -GeneratorPlatform "${CMAKE_GENERATOR_PLATFORM}")
         endif()
+        if(FFMPEG_RUNTIME_DIR)
+            list(APPEND _native_product_runtime_audit_command
+                -FFmpegRuntimeDir "${FFMPEG_RUNTIME_DIR}")
+        endif()
         if(CMAKE_TOOLCHAIN_FILE)
             list(APPEND _native_product_runtime_audit_command
                 -ToolchainFile "${CMAKE_TOOLCHAIN_FILE}")

@@ -117,6 +117,8 @@ function Test-NativeX64CIWorkflow {
     Assert-Contains $BuildWorkflow `
         "timeout-minutes: \$\{\{ startsWith\(inputs\.preset, 'x64'\) && 90 \|\| 30 \}\}" `
         'native dependency builds retain the legacy 30-minute timeout'
+    Assert-Contains $BuildWorkflow "hashFiles\([^\r\n]*'cmake/patches/\*\.patch'" `
+        'native D3D8 patch contents do not invalidate the CMake dependency cache'
 
     $testStep = Get-StepBody -Workflow $BuildWorkflow -StepNamePrefix 'Run Core extras tests'
     Assert-Contains $testStep '(?m)^        if: inputs\.extras\r?$' `
@@ -192,10 +194,18 @@ function Test-NativeX64CMakeContract {
         'the nested native product audit does not enforce the 80-character path budget'
     Assert-Contains $CoreToolsCMake '-FFmpegRoot "\$\{FFMPEG_SDK_ROOT\}"' `
         'the nested native product audit does not receive the resolved FFmpeg SDK root'
+    Assert-Contains $CoreToolsCMake '-FFmpegRuntimeDir "\$\{FFMPEG_RUNTIME_DIR\}"' `
+        'the nested native product audit does not receive a custom FFmpeg runtime directory'
     Assert-Contains $CoreToolsCMake '-ToolchainFile "\$\{CMAKE_TOOLCHAIN_FILE\}"' `
         'the nested native product audit does not inherit the parent dependency toolchain'
     Assert-Contains $FindFFmpegCMake 'set\(FFMPEG_SDK_ROOT ' `
         'FFmpeg discovery does not publish its resolved SDK root'
+    Assert-Contains $FindFFmpegCMake 'RTS_FFMPEG_ROOT_HINT_SIGNATURE' `
+        'FFmpeg discovery does not invalidate cached SDK paths when root hints change'
+    Assert-Contains $FindFFmpegCMake 'ResolveWindowsRuntimeClosure\.cmake' `
+        'FFmpeg packaging does not resolve app-local transitive runtime dependencies'
+    Assert-Contains $FindFFmpegCMake '(?ms)set\(RTS_FFMPEG_RUNTIME_DLLS .*?CACHE INTERNAL.*?FORCE\)' `
+        'FFmpeg runtime closure can remain stale after an SDK change'
     Assert-Contains $CompressionCMake 'RTS_NATIVE_ZLIB_RUNTIME_DLLS_RELEASE' `
         'vcpkg zlib runtime discovery is missing'
     Assert-Contains $GeneralsCMake 'RTS_NATIVE_ZLIB_RUNTIME_DLLS_RELEASE' `
@@ -204,6 +214,8 @@ function Test-NativeX64CMakeContract {
         'Zero Hour does not install the resolved vcpkg zlib runtime'
     Assert-Contains $NativeProductRuntimeAudit 'RTS_NATIVE_ZLIB_RUNTIME_DLLS_' `
         'the installed product audit does not validate the resolved zlib runtime'
+    Assert-Contains $NativeProductRuntimeAudit '-DFFMPEG_RUNTIME_DIR=\$FFmpegRuntimeDir' `
+        'the installed product audit does not preserve a custom FFmpeg runtime directory'
 }
 
 if ($SelfTest) {
@@ -235,6 +247,7 @@ jobs:
 if: startsWith(inputs.preset, 'win32') || startsWith(inputs.preset, 'x64')
 arch: ${{ startsWith(inputs.preset, 'x64') && 'x64' || 'x86' }}
 timeout-minutes: ${{ startsWith(inputs.preset, 'x64') && 90 || 30 }}
+key: cmake-deps-${{ hashFiles('cmake/patches/*.patch') }}
 if: inputs.game == 'Generals' && inputs.preset == 'x64-vcpkg'
       - name: Run Core extras tests for game
         if: inputs.extras
@@ -271,14 +284,23 @@ string(LENGTH "${_native_product_runtime_audit_budget_root}" audit_root_length)
 if(audit_root_length GREATER 80)
 endif()
 -FFmpegRoot "${FFMPEG_SDK_ROOT}"
+-FFmpegRuntimeDir "${FFMPEG_RUNTIME_DIR}"
 -Configuration "${_native_product_runtime_audit_configuration}"
 -ToolchainFile "${CMAKE_TOOLCHAIN_FILE}"
 '@
-    $goodFindFFmpegCMake = 'set(FFMPEG_SDK_ROOT "resolved" CACHE PATH "root")'
+    $goodFindFFmpegCMake = @'
+set(FFMPEG_SDK_ROOT "resolved" CACHE PATH "root")
+set(RTS_FFMPEG_ROOT_HINT_SIGNATURE "signature" CACHE INTERNAL "signature" FORCE)
+-P "ResolveWindowsRuntimeClosure.cmake"
+set(RTS_FFMPEG_RUNTIME_DLLS "closure" CACHE INTERNAL "closure" FORCE)
+'@
     $goodCompressionCMake = 'set(RTS_NATIVE_ZLIB_RUNTIME_DLLS_RELEASE "zlib1.dll")'
     $goodGeneralsCMake = 'install(FILES ${RTS_NATIVE_ZLIB_RUNTIME_DLLS_RELEASE})'
     $goodZeroHourCMake = 'install(FILES ${RTS_NATIVE_ZLIB_RUNTIME_DLLS_RELEASE})'
-    $goodNativeProductRuntimeAudit = '$cacheName = "RTS_NATIVE_ZLIB_RUNTIME_DLLS_$Configuration"'
+    $goodNativeProductRuntimeAudit = @'
+$cacheName = "RTS_NATIVE_ZLIB_RUNTIME_DLLS_$Configuration"
+$arguments += "-DFFMPEG_RUNTIME_DIR=$FFmpegRuntimeDir"
+'@
 
     Test-NativeX64CIWorkflow -CIWorkflow $goodCI -BuildWorkflow $goodBuild
     Test-NativeX64CMakeContract `
@@ -348,6 +370,18 @@ endif()
     }
     if (-not $caughtWin32Only) {
         throw 'Native x64 CI workflow audit self-test failed to reject Win32-only handling'
+    }
+
+    $caughtMissingPatchHash = $false
+    try {
+        Test-NativeX64CIWorkflow `
+            -CIWorkflow $goodCI `
+            -BuildWorkflow ($goodBuild -replace "'cmake/patches/\*\.patch'", "'cmake/patches/ignored.txt'")
+    } catch {
+        $caughtMissingPatchHash = $true
+    }
+    if (-not $caughtMissingPatchHash) {
+        throw 'Native x64 CI workflow audit self-test failed to reject a stale D3D8 patch cache key'
     }
 
     $caughtSkippedCTest = $false
@@ -424,6 +458,40 @@ endif()
     }
     if (-not $caughtMissingConfiguration) {
         throw 'Native x64 CI workflow audit self-test failed to reject missing configuration propagation'
+    }
+
+    $caughtMissingRuntimeOverride = $false
+    try {
+        Test-NativeX64CMakeContract `
+            -Presets $goodPresets `
+            -CoreToolsCMake ($goodCoreToolsCMake -replace '-FFmpegRuntimeDir "\$\{FFMPEG_RUNTIME_DIR\}"', '') `
+            -FindFFmpegCMake $goodFindFFmpegCMake `
+            -CompressionCMake $goodCompressionCMake `
+            -GeneralsCMake $goodGeneralsCMake `
+            -ZeroHourCMake $goodZeroHourCMake `
+            -NativeProductRuntimeAudit $goodNativeProductRuntimeAudit
+    } catch {
+        $caughtMissingRuntimeOverride = $true
+    }
+    if (-not $caughtMissingRuntimeOverride) {
+        throw 'Native x64 CI workflow audit self-test failed to reject a dropped FFmpeg runtime override'
+    }
+
+    $caughtMissingRuntimeClosure = $false
+    try {
+        Test-NativeX64CMakeContract `
+            -Presets $goodPresets `
+            -CoreToolsCMake $goodCoreToolsCMake `
+            -FindFFmpegCMake ($goodFindFFmpegCMake -replace 'ResolveWindowsRuntimeClosure\.cmake', 'MissingClosure.cmake') `
+            -CompressionCMake $goodCompressionCMake `
+            -GeneralsCMake $goodGeneralsCMake `
+            -ZeroHourCMake $goodZeroHourCMake `
+            -NativeProductRuntimeAudit $goodNativeProductRuntimeAudit
+    } catch {
+        $caughtMissingRuntimeClosure = $true
+    }
+    if (-not $caughtMissingRuntimeClosure) {
+        throw 'Native x64 CI workflow audit self-test failed to reject a missing FFmpeg runtime closure'
     }
 
     $caughtMissingPathBudget = $false

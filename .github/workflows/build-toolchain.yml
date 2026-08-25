@@ -54,7 +54,7 @@ jobs:
         uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
         with:
           path: build\${{ inputs.preset }}\_deps
-          key: cmake-deps-${{ inputs.preset }}-${{ hashFiles('CMakePresets.json','cmake/**/*.cmake','**/CMakeLists.txt') }}
+          key: cmake-deps-${{ inputs.preset }}-${{ hashFiles('CMakePresets.json','cmake/**/*.cmake','cmake/patches/*.patch','**/CMakeLists.txt') }}
 
       - name: Download VC6 Portable from itsmattkc repo
         if: ${{ startsWith(inputs.preset, 'vc6') && steps.cache-vc6.outputs.cache-hit != 'true' }}

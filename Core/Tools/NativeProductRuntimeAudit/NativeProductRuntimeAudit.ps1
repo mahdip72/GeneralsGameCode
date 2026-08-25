@@ -16,6 +16,7 @@ param(
     [string] $ManifestTool,
     [Parameter(Mandatory = $true)]
     [string] $FFmpegRoot,
+    [string] $FFmpegRuntimeDir,
     [string] $ToolchainFile,
     [string] $VcpkgInstalledDir,
     [string] $VcpkgTargetTriplet,
@@ -317,6 +318,9 @@ foreach ($product in @(
     )
     if (-not [string]::IsNullOrWhiteSpace($ToolchainFile)) {
         $arguments += "-DCMAKE_TOOLCHAIN_FILE=$ToolchainFile"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($FFmpegRuntimeDir)) {
+        $arguments += "-DFFMPEG_RUNTIME_DIR=$FFmpegRuntimeDir"
     }
     if (-not [string]::IsNullOrWhiteSpace($VcpkgInstalledDir)) {
         $arguments += "-DVCPKG_INSTALLED_DIR=$VcpkgInstalledDir"
