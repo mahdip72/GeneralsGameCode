@@ -2,15 +2,21 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <process.h>
 #include <string>
+#include <system_error>
 #include <utility>
 
 namespace
 {
 void check(bool condition, const char *message = "catalog assertion failed");
+
+struct TestFailure
+{
+};
 
 class MemoryVirtualAudioSource final : public AudioVirtualFileSource
 {
@@ -140,12 +146,28 @@ void check(bool condition, const char *message)
 {
 	if (!condition) {
 		std::fprintf(stderr, "FAIL: %s\n", message);
-		std::abort();
+		std::fflush(stderr);
+		throw TestFailure{};
 	}
 }
+
+class FixtureDirectory
+{
+public:
+	explicit FixtureDirectory(std::filesystem::path path) : m_path(std::move(path)) {}
+	~FixtureDirectory()
+	{
+		std::error_code cleanupError;
+		std::filesystem::remove_all(m_path, cleanupError);
+	}
+	const std::filesystem::path &path() const { return m_path; }
+
+private:
+	std::filesystem::path m_path;
+};
 }
 
-int main(int argc, char *argv[])
+int runCatalogTest(int argc, char *argv[])
 {
 #if defined(RTS_NATIVE_AUDIO_HAS_FFMPEG_CLI)
 	check(argc == 3 && std::string(argv[1]) == "--ffmpeg" && argv[2][0] != '\0',
@@ -227,8 +249,9 @@ int main(int argc, char *argv[])
 	check(pcm.data[0] == 0x7fU);
 	check(pcm.data[7] == 0x7fU);
 
-	const std::filesystem::path root = std::filesystem::temp_directory_path()
-		/ "rts-native-audio-real-source";
+	FixtureDirectory fixture(std::filesystem::temp_directory_path()
+		/ ("rts-native-audio-real-source-" + std::to_string(_getpid())));
+	const std::filesystem::path &root = fixture.path();
 	std::filesystem::create_directories(root);
 	const std::filesystem::path attackPath = root / "attack.wav";
 	const std::filesystem::path mainPath = root / "main.wav";
@@ -388,6 +411,22 @@ int main(int argc, char *argv[])
 	looseStream.reset();
 
 #endif
-	std::filesystem::remove_all(root);
 	return 0;
+}
+
+int main(int argc, char *argv[])
+{
+#if defined(_MSC_VER)
+	// Keep unexpected CRT failures in the CTest log instead of opening an
+	// interactive Visual C++ Runtime or Windows Error Reporting dialog.
+	_set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
+	try {
+		return runCatalogTest(argc, argv);
+	} catch (const TestFailure &) {
+		return EXIT_FAILURE;
+	} catch (const std::exception &error) {
+		std::fprintf(stderr, "FAIL: catalog test exception: %s\n", error.what());
+		return EXIT_FAILURE;
+	}
 }

@@ -10,6 +10,7 @@
 #include "Common/AudioSettings.h"
 #include "Common/GameAudio.h"
 #include "XAudio2AudioDevice/IXAudio2AudioEngineBackend.h"
+#include "XAudio2AudioDevice/NativeAudioCompatibility.h"
 #include "XAudio2AudioDevice/XAudio2AudioManager.h"
 #include "XAudio2AudioDevice/XAudio2AudioService.h"
 #include "XAudio2AudioDevice/XAudio2PcmVoice.h"
@@ -17,8 +18,10 @@
 #include <cstdio>
 #include <cstdint>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <type_traits>
 #include <vector>
@@ -43,6 +46,17 @@ namespace
 			std::fprintf(stderr, "FAIL: %s\n", message);
 			++failures;
 		}
+	}
+
+	std::uint32_t readEncodedFrame(const std::vector<std::uint8_t> &bytes)
+	{
+		if (bytes.size() < 4U) {
+			return (std::numeric_limits<std::uint32_t>::max)();
+		}
+		return static_cast<std::uint32_t>(bytes[0])
+			| (static_cast<std::uint32_t>(bytes[1]) << 8U)
+			| (static_cast<std::uint32_t>(bytes[2]) << 16U)
+			| (static_cast<std::uint32_t>(bytes[3]) << 24U);
 	}
 
 	void writeWaveFile(const std::filesystem::path &path, UnsignedInt durationMS)
@@ -108,6 +122,12 @@ namespace
 			}
 			m_lastContext = buffer.pContext;
 			m_pendingContexts.push_back(buffer.pContext);
+			if (buffer.pAudioData != nullptr && buffer.AudioBytes != 0) {
+				submittedAudio.emplace_back(buffer.pAudioData,
+					buffer.pAudioData + buffer.AudioBytes);
+			} else {
+				submittedAudio.emplace_back();
+			}
 			++submitCalls;
 			if (m_totalSubmitCalls != nullptr) {
 				++(*m_totalSubmitCalls);
@@ -169,6 +189,7 @@ namespace
 		UINT32 matrixDestinationChannels = 0;
 		int matrixCalls = 0;
 		std::vector<float> lastMatrix;
+		std::vector<std::vector<std::uint8_t>> submittedAudio;
 
 	private:
 		Bool m_failCreate;
@@ -330,10 +351,135 @@ namespace
 	private:
 		UnsignedInt m_totalFrames;
 	};
+
+	class LegacyAudioAssetSource final : public AudioAssetSource
+	{
+	public:
+		explicit LegacyAudioAssetSource(UnsignedInt totalFrames, Bool materialize = TRUE,
+			UnsignedInt sampleRate = 48000U, UnsignedShort channels = 2U) :
+			m_totalFrames(totalFrames), m_materialize(materialize), m_sampleRate(sampleRate),
+			m_channels(channels)
+		{
+		}
+
+		Bool getDurationMS(const AsciiString &, Real &durationMS) const override
+		{
+			durationMS = static_cast<Real>(m_totalFrames) * 1000.0f
+				/ static_cast<Real>(m_sampleRate);
+			return TRUE;
+		}
+		Bool decodePcm(const AsciiString &, AudioPcmChunk &chunk,
+			UnsignedInt maxFrames) const override
+		{
+			decodeBounds.push_back(maxFrames);
+			if (maxFrames == 0) {
+				chunk = {};
+				return FALSE;
+			}
+			if (!m_materialize && maxFrames > 1U) {
+				chunk = {};
+				return FALSE;
+			}
+			const UnsignedInt frameCount = std::min(maxFrames, m_totalFrames);
+			chunk.sampleRate = m_sampleRate;
+			chunk.channels = m_channels;
+			chunk.format = AudioPcmFormat::SIGNED_16_INTERLEAVED_LITTLE_ENDIAN;
+			chunk.frameCount = frameCount;
+			chunk.startSample = 0;
+			const std::size_t bytesPerFrame = static_cast<std::size_t>(m_channels) * sizeof(Short);
+			chunk.data.assign(static_cast<std::size_t>(frameCount) * bytesPerFrame, 0U);
+			for (UnsignedInt frame = 0; frame < frameCount; ++frame) {
+				for (std::size_t byte = 0; byte < std::min<std::size_t>(4U, bytesPerFrame); ++byte) {
+					chunk.data[static_cast<std::size_t>(frame) * bytesPerFrame + byte]
+						= static_cast<std::uint8_t>((frame >> (byte * 8U)) & 0xffU);
+				}
+			}
+			return TRUE;
+		}
+		const void *getFileIdentity(const AsciiString &) const override
+		{
+			return this;
+		}
+
+		mutable std::vector<UnsignedInt> decodeBounds;
+
+	private:
+		UnsignedInt m_totalFrames;
+		Bool m_materialize;
+		UnsignedInt m_sampleRate;
+		UnsignedShort m_channels;
+	};
+
+	class BoundedRangeAudioAssetSource final : public AudioAssetSource
+	{
+	public:
+		explicit BoundedRangeAudioAssetSource(UnsignedInt totalFrames) :
+			m_totalFrames(totalFrames)
+		{
+		}
+
+		Bool getDurationMS(const AsciiString &, Real &durationMS) const override
+		{
+			durationMS = static_cast<Real>(m_totalFrames) * 1000.0f / 48000.0f;
+			return TRUE;
+		}
+		Bool decodePcm(const AsciiString &, AudioPcmChunk &chunk,
+			UnsignedInt maxFrames) const override
+		{
+			decodePcmBounds.push_back(maxFrames);
+			if (maxFrames > 48000U) {
+				chunk = {};
+				return FALSE;
+			}
+			return decodeRange(chunk, maxFrames, 0);
+		}
+		Bool decodePcmAt(const AsciiString &, AudioPcmChunk &chunk,
+			UnsignedInt maxFrames, UnsignedInt startFrame) const override
+		{
+			decodeStarts.push_back(startFrame);
+			decodeRangeBounds.push_back(maxFrames);
+			return decodeRange(chunk, maxFrames, startFrame);
+		}
+		Bool supportsPcmRangeDecode() const override { return TRUE; }
+
+		mutable std::vector<UnsignedInt> decodePcmBounds;
+		mutable std::vector<UnsignedInt> decodeStarts;
+		mutable std::vector<UnsignedInt> decodeRangeBounds;
+
+	private:
+		Bool decodeRange(AudioPcmChunk &chunk, UnsignedInt maxFrames,
+			UnsignedInt startFrame) const
+		{
+			if (maxFrames == 0 || startFrame >= m_totalFrames) {
+				chunk = {};
+				return FALSE;
+			}
+			const UnsignedInt frameCount = std::min(maxFrames, m_totalFrames - startFrame);
+			chunk.sampleRate = 48000U;
+			chunk.channels = 2U;
+			chunk.format = AudioPcmFormat::SIGNED_16_INTERLEAVED_LITTLE_ENDIAN;
+			chunk.frameCount = frameCount;
+			chunk.startSample = static_cast<std::int64_t>(startFrame);
+			chunk.data.resize(static_cast<std::size_t>(frameCount) * 4U);
+			for (UnsignedInt frame = 0; frame < frameCount; ++frame) {
+				const UnsignedInt absoluteFrame = startFrame + frame;
+				for (UnsignedInt byte = 0; byte < 4U; ++byte) {
+					chunk.data[static_cast<std::size_t>(frame) * 4U + byte]
+						= static_cast<std::uint8_t>((absoluteFrame >> (byte * 8U)) & 0xffU);
+				}
+			}
+			return TRUE;
+		}
+
+		UnsignedInt m_totalFrames;
+	};
 }
 
 int main()
 {
+#if defined(_MSC_VER)
+	_set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
 	const std::filesystem::path realRoot = std::filesystem::temp_directory_path()
 		/ "rts-native-audio-manager-real-source";
 	std::filesystem::create_directories(realRoot);
@@ -581,6 +727,192 @@ int main()
 		"stopping streaming playback releases its stream-backed handle");
 	streamingManager.closeDevice();
 	deleteInstance(streamingInfo);
+
+	BoundedRangeAudioAssetSource rangedSource(120000U);
+	std::unique_ptr<FakeEngine> rangedOwnedEngine = std::make_unique<FakeEngine>();
+	FakeEngine *rangedEngine = rangedOwnedEngine.get();
+	XAudio2AudioService rangedService(std::move(rangedOwnedEngine));
+	XAudio2AudioManager rangedManager(&rangedService, &rangedSource);
+	rangedManager.openDevice();
+	AudioEventInfo *rangedInfo = newInstance(AudioEventInfo);
+	*rangedInfo = *fixtureInfo;
+	rangedInfo->m_attackSounds.clear();
+	rangedInfo->m_decaySounds.clear();
+	rangedInfo->m_sounds.clear();
+	rangedInfo->m_sounds.push_back(AsciiString("ranged.wav"));
+	FixtureEvent rangedEvent(AsciiString("fixture-ranged"));
+	rangedEvent.setAudioEventInfo(rangedInfo);
+	const AudioHandle rangedHandle = rangedManager.addAudioEvent(&rangedEvent);
+	rangedManager.update();
+	rangedManager.update();
+	FakeVoice *rangedVoice = rangedEngine->lastVoice;
+	check(rangedVoice != nullptr && rangedVoice->submitCalls == 2
+		&& rangedManager.isCurrentlyPlaying(rangedHandle)
+		&& rangedSource.decodePcmBounds.empty()
+		&& rangedSource.decodeStarts.size() == 3U
+		&& rangedSource.decodeStarts[0] == 0U
+		&& rangedSource.decodeStarts[1] == 0U
+		&& rangedSource.decodeStarts[2] == 48000U
+		&& rangedVoice->submittedAudio.size() == 2U
+		&& readEncodedFrame(rangedVoice->submittedAudio[0]) == 0U
+		&& readEncodedFrame(rangedVoice->submittedAudio[1]) == 48000U,
+		"bounded range sources keep using their efficient chunk decoder when stream opening fails");
+	check(rangedVoice != nullptr && rangedVoice->completeOldestBuffer(),
+		"bounded range fixture completes its oldest queued chunk");
+	rangedManager.update();
+	check(rangedVoice != nullptr && rangedVoice->submitCalls == 3
+		&& rangedSource.decodeStarts.size() == 4U
+		&& rangedSource.decodeStarts[3] == 96000U
+		&& rangedVoice->submittedAudio.size() == 3U
+		&& readEncodedFrame(rangedVoice->submittedAudio[2]) == 96000U,
+		"bounded range playback continues without an oversized full-source decode");
+	rangedManager.stopAudio(AudioAffect_Sound);
+	rangedManager.update();
+	rangedManager.closeDevice();
+	deleteInstance(rangedInfo);
+
+	LegacyAudioAssetSource legacySource(120000U);
+	std::unique_ptr<FakeEngine> legacyOwnedEngine = std::make_unique<FakeEngine>();
+	FakeEngine *legacyEngine = legacyOwnedEngine.get();
+	XAudio2AudioService legacyService(std::move(legacyOwnedEngine));
+	XAudio2AudioManager legacyManager(&legacyService, &legacySource);
+	legacyManager.openDevice();
+	AudioEventInfo *legacyInfo = newInstance(AudioEventInfo);
+	*legacyInfo = *fixtureInfo;
+	legacyInfo->m_attackSounds.clear();
+	legacyInfo->m_decaySounds.clear();
+	legacyInfo->m_sounds.clear();
+	legacyInfo->m_sounds.push_back(AsciiString("legacy.wav"));
+	FixtureEvent legacyEvent(AsciiString("fixture-legacy"));
+	legacyEvent.setAudioEventInfo(legacyInfo);
+	const AudioHandle legacyHandle = legacyManager.addAudioEvent(&legacyEvent);
+	legacyManager.update();
+	legacyManager.update();
+	FakeVoice *legacyVoice = legacyEngine->lastVoice;
+	check(legacyVoice != nullptr && legacyVoice->submitCalls == 2
+		&& legacyManager.isCurrentlyPlaying(legacyHandle)
+		&& legacySource.decodeBounds.size() == 2U
+		&& legacySource.decodeBounds[0] == 1U
+		&& legacySource.decodeBounds[1] == 120000U
+		&& legacyVoice->submittedAudio.size() == 2U
+		&& legacyVoice->submittedAudio[0].size() == 48000U * 4U
+		&& legacyVoice->submittedAudio[1].size() == 48000U * 4U
+		&& readEncodedFrame(legacyVoice->submittedAudio[0]) == 0U
+		&& readEncodedFrame(legacyVoice->submittedAudio[1]) == 48000U,
+		"legacy playback materializes one bounded phase instead of decoding growing prefixes");
+	check(legacyVoice != nullptr && legacyVoice->completeOldestBuffer(),
+		"legacy buffered fixture completes its oldest queued chunk");
+	legacyManager.update();
+	check(legacyVoice != nullptr && legacyVoice->submitCalls == 3
+		&& legacySource.decodeBounds.size() == 2U
+		&& legacyVoice->submittedAudio.size() == 3U
+		&& legacyVoice->submittedAudio[2].size() == 24000U * 4U
+		&& readEncodedFrame(legacyVoice->submittedAudio[2]) == 96000U,
+		"legacy buffered completion reuses the phase without another source decode");
+	LegacyAudioAssetSource replacementLegacySource(96000U);
+	legacyManager.setAssetSource(&replacementLegacySource);
+	check(legacyManager.getActiveAudioCount() == 0
+		&& !legacyManager.isCurrentlyPlaying(legacyHandle)
+		&& legacySource.decodeBounds.size() == 2U,
+		"replacing the source releases an active compatibility buffer without another decode");
+	FixtureEvent replacementLegacyEvent(AsciiString("fixture-replacement-legacy"));
+	replacementLegacyEvent.setAudioEventInfo(legacyInfo);
+	const AudioHandle replacementLegacyHandle = legacyManager.addAudioEvent(&replacementLegacyEvent);
+	legacyManager.update();
+	legacyManager.update();
+	check(legacyManager.isCurrentlyPlaying(replacementLegacyHandle)
+		&& replacementLegacySource.decodeBounds.size() == 2U
+		&& replacementLegacySource.decodeBounds[0] == 1U
+		&& replacementLegacySource.decodeBounds[1] == 96000U,
+		"legacy admission resumes with a fresh bounded buffer after source replacement");
+	legacyManager.closeDevice();
+	deleteInstance(legacyInfo);
+
+	LegacyAudioAssetSource oversizedLegacySource(19200000U, FALSE);
+	std::unique_ptr<FakeEngine> oversizedOwnedEngine = std::make_unique<FakeEngine>();
+	FakeEngine *oversizedEngine = oversizedOwnedEngine.get();
+	XAudio2AudioService oversizedService(std::move(oversizedOwnedEngine));
+	XAudio2AudioManager oversizedManager(&oversizedService, &oversizedLegacySource);
+	oversizedManager.openDevice();
+	AudioEventInfo *oversizedInfo = newInstance(AudioEventInfo);
+	*oversizedInfo = *fixtureInfo;
+	oversizedInfo->m_attackSounds.clear();
+	oversizedInfo->m_decaySounds.clear();
+	oversizedInfo->m_sounds.clear();
+	oversizedInfo->m_sounds.push_back(AsciiString("oversized-legacy.wav"));
+	FixtureEvent oversizedEvent(AsciiString("fixture-oversized-legacy"));
+	oversizedEvent.setAudioEventInfo(oversizedInfo);
+	const AudioHandle oversizedHandle = oversizedManager.addAudioEvent(&oversizedEvent);
+	oversizedManager.update();
+	check(!oversizedManager.isCurrentlyPlaying(oversizedHandle),
+		"oversized legacy playback releases its admitted handle");
+	check(oversizedEngine->lastVoice == nullptr,
+		"oversized legacy playback fails before creating a voice");
+	check(oversizedLegacySource.decodeBounds.size() == 1U
+		&& oversizedLegacySource.decodeBounds[0] == 1U,
+		"oversized legacy playback performs only its bounded format probe");
+	oversizedManager.closeDevice();
+	deleteInstance(oversizedInfo);
+
+	check(NativeAudioCompatibility::canBufferPcm(16777216U, 2U),
+		"legacy compatibility admission accepts an exact 64 MiB stereo PCM phase");
+	check(!NativeAudioCompatibility::canBufferPcm(16777217U, 2U),
+		"legacy compatibility admission rejects the first frame beyond 64 MiB");
+
+	LegacyAudioAssetSource malformedLegacySource(120000U, FALSE, 44100U, 2U);
+	std::unique_ptr<FakeEngine> malformedOwnedEngine = std::make_unique<FakeEngine>();
+	FakeEngine *malformedEngine = malformedOwnedEngine.get();
+	XAudio2AudioService malformedService(std::move(malformedOwnedEngine));
+	XAudio2AudioManager malformedManager(&malformedService, &malformedLegacySource);
+	malformedManager.openDevice();
+	AudioEventInfo *malformedInfo = newInstance(AudioEventInfo);
+	*malformedInfo = *fixtureInfo;
+	malformedInfo->m_attackSounds.clear();
+	malformedInfo->m_decaySounds.clear();
+	malformedInfo->m_sounds.clear();
+	malformedInfo->m_sounds.push_back(AsciiString("malformed-legacy.wav"));
+	FixtureEvent malformedEvent(AsciiString("fixture-malformed-legacy"));
+	malformedEvent.setAudioEventInfo(malformedInfo);
+	const AudioHandle malformedHandle = malformedManager.addAudioEvent(&malformedEvent);
+	malformedManager.update();
+	check(!malformedManager.isCurrentlyPlaying(malformedHandle)
+		&& malformedEngine->lastVoice == nullptr
+		&& malformedLegacySource.decodeBounds.size() == 1U
+		&& malformedLegacySource.decodeBounds[0] == 1U,
+		"non-shipping legacy PCM fails after its probe and before phase materialization");
+	malformedManager.closeDevice();
+	deleteInstance(malformedInfo);
+
+	LegacyAudioAssetSource budgetedLegacySource(10000000U);
+	std::unique_ptr<FakeEngine> budgetOwnedEngine = std::make_unique<FakeEngine>();
+	XAudio2AudioService budgetService(std::move(budgetOwnedEngine));
+	XAudio2AudioManager budgetManager(&budgetService, &budgetedLegacySource);
+	budgetManager.openDevice();
+	AudioEventInfo *budgetInfo = newInstance(AudioEventInfo);
+	*budgetInfo = *fixtureInfo;
+	budgetInfo->m_attackSounds.clear();
+	budgetInfo->m_decaySounds.clear();
+	budgetInfo->m_sounds.clear();
+	budgetInfo->m_sounds.push_back(AsciiString("budgeted-legacy.wav"));
+	FixtureEvent firstBudgetEvent(AsciiString("fixture-budgeted-legacy-first"));
+	firstBudgetEvent.setAudioEventInfo(budgetInfo);
+	const AudioHandle firstBudgetHandle = budgetManager.addAudioEvent(&firstBudgetEvent);
+	budgetManager.update();
+	budgetManager.update();
+	FixtureEvent secondBudgetEvent(AsciiString("fixture-budgeted-legacy-second"));
+	secondBudgetEvent.setAudioEventInfo(budgetInfo);
+	const AudioHandle secondBudgetHandle = budgetManager.addAudioEvent(&secondBudgetEvent);
+	budgetManager.update();
+	check(budgetManager.isCurrentlyPlaying(firstBudgetHandle)
+		&& !budgetManager.isCurrentlyPlaying(secondBudgetHandle)
+		&& budgetManager.getActiveAudioCount() == 1U
+		&& budgetedLegacySource.decodeBounds.size() == 3U
+		&& budgetedLegacySource.decodeBounds[0] == 1U
+		&& budgetedLegacySource.decodeBounds[1] == 10000000U
+		&& budgetedLegacySource.decodeBounds[2] == 1U,
+		"legacy compatibility buffers share one aggregate 64 MiB manager budget");
+	budgetManager.closeDevice();
+	deleteInstance(budgetInfo);
 
 	AudioEventInfo *simpleInfo = newInstance(AudioEventInfo);
 	*simpleInfo = *fixtureInfo;

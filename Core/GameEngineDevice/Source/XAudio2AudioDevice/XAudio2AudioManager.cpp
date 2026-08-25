@@ -1,4 +1,5 @@
 #include "XAudio2AudioDevice/XAudio2AudioManager.h"
+#include "XAudio2AudioDevice/NativeAudioCompatibility.h"
 
 #include "Common/AudioEventInfo.h"
 #include "Common/AudioAffect.h"
@@ -20,15 +21,75 @@
 class View;
 extern View *TheTacticalView;
 
+struct XAudio2CompatibilityPcmBudget
+{
+	std::size_t bytesInUse = 0;
+};
+
 namespace
 {
 constexpr Real LOGIC_FRAME_MS = MSEC_PER_LOGICFRAME_REAL;
 constexpr UnsignedInt DEFAULT_2D_CHANNELS = 32;
 constexpr UnsignedInt DEFAULT_3D_CHANNELS = 32;
 constexpr UnsignedInt DEFAULT_STREAM_CHANNELS = 8;
+constexpr UnsignedInt PCM_SAMPLE_RATE = 48000;
+constexpr UnsignedShort PCM_CHANNELS = 2;
 constexpr UnsignedInt PCM_MAX_FRAMES = 48000;
 constexpr UnsignedInt PCM_PREQUEUE_BUFFERS = 2;
 constexpr std::size_t MAX_VIRTUAL_AUDIO_BYTES = 64U * 1024U * 1024U;
+
+class BufferedAudioPcmStream final : public AudioPcmStream
+{
+public:
+	BufferedAudioPcmStream(AudioPcmChunk &&pcm,
+		std::shared_ptr<XAudio2CompatibilityPcmBudget> budget) :
+		m_pcm(std::move(pcm)), m_budget(std::move(budget)), m_reservedBytes(m_pcm.data.size())
+	{
+		m_budget->bytesInUse += m_reservedBytes;
+	}
+	~BufferedAudioPcmStream() override
+	{
+		if (m_budget != nullptr) {
+			m_budget->bytesInUse = m_reservedBytes <= m_budget->bytesInUse
+				? m_budget->bytesInUse - m_reservedBytes : 0;
+		}
+	}
+
+	UnsignedInt sampleRate() const override { return m_pcm.sampleRate; }
+	Real durationMS() const override
+	{
+		return static_cast<Real>(m_pcm.frameCount) * 1000.0f
+			/ static_cast<Real>(m_pcm.sampleRate);
+	}
+	Bool readPcm(AudioPcmChunk &chunk, UnsignedInt maxFrames) override
+	{
+		chunk = {};
+		if (maxFrames == 0 || m_nextFrame >= m_pcm.frameCount || m_pcm.channels == 0) {
+			return FALSE;
+		}
+		const UnsignedInt frameCount = std::min(maxFrames, m_pcm.frameCount - m_nextFrame);
+		const std::size_t bytesPerFrame = static_cast<std::size_t>(m_pcm.channels) * sizeof(Short);
+		const std::size_t begin = static_cast<std::size_t>(m_nextFrame) * bytesPerFrame;
+		const std::size_t end = begin + static_cast<std::size_t>(frameCount) * bytesPerFrame;
+		if (end > m_pcm.data.size()) {
+			return FALSE;
+		}
+		chunk.sampleRate = m_pcm.sampleRate;
+		chunk.channels = m_pcm.channels;
+		chunk.format = m_pcm.format;
+		chunk.frameCount = frameCount;
+		chunk.startSample = static_cast<std::int64_t>(m_nextFrame);
+		chunk.data.assign(m_pcm.data.begin() + begin, m_pcm.data.begin() + end);
+		m_nextFrame += frameCount;
+		return TRUE;
+	}
+
+private:
+	AudioPcmChunk m_pcm;
+	std::shared_ptr<XAudio2CompatibilityPcmBudget> m_budget;
+	std::size_t m_reservedBytes;
+	UnsignedInt m_nextFrame = 0;
+};
 
 class EngineVirtualAudioSource final : public AudioVirtualFileSource
 {
@@ -166,6 +227,7 @@ XAudio2AudioManager::XAudio2AudioManager() :
 
 XAudio2AudioManager::XAudio2AudioManager(XAudio2AudioService *service,
 	AudioAssetSource *assetSource) :
+	m_compatibilityPcmBudget(std::make_shared<XAudio2CompatibilityPcmBudget>()),
 	m_service(service),
 	m_ownsService(FALSE),
 	m_assetSource(assetSource),
@@ -749,10 +811,39 @@ Bool XAudio2AudioManager::preparePhaseSource(PlayingAudio &playing,
 		if (!m_assetSource->getDurationMS(fileName, playing.phaseDurationMS)
 			|| playing.phaseDurationMS <= 0.0f
 			|| !m_assetSource->decodePcmAt(fileName, probe, 1, 0)
-			|| probe.sampleRate == 0) {
+			|| probe.sampleRate != PCM_SAMPLE_RATE || probe.channels != PCM_CHANNELS
+			|| probe.format != AudioPcmFormat::SIGNED_16_INTERLEAVED_LITTLE_ENDIAN) {
 			return FALSE;
 		}
 		sampleRate = probe.sampleRate;
+		if (!durationToFrames(playing.phaseDurationMS, sampleRate,
+			playing.phaseTotalFrames)) {
+			return FALSE;
+		}
+		if (m_assetSource->supportsPcmRangeDecode()) {
+			return TRUE;
+		}
+		const std::size_t bytesPerFrame = static_cast<std::size_t>(probe.channels) * sizeof(Short);
+		if (m_compatibilityPcmBudget == nullptr
+			|| !NativeAudioCompatibility::canReservePcm(
+				m_compatibilityPcmBudget->bytesInUse,
+				playing.phaseTotalFrames, probe.channels)) {
+			return FALSE;
+		}
+		AudioPcmChunk pcm;
+		if (!m_assetSource->decodePcm(fileName, pcm, playing.phaseTotalFrames)
+			|| pcm.sampleRate != sampleRate || pcm.channels != probe.channels
+			|| pcm.format != probe.format || pcm.frameCount == 0
+			|| pcm.frameCount > playing.phaseTotalFrames
+			|| pcm.data.size() != static_cast<std::size_t>(pcm.frameCount) * bytesPerFrame) {
+			return FALSE;
+		}
+		playing.phaseTotalFrames = pcm.frameCount;
+		playing.phaseDurationMS = static_cast<Real>(pcm.frameCount) * 1000.0f
+			/ static_cast<Real>(sampleRate);
+		playing.pcmStream = std::make_unique<BufferedAudioPcmStream>(
+			std::move(pcm), m_compatibilityPcmBudget);
+		return TRUE;
 	}
 	return durationToFrames(playing.phaseDurationMS, sampleRate,
 		playing.phaseTotalFrames);

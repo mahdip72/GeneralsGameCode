@@ -44,6 +44,10 @@ target_sources(core_native_audio_asset_catalog_test PRIVATE
 
 target_link_libraries(core_native_audio_asset_catalog_test PRIVATE
     rts_native_audio_asset_source
+	core_wwlib
+	core_wwdebug
+	core_wwstub
+	winmm
 )
 
 target_compile_options(core_native_audio_asset_catalog_test PRIVATE

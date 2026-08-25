@@ -9,6 +9,8 @@
 #include <memory>
 #include <vector>
 
+struct XAudio2CompatibilityPcmBudget;
+
 class XAudio2AudioManager final : public AudioManager
 {
 public:
@@ -183,6 +185,7 @@ private:
 	std::unique_ptr<XAudio2AudioService> m_ownedService;
 	std::unique_ptr<AudioAssetSource> m_ownedAssetSource;
 	std::shared_ptr<AudioVirtualFileSource> m_ownedVirtualFileSource;
+	std::shared_ptr<XAudio2CompatibilityPcmBudget> m_compatibilityPcmBudget;
 	XAudio2AudioService *m_service;
 	Bool m_ownsService;
 	AudioAssetSource *m_assetSource;

@@ -44,6 +44,9 @@ public:
 		stream.reset();
 		return FALSE;
 	}
+	// Sources with an efficient seek/range implementation opt in explicitly.
+	// The default decodePcmAt compatibility shim may materialize growing prefixes.
+	virtual Bool supportsPcmRangeDecode() const { return FALSE; }
 
 	// Implementations that can seek should override this to avoid materializing
 	// an entire duration-only asset.  The default remains correct for small
@@ -219,6 +222,7 @@ public:
 		}
 		return TRUE;
 	}
+	Bool supportsPcmRangeDecode() const override { return TRUE; }
 
 	const void *getFileIdentity(const AsciiString &fileName) const override
 	{
@@ -314,6 +318,7 @@ public:
 		UnsignedInt maxFrames, UnsignedInt startFrame) const override;
 	Bool openPcmStream(const AsciiString &fileName,
 		std::unique_ptr<AudioPcmStream> &stream) const override;
+	Bool supportsPcmRangeDecode() const override { return TRUE; }
 	const void *getFileIdentity(const AsciiString &fileName) const override;
 	Bool matchesFileIdentity(const AsciiString &fileName,
 		const void *callerIdentity) const override;

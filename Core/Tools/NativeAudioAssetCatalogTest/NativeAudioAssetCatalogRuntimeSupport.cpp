@@ -1,5 +1,6 @@
 #include "Common/AsciiString.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -8,6 +9,21 @@
 // full implementation; the test deliberately avoids loading the legacy INI
 // and memory-manager graph just to exercise the neutral catalog.
 const AsciiString AsciiString::TheEmptyString;
+
+#if defined(RTS_DEBUG)
+void AsciiString::validate() const
+{
+	if (m_data == nullptr) {
+		return;
+	}
+	if (m_data->m_refCount <= 0 || m_data->m_refCount >= 32000
+		|| m_data->m_numCharsAllocated == 0
+		|| std::strlen(m_data->peek()) + 1U > m_data->m_numCharsAllocated) {
+		std::fprintf(stderr, "FAIL: invalid device-free AsciiString fixture\n");
+		std::exit(EXIT_FAILURE);
+	}
+}
+#endif
 
 AsciiString::AsciiString(const AsciiString &source) : m_data(source.m_data)
 {
@@ -72,7 +88,8 @@ void AsciiString::set(const char *source, int length)
 	const std::size_t bytes = sizeof(AsciiStringData) + static_cast<std::size_t>(length) + 1U;
 	m_data = static_cast<AsciiStringData *>(std::malloc(bytes));
 	if (m_data == nullptr) {
-		std::abort();
+		std::fprintf(stderr, "FAIL: device-free AsciiString allocation failed\n");
+		std::exit(EXIT_FAILURE);
 	}
 	m_data->m_refCount = 1;
 	m_data->m_numCharsAllocated = static_cast<unsigned short>(length + 1);
