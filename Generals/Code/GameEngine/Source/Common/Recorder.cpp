@@ -585,6 +585,13 @@ void RecorderClass::updatePlayback() {
 	// executed during playback.
 	CullBadCommandsResult result = cullBadCommands();
 
+	if (result.hasNewGameMessage) {
+		// The replay's frame-zero commands were recorded after the new map was
+		// initialized. Defer them until MSG_NEW_GAME has been consumed so their
+		// temporary AI groups cannot advance deterministic IDs before map setup.
+		return;
+	}
+
 	if (result.hasClearGameDataMessage) {
 		// TheSuperHackers @bugfix Stop appending more commands if the replay playback is about to end.
 		// Previously this would be able to append more commands, which could have unintended consequences,
@@ -1773,6 +1780,10 @@ RecorderClass::CullBadCommandsResult RecorderClass::cullBadCommands() {
 		else if (msg->getType() == GameMessage::MSG_CLEAR_GAME_DATA)
 		{
 			result.hasClearGameDataMessage = true;
+		}
+		else if (msg->getType() == GameMessage::MSG_NEW_GAME)
+		{
+			result.hasNewGameMessage = true;
 		}
 
 		msg = next;
