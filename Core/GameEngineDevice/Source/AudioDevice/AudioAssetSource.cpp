@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cerrno>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -534,6 +535,355 @@ void closeMemoryFFmpeg(AVFormatContext *&format, AVIOContext *&avio)
 	}
 }
 
+class SequentialPcmSink final : public AudioPcmSink
+{
+public:
+	static constexpr UnsignedInt MAX_PENDING_FRAMES =
+		2U * FFmpegAudioDecoder::MAX_CHUNK_FRAMES;
+
+	AudioPcmSubmitResult submit(AudioPcmChunk &&source) override
+	{
+		if (source.sampleRate != OUTPUT_SAMPLE_RATE || source.channels != OUTPUT_CHANNELS
+			|| source.format != AudioPcmFormat::SIGNED_16_INTERLEAVED_LITTLE_ENDIAN
+			|| source.frameCount == 0U
+			|| source.frameCount > MAX_PENDING_FRAMES - m_pendingFrames
+			|| source.frameCount > (std::numeric_limits<std::size_t>::max)()
+			/ OUTPUT_BYTES_PER_FRAME
+			|| source.data.size() != static_cast<std::size_t>(source.frameCount)
+			* OUTPUT_BYTES_PER_FRAME) {
+			return AudioPcmSubmitResult::FAILED;
+		}
+		m_pendingFrames += source.frameCount;
+		m_pending.push_back(std::move(source));
+		return AudioPcmSubmitResult::ACCEPTED;
+	}
+
+	void reset(std::uint64_t) override
+	{
+		m_pending.clear();
+		m_pendingFrames = 0;
+	}
+
+	UnsignedInt pendingFrames() const { return m_pendingFrames; }
+
+	Bool take(UnsignedInt maxFrames, AudioPcmChunk &chunk)
+	{
+		chunk = {};
+		if (maxFrames == 0U) {
+			return FALSE;
+		}
+		while (!m_pending.empty() && chunk.frameCount < maxFrames) {
+			AudioPcmChunk &source = m_pending.front();
+			const UnsignedInt frames = std::min(maxFrames - chunk.frameCount,
+				source.frameCount);
+			const std::size_t bytes = static_cast<std::size_t>(frames)
+				* OUTPUT_BYTES_PER_FRAME;
+			if (chunk.frameCount == 0U) {
+				chunk.sampleRate = source.sampleRate;
+				chunk.channels = source.channels;
+				chunk.format = source.format;
+				chunk.startSample = source.startSample;
+				chunk.generation = source.generation;
+				chunk.sequence = source.sequence;
+				chunk.discontinuity = source.discontinuity;
+			} else {
+				const bool hasExpectedStart = chunk.startSample <=
+					(std::numeric_limits<std::int64_t>::max)()
+					- static_cast<std::int64_t>(chunk.frameCount);
+				if (!hasExpectedStart || source.startSample != chunk.startSample
+					+ static_cast<std::int64_t>(chunk.frameCount)) {
+					chunk.discontinuity = true;
+				}
+				chunk.discontinuity = chunk.discontinuity || source.discontinuity;
+			}
+			chunk.data.insert(chunk.data.end(), source.data.begin(), source.data.begin() + bytes);
+			chunk.frameCount += frames;
+			m_pendingFrames -= frames;
+			if (frames == source.frameCount) {
+				m_pending.pop_front();
+			} else {
+				source.data.erase(source.data.begin(), source.data.begin() + bytes);
+				source.frameCount -= frames;
+				if (source.startSample <= (std::numeric_limits<std::int64_t>::max)()
+					- static_cast<std::int64_t>(frames)) {
+					source.startSample += static_cast<std::int64_t>(frames);
+				}
+				source.discontinuity = false;
+			}
+		}
+		return chunk.frameCount != 0U;
+	}
+
+private:
+	std::deque<AudioPcmChunk> m_pending;
+	UnsignedInt m_pendingFrames = 0;
+};
+
+class FFmpegPcmStream final : public AudioPcmStream
+{
+public:
+	FFmpegPcmStream() = default;
+	~FFmpegPcmStream() override { close(); }
+
+	FFmpegPcmStream(const FFmpegPcmStream &) = delete;
+	FFmpegPcmStream &operator=(const FFmpegPcmStream &) = delete;
+
+	bool openPath(const std::string &path)
+	{
+		close();
+		if (path.empty() || avformat_open_input(&m_format, path.c_str(), nullptr, nullptr) < 0
+			|| m_format == nullptr || avformat_find_stream_info(m_format, nullptr) < 0) {
+			close();
+			return false;
+		}
+		return initialize();
+	}
+
+	bool openBytes(std::vector<std::uint8_t> &&bytes)
+	{
+		close();
+		if (bytes.empty()) {
+			return false;
+		}
+		m_bytes = std::move(bytes);
+		if (!openMemoryFFmpeg(m_bytes, m_memoryInput, m_format, m_avio)) {
+			close();
+			return false;
+		}
+		return initialize();
+	}
+
+	UnsignedInt sampleRate() const override { return OUTPUT_SAMPLE_RATE; }
+	Real durationMS() const override { return m_durationMS; }
+
+	Bool readPcm(AudioPcmChunk &chunk, UnsignedInt maxFrames) override
+	{
+		chunk = {};
+		if (!m_opened || m_failed || maxFrames == 0U || maxFrames > MAX_OUTPUT_FRAMES) {
+			return FALSE;
+		}
+		while (chunk.frameCount < maxFrames) {
+			AudioPcmChunk part;
+			if (m_sink.take(maxFrames - chunk.frameCount, part)) {
+				if (!append(chunk, std::move(part), maxFrames)) {
+					m_failed = true;
+					break;
+				}
+				if (chunk.frameCount >= maxFrames) {
+					return TRUE;
+				}
+				continue;
+			}
+			if (m_eof || !decodeUntil(maxFrames - chunk.frameCount)) {
+				m_failed = m_failed || !m_eof;
+				break;
+			}
+		}
+		return chunk.frameCount != 0U ? TRUE : FALSE;
+	}
+
+private:
+	bool initialize()
+	{
+		if (m_format == nullptr) {
+			return false;
+		}
+		m_streamIndex = av_find_best_stream(m_format, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+		if (m_streamIndex < 0 || m_format->streams[m_streamIndex] == nullptr) {
+			return false;
+		}
+		const AVStream *stream = m_format->streams[m_streamIndex];
+		const AVCodecParameters *parameters = stream->codecpar;
+		const AVCodec *codec = parameters == nullptr
+			? nullptr : avcodec_find_decoder(parameters->codec_id);
+		m_codecContext = codec == nullptr ? nullptr : avcodec_alloc_context3(codec);
+		if (m_codecContext == nullptr || avcodec_parameters_to_context(m_codecContext, parameters) < 0
+			|| avcodec_open2(m_codecContext, codec, nullptr) < 0) {
+			return false;
+		}
+		m_packet = av_packet_alloc();
+		m_frame = av_frame_alloc();
+		if (m_packet == nullptr || m_frame == nullptr) {
+			return false;
+		}
+		if (stream->duration != AV_NOPTS_VALUE && stream->time_base.den != 0) {
+			const std::int64_t duration = av_rescale_q(stream->duration,
+				stream->time_base, AVRational { 1, 1000 });
+			m_durationMS = duration >= 0 ? static_cast<Real>(duration) : 0.0f;
+		} else if (m_format->duration != AV_NOPTS_VALUE) {
+			m_durationMS = m_format->duration >= 0
+				? static_cast<Real>(m_format->duration) / 1000.0f : 0.0f;
+		}
+		m_decoder.reset(1, m_sink);
+		m_opened = true;
+		return true;
+	}
+
+	bool append(AudioPcmChunk &destination, AudioPcmChunk &&source,
+		UnsignedInt maxFrames)
+	{
+		if (source.frameCount == 0U || source.frameCount > maxFrames
+			|| source.data.size() != static_cast<std::size_t>(source.frameCount)
+			* OUTPUT_BYTES_PER_FRAME) {
+			return false;
+		}
+		if (destination.frameCount == 0U) {
+			destination = std::move(source);
+			return true;
+		}
+		if (source.frameCount > maxFrames - destination.frameCount) {
+			return false;
+		}
+		const bool hasExpectedStart = destination.startSample <=
+			(std::numeric_limits<std::int64_t>::max)()
+			- static_cast<std::int64_t>(destination.frameCount);
+		if (!hasExpectedStart || source.startSample != destination.startSample
+			+ static_cast<std::int64_t>(destination.frameCount)) {
+			destination.discontinuity = true;
+		}
+		destination.discontinuity = destination.discontinuity || source.discontinuity;
+		destination.data.insert(destination.data.end(), source.data.begin(), source.data.end());
+		destination.frameCount += source.frameCount;
+		return true;
+	}
+
+	bool receiveFrames(UnsignedInt requiredFrames)
+	{
+		for (;;) {
+			const int result = avcodec_receive_frame(m_codecContext, m_frame);
+			if (result == AVERROR(EAGAIN)) {
+				m_needReceive = false;
+				if (m_flushSent) {
+					m_decoderEof = true;
+				}
+				return true;
+			}
+			if (result == AVERROR_EOF) {
+				m_needReceive = false;
+				m_decoderEof = true;
+				return true;
+			}
+			if (result < 0 || !m_decoder.convert(m_frame,
+				m_format->streams[m_streamIndex]->time_base.num,
+				m_format->streams[m_streamIndex]->time_base.den, m_sink)) {
+				return false;
+			}
+			av_frame_unref(m_frame);
+			if (m_sink.pendingFrames() >= requiredFrames) {
+				return true;
+			}
+		}
+	}
+
+	bool decodeUntil(UnsignedInt requiredFrames)
+	{
+		while (m_sink.pendingFrames() < requiredFrames && !m_eof) {
+			if (m_needReceive) {
+				if (!receiveFrames(requiredFrames)) {
+					return false;
+				}
+				if (m_sink.pendingFrames() >= requiredFrames) {
+					return true;
+				}
+				if (m_decoderEof) {
+					if (!m_decoder.drain(m_sink)) {
+						return false;
+					}
+					m_eof = true;
+					continue;
+				}
+			}
+			if (m_packetReady) {
+				const int result = avcodec_send_packet(m_codecContext, m_packet);
+				if (result == AVERROR(EAGAIN)) {
+					m_needReceive = true;
+					continue;
+				}
+				if (result < 0) {
+					return false;
+				}
+				av_packet_unref(m_packet);
+				m_packetReady = false;
+				m_needReceive = true;
+				continue;
+			}
+			if (m_inputEof) {
+				if (!m_flushSent) {
+					const int result = avcodec_send_packet(m_codecContext, nullptr);
+					if (result == AVERROR(EAGAIN)) {
+						m_needReceive = true;
+						continue;
+					}
+					if (result < 0) {
+						return false;
+					}
+					m_flushSent = true;
+					m_needReceive = true;
+					continue;
+				}
+				m_needReceive = true;
+				continue;
+			}
+			const int result = av_read_frame(m_format, m_packet);
+			if (result < 0) {
+				m_inputEof = true;
+				continue;
+			}
+			if (m_packet->stream_index != m_streamIndex) {
+				av_packet_unref(m_packet);
+				continue;
+			}
+			m_packetReady = true;
+		}
+		return true;
+	}
+
+	void close()
+	{
+		m_decoder.reset(0, m_sink);
+		av_frame_free(&m_frame);
+		av_packet_free(&m_packet);
+		avcodec_free_context(&m_codecContext);
+		if (m_avio != nullptr) {
+			closeMemoryFFmpeg(m_format, m_avio);
+		} else if (m_format != nullptr) {
+			avformat_close_input(&m_format);
+		}
+		m_memoryInput = {};
+		m_bytes.clear();
+		m_streamIndex = -1;
+		m_durationMS = 0.0f;
+		m_opened = false;
+		m_eof = false;
+		m_failed = false;
+		m_inputEof = false;
+		m_flushSent = false;
+		m_decoderEof = false;
+		m_needReceive = false;
+		m_packetReady = false;
+	}
+
+	std::vector<std::uint8_t> m_bytes;
+	MemoryFFmpegInput m_memoryInput;
+	AVFormatContext *m_format = nullptr;
+	AVIOContext *m_avio = nullptr;
+	AVCodecContext *m_codecContext = nullptr;
+	AVPacket *m_packet = nullptr;
+	AVFrame *m_frame = nullptr;
+	int m_streamIndex = -1;
+	Real m_durationMS = 0.0f;
+	SequentialPcmSink m_sink;
+	FFmpegAudioDecoder m_decoder;
+	bool m_opened = false;
+	bool m_eof = false;
+	bool m_failed = false;
+	bool m_inputEof = false;
+	bool m_flushSent = false;
+	bool m_decoderEof = false;
+	bool m_needReceive = false;
+	bool m_packetReady = false;
+};
+
 bool getFFmpegDuration(const std::string &path, Real &durationMS)
 {
 	AVFormatContext *format = nullptr;
@@ -774,7 +1124,32 @@ Bool FileAudioAssetSource::readVirtualFile(const AsciiString &fileName,
 		identity.clear();
 		return FALSE;
 	}
+	rememberVirtualIdentity(fileName, identity);
 	return TRUE;
+}
+
+const void *FileAudioAssetSource::findVirtualIdentity(const AsciiString &fileName) const
+{
+	for (const VirtualIdentity &entry : m_virtualIdentities) {
+		if (entry.fileName == fileName) {
+			return &entry.identity;
+		}
+	}
+	return nullptr;
+}
+
+const void *FileAudioAssetSource::rememberVirtualIdentity(const AsciiString &fileName,
+	const std::string &identity) const
+{
+	for (VirtualIdentity &entry : m_virtualIdentities) {
+		if (entry.fileName == fileName && entry.identity == identity) {
+			return &entry.identity;
+		}
+	}
+	// Keep older identities alive so an opaque pointer already returned to a
+	// caller never changes meaning when a virtual source generation changes.
+	m_virtualIdentities.push_front(VirtualIdentity { fileName, identity });
+	return &m_virtualIdentities.front().identity;
 }
 
 std::string FileAudioAssetSource::resolvePath(const AsciiString &fileName) const
@@ -875,6 +1250,40 @@ Bool FileAudioAssetSource::decodePcm(const AsciiString &fileName, AudioPcmChunk 
 	return decodePcmAt(fileName, chunk, maxFrames, 0);
 }
 
+Bool FileAudioAssetSource::openPcmStream(const AsciiString &fileName,
+	std::unique_ptr<AudioPcmStream> &stream) const
+{
+	stream.reset();
+	const std::string path = resolvePath(fileName);
+	if (path.empty()) {
+		return FALSE;
+	}
+	std::error_code error;
+	const bool looseExists = std::filesystem::exists(path, error) && !error;
+#if defined(RTS_HAS_FFMPEG)
+	if (looseExists) {
+		std::unique_ptr<FFmpegPcmStream> decoder = std::make_unique<FFmpegPcmStream>();
+		if (decoder->openPath(path)) {
+			stream = std::move(decoder);
+			return TRUE;
+		}
+		return FALSE;
+	}
+	std::vector<std::uint8_t> bytes;
+	std::string identity;
+	if (readVirtualFile(fileName, bytes, identity)) {
+		std::unique_ptr<FFmpegPcmStream> decoder = std::make_unique<FFmpegPcmStream>();
+		if (decoder->openBytes(std::move(bytes))) {
+			stream = std::move(decoder);
+			return TRUE;
+		}
+	}
+#else
+	(void)looseExists;
+#endif
+	return FALSE;
+}
+
 Bool FileAudioAssetSource::decodePcmAt(const AsciiString &fileName, AudioPcmChunk &chunk,
 	UnsignedInt maxFrames, UnsignedInt startFrame) const
 {
@@ -924,18 +1333,15 @@ const void *FileAudioAssetSource::getFileIdentity(const AsciiString &fileName) c
 		m_identityPaths.push_back(path);
 		return &m_identityPaths.back();
 	}
+	if (const void *cachedIdentity = findVirtualIdentity(fileName)) {
+		return cachedIdentity;
+	}
 	std::vector<std::uint8_t> bytes;
 	std::string identity;
 	if (!readVirtualFile(fileName, bytes, identity)) {
 		return nullptr;
 	}
-	for (std::string &storedIdentity : m_identityPaths) {
-		if (storedIdentity == identity) {
-			return &storedIdentity;
-		}
-	}
-	m_identityPaths.push_back(identity);
-	return &m_identityPaths.back();
+	return findVirtualIdentity(fileName);
 }
 
 Bool FileAudioAssetSource::matchesFileIdentity(const AsciiString &fileName,
@@ -944,11 +1350,17 @@ Bool FileAudioAssetSource::matchesFileIdentity(const AsciiString &fileName,
 	if (callerIdentity == nullptr) {
 		return FALSE;
 	}
-	if (callerIdentity == getFileIdentity(fileName)) {
+	const std::string path = resolvePath(fileName);
+	std::error_code error;
+	if (!path.empty() && std::filesystem::exists(path, error) && !error
+		&& callerIdentity == getFileIdentity(fileName)) {
 		return TRUE;
 	}
-	return m_virtualSource != nullptr
-		&& m_virtualSource->matchesIdentity(fileName, callerIdentity);
+	if (m_virtualSource != nullptr
+		&& m_virtualSource->matchesIdentity(fileName, callerIdentity)) {
+		return TRUE;
+	}
+	return callerIdentity == findVirtualIdentity(fileName);
 }
 
 Bool FileAudioAssetSource::getEventDurationMS(const AsciiString &attackFile,

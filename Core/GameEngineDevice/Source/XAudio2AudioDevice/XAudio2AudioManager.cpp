@@ -27,6 +27,7 @@ constexpr UnsignedInt DEFAULT_2D_CHANNELS = 32;
 constexpr UnsignedInt DEFAULT_3D_CHANNELS = 32;
 constexpr UnsignedInt DEFAULT_STREAM_CHANNELS = 8;
 constexpr UnsignedInt PCM_MAX_FRAMES = 48000;
+constexpr UnsignedInt PCM_PREQUEUE_BUFFERS = 2;
 constexpr std::size_t MAX_VIRTUAL_AUDIO_BYTES = 64U * 1024U * 1024U;
 
 class EngineVirtualAudioSource final : public AudioVirtualFileSource
@@ -203,20 +204,11 @@ Bool XAudio2AudioManager::runInjectedPlaybackProbe(AsciiString fileName)
 	playing.generation = m_lifecycleGeneration;
 	playing.phase = PP_Sound;
 	playing.assetFileName = fileName;
-	playing.assetIdentity = m_assetSource->getFileIdentity(fileName);
-	if (!m_assetSource->getDurationMS(fileName, playing.phaseDurationMS)
-		|| playing.phaseDurationMS <= 0.0f) {
-		return FALSE;
-	}
-	AudioPcmChunk probe;
-	if (!m_assetSource->decodePcmAt(fileName, probe, 1, 0) || probe.sampleRate == 0) {
-		return FALSE;
-	}
-	if (!durationToFrames(playing.phaseDurationMS, probe.sampleRate, playing.phaseTotalFrames)) {
+	if (!preparePhaseSource(playing, fileName)) {
 		releaseVoice(playing);
 		return FALSE;
 	}
-	if (!ensureVoice(playing) || !submitPhase(playing)) {
+	if (!ensureVoice(playing) || !queuePhaseLowWater(playing)) {
 		releaseVoice(playing);
 		return FALSE;
 	}
@@ -647,7 +639,7 @@ void XAudio2AudioManager::processPlayRequest(AudioRequest *request)
 		}
 	}
 
-	m_playing.push_back(playing);
+	m_playing.push_back(std::move(playing));
 	if (isMusic(*event)) {
 		m_activeMusicTrack = event->getEventName();
 	}
@@ -710,38 +702,60 @@ void XAudio2AudioManager::startNextPhase(PlayingAudio &playing)
 			continue;
 		}
 
-		playing.phaseDurationMS = 0.0f;
-		if (m_assetSource == nullptr
-			|| !m_assetSource->getDurationMS(fileName, playing.phaseDurationMS)
-			|| playing.phaseDurationMS <= 0.0f) {
-			// Unreadable assets are terminal failures, never fabricated zero-length
-			// phases that silently advance or loop forever.
-			failPlaying(playing);
-			return;
-		}
-		playing.phaseRemainingMS = playing.phaseDurationMS;
 		{
 			playing.assetFileName = fileName;
-			playing.assetIdentity = m_assetSource == nullptr
-				? nullptr : m_assetSource->getFileIdentity(fileName);
 			playing.phaseSubmittedFrames = 0;
+			playing.phaseQueuedBuffers = 0;
 			playing.phaseCompletedFrames = 0;
 			playing.phaseTotalFrames = 0;
 			playing.phaseFirstSequence = playing.voiceSequence;
-			AudioPcmChunk probe;
-			if (!m_assetSource->decodePcmAt(fileName, probe, 1, 0)
-				|| probe.sampleRate == 0
-				|| !durationToFrames(playing.phaseDurationMS, probe.sampleRate,
-					playing.phaseTotalFrames)) {
+			if (!preparePhaseSource(playing, fileName)) {
+				// Unreadable assets are terminal failures, never fabricated zero-length
+				// phases that silently advance or loop forever.
 				failPlaying(playing);
 				return;
 			}
-			if (!ensureVoice(playing) || !submitPhase(playing)) {
+			playing.phaseRemainingMS = playing.phaseDurationMS;
+			if (!ensureVoice(playing) || !queuePhaseLowWater(playing)) {
 				failPlaying(playing);
 			}
 			return;
 		}
 	}
+}
+
+Bool XAudio2AudioManager::preparePhaseSource(PlayingAudio &playing,
+	const AsciiString &fileName)
+{
+	playing.pcmStream.reset();
+	playing.phaseDurationMS = 0.0f;
+	playing.phaseTotalFrames = 0;
+	if (m_assetSource == nullptr) {
+		return FALSE;
+	}
+
+	std::unique_ptr<AudioPcmStream> stream;
+	UnsignedInt sampleRate = 0;
+	if (m_assetSource->openPcmStream(fileName, stream)) {
+		if (stream == nullptr || stream->durationMS() <= 0.0f
+			|| stream->sampleRate() == 0) {
+			return FALSE;
+		}
+		playing.phaseDurationMS = stream->durationMS();
+		sampleRate = stream->sampleRate();
+		playing.pcmStream = std::move(stream);
+	} else {
+		AudioPcmChunk probe;
+		if (!m_assetSource->getDurationMS(fileName, playing.phaseDurationMS)
+			|| playing.phaseDurationMS <= 0.0f
+			|| !m_assetSource->decodePcmAt(fileName, probe, 1, 0)
+			|| probe.sampleRate == 0) {
+			return FALSE;
+		}
+		sampleRate = probe.sampleRate;
+	}
+	return durationToFrames(playing.phaseDurationMS, sampleRate,
+		playing.phaseTotalFrames);
 }
 
 Bool XAudio2AudioManager::ensureVoice(PlayingAudio &playing)
@@ -788,8 +802,11 @@ Bool XAudio2AudioManager::submitPhase(PlayingAudio &playing)
 	const UnsignedInt framesToSubmit = std::min(
 		PCM_MAX_FRAMES, playing.phaseTotalFrames - playing.phaseSubmittedFrames);
 	AudioPcmChunk chunk;
-	if (!m_assetSource->decodePcmAt(fileName, chunk, framesToSubmit,
-		playing.phaseSubmittedFrames)) {
+	const Bool decoded = playing.pcmStream != nullptr
+		? playing.pcmStream->readPcm(chunk, framesToSubmit)
+		: m_assetSource->decodePcmAt(fileName, chunk, framesToSubmit,
+			playing.phaseSubmittedFrames);
+	if (!decoded) {
 		return FALSE;
 	}
 	if (chunk.frameCount == 0 || chunk.frameCount > framesToSubmit) {
@@ -804,6 +821,18 @@ Bool XAudio2AudioManager::submitPhase(PlayingAudio &playing)
 	}
 	playing.phaseSubmittedFrames += submittedFrames;
 	m_service->setVoiceVolume(playing.voice, effectiveVolume(playing));
+	return TRUE;
+}
+
+Bool XAudio2AudioManager::queuePhaseLowWater(PlayingAudio &playing)
+{
+	while (playing.phaseQueuedBuffers < PCM_PREQUEUE_BUFFERS
+		&& playing.phaseSubmittedFrames < playing.phaseTotalFrames) {
+		if (!submitPhase(playing)) {
+			return FALSE;
+		}
+		++playing.phaseQueuedBuffers;
+	}
 	return TRUE;
 }
 
@@ -822,6 +851,9 @@ void XAudio2AudioManager::drainCompletions()
 				&& playing.generation == completion.generation
 				&& completion.sequence >= playing.phaseFirstSequence
 				&& completion.sequence < playing.voiceSequence) {
+				if (playing.phaseQueuedBuffers > 0) {
+					--playing.phaseQueuedBuffers;
+				}
 				if (completion.endSample >= 0) {
 					playing.phaseCompletedFrames = std::min(
 						playing.phaseTotalFrames,
@@ -835,8 +867,12 @@ void XAudio2AudioManager::drainCompletions()
 					break;
 				}
 				if (playing.phaseSubmittedFrames < playing.phaseTotalFrames) {
-					if (!submitPhase(playing)) {
+					if (!queuePhaseLowWater(playing)) {
 						failPlaying(playing);
+					} else {
+						// The completion was observed by the owner, so submit the
+						// replacement immediately instead of waiting for the next update.
+						m_service->serviceVoice(playing.voice);
 					}
 				} else {
 					playing.phaseRemainingMS = 0.0f;
@@ -1065,7 +1101,7 @@ void XAudio2AudioManager::resumeAudio(AudioAffect which)
 				m_service->resumeVoice(playing.voice);
 			}
 			if (playing.phaseSubmittedFrames < playing.phaseTotalFrames) {
-				if (!submitPhase(playing)) {
+				if (!queuePhaseLowWater(playing)) {
 					failPlaying(playing);
 				}
 			} else if (playing.phaseCompletedFrames >= playing.phaseTotalFrames) {

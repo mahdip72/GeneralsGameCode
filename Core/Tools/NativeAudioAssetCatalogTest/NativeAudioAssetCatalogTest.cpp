@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <process.h>
 #include <string>
 #include <utility>
 
@@ -25,10 +26,12 @@ public:
 		if (fileName.str() == nullptr || std::string(fileName.str()) != m_name) {
 			return FALSE;
 		}
+		++m_readCalls;
 		bytes = m_bytes;
 		identity = "archive:" + m_name;
 		return TRUE;
 	}
+	UnsignedInt getReadCalls() const { return m_readCalls; }
 	Bool matchesIdentity(const AsciiString &fileName, const void *identity) const override
 	{
 		return fileName.str() != nullptr && std::string(fileName.str()) == m_name
@@ -38,6 +41,7 @@ public:
 private:
 	std::string m_name;
 	std::vector<std::uint8_t> m_bytes;
+	mutable UnsignedInt m_readCalls = 0;
 };
 
 void writeWaveFile(const std::filesystem::path &path, UnsignedInt durationMS,
@@ -90,6 +94,44 @@ std::vector<std::uint8_t> readBinaryFile(const std::filesystem::path &path)
 	check(input.good(), "binary fixture is fully read");
 	return bytes;
 }
+
+int runFFmpeg(const std::string &executable, const std::filesystem::path &input,
+	const char *codec, const std::filesystem::path &output)
+{
+	const std::string inputPath = input.string();
+	const std::string outputPath = output.string();
+	const char *arguments[] = {
+		executable.c_str(), "-y", "-v", "error", "-i", inputPath.c_str(),
+		"-c:a", codec, outputPath.c_str(), nullptr
+	};
+	return static_cast<int>(_spawnv(_P_WAIT, executable.c_str(), arguments));
+}
+
+#if defined(RTS_NATIVE_AUDIO_HAS_FFMPEG_CLI)
+std::uint64_t consumePcmStream(AudioPcmStream &stream)
+{
+	std::uint64_t expectedStart = 0;
+	UnsignedInt readCount = 0;
+	for (;;) {
+		AudioPcmChunk chunk;
+		if (!stream.readPcm(chunk, 48000U)) {
+			break;
+		}
+		check(chunk.sampleRate == 48000U && chunk.channels == 2U
+			&& chunk.format == AudioPcmFormat::SIGNED_16_INTERLEAVED_LITTLE_ENDIAN
+			&& chunk.frameCount > 0U && chunk.frameCount <= 48000U,
+			"persistent PCM stream returns bounded shipping chunks");
+		check(chunk.startSample == static_cast<std::int64_t>(expectedStart),
+			"persistent PCM stream preserves contiguous sample offsets");
+		check(chunk.data.size() == static_cast<std::size_t>(chunk.frameCount)
+			* 2U * sizeof(Short), "persistent PCM stream returns complete frames");
+		expectedStart += chunk.frameCount;
+		check(++readCount <= 16U, "persistent PCM stream remains bounded at EOF");
+	}
+	check(readCount >= 4U, "persistent PCM stream consumes multiple sequential chunks");
+	return expectedStart;
+}
+#endif
 }
 
 namespace
@@ -103,8 +145,16 @@ void check(bool condition, const char *message)
 }
 }
 
-int main()
+int main(int argc, char *argv[])
 {
+#if defined(RTS_NATIVE_AUDIO_HAS_FFMPEG_CLI)
+	check(argc == 3 && std::string(argv[1]) == "--ffmpeg" && argv[2][0] != '\0',
+		"FFmpeg-enabled catalog test receives the resolved fixture executable");
+	const std::string ffmpegExecutable = argv[2];
+#else
+	(void)argc;
+	(void)argv;
+#endif
 	AudioAssetCatalog catalog;
 	Real duration = 0.0f;
 	catalog.setDurationMS(AsciiString("attack.wav"), 100.0f);
@@ -219,8 +269,10 @@ int main()
 		archiveChunk, 3U, 7U)
 		&& archiveChunk.frameCount == 3U && archiveChunk.startSample == 7,
 		"archive-backed audio decodes a bounded continuation");
-	check(archiveAwareSource.getFileIdentity(AsciiString("archive\\virtual_main.wav")) != nullptr,
-		"archive-backed audio exposes source-owned identity");
+	const UnsignedInt fallbackReadsBeforeIdentity = archiveSource.getReadCalls();
+	check(archiveAwareSource.getFileIdentity(AsciiString("archive\\virtual_main.wav")) != nullptr
+		&& archiveSource.getReadCalls() == fallbackReadsBeforeIdentity,
+		"archive fallback exposes cached identity without another provider read");
 	check(archiveAwareSource.matchesFileIdentity(
 		AsciiString("archive\\virtual_main.wav"), &archiveSource),
 		"archive source bridges a legacy caller identity through its provider");
@@ -270,11 +322,9 @@ int main()
 	check(!realSource.getDurationMS(AsciiString(corruptPath.string().c_str()), duration),
 		"filesystem source safely rejects corrupt assets");
 
-#if defined(RTS_NATIVE_AUDIO_HAS_FFMPEG)
+#if defined(RTS_NATIVE_AUDIO_HAS_FFMPEG_CLI)
 	const std::filesystem::path adpcmPath = root / "adpcm.wav";
-	const std::string adpcmCommand = "ffmpeg -y -v error -i \""
-		+ mainPath.string() + "\" -c:a adpcm_ima_wav \"" + adpcmPath.string() + "\"";
-	check(std::system(adpcmCommand.c_str()) == 0,
+	check(runFFmpeg(ffmpegExecutable, mainPath, "adpcm_ima_wav", adpcmPath) == 0,
 		"FFmpeg creates a deterministic IMA ADPCM fixture");
 	MemoryVirtualAudioSource adpcmArchive("archive\\adpcm.wav", readBinaryFile(adpcmPath));
 	FileAudioAssetSource adpcmSource(AsciiString(root.string().c_str()), &adpcmArchive);
@@ -289,9 +339,7 @@ int main()
 		"archive ADPCM PCM remains bounded 48 kHz stereo s16");
 
 	const std::filesystem::path genericPath = root / "main.aiff";
-	const std::string ffmpegCommand = "ffmpeg -y -v error -i \""
-		+ mainPath.string() + "\" -c:a pcm_s16le \"" + genericPath.string() + "\"";
-	check(std::system(ffmpegCommand.c_str()) == 0,
+	check(runFFmpeg(ffmpegExecutable, mainPath, "pcm_s16le", genericPath) == 0,
 		"FFmpeg creates a deterministic non-WAVE audio container");
 	check(realSource.getDurationMS(AsciiString(genericPath.string().c_str()), duration)
 		&& duration == 350.0f, "FFmpeg source reports exact generic audio duration");
@@ -301,6 +349,44 @@ int main()
 	check(genericChunk.sampleRate == 48000U && genericChunk.channels == 2U
 		&& genericChunk.frameCount == 3U && genericChunk.data.size() == 3U * 2U * sizeof(Short),
 		"FFmpeg generic PCM remains bounded 48 kHz stereo s16");
+
+	const std::filesystem::path longPath = root / "long.wav";
+	const std::filesystem::path longAdpcmPath = root / "long_adpcm.wav";
+	writeWaveFile(longPath, 5000U);
+	check(runFFmpeg(ffmpegExecutable, longPath, "adpcm_ima_wav", longAdpcmPath) == 0,
+		"FFmpeg creates the persistent-stream ADPCM fixture");
+	std::unique_ptr<AudioPcmStream> looseStream;
+	check(realSource.openPcmStream(
+		AsciiString(longAdpcmPath.string().c_str()), looseStream) && looseStream != nullptr,
+		"filesystem source opens a persistent FFmpeg PCM stream");
+	check(looseStream->sampleRate() == 48000U && looseStream->durationMS() > 4900.0f
+		&& looseStream->durationMS() < 5100.0f,
+		"persistent filesystem stream exposes bounded output metadata");
+	const std::uint64_t looseFrames = consumePcmStream(*looseStream);
+	check(looseFrames >= 4U * 48000U && looseFrames <= 6U * 48000U,
+		"persistent filesystem stream drains the complete fixture");
+
+	MemoryVirtualAudioSource longArchive("archive\\long_adpcm.wav", readBinaryFile(longAdpcmPath));
+	FileAudioAssetSource longArchiveSource(AsciiString(root.string().c_str()), &longArchive);
+	std::unique_ptr<AudioPcmStream> archiveStream;
+	check(longArchiveSource.openPcmStream(AsciiString("archive\\long_adpcm.wav"), archiveStream)
+		&& archiveStream != nullptr, "archive source opens a persistent FFmpeg PCM stream");
+	check(longArchive.getReadCalls() == 1U,
+		"archive-backed persistent stream reads its virtual asset exactly once");
+	const void *archiveIdentity = longArchiveSource.getFileIdentity(
+		AsciiString("archive\\long_adpcm.wav"));
+	check(archiveIdentity != nullptr && longArchive.getReadCalls() == 1U
+		&& longArchiveSource.matchesFileIdentity(
+			AsciiString("archive\\long_adpcm.wav"), archiveIdentity)
+		&& longArchive.getReadCalls() == 1U,
+		"stream-cached archive identity matches without rereading the asset");
+	const std::uint64_t archiveFrames = consumePcmStream(*archiveStream);
+	check(archiveFrames >= 4U * 48000U && archiveFrames <= 6U * 48000U,
+		"persistent archive stream drains the complete fixture");
+	// Release decoder/file handles before removing the temporary fixture tree.
+	archiveStream.reset();
+	looseStream.reset();
+
 #endif
 	std::filesystem::remove_all(root);
 	return 0;

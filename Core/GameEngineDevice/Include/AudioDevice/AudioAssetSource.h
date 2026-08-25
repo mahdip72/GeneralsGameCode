@@ -13,6 +13,19 @@
 #include <utility>
 #include <vector>
 
+// Optional per-playback sequential decoder.  A stream owns its decoder state
+// and advances monotonically; callers must open a new stream for a new phase
+// or after a source-generation change.
+class AudioPcmStream
+{
+public:
+	virtual ~AudioPcmStream() = default;
+
+	virtual UnsignedInt sampleRate() const = 0;
+	virtual Real durationMS() const = 0;
+	virtual Bool readPcm(AudioPcmChunk &chunk, UnsignedInt maxFrames) = 0;
+};
+
 // Neutral source/decoder seam used by both device-free scripts and native audio.
 // Implementations own their storage; callers receive bounded, fixed-format PCM.
 class AudioAssetSource
@@ -23,6 +36,14 @@ public:
 	virtual Bool getDurationMS(const AsciiString &fileName, Real &durationMS) const = 0;
 	virtual Bool decodePcm(const AsciiString &fileName, AudioPcmChunk &chunk,
 		UnsignedInt maxFrames) const = 0;
+
+	// Optional persistent sequential decoder.  The default keeps injected and
+	// legacy sources source-compatible; callers retain decodePcmAt as fallback.
+	virtual Bool openPcmStream(const AsciiString &, std::unique_ptr<AudioPcmStream> &stream) const
+	{
+		stream.reset();
+		return FALSE;
+	}
 
 	// Implementations that can seek should override this to avoid materializing
 	// an entire duration-only asset.  The default remains correct for small
@@ -291,6 +312,8 @@ public:
 		UnsignedInt maxFrames) const override;
 	Bool decodePcmAt(const AsciiString &fileName, AudioPcmChunk &chunk,
 		UnsignedInt maxFrames, UnsignedInt startFrame) const override;
+	Bool openPcmStream(const AsciiString &fileName,
+		std::unique_ptr<AudioPcmStream> &stream) const override;
 	const void *getFileIdentity(const AsciiString &fileName) const override;
 	Bool matchesFileIdentity(const AsciiString &fileName,
 		const void *callerIdentity) const override;
@@ -299,23 +322,35 @@ public:
 	{
 		m_ownedVirtualSource.reset();
 		m_virtualSource = virtualSource;
+		m_virtualIdentities.clear();
 	}
 	void setOwnedVirtualFileSource(std::shared_ptr<AudioVirtualFileSource> virtualSource)
 	{
 		m_ownedVirtualSource = std::move(virtualSource);
 		m_virtualSource = m_ownedVirtualSource.get();
+		m_virtualIdentities.clear();
 	}
 
 	Bool getEventDurationMS(const AsciiString &attackFile, const AsciiString &mainFile,
 		const AsciiString &decayFile, Real &durationMS) const;
 
 private:
+	struct VirtualIdentity
+	{
+		AsciiString fileName;
+		std::string identity;
+	};
+
 	std::string resolvePath(const AsciiString &fileName) const;
 	Bool readVirtualFile(const AsciiString &fileName, std::vector<std::uint8_t> &bytes,
 		std::string &identity) const;
+	const void *findVirtualIdentity(const AsciiString &fileName) const;
+	const void *rememberVirtualIdentity(const AsciiString &fileName,
+		const std::string &identity) const;
 
 	std::string m_rootDirectory;
 	std::shared_ptr<AudioVirtualFileSource> m_ownedVirtualSource;
 	AudioVirtualFileSource *m_virtualSource = nullptr;
 	mutable std::list<std::string> m_identityPaths;
+	mutable std::list<VirtualIdentity> m_virtualIdentities;
 };

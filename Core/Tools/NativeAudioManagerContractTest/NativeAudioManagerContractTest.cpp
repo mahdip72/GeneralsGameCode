@@ -107,6 +107,7 @@ namespace
 				return E_FAIL;
 			}
 			m_lastContext = buffer.pContext;
+			m_pendingContexts.push_back(buffer.pContext);
 			++submitCalls;
 			if (m_totalSubmitCalls != nullptr) {
 				++(*m_totalSubmitCalls);
@@ -137,11 +138,27 @@ namespace
 		void destroy() noexcept override { m_callback = nullptr; }
 		Bool completeLastBuffer() noexcept
 		{
-			if (m_callback == nullptr || m_lastContext == nullptr) {
+			if (m_callback == nullptr || m_pendingContexts.empty()) {
 				return FALSE;
 			}
-			void *context = m_lastContext;
-			m_lastContext = nullptr;
+			void *context = m_pendingContexts.back();
+			m_pendingContexts.pop_back();
+			if (context == m_lastContext) {
+				m_lastContext = m_pendingContexts.empty() ? nullptr : m_pendingContexts.back();
+			}
+			m_callback->OnBufferEnd(context);
+			return TRUE;
+		}
+		Bool completeOldestBuffer() noexcept
+		{
+			if (m_callback == nullptr || m_pendingContexts.empty()) {
+				return FALSE;
+			}
+			void *context = m_pendingContexts.front();
+			m_pendingContexts.erase(m_pendingContexts.begin());
+			if (context == m_lastContext) {
+				m_lastContext = m_pendingContexts.empty() ? nullptr : m_pendingContexts.back();
+			}
 			m_callback->OnBufferEnd(context);
 			return TRUE;
 		}
@@ -161,6 +178,7 @@ namespace
 		int *m_totalSubmitCalls;
 		IXAudio2VoiceCallback *m_callback = nullptr;
 		void *m_lastContext = nullptr;
+		std::vector<void *> m_pendingContexts;
 	};
 
 	class FakeEngine final : public IXAudio2AudioEngineBackend
@@ -223,6 +241,94 @@ namespace
 	public:
 		explicit FixtureEvent(const AsciiString &name) : AudioEventRTS(name) {}
 		void setDelayForTest(Real delay) { m_delay = delay; }
+	};
+
+	class CountingPcmStream final : public AudioPcmStream
+	{
+	public:
+		CountingPcmStream(UnsignedInt totalFrames, std::vector<UnsignedInt> &readStarts,
+			std::vector<UnsignedInt> &readBounds) :
+			m_totalFrames(totalFrames),
+			m_readStarts(readStarts),
+			m_readBounds(readBounds)
+		{
+		}
+
+		UnsignedInt sampleRate() const override { return 48000U; }
+		Real durationMS() const override
+		{
+			return static_cast<Real>(m_totalFrames) * 1000.0f / 48000.0f;
+		}
+		Bool readPcm(AudioPcmChunk &chunk, UnsignedInt maxFrames) override
+		{
+			m_readStarts.push_back(m_nextFrame);
+			m_readBounds.push_back(maxFrames);
+			if (maxFrames == 0 || m_nextFrame >= m_totalFrames) {
+				chunk = {};
+				return FALSE;
+			}
+			const UnsignedInt frameCount = std::min(maxFrames, m_totalFrames - m_nextFrame);
+			chunk.sampleRate = 48000U;
+			chunk.channels = 2U;
+			chunk.format = AudioPcmFormat::SIGNED_16_INTERLEAVED_LITTLE_ENDIAN;
+			chunk.frameCount = frameCount;
+			chunk.startSample = static_cast<std::int64_t>(m_nextFrame);
+			chunk.data.assign(static_cast<std::size_t>(frameCount) * 4U, 0x5aU);
+			m_nextFrame += frameCount;
+			return TRUE;
+		}
+
+	private:
+		UnsignedInt m_totalFrames;
+		UnsignedInt m_nextFrame = 0;
+		std::vector<UnsignedInt> &m_readStarts;
+		std::vector<UnsignedInt> &m_readBounds;
+	};
+
+	class StreamingAudioAssetSource final : public AudioAssetSource
+	{
+	public:
+		explicit StreamingAudioAssetSource(UnsignedInt totalFrames) : m_totalFrames(totalFrames) {}
+
+		Bool getDurationMS(const AsciiString &, Real &durationMS) const override
+		{
+			++getDurationCalls;
+			durationMS = static_cast<Real>(m_totalFrames) * 1000.0f / 48000.0f;
+			return TRUE;
+		}
+		Bool decodePcm(const AsciiString &, AudioPcmChunk &chunk, UnsignedInt) const override
+		{
+			++decodePcmCalls;
+			chunk = {};
+			return FALSE;
+		}
+		Bool decodePcmAt(const AsciiString &, AudioPcmChunk &chunk,
+			UnsignedInt, UnsignedInt) const override
+		{
+			++decodePcmAtCalls;
+			chunk = {};
+			return FALSE;
+		}
+		Bool openPcmStream(const AsciiString &, std::unique_ptr<AudioPcmStream> &stream) const override
+		{
+			++openStreamCalls;
+			stream = std::make_unique<CountingPcmStream>(m_totalFrames, readStarts, readBounds);
+			return TRUE;
+		}
+		const void *getFileIdentity(const AsciiString &) const override
+		{
+			return this;
+		}
+
+		mutable int openStreamCalls = 0;
+		mutable int getDurationCalls = 0;
+		mutable int decodePcmCalls = 0;
+		mutable int decodePcmAtCalls = 0;
+		mutable std::vector<UnsignedInt> readStarts;
+		mutable std::vector<UnsignedInt> readBounds;
+
+	private:
+		UnsignedInt m_totalFrames;
 	};
 }
 
@@ -422,18 +528,59 @@ int main()
 	manager.update();
 	manager.update();
 	FakeVoice *longVoice = engine->lastVoice;
-	check(longVoice != nullptr && longVoice->submitCalls == 1,
-		"duration-only long asset starts with one bounded PCM chunk");
-	check(longVoice->completeLastBuffer(), "fake backend completes the first long-asset chunk");
+	check(longVoice != nullptr && longVoice->submitCalls == 2,
+		"duration-only long asset starts with two bounded PCM chunks");
+	check(longVoice->completeOldestBuffer(), "fake backend completes the oldest long-asset chunk");
 	manager.update();
-	manager.update();
-	check(longVoice->submitCalls >= 2,
-		"completion deterministically submits the next long-asset chunk");
+	check(longVoice->submitCalls == 3,
+		"oldest completion deterministically refills the low-water queue");
 	manager.stopAudio(AudioAffect_Sound);
 	manager.update();
 	check(!manager.isCurrentlyPlaying(longHandle),
 		"stopping the long asset clears its generation-aware handle state");
 	deleteInstance(longInfo);
+
+	StreamingAudioAssetSource streamingSource(120000U);
+	std::unique_ptr<FakeEngine> streamingOwnedEngine = std::make_unique<FakeEngine>();
+	FakeEngine *streamingEngine = streamingOwnedEngine.get();
+	XAudio2AudioService streamingService(std::move(streamingOwnedEngine));
+	XAudio2AudioManager streamingManager(&streamingService, &streamingSource);
+	streamingManager.openDevice();
+	AudioEventInfo *streamingInfo = newInstance(AudioEventInfo);
+	*streamingInfo = *fixtureInfo;
+	streamingInfo->m_attackSounds.clear();
+	streamingInfo->m_decaySounds.clear();
+	streamingInfo->m_sounds.clear();
+	streamingInfo->m_sounds.push_back(AsciiString("stream.wav"));
+	FixtureEvent streamingEvent(AsciiString("fixture-stream"));
+	streamingEvent.setAudioEventInfo(streamingInfo);
+	const AudioHandle streamingHandle = streamingManager.addAudioEvent(&streamingEvent);
+	streamingManager.update();
+	streamingManager.update();
+	FakeVoice *streamingVoice = streamingEngine->lastVoice;
+	check(streamingVoice != nullptr && streamingVoice->submitCalls == 2
+		&& streamingSource.openStreamCalls == 1
+		&& streamingSource.decodePcmCalls == 0 && streamingSource.decodePcmAtCalls == 0
+		&& streamingSource.readStarts.size() == 2
+		&& streamingSource.readStarts[0] == 0U
+		&& streamingSource.readStarts[1] == 48000U
+		&& streamingSource.readBounds[0] == 48000U
+		&& streamingSource.readBounds[1] == 48000U,
+		"long playback opens one sequential PCM stream and prequeues its first two chunks");
+	check(streamingVoice != nullptr && streamingVoice->completeOldestBuffer(),
+		"streaming fixture completes its oldest queued chunk");
+	streamingManager.update();
+	check(streamingVoice != nullptr && streamingVoice->submitCalls == 3
+		&& streamingSource.readStarts.size() == 3
+		&& streamingSource.readStarts[2] == 96000U
+		&& streamingSource.decodePcmCalls == 0 && streamingSource.decodePcmAtCalls == 0,
+		"streaming completion reads the next linear chunk without decode fallback");
+	streamingManager.stopAudio(AudioAffect_Sound);
+	streamingManager.update();
+	check(!streamingManager.isCurrentlyPlaying(streamingHandle),
+		"stopping streaming playback releases its stream-backed handle");
+	streamingManager.closeDevice();
+	deleteInstance(streamingInfo);
 
 	AudioEventInfo *simpleInfo = newInstance(AudioEventInfo);
 	*simpleInfo = *fixtureInfo;

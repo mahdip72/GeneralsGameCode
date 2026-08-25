@@ -24,8 +24,9 @@ add_executable(core_native_audio_asset_catalog_test
 )
 
 target_compile_definitions(core_native_audio_asset_catalog_test PRIVATE DISABLE_GAMEMEMORY)
-if(RTS_BUILD_OPTION_FFMPEG)
-    target_compile_definitions(core_native_audio_asset_catalog_test PRIVATE RTS_NATIVE_AUDIO_HAS_FFMPEG)
+if(RTS_BUILD_OPTION_FFMPEG AND FFMPEG_EXECUTABLE)
+    target_compile_definitions(core_native_audio_asset_catalog_test PRIVATE
+        RTS_NATIVE_AUDIO_HAS_FFMPEG_CLI)
 endif()
 
 target_include_directories(core_native_audio_asset_catalog_test PRIVATE
@@ -55,9 +56,16 @@ set_target_properties(core_native_audio_asset_catalog_test PROPERTIES
     CXX_EXTENSIONS NO
 )
 
-add_test(NAME core_native_audio_asset_catalog_test
-    COMMAND core_native_audio_asset_catalog_test
-)
+if(RTS_BUILD_OPTION_FFMPEG AND FFMPEG_EXECUTABLE)
+    add_test(NAME core_native_audio_asset_catalog_test
+        COMMAND core_native_audio_asset_catalog_test
+            --ffmpeg "${FFMPEG_EXECUTABLE}"
+    )
+else()
+    add_test(NAME core_native_audio_asset_catalog_test
+        COMMAND core_native_audio_asset_catalog_test
+    )
+endif()
 set_tests_properties(core_native_audio_asset_catalog_test PROPERTIES TIMEOUT 30)
 if(WIN32 AND RTS_BUILD_OPTION_FFMPEG AND FFMPEG_RUNTIME_DIR)
     set_tests_properties(core_native_audio_asset_catalog_test PROPERTIES

@@ -35,7 +35,8 @@ Require $managerSource 'removeLevelSpecificAudioEventInfos\(\)' 'reset metadata 
 Require $managerSource 'prepareAudioEventForPlayback' 'native manager bypasses base admission semantics'
 Require $managerSource 'resetVoice\(playing\.voice,\s*playing\.generation\)' 'new voices are not reset to manager generation'
 Require $managerSource 'm_assetSource->decodePcmAt' 'native manager has no deterministic chunk continuation path'
-Require $managerSource 'getFileIdentity' 'native manager does not track asset identity'
+Require $managerSource 'matchesFileIdentity\(playing\.assetFileName,\s*fileToClose\)' `
+    'native manager does not honor close notifications by stable asset identity'
 Require $managerSource 'isCurrentlyPlaying\(AudioHandle handle\)' 'generation-aware playback query missing'
 Require $managerSource 'm_fadeAudioFrames' 'configured fade frame count is ignored'
 Require $managerSource 'm_3DSoundRangeVolumeFadeExponent' 'configured 3D attenuation exponent is ignored'

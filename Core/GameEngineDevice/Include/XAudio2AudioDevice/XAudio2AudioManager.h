@@ -135,8 +135,9 @@ private:
 		Bool waitingForGeneratedDelay = FALSE;
 		Bool voiceOpen = FALSE;
 		AsciiString assetFileName;
-		const void *assetIdentity = nullptr;
+		std::unique_ptr<AudioPcmStream> pcmStream;
 		UnsignedInt phaseSubmittedFrames = 0;
+		UnsignedInt phaseQueuedBuffers = 0;
 		UnsignedInt phaseCompletedFrames = 0;
 		UnsignedInt phaseTotalFrames = 0;
 	};
@@ -153,8 +154,10 @@ private:
 	void processActiveAudio();
 	void processFades();
 	void releaseVoice(PlayingAudio &playing);
+	Bool preparePhaseSource(PlayingAudio &playing, const AsciiString &fileName);
 	Bool ensureVoice(PlayingAudio &playing);
 	Bool submitPhase(PlayingAudio &playing);
+	Bool queuePhaseLowWater(PlayingAudio &playing);
 	Bool affectMatches(const PlayingAudio &playing, AudioAffect which) const;
 	Bool requestAffectMatches(const AudioRequest *request, AudioAffect which) const;
 	Bool canReplace(const PlayingAudio &victim, const DynamicAudioEventRTS &incoming) const;
