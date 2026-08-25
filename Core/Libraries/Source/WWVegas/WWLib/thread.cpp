@@ -105,11 +105,21 @@ void ThreadClass::Execute()
 		// assert(0);
 		return;
 	#else
-	if (handle && WaitForSingleObject(reinterpret_cast<HANDLE>(handle), 0) == WAIT_OBJECT_0)
+	if (handle)
 	{
-		CloseHandle(reinterpret_cast<HANDLE>(handle));
-		handle = 0;
-		ThreadID = 0;
+		const DWORD wait_result = WaitForSingleObject(reinterpret_cast<HANDLE>(handle), 0);
+		if (wait_result == WAIT_OBJECT_0)
+		{
+			CloseHandle(reinterpret_cast<HANDLE>(handle));
+			handle = 0;
+			ThreadID = 0;
+		}
+		else
+		{
+			WWASSERT(wait_result != WAIT_FAILED);
+			WWASSERT(!"ThreadClass::Execute called before the previous thread exited");
+			return;
+		}
 	}
 	WWASSERT(!handle);	// Only one thread at a time!
 		WWASSERT(!running);
@@ -199,7 +209,8 @@ unsigned ThreadClass::_Get_Current_Thread_ID()
 bool ThreadClass::Is_Running()
 {
 	#ifdef _WIN32
-	return InterlockedCompareExchange(&running, 0, 0) != 0;
+	const HANDLE native_handle = reinterpret_cast<HANDLE>(handle);
+	return native_handle != nullptr && WaitForSingleObject(native_handle, 0) != WAIT_OBJECT_0;
 	#else
 	return running != 0;
 	#endif

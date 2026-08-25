@@ -8,6 +8,11 @@ target_include_directories(core_thread_handle_contract_tests PRIVATE
     "${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas"
 )
 
+target_link_libraries(core_thread_handle_contract_tests PRIVATE
+    core_wwlib
+    winmm
+)
+
 set_target_properties(core_thread_handle_contract_tests PROPERTIES
     CXX_STANDARD 20
     CXX_STANDARD_REQUIRED YES
