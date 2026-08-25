@@ -68,20 +68,31 @@ if(RTS_BUILD_CORE_EXTRAS)
                 -SelfTest
         )
         set_tests_properties(core_replay_recorder_integration_audit_self_test PROPERTIES TIMEOUT 30)
+        set(_native_product_runtime_audit_build_root
+            "${CMAKE_BINARY_DIR}/Stage3NativeProductGraphAudit")
+        if(DEFINED ENV{RUNNER_TEMP} AND NOT "$ENV{RUNNER_TEMP}" STREQUAL "")
+            string(SHA256 _native_product_runtime_audit_source_hash "${CMAKE_SOURCE_DIR}")
+            string(SUBSTRING "${_native_product_runtime_audit_source_hash}" 0 16
+                _native_product_runtime_audit_source_hash)
+            set(_native_product_runtime_audit_build_root
+                "$ENV{RUNNER_TEMP}/GeneralsGameCode/${_native_product_runtime_audit_source_hash}/Stage3NativeProductGraphAudit")
+        endif()
         add_test(NAME core_native_product_runtime_audit
             COMMAND powershell -NoProfile -ExecutionPolicy Bypass
                 -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeProductRuntimeAudit/NativeProductRuntimeAudit.ps1"
                 -SourceRoot "${CMAKE_SOURCE_DIR}"
-                -BuildRoot "${CMAKE_BINARY_DIR}/Stage3NativeProductGraphAudit"
+                -BuildRoot "${_native_product_runtime_audit_build_root}"
                 -Generator "${CMAKE_GENERATOR}"
                 -GeneratorPlatform "${CMAKE_GENERATOR_PLATFORM}"
                 -CCompiler "${CMAKE_C_COMPILER}"
                 -CxxCompiler "${CMAKE_CXX_COMPILER}"
                 -RcCompiler "${CMAKE_RC_COMPILER}"
                 -ManifestTool "${CMAKE_MT}"
-                -FFmpegRoot "${FFMPEG_ROOT}"
+                -FFmpegRoot "${FFMPEG_SDK_ROOT}"
         )
         set_tests_properties(core_native_product_runtime_audit PROPERTIES TIMEOUT 1200)
+        unset(_native_product_runtime_audit_build_root)
+        unset(_native_product_runtime_audit_source_hash)
         add_test(NAME core_native_x64_ci_workflow_audit
             COMMAND powershell -NoProfile -ExecutionPolicy Bypass
                 -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeX64CIWorkflowAudit/NativeX64CIWorkflowAudit.ps1"

@@ -48,8 +48,8 @@ function Test-NativeX64CIWorkflow {
         $body = Get-JobBody -Workflow $CIWorkflow -JobName $contract.Name
         Assert-Contains $body "(?m)^      game: `"$([Regex]::Escape($contract.Game))`"\r?$" `
             "$($contract.Name) does not select $($contract.Game)"
-        Assert-Contains $body '(?m)^      preset: "x64"\r?$' `
-            "$($contract.Name) does not select the native x64 preset"
+        Assert-Contains $body '(?m)^      preset: "x64-vcpkg"\r?$' `
+            "$($contract.Name) does not select the dependency-complete native x64 preset"
         Assert-Contains $body '(?m)^      extras: true\r?$' `
             "$($contract.Name) does not enable the native test graph"
     }
@@ -80,6 +80,33 @@ function Test-NativeX64CIWorkflow {
     }
 }
 
+function Test-NativeX64CMakeContract {
+    param(
+        [string]$Presets,
+        [string]$CoreToolsCMake,
+        [string]$FindFFmpegCMake
+    )
+
+    $parsedPresets = $Presets | ConvertFrom-Json
+    $x64VcpkgPreset = @($parsedPresets.configurePresets | Where-Object {
+        $_.name -eq 'x64-vcpkg'
+    })
+    if ($x64VcpkgPreset.Count -ne 1) {
+        throw 'Native x64 CI workflow audit failed: x64-vcpkg configure preset is missing or ambiguous'
+    }
+    $inheritedPresets = @($x64VcpkgPreset[0].inherits)
+    if ($inheritedPresets -notcontains 'x64' -or $inheritedPresets -notcontains 'default-vcpkg') {
+        throw 'Native x64 CI workflow audit failed: x64-vcpkg does not inherit the product and dependency contracts'
+    }
+
+    Assert-Contains $CoreToolsCMake '\$ENV\{RUNNER_TEMP\}' `
+        'the nested native product audit is not redirected to runner-owned scratch storage'
+    Assert-Contains $CoreToolsCMake '-FFmpegRoot "\$\{FFMPEG_SDK_ROOT\}"' `
+        'the nested native product audit does not receive the resolved FFmpeg SDK root'
+    Assert-Contains $FindFFmpegCMake 'set\(FFMPEG_SDK_ROOT ' `
+        'FFmpeg discovery does not publish its resolved SDK root'
+}
+
 if ($SelfTest) {
     $goodCI = @'
 on:
@@ -88,12 +115,12 @@ jobs:
   build-generals-x64:
     with:
       game: "Generals"
-      preset: "x64"
+      preset: "x64-vcpkg"
       extras: true
   build-generalsmd-x64:
     with:
       game: "GeneralsMD"
-      preset: "x64"
+      preset: "x64-vcpkg"
       extras: true
 '@
     $goodBuild = @'
@@ -102,8 +129,20 @@ arch: ${{ startsWith(inputs.preset, 'x64') && 'x64' || 'x86' }}
 if ('preset' -like 'win32*' -or 'preset' -like 'x64*') {}
 if ('preset' -like 'win32*' -or 'preset' -like 'x64*') {}
 '@
+    $goodPresets = @'
+{"configurePresets":[{"name":"x64-vcpkg","inherits":["x64","default-vcpkg"]}]}
+'@
+    $goodCoreToolsCMake = @'
+set(audit_root "$ENV{RUNNER_TEMP}/GeneralsGameCode")
+-FFmpegRoot "${FFMPEG_SDK_ROOT}"
+'@
+    $goodFindFFmpegCMake = 'set(FFMPEG_SDK_ROOT "resolved" CACHE PATH "root")'
 
     Test-NativeX64CIWorkflow -CIWorkflow $goodCI -BuildWorkflow $goodBuild
+    Test-NativeX64CMakeContract `
+        -Presets $goodPresets `
+        -CoreToolsCMake $goodCoreToolsCMake `
+        -FindFFmpegCMake $goodFindFFmpegCMake
 
     $caughtMissingTitle = $false
     try {
@@ -141,6 +180,19 @@ if ('preset' -like 'win32*' -or 'preset' -like 'x64*') {}
         throw 'Native x64 CI workflow audit self-test failed to reject Win32-only handling'
     }
 
+    $caughtCheckoutAuditRoot = $false
+    try {
+        Test-NativeX64CMakeContract `
+            -Presets $goodPresets `
+            -CoreToolsCMake ($goodCoreToolsCMake -replace '\$ENV\{RUNNER_TEMP\}', '${CMAKE_BINARY_DIR}') `
+            -FindFFmpegCMake $goodFindFFmpegCMake
+    } catch {
+        $caughtCheckoutAuditRoot = $true
+    }
+    if (-not $caughtCheckoutAuditRoot) {
+        throw 'Native x64 CI workflow audit self-test failed to reject checkout-local audit storage'
+    }
+
     Write-Host 'Native x64 CI workflow audit self-test passed.'
     exit 0
 }
@@ -151,8 +203,15 @@ if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
 
 $ciPath = Join-Path $SourceRoot '.github/workflows/ci.yml'
 $buildPath = Join-Path $SourceRoot '.github/workflows/build-toolchain.yml'
+$presetsPath = Join-Path $SourceRoot 'CMakePresets.json'
+$coreToolsCMakePath = Join-Path $SourceRoot 'Core/Tools/CMakeLists.txt'
+$findFFmpegCMakePath = Join-Path $SourceRoot 'cmake/FindFFMPEG.cmake'
 Test-NativeX64CIWorkflow `
     -CIWorkflow (Get-Content -Raw -LiteralPath $ciPath) `
     -BuildWorkflow (Get-Content -Raw -LiteralPath $buildPath)
+Test-NativeX64CMakeContract `
+    -Presets (Get-Content -Raw -LiteralPath $presetsPath) `
+    -CoreToolsCMake (Get-Content -Raw -LiteralPath $coreToolsCMakePath) `
+    -FindFFmpegCMake (Get-Content -Raw -LiteralPath $findFFmpegCMakePath)
 
 Write-Host 'Native x64 CI workflow audit passed.'

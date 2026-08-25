@@ -147,6 +147,12 @@
             }
         },
         {
+            "name": "x64-vcpkg",
+            "inherits": ["x64", "default-vcpkg"],
+            "hidden": false,
+            "displayName": "Windows x64 VCPKG Release Product"
+        },
+        {
             "name": "x64-debug",
             "inherits": "x64",
             "hidden": false,
@@ -327,6 +333,13 @@
             "configuration": "Release"
         },
         {
+            "name": "x64-vcpkg",
+            "configurePreset": "x64-vcpkg",
+            "displayName": "Build Windows x64 VCPKG Release Product",
+            "description": "Build Windows x64 VCPKG Release Product",
+            "configuration": "Release"
+        },
+        {
             "name": "x64-debug",
             "configurePreset": "x64-debug",
             "displayName": "Build Windows x64 Debug Product",
@@ -378,6 +391,18 @@
             "name": "x64",
             "configurePreset": "x64",
             "displayName": "Test Windows x64 Release Product",
+            "configuration": "Release",
+            "output": {
+                "outputOnFailure": true
+            },
+            "execution": {
+                "noTestsAction": "error"
+            }
+        },
+        {
+            "name": "x64-vcpkg",
+            "configurePreset": "x64-vcpkg",
+            "displayName": "Test Windows x64 VCPKG Release Product",
             "configuration": "Release",
             "output": {
                 "outputOnFailure": true
@@ -542,6 +567,23 @@
                 {
                     "type": "test",
                     "name": "x64"
+                }
+            ]
+        },
+        {
+            "name": "x64-vcpkg",
+            "steps": [
+                {
+                    "type": "configure",
+                    "name": "x64-vcpkg"
+                },
+                {
+                    "type": "build",
+                    "name": "x64-vcpkg"
+                },
+                {
+                    "type": "test",
+                    "name": "x64-vcpkg"
                 }
             ]
         },

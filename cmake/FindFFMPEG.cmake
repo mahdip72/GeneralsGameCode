@@ -61,6 +61,11 @@ find_package_handle_standard_args(FFMPEG
 )
 
 if(FFMPEG_FOUND)
+	get_filename_component(_FFMPEG_FIRST_LIBRARY_DIR "${FFMPEG_AVCODEC_LIBRARY}" DIRECTORY)
+	get_filename_component(_FFMPEG_SDK_ROOT "${_FFMPEG_FIRST_LIBRARY_DIR}" DIRECTORY)
+	set(FFMPEG_SDK_ROOT "${_FFMPEG_SDK_ROOT}" CACHE PATH
+		"Resolved root of the FFmpeg development SDK" FORCE)
+
 	# Validate the actual COFF machine records from each import library.  Root
 	# directory names are not an architecture contract and are intentionally not
 	# consulted here.
@@ -98,10 +103,8 @@ if(FFMPEG_FOUND)
 	set(RTS_FFMPEG_RUNTIME_DLLS)
 
     if(WIN32 AND NOT FFMPEG_RUNTIME_DIR)
-        get_filename_component(_FFMPEG_FIRST_LIBRARY_DIR "${FFMPEG_AVCODEC_LIBRARY}" DIRECTORY)
-        get_filename_component(_FFMPEG_SDK_ROOT "${_FFMPEG_FIRST_LIBRARY_DIR}" DIRECTORY)
-        if(IS_DIRECTORY "${_FFMPEG_SDK_ROOT}/bin")
-            set(FFMPEG_RUNTIME_DIR "${_FFMPEG_SDK_ROOT}/bin" CACHE PATH
+		if(IS_DIRECTORY "${FFMPEG_SDK_ROOT}/bin")
+			set(FFMPEG_RUNTIME_DIR "${FFMPEG_SDK_ROOT}/bin" CACHE PATH
                 "Directory containing the FFmpeg shared runtime libraries")
         endif()
     endif()
@@ -153,7 +156,8 @@ if(FFMPEG_FOUND)
 endif()
 
 mark_as_advanced(
-    FFMPEG_INCLUDE_DIR
+	FFMPEG_INCLUDE_DIR
+	FFMPEG_SDK_ROOT
     FFMPEG_AVCODEC_LIBRARY
     FFMPEG_AVFORMAT_LIBRARY
     FFMPEG_AVUTIL_LIBRARY

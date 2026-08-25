@@ -103,7 +103,7 @@ jobs:
     uses: ./.github/workflows/build-toolchain.yml
     with:
       game: "Generals"
-      preset: "x64"
+      preset: "x64-vcpkg"
       tools: false
       extras: true
     secrets: inherit
@@ -179,7 +179,7 @@ jobs:
     uses: ./.github/workflows/build-toolchain.yml
     with:
       game: "GeneralsMD"
-      preset: "x64"
+      preset: "x64-vcpkg"
       tools: false
       extras: true
     secrets: inherit
