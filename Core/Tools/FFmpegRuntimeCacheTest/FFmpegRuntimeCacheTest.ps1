@@ -44,6 +44,54 @@ function Invoke-FixtureConfigure {
     }
 }
 
+function Copy-SdkTree {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Source,
+        [Parameter(Mandatory = $true)]
+        [string]$Destination
+    )
+
+    $sourceFull = [IO.Path]::GetFullPath($Source).TrimEnd('\')
+    $sourcePrefix = $sourceFull + '\'
+    New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+    foreach ($sourceFile in @(Get-ChildItem -LiteralPath $Source -Recurse -File)) {
+        if (-not $sourceFile.FullName.StartsWith($sourcePrefix,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            throw "SDK file escaped the source root: $($sourceFile.FullName)"
+        }
+        $relative = $sourceFile.FullName.Substring($sourcePrefix.Length)
+        $destinationFile = Join-Path $Destination $relative
+        New-Item -ItemType Directory -Path (Split-Path -Parent $destinationFile) `
+            -Force | Out-Null
+        try {
+            New-Item -ItemType HardLink -Path $destinationFile `
+                -Target $sourceFile.FullName -ErrorAction Stop | Out-Null
+        } catch {
+            Copy-Item -LiteralPath $sourceFile.FullName -Destination $destinationFile
+        }
+    }
+}
+
+function Get-FixtureCacheValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+        [Parameter(Mandatory = $true)]
+        [string]$Key
+    )
+
+    $cachePath = Join-Path (Join-Path $script:RunRoot $Name) 'CMakeCache.txt'
+    $prefix = $Key + ':'
+    $entry = @(Get-Content -LiteralPath $cachePath | Where-Object {
+        $_.StartsWith($prefix, [StringComparison]::Ordinal)
+    })
+    if ($entry.Count -ne 1) {
+        throw "Expected one '$Key' cache entry in fixture '$Name'."
+    }
+    return $entry[0].Substring($entry[0].IndexOf('=') + 1)
+}
+
 $resolvedSourceRoot = [IO.Path]::GetFullPath($SourceRoot)
 $resolvedScratchRoot = [IO.Path]::GetFullPath($ScratchRoot)
 $resolvedFFmpegRoot = [IO.Path]::GetFullPath($FFmpegRoot)
@@ -69,7 +117,26 @@ cmake_minimum_required(VERSION 3.25)
 project(FFmpegRuntimeCacheFixture NONE)
 set(CMAKE_SIZEOF_VOID_P 8)
 list(PREPEND CMAKE_MODULE_PATH "${REPO_ROOT}/cmake")
+if(EXPECT_HINT_PRECEDENCE)
+    set(_expected_hints "${RTS_FFMPEG_ROOT};$ENV{RTS_FFMPEG_ROOT}")
+    list(REMOVE_DUPLICATES _expected_hints)
+    string(SHA256 _expected_hint_signature "${_expected_hints}")
+endif()
 find_package(FFMPEG REQUIRED)
+if(EXPECT_HINT_PRECEDENCE)
+    if(NOT RTS_FFMPEG_ROOT_HINT_SIGNATURE STREQUAL _expected_hint_signature)
+        message(FATAL_ERROR "FFmpeg hint signature lost explicit-root precedence")
+    endif()
+endif()
+if(DEFINED EXPECTED_SDK)
+    file(REAL_PATH "${EXPECTED_SDK}" _expected_sdk)
+    file(REAL_PATH "${FFMPEG_SDK_ROOT}" _actual_sdk)
+    string(TOLOWER "${_expected_sdk}" _expected_sdk)
+    string(TOLOWER "${_actual_sdk}" _actual_sdk)
+    if(NOT _actual_sdk STREQUAL _expected_sdk)
+        message(FATAL_ERROR "Unexpected FFmpeg SDK: ${FFMPEG_SDK_ROOT}")
+    endif()
+endif()
 file(REAL_PATH "${EXPECTED_RUNTIME}" _expected_runtime)
 file(REAL_PATH "${FFMPEG_RUNTIME_DIR}" _actual_runtime)
 string(TOLOWER "${_expected_runtime}" _expected_runtime)
@@ -100,6 +167,64 @@ endif()
         "-DEXPECTED_RUNTIME=$(Join-Path $resolvedFFmpegRoot 'bin')",
         '-DEXPECT_AUTO_RUNTIME=ON'
     ))
+
+    $environmentRoot = Join-Path $script:RunRoot 'a-environment-root'
+    $explicitRoot = Join-Path $script:RunRoot 'z-explicit-root'
+    $replacementExplicitRoot = Join-Path $script:RunRoot 'y-replacement-explicit-root'
+    Copy-SdkTree -Source $resolvedFFmpegRoot -Destination $environmentRoot
+    Copy-SdkTree -Source $resolvedFFmpegRoot -Destination $explicitRoot
+    Copy-SdkTree -Source $resolvedFFmpegRoot -Destination $replacementExplicitRoot
+    $previousFFmpegEnvironmentRoot = $env:FFMPEG_ROOT
+    $previousRtsEnvironmentRoot = $env:RTS_FFMPEG_ROOT
+    try {
+        Remove-Item Env:FFMPEG_ROOT -ErrorAction SilentlyContinue
+        $env:RTS_FFMPEG_ROOT = $environmentRoot.Replace('\', '/')
+        Invoke-FixtureConfigure -Name 'explicit-root-precedence' -Arguments @(
+            "-DREPO_ROOT=$resolvedSourceRoot",
+            "-DRTS_FFMPEG_ROOT:PATH=$explicitRoot",
+            "-DEXPECTED_SDK=$explicitRoot",
+            "-DEXPECTED_RUNTIME=$(Join-Path $explicitRoot 'bin')",
+            '-DEXPECT_HINT_PRECEDENCE=ON',
+            '-DEXPECT_AUTO_RUNTIME=ON'
+        )
+        $firstSignature = Get-FixtureCacheValue -Name 'explicit-root-precedence' `
+            -Key 'RTS_FFMPEG_ROOT_HINT_SIGNATURE'
+
+        $replacementArguments = @(
+            "-DREPO_ROOT=$resolvedSourceRoot",
+            "-DRTS_FFMPEG_ROOT:PATH=$replacementExplicitRoot",
+            "-DEXPECTED_SDK=$replacementExplicitRoot",
+            "-DEXPECTED_RUNTIME=$(Join-Path $replacementExplicitRoot 'bin')",
+            '-DEXPECT_HINT_PRECEDENCE=ON',
+            '-DEXPECT_AUTO_RUNTIME=ON'
+        )
+        Invoke-FixtureConfigure -Name 'explicit-root-precedence' `
+            -Arguments $replacementArguments
+        $replacementSignature = Get-FixtureCacheValue -Name 'explicit-root-precedence' `
+            -Key 'RTS_FFMPEG_ROOT_HINT_SIGNATURE'
+        if ($replacementSignature -eq $firstSignature) {
+            throw 'FFmpeg root change did not invalidate the cached hint signature.'
+        }
+
+        Invoke-FixtureConfigure -Name 'explicit-root-precedence' `
+            -Arguments $replacementArguments
+        $stableSignature = Get-FixtureCacheValue -Name 'explicit-root-precedence' `
+            -Key 'RTS_FFMPEG_ROOT_HINT_SIGNATURE'
+        if ($stableSignature -ne $replacementSignature) {
+            throw 'Identical FFmpeg root hints did not retain a stable signature.'
+        }
+    } finally {
+        if ($null -eq $previousFFmpegEnvironmentRoot) {
+            Remove-Item Env:FFMPEG_ROOT -ErrorAction SilentlyContinue
+        } else {
+            $env:FFMPEG_ROOT = $previousFFmpegEnvironmentRoot
+        }
+        if ($null -eq $previousRtsEnvironmentRoot) {
+            Remove-Item Env:RTS_FFMPEG_ROOT -ErrorAction SilentlyContinue
+        } else {
+            $env:RTS_FFMPEG_ROOT = $previousRtsEnvironmentRoot
+        }
+    }
 
     $customRuntime = Join-Path $script:RunRoot 'custom-runtime'
     New-Item -ItemType Directory -Path $customRuntime -Force | Out-Null
