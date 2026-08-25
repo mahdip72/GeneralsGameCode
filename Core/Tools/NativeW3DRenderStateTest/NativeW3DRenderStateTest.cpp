@@ -1,7 +1,37 @@
 #include "Renderer/NativeW3DRenderState.h"
+#include "Renderer/NativeW3DRenderer.h"
 
+#include <cstdint>
 #include <cstdio>
 #include <windows.h>
+
+namespace rts
+{
+namespace render
+{
+class NativeW3DRecoveryTestAccess
+{
+public:
+	static RenderResult AttachSentinelBackend(NativeW3DRenderState *state)
+	{
+		return state->AttachBackend(
+			reinterpret_cast<IRenderDevice *>(static_cast<uintptr_t>(1)),
+			reinterpret_cast<IRenderContext *>(static_cast<uintptr_t>(1)));
+	}
+
+	static RenderResult DrainFailedRecoveryCleanup(
+		NativeW3DRenderState *state, unsigned int *drained)
+	{
+		return NativeW3DRenderer::DrainFailedRecoveryCleanup(state, drained);
+	}
+
+	static bool IsBackendDetached(const NativeW3DRenderState *state)
+	{
+		return state->Device() == 0 && state->Context() == 0;
+	}
+};
+}
+}
 
 namespace
 {
@@ -30,6 +60,29 @@ void RunCommand(void *context)
 void ReleaseCommand(void *context)
 {
 	++static_cast<ReleaseStats *>(context)->releaseCount;
+}
+
+struct RecoveryCleanupStats
+{
+	RecoveryCleanupStats() : state(0), commandCount(0), releaseCount(0),
+		observedDetached(false) {}
+	rts::render::NativeW3DRenderState *state;
+	int commandCount;
+	int releaseCount;
+	bool observedDetached;
+};
+
+void ObserveRecoveryCleanup(void *context)
+{
+	RecoveryCleanupStats *stats = static_cast<RecoveryCleanupStats *>(context);
+	++stats->commandCount;
+	stats->observedDetached =
+		rts::render::NativeW3DRecoveryTestAccess::IsBackendDetached(stats->state);
+}
+
+void ReleaseRecoveryCleanup(void *context)
+{
+	++static_cast<RecoveryCleanupStats *>(context)->releaseCount;
 }
 
 struct WrongOwnerRequest
@@ -107,5 +160,44 @@ int main()
 		lateToken->Release();
 	}
 	state->Release();
+
+	rts::render::NativeW3DRenderState *recoveryState =
+		rts::render::NativeW3DRenderState::Create(2);
+	result |= Check(recoveryState != 0,
+		"failed-recovery fixture can allocate render state");
+	if (recoveryState != 0)
+	{
+		result |= Check(recoveryState->BindOwner() ==
+			rts::render::RENDER_RESULT_OK &&
+			rts::render::NativeW3DRecoveryTestAccess::AttachSentinelBackend(
+				recoveryState) == rts::render::RENDER_RESULT_OK,
+			"failed-recovery fixture attaches an opaque backend");
+		RecoveryCleanupStats recoveryStats;
+		recoveryStats.state = recoveryState;
+		rts::render::NativeW3DOwnerToken *recoveryToken =
+			rts::render::NativeW3DOwnerToken::Create(&recoveryStats,
+				ReleaseRecoveryCleanup);
+		result |= Check(recoveryToken != 0,
+			"failed-recovery fixture allocates a cleanup token");
+		if (recoveryToken != 0)
+		{
+			result |= Check(recoveryState->EnqueueCleanup(
+				ObserveRecoveryCleanup, recoveryToken) ==
+				rts::render::RENDER_RESULT_OK,
+				"failed recovery accepts cleanup before admission closes");
+			recoveryToken->Release();
+		}
+		unsigned int recoveryDrained = 0;
+		result |= Check(
+			rts::render::NativeW3DRecoveryTestAccess::DrainFailedRecoveryCleanup(
+				recoveryState, &recoveryDrained) ==
+				rts::render::RENDER_RESULT_OK &&
+			recoveryDrained == 1 && recoveryStats.commandCount == 1 &&
+			recoveryStats.releaseCount == 1 && recoveryStats.observedDetached &&
+			rts::render::NativeW3DRecoveryTestAccess::IsBackendDetached(
+				recoveryState) && !recoveryState->IsAcceptingCleanup(),
+			"failed recovery detaches the backend before draining accepted cleanup");
+		recoveryState->Release();
+	}
 	return result;
 }

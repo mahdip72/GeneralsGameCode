@@ -238,6 +238,29 @@ RenderResult NativeW3DRenderer::EndFrame(bool present)
 	return device == 0 ? RENDER_RESULT_FAILED : device->present();
 }
 
+RenderResult NativeW3DRenderer::DrainFailedRecoveryCleanup(
+	NativeW3DRenderState *state, unsigned int *drained)
+{
+	if (state == 0 || drained == 0)
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	const RenderResult closeResult = state->BeginShutdown();
+	if (closeResult != RENDER_RESULT_OK)
+	{
+		return closeResult;
+	}
+	// Recovery has already made the backend non-operational.  Unpublish it
+	// before accepted cleanup runs so callbacks can release their tokens
+	// without calling through a stale backend pointer.
+	const RenderResult detachResult = state->DetachBackend();
+	if (detachResult != RENDER_RESULT_OK)
+	{
+		return detachResult;
+	}
+	return state->DrainCleanup(0, drained);
+}
+
 RenderResult NativeW3DRenderer::RecoverDevice()
 {
 	IRenderDevice *device = m_state == 0 ? 0 : m_state->Device();
@@ -252,13 +275,8 @@ RenderResult NativeW3DRenderer::RecoverDevice()
 		// The facade must make the same terminal transition before a caller can
 		// observe it again; retaining m_context would permit a later frame to
 		// call through a released immediate-context object.
-		m_state->BeginShutdown();
-		// Recovery failure has already made the backend non-operational.  Detach
-		// it before draining accepted cleanup so callbacks cannot call through a
-		// stale backend pointer; the device shutdown below releases all resources.
-		m_state->DetachBackend();
 		unsigned int drained = 0;
-		m_state->DrainCleanup(0, &drained);
+		DrainFailedRecoveryCleanup(m_state, &drained);
 		device->shutdown();
 		delete device;
 		m_state->Release();
@@ -269,10 +287,8 @@ RenderResult NativeW3DRenderer::RecoverDevice()
 	IRenderContext *context = device->immediateContext();
 	if (context == 0)
 	{
-		m_state->BeginShutdown();
-		m_state->DetachBackend();
 		unsigned int drained = 0;
-		m_state->DrainCleanup(0, &drained);
+		DrainFailedRecoveryCleanup(m_state, &drained);
 		device->shutdown();
 		delete device;
 		m_state->Release();
