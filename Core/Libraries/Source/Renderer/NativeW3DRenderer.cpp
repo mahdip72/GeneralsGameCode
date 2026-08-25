@@ -253,11 +253,14 @@ RenderResult NativeW3DRenderer::RecoverDevice()
 		// observe it again; retaining m_context would permit a later frame to
 		// call through a released immediate-context object.
 		m_state->BeginShutdown();
+		// Recovery failure has already made the backend non-operational.  Detach
+		// it before draining accepted cleanup so callbacks cannot call through a
+		// stale backend pointer; the device shutdown below releases all resources.
+		m_state->DetachBackend();
 		unsigned int drained = 0;
 		m_state->DrainCleanup(0, &drained);
 		device->shutdown();
 		delete device;
-		m_state->DetachBackend();
 		m_state->Release();
 		m_state = 0;
 		m_frameOpen = false;
@@ -267,11 +270,11 @@ RenderResult NativeW3DRenderer::RecoverDevice()
 	if (context == 0)
 	{
 		m_state->BeginShutdown();
+		m_state->DetachBackend();
 		unsigned int drained = 0;
 		m_state->DrainCleanup(0, &drained);
 		device->shutdown();
 		delete device;
-		m_state->DetachBackend();
 		m_state->Release();
 		m_state = 0;
 		m_frameOpen = false;
