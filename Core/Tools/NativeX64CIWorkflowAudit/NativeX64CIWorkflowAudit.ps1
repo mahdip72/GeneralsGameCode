@@ -202,6 +202,8 @@ function Test-NativeX64CMakeContract {
         'FFmpeg discovery does not publish its resolved SDK root'
     Assert-Contains $FindFFmpegCMake 'RTS_FFMPEG_ROOT_HINT_SIGNATURE' `
         'FFmpeg discovery does not invalidate cached SDK paths when root hints change'
+    Assert-Contains $FindFFmpegCMake 'cmake_path\(NORMAL_PATH _FFMPEG_PREVIOUS_AUTO_RUNTIME_DIR\)' `
+        'FFmpeg discovery dereferences a stale automatic runtime path when SDK roots change'
     Assert-Contains $FindFFmpegCMake 'ResolveWindowsRuntimeClosure\.cmake' `
         'FFmpeg packaging does not resolve app-local transitive runtime dependencies'
     Assert-Contains $FindFFmpegCMake '(?ms)set\(RTS_FFMPEG_RUNTIME_DLLS .*?CACHE INTERNAL.*?FORCE\)' `
@@ -291,6 +293,7 @@ endif()
     $goodFindFFmpegCMake = @'
 set(FFMPEG_SDK_ROOT "resolved" CACHE PATH "root")
 set(RTS_FFMPEG_ROOT_HINT_SIGNATURE "signature" CACHE INTERNAL "signature" FORCE)
+cmake_path(NORMAL_PATH _FFMPEG_PREVIOUS_AUTO_RUNTIME_DIR)
 -P "ResolveWindowsRuntimeClosure.cmake"
 set(RTS_FFMPEG_RUNTIME_DLLS "closure" CACHE INTERNAL "closure" FORCE)
 '@
@@ -492,6 +495,23 @@ $arguments += "-DFFMPEG_RUNTIME_DIR=$FFmpegRuntimeDir"
     }
     if (-not $caughtMissingRuntimeClosure) {
         throw 'Native x64 CI workflow audit self-test failed to reject a missing FFmpeg runtime closure'
+    }
+
+    $caughtStaleRuntimeDereference = $false
+    try {
+        Test-NativeX64CMakeContract `
+            -Presets $goodPresets `
+            -CoreToolsCMake $goodCoreToolsCMake `
+            -FindFFmpegCMake ($goodFindFFmpegCMake -replace 'cmake_path\(NORMAL_PATH _FFMPEG_PREVIOUS_AUTO_RUNTIME_DIR\)', 'file(REAL_PATH ${RTS_FFMPEG_AUTO_RUNTIME_DIR} _FFMPEG_PREVIOUS_AUTO_RUNTIME_DIR)') `
+            -CompressionCMake $goodCompressionCMake `
+            -GeneralsCMake $goodGeneralsCMake `
+            -ZeroHourCMake $goodZeroHourCMake `
+            -NativeProductRuntimeAudit $goodNativeProductRuntimeAudit
+    } catch {
+        $caughtStaleRuntimeDereference = $true
+    }
+    if (-not $caughtStaleRuntimeDereference) {
+        throw 'Native x64 CI workflow audit self-test failed to reject stale FFmpeg runtime dereferencing'
     }
 
     $caughtMissingPathBudget = $false

@@ -159,6 +159,15 @@ if(RTS_BUILD_CORE_EXTRAS)
         )
         set_tests_properties(core_native_x64_ci_workflow_audit_self_test PROPERTIES TIMEOUT 30)
         if(RTS_BUILD_OPTION_FFMPEG)
+            add_test(NAME core_ffmpeg_runtime_cache_tests
+                COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                    -File "${CMAKE_CURRENT_SOURCE_DIR}/FFmpegRuntimeCacheTest/FFmpegRuntimeCacheTest.ps1"
+                    -SourceRoot "${CMAKE_SOURCE_DIR}"
+                    -ScratchRoot "${CMAKE_BINARY_DIR}/TestScratch/FFmpegRuntimeCache"
+                    -FFmpegRoot "${FFMPEG_SDK_ROOT}"
+                    -FFmpegRuntimeDir "${FFMPEG_RUNTIME_DIR}"
+            )
+            set_tests_properties(core_ffmpeg_runtime_cache_tests PROPERTIES TIMEOUT 120)
             add_subdirectory(FFmpegContractTest)
             add_subdirectory(FFmpegFileBehaviorTest)
             add_subdirectory(FFmpegAudioDecoderTest)
