@@ -100,10 +100,10 @@ jobs:
           "LIB=$MSVCDir\LIB;$MSVCDir\MFC\LIB;$env:LIB" >> $env:GITHUB_ENV
 
       - name: Set Up VC2022 Environment
-        if: startsWith(inputs.preset, 'win32')
+        if: startsWith(inputs.preset, 'win32') || startsWith(inputs.preset, 'x64')
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
         with:
-          arch: x86
+          arch: ${{ startsWith(inputs.preset, 'x64') && 'x64' || 'x86' }}
 
       - name: Compute vcpkg cache key parts
         if: contains(inputs.preset, 'vcpkg')
@@ -196,8 +196,8 @@ jobs:
         shell: pwsh
         run: |
           $arguments = @('--test-dir', "build\${{ inputs.preset }}", '--output-on-failure')
-          if ('${{ inputs.preset }}' -like 'win32*') {
-            $configuration = if ('${{ inputs.preset }}' -match 'debug') { 'Debug' } else { 'Release' }
+          if ('${{ inputs.preset }}' -like 'win32*' -or '${{ inputs.preset }}' -like 'x64*') {
+            $configuration = if ('${{ inputs.preset }}' -match 'debug|asan') { 'Debug' } else { 'Release' }
             $arguments += @('-C', $configuration)
           }
           & ctest @arguments
@@ -216,8 +216,8 @@ jobs:
           $buildDir = "build\${{ inputs.preset }}"
           $artifactsDir = New-Item -ItemType Directory -Force -Path "$buildDir\${{ inputs.game }}\artifacts" -Verbose
 
-          if ("${{ inputs.preset }}" -like "win32*") {
-            $configToUse = if ("${{ inputs.preset }}" -match "debug") { "Debug" } else { "Release" }
+          if ('${{ inputs.preset }}' -like 'win32*' -or '${{ inputs.preset }}' -like 'x64*') {
+            $configToUse = if ('${{ inputs.preset }}' -match 'debug|asan') { 'Debug' } else { 'Release' }
             $files = Get-ChildItem -Path "$buildDir\Core\$configToUse","$buildDir\${{ inputs.game }}\$configToUse" -File |
               Where-Object { $_.Extension -in @(".exe", ".dll", ".pdb") } -Verbose
           } else {
