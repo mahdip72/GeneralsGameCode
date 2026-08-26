@@ -187,6 +187,7 @@ if(RTS_BUILD_CORE_EXTRAS)
         add_subdirectory(FileTransferTimeoutTest)
         add_subdirectory(PersistPointerTokenTest)
         add_subdirectory(ChunkIOValueReadTest)
+        add_subdirectory(BezierLegacyParityTest)
     endif()
 
     if(WIN32)

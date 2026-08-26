@@ -250,13 +250,16 @@ const float BezierSegment::s_bezBasisMatrix[4][4] = {
 
 void BezierSegment::transformBasis(const float input[4], float output[4])
 {
-	// D3DXVec4Transform treats the input as a row vector and writes one
-	// output component from each matrix column.  Preserve that convention
-	// exactly while keeping the operation independent of D3DX.
+	// D3DXVec4Transform used two pairwise SSE additions. Preserve its
+	// single-precision rounding points as well as its row-vector convention;
+	// replay flight paths depend on the resulting bits.
 	for (int column = 0; column < 4; ++column) {
-		output[column] = input[0] * s_bezBasisMatrix[0][column]
-			+ input[1] * s_bezBasisMatrix[1][column]
-			+ input[2] * s_bezBasisMatrix[2][column]
-			+ input[3] * s_bezBasisMatrix[3][column];
+		const volatile float product0 = input[0] * s_bezBasisMatrix[0][column];
+		const volatile float product1 = input[1] * s_bezBasisMatrix[1][column];
+		const volatile float product2 = input[2] * s_bezBasisMatrix[2][column];
+		const volatile float product3 = input[3] * s_bezBasisMatrix[3][column];
+		const volatile float firstPair = product0 + product1;
+		const volatile float secondPair = product2 + product3;
+		output[column] = firstPair + secondPair;
 	}
 }
