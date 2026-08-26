@@ -642,6 +642,19 @@ bool XAudio2AudioService::tryPopCompletion(XAudio2AudioCompletion &completion) n
 	return false;
 }
 
+void XAudio2AudioService::discardCompletions() noexcept
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	for (VoiceRecord &record : m_voices) {
+		if (record.voice == nullptr) {
+			continue;
+		}
+		XAudio2PcmCompletionRecord completion;
+		while (record.voice->tryPopCompletion(completion)) {
+		}
+	}
+}
+
 void XAudio2AudioService::serviceVoices() noexcept
 {
 	std::lock_guard<std::mutex> lock(m_mutex);

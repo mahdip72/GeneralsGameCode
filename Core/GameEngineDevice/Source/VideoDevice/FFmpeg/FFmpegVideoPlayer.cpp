@@ -185,12 +185,14 @@ void	FFmpegVideoPlayer::update()
 #if defined(_WIN64)
 	if (m_audioService != nullptr) {
 		m_audioService->serviceVoices();
+		m_audioService->discardCompletions();
 	}
 #endif
 	VideoPlayer::update();
 #if defined(_WIN64)
 	if (m_audioService != nullptr) {
 		m_audioService->serviceVoices();
+		m_audioService->discardCompletions();
 	}
 #endif
 }

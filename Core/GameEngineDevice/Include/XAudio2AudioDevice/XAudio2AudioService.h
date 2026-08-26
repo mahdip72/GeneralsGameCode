@@ -103,6 +103,9 @@ public:
 	HRESULT getVoiceLastError(XAudio2PcmVoiceHandle handle) const noexcept;
 	bool getVoicePlayedSample(XAudio2PcmVoiceHandle handle, std::int64_t &sample) const noexcept;
 	bool tryPopCompletion(XAudio2AudioCompletion &completion) noexcept;
+	// Dedicated owners such as movie playback do not translate PCM completions
+	// into game events, but they must still consume the bounded callback FIFO.
+	void discardCompletions() noexcept;
 
 private:
 	struct VoiceRecord

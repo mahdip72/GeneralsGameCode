@@ -41,11 +41,12 @@ public:
 		return m_createResult;
 	}
 
-	HRESULT submit(const XAUDIO2_BUFFER &) noexcept override
+	HRESULT submit(const XAUDIO2_BUFFER &buffer) noexcept override
 	{
 		if (m_destroyed) {
 			++g_backendUseAfterDestroy;
 		}
+		m_submittedContexts.push_back(buffer.pContext);
 		return S_OK;
 	}
 	HRESULT start() noexcept override
@@ -79,11 +80,21 @@ public:
 		m_calls.push_back("voice.destroy");
 	}
 
+	void complete(std::size_t index)
+	{
+		if (m_callback != nullptr && index < m_submittedContexts.size()) {
+			m_callback->OnBufferEnd(m_submittedContexts[index]);
+		}
+	}
+
+	std::size_t submissionCount() const noexcept { return m_submittedContexts.size(); }
+
 private:
 	std::vector<std::string> &m_calls;
 	int &m_destroyCount;
 	HRESULT m_createResult;
 	IXAudio2VoiceCallback *m_callback = nullptr;
+	std::vector<void *> m_submittedContexts;
 	bool m_destroyed = false;
 };
 
@@ -115,6 +126,7 @@ public:
 	bool blockCreateBackend = false;
 	std::atomic<bool> createBackendEntered { false };
 	std::atomic<bool> releaseCreateBackend { true };
+	FakePcmVoiceBackend *lastVoiceBackend = nullptr;
 
 	HRESULT open(CriticalErrorCallback callback, void *context) noexcept override
 	{
@@ -156,7 +168,9 @@ public:
 			}
 			return createVoiceResult;
 		}
-		voice = std::make_unique<FakePcmVoiceBackend>(calls, voiceDestroyCount, voiceCreateResult);
+		auto pcmBackend = std::make_unique<FakePcmVoiceBackend>(calls, voiceDestroyCount, voiceCreateResult);
+		lastVoiceBackend = pcmBackend.get();
+		voice = std::move(pcmBackend);
 		return createVoiceResult;
 	}
 
@@ -400,6 +414,35 @@ void testHandleScopedOperationsAndConcurrentStaleAccess()
 	check(!service.isVoiceOpen(handle), "stale handle queries are rejected after destruction");
 	check(g_backendUseAfterDestroy.load(std::memory_order_acquire) == 0,
 		"stale handle operations never touch a destroyed backend");
+	service.shutdown();
+}
+
+void testDedicatedMovieOwnerDiscardsCompletions()
+{
+	auto backend = std::make_unique<FakeAudioEngine>();
+	FakeAudioEngine *backendView = backend.get();
+	XAudio2AudioService service(std::move(backend));
+	check(service.open(), "movie-completion service opens");
+	const XAudio2PcmVoiceHandle handle = service.createVoice();
+	check(handle.isValid() && backendView->lastVoiceBackend != nullptr,
+		"movie-completion service creates one observable voice");
+	check(service.resetVoice(handle, 1), "movie-completion voice activates its generation");
+
+	for (std::uint64_t sequence = 0; sequence < 40; ++sequence) {
+		check(service.submit(handle, makeChunk(1, sequence)) == AudioPcmSubmitResult::ACCEPTED,
+			"movie-completion cycle admits one chunk");
+		check(service.serviceVoice(handle), "movie-completion cycle submits its chunk");
+		check(backendView->lastVoiceBackend->submissionCount() == sequence + 1,
+			"movie-completion backend observes each submission");
+		backendView->lastVoiceBackend->complete(static_cast<std::size_t>(sequence));
+		check(service.serviceVoice(handle), "movie-completion owner reclaims its completed slot");
+		if ((sequence + 1) % XAudio2PcmVoice::SLOT_COUNT == 0) {
+			service.discardCompletions();
+		}
+		check(!service.isVoiceFailed(handle),
+			"dedicated movie completion draining prevents bounded-queue overflow");
+	}
+	service.discardCompletions();
 	service.shutdown();
 }
 
@@ -663,6 +706,7 @@ int main()
 	testFailurePublicationFenceAndOrdering();
 	testCallbackGateAdmissionDrainAndReopen();
 	testHandleScopedOperationsAndConcurrentStaleAccess();
+	testDedicatedMovieOwnerDiscardsCompletions();
 	testPartialBackendFailureIsDestroyedOnce();
 	testConcurrentTransitionsPreserveFirstFailure();
 	testInjectedLifecycleAndIndependentVoices();

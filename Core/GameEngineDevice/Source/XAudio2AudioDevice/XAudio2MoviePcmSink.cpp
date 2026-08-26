@@ -73,6 +73,7 @@ bool XAudio2MoviePcmSink::service() noexcept
 		|| !m_service->serviceVoice(m_handle)) {
 		return false;
 	}
+	m_service->discardCompletions();
 	return !m_service->isVoiceFailed(m_handle);
 }
 
