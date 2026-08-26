@@ -385,6 +385,7 @@ int runCatalogTest(int argc, char *argv[])
 	check(looseStream->sampleRate() == 48000U && looseStream->durationMS() > 4900.0f
 		&& looseStream->durationMS() < 5100.0f,
 		"persistent filesystem stream exposes bounded output metadata");
+#if defined(RTS_NATIVE_AUDIO_ASSET_SOURCE_TEST_HOOK)
 	NativeAudioAssetSourceTestHook::failFFmpegReadFrameAfter(1U);
 	AudioPcmChunk streamReadFailureChunk;
 	check(!looseStream->readPcm(streamReadFailureChunk, 48000U)
@@ -396,6 +397,7 @@ int runCatalogTest(int argc, char *argv[])
 	check(realSource.openPcmStream(
 		AsciiString(longAdpcmPath.string().c_str()), looseStream) && looseStream != nullptr,
 		"persistent FFmpeg stream can be reopened after a terminal read failure");
+#endif
 	const std::uint64_t looseFrames = consumePcmStream(*looseStream);
 	check(looseFrames >= 4U * 48000U && looseFrames <= 6U * 48000U,
 		"persistent filesystem stream drains the complete fixture");
@@ -414,6 +416,7 @@ int runCatalogTest(int argc, char *argv[])
 			AsciiString("archive\\long_adpcm.wav"), archiveIdentity)
 		&& longArchive.getReadCalls() == 1U,
 		"stream-cached archive identity matches without rereading the asset");
+#if defined(RTS_NATIVE_AUDIO_ASSET_SOURCE_TEST_HOOK)
 	NativeAudioAssetSourceTestHook::failFFmpegReadFrameAfter(1U);
 	AudioPcmChunk boundedReadFailureChunk;
 	check(!longArchiveSource.decodePcmAt(AsciiString("archive\\long_adpcm.wav"),
@@ -422,6 +425,7 @@ int runCatalogTest(int argc, char *argv[])
 		&& boundedReadFailureChunk.data.empty(),
 		"bounded FFmpeg fallback rejects non-EOF read errors without returning partial PCM");
 	NativeAudioAssetSourceTestHook::clearFFmpegReadFrameFailure();
+#endif
 	const std::uint64_t archiveFrames = consumePcmStream(*archiveStream);
 	check(archiveFrames >= 4U * 48000U && archiveFrames <= 6U * 48000U,
 		"persistent archive stream drains the complete fixture");
