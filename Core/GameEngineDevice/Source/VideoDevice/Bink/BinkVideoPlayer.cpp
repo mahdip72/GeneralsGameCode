@@ -139,7 +139,7 @@ void	BinkVideoPlayer::init()
 
 void BinkVideoPlayer::deinit()
 {
-	LegacyVideoAudioInterface *audio = dynamic_cast<LegacyVideoAudioInterface *>(TheAudio);
+	LegacyVideoAudioInterface *audio = TheAudio != nullptr ? TheAudio->getLegacyVideoAudioInterface() : nullptr;
 	if (audio != nullptr) {
 		audio->releaseLegacyVideoAudioHandle();
 	}
@@ -274,7 +274,7 @@ VideoStreamInterface*	BinkVideoPlayer::load( AsciiString movieTitle )
 void BinkVideoPlayer::notifyVideoPlayerOfNewProvider( Bool nowHasValid )
 {
 	if (!nowHasValid) {
-		LegacyVideoAudioInterface *audio = dynamic_cast<LegacyVideoAudioInterface *>(TheAudio);
+		LegacyVideoAudioInterface *audio = TheAudio != nullptr ? TheAudio->getLegacyVideoAudioInterface() : nullptr;
 		if (audio != nullptr) {
 			audio->releaseLegacyVideoAudioHandle();
 		}
@@ -289,7 +289,7 @@ void BinkVideoPlayer::notifyVideoPlayerOfNewProvider( Bool nowHasValid )
 void BinkVideoPlayer::initializeVideoAudio()
 {
 	Int retVal = 0;
-	LegacyVideoAudioInterface *audio = dynamic_cast<LegacyVideoAudioInterface *>(TheAudio);
+	LegacyVideoAudioInterface *audio = TheAudio != nullptr ? TheAudio->getLegacyVideoAudioInterface() : nullptr;
 	void *driver = audio != nullptr ? audio->getLegacyVideoDirectSoundHandle() : nullptr;
 
 	if ( driver )

@@ -214,6 +214,7 @@ class AudioManager : public SubsystemInterface
 		virtual void openDevice() = 0;
 		virtual void closeDevice() = 0;
 		virtual void *getDevice() = 0;
+		virtual LegacyVideoAudioInterface *getLegacyVideoAudioInterface() { return nullptr; }
 
 		// Device Dependent notification functions
 		virtual void notifyOfAudioCompletion( UnsignedInt audioCompleted, UnsignedInt flags ) = 0;

@@ -495,9 +495,13 @@ int main()
 	AudioManager *dummy = AudioManagerFactory::create(true);
 	check(dummy != nullptr && dummy->getDevice() == nullptr,
 		"factory dummy remains device-free");
+	check(dummy != nullptr && dummy->getLegacyVideoAudioInterface() == nullptr,
+		"x64 factory dummy exposes no legacy video-audio capability");
 	delete dummy;
 	AudioManager *native = AudioManagerFactory::create(false);
 	XAudio2AudioManager *nativeManager = dynamic_cast<XAudio2AudioManager *>(native);
+	check(native != nullptr && native->getLegacyVideoAudioInterface() == nullptr,
+		"x64 factory native manager exposes no legacy video-audio capability");
 	check(nativeManager != nullptr && nativeManager->getAssetSource() != nullptr,
 		"x64 factory wires a neutral production asset source into the native manager");
 	check(nativeManager != nullptr
@@ -510,6 +514,8 @@ int main()
 
 	NullAudioManager nullManager;
 	check(nullManager.getDevice() == nullptr, "NullAudioManager has no device");
+	check(nullManager.getLegacyVideoAudioInterface() == nullptr,
+		"NullAudioManager exposes no legacy video-audio capability");
 	check(dynamic_cast<FileAudioAssetSource *>(nullManager.getAssetSource()) != nullptr,
 		"NullAudioManager uses the same production-neutral asset source");
 	check(nullManager.getFileLengthMS(AsciiString(realAttack.string().c_str())) == 100.0f,

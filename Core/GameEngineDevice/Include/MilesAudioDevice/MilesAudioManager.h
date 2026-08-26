@@ -190,6 +190,7 @@ class MilesAudioManager : public AudioManager, public LegacyVideoAudioInterface
 
 		virtual void *getLegacyVideoDirectSoundHandle();
 		virtual void releaseLegacyVideoAudioHandle();
+		virtual LegacyVideoAudioInterface *getLegacyVideoAudioInterface() override { return this; }
 
 		virtual void friend_forcePlayAudioEventRTS(const AudioEventRTS* eventToPlay) override;
 
