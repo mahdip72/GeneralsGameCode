@@ -265,8 +265,13 @@ void BezierSegment::transformBasis(const float input[4], float output[4])
 {
 	// D3DXVec4Transform used two pairwise SSE additions. Preserve its
 	// single-precision rounding points as well as its row-vector convention;
-	// replay flight paths depend on the resulting bits. The VC6 caller selects
-	// single-precision x87 arithmetic for this transform.
+	// replay flight paths depend on the resulting bits.
+#if defined(_MSC_VER) && _MSC_VER < 1300 && defined(_M_IX86)
+	// VC6 otherwise evaluates these expressions with extended x87 precision,
+	// unlike the single-precision SSE instructions used by D3DXVec4Transform.
+	const unsigned int previousControl = _control87(0, 0);
+	_control87(_PC_24, _MCW_PC);
+#endif
 	for (int column = 0; column < 4; ++column) {
 		const volatile float product0 = input[0] * s_bezBasisMatrix[0][column];
 		const volatile float product1 = input[1] * s_bezBasisMatrix[1][column];
@@ -276,4 +281,7 @@ void BezierSegment::transformBasis(const float input[4], float output[4])
 		const volatile float secondPair = product2 + product3;
 		output[column] = firstPair + secondPair;
 	}
+#if defined(_MSC_VER) && _MSC_VER < 1300 && defined(_M_IX86)
+	_control87(previousControl, _MCW_PC);
+#endif
 }
