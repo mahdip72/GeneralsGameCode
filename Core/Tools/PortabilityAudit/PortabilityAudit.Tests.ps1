@@ -5,6 +5,17 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+$exceptPath = Join-Path $PSScriptRoot '..\..\Libraries\Source\WWVegas\WWLib\Except.cpp'
+$exceptText = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $exceptPath))
+if ($exceptText -notmatch '(?m)^\s*typedef\s+DWORD64\s+\(WINAPI \*SymLoadModuleType\)\s*\(') {
+    throw 'DbgHelp SymLoadModule64 contract must use a DWORD64 return type on x64.'
+}
+$symLoadResults = [regex]::Matches($exceptText,
+    '(?m)^\s*ExceptAddress\s+symload\s*=\s*0;\s*$').Count
+if ($symLoadResults -ne 2) {
+    throw 'DbgHelp SymLoadModule64 results must remain pointer-width at both call sites.'
+}
+
 function Invoke-FixtureGit {
     param(
         [Parameter(Mandatory = $true)]

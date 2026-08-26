@@ -121,7 +121,7 @@ DynamicVectorClass<ThreadInfoType*> ThreadList;
 typedef BOOL  (WINAPI *SymCleanupType) (HANDLE hProcess);
 typedef BOOL  (WINAPI *SymGetSymFromAddrType) (HANDLE hProcess, DWORD64 Address, PDWORD64 Displacement, PIMAGEHLP_SYMBOL64 Symbol);
 typedef BOOL  (WINAPI *SymInitializeType) (HANDLE hProcess, PCSTR UserSearchPath, BOOL fInvadeProcess);
-typedef BOOL  (WINAPI *SymLoadModuleType) (HANDLE hProcess, HANDLE hFile, PCSTR ImageName, PCSTR ModuleName, DWORD64 BaseOfDll, DWORD SizeOfDll);
+typedef DWORD64 (WINAPI *SymLoadModuleType) (HANDLE hProcess, HANDLE hFile, PCSTR ImageName, PCSTR ModuleName, DWORD64 BaseOfDll, DWORD SizeOfDll);
 typedef DWORD (WINAPI *SymSetOptionsType) (DWORD SymOptions);
 typedef BOOL  (WINAPI *SymUnloadModuleType) (HANDLE hProcess, DWORD64 BaseOfDll);
 typedef BOOL  (WINAPI *StackWalkType) (DWORD MachineType, HANDLE hProcess, HANDLE hThread, LPSTACKFRAME64 StackFrame, LPVOID ContextRecord, PREAD_PROCESS_MEMORY_ROUTINE64 ReadMemoryRoutine, PFUNCTION_TABLE_ACCESS_ROUTINE64 FunctionTableAccessRoutine, PGET_MODULE_BASE_ROUTINE64 GetModuleBaseRoutine, PTRANSLATE_ADDRESS_ROUTINE TranslateAddress);
@@ -454,7 +454,7 @@ void Dump_Exception_Info(EXCEPTION_POINTERS *e_info)
 		_SymSetOptions(SYMOPT_DEFERRED_LOADS);
 	}
 
-	int symload = 0;
+	ExceptAddress symload = 0;
 	int symbols_available = false;
 
 	if (symbol_functions_available && _SymInitialize (GetCurrentProcess(), nullptr, false))	{
@@ -1196,7 +1196,7 @@ void Load_Image_Helper()
 			_SymSetOptions(SYMOPT_DEFERRED_LOADS);
 		}
 
-		int symload = 0;
+		ExceptAddress symload = 0;
 
 		if (symbol_functions_available && _SymInitialize(GetCurrentProcess(), nullptr, FALSE)) {
 

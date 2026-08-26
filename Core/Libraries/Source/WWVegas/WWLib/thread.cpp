@@ -31,6 +31,8 @@
 #include <windows.h>
 #endif
 
+ThreadClass::StartupHookType ThreadClass::s_testStartupHook = nullptr;
+
 ThreadClass::ThreadClass(const char *thread_name, ExceptionHandlerType exception_handler) : handle(0), running(false), thread_priority(0)
 {
 	if (thread_name) {
@@ -55,10 +57,13 @@ void __cdecl ThreadClass::Internal_Thread_Function(void* params)
 #endif
 {
 	ThreadClass* tc=reinterpret_cast<ThreadClass*>(params);
-	#ifdef _WIN32
-	InterlockedExchange(&tc->running, 1);
-	#else
+	if (s_testStartupHook != nullptr)
+		s_testStartupHook(tc);
+	#ifndef _WIN32
 	tc->running = true;
+	#else
+	// Execute publishes the initial running state before creating the worker.
+	// Do not reassert it here: Stop() may have cleared it before this entry point.
 	#endif
 
 #ifdef _WIN32
@@ -97,6 +102,11 @@ void __cdecl ThreadClass::Internal_Thread_Function(void* params)
 	#ifdef _WIN32
 	return 0;
 	#endif
+}
+
+void ThreadClass::Set_Test_Startup_Hook(StartupHookType hook)
+{
+	s_testStartupHook = hook;
 }
 
 void ThreadClass::Execute()

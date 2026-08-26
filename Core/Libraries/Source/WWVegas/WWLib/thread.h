@@ -74,6 +74,10 @@ public:
 	static int Get_Thread_By_Index(int index, char *name_ptr = nullptr);
 
 protected:
+	typedef void (*StartupHookType)(ThreadClass *thread);
+
+	// Test-only startup synchronization hook. Production callers leave this unset.
+	static void Set_Test_Startup_Hook(StartupHookType hook);
 
 	// User defined thread function. The thread function should check for "running" flag every now and then
 	// and exit the thread if running is false.
@@ -95,6 +99,7 @@ private:
 	#else
 	static void __cdecl Internal_Thread_Function(void*);
 	#endif
+	static StartupHookType s_testStartupHook;
 	size_t handle;
 	int thread_priority;
 };
