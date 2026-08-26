@@ -137,6 +137,9 @@ jobs:
         if: contains(inputs.preset, 'vcpkg')
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:
+          # Keep package versions at the manifest baseline while using the
+          # acquire-msys repair that replaces the retired file-5.45-3 archive.
+          vcpkgGitCommitId: 6fa128f2b6e1dd260ebfb30fdb1c38a191369812
           runVcpkgInstall: false
           doNotCache: false
 
