@@ -953,12 +953,14 @@ void RecorderClass::updatePlayback() {
 	// executed during playback.
 	CullBadCommandsResult result = cullBadCommands();
 
-	if (result.hasNewGameMessage) {
-		// The replay's frame-zero commands were recorded after the new map was
+	#if defined(_WIN64)
+	if (m_nativeReplayContainer && result.hasNewGameMessage) {
+		// Native replay frame-zero commands were recorded after the new map was
 		// initialized. Defer them until MSG_NEW_GAME has been consumed so their
 		// temporary AI groups cannot advance deterministic IDs before map setup.
 		return;
 	}
+	#endif
 
 	if (result.hasClearGameDataMessage) {
 		// TheSuperHackers @bugfix Stop appending more commands if the replay playback is about to end.

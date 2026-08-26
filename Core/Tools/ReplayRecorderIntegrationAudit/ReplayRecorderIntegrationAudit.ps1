@@ -65,6 +65,7 @@ function Test-RecorderContent {
     $validator = Get-FunctionBody $Content 'static Bool validateNativeReplayContainer('
     $header = Get-FunctionBody $Content 'Bool RecorderClass::readReplayHeader('
     $playback = Get-FunctionBody $Content 'Bool RecorderClass::playbackFile('
+    $playbackUpdate = Get-FunctionBody $Content 'void RecorderClass::updatePlayback()'
     $readers = (Get-FunctionBody $Content 'Bool RecorderClass::readExact(') +
         (Get-FunctionBody $Content 'Bool RecorderClass::readUnicodeString(') +
         (Get-FunctionBody $Content 'Bool RecorderClass::readAsciiString(')
@@ -167,6 +168,25 @@ function Test-RecorderContent {
     if ($playback.IndexOf('readNativeReplayU32Field(m_file', [StringComparison]::Ordinal) -lt 0) {
         $violations.Add('native replay launch fields must use explicit little-endian reads')
     }
+    $nativeDeferralGuardIndex = $playbackUpdate.IndexOf('#if defined(_WIN64)',
+        [StringComparison]::Ordinal)
+    $nativeDeferralIndex = $playbackUpdate.IndexOf(
+        'if (m_nativeReplayContainer && result.hasNewGameMessage)',
+        [StringComparison]::Ordinal)
+    $nativeDeferralEndIndex = if ($nativeDeferralIndex -ge 0) {
+        $playbackUpdate.IndexOf('#endif', $nativeDeferralIndex, [StringComparison]::Ordinal)
+    } else {
+        -1
+    }
+    if ($nativeDeferralGuardIndex -lt 0 -or
+        $nativeDeferralIndex -le $nativeDeferralGuardIndex -or
+        $nativeDeferralEndIndex -le $nativeDeferralIndex) {
+        $violations.Add('frame-zero command deferral must be limited to validated native replay containers')
+    }
+    if ([regex]::IsMatch($playbackUpdate,
+        '(?m)^\s*if\s*\(\s*result\.hasNewGameMessage\s*\)')) {
+        $violations.Add('legacy replay playback must not defer frame-zero commands')
+    }
     foreach ($required in @(
         'ParseCanonicalReplayCommand(',
         'kMaxReplayCommandBytes',
@@ -233,6 +253,11 @@ static Bool validateNativeReplayContainer() {
   options.expectedSchemaVersion = rts::runtime_epoch::kCurrentReplaySchemaVersion;
 }
 static void writeNativeReplayU16() {}
+void RecorderClass::updatePlayback() {
+#if defined(_WIN64)
+  if (m_nativeReplayContainer && result.hasNewGameMessage) { return; }
+#endif
+}
 Bool RecorderClass::readReplayHeader() {
   if (!validateNativeReplayContainer(m_file, &m_nativeReplayPayloadEnd)) { return FALSE; }
   m_nativeReplayContainer = TRUE;
@@ -322,6 +347,17 @@ void RecorderClass::readArgument() {}
     $ignoredParseFailure = $good.Replace('  if (!m_nativeReplayParsed.ok()) {', '  if (FALSE) {')
     if (-not ((Test-RecorderContent $ignoredParseFailure) -match 'fail closed')) {
         throw 'ignored native parse failure was not rejected'
+    }
+    $unconditionalFrameZeroDeferral = $good.Replace(@'
+#if defined(_WIN64)
+  if (m_nativeReplayContainer && result.hasNewGameMessage) { return; }
+#endif
+'@, @'
+  if (result.hasNewGameMessage) { return; }
+'@)
+    if (-not ((Test-RecorderContent $unconditionalFrameZeroDeferral) -match
+        'legacy replay playback must not defer frame-zero commands')) {
+        throw 'unconditional frame-zero command deferral was not rejected'
     }
     Write-Output 'Replay recorder integration audit self-tests passed.'
     exit 0
