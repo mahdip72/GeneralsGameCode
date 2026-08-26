@@ -53,6 +53,80 @@ function Assert-EffectiveRuntimeInstall {
     }
 }
 
+function Remove-CppCommentsAndLiterals {
+    param([string]$Content)
+
+    $pattern = '(?s)R"(?<rawDelimiter>[^\s()\\]{0,16})\(.*?\)\k<rawDelimiter>"|' +
+        '/\*.*?\*/|//[^\r\n]*|"(?:\\.|[^"\\])*"|''(?:\\.|[^''\\])*'''
+    return [regex]::Replace($Content, $pattern, ' ')
+}
+
+function Get-CppClassBody {
+    param(
+        [string]$Content,
+        [string]$ClassName
+    )
+
+    $code = Remove-CppCommentsAndLiterals $Content
+    $declaration = [regex]::Match($code,
+        '\bclass\s+' + [regex]::Escape($ClassName) + '\b[^;{]*\{')
+    if (-not $declaration.Success) {
+        throw "Class $ClassName was not found."
+    }
+
+    $openBrace = $declaration.Index + $declaration.Value.LastIndexOf('{')
+    $depth = 0
+    for ($index = $openBrace; $index -lt $code.Length; ++$index) {
+        if ($code[$index] -eq '{') {
+            ++$depth
+        } elseif ($code[$index] -eq '}') {
+            --$depth
+            if ($depth -eq 0) {
+                return $code.Substring($openBrace + 1, $index - $openBrace - 1)
+            }
+        }
+    }
+    throw "Class $ClassName has no balanced body."
+}
+
+function Assert-LegacyVideoAccessor {
+    param(
+        [string]$ClassBody,
+        [string]$ReturnValue,
+        [switch]$RequireOverride,
+        [string]$FailureMessage
+    )
+
+    $override = if ($RequireOverride) { '\s+override' } else { '(?:\s+override)?' }
+    $pattern = '\bvirtual\s+LegacyVideoAudioInterface\s*\*\s*' +
+        'getLegacyVideoAudioInterface\s*\(\s*\)' + $override +
+        '\s*\{\s*return\s+' + [regex]::Escape($ReturnValue) + '\s*;\s*\}'
+    if ($ClassBody -cnotmatch $pattern) {
+        throw $FailureMessage
+    }
+}
+
+function Assert-NoLegacyVideoDynamicCast {
+    param([string]$Content)
+
+    $code = Remove-CppCommentsAndLiterals $Content
+    if ($code -cmatch '\bdynamic_cast\s*<') {
+        throw 'Bink player reintroduced an RTTI-dependent legacy video audio bridge.'
+    }
+}
+
+function Assert-LegacyVideoAccessorCount {
+    param(
+        [string]$Content,
+        [int]$ExpectedCount
+    )
+
+    $code = Remove-CppCommentsAndLiterals $Content
+    if ([regex]::Matches($code, '\bgetLegacyVideoAudioInterface\s*\(').Count -ne $ExpectedCount) {
+        throw 'Bink player does not use exactly the checked legacy video audio capabilities.'
+    }
+}
+
 if ($SelfTest) {
     $valid = "    if(`${CMAKE_SIZEOF_VOID_P} EQUAL 4 AND NOT RTS_BUILD_OPTION_FFMPEG)`n        include(cmake/bink.cmake)`n    endif()"
     Assert-ExactConditionalBlock $valid '    if(${CMAKE_SIZEOF_VOID_P} EQUAL 4 AND NOT RTS_BUILD_OPTION_FFMPEG)' '        include(cmake/bink.cmake)' '    endif()' 'Valid conditional block was rejected.'
@@ -62,15 +136,15 @@ if ($SelfTest) {
         Assert-ExactConditionalBlock $wrongCondition '    if(NOT RTS_BUILD_OPTION_FFMPEG)' '        include(cmake/bink.cmake)' '    endif()' 'Malformed condition was accepted.'
         throw 'Negative conditional self-test did not reject a wrong condition.'
     } catch {
-        if ($_.Exception.Message -eq 'Negative conditional self-test did not reject a wrong condition.') { throw }
+        if ($_.Exception.Message -ne 'Malformed condition was accepted.') { throw }
     }
 
     $duplicate = $valid + "`n" + $valid
     try {
-        Assert-ExactConditionalBlock $duplicate '    if(NOT RTS_BUILD_OPTION_FFMPEG)' '        include(cmake/bink.cmake)' '    endif()' 'Duplicate conditional block was accepted.'
+        Assert-ExactConditionalBlock $duplicate '    if(${CMAKE_SIZEOF_VOID_P} EQUAL 4 AND NOT RTS_BUILD_OPTION_FFMPEG)' '        include(cmake/bink.cmake)' '    endif()' 'Duplicate conditional block was accepted.'
         throw 'Negative conditional self-test did not reject a duplicate block.'
     } catch {
-        if ($_.Exception.Message -eq 'Negative conditional self-test did not reject a duplicate block.') { throw }
+        if ($_.Exception.Message -ne 'Duplicate conditional block was accepted.') { throw }
     }
 
     $validInstall = @'
@@ -87,7 +161,88 @@ if ($SelfTest) {
         Assert-EffectiveRuntimeInstall $rawInstall '_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS' 'Raw-prefix install was accepted.'
         throw 'Negative effective-prefix self-test did not reject a raw prefix.'
     } catch {
-        if ($_.Exception.Message -eq 'Negative effective-prefix self-test did not reject a raw prefix.') { throw }
+        if ($_.Exception.Message -ne 'Raw-prefix install was accepted.') { throw }
+    }
+
+    $validAudioManager = @'
+class AudioManager : public SubsystemInterface
+{
+    public:
+        // A misleading getLegacyVideoAudioInterface() token must not satisfy the check.
+        const char *description = "dynamic_cast<LegacyVideoAudioInterface *>(TheAudio)";
+        virtual LegacyVideoAudioInterface *
+        getLegacyVideoAudioInterface()
+        {
+            return nullptr;
+        }
+};
+'@
+    $audioManagerBody = Get-CppClassBody $validAudioManager 'AudioManager'
+    Assert-LegacyVideoAccessor $audioManagerBody 'nullptr' `
+        -FailureMessage 'Valid AudioManager accessor was rejected.'
+
+    $validMilesAudioManager = @'
+class MilesAudioManager : public AudioManager, public LegacyVideoAudioInterface
+{
+    public:
+        virtual LegacyVideoAudioInterface *getLegacyVideoAudioInterface() override
+        {
+            return this;
+        }
+};
+'@
+    $milesAudioManagerBody = Get-CppClassBody $validMilesAudioManager 'MilesAudioManager'
+    Assert-LegacyVideoAccessor $milesAudioManagerBody 'this' -RequireOverride `
+        -FailureMessage 'Valid MilesAudioManager accessor was rejected.'
+
+    $validBinkPlayer = @'
+void BinkVideoPlayer::deinit()
+{
+    TheAudio->getLegacyVideoAudioInterface();
+    /* alias->getLegacyVideoAudioInterface(); */
+    const char *ignored = "dynamic_cast<LegacyVideoAudioInterface *>(TheAudio)";
+    const char *rawIgnored = R"AUDIT(alias->getLegacyVideoAudioInterface();
+        dynamic_cast<LegacyVideoAudioInterface const *>(TheAudio))AUDIT";
+    TheAudio->getLegacyVideoAudioInterface();
+    TheAudio->getLegacyVideoAudioInterface();
+}
+'@
+    Assert-NoLegacyVideoDynamicCast $validBinkPlayer
+    Assert-LegacyVideoAccessorCount $validBinkPlayer 3
+
+    foreach ($invalidDynamicCast in @(
+        'dynamic_cast<LegacyVideoAudioInterface*>(TheAudio)',
+        'dynamic_cast< const LegacyVideoAudioInterface * >(TheAudio)',
+        'dynamic_cast<LegacyVideoAudioInterface const*>(TheAudio)',
+        'dynamic_cast<::LegacyVideoAudioInterface volatile *>(TheAudio)',
+        'using V = LegacyVideoAudioInterface; dynamic_cast<V *>(TheAudio)',
+        'dynamic_cast<class LegacyVideoAudioInterface *>(TheAudio)',
+        'dynamic_cast<::audio::LegacyVideoAudioInterface *>(TheAudio)'
+    )) {
+        try {
+            Assert-NoLegacyVideoDynamicCast $invalidDynamicCast
+            throw 'Negative dynamic-cast self-test accepted an RTTI bridge.'
+        } catch {
+            if ($_.Exception.Message -ne 'Bink player reintroduced an RTTI-dependent legacy video audio bridge.') { throw }
+        }
+    }
+
+    $wrongCaseAccessor = $validAudioManager.Replace(
+        'getLegacyVideoAudioInterface', 'getlegacyvideoaudiointerface')
+    try {
+        Assert-LegacyVideoAccessor (Get-CppClassBody $wrongCaseAccessor 'AudioManager') 'nullptr' `
+            -FailureMessage 'Wrong-case accessor was accepted.'
+        throw 'Negative accessor-case self-test accepted a malformed identifier.'
+    } catch {
+        if ($_.Exception.Message -ne 'Wrong-case accessor was accepted.') { throw }
+    }
+
+    $extraAliasCall = $validBinkPlayer + "`nLegacyVideoAudioInterface *audio = manager->getLegacyVideoAudioInterface();"
+    try {
+        Assert-LegacyVideoAccessorCount $extraAliasCall 3
+        throw 'Negative accessor-count self-test accepted a fourth alias call.'
+    } catch {
+        if ($_.Exception.Message -ne 'Bink player does not use exactly the checked legacy video audio capabilities.') { throw }
     }
 
     Write-Output 'Video backend selection audit negative self-test passed.'
@@ -177,6 +332,9 @@ $gameAudio = Get-Content -LiteralPath (Join-Path $SourceRoot 'Core/GameEngine/In
 if ($gameAudio -notmatch 'class LegacyVideoAudioInterface') {
     throw 'AudioManager is missing the explicit legacy video audio capability interface.'
 }
+$gameAudioBody = Get-CppClassBody $gameAudio 'AudioManager'
+Assert-LegacyVideoAccessor $gameAudioBody 'nullptr' `
+    -FailureMessage 'AudioManager is missing the checked legacy video audio capability accessor.'
 if ($gameAudio -match 'getHandleForVideo') {
     throw 'AudioManager retains a raw video audio acquisition contract.'
 }
@@ -191,11 +349,13 @@ if ($milesAudio -notmatch 'virtual void \*getLegacyVideoDirectSoundHandle\(\)' -
 if ($milesAudio -notmatch 'void\* getLegacyVideoDirectSoundHandle\(\) override' -or $milesAudio -notmatch 'void releaseLegacyVideoAudioHandle\(\) override') {
     throw 'Miles headless audio manager does not override the legacy video audio contract.'
 }
+$milesAudioBody = Get-CppClassBody $milesAudio 'MilesAudioManager'
+Assert-LegacyVideoAccessor $milesAudioBody 'this' -RequireOverride `
+    -FailureMessage 'Miles fallback does not publish its checked legacy video audio capability.'
 
 $binkPlayer = Get-Content -LiteralPath (Join-Path $SourceRoot 'Core/GameEngineDevice/Source/VideoDevice/Bink/BinkVideoPlayer.cpp') -Raw
-if ($binkPlayer -notmatch 'dynamic_cast<LegacyVideoAudioInterface \*>') {
-    throw 'Bink player does not use the checked legacy video audio capability.'
-}
+Assert-NoLegacyVideoDynamicCast $binkPlayer
+Assert-LegacyVideoAccessorCount $binkPlayer 3
 
 $ffmpegPlayer = Get-Content -LiteralPath (Join-Path $SourceRoot 'Core/GameEngineDevice/Source/VideoDevice/FFmpeg/FFmpegVideoPlayer.cpp') -Raw
 if ($ffmpegPlayer -match 'RTS_HAS_OPENAL|RTS_USE_OPENAL|OpenALAudioStream|getHandleForVideo|releaseHandleForVideo') {
