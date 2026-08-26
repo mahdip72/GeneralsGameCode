@@ -31,6 +31,24 @@
 #include <float.h>
 #endif
 
+#if !(defined(_MSC_VER) && _MSC_VER < 1300 && defined(_M_IX86))
+namespace
+{
+Real evaluateLegacyControlPointDot(Real point0, Real point1, Real point2, Real point3,
+	const float weights[4])
+{
+	// VC6 accumulated this dot product from w through x in the x87 register
+	// stack. Use explicit double steps so modern SSE builds retain that final
+	// rounding instead of reassociating the expression in float precision.
+	volatile double result = static_cast<double>(point3) * static_cast<double>(weights[3]);
+	result += static_cast<double>(point2) * static_cast<double>(weights[2]);
+	result += static_cast<double>(point1) * static_cast<double>(weights[1]);
+	result += static_cast<double>(point0) * static_cast<double>(weights[0]);
+	return static_cast<Real>(result);
+}
+}
+#endif
+
 //-------------------------------------------------------------------------------------------------
 BezierSegment::BezierSegment()
 {
@@ -118,6 +136,7 @@ void BezierSegment::evaluateBezSegmentAtT(Real tValue, Coord3D *outResult) const
 	_control87(previousControl, _MCW_PC);
 #endif
 
+#if defined(_MSC_VER) && _MSC_VER < 1300 && defined(_M_IX86)
 	outResult->x = m_controlPoints[0].x * tResult[0]
 		+ m_controlPoints[1].x * tResult[1]
 		+ m_controlPoints[2].x * tResult[2]
@@ -130,6 +149,14 @@ void BezierSegment::evaluateBezSegmentAtT(Real tValue, Coord3D *outResult) const
 		+ m_controlPoints[1].z * tResult[1]
 		+ m_controlPoints[2].z * tResult[2]
 		+ m_controlPoints[3].z * tResult[3];
+#else
+	outResult->x = evaluateLegacyControlPointDot(m_controlPoints[0].x, m_controlPoints[1].x,
+		m_controlPoints[2].x, m_controlPoints[3].x, tResult);
+	outResult->y = evaluateLegacyControlPointDot(m_controlPoints[0].y, m_controlPoints[1].y,
+		m_controlPoints[2].y, m_controlPoints[3].y, tResult);
+	outResult->z = evaluateLegacyControlPointDot(m_controlPoints[0].z, m_controlPoints[1].z,
+		m_controlPoints[2].z, m_controlPoints[3].z, tResult);
+#endif
 }
 
 //-------------------------------------------------------------------------------------------------
