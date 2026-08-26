@@ -199,7 +199,7 @@ Color Evaluate(RenderTextureOperation operation, const Color &argument1,
 
 bool Near(float actual, float expected)
 {
-	return std::fabs(actual - expected) < 0.0001f;
+	return fabs(actual - expected) < 0.0001f;
 }
 
 bool Same(const Color &actual, const Color &expected)
@@ -212,7 +212,7 @@ int Check(bool condition, const char *message)
 {
 	if (!condition)
 	{
-		std::fprintf(stderr, "FAIL: %s\n", message);
+		fprintf(stderr, "FAIL: %s\n", message);
 		return 1;
 	}
 	return 0;
@@ -225,7 +225,7 @@ int CheckOperation(RenderTextureOperation operation, Channel channel,
 	{
 		return 0;
 	}
-	std::fprintf(stderr, "FAIL: %s (%u) channel %u: got %.6f %.6f %.6f %.6f, "
+	fprintf(stderr, "FAIL: %s (%u) channel %u: got %.6f %.6f %.6f %.6f, "
 		"expected %.6f %.6f %.6f %.6f\n", name,
 		static_cast<unsigned int>(operation), static_cast<unsigned int>(channel),
 		actual.r, actual.g, actual.b, actual.a, expected.r, expected.g,
@@ -291,37 +291,43 @@ int main()
 
 	struct ExpectedOperation
 	{
+		ExpectedOperation(RenderTextureOperation operation_value,
+			const Color &expected_value, const char *name_value) :
+			operation(operation_value), expected(expected_value), name(name_value)
+		{
+		}
+
 		RenderTextureOperation operation;
 		Color expected;
 		const char *name;
 	};
 	const ExpectedOperation expected[] = {
-		{ rts::render::RENDER_TEXTURE_OP_DISABLE, Color(0.3f, 0.6f, 0.2f, 0.45f), "DISABLE" },
-		{ rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_1, Color(0.2f, 0.4f, 0.7f, 0.3f), "SELECTARG1" },
-		{ rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_2, Color(0.8f, 0.1f, 0.5f, 0.6f), "SELECTARG2" },
-		{ rts::render::RENDER_TEXTURE_OP_MODULATE, Color(0.16f, 0.04f, 0.35f, 0.18f), "MODULATE" },
-		{ rts::render::RENDER_TEXTURE_OP_MODULATE_2X, Color(0.32f, 0.08f, 0.7f, 0.36f), "MODULATE2X" },
-		{ rts::render::RENDER_TEXTURE_OP_MODULATE_4X, Color(0.64f, 0.16f, 1.4f, 0.72f), "MODULATE4X" },
-		{ rts::render::RENDER_TEXTURE_OP_ADD, Color(1.0f, 0.5f, 1.2f, 0.9f), "ADD" },
-		{ rts::render::RENDER_TEXTURE_OP_ADD_SIGNED, Color(0.5f, 0.0f, 0.7f, 0.4f), "ADDSIGNED" },
-		{ rts::render::RENDER_TEXTURE_OP_ADD_SIGNED_2X, Color(1.0f, 0.0f, 1.4f, 0.8f), "ADDSIGNED2X" },
-		{ rts::render::RENDER_TEXTURE_OP_SUBTRACT, Color(-0.6f, 0.3f, 0.2f, -0.3f), "SUBTRACT" },
-		{ rts::render::RENDER_TEXTURE_OP_ADD_SMOOTH, Color(0.84f, 0.46f, 0.85f, 0.72f), "ADDSMOOTH" },
-		{ rts::render::RENDER_TEXTURE_OP_BLEND_DIFFUSE_ALPHA, Color(0.59f, 0.205f, 0.57f, 0.495f), "BLENDDIFFUSEALPHA" },
-		{ rts::render::RENDER_TEXTURE_OP_BLEND_TEXTURE_ALPHA, Color(0.41f, 0.295f, 0.63f, 0.405f), "BLENDTEXTUREALPHA" },
-		{ rts::render::RENDER_TEXTURE_OP_BLEND_CURRENT_ALPHA, Color(0.53f, 0.235f, 0.59f, 0.465f), "BLENDCURRENTALPHA" },
-		{ rts::render::RENDER_TEXTURE_OP_MODULATE_ALPHA_ADD_COLOR, Color(0.44f, 0.43f, 0.85f, 0.45f), "MODULATEALPHA_ADDCOLOR" },
-		{ rts::render::RENDER_TEXTURE_OP_DOT_PRODUCT_3, Color(-0.2f, -0.2f, -0.2f, 0.45f), "DOTPRODUCT3" },
-		{ rts::render::RENDER_TEXTURE_OP_BUMP_ENVIRONMENT, Color(0.3f, 0.6f, 0.2f, 0.45f), "BUMPENVMAP" },
-		{ rts::render::RENDER_TEXTURE_OP_BUMP_ENVIRONMENT_LUMINANCE, Color(0.3f, 0.6f, 0.2f, 0.45f), "BUMPENVMAPLUMINANCE" },
-		{ rts::render::RENDER_TEXTURE_OP_BLEND_TEXTURE_ALPHA_PREMULTIPLIED, Color(0.48f, 0.435f, 0.875f, 0.51f), "BLENDTEXTUREALPHAPM" },
-		{ rts::render::RENDER_TEXTURE_OP_BLEND_TEXTURE_FACTOR_ALPHA, Color(0.47f, 0.265f, 0.61f, 0.435f), "BLENDFACTORALPHA" },
-		{ rts::render::RENDER_TEXTURE_OP_PREMODULATE, Color(0.2f, 0.4f, 0.7f, 0.3f), "PREMODULATE" },
-		{ rts::render::RENDER_TEXTURE_OP_MODULATE_COLOR_ADD_ALPHA, Color(0.46f, 0.34f, 0.65f, 0.45f), "MODULATECOLOR_ADDALPHA" },
-		{ rts::render::RENDER_TEXTURE_OP_MODULATE_INVERSE_ALPHA_ADD_COLOR, Color(0.76f, 0.47f, 1.05f, 0.45f), "MODULATEINVALPHA_ADDCOLOR" },
-		{ rts::render::RENDER_TEXTURE_OP_MODULATE_INVERSE_COLOR_ADD_ALPHA, Color(0.94f, 0.36f, 0.45f, 0.45f), "MODULATEINVCOLOR_ADDALPHA" },
-		{ rts::render::RENDER_TEXTURE_OP_MULTIPLY_ADD, Color(0.56f, 0.94f, 0.6f, 0.98f), "MULTIPLYADD" },
-		{ rts::render::RENDER_TEXTURE_OP_LINEAR_INTERPOLATE, Color(0.56f, 0.37f, 0.55f, 0.36f), "LERP" }
+		ExpectedOperation(rts::render::RENDER_TEXTURE_OP_DISABLE, Color(0.3f, 0.6f, 0.2f, 0.45f), "DISABLE"),
+		ExpectedOperation(rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_1, Color(0.2f, 0.4f, 0.7f, 0.3f), "SELECTARG1"),
+		ExpectedOperation(rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_2, Color(0.8f, 0.1f, 0.5f, 0.6f), "SELECTARG2"),
+		ExpectedOperation(rts::render::RENDER_TEXTURE_OP_MODULATE, Color(0.16f, 0.04f, 0.35f, 0.18f), "MODULATE"),
+		ExpectedOperation(rts::render::RENDER_TEXTURE_OP_MODULATE_2X, Color(0.32f, 0.08f, 0.7f, 0.36f), "MODULATE2X"),
+		ExpectedOperation(rts::render::RENDER_TEXTURE_OP_MODULATE_4X, Color(0.64f, 0.16f, 1.4f, 0.72f), "MODULATE4X"),
+		ExpectedOperation(rts::render::RENDER_TEXTURE_OP_ADD, Color(1.0f, 0.5f, 1.2f, 0.9f), "ADD"),
+		ExpectedOperation(rts::render::RENDER_TEXTURE_OP_ADD_SIGNED, Color(0.5f, 0.0f, 0.7f, 0.4f), "ADDSIGNED"),
+		ExpectedOperation(rts::render::RENDER_TEXTURE_OP_ADD_SIGNED_2X, Color(1.0f, 0.0f, 1.4f, 0.8f), "ADDSIGNED2X"),
+		ExpectedOperation(rts::render::RENDER_TEXTURE_OP_SUBTRACT, Color(-0.6f, 0.3f, 0.2f, -0.3f), "SUBTRACT"),
+		ExpectedOperation(rts::render::RENDER_TEXTURE_OP_ADD_SMOOTH, Color(0.84f, 0.46f, 0.85f, 0.72f), "ADDSMOOTH"),
+		ExpectedOperation(rts::render::RENDER_TEXTURE_OP_BLEND_DIFFUSE_ALPHA, Color(0.59f, 0.205f, 0.57f, 0.495f), "BLENDDIFFUSEALPHA"),
+		ExpectedOperation(rts::render::RENDER_TEXTURE_OP_BLEND_TEXTURE_ALPHA, Color(0.41f, 0.295f, 0.63f, 0.405f), "BLENDTEXTUREALPHA"),
+		ExpectedOperation(rts::render::RENDER_TEXTURE_OP_BLEND_CURRENT_ALPHA, Color(0.53f, 0.235f, 0.59f, 0.465f), "BLENDCURRENTALPHA"),
+		ExpectedOperation(rts::render::RENDER_TEXTURE_OP_MODULATE_ALPHA_ADD_COLOR, Color(0.44f, 0.43f, 0.85f, 0.45f), "MODULATEALPHA_ADDCOLOR"),
+		ExpectedOperation(rts::render::RENDER_TEXTURE_OP_DOT_PRODUCT_3, Color(-0.2f, -0.2f, -0.2f, 0.45f), "DOTPRODUCT3"),
+		ExpectedOperation(rts::render::RENDER_TEXTURE_OP_BUMP_ENVIRONMENT, Color(0.3f, 0.6f, 0.2f, 0.45f), "BUMPENVMAP"),
+		ExpectedOperation(rts::render::RENDER_TEXTURE_OP_BUMP_ENVIRONMENT_LUMINANCE, Color(0.3f, 0.6f, 0.2f, 0.45f), "BUMPENVMAPLUMINANCE"),
+		ExpectedOperation(rts::render::RENDER_TEXTURE_OP_BLEND_TEXTURE_ALPHA_PREMULTIPLIED, Color(0.48f, 0.435f, 0.875f, 0.51f), "BLENDTEXTUREALPHAPM"),
+		ExpectedOperation(rts::render::RENDER_TEXTURE_OP_BLEND_TEXTURE_FACTOR_ALPHA, Color(0.47f, 0.265f, 0.61f, 0.435f), "BLENDFACTORALPHA"),
+		ExpectedOperation(rts::render::RENDER_TEXTURE_OP_PREMODULATE, Color(0.2f, 0.4f, 0.7f, 0.3f), "PREMODULATE"),
+		ExpectedOperation(rts::render::RENDER_TEXTURE_OP_MODULATE_COLOR_ADD_ALPHA, Color(0.46f, 0.34f, 0.65f, 0.45f), "MODULATECOLOR_ADDALPHA"),
+		ExpectedOperation(rts::render::RENDER_TEXTURE_OP_MODULATE_INVERSE_ALPHA_ADD_COLOR, Color(0.76f, 0.47f, 1.05f, 0.45f), "MODULATEINVALPHA_ADDCOLOR"),
+		ExpectedOperation(rts::render::RENDER_TEXTURE_OP_MODULATE_INVERSE_COLOR_ADD_ALPHA, Color(0.94f, 0.36f, 0.45f, 0.45f), "MODULATEINVCOLOR_ADDALPHA"),
+		ExpectedOperation(rts::render::RENDER_TEXTURE_OP_MULTIPLY_ADD, Color(0.56f, 0.94f, 0.6f, 0.98f), "MULTIPLYADD"),
+		ExpectedOperation(rts::render::RENDER_TEXTURE_OP_LINEAR_INTERPOLATE, Color(0.56f, 0.37f, 0.55f, 0.36f), "LERP")
 	};
 	const unsigned int expectedCount = static_cast<unsigned int>(
 		sizeof(expected) / sizeof(expected[0]));
@@ -359,7 +365,7 @@ int main()
 		"PREMODULATE next-stage CURRENT");
 	if (result == 0)
 	{
-		std::printf("legacy texture operation semantics: PASS\n");
+		printf("legacy texture operation semantics: PASS\n");
 	}
 	return result;
 }

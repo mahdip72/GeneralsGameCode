@@ -1,5 +1,5 @@
 #include <stdio.h>
-#include <stdint.h>
+#include "Utility/stdint_adapter.h"
 #include <string.h>
 
 #include "WWVegas/WW3D2/surfaceblit.h"

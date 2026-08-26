@@ -8,7 +8,7 @@ int check(bool condition, const char *message)
 {
 	if (!condition)
 	{
-		std::fprintf(stderr, "FAIL: %s\n", message);
+		fprintf(stderr, "FAIL: %s\n", message);
 		return 1;
 	}
 	return 0;

@@ -14,6 +14,7 @@ target_link_libraries(core_fvf_stride_tests PRIVATE
     core_wwstub
     corei_always
     d3d8lib
+    winmm
 )
 
 if(IS_VS6_BUILD)
