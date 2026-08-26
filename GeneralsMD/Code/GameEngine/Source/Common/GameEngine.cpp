@@ -276,8 +276,10 @@ GameEngine::~GameEngine()
 	// TheSuperHackers @fix helmutbuhler 03/06/2025
 	// Reset all subsystems before deletion to prevent crashing due to cross dependencies.
 	reset();
-	// Drain compute jobs and owner completions while their subsystem owners are alive.
-	rts::JobSystem::instance().shutdown();
+	// Headless replay never starts the shared compute scheduler.  Avoid creating
+	// it solely for shutdown while subsystem owners are being destroyed.
+	if (!TheGlobalData->m_headless)
+		rts::JobSystem::instance().shutdown();
 
 	TheSubsystemList->shutdownAll();
 	delete TheSubsystemList;
