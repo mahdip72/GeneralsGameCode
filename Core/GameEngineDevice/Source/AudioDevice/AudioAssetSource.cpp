@@ -433,6 +433,25 @@ struct MemoryFFmpegInput
 	std::size_t position = 0;
 };
 
+#if defined(RTS_NATIVE_AUDIO_ASSET_SOURCE_TEST_HOOK)
+UnsignedInt g_ffmpegReadFrameFailureAfter =
+	(std::numeric_limits<UnsignedInt>::max)();
+UnsignedInt g_ffmpegReadFrameSuccesses = 0;
+#endif
+
+int readFFmpegFrame(AVFormatContext *format, AVPacket *packet)
+{
+#if defined(RTS_NATIVE_AUDIO_ASSET_SOURCE_TEST_HOOK)
+	if (g_ffmpegReadFrameFailureAfter != (std::numeric_limits<UnsignedInt>::max)()) {
+		if (g_ffmpegReadFrameSuccesses >= g_ffmpegReadFrameFailureAfter) {
+			return AVERROR(EIO);
+		}
+		++g_ffmpegReadFrameSuccesses;
+	}
+#endif
+	return av_read_frame(format, packet);
+}
+
 int readMemoryFFmpeg(void *opaque, std::uint8_t *buffer, int bufferSize)
 {
 	MemoryFFmpegInput *input = static_cast<MemoryFFmpegInput *>(opaque);
@@ -674,9 +693,13 @@ public:
 				}
 				continue;
 			}
-			if (m_eof || !decodeUntil(maxFrames - chunk.frameCount)) {
-				m_failed = m_failed || !m_eof;
+			if (m_eof) {
 				break;
+			}
+			if (!decodeUntil(maxFrames - chunk.frameCount)) {
+				m_failed = true;
+				chunk = {};
+				return FALSE;
 			}
 		}
 		return chunk.frameCount != 0U ? TRUE : FALSE;
@@ -824,10 +847,14 @@ private:
 				m_needReceive = true;
 				continue;
 			}
-			const int result = av_read_frame(m_format, m_packet);
-			if (result < 0) {
+			const int result = readFFmpegFrame(m_format, m_packet);
+			if (result == AVERROR_EOF) {
 				m_inputEof = true;
 				continue;
+			}
+			if (result < 0) {
+				m_failed = true;
+				return false;
 			}
 			if (m_packet->stream_index != m_streamIndex) {
 				av_packet_unref(m_packet);
@@ -989,7 +1016,14 @@ bool decodeWithFFmpeg(const std::string &path, AudioPcmChunk &chunk,
 			if (sink.isComplete()) return true;
 		}
 	};
-	while (!sink.isComplete() && packet != nullptr && av_read_frame(format, packet) >= 0) {
+	while (!sink.isComplete() && packet != nullptr) {
+		const int readResult = readFFmpegFrame(format, packet);
+		if (readResult == AVERROR_EOF) {
+			break;
+		}
+		if (readResult < 0) {
+			goto cleanup;
+		}
 		if (packet->stream_index == streamIndex) {
 			if (avcodec_send_packet(codecContext, packet) < 0 || !receiveFrames()) {
 				av_packet_unref(packet);
@@ -1068,7 +1102,14 @@ bool decodeWithFFmpeg(const std::vector<std::uint8_t> &bytes, AudioPcmChunk &chu
 				if (sink.isComplete()) return true;
 			}
 		};
-		while (!sink.isComplete() && av_read_frame(format, packet) >= 0) {
+		while (!sink.isComplete()) {
+			const int readResult = readFFmpegFrame(format, packet);
+			if (readResult == AVERROR_EOF) {
+				break;
+			}
+			if (readResult < 0) {
+				goto cleanup;
+			}
 			if (packet->stream_index == streamIndex) {
 				if (avcodec_send_packet(codecContext, packet) < 0 || !receiveFrames()) {
 					av_packet_unref(packet);
@@ -1098,6 +1139,23 @@ cleanup:
 }
 #endif
 }
+
+#if defined(RTS_NATIVE_AUDIO_ASSET_SOURCE_TEST_HOOK) && defined(RTS_HAS_FFMPEG)
+namespace NativeAudioAssetSourceTestHook
+{
+void failFFmpegReadFrameAfter(UnsignedInt successfulReads)
+{
+	g_ffmpegReadFrameFailureAfter = successfulReads;
+	g_ffmpegReadFrameSuccesses = 0;
+}
+
+void clearFFmpegReadFrameFailure()
+{
+	g_ffmpegReadFrameFailureAfter = (std::numeric_limits<UnsignedInt>::max)();
+	g_ffmpegReadFrameSuccesses = 0;
+}
+}
+#endif
 
 FileAudioAssetSource::FileAudioAssetSource() = default;
 

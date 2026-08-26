@@ -359,3 +359,11 @@ private:
 	mutable std::list<std::string> m_identityPaths;
 	mutable std::list<VirtualIdentity> m_virtualIdentities;
 };
+
+#if defined(RTS_NATIVE_AUDIO_ASSET_SOURCE_TEST_HOOK)
+namespace NativeAudioAssetSourceTestHook
+{
+void failFFmpegReadFrameAfter(UnsignedInt successfulReads);
+void clearFFmpegReadFrameFailure();
+}
+#endif

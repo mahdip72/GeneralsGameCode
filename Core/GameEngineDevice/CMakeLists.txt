@@ -341,6 +341,10 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     target_compile_features(rts_native_audio_asset_source PUBLIC cxx_std_20)
     if(RTS_BUILD_OPTION_FFMPEG AND FFMPEG_FOUND)
         target_compile_definitions(rts_native_audio_asset_source PRIVATE RTS_HAS_FFMPEG)
+        if(RTS_BUILD_CORE_EXTRAS)
+            target_compile_definitions(rts_native_audio_asset_source PRIVATE
+                RTS_NATIVE_AUDIO_ASSET_SOURCE_TEST_HOOK)
+        endif()
         target_link_libraries(rts_native_audio_asset_source PRIVATE
             rts_ffmpeg_audio_decoder
             FFMPEG::avcodec

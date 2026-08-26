@@ -26,7 +26,8 @@ add_executable(core_native_audio_asset_catalog_test
 target_compile_definitions(core_native_audio_asset_catalog_test PRIVATE DISABLE_GAMEMEMORY)
 if(RTS_BUILD_OPTION_FFMPEG AND FFMPEG_EXECUTABLE)
     target_compile_definitions(core_native_audio_asset_catalog_test PRIVATE
-        RTS_NATIVE_AUDIO_HAS_FFMPEG_CLI)
+        RTS_NATIVE_AUDIO_HAS_FFMPEG_CLI
+        RTS_NATIVE_AUDIO_ASSET_SOURCE_TEST_HOOK)
 endif()
 
 target_include_directories(core_native_audio_asset_catalog_test PRIVATE
