@@ -1404,11 +1404,12 @@ here:
 	}
 
 	int pointer_index = 0;
+	bool skip_first_result = context == nullptr;
 
 	/*
 	** Walk the stack by the requested number of return address iterations.
 	*/
-	for (int i = 0; i < num_addresses + 1; i++) {
+	while (pointer_index < num_addresses) {
 		if (
 		#if defined(_WIN64)
 			_StackWalk(IMAGE_FILE_MACHINE_AMD64, GetCurrentProcess(), GetCurrentThread(), &stack_frame, walk_context, nullptr, _SymFunctionTableAccess, _SymGetModuleBase, nullptr)
@@ -1420,7 +1421,8 @@ here:
 			/*
 			** First result will always be the return address we were called from.
 			*/
-			if (i==0 && context == nullptr) {
+			if (skip_first_result) {
+				skip_first_result = false;
 				continue;
 			}
 			uintptr_t return_address = static_cast<uintptr_t>(stack_frame.AddrReturn.Offset);

@@ -15,6 +15,10 @@ $symLoadResults = [regex]::Matches($exceptText,
 if ($symLoadResults -ne 2) {
     throw 'DbgHelp SymLoadModule64 results must remain pointer-width at both call sites.'
 }
+if ($exceptText -notmatch '(?m)^\s*while\s*\(pointer_index\s*<\s*num_addresses\)\s*\{\s*$' -or
+    $exceptText -match 'num_addresses\s*\+\s*1') {
+    throw 'Stack_Walk must bound writes by the caller-provided return-address capacity.'
+}
 
 function Invoke-FixtureGit {
     param(
