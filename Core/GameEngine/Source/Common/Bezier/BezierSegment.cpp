@@ -104,10 +104,19 @@ void BezierSegment::evaluateBezSegmentAtT(Real tValue, Coord3D *outResult) const
 	if (!outResult)
 		return;
 
+#if defined(_MSC_VER) && _MSC_VER < 1300 && defined(_M_IX86)
+	// The legacy constructor materialized t^2 before multiplying by t, while
+	// VC6 otherwise keeps this replacement expression in extended precision.
+	const unsigned int previousControl = _control87(0, 0);
+	_control87(_PC_24, _MCW_PC);
+#endif
 	const float tSquared = tValue * tValue;
 	const float tVector[4] = { tValue * tSquared, tSquared, tValue, 1.0f };
 	float tResult[4];
 	transformBasis(tVector, tResult);
+#if defined(_MSC_VER) && _MSC_VER < 1300 && defined(_M_IX86)
+	_control87(previousControl, _MCW_PC);
+#endif
 
 	outResult->x = m_controlPoints[0].x * tResult[0]
 		+ m_controlPoints[1].x * tResult[1]
@@ -256,13 +265,8 @@ void BezierSegment::transformBasis(const float input[4], float output[4])
 {
 	// D3DXVec4Transform used two pairwise SSE additions. Preserve its
 	// single-precision rounding points as well as its row-vector convention;
-	// replay flight paths depend on the resulting bits.
-#if defined(_MSC_VER) && _MSC_VER < 1300 && defined(_M_IX86)
-	// VC6 otherwise evaluates these expressions with extended x87 precision,
-	// unlike the single-precision SSE instructions used by D3DXVec4Transform.
-	const unsigned int previousControl = _control87(0, 0);
-	_control87(_PC_24, _MCW_PC);
-#endif
+	// replay flight paths depend on the resulting bits. The VC6 caller selects
+	// single-precision x87 arithmetic for this transform.
 	for (int column = 0; column < 4; ++column) {
 		const volatile float product0 = input[0] * s_bezBasisMatrix[0][column];
 		const volatile float product1 = input[1] * s_bezBasisMatrix[1][column];
@@ -272,7 +276,4 @@ void BezierSegment::transformBasis(const float input[4], float output[4])
 		const volatile float secondPair = product2 + product3;
 		output[column] = firstPair + secondPair;
 	}
-#if defined(_MSC_VER) && _MSC_VER < 1300 && defined(_M_IX86)
-	_control87(previousControl, _MCW_PC);
-#endif
 }
