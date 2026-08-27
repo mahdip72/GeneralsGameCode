@@ -442,8 +442,19 @@ static Bool buildNativeReplayCommand(GameMessage *msg,
 
 static Bool writeNativeReplayExact(File *file, const void *data, std::size_t byteCount)
 {
-	return file != nullptr && data != nullptr && byteCount <= static_cast<std::size_t>(INT_MAX) &&
-		file->write(data, static_cast<Int>(byteCount)) == static_cast<Int>(byteCount);
+	if (file == nullptr || data == nullptr || byteCount > static_cast<std::size_t>(INT_MAX))
+		return FALSE;
+	const Int position = file->position();
+	if (position < kNativeReplayPayloadBase)
+		return FALSE;
+	const std::uint64_t payloadBytes =
+		static_cast<std::uint64_t>(position - kNativeReplayPayloadBase);
+	if (payloadBytes > kNativeReplayMaxPayloadBytes ||
+		byteCount > kNativeReplayMaxPayloadBytes - payloadBytes)
+	{
+		return FALSE;
+	}
+	return file->write(data, static_cast<Int>(byteCount)) == static_cast<Int>(byteCount);
 }
 
 static Bool writeNativeReplayU16Field(File *file, std::uint16_t value)
@@ -1403,8 +1414,8 @@ void RecorderClass::writeToFile(GameMessage * msg) {
 #if defined(_WIN64)
 	std::array<rts::replay_command::Byte, rts::replay_command::kMaxReplayCommandBytes> record = {{}};
 	std::size_t recordBytes = 0U;
-	if (!buildNativeReplayCommand(msg, record, &recordBytes) || m_file == nullptr ||
-		m_file->write(record.data(), static_cast<Int>(recordBytes)) != static_cast<Int>(recordBytes))
+	if (!buildNativeReplayCommand(msg, record, &recordBytes) ||
+		!writeNativeReplayExact(m_file, record.data(), recordBytes))
 	{
 		m_replayWriteError = TRUE;
 		DEBUG_LOG(("RecorderClass::writeToFile - failed to write canonical replay command"));

@@ -70,6 +70,7 @@ function Test-RecorderContent {
         (Get-FunctionBody $Content 'Bool RecorderClass::readUnicodeString(') +
         (Get-FunctionBody $Content 'Bool RecorderClass::readAsciiString(')
     $writer = Get-FunctionBody $Content 'void RecorderClass::writeToFile(GameMessage * msg)'
+    $exactWriter = Get-FunctionBody $Content 'static Bool writeNativeReplayExact('
     $failure = Get-FunctionBody $Content 'void RecorderClass::failNativeReplayRead('
     $nativeCommand = Get-FunctionBody $Content 'Bool RecorderClass::appendNativeReplayCommand()'
     $frameReader = Get-FunctionBody $Content 'void RecorderClass::readNextFrame()'
@@ -113,11 +114,20 @@ function Test-RecorderContent {
     }
     foreach ($required in @(
         'buildNativeReplayCommand(msg, record, &recordBytes)',
+        'writeNativeReplayExact(m_file, record.data(), recordBytes)',
         'm_replayWriteError = TRUE;',
         '#else',
         '#endif')) {
         if ($writer.IndexOf($required, [StringComparison]::Ordinal) -lt 0) {
             $violations.Add("native recording must fail closed for '$required'")
+        }
+    }
+    foreach ($required in @(
+        'position < kNativeReplayPayloadBase',
+        'payloadBytes > kNativeReplayMaxPayloadBytes',
+        'byteCount > kNativeReplayMaxPayloadBytes - payloadBytes')) {
+        if ($exactWriter.IndexOf($required, [StringComparison]::Ordinal) -lt 0) {
+            $violations.Add("native replay append limit is missing '$required'")
         }
     }
     if ($stop.IndexOf('m_file->close();', [StringComparison]::Ordinal) -lt 0 -or
@@ -142,11 +152,13 @@ function Test-RecorderContent {
             [StringComparison]::Ordinal) -lt 0) {
         $violations.Add('native replay container validation must require the current replay schema')
     }
+    if ($Content.IndexOf('kNativeReplayMaxPayloadBytes', [StringComparison]::Ordinal) -lt 0) {
+        $violations.Add("native replay payload limit policy is missing 'kNativeReplayMaxPayloadBytes'")
+    }
     foreach ($required in @(
-        'kNativeReplayMaxPayloadBytes',
         'options.maxPayloadByteCount = availablePayloadBytes < kNativeReplayMaxPayloadBytes',
         'header.payloadByteCount > options.maxPayloadByteCount')) {
-        if ($Content.IndexOf($required, [StringComparison]::Ordinal) -lt 0) {
+        if ($validator.IndexOf($required, [StringComparison]::Ordinal) -lt 0) {
             $violations.Add("native replay payload limit policy is missing '$required'")
         }
     }
@@ -284,9 +296,15 @@ Bool RecorderClass::readUnicodeString() { readNativeReplayU16Field(m_file, value
 Bool RecorderClass::readAsciiString() { return rts::replay::ReadAsciiString(*m_file, p, n); }
 void RecorderClass::writeToFile(GameMessage * msg) {
   buildNativeReplayCommand(msg, record, &recordBytes);
+  writeNativeReplayExact(m_file, record.data(), recordBytes);
   m_replayWriteError = TRUE;
 #else
 #endif
+}
+static Bool writeNativeReplayExact() {
+  if (position < kNativeReplayPayloadBase) return FALSE;
+  if (payloadBytes > kNativeReplayMaxPayloadBytes) return FALSE;
+  if (byteCount > kNativeReplayMaxPayloadBytes - payloadBytes) return FALSE;
 }
 void RecorderClass::writeArgument() {}
 void RecorderClass::failNativeReplayRead() {
@@ -344,6 +362,11 @@ void RecorderClass::readArgument() {}
     $payloadCheckOutsideCommand += "`nReplayCommandError::PayloadSizeMismatch;"
     if (-not ((Test-RecorderContent $payloadCheckOutsideCommand) -match 'PayloadSizeMismatch')) {
         throw 'payload-size token outside the native command helper was not rejected'
+    }
+    $unboundedAppend = $good.Replace(
+        '  if (byteCount > kNativeReplayMaxPayloadBytes - payloadBytes) return FALSE;', '')
+    if (-not ((Test-RecorderContent $unboundedAppend) -match 'append limit')) {
+        throw 'unbounded native replay append was not rejected'
     }
     $unguardedStartup = $good.Replace('if (!beginNativeReplayContainer(m_file)) { return; }',
         'beginNativeReplayContainer(m_file);')
