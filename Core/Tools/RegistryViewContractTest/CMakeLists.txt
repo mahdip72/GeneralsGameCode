@@ -3,7 +3,7 @@ add_executable(core_registry_view_contract_tests
 )
 
 target_include_directories(core_registry_view_contract_tests PRIVATE
-    "${CMAKE_SOURCE_DIR}/Core/GameEngine/Include"
+    "${CMAKE_SOURCE_DIR}/Core/Libraries/Include"
 )
 
 target_link_libraries(core_registry_view_contract_tests PRIVATE advapi32 ole32)

@@ -34,6 +34,7 @@ function Assert-RegistrySourceContract {
         [Parameter(Mandatory = $true)][string]$Context,
         [int]$ExpectedRetailReads = 2,
         [int]$ExpectedRetailWrites = 2,
+        [int]$ExpectedRetailDeletes = 0,
         [int]$ExpectedNativeReads = 0,
         [int]$ExpectedNativeWrites = 0
     )
@@ -43,7 +44,8 @@ function Assert-RegistrySourceContract {
         throw "$Context does not include the retail registry-view boundary."
     }
     $code = Remove-CppCommentsAndLiterals -Content $Content
-    if ($code -match '\bReg(?:Open|Create)KeyEx(?:A|W)?\b') {
+    if ($code -match '\bReg(?:Open|Create)Key(?:Ex)?(?:A|W)?\b' -or
+        $code -match '\bRegDeleteKey(?:Ex)?(?:A|W)?\b') {
         throw "$Context bypasses the retail registry-view boundary."
     }
     if ([regex]::Matches($code, '\bOpenRetailRegistryKey\s*\(').Count -ne $ExpectedRetailReads) {
@@ -51,6 +53,9 @@ function Assert-RegistrySourceContract {
     }
     if ([regex]::Matches($code, '\bCreateRetailRegistryKey\s*\(').Count -ne $ExpectedRetailWrites) {
         throw "$Context must contain exactly $ExpectedRetailWrites retail registry writes."
+    }
+    if ([regex]::Matches($code, '\bDeleteRetailRegistryKey\s*\(').Count -ne $ExpectedRetailDeletes) {
+        throw "$Context must contain exactly $ExpectedRetailDeletes retail registry deletes."
     }
     if ([regex]::Matches($code, '\bOpenNativeRegistryKey\s*\(').Count -ne $ExpectedNativeReads) {
         throw "$Context must contain exactly $ExpectedNativeReads native registry reads."
@@ -69,6 +74,7 @@ function Assert-RegistryHeaderContract {
         'KEY_WOW64_32KEY',
         'OpenRetailRegistryKey',
         'CreateRetailRegistryKey',
+        'DeleteRetailRegistryKey',
         'GetNativeRegistryAccessMask',
         'KEY_WOW64_64KEY',
         'OpenNativeRegistryKey',
@@ -84,6 +90,9 @@ function Assert-RegistryHeaderContract {
     if ($code -notmatch '(?s)inline\s+REGSAM\s+GetNativeRegistryAccessMask.*?#if\s+defined\(_WIN64\).*?KEY_WOW64_64KEY.*?#else.*?return\s+access\s*;.*?#endif') {
         throw 'RegistryView.h does not preserve Win32 behavior while selecting the native view on x64.'
     }
+    if ($code -notmatch '(?s)inline\s+LONG\s+DeleteRetailRegistryKey\s*\([^)]*\)\s*\{\s*#if\s+defined\(_WIN64\).*?RegDeleteKeyExA\s*\([^;]*KEY_WOW64_32KEY[^;]*\).*?#else.*?RegDeleteKeyA\s*\(.*?#endif\s*\}') {
+        throw 'RegistryView.h does not preserve Win32 deletion while selecting the retail view on x64.'
+    }
     foreach ($wrapper in @(
         [pscustomobject]@{ Name = 'OpenRetailRegistryKey'; Mask = 'GetRetailRegistryAccessMask' },
         [pscustomobject]@{ Name = 'CreateRetailRegistryKey'; Mask = 'GetRetailRegistryAccessMask' },
@@ -98,8 +107,10 @@ function Assert-RegistryHeaderContract {
         }
     }
     if ([regex]::Matches($code, '\bRegOpenKeyExA\s*\(').Count -ne 2 -or
-        [regex]::Matches($code, '\bRegCreateKeyExA\s*\(').Count -ne 2) {
-        throw 'RegistryView.h must contain exactly the four audited WinAPI boundary calls.'
+        [regex]::Matches($code, '\bRegCreateKeyExA\s*\(').Count -ne 2 -or
+        [regex]::Matches($code, '\bRegDeleteKeyExA\s*\(').Count -ne 1 -or
+        [regex]::Matches($code, '\bRegDeleteKeyA\s*\(').Count -ne 1) {
+        throw 'RegistryView.h must contain exactly the six audited WinAPI boundary calls.'
     }
 }
 
@@ -114,8 +125,12 @@ CreateRetailRegistryKey(root, path, 0, name, 0, KEY_WRITE, 0, &handle, 0);
     Assert-RegistrySourceContract -Content $valid -Context 'valid fixture'
 
     foreach ($api in @(
+        'RegOpenKey', 'RegOpenKeyA', 'RegOpenKeyW',
         'RegOpenKeyEx', 'RegOpenKeyExA', 'RegOpenKeyExW',
-        'RegCreateKeyEx', 'RegCreateKeyExA', 'RegCreateKeyExW'
+        'RegCreateKey', 'RegCreateKeyA', 'RegCreateKeyW',
+        'RegCreateKeyEx', 'RegCreateKeyExA', 'RegCreateKeyExW',
+        'RegDeleteKey', 'RegDeleteKeyA', 'RegDeleteKeyW',
+        'RegDeleteKeyEx', 'RegDeleteKeyExA', 'RegDeleteKeyExW'
     )) {
         $caughtExplicitBypass = $false
         try {
@@ -150,7 +165,7 @@ if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
 }
 
 $sourceFull = [IO.Path]::GetFullPath($SourceRoot)
-$headerPath = Join-Path $sourceFull 'Core/GameEngine/Include/Common/RegistryView.h'
+$headerPath = Join-Path $sourceFull 'Core/Libraries/Include/Common/RegistryView.h'
 if (-not (Test-Path -LiteralPath $headerPath -PathType Leaf)) {
     throw "Retail registry-view boundary is missing: $headerPath"
 }
@@ -158,28 +173,43 @@ Assert-RegistryHeaderContract -Content (Get-Content -LiteralPath $headerPath -Ra
 
 foreach ($contract in @(
     [pscustomobject]@{
+        Path = 'Core/Libraries/Source/WWVegas/WWLib/registry.cpp'
+        RetailReads = 6; RetailWrites = 1; RetailDeletes = 2
+        NativeReads = 0; NativeWrites = 0
+    },
+    [pscustomobject]@{
+        Path = 'Core/Libraries/Source/WWVegas/WWDownload/FTP.cpp'
+        RetailReads = 1; RetailWrites = 0; RetailDeletes = 0
+        NativeReads = 0; NativeWrites = 0
+    },
+    [pscustomobject]@{
+        Path = 'Core/GameEngine/Source/Common/Audio/urllaunch.cpp'
+        RetailReads = 0; RetailWrites = 0; RetailDeletes = 0
+        NativeReads = 3; NativeWrites = 0
+    },
+    [pscustomobject]@{
         Path = 'Core/Libraries/Source/WWVegas/WWDownload/registry.cpp'
-        RetailReads = 2; RetailWrites = 2; NativeReads = 0; NativeWrites = 0
+        RetailReads = 2; RetailWrites = 2; RetailDeletes = 0; NativeReads = 0; NativeWrites = 0
     },
     [pscustomobject]@{
         Path = 'Generals/Code/GameEngine/Source/Common/System/registry.cpp'
-        RetailReads = 2; RetailWrites = 2; NativeReads = 0; NativeWrites = 0
+        RetailReads = 2; RetailWrites = 2; RetailDeletes = 0; NativeReads = 0; NativeWrites = 0
     },
     [pscustomobject]@{
         Path = 'GeneralsMD/Code/GameEngine/Source/Common/System/registry.cpp'
-        RetailReads = 2; RetailWrites = 2; NativeReads = 0; NativeWrites = 0
+        RetailReads = 2; RetailWrites = 2; RetailDeletes = 0; NativeReads = 0; NativeWrites = 0
     },
     [pscustomobject]@{
         Path = 'Core/Tools/Launcher/findpatch.cpp'
-        RetailReads = 1; RetailWrites = 0; NativeReads = 0; NativeWrites = 0
+        RetailReads = 1; RetailWrites = 0; RetailDeletes = 0; NativeReads = 0; NativeWrites = 0
     },
     [pscustomobject]@{
         Path = 'Core/Tools/Launcher/patch.cpp'
-        RetailReads = 1; RetailWrites = 0; NativeReads = 0; NativeWrites = 1
+        RetailReads = 1; RetailWrites = 0; RetailDeletes = 0; NativeReads = 0; NativeWrites = 1
     },
     [pscustomobject]@{
         Path = 'Core/Tools/Launcher/DatGen/DatGen.cpp'
-        RetailReads = 4; RetailWrites = 0; NativeReads = 1; NativeWrites = 0
+        RetailReads = 4; RetailWrites = 0; RetailDeletes = 0; NativeReads = 1; NativeWrites = 0
     }
 )) {
     $path = Join-Path $sourceFull $contract.Path
@@ -187,6 +217,7 @@ foreach ($contract in @(
         -Context $contract.Path `
         -ExpectedRetailReads $contract.RetailReads `
         -ExpectedRetailWrites $contract.RetailWrites `
+        -ExpectedRetailDeletes $contract.RetailDeletes `
         -ExpectedNativeReads $contract.NativeReads `
         -ExpectedNativeWrites $contract.NativeWrites
 }

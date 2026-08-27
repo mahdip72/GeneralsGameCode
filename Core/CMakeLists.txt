@@ -15,6 +15,7 @@ target_include_directories(corei_libraries_source_wwvegas INTERFACE "Libraries/S
 target_include_directories(corei_main INTERFACE "Main")
 
 target_sources(corei_libraries_include PRIVATE
+    Libraries/Include/Common/RegistryView.h
     Libraries/Include/Lib/BaseType.h
     Libraries/Include/Lib/BaseTypeCore.h
     Libraries/Include/Lib/trig.h

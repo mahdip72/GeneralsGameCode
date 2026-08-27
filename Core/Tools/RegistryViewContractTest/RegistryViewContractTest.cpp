@@ -60,6 +60,7 @@ int main()
 	char readPath[192];
 	char writePath[192];
 	char nativePath[192];
+	char deletePath[192];
 	// Some Windows Server WOW64 registry views reject volatile Classes keys.
 	const DWORD fixtureOptions = REG_OPTION_NON_VOLATILE;
 	_snprintf_s(readPath, sizeof(readPath), _TRUNCATE,
@@ -80,6 +81,14 @@ int main()
 		static_cast<unsigned int>(id.Data4[7]));
 	_snprintf_s(nativePath, sizeof(nativePath), _TRUNCATE,
 		"Software\\Classes\\CLSID\\GGCRegistryNativeView_%08lX_%04X_%04X_%02X%02X%02X%02X%02X%02X%02X%02X",
+		static_cast<unsigned long>(id.Data1), static_cast<unsigned int>(id.Data2),
+		static_cast<unsigned int>(id.Data3), static_cast<unsigned int>(id.Data4[0]),
+		static_cast<unsigned int>(id.Data4[1]), static_cast<unsigned int>(id.Data4[2]),
+		static_cast<unsigned int>(id.Data4[3]), static_cast<unsigned int>(id.Data4[4]),
+		static_cast<unsigned int>(id.Data4[5]), static_cast<unsigned int>(id.Data4[6]),
+		static_cast<unsigned int>(id.Data4[7]));
+	_snprintf_s(deletePath, sizeof(deletePath), _TRUNCATE,
+		"Software\\Classes\\CLSID\\GGCRegistryDeleteView_%08lX_%04X_%04X_%02X%02X%02X%02X%02X%02X%02X%02X",
 		static_cast<unsigned long>(id.Data1), static_cast<unsigned int>(id.Data2),
 		static_cast<unsigned int>(id.Data3), static_cast<unsigned int>(id.Data4[0]),
 		static_cast<unsigned int>(id.Data4[1]), static_cast<unsigned int>(id.Data4[2]),
@@ -195,6 +204,61 @@ int main()
 		key = nullptr;
 	}
 
+	disposition = 0;
+	CHECK(CreateRetailRegistryKey(HKEY_CURRENT_USER, deletePath, 0, nullptr,
+		fixtureOptions, KEY_WRITE, nullptr, &key, &disposition) == ERROR_SUCCESS);
+	const bool retailDeleteKeyCreated = key != nullptr && disposition == REG_CREATED_NEW_KEY;
+	CHECK(retailDeleteKeyCreated);
+	if (retailDeleteKeyCreated)
+	{
+		CHECK(SetStringValue(key, "Probe", "delete32"));
+		RegCloseKey(key);
+		key = nullptr;
+	}
+	else if (key != nullptr)
+	{
+		RegCloseKey(key);
+		key = nullptr;
+	}
+
+	disposition = 0;
+	CHECK(CreateNativeRegistryKey(HKEY_CURRENT_USER, deletePath, 0, nullptr,
+		fixtureOptions, KEY_WRITE, nullptr, &key, &disposition) == ERROR_SUCCESS);
+	const bool nativeDeleteKeyCreated = key != nullptr && disposition == REG_CREATED_NEW_KEY;
+	CHECK(nativeDeleteKeyCreated);
+	if (nativeDeleteKeyCreated)
+	{
+		CHECK(SetStringValue(key, "Probe", "keep64"));
+		RegCloseKey(key);
+		key = nullptr;
+	}
+	else if (key != nullptr)
+	{
+		RegCloseKey(key);
+		key = nullptr;
+	}
+
+	const bool retailDeleteSucceeded = retailDeleteKeyCreated &&
+		DeleteRetailRegistryKey(HKEY_CURRENT_USER, deletePath) == ERROR_SUCCESS;
+	CHECK(retailDeleteSucceeded);
+	const LONG deletedRetailVisible = OpenRetailRegistryKey(
+		HKEY_CURRENT_USER, deletePath, 0, KEY_READ, &key);
+	CHECK(deletedRetailVisible == ERROR_FILE_NOT_FOUND);
+	if (key != nullptr)
+	{
+		RegCloseKey(key);
+		key = nullptr;
+	}
+	CHECK(OpenNativeRegistryKey(HKEY_CURRENT_USER, deletePath, 0, KEY_READ, &key) == ERROR_SUCCESS);
+	if (key != nullptr)
+	{
+		char value[32] = {};
+		CHECK(QueryStringValue(key, "Probe", value, sizeof(value)));
+		CHECK(strcmp(value, "keep64") == 0);
+		RegCloseKey(key);
+		key = nullptr;
+	}
+
 	if (readKeyCreated)
 	{
 		CHECK(DeleteTestKey(readPath, KEY_WOW64_32KEY));
@@ -206,6 +270,14 @@ int main()
 	if (nativeKeyCreated)
 	{
 		CHECK(DeleteTestKey(nativePath, KEY_WOW64_64KEY));
+	}
+	if (retailDeleteKeyCreated && !retailDeleteSucceeded)
+	{
+		CHECK(DeleteTestKey(deletePath, KEY_WOW64_32KEY));
+	}
+	if (nativeDeleteKeyCreated)
+	{
+		CHECK(DeleteTestKey(deletePath, KEY_WOW64_64KEY));
 	}
 
 	return s_failures == 0 ? 0 : 1;

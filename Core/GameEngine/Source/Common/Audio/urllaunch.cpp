@@ -18,6 +18,7 @@
 
 
 #include "Common/urllaunch.h"
+#include "Common/RegistryView.h"
 
 #define FILE_PREFIX     L"file://"
 
@@ -139,7 +140,7 @@ HRESULT GetShellOpenCommand( LPTSTR ptszShellOpenCommand, DWORD cbShellOpenComma
         //
         TCHAR szFileType[ MAX_PATH ];
 
-        lResult = RegOpenKeyEx( HKEY_CLASSES_ROOT, _T( ".html" ), 0, KEY_READ, &hKey );
+        lResult = OpenNativeRegistryKey( HKEY_CLASSES_ROOT, _T( ".html" ), 0, KEY_READ, &hKey );
 
         if( ERROR_SUCCESS != lResult )
         {
@@ -162,7 +163,7 @@ HRESULT GetShellOpenCommand( LPTSTR ptszShellOpenCommand, DWORD cbShellOpenComma
 
         wsprintf( szKeyName, _T( "%s\\shell\\open\\command" ), szFileType );
 
-        lResult = RegOpenKeyEx( HKEY_CLASSES_ROOT, szKeyName, 0, KEY_READ, &hFileKey );
+        lResult = OpenNativeRegistryKey( HKEY_CLASSES_ROOT, szKeyName, 0, KEY_READ, &hFileKey );
 
         if( ERROR_SUCCESS != lResult )
         {
@@ -196,7 +197,7 @@ HRESULT GetShellOpenCommand( LPTSTR ptszShellOpenCommand, DWORD cbShellOpenComma
             //
             // Find the command for the shell's open verb associated with the http protocol
             //
-            lResult = RegOpenKeyEx( HKEY_CLASSES_ROOT, _T( "http\\shell\\open\\command" ), 0, KEY_READ, &hKey );
+            lResult = OpenNativeRegistryKey( HKEY_CLASSES_ROOT, _T( "http\\shell\\open\\command" ), 0, KEY_READ, &hKey );
 
             if( ERROR_SUCCESS != lResult )
             {

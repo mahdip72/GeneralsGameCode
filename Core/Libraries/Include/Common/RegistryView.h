@@ -52,6 +52,15 @@ inline LONG CreateRetailRegistryKey(HKEY root, const char *path, DWORD reserved,
 		GetRetailRegistryAccessMask(access), securityAttributes, handle, disposition);
 }
 
+inline LONG DeleteRetailRegistryKey(HKEY root, const char *path)
+{
+#if defined(_WIN64)
+	return RegDeleteKeyExA(root, path, KEY_WOW64_32KEY, 0);
+#else
+	return RegDeleteKeyA(root, path);
+#endif
+}
+
 inline LONG CreateNativeRegistryKey(HKEY root, const char *path, DWORD reserved,
 	char *keyClass, DWORD options, REGSAM access,
 	LPSECURITY_ATTRIBUTES securityAttributes, HKEY *handle, LPDWORD disposition)
