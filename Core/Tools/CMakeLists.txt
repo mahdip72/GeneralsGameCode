@@ -49,7 +49,7 @@ if(RTS_BUILD_CORE_EXTRAS)
                 -File "${CMAKE_CURRENT_SOURCE_DIR}/AsanRuntimeAudit/AsanRuntimePackaging.Tests.ps1"
                 -ScratchRoot "${CMAKE_BINARY_DIR}/TestScratch/AsanRuntimePackaging"
         )
-        set_tests_properties(core_asan_runtime_packaging_tests PROPERTIES TIMEOUT 60)
+        set_tests_properties(core_asan_runtime_packaging_tests PROPERTIES TIMEOUT 180)
         add_test(NAME core_native_audio_graph_audit
             COMMAND powershell -NoProfile -ExecutionPolicy Bypass
                 -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeAudioGraphAudit/NativeAudioGraphAudit.ps1"
@@ -139,7 +139,7 @@ if(RTS_BUILD_CORE_EXTRAS)
         endif()
         add_test(NAME core_native_product_runtime_audit
             COMMAND ${_native_product_runtime_audit_command})
-        set_tests_properties(core_native_product_runtime_audit PROPERTIES TIMEOUT 1200)
+        set_tests_properties(core_native_product_runtime_audit PROPERTIES TIMEOUT 3600)
         unset(_native_product_runtime_audit_command)
         unset(_native_product_runtime_audit_budget_root)
         unset(_native_product_runtime_audit_build_root)

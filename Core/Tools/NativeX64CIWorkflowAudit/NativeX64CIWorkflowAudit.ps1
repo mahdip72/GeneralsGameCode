@@ -154,43 +154,48 @@ function Test-NativeX64CIWorkflow {
     Assert-Contains $installStep 'cmake --install ' `
         'the native CI artifact is not produced through CMake install rules'
 
-    $runtimeRegressionStep = Get-StepBody -Workflow $BuildWorkflow `
-        -StepNamePrefix 'Run installed native runtime regression tests'
+    $runtimeContractStep = Get-StepBody -Workflow $BuildWorkflow `
+        -StepNamePrefix 'Run installed native contract tests'
     Assert-StepOrder -Workflow $BuildWorkflow `
         -EarlierStepNamePrefix 'Install native runtime' `
-        -LaterStepNamePrefix 'Run installed native runtime regression tests'
-    Assert-Contains $runtimeRegressionStep `
+        -LaterStepNamePrefix 'Run installed native contract tests'
+    Assert-Contains $runtimeContractStep `
         '(?m)^        if: \$\{\{ inputs\.extras && startsWith\(inputs\.preset, ''x64''\) \}\}\r?$' `
-        'the installed runtime regression gate is not enabled for both native title extras lanes'
-    Assert-Contains $runtimeRegressionStep `
+        'the installed contract gate is not enabled for both native title extras lanes'
+    Assert-Contains $runtimeContractStep `
         "\$titleDirectory = '\$\{\{ inputs\.game == 'Generals' && 'Generals' \|\| 'ZeroHour' \}\}'" `
-        'the runtime regression gate does not select both installed title directories'
-    Assert-Contains $runtimeRegressionStep `
+        'the contract gate does not select both installed title directories'
+    Assert-Contains $runtimeContractStep `
         "\$testName = '\$\{\{ inputs\.game == 'Generals' && 'g_skirmish_ai_runner_contract_tests\.exe' \|\| 'z_runtime_regression_tests\.exe' \}\}'" `
-        'the runtime regression gate does not select both installed utilities'
-    Assert-Contains $runtimeRegressionStep `
+        'the contract gate does not select both installed utilities'
+    Assert-Contains $runtimeContractStep `
         '(?ms)\$installedRuntime = \[IO\.Path\]::GetFullPath\(\s*\(Join-Path "build\\\$\{\{ inputs\.preset \}\}\\installed" \$titleDirectory\)\)' `
-        'the runtime regression gate does not resolve an absolute installed title runtime'
-    Assert-Contains $runtimeRegressionStep `
+        'the contract gate does not resolve an absolute installed title runtime'
+    Assert-Contains $runtimeContractStep `
         '\$test = Join-Path \$installedRuntime \$testName' `
-        'the runtime regression gate does not resolve the selected installed utility'
-    Assert-Contains $runtimeRegressionStep 'Test-Path -LiteralPath \$test -PathType Leaf' `
-        'the runtime regression gate does not reject a missing installed utility'
-    Assert-Contains $runtimeRegressionStep '\$testExitCode = 1' `
-        'the runtime regression gate has no safe default failure result'
-    Assert-Contains $runtimeRegressionStep 'Push-Location \$installedRuntime' `
-        'the runtime regression utility is not launched from its installed runtime directory'
-    Assert-Contains $runtimeRegressionStep '(?m)^\s*& \$test\r?$' `
-        'the installed runtime regression utility is not executed'
-    Assert-Contains $runtimeRegressionStep '\$testExitCode = \$LASTEXITCODE' `
-        'the installed runtime regression result is not captured'
-    Assert-Contains $runtimeRegressionStep '(?ms)finally\s*\{\s*Pop-Location\s*\}' `
-        'the installed runtime regression working directory is not restored'
-    Assert-Contains $runtimeRegressionStep 'exit \$testExitCode' `
-        'the installed runtime regression failure is not propagated'
-    Assert-Contains $runtimeRegressionStep `
-        '(?ms)Push-Location \$installedRuntime\s+try\s*\{\s*& \$test\s+\$testExitCode = \$LASTEXITCODE\s*\}\s*finally\s*\{\s*Pop-Location\s*\}\s*exit \$testExitCode' `
-        'the installed runtime regression launch, capture, cleanup, and exit sequence is not structurally ordered'
+        'the contract gate does not resolve the selected installed utility'
+    Assert-Contains $runtimeContractStep 'Test-Path -LiteralPath \$test -PathType Leaf' `
+        'the contract gate does not reject a missing installed utility'
+    Assert-Contains $runtimeContractStep '\$testExitCode = 1' `
+        'the contract gate has no safe default failure result'
+    Assert-Contains $runtimeContractStep 'Push-Location \$installedRuntime' `
+        'the contract utility is not launched from its installed runtime directory'
+    Assert-Contains $runtimeContractStep '(?m)^\s*& \$test\r?$' `
+        'the installed contract utility is not executed'
+    Assert-Contains $runtimeContractStep `
+        'if \(\$testExitCode -eq 0 -and ''\$\{\{ inputs\.game \}\}'' -eq ''GeneralsMD''\)' `
+        'the Zero Hour replay epoch contract is not limited to the Zero Hour lane'
+    Assert-Contains $runtimeContractStep '(?m)^\s*& \$test --skirmish-ai-replay-epoch\r?$' `
+        'the installed Zero Hour replay epoch contract is not executed'
+    Assert-Contains $runtimeContractStep '\$testExitCode = \$LASTEXITCODE' `
+        'the installed contract result is not captured'
+    Assert-Contains $runtimeContractStep '(?ms)finally\s*\{\s*Pop-Location\s*\}' `
+        'the installed contract working directory is not restored'
+    Assert-Contains $runtimeContractStep 'exit \$testExitCode' `
+        'the installed contract failure is not propagated'
+    Assert-Contains $runtimeContractStep `
+        '(?ms)Push-Location \$installedRuntime\s+try\s*\{\s*& \$test\s+\$testExitCode = \$LASTEXITCODE\s+if \(\$testExitCode -eq 0 -and ''\$\{\{ inputs\.game \}\}'' -eq ''GeneralsMD''\)\s*\{\s*& \$test --skirmish-ai-replay-epoch\s+\$testExitCode = \$LASTEXITCODE\s*\}\s*\}\s*finally\s*\{\s*Pop-Location\s*\}\s*exit \$testExitCode' `
+        'the installed contract launch, replay epoch check, cleanup, and exit sequence is not structurally ordered'
 
     $artifactStep = Get-StepBody -Workflow $BuildWorkflow -StepNamePrefix 'Collect '
     Assert-Contains $artifactStep "-like 'x64\*'" `
@@ -338,7 +343,7 @@ if: inputs.game == 'Generals' && inputs.preset == 'x64-vcpkg'
         if: startsWith(inputs.preset, 'x64')
         run: |
           cmake --install build
-      - name: Run installed native runtime regression tests
+      - name: Run installed native contract tests
         if: ${{ inputs.extras && startsWith(inputs.preset, 'x64') }}
         run: |
           $titleDirectory = '${{ inputs.game == 'Generals' && 'Generals' || 'ZeroHour' }}'
@@ -352,6 +357,10 @@ if: inputs.game == 'Generals' && inputs.preset == 'x64-vcpkg'
           try {
             & $test
             $testExitCode = $LASTEXITCODE
+            if ($testExitCode -eq 0 -and '${{ inputs.game }}' -eq 'GeneralsMD') {
+              & $test --skirmish-ai-replay-epoch
+              $testExitCode = $LASTEXITCODE
+            }
           }
           finally {
             Pop-Location
@@ -494,16 +503,28 @@ $arguments += "-DFFMPEG_RUNTIME_DIR=$FFmpegRuntimeDir"
         throw 'Native x64 CI workflow audit self-test failed to reject an unbound CTest predicate'
     }
 
-    $caughtMissingInstalledRegression = $false
+    $caughtMissingInstalledContract = $false
     try {
         Test-NativeX64CIWorkflow `
             -CIWorkflow $goodCI `
             -BuildWorkflow ($goodBuild -replace '(?m)^\s*& \$test\r?$', "          & 'build\\raw\\z_runtime_regression_tests.exe'")
     } catch {
-        $caughtMissingInstalledRegression = $true
+        $caughtMissingInstalledContract = $true
     }
-    if (-not $caughtMissingInstalledRegression) {
-        throw 'Native x64 CI workflow audit self-test failed to reject build-tree runtime regression execution'
+    if (-not $caughtMissingInstalledContract) {
+        throw 'Native x64 CI workflow audit self-test failed to reject build-tree contract execution'
+    }
+
+    $caughtMissingReplayEpochContract = $false
+    try {
+        Test-NativeX64CIWorkflow `
+            -CIWorkflow $goodCI `
+            -BuildWorkflow ($goodBuild -replace '(?m)^\s*& \$test --skirmish-ai-replay-epoch\r?\n', '')
+    } catch {
+        $caughtMissingReplayEpochContract = $true
+    }
+    if (-not $caughtMissingReplayEpochContract) {
+        throw 'Native x64 CI workflow audit self-test failed to reject a missing replay epoch contract execution'
     }
 
     $caughtRelativeInstalledRuntime = $false
@@ -521,13 +542,13 @@ $arguments += "-DFFMPEG_RUNTIME_DIR=$FFmpegRuntimeDir"
     $caughtWrongRuntimeStepOrder = $false
     try {
         $wrongRuntimeStepOrder = @'
-      - name: Run installed native runtime regression tests
+      - name: Run installed native contract tests
       - name: Install native runtime for game
 '@
         Assert-StepOrder `
             -Workflow $wrongRuntimeStepOrder `
             -EarlierStepNamePrefix 'Install native runtime' `
-            -LaterStepNamePrefix 'Run installed native runtime regression tests'
+            -LaterStepNamePrefix 'Run installed native contract tests'
     } catch {
         $caughtWrongRuntimeStepOrder = $true
     }

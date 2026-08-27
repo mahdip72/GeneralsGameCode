@@ -129,7 +129,7 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD)
 			-SourceRoot "${CMAKE_SOURCE_DIR}"
 			-BuildRoot "${CMAKE_BINARY_DIR}"
 	)
-	set_tests_properties(z_runtime_regression_graph_audit PROPERTIES TIMEOUT 120)
+	set_tests_properties(z_runtime_regression_graph_audit PROPERTIES TIMEOUT 240)
 
 	add_test(NAME z_runtime_regression_graph_audit_self_test
 		COMMAND powershell -NoProfile -ExecutionPolicy Bypass

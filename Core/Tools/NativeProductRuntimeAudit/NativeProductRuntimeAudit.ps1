@@ -276,8 +276,8 @@ function Assert-SameFile([string] $ExpectedPath, [string] $InstalledPath,
 }
 
 foreach ($product in @(
-    @{ Name = 'Generals'; Generals = 'ON'; ZeroHour = 'OFF'; TitleDirectory = 'Generals'; InstallDirectory = 'Generals'; Targets = @('g_generals', 'g_launcher', 'g_skirmish_ai_runner_contract_tests', 'core_native_d3d8_compatibility_test'); Executables = @("generalsv$OutputSuffix.exe", 'launcher.exe', 'g_skirmish_ai_runner_contract_tests.exe'); RegressionExecutable = 'g_skirmish_ai_runner_contract_tests.exe'; LauncherCommand = "generalsv$OutputSuffix.exe" },
-    @{ Name = 'ZeroHour'; Generals = 'OFF'; ZeroHour = 'ON'; TitleDirectory = 'GeneralsMD'; InstallDirectory = 'ZeroHour'; Targets = @('z_generals', 'z_launcher', 'z_runtime_regression_tests', 'core_native_d3d8_compatibility_test'); Executables = @("generalszh$OutputSuffix.exe", 'launcher.exe', 'z_runtime_regression_tests.exe'); RegressionExecutable = 'z_runtime_regression_tests.exe'; LauncherCommand = "generalszh$OutputSuffix.exe" }
+    @{ Name = 'Generals'; Generals = 'ON'; ZeroHour = 'OFF'; TitleDirectory = 'Generals'; InstallDirectory = 'Generals'; Targets = @('g_generals', 'g_launcher', 'g_skirmish_ai_runner_contract_tests', 'core_native_d3d8_compatibility_test'); Executables = @("generalsv$OutputSuffix.exe", 'launcher.exe', 'g_skirmish_ai_runner_contract_tests.exe'); ContractExecutable = 'g_skirmish_ai_runner_contract_tests.exe'; ContractArguments = @(); LauncherCommand = "generalsv$OutputSuffix.exe" },
+    @{ Name = 'ZeroHour'; Generals = 'OFF'; ZeroHour = 'ON'; TitleDirectory = 'GeneralsMD'; InstallDirectory = 'ZeroHour'; Targets = @('z_generals', 'z_launcher', 'z_runtime_regression_tests', 'core_native_d3d8_compatibility_test'); Executables = @("generalszh$OutputSuffix.exe", 'launcher.exe', 'z_runtime_regression_tests.exe'); ContractExecutable = 'z_runtime_regression_tests.exe'; ContractArguments = @('--skirmish-ai-replay-epoch'); LauncherCommand = "generalszh$OutputSuffix.exe" }
 )) {
     $productBuildRoot = Join-Path $BuildRoot $product.Name
     $installRoot = Join-Path $productBuildRoot 'InstallRoot'
@@ -598,17 +598,22 @@ foreach ($product in @(
         throw "Native x64 $($product.Name) installed compatibility runtime behavior probe failed."
     }
 
-    $installedRegression = Join-Path $installedTitleRoot $product.RegressionExecutable
+    $installedContract = Join-Path $installedTitleRoot $product.ContractExecutable
     Push-Location $installedTitleRoot
     try {
-        & $installedRegression
-        $regressionExitCode = $LASTEXITCODE
+        & $installedContract
+        $contractExitCode = $LASTEXITCODE
+        if ($contractExitCode -eq 0 -and $product.ContractArguments.Count -gt 0) {
+            $contractArguments = @($product.ContractArguments)
+            & $installedContract @contractArguments
+            $contractExitCode = $LASTEXITCODE
+        }
     }
     finally {
         Pop-Location
     }
-    if ($regressionExitCode -ne 0) {
-        throw "Native x64 $($product.Name) installed runtime regression utility failed."
+    if ($contractExitCode -ne 0) {
+        throw "Native x64 $($product.Name) installed contract utility failed."
     }
 
     $compatibilityLicenseRoot = Join-Path $installedTitleRoot 'licenses/native-d3d8-compat'

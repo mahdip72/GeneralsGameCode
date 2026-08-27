@@ -226,7 +226,7 @@ jobs:
             exit 1
           }
 
-      - name: Run installed native runtime regression tests
+      - name: Run installed native contract tests
         if: ${{ inputs.extras && startsWith(inputs.preset, 'x64') }}
         shell: pwsh
         run: |
@@ -236,7 +236,7 @@ jobs:
             (Join-Path "build\${{ inputs.preset }}\installed" $titleDirectory))
           $test = Join-Path $installedRuntime $testName
           if (-not (Test-Path -LiteralPath $test -PathType Leaf)) {
-            Write-Error "Installed native runtime regression utility was not produced at $test"
+            Write-Error "Installed native contract utility was not produced at $test"
             exit 1
           }
 
@@ -245,6 +245,10 @@ jobs:
           try {
             & $test
             $testExitCode = $LASTEXITCODE
+            if ($testExitCode -eq 0 -and '${{ inputs.game }}' -eq 'GeneralsMD') {
+              & $test --skirmish-ai-replay-epoch
+              $testExitCode = $LASTEXITCODE
+            }
           }
           finally {
             Pop-Location
