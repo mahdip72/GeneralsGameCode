@@ -76,8 +76,10 @@ find_package_handle_standard_args(FFMPEG
 
 if(FFMPEG_FOUND)
 	set(_FFMPEG_PREVIOUS_SDK_ROOT "${FFMPEG_SDK_ROOT}")
-	get_filename_component(_FFMPEG_FIRST_LIBRARY_DIR "${FFMPEG_AVCODEC_LIBRARY}" DIRECTORY)
-	get_filename_component(_FFMPEG_SDK_ROOT "${_FFMPEG_FIRST_LIBRARY_DIR}" DIRECTORY)
+	# The public include directory is common to release and debug libraries.
+	# Deriving the SDK root from a selected import library incorrectly produces
+	# <sdk>/debug for multi-configuration package layouts such as vcpkg.
+	get_filename_component(_FFMPEG_SDK_ROOT "${FFMPEG_INCLUDE_DIR}" DIRECTORY)
 	set(FFMPEG_SDK_ROOT "${_FFMPEG_SDK_ROOT}" CACHE PATH
 		"Resolved root of the FFmpeg development SDK" FORCE)
 
@@ -245,7 +247,6 @@ unset(_FFMPEG_COMPONENT_UPPER)
 unset(_FFMPEG_COMPONENTS)
 unset(_FFMPEG_LIBRARY)
 unset(_FFMPEG_LIBRARY_DIR)
-unset(_FFMPEG_FIRST_LIBRARY_DIR)
 unset(_FFMPEG_PREVIOUS_SDK_ROOT)
 unset(_FFMPEG_REQUIRED_VARIABLES)
 unset(_FFMPEG_ROOT_HINTS)

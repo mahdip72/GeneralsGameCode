@@ -46,6 +46,14 @@ FetchContent_Declare(
         COMMAND "${CMAKE_COMMAND}"
         "-DPATCH_GIT_EXECUTABLE=${GIT_EXECUTABLE}"
         "-DPATCH_SOURCE_DIR=<SOURCE_DIR>"
+        "-DPATCH_FILE=${CMAKE_SOURCE_DIR}/cmake/patches/d3d8to9-app-local-compiler.patch"
+        -DPATCH_SENTINEL_COUNT=1
+        "-DPATCH_SENTINEL_FILE_1=source/d3d8to9.cpp"
+        "-DPATCH_SENTINEL_TEXT_1=D3DCompilerModule = LoadAppLocalRuntime"
+        -P "${CMAKE_SOURCE_DIR}/cmake/ApplyGitPatch.cmake"
+        COMMAND "${CMAKE_COMMAND}"
+        "-DPATCH_GIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        "-DPATCH_SOURCE_DIR=<SOURCE_DIR>"
         "-DPATCH_FILE=${CMAKE_SOURCE_DIR}/cmake/patches/d3d8to9-relwithdebinfo-release-crt.patch"
         -DPATCH_SENTINEL_COUNT=1
         "-DPATCH_SENTINEL_FILE_1=CMakeLists.txt"

@@ -168,6 +168,37 @@ endif()
         '-DEXPECT_AUTO_RUNTIME=ON'
     ))
 
+    $splitLayoutRoot = Join-Path $script:RunRoot 'split-layout-sdk'
+    Copy-SdkTree -Source $resolvedFFmpegRoot -Destination $splitLayoutRoot
+    $splitLayoutLibraryRoot = Join-Path $splitLayoutRoot 'debug\lib'
+    New-Item -ItemType Directory -Path $splitLayoutLibraryRoot -Force | Out-Null
+    $splitLayoutArguments = @(
+        "-DREPO_ROOT=$resolvedSourceRoot",
+        "-DFFMPEG_ROOT=$splitLayoutRoot",
+        "-DFFMPEG_RUNTIME_DIR=$(Join-Path $splitLayoutRoot 'bin')",
+        "-DEXPECTED_SDK=$splitLayoutRoot",
+        "-DEXPECTED_RUNTIME=$(Join-Path $splitLayoutRoot 'bin')",
+        '-DEXPECT_AUTO_RUNTIME=OFF'
+    )
+    foreach ($component in @('avcodec', 'avformat', 'avutil', 'swresample', 'swscale')) {
+        $sourceLibrary = Get-ChildItem -LiteralPath (Join-Path $resolvedFFmpegRoot 'lib') `
+            -Filter "$component*.lib" -File | Where-Object {
+                $_.BaseName.Equals($component, [StringComparison]::OrdinalIgnoreCase)
+            } | Select-Object -First 1
+        if ($null -eq $sourceLibrary) {
+            throw "The FFmpeg SDK is missing the $component import library."
+        }
+        $splitLayoutLibrary = Join-Path $splitLayoutLibraryRoot $sourceLibrary.Name
+        try {
+            New-Item -ItemType HardLink -Path $splitLayoutLibrary `
+                -Target $sourceLibrary.FullName -ErrorAction Stop | Out-Null
+        } catch {
+            Copy-Item -LiteralPath $sourceLibrary.FullName -Destination $splitLayoutLibrary
+        }
+        $splitLayoutArguments += "-DFFMPEG_$($component.ToUpperInvariant())_LIBRARY:FILEPATH=$splitLayoutLibrary"
+    }
+    Invoke-FixtureConfigure -Name 'split-layout-sdk-root' -Arguments $splitLayoutArguments
+
     $environmentRoot = Join-Path $script:RunRoot 'a-environment-root'
     $explicitRoot = Join-Path $script:RunRoot 'z-explicit-root'
     $replacementExplicitRoot = Join-Path $script:RunRoot 'y-replacement-explicit-root'

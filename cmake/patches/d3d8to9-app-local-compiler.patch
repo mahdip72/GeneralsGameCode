@@ -1,0 +1,72 @@
+diff --git a/source/d3d8to9.cpp b/source/d3d8to9.cpp
+index 3d96f84..3379d98 100644
+--- a/source/d3d8to9.cpp
++++ b/source/d3d8to9.cpp
+@@ -9,6 +9,7 @@
+ PFN_D3DXAssembleShader D3DXAssembleShader = nullptr;
+ PFN_D3DXDisassembleShader D3DXDisassembleShader = nullptr;
+ PFN_D3DXLoadSurfaceFromSurface D3DXLoadSurfaceFromSurface = nullptr;
++static HMODULE D3DCompilerModule = nullptr;
+ static HMODULE D3DXModule = nullptr;
+ static unsigned int D3DXObjectCount = 0;
+ 
+@@ -32,14 +33,21 @@ void ReleaseAppLocalD3DX()
+ 	D3DXAssembleShader = nullptr;
+ 	D3DXDisassembleShader = nullptr;
+ 	D3DXLoadSurfaceFromSurface = nullptr;
+-	const HMODULE module = D3DXModule;
++	const HMODULE d3dxModule = D3DXModule;
++	const HMODULE compilerModule = D3DCompilerModule;
+ 	D3DXModule = nullptr;
+-	if (module != nullptr)
+-		FreeLibrary(module);
++	D3DCompilerModule = nullptr;
++	if (d3dxModule != nullptr)
++		FreeLibrary(d3dxModule);
++	if (compilerModule != nullptr)
++		FreeLibrary(compilerModule);
+ }
+ 
+-static HMODULE LoadAppLocalD3DX()
++static HMODULE LoadAppLocalRuntime(const wchar_t *runtimeName)
+ {
++	if (runtimeName == nullptr)
++		return nullptr;
++
+ 	HMODULE thisModule = nullptr;
+ 	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+ 		GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+@@ -54,13 +62,13 @@ static HMODULE LoadAppLocalD3DX()
+ 		return nullptr;
+ 
+ 	wchar_t *const fileName = wcsrchr(modulePath, L'\\');
+-	static const wchar_t runtimeName[] = L"d3dx9_43.dll";
++	const size_t runtimeNameLength = wcslen(runtimeName) + 1;
+ 	if (fileName == nullptr ||
+-		(fileName - modulePath) + sizeof(runtimeName) / sizeof(runtimeName[0]) >=
++		(fileName - modulePath) + runtimeNameLength >=
+ 			sizeof(modulePath) / sizeof(modulePath[0]))
+ 		return nullptr;
+ 
+-	memcpy(fileName + 1, runtimeName, sizeof(runtimeName));
++	memcpy(fileName + 1, runtimeName, runtimeNameLength * sizeof(wchar_t));
+ 	return LoadLibraryExW(modulePath, nullptr,
+ 		LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+ }
+@@ -214,8 +222,15 @@ extern "C" IDirect3D8 *WINAPI Direct3DCreate8(UINT SDKVersion)
+ 	// Load D3DX
+ 	if (!D3DXAssembleShader || !D3DXDisassembleShader || !D3DXLoadSurfaceFromSurface)
+ 	{
++		if (D3DCompilerModule == nullptr)
++			D3DCompilerModule = LoadAppLocalRuntime(L"d3dcompiler_43.dll");
++		if (D3DCompilerModule == nullptr)
++		{
++			d3d->Release();
++			return nullptr;
++		}
+ 		if (D3DXModule == nullptr)
+-			D3DXModule = LoadAppLocalD3DX();
++			D3DXModule = LoadAppLocalRuntime(L"d3dx9_43.dll");
+ 
+ 		if (D3DXModule != nullptr)
+ 		{

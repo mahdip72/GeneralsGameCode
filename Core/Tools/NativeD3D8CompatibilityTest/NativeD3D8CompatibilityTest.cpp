@@ -364,6 +364,8 @@ int wmain(int argc, wchar_t **argv)
 	if (FAILED(result) || pixel_shader < 0x40000001u ||
 		pixel_shader > 0x5fffffffu)
 		return Fail("Pixel shader did not return an opaque x64-safe handle", result);
+	if (!LoadedModuleMatches(GetModuleHandleW(L"d3dcompiler_43.dll"), argv[2]))
+		return Fail("Compatibility bridge did not resolve its exact app-local D3DCompiler runtime");
 	if (FAILED(device->SetPixelShader(pixel_shader)) ||
 		FAILED(device->DeletePixelShader(pixel_shader)) ||
 		device->SetPixelShader(pixel_shader) != D3DERR_INVALIDCALL)
