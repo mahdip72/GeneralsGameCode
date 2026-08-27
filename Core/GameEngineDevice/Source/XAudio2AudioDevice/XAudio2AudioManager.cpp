@@ -800,7 +800,7 @@ Bool XAudio2AudioManager::preparePhaseSource(PlayingAudio &playing,
 	std::unique_ptr<AudioPcmStream> stream;
 	UnsignedInt sampleRate = 0;
 	if (m_assetSource->openPcmStream(fileName, stream)) {
-		if (stream == nullptr || stream->durationMS() <= 0.0f
+		if (stream == nullptr || stream->durationMS() < 0.0f
 			|| stream->sampleRate() == 0) {
 			return FALSE;
 		}

@@ -312,9 +312,10 @@ namespace
 	class StreamingAudioAssetSource final : public AudioAssetSource
 	{
 	public:
-		explicit StreamingAudioAssetSource(UnsignedInt totalFrames, Real durationMS = 0.0f) :
+		explicit StreamingAudioAssetSource(UnsignedInt totalFrames, Real durationMS = 0.0f,
+			Bool unknownDuration = FALSE) :
 			m_totalFrames(totalFrames),
-			m_durationMS(durationMS > 0.0f ? durationMS : static_cast<Real>(
+			m_durationMS(unknownDuration ? 0.0f : durationMS > 0.0f ? durationMS : static_cast<Real>(
 				(static_cast<std::uint64_t>(totalFrames) * 1000U + 24000U) / 48000U))
 		{
 		}
@@ -743,6 +744,36 @@ int main()
 		"stopping streaming playback releases its stream-backed handle");
 	streamingManager.closeDevice();
 	deleteInstance(streamingInfo);
+
+	StreamingAudioAssetSource unknownDurationSource(1200U, 0.0f, TRUE);
+	std::unique_ptr<FakeEngine> unknownDurationOwnedEngine = std::make_unique<FakeEngine>();
+	FakeEngine *unknownDurationEngine = unknownDurationOwnedEngine.get();
+	XAudio2AudioService unknownDurationService(std::move(unknownDurationOwnedEngine));
+	XAudio2AudioManager unknownDurationManager(&unknownDurationService, &unknownDurationSource);
+	unknownDurationManager.openDevice();
+	AudioEventInfo *unknownDurationInfo = newInstance(AudioEventInfo);
+	*unknownDurationInfo = *fixtureInfo;
+	unknownDurationInfo->m_attackSounds.clear();
+	unknownDurationInfo->m_decaySounds.clear();
+	unknownDurationInfo->m_sounds.clear();
+	unknownDurationInfo->m_sounds.push_back(AsciiString("unknown-duration.wav"));
+	FixtureEvent unknownDurationEvent(AsciiString("fixture-unknown-duration"));
+	unknownDurationEvent.setAudioEventInfo(unknownDurationInfo);
+	const AudioHandle unknownDurationHandle = unknownDurationManager.addAudioEvent(
+		&unknownDurationEvent);
+	unknownDurationManager.update();
+	unknownDurationManager.update();
+	FakeVoice *unknownDurationVoice = unknownDurationEngine->lastVoice;
+	check(unknownDurationVoice != nullptr && unknownDurationVoice->submitCalls == 1
+		&& unknownDurationManager.isCurrentlyPlaying(unknownDurationHandle),
+		"metadata-free streams start and derive their duration from decoder EOF");
+	check(unknownDurationVoice != nullptr && unknownDurationVoice->completeOldestBuffer(),
+		"metadata-free stream fixture completes its decoded buffer");
+	unknownDurationManager.update();
+	check(!unknownDurationManager.isCurrentlyPlaying(unknownDurationHandle),
+		"metadata-free streams finish after the final queued buffer completes");
+	unknownDurationManager.closeDevice();
+	deleteInstance(unknownDurationInfo);
 
 	StreamingAudioAssetSource quantizedDurationSource(48025U);
 	std::unique_ptr<FakeEngine> quantizedOwnedEngine = std::make_unique<FakeEngine>();

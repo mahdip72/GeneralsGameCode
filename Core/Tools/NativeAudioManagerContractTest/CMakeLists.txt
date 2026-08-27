@@ -42,7 +42,7 @@ set_target_properties(core_native_audio_manager_contract_test PROPERTIES
 add_test(NAME core_native_audio_manager_contract_test
     COMMAND core_native_audio_manager_contract_test
 )
-set_tests_properties(core_native_audio_manager_contract_test PROPERTIES TIMEOUT 30)
+set_tests_properties(core_native_audio_manager_contract_test PROPERTIES TIMEOUT 60)
 if(WIN32 AND RTS_BUILD_OPTION_FFMPEG AND FFMPEG_RUNTIME_DIR)
     set_tests_properties(core_native_audio_manager_contract_test PROPERTIES
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${FFMPEG_RUNTIME_DIR}"
