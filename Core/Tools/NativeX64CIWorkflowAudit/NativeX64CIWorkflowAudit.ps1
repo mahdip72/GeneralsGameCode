@@ -53,6 +53,22 @@ function Get-StepBody {
     return $match.Groups['body'].Value
 }
 
+function Assert-StepOrder {
+    param(
+        [string]$Workflow,
+        [string]$EarlierStepNamePrefix,
+        [string]$LaterStepNamePrefix
+    )
+
+    $earlier = [Regex]::Match($Workflow,
+        "(?m)^      - name: $([Regex]::Escape($EarlierStepNamePrefix))[^\r\n]*\r?$")
+    $later = [Regex]::Match($Workflow,
+        "(?m)^      - name: $([Regex]::Escape($LaterStepNamePrefix))[^\r\n]*\r?$")
+    if (-not $earlier.Success -or -not $later.Success -or $earlier.Index -ge $later.Index) {
+        throw "Native x64 CI workflow audit failed: '$EarlierStepNamePrefix' must precede '$LaterStepNamePrefix'"
+    }
+}
+
 function Test-NativeX64CIWorkflow {
     param(
         [string]$CIWorkflow,
@@ -137,6 +153,38 @@ function Test-NativeX64CIWorkflow {
         'the installed-runtime step is not limited to native x64 builds'
     Assert-Contains $installStep 'cmake --install ' `
         'the native CI artifact is not produced through CMake install rules'
+
+    $runtimeRegressionStep = Get-StepBody -Workflow $BuildWorkflow `
+        -StepNamePrefix 'Run installed native runtime regression tests'
+    Assert-StepOrder -Workflow $BuildWorkflow `
+        -EarlierStepNamePrefix 'Install native runtime' `
+        -LaterStepNamePrefix 'Run installed native runtime regression tests'
+    Assert-Contains $runtimeRegressionStep `
+        '(?m)^        if: \$\{\{ inputs\.game == ''GeneralsMD'' && inputs\.extras && startsWith\(inputs\.preset, ''x64''\) \}\}\r?$' `
+        'the installed runtime regression gate is not limited to the native Zero Hour extras lane'
+    Assert-Contains $runtimeRegressionStep `
+        '(?ms)\$installedRuntime = \[IO\.Path\]::GetFullPath\(\s*\(Join-Path "build\\\$\{\{ inputs\.preset \}\}\\installed" ''ZeroHour''\)\)' `
+        'the runtime regression gate does not resolve an absolute installed Zero Hour runtime'
+    Assert-Contains $runtimeRegressionStep `
+        '\$test = Join-Path \$installedRuntime ''z_runtime_regression_tests\.exe''' `
+        'the runtime regression gate does not resolve the installed utility'
+    Assert-Contains $runtimeRegressionStep 'Test-Path -LiteralPath \$test -PathType Leaf' `
+        'the runtime regression gate does not reject a missing installed utility'
+    Assert-Contains $runtimeRegressionStep '\$testExitCode = 1' `
+        'the runtime regression gate has no safe default failure result'
+    Assert-Contains $runtimeRegressionStep 'Push-Location \$installedRuntime' `
+        'the runtime regression utility is not launched from its installed runtime directory'
+    Assert-Contains $runtimeRegressionStep '(?m)^\s*& \$test\r?$' `
+        'the installed runtime regression utility is not executed'
+    Assert-Contains $runtimeRegressionStep '\$testExitCode = \$LASTEXITCODE' `
+        'the installed runtime regression result is not captured'
+    Assert-Contains $runtimeRegressionStep '(?ms)finally\s*\{\s*Pop-Location\s*\}' `
+        'the installed runtime regression working directory is not restored'
+    Assert-Contains $runtimeRegressionStep 'exit \$testExitCode' `
+        'the installed runtime regression failure is not propagated'
+    Assert-Contains $runtimeRegressionStep `
+        '(?ms)Push-Location \$installedRuntime\s+try\s*\{\s*& \$test\s+\$testExitCode = \$LASTEXITCODE\s*\}\s*finally\s*\{\s*Pop-Location\s*\}\s*exit \$testExitCode' `
+        'the installed runtime regression launch, capture, cleanup, and exit sequence is not structurally ordered'
 
     $artifactStep = Get-StepBody -Workflow $BuildWorkflow -StepNamePrefix 'Collect '
     Assert-Contains $artifactStep "-like 'x64\*'" `
@@ -284,6 +332,23 @@ if: inputs.game == 'Generals' && inputs.preset == 'x64-vcpkg'
         if: startsWith(inputs.preset, 'x64')
         run: |
           cmake --install build
+      - name: Run installed native runtime regression tests
+        if: ${{ inputs.game == 'GeneralsMD' && inputs.extras && startsWith(inputs.preset, 'x64') }}
+        run: |
+          $installedRuntime = [IO.Path]::GetFullPath(
+            (Join-Path "build\${{ inputs.preset }}\installed" 'ZeroHour'))
+          $test = Join-Path $installedRuntime 'z_runtime_regression_tests.exe'
+          if (-not (Test-Path -LiteralPath $test -PathType Leaf)) { exit 1 }
+          $testExitCode = 1
+          Push-Location $installedRuntime
+          try {
+            & $test
+            $testExitCode = $LASTEXITCODE
+          }
+          finally {
+            Pop-Location
+          }
+          exit $testExitCode
       - name: Collect game Artifact
         run: |
           if ('preset' -like 'x64*') {
@@ -419,6 +484,59 @@ $arguments += "-DFFMPEG_RUNTIME_DIR=$FFmpegRuntimeDir"
     }
     if (-not $caughtSkippedCTest) {
         throw 'Native x64 CI workflow audit self-test failed to reject an unbound CTest predicate'
+    }
+
+    $caughtMissingInstalledRegression = $false
+    try {
+        Test-NativeX64CIWorkflow `
+            -CIWorkflow $goodCI `
+            -BuildWorkflow ($goodBuild -replace '(?m)^\s*& \$test\r?$', "          & 'build\\raw\\z_runtime_regression_tests.exe'")
+    } catch {
+        $caughtMissingInstalledRegression = $true
+    }
+    if (-not $caughtMissingInstalledRegression) {
+        throw 'Native x64 CI workflow audit self-test failed to reject build-tree runtime regression execution'
+    }
+
+    $caughtRelativeInstalledRuntime = $false
+    try {
+        Test-NativeX64CIWorkflow `
+            -CIWorkflow $goodCI `
+            -BuildWorkflow ($goodBuild -replace '\[IO\.Path\]::GetFullPath\(\s*\(Join-Path "build\\\$\{\{ inputs\.preset \}\}\\installed" ''ZeroHour''\)\)', 'Join-Path "build\${{ inputs.preset }}\installed" ''ZeroHour''')
+    } catch {
+        $caughtRelativeInstalledRuntime = $true
+    }
+    if (-not $caughtRelativeInstalledRuntime) {
+        throw 'Native x64 CI workflow audit self-test failed to reject a relative installed runtime path'
+    }
+
+    $caughtWrongRuntimeStepOrder = $false
+    try {
+        $wrongRuntimeStepOrder = @'
+      - name: Run installed native runtime regression tests
+      - name: Install native runtime for game
+'@
+        Assert-StepOrder `
+            -Workflow $wrongRuntimeStepOrder `
+            -EarlierStepNamePrefix 'Install native runtime' `
+            -LaterStepNamePrefix 'Run installed native runtime regression tests'
+    } catch {
+        $caughtWrongRuntimeStepOrder = $true
+    }
+    if (-not $caughtWrongRuntimeStepOrder) {
+        throw 'Native x64 CI workflow audit self-test failed to reject runtime execution before installation'
+    }
+
+    $caughtWrongRuntimeCommandOrder = $false
+    try {
+        Test-NativeX64CIWorkflow `
+            -CIWorkflow $goodCI `
+            -BuildWorkflow ($goodBuild -replace '(?ms)          Push-Location \$installedRuntime\s+          try \{\s+            & \$test', "          & `$test`r`n          Push-Location `$installedRuntime`r`n          try {")
+    } catch {
+        $caughtWrongRuntimeCommandOrder = $true
+    }
+    if (-not $caughtWrongRuntimeCommandOrder) {
+        throw 'Native x64 CI workflow audit self-test failed to reject runtime execution before changing directory'
     }
 
     $caughtRawBuildArtifact = $false

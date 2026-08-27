@@ -226,6 +226,29 @@ jobs:
             exit 1
           }
 
+      - name: Run installed native runtime regression tests
+        if: ${{ inputs.game == 'GeneralsMD' && inputs.extras && startsWith(inputs.preset, 'x64') }}
+        shell: pwsh
+        run: |
+          $installedRuntime = [IO.Path]::GetFullPath(
+            (Join-Path "build\${{ inputs.preset }}\installed" 'ZeroHour'))
+          $test = Join-Path $installedRuntime 'z_runtime_regression_tests.exe'
+          if (-not (Test-Path -LiteralPath $test -PathType Leaf)) {
+            Write-Error "Installed native runtime regression utility was not produced at $test"
+            exit 1
+          }
+
+          $testExitCode = 1
+          Push-Location $installedRuntime
+          try {
+            & $test
+            $testExitCode = $LASTEXITCODE
+          }
+          finally {
+            Pop-Location
+          }
+          exit $testExitCode
+
       - name: Save vcpkg binary cache
         # Only one job should save to avoid "Unable to reserve cache" conflicts.
         if: ${{ contains(inputs.preset, 'vcpkg') && steps.vcpkg_cache.outputs.cache-hit != 'true' && inputs.game == 'Generals' && inputs.preset == 'x64-vcpkg' }}
