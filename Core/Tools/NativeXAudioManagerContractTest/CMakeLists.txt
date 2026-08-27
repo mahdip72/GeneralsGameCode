@@ -27,6 +27,10 @@ target_link_libraries(core_native_xaudio_manager_contract_test PRIVATE
 	rts_native_audio_manager
 	rts_xaudio2_audio_service
 	rts_native_audio_asset_source
+	core_wwlib
+	core_wwdebug
+	core_wwstub
+	winmm
 )
 
 set_target_properties(core_native_xaudio_manager_contract_test PROPERTIES
