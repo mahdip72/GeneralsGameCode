@@ -98,6 +98,27 @@ public:
 	};
 };
 
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
+namespace PersistFactoryDetail
+{
+
+inline bool Open_Expected_Chunk(ChunkLoadClass &cload, uint32 expected_chunk_id)
+{
+	if (!cload.Open_Chunk())
+	{
+		return false;
+	}
+	if (cload.Cur_Chunk_ID() == expected_chunk_id)
+	{
+		return true;
+	}
+	cload.Close_Chunk();
+	return false;
+}
+
+} // namespace PersistFactoryDetail
+#endif
+
 
 template<class T, int CHUNKID> PersistClass *
 SimplePersistFactoryClass<T,CHUNKID>::Load(ChunkLoadClass & cload) const
@@ -111,8 +132,8 @@ SimplePersistFactoryClass<T,CHUNKID>::Load(ChunkLoadClass & cload) const
 	cload.Read(&old_obj,sizeof(T *));
 	cload.Close_Chunk();
 #else
-	if (!cload.Open_Chunk() ||
-		cload.Cur_Chunk_ID() != SIMPLEFACTORY_CHUNKID_OBJPOINTER)
+	if (!PersistFactoryDetail::Open_Expected_Chunk(
+		cload, SIMPLEFACTORY_CHUNKID_OBJPOINTER))
 	{
 		WWASSERT(0);
 		delete new_obj;
@@ -138,7 +159,8 @@ SimplePersistFactoryClass<T,CHUNKID>::Load(ChunkLoadClass & cload) const
 	cload.Open_Chunk();
 	WWASSERT(cload.Cur_Chunk_ID() == SIMPLEFACTORY_CHUNKID_OBJDATA);
 #else
-	if (!cload.Open_Chunk() || cload.Cur_Chunk_ID() != SIMPLEFACTORY_CHUNKID_OBJDATA)
+	if (!PersistFactoryDetail::Open_Expected_Chunk(
+		cload, SIMPLEFACTORY_CHUNKID_OBJDATA))
 	{
 		WWASSERT(0);
 		delete new_obj;
