@@ -30,6 +30,7 @@
 #include "Common/CRCDebug.h"
 #include "Common/LocalFileSystem.h"
 #include "Common/Recorder.h"
+#include "Common/SkirmishAITestRunner.h"
 #include "Common/version.h"
 #include "GameClient/ClientInstance.h"
 #include "GameClient/TerrainVisual.h" // for TERRAIN_LOD_MIN definition
@@ -425,6 +426,32 @@ Int parseHeadless(char *args[], int num)
 	DX8Wrapper_IsWindowed = false;
 
 	return 1;
+}
+
+Int parseRunSkirmishAITest(char *args[], int num)
+{
+	if (IsSkirmishAITestRunnerArmed())
+	{
+		printf("SKIRMISH_AI_TEST_FAIL seed=0 reason=duplicate_option\n");
+		fflush(stdout);
+		exit(2);
+	}
+
+	Int seed = 0;
+	if (num < 2 || !TryParseSkirmishAITestSeed(args[1], &seed))
+	{
+		printf("SKIRMISH_AI_TEST_FAIL seed=0 reason=invalid_seed\n");
+		fflush(stdout);
+		exit(2);
+	}
+
+	ArmSkirmishAITestRunner(seed);
+	parseHeadless(args, num);
+	TheWritableGlobalData->m_shellMapOn = FALSE;
+	TheWritableGlobalData->m_useFpsLimit = FALSE;
+	rts::ClientInstance::setMultiInstance(TRUE);
+	rts::ClientInstance::skipPrimaryInstance();
+	return 2;
 }
 
 Int parseReplay(char *args[], int num)
@@ -1167,6 +1194,7 @@ static CommandLineParam paramsForStartup[] =
 	// TheSuperHackers @feature helmutbuhler 11/04/2025
 	// This runs the game without a window, graphics, input and audio. You can combine this with -replay
 	{ "-headless", parseHeadless },
+	{ "-runSkirmishAITest", parseRunSkirmishAITest },
 
 	// TheSuperHackers @feature helmutbuhler 13/04/2025
 	// Play back a replay. Pass the filename including .rep afterwards.

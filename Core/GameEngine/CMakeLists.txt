@@ -21,6 +21,7 @@ set(GAMEENGINE_SRC
 #    Include/Common/BuildAssistant.h
 #    Include/Common/ClientUpdateModule.h
     Include/Common/CommandLine.h
+    Include/Common/SkirmishAITestRunner.h
     Include/Common/crc.h
     Include/Common/CRCDebug.h
 #    Include/Common/CriticalSection.h
@@ -572,6 +573,7 @@ set(GAMEENGINE_SRC
     Source/Common/Bezier/BezierSegment.cpp
 #    Source/Common/BitFlags.cpp
     Source/Common/CommandLine.cpp
+    Source/Common/SkirmishAITestRunner.cpp
     Source/Common/crc.cpp
     Source/Common/CRCDebug.cpp
     Source/Common/DamageFX.cpp

@@ -65,6 +65,7 @@
 #include "Common/DamageFX.h"
 #include "Common/MultiplayerSettings.h"
 #include "Common/Recorder.h"
+#include "Common/SkirmishAITestRunner.h"
 #include "Common/SpecialPower.h"
 #include "Common/TerrainTypes.h"
 #include "Common/Upgrade.h"
@@ -1017,6 +1018,7 @@ void GameEngine::execute()
 				{
 					// compute a frame
 					update();
+					UpdateSkirmishAITestRunner();
 				}
 				catch (INIException e)
 				{

@@ -24,3 +24,6 @@ target_link_libraries(z_runtime_regression_tests PRIVATE
 
 add_test(NAME z_skirmish_ai_replay_epoch_tests COMMAND z_runtime_regression_tests --skirmish-ai-replay-epoch)
 set_tests_properties(z_skirmish_ai_replay_epoch_tests PROPERTIES TIMEOUT 30)
+
+add_test(NAME z_skirmish_ai_runner_contract_tests COMMAND z_runtime_regression_tests --skirmish-ai-runner-contract)
+set_tests_properties(z_skirmish_ai_runner_contract_tests PROPERTIES TIMEOUT 30)
