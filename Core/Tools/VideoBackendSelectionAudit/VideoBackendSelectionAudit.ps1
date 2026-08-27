@@ -127,6 +127,64 @@ function Assert-LegacyVideoAccessorCount {
     }
 }
 
+function Get-CppIntroBody {
+    param([string]$Content)
+
+    $code = Remove-CppCommentsAndLiterals $Content
+    $matches = [regex]::Matches($code,
+        '\bif\s*\(\s*m_intro\s*!=\s*nullptr\s*\)\s*\{')
+    $candidates = @()
+    foreach ($match in $matches) {
+        $openBrace = $match.Index + $match.Value.LastIndexOf('{')
+        $depth = 0
+        for ($index = $openBrace; $index -lt $code.Length; ++$index) {
+            if ($code[$index] -eq '{') {
+                ++$depth
+            } elseif ($code[$index] -eq '}') {
+                --$depth
+                if ($depth -eq 0) {
+                    $body = $code.Substring($openBrace + 1, $index - $openBrace - 1)
+                    if ($body -match '\bTheDisplay\s*->\s*UPDATE\s*\(' -and
+                        $body -match '\bTheDisplay\s*->\s*DRAW\s*\(' -and
+                        $body -match '\breturn\s*;') {
+                        $candidates += $body
+                    }
+                    break
+                }
+            }
+        }
+    }
+    if ($candidates.Count -ne 1) {
+        throw 'Game client does not contain exactly one checked intro update block.'
+    }
+    return $candidates[0]
+}
+
+function Assert-IntroVideoService {
+    param(
+        [string]$Content,
+        [string]$FailureMessage
+    )
+
+    $body = Get-CppIntroBody $Content
+    $videoCalls = [regex]::Matches($body,
+        '\bTheVideoPlayer\s*->\s*UPDATE\s*\(\s*\)\s*;')
+    $displayUpdate = [regex]::Match($body,
+        '\bTheDisplay\s*->\s*UPDATE\s*\(\s*\)\s*;')
+    $displayDraw = [regex]::Match($body,
+        '\bTheDisplay\s*->\s*DRAW\s*\(\s*\)\s*;')
+    $return = [regex]::Match($body, '\breturn\s*;')
+    if ($videoCalls.Count -ne 1 -or
+        -not $displayUpdate.Success -or
+        -not $displayDraw.Success -or
+        -not $return.Success -or
+        $videoCalls[0].Index -gt $displayUpdate.Index -or
+        $displayUpdate.Index -gt $displayDraw.Index -or
+        $displayDraw.Index -gt $return.Index) {
+        throw $FailureMessage
+    }
+}
+
 if ($SelfTest) {
     $valid = "    if(`${CMAKE_SIZEOF_VOID_P} EQUAL 4 AND NOT RTS_BUILD_OPTION_FFMPEG)`n        include(cmake/bink.cmake)`n    endif()"
     Assert-ExactConditionalBlock $valid '    if(${CMAKE_SIZEOF_VOID_P} EQUAL 4 AND NOT RTS_BUILD_OPTION_FFMPEG)' '        include(cmake/bink.cmake)' '    endif()' 'Valid conditional block was rejected.'
@@ -245,6 +303,34 @@ void BinkVideoPlayer::deinit()
         if ($_.Exception.Message -ne 'Bink player does not use exactly the checked legacy video audio capabilities.') { throw }
     }
 
+    $validIntroUpdate = @'
+if (m_intro != nullptr)
+{
+    TheVideoPlayer->UPDATE();
+    TheDisplay->UPDATE();
+    TheDisplay->DRAW();
+    return;
+}
+'@
+    Assert-IntroVideoService $validIntroUpdate 'Valid intro video service ordering was rejected.'
+
+    foreach ($invalidIntroUpdate in @(
+        $validIntroUpdate.Replace('    TheVideoPlayer->UPDATE();' + "`n", ''),
+        $validIntroUpdate.Replace(
+            '    TheVideoPlayer->UPDATE();' + "`n" + '    TheDisplay->UPDATE();',
+            '    TheDisplay->UPDATE();' + "`n" + '    TheVideoPlayer->UPDATE();'),
+        $validIntroUpdate.Replace(
+            '    TheVideoPlayer->UPDATE();',
+            '    TheVideoPlayer->UPDATE();' + "`n" + '    TheVideoPlayer->UPDATE();')
+    )) {
+        try {
+            Assert-IntroVideoService $invalidIntroUpdate 'Malformed intro video service ordering was accepted.'
+            throw 'Negative intro-service self-test accepted a malformed update block.'
+        } catch {
+            if ($_.Exception.Message -ne 'Malformed intro video service ordering was accepted.') { throw }
+        }
+    }
+
     Write-Output 'Video backend selection audit negative self-test passed.'
     exit 0
 }
@@ -360,6 +446,15 @@ Assert-LegacyVideoAccessorCount $binkPlayer 3
 $ffmpegPlayer = Get-Content -LiteralPath (Join-Path $SourceRoot 'Core/GameEngineDevice/Source/VideoDevice/FFmpeg/FFmpegVideoPlayer.cpp') -Raw
 if ($ffmpegPlayer -match 'RTS_HAS_OPENAL|RTS_USE_OPENAL|OpenALAudioStream|getHandleForVideo|releaseHandleForVideo') {
     throw 'FFmpeg player retains an unowned legacy or OpenAL audio path.'
+}
+
+foreach ($relativePath in @(
+    'Generals/Code/GameEngine/Source/GameClient/GameClient.cpp',
+    'GeneralsMD/Code/GameEngine/Source/GameClient/GameClient.cpp'
+)) {
+    $gameClient = Get-Content -LiteralPath (Join-Path $SourceRoot $relativePath) -Raw
+    Assert-IntroVideoService $gameClient `
+        "Intro movie audio is not serviced before display update in $relativePath"
 }
 
 Write-Output 'Video backend selection audit passed.'

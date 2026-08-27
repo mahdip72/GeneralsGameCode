@@ -583,6 +583,9 @@ void GameClient::update()
 
 	if (m_intro != nullptr)
 	{
+		// The intro returns before the normal video-player update below. Service
+		// native movie audio here so draining can advance the final video frames.
+		TheVideoPlayer->UPDATE();
 		// redraw all views, update the GUI
 		TheDisplay->UPDATE();
 		TheDisplay->DRAW();
