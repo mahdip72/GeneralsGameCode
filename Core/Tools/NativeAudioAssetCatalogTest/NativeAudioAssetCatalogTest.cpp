@@ -50,10 +50,9 @@ private:
 	mutable UnsignedInt m_readCalls = 0;
 };
 
-void writeWaveFile(const std::filesystem::path &path, UnsignedInt durationMS,
+void writeWaveFrames(const std::filesystem::path &path, UnsignedInt frames,
 	UnsignedInt sampleRate = 48000, UnsignedShort channels = 2)
 {
-	const UnsignedInt frames = durationMS * sampleRate / 1000U;
 	const UnsignedInt bytesPerFrame = static_cast<UnsignedInt>(channels) * sizeof(Short);
 	const UnsignedInt dataBytes = frames * bytesPerFrame;
 	std::ofstream output(path, std::ios::binary | std::ios::trunc);
@@ -86,6 +85,12 @@ void writeWaveFile(const std::filesystem::path &path, UnsignedInt durationMS,
 		}
 	}
 	check(output.good(), "real fixture is fully written");
+}
+
+void writeWaveFile(const std::filesystem::path &path, UnsignedInt durationMS,
+	UnsignedInt sampleRate = 48000, UnsignedShort channels = 2)
+{
+	writeWaveFrames(path, durationMS * sampleRate / 1000U, sampleRate, channels);
 }
 
 std::vector<std::uint8_t> readBinaryFile(const std::filesystem::path &path)
@@ -372,6 +377,25 @@ int runCatalogTest(int argc, char *argv[])
 	check(genericChunk.sampleRate == 48000U && genericChunk.channels == 2U
 		&& genericChunk.frameCount == 3U && genericChunk.data.size() == 3U * 2U * sizeof(Short),
 		"FFmpeg generic PCM remains bounded 48 kHz stereo s16");
+
+	constexpr UnsignedInt exactSourceFrames = 220523U;
+	constexpr UnsignedInt exactSourceRate = 44100U;
+	const std::filesystem::path exactDurationPath = root / "exact_duration.wav";
+	writeWaveFrames(exactDurationPath, exactSourceFrames, exactSourceRate);
+	std::unique_ptr<AudioPcmStream> exactDurationStream;
+	check(realSource.openPcmStream(AsciiString(exactDurationPath.string().c_str()),
+		exactDurationStream) && exactDurationStream != nullptr,
+		"filesystem source opens a non-millisecond persistent stream");
+	const std::uint64_t estimatedExactFrames =
+		(static_cast<std::uint64_t>(exactSourceFrames) * 48000U + exactSourceRate / 2U)
+		/ exactSourceRate;
+	check(exactDurationStream->durationMS() > 5000.0f
+		&& exactDurationStream->durationMS() < 5001.0f,
+		"persistent stream preserves sub-millisecond duration metadata");
+	const std::uint64_t drainedExactFrames = consumePcmStream(*exactDurationStream);
+	check(drainedExactFrames >= estimatedExactFrames
+		&& drainedExactFrames <= estimatedExactFrames + 1U,
+		"non-millisecond persistent stream drains through decoder EOF");
 
 	const std::filesystem::path longPath = root / "long.wav";
 	const std::filesystem::path longAdpcmPath = root / "long_adpcm.wav";

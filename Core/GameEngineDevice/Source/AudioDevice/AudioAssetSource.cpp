@@ -674,6 +674,10 @@ public:
 
 	UnsignedInt sampleRate() const override { return OUTPUT_SAMPLE_RATE; }
 	Real durationMS() const override { return m_durationMS; }
+	Bool isEnded() const override
+	{
+		return m_eof && m_sink.pendingFrames() == 0U ? TRUE : FALSE;
+	}
 
 	Bool readPcm(AudioPcmChunk &chunk, UnsignedInt maxFrames) override
 	{
@@ -729,13 +733,15 @@ private:
 		if (m_packet == nullptr || m_frame == nullptr) {
 			return false;
 		}
+		std::int64_t durationMicroseconds = 0;
 		if (stream->duration != AV_NOPTS_VALUE && stream->time_base.den != 0) {
-			const std::int64_t duration = av_rescale_q(stream->duration,
-				stream->time_base, AVRational { 1, 1000 });
-			m_durationMS = duration >= 0 ? static_cast<Real>(duration) : 0.0f;
+			durationMicroseconds = av_rescale_q(stream->duration,
+				stream->time_base, AV_TIME_BASE_Q);
 		} else if (m_format->duration != AV_NOPTS_VALUE) {
-			m_durationMS = m_format->duration >= 0
-				? static_cast<Real>(m_format->duration) / 1000.0f : 0.0f;
+			durationMicroseconds = m_format->duration;
+		}
+		if (durationMicroseconds > 0) {
+			m_durationMS = static_cast<Real>(durationMicroseconds) / 1000.0f;
 		}
 		m_decoder.reset(1, m_sink);
 		m_opened = true;

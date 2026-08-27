@@ -24,6 +24,8 @@ public:
 	virtual UnsignedInt sampleRate() const = 0;
 	virtual Real durationMS() const = 0;
 	virtual Bool readPcm(AudioPcmChunk &chunk, UnsignedInt maxFrames) = 0;
+	// TRUE only after clean decoder EOF and all buffered PCM has been consumed.
+	virtual Bool isEnded() const = 0;
 };
 
 // Neutral source/decoder seam used by both device-free scripts and native audio.

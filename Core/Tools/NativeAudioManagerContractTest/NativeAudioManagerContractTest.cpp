@@ -268,17 +268,18 @@ namespace
 	{
 	public:
 		CountingPcmStream(UnsignedInt totalFrames, std::vector<UnsignedInt> &readStarts,
-			std::vector<UnsignedInt> &readBounds) :
+			std::vector<UnsignedInt> &readBounds, Real durationMS) :
 			m_totalFrames(totalFrames),
 			m_readStarts(readStarts),
-			m_readBounds(readBounds)
+			m_readBounds(readBounds),
+			m_durationMS(durationMS)
 		{
 		}
 
 		UnsignedInt sampleRate() const override { return 48000U; }
 		Real durationMS() const override
 		{
-			return static_cast<Real>(m_totalFrames) * 1000.0f / 48000.0f;
+			return m_durationMS;
 		}
 		Bool readPcm(AudioPcmChunk &chunk, UnsignedInt maxFrames) override
 		{
@@ -298,23 +299,30 @@ namespace
 			m_nextFrame += frameCount;
 			return TRUE;
 		}
+		Bool isEnded() const override { return m_nextFrame >= m_totalFrames ? TRUE : FALSE; }
 
 	private:
 		UnsignedInt m_totalFrames;
 		UnsignedInt m_nextFrame = 0;
 		std::vector<UnsignedInt> &m_readStarts;
 		std::vector<UnsignedInt> &m_readBounds;
+		Real m_durationMS;
 	};
 
 	class StreamingAudioAssetSource final : public AudioAssetSource
 	{
 	public:
-		explicit StreamingAudioAssetSource(UnsignedInt totalFrames) : m_totalFrames(totalFrames) {}
+		explicit StreamingAudioAssetSource(UnsignedInt totalFrames, Real durationMS = 0.0f) :
+			m_totalFrames(totalFrames),
+			m_durationMS(durationMS > 0.0f ? durationMS : static_cast<Real>(
+				(static_cast<std::uint64_t>(totalFrames) * 1000U + 24000U) / 48000U))
+		{
+		}
 
 		Bool getDurationMS(const AsciiString &, Real &durationMS) const override
 		{
 			++getDurationCalls;
-			durationMS = static_cast<Real>(m_totalFrames) * 1000.0f / 48000.0f;
+			durationMS = m_durationMS;
 			return TRUE;
 		}
 		Bool decodePcm(const AsciiString &, AudioPcmChunk &chunk, UnsignedInt) const override
@@ -333,7 +341,8 @@ namespace
 		Bool openPcmStream(const AsciiString &, std::unique_ptr<AudioPcmStream> &stream) const override
 		{
 			++openStreamCalls;
-			stream = std::make_unique<CountingPcmStream>(m_totalFrames, readStarts, readBounds);
+			stream = std::make_unique<CountingPcmStream>(
+				m_totalFrames, readStarts, readBounds, m_durationMS);
 			return TRUE;
 		}
 		const void *getFileIdentity(const AsciiString &) const override
@@ -350,6 +359,7 @@ namespace
 
 	private:
 		UnsignedInt m_totalFrames;
+		Real m_durationMS;
 	};
 
 	class LegacyAudioAssetSource final : public AudioAssetSource
@@ -733,6 +743,62 @@ int main()
 		"stopping streaming playback releases its stream-backed handle");
 	streamingManager.closeDevice();
 	deleteInstance(streamingInfo);
+
+	StreamingAudioAssetSource quantizedDurationSource(48025U);
+	std::unique_ptr<FakeEngine> quantizedOwnedEngine = std::make_unique<FakeEngine>();
+	FakeEngine *quantizedEngine = quantizedOwnedEngine.get();
+	XAudio2AudioService quantizedService(std::move(quantizedOwnedEngine));
+	XAudio2AudioManager quantizedManager(&quantizedService, &quantizedDurationSource);
+	quantizedManager.openDevice();
+	AudioEventInfo *quantizedInfo = newInstance(AudioEventInfo);
+	*quantizedInfo = *fixtureInfo;
+	quantizedInfo->m_attackSounds.clear();
+	quantizedInfo->m_decaySounds.clear();
+	quantizedInfo->m_sounds.clear();
+	quantizedInfo->m_sounds.push_back(AsciiString("quantized-duration.wav"));
+	FixtureEvent quantizedEvent(AsciiString("fixture-quantized-duration"));
+	quantizedEvent.setAudioEventInfo(quantizedInfo);
+	const AudioHandle quantizedHandle = quantizedManager.addAudioEvent(&quantizedEvent);
+	quantizedManager.update();
+	quantizedManager.update();
+	FakeVoice *quantizedVoice = quantizedEngine->lastVoice;
+	check(quantizedVoice != nullptr && quantizedVoice->submitCalls == 2
+		&& quantizedDurationSource.readBounds.size() == 2U
+		&& quantizedDurationSource.readBounds[0] == 48000U
+		&& quantizedDurationSource.readBounds[1] == 48000U,
+		"stream playback reads through decoder EOF instead of treating rounded duration as exact");
+	check(quantizedVoice->completeOldestBuffer(),
+		"quantized-duration fixture completes its first buffer");
+	quantizedManager.update();
+	check(quantizedManager.isCurrentlyPlaying(quantizedHandle)
+		&& quantizedDurationSource.readStarts.size() == 2U,
+		"quantized duration does not trigger a false EOF read failure");
+	quantizedManager.stopAudio(AudioAffect_Sound);
+	quantizedManager.update();
+	quantizedManager.closeDevice();
+	deleteInstance(quantizedInfo);
+
+	StreamingAudioAssetSource emptyStreamSource(0U, 1000.0f);
+	std::unique_ptr<FakeEngine> emptyOwnedEngine = std::make_unique<FakeEngine>();
+	XAudio2AudioService emptyService(std::move(emptyOwnedEngine));
+	XAudio2AudioManager emptyManager(&emptyService, &emptyStreamSource);
+	emptyManager.openDevice();
+	AudioEventInfo *emptyInfo = newInstance(AudioEventInfo);
+	*emptyInfo = *fixtureInfo;
+	emptyInfo->m_attackSounds.clear();
+	emptyInfo->m_decaySounds.clear();
+	emptyInfo->m_sounds.clear();
+	emptyInfo->m_sounds.push_back(AsciiString("empty-stream.wav"));
+	FixtureEvent emptyEvent(AsciiString("fixture-empty-stream"));
+	emptyEvent.setAudioEventInfo(emptyInfo);
+	const AudioHandle emptyHandle = emptyManager.addAudioEvent(&emptyEvent);
+	emptyManager.update();
+	emptyManager.update();
+	check(!emptyManager.isCurrentlyPlaying(emptyHandle)
+		&& emptyStreamSource.readStarts.size() == 1U,
+		"positive-duration streams that end before PCM fail instead of completing silently");
+	emptyManager.closeDevice();
+	deleteInstance(emptyInfo);
 
 	BoundedRangeAudioAssetSource rangedSource(120000U);
 	std::unique_ptr<FakeEngine> rangedOwnedEngine = std::make_unique<FakeEngine>();

@@ -83,6 +83,7 @@ public:
 		m_nextFrame += frameCount;
 		return TRUE;
 	}
+	Bool isEnded() const override { return m_nextFrame >= m_pcm.frameCount ? TRUE : FALSE; }
 
 private:
 	AudioPcmChunk m_pcm;
@@ -804,8 +805,9 @@ Bool XAudio2AudioManager::preparePhaseSource(PlayingAudio &playing,
 			return FALSE;
 		}
 		playing.phaseDurationMS = stream->durationMS();
-		sampleRate = stream->sampleRate();
+		playing.phaseTotalFrames = std::numeric_limits<UnsignedInt>::max();
 		playing.pcmStream = std::move(stream);
+		return TRUE;
 	} else {
 		AudioPcmChunk probe;
 		if (!m_assetSource->getDurationMS(fileName, playing.phaseDurationMS)
@@ -890,18 +892,38 @@ Bool XAudio2AudioManager::submitPhase(PlayingAudio &playing)
 	if (playing.phaseSubmittedFrames >= playing.phaseTotalFrames) {
 		return TRUE;
 	}
-	const UnsignedInt framesToSubmit = std::min(
+	const Bool openEndedStream = playing.pcmStream != nullptr
+		&& playing.phaseTotalFrames == std::numeric_limits<UnsignedInt>::max();
+	const UnsignedInt framesToSubmit = openEndedStream ? PCM_MAX_FRAMES : std::min(
 		PCM_MAX_FRAMES, playing.phaseTotalFrames - playing.phaseSubmittedFrames);
 	AudioPcmChunk chunk;
 	const Bool decoded = playing.pcmStream != nullptr
 		? playing.pcmStream->readPcm(chunk, framesToSubmit)
 		: m_assetSource->decodePcmAt(fileName, chunk, framesToSubmit,
 			playing.phaseSubmittedFrames);
+	if (!decoded && playing.pcmStream != nullptr && playing.pcmStream->isEnded()) {
+		if (playing.phaseSubmittedFrames == 0) {
+			return FALSE;
+		}
+		playing.phaseTotalFrames = playing.phaseSubmittedFrames;
+		playing.phaseDurationMS = static_cast<Real>(playing.phaseTotalFrames) * 1000.0f
+			/ static_cast<Real>(playing.pcmStream->sampleRate());
+		return TRUE;
+	}
 	if (!decoded) {
 		return FALSE;
 	}
 	if (chunk.frameCount == 0 || chunk.frameCount > framesToSubmit) {
 		return FALSE;
+	}
+	if (chunk.frameCount > std::numeric_limits<UnsignedInt>::max()
+		- playing.phaseSubmittedFrames) {
+		return FALSE;
+	}
+	if (playing.pcmStream != nullptr && playing.pcmStream->isEnded()) {
+		playing.phaseTotalFrames = playing.phaseSubmittedFrames + chunk.frameCount;
+		playing.phaseDurationMS = static_cast<Real>(playing.phaseTotalFrames) * 1000.0f
+			/ static_cast<Real>(playing.pcmStream->sampleRate());
 	}
 	chunk.generation = playing.generation;
 	chunk.sequence = playing.voiceSequence++;
@@ -919,8 +941,12 @@ Bool XAudio2AudioManager::queuePhaseLowWater(PlayingAudio &playing)
 {
 	while (playing.phaseQueuedBuffers < PCM_PREQUEUE_BUFFERS
 		&& playing.phaseSubmittedFrames < playing.phaseTotalFrames) {
+		const UnsignedInt submittedBefore = playing.phaseSubmittedFrames;
 		if (!submitPhase(playing)) {
 			return FALSE;
+		}
+		if (playing.phaseSubmittedFrames == submittedBefore) {
+			break;
 		}
 		++playing.phaseQueuedBuffers;
 	}
