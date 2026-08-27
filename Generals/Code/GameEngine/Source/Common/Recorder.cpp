@@ -89,6 +89,11 @@ static const UnsignedInt disconOffset = quitEarlyOffset + sizeof(Bool);
 #if defined(_WIN64)
 static constexpr Int kNativeReplayPayloadBase = static_cast<Int>(rts::runtime_epoch::kHeaderSize);
 static constexpr Int kNativeReplayChecksumChunkSize = 64 * 1024;
+// The epoch header keeps a 64-bit byte count so its wire layout is stable and
+// future file backends can grow. The current File API and replay cursor are
+// intentionally signed 32-bit, so schema 2 fails closed above this limit.
+static constexpr std::uint64_t kNativeReplayMaxPayloadBytes =
+	static_cast<std::uint64_t>(INT_MAX - kNativeReplayPayloadBase);
 
 static_assert(static_cast<std::int32_t>(GameMessage::MSG_CLEAR_GAME_DATA) ==
 	 rts::replay_command::kClearGameDataMessageType, "native replay clear-data ID must remain stable");
@@ -230,7 +235,11 @@ static Bool validateNativeReplayContainer(File* file, Int* payloadEnd)
 	options.expectedContentHash =
 		rts::runtime_epoch::ContentHashFromIniCrc(TheGlobalData->m_iniCRC);
 	options.expectedSchemaVersion = rts::runtime_epoch::kCurrentReplaySchemaVersion;
-	options.maxPayloadByteCount = static_cast<std::uint64_t>(fileSize - kNativeReplayPayloadBase);
+	const std::uint64_t availablePayloadBytes =
+		static_cast<std::uint64_t>(fileSize - kNativeReplayPayloadBase);
+	options.maxPayloadByteCount = availablePayloadBytes < kNativeReplayMaxPayloadBytes
+		? availablePayloadBytes
+		: kNativeReplayMaxPayloadBytes;
 	options.requireBuildCompatibilityMatch = true;
 	options.requireContentHashMatch = true;
 	if (!rts::runtime_epoch::Validate(header, options).ok())
@@ -248,8 +257,7 @@ static Bool validateNativeReplayContainer(File* file, Int* payloadEnd)
 
 	// Leave the stream at the first byte of the legacy replay payload.  Every
 	// subsequent GENREP read is therefore relative to the validated container.
-	if (header.payloadByteCount > static_cast<std::uint64_t>(fileSize - kNativeReplayPayloadBase) ||
-		header.payloadByteCount > static_cast<std::uint64_t>(INT_MAX - kNativeReplayPayloadBase))
+	if (header.payloadByteCount > options.maxPayloadByteCount)
 	{
 		return FALSE;
 	}

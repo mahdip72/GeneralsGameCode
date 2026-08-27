@@ -143,6 +143,14 @@ function Test-RecorderContent {
         $violations.Add('native replay container validation must require the current replay schema')
     }
     foreach ($required in @(
+        'kNativeReplayMaxPayloadBytes',
+        'options.maxPayloadByteCount = availablePayloadBytes < kNativeReplayMaxPayloadBytes',
+        'header.payloadByteCount > options.maxPayloadByteCount')) {
+        if ($Content.IndexOf($required, [StringComparison]::Ordinal) -lt 0) {
+            $violations.Add("native replay payload limit policy is missing '$required'")
+        }
+    }
+    foreach ($required in @(
         'validateNativeReplayContainer(m_file, &m_nativeReplayPayloadEnd)',
         'm_nativeReplayContainer = TRUE;')) {
         if ($header.IndexOf($required, [StringComparison]::Ordinal) -lt 0) {
@@ -223,6 +231,7 @@ function Test-RecorderContent {
 
 if ($SelfTest) {
     $good = @'
+static constexpr std::uint64_t kNativeReplayMaxPayloadBytes = 1;
 void RecorderClass::startRecording() {
   if (!beginNativeReplayContainer(m_file)) { return; }
   writeNativeReplayExact(m_file, data, size);
@@ -251,6 +260,8 @@ void RecorderClass::stopRecording() {
 void RecorderClass::archiveReplay() {}
 static Bool validateNativeReplayContainer() {
   options.expectedSchemaVersion = rts::runtime_epoch::kCurrentReplaySchemaVersion;
+  options.maxPayloadByteCount = availablePayloadBytes < kNativeReplayMaxPayloadBytes;
+  if (header.payloadByteCount > options.maxPayloadByteCount) return FALSE;
 }
 static void writeNativeReplayU16() {}
 void RecorderClass::updatePlayback() {
@@ -318,6 +329,11 @@ void RecorderClass::readArgument() {}
     $schemaOutsideValidator += "`noptions.expectedSchemaVersion = rts::runtime_epoch::kCurrentReplaySchemaVersion;"
     if (-not ((Test-RecorderContent $schemaOutsideValidator) -match 'current replay schema')) {
         throw 'schema token outside the native validator was not rejected'
+    }
+    $missingPayloadLimit = $good.Replace(
+        '  options.maxPayloadByteCount = availablePayloadBytes < kNativeReplayMaxPayloadBytes;', '')
+    if (-not ((Test-RecorderContent $missingPayloadLimit) -match 'payload limit policy')) {
+        throw 'missing native replay payload limit was not rejected'
     }
     $errorOutsideFailure = $good.Replace('  m_replayReadError = TRUE;', '')
     $errorOutsideFailure += "`nm_replayReadError = TRUE;"
