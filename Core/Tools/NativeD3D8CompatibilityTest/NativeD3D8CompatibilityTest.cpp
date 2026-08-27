@@ -3,6 +3,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <string>
 
 namespace
@@ -133,6 +134,138 @@ bool StagedFileMatchesModuleDirectory(const wchar_t *path, HMODULE module)
 		static_cast<int>(module_separator), TRUE) == CSTR_EQUAL;
 }
 
+struct TemporaryCompatibilityDirectory
+{
+	wchar_t temp_root[MAX_PATH];
+	wchar_t temp_directory[MAX_PATH];
+	wchar_t staged_compatibility[MAX_PATH];
+	wchar_t staged_compiler[MAX_PATH];
+
+	TemporaryCompatibilityDirectory() :
+		temp_root{}, temp_directory{}, staged_compatibility{}, staged_compiler{}
+	{
+	}
+
+	~TemporaryCompatibilityDirectory()
+	{
+		cleanup();
+	}
+
+	bool initialize(const wchar_t *compatibility_path, const wchar_t *compiler_path)
+	{
+		const DWORD temp_length = GetTempPathW(MAX_PATH, temp_root);
+		if (temp_length == 0 || temp_length >= MAX_PATH ||
+			GetTempFileNameW(temp_root, L"GGC", 0, temp_directory) == 0 ||
+			DeleteFileW(temp_directory) == FALSE ||
+			CreateDirectoryW(temp_directory, nullptr) == FALSE)
+		{
+			return false;
+		}
+
+		_snwprintf_s(staged_compatibility, MAX_PATH, _TRUNCATE,
+			L"%s\\d3d8.dll", temp_directory);
+		_snwprintf_s(staged_compiler, MAX_PATH, _TRUNCATE,
+			L"%s\\d3dcompiler_43.dll", temp_directory);
+		return CopyFileW(compatibility_path, staged_compatibility, FALSE) != FALSE &&
+			CopyFileW(compiler_path, staged_compiler, FALSE) != FALSE;
+	}
+
+	bool cleanup()
+	{
+		bool result = true;
+		if (staged_compiler[0] != L'\0' && DeleteFileW(staged_compiler) == FALSE &&
+			GetLastError() != ERROR_FILE_NOT_FOUND)
+			result = false;
+		if (staged_compatibility[0] != L'\0' &&
+			DeleteFileW(staged_compatibility) == FALSE &&
+			GetLastError() != ERROR_FILE_NOT_FOUND)
+			result = false;
+		if (temp_directory[0] != L'\0')
+		{
+			const DWORD attributes = GetFileAttributesW(temp_directory);
+			if (attributes != INVALID_FILE_ATTRIBUTES)
+			{
+				const BOOL removed = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ?
+					RemoveDirectoryW(temp_directory) : DeleteFileW(temp_directory);
+				if (removed == FALSE)
+					result = false;
+			}
+			else if (GetLastError() != ERROR_FILE_NOT_FOUND &&
+				GetLastError() != ERROR_PATH_NOT_FOUND)
+			{
+				result = false;
+			}
+		}
+		if (result)
+		{
+			staged_compiler[0] = L'\0';
+			staged_compatibility[0] = L'\0';
+			temp_directory[0] = L'\0';
+		}
+		return result;
+	}
+};
+
+bool MissingD3DXChildReleasesCompiler(const wchar_t *compatibility_path,
+	const wchar_t *compiler_path)
+{
+	HMODULE compatibility = LoadExactRuntime(compatibility_path);
+	Direct3DCreate8Function create_d3d8 = compatibility == nullptr ? nullptr :
+		reinterpret_cast<Direct3DCreate8Function>(GetProcAddress(compatibility,
+			"Direct3DCreate8"));
+	IDirect3D8 *d3d = create_d3d8 == nullptr ? nullptr : create_d3d8(D3D_SDK_VERSION);
+	HMODULE compiler_during_lifetime = GetModuleHandleW(L"d3dcompiler_43.dll");
+	const bool compiler_matches = LoadedModuleMatches(compiler_during_lifetime,
+		compiler_path);
+	if (d3d != nullptr)
+		d3d->Release();
+	HMODULE compiler_after_release = GetModuleHandleW(L"d3dcompiler_43.dll");
+	const bool result = compatibility != nullptr && create_d3d8 != nullptr &&
+		d3d != nullptr && compiler_matches &&
+		compiler_after_release == nullptr;
+	if (!result)
+		std::fprintf(stderr,
+			"Missing-D3DX child diagnostics: d3d=%p compiler-during=%p compiler-after=%p\n",
+			static_cast<void *>(d3d), static_cast<void *>(compiler_during_lifetime),
+			static_cast<void *>(compiler_after_release));
+	if (compatibility != nullptr)
+		FreeLibrary(compatibility);
+	return result;
+}
+
+bool MissingD3DXReleasesCompiler(const wchar_t *executable_path,
+	const wchar_t *compatibility_path, const wchar_t *compiler_path)
+{
+	TemporaryCompatibilityDirectory temporary;
+	if (!temporary.initialize(compatibility_path, compiler_path))
+		return false;
+
+	std::wstring command_line = L"\"" + std::wstring(executable_path) +
+		L"\" --missing-d3dx-child \"" + temporary.staged_compatibility +
+		L"\" \"" + temporary.staged_compiler + L"\"";
+	STARTUPINFOW startup = {};
+	startup.cb = sizeof(startup);
+	PROCESS_INFORMATION process = {};
+	if (CreateProcessW(nullptr, &command_line[0], nullptr, nullptr, FALSE,
+		CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process) == FALSE)
+	{
+		return false;
+	}
+
+	const DWORD wait_result = WaitForSingleObject(process.hProcess, 30000);
+	if (wait_result != WAIT_OBJECT_0)
+	{
+		TerminateProcess(process.hProcess, 1);
+		WaitForSingleObject(process.hProcess, 5000);
+	}
+	DWORD exit_code = 1;
+	const bool child_passed = wait_result == WAIT_OBJECT_0 &&
+		GetExitCodeProcess(process.hProcess, &exit_code) != FALSE && exit_code == 0;
+	CloseHandle(process.hThread);
+	CloseHandle(process.hProcess);
+	return child_passed && temporary.cleanup();
+}
+
 struct TestResources
 {
 	HMODULE compatibility = nullptr;
@@ -167,6 +300,15 @@ struct TestResources
 
 int wmain(int argc, wchar_t **argv)
 {
+	if (argc == 4 && std::wcscmp(argv[1], L"--missing-d3dx") == 0)
+	{
+		if (!MissingD3DXReleasesCompiler(argv[0], argv[2], argv[3]))
+			return Fail("Missing D3DX compiler ownership lifecycle failed");
+		std::puts("Missing D3DX initialization released the app-local compiler module.");
+		return 0;
+	}
+	if (argc == 4 && std::wcscmp(argv[1], L"--missing-d3dx-child") == 0)
+		return MissingD3DXChildReleasesCompiler(argv[2], argv[3]) ? 0 : 1;
 	if (argc != 4)
 		return Fail("Expected app-local d3d8.dll, staged D3DCompiler_43.dll, and D3DX9_43.dll paths");
 
