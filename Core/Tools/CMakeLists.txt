@@ -192,6 +192,18 @@ if(RTS_BUILD_CORE_EXTRAS)
     endif()
 
     if(WIN32)
+        add_test(NAME core_renderer_shutdown_lifecycle_audit
+            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/RendererShutdownLifecycleAudit/RendererShutdownLifecycleAudit.ps1"
+                -SourceRoot "${CMAKE_SOURCE_DIR}"
+        )
+        set_tests_properties(core_renderer_shutdown_lifecycle_audit PROPERTIES TIMEOUT 30)
+        add_test(NAME core_renderer_shutdown_lifecycle_audit_self_test
+            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/RendererShutdownLifecycleAudit/RendererShutdownLifecycleAudit.ps1"
+                -SelfTest
+        )
+        set_tests_properties(core_renderer_shutdown_lifecycle_audit_self_test PROPERTIES TIMEOUT 30)
         if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT IS_VS6_BUILD)
             add_test(NAME core_native_audio_backend_audit
                 COMMAND powershell -NoProfile -ExecutionPolicy Bypass

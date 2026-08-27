@@ -83,6 +83,23 @@ W3DParticleSystemManager::~W3DParticleSystemManager()
 	REF_PTR_RELEASE(m_angleBuffer);
 }
 
+void W3DParticleSystemManager::reset()
+{
+	// GameEngine resets every subsystem before destroying them in reverse
+	// registration order. The display owns the graphics runtime, but the
+	// particle manager is destroyed later and its reusable render helpers can
+	// still retain the last particle textures. Drop those references while the
+	// graphics runtime is alive so their eventual destructors never release a
+	// legacy COM object after the D3D8 compatibility module has been unloaded.
+	if (m_pointGroup != nullptr)
+		m_pointGroup->Set_Texture(nullptr);
+	if (m_streakLine != nullptr)
+		m_streakLine->Set_Texture(nullptr);
+	m_readyToRender = false;
+
+	ParticleSystemManager::reset();
+}
+
 /**
  * Hack because DoParticles is called from Flush(), which is called
  * multiple times per frame.  We only want to render once.

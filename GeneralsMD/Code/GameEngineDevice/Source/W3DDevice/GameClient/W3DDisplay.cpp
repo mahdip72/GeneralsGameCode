@@ -426,6 +426,9 @@ W3DDisplay::W3DDisplay()
 W3DDisplay::~W3DDisplay()
 {
 	ASSERT_GAME_THREAD("W3DDisplay::~W3DDisplay radar preparation");
+	// Display's base destructor runs after WW3D shutdown. Release the movie
+	// buffer here while its texture backend is still loaded.
+	stopMovie();
 	GetRadarTerrainPrepareService().shutdown();
 	W3D_ShutdownScreenshotTasks();
 
@@ -457,6 +460,7 @@ W3DDisplay::~W3DDisplay()
 	if( m_benchmarkDisplayString ) {
 		TheDisplayStringManager->freeDisplayString(m_benchmarkDisplayString);
 	}
+	TheDisplayStringManager->releaseGraphicsResources();
 
 	// delete 2D renderer
 	if( m_2DRender )
