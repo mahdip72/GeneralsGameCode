@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include "BFISH.h"
+#include "Common/RegistryView.h"
 #include <Debug/DebugPrint.h>
 
 void __cdecl doIt();
@@ -45,10 +46,10 @@ static void doIt()
 	const char* gameRegistryKey = "Software\\Electronic Arts\\EA Games\\Command and Conquer Generals Zero Hour";
 #endif
 
-	LONG result = RegOpenKeyEx(HKEY_LOCAL_MACHINE, gameRegistryKey, 0, KEY_READ, &hKey);
+	LONG result = OpenRetailRegistryKey(HKEY_LOCAL_MACHINE, gameRegistryKey, 0, KEY_READ, &hKey);
 	if (result != ERROR_SUCCESS)
 	{
-		result = RegOpenKeyEx(HKEY_CURRENT_USER, gameRegistryKey, 0, KEY_READ, &hKey);
+		result = OpenRetailRegistryKey(HKEY_CURRENT_USER, gameRegistryKey, 0, KEY_READ, &hKey);
 		usesHKeycurrentUser = true;
 	}
 	assert((result == ERROR_SUCCESS) && "Failed to open game registry key");
@@ -103,11 +104,11 @@ static void doIt()
 
 	if (usesHKeycurrentUser)
 	{
-		result = RegOpenKeyEx(HKEY_CURRENT_USER, serialRegistryKey, 0, KEY_READ, &hKey);
+		result = OpenRetailRegistryKey(HKEY_CURRENT_USER, serialRegistryKey, 0, KEY_READ, &hKey);
 	}
 	else
 	{
-		result = RegOpenKeyEx(HKEY_LOCAL_MACHINE, serialRegistryKey, 0, KEY_READ, &hKey);
+		result = OpenRetailRegistryKey(HKEY_LOCAL_MACHINE, serialRegistryKey, 0, KEY_READ, &hKey);
 	}
 	assert((result == ERROR_SUCCESS) && "Failed to open game serial registry key");
 
@@ -126,7 +127,7 @@ static void doIt()
 	strcat(passKey, (char*)gameSerialNumber);
 
 	// Obtain windows product ID
-	result = RegOpenKeyEx(HKEY_LOCAL_MACHINE, "Software\\Microsoft\\Windows\\CurrentVersion", 0, KEY_READ, &hKey);
+	result = OpenNativeRegistryKey(HKEY_LOCAL_MACHINE, "Software\\Microsoft\\Windows\\CurrentVersion", 0, KEY_READ, &hKey);
 	assert((result == ERROR_SUCCESS) && "Failed to open windows registry key!");
 
 	if (result == ERROR_SUCCESS)

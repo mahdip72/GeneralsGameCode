@@ -17,6 +17,7 @@
 */
 
 #include "findpatch.h"
+#include "Common/RegistryView.h"
 
 //
 // Locate a patch file
@@ -123,7 +124,7 @@ bit8 Get_App_Dir(OUT char *filename,int maxlen, ConfigFile &config,int index)
   HKEY   regKey;
   LONG   regRetval;
   /////////////DWORD  regPrevious;
-  regRetval=RegOpenKeyEx(HKEY_LOCAL_MACHINE,path.get(),0,KEY_READ,&regKey);
+  regRetval=OpenRetailRegistryKey(HKEY_LOCAL_MACHINE,path.get(),0,KEY_READ,&regKey);
   if (regRetval!=ERROR_SUCCESS)
   {
     DBGMSG("RegOpenKey failed");

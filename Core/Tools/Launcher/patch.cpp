@@ -32,6 +32,7 @@ This is where all the code is for applying various types of patches.
 
 
 #include "patch.h"
+#include "Common/RegistryView.h"
 #include <shellapi.h>
 #include <direct.h>
 
@@ -151,7 +152,7 @@ void Apply_Patch(char *patchfile,ConfigFile &config,int skuIndex)
     DWORD  regPrevious;
     char lpClass[] = "";
 
-    regRetval=RegCreateKeyEx(
+    regRetval=CreateNativeRegistryKey(
       HKEY_LOCAL_MACHINE,
       "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
       0,
@@ -276,7 +277,7 @@ void Apply_Patch(char *patchfile,ConfigFile &config,int skuIndex)
     // Open the registry key for modifying now...
     HKEY regKey;
     LONG regRetval;
-    regRetval=RegOpenKeyEx(HKEY_LOCAL_MACHINE,path.get(),0,
+    regRetval=OpenRetailRegistryKey(HKEY_LOCAL_MACHINE,path.get(),0,
         KEY_ALL_ACCESS,&regKey);
     if (regRetval!=ERROR_SUCCESS)
       DBGMSG("Can't open reg key for writing");

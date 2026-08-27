@@ -14,6 +14,7 @@ target_include_directories(corei_datgen INTERFACE
 )
 
 target_link_libraries(corei_datgen INTERFACE
+    corei_gameengine_include
 )
 
 target_sources(corei_datgen INTERFACE ${DATGEN_SRC})

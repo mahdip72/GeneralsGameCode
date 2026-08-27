@@ -61,6 +61,7 @@ target_compile_definitions(corei_launcher INTERFACE
 )
 
 target_link_libraries(corei_launcher INTERFACE
+    corei_gameengine_include
     comctl32
 )
 
