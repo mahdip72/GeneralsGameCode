@@ -920,6 +920,16 @@ static void TestSkirmishAITestRunnerContract()
 	CHECK(IsSkirmishAITestProgressStalled(30000));
 	CHECK(!IsSkirmishAITestShutdownTimedOut(29999));
 	CHECK(IsSkirmishAITestShutdownTimedOut(30000));
+
+	CHECK(IsValidSkirmishAITestReplayResult(42000, 42001, FALSE, FALSE, 100, 200));
+	CHECK(!IsValidSkirmishAITestReplayResult(0, 0, FALSE, FALSE, 100, 200));
+	CHECK(!IsValidSkirmishAITestReplayResult(UINT_MAX, 0, FALSE, FALSE, 100, 200));
+	CHECK(!IsValidSkirmishAITestReplayResult(42000, 42000, FALSE, FALSE, 100, 200));
+	CHECK(!IsValidSkirmishAITestReplayResult(42000, 42002, FALSE, FALSE, 100, 200));
+	CHECK(!IsValidSkirmishAITestReplayResult(42000, 42001, TRUE, FALSE, 100, 200));
+	CHECK(!IsValidSkirmishAITestReplayResult(42000, 42001, FALSE, TRUE, 100, 200));
+	CHECK(!IsValidSkirmishAITestReplayResult(42000, 42001, FALSE, FALSE, 0, 200));
+	CHECK(!IsValidSkirmishAITestReplayResult(42000, 42001, FALSE, FALSE, 200, 199));
 }
 
 int main(int argc, char **argv)

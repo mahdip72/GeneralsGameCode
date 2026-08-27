@@ -59,6 +59,9 @@ void BuildSkirmishAITestPlan(Int seed, SkirmishAITestPlan *plan);
 Bool IsExpectedSkirmishAITestLoadedState(const SkirmishAITestPlan &plan,
 	UnsignedInt expectedMapCRC, UnsignedInt expectedMapSize,
 	const SkirmishAITestLoadedState *loadedState);
+Bool IsValidSkirmishAITestReplayResult(UnsignedInt expectedFrameCount,
+	UnsignedInt actualFrameCount, Bool desyncGame, Bool quitEarly,
+	time_t startTime, time_t endTime);
 SkirmishAITestProgress EvaluateSkirmishAITestProgress(UnsignedInt endFrame, UnsignedInt currentFrame);
 Bool IsSkirmishAITestStartupTimedOut(UnsignedInt elapsedMilliseconds);
 Bool IsSkirmishAITestProgressStalled(UnsignedInt elapsedMilliseconds);

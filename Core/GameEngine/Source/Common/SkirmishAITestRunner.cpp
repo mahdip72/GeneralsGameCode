@@ -150,6 +150,17 @@ Bool IsExpectedSkirmishAITestLoadedState(const SkirmishAITestPlan &plan,
 		loadedState->seed == plan.seed;
 }
 
+Bool IsValidSkirmishAITestReplayResult(UnsignedInt expectedFrameCount,
+	UnsignedInt actualFrameCount, Bool desyncGame, Bool quitEarly,
+	time_t startTime, time_t endTime)
+{
+	// VictoryConditions records the winning frame before GameLogic advances to
+	// the frame written by RecorderClass::logGameEnd().
+	return expectedFrameCount != 0 && expectedFrameCount < UINT_MAX &&
+		actualFrameCount == expectedFrameCount + 1U &&
+		!desyncGame && !quitEarly && startTime > 0 && endTime >= startTime;
+}
+
 SkirmishAITestProgress EvaluateSkirmishAITestProgress(UnsignedInt endFrame, UnsignedInt currentFrame)
 {
 	if (endFrame != 0)
@@ -362,6 +373,12 @@ void UpdateSkirmishAITestRunner()
 	// startup hook. Reassert it while recording so LastReplay remains at the
 	// exact path reported and validated by this test.
 	TheRecorder->setArchiveEnabled(FALSE);
+	if (TheRecorder->getMode() == RECORDERMODETYPE_RECORD && !TheRecorder->hasOpenRecordingFile())
+	{
+		FailSkirmishAITest("recorder_file_unavailable");
+		RequestSkirmishAITestStop();
+		return;
+	}
 	if (s_runner.replayFileName[0] == '\0' && TheRecorder->getMode() == RECORDERMODETYPE_RECORD)
 	{
 		const AsciiString recordingFileName = TheRecorder->getRecordingFileName();
@@ -457,9 +474,9 @@ void UpdateSkirmishAITestRunner()
 		RequestSkirmishAITestStop();
 		return;
 	}
-	if (TheRecorder->getMode() != RECORDERMODETYPE_RECORD)
+	if (TheRecorder->getMode() != RECORDERMODETYPE_RECORD || !TheRecorder->hasOpenRecordingFile())
 	{
-		FailSkirmishAITest("recorder_not_recording");
+		FailSkirmishAITest("recorder_file_unavailable");
 		RequestSkirmishAITestStop();
 		return;
 	}
@@ -493,7 +510,9 @@ Int FinalizeSkirmishAITestRunner(Int engineExitCode)
 		header.filename = replayName;
 		header.forPlayback = FALSE;
 		if (!TheRecorder || !TheRecorder->readReplayHeader(header) ||
-			!RecorderClass::replayMatchesGameVersion(header))
+			!RecorderClass::replayMatchesGameVersion(header) ||
+			!IsValidSkirmishAITestReplayResult(s_runner.endFrame, header.frameCount,
+				header.desyncGame, header.quitEarly, header.startTime, header.endTime))
 		{
 			FailSkirmishAITest("replay_validation");
 		}
