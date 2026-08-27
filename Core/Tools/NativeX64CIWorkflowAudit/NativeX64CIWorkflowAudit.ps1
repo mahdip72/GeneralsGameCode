@@ -160,14 +160,20 @@ function Test-NativeX64CIWorkflow {
         -EarlierStepNamePrefix 'Install native runtime' `
         -LaterStepNamePrefix 'Run installed native runtime regression tests'
     Assert-Contains $runtimeRegressionStep `
-        '(?m)^        if: \$\{\{ inputs\.game == ''GeneralsMD'' && inputs\.extras && startsWith\(inputs\.preset, ''x64''\) \}\}\r?$' `
-        'the installed runtime regression gate is not limited to the native Zero Hour extras lane'
+        '(?m)^        if: \$\{\{ inputs\.extras && startsWith\(inputs\.preset, ''x64''\) \}\}\r?$' `
+        'the installed runtime regression gate is not enabled for both native title extras lanes'
     Assert-Contains $runtimeRegressionStep `
-        '(?ms)\$installedRuntime = \[IO\.Path\]::GetFullPath\(\s*\(Join-Path "build\\\$\{\{ inputs\.preset \}\}\\installed" ''ZeroHour''\)\)' `
-        'the runtime regression gate does not resolve an absolute installed Zero Hour runtime'
+        "\$titleDirectory = '\$\{\{ inputs\.game == 'Generals' && 'Generals' \|\| 'ZeroHour' \}\}'" `
+        'the runtime regression gate does not select both installed title directories'
     Assert-Contains $runtimeRegressionStep `
-        '\$test = Join-Path \$installedRuntime ''z_runtime_regression_tests\.exe''' `
-        'the runtime regression gate does not resolve the installed utility'
+        "\$testName = '\$\{\{ inputs\.game == 'Generals' && 'g_skirmish_ai_runner_contract_tests\.exe' \|\| 'z_runtime_regression_tests\.exe' \}\}'" `
+        'the runtime regression gate does not select both installed utilities'
+    Assert-Contains $runtimeRegressionStep `
+        '(?ms)\$installedRuntime = \[IO\.Path\]::GetFullPath\(\s*\(Join-Path "build\\\$\{\{ inputs\.preset \}\}\\installed" \$titleDirectory\)\)' `
+        'the runtime regression gate does not resolve an absolute installed title runtime'
+    Assert-Contains $runtimeRegressionStep `
+        '\$test = Join-Path \$installedRuntime \$testName' `
+        'the runtime regression gate does not resolve the selected installed utility'
     Assert-Contains $runtimeRegressionStep 'Test-Path -LiteralPath \$test -PathType Leaf' `
         'the runtime regression gate does not reject a missing installed utility'
     Assert-Contains $runtimeRegressionStep '\$testExitCode = 1' `
@@ -333,11 +339,13 @@ if: inputs.game == 'Generals' && inputs.preset == 'x64-vcpkg'
         run: |
           cmake --install build
       - name: Run installed native runtime regression tests
-        if: ${{ inputs.game == 'GeneralsMD' && inputs.extras && startsWith(inputs.preset, 'x64') }}
+        if: ${{ inputs.extras && startsWith(inputs.preset, 'x64') }}
         run: |
+          $titleDirectory = '${{ inputs.game == 'Generals' && 'Generals' || 'ZeroHour' }}'
+          $testName = '${{ inputs.game == 'Generals' && 'g_skirmish_ai_runner_contract_tests.exe' || 'z_runtime_regression_tests.exe' }}'
           $installedRuntime = [IO.Path]::GetFullPath(
-            (Join-Path "build\${{ inputs.preset }}\installed" 'ZeroHour'))
-          $test = Join-Path $installedRuntime 'z_runtime_regression_tests.exe'
+            (Join-Path "build\${{ inputs.preset }}\installed" $titleDirectory))
+          $test = Join-Path $installedRuntime $testName
           if (-not (Test-Path -LiteralPath $test -PathType Leaf)) { exit 1 }
           $testExitCode = 1
           Push-Location $installedRuntime
@@ -502,7 +510,7 @@ $arguments += "-DFFMPEG_RUNTIME_DIR=$FFmpegRuntimeDir"
     try {
         Test-NativeX64CIWorkflow `
             -CIWorkflow $goodCI `
-            -BuildWorkflow ($goodBuild -replace '\[IO\.Path\]::GetFullPath\(\s*\(Join-Path "build\\\$\{\{ inputs\.preset \}\}\\installed" ''ZeroHour''\)\)', 'Join-Path "build\${{ inputs.preset }}\installed" ''ZeroHour''')
+            -BuildWorkflow ($goodBuild -replace '\[IO\.Path\]::GetFullPath\(\s*\(Join-Path "build\\\$\{\{ inputs\.preset \}\}\\installed" \$titleDirectory\)\)', 'Join-Path "build\${{ inputs.preset }}\installed" $titleDirectory')
     } catch {
         $caughtRelativeInstalledRuntime = $true
     }

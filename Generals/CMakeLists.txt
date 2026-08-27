@@ -121,6 +121,15 @@ if(_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS)
             DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}")
     endif()
 
+    # Exercise the Generals title graph from the exact disposable native
+    # runtime that is promoted. Keep this test-only utility out of Win32.
+    if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND TARGET g_skirmish_ai_runner_contract_tests)
+        install(TARGETS g_skirmish_ai_runner_contract_tests
+            RUNTIME DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}")
+        install(FILES $<TARGET_PDB_FILE:g_skirmish_ai_runner_contract_tests>
+            DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}" OPTIONAL)
+    endif()
+
     if(TARGET g_worldbuilder)
         install(TARGETS g_worldbuilder RUNTIME DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}")
         install(FILES $<TARGET_PDB_FILE:g_worldbuilder> DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}" OPTIONAL)

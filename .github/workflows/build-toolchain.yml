@@ -227,12 +227,14 @@ jobs:
           }
 
       - name: Run installed native runtime regression tests
-        if: ${{ inputs.game == 'GeneralsMD' && inputs.extras && startsWith(inputs.preset, 'x64') }}
+        if: ${{ inputs.extras && startsWith(inputs.preset, 'x64') }}
         shell: pwsh
         run: |
+          $titleDirectory = '${{ inputs.game == 'Generals' && 'Generals' || 'ZeroHour' }}'
+          $testName = '${{ inputs.game == 'Generals' && 'g_skirmish_ai_runner_contract_tests.exe' || 'z_runtime_regression_tests.exe' }}'
           $installedRuntime = [IO.Path]::GetFullPath(
-            (Join-Path "build\${{ inputs.preset }}\installed" 'ZeroHour'))
-          $test = Join-Path $installedRuntime 'z_runtime_regression_tests.exe'
+            (Join-Path "build\${{ inputs.preset }}\installed" $titleDirectory))
+          $test = Join-Path $installedRuntime $testName
           if (-not (Test-Path -LiteralPath $test -PathType Leaf)) {
             Write-Error "Installed native runtime regression utility was not produced at $test"
             exit 1
