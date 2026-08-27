@@ -95,7 +95,7 @@ void W3DParticleSystemManager::reset()
 }
 '@
     $missingStreak = $valid.Replace(
-        '    if (m_streakLine != nullptr) m_streakLine->Set_Texture(nullptr);' + "`n", '')
+        '    if (m_streakLine != nullptr) m_streakLine->Set_Texture(nullptr);', '')
     $wrongOrder = @'
 void W3DParticleSystemManager::reset()
 {
@@ -150,14 +150,21 @@ void GameClient::init() {}
     if (-not (Test-DisplayShutdownLifecycleContract $baseManager $managerHeader $managerImplementation $displayImplementation $gameClientImplementation $true)) {
         throw 'The valid display shutdown-lifecycle fixture was rejected.'
     }
-    $lateMovie = $displayImplementation.Replace('    stopMovie();' + "`n", '').Replace(
+    $lateMovie = $displayImplementation.Replace('    stopMovie();', '').Replace(
         '    WW3D::Shutdown();', "    WW3D::Shutdown();`n    stopMovie();")
     if (Test-DisplayShutdownLifecycleContract $baseManager $managerHeader $managerImplementation $lateMovie $gameClientImplementation $true) {
         throw 'A movie texture released after renderer shutdown was accepted.'
     }
-    $lateSnow = $gameClientImplementation.Replace(
-        "    delete TheSnowManager;`n    delete TheDisplay;",
-        "    delete TheDisplay;`n    delete TheSnowManager;")
+    $lateSnow = @'
+GameClient::~GameClient()
+{
+    delete TheDisplay;
+    delete TheSnowManager;
+    delete TheDisplayStringManager;
+    delete TheFontLibrary;
+}
+void GameClient::init() {}
+'@
     if (Test-DisplayShutdownLifecycleContract $baseManager $managerHeader $managerImplementation $displayImplementation $lateSnow $true) {
         throw 'Snow resources released after display shutdown were accepted.'
     }
