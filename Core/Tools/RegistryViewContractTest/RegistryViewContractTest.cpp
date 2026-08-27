@@ -60,6 +60,8 @@ int main()
 	char readPath[192];
 	char writePath[192];
 	char nativePath[192];
+	// Some Windows Server WOW64 registry views reject volatile Classes keys.
+	const DWORD fixtureOptions = REG_OPTION_NON_VOLATILE;
 	_snprintf_s(readPath, sizeof(readPath), _TRUNCATE,
 		"Software\\Classes\\CLSID\\GGCRegistryReadView_%08lX_%04X_%04X_%02X%02X%02X%02X%02X%02X%02X%02X",
 		static_cast<unsigned long>(id.Data1), static_cast<unsigned int>(id.Data2),
@@ -88,7 +90,7 @@ int main()
 	HKEY key = nullptr;
 	DWORD disposition = 0;
 	CHECK(RegCreateKeyExA(HKEY_CURRENT_USER, readPath, 0, nullptr,
-		REG_OPTION_VOLATILE, KEY_WRITE | KEY_WOW64_32KEY,
+		fixtureOptions, KEY_WRITE | KEY_WOW64_32KEY,
 		nullptr, &key, &disposition) == ERROR_SUCCESS);
 	const bool readKeyCreated = key != nullptr && disposition == REG_CREATED_NEW_KEY;
 	CHECK(readKeyCreated);
@@ -124,7 +126,7 @@ int main()
 
 	disposition = 0;
 	CHECK(CreateNativeRegistryKey(HKEY_CURRENT_USER, nativePath, 0, nullptr,
-		REG_OPTION_VOLATILE, KEY_WRITE, nullptr, &key, &disposition) == ERROR_SUCCESS);
+		fixtureOptions, KEY_WRITE, nullptr, &key, &disposition) == ERROR_SUCCESS);
 	const bool nativeKeyCreated = key != nullptr && disposition == REG_CREATED_NEW_KEY;
 	CHECK(nativeKeyCreated);
 	if (nativeKeyCreated)
@@ -159,7 +161,7 @@ int main()
 
 	disposition = 0;
 	CHECK(CreateRetailRegistryKey(HKEY_CURRENT_USER, writePath, 0, nullptr,
-		REG_OPTION_VOLATILE, KEY_WRITE, nullptr, &key, &disposition) == ERROR_SUCCESS);
+		fixtureOptions, KEY_WRITE, nullptr, &key, &disposition) == ERROR_SUCCESS);
 	const bool writeKeyCreated = key != nullptr && disposition == REG_CREATED_NEW_KEY;
 	CHECK(writeKeyCreated);
 	if (writeKeyCreated)
