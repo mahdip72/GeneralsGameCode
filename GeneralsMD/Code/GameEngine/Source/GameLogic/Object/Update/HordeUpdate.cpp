@@ -85,7 +85,7 @@ public:
 		if (objOther->isEffectivelyDead())
 			return false;
 #endif
-		
+
 		// must be exact same type as us (well, maybe)
 		if (m_data->m_exactMatch && m_obj->getTemplate() != objOther->getTemplate())
 			return false;
