@@ -161,6 +161,29 @@ static bool isCommandNewerInSamePlayerGroup(const NetCommandMsg* newCommand, con
 		&& isCommandIdNewer(newCommand->getSortNumber(), oldCommand->getSortNumber());
 }
 
+static bool canUseLastMessageFastPath(const NetCommandMsg* command,
+	const NetCommandMsg* lastCommand, const NetCommandRef* nextCommandRef)
+{
+#if RETAIL_COMPATIBLE_NETWORKING
+	// Retail's cached insertion path compared command IDs even though the full
+	// scan used the polymorphic sort number. Preserve that quirk for existing
+	// replay/network compatibility; use the corrected ordering in modern mode.
+	return isCommandFromSamePlayerGroup(command, lastCommand)
+		&& isCommandIdNewer(command->getID(), lastCommand->getID())
+		&& (nextCommandRef == nullptr
+			|| nextCommandRef->getCommand()->getNetCommandType() > command->getNetCommandType()
+			|| nextCommandRef->getCommand()->getPlayerID() > command->getPlayerID()
+			|| isCommandIdNewer(nextCommandRef->getCommand()->getID(), command->getID()));
+#else
+	bool canInsertAfterLast = isCommandNewerInSamePlayerGroup(command, lastCommand);
+	if (canInsertAfterLast && nextCommandRef != nullptr)
+	{
+		canInsertAfterLast = isCommandNewer(nextCommandRef->getCommand(), command);
+	}
+	return canInsertAfterLast;
+#endif
+}
+
 /**
  * Insert sorts msg.  Assumes that all the previous message inserts were done using this function.
  * The message is sorted based first on command type, then player id, and then sort number.
@@ -197,14 +220,8 @@ NetCommandRef * NetCommandList::addMessage(NetCommandRef *&msg) {
 		NetCommandMsg* lastCommand = m_lastMessageInserted->getCommand();
 		NetCommandRef* nextCommandRef = m_lastMessageInserted->getNext();
 
-		// TheSuperHackers @bugfix CryoTheRenegade 03/08/2026 Keep both cached
-		// insertion boundaries consistent with the full scan's polymorphic sort key.
-		bool canInsertAfterLast = isCommandNewerInSamePlayerGroup(command, lastCommand);
-
-		if (canInsertAfterLast && nextCommandRef != nullptr)
-		{
-			canInsertAfterLast = isCommandNewer(nextCommandRef->getCommand(), command);
-		}
+		bool canInsertAfterLast = canUseLastMessageFastPath(
+			command, lastCommand, nextCommandRef);
 
 		if (canInsertAfterLast)
 		{
