@@ -31,6 +31,7 @@
 #include "Common/FramePacer.h"
 #include "Common/GameEngine.h"
 #include "Common/GameThreadOwnership.h"
+#include "Common/GlobalData.h"
 #include "Common/ReplaySimulation.h"
 #include "Common/SkirmishAITestRunner.h"
 
@@ -47,6 +48,8 @@ Int GameMain()
 	TheFramePacer->enableFramesPerSecondLimit(TRUE);
 	TheGameEngine = CreateGameEngine();
 	TheGameEngine->init();
+	if (TheGlobalData->m_commandLineData.hasSkirmishAITestRequest())
+		ArmSkirmishAITestRunner(TheGlobalData->m_commandLineData.getSkirmishAITestSeed());
 	const Bool canRun = StartSkirmishAITestRunner();
 
 	if (!canRun)

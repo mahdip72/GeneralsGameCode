@@ -15,6 +15,7 @@
 #include "GameNetwork/GameSpy/ThreadUtils.h"
 #include "Common/FrameRateLimit.h"
 #include "Common/GameMemory.h"
+#include "Common/GlobalData.h"
 #include "Common/SkirmishAITestRunner.h"
 #include "Common/SkirmishAIReplayEpoch.h"
 #include "Common/PathfindQueueReplayEpoch.h"
@@ -848,6 +849,13 @@ static void TestSkirmishAIFeedbackPolicies()
 
 static void TestSkirmishAITestRunnerContract()
 {
+	CommandLineData commandLineData;
+	CHECK(!commandLineData.hasSkirmishAITestRequest());
+	CHECK(commandLineData.getSkirmishAITestSeed() == 0);
+	commandLineData.requestSkirmishAITest(1729);
+	CHECK(commandLineData.hasSkirmishAITestRequest());
+	CHECK(commandLineData.getSkirmishAITestSeed() == 1729);
+
 	CHECK(!IsSkirmishAITestRunnerArmed());
 	CHECK(!ShouldBypassFramePacingForSkirmishAITest(FALSE));
 	CHECK(ShouldBypassFramePacingForSkirmishAITest(TRUE));

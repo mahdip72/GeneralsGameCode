@@ -59,13 +59,27 @@ class CommandLineData
 	friend class CommandLine;
 	friend class GlobalData;
 
+public:
 	CommandLineData()
 		: m_hasParsedCommandLineForStartup(false)
 		, m_hasParsedCommandLineForEngineInit(false)
+		, m_hasSkirmishAITestRequest(false)
+		, m_skirmishAITestSeed(0)
 	{}
 
+	Bool hasSkirmishAITestRequest() const { return m_hasSkirmishAITestRequest; }
+	Int getSkirmishAITestSeed() const { return m_skirmishAITestSeed; }
+	void requestSkirmishAITest(Int seed)
+	{
+		m_hasSkirmishAITestRequest = true;
+		m_skirmishAITestSeed = seed;
+	}
+
+private:
 	Bool m_hasParsedCommandLineForStartup;
 	Bool m_hasParsedCommandLineForEngineInit;
+	Bool m_hasSkirmishAITestRequest;
+	Int m_skirmishAITestSeed;
 };
 
 //-------------------------------------------------------------------------------------------------

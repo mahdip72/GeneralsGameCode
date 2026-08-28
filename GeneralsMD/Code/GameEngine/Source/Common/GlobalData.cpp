@@ -1117,6 +1117,11 @@ GlobalData *GlobalData::newOverride()
 	DEBUG_ASSERTCRASH( TheWritableGlobalData, ("GlobalData::newOverride() - no existing data") );
 	*overrideData = *TheWritableGlobalData;
 
+	// The VC6 GlobalData assignment operator intentionally leaves the object unchanged.
+	// Preserve the two-phase command-line state explicitly so startup-only requests
+	// survive the INI override created during engine initialization.
+	overrideData->m_commandLineData = TheWritableGlobalData->m_commandLineData;
+
 	//
 	// link the override to the previously created one, the link order is important here
 	// for the reset function, if you change the way things are linked
