@@ -27,6 +27,28 @@
 #include "Common/BezierSegment.h"
 #include "Common/BezFwdIterator.h"
 
+#if defined(_MSC_VER) && _MSC_VER < 1300 && defined(_M_IX86)
+#include <float.h>
+#endif
+
+#if !(defined(_MSC_VER) && _MSC_VER < 1300 && defined(_M_IX86))
+namespace
+{
+Real evaluateLegacyControlPointDot(Real point0, Real point1, Real point2, Real point3,
+	const float weights[4])
+{
+	// VC6 accumulated this dot product from w through x in the x87 register
+	// stack. Use explicit double steps so modern SSE builds retain that final
+	// rounding instead of reassociating the expression in float precision.
+	volatile double result = static_cast<double>(point3) * static_cast<double>(weights[3]);
+	result += static_cast<double>(point2) * static_cast<double>(weights[2]);
+	result += static_cast<double>(point1) * static_cast<double>(weights[1]);
+	result += static_cast<double>(point0) * static_cast<double>(weights[0]);
+	return static_cast<Real>(result);
+}
+}
+#endif
+
 //-------------------------------------------------------------------------------------------------
 BezierSegment::BezierSegment()
 {
@@ -100,11 +122,21 @@ void BezierSegment::evaluateBezSegmentAtT(Real tValue, Coord3D *outResult) const
 	if (!outResult)
 		return;
 
+#if defined(_MSC_VER) && _MSC_VER < 1300 && defined(_M_IX86)
+	// The legacy constructor materialized t^2 before multiplying by t, while
+	// VC6 otherwise keeps this replacement expression in extended precision.
+	const unsigned int previousControl = _control87(0, 0);
+	_control87(_PC_24, _MCW_PC);
+#endif
 	const float tSquared = tValue * tValue;
 	const float tVector[4] = { tValue * tSquared, tSquared, tValue, 1.0f };
 	float tResult[4];
 	transformBasis(tVector, tResult);
+#if defined(_MSC_VER) && _MSC_VER < 1300 && defined(_M_IX86)
+	_control87(previousControl, _MCW_PC);
+#endif
 
+#if defined(_MSC_VER) && _MSC_VER < 1300 && defined(_M_IX86)
 	outResult->x = m_controlPoints[0].x * tResult[0]
 		+ m_controlPoints[1].x * tResult[1]
 		+ m_controlPoints[2].x * tResult[2]
@@ -117,6 +149,14 @@ void BezierSegment::evaluateBezSegmentAtT(Real tValue, Coord3D *outResult) const
 		+ m_controlPoints[1].z * tResult[1]
 		+ m_controlPoints[2].z * tResult[2]
 		+ m_controlPoints[3].z * tResult[3];
+#else
+	outResult->x = evaluateLegacyControlPointDot(m_controlPoints[0].x, m_controlPoints[1].x,
+		m_controlPoints[2].x, m_controlPoints[3].x, tResult);
+	outResult->y = evaluateLegacyControlPointDot(m_controlPoints[0].y, m_controlPoints[1].y,
+		m_controlPoints[2].y, m_controlPoints[3].y, tResult);
+	outResult->z = evaluateLegacyControlPointDot(m_controlPoints[0].z, m_controlPoints[1].z,
+		m_controlPoints[2].z, m_controlPoints[3].z, tResult);
+#endif
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -250,13 +290,25 @@ const float BezierSegment::s_bezBasisMatrix[4][4] = {
 
 void BezierSegment::transformBasis(const float input[4], float output[4])
 {
-	// D3DXVec4Transform treats the input as a row vector and writes one
-	// output component from each matrix column.  Preserve that convention
-	// exactly while keeping the operation independent of D3DX.
+	// D3DXVec4Transform used two pairwise SSE additions. Preserve its
+	// single-precision rounding points as well as its row-vector convention;
+	// replay flight paths depend on the resulting bits.
+#if defined(_MSC_VER) && _MSC_VER < 1300 && defined(_M_IX86)
+	// VC6 otherwise evaluates these expressions with extended x87 precision,
+	// unlike the single-precision SSE instructions used by D3DXVec4Transform.
+	const unsigned int previousControl = _control87(0, 0);
+	_control87(_PC_24, _MCW_PC);
+#endif
 	for (int column = 0; column < 4; ++column) {
-		output[column] = input[0] * s_bezBasisMatrix[0][column]
-			+ input[1] * s_bezBasisMatrix[1][column]
-			+ input[2] * s_bezBasisMatrix[2][column]
-			+ input[3] * s_bezBasisMatrix[3][column];
+		const volatile float product0 = input[0] * s_bezBasisMatrix[0][column];
+		const volatile float product1 = input[1] * s_bezBasisMatrix[1][column];
+		const volatile float product2 = input[2] * s_bezBasisMatrix[2][column];
+		const volatile float product3 = input[3] * s_bezBasisMatrix[3][column];
+		const volatile float firstPair = product0 + product1;
+		const volatile float secondPair = product2 + product3;
+		output[column] = firstPair + secondPair;
 	}
+#if defined(_MSC_VER) && _MSC_VER < 1300 && defined(_M_IX86)
+	_control87(previousControl, _MCW_PC);
+#endif
 }

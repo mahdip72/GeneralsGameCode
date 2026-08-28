@@ -17,6 +17,7 @@ if(RTS_BUILD_CORE_EXTRAS)
         add_subdirectory(NativeW3D2Test)
     endif()
     add_subdirectory(JobSystemTest)
+    add_subdirectory(BezierLegacyParityTest)
 
     if(WIN32)
         add_test(NAME core_portability_audit

@@ -90,9 +90,26 @@ void BezFwdIterator::start()
 			pDDD = &mDDDq.x;
 		}
 
+#if defined(_MSC_VER) && _MSC_VER < 1300 && defined(_M_IX86)
+		// The D3DX-era VC6 build rounded b*d2 to float before accumulating
+		// the forward differences. Preserve that spill and addition order for
+		// legacy replay comparisons while the modern builds retain their path.
+		const volatile float roundedBD2 = b * d2;
+		float dq = c * d;
+		dq += roundedBD2;
+		dq += a * d3;
+		(*pD) = dq;
+
+		float ddq = roundedBD2;
+		ddq += roundedBD2;
+		ddq += (a * d3) * 6.0f;
+		(*pDD) = ddq;
+		(*pDDD) = (a * d3) * 6.0f;
+#else
 		(*pD) = a * d3 + b * d2 + c * d;
 		(*pDD) = 6 * a * d3 + 2 * b * d2;
 		(*pDDD) = 6 * a * d3;
+#endif
 	}
 }
 
