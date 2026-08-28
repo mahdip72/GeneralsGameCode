@@ -205,6 +205,7 @@ MilesAudioManager::MilesAudioManager() :
 	m_selectedSpeakerType(0),
 	m_lastProvider(PROVIDER_ERROR),
 	m_digitalHandle(nullptr),
+	m_headlessWaveOut(FALSE),
 	m_num2DSamples(0),
 	m_num3DSamples(0),
 	m_numStreams(0),
@@ -1652,10 +1653,36 @@ void MilesAudioManager::openDevice()
 	const AudioSettings *audioSettings = getAudioSettings();
 	m_selectedSpeakerType = TheAudio->translateSpeakerTypeToUnsignedInt(m_prefSpeaker);
 
-	retval = AIL_quick_startup(audioSettings->m_useDigital, audioSettings->m_useMidi, audioSettings->m_outputRate, audioSettings->m_outputBits, audioSettings->m_outputChannels);
+	if (TheGlobalData->m_headless)
+	{
+		// Quick startup forces DirectSound cooperative-window ownership. Use
+		// WaveOut for headless/locked sessions while retaining Miles stream
+		// metadata queries required by deterministic scripts.
+		WAVEFORMATEX format;
+		memset(&format, 0, sizeof(format));
+		format.wFormatTag = WAVE_FORMAT_PCM;
+		format.nChannels = static_cast<WORD>(audioSettings->m_outputChannels);
+		format.nSamplesPerSec = audioSettings->m_outputRate;
+		format.wBitsPerSample = static_cast<WORD>(audioSettings->m_outputBits);
+		format.nBlockAlign = static_cast<WORD>(
+			format.nChannels * format.wBitsPerSample / 8);
+		format.nAvgBytesPerSec = format.nSamplesPerSec * format.nBlockAlign;
+		AIL_set_preference(DIG_USE_WAVEOUT, TRUE);
+		retval = AIL_waveOutOpen(&m_digitalHandle, nullptr, 0,
+			reinterpret_cast<LPWAVEFORMAT>(&format)) == AIL_NO_ERROR;
+		m_headlessWaveOut = retval != 0;
+		if (!m_headlessWaveOut) m_digitalHandle = nullptr;
+	}
+	else
+	{
+		retval = AIL_quick_startup(audioSettings->m_useDigital,
+			audioSettings->m_useMidi, audioSettings->m_outputRate,
+			audioSettings->m_outputBits, audioSettings->m_outputChannels);
 
-	// Quick handles tells us where to store the various devices. For now, we're only interested in the digital handle.
-	AIL_quick_handles(&m_digitalHandle, nullptr, nullptr);
+		// Quick handles tells us where to store the various devices. For now,
+		// we're only interested in the digital handle.
+		AIL_quick_handles(&m_digitalHandle, nullptr, nullptr);
+	}
 
 	if (retval) {
 		buildProviderList();
@@ -1684,6 +1711,12 @@ void MilesAudioManager::closeDevice()
 	s_audioCompletionQueue.close();
 	freeAllMilesHandles();
 	unselectProvider();
+	if (m_headlessWaveOut && m_digitalHandle != nullptr)
+	{
+		AIL_waveOutClose(m_digitalHandle);
+		m_digitalHandle = nullptr;
+		m_headlessWaveOut = FALSE;
+	}
 	AIL_shutdown();
 	s_audioCompletionQueue.clear();
 }

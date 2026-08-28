@@ -59,11 +59,13 @@
 #include "Common/Science.h"
 #include "Common/FunctionLexicon.h"
 #include "Common/CommandLine.h"
+#include "Lib/JobSystem.h"
 
 #include "rts/profile.h"
 #include "Common/DamageFX.h"
 #include "Common/MultiplayerSettings.h"
 #include "Common/Recorder.h"
+#include "Common/SkirmishAITestRunner.h"
 #include "Common/SpecialPower.h"
 #include "Common/TerrainTypes.h"
 #include "Common/Upgrade.h"
@@ -274,6 +276,8 @@ GameEngine::~GameEngine()
 	// TheSuperHackers @fix helmutbuhler 03/06/2025
 	// Reset all subsystems before deletion to prevent crashing due to cross dependencies.
 	reset();
+	// Drain compute jobs and owner completions while their subsystem owners are alive.
+	rts::JobSystem::instance().shutdown();
 
 	TheSubsystemList->shutdownAll();
 	delete TheSubsystemList;
@@ -355,6 +359,12 @@ void GameEngine::init()
 {
 	ASSERT_GAME_THREAD("GameEngine::init");
 	try {
+		if (!TheGlobalData->m_headless &&
+			!rts::JobSystem::instance().ensureStarted())
+		{
+			DEBUG_LOG(("JobSystem startup failed; parallel consumers will use their serial fallback."));
+		}
+
 		//create an INI object to use for loading stuff
 		INI ini;
 
@@ -1008,6 +1018,7 @@ void GameEngine::execute()
 				{
 					// compute a frame
 					update();
+					UpdateSkirmishAITestRunner();
 				}
 				catch (INIException e)
 				{

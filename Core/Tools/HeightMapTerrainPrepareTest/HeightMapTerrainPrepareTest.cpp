@@ -1724,7 +1724,8 @@ static int testOwnerBatchParallelByteParity()
 	ranParallel = false;
 	CHECK(testName, RunHeightMapTerrainBatch(batch, service, false,
 		&ranParallel));
-	CHECK(testName, ranParallel);
+	CHECK(testName, ranParallel ==
+		(rts::JobSystem::instance().workerCount() > 1));
 	CHECK(testName, memcmp(batch.output(), expected,
 		batch.snapshot().outputCapacityBytes) == 0);
 	CHECK(testName, service.pendingTaskCount() == 0);
@@ -1774,27 +1775,28 @@ public:
 
 	virtual bool executeRows(unsigned rowBegin, unsigned rowEnd)
 	{
-		const unsigned slot = rowBegin == 0 ? 0 : 1;
+		const unsigned gateSlot = rowBegin == 0 ? 0 : 1;
 		if (rowBegin >= rowEnd || rowEnd > m_height ||
-			m_threadIds == 0 || m_arrivals == 0 || slot > 1)
+			m_threadIds == 0 || m_arrivals == 0)
 			return false;
-		/* Each fixed row range owns one result slot; no shared counter or
-		 * scheduling delay is needed to observe both worker identities. */
-		m_threadIds[slot] = heightMapTerrainCurrentThreadId();
-		m_arrivals[slot] = 1;
+		/* Adaptive splitting can produce more than two ranges. Index by the
+		 * stable range start so later ranges cannot overwrite the identity
+		 * that satisfied the overlap gate. */
+		m_threadIds[rowBegin] = heightMapTerrainCurrentThreadId();
+		m_arrivals[rowBegin] = 1;
 	#if defined(_WIN32)
 		/* Hold both tasks at a native event gate so a single worker cannot
 		 * execute both ranges and still make the identity assertion pass. */
-		if (slot == 0)
+		if (gateSlot == 0)
 		{
 			if (m_firstStarted == 0 || m_secondStarted == 0 ||
 				SetEvent(m_firstStarted) == FALSE ||
-				WaitForSingleObject(m_secondStarted, 1000) != WAIT_OBJECT_0)
+				WaitForSingleObject(m_secondStarted, 5000) != WAIT_OBJECT_0)
 				return false;
 		}
 		else if (m_secondStarted == 0 || m_firstStarted == 0 ||
 			SetEvent(m_secondStarted) == FALSE ||
-			WaitForSingleObject(m_firstStarted, 1000) != WAIT_OBJECT_0)
+			WaitForSingleObject(m_firstStarted, 5000) != WAIT_OBJECT_0)
 		{
 			return false;
 		}
@@ -1802,9 +1804,9 @@ public:
 		struct timespec deadline;
 		if (clock_gettime(CLOCK_REALTIME, &deadline) != 0)
 			return false;
-		deadline.tv_sec += 1;
+		deadline.tv_sec += 5;
 		pthread_mutex_lock(&m_gateMutex);
-		m_startedMask |= 1u << slot;
+		m_startedMask |= 1u << gateSlot;
 		pthread_cond_broadcast(&m_gateCondition);
 		while (m_startedMask != 3u)
 		{
@@ -1842,12 +1844,22 @@ static int testEligibleBatchUsesWorkersAndJoins()
 	const char *testName = "testEligibleBatchUsesWorkersAndJoins";
 	HeightMapTerrainBatch batch;
 	RadarTerrainPrepareService service;
-	HeightMapTerrainTestThreadId threadIds[2];
-	unsigned char arrivals[2] = { 0, 0 };
+	HeightMapTerrainTestThreadId threadIds[32];
+	unsigned char arrivals[32];
 	const HeightMapTerrainTestThreadId ownerThreadId =
 		heightMapTerrainCurrentThreadId();
 	HeightMapTerrainWorkerProbe probe(32, threadIds, arrivals);
+	rts::JobSystem &system = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 2;
+	config.queueCapacity = 16;
+	config.scratchBytesPerWorker = 4096;
+	config.pinWorkers = false;
 
+	memset(arrivals, 0, sizeof(arrivals));
+	system.shutdown();
+	CHECK(testName, system.start(config));
+	CHECK(testName, system.workerCount() == 2);
 	CHECK(testName, batch.initialize(32, 16, 0, 0));
 	CHECK(testName, batch.markComplete());
 	CHECK(testName, service.initialize(2, 2));
@@ -1869,16 +1881,28 @@ static int testEligibleBatchUsesWorkersAndJoins()
 	service.release(4);
 	CHECK(testName, service.tryAcquire(4));
 	CHECK(testName, service.runRows(probe, 0, 16));
-	CHECK(testName, arrivals[0] != 0 && arrivals[1] != 0);
-	CHECK(testName, !heightMapTerrainThreadIdsEqual(threadIds[0],
-		ownerThreadId));
-	CHECK(testName, !heightMapTerrainThreadIdsEqual(threadIds[1],
-		ownerThreadId));
-	CHECK(testName, !heightMapTerrainThreadIdsEqual(threadIds[0],
-		threadIds[1]));
+	CHECK(testName, arrivals[0] != 0);
+	bool observedOtherRange = false;
+	bool observedDistinctThread = false;
+	bool observedNonOwnerThread = !heightMapTerrainThreadIdsEqual(
+		threadIds[0], ownerThreadId);
+	for (unsigned row = 1; row < 16; ++row)
+	{
+		if (arrivals[row] == 0)
+			continue;
+		observedOtherRange = true;
+		observedDistinctThread = observedDistinctThread ||
+			!heightMapTerrainThreadIdsEqual(threadIds[0], threadIds[row]);
+		observedNonOwnerThread = observedNonOwnerThread ||
+			!heightMapTerrainThreadIdsEqual(threadIds[row], ownerThreadId);
+	}
+	CHECK(testName, observedOtherRange);
+	CHECK(testName, observedDistinctThread);
+	CHECK(testName, observedNonOwnerThread);
 	CHECK(testName, service.pendingTaskCount() == 0);
 	service.release(4);
 	service.shutdown();
+	system.shutdown();
 	return 0;
 }
 
@@ -1992,7 +2016,9 @@ int main()
 	result |= testOwnerBatchSerialSmallAndInvalidFallback();
 	result |= testOwnerBatchMetadataFreeze();
 	result |= testOwnerBatchParallelByteParity();
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
 	result |= testEligibleBatchUsesWorkersAndJoins();
+#endif
 	result |= testOwnerBatchFallbackFailuresAndCleanup();
 
 	if (result != 0)

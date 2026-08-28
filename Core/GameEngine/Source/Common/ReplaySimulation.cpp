@@ -26,6 +26,7 @@
 #include "Common/WorkerProcess.h"
 #include "GameLogic/GameLogic.h"
 #include "GameClient/GameClient.h"
+#include "Lib/JobSystem.h"
 
 
 Bool ReplaySimulation::s_isRunning = false;
@@ -168,12 +169,26 @@ int ReplaySimulation::simulateReplaysInWorkerProcesses(const std::vector<AsciiSt
 		{
 			UnicodeString filenameWide;
 			filenameWide.translate(filenames[filenamePositionStarted]);
+			const rts::JobSystemConfig jobConfig = rts::JobSystem::startupConfig();
+			const WideChar *workerPolicy = jobConfig.workerPolicy ==
+				rts::JOB_WORKER_POLICY_ALL ? L"all" : L"auto";
 			UnicodeString command;
-			command.format(L"\"%s\"%s%s -replay \"%s\"",
-				exePath,
-				TheGlobalData->m_windowed ? L" -win" : L"",
-				TheGlobalData->m_headless ? L" -headless" : L"",
-				filenameWide.str());
+			if (jobConfig.workerCount != 0)
+			{
+				command.format(L"\"%s\"%s%s -workerCount %u -workerPolicy %s -replay \"%s\"",
+					exePath,
+					TheGlobalData->m_windowed ? L" -win" : L"",
+					TheGlobalData->m_headless ? L" -headless" : L"",
+					jobConfig.workerCount, workerPolicy, filenameWide.str());
+			}
+			else
+			{
+				command.format(L"\"%s\"%s%s -workerPolicy %s -replay \"%s\"",
+					exePath,
+					TheGlobalData->m_windowed ? L" -win" : L"",
+					TheGlobalData->m_headless ? L" -headless" : L"",
+					workerPolicy, filenameWide.str());
+			}
 
 			processes.push_back(WorkerProcess());
 			processes.back().startProcess(command);

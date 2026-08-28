@@ -52,8 +52,7 @@ class Targa;
 class TextureLoadTaskListClass;
 namespace rts
 {
-	class Task;
-	class TaskRuntime;
+	class Job;
 }
 
 class TextureLoader
@@ -88,6 +87,7 @@ public:
 	static void Request_Foreground_Loading(TextureBaseClass* tc);
 
 	static void	Flush_Pending_Load_Tasks();
+	static void Discard_Pending_Background_Load_Tasks();
 	static void Update(void(*network_callback)() = nullptr);
 
 	// returns true if current thread of execution is allowed to make DX8 calls.
@@ -172,8 +172,9 @@ class SynchronizedTextureLoadTaskListClass : public TextureLoadTaskListClass
 		void									Publish_Completed(TextureLoadTaskClass *task);
 		void									Publish_Failed	(TextureLoadTaskClass *task);
 		void									Publish_Thumbnail(TextureLoadTaskClass *task, TextureLoadTaskClass *loadTask);
-		rts::Task*							Take_Prepare_Task(TextureLoadTaskClass *task,
-			rts::TaskRuntime& runtime, bool& wasSubmitted);
+		bool								Has_Prepare_Job(TextureLoadTaskClass *task);
+		void								Set_Prepare_Job(TextureLoadTaskClass *task, void *prepareJob);
+		bool								Promote_Prepare_Job(TextureLoadTaskClass *task);
 		TextureLoadTaskClass *			Pop_Front	();
 		TextureLoadTaskClass *			Pop_Back		();
 		void									Remove		(TextureLoadTaskClass *task);

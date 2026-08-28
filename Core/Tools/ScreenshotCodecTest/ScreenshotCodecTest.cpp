@@ -1,5 +1,5 @@
 #include "W3DDevice/GameClient/W3DScreenshotCodec.h"
-#include "Lib/TaskRuntime.h"
+#include "Lib/JobSystem.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -66,14 +66,14 @@ static void convertFullImage(const ScreenshotPixelSource &source, unsigned char 
 	ConvertScreenshotRows(source, 0, source.height, destination);
 }
 
-class TwoWorkerGate
+class WorkerGate
 {
 public:
-	TwoWorkerGate()
+	explicit WorkerGate(unsigned targetCount)
 #if defined(_WIN32)
-		: m_twoEntered(CreateEvent(0, TRUE, FALSE, 0)),
+		: m_targetEntered(CreateEvent(0, TRUE, FALSE, 0)),
 		  m_open(CreateEvent(0, TRUE, FALSE, 0)),
-		  m_enteredCount(0)
+		  m_enteredCount(0), m_targetCount(targetCount)
 #endif
 	{
 #if !defined(_WIN32)
@@ -81,15 +81,16 @@ public:
 		pthread_cond_init(&m_condition, 0);
 		m_enteredCount = 0;
 		m_open = false;
+		m_targetCount = targetCount;
 #endif
 	}
 
-	~TwoWorkerGate()
+	~WorkerGate()
 	{
 #if defined(_WIN32)
-		if (m_twoEntered != 0)
+		if (m_targetEntered != 0)
 		{
-			CloseHandle(m_twoEntered);
+			CloseHandle(m_targetEntered);
 		}
 		if (m_open != 0)
 		{
@@ -104,9 +105,10 @@ public:
 	void enterAndWait()
 	{
 #if defined(_WIN32)
-		if (InterlockedIncrement(&m_enteredCount) >= 2 && m_twoEntered != 0)
+		if (InterlockedIncrement(&m_enteredCount) >= (LONG)m_targetCount &&
+			m_targetEntered != 0)
 		{
-			SetEvent(m_twoEntered);
+			SetEvent(m_targetEntered);
 		}
 		if (m_open != 0)
 		{
@@ -129,11 +131,11 @@ public:
 #endif
 	}
 
-	bool waitForTwoEntries(unsigned timeoutMilliseconds)
+	bool waitForTargetEntries(unsigned timeoutMilliseconds)
 	{
 #if defined(_WIN32)
-		return m_twoEntered != 0 && m_open != 0 &&
-			WaitForSingleObject(m_twoEntered, timeoutMilliseconds) == WAIT_OBJECT_0;
+		return m_targetEntered != 0 && m_open != 0 &&
+			WaitForSingleObject(m_targetEntered, timeoutMilliseconds) == WAIT_OBJECT_0;
 #else
 		struct timespec deadline;
 		int waitResult = 0;
@@ -141,11 +143,11 @@ public:
 
 		deadlineAfter(timeoutMilliseconds, deadline);
 		pthread_mutex_lock(&m_mutex);
-		while (m_enteredCount < 2 && waitResult == 0)
+		while (m_enteredCount < m_targetCount && waitResult == 0)
 		{
 			waitResult = pthread_cond_timedwait(&m_condition, &m_mutex, &deadline);
 		}
-		reached = m_enteredCount >= 2;
+		reached = m_enteredCount >= m_targetCount;
 		pthread_mutex_unlock(&m_mutex);
 		return reached;
 #endif
@@ -167,18 +169,20 @@ public:
 	}
 
 private:
-	TwoWorkerGate(const TwoWorkerGate &);
-	TwoWorkerGate &operator=(const TwoWorkerGate &);
+	WorkerGate(const WorkerGate &);
+	WorkerGate &operator=(const WorkerGate &);
 
 #if defined(_WIN32)
-	HANDLE m_twoEntered;
+	HANDLE m_targetEntered;
 	HANDLE m_open;
 	LONG m_enteredCount;
+	unsigned m_targetCount;
 #else
 	pthread_mutex_t m_mutex;
 	pthread_cond_t m_condition;
 	unsigned m_enteredCount;
 	bool m_open;
+	unsigned m_targetCount;
 #endif
 };
 
@@ -213,6 +217,7 @@ static int testRowRangePlanning()
 	CHECK(testName, checkRanges(127, 2, 1, testName) == 0);
 	CHECK(testName, checkRanges(128, 2, 2, testName) == 0);
 	CHECK(testName, checkRanges(1080, 2, 4, testName) == 0);
+	CHECK(testName, checkRanges(1080, 8, 16, testName) == 0);
 	CHECK(testName, checkRanges(1080, 1, 1, testName) == 0);
 	CHECK(testName, BuildScreenshotRowRanges(1080, 2, &range, 1) == 1);
 	CHECK(testName, range.yBegin == 0 && range.yEnd == 1080);
@@ -222,16 +227,16 @@ static int testRowRangePlanning()
 	return 0;
 }
 
-class ConvertRangeTask : public rts::Task
+class ConvertRangeTask : public rts::Job
 {
 public:
 	ConvertRangeTask(const ScreenshotPixelSource &source, const ScreenshotRowRange &range,
-		unsigned char *destination, TwoWorkerGate *gate)
+		unsigned char *destination, WorkerGate *gate)
 		: m_source(source), m_range(range), m_destination(destination), m_gate(gate)
 	{
 	}
 
-	virtual void execute()
+	virtual void execute(rts::JobContext &)
 	{
 		m_gate->enterAndWait();
 		ConvertScreenshotRows(m_source, m_range.yBegin, m_range.yEnd, m_destination);
@@ -241,39 +246,69 @@ private:
 	ScreenshotPixelSource m_source;
 	ScreenshotRowRange m_range;
 	unsigned char *m_destination;
-	TwoWorkerGate *m_gate;
+	WorkerGate *m_gate;
 };
 
 static int checkParallelConversion(const ScreenshotPixelSource &source, const char *testName)
 {
 	ScreenshotRowRange ranges[16];
-	rts::Task *tasks[16];
+	rts::Job *tasks[16];
+	rts::JobSubmission submissions[16];
+	rts::JobHandle handles[16];
 	const unsigned byteCount = source.width * source.height * 3;
 	unsigned char *serial = new unsigned char[byteCount];
 	unsigned char *striped = new unsigned char[byteCount];
-	rts::TaskRuntime runtime;
-	TwoWorkerGate gate;
+	rts::JobSystem &system = rts::JobSystem::instance();
+	const unsigned workerCounts[] = { 1, 2, 4, 8, 16 };
 	unsigned rangeCount;
 	unsigned index;
+	unsigned workerIndex;
 	int result = 0;
 
 	memset(serial, 0, byteCount);
-	memset(striped, 0xCD, byteCount);
 	convertFullImage(source, serial);
-	if (!runtime.start(2, 16))
+	system.shutdown();
+	for (workerIndex = 0;
+		workerIndex < sizeof(workerCounts) / sizeof(workerCounts[0]);
+		++workerIndex)
 	{
-		fprintf(stderr, "%s: failed to start task runtime\n", testName);
-		result = 1;
-	}
-	else
-	{
-		rangeCount = BuildScreenshotRowRanges(source.height, runtime.workerCount(),
+		memset(striped, 0xCD, byteCount);
+		rts::JobSystemConfig config;
+		config.workerCount = workerCounts[workerIndex];
+		config.queueCapacity = 16;
+		config.scratchBytesPerWorker = 4096;
+		config.pinWorkers = false;
+		if (!system.start(config))
+		{
+			fprintf(stderr, "%s: failed to start %u-worker runtime\n",
+				testName, workerCounts[workerIndex]);
+			result = 1;
+			continue;
+		}
+		const unsigned actualWorkerCount = system.workerCount();
+		const unsigned observedTarget = actualWorkerCount > 3 ?
+			3 : actualWorkerCount;
+		WorkerGate gate(observedTarget);
+		result |= check(actualWorkerCount != 0 &&
+			actualWorkerCount <= workerCounts[workerIndex], testName,
+			"screenshot worker count respects the requested upper bound");
+		if (actualWorkerCount == 1)
+		{
+			/* The VC6 oracle and forced-reference mode execute submissions
+			 * synchronously, so their single range must not wait on its caller. */
+			gate.open();
+		}
+		rangeCount = BuildScreenshotRowRanges(source.height, actualWorkerCount,
 			ranges, sizeof(ranges) / sizeof(ranges[0]));
+		rts::JobGroup group = system.createGroup();
 		for (index = 0; index < rangeCount; ++index)
 		{
 			tasks[index] = new ConvertRangeTask(source, ranges[index], striped, &gate);
+			submissions[index].job = tasks[index];
+			submissions[index].priority = rts::JOB_PRIORITY_BACKGROUND;
 		}
-		if (!runtime.trySubmitBatch(tasks, rangeCount))
+		if (!group.isValid() || !system.trySubmitBatch(submissions, rangeCount,
+			group, handles))
 		{
 			fprintf(stderr, "%s: failed to submit conversion batch\n", testName);
 			for (index = 0; index < rangeCount; ++index)
@@ -284,13 +319,27 @@ static int checkParallelConversion(const ScreenshotPixelSource &source, const ch
 		}
 		else
 		{
-			const bool usedTwoWorkers = gate.waitForTwoEntries(TWO_WORKER_GATE_TIMEOUT_MS);
+			const bool reachedConfiguredConcurrency =
+				gate.waitForTargetEntries(TWO_WORKER_GATE_TIMEOUT_MS);
 			gate.open();
-			runtime.waitUntilIdle();
-			result |= check(usedTwoWorkers, testName, "two conversion tasks entered concurrently");
+			const bool waited = system.wait(group);
+			bool handlesSucceeded = true;
+			for (index = 0; index < rangeCount; ++index)
+			{
+				handlesSucceeded = handlesSucceeded && handles[index].isValid() &&
+					handles[index].succeeded();
+			}
+			result |= check(waited && !group.failed() && !group.wasCancelled() &&
+				handlesSucceeded, testName,
+				"conversion scheduler group and handles complete successfully");
+			result |= check(reachedConfiguredConcurrency, testName,
+				"conversion tasks use the configured worker-count matrix");
+			result |= check(system.metrics().maximumActiveWorkers >= observedTarget,
+				testName,
+				"screenshot telemetry observes configured concurrency");
 			result |= checkBytes(striped, serial, byteCount, testName);
 		}
-		runtime.shutdown();
+		system.shutdown();
 	}
 
 	delete[] serial;

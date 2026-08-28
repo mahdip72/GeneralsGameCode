@@ -460,7 +460,7 @@ bool RadarOverlayPrepareLease::runRows(RadarPrepareRowWork &work,
 		m_active = m_service->tryAcquire(m_consumerId);
 	}
 
-	if (m_active && m_service->runRows(&work, rowBegin, rowEnd))
+	if (m_active && m_service->runRows(&work, rowBegin, rowEnd, 0))
 	{
 		return true;
 	}

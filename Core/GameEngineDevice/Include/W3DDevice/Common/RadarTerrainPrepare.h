@@ -10,7 +10,7 @@
 
 #pragma once
 
-#include "Lib/TaskRuntime.h"
+#include "Lib/JobSystem.h"
 #include "Lib/RadarTerrainKernel.h"
 
 class W3DRadar;
@@ -96,8 +96,13 @@ struct RadarTerrainRowRange
 bool SplitRadarTerrainRowRanges(unsigned rowBegin, unsigned rowEnd,
 	RadarTerrainRowRange ranges[2]);
 
+/* Build a balanced, gap-free split without imposing a subsystem worker cap. */
+unsigned BuildRadarTerrainRowRanges(unsigned rowBegin, unsigned rowEnd,
+	unsigned desiredRangeCount, RadarTerrainRowRange *ranges,
+	unsigned rangeCapacity);
+
 /*
- * One private, synchronous render-preparation runtime.  The service owns no
+ * A synchronous client of the process-wide compute scheduler. The service owns no
  * raster data: a caller-owned snapshot and output buffer remain valid until
  * runRows returns.  Every lifecycle, lease, and run method is owner-thread
  * only and calls must never overlap.  A consumer must acquire before calling
@@ -110,25 +115,25 @@ public:
 	~RadarTerrainPrepareService();
 
 	/*
-	 * Production requests two workers.  One is an intentional degraded/test
-	 * configuration; capacity below two forces the serial fallback.
+	 * The worker count is retained only as a compatibility/configuration hint;
+	 * execution uses the shared scheduler's current topology-aware worker count.
 	 */
 	bool initialize(unsigned workerCount, unsigned queueCapacity);
-	/* Start private workers during interactive display initialization to avoid
-	 * a first-use hitch; headless replay defers this until first use. */
+	/* Start the shared scheduler during interactive display initialization to
+	 * avoid a first-use hitch; headless replay may defer this until first use. */
 	bool warmup();
 	bool tryAcquire(unsigned consumerId);
 
 	/* Returns true only when both row tasks completed successfully. */
 	bool runRows(RadarTerrainSnapshot *snapshot, unsigned char *output,
-		unsigned rowBegin, unsigned rowEnd);
+		unsigned rowBegin, unsigned rowEnd, bool *ranParallel = 0);
 	/* Generic row operation shared by later render-preparation consumers. */
 	bool runRows(RadarPrepareRowWork *work, unsigned rowBegin,
-		unsigned rowEnd);
+		unsigned rowEnd, bool *ranParallel = 0);
 	bool runRows(RadarPrepareRowWork &work, unsigned rowBegin,
-		unsigned rowEnd)
+		unsigned rowEnd, bool *ranParallel = 0)
 	{
-		return runRows(&work, rowBegin, rowEnd);
+		return runRows(&work, rowBegin, rowEnd, ranParallel);
 	}
 
 	void release(unsigned consumerId);
@@ -145,13 +150,10 @@ private:
 	RadarTerrainPrepareService(const RadarTerrainPrepareService &);
 	RadarTerrainPrepareService &operator=(const RadarTerrainPrepareService &);
 
-	bool startRuntime(unsigned workerCount);
 	bool runAttempt(RadarPrepareRowWork *work, unsigned rowBegin,
 		unsigned rowEnd,
-		unsigned workerCount);
-	void stopIdleRuntime();
+		unsigned desiredRangeCount, bool *ranParallel);
 
-	rts::TaskRuntime m_runtime;
 	unsigned m_requestedWorkers;
 	unsigned m_queueCapacity;
 	unsigned m_activeConsumer;

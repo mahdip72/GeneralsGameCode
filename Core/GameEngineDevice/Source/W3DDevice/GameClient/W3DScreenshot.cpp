@@ -21,7 +21,7 @@
 #include "Common/GlobalData.h"
 #include "GameClient/GameText.h"
 #include "GameClient/InGameUI.h"
-#include "Lib/TaskRuntime.h"
+#include "Lib/JobSystem.h"
 #include "WW3D2/dx8wrapper.h"
 #include "WW3D2/surfaceclass.h"
 #include "WWLib/mpsc_intrusive_queue.h"
@@ -201,7 +201,7 @@ private:
 	volatile LONG m_failed;
 };
 
-class ScreenshotConvertTask : public rts::Task
+class ScreenshotConvertTask : public rts::Job
 {
 public:
 	ScreenshotConvertTask(ScreenshotBatch* batch, unsigned yBegin, unsigned yEnd)
@@ -209,7 +209,7 @@ public:
 	{
 	}
 
-	virtual void execute()
+	virtual void execute(rts::JobContext &)
 	{
 		m_batch->convert(m_yBegin, m_yEnd);
 	}
@@ -225,34 +225,57 @@ class ScreenshotTaskService
 public:
 	void submit(ScreenshotBatch* batch)
 	{
-		if (!m_runtime.isRunning())
+		rts::JobSystem& system = rts::JobSystem::instance();
+		if (!system.ensureStarted())
 		{
-			SYSTEM_INFO systemInfo;
-			GetSystemInfo(&systemInfo);
-
-			unsigned workerCount = (unsigned)systemInfo.dwNumberOfProcessors;
-			if (workerCount < 1)
+			system.recordSerialFallback();
+			batch->setTaskCount(1);
+			batch->convert(0, batch->height());
+			return;
+		}
+		if (!m_group.isValid())
+		{
+			m_group = system.createGroup();
+			if (!m_group.isValid())
 			{
-				workerCount = 1;
-			}
-			else if (workerCount > 2)
-			{
-				workerCount = 2;
-			}
-
-			if (!m_runtime.start(workerCount, 4) &&
-				(workerCount == 1 || !m_runtime.start(1, 4)))
-			{
-				DEBUG_LOG(("Dropped screenshot %s because the screenshot task service could not start", batch->leafname()));
-				delete batch;
+				system.recordSerialFallback();
+				batch->setTaskCount(1);
+				batch->convert(0, batch->height());
 				return;
 			}
 		}
 
-		ScreenshotRowRange ranges[4];
-		rts::Task* tasks[4];
+		const unsigned workerCount = system.workerCount();
+		unsigned rangeCapacity = workerCount <= UINT_MAX / 2 ?
+			workerCount * 2 : workerCount;
+		if (rangeCapacity == 0)
+		{
+			rangeCapacity = 1;
+		}
+		ScreenshotRowRange* ranges = 0;
+		ScreenshotConvertTask** tasks = 0;
+		rts::JobSubmission* submissions = 0;
+		rts::JobHandle* handles = 0;
+		try
+		{
+			ranges = new ScreenshotRowRange[rangeCapacity];
+			tasks = new ScreenshotConvertTask*[rangeCapacity];
+			submissions = new rts::JobSubmission[rangeCapacity];
+			handles = new rts::JobHandle[rangeCapacity];
+		}
+		catch (...)
+		{
+			delete[] handles;
+			delete[] submissions;
+			delete[] tasks;
+			delete[] ranges;
+			system.recordSerialFallback();
+			batch->setTaskCount(1);
+			batch->convert(0, batch->height());
+			return;
+		}
 		const unsigned taskCount = BuildScreenshotRowRanges(batch->height(),
-			m_runtime.workerCount(), ranges, ARRAY_SIZE(ranges));
+			workerCount, ranges, rangeCapacity);
 		unsigned index;
 
 		for (index = 0; index < taskCount; ++index)
@@ -268,35 +291,52 @@ public:
 			}
 			if (tasks[index] == 0)
 			{
-				DEBUG_LOG(("Dropped screenshot %s because its conversion tasks could not be allocated", batch->leafname()));
 				while (index > 0)
 				{
 					delete tasks[--index];
 				}
-				delete batch;
+				delete[] handles;
+				delete[] submissions;
+				delete[] tasks;
+				delete[] ranges;
+				system.recordSerialFallback();
+				batch->setTaskCount(1);
+				batch->convert(0, batch->height());
 				return;
 			}
+			submissions[index].job = tasks[index];
+			submissions[index].priority = rts::JOB_PRIORITY_BACKGROUND;
 		}
 
 		batch->setTaskCount(taskCount);
-		if (!m_runtime.trySubmitBatch(tasks, taskCount))
+		if (taskCount == 0 || !system.trySubmitBatch(submissions, taskCount,
+			m_group, handles))
 		{
-			DEBUG_LOG(("Dropped screenshot %s because the screenshot task queue is full", batch->leafname()));
 			for (index = 0; index < taskCount; ++index)
 			{
 				delete tasks[index];
 			}
-			delete batch;
+			system.recordSerialFallback();
+			batch->setTaskCount(1);
+			batch->convert(0, batch->height());
 		}
+		delete[] handles;
+		delete[] submissions;
+		delete[] tasks;
+		delete[] ranges;
 	}
 
 	void shutdown()
 	{
-		m_runtime.shutdown();
+		if (m_group.isValid())
+		{
+			rts::JobSystem::instance().wait(m_group);
+			m_group = rts::JobGroup();
+		}
 	}
 
 private:
-	rts::TaskRuntime m_runtime;
+	rts::JobGroup m_group;
 };
 
 static ScreenshotTaskService s_screenshotTaskService;

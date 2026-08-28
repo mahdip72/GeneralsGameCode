@@ -925,7 +925,8 @@ void W3DDisplay::init()
 	ASSERT_GAME_THREAD("W3DDisplay::init radar preparation");
 	RadarTerrainPrepareService &radarPrepareService =
 		GetRadarTerrainPrepareService();
-	radarPrepareService.initialize(2, 2);
+	radarPrepareService.initialize(
+		rts::JobSystem::instance().workerCount(), 64);
 	/* Headless replay never renders terrain.  Defer worker creation until the
 	 * first owner-side preparation so replay teardown does not retain an idle
 	 * thread pool that the renderer never used. */
@@ -966,6 +967,8 @@ void W3DDisplay::reset()
 	}
 
 	m_isClippedEnabled = FALSE;
+
+	TextureLoader::Discard_Pending_Background_Load_Tasks();
 
 	// release any unused assets from W3D
 	/// @todo really need that "scene abstraction", having this stuff in the display is icky

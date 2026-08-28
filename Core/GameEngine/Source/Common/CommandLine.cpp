@@ -30,13 +30,18 @@
 #include "Common/CRCDebug.h"
 #include "Common/LocalFileSystem.h"
 #include "Common/Recorder.h"
+#include "Common/SkirmishAITestRunner.h"
 #include "Common/version.h"
 #include "GameClient/ClientInstance.h"
 #include "GameClient/TerrainVisual.h" // for TERRAIN_LOD_MIN definition
 #include "GameClient/GameText.h"
 #include "GameNetwork/NetworkDefs.h"
+#include "Lib/JobSystem.h"
 #include "WWLib/trim.h"
 
+#include <errno.h>
+#include <limits.h>
+#include <stdlib.h>
 
 
 
@@ -423,6 +428,32 @@ Int parseHeadless(char *args[], int num)
 	return 1;
 }
 
+Int parseRunSkirmishAITest(char *args[], int num)
+{
+	if (IsSkirmishAITestRunnerArmed())
+	{
+		printf("SKIRMISH_AI_TEST_FAIL seed=0 reason=duplicate_option\n");
+		fflush(stdout);
+		exit(2);
+	}
+
+	Int seed = 0;
+	if (num < 2 || !TryParseSkirmishAITestSeed(args[1], &seed))
+	{
+		printf("SKIRMISH_AI_TEST_FAIL seed=0 reason=invalid_seed\n");
+		fflush(stdout);
+		exit(2);
+	}
+
+	ArmSkirmishAITestRunner(seed);
+	parseHeadless(args, num);
+	TheWritableGlobalData->m_shellMapOn = FALSE;
+	TheWritableGlobalData->m_useFpsLimit = FALSE;
+	rts::ClientInstance::setMultiInstance(TRUE);
+	rts::ClientInstance::skipPrimaryInstance();
+	return 2;
+}
+
 Int parseReplay(char *args[], int num)
 {
 	if (num > 1)
@@ -456,6 +487,40 @@ Int parseJobs(char *args[], int num)
 		if (TheGlobalData->m_simulateReplayJobs < SIMULATE_REPLAYS_SEQUENTIAL || TheGlobalData->m_simulateReplayJobs == 0)
 		{
 			printf("Invalid number of jobs: %d\n", TheGlobalData->m_simulateReplayJobs);
+			exit(1);
+		}
+		return 2;
+	}
+	return 1;
+}
+
+Int parseWorkerCount(char *args[], int num)
+{
+	if (num > 1)
+	{
+		char *end = nullptr;
+		errno = 0;
+		const unsigned long workerCount = strtoul(args[1], &end, 10);
+		if (args[1][0] == '-' || errno != 0 || end == args[1] || *end != '\0' ||
+			workerCount == 0 || workerCount >= UINT_MAX)
+		{
+			printf("Invalid worker count: %s\n", args[1]);
+			exit(1);
+		}
+		rts::JobSystem::setStartupWorkerCount(
+			static_cast<unsigned>(workerCount));
+		return 2;
+	}
+	return 1;
+}
+
+Int parseWorkerPolicy(char *args[], int num)
+{
+	if (num > 1)
+	{
+		if (!rts::JobSystem::setStartupWorkerPolicy(args[1]))
+		{
+			printf("Invalid worker policy: %s (expected auto or all)\n", args[1]);
 			exit(1);
 		}
 		return 2;
@@ -1129,6 +1194,7 @@ static CommandLineParam paramsForStartup[] =
 	// TheSuperHackers @feature helmutbuhler 11/04/2025
 	// This runs the game without a window, graphics, input and audio. You can combine this with -replay
 	{ "-headless", parseHeadless },
+	{ "-runSkirmishAITest", parseRunSkirmishAITest },
 
 	// TheSuperHackers @feature helmutbuhler 13/04/2025
 	// Play back a replay. Pass the filename including .rep afterwards.
@@ -1141,6 +1207,11 @@ static CommandLineParam paramsForStartup[] =
 	// (If you have 4 cores, call it with -jobs 4)
 	// If you do not call this, all replays will be simulated in sequence in the same process.
 	{ "-jobs", parseJobs },
+
+	// Configure the process-wide compute scheduler. These switches are kept
+	// separate from -jobs, which controls replay child processes.
+	{ "-workerCount", parseWorkerCount },
+	{ "-workerPolicy", parseWorkerPolicy },
 };
 
 // These Params are parsed during Engine Init before INI data is loaded

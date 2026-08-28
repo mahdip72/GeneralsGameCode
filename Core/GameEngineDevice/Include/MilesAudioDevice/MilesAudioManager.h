@@ -301,6 +301,7 @@ class MilesAudioManager : public AudioManager
 		AsciiString m_prefSpeaker;
 
 		HDIGDRIVER m_digitalHandle;
+		Bool m_headlessWaveOut;
 		H3DPOBJECT m_listener;
 		HPROVIDER m_delayFilter;
 

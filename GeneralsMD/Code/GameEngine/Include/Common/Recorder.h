@@ -139,6 +139,8 @@ public:
 	Bool readReplayHeader( ReplayHeader& header );
 
 	RecorderModeType getMode();												///< Returns the current operating mode.
+	AsciiString getRecordingFileName() const { return m_fileName; }
+	Bool hasOpenRecordingFile() const { return m_mode == RECORDERMODETYPE_RECORD && m_file != nullptr; }
 	Bool isPlaybackMode() const { return m_mode == RECORDERMODETYPE_PLAYBACK || m_mode == RECORDERMODETYPE_SIMULATION_PLAYBACK; }
 	Int getSkirmishAIReplayEpoch() const { return m_skirmishAIReplayEpoch; }
 	Bool replayUsesSkirmishAILivenessRecovery() const { return m_skirmishAIReplayEpoch >= SKIRMISH_AI_REPLAY_EPOCH_PR6_LIVENESS; }

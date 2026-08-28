@@ -32,6 +32,7 @@
 #include "Common/GameEngine.h"
 #include "Common/GameThreadOwnership.h"
 #include "Common/ReplaySimulation.h"
+#include "Common/SkirmishAITestRunner.h"
 
 
 /**
@@ -46,8 +47,13 @@ Int GameMain()
 	TheFramePacer->enableFramesPerSecondLimit(TRUE);
 	TheGameEngine = CreateGameEngine();
 	TheGameEngine->init();
+	const Bool canRun = StartSkirmishAITestRunner();
 
-	if (!TheGlobalData->m_simulateReplays.empty())
+	if (!canRun)
+	{
+		TheGameEngine->setQuitting(TRUE);
+	}
+	else if (!TheGlobalData->m_simulateReplays.empty())
 	{
 		exitcode = ReplaySimulation::simulateReplays(TheGlobalData->m_simulateReplays, TheGlobalData->m_simulateReplayJobs);
 	}
@@ -56,6 +62,8 @@ Int GameMain()
 		// run it
 		TheGameEngine->execute();
 	}
+	if (IsSkirmishAITestRunnerArmed())
+		exitcode = FinalizeSkirmishAITestRunner(exitcode);
 
 	// since execute() returned, we are exiting the game
 	delete TheFramePacer;
