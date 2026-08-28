@@ -933,8 +933,11 @@ void VertexMaterialClass::Apply() const
 		}
 	}
 	DX8Wrapper::Set_Legacy_Vertex_Material(state);
-	for (unsigned int i=0; i<MeshBuilderClass::MAX_STAGES; i++) {
-		if (Mapper[i]) Mapper[i]->Apply(UVSource[i]);
+	for (unsigned int mapperIndex = 0;
+		mapperIndex < MeshBuilderClass::MAX_STAGES; ++mapperIndex) {
+		if (Mapper[mapperIndex]) {
+			Mapper[mapperIndex]->Apply(UVSource[mapperIndex]);
+		}
 	}
 }
 
