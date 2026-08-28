@@ -1019,6 +1019,8 @@ void W3DDisplay::reset()
 
 	m_isClippedEnabled = FALSE;
 
+	TextureLoader::Discard_Pending_Background_Load_Tasks();
+
 	// release any unused assets from W3D
 	/// @todo really need that "scene abstraction", having this stuff in the display is icky
 	m_assetManager->Release_Unused_Assets();

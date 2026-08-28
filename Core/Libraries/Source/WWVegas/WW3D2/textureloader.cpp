@@ -181,7 +181,14 @@ void SynchronizedTextureLoadTaskListClass::Publish_Completed(TextureLoadTaskClas
 {
 	FastCriticalSectionClass::LockClass lock(CriticalSection);
 	task->Set_Prepare_Runtime_Task(nullptr);
-	TextureLoadTaskListClass::Push_Back(task);
+	if (task->Get_Priority() == TextureLoadTaskClass::PRIORITY_HIGH)
+	{
+		TextureLoadTaskListClass::Push_Front(task);
+	}
+	else
+	{
+		TextureLoadTaskListClass::Push_Back(task);
+	}
 	task->Complete_Async_Prepare();
 }
 
@@ -189,7 +196,14 @@ void SynchronizedTextureLoadTaskListClass::Publish_Failed(TextureLoadTaskClass *
 {
 	FastCriticalSectionClass::LockClass lock(CriticalSection);
 	task->Set_Prepare_Runtime_Task(nullptr);
-	TextureLoadTaskListClass::Push_Back(task);
+	if (task->Get_Priority() == TextureLoadTaskClass::PRIORITY_HIGH)
+	{
+		TextureLoadTaskListClass::Push_Front(task);
+	}
+	else
+	{
+		TextureLoadTaskListClass::Push_Back(task);
+	}
 	task->Fail_Async_Prepare();
 }
 
@@ -222,10 +236,21 @@ bool SynchronizedTextureLoadTaskListClass::Promote_Prepare_Job(
 	TextureLoadTaskClass *task)
 {
 	FastCriticalSectionClass::LockClass lock(CriticalSection);
+	task->Set_Priority(TextureLoadTaskClass::PRIORITY_HIGH);
 	rts::Job *prepareJob = static_cast<rts::Job *>(
 		task->Get_Prepare_Runtime_Task());
-	return prepareJob != nullptr && rts::JobSystem::instance().tryPromote(
-		prepareJob, rts::JOB_PRIORITY_FRAME_CRITICAL);
+	if (prepareJob != nullptr)
+	{
+		return rts::JobSystem::instance().tryPromote(prepareJob,
+			rts::JOB_PRIORITY_FRAME_CRITICAL);
+	}
+	if (task->Get_List() == this)
+	{
+		TextureLoadTaskListClass::Remove(task);
+		TextureLoadTaskListClass::Push_Front(task);
+		return true;
+	}
+	return false;
 }
 
 TextureLoadTaskClass *SynchronizedTextureLoadTaskListClass::Pop_Front()
@@ -273,6 +298,8 @@ static TextureLoadTaskListClass					_VolTexLoadFreeList;
 
 static rts::JobGroup _TexturePrepareGroup;
 static TexturePrepareMemoryBudget _TexturePrepareMemoryBudget(64u * 1024u * 1024u);
+static const unsigned long _TextureForegroundSliceMilliseconds = 4;
+static const unsigned _TextureForegroundMaximumTasksPerUpdate = 8;
 
 static bool Try_Load_For_Owner(TextureLoadTaskClass *task)
 {
@@ -437,7 +464,11 @@ void TextureLoader::Deinit()
 				break;
 
 			case TextureLoadTaskClass::TASK_LOAD:
-				Process_Foreground_Load(task);
+				// JobSystem shuts down before W3DDisplay. Retire any queued
+				// owner-side load synchronously so teardown cannot restart the
+				// scheduler or publish into a deinitialized texture subsystem.
+				task->Finish_Load();
+				task->Destroy();
 				break;
 		}
 	}
@@ -809,11 +840,11 @@ void TextureLoader::Request_Background_Loading(TextureBaseClass *tc)
 
 	task = TextureLoadTaskClass::Create(tc, TextureLoadTaskClass::TASK_LOAD, TextureLoadTaskClass::PRIORITY_LOW);
 
-	if (Is_DX8_Thread()) {
-		Begin_Load_And_Queue(task);
-	} else {
-		_ForegroundQueue.Push_Back(task);
-	}
+	// Full texture reads and staging can be expensive on rotational storage.
+	// Queue low-priority work even when requested by the render owner so Update
+	// can enforce its per-frame foreground budget. A later foreground request
+	// still takes the task back and completes it immediately when required.
+	_ForegroundQueue.Push_Back(task);
 }
 
 
@@ -883,7 +914,6 @@ void TextureLoader::Request_Foreground_Loading(TextureBaseClass *tc)
 		}
 
 		if (task) {
-			task->Set_Priority(TextureLoadTaskClass::PRIORITY_HIGH);
 			// Promote queued preparation ahead of streaming work. If a worker
 			// already owns it, publication proceeds normally.
 			_ForegroundQueue.Promote_Prepare_Job(task);
@@ -892,8 +922,8 @@ void TextureLoader::Request_Foreground_Loading(TextureBaseClass *tc)
 			// allocate high priority load task
 			task = TextureLoadTaskClass::Create(tc, TextureLoadTaskClass::TASK_LOAD, TextureLoadTaskClass::PRIORITY_HIGH);
 
-			// add to back of foreground queue.
-			_ForegroundQueue.Push_Back(task);
+			// Keep an explicit foreground request ahead of streaming work.
+			_ForegroundQueue.Push_Front(task);
 		}
 	}
 }
@@ -917,6 +947,39 @@ void TextureLoader::Flush_Pending_Load_Tasks()
 			break;
 		}
 		Update();
+	}
+}
+
+
+void TextureLoader::Discard_Pending_Background_Load_Tasks()
+{
+	WWASSERT(Is_DX8_Thread());
+	// A prepare job temporarily owns its task outside the foreground queue.
+	// Drain the group before filtering so an outgoing-map task cannot publish
+	// after reset and upload its prepared surfaces into the next map.
+	if (_TexturePrepareGroup.isValid())
+	{
+		rts::JobSystem::instance().wait(_TexturePrepareGroup);
+	}
+	FastCriticalSectionClass::LockClass lock(_ForegroundCriticalSection);
+
+	TextureLoadTaskListClass retainedTasks;
+	TextureLoadTaskClass *task = nullptr;
+	while ((task = _ForegroundQueue.Pop_Front()) != nullptr)
+	{
+		if (task->Get_Type() == TextureLoadTaskClass::TASK_LOAD &&
+			task->Get_Priority() == TextureLoadTaskClass::PRIORITY_LOW)
+		{
+			task->Destroy();
+		}
+		else
+		{
+			retainedTasks.Push_Back(task);
+		}
+	}
+	while ((task = retainedTasks.Pop_Front()) != nullptr)
+	{
+		_ForegroundQueue.Push_Back(task);
 	}
 }
 
@@ -947,8 +1010,13 @@ void TextureLoader::Update(void (*network_callback)())
 	FastCriticalSectionClass::LockClass lock(_ForegroundCriticalSection);
 
 	unsigned long time = timeGetTime();
+	const unsigned long budgetStart = time;
+	unsigned processedTaskCount = 0;
 
-	// while we have tasks on the foreground queue
+	// Bound low-priority file reads, staging, and uploads so first-use texture
+	// bursts do not consume an entire rendered frame. Flush and Deinit retain
+	// their explicit drain semantics by invoking Update repeatedly or bypassing
+	// this loop.
 	while (TextureLoadTaskClass *task = _ForegroundQueue.Pop_Front()) {
 		UPDATE_NETWORK;
 		// dispatch to proper task handler
@@ -960,6 +1028,11 @@ void TextureLoader::Update(void (*network_callback)())
 			case TextureLoadTaskClass::TASK_LOAD:
 				Process_Foreground_Load(task);
 				break;
+		}
+		++processedTaskCount;
+		if (processedTaskCount >= _TextureForegroundMaximumTasksPerUpdate ||
+			timeGetTime() - budgetStart >= _TextureForegroundSliceMilliseconds) {
+			break;
 		}
 	}
 

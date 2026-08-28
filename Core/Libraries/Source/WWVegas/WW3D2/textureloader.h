@@ -87,6 +87,7 @@ public:
 	static void Request_Foreground_Loading(TextureBaseClass* tc);
 
 	static void	Flush_Pending_Load_Tasks();
+	static void Discard_Pending_Background_Load_Tasks();
 	static void Update(void(*network_callback)() = nullptr);
 
 	// returns true if current thread of execution is allowed to make DX8 calls.
