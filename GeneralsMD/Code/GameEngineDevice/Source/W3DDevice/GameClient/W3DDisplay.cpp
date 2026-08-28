@@ -1044,8 +1044,11 @@ void W3DDisplay::reset()
 
 	m_isClippedEnabled = FALSE;
 
-	ASSERT_GAME_THREAD("W3DDisplay::reset texture task discard");
-	TextureLoader::Discard_Pending_Background_Load_Tasks();
+	if (!TheGlobalData->m_headless)
+	{
+		ASSERT_GAME_THREAD("W3DDisplay::reset texture task discard");
+		TextureLoader::Discard_Pending_Background_Load_Tasks();
+	}
 
 	// release any unused assets from W3D
 	/// @todo really need that "scene abstraction", having this stuff in the display is icky
