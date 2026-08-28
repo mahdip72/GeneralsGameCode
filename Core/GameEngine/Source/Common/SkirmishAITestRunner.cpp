@@ -105,6 +105,11 @@ Bool TryParseSkirmishAITestSeed(const char *text, Int *seed)
 	return TRUE;
 }
 
+Bool ShouldBypassFramePacingForSkirmishAITest(Bool runnerArmed)
+{
+	return runnerArmed;
+}
+
 void BuildSkirmishAITestPlan(Int seed, SkirmishAITestPlan *plan)
 {
 	if (plan == nullptr)

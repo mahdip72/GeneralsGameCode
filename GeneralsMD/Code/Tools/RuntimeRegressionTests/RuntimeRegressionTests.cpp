@@ -849,6 +849,8 @@ static void TestSkirmishAIFeedbackPolicies()
 static void TestSkirmishAITestRunnerContract()
 {
 	CHECK(!IsSkirmishAITestRunnerArmed());
+	CHECK(!ShouldBypassFramePacingForSkirmishAITest(FALSE));
+	CHECK(ShouldBypassFramePacingForSkirmishAITest(TRUE));
 	Int seed = 0;
 	CHECK(TryParseSkirmishAITestSeed("1729", &seed));
 	CHECK(seed == 1729);
