@@ -1840,6 +1840,40 @@ int testD3D11HiddenSwapChain()
 			context->endFrame() == rts::render::RENDER_RESULT_OK,
 			"D3D11 indexed drawing rejects wrong bindings, formats, alignment, and state");
 		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->setLegacyState(logicalState,
+				rts::render::RENDER_VERTEX_POSITION3_COLOR, 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(vertexBuffer, sizeof(TestVertex),
+				sizeof(TestVertex)) == rts::render::RENDER_RESULT_OK &&
+			context->draw(2, 0) == rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) ==
+				rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+			context->draw(0xffffffffU, 0) ==
+				rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+			context->draw(1, 0xffffffffU) ==
+				rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+			context->setVertexBuffer(vertexBuffer, sizeof(TestVertex), 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setIndexBuffer(indexBuffer,
+				rts::render::RENDER_FORMAT_R16_UINT, sizeof(indices[0])) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->drawIndexed(2, 0, 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->drawIndexed(3, 0, 0) ==
+				rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+			context->drawIndexed(0xffffffffU, 0, 0) ==
+				rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+			context->drawIndexed(1, 0xffffffffU, 0) ==
+				rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+			context->setIndexBuffer(indexBuffer,
+				rts::render::RENDER_FORMAT_R16_UINT, 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK,
+			"D3D11 draw submission rejects vertex and index ranges outside bound buffers");
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
 			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
 			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
 				rts::render::RENDER_RESULT_OK &&
@@ -2619,11 +2653,99 @@ int testD3D11HiddenSwapChain()
 		secondTextureData.data = redPixels;
 		secondTextureData.rowPitch = 2 * sizeof(unsigned int);
 		secondTextureData.slicePitch = sizeof(redPixels);
+		rts::render::TextureDescriptor refreshableTextureDescriptor =
+			textureDescriptor;
+		refreshableTextureDescriptor.usage = rts::render::RENDER_USAGE_DEFAULT;
 		rts::render::GpuHandle secondTexture;
-		result |= check(device->createTexture(textureDescriptor,
+		result |= check(device->createTexture(refreshableTextureDescriptor,
 			&secondTextureData, 1, &secondTexture) ==
 			rts::render::RENDER_RESULT_OK,
 			"D3D11 parity probe creates a second texture stage resource");
+		logicalState.pipeline.textureStages[0].colorOperation =
+			rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_1;
+		logicalState.pipeline.textureStages[0].colorArgument1 =
+			rts::render::RENDER_TEXTURE_ARG_TEXTURE;
+		logicalState.pipeline.textureStages[1] =
+			rts::render::LegacyTextureStageState();
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyStateForLayout(logicalState, texturedLayout, 3) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(texturedVertexBuffer,
+				sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(0, texture) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(1, secondTexture) ==
+				rts::render::RENDER_RESULT_OK &&
+			device->refreshTexture(secondTexture, refreshableTextureDescriptor,
+				&secondTextureData, 1) == rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"D3D11 texture refresh preserves unrelated shader-resource stages");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[1] > 240 && center[0] < 16 && center[2] < 16,
+			"a later-stage refresh leaves the earlier sampled texture visible");
+
+		rts::render::GpuHandle destroyProbeTexture;
+		result |= check(device->createTexture(refreshableTextureDescriptor,
+			&secondTextureData, 1, &destroyProbeTexture) ==
+			rts::render::RENDER_RESULT_OK &&
+			context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyStateForLayout(logicalState, texturedLayout, 3) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(texturedVertexBuffer,
+				sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(0, texture) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(1, destroyProbeTexture) ==
+				rts::render::RENDER_RESULT_OK &&
+			device->destroyResource(destroyProbeTexture) &&
+			context->setTexture(1, destroyProbeTexture) ==
+				rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"D3D11 texture destruction preserves unrelated shader-resource stages");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[1] > 240 && center[0] < 16 && center[2] < 16,
+			"destroying a later-stage texture leaves the earlier sample visible");
+
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyStateForLayout(logicalState, texturedLayout, 3) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(texturedVertexBuffer,
+				sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(0, texture) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(1, copiedColor) ==
+				rts::render::RENDER_RESULT_OK &&
+			device->copyActiveColorTargetToTexture(copiedColor) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"D3D11 target copies preserve unrelated shader-resource stages");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[1] > 240 && center[0] < 16 && center[2] < 16,
+			"copying a later-stage target leaves the earlier sample visible");
 		logicalState.pipeline.pixelProgram =
 			rts::render::RENDER_LEGACY_PIXEL_TERRAIN_BASE;
 		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&

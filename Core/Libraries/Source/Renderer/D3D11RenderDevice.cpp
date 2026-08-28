@@ -913,23 +913,10 @@ public:
 			return preparationResult;
 		}
 
-		// An SRV can be bound while a source texture is refreshed.  Clear all
-		// cached SRVs before writing so the update never races an output binding;
-		// the next legacy draw will bind the required stages again.
-		bool textureBound = false;
-		for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT;
-			++stage)
-		{
-			if (m_textureBindingsValid && m_boundTextures[stage] == texture)
-			{
-				textureBound = true;
-				break;
-			}
-		}
-		if (textureBound)
-		{
-			unbindTextureResources();
-		}
+		// D3D11 forbids updating a resource while it is exposed as an SRV.  Clear
+		// only the stages that reference this texture so unrelated legacy stages
+		// remain intact across the refresh.
+		const unsigned int reboundStages = unbindTextureResource(texture);
 
 		const unsigned int subresourceCount = descriptor.mipCount *
 			descriptor.arrayCount;
@@ -1010,7 +997,7 @@ public:
 		// device loss must preserve this upload rather than treating the resource
 		// as GPU-only merely because it was copied earlier in its lifetime.
 		slot.gpuAuthoritative = false;
-		return RENDER_RESULT_OK;
+		return rebindTextureResource(texture, reboundStages);
 	}
 
 	virtual RenderResult copyActiveColorTargetToTexture(GpuHandle texture)
@@ -1081,22 +1068,10 @@ public:
 			return RENDER_RESULT_UNSUPPORTED;
 		}
 
-		// CopyResource rejects a destination that is still exposed as an SRV in
-		// the same context.  Clear the cached bindings before the copy; the next
-		// legacy draw will bind the requested texture again.
-		bool destinationBound = false;
-		for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
-		{
-			if (m_textureBindingsValid && m_boundTextures[stage] == texture)
-			{
-				destinationBound = true;
-				break;
-			}
-		}
-		if (destinationBound)
-		{
-			unbindTextureResources();
-		}
+		// CopyResource rejects a destination that is still exposed as an SRV.
+		// Preserve every unrelated stage and restore the destination stages after
+		// the copy completes.
+		const unsigned int reboundStages = unbindTextureResource(texture);
 		m_context->CopyResource(destinationTexture, sourceTexture);
 		const HRESULT deviceResult = m_device->GetDeviceRemovedReason();
 		destinationTexture->Release();
@@ -1116,7 +1091,7 @@ public:
 		destination.subresourceOffsets.clear();
 		destination.subresourceRowPitches.clear();
 		destination.subresourceSlicePitches.clear();
-		return RENDER_RESULT_OK;
+		return rebindTextureResource(texture, reboundStages);
 	}
 
 	virtual bool destroyResource(GpuHandle resource)
@@ -1128,7 +1103,7 @@ public:
 		ResourceSlot &slot = m_resources[resource.index()];
 		if (slot.kind == RESOURCE_TEXTURE)
 		{
-			unbindTextureResources();
+			unbindTextureResource(resource);
 			if (slot.renderTarget == m_activeRenderTarget ||
 				slot.depthStencil == m_activeDepthStencil)
 			{
@@ -2415,7 +2390,14 @@ public:
 	virtual RenderResult draw(unsigned int vertexCount, unsigned int startVertex)
 	{
 		if (!isOwner() || !m_frameOpen || !m_pipelineBound || !m_topologyBound ||
-			!m_vertexBufferBound || vertexCount == 0)
+			!m_vertexBufferBound || !m_handles->isLive(m_boundVertexBuffer))
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		const ResourceSlot &vertexSlot =
+			m_resources[m_boundVertexBuffer.index()];
+		if (!isElementRangeWithinBuffer(vertexSlot.byteCount,
+			m_boundVertexOffset, m_boundVertexStride, startVertex, vertexCount))
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
@@ -2427,7 +2409,17 @@ public:
 		unsigned int startIndex, int baseVertex)
 	{
 		if (!isOwner() || !m_frameOpen || !m_pipelineBound || !m_topologyBound ||
-			!m_vertexBufferBound || !m_indexBufferBound || indexCount == 0)
+			!m_vertexBufferBound || !m_indexBufferBound ||
+			!m_handles->isLive(m_boundIndexBuffer))
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		const ResourceSlot &indexSlot = m_resources[m_boundIndexBuffer.index()];
+		const unsigned int indexSize = m_boundIndexFormat ==
+			RENDER_FORMAT_R16_UINT ? 2U : (m_boundIndexFormat ==
+			RENDER_FORMAT_R32_UINT ? 4U : 0U);
+		if (!isElementRangeWithinBuffer(indexSlot.byteCount,
+			m_boundIndexOffset, indexSize, startIndex, indexCount))
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
@@ -2666,6 +2658,74 @@ private:
 		markTextureBindingsEmpty();
 	}
 
+	void clearTextureStage(unsigned int stage)
+	{
+		ID3D11ShaderResourceView *emptyView = 0;
+		m_context->PSSetShaderResources(stage, 1, &emptyView);
+		m_context->PSSetShaderResources(8 + stage, 1, &emptyView);
+		m_boundTextures[stage] = GpuHandle();
+		m_boundCubeTextureMask &= ~(1U << stage);
+	}
+
+	unsigned int unbindTextureResource(GpuHandle texture)
+	{
+		if (!m_textureBindingsValid)
+		{
+			unbindTextureResources();
+			return 0;
+		}
+		unsigned int affectedStages = 0;
+		for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT;
+			++stage)
+		{
+			if (m_boundTextures[stage] != texture)
+			{
+				continue;
+			}
+			clearTextureStage(stage);
+			affectedStages |= 1U << stage;
+		}
+		return affectedStages;
+	}
+
+	RenderResult rebindTextureResource(GpuHandle texture,
+		unsigned int affectedStages)
+	{
+		if (affectedStages == 0 || !m_frameOpen)
+		{
+			return RENDER_RESULT_OK;
+		}
+		for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT;
+			++stage)
+		{
+			if ((affectedStages & (1U << stage)) == 0)
+			{
+				continue;
+			}
+			const RenderResult bindingResult = setTexture(stage, texture);
+			if (bindingResult != RENDER_RESULT_OK)
+			{
+				return bindingResult;
+			}
+		}
+		return RENDER_RESULT_OK;
+	}
+
+	static bool isElementRangeWithinBuffer(size_t byteCapacity,
+		size_t byteOffset, size_t elementSize, unsigned int start,
+		unsigned int count)
+	{
+		if (elementSize == 0 || count == 0 || byteOffset > byteCapacity)
+		{
+			return false;
+		}
+		const size_t availableElements =
+			(byteCapacity - byteOffset) / elementSize;
+		const size_t firstElement = static_cast<size_t>(start);
+		return firstElement <= availableElements &&
+			static_cast<size_t>(count) <= availableElements - firstElement;
+	}
+
 	void invalidateTextureBindingsForTargets(ID3D11Resource *colorResource,
 		ID3D11Resource *depthResource)
 	{
@@ -2687,11 +2747,7 @@ private:
 			{
 				continue;
 			}
-			ID3D11ShaderResourceView *emptyView = 0;
-			m_context->PSSetShaderResources(stage, 1, &emptyView);
-			m_context->PSSetShaderResources(8 + stage, 1, &emptyView);
-			m_boundTextures[stage] = GpuHandle();
-			m_boundCubeTextureMask &= ~(1U << stage);
+			clearTextureStage(stage);
 		}
 	}
 

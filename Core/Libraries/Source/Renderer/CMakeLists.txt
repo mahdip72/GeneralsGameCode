@@ -8,7 +8,73 @@ add_library(core_renderer STATIC
 )
 
 if(WIN32 AND NOT IS_VS6_BUILD)
-    find_program(RTS_FXC_EXECUTABLE NAMES fxc.exe fxc REQUIRED)
+    set(_rts_fxc_roots)
+    foreach(_rts_fxc_root IN ITEMS
+        "${CMAKE_WINDOWS_KITS_10_DIR}"
+        "$ENV{WindowsSdkDir}"
+        "$ENV{CMAKE_WINDOWS_KITS_10_DIR}")
+        if(_rts_fxc_root)
+            file(TO_CMAKE_PATH "${_rts_fxc_root}" _rts_fxc_root)
+            string(REGEX REPLACE "/+$" "" _rts_fxc_root "${_rts_fxc_root}")
+            list(APPEND _rts_fxc_roots "${_rts_fxc_root}")
+        endif()
+    endforeach()
+
+    cmake_host_system_information(
+        RESULT _rts_fxc_registry_root
+        QUERY WINDOWS_REGISTRY
+            "HKLM/SOFTWARE/Microsoft/Windows Kits/Installed Roots"
+        VALUE KitsRoot10
+        VIEW BOTH)
+    if(_rts_fxc_registry_root AND
+        NOT _rts_fxc_registry_root MATCHES "REGISTRY-NOTFOUND")
+        file(TO_CMAKE_PATH "${_rts_fxc_registry_root}"
+            _rts_fxc_registry_root)
+        string(REGEX REPLACE "/+$" "" _rts_fxc_registry_root
+            "${_rts_fxc_registry_root}")
+        list(APPEND _rts_fxc_roots "${_rts_fxc_registry_root}")
+    endif()
+    list(REMOVE_DUPLICATES _rts_fxc_roots)
+
+    if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+        set(_rts_fxc_arches x86 x64)
+    else()
+        set(_rts_fxc_arches x64 x86)
+    endif()
+
+    set(_rts_fxc_versions
+        "${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}"
+        "$ENV{WindowsSDKVersion}")
+    set(_rts_fxc_hints)
+    foreach(_rts_fxc_root IN LISTS _rts_fxc_roots)
+        foreach(_rts_fxc_version IN LISTS _rts_fxc_versions)
+            string(REGEX REPLACE "[/\\\\]+$" "" _rts_fxc_version
+                "${_rts_fxc_version}")
+            if(_rts_fxc_version MATCHES "^10\\.0\\.[0-9]+\\.[0-9]+$")
+                foreach(_rts_fxc_arch IN LISTS _rts_fxc_arches)
+                    list(APPEND _rts_fxc_hints
+                        "${_rts_fxc_root}/bin/${_rts_fxc_version}/${_rts_fxc_arch}")
+                endforeach()
+            endif()
+        endforeach()
+        foreach(_rts_fxc_arch IN LISTS _rts_fxc_arches)
+            file(GLOB _rts_fxc_arch_dirs LIST_DIRECTORIES TRUE
+                "${_rts_fxc_root}/bin/10.*/${_rts_fxc_arch}")
+            list(SORT _rts_fxc_arch_dirs COMPARE NATURAL ORDER DESCENDING)
+            list(APPEND _rts_fxc_hints ${_rts_fxc_arch_dirs})
+        endforeach()
+    endforeach()
+    list(REMOVE_DUPLICATES _rts_fxc_hints)
+
+    find_program(RTS_FXC_EXECUTABLE
+        NAMES fxc.exe fxc
+        HINTS ${_rts_fxc_hints}
+        DOC "Path to the Windows SDK fxc shader compiler")
+    if(NOT RTS_FXC_EXECUTABLE)
+        message(FATAL_ERROR
+            "The Windows SDK fxc shader compiler was not found. Install the "
+            "Windows 10/11 SDK or set RTS_FXC_EXECUTABLE to fxc.exe.")
+    endif()
     set(renderer_generated_dir "${CMAKE_CURRENT_BINARY_DIR}/Generated")
     set(renderer_shader_source "${CMAKE_CURRENT_SOURCE_DIR}/Shaders/LegacyFixedFunction.hlsl")
     set(renderer_vertex_shader_header "${renderer_generated_dir}/LegacyFixedFunctionVS.h")
