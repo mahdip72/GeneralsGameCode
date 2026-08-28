@@ -1000,7 +1000,9 @@ void TextureLoader::Flush_Pending_Load_Tasks()
 
 void TextureLoader::Discard_Pending_Background_Load_Tasks()
 {
-	WWASSERT(Is_DX8_Thread());
+	// This path only drains CPU preparation and edits the synchronized task
+	// queue. Headless replay has a game owner but never initializes a DX8 owner,
+	// so the caller enforces game-thread ownership instead of requiring DX8.
 	// A prepare job temporarily owns its task outside the foreground queue.
 	// Drain the group before filtering so an outgoing-map task cannot publish
 	// after reset and upload its prepared surfaces into the next map.
