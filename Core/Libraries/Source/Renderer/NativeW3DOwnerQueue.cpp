@@ -124,12 +124,20 @@ private:
 #ifdef _WIN32
 long IncrementTokenReference(volatile long *references)
 {
+#if defined(_MSC_VER) && _MSC_VER < 1300
+	return InterlockedIncrement(const_cast<long *>(references));
+#else
 	return InterlockedIncrement(references);
+#endif
 }
 
 long DecrementTokenReference(volatile long *references)
 {
+#if defined(_MSC_VER) && _MSC_VER < 1300
+	return InterlockedDecrement(const_cast<long *>(references));
+#else
 	return InterlockedDecrement(references);
+#endif
 }
 #else
 long IncrementTokenReference(volatile long *references)
