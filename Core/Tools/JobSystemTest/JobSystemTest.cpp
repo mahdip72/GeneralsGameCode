@@ -22,7 +22,8 @@ enum JobSystemTestFault
 	JOB_SYSTEM_TEST_FAIL_QUEUE_PUSH = 6,
 	JOB_SYSTEM_TEST_FAIL_COMPLETION_PUSH = 7,
 	JOB_SYSTEM_TEST_FAIL_PROMOTION_PUSH = 8,
-	JOB_SYSTEM_TEST_COMPETING_FINALIZER = 9
+	JOB_SYSTEM_TEST_COMPETING_FINALIZER = 9,
+	JOB_SYSTEM_TEST_FAIL_AFTER_QUEUE_PUSH = 10
 };
 
 enum JobSystemTestPause
@@ -31,7 +32,9 @@ enum JobSystemTestPause
 	JOB_SYSTEM_TEST_PAUSE_BEFORE_DEPENDENT_ENQUEUE = 2,
 	JOB_SYSTEM_TEST_PAUSE_AFTER_QUEUE_FAILURE = 4,
 	JOB_SYSTEM_TEST_PAUSE_NON_OWNER_FINALIZER = 8,
-	JOB_SYSTEM_TEST_PAUSE_AFTER_DEPENDENT_ENQUEUE = 16
+	JOB_SYSTEM_TEST_PAUSE_AFTER_DEPENDENT_ENQUEUE = 16,
+	JOB_SYSTEM_TEST_PAUSE_AFTER_EXECUTION_CLAIM = 32,
+	JOB_SYSTEM_TEST_PAUSE_AFTER_STALE_QUEUE_DISCARD = 64
 };
 
 extern "C" void rts_job_system_set_test_fault(unsigned fault,
@@ -862,6 +865,59 @@ int testFaultInjectionAndRecovery()
 
 #if !defined(_MSC_VER) || _MSC_VER >= 1300
 	{
+		rts::JobGroup staleGroup = system.createGroup();
+		std::atomic<unsigned> staleDestructions(0);
+		rts_job_system_set_test_pause_mask(
+			JOB_SYSTEM_TEST_PAUSE_AFTER_EXECUTION_CLAIM |
+			JOB_SYSTEM_TEST_PAUSE_AFTER_STALE_QUEUE_DISCARD);
+		rts_job_system_set_test_fault(
+			JOB_SYSTEM_TEST_FAIL_AFTER_QUEUE_PUSH, 1);
+		rts::Job *staleJob = new LifetimeJob(&staleDestructions);
+		rts::JobHandle staleHandle = system.trySubmit(staleJob,
+			rts::JOB_PRIORITY_NORMAL, staleGroup);
+		result |= check(!staleHandle.isValid() && staleGroup.isComplete() &&
+			system.outstandingJobCount() == 0 &&
+			staleDestructions.load(std::memory_order_acquire) == 0,
+			"post-push failure rolls admission back to the caller");
+		delete staleJob;
+		result |= check(staleDestructions.load(std::memory_order_acquire) == 1,
+			"caller destroys the post-push rejected job once");
+		rts::JobGroup recoveryGroup = system.createGroup();
+		Gate recoveryGate;
+		std::atomic<unsigned> recoveryExecutions(0);
+		std::atomic<unsigned> recoveryDestructions(0);
+		BlockingLifetimeJob *recoveryJob = new BlockingLifetimeJob(
+			&recoveryGate, &recoveryExecutions, &recoveryDestructions);
+		rts::JobHandle recoveryHandle = system.trySubmit(recoveryJob,
+			rts::JOB_PRIORITY_NORMAL, recoveryGroup);
+		if (!recoveryHandle.isValid())
+		{
+			delete recoveryJob;
+		}
+		result |= check(rts_job_system_wait_for_test_pause(
+			JOB_SYSTEM_TEST_PAUSE_AFTER_STALE_QUEUE_DISCARD, 5000),
+			"worker discards the uncounted failed-publication entry");
+		rts_job_system_release_test_pause(
+			JOB_SYSTEM_TEST_PAUSE_AFTER_STALE_QUEUE_DISCARD);
+		result |= check(recoveryHandle.isValid() &&
+			rts_job_system_wait_for_test_pause(
+				JOB_SYSTEM_TEST_PAUSE_AFTER_EXECUTION_CLAIM, 5000),
+			"scheduler claims valid work after stale-entry recovery");
+		rts_job_system_release_test_pause(
+			JOB_SYSTEM_TEST_PAUSE_AFTER_EXECUTION_CLAIM);
+		result |= check(recoveryGate.waitForEntry(),
+			"recovery job starts");
+		recoveryGate.open();
+		result |= check(system.wait(recoveryGroup),
+			"recovery group drains");
+		result |= check(recoveryHandle.isValid() &&
+			recoveryHandle.succeeded() &&
+			recoveryExecutions.load(std::memory_order_acquire) == 1 &&
+			recoveryDestructions.load(std::memory_order_acquire) == 1 &&
+			system.outstandingJobCount() == 0,
+			"uncounted stale entry cannot corrupt later execution or shutdown");
+		rts_job_system_set_test_pause_mask(0);
+
 		system.shutdown();
 		config.workerCount = 1;
 		config.queueCapacity = 8;

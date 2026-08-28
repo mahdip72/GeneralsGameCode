@@ -64,10 +64,10 @@ struct JobRecord
 	~JobRecord()
 	{
 		delete completion;
-		delete job;
+		delete job.exchange(0, std::memory_order_acq_rel);
 	}
 
-	Job *job;
+	std::atomic<Job *> job;
 	JobPriority priority;
 	std::shared_ptr<GroupRecord> group;
 	std::atomic<bool> complete;
@@ -458,24 +458,60 @@ struct JobSystem::State
 
 	std::shared_ptr<JobRecord> takeWork(Worker &worker)
 	{
-		std::shared_ptr<JobRecord> record = popLocalWork(worker);
-		if (!record)
+		for (;;)
 		{
-			std::lock_guard<std::mutex> lock(mutex);
-			record = popInjectedWorkUnlocked();
+			std::shared_ptr<JobRecord> record = popLocalWork(worker);
+			if (!record)
+			{
+				std::lock_guard<std::mutex> lock(mutex);
+				record = popInjectedWorkUnlocked();
+			}
+			if (!record)
+			{
+				record = stealWork(worker);
+			}
+			if (!record)
+			{
+				return std::shared_ptr<JobRecord>();
+			}
+
+			unsigned observedReadyCount = readyCount.load(std::memory_order_acquire);
+			while (observedReadyCount != 0 &&
+				!readyCount.compare_exchange_weak(observedReadyCount,
+					observedReadyCount - 1, std::memory_order_acq_rel,
+					std::memory_order_acquire))
+			{
+			}
+			bool claimed = false;
+			{
+				std::lock_guard<std::mutex> publicationLock(
+					record->publicationMutex);
+				/* A physical queue entry is not itself execution ownership.  A
+				 * failed publication rollback or a stale duplicate may leave an
+				 * entry whose record has already been claimed or finalized. */
+				if (record->queued.load(std::memory_order_acquire) &&
+					!record->executing.load(std::memory_order_acquire) &&
+					!record->finalizing.load(std::memory_order_acquire) &&
+					!record->complete.load(std::memory_order_acquire) &&
+					record->job.load(std::memory_order_acquire) != 0)
+				{
+					record->executing.store(true, std::memory_order_release);
+					record->queued.store(false, std::memory_order_release);
+					claimed = true;
+				}
+			}
+			if (!claimed)
+			{
+#if defined(RTS_BUILD_CORE_EXTRAS)
+				pauseJobSystemTest(64);
+#endif
+				continue;
+			}
+#if defined(RTS_BUILD_CORE_EXTRAS)
+			pauseJobSystemTest(32);
+#endif
+			return record;
 		}
-		if (!record)
-		{
-			record = stealWork(worker);
-		}
-		if (record)
-		{
-			std::lock_guard<std::mutex> publicationLock(record->publicationMutex);
-			record->executing.store(true, std::memory_order_release);
-			record->queued.store(false, std::memory_order_release);
-			readyCount.fetch_sub(1, std::memory_order_acq_rel);
-		}
-		return record;
 	}
 
 	bool helpOwnerOnce()
@@ -532,12 +568,24 @@ struct JobSystem::State
 				Worker *worker = static_cast<Worker *>(s_currentJobSystemWorkerQueue);
 				std::lock_guard<std::mutex> lock(worker->mutex);
 				worker->queues[record->priority].push_front(record);
+#if defined(RTS_BUILD_CORE_EXTRAS)
+				if (consumeJobSystemTestFault(10))
+				{
+					throw std::bad_alloc();
+				}
+#endif
 				readyCount.fetch_add(1, std::memory_order_release);
 			}
 			else
 			{
 				std::lock_guard<std::mutex> lock(mutex);
 				injectionQueues[record->priority].push_back(record);
+#if defined(RTS_BUILD_CORE_EXTRAS)
+				if (consumeJobSystemTestFault(10))
+				{
+					throw std::bad_alloc();
+				}
+#endif
 				unsigned injectedCount = 0;
 				for (unsigned lane = 0; lane < JOB_PRIORITY_COUNT; ++lane)
 				{
@@ -601,8 +649,8 @@ struct JobSystem::State
 				#endif
 				if (enqueueResult == READY_FAILED)
 				{
-					delete dependent->job;
-					dependent->job = 0;
+					delete dependent->job.exchange(0,
+						std::memory_order_acq_rel);
 					finish(dependent, true, false);
 				}
 			}
@@ -747,6 +795,11 @@ struct JobSystem::State
 		bool cancelled = record->group->cancelled.load(
 			std::memory_order_acquire);
 		bool failed = record->dependencyFailed.load(std::memory_order_acquire);
+		Job *executionJob = record->job.load(std::memory_order_acquire);
+		if (executionJob == 0)
+		{
+			failed = true;
+		}
 		if (!cancelled && !failed)
 		{
 #if defined(_WIN32) && !defined(_WIN64)
@@ -758,7 +811,7 @@ struct JobSystem::State
 			JobContext context(&contextState);
 			try
 			{
-				record->job->execute(context);
+				executionJob->execute(context);
 				failed = contextState.failed;
 			}
 			catch (...)
@@ -769,8 +822,7 @@ struct JobSystem::State
 		cancelled = cancelled || record->group->cancelled.load(
 			std::memory_order_acquire);
 
-		delete record->job;
-		record->job = 0;
+		delete record->job.exchange(0, std::memory_order_acq_rel);
 		if (poolWorker)
 		{
 			activeWorkers.fetch_sub(1, std::memory_order_acq_rel);
@@ -1685,7 +1737,7 @@ JobHandle JobSystem::trySubmitAfter(Job *job, JobPriority priority,
 			delete handleState;
 			return JobHandle();
 		}
-		record->job = job;
+		record->job.store(job, std::memory_order_release);
 		record->completion = completion;
 		++m_state->outstanding;
 		groupRecord->pending.fetch_add(1, std::memory_order_acq_rel);
@@ -1723,7 +1775,7 @@ JobHandle JobSystem::trySubmitAfter(Job *job, JobPriority priority,
 
 	if (!wired)
 	{
-		record->job = 0;
+		record->job.store(0, std::memory_order_release);
 		record->completion = 0;
 		if (groupRecord->pending.fetch_sub(1, std::memory_order_acq_rel) == 1)
 		{
@@ -1749,7 +1801,7 @@ JobHandle JobSystem::trySubmitAfter(Job *job, JobPriority priority,
 		m_state->enqueueReady(record) == State::READY_FAILED)
 	{
 		record->accepted.store(false, std::memory_order_release);
-		record->job = 0;
+		record->job.store(0, std::memory_order_release);
 		record->completion = 0;
 		if (groupRecord->pending.fetch_sub(1, std::memory_order_acq_rel) == 1)
 		{
@@ -1877,7 +1929,8 @@ bool JobSystem::trySubmitBatch(const JobSubmission *submissions,
 	}
 	for (unsigned index = 0; index < submissionCount; ++index)
 	{
-		records[index]->job = submissions[index].job;
+		records[index]->job.store(submissions[index].job,
+			std::memory_order_release);
 		records[index]->completion = submissions[index].completion;
 	}
 
@@ -1919,7 +1972,7 @@ bool JobSystem::trySubmitBatch(const JobSubmission *submissions,
 	auto rollbackAdmission = [&]() {
 		for (unsigned index = 0; index < submissionCount; ++index)
 		{
-			records[index]->job = 0;
+			records[index]->job.store(0, std::memory_order_release);
 			records[index]->completion = 0;
 			records[index]->accepted.store(false, std::memory_order_release);
 			records[index]->queued.store(false, std::memory_order_release);
@@ -2120,8 +2173,7 @@ bool JobSystem::trySubmitBatch(const JobSubmission *submissions,
 		{
 			if (m_state->enqueueReady(record) == State::READY_FAILED)
 			{
-				delete record->job;
-				record->job = 0;
+				delete record->job.exchange(0, std::memory_order_acq_rel);
 				m_state->finish(record, true, false);
 			}
 		}
@@ -2150,7 +2202,7 @@ bool JobSystem::tryPromote(Job *job, JobPriority priority)
 		{
 			for (auto it = queues[lane].begin(); it != queues[lane].end(); ++it)
 			{
-				if ((*it)->job == job)
+				if ((*it)->job.load(std::memory_order_acquire) == job)
 				{
 					std::shared_ptr<JobRecord> record = *it;
 					if (lane == static_cast<unsigned>(priority))
