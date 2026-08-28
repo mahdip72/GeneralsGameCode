@@ -30,7 +30,7 @@ struct JOBOBJECT_BASIC_LIMIT_INFORMATION2
 	SIZE_T MinimumWorkingSetSize;
 	SIZE_T MaximumWorkingSetSize;
 	DWORD ActiveProcessLimit;
-	ULONG_PTR Affinity;
+	DWORD Affinity;
 	DWORD PriorityClass;
 	DWORD SchedulingClass;
 };
