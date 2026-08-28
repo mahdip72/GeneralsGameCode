@@ -361,6 +361,7 @@ WaterRenderObjClass::WaterRenderObjClass()
 	m_waterType = WATER_TYPE_0_TRANSLUCENT;
 	m_tod=TIME_OF_DAY_AFTERNOON;
 	m_pReflectionTexture=nullptr;
+	m_pReflectionDepthTexture=nullptr;
 	m_skyBox=nullptr;
 	m_vertexBufferD3D=nullptr;
 	m_indexBufferD3D=nullptr;
@@ -841,6 +842,7 @@ void WaterRenderObjClass::ReleaseResources()
 	REF_PTR_RELEASE(m_indexBuffer);
 
 	REF_PTR_RELEASE(m_pReflectionTexture);
+	REF_PTR_RELEASE(m_pReflectionDepthTexture);
 	SAFE_RELEASE(m_vertexBufferD3D);
 	SAFE_RELEASE(m_indexBufferD3D);
 
@@ -934,8 +936,29 @@ void WaterRenderObjClass::ReAcquireResources()
 		if (FAILED(hr))
 			return;
 
-		// Create reflection texture
-		m_pReflectionTexture = DX8Wrapper::Create_Render_Target (SEA_REFLECTION_SIZE, SEA_REFLECTION_SIZE);
+		// The D3D11 render target cannot share the differently sized swap-chain
+		// depth buffer. Give the reflection pass a matching depth texture while
+		// preserving the historical default-depth path for the D3D8 oracle.
+		if (DX8Wrapper::Is_D3D11_Backend_Active())
+		{
+			DX8Wrapper::Create_Render_Target(SEA_REFLECTION_SIZE,
+				SEA_REFLECTION_SIZE, WW3D_FORMAT_A8R8G8B8,
+				WW3D_ZFORMAT_D24S8, &m_pReflectionTexture,
+				&m_pReflectionDepthTexture);
+			if (m_pReflectionTexture == nullptr ||
+				m_pReflectionDepthTexture == nullptr ||
+				m_pReflectionDepthTexture->Peek_D3D_Base_Texture() == nullptr)
+			{
+				REF_PTR_RELEASE(m_pReflectionTexture);
+				REF_PTR_RELEASE(m_pReflectionDepthTexture);
+				WWDEBUG_SAY(("D3D11 water reflection target creation failed"));
+			}
+		}
+		else
+		{
+			m_pReflectionTexture = DX8Wrapper::Create_Render_Target(
+				SEA_REFLECTION_SIZE, SEA_REFLECTION_SIZE);
+		}
 	}
 
 	if (m_waterTrackSystem)
@@ -1425,7 +1448,10 @@ void WaterRenderObjClass::loadSetting( Setting *setting, TimeOfDay timeOfDay )
 //-------------------------------------------------------------------------------------------------
 void WaterRenderObjClass::updateRenderTargetTextures(CameraClass *cam)
 {
-	if (m_waterType == WATER_TYPE_2_PVSHADER && getClippedWaterPlane(cam, nullptr) &&
+	if (m_waterType == WATER_TYPE_2_PVSHADER && m_pReflectionTexture != nullptr &&
+		(!DX8Wrapper::Is_D3D11_Backend_Active() ||
+			m_pReflectionDepthTexture != nullptr) &&
+		getClippedWaterPlane(cam, nullptr) &&
 		TheTerrainRenderObject && TheTerrainRenderObject->getMap())
 		renderMirror(cam);	//generate texture containing reflected scene
 }
@@ -1435,6 +1461,12 @@ void WaterRenderObjClass::updateRenderTargetTextures(CameraClass *cam)
 //-------------------------------------------------------------------------------------------------
 void WaterRenderObjClass::renderMirror(CameraClass *cam)
 {
+	if (cam == nullptr || m_pReflectionTexture == nullptr ||
+		(DX8Wrapper::Is_D3D11_Backend_Active() &&
+			m_pReflectionDepthTexture == nullptr))
+	{
+		return;
+	}
 #ifdef EXTENDED_STATS
 	if (DX8Wrapper::stats.m_disableWater) {
 		return;
@@ -1469,10 +1501,21 @@ void WaterRenderObjClass::renderMirror(CameraClass *cam)
 	Matrix3D reflectedTransform(rRight,rUp,rN,rPos);
 
 
-	DX8Wrapper::Set_Render_Target_With_Z((TextureClass*)m_pReflectionTexture);
+	DX8Wrapper::Set_Render_Target_With_Z((TextureClass*)m_pReflectionTexture,
+		m_pReflectionDepthTexture);
+	if (!DX8Wrapper::Is_Render_To_Texture())
+	{
+		DX8Wrapper::Restore_Default_Render_Target();
+		return;
+	}
 
 	// Clear the backbuffer
-	WW3D::Begin_Render(false,true,Vector3(0.0f,0.0f,0.0f));	//clearing only z-buffer since background always filled with clouds
+	if (WW3D::Begin_Render(false,true,Vector3(0.0f,0.0f,0.0f)) !=
+		WW3D_ERROR_OK)
+	{
+		DX8Wrapper::Restore_Default_Render_Target();
+		return;
+	}	//clearing only z-buffer since background always filled with clouds
 
 	cam->Set_Transform( reflectedTransform );
 
@@ -1505,7 +1548,7 @@ void WaterRenderObjClass::renderMirror(CameraClass *cam)
 	WW3D::End_Render(false);
 
 	// Change the rendertarget back to the main backbuffer
-	DX8Wrapper::Set_Render_Target((IDirect3DSurface8 *)nullptr);
+	DX8Wrapper::Restore_Default_Render_Target();
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -1564,6 +1607,10 @@ void WaterRenderObjClass::Render(RenderInfoClass & rinfo)
 
 		case WATER_TYPE_2_PVSHADER:
 			//Pixel/Vertex Shader based water which uses an off-screen rendered reflection texture
+			if (m_pReflectionTexture == nullptr)
+			{
+				break;
+			}
 			drawSea(rinfo);	//draw water surface
 			break;
 

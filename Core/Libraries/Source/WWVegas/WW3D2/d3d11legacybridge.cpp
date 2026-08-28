@@ -266,19 +266,24 @@ struct D3D11LegacyBridge::Impl
 	struct TextureEntry
 	{
 		TextureEntry() : source(0), render_target(false), depth_stencil(false),
-			d3d11_authority(false), d3d8_dirty(false),
-			last_used_frame(0), handle() {}
+			d3d11_authority(false), d3d8_dirty(false), gpu_copy_valid(false),
+			gpu_copy_frame(0), gpu_copy_lease_epoch(0), last_used_frame(0),
+			handle() {}
 		IDirect3DBaseTexture8 *source;
 		bool render_target;
 		bool depth_stencil;
 		bool d3d11_authority;
 		bool d3d8_dirty;
+		bool gpu_copy_valid;
+		unsigned int gpu_copy_frame;
+		unsigned int gpu_copy_lease_epoch;
 		unsigned int last_used_frame;
 		GpuHandle handle;
 	};
 
 	Impl() : device(0), context(0), legacy_device(0), frame_open(false),
-		log_file(0), frame_id(0), draw_count(0), draw_failure_count(0),
+		log_file(0), frame_id(0), display_epoch(1), draw_count(0),
+		draw_failure_count(0),
 		raw_indexed_draw_count(0),
 		counter_clockwise_draw_count(0), unculled_draw_count(0),
 		color_write_draw_count(0), depth_never_draw_count(0),
@@ -301,6 +306,7 @@ struct D3D11LegacyBridge::Impl
 	bool frame_open;
 	FILE *log_file;
 	unsigned int frame_id;
+	unsigned int display_epoch;
 	unsigned int draw_count;
 	unsigned int draw_failure_count;
 	unsigned int raw_indexed_draw_count;
@@ -416,6 +422,13 @@ struct D3D11LegacyBridge::Impl
 			target_transition_failed = true;
 			return recovery_result;
 		}
+		for (unsigned int index = 0; index < textures.size(); ++index)
+		{
+			// GPU-only render-to-texture contents are not reconstructible by the
+			// render device. Their owners must regenerate them after recovery.
+			textures[index].gpu_copy_valid = false;
+			textures[index].gpu_copy_lease_epoch = 0;
+		}
 		context = device->immediateContext();
 		if (context == 0)
 		{
@@ -530,7 +543,30 @@ struct D3D11LegacyBridge::Impl
 			Is_Target_Handle_Pinned(entry.handle, active_target);
 		const bool pending_target_pinned = pending_target_change &&
 			Is_Target_Handle_Pinned(entry.handle, pending_target);
-		return active_target_pinned || pending_target_pinned;
+		// GPU-produced content acquired by its owner must remain resident through
+		// the current frame. Otherwise an unrelated cache insertion between the
+		// owner's update and draw could recreate the texture from stale D3D8 data.
+		const bool copied_content_acquired =
+			rts::render::Is_D3D11_GPU_Copy_Lease_Active(
+				entry.gpu_copy_valid, entry.gpu_copy_lease_epoch,
+				display_epoch);
+		return active_target_pinned || pending_target_pinned ||
+			copied_content_acquired;
+	}
+
+	void Complete_GPU_Copy_Frame(bool frame_succeeded)
+	{
+		for (unsigned int index = 0; index < textures.size(); ++index)
+		{
+			TextureEntry &entry = textures[index];
+			if (rts::render::Should_Invalidate_D3D11_GPU_Copy(
+					entry.gpu_copy_valid, entry.gpu_copy_frame, frame_id,
+					frame_succeeded))
+			{
+				entry.gpu_copy_valid = false;
+				entry.gpu_copy_lease_epoch = 0;
+			}
+		}
 	}
 
 	void Release_Unbound_Texture_Authority(const RenderTargetBinding &binding)
@@ -1673,7 +1709,7 @@ struct D3D11LegacyBridge::Impl
 		// sampling-only resource. Upgrade it through the normal target path so
 		// the neutral destination has an RTV before issuing CopyResource.
 		TextureEntry *existing = Find_Texture_Entry(destination);
-		if (existing != 0 && !existing->render_target &&
+		if ((existing == 0 || !existing->render_target) &&
 			destination->GetType() == D3DRTYPE_TEXTURE)
 		{
 			IDirect3DSurface8 *surface = 0;
@@ -1749,6 +1785,9 @@ struct D3D11LegacyBridge::Impl
 		{
 			entry->d3d11_authority = true;
 			entry->d3d8_dirty = false;
+			entry->gpu_copy_valid = true;
+			entry->gpu_copy_frame = frame_id;
+			entry->gpu_copy_lease_epoch = display_epoch;
 			entry->last_used_frame = frame_id;
 		}
 		return rts::render::RENDER_RESULT_OK;
@@ -2446,6 +2485,22 @@ bool D3D11LegacyBridge::Is_Active() const
 		m_impl->context != 0 && m_impl->device->isOperational();
 }
 
+void D3D11LegacyBridge::Begin_Display_Iteration()
+{
+	if (!Is_Active())
+	{
+		return;
+	}
+	m_impl->Require_Owner_Thread("display iteration");
+	// A display iteration is the ownership boundary for GPU-copy leases.  It
+	// may contain several hidden RTT frames followed by one visible frame, or
+	// no visible frame at all when rendering is disabled/lost.  Advancing here
+	// expires removed textures in both cases without releasing new RTT content
+	// before the visible draw can sample it.
+	m_impl->display_epoch = rts::render::Advance_D3D11_Display_Epoch(
+		m_impl->display_epoch);
+}
+
 bool D3D11LegacyBridge::Begin_Frame()
 {
 	if (!Is_Active() || m_impl->frame_open)
@@ -2611,6 +2666,9 @@ RenderResult D3D11LegacyBridge::End_Frame(bool present_frame,
 	m_impl->frame_open = false;
 	m_impl->frame_outcome.recordEndFrame(end_result);
 	m_impl->frame_outcome.markFrameEnded();
+	const bool frame_succeeded = end_result == rts::render::RENDER_RESULT_OK &&
+		!m_impl->frame_outcome.hasCommandFailure();
+	m_impl->Complete_GPU_Copy_Frame(frame_succeeded);
 	if (end_result != rts::render::RENDER_RESULT_OK)
 	{
 		m_impl->Log_Result("D3D11 legacy bridge end-frame failed", end_result);
@@ -2932,6 +2990,27 @@ rts::render::RenderResult D3D11LegacyBridge::Copy_Active_Color_Target_To_Texture
 	return m_impl->Copy_Active_Color_Target_To_Texture(destination);
 }
 
+bool D3D11LegacyBridge::Acquire_Copied_Texture_Content(
+	IDirect3DBaseTexture8 *texture)
+{
+	if (!Is_Active() || texture == 0)
+	{
+		return false;
+	}
+	unsigned int found_index = 0;
+	const bool valid = m_impl->texture_index.Find(texture, &found_index) &&
+		found_index < m_impl->textures.size() &&
+		m_impl->textures[found_index].source == texture &&
+		m_impl->textures[found_index].gpu_copy_valid;
+	if (valid)
+	{
+		m_impl->textures[found_index].gpu_copy_lease_epoch =
+			m_impl->display_epoch;
+		m_impl->textures[found_index].last_used_frame = m_impl->frame_id;
+	}
+	return valid;
+}
+
 rts::render::RenderResult D3D11LegacyBridge::Set_Render_Target_Surfaces(
 	IDirect3DSurface8 *color_surface, IDirect3DSurface8 *depth_surface,
 	bool use_default_depth)
@@ -3051,12 +3130,15 @@ void D3D11LegacyBridge::Invalidate_Texture(IDirect3DBaseTexture8 *texture)
 		// idempotent, so consecutive notifications coalesce into one refresh.
 		entry.d3d11_authority = false;
 		entry.d3d8_dirty = true;
+		entry.gpu_copy_valid = false;
+		entry.gpu_copy_lease_epoch = 0;
 		entry.last_used_frame = m_impl->frame_id;
 	}
 }
 
 bool D3D11LegacyBridge::Draw(VertexBufferClass *vertex_buffer,
 	IndexBufferClass *index_buffer, unsigned int primitive_type,
+	unsigned int min_vertex_index, unsigned int vertex_count,
 	unsigned int start_index, unsigned int primitive_count,
 	unsigned int base_vertex)
 {
@@ -3080,6 +3162,17 @@ bool D3D11LegacyBridge::Draw(VertexBufferClass *vertex_buffer,
 		start_index, index_count))
 	{
 		return m_impl->Fail("draw failure: indexed range exceeds buffer");
+	}
+	if (!rts::render::Is_D3D11_Base_Vertex_Valid(base_vertex))
+	{
+		return m_impl->Fail(rts::render::RENDER_RESULT_UNSUPPORTED,
+			"draw failure: base vertex exceeds D3D11 range");
+	}
+	if (!rts::render::Is_D3D8_Vertex_Range_Valid(
+		static_cast<unsigned long>(vertex_buffer->Get_Vertex_Count()),
+		base_vertex, min_vertex_index, vertex_count))
+	{
+		return m_impl->Fail("draw failure: vertex range exceeds buffer");
 	}
 	GpuHandle vertex_handle;
 	GpuHandle index_handle;
@@ -3269,8 +3362,7 @@ bool D3D11LegacyBridge::Draw(IDirect3DVertexBuffer8 *vertex_buffer,
 	{
 		return m_impl->Fail("raw draw failure: indexed primitive count overflow or unsupported topology");
 	}
-	if (base_vertex > static_cast<unsigned int>(
-		std::numeric_limits<int>::max()))
+	if (!rts::render::Is_D3D11_Base_Vertex_Valid(base_vertex))
 	{
 		return m_impl->Fail(rts::render::RENDER_RESULT_UNSUPPORTED,
 			"raw draw failure: base vertex exceeds D3D11 range");
@@ -3578,6 +3670,7 @@ bool D3D11LegacyBridge::Initialize(HWND, IDirect3DDevice8 *, unsigned int,
 	unsigned int, bool) { return false; }
 void D3D11LegacyBridge::Shutdown() {}
 bool D3D11LegacyBridge::Is_Active() const { return false; }
+void D3D11LegacyBridge::Begin_Display_Iteration() {}
 bool D3D11LegacyBridge::Begin_Frame() { return false; }
 void D3D11LegacyBridge::Request_Frame_Capture() {}
 rts::render::RenderResult D3D11LegacyBridge::Get_Back_Buffer_Info(
@@ -3629,10 +3722,13 @@ rts::render::RenderResult D3D11LegacyBridge::Copy_Active_Color_Target_To_Texture
 {
 	return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 }
+bool D3D11LegacyBridge::Acquire_Copied_Texture_Content(
+	IDirect3DBaseTexture8 *) { return false; }
 void D3D11LegacyBridge::Invalidate_Buffer(IUnknown *) {}
 void D3D11LegacyBridge::Invalidate_Texture(IDirect3DBaseTexture8 *) {}
 bool D3D11LegacyBridge::Draw(VertexBufferClass *, IndexBufferClass *,
-	unsigned int, unsigned int, unsigned int, unsigned int) { return false; }
+	unsigned int, unsigned int, unsigned int, unsigned int, unsigned int,
+	unsigned int) { return false; }
 bool D3D11LegacyBridge::Draw(IDirect3DVertexBuffer8 *, unsigned int,
 	unsigned int, IDirect3DIndexBuffer8 *, unsigned int, unsigned int,
 	unsigned int, unsigned int, unsigned int, unsigned int) { return false; }

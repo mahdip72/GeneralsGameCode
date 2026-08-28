@@ -275,8 +275,11 @@ Bool W3DProjectedShadowManager::ReAcquireResources()
 			m_dynamicRenderTarget=DX8Wrapper::Create_Render_Target (DEFAULT_RENDER_TARGET_WIDTH, DEFAULT_RENDER_TARGET_HEIGHT);
 	}
 
-	if (!DX8Wrapper::Is_Initted())
+	if (m_dynamicRenderTarget == nullptr || !DX8Wrapper::Is_Initted())
+	{
+		REF_PTR_RELEASE(m_dynamicRenderTarget);
 		return FALSE;
+	}
 
 	DEBUG_ASSERTCRASH(shadowDecalIndexBufferD3D == nullptr && shadowDecalIndexBufferOwner == nullptr &&
 		shadowDecalVertexBufferD3D == nullptr && shadowDecalVertexBufferOwner == nullptr,
@@ -2157,21 +2160,26 @@ void W3DProjectedShadow::updateTexture(Vector3 &lightPos)
 
 		context->light_environment->Reset(m_robj->Get_Position(), Vector3(0,0,0));
 
-		m_shadowProjector->Compute_Texture(m_robj,context);
+		TextureClass *shadow_texture=m_shadowTexture[0]->getTexture();
+		const bool d3d11_active=DX8Wrapper::Is_D3D11_Backend_Active();
+		if (!m_shadowProjector->Compute_Texture(m_robj,context,
+				d3d11_active ? shadow_texture : nullptr))
+		{
+			return;
+		}
 
-		//Need to copy generated texture into permanent texture.
-		SurfaceClass *oldSurface=m_shadowTexture[0]->getTexture()->Get_Surface_Level();
-		SurfaceClass *newSurface=TheW3DProjectedShadowManager->getRenderTarget()->Get_Surface_Level();
-
-		//Copy shadow from temporary video-memory surface into a permanent texture
-		oldSurface->Copy(0,0,0,0,DEFAULT_RENDER_TARGET_WIDTH,DEFAULT_RENDER_TARGET_HEIGHT,newSurface);
-		// The permanent shadow texture is retained across frames.  The legacy
-		// surface copy updates its legacy storage in place, so invalidate the
-		// corresponding D3D11 upload before the next mirrored draw.
-		Notify_Render_Texture_Changed(
-			m_shadowTexture[0]->getTexture()->Peek_D3D_Base_Texture());
-		REF_PTR_RELEASE(newSurface);
-		REF_PTR_RELEASE(oldSurface);
+		if (!d3d11_active)
+		{
+			// Copy shadow from the temporary video-memory surface into the
+			// permanent texture. D3D11 performs its GPU copy while the temporary
+			// target is still active inside Compute_Texture.
+			SurfaceClass *oldSurface=shadow_texture->Get_Surface_Level();
+			SurfaceClass *newSurface=TheW3DProjectedShadowManager->getRenderTarget()->Get_Surface_Level();
+			oldSurface->Copy(0,0,0,0,DEFAULT_RENDER_TARGET_WIDTH,DEFAULT_RENDER_TARGET_HEIGHT,newSurface);
+			Notify_Render_Texture_Changed(shadow_texture->Peek_D3D_Base_Texture());
+			REF_PTR_RELEASE(newSurface);
+			REF_PTR_RELEASE(oldSurface);
+		}
 		m_shadowTexture[0]->updateBounds(TheW3DShadowManager->getLightPosWorld(0),m_robj);	//update local shadow bounds
 	}
 	else
@@ -2220,7 +2228,12 @@ void W3DProjectedShadow::updateProjectionParameters(const Matrix3D &cameraXform)
 
 void W3DProjectedShadow::update()
 {
-	if (m_shadowTexture[0]->getLightPosHistory() != TheW3DShadowManager->getLightPosWorld(0))
+	const bool missing_d3d11_projection =
+		m_type == SHADOW_PROJECTION && DX8Wrapper::Is_D3D11_Backend_Active() &&
+		!DX8Wrapper::Acquire_D3D11_Copied_Texture_Content(
+			m_shadowTexture[0]->getTexture()->Peek_D3D_Base_Texture());
+	if (missing_d3d11_projection ||
+		m_shadowTexture[0]->getLightPosHistory() != TheW3DShadowManager->getLightPosWorld(0))
 	{	//light has moved since last time this shadow was calculated. Need update
 		updateTexture(TheW3DShadowManager->getLightPosWorld(0));
 	}
@@ -2246,7 +2259,12 @@ Int W3DShadowTexture::init(RenderObjClass *robj)
 	///@todo: implement this function
 	SurfaceClass::SurfaceDescription surface_desc;
 
-	TheW3DProjectedShadowManager->getRenderTarget()->Get_Level_Description(surface_desc);
+	TextureClass *render_target = TheW3DProjectedShadowManager->getRenderTarget();
+	if (render_target == nullptr)
+	{
+		return 0;
+	}
+	render_target->Get_Level_Description(surface_desc);
 
 	TextureClass *new_texture = MSGNEW("TextureClass") TextureClass(surface_desc.Width,surface_desc.Height,surface_desc.Format,MIP_LEVELS_1);
 

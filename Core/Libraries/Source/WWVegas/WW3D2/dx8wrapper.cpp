@@ -2250,6 +2250,11 @@ bool DX8Wrapper::Is_D3D11_Backend_Active()
 	return _D3D11Bridge.Is_Active();
 }
 
+void DX8Wrapper::Begin_D3D11_Display_Iteration()
+{
+	_D3D11Bridge.Begin_Display_Iteration();
+}
+
 rts::render::RenderResult DX8Wrapper::Get_Render_Back_Buffer_Info(
 	rts::render::RenderBackBufferInfo *info)
 {
@@ -2260,6 +2265,12 @@ rts::render::RenderResult DX8Wrapper::Copy_Active_Render_Target_To_Texture(
 	IDirect3DBaseTexture8 *destination)
 {
 	return _D3D11Bridge.Copy_Active_Color_Target_To_Texture(destination);
+}
+
+bool DX8Wrapper::Acquire_D3D11_Copied_Texture_Content(
+	IDirect3DBaseTexture8 *texture)
+{
+	return _D3D11Bridge.Acquire_Copied_Texture_Content(texture);
 }
 
 void DX8Wrapper::Notify_D3D11_Buffer_Changed(IUnknown *buffer)
@@ -2516,6 +2527,7 @@ void DX8Wrapper::Draw_Sorting_IB_VB(
 	{
 		if (!_D3D11Bridge.Draw(dyn_vb_access.VertexBuffer,
 			dyn_ib_access.IndexBuffer, D3DPT_TRIANGLELIST,
+			0, vertex_count,
 			dyn_ib_access.IndexBufferOffset, polygon_count,
 			dyn_vb_access.VertexBufferOffset))
 		{
@@ -2650,6 +2662,7 @@ void DX8Wrapper::Draw(
 				{
 					if (!_D3D11Bridge.Draw(render_state.vertex_buffers[0],
 						render_state.index_buffer, primitive_type,
+						min_vertex_index, vertex_count,
 						start_index + render_state.iba_offset, polygon_count,
 						render_state.index_base_offset + render_state.vba_offset))
 					{
@@ -3901,6 +3914,9 @@ bool DX8Wrapper::Publish_Render_State(D3DRENDERSTATETYPE state,
 		rts::render::TrackLegacyGlobalAmbient(
 			rts::render::DecodeLegacyD3D8Ambient(value));
 		break;
+	case D3DRS_RANGEFOGENABLE:
+		neutral.rangeFogEnable = value != FALSE;
+		break;
 	case D3DRS_NORMALIZENORMALS:
 		neutral.normalizeNormals = value != FALSE;
 		break;
@@ -4433,7 +4449,8 @@ void DX8Wrapper::Create_Render_Target
 void DX8Wrapper::Set_Render_Target_With_Z
 (
 	TextureClass* texture,
-	ZTextureClass* ztexture
+	ZTextureClass* ztexture,
+	bool use_default_depth_if_missing
 )
 {
 	WWASSERT(texture!=nullptr);
@@ -4452,7 +4469,8 @@ void DX8Wrapper::Set_Render_Target_With_Z
 	}
 	else
 	{
-		target_result = Set_Render_Target(d3d_surf,true);
+		target_result = Set_Render_Target(d3d_surf,
+			use_default_depth_if_missing);
 	}
 	d3d_surf->Release();
 
@@ -4644,6 +4662,11 @@ DX8Wrapper::Set_Render_Target(IDirect3DSurface8 *render_target, bool use_default
 	// clear the state.
 	IsRenderToTexture = SUCCEEDED(target_result) && !restoring_default;
 	return target_result;
+}
+
+HRESULT DX8Wrapper::Restore_Default_Render_Target()
+{
+	return Set_Render_Target((IDirect3DSurface8 *)nullptr);
 }
 
 

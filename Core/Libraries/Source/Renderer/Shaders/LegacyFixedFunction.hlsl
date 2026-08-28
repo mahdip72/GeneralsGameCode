@@ -39,6 +39,7 @@ cbuffer LegacyTransformConstants : register(b0)
 	row_major float3x3 WorldViewNormalMatrix;
 	float4 ClipPlanes[6];
 	uint4 ClipPlaneParameters;
+	uint4 FogStateParameters;
 };
 
 bool UsesPreTransformedPosition()
@@ -116,6 +117,16 @@ float CalculateFogFactor(float depth)
 	const float range = FogParameters.y - FogParameters.x;
 	return abs(range) < 0.000001f ? 0.0f :
 		saturate((FogParameters.y - depth) / range);
+}
+
+float CalculateFogDepth(float3 cameraPosition, bool preTransformed)
+{
+	if (preTransformed)
+	{
+		return cameraPosition.z;
+	}
+	return FogStateParameters.x != 0U ?
+		length(cameraPosition) : cameraPosition.z;
 }
 
 float4 ApplyLegacyPixelState(float4 color, float fogDepth)
@@ -378,8 +389,10 @@ VertexOutput VSMain(VertexInput input)
 	const float4 objectPosition = float4(input.position.xyz, 1.0f);
 	output.position = TransformLegacyPosition(input.position);
 	output.color = input.color;
-	output.fogDepth = UsesPreTransformedPosition() ?
-		input.position.z : mul(objectPosition, WorldView).z;
+	const float3 cameraPosition = UsesPreTransformedPosition() ?
+		input.position.xyz : mul(objectPosition, WorldView).xyz;
+	output.fogDepth = CalculateFogDepth(cameraPosition,
+		UsesPreTransformedPosition());
 	const float3 worldPosition = mul(objectPosition, World).xyz;
 	output.clipDistance0 = float4(
 		GetLegacyClipDistance(0, worldPosition, UsesPreTransformedPosition()),
@@ -462,7 +475,7 @@ TexturedVertexOutput VSTextured(TexturedVertexInput input)
 		output.textureCoordinate6 = 0.0f;
 		output.textureCoordinate7 = 0.0f;
 		const float4 cameraPosition = mul(animatedObjectPosition, WorldView);
-		output.fogDepth = cameraPosition.z;
+		output.fogDepth = CalculateFogDepth(cameraPosition.xyz, false);
 		output.cameraPosition = cameraPosition.xyz;
 		output.cameraNormal = float3(0.0f, 0.0f, 1.0f);
 		const float3 worldPosition = mul(animatedObjectPosition, World).xyz;
@@ -509,8 +522,8 @@ TexturedVertexOutput VSTextured(TexturedVertexInput input)
 	output.textureCoordinate6 = input.textureCoordinate6;
 	output.textureCoordinate7 = input.textureCoordinate7;
 	const float4 cameraPosition = mul(objectPosition, WorldView);
-	output.fogDepth = UsesPreTransformedPosition() ?
-		input.position.z : cameraPosition.z;
+	output.fogDepth = CalculateFogDepth(UsesPreTransformedPosition() ?
+		input.position.xyz : cameraPosition.xyz, UsesPreTransformedPosition());
 	output.cameraPosition = cameraPosition.xyz;
 	output.cameraNormal = GetLegacyCameraSpaceNormal(normal,
 		VertexLayoutParameters.x != 0U, UsesPreTransformedPosition());
@@ -567,8 +580,13 @@ SeaWaveVertexOutput VSSeaWave(SeaWaveVertexInput input)
 	output.bumpCoordinate = input.bumpCoordinate;
 	output.diffuse = input.diffuse;
 	// c7-c10 is the transposed per-patch world/view matrix uploaded alongside
-	// the c2-c5 WVP.  Its third row produces the matching view-space depth.
-	output.fogDepth = dot(objectPosition, LegacyVertexConstants[9]);
+	// the c2-c5 WVP. Reconstruct the view-space position so range fog can use
+	// viewer distance while z fog retains the legacy third-row result.
+	const float3 cameraPosition = float3(
+		dot(objectPosition, LegacyVertexConstants[7]),
+		dot(objectPosition, LegacyVertexConstants[8]),
+		dot(objectPosition, LegacyVertexConstants[9]));
+	output.fogDepth = CalculateFogDepth(cameraPosition, false);
 	const float3 worldPosition = mul(objectPosition, World).xyz;
 	output.clipDistance0 = float4(
 		GetLegacyClipDistance(0, worldPosition, false),

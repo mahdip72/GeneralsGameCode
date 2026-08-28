@@ -318,6 +318,7 @@ struct LegacyPipelineState
 	LegacyRasterizerState rasterizer;
 	LegacyTextureStageState textureStages[LEGACY_TEXTURE_STAGE_COUNT];
 	RenderFogMode fogMode;
+	bool rangeFogEnable;
 	bool secondaryGradientEnable;
 	bool nPatchEnable;
 	bool lightingEnable;

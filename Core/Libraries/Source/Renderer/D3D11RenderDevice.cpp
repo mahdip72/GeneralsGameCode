@@ -381,6 +381,7 @@ struct LegacyTransformConstants
 	float worldViewNormalMatrix[12];
 	float clipPlanes[LEGACY_CLIP_PLANE_COUNT][4];
 	unsigned int clipPlaneParameters[4];
+	unsigned int fogStateParameters[4];
 };
 
 void MultiplyMatrices(const float *left, const float *right, float *product)
@@ -3025,6 +3026,11 @@ private:
 			state.pipeline.alphaReference > 255 ? 255 :
 			state.pipeline.alphaReference;
 		shaderConstants.alphaTestParameters[3] = 0;
+		shaderConstants.fogStateParameters[0] =
+			state.pipeline.rangeFogEnable ? 1U : 0U;
+		shaderConstants.fogStateParameters[1] = 0;
+		shaderConstants.fogStateParameters[2] = 0;
+		shaderConstants.fogStateParameters[3] = 0;
 		for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
 		{
 			const LegacyTextureStageState &textureStage =

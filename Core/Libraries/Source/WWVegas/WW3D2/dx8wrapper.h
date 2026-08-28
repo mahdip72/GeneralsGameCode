@@ -470,10 +470,13 @@ public:
 	static IDirect3DSurface8 * _Get_DX8_Front_Buffer();
 	static SurfaceClass * _Get_DX8_Back_Buffer(unsigned int num=0);
 	static bool Is_D3D11_Backend_Active();
+	static void Begin_D3D11_Display_Iteration();
 	static rts::render::RenderResult Get_Render_Back_Buffer_Info(
 		rts::render::RenderBackBufferInfo *info);
 	static rts::render::RenderResult Copy_Active_Render_Target_To_Texture(
 		IDirect3DBaseTexture8 *destination);
+	static bool Acquire_D3D11_Copied_Texture_Content(
+		IDirect3DBaseTexture8 *texture);
 	static void Notify_D3D11_Buffer_Changed(IUnknown *buffer);
 	static void Notify_D3D11_Texture_Changed(IDirect3DBaseTexture8 *texture);
 	static void Notify_D3D11_Texture_Changed(TextureClass *texture);
@@ -563,6 +566,7 @@ public:
 	// historical fire-and-forget use, but RTT publishers must honor it.
 	static HRESULT				Set_Render_Target (IDirect3DSurface8 *render_target, bool use_default_depth_buffer = false);
 	static HRESULT				Set_Render_Target (IDirect3DSurface8* render_target, IDirect3DSurface8* dpeth_buffer);
+	static HRESULT				Restore_Default_Render_Target();
 
 	static void					Set_Render_Target (IDirect3DSwapChain8 *swap_chain);
 	static bool					Is_Render_To_Texture() { return IsRenderToTexture; }
@@ -577,7 +581,8 @@ public:
 		TextureClass** target,
 		ZTextureClass** depth_buffer
 	);
-	static void					Set_Render_Target_With_Z (TextureClass * texture, ZTextureClass* ztexture=nullptr);
+	static void					Set_Render_Target_With_Z (TextureClass * texture,
+		ZTextureClass* ztexture=nullptr, bool use_default_depth_if_missing=true);
 
 	static void Set_Shadow_Map(int idx, ZTextureClass* ztex) { Shadow_Map[idx]=ztex; }
 	static ZTextureClass* Get_Shadow_Map(int idx) { return Shadow_Map[idx]; }

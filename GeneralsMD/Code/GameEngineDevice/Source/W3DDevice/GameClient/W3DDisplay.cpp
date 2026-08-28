@@ -1997,6 +1997,10 @@ AGAIN:
 	}
 
 	do {
+		// Retire last iteration's transient GPU-copy leases even if rendering was
+		// disabled or the visible frame could not begin.  Hidden RTT passes below
+		// acquire fresh leases which remain valid through this iteration's draw.
+		DX8Wrapper::Begin_D3D11_Display_Iteration();
 
 		// update all views of the world - recomputes data which will affect drawing
 		// The D3D8 device is intentionally absent when the D3D11 compatibility

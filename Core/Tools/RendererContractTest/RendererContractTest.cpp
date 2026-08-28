@@ -1172,15 +1172,26 @@ int testLegacyShaderBitDecoder()
 		"reserved legacy encodings fail closed to deterministic defaults");
 	rts::render::TrackLegacyShaderBits(opaque);
 	rts::render::TrackLegacyCullState(true, true);
+	rts::render::GetTrackedLegacyPipelineState(&state);
+	state.rangeFogEnable = true;
+	rts::render::TrackLegacyPipelineState(state);
 	// Re-selecting an already-applied shader must not erase the effective
-	// D3D8 winding when its cached render-state call is suppressed.
+	// D3D8 winding or independent range-fog state when their cached render-state
+	// calls are suppressed.
 	rts::render::TrackLegacyShaderBits(opaque);
 	result |= check(rts::render::GetTrackedLegacyPipelineState(&state) &&
 		state.shaderBits == opaque &&
 		state.rasterizer.cullMode == rts::render::RENDER_CULL_BACK &&
 		state.rasterizer.frontCounterClockwise &&
+		state.rangeFogEnable &&
 		state.textureStages[0].colorOperation == rts::render::RENDER_TEXTURE_OP_MODULATE,
-		"legacy bridge publishes the effective D3D8 cull winding to the neutral boundary");
+		"legacy shader publication preserves independent cull and range-fog state");
+	rts::render::TrackLegacyShaderBits(alphaTested);
+	result |= check(rts::render::GetTrackedLegacyPipelineState(&state) &&
+		state.shaderBits == alphaTested && state.rangeFogEnable,
+		"legacy shader changes preserve independent range-fog state");
+	rts::render::TrackLegacyShaderBits(opaque);
+	rts::render::GetTrackedLegacyPipelineState(&state);
 	rts::render::LegacyPipelineState effectiveState = state;
 	effectiveState.blend.blendEnable = true;
 	effectiveState.blend.sourceColor = rts::render::RENDER_BLEND_SOURCE_ALPHA;
@@ -1704,6 +1715,22 @@ int testD3D11HiddenSwapChain()
 				rts::render::RENDER_RESULT_OK &&
 			context->endFrame() == rts::render::RENDER_RESULT_OK,
 			"D3D11 rejects mismatched color/depth attachment dimensions before binding");
+		rts::render::RenderTargetBinding colorOnlyTarget;
+		colorOnlyTarget.useBackBufferColor = false;
+		colorOnlyTarget.useBackBufferDepth = false;
+		colorOnlyTarget.hasColor = true;
+		colorOnlyTarget.hasDepth = false;
+		colorOnlyTarget.color.resource = offscreenColor;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->setRenderTargets(colorOnlyTarget) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->clearTargets(rts::render::RENDER_CLEAR_COLOR,
+				rts::render::RenderFloat4(1.0f, 1.0f, 1.0f, 1.0f),
+				1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setRenderTargets(rts::render::RenderTargetBinding()) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK,
+			"D3D11 accepts a differently sized color-only projected-shadow target");
 		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
 			context->clear(rts::render::RenderFloat4(0.0f, 0.0f, 1.0f, 1.0f),
 				1.0f, 0) == rts::render::RENDER_RESULT_OK &&
@@ -1711,6 +1738,9 @@ int testD3D11HiddenSwapChain()
 				rts::render::RENDER_RESULT_OK &&
 			context->endFrame() == rts::render::RENDER_RESULT_OK,
 			"D3D11 copies the active color target into a compatible texture");
+		result |= check(device->copyActiveColorTargetToTexture(copiedColor) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+			"D3D11 active-target copy requires an open render frame");
 		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
 			context->clear(rts::render::RenderFloat4(0.0f, 0.0f, 1.0f, 1.0f),
 				1.0f, 0) == rts::render::RENDER_RESULT_OK &&
@@ -1978,6 +2008,60 @@ int testD3D11HiddenSwapChain()
 		center = &pixels[4 * (32 * 64 + 32)];
 		result |= check(center[1] > 240 && center[0] < 16 && center[2] < 16,
 			"linear fog reaches the configured fog color");
+
+		// Keep the triangle centered while translating view space sideways. Z fog
+		// sees zero depth; range fog must see the non-zero viewer distance.
+		logicalState.constants.fog.start = 0.0f;
+		logicalState.constants.fog.end = 0.25f;
+		logicalState.constants.view.values[12] = 0.5f;
+		logicalState.constants.projection.values[12] = -0.5f;
+		logicalState.pipeline.rangeFogEnable = false;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyState(logicalState,
+				rts::render::RENDER_VERTEX_POSITION3_COLOR, 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(vertexBuffer, sizeof(TestVertex), 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"D3D11 z fog preserves zero-depth geometry");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[0] > 240 && center[1] < 16,
+			"z fog uses camera-space z instead of viewer distance");
+		logicalState.pipeline.rangeFogEnable = true;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyState(logicalState,
+				rts::render::RENDER_VERTEX_POSITION3_COLOR, 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(vertexBuffer, sizeof(TestVertex), 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"D3D11 range fog uses viewer distance");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[1] > 240 && center[0] < 16,
+			"range fog reaches the configured color away from the view axis");
+		logicalState.pipeline.rangeFogEnable = false;
+		logicalState.constants.view.values[12] = 0.0f;
+		logicalState.constants.projection.values[12] = 0.0f;
+		logicalState.constants.fog.start = -1.0f;
+		logicalState.constants.fog.end = 0.0f;
 		// Fog blends RGB only.  Preserve a half-alpha source so the blend stage
 		// can distinguish the fixed-function fog result from an alpha blend with
 		// fog color alpha zero.
@@ -2534,6 +2618,62 @@ int testD3D11HiddenSwapChain()
 			"sea-wave alpha-test rejection leaves the clear target untouched");
 		logicalState.pipeline.alphaTestEnable = false;
 		logicalState.pipeline.blend = rts::render::LegacyBlendState();
+		logicalState.pipeline.fogMode = rts::render::RENDER_FOG_LINEAR;
+		logicalState.constants.fog.enabled = true;
+		logicalState.constants.fog.color =
+			rts::render::RenderFloat4(0.0f, 1.0f, 0.0f, 1.0f);
+		logicalState.constants.fog.start = 0.0f;
+		logicalState.constants.fog.end = 0.25f;
+		logicalState.constants.vertexShaderConstants[7].w = 0.5f;
+		logicalState.pipeline.rangeFogEnable = false;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyStateForLayout(logicalState, seaLayout, 3) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(seaVertexBuffer, sizeof(SeaVertex), 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setTexture(0, seaBumpTexture) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setTexture(1, seaReflectionTexture) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"sea-wave z fog preserves off-axis zero-depth color");
+		center = &pixels[4 * (32 * 64 + 32)];
+		const unsigned char seaZFogGreen = center[1];
+		logicalState.pipeline.rangeFogEnable = true;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyStateForLayout(logicalState, seaLayout, 3) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(seaVertexBuffer, sizeof(SeaVertex), 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setTexture(0, seaBumpTexture) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setTexture(1, seaReflectionTexture) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"sea-wave range fog uses off-axis per-patch viewer distance");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[1] > 240 && center[1] > seaZFogGreen + 100,
+			"sea-wave range fog reaches its color away from the view axis");
+		logicalState.pipeline.rangeFogEnable = false;
+		logicalState.constants.vertexShaderConstants[7].w = 0.0f;
 		logicalState.pipeline.fogMode = rts::render::RENDER_FOG_DISABLED;
 		logicalState.constants.fog.enabled = false;
 		logicalState.pipeline.pixelProgram =
@@ -2571,6 +2711,112 @@ int testD3D11HiddenSwapChain()
 		center = &pixels[4 * (32 * 64 + 32)];
 		result |= check(center[1] > 240 && center[0] < 16 && center[2] < 16,
 			"captured D3D11 textured triangle preserves sampled color");
+		logicalState.pipeline.fogMode = rts::render::RENDER_FOG_LINEAR;
+		logicalState.constants.fog.enabled = true;
+		logicalState.constants.fog.color =
+			rts::render::RenderFloat4(1.0f, 0.0f, 0.0f, 1.0f);
+		logicalState.constants.fog.start = 0.0f;
+		logicalState.constants.fog.end = 0.25f;
+		logicalState.constants.view.values[12] = 0.5f;
+		logicalState.constants.projection.values[12] = -0.5f;
+		logicalState.pipeline.rangeFogEnable = false;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyStateForLayout(logicalState, texturedLayout, 1) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(texturedVertexBuffer,
+				sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(0, texture) == rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"textured z fog preserves zero-depth sampled color");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[1] > 240 && center[0] < 16,
+			"textured z fog uses camera-space z");
+		logicalState.pipeline.rangeFogEnable = true;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyStateForLayout(logicalState, texturedLayout, 1) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(texturedVertexBuffer,
+				sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(0, texture) == rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"textured range fog uses viewer distance");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[2] > 240 && center[1] < 16,
+			"textured range fog reaches its color away from the view axis");
+		// The tree program derives its diffuse intensity from normal.y. These
+		// vertices deliberately produce black before fog, making the same
+		// off-axis range-fog transition unambiguous without a separate fixture.
+		logicalState.pipeline.vertexProgram =
+			rts::render::RENDER_LEGACY_VERTEX_TREES;
+		logicalState.constants.vertexShaderConstants[8] =
+			rts::render::RenderFloat4();
+		logicalState.pipeline.rangeFogEnable = false;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyStateForLayout(logicalState, texturedLayout, 1) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(texturedVertexBuffer,
+				sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(0, texture) == rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"tree z fog preserves off-axis zero-depth color");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[0] < 16 && center[1] < 16 && center[2] < 16,
+			"tree z fog uses camera-space z");
+		logicalState.pipeline.rangeFogEnable = true;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyStateForLayout(logicalState, texturedLayout, 1) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(texturedVertexBuffer,
+				sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(0, texture) == rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"tree range fog uses viewer distance");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[2] > 240 && center[1] < 16,
+			"tree range fog reaches its color away from the view axis");
+		logicalState.pipeline.vertexProgram =
+			rts::render::RENDER_LEGACY_VERTEX_FIXED_FUNCTION;
+		logicalState.pipeline.rangeFogEnable = false;
+		logicalState.pipeline.fogMode = rts::render::RENDER_FOG_DISABLED;
+		logicalState.constants.fog.enabled = false;
+		logicalState.constants.view.values[12] = 0.0f;
+		logicalState.constants.projection.values[12] = 0.0f;
 		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
 			context->setTexture(0, offscreenColor) ==
 				rts::render::RENDER_RESULT_OK &&
@@ -4292,6 +4538,9 @@ int testD3D11LegacyBridgeLifecycleContract()
 		unsigned int, unsigned int);
 	typedef rts::render::RenderResult (D3D11LegacyBridge::*ExpectedActiveCopy)(
 		IDirect3DBaseTexture8 *);
+	typedef bool (D3D11LegacyBridge::*ExpectedCopiedContentAcquire)(
+		IDirect3DBaseTexture8 *);
+	typedef void (D3D11LegacyBridge::*ExpectedDisplayIteration)();
 	typedef void (D3D11LegacyBridge::*ExpectedCaptureRequest)();
 	typedef bool (D3D11LegacyBridge::*ExpectedBeginFrame)();
 	result |= check(std::is_same<decltype(static_cast<ExpectedEndFrame>(
@@ -4302,6 +4551,10 @@ int testD3D11LegacyBridgeLifecycleContract()
 		ExpectedResize>::value &&
 		std::is_same<decltype(&D3D11LegacyBridge::Copy_Active_Color_Target_To_Texture),
 		ExpectedActiveCopy>::value &&
+		std::is_same<decltype(&D3D11LegacyBridge::Acquire_Copied_Texture_Content),
+		ExpectedCopiedContentAcquire>::value &&
+		std::is_same<decltype(&D3D11LegacyBridge::Begin_Display_Iteration),
+		ExpectedDisplayIteration>::value &&
 		std::is_same<decltype(&D3D11LegacyBridge::Request_Frame_Capture),
 		ExpectedCaptureRequest>::value &&
 		std::is_same<decltype(&D3D11LegacyBridge::Begin_Frame),
