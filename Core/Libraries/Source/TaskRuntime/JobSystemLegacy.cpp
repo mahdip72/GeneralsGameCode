@@ -410,13 +410,20 @@ void JobSystem::recordSerialFallback() { if (m_state != 0) ++m_state->metrics.se
 JobGroup JobSystem::createGroup()
 {
 	if (!isRunning() || m_state->stopping) return JobGroup();
+	LegacyGroupRecord *record = 0;
 	try
 	{
-		LegacyGroupRecord *record = new LegacyGroupRecord(m_state,
+		record = new LegacyGroupRecord(m_state,
 			m_state->generation);
-		return JobGroup(new JobGroup::State(record));
+		JobGroup::State *state = new JobGroup::State(record);
+		record = 0;
+		return JobGroup(state);
 	}
-	catch (...) { return JobGroup(); }
+	catch (...)
+	{
+		delete record;
+		return JobGroup();
+	}
 }
 
 JobHandle JobSystem::trySubmit(Job *job, JobPriority priority,

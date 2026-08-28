@@ -21,11 +21,27 @@ enum JobSystemTestFault
 	JOB_SYSTEM_TEST_FAIL_JOB_ALLOCATION = 5,
 	JOB_SYSTEM_TEST_FAIL_QUEUE_PUSH = 6,
 	JOB_SYSTEM_TEST_FAIL_COMPLETION_PUSH = 7,
-	JOB_SYSTEM_TEST_FAIL_PROMOTION_PUSH = 8
+	JOB_SYSTEM_TEST_FAIL_PROMOTION_PUSH = 8,
+	JOB_SYSTEM_TEST_COMPETING_FINALIZER = 9
+};
+
+enum JobSystemTestPause
+{
+	JOB_SYSTEM_TEST_PAUSE_AFTER_ACCEPT = 1,
+	JOB_SYSTEM_TEST_PAUSE_BEFORE_DEPENDENT_ENQUEUE = 2,
+	JOB_SYSTEM_TEST_PAUSE_AFTER_QUEUE_FAILURE = 4,
+	JOB_SYSTEM_TEST_PAUSE_NON_OWNER_FINALIZER = 8,
+	JOB_SYSTEM_TEST_PAUSE_AFTER_DEPENDENT_ENQUEUE = 16
 };
 
 extern "C" void rts_job_system_set_test_fault(unsigned fault,
 	unsigned occurrence);
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
+extern "C" void rts_job_system_set_test_pause_mask(unsigned pauseMask);
+extern "C" bool rts_job_system_wait_for_test_pause(unsigned pausePoint,
+	unsigned timeoutMilliseconds);
+extern "C" void rts_job_system_release_test_pause(unsigned pausePoint);
+#endif
 #endif
 
 namespace
@@ -360,6 +376,27 @@ public:
 	virtual ~LifetimeJob() { m_destructions->fetch_add(1, std::memory_order_relaxed); }
 	virtual void execute(rts::JobContext &) {}
 private:
+	std::atomic<unsigned> *m_destructions;
+};
+
+class BlockingLifetimeJob : public rts::Job
+{
+public:
+	BlockingLifetimeJob(Gate *gate, std::atomic<unsigned> *executions,
+		std::atomic<unsigned> *destructions)
+		: m_gate(gate), m_executions(executions), m_destructions(destructions) {}
+	virtual ~BlockingLifetimeJob()
+	{
+		m_destructions->fetch_add(1, std::memory_order_relaxed);
+	}
+	virtual void execute(rts::JobContext &)
+	{
+		m_executions->fetch_add(1, std::memory_order_relaxed);
+		m_gate->waitUntilOpen();
+	}
+private:
+	Gate *m_gate;
+	std::atomic<unsigned> *m_executions;
 	std::atomic<unsigned> *m_destructions;
 };
 
@@ -823,6 +860,275 @@ int testFaultInjectionAndRecovery()
 	delete job;
 	result |= check(destructions.load() == 2, "caller owns queue-rejected job");
 
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
+	{
+		system.shutdown();
+		config.workerCount = 1;
+		config.queueCapacity = 8;
+		result |= check(system.start(config),
+			"admission-claim race test starts");
+		rts::JobGroup raceGroup = system.createGroup();
+		Gate prerequisiteGate;
+		Gate dependentGate;
+		std::atomic<unsigned> executions(0);
+		std::atomic<unsigned> raceDestructions(0);
+		GateJob *prerequisiteJob = new GateJob(&prerequisiteGate);
+		rts::JobHandle prerequisite = system.trySubmit(prerequisiteJob,
+			rts::JOB_PRIORITY_NORMAL, raceGroup);
+		if (!prerequisite.isValid())
+		{
+			delete prerequisiteJob;
+		}
+		result |= check(prerequisite.isValid() && prerequisiteGate.waitForEntry(),
+			"admission-claim prerequisite enters");
+
+		rts::JobHandle dependent;
+		BlockingLifetimeJob *raceJob = new BlockingLifetimeJob(&dependentGate,
+			&executions, &raceDestructions);
+		rts_job_system_set_test_pause_mask(JOB_SYSTEM_TEST_PAUSE_AFTER_ACCEPT);
+		std::thread submitter([&]() {
+			dependent = system.trySubmitAfter(raceJob,
+				rts::JOB_PRIORITY_NORMAL, raceGroup, &prerequisite, 1);
+		});
+		const bool admissionPaused = rts_job_system_wait_for_test_pause(
+			JOB_SYSTEM_TEST_PAUSE_AFTER_ACCEPT, 5000);
+		result |= check(admissionPaused,
+			"dependent admission reaches the deterministic pause");
+		prerequisiteGate.open();
+		result |= check(dependentGate.waitForEntry(),
+			"dependency release transfers execution ownership");
+		rts_job_system_release_test_pause(JOB_SYSTEM_TEST_PAUSE_AFTER_ACCEPT);
+		submitter.join();
+		result |= check(dependent.isValid(),
+			"execution ownership prevents admission rollback");
+		dependentGate.open();
+		const std::chrono::steady_clock::time_point raceDeadline =
+			std::chrono::steady_clock::now() + std::chrono::seconds(5);
+		while (!raceGroup.isComplete() &&
+			std::chrono::steady_clock::now() < raceDeadline)
+		{
+			std::this_thread::yield();
+		}
+		result |= check(raceGroup.isComplete(),
+			"admission-claim race group drains");
+		result |= check(dependent.isValid() && dependent.succeeded() &&
+			executions.load(std::memory_order_relaxed) == 1 &&
+			raceDestructions.load(std::memory_order_relaxed) == 1 &&
+			system.outstandingJobCount() == 0,
+			"claimed dependent executes and is finalized exactly once");
+		if (!dependent.isValid() &&
+			executions.load(std::memory_order_acquire) == 0)
+		{
+			delete raceJob;
+		}
+		rts_job_system_set_test_pause_mask(0);
+
+		system.shutdown();
+		result |= check(system.start(config),
+			"dependency-publication failure test starts");
+		rts::JobGroup failureGroup = system.createGroup();
+		Gate failurePrerequisiteGate;
+		std::atomic<unsigned> failedExecutions(0);
+		std::atomic<unsigned> failedDestructions(0);
+		Gate failedJobGate;
+		GateJob *failurePrerequisiteJob = new GateJob(&failurePrerequisiteGate);
+		rts::JobHandle failurePrerequisite = system.trySubmit(
+			failurePrerequisiteJob, rts::JOB_PRIORITY_NORMAL, failureGroup);
+		if (!failurePrerequisite.isValid())
+		{
+			delete failurePrerequisiteJob;
+		}
+		result |= check(failurePrerequisite.isValid() &&
+			failurePrerequisiteGate.waitForEntry(),
+			"publication-failure prerequisite enters");
+		rts::JobHandle failedDependent;
+		BlockingLifetimeJob *failedJob = new BlockingLifetimeJob(&failedJobGate,
+			&failedExecutions, &failedDestructions);
+		const unsigned publicationPauseMask =
+			JOB_SYSTEM_TEST_PAUSE_AFTER_ACCEPT |
+			JOB_SYSTEM_TEST_PAUSE_BEFORE_DEPENDENT_ENQUEUE |
+			JOB_SYSTEM_TEST_PAUSE_AFTER_QUEUE_FAILURE |
+			JOB_SYSTEM_TEST_PAUSE_AFTER_DEPENDENT_ENQUEUE;
+		rts_job_system_set_test_pause_mask(publicationPauseMask);
+		std::thread failureSubmitter([&]() {
+			failedDependent = system.trySubmitAfter(failedJob,
+				rts::JOB_PRIORITY_NORMAL, failureGroup, &failurePrerequisite, 1);
+		});
+		const bool failureAdmissionPaused =
+			rts_job_system_wait_for_test_pause(
+				JOB_SYSTEM_TEST_PAUSE_AFTER_ACCEPT, 5000);
+		result |= check(failureAdmissionPaused,
+			"publication-failure admission reaches the deterministic pause");
+		failurePrerequisiteGate.open();
+		const bool dependencyReleasePaused =
+			rts_job_system_wait_for_test_pause(
+				JOB_SYSTEM_TEST_PAUSE_BEFORE_DEPENDENT_ENQUEUE, 5000);
+		result |= check(dependencyReleasePaused,
+			"dependency release pauses before competing publication");
+		rts_job_system_set_test_fault(JOB_SYSTEM_TEST_FAIL_QUEUE_PUSH, 1);
+		rts_job_system_release_test_pause(JOB_SYSTEM_TEST_PAUSE_AFTER_ACCEPT);
+		const bool queueFailurePaused = rts_job_system_wait_for_test_pause(
+			JOB_SYSTEM_TEST_PAUSE_AFTER_QUEUE_FAILURE, 5000);
+		result |= check(queueFailurePaused,
+			"submitter publication failure is held before rollback");
+		rts_job_system_release_test_pause(
+			JOB_SYSTEM_TEST_PAUSE_BEFORE_DEPENDENT_ENQUEUE);
+		const bool dependencyEnqueueCompleted =
+			rts_job_system_wait_for_test_pause(
+				JOB_SYSTEM_TEST_PAUSE_AFTER_DEPENDENT_ENQUEUE, 5000);
+		result |= check(dependencyEnqueueCompleted,
+			"dependency release observes failed publication ownership");
+		rts_job_system_release_test_pause(
+			JOB_SYSTEM_TEST_PAUSE_AFTER_DEPENDENT_ENQUEUE);
+		rts_job_system_release_test_pause(
+			JOB_SYSTEM_TEST_PAUSE_AFTER_QUEUE_FAILURE);
+		failureSubmitter.join();
+		result |= check(!failedDependent.isValid(),
+			"submitter publication failure returns caller ownership");
+		rts_job_system_set_test_pause_mask(0);
+		failedJobGate.open();
+		const std::chrono::steady_clock::time_point failureDeadline =
+			std::chrono::steady_clock::now() + std::chrono::seconds(5);
+		while (!failureGroup.isComplete() &&
+			std::chrono::steady_clock::now() < failureDeadline)
+		{
+			std::this_thread::yield();
+		}
+		const bool failureGroupCompleted = failureGroup.isComplete();
+		const unsigned failedExecutionCount = failedExecutions.load(
+			std::memory_order_acquire);
+		const unsigned failureOutstandingCount = system.outstandingJobCount();
+		system.shutdown();
+		if (failedDestructions.load(std::memory_order_acquire) == 0)
+		{
+			delete failedJob;
+		}
+		result |= check(failureGroupCompleted,
+			"dependency-publication failure group drains");
+		result |= check(failedExecutionCount == 0 &&
+			failedDestructions.load(std::memory_order_relaxed) == 1 &&
+			failureOutstandingCount == 0,
+			"failed publication cannot resurrect or double-finalize work");
+
+		result |= check(system.start(config),
+			"dependency-first publication failure test starts");
+		rts::JobGroup dependencyFirstGroup = system.createGroup();
+		Gate dependencyFirstPrerequisiteGate;
+		Gate dependencyFirstJobGate;
+		std::atomic<unsigned> dependencyFirstExecutions(0);
+		std::atomic<unsigned> dependencyFirstDestructions(0);
+		GateJob *dependencyFirstPrerequisiteJob =
+			new GateJob(&dependencyFirstPrerequisiteGate);
+		rts::JobHandle dependencyFirstPrerequisite = system.trySubmit(
+			dependencyFirstPrerequisiteJob, rts::JOB_PRIORITY_NORMAL,
+			dependencyFirstGroup);
+		if (!dependencyFirstPrerequisite.isValid())
+		{
+			delete dependencyFirstPrerequisiteJob;
+		}
+		result |= check(dependencyFirstPrerequisite.isValid() &&
+			dependencyFirstPrerequisiteGate.waitForEntry(),
+			"dependency-first prerequisite enters");
+		BlockingLifetimeJob *dependencyFirstJob = new BlockingLifetimeJob(
+			&dependencyFirstJobGate, &dependencyFirstExecutions,
+			&dependencyFirstDestructions);
+		rts::JobHandle dependencyFirstHandle;
+		rts_job_system_set_test_pause_mask(publicationPauseMask);
+		std::thread dependencyFirstSubmitter([&]() {
+			dependencyFirstHandle = system.trySubmitAfter(dependencyFirstJob,
+				rts::JOB_PRIORITY_NORMAL, dependencyFirstGroup,
+				&dependencyFirstPrerequisite, 1);
+		});
+		result |= check(rts_job_system_wait_for_test_pause(
+			JOB_SYSTEM_TEST_PAUSE_AFTER_ACCEPT, 5000),
+			"dependency-first admission reaches the deterministic pause");
+		dependencyFirstPrerequisiteGate.open();
+		result |= check(rts_job_system_wait_for_test_pause(
+			JOB_SYSTEM_TEST_PAUSE_BEFORE_DEPENDENT_ENQUEUE, 5000),
+			"dependency-first publisher pauses before queue publication");
+		rts_job_system_set_test_fault(JOB_SYSTEM_TEST_FAIL_QUEUE_PUSH, 1);
+		rts_job_system_release_test_pause(
+			JOB_SYSTEM_TEST_PAUSE_BEFORE_DEPENDENT_ENQUEUE);
+		result |= check(rts_job_system_wait_for_test_pause(
+			JOB_SYSTEM_TEST_PAUSE_AFTER_QUEUE_FAILURE, 5000),
+			"dependency-first publisher records queue failure");
+		rts_job_system_release_test_pause(JOB_SYSTEM_TEST_PAUSE_AFTER_ACCEPT);
+		dependencyFirstSubmitter.join();
+		result |= check(dependencyFirstHandle.isValid(),
+			"competing submitter preserves scheduler failure ownership");
+		rts_job_system_release_test_pause(
+			JOB_SYSTEM_TEST_PAUSE_AFTER_QUEUE_FAILURE);
+		result |= check(rts_job_system_wait_for_test_pause(
+			JOB_SYSTEM_TEST_PAUSE_AFTER_DEPENDENT_ENQUEUE, 5000),
+			"dependency-first publisher reaches finalization handoff");
+		rts_job_system_release_test_pause(
+			JOB_SYSTEM_TEST_PAUSE_AFTER_DEPENDENT_ENQUEUE);
+		rts_job_system_set_test_pause_mask(0);
+		dependencyFirstJobGate.open();
+		const std::chrono::steady_clock::time_point dependencyFirstDeadline =
+			std::chrono::steady_clock::now() + std::chrono::seconds(5);
+		while (!dependencyFirstGroup.isComplete() &&
+			std::chrono::steady_clock::now() < dependencyFirstDeadline)
+		{
+			std::this_thread::yield();
+		}
+		const bool dependencyFirstCompleted = dependencyFirstGroup.isComplete();
+		const unsigned dependencyFirstOutstanding = system.outstandingJobCount();
+		system.shutdown();
+		if (!dependencyFirstHandle.isValid() &&
+			dependencyFirstDestructions.load(std::memory_order_acquire) == 0)
+		{
+			delete dependencyFirstJob;
+		}
+		result |= check(dependencyFirstCompleted &&
+			dependencyFirstHandle.isValid() && dependencyFirstHandle.failed() &&
+			dependencyFirstExecutions.load(std::memory_order_relaxed) == 0 &&
+			dependencyFirstDestructions.load(std::memory_order_relaxed) == 1 &&
+			dependencyFirstOutstanding == 0,
+			"dependency-first queue failure finalizes exactly once without a strand");
+
+		result |= check(system.start(config),
+			"execution-owner finalization race test starts");
+		rts::JobGroup finalizationGroup = system.createGroup();
+		rts_job_system_set_test_pause_mask(
+			JOB_SYSTEM_TEST_PAUSE_NON_OWNER_FINALIZER);
+		rts_job_system_set_test_fault(JOB_SYSTEM_TEST_COMPETING_FINALIZER, 1);
+		FailJob *finalizationJob = new FailJob;
+		rts::JobHandle finalizationHandle = system.trySubmit(finalizationJob,
+			rts::JOB_PRIORITY_NORMAL, finalizationGroup);
+		if (!finalizationHandle.isValid())
+		{
+			delete finalizationJob;
+		}
+		result |= check(finalizationHandle.isValid(),
+			"finalization-race job is admitted");
+		const bool nonOwnerPaused = rts_job_system_wait_for_test_pause(
+			JOB_SYSTEM_TEST_PAUSE_NON_OWNER_FINALIZER, 5000);
+		result |= check(nonOwnerPaused,
+			"non-owner finalizer holds the finalization claim");
+		rts_job_system_release_test_pause(
+			JOB_SYSTEM_TEST_PAUSE_NON_OWNER_FINALIZER);
+		const std::chrono::steady_clock::time_point finalizationDeadline =
+			std::chrono::steady_clock::now() + std::chrono::seconds(5);
+		while (!finalizationGroup.isComplete() &&
+			std::chrono::steady_clock::now() < finalizationDeadline)
+		{
+			std::this_thread::yield();
+		}
+		const rts::JobSystemMetrics finalizationMetrics = system.metrics();
+		result |= check(finalizationGroup.isComplete() &&
+			finalizationHandle.failed() && finalizationGroup.failed() &&
+			finalizationMetrics.executedJobCount == 1 &&
+			finalizationMetrics.failedJobCount == 1 &&
+			system.outstandingJobCount() == 0,
+			"execution owner retries and finalizes exactly once");
+		rts_job_system_set_test_pause_mask(0);
+	}
+#endif
+
+	group = system.createGroup();
+	result |= check(group.isValid(),
+		"completion-fault group is recreated after race tests");
 	CompletionRecord completionRecord;
 	bool executed = false;
 	rts_job_system_set_test_fault(JOB_SYSTEM_TEST_FAIL_COMPLETION_PUSH, 1);

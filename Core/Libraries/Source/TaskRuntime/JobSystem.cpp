@@ -56,7 +56,8 @@ struct JobRecord
 		: job(0), priority(JOB_PRIORITY_NORMAL), complete(false),
 		  failed(false), cancelled(false), owner(0), generation(0),
 		  unresolvedDependencies(0), dependencyFailed(false), finalizing(false),
-		  accepted(false), queued(false), executing(false), completion(0)
+		  accepted(false), queued(false), executing(false),
+		  readyPublicationFailed(false), completion(0)
 	{
 	}
 
@@ -80,8 +81,10 @@ struct JobRecord
 	std::atomic<bool> accepted;
 	std::atomic<bool> queued;
 	std::atomic<bool> executing;
+	std::atomic<bool> readyPublicationFailed;
 	OwnerCompletion *completion;
 	std::chrono::steady_clock::time_point readyAt;
+	std::mutex publicationMutex;
 	std::mutex dependentsMutex;
 	std::vector<std::shared_ptr<JobRecord> > dependents;
 	std::mutex mutex;
@@ -96,6 +99,9 @@ std::atomic<unsigned> s_startupWorkerPolicy(JOB_WORKER_POLICY_AUTO);
 #if defined(RTS_BUILD_CORE_EXTRAS)
 std::atomic<unsigned> s_jobSystemTestFault(0);
 std::atomic<unsigned> s_jobSystemTestFaultOccurrence(0);
+std::atomic<unsigned> s_jobSystemTestPauseMask(0);
+std::atomic<unsigned> s_jobSystemTestPauseReachedMask(0);
+std::atomic<unsigned> s_jobSystemTestPauseReleasedMask(0);
 
 bool consumeJobSystemTestFault(unsigned fault)
 {
@@ -120,6 +126,21 @@ bool consumeJobSystemTestFault(unsigned fault)
 		}
 	}
 	return false;
+}
+
+void pauseJobSystemTest(unsigned pausePoint)
+{
+	if ((s_jobSystemTestPauseMask.load(std::memory_order_acquire) & pausePoint) == 0)
+	{
+		return;
+	}
+	s_jobSystemTestPauseReachedMask.fetch_or(pausePoint, std::memory_order_acq_rel);
+	while ((s_jobSystemTestPauseMask.load(std::memory_order_acquire) & pausePoint) != 0 &&
+		(s_jobSystemTestPauseReleasedMask.load(std::memory_order_acquire) &
+			pausePoint) == 0)
+	{
+		std::this_thread::yield();
+	}
 }
 #endif
 
@@ -258,6 +279,36 @@ extern "C" void rts_job_system_set_test_fault(unsigned fault,
 	s_jobSystemTestFaultOccurrence.store(occurrence, std::memory_order_release);
 	s_jobSystemTestFault.store(fault, std::memory_order_release);
 }
+
+extern "C" void rts_job_system_set_test_pause_mask(unsigned pauseMask)
+{
+	s_jobSystemTestPauseReleasedMask.store(0, std::memory_order_release);
+	s_jobSystemTestPauseReachedMask.store(0, std::memory_order_release);
+	s_jobSystemTestPauseMask.store(pauseMask, std::memory_order_release);
+}
+
+extern "C" bool rts_job_system_wait_for_test_pause(unsigned pausePoint,
+	unsigned timeoutMilliseconds)
+{
+	const std::chrono::steady_clock::time_point deadline =
+		std::chrono::steady_clock::now() +
+		std::chrono::milliseconds(timeoutMilliseconds);
+	while ((s_jobSystemTestPauseReachedMask.load(std::memory_order_acquire) &
+		pausePoint) == 0)
+	{
+		if (std::chrono::steady_clock::now() >= deadline)
+		{
+			return false;
+		}
+		std::this_thread::yield();
+	}
+	return true;
+}
+
+extern "C" void rts_job_system_release_test_pause(unsigned pausePoint)
+{
+	s_jobSystemTestPauseReleasedMask.fetch_or(pausePoint, std::memory_order_acq_rel);
+}
 #endif
 
 struct JobContext::State
@@ -298,6 +349,13 @@ struct JobGroup::State
 
 struct JobSystem::State
 {
+	enum ReadyEnqueueResult
+	{
+		READY_ENQUEUED,
+		READY_ALREADY_OWNED,
+		READY_FAILED
+	};
+
 	struct CompletionItem
 	{
 		CompletionItem() : completion(0), succeeded(false), cancelled(false) {}
@@ -412,6 +470,7 @@ struct JobSystem::State
 		}
 		if (record)
 		{
+			std::lock_guard<std::mutex> publicationLock(record->publicationMutex);
 			record->executing.store(true, std::memory_order_release);
 			record->queued.store(false, std::memory_order_release);
 			readyCount.fetch_sub(1, std::memory_order_acq_rel);
@@ -441,22 +500,22 @@ struct JobSystem::State
 		return true;
 	}
 
-	bool enqueueReady(const std::shared_ptr<JobRecord> &record)
+	ReadyEnqueueResult enqueueReady(const std::shared_ptr<JobRecord> &record)
 	{
+		std::unique_lock<std::mutex> publicationLock(record->publicationMutex);
+		if (record->readyPublicationFailed.load(std::memory_order_acquire) ||
+			record->finalizing.load(std::memory_order_acquire) ||
+			record->executing.load(std::memory_order_acquire) ||
+			record->complete.load(std::memory_order_acquire))
+		{
+			return READY_ALREADY_OWNED;
+		}
 		bool expected = false;
 		if (!record->queued.compare_exchange_strong(expected, true,
 			std::memory_order_acq_rel, std::memory_order_acquire))
 		{
-			return false;
+			return READY_ALREADY_OWNED;
 		}
-		if (record->finalizing.load(std::memory_order_acquire) ||
-			record->executing.load(std::memory_order_acquire) ||
-			record->complete.load(std::memory_order_acquire))
-		{
-			record->queued.store(false, std::memory_order_release);
-			return false;
-		}
-
 		try
 		{
 #if defined(RTS_BUILD_CORE_EXTRAS)
@@ -498,12 +557,17 @@ struct JobSystem::State
 		}
 		catch (...)
 		{
+			record->readyPublicationFailed.store(true, std::memory_order_release);
 			record->queued.store(false, std::memory_order_release);
-			return false;
+			publicationLock.unlock();
+#if defined(RTS_BUILD_CORE_EXTRAS)
+			pauseJobSystemTest(4);
+#endif
+			return READY_FAILED;
 		}
 
 		workAvailable.notify_one();
-		return true;
+		return READY_ENQUEUED;
 	}
 
 	void releaseDependents(const std::shared_ptr<JobRecord> &record,
@@ -528,12 +592,18 @@ struct JobSystem::State
 				std::memory_order_acq_rel) == 1 &&
 				dependent->accepted.load(std::memory_order_acquire))
 			{
-				if (!enqueueReady(dependent))
+				#if defined(RTS_BUILD_CORE_EXTRAS)
+				pauseJobSystemTest(2);
+				#endif
+				const ReadyEnqueueResult enqueueResult = enqueueReady(dependent);
+				#if defined(RTS_BUILD_CORE_EXTRAS)
+				pauseJobSystemTest(16);
+				#endif
+				if (enqueueResult == READY_FAILED)
 				{
-					if (!dependent->queued.load(std::memory_order_acquire))
-					{
-						finish(dependent, true, false);
-					}
+					delete dependent->job;
+					dependent->job = 0;
+					finish(dependent, true, false);
 				}
 			}
 		}
@@ -543,11 +613,22 @@ struct JobSystem::State
 		bool cancelled, bool executionOwner = false)
 	{
 		bool expected = false;
-		if (!record->finalizing.compare_exchange_strong(expected, true,
+		while (!record->finalizing.compare_exchange_strong(expected, true,
 			std::memory_order_acq_rel, std::memory_order_acquire))
 		{
-			return;
+			if (!executionOwner || record->complete.load(std::memory_order_acquire))
+			{
+				return;
+			}
+			expected = false;
+			std::this_thread::yield();
 		}
+#if defined(RTS_BUILD_CORE_EXTRAS)
+		if (!executionOwner)
+		{
+			pauseJobSystemTest(8);
+		}
+#endif
 		/* Enqueue and finalization use queued/finalizing as a two-way claim.
 		 * If an enqueue won first, its caller owns eventual execution. */
 		if (record->queued.load(std::memory_order_acquire) ||
@@ -694,7 +775,41 @@ struct JobSystem::State
 		{
 			activeWorkers.fetch_sub(1, std::memory_order_acq_rel);
 		}
+#if defined(RTS_BUILD_CORE_EXTRAS)
+		std::unique_ptr<std::thread> competingFinalizer;
+		if (consumeJobSystemTestFault(9))
+		{
+			try
+			{
+				competingFinalizer.reset(new std::thread([this, record]() {
+					finish(record, true, false);
+				}));
+			}
+			catch (...)
+			{
+				competingFinalizer.reset();
+			}
+			if (competingFinalizer.get() != 0 &&
+				(s_jobSystemTestPauseMask.load(std::memory_order_acquire) & 8) != 0)
+			{
+				const std::chrono::steady_clock::time_point pauseDeadline =
+					std::chrono::steady_clock::now() + std::chrono::seconds(5);
+				while ((s_jobSystemTestPauseReachedMask.load(
+					std::memory_order_acquire) & 8) == 0 &&
+					std::chrono::steady_clock::now() < pauseDeadline)
+				{
+					std::this_thread::yield();
+				}
+			}
+		}
+#endif
 		finish(record, failed, cancelled, true);
+#if defined(RTS_BUILD_CORE_EXTRAS)
+		if (competingFinalizer.get() != 0 && competingFinalizer->joinable())
+		{
+			competingFinalizer->join();
+		}
+#endif
 	}
 
 	void workerLoop(Worker *worker)
@@ -1627,9 +1742,11 @@ JobHandle JobSystem::trySubmitAfter(Job *job, JobPriority priority,
 	}
 
 	record->accepted.store(true, std::memory_order_release);
+#if defined(RTS_BUILD_CORE_EXTRAS)
+	pauseJobSystemTest(1);
+#endif
 	if (record->unresolvedDependencies.load(std::memory_order_acquire) == 0 &&
-		!m_state->enqueueReady(record) &&
-		!record->queued.load(std::memory_order_acquire))
+		m_state->enqueueReady(record) == State::READY_FAILED)
 	{
 		record->accepted.store(false, std::memory_order_release);
 		record->job = 0;
@@ -2001,9 +2118,10 @@ bool JobSystem::trySubmitBatch(const JobSubmission *submissions,
 			!record->queued.load(std::memory_order_acquire) &&
 			record->unresolvedDependencies.load(std::memory_order_acquire) == 0)
 		{
-			if (!m_state->enqueueReady(record) &&
-				!record->queued.load(std::memory_order_acquire))
+			if (m_state->enqueueReady(record) == State::READY_FAILED)
 			{
+				delete record->job;
+				record->job = 0;
 				m_state->finish(record, true, false);
 			}
 		}
