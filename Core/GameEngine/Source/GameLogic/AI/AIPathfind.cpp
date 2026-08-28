@@ -1855,7 +1855,9 @@ void PathfindCell::forwardInsertionSortRetailCompatible(PathfindCellList& list)
 	while (currentCell && cellCount < PATHFIND_CELLS_PER_FRAME && currentCell->m_info->m_totalCost <= m_info->m_totalCost)
 	{
 		// Prevent a retail crash where a pathfindCell has an m_info with a dangling nextOpen pointer
-		if (currentCell->m_info->m_nextOpen && !currentCell->m_info->m_nextOpen->m_cell->m_info)
+		if (currentCell->m_info->m_nextOpen &&
+			(!currentCell->m_info->m_nextOpen->m_cell ||
+			 !currentCell->m_info->m_nextOpen->m_cell->m_info))
 		{
 			currentCell->m_info->m_nextOpen->m_cell = nullptr;
 			currentCell->m_info->m_nextOpen = nullptr;
