@@ -28,7 +28,13 @@ if(NOT TARGET rts_d3d8lib)
     )
 
     if(MSVC)
-        target_link_libraries(rts_d3d8lib INTERFACE legacy_stdio_definitions)
+        # Visual Studio 2015 and newer need the compatibility library because
+        # their CRT no longer exports the legacy stdio symbols used by D3D8.
+        # VC6 provides those symbols itself; mixing in the modern shim also
+        # introduces unresolved Universal CRT dependencies.
+        if(MSVC_VERSION GREATER_EQUAL 1900)
+            target_link_libraries(rts_d3d8lib INTERFACE legacy_stdio_definitions)
+        endif()
         target_link_options(rts_d3d8lib INTERFACE /NODEFAULTLIB:libci.lib)
 
         if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "12.0.8804")
