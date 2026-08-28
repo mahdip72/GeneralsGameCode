@@ -290,6 +290,9 @@ Bool StartSkirmishAITestRunner()
 	TheWritableGlobalData->m_headless = TRUE;
 	TheWritableGlobalData->m_shellMapOn = FALSE;
 	TheWritableGlobalData->m_useFpsLimit = FALSE;
+	// The automated observer owns no units. Keep its logical and local retaliation modes disabled
+	// so the recorder does not capture an irrelevant frame-zero preference synchronization command.
+	TheWritableGlobalData->m_clientRetaliationModeEnabled = FALSE;
 	TheRecorder->setArchiveEnabled(FALSE);
 	InitRandom(static_cast<UnsignedInt>(plan.seed));
 
