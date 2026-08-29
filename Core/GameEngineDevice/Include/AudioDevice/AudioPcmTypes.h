@@ -20,6 +20,9 @@ struct AudioPcmChunk
 {
 	std::uint32_t sampleRate = 0;
 	std::uint16_t channels = 0;
+	// Original decoded channel count before normalization to the native PCM
+	// format. Zero means that the producer has no provenance information.
+	std::uint16_t sourceChannels = 0;
 	AudioPcmFormat format = AudioPcmFormat::SIGNED_16_INTERLEAVED_LITTLE_ENDIAN;
 	std::uint32_t frameCount = 0;
 	std::int64_t startSample = 0;

@@ -122,7 +122,13 @@ if(FFMPEG_FOUND)
     if(WIN32)
         set(_FFMPEG_AUTO_RUNTIME_DIR "${FFMPEG_SDK_ROOT}/bin")
         set(_FFMPEG_USE_AUTO_RUNTIME_DIR FALSE)
-        if(NOT FFMPEG_RUNTIME_DIR)
+        get_property(_FFMPEG_RUNTIME_RESOLVED_THIS_CONFIGURE GLOBAL
+            PROPERTY RTS_FFMPEG_RUNTIME_RESOLVED_THIS_CONFIGURE)
+        if(_FFMPEG_RUNTIME_RESOLVED_THIS_CONFIGURE AND FFMPEG_RUNTIME_DIR)
+            if(RTS_FFMPEG_AUTO_RUNTIME_DIR)
+                set(_FFMPEG_USE_AUTO_RUNTIME_DIR TRUE)
+            endif()
+        elseif(NOT FFMPEG_RUNTIME_DIR)
             set(_FFMPEG_USE_AUTO_RUNTIME_DIR TRUE)
         elseif(RTS_FFMPEG_AUTO_RUNTIME_DIR)
             set(_FFMPEG_CURRENT_RUNTIME_DIR "${FFMPEG_RUNTIME_DIR}")
@@ -164,6 +170,7 @@ if(FFMPEG_FOUND)
             message(FATAL_ERROR
                 "FFmpeg runtime directory does not exist: ${FFMPEG_RUNTIME_DIR}")
         endif()
+        set_property(GLOBAL PROPERTY RTS_FFMPEG_RUNTIME_RESOLVED_THIS_CONFIGURE TRUE)
     endif()
 
     foreach(_FFMPEG_COMPONENT IN LISTS _FFMPEG_COMPONENTS)
@@ -174,35 +181,37 @@ if(FFMPEG_FOUND)
         get_filename_component(_FFMPEG_LIBRARY_DIR "${_FFMPEG_LIBRARY}" DIRECTORY)
         list(APPEND FFMPEG_LIBRARY_DIRS "${_FFMPEG_LIBRARY_DIR}")
 
-        if(NOT TARGET FFMPEG::${_FFMPEG_COMPONENT})
-            if(WIN32)
+        if(WIN32)
+            if(NOT TARGET FFMPEG::${_FFMPEG_COMPONENT})
                 add_library(FFMPEG::${_FFMPEG_COMPONENT} SHARED IMPORTED)
-                set_target_properties(FFMPEG::${_FFMPEG_COMPONENT} PROPERTIES
-                    IMPORTED_IMPLIB "${_FFMPEG_LIBRARY}"
-                    INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_INCLUDE_DIR}"
-                )
-
-				if(FFMPEG_RUNTIME_DIR)
-                    file(GLOB _FFMPEG_RUNTIME_LIBRARY LIST_DIRECTORIES FALSE
-                        "${FFMPEG_RUNTIME_DIR}/${_FFMPEG_COMPONENT}-*.dll")
-                    list(LENGTH _FFMPEG_RUNTIME_LIBRARY _FFMPEG_RUNTIME_LIBRARY_COUNT)
-					if(_FFMPEG_RUNTIME_LIBRARY_COUNT EQUAL 1)
-						list(GET _FFMPEG_RUNTIME_LIBRARY 0 _FFMPEG_RUNTIME_LIBRARY_PATH)
-						set_property(TARGET FFMPEG::${_FFMPEG_COMPONENT} PROPERTY
-							IMPORTED_LOCATION "${_FFMPEG_RUNTIME_LIBRARY_PATH}")
-						list(APPEND RTS_FFMPEG_RUNTIME_DLLS "${_FFMPEG_RUNTIME_LIBRARY_PATH}")
-					else()
-						message(FATAL_ERROR
-							"FFmpeg runtime directory must contain exactly one ${_FFMPEG_COMPONENT}-*.dll: ${FFMPEG_RUNTIME_DIR}")
-					endif()
-                endif()
-            else()
-                add_library(FFMPEG::${_FFMPEG_COMPONENT} UNKNOWN IMPORTED)
-                set_target_properties(FFMPEG::${_FFMPEG_COMPONENT} PROPERTIES
-                    IMPORTED_LOCATION "${_FFMPEG_LIBRARY}"
-                    INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_INCLUDE_DIR}"
-                )
             endif()
+            set_target_properties(FFMPEG::${_FFMPEG_COMPONENT} PROPERTIES
+                IMPORTED_IMPLIB "${_FFMPEG_LIBRARY}"
+                INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_INCLUDE_DIR}"
+            )
+
+            if(FFMPEG_RUNTIME_DIR)
+                file(GLOB _FFMPEG_RUNTIME_LIBRARY LIST_DIRECTORIES FALSE
+                    "${FFMPEG_RUNTIME_DIR}/${_FFMPEG_COMPONENT}-*.dll")
+                list(LENGTH _FFMPEG_RUNTIME_LIBRARY _FFMPEG_RUNTIME_LIBRARY_COUNT)
+                if(_FFMPEG_RUNTIME_LIBRARY_COUNT EQUAL 1)
+                    list(GET _FFMPEG_RUNTIME_LIBRARY 0 _FFMPEG_RUNTIME_LIBRARY_PATH)
+                    set_property(TARGET FFMPEG::${_FFMPEG_COMPONENT} PROPERTY
+                        IMPORTED_LOCATION "${_FFMPEG_RUNTIME_LIBRARY_PATH}")
+                    list(APPEND RTS_FFMPEG_RUNTIME_DLLS "${_FFMPEG_RUNTIME_LIBRARY_PATH}")
+                else()
+                    message(FATAL_ERROR
+                        "FFmpeg runtime directory must contain exactly one ${_FFMPEG_COMPONENT}-*.dll: ${FFMPEG_RUNTIME_DIR}")
+                endif()
+            endif()
+        else()
+            if(NOT TARGET FFMPEG::${_FFMPEG_COMPONENT})
+                add_library(FFMPEG::${_FFMPEG_COMPONENT} UNKNOWN IMPORTED)
+            endif()
+            set_target_properties(FFMPEG::${_FFMPEG_COMPONENT} PROPERTIES
+                IMPORTED_LOCATION "${_FFMPEG_LIBRARY}"
+                INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_INCLUDE_DIR}"
+            )
         endif()
     endforeach()
 
@@ -254,6 +263,7 @@ unset(_FFMPEG_ROOT_HINT)
 unset(_FFMPEG_RUNTIME_LIBRARY)
 unset(_FFMPEG_RUNTIME_LIBRARY_COUNT)
 unset(_FFMPEG_RUNTIME_LIBRARY_PATH)
+unset(_FFMPEG_RUNTIME_RESOLVED_THIS_CONFIGURE)
 unset(_FFMPEG_RUNTIME_CLOSURE_ERROR)
 unset(_FFMPEG_RUNTIME_CLOSURE_FILE)
 unset(_FFMPEG_RUNTIME_CLOSURE_OUTPUT)

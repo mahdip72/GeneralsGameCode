@@ -286,6 +286,8 @@ bool FFmpegAudioDecoder::submitSamples(std::uint32_t capacity, const std::uint8_
 	AudioPcmChunk chunk;
 	chunk.sampleRate = OUTPUT_SAMPLE_RATE;
 	chunk.channels = OUTPUT_CHANNELS;
+	chunk.sourceChannels = m_inputChannelLayout.nb_channels > 0
+		? static_cast<std::uint16_t>(m_inputChannelLayout.nb_channels) : 0;
 	chunk.startSample = start_sample;
 	chunk.generation = m_generation;
 	chunk.sequence = m_sequence;

@@ -416,6 +416,13 @@ void FFmpegVideoStream::update()
 		m_gotFrame = false;
 		return;
 	}
+	// Display owns frame advancement through frameNext(). Do not replace a
+	// decoded frame before that frame has been presented; doing so lets a fast
+	// game update loop continually move the presentation timestamp ahead of the
+	// display and leaves the newly allocated movie buffer black.
+	if (m_gotFrame) {
+		return;
+	}
 	if (!m_playback->pump(32) && !m_playback->isTerminal()) {
 		m_good = false;
 	}
@@ -473,7 +480,7 @@ void FFmpegVideoStream::frameRender( VideoBuffer *buffer )
 
 	switch (buffer->format()) {
 		case VideoBuffer::TYPE_R8G8B8:
-			dst_pix_fmt = AV_PIX_FMT_RGB24;
+			dst_pix_fmt = AV_PIX_FMT_BGR24;
 			bytes_per_pixel = 3;
 			break;
 		case VideoBuffer::TYPE_X8R8G8B8:

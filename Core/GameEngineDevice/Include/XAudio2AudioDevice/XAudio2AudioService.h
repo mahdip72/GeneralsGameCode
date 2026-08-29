@@ -113,6 +113,7 @@ private:
 		std::unique_ptr<XAudio2PcmVoice> voice;
 		std::unique_ptr<IXAudio2PcmVoiceBackend> backend;
 		std::uint64_t generation = 0;
+		bool monoExpandedToStereo = false;
 	};
 
 	static void criticalErrorThunk(void *context, HRESULT error) noexcept;

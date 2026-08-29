@@ -49,6 +49,7 @@
 #include "Common/FileSystem.h"
 #include "Common/GameAudio.h"
 #include "Common/INI.h"
+#include "Common/LocalFileSystem.h"
 #include "Common/Registry.h"
 #include "Common/OptionPreferences.h"
 #include "Common/version.h"
@@ -68,6 +69,14 @@ GlobalData* TheWritableGlobalData = nullptr;				///< The global data singleton
 
 //-------------------------------------------------------------------------------------------------
 GlobalData* GlobalData::m_theOriginal = nullptr;
+
+#if defined(_WIN64)
+namespace
+{
+constexpr Real NATIVE_DEFAULT_MAX_CAMERA_HEIGHT = 600.0f;
+constexpr const char *RETAIL_GAME_DATA_FILE = "Data\\INI\\GameData.ini";
+}
+#endif
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 // PRIVATE DATA ///////////////////////////////////////////////////////////////////////////////////
@@ -855,7 +864,11 @@ GlobalData::GlobalData()
 	m_cameraHeight = 232.0f;
 #endif
 	m_minCameraHeight = 120.0f;
+#if defined(_WIN64)
+	m_maxCameraHeight = NATIVE_DEFAULT_MAX_CAMERA_HEIGHT;
+#else
 	m_maxCameraHeight = 310.0f;
+#endif
 	m_terrainHeightAtEdgeOfMap = 0.0f;
 
 	m_unitDamagedThresh = 0.5f;
@@ -1205,6 +1218,20 @@ void GlobalData::parseGameDataDefinition( INI* ini )
 
 	// parse the ini weapon definition
 	ini->initFromINI( TheWritableGlobalData, s_GlobalDataFieldParseTable );
+
+#if defined(_WIN64)
+	// The retail archive restores the original 310-unit ceiling after the
+	// constructor runs. Apply the accepted native camera only to that archived
+	// base file; loose base files and later GameData overrides remain authoritative
+	// for data mods.
+	const AsciiString filename = ini->getFilename();
+	if (filename.compareNoCase(RETAIL_GAME_DATA_FILE) == 0
+		&& TheLocalFileSystem != nullptr
+		&& !TheLocalFileSystem->doesFileExist(filename.str()))
+	{
+		TheWritableGlobalData->m_maxCameraHeight = NATIVE_DEFAULT_MAX_CAMERA_HEIGHT;
+	}
+#endif
 
 
 	// override INI values with user preferences

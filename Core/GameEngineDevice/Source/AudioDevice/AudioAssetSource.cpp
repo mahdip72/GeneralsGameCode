@@ -252,6 +252,7 @@ bool decodeWaveBuffer(const std::vector<std::uint8_t> &bytes, AudioPcmChunk &chu
 
 	chunk.sampleRate = OUTPUT_SAMPLE_RATE;
 	chunk.channels = OUTPUT_CHANNELS;
+	chunk.sourceChannels = info.channels;
 	chunk.format = AudioPcmFormat::SIGNED_16_INTERLEAVED_LITTLE_ENDIAN;
 	chunk.startSample = startFrame;
 	chunk.frameCount = static_cast<UnsignedInt>(requestedFrames);
@@ -327,6 +328,7 @@ bool decodeWave(const std::string &path, AudioPcmChunk &chunk,
 
 	chunk.sampleRate = OUTPUT_SAMPLE_RATE;
 	chunk.channels = OUTPUT_CHANNELS;
+	chunk.sourceChannels = info.channels;
 	chunk.format = AudioPcmFormat::SIGNED_16_INTERLEAVED_LITTLE_ENDIAN;
 	chunk.startSample = startFrame;
 	chunk.frameCount = static_cast<UnsignedInt>(requestedFrames);
@@ -390,8 +392,11 @@ public:
 			if (m_chunk.data.empty()) {
 				m_chunk.sampleRate = OUTPUT_SAMPLE_RATE;
 				m_chunk.channels = OUTPUT_CHANNELS;
+				m_chunk.sourceChannels = source.sourceChannels;
 				m_chunk.format = AudioPcmFormat::SIGNED_16_INTERLEAVED_LITTLE_ENDIAN;
 				m_chunk.startSample = m_startFrame;
+			} else if (m_chunk.sourceChannels != source.sourceChannels) {
+				m_chunk.sourceChannels = 0;
 			}
 			m_chunk.data.insert(m_chunk.data.end(), source.data.begin() + sourceOffset,
 				source.data.begin() + sourceOffset + copyBytes);
@@ -600,12 +605,16 @@ public:
 			if (chunk.frameCount == 0U) {
 				chunk.sampleRate = source.sampleRate;
 				chunk.channels = source.channels;
+				chunk.sourceChannels = source.sourceChannels;
 				chunk.format = source.format;
 				chunk.startSample = source.startSample;
 				chunk.generation = source.generation;
 				chunk.sequence = source.sequence;
 				chunk.discontinuity = source.discontinuity;
 			} else {
+				if (chunk.sourceChannels != source.sourceChannels) {
+					chunk.sourceChannels = 0;
+				}
 				const bool hasExpectedStart = chunk.startSample <=
 					(std::numeric_limits<std::int64_t>::max)()
 					- static_cast<std::int64_t>(chunk.frameCount);
@@ -762,6 +771,9 @@ private:
 		}
 		if (source.frameCount > maxFrames - destination.frameCount) {
 			return false;
+		}
+		if (destination.sourceChannels != source.sourceChannels) {
+			destination.sourceChannels = 0;
 		}
 		const bool hasExpectedStart = destination.startSample <=
 			(std::numeric_limits<std::int64_t>::max)()

@@ -398,6 +398,7 @@ XAudio2PcmVoiceHandle XAudio2AudioService::createVoice() noexcept
 	VoiceRecord &record = m_voices[index];
 	record.backend = std::move(backend);
 	record.voice = std::move(voice);
+	record.monoExpandedToStereo = false;
 	record.generation = m_nextHandleGeneration++;
 	if (m_nextHandleGeneration == 0) {
 		m_nextHandleGeneration = 1;
@@ -425,6 +426,7 @@ bool XAudio2AudioService::destroyVoice(XAudio2PcmVoiceHandle handle) noexcept
 	record.voice.reset();
 	record.backend.reset();
 	record.generation = 0;
+	record.monoExpandedToStereo = false;
 	if (FAILED(voiceFailure)) {
 		m_lastError.store(voiceFailure, std::memory_order_release);
 		return false;
@@ -447,7 +449,13 @@ AudioPcmSubmitResult XAudio2AudioService::submit(XAudio2PcmVoiceHandle handle, A
 		chunk = {};
 		return AudioPcmSubmitResult::FAILED;
 	}
-	return m_voices[handle.index].voice->submit(std::move(chunk));
+	VoiceRecord &record = m_voices[handle.index];
+	const bool monoExpandedToStereo = chunk.sourceChannels == 1 && chunk.channels == 2;
+	const AudioPcmSubmitResult result = record.voice->submit(std::move(chunk));
+	if (result == AudioPcmSubmitResult::ACCEPTED) {
+		record.monoExpandedToStereo = monoExpandedToStereo;
+	}
+	return result;
 }
 
 bool XAudio2AudioService::resetVoice(XAudio2PcmVoiceHandle handle, std::uint64_t generation) noexcept
@@ -460,6 +468,7 @@ bool XAudio2AudioService::resetVoice(XAudio2PcmVoiceHandle handle, std::uint64_t
 		|| !isHandleOwnedLocked(handle)) {
 		return false;
 	}
+	m_voices[handle.index].monoExpandedToStereo = false;
 	m_voices[handle.index].voice->reset(generation);
 	return true;
 }
@@ -539,9 +548,16 @@ bool XAudio2AudioService::setVoiceSpatialization(XAudio2PcmVoiceHandle handle,
 		X3DAUDIO_CALCULATE_MATRIX, &settings);
 	const std::size_t coefficientCount = static_cast<std::size_t>(settings.SrcChannelCount)
 		* settings.DstChannelCount;
+	const bool normalizeExpandedMono = m_voices[handle.index].monoExpandedToStereo;
 	for (std::size_t index = 0; index < coefficientCount; ++index) {
 		if (!std::isfinite(matrix[index])) {
 			return false;
+		}
+		if (normalizeExpandedMono) {
+			// Native decoding expands legacy mono point sources to two identical
+			// PCM channels. X3DAudio treats them as independent emitters, so retain
+			// the original mono level without attenuating genuine stereo assets.
+			matrix[index] *= 0.5f;
 		}
 	}
 	return m_voices[handle.index].voice->setOutputMatrix(settings.SrcChannelCount,

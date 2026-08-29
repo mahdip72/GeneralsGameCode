@@ -5,6 +5,7 @@
 #include "XAudio2AudioDevice/XAudio2PcmVoice.h"
 
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <memory>
 #include <thread>
@@ -71,6 +72,14 @@ public:
 		return S_OK;
 	}
 	HRESULT getCriticalError() const noexcept override { return S_OK; }
+	HRESULT setOutputMatrix(UINT32 sourceChannels, UINT32 destinationChannels,
+		const float *matrix) noexcept override
+	{
+		lastSourceChannels = sourceChannels;
+		lastDestinationChannels = destinationChannels;
+		lastMatrix.assign(matrix, matrix + sourceChannels * destinationChannels);
+		return S_OK;
+	}
 
 	void destroy() noexcept override
 	{
@@ -88,6 +97,9 @@ public:
 	}
 
 	std::size_t submissionCount() const noexcept { return m_submittedContexts.size(); }
+	UINT32 lastSourceChannels = 0;
+	UINT32 lastDestinationChannels = 0;
+	std::vector<float> lastMatrix;
 
 private:
 	std::vector<std::string> &m_calls;
@@ -127,6 +139,7 @@ public:
 	std::atomic<bool> createBackendEntered { false };
 	std::atomic<bool> releaseCreateBackend { true };
 	FakePcmVoiceBackend *lastVoiceBackend = nullptr;
+	bool provideOutputDetails = false;
 
 	HRESULT open(CriticalErrorCallback callback, void *context) noexcept override
 	{
@@ -172,6 +185,17 @@ public:
 		lastVoiceBackend = pcmBackend.get();
 		voice = std::move(pcmBackend);
 		return createVoiceResult;
+	}
+
+	HRESULT getOutputDetails(XAudio2OutputDetails &details) const noexcept override
+	{
+		if (!provideOutputDetails) {
+			details = {};
+			return E_NOTIMPL;
+		}
+		details.channelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
+		details.channelCount = 2;
+		return S_OK;
 	}
 
 	HRESULT stop() noexcept override
@@ -699,6 +723,72 @@ void testRepeatedCyclesRemainDeterministic()
 			&& backendView->stopCalls == 4 && backendView->closeCalls == 4,
 		"repeated open and shutdown cycles acquire and release once per cycle");
 }
+
+void testPointSourceSpatializationPreservesMonoLevel()
+{
+	auto backend = std::make_unique<FakeAudioEngine>();
+	FakeAudioEngine *backendView = backend.get();
+	backendView->provideOutputDetails = true;
+	XAudio2AudioService service(std::move(backend));
+	check(service.open(), "spatialization service opens");
+	const XAudio2PcmVoiceHandle monoHandle = service.createVoice();
+	FakePcmVoiceBackend *monoVoice = backendView->lastVoiceBackend;
+	const XAudio2PcmVoiceHandle stereoHandle = service.createVoice();
+	FakePcmVoiceBackend *stereoVoice = backendView->lastVoiceBackend;
+	check(monoHandle.isValid() && stereoHandle.isValid()
+			&& monoVoice != nullptr && stereoVoice != nullptr,
+		"spatialization service creates independent voices");
+	AudioPcmChunk monoChunk = makeChunk(monoHandle.generation, 0);
+	monoChunk.sourceChannels = 1;
+	AudioPcmChunk stereoChunk = makeChunk(stereoHandle.generation, 0);
+	stereoChunk.sourceChannels = 2;
+	check(service.resetVoice(monoHandle, monoHandle.generation)
+			&& service.resetVoice(stereoHandle, stereoHandle.generation),
+		"spatialization voices accept their playback generations");
+	check(service.submit(monoHandle, std::move(monoChunk)) == AudioPcmSubmitResult::ACCEPTED
+			&& service.submit(stereoHandle, std::move(stereoChunk)) == AudioPcmSubmitResult::ACCEPTED,
+		"spatialization voices accept mono and stereo provenance");
+	XAudio2SpatializationPose listener = {};
+	listener.front[1] = 1.0f;
+	listener.top[2] = 1.0f;
+	XAudio2SpatializationPose emitter = listener;
+	emitter.position[1] = 1.0f;
+	check(service.setVoiceSpatialization(monoHandle, listener, emitter)
+			&& service.setVoiceSpatialization(stereoHandle, listener, emitter),
+		"point-source spatialization succeeds for both provenances");
+	check(monoVoice->lastSourceChannels == 2 && monoVoice->lastDestinationChannels == 2
+			&& monoVoice->lastMatrix.size() == 4 && stereoVoice->lastMatrix.size() == 4,
+		"point-source spatialization publishes stereo matrices");
+	if (monoVoice->lastMatrix.size() == 4 && stereoVoice->lastMatrix.size() == 4) {
+		for (std::size_t index = 0; index < 4; ++index) {
+			check(std::abs(monoVoice->lastMatrix[index] * 2.0f
+					- stereoVoice->lastMatrix[index]) < 0.0001f,
+				"mono-expanded matrix is compensated without attenuating stereo");
+		}
+	}
+	AudioPcmChunk unknownChunk = makeChunk(monoHandle.generation, 1);
+	check(service.submit(monoHandle, std::move(unknownChunk)) == AudioPcmSubmitResult::ACCEPTED
+			&& service.setVoiceSpatialization(monoHandle, listener, emitter),
+		"accepted unknown provenance clears prior mono compensation");
+	if (monoVoice->lastMatrix.size() == 4 && stereoVoice->lastMatrix.size() == 4) {
+		for (std::size_t index = 0; index < 4; ++index) {
+			check(std::abs(monoVoice->lastMatrix[index]
+					- stereoVoice->lastMatrix[index]) < 0.0001f,
+				"unknown provenance is not treated as mono-expanded audio");
+		}
+	}
+	check(service.resetVoice(monoHandle, monoHandle.generation + 1)
+			&& service.setVoiceSpatialization(monoHandle, listener, emitter),
+		"voice reset clears prior asset provenance");
+	if (monoVoice->lastMatrix.size() == 4 && stereoVoice->lastMatrix.size() == 4) {
+		for (std::size_t index = 0; index < 4; ++index) {
+			check(std::abs(monoVoice->lastMatrix[index]
+					- stereoVoice->lastMatrix[index]) < 0.0001f,
+				"reset voice does not retain mono compensation for its next asset");
+		}
+	}
+	service.shutdown();
+}
 }
 
 int main()
@@ -715,6 +805,7 @@ int main()
 	testClosedFailedQuiescingAndStaleHandles();
 	testShutdownOrderFailureAndIdempotence();
 	testRepeatedCyclesRemainDeterministic();
+	testPointSourceSpatializationPreservesMonoLevel();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "%d XAudio2AudioService checks failed\n", g_failures);
 		return 1;

@@ -76,6 +76,7 @@ public:
 		}
 		chunk.sampleRate = m_pcm.sampleRate;
 		chunk.channels = m_pcm.channels;
+		chunk.sourceChannels = m_pcm.sourceChannels;
 		chunk.format = m_pcm.format;
 		chunk.frameCount = frameCount;
 		chunk.startSample = static_cast<std::int64_t>(m_nextFrame);

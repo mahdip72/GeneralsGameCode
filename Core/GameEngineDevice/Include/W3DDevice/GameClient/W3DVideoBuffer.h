@@ -73,6 +73,7 @@ class W3DVideoBuffer : public VideoBuffer
 
 		TextureClass	*m_texture;
 		SurfaceClass	*m_surface;
+		Bool m_surfaceLocked;
 
 	public:
 

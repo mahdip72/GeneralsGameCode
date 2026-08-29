@@ -105,7 +105,8 @@
 W3DVideoBuffer::W3DVideoBuffer( VideoBuffer::Type format )
 : VideoBuffer(format),
 	m_texture(nullptr),
-	m_surface(nullptr)
+	m_surface(nullptr),
+	m_surfaceLocked(FALSE)
 {
 
 }
@@ -184,6 +185,12 @@ void*		W3DVideoBuffer::lock()
 	if ( m_surface )
 	{
 		mem = m_surface->Lock( (Int*) &m_pitch );
+		m_surfaceLocked = mem != nullptr;
+		if (!m_surfaceLocked)
+		{
+			m_surface->Release_Ref();
+			m_surface = nullptr;
+		}
 	}
 
 	return mem;
@@ -197,9 +204,13 @@ void		W3DVideoBuffer::unlock()
 {
 	if ( m_surface != nullptr )
 	{
-		m_surface->Unlock();
+		if (m_surfaceLocked)
+		{
+			m_surface->Unlock();
+		}
 		m_surface->Release_Ref();
 		m_surface = nullptr;
+		m_surfaceLocked = FALSE;
 		// Decoded frames update the same managed legacy texture in place. Discard
 		// the D3D11 conversion so the next video draw uploads the new frame.
 		if ( m_texture != nullptr )
