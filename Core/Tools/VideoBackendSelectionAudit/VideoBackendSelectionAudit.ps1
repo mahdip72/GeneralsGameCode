@@ -303,7 +303,7 @@ void BinkVideoPlayer::deinit()
         if ($_.Exception.Message -ne 'Bink player does not use exactly the checked legacy video audio capabilities.') { throw }
     }
 
-    $validIntroUpdate = @'
+    $validIntroUpdate = (@'
 if (m_intro != nullptr)
 {
     TheVideoPlayer->UPDATE();
@@ -311,7 +311,7 @@ if (m_intro != nullptr)
     TheDisplay->DRAW();
     return;
 }
-'@
+'@) -replace "`r`n", "`n"
     Assert-IntroVideoService $validIntroUpdate 'Valid intro video service ordering was rejected.'
 
     foreach ($invalidIntroUpdate in @(
