@@ -10,6 +10,7 @@ target_include_directories(core_mouse_cursor_mode_tests PRIVATE
 )
 
 if(IS_VS6_BUILD)
+    target_link_libraries(core_mouse_cursor_mode_tests PRIVATE stlport)
     set_target_properties(core_mouse_cursor_mode_tests PROPERTIES
         CXX_STANDARD 98
         CXX_STANDARD_REQUIRED YES

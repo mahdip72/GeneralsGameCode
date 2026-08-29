@@ -1,4 +1,4 @@
-#include <cstdio>
+#include <stdio.h>
 
 #include "W3DDevice/Common/W3DShroudRenderPolicy.h"
 
@@ -8,7 +8,7 @@ int check(bool condition, const char *message)
 {
 	if (!condition)
 	{
-		std::fprintf(stderr, "FAIL: %s\n", message);
+		fprintf(stderr, "FAIL: %s\n", message);
 		return 1;
 	}
 	return 0;
