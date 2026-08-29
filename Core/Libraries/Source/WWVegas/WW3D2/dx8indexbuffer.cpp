@@ -72,7 +72,11 @@ IndexBufferClass::IndexBufferClass(unsigned type_, unsigned short index_count_)
 	index_count(index_count_),
 	type(type_),
 	engine_refs(0),
-	generation(1)
+	generation(1),
+	change_base_generation(0),
+	change_offset(0),
+	change_count(index_count_),
+	change_flags(0)
 {
 	WWASSERT(type==BUFFER_TYPE_DX8 || type==BUFFER_TYPE_SORTING);
 	WWASSERT(index_count);
@@ -131,11 +135,35 @@ void IndexBufferClass::Release_Engine_Ref() const
 
 void IndexBufferClass::Mark_Changed()
 {
+	Mark_Changed_Range(0, index_count, 0);
+}
+
+void IndexBufferClass::Mark_Changed_Range(unsigned int offset,
+	unsigned int count, unsigned int flags)
+{
+	change_base_generation = generation;
 	++generation;
 	if (generation == 0)
 	{
 		++generation;
 	}
+	change_offset = offset;
+	change_count = count;
+	change_flags = flags;
+}
+
+bool IndexBufferClass::Get_Change_Since(unsigned int uploaded_generation,
+	unsigned int *offset, unsigned int *count, unsigned int *flags) const
+{
+	if (offset == nullptr || count == nullptr || flags == nullptr ||
+		change_base_generation != uploaded_generation || change_count == 0)
+	{
+		return false;
+	}
+	*offset = change_offset;
+	*count = change_count;
+	*flags = change_flags;
+	return true;
 }
 
 // ----------------------------------------------------------------------------
@@ -462,9 +490,25 @@ DynamicIBAccessClass::WriteLockClass::WriteLockClass(DynamicIBAccessClass* ib_ac
 DynamicIBAccessClass::WriteLockClass::~WriteLockClass()
 {
 	DX8_THREAD_ASSERT();
+	const unsigned int change_flags =
+		!DynamicIBAccess->IndexBufferOffset ?
+			D3DLOCK_DISCARD : D3DLOCK_NOOVERWRITE;
+	DynamicIBAccess->IndexBuffer->Mark_Changed_Range(
+		DynamicIBAccess->IndexBufferOffset,
+		DynamicIBAccess->Get_Index_Count(), change_flags);
 	switch (DynamicIBAccess->Get_Type()) {
 	case BUFFER_TYPE_DYNAMIC_DX8:
 		DX8_Assert();
+		Publish_Render_Buffer_Change(
+			static_cast<DX8IndexBufferClass *>(
+				DynamicIBAccess->IndexBuffer)->Get_DX8_Index_Buffer(),
+			rts::render::RENDER_BUFFER_INDEX, Indices,
+			static_cast<size_t>(DynamicIBAccess->Get_Index_Count()) * sizeof(WORD),
+			static_cast<size_t>(DynamicIBAccess->IndexBufferOffset) * sizeof(WORD),
+			!DynamicIBAccess->IndexBufferOffset ?
+				rts::render::RENDER_BUFFER_UPDATE_DISCARD :
+				rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE,
+			DynamicIBAccess->IndexBuffer->Get_Generation());
 		DX8_ErrorCode(static_cast<DX8IndexBufferClass*>(DynamicIBAccess->IndexBuffer)->Get_DX8_Index_Buffer()->Unlock());
 		break;
 	case BUFFER_TYPE_DYNAMIC_SORTING:
@@ -473,7 +517,6 @@ DynamicIBAccessClass::WriteLockClass::~WriteLockClass()
 		WWASSERT(0);
 		break;
 	}
-	DynamicIBAccess->IndexBuffer->Mark_Changed();
 	DynamicIBAccess->IndexBuffer->Release_Ref();
 }
 

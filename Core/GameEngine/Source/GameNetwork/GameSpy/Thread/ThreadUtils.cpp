@@ -28,32 +28,56 @@
 
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
 
+#include "WWLib/utf8.h"
+
 //-------------------------------------------------------------------------
 
+// TheSuperHackers @refactor bobtista 02/04/2026 Use WWLib UTF-8 functions instead of raw Win32 API calls
 std::wstring MultiByteToWideCharSingleLine( const char *orig )
 {
 	if (orig == nullptr)
 		return std::wstring();
 
-	const Int requiredLength = MultiByteToWideChar(CP_UTF8, 0, orig, -1, nullptr, 0);
-	if (requiredLength <= 0)
+	const size_t srcLen = strlen(orig);
+	const size_t dstLen = Utf8_To_Wide_Len(orig, srcLen);
+	if (dstLen == 0)
 		return std::wstring();
-
-	WideChar *dest = NEW WideChar[requiredLength];
-	if (MultiByteToWideChar(CP_UTF8, 0, orig, -1, dest, requiredLength) != requiredLength)
+	std::wstring ret;
+	if (dstLen == UTF8_INVALID)
 	{
-		delete[] dest;
-		return std::wstring();
+		// Not UTF-8. Fall back to a 1:1 byte cast so legacy data keeps its characters, matching
+		// UnicodeString::translate.
+		ret.resize(srcLen);
+		for (size_t i = 0; i < srcLen; ++i)
+		{
+			ret[i] = (WideChar)(unsigned char)orig[i];
+		}
 	}
-
-	for (Int i = 0; i < requiredLength - 1; ++i)
+	else
 	{
-		if (dest[i] == L'\n' || dest[i] == L'\r')
-			dest[i] = L' ';
+		ret.resize(dstLen);
+		Utf8_To_Wide(&ret[0], dstLen, orig, srcLen);
 	}
+	WideChar *c = nullptr;
+	do
+	{
+		c = wcschr(&ret[0], L'\n');
+		if (c)
+		{
+			*c = L' ';
+		}
+	}
+	while ( c != nullptr );
+	do
+	{
+		c = wcschr(&ret[0], L'\r');
+		if (c)
+		{
+			*c = L' ';
+		}
+	}
+	while ( c != nullptr );
 
-	const std::wstring ret = dest;
-	delete[] dest;
 	return ret;
 }
 
@@ -62,19 +86,13 @@ std::string WideCharStringToMultiByte( const WideChar *orig )
 	if (orig == nullptr)
 		return std::string();
 
-	const Int requiredLength = WideCharToMultiByte(CP_UTF8, 0, orig, -1, nullptr, 0, nullptr, nullptr);
-	if (requiredLength <= 0)
+	const size_t srcLen = wcslen(orig);
+	const size_t dstLen = Wide_To_Utf8_Len(orig, srcLen);
+	if (dstLen == 0)
 		return std::string();
-
-	char *dest = NEW char[requiredLength];
-	if (WideCharToMultiByte(CP_UTF8, 0, orig, -1, dest, requiredLength, nullptr, nullptr) != requiredLength)
-	{
-		delete[] dest;
-		return std::string();
-	}
-
-	const std::string ret = dest;
-	delete[] dest;
+	std::string ret;
+	ret.resize(dstLen);
+	Wide_To_Utf8(&ret[0], dstLen, orig, srcLen);
 	return ret;
 }
 

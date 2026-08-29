@@ -103,6 +103,13 @@ class SurfaceClass;
 void Notify_Render_Texture_Changed(IDirect3DBaseTexture8 *texture);
 void Notify_Render_Texture_Changed(TextureClass *texture);
 void Notify_Render_Buffer_Changed(IUnknown *buffer);
+void Notify_Render_Buffer_Range_Changed(IUnknown *buffer,
+	unsigned int binding, size_t destination_offset, size_t byte_count,
+	rts::render::RenderBufferUpdateMode mode);
+bool Publish_Render_Buffer_Change(IUnknown *buffer, unsigned int binding,
+	const void *data, size_t byte_count, size_t destination_offset,
+	rts::render::RenderBufferUpdateMode mode,
+	unsigned int source_generation = 0);
 
 struct DX8FrameStatistics
 {
@@ -470,11 +477,21 @@ public:
 	static IDirect3DSurface8 * _Get_DX8_Front_Buffer();
 	static SurfaceClass * _Get_DX8_Back_Buffer(unsigned int num=0);
 	static bool Is_D3D11_Backend_Active();
+	static void Begin_D3D11_Display_Iteration();
 	static rts::render::RenderResult Get_Render_Back_Buffer_Info(
 		rts::render::RenderBackBufferInfo *info);
 	static rts::render::RenderResult Copy_Active_Render_Target_To_Texture(
 		IDirect3DBaseTexture8 *destination);
+	static bool Acquire_D3D11_Copied_Texture_Content(
+		IDirect3DBaseTexture8 *texture);
 	static void Notify_D3D11_Buffer_Changed(IUnknown *buffer);
+	static void Notify_D3D11_Buffer_Range_Changed(IUnknown *buffer,
+		unsigned int binding, size_t destination_offset, size_t byte_count,
+		rts::render::RenderBufferUpdateMode mode);
+	static bool Publish_D3D11_Buffer_Change(IUnknown *buffer,
+		unsigned int binding, const void *data, size_t byte_count,
+		size_t destination_offset, rts::render::RenderBufferUpdateMode mode,
+		unsigned int source_generation = 0);
 	static void Notify_D3D11_Texture_Changed(IDirect3DBaseTexture8 *texture);
 	static void Notify_D3D11_Texture_Changed(TextureClass *texture);
 	static void Request_D3D11_Back_Buffer_Capture();
@@ -563,6 +580,7 @@ public:
 	// historical fire-and-forget use, but RTT publishers must honor it.
 	static HRESULT				Set_Render_Target (IDirect3DSurface8 *render_target, bool use_default_depth_buffer = false);
 	static HRESULT				Set_Render_Target (IDirect3DSurface8* render_target, IDirect3DSurface8* dpeth_buffer);
+	static HRESULT				Restore_Default_Render_Target();
 
 	static void					Set_Render_Target (IDirect3DSwapChain8 *swap_chain);
 	static bool					Is_Render_To_Texture() { return IsRenderToTexture; }
@@ -577,7 +595,8 @@ public:
 		TextureClass** target,
 		ZTextureClass** depth_buffer
 	);
-	static void					Set_Render_Target_With_Z (TextureClass * texture, ZTextureClass* ztexture=nullptr);
+	static void					Set_Render_Target_With_Z (TextureClass * texture,
+		ZTextureClass* ztexture=nullptr, bool use_default_depth_if_missing=true);
 
 	static void Set_Shadow_Map(int idx, ZTextureClass* ztex) { Shadow_Map[idx]=ztex; }
 	static ZTextureClass* Get_Shadow_Map(int idx) { return Shadow_Map[idx]; }
@@ -612,7 +631,8 @@ public:
 	static IDirect3D8* _Get_D3D8() { return D3DInterface; }
 	/// Returns the display format - added by TR for video playback - not part of W3D
 	static WW3DFormat	getBackBufferFormat();
-	static bool Reset_Device(bool reload_assets=true);
+	static bool Reset_Device(bool reload_assets=true,
+		bool *reset_requires_reacquire=nullptr);
 
 	static const DX8Caps*	Get_Current_Caps() { WWASSERT(CurrentCaps); return CurrentCaps; }
 
@@ -697,7 +717,8 @@ protected:
 	/*
 	** Internal functions
 	*/
-	static void Resize_And_Position_Window();
+	static bool Resize_And_Position_Window(bool use_restored_width,
+		bool use_restored_height);
 	static bool Find_Color_And_Z_Mode(int resx,int resy,int bitdepth,D3DFORMAT * set_colorbuffer,D3DFORMAT * set_backbuffer, D3DFORMAT * set_zmode);
 	static bool Find_Color_Mode(D3DFORMAT colorbuffer, int resx, int resy, UINT *mode);
 	static bool Find_Z_Mode(D3DFORMAT colorbuffer,D3DFORMAT backbuffer, D3DFORMAT *zmode);
@@ -1018,23 +1039,6 @@ WWINLINE void DX8Wrapper::Set_DX8_Material(const D3DMATERIAL8* mat)
 	WWASSERT(mat);
 	SNAPSHOT_SAY(("DX8 - SetMaterial"));
 	DX8CALL(SetMaterial(mat));
-}
-
-WWINLINE void DX8Wrapper::Set_DX8_Light(int index, D3DLIGHT8* light)
-{
-	if (light) {
-		DX8_RECORD_LIGHT_CHANGE();
-		DX8CALL(SetLight(index,light));
-		DX8CALL(LightEnable(index,TRUE));
-		CurrentDX8LightEnables[index]=true;
-		SNAPSHOT_SAY(("DX8 - SetLight %d",index));
-	}
-	else if (CurrentDX8LightEnables[index]) {
-		DX8_RECORD_LIGHT_CHANGE();
-		CurrentDX8LightEnables[index]=false;
-		DX8CALL(LightEnable(index,FALSE));
-		SNAPSHOT_SAY(("DX8 - DisableLight %d",index));
-	}
 }
 
 WWINLINE void DX8Wrapper::Set_DX8_Render_State(D3DRENDERSTATETYPE state, unsigned value)

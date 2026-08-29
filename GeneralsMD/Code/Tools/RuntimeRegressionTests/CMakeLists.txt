@@ -138,3 +138,6 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD)
 	)
 	set_tests_properties(z_runtime_regression_graph_audit_self_test PROPERTIES TIMEOUT 30)
 endif()
+
+add_test(NAME z_texture_load_queue_contract_tests COMMAND z_runtime_regression_tests --texture-load-queue-contract)
+set_tests_properties(z_texture_load_queue_contract_tests PROPERTIES TIMEOUT 30)

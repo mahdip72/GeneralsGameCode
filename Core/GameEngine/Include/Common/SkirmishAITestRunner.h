@@ -55,6 +55,7 @@ struct SkirmishAITestLoadedState
 };
 
 Bool TryParseSkirmishAITestSeed(const char *text, Int *seed);
+Bool ShouldBypassFramePacingForSkirmishAITest(Bool runnerArmed);
 void BuildSkirmishAITestPlan(Int seed, SkirmishAITestPlan *plan);
 Bool IsExpectedSkirmishAITestLoadedState(const SkirmishAITestPlan &plan,
 	UnsignedInt expectedMapCRC, UnsignedInt expectedMapSize,

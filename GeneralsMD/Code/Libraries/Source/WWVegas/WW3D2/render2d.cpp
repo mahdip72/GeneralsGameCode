@@ -644,8 +644,10 @@ void Render2DClass::Render()
 		{
 			Vector3 temp(Vertices[i].X,Vertices[i].Y,ZValue);
 			*(Vector3*)(va+fi.Get_Location_Offset())=temp;
+			*(Vector3*)(va+fi.Get_Normal_Offset())=Vector3(0.0f,0.0f,1.0f);
 			*(unsigned int*)(va+fi.Get_Diffuse_Offset())=Colors[i];
 			*(Vector2*)(va+fi.Get_Tex_Offset(0))=UVCoordinates[i];
+			*(Vector2*)(va+fi.Get_Tex_Offset(1))=Vector2(0.0f,0.0f);
 			va+=fi.Get_FVF_Size();
 		}
 	}

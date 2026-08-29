@@ -169,6 +169,44 @@ inline bool Is_D3D8_Indexed_Range_Valid(unsigned long index_capacity,
 	return start <= index_capacity && count <= index_capacity - start;
 }
 
+inline bool Is_D3D8_Vertex_Range_Valid(unsigned long vertex_capacity,
+	unsigned int base_vertex, unsigned int min_vertex_index,
+	unsigned int vertex_count)
+{
+	if (base_vertex > vertex_capacity)
+	{
+		return false;
+	}
+	const unsigned long after_base = vertex_capacity - base_vertex;
+	return min_vertex_index <= after_base &&
+		vertex_count <= after_base - min_vertex_index;
+}
+
+inline bool Is_D3D11_Base_Vertex_Valid(unsigned int base_vertex)
+{
+	return base_vertex <= 0x7fffffffU;
+}
+
+inline bool Is_D3D11_GPU_Copy_Lease_Active(bool copy_valid,
+	unsigned int lease_epoch, unsigned int display_epoch)
+{
+	return copy_valid && lease_epoch == display_epoch;
+}
+
+inline unsigned int Advance_D3D11_Display_Epoch(unsigned int display_epoch)
+{
+	// Zero represents no lease.  Skip it when the epoch wraps so an acquired
+	// GPU copy can never alias the invalid/unowned state.
+	return display_epoch == 0xffffffffU ? 1U : display_epoch + 1U;
+}
+
+inline bool Should_Invalidate_D3D11_GPU_Copy(bool copy_valid,
+	unsigned int copy_frame, unsigned int completed_frame,
+	bool frame_succeeded)
+{
+	return copy_valid && copy_frame == completed_frame && !frame_succeeded;
+}
+
 // These states are deliberately not published into the neutral pipeline:
 // fog constants and shader-derived fog/specular bits are mirrored by
 // TrackLegacyFog/ShaderBits, while active water code publishes sampler wrap
@@ -185,7 +223,6 @@ inline bool Is_D3D11_Irrelevant_Render_State(unsigned int state)
 	case LEGACY_D3DRS_FOGSTART:
 	case LEGACY_D3DRS_FOGEND:
 	case LEGACY_D3DRS_FOGDENSITY:
-	case LEGACY_D3DRS_RANGEFOGENABLE:
 	case LEGACY_D3DRS_FOGTABLEMODE:
 	case LEGACY_D3DRS_FOGVERTEXMODE:
 	case LEGACY_D3DRS_SPECULARENABLE:

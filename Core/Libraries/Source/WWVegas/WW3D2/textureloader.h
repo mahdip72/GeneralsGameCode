@@ -150,6 +150,9 @@ class TextureLoadTaskListClass
 		// Remove and return a task from end of list, or null if list is empty
 		TextureLoadTaskClass *			Pop_Back		();
 
+		// Return the first task without removing it, or null if list is empty.
+		TextureLoadTaskClass *			Peek_Front	() const;
+
 		// Remove specified task from list, if present
 		void									Remove		(TextureLoadTaskClass *task);
 
@@ -182,6 +185,7 @@ class SynchronizedTextureLoadTaskListClass : public TextureLoadTaskListClass
 
 	private:
 		FastCriticalSectionClass		CriticalSection;
+		TextureLoadTaskListClass		ReadyQueue;
 };
 
 /*

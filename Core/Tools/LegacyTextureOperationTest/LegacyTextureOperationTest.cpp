@@ -1,9 +1,8 @@
 #include "Renderer/LegacyRenderState.h"
 
-#include <cmath>
-#include <cstdio>
-#include <fstream>
-#include <sstream>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string>
 
 namespace
@@ -237,19 +236,42 @@ int CheckShaderSource()
 {
 	std::string path = RTS_SOURCE_ROOT;
 	path += "/Core/Libraries/Source/Renderer/Shaders/LegacyFixedFunction.hlsl";
-	std::ifstream input(path.c_str(), std::ios::in | std::ios::binary);
-	if (!input)
+	FILE *input = fopen(path.c_str(), "rb");
+	if (input == 0)
 	{
 		return Check(false, "could not open LegacyFixedFunction.hlsl");
 	}
-	std::ostringstream contents;
-	contents << input.rdbuf();
-	const std::string source = contents.str();
+	if (fseek(input, 0, SEEK_END) != 0)
+	{
+		fclose(input);
+		return Check(false, "could not seek LegacyFixedFunction.hlsl");
+	}
+	const long byteCount = ftell(input);
+	if (byteCount <= 0 || fseek(input, 0, SEEK_SET) != 0)
+	{
+		fclose(input);
+		return Check(false, "could not measure LegacyFixedFunction.hlsl");
+	}
+	char *bytes = static_cast<char *>(malloc(static_cast<size_t>(byteCount)));
+	if (bytes == 0)
+	{
+		fclose(input);
+		return Check(false, "could not allocate shader source buffer");
+	}
+	const size_t bytesRead = fread(bytes, 1, static_cast<size_t>(byteCount), input);
+	fclose(input);
+	if (bytesRead != static_cast<size_t>(byteCount))
+	{
+		free(bytes);
+		return Check(false, "could not read LegacyFixedFunction.hlsl");
+	}
+	const std::string source(bytes, bytesRead);
+	free(bytes);
 	const std::string::size_type premodulateCase = source.find("case 20:");
-	const std::string::size_type premodulateReturn = source.find(
-		"return argument1;", premodulateCase);
-	const std::string::size_type followingCase = source.find(
-		"case 21:", premodulateCase);
+	const std::string::size_type nextCase = source.find("case 21:", premodulateCase);
+	const bool premodulateReturnsArgument1 = premodulateCase != std::string::npos &&
+		nextCase != std::string::npos &&
+		source.find("return argument1;", premodulateCase) < nextCase;
 	int result = 0;
 	result |= Check(source.find("float4 textureSample, bool alphaOperation") !=
 		std::string::npos, "shader combiner must distinguish alpha operations");
@@ -261,10 +283,7 @@ int CheckShaderSource()
 		std::string::npos, "shader MODULATEINVALPHA_ADDCOLOR RGB formula");
 	result |= Check(source.find("(1.0f - argument1.rgb) * argument2.rgb + argument1.a") !=
 		std::string::npos, "shader MODULATEINVCOLOR_ADDALPHA RGB formula");
-	result |= Check(premodulateCase != std::string::npos &&
-		premodulateReturn != std::string::npos &&
-		followingCase != std::string::npos &&
-		premodulateCase < premodulateReturn && premodulateReturn < followingCase,
+	result |= Check(premodulateReturnsArgument1,
 		"shader PREMODULATE must output argument 1");
 	result |= Check(source.find("float4(current.rgb, dotProduct)") !=
 		std::string::npos, "shader DOTPRODUCT3 alpha routing");
@@ -291,9 +310,9 @@ int main()
 
 	struct ExpectedOperation
 	{
-		ExpectedOperation(RenderTextureOperation operation_value,
-			const Color &expected_value, const char *name_value) :
-			operation(operation_value), expected(expected_value), name(name_value)
+		ExpectedOperation(RenderTextureOperation textureOperation,
+			const Color &expectedColor, const char *operationName)
+			: operation(textureOperation), expected(expectedColor), name(operationName)
 		{
 		}
 

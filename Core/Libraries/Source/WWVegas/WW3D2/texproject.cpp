@@ -95,6 +95,11 @@
 
 const float INTENSITY_RATE_OF_CHANGE			= 1.0f;			// change in intensity per second
 
+static void Restore_Default_Render_Target()
+{
+	DX8Wrapper::Set_Render_Target((IDirect3DSurface8 *)nullptr);
+}
+
 
 /*
 **
@@ -1115,7 +1120,8 @@ bool TexProjectClass::Compute_Ortho_Projection
 bool TexProjectClass::Compute_Texture
 (
 	RenderObjClass * model,
-	SpecialRenderInfoClass * context
+	SpecialRenderInfoClass * context,
+	TextureClass * d3d11_copy_target
 )
 {
 	if ((model == nullptr) || (context == nullptr))
@@ -1129,6 +1135,10 @@ bool TexProjectClass::Compute_Texture
 	ZTextureClass* ztarget=nullptr;
 
 	Peek_Render_Target(&rtarget,&ztarget);
+	if (rtarget == nullptr)
+	{
+		return false;
+	}
 
 	if (rtarget != nullptr)
 	{
@@ -1138,7 +1148,16 @@ bool TexProjectClass::Compute_Texture
 		/*
 		** Set the render target
 		*/
-		DX8Wrapper::Set_Render_Target_With_Z (rtarget,ztarget);
+		// The D3D11 copy target deliberately renders without depth because it is
+		// smaller than the swap chain. Preserve the historical D3D8 behavior,
+		// which attaches the default depth surface when ztarget is absent.
+		DX8Wrapper::Set_Render_Target_With_Z(rtarget, ztarget,
+			!DX8Wrapper::Is_D3D11_Backend_Active());
+		if (!DX8Wrapper::Is_Render_To_Texture())
+		{
+			Restore_Default_Render_Target();
+			return false;
+		}
 
 		/*
 		** Set up the camera
@@ -1157,13 +1176,40 @@ bool TexProjectClass::Compute_Texture
 
 		bool snapshot=WW3D::Is_Snapshot_Activated();
 		SNAPSHOT_SAY(("TexProjectCLass::Begin_Render()"));
-		WW3D::Begin_Render(true,zclear,color);	// false to zclear as we don't have z-buffer
+		if (WW3D::Begin_Render(true,zclear,color) != WW3D_ERROR_OK)
+		{
+			Restore_Default_Render_Target();
+			WW3D::Activate_Snapshot(snapshot);
+			return false;
+		}
 		WW3D::Render(*model,*context);
+		bool copy_succeeded = true;
+		if (d3d11_copy_target != nullptr &&
+			DX8Wrapper::Is_D3D11_Backend_Active())
+		{
+			copy_succeeded = DX8Wrapper::Copy_Active_Render_Target_To_Texture(
+				d3d11_copy_target->Peek_D3D_Base_Texture()) ==
+				rts::render::RENDER_RESULT_OK;
+		}
 		SNAPSHOT_SAY(("TexProjectCLass::End_Render()"));
 		WW3D::End_Render(false);
 		WW3D::Activate_Snapshot(snapshot);	// End_Render() ends the shapsnot, so restore the state
+		if (copy_succeeded && d3d11_copy_target != nullptr &&
+			DX8Wrapper::Is_D3D11_Backend_Active())
+		{
+			// End_Render finalizes the hidden producer frame.  A failed frame
+			// invalidates its copy, so verify publication before advancing the
+			// shadow's bounds/history and suppressing regeneration.
+			copy_succeeded =
+				DX8Wrapper::Acquire_D3D11_Copied_Texture_Content(
+					d3d11_copy_target->Peek_D3D_Base_Texture());
+		}
 
-		DX8Wrapper::Set_Render_Target((IDirect3DSurface8 *)nullptr);
+		Restore_Default_Render_Target();
+		if (!copy_succeeded)
+		{
+			return false;
+		}
 
 	}
 

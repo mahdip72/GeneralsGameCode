@@ -457,9 +457,33 @@ Int parseHeadless(char *args[], int num)
 	return 1;
 }
 
+Bool parseSkirmishAITestSeedArgument(char *args[], int num, Int *seed)
+{
+	if (num < 2 || !TryParseSkirmishAITestSeed(args[1], seed))
+	{
+		printf("SKIRMISH_AI_TEST_FAIL seed=0 reason=invalid_seed\n");
+		fflush(stdout);
+		exit(2);
+	}
+	return TRUE;
+}
+
+Int parseRunSkirmishAITestForStartup(char *args[], int num)
+{
+	Int seed = 0;
+	parseSkirmishAITestSeedArgument(args, num, &seed);
+
+	parseHeadless(args, num);
+	TheWritableGlobalData->m_shellMapOn = FALSE;
+	TheWritableGlobalData->m_useFpsLimit = FALSE;
+	rts::ClientInstance::setMultiInstance(TRUE);
+	rts::ClientInstance::skipPrimaryInstance();
+	return 2;
+}
+
 Int parseRunSkirmishAITest(char *args[], int num)
 {
-	if (IsSkirmishAITestRunnerArmed())
+	if (TheGlobalData->m_commandLineData.hasSkirmishAITestRequest())
 	{
 		printf("SKIRMISH_AI_TEST_FAIL seed=0 reason=duplicate_option\n");
 		fflush(stdout);
@@ -467,19 +491,8 @@ Int parseRunSkirmishAITest(char *args[], int num)
 	}
 
 	Int seed = 0;
-	if (num < 2 || !TryParseSkirmishAITestSeed(args[1], &seed))
-	{
-		printf("SKIRMISH_AI_TEST_FAIL seed=0 reason=invalid_seed\n");
-		fflush(stdout);
-		exit(2);
-	}
-
-	ArmSkirmishAITestRunner(seed);
-	parseHeadless(args, num);
-	TheWritableGlobalData->m_shellMapOn = FALSE;
-	TheWritableGlobalData->m_useFpsLimit = FALSE;
-	rts::ClientInstance::setMultiInstance(TRUE);
-	rts::ClientInstance::skipPrimaryInstance();
+	parseSkirmishAITestSeedArgument(args, num, &seed);
+	TheWritableGlobalData->m_commandLineData.requestSkirmishAITest(seed);
 	return 2;
 }
 
@@ -812,6 +825,18 @@ Int parseVTune ( char *args[], int num )
 /// end stuff for VTUNE
 
 #endif // defined(RTS_DEBUG)
+
+Int parseLoadSave(char *args[], int num)
+{
+	if (num > 1)
+	{
+		TheWritableGlobalData->m_loadSaveGame = args[1];
+		TheWritableGlobalData->m_shellMapOn = FALSE;
+		TheWritableGlobalData->m_playIntro = FALSE;
+		TheWritableGlobalData->m_playSizzle = FALSE;
+	}
+	return 2;
+}
 
 //=============================================================================
 //=============================================================================
@@ -1225,7 +1250,7 @@ static CommandLineParam paramsForStartup[] =
 	// TheSuperHackers @feature helmutbuhler 11/04/2025
 	// This runs the game without a window, graphics, input and audio. You can combine this with -replay
 	{ "-headless", parseHeadless },
-	{ "-runSkirmishAITest", parseRunSkirmishAITest },
+	{ "-runSkirmishAITest", parseRunSkirmishAITestForStartup },
 
 	// TheSuperHackers @feature helmutbuhler 13/04/2025
 	// Play back a replay. Pass the filename including .rep afterwards.
@@ -1248,6 +1273,7 @@ static CommandLineParam paramsForStartup[] =
 // These Params are parsed during Engine Init before INI data is loaded
 static CommandLineParam paramsForEngineInit[] =
 {
+	{ "-runSkirmishAITest", parseRunSkirmishAITest },
 	{ "-nologo", parseNoLogo }, // TheSuperHackers @tweak Is now available in Release builds.
 	{ "-noshellmap", parseNoShellMap },
 	{ "-noShellAnim", parseNoWindowAnimation }, // TheSuperHackers @tweak Is now available in Release builds.
@@ -1261,6 +1287,9 @@ static CommandLineParam paramsForEngineInit[] =
 	{ "-noshaders", parseNoShaders },
 	{ "-quickstart", parseQuickStart },
 	{ "-useWaveEditor", parseUseWaveEditor },
+
+	// TheSuperHackers @feature bobtista 22/07/2026 Load a save game file from the command line.
+	{ "-loadsave", parseLoadSave },
 
 	// TheSuperHackers @feature xezon 03/08/2025 Force full viewport for 'Control Bar Pro' Addons like GenTool did it.
 	{ "-forcefullviewport", parseFullViewport },

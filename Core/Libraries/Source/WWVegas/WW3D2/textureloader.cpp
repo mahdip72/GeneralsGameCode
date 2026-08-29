@@ -134,6 +134,11 @@ TextureLoadTaskClass *TextureLoadTaskListClass::Pop_Back()
 	return task;
 }
 
+TextureLoadTaskClass *TextureLoadTaskListClass::Peek_Front() const
+{
+	return Is_Empty() ? nullptr : (TextureLoadTaskClass *)Root.Next;
+}
+
 void TextureLoadTaskListClass::Remove(TextureLoadTaskClass *task)
 {
 	// exit early if task is not on this list.
@@ -160,7 +165,8 @@ void TextureLoadTaskListClass::Remove(TextureLoadTaskClass *task)
 
 SynchronizedTextureLoadTaskListClass::SynchronizedTextureLoadTaskListClass()
 :	TextureLoadTaskListClass(),
-	CriticalSection()
+	CriticalSection(),
+	ReadyQueue()
 {
 }
 
@@ -186,7 +192,9 @@ void SynchronizedTextureLoadTaskListClass::Publish_Completed(TextureLoadTaskClas
 	}
 	else
 	{
-		TextureLoadTaskListClass::Push_Back(task);
+		// Ready streaming work remains FIFO and publishes before requests that
+		// have not started, without overtaking explicit foreground requests.
+		ReadyQueue.Push_Back(task);
 	}
 	task->Complete_Async_Prepare();
 }
@@ -201,7 +209,7 @@ void SynchronizedTextureLoadTaskListClass::Publish_Failed(TextureLoadTaskClass *
 	}
 	else
 	{
-		TextureLoadTaskListClass::Push_Back(task);
+		ReadyQueue.Push_Back(task);
 	}
 	task->Fail_Async_Prepare();
 }
@@ -249,12 +257,28 @@ bool SynchronizedTextureLoadTaskListClass::Promote_Prepare_Job(
 		TextureLoadTaskListClass::Push_Front(task);
 		return true;
 	}
+	if (task->Get_List() == &ReadyQueue)
+	{
+		ReadyQueue.Remove(task);
+		TextureLoadTaskListClass::Push_Front(task);
+		return true;
+	}
 	return false;
 }
 
 TextureLoadTaskClass *SynchronizedTextureLoadTaskListClass::Pop_Front()
 {
 	FastCriticalSectionClass::LockClass lock(CriticalSection);
+	TextureLoadTaskClass *task = TextureLoadTaskListClass::Peek_Front();
+	if (task != nullptr && task->Get_Priority() == TextureLoadTaskClass::PRIORITY_HIGH)
+	{
+		return TextureLoadTaskListClass::Pop_Front();
+	}
+	task = ReadyQueue.Pop_Front();
+	if (task != nullptr)
+	{
+		return task;
+	}
 	return TextureLoadTaskListClass::Pop_Front();
 
 }
@@ -262,19 +286,21 @@ TextureLoadTaskClass *SynchronizedTextureLoadTaskListClass::Pop_Front()
 TextureLoadTaskClass *SynchronizedTextureLoadTaskListClass::Pop_Back()
 {
 	FastCriticalSectionClass::LockClass lock(CriticalSection);
-	return TextureLoadTaskListClass::Pop_Back();
+	TextureLoadTaskClass *task = TextureLoadTaskListClass::Pop_Back();
+	return task != nullptr ? task : ReadyQueue.Pop_Back();
 }
 
 void SynchronizedTextureLoadTaskListClass::Remove(TextureLoadTaskClass *task)
 {
 	FastCriticalSectionClass::LockClass lock(CriticalSection);
 	TextureLoadTaskListClass::Remove(task);
+	ReadyQueue.Remove(task);
 }
 
 bool SynchronizedTextureLoadTaskListClass::Is_Empty()
 {
 	FastCriticalSectionClass::LockClass lock(CriticalSection);
-	return TextureLoadTaskListClass::Is_Empty();
+	return TextureLoadTaskListClass::Is_Empty() && ReadyQueue.Is_Empty();
 }
 
 

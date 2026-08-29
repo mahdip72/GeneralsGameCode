@@ -291,6 +291,30 @@ if(RTS_BUILD_CORE_EXTRAS)
                 -SelfTest
         )
         set_tests_properties(core_legacy_product_runtime_audit_self_test PROPERTIES TIMEOUT 30)
+        add_test(NAME core_legacy_state_invalidation_audit
+            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/LegacyStateInvalidationAudit/LegacyStateInvalidationAudit.ps1"
+                -SourceRoot "${CMAKE_SOURCE_DIR}"
+        )
+        set_tests_properties(core_legacy_state_invalidation_audit PROPERTIES TIMEOUT 30)
+        add_test(NAME core_legacy_state_invalidation_audit_self_test
+            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/LegacyStateInvalidationAudit/LegacyStateInvalidationAudit.ps1"
+                -SelfTest
+        )
+        set_tests_properties(core_legacy_state_invalidation_audit_self_test PROPERTIES TIMEOUT 30)
+        add_test(NAME core_terrain_lod_startup_audit
+            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/TerrainLodStartupAudit/TerrainLodStartupAudit.ps1"
+                -SourceRoot "${CMAKE_SOURCE_DIR}"
+        )
+        set_tests_properties(core_terrain_lod_startup_audit PROPERTIES TIMEOUT 30)
+        add_test(NAME core_terrain_lod_startup_audit_self_test
+            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/TerrainLodStartupAudit/TerrainLodStartupAudit.ps1"
+                -SelfTest
+        )
+        set_tests_properties(core_terrain_lod_startup_audit_self_test PROPERTIES TIMEOUT 30)
     endif()
     add_subdirectory(TaskRuntimeTest)
     add_subdirectory(RadarTerrainPrepareTest)

@@ -102,7 +102,8 @@ LegacyPipelineState::LegacyPipelineState() :
 	shaderBits(0), pixelProgram(RENDER_LEGACY_PIXEL_FIXED_FUNCTION),
 	vertexProgram(RENDER_LEGACY_VERTEX_FIXED_FUNCTION), blend(),
 	depthStencil(), rasterizer(),
-	fogMode(RENDER_FOG_DISABLED), secondaryGradientEnable(false),
+	fogMode(RENDER_FOG_DISABLED), rangeFogEnable(false),
+	secondaryGradientEnable(false),
 	nPatchEnable(false), lightingEnable(false),
 	normalizeNormals(false), alphaTestEnable(false),
 	alphaFunction(RENDER_COMPARE_ALWAYS), alphaReference(0), textureFactor(0),
@@ -483,6 +484,8 @@ void TrackLegacyShaderBits(unsigned int shaderBits)
 {
 	const bool frontCounterClockwise =
 		g_trackedLogicalState.pipeline.rasterizer.frontCounterClockwise;
+	const bool rangeFogEnable =
+		g_trackedLogicalState.pipeline.rangeFogEnable;
 	LegacyPipelineState decoded;
 	g_trackedPipelineStateValid = DecodeLegacyShaderBits(shaderBits, &decoded);
 	if (!g_trackedPipelineStateValid)
@@ -498,6 +501,10 @@ void TrackLegacyShaderBits(unsigned int shaderBits)
 	// process state and may be unchanged when the legacy cache suppresses the
 	// corresponding SetRenderState call.
 	decoded.rasterizer.frontCounterClockwise = frontCounterClockwise;
+	// Range fog is an independent D3D8 render state. Selecting a ShaderClass
+	// must not reset it merely because the shader-bit decoder starts from
+	// neutral defaults.
+	decoded.rangeFogEnable = rangeFogEnable;
 	decoded.pixelProgram = g_trackedLogicalState.pipeline.pixelProgram;
 	decoded.vertexProgram = g_trackedLogicalState.pipeline.vertexProgram;
 	g_trackedLogicalState.pipeline = decoded;

@@ -63,6 +63,10 @@ public:
 	unsigned short Get_Index_Count() const { return index_count; }
 	unsigned int Get_Generation() const { return generation; }
 	void Mark_Changed();
+	void Mark_Changed_Range(unsigned int offset, unsigned int count,
+		unsigned int flags);
+	bool Get_Change_Since(unsigned int uploaded_generation,
+		unsigned int *offset, unsigned int *count, unsigned int *flags) const;
 
 	unsigned Type() const { return type; }
 
@@ -101,6 +105,10 @@ protected:
 	unsigned short				index_count;		// number of indices
 	unsigned						type;
 	unsigned int					generation;
+	unsigned int					change_base_generation;
+	unsigned int					change_offset;
+	unsigned int					change_count;
+	unsigned int					change_flags;
 };
 
 

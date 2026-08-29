@@ -1,5 +1,5 @@
 /*
-**	Command & Conquer Generals(tm)
+**	Command & Conquer Generals Zero Hour(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
 **	This program is free software: you can redistribute it and/or modify
@@ -43,7 +43,6 @@ class W3DParticleSystemManager : public ParticleSystemManager
 public:
 	W3DParticleSystemManager();
 	virtual ~W3DParticleSystemManager() override;
-
 	virtual void reset() override;
 	virtual void doParticles(RenderInfoClass &rinfo) override;
 	virtual void queueParticleRender() override;

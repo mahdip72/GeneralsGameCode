@@ -5,7 +5,7 @@
 
 #include "W3DDevice/Common/LegacyPixelShaderBytecode.h"
 
-#include <cstdio>
+#include <stdio.h>
 
 namespace
 {

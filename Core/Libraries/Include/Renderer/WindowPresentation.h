@@ -46,6 +46,12 @@ inline bool IsValidWindowPresentationRect(const RECT &rect)
 	return rect.right > rect.left && rect.bottom > rect.top;
 }
 
+inline bool EqualWindowPresentationRect(const RECT &left, const RECT &right)
+{
+	return left.left == right.left && left.top == right.top &&
+		left.right == right.right && left.bottom == right.bottom;
+}
+
 inline DWORD BorderlessWindowStyle(DWORD savedStyle)
 {
 	// Keep only flags that affect child clipping/visibility.  Caption,
@@ -57,9 +63,10 @@ inline DWORD BorderlessWindowStyle(DWORD savedStyle)
 inline DWORD BorderlessWindowExStyle(DWORD savedExStyle)
 {
 	// These extended styles can reintroduce a non-client edge even when the
-	// base style is WS_POPUP.  Preserve application/taskbar and input flags.
+	// base style is WS_POPUP.  D3D11 borderless presentation must also remain
+	// a normal Alt-Tab participant instead of covering other applications.
 	return savedExStyle & ~(WS_EX_DLGMODALFRAME | WS_EX_CLIENTEDGE |
-		WS_EX_STATICEDGE | WS_EX_WINDOWEDGE);
+		WS_EX_STATICEDGE | WS_EX_WINDOWEDGE | WS_EX_TOPMOST);
 }
 
 inline bool IsBorderlessWindowStyle(DWORD style)
@@ -191,11 +198,68 @@ struct WindowPresentationState
 	WINDOWPLACEMENT placement;
 };
 
+inline bool RestoreWindowPresentationSnapshot(HWND window,
+	WindowPresentationState *state, bool clearState)
+{
+	if (window == 0 || !IsWindow(window) || state == 0 || !state->valid)
+	{
+		return false;
+	}
+
+	bool restored = true;
+	if (!WriteWindowStyle(window, GWL_STYLE, state->style))
+	{
+		restored = false;
+	}
+	if (!WriteWindowStyle(window, GWL_EXSTYLE, state->exStyle))
+	{
+		restored = false;
+	}
+	const HWND restoredOrder = (state->exStyle & WS_EX_TOPMOST) != 0 ?
+		HWND_TOPMOST : HWND_NOTOPMOST;
+	if (!SetWindowPos(window, restoredOrder, 0, 0, 0, 0,
+		SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED))
+	{
+		restored = false;
+	}
+
+	WINDOWPLACEMENT placement = state->placement;
+	placement.length = sizeof(placement);
+	if (!SetWindowPlacement(window, &placement))
+	{
+		restored = false;
+	}
+	if (restored && clearState)
+	{
+		state->clear();
+	}
+	return restored;
+}
+
 inline bool ApplyBorderlessWindow(HWND window, const RECT &monitorRect,
 	WindowPresentationState *state)
 {
 	if (window == 0 || !IsWindow(window) || state == 0 ||
-		!IsValidWindowPresentationRect(monitorRect) || !state->capture(window))
+		!IsValidWindowPresentationRect(monitorRect))
+	{
+		return false;
+	}
+
+	// The persistent state is the windowed restoration point.  A refresh while
+	// already fullscreen needs a separate attempt snapshot so a failed monitor
+	// move restores the prior borderless window without discarding that point.
+	const bool refreshingBorderless = state->valid;
+	WindowPresentationState attemptSnapshot;
+	WindowPresentationState *failureSnapshot = state;
+	if (refreshingBorderless)
+	{
+		if (!attemptSnapshot.capture(window))
+		{
+			return false;
+		}
+		failureSnapshot = &attemptSnapshot;
+	}
+	else if (!state->capture(window))
 	{
 		return false;
 	}
@@ -205,24 +269,51 @@ inline bool ApplyBorderlessWindow(HWND window, const RECT &monitorRect,
 		state->placement.rcNormalPosition, monitorRect);
 	if (!WriteWindowStyle(window, GWL_STYLE, plan.style))
 	{
+		const DWORD error = GetLastError();
+		RestoreWindowPresentationSnapshot(window, failureSnapshot, true);
+		SetLastError(error);
 		return false;
 	}
 	if (!WriteWindowStyle(window, GWL_EXSTYLE, plan.exStyle))
 	{
-		WriteWindowStyle(window, GWL_STYLE, state->style);
+		const DWORD error = GetLastError();
+		RestoreWindowPresentationSnapshot(window, failureSnapshot, true);
+		SetLastError(error);
 		return false;
 	}
 	ShowWindow(window, SW_SHOWNORMAL);
-	if (SetWindowPos(window, HWND_TOP,
+	if (SetWindowPos(window, HWND_NOTOPMOST,
 		plan.rect.left, plan.rect.top,
 		plan.rect.right - plan.rect.left,
 		plan.rect.bottom - plan.rect.top,
 		SWP_FRAMECHANGED | SWP_SHOWWINDOW) != FALSE)
 	{
-		return true;
+		SetLastError(ERROR_SUCCESS);
+		DWORD actualStyle = 0;
+		DWORD actualExStyle = 0;
+		RECT actualWindowRect = { 0 };
+		RECT actualClientRect = { 0 };
+		if (ReadWindowStyle(window, GWL_STYLE, &actualStyle) &&
+			ReadWindowStyle(window, GWL_EXSTYLE, &actualExStyle) &&
+			GetWindowRect(window, &actualWindowRect) &&
+			GetClientRect(window, &actualClientRect) &&
+			IsBorderlessWindowStyle(actualStyle) &&
+			(actualExStyle & WS_EX_TOPMOST) == 0 &&
+			EqualWindowPresentationRect(actualWindowRect, monitorRect) &&
+			actualClientRect.left == 0 && actualClientRect.top == 0 &&
+			actualClientRect.right == monitorRect.right - monitorRect.left &&
+			actualClientRect.bottom == monitorRect.bottom - monitorRect.top)
+		{
+			return true;
+		}
+		if (GetLastError() == ERROR_SUCCESS)
+		{
+			SetLastError(ERROR_INVALID_DATA);
+		}
 	}
-	WriteWindowStyle(window, GWL_STYLE, state->style);
-	WriteWindowStyle(window, GWL_EXSTYLE, state->exStyle);
+	const DWORD error = GetLastError();
+	RestoreWindowPresentationSnapshot(window, failureSnapshot, true);
+	SetLastError(error);
 	return false;
 }
 
@@ -233,25 +324,7 @@ inline bool RestoreWindowedWindow(HWND window, WindowPresentationState *state)
 		return false;
 	}
 
-	if (!WriteWindowStyle(window, GWL_STYLE, state->style) ||
-		!WriteWindowStyle(window, GWL_EXSTYLE, state->exStyle))
-	{
-		return false;
-	}
-	if (!SetWindowPos(window, HWND_NOTOPMOST, 0, 0, 0, 0,
-		SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED))
-	{
-		return false;
-	}
-
-	WINDOWPLACEMENT placement = state->placement;
-	placement.length = sizeof(placement);
-	if (!SetWindowPlacement(window, &placement))
-	{
-		return false;
-	}
-	state->clear();
-	return true;
+	return RestoreWindowPresentationSnapshot(window, state, true);
 }
 
 } // namespace render

@@ -191,6 +191,7 @@ static DynamicVectorClass<RenderDeviceDescClass>	_RenderDeviceDescriptionTable;
 static bool _UseD3D11Backend = false;
 static D3D11LegacyBridge _D3D11Bridge;
 static rts::render::WindowPresentationState _D3D11WindowPresentationState;
+static bool _D3D11FrameStarted = false;
 
 namespace
 {
@@ -241,8 +242,27 @@ bool Get_D3D11_Monitor_Rect(RECT *monitor_rect)
 	return rts::render::IsValidWindowPresentationRect(*monitor_rect);
 }
 
+bool Abort_D3D11_Windowed_Transition(const RECT &monitor_rect)
+{
+	if (_D3D11WindowPresentationState.valid &&
+		!rts::render::ApplyBorderlessWindow(_Hwnd, monitor_rect,
+			&_D3D11WindowPresentationState))
+	{
+		WWDEBUG_SAY(("D3D11 windowed transition rollback failed: %lu.",
+			GetLastError()));
+	}
+	return false;
+}
+
 rts::render::RenderSubmissionDecision Get_Visible_Submission_Decision()
 {
+	if (_UseD3D11Backend && !_D3D11Bridge.Is_Active())
+	{
+		// D3D11 was explicitly selected, so an inactive bridge is a terminal
+		// ownership failure.  Treat it as unavailable instead of exposing the
+		// hidden differential D3D8 swap chain.
+		return rts::render::ChooseVisibleSubmissionBackend(true, false);
+	}
 	return rts::render::ChooseVisibleSubmissionBackend(
 		_D3D11Bridge.Is_Active(),
 		_D3D11Bridge.Is_Render_Target_Operational());
@@ -347,6 +367,12 @@ void MoveRectIntoOtherRect(const RECT& inner, const RECT& outer, int* x, int* y)
 bool DX8Wrapper::Init(void * hwnd, bool lite)
 {
 	WWASSERT(!IsInitted);
+	// The neutral D3D11 shadow starts with the same device-default state as a
+	// newly created D3D8 device.  Ordinary cache invalidations below must not
+	// repeat this reset: legacy shader helpers invalidate wrapper caches without
+	// resetting the actual D3D8 device state.
+	rts::render::ResetTrackedLegacyState();
+	rts::render::SeedTrackedLegacyPipelineState();
 	_UseD3D11Backend = rts::render::RequestedRenderBackend() ==
 		rts::render::RENDER_BACKEND_D3D11;
 #if !defined(RTS_RENDERER_HAS_D3D11)
@@ -552,6 +578,7 @@ void DX8Wrapper::Invalidate_Cached_Render_States()
 			Textures[a]->Release();
 		}
 		Textures[a]=nullptr;
+		rts::render::TrackLegacyTexturePresence(a, false);
 	}
 
 	ShaderClass::Invalidate();
@@ -561,8 +588,6 @@ void DX8Wrapper::Invalidate_Cached_Render_States()
 
 	// (gth) clear the matrix shadows too
 	memset(&DX8Transforms, 0, sizeof(DX8Transforms));
-	rts::render::ResetTrackedLegacyState();
-	rts::render::SeedTrackedLegacyPipelineState();
 }
 
 void DX8Wrapper::Do_Onetime_Device_Dependent_Shutdowns()
@@ -710,6 +735,9 @@ bool DX8Wrapper::Create_Device()
 	}
 
 	dbgHelpGuard.deactivate();
+	rts::render::ResetTrackedLegacyState();
+	rts::render::SeedTrackedLegacyPipelineState();
+	Invalidate_Cached_Render_States();
 
 	/*
 	** Initialize all subsystems
@@ -734,11 +762,30 @@ bool DX8Wrapper::Create_Device()
 	return true;
 }
 
-bool DX8Wrapper::Reset_Device(bool reload_assets)
+bool DX8Wrapper::Reset_Device(bool reload_assets, bool *reset_requires_reacquire)
 {
 	WWDEBUG_SAY(("Resetting device."));
 	DX8_THREAD_ASSERT();
+	if (reset_requires_reacquire != nullptr)
+	{
+		*reset_requires_reacquire = false;
+	}
 	if ((IsInitted) && (D3DDevice != nullptr)) {
+		HRESULT hr=_Get_D3D_Device8()->TestCooperativeLevel();
+		if (hr == D3DERR_DEVICELOST)
+		{
+			return false;
+		}
+		if (_UseD3D11Backend &&
+			!_D3D11Bridge.Prepare_Legacy_Device_Reset())
+		{
+			return false;
+		}
+		if (reset_requires_reacquire != nullptr)
+		{
+			*reset_requires_reacquire = true;
+		}
+
 		// Release all non-MANAGED stuff
 		WW3D::_Invalidate_Textures();
 
@@ -761,14 +808,11 @@ bool DX8Wrapper::Reset_Device(bool reload_assets)
 		memset(Vertex_Shader_Constants,0,sizeof(Vector4)*MAX_VERTEX_SHADER_CONSTANTS);
 		memset(Pixel_Shader_Constants,0,sizeof(Vector4)*MAX_PIXEL_SHADER_CONSTANTS);
 
-		HRESULT hr=_Get_D3D_Device8()->TestCooperativeLevel();
-		if (hr != D3DERR_DEVICELOST )
-		{	DX8CALL_HRES(Reset(&_PresentParameters),hr)
-			if (hr != D3D_OK)
-				return false;	//reset failed.
-		}
-		else
-			return false;	//device is lost and can't be reset.
+		DX8CALL_HRES(Reset(&_PresentParameters),hr)
+		if (hr != D3D_OK)
+			return false;	//reset failed.
+		rts::render::ResetTrackedLegacyState();
+		rts::render::SeedTrackedLegacyPipelineState();
 
 		if (reload_assets)
 		{
@@ -780,8 +824,13 @@ bool DX8Wrapper::Reset_Device(bool reload_assets)
 		Invalidate_Cached_Render_States();
 		Set_Default_Global_Render_States();
 		SHD_INIT_SHADERS;
-		if (_D3D11Bridge.Is_Active())
+		if (_UseD3D11Backend)
 		{
+			if (!_D3D11Bridge.Is_Active())
+			{
+				WWDEBUG_SAY(("D3D11 renderer became inactive during device reset"));
+				return false;
+			}
 			const rts::render::RenderResult bridge_result =
 				_D3D11Bridge.Resize(ResolutionWidth, ResolutionHeight);
 			if (bridge_result != rts::render::RENDER_RESULT_OK)
@@ -1021,50 +1070,84 @@ void DX8Wrapper::Get_Format_Name(unsigned int format, StringClass *tex_format)
 		}
 }
 
-void DX8Wrapper::Resize_And_Position_Window()
+bool DX8Wrapper::Resize_And_Position_Window(bool use_restored_width,
+	bool use_restored_height)
 {
+	bool d3d11_windowed_restore_pending = false;
+	RECT d3d11_rollback_monitor = { 0 };
 	if (_UseD3D11Backend)
 	{
 		if (!IsWindowed)
 		{
 			RECT monitor_rect;
-			if (Get_D3D11_Monitor_Rect(&monitor_rect))
+			if (!Get_D3D11_Monitor_Rect(&monitor_rect))
 			{
-				ResolutionWidth = monitor_rect.right - monitor_rect.left;
-				ResolutionHeight = monitor_rect.bottom - monitor_rect.top;
-				_PresentParameters.BackBufferWidth = ResolutionWidth;
-				_PresentParameters.BackBufferHeight = ResolutionHeight;
-				if (!rts::render::ApplyBorderlessWindow(_Hwnd, monitor_rect,
-					&_D3D11WindowPresentationState))
-				{
-					WWDEBUG_SAY(("D3D11 borderless window transition failed."));
-				}
-				return;
+				WWDEBUG_SAY(("D3D11 monitor lookup failed: %lu.", GetLastError()));
+				return false;
 			}
+			ResolutionWidth = monitor_rect.right - monitor_rect.left;
+			ResolutionHeight = monitor_rect.bottom - monitor_rect.top;
+			_PresentParameters.BackBufferWidth = ResolutionWidth;
+			_PresentParameters.BackBufferHeight = ResolutionHeight;
+			if (!rts::render::ApplyBorderlessWindow(_Hwnd, monitor_rect,
+				&_D3D11WindowPresentationState))
+			{
+				WWDEBUG_SAY(("D3D11 borderless window transition failed: %lu.",
+					GetLastError()));
+				return false;
+			}
+			return true;
 		}
-		else if (_D3D11WindowPresentationState.valid &&
-			rts::render::RestoreWindowedWindow(_Hwnd,
-			&_D3D11WindowPresentationState))
+		else if (_D3D11WindowPresentationState.valid)
 		{
+			if (!Get_D3D11_Monitor_Rect(&d3d11_rollback_monitor))
+			{
+				WWDEBUG_SAY(("D3D11 rollback monitor lookup failed: %lu.",
+					GetLastError()));
+				return false;
+			}
+			if (!rts::render::RestoreWindowPresentationSnapshot(_Hwnd,
+				&_D3D11WindowPresentationState, false))
+			{
+				WWDEBUG_SAY(("D3D11 windowed restoration failed: %lu.",
+					GetLastError()));
+				return Abort_D3D11_Windowed_Transition(
+					d3d11_rollback_monitor);
+			}
+			d3d11_windowed_restore_pending = true;
 			RECT restored_client_rect;
-			::GetClientRect(_Hwnd, &restored_client_rect);
-			if (restored_client_rect.right > restored_client_rect.left &&
-				restored_client_rect.bottom > restored_client_rect.top)
+			if (!::GetClientRect(_Hwnd, &restored_client_rect) ||
+				restored_client_rect.right <= restored_client_rect.left ||
+				restored_client_rect.bottom <= restored_client_rect.top)
+			{
+				return Abort_D3D11_Windowed_Transition(
+					d3d11_rollback_monitor);
+			}
+			if (use_restored_width)
 			{
 				ResolutionWidth = restored_client_rect.right -
 					restored_client_rect.left;
+			}
+			if (use_restored_height)
+			{
 				ResolutionHeight = restored_client_rect.bottom -
 					restored_client_rect.top;
-				_PresentParameters.BackBufferWidth = ResolutionWidth;
-				_PresentParameters.BackBufferHeight = ResolutionHeight;
 			}
-			return;
+			_PresentParameters.BackBufferWidth = ResolutionWidth;
+			_PresentParameters.BackBufferHeight = ResolutionHeight;
+			// Continue through the normal windowed sizing path.  This preserves
+			// an explicit requested resolution while using the captured client
+			// size only for dimensions the caller left unspecified.
 		}
 	}
 
 	// Get the current dimensions of the 'render area' of the window
 	RECT rect = { 0 };
-	::GetClientRect (_Hwnd, &rect);
+	if (!::GetClientRect(_Hwnd, &rect) && _UseD3D11Backend)
+	{
+		return d3d11_windowed_restore_pending ?
+			Abort_D3D11_Windowed_Transition(d3d11_rollback_monitor) : false;
+	}
 
 	// Is the window the correct size for this resolution?
 	if ((rect.right-rect.left) != ResolutionWidth ||
@@ -1076,8 +1159,21 @@ void DX8Wrapper::Resize_And_Position_Window()
 		rect.top = 0;
 		rect.right = ResolutionWidth;
 		rect.bottom = ResolutionHeight;
-		DWORD dwstyle = ::GetWindowLong (_Hwnd, GWL_STYLE);
-		AdjustWindowRect (&rect, dwstyle, FALSE);
+		DWORD dwstyle = 0;
+		if (_UseD3D11Backend)
+		{
+			if (!rts::render::ReadWindowStyle(_Hwnd, GWL_STYLE, &dwstyle) ||
+				!AdjustWindowRect(&rect, dwstyle, FALSE))
+			{
+				return d3d11_windowed_restore_pending ?
+					Abort_D3D11_Windowed_Transition(d3d11_rollback_monitor) : false;
+			}
+		}
+		else
+		{
+			dwstyle = ::GetWindowLong(_Hwnd, GWL_STYLE);
+			AdjustWindowRect(&rect, dwstyle, FALSE);
+		}
 		int width = rect.right-rect.left;
 		int height = rect.bottom-rect.top;
 
@@ -1093,7 +1189,12 @@ void DX8Wrapper::Resize_And_Position_Window()
 			// TheSuperHackers @feature helmutbuhler 14/04/2025
 			// Center the window in the workarea of the monitor it is on.
 			MONITORINFO mi = {sizeof(MONITORINFO)};
-			GetMonitorInfo(MonitorFromWindow(_Hwnd, MONITOR_DEFAULTTOPRIMARY), &mi);
+			if (!GetMonitorInfo(MonitorFromWindow(_Hwnd,
+				MONITOR_DEFAULTTOPRIMARY), &mi) && _UseD3D11Backend)
+			{
+				return d3d11_windowed_restore_pending ?
+					Abort_D3D11_Windowed_Transition(d3d11_rollback_monitor) : false;
+			}
 			int left = (mi.rcWork.left + mi.rcWork.right - width) / 2;
 			int top  = (mi.rcWork.top + mi.rcWork.bottom - height) / 2;
 
@@ -1107,11 +1208,34 @@ void DX8Wrapper::Resize_And_Position_Window()
 			rectClient.bottom = rectClient.top + ResolutionHeight;
 			MoveRectIntoOtherRect(rectClient, mi.rcMonitor, &left, &top);
 
-			::SetWindowPos (_Hwnd, nullptr, left, top, width, height, SWP_NOZORDER);
+			if (!::SetWindowPos(_Hwnd, nullptr, left, top, width, height,
+				SWP_NOZORDER) && _UseD3D11Backend)
+			{
+				return d3d11_windowed_restore_pending ?
+					Abort_D3D11_Windowed_Transition(d3d11_rollback_monitor) : false;
+			}
 
 			DEBUG_LOG(("Window positioned to x:%d y:%d, resized to w:%d h:%d", left, top, width, height));
 		}
 	}
+	if (_UseD3D11Backend)
+	{
+		RECT verified_client_rect = { 0 };
+		if (!GetClientRect(_Hwnd, &verified_client_rect) ||
+			verified_client_rect.right - verified_client_rect.left !=
+				ResolutionWidth ||
+			verified_client_rect.bottom - verified_client_rect.top !=
+				ResolutionHeight)
+		{
+			return d3d11_windowed_restore_pending ?
+				Abort_D3D11_Windowed_Transition(d3d11_rollback_monitor) : false;
+		}
+		if (d3d11_windowed_restore_pending)
+		{
+			_D3D11WindowPresentationState.clear();
+		}
+	}
+	return true;
 }
 
 bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int windowed,
@@ -1121,6 +1245,11 @@ bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int
 	WWASSERT(dev >= -1);
 	WWASSERT(dev < _RenderDeviceNameTable.Count());
 	const bool previous_windowed = IsWindowed;
+	const int previous_resolution_width = ResolutionWidth;
+	const int previous_resolution_height = ResolutionHeight;
+	const int previous_bit_depth = BitDepth;
+	const UINT previous_back_buffer_width = _PresentParameters.BackBufferWidth;
+	const UINT previous_back_buffer_height = _PresentParameters.BackBufferHeight;
 
 	/*
 	** If user has never selected a render device, start out with device 0
@@ -1164,7 +1293,17 @@ bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int
 	// if ( resize_window && windowed ) {
 	if (resize_window || (_UseD3D11Backend &&
 		(!IsWindowed || previous_windowed != IsWindowed))) {
-		Resize_And_Position_Window();
+		if (!Resize_And_Position_Window(width == -1, height == -1))
+		{
+			ResolutionWidth = previous_resolution_width;
+			ResolutionHeight = previous_resolution_height;
+			BitDepth = previous_bit_depth;
+			IsWindowed = previous_windowed;
+			DX8Wrapper_IsWindowed = previous_windowed;
+			_PresentParameters.BackBufferWidth = previous_back_buffer_width;
+			_PresentParameters.BackBufferHeight = previous_back_buffer_height;
+			return false;
+		}
 	}
 #endif
 	//must be either resetting existing device or creating a new one.
@@ -1310,7 +1449,16 @@ bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int
 	if (reset_device)
 	{
 		WWDEBUG_SAY(("DX8Wrapper::Set_Render_Device is resetting the device."));
-		ret = Reset_Device(restore_assets);	//reset device without restoring data - we're likely switching out of the app.
+		bool reset_requires_reacquire = false;
+		ret = Reset_Device(restore_assets, &reset_requires_reacquire);	//reset device without restoring data - we're likely switching out of the app.
+		if (!ret && reset_requires_reacquire)
+		{
+			IsDeviceLost = true;
+			if (_UseD3D11Backend)
+			{
+				_D3D11Bridge.Shutdown();
+			}
+		}
 	}
 	else
 		ret = Create_Device();
@@ -1389,7 +1537,16 @@ void DX8Wrapper::Set_Swap_Interval(int swap)
 	}
 
 	WWDEBUG_SAY(("DX8Wrapper::Set_Swap_Interval is resetting the device."));
-	Reset_Device();
+	bool reset_requires_reacquire = false;
+	if (!Reset_Device(true, &reset_requires_reacquire) &&
+		reset_requires_reacquire)
+	{
+		IsDeviceLost = true;
+		if (_UseD3D11Backend)
+		{
+			_D3D11Bridge.Shutdown();
+		}
+	}
 }
 
 int DX8Wrapper::Get_Swap_Interval()
@@ -1447,6 +1604,28 @@ bool DX8Wrapper::Set_Device_Resolution(int width,int height,int bits,int windowe
 {
 	if (D3DDevice != nullptr) {
 		const bool previous_windowed = IsWindowed;
+		bool reset_requires_reacquire = false;
+		bool window_rollback_failed = false;
+		const bool previous_dx8_windowed = DX8Wrapper_IsWindowed;
+		const int previous_resolution_width = ResolutionWidth;
+		const int previous_resolution_height = ResolutionHeight;
+		const int previous_bit_depth = BitDepth;
+		const unsigned long previous_frame_count = FrameCount;
+		const D3DPRESENT_PARAMETERS previous_present_parameters =
+			_PresentParameters;
+		const rts::render::WindowPresentationState previous_presentation_state =
+			_D3D11WindowPresentationState;
+		const bool requested_windowed = windowed == -1 ? IsWindowed :
+			windowed != 0;
+		const bool changes_window = _UseD3D11Backend && (resize_window ||
+			!requested_windowed || requested_windowed != previous_windowed);
+		rts::render::WindowPresentationState physical_window_state;
+		if (changes_window && !physical_window_state.capture(_Hwnd))
+		{
+			WWDEBUG_SAY(("D3D11 window rollback snapshot failed: %lu.",
+				GetLastError()));
+			return false;
+		}
 
 		if (width != -1) {
 			_PresentParameters.BackBufferWidth = ResolutionWidth = width;
@@ -1473,11 +1652,72 @@ bool DX8Wrapper::Set_Device_Resolution(int width,int height,int bits,int windowe
 		if (resize_window || (_UseD3D11Backend &&
 			(!IsWindowed || previous_windowed != IsWindowed)))
 		{
-			Resize_And_Position_Window();
+			if (!Resize_And_Position_Window(width == -1, height == -1))
+			{
+				goto reset_failed;
+			}
 		}
 #pragma message("TODO: support changing windowed status and changing the bit depth")
 		WWDEBUG_SAY(("DX8Wrapper::Set_Device_Resolution is resetting the device."));
-		return Reset_Device();
+		if (Reset_Device(true, &reset_requires_reacquire))
+		{
+			return true;
+		}
+
+reset_failed:
+		ResolutionWidth = previous_resolution_width;
+		ResolutionHeight = previous_resolution_height;
+		BitDepth = previous_bit_depth;
+		IsWindowed = previous_windowed;
+		DX8Wrapper_IsWindowed = previous_dx8_windowed;
+		_PresentParameters = previous_present_parameters;
+		FrameCount = previous_frame_count;
+		if (physical_window_state.valid)
+		{
+			if (rts::render::RestoreWindowPresentationSnapshot(_Hwnd,
+				&physical_window_state, true))
+			{
+				_D3D11WindowPresentationState = previous_presentation_state;
+			}
+			else
+			{
+				WWDEBUG_SAY(("D3D11 window reset rollback failed: %lu.",
+					GetLastError()));
+				window_rollback_failed = true;
+				_D3D11WindowPresentationState = previous_presentation_state.valid ?
+					previous_presentation_state : physical_window_state;
+			}
+		}
+		else
+		{
+			_D3D11WindowPresentationState = previous_presentation_state;
+		}
+		if (reset_requires_reacquire)
+		{
+			bool rollback_requires_reacquire = false;
+			if (!Reset_Device(true, &rollback_requires_reacquire))
+			{
+				WWDEBUG_SAY(("Native device rollback failed after D3D11 resize failure."));
+				IsDeviceLost = true;
+				if (_UseD3D11Backend)
+				{
+					_D3D11Bridge.Shutdown();
+				}
+			}
+			else
+			{
+				FrameCount = previous_frame_count;
+			}
+		}
+		if (window_rollback_failed)
+		{
+			IsDeviceLost = true;
+			if (_UseD3D11Backend)
+			{
+				_D3D11Bridge.Shutdown();
+			}
+		}
+		return false;
 	} else {
 		return false;
 	}
@@ -1874,13 +2114,19 @@ bool DX8Wrapper::Begin_Scene()
 {
 	DX8_THREAD_ASSERT();
 	rts::render::ResetLegacyStatePublicationFailure();
+	_D3D11FrameStarted = false;
+	if (_UseD3D11Backend && !_D3D11Bridge.Is_Active())
+	{
+		WWDEBUG_SAY(("D3D11 renderer is unavailable at begin-scene."));
+		return false;
+	}
 
 #if ENABLE_EMBEDDED_BROWSER
 	DX8WebBrowser::Update();
 #endif
 
 	DX8CALL(BeginScene());
-	if (_D3D11Bridge.Is_Active())
+	if (_UseD3D11Backend)
 	{
 		if (!_D3D11Bridge.Begin_Frame())
 		{
@@ -1888,6 +2134,7 @@ bool DX8Wrapper::Begin_Scene()
 			WWDEBUG_SAY(("D3D11 renderer begin-frame failed."));
 			return false;
 		}
+		_D3D11FrameStarted = true;
 	}
 
 	DX8WebBrowser::Update();
@@ -1900,7 +2147,8 @@ void DX8Wrapper::End_Scene(bool flip_frames)
 	DX8CALL(EndScene());
 
 	DX8WebBrowser::Render(0);
-	const bool d3d11_frame_active = _D3D11Bridge.Is_Active();
+	const bool d3d11_frame_active = _D3D11FrameStarted;
+	_D3D11FrameStarted = false;
 	rts::render::RenderResult d3d11_frame_result =
 		rts::render::RENDER_RESULT_OK;
 	rts::render::RenderFrameOutcome d3d11_frame_outcome;
@@ -1919,8 +2167,9 @@ void DX8Wrapper::End_Scene(bool flip_frames)
 			!d3d11_frame_outcome.hasDeviceRemoval() &&
 			!d3d11_frame_outcome.hasLifecycleFailure() &&
 			d3d11_frame_outcome.isOperational();
-		if (rts::render::ShouldPresentLegacyFrame(d3d11_frame_active,
-			_D3D11Bridge.Is_Active())) {
+		if (!_UseD3D11Backend &&
+			rts::render::ShouldPresentLegacyFrame(d3d11_frame_active,
+				_D3D11Bridge.Is_Active())) {
 			WWPROFILE("DX8Device::Present()");
 			hr=_Get_D3D_Device8()->Present(nullptr, nullptr, nullptr, nullptr);
 		}
@@ -1971,7 +2220,16 @@ void DX8Wrapper::End_Scene(bool flip_frames)
 			hr=_Get_D3D_Device8()->TestCooperativeLevel();
 			if (hr==D3DERR_DEVICENOTRESET) {
 				WWDEBUG_SAY(("DX8Wrapper::End_Scene is resetting the device."));
-				Reset_Device();
+				bool reset_requires_reacquire = false;
+				if (!Reset_Device(true, &reset_requires_reacquire) &&
+					reset_requires_reacquire)
+				{
+					IsDeviceLost = true;
+					if (_UseD3D11Backend)
+					{
+						_D3D11Bridge.Shutdown();
+					}
+				}
 			}
 			else {
 				// Sleep it not active
@@ -2014,7 +2272,7 @@ void DX8Wrapper::Flip_To_Primary()
 	// The D3D11 bridge owns presentation for its active backend.  A legacy
 	// page flip here would expose the hidden differential swap chain and can
 	// overwrite or duplicate the visible frame.
-	if (_D3D11Bridge.Is_Active())
+	if (_UseD3D11Backend)
 	{
 		return;
 	}
@@ -2286,6 +2544,11 @@ bool DX8Wrapper::Is_D3D11_Backend_Active()
 	return _D3D11Bridge.Is_Active();
 }
 
+void DX8Wrapper::Begin_D3D11_Display_Iteration()
+{
+	_D3D11Bridge.Begin_Display_Iteration();
+}
+
 rts::render::RenderResult DX8Wrapper::Get_Render_Back_Buffer_Info(
 	rts::render::RenderBackBufferInfo *info)
 {
@@ -2298,9 +2561,32 @@ rts::render::RenderResult DX8Wrapper::Copy_Active_Render_Target_To_Texture(
 	return _D3D11Bridge.Copy_Active_Color_Target_To_Texture(destination);
 }
 
+bool DX8Wrapper::Acquire_D3D11_Copied_Texture_Content(
+	IDirect3DBaseTexture8 *texture)
+{
+	return _D3D11Bridge.Acquire_Copied_Texture_Content(texture);
+}
+
 void DX8Wrapper::Notify_D3D11_Buffer_Changed(IUnknown *buffer)
 {
 	_D3D11Bridge.Invalidate_Buffer(buffer);
+}
+
+void DX8Wrapper::Notify_D3D11_Buffer_Range_Changed(IUnknown *buffer,
+	unsigned int binding, size_t destination_offset, size_t byte_count,
+	rts::render::RenderBufferUpdateMode mode)
+{
+	_D3D11Bridge.Invalidate_Buffer_Range(buffer, binding,
+		destination_offset, byte_count, mode);
+}
+
+bool DX8Wrapper::Publish_D3D11_Buffer_Change(IUnknown *buffer,
+	unsigned int binding, const void *data, size_t byte_count,
+	size_t destination_offset, rts::render::RenderBufferUpdateMode mode,
+	unsigned int source_generation)
+{
+	return _D3D11Bridge.Publish_Buffer_Change(buffer, binding, data,
+		byte_count, destination_offset, mode, source_generation);
 }
 
 void DX8Wrapper::Notify_D3D11_Texture_Changed(
@@ -2328,6 +2614,22 @@ void Notify_Render_Texture_Changed(TextureClass *texture)
 void Notify_Render_Buffer_Changed(IUnknown *buffer)
 {
 	DX8Wrapper::Notify_D3D11_Buffer_Changed(buffer);
+}
+
+void Notify_Render_Buffer_Range_Changed(IUnknown *buffer,
+	unsigned int binding, size_t destination_offset, size_t byte_count,
+	rts::render::RenderBufferUpdateMode mode)
+{
+	DX8Wrapper::Notify_D3D11_Buffer_Range_Changed(buffer, binding,
+		destination_offset, byte_count, mode);
+}
+
+bool Publish_Render_Buffer_Change(IUnknown *buffer, unsigned int binding,
+	const void *data, size_t byte_count, size_t destination_offset,
+	rts::render::RenderBufferUpdateMode mode, unsigned int source_generation)
+{
+	return DX8Wrapper::Publish_D3D11_Buffer_Change(buffer, binding, data,
+		byte_count, destination_offset, mode, source_generation);
 }
 
 void DX8Wrapper::Request_D3D11_Back_Buffer_Capture()
@@ -2552,6 +2854,7 @@ void DX8Wrapper::Draw_Sorting_IB_VB(
 	{
 		if (!_D3D11Bridge.Draw(dyn_vb_access.VertexBuffer,
 			dyn_ib_access.IndexBuffer, D3DPT_TRIANGLELIST,
+			0, vertex_count,
 			dyn_ib_access.IndexBufferOffset, polygon_count,
 			dyn_vb_access.VertexBufferOffset))
 		{
@@ -2686,6 +2989,7 @@ void DX8Wrapper::Draw(
 				{
 					if (!_D3D11Bridge.Draw(render_state.vertex_buffers[0],
 						render_state.index_buffer, primitive_type,
+						min_vertex_index, vertex_count,
 						start_index + render_state.iba_offset, polygon_count,
 						render_state.index_base_offset + render_state.vba_offset))
 					{
@@ -3937,6 +4241,9 @@ bool DX8Wrapper::Publish_Render_State(D3DRENDERSTATETYPE state,
 		rts::render::TrackLegacyGlobalAmbient(
 			rts::render::DecodeLegacyD3D8Ambient(value));
 		break;
+	case D3DRS_RANGEFOGENABLE:
+		neutral.rangeFogEnable = value != FALSE;
+		break;
 	case D3DRS_NORMALIZENORMALS:
 		neutral.normalizeNormals = value != FALSE;
 		break;
@@ -4094,6 +4401,46 @@ bool DX8Wrapper::Publish_Texture_Stage_State(unsigned stage,
 	return rts::render::TrackLegacyTextureStage(stage, neutral);
 }
 
+
+void DX8Wrapper::Set_DX8_Light(int index, D3DLIGHT8* light)
+{
+	rts::render::LegacyLightState neutralLight;
+	if (light) {
+		DX8_RECORD_LIGHT_CHANGE();
+		DX8CALL(SetLight(index,light));
+		DX8CALL(LightEnable(index,TRUE));
+		CurrentDX8LightEnables[index]=true;
+		SNAPSHOT_SAY(("DX8 - SetLight %d",index));
+		neutralLight.enabled = true;
+		neutralLight.type = light->Type == D3DLIGHT_POINT ?
+			rts::render::RENDER_LIGHT_POINT : (light->Type == D3DLIGHT_SPOT ?
+			rts::render::RENDER_LIGHT_SPOT : rts::render::RENDER_LIGHT_DIRECTIONAL);
+		neutralLight.diffuse = rts::render::RenderFloat4(light->Diffuse.r,
+			light->Diffuse.g, light->Diffuse.b, light->Diffuse.a);
+		neutralLight.specular = rts::render::RenderFloat4(light->Specular.r,
+			light->Specular.g, light->Specular.b, light->Specular.a);
+		neutralLight.ambient = rts::render::RenderFloat4(light->Ambient.r,
+			light->Ambient.g, light->Ambient.b, light->Ambient.a);
+		neutralLight.position = rts::render::RenderFloat4(light->Position.x,
+			light->Position.y, light->Position.z, 1.0f);
+		neutralLight.direction = rts::render::RenderFloat4(light->Direction.x,
+			light->Direction.y, light->Direction.z, 0.0f);
+		neutralLight.range = light->Range;
+		neutralLight.falloff = light->Falloff;
+		neutralLight.attenuation0 = light->Attenuation0;
+		neutralLight.attenuation1 = light->Attenuation1;
+		neutralLight.attenuation2 = light->Attenuation2;
+		neutralLight.theta = light->Theta;
+		neutralLight.phi = light->Phi;
+	}
+	else if (CurrentDX8LightEnables[index]) {
+		DX8_RECORD_LIGHT_CHANGE();
+		CurrentDX8LightEnables[index]=false;
+		DX8CALL(LightEnable(index,FALSE));
+		SNAPSHOT_SAY(("DX8 - DisableLight %d",index));
+	}
+	rts::render::TrackLegacyLight(index, neutralLight);
+}
 
 void DX8Wrapper::Set_Light(unsigned index, const D3DLIGHT8* light)
 {
@@ -4469,7 +4816,8 @@ void DX8Wrapper::Create_Render_Target
 void DX8Wrapper::Set_Render_Target_With_Z
 (
 	TextureClass* texture,
-	ZTextureClass* ztexture
+	ZTextureClass* ztexture,
+	bool use_default_depth_if_missing
 )
 {
 	WWASSERT(texture!=nullptr);
@@ -4488,7 +4836,8 @@ void DX8Wrapper::Set_Render_Target_With_Z
 	}
 	else
 	{
-		target_result = Set_Render_Target(d3d_surf,true);
+		target_result = Set_Render_Target(d3d_surf,
+			use_default_depth_if_missing);
 	}
 	d3d_surf->Release();
 
@@ -4535,6 +4884,11 @@ DX8Wrapper::Set_Render_Target(IDirect3DSurface8 *render_target, bool use_default
 	DX8_Assert();
 	const bool restoring_default = render_target == nullptr ||
 		render_target == DefaultRenderTarget;
+	if (_UseD3D11Backend && !_D3D11Bridge.Is_Active() && !restoring_default)
+	{
+		IsRenderToTexture = false;
+		return E_FAIL;
+	}
 	HRESULT target_result = D3D_OK;
 
 	//
@@ -4654,7 +5008,7 @@ DX8Wrapper::Set_Render_Target(IDirect3DSurface8 *render_target, bool use_default
 //		depth_buffer = nullptr;
 //	}
 
-	if (_D3D11Bridge.Is_Active())
+	if (_UseD3D11Backend)
 	{
 		const rts::render::RenderResult bridge_result = restoring_default ?
 			_D3D11Bridge.Set_Render_Target_Default() :
@@ -4682,6 +5036,11 @@ DX8Wrapper::Set_Render_Target(IDirect3DSurface8 *render_target, bool use_default
 	return target_result;
 }
 
+HRESULT DX8Wrapper::Restore_Default_Render_Target()
+{
+	return Set_Render_Target((IDirect3DSurface8 *)nullptr);
+}
+
 
 //**********************************************************************************************
 //! Set render target with depth stencil buffer
@@ -4697,6 +5056,11 @@ HRESULT DX8Wrapper::Set_Render_Target
 	DX8_Assert();
 	const bool restoring_default = render_target == nullptr ||
 		render_target == DefaultRenderTarget;
+	if (_UseD3D11Backend && !_D3D11Bridge.Is_Active() && !restoring_default)
+	{
+		IsRenderToTexture = false;
+		return E_FAIL;
+	}
 	bool depth_buffer_is_default = depth_buffer != nullptr &&
 		DefaultDepthBuffer != nullptr && depth_buffer == DefaultDepthBuffer;
 	HRESULT target_result = D3D_OK;
@@ -4834,7 +5198,7 @@ HRESULT DX8Wrapper::Set_Render_Target
 	// backend owns the visible frame.  Always give the bridge a chance to
 	// restore its default target: a failed hidden D3D8 restore must not leave
 	// the visible D3D11 context bound to the off-screen target.
-	if (_D3D11Bridge.Is_Active())
+	if (_UseD3D11Backend)
 	{
 		const rts::render::RenderResult bridge_result = restoring_default ?
 			_D3D11Bridge.Set_Render_Target_Default() :

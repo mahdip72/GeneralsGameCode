@@ -105,6 +105,11 @@ Bool TryParseSkirmishAITestSeed(const char *text, Int *seed)
 	return TRUE;
 }
 
+Bool ShouldBypassFramePacingForSkirmishAITest(Bool runnerArmed)
+{
+	return runnerArmed;
+}
+
 void BuildSkirmishAITestPlan(Int seed, SkirmishAITestPlan *plan)
 {
 	if (plan == nullptr)
@@ -219,6 +224,7 @@ Bool StartSkirmishAITestRunner()
 {
 	if (!s_runner.armed)
 		return TRUE;
+	DEBUG_LOG(("SkirmishAITestRunner::start phase=entry seed=%d", s_runner.seed));
 	s_runner.startupStartMilliseconds = GetTickCount();
 	if (!TheGlobalData->m_simulateReplays.empty())
 	{
@@ -230,6 +236,7 @@ Bool StartSkirmishAITestRunner()
 		FailSkirmishAITest("engine_not_ready");
 		return FALSE;
 	}
+	DEBUG_LOG(("SkirmishAITestRunner::start phase=dependencies_ready"));
 
 	SkirmishAITestPlan plan;
 	BuildSkirmishAITestPlan(s_runner.seed, &plan);
@@ -239,6 +246,7 @@ Bool StartSkirmishAITestRunner()
 		FailSkirmishAITest("twilight_flame_unavailable");
 		return FALSE;
 	}
+	DEBUG_LOG(("SkirmishAITestRunner::start phase=map_ready"));
 	s_runner.expectedMapCRC = map->m_CRC;
 	s_runner.expectedMapSize = map->m_filesize;
 
@@ -249,6 +257,7 @@ Bool StartSkirmishAITestRunner()
 	TheSkirmishGameInfo->reset();
 	TheSkirmishGameInfo->setLocalIP(0);
 	TheSkirmishGameInfo->enterGame();
+	DEBUG_LOG(("SkirmishAITestRunner::start phase=game_info_ready"));
 
 	for (Int i = 0; i < SKIRMISH_AI_TEST_SLOT_COUNT; ++i)
 	{
@@ -268,17 +277,22 @@ Bool StartSkirmishAITestRunner()
 			slot->setMapAvailability(TRUE);
 		}
 	}
+	DEBUG_LOG(("SkirmishAITestRunner::start phase=slots_ready"));
 
 	TheSkirmishGameInfo->setMap(plan.mapName);
 	TheSkirmishGameInfo->setMapCRC(map->m_CRC);
 	TheSkirmishGameInfo->setMapSize(map->m_filesize);
 	TheSkirmishGameInfo->setSeed(plan.seed);
 	TheSkirmishGameInfo->startGame(0);
+	DEBUG_LOG(("SkirmishAITestRunner::start phase=start_game_complete"));
 
 	TheWritableGlobalData->m_mapName = plan.mapName;
 	TheWritableGlobalData->m_headless = TRUE;
 	TheWritableGlobalData->m_shellMapOn = FALSE;
 	TheWritableGlobalData->m_useFpsLimit = FALSE;
+	// The automated observer owns no units. Keep its logical and local retaliation modes disabled
+	// so the recorder does not capture an irrelevant frame-zero preference synchronization command.
+	TheWritableGlobalData->m_clientRetaliationModeEnabled = FALSE;
 	TheRecorder->setArchiveEnabled(FALSE);
 	InitRandom(static_cast<UnsignedInt>(plan.seed));
 
@@ -296,6 +310,18 @@ Bool StartSkirmishAITestRunner()
 
 void UpdateSkirmishAITestRunner()
 {
+	static UnsignedInt lastDiagnosticMilliseconds = 0;
+	const UnsignedInt diagnosticMilliseconds = GetTickCount();
+	if (s_runner.armed &&
+		(lastDiagnosticMilliseconds == 0 ||
+			ElapsedMilliseconds(lastDiagnosticMilliseconds, diagnosticMilliseconds) >= 10000))
+	{
+		lastDiagnosticMilliseconds = diagnosticMilliseconds;
+		DEBUG_LOG(("SkirmishAITestRunner::update armed=%d started=%d ending=%d finished=%d failed=%d frame=%u",
+			s_runner.armed, s_runner.started, s_runner.ending, s_runner.finished, s_runner.failed,
+			TheGameLogic ? TheGameLogic->getFrame() : 0));
+	}
+
 	if (!s_runner.armed || !s_runner.started || s_runner.finished)
 		return;
 	if (!TheGameLogic)

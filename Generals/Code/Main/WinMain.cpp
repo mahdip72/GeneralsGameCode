@@ -64,6 +64,7 @@
 #include "Common/version.h"
 #include "BuildVersion.h"
 #include "GeneratedVersion.h"
+#include "Renderer/RendererDevice.h"
 #include "resource.h"
 #ifdef RTS_ENABLE_CRASHDUMP
 #include "Common/MiniDumper.h"
@@ -694,8 +695,15 @@ LRESULT CALLBACK WndProc( HWND hWnd, UINT message,
 static Bool initializeAppWindows( HINSTANCE hInstance, Int nCmdShow, Bool runWindowed )
 {
 	DWORD windowStyle;
+	DWORD windowExStyle = 0;
 	Int startWidth = DEFAULT_DISPLAY_WIDTH,
 			startHeight = DEFAULT_DISPLAY_HEIGHT;
+	Int windowX = 0;
+	Int windowY = 0;
+	const Bool d3d11Fullscreen = !runWindowed &&
+		rts::render::RequestedRenderBackend() ==
+			rts::render::RENDER_BACKEND_D3D11;
+	const Bool createWindowedBootstrap = runWindowed || d3d11Fullscreen;
 
 	// register the window class
 
@@ -708,30 +716,46 @@ static Bool initializeAppWindows( HINSTANCE hInstance, Int nCmdShow, Bool runWin
 
    // Create our main window
 	windowStyle =  WS_POPUP|WS_VISIBLE;
-	if (runWindowed)
+	if (createWindowedBootstrap)
 		windowStyle |= WS_MINIMIZEBOX | WS_SYSMENU | WS_DLGFRAME | WS_CAPTION;
 	else
-		windowStyle |= WS_EX_TOPMOST | WS_SYSMENU;
+		windowExStyle |= WS_EX_TOPMOST;
 
 	RECT rect;
 	rect.left = 0;
 	rect.top = 0;
 	rect.right = startWidth;
 	rect.bottom = startHeight;
-	AdjustWindowRect (&rect, windowStyle, FALSE);
-	if (runWindowed) {
+	if (createWindowedBootstrap) {
+		AdjustWindowRectEx(&rect, windowStyle, FALSE, windowExStyle);
 		// Makes the normal debug 800x600 window center in the screen.
 		startWidth = DEFAULT_DISPLAY_WIDTH;
 		startHeight= DEFAULT_DISPLAY_HEIGHT;
+		windowX = (GetSystemMetrics(SM_CXSCREEN) / 2) - (startWidth / 2);
+		windowY = (GetSystemMetrics(SM_CYSCREEN) / 2) - (startHeight / 2);
+	}
+	else
+	{
+		// The VC6 SDK hides the multimonitor declarations behind WINVER 0x0500.
+		// This path is only used by the legacy D3D8 fullscreen bootstrap; D3D11
+		// fullscreen takes the windowed bootstrap above and positions the window
+		// through its modern presentation path.
+		rect.left = 0;
+		rect.top = 0;
+		rect.right = GetSystemMetrics(SM_CXSCREEN);
+		rect.bottom = GetSystemMetrics(SM_CYSCREEN);
+		windowX = rect.left;
+		windowY = rect.top;
 	}
 
 	gInitializing = true;
 
-  HWND hWnd = CreateWindow( TEXT("Game Window"),
+  HWND hWnd = CreateWindowEx( windowExStyle,
+							TEXT("Game Window"),
                             TEXT("Command and Conquer Generals"),
                             windowStyle,
-														(GetSystemMetrics( SM_CXSCREEN ) / 2) - (startWidth / 2), // original position X
-														(GetSystemMetrics( SM_CYSCREEN ) / 2) - (startHeight / 2),// original position Y
+												windowX,
+												windowY,
 														// Lorenzen nudged the window higher
 														// so the constantdebug report would
 														// not get obliterated by assert windows, thank you.
@@ -745,8 +769,10 @@ static Bool initializeAppWindows( HINSTANCE hInstance, Int nCmdShow, Bool runWin
 														nullptr );
 
 
-	if (!runWindowed)
-	{	SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0,SWP_NOSIZE |SWP_NOMOVE);
+	if (!createWindowedBootstrap)
+	{	SetWindowPos(hWnd, HWND_TOPMOST, rect.left, rect.top,
+				rect.right - rect.left, rect.bottom - rect.top,
+				SWP_FRAMECHANGED | SWP_SHOWWINDOW);
 	}
 	else
 		SetWindowPos(hWnd, HWND_TOP, 0, 0, 0, 0,SWP_NOSIZE |SWP_NOMOVE);

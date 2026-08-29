@@ -1172,15 +1172,26 @@ int testLegacyShaderBitDecoder()
 		"reserved legacy encodings fail closed to deterministic defaults");
 	rts::render::TrackLegacyShaderBits(opaque);
 	rts::render::TrackLegacyCullState(true, true);
+	rts::render::GetTrackedLegacyPipelineState(&state);
+	state.rangeFogEnable = true;
+	rts::render::TrackLegacyPipelineState(state);
 	// Re-selecting an already-applied shader must not erase the effective
-	// D3D8 winding when its cached render-state call is suppressed.
+	// D3D8 winding or independent range-fog state when their cached render-state
+	// calls are suppressed.
 	rts::render::TrackLegacyShaderBits(opaque);
 	result |= check(rts::render::GetTrackedLegacyPipelineState(&state) &&
 		state.shaderBits == opaque &&
 		state.rasterizer.cullMode == rts::render::RENDER_CULL_BACK &&
 		state.rasterizer.frontCounterClockwise &&
+		state.rangeFogEnable &&
 		state.textureStages[0].colorOperation == rts::render::RENDER_TEXTURE_OP_MODULATE,
-		"legacy bridge publishes the effective D3D8 cull winding to the neutral boundary");
+		"legacy shader publication preserves independent cull and range-fog state");
+	rts::render::TrackLegacyShaderBits(alphaTested);
+	result |= check(rts::render::GetTrackedLegacyPipelineState(&state) &&
+		state.shaderBits == alphaTested && state.rangeFogEnable,
+		"legacy shader changes preserve independent range-fog state");
+	rts::render::TrackLegacyShaderBits(opaque);
+	rts::render::GetTrackedLegacyPipelineState(&state);
 	rts::render::LegacyPipelineState effectiveState = state;
 	effectiveState.blend.blendEnable = true;
 	effectiveState.blend.sourceColor = rts::render::RENDER_BLEND_SOURCE_ALPHA;
@@ -1704,6 +1715,22 @@ int testD3D11HiddenSwapChain()
 				rts::render::RENDER_RESULT_OK &&
 			context->endFrame() == rts::render::RENDER_RESULT_OK,
 			"D3D11 rejects mismatched color/depth attachment dimensions before binding");
+		rts::render::RenderTargetBinding colorOnlyTarget;
+		colorOnlyTarget.useBackBufferColor = false;
+		colorOnlyTarget.useBackBufferDepth = false;
+		colorOnlyTarget.hasColor = true;
+		colorOnlyTarget.hasDepth = false;
+		colorOnlyTarget.color.resource = offscreenColor;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->setRenderTargets(colorOnlyTarget) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->clearTargets(rts::render::RENDER_CLEAR_COLOR,
+				rts::render::RenderFloat4(1.0f, 1.0f, 1.0f, 1.0f),
+				1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setRenderTargets(rts::render::RenderTargetBinding()) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK,
+			"D3D11 accepts a differently sized color-only projected-shadow target");
 		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
 			context->clear(rts::render::RenderFloat4(0.0f, 0.0f, 1.0f, 1.0f),
 				1.0f, 0) == rts::render::RENDER_RESULT_OK &&
@@ -1711,6 +1738,9 @@ int testD3D11HiddenSwapChain()
 				rts::render::RENDER_RESULT_OK &&
 			context->endFrame() == rts::render::RENDER_RESULT_OK,
 			"D3D11 copies the active color target into a compatible texture");
+		result |= check(device->copyActiveColorTargetToTexture(copiedColor) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+			"D3D11 active-target copy requires an open render frame");
 		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
 			context->clear(rts::render::RenderFloat4(0.0f, 0.0f, 1.0f, 1.0f),
 				1.0f, 0) == rts::render::RENDER_RESULT_OK &&
@@ -1840,6 +1870,40 @@ int testD3D11HiddenSwapChain()
 			context->endFrame() == rts::render::RENDER_RESULT_OK,
 			"D3D11 indexed drawing rejects wrong bindings, formats, alignment, and state");
 		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->setLegacyState(logicalState,
+				rts::render::RENDER_VERTEX_POSITION3_COLOR, 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(vertexBuffer, sizeof(TestVertex),
+				sizeof(TestVertex)) == rts::render::RENDER_RESULT_OK &&
+			context->draw(2, 0) == rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) ==
+				rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+			context->draw(0xffffffffU, 0) ==
+				rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+			context->draw(1, 0xffffffffU) ==
+				rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+			context->setVertexBuffer(vertexBuffer, sizeof(TestVertex), 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setIndexBuffer(indexBuffer,
+				rts::render::RENDER_FORMAT_R16_UINT, sizeof(indices[0])) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->drawIndexed(2, 0, 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->drawIndexed(3, 0, 0) ==
+				rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+			context->drawIndexed(0xffffffffU, 0, 0) ==
+				rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+			context->drawIndexed(1, 0xffffffffU, 0) ==
+				rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+			context->setIndexBuffer(indexBuffer,
+				rts::render::RENDER_FORMAT_R16_UINT, 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK,
+			"D3D11 draw submission rejects vertex and index ranges outside bound buffers");
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
 			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
 			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
 				rts::render::RENDER_RESULT_OK &&
@@ -1944,6 +2008,60 @@ int testD3D11HiddenSwapChain()
 		center = &pixels[4 * (32 * 64 + 32)];
 		result |= check(center[1] > 240 && center[0] < 16 && center[2] < 16,
 			"linear fog reaches the configured fog color");
+
+		// Keep the triangle centered while translating view space sideways. Z fog
+		// sees zero depth; range fog must see the non-zero viewer distance.
+		logicalState.constants.fog.start = 0.0f;
+		logicalState.constants.fog.end = 0.25f;
+		logicalState.constants.view.values[12] = 0.5f;
+		logicalState.constants.projection.values[12] = -0.5f;
+		logicalState.pipeline.rangeFogEnable = false;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyState(logicalState,
+				rts::render::RENDER_VERTEX_POSITION3_COLOR, 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(vertexBuffer, sizeof(TestVertex), 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"D3D11 z fog preserves zero-depth geometry");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[0] > 240 && center[1] < 16,
+			"z fog uses camera-space z instead of viewer distance");
+		logicalState.pipeline.rangeFogEnable = true;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyState(logicalState,
+				rts::render::RENDER_VERTEX_POSITION3_COLOR, 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(vertexBuffer, sizeof(TestVertex), 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"D3D11 range fog uses viewer distance");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[1] > 240 && center[0] < 16,
+			"range fog reaches the configured color away from the view axis");
+		logicalState.pipeline.rangeFogEnable = false;
+		logicalState.constants.view.values[12] = 0.0f;
+		logicalState.constants.projection.values[12] = 0.0f;
+		logicalState.constants.fog.start = -1.0f;
+		logicalState.constants.fog.end = 0.0f;
 		// Fog blends RGB only.  Preserve a half-alpha source so the blend stage
 		// can distinguish the fixed-function fog result from an alpha blend with
 		// fog color alpha zero.
@@ -2500,6 +2618,62 @@ int testD3D11HiddenSwapChain()
 			"sea-wave alpha-test rejection leaves the clear target untouched");
 		logicalState.pipeline.alphaTestEnable = false;
 		logicalState.pipeline.blend = rts::render::LegacyBlendState();
+		logicalState.pipeline.fogMode = rts::render::RENDER_FOG_LINEAR;
+		logicalState.constants.fog.enabled = true;
+		logicalState.constants.fog.color =
+			rts::render::RenderFloat4(0.0f, 1.0f, 0.0f, 1.0f);
+		logicalState.constants.fog.start = 0.0f;
+		logicalState.constants.fog.end = 0.25f;
+		logicalState.constants.vertexShaderConstants[7].w = 0.5f;
+		logicalState.pipeline.rangeFogEnable = false;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyStateForLayout(logicalState, seaLayout, 3) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(seaVertexBuffer, sizeof(SeaVertex), 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setTexture(0, seaBumpTexture) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setTexture(1, seaReflectionTexture) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"sea-wave z fog preserves off-axis zero-depth color");
+		center = &pixels[4 * (32 * 64 + 32)];
+		const unsigned char seaZFogGreen = center[1];
+		logicalState.pipeline.rangeFogEnable = true;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyStateForLayout(logicalState, seaLayout, 3) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(seaVertexBuffer, sizeof(SeaVertex), 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setTexture(0, seaBumpTexture) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setTexture(1, seaReflectionTexture) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"sea-wave range fog uses off-axis per-patch viewer distance");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[1] > 240 && center[1] > seaZFogGreen + 100,
+			"sea-wave range fog reaches its color away from the view axis");
+		logicalState.pipeline.rangeFogEnable = false;
+		logicalState.constants.vertexShaderConstants[7].w = 0.0f;
 		logicalState.pipeline.fogMode = rts::render::RENDER_FOG_DISABLED;
 		logicalState.constants.fog.enabled = false;
 		logicalState.pipeline.pixelProgram =
@@ -2537,6 +2711,112 @@ int testD3D11HiddenSwapChain()
 		center = &pixels[4 * (32 * 64 + 32)];
 		result |= check(center[1] > 240 && center[0] < 16 && center[2] < 16,
 			"captured D3D11 textured triangle preserves sampled color");
+		logicalState.pipeline.fogMode = rts::render::RENDER_FOG_LINEAR;
+		logicalState.constants.fog.enabled = true;
+		logicalState.constants.fog.color =
+			rts::render::RenderFloat4(1.0f, 0.0f, 0.0f, 1.0f);
+		logicalState.constants.fog.start = 0.0f;
+		logicalState.constants.fog.end = 0.25f;
+		logicalState.constants.view.values[12] = 0.5f;
+		logicalState.constants.projection.values[12] = -0.5f;
+		logicalState.pipeline.rangeFogEnable = false;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyStateForLayout(logicalState, texturedLayout, 1) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(texturedVertexBuffer,
+				sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(0, texture) == rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"textured z fog preserves zero-depth sampled color");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[1] > 240 && center[0] < 16,
+			"textured z fog uses camera-space z");
+		logicalState.pipeline.rangeFogEnable = true;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyStateForLayout(logicalState, texturedLayout, 1) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(texturedVertexBuffer,
+				sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(0, texture) == rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"textured range fog uses viewer distance");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[2] > 240 && center[1] < 16,
+			"textured range fog reaches its color away from the view axis");
+		// The tree program derives its diffuse intensity from normal.y. These
+		// vertices deliberately produce black before fog, making the same
+		// off-axis range-fog transition unambiguous without a separate fixture.
+		logicalState.pipeline.vertexProgram =
+			rts::render::RENDER_LEGACY_VERTEX_TREES;
+		logicalState.constants.vertexShaderConstants[8] =
+			rts::render::RenderFloat4();
+		logicalState.pipeline.rangeFogEnable = false;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyStateForLayout(logicalState, texturedLayout, 1) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(texturedVertexBuffer,
+				sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(0, texture) == rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"tree z fog preserves off-axis zero-depth color");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[0] < 16 && center[1] < 16 && center[2] < 16,
+			"tree z fog uses camera-space z");
+		logicalState.pipeline.rangeFogEnable = true;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyStateForLayout(logicalState, texturedLayout, 1) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(texturedVertexBuffer,
+				sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(0, texture) == rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"tree range fog uses viewer distance");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[2] > 240 && center[1] < 16,
+			"tree range fog reaches its color away from the view axis");
+		logicalState.pipeline.vertexProgram =
+			rts::render::RENDER_LEGACY_VERTEX_FIXED_FUNCTION;
+		logicalState.pipeline.rangeFogEnable = false;
+		logicalState.pipeline.fogMode = rts::render::RENDER_FOG_DISABLED;
+		logicalState.constants.fog.enabled = false;
+		logicalState.constants.view.values[12] = 0.0f;
+		logicalState.constants.projection.values[12] = 0.0f;
 		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
 			context->setTexture(0, offscreenColor) ==
 				rts::render::RENDER_RESULT_OK &&
@@ -2619,11 +2899,99 @@ int testD3D11HiddenSwapChain()
 		secondTextureData.data = redPixels;
 		secondTextureData.rowPitch = 2 * sizeof(unsigned int);
 		secondTextureData.slicePitch = sizeof(redPixels);
+		rts::render::TextureDescriptor refreshableTextureDescriptor =
+			textureDescriptor;
+		refreshableTextureDescriptor.usage = rts::render::RENDER_USAGE_DEFAULT;
 		rts::render::GpuHandle secondTexture;
-		result |= check(device->createTexture(textureDescriptor,
+		result |= check(device->createTexture(refreshableTextureDescriptor,
 			&secondTextureData, 1, &secondTexture) ==
 			rts::render::RENDER_RESULT_OK,
 			"D3D11 parity probe creates a second texture stage resource");
+		logicalState.pipeline.textureStages[0].colorOperation =
+			rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_1;
+		logicalState.pipeline.textureStages[0].colorArgument1 =
+			rts::render::RENDER_TEXTURE_ARG_TEXTURE;
+		logicalState.pipeline.textureStages[1] =
+			rts::render::LegacyTextureStageState();
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyStateForLayout(logicalState, texturedLayout, 3) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(texturedVertexBuffer,
+				sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(0, texture) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(1, secondTexture) ==
+				rts::render::RENDER_RESULT_OK &&
+			device->refreshTexture(secondTexture, refreshableTextureDescriptor,
+				&secondTextureData, 1) == rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"D3D11 texture refresh preserves unrelated shader-resource stages");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[1] > 240 && center[0] < 16 && center[2] < 16,
+			"a later-stage refresh leaves the earlier sampled texture visible");
+
+		rts::render::GpuHandle destroyProbeTexture;
+		result |= check(device->createTexture(refreshableTextureDescriptor,
+			&secondTextureData, 1, &destroyProbeTexture) ==
+			rts::render::RENDER_RESULT_OK &&
+			context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyStateForLayout(logicalState, texturedLayout, 3) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(texturedVertexBuffer,
+				sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(0, texture) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(1, destroyProbeTexture) ==
+				rts::render::RENDER_RESULT_OK &&
+			device->destroyResource(destroyProbeTexture) &&
+			context->setTexture(1, destroyProbeTexture) ==
+				rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"D3D11 texture destruction preserves unrelated shader-resource stages");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[1] > 240 && center[0] < 16 && center[2] < 16,
+			"destroying a later-stage texture leaves the earlier sample visible");
+
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyStateForLayout(logicalState, texturedLayout, 3) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(texturedVertexBuffer,
+				sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(0, texture) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(1, copiedColor) ==
+				rts::render::RENDER_RESULT_OK &&
+			device->copyActiveColorTargetToTexture(copiedColor) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"D3D11 target copies preserve unrelated shader-resource stages");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[1] > 240 && center[0] < 16 && center[2] < 16,
+			"copying a later-stage target leaves the earlier sample visible");
 		logicalState.pipeline.pixelProgram =
 			rts::render::RENDER_LEGACY_PIXEL_TERRAIN_BASE;
 		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
@@ -3769,6 +4137,74 @@ int testD3D11HeadlessDevice()
 		device->immediateContext()->endFrame() ==
 			rts::render::RENDER_RESULT_OK,
 		"recreated dynamic buffers retain their logical handle and update path");
+	unsigned int rangeValues[4] = { 10, 20, 30, 40 };
+	rts::render::IRenderContext *rangeContext = device->immediateContext();
+	result |= check(rangeContext->updateBuffer(buffer, rangeValues,
+		sizeof(rangeValues), 0, rts::render::RENDER_BUFFER_UPDATE_DISCARD) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+		"dynamic range updates require an open owner frame");
+	result |= check(rangeContext->beginFrame() ==
+		rts::render::RENDER_RESULT_OK &&
+		rangeContext->updateBuffer(buffer, rangeValues, sizeof(unsigned int) * 2,
+			0, rts::render::RENDER_BUFFER_UPDATE_DISCARD) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->updateBuffer(buffer, rangeValues + 2,
+			sizeof(unsigned int) * 2, sizeof(unsigned int) * 2,
+			rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->updateBuffer(buffer, rangeValues, sizeof(unsigned int),
+			sizeof(unsigned int), rts::render::RENDER_BUFFER_UPDATE_DISCARD) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+		rangeContext->updateBuffer(buffer, rangeValues, 0, 0,
+			rts::render::RENDER_BUFFER_UPDATE_DISCARD) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+		rangeContext->updateBuffer(buffer, rangeValues, sizeof(rangeValues),
+			descriptor.byteCount - sizeof(unsigned int),
+			rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+		rangeContext->updateBuffer(buffer, rangeValues, sizeof(rangeValues), 0,
+			static_cast<rts::render::RenderBufferUpdateMode>(99)) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+		rangeContext->endFrame() == rts::render::RENDER_RESULT_OK,
+		"dynamic vertex buffers enforce discard and no-overwrite range contracts");
+
+	rts::render::BufferDescriptor indexDescriptor;
+	indexDescriptor.byteCount = 16;
+	indexDescriptor.stride = 2;
+	indexDescriptor.binding = rts::render::RENDER_BUFFER_INDEX;
+	indexDescriptor.usage = rts::render::RENDER_USAGE_DYNAMIC;
+	rts::render::GpuHandle indexBuffer;
+	rts::render::BufferDescriptor constantDescriptor;
+	constantDescriptor.byteCount = 64;
+	constantDescriptor.stride = 16;
+	constantDescriptor.binding = rts::render::RENDER_BUFFER_CONSTANT;
+	constantDescriptor.usage = rts::render::RENDER_USAGE_DYNAMIC;
+	rts::render::GpuHandle constantBuffer;
+	unsigned short rangeIndices[4] = { 0, 1, 2, 3 };
+	result |= check(device->createBuffer(indexDescriptor, 0, 0, &indexBuffer) ==
+		rts::render::RENDER_RESULT_OK &&
+		device->createBuffer(constantDescriptor, 0, 0, &constantBuffer) ==
+		rts::render::RENDER_RESULT_OK &&
+		rangeContext->beginFrame() == rts::render::RENDER_RESULT_OK &&
+		rangeContext->updateBuffer(indexBuffer, rangeIndices,
+			sizeof(unsigned short) * 2, 0,
+			rts::render::RENDER_BUFFER_UPDATE_DISCARD) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->updateBuffer(indexBuffer, rangeIndices + 2,
+			sizeof(unsigned short) * 2, sizeof(unsigned short) * 2,
+			rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->updateBuffer(constantBuffer, rangeValues,
+			sizeof(rangeValues), 0,
+			rts::render::RENDER_BUFFER_UPDATE_DISCARD) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+		rangeContext->endFrame() == rts::render::RENDER_RESULT_OK &&
+		device->recoverDevice() == rts::render::RENDER_RESULT_OK &&
+		device->isOperational(),
+		"dynamic index ranges recover while constant ranges fail closed");
+	result |= check(device->destroyResource(indexBuffer) &&
+		device->destroyResource(constantBuffer),
+		"dynamic range contract resources release cleanly");
 	result |= check(device->destroyResource(buffer) &&
 		!device->destroyResource(buffer),
 		"D3D11 resource destruction rejects stale handles");
@@ -4170,8 +4606,17 @@ int testD3D11LegacyBridgeLifecycleContract()
 		unsigned int, unsigned int);
 	typedef rts::render::RenderResult (D3D11LegacyBridge::*ExpectedActiveCopy)(
 		IDirect3DBaseTexture8 *);
+	typedef bool (D3D11LegacyBridge::*ExpectedCopiedContentAcquire)(
+		IDirect3DBaseTexture8 *);
+	typedef void (D3D11LegacyBridge::*ExpectedDisplayIteration)();
 	typedef void (D3D11LegacyBridge::*ExpectedCaptureRequest)();
 	typedef bool (D3D11LegacyBridge::*ExpectedBeginFrame)();
+	typedef bool (D3D11LegacyBridge::*ExpectedPrepareReset)();
+	typedef void (D3D11LegacyBridge::*ExpectedInvalidateBufferRange)(IUnknown *,
+		unsigned int, size_t, size_t, rts::render::RenderBufferUpdateMode);
+	typedef bool (D3D11LegacyBridge::*ExpectedPublishBufferChange)(IUnknown *,
+		unsigned int, const void *, size_t, size_t,
+		rts::render::RenderBufferUpdateMode, unsigned int);
 	result |= check(std::is_same<decltype(static_cast<ExpectedEndFrame>(
 		&D3D11LegacyBridge::End_Frame)), ExpectedEndFrame>::value &&
 		std::is_same<decltype(static_cast<ExpectedEndFrameOutcome>(
@@ -4180,10 +4625,20 @@ int testD3D11LegacyBridgeLifecycleContract()
 		ExpectedResize>::value &&
 		std::is_same<decltype(&D3D11LegacyBridge::Copy_Active_Color_Target_To_Texture),
 		ExpectedActiveCopy>::value &&
+		std::is_same<decltype(&D3D11LegacyBridge::Acquire_Copied_Texture_Content),
+		ExpectedCopiedContentAcquire>::value &&
+		std::is_same<decltype(&D3D11LegacyBridge::Begin_Display_Iteration),
+		ExpectedDisplayIteration>::value &&
 		std::is_same<decltype(&D3D11LegacyBridge::Request_Frame_Capture),
 		ExpectedCaptureRequest>::value &&
 		std::is_same<decltype(&D3D11LegacyBridge::Begin_Frame),
-		ExpectedBeginFrame>::value,
+		ExpectedBeginFrame>::value &&
+		std::is_same<decltype(&D3D11LegacyBridge::Prepare_Legacy_Device_Reset),
+		ExpectedPrepareReset>::value &&
+		std::is_same<decltype(&D3D11LegacyBridge::Invalidate_Buffer_Range),
+		ExpectedInvalidateBufferRange>::value &&
+		std::is_same<decltype(&D3D11LegacyBridge::Publish_Buffer_Change),
+		ExpectedPublishBufferChange>::value,
 		"D3D11 bridge exposes result-bearing lifecycle and pre-present capture methods");
 	return result;
 }

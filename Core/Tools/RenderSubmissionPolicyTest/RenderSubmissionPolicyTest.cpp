@@ -107,7 +107,8 @@ int testCaptureFrameGate()
 int testWindowPresentationPolicy()
 {
 	const DWORD savedStyle = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
-	const DWORD savedExStyle = WS_EX_APPWINDOW | WS_EX_WINDOWEDGE;
+	const DWORD savedExStyle = WS_EX_APPWINDOW | WS_EX_WINDOWEDGE |
+		WS_EX_TOPMOST;
 	const RECT savedWindowRect = { 100, 200, 1380, 920 };
 	const RECT monitorRect = { -1920, 0, 0, 1080 };
 
@@ -120,11 +121,16 @@ int testWindowPresentationPolicy()
 		rts::render::IsBorderlessWindowStyle(fullscreen.style));
 	CHECK("D3D11 fullscreen removes extended frame",
 		(fullscreen.exStyle & WS_EX_WINDOWEDGE) == 0);
+	CHECK("D3D11 borderless fullscreen is not permanently topmost",
+		(fullscreen.exStyle & WS_EX_TOPMOST) == 0);
 	CHECK("D3D11 fullscreen covers selected monitor",
 		fullscreen.rect.left == monitorRect.left &&
 		fullscreen.rect.top == monitorRect.top &&
 		fullscreen.rect.right == monitorRect.right &&
 		fullscreen.rect.bottom == monitorRect.bottom);
+	CHECK("fullscreen rectangle equality rejects stale startup placement",
+		rts::render::EqualWindowPresentationRect(fullscreen.rect, monitorRect) &&
+		!rts::render::EqualWindowPresentationRect(savedWindowRect, monitorRect));
 	CHECK("D3D11 fullscreen does not request exclusive mode",
 		!fullscreen.usesExclusiveMode);
 
@@ -173,6 +179,44 @@ int testCheckedIndexedSubmissionBounds()
 		!rts::render::Is_D3D8_Indexed_Range_Valid(8, 7, 2));
 	CHECK("indexed range with start past buffer is rejected",
 		!rts::render::Is_D3D8_Indexed_Range_Valid(8, 9, 0));
+	CHECK("exact vertex window is valid",
+		rts::render::Is_D3D8_Vertex_Range_Valid(12, 2, 4, 6));
+	CHECK("sorting vertex window accepts rebased indices at a dynamic offset",
+		rts::render::Is_D3D8_Vertex_Range_Valid(12, 4, 0, 8));
+	CHECK("empty vertex window at the end is valid",
+		rts::render::Is_D3D8_Vertex_Range_Valid(12, 12, 0, 0));
+	CHECK("vertex base beyond capacity is rejected",
+		!rts::render::Is_D3D8_Vertex_Range_Valid(12, 13, 0, 0));
+	CHECK("minimum vertex overflow is rejected",
+		!rts::render::Is_D3D8_Vertex_Range_Valid(12, 2, 11, 0));
+	CHECK("vertex count overflow is rejected",
+		!rts::render::Is_D3D8_Vertex_Range_Valid(12, 2, 4, 7));
+	CHECK("unsigned vertex addition cannot wrap into the buffer",
+		!rts::render::Is_D3D8_Vertex_Range_Valid(12, 2,
+			static_cast<unsigned int>(-1), 1));
+	CHECK("largest signed D3D11 base vertex is valid",
+		rts::render::Is_D3D11_Base_Vertex_Valid(0x7fffffffU));
+	CHECK("unsigned D3D8 base vertex cannot truncate into D3D11",
+		!rts::render::Is_D3D11_Base_Vertex_Valid(0x80000000U) &&
+		!rts::render::Is_D3D11_Base_Vertex_Valid(
+			static_cast<unsigned int>(-1)));
+	CHECK("GPU-copy lease spans hidden render passes in one display frame",
+		rts::render::Is_D3D11_GPU_Copy_Lease_Active(true, 17, 17));
+	CHECK("GPU-copy lease expires at the next display frame",
+		!rts::render::Is_D3D11_GPU_Copy_Lease_Active(true, 17, 18));
+	const unsigned int nextDisplayEpoch =
+		rts::render::Advance_D3D11_Display_Epoch(17);
+	CHECK("display iteration retires a skipped visible frame lease",
+		nextDisplayEpoch == 18 &&
+		!rts::render::Is_D3D11_GPU_Copy_Lease_Active(
+			true, 17, nextDisplayEpoch));
+	CHECK("display epoch wrap preserves zero as the unowned lease",
+		rts::render::Advance_D3D11_Display_Epoch(0xffffffffU) == 1U);
+	CHECK("failed producer frame invalidates its copied texture",
+		rts::render::Should_Invalidate_D3D11_GPU_Copy(true, 41, 41, false));
+	CHECK("successful or unrelated frames retain copied texture validity",
+		!rts::render::Should_Invalidate_D3D11_GPU_Copy(true, 41, 41, true) &&
+		!rts::render::Should_Invalidate_D3D11_GPU_Copy(true, 40, 41, false));
 	return 0;
 }
 
@@ -190,6 +234,9 @@ int testRenderStatePublicationDisposition()
 	CHECK("tracked fog enable is deliberately irrelevant",
 		rts::render::Is_D3D11_Irrelevant_Render_State(
 			rts::render::LEGACY_D3DRS_FOGENABLE));
+	CHECK("range fog is published into neutral fog state",
+		!rts::render::Is_D3D11_Irrelevant_Render_State(
+			rts::render::LEGACY_D3DRS_RANGEFOGENABLE));
 	CHECK("shader-derived specular enable is deliberately irrelevant",
 		rts::render::Is_D3D11_Irrelevant_Render_State(
 			rts::render::LEGACY_D3DRS_SPECULARENABLE));

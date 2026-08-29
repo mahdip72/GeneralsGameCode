@@ -122,6 +122,13 @@ struct BufferDescriptor
 	RenderUsage usage;
 };
 
+enum RenderBufferUpdateMode
+{
+	RENDER_BUFFER_UPDATE_PRESERVE,
+	RENDER_BUFFER_UPDATE_DISCARD,
+	RENDER_BUFFER_UPDATE_NO_OVERWRITE
+};
+
 struct TextureSubresourceData
 {
 	TextureSubresourceData();
@@ -413,7 +420,8 @@ public:
 	virtual ~IRenderContext() {}
 	virtual RenderResult beginFrame() = 0;
 	virtual RenderResult updateBuffer(GpuHandle buffer, const void *data,
-		size_t byteCount, size_t destinationOffset) = 0;
+		size_t byteCount, size_t destinationOffset,
+		RenderBufferUpdateMode mode = RENDER_BUFFER_UPDATE_PRESERVE) = 0;
 	virtual RenderResult clear(const RenderFloat4 &color, float depth,
 		unsigned int stencil) = 0;
 	virtual RenderResult clearTargets(unsigned int clearFlags,

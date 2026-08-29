@@ -967,6 +967,7 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 				/// @todo lorenzen sez: use a fast while loop
 				// Copy Locations
 				*(Vector3*)(vb+fvfinfo.Get_Location_Offset())=VertexLoc[i];
+				*(Vector3*)(vb+fvfinfo.Get_Normal_Offset())=Vector3(0.0f,0.0f,1.0f);
 				if (current_diffuse) {
 					unsigned color=DX8Wrapper::Convert_Color_Clamp(VertexDiffuse[i]);
 					*(unsigned int*)(vb+fvfinfo.Get_Diffuse_Offset())=color;
@@ -975,6 +976,7 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 					*(unsigned int*)(vb+fvfinfo.Get_Diffuse_Offset())=
 						DX8Wrapper::Convert_Color_Clamp(Vector4(DefaultPointColor[0],DefaultPointColor[1],DefaultPointColor[2],DefaultPointAlpha));
 				*(Vector2*)(vb+fvfinfo.Get_Tex_Offset(0))=VertexUV[i];
+				*(Vector2*)(vb+fvfinfo.Get_Tex_Offset(1))=Vector2(0.0f,0.0f);
 				vb+=fvfinfo.Get_FVF_Size();
 			}
 		}
@@ -1649,11 +1651,12 @@ void PointGroupClass::_Shutdown()
  *   12/03/2002	Mark Lorenzen		Created.                                  *
  *																		                                    *
  *========================================================================*/
+#define DEFAULT_VOLUME_PARTICLE_DEPTH ( 1 )
 #define MAX_VOLUME_PARTICLE_DEPTH ( 16 )
 void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int depth )
 {
 
-	if ( depth <= 1 ) //oops,wrong number
+	if ( depth <= DEFAULT_VOLUME_PARTICLE_DEPTH) //oops,wrong number
 	{
 		Render( rinfo );
 		return;
@@ -1888,6 +1891,7 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 					/// @todo lorenzen sez: use a fast while loop
 					// Copy Locations
 					*(Vector3*)(vb+fvfinfo.Get_Location_Offset()) = VertexLoc[i];
+					*(Vector3*)(vb+fvfinfo.Get_Normal_Offset()) = Vector3(0.0f,0.0f,1.0f);
 
 					if (current_diffuse) {
 						unsigned color=DX8Wrapper::Convert_Color_Clamp(VertexDiffuse[i]);
@@ -1897,6 +1901,7 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 						*(unsigned int*)(vb+fvfinfo.Get_Diffuse_Offset())=
 							DX8Wrapper::Convert_Color_Clamp(Vector4(DefaultPointColor[0],DefaultPointColor[1],DefaultPointColor[2],DefaultPointAlpha));
 					*(Vector2*)(vb+fvfinfo.Get_Tex_Offset(0))=VertexUV[i];
+					*(Vector2*)(vb+fvfinfo.Get_Tex_Offset(1))=Vector2(0.0f,0.0f);
 					vb+=fvfinfo.Get_FVF_Size();
 				}
 			}

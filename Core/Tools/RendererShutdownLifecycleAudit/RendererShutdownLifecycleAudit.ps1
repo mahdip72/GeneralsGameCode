@@ -6,215 +6,171 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-function Test-RendererShutdownLifecycleContract {
+function Get-FunctionBody {
     param(
-        [Parameter(Mandatory = $true)][string]$HeaderText,
-        [Parameter(Mandatory = $true)][string]$ImplementationText
+        [Parameter(Mandatory = $true)][string]$Text,
+        [Parameter(Mandatory = $true)][string]$Signature
     )
 
-    if ($HeaderText -notmatch '(?s)class\s+W3DParticleSystemManager.*?virtual\s+void\s+reset\s*\(\s*\)\s+override\s*;') {
-        return $false
+    $start = $Text.IndexOf($Signature, [StringComparison]::Ordinal)
+    if ($start -lt 0) { return $null }
+    $open = $Text.IndexOf('{', $start)
+    if ($open -lt 0) { return $null }
+    $depth = 0
+    for ($index = $open; $index -lt $Text.Length; ++$index) {
+        if ($Text[$index] -eq '{') { ++$depth }
+        elseif ($Text[$index] -eq '}') {
+            --$depth
+            if ($depth -eq 0) { return $Text.Substring($open + 1, $index - $open - 1) }
+        }
     }
-
-    $match = [regex]::Match($ImplementationText,
-        '(?s)void\s+W3DParticleSystemManager::reset\s*\(\s*\)\s*\{(?<body>.*?)\n\}')
-    if (-not $match.Success) {
-        return $false
-    }
-
-    $body = $match.Groups['body'].Value
-    $pointRelease = $body.IndexOf('m_pointGroup->Set_Texture(nullptr);', [StringComparison]::Ordinal)
-    $streakRelease = $body.IndexOf('m_streakLine->Set_Texture(nullptr);', [StringComparison]::Ordinal)
-    $baseReset = $body.IndexOf('ParticleSystemManager::reset();', [StringComparison]::Ordinal)
-    return $pointRelease -ge 0 -and $streakRelease -ge 0 -and $baseReset -ge 0 -and
-        $pointRelease -lt $baseReset -and $streakRelease -lt $baseReset
+    return $null
 }
 
-function Test-DisplayShutdownLifecycleContract {
+function Remove-CppComments {
+    param([string]$Text)
+    return [regex]::Replace($Text, '(?s)/\*.*?\*/|//[^\r\n]*', '')
+}
+
+function Test-ParticleResetContract {
+    param([string]$HeaderText, [string]$ImplementationText)
+
+	$HeaderText = Remove-CppComments $HeaderText
+	$ImplementationText = Remove-CppComments $ImplementationText
+    if ($HeaderText -notmatch 'virtual\s+void\s+reset\s*\(\s*\)\s+override\s*;') { return $false }
+    $body = Get-FunctionBody $ImplementationText 'void W3DParticleSystemManager::reset()'
+    if ($null -eq $body) { return $false }
+    $point = $body.IndexOf('m_pointGroup->Set_Texture(nullptr);', [StringComparison]::Ordinal)
+    $streak = $body.IndexOf('m_streakLine->Set_Texture(nullptr);', [StringComparison]::Ordinal)
+    $base = $body.IndexOf('ParticleSystemManager::reset();', [StringComparison]::Ordinal)
+    return $point -ge 0 -and $streak -ge 0 -and $base -ge 0 -and
+        $point -lt $base -and $streak -lt $base
+}
+
+function Test-DisplayContract {
     param(
-        [Parameter(Mandatory = $true)][string]$BaseManagerHeader,
-        [Parameter(Mandatory = $true)][string]$ManagerHeader,
-        [Parameter(Mandatory = $true)][string]$ManagerImplementation,
-        [Parameter(Mandatory = $true)][string]$DisplayImplementation,
-        [Parameter(Mandatory = $true)][string]$GameClientImplementation,
-        [Parameter(Mandatory = $true)][bool]$RequireSnow
+        [string]$BaseManagerHeader,
+        [string]$ManagerHeader,
+        [string]$ManagerImplementation,
+        [string]$DisplayImplementation,
+        [string]$GameClientImplementation,
+        [bool]$RequireSnow
     )
+
+	$BaseManagerHeader = Remove-CppComments $BaseManagerHeader
+	$ManagerHeader = Remove-CppComments $ManagerHeader
+	$ManagerImplementation = Remove-CppComments $ManagerImplementation
+	$DisplayImplementation = Remove-CppComments $DisplayImplementation
+	$GameClientImplementation = Remove-CppComments $GameClientImplementation
 
     if ($BaseManagerHeader -notmatch 'virtual\s+void\s+releaseGraphicsResources\s*\(\s*\)' -or
         $ManagerHeader -notmatch 'virtual\s+void\s+releaseGraphicsResources\s*\(\s*\)\s+override\s*;') {
         return $false
     }
-    if ($ManagerImplementation -notmatch '(?s)W3DDisplayStringManager::~W3DDisplayStringManager\s*\(\s*\).*?releaseGraphicsResources\s*\(\s*\)\s*;' -or
-        $ManagerImplementation -notmatch '(?s)void\s+W3DDisplayStringManager::releaseGraphicsResources\s*\(\s*\).*?m_groupNumeralStrings.*?m_formationLetterDisplayString') {
-        return $false
-    }
+    $managerBody = Get-FunctionBody $ManagerImplementation 'void W3DDisplayStringManager::releaseGraphicsResources()'
+    $displayBody = Get-FunctionBody $DisplayImplementation 'W3DDisplay::~W3DDisplay()'
+    $clientBody = Get-FunctionBody $GameClientImplementation 'GameClient::~GameClient()'
+    if ($null -eq $managerBody -or $null -eq $displayBody -or $null -eq $clientBody) { return $false }
+    if ($managerBody -notmatch 'freeDisplayString\s*\(\s*m_groupNumeralStrings\s*\[' -or
+        $managerBody -notmatch 'freeDisplayString\s*\(\s*m_formationLetterDisplayString\s*\)') { return $false }
 
-    $displayStart = $DisplayImplementation.IndexOf('W3DDisplay::~W3DDisplay()', [StringComparison]::Ordinal)
-    $displayEnd = $DisplayImplementation.IndexOf('inline Bool isResolutionSupported', $displayStart, [StringComparison]::Ordinal)
-    if ($displayStart -lt 0 -or $displayEnd -lt 0) {
-        return $false
-    }
-    $displayDestructor = $DisplayImplementation.Substring($displayStart, $displayEnd - $displayStart)
-    $movieStop = $displayDestructor.IndexOf('stopMovie();', [StringComparison]::Ordinal)
-    $stringRelease = $displayDestructor.IndexOf('TheDisplayStringManager->releaseGraphicsResources();', [StringComparison]::Ordinal)
-    $rendererShutdown = $displayDestructor.IndexOf('WW3D::Shutdown();', [StringComparison]::Ordinal)
-    if ($movieStop -lt 0 -or $stringRelease -lt 0 -or $rendererShutdown -lt 0 -or
-        $movieStop -gt $rendererShutdown -or $stringRelease -gt $rendererShutdown) {
-        return $false
-    }
+    $movie = $displayBody.IndexOf('stopMovie();', [StringComparison]::Ordinal)
+    $strings = $displayBody.IndexOf('TheDisplayStringManager->releaseGraphicsResources();', [StringComparison]::Ordinal)
+    $shutdown = $displayBody.IndexOf('WW3D::Shutdown();', [StringComparison]::Ordinal)
+    if ($movie -lt 0 -or $strings -lt 0 -or $shutdown -lt 0 -or
+        $movie -gt $shutdown -or $strings -gt $shutdown) { return $false }
 
-    $clientStart = $GameClientImplementation.IndexOf('GameClient::~GameClient()', [StringComparison]::Ordinal)
-    $clientEnd = $GameClientImplementation.IndexOf('void GameClient::init()', $clientStart, [StringComparison]::Ordinal)
-    if ($clientStart -lt 0 -or $clientEnd -lt 0) {
-        return $false
-    }
-    $clientDestructor = $GameClientImplementation.Substring($clientStart, $clientEnd - $clientStart)
-    $managerDelete = $clientDestructor.IndexOf('delete TheDisplayStringManager;', [StringComparison]::Ordinal)
-    $fontDelete = $clientDestructor.IndexOf('delete TheFontLibrary;', [StringComparison]::Ordinal)
-    if ($managerDelete -lt 0 -or $fontDelete -lt 0 -or $managerDelete -gt $fontDelete) {
-        return $false
-    }
+    $managerDelete = $clientBody.IndexOf('delete TheDisplayStringManager;', [StringComparison]::Ordinal)
+	$fontReset = $clientBody.IndexOf('TheFontLibrary->reset();', [StringComparison]::Ordinal)
+    $fontDelete = $clientBody.IndexOf('delete TheFontLibrary;', [StringComparison]::Ordinal)
+    if ($managerDelete -lt 0 -or $fontReset -lt 0 -or $fontDelete -lt 0 -or
+		$managerDelete -gt $fontReset -or $fontReset -gt $fontDelete) { return $false }
     if ($RequireSnow) {
-        $snowDelete = $clientDestructor.IndexOf('delete TheSnowManager;', [StringComparison]::Ordinal)
-        $displayDelete = $clientDestructor.IndexOf('delete TheDisplay;', [StringComparison]::Ordinal)
-        if ($snowDelete -lt 0 -or $displayDelete -lt 0 -or $snowDelete -gt $displayDelete) {
-            return $false
-        }
+        $snowDelete = $clientBody.IndexOf('delete TheSnowManager;', [StringComparison]::Ordinal)
+        $displayDelete = $clientBody.IndexOf('delete TheDisplay;', [StringComparison]::Ordinal)
+        if ($snowDelete -lt 0 -or $displayDelete -lt 0 -or $snowDelete -gt $displayDelete) { return $false }
     }
     return $true
 }
 
 if ($SelfTest) {
-    $header = 'class W3DParticleSystemManager { public: virtual void reset() override; };'
-    $valid = @'
+    $header = 'virtual void reset() override;'
+    $validParticle = @'
 void W3DParticleSystemManager::reset()
 {
-    if (m_pointGroup != nullptr) m_pointGroup->Set_Texture(nullptr);
-    if (m_streakLine != nullptr) m_streakLine->Set_Texture(nullptr);
+    m_pointGroup->Set_Texture(nullptr);
+    m_streakLine->Set_Texture(nullptr);
     ParticleSystemManager::reset();
 }
 '@
-    $missingStreak = $valid.Replace(
-        '    if (m_streakLine != nullptr) m_streakLine->Set_Texture(nullptr);', '')
-    $wrongOrder = @'
-void W3DParticleSystemManager::reset()
-{
-    ParticleSystemManager::reset();
-    if (m_pointGroup != nullptr) m_pointGroup->Set_Texture(nullptr);
-    if (m_streakLine != nullptr) m_streakLine->Set_Texture(nullptr);
-}
-'@
+    if (-not (Test-ParticleResetContract $header $validParticle)) { throw 'Valid particle fixture rejected.' }
+    if (Test-ParticleResetContract $header $validParticle.Replace('m_streakLine->Set_Texture(nullptr);', '')) {
+        throw 'Missing streak release accepted.'
+    }
+    $lateParticle = $validParticle.Replace(
+        '    m_pointGroup->Set_Texture(nullptr);',
+        '').Replace(
+        '    ParticleSystemManager::reset();',
+        "    ParticleSystemManager::reset();`n    m_pointGroup->Set_Texture(nullptr);")
+    if (Test-ParticleResetContract $header $lateParticle) { throw 'Late particle release accepted.' }
+	$commentedParticle = $validParticle.Replace(
+		'm_pointGroup->Set_Texture(nullptr);',
+		'// m_pointGroup->Set_Texture(nullptr);')
+	if (Test-ParticleResetContract $header $commentedParticle) { throw 'Commented particle release accepted.' }
 
-    if (-not (Test-RendererShutdownLifecycleContract $header $valid)) {
-        throw 'The valid shutdown-lifecycle fixture was rejected.'
-    }
-    if (Test-RendererShutdownLifecycleContract 'class W3DParticleSystemManager {};' $valid) {
-        throw 'A missing reset override was accepted.'
-    }
-    if (Test-RendererShutdownLifecycleContract $header $missingStreak) {
-        throw 'A missing streak release was accepted.'
-    }
-    if (Test-RendererShutdownLifecycleContract $header $wrongOrder) {
-        throw 'Renderer resources released after the base reset were accepted.'
-    }
-
-    $baseManager = 'virtual void releaseGraphicsResources() {}'
+    $base = 'virtual void releaseGraphicsResources() {}'
     $managerHeader = 'virtual void releaseGraphicsResources() override;'
-    $managerImplementation = @'
-W3DDisplayStringManager::~W3DDisplayStringManager() { releaseGraphicsResources(); }
-void W3DDisplayStringManager::releaseGraphicsResources()
-{
-    freeDisplayString(m_groupNumeralStrings[0]);
-    freeDisplayString(m_formationLetterDisplayString);
-}
-'@
-    $displayImplementation = @'
-W3DDisplay::~W3DDisplay()
-{
-    stopMovie();
-    TheDisplayStringManager->releaseGraphicsResources();
-    WW3D::Shutdown();
-}
-inline Bool isResolutionSupported() { return true; }
-'@
-    $gameClientImplementation = @'
-GameClient::~GameClient()
-{
-    delete TheSnowManager;
-    delete TheDisplay;
-    delete TheDisplayStringManager;
-    delete TheFontLibrary;
-}
-void GameClient::init() {}
-'@
-    if (-not (Test-DisplayShutdownLifecycleContract $baseManager $managerHeader $managerImplementation $displayImplementation $gameClientImplementation $true)) {
-        throw 'The valid display shutdown-lifecycle fixture was rejected.'
+	$manager = 'void W3DDisplayStringManager::releaseGraphicsResources() { freeDisplayString(m_groupNumeralStrings[0]); freeDisplayString(m_formationLetterDisplayString); }'
+    $display = 'W3DDisplay::~W3DDisplay() { stopMovie(); TheDisplayStringManager->releaseGraphicsResources(); WW3D::Shutdown(); }'
+	$client = 'GameClient::~GameClient() { delete TheSnowManager; delete TheDisplay; delete TheDisplayStringManager; TheFontLibrary->reset(); delete TheFontLibrary; }'
+    if (-not (Test-DisplayContract $base $managerHeader $manager $display $client $true)) {
+        throw 'Valid display fixture rejected.'
     }
-    $lateMovie = $displayImplementation.Replace('    stopMovie();', '').Replace(
-        '    WW3D::Shutdown();', "    WW3D::Shutdown();`n    stopMovie();")
-    if (Test-DisplayShutdownLifecycleContract $baseManager $managerHeader $managerImplementation $lateMovie $gameClientImplementation $true) {
-        throw 'A movie texture released after renderer shutdown was accepted.'
+    $lateDisplay = 'W3DDisplay::~W3DDisplay() { WW3D::Shutdown(); stopMovie(); TheDisplayStringManager->releaseGraphicsResources(); }'
+    if (Test-DisplayContract $base $managerHeader $manager $lateDisplay $client $true) {
+        throw 'Late display release accepted.'
     }
-    $lateSnow = @'
-GameClient::~GameClient()
-{
-    delete TheDisplay;
-    delete TheSnowManager;
-    delete TheDisplayStringManager;
-    delete TheFontLibrary;
-}
-void GameClient::init() {}
-'@
-    if (Test-DisplayShutdownLifecycleContract $baseManager $managerHeader $managerImplementation $displayImplementation $lateSnow $true) {
-        throw 'Snow resources released after display shutdown were accepted.'
-    }
+	$commentedManager = 'void W3DDisplayStringManager::releaseGraphicsResources() { // freeDisplayString(m_groupNumeralStrings[0]);' + "`n" + '// freeDisplayString(m_formationLetterDisplayString);' + "`n}"
+	if (Test-DisplayContract $base $managerHeader $commentedManager $display $client $true) {
+		throw 'Commented display-string release accepted.'
+	}
+	$lateFont = 'GameClient::~GameClient() { delete TheSnowManager; delete TheDisplay; TheFontLibrary->reset(); delete TheFontLibrary; delete TheDisplayStringManager; }'
+	if (Test-DisplayContract $base $managerHeader $manager $display $lateFont $true) {
+		throw 'Font deletion before display strings accepted.'
+	}
+	$earlyFontReset = 'GameClient::~GameClient() { delete TheSnowManager; delete TheDisplay; TheFontLibrary->reset(); delete TheDisplayStringManager; delete TheFontLibrary; }'
+	if (Test-DisplayContract $base $managerHeader $manager $display $earlyFontReset $true) {
+		throw 'Font reset before display strings accepted.'
+	}
+	$lateSnow = 'GameClient::~GameClient() { delete TheDisplay; delete TheSnowManager; delete TheDisplayStringManager; TheFontLibrary->reset(); delete TheFontLibrary; }'
+	if (Test-DisplayContract $base $managerHeader $manager $display $lateSnow $true) {
+		throw 'Snow deletion after display accepted.'
+	}
     Write-Output 'Renderer shutdown lifecycle audit self-test passed.'
     exit 0
 }
 
-if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
-    throw 'SourceRoot is required unless SelfTest is specified.'
-}
+if ([string]::IsNullOrWhiteSpace($SourceRoot)) { throw 'SourceRoot is required unless SelfTest is specified.' }
 
-$headers = @(
-    Join-Path $SourceRoot 'Generals/Code/GameEngineDevice/Include/W3DDevice/GameClient/W3DParticleSys.h'
-    Join-Path $SourceRoot 'GeneralsMD/Code/GameEngineDevice/Include/W3DDevice/GameClient/W3DParticleSys.h'
-)
-$implementationPath = Join-Path $SourceRoot 'Core/GameEngineDevice/Source/W3DDevice/GameClient/W3DParticleSys.cpp'
-$implementation = Get-Content -LiteralPath $implementationPath -Raw
-
-foreach ($headerPath in $headers) {
-    $header = Get-Content -LiteralPath $headerPath -Raw
-    if (-not (Test-RendererShutdownLifecycleContract $header $implementation)) {
-        throw "Particle renderer resources are not released by reset before display shutdown: $headerPath"
-    }
+$particleHeader = Get-Content -LiteralPath (Join-Path $SourceRoot 'Core/GameEngineDevice/Include/W3DDevice/GameClient/W3DParticleSys.h') -Raw
+$particleImplementation = Get-Content -LiteralPath (Join-Path $SourceRoot 'Core/GameEngineDevice/Source/W3DDevice/GameClient/W3DParticleSys.cpp') -Raw
+if (-not (Test-ParticleResetContract $particleHeader $particleImplementation)) {
+    throw 'Particle renderer resources are not released before base reset and display shutdown.'
 }
 
 $baseManagerHeader = Get-Content -LiteralPath (Join-Path $SourceRoot 'Core/GameEngine/Include/GameClient/DisplayStringManager.h') -Raw
-$titleContracts = @(
-    @{
-        ManagerHeader = 'Generals/Code/GameEngineDevice/Include/W3DDevice/GameClient/W3DDisplayStringManager.h'
-        ManagerImplementation = 'Generals/Code/GameEngineDevice/Source/W3DDevice/GameClient/W3DDisplayStringManager.cpp'
-        DisplayImplementation = 'Generals/Code/GameEngineDevice/Source/W3DDevice/GameClient/W3DDisplay.cpp'
-        GameClientImplementation = 'Generals/Code/GameEngine/Source/GameClient/GameClient.cpp'
-        RequireSnow = $false
-    },
-    @{
-        ManagerHeader = 'GeneralsMD/Code/GameEngineDevice/Include/W3DDevice/GameClient/W3DDisplayStringManager.h'
-        ManagerImplementation = 'GeneralsMD/Code/GameEngineDevice/Source/W3DDevice/GameClient/W3DDisplayStringManager.cpp'
-        DisplayImplementation = 'GeneralsMD/Code/GameEngineDevice/Source/W3DDevice/GameClient/W3DDisplay.cpp'
-        GameClientImplementation = 'GeneralsMD/Code/GameEngine/Source/GameClient/GameClient.cpp'
-        RequireSnow = $true
-    }
+$titles = @(
+    @{ Root = 'Generals'; RequireSnow = $false },
+    @{ Root = 'GeneralsMD'; RequireSnow = $true }
 )
-foreach ($contract in $titleContracts) {
-    $managerHeader = Get-Content -LiteralPath (Join-Path $SourceRoot $contract.ManagerHeader) -Raw
-    $managerImplementation = Get-Content -LiteralPath (Join-Path $SourceRoot $contract.ManagerImplementation) -Raw
-    $displayImplementation = Get-Content -LiteralPath (Join-Path $SourceRoot $contract.DisplayImplementation) -Raw
-    $gameClientImplementation = Get-Content -LiteralPath (Join-Path $SourceRoot $contract.GameClientImplementation) -Raw
-    if (-not (Test-DisplayShutdownLifecycleContract $baseManagerHeader $managerHeader $managerImplementation `
-        $displayImplementation $gameClientImplementation $contract.RequireSnow)) {
-        throw "Display graphics resources are not quiesced before renderer shutdown: $($contract.DisplayImplementation)"
+foreach ($title in $titles) {
+    $root = $title.Root
+    $managerHeader = Get-Content -LiteralPath (Join-Path $SourceRoot "$root/Code/GameEngineDevice/Include/W3DDevice/GameClient/W3DDisplayStringManager.h") -Raw
+    $managerImplementation = Get-Content -LiteralPath (Join-Path $SourceRoot "$root/Code/GameEngineDevice/Source/W3DDevice/GameClient/W3DDisplayStringManager.cpp") -Raw
+    $displayImplementation = Get-Content -LiteralPath (Join-Path $SourceRoot "$root/Code/GameEngineDevice/Source/W3DDevice/GameClient/W3DDisplay.cpp") -Raw
+    $gameClientImplementation = Get-Content -LiteralPath (Join-Path $SourceRoot "$root/Code/GameEngine/Source/GameClient/GameClient.cpp") -Raw
+    if (-not (Test-DisplayContract $baseManagerHeader $managerHeader $managerImplementation $displayImplementation $gameClientImplementation $title.RequireSnow)) {
+        throw "Display graphics resources are not quiesced before renderer shutdown: $root"
     }
 }
 

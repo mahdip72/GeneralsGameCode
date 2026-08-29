@@ -194,9 +194,11 @@ RenderResult NativeW3DRenderer::Submit(const NativeW3DResources &resources,
 	{
 		return result;
 	}
-	for (unsigned int textureStage = 0; textureStage < LEGACY_TEXTURE_STAGE_COUNT; ++textureStage)
+	for (unsigned int textureStage = 0;
+		textureStage < LEGACY_TEXTURE_STAGE_COUNT; ++textureStage)
 	{
-		result = context->setTexture(textureStage, packet.textures[textureStage]);
+		result = context->setTexture(textureStage,
+			packet.textures[textureStage]);
 		if (result != RENDER_RESULT_OK)
 		{
 			return result;

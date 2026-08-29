@@ -41,6 +41,7 @@
 #include "Common/PerfTimer.h"
 #include "Common/Player.h"
 #include "Common/PlayerList.h"
+#include "Common/SkirmishAITestRunner.h"
 #include "Common/ThingFactory.h"
 #include "Common/ThingTemplate.h"
 #include "Common/Xfer.h"
@@ -515,8 +516,16 @@ void GameClient::update()
 			delete m_intro;
 			m_intro = nullptr;
 
-			TheShell->showShellMap(TRUE);
-			TheShell->showShell();
+			if (!IsSkirmishAITestRunnerArmed())
+			{
+				TheShell->showShellMap(TRUE);
+				TheShell->showShell();
+			}
+
+			if (TheGlobalData->m_loadSaveGame.isNotEmpty())
+			{
+				TheGameState->loadQueuedSaveGame();
+			}
 		}
 	}
 

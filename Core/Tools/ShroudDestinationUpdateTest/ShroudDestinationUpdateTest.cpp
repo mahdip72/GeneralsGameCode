@@ -1,4 +1,4 @@
-#include <cstdio>
+#include <stdio.h>
 
 #include "W3DDevice/Common/W3DShroudRenderPolicy.h"
 

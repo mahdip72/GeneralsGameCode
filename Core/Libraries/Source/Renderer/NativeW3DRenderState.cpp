@@ -16,7 +16,11 @@ namespace
 long IncrementReference(volatile long *references)
 {
 #ifdef _WIN32
+#if defined(_MSC_VER) && _MSC_VER < 1300
+	return InterlockedIncrement(const_cast<long *>(references));
+#else
 	return InterlockedIncrement(references);
+#endif
 #else
 	return __sync_add_and_fetch(references, 1);
 #endif
@@ -25,7 +29,11 @@ long IncrementReference(volatile long *references)
 long DecrementReference(volatile long *references)
 {
 #ifdef _WIN32
+#if defined(_MSC_VER) && _MSC_VER < 1300
+	return InterlockedDecrement(const_cast<long *>(references));
+#else
 	return InterlockedDecrement(references);
+#endif
 #else
 	return __sync_sub_and_fetch(references, 1);
 #endif
