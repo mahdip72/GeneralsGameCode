@@ -850,11 +850,12 @@ GlobalData::GlobalData()
 
 	m_cameraPitch = 0.0f;
 	m_cameraYaw = 0.0f;
+	// Match the retail GameData.ini camera defaults before or without an INI override.
 #if PRESERVE_RETAIL_SCRIPTED_CAMERA
-	m_cameraHeight = 0.0f;
+	m_cameraHeight = 232.0f;
 #endif
-	m_minCameraHeight = 100.0f;
-	m_maxCameraHeight = 300.0f;
+	m_minCameraHeight = 120.0f;
+	m_maxCameraHeight = 310.0f;
 	m_terrainHeightAtEdgeOfMap = 0.0f;
 
 	m_unitDamagedThresh = 0.5f;
