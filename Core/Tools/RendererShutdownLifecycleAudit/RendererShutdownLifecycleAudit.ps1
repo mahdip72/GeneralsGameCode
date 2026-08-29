@@ -108,9 +108,10 @@ void W3DParticleSystemManager::reset()
         throw 'Missing streak release accepted.'
     }
     $lateParticle = $validParticle.Replace(
+        '    m_pointGroup->Set_Texture(nullptr);',
+        '').Replace(
         '    ParticleSystemManager::reset();',
-        "    ParticleSystemManager::reset();`n    m_pointGroup->Set_Texture(nullptr);").Replace(
-        '    m_pointGroup->Set_Texture(nullptr);' + "`n", '')
+        "    ParticleSystemManager::reset();`n    m_pointGroup->Set_Texture(nullptr);")
     if (Test-ParticleResetContract $header $lateParticle) { throw 'Late particle release accepted.' }
 	$commentedParticle = $validParticle.Replace(
 		'm_pointGroup->Set_Texture(nullptr);',

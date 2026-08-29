@@ -11,6 +11,7 @@ target_compile_definitions(core_legacy_texture_operation_tests PRIVATE
 )
 
 if(IS_VS6_BUILD)
+    target_link_libraries(core_legacy_texture_operation_tests PRIVATE stlport)
     set_target_properties(core_legacy_texture_operation_tests PROPERTIES
         CXX_STANDARD 98
         CXX_STANDARD_REQUIRED YES

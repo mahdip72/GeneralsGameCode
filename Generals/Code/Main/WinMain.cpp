@@ -736,15 +736,16 @@ static Bool initializeAppWindows( HINSTANCE hInstance, Int nCmdShow, Bool runWin
 	}
 	else
 	{
-		POINT primaryPoint = { 0, 0 };
-		MONITORINFO monitorInfo = { sizeof(MONITORINFO) };
-		if (GetMonitorInfo(MonitorFromPoint(primaryPoint, MONITOR_DEFAULTTOPRIMARY),
-			&monitorInfo))
-		{
-			rect = monitorInfo.rcMonitor;
-			windowX = rect.left;
-			windowY = rect.top;
-		}
+		// The VC6 SDK hides the multimonitor declarations behind WINVER 0x0500.
+		// This path is only used by the legacy D3D8 fullscreen bootstrap; D3D11
+		// fullscreen takes the windowed bootstrap above and positions the window
+		// through its modern presentation path.
+		rect.left = 0;
+		rect.top = 0;
+		rect.right = GetSystemMetrics(SM_CXSCREEN);
+		rect.bottom = GetSystemMetrics(SM_CYSCREEN);
+		windowX = rect.left;
+		windowY = rect.top;
 	}
 
 	gInitializing = true;

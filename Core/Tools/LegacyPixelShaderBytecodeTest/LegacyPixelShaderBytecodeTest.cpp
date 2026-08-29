@@ -5,7 +5,7 @@
 
 #include "W3DDevice/Common/LegacyPixelShaderBytecode.h"
 
-#include <cstdio>
+#include <stdio.h>
 
 namespace
 {
@@ -35,7 +35,7 @@ bool Expect(LegacyPixelShaderBytecode::Program program,
 		stream.words[0] != expected_version ||
 		Fnv1a(stream) != expected_hash)
 	{
-		std::printf("legacy shader %d failed validation (count=%u version=0x%08x hash=0x%08x)\n",
+		printf("legacy shader %d failed validation (count=%u version=0x%08x hash=0x%08x)\n",
 			static_cast<int>(program), stream.word_count,
 			stream.words == 0 ? 0u : stream.words[0],
 			Fnv1a(stream));
