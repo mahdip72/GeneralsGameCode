@@ -446,6 +446,69 @@ static void testConversionReferenceMatrix()
 	expectBytes(&pixels[0], dxt1Expected,
 		4, "DXT1 block decode preserves the source color");
 
+	// BC2/DXT3 places explicit alpha before the BC1-compatible color block.
+	// Keep the two halves deliberately different so a swapped decoder cannot
+	// accidentally satisfy this reference.
+	static const unsigned char dxt3Source[16] = {
+		0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88,
+		0x00, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+	};
+	static const unsigned char dxt3Expected[4] = { 0x00, 0x00, 0xff, 0x88 };
+	expectTrue(SurfaceBlit_Convert_To_A8R8G8B8(dxt3Source, 16, 1, 1,
+		D3DFMT_DXT3, &pixels),
+		"DXT3 block decode is supported for D3D11 readback");
+	expectBytes(&pixels[0], dxt3Expected, 4,
+		"DXT3 block decode keeps explicit alpha separate from color");
+
+	// BC3/DXT5 uses an interpolated alpha table followed by the color block.
+	// Alpha index zero selects 0xcc and color index zero selects green.
+	static const unsigned char dxt5Source[16] = {
+		0xcc, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0xe0, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+	};
+	static const unsigned char dxt5Expected[4] = { 0x00, 0xff, 0x00, 0xcc };
+	expectTrue(SurfaceBlit_Convert_To_A8R8G8B8(dxt5Source, 16, 1, 1,
+		D3DFMT_DXT5, &pixels),
+		"DXT5 block decode is supported for D3D11 readback");
+	expectBytes(&pixels[0], dxt5Expected, 4,
+		"DXT5 block decode keeps interpolated alpha separate from color");
+
+	// Exercise every BC3 alpha index at the end of a single-block allocation.
+	// All-one index bits select table entry seven, including pixel 15 whose
+	// three bits end at the final byte of the six-byte index payload.
+	static const unsigned char dxt5BoundarySource[16] = {
+		0xcc, 0x11, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xe0, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+	};
+	static const unsigned char dxt5BoundaryPixel[4] = {
+		0x00, 0xff, 0x00, 0x2c
+	};
+	expectTrue(SurfaceBlit_Convert_To_A8R8G8B8(dxt5BoundarySource, 16, 4, 4,
+		D3DFMT_DXT5, &pixels),
+		"DXT5 full-block decode stays within the terminal alpha payload");
+	expectTrue(pixels.size() == 64,
+		"DXT5 full-block decode produces all sixteen pixels");
+	if (pixels.size() == 64)
+	{
+		for (unsigned int pixel = 0; pixel < 16; ++pixel)
+		{
+			expectBytes(&pixels[pixel * 4], dxt5BoundaryPixel, 4,
+				"DXT5 boundary index selects the characterized alpha entry");
+		}
+	}
+
+	// DXT2 and DXT4 share the same physical layouts as DXT3 and DXT5.
+	expectTrue(SurfaceBlit_Convert_To_A8R8G8B8(dxt3Source, 16, 1, 1,
+		D3DFMT_DXT2, &pixels),
+		"DXT2 shares the characterized BC2 layout");
+	expectBytes(&pixels[0], dxt3Expected, 4,
+		"DXT2 reads the BC2 color and alpha halves in the correct order");
+	expectTrue(SurfaceBlit_Convert_To_A8R8G8B8(dxt5Source, 16, 1, 1,
+		D3DFMT_DXT4, &pixels),
+		"DXT4 shares the characterized BC3 layout");
+	expectBytes(&pixels[0], dxt5Expected, 4,
+		"DXT4 reads the BC3 color and alpha halves in the correct order");
+
 	static const unsigned char unsupported[] = { 0, 0, 0, 0 };
 	expectTrue(!SurfaceBlit_Convert_To_A8R8G8B8(unsupported, 4, 1, 1,
 		D3DFMT_V8U8, &pixels),

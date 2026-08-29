@@ -221,9 +221,14 @@ static unsigned Dxt_Alpha(const unsigned char *block, D3DFORMAT format,
 		const unsigned bitOffset = 3U * pixelIndex;
 		const unsigned byteOffset = bitOffset / 8U;
 		const unsigned shift = bitOffset & 7U;
-		const unsigned packed = (unsigned)block[2U + byteOffset] |
-			((unsigned)block[2U + byteOffset + 1U] << 8) |
-			((unsigned)block[2U + byteOffset + 2U] << 16);
+		// A BC3 alpha-index payload is exactly six bytes.  Three index bits can
+		// straddle at most two bytes; avoid reading into the following color
+		// block for the final index in the payload.
+		unsigned packed = (unsigned)block[2U + byteOffset];
+		if (byteOffset + 1U < 6U)
+		{
+			packed |= (unsigned)block[2U + byteOffset + 1U] << 8;
+		}
 		return alphaTable[(packed >> shift) & 7U];
 	}
 }
@@ -239,6 +244,7 @@ static bool Read_Dxt_Pixel(const unsigned char *source, int source_pitch,
 	const unsigned blockY = y / 4U;
 	const unsigned localIndex = (y & 3U) * 4U + (x & 3U);
 	const unsigned char *block;
+	const unsigned char *colorBlock;
 	unsigned long colorIndexes;
 	unsigned short color0;
 	unsigned short color1;
@@ -249,12 +255,16 @@ static bool Read_Dxt_Pixel(const unsigned char *source, int source_pitch,
 	}
 	block = source + (size_t)blockY * (size_t)source_pitch +
 		(size_t)blockX * blockBytes;
-	color0 = Read_Word(block);
-	color1 = Read_Word(block + 2);
-	colorIndexes = (unsigned long)block[4] |
-		((unsigned long)block[5] << 8) |
-		((unsigned long)block[6] << 16) |
-		((unsigned long)block[7] << 24);
+	// BC2/BC3 (D3D8 DXT2-5) store alpha in the first eight bytes and the
+	// BC1-compatible color payload in the second eight.  DXT1 consists only
+	// of that color payload.
+	colorBlock = format == D3DFMT_DXT1 ? block : block + 8;
+	color0 = Read_Word(colorBlock);
+	color1 = Read_Word(colorBlock + 2);
+	colorIndexes = (unsigned long)colorBlock[4] |
+		((unsigned long)colorBlock[5] << 8) |
+		((unsigned long)colorBlock[6] << 16) |
+		((unsigned long)colorBlock[7] << 24);
 	Read_Dxt_Color((colorIndexes >> (2U * localIndex)) & 3U,
 		color0, color1, format != D3DFMT_DXT1, pixel);
 	if (format == D3DFMT_DXT1 && color0 <= color1 &&
@@ -264,8 +274,7 @@ static bool Read_Dxt_Pixel(const unsigned char *source, int source_pitch,
 	}
 	else
 	{
-		pixel[3] = (unsigned char)Dxt_Alpha(block +
-			(format == D3DFMT_DXT1 ? 0 : 8), format, localIndex);
+		pixel[3] = (unsigned char)Dxt_Alpha(block, format, localIndex);
 	}
 	return x < width && y < height;
 }

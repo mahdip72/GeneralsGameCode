@@ -1379,8 +1379,12 @@ struct D3D11LegacyBridge::Impl
 		descriptor.format = rts::render::RENDER_FORMAT_B8G8R8A8_UNORM;
 		descriptor.binding = rts::render::RENDER_TEXTURE_SHADER_RESOURCE |
 			(for_render_target ? rts::render::RENDER_TEXTURE_RENDER_TARGET : 0);
-		descriptor.usage = for_render_target ? rts::render::RENDER_USAGE_DEFAULT :
-			rts::render::RENDER_USAGE_IMMUTABLE;
+		// D3D8 resources can be mutated through LockRect/UpdateTexture even when
+		// they were not created with D3DUSAGE_DYNAMIC.  The bridge exposes that
+		// mutation through Invalidate_Texture, so its D3D11 mirror must remain
+		// refreshable.  Immutable mirrors forced every animated shell texture to
+		// be destroyed and recreated on each dirty notification.
+		descriptor.usage = rts::render::RENDER_USAGE_DEFAULT;
 		if (source->GetType() == D3DRTYPE_TEXTURE)
 		{
 			IDirect3DTexture8 *texture = static_cast<IDirect3DTexture8 *>(source);

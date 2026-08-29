@@ -107,7 +107,8 @@ int testCaptureFrameGate()
 int testWindowPresentationPolicy()
 {
 	const DWORD savedStyle = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
-	const DWORD savedExStyle = WS_EX_APPWINDOW | WS_EX_WINDOWEDGE;
+	const DWORD savedExStyle = WS_EX_APPWINDOW | WS_EX_WINDOWEDGE |
+		WS_EX_TOPMOST;
 	const RECT savedWindowRect = { 100, 200, 1380, 920 };
 	const RECT monitorRect = { -1920, 0, 0, 1080 };
 
@@ -120,11 +121,16 @@ int testWindowPresentationPolicy()
 		rts::render::IsBorderlessWindowStyle(fullscreen.style));
 	CHECK("D3D11 fullscreen removes extended frame",
 		(fullscreen.exStyle & WS_EX_WINDOWEDGE) == 0);
+	CHECK("D3D11 borderless fullscreen is not permanently topmost",
+		(fullscreen.exStyle & WS_EX_TOPMOST) == 0);
 	CHECK("D3D11 fullscreen covers selected monitor",
 		fullscreen.rect.left == monitorRect.left &&
 		fullscreen.rect.top == monitorRect.top &&
 		fullscreen.rect.right == monitorRect.right &&
 		fullscreen.rect.bottom == monitorRect.bottom);
+	CHECK("fullscreen rectangle equality rejects stale startup placement",
+		rts::render::EqualWindowPresentationRect(fullscreen.rect, monitorRect) &&
+		!rts::render::EqualWindowPresentationRect(savedWindowRect, monitorRect));
 	CHECK("D3D11 fullscreen does not request exclusive mode",
 		!fullscreen.usesExclusiveMode);
 

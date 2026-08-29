@@ -212,6 +212,18 @@ bool Get_D3D11_Monitor_Rect(RECT *monitor_rect)
 	return rts::render::IsValidWindowPresentationRect(*monitor_rect);
 }
 
+bool Abort_D3D11_Windowed_Transition(const RECT &monitor_rect)
+{
+	if (_D3D11WindowPresentationState.valid &&
+		!rts::render::ApplyBorderlessWindow(_Hwnd, monitor_rect,
+			&_D3D11WindowPresentationState))
+	{
+		WWDEBUG_SAY(("D3D11 windowed transition rollback failed: %lu.",
+			GetLastError()));
+	}
+	return false;
+}
+
 rts::render::RenderSubmissionDecision Get_Visible_Submission_Decision()
 {
 	return rts::render::ChooseVisibleSubmissionBackend(
@@ -985,50 +997,84 @@ void DX8Wrapper::Get_Format_Name(unsigned int format, StringClass *tex_format)
 		}
 }
 
-void DX8Wrapper::Resize_And_Position_Window()
+bool DX8Wrapper::Resize_And_Position_Window(bool use_restored_width,
+	bool use_restored_height)
 {
+	bool d3d11_windowed_restore_pending = false;
+	RECT d3d11_rollback_monitor = { 0 };
 	if (_UseD3D11Backend)
 	{
 		if (!IsWindowed)
 		{
 			RECT monitor_rect;
-			if (Get_D3D11_Monitor_Rect(&monitor_rect))
+			if (!Get_D3D11_Monitor_Rect(&monitor_rect))
 			{
-				ResolutionWidth = monitor_rect.right - monitor_rect.left;
-				ResolutionHeight = monitor_rect.bottom - monitor_rect.top;
-				_PresentParameters.BackBufferWidth = ResolutionWidth;
-				_PresentParameters.BackBufferHeight = ResolutionHeight;
-				if (!rts::render::ApplyBorderlessWindow(_Hwnd, monitor_rect,
-					&_D3D11WindowPresentationState))
-				{
-					WWDEBUG_SAY(("D3D11 borderless window transition failed."));
-				}
-				return;
+				WWDEBUG_SAY(("D3D11 monitor lookup failed: %lu.", GetLastError()));
+				return false;
 			}
+			ResolutionWidth = monitor_rect.right - monitor_rect.left;
+			ResolutionHeight = monitor_rect.bottom - monitor_rect.top;
+			_PresentParameters.BackBufferWidth = ResolutionWidth;
+			_PresentParameters.BackBufferHeight = ResolutionHeight;
+			if (!rts::render::ApplyBorderlessWindow(_Hwnd, monitor_rect,
+				&_D3D11WindowPresentationState))
+			{
+				WWDEBUG_SAY(("D3D11 borderless window transition failed: %lu.",
+					GetLastError()));
+				return false;
+			}
+			return true;
 		}
-		else if (_D3D11WindowPresentationState.valid &&
-			rts::render::RestoreWindowedWindow(_Hwnd,
-			&_D3D11WindowPresentationState))
+		else if (_D3D11WindowPresentationState.valid)
 		{
+			if (!Get_D3D11_Monitor_Rect(&d3d11_rollback_monitor))
+			{
+				WWDEBUG_SAY(("D3D11 rollback monitor lookup failed: %lu.",
+					GetLastError()));
+				return false;
+			}
+			if (!rts::render::RestoreWindowPresentationSnapshot(_Hwnd,
+				&_D3D11WindowPresentationState, false))
+			{
+				WWDEBUG_SAY(("D3D11 windowed restoration failed: %lu.",
+					GetLastError()));
+				return Abort_D3D11_Windowed_Transition(
+					d3d11_rollback_monitor);
+			}
+			d3d11_windowed_restore_pending = true;
 			RECT restored_client_rect;
-			::GetClientRect(_Hwnd, &restored_client_rect);
-			if (restored_client_rect.right > restored_client_rect.left &&
-				restored_client_rect.bottom > restored_client_rect.top)
+			if (!::GetClientRect(_Hwnd, &restored_client_rect) ||
+				restored_client_rect.right <= restored_client_rect.left ||
+				restored_client_rect.bottom <= restored_client_rect.top)
+			{
+				return Abort_D3D11_Windowed_Transition(
+					d3d11_rollback_monitor);
+			}
+			if (use_restored_width)
 			{
 				ResolutionWidth = restored_client_rect.right -
 					restored_client_rect.left;
+			}
+			if (use_restored_height)
+			{
 				ResolutionHeight = restored_client_rect.bottom -
 					restored_client_rect.top;
-				_PresentParameters.BackBufferWidth = ResolutionWidth;
-				_PresentParameters.BackBufferHeight = ResolutionHeight;
 			}
-			return;
+			_PresentParameters.BackBufferWidth = ResolutionWidth;
+			_PresentParameters.BackBufferHeight = ResolutionHeight;
+			// Continue through the normal windowed sizing path.  This preserves
+			// an explicit requested resolution while using the captured client
+			// size only for dimensions the caller left unspecified.
 		}
 	}
 
 	// Get the current dimensions of the 'render area' of the window
 	RECT rect = { 0 };
-	::GetClientRect (_Hwnd, &rect);
+	if (!::GetClientRect(_Hwnd, &rect) && _UseD3D11Backend)
+	{
+		return d3d11_windowed_restore_pending ?
+			Abort_D3D11_Windowed_Transition(d3d11_rollback_monitor) : false;
+	}
 
 	// Is the window the correct size for this resolution?
 	if ((rect.right-rect.left) != ResolutionWidth ||
@@ -1040,8 +1086,21 @@ void DX8Wrapper::Resize_And_Position_Window()
 		rect.top = 0;
 		rect.right = ResolutionWidth;
 		rect.bottom = ResolutionHeight;
-		DWORD dwstyle = ::GetWindowLong (_Hwnd, GWL_STYLE);
-		AdjustWindowRect (&rect, dwstyle, FALSE);
+		DWORD dwstyle = 0;
+		if (_UseD3D11Backend)
+		{
+			if (!rts::render::ReadWindowStyle(_Hwnd, GWL_STYLE, &dwstyle) ||
+				!AdjustWindowRect(&rect, dwstyle, FALSE))
+			{
+				return d3d11_windowed_restore_pending ?
+					Abort_D3D11_Windowed_Transition(d3d11_rollback_monitor) : false;
+			}
+		}
+		else
+		{
+			dwstyle = ::GetWindowLong(_Hwnd, GWL_STYLE);
+			AdjustWindowRect(&rect, dwstyle, FALSE);
+		}
 		int width = rect.right-rect.left;
 		int height = rect.bottom-rect.top;
 
@@ -1057,7 +1116,12 @@ void DX8Wrapper::Resize_And_Position_Window()
 			// TheSuperHackers @feature helmutbuhler 14/04/2025
 			// Center the window in the workarea of the monitor it is on.
 			MONITORINFO mi = {sizeof(MONITORINFO)};
-			GetMonitorInfo(MonitorFromWindow(_Hwnd, MONITOR_DEFAULTTOPRIMARY), &mi);
+			if (!GetMonitorInfo(MonitorFromWindow(_Hwnd,
+				MONITOR_DEFAULTTOPRIMARY), &mi) && _UseD3D11Backend)
+			{
+				return d3d11_windowed_restore_pending ?
+					Abort_D3D11_Windowed_Transition(d3d11_rollback_monitor) : false;
+			}
 			int left = (mi.rcWork.left + mi.rcWork.right - width) / 2;
 			int top  = (mi.rcWork.top + mi.rcWork.bottom - height) / 2;
 
@@ -1071,11 +1135,34 @@ void DX8Wrapper::Resize_And_Position_Window()
 			rectClient.bottom = rectClient.top + ResolutionHeight;
 			MoveRectIntoOtherRect(rectClient, mi.rcMonitor, &left, &top);
 
-			::SetWindowPos (_Hwnd, nullptr, left, top, width, height, SWP_NOZORDER);
+			if (!::SetWindowPos(_Hwnd, nullptr, left, top, width, height,
+				SWP_NOZORDER) && _UseD3D11Backend)
+			{
+				return d3d11_windowed_restore_pending ?
+					Abort_D3D11_Windowed_Transition(d3d11_rollback_monitor) : false;
+			}
 
 			DEBUG_LOG(("Window positioned to x:%d y:%d, resized to w:%d h:%d", left, top, width, height));
 		}
 	}
+	if (_UseD3D11Backend)
+	{
+		RECT verified_client_rect = { 0 };
+		if (!GetClientRect(_Hwnd, &verified_client_rect) ||
+			verified_client_rect.right - verified_client_rect.left !=
+				ResolutionWidth ||
+			verified_client_rect.bottom - verified_client_rect.top !=
+				ResolutionHeight)
+		{
+			return d3d11_windowed_restore_pending ?
+				Abort_D3D11_Windowed_Transition(d3d11_rollback_monitor) : false;
+		}
+		if (d3d11_windowed_restore_pending)
+		{
+			_D3D11WindowPresentationState.clear();
+		}
+	}
+	return true;
 }
 
 bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int windowed,
@@ -1085,6 +1172,11 @@ bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int
 	WWASSERT(dev >= -1);
 	WWASSERT(dev < _RenderDeviceNameTable.Count());
 	const bool previous_windowed = IsWindowed;
+	const int previous_resolution_width = ResolutionWidth;
+	const int previous_resolution_height = ResolutionHeight;
+	const int previous_bit_depth = BitDepth;
+	const UINT previous_back_buffer_width = _PresentParameters.BackBufferWidth;
+	const UINT previous_back_buffer_height = _PresentParameters.BackBufferHeight;
 
 	/*
 	** If user has never selected a render device, start out with device 0
@@ -1128,7 +1220,17 @@ bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int
 	// if ( resize_window && windowed ) {
 	if (resize_window || (_UseD3D11Backend &&
 		(!IsWindowed || previous_windowed != IsWindowed))) {
-		Resize_And_Position_Window();
+		if (!Resize_And_Position_Window(width == -1, height == -1))
+		{
+			ResolutionWidth = previous_resolution_width;
+			ResolutionHeight = previous_resolution_height;
+			BitDepth = previous_bit_depth;
+			IsWindowed = previous_windowed;
+			DX8Wrapper_IsWindowed = previous_windowed;
+			_PresentParameters.BackBufferWidth = previous_back_buffer_width;
+			_PresentParameters.BackBufferHeight = previous_back_buffer_height;
+			return false;
+		}
 	}
 #endif
 	//must be either resetting existing device or creating a new one.
@@ -1411,6 +1513,10 @@ bool DX8Wrapper::Set_Device_Resolution(int width,int height,int bits,int windowe
 {
 	if (D3DDevice != nullptr) {
 		const bool previous_windowed = IsWindowed;
+		const int previous_resolution_width = ResolutionWidth;
+		const int previous_resolution_height = ResolutionHeight;
+		const UINT previous_back_buffer_width = _PresentParameters.BackBufferWidth;
+		const UINT previous_back_buffer_height = _PresentParameters.BackBufferHeight;
 
 		if (width != -1) {
 			_PresentParameters.BackBufferWidth = ResolutionWidth = width;
@@ -1437,7 +1543,16 @@ bool DX8Wrapper::Set_Device_Resolution(int width,int height,int bits,int windowe
 		if (resize_window || (_UseD3D11Backend &&
 			(!IsWindowed || previous_windowed != IsWindowed)))
 		{
-			Resize_And_Position_Window();
+			if (!Resize_And_Position_Window(width == -1, height == -1))
+			{
+				ResolutionWidth = previous_resolution_width;
+				ResolutionHeight = previous_resolution_height;
+				IsWindowed = previous_windowed;
+				DX8Wrapper_IsWindowed = previous_windowed;
+				_PresentParameters.BackBufferWidth = previous_back_buffer_width;
+				_PresentParameters.BackBufferHeight = previous_back_buffer_height;
+				return false;
+			}
 		}
 #pragma message("TODO: support changing windowed status and changing the bit depth")
 		WWDEBUG_SAY(("DX8Wrapper::Set_Device_Resolution is resetting the device."));
