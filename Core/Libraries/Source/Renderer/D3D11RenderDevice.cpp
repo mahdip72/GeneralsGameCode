@@ -465,7 +465,11 @@ public:
 		m_boundBlendState(0), m_boundDepthState(0),
 		m_boundRasterizerState(0), m_boundInputLayout(0),
 		m_boundVertexShader(0), m_boundPixelShader(0),
-		m_pipelineHasTextures(false), m_transformConstantsValid(false),
+		m_pipelineHasTextures(false), m_cachedLegacyStateValid(false),
+		m_cachedLegacyVertexFormat(RENDER_VERTEX_POSITION3_COLOR),
+		m_cachedLegacyTexturePresenceMask(0), m_cachedLegacyCubeTextureMask(0),
+		m_cachedLegacyVertexLayoutFlags(0), m_cachedLegacyInputLayout(0),
+		m_transformConstantsValid(false),
 		m_transformConstantsChanged(false), m_hasInputLayoutOverride(false),
 		m_inputLayoutOverride(0), m_renderTargetsBound(false),
 		m_textureBindingsValid(false),
@@ -482,6 +486,7 @@ public:
 		memset(&m_boundRasterizerDescriptor, 0,
 			sizeof(m_boundRasterizerDescriptor));
 		memset(m_boundSamplerStates, 0, sizeof(m_boundSamplerStates));
+		memset(m_cachedLegacyState, 0, sizeof(m_cachedLegacyState));
 		memset(m_boundTextures, 0, sizeof(m_boundTextures));
 		memset(&m_lastTransformConstants, 0, sizeof(m_lastTransformConstants));
 	}
@@ -1854,6 +1859,7 @@ public:
 		m_viewportMinimumDepth = minimumDepth;
 		m_viewportMaximumDepth = maximumDepth;
 		m_viewportBound = true;
+		m_cachedLegacyStateValid = false;
 		return RENDER_RESULT_OK;
 	}
 
@@ -1894,6 +1900,22 @@ public:
 		{
 			return RENDER_RESULT_UNSUPPORTED;
 		}
+		const unsigned int vertexLayoutFlags = m_hasVertexLayoutFlagsOverride ?
+			m_vertexLayoutFlagsOverride : (useFullPipeline ? 0x10bU : 0x02U);
+		ID3D11InputLayout *inputLayout = m_hasInputLayoutOverride ?
+			m_inputLayoutOverride : (useSeaWavePipeline ? m_seaWaveLayout :
+			m_positionColorLayout);
+		if (m_pipelineStateValid && m_pipelineBound &&
+			m_cachedLegacyStateValid &&
+			m_cachedLegacyVertexFormat == vertexFormat &&
+			m_cachedLegacyTexturePresenceMask == texturePresenceMask &&
+			m_cachedLegacyCubeTextureMask == m_boundCubeTextureMask &&
+			m_cachedLegacyVertexLayoutFlags == vertexLayoutFlags &&
+			m_cachedLegacyInputLayout == inputLayout &&
+			memcmp(m_cachedLegacyState, &state, sizeof(state)) == 0)
+		{
+			return RENDER_RESULT_OK;
+		}
 	if (state.pipeline.ambientMaterialSource >
 			RENDER_MATERIAL_SOURCE_COLOR2 ||
 			state.pipeline.diffuseMaterialSource >
@@ -1925,8 +1947,6 @@ public:
 				return RENDER_RESULT_UNSUPPORTED;
 			}
 		}
-		const unsigned int vertexLayoutFlags = m_hasVertexLayoutFlagsOverride ?
-			m_vertexLayoutFlagsOverride : (useFullPipeline ? 0x10bU : 0x02U);
 		// Clip equations are published in world space.  The fixed-function
 		// shader deliberately does not reinterpret them for POSITIONT data;
 		// reject that combination instead of silently drawing with clipping
@@ -2076,9 +2096,6 @@ public:
 			}
 		}
 
-		ID3D11InputLayout *inputLayout = m_hasInputLayoutOverride ?
-			m_inputLayoutOverride : (useSeaWavePipeline ? m_seaWaveLayout :
-			m_positionColorLayout);
 		ID3D11VertexShader *vertexShader = useSeaWavePipeline ?
 			m_seaWaveVertexShader : (useFullPipeline ?
 			m_texturedVertexShader : m_vertexShader);
@@ -2131,6 +2148,8 @@ public:
 		if (pipelineMatches)
 		{
 			m_pipelineBound = true;
+			cacheLegacyState(state, vertexFormat, texturePresenceMask,
+				vertexLayoutFlags, inputLayout);
 			return RENDER_RESULT_OK;
 		}
 
@@ -2194,6 +2213,8 @@ public:
 		m_pipelineBound = true;
 		m_pipelineStateValid = true;
 		m_transformConstantsChanged = false;
+		cacheLegacyState(state, vertexFormat, texturePresenceMask,
+			vertexLayoutFlags, inputLayout);
 		return RENDER_RESULT_OK;
 	}
 
@@ -2632,10 +2653,24 @@ private:
 		return m_initialized && GetCurrentThreadId() == m_ownerThread;
 	}
 
+	void cacheLegacyState(const LegacyLogicalState &state,
+		LegacyVertexFormat vertexFormat, unsigned int texturePresenceMask,
+		unsigned int vertexLayoutFlags, ID3D11InputLayout *inputLayout)
+	{
+		memcpy(m_cachedLegacyState, &state, sizeof(state));
+		m_cachedLegacyVertexFormat = vertexFormat;
+		m_cachedLegacyTexturePresenceMask = texturePresenceMask;
+		m_cachedLegacyCubeTextureMask = m_boundCubeTextureMask;
+		m_cachedLegacyVertexLayoutFlags = vertexLayoutFlags;
+		m_cachedLegacyInputLayout = inputLayout;
+		m_cachedLegacyStateValid = true;
+	}
+
 	void invalidatePipelineBindings()
 	{
 		m_pipelineStateValid = false;
 		m_pipelineBound = false;
+		m_cachedLegacyStateValid = false;
 		m_transformConstantsValid = false;
 		m_transformConstantsChanged = true;
 	}
@@ -4572,6 +4607,13 @@ private:
 	ID3D11PixelShader *m_boundPixelShader;
 	ID3D11SamplerState *m_boundSamplerStates[LEGACY_TEXTURE_STAGE_COUNT];
 	bool m_pipelineHasTextures;
+	unsigned char m_cachedLegacyState[sizeof(LegacyLogicalState)];
+	bool m_cachedLegacyStateValid;
+	LegacyVertexFormat m_cachedLegacyVertexFormat;
+	unsigned int m_cachedLegacyTexturePresenceMask;
+	unsigned int m_cachedLegacyCubeTextureMask;
+	unsigned int m_cachedLegacyVertexLayoutFlags;
+	ID3D11InputLayout *m_cachedLegacyInputLayout;
 	LegacyTransformConstants m_lastTransformConstants;
 	bool m_transformConstantsValid;
 	bool m_transformConstantsChanged;
