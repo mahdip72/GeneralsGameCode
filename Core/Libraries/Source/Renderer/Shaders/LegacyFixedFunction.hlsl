@@ -812,7 +812,7 @@ float4 PSTextured(TexturedVertexOutput input) : SV_TARGET
 		float4(0.0f, 0.0f, 0.0f, 0.0f),
 		float4(0.0f, 0.0f, 0.0f, 0.0f)
 	};
-	[unroll]
+	[loop]
 	for (uint stage = 0; stage < 8; ++stage)
 	{
 		const uint colorOperation = TextureColorParameters[stage].x;

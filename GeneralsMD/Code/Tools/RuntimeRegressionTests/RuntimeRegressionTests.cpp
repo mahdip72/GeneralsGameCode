@@ -21,10 +21,12 @@
 #include "Common/PathfindQueueReplayEpoch.h"
 #include "GameLogic/SkirmishAIDecision.h"
 #include "GameLogic/SkirmishAILiveness.h"
+#include "WW3D2/textureloader.h"
 
 #include <stdio.h>
 #include <string.h>
 #include <windows.h>
+#include <mmsystem.h>
 
 
 class Win32Mouse;
@@ -56,6 +58,71 @@ static void Check(Bool result, const char *expression, Int line)
 		printf("FAIL line %d: %s\n", line, expression);
 		++s_failures;
 	}
+}
+
+static void TestTextureLoadQueuePublication()
+{
+	SynchronizedTextureLoadTaskListClass queue;
+	TextureLoadTaskClass lowPending;
+	TextureLoadTaskClass readyFirst;
+	TextureLoadTaskClass readySecond;
+	TextureLoadTaskClass highPending;
+
+	queue.Push_Back(&lowPending);
+	CHECK(readyFirst.Begin_Async_Prepare());
+	readyFirst.Set_State(TextureLoadTaskClass::STATE_LOAD_MIPMAP);
+	queue.Publish_Completed(&readyFirst);
+	CHECK(readySecond.Begin_Async_Prepare());
+	readySecond.Set_State(TextureLoadTaskClass::STATE_LOAD_COMPLETE);
+	queue.Publish_Failed(&readySecond);
+	highPending.Set_Priority(TextureLoadTaskClass::PRIORITY_HIGH);
+	queue.Push_Front(&highPending);
+
+	CHECK(readyFirst.Is_Async_Prepare_Complete());
+	CHECK(readySecond.Is_Async_Prepare_Complete());
+	CHECK(readySecond.Get_State() == TextureLoadTaskClass::STATE_LOAD_MIPMAP);
+	CHECK(queue.Pop_Front() == &highPending);
+	CHECK(queue.Pop_Front() == &readyFirst);
+	CHECK(queue.Pop_Front() == &readySecond);
+	CHECK(queue.Pop_Front() == &lowPending);
+	CHECK(queue.Is_Empty());
+
+	TextureLoadTaskClass promotedReady;
+	TextureLoadTaskClass pendingAfterPromotion;
+	queue.Push_Back(&pendingAfterPromotion);
+	CHECK(promotedReady.Begin_Async_Prepare());
+	promotedReady.Set_State(TextureLoadTaskClass::STATE_LOAD_MIPMAP);
+	queue.Publish_Completed(&promotedReady);
+	CHECK(queue.Promote_Prepare_Job(&promotedReady));
+	CHECK(promotedReady.Get_Priority() == TextureLoadTaskClass::PRIORITY_HIGH);
+	CHECK(queue.Pop_Front() == &promotedReady);
+	CHECK(queue.Pop_Front() == &pendingAfterPromotion);
+
+	TextureLoadTaskClass promotedBeforePublication;
+	TextureLoadTaskClass lowReady;
+	CHECK(lowReady.Begin_Async_Prepare());
+	lowReady.Set_State(TextureLoadTaskClass::STATE_LOAD_MIPMAP);
+	queue.Publish_Completed(&lowReady);
+	promotedBeforePublication.Set_Priority(TextureLoadTaskClass::PRIORITY_HIGH);
+	CHECK(promotedBeforePublication.Begin_Async_Prepare());
+	promotedBeforePublication.Set_State(TextureLoadTaskClass::STATE_LOAD_MIPMAP);
+	queue.Publish_Completed(&promotedBeforePublication);
+	CHECK(queue.Pop_Front() == &promotedBeforePublication);
+	CHECK(queue.Pop_Front() == &lowReady);
+
+	TextureLoadTaskClass removableReady;
+	CHECK(removableReady.Begin_Async_Prepare());
+	removableReady.Set_State(TextureLoadTaskClass::STATE_LOAD_MIPMAP);
+	queue.Publish_Completed(&removableReady);
+	queue.Remove(&removableReady);
+	CHECK(queue.Is_Empty());
+
+	TextureLoadTaskClass backReady;
+	CHECK(backReady.Begin_Async_Prepare());
+	backReady.Set_State(TextureLoadTaskClass::STATE_LOAD_MIPMAP);
+	queue.Publish_Completed(&backReady);
+	CHECK(queue.Pop_Back() == &backReady);
+	CHECK(queue.Is_Empty());
 }
 
 static void TestNetworkValidation()
@@ -945,6 +1012,19 @@ static void TestSkirmishAITestRunnerContract()
 int main(int argc, char **argv)
 {
 	initMemoryManager();
+	if (argc == 2 && strcmp(argv[1], "--texture-load-queue-contract") == 0)
+	{
+		TestTextureLoadQueuePublication();
+		if (s_failures != 0)
+		{
+			printf("%d texture load queue contract test(s) failed.\n", s_failures);
+			shutdownMemoryManager();
+			return 1;
+		}
+		printf("All texture load queue contract tests passed.\n");
+		shutdownMemoryManager();
+		return 0;
+	}
 	if (argc == 2 && strcmp(argv[1], "--skirmish-ai-runner-contract") == 0)
 	{
 		TestSkirmishAITestRunnerContract();

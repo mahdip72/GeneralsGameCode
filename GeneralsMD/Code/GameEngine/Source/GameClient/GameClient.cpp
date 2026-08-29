@@ -185,11 +185,6 @@ GameClient::~GameClient()
 	delete TheWindowManager;
 	TheWindowManager = nullptr;
 
-	// delete the font library
-	TheFontLibrary->reset();
-	delete TheFontLibrary;
-	TheFontLibrary = nullptr;
-
 	TheMouse->reset();
 	delete TheMouse;
 	TheMouse = nullptr;
@@ -201,6 +196,11 @@ GameClient::~GameClient()
 	// destroy the terrain visual representation
 	delete TheTerrainVisual;
 	TheTerrainVisual = nullptr;
+
+	// Snow owns D3D resources and must be destroyed while the display still
+	// owns a live graphics runtime.
+	delete TheSnowManager;
+	TheSnowManager = nullptr;
 
 	// destroy the display
 	delete TheDisplay;
@@ -233,11 +233,13 @@ GameClient::~GameClient()
 	delete TheDisplayStringManager;
 	TheDisplayStringManager = nullptr;
 
+	// Display strings retain fonts; destroy their manager before the library.
+	TheFontLibrary->reset();
+	delete TheFontLibrary;
+	TheFontLibrary = nullptr;
+
 	delete TheEva;
 	TheEva = nullptr;
-
-	delete TheSnowManager;
-	TheSnowManager = nullptr;
 
 }
 

@@ -27,3 +27,6 @@ set_tests_properties(z_skirmish_ai_replay_epoch_tests PROPERTIES TIMEOUT 30)
 
 add_test(NAME z_skirmish_ai_runner_contract_tests COMMAND z_runtime_regression_tests --skirmish-ai-runner-contract)
 set_tests_properties(z_skirmish_ai_runner_contract_tests PROPERTIES TIMEOUT 30)
+
+add_test(NAME z_texture_load_queue_contract_tests COMMAND z_runtime_regression_tests --texture-load-queue-contract)
+set_tests_properties(z_texture_load_queue_contract_tests PROPERTIES TIMEOUT 30)

@@ -56,6 +56,12 @@ W3DDisplayStringManager::W3DDisplayStringManager()
 //-------------------------------------------------------------------------------------------------
 W3DDisplayStringManager::~W3DDisplayStringManager()
 {
+	releaseGraphicsResources();
+}
+
+//-------------------------------------------------------------------------------------------------
+void W3DDisplayStringManager::releaseGraphicsResources()
+{
 	for (Int i = 0; i < MAX_GROUPS; ++i)
 	{
 		if (m_groupNumeralStrings[i])
@@ -66,8 +72,6 @@ W3DDisplayStringManager::~W3DDisplayStringManager()
 	if (m_formationLetterDisplayString)
 		freeDisplayString( m_formationLetterDisplayString );
 	m_formationLetterDisplayString = nullptr;
-
-
 }
 
 //-------------------------------------------------------------------------------------------------

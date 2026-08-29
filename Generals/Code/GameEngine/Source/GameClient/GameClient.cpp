@@ -180,11 +180,6 @@ GameClient::~GameClient()
 	delete TheWindowManager;
 	TheWindowManager = nullptr;
 
-	// delete the font library
-	TheFontLibrary->reset();
-	delete TheFontLibrary;
-	TheFontLibrary = nullptr;
-
 	TheMouse->reset();
 	delete TheMouse;
 	TheMouse = nullptr;
@@ -227,6 +222,11 @@ GameClient::~GameClient()
 
 	delete TheDisplayStringManager;
 	TheDisplayStringManager = nullptr;
+
+	// Display strings retain fonts; destroy their manager before the library.
+	TheFontLibrary->reset();
+	delete TheFontLibrary;
+	TheFontLibrary = nullptr;
 
 	delete TheEva;
 	TheEva = nullptr;
