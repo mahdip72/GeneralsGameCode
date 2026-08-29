@@ -792,13 +792,19 @@ float4 ApplyLegacyPixelProgram(TexturedVertexOutput input)
 	return input.color;
 }
 
+#ifndef LEGACY_ACTIVE_TEXTURE_STAGE_COUNT
+#define LEGACY_ACTIVE_TEXTURE_STAGE_COUNT 8
+#endif
+
 float4 PSTextured(TexturedVertexOutput input) : SV_TARGET
 {
+#if !defined(LEGACY_FIXED_FUNCTION_ONLY)
 	if (LightingParameters.z >= 3U)
 	{
 		return ApplyLegacyPixelState(saturate(ApplyLegacyPixelProgram(input)),
 			input.fogDepth);
 	}
+#endif
 	float4 current = input.color;
 	float4 temporary = 0.0f;
 	bool premodulateCurrent = false;
@@ -812,8 +818,12 @@ float4 PSTextured(TexturedVertexOutput input) : SV_TARGET
 		float4(0.0f, 0.0f, 0.0f, 0.0f),
 		float4(0.0f, 0.0f, 0.0f, 0.0f)
 	};
+#if defined(LEGACY_FIXED_FUNCTION_ONLY)
+	[unroll]
+#else
 	[loop]
-	for (uint stage = 0; stage < 8; ++stage)
+#endif
+	for (uint stage = 0; stage < LEGACY_ACTIVE_TEXTURE_STAGE_COUNT; ++stage)
 	{
 		const uint colorOperation = TextureColorParameters[stage].x;
 		if (colorOperation == 0)
@@ -835,7 +845,7 @@ float4 PSTextured(TexturedVertexOutput input) : SV_TARGET
 			current * textureSample : current;
 		if (colorOperation == 16 || colorOperation == 17)
 		{
-			if (stage + 1 < 8)
+			if (stage + 1 < LEGACY_ACTIVE_TEXTURE_STAGE_COUNT)
 			{
 				const float2 bump = textureSample.rg * 2.0f - 1.0f;
 				coordinateOffsets[stage + 1].xy += float2(

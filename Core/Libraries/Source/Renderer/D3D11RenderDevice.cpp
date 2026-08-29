@@ -11,6 +11,8 @@
 #include "LegacyWaterRiverPS.h"
 #include "LegacySeaWaveVS.h"
 #include "LegacySeaWavePS.h"
+#include "LegacyTexturedFixed1PS.h"
+#include "LegacyTexturedFixed2PS.h"
 #include "LegacyTexturedPS.h"
 #include "LegacyTexturedVS.h"
 
@@ -425,6 +427,19 @@ bool IsSeaWaveVertexLayout(const LegacyVertexLayout &layout)
 		texture.byteOffset == 16;
 }
 
+unsigned int CountActiveFixedFunctionStages(
+	const LegacyPipelineState &pipeline)
+{
+	unsigned int count = 0;
+	while (count < LEGACY_TEXTURE_STAGE_COUNT &&
+		pipeline.textureStages[count].colorOperation !=
+			RENDER_TEXTURE_OP_DISABLE)
+	{
+		++count;
+	}
+	return count;
+}
+
 class D3D11RenderDevice : public IRenderDevice, public IRenderContext
 {
 public:
@@ -435,6 +450,7 @@ public:
 		m_activeColorResource(0), m_activeDepthResource(0),
 		m_vertexShader(0), m_pixelShader(0), m_positionColorLayout(0),
 		m_texturedVertexShader(0), m_texturedPixelShader(0),
+		m_texturedFixed1PixelShader(0), m_texturedFixed2PixelShader(0),
 		m_waterFlatPixelShader(0), m_waterRiverPixelShader(0),
 		m_seaWaveVertexShader(0), m_seaWavePixelShader(0),
 		m_seaWaveLayout(0),
@@ -2070,6 +2086,20 @@ public:
 			m_seaWavePixelShader : (useFullPipeline ?
 			m_texturedPixelShader : m_pixelShader);
 		if (useFullPipeline && state.pipeline.pixelProgram ==
+			RENDER_LEGACY_PIXEL_FIXED_FUNCTION)
+		{
+			const unsigned int activeStages =
+				CountActiveFixedFunctionStages(state.pipeline);
+			if (activeStages <= 1)
+			{
+				pixelShader = m_texturedFixed1PixelShader;
+			}
+			else if (activeStages == 2)
+			{
+				pixelShader = m_texturedFixed2PixelShader;
+			}
+		}
+		if (useFullPipeline && state.pipeline.pixelProgram ==
 			RENDER_LEGACY_PIXEL_WATER_FLAT)
 		{
 			pixelShader = m_waterFlatPixelShader;
@@ -2931,6 +2961,18 @@ private:
 		}
 	result = m_device->CreatePixelShader(g_LegacyTexturedPS,
 		 sizeof(g_LegacyTexturedPS), 0, &m_texturedPixelShader);
+	if (FAILED(result))
+	{
+		return result;
+	}
+	result = m_device->CreatePixelShader(g_LegacyTexturedFixed1PS,
+		sizeof(g_LegacyTexturedFixed1PS), 0, &m_texturedFixed1PixelShader);
+	if (FAILED(result))
+	{
+		return result;
+	}
+	result = m_device->CreatePixelShader(g_LegacyTexturedFixed2PS,
+		sizeof(g_LegacyTexturedFixed2PS), 0, &m_texturedFixed2PixelShader);
 	if (FAILED(result))
 	{
 		return result;
@@ -4372,6 +4414,16 @@ private:
 			m_texturedPixelShader->Release();
 			m_texturedPixelShader = 0;
 		}
+		if (m_texturedFixed2PixelShader != 0)
+		{
+			m_texturedFixed2PixelShader->Release();
+			m_texturedFixed2PixelShader = 0;
+		}
+		if (m_texturedFixed1PixelShader != 0)
+		{
+			m_texturedFixed1PixelShader->Release();
+			m_texturedFixed1PixelShader = 0;
+		}
 		if (m_texturedVertexShader != 0)
 		{
 			m_texturedVertexShader->Release();
@@ -4474,6 +4526,8 @@ private:
 	ID3D11InputLayout *m_positionColorLayout;
 	ID3D11VertexShader *m_texturedVertexShader;
 	ID3D11PixelShader *m_texturedPixelShader;
+	ID3D11PixelShader *m_texturedFixed1PixelShader;
+	ID3D11PixelShader *m_texturedFixed2PixelShader;
 	ID3D11PixelShader *m_waterFlatPixelShader;
 	ID3D11PixelShader *m_waterRiverPixelShader;
 	ID3D11VertexShader *m_seaWaveVertexShader;
