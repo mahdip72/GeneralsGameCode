@@ -55,6 +55,7 @@ using rts::render::LegacyVertexDataFormat;
 using rts::render::LegacyVertexElement;
 using rts::render::LegacyVertexLayout;
 using rts::render::RenderResult;
+using rts::render::RenderBufferUpdateMode;
 using rts::render::RenderTargetBinding;
 using rts::render::TextureDescriptor;
 using rts::render::TextureSubresourceData;
@@ -253,12 +254,18 @@ struct D3D11LegacyBridge::Impl
 	struct BufferEntry
 	{
 		BufferEntry() : source(0), byte_count(0), source_generation(0),
-			source_dirty(true),
+			source_dirty(true), raw_range_valid(false), raw_range_offset(0),
+			raw_range_bytes(0), raw_range_mode(
+				rts::render::RENDER_BUFFER_UPDATE_PRESERVE),
 			last_used_frame(0), handle() {}
 		IUnknown *source;
 		size_t byte_count;
 		unsigned int source_generation;
 		bool source_dirty;
+		bool raw_range_valid;
+		size_t raw_range_offset;
+		size_t raw_range_bytes;
+		rts::render::RenderBufferUpdateMode raw_range_mode;
 		unsigned int last_used_frame;
 		GpuHandle handle;
 	};
@@ -406,6 +413,16 @@ struct D3D11LegacyBridge::Impl
 		return Fail(rts::render::RENDER_RESULT_FAILED, message);
 	}
 
+	void Invalidate_GPU_Copy_Content()
+	{
+		for (unsigned int index = 0; index < textures.size(); ++index)
+		{
+			textures[index].gpu_copy_valid = false;
+			textures[index].gpu_copy_frame = 0;
+			textures[index].gpu_copy_lease_epoch = 0;
+		}
+	}
+
 	RenderResult Recover_Device()
 	{
 		// A target transition requested while no frame was open is deliberately
@@ -422,13 +439,9 @@ struct D3D11LegacyBridge::Impl
 			target_transition_failed = true;
 			return recovery_result;
 		}
-		for (unsigned int index = 0; index < textures.size(); ++index)
-		{
-			// GPU-only render-to-texture contents are not reconstructible by the
-			// render device. Their owners must regenerate them after recovery.
-			textures[index].gpu_copy_valid = false;
-			textures[index].gpu_copy_lease_epoch = 0;
-		}
+		// GPU-only render-to-texture contents are not reconstructible by the
+		// render device. Their owners must regenerate them after recovery.
+		Invalidate_GPU_Copy_Content();
 		context = device->immediateContext();
 		if (context == 0)
 		{
@@ -694,6 +707,7 @@ struct D3D11LegacyBridge::Impl
 		const unsigned int source_generation = vertex_buffer->Get_Generation();
 		BufferEntry *entry = Find_Buffer(vertex_buffers, vertex_buffer_index,
 			source);
+		const bool created_entry = entry == 0;
 		if (entry == 0)
 		{
 			if (vertex_buffers.size() >= BUFFER_CACHE_CAPACITY)
@@ -743,25 +757,57 @@ struct D3D11LegacyBridge::Impl
 		{
 			return Fail("draw failure: vertex buffer size changed");
 		}
-		if (!rts::render::LegacyBridgeTypedBufferNeedsUpload(
+		if (!entry->source_dirty &&
+			!rts::render::LegacyBridgeTypedBufferNeedsUpload(
 			entry->source_generation, source_generation))
 		{
 			*handle = entry->handle;
 			return true;
 		}
+		size_t upload_offset = 0;
+		size_t upload_bytes = byte_count;
+		RenderBufferUpdateMode update_mode =
+			rts::render::RENDER_BUFFER_UPDATE_PRESERVE;
+		if (!created_entry && !entry->source_dirty &&
+			vertex_buffer->Type() == BUFFER_TYPE_DYNAMIC_DX8)
+		{
+			unsigned int change_offset = 0;
+			unsigned int change_count = 0;
+			unsigned int change_flags = 0;
+			if (vertex_buffer->Get_Change_Since(entry->source_generation,
+				&change_offset, &change_count, &change_flags) &&
+				change_offset <= vertex_buffer->Get_Vertex_Count() &&
+				change_count <= vertex_buffer->Get_Vertex_Count() - change_offset)
+			{
+				upload_offset = static_cast<size_t>(change_offset) *
+					vertex_buffer->FVF_Info().Get_FVF_Size();
+				upload_bytes = static_cast<size_t>(change_count) *
+					vertex_buffer->FVF_Info().Get_FVF_Size();
+				if ((change_flags & D3DLOCK_DISCARD) != 0 && upload_offset == 0)
+				{
+					update_mode = rts::render::RENDER_BUFFER_UPDATE_DISCARD;
+				}
+				else if ((change_flags & D3DLOCK_NOOVERWRITE) != 0)
+				{
+					update_mode = rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE;
+				}
+			}
+		}
 		unsigned char *data = 0;
-		HRESULT result = source->Lock(0, static_cast<UINT>(byte_count),
+		HRESULT result = source->Lock(static_cast<UINT>(upload_offset),
+			static_cast<UINT>(upload_bytes),
 			&data, D3DLOCK_READONLY);
 		if (FAILED(result))
 		{
-			result = source->Lock(0, static_cast<UINT>(byte_count), &data, 0);
+			result = source->Lock(static_cast<UINT>(upload_offset),
+				static_cast<UINT>(upload_bytes), &data, 0);
 		}
 		if (FAILED(result) || data == 0)
 		{
 			return Fail("draw failure: legacy vertex buffer lock");
 		}
 		const RenderResult upload_result = context->updateBuffer(entry->handle,
-			data, byte_count, 0);
+			data, upload_bytes, upload_offset, update_mode);
 		source->Unlock();
 		if (upload_result != rts::render::RENDER_RESULT_OK)
 		{
@@ -770,6 +816,7 @@ struct D3D11LegacyBridge::Impl
 		}
 		cache_counters.RecordBufferUpload();
 		entry->source_generation = source_generation;
+		entry->source_dirty = false;
 		*handle = entry->handle;
 		return true;
 	}
@@ -789,6 +836,7 @@ struct D3D11LegacyBridge::Impl
 		const unsigned int source_generation = index_buffer->Get_Generation();
 		BufferEntry *entry = Find_Buffer(index_buffers, index_buffer_index,
 			source);
+		const bool created_entry = entry == 0;
 		if (entry == 0)
 		{
 			if (index_buffers.size() >= BUFFER_CACHE_CAPACITY)
@@ -838,25 +886,57 @@ struct D3D11LegacyBridge::Impl
 		{
 			return Fail("draw failure: index buffer size changed");
 		}
-		if (!rts::render::LegacyBridgeTypedBufferNeedsUpload(
+		if (!entry->source_dirty &&
+			!rts::render::LegacyBridgeTypedBufferNeedsUpload(
 			entry->source_generation, source_generation))
 		{
 			*handle = entry->handle;
 			return true;
 		}
+		size_t upload_offset = 0;
+		size_t upload_bytes = byte_count;
+		RenderBufferUpdateMode update_mode =
+			rts::render::RENDER_BUFFER_UPDATE_PRESERVE;
+		if (!created_entry && !entry->source_dirty &&
+			index_buffer->Type() == BUFFER_TYPE_DYNAMIC_DX8)
+		{
+			unsigned int change_offset = 0;
+			unsigned int change_count = 0;
+			unsigned int change_flags = 0;
+			if (index_buffer->Get_Change_Since(entry->source_generation,
+				&change_offset, &change_count, &change_flags) &&
+				change_offset <= index_buffer->Get_Index_Count() &&
+				change_count <= index_buffer->Get_Index_Count() - change_offset)
+			{
+				upload_offset = static_cast<size_t>(change_offset) *
+					sizeof(unsigned short);
+				upload_bytes = static_cast<size_t>(change_count) *
+					sizeof(unsigned short);
+				if ((change_flags & D3DLOCK_DISCARD) != 0 && upload_offset == 0)
+				{
+					update_mode = rts::render::RENDER_BUFFER_UPDATE_DISCARD;
+				}
+				else if ((change_flags & D3DLOCK_NOOVERWRITE) != 0)
+				{
+					update_mode = rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE;
+				}
+			}
+		}
 		unsigned char *data = 0;
-		HRESULT result = source->Lock(0, static_cast<UINT>(byte_count),
+		HRESULT result = source->Lock(static_cast<UINT>(upload_offset),
+			static_cast<UINT>(upload_bytes),
 			&data, D3DLOCK_READONLY);
 		if (FAILED(result))
 		{
-			result = source->Lock(0, static_cast<UINT>(byte_count), &data, 0);
+			result = source->Lock(static_cast<UINT>(upload_offset),
+				static_cast<UINT>(upload_bytes), &data, 0);
 		}
 		if (FAILED(result) || data == 0)
 		{
 			return Fail("draw failure: legacy index buffer lock");
 		}
 		const RenderResult upload_result = context->updateBuffer(entry->handle,
-			data, byte_count, 0);
+			data, upload_bytes, upload_offset, update_mode);
 		source->Unlock();
 		if (upload_result != rts::render::RENDER_RESULT_OK)
 		{
@@ -865,6 +945,7 @@ struct D3D11LegacyBridge::Impl
 		}
 		cache_counters.RecordBufferUpload();
 		entry->source_generation = source_generation;
+		entry->source_dirty = false;
 		*handle = entry->handle;
 		return true;
 	}
@@ -942,18 +1023,33 @@ struct D3D11LegacyBridge::Impl
 		}
 
 		unsigned char *data = 0;
-		HRESULT result = source->Lock(0, descriptor8.Size, &data,
+		size_t upload_offset = 0;
+		size_t upload_bytes = descriptor8.Size;
+		RenderBufferUpdateMode update_mode =
+			rts::render::RENDER_BUFFER_UPDATE_PRESERVE;
+		if (entry->raw_range_valid &&
+			entry->raw_range_offset <= descriptor8.Size &&
+			entry->raw_range_bytes <=
+				descriptor8.Size - entry->raw_range_offset)
+		{
+			upload_offset = entry->raw_range_offset;
+			upload_bytes = entry->raw_range_bytes;
+			update_mode = entry->raw_range_mode;
+		}
+		HRESULT result = source->Lock(static_cast<UINT>(upload_offset),
+			static_cast<UINT>(upload_bytes), &data,
 			D3DLOCK_READONLY);
 		if (FAILED(result))
 		{
-			result = source->Lock(0, descriptor8.Size, &data, 0);
+			result = source->Lock(static_cast<UINT>(upload_offset),
+				static_cast<UINT>(upload_bytes), &data, 0);
 		}
 		if (FAILED(result) || data == 0)
 		{
 			return Fail("raw draw failure: vertex buffer lock");
 		}
 		const RenderResult upload_result = context->updateBuffer(entry->handle,
-			data, *byte_count, 0);
+			data, upload_bytes, upload_offset, update_mode);
 		source->Unlock();
 		if (upload_result != rts::render::RENDER_RESULT_OK)
 		{
@@ -962,6 +1058,7 @@ struct D3D11LegacyBridge::Impl
 		}
 		cache_counters.RecordBufferUpload();
 		entry->source_dirty = false;
+		entry->raw_range_valid = false;
 		*handle = entry->handle;
 		return true;
 	}
@@ -1044,18 +1141,33 @@ struct D3D11LegacyBridge::Impl
 		}
 
 		unsigned char *data = 0;
-		HRESULT result = source->Lock(0, descriptor8.Size, &data,
+		size_t upload_offset = 0;
+		size_t upload_bytes = descriptor8.Size;
+		RenderBufferUpdateMode update_mode =
+			rts::render::RENDER_BUFFER_UPDATE_PRESERVE;
+		if (entry->raw_range_valid &&
+			entry->raw_range_offset <= descriptor8.Size &&
+			entry->raw_range_bytes <=
+				descriptor8.Size - entry->raw_range_offset)
+		{
+			upload_offset = entry->raw_range_offset;
+			upload_bytes = entry->raw_range_bytes;
+			update_mode = entry->raw_range_mode;
+		}
+		HRESULT result = source->Lock(static_cast<UINT>(upload_offset),
+			static_cast<UINT>(upload_bytes), &data,
 			D3DLOCK_READONLY);
 		if (FAILED(result))
 		{
-			result = source->Lock(0, descriptor8.Size, &data, 0);
+			result = source->Lock(static_cast<UINT>(upload_offset),
+				static_cast<UINT>(upload_bytes), &data, 0);
 		}
 		if (FAILED(result) || data == 0)
 		{
 			return Fail("raw draw failure: index buffer lock");
 		}
 		const RenderResult upload_result = context->updateBuffer(entry->handle,
-			data, *byte_count, 0);
+			data, upload_bytes, upload_offset, update_mode);
 		source->Unlock();
 		if (upload_result != rts::render::RENDER_RESULT_OK)
 		{
@@ -1064,6 +1176,7 @@ struct D3D11LegacyBridge::Impl
 		}
 		cache_counters.RecordBufferUpload();
 		entry->source_dirty = false;
+		entry->raw_range_valid = false;
 		*handle = entry->handle;
 		return true;
 	}
@@ -1297,7 +1410,8 @@ struct D3D11LegacyBridge::Impl
 			return false;
 		}
 		const RenderResult upload_result = context->updateBuffer(*handle,
-			vertex_data, byte_count, 0);
+			vertex_data, byte_count, 0,
+			rts::render::RENDER_BUFFER_UPDATE_DISCARD);
 		if (upload_result != rts::render::RENDER_RESULT_OK)
 		{
 			return Fail(upload_result,
@@ -2356,6 +2470,10 @@ bool D3D11LegacyBridge::Initialize(HWND window,
 	parameters.width = width;
 	parameters.height = height;
 	parameters.enableVsync = enable_vsync;
+	// The installed product must never degrade to WARP silently.  A software
+	// device at high resolution can look like a renderer hang while producing
+	// only a few frames per second; fail initialization clearly instead.
+	parameters.allowSoftwareFallback = false;
 #ifdef _DEBUG
 	parameters.enableDebugLayer = true;
 #else
@@ -2386,6 +2504,16 @@ bool D3D11LegacyBridge::Initialize(HWND window,
 	m_impl->pending_target_change = false;
 	m_impl->target_transition_failed = false;
 	m_impl->Log("D3D11 legacy bridge initialized");
+	rts::render::RenderBackBufferInfo back_buffer_info;
+	if (m_impl->device->getBackBufferInfo(&back_buffer_info) ==
+		rts::render::RENDER_RESULT_OK && m_impl->log_file != 0)
+	{
+		fprintf(m_impl->log_file,
+			"D3D11 hardware renderer back buffer: %ux%u format=%u\n",
+			back_buffer_info.width, back_buffer_info.height,
+			static_cast<unsigned int>(back_buffer_info.format));
+		fflush(m_impl->log_file);
+	}
 	if (m_impl->context == 0)
 	{
 		m_impl->Log("D3D11 immediate context is unavailable");
@@ -2481,6 +2609,34 @@ void D3D11LegacyBridge::Shutdown()
 	m_impl->pending_target_change = false;
 	m_impl->target_transition_failed = true;
 	m_impl->owner_thread_id = 0;
+}
+
+bool D3D11LegacyBridge::Prepare_Legacy_Device_Reset()
+{
+	if (!Is_Active())
+	{
+		return false;
+	}
+	m_impl->Require_Owner_Thread("legacy device reset");
+	if (m_impl->frame_open)
+	{
+		rts::render::RenderFrameOutcome outcome;
+		End_Frame(false, &outcome);
+		if (!Is_Active() || !outcome.isOperational())
+		{
+			return false;
+		}
+	}
+	m_impl->capture_queue.advanceGeneration();
+	m_impl->capture_queue.cancelStale(rts::render::RENDER_RESULT_FAILED);
+	m_impl->active_target = RenderTargetBinding();
+	m_impl->pending_target = RenderTargetBinding();
+	m_impl->pending_target_change = false;
+	m_impl->target_transition_failed = false;
+	m_impl->pending_viewport = false;
+	m_impl->pending_clear = false;
+	m_impl->Release_Caches();
+	return Is_Active();
 }
 
 bool D3D11LegacyBridge::Is_Active() const
@@ -3041,29 +3197,11 @@ rts::render::RenderResult D3D11LegacyBridge::Set_Render_Target_Surfaces(
 			target_result);
 		return target_result;
 	}
-	// The DX8 render-to-texture path historically passes the surface returned by
-	// GetDepthStencilSurface explicitly.  That surface is the swap-chain depth
-	// buffer, not a texture-backed depth target.  Do not send it through
-	// Ensure_Depth_Target: a swap-chain depth surface has no texture container
-	// and must map to the D3D11 device's back-buffer depth view instead.
-	//
-	// Keep this identity check in the bridge as a defensive boundary as well as
-	// in DX8Wrapper's tracked state.  It covers legacy callers which still pass
-	// the default surface through the two-surface overload while preserving
-	// texture-backed custom depth surfaces.
-	bool effective_default_depth = use_default_depth;
-	if (!effective_default_depth && depth_surface != 0 &&
-		m_impl->legacy_device != 0)
-	{
-		IDirect3DSurface8 *bound_depth_surface = 0;
-		if (SUCCEEDED(m_impl->legacy_device->GetDepthStencilSurface(
-			&bound_depth_surface)))
-		{
-			effective_default_depth = bound_depth_surface == depth_surface;
-			bound_depth_surface->Release();
-		}
-	}
-	if (effective_default_depth)
+	// DX8Wrapper determines this identity before changing the native binding.
+	// Re-querying the device here would only observe the newly requested custom
+	// surface and would incorrectly classify every explicit depth target as the
+	// swap-chain depth buffer.
+	if (use_default_depth)
 	{
 		binding.useBackBufferDepth = true;
 	}
@@ -3104,13 +3242,237 @@ void D3D11LegacyBridge::Invalidate_Buffer(IUnknown *buffer)
 	if (vertex_entry != 0)
 	{
 		vertex_entry->source_dirty = true;
+		vertex_entry->raw_range_valid = false;
 	}
 	Impl::BufferEntry *index_entry = m_impl->Find_Buffer(
 		m_impl->index_buffers, m_impl->index_buffer_index, buffer, false);
 	if (index_entry != 0)
 	{
 		index_entry->source_dirty = true;
+		index_entry->raw_range_valid = false;
 	}
+}
+
+void D3D11LegacyBridge::Invalidate_Buffer_Range(IUnknown *buffer,
+	unsigned int binding, size_t destination_offset, size_t byte_count,
+	rts::render::RenderBufferUpdateMode mode)
+{
+	if (!Is_Active() || buffer == 0 || byte_count == 0)
+	{
+		return;
+	}
+	Impl::BufferEntry *entry = 0;
+	if (binding == rts::render::RENDER_BUFFER_VERTEX)
+	{
+		entry = m_impl->Find_Buffer(m_impl->vertex_buffers,
+			m_impl->vertex_buffer_index, buffer, false);
+	}
+	else if (binding == rts::render::RENDER_BUFFER_INDEX)
+	{
+		entry = m_impl->Find_Buffer(m_impl->index_buffers,
+			m_impl->index_buffer_index, buffer, false);
+	}
+	if (entry == 0)
+	{
+		return;
+	}
+	if (destination_offset > entry->byte_count ||
+		byte_count > entry->byte_count - destination_offset ||
+		(mode != rts::render::RENDER_BUFFER_UPDATE_DISCARD &&
+		 mode != rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE) ||
+		(mode == rts::render::RENDER_BUFFER_UPDATE_DISCARD &&
+		 destination_offset != 0))
+	{
+		entry->source_dirty = true;
+		entry->raw_range_valid = false;
+		return;
+	}
+
+	if (mode == rts::render::RENDER_BUFFER_UPDATE_DISCARD)
+	{
+		entry->source_dirty = true;
+		entry->raw_range_valid = true;
+		entry->raw_range_offset = 0;
+		entry->raw_range_bytes = byte_count;
+		entry->raw_range_mode = mode;
+		return;
+	}
+
+	if (!entry->source_dirty)
+	{
+		entry->source_dirty = true;
+		entry->raw_range_valid = true;
+		entry->raw_range_offset = destination_offset;
+		entry->raw_range_bytes = byte_count;
+		entry->raw_range_mode = mode;
+		return;
+	}
+	if (!entry->raw_range_valid)
+	{
+		return;
+	}
+	const size_t previous_end = entry->raw_range_offset +
+		entry->raw_range_bytes;
+	const size_t changed_end = destination_offset + byte_count;
+	if (destination_offset > previous_end ||
+		changed_end < entry->raw_range_offset)
+	{
+		// A gap could contain bytes that the GPU is still consuming.  Preserve
+		// the conservative full-copy path instead of rewriting that gap while
+		// coalescing unrelated NO_OVERWRITE updates.
+		entry->raw_range_valid = false;
+		return;
+	}
+	const size_t combined_start = destination_offset < entry->raw_range_offset ?
+		destination_offset : entry->raw_range_offset;
+	const size_t combined_end = changed_end > previous_end ?
+		changed_end : previous_end;
+	entry->raw_range_offset = combined_start;
+	entry->raw_range_bytes = combined_end - combined_start;
+}
+
+bool D3D11LegacyBridge::Publish_Buffer_Change(IUnknown *buffer,
+	unsigned int binding, const void *data, size_t byte_count,
+	size_t destination_offset, rts::render::RenderBufferUpdateMode mode,
+	unsigned int source_generation)
+{
+	if (!Is_Active() || !m_impl->frame_open || buffer == 0 || data == 0 ||
+		byte_count == 0)
+	{
+		return false;
+	}
+	m_impl->Require_Owner_Thread("legacy buffer publication");
+	std::vector<Impl::BufferEntry> *entries = 0;
+	rts::render::LegacyBridgePointerIndex *cache_index = 0;
+	Impl::BufferEntry *entry = 0;
+	if (binding == rts::render::RENDER_BUFFER_VERTEX)
+	{
+		entries = &m_impl->vertex_buffers;
+		cache_index = &m_impl->vertex_buffer_index;
+	}
+	else if (binding == rts::render::RENDER_BUFFER_INDEX)
+	{
+		entries = &m_impl->index_buffers;
+		cache_index = &m_impl->index_buffer_index;
+	}
+	else
+	{
+		return false;
+	}
+	entry = m_impl->Find_Buffer(*entries, *cache_index, buffer, false);
+	if (entry == 0)
+	{
+		size_t source_byte_count = 0;
+		unsigned int source_stride = 1;
+		if (binding == rts::render::RENDER_BUFFER_VERTEX)
+		{
+			D3DVERTEXBUFFER_DESC descriptor8;
+			memset(&descriptor8, 0, sizeof(descriptor8));
+			IDirect3DVertexBuffer8 *source =
+				static_cast<IDirect3DVertexBuffer8 *>(buffer);
+			if (FAILED(source->GetDesc(&descriptor8)) || descriptor8.Size == 0)
+			{
+				return false;
+			}
+			source_byte_count = descriptor8.Size;
+		}
+		else
+		{
+			D3DINDEXBUFFER_DESC descriptor8;
+			memset(&descriptor8, 0, sizeof(descriptor8));
+			IDirect3DIndexBuffer8 *source =
+				static_cast<IDirect3DIndexBuffer8 *>(buffer);
+			if (FAILED(source->GetDesc(&descriptor8)) || descriptor8.Size == 0 ||
+				descriptor8.Format != D3DFMT_INDEX16)
+			{
+				return false;
+			}
+			source_byte_count = descriptor8.Size;
+			source_stride = sizeof(unsigned short);
+		}
+		if (destination_offset > source_byte_count ||
+			byte_count > source_byte_count - destination_offset ||
+			(mode != rts::render::RENDER_BUFFER_UPDATE_PRESERVE &&
+			 mode != rts::render::RENDER_BUFFER_UPDATE_DISCARD &&
+			 mode != rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE) ||
+			(mode == rts::render::RENDER_BUFFER_UPDATE_DISCARD &&
+			 destination_offset != 0))
+		{
+			return false;
+		}
+		if (entries->size() >= BUFFER_CACHE_CAPACITY)
+		{
+			m_impl->Evict_Oldest_Buffer(*entries, *cache_index);
+		}
+		Impl::BufferEntry new_entry;
+		new_entry.source = buffer;
+		new_entry.source->AddRef();
+		new_entry.byte_count = source_byte_count;
+		new_entry.last_used_frame = m_impl->frame_id;
+		rts::render::BufferDescriptor descriptor;
+		descriptor.byteCount = source_byte_count;
+		descriptor.stride = source_stride;
+		descriptor.binding = binding;
+		descriptor.usage = rts::render::RENDER_USAGE_DYNAMIC;
+		const RenderResult create_result = m_impl->device->createBuffer(
+			descriptor, 0, 0, &new_entry.handle);
+		if (create_result != rts::render::RENDER_RESULT_OK)
+		{
+			new_entry.source->Release();
+			return false;
+		}
+		try
+		{
+			entries->push_back(new_entry);
+		}
+		catch (...)
+		{
+			m_impl->device->destroyResource(new_entry.handle);
+			new_entry.source->Release();
+			return false;
+		}
+		if (!cache_index->Insert(buffer,
+			static_cast<unsigned int>(entries->size() - 1)))
+		{
+			m_impl->device->destroyResource(entries->back().handle);
+			entries->back().source->Release();
+			entries->pop_back();
+			return false;
+		}
+		entry = &entries->back();
+	}
+	if (destination_offset > entry->byte_count ||
+		byte_count > entry->byte_count - destination_offset)
+	{
+		return false;
+	}
+	const bool full_publication = destination_offset == 0 &&
+		byte_count == entry->byte_count &&
+		mode != rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE;
+	const bool discard_publication = destination_offset == 0 &&
+		mode == rts::render::RENDER_BUFFER_UPDATE_DISCARD;
+	if (entry->source_dirty && !full_publication &&
+		!discard_publication)
+	{
+		// A partial patch cannot make an already-dirty cached copy authoritative.
+		// Leave it dirty so the next draw performs the conservative full upload.
+		return false;
+	}
+	const RenderResult result = m_impl->context->updateBuffer(entry->handle,
+		data, byte_count, destination_offset, mode);
+	if (result != rts::render::RENDER_RESULT_OK)
+	{
+		entry->source_dirty = true;
+		return false;
+	}
+	m_impl->cache_counters.RecordBufferUpload();
+	entry->source_dirty = false;
+	entry->raw_range_valid = false;
+	if (source_generation != 0)
+	{
+		entry->source_generation = source_generation;
+	}
+	return true;
 }
 
 void D3D11LegacyBridge::Invalidate_Texture(IDirect3DBaseTexture8 *texture)
@@ -3614,6 +3976,7 @@ RenderResult D3D11LegacyBridge::Resize(unsigned int width, unsigned int height)
 	}
 	m_impl->capture_queue.advanceGeneration();
 	m_impl->capture_queue.cancelStale(rts::render::RENDER_RESULT_FAILED);
+	m_impl->Invalidate_GPU_Copy_Content();
 	RenderResult result = m_impl->device->resize(width, height);
 	if (result == rts::render::RENDER_RESULT_DEVICE_REMOVED)
 	{
@@ -3673,6 +4036,7 @@ D3D11LegacyBridge::~D3D11LegacyBridge() {}
 bool D3D11LegacyBridge::Initialize(HWND, IDirect3DDevice8 *, unsigned int,
 	unsigned int, bool) { return false; }
 void D3D11LegacyBridge::Shutdown() {}
+bool D3D11LegacyBridge::Prepare_Legacy_Device_Reset() { return true; }
 bool D3D11LegacyBridge::Is_Active() const { return false; }
 void D3D11LegacyBridge::Begin_Display_Iteration() {}
 bool D3D11LegacyBridge::Begin_Frame() { return false; }
@@ -3729,6 +4093,11 @@ rts::render::RenderResult D3D11LegacyBridge::Copy_Active_Color_Target_To_Texture
 bool D3D11LegacyBridge::Acquire_Copied_Texture_Content(
 	IDirect3DBaseTexture8 *) { return false; }
 void D3D11LegacyBridge::Invalidate_Buffer(IUnknown *) {}
+void D3D11LegacyBridge::Invalidate_Buffer_Range(IUnknown *, unsigned int,
+	size_t, size_t, rts::render::RenderBufferUpdateMode) {}
+bool D3D11LegacyBridge::Publish_Buffer_Change(IUnknown *, unsigned int,
+	const void *, size_t, size_t,
+	rts::render::RenderBufferUpdateMode, unsigned int) { return false; }
 void D3D11LegacyBridge::Invalidate_Texture(IDirect3DBaseTexture8 *) {}
 bool D3D11LegacyBridge::Draw(VertexBufferClass *, IndexBufferClass *,
 	unsigned int, unsigned int, unsigned int, unsigned int, unsigned int,

@@ -547,8 +547,19 @@ Bool W3DDisplay::setDisplayMode( UnsignedInt xres, UnsignedInt yres, UnsignedInt
 
 	if (WW3D_ERROR_OK == WW3D::Set_Device_Resolution(xres,yres,bitdepth,windowed,true))
 	{
-		Render2DClass::Set_Screen_Resolution(RectClass(0, 0, xres, yres));
-		Display::setDisplayMode(xres, yres, bitdepth, windowed);
+		Int actualWidth, actualHeight, actualBitDepth;
+		bool actualWindowed;
+		WW3D::Get_Device_Resolution(actualWidth, actualHeight,
+			actualBitDepth, actualWindowed);
+		Render2DClass::Set_Screen_Resolution(
+			RectClass(0, 0, actualWidth, actualHeight));
+		Display::setDisplayMode(actualWidth, actualHeight, actualBitDepth,
+			actualWindowed);
+		setBitDepth(actualBitDepth);
+		setWindowed(actualWindowed);
+		TheWritableGlobalData->m_xResolution = actualWidth;
+		TheWritableGlobalData->m_yResolution = actualHeight;
+		TheWritableGlobalData->m_windowed = actualWindowed;
 		return TRUE;
 	}
 
@@ -898,6 +909,17 @@ void W3DDisplay::init()
 			DEBUG_CRASH( ("Unable to set render device") );
 			return;
 		}
+		Int actualWidth, actualHeight, actualBitDepth;
+		bool actualWindowed;
+		WW3D::Get_Device_Resolution(actualWidth, actualHeight,
+			actualBitDepth, actualWindowed);
+		setWidth(actualWidth);
+		setHeight(actualHeight);
+		setBitDepth(actualBitDepth);
+		setWindowed(actualWindowed);
+		TheWritableGlobalData->m_xResolution = actualWidth;
+		TheWritableGlobalData->m_yResolution = actualHeight;
+		TheWritableGlobalData->m_windowed = actualWindowed;
 		WW3D::Set_Texture_Bitdepth(getBitDepth());
 
 		//Check if level was never set and default to setting most suitable for system.
@@ -1673,6 +1695,18 @@ void W3DDisplay::drawCurrentDebugDisplay()
 //=============================================================================
 void W3DDisplay::calculateTerrainLOD()
 {
+	// D3D11 targets hardware where the maximum terrain LOD is the stable
+	// baseline.  The legacy calibration presents terrain-only frames before the
+	// D3D11 display-iteration boundary, hiding the shell map and UI while shader
+	// and resource caches are cold.  Keep the D3D8 calibration unchanged.
+	if (DX8Wrapper::Is_D3D11_Backend_Active())
+	{
+		TheWritableGlobalData->m_terrainLOD = TERRAIN_LOD_MAX;
+		m_3DScene->drawTerrainOnly(false);
+		TheTerrainRenderObject->adjustTerrainLOD(0);
+		return;
+	}
+
 	const Int NUM_SAMPLES=20;
 	const Int NUM_TO_DISCARD=5;
 

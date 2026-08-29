@@ -112,6 +112,8 @@ int	nShadowDecalPolysInBatch=0;
 int	nShadowDecalVertsInBatch=0;
 int SHADOW_DECAL_VERTEX_SIZE=32768;
 int SHADOW_DECAL_INDEX_SIZE=65536;
+static SHADOW_DECAL_VERTEX shadowDecalVertexUpload[32768];
+static unsigned short shadowDecalIndexUpload[65536];
 
 
 class W3DShadowTexture;	//forward reference
@@ -432,8 +434,14 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 			}
 		}
 
+		Publish_Render_Buffer_Change(shadowVertexBufferD3D,
+			rts::render::RENDER_BUFFER_VERTEX,
+			pvVertices - numVerts,
+			static_cast<size_t>(numVerts) * sizeof(SHADOW_VOLUME_VERTEX),
+			static_cast<size_t>(nShadowVertsInBuf) * sizeof(SHADOW_VOLUME_VERTEX),
+			nShadowVertsInBuf == 0 ? rts::render::RENDER_BUFFER_UPDATE_DISCARD :
+				rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE);
 		shadowVertexBufferD3D->Unlock();
-		Notify_Render_Buffer_Changed(shadowVertexBufferD3D);
 
 		Int numIndex=(endX - startX) * (endY-startY)*6;	//6 indices per terrain cell (2 triangles).
 
@@ -493,8 +501,14 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 				}
 		}
 
+		Publish_Render_Buffer_Change(shadowIndexBufferD3D,
+			rts::render::RENDER_BUFFER_INDEX,
+			pvIndices - numIndex,
+			static_cast<size_t>(numIndex) * sizeof(short),
+			static_cast<size_t>(nShadowIndicesInBuf) * sizeof(short),
+			nShadowIndicesInBuf == 0 ? rts::render::RENDER_BUFFER_UPDATE_DISCARD :
+				rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE);
 		shadowIndexBufferD3D->Unlock();
-		Notify_Render_Buffer_Changed(shadowIndexBufferD3D);
 
 		DX8Wrapper::Set_DX8_Index_Buffer(shadowIndexBufferD3D,
 			nShadowStartBatchVertex);
@@ -700,6 +714,24 @@ void W3DProjectedShadowManager::flushDecals(W3DShadowTexture *texture, ShadowTyp
 
 	if (!DX8Wrapper::Is_Initted())
 		return;	//no render device to render
+
+	if (DX8Wrapper::Is_D3D11_Backend_Active())
+	{
+		Publish_Render_Buffer_Change(shadowDecalVertexBufferD3D,
+			rts::render::RENDER_BUFFER_VERTEX,
+			shadowDecalVertexUpload + nShadowDecalStartBatchVertex,
+			static_cast<size_t>(nShadowDecalVertsInBatch) * sizeof(SHADOW_DECAL_VERTEX),
+			static_cast<size_t>(nShadowDecalStartBatchVertex) * sizeof(SHADOW_DECAL_VERTEX),
+			nShadowDecalStartBatchVertex == 0 ? rts::render::RENDER_BUFFER_UPDATE_DISCARD :
+				rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE);
+		Publish_Render_Buffer_Change(shadowDecalIndexBufferD3D,
+			rts::render::RENDER_BUFFER_INDEX,
+			shadowDecalIndexUpload + nShadowDecalStartBatchIndex,
+			static_cast<size_t>(nShadowDecalPolysInBatch) * 3 * sizeof(unsigned short),
+			static_cast<size_t>(nShadowDecalStartBatchIndex) * sizeof(unsigned short),
+			nShadowDecalStartBatchIndex == 0 ? rts::render::RENDER_BUFFER_UPDATE_DISCARD :
+				rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE);
+	}
 
 	VertexMaterialClass *vmat=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
 	DX8Wrapper::Set_Material(vmat);
@@ -1088,8 +1120,10 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 			}
 		}
 
+		if (DX8Wrapper::Is_D3D11_Backend_Active())
+			memcpy(shadowDecalVertexUpload + nShadowDecalVertsInBuf,
+				pvVertices - numVerts, static_cast<size_t>(numVerts) * sizeof(SHADOW_DECAL_VERTEX));
 		shadowDecalVertexBufferD3D->Unlock();
-		Notify_Render_Buffer_Changed(shadowDecalVertexBufferD3D);
 
 		if (nShadowDecalIndicesInBuf > (SHADOW_DECAL_INDEX_SIZE-numIndex))	//check if room for model verts
 		{	//flush the buffer by drawing the contents and re-locking again
@@ -1137,8 +1171,10 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 			}
 		}
 
+		if (DX8Wrapper::Is_D3D11_Backend_Active())
+			memcpy(shadowDecalIndexUpload + nShadowDecalIndicesInBuf,
+				pvIndices - numIndex, static_cast<size_t>(numIndex) * sizeof(unsigned short));
 		shadowDecalIndexBufferD3D->Unlock();
-		Notify_Render_Buffer_Changed(shadowDecalIndexBufferD3D);
 
 		Int numPolys = (endX - startX)*(endY - startY)*2;	//2 triangles per cell
 		nShadowDecalPolysInBatch += numPolys;
@@ -1250,8 +1286,10 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 			pvVertices++;
 		}
 
+		if (DX8Wrapper::Is_D3D11_Backend_Active())
+			memcpy(shadowDecalVertexUpload + nShadowDecalVertsInBuf,
+				pvVertices - numVerts, static_cast<size_t>(numVerts) * sizeof(SHADOW_DECAL_VERTEX));
 		shadowDecalVertexBufferD3D->Unlock();
-		Notify_Render_Buffer_Changed(shadowDecalVertexBufferD3D);
 
 		if (nShadowDecalIndicesInBuf > (SHADOW_DECAL_INDEX_SIZE-numIndex))	//check if room for model verts
 		{	//flush the buffer by drawing the contents and re-locking again
@@ -1280,8 +1318,10 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 			pvIndices += 6;
 		}
 
+		if (DX8Wrapper::Is_D3D11_Backend_Active())
+			memcpy(shadowDecalIndexUpload + nShadowDecalIndicesInBuf,
+				pvIndices - numIndex, static_cast<size_t>(numIndex) * sizeof(unsigned short));
 		shadowDecalIndexBufferD3D->Unlock();
-		Notify_Render_Buffer_Changed(shadowDecalIndexBufferD3D);
 
 		Int numPolys = 2;	//2 triangles per decal
 		nShadowDecalPolysInBatch += numPolys;

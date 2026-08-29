@@ -64,6 +64,7 @@ public:
 	bool Initialize(HWND window, IDirect3DDevice8 *legacy_device,
 		unsigned int width, unsigned int height, bool enable_vsync);
 	void Shutdown();
+	bool Prepare_Legacy_Device_Reset();
 	bool Is_Active() const;
 	void Begin_Display_Iteration();
 	bool Begin_Frame();
@@ -103,6 +104,13 @@ public:
 	// invalidates that content and makes the owner regenerate it.
 	bool Acquire_Copied_Texture_Content(IDirect3DBaseTexture8 *texture);
 	void Invalidate_Buffer(IUnknown *buffer);
+	void Invalidate_Buffer_Range(IUnknown *buffer, unsigned int binding,
+		size_t destination_offset, size_t byte_count,
+		rts::render::RenderBufferUpdateMode mode);
+	bool Publish_Buffer_Change(IUnknown *buffer, unsigned int binding,
+		const void *data, size_t byte_count, size_t destination_offset,
+		rts::render::RenderBufferUpdateMode mode,
+		unsigned int source_generation);
 	void Invalidate_Texture(IDirect3DBaseTexture8 *texture);
 	bool Draw(VertexBufferClass *vertex_buffer,
 		IndexBufferClass *index_buffer, unsigned int primitive_type,

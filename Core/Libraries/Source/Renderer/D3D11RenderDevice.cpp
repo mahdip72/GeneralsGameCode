@@ -11,6 +11,14 @@
 #include "LegacyWaterRiverPS.h"
 #include "LegacySeaWaveVS.h"
 #include "LegacySeaWavePS.h"
+#include "LegacyTerrainBasePS.h"
+#include "LegacyTerrainNoisePS.h"
+#include "LegacyTerrainNoise2PS.h"
+#include "LegacyRoadNoise2PS.h"
+#include "LegacyFlatTerrainBase0PS.h"
+#include "LegacyFlatTerrainBasePS.h"
+#include "LegacyFlatTerrainNoisePS.h"
+#include "LegacyFlatTerrainNoise2PS.h"
 #include "LegacyTexturedFixed1PS.h"
 #include "LegacyTexturedFixed2PS.h"
 #include "LegacyTexturedPS.h"
@@ -31,6 +39,7 @@ namespace
 const unsigned int RESOURCE_CAPACITY = 4096;
 const unsigned int STATE_CACHE_CAPACITY = 256;
 const unsigned int TRANSFORM_CONSTANT_BUFFER_COUNT = 64;
+const unsigned int TERRAIN_PIXEL_PROGRAM_COUNT = 8;
 const unsigned int LEGACY_VERTEX_LAYOUT_PRETRANSFORMED = 0x80000000U;
 const unsigned int MAX_TEXTURE_REFRESH_SUBRESOURCES = 4096;
 const size_t MAX_TEXTURE_REFRESH_BYTES = 256U * 1024U * 1024U;
@@ -466,14 +475,16 @@ public:
 		m_boundRasterizerState(0), m_boundInputLayout(0),
 		m_boundVertexShader(0), m_boundPixelShader(0),
 		m_pipelineHasTextures(false), m_cachedLegacyStateValid(false),
+		m_cachedLegacyPipelineValid(false),
 		m_cachedLegacyVertexFormat(RENDER_VERTEX_POSITION3_COLOR),
 		m_cachedLegacyTexturePresenceMask(0), m_cachedLegacyCubeTextureMask(0),
+		m_cachedLegacySignedTextureMask(0),
 		m_cachedLegacyVertexLayoutFlags(0), m_cachedLegacyInputLayout(0),
 		m_transformConstantsValid(false),
 		m_transformConstantsChanged(false), m_hasInputLayoutOverride(false),
 		m_inputLayoutOverride(0), m_renderTargetsBound(false),
 		m_textureBindingsValid(false),
-		m_boundCubeTextureMask(0),
+		m_boundCubeTextureMask(0), m_boundSignedTextureMask(0),
 		m_boundVertexBuffer(), m_boundVertexStride(0), m_boundVertexOffset(0),
 		m_boundIndexBuffer(), m_boundIndexFormat(RENDER_FORMAT_UNKNOWN),
 		m_boundIndexOffset(0), m_boundTopology(RENDER_PRIMITIVE_TRIANGLE_LIST),
@@ -481,12 +492,14 @@ public:
 		m_viewportMaximumDepth(1.0f)
 	{
 		memset(m_transformConstants, 0, sizeof(m_transformConstants));
+		memset(m_terrainPixelShaders, 0, sizeof(m_terrainPixelShaders));
 		memset(&m_boundBlendDescriptor, 0, sizeof(m_boundBlendDescriptor));
 		memset(&m_boundDepthDescriptor, 0, sizeof(m_boundDepthDescriptor));
 		memset(&m_boundRasterizerDescriptor, 0,
 			sizeof(m_boundRasterizerDescriptor));
 		memset(m_boundSamplerStates, 0, sizeof(m_boundSamplerStates));
 		memset(m_cachedLegacyState, 0, sizeof(m_cachedLegacyState));
+		memset(m_cachedLegacyPipeline, 0, sizeof(m_cachedLegacyPipeline));
 		memset(m_boundTextures, 0, sizeof(m_boundTextures));
 		memset(&m_lastTransformConstants, 0, sizeof(m_lastTransformConstants));
 	}
@@ -1477,7 +1490,8 @@ public:
 	}
 
 	virtual RenderResult updateBuffer(GpuHandle buffer, const void *data,
-		size_t byteCount, size_t destinationOffset)
+		size_t byteCount, size_t destinationOffset,
+		RenderBufferUpdateMode mode)
 	{
 		if (!isOwner() || !m_frameOpen || data == 0 || byteCount == 0 ||
 			!m_handles->isLive(buffer))
@@ -1494,12 +1508,28 @@ public:
 		{
 			return RENDER_RESULT_UNSUPPORTED;
 		}
+		if (mode != RENDER_BUFFER_UPDATE_PRESERVE &&
+			mode != RENDER_BUFFER_UPDATE_DISCARD &&
+			mode != RENDER_BUFFER_UPDATE_NO_OVERWRITE)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		const bool rangeUpdate = mode != RENDER_BUFFER_UPDATE_PRESERVE;
+		if (rangeUpdate && (slot.usage != RENDER_USAGE_DYNAMIC ||
+			(slot.binding != RENDER_BUFFER_VERTEX &&
+			 slot.binding != RENDER_BUFFER_INDEX) ||
+			(mode == RENDER_BUFFER_UPDATE_DISCARD && destinationOffset != 0)))
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
 		memcpy(&slot.shadow[destinationOffset], data, byteCount);
 		if (slot.usage == RENDER_USAGE_DYNAMIC)
 		{
 			D3D11_MAPPED_SUBRESOURCE mapped;
+			const D3D11_MAP mapMode = mode == RENDER_BUFFER_UPDATE_NO_OVERWRITE ?
+				D3D11_MAP_WRITE_NO_OVERWRITE : D3D11_MAP_WRITE_DISCARD;
 			const HRESULT result = m_context->Map(slot.resource, 0,
-				D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+				mapMode, 0, &mapped);
 			if (FAILED(result))
 			{
 				return TranslateResult(result);
@@ -1509,7 +1539,15 @@ public:
 				m_context->Unmap(slot.resource, 0);
 				return RENDER_RESULT_FAILED;
 			}
-			memcpy(mapped.pData, &slot.shadow[0], slot.byteCount);
+			if (mode == RENDER_BUFFER_UPDATE_PRESERVE)
+			{
+				memcpy(mapped.pData, &slot.shadow[0], slot.byteCount);
+			}
+			else
+			{
+				memcpy(static_cast<unsigned char *>(mapped.pData) +
+					destinationOffset, data, byteCount);
+			}
 			m_context->Unmap(slot.resource, 0);
 			return RENDER_RESULT_OK;
 		}
@@ -1910,13 +1948,36 @@ public:
 			m_cachedLegacyVertexFormat == vertexFormat &&
 			m_cachedLegacyTexturePresenceMask == texturePresenceMask &&
 			m_cachedLegacyCubeTextureMask == m_boundCubeTextureMask &&
+			m_cachedLegacySignedTextureMask == m_boundSignedTextureMask &&
 			m_cachedLegacyVertexLayoutFlags == vertexLayoutFlags &&
 			m_cachedLegacyInputLayout == inputLayout &&
 			memcmp(m_cachedLegacyState, &state, sizeof(state)) == 0)
 		{
 			return RENDER_RESULT_OK;
 		}
-	if (state.pipeline.ambientMaterialSource >
+		if (m_pipelineStateValid && m_pipelineBound &&
+			m_cachedLegacyPipelineValid &&
+			m_cachedLegacyVertexFormat == vertexFormat &&
+			m_cachedLegacyTexturePresenceMask == texturePresenceMask &&
+			m_cachedLegacyCubeTextureMask == m_boundCubeTextureMask &&
+			m_cachedLegacySignedTextureMask == m_boundSignedTextureMask &&
+			m_cachedLegacyVertexLayoutFlags == vertexLayoutFlags &&
+			m_cachedLegacyInputLayout == inputLayout &&
+			memcmp(m_cachedLegacyPipeline, &state.pipeline,
+				sizeof(state.pipeline)) == 0)
+		{
+			const HRESULT transformResult = updateTransformConstants(state,
+				vertexLayoutFlags, texturePresenceMask, m_boundCubeTextureMask);
+			if (FAILED(transformResult))
+			{
+				return TranslateResult(transformResult);
+			}
+			m_transformConstantsChanged = false;
+			cacheLegacyState(state, vertexFormat, texturePresenceMask,
+				vertexLayoutFlags, inputLayout);
+			return RENDER_RESULT_OK;
+		}
+		if (state.pipeline.ambientMaterialSource >
 			RENDER_MATERIAL_SOURCE_COLOR2 ||
 			state.pipeline.diffuseMaterialSource >
 				RENDER_MATERIAL_SOURCE_COLOR2 ||
@@ -2125,6 +2186,14 @@ public:
 			RENDER_LEGACY_PIXEL_WATER_RIVER)
 		{
 			pixelShader = m_waterRiverPixelShader;
+		}
+		else if (useFullPipeline && state.pipeline.pixelProgram >=
+			RENDER_LEGACY_PIXEL_TERRAIN_BASE &&
+			state.pipeline.pixelProgram <=
+			RENDER_LEGACY_PIXEL_FLAT_TERRAIN_NOISE2)
+		{
+			pixelShader = m_terrainPixelShaders[
+				state.pipeline.pixelProgram - RENDER_LEGACY_PIXEL_TERRAIN_BASE];
 		}
 		const bool pipelineMatches = m_pipelineStateValid &&
 			!m_transformConstantsChanged &&
@@ -2350,7 +2419,8 @@ public:
 		if (!texture.isValid())
 		{
 			if (m_textureBindingsValid && !m_boundTextures[stage].isValid() &&
-				(m_boundCubeTextureMask & (1U << stage)) == 0U)
+				(m_boundCubeTextureMask & (1U << stage)) == 0U &&
+				(m_boundSignedTextureMask & (1U << stage)) == 0U)
 			{
 				return RENDER_RESULT_OK;
 			}
@@ -2359,6 +2429,8 @@ public:
 			m_context->PSSetShaderResources(8 + stage, 1, &emptyView);
 			m_boundTextures[stage] = GpuHandle();
 			m_boundCubeTextureMask &= ~(1U << stage);
+			m_boundSignedTextureMask &= ~(1U << stage);
+			m_transformConstantsChanged = true;
 			m_textureBindingsValid = true;
 			return RENDER_RESULT_OK;
 		}
@@ -2381,9 +2453,12 @@ public:
 		}
 		const bool isCube = slot.textureDescriptor.dimension ==
 			RENDER_TEXTURE_CUBE;
+		const bool isSigned = slot.textureDescriptor.format ==
+			RENDER_FORMAT_R8G8_SNORM;
 		const bool wasCube = (m_boundCubeTextureMask & (1U << stage)) != 0U;
+		const bool wasSigned = (m_boundSignedTextureMask & (1U << stage)) != 0U;
 		if (m_textureBindingsValid && m_boundTextures[stage] == texture &&
-			wasCube == isCube)
+			wasCube == isCube && wasSigned == isSigned)
 		{
 			return RENDER_RESULT_OK;
 		}
@@ -2400,8 +2475,17 @@ public:
 			m_context->PSSetShaderResources(8 + stage, 1, &emptyView);
 			m_boundCubeTextureMask &= ~(1U << stage);
 		}
+		if (isSigned)
+		{
+			m_boundSignedTextureMask |= 1U << stage;
+		}
+		else
+		{
+			m_boundSignedTextureMask &= ~(1U << stage);
+		}
 		m_boundTextures[stage] = texture;
 		m_textureBindingsValid = true;
+		m_transformConstantsChanged = true;
 		return RENDER_RESULT_OK;
 	}
 
@@ -2658,12 +2742,16 @@ private:
 		unsigned int vertexLayoutFlags, ID3D11InputLayout *inputLayout)
 	{
 		memcpy(m_cachedLegacyState, &state, sizeof(state));
+		memcpy(m_cachedLegacyPipeline, &state.pipeline,
+			sizeof(state.pipeline));
 		m_cachedLegacyVertexFormat = vertexFormat;
 		m_cachedLegacyTexturePresenceMask = texturePresenceMask;
 		m_cachedLegacyCubeTextureMask = m_boundCubeTextureMask;
+		m_cachedLegacySignedTextureMask = m_boundSignedTextureMask;
 		m_cachedLegacyVertexLayoutFlags = vertexLayoutFlags;
 		m_cachedLegacyInputLayout = inputLayout;
 		m_cachedLegacyStateValid = true;
+		m_cachedLegacyPipelineValid = true;
 	}
 
 	void invalidatePipelineBindings()
@@ -2671,6 +2759,7 @@ private:
 		m_pipelineStateValid = false;
 		m_pipelineBound = false;
 		m_cachedLegacyStateValid = false;
+		m_cachedLegacyPipelineValid = false;
 		m_transformConstantsValid = false;
 		m_transformConstantsChanged = true;
 	}
@@ -2695,6 +2784,8 @@ private:
 	{
 		m_textureBindingsValid = true;
 		m_boundCubeTextureMask = 0;
+		m_boundSignedTextureMask = 0;
+		m_transformConstantsChanged = true;
 		for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT;
 			++stage)
 		{
@@ -2731,6 +2822,8 @@ private:
 		m_context->PSSetShaderResources(8 + stage, 1, &emptyView);
 		m_boundTextures[stage] = GpuHandle();
 		m_boundCubeTextureMask &= ~(1U << stage);
+		m_boundSignedTextureMask &= ~(1U << stage);
+		m_transformConstantsChanged = true;
 	}
 
 	unsigned int unbindTextureResource(GpuHandle texture)
@@ -3012,6 +3105,33 @@ private:
 	{
 		return result;
 	}
+	struct TerrainPixelShaderBlob
+	{
+		const void *data;
+		size_t byteCount;
+	};
+	const TerrainPixelShaderBlob terrainPixelShaders[
+		TERRAIN_PIXEL_PROGRAM_COUNT] = {
+		{ g_LegacyTerrainBasePS, sizeof(g_LegacyTerrainBasePS) },
+		{ g_LegacyTerrainNoisePS, sizeof(g_LegacyTerrainNoisePS) },
+		{ g_LegacyTerrainNoise2PS, sizeof(g_LegacyTerrainNoise2PS) },
+		{ g_LegacyRoadNoise2PS, sizeof(g_LegacyRoadNoise2PS) },
+		{ g_LegacyFlatTerrainBase0PS, sizeof(g_LegacyFlatTerrainBase0PS) },
+		{ g_LegacyFlatTerrainBasePS, sizeof(g_LegacyFlatTerrainBasePS) },
+		{ g_LegacyFlatTerrainNoisePS, sizeof(g_LegacyFlatTerrainNoisePS) },
+		{ g_LegacyFlatTerrainNoise2PS, sizeof(g_LegacyFlatTerrainNoise2PS) }
+	};
+	for (unsigned int programIndex = 0;
+		programIndex < TERRAIN_PIXEL_PROGRAM_COUNT; ++programIndex)
+	{
+		result = m_device->CreatePixelShader(terrainPixelShaders[programIndex].data,
+			terrainPixelShaders[programIndex].byteCount, 0,
+			&m_terrainPixelShaders[programIndex]);
+		if (FAILED(result))
+		{
+			return result;
+		}
+	}
 	result = m_device->CreatePixelShader(g_LegacyWaterFlatPS,
 		sizeof(g_LegacyWaterFlatPS), 0, &m_waterFlatPixelShader);
 	if (FAILED(result))
@@ -3255,6 +3375,8 @@ private:
 		shaderConstants.lightingParameters[3] = texturePresenceMask & 0xffU;
 		shaderConstants.lightingParameters[3] |=
 			(cubeTextureMask & 0xffU) << 8;
+		shaderConstants.lightingParameters[3] |=
+			(m_boundSignedTextureMask & 0xffU) << 16;
 		shaderConstants.vertexLayoutParameters[0] =
 			(vertexLayoutFlags & 1U) != 0 ? 1U : 0U;
 		shaderConstants.vertexLayoutParameters[1] =
@@ -4449,6 +4571,15 @@ private:
 			m_texturedPixelShader->Release();
 			m_texturedPixelShader = 0;
 		}
+		for (unsigned int programIndex = 0;
+			programIndex < TERRAIN_PIXEL_PROGRAM_COUNT; ++programIndex)
+		{
+			if (m_terrainPixelShaders[programIndex] != 0)
+			{
+				m_terrainPixelShaders[programIndex]->Release();
+				m_terrainPixelShaders[programIndex] = 0;
+			}
+		}
 		if (m_texturedFixed2PixelShader != 0)
 		{
 			m_texturedFixed2PixelShader->Release();
@@ -4563,6 +4694,7 @@ private:
 	ID3D11PixelShader *m_texturedPixelShader;
 	ID3D11PixelShader *m_texturedFixed1PixelShader;
 	ID3D11PixelShader *m_texturedFixed2PixelShader;
+	ID3D11PixelShader *m_terrainPixelShaders[TERRAIN_PIXEL_PROGRAM_COUNT];
 	ID3D11PixelShader *m_waterFlatPixelShader;
 	ID3D11PixelShader *m_waterRiverPixelShader;
 	ID3D11VertexShader *m_seaWaveVertexShader;
@@ -4609,9 +4741,12 @@ private:
 	bool m_pipelineHasTextures;
 	unsigned char m_cachedLegacyState[sizeof(LegacyLogicalState)];
 	bool m_cachedLegacyStateValid;
+	unsigned char m_cachedLegacyPipeline[sizeof(LegacyPipelineState)];
+	bool m_cachedLegacyPipelineValid;
 	LegacyVertexFormat m_cachedLegacyVertexFormat;
 	unsigned int m_cachedLegacyTexturePresenceMask;
 	unsigned int m_cachedLegacyCubeTextureMask;
+	unsigned int m_cachedLegacySignedTextureMask;
 	unsigned int m_cachedLegacyVertexLayoutFlags;
 	ID3D11InputLayout *m_cachedLegacyInputLayout;
 	LegacyTransformConstants m_lastTransformConstants;
@@ -4622,6 +4757,7 @@ private:
 	bool m_renderTargetsBound;
 	bool m_textureBindingsValid;
 	unsigned int m_boundCubeTextureMask;
+	unsigned int m_boundSignedTextureMask;
 	GpuHandle m_boundTextures[LEGACY_TEXTURE_STAGE_COUNT];
 	GpuHandle m_boundVertexBuffer;
 	unsigned int m_boundVertexStride;

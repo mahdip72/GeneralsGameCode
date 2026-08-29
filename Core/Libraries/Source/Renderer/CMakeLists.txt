@@ -88,6 +88,38 @@ if(WIN32 AND NOT IS_VS6_BUILD)
     set(renderer_textured_fixed1_pixel_shader_header "${renderer_generated_dir}/LegacyTexturedFixed1PS.h")
     set(renderer_textured_fixed2_pixel_shader_header "${renderer_generated_dir}/LegacyTexturedFixed2PS.h")
 
+    function(add_legacy_pixel_program_shader output_variable file_name symbol program)
+        set(output_path "${renderer_generated_dir}/${file_name}")
+        add_custom_command(
+            OUTPUT "${output_path}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${renderer_generated_dir}"
+            COMMAND "${RTS_FXC_EXECUTABLE}" /nologo /O3 /T ps_5_0 /E PSTextured
+                /D LEGACY_PIXEL_PROGRAM=${program}
+                /Fh "${output_path}"
+                /Vn ${symbol} "${renderer_shader_source}"
+            DEPENDS "${renderer_shader_source}"
+            VERBATIM
+        )
+        set(${output_variable} "${output_path}" PARENT_SCOPE)
+    endfunction()
+
+    add_legacy_pixel_program_shader(renderer_terrain_base_pixel_shader_header
+        LegacyTerrainBasePS.h g_LegacyTerrainBasePS 3)
+    add_legacy_pixel_program_shader(renderer_terrain_noise_pixel_shader_header
+        LegacyTerrainNoisePS.h g_LegacyTerrainNoisePS 4)
+    add_legacy_pixel_program_shader(renderer_terrain_noise2_pixel_shader_header
+        LegacyTerrainNoise2PS.h g_LegacyTerrainNoise2PS 5)
+    add_legacy_pixel_program_shader(renderer_road_noise2_pixel_shader_header
+        LegacyRoadNoise2PS.h g_LegacyRoadNoise2PS 6)
+    add_legacy_pixel_program_shader(renderer_flat_terrain_base0_pixel_shader_header
+        LegacyFlatTerrainBase0PS.h g_LegacyFlatTerrainBase0PS 7)
+    add_legacy_pixel_program_shader(renderer_flat_terrain_base_pixel_shader_header
+        LegacyFlatTerrainBasePS.h g_LegacyFlatTerrainBasePS 8)
+    add_legacy_pixel_program_shader(renderer_flat_terrain_noise_pixel_shader_header
+        LegacyFlatTerrainNoisePS.h g_LegacyFlatTerrainNoisePS 9)
+    add_legacy_pixel_program_shader(renderer_flat_terrain_noise2_pixel_shader_header
+        LegacyFlatTerrainNoise2PS.h g_LegacyFlatTerrainNoise2PS 10)
+
     add_custom_command(
         OUTPUT "${renderer_vertex_shader_header}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${renderer_generated_dir}"
@@ -195,6 +227,14 @@ if(WIN32 AND NOT IS_VS6_BUILD)
         "${renderer_textured_pixel_shader_header}"
         "${renderer_textured_fixed1_pixel_shader_header}"
         "${renderer_textured_fixed2_pixel_shader_header}"
+        "${renderer_terrain_base_pixel_shader_header}"
+        "${renderer_terrain_noise_pixel_shader_header}"
+        "${renderer_terrain_noise2_pixel_shader_header}"
+        "${renderer_road_noise2_pixel_shader_header}"
+        "${renderer_flat_terrain_base0_pixel_shader_header}"
+        "${renderer_flat_terrain_base_pixel_shader_header}"
+        "${renderer_flat_terrain_noise_pixel_shader_header}"
+        "${renderer_flat_terrain_noise2_pixel_shader_header}"
     )
     target_include_directories(core_renderer PRIVATE
         "${renderer_generated_dir}"

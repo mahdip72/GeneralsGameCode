@@ -1324,6 +1324,7 @@ void W3DVolumetricShadow::RenderDynamicMeshVolume(Int meshIndex, Int lightIndex,
 	{	if (shadowVertexBufferD3D->Lock(nShadowVertsInBuf*sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),numVerts*sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX), (unsigned char**)&pvVertices,D3DLOCK_NOOVERWRITE) != D3D_OK)
 			return;
 	}
+	SHADOW_DYNAMIC_VOLUME_VERTEX *publishedVertices = pvVertices;
 #ifdef SV_DEBUG
 	srand(0x1345465);
 #endif
@@ -1341,8 +1342,14 @@ void W3DVolumetricShadow::RenderDynamicMeshVolume(Int meshIndex, Int lightIndex,
 #endif
 	}
 
+	Publish_Render_Buffer_Change(shadowVertexBufferD3D,
+		rts::render::RENDER_BUFFER_VERTEX,
+		publishedVertices,
+		static_cast<size_t>(numVerts) * sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),
+		static_cast<size_t>(nShadowVertsInBuf) * sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),
+		nShadowVertsInBuf == 0 ? rts::render::RENDER_BUFFER_UPDATE_DISCARD :
+			rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE);
 	shadowVertexBufferD3D->Unlock();
-	Notify_Render_Buffer_Changed(shadowVertexBufferD3D);
 
 	if (nShadowIndicesInBuf > (SHADOW_INDEX_SIZE-numIndex))	//check if room for model verts
 	{	//flush the buffer by drawing the contents and re-locking again
@@ -1355,6 +1362,7 @@ void W3DVolumetricShadow::RenderDynamicMeshVolume(Int meshIndex, Int lightIndex,
 	{	if (shadowIndexBufferD3D->Lock(nShadowIndicesInBuf*sizeof(short),numIndex*sizeof(short), (unsigned char**)&pvIndices,D3DLOCK_NOOVERWRITE) != D3D_OK)
 			return;
 	}
+	unsigned short *publishedIndices = pvIndices;
 
 
 	if(pvIndices)
@@ -1362,8 +1370,14 @@ void W3DVolumetricShadow::RenderDynamicMeshVolume(Int meshIndex, Int lightIndex,
 		memcpy(pvIndices,geometry->GetPolygonIndex(0,(short *)pvIndices,3),numPolys*3*sizeof(short));
 	}
 
+	Publish_Render_Buffer_Change(shadowIndexBufferD3D,
+		rts::render::RENDER_BUFFER_INDEX,
+		publishedIndices,
+		static_cast<size_t>(numIndex) * sizeof(short),
+		static_cast<size_t>(nShadowIndicesInBuf) * sizeof(short),
+		nShadowIndicesInBuf == 0 ? rts::render::RENDER_BUFFER_UPDATE_DISCARD :
+			rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE);
 	shadowIndexBufferD3D->Unlock();
-	Notify_Render_Buffer_Changed(shadowIndexBufferD3D);
 
 	DX8Wrapper::Set_DX8_Index_Buffer(shadowIndexBufferD3D,
 		nShadowStartBatchVertex);
@@ -1495,8 +1509,14 @@ void W3DVolumetricShadow::RenderMeshVolumeBounds(Int meshIndex, Int lightIndex, 
 		}
 	}
 
+	Publish_Render_Buffer_Change(shadowVertexBufferD3D,
+		rts::render::RENDER_BUFFER_VERTEX,
+		pvVertices - numVerts,
+		static_cast<size_t>(numVerts) * sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),
+		static_cast<size_t>(nShadowVertsInBuf) * sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),
+		nShadowVertsInBuf == 0 ? rts::render::RENDER_BUFFER_UPDATE_DISCARD :
+			rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE);
 	shadowVertexBufferD3D->Unlock();
-	Notify_Render_Buffer_Changed(shadowVertexBufferD3D);
 
 	if (nShadowIndicesInBuf > (SHADOW_INDEX_SIZE-numIndex))	//check if room for model verts
 	{	//flush the buffer by drawing the contents and re-locking again
@@ -1521,8 +1541,14 @@ void W3DVolumetricShadow::RenderMeshVolumeBounds(Int meshIndex, Int lightIndex, 
 		}
 	}
 
+	Publish_Render_Buffer_Change(shadowIndexBufferD3D,
+		rts::render::RENDER_BUFFER_INDEX,
+		pvIndices - numIndex,
+		static_cast<size_t>(numIndex) * sizeof(short),
+		static_cast<size_t>(nShadowIndicesInBuf) * sizeof(short),
+		nShadowIndicesInBuf == 0 ? rts::render::RENDER_BUFFER_UPDATE_DISCARD :
+			rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE);
 	shadowIndexBufferD3D->Unlock();
-	Notify_Render_Buffer_Changed(shadowIndexBufferD3D);
 
 	DX8Wrapper::Set_DX8_Index_Buffer(shadowIndexBufferD3D,
 		nShadowStartBatchVertex);

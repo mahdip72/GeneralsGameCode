@@ -1252,6 +1252,11 @@ void WaterRenderObjClass::update()
 	// TheSuperHackers @tweak The water movement time step is now decoupled from the render update.
 	const Real timeScale = TheFramePacer->getActualLogicTimeScaleOverFpsRatio();
 
+	if (m_waterTrackSystem && DX8Wrapper::Is_D3D11_Backend_Active())
+	{
+		m_waterTrackSystem->update();
+	}
+
 	{
 		constexpr const Real MagicOffset = 0.0125f * 33 / 5000; ///< the work of top Munkees; do not question it
 
@@ -2381,17 +2386,25 @@ void WaterRenderObjClass::renderWaterMesh()
 #endif
 
 	MaterMeshVertexFormat *vb;
+	rts::render::RenderBufferUpdateMode bufferUpdateMode;
+	size_t bufferUpdateOffset;
 	if (m_vertexBufferD3DOffset < m_numVertices)
 	{	//we have room in current VB, append new verts
 		if(m_vertexBufferD3D->Lock(m_vertexBufferD3DOffset*sizeof(MaterMeshVertexFormat),mx*my*sizeof(MaterMeshVertexFormat),(unsigned char**)&vb,D3DLOCK_NOOVERWRITE) != D3D_OK)
 			return;
+		bufferUpdateMode = rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE;
+		bufferUpdateOffset = static_cast<size_t>(m_vertexBufferD3DOffset) *
+			sizeof(MaterMeshVertexFormat);
 	}
 	else
 	{	//ran out of room in last VB, request a substitute VB.
 		if(m_vertexBufferD3D->Lock(0,mx*my*sizeof(MaterMeshVertexFormat),(unsigned char**)&vb,D3DLOCK_DISCARD) != D3D_OK)
 			return;
 		m_vertexBufferD3DOffset=0;	//reset start of page to first vertex
+		bufferUpdateMode = rts::render::RENDER_BUFFER_UPDATE_DISCARD;
+		bufferUpdateOffset = 0;
 	}
+	MaterMeshVertexFormat *const lockedVertices = vb;
 	Int diffuse;
 	diffuse = setting->waterDiffuse&0x00ffffff;
 	Int alpha = (setting->waterDiffuse & 0xff000000)>>24;
@@ -2456,8 +2469,16 @@ void WaterRenderObjClass::renderWaterMesh()
 		}
 	}
 
+	const size_t bufferUpdateBytes = static_cast<size_t>(mx) * my *
+		sizeof(MaterMeshVertexFormat);
+	const bool bufferPublished = Publish_Render_Buffer_Change(
+		m_vertexBufferD3D, rts::render::RENDER_BUFFER_VERTEX, lockedVertices,
+		bufferUpdateBytes, bufferUpdateOffset, bufferUpdateMode);
 	m_vertexBufferD3D->Unlock();
-	Notify_Render_Buffer_Changed(m_vertexBufferD3D);
+	if (!bufferPublished)
+	{
+		Notify_Render_Buffer_Changed(m_vertexBufferD3D);
+	}
 
 	DX8Wrapper::Set_Transform(D3DTS_WORLD,Transform);	//position the water surface
 	DX8Wrapper::Set_Material(m_meshVertexMaterialClass);

@@ -4137,6 +4137,74 @@ int testD3D11HeadlessDevice()
 		device->immediateContext()->endFrame() ==
 			rts::render::RENDER_RESULT_OK,
 		"recreated dynamic buffers retain their logical handle and update path");
+	unsigned int rangeValues[4] = { 10, 20, 30, 40 };
+	rts::render::IRenderContext *rangeContext = device->immediateContext();
+	result |= check(rangeContext->updateBuffer(buffer, rangeValues,
+		sizeof(rangeValues), 0, rts::render::RENDER_BUFFER_UPDATE_DISCARD) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+		"dynamic range updates require an open owner frame");
+	result |= check(rangeContext->beginFrame() ==
+		rts::render::RENDER_RESULT_OK &&
+		rangeContext->updateBuffer(buffer, rangeValues, sizeof(unsigned int) * 2,
+			0, rts::render::RENDER_BUFFER_UPDATE_DISCARD) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->updateBuffer(buffer, rangeValues + 2,
+			sizeof(unsigned int) * 2, sizeof(unsigned int) * 2,
+			rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->updateBuffer(buffer, rangeValues, sizeof(unsigned int),
+			sizeof(unsigned int), rts::render::RENDER_BUFFER_UPDATE_DISCARD) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+		rangeContext->updateBuffer(buffer, rangeValues, 0, 0,
+			rts::render::RENDER_BUFFER_UPDATE_DISCARD) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+		rangeContext->updateBuffer(buffer, rangeValues, sizeof(rangeValues),
+			descriptor.byteCount - sizeof(unsigned int),
+			rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+		rangeContext->updateBuffer(buffer, rangeValues, sizeof(rangeValues), 0,
+			static_cast<rts::render::RenderBufferUpdateMode>(99)) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+		rangeContext->endFrame() == rts::render::RENDER_RESULT_OK,
+		"dynamic vertex buffers enforce discard and no-overwrite range contracts");
+
+	rts::render::BufferDescriptor indexDescriptor;
+	indexDescriptor.byteCount = 16;
+	indexDescriptor.stride = 2;
+	indexDescriptor.binding = rts::render::RENDER_BUFFER_INDEX;
+	indexDescriptor.usage = rts::render::RENDER_USAGE_DYNAMIC;
+	rts::render::GpuHandle indexBuffer;
+	rts::render::BufferDescriptor constantDescriptor;
+	constantDescriptor.byteCount = 64;
+	constantDescriptor.stride = 16;
+	constantDescriptor.binding = rts::render::RENDER_BUFFER_CONSTANT;
+	constantDescriptor.usage = rts::render::RENDER_USAGE_DYNAMIC;
+	rts::render::GpuHandle constantBuffer;
+	unsigned short rangeIndices[4] = { 0, 1, 2, 3 };
+	result |= check(device->createBuffer(indexDescriptor, 0, 0, &indexBuffer) ==
+		rts::render::RENDER_RESULT_OK &&
+		device->createBuffer(constantDescriptor, 0, 0, &constantBuffer) ==
+		rts::render::RENDER_RESULT_OK &&
+		rangeContext->beginFrame() == rts::render::RENDER_RESULT_OK &&
+		rangeContext->updateBuffer(indexBuffer, rangeIndices,
+			sizeof(unsigned short) * 2, 0,
+			rts::render::RENDER_BUFFER_UPDATE_DISCARD) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->updateBuffer(indexBuffer, rangeIndices + 2,
+			sizeof(unsigned short) * 2, sizeof(unsigned short) * 2,
+			rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->updateBuffer(constantBuffer, rangeValues,
+			sizeof(rangeValues), 0,
+			rts::render::RENDER_BUFFER_UPDATE_DISCARD) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+		rangeContext->endFrame() == rts::render::RENDER_RESULT_OK &&
+		device->recoverDevice() == rts::render::RENDER_RESULT_OK &&
+		device->isOperational(),
+		"dynamic index ranges recover while constant ranges fail closed");
+	result |= check(device->destroyResource(indexBuffer) &&
+		device->destroyResource(constantBuffer),
+		"dynamic range contract resources release cleanly");
 	result |= check(device->destroyResource(buffer) &&
 		!device->destroyResource(buffer),
 		"D3D11 resource destruction rejects stale handles");
@@ -4543,6 +4611,12 @@ int testD3D11LegacyBridgeLifecycleContract()
 	typedef void (D3D11LegacyBridge::*ExpectedDisplayIteration)();
 	typedef void (D3D11LegacyBridge::*ExpectedCaptureRequest)();
 	typedef bool (D3D11LegacyBridge::*ExpectedBeginFrame)();
+	typedef bool (D3D11LegacyBridge::*ExpectedPrepareReset)();
+	typedef void (D3D11LegacyBridge::*ExpectedInvalidateBufferRange)(IUnknown *,
+		unsigned int, size_t, size_t, rts::render::RenderBufferUpdateMode);
+	typedef bool (D3D11LegacyBridge::*ExpectedPublishBufferChange)(IUnknown *,
+		unsigned int, const void *, size_t, size_t,
+		rts::render::RenderBufferUpdateMode, unsigned int);
 	result |= check(std::is_same<decltype(static_cast<ExpectedEndFrame>(
 		&D3D11LegacyBridge::End_Frame)), ExpectedEndFrame>::value &&
 		std::is_same<decltype(static_cast<ExpectedEndFrameOutcome>(
@@ -4558,7 +4632,13 @@ int testD3D11LegacyBridgeLifecycleContract()
 		std::is_same<decltype(&D3D11LegacyBridge::Request_Frame_Capture),
 		ExpectedCaptureRequest>::value &&
 		std::is_same<decltype(&D3D11LegacyBridge::Begin_Frame),
-		ExpectedBeginFrame>::value,
+		ExpectedBeginFrame>::value &&
+		std::is_same<decltype(&D3D11LegacyBridge::Prepare_Legacy_Device_Reset),
+		ExpectedPrepareReset>::value &&
+		std::is_same<decltype(&D3D11LegacyBridge::Invalidate_Buffer_Range),
+		ExpectedInvalidateBufferRange>::value &&
+		std::is_same<decltype(&D3D11LegacyBridge::Publish_Buffer_Change),
+		ExpectedPublishBufferChange>::value,
 		"D3D11 bridge exposes result-bearing lifecycle and pre-present capture methods");
 	return result;
 }
