@@ -280,6 +280,11 @@ void WaterTracksObj::init( Real width, const Vector2 &start, const Vector2 &end,
 //=============================================================================
 Int WaterTracksObj::update(Int msElapsed)
 {
+	m_elapsedMs += msElapsed;
+	if (m_elapsedMs >= m_totalMs)
+	{
+		m_elapsedMs = 0;
+	}
 	return TRUE;	//assume we had an update
 }
 
@@ -295,9 +300,6 @@ Int WaterTracksObj::update(Int msElapsed)
 
 Int WaterTracksObj::render(DX8VertexBufferClass	*vertexBuffer, Int batchStart)
 {
-	// TheSuperHackers @tweak The wave movement time step is now decoupled from the render update.
-	m_elapsedMs += TheFramePacer->getLogicTimeStepMilliseconds();
-
 	VertexFormatXYZDUV1 *vb;
 	Vector2	waveTailOrigin,waveFrontOrigin;
 	Real	ooWaveDirLen=1.0f/m_waveDir.Length();	//one over length
@@ -305,18 +307,25 @@ Int WaterTracksObj::render(DX8VertexBufferClass	*vertexBuffer, Int batchStart)
 	Real	waveAlpha;
 	Real	widthFrac;
 	Real	heightFrac;
+	unsigned int lockFlags;
+	rts::render::RenderBufferUpdateMode bufferUpdateMode;
 
 	if (batchStart < (WATER_VB_PAGES*WATER_STRIP_X*WATER_STRIP_Y-m_x*m_y))
 	{	//we have room in current VB, append new verts
-		if(vertexBuffer->Get_DX8_Vertex_Buffer()->Lock(batchStart*vertexBuffer->FVF_Info().Get_FVF_Size(),m_x*m_y*vertexBuffer->FVF_Info().Get_FVF_Size(),(unsigned char**)&vb,D3DLOCK_NOOVERWRITE) != D3D_OK)
+		lockFlags = D3DLOCK_NOOVERWRITE;
+		bufferUpdateMode = rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE;
+		if(vertexBuffer->Get_DX8_Vertex_Buffer()->Lock(batchStart*vertexBuffer->FVF_Info().Get_FVF_Size(),m_x*m_y*vertexBuffer->FVF_Info().Get_FVF_Size(),(unsigned char**)&vb,lockFlags) != D3D_OK)
 			return batchStart;
 	}
 	else
 	{	//ran out of room in last VB, request a substitute VB.
-		if(vertexBuffer->Get_DX8_Vertex_Buffer()->Lock(0,m_x*m_y*vertexBuffer->FVF_Info().Get_FVF_Size(),(unsigned char**)&vb,D3DLOCK_DISCARD) != D3D_OK)
+		lockFlags = D3DLOCK_DISCARD;
+		bufferUpdateMode = rts::render::RENDER_BUFFER_UPDATE_DISCARD;
+		if(vertexBuffer->Get_DX8_Vertex_Buffer()->Lock(0,m_x*m_y*vertexBuffer->FVF_Info().Get_FVF_Size(),(unsigned char**)&vb,lockFlags) != D3D_OK)
 			return batchStart;
 		batchStart=0;	//reset start of page to first vertex
 	}
+	VertexFormatXYZDUV1 *const lockedVertices = vb;
 
 	//Adjust wave position in a non-linear way so that it slows down as it hits the target.  Using 1/4 sine wave
 	//seems to work okay since it maxes out at 1.0 at our final position.
@@ -334,8 +343,6 @@ Int WaterTracksObj::render(DX8VertexBufferClass	*vertexBuffer, Int batchStart)
 		waveTailOrigin = waveFrontOrigin - m_waveFinalHeight * ooWaveDirLen*m_waveDir;
 		waveAlpha = 0.0f;
 
-		if (m_elapsedMs >= m_totalMs)
-			m_elapsedMs = 0;	//done with effect*/
 		if (m_elapsedMs > (m_timeToReachBeach + m_timeToStop -1000 + m_fadeMs))
 		{	//fading out
 			waveAlpha = m_elapsedMs-(m_timeToReachBeach + m_timeToStop - 1000 +m_fadeMs);//(m_totalMs-m_timeToRetreat -m_fadeMs - m_elapsedMs)/m_fadeMs;
@@ -409,7 +416,7 @@ Int WaterTracksObj::render(DX8VertexBufferClass	*vertexBuffer, Int batchStart)
 			waveTailOrigin -= m_perpDir*m_waveFinalWidth*0.5f*widthFrac;	//offset to left edge of wave
 		}
 		else
-		{	m_elapsedMs = 0;
+		{
 			waveAlpha = m_elapsedMs / m_timeToReachBeach;
 			widthFrac = waveAlpha;
 			widthFrac=(m_waveInitialWidth + widthFrac* (m_waveFinalWidth-m_waveInitialWidth))/m_waveFinalWidth;
@@ -469,6 +476,15 @@ Int WaterTracksObj::render(DX8VertexBufferClass	*vertexBuffer, Int batchStart)
 	vb->v1=1.0f;
 	vb++;
 
+	const size_t bufferUpdateOffset = static_cast<size_t>(batchStart) *
+		vertexBuffer->FVF_Info().Get_FVF_Size();
+	const size_t bufferUpdateBytes = static_cast<size_t>(m_x) * m_y *
+		vertexBuffer->FVF_Info().Get_FVF_Size();
+	vertexBuffer->Mark_Changed_Range(batchStart, m_x * m_y, lockFlags);
+	Publish_Render_Buffer_Change(
+		vertexBuffer->Get_DX8_Vertex_Buffer(),
+		rts::render::RENDER_BUFFER_VERTEX, lockedVertices, bufferUpdateBytes,
+		bufferUpdateOffset, bufferUpdateMode, vertexBuffer->Get_Generation());
 	vertexBuffer->Get_DX8_Vertex_Buffer()->Unlock();
 
 	Int idxCount=(m_y-1)*(m_x*2+2) - 2;	//index count
@@ -816,12 +832,8 @@ void WaterTracksRenderSystem::shutdown()
 //=============================================================================
 void WaterTracksRenderSystem::update()
 {
-
-	static  Int iLastTime=timeGetTime();
 	WaterTracksObj *mod=m_usedModules,*nextMod;
-
-	Int timeDiff = timeGetTime()-iLastTime;
-	iLastTime += timeDiff;
+	const Int timeDiff = TheFramePacer->getLogicTimeStepMilliseconds();
 
 	//first update all the tracks
 	while( mod )
@@ -860,7 +872,8 @@ Try improving the fit to vertical surfaces like cliffs.
 	if (TheGlobalData->m_usingWaterTrackEditor)
 		TestWaterUpdate();
 
-	update();	//update positions of all the tracks
+	if (!DX8Wrapper::Is_D3D11_Backend_Active())
+		update();	//legacy D3D8 advances tracks when their render queue is flushed
 
 	rinfo.Camera.Apply();
 

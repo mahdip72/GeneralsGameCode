@@ -45,7 +45,6 @@
 #include "dx8caps.h"
 #include "WWLib/thread.h"
 #include "WWDebug/wwmemlog.h"
-#include <d3dx8core.h>
 
 #define DEFAULT_VB_SIZE 5000
 
@@ -78,7 +77,12 @@ VertexBufferClass::VertexBufferClass(unsigned type_, unsigned FVF, unsigned shor
 	:
 	VertexCount(vertex_count_),
 	type(type_),
-	engine_refs(0)
+	engine_refs(0),
+	generation(1),
+	change_base_generation(0),
+	change_offset(0),
+	change_count(vertex_count_),
+	change_flags(0)
 {
 	WWMEMLOG(MEM_RENDERER);
 	WWASSERT(VertexCount);
@@ -147,6 +151,39 @@ void VertexBufferClass::Release_Engine_Ref() const
 	WWASSERT(engine_refs>=0);
 }
 
+void VertexBufferClass::Mark_Changed()
+{
+	Mark_Changed_Range(0, VertexCount, 0);
+}
+
+void VertexBufferClass::Mark_Changed_Range(unsigned int offset,
+	unsigned int count, unsigned int flags)
+{
+	change_base_generation = generation;
+	++generation;
+	if (generation == 0)
+	{
+		++generation;
+	}
+	change_offset = offset;
+	change_count = count;
+	change_flags = flags;
+}
+
+bool VertexBufferClass::Get_Change_Since(unsigned int uploaded_generation,
+	unsigned int *offset, unsigned int *count, unsigned int *flags) const
+{
+	if (offset == nullptr || count == nullptr || flags == nullptr ||
+		change_base_generation != uploaded_generation || change_count == 0)
+	{
+		return false;
+	}
+	*offset = change_offset;
+	*count = change_count;
+	*flags = change_flags;
+	return true;
+}
+
 // ----------------------------------------------------------------------------
 //
 //
@@ -208,6 +245,7 @@ VertexBufferClass::WriteLockClass::~WriteLockClass()
 		WWASSERT(0);
 		break;
 	}
+	VertexBuffer->Mark_Changed();
 	VertexBuffer->Release_Ref();
 }
 
@@ -274,6 +312,7 @@ VertexBufferClass::AppendLockClass::~AppendLockClass()
 		WWASSERT(0);
 		break;
 	}
+	VertexBuffer->Mark_Changed();
 	VertexBuffer->Release_Ref();
 }
 
@@ -871,6 +910,12 @@ DynamicVBAccessClass::WriteLockClass::WriteLockClass(DynamicVBAccessClass* dynam
 DynamicVBAccessClass::WriteLockClass::~WriteLockClass()
 {
 	DX8_THREAD_ASSERT();
+	const unsigned int change_flags =
+		!DynamicVBAccess->VertexBufferOffset ?
+			D3DLOCK_DISCARD : D3DLOCK_NOOVERWRITE;
+	DynamicVBAccess->VertexBuffer->Mark_Changed_Range(
+		DynamicVBAccess->VertexBufferOffset,
+		DynamicVBAccess->Get_Vertex_Count(), change_flags);
 	switch (DynamicVBAccess->Get_Type()) {
 	case BUFFER_TYPE_DYNAMIC_DX8:
 #ifdef VERTEX_BUFFER_LOG
@@ -879,6 +924,18 @@ DynamicVBAccessClass::WriteLockClass::~WriteLockClass()
 		WWDEBUG_SAY(("DynamicVertexBuffer->Unlock()"));
 #endif
 		DX8_Assert();
+		Publish_Render_Buffer_Change(
+			static_cast<DX8VertexBufferClass *>(
+				DynamicVBAccess->VertexBuffer)->Get_DX8_Vertex_Buffer(),
+			rts::render::RENDER_BUFFER_VERTEX, Vertices,
+			static_cast<size_t>(DynamicVBAccess->Get_Vertex_Count()) *
+				DynamicVBAccess->VertexBuffer->FVF_Info().Get_FVF_Size(),
+			static_cast<size_t>(DynamicVBAccess->VertexBufferOffset) *
+				DynamicVBAccess->VertexBuffer->FVF_Info().Get_FVF_Size(),
+			!DynamicVBAccess->VertexBufferOffset ?
+				rts::render::RENDER_BUFFER_UPDATE_DISCARD :
+				rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE,
+			DynamicVBAccess->VertexBuffer->Get_Generation());
 		DX8_ErrorCode(static_cast<DX8VertexBufferClass*>(DynamicVBAccess->VertexBuffer)->Get_DX8_Vertex_Buffer()->Unlock());
 		break;
 	case BUFFER_TYPE_DYNAMIC_SORTING:

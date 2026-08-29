@@ -10,7 +10,9 @@ set(GAMEENGINEDEVICE_SRC
     Include/W3DDevice/Common/RadarTerrainPrepare.h
     Include/W3DDevice/Common/HeightMapTerrainPrepare.h
     Include/W3DDevice/Common/HeightMapDynamicLightPrepare.h
+    Include/W3DDevice/Common/LegacyPixelShaderBytecode.h
     Include/W3DDevice/Common/W3DRadar.h
+    Include/W3DDevice/Common/W3DShroudRenderPolicy.h
     Include/W3DDevice/Common/W3DThingFactory.h
     Include/W3DDevice/GameClient/BaseHeightMap.h
 #    Include/W3DDevice/GameClient/camerashakesystem.h
@@ -59,7 +61,7 @@ set(GAMEENGINEDEVICE_SRC
 #    Include/W3DDevice/GameClient/W3DInGameUI.h
 #    Include/W3DDevice/GameClient/W3DMirror.h
     Include/W3DDevice/GameClient/W3DMouse.h
-#    Include/W3DDevice/GameClient/W3DParticleSys.h
+    Include/W3DDevice/GameClient/W3DParticleSys.h
 #    Include/W3DDevice/GameClient/W3DPoly.h
     Include/W3DDevice/GameClient/W3DProfilerFrameCapture.h
 #    Include/W3DDevice/GameClient/W3DProjectedShadow.h
@@ -107,10 +109,12 @@ set(GAMEENGINEDEVICE_SRC
     Source/W3DDevice/Common/System/RadarTerrainPrepare.cpp
     Source/W3DDevice/Common/System/HeightMapTerrainPrepare.cpp
     Source/W3DDevice/Common/System/HeightMapDynamicLightPrepare.cpp
+    Source/W3DDevice/Common/System/LegacyPixelShaderBytecode.cpp
     Source/W3DDevice/Common/System/W3DRadar.cpp
     Source/W3DDevice/Common/Thing/W3DModuleFactory.cpp
     Source/W3DDevice/Common/Thing/W3DThingFactory.cpp
     Source/W3DDevice/Common/W3DConvert.cpp
+    Source/W3DDevice/Common/System/W3DShroudRenderPolicy.cpp
     Source/W3DDevice/GameClient/BaseHeightMap.cpp
     Source/W3DDevice/GameClient/CameraShakeSystem.cpp
     Source/W3DDevice/GameClient/Drawable/Draw/W3DDebrisDraw.cpp
@@ -244,7 +248,7 @@ target_link_libraries(corei_gameenginedevice_private INTERFACE
 target_link_libraries(corei_gameenginedevice_public INTERFACE
     binkstub
     corei_gameengine_public
-    d3d8lib
+    rts_d3d8lib
     milesstub
 )
 

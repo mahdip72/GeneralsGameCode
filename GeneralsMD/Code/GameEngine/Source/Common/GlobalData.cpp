@@ -637,6 +637,7 @@ GlobalData::GlobalData()
 	m_framesPerSecondLimit = 0;
 	m_chipSetType = 0;
 	m_headless = FALSE;
+	m_rendererCaptureFrame = FALSE;
 	m_windowed = 0;
 	m_xResolution = DEFAULT_DISPLAY_WIDTH;
 	m_yResolution = DEFAULT_DISPLAY_HEIGHT;
@@ -1115,6 +1116,11 @@ GlobalData *GlobalData::newOverride()
 	// copy the data from the latest override (TheWritableGlobalData) to the newly created instance
 	DEBUG_ASSERTCRASH( TheWritableGlobalData, ("GlobalData::newOverride() - no existing data") );
 	*overrideData = *TheWritableGlobalData;
+
+	// The VC6 GlobalData assignment operator intentionally leaves the object unchanged.
+	// Preserve the two-phase command-line state explicitly so startup-only requests
+	// survive the INI override created during engine initialization.
+	overrideData->m_commandLineData = TheWritableGlobalData->m_commandLineData;
 
 	//
 	// link the override to the previously created one, the link order is important here

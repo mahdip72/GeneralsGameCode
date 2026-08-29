@@ -26,7 +26,6 @@
 #include "WWMath/vector3.h"
 
 struct IDirect3DSurface8;
-struct IDirect3DVolume8;
 
 // ----------------------------------------------------------------------------
 //
@@ -138,7 +137,10 @@ struct LegacyDDSURFACEDESC2 {
 	};
 	unsigned AlphaBitDepth;
 	unsigned Reserved;
-	void* Surface;
+	// DDS stores the legacy lpSurface field as a 32-bit on-disk value.  Keep
+	// this fixed-width rather than using a pointer so the header remains 124
+	// bytes when this reader is compiled for x64.
+	unsigned Surface;
 	union
 	{
 		LegacyDDCOLORKEY CKDestOverlay;
@@ -189,10 +191,20 @@ class DDSFileClass
 	unsigned* LevelSizes;
 	unsigned* LevelOffsets;
 	unsigned CubeFaceSize;
+	unsigned CubeFaceDataOffset;
 	LegacyDDSURFACEDESC2 SurfaceDesc;
 	char Name[256];
 
 	static unsigned Calculate_DXTC_Surface_Size(unsigned width, unsigned height, WW3DFormat format);
+	bool Get_4x4_Block_From_Memory(
+		const unsigned char* source_memory,
+		unsigned char* dest_ptr,
+		unsigned dest_pitch,
+		WW3DFormat dest_format,
+		unsigned level,
+		unsigned source_x,
+		unsigned source_y,
+		const Vector3& hsv_shift) const;
 
 public:
 	// You can pass the name in .tga or .dds format, the class will automatically try and load .dds file.

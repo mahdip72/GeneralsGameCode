@@ -219,12 +219,13 @@ set(GAMEENGINE_SRC
     Include/GameClient/ProcessAnimateWindow.h
     Include/GameClient/RadiusDecal.h
     Include/GameClient/RayEffect.h
+    Include/GameClient/SaveLoadFeedback.h
     Include/GameClient/SelectionInfo.h
     Include/GameClient/SelectionXlat.h
 #    Include/GameClient/Shadow.h
-#    Include/GameClient/Shell.h
-#    Include/GameClient/ShellHooks.h
-#    Include/GameClient/ShellMenuScheme.h
+    Include/GameClient/Shell.h
+    Include/GameClient/ShellHooks.h
+    Include/GameClient/ShellMenuScheme.h
     Include/GameClient/Smudge.h
     Include/GameClient/Snow.h
     Include/GameClient/Statistics.h
@@ -800,12 +801,13 @@ set(GAMEENGINE_SRC
 #    Source/GameClient/GUI/GUICallbacks/Menus/WOLWelcomeMenu.cpp
     Source/GameClient/GUI/GUICallbacks/MessageBox.cpp
     Source/GameClient/GUI/GUICallbacks/ReplayControls.cpp
+    Source/GameClient/GUI/GUICallbacks/SaveLoadFeedback.cpp
     Source/GameClient/GUI/HeaderTemplate.cpp
     Source/GameClient/GUI/IMEManager.cpp
     Source/GameClient/GUI/LoadScreen.cpp
     Source/GameClient/GUI/ProcessAnimateWindow.cpp
-#    Source/GameClient/GUI/Shell/Shell.cpp
-#    Source/GameClient/GUI/Shell/ShellMenuScheme.cpp
+    Source/GameClient/GUI/Shell/Shell.cpp
+    Source/GameClient/GUI/Shell/ShellMenuScheme.cpp
     Source/GameClient/GUI/WindowLayout.cpp
     Source/GameClient/GUI/WindowVideoManager.cpp
     Source/GameClient/GUI/WinInstanceData.cpp
@@ -1184,6 +1186,7 @@ target_include_directories(corei_gameengine_private INTERFACE
 
 target_link_libraries(corei_gameengine_private INTERFACE
     corei_always
+    core_profile_legacy
 )
 
 target_compile_definitions(corei_gameengine_private INTERFACE
@@ -1202,7 +1205,7 @@ target_link_libraries(corei_gameengine_public INTERFACE
     core_compression
     core_browserdispatch
     #core_wwvegas
-    d3d8lib
+    rts_d3d8lib
     gamespy::gamespy
     stlport
 )

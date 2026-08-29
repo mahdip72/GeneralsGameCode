@@ -18,6 +18,7 @@
 #include "PreRTS.h"
 
 #include "Common/FramePacer.h"
+#include "Common/SkirmishAITestRunner.h"
 
 #include "GameClient/View.h"
 
@@ -87,6 +88,12 @@ Bool FramePacer::isFramesPerSecondLimitEnabled() const
 
 Bool FramePacer::isActualFramesPerSecondLimitEnabled() const
 {
+	// The automated live-AI gate must never inherit a startup, map, script,
+	// or profile frame limit.  Its armed state is narrower and more durable
+	// than the mutable preference flag used by ordinary gameplay.
+	if (ShouldBypassFramePacingForSkirmishAITest(IsSkirmishAITestRunnerArmed()))
+		return FALSE;
+
 	Bool allowFpsLimit = true;
 
 	if (TheTacticalView != nullptr)

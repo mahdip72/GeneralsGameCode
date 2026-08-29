@@ -536,7 +536,7 @@ WWINLINE Matrix4x4 Matrix4x4::Transpose() const
 WWINLINE Matrix4x4* Matrix4x4::Inverse(Matrix4x4* out, float* detOut, const Matrix4x4* m)
 {
 	// Read matrix elements
-	// Uses a column-major, column-vector convention (matches D3DXMatrixInverse)
+	// Uses a column-major, column-vector convention.
 	// Row[i][j] stores the element at row i, column j.
 
 	const float m00 = m->Row[0][0], m01 = m->Row[1][0], m02 = m->Row[2][0], m03 = m->Row[3][0];
@@ -885,11 +885,9 @@ WWINLINE void	Matrix4x4::Transform_Vector(const Matrix4x4 & A,const Vector4 & in
 // other will always require a transpose.
 
 struct _D3DMATRIX;
-struct D3DXMATRIX;
 
 extern void To_D3DMATRIX(_D3DMATRIX& dxm, const Matrix4x4& m);
 extern _D3DMATRIX To_D3DMATRIX(const Matrix4x4& m);
-extern D3DXMATRIX To_D3DXMATRIX(const Matrix4x4& m);
 
 extern void To_Matrix4x4(Matrix4x4& m, const _D3DMATRIX& dxm);
 extern Matrix4x4 To_Matrix4x4(const _D3DMATRIX& dxm);

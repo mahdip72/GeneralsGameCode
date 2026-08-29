@@ -52,11 +52,15 @@
 #include "WWMath/vector4.h"
 #include "WWLib/cpudetect.h"
 #include "dx8caps.h"
+#include "Renderer/RendererDevice.h"
+#include "Renderer/RenderSubmissionPolicy.h"
+#include "Renderer/LegacyBridgeValidation.h"
 
 #include "texture.h"
 #include "dx8vertexbuffer.h"
 #include "dx8indexbuffer.h"
 #include "WW3D2/vertmaterial.h"
+#include "Renderer/LegacyRenderState.h"
 
 /*
 ** Registry value names
@@ -94,6 +98,19 @@ class TextureClass;
 class LightClass;
 class SurfaceClass;
 
+// Temporary backend-migration notifications. Callers publish logical content
+// changes without depending on which modern renderer mirrors the resource.
+void Notify_Render_Texture_Changed(IDirect3DBaseTexture8 *texture);
+void Notify_Render_Texture_Changed(TextureClass *texture);
+void Notify_Render_Buffer_Changed(IUnknown *buffer);
+void Notify_Render_Buffer_Range_Changed(IUnknown *buffer,
+	unsigned int binding, size_t destination_offset, size_t byte_count,
+	rts::render::RenderBufferUpdateMode mode);
+bool Publish_Render_Buffer_Change(IUnknown *buffer, unsigned int binding,
+	const void *data, size_t byte_count, size_t destination_offset,
+	rts::render::RenderBufferUpdateMode mode,
+	unsigned int source_generation = 0);
+
 struct DX8FrameStatistics
 {
 	DX8FrameStatistics() :
@@ -105,6 +122,7 @@ struct DX8FrameStatistics
 		texture_changes(0),
 		render_state_changes(0),
 		texture_stage_state_changes(0),
+		texture_stage_state_publication_failures(0),
 		dx8_calls(0),
 		draw_calls(0)
 	{
@@ -118,6 +136,10 @@ struct DX8FrameStatistics
 	unsigned texture_changes;
 	unsigned render_state_changes;
 	unsigned texture_stage_state_changes;
+	// Counts logical state updates that the neutral renderer rejected.  The
+	// legacy device still receives the original call; the neutral shadow stays
+	// unchanged so a failed conversion cannot publish a partial state.
+	unsigned texture_stage_state_publication_failures;
 	unsigned dx8_calls;
 	unsigned draw_calls;
 };
@@ -130,6 +152,8 @@ struct DX8FrameStatistics
 #define DX8_RECORD_TEXTURE_CHANGE()				FrameStatistics.texture_changes++
 #define DX8_RECORD_RENDER_STATE_CHANGE()		FrameStatistics.render_state_changes++
 #define DX8_RECORD_TEXTURE_STAGE_STATE_CHANGE() FrameStatistics.texture_stage_state_changes++
+#define DX8_RECORD_TEXTURE_STAGE_STATE_PUBLICATION_FAILURE() \
+	FrameStatistics.texture_stage_state_publication_failures++
 #define DX8_RECORD_DX8_CALLS()					FrameStatistics.dx8_calls++
 #define DX8_RECORD_DRAW_CALLS()					FrameStatistics.draw_calls++
 
@@ -290,13 +314,30 @@ public:
 	/*
 	** Rendering
 	*/
-	static void Begin_Scene();
+	static bool Begin_Scene();
 	static void End_Scene(bool flip_frame = true);
 
 	// Flip until the primary buffer is visible.
 	static void Flip_To_Primary();
 
 	static void Clear(bool clear_color, bool clear_z_stencil, const Vector3 &color, float dest_alpha=0.0f, float z=1.0f, unsigned int stencil=0);
+	// Preserve the legacy submission while optionally mirroring the raw vertex
+	// stream through the active D3D11 bridge.
+	static HRESULT Draw_Primitive_UP(D3DPRIMITIVETYPE primitive_type,
+		UINT primitive_count, CONST void *vertex_data, UINT vertex_stride);
+	// Submit raw DX8 stream/index bindings through the compatibility boundary.
+	// These helpers preserve the legacy device call while retaining enough
+	// typed state for the D3D11 bridge to mirror the successful draw.
+	static HRESULT Set_DX8_Vertex_Buffer(IDirect3DVertexBuffer8 *vb,
+		UINT stride, DWORD fvf);
+	static void Track_DX8_Vertex_Buffer(IDirect3DVertexBuffer8 *vb,
+		UINT stride, DWORD fvf);
+	static HRESULT Set_DX8_Index_Buffer(IDirect3DIndexBuffer8 *ib,
+		UINT base_vertex);
+	static HRESULT Draw_DX8_Indexed_Primitive(
+		D3DPRIMITIVETYPE primitive_type, UINT min_vertex_index,
+		UINT vertex_count, UINT start_index, UINT primitive_count);
+	static unsigned int Get_D3D11_Raw_Indexed_Draw_Count();
 
 	static void	Set_Viewport(CONST D3DVIEWPORT8* pViewport);
 
@@ -311,6 +352,13 @@ public:
 	static void Release_Render_State();
 
 	static void Set_DX8_Material(const D3DMATERIAL8* mat);
+	// Apply a fixed-function vertex-material state supplied through the
+	// renderer-neutral contract.  The implementation performs the legacy
+	// backend conversion here, keeping D3D8 descriptors/constants out of
+	// product material code while preserving the compatibility call path.
+	static void Set_Legacy_Vertex_Material(
+		const rts::render::LegacyVertexMaterialState& state);
+	static void Set_Legacy_Vertex_Material_Null();
 
 	static void Set_Gamma(float gamma,float bright,float contrast,bool calibrate=true,bool uselimit=true);
 
@@ -333,9 +381,18 @@ public:
 
 	static void Set_DX8_Light(int index,D3DLIGHT8* light);
 	static void Set_DX8_Render_State(D3DRENDERSTATETYPE state, unsigned value);
+	static bool Publish_Render_State(D3DRENDERSTATETYPE state, unsigned value);
 	static void Set_DX8_Clip_Plane(DWORD Index, CONST float* pPlane);
 	static void Set_DX8_Texture_Stage_State(unsigned stage, D3DTEXTURESTAGESTATETYPE state, unsigned value);
+	// Returns false when the value cannot be represented by the neutral
+	// renderer.  On failure the neutral stage remains unchanged; the legacy
+	// D3D8 call is still issued by Set_DX8_Texture_Stage_State.
+	static bool Publish_Texture_Stage_State(unsigned stage,
+		D3DTEXTURESTAGESTATETYPE state, unsigned value);
 	static void Set_DX8_Texture(unsigned int stage, IDirect3DBaseTexture8* texture);
+	// Returns the wrapper-owned texture shadow without changing its reference
+	// count.  The caller must consume it before the next texture-state change.
+	static IDirect3DBaseTexture8 *Get_Tracked_DX8_Texture(unsigned int stage);
 	static void Set_Light_Environment(LightEnvironmentClass* light_env);
 	static LightEnvironmentClass* Get_Light_Environment() { return Light_Environment; }
 	static void Set_Fog(bool enable, const Vector3 &color, float start, float end);
@@ -419,6 +476,32 @@ public:
 	static IDirect3DSurface8 * _Create_DX8_Surface(const char *filename);
 	static IDirect3DSurface8 * _Get_DX8_Front_Buffer();
 	static SurfaceClass * _Get_DX8_Back_Buffer(unsigned int num=0);
+	static bool Is_D3D11_Backend_Active();
+	static void Begin_D3D11_Display_Iteration();
+	static rts::render::RenderResult Get_Render_Back_Buffer_Info(
+		rts::render::RenderBackBufferInfo *info);
+	static rts::render::RenderResult Copy_Active_Render_Target_To_Texture(
+		IDirect3DBaseTexture8 *destination);
+	static bool Acquire_D3D11_Copied_Texture_Content(
+		IDirect3DBaseTexture8 *texture);
+	static void Notify_D3D11_Buffer_Changed(IUnknown *buffer);
+	static void Notify_D3D11_Buffer_Range_Changed(IUnknown *buffer,
+		unsigned int binding, size_t destination_offset, size_t byte_count,
+		rts::render::RenderBufferUpdateMode mode);
+	static bool Publish_D3D11_Buffer_Change(IUnknown *buffer,
+		unsigned int binding, const void *data, size_t byte_count,
+		size_t destination_offset, rts::render::RenderBufferUpdateMode mode,
+		unsigned int source_generation = 0);
+	static void Notify_D3D11_Texture_Changed(IDirect3DBaseTexture8 *texture);
+	static void Notify_D3D11_Texture_Changed(TextureClass *texture);
+	static void Request_D3D11_Back_Buffer_Capture();
+	static rts::render::RenderResult Get_D3D11_Back_Buffer_Info(
+		rts::render::RenderBackBufferInfo *info);
+	static rts::render::RenderResult Queue_D3D11_Back_Buffer_Capture(
+		const rts::render::RenderCaptureRequestDescriptor &descriptor,
+		rts::render::RenderCaptureHandle *handle);
+	static unsigned int Cancel_D3D11_Back_Buffer_Captures(void *consumer,
+		rts::render::RenderResult reason);
 
 	static void _Copy_DX8_Rects(
 			IDirect3DSurface8* pSourceSurface,
@@ -429,6 +512,13 @@ public:
 	);
 
 	static void _Update_Texture(TextureClass *system, TextureClass *video);
+	// Keep raw texture uploads behind the renderer compatibility boundary.  A
+	// few legacy loaders own a temporary cube/volume resource directly and do
+	// not have a TextureClass wrapper for the destination yet.
+	static void _Update_Texture(
+		IDirect3DBaseTexture8 *system,
+		IDirect3DBaseTexture8 *video);
+	static void Set_Cursor_Visible(bool visible);
 	static void Flush_DX8_Resource_Manager(unsigned int bytes=0);
 	static unsigned int Get_Free_Texture_RAM();
 
@@ -485,8 +575,12 @@ public:
 	*/
 	static TextureClass *	Create_Render_Target (int width, int height, WW3DFormat format = WW3D_FORMAT_UNKNOWN);
 
-	static void					Set_Render_Target (IDirect3DSurface8 *render_target, bool use_default_depth_buffer = false);
-	static void					Set_Render_Target (IDirect3DSurface8* render_target, IDirect3DSurface8* dpeth_buffer);
+	// Returns success only after the legacy target and, when active, the
+	// D3D11 bridge accepted the transition.  Callers may ignore the result for
+	// historical fire-and-forget use, but RTT publishers must honor it.
+	static HRESULT				Set_Render_Target (IDirect3DSurface8 *render_target, bool use_default_depth_buffer = false);
+	static HRESULT				Set_Render_Target (IDirect3DSurface8* render_target, IDirect3DSurface8* dpeth_buffer);
+	static HRESULT				Restore_Default_Render_Target();
 
 	static void					Set_Render_Target (IDirect3DSwapChain8 *swap_chain);
 	static bool					Is_Render_To_Texture() { return IsRenderToTexture; }
@@ -501,7 +595,8 @@ public:
 		TextureClass** target,
 		ZTextureClass** depth_buffer
 	);
-	static void					Set_Render_Target_With_Z (TextureClass * texture, ZTextureClass* ztexture=nullptr);
+	static void					Set_Render_Target_With_Z (TextureClass * texture,
+		ZTextureClass* ztexture=nullptr, bool use_default_depth_if_missing=true);
 
 	static void Set_Shadow_Map(int idx, ZTextureClass* ztex) { Shadow_Map[idx]=ztex; }
 	static ZTextureClass* Get_Shadow_Map(int idx) { return Shadow_Map[idx]; }
@@ -512,6 +607,12 @@ public:
 
 	static void Set_Vertex_Shader(DWORD vertex_shader);
 	static void Set_Pixel_Shader(DWORD pixel_shader);
+	static HRESULT Create_Pixel_Shader(const DWORD *function, DWORD *pixel_shader);
+	static HRESULT Delete_Pixel_Shader(DWORD pixel_shader);
+	static void Set_Legacy_Pixel_Program(
+		rts::render::RenderLegacyPixelProgram program);
+	static void Set_Legacy_Vertex_Program(
+		rts::render::RenderLegacyVertexProgram program);
 
 	static void Set_Vertex_Shader_Constant(int reg, const void* data, int count);
 	static void Set_Pixel_Shader_Constant(int reg, const void* data, int count);
@@ -530,7 +631,8 @@ public:
 	static IDirect3D8* _Get_D3D8() { return D3DInterface; }
 	/// Returns the display format - added by TR for video playback - not part of W3D
 	static WW3DFormat	getBackBufferFormat();
-	static bool Reset_Device(bool reload_assets=true);
+	static bool Reset_Device(bool reload_assets=true,
+		bool *reset_requires_reacquire=nullptr);
 
 	static const DX8Caps*	Get_Current_Caps() { WWASSERT(CurrentCaps); return CurrentCaps; }
 
@@ -615,7 +717,8 @@ protected:
 	/*
 	** Internal functions
 	*/
-	static void Resize_And_Position_Window();
+	static bool Resize_And_Position_Window(bool use_restored_width,
+		bool use_restored_height);
 	static bool Find_Color_And_Z_Mode(int resx,int resy,int bitdepth,D3DFORMAT * set_colorbuffer,D3DFORMAT * set_backbuffer, D3DFORMAT * set_zmode);
 	static bool Find_Color_Mode(D3DFORMAT colorbuffer, int resx, int resy, UINT *mode);
 	static bool Find_Z_Mode(D3DFORMAT colorbuffer,D3DFORMAT backbuffer, D3DFORMAT *zmode);
@@ -631,6 +734,11 @@ protected:
 	static RenderStateStruct			render_state;
 	static unsigned						render_state_changed;
 	static D3DMATRIX						DX8Transforms[D3DTS_WORLD+1];
+	static IDirect3DVertexBuffer8 *		RawVertexBuffer;
+	static IDirect3DIndexBuffer8 *		RawIndexBuffer;
+	static UINT							RawVertexStride;
+	static DWORD							RawVertexFVF;
+	static UINT							RawIndexBaseVertex;
 
 	static bool								IsInitted;
 	static bool								IsDeviceLost;
@@ -689,6 +797,7 @@ protected:
 
 	static IDirect3DSurface8 *			CurrentRenderTarget;
 	static IDirect3DSurface8 *			CurrentDepthBuffer;
+	static bool							CurrentDepthBufferIsDefault;
 	static IDirect3DSurface8 *			DefaultRenderTarget;
 	static IDirect3DSurface8 *			DefaultDepthBuffer;
 
@@ -728,9 +837,70 @@ WWINLINE void DX8Wrapper::Set_Pixel_Shader(DWORD pixel_shader)
 	DX8CALL(SetPixelShader(Pixel_Shader));
 }
 
+WWINLINE void DX8Wrapper::Set_Cursor_Visible(bool visible)
+{
+	if (D3DDevice == 0)
+	{
+		return;
+	}
+	DX8_THREAD_ASSERT();
+	// ShowCursor returns the display-count, not an HRESULT.  Do not feed that
+	// value through DX8_ErrorCode: a successful hide commonly returns FALSE.
+	DX8_Assert();
+	D3DDevice->ShowCursor(visible ? TRUE : FALSE);
+	DX8Wrapper::Increment_DX8_CallCount();
+}
+
+WWINLINE HRESULT DX8Wrapper::Create_Pixel_Shader(const DWORD *function,
+	DWORD *pixel_shader)
+{
+	if (function == 0 || pixel_shader == 0 || D3DDevice == 0)
+	{
+		return E_INVALIDARG;
+	}
+	DX8_THREAD_ASSERT();
+	HRESULT result = E_FAIL;
+	DX8CALL_HRES(CreatePixelShader(function, pixel_shader), result);
+	return result;
+}
+
+WWINLINE HRESULT DX8Wrapper::Delete_Pixel_Shader(DWORD pixel_shader)
+{
+	if (D3DDevice == 0)
+	{
+		return E_FAIL;
+	}
+	DX8_THREAD_ASSERT();
+	HRESULT result = E_FAIL;
+	DX8CALL_HRES(DeletePixelShader(pixel_shader), result);
+	if (SUCCEEDED(result) && Pixel_Shader == pixel_shader)
+	{
+		Pixel_Shader = 0;
+	}
+	return result;
+}
+
+WWINLINE void DX8Wrapper::Set_Legacy_Pixel_Program(
+	rts::render::RenderLegacyPixelProgram program)
+{
+	rts::render::TrackLegacyPixelProgram(program);
+}
+
+WWINLINE void DX8Wrapper::Set_Legacy_Vertex_Program(
+	rts::render::RenderLegacyVertexProgram program)
+{
+	rts::render::TrackLegacyVertexProgram(program);
+}
+
 WWINLINE void DX8Wrapper::Set_Vertex_Shader_Constant(int reg, const void* data, int count)
 {
 	int memsize=sizeof(Vector4)*count;
+	if (reg >= 0 && count > 0)
+	{
+		rts::render::TrackLegacyVertexShaderConstants(
+			static_cast<unsigned int>(reg), static_cast<const float *>(data),
+			static_cast<unsigned int>(count));
+	}
 
 	// may be incorrect if shaders are created and destroyed dynamically
 	if (memcmp(data, &Vertex_Shader_Constants[reg],memsize)==0) return;
@@ -742,6 +912,12 @@ WWINLINE void DX8Wrapper::Set_Vertex_Shader_Constant(int reg, const void* data, 
 WWINLINE void DX8Wrapper::Set_Pixel_Shader_Constant(int reg, const void* data, int count)
 {
 	int memsize=sizeof(Vector4)*count;
+	if (reg >= 0 && count > 0)
+	{
+		rts::render::TrackLegacyPixelShaderConstants(
+			static_cast<unsigned int>(reg), static_cast<const float *>(data),
+			static_cast<unsigned int>(count));
+	}
 
 	// may be incorrect if shaders are created and destroyed dynamically
 	if (memcmp(data, &Pixel_Shader_Constants[reg],memsize)==0) return;
@@ -754,6 +930,30 @@ WWINLINE void DX8Wrapper::Set_Pixel_Shader_Constant(int reg, const void* data, i
 WWINLINE void DX8Wrapper::_Set_DX8_Transform(D3DTRANSFORMSTATETYPE transform, const D3DMATRIX& m)
 {
 	WWASSERT(transform<=D3DTS_WORLD);
+	switch (transform)
+	{
+	case D3DTS_WORLD:
+		rts::render::TrackLegacyTransform(rts::render::LEGACY_TRANSFORM_WORLD,
+			&m.m[0][0]);
+		break;
+	case D3DTS_VIEW:
+		rts::render::TrackLegacyTransform(rts::render::LEGACY_TRANSFORM_VIEW,
+			&m.m[0][0]);
+		break;
+	case D3DTS_PROJECTION:
+		rts::render::TrackLegacyTransform(
+			rts::render::LEGACY_TRANSFORM_PROJECTION, &m.m[0][0]);
+		break;
+	default:
+		if (transform >= D3DTS_TEXTURE0 && transform <= D3DTS_TEXTURE7)
+		{
+			rts::render::TrackLegacyTransform(
+				static_cast<rts::render::LegacyTransformSlot>(
+					rts::render::LEGACY_TRANSFORM_TEXTURE0 +
+					(transform - D3DTS_TEXTURE0)), &m.m[0][0]);
+		}
+		break;
+	}
 #if 0 // (gth) this optimization is breaking generals because they set the transform behind our backs.
 	if (mtx!=DX8Transforms[transform])
 #endif
@@ -800,6 +1000,12 @@ WWINLINE void DX8Wrapper::Set_Fog(bool enable, const Vector3 &color, float start
 	// Set global states
 	FogEnable = enable;
 	FogColor = Convert_Color(color,0.0f);
+	rts::render::LegacyFogConstants neutralFog;
+	neutralFog.enabled = enable;
+	neutralFog.color = rts::render::RenderFloat4(color.X, color.Y, color.Z, 1.0f);
+	neutralFog.start = start;
+	neutralFog.end = end;
+	rts::render::TrackLegacyFog(neutralFog);
 
 	// Invalidate the current shader (since the renderstates set by the shader
 	// depend on the global fog settings as well as the actual shader settings)
@@ -815,6 +1021,8 @@ WWINLINE void DX8Wrapper::Set_Ambient(const Vector3& color)
 {
 	Ambient_Color=color;
 	Set_DX8_Render_State(D3DRS_AMBIENT, DX8Wrapper::Convert_Color(color,0.0f));
+	rts::render::TrackLegacyGlobalAmbient(
+		rts::render::RenderFloat4(color.X, color.Y, color.Z, 1.0f));
 }
 
 // ----------------------------------------------------------------------------
@@ -833,25 +1041,16 @@ WWINLINE void DX8Wrapper::Set_DX8_Material(const D3DMATERIAL8* mat)
 	DX8CALL(SetMaterial(mat));
 }
 
-WWINLINE void DX8Wrapper::Set_DX8_Light(int index, D3DLIGHT8* light)
-{
-	if (light) {
-		DX8_RECORD_LIGHT_CHANGE();
-		DX8CALL(SetLight(index,light));
-		DX8CALL(LightEnable(index,TRUE));
-		CurrentDX8LightEnables[index]=true;
-		SNAPSHOT_SAY(("DX8 - SetLight %d",index));
-	}
-	else if (CurrentDX8LightEnables[index]) {
-		DX8_RECORD_LIGHT_CHANGE();
-		CurrentDX8LightEnables[index]=false;
-		DX8CALL(LightEnable(index,FALSE));
-		SNAPSHOT_SAY(("DX8 - DisableLight %d",index));
-	}
-}
-
 WWINLINE void DX8Wrapper::Set_DX8_Render_State(D3DRENDERSTATETYPE state, unsigned value)
 {
+	const bool published = Publish_Render_State(state, value);
+	if (rts::render::Should_Poison_D3D11_Render_State(
+		static_cast<unsigned int>(state), published))
+	{
+		// D3D8 remains the compatibility authority, but a visible D3D11 draw
+		// must not reuse stale neutral state after a rejected publication.
+		rts::render::MarkLegacyStatePublicationFailure();
+	}
 	// Can't monitor state changes because setShader call to GERD may change the states!
 	if (RenderStates[state]==value) return;
 
@@ -873,18 +1072,51 @@ WWINLINE void DX8Wrapper::Set_DX8_Render_State(D3DRENDERSTATETYPE state, unsigne
 WWINLINE void DX8Wrapper::Set_DX8_Clip_Plane(DWORD Index, CONST float* pPlane)
 {
 	DX8CALL(SetClipPlane( Index, pPlane ));
+	if (!rts::render::TrackLegacyClipPlane(Index, pPlane))
+	{
+		// Preserve the D3D8 call, but never let D3D11 reuse an earlier plane
+		// when the requested slot/equation cannot be mirrored safely.
+		rts::render::MarkLegacyStatePublicationFailure();
+	}
 }
 
 WWINLINE void DX8Wrapper::Set_DX8_Texture_Stage_State(unsigned stage, D3DTEXTURESTAGESTATETYPE state, unsigned value)
 {
   	if (stage >= MAX_TEXTURE_STAGES)
-  	{	DX8CALL(SetTextureStageState( stage, state, value ));
-  		return;
-  	}
+	{
+		DX8CALL(SetTextureStageState( stage, state, value ));
+		DX8_RECORD_TEXTURE_STAGE_STATE_PUBLICATION_FAILURE();
+		rts::render::MarkLegacyStatePublicationFailure();
+		return;
+	}
 
 	// Can't monitor state changes because setShader call to GERD may change the states!
-	if (TextureStageStates[stage][(unsigned int)state]==value) return;
-#ifdef MESH_RENDER_SNAPSHOT_ENABLED
+	const unsigned int state_index = static_cast<unsigned int>(state);
+	if (state_index >= 32)
+	{
+		// Keep the D3D8 compatibility call intact, but never index the fixed
+		// 32-entry shadow with an invalid enum. An active neutral renderer
+		// cannot safely infer the requested state, so poison this frame just as
+		// Publish_Texture_Stage_State does for an unsupported value.
+		DX8CALL(SetTextureStageState( stage, state, value ));
+		DX8_RECORD_TEXTURE_STAGE_STATE_PUBLICATION_FAILURE();
+		rts::render::MarkLegacyStatePublicationFailure();
+		return;
+	}
+	if (!Publish_Texture_Stage_State(stage, state, value))
+	{
+		// D3D8 remains the compatibility authority for this call.  Do not
+		// mutate the neutral shadow on a rejected conversion; preserve the
+		// failure in frame statistics so D3D11 parity diagnostics can identify
+		// the first unsupported state publication.
+		DX8_RECORD_TEXTURE_STAGE_STATE_PUBLICATION_FAILURE();
+		rts::render::MarkLegacyStatePublicationFailure();
+	}
+	// Publish first so a reset/reseed cannot leave the neutral shadow stale,
+	// then retain the legacy redundant-state fast path for the actual D3D8
+	// call and its bookkeeping.
+	if (TextureStageStates[stage][state_index]==value) return;
+	#ifdef MESH_RENDER_SNAPSHOT_ENABLED
 	if (WW3D::Is_Snapshot_Activated()) {
 		StringClass value_name(0,true);
 		Get_DX8_Texture_Stage_State_Value_Name(value_name,state,value);
@@ -893,9 +1125,9 @@ WWINLINE void DX8Wrapper::Set_DX8_Texture_Stage_State(unsigned stage, D3DTEXTURE
 			Get_DX8_Texture_Stage_State_Name(state),
 			value_name.str()));
 	}
-#endif
+	#endif
 
-	TextureStageStates[stage][(unsigned int)state]=value;
+	TextureStageStates[stage][state_index]=value;
 	DX8CALL(SetTextureStageState( stage, state, value ));
 	DX8_RECORD_TEXTURE_STAGE_STATE_CHANGE();
 }
@@ -907,6 +1139,7 @@ WWINLINE void DX8Wrapper::Set_DX8_Texture(unsigned int stage, IDirect3DBaseTextu
   		return;
   	}
 
+	rts::render::TrackLegacyTexturePresence(stage, texture != nullptr);
 	if (Textures[stage]==texture) return;
 
 	SNAPSHOT_SAY(("DX8 - SetTexture(%x) ",texture));
@@ -916,6 +1149,12 @@ WWINLINE void DX8Wrapper::Set_DX8_Texture(unsigned int stage, IDirect3DBaseTextu
 	if (Textures[stage]) Textures[stage]->AddRef();
 	DX8CALL(SetTexture(stage, texture));
 	DX8_RECORD_TEXTURE_CHANGE();
+}
+
+WWINLINE IDirect3DBaseTexture8 *DX8Wrapper::Get_Tracked_DX8_Texture(
+	unsigned int stage)
+{
+	return stage < MAX_TEXTURE_STAGES ? Textures[stage] : nullptr;
 }
 
 WWINLINE void DX8Wrapper::_Copy_DX8_Rects(
@@ -1158,6 +1397,7 @@ WWINLINE void DX8Wrapper::Get_Shader(ShaderClass& shader)
 WWINLINE void DX8Wrapper::Set_Texture(unsigned stage,TextureBaseClass* texture)
 {
 	WWASSERT(stage<(unsigned int)CurrentCaps->Get_Max_Textures_Per_Pass());
+	rts::render::TrackLegacyTexturePresence(stage, texture != nullptr);
 	if (texture==render_state.Textures[stage]) return;
 	REF_PTR_SET(render_state.Textures[stage],texture);
 	render_state_changed|=(TEXTURE0_CHANGED<<stage);
@@ -1165,6 +1405,13 @@ WWINLINE void DX8Wrapper::Set_Texture(unsigned stage,TextureBaseClass* texture)
 
 WWINLINE void DX8Wrapper::Set_Material(const VertexMaterialClass* material)
 {
+	rts::render::LegacyMaterialState neutralMaterial;
+	if (material != nullptr) {
+		// Preserve every legacy material channel, including alpha values not
+		// exposed by the historic Vector3 getter methods.
+		neutralMaterial = material->Get_Renderer_Material_State();
+	}
+	rts::render::TrackLegacyMaterial(neutralMaterial);
 /*	if (material && render_state.material &&
 		// !stricmp(material->Get_Name(),render_state.material->Get_Name())) {
 		material->Get_CRC()!=render_state.material->Get_CRC()) {
@@ -1181,6 +1428,7 @@ WWINLINE void DX8Wrapper::Set_Material(const VertexMaterialClass* material)
 
 WWINLINE void DX8Wrapper::Set_Shader(const ShaderClass& shader)
 {
+	rts::render::TrackLegacyShaderBits(shader.Get_Bits());
 	if (!ShaderClass::ShaderDirty && ((unsigned&)shader==(unsigned&)render_state.shader)) {
 		return;
 	}
@@ -1204,9 +1452,14 @@ WWINLINE void DX8Wrapper::Set_Projection_Transform_With_Z_Bias(const Matrix4x4& 
 		tmp_zbias*=(1.0f/16.0f);
 		tmp_zbias*=1.0f / (ZFar - ZNear);
 		tmp.m[2][2]-=tmp_zbias*tmp.m[3][2];
+		rts::render::TrackLegacyTransform(
+			rts::render::LEGACY_TRANSFORM_PROJECTION, &tmp.m[0][0]);
 		DX8CALL(SetTransform(D3DTS_PROJECTION,&tmp));
 	}
 	else {
+		rts::render::TrackLegacyTransform(
+			rts::render::LEGACY_TRANSFORM_PROJECTION,
+			&ProjectionMatrix.m[0][0]);
 		DX8CALL(SetTransform(D3DTS_PROJECTION,&ProjectionMatrix));
 	}
 }
@@ -1216,17 +1469,24 @@ WWINLINE void DX8Wrapper::Set_Transform(D3DTRANSFORMSTATETYPE transform,const Ma
 	switch ((int)transform) {
 	case D3DTS_WORLD:
 		render_state.world=To_D3DMATRIX(m);
+		rts::render::TrackLegacyTransform(rts::render::LEGACY_TRANSFORM_WORLD,
+			&render_state.world.m[0][0]);
 		render_state_changed|=(unsigned)WORLD_CHANGED;
 		render_state_changed&=~(unsigned)WORLD_IDENTITY;
 		break;
 	case D3DTS_VIEW:
 		render_state.view=To_D3DMATRIX(m);
+		rts::render::TrackLegacyTransform(rts::render::LEGACY_TRANSFORM_VIEW,
+			&render_state.view.m[0][0]);
 		render_state_changed|=(unsigned)VIEW_CHANGED;
 		render_state_changed&=~(unsigned)VIEW_IDENTITY;
 		break;
 	case D3DTS_PROJECTION:
 		{
 			D3DMATRIX ProjectionMatrix=To_D3DMATRIX(m);
+			rts::render::TrackLegacyTransform(
+				rts::render::LEGACY_TRANSFORM_PROJECTION,
+				&ProjectionMatrix.m[0][0]);
 			ZFar=0.0f;
 			ZNear=0.0f;
 			DX8CALL(SetTransform(D3DTS_PROJECTION,&ProjectionMatrix));
@@ -1235,6 +1495,12 @@ WWINLINE void DX8Wrapper::Set_Transform(D3DTRANSFORMSTATETYPE transform,const Ma
 	default:
 		DX8_RECORD_MATRIX_CHANGE();
 		D3DMATRIX dxm=To_D3DMATRIX(m);
+		if (transform >= D3DTS_TEXTURE0 && transform <= D3DTS_TEXTURE7) {
+			rts::render::TrackLegacyTransform(
+				static_cast<rts::render::LegacyTransformSlot>(
+					rts::render::LEGACY_TRANSFORM_TEXTURE0 +
+					(transform - D3DTS_TEXTURE0)), &dxm.m[0][0]);
+		}
 		DX8CALL(SetTransform(transform,&dxm));
 		break;
 	}
@@ -1245,17 +1511,27 @@ WWINLINE void DX8Wrapper::Set_Transform(D3DTRANSFORMSTATETYPE transform,const Ma
 	switch ((int)transform) {
 	case D3DTS_WORLD:
 		render_state.world=To_D3DMATRIX(m);
+		rts::render::TrackLegacyTransform(rts::render::LEGACY_TRANSFORM_WORLD,
+			&render_state.world.m[0][0]);
 		render_state_changed|=(unsigned)WORLD_CHANGED;
 		render_state_changed&=~(unsigned)WORLD_IDENTITY;
 		break;
 	case D3DTS_VIEW:
 		render_state.view=To_D3DMATRIX(m);
+		rts::render::TrackLegacyTransform(rts::render::LEGACY_TRANSFORM_VIEW,
+			&render_state.view.m[0][0]);
 		render_state_changed|=(unsigned)VIEW_CHANGED;
 		render_state_changed&=~(unsigned)VIEW_IDENTITY;
 		break;
 	default:
 		DX8_RECORD_MATRIX_CHANGE();
 		D3DMATRIX dxm=To_D3DMATRIX(m);
+		if (transform >= D3DTS_TEXTURE0 && transform <= D3DTS_TEXTURE7) {
+			rts::render::TrackLegacyTransform(
+				static_cast<rts::render::LegacyTransformSlot>(
+					rts::render::LEGACY_TRANSFORM_TEXTURE0 +
+					(transform - D3DTS_TEXTURE0)), &dxm.m[0][0]);
+		}
 		DX8CALL(SetTransform(transform,&dxm));
 		break;
 	}

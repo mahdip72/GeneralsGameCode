@@ -41,11 +41,114 @@
 
 #include "dx8fvf.h"
 #include "WWLib/wwstring.h"
-#include <d3dx8core.h>
+
+namespace
+{
+/* Newer SDKs name these legacy-compatible bit values; keep the calculator
+ * usable with the minimal headers used by the VC6 lane. */
+const unsigned kD3DFVF_PSIZE = 0x00000020u;
+const unsigned kD3DFVF_LASTBETA_D3DCOLOR = 0x00008000u;
+const unsigned kD3DFVF_TEXCOORD_MASK = 0xffff0000u;
+const unsigned kD3DFVF_MAX_TEXCOORD = 8u;
 
 static unsigned Get_FVF_Vertex_Size(unsigned FVF)
 {
-	return D3DXGetFVFVertexSize(FVF);
+	const unsigned position = FVF & D3DFVF_POSITION_MASK;
+	const unsigned lastBetaMask = D3DFVF_LASTBETA_UBYTE4 |
+		kD3DFVF_LASTBETA_D3DCOLOR;
+	const unsigned knownMask = D3DFVF_POSITION_MASK |
+		D3DFVF_NORMAL | kD3DFVF_PSIZE | D3DFVF_DIFFUSE |
+		D3DFVF_SPECULAR | D3DFVF_TEXCOUNT_MASK | lastBetaMask |
+		kD3DFVF_TEXCOORD_MASK;
+	unsigned vertexSize;
+	unsigned blendFieldCount;
+	unsigned textureCount;
+	unsigned stage;
+
+	/* Reject bits which have no legacy FVF meaning before decoding fields. */
+	if ((FVF & ~knownMask) != 0u)
+		return 0;
+
+	switch (position)
+	{
+	case D3DFVF_XYZ:
+		vertexSize = 3 * sizeof(float);
+		blendFieldCount = 0;
+		break;
+	case D3DFVF_XYZRHW:
+		vertexSize = 4 * sizeof(float);
+		blendFieldCount = 0;
+		break;
+	case D3DFVF_XYZB1:
+		vertexSize = 4 * sizeof(float);
+		blendFieldCount = 1;
+		break;
+	case D3DFVF_XYZB2:
+		vertexSize = 5 * sizeof(float);
+		blendFieldCount = 2;
+		break;
+	case D3DFVF_XYZB3:
+		vertexSize = 6 * sizeof(float);
+		blendFieldCount = 3;
+		break;
+	case D3DFVF_XYZB4:
+		vertexSize = 7 * sizeof(float);
+		blendFieldCount = 4;
+		break;
+	case D3DFVF_XYZB5:
+		vertexSize = 8 * sizeof(float);
+		blendFieldCount = 5;
+		break;
+	default:
+		return 0;
+	}
+
+	/* RHW vertices cannot carry a normal; LASTBETA requires blend fields. */
+	if ((position == D3DFVF_XYZRHW && (FVF & D3DFVF_NORMAL) != 0u) ||
+		(blendFieldCount == 0u && (FVF & lastBetaMask) != 0u) ||
+		((FVF & lastBetaMask) == lastBetaMask))
+		return 0;
+
+	textureCount = (FVF & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT;
+	if (textureCount > kD3DFVF_MAX_TEXCOORD)
+		return 0;
+
+	if ((FVF & D3DFVF_NORMAL) != 0u)
+		vertexSize += 3 * sizeof(float);
+	if ((FVF & kD3DFVF_PSIZE) != 0u)
+		vertexSize += sizeof(float);
+	if ((FVF & D3DFVF_DIFFUSE) != 0u)
+		vertexSize += sizeof(DWORD);
+	if ((FVF & D3DFVF_SPECULAR) != 0u)
+		vertexSize += sizeof(DWORD);
+
+	for (stage = 0; stage < kD3DFVF_MAX_TEXCOORD; ++stage)
+	{
+		const unsigned format = (FVF >> (16 + stage * 2)) & 3u;
+		unsigned componentCount;
+
+		/* A non-default dimension on an unused stage is not a legal FVF. */
+		if (stage >= textureCount)
+		{
+			if (format != 0u)
+				return 0;
+			continue;
+		}
+
+		/* D3DFVF_TEXTUREFORMAT2 is encoded as zero. */
+		switch (format)
+		{
+		case 0u: componentCount = 2u; break;
+		case 1u: componentCount = 3u; break;
+		case 2u: componentCount = 4u; break;
+		case 3u: componentCount = 1u; break;
+		default: return 0;
+		}
+		vertexSize += componentCount * sizeof(float);
+	}
+
+	return vertexSize;
+}
 }
 
 FVFInfoClass::FVFInfoClass(unsigned FVF_)
@@ -53,14 +156,46 @@ FVFInfoClass::FVFInfoClass(unsigned FVF_)
 	FVF(FVF_),
 	fvf_size(Get_FVF_Vertex_Size(FVF))
 {
-	location_offset=0;
-	blend_offset=location_offset;
-
-	if ((FVF&D3DFVF_XYZ)==D3DFVF_XYZ) blend_offset+=3*sizeof(float);
+	/*
+	 * Keep the offsets derived from the same field order as the FVF stride
+	 * calculator above.  The old code only advanced XYZ (not XYZRHW) and
+	 * special-cased one XYZB4 form.  That made every pre-transformed colour
+	 * or textured vertex point at byte zero for D3D11 input-layout creation,
+	 * which is a particularly bad failure mode for the shell/UI path.
+	 */
+	location_offset = 0;
+	blend_offset = 0;
+	switch (FVF & D3DFVF_POSITION_MASK)
+	{
+	case D3DFVF_XYZ:
+		blend_offset = 3 * sizeof(float);
+		break;
+	case D3DFVF_XYZRHW:
+	case D3DFVF_XYZB1:
+		blend_offset = 4 * sizeof(float);
+		break;
+	case D3DFVF_XYZB2:
+		blend_offset = 5 * sizeof(float);
+		break;
+	case D3DFVF_XYZB3:
+		blend_offset = 6 * sizeof(float);
+		break;
+	case D3DFVF_XYZB4:
+		blend_offset = 7 * sizeof(float);
+		break;
+	case D3DFVF_XYZB5:
+		blend_offset = 8 * sizeof(float);
+		break;
+	default:
+		/* Keep invalid FVFs fail-closed for the D3D11 layout builder. */
+		blend_offset = 0;
+		break;
+	}
+	if ((FVF & kD3DFVF_PSIZE) != 0u)
+	{
+		blend_offset += sizeof(float);
+	}
 	normal_offset=blend_offset;
-
-	if ( ((FVF&D3DFVF_XYZB4)==D3DFVF_XYZB4) &&
-		  ((FVF&D3DFVF_LASTBETA_UBYTE4)==D3DFVF_LASTBETA_UBYTE4) ) normal_offset+=3*sizeof(float)+sizeof(DWORD);
 	diffuse_offset=normal_offset;
 
 	if ((FVF&D3DFVF_NORMAL)==D3DFVF_NORMAL) diffuse_offset+=3*sizeof(float);

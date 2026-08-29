@@ -25,7 +25,151 @@
 #include "dx8wrapper.h"
 #include "bitmaphandler.h"
 #include "colorspace.h"
-#include <ddraw.h>
+#include "legacytexturecompat.h"
+
+#include <string.h>
+
+namespace
+{
+// These values are part of the DDS file format's legacy CAPS2 field.  They
+// are deliberately kept local instead of importing DirectDraw headers into
+// the asset loader.
+const unsigned DDS_FILE_CAPS2_CUBEMAP = 0x00000200;
+const unsigned DDS_FILE_CAPS2_VOLUME = 0x00200000;
+
+bool Is_Supported_DDS_Format(WW3DFormat format)
+{
+	switch (format)
+	{
+	case WW3D_FORMAT_DXT1:
+	case WW3D_FORMAT_DXT2:
+	case WW3D_FORMAT_DXT3:
+	case WW3D_FORMAT_DXT4:
+	case WW3D_FORMAT_DXT5:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static unsigned Legacy_DDS_Level_Dimension(unsigned dimension, unsigned level)
+{
+	while (level != 0)
+	{
+		dimension = dimension > 1 ? dimension / 2 : 1;
+		--level;
+	}
+	return dimension == 0 ? 1 : dimension;
+}
+
+static unsigned Legacy_DDS_Max_Mip_Levels
+(
+	unsigned width,
+	unsigned height,
+	unsigned depth,
+	DDSType type
+)
+{
+	unsigned maximum_dimension=width>height ? width : height;
+	if (type==DDS_VOLUME && depth>maximum_dimension) maximum_dimension=depth;
+
+	unsigned maximum_levels=1;
+	while (maximum_dimension>1)
+	{
+		maximum_dimension/=2;
+		++maximum_levels;
+	}
+	return maximum_levels;
+}
+
+}
+
+namespace
+{
+static bool Legacy_DDS_Name_Is_Compatible(const char *filename)
+{
+	const size_t length = filename != 0 ? strlen(filename) : 0;
+	return length >= 4 && filename[length - 4] == '.';
+}
+
+static bool Legacy_DDS_Format_To_Neutral(
+	WW3DFormat format, LegacyTextureDDSFormat *neutralFormat)
+{
+	if (neutralFormat == 0) return false;
+	switch (format)
+	{
+	case WW3D_FORMAT_DXT1: *neutralFormat = LEGACY_TEXTURE_DDS_DXT1; return true;
+	case WW3D_FORMAT_DXT2: *neutralFormat = LEGACY_TEXTURE_DDS_DXT2; return true;
+	case WW3D_FORMAT_DXT3: *neutralFormat = LEGACY_TEXTURE_DDS_DXT3; return true;
+	case WW3D_FORMAT_DXT4: *neutralFormat = LEGACY_TEXTURE_DDS_DXT4; return true;
+	case WW3D_FORMAT_DXT5: *neutralFormat = LEGACY_TEXTURE_DDS_DXT5; return true;
+	default: return false;
+	}
+}
+
+static const unsigned char *Legacy_DDS_Get_Level_Data(void *context,
+	UINT level)
+{
+	DDSFileClass *dds = static_cast<DDSFileClass *>(context);
+	if (dds == 0 || level >= dds->Get_Mip_Level_Count()) return 0;
+	return dds->Get_Memory_Pointer(level);
+}
+
+static UINT Legacy_DDS_Get_Level_Size(void *context, UINT level)
+{
+	DDSFileClass *dds = static_cast<DDSFileClass *>(context);
+	if (dds == 0 || level >= dds->Get_Mip_Level_Count()) return 0;
+	return dds->Get_Level_Size(level);
+}
+
+static void Legacy_DDS_Release(void *context)
+{
+	delete static_cast<DDSFileClass *>(context);
+}
+
+static bool Legacy_DDS_Decode(const char *filename,
+	LegacyTextureDDSImage *image)
+{
+	DDSFileClass *dds;
+	LegacyTextureDDSFormat neutralFormat;
+	if (image == 0) return false;
+	memset(image, 0, sizeof(*image));
+	if (!Legacy_DDS_Name_Is_Compatible(filename)) return false;
+	dds = new DDSFileClass(filename, 0);
+	if (dds == 0 || !dds->Is_Available() || dds->Get_Type() != DDS_TEXTURE ||
+		!dds->Load())
+	{
+		delete dds;
+		return false;
+	}
+	if (dds->Get_Full_Width() == 0 || dds->Get_Full_Height() == 0 ||
+		dds->Get_Mip_Level_Count() == 0 ||
+		!Legacy_DDS_Format_To_Neutral(dds->Get_Format(), &neutralFormat))
+	{
+		delete dds;
+		return false;
+	}
+	image->context = dds;
+	image->width = dds->Get_Full_Width();
+	image->height = dds->Get_Full_Height();
+	image->mipLevels = dds->Get_Mip_Level_Count();
+	image->format = neutralFormat;
+	image->getLevelData = &Legacy_DDS_Get_Level_Data;
+	image->getLevelSize = &Legacy_DDS_Get_Level_Size;
+	image->release = &Legacy_DDS_Release;
+	return true;
+}
+
+struct Legacy_DDS_Compat_Registration
+{
+	Legacy_DDS_Compat_Registration()
+	{
+		LegacyTextureCreation_Register_DDS_Decode_Callback(&Legacy_DDS_Decode);
+	}
+};
+
+Legacy_DDS_Compat_Registration g_legacyDDSCompatRegistration;
+}
 
 // ----------------------------------------------------------------------------
 
@@ -46,7 +190,8 @@ DDSFileClass::DDSFileClass(const char* name,unsigned reduction_factor)
 	Format(WW3D_FORMAT_UNKNOWN),
 	Type(DDS_TEXTURE),
 	DateTime(0),
-	CubeFaceSize(0)
+	CubeFaceSize(0),
+	CubeFaceDataOffset(0)
 {
 	strlcpy(Name,name,sizeof(Name));
 	// The name could be given in .tga or .dds format, so ensure we're opening .dds...
@@ -72,15 +217,16 @@ DDSFileClass::DDSFileClass(const char* name,unsigned reduction_factor)
 	char header[4];
 
 	unsigned read_bytes=file->Read(header,4);
-	if (!read_bytes)
+	if (read_bytes!=4 || header[0]!='D' || header[1]!='D' || header[2]!='S' || header[3]!=' ')
 	{
-		WWASSERT("File loading failed trying to read header");
+		WWASSERT_PRINT(0,"File loading failed: invalid DDS magic");
 		return;
 	}
 	// Now, we read DDSURFACEDESC2 defining the compressed data
 	read_bytes=file->Read(&SurfaceDesc,sizeof(LegacyDDSURFACEDESC2));
 	// Verify the structure size matches the read size
-	if (read_bytes==0 || read_bytes!=SurfaceDesc.Size)
+	if (read_bytes!=sizeof(LegacyDDSURFACEDESC2) ||
+		SurfaceDesc.Size!=sizeof(LegacyDDSURFACEDESC2))
 	{
 		StringClass tmp(0,true);
 		tmp.Format("File %s loading failed.\nTried to read %d bytes, got %d. (SurfDesc.size=%d)",name,sizeof(LegacyDDSURFACEDESC2),read_bytes,SurfaceDesc.Size);
@@ -89,92 +235,131 @@ DDSFileClass::DDSFileClass(const char* name,unsigned reduction_factor)
 	}
 
 	Format=D3DFormat_To_WW3DFormat((D3DFORMAT)SurfaceDesc.PixelFormat.FourCC);
-	WWASSERT(
-		Format==WW3D_FORMAT_DXT1 ||
-		Format==WW3D_FORMAT_DXT2 ||
-		Format==WW3D_FORMAT_DXT3 ||
-		Format==WW3D_FORMAT_DXT4 ||
-		Format==WW3D_FORMAT_DXT5);
-
-	MipLevels=SurfaceDesc.MipMapCount;
-	if (MipLevels==0) MipLevels=1;
-
-
-	if (MipLevels>ReductionFactor) MipLevels-=ReductionFactor;
-	else {
-		MipLevels=1;
-		ReductionFactor=ReductionFactor-MipLevels;
+	if (!Is_Supported_DDS_Format(Format))
+	{
+		WWASSERT_PRINT(0,"File loading failed: unsupported DDS texture format");
+		return;
 	}
 
-	// Drop the two lowest miplevels!
-	if (MipLevels>2) MipLevels-=2;
-	else MipLevels=1;
-
-	// check texture type, normal, cube or volume
-	if (SurfaceDesc.Caps.Caps2&DDSCAPS2_CUBEMAP)
+	// Check texture type, normal, cube or volume.  A zero width or height is
+	// never a valid compressed surface.  Depth is optional for ordinary DDS
+	// textures, but a volume texture must carry a real slice count.
+	if (SurfaceDesc.Caps.Caps2&DDS_FILE_CAPS2_CUBEMAP)
 	{
 		Type=DDS_CUBEMAP;
 	}
-	else if (SurfaceDesc.Caps.Caps2&DDSCAPS2_VOLUME)
+	else if (SurfaceDesc.Caps.Caps2&DDS_FILE_CAPS2_VOLUME)
 	{
 		Type=DDS_VOLUME;
 	}
+	if (SurfaceDesc.Width==0 || SurfaceDesc.Height==0 ||
+		(Type==DDS_VOLUME && SurfaceDesc.Depth==0))
+	{
+		file->Close();
+		return;
+	}
 
+	unsigned source_mip_levels=SurfaceDesc.MipMapCount;
+	if (source_mip_levels==0) source_mip_levels=1;
+	const unsigned maximum_mip_levels=Legacy_DDS_Max_Mip_Levels(
+		SurfaceDesc.Width,SurfaceDesc.Height,SurfaceDesc.Depth,Type);
+	if (source_mip_levels>maximum_mip_levels)
+		source_mip_levels=maximum_mip_levels;
+	if (ReductionFactor>=source_mip_levels)
+		ReductionFactor=source_mip_levels-1;
 
+	const unsigned available_mip_levels=source_mip_levels-ReductionFactor;
+	MipLevels=available_mip_levels>2 ? available_mip_levels-2 : 1;
+
+	// Drop the two lowest miplevels!
 	FullWidth=SurfaceDesc.Width;
 	FullHeight=SurfaceDesc.Height;
 	FullDepth=SurfaceDesc.Depth;
-	Width=SurfaceDesc.Width>>ReductionFactor;
-	Height=SurfaceDesc.Height>>ReductionFactor;
-	Depth=SurfaceDesc.Depth;
+	Width=Legacy_DDS_Level_Dimension(SurfaceDesc.Width,ReductionFactor);
+	Height=Legacy_DDS_Level_Dimension(SurfaceDesc.Height,ReductionFactor);
+	Depth=Type==DDS_VOLUME ?
+		Legacy_DDS_Level_Dimension(SurfaceDesc.Depth,ReductionFactor) :
+		SurfaceDesc.Depth;
 
-	unsigned level_size=Calculate_DXTC_Surface_Size
-	(
-		SurfaceDesc.Width,
-		SurfaceDesc.Height,
-		Format
-	);
 	unsigned level_offset=0;
-
-	unsigned level_mip_dec=4;
-	if (Type==DDS_VOLUME)
-	{
-		// add slices to level data size
-		level_size*=SurfaceDesc.Depth;
-		level_mip_dec=8;
-	}
 
 	LevelSizes=W3DNEWARRAY unsigned[MipLevels];
 	LevelOffsets=W3DNEWARRAY unsigned[MipLevels];
-	unsigned level=0;
-	for (;level<ReductionFactor;++level)
+	for (unsigned level=0;level<MipLevels;++level)
 	{
-		if (level_size>16)
-		{	// If surface is bigger than one block (8 or 16 bytes)...
-			level_size/=level_mip_dec;
+		const unsigned sourceLevel=ReductionFactor+level;
+		const unsigned levelWidth=Legacy_DDS_Level_Dimension(
+			SurfaceDesc.Width,sourceLevel);
+		const unsigned levelHeight=Legacy_DDS_Level_Dimension(
+			SurfaceDesc.Height,sourceLevel);
+		const unsigned levelDepth=Legacy_DDS_Level_Dimension(
+			SurfaceDesc.Depth,sourceLevel);
+		unsigned level_size=Calculate_DXTC_Surface_Size(
+			levelWidth,levelHeight,Format);
+		if (level_size==0 ||
+			(Type==DDS_VOLUME &&
+			(levelDepth==0 || level_size>((unsigned)-1)/levelDepth)))
+		{
+			delete[] LevelSizes;
+			delete[] LevelOffsets;
+			LevelSizes=0;
+			LevelOffsets=0;
+			MipLevels=0;
+			return;
 		}
-	}
-	for (level=0;level<MipLevels;++level)
-	{
+		if (Type==DDS_VOLUME) level_size*=levelDepth;
+		if (level_offset>((unsigned)-1)-level_size)
+		{
+			delete[] LevelSizes;
+			delete[] LevelOffsets;
+			LevelSizes=0;
+			LevelOffsets=0;
+			MipLevels=0;
+			return;
+		}
 		LevelSizes[level]=level_size;
 		LevelOffsets[level]=level_offset;
 		level_offset+=level_size;
-		if (level_size>16)
-		{	// If surface is bigger than one block (8 or 16 bytes)...
-			level_size/=level_mip_dec;
-		}
 	}
 
 	if (Type==DDS_CUBEMAP)
 	{
-		for (level=0; level<MipLevels;++level)
+		// DDS cube data is face-major.  Keep the complete source-face stride
+		// and separately record the bytes skipped before the retained first
+		// mip; otherwise reduction would make face N point into face N-1.
+		for (unsigned source_level=0; source_level<source_mip_levels; ++source_level)
 		{
-			CubeFaceSize+=LevelSizes[level];
+			const unsigned levelWidth=Legacy_DDS_Level_Dimension(
+				SurfaceDesc.Width,source_level);
+			const unsigned levelHeight=Legacy_DDS_Level_Dimension(
+				SurfaceDesc.Height,source_level);
+			const unsigned source_level_size=Calculate_DXTC_Surface_Size(
+				levelWidth,levelHeight,Format);
+			if (source_level_size==0 ||
+				CubeFaceSize>((unsigned)-1)-source_level_size)
+			{
+				delete[] LevelSizes;
+				delete[] LevelOffsets;
+				LevelSizes=0;
+				LevelOffsets=0;
+				MipLevels=0;
+				return;
+			}
+			CubeFaceSize+=source_level_size;
+			if (source_level<ReductionFactor)
+			{
+				if (CubeFaceDataOffset>((unsigned)-1)-source_level_size)
+				{
+					delete[] LevelSizes;
+					delete[] LevelOffsets;
+					LevelSizes=0;
+					LevelOffsets=0;
+					MipLevels=0;
+					return;
+				}
+				CubeFaceDataOffset+=source_level_size;
+			}
 		}
-
-		// this accounts for dropping 2 lowest mip levels
-		if (MipLevels>2)
-			CubeFaceSize+=16;
 	}
 	// Verify we read through the whole file (not more, not less).
 #if 0
@@ -200,7 +385,7 @@ DDSFileClass::~DDSFileClass()
 unsigned DDSFileClass::Get_Width(unsigned level) const
 {
 	WWASSERT(level<MipLevels);
-	unsigned width=Width>>level;
+	unsigned width=Legacy_DDS_Level_Dimension(Width,level);
 	if (width<4) width=4;
 	return width;
 }
@@ -208,7 +393,7 @@ unsigned DDSFileClass::Get_Width(unsigned level) const
 unsigned DDSFileClass::Get_Height(unsigned level) const
 {
 	WWASSERT(level<MipLevels);
-	unsigned height=Height>>level;
+	unsigned height=Legacy_DDS_Level_Dimension(Height,level);
 	if (height<4) height=4;
 	return height;
 }
@@ -216,14 +401,15 @@ unsigned DDSFileClass::Get_Height(unsigned level) const
 unsigned DDSFileClass::Get_Depth(unsigned level) const
 {
 	WWASSERT(level<MipLevels);
-	unsigned depth=Depth>>level;
-	if (depth<4) depth=4;
-	return depth;
+	return Legacy_DDS_Level_Dimension(Depth,level);
 }
 
 const unsigned char* DDSFileClass::Get_Memory_Pointer(unsigned level) const
 {
 	WWASSERT(level<MipLevels);
+	if (DDSMemory==nullptr || level>=MipLevels ||
+		LevelOffsets[level]>=DDSMemorySize)
+		return nullptr;
 	return DDSMemory+LevelOffsets[level];
 }
 
@@ -241,18 +427,29 @@ unsigned DDSFileClass::Calculate_DXTC_Surface_Size
 	WW3DFormat format
 )
 {
-	unsigned level_size=(width/4)*(height/4);
+	const size_t maximum_size=(size_t)-1;
+	if ((size_t)width>maximum_size-3U || (size_t)height>maximum_size-3U)
+		return 0;
+	const size_t block_columns=((size_t)width+3U)/4U;
+	const size_t block_rows=((size_t)height+3U)/4U;
+	const size_t bytes_per_block=format==WW3D_FORMAT_DXT1 ? 8U : 16U;
+	if (block_columns==0 || block_rows==0 ||
+		block_columns>maximum_size/block_rows) return 0;
+	const size_t block_count=block_columns*block_rows;
+	if (block_count>maximum_size/bytes_per_block ||
+		block_count*bytes_per_block>(unsigned)-1) return 0;
+	unsigned level_size=(unsigned)(block_count*bytes_per_block);
 	switch (format)
 	{
 	case WW3D_FORMAT_DXT1:
-		level_size*=8;
 		break;
 	case WW3D_FORMAT_DXT2:
 	case WW3D_FORMAT_DXT3:
 	case WW3D_FORMAT_DXT4:
 	case WW3D_FORMAT_DXT5:
-		level_size*=16;
 		break;
+	default:
+		return 0;
 	}
 
 	return level_size;
@@ -272,46 +469,109 @@ bool DDSFileClass::Load()
 	}
 
 	file->Open();
-	// Data size is file size minus the header and info block
-	unsigned size=file->Size()-SurfaceDesc.Size-4;
-
-	if (!size)
+	// Data size is file size minus the header and info block.  Validate before
+	// subtracting so a truncated/corrupt DDS cannot wrap an unsigned size and
+	// turn into a huge allocation.
+	const unsigned file_size=file->Size();
+	if (file_size<SurfaceDesc.Size+4)
 	{
+		file->Close();
+		return false;
+	}
+	unsigned size=file_size-SurfaceDesc.Size-4;
+
+	if (!size || size>=0x80000000)
+	{
+		file->Close();
 		return false;
 	}
 
-	// Skip mip levels if reduction factor is not zero
-	unsigned level_size=Calculate_DXTC_Surface_Size
-	(
-		SurfaceDesc.Width,
-		SurfaceDesc.Height,
-		Format
-	);
-
+	// Skip mip levels if reduction factor is not zero.  Cube maps are stored
+	// face-major, so their reduced data cannot be skipped with one global seek;
+	// retain the complete payload and apply CubeFaceDataOffset per face below.
 	unsigned skipped_offset=0;
-	for (unsigned i=0;i<ReductionFactor;++i)
+	if (Type!=DDS_CUBEMAP)
 	{
-		skipped_offset+=level_size;
-		size-=level_size;
-		if (level_size>16)
-		{	// If surface is bigger than one block (8 or 16 bytes)...
-			level_size/=4;
+		for (unsigned i=0;i<ReductionFactor;++i)
+		{
+			const unsigned levelWidth=Legacy_DDS_Level_Dimension(
+				SurfaceDesc.Width,i);
+			const unsigned levelHeight=Legacy_DDS_Level_Dimension(
+				SurfaceDesc.Height,i);
+			const unsigned levelDepth=Legacy_DDS_Level_Dimension(
+				SurfaceDesc.Depth,i);
+			unsigned level_size=Calculate_DXTC_Surface_Size(
+				levelWidth,levelHeight,Format);
+			if (level_size==0 ||
+				(Type==DDS_VOLUME &&
+				(levelDepth==0 || level_size>((unsigned)-1)/levelDepth)))
+			{
+				file->Close();
+				return false;
+			}
+			if (Type==DDS_VOLUME) level_size*=levelDepth;
+			if (skipped_offset>((unsigned)-1)-level_size)
+			{
+				file->Close();
+				return false;
+			}
+			if (size<level_size)
+			{
+				file->Close();
+				return false;
+			}
+			skipped_offset+=level_size;
+			size-=level_size;
 		}
 	}
 
 	// Skip the header and info block and possible unused mip levels
-	unsigned seek_size=file->Seek(SurfaceDesc.Size+4+skipped_offset);
-	WWASSERT(seek_size==(SurfaceDesc.Size+4+skipped_offset));
-
-	if (size && size<0x80000000)
+	if (MipLevels==0 ||
+		LevelOffsets[MipLevels-1]>((unsigned)-1)-LevelSizes[MipLevels-1])
 	{
-		// Allocate memory for the data excluding the headers
-		DDSMemory=MSGW3DNEWARRAY("DDSMemory") unsigned char[size];
-		DDSMemorySize=size;
-		// Read data
-		unsigned read_size=file->Read(DDSMemory,size);
-		// Verify we got all the data
-		WWASSERT(read_size==size);
+		file->Close();
+		return false;
+	}
+	unsigned required_size=LevelOffsets[MipLevels-1]+LevelSizes[MipLevels-1];
+	if (Type==DDS_CUBEMAP)
+	{
+		if (CubeFaceSize==0 || CubeFaceSize>((unsigned)-1)/6U)
+		{
+			file->Close();
+			return false;
+		}
+		required_size=CubeFaceSize*6U;
+	}
+	if (Type==DDS_CUBEMAP && size<required_size)
+	{
+		file->Close();
+		return false;
+	}
+	if (Type!=DDS_CUBEMAP &&
+		(size<required_size || skipped_offset>((unsigned)-1)-SurfaceDesc.Size-4))
+	{
+		file->Close();
+		return false;
+	}
+	unsigned seek_size=file->Seek(SurfaceDesc.Size+4+skipped_offset);
+	if (seek_size!=SurfaceDesc.Size+4+skipped_offset)
+	{
+		file->Close();
+		return false;
+	}
+
+	// Allocate memory for the data excluding the headers.
+	DDSMemory=MSGW3DNEWARRAY("DDSMemory") unsigned char[size];
+	DDSMemorySize=size;
+	// Read data.
+	unsigned read_size=file->Read(DDSMemory,size);
+	if (read_size!=size)
+	{
+		delete[] DDSMemory;
+		DDSMemory=0;
+		DDSMemorySize=0;
+		file->Close();
+		return false;
 	}
 	file->Close();
 	return true;
@@ -524,13 +784,23 @@ void DDSFileClass::Copy_Level_To_Surface
 }
 
 // cube map
-const unsigned char* DDSFileClass::Get_CubeMap_Memory_Pointer
+	const unsigned char* DDSFileClass::Get_CubeMap_Memory_Pointer
 (
 	unsigned int face,
 	unsigned int level
 ) const
 {
-	return &DDSMemory[CubeFaceSize*face+LevelOffsets[level]];
+	if (DDSMemory==nullptr || face>=6 || level>=MipLevels ||
+		CubeFaceSize==0 || CubeFaceSize>DDSMemorySize/6U)
+		return nullptr;
+	const unsigned face_offset=CubeFaceSize*face;
+	if (face_offset>DDSMemorySize ||
+		CubeFaceDataOffset>DDSMemorySize-face_offset)
+		return nullptr;
+	const unsigned level_base=face_offset+CubeFaceDataOffset;
+	if (LevelOffsets[level]>=DDSMemorySize-level_base)
+		return nullptr;
+	return DDSMemory+level_base+LevelOffsets[level];
 }
 
 
@@ -685,7 +955,9 @@ void DDSFileClass::Copy_CubeMap_Level_To_Surface
 					dest_ptr+=y*dest_pitch;
 					for (unsigned x=0;x<dest_width;x+=4,dest_ptr+=dest_bpp*4)
 					{
-						contains_alpha|=Get_4x4_Block(dest_ptr,dest_pitch,dest_format,level,x,y,hsv_shift);
+						contains_alpha|=Get_4x4_Block_From_Memory(
+							Get_CubeMap_Memory_Pointer(face,level),dest_ptr,
+							dest_pitch,dest_format,level,x,y,hsv_shift);
 					}
 				}
 				if (Format==WW3D_FORMAT_DXT1 && contains_alpha)
@@ -934,7 +1206,7 @@ unsigned DDSFileClass::Get_Pixel(unsigned level,unsigned x,unsigned y) const
 	// or we don't.
 	case WW3D_FORMAT_DXT1:
 		{
-			const unsigned char* block_memory=Get_Memory_Pointer(level)+(x/4)*8+((y/4)*(Get_Width(level)/4))*8;
+			const unsigned char* block_memory=Get_Memory_Pointer(level)+(x/4)*8+((y/4)*((Get_Width(level)+3)/4))*8;
 
 			unsigned col0=RGB565_To_ARGB8888(*(unsigned short*)&block_memory[0]);
 			unsigned col1=RGB565_To_ARGB8888(*(unsigned short*)&block_memory[2]);
@@ -967,7 +1239,7 @@ unsigned DDSFileClass::Get_Pixel(unsigned level,unsigned x,unsigned y) const
 		return 0xffffffff;
 	case WW3D_FORMAT_DXT5:
 		{
-			const unsigned char* alpha_block=Get_Memory_Pointer(level)+(x/4)*16+((y/4)*(Get_Width(level)/4))*16;
+			const unsigned char* alpha_block=Get_Memory_Pointer(level)+(x/4)*16+((y/4)*((Get_Width(level)+3)/4))*16;
 
 			unsigned alpha0=alpha_block[0];
 			unsigned alpha1=alpha_block[1];
@@ -1050,7 +1322,8 @@ unsigned DDSFileClass::Get_Pixel(unsigned level,unsigned x,unsigned y) const
 //
 // ----------------------------------------------------------------------------
 
-bool DDSFileClass::Get_4x4_Block(
+bool DDSFileClass::Get_4x4_Block_From_Memory(
+	const unsigned char* source_memory,
 	unsigned char* dest_ptr,			// Destination surface pointer
 	unsigned dest_pitch,					// Destination surface pitch, in bytes
 	WW3DFormat dest_format,				// Destination surface format, A8R8G8B8 is fastest
@@ -1059,6 +1332,8 @@ bool DDSFileClass::Get_4x4_Block(
 	unsigned source_y,					// DDS y offset to copy from, must be aligned by 4!
 	const Vector3& hsv_shift) const
 {
+	if (source_memory==nullptr || dest_ptr==nullptr)
+		return false;
 	// Verify the block alignment
 	WWASSERT((source_x&3)==0);
 	WWASSERT((source_y&3)==0);
@@ -1079,7 +1354,7 @@ bool DDSFileClass::Get_4x4_Block(
 	// or we don't.
 	case WW3D_FORMAT_DXT1:
 		{
-			const unsigned char* block_memory=Get_Memory_Pointer(level)+(source_x/4)*8+((source_y/4)*(Get_Width(level)/4))*8;
+			const unsigned char* block_memory=source_memory+(source_x/4)*8+((source_y/4)*((Get_Width(level)+3)/4))*8;
 
 			unsigned col0=RGB565_To_ARGB8888(*(unsigned short*)&block_memory[0]);
 			unsigned col1=RGB565_To_ARGB8888(*(unsigned short*)&block_memory[2]);
@@ -1146,7 +1421,7 @@ bool DDSFileClass::Get_4x4_Block(
 	case WW3D_FORMAT_DXT5:
 		{
 			// Init alphas
-			const unsigned char* alpha_block=Get_Memory_Pointer(level)+(source_x/4)*16+((source_y/4)*(Get_Width(level)/4))*16;
+			const unsigned char* alpha_block=source_memory+(source_x/4)*16+((source_y/4)*((Get_Width(level)+3)/4))*16;
 
 			unsigned alphas[8];
 			alphas[0]=alpha_block[0];
@@ -1271,4 +1546,18 @@ bool DDSFileClass::Get_4x4_Block(
 	}
 	return false;
 
+}
+
+bool DDSFileClass::Get_4x4_Block(
+	unsigned char* dest_ptr,
+	unsigned dest_pitch,
+	WW3DFormat dest_format,
+	unsigned level,
+	unsigned source_x,
+	unsigned source_y,
+	const Vector3& hsv_shift) const
+{
+	return Get_4x4_Block_From_Memory(
+		Get_Memory_Pointer(level),dest_ptr,dest_pitch,dest_format,
+		level,source_x,source_y,hsv_shift);
 }

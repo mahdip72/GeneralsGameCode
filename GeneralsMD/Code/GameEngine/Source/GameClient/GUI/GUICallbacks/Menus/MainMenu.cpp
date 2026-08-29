@@ -626,6 +626,9 @@ void MainMenuInit( WindowLayout *layout, void *userData )
 	}
 	else
 	{
+		dropDownWindows[DROPDOWN_MAIN]->winHide(FALSE);
+		TheMouse->setVisibility(TRUE);
+		notShown = FALSE;
 		showFade = TRUE;
 		justEntered = TRUE;
 		initialGadgetDelay = 2;

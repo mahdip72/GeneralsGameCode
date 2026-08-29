@@ -88,6 +88,7 @@ static void drawFramerateBar();
 #include "WWMath/wwmath.h"
 #include "WWLib/registry.h"
 #include "WW3D2/ww3d.h"
+#include "WW3D2/dx8wrapper.h"
 #include "WW3D2/predlod.h"
 #include "WW3D2/part_emt.h"
 #include "WW3D2/part_ldr.h"
@@ -104,6 +105,7 @@ static void drawFramerateBar();
 #include "WW3D2/meshmdl.h"
 #include "WW3D2/rddesc.h"
 #include "WWLib/TARGA.h"
+#include "Renderer/RenderSubmissionPolicy.h"
 
 #include "GameLogic/ScriptEngine.h"		// For TheScriptEngine - jkmcd
 #include "GameLogic/GameLogic.h"
@@ -424,10 +426,23 @@ W3DDisplay::W3DDisplay()
 W3DDisplay::~W3DDisplay()
 {
 	ASSERT_GAME_THREAD("W3DDisplay::~W3DDisplay radar preparation");
+	// Display's base destructor runs after WW3D shutdown. Release the movie
+	// buffer here while its texture backend is still loaded.
+	stopMovie();
 	GetRadarTerrainPrepareService().shutdown();
 	W3D_ShutdownScreenshotTasks();
 
 #ifdef PROFILER_ENABLED
+	W3DProfilerFrameCapture *deferredProfilerFrameCapture = nullptr;
+	if (m_profilerFrameCapture != nullptr &&
+		!m_profilerFrameCapture->Shutdown_D3D11_Capture())
+	{
+		WWDEBUG_ERROR(("Profiler frame capture could not drain on the render owner"));
+		// Keep the callback target alive until the renderer drains its queue.
+		// This is safer than deleting an object still referenced by the queue.
+		deferredProfilerFrameCapture = m_profilerFrameCapture;
+		m_profilerFrameCapture = nullptr;
+	}
 	delete m_profilerFrameCapture;
 	m_profilerFrameCapture = nullptr;
 #endif
@@ -445,6 +460,7 @@ W3DDisplay::~W3DDisplay()
 	if( m_benchmarkDisplayString ) {
 		TheDisplayStringManager->freeDisplayString(m_benchmarkDisplayString);
 	}
+	TheDisplayStringManager->releaseGraphicsResources();
 
 	// delete 2D renderer
 	if( m_2DRender )
@@ -478,6 +494,19 @@ W3DDisplay::~W3DDisplay()
 	delete m_assetManager;
 	if (!TheGlobalData->m_headless)
 		WW3D::Shutdown();
+#ifdef PROFILER_ENABLED
+	if (deferredProfilerFrameCapture != nullptr)
+	{
+		if (deferredProfilerFrameCapture->Shutdown_D3D11_Capture())
+		{
+			delete deferredProfilerFrameCapture;
+		}
+		else
+		{
+			WWDEBUG_ERROR(("Profiler frame capture remained owned after renderer shutdown"));
+		}
+	}
+#endif
 	WWMath::Shutdown();
 	if (!TheGlobalData->m_headless)
 		DX8WebBrowser::Shutdown();
@@ -568,8 +597,19 @@ Bool W3DDisplay::setDisplayMode( UnsignedInt xres, UnsignedInt yres, UnsignedInt
 
 	if (WW3D_ERROR_OK == WW3D::Set_Device_Resolution(xres,yres,bitdepth,windowed,true))
 	{
-		Render2DClass::Set_Screen_Resolution(RectClass(0, 0, xres, yres));
-		Display::setDisplayMode(xres, yres, bitdepth, windowed);
+		Int actualWidth, actualHeight, actualBitDepth;
+		bool actualWindowed;
+		WW3D::Get_Device_Resolution(actualWidth, actualHeight,
+			actualBitDepth, actualWindowed);
+		Render2DClass::Set_Screen_Resolution(
+			RectClass(0, 0, actualWidth, actualHeight));
+		Display::setDisplayMode(actualWidth, actualHeight, actualBitDepth,
+			actualWindowed);
+		setBitDepth(actualBitDepth);
+		setWindowed(actualWindowed);
+		TheWritableGlobalData->m_xResolution = actualWidth;
+		TheWritableGlobalData->m_yResolution = actualHeight;
+		TheWritableGlobalData->m_windowed = actualWindowed;
 		return TRUE;
 	}
 
@@ -832,7 +872,6 @@ void W3DDisplay::init()
 		WW3D::Enable_Static_Sort_Lists(true);
 		WW3D::Set_Thumbnail_Enabled(false);
 		WW3D::Set_Screen_UV_Bias( TRUE );  ///< this makes text look good :)
-		WW3D::Set_Texture_Bitdepth(32);
 
 		setWindowed( TheGlobalData->m_windowed );
 
@@ -920,6 +959,18 @@ void W3DDisplay::init()
 			DEBUG_CRASH( ("Unable to set render device") );
 			return;
 		}
+		Int actualWidth, actualHeight, actualBitDepth;
+		bool actualWindowed;
+		WW3D::Get_Device_Resolution(actualWidth, actualHeight,
+			actualBitDepth, actualWindowed);
+		setWidth(actualWidth);
+		setHeight(actualHeight);
+		setBitDepth(actualBitDepth);
+		setWindowed(actualWindowed);
+		TheWritableGlobalData->m_xResolution = actualWidth;
+		TheWritableGlobalData->m_yResolution = actualHeight;
+		TheWritableGlobalData->m_windowed = actualWindowed;
+		WW3D::Set_Texture_Bitdepth(getBitDepth());
 
 		//Check if level was never set and default to setting most suitable for system.
 		if (TheGameLODManager->getStaticLODLevel() == STATIC_GAME_LOD_UNKNOWN)
@@ -1019,7 +1070,11 @@ void W3DDisplay::reset()
 
 	m_isClippedEnabled = FALSE;
 
-	TextureLoader::Discard_Pending_Background_Load_Tasks();
+	if (!TheGlobalData->m_headless)
+	{
+		ASSERT_GAME_THREAD("W3DDisplay::reset texture task discard");
+		TextureLoader::Discard_Pending_Background_Load_Tasks();
+	}
 
 	// release any unused assets from W3D
 	/// @todo really need that "scene abstraction", having this stuff in the display is icky
@@ -1709,6 +1764,18 @@ void W3DDisplay::drawCurrentDebugDisplay()
 //=============================================================================
 void W3DDisplay::calculateTerrainLOD()
 {
+	// D3D11 targets hardware where the maximum terrain LOD is the stable
+	// baseline.  The legacy calibration presents terrain-only frames before the
+	// D3D11 display-iteration boundary, hiding the shell map and UI while shader
+	// and resource caches are cold.  Keep the D3D8 calibration unchanged.
+	if (DX8Wrapper::Is_D3D11_Backend_Active())
+	{
+		TheWritableGlobalData->m_terrainLOD = TERRAIN_LOD_MAX;
+		m_3DScene->drawTerrainOnly(false);
+		TheTerrainRenderObject->adjustTerrainLOD(0);
+		return;
+	}
+
 	const Int NUM_SAMPLES=20;
 	const Int NUM_TO_DISCARD=5;
 
@@ -1824,6 +1891,16 @@ void W3DDisplay::draw()
 
 	if (TheGlobalData->m_headless)
 		return;
+
+	static rts::render::RenderCaptureFrameGate rendererCaptureFrameGate;
+	if (!TheGlobalData->m_rendererCaptureFrame)
+	{
+		rendererCaptureFrameGate.clear();
+	}
+	else
+	{
+		rendererCaptureFrameGate.request();
+	}
 
 	// TheSuperHackers @feature bobtista 10/07/2026 Show messages for screenshots finished by the screenshot thread.
 	W3D_UpdateScreenshotMessages();
@@ -1958,9 +2035,17 @@ AGAIN:
 	}
 
 	do {
+		// Retire last iteration's transient GPU-copy leases even if rendering was
+		// disabled or the visible frame could not begin.  Hidden RTT passes below
+		// acquire fresh leases which remain valid through this iteration's draw.
+		DX8Wrapper::Begin_D3D11_Display_Iteration();
 
 		// update all views of the world - recomputes data which will affect drawing
-		if (DX8Wrapper::_Get_D3D_Device8() && (DX8Wrapper::_Get_D3D_Device8()->TestCooperativeLevel()) == D3D_OK)
+		// The D3D8 device is intentionally absent when the D3D11 compatibility
+		// backend owns presentation.  Use the wrapper lifecycle state here so
+		// view preparation is not accidentally skipped (or tied to a raw D3D8
+		// cooperative-level query) on the modern path.
+		if (DX8Wrapper::Is_Initted() && !DX8Wrapper::Is_Device_Lost())
 		{	//Checking if we have the device before updating views because the heightmap crashes otherwise while
 			//trying to refresh the visible terrain geometry.
 //			if(TheGlobalData->m_loadScreenRender != TRUE)
@@ -2007,7 +2092,18 @@ AGAIN:
 					TheInGameUI->draw();
 					if( TheMouse )
 						TheMouse->draw();	//keep applying the current cursor style so it remains hidden if needed.
+					const bool captureArmed = rendererCaptureFrameGate.arm(
+						DX8Wrapper::Is_D3D11_Backend_Active());
+					const unsigned long captureFrameCount = captureArmed ?
+						DX8Wrapper::Get_FrameCount() : 0;
+					if (captureArmed)
+						DX8Wrapper::Request_D3D11_Back_Buffer_Capture();
 					WW3D::End_Render();
+					if (captureArmed && rendererCaptureFrameGate.complete(
+						DX8Wrapper::Get_FrameCount() != captureFrameCount))
+					{
+						TheWritableGlobalData->m_rendererCaptureFrame = FALSE;
+					}
 					continue;
 				}
 				couldRender = true;
@@ -2098,7 +2194,18 @@ AGAIN:
 				}
 #endif
 				// render is all done!
+				const bool captureArmed = rendererCaptureFrameGate.arm(
+					DX8Wrapper::Is_D3D11_Backend_Active());
+				const unsigned long captureFrameCount = captureArmed ?
+					DX8Wrapper::Get_FrameCount() : 0;
+				if (captureArmed)
+					DX8Wrapper::Request_D3D11_Back_Buffer_Capture();
 				WW3D::End_Render();
+				if (captureArmed && rendererCaptureFrameGate.complete(
+					DX8Wrapper::Get_FrameCount() != captureFrameCount))
+				{
+					TheWritableGlobalData->m_rendererCaptureFrame = FALSE;
+				}
 			}
 			else
 			{

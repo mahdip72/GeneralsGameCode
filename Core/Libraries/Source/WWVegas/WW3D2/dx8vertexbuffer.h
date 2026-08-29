@@ -83,6 +83,12 @@ public:
 	const FVFInfoClass& FVF_Info() const { return *fvf_info; }
 	unsigned short Get_Vertex_Count() const { return VertexCount; }
 	unsigned Type() const { return type; }
+	unsigned int Get_Generation() const { return generation; }
+	void Mark_Changed();
+	void Mark_Changed_Range(unsigned int offset, unsigned int count,
+		unsigned int flags);
+	bool Get_Change_Since(unsigned int uploaded_generation,
+		unsigned int *offset, unsigned int *count, unsigned int *flags) const;
 
 	void Add_Engine_Ref() const;
 	void Release_Engine_Ref() const;
@@ -111,6 +117,11 @@ protected:
 	unsigned short					VertexCount;
 	mutable int						engine_refs;
 	FVFInfoClass*					fvf_info;
+	unsigned int					generation;
+	unsigned int					change_base_generation;
+	unsigned int					change_offset;
+	unsigned int					change_count;
+	unsigned int					change_flags;
 };
 
 

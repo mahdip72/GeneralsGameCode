@@ -46,11 +46,13 @@
 #define CV_ONE 1
 #define CV_WORLDVIEWPROJ_0 2
 #define CV_TEXPROJ_0 6
+#define CV_SEA_WAVE_WORLDVIEW_0 7
 #define CV_PATCH_SCALE_OFFSET 10
 
 class PolygonTrigger;
 class WaterTracksRenderSystem;
 class Xfer;
+class ZTextureClass;
 /// Custom render object that draws mirrors, water, and skies.
 /**
 This render object handles drawing reflected W3D scenes.  It will only work
@@ -168,6 +170,7 @@ protected:
 	Real				m_fBumpFrame;	///<current animation frame
 	Real				m_fBumpScale;	///<scales bump map uv perturbation
 	TextureClass * m_pReflectionTexture;	///<render target for reflection
+	ZTextureClass *m_pReflectionDepthTexture;	///<matching depth target for reflection
 	RenderObjClass	*m_skyBox;		///<box around level
 	WaterTracksRenderSystem *m_waterTrackSystem;	///<object responsible for rendering water wakes
 

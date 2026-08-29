@@ -59,13 +59,27 @@ class CommandLineData
 	friend class CommandLine;
 	friend class GlobalData;
 
+public:
 	CommandLineData()
 		: m_hasParsedCommandLineForStartup(false)
 		, m_hasParsedCommandLineForEngineInit(false)
+		, m_hasSkirmishAITestRequest(false)
+		, m_skirmishAITestSeed(0)
 	{}
 
+	Bool hasSkirmishAITestRequest() const { return m_hasSkirmishAITestRequest; }
+	Int getSkirmishAITestSeed() const { return m_skirmishAITestSeed; }
+	void requestSkirmishAITest(Int seed)
+	{
+		m_hasSkirmishAITestRequest = true;
+		m_skirmishAITestSeed = seed;
+	}
+
+private:
 	Bool m_hasParsedCommandLineForStartup;
 	Bool m_hasParsedCommandLineForEngineInit;
+	Bool m_hasSkirmishAITestRequest;
+	Int m_skirmishAITestSeed;
 };
 
 //-------------------------------------------------------------------------------------------------
@@ -120,6 +134,9 @@ public:
 	// TheSuperHackers @feature helmutbuhler 11/04/2025
 	// Run game without graphics, input or audio.
 	Bool m_headless;
+
+	// One-shot renderer capture requested by the installed-runtime smoke harness.
+	Bool m_rendererCaptureFrame;
 
 	Bool m_windowed;
 	Int m_xResolution;
@@ -351,6 +368,7 @@ public:
 	Bool m_buildMapCache;
 	AsciiString m_initialFile;				///< If this is specified, load a specific map from the command-line
 	AsciiString m_pendingFile;				///< If this is specified, use this map at the next game start
+	AsciiString m_loadSaveGame;				///< If this is specified, load a save game file from the command-line
 
 	std::vector<AsciiString> m_simulateReplays; ///< If not empty, simulate this list of replays and exit.
 	Int m_simulateReplayJobs; ///< Maximum number of processes to use for simulation, or SIMULATE_REPLAYS_SEQUENTIAL for sequential simulation

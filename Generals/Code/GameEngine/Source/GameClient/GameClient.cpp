@@ -41,6 +41,7 @@
 #include "Common/PerfTimer.h"
 #include "Common/Player.h"
 #include "Common/PlayerList.h"
+#include "Common/SkirmishAITestRunner.h"
 #include "Common/ThingFactory.h"
 #include "Common/ThingTemplate.h"
 #include "Common/Xfer.h"
@@ -179,11 +180,6 @@ GameClient::~GameClient()
 	delete TheWindowManager;
 	TheWindowManager = nullptr;
 
-	// delete the font library
-	TheFontLibrary->reset();
-	delete TheFontLibrary;
-	TheFontLibrary = nullptr;
-
 	TheMouse->reset();
 	delete TheMouse;
 	TheMouse = nullptr;
@@ -226,6 +222,11 @@ GameClient::~GameClient()
 
 	delete TheDisplayStringManager;
 	TheDisplayStringManager = nullptr;
+
+	// Display strings retain fonts; destroy their manager before the library.
+	TheFontLibrary->reset();
+	delete TheFontLibrary;
+	TheFontLibrary = nullptr;
 
 	delete TheEva;
 	TheEva = nullptr;
@@ -515,8 +516,16 @@ void GameClient::update()
 			delete m_intro;
 			m_intro = nullptr;
 
-			TheShell->showShellMap(TRUE);
-			TheShell->showShell();
+			if (!IsSkirmishAITestRunnerArmed())
+			{
+				TheShell->showShellMap(TRUE);
+				TheShell->showShell();
+			}
+
+			if (TheGlobalData->m_loadSaveGame.isNotEmpty())
+			{
+				TheGameState->loadQueuedSaveGame();
+			}
 		}
 	}
 

@@ -50,6 +50,8 @@ set(WW3D2_SRC
     dx8indexbuffer.cpp
     dx8indexbuffer.h
     dx8list.h
+    d3d11legacybridge.cpp
+    d3d11legacybridge.h
     dx8polygonrenderer.cpp
     dx8polygonrenderer.h
     dx8renderer.cpp
@@ -64,6 +66,8 @@ set(WW3D2_SRC
     dx8webbrowser.h
     dx8wrapper.cpp
     dx8wrapper.h
+    legacytexturecompat.cpp
+    legacytexturecompat.h
     dynamesh.cpp
     dynamesh.h
     font3d.cpp
@@ -200,6 +204,8 @@ set(WW3D2_SRC
     stripoptimizer.h
     surfaceclass.cpp
     surfaceclass.h
+    surfaceblit.cpp
+    surfaceblit.h
     texproject.cpp
     texproject.h
     #textdraw.cpp # unused
@@ -212,6 +218,8 @@ set(WW3D2_SRC
     textureloader.h
     texturemipbuffer.cpp
     texturemipbuffer.h
+    texturemipgenerator.cpp
+    texturemipgenerator.h
     texturethumbnail.cpp
     texturethumbnail.h
     #vertmaterial.cpp
@@ -246,6 +254,8 @@ target_include_directories(corei_ww3d2 INTERFACE
 if (MSVC AND NOT IS_VS6_BUILD)
     target_link_libraries(corei_ww3d2 INTERFACE
         comsuppw
+        ole32
+        windowscodecs
     )
 endif()
 
@@ -254,3 +264,23 @@ target_link_libraries(corei_ww3d2 INTERFACE
     core_wwlib
     core_wwmath
 )
+
+# The native runtime path is deliberately a separate target.  It must never
+# inherit the D3D8 compatibility PCH or the legacy WW3D source list.
+if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD)
+    add_library(core_ww3d2_native STATIC
+        nativew3d2.cpp
+        nativew3d2.h
+    )
+    target_include_directories(core_ww3d2_native PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    target_link_libraries(core_ww3d2_native PUBLIC
+        core_renderer
+    )
+    set_target_properties(core_ww3d2_native PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED YES
+        CXX_EXTENSIONS NO
+    )
+endif()

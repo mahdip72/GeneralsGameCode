@@ -86,7 +86,6 @@
 #include "W3DDevice/GameClient/W3DDisplay.h"
 #include "W3DDevice/GameClient/W3DScene.h"
 #include "W3DDevice/GameClient/W3DView.h"
-#include "d3dx8math.h"
 #include "W3DDevice/GameClient/W3DShaderManager.h"
 #include "W3DDevice/GameClient/Module/W3DModelDraw.h"
 #include "W3DDevice/GameClient/W3DCustomScene.h"
@@ -798,7 +797,7 @@ void W3DView::updateCameraClipPlanes(const Matrix3D &transform)
 		const Real projectedRadiusToEdge = fabs(dx * camDir.X) + fabs(dy * camDir.Y);
 
 		// Final far plane
-		farZ = projectedDistanceToCenter + projectedRadiusToEdge;
+		farZ = std::max(projectedDistanceToCenter + projectedRadiusToEdge, 0.0f);
 	}
 	else
 	{

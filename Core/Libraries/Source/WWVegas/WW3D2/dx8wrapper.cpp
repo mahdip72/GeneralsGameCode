@@ -75,15 +75,20 @@
 #include "textureloader.h"
 #include "missingtexture.h"
 #include "WWLib/thread.h"
-#include <d3dx8core.h>
 #include "WWMath/pot.h"
 #include "WWDebug/wwprofile.h"
 #include "WWLib/ffactory.h"
 #include "dx8caps.h"
+#include "d3d11legacybridge.h"
 #include "formconv.h"
 #include "dx8texman.h"
+#include "surfaceblit.h"
+#include "texturemipgenerator.h"
+#include "legacytexturecompat.h"
 #include "WWLib/bound.h"
 #include "WWLib/DbgHelpGuard.h"
+#include "Renderer/RendererDevice.h"
+#include "Renderer/WindowPresentation.h"
 
 #include "shdlib.h"
 
@@ -149,6 +154,7 @@ IDirect3D8 *					DX8Wrapper::D3DInterface								= nullptr;
 IDirect3DDevice8 *			DX8Wrapper::D3DDevice									= nullptr;
 IDirect3DSurface8 *			DX8Wrapper::CurrentRenderTarget						= nullptr;
 IDirect3DSurface8 *			DX8Wrapper::CurrentDepthBuffer						= nullptr;
+bool							DX8Wrapper::CurrentDepthBufferIsDefault				= false;
 IDirect3DSurface8 *			DX8Wrapper::DefaultRenderTarget						= nullptr;
 IDirect3DSurface8 *			DX8Wrapper::DefaultDepthBuffer						= nullptr;
 bool								DX8Wrapper::IsRenderToTexture							= false;
@@ -161,6 +167,11 @@ float								DX8Wrapper::ZNear;
 float								DX8Wrapper::ZFar;
 D3DMATRIX						DX8Wrapper::ProjectionMatrix;
 D3DMATRIX						DX8Wrapper::DX8Transforms[D3DTS_WORLD+1];
+IDirect3DVertexBuffer8 *		DX8Wrapper::RawVertexBuffer = nullptr;
+IDirect3DIndexBuffer8 *		DX8Wrapper::RawIndexBuffer = nullptr;
+UINT								DX8Wrapper::RawVertexStride = 0;
+DWORD								DX8Wrapper::RawVertexFVF = 0;
+UINT								DX8Wrapper::RawIndexBaseVertex = 0;
 
 DX8Caps*							DX8Wrapper::CurrentCaps = nullptr;
 
@@ -177,6 +188,87 @@ static D3DPRESENT_PARAMETERS								_PresentParameters;
 static DynamicVectorClass<StringClass>					_RenderDeviceNameTable;
 static DynamicVectorClass<StringClass>					_RenderDeviceShortNameTable;
 static DynamicVectorClass<RenderDeviceDescClass>	_RenderDeviceDescriptionTable;
+static bool _UseD3D11Backend = false;
+static D3D11LegacyBridge _D3D11Bridge;
+static rts::render::WindowPresentationState _D3D11WindowPresentationState;
+static bool _D3D11FrameStarted = false;
+
+namespace
+{
+bool Get_D3D11_Monitor_Rect(RECT *monitor_rect)
+{
+	if (monitor_rect == nullptr || _Hwnd == nullptr)
+	{
+		return false;
+	}
+
+	MONITORINFO monitor_info = { sizeof(MONITORINFO) };
+	if (!GetMonitorInfo(MonitorFromWindow(_Hwnd, MONITOR_DEFAULTTOPRIMARY),
+		&monitor_info))
+	{
+		return false;
+	}
+
+	*monitor_rect = monitor_info.rcMonitor;
+	return rts::render::IsValidWindowPresentationRect(*monitor_rect);
+}
+
+bool Abort_D3D11_Windowed_Transition(const RECT &monitor_rect)
+{
+	if (_D3D11WindowPresentationState.valid &&
+		!rts::render::ApplyBorderlessWindow(_Hwnd, monitor_rect,
+			&_D3D11WindowPresentationState))
+	{
+		WWDEBUG_SAY(("D3D11 windowed transition rollback failed: %lu.",
+			GetLastError()));
+	}
+	return false;
+}
+
+rts::render::RenderSubmissionDecision Get_Visible_Submission_Decision()
+{
+	if (_UseD3D11Backend && !_D3D11Bridge.Is_Active())
+	{
+		// D3D11 was explicitly selected, so an inactive bridge is a terminal
+		// ownership failure.  Treat it as unavailable instead of exposing the
+		// hidden differential D3D8 swap chain.
+		return rts::render::ChooseVisibleSubmissionBackend(true, false);
+	}
+	return rts::render::ChooseVisibleSubmissionBackend(
+		_D3D11Bridge.Is_Active(),
+		_D3D11Bridge.Is_Render_Target_Operational());
+}
+
+HRESULT Render_Result_To_HRESULT(rts::render::RenderResult result)
+{
+	switch (result)
+	{
+	case rts::render::RENDER_RESULT_OK:
+		return D3D_OK;
+	case rts::render::RENDER_RESULT_INVALID_ARGUMENT:
+		return E_INVALIDARG;
+	case rts::render::RENDER_RESULT_UNSUPPORTED:
+		return E_NOTIMPL;
+	case rts::render::RENDER_RESULT_OUT_OF_MEMORY:
+		return E_OUTOFMEMORY;
+	case rts::render::RENDER_RESULT_DEVICE_REMOVED:
+		return D3DERR_DEVICELOST;
+	default:
+		return E_FAIL;
+	}
+}
+
+bool Record_Unavailable_Visible_Submission(
+	const rts::render::RenderSubmissionDecision &decision)
+{
+	if (decision.submitLegacy || decision.submitD3D11)
+	{
+		return false;
+	}
+	_D3D11Bridge.Record_Visible_Submission_Failure();
+	return true;
+}
+}
 
 
 typedef IDirect3D8* (WINAPI *Direct3DCreate8Type) (UINT SDKVersion);
@@ -193,34 +285,31 @@ DX8_Stats	 DX8Wrapper::stats;
 **
 ***********************************************************************************/
 
+static const char *DX8_Error_Name(unsigned res)
+{
+	switch ((HRESULT)res)
+	{
+	case D3D_OK: return "D3D_OK";
+	case D3DERR_INVALIDCALL: return "D3DERR_INVALIDCALL";
+	case D3DERR_OUTOFVIDEOMEMORY: return "D3DERR_OUTOFVIDEOMEMORY";
+	case D3DERR_NOTAVAILABLE: return "D3DERR_NOTAVAILABLE";
+	case D3DERR_DEVICELOST: return "D3DERR_DEVICELOST";
+	case D3DERR_DEVICENOTRESET: return "D3DERR_DEVICENOTRESET";
+	case D3DERR_DRIVERINTERNALERROR: return "D3DERR_DRIVERINTERNALERROR";
+	default: return "HRESULT";
+	}
+}
+
 void Log_DX8_ErrorCode(unsigned res)
 {
-	char tmp[256]="";
-
-	HRESULT new_res=D3DXGetErrorStringA(
-		res,
-		tmp,
-		sizeof(tmp));
-
-	if (new_res==D3D_OK) {
-		WWDEBUG_SAY((tmp));
-	}
-
+	WWDEBUG_SAY(("DX8 Error: 0x%08x (%s)", res, DX8_Error_Name(res)));
 	WWASSERT(0);
 }
 
 void Non_Fatal_Log_DX8_ErrorCode(unsigned res,const char * file,int line)
 {
-	char tmp[256]="";
-
-	HRESULT new_res=D3DXGetErrorStringA(
-		res,
-		tmp,
-		sizeof(tmp));
-
-	if (new_res==D3D_OK) {
-		WWDEBUG_SAY(("DX8 Error: %s, File: %s, Line: %d",tmp,file,line));
-	}
+	WWDEBUG_SAY(("DX8 Error: 0x%08x (%s), File: %s, Line: %d", res,
+		DX8_Error_Name(res), file, line));
 }
 
 // TheSuperHackers @info helmutbuhler 14/04/2025
@@ -249,6 +338,21 @@ void MoveRectIntoOtherRect(const RECT& inner, const RECT& outer, int* x, int* y)
 bool DX8Wrapper::Init(void * hwnd, bool lite)
 {
 	WWASSERT(!IsInitted);
+	// The neutral D3D11 shadow starts with the same device-default state as a
+	// newly created D3D8 device.  Ordinary cache invalidations below must not
+	// repeat this reset: legacy shader helpers invalidate wrapper caches without
+	// resetting the actual D3D8 device state.
+	rts::render::ResetTrackedLegacyState();
+	rts::render::SeedTrackedLegacyPipelineState();
+	_UseD3D11Backend = rts::render::RequestedRenderBackend() ==
+		rts::render::RENDER_BACKEND_D3D11;
+#if !defined(RTS_RENDERER_HAS_D3D11)
+	if (_UseD3D11Backend)
+	{
+		WWDEBUG_SAY(("The D3D11 renderer is unavailable in this build."));
+		return false;
+	}
+#endif
 
 	// zero memory
 	memset(Textures,0,sizeof(IDirect3DBaseTexture8*)*MAX_TEXTURE_STAGES);
@@ -328,6 +432,7 @@ bool DX8Wrapper::Init(void * hwnd, bool lite)
 
 void DX8Wrapper::Shutdown()
 {
+	_D3D11Bridge.Shutdown();
 	if (D3DDevice) {
 
 		Set_Render_Target ((IDirect3DSurface8 *)nullptr);
@@ -437,6 +542,7 @@ void DX8Wrapper::Invalidate_Cached_Render_States()
 			Textures[a]->Release();
 		}
 		Textures[a]=nullptr;
+		rts::render::TrackLegacyTexturePresence(a, false);
 	}
 
 	ShaderClass::Invalidate();
@@ -593,19 +699,57 @@ bool DX8Wrapper::Create_Device()
 	}
 
 	dbgHelpGuard.deactivate();
+	rts::render::ResetTrackedLegacyState();
+	rts::render::SeedTrackedLegacyPipelineState();
+	Invalidate_Cached_Render_States();
 
 	/*
 	** Initialize all subsystems
 	*/
 	Do_Onetime_Device_Dependent_Inits();
+	if (_UseD3D11Backend && !_D3D11Bridge.Initialize(_Hwnd, D3DDevice,
+		ResolutionWidth, ResolutionHeight,
+		_PresentParameters.FullScreen_PresentationInterval !=
+			D3DPRESENT_INTERVAL_IMMEDIATE))
+	{
+		WWDEBUG_SAY(("Failed to initialize the D3D11 renderer backend."));
+		_D3D11Bridge.Shutdown();
+		Do_Onetime_Device_Dependent_Shutdowns();
+		D3DDevice->Release();
+		D3DDevice = nullptr;
+		return false;
+	}
+	if (_D3D11Bridge.Is_Active())
+	{
+		WWDEBUG_SAY(("Renderer backend: d3d11"));
+	}
 	return true;
 }
 
-bool DX8Wrapper::Reset_Device(bool reload_assets)
+bool DX8Wrapper::Reset_Device(bool reload_assets, bool *reset_requires_reacquire)
 {
 	WWDEBUG_SAY(("Resetting device."));
 	DX8_THREAD_ASSERT();
+	if (reset_requires_reacquire != nullptr)
+	{
+		*reset_requires_reacquire = false;
+	}
 	if ((IsInitted) && (D3DDevice != nullptr)) {
+		HRESULT hr=_Get_D3D_Device8()->TestCooperativeLevel();
+		if (hr == D3DERR_DEVICELOST)
+		{
+			return false;
+		}
+		if (_UseD3D11Backend &&
+			!_D3D11Bridge.Prepare_Legacy_Device_Reset())
+		{
+			return false;
+		}
+		if (reset_requires_reacquire != nullptr)
+		{
+			*reset_requires_reacquire = true;
+		}
+
 		// Release all non-MANAGED stuff
 		WW3D::_Invalidate_Textures();
 
@@ -628,14 +772,11 @@ bool DX8Wrapper::Reset_Device(bool reload_assets)
 		memset(Vertex_Shader_Constants,0,sizeof(Vector4)*MAX_VERTEX_SHADER_CONSTANTS);
 		memset(Pixel_Shader_Constants,0,sizeof(Vector4)*MAX_PIXEL_SHADER_CONSTANTS);
 
-		HRESULT hr=_Get_D3D_Device8()->TestCooperativeLevel();
-		if (hr != D3DERR_DEVICELOST )
-		{	DX8CALL_HRES(Reset(&_PresentParameters),hr)
-			if (hr != D3D_OK)
-				return false;	//reset failed.
-		}
-		else
-			return false;	//device is lost and can't be reset.
+		DX8CALL_HRES(Reset(&_PresentParameters),hr)
+		if (hr != D3D_OK)
+			return false;	//reset failed.
+		rts::render::ResetTrackedLegacyState();
+		rts::render::SeedTrackedLegacyPipelineState();
 
 		if (reload_assets)
 		{
@@ -647,6 +788,22 @@ bool DX8Wrapper::Reset_Device(bool reload_assets)
 		Invalidate_Cached_Render_States();
 		Set_Default_Global_Render_States();
 		SHD_INIT_SHADERS;
+		if (_UseD3D11Backend)
+		{
+			if (!_D3D11Bridge.Is_Active())
+			{
+				WWDEBUG_SAY(("D3D11 renderer became inactive during device reset"));
+				return false;
+			}
+			const rts::render::RenderResult bridge_result =
+				_D3D11Bridge.Resize(ResolutionWidth, ResolutionHeight);
+			if (bridge_result != rts::render::RENDER_RESULT_OK)
+			{
+				WWDEBUG_SAY(("D3D11 renderer resize failed during device reset: %d",
+					static_cast<int>(bridge_result)));
+				return false;
+			}
+		}
 		WWDEBUG_SAY(("Device reset completed"));
 		return true;
 	}
@@ -665,6 +822,13 @@ void DX8Wrapper::Release_Device()
 
 		DX8CALL(SetStreamSource(0, nullptr, 0));	//release reference count on last rendered vertex buffer
 		DX8CALL(SetIndices(nullptr,0));	//release reference count on last rendered index buffer
+		Track_DX8_Vertex_Buffer(nullptr, 0, 0);
+		if (RawIndexBuffer != nullptr)
+		{
+			RawIndexBuffer->Release();
+			RawIndexBuffer = nullptr;
+		}
+		RawIndexBaseVertex = 0;
 
 
 		/*
@@ -870,11 +1034,84 @@ void DX8Wrapper::Get_Format_Name(unsigned int format, StringClass *tex_format)
 		}
 }
 
-void DX8Wrapper::Resize_And_Position_Window()
+bool DX8Wrapper::Resize_And_Position_Window(bool use_restored_width,
+	bool use_restored_height)
 {
+	bool d3d11_windowed_restore_pending = false;
+	RECT d3d11_rollback_monitor = { 0 };
+	if (_UseD3D11Backend)
+	{
+		if (!IsWindowed)
+		{
+			RECT monitor_rect;
+			if (!Get_D3D11_Monitor_Rect(&monitor_rect))
+			{
+				WWDEBUG_SAY(("D3D11 monitor lookup failed: %lu.", GetLastError()));
+				return false;
+			}
+			ResolutionWidth = monitor_rect.right - monitor_rect.left;
+			ResolutionHeight = monitor_rect.bottom - monitor_rect.top;
+			_PresentParameters.BackBufferWidth = ResolutionWidth;
+			_PresentParameters.BackBufferHeight = ResolutionHeight;
+			if (!rts::render::ApplyBorderlessWindow(_Hwnd, monitor_rect,
+				&_D3D11WindowPresentationState))
+			{
+				WWDEBUG_SAY(("D3D11 borderless window transition failed: %lu.",
+					GetLastError()));
+				return false;
+			}
+			return true;
+		}
+		else if (_D3D11WindowPresentationState.valid)
+		{
+			if (!Get_D3D11_Monitor_Rect(&d3d11_rollback_monitor))
+			{
+				WWDEBUG_SAY(("D3D11 rollback monitor lookup failed: %lu.",
+					GetLastError()));
+				return false;
+			}
+			if (!rts::render::RestoreWindowPresentationSnapshot(_Hwnd,
+				&_D3D11WindowPresentationState, false))
+			{
+				WWDEBUG_SAY(("D3D11 windowed restoration failed: %lu.",
+					GetLastError()));
+				return Abort_D3D11_Windowed_Transition(
+					d3d11_rollback_monitor);
+			}
+			d3d11_windowed_restore_pending = true;
+			RECT restored_client_rect;
+			if (!::GetClientRect(_Hwnd, &restored_client_rect) ||
+				restored_client_rect.right <= restored_client_rect.left ||
+				restored_client_rect.bottom <= restored_client_rect.top)
+			{
+				return Abort_D3D11_Windowed_Transition(
+					d3d11_rollback_monitor);
+			}
+			if (use_restored_width)
+			{
+				ResolutionWidth = restored_client_rect.right -
+					restored_client_rect.left;
+			}
+			if (use_restored_height)
+			{
+				ResolutionHeight = restored_client_rect.bottom -
+					restored_client_rect.top;
+			}
+			_PresentParameters.BackBufferWidth = ResolutionWidth;
+			_PresentParameters.BackBufferHeight = ResolutionHeight;
+			// Continue through the normal windowed sizing path.  This preserves
+			// an explicit requested resolution while using the captured client
+			// size only for dimensions the caller left unspecified.
+		}
+	}
+
 	// Get the current dimensions of the 'render area' of the window
 	RECT rect = { 0 };
-	::GetClientRect (_Hwnd, &rect);
+	if (!::GetClientRect(_Hwnd, &rect) && _UseD3D11Backend)
+	{
+		return d3d11_windowed_restore_pending ?
+			Abort_D3D11_Windowed_Transition(d3d11_rollback_monitor) : false;
+	}
 
 	// Is the window the correct size for this resolution?
 	if ((rect.right-rect.left) != ResolutionWidth ||
@@ -886,8 +1123,21 @@ void DX8Wrapper::Resize_And_Position_Window()
 		rect.top = 0;
 		rect.right = ResolutionWidth;
 		rect.bottom = ResolutionHeight;
-		DWORD dwstyle = ::GetWindowLong (_Hwnd, GWL_STYLE);
-		AdjustWindowRect (&rect, dwstyle, FALSE);
+		DWORD dwstyle = 0;
+		if (_UseD3D11Backend)
+		{
+			if (!rts::render::ReadWindowStyle(_Hwnd, GWL_STYLE, &dwstyle) ||
+				!AdjustWindowRect(&rect, dwstyle, FALSE))
+			{
+				return d3d11_windowed_restore_pending ?
+					Abort_D3D11_Windowed_Transition(d3d11_rollback_monitor) : false;
+			}
+		}
+		else
+		{
+			dwstyle = ::GetWindowLong(_Hwnd, GWL_STYLE);
+			AdjustWindowRect(&rect, dwstyle, FALSE);
+		}
 		int width = rect.right-rect.left;
 		int height = rect.bottom-rect.top;
 
@@ -903,7 +1153,12 @@ void DX8Wrapper::Resize_And_Position_Window()
 			// TheSuperHackers @feature helmutbuhler 14/04/2025
 			// Center the window in the workarea of the monitor it is on.
 			MONITORINFO mi = {sizeof(MONITORINFO)};
-			GetMonitorInfo(MonitorFromWindow(_Hwnd, MONITOR_DEFAULTTOPRIMARY), &mi);
+			if (!GetMonitorInfo(MonitorFromWindow(_Hwnd,
+				MONITOR_DEFAULTTOPRIMARY), &mi) && _UseD3D11Backend)
+			{
+				return d3d11_windowed_restore_pending ?
+					Abort_D3D11_Windowed_Transition(d3d11_rollback_monitor) : false;
+			}
 			int left = (mi.rcWork.left + mi.rcWork.right - width) / 2;
 			int top  = (mi.rcWork.top + mi.rcWork.bottom - height) / 2;
 
@@ -917,11 +1172,34 @@ void DX8Wrapper::Resize_And_Position_Window()
 			rectClient.bottom = rectClient.top + ResolutionHeight;
 			MoveRectIntoOtherRect(rectClient, mi.rcMonitor, &left, &top);
 
-			::SetWindowPos (_Hwnd, nullptr, left, top, width, height, SWP_NOZORDER);
+			if (!::SetWindowPos(_Hwnd, nullptr, left, top, width, height,
+				SWP_NOZORDER) && _UseD3D11Backend)
+			{
+				return d3d11_windowed_restore_pending ?
+					Abort_D3D11_Windowed_Transition(d3d11_rollback_monitor) : false;
+			}
 
 			DEBUG_LOG(("Window positioned to x:%d y:%d, resized to w:%d h:%d", left, top, width, height));
 		}
 	}
+	if (_UseD3D11Backend)
+	{
+		RECT verified_client_rect = { 0 };
+		if (!GetClientRect(_Hwnd, &verified_client_rect) ||
+			verified_client_rect.right - verified_client_rect.left !=
+				ResolutionWidth ||
+			verified_client_rect.bottom - verified_client_rect.top !=
+				ResolutionHeight)
+		{
+			return d3d11_windowed_restore_pending ?
+				Abort_D3D11_Windowed_Transition(d3d11_rollback_monitor) : false;
+		}
+		if (d3d11_windowed_restore_pending)
+		{
+			_D3D11WindowPresentationState.clear();
+		}
+	}
+	return true;
 }
 
 bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int windowed,
@@ -930,6 +1208,12 @@ bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int
 	WWASSERT(IsInitted);
 	WWASSERT(dev >= -1);
 	WWASSERT(dev < _RenderDeviceNameTable.Count());
+	const bool previous_windowed = IsWindowed;
+	const int previous_resolution_width = ResolutionWidth;
+	const int previous_resolution_height = ResolutionHeight;
+	const int previous_bit_depth = BitDepth;
+	const UINT previous_back_buffer_width = _PresentParameters.BackBufferWidth;
+	const UINT previous_back_buffer_height = _PresentParameters.BackBufferHeight;
 
 	/*
 	** If user has never selected a render device, start out with device 0
@@ -949,7 +1233,17 @@ bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int
 
 	if (bits != -1)		BitDepth = bits;
 	if (windowed != -1)	IsWindowed = (windowed != 0);
+	if (_UseD3D11Backend && !IsWindowed)
+	{
+		RECT monitor_rect;
+		if (Get_D3D11_Monitor_Rect(&monitor_rect))
+		{
+			ResolutionWidth = monitor_rect.right - monitor_rect.left;
+			ResolutionHeight = monitor_rect.bottom - monitor_rect.top;
+		}
+	}
 	DX8Wrapper_IsWindowed = IsWindowed;
+	const bool presentation_windowed = IsWindowed || _UseD3D11Backend;
 
 	WWDEBUG_SAY(("Attempting Set_Render_Device: name: %s (%s:%s), width: %d, height: %d, windowed: %d",
 		_RenderDeviceNameTable[CurRenderDevice].str(),_RenderDeviceDescriptionTable[CurRenderDevice].Get_Driver_Name(),
@@ -961,8 +1255,19 @@ bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int
 	// the caption and edges of the window type you provide, so its important to
 	// push the client area to be the size you really want.
 	// if ( resize_window && windowed ) {
-	if (resize_window) {
-		Resize_And_Position_Window();
+	if (resize_window || (_UseD3D11Backend &&
+		(!IsWindowed || previous_windowed != IsWindowed))) {
+		if (!Resize_And_Position_Window(width == -1, height == -1))
+		{
+			ResolutionWidth = previous_resolution_width;
+			ResolutionHeight = previous_resolution_height;
+			BitDepth = previous_bit_depth;
+			IsWindowed = previous_windowed;
+			DX8Wrapper_IsWindowed = previous_windowed;
+			_PresentParameters.BackBufferWidth = previous_back_buffer_width;
+			_PresentParameters.BackBufferHeight = previous_back_buffer_height;
+			return false;
+		}
 	}
 #endif
 	//must be either resetting existing device or creating a new one.
@@ -975,12 +1280,12 @@ bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int
 
 	_PresentParameters.BackBufferWidth = ResolutionWidth;
 	_PresentParameters.BackBufferHeight = ResolutionHeight;
-	_PresentParameters.BackBufferCount = IsWindowed ? 1 : 2;
+	_PresentParameters.BackBufferCount = presentation_windowed ? 1 : 2;
 
 	//I changed this to discard all the time (even when full-screen) since that the most efficient. 07-16-03 MW:
 	_PresentParameters.SwapEffect = D3DSWAPEFFECT_DISCARD;//IsWindowed ? D3DSWAPEFFECT_DISCARD : D3DSWAPEFFECT_FLIP;		// Shouldn't this be D3DSWAPEFFECT_FLIP?
 	_PresentParameters.hDeviceWindow = _Hwnd;
-	_PresentParameters.Windowed = IsWindowed;
+	_PresentParameters.Windowed = presentation_windowed;
 
 	_PresentParameters.EnableAutoDepthStencil = TRUE;				// Driver will attempt to match Z-buffer depth
 	_PresentParameters.Flags=0;											// We're not going to lock the backbuffer
@@ -993,7 +1298,7 @@ bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int
 	** - if in windowed mode, the backbuffer must use the current display format.
 	** - the depth buffer must use
 	*/
-	if (IsWindowed) {
+	if (presentation_windowed) {
 
 		D3DDISPLAYMODE desktop_mode;
 		::ZeroMemory(&desktop_mode, sizeof(D3DDISPLAYMODE));
@@ -1070,7 +1375,7 @@ bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int
 			CurRenderDevice,
 			D3DDEVTYPE_HAL,
 			_PresentParameters.BackBufferFormat,
-			IsWindowed,
+			presentation_windowed,
 			MultiSampleAntiAliasing
 		);
 
@@ -1078,7 +1383,7 @@ bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int
 			CurRenderDevice,
 			D3DDEVTYPE_HAL,
 			_PresentParameters.AutoDepthStencilFormat,
-			IsWindowed,
+			presentation_windowed,
 			MultiSampleAntiAliasing
 		);
 
@@ -1108,7 +1413,16 @@ bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int
 	if (reset_device)
 	{
 		WWDEBUG_SAY(("DX8Wrapper::Set_Render_Device is resetting the device."));
-		ret = Reset_Device(restore_assets);	//reset device without restoring data - we're likely switching out of the app.
+		bool reset_requires_reacquire = false;
+		ret = Reset_Device(restore_assets, &reset_requires_reacquire);	//reset device without restoring data - we're likely switching out of the app.
+		if (!ret && reset_requires_reacquire)
+		{
+			IsDeviceLost = true;
+			if (_UseD3D11Backend)
+			{
+				_D3D11Bridge.Shutdown();
+			}
+		}
 	}
 	else
 		ret = Create_Device();
@@ -1187,7 +1501,16 @@ void DX8Wrapper::Set_Swap_Interval(int swap)
 	}
 
 	WWDEBUG_SAY(("DX8Wrapper::Set_Swap_Interval is resetting the device."));
-	Reset_Device();
+	bool reset_requires_reacquire = false;
+	if (!Reset_Device(true, &reset_requires_reacquire) &&
+		reset_requires_reacquire)
+	{
+		IsDeviceLost = true;
+		if (_UseD3D11Backend)
+		{
+			_D3D11Bridge.Shutdown();
+		}
+	}
 }
 
 int DX8Wrapper::Get_Swap_Interval()
@@ -1244,6 +1567,29 @@ const char * DX8Wrapper::Get_Render_Device_Name(int device_index)
 bool DX8Wrapper::Set_Device_Resolution(int width,int height,int bits,int windowed, bool resize_window)
 {
 	if (D3DDevice != nullptr) {
+		const bool previous_windowed = IsWindowed;
+		bool reset_requires_reacquire = false;
+		bool window_rollback_failed = false;
+		const bool previous_dx8_windowed = DX8Wrapper_IsWindowed;
+		const int previous_resolution_width = ResolutionWidth;
+		const int previous_resolution_height = ResolutionHeight;
+		const int previous_bit_depth = BitDepth;
+		const unsigned long previous_frame_count = FrameCount;
+		const D3DPRESENT_PARAMETERS previous_present_parameters =
+			_PresentParameters;
+		const rts::render::WindowPresentationState previous_presentation_state =
+			_D3D11WindowPresentationState;
+		const bool requested_windowed = windowed == -1 ? IsWindowed :
+			windowed != 0;
+		const bool changes_window = _UseD3D11Backend && (resize_window ||
+			!requested_windowed || requested_windowed != previous_windowed);
+		rts::render::WindowPresentationState physical_window_state;
+		if (changes_window && !physical_window_state.capture(_Hwnd))
+		{
+			WWDEBUG_SAY(("D3D11 window rollback snapshot failed: %lu.",
+				GetLastError()));
+			return false;
+		}
 
 		if (width != -1) {
 			_PresentParameters.BackBufferWidth = ResolutionWidth = width;
@@ -1251,13 +1597,91 @@ bool DX8Wrapper::Set_Device_Resolution(int width,int height,int bits,int windowe
 		if (height != -1) {
 			_PresentParameters.BackBufferHeight = ResolutionHeight = height;
 		}
-		if (resize_window)
+		if (_UseD3D11Backend && windowed != -1)
 		{
-			Resize_And_Position_Window();
+			IsWindowed = windowed != 0;
+			DX8Wrapper_IsWindowed = IsWindowed;
+		}
+		if (_UseD3D11Backend && !IsWindowed)
+		{
+			RECT monitor_rect;
+			if (Get_D3D11_Monitor_Rect(&monitor_rect))
+			{
+				ResolutionWidth = monitor_rect.right - monitor_rect.left;
+				ResolutionHeight = monitor_rect.bottom - monitor_rect.top;
+				_PresentParameters.BackBufferWidth = ResolutionWidth;
+				_PresentParameters.BackBufferHeight = ResolutionHeight;
+			}
+		}
+		if (resize_window || (_UseD3D11Backend &&
+			(!IsWindowed || previous_windowed != IsWindowed)))
+		{
+			if (!Resize_And_Position_Window(width == -1, height == -1))
+			{
+				goto reset_failed;
+			}
 		}
 #pragma message("TODO: support changing windowed status and changing the bit depth")
 		WWDEBUG_SAY(("DX8Wrapper::Set_Device_Resolution is resetting the device."));
-		return Reset_Device();
+		if (Reset_Device(true, &reset_requires_reacquire))
+		{
+			return true;
+		}
+
+reset_failed:
+		ResolutionWidth = previous_resolution_width;
+		ResolutionHeight = previous_resolution_height;
+		BitDepth = previous_bit_depth;
+		IsWindowed = previous_windowed;
+		DX8Wrapper_IsWindowed = previous_dx8_windowed;
+		_PresentParameters = previous_present_parameters;
+		FrameCount = previous_frame_count;
+		if (physical_window_state.valid)
+		{
+			if (rts::render::RestoreWindowPresentationSnapshot(_Hwnd,
+				&physical_window_state, true))
+			{
+				_D3D11WindowPresentationState = previous_presentation_state;
+			}
+			else
+			{
+				WWDEBUG_SAY(("D3D11 window reset rollback failed: %lu.",
+					GetLastError()));
+				window_rollback_failed = true;
+				_D3D11WindowPresentationState = previous_presentation_state.valid ?
+					previous_presentation_state : physical_window_state;
+			}
+		}
+		else
+		{
+			_D3D11WindowPresentationState = previous_presentation_state;
+		}
+		if (reset_requires_reacquire)
+		{
+			bool rollback_requires_reacquire = false;
+			if (!Reset_Device(true, &rollback_requires_reacquire))
+			{
+				WWDEBUG_SAY(("Native device rollback failed after D3D11 resize failure."));
+				IsDeviceLost = true;
+				if (_UseD3D11Backend)
+				{
+					_D3D11Bridge.Shutdown();
+				}
+			}
+			else
+			{
+				FrameCount = previous_frame_count;
+			}
+		}
+		if (window_rollback_failed)
+		{
+			IsDeviceLost = true;
+			if (_UseD3D11Backend)
+			{
+				_D3D11Bridge.Shutdown();
+			}
+		}
+		return false;
 	} else {
 		return false;
 	}
@@ -1650,17 +2074,35 @@ void DX8_Assert()
 	DX8_THREAD_ASSERT();
 }
 
-void DX8Wrapper::Begin_Scene()
+bool DX8Wrapper::Begin_Scene()
 {
 	DX8_THREAD_ASSERT();
+	rts::render::ResetLegacyStatePublicationFailure();
+	_D3D11FrameStarted = false;
+	if (_UseD3D11Backend && !_D3D11Bridge.Is_Active())
+	{
+		WWDEBUG_SAY(("D3D11 renderer is unavailable at begin-scene."));
+		return false;
+	}
 
 #if ENABLE_EMBEDDED_BROWSER
 	DX8WebBrowser::Update();
 #endif
 
 	DX8CALL(BeginScene());
+	if (_UseD3D11Backend)
+	{
+		if (!_D3D11Bridge.Begin_Frame())
+		{
+			DX8CALL(EndScene());
+			WWDEBUG_SAY(("D3D11 renderer begin-frame failed."));
+			return false;
+		}
+		_D3D11FrameStarted = true;
+	}
 
 	DX8WebBrowser::Update();
+	return true;
 }
 
 void DX8Wrapper::End_Scene(bool flip_frames)
@@ -1669,13 +2111,54 @@ void DX8Wrapper::End_Scene(bool flip_frames)
 	DX8CALL(EndScene());
 
 	DX8WebBrowser::Render(0);
+	const bool d3d11_frame_active = _D3D11FrameStarted;
+	_D3D11FrameStarted = false;
+	rts::render::RenderResult d3d11_frame_result =
+		rts::render::RENDER_RESULT_OK;
+	rts::render::RenderFrameOutcome d3d11_frame_outcome;
+	if (d3d11_frame_active)
+	{
+		d3d11_frame_result = _D3D11Bridge.End_Frame(flip_frames,
+			&d3d11_frame_outcome);
+	}
 
 	if (flip_frames) {
 		DX8_Assert();
 		HRESULT hr;
-		{
+		const bool d3d11_command_frame_dropped = d3d11_frame_active &&
+			d3d11_frame_outcome.hasCommandFailure() &&
+			!d3d11_frame_outcome.wasPresented() &&
+			!d3d11_frame_outcome.hasDeviceRemoval() &&
+			!d3d11_frame_outcome.hasLifecycleFailure() &&
+			d3d11_frame_outcome.isOperational();
+		if (!_UseD3D11Backend &&
+			rts::render::ShouldPresentLegacyFrame(d3d11_frame_active,
+				_D3D11Bridge.Is_Active())) {
 			WWPROFILE("DX8Device::Present()");
 			hr=_Get_D3D_Device8()->Present(nullptr, nullptr, nullptr, nullptr);
+		}
+		else if (d3d11_frame_active) {
+			hr = d3d11_command_frame_dropped ? D3D_OK :
+				(d3d11_frame_outcome.wasPresented() &&
+				 d3d11_frame_outcome.presentationResult() ==
+					rts::render::RENDER_RESULT_OK ? D3D_OK :
+					(d3d11_frame_result == rts::render::RENDER_RESULT_OK ?
+						E_FAIL : Render_Result_To_HRESULT(d3d11_frame_result)));
+			if (d3d11_frame_result != rts::render::RENDER_RESULT_OK)
+			{
+				WWDEBUG_SAY(("D3D11 renderer frame failed: %d",
+					static_cast<int>(d3d11_frame_result)));
+			}
+			if (d3d11_frame_outcome.hasCommandFailure())
+			{
+				WWDEBUG_SAY(("D3D11 renderer command failure was reported after frame completion: %d",
+					static_cast<int>(d3d11_frame_outcome.commandResult())));
+			}
+		}
+		else {
+			// The bridge became active or was torn down without owning this scene;
+			// do not expose a differential frame while ownership is ambiguous.
+			hr = E_FAIL;
 		}
 
 		DX8_RECORD_DX8_CALLS();
@@ -1687,7 +2170,10 @@ void DX8Wrapper::End_Scene(bool flip_frames)
 			}
 #endif
 			IsDeviceLost=false;
-			FrameCount++;
+			if (!d3d11_command_frame_dropped)
+			{
+				FrameCount++;
+			}
 		}
 		else {
 			IsDeviceLost=true;
@@ -1698,7 +2184,16 @@ void DX8Wrapper::End_Scene(bool flip_frames)
 			hr=_Get_D3D_Device8()->TestCooperativeLevel();
 			if (hr==D3DERR_DEVICENOTRESET) {
 				WWDEBUG_SAY(("DX8Wrapper::End_Scene is resetting the device."));
-				Reset_Device();
+				bool reset_requires_reacquire = false;
+				if (!Reset_Device(true, &reset_requires_reacquire) &&
+					reset_requires_reacquire)
+				{
+					IsDeviceLost = true;
+					if (_UseD3D11Backend)
+					{
+						_D3D11Bridge.Shutdown();
+					}
+				}
 			}
 			else {
 				// Sleep it not active
@@ -1706,8 +2201,26 @@ void DX8Wrapper::End_Scene(bool flip_frames)
 			}
 		}
 		else {
-			DX8_ErrorCode(hr);
+			if (!_D3D11Bridge.Is_Active())
+			{
+				DX8_ErrorCode(hr);
+			}
 		}
+	}
+	else if (d3d11_frame_active &&
+		(!d3d11_frame_outcome.isOperational() ||
+			d3d11_frame_outcome.hasDeviceRemoval() ||
+			d3d11_frame_outcome.hasLifecycleFailure()))
+	{
+		WWDEBUG_SAY(("D3D11 renderer frame failed without present: %d",
+			static_cast<int>(d3d11_frame_result)));
+		IsDeviceLost = true;
+	}
+	else if (d3d11_frame_active)
+	{
+		// A non-device command failure is observable in the frame outcome but does
+		// not make the device unavailable for the next visible frame.
+		IsDeviceLost = false;
 	}
 
 	// Each frame, release all of the buffers and textures.
@@ -1720,6 +2233,14 @@ void DX8Wrapper::End_Scene(bool flip_frames)
 
 void DX8Wrapper::Flip_To_Primary()
 {
+	// The D3D11 bridge owns presentation for its active backend.  A legacy
+	// page flip here would expose the hidden differential swap chain and can
+	// overwrite or duplicate the visible frame.
+	if (_UseD3D11Backend)
+	{
+		return;
+	}
+
 	// If we are fullscreen and the current frame is odd then we need
 	// to force a page flip to ensure that the first buffer in the flipping
 	// chain is the one visible.
@@ -1777,6 +2298,26 @@ void DX8Wrapper::Flip_To_Primary()
 void DX8Wrapper::Clear(bool clear_color, bool clear_z_stencil, const Vector3 &color, float dest_alpha, float z, unsigned int stencil)
 {
 	DX8_THREAD_ASSERT();
+	const rts::render::RenderSubmissionDecision submission =
+		Get_Visible_Submission_Decision();
+	if (submission.submitD3D11)
+	{
+		if (clear_color || clear_z_stencil)
+		{
+			// D3D11 is the sole visible clear owner while its target mapping is
+			// valid. Any command failure is retained by the bridge frame outcome;
+			// do not issue a duplicate legacy clear as a hidden fallback.
+			_D3D11Bridge.Clear(clear_color, clear_z_stencil,
+				color.X, color.Y, color.Z, dest_alpha, z, stencil);
+		}
+		return;
+	}
+	if (!submission.submitLegacy)
+	{
+		Record_Unavailable_Visible_Submission(submission);
+		WWDEBUG_SAY(("D3D11 renderer suppressed a clear because its target is unavailable."));
+		return;
+	}
 
 	// If we try to clear a stencil buffer which is not there, the entire call will fail
 	// KJM fixed this to get format from back buffer (incase render to texture is used)
@@ -1814,10 +2355,282 @@ void DX8Wrapper::Clear(bool clear_color, bool clear_z_stencil, const Vector3 &co
 	}
 }
 
+HRESULT DX8Wrapper::Draw_Primitive_UP(D3DPRIMITIVETYPE primitive_type,
+	UINT primitive_count, CONST void *vertex_data, UINT vertex_stride)
+{
+	DX8_THREAD_ASSERT();
+	DX8_Assert();
+	const rts::render::RenderSubmissionDecision submission =
+		Get_Visible_Submission_Decision();
+	if (submission.submitD3D11)
+	{
+		const rts::render::RenderResult result = _D3D11Bridge.Draw_Primitive_UP(
+			Vertex_Shader, static_cast<unsigned int>(primitive_type),
+			primitive_count, vertex_data, vertex_stride);
+		if (result != rts::render::RENDER_RESULT_OK)
+		{
+			WWDEBUG_SAY(("D3D11 renderer rejected DrawPrimitiveUP: %d",
+				static_cast<int>(result)));
+		}
+		return Render_Result_To_HRESULT(result);
+	}
+	if (!submission.submitLegacy)
+	{
+		Record_Unavailable_Visible_Submission(submission);
+		WWDEBUG_SAY(("D3D11 renderer suppressed DrawPrimitiveUP because its target is unavailable."));
+		return E_FAIL;
+	}
+
+	HRESULT legacy_result = D3D_OK;
+	DX8CALL_HRES(DrawPrimitiveUP(primitive_type, primitive_count, vertex_data,
+		vertex_stride), legacy_result);
+	if (FAILED(legacy_result))
+	{
+		return legacy_result;
+	}
+	return legacy_result;
+}
+
+void DX8Wrapper::Track_DX8_Vertex_Buffer(IDirect3DVertexBuffer8 *vb,
+	UINT stride, DWORD fvf)
+{
+	if (RawVertexBuffer != vb)
+	{
+		if (RawVertexBuffer != nullptr)
+		{
+			RawVertexBuffer->Release();
+		}
+		RawVertexBuffer = vb;
+		if (RawVertexBuffer != nullptr)
+		{
+			RawVertexBuffer->AddRef();
+		}
+	}
+	RawVertexStride = stride;
+	RawVertexFVF = fvf;
+}
+
+HRESULT DX8Wrapper::Set_DX8_Vertex_Buffer(IDirect3DVertexBuffer8 *vb,
+	UINT stride, DWORD fvf)
+{
+	DX8_THREAD_ASSERT();
+	DX8_Assert();
+	HRESULT result = D3D_OK;
+	DX8CALL_HRES(SetStreamSource(0, vb, stride), result);
+	if (SUCCEEDED(result))
+	{
+		Track_DX8_Vertex_Buffer(vb, stride, fvf);
+		DX8_RECORD_VERTEX_BUFFER_CHANGE();
+	}
+	return result;
+}
+
+HRESULT DX8Wrapper::Set_DX8_Index_Buffer(IDirect3DIndexBuffer8 *ib,
+	UINT base_vertex)
+{
+	DX8_THREAD_ASSERT();
+	DX8_Assert();
+	HRESULT result = D3D_OK;
+	DX8CALL_HRES(SetIndices(ib, base_vertex), result);
+	if (SUCCEEDED(result))
+	{
+		if (RawIndexBuffer != ib)
+		{
+			if (RawIndexBuffer != nullptr)
+			{
+				RawIndexBuffer->Release();
+			}
+			RawIndexBuffer = ib;
+			if (RawIndexBuffer != nullptr)
+			{
+				RawIndexBuffer->AddRef();
+			}
+		}
+		RawIndexBaseVertex = base_vertex;
+		DX8_RECORD_INDEX_BUFFER_CHANGE();
+	}
+	return result;
+}
+
+HRESULT DX8Wrapper::Draw_DX8_Indexed_Primitive(
+	D3DPRIMITIVETYPE primitive_type, UINT min_vertex_index,
+	UINT vertex_count, UINT start_index, UINT primitive_count)
+{
+	DX8_THREAD_ASSERT();
+	DX8_Assert();
+	const rts::render::RenderSubmissionDecision submission =
+		Get_Visible_Submission_Decision();
+	if (submission.submitD3D11)
+	{
+		DX8_RECORD_DRAW_CALLS();
+		if (RawVertexBuffer == nullptr || RawIndexBuffer == nullptr ||
+			RawVertexStride == 0 || RawVertexFVF == 0)
+		{
+			WWDEBUG_SAY(("D3D11 renderer rejected a raw indexed draw with no tracked DX8 buffers."));
+			return E_FAIL;
+		}
+		if (!_D3D11Bridge.Draw(RawVertexBuffer, RawVertexFVF,
+			RawVertexStride, RawIndexBuffer,
+			static_cast<unsigned int>(primitive_type), min_vertex_index,
+			vertex_count, start_index, primitive_count, RawIndexBaseVertex))
+		{
+			WWDEBUG_SAY(("D3D11 renderer rejected a raw indexed draw submission."));
+			return E_FAIL;
+		}
+		return D3D_OK;
+	}
+	if (!submission.submitLegacy)
+	{
+		Record_Unavailable_Visible_Submission(submission);
+		WWDEBUG_SAY(("D3D11 renderer suppressed a raw indexed draw because its target is unavailable."));
+		return E_FAIL;
+	}
+
+	HRESULT legacy_result = D3D_OK;
+	DX8CALL_HRES(DrawIndexedPrimitive(primitive_type, min_vertex_index,
+		vertex_count, start_index, primitive_count), legacy_result);
+	if (FAILED(legacy_result))
+	{
+		return legacy_result;
+	}
+
+	DX8_RECORD_DRAW_CALLS();
+	return legacy_result;
+}
+
+unsigned int DX8Wrapper::Get_D3D11_Raw_Indexed_Draw_Count()
+{
+	return _D3D11Bridge.Get_Raw_Indexed_Draw_Count();
+}
+
+bool DX8Wrapper::Is_D3D11_Backend_Active()
+{
+	return _D3D11Bridge.Is_Active();
+}
+
+void DX8Wrapper::Begin_D3D11_Display_Iteration()
+{
+	_D3D11Bridge.Begin_Display_Iteration();
+}
+
+rts::render::RenderResult DX8Wrapper::Get_Render_Back_Buffer_Info(
+	rts::render::RenderBackBufferInfo *info)
+{
+	return _D3D11Bridge.Get_Back_Buffer_Info(info);
+}
+
+rts::render::RenderResult DX8Wrapper::Copy_Active_Render_Target_To_Texture(
+	IDirect3DBaseTexture8 *destination)
+{
+	return _D3D11Bridge.Copy_Active_Color_Target_To_Texture(destination);
+}
+
+bool DX8Wrapper::Acquire_D3D11_Copied_Texture_Content(
+	IDirect3DBaseTexture8 *texture)
+{
+	return _D3D11Bridge.Acquire_Copied_Texture_Content(texture);
+}
+
+void DX8Wrapper::Notify_D3D11_Buffer_Changed(IUnknown *buffer)
+{
+	_D3D11Bridge.Invalidate_Buffer(buffer);
+}
+
+void DX8Wrapper::Notify_D3D11_Buffer_Range_Changed(IUnknown *buffer,
+	unsigned int binding, size_t destination_offset, size_t byte_count,
+	rts::render::RenderBufferUpdateMode mode)
+{
+	_D3D11Bridge.Invalidate_Buffer_Range(buffer, binding,
+		destination_offset, byte_count, mode);
+}
+
+bool DX8Wrapper::Publish_D3D11_Buffer_Change(IUnknown *buffer,
+	unsigned int binding, const void *data, size_t byte_count,
+	size_t destination_offset, rts::render::RenderBufferUpdateMode mode,
+	unsigned int source_generation)
+{
+	return _D3D11Bridge.Publish_Buffer_Change(buffer, binding, data,
+		byte_count, destination_offset, mode, source_generation);
+}
+
+void DX8Wrapper::Notify_D3D11_Texture_Changed(
+	IDirect3DBaseTexture8 *texture)
+{
+	_D3D11Bridge.Invalidate_Texture(texture);
+}
+
+void DX8Wrapper::Notify_D3D11_Texture_Changed(TextureClass *texture)
+{
+	Notify_D3D11_Texture_Changed(
+		texture != nullptr ? texture->Peek_D3D_Base_Texture() : nullptr);
+}
+
+void Notify_Render_Texture_Changed(IDirect3DBaseTexture8 *texture)
+{
+	DX8Wrapper::Notify_D3D11_Texture_Changed(texture);
+}
+
+void Notify_Render_Texture_Changed(TextureClass *texture)
+{
+	DX8Wrapper::Notify_D3D11_Texture_Changed(texture);
+}
+
+void Notify_Render_Buffer_Changed(IUnknown *buffer)
+{
+	DX8Wrapper::Notify_D3D11_Buffer_Changed(buffer);
+}
+
+void Notify_Render_Buffer_Range_Changed(IUnknown *buffer,
+	unsigned int binding, size_t destination_offset, size_t byte_count,
+	rts::render::RenderBufferUpdateMode mode)
+{
+	DX8Wrapper::Notify_D3D11_Buffer_Range_Changed(buffer, binding,
+		destination_offset, byte_count, mode);
+}
+
+bool Publish_Render_Buffer_Change(IUnknown *buffer, unsigned int binding,
+	const void *data, size_t byte_count, size_t destination_offset,
+	rts::render::RenderBufferUpdateMode mode, unsigned int source_generation)
+{
+	return DX8Wrapper::Publish_D3D11_Buffer_Change(buffer, binding, data,
+		byte_count, destination_offset, mode, source_generation);
+}
+
+void DX8Wrapper::Request_D3D11_Back_Buffer_Capture()
+{
+	if (_D3D11Bridge.Is_Active())
+	{
+		_D3D11Bridge.Request_Frame_Capture();
+	}
+}
+
+rts::render::RenderResult DX8Wrapper::Get_D3D11_Back_Buffer_Info(
+	rts::render::RenderBackBufferInfo *info)
+{
+	return _D3D11Bridge.Get_Back_Buffer_Info(info);
+}
+
+rts::render::RenderResult DX8Wrapper::Queue_D3D11_Back_Buffer_Capture(
+	const rts::render::RenderCaptureRequestDescriptor &descriptor,
+	rts::render::RenderCaptureHandle *handle)
+{
+	return _D3D11Bridge.Queue_Back_Buffer_Capture(descriptor, handle);
+}
+
+unsigned int DX8Wrapper::Cancel_D3D11_Back_Buffer_Captures(void *consumer,
+	rts::render::RenderResult reason)
+{
+	return _D3D11Bridge.Cancel_Back_Buffer_Captures(consumer, reason);
+}
+
 void DX8Wrapper::Set_Viewport(CONST D3DVIEWPORT8* pViewport)
 {
 	DX8_THREAD_ASSERT();
 	DX8CALL(SetViewport(pViewport));
+	if (_D3D11Bridge.Is_Render_Target_Operational() && pViewport != nullptr)
+	{
+		_D3D11Bridge.Set_Viewport(*pViewport);
+	}
 }
 
 // ----------------------------------------------------------------------------
@@ -1990,12 +2803,33 @@ void DX8Wrapper::Draw_Sorting_IB_VB(
 	DX8_RECORD_INDEX_BUFFER_CHANGE();
 
 	DX8_RECORD_DRAW_CALLS();
-	DX8CALL(DrawIndexedPrimitive(
-		D3DPT_TRIANGLELIST,
-		0,		// start vertex
-		vertex_count,
-		dyn_ib_access.IndexBufferOffset,
-		polygon_count));
+	const rts::render::RenderSubmissionDecision submission =
+		Get_Visible_Submission_Decision();
+	if (submission.submitLegacy)
+	{
+		DX8CALL(DrawIndexedPrimitive(
+			D3DPT_TRIANGLELIST,
+			0,		// start vertex
+			vertex_count,
+			dyn_ib_access.IndexBufferOffset,
+			polygon_count));
+	}
+	if (submission.submitD3D11)
+	{
+		if (!_D3D11Bridge.Draw(dyn_vb_access.VertexBuffer,
+			dyn_ib_access.IndexBuffer, D3DPT_TRIANGLELIST,
+			0, vertex_count,
+			dyn_ib_access.IndexBufferOffset, polygon_count,
+			dyn_vb_access.VertexBufferOffset))
+		{
+			WWDEBUG_SAY(("D3D11 renderer rejected a sorting draw submission."));
+		}
+	}
+	else if (!submission.submitLegacy)
+	{
+		Record_Unavailable_Visible_Submission(submission);
+		WWDEBUG_SAY(("D3D11 renderer suppressed a sorting draw because its target is unavailable."));
+	}
 
 	DX8_RECORD_RENDER(polygon_count,vertex_count,render_state.shader);
 }
@@ -2104,12 +2938,33 @@ void DX8Wrapper::Draw(
 				}*/
 				DX8_RECORD_RENDER(polygon_count,vertex_count,render_state.shader);
 				DX8_RECORD_DRAW_CALLS();
-				DX8CALL(DrawIndexedPrimitive(
-					(D3DPRIMITIVETYPE)primitive_type,
-					min_vertex_index,
-					vertex_count,
-					start_index+render_state.iba_offset,
-					polygon_count));
+				const rts::render::RenderSubmissionDecision submission =
+					Get_Visible_Submission_Decision();
+				if (submission.submitLegacy)
+				{
+					DX8CALL(DrawIndexedPrimitive(
+						(D3DPRIMITIVETYPE)primitive_type,
+						min_vertex_index,
+						vertex_count,
+						start_index+render_state.iba_offset,
+						polygon_count));
+				}
+				if (submission.submitD3D11)
+				{
+					if (!_D3D11Bridge.Draw(render_state.vertex_buffers[0],
+						render_state.index_buffer, primitive_type,
+						min_vertex_index, vertex_count,
+						start_index + render_state.iba_offset, polygon_count,
+						render_state.index_base_offset + render_state.vba_offset))
+					{
+						WWDEBUG_SAY(("D3D11 renderer rejected a draw submission."));
+					}
+				}
+				else if (!submission.submitLegacy)
+				{
+					Record_Unavailable_Visible_Submission(submission);
+					WWDEBUG_SAY(("D3D11 renderer suppressed a draw because its target is unavailable."));
+				}
 			}
 			break;
 		case BUFFER_TYPE_SORTING:
@@ -2368,8 +3223,7 @@ IDirect3DTexture8 * DX8Wrapper::_Create_DX8_Texture
 	// Render target may return NOTAVAILABLE, in
 	// which case we return null.
 	if (rendertarget) {
-		unsigned ret=D3DXCreateTexture(
-			DX8Wrapper::_Get_D3D_Device8(),
+		unsigned ret=DX8Wrapper::_Get_D3D_Device8()->CreateTexture(
 			width,
 			height,
 			mip_level_count,
@@ -2392,8 +3246,7 @@ IDirect3DTexture8 * DX8Wrapper::_Create_DX8_Texture
 			// Invalidate the mesh cache
 			WW3D::_Invalidate_Mesh_Cache();
 
-			ret=D3DXCreateTexture(
-				DX8Wrapper::_Get_D3D_Device8(),
+			ret=DX8Wrapper::_Get_D3D_Device8()->CreateTexture(
 				width,
 				height,
 				mip_level_count,
@@ -2423,8 +3276,7 @@ IDirect3DTexture8 * DX8Wrapper::_Create_DX8_Texture
 	// We should never run out of video memory when allocating a non-rendertarget texture.
 	// However, it seems to happen sometimes when there are a lot of textures in memory and so
 	// if it happens we'll release assets and try again (anything is better than crashing).
-	unsigned ret=D3DXCreateTexture(
-		DX8Wrapper::_Get_D3D_Device8(),
+	unsigned ret=DX8Wrapper::_Get_D3D_Device8()->CreateTexture(
 		width,
 		height,
 		mip_level_count,
@@ -2442,8 +3294,7 @@ IDirect3DTexture8 * DX8Wrapper::_Create_DX8_Texture
 		// Invalidate the mesh cache
 		WW3D::_Invalidate_Mesh_Cache();
 
-		ret=D3DXCreateTexture(
-			DX8Wrapper::_Get_D3D_Device8(),
+		ret=DX8Wrapper::_Get_D3D_Device8()->CreateTexture(
 			width,
 			height,
 			mip_level_count,
@@ -2478,20 +3329,19 @@ IDirect3DTexture8 * DX8Wrapper::_Create_DX8_Texture
 
 	// NOTE: If the original image format is not supported as a texture format, it will
 	// automatically be converted to an appropriate format.
-	// NOTE: It is possible to get the size and format of the original image file from this
-	// function as well, so if we later want to second-guess D3DX's format conversion decisions
-	// we can do so after this function is called..
-	unsigned result = D3DXCreateTextureFromFileExA(
+	// The project Targa decoder preserves source dimensions and performs the
+	// requested explicit CPU conversion before native texture creation.
+	unsigned result = LegacyTextureCreation_Create_File_Texture(
 		_Get_D3D_Device8(),
 		filename,
-		D3DX_DEFAULT,
-		D3DX_DEFAULT,
+		LEGACY_TEXTURE_DIMENSION_DEFAULT,
+		LEGACY_TEXTURE_DIMENSION_DEFAULT,
 		mip_level_count,//create_mipmaps ? 0 : 1,
 		0,
 		D3DFMT_UNKNOWN,
 		D3DPOOL_MANAGED,
-		D3DX_FILTER_BOX,
-		D3DX_FILTER_BOX,
+		LEGACY_TEXTURE_FILTER_BOX,
+		LEGACY_TEXTURE_FILTER_BOX,
 		0,
 		nullptr,
 		nullptr,
@@ -2533,13 +3383,22 @@ IDirect3DTexture8 * DX8Wrapper::_Create_DX8_Texture
 	// Copy the surface to the texture
 	IDirect3DSurface8 *tex_surface = nullptr;
 	texture->GetSurfaceLevel(0, &tex_surface);
-	DX8_ErrorCode(D3DXLoadSurfaceFromSurface(tex_surface, nullptr, nullptr, surface, nullptr, nullptr, D3DX_FILTER_BOX, 0));
+	D3DSURFACE_DESC texture_surface_desc;
+	::ZeroMemory(&texture_surface_desc, sizeof(D3DSURFACE_DESC));
+	tex_surface->GetDesc(&texture_surface_desc);
+	// SurfaceClass callers provide a full level copy.  Keep the byte-exact
+	// native CopyRects path for equal-size/equal-format surfaces; preserve the
+	// old BOX conversion boundary for implicit format or size conversion.
+	const SurfaceBlitFilter copy_filter =
+		SurfaceBlit_Filter_For_Full_Copy(texture_surface_desc, surface_desc);
+	DX8_ErrorCode(SurfaceBlit_Copy(tex_surface, nullptr, surface, nullptr,
+		copy_filter));
 	tex_surface->Release();
 
 	// Create mipmaps if needed
 	if (mip_level_count!=MIP_LEVELS_1)
 	{
-		DX8_ErrorCode(D3DXFilterTexture(texture, nullptr, 0, D3DX_FILTER_BOX));
+		DX8_ErrorCode(Generate_DX8_Texture_Mip_Levels(texture));
 	}
 
 	return texture;
@@ -2655,7 +3514,7 @@ IDirect3DCubeTexture8* DX8Wrapper::_Create_DX8_Cube_Texture
 	// which case we return null.
 	if (rendertarget)
 	{
-		unsigned ret=D3DXCreateCubeTexture
+		unsigned ret=LegacyTextureCreation_Create_Cube
 		(
 			DX8Wrapper::_Get_D3D_Device8(),
 			width,
@@ -2682,7 +3541,7 @@ IDirect3DCubeTexture8* DX8Wrapper::_Create_DX8_Cube_Texture
 			// Invalidate the mesh cache
 			WW3D::_Invalidate_Mesh_Cache();
 
-			ret=D3DXCreateCubeTexture
+			ret=LegacyTextureCreation_Create_Cube
 			(
 				DX8Wrapper::_Get_D3D_Device8(),
 				width,
@@ -2717,7 +3576,7 @@ IDirect3DCubeTexture8* DX8Wrapper::_Create_DX8_Cube_Texture
 	// We should never run out of video memory when allocating a non-rendertarget texture.
 	// However, it seems to happen sometimes when there are a lot of textures in memory and so
 	// if it happens we'll release assets and try again (anything is better than crashing).
-	unsigned ret=D3DXCreateCubeTexture
+	unsigned ret=LegacyTextureCreation_Create_Cube
 	(
 		DX8Wrapper::_Get_D3D_Device8(),
 		width,
@@ -2738,7 +3597,7 @@ IDirect3DCubeTexture8* DX8Wrapper::_Create_DX8_Cube_Texture
 		// Invalidate the mesh cache
 		WW3D::_Invalidate_Mesh_Cache();
 
-		ret=D3DXCreateCubeTexture
+		ret=LegacyTextureCreation_Create_Cube
 		(
 			DX8Wrapper::_Get_D3D_Device8(),
 			width,
@@ -2792,7 +3651,7 @@ IDirect3DVolumeTexture8* DX8Wrapper::_Create_DX8_Volume_Texture
 	// We should never run out of video memory when allocating a non-rendertarget texture.
 	// However, it seems to happen sometimes when there are a lot of textures in memory and so
 	// if it happens we'll release assets and try again (anything is better than crashing).
-	unsigned ret=D3DXCreateVolumeTexture
+	unsigned ret=LegacyTextureCreation_Create_Volume
 	(
 		DX8Wrapper::_Get_D3D_Device8(),
 		width,
@@ -2815,7 +3674,7 @@ IDirect3DVolumeTexture8* DX8Wrapper::_Create_DX8_Volume_Texture
 		// Invalidate the mesh cache
 		WW3D::_Invalidate_Mesh_Cache();
 
-		ret=D3DXCreateVolumeTexture
+		ret=LegacyTextureCreation_Create_Volume
 		(
 			DX8Wrapper::_Get_D3D_Device8(),
 			width,
@@ -2865,14 +3724,10 @@ IDirect3DSurface8 * DX8Wrapper::_Create_DX8_Surface(const char *filename_)
 	DX8_THREAD_ASSERT();
 	DX8_Assert();
 
-	// Note: Since there is no "D3DXCreateSurfaceFromFile" and no "GetSurfaceInfoFromFile" (the
-	// latter is supposed to be added to D3DX in a future version), we create a texture from the
-	// file (w/o mipmaps), check that its surface is equal to the original file data (which it
-	// will not be if the file is not in a texture-supported format or size). If so, copy its
-	// surface (we might be able to just get its surface and add a ref to it but I'm not sure so
-	// I'm not going to risk it) and release the texture. If not, create a surface according to
-	// the file data and use D3DXLoadSurfaceFromFile. This is a horrible hack, but it saves us
-	// having to write file loaders. Will fix this when D3DX provides us with the right functions.
+	// The file-to-surface path is intentionally kept behind TextureLoader's
+	// centralized legacy decoder.  It preserves the original-file dimensions
+	// and format conversion behavior without leaking that dependency into
+	// renderer call sites.
 	// Create a surface the size of the file image data
 	IDirect3DSurface8 *surface = nullptr;
 
@@ -2931,7 +3786,19 @@ void DX8Wrapper::_Update_Texture(TextureClass *system, TextureClass *video)
 	WWASSERT(video);
 	WWASSERT(system->Get_Pool()==TextureClass::POOL_SYSTEMMEM);
 	WWASSERT(video->Get_Pool()==TextureClass::POOL_DEFAULT);
-	DX8CALL(UpdateTexture(system->Peek_D3D_Base_Texture(),video->Peek_D3D_Base_Texture()));
+	_Update_Texture(system->Peek_D3D_Base_Texture(), video->Peek_D3D_Base_Texture());
+}
+
+void DX8Wrapper::_Update_Texture(
+	IDirect3DBaseTexture8 *system,
+	IDirect3DBaseTexture8 *video)
+{
+	if (system == nullptr || video == nullptr)
+	{
+		return;
+	}
+	DX8_THREAD_ASSERT();
+	DX8CALL(UpdateTexture(system, video));
 }
 
 void DX8Wrapper::Compute_Caps(WW3DFormat display_format)
@@ -2942,16 +3809,635 @@ void DX8Wrapper::Compute_Caps(WW3DFormat display_format)
 	CurrentCaps=new DX8Caps(_Get_D3D8(),D3DDevice,display_format,Get_Current_Adapter_Identifier());
 }
 
+namespace
+{
+bool Convert_Render_Compare(unsigned int value,
+	rts::render::RenderCompareFunction *function)
+{
+	if (function == nullptr) return false;
+	switch (value) {
+	case D3DCMP_NEVER: *function = rts::render::RENDER_COMPARE_NEVER; break;
+	case D3DCMP_LESS: *function = rts::render::RENDER_COMPARE_LESS; break;
+	case D3DCMP_EQUAL: *function = rts::render::RENDER_COMPARE_EQUAL; break;
+	case D3DCMP_LESSEQUAL: *function = rts::render::RENDER_COMPARE_LESS_EQUAL; break;
+	case D3DCMP_GREATER: *function = rts::render::RENDER_COMPARE_GREATER; break;
+	case D3DCMP_NOTEQUAL: *function = rts::render::RENDER_COMPARE_NOT_EQUAL; break;
+	case D3DCMP_GREATEREQUAL: *function = rts::render::RENDER_COMPARE_GREATER_EQUAL; break;
+	case D3DCMP_ALWAYS: *function = rts::render::RENDER_COMPARE_ALWAYS; break;
+	default: return false;
+	}
+	return true;
+}
+
+bool Convert_Render_Blend(unsigned int value,
+	rts::render::RenderBlendFactor *factor)
+{
+	if (factor == nullptr) return false;
+	switch (value) {
+	case D3DBLEND_ZERO: *factor = rts::render::RENDER_BLEND_ZERO; break;
+	case D3DBLEND_ONE: *factor = rts::render::RENDER_BLEND_ONE; break;
+	case D3DBLEND_SRCCOLOR: *factor = rts::render::RENDER_BLEND_SOURCE_COLOR; break;
+	case D3DBLEND_INVSRCCOLOR: *factor = rts::render::RENDER_BLEND_INVERSE_SOURCE_COLOR; break;
+	case D3DBLEND_SRCALPHA: *factor = rts::render::RENDER_BLEND_SOURCE_ALPHA; break;
+	case D3DBLEND_INVSRCALPHA: *factor = rts::render::RENDER_BLEND_INVERSE_SOURCE_ALPHA; break;
+	case D3DBLEND_DESTALPHA: *factor = rts::render::RENDER_BLEND_DESTINATION_ALPHA; break;
+	case D3DBLEND_INVDESTALPHA: *factor = rts::render::RENDER_BLEND_INVERSE_DESTINATION_ALPHA; break;
+	case D3DBLEND_DESTCOLOR: *factor = rts::render::RENDER_BLEND_DESTINATION_COLOR; break;
+	case D3DBLEND_INVDESTCOLOR: *factor = rts::render::RENDER_BLEND_INVERSE_DESTINATION_COLOR; break;
+	default: return false;
+	}
+	return true;
+}
+
+bool Convert_Render_Blend_Operation(unsigned int value,
+	rts::render::RenderBlendOperation *operation)
+{
+	if (operation == nullptr) return false;
+	switch (value) {
+	case D3DBLENDOP_ADD: *operation = rts::render::RENDER_BLEND_ADD; break;
+	case D3DBLENDOP_SUBTRACT: *operation = rts::render::RENDER_BLEND_SUBTRACT; break;
+	case D3DBLENDOP_REVSUBTRACT: *operation = rts::render::RENDER_BLEND_REVERSE_SUBTRACT; break;
+	case D3DBLENDOP_MIN: *operation = rts::render::RENDER_BLEND_MINIMUM; break;
+	case D3DBLENDOP_MAX: *operation = rts::render::RENDER_BLEND_MAXIMUM; break;
+	default: return false;
+	}
+	return true;
+}
+
+bool Convert_Render_Stencil_Operation(unsigned int value,
+	rts::render::RenderStencilOperation *operation)
+{
+	if (operation == nullptr) return false;
+	switch (value) {
+	case D3DSTENCILOP_KEEP: *operation = rts::render::RENDER_STENCIL_KEEP; break;
+	case D3DSTENCILOP_ZERO: *operation = rts::render::RENDER_STENCIL_ZERO; break;
+	case D3DSTENCILOP_REPLACE: *operation = rts::render::RENDER_STENCIL_REPLACE; break;
+	case D3DSTENCILOP_INCRSAT: *operation = rts::render::RENDER_STENCIL_INCREMENT_SATURATE; break;
+	case D3DSTENCILOP_DECRSAT: *operation = rts::render::RENDER_STENCIL_DECREMENT_SATURATE; break;
+	case D3DSTENCILOP_INVERT: *operation = rts::render::RENDER_STENCIL_INVERT; break;
+	case D3DSTENCILOP_INCR: *operation = rts::render::RENDER_STENCIL_INCREMENT; break;
+	case D3DSTENCILOP_DECR: *operation = rts::render::RENDER_STENCIL_DECREMENT; break;
+	default: return false;
+	}
+	return true;
+}
+
+bool Convert_Render_Material_Source(unsigned int value,
+	rts::render::RenderMaterialSource *source)
+{
+	if (source == nullptr) return false;
+	switch (value) {
+	case D3DMCS_MATERIAL:
+		*source = rts::render::RENDER_MATERIAL_SOURCE_MATERIAL;
+		break;
+	case D3DMCS_COLOR1:
+		*source = rts::render::RENDER_MATERIAL_SOURCE_COLOR1;
+		break;
+	case D3DMCS_COLOR2:
+		*source = rts::render::RENDER_MATERIAL_SOURCE_COLOR2;
+		break;
+	default:
+		return false;
+	}
+	return true;
+}
+
+bool Convert_Texture_Operation(unsigned int value,
+	rts::render::RenderTextureOperation *operation)
+{
+	if (operation == nullptr) return false;
+	switch (value) {
+	case D3DTOP_DISABLE: *operation = rts::render::RENDER_TEXTURE_OP_DISABLE; break;
+	case D3DTOP_SELECTARG1: *operation = rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_1; break;
+	case D3DTOP_SELECTARG2: *operation = rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_2; break;
+	case D3DTOP_MODULATE: *operation = rts::render::RENDER_TEXTURE_OP_MODULATE; break;
+	case D3DTOP_MODULATE2X: *operation = rts::render::RENDER_TEXTURE_OP_MODULATE_2X; break;
+	case D3DTOP_MODULATE4X: *operation = rts::render::RENDER_TEXTURE_OP_MODULATE_4X; break;
+	case D3DTOP_ADD: *operation = rts::render::RENDER_TEXTURE_OP_ADD; break;
+	case D3DTOP_ADDSIGNED: *operation = rts::render::RENDER_TEXTURE_OP_ADD_SIGNED; break;
+	case D3DTOP_ADDSIGNED2X: *operation = rts::render::RENDER_TEXTURE_OP_ADD_SIGNED_2X; break;
+	case D3DTOP_SUBTRACT: *operation = rts::render::RENDER_TEXTURE_OP_SUBTRACT; break;
+	case D3DTOP_ADDSMOOTH: *operation = rts::render::RENDER_TEXTURE_OP_ADD_SMOOTH; break;
+	case D3DTOP_BLENDDIFFUSEALPHA: *operation = rts::render::RENDER_TEXTURE_OP_BLEND_DIFFUSE_ALPHA; break;
+	case D3DTOP_BLENDTEXTUREALPHA: *operation = rts::render::RENDER_TEXTURE_OP_BLEND_TEXTURE_ALPHA; break;
+	case D3DTOP_BLENDFACTORALPHA: *operation = rts::render::RENDER_TEXTURE_OP_BLEND_TEXTURE_FACTOR_ALPHA; break;
+	case D3DTOP_BLENDTEXTUREALPHAPM: *operation = rts::render::RENDER_TEXTURE_OP_BLEND_TEXTURE_ALPHA_PREMULTIPLIED; break;
+	case D3DTOP_BLENDCURRENTALPHA: *operation = rts::render::RENDER_TEXTURE_OP_BLEND_CURRENT_ALPHA; break;
+	case D3DTOP_PREMODULATE: *operation = rts::render::RENDER_TEXTURE_OP_PREMODULATE; break;
+	case D3DTOP_MODULATEALPHA_ADDCOLOR: *operation = rts::render::RENDER_TEXTURE_OP_MODULATE_ALPHA_ADD_COLOR; break;
+	case D3DTOP_MODULATECOLOR_ADDALPHA: *operation = rts::render::RENDER_TEXTURE_OP_MODULATE_COLOR_ADD_ALPHA; break;
+	case D3DTOP_MODULATEINVALPHA_ADDCOLOR: *operation = rts::render::RENDER_TEXTURE_OP_MODULATE_INVERSE_ALPHA_ADD_COLOR; break;
+	case D3DTOP_MODULATEINVCOLOR_ADDALPHA: *operation = rts::render::RENDER_TEXTURE_OP_MODULATE_INVERSE_COLOR_ADD_ALPHA; break;
+	case D3DTOP_BUMPENVMAP: *operation = rts::render::RENDER_TEXTURE_OP_BUMP_ENVIRONMENT; break;
+	case D3DTOP_BUMPENVMAPLUMINANCE: *operation = rts::render::RENDER_TEXTURE_OP_BUMP_ENVIRONMENT_LUMINANCE; break;
+	case D3DTOP_DOTPRODUCT3: *operation = rts::render::RENDER_TEXTURE_OP_DOT_PRODUCT_3; break;
+	case D3DTOP_MULTIPLYADD: *operation = rts::render::RENDER_TEXTURE_OP_MULTIPLY_ADD; break;
+	case D3DTOP_LERP: *operation = rts::render::RENDER_TEXTURE_OP_LINEAR_INTERPOLATE; break;
+	default: return false;
+	}
+	return true;
+}
+
+bool Convert_Texture_Argument(unsigned int value,
+	rts::render::RenderTextureArgument *argument, bool *complement,
+	bool *alphaReplicate)
+{
+	if (argument == nullptr || complement == nullptr || alphaReplicate == nullptr) return false;
+	if ((value & ~(D3DTA_SELECTMASK | D3DTA_COMPLEMENT |
+		D3DTA_ALPHAREPLICATE)) != 0)
+	{
+		return false;
+	}
+	switch (value & D3DTA_SELECTMASK) {
+	case D3DTA_CURRENT: *argument = rts::render::RENDER_TEXTURE_ARG_CURRENT; break;
+	case D3DTA_DIFFUSE: *argument = rts::render::RENDER_TEXTURE_ARG_DIFFUSE; break;
+	case D3DTA_TEXTURE: *argument = rts::render::RENDER_TEXTURE_ARG_TEXTURE; break;
+	case D3DTA_TFACTOR: *argument = rts::render::RENDER_TEXTURE_ARG_TEXTURE_FACTOR; break;
+	case D3DTA_SPECULAR: *argument = rts::render::RENDER_TEXTURE_ARG_SPECULAR; break;
+	case D3DTA_TEMP: *argument = rts::render::RENDER_TEXTURE_ARG_TEMP; break;
+	default: return false;
+	}
+	*complement = (value & D3DTA_COMPLEMENT) != 0;
+	*alphaReplicate = (value & D3DTA_ALPHAREPLICATE) != 0;
+	return true;
+}
+
+bool Convert_Texture_Address(unsigned int value,
+	rts::render::RenderTextureAddressMode *address)
+{
+	if (address == nullptr) return false;
+	switch (value) {
+	case D3DTADDRESS_WRAP: *address = rts::render::RENDER_TEXTURE_ADDRESS_WRAP; break;
+	case D3DTADDRESS_MIRROR: *address = rts::render::RENDER_TEXTURE_ADDRESS_MIRROR; break;
+	case D3DTADDRESS_CLAMP: *address = rts::render::RENDER_TEXTURE_ADDRESS_CLAMP; break;
+	case D3DTADDRESS_BORDER: *address = rts::render::RENDER_TEXTURE_ADDRESS_BORDER; break;
+	default: return false;
+	}
+	return true;
+}
+
+bool Convert_Texture_Filter(unsigned int value,
+	rts::render::RenderTextureFilter *filter)
+{
+	if (filter == nullptr) return false;
+	switch (value) {
+	case D3DTEXF_NONE: *filter = rts::render::RENDER_TEXTURE_FILTER_NONE; break;
+	case D3DTEXF_POINT: *filter = rts::render::RENDER_TEXTURE_FILTER_POINT; break;
+	case D3DTEXF_LINEAR: *filter = rts::render::RENDER_TEXTURE_FILTER_LINEAR; break;
+	case D3DTEXF_ANISOTROPIC: *filter = rts::render::RENDER_TEXTURE_FILTER_ANISOTROPIC; break;
+	default: return false;
+	}
+	return true;
+}
+
+float Texture_State_Float(unsigned int value)
+{
+	float result = 0.0f;
+	memcpy(&result, &value, sizeof(result));
+	return result;
+}
+
+unsigned int Legacy_Material_Source_To_DX8(
+	rts::render::RenderMaterialSource source)
+{
+	switch (source)
+	{
+	case rts::render::RENDER_MATERIAL_SOURCE_COLOR1:
+		return D3DMCS_COLOR1;
+	case rts::render::RENDER_MATERIAL_SOURCE_COLOR2:
+		return D3DMCS_COLOR2;
+	case rts::render::RENDER_MATERIAL_SOURCE_MATERIAL:
+	default:
+		return D3DMCS_MATERIAL;
+	}
+}
+}
+
+void DX8Wrapper::Set_Legacy_Vertex_Material(
+	const rts::render::LegacyVertexMaterialState& state)
+{
+	D3DMATERIAL8 legacyMaterial;
+	memset(&legacyMaterial, 0, sizeof(legacyMaterial));
+	legacyMaterial.Diffuse.r = state.material.diffuse.x;
+	legacyMaterial.Diffuse.g = state.material.diffuse.y;
+	legacyMaterial.Diffuse.b = state.material.diffuse.z;
+	legacyMaterial.Diffuse.a = state.material.diffuse.w;
+	legacyMaterial.Ambient.r = state.material.ambient.x;
+	legacyMaterial.Ambient.g = state.material.ambient.y;
+	legacyMaterial.Ambient.b = state.material.ambient.z;
+	legacyMaterial.Ambient.a = state.material.ambient.w;
+	legacyMaterial.Specular.r = state.material.specular.x;
+	legacyMaterial.Specular.g = state.material.specular.y;
+	legacyMaterial.Specular.b = state.material.specular.z;
+	legacyMaterial.Specular.a = state.material.specular.w;
+	legacyMaterial.Emissive.r = state.material.emissive.x;
+	legacyMaterial.Emissive.g = state.material.emissive.y;
+	legacyMaterial.Emissive.b = state.material.emissive.z;
+	legacyMaterial.Emissive.a = state.material.emissive.w;
+	legacyMaterial.Power = state.material.specularPower;
+
+	// Publish the neutral value before issuing the legacy compatibility call;
+	// this keeps the D3D11 bridge authoritative even when the D3D8 device is
+	// only present as a differential oracle.
+	rts::render::TrackLegacyMaterial(state.material);
+	Set_DX8_Material(&legacyMaterial);
+	Set_DX8_Render_State(D3DRS_LIGHTING,
+		state.lightingEnable ? TRUE : FALSE);
+	Set_DX8_Render_State(D3DRS_AMBIENTMATERIALSOURCE,
+		Legacy_Material_Source_To_DX8(state.ambientMaterialSource));
+	Set_DX8_Render_State(D3DRS_DIFFUSEMATERIALSOURCE,
+		Legacy_Material_Source_To_DX8(state.diffuseMaterialSource));
+	Set_DX8_Render_State(D3DRS_EMISSIVEMATERIALSOURCE,
+		Legacy_Material_Source_To_DX8(state.emissiveMaterialSource));
+
+	for (unsigned int stage = 0;
+		stage < rts::render::LEGACY_TEXTURE_STAGE_COUNT; ++stage)
+	{
+		if ((state.textureStageResetMask & (1U << stage)) == 0)
+		{
+			continue;
+		}
+		Set_DX8_Texture_Stage_State(stage, D3DTSS_TEXCOORDINDEX,
+			D3DTSS_TCI_PASSTHRU | (state.textureCoordinateIndex[stage] & 7U));
+		Set_DX8_Texture_Stage_State(stage,
+			D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+	}
+}
+
+void DX8Wrapper::Set_Legacy_Vertex_Material_Null()
+{
+	rts::render::LegacyVertexMaterialState state;
+	state.material.diffuse = rts::render::RenderFloat4(1.0f, 1.0f, 1.0f, 1.0f);
+	state.material.ambient = rts::render::RenderFloat4(1.0f, 1.0f, 1.0f, 1.0f);
+	state.material.specular = rts::render::RenderFloat4(0.0f, 0.0f, 0.0f, 0.0f);
+	state.material.emissive = rts::render::RenderFloat4(0.0f, 0.0f, 0.0f, 0.0f);
+	state.material.specularPower = 1.0f;
+	state.lightingEnable = false;
+	state.textureStageResetMask =
+		(1U << rts::render::LEGACY_TEXTURE_STAGE_COUNT) - 1U;
+	Set_Legacy_Vertex_Material(state);
+}
+
+bool DX8Wrapper::Publish_Render_State(D3DRENDERSTATETYPE state,
+	unsigned value)
+{
+	rts::render::LegacyPipelineState neutral;
+	if (!rts::render::GetTrackedLegacyPipelineState(&neutral)) return false;
+	bool changed = true;
+	switch (state) {
+	case D3DRS_ALPHABLENDENABLE:
+		neutral.blend.blendEnable = value != FALSE;
+		break;
+	case D3DRS_SRCBLEND:
+		changed = Convert_Render_Blend(value, &neutral.blend.sourceColor);
+		if (changed) neutral.blend.sourceAlpha = neutral.blend.sourceColor;
+		break;
+	case D3DRS_DESTBLEND:
+		changed = Convert_Render_Blend(value, &neutral.blend.destinationColor);
+		if (changed) neutral.blend.destinationAlpha = neutral.blend.destinationColor;
+		break;
+	case D3DRS_BLENDOP:
+		changed = Convert_Render_Blend_Operation(value,
+			&neutral.blend.colorOperation);
+		if (changed) neutral.blend.alphaOperation = neutral.blend.colorOperation;
+		break;
+	case D3DRS_COLORWRITEENABLE:
+		neutral.blend.colorWriteMask = value & 0x0fU;
+		break;
+	case D3DRS_ZENABLE:
+		neutral.depthStencil.depthEnable = value != D3DZB_FALSE;
+		break;
+	case D3DRS_ZWRITEENABLE:
+		neutral.depthStencil.depthWrite = value != FALSE;
+		break;
+	case D3DRS_ZFUNC:
+		changed = Convert_Render_Compare(value,
+			&neutral.depthStencil.depthFunction);
+		break;
+	case D3DRS_STENCILENABLE:
+		neutral.depthStencil.stencilEnable = value != FALSE;
+		break;
+	case D3DRS_STENCILMASK:
+		neutral.depthStencil.stencilReadMask = value;
+		break;
+	case D3DRS_STENCILWRITEMASK:
+		neutral.depthStencil.stencilWriteMask = value;
+		break;
+	case D3DRS_STENCILREF:
+		neutral.depthStencil.stencilReference = value;
+		break;
+	case D3DRS_STENCILFUNC:
+		changed = Convert_Render_Compare(value,
+			&neutral.depthStencil.stencilFunction);
+		break;
+	case D3DRS_STENCILFAIL:
+		changed = Convert_Render_Stencil_Operation(value,
+			&neutral.depthStencil.stencilFail);
+		break;
+	case D3DRS_STENCILZFAIL:
+		changed = Convert_Render_Stencil_Operation(value,
+			&neutral.depthStencil.stencilDepthFail);
+		break;
+	case D3DRS_STENCILPASS:
+		changed = Convert_Render_Stencil_Operation(value,
+			&neutral.depthStencil.stencilPass);
+		break;
+	case D3DRS_FILLMODE:
+		if (value == D3DFILL_WIREFRAME) {
+			neutral.rasterizer.fillMode = rts::render::RENDER_FILL_WIREFRAME;
+		} else if (value == D3DFILL_SOLID) {
+			neutral.rasterizer.fillMode = rts::render::RENDER_FILL_SOLID;
+		} else {
+			changed = false;
+		}
+		break;
+	case D3DRS_SHADEMODE:
+		// The neutral shader interpolates vertex color. Gouraud is therefore
+		// represented exactly; flat/provoking-vertex shading remains fail-closed
+		// until a dedicated shader input route exists.
+		changed = rts::render::Is_D3D11_Shade_Mode_Value_Supported(value);
+		break;
+	case D3DRS_CULLMODE:
+		if (value == D3DCULL_NONE) {
+			neutral.rasterizer.cullMode = rts::render::RENDER_CULL_NONE;
+		} else if (value == D3DCULL_CW || value == D3DCULL_CCW) {
+			neutral.rasterizer.cullMode = rts::render::RENDER_CULL_BACK;
+			neutral.rasterizer.frontCounterClockwise = value == D3DCULL_CW;
+		} else {
+			changed = false;
+		}
+		break;
+	case D3DRS_ZBIAS:
+		neutral.rasterizer.depthBias = static_cast<int>(value);
+		break;
+	case D3DRS_ALPHATESTENABLE:
+		neutral.alphaTestEnable = value != FALSE;
+		break;
+	case D3DRS_ALPHAFUNC:
+		changed = Convert_Render_Compare(value, &neutral.alphaFunction);
+		break;
+	case D3DRS_ALPHAREF:
+		neutral.alphaReference = value & 0xffU;
+		break;
+	case D3DRS_TEXTUREFACTOR:
+		neutral.textureFactor = value;
+		break;
+	case D3DRS_LIGHTING:
+		neutral.lightingEnable = value != FALSE;
+		break;
+	case D3DRS_AMBIENTMATERIALSOURCE:
+		changed = Convert_Render_Material_Source(value,
+			&neutral.ambientMaterialSource);
+		break;
+	case D3DRS_DIFFUSEMATERIALSOURCE:
+		changed = Convert_Render_Material_Source(value,
+			&neutral.diffuseMaterialSource);
+		break;
+	case D3DRS_EMISSIVEMATERIALSOURCE:
+		changed = Convert_Render_Material_Source(value,
+			&neutral.emissiveMaterialSource);
+		break;
+	case D3DRS_SPECULARMATERIALSOURCE:
+		changed = Convert_Render_Material_Source(value,
+			&neutral.specularMaterialSource);
+		break;
+	case D3DRS_AMBIENT:
+		rts::render::TrackLegacyGlobalAmbient(
+			rts::render::DecodeLegacyD3D8Ambient(value));
+		break;
+	case D3DRS_RANGEFOGENABLE:
+		neutral.rangeFogEnable = value != FALSE;
+		break;
+	case D3DRS_NORMALIZENORMALS:
+		neutral.normalizeNormals = value != FALSE;
+		break;
+	case D3DRS_LOCALVIEWER:
+		// The neutral lighting shader implements the D3D8 default (viewer at
+		// infinity). A TRUE local-viewer request changes specular direction and
+		// cannot be accepted without a matching shader route.
+		changed = rts::render::Is_D3D11_Local_Viewer_Value_Supported(value);
+		break;
+	case D3DRS_CLIPPLANEENABLE:
+		changed = rts::render::Is_D3D11_Clip_Plane_Mask_Supported(value);
+		if (changed)
+		{
+			neutral.clipPlaneEnableMask = value;
+		}
+		break;
+	case D3DRS_PATCHSEGMENTS:
+		changed = rts::render::Is_D3D11_Patch_Segments_Value_Supported(value);
+		break;
+	case D3DRS_COLORVERTEX:
+	case D3DRS_DITHERENABLE:
+	case D3DRS_CLIPPING:
+	case D3DRS_SOFTWAREVERTEXPROCESSING:
+		changed = rts::render::Is_D3D11_Default_Render_State_Value_Supported(
+			static_cast<unsigned int>(state), value);
+		break;
+	default:
+		changed = false;
+		break;
+	}
+	if (changed) rts::render::TrackLegacyPipelineState(neutral);
+	return changed;
+}
+
+bool DX8Wrapper::Publish_Texture_Stage_State(unsigned stage,
+	D3DTEXTURESTAGESTATETYPE state, unsigned value)
+{
+	rts::render::LegacyTextureStageState neutral;
+	if (!rts::render::GetTrackedLegacyTextureStage(stage, &neutral)) return false;
+	bool changed = true;
+	switch (state) {
+	case D3DTSS_COLOROP: changed = Convert_Texture_Operation(value,
+		&neutral.colorOperation); break;
+	case D3DTSS_COLORARG0: changed = Convert_Texture_Argument(value,
+		&neutral.colorArgument0, &neutral.colorArgument0Complement,
+		&neutral.colorArgument0AlphaReplicate); break;
+	case D3DTSS_COLORARG1: changed = Convert_Texture_Argument(value,
+		&neutral.colorArgument1, &neutral.colorArgument1Complement,
+		&neutral.colorArgument1AlphaReplicate); break;
+	case D3DTSS_COLORARG2: changed = Convert_Texture_Argument(value,
+		&neutral.colorArgument2, &neutral.colorArgument2Complement,
+		&neutral.colorArgument2AlphaReplicate); break;
+	case D3DTSS_ALPHAOP: changed = Convert_Texture_Operation(value,
+		&neutral.alphaOperation); break;
+	case D3DTSS_ALPHAARG0: changed = Convert_Texture_Argument(value,
+		&neutral.alphaArgument0, &neutral.alphaArgument0Complement,
+		&neutral.alphaArgument0AlphaReplicate); break;
+	case D3DTSS_ALPHAARG1: changed = Convert_Texture_Argument(value,
+		&neutral.alphaArgument1, &neutral.alphaArgument1Complement,
+		&neutral.alphaArgument1AlphaReplicate); break;
+	case D3DTSS_ALPHAARG2: changed = Convert_Texture_Argument(value,
+		&neutral.alphaArgument2, &neutral.alphaArgument2Complement,
+		&neutral.alphaArgument2AlphaReplicate); break;
+	case D3DTSS_RESULTARG: {
+		// D3D8 permits only CURRENT or TEMP as the result destination.  The
+		// argument modifier bits are meaningful for color/alpha operands but
+		// have no neutral representation for RESULTARG, so reject them rather
+		// than silently publishing a different destination.
+		if (value == D3DTA_CURRENT)
+		{
+			neutral.resultArgument = rts::render::RENDER_TEXTURE_ARG_CURRENT;
+		}
+		else if (value == D3DTA_TEMP)
+		{
+			neutral.resultArgument = rts::render::RENDER_TEXTURE_ARG_TEMP;
+		}
+		else
+		{
+			changed = false;
+		}
+		break;
+	}
+	case D3DTSS_TEXCOORDINDEX:
+	{
+		const unsigned int generation = value & 0xfffffff8U;
+		if (generation != D3DTSS_TCI_PASSTHRU &&
+			generation != D3DTSS_TCI_CAMERASPACENORMAL &&
+			generation != D3DTSS_TCI_CAMERASPACEPOSITION &&
+			generation != D3DTSS_TCI_CAMERASPACEREFLECTIONVECTOR)
+		{
+			changed = false;
+		}
+		else
+		{
+			neutral.textureCoordinateIndex = value & 7U;
+			neutral.cameraSpacePosition = generation ==
+				D3DTSS_TCI_CAMERASPACEPOSITION;
+			neutral.cameraSpaceNormal = generation ==
+				D3DTSS_TCI_CAMERASPACENORMAL;
+			neutral.cameraSpaceReflectionVector = generation ==
+				D3DTSS_TCI_CAMERASPACEREFLECTIONVECTOR;
+		}
+	}
+	break;
+	case D3DTSS_TEXTURETRANSFORMFLAGS:
+		// COUNT1..COUNT4 are distinct values in the low byte, not individual
+		// bits.  Validate the complete low-byte count and reject any other
+		// flag bits before changing the neutral copy.
+		if ((value & ~(0xffU | D3DTTFF_PROJECTED)) != 0 ||
+			!rts::render::IsLegacyProjectedTextureTransformValid(
+				value & 0xffU, (value & D3DTTFF_PROJECTED) != 0))
+		{
+			changed = false;
+		}
+		else
+		{
+			neutral.textureTransformEnable = value != D3DTTFF_DISABLE;
+			neutral.projectedCoordinates = (value & D3DTTFF_PROJECTED) != 0;
+			neutral.textureTransformCount = value & 0xffU;
+		}
+		break;
+	case D3DTSS_ADDRESSU: changed = Convert_Texture_Address(value,
+		&neutral.sampler.addressU); break;
+	case D3DTSS_ADDRESSV: changed = Convert_Texture_Address(value,
+		&neutral.sampler.addressV); break;
+	case D3DTSS_ADDRESSW: changed = Convert_Texture_Address(value,
+		&neutral.sampler.addressW); break;
+	case D3DTSS_MINFILTER: changed = Convert_Texture_Filter(value,
+		&neutral.sampler.minification); break;
+	case D3DTSS_MAGFILTER: changed = Convert_Texture_Filter(value,
+		&neutral.sampler.magnification); break;
+	case D3DTSS_MIPFILTER: changed = Convert_Texture_Filter(value,
+		&neutral.sampler.mipmapping); break;
+	case D3DTSS_MAXANISOTROPY: neutral.sampler.maximumAnisotropy = value; break;
+	case D3DTSS_MAXMIPLEVEL: neutral.sampler.maximumMipLevel = value; break;
+	case D3DTSS_MIPMAPLODBIAS: neutral.sampler.mipLodBias = Texture_State_Float(value); break;
+	case D3DTSS_BORDERCOLOR:
+		neutral.sampler.borderColor = rts::render::RenderFloat4(
+			static_cast<float>((value >> 16) & 0xffU) / 255.0f,
+			static_cast<float>((value >> 8) & 0xffU) / 255.0f,
+			static_cast<float>(value & 0xffU) / 255.0f,
+			static_cast<float>((value >> 24) & 0xffU) / 255.0f); break;
+	case D3DTSS_BUMPENVMAT00: neutral.bumpEnvironmentMatrix00 = Texture_State_Float(value); break;
+	case D3DTSS_BUMPENVMAT01: neutral.bumpEnvironmentMatrix01 = Texture_State_Float(value); break;
+	case D3DTSS_BUMPENVMAT10: neutral.bumpEnvironmentMatrix10 = Texture_State_Float(value); break;
+	case D3DTSS_BUMPENVMAT11: neutral.bumpEnvironmentMatrix11 = Texture_State_Float(value); break;
+	case D3DTSS_BUMPENVLSCALE: neutral.bumpEnvironmentLuminanceScale = Texture_State_Float(value); break;
+	case D3DTSS_BUMPENVLOFFSET: neutral.bumpEnvironmentLuminanceOffset = Texture_State_Float(value); break;
+	default: return false;
+	}
+	if (!changed)
+	{
+		return false;
+	}
+	return rts::render::TrackLegacyTextureStage(stage, neutral);
+}
+
+
+void DX8Wrapper::Set_DX8_Light(int index, D3DLIGHT8* light)
+{
+	rts::render::LegacyLightState neutralLight;
+	if (light) {
+		DX8_RECORD_LIGHT_CHANGE();
+		DX8CALL(SetLight(index,light));
+		DX8CALL(LightEnable(index,TRUE));
+		CurrentDX8LightEnables[index]=true;
+		SNAPSHOT_SAY(("DX8 - SetLight %d",index));
+		neutralLight.enabled = true;
+		neutralLight.type = light->Type == D3DLIGHT_POINT ?
+			rts::render::RENDER_LIGHT_POINT : (light->Type == D3DLIGHT_SPOT ?
+			rts::render::RENDER_LIGHT_SPOT : rts::render::RENDER_LIGHT_DIRECTIONAL);
+		neutralLight.diffuse = rts::render::RenderFloat4(light->Diffuse.r,
+			light->Diffuse.g, light->Diffuse.b, light->Diffuse.a);
+		neutralLight.specular = rts::render::RenderFloat4(light->Specular.r,
+			light->Specular.g, light->Specular.b, light->Specular.a);
+		neutralLight.ambient = rts::render::RenderFloat4(light->Ambient.r,
+			light->Ambient.g, light->Ambient.b, light->Ambient.a);
+		neutralLight.position = rts::render::RenderFloat4(light->Position.x,
+			light->Position.y, light->Position.z, 1.0f);
+		neutralLight.direction = rts::render::RenderFloat4(light->Direction.x,
+			light->Direction.y, light->Direction.z, 0.0f);
+		neutralLight.range = light->Range;
+		neutralLight.falloff = light->Falloff;
+		neutralLight.attenuation0 = light->Attenuation0;
+		neutralLight.attenuation1 = light->Attenuation1;
+		neutralLight.attenuation2 = light->Attenuation2;
+		neutralLight.theta = light->Theta;
+		neutralLight.phi = light->Phi;
+	}
+	else if (CurrentDX8LightEnables[index]) {
+		DX8_RECORD_LIGHT_CHANGE();
+		CurrentDX8LightEnables[index]=false;
+		DX8CALL(LightEnable(index,FALSE));
+		SNAPSHOT_SAY(("DX8 - DisableLight %d",index));
+	}
+	rts::render::TrackLegacyLight(index, neutralLight);
+}
 
 void DX8Wrapper::Set_Light(unsigned index, const D3DLIGHT8* light)
 {
+	rts::render::LegacyLightState neutralLight;
 	if (light) {
 		render_state.Lights[index]=*light;
 		render_state.LightEnable[index]=true;
+		neutralLight.enabled = true;
+		neutralLight.type = light->Type == D3DLIGHT_POINT ?
+			rts::render::RENDER_LIGHT_POINT : (light->Type == D3DLIGHT_SPOT ?
+			rts::render::RENDER_LIGHT_SPOT : rts::render::RENDER_LIGHT_DIRECTIONAL);
+		neutralLight.diffuse = rts::render::RenderFloat4(light->Diffuse.r,
+			light->Diffuse.g, light->Diffuse.b, light->Diffuse.a);
+		neutralLight.specular = rts::render::RenderFloat4(light->Specular.r,
+			light->Specular.g, light->Specular.b, light->Specular.a);
+		neutralLight.ambient = rts::render::RenderFloat4(light->Ambient.r,
+			light->Ambient.g, light->Ambient.b, light->Ambient.a);
+		neutralLight.position = rts::render::RenderFloat4(light->Position.x,
+			light->Position.y, light->Position.z, 1.0f);
+		neutralLight.direction = rts::render::RenderFloat4(light->Direction.x,
+			light->Direction.y, light->Direction.z, 0.0f);
+		neutralLight.range = light->Range;
+		neutralLight.falloff = light->Falloff;
+		neutralLight.attenuation0 = light->Attenuation0;
+		neutralLight.attenuation1 = light->Attenuation1;
+		neutralLight.attenuation2 = light->Attenuation2;
+		neutralLight.theta = light->Theta;
+		neutralLight.phi = light->Phi;
 	}
 	else {
 		render_state.LightEnable[index]=false;
 	}
+	rts::render::TrackLegacyLight(index, neutralLight);
 	render_state_changed|=(LIGHT0_CHANGED<<index);
 }
 
@@ -3040,7 +4526,9 @@ void DX8Wrapper::Set_Light_Environment(LightEnvironmentClass* light_env)
 	if (light_env)
 	{
 		int light_count = light_env->Get_Light_Count();
-		unsigned int color=Convert_Color(light_env->Get_Equivalent_Ambient(),0.0f);
+		const Vector3 equivalent_ambient =
+			light_env->Get_Equivalent_Ambient();
+		unsigned int color=Convert_Color(equivalent_ambient,0.0f);
 		if (RenderStates[D3DRS_AMBIENT]!=color)
 		{
 			Set_DX8_Render_State(D3DRS_AMBIENT,color);
@@ -3049,6 +4537,9 @@ void DX8Wrapper::Set_Light_Environment(LightEnvironmentClass* light_env)
 			render_state_changed|=MATERIAL_CHANGED;
 #endif
 		}
+		rts::render::TrackLegacyGlobalAmbient(
+			rts::render::RenderFloat4(equivalent_ambient.X,
+			equivalent_ambient.Y, equivalent_ambient.Z, 1.0f));
 
 		D3DLIGHT8 light;
 		int l=0;
@@ -3289,7 +4780,8 @@ void DX8Wrapper::Create_Render_Target
 void DX8Wrapper::Set_Render_Target_With_Z
 (
 	TextureClass* texture,
-	ZTextureClass* ztexture
+	ZTextureClass* ztexture,
+	bool use_default_depth_if_missing
 )
 {
 	WWASSERT(texture!=nullptr);
@@ -3297,21 +4789,28 @@ void DX8Wrapper::Set_Render_Target_With_Z
 	WWASSERT(d3d_surf != nullptr);
 
 	IDirect3DSurface8* d3d_zbuf=nullptr;
+	HRESULT target_result = D3D_OK;
 	if (ztexture!=nullptr)
 	{
 
 		d3d_zbuf=ztexture->Get_D3D_Surface_Level();
 		WWASSERT(d3d_zbuf!=nullptr);
-		Set_Render_Target(d3d_surf,d3d_zbuf);
+		target_result = Set_Render_Target(d3d_surf,d3d_zbuf);
 		d3d_zbuf->Release();
 	}
 	else
 	{
-		Set_Render_Target(d3d_surf,true);
+		target_result = Set_Render_Target(d3d_surf,
+			use_default_depth_if_missing);
 	}
 	d3d_surf->Release();
 
-	IsRenderToTexture = true;
+	// A logical RTT pass is valid only when the bridge accepted the actual
+	// target transition.  In particular, the D3D8 compatibility device may
+	// accept a surface while D3D11 rejects its resource/attachment mapping;
+	// publishing true in that case suppresses the visible back-buffer path and
+	// leaves the frame black.  Failed transitions must therefore fail closed.
+	IsRenderToTexture = SUCCEEDED(target_result);
 }
 
 void
@@ -3342,11 +4841,19 @@ DX8Wrapper::Set_Render_Target(IDirect3DSwapChain8 *swap_chain)
 	IsRenderToTexture = false;
 }
 
-void
+HRESULT
 DX8Wrapper::Set_Render_Target(IDirect3DSurface8 *render_target, bool use_default_depth_buffer)
 {
 	DX8_THREAD_ASSERT();
 	DX8_Assert();
+	const bool restoring_default = render_target == nullptr ||
+		render_target == DefaultRenderTarget;
+	if (_UseD3D11Backend && !_D3D11Bridge.Is_Active() && !restoring_default)
+	{
+		IsRenderToTexture = false;
+		return E_FAIL;
+	}
+	HRESULT target_result = D3D_OK;
 
 	//
 	//	Should we restore the default render target set a new one?
@@ -3364,7 +4871,8 @@ DX8Wrapper::Set_Render_Target(IDirect3DSurface8 *render_target, bool use_default
 		//
 		if (DefaultRenderTarget != nullptr)
 		{
-			DX8CALL(SetRenderTarget (DefaultRenderTarget, DefaultDepthBuffer));
+			DX8CALL_HRES(SetRenderTarget (DefaultRenderTarget, DefaultDepthBuffer),
+				target_result);
 			DefaultRenderTarget->Release ();
 			DefaultRenderTarget = nullptr;
 			if (DefaultDepthBuffer)
@@ -3388,9 +4896,13 @@ DX8Wrapper::Set_Render_Target(IDirect3DSurface8 *render_target, bool use_default
 			CurrentDepthBuffer->Release();
 			CurrentDepthBuffer=nullptr;
 		}
+		CurrentDepthBufferIsDefault = false;
 
 	}
-	else if (render_target != CurrentRenderTarget)
+	else if (!rts::render::Is_Legacy_Render_Target_Binding_Equal(
+		CurrentRenderTarget, CurrentDepthBuffer, CurrentDepthBufferIsDefault,
+		render_target, use_default_depth_buffer ? DefaultDepthBuffer : nullptr,
+		use_default_depth_buffer))
 	{
 		WWASSERT(DefaultRenderTarget==nullptr);
 
@@ -3440,12 +4952,15 @@ DX8Wrapper::Set_Render_Target(IDirect3DSurface8 *render_target, bool use_default
 			//
 			if (use_default_depth_buffer)
 			{
-				DX8CALL(SetRenderTarget (CurrentRenderTarget, DefaultDepthBuffer));
+				DX8CALL_HRES(SetRenderTarget (CurrentRenderTarget, DefaultDepthBuffer),
+					target_result);
 			}
 			else
 			{
-				DX8CALL(SetRenderTarget (CurrentRenderTarget, nullptr));
+				DX8CALL_HRES(SetRenderTarget (CurrentRenderTarget, nullptr),
+					target_result);
 			}
+			CurrentDepthBufferIsDefault = use_default_depth_buffer;
 		}
 	}
 
@@ -3457,7 +4972,37 @@ DX8Wrapper::Set_Render_Target(IDirect3DSurface8 *render_target, bool use_default
 //		depth_buffer = nullptr;
 //	}
 
-	IsRenderToTexture = false;
+	if (_UseD3D11Backend)
+	{
+		const rts::render::RenderResult bridge_result = restoring_default ?
+			_D3D11Bridge.Set_Render_Target_Default() :
+			_D3D11Bridge.Set_Render_Target_Surfaces(CurrentRenderTarget,
+				nullptr, CurrentDepthBufferIsDefault);
+		if (bridge_result != rts::render::RENDER_RESULT_OK)
+		{
+			WWDEBUG_SAY(("D3D11 renderer render-target transition failed: %d",
+				static_cast<int>(bridge_result)));
+			target_result = Render_Result_To_HRESULT(bridge_result);
+		}
+		else
+		{
+			// D3D8 is only the compatibility oracle while this backend is active;
+			// an accepted D3D11 mapping is the result visible to the caller.
+			target_result = D3D_OK;
+		}
+	}
+
+	// The D3D11 result is authoritative while the bridge owns presentation;
+	// the hidden D3D8 target must not make an accepted D3D11 mapping look like
+	// a failed RTT pass.  Failed transitions and default restoration always
+	// clear the state.
+	IsRenderToTexture = SUCCEEDED(target_result) && !restoring_default;
+	return target_result;
+}
+
+HRESULT DX8Wrapper::Restore_Default_Render_Target()
+{
+	return Set_Render_Target((IDirect3DSurface8 *)nullptr);
 }
 
 
@@ -3465,7 +5010,7 @@ DX8Wrapper::Set_Render_Target(IDirect3DSurface8 *render_target, bool use_default
 //! Set render target with depth stencil buffer
 /*! KJM
 */
-void DX8Wrapper::Set_Render_Target
+HRESULT DX8Wrapper::Set_Render_Target
 (
 	IDirect3DSurface8* render_target,
 	IDirect3DSurface8* depth_buffer
@@ -3473,6 +5018,16 @@ void DX8Wrapper::Set_Render_Target
 {
 	DX8_THREAD_ASSERT();
 	DX8_Assert();
+	const bool restoring_default = render_target == nullptr ||
+		render_target == DefaultRenderTarget;
+	if (_UseD3D11Backend && !_D3D11Bridge.Is_Active() && !restoring_default)
+	{
+		IsRenderToTexture = false;
+		return E_FAIL;
+	}
+	bool depth_buffer_is_default = depth_buffer != nullptr &&
+		DefaultDepthBuffer != nullptr && depth_buffer == DefaultDepthBuffer;
+	HRESULT target_result = D3D_OK;
 
 	//
 	//	Should we restore the default render target set a new one?
@@ -3490,7 +5045,8 @@ void DX8Wrapper::Set_Render_Target
 		//
 		if (DefaultRenderTarget != nullptr)
 		{
-			DX8CALL(SetRenderTarget (DefaultRenderTarget, DefaultDepthBuffer));
+			DX8CALL_HRES(SetRenderTarget (DefaultRenderTarget, DefaultDepthBuffer),
+				target_result);
 			DefaultRenderTarget->Release ();
 			DefaultRenderTarget = nullptr;
 			if (DefaultDepthBuffer)
@@ -3514,6 +5070,32 @@ void DX8Wrapper::Set_Render_Target
 			CurrentDepthBuffer->Release();
 			CurrentDepthBuffer=nullptr;
 		}
+		CurrentDepthBufferIsDefault = false;
+	}
+	else if (render_target == CurrentRenderTarget &&
+		!rts::render::Is_Legacy_Render_Target_Binding_Equal(
+			CurrentRenderTarget, CurrentDepthBuffer, CurrentDepthBufferIsDefault,
+			render_target, depth_buffer_is_default ? DefaultDepthBuffer : depth_buffer,
+			depth_buffer_is_default))
+	{
+		// A color target can remain bound while its depth attachment changes.
+		// Transition D3D8 first and update the held reference only after success;
+		// the bridge then receives the same attachment identity as D3D8.
+		DX8CALL_HRES(SetRenderTarget (CurrentRenderTarget, depth_buffer),
+			target_result);
+		if (SUCCEEDED(target_result))
+		{
+			if (CurrentDepthBuffer != nullptr)
+			{
+				CurrentDepthBuffer->Release();
+			}
+			CurrentDepthBuffer = depth_buffer;
+			if (CurrentDepthBuffer != nullptr)
+			{
+				CurrentDepthBuffer->AddRef();
+			}
+			CurrentDepthBufferIsDefault = depth_buffer_is_default;
+		}
 	}
 	else if (render_target != CurrentRenderTarget)
 	{
@@ -3527,6 +5109,8 @@ void DX8Wrapper::Set_Render_Target
 //		IDirect3DSurface8 *depth_buffer = nullptr;
 			DX8CALL(GetDepthStencilSurface (&DefaultDepthBuffer));
 		}
+		depth_buffer_is_default = depth_buffer != nullptr &&
+			DefaultDepthBuffer != nullptr && depth_buffer == DefaultDepthBuffer;
 
 		//
 		//	Get a pointer to the default render target (if necessary)
@@ -3556,20 +5140,59 @@ void DX8Wrapper::Set_Render_Target
 		//
 		CurrentRenderTarget = render_target;
 		CurrentDepthBuffer = depth_buffer;
+		CurrentDepthBufferIsDefault = depth_buffer_is_default;
 		WWASSERT (CurrentRenderTarget != nullptr);
 		if (CurrentRenderTarget != nullptr)
 		{
 			CurrentRenderTarget->AddRef ();
-			CurrentDepthBuffer->AddRef();
+			if (CurrentDepthBuffer != nullptr)
+			{
+				CurrentDepthBuffer->AddRef();
+			}
 
 			//
 			//	Switch render targets
 			//
-			DX8CALL(SetRenderTarget (CurrentRenderTarget, CurrentDepthBuffer));
+			DX8CALL_HRES(SetRenderTarget (CurrentRenderTarget, CurrentDepthBuffer),
+				target_result);
 		}
 	}
 
-	IsRenderToTexture=true;
+	// The D3D8 device is a hidden compatibility oracle while the D3D11
+	// backend owns the visible frame.  Always give the bridge a chance to
+	// restore its default target: a failed hidden D3D8 restore must not leave
+	// the visible D3D11 context bound to the off-screen target.
+	if (_UseD3D11Backend)
+	{
+		const rts::render::RenderResult bridge_result = restoring_default ?
+			_D3D11Bridge.Set_Render_Target_Default() :
+			_D3D11Bridge.Set_Render_Target_Surfaces(CurrentRenderTarget,
+				CurrentDepthBuffer, CurrentDepthBufferIsDefault);
+		if (bridge_result != rts::render::RENDER_RESULT_OK)
+		{
+			WWDEBUG_SAY(("D3D11 renderer render-target transition failed: %d",
+				static_cast<int>(bridge_result)));
+			// D3D8 and D3D11 are separate visible paths during the parity
+			// migration.  A successful D3D8 SetRenderTarget is not enough to
+			// report success when the D3D11 target could not be bound: callers
+			// must be able to abandon an off-screen pass before submitting draws
+			// into an unavailable target.
+			target_result = Render_Result_To_HRESULT(bridge_result);
+		}
+		else
+		{
+			// An accepted D3D11 mapping is authoritative for the visible path;
+			// the legacy result can still represent a failure in the hidden
+			// compatibility device.
+			target_result = D3D_OK;
+		}
+	}
+
+	// Never leave a stale RTT publication after a failed transition.  A
+	// caller may recover by restoring the default target on the next command;
+	// until then visible-frame capture and presentation must fail closed.
+	IsRenderToTexture = SUCCEEDED(target_result) && !restoring_default;
+	return target_result;
 }
 
 

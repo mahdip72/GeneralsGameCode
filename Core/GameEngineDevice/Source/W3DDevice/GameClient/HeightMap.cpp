@@ -48,6 +48,7 @@
 #include "W3DDevice/GameClient/HeightMap.h"
 #include "W3DDevice/Common/HeightMapTerrainPrepare.h"
 #include "W3DDevice/Common/HeightMapDynamicLightPrepare.h"
+#include "Renderer/RenderSubmissionPolicy.h"
 
 #ifndef USE_FLAT_HEIGHT_MAP // Flat height map uses flattened textures. jba. [3/20/2003]
 
@@ -60,7 +61,6 @@
 #include <WW3D2/coltest.h>
 #include <WW3D2/rinfo.h>
 #include <WW3D2/camera.h>
-#include <d3dx8core.h>
 #include "Common/GlobalData.h"
 #include "Common/PerfTimer.h"
 
@@ -2637,20 +2637,25 @@ void HeightMapRenderObjClass::Render(RenderInfoClass & rinfo)
 			{
 				DX8Wrapper::Set_Vertex_Buffer(getVertexBufferTile(i, j));
 #ifdef PRE_TRANSFORM_VERTEX
-				if (m_xformedVertexBuffer && pass==0) {
+				const bool useLegacyPreTransform =
+					rts::render::UseLegacyPreTransformVertexPath(
+						DX8Wrapper::Is_D3D11_Backend_Active());
+				if (useLegacyPreTransform && m_xformedVertexBuffer && pass==0) {
 					// Note - m_xformedVertexBuffer should only be used for non T&L hardware.  jba.
 					DX8Wrapper::Apply_Render_State_Changes();
 					int code = DX8Wrapper::_Get_D3D_Device8()->ProcessVertices(0, 0, numVertex, m_xformedVertexBuffer[j*m_numVBTilesX+i], 0);
 					::OutputDebugString("did process vertex\n");
 				}
-				if (m_xformedVertexBuffer) {
+				if (useLegacyPreTransform && m_xformedVertexBuffer) {
 					// Note - m_xformedVertexBuffer should only be used for non T&L hardware.  jba.
 					DX8Wrapper::Apply_Render_State_Changes();
-					DX8Wrapper::_Get_D3D_Device8()->SetStreamSource(
-						0,
+					DX8Wrapper::Set_DX8_Vertex_Buffer(
 						m_xformedVertexBuffer[j*m_numVBTilesX+i],
-						D3DXGetFVFVertexSize(D3DFVF_XYZRHW |D3DFVF_DIFFUSE|D3DFVF_TEX2));
-					DX8Wrapper::_Get_D3D_Device8()->SetVertexShader(D3DFVF_XYZRHW |D3DFVF_DIFFUSE|D3DFVF_TEX2);
+						FVFInfoClass(D3DFVF_XYZRHW | D3DFVF_DIFFUSE |
+							D3DFVF_TEX2).Get_FVF_Size(),
+						D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX2);
+					DX8Wrapper::Set_Vertex_Shader(
+						D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX2);
 				}
 #endif
 				if (Is_Hidden() == 0) {
@@ -2755,20 +2760,25 @@ void HeightMapRenderObjClass::renderTerrainPass(CameraClass *pCamera)
 		{
 			DX8Wrapper::Set_Vertex_Buffer(getVertexBufferTile(i, j));
 #ifdef PRE_TRANSFORM_VERTEX
-			if (m_xformedVertexBuffer && pass==0) {
+			const bool useLegacyPreTransform =
+				rts::render::UseLegacyPreTransformVertexPath(
+					DX8Wrapper::Is_D3D11_Backend_Active());
+			if (useLegacyPreTransform && m_xformedVertexBuffer && pass==0) {
 				// Note - m_xformedVertexBuffer should only be used for non T&L hardware.  jba.
 				DX8Wrapper::Apply_Render_State_Changes();
 				int code = DX8Wrapper::_Get_D3D_Device8()->ProcessVertices(0, 0, numVertex, m_xformedVertexBuffer[j*m_numVBTilesX+i], 0);
 				::OutputDebugString("did process vertex\n");
 			}
-			if (m_xformedVertexBuffer) {
+			if (useLegacyPreTransform && m_xformedVertexBuffer) {
 				// Note - m_xformedVertexBuffer should only be used for non T&L hardware.  jba.
 				DX8Wrapper::Apply_Render_State_Changes();
-				DX8Wrapper::_Get_D3D_Device8()->SetStreamSource(
-					0,
+				DX8Wrapper::Set_DX8_Vertex_Buffer(
 					m_xformedVertexBuffer[j*m_numVBTilesX+i],
-					D3DXGetFVFVertexSize(D3DFVF_XYZRHW |D3DFVF_DIFFUSE|D3DFVF_TEX2));
-				DX8Wrapper::_Get_D3D_Device8()->SetVertexShader(D3DFVF_XYZRHW |D3DFVF_DIFFUSE|D3DFVF_TEX2);
+					FVFInfoClass(D3DFVF_XYZRHW | D3DFVF_DIFFUSE |
+						D3DFVF_TEX2).Get_FVF_Size(),
+					D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX2);
+				DX8Wrapper::Set_Vertex_Shader(
+					D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX2);
 			}
 #endif
 			if (Is_Hidden() == 0) {

@@ -380,7 +380,7 @@ const Blend srcBlendLUT[ShaderClass::SRCBLEND_MAX] =
 	Blend(D3DBLEND_ZERO, false),
 	Blend(D3DBLEND_ONE, false),
 	Blend(D3DBLEND_SRCALPHA, true),
- 	Blend(D3DBLEND_DESTCOLOR, true)
+	Blend(D3DBLEND_INVSRCALPHA, true)
 };
 
 const Blend dstBlendLUT[ShaderClass::DSTBLEND_MAX] =

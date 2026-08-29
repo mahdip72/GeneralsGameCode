@@ -263,6 +263,13 @@ public:
 	static const char *const CursorCaptureBlockReasonNames[];
 	static const char *const RedrawModeName[];
 
+	// Keep hardware cursor selection restricted to backends that expose a
+	// visible hardware cursor.  Other backends use the visible polygon path.
+	static RedrawMode resolveHardwareCursorMode(RedrawMode requested, Bool hardwareCursorVisible)
+	{
+		return requested == RM_DX8 && !hardwareCursorVisible ? RM_POLYGON : requested;
+	}
+
 	CursorInfo m_cursorInfo[NUM_MOUSE_CURSORS];
 
 public:
