@@ -32,6 +32,7 @@
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
 
 #include "GameNetwork/NAT.h"
+#include "Lib/NetworkNatPolicy.h"
 #include "GameNetwork/Transport.h"
 #include "GameNetwork/NetworkDefs.h"
 #include "GameClient/EstablishConnectionsMenu.h"
@@ -142,9 +143,50 @@
 
 NAT *TheNAT = nullptr;
 
+namespace
+{
+#if defined(_WIN64)
+typedef unsigned char (WINAPI *NatProbeRandomFunction)(void *, unsigned long);
+
+// SystemFunction036 is resolved from advapi32 at runtime and the negotiation
+// fails closed if a nonzero cookie cannot be generated.
+Bool generateNatProbeCookie(UnsignedInt *cookie)
+{
+	if (cookie == nullptr)
+		return FALSE;
+
+	*cookie = 0U;
+	HMODULE advapi32 = LoadLibraryA("advapi32.dll");
+	if (advapi32 == nullptr)
+		return FALSE;
+
+	NatProbeRandomFunction randomFunction =
+		reinterpret_cast<NatProbeRandomFunction>(
+			GetProcAddress(advapi32, "SystemFunction036"));
+	const Bool generated = randomFunction != nullptr &&
+		randomFunction(cookie, static_cast<unsigned long>(sizeof(*cookie))) != 0;
+	FreeLibrary(advapi32);
+
+	if (!generated || *cookie == 0U)
+	{
+		*cookie = 0U;
+		return FALSE;
+	}
+	return TRUE;
+}
+#endif
+}
+
 NAT::NAT()
 {
 	m_beenProbed = FALSE;
+	#if defined(_WIN64)
+	m_expectedProbeNodeNumber = -1;
+	m_probeCookie = 0U;
+	m_expectedProbeCookie = 0U;
+	m_probeGeneration = 0U;
+	m_lastAcceptedProbeGeneration = 0U;
+	#endif
 	m_connectionPairIndex = 0;
 	m_connectionRound = 0;
 	m_localIP = 0;
@@ -284,14 +326,40 @@ NATStateType NAT::update() {
 // MANGLER:
 // if we are talking to the mangler, check to see if we got a response
 // if we didn't get a response, check to see if its time to send another packet to it
+Bool NAT::isValidNode(Int nodeNumber) const
+{
+	return rts::network_nat::IsValidNode(nodeNumber, m_numNodes, MAX_SLOTS);
+}
+
+Bool NAT::isValidConnectionPairState() const
+{
+	return rts::network_nat::IsValidConnectionPairState(
+		m_connectionPairIndex, m_connectionRound, MAX_SLOTS - 1);
+}
+
+Bool NAT::isNodeOwnedBySlot(Int nodeNumber, Int slotNum) const
+{
+	return rts::network_nat::IsValidControlSource(slotNum, MAX_SLOTS) &&
+		isValidNode(nodeNumber) &&
+		m_connectionNodes[nodeNumber].m_slotIndex < MAX_SLOTS &&
+		static_cast<Int>(m_connectionNodes[nodeNumber].m_slotIndex) == slotNum;
+}
+
 NATConnectionState NAT::connectionUpdate() {
 
 	GameSlot *targetSlot = nullptr;
-	if (m_targetNodeNumber >= 0) {
+	if (!isValidNode(m_localNodeNumber)) {
+		return NATCONNECTIONSTATE_FAILED;
+	}
+	if (isValidNode(m_targetNodeNumber)) {
+		if (m_connectionNodes[m_targetNodeNumber].m_slotIndex >= MAX_SLOTS || m_slotList == nullptr)
+			return NATCONNECTIONSTATE_FAILED;
 		targetSlot = m_slotList[m_connectionNodes[m_targetNodeNumber].m_slotIndex];
 	} else {
 		return m_connectionStates[m_localNodeNumber];
 	}
+	if (targetSlot == nullptr)
+		return NATCONNECTIONSTATE_FAILED;
 
 	if (m_beenProbed == FALSE) {
 		if (timeGetTime() >= m_nextPortSendTime) {
@@ -333,23 +401,38 @@ NATConnectionState NAT::connectionUpdate() {
 			DEBUG_LOG(("NAT::connectionUpdate - got a packet from %d.%d.%d.%d:%d, length = %d",
 									PRINTF_IP_AS_4_INTS(ip), m_transport->m_inBuffer[i].port, m_transport->m_inBuffer[i].length));
 			UnsignedByte *data = m_transport->m_inBuffer[i].data;
-			if (memcmp(data, "PROBE", strlen("PROBE")) == 0) {
-				Int fromNode = atoi((char *)data + strlen("PROBE"));
+		#if defined(_WIN64)
+			const size_t probePrefixLength = strlen("PROBE");
+			if (m_transport->m_inBuffer[i].length >= static_cast<Int>(probePrefixLength) &&
+				memcmp(data, "PROBE", probePrefixLength) == 0) {
+				Int fromNode = -1;
+				UnsignedInt probeCookie = 0U;
+				UnsignedInt probeGeneration = 0U;
+				char probeText[64];
+				char trailingChar = '\0';
+				const Int probeLength = m_transport->m_inBuffer[i].length;
+				Bool parsedNode = FALSE;
+				if (probeLength > 0 && probeLength < static_cast<Int>(sizeof(probeText))) {
+					memcpy(probeText, data, probeLength);
+					probeText[probeLength] = '\0';
+					parsedNode = sscanf(probeText + probePrefixLength, "%d %X %X %c",
+						&fromNode, &probeCookie, &probeGeneration, &trailingChar) == 3;
+				}
 				DEBUG_LOG(("NAT::connectionUpdate - we've been probed by node %d.", fromNode));
 
-				if (fromNode == m_targetNodeNumber) {
+				if (parsedNode && isValidNode(fromNode) &&
+					rts::network_nat::IsExpectedProbeSource(m_expectedProbeNodeNumber, fromNode,
+					m_expectedProbeCookie, probeCookie, m_transport->m_inBuffer[i].addr,
+					m_numNodes, MAX_SLOTS) &&
+					rts::network_nat::IsNewerProbeGeneration(
+					probeGeneration, m_lastAcceptedProbeGeneration)) {
 					DEBUG_LOG(("NAT::connectionUpdate - probe was sent by our target, setting connection state %d to done.", m_targetNodeNumber));
+					m_lastAcceptedProbeGeneration = probeGeneration;
 					setConnectionState(m_targetNodeNumber, NATCONNECTIONSTATE_DONE);
-
 					if (m_transport->m_inBuffer[i].addr != targetSlot->getIP()) {
-						UnsignedInt fromIP = m_transport->m_inBuffer[i].addr;
-#ifdef DEBUG_LOGGING
-						UnsignedInt slotIP = targetSlot->getIP();
-#endif
-						DEBUG_LOG(("NAT::connectionUpdate - incoming packet has different from address than we expected, incoming: %d.%d.%d.%d expected: %d.%d.%d.%d",
-												PRINTF_IP_AS_4_INTS(fromIP),
-												PRINTF_IP_AS_4_INTS(slotIP)));
-						targetSlot->setIP(fromIP);
+						DEBUG_LOG(("NAT::connectionUpdate - learning target address from its validated probe: %d.%d.%d.%d",
+							PRINTF_IP_AS_4_INTS(m_transport->m_inBuffer[i].addr)));
+						targetSlot->setIP(m_transport->m_inBuffer[i].addr);
 					}
 					if (m_transport->m_inBuffer[i].port != targetSlot->getPort()) {
 						DEBUG_LOG(("NAT::connectionUpdate - incoming packet came from a different port than we expected, incoming: %d expected: %d",
@@ -358,10 +441,45 @@ NATConnectionState NAT::connectionUpdate() {
 						m_sourcePorts[m_targetNodeNumber] = m_transport->m_inBuffer[i].port;
 					}
 					notifyUsersOfConnectionDone(m_targetNodeNumber);
+				} else if (fromNode == m_targetNodeNumber) {
+					DEBUG_LOG(("NAT::connectionUpdate - rejecting target probe without validated target provenance from %d.%d.%d.%d",
+						PRINTF_IP_AS_4_INTS(m_transport->m_inBuffer[i].addr)));
 				}
 
 				m_transport->m_inBuffer[i].length = 0;
 			}
+		#else
+			if (memcmp(data, "PROBE", strlen("PROBE")) == 0) {
+				Int fromNode = atoi((char *)data + strlen("PROBE"));
+				DEBUG_LOG(("NAT::connectionUpdate - we've been probed by node %d.", fromNode));
+
+				if (fromNode == m_targetNodeNumber) {
+					DEBUG_LOG(("NAT::connectionUpdate - probe was sent by our target, setting connection state %d to done.",
+						m_targetNodeNumber));
+					setConnectionState(m_targetNodeNumber, NATCONNECTIONSTATE_DONE);
+
+					if (m_transport->m_inBuffer[i].addr != targetSlot->getIP()) {
+						UnsignedInt fromIP = m_transport->m_inBuffer[i].addr;
+#ifdef DEBUG_LOGGING
+						UnsignedInt slotIP = targetSlot->getIP();
+#endif
+						DEBUG_LOG(("NAT::connectionUpdate - incoming packet has different from address than we expected, incoming: %d.%d.%d.%d expected: %d.%d.%d.%d",
+										PRINTF_IP_AS_4_INTS(fromIP),
+										PRINTF_IP_AS_4_INTS(slotIP)));
+						targetSlot->setIP(fromIP);
+					}
+					if (m_transport->m_inBuffer[i].port != targetSlot->getPort()) {
+						DEBUG_LOG(("NAT::connectionUpdate - incoming packet came from a different port than we expected, incoming: %d expected: %d",
+										m_transport->m_inBuffer[i].port, targetSlot->getPort()));
+						targetSlot->setPort(m_transport->m_inBuffer[i].port);
+						m_sourcePorts[m_targetNodeNumber] = m_transport->m_inBuffer[i].port;
+					}
+					notifyUsersOfConnectionDone(m_targetNodeNumber);
+				}
+
+				m_transport->m_inBuffer[i].length = 0;
+			}
+		#endif
 			if (memcmp(data, "KEEPALIVE", strlen("KEEPALIVE")) == 0) {
 				// keep alive packet, just toss it.
 				DEBUG_LOG(("NAT::connectionUpdate - got keepalive from %d.%d.%d.%d:%d",
@@ -612,7 +730,21 @@ void NAT::doThisConnectionRound() {
 	}
 
 	m_beenProbed = FALSE;
+	#if defined(_WIN64)
+	m_expectedProbeNodeNumber = -1;
+	m_probeCookie = 0U;
+	m_expectedProbeCookie = 0U;
+	m_probeGeneration = 0U;
+	m_lastAcceptedProbeGeneration = 0U;
+	#endif
 	m_numRetries = 0;
+	#if defined(_WIN64)
+	if (!generateNatProbeCookie(&m_probeCookie)) {
+		DEBUG_LOG(("NAT::doThisConnectionRound - failed to generate probe cookie"));
+		setConnectionState(m_localNodeNumber, NATCONNECTIONSTATE_FAILED);
+		return;
+	}
+	#endif
 
 	for (i = 0; i < m_numNodes; ++i) {
 		Int targetNodeNumber = m_connectionPairs[m_connectionPairIndex][m_connectionRound][i];
@@ -658,10 +790,21 @@ void NAT::doThisConnectionRound() {
 }
 
 void NAT::sendAProbe(UnsignedInt ip, UnsignedShort port, Int fromNode) {
+	#if defined(_WIN64)
+	if (m_probeCookie == 0U)
+		return;
+	if (m_probeGeneration == 0xFFFFFFFFU)
+		m_probeGeneration = 0U;
+	++m_probeGeneration;
+	#endif
 	DEBUG_LOG(("NAT::sendAProbe - sending a probe from port %d to %d.%d.%d.%d:%d", getSlotPort(m_connectionNodes[m_localNodeNumber].m_slotIndex),
 							PRINTF_IP_AS_4_INTS(ip), port));
 	AsciiString str;
+	#if defined(_WIN64)
+	str.format("PROBE%d %08X %08X", fromNode, m_probeCookie, m_probeGeneration);
+	#else
 	str.format("PROBE%d", fromNode);
+	#endif
 	m_transport->queueSend(ip, port, (unsigned char *)str.str(), str.getLength() + 1);
 	m_transport->doSend();
 }
@@ -875,6 +1018,12 @@ void NAT::connectionFailed(Int slotIndex) {
 
 // I have been probed by the target.
 void NAT::probed(Int nodeNumber) {
+	if (!isValidNode(m_localNodeNumber) || !isValidNode(nodeNumber) ||
+		nodeNumber != m_targetNodeNumber || m_slotList == nullptr ||
+		m_connectionNodes[m_localNodeNumber].m_slotIndex >= MAX_SLOTS) {
+		DEBUG_LOG(("NAT::probed - rejecting invalid or unexpected node %d", nodeNumber));
+		return;
+	}
 	GameSlot *localSlot = m_slotList[m_connectionNodes[m_localNodeNumber].m_slotIndex];
 	DEBUG_ASSERTCRASH(localSlot != nullptr, ("NAT::probed - localSlot is null, WTF?"));
 	if (localSlot == nullptr) {
@@ -891,6 +1040,14 @@ void NAT::probed(Int nodeNumber) {
 
 // got the mangled port for our target for this round.
 void NAT::gotMangledPort(Int nodeNumber, UnsignedShort mangledPort) {
+	if (!isValidNode(m_localNodeNumber) || !isValidNode(m_targetNodeNumber) ||
+		nodeNumber != m_targetNodeNumber ||
+		!rts::network_nat::IsValidNatPort(mangledPort) || m_slotList == nullptr ||
+		m_connectionNodes[m_targetNodeNumber].m_slotIndex >= MAX_SLOTS ||
+		m_connectionNodes[m_localNodeNumber].m_slotIndex >= MAX_SLOTS) {
+		DEBUG_LOG(("NAT::gotMangledPort - rejecting invalid or unexpected node %d", nodeNumber));
+		return;
+	}
 
 	// if we've already finished the connection, then we don't need to process this.
 	if (m_connectionStates[m_localNodeNumber] == NATCONNECTIONSTATE_DONE) {
@@ -914,11 +1071,6 @@ void NAT::gotMangledPort(Int nodeNumber, UnsignedShort mangledPort) {
 		return;
 	}
 
-	if (nodeNumber != m_targetNodeNumber) {
-		DEBUG_LOG(("NAT::gotMangledPort - got a mangled port number for someone that isn't my target. node = %d, target node = %d", nodeNumber, m_targetNodeNumber));
-		return;
-	}
-
 	targetSlot->setPort(mangledPort);
 	DEBUG_LOG(("NAT::gotMangledPort - got mangled port number %d from our target node (%ls)", mangledPort, targetSlot->getName().str()));
 	DEBUG_LOG(("NAT::gotMangledPort - Send a PROBE to %d.%d.%d.%d:%d",
@@ -930,6 +1082,13 @@ void NAT::gotMangledPort(Int nodeNumber, UnsignedShort mangledPort) {
 }
 
 void NAT::gotInternalAddress(Int nodeNumber, UnsignedInt address) {
+	if (!isValidNode(m_localNodeNumber) || !isValidNode(m_targetNodeNumber) ||
+		!isValidNode(nodeNumber) || nodeNumber != m_targetNodeNumber ||
+		m_slotList == nullptr || m_connectionNodes[nodeNumber].m_slotIndex >= MAX_SLOTS ||
+		m_connectionNodes[m_localNodeNumber].m_slotIndex >= MAX_SLOTS) {
+		DEBUG_LOG(("NAT::gotInternalAddress - rejecting invalid or unexpected node %d", nodeNumber));
+		return;
+	}
 	GameSlot *targetSlot = m_slotList[m_connectionNodes[nodeNumber].m_slotIndex];
 	DEBUG_ASSERTCRASH(targetSlot != nullptr, ("NAT::gotInternalAddress - targetSlot is null"));
 	if (targetSlot == nullptr) {
@@ -939,11 +1098,6 @@ void NAT::gotInternalAddress(Int nodeNumber, UnsignedInt address) {
 	GameSlot *localSlot = m_slotList[m_connectionNodes[m_localNodeNumber].m_slotIndex];
 	DEBUG_ASSERTCRASH(localSlot != nullptr, ("NAT::gotInternalAddress - localSlot is null, WTF?"));
 	if (localSlot == nullptr) {
-		return;
-	}
-
-	if (nodeNumber != m_targetNodeNumber) {
-		DEBUG_LOG(("NAT::gotInternalAddress - got a internal address for someone that isn't my target. node = %d, target node = %d", nodeNumber, m_targetNodeNumber));
 		return;
 	}
 
@@ -1064,9 +1218,17 @@ void NAT::notifyUsersOfConnectionFailed(Int nodeIndex) {
 }
 
 void NAT::sendMangledPortNumberToTarget(UnsignedShort mangledPort, GameSlot *targetSlot) {
+	#if defined(_WIN64)
+	if (m_probeCookie == 0U)
+		return;
+	#endif
 	PeerRequest req;
 	AsciiString options;
+	#if defined(_WIN64)
+	options.format("PORT%d %d %08X %08X", m_localNodeNumber, mangledPort, m_localIP, m_probeCookie);
+	#else
 	options.format("PORT%d %d %08X", m_localNodeNumber, mangledPort, m_localIP);
+	#endif
 
 	req.peerRequestType = PeerRequest::PEERREQUEST_UTMPLAYER;
 	req.UTM.isStagingRoom = TRUE;
@@ -1080,44 +1242,51 @@ void NAT::sendMangledPortNumberToTarget(UnsignedShort mangledPort, GameSlot *tar
 }
 
 void NAT::processGlobalMessage(Int slotNum, const char *options) {
+	if (!rts::network_nat::IsValidControlSource(slotNum, MAX_SLOTS) || options == nullptr) {
+		DEBUG_LOG(("NAT::processGlobalMessage - ignoring room or invalid-source message from slot %d", slotNum));
+		return;
+	}
+
 	const char *ptr = options;
 	// skip preceding whitespace.
-	while (isspace(*ptr)) {
+	while (*ptr != '\0' && isspace(static_cast<unsigned char>(*ptr))) {
 		++ptr;
+	}
+	if (*ptr == '\0') {
+		return;
 	}
 	DEBUG_LOG(("NAT::processGlobalMessage - got message from slot %d, message is \"%s\"", slotNum, ptr));
 	if (strncmp(ptr, "PROBED", strlen("PROBED")) == 0) {
 		// format: PROBED<node number>
 		// a probe has been sent at us; notify probed node.
-		Int node = atoi(ptr + strlen("PROBED"));
-		if (node == m_targetNodeNumber) {
+		Int node = -1;
+		if (sscanf(ptr + strlen("PROBED"), "%d", &node) == 1 &&
+			isNodeOwnedBySlot(node, slotNum) && node == m_targetNodeNumber) {
 			// make sure we're being probed by who we're supposed to be probed by.
 			probed(node);
 		} else {
-			DEBUG_LOG(("NAT::processGlobalMessage - probed by node %d, not our target", node));
+			DEBUG_LOG(("NAT::processGlobalMessage - rejecting PROBED node %d from slot %d", node, slotNum));
 		}
 	} else if (strncmp(ptr, "CONNDONE", strlen("CONNDONE")) == 0) {
 		// format: CONNDONE<node number>
 		// we should get the node number of the player who's connection is done from the options
 		// and mark that down as part of the connectionStates.
 		const char *c = ptr + strlen("CONNDONE");
-/*		while (*c != ' ') {
-			++c;
+		Int node = -1;
+		Int sendingNode = -1;
+		if (sscanf(c, "%d %d", &node, &sendingNode) != 2 ||
+			!isValidConnectionPairState() || !isValidNode(node) ||
+			!isValidNode(sendingNode) || !isNodeOwnedBySlot(sendingNode, slotNum)) {
+			DEBUG_LOG(("NAT::processGlobalMessage - rejecting invalid CONNDONE node %d sender %d from slot %d",
+				node, sendingNode, slotNum));
+			return;
 		}
-		while (*c == ' ') {
-			++c;
-		}
-*/		Int node;
-		Int sendingNode;
-		sscanf(c, "%d %d\n", &node, &sendingNode);
 
 		if (m_connectionPairs[m_connectionPairIndex][m_connectionRound][node] == sendingNode) {
 //			Int node = atoi(ptr + strlen("CONNDONE"));
 			DEBUG_LOG(("NAT::processGlobalMessage - got a CONNDONE message for node %d", node));
-			if ((node >= 0) && (node <= m_numNodes)) {
-				DEBUG_LOG(("NAT::processGlobalMessage - node %d's connection is complete, setting connection state to done", node));
-				setConnectionState(node, NATCONNECTIONSTATE_DONE);
-			}
+			DEBUG_LOG(("NAT::processGlobalMessage - node %d's connection is complete, setting connection state to done", node));
+			setConnectionState(node, NATCONNECTIONSTATE_DONE);
 		} else {
 			DEBUG_LOG(("NAT::processGlobalMessage - got a connection done message that isn't from this round. node: %d sending node: %d", node, sendingNode));
 		}
@@ -1125,17 +1294,44 @@ void NAT::processGlobalMessage(Int slotNum, const char *options) {
 		// format: CONNFAILED<node number>
 		// we should get the node number of the player who's connection failed from the options
 		// and mark that down as part of the connectionStates.
-		Int node = atoi(ptr + strlen("CONNFAILED"));
-		if ((node >= 0) && (node < m_numNodes)) {
+		Int node = -1;
+		if (sscanf(ptr + strlen("CONNFAILED"), "%d", &node) == 1 &&
+			isNodeOwnedBySlot(node, slotNum)) {
 			DEBUG_LOG(("NAT::processGlobalMessage - node %d's connection failed, setting connection state to failed", node));
 			setConnectionState(node, NATCONNECTIONSTATE_FAILED);
+		} else {
+			DEBUG_LOG(("NAT::processGlobalMessage - rejecting CONNFAILED node %d from slot %d", node, slotNum));
 		}
 	} else if (strncmp(ptr, "PORT", strlen("PORT")) == 0) {
-		// format: PORT<node number> <port number> <internal IP>
+		// format: PORT<node number> <port number> <internal IP> <probe cookie>
 		// we should get the node number and the mangled port number of the client we
 		// are supposed to be communicating with and start probing them. No, that was not
 		// meant to be a phallic reference, you sicko.
 		const char *c = ptr + strlen("PORT");
+		#if defined(_WIN64)
+		Int node = -1;
+		UnsignedInt intport = 0;
+		UnsignedInt addr = 0;
+		UnsignedInt probeCookie = 0U;
+		if (sscanf(c, "%d %u %X %X", &node, &intport, &addr, &probeCookie) != 4 ||
+			!isNodeOwnedBySlot(node, slotNum) || node != m_targetNodeNumber ||
+			!rts::network_nat::IsValidNatPort(intport) || probeCookie == 0U) {
+			DEBUG_LOG(("NAT::processGlobalMessage - rejecting invalid PORT node %d from slot %d", node, slotNum));
+			return;
+		}
+		UnsignedShort port = static_cast<UnsignedShort>(intport);
+		if (rts::network_nat::IsNewProbeEpoch(m_expectedProbeNodeNumber,
+			m_expectedProbeCookie, node, probeCookie))
+			m_lastAcceptedProbeGeneration = 0U;
+		m_expectedProbeNodeNumber = node;
+		m_expectedProbeCookie = probeCookie;
+
+		DEBUG_LOG(("NAT::processGlobalMessage - got port message from node %d, port: %d, internal address: %d.%d.%d.%d", node, port,
+								PRINTF_IP_AS_4_INTS(addr)));
+
+		gotInternalAddress(node, addr);
+		gotMangledPort(node, port);
+		#else
 		Int node = atoi(c);
 		while (*c != ' ') {
 			++c;
@@ -1160,10 +1356,15 @@ void NAT::processGlobalMessage(Int slotNum, const char *options) {
 			gotInternalAddress(node, addr);
 			gotMangledPort(node, port);
 		}
+		#endif
 	}
 }
 
 void NAT::setConnectionState(Int nodeNumber, NATConnectionState state) {
+	if (nodeNumber < 0 || nodeNumber >= MAX_SLOTS) {
+		DEBUG_LOG(("NAT::setConnectionState - rejecting invalid node %d", nodeNumber));
+		return;
+	}
 	m_connectionStates[nodeNumber] = state;
 
 	if (nodeNumber != m_localNodeNumber) {
@@ -1178,7 +1379,9 @@ void NAT::setConnectionState(Int nodeNumber, NATConnectionState state) {
 
 	// if this is the start of a new connection round we don't have a
 	// target yet.
-	if (m_targetNodeNumber == -1) {
+	if (!isValidNode(m_targetNodeNumber) || m_slotList == nullptr ||
+		m_connectionNodes[m_targetNodeNumber].m_slotIndex >= MAX_SLOTS ||
+		m_connectionNodes[m_localNodeNumber].m_slotIndex >= MAX_SLOTS) {
 		return;
 	}
 

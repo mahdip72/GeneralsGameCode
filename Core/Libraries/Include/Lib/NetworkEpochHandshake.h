@@ -19,8 +19,9 @@ namespace network_epoch
 // The payload identifies the record kind, stable sender/recipient slots, and a
 // per-exchange session challenge.  All payload fields are covered by the epoch
 // checksum. The challenge rejects passive stale-record replay; it is not a
-// keyed peer authenticator. Endpoint addresses are deliberately not part of
-// the identity because NAT may rewrite the source port.
+// keyed peer authenticator. Endpoint addresses are deliberately not encoded
+// in the identity because NAT may rewrite them. The transport owner separately
+// binds the observed source to its post-NAT peer endpoint before validation.
 //
 // This tokenized 60-byte record is mandatory for the clean Stage 3 runtime
 // epoch. Earlier 52-byte development records and pre-epoch peers are
@@ -56,12 +57,119 @@ enum class NetworkHelloKind : std::uint32_t
 constexpr std::uint32_t kNetworkHelloRetryIntervalMs = 1000U;
 constexpr std::uint32_t kNetworkHelloMaxAttempts = 5U;
 constexpr std::uint32_t kNetworkHelloTimeoutMs = 10000U;
+// A frame-resend provenance exception is intentionally short-lived.  It is
+// scoped to the direct responder and frame requested by this connection.
+constexpr std::uint32_t kNetworkFrameResendResponseTimeoutMs = 5000U;
 
 struct NetworkHelloIdentity
 {
 	std::uint32_t senderSlot;
 	std::uint32_t recipientSlot;
 };
+
+inline bool IsMatchingNetworkPeerEndpoint(std::uint32_t observedAddress,
+	std::uint16_t observedPort,
+	std::uint32_t expectedAddress,
+	std::uint16_t expectedPort)
+{
+	return observedAddress == expectedAddress && observedPort == expectedPort;
+}
+
+// A direct packet must name the peer that sent it. Packets arriving from the
+// current packet router are allowed to carry another player's origin because
+// the router is the protocol's existing relay boundary.
+inline bool IsNetworkCommandSourceAuthorized(std::uint32_t observedSlot,
+	std::uint32_t claimedSlot,
+	std::uint32_t packetRouterSlot)
+{
+	return observedSlot == claimedSlot || observedSlot == packetRouterSlot;
+}
+
+// A direct frame resend carries cached commands originally authored by more
+// than one player.  Permit that deliberate provenance exception only while a
+// local request is outstanding, only from its direct responder, only for the
+// requested frame, and only for the two synchronized frame-data wire types.
+// The expected-origin mask mirrors the responder's sendSingleFrameToPlayer
+// loop, which excludes the requester and may include the responder's own
+// cached origin.
+// The normal source-binding check remains authoritative for every other
+// command and for router-mediated traffic.
+inline bool IsNetworkFrameResendResponseAuthorized(
+	std::uint32_t observedSlot,
+	std::uint32_t requestedResponderSlot,
+	std::uint32_t claimedSlot,
+	std::uint32_t expectedOriginMask,
+	std::uint32_t maxSlots,
+	bool requestOutstanding,
+	bool requestExpired,
+	bool isFrameDataCommand,
+	std::uint32_t responseFrame,
+	std::uint32_t requestedFrame)
+{
+	return requestOutstanding && !requestExpired && isFrameDataCommand &&
+		observedSlot < maxSlots && requestedResponderSlot < maxSlots &&
+		claimedSlot < maxSlots && claimedSlot < 32U &&
+		(expectedOriginMask & (1U << claimedSlot)) != 0U &&
+		observedSlot == requestedResponderSlot &&
+		responseFrame == requestedFrame;
+}
+
+// Frame-info records describe the command count that must be present for an
+// origin, but they can arrive before the cached commands themselves when a
+// resend spans multiple UDP packets.  Keep provenance active until both the
+// expected frame-info records and the corresponding frame data are complete.
+inline bool IsNetworkFrameResendResponseComplete(
+	std::uint32_t expectedInfoMask,
+	std::uint32_t receivedInfoMask,
+	std::uint32_t readyCommandMask)
+{
+	return expectedInfoMask == 0U ||
+		((receivedInfoMask & expectedInfoMask) == expectedInfoMask &&
+		(readyCommandMask & expectedInfoMask) == expectedInfoMask);
+}
+
+enum class NetworkIngressDisposition : std::uint32_t
+{
+	Drop = 0U,
+	Defer = 1U,
+	Process = 2U,
+	Quarantine = 3U
+};
+
+// Keep the transport admission decision independent from ConnectionManager's
+// object graph so the same malformed/unknown-peer cases are executable-testable.
+inline NetworkIngressDisposition ClassifyNetworkIngress(bool hasHelloPrefix,
+	bool hasHelloMagic, bool handshakeRequired, bool endpointKnown,
+	bool validHelloCandidate)
+{
+	if (hasHelloPrefix)
+	{
+		if (hasHelloMagic && validHelloCandidate)
+			return NetworkIngressDisposition::Process;
+		return endpointKnown ? NetworkIngressDisposition::Quarantine :
+			NetworkIngressDisposition::Drop;
+	}
+
+	if (handshakeRequired)
+		return endpointKnown ? NetworkIngressDisposition::Defer :
+			NetworkIngressDisposition::Drop;
+	return endpointKnown ? NetworkIngressDisposition::Process :
+		NetworkIngressDisposition::Drop;
+}
+
+inline bool IsNetworkHelloDeferredPeerQuotaExceeded(std::uint32_t peerCount,
+	std::uint32_t totalCapacity, std::uint32_t peerCountLimit)
+{
+	return peerCountLimit != 0U && peerCount >= (totalCapacity / peerCountLimit);
+}
+
+inline bool IsNetworkPacketRouterEligible(std::uint32_t candidateSlot,
+	std::uint32_t localSlot, std::uint32_t maxSlots, bool hasConnection,
+	bool connectionQuitting)
+{
+	return candidateSlot < maxSlots &&
+		(candidateSlot == localSlot || (hasConnection && !connectionQuitting));
+}
 
 inline bool IsNetworkHelloRetryDue(std::uint32_t now, std::uint32_t lastSend)
 {

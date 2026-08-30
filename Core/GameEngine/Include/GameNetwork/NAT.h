@@ -98,6 +98,9 @@ protected:
 	void gotInternalAddress(Int nodeNumber, UnsignedInt address);
 	void connectionComplete(Int slotIndex);
 	void connectionFailed(Int slotIndex);
+	Bool isValidNode(Int nodeNumber) const;
+	Bool isValidConnectionPairState() const;
+	Bool isNodeOwnedBySlot(Int nodeNumber, Int slotNum) const;
 
 	Transport *m_transport;
 	GameSlot **m_slotList;
@@ -118,6 +121,13 @@ protected:
 	UnsignedShort m_previousSourcePort;
 
 	Bool m_beenProbed; ///< have I been notified that I've been probed this round?
+	#if defined(_WIN64)
+	Int m_expectedProbeNodeNumber; ///< target identity authorized by its PORT notification.
+	UnsignedInt m_probeCookie; ///< per-round cookie advertised to the target in PORT.
+	UnsignedInt m_expectedProbeCookie; ///< cookie authorized by the target's PORT notification.
+	UnsignedInt m_probeGeneration; ///< monotonically increasing probe attempt for this round.
+	UnsignedInt m_lastAcceptedProbeGeneration; ///< newest validated target probe seen this round.
+	#endif
 
 	UnsignedInt m_manglerAddress;
 

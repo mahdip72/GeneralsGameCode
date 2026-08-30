@@ -186,11 +186,18 @@ private:
 	Bool sendNetworkHelloAck(Int slot);
 	Bool processNetworkHello(const TransportMessage &message, Bool enforceFailure);
 	Bool isNetworkHelloCandidate(const TransportMessage &message) const;
+	Bool matchesNetworkPeerEndpoint(const TransportMessage &message, Int slot) const;
+	Int findNetworkPeerEndpoint(const TransportMessage &message) const;
+	Bool isKnownNetworkPeerEndpoint(const TransportMessage &message) const;
+	Bool isNetworkCommandSourceAuthorized(const NetCommandMsg *msg, Int sourceSlot) const;
+	void clearNetworkFrameResendRequest();
 	void deferNetworkMessage(const TransportMessage &message);
 	Bool queueNetworkHelloCommand(NetCommandMsg *msg, UnsignedByte relay);
 	void drainNetworkHelloPendingCommands();
 	void clearNetworkHelloPendingCommands();
 	void rejectNetworkHello(Int slot, const char *reason);
+	void dropNetworkHelloDeferredForPeer(Int slot);
+	void quarantineNetworkHelloPeer(Int slot, const char *reason);
 	Int findNetworkHelloSlot(UnsignedInt senderSlot, UnsignedInt recipientSlot) const;
 #endif
 	void sendLocalCommandImmediate(NetCommandMsg *msg, UnsignedByte relay);
@@ -252,6 +259,12 @@ private:
 	UnsignedInt m_networkHelloStartTime;
 	UnsignedInt m_networkHelloLastSend;
 	UnsignedInt m_networkHelloAttempts;
+	Bool m_frameResendRequestOutstanding;
+	UnsignedInt m_frameResendRequestResponder;
+	UnsignedInt m_frameResendRequestFrame;
+	UnsignedInt m_frameResendRequestStartTime;
+	UnsignedInt m_frameResendRequestExpectedInfoMask;
+	UnsignedInt m_frameResendRequestReceivedInfoMask;
 	TransportMessage m_networkHelloDeferred[MAX_MESSAGES];
 	UnsignedInt m_networkHelloDeferredCount;
 	NetCommandList *m_networkHelloPendingCommands;
