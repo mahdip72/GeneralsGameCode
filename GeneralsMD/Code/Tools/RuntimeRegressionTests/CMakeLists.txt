@@ -26,7 +26,7 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4)
 		target_link_libraries(z_runtime_regression_tests PRIVATE binkstub)
 	endif()
 else()
-	# The native x64 utility exercises logic/network contracts only.  Keep it
+	# The native x64 utility exercises production runtime contracts. Keep it
 	# on the product's modern dependency boundary and do not pull the legacy
 	# D3D8, Miles, or Bink import libraries into the test executable.
 	#
@@ -55,6 +55,25 @@ add_test(NAME z_skirmish_ai_runner_contract_tests COMMAND z_runtime_regression_t
 set_tests_properties(z_skirmish_ai_runner_contract_tests PROPERTIES TIMEOUT 30)
 
 if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD)
+	# Exercise the real product AudioEventRTS/GameAudio implementations, not the
+	# isolated manager fixture's runtime substitutes. The hook only sets capacity.
+	target_link_libraries(z_runtime_regression_tests PRIVATE rts_native_audio_manager)
+	target_compile_definitions(z_runtime_regression_tests PRIVATE RTS_NATIVE_AUDIO_TEST_HOOK)
+	if(RTS_BUILD_OPTION_FFMPEG AND RTS_FFMPEG_RUNTIME_DLLS)
+		# This executable now imports FFmpeg in every mode. Stage the exact
+		# validated closure (including swresample/swscale), as the product install
+		# already does, so direct build-tree invocations are app-local as well.
+		add_custom_command(TARGET z_runtime_regression_tests POST_BUILD
+			COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+				${RTS_FFMPEG_RUNTIME_DLLS} "$<TARGET_FILE_DIR:z_runtime_regression_tests>"
+			COMMAND_EXPAND_LISTS
+			VERBATIM
+		)
+	endif()
+	add_test(NAME z_native_logical_audio_tests
+		COMMAND z_runtime_regression_tests --native-logical-audio)
+	set_tests_properties(z_native_logical_audio_tests PROPERTIES TIMEOUT 30)
+
 	# Capture the target's full CMake link closure at configure time.  A direct
 	# LINK_LIBRARIES property is insufficient because a legacy dependency can
 	# arrive through an INTERFACE target several levels below the executable.
@@ -141,3 +160,16 @@ endif()
 
 add_test(NAME z_texture_load_queue_contract_tests COMMAND z_runtime_regression_tests --texture-load-queue-contract)
 set_tests_properties(z_texture_load_queue_contract_tests PROPERTIES TIMEOUT 30)
+
+if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD
+		AND RTS_BUILD_OPTION_FFMPEG AND FFMPEG_RUNTIME_DIR)
+	# All four tests share the same loader dependency set, not just the audio
+	# mode. Keep the SDK lookup local to these test processes.
+	set_tests_properties(
+		z_skirmish_ai_replay_epoch_tests
+		z_skirmish_ai_runner_contract_tests
+		z_native_logical_audio_tests
+		z_texture_load_queue_contract_tests
+		PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${FFMPEG_RUNTIME_DIR}"
+	)
+endif()

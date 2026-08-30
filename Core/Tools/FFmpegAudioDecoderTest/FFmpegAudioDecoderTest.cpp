@@ -1,3 +1,7 @@
+#if defined(_WIN32)
+// Match native PCM consumers: the decoder header must tolerate SDK macros.
+#include <windows.h>
+#endif
 #include "VideoDevice/FFmpeg/FFmpegAudioDecoder.h"
 
 extern "C" {
@@ -8,8 +12,10 @@ extern "C" {
 }
 
 #include <cstdint>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -39,7 +45,7 @@ public:
 	}
 
 	std::vector<AudioPcmChunk> chunks;
-	std::uint64_t lastResetGeneration = std::numeric_limits<std::uint64_t>::max();
+	std::uint64_t lastResetGeneration = (std::numeric_limits<std::uint64_t>::max)();
 	std::vector<AudioPcmChunk> droppedChunks;
 	bool dropNext = false;
 };
@@ -116,6 +122,69 @@ static bool testOwnedInterleaving()
 	const bool ended_rejects_input = frame != nullptr && !decoder.convert(frame, 1, 48000, sink);
 	av_frame_free(&frame);
 	return ended_rejects_input && !decoder.isFailed();
+}
+
+static bool testMonoMixPolicy()
+{
+	const FFmpegAudioDecoder::MonoMix modes[] = {
+		FFmpegAudioDecoder::MonoMix::DefaultMix,
+		FFmpegAudioDecoder::MonoMix::UnityDuplicate
+	};
+	for (const auto mode : modes) {
+		CapturingSink sink;
+		FFmpegAudioDecoder decoder(mode);
+		for (const int sampleRate : { 48000, 22050 }) {
+			decoder.reset(static_cast<std::uint64_t>(sampleRate), sink);
+			AVFrame *frame = createS16Frame(sampleRate, 512, 0, true, 1);
+			if (frame == nullptr) return false;
+			for (int sample = 0; sample < frame->nb_samples; ++sample) {
+				reinterpret_cast<std::int16_t *>(frame->extended_data[0])[sample] = 10000;
+			}
+			const bool converted = decoder.convert(frame, 1, sampleRate, sink);
+			av_frame_free(&frame);
+			if (!converted || !decoder.drain(sink) || sink.chunks.empty()) return false;
+			const int expected = mode == FFmpegAudioDecoder::MonoMix::UnityDuplicate ? 10000 : 7071;
+			for (const AudioPcmChunk &chunk : sink.chunks) {
+				if (!chunkInvariant(chunk) || chunk.sourceChannels != 1) return false;
+				const auto *samples = reinterpret_cast<const std::int16_t *>(chunk.data.data());
+				for (std::uint32_t index = 0; index < chunk.frameCount; ++index) {
+					if (samples[index * 2] != samples[index * 2 + 1]
+						|| std::abs(samples[index * 2] - expected) > 2) return false;
+				}
+			}
+		}
+	}
+
+	CapturingSink sink;
+	FFmpegAudioDecoder decoder(FFmpegAudioDecoder::MonoMix::UnityDuplicate);
+	decoder.reset(50, sink);
+	for (const int channels : { 1, 2, 1 }) {
+		AVFrame *frame = createS16Frame(48000, 4, AV_NOPTS_VALUE, true, channels);
+		const bool converted = frame != nullptr && decoder.convert(frame, 1, 48000, sink);
+		av_frame_free(&frame);
+		if (!converted || sink.chunks.empty()) return false;
+		const AudioPcmChunk &chunk = sink.chunks.back();
+		if (chunk.frameCount != 4 || chunk.sourceChannels != channels) return false;
+		const auto *samples = reinterpret_cast<const std::int16_t *>(chunk.data.data());
+		for (int index = 0; index < 4; ++index) {
+			if (samples[index * 2] != 100 + index
+				|| samples[index * 2 + 1] != (channels == 1 ? 100 + index : -500 - index)) return false;
+		}
+	}
+	decoder.reset(51, sink);
+	for (const int timestamp : { 0, 200 }) {
+		AVFrame *frame = createS16Frame(48000, 4, timestamp, true, 1);
+		const bool converted = frame != nullptr && decoder.convert(frame, 1, 48000, sink);
+		av_frame_free(&frame);
+		if (!converted || sink.chunks.empty()) return false;
+		const AudioPcmChunk &chunk = sink.chunks.back();
+		if (chunk.frameCount != 4) return false;
+		const auto *samples = reinterpret_cast<const std::int16_t *>(chunk.data.data());
+		for (int index = 0; index < 4; ++index) {
+			if (samples[index * 2] != 100 + index || samples[index * 2 + 1] != 100 + index) return false;
+		}
+	}
+	return sink.chunks.size() == 2 && sink.chunks.back().discontinuity;
 }
 
 static bool testResamplingAndDrain()
@@ -392,6 +461,7 @@ int main()
 		}
 	};
 	run("owned interleaving", testOwnedInterleaving);
+	run("mono mix policy", testMonoMixPolicy);
 	run("resampling and drain", testResamplingAndDrain);
 	run("timeline and reset", testTimelineAndReset);
 	run("resampled missing timestamps", testResampledMissingTimestamps);

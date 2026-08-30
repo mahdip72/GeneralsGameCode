@@ -32,6 +32,8 @@
 
 #include "Lib/BaseType.h"
 #include "VideoDevice/FFmpeg/FFmpegVideoPlayer.h"
+#include "Common/AudioAffect.h"
+#include "Common/GameAudio.h"
 #include "Common/GameMemory.h"
 #include "Common/GlobalData.h"
 #include "Common/Registry.h"
@@ -47,11 +49,13 @@
 
 extern "C" {
 	#include <libavcodec/avcodec.h>
+	#include <libavutil/pixdesc.h>
 	#include <libswscale/swscale.h>
 }
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 
 namespace
 {
@@ -59,6 +63,14 @@ UnsignedInt64 getMonotonicMilliseconds()
 {
 	return std::chrono::duration_cast<std::chrono::milliseconds>(
 		std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+double getMovieSpeechGain()
+{
+	// Match the legacy Bink movie attenuation, but preserve a true zero so the
+	// live SpeechOn control can mute an already-playing native movie.
+	return TheAudio != nullptr && TheAudio->isOn(AudioAffect_Speech)
+		? static_cast<double>(TheAudio->getVolume(AudioAffect_Speech)) * 0.8 : 0.0;
 }
 }
 
@@ -246,7 +258,7 @@ VideoStreamInterface* FFmpegVideoPlayer::createStream( File* file )
 	}
 #endif
 
-	FFmpegVideoStream *stream = NEW FFmpegVideoStream(ffmpegHandle, audioSink);
+	FFmpegVideoStream *stream = NEW FFmpegVideoStream(ffmpegHandle, audioSink, getMovieSpeechGain());
 	if (stream == nullptr) {
 		delete audioSink;
 		delete ffmpegHandle;
@@ -333,7 +345,7 @@ void FFmpegVideoPlayer::notifyVideoPlayerOfNewProvider( Bool nowHasValid )
 // FFmpegVideoStream::FFmpegVideoStream
 //============================================================================
 
-FFmpegVideoStream::FFmpegVideoStream(FFmpegFile* file, AudioPcmSink *audioSink)
+FFmpegVideoStream::FFmpegVideoStream(FFmpegFile* file, AudioPcmSink *audioSink, double initialGain)
 : m_ffmpegFile(file), m_audioSink(audioSink)
 {
 	if (m_ffmpegFile == nullptr) {
@@ -342,6 +354,7 @@ FFmpegVideoStream::FFmpegVideoStream(FFmpegFile* file, AudioPcmSink *audioSink)
 	}
 	FFmpegMoviePlaybackOptions options;
 	options.mode = FFmpegMoviePlaybackMode::SHOW_LAST_FRAME;
+	options.gain = initialGain;
 	m_playback = NEW FFmpegMoviePlayback(*m_ffmpegFile, m_audioSink, options);
 	if (m_playback == nullptr) {
 		m_good = false;
@@ -353,7 +366,19 @@ FFmpegVideoStream::FFmpegVideoStream(FFmpegFile* file, AudioPcmSink *audioSink)
 	// Decode until we have our first video frame, but keep open-time work
 	// bounded just like frameNext/frameGoto and the destructor finish path.
 	for (std::size_t attempts = 0; attempts < 256 && m_good && !m_gotFrame; ++attempts) {
-		m_good = m_playback->pump(64);
+		const bool progressed = m_playback->pump(1);
+		if (!progressed && !m_playback->isTerminal()) {
+			markPlaybackFailed();
+			break;
+		}
+		if (m_audioSink != nullptr && !m_audioSink->serviceSink()) {
+			markPlaybackFailed();
+			break;
+		}
+		if (m_playback->state() == FFmpegMoviePlaybackState::FAILED) {
+			markPlaybackFailed();
+			break;
+		}
 	}
 	if (m_good && !m_gotFrame) {
 		m_good = false;
@@ -362,17 +387,23 @@ FFmpegVideoStream::FFmpegVideoStream(FFmpegFile* file, AudioPcmSink *audioSink)
 	m_startTime = getMonotonicMilliseconds();
 }
 
+void FFmpegVideoStream::syncSpeechGain()
+{
+	if (m_playback != nullptr) {
+		m_playback->setGain(getMovieSpeechGain());
+	}
+}
+
 //============================================================================
 // FFmpegVideoStream::~FFmpegVideoStream
 //============================================================================
 
 FFmpegVideoStream::~FFmpegVideoStream()
 {
-	if (m_playback != nullptr && !m_playback->isTerminal()) {
-		// Drain decoder/resampler tail while the sink is still alive.  This is
-		// bounded and owner-side; callbacks never close the native voice.
-		m_playback->finish(256);
-	}
+	// Closing or skipping a movie is an abort operation.  Draining a long
+	// movie here can synchronously decode its remaining tail on the game thread
+	// and make an intro transition appear hung.  FFmpegMoviePlayback teardown
+	// resets the active audio generation before the sink is closed below.
 	av_frame_free(&m_frame);
 	sws_freeContext(m_swsContext);
 	delete m_playback;
@@ -407,13 +438,31 @@ void FFmpegVideoStream::update()
 	if (!m_good || m_playback == nullptr) {
 		return;
 	}
+	syncSpeechGain();
+	// Blocking load-screen loops update the stream directly rather than going
+	// through FFmpegVideoPlayer::update().  Service the stream-owned voice here
+	// as well so pending PCM starts and completion/drain state keeps moving.
+	if (m_audioSink != nullptr && !m_audioSink->serviceSink()) {
+		markPlaybackFailed();
+		return;
+	}
 	if (m_playback->state() == FFmpegMoviePlaybackState::ENDED) {
 		m_gotFrame = m_playback->hasCurrentFrame();
 		return;
 	}
 	if (m_playback->state() == FFmpegMoviePlaybackState::FAILED) {
-		m_good = false;
-		m_gotFrame = false;
+		markPlaybackFailed();
+		return;
+	}
+	if (m_playback->state() == FFmpegMoviePlaybackState::DRAINING) {
+		// A retained final frame must not prevent callback-driven audio drain
+		// from publishing the terminal state.  DRAINING pump() only services
+		// the sink; it cannot replace the display-owned frame.
+		const bool progressed = m_playback->pump(1);
+		if (m_playback->state() == FFmpegMoviePlaybackState::FAILED
+			|| (!progressed && !m_playback->isTerminal())) {
+			markPlaybackFailed();
+		}
 		return;
 	}
 	// Display owns frame advancement through frameNext(). Do not replace a
@@ -423,18 +472,42 @@ void FFmpegVideoStream::update()
 	if (m_gotFrame) {
 		return;
 	}
-	if (!m_playback->pump(32) && !m_playback->isTerminal()) {
-		m_good = false;
+	const bool progressed = m_playback->pump(32);
+	if (!progressed && !m_playback->isTerminal()) {
+		markPlaybackFailed();
 	}
 	if (m_playback->state() == FFmpegMoviePlaybackState::FAILED) {
-		m_good = false;
-		m_gotFrame = false;
+		markPlaybackFailed();
+	}
+}
+
+void FFmpegVideoStream::markPlaybackFailed()
+{
+	const Bool wasGood = m_good;
+	m_good = false;
+	m_gotFrame = false;
+	if (m_playback != nullptr && !m_playback->isTerminal()) {
+		m_playback->failPlayback();
+	}
+	// The owner-side close quiesces native callbacks.  The stream remains
+	// terminal so hosts can observe the failure and advance before deleting it.
+	if (m_audioSink != nullptr) {
+		m_audioSink->close();
+	}
+	if (wasGood) {
+		DEBUG_LOG(("FFmpegVideoStream playback failed; native movie audio closed"));
 	}
 }
 
 Bool FFmpegVideoStream::isFinished() const
 {
 	return !m_good || m_playback == nullptr || m_playback->isTerminal();
+}
+
+Bool FFmpegVideoStream::isPlaybackFailed() const
+{
+	return !m_good || (m_playback != nullptr
+		&& m_playback->state() == FFmpegMoviePlaybackState::FAILED);
 }
 
 //============================================================================
@@ -477,6 +550,7 @@ void FFmpegVideoStream::frameRender( VideoBuffer *buffer )
 
 	AVPixelFormat dst_pix_fmt;
 	UnsignedInt bytes_per_pixel;
+	Bool direct_bgra8_publication = FALSE;
 
 	switch (buffer->format()) {
 		case VideoBuffer::TYPE_R8G8B8:
@@ -484,8 +558,17 @@ void FFmpegVideoStream::frameRender( VideoBuffer *buffer )
 			bytes_per_pixel = 3;
 			break;
 		case VideoBuffer::TYPE_X8R8G8B8:
-			dst_pix_fmt = AV_PIX_FMT_BGR0;
+			// The direct D3D11 publication path consumes BGRA8. BGRA also gives
+			// non-alpha movie sources the opaque alpha that the legacy X8 surface
+			// conversion supplied before DRAW_IMAGE_ALPHA sampling.
+			dst_pix_fmt = AV_PIX_FMT_BGRA;
 			bytes_per_pixel = 4;
+			{
+				const AVPixFmtDescriptor *source_descriptor = av_pix_fmt_desc_get(
+					static_cast<AVPixelFormat>(m_frame->format));
+				direct_bgra8_publication = source_descriptor != nullptr &&
+					(source_descriptor->flags & AV_PIX_FMT_FLAG_ALPHA) == 0;
+			}
 			break;
 		case VideoBuffer::TYPE_R5G6B5:
 			dst_pix_fmt = AV_PIX_FMT_RGB565;
@@ -525,9 +608,13 @@ void FFmpegVideoStream::frameRender( VideoBuffer *buffer )
 	uint8_t *dst_data[] = {
 		buffer_data + buffer->yPos() * buffer->pitch() + buffer->xPos() * bytes_per_pixel
 	};
-	[[maybe_unused]] int result =
+	const int result =
 		sws_scale(m_swsContext, m_frame->data, m_frame->linesize, 0, height(), dst_data, dst_strides);
 	DEBUG_ASSERTLOG(result >= 0, ("Failed to scale frame"));
+	if (result == static_cast<int>(buffer->height()) &&
+		direct_bgra8_publication) {
+		buffer->publishLockedFrame();
+	}
 	buffer->unlock();
 }
 
@@ -540,25 +627,35 @@ void FFmpegVideoStream::frameNext()
 	if (!m_good || m_playback == nullptr) {
 		return;
 	}
+	syncSpeechGain();
 	if (m_playback->isTerminal()) {
 		m_gotFrame = m_playback->state() == FFmpegMoviePlaybackState::ENDED
 			&& m_playback->hasCurrentFrame();
 		if (m_playback->state() == FFmpegMoviePlaybackState::FAILED) {
-			m_good = false;
+			markPlaybackFailed();
 		}
 		return;
 	}
 	const Int previousFrame = m_playback->frameIndex();
 	m_gotFrame = false;
-	for (std::size_t attempts = 0; attempts < 256 && !m_playback->isTerminal(); ++attempts) {
-		if (!m_playback->pump(32)) {
-			if (!m_playback->isTerminal()) {
-				m_good = false;
-			}
+	for (std::size_t attempts = 0; attempts < 32 && !m_playback->isTerminal(); ++attempts) {
+		const bool progressed = m_playback->pump(1);
+		if (!progressed && !m_playback->isTerminal()) {
+			markPlaybackFailed();
+			break;
+		}
+		if (m_audioSink != nullptr && !m_audioSink->serviceSink()) {
+			markPlaybackFailed();
 			break;
 		}
 		if (m_playback->hasCurrentFrame() && m_playback->frameIndex() != previousFrame) {
+			// Display owns frame cadence. Stop on the first new video frame;
+			// dropping multiple frames is unsafe until the native sink exposes a
+			// continuous media cursor across queue discontinuities.
 			m_gotFrame = true;
+			break;
+		}
+		if (m_playback->state() == FFmpegMoviePlaybackState::DRAINING) {
 			break;
 		}
 	}
@@ -566,9 +663,44 @@ void FFmpegVideoStream::frameNext()
 		m_gotFrame = m_playback->state() == FFmpegMoviePlaybackState::ENDED
 			&& m_playback->hasCurrentFrame();
 		if (m_playback->state() == FFmpegMoviePlaybackState::FAILED) {
-			m_good = false;
+			markPlaybackFailed();
 		}
 	}
+}
+
+Bool FFmpegVideoStream::finishPlayback()
+{
+	if (m_playback == nullptr) {
+		markPlaybackFailed();
+		return TRUE;
+	}
+	if (!m_good) {
+		markPlaybackFailed();
+		return TRUE;
+	}
+	if (m_playback->state() == FFmpegMoviePlaybackState::FAILED) {
+		markPlaybackFailed();
+		return TRUE;
+	}
+	if (m_playback->state() == FFmpegMoviePlaybackState::ENDED) {
+		return TRUE;
+	}
+	syncSpeechGain();
+	m_gotFrame = false;
+	// Perform one bounded owner-side service quantum. Blocking hosts retain
+	// control of abort polling between calls, so a stalled device cannot make
+	// Escape, shutdown, or a load transition unresponsive.
+	if (m_audioSink != nullptr && !m_audioSink->serviceSink()) {
+		markPlaybackFailed();
+		return TRUE;
+	}
+	const bool progressed = m_playback->pump(1);
+	if (m_playback->state() == FFmpegMoviePlaybackState::FAILED
+		|| (!progressed && m_playback->state() != FFmpegMoviePlaybackState::DRAINING)) {
+		markPlaybackFailed();
+		return TRUE;
+	}
+	return m_playback->isTerminal() ? TRUE : FALSE;
 }
 
 //============================================================================
@@ -595,6 +727,7 @@ Int	FFmpegVideoStream::frameCount()
 
 Bool FFmpegVideoStream::frameGoto( Int index )
 {
+	syncSpeechGain();
 	const Int frame_count = m_ffmpegFile->getNumFrames();
 	if (frame_count > 0) {
 		index = std::clamp(index, 0, frame_count - 1);
@@ -604,8 +737,7 @@ Bool FFmpegVideoStream::frameGoto( Int index )
 
 	if (m_playback == nullptr || !m_playback->seekFrame(index)) {
 		av_frame_free(&m_frame);
-		m_gotFrame = false;
-		m_good = false;
+		markPlaybackFailed();
 		return FALSE;
 	}
 
@@ -614,8 +746,21 @@ Bool FFmpegVideoStream::frameGoto( Int index )
 	m_good = true;
 	for (std::size_t attempts = 0; attempts < 256 && m_good && !m_gotFrame; ++attempts) {
 		const Int targetFrame = index;
-		if (!m_playback->pump(32)) {
-			m_good = m_playback->state() == FFmpegMoviePlaybackState::ENDED;
+		const bool progressed = m_playback->pump(32);
+		if (!progressed) {
+			if (m_playback->state() == FFmpegMoviePlaybackState::ENDED) {
+				m_good = true;
+			} else {
+				markPlaybackFailed();
+			}
+			break;
+		}
+		if (m_audioSink != nullptr && !m_audioSink->serviceSink()) {
+			markPlaybackFailed();
+			break;
+		}
+		if (m_playback->state() == FFmpegMoviePlaybackState::FAILED) {
+			markPlaybackFailed();
 			break;
 		}
 		if (m_playback->hasCurrentFrame() && m_playback->frameIndex() >= targetFrame) {

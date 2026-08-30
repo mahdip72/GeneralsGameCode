@@ -43,6 +43,7 @@ XAudio2PcmVoice::XAudio2PcmVoice(IXAudio2PcmVoiceBackend &backend) :
 	m_nextCallbackToken(1),
 	m_resetPending(false),
 	m_started(false),
+	m_paused(false),
 	m_backendCreated(false)
 {
 }
@@ -120,6 +121,7 @@ bool XAudio2PcmVoice::open()
 
 	m_backendCreated = true;
 	m_started = false;
+	m_paused = false;
 	m_activeGeneration = m_requestedGeneration;
 	m_resetPending = false;
 	m_failed.store(false, std::memory_order_release);
@@ -276,6 +278,12 @@ void XAudio2PcmVoice::service()
 		m_clockPublicationEnabled.store(true, std::memory_order_release);
 	}
 
+	// Pause/stop is persistent owner intent, including before the first native
+	// submission. Reclaim callbacks and service reset barriers without restarting.
+	if (m_paused) {
+		return;
+	}
+
 	for (;;) {
 		Slot *slot = findNextPendingSlot();
 		if (slot == nullptr) {
@@ -336,6 +344,7 @@ void XAudio2PcmVoice::close() noexcept
 	}
 	m_backendCreated = false;
 	m_started = false;
+	m_paused = false;
 	m_resetPending = false;
 	m_activeGeneration = m_requestedGeneration;
 	m_callbackError.store(false, std::memory_order_release);
@@ -401,6 +410,9 @@ bool XAudio2PcmVoice::setVolume(float volume) noexcept
 		return false;
 	}
 	const HRESULT result = m_backend.setVolume(volume);
+	if (result == E_NOTIMPL) {
+		return false;
+	}
 	if (FAILED(result)) {
 		fail(result);
 		return false;
@@ -440,6 +452,7 @@ bool XAudio2PcmVoice::pause() noexcept
 		return false;
 	}
 	m_started = false;
+	m_paused = true;
 	return true;
 }
 
@@ -456,6 +469,7 @@ bool XAudio2PcmVoice::resume() noexcept
 		return false;
 	}
 	m_started = true;
+	m_paused = false;
 	return true;
 }
 
@@ -472,6 +486,7 @@ bool XAudio2PcmVoice::stop() noexcept
 		return false;
 	}
 	m_started = false;
+	m_paused = true;
 	return true;
 }
 
@@ -561,6 +576,23 @@ AudioPcmSubmitResult XAudio2PcmVoice::submit(AudioPcmChunk &&chunk)
 	slot->cancelled = false;
 	slot->state.store(SlotState::PENDING, std::memory_order_release);
 	return AudioPcmSubmitResult::ACCEPTED;
+}
+
+bool XAudio2PcmVoice::canAccept(std::size_t submissions) const noexcept
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	if (!m_open.load(std::memory_order_acquire)
+		|| m_failed.load(std::memory_order_acquire) || m_resetPending) {
+		return false;
+	}
+	std::size_t freeSlots = 0;
+	for (const Slot &slot : m_slots) {
+		if (slot.state.load(std::memory_order_acquire) == SlotState::FREE
+			&& ++freeSlots >= submissions) {
+			return true;
+		}
+	}
+	return submissions == 0;
 }
 
 void XAudio2PcmVoice::reset(std::uint64_t generation)

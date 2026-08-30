@@ -29,7 +29,8 @@ public:
 	Bool readFile(const AsciiString &fileName, std::vector<std::uint8_t> &bytes,
 		std::string &identity) const override
 	{
-		if (fileName.str() == nullptr || std::string(fileName.str()) != m_name) {
+		if (fileName.str() == nullptr || (std::string(fileName.str()) != m_name
+			&& (m_alias.empty() || std::string(fileName.str()) != m_alias))) {
 			return FALSE;
 		}
 		++m_readCalls;
@@ -38,6 +39,7 @@ public:
 		return TRUE;
 	}
 	UnsignedInt getReadCalls() const { return m_readCalls; }
+	void setAlias(const std::string &alias) { m_alias = alias; }
 	Bool matchesIdentity(const AsciiString &fileName, const void *identity) const override
 	{
 		return fileName.str() != nullptr && std::string(fileName.str()) == m_name
@@ -46,6 +48,7 @@ public:
 
 private:
 	std::string m_name;
+	std::string m_alias;
 	std::vector<std::uint8_t> m_bytes;
 	mutable UnsignedInt m_readCalls = 0;
 };
@@ -351,6 +354,42 @@ int runCatalogTest(int argc, char *argv[])
 		"filesystem source safely rejects corrupt assets");
 
 #if defined(RTS_NATIVE_AUDIO_HAS_FFMPEG_CLI)
+	const std::filesystem::path monoPath = root / "mono.wav";
+	writeWaveFrames(monoPath, 512U, 48000U, 1U);
+	AudioPcmChunk monoReference;
+	check(realSource.decodePcmAt(AsciiString(monoPath.string().c_str()), monoReference, 512U, 0U)
+		&& monoReference.sourceChannels == 1U && monoReference.frameCount == 512U,
+		"mono PCM fallback exposes the original channel provenance");
+	std::unique_ptr<AudioPcmStream> monoStream;
+	AudioPcmChunk monoStreamChunk;
+	check(realSource.openPcmStream(AsciiString(monoPath.string().c_str()), monoStream)
+		&& monoStream->readPcm(monoStreamChunk, 512U)
+		&& monoStreamChunk.sourceChannels == 1U && monoStreamChunk.data == monoReference.data,
+		"legacy asset streams duplicate mono at unity like the PCM fallback");
+	monoStream.reset();
+	MemoryVirtualAudioSource monoArchive("archive\\mono.wav", readBinaryFile(monoPath));
+	FileAudioAssetSource monoSource(AsciiString(root.string().c_str()), &monoArchive);
+	monoSource.setSamplePcmCacheBudget(4096U);
+	for (int playback = 0; playback < 2; ++playback) {
+		check(monoSource.openPcmSampleStream(AsciiString("archive\\mono.wav"), monoStream)
+			&& monoStream->readPcm(monoStreamChunk, 512U)
+			&& monoStreamChunk.sourceChannels == 1U && monoStreamChunk.data == monoReference.data,
+			"archive and cached mono samples retain unity duplication and provenance");
+		monoStream.reset();
+	}
+	check(monoArchive.getReadCalls() == 1U, "mono sample gain is preserved on a real cache hit");
+	const std::filesystem::path monoGenericPath = root / "mono.aiff";
+	check(runFFmpeg(ffmpegExecutable, monoPath, "pcm_s16le", monoGenericPath) == 0,
+		"FFmpeg creates the lossless mono generic-container fixture");
+	check(realSource.decodePcmAt(AsciiString(monoGenericPath.string().c_str()), monoStreamChunk, 512U, 0U)
+		&& monoStreamChunk.sourceChannels == 1U && monoStreamChunk.data == monoReference.data,
+		"loose FFmpeg range decoding matches unity mono PCM fallback levels");
+	MemoryVirtualAudioSource monoGenericArchive("archive\\mono.aiff", readBinaryFile(monoGenericPath));
+	FileAudioAssetSource monoGenericSource(AsciiString(root.string().c_str()), &monoGenericArchive);
+	check(monoGenericSource.decodePcmAt(AsciiString("archive\\mono.aiff"), monoStreamChunk, 512U, 0U)
+		&& monoStreamChunk.sourceChannels == 1U && monoStreamChunk.data == monoReference.data,
+		"archive FFmpeg range decoding matches unity mono PCM fallback levels");
+
 	const std::filesystem::path adpcmPath = root / "adpcm.wav";
 	check(runFFmpeg(ffmpegExecutable, mainPath, "adpcm_ima_wav", adpcmPath) == 0,
 		"FFmpeg creates a deterministic IMA ADPCM fixture");
@@ -365,6 +404,132 @@ int runCatalogTest(int argc, char *argv[])
 		&& adpcmChunk.frameCount == 3U && adpcmChunk.startSample == 7
 		&& adpcmChunk.data.size() == 3U * 2U * sizeof(Short),
 		"archive ADPCM PCM remains bounded 48 kHz stereo s16");
+
+	MemoryVirtualAudioSource cachedArchive("archive\\cached.wav", readBinaryFile(mainPath));
+	cachedArchive.setAlias("archive\\cache-alias.wav");
+	FileAudioAssetSource cachedSource(AsciiString(root.string().c_str()), &cachedArchive);
+	const AsciiString cachedName("archive\\cached.wav");
+	const AsciiString aliasName("archive\\cache-alias.wav");
+	std::unique_ptr<AudioPcmStream> cachedFirst;
+	std::unique_ptr<AudioPcmStream> cachedSecond;
+	check(cachedSource.openPcmSampleStream(cachedName, cachedFirst)
+		&& cachedSource.openPcmSampleStream(cachedName, cachedSecond)
+		&& cachedArchive.getReadCalls() == 2U,
+		"short sample caching is disabled unless its owner opts in");
+	cachedFirst.reset();
+	cachedSecond.reset();
+	constexpr std::size_t shortSampleBytes = 350U * 48U * 4U;
+	cachedSource.setSamplePcmCacheBudget(shortSampleBytes);
+	const UnsignedInt readsBeforeCache = cachedArchive.getReadCalls();
+	check(cachedSource.openPcmSampleStream(cachedName, cachedFirst)
+		&& cachedSource.openPcmSampleStream(cachedName, cachedSecond)
+		&& cachedArchive.getReadCalls() == readsBeforeCache + 1U,
+		"short sample playback reuses decoded PCM without another archive read");
+	AudioPcmChunk cachedFirstChunk;
+	AudioPcmChunk cachedSecondChunk;
+	check(cachedFirst->readPcm(cachedFirstChunk, 7U)
+		&& cachedSecond->readPcm(cachedSecondChunk, 7U)
+		&& cachedFirstChunk.data == cachedSecondChunk.data
+		&& cachedFirstChunk.startSample == 0 && cachedSecondChunk.startSample == 0,
+		"cached playbacks have independent cursors and identical source samples");
+	check(cachedFirst->readPcm(cachedFirstChunk, 7U) && cachedFirstChunk.startSample == 7,
+		"one cached playback advances without changing another playback");
+	std::unique_ptr<AudioPcmStream> uncachedSpeech;
+	check(cachedSource.openPcmStream(cachedName, uncachedSpeech)
+		&& cachedArchive.getReadCalls() == readsBeforeCache + 2U,
+		"the music and speech stream entrypoint bypasses the sample cache");
+	uncachedSpeech.reset();
+	cachedSource.invalidateSamplePcmCache();
+	const UnsignedInt readsBeforePinned = cachedArchive.getReadCalls();
+	std::unique_ptr<AudioPcmStream> pinnedFallback;
+	check(cachedSource.openPcmSampleStream(aliasName, pinnedFallback),
+		"an old-generation pinned sample does not block uncached playback");
+	pinnedFallback.reset();
+	check(cachedSource.openPcmSampleStream(aliasName, pinnedFallback)
+		&& cachedArchive.getReadCalls() == readsBeforePinned + 2U,
+		"invalidated but live PCM keeps its budget charge and cannot grow the cache");
+	pinnedFallback.reset();
+	check(cachedSecond->readPcm(cachedSecondChunk, 7U) && cachedSecondChunk.startSample == 7,
+		"invalidation leaves an active immutable sample and cursor valid");
+	cachedFirst.reset();
+	cachedSecond.reset();
+	const UnsignedInt readsAfterUnpin = cachedArchive.getReadCalls();
+	check(cachedSource.openPcmSampleStream(aliasName, cachedFirst),
+		"released pinned PCM returns its byte budget");
+	cachedFirst.reset();
+	check(cachedSource.openPcmSampleStream(aliasName, cachedFirst)
+		&& cachedArchive.getReadCalls() == readsAfterUnpin + 1U,
+		"a newly available budget caches the replacement sample");
+	cachedFirst.reset();
+	const UnsignedInt readsBeforeEviction = cachedArchive.getReadCalls();
+	check(cachedSource.openPcmSampleStream(cachedName, cachedFirst),
+		"an unpinned least-recent sample can be evicted for a new sound");
+	cachedFirst.reset();
+	check(cachedSource.openPcmSampleStream(aliasName, cachedFirst)
+		&& cachedArchive.getReadCalls() == readsBeforeEviction + 2U,
+		"evicted entries are decoded again instead of exceeding the one-sample budget");
+	cachedFirst.reset();
+	MemoryVirtualAudioSource replacementArchive("archive\\cached.wav", readBinaryFile(decayPath));
+	cachedSource.setVirtualFileSource(&replacementArchive);
+	check(cachedSource.openPcmSampleStream(cachedName, cachedFirst)
+		&& cachedFirst->durationMS() == 75.0f && replacementArchive.getReadCalls() == 1U,
+		"replacing the virtual source invalidates cached PCM from the previous generation");
+	cachedFirst.reset();
+	cachedSource.setSamplePcmCacheBudget(0);
+	check(cachedSource.openPcmSampleStream(cachedName, cachedFirst)
+		&& cachedSource.openPcmSampleStream(cachedName, cachedSecond)
+		&& replacementArchive.getReadCalls() == 3U,
+		"disabling the cache releases reusable entries and restores sequential playback");
+	cachedFirst.reset();
+	cachedSecond.reset();
+
+	FileAudioAssetSource looseCachedSource;
+	looseCachedSource.setSamplePcmCacheBudget(192000U);
+	const std::filesystem::path looseCachedPath = root / "cached_loose.wav";
+	writeWaveFile(looseCachedPath, 125U);
+	const AsciiString looseCachedName(looseCachedPath.string().c_str());
+	check(looseCachedSource.openPcmSampleStream(looseCachedName, cachedFirst)
+		&& cachedFirst->durationMS() == 125.0f, "a loose short sample is cacheable");
+	writeWaveFile(looseCachedPath, 75U);
+	check(looseCachedSource.openPcmSampleStream(looseCachedName, cachedSecond)
+		&& cachedSecond->durationMS() == 75.0f && cachedFirst->durationMS() == 125.0f,
+		"loose file metadata invalidates a changed asset without mutating active PCM");
+	cachedFirst.reset();
+	cachedSecond.reset();
+	MemoryVirtualAudioSource overrideArchive("archive\\override.wav", readBinaryFile(mainPath));
+	FileAudioAssetSource overrideSource(AsciiString(root.string().c_str()), &overrideArchive);
+	overrideSource.setSamplePcmCacheBudget(192000U);
+	const AsciiString overrideName("archive\\override.wav");
+	check(overrideSource.openPcmSampleStream(overrideName, cachedFirst)
+		&& cachedFirst->durationMS() == 350.0f && overrideArchive.getReadCalls() == 1U,
+		"archive PCM is cached before a matching loose override exists");
+	std::filesystem::create_directories(root / "archive");
+	writeWaveFile(root / "archive" / "override.wav", 75U);
+	check(overrideSource.openPcmSampleStream(overrideName, cachedSecond)
+		&& cachedSecond->durationMS() == 75.0f && cachedFirst->durationMS() == 350.0f
+		&& overrideArchive.getReadCalls() == 1U,
+		"new loose overrides invalidate virtual cache hits while active archive PCM stays immutable");
+	cachedFirst.reset();
+	cachedSecond.reset();
+#if defined(RTS_NATIVE_AUDIO_ASSET_SOURCE_TEST_HOOK)
+	cachedSource.setVirtualFileSource(&cachedArchive);
+	cachedSource.setSamplePcmCacheBudget(192000U);
+	NativeAudioAssetSourceTestHook::failFFmpegReadFrameAfter(1U);
+	check(cachedSource.openPcmSampleStream(cachedName, cachedFirst),
+		"a failed cache fill falls back to a fresh ordinary decoder");
+	AudioPcmChunk failedCacheChunk;
+	check(!cachedFirst->readPcm(failedCacheChunk, 48000U) && !cachedFirst->isEnded(),
+		"a cache-fill decode failure is not published as truncated PCM or clean EOF");
+	NativeAudioAssetSourceTestHook::clearFFmpegReadFrameFailure();
+	cachedFirst.reset();
+	const UnsignedInt readsAfterCacheFailure = cachedArchive.getReadCalls();
+	check(cachedSource.openPcmSampleStream(cachedName, cachedFirst)
+		&& cachedSource.openPcmSampleStream(cachedName, cachedSecond)
+		&& cachedArchive.getReadCalls() == readsAfterCacheFailure + 1U,
+		"a failed cache fill does not poison subsequent complete sample reuse");
+	cachedFirst.reset();
+	cachedSecond.reset();
+#endif
 
 	const std::filesystem::path genericPath = root / "main.aiff";
 	check(runFFmpeg(ffmpegExecutable, mainPath, "pcm_s16le", genericPath) == 0,
@@ -400,6 +565,15 @@ int runCatalogTest(int argc, char *argv[])
 	const std::filesystem::path longPath = root / "long.wav";
 	const std::filesystem::path longAdpcmPath = root / "long_adpcm.wav";
 	writeWaveFile(longPath, 5000U);
+	MemoryVirtualAudioSource uncachedLongArchive("archive\\long-cache-bypass.wav", readBinaryFile(longPath));
+	FileAudioAssetSource uncachedLongSource(AsciiString(root.string().c_str()), &uncachedLongArchive);
+	uncachedLongSource.setSamplePcmCacheBudget(1920000U);
+	check(uncachedLongSource.openPcmSampleStream(AsciiString("archive\\long-cache-bypass.wav"), cachedFirst)
+		&& uncachedLongSource.openPcmSampleStream(AsciiString("archive\\long-cache-bypass.wav"), cachedSecond)
+		&& uncachedLongArchive.getReadCalls() == 2U,
+		"long sound effects remain sequential streams even when the cache budget could hold them");
+	cachedFirst.reset();
+	cachedSecond.reset();
 	check(runFFmpeg(ffmpegExecutable, longPath, "adpcm_ima_wav", longAdpcmPath) == 0,
 		"FFmpeg creates the persistent-stream ADPCM fixture");
 	std::unique_ptr<AudioPcmStream> looseStream;

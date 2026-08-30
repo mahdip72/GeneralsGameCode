@@ -51,14 +51,17 @@ public:
 	void setGain(double gain);
 	FFmpegMoviePlaybackMode mode() const { return m_mode; }
 
-	// Decode at most maxDecodeCalls. Every call consumes input; no sink drop is retried.
-	bool pump(std::size_t maxDecodeCalls = 64);
+	// Advance at most maxDecodeSteps. Every step is bounded; no sink drop is retried.
+	bool pump(std::size_t maxDecodeSteps = 64);
 	// Finish a non-looping generation, including decoder/resampler EOF drain.
 	bool finish(std::size_t maxPumpCalls = 256);
 	bool seekFrame(Int frameIndex);
 
 	FFmpegMoviePlaybackState state() const { return m_state; }
 	bool isTerminal() const;
+	// Force a terminal failure from the stream owner after an audio/device
+	// service error. This keeps teardown from waiting on an unobservable drain.
+	void failPlayback();
 	bool isFrameReady() const;
 	bool hasCurrentFrame() const { return m_currentFrame != nullptr; }
 	const AVFrame *currentFrame() const { return m_currentFrame; }
@@ -85,6 +88,9 @@ private:
 	void handleFrame(const AVFrame *frame, const FFmpegFrameMetadata &metadata);
 	bool handleEndOfInput();
 	bool completeDrain();
+	void beginDrainWatchdog();
+	void clearDrainWatchdog();
+	bool drainWatchdogExpired();
 	bool resetGeneration(std::uint64_t generation);
 	bool setFailed(bool resetAudio = true);
 	void clearCurrentFrame();
@@ -114,10 +120,16 @@ private:
 	std::int64_t m_clockBaseUs;
 	std::int64_t m_audioBaseSample;
 	std::int64_t m_videoPresentationTimeUs;
+	std::int64_t m_videoTimelineOriginUs;
 	std::int64_t m_seekTargetUs;
+	std::int64_t m_videoTimelineBaseUs;
+	std::int64_t m_drainWatchdogStartUs;
+	std::int64_t m_drainWatchdogProgressSample;
 	bool m_clockRebased;
 	bool m_audioClockRebased;
 	bool m_videoGateActive;
 	bool m_audioGateActive;
 	bool m_newVideoFrame;
+	bool m_drainWatchdogActive;
+	bool m_drainWatchdogHasProgress;
 };

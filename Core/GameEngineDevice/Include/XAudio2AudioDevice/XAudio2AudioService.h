@@ -88,6 +88,7 @@ public:
 	XAudio2PcmVoiceHandle createVoice() noexcept;
 	bool destroyVoice(XAudio2PcmVoiceHandle handle) noexcept;
 	AudioPcmSubmitResult submit(XAudio2PcmVoiceHandle handle, AudioPcmChunk &&chunk) noexcept;
+	bool canVoiceAccept(XAudio2PcmVoiceHandle handle, std::size_t submissions) const noexcept;
 	bool resetVoice(XAudio2PcmVoiceHandle handle, std::uint64_t generation) noexcept;
 	bool serviceVoice(XAudio2PcmVoiceHandle handle) noexcept;
 	bool setVoiceVolume(XAudio2PcmVoiceHandle handle, float volume) noexcept;

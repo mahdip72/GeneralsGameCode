@@ -19,7 +19,9 @@ public:
 	// Frames producing more than one second of PCM are rejected terminally; callers reset rather than silently skipping audio.
 	static constexpr std::uint32_t MAX_CHUNK_FRAMES = OUTPUT_SAMPLE_RATE;
 
-	FFmpegAudioDecoder();
+	enum class MonoMix { DefaultMix, UnityDuplicate };
+	// Movies retain FFmpeg's default mix; legacy audio assets request unity mono duplication.
+	explicit FFmpegAudioDecoder(MonoMix monoMix = MonoMix::DefaultMix);
 	~FFmpegAudioDecoder();
 
 	FFmpegAudioDecoder(const FFmpegAudioDecoder &) = delete;
@@ -39,6 +41,7 @@ private:
 		std::int64_t start_sample, bool discontinuity, AudioPcmSink &sink);
 	void releaseContext();
 
+	const MonoMix m_monoMix;
 	SwrContext *m_context;
 	int m_inputSampleRate;
 	int m_inputSampleFormat;

@@ -643,8 +643,12 @@ void PlayMovieAndBlock(AsciiString movieTitle)
 
 	GameWindow *movieWindow = s_blankLayout->getFirstWindow();
 	TheWritableGlobalData->m_loadScreenRender = TRUE;
-	while (videoStream->frameIndex() < videoStream->frameCount() - 1
-		&& !videoStream->isFinished())
+	const Int movieFrameCount = videoStream->frameCount();
+	const Bool hasKnownFrameCount = movieFrameCount > 0;
+	Bool movieAborted = FALSE;
+	while ((!hasKnownFrameCount || videoStream->frameIndex() < movieFrameCount - 1)
+		&& !videoStream->isFinished()
+		&& !videoStream->isPlaybackFailed())
 	{
 		// TheSuperHackers @feature User can now skip video by pressing ESC
 		if (TheKeyboard)
@@ -654,6 +658,7 @@ void PlayMovieAndBlock(AsciiString movieTitle)
 			if (io && BitIsSet(io->state, KEY_STATE_DOWN))
 			{
 				io->setUsed();
+				movieAborted = TRUE;
 				break;
 			}
 		}
@@ -663,7 +668,7 @@ void PlayMovieAndBlock(AsciiString movieTitle)
 		if(!videoStream->isFrameReady())
 		{
 			videoStream->update();
-			if (videoStream->isFinished())
+			if (videoStream->isPlaybackFailed() || videoStream->isFinished())
 			{
 				break;
 			}
@@ -681,6 +686,93 @@ void PlayMovieAndBlock(AsciiString movieTitle)
 		//TheWindowManager->update();
 
 		TheDisplay->draw();
+	}
+	const Bool finalFrameReached = hasKnownFrameCount
+		? videoStream->frameIndex() >= movieFrameCount - 1
+		: videoStream->isFinished();
+	if (!movieAborted && !videoStream->isPlaybackFailed() && finalFrameReached) {
+		Bool finalFrameReady = FALSE;
+		TheGameEngine->serviceWindowsOS();
+		if (TheKeyboard) {
+			TheKeyboard->UPDATE();
+			KeyboardIO *io = TheKeyboard->findKey(KEY_ESC, KeyboardIO::STATUS_UNUSED);
+			if (io && BitIsSet(io->state, KEY_STATE_DOWN)) {
+				io->setUsed();
+				movieAborted = TRUE;
+			}
+		}
+		if (!movieAborted) {
+			finalFrameReady = videoStream->isFrameReady();
+		}
+		enum { MAX_FINAL_FRAME_READY_ATTEMPTS = 10000 };
+		for (Int attempt = 0;
+			!finalFrameReady && !videoStream->isPlaybackFailed()
+				&& attempt < MAX_FINAL_FRAME_READY_ATTEMPTS;
+			++attempt) {
+			if (TheKeyboard) {
+				TheKeyboard->UPDATE();
+				KeyboardIO *io = TheKeyboard->findKey(KEY_ESC, KeyboardIO::STATUS_UNUSED);
+				if (io && BitIsSet(io->state, KEY_STATE_DOWN)) {
+					io->setUsed();
+					movieAborted = TRUE;
+					break;
+				}
+			}
+			TheGameEngine->serviceWindowsOS();
+			// Bink reports finished when the final index is selected, but its
+			// BinkWait gate can still leave that frame unready. Always update
+			// before considering the terminal state, and never decode until the
+			// readiness contract succeeds. Native streams retain their frame.
+			videoStream->update();
+			if (videoStream->isPlaybackFailed()) {
+				break;
+			}
+			if (TheKeyboard) {
+				TheKeyboard->UPDATE();
+				KeyboardIO *io = TheKeyboard->findKey(KEY_ESC, KeyboardIO::STATUS_UNUSED);
+				if (io && BitIsSet(io->state, KEY_STATE_DOWN)) {
+					io->setUsed();
+					movieAborted = TRUE;
+					break;
+				}
+			}
+			finalFrameReady = videoStream->isFrameReady();
+			if (!finalFrameReady && videoStream->isFinished()) {
+				Sleep(1);
+				continue;
+			}
+			if (!finalFrameReady) {
+				Sleep(1);
+			}
+		}
+		if (!movieAborted && !videoStream->isPlaybackFailed() && finalFrameReady) {
+			videoStream->frameDecompress();
+			videoStream->frameRender(videoBuffer);
+			if (videoBuffer) {
+				movieWindow->winGetInstanceData()->setVideoBuffer(videoBuffer);
+			}
+			TheDisplay->draw();
+		}
+		enum { MAX_FINISH_PLAYBACK_ATTEMPTS = 10000 };
+		if (!movieAborted && !videoStream->isPlaybackFailed() && finalFrameReady) {
+			for (Int attempt = 0;
+				attempt < MAX_FINISH_PLAYBACK_ATTEMPTS && !videoStream->isPlaybackFailed();
+				++attempt) {
+				if (videoStream->finishPlayback()) {
+					break;
+				}
+				TheGameEngine->serviceWindowsOS();
+				if (TheKeyboard) {
+					TheKeyboard->UPDATE();
+					KeyboardIO *io = TheKeyboard->findKey(KEY_ESC, KeyboardIO::STATUS_UNUSED);
+					if (io && BitIsSet(io->state, KEY_STATE_DOWN)) {
+						io->setUsed();
+						break;
+					}
+				}
+				Sleep(1);
+			}
+		}
 	}
 	TheWritableGlobalData->m_loadScreenRender = FALSE;
 	movieWindow->winGetInstanceData()->setVideoBuffer(nullptr);

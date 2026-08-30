@@ -171,10 +171,23 @@ int main(int argc, char **argv)
 			std::fputs("Decoder did not exercise the custom seek path.\n", stderr);
 			return 1;
 		}
-		decodeCalls = 0;
-		while (decoder.decodePacket()) {
-			if (++decodeCalls > 1024) {
-				std::fputs("Decoder failed to reach EOF after a non-keyframe seek.\n", stderr);
+		Int decodeSteps = 0;
+		for (;;) {
+			const Int framesBeforeStep = state.videoFrames;
+			const FFmpegDecodeStepResult result = decoder.decodeStep();
+			if (state.videoFrames - framesBeforeStep > 1) {
+				std::fputs("A bounded decoder step delivered more than one frame.\n", stderr);
+				return 1;
+			}
+			if (result == FFmpegDecodeStepResult::FAILED) {
+				std::fputs("Decoder failed after a non-keyframe seek.\n", stderr);
+				return 1;
+			}
+			if (result == FFmpegDecodeStepResult::END_OF_INPUT) {
+				break;
+			}
+			if (++decodeSteps > 4096) {
+				std::fputs("Decoder steps failed to reach EOF after a non-keyframe seek.\n", stderr);
 				return 1;
 			}
 		}

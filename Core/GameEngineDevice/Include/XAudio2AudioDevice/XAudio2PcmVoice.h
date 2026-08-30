@@ -86,6 +86,7 @@ public:
 	void failFromService(HRESULT error) noexcept;
 
 	AudioPcmSubmitResult submit(AudioPcmChunk &&chunk) override;
+	bool canAccept(std::size_t submissions) const noexcept override;
 	void reset(std::uint64_t generation) override;
 	bool getPlayedSample(std::int64_t &sample) const noexcept override;
 	bool tryPopCompletion(XAudio2PcmCompletionRecord &completion) noexcept;
@@ -163,5 +164,6 @@ private:
 	std::uint64_t m_nextCallbackToken;
 	bool m_resetPending;
 	bool m_started;
+	bool m_paused;
 	bool m_backendCreated;
 };

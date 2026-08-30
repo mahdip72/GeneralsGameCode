@@ -81,6 +81,14 @@ public:
 
 using FFmpegFrameCallback = std::function<void(const AVFrame *, const FFmpegFrameMetadata &, void *)>;
 
+enum class FFmpegDecodeStepResult : std::uint8_t
+{
+	PROGRESSED,
+	FRAME_READY,
+	END_OF_INPUT,
+	FAILED,
+};
+
 class FFmpegFile
 {
 public:
@@ -96,7 +104,9 @@ public:
 	void close();
 	void setFrameCallback(FFmpegFrameCallback callback) { m_frameCallback = callback; }
 	void setUserData(void *user_data) { m_userData = user_data; }
-	// Read & decode a packet from the container. Note that we could/should split this step
+	// Advance one bounded demux/decode state transition.
+	FFmpegDecodeStepResult decodeStep();
+	// Compatibility wrapper: run bounded steps until one frame is ready or decoding ends.
 	Bool decodePacket();
 	Bool seekFrame(int frame_idx);
 	Bool isAtEnd() const { return m_atEnd; }
@@ -117,6 +127,9 @@ public:
 	Int getPixelFormat() const;
 	UnsignedInt getFrameTime() const;
 	FFmpegFrameRate getVideoFrameRate() const;
+	// Presentation timestamp of the first video frame, in microseconds.  A
+	// missing container start time safely falls back to the zero timeline.
+	Int64 getVideoStartTimeMicroseconds() const;
 
 private:
 	struct FFmpegStream
@@ -145,6 +158,7 @@ private:
 	static Int64 seekPacket(void *opaque, Int64 offset, Int whence);
 	ReceiveResult receiveFrame(FFmpegStream &stream);
 	const FFmpegStream *findMatch(int type) const;
+	Int64 getVideoStartTimestamp() const;
 
 	FFmpegFrameCallback 		m_frameCallback = nullptr; ///< Callback for frame processing
 	AVFormatContext 			*m_fmtCtx = nullptr; ///< Format context for AVFormat

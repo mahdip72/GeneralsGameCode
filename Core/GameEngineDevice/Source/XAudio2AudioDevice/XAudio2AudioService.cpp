@@ -3,6 +3,7 @@
 #include "XAudio2AudioDevice/XAudio2NativeAudioEngine.h"
 #include "XAudio2AudioDevice/XAudio2PcmVoice.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <new>
@@ -20,6 +21,45 @@ bool isFinitePose(const XAudio2SpatializationPose &pose) noexcept
 	for (float value : pose.front) if (!std::isfinite(value)) return false;
 	for (float value : pose.top) if (!std::isfinite(value)) return false;
 	return true;
+}
+
+void makeLegacyStereoPointMatrix(const XAudio2SpatializationPose &listener,
+	const XAudio2SpatializationPose &emitter, float *matrix) noexcept
+{
+	// Miles Fast 2D uses the full 3D direction, an angle-linear stereo split,
+	// and .75 rear gain. Keep its distance/volume law in the audio manager.
+	double direction[3];
+	double distanceSquared = 0.0;
+	for (int component = 0; component < 3; ++component) {
+		direction[component] = static_cast<double>(emitter.position[component])
+			- listener.position[component];
+		distanceSquared += direction[component] * direction[component];
+	}
+	const double distance = std::sqrt(distanceSquared);
+	if (distance > 0.0) {
+		for (double &component : direction) component /= distance;
+	} else {
+		// This is the provider's zero-direction fallback; near positions pan center.
+		direction[0] = 1.0;
+		direction[1] = direction[2] = 0.0;
+	}
+	double frontDot = 0.0;
+	double rightDot = 0.0;
+	for (int component = 0; component < 3; ++component) {
+		const int next = (component + 1) % 3;
+		const int last = (component + 2) % 3;
+		const double right = static_cast<double>(listener.top[next]) * listener.front[last]
+			- static_cast<double>(listener.top[last]) * listener.front[next];
+		frontDot += direction[component] * listener.front[component];
+		rightDot += direction[component] * right;
+	}
+	constexpr double pi = 3.14159265358979323846;
+	const double pan = distance > 0.0001f
+		? std::acos(std::clamp(rightDot, -1.0, 1.0)) / pi : 0.5;
+	const double rearGain = frontDot < 0.0 ? 0.75 : 1.0;
+	// Destination-major matrix; existing mono expansion normalization halves it.
+	matrix[0] = matrix[1] = static_cast<float>(pan * rearGain);
+	matrix[2] = matrix[3] = static_cast<float>((1.0 - pan) * rearGain);
 }
 }
 
@@ -458,6 +498,15 @@ AudioPcmSubmitResult XAudio2AudioService::submit(XAudio2PcmVoiceHandle handle, A
 	return result;
 }
 
+bool XAudio2AudioService::canVoiceAccept(XAudio2PcmVoiceHandle handle,
+	std::size_t submissions) const noexcept
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	return m_state.load(std::memory_order_acquire) == XAudio2AudioServiceState::RUNNING
+		&& !m_failurePublication.hasFailure() && isHandleOwnedLocked(handle)
+		&& m_voices[handle.index].voice->canAccept(submissions);
+}
+
 bool XAudio2AudioService::resetVoice(XAudio2PcmVoiceHandle handle, std::uint64_t generation) noexcept
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
@@ -544,11 +593,16 @@ bool XAudio2AudioService::setVoiceSpatialization(XAudio2PcmVoiceHandle handle,
 	settings.SrcChannelCount = 2;
 	settings.DstChannelCount = m_outputDetails.channelCount;
 	settings.pMatrixCoefficients = matrix.data();
-	X3DAudioCalculate(m_x3dHandle, &listener, &emitter,
-		X3DAUDIO_CALCULATE_MATRIX, &settings);
+	const bool normalizeExpandedMono = m_voices[handle.index].monoExpandedToStereo;
+	if (normalizeExpandedMono && m_outputDetails.channelCount == 2
+		&& m_outputDetails.channelMask == SPEAKER_STEREO) {
+		makeLegacyStereoPointMatrix(listenerPose, emitterPose, matrix.data());
+	} else {
+		X3DAudioCalculate(m_x3dHandle, &listener, &emitter,
+			X3DAUDIO_CALCULATE_MATRIX, &settings);
+	}
 	const std::size_t coefficientCount = static_cast<std::size_t>(settings.SrcChannelCount)
 		* settings.DstChannelCount;
-	const bool normalizeExpandedMono = m_voices[handle.index].monoExpandedToStereo;
 	for (std::size_t index = 0; index < coefficientCount; ++index) {
 		if (!std::isfinite(matrix[index])) {
 			return false;

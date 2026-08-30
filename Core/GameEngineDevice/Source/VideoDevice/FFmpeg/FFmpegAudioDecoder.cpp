@@ -16,7 +16,8 @@ namespace
 constexpr std::int64_t TIMESTAMP_TOLERANCE_SAMPLES = 1;
 }
 
-FFmpegAudioDecoder::FFmpegAudioDecoder() :
+FFmpegAudioDecoder::FFmpegAudioDecoder(MonoMix monoMix) :
+	m_monoMix(monoMix),
 	m_context(nullptr),
 	m_inputSampleRate(0),
 	m_inputSampleFormat(AV_SAMPLE_FMT_NONE),
@@ -70,7 +71,11 @@ bool FFmpegAudioDecoder::configure(const AVFrame *frame, AudioPcmSink &sink)
 		frame->sample_rate,
 		0,
 		nullptr);
-	if (result < 0 || m_context == nullptr || swr_init(m_context) < 0
+	const double monoMatrix[] = { 1.0, 1.0 };
+	if (result < 0 || m_context == nullptr
+		|| (m_monoMix == MonoMix::UnityDuplicate && frame->ch_layout.nb_channels == 1
+			&& swr_set_matrix(m_context, monoMatrix, 1) < 0)
+		|| swr_init(m_context) < 0
 		|| av_channel_layout_copy(&m_inputChannelLayout, &frame->ch_layout) < 0) {
 		releaseContext();
 		return false;

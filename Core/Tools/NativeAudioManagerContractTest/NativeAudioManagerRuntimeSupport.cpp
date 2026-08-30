@@ -11,6 +11,9 @@
 
 AudioManager *TheAudio = nullptr;
 Bool g_nativeAudioShroudedForTest = FALSE;
+Bool g_nativeAudioDeadObjectForTest = FALSE;
+Bool g_nativeAudioNullPositionForTest = FALSE;
+Coord3D g_nativeAudioObjectPositionForTest = { 0.0f, 0.0f, 0.0f };
 Bool isAudioEventShroudedForLocalPlayer(const Coord3D *)
 {
 	return g_nativeAudioShroudedForTest;
@@ -76,6 +79,7 @@ AudioEventRTS::AudioEventRTS() :
 	m_priority(AP_NORMAL),
 	m_volume(-1.0f),
 	m_timeOfDay(TIME_OF_DAY_AFTERNOON),
+	m_objectID(INVALID_ID),
 	m_ownerType(OT_INVALID),
 	m_shouldFade(FALSE),
 	m_isLogicalAudio(FALSE),
@@ -147,8 +151,15 @@ Real AudioEventRTS::getDelay() const { return m_delay; }
 void AudioEventRTS::decrementDelay(Real amount) { m_delay -= amount; }
 PortionToPlay AudioEventRTS::getNextPlayPortion() const { return m_portionToPlayNext; }
 void AudioEventRTS::setNextPlayPortion(PortionToPlay portion) { m_portionToPlayNext = portion; }
-void AudioEventRTS::decreaseLoopCount() { if (m_loopCount > 0) --m_loopCount; }
-Bool AudioEventRTS::hasMoreLoops() const { return m_loopCount != 0; }
+void AudioEventRTS::decreaseLoopCount()
+{
+	if (m_loopCount == 1) {
+		m_loopCount = -1;
+	} else if (m_loopCount > 1) {
+		--m_loopCount;
+	}
+}
+Bool AudioEventRTS::hasMoreLoops() const { return m_loopCount >= 0; }
 void AudioEventRTS::setAudioEventInfo(const AudioEventInfo *info) const { m_eventInfo = info; }
 const AudioEventInfo *AudioEventRTS::getAudioEventInfo() const { return m_eventInfo; }
 void AudioEventRTS::setPlayingHandle(AudioHandle handle) { m_playingHandle = handle; }
@@ -156,23 +167,56 @@ AudioHandle AudioEventRTS::getPlayingHandle() { return m_playingHandle; }
 void AudioEventRTS::setHandleToKill(AudioHandle handle) { m_killThisHandle = handle; }
 AudioHandle AudioEventRTS::getHandleToKill() const { return m_killThisHandle; }
 Bool AudioEventRTS::getIsLogicalAudio() const { return m_isLogicalAudio; }
-void AudioEventRTS::setObjectID(ObjectID objectID) { m_objectID = objectID; m_ownerType = OT_Object; }
-ObjectID AudioEventRTS::getObjectID() { return m_objectID; }
+void AudioEventRTS::setObjectID(ObjectID objectID)
+{
+	if (m_ownerType == OT_Object || m_ownerType == OT_INVALID) {
+		m_objectID = objectID;
+		m_ownerType = OT_Object;
+	}
+}
+ObjectID AudioEventRTS::getObjectID() { return m_ownerType == OT_Object ? m_objectID : INVALID_ID; }
 void AudioEventRTS::setPosition(const Coord3D *position)
 {
-	if (position != nullptr) {
+	if (position != nullptr && (m_ownerType == OT_Positional || m_ownerType == OT_INVALID)) {
 		m_positionOfAudio = *position;
 		m_ownerType = OT_Positional;
 	}
 }
-const Coord3D *AudioEventRTS::getPosition() { return &m_positionOfAudio; }
-Bool AudioEventRTS::isPositionalAudio() const { return m_ownerType == OT_Positional || m_ownerType == OT_Object || m_ownerType == OT_Drawable; }
+const Coord3D *AudioEventRTS::getPosition() { return m_ownerType == OT_INVALID ? nullptr : &m_positionOfAudio; }
+Bool AudioEventRTS::isPositionalAudio() const
+{
+	if (m_eventInfo != nullptr && !BitIsSet(m_eventInfo->m_type, ST_WORLD)) {
+		return FALSE;
+	}
+	return m_ownerType != OT_INVALID
+		&& (m_ownerType == OT_Positional || m_objectID != INVALID_ID);
+}
 Bool AudioEventRTS::isCurrentlyPlaying() const { return FALSE; }
 AudioPriority AudioEventRTS::getAudioPriority() const { return m_priority; }
 void AudioEventRTS::setAudioPriority(AudioPriority priority) { m_priority = priority; }
 Real AudioEventRTS::getVolume() const { return m_volume < 0.0f && m_eventInfo != nullptr ? m_eventInfo->m_volume : m_volume; }
 void AudioEventRTS::setVolume(Real volume) { m_volume = volume; }
-const Coord3D *AudioEventRTS::getCurrentPosition() { return &m_positionOfAudio; }
+const Coord3D *AudioEventRTS::getCurrentPosition()
+{
+	if (g_nativeAudioNullPositionForTest) {
+		return nullptr;
+	}
+	switch (m_ownerType) {
+		case OT_Object:
+		case OT_Drawable:
+			if (g_nativeAudioDeadObjectForTest) {
+				m_ownerType = OT_Dead;
+			} else {
+				m_positionOfAudio = g_nativeAudioObjectPositionForTest;
+			}
+			return &m_positionOfAudio;
+		case OT_Positional:
+		case OT_Dead:
+			return &m_positionOfAudio;
+		default:
+			return nullptr;
+	}
+}
 Int AudioEventRTS::getPlayerIndex() const { return m_playerIndex; }
 void AudioEventRTS::setPlayerIndex(Int index) { m_playerIndex = index; }
 
@@ -182,13 +226,16 @@ AudioEventInfo::~AudioEventInfo() = default;
 void AudioEventRTS::generateFilename()
 {
 	if (m_eventInfo != nullptr) {
-		if (!m_eventInfo->m_filename.isEmpty()
-			&& (m_eventInfo->m_soundType == AT_Music || m_eventInfo->m_soundType == AT_Streaming)) {
+		// Fixtures supply resolved paths, but the source field must match the
+		// production event type: streams never fall back to the sample list.
+		if (m_eventInfo->m_soundType == AT_Music || m_eventInfo->m_soundType == AT_Streaming) {
 			m_filenameToLoad = m_eventInfo->m_filename;
 		} else if (!m_eventInfo->m_sounds.empty()) {
 			m_playingAudioIndex = (m_playingAudioIndex + 1)
 				% static_cast<Int>(m_eventInfo->m_sounds.size());
 			m_filenameToLoad = m_eventInfo->m_sounds[m_playingAudioIndex];
+		} else {
+			m_filenameToLoad = AsciiString::TheEmptyString;
 		}
 	}
 }
@@ -310,6 +357,7 @@ void AudioManager::setVolume(Real volume, AudioAffect which)
 		else m_scriptSpeechVolume = volume;
 		m_speechVolume = m_scriptSpeechVolume * m_systemSpeechVolume;
 	}
+	m_volumeHasChanged = TRUE;
 }
 
 Real AudioManager::getVolume(AudioAffect which)

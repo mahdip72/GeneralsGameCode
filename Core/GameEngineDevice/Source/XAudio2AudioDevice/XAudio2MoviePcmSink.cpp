@@ -20,6 +20,13 @@ bool XAudio2MoviePcmSink::isReady() const noexcept
 		&& m_service->isVoiceOpen(m_handle) && !m_service->isVoiceFailed(m_handle);
 }
 
+bool XAudio2MoviePcmSink::canAccept(std::size_t submissions) const noexcept
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	return !m_closed && m_service != nullptr && m_handle.isValid()
+		&& m_service->canVoiceAccept(m_handle, submissions);
+}
+
 AudioPcmSubmitResult XAudio2MoviePcmSink::submit(AudioPcmChunk &&chunk)
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
@@ -75,6 +82,15 @@ bool XAudio2MoviePcmSink::service() noexcept
 	}
 	m_service->discardCompletions();
 	return !m_service->isVoiceFailed(m_handle);
+}
+
+bool XAudio2MoviePcmSink::setOutputGain(double gain) noexcept
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	if (m_closed || m_service == nullptr || !m_handle.isValid()) {
+		return false;
+	}
+	return m_service->setVoiceVolume(m_handle, static_cast<float>(gain));
 }
 
 void XAudio2MoviePcmSink::close() noexcept

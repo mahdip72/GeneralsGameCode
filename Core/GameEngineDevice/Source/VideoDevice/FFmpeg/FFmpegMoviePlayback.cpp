@@ -19,6 +19,7 @@ namespace
 {
 constexpr std::int64_t INVALID_TIMESTAMP = (std::numeric_limits<std::int64_t>::min)();
 constexpr std::int64_t MICROSECONDS_PER_SECOND = 1000000;
+constexpr std::int64_t DRAIN_NO_PROGRESS_TIMEOUT_US = 10 * MICROSECONDS_PER_SECOND;
 
 bool validTimeBase(const FFmpegFrameMetadata &metadata)
 {
@@ -74,13 +75,27 @@ private:
 class FFmpegMoviePlayback::GainSink final : public AudioPcmSink
 {
 public:
-	GainSink(AudioPcmSink &sink, double gain) : m_sink(sink), m_gain(std::max(0.0, gain)) {}
-	void setGain(double gain) { m_gain = std::max(0.0, gain); }
+	GainSink(AudioPcmSink &sink, double gain) : m_sink(sink), m_gain(1.0) { setGain(gain); }
+	void setGain(double gain)
+	{
+		gain = std::max(0.0, gain);
+		m_gain = m_sink.setOutputGain(gain) ? 1.0 : gain;
+	}
+
+	bool canAccept(std::size_t submissions) const noexcept override
+	{
+		return m_sink.canAccept(submissions);
+	}
 
 	AudioPcmSubmitResult submit(AudioPcmChunk &&chunk) override
 	{
-		if (chunk.data.size() % sizeof(std::int16_t) != 0) {
-			return AudioPcmSubmitResult::DROPPED;
+		if (chunk.frameCount == 0 || chunk.frameCount > FFmpegAudioDecoder::MAX_CHUNK_FRAMES
+			|| chunk.channels != FFmpegAudioDecoder::OUTPUT_CHANNELS
+			|| chunk.sampleRate != FFmpegAudioDecoder::OUTPUT_SAMPLE_RATE
+			|| chunk.format != AudioPcmFormat::SIGNED_16_INTERLEAVED_LITTLE_ENDIAN
+			|| chunk.data.size() != static_cast<std::size_t>(chunk.frameCount)
+				* chunk.channels * sizeof(std::int16_t)) {
+			return AudioPcmSubmitResult::FAILED;
 		}
 		for (std::size_t offset = 0; offset < chunk.data.size(); offset += sizeof(std::int16_t)) {
 			std::int16_t value = 0;
@@ -88,11 +103,48 @@ public:
 			value = scaleSample(value, m_gain);
 			std::memcpy(chunk.data.data() + offset, &value, sizeof(value));
 		}
-		return m_sink.submit(std::move(chunk));
+		// A single BIK packet can decode many small audio frames before its
+		// first video frame. Keep contiguous PCM together so opening a movie
+		// does not need physical playback to free one native slot per AVFrame.
+		if (m_pending.frameCount != 0 && !canAppend(chunk) && !flush()) {
+			return AudioPcmSubmitResult::FAILED;
+		}
+		m_lastInputSequence = chunk.sequence;
+		if (m_pending.frameCount == 0) {
+			m_pending = std::move(chunk);
+		} else {
+			m_pending.data.insert(m_pending.data.end(), chunk.data.begin(), chunk.data.end());
+			m_pending.frameCount += chunk.frameCount;
+		}
+		// Even a full chunk stays pending until the next input or video/EOF
+		// boundary. Each convert() submission can therefore flush at most one
+		// native buffer, preserving pump()'s two-slot admission reservation.
+		return AudioPcmSubmitResult::ACCEPTED;
+	}
+
+	bool flush()
+	{
+		if (m_pending.frameCount == 0) {
+			return true;
+		}
+		m_pending.sequence = m_outputSequence;
+		const AudioPcmSubmitResult result = m_sink.submit(std::move(m_pending));
+		m_pending = {};
+		// Movie input has already been consumed when it reaches the sink.  A
+		// defensive drop must fail the generation instead of creating an audio
+		// hole while video continues on its monotonic clock.
+		if (result != AudioPcmSubmitResult::ACCEPTED) {
+			return false;
+		}
+		++m_outputSequence;
+		return true;
 	}
 
 	void reset(std::uint64_t generation) override
 	{
+		m_pending = {};
+		m_outputSequence = 0;
+		m_lastInputSequence = 0;
 		m_sink.reset(generation);
 	}
 
@@ -103,7 +155,7 @@ public:
 
 	bool isDrained() const noexcept override
 	{
-		return m_sink.isDrained();
+		return m_pending.frameCount == 0 && m_sink.isDrained();
 	}
 
 	bool serviceSink() noexcept override
@@ -113,6 +165,7 @@ public:
 
 	void close() noexcept override
 	{
+		m_pending = {};
 		m_sink.close();
 	}
 
@@ -122,8 +175,23 @@ public:
 	}
 
 private:
+	bool canAppend(const AudioPcmChunk &chunk) const
+	{
+		return !chunk.discontinuity && m_pending.generation == chunk.generation
+			&& m_lastInputSequence != (std::numeric_limits<std::uint64_t>::max)()
+			&& chunk.sequence == m_lastInputSequence + 1
+			&& m_pending.sampleRate == chunk.sampleRate && m_pending.channels == chunk.channels
+			&& m_pending.sourceChannels == chunk.sourceChannels && m_pending.format == chunk.format
+			&& m_pending.startSample <= (std::numeric_limits<std::int64_t>::max)() - m_pending.frameCount
+			&& chunk.startSample == m_pending.startSample + m_pending.frameCount
+			&& chunk.frameCount <= FFmpegAudioDecoder::MAX_CHUNK_FRAMES - m_pending.frameCount;
+	}
+
 	AudioPcmSink &m_sink;
 	double m_gain;
+	AudioPcmChunk m_pending;
+	std::uint64_t m_outputSequence = 0;
+	std::uint64_t m_lastInputSequence = 0;
 };
 
 FFmpegMoviePlayback::FFmpegMoviePlayback(FFmpegFile &file, AudioPcmSink *sink,
@@ -148,12 +216,18 @@ FFmpegMoviePlayback::FFmpegMoviePlayback(FFmpegFile &file, AudioPcmSink *sink,
 	m_clockBaseUs(0),
 	m_audioBaseSample(0),
 	m_videoPresentationTimeUs(0),
+	m_videoTimelineOriginUs(file.getVideoStartTimeMicroseconds()),
 	m_seekTargetUs(0),
+	m_videoTimelineBaseUs(0),
+	m_drainWatchdogStartUs(0),
+	m_drainWatchdogProgressSample(0),
 	m_clockRebased(false),
 	m_audioClockRebased(false),
 	m_videoGateActive(false),
 	m_audioGateActive(false),
-	m_newVideoFrame(false)
+	m_newVideoFrame(false),
+	m_drainWatchdogActive(false),
+	m_drainWatchdogHasProgress(false)
 {
 	const bool useExternalAudio = m_audioEnabled;
 	m_audioSink = useExternalAudio ? sink : m_silentSink;
@@ -222,24 +296,28 @@ bool FFmpegMoviePlayback::isTerminal() const
 	return m_state == FFmpegMoviePlaybackState::ENDED || m_state == FFmpegMoviePlaybackState::FAILED;
 }
 
+void FFmpegMoviePlayback::failPlayback()
+{
+	setFailed();
+}
+
 bool FFmpegMoviePlayback::isFrameReady() const
 {
 	if (m_currentFrame == nullptr) {
 		return false;
 	}
-	std::int64_t playedSample = 0;
-	if (m_audioSink != nullptr && m_audioSink->getPlayedSample(playedSample) && playedSample >= m_audioBaseSample) {
-		const std::int64_t elapsedUs = av_rescale_q(playedSample - m_audioBaseSample,
-			AVRational { 1, FFmpegAudioDecoder::OUTPUT_SAMPLE_RATE }, AVRational { 1, MICROSECONDS_PER_SECOND });
-		return m_videoPresentationTimeUs <= elapsedUs;
-	}
+	// The native sink publishes completed buffers rather than a continuously
+	// advancing in-buffer cursor. A BIK audio packet can cover roughly three
+	// quarters of a second, so using that staircase as the movie master clock
+	// freezes video between completions. Keep presentation on the generation-
+	// rebased monotonic clock; bounded admission prevents capacity holes.
 	const std::int64_t elapsedUs = nowMicroseconds() - m_clockBaseUs;
 	return m_videoPresentationTimeUs <= std::max<std::int64_t>(0, elapsedUs);
 }
 
-bool FFmpegMoviePlayback::pump(std::size_t maxDecodeCalls)
+bool FFmpegMoviePlayback::pump(std::size_t maxDecodeSteps)
 {
-	if (maxDecodeCalls == 0 || isTerminal()) {
+	if (maxDecodeSteps == 0 || isTerminal()) {
 		return false;
 	}
 	if (m_state == FFmpegMoviePlaybackState::DRAINING) {
@@ -249,27 +327,57 @@ bool FFmpegMoviePlayback::pump(std::size_t maxDecodeCalls)
 		return completeDrain();
 	}
 	bool progressed = false;
-	for (std::size_t call = 0; call < maxDecodeCalls; ++call) {
+	for (std::size_t step = 0; step < maxDecodeSteps; ++step) {
+		// One decoded audio frame can submit both a delayed resampler tail and
+		// its current PCM. Reserve both slots before consuming the next bounded
+		// demux/decode transition. Backpressure yields to the owner without
+		// advancing either audio or video.
+		if (m_audioSink == nullptr) {
+			return setFailed() || progressed;
+		}
+		if (!m_audioSink->canAccept(2)) {
+			if (!m_audioSink->serviceSink()) {
+				return setFailed() || progressed;
+			}
+			// Service may reclaim a completed slot immediately.  Recheck before
+			// declaring a stall so ordinary short-lived backpressure remains
+			// lossless and does not consume the no-progress budget.
+			if (m_audioSink->canAccept(2)) {
+				clearDrainWatchdog();
+				// The service/reset transition itself is forward progress.  With
+				// pump(1), returning false here makes stream owners mistake a
+				// reopened native voice for a playback failure before the next
+				// bounded decode step can run.
+				progressed = true;
+				continue;
+			}
+			if (!m_drainWatchdogActive) {
+				beginDrainWatchdog();
+			} else if (drainWatchdogExpired()) {
+				return setFailed() || progressed;
+			}
+			return true;
+		}
+		clearDrainWatchdog();
 		m_newVideoFrame = false;
-		if (m_file.decodePacket()) {
-			progressed = true;
-			if (m_state == FFmpegMoviePlaybackState::FAILED) {
+		switch (m_file.decodeStep()) {
+			case FFmpegDecodeStepResult::PROGRESSED:
+				progressed = true;
+				continue;
+			case FFmpegDecodeStepResult::FRAME_READY:
+				progressed = true;
+				if (m_state == FFmpegMoviePlaybackState::FAILED) {
+					return progressed;
+				}
+				if (m_newVideoFrame) {
+					return true;
+				}
+				continue;
+			case FFmpegDecodeStepResult::FAILED:
+				return setFailed() || progressed;
+			case FFmpegDecodeStepResult::END_OF_INPUT:
+				progressed = handleEndOfInput() || progressed;
 				return progressed;
-			}
-			if (m_newVideoFrame) {
-				return true;
-			}
-			continue;
-		}
-		if (m_file.hasError()) {
-			return setFailed() || progressed;
-		}
-		if (!m_file.isAtEnd()) {
-			return setFailed() || progressed;
-		}
-		progressed = handleEndOfInput() || progressed;
-		if (isTerminal()) {
-			return progressed;
 		}
 	}
 	return progressed;
@@ -344,6 +452,12 @@ void FFmpegMoviePlayback::handleFrame(const AVFrame *frame, const FFmpegFrameMet
 		}
 		m_videoGateActive = false;
 	}
+	// Publish the bounded PCM prefix before the associated video callback.
+	// Owner-side service can then start both at the same presentation boundary.
+	if (!m_gainSink->flush()) {
+		setFailed();
+		return;
+	}
 	AVFrame *clone = av_frame_clone(frame);
 	if (clone == nullptr) {
 		setFailed();
@@ -355,7 +469,8 @@ void FFmpegMoviePlayback::handleFrame(const AVFrame *frame, const FFmpegFrameMet
 	if (!m_clockRebased) {
 		rebaseClocks(timestampUs == INVALID_TIMESTAMP ? 0 : timestampUs);
 	}
-	m_videoPresentationTimeUs = timestampUs == INVALID_TIMESTAMP ? 0 : std::max<std::int64_t>(0, timestampUs - m_seekTargetUs);
+	m_videoPresentationTimeUs = timestampUs == INVALID_TIMESTAMP ? 0
+		: std::max<std::int64_t>(0, timestampUs - m_videoTimelineBaseUs);
 	m_newVideoFrame = true;
 	if (m_videoCallback) {
 		m_videoCallback(m_currentFrame, m_currentMetadata, m_videoUserData);
@@ -369,7 +484,8 @@ bool FFmpegMoviePlayback::handleEndOfInput()
 	}
 	m_state = FFmpegMoviePlaybackState::DRAINING;
 	++m_drainCount;
-	if (!m_audioDecoder->drain(*m_audioSink)) {
+	beginDrainWatchdog();
+	if (!m_audioDecoder->drain(*m_audioSink) || !m_gainSink->flush()) {
 		return setFailed();
 	}
 	m_audioSink->endOfStream();
@@ -378,10 +494,19 @@ bool FFmpegMoviePlayback::handleEndOfInput()
 
 bool FFmpegMoviePlayback::completeDrain()
 {
-	if (m_state != FFmpegMoviePlaybackState::DRAINING
-		|| m_audioSink == nullptr || !m_audioSink->isDrained()) {
-		return m_state == FFmpegMoviePlaybackState::DRAINING;
+	if (m_state != FFmpegMoviePlaybackState::DRAINING) {
+		return false;
 	}
+	if (m_audioSink == nullptr) {
+		return setFailed(false);
+	}
+	if (!m_audioSink->isDrained()) {
+		if (drainWatchdogExpired()) {
+			return setFailed();
+		}
+		return true;
+	}
+	clearDrainWatchdog();
 	if (m_mode != FFmpegMoviePlaybackMode::LOOP) {
 		if (m_mode == FFmpegMoviePlaybackMode::ONCE) {
 			clearCurrentFrame();
@@ -397,7 +522,7 @@ bool FFmpegMoviePlayback::completeDrain()
 	if (!m_file.seekFrame(0)) {
 		return setFailed(false);
 	}
-	m_seekTargetUs = 0;
+	m_seekTargetUs = m_videoTimelineOriginUs;
 	m_videoGateActive = false;
 	m_audioGateActive = false;
 	m_clockRebased = false;
@@ -423,12 +548,58 @@ bool FFmpegMoviePlayback::setFailed(bool resetAudio)
 	if (m_state == FFmpegMoviePlaybackState::FAILED) {
 		return false;
 	}
+	clearDrainWatchdog();
 	if (resetAudio) {
 		resetGeneration(m_generation);
 	}
 	clearCurrentFrame();
 	m_state = FFmpegMoviePlaybackState::FAILED;
 	return false;
+}
+
+void FFmpegMoviePlayback::beginDrainWatchdog()
+{
+	m_drainWatchdogStartUs = nowMicroseconds();
+	m_drainWatchdogProgressSample = 0;
+	m_drainWatchdogActive = true;
+	m_drainWatchdogHasProgress = false;
+	if (m_audioSink != nullptr) {
+		std::int64_t playedSample = 0;
+		if (m_audioSink->getPlayedSample(playedSample) && playedSample >= 0) {
+			m_drainWatchdogProgressSample = playedSample;
+			m_drainWatchdogHasProgress = true;
+		}
+	}
+}
+
+void FFmpegMoviePlayback::clearDrainWatchdog()
+{
+	m_drainWatchdogActive = false;
+	m_drainWatchdogHasProgress = false;
+	m_drainWatchdogStartUs = 0;
+	m_drainWatchdogProgressSample = 0;
+}
+
+bool FFmpegMoviePlayback::drainWatchdogExpired()
+{
+	if (!m_drainWatchdogActive) {
+		beginDrainWatchdog();
+	}
+
+	const std::int64_t now = nowMicroseconds();
+	if (m_audioSink != nullptr) {
+		std::int64_t playedSample = 0;
+		if (m_audioSink->getPlayedSample(playedSample) && playedSample >= 0
+			&& (!m_drainWatchdogHasProgress || playedSample > m_drainWatchdogProgressSample)) {
+			m_drainWatchdogProgressSample = playedSample;
+			m_drainWatchdogHasProgress = true;
+			m_drainWatchdogStartUs = now;
+			return false;
+		}
+	}
+
+	return now >= m_drainWatchdogStartUs
+		&& now - m_drainWatchdogStartUs >= DRAIN_NO_PROGRESS_TIMEOUT_US;
 }
 
 bool FFmpegMoviePlayback::isAudioFrameAdmitted(const FFmpegFrameMetadata &metadata)
@@ -465,10 +636,16 @@ std::int64_t FFmpegMoviePlayback::targetTimeForFrame(Int frameIndex) const
 {
 	const FFmpegFrameRate rate = m_file.getVideoFrameRate();
 	if (frameIndex <= 0 || rate.numerator <= 0 || rate.denominator <= 0) {
-		return 0;
+		return m_videoTimelineOriginUs;
 	}
-	return av_rescale_q(frameIndex, AVRational { rate.denominator, rate.numerator },
-		AVRational { 1, MICROSECONDS_PER_SECOND });
+	const std::int64_t relativeUs = av_rescale_q(frameIndex,
+		AVRational { rate.denominator, rate.numerator }, AVRational { 1, MICROSECONDS_PER_SECOND });
+	if ((relativeUs > 0 && m_videoTimelineOriginUs > (std::numeric_limits<std::int64_t>::max)() - relativeUs)
+		|| (relativeUs < 0 && m_videoTimelineOriginUs < (std::numeric_limits<std::int64_t>::min)() - relativeUs)) {
+		return relativeUs > 0 ? (std::numeric_limits<std::int64_t>::max)()
+			: (std::numeric_limits<std::int64_t>::min)();
+	}
+	return m_videoTimelineOriginUs + relativeUs;
 }
 
 std::int64_t FFmpegMoviePlayback::nowMicroseconds() const
@@ -478,7 +655,7 @@ std::int64_t FFmpegMoviePlayback::nowMicroseconds() const
 
 void FFmpegMoviePlayback::rebaseClocks(std::int64_t timelineBase)
 {
-	(void)timelineBase;
+	m_videoTimelineBaseUs = timelineBase;
 	m_clockBaseUs = nowMicroseconds();
 	m_audioBaseSample = 0;
 	m_clockRebased = true;

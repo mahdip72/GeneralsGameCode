@@ -41,6 +41,7 @@ public:
 	HRESULT flushResult = S_OK;
 	HRESULT destroyResult = S_OK;
 	HRESULT criticalError = S_OK;
+	HRESULT setVolumeResult = S_OK;
 	int createCalls = 0;
 	int submitCalls = 0;
 	int startCalls = 0;
@@ -48,6 +49,8 @@ public:
 	int flushCalls = 0;
 	int destroyCalls = 0;
 	int criticalErrorCalls = 0;
+	int setVolumeCalls = 0;
+	float lastVolume = -1.0f;
 	WAVEFORMATEX createFormat = {};
 	IXAudio2VoiceCallback *callback = nullptr;
 	std::vector<Submission> submissions;
@@ -95,6 +98,13 @@ public:
 	{
 		const_cast<FakePcmVoiceBackend *>(this)->criticalErrorCalls++;
 		return criticalError;
+	}
+
+	HRESULT setVolume(float volume) noexcept override
+	{
+		++setVolumeCalls;
+		lastVolume = volume;
+		return setVolumeResult;
 	}
 
 	void destroy() noexcept override
@@ -167,12 +177,17 @@ void testFixedFormatAndBoundedAdmission()
 		"source voice format has exact block alignment");
 	check(backend.createFormat.wBitsPerSample == 16, "source voice format is signed 16-bit PCM");
 	check(backend.createFormat.cbSize == 0, "source voice format has no extension bytes");
+	check(voice.canAccept(XAudio2PcmVoice::SLOT_COUNT),
+		"a new voice advertises all fixed admission slots");
+	check(voice.setVolume(0.4f) && backend.setVolumeCalls == 1 && backend.lastVolume == 0.4f,
+		"native output gain reaches the already-created source voice");
 
 	for (std::uint64_t sequence = 0; sequence < XAudio2PcmVoice::SLOT_COUNT; ++sequence) {
 		check(voice.submit(makeChunk(0, sequence, static_cast<std::uint8_t>(sequence)))
 				== AudioPcmSubmitResult::ACCEPTED,
 			"the eight fixed slots admit valid chunks");
 	}
+	check(!voice.canAccept(1), "a full voice publishes backpressure before input is consumed");
 	check(voice.submit(makeChunk(0, XAudio2PcmVoice::SLOT_COUNT, 100)) == AudioPcmSubmitResult::DROPPED,
 		"the ninth chunk is dropped when all slots are pending");
 	check(backend.submitCalls == 0 && backend.criticalErrorCalls == 0,
@@ -188,6 +203,14 @@ void testFixedFormatAndBoundedAdmission()
 		check(backend.submissions[i].bytes == 8, "submitted byte count matches owned PCM data");
 	}
 	voice.close();
+
+	FakePcmVoiceBackend unsupportedGainBackend;
+	unsupportedGainBackend.setVolumeResult = E_NOTIMPL;
+	XAudio2PcmVoice unsupportedGainVoice(unsupportedGainBackend);
+	check(unsupportedGainVoice.open() && !unsupportedGainVoice.setVolume(0.5f)
+			&& !unsupportedGainVoice.isFailed(),
+		"an unsupported native gain hook falls back without failing the voice");
+	unsupportedGainVoice.close();
 }
 
 void testOwnedStorageAndOwnerOnlyReclaim()
@@ -217,9 +240,11 @@ void testOwnedStorageAndOwnerOnlyReclaim()
 		"repeated service does not reclaim a slot before its callback");
 
 	backend.complete(0);
+	check(!voice.canAccept(1), "callback completion is not producer capacity until owner service");
 	check(voice.submit(makeChunk(0, 1, 55)) == AudioPcmSubmitResult::DROPPED,
 		"callback completion alone does not reclaim a slot");
 	voice.service();
+	check(voice.canAccept(1), "owner service republishes a reclaimed admission slot");
 	check(voice.submit(makeChunk(0, 1, 55)) == AudioPcmSubmitResult::ACCEPTED,
 		"the owner service reclaims a callback-complete slot");
 	voice.close();
@@ -288,6 +313,90 @@ void testPlayedSampleClockAndGeneration()
 		"buffer completion publishes the played sample position");
 	voice.reset(1);
 	check(!voice.getPlayedSample(playedSample), "generation reset rebases the played sample clock");
+	voice.close();
+}
+
+void testPauseBeforeFirstServiceAndPendingRefill()
+{
+	FakePcmVoiceBackend backend;
+	XAudio2PcmVoice voice(backend);
+	check(voice.open(), "pause-before-service voice opens");
+	check(voice.submit(makeChunk(0, 0, 70)) == AudioPcmSubmitResult::ACCEPTED,
+		"pause-before-service voice admits its first pending chunk");
+	check(voice.pause(), "voice pauses before its first native submission");
+	voice.service();
+	voice.service();
+	check(backend.submitCalls == 0 && backend.startCalls == 0,
+		"repeated service neither submits nor starts a paused pending voice");
+	check(voice.resume(), "pending voice resumes explicitly");
+	voice.service();
+	voice.service();
+	check(backend.submitCalls == 1 && backend.startCalls == 1,
+		"resume and service start the first pending chunk exactly once");
+
+	check(voice.submit(makeChunk(0, 1, 71)) == AudioPcmSubmitResult::ACCEPTED,
+		"running voice admits a pending refill before pause");
+	check(voice.pause(), "running voice pauses with a pending refill");
+	backend.complete(0);
+	voice.service();
+	check(backend.submitCalls == 1 && backend.startCalls == 1,
+		"reclaiming an in-flight completion does not start a paused refill");
+	check(voice.canAccept(XAudio2PcmVoice::SLOT_COUNT - 1),
+		"paused service still reclaims completed storage");
+	check(voice.resume(), "paused refill resumes explicitly");
+	voice.service();
+	check(backend.submitCalls == 2 && backend.startCalls == 2,
+		"resuming the refill issues only one additional native start");
+	voice.close();
+}
+
+void testPauseSurvivesGenerationReset()
+{
+	FakePcmVoiceBackend backend;
+	XAudio2PcmVoice voice(backend);
+	check(voice.open() && voice.pause(), "generation-reset voice opens paused");
+	check(voice.submit(makeChunk(0, 0, 72)) == AudioPcmSubmitResult::ACCEPTED,
+		"paused voice admits old pending data");
+	voice.reset(1);
+	check(voice.submit(makeChunk(1, 0, 73)) == AudioPcmSubmitResult::ACCEPTED,
+		"paused reset admits new-generation pending data");
+	voice.service();
+	voice.service();
+	check(backend.flushCalls == 1 && backend.submitCalls == 0 && backend.startCalls == 0,
+		"reset completes its empty old-generation barrier without unpausing");
+	check(voice.submit(makeChunk(0, 1, 74)) == AudioPcmSubmitResult::DROPPED,
+		"paused reset still rejects old-generation admission");
+	check(voice.resume(), "new generation resumes explicitly");
+	voice.service();
+	check(backend.submitCalls == 1 && backend.startCalls == 1
+		&& !backend.submissions.empty() && backend.submissions.front().audio[0] == 73,
+		"resumed reset plays only the retained new-generation data");
+	voice.close();
+}
+
+void testStopPreventsPendingRestartAndCloseClearsPause()
+{
+	FakePcmVoiceBackend backend;
+	XAudio2PcmVoice voice(backend);
+	check(voice.open(), "stop-before-service voice opens");
+	check(voice.submit(makeChunk(0, 0, 75)) == AudioPcmSubmitResult::ACCEPTED,
+		"stop-before-service voice admits pending data");
+	check(voice.stop(), "pending voice stops before its native submission");
+	voice.service();
+	voice.service();
+	check(backend.submitCalls == 0 && backend.startCalls == 0,
+		"owner service cannot restart a stopped pending voice");
+	voice.close();
+	voice.service();
+	check(backend.destroyCalls == 1 && backend.submitCalls == 0,
+		"closing a stopped voice cancels pending data without submitting it");
+	check(voice.open(), "stopped voice can open a fresh lifecycle");
+	check(voice.submit(makeChunk(0, 0, 76)) == AudioPcmSubmitResult::ACCEPTED,
+		"fresh lifecycle admits data without inheriting stop state");
+	voice.service();
+	check(backend.submitCalls == 1 && backend.startCalls == 1
+		&& !backend.submissions.empty() && backend.submissions.front().audio[0] == 76,
+		"reopened voice starts only fresh data without an explicit resume");
 	voice.close();
 }
 
@@ -604,6 +713,9 @@ int main()
 	testOwnedStorageAndOwnerOnlyReclaim();
 	testValidationAndClosedAdmission();
 	testPlayedSampleClockAndGeneration();
+	testPauseBeforeFirstServiceAndPendingRefill();
+	testPauseSurvivesGenerationReset();
+	testStopPreventsPendingRestartAndCloseClearsPause();
 	testPlayedSampleClockIgnoresTimelineGaps();
 	testSameGenerationResetRejectsStaleClockCompletion();
 	testResetBarrierAndGenerationActivation();

@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <memory>
 #include <thread>
 #include <string>
@@ -72,6 +73,12 @@ public:
 		return S_OK;
 	}
 	HRESULT getCriticalError() const noexcept override { return S_OK; }
+	HRESULT setVolume(float volume) noexcept override
+	{
+		lastVolume = volume;
+		++setVolumeCalls;
+		return S_OK;
+	}
 	HRESULT setOutputMatrix(UINT32 sourceChannels, UINT32 destinationChannels,
 		const float *matrix) noexcept override
 	{
@@ -99,6 +106,8 @@ public:
 	std::size_t submissionCount() const noexcept { return m_submittedContexts.size(); }
 	UINT32 lastSourceChannels = 0;
 	UINT32 lastDestinationChannels = 0;
+	float lastVolume = -1.0f;
+	int setVolumeCalls = 0;
 	std::vector<float> lastMatrix;
 
 private:
@@ -140,6 +149,8 @@ public:
 	std::atomic<bool> releaseCreateBackend { true };
 	FakePcmVoiceBackend *lastVoiceBackend = nullptr;
 	bool provideOutputDetails = false;
+	UINT32 outputChannelMask = SPEAKER_STEREO;
+	UINT32 outputChannelCount = 2;
 
 	HRESULT open(CriticalErrorCallback callback, void *context) noexcept override
 	{
@@ -193,8 +204,8 @@ public:
 			details = {};
 			return E_NOTIMPL;
 		}
-		details.channelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
-		details.channelCount = 2;
+		details.channelMask = outputChannelMask;
+		details.channelCount = outputChannelCount;
 		return S_OK;
 	}
 
@@ -401,13 +412,26 @@ void testHandleScopedOperationsAndConcurrentStaleAccess()
 {
 	g_backendUseAfterDestroy.store(0, std::memory_order_release);
 	auto backend = std::make_unique<FakeAudioEngine>();
+	FakeAudioEngine *backendView = backend.get();
 	XAudio2AudioService service(std::move(backend));
 	check(service.open(), "handle-operation service opens");
 	const XAudio2PcmVoiceHandle handle = service.createVoice();
 	check(handle.isValid(), "handle-operation service creates a voice");
 	check(service.isVoiceOpen(handle), "valid handles report an open voice");
 	check(service.getVoiceLastError(handle) == S_OK, "valid handles query voice errors");
+	check(service.canVoiceAccept(handle, 1),
+		"new valid handles initially accept audio");
 	check(service.resetVoice(handle, 1), "valid handles reset their voice");
+	check(!service.canVoiceAccept(handle, 1),
+		"pending generation resets suspend admission until owner service");
+	check(service.serviceVoice(handle),
+		"owner service commits pending generation resets");
+	check(service.canVoiceAccept(handle, 1),
+		"serviced valid handles resume audio admission");
+	check(service.setVoiceVolume(handle, 0.4f)
+			&& backendView->lastVoiceBackend->setVolumeCalls == 1
+			&& backendView->lastVoiceBackend->lastVolume == 0.4f,
+		"valid handles update native output gain");
 	check(service.submit(handle, makeChunk(1, 0)) == AudioPcmSubmitResult::ACCEPTED,
 		"valid handles submit through the service");
 	check(service.serviceVoice(handle), "valid handles service their voice");
@@ -436,6 +460,7 @@ void testHandleScopedOperationsAndConcurrentStaleAccess()
 	destroyer.join();
 	staleAccess.join();
 	check(!service.isVoiceOpen(handle), "stale handle queries are rejected after destruction");
+	check(!service.canVoiceAccept(handle, 1), "stale handles publish no admission capacity");
 	check(g_backendUseAfterDestroy.load(std::memory_order_acquire) == 0,
 		"stale handle operations never touch a destroyed backend");
 	service.shutdown();
@@ -749,10 +774,8 @@ void testPointSourceSpatializationPreservesMonoLevel()
 			&& service.submit(stereoHandle, std::move(stereoChunk)) == AudioPcmSubmitResult::ACCEPTED,
 		"spatialization voices accept mono and stereo provenance");
 	XAudio2SpatializationPose listener = {};
-	listener.front[1] = 1.0f;
-	listener.top[2] = 1.0f;
 	XAudio2SpatializationPose emitter = listener;
-	emitter.position[1] = 1.0f;
+	emitter.position[2] = 1.0f;
 	check(service.setVoiceSpatialization(monoHandle, listener, emitter)
 			&& service.setVoiceSpatialization(stereoHandle, listener, emitter),
 		"point-source spatialization succeeds for both provenances");
@@ -789,6 +812,148 @@ void testPointSourceSpatializationPreservesMonoLevel()
 	}
 	service.shutdown();
 }
+
+void testLegacyStereoPointSourceDirections()
+{
+	auto backend = std::make_unique<FakeAudioEngine>();
+	FakeAudioEngine *backendView = backend.get();
+	backendView->provideOutputDetails = true;
+	XAudio2AudioService service(std::move(backend));
+	check(service.open(), "legacy stereo direction service opens");
+	const XAudio2PcmVoiceHandle handle = service.createVoice();
+	FakePcmVoiceBackend *voice = backendView->lastVoiceBackend;
+	AudioPcmChunk chunk = makeChunk(handle.generation, 0);
+	chunk.sourceChannels = 1;
+	check(handle.isValid() && voice != nullptr
+			&& service.resetVoice(handle, handle.generation)
+			&& service.submit(handle, std::move(chunk)) == AudioPcmSubmitResult::ACCEPTED,
+		"legacy stereo direction voice accepts mono provenance");
+	if (voice == nullptr) return;
+	check(service.setVoiceVolume(handle, 0.37f), "direction test sets independent volume");
+	const int volumeCalls = voice->setVolumeCalls;
+	struct DirectionCase {
+		float x, y, z;
+		float left, right;
+		const char *message;
+	};
+	const DirectionCase cases[] = {
+		{ 0, 0, 50, .5f, .5f, "front center retains legacy half-gain per speaker" },
+		{ 0, 0, -50, .375f, .375f, "rear center includes legacy .75 rear gain" },
+		{ 50, 0, 0, 0, 1, "right side reaches the right speaker" },
+		{ -50, 0, 0, 1, 0, "left side reaches the left speaker" },
+		{ 50, 0, 50, .25f, .75f, "front diagonal uses angle-linear panning" },
+		{ 50, 0, -50, .1875f, .5625f, "rear diagonal includes rear gain" },
+		{ 0, -50, 50, .5f, .5f, "lower front center retains legacy center gain" },
+		{ 50, -86.60254f, 0, 1.0f / 3.0f, 2.0f / 3.0f,
+			"lower side uses full 3D direction instead of horizontal azimuth" },
+		{ 50, 86.60254f, 0, 1.0f / 3.0f, 2.0f / 3.0f,
+			"upper side uses the same elevation-aware split" },
+		{ 0, 0, 0, .5f, .5f, "coincident source remains finite and centered" },
+		{ .00001f, 0, 0, .5f, .5f, "near-coincident source uses legacy center branch" },
+	};
+	XAudio2SpatializationPose listener;
+	for (const DirectionCase &test : cases) {
+		XAudio2SpatializationPose emitter;
+		emitter.position[0] = test.x;
+		emitter.position[1] = test.y;
+		emitter.position[2] = test.z;
+		check(service.setVoiceSpatialization(handle, listener, emitter), test.message);
+		check(voice->lastMatrix.size() == 4, "legacy stereo matrix has four coefficients");
+		if (voice->lastMatrix.size() != 4) continue;
+		check(std::abs(voice->lastMatrix[0] - test.left * .5f) < .00001f
+				&& std::abs(voice->lastMatrix[1] - test.left * .5f) < .00001f
+				&& std::abs(voice->lastMatrix[2] - test.right * .5f) < .00001f
+				&& std::abs(voice->lastMatrix[3] - test.right * .5f) < .00001f,
+			test.message);
+	}
+	XAudio2SpatializationPose emitter;
+	listener.front[0] = 1.0f;
+	listener.front[2] = 0.0f;
+	emitter.position[0] = 50.0f;
+	emitter.position[2] = -50.0f;
+	check(service.setVoiceSpatialization(handle, listener, emitter)
+			&& voice->lastMatrix.size() == 4
+			&& std::abs(voice->lastMatrix[0] - .125f) < .00001f
+			&& std::abs(voice->lastMatrix[2] - .375f) < .00001f,
+		"rotated horizontal listener preserves right-front diagonal panning");
+	const std::vector<float> validMatrix = voice->lastMatrix;
+	emitter.position[0] = std::numeric_limits<float>::infinity();
+	check(!service.setVoiceSpatialization(handle, listener, emitter)
+			&& voice->lastMatrix == validMatrix,
+		"infinite emitter does not publish a replacement matrix");
+	emitter.position[0] = 50.0f;
+	listener.front[0] = std::numeric_limits<float>::quiet_NaN();
+	check(!service.setVoiceSpatialization(handle, listener, emitter)
+			&& voice->lastMatrix == validMatrix,
+		"nonfinite listener does not publish a replacement matrix");
+	check(voice->setVolumeCalls == volumeCalls && voice->lastVolume == .37f,
+		"direction matrix never changes the manager's independent gain");
+	service.shutdown();
+}
+
+void testOtherSpatializationPathsKeepX3DAudio()
+{
+	for (bool multichannel : { false, true }) {
+		auto backend = std::make_unique<FakeAudioEngine>();
+		FakeAudioEngine *backendView = backend.get();
+		backendView->provideOutputDetails = true;
+		if (multichannel) {
+			backendView->outputChannelMask = SPEAKER_5POINT1;
+			backendView->outputChannelCount = 6;
+		}
+		XAudio2AudioService service(std::move(backend));
+		check(service.open(), "unchanged X3DAudio path opens");
+		const XAudio2PcmVoiceHandle handle = service.createVoice();
+		FakePcmVoiceBackend *voice = backendView->lastVoiceBackend;
+		AudioPcmChunk chunk = makeChunk(handle.generation, 0);
+		chunk.sourceChannels = multichannel ? 1 : 2;
+		check(handle.isValid() && voice != nullptr
+				&& service.resetVoice(handle, handle.generation)
+				&& service.submit(handle, std::move(chunk)) == AudioPcmSubmitResult::ACCEPTED,
+			"unchanged path accepts its original channel provenance");
+		if (voice == nullptr) continue;
+		XAudio2SpatializationPose listenerPose;
+		XAudio2SpatializationPose emitterPose;
+		emitterPose.position[0] = 50.0f;
+		emitterPose.position[1] = -50.0f;
+		emitterPose.position[2] = -50.0f;
+		check(service.setVoiceSpatialization(handle, listenerPose, emitterPose),
+			"unchanged path spatialization succeeds");
+		X3DAUDIO_HANDLE x3d;
+		check(SUCCEEDED(X3DAudioInitialize(backendView->outputChannelMask,
+			X3DAUDIO_SPEED_OF_SOUND, x3d)), "reference X3DAudio initializes");
+		X3DAUDIO_LISTENER listener = {};
+		listener.OrientFront = { 0, 0, 1 };
+		listener.OrientTop = { 0, 1, 0 };
+		float azimuths[2] = {};
+		X3DAUDIO_DISTANCE_CURVE_POINT points[2] = { { 0, 1 }, { 1, 1 } };
+		X3DAUDIO_DISTANCE_CURVE curve = { points, 2 };
+		X3DAUDIO_EMITTER emitter = {};
+		emitter.Position = { 50, -50, -50 };
+		emitter.OrientFront = listener.OrientFront;
+		emitter.OrientTop = listener.OrientTop;
+		emitter.ChannelCount = 2;
+		emitter.pChannelAzimuths = azimuths;
+		emitter.pVolumeCurve = &curve;
+		emitter.CurveDistanceScaler = 1;
+		emitter.DopplerScaler = 1;
+		std::vector<float> expected(2 * backendView->outputChannelCount);
+		X3DAUDIO_DSP_SETTINGS settings = {};
+		settings.SrcChannelCount = 2;
+		settings.DstChannelCount = backendView->outputChannelCount;
+		settings.pMatrixCoefficients = expected.data();
+		X3DAudioCalculate(x3d, &listener, &emitter, X3DAUDIO_CALCULATE_MATRIX, &settings);
+		check(voice->lastMatrix.size() == expected.size(), "unchanged matrix size matches X3DAudio");
+		if (voice->lastMatrix.size() == expected.size()) {
+			for (std::size_t index = 0; index < expected.size(); ++index) {
+				const float normalization = multichannel ? .5f : 1.0f;
+				check(std::abs(voice->lastMatrix[index] - expected[index] * normalization) < .00001f,
+					"genuine stereo and multichannel mono retain X3DAudio coefficients");
+			}
+		}
+		service.shutdown();
+	}
+}
 }
 
 int main()
@@ -806,6 +971,8 @@ int main()
 	testShutdownOrderFailureAndIdempotence();
 	testRepeatedCyclesRemainDeterministic();
 	testPointSourceSpatializationPreservesMonoLevel();
+	testLegacyStereoPointSourceDirections();
+	testOtherSpatializationPathsKeepX3DAudio();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "%d XAudio2AudioService checks failed\n", g_failures);
 		return 1;

@@ -384,140 +384,154 @@ void FFmpegFile::close()
 	m_ownedSource.reset();
 }
 
-Bool FFmpegFile::decodePacket()
+FFmpegDecodeStepResult FFmpegFile::decodeStep()
 {
 	DEBUG_ASSERTCRASH(m_fmtCtx != nullptr, ("null format context"));
 	DEBUG_ASSERTCRASH(m_packet != nullptr, ("null packet pointer"));
 	if (m_fmtCtx == nullptr || m_packet == nullptr || m_decodeError) {
 		m_decodeError = true;
-		return false;
+		return FFmpegDecodeStepResult::FAILED;
 	}
 	if (m_atEnd) {
-		return false;
+		return FFmpegDecodeStepResult::END_OF_INPUT;
 	}
 
-	for (;;) {
-		if (m_receiveStreamIndex >= 0) {
-			FFmpegStream &stream = m_streams[m_receiveStreamIndex];
-			const ReceiveResult receive_result = receiveFrame(stream);
-			if (receive_result == ReceiveResult::FRAME_SKIPPED) {
-				continue;
-			}
-			if (receive_result == ReceiveResult::FRAME_READY) {
-				return true;
-			}
-			if (receive_result == ReceiveResult::FAILED) {
-				m_decodeError = true;
-				return false;
-			}
-			if (receive_result == ReceiveResult::FINISHED) {
-				stream.drained = true;
-			}
-			if (receive_result == ReceiveResult::NEEDS_INPUT && m_inputEnded && stream.drain_sent) {
-				DEBUG_LOG(("Decoder requested input after its drain packet"));
-				m_decodeError = true;
-				return false;
-			}
-			m_receiveStreamIndex = -1;
+	if (m_receiveStreamIndex >= 0) {
+		FFmpegStream &stream = m_streams[m_receiveStreamIndex];
+		const ReceiveResult receive_result = receiveFrame(stream);
+		if (receive_result == ReceiveResult::FRAME_SKIPPED) {
+			return FFmpegDecodeStepResult::PROGRESSED;
+		}
+		if (receive_result == ReceiveResult::FRAME_READY) {
+			return FFmpegDecodeStepResult::FRAME_READY;
+		}
+		if (receive_result == ReceiveResult::FAILED) {
+			m_decodeError = true;
+			return FFmpegDecodeStepResult::FAILED;
+		}
+		if (receive_result == ReceiveResult::FINISHED) {
+			stream.drained = true;
+		}
+		if (receive_result == ReceiveResult::NEEDS_INPUT && m_inputEnded && stream.drain_sent) {
+			DEBUG_LOG(("Decoder requested input after its drain packet"));
+			m_decodeError = true;
+			return FFmpegDecodeStepResult::FAILED;
+		}
+		m_receiveStreamIndex = -1;
+		return FFmpegDecodeStepResult::PROGRESSED;
+	}
+
+	if (m_packetPending) {
+		const Int stream_idx = m_packet->stream_index;
+		if (stream_idx < 0 || static_cast<size_t>(stream_idx) >= m_streams.size()) {
+			DEBUG_LOG(("Demuxer returned invalid stream index %d", stream_idx));
+			av_packet_unref(m_packet);
+			m_packetPending = false;
+			m_decodeError = true;
+			return FFmpegDecodeStepResult::FAILED;
 		}
 
-		if (m_packetPending) {
-			const Int stream_idx = m_packet->stream_index;
-			if (stream_idx < 0 || static_cast<size_t>(stream_idx) >= m_streams.size()) {
-				DEBUG_LOG(("Demuxer returned invalid stream index %d", stream_idx));
-				av_packet_unref(m_packet);
-				m_packetPending = false;
-				m_decodeError = true;
-				return false;
-			}
+		FFmpegStream &stream = m_streams[stream_idx];
+		if (stream.codec_ctx == nullptr) {
+			av_packet_unref(m_packet);
+			m_packetPending = false;
+			return FFmpegDecodeStepResult::PROGRESSED;
+		}
 
-			FFmpegStream &stream = m_streams[stream_idx];
-			if (stream.codec_ctx == nullptr) {
-				av_packet_unref(m_packet);
-				m_packetPending = false;
-				continue;
-			}
+		const int result = avcodec_send_packet(stream.codec_ctx, m_packet);
+		if (result == AVERROR(EAGAIN)) {
+			m_receiveStreamIndex = stream_idx;
+			return FFmpegDecodeStepResult::PROGRESSED;
+		}
+		if (result < 0) {
+			char error_buffer[1024];
+			av_strerror(result, error_buffer, sizeof(error_buffer));
+			DEBUG_LOG(("Failed 'avcodec_send_packet': %s", error_buffer));
+			av_packet_unref(m_packet);
+			m_packetPending = false;
+			m_decodeError = true;
+			return FFmpegDecodeStepResult::FAILED;
+		}
 
-			const int result = avcodec_send_packet(stream.codec_ctx, m_packet);
+		av_packet_unref(m_packet);
+		m_packetPending = false;
+		m_receiveStreamIndex = stream_idx;
+		return FFmpegDecodeStepResult::PROGRESSED;
+	}
+
+	if (!m_inputEnded) {
+		const int result = av_read_frame(m_fmtCtx, m_packet);
+		if (result >= 0) {
+			m_packetPending = true;
+			return FFmpegDecodeStepResult::PROGRESSED;
+		}
+		if (result == AVERROR(EAGAIN)) {
+			DEBUG_LOG(("Local movie demuxer unexpectedly requested more input"));
+			m_decodeError = true;
+			return FFmpegDecodeStepResult::FAILED;
+		}
+		if (result != AVERROR_EOF) {
+			char error_buffer[1024];
+			av_strerror(result, error_buffer, sizeof(error_buffer));
+			DEBUG_LOG(("Failed 'av_read_frame': %s", error_buffer));
+			m_decodeError = true;
+			return FFmpegDecodeStepResult::FAILED;
+		}
+		m_inputEnded = true;
+		return FFmpegDecodeStepResult::PROGRESSED;
+	}
+
+	if (m_drainStreamIndex < m_streams.size()) {
+		FFmpegStream &stream = m_streams[m_drainStreamIndex];
+		if (stream.codec_ctx == nullptr || stream.drained) {
+			++m_drainStreamIndex;
+			return FFmpegDecodeStepResult::PROGRESSED;
+		}
+
+		if (!stream.drain_sent) {
+			const int result = avcodec_send_packet(stream.codec_ctx, nullptr);
 			if (result == AVERROR(EAGAIN)) {
-				m_receiveStreamIndex = stream_idx;
-				continue;
+				m_receiveStreamIndex = static_cast<Int>(m_drainStreamIndex);
+				return FFmpegDecodeStepResult::PROGRESSED;
+			}
+			if (result == AVERROR_EOF) {
+				stream.drained = true;
+				++m_drainStreamIndex;
+				return FFmpegDecodeStepResult::PROGRESSED;
 			}
 			if (result < 0) {
 				char error_buffer[1024];
 				av_strerror(result, error_buffer, sizeof(error_buffer));
-				DEBUG_LOG(("Failed 'avcodec_send_packet': %s", error_buffer));
-				av_packet_unref(m_packet);
-				m_packetPending = false;
+				DEBUG_LOG(("Failed to drain decoder: %s", error_buffer));
 				m_decodeError = true;
-				return false;
+				return FFmpegDecodeStepResult::FAILED;
 			}
-
-			av_packet_unref(m_packet);
-			m_packetPending = false;
-			m_receiveStreamIndex = stream_idx;
-			continue;
+			stream.drain_sent = true;
+			return FFmpegDecodeStepResult::PROGRESSED;
 		}
 
-		if (!m_inputEnded) {
-			const int result = av_read_frame(m_fmtCtx, m_packet);
-			if (result >= 0) {
-				m_packetPending = true;
+		m_receiveStreamIndex = static_cast<Int>(m_drainStreamIndex);
+		return FFmpegDecodeStepResult::PROGRESSED;
+	}
+
+	if (m_videoFramesDelivered > 0) {
+		m_discoveredVideoFrameCount = std::max(m_discoveredVideoFrameCount, m_currentVideoFrame + 1);
+	}
+	m_atEnd = true;
+	return FFmpegDecodeStepResult::END_OF_INPUT;
+}
+
+Bool FFmpegFile::decodePacket()
+{
+	for (;;) {
+		switch (decodeStep()) {
+			case FFmpegDecodeStepResult::PROGRESSED:
 				continue;
-			}
-			if (result == AVERROR(EAGAIN)) {
-				DEBUG_LOG(("Local movie demuxer unexpectedly requested more input"));
-				m_decodeError = true;
+			case FFmpegDecodeStepResult::FRAME_READY:
+				return true;
+			case FFmpegDecodeStepResult::END_OF_INPUT:
+			case FFmpegDecodeStepResult::FAILED:
 				return false;
-			}
-			if (result != AVERROR_EOF) {
-				char error_buffer[1024];
-				av_strerror(result, error_buffer, sizeof(error_buffer));
-				DEBUG_LOG(("Failed 'av_read_frame': %s", error_buffer));
-				m_decodeError = true;
-				return false;
-			}
-			m_inputEnded = true;
-		}
-
-		while (m_drainStreamIndex < m_streams.size()) {
-			FFmpegStream &stream = m_streams[m_drainStreamIndex];
-			if (stream.codec_ctx == nullptr || stream.drained) {
-				++m_drainStreamIndex;
-				continue;
-			}
-
-			if (!stream.drain_sent) {
-				const int result = avcodec_send_packet(stream.codec_ctx, nullptr);
-				if (result == AVERROR(EAGAIN)) {
-					m_receiveStreamIndex = static_cast<Int>(m_drainStreamIndex);
-					break;
-				}
-				if (result == AVERROR_EOF) {
-					stream.drained = true;
-					++m_drainStreamIndex;
-					continue;
-				}
-				if (result < 0) {
-					char error_buffer[1024];
-					av_strerror(result, error_buffer, sizeof(error_buffer));
-					DEBUG_LOG(("Failed to drain decoder: %s", error_buffer));
-					m_decodeError = true;
-					return false;
-				}
-				stream.drain_sent = true;
-			}
-
-			m_receiveStreamIndex = static_cast<Int>(m_drainStreamIndex);
-			break;
-		}
-
-		if (m_receiveStreamIndex < 0) {
-			if (m_videoFramesDelivered > 0) {
-				m_discoveredVideoFrameCount = std::max(m_discoveredVideoFrameCount, m_currentVideoFrame + 1);
-			}
-			m_atEnd = true;
-			return false;
 		}
 	}
 }
@@ -600,7 +614,20 @@ Bool FFmpegFile::seekFrame(int frame_idx)
 		return false;
 	}
 
-	const Int64 timestamp = av_rescale_q(frame_idx, av_inv_q(stream->avg_frame_rate), stream->time_base);
+	const Int64 relative_timestamp = av_rescale_q(frame_idx, av_inv_q(stream->avg_frame_rate), stream->time_base);
+	const Int64 origin_timestamp = getVideoStartTimestamp();
+	Int64 timestamp = relative_timestamp;
+	if (origin_timestamp != AV_NOPTS_VALUE) {
+		if ((relative_timestamp > 0
+				&& origin_timestamp > (std::numeric_limits<Int64>::max)() - relative_timestamp)
+			|| (relative_timestamp < 0
+				&& origin_timestamp < (std::numeric_limits<Int64>::min)() - relative_timestamp)) {
+			DEBUG_LOG(("Video seek timestamp overflow"));
+			m_decodeError = true;
+			return false;
+		}
+		timestamp = origin_timestamp + relative_timestamp;
+	}
 	const int result = av_seek_frame(m_fmtCtx, video_stream->stream_idx, timestamp, AVSEEK_FLAG_BACKWARD);
 	if (result < 0) {
 		char error_buffer[1024];
@@ -654,6 +681,19 @@ const FFmpegFile::FFmpegStream *FFmpegFile::findMatch(Int type) const
 	}
 
 	return nullptr;
+}
+
+Int64 FFmpegFile::getVideoStartTimestamp() const
+{
+	const FFmpegStream *video_stream = findMatch(AVMEDIA_TYPE_VIDEO);
+	if (m_fmtCtx == nullptr || video_stream == nullptr
+		|| video_stream->stream_idx < 0
+		|| static_cast<unsigned int>(video_stream->stream_idx) >= m_fmtCtx->nb_streams) {
+		return AV_NOPTS_VALUE;
+	}
+
+	const AVStream *stream = m_fmtCtx->streams[video_stream->stream_idx];
+	return stream == nullptr ? AV_NOPTS_VALUE : stream->start_time;
 }
 
 Int FFmpegFile::getNumChannels() const
@@ -789,4 +829,22 @@ FFmpegFrameRate FFmpegFile::getVideoFrameRate() const
 	}
 	const AVRational frame_rate = m_fmtCtx->streams[stream->stream_idx]->avg_frame_rate;
 	return { frame_rate.num, frame_rate.den };
+}
+
+Int64 FFmpegFile::getVideoStartTimeMicroseconds() const
+{
+	const FFmpegStream *video_stream = findMatch(AVMEDIA_TYPE_VIDEO);
+	if (m_fmtCtx == nullptr || video_stream == nullptr
+		|| video_stream->stream_idx < 0
+		|| static_cast<unsigned int>(video_stream->stream_idx) >= m_fmtCtx->nb_streams) {
+		return 0;
+	}
+
+	const AVStream *stream = m_fmtCtx->streams[video_stream->stream_idx];
+	const Int64 timestamp = getVideoStartTimestamp();
+	if (stream == nullptr || timestamp == AV_NOPTS_VALUE
+		|| stream->time_base.num <= 0 || stream->time_base.den <= 0) {
+		return 0;
+	}
+	return av_rescale_q(timestamp, stream->time_base, AVRational { 1, AV_TIME_BASE });
 }

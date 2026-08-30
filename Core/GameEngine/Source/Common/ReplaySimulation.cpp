@@ -19,6 +19,7 @@
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
 
 #include "Common/ReplaySimulation.h"
+#include "Lib/FrameTimingDiagnostics.h"
 
 #include "Common/GameEngine.h"
 #include "Common/LocalFileSystem.h"
@@ -82,6 +83,7 @@ int ReplaySimulation::simulateReplaysInThisProcess(const std::vector<AsciiString
 	DWORD totalStartTimeMillis = GetTickCount();
 	for (size_t i = 0; i < filenames.size(); i++)
 	{
+		rts::frame_timing::Session frameTimingSession("headless");
 		AsciiString filename = filenames[i];
 		printf("Simulating Replay \"%s\"\n", filename.str());
 		fflush(stdout);
@@ -99,6 +101,7 @@ int ReplaySimulation::simulateReplaysInThisProcess(const std::vector<AsciiString
 			UnsignedInt totalTimeSec = TheRecorder->getPlaybackFrameCount() / LOGICFRAMES_PER_SECOND;
 			while (TheRecorder->isPlaybackInProgress())
 			{
+				rts::frame_timing::BeginFrame(TheGameLogic->getFrame());
 				const int progressFrameInterval = 10*60*LOGICFRAMES_PER_SECOND;
 				if (TheGameLogic->getFrame() != 0 && TheGameLogic->getFrame() % progressFrameInterval == 0)
 				{
@@ -109,7 +112,11 @@ int ReplaySimulation::simulateReplaysInThisProcess(const std::vector<AsciiString
 							realTimeSec/60, realTimeSec%60, gameTimeSec/60, gameTimeSec%60, totalTimeSec/60, totalTimeSec%60);
 					fflush(stdout);
 				}
-				TheGameLogic->UPDATE();
+				{
+					rts::frame_timing::Scope frameTiming(rts::frame_timing::Logic);
+					TheGameLogic->UPDATE();
+				}
+				rts::frame_timing::EndFrame(TheGameLogic->getFrame());
 				if (TheRecorder->hasReplayReadError())
 				{
 					printf("REPLAY_FAIL reason=malformed_command\n");

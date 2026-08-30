@@ -46,6 +46,13 @@ public:
 		stream.reset();
 		return FALSE;
 	}
+	// Only sound effects may opt in to a short-sample cache. Music and speech
+	// continue to use the ordinary sequential stream path.
+	virtual Bool openPcmSampleStream(const AsciiString &fileName,
+		std::unique_ptr<AudioPcmStream> &stream) const
+	{
+		return openPcmStream(fileName, stream);
+	}
 	// Sources with an efficient seek/range implementation opt in explicitly.
 	// The default decodePcmAt compatibility shim may materialize growing prefixes.
 	virtual Bool supportsPcmRangeDecode() const { return FALSE; }
@@ -311,7 +318,7 @@ public:
 	FileAudioAssetSource();
 	explicit FileAudioAssetSource(const AsciiString &rootDirectory);
 	FileAudioAssetSource(const AsciiString &rootDirectory, AudioVirtualFileSource *virtualSource);
-	~FileAudioAssetSource() override = default;
+	~FileAudioAssetSource() override;
 
 	Bool getDurationMS(const AsciiString &fileName, Real &durationMS) const override;
 	Bool decodePcm(const AsciiString &fileName, AudioPcmChunk &chunk,
@@ -320,6 +327,12 @@ public:
 		UnsignedInt maxFrames, UnsignedInt startFrame) const override;
 	Bool openPcmStream(const AsciiString &fileName,
 		std::unique_ptr<AudioPcmStream> &stream) const override;
+	Bool openPcmSampleStream(const AsciiString &fileName,
+		std::unique_ptr<AudioPcmStream> &stream) const override;
+	void setSamplePcmCacheBudget(std::size_t bytes) noexcept;
+	// Virtual files are immutable within the owner's source generation. Clear
+	// this cache at reset/close and before publishing a changed virtual source.
+	void invalidateSamplePcmCache() noexcept;
 	Bool supportsPcmRangeDecode() const override { return TRUE; }
 	const void *getFileIdentity(const AsciiString &fileName) const override;
 	Bool matchesFileIdentity(const AsciiString &fileName,
@@ -327,12 +340,14 @@ public:
 	AudioVirtualFileSource *getVirtualFileSource() const { return m_virtualSource; }
 	void setVirtualFileSource(AudioVirtualFileSource *virtualSource)
 	{
+		invalidateSamplePcmCache();
 		m_ownedVirtualSource.reset();
 		m_virtualSource = virtualSource;
 		m_virtualIdentities.clear();
 	}
 	void setOwnedVirtualFileSource(std::shared_ptr<AudioVirtualFileSource> virtualSource)
 	{
+		invalidateSamplePcmCache();
 		m_ownedVirtualSource = std::move(virtualSource);
 		m_virtualSource = m_ownedVirtualSource.get();
 		m_virtualIdentities.clear();
@@ -342,6 +357,7 @@ public:
 		const AsciiString &decayFile, Real &durationMS) const;
 
 private:
+	struct SamplePcmCache;
 	struct VirtualIdentity
 	{
 		AsciiString fileName;
@@ -360,6 +376,7 @@ private:
 	AudioVirtualFileSource *m_virtualSource = nullptr;
 	mutable std::list<std::string> m_identityPaths;
 	mutable std::list<VirtualIdentity> m_virtualIdentities;
+	std::unique_ptr<SamplePcmCache> m_samplePcmCache;
 };
 
 #if defined(RTS_NATIVE_AUDIO_ASSET_SOURCE_TEST_HOOK)

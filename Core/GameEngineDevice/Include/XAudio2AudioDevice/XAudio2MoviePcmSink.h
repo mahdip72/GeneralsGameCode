@@ -18,6 +18,7 @@ public:
 	XAudio2MoviePcmSink &operator=(const XAudio2MoviePcmSink &) = delete;
 
 	bool isReady() const noexcept;
+	bool canAccept(std::size_t submissions) const noexcept override;
 	AudioPcmSubmitResult submit(AudioPcmChunk &&chunk) override;
 	void reset(std::uint64_t generation) override;
 	void endOfStream() noexcept override;
@@ -28,6 +29,7 @@ public:
 	// separate from submit so decoder callbacks never touch XAudio2.
 	bool service() noexcept;
 	bool serviceSink() noexcept override { return service(); }
+	bool setOutputGain(double gain) noexcept override;
 	void close() noexcept override;
 
 private:

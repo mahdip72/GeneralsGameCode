@@ -29,6 +29,19 @@
 #include <windows.h>
 #include <mmsystem.h>
 
+#if defined(_WIN64)
+#include "AudioDevice/AudioAssetSource.h"
+#include "AudioDevice/NullAudioManager.h"
+#include "Common/ArchiveFileSystem.h"
+#include "Common/AudioEventInfo.h"
+#include "Common/AudioSettings.h"
+#include "Common/FileSystem.h"
+#include "Common/GameDefines.h"
+#include "Common/LocalFileSystem.h"
+#include "Common/RandomValue.h"
+#include "XAudio2AudioDevice/XAudio2AudioManager.h"
+#endif
+
 
 class Win32Mouse;
 HINSTANCE ApplicationHInstance = nullptr;
@@ -60,6 +73,259 @@ static void Check(Bool result, const char *expression, Int line)
 		++s_failures;
 	}
 }
+
+#if defined(_WIN64)
+// Only the external environment is substituted here. AudioEventRTS, GameAudio,
+// NullAudioManager and XAudio2AudioManager are the linked production sources.
+// Deny all file access, including localized asset probes, without using an
+// installed game, a shared temporary directory, or user-profile files.
+class LogicalAudioLocalFileSystem final : public LocalFileSystem
+{
+public:
+	void init() override {}
+	void reset() override {}
+	void update() override {}
+	File *openFile(const Char *, Int, size_t) override { CHECK(FALSE); return nullptr; }
+	Bool doesFileExist(const Char *) const override { return FALSE; }
+	void getFileListInDirectory(const AsciiString &, const AsciiString &,
+		const AsciiString &, FilenameList &, Bool) const override { CHECK(FALSE); }
+	Bool getFileInfo(const AsciiString &, FileInfo *) const override { return FALSE; }
+	Bool createDirectory(AsciiString) override { CHECK(FALSE); return FALSE; }
+	AsciiString normalizePath(const AsciiString &path) const override { return path; }
+};
+
+class LogicalAudioArchiveFileSystem final : public ArchiveFileSystem
+{
+public:
+	void init() override {}
+	void reset() override {}
+	void update() override {}
+	void postProcessLoad() override {}
+	ArchiveFile *openArchiveFile(const Char *) override { CHECK(FALSE); return nullptr; }
+	void closeArchiveFile(const Char *) override {}
+	void closeAllArchiveFiles() override {}
+	File *openFile(const Char *, Int, FileInstance) override { CHECK(FALSE); return nullptr; }
+	void closeAllFiles() override {}
+	Bool doesFileExist(const Char *, FileInstance) const override { return FALSE; }
+	Bool loadBigFilesFromDirectory(AsciiString, AsciiString, Bool) override
+	{
+		CHECK(FALSE);
+		return FALSE;
+	}
+};
+
+class LogicalAudioEnvironment
+{
+public:
+	LogicalAudioEnvironment() :
+		m_previousAudio(TheAudio), m_previousFileSystem(TheFileSystem),
+		m_previousLocal(TheLocalFileSystem), m_previousArchive(TheArchiveFileSystem)
+	{
+		TheFileSystem = &m_fileSystem;
+		TheLocalFileSystem = &m_local;
+		TheArchiveFileSystem = &m_archive;
+	}
+
+	~LogicalAudioEnvironment()
+	{
+		TheAudio = m_previousAudio;
+		TheFileSystem = m_previousFileSystem;
+		TheLocalFileSystem = m_previousLocal;
+		TheArchiveFileSystem = m_previousArchive;
+	}
+
+private:
+	FileSystem m_fileSystem;
+	LogicalAudioLocalFileSystem m_local;
+	LogicalAudioArchiveFileSystem m_archive;
+	AudioManager *m_previousAudio;
+	FileSystem *m_previousFileSystem;
+	LocalFileSystem *m_previousLocal;
+	ArchiveFileSystem *m_previousArchive;
+};
+
+class LogicalAudioEngineBackend final : public IXAudio2AudioEngineBackend
+{
+public:
+	HRESULT open(CriticalErrorCallback, void *) noexcept override { return S_OK; }
+	HRESULT start() noexcept override { return S_OK; }
+	HRESULT createPcmVoice(std::unique_ptr<IXAudio2PcmVoiceBackend> &) noexcept override
+	{
+		// Admission never services a request or creates a physical audio voice.
+		CHECK(FALSE);
+		return E_FAIL;
+	}
+	HRESULT stop() noexcept override { return S_OK; }
+	HRESULT close() noexcept override { return S_OK; }
+};
+
+static AudioEventInfo *ConfigureLogicalAudioFixture(AudioManager &manager, Real minimumVolume)
+{
+	TheAudio = &manager;
+	manager.AudioManager::reset();
+	AudioSettings *settings = manager.friend_getAudioSettings();
+	settings->m_audioRoot = "native-logical-audio-fixture";
+	settings->m_soundsFolder = "sounds";
+	settings->m_soundsExtension = "wav";
+	settings->m_minVolume = minimumVolume;
+
+	AudioEventInfo *info = manager.newAudioEventInfo("logical-audio-seed");
+	info->m_audioName = "logical-audio-seed";
+	info->m_soundType = AT_SoundEffect;
+	info->m_type = ST_WORLD;
+	info->m_control = AC_RANDOM;
+	info->m_priority = AP_NORMAL;
+	info->m_volume = 1.0f;
+	info->m_minVolume = 0.0f;
+	info->m_volumeShift = -0.25f;
+	info->m_pitchShiftMin = 0.9f;
+	info->m_pitchShiftMax = 1.1f;
+	info->m_delayMin = 0;
+	info->m_delayMax = 10;
+	info->m_limit = 0;
+	info->m_loopCount = 1;
+	info->m_lowPassFreq = 1.0f;
+	info->m_minDistance = 0.0f;
+	info->m_maxDistance = 100.0f;
+	info->m_sounds.push_back("main-a");
+	info->m_sounds.push_back("main-b");
+	info->m_sounds.push_back("main-c");
+	info->m_attackSounds.push_back("attack-a");
+	info->m_attackSounds.push_back("attack-b");
+	info->m_decaySounds.push_back("decay-a");
+	info->m_decaySounds.push_back("decay-b");
+	return info;
+}
+
+static void ConfigureLogicalAudioEvent(AudioEventRTS &event,
+	const AudioEventInfo *info, Bool logical)
+{
+	event.setAudioEventInfo(info);
+	event.setIsLogicalAudio(logical);
+	// Player filtering is a separate contract. This avoids requiring a game
+	// world, but does not bypass native range, capacity or event-volume culling.
+	event.setUninterruptible(TRUE);
+	event.setNextPlayPortion(PP_Sound);
+}
+
+static UnsignedInt NullLogicalAudioSeed(UnsignedInt seed, Bool logical, Int &playingIndex)
+{
+	NullAudioManager manager;
+	// The real common/Null path culls this AFTER filename/play-info generation.
+	// This provides a device-free RNG oracle without initializing SoundManager
+	// or changing any event methods, even when native rejects before queueing.
+	AudioEventInfo *info = ConfigureLogicalAudioFixture(manager, 2.0f);
+	Coord3D nearPosition = { 1.0f, 0.0f, 0.0f };
+	AudioEventRTS event(info->m_audioName, &nearPosition);
+	ConfigureLogicalAudioEvent(event, info, logical);
+	InitRandom(seed);
+	CHECK(manager.addAudioEvent(&event) == AHSV_Muted);
+	playingIndex = event.getPlayingAudioIndex();
+	CHECK(playingIndex >= 0 && playingIndex < 3);
+	return GetGameLogicRandomSeedCRC();
+}
+
+enum LogicalAudioAdmissionCase
+{
+	LogicalAudio_Near,
+	LogicalAudio_Far,
+	LogicalAudio_Capacity,
+	LogicalAudio_Muted,
+	LogicalAudio_Closed
+};
+
+static void CheckNativeLogicalAudioSeed(UnsignedInt seed, Bool logical,
+	LogicalAudioAdmissionCase admission, UnsignedInt expectedCRC, Int expectedIndex)
+{
+	XAudio2AudioService service(std::make_unique<LogicalAudioEngineBackend>());
+	AudioAssetCatalog assets;
+	XAudio2AudioManager manager(&service, &assets);
+	AudioEventInfo *info = ConfigureLogicalAudioFixture(manager, 0.01f);
+	manager.setChannelLimitsForTest(1, 1, 1);
+	manager.openDevice();
+	CHECK(manager.isOpen());
+	Coord3D position = { 1.0f, 0.0f, 0.0f };
+	if (admission == LogicalAudio_Far)
+	{
+		position.x = 200.0f;
+	}
+	if (admission == LogicalAudio_Capacity)
+	{
+		AudioEventRTS occupyingEvent(info->m_audioName, &position);
+		ConfigureLogicalAudioEvent(occupyingEvent, info, FALSE);
+		CHECK(manager.addAudioEvent(&occupyingEvent) >= AHSV_FirstHandle);
+		CHECK(manager.getPendingAudioRequestCount() == 1);
+		CHECK(manager.getNumAvailable3DSamples() == 0);
+	}
+	if (admission == LogicalAudio_Muted)
+	{
+		manager.setAudioEventVolumeOverride(info->m_audioName, 0.0f);
+	}
+	if (admission == LogicalAudio_Closed)
+	{
+		manager.closeDevice();
+		CHECK(!manager.isOpen());
+	}
+
+	AudioEventRTS event(info->m_audioName, &position);
+	ConfigureLogicalAudioEvent(event, info, logical);
+	InitRandom(seed); // The capacity occupant must not influence this comparison.
+	const AudioHandle result = manager.addAudioEvent(&event);
+	const UnsignedInt actualCRC = GetGameLogicRandomSeedCRC();
+	if (actualCRC != expectedCRC)
+	{
+		printf("Logical audio seed mismatch: seed=%u logical=%d admission=%d null=%u native=%u\n",
+			seed, logical, admission, expectedCRC, actualCRC);
+	}
+	CHECK(actualCRC == expectedCRC);
+#if RETAIL_COMPATIBLE_CRC
+	if (logical)
+	{
+		CHECK(event.getPlayingAudioIndex() == expectedIndex);
+	}
+#else
+	(void)expectedIndex;
+#endif
+	if (admission == LogicalAudio_Near)
+	{
+		CHECK(result >= AHSV_FirstHandle);
+	}
+	else
+	{
+		CHECK(result == (admission == LogicalAudio_Far ? AHSV_NotForLocal
+			: admission == LogicalAudio_Muted ? AHSV_Muted : AHSV_NoSound));
+	}
+	CHECK(manager.getPendingAudioRequestCount()
+		== (admission == LogicalAudio_Near || admission == LogicalAudio_Capacity ? 1U : 0U));
+	CHECK(manager.getActiveAudioCount() == 0);
+}
+
+static void TestNativeLogicalAudioSeed()
+{
+	LogicalAudioEnvironment environment;
+	const UnsignedInt seeds[] = { 0x01234567U, 0x89abcdefU };
+	for (Int seedIndex = 0; seedIndex < 2; ++seedIndex)
+	{
+		for (Int logical = 0; logical < 2; ++logical)
+		{
+			InitRandom(seeds[seedIndex]);
+			const UnsignedInt initialCRC = GetGameLogicRandomSeedCRC();
+			Int expectedIndex = -1;
+			const UnsignedInt expectedCRC = NullLogicalAudioSeed(seeds[seedIndex], logical, expectedIndex);
+#if RETAIL_COMPATIBLE_CRC
+			CHECK(logical ? expectedCRC != initialCRC : expectedCRC == initialCRC);
+#else
+			CHECK(expectedCRC == initialCRC);
+#endif
+			for (Int admission = LogicalAudio_Near; admission <= LogicalAudio_Closed; ++admission)
+			{
+				CheckNativeLogicalAudioSeed(seeds[seedIndex], logical,
+					static_cast<LogicalAudioAdmissionCase>(admission), expectedCRC, expectedIndex);
+			}
+		}
+	}
+}
+#endif
 
 static void TestTextureLoadQueuePublication()
 {
@@ -1072,6 +1338,23 @@ static void TestSkirmishAITestRunnerContract()
 int main(int argc, char **argv)
 {
 	initMemoryManager();
+#if defined(_WIN64)
+	if (argc == 2 && strcmp(argv[1], "--native-logical-audio") == 0)
+	{
+		printf("Running 20 production-linked, device-free logical audio cases.\n");
+		fflush(stdout);
+		TestNativeLogicalAudioSeed();
+		if (s_failures != 0)
+		{
+			printf("%d native logical audio test(s) failed.\n", s_failures);
+			shutdownMemoryManager();
+			return 1;
+		}
+		printf("All native logical audio tests passed.\n");
+		shutdownMemoryManager();
+		return 0;
+	}
+#endif
 	if (argc == 2 && strcmp(argv[1], "--texture-load-queue-contract") == 0)
 	{
 		TestTextureLoadQueuePublication();

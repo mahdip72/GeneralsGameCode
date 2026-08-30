@@ -41,11 +41,14 @@
 
 #pragma once
 
+#include <stddef.h>
+
 //----------------------------------------------------------------------------
 //           Includes
 //----------------------------------------------------------------------------
 
 #include "GameClient/VideoPlayer.h"
+#include "WW3D2/ww3dformat.h"
 
 //----------------------------------------------------------------------------
 //           Forward References
@@ -74,6 +77,8 @@ class W3DVideoBuffer : public VideoBuffer
 		TextureClass	*m_texture;
 		SurfaceClass	*m_surface;
 		Bool m_surfaceLocked;
+		void *m_lockedMemory;
+		Bool m_framePublished;
 
 	public:
 
@@ -83,6 +88,10 @@ class W3DVideoBuffer : public VideoBuffer
 		virtual	Bool		allocate( UnsignedInt width, UnsignedInt height) override; ///< Allocates buffer
 		virtual void		free() override;					///< Free buffer
 		virtual	void*		lock() override;					///< Returns memory pointer to start of buffer
+		static Bool		ComputeDirectBGRA8SlicePitch(Type format,
+			UnsignedInt width, UnsignedInt height, UnsignedInt pitch,
+			size_t *slice_pitch);
+		virtual Bool		publishLockedFrame() override;	///< Publish an opaque BGRA8 frame before unlock
 		virtual void		unlock() override;				///< Release buffer
 		virtual Bool		valid() override;				///< Is the buffer valid to use
 
@@ -98,3 +107,31 @@ class W3DVideoBuffer : public VideoBuffer
 //----------------------------------------------------------------------------
 
 inline TextureClass* W3DVideoBuffer::texture() { return m_texture; }
+
+inline Bool W3DVideoBuffer::ComputeDirectBGRA8SlicePitch(
+	Type format, UnsignedInt width, UnsignedInt height, UnsignedInt pitch,
+	size_t *slice_pitch)
+{
+	if (slice_pitch == 0 || format != TYPE_X8R8G8B8 || width == 0 ||
+		height == 0)
+	{
+		return FALSE;
+	}
+
+	const size_t width_size = static_cast<size_t>(width);
+	const size_t row_pitch = static_cast<size_t>(pitch);
+	const size_t maximum_size = static_cast<size_t>(-1);
+	if (width_size > maximum_size / 4U)
+	{
+		return FALSE;
+	}
+	const size_t minimum_row_pitch = width_size * 4U;
+	if (row_pitch < minimum_row_pitch ||
+		row_pitch > maximum_size / static_cast<size_t>(height))
+	{
+		return FALSE;
+	}
+
+	*slice_pitch = row_pitch * static_cast<size_t>(height);
+	return TRUE;
+}

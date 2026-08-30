@@ -73,18 +73,22 @@ class FFmpegVideoStream : public VideoStream
 		UnsignedInt64	m_startTime = 0;		///< Time the stream started
 
 		virtual ~FFmpegVideoStream();
-		FFmpegVideoStream(FFmpegFile* file, AudioPcmSink *audioSink);
+		FFmpegVideoStream(FFmpegFile* file, AudioPcmSink *audioSink, double initialGain);
 
 		static void onFrame(const AVFrame *frame, const FFmpegFrameMetadata &metadata, void *user_data);
+		void syncSpeechGain();
+		void markPlaybackFailed();
 	public:
 
 		virtual void update();											///< Update bink stream
 
 		virtual Bool	isFrameReady();								///< Is the frame ready to be displayed
 		virtual Bool	isFinished() const;
+		virtual Bool	isPlaybackFailed() const;
 		virtual void	frameDecompress();						///< Render current frame in to buffer
 		virtual void	frameRender( VideoBuffer *buffer ); ///< Render current frame in to buffer
 		virtual void	frameNext();									///< Advance to next frame
+		virtual Bool	finishPlayback();
 		virtual Int		frameIndex();									///< Returns zero based index of current frame
 		virtual Int		frameCount();									///< Returns the total number of frames in the stream
 		virtual Bool	frameGoto( Int index );							///< Go to the specified frame index

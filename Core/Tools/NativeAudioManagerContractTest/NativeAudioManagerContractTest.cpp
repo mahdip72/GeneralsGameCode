@@ -30,6 +30,9 @@ class View;
 extern View *TheTacticalView;
 extern int g_nativeAudioBaseUpdateCalls;
 extern Bool g_nativeAudioShroudedForTest;
+extern Bool g_nativeAudioDeadObjectForTest;
+extern Bool g_nativeAudioNullPositionForTest;
+extern Coord3D g_nativeAudioObjectPositionForTest;
 
 static_assert(std::is_base_of<AudioManager, NullAudioManager>::value,
 	"NullAudioManager must implement the common AudioManager contract");
@@ -99,12 +102,14 @@ namespace
 	{
 	public:
 		FakeVoice(Bool failCreate, Bool failSubmit, Bool failStop, Bool failFlush,
-			int *totalSubmitCalls) :
+			int *totalSubmitCalls, int *activeVoiceCount, int *peakVoiceCount) :
 			m_failCreate(failCreate),
 			m_failSubmit(failSubmit),
 			m_failStop(failStop),
 			m_failFlush(failFlush),
-			m_totalSubmitCalls(totalSubmitCalls)
+			m_totalSubmitCalls(totalSubmitCalls),
+			m_activeVoiceCount(activeVoiceCount),
+			m_peakVoiceCount(peakVoiceCount)
 		{
 		}
 		HRESULT create(const WAVEFORMATEX &, IXAudio2VoiceCallback *callback) noexcept override
@@ -113,12 +118,19 @@ namespace
 				return E_FAIL;
 			}
 			m_callback = callback;
+			++(*m_activeVoiceCount);
+			*m_peakVoiceCount = std::max(*m_peakVoiceCount, *m_activeVoiceCount);
+			m_created = TRUE;
 			return S_OK;
 		}
 		HRESULT submit(const XAUDIO2_BUFFER &buffer) noexcept override
 		{
 			if (m_failSubmit) {
 				return E_FAIL;
+			}
+			if (submitCalls == 0) {
+				firstSubmitVolumeCalls = volumeCalls;
+				firstSubmitMatrixCalls = matrixCalls;
 			}
 			m_lastContext = buffer.pContext;
 			m_pendingContexts.push_back(buffer.pContext);
@@ -134,7 +146,12 @@ namespace
 			}
 			return S_OK;
 		}
-		HRESULT start() noexcept override { return S_OK; }
+		HRESULT start() noexcept override
+		{
+			++startCalls;
+			playbackStarted = TRUE;
+			return S_OK;
+		}
 		HRESULT stop() noexcept override { return m_failStop ? E_FAIL : S_OK; }
 		HRESULT flush() noexcept override { return m_failFlush ? E_FAIL : S_OK; }
 		HRESULT setVolume(float volume) noexcept override
@@ -152,10 +169,22 @@ namespace
 			++matrixCalls;
 			return S_OK;
 		}
-		HRESULT pause() noexcept override { return S_OK; }
-		HRESULT resume() noexcept override { return S_OK; }
+		HRESULT pause() noexcept override { playbackStarted = FALSE; return S_OK; }
+		HRESULT resume() noexcept override
+		{
+			++resumeCalls;
+			playbackStarted = TRUE;
+			return S_OK;
+		}
 		HRESULT getCriticalError() const noexcept override { return S_OK; }
-		void destroy() noexcept override { m_callback = nullptr; }
+		void destroy() noexcept override
+		{
+			if (m_created) {
+				--(*m_activeVoiceCount);
+				m_created = FALSE;
+			}
+			m_callback = nullptr;
+		}
 		Bool completeLastBuffer() noexcept
 		{
 			if (m_callback == nullptr || m_pendingContexts.empty()) {
@@ -183,6 +212,11 @@ namespace
 			return TRUE;
 		}
 		int submitCalls = 0;
+		int startCalls = 0;
+		int resumeCalls = 0;
+		Bool playbackStarted = FALSE;
+		int firstSubmitVolumeCalls = 0;
+		int firstSubmitMatrixCalls = 0;
 		float lastVolume = 0.0f;
 		int volumeCalls = 0;
 		UINT32 matrixSourceChannels = 0;
@@ -197,6 +231,9 @@ namespace
 		Bool m_failStop;
 		Bool m_failFlush;
 		int *m_totalSubmitCalls;
+		int *m_activeVoiceCount;
+		int *m_peakVoiceCount;
+		Bool m_created = FALSE;
 		IXAudio2VoiceCallback *m_callback = nullptr;
 		void *m_lastContext = nullptr;
 		std::vector<void *> m_pendingContexts;
@@ -225,7 +262,8 @@ namespace
 				return E_FAIL;
 			}
 			std::unique_ptr<FakeVoice> created = std::make_unique<FakeVoice>(
-				failVoiceCreate, failSubmit, failStop, failFlush, &totalSubmitCalls);
+				failVoiceCreate, failSubmit, failStop, failFlush, &totalSubmitCalls,
+				&activeVoiceCount, &peakVoiceCount);
 			lastVoice = created.get();
 			voices.push_back(lastVoice);
 			voice = std::move(created);
@@ -247,6 +285,8 @@ namespace
 		Bool failStop = FALSE;
 		Bool failFlush = FALSE;
 		int totalSubmitCalls = 0;
+		int activeVoiceCount = 0;
+		int peakVoiceCount = 0;
 		int openCalls = 0;
 		int startCalls = 0;
 		int stopCalls = 0;
@@ -492,7 +532,7 @@ int main()
 	_set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
 #endif
 	const std::filesystem::path realRoot = std::filesystem::temp_directory_path()
-		/ "rts-native-audio-manager-real-source";
+		/ ("rts-native-audio-manager-real-source-" + std::to_string(GetCurrentProcessId()));
 	std::filesystem::create_directories(realRoot);
 	const std::filesystem::path realAttack = realRoot / "attack.wav";
 	const std::filesystem::path realMain = realRoot / "main.wav";
@@ -542,6 +582,32 @@ int main()
 	catalog.setDurationMS(AsciiString("main.wav"), 400.0f);
 	catalog.setDurationMS(AsciiString("decay.wav"), 50.0f);
 	catalog.setDurationMS(AsciiString("long.wav"), 2500.0f);
+	{
+		XAudio2AudioService capacityService(std::make_unique<FakeEngine>());
+		XAudio2AudioManager capacityManager(&capacityService, &catalog);
+		AudioSettings capacitySettings;
+		capacitySettings.m_sampleCount2D = 4;
+		capacitySettings.m_sampleCount3D = 25;
+		capacitySettings.m_streamCount = 3;
+		capacitySettings.m_defaultSpeakerType3D = 0;
+		capacityManager.setAudioSettingsForTest(&capacitySettings);
+		capacityManager.init();
+		check(capacityManager.getNum3DSamples() == 57U
+			&& capacityManager.getNum2DSamples() == 4U && capacityManager.getNumStreams() == 3U,
+			"native 3D capacity expands to the adaptive ceiling after 2D and stream reservations");
+		capacitySettings.m_sampleCount2D = 40;
+		capacitySettings.m_streamCount = 30;
+		capacityManager.init();
+		check(capacityManager.getNum3DSamples() == 25U,
+			"reservations above the adaptive target do not underflow or shrink configured 3D capacity");
+		capacitySettings.m_sampleCount2D = 4;
+		capacitySettings.m_sampleCount3D = 80;
+		capacitySettings.m_streamCount = 3;
+		capacityManager.init();
+		check(capacityManager.getNum3DSamples() == 80U,
+			"configured 3D capacity above the adaptive target is preserved");
+		capacityManager.closeDevice();
+	}
 	XAudio2AudioManager manager(&service, &catalog);
 	manager.openDevice();
 	check(manager.isOpen(), "manager opens the injected device-free service");
@@ -571,6 +637,34 @@ int main()
 	fixtureInfo->m_sounds.push_back(AsciiString("main.wav"));
 	fixtureInfo->m_attackSounds.push_back(AsciiString("attack.wav"));
 	fixtureInfo->m_decaySounds.push_back(AsciiString("decay.wav"));
+	{
+		std::unique_ptr<FakeEngine> pendingOwnedEngine = std::make_unique<FakeEngine>();
+		FakeEngine *pendingEngine = pendingOwnedEngine.get();
+		XAudio2AudioService pendingService(std::move(pendingOwnedEngine));
+		XAudio2AudioManager pendingManager(&pendingService, &catalog);
+		pendingManager.openDevice();
+		FixtureEvent pendingEvent(AsciiString("pause-before-service"));
+		pendingEvent.setAudioEventInfo(fixtureInfo);
+		const AudioHandle pendingHandle = pendingManager.addAudioEvent(&pendingEvent);
+		pendingManager.processRequestList();
+		FakeVoice *pendingVoice = pendingEngine->lastVoice;
+		check(pendingVoice != nullptr && pendingVoice->submitCalls == 0
+			&& pendingVoice->startCalls == 0 && pendingManager.isCurrentlyPlaying(pendingHandle),
+			"pause fixture queues its first phase before native voice service");
+		pendingManager.pauseAudio(AudioAffect_Sound);
+		pendingManager.update();
+		check(pendingVoice != nullptr && pendingVoice->submitCalls == 0
+			&& pendingVoice->startCalls == 0 && !pendingVoice->playbackStarted
+			&& pendingManager.isCurrentlyPlaying(pendingHandle),
+			"pausing before the first service keeps pending PCM silent without losing its handle");
+		pendingManager.resumeAudio(AudioAffect_Sound);
+		pendingManager.update();
+		check(pendingVoice != nullptr && pendingVoice->submitCalls == 1
+			&& pendingVoice->startCalls + pendingVoice->resumeCalls == 1
+			&& pendingVoice->playbackStarted,
+			"resuming a pending phase submits it once and starts playback once");
+		pendingManager.closeDevice();
+	}
 
 	AudioSettings admissionSettings;
 	admissionSettings.m_minVolume = 0.5f;
@@ -640,6 +734,10 @@ int main()
 	check(delayedEvent.getPlayingAudioIndex() >= 0,
 		"common admission updates the caller event's selected sound index");
 	FakeVoice *positionalVoice = engine->lastVoice;
+	check(positionalVoice != nullptr && positionalVoice->submitCalls == 1
+		&& positionalVoice->startCalls == 1 && positionalVoice->firstSubmitVolumeCalls > 0
+		&& positionalVoice->firstSubmitMatrixCalls > 0,
+		"first update submits and starts a positional phase only after gain and spatial controls");
 	manager.update();
 	manager.pauseAudio(AudioAffect_Sound3D);
 	manager.resumeAudio(AudioAffect_Sound);
@@ -660,20 +758,17 @@ int main()
 		"paused records do not advance phases on completion");
 	manager.resumeAudio(AudioAffect_Sound3D);
 	manager.update();
-	manager.update();
-	check(positionalVoice->submitCalls >= 2,
-		"resuming the exact affect advances the positional event to its next phase");
+	check(positionalVoice->submitCalls == 2,
+		"resuming the exact affect submits the next phase in that same update");
 
 	check(delayedVoice->completeLastBuffer(), "fake backend completes the attack phase");
 	manager.update();
-	manager.update();
-	check(delayedVoice->submitCalls >= 2,
-		"manager continues the event with its main phase after completion");
+	check(delayedVoice->submitCalls == 2,
+		"manager submits the main phase in the update that observes attack completion");
 	check(delayedVoice->completeLastBuffer(), "fake backend completes the main phase");
 	manager.update();
-	manager.update();
-	check(delayedVoice->submitCalls >= 3,
-		"manager continues the event with its decay phase after completion");
+	check(delayedVoice->submitCalls == 3,
+		"manager submits the decay phase in the update that observes main completion");
 	check(delayedVoice->completeLastBuffer(), "fake backend completes the decay phase");
 	manager.update();
 	check(!manager.isCurrentlyPlaying(delayedHandle) && manager.getActiveAudioCount() == 1,
@@ -1055,7 +1150,6 @@ int main()
 	lowInfo->m_priority = AP_LOW;
 	FixtureEvent lowPriorityEvent(AsciiString("policy-low"));
 	lowPriorityEvent.setAudioEventInfo(lowInfo);
-	lowPriorityEvent.setAudioPriority(AP_LOW);
 	const AudioHandle lowPriorityHandle = manager.addAudioEvent(&lowPriorityEvent);
 	manager.update();
 	check(manager.isCurrentlyPlaying(lowPriorityHandle),
@@ -1066,12 +1160,15 @@ int main()
 	highInfo->m_priority = AP_HIGH;
 	FixtureEvent highPriorityEvent(AsciiString("policy-high"));
 	highPriorityEvent.setAudioEventInfo(highInfo);
-	highPriorityEvent.setAudioPriority(AP_HIGH);
+	check(lowPriorityEvent.getAudioPriority() == AP_NORMAL
+		&& highPriorityEvent.getAudioPriority() == AP_NORMAL
+		&& manager.isPlayingLowerPriority(&highPriorityEvent),
+		"replacement admission uses INI priorities while event runtime priorities remain at defaults");
 	const AudioHandle highPriorityHandle = manager.addAudioEvent(&highPriorityEvent);
 	manager.update();
 	check(manager.isCurrentlyPlaying(highPriorityHandle)
 		&& !manager.isCurrentlyPlaying(lowPriorityHandle),
-		"configured channel policy replaces a lower-priority event");
+		"configured channel policy replaces a lower-INI-priority event without a runtime override");
 	manager.stopAudio(AudioAffect_Sound);
 	manager.update();
 
@@ -1084,7 +1181,6 @@ int main()
 	manager.update();
 	FixtureEvent blockedEvent(AsciiString("policy-blocked"));
 	blockedEvent.setAudioEventInfo(highInfo);
-	blockedEvent.setAudioPriority(AP_HIGH);
 	const AudioHandle blockedHandle = manager.addAudioEvent(&blockedEvent);
 	manager.update();
 	check(manager.isCurrentlyPlaying(protectedHandle) && !manager.isCurrentlyPlaying(blockedHandle),
@@ -1103,8 +1199,7 @@ int main()
 	check(manager.isCurrentlyPlaying(objectVoiceHandle) && manager.isObjectPlayingVoice(42U),
 		"configured object voice query reports the active voice record");
 	FixtureEvent voiceReplacement(AsciiString("policy-voice-replacement"));
-	voiceReplacement.setAudioEventInfo(objectInfo);
-	voiceReplacement.setAudioPriority(AP_HIGH);
+	voiceReplacement.setAudioEventInfo(highInfo);
 	Coord3D voiceReplacementPosition;
 	voiceReplacementPosition.set(12.0f, 0.0f, 0.0f);
 	voiceReplacement.setPosition(&voiceReplacementPosition);
@@ -1116,12 +1211,77 @@ int main()
 	manager.stopAudio(AudioAffect_Sound3D);
 	manager.update();
 
+	AudioEventInfo *criticalInfo = newInstance(AudioEventInfo);
+	*criticalInfo = *lowInfo;
+	criticalInfo->m_priority = AP_CRITICAL;
+	FixtureEvent criticalEvent(AsciiString("policy-critical"));
+	criticalEvent.setAudioEventInfo(criticalInfo);
+	criticalEvent.setPosition(&voiceReplacementPosition);
+	const AudioHandle criticalHandle = manager.addAudioEvent(&criticalEvent);
+	manager.update();
+	AudioEventInfo *interruptInfo = newInstance(AudioEventInfo);
+	*interruptInfo = *criticalInfo;
+	interruptInfo->m_control = AC_INTERRUPT;
+	FixtureEvent criticalInterrupt(AsciiString("policy-critical-interrupt"));
+	criticalInterrupt.setAudioEventInfo(interruptInfo);
+	criticalInterrupt.setPosition(&voiceReplacementPosition);
+	check(criticalEvent.getAudioPriority() == AP_NORMAL
+		&& !manager.isPlayingLowerPriority(&criticalInterrupt),
+		"INI-critical positional audio is not an eligible interrupt victim");
+	const AudioHandle criticalInterruptHandle = manager.addAudioEvent(&criticalInterrupt);
+	manager.update();
+	check(manager.isCurrentlyPlaying(criticalHandle)
+		&& !manager.isCurrentlyPlaying(criticalInterruptHandle),
+		"AC_INTERRUPT cannot steal INI-critical audio whose runtime priority was never overridden");
+	manager.stopAudio(AudioAffect_Sound3D);
+	manager.update();
+	deleteInstance(interruptInfo);
+	deleteInstance(criticalInfo);
+
+	manager.setChannelLimitsForTest(1U, 2U, 1U);
+	AudioEventInfo *protectedLoopInfo = newInstance(AudioEventInfo);
+	*protectedLoopInfo = *lowInfo;
+	protectedLoopInfo->m_priority = AP_LOWEST;
+	protectedLoopInfo->m_control = AC_LOOP;
+	protectedLoopInfo->m_loopCount = 10;
+	for (int equalPriority = 0; equalPriority < 2; ++equalPriority) {
+		FixtureEvent protectedLoop(AsciiString("policy-protected-loop"));
+		protectedLoop.setAudioEventInfo(protectedLoopInfo);
+		protectedLoop.setPosition(&voiceReplacementPosition);
+		const AudioHandle protectedLoopHandle = manager.addAudioEvent(&protectedLoop);
+		manager.update();
+		AudioEventInfo *eligibleInfo = newInstance(AudioEventInfo);
+		*eligibleInfo = *lowInfo;
+		eligibleInfo->m_priority = equalPriority ? AP_LOWEST : AP_LOW;
+		FixtureEvent eligibleEvent(AsciiString("policy-eligible-victim"));
+		eligibleEvent.setAudioEventInfo(eligibleInfo);
+		eligibleEvent.setPosition(&voiceReplacementPosition);
+		const AudioHandle eligibleHandle = manager.addAudioEvent(&eligibleEvent);
+		manager.update();
+		FixtureEvent incomingEvent(AsciiString("policy-eligible-replacement"));
+		incomingEvent.setAudioEventInfo(highInfo);
+		incomingEvent.setPosition(&voiceReplacementPosition);
+		check(manager.getNumAvailable3DSamples() == 0U
+			&& manager.isPlayingLowerPriority(&incomingEvent),
+			"full-pool admission finds an eligible victim beyond an older protected loop");
+		const AudioHandle incomingHandle = manager.addAudioEvent(&incomingEvent);
+		manager.update();
+		check(manager.isCurrentlyPlaying(protectedLoopHandle)
+			&& !manager.isCurrentlyPlaying(eligibleHandle)
+			&& manager.isCurrentlyPlaying(incomingHandle) && manager.getActiveAudioCount() == 2U,
+			equalPriority ? "equal-priority victim selection skips the older protected loop"
+				: "lowest-priority protected loop does not conceal an eligible ordinary victim");
+		manager.stopAudio(AudioAffect_Sound3D);
+		manager.update();
+		deleteInstance(eligibleInfo);
+	}
+	deleteInstance(protectedLoopInfo);
+
 	manager.setChannelLimitsForTest(1U, 1U, 1U);
 	Coord3D forcedPosition;
 	forcedPosition.set(14.0f, 0.0f, 0.0f);
 	FixtureEvent forcedFiller(AsciiString("policy-forced-filler"));
 	forcedFiller.setAudioEventInfo(lowInfo);
-	forcedFiller.setAudioPriority(AP_LOW);
 	forcedFiller.setPosition(&forcedPosition);
 	const AudioHandle forcedFillerHandle = manager.addAudioEvent(&forcedFiller);
 	manager.update();
@@ -1133,7 +1293,6 @@ int main()
 	forcedInfo->m_type = ST_WORLD | ST_VOICE;
 	FixtureEvent forcedEvent(AsciiString("policy-forced-voice"));
 	forcedEvent.setAudioEventInfo(forcedInfo);
-	forcedEvent.setPosition(&forcedPosition);
 	forcedEvent.setObjectID(static_cast<ObjectID>(99U));
 	manager.friend_forcePlayAudioEventRTS(&forcedEvent);
 	manager.update();
@@ -1145,7 +1304,6 @@ int main()
 	forcedHighInfo->m_priority = AP_HIGH;
 	FixtureEvent forcedHigh(AsciiString("policy-after-force-high"));
 	forcedHigh.setAudioEventInfo(forcedHighInfo);
-	forcedHigh.setAudioPriority(AP_HIGH);
 	forcedHigh.setPosition(&forcedPosition);
 	const AudioHandle forcedHighHandle = manager.addAudioEvent(&forcedHigh);
 	manager.update();
@@ -1156,7 +1314,6 @@ int main()
 	forcedLowInfo->m_audioName = AsciiString("policy-after-force-low");
 	FixtureEvent forcedLow(AsciiString("policy-after-force-low"));
 	forcedLow.setAudioEventInfo(forcedLowInfo);
-	forcedLow.setAudioPriority(AP_LOW);
 	forcedLow.setPosition(&forcedPosition);
 	const AudioHandle forcedLowHandle = manager.addAudioEvent(&forcedLow);
 	manager.update();
@@ -1169,6 +1326,147 @@ int main()
 	deleteInstance(forcedInfo);
 	deleteInstance(forcedHighInfo);
 	deleteInstance(forcedLowInfo);
+
+	AudioSettings lifecycleSettings;
+	lifecycleSettings.m_use3DSoundRangeVolumeFade = TRUE;
+	lifecycleSettings.m_3DSoundRangeVolumeFadeExponent = 1.0f;
+	lifecycleSettings.m_globalMinRange = 10;
+	lifecycleSettings.m_globalMaxRange = 100;
+	lifecycleSettings.m_minVolume = 0.01f;
+	manager.setAudioSettingsForTest(&lifecycleSettings);
+	AudioEventInfo *lifecycleInfo = newInstance(AudioEventInfo);
+	*lifecycleInfo = *lowInfo;
+	lifecycleInfo->m_control = AC_LOOP;
+	lifecycleInfo->m_loopCount = 10;
+	check(engine->activeVoiceCount == 0, "lifecycle fixtures start with no stale backend voices");
+	for (int cycle = 0; cycle < 6; ++cycle) {
+		for (int retirement = 0; retirement < 3; ++retirement) {
+			g_nativeAudioDeadObjectForTest = FALSE;
+			g_nativeAudioObjectPositionForTest.set(10.0f, 0.0f, 0.0f);
+			FixtureEvent movingLoop(AsciiString("lifecycle-moving-loop"));
+			movingLoop.setAudioEventInfo(lifecycleInfo);
+			movingLoop.setObjectID(static_cast<ObjectID>(77U));
+			const AudioHandle movingHandle = manager.addAudioEvent(&movingLoop);
+			manager.update();
+			check(manager.isCurrentlyPlaying(movingHandle)
+				&& manager.getActiveAudioCount() == 1U && engine->activeVoiceCount == 1,
+				"repeated positional lifecycle starts exactly one manager record and backend voice");
+			if (cycle == 0 && retirement == 0) {
+				check(engine->lastVoice != nullptr
+					&& std::abs(engine->lastVoice->lastVolume - 0.00000838953f) < 0.00000001f,
+					"zero minimum range uses the legacy provider epsilon after gain conversion");
+				check(manager.isCurrentlyPlaying(movingHandle),
+					"culling compares raw effective volume, not the quieter converted provider gain");
+			}
+			if (retirement == 0) {
+				g_nativeAudioObjectPositionForTest.set(100.0f, 0.0f, 0.0f);
+			} else if (retirement == 1) {
+				g_nativeAudioDeadObjectForTest = TRUE;
+			} else {
+				manager.stopAudio(AudioAffect_Sound3D);
+			}
+			manager.update();
+			check(!manager.isCurrentlyPlaying(movingHandle)
+				&& manager.getActiveAudioCount() == 0U
+				&& manager.getPendingAudioRequestCount() == 0U
+				&& manager.getNumAvailable3DSamples() == 1U && engine->activeVoiceCount == 0,
+				"repeated movement, death, and stop release records, requests, channels, and backend voices");
+		}
+	}
+	g_nativeAudioDeadObjectForTest = FALSE;
+	g_nativeAudioObjectPositionForTest.set(10.0f, 0.0f, 0.0f);
+	FixtureEvent inaudibleLoop(AsciiString("lifecycle-inaudible-loop"));
+	inaudibleLoop.setAudioEventInfo(lifecycleInfo);
+	inaudibleLoop.setObjectID(static_cast<ObjectID>(77U));
+	const AudioHandle inaudibleHandle = manager.addAudioEvent(&inaudibleLoop);
+	manager.update();
+	check(manager.isCurrentlyPlaying(inaudibleHandle), "range-volume fixture starts audibly");
+	g_nativeAudioObjectPositionForTest.set(99.5f, 0.0f, 0.0f);
+	manager.update();
+	check(!manager.isCurrentlyPlaying(inaudibleHandle) && engine->activeVoiceCount == 0,
+		"ordinary 3D loops retire below the minimum volume before reaching maximum range");
+
+	g_nativeAudioObjectPositionForTest.set(10.0f, 0.0f, 0.0f);
+	FixtureEvent nullPositionLoop(AsciiString("lifecycle-null-position"));
+	nullPositionLoop.setAudioEventInfo(lifecycleInfo);
+	nullPositionLoop.setObjectID(static_cast<ObjectID>(77U));
+	const AudioHandle nullPositionHandle = manager.addAudioEvent(&nullPositionLoop);
+	manager.update();
+	check(manager.isCurrentlyPlaying(nullPositionHandle), "null-position fixture starts with a live emitter");
+	g_nativeAudioNullPositionForTest = TRUE;
+	manager.update();
+	g_nativeAudioNullPositionForTest = FALSE;
+	check(!manager.isCurrentlyPlaying(nullPositionHandle) && engine->activeVoiceCount == 0,
+		"a missing current emitter position retires its backend voice");
+
+	for (int critical = 0; critical < 2; ++critical) {
+		AudioEventInfo *exemptInfo = newInstance(AudioEventInfo);
+		*exemptInfo = *lifecycleInfo;
+		exemptInfo->m_type = critical ? ST_WORLD : ST_WORLD | ST_GLOBAL;
+		exemptInfo->m_priority = critical ? AP_CRITICAL : AP_LOW;
+		g_nativeAudioDeadObjectForTest = FALSE;
+		g_nativeAudioObjectPositionForTest.set(10.0f, 0.0f, 0.0f);
+		FixtureEvent exemptLoop(AsciiString("lifecycle-exempt-loop"));
+		exemptLoop.setAudioEventInfo(exemptInfo);
+		exemptLoop.setObjectID(static_cast<ObjectID>(77U));
+		const AudioHandle exemptHandle = manager.addAudioEvent(&exemptLoop);
+		manager.update();
+		check(manager.isCurrentlyPlaying(exemptHandle), "range-exempt loop starts with a live emitter");
+		if (!critical) {
+			FakeVoice *ambientVoice = engine->lastVoice;
+			manager.setVolume(0.5f, AudioAffect_Sound3D);
+			manager.setVolume(0.25f,
+				static_cast<AudioAffect>(AudioAffect_Sound3D | AudioAffect_SystemSetting));
+			manager.update();
+			check(ambientVoice != nullptr && std::abs(ambientVoice->lastVolume - 0.03125f) < 0.000001f,
+				"3D ambiance converts combined live system-slider and script volume to legacy gain");
+			manager.setVolume(0.0f,
+				static_cast<AudioAffect>(AudioAffect_Sound3D | AudioAffect_SystemSetting));
+			manager.update();
+			check(manager.isCurrentlyPlaying(exemptHandle) && ambientVoice->lastVolume == 0.0f,
+				"muting the 3D slider silences active global ambiance without retiring its loop");
+			manager.setVolume(1.0f,
+				static_cast<AudioAffect>(AudioAffect_Sound3D | AudioAffect_SystemSetting));
+			manager.setVolume(1.0f, AudioAffect_Sound3D);
+			manager.update();
+			check(std::abs(ambientVoice->lastVolume - 1.0f) < 0.001f,
+				"restoring the 3D slider restores the same active ambiance voice");
+		}
+		g_nativeAudioObjectPositionForTest.set(200.0f, 0.0f, 0.0f);
+		manager.update();
+		check(manager.isCurrentlyPlaying(exemptHandle)
+			&& manager.getActiveAudioCount() == 1U && engine->activeVoiceCount == 1,
+			critical ? "live INI-critical 3D loops survive range and volume culling"
+				: "live global 3D loops survive range and volume culling");
+		g_nativeAudioDeadObjectForTest = TRUE;
+		manager.update();
+		check(!manager.isCurrentlyPlaying(exemptHandle)
+			&& manager.getActiveAudioCount() == 0U && engine->activeVoiceCount == 0,
+			critical ? "critical priority never exempts a dead emitter from retirement"
+				: "global audio never exempts a dead emitter from retirement");
+		deleteInstance(exemptInfo);
+	}
+	g_nativeAudioDeadObjectForTest = FALSE;
+	g_nativeAudioObjectPositionForTest.zero();
+	AudioEventInfo *nonWorldInfo = newInstance(AudioEventInfo);
+	*nonWorldInfo = *lifecycleInfo;
+	nonWorldInfo->m_type = ST_UI;
+	FixtureEvent nonWorldEvent(AsciiString("lifecycle-non-world-ui"));
+	nonWorldEvent.setAudioEventInfo(nonWorldInfo);
+	nonWorldEvent.setPosition(&outOfRangePosition);
+	check(!nonWorldEvent.isPositionalAudio() && nonWorldEvent.getObjectID() == INVALID_ID,
+		"position storage alone does not classify non-world UI audio as 3D or object-owned");
+	const AudioHandle nonWorldHandle = manager.addAudioEvent(&nonWorldEvent);
+	manager.update();
+	g_nativeAudioNullPositionForTest = TRUE;
+	manager.update();
+	g_nativeAudioNullPositionForTest = FALSE;
+	check(manager.isCurrentlyPlaying(nonWorldHandle),
+		"3D emitter lifecycle checks do not retire non-world UI audio");
+	manager.killAudioEventImmediately(nonWorldHandle);
+	deleteInstance(nonWorldInfo);
+	manager.setAudioSettingsForTest(nullptr);
+	deleteInstance(lifecycleInfo);
 
 	AudioEventInfo *pendingLimitInfo = newInstance(AudioEventInfo);
 	*pendingLimitInfo = *lowInfo;
@@ -1215,23 +1513,255 @@ int main()
 	loopEvent.setAudioEventInfo(loopInfo);
 	const AudioHandle loopHandle = manager.addAudioEvent(&loopEvent);
 	manager.update();
-	manager.update();
 	FakeVoice *loopVoice = engine->lastVoice;
 	check(loopVoice != nullptr && loopVoice->completeLastBuffer(),
 		"fake backend completes loop audio");
 	manager.update();
-	manager.update();
-	check(manager.isCurrentlyPlaying(loopHandle) && loopVoice->submitCalls >= 2,
-		"AC_LOOP audio deterministically restarts after terminal phase completion");
+	check(manager.isCurrentlyPlaying(loopHandle) && loopVoice->submitCalls == 2,
+		"AC_LOOP audio restarts in the update that observes terminal phase completion");
 	manager.stopAudio(AudioAffect_Sound);
 	manager.update();
+
+	// A completed attack consumes one loop in Miles. Decay plays only once,
+	// after the finite loop count expires; zero is the infinite sentinel.
+	struct PhaseSequenceCase
+	{
+		Bool attack;
+		Bool decay;
+		Bool looping;
+		Int count;
+		const char *sequence;
+	};
+	const PhaseSequenceCase phaseCases[] = {
+		{FALSE, TRUE, TRUE, 1, "SD"},
+		{FALSE, TRUE, TRUE, 2, "SSD"},
+		{FALSE, TRUE, TRUE, 3, "SSSD"},
+		{FALSE, TRUE, TRUE, 0, "SSSS"},
+		{TRUE, TRUE, TRUE, 1, "AD"},
+		{TRUE, TRUE, TRUE, 2, "ASD"},
+		{TRUE, TRUE, TRUE, 3, "ASSD"},
+		{TRUE, TRUE, TRUE, 0, "ASSS"},
+		{TRUE, TRUE, FALSE, 3, "ASD"},
+		{FALSE, TRUE, FALSE, 3, "SD"},
+		{FALSE, FALSE, TRUE, 1, "S"},
+		{TRUE, FALSE, TRUE, 2, "AS"}
+	};
+	for (const PhaseSequenceCase &phaseCase : phaseCases) {
+		AudioAssetCatalog phaseCatalog;
+		phaseCatalog.setDurationMS(AsciiString("phase-attack.wav"), 1.0f);
+		phaseCatalog.setDurationMS(AsciiString("phase-sound.wav"), 2.0f);
+		phaseCatalog.setDurationMS(AsciiString("phase-decay.wav"), 3.0f);
+		std::unique_ptr<FakeEngine> phaseOwnedEngine = std::make_unique<FakeEngine>();
+		FakeEngine *phaseEngine = phaseOwnedEngine.get();
+		XAudio2AudioService phaseService(std::move(phaseOwnedEngine));
+		XAudio2AudioManager phaseManager(&phaseService, &phaseCatalog);
+		phaseManager.openDevice();
+		AudioEventInfo *phaseInfo = newInstance(AudioEventInfo);
+		*phaseInfo = *fixtureInfo;
+		phaseInfo->m_sounds.clear();
+		phaseInfo->m_sounds.push_back(AsciiString("phase-sound.wav"));
+		phaseInfo->m_attackSounds.clear();
+		phaseInfo->m_decaySounds.clear();
+		if (phaseCase.attack) phaseInfo->m_attackSounds.push_back(AsciiString("phase-attack.wav"));
+		if (phaseCase.decay) phaseInfo->m_decaySounds.push_back(AsciiString("phase-decay.wav"));
+		phaseInfo->m_control = phaseCase.looping ? AC_LOOP : 0;
+		phaseInfo->m_loopCount = phaseCase.count;
+		FixtureEvent phaseEvent(AsciiString("phase-sequence"));
+		phaseEvent.setAudioEventInfo(phaseInfo);
+		const AudioHandle phaseHandle = phaseManager.addAudioEvent(&phaseEvent);
+		phaseManager.update();
+		for (std::size_t portion = 0; phaseCase.sequence[portion] != '\0'; ++portion) {
+			const char expected = phaseCase.sequence[portion];
+			const std::size_t expectedBytes = (expected == 'A' ? 48U : expected == 'S' ? 96U : 144U) * 4U;
+			const Bool active = phaseManager.isCurrentlyPlaying(phaseHandle);
+			FakeVoice *phaseVoice = active ? phaseEngine->lastVoice : nullptr;
+			check(phaseVoice != nullptr && phaseVoice->submitCalls == static_cast<int>(portion + 1)
+				&& phaseVoice->submittedAudio.back().size() == expectedBytes,
+				"every finite/infinite attack-body-decay portion matches the legacy sequence");
+			check(phaseVoice != nullptr && phaseVoice->completeLastBuffer(),
+				"phase sequence completion advances its real queued buffer");
+			phaseManager.update();
+		}
+		if (phaseCase.looping && phaseCase.count == 0) {
+			check(phaseManager.isCurrentlyPlaying(phaseHandle),
+				"zero loop count remains active without entering decay");
+			phaseManager.stopAudio(AudioAffect_Sound);
+			phaseManager.update();
+		}
+		check(!phaseManager.isCurrentlyPlaying(phaseHandle),
+			"finite phase sequence completes exactly, and infinite playback stops explicitly");
+		phaseManager.closeDevice();
+		deleteInstance(phaseInfo);
+	}
+
+	{
+		std::unique_ptr<FakeEngine> budgetOwnedEngine = std::make_unique<FakeEngine>();
+		FakeEngine *budgetEngine = budgetOwnedEngine.get();
+		XAudio2AudioService budgetService(std::move(budgetOwnedEngine));
+		XAudio2AudioManager budgetManager(&budgetService, &catalog);
+		AudioSettings budgetSettings;
+		budgetSettings.m_minVolume = 0.0f;
+		budgetSettings.m_fadeAudioFrames = 3;
+		budgetManager.setAudioSettingsForTest(&budgetSettings);
+		budgetManager.setChannelLimitsForTest(1U, 1U, 3U);
+		budgetManager.openDevice();
+		AudioEventInfo *budgetMusicInfo = newInstance(AudioEventInfo);
+		*budgetMusicInfo = *lowInfo;
+		budgetMusicInfo->m_soundType = AT_Music;
+		budgetMusicInfo->m_limit = 0;
+		budgetMusicInfo->m_type = 0;
+		budgetMusicInfo->m_sounds.clear();
+		budgetMusicInfo->m_filename = AsciiString("long.wav");
+		AudioEventInfo *budgetSpeechInfo = newInstance(AudioEventInfo);
+		*budgetSpeechInfo = *budgetMusicInfo;
+		budgetSpeechInfo->m_soundType = AT_Streaming;
+		FixtureEvent oldTrack(AsciiString("budget-old-music"));
+		oldTrack.setAudioEventInfo(budgetMusicInfo);
+		const AudioHandle oldTrackHandle = budgetManager.addAudioEvent(&oldTrack);
+		FixtureEvent dialogueOne(AsciiString("budget-dialogue-one"));
+		dialogueOne.setAudioEventInfo(budgetSpeechInfo);
+		const AudioHandle dialogueOneHandle = budgetManager.addAudioEvent(&dialogueOne);
+		FixtureEvent dialogueTwo(AsciiString("budget-dialogue-two"));
+		dialogueTwo.setAudioEventInfo(budgetSpeechInfo);
+		const AudioHandle dialogueTwoHandle = budgetManager.addAudioEvent(&dialogueTwo);
+		budgetManager.update();
+		check(budgetManager.isCurrentlyPlaying(oldTrackHandle)
+			&& budgetManager.isCurrentlyPlaying(dialogueOneHandle)
+			&& budgetManager.isCurrentlyPlaying(dialogueTwoHandle),
+			"old music and two dialogues are active before the victory transition");
+		budgetManager.removeAudioEvent(AHSV_StopTheMusicFade);
+		FixtureEvent victoryTrack(AsciiString("End_USA"));
+		victoryTrack.setAudioEventInfo(budgetMusicInfo);
+		const AudioHandle victoryHandle = budgetManager.addAudioEvent(&victoryTrack);
+		FixtureEvent dialogueThree(AsciiString("budget-dialogue-three"));
+		dialogueThree.setAudioEventInfo(budgetSpeechInfo);
+		const AudioHandle dialogueThreeHandle = budgetManager.addAudioEvent(&dialogueThree);
+		FixtureEvent dialogueFour(AsciiString("budget-dialogue-four"));
+		dialogueFour.setAudioEventInfo(budgetSpeechInfo);
+		check(victoryHandle >= AHSV_FirstHandle && dialogueThreeHandle >= AHSV_FirstHandle
+			&& budgetManager.addAudioEvent(&dialogueFour) == AHSV_NoSound,
+			"queued victory music has its own slot while pending dialogue obeys the three-stream cap");
+		budgetManager.update();
+		check(budgetManager.isCurrentlyPlaying(oldTrackHandle)
+			&& budgetManager.isCurrentlyPlaying(victoryHandle)
+			&& budgetManager.isCurrentlyPlaying(dialogueThreeHandle)
+			&& budgetEngine->activeVoiceCount == 5,
+			"fading old music and victory music coexist with three configured dialogue streams");
+		AudioEventInfo *urgentMusicInfo = newInstance(AudioEventInfo);
+		*urgentMusicInfo = *budgetMusicInfo;
+		urgentMusicInfo->m_priority = AP_CRITICAL;
+		urgentMusicInfo->m_control = AC_INTERRUPT;
+		FixtureEvent urgentTrack(AsciiString("budget-urgent-music"));
+		urgentTrack.setAudioEventInfo(urgentMusicInfo);
+		for (int request = 0; request < 8; ++request) {
+			check(budgetManager.addAudioEvent(&urgentTrack) == AHSV_NoSound,
+				"full music budget rejects repeated higher-priority replacement promises");
+		}
+		budgetManager.friend_forcePlayAudioEventRTS(&urgentTrack);
+		budgetManager.pauseAudio(AudioAffect_Music);
+		check(budgetManager.addAudioEvent(&urgentTrack) == AHSV_NoSound
+			&& budgetManager.getPendingAudioRequestCount() == 0,
+			"paused and fading music count toward the same bound, including force-play requests");
+		budgetManager.resumeAudio(AudioAffect_Music);
+		budgetManager.update();
+		budgetManager.update();
+		budgetManager.update();
+		check(!budgetManager.isCurrentlyPlaying(oldTrackHandle)
+			&& budgetManager.isCurrentlyPlaying(victoryHandle)
+			&& budgetManager.isCurrentlyPlaying(dialogueOneHandle)
+			&& budgetManager.isCurrentlyPlaying(dialogueTwoHandle)
+			&& budgetManager.isCurrentlyPlaying(dialogueThreeHandle)
+			&& !budgetManager.hasMusicTrackCompleted(AsciiString("budget-old-music"), 1),
+			"finishing the outgoing fade preserves victory and dialogue without false completion");
+		budgetManager.stopAudio(AudioAffect_Music);
+		budgetManager.update();
+		oldTrack.setDelayForTest(100.0f);
+		victoryTrack.setDelayForTest(100.0f);
+		const AudioHandle pendingOldHandle = budgetManager.addAudioEvent(&oldTrack);
+		const AudioHandle pendingVictoryHandle = budgetManager.addAudioEvent(&victoryTrack);
+		budgetManager.pauseAudio(AudioAffect_Music);
+		check(pendingOldHandle >= AHSV_FirstHandle && pendingVictoryHandle >= AHSV_FirstHandle
+			&& budgetManager.addAudioEvent(&urgentTrack) == AHSV_NoSound
+			&& budgetManager.getPendingAudioRequestCount() == 2,
+			"two delayed paused music requests reserve both slots before any voice starts");
+		budgetManager.stopAudio(AudioAffect_Music);
+		check(!budgetManager.isCurrentlyPlaying(pendingOldHandle)
+			&& !budgetManager.isCurrentlyPlaying(pendingVictoryHandle)
+			&& budgetManager.isCurrentlyPlaying(dialogueOneHandle),
+			"music stop clears pending reservations without stopping dialogue");
+		oldTrack.setDelayForTest(0.0f);
+		victoryTrack.setDelayForTest(0.0f);
+		for (int fade = 0; fade < 2; ++fade) {
+			budgetManager.stopAudio(AudioAffect_Music);
+			budgetManager.update();
+			const AudioHandle outgoingHandle = budgetManager.addAudioEvent(&oldTrack);
+			budgetManager.update();
+			budgetManager.removeAudioEvent(AHSV_StopTheMusicFade);
+			FixtureEvent currentTrack(AsciiString("budget-current-music"));
+			currentTrack.setAudioEventInfo(budgetMusicInfo);
+			const AudioHandle currentHandle = budgetManager.addAudioEvent(&currentTrack);
+			budgetManager.update();
+			check(budgetManager.isCurrentlyPlaying(outgoingHandle)
+				&& budgetManager.isCurrentlyPlaying(currentHandle),
+				"a current track and outgoing fader fill both music slots before victory");
+			budgetManager.removeAudioEvent(fade ? AHSV_StopTheMusicFade : AHSV_StopTheMusic);
+			const AudioHandle orderedVictoryHandle = budgetManager.addAudioEvent(&victoryTrack);
+			check(orderedVictoryHandle >= AHSV_FirstHandle,
+				"a preceding queued music stop reserves room for the victory transition");
+			budgetManager.update();
+			check(budgetManager.isCurrentlyPlaying(orderedVictoryHandle)
+				&& !budgetManager.isCurrentlyPlaying(outgoingHandle)
+				&& budgetManager.isCurrentlyPlaying(currentHandle) == static_cast<Bool>(fade)
+				&& budgetEngine->activeVoiceCount == 4 + fade,
+				"victory replaces full music occupancy while preserving only the newest outgoing fade");
+		}
+		budgetManager.stopAudio(AudioAffect_Music);
+		budgetManager.update();
+		int acceptedMusicRequests = 0;
+		for (int request = 0; request < 8; ++request) {
+			budgetManager.removeAudioEvent(AHSV_StopTheMusic);
+			if (budgetManager.addAudioEvent(&urgentTrack) >= AHSV_FirstHandle) {
+				++acceptedMusicRequests;
+			}
+		}
+		check(acceptedMusicRequests == 2,
+			"ordered music stops cannot create more than two pending music reservations");
+		budgetManager.update();
+		check(budgetEngine->activeVoiceCount == 3,
+			"a bounded music-stop burst preserves FIFO stops and unrelated dialogue");
+		check(budgetEngine->peakVoiceCount <= 5,
+			"music transitions never exceed two music voices alongside three dialogue voices");
+		FixtureEvent fullBudgetVictorySpeech(AsciiString("full-budget-victory-speech"));
+		fullBudgetVictorySpeech.setAudioEventInfo(budgetSpeechInfo);
+		fullBudgetVictorySpeech.setUninterruptible(TRUE);
+		budgetEngine->peakVoiceCount = budgetEngine->activeVoiceCount;
+		const AudioHandle fullBudgetVictoryHandle = budgetManager.addAudioEvent(&fullBudgetVictorySpeech);
+		check(fullBudgetVictoryHandle >= AHSV_FirstHandle,
+			"uninterruptible victory speech is admitted when all three dialogue slots are occupied");
+		budgetManager.update();
+		check(budgetManager.isCurrentlyPlaying(fullBudgetVictoryHandle)
+			&& !budgetManager.isCurrentlyPlaying(dialogueOneHandle)
+			&& !budgetManager.isCurrentlyPlaying(dialogueTwoHandle)
+			&& !budgetManager.isCurrentlyPlaying(dialogueThreeHandle)
+			&& budgetEngine->activeVoiceCount == 1 && budgetEngine->peakVoiceCount <= 3,
+			"full-budget victory takeover releases old dialogue before allocating its single voice");
+		budgetManager.reset();
+		check(budgetManager.getActiveAudioCount() == 0
+			&& budgetManager.getPendingAudioRequestCount() == 0
+			&& budgetManager.addAudioEvent(&urgentTrack) >= AHSV_FirstHandle,
+			"reset clears both budgets and reopens music admission");
+		budgetManager.closeDevice();
+		deleteInstance(urgentMusicInfo);
+		deleteInstance(budgetSpeechInfo);
+		deleteInstance(budgetMusicInfo);
+	}
 
 	AudioEventInfo *musicOneInfo = newInstance(AudioEventInfo);
 	*musicOneInfo = *lowInfo;
 	musicOneInfo->m_audioName = AsciiString("music-one");
 	musicOneInfo->m_soundType = AT_Music;
 	musicOneInfo->m_sounds.clear();
-	musicOneInfo->m_sounds.push_back(AsciiString("short.wav"));
+	musicOneInfo->m_filename = AsciiString("short.wav");
 	musicOneInfo->m_loopCount = 0;
 	musicOneInfo->m_control = 0;
 	AudioEventInfo *musicTwoInfo = newInstance(AudioEventInfo);
@@ -1251,6 +1781,13 @@ int main()
 	FakeVoice *musicVoice = engine->lastVoice;
 	check(manager.isCurrentlyPlaying(musicHandle) && manager.isMusicPlaying(),
 		"music fixture starts through the native stream channel");
+	manager.setVolume(0.25f,
+		static_cast<AudioAffect>(AudioAffect_Music | AudioAffect_SystemSetting));
+	manager.update();
+	check(musicVoice != nullptr && std::abs(musicVoice->lastVolume - 0.08058564f) < 0.000001f,
+		"active music streams apply legacy gain conversion to the live music slider");
+	manager.setVolume(1.0f,
+		static_cast<AudioAffect>(AudioAffect_Music | AudioAffect_SystemSetting));
 	check(musicVoice != nullptr && musicVoice->completeLastBuffer(),
 		"fake backend completes natural music playback");
 	manager.update();
@@ -1303,9 +1840,9 @@ int main()
 	manager.update();
 	manager.update();
 	FakeVoice *attenuationVoice = engine->lastVoice;
-	check(attenuationVoice != nullptr && attenuationVoice->lastVolume > 0.149f
-		&& attenuationVoice->lastVolume < 0.151f,
-		"effective volume applies event shifts, category volume, and configured global attenuation");
+	check(attenuationVoice != nullptr
+		&& std::abs(attenuationVoice->lastVolume - 0.007699386f) < 0.000001f,
+		"3D output applies shifts, category and global range fade before legacy gain and provider falloff");
 	check(attenuationVoice != nullptr && attenuationVoice->matrixCalls > 0
 		&& attenuationVoice->matrixSourceChannels == 2
 		&& attenuationVoice->matrixDestinationChannels == 2
@@ -1317,15 +1854,15 @@ int main()
 	g_nativeAudioBaseUpdateCalls = 0;
 	manager.update();
 	TheTacticalView = nullptr;
-	check(g_nativeAudioBaseUpdateCalls == 1 && attenuationVoice->lastVolume > 0.074f
-		&& attenuationVoice->lastVolume < 0.076f,
-		"active 3D volume applies the base zoom adjustment exactly once");
+	check(g_nativeAudioBaseUpdateCalls == 1
+		&& std::abs(attenuationVoice->lastVolume - 0.002425155f) < 0.000001f,
+		"active 3D output applies the base zoom adjustment exactly once before gain conversion");
 	Coord3D listenerPosition;
 	listenerPosition.set(55.0f, 0.0f, 0.0f);
 	manager.setListenerPosition(&listenerPosition, nullptr);
 	manager.update();
-	check(attenuationVoice->lastVolume > 0.19f && attenuationVoice->lastVolume < 0.21f,
-		"listener movement updates active 3D attenuation on the owner thread");
+	check(std::abs(attenuationVoice->lastVolume - 0.06839904f) < 0.000001f,
+		"coincident listener removes provider falloff while retaining legacy gain conversion");
 	check(attenuationVoice->lastMatrix.size() == 4
 		&& std::abs((attenuationVoice->lastMatrix[0] + attenuationVoice->lastMatrix[1])
 			- (attenuationVoice->lastMatrix[2] + attenuationVoice->lastMatrix[3])) < 0.001f,
@@ -1341,8 +1878,8 @@ int main()
 	manager.setListenerPosition(&listenerPosition, nullptr);
 	manager.update();
 	manager.setAudioEventVolumeOverride(AsciiString("configured-attenuation"), 0.4f);
-	check(attenuationVoice->lastVolume > 0.099f && attenuationVoice->lastVolume < 0.101f,
-		"active event volume override replaces the event volume exactly once");
+	check(std::abs(attenuationVoice->lastVolume - 0.02154435f) < 0.000001f,
+		"active event volume override replaces event volume exactly once before gain conversion");
 	manager.stopAudio(AudioAffect_Sound3D);
 	manager.update();
 	check(!manager.isCurrentlyPlaying(attenuationHandle), "3D attenuation fixture stops cleanly");
@@ -1354,6 +1891,20 @@ int main()
 	check(manager.isCurrentlyPlaying(matrix2DHandle) && matrix2DVoice != nullptr
 		&& matrix2DVoice->matrixCalls == 0,
 		"non-positional audio does not receive an X3DAudio output matrix");
+	manager.setVolume(0.25f,
+		static_cast<AudioAffect>(AudioAffect_Sound | AudioAffect_SystemSetting));
+	manager.update();
+	check(matrix2DVoice != nullptr && std::abs(matrix2DVoice->lastVolume - 0.08058564f) < 0.000001f,
+		"2D samples apply the legacy gain curve without provider distance attenuation");
+	manager.setVolume(0.0f,
+		static_cast<AudioAffect>(AudioAffect_Sound | AudioAffect_SystemSetting));
+	manager.update();
+	check(matrix2DVoice->lastVolume == 0.0f, "zero 2D slider volume produces exactly zero output gain");
+	manager.setVolume(1.0f,
+		static_cast<AudioAffect>(AudioAffect_Sound | AudioAffect_SystemSetting));
+	manager.update();
+	check(std::abs(matrix2DVoice->lastVolume - 0.81225239f) < 0.000001f,
+		"unity 2D slider volume retains the legacy centered-pan output gain");
 	manager.killAudioEventImmediately(matrix2DHandle);
 	settings.m_use3DSoundRangeVolumeFade = FALSE;
 	Coord3D origin;
@@ -1363,9 +1914,9 @@ int main()
 	const AudioHandle noFadeHandle = manager.addAudioEvent(&attenuationEvent);
 	manager.update();
 	FakeVoice *noFadeVoice = engine->lastVoice;
-	check(noFadeVoice != nullptr && noFadeVoice->lastVolume > 0.199f
-		&& noFadeVoice->lastVolume < 0.201f,
-		"disabled range fading keeps full volume until the maximum-range cut");
+	check(noFadeVoice != nullptr
+		&& std::abs(noFadeVoice->lastVolume - 0.01243619f) < 0.000001f,
+		"disabled configured range fading still retains legacy provider distance attenuation");
 	manager.killAudioEventImmediately(noFadeHandle);
 
 	AudioEventInfo *fadeInfo = newInstance(AudioEventInfo);
@@ -1399,7 +1950,7 @@ int main()
 	*speechInfo = *lowInfo;
 	speechInfo->m_soundType = AT_Streaming;
 	speechInfo->m_sounds.clear();
-	speechInfo->m_sounds.push_back(AsciiString("short.wav"));
+	speechInfo->m_filename = AsciiString("short.wav");
 	FixtureEvent guardedSpeech(AsciiString("guarded-speech"));
 	guardedSpeech.setAudioEventInfo(speechInfo);
 	guardedSpeech.setUninterruptible(TRUE);
@@ -1455,18 +2006,42 @@ int main()
 	check(!manager.isCurrentlyPlaying(takeoverSpeechHandle)
 		&& manager.getActiveAudioCount() == 0 && !manager.getDisallowSpeech(),
 		"immediate speech kill synchronously releases the voice and guard");
+	FixtureEvent firstScriptedSpeech(AsciiString("first-scripted-speech"));
+	firstScriptedSpeech.setAudioEventInfo(speechInfo);
+	firstScriptedSpeech.setUninterruptible(TRUE);
+	FixtureEvent victorySpeech(AsciiString("victory-scripted-speech"));
+	victorySpeech.setAudioEventInfo(speechInfo);
+	victorySpeech.setUninterruptible(TRUE);
+	const AudioHandle firstScriptedHandle = manager.addAudioEvent(&firstScriptedSpeech);
+	const AudioHandle victorySpeechHandle = manager.addAudioEvent(&victorySpeech);
+	check(firstScriptedHandle >= AHSV_FirstHandle && victorySpeechHandle >= AHSV_FirstHandle,
+		"two same-tick uninterruptible scripted speech requests are admitted in order");
+	manager.update();
+	check(!manager.isCurrentlyPlaying(firstScriptedHandle)
+		&& manager.isCurrentlyPlaying(victorySpeechHandle)
+		&& manager.getActiveAudioCount() == 1 && manager.getDisallowSpeech(),
+		"a later same-tick victory takeover survives and replaces earlier scripted speech");
+	manager.killAudioEventImmediately(victorySpeechHandle);
 
-	manager.setVolume(0.25f, AudioAffect_Speech);
+	manager.setVolume(0.25f,
+		static_cast<AudioAffect>(AudioAffect_Speech | AudioAffect_SystemSetting));
 	FixtureEvent forcedSpeech(AsciiString("forced-speech"));
 	forcedSpeech.setAudioEventInfo(speechInfo);
 	manager.friend_forcePlayAudioEventRTS(&forcedSpeech);
 	manager.update();
-	check(engine->lastVoice != nullptr && engine->lastVoice->lastVolume > 0.24f
-		&& engine->lastVoice->lastVolume < 0.26f,
-		"briefing force-play honors the speech slider for streaming audio");
+	check(engine->lastVoice != nullptr
+		&& std::abs(engine->lastVoice->lastVolume - 0.08058564f) < 0.000001f,
+		"briefing force-play converts the speech slider to legacy streaming gain");
+	manager.setVolume(0.5f,
+		static_cast<AudioAffect>(AudioAffect_Speech | AudioAffect_SystemSetting));
+	manager.update();
+	check(engine->lastVoice != nullptr
+		&& std::abs(engine->lastVoice->lastVolume - 0.25584347f) < 0.000001f,
+		"active speech streams update converted gain when the system slider changes");
 	manager.stopAudio(AudioAffect_Speech);
 	manager.update();
-	manager.setVolume(1.0f, AudioAffect_Speech);
+	manager.setVolume(1.0f,
+		static_cast<AudioAffect>(AudioAffect_Speech | AudioAffect_SystemSetting));
 
 	std::unique_ptr<FakeEngine> replacementOwnedEngine = std::make_unique<FakeEngine>();
 	FakeEngine *replacementEngine = replacementOwnedEngine.get();
@@ -1521,7 +2096,7 @@ int main()
 	failureMusicInfo->m_soundType = AT_Music;
 	failureMusicInfo->m_type = 0;
 	failureMusicInfo->m_sounds.clear();
-	failureMusicInfo->m_sounds.push_back(AsciiString("short.wav"));
+	failureMusicInfo->m_filename = AsciiString("short.wav");
 	FixtureEvent failureMusic(AsciiString("failure-create-music"));
 	failureMusic.setAudioEventInfo(failureMusicInfo);
 	failureEngine->failCreateVoice = TRUE;
@@ -1542,9 +2117,9 @@ int main()
 	failureEngine->failStop = TRUE;
 	const AudioHandle failureResetHandle = failureManager.addAudioEvent(&failureReset);
 	failureManager.update();
-	check(failureManager.isCurrentlyPlaying(failureResetHandle)
-		&& failureManager.getDisallowSpeech(),
-		"reset-failure fixture first raises the native speech guard");
+	check(!failureManager.isCurrentlyPlaying(failureResetHandle)
+		&& !failureManager.getDisallowSpeech(),
+		"same-update voice-reset failure releases the native speech guard immediately");
 	failureManager.update();
 	check(!failureManager.isCurrentlyPlaying(failureResetHandle)
 		&& failureManager.getActiveAudioCount() == 0 && !failureManager.getDisallowSpeech(),

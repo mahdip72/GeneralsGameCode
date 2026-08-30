@@ -18,7 +18,8 @@ public:
 	{
 		SAMPLE_2D,
 		SAMPLE_3D,
-		STREAM
+		STREAM,
+		MUSIC
 	};
 
 	XAudio2AudioManager();
@@ -136,6 +137,7 @@ private:
 		Bool speechVolumeOverride = FALSE;
 		Bool waitingForGeneratedDelay = FALSE;
 		Bool voiceOpen = FALSE;
+		Bool needsVoiceService = FALSE;
 		AsciiString assetFileName;
 		std::unique_ptr<AudioPcmStream> pcmStream;
 		UnsignedInt phaseSubmittedFrames = 0;
@@ -162,7 +164,7 @@ private:
 	Bool queuePhaseLowWater(PlayingAudio &playing);
 	Bool affectMatches(const PlayingAudio &playing, AudioAffect which) const;
 	Bool requestAffectMatches(const AudioRequest *request, AudioAffect which) const;
-	Bool canReplace(const PlayingAudio &victim, const DynamicAudioEventRTS &incoming) const;
+	Bool canReplace(const PlayingAudio &victim, const AudioEventRTS &incoming) const;
 	Bool isChannelFull(Channel channel) const;
 	Bool isChannelFullForEvent(Channel channel, AudioHandle excludeHandle) const;
 	UnsignedInt channelCount(Channel channel) const;
@@ -175,8 +177,9 @@ private:
 	void stopExistingSpeechForUninterruptible(AudioHandle exceptHandle);
 	PlayingAudio *findPlaying(AudioHandle handle);
 	const PlayingAudio *findPlaying(AudioHandle handle) const;
-	PlayingAudio *findLowestPriority(Channel channel, AudioPriority minimumPriority);
+	PlayingAudio *findLowestPriority(Channel channel, const AudioEventRTS &incoming);
 	Real effectiveVolume(const PlayingAudio &playing) const;
+	Real outputVolume(const PlayingAudio &playing) const;
 	void recordMusicCompletion(const PlayingAudio &playing);
 	void updatePlayingVolumes();
 	void updateDisallowSpeechGuard();

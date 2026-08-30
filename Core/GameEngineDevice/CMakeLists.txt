@@ -383,7 +383,10 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32)
         Source/XAudio2AudioDevice/XAudio2MoviePcmSink.cpp
         Source/XAudio2AudioDevice/XAudio2NativeAudioEngine.cpp
     )
-    target_include_directories(rts_xaudio2_audio_service PUBLIC Include)
+    target_include_directories(rts_xaudio2_audio_service
+        PUBLIC Include
+        PRIVATE ${CMAKE_SOURCE_DIR}/Core/Libraries/Include
+    )
     target_link_libraries(rts_xaudio2_audio_service PUBLIC
         rts_xaudio2
         rts_xaudio2_pcm_voice

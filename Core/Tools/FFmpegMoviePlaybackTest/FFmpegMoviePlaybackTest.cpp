@@ -29,6 +29,21 @@ public:
 	{
 		return playback.isAudioFrameAdmitted(metadata);
 	}
+
+	static bool deliverFrame(FFmpegMoviePlayback &playback, const AVFrame *frame,
+		const FFmpegFrameMetadata &metadata)
+	{
+		if (!playback.m_audioSink->canAccept(2)) {
+			return false;
+		}
+		playback.handleFrame(frame, metadata);
+		return playback.state() != FFmpegMoviePlaybackState::FAILED;
+	}
+
+	static bool endInput(FFmpegMoviePlayback &playback)
+	{
+		return playback.handleEndOfInput();
+	}
 };
 
 static_assert(UINTPTR_MAX == UINT64_MAX, "The native FFmpeg movie playback contract is x64-only.");
@@ -140,6 +155,12 @@ private:
 class RecordingSink : public AudioPcmSink
 {
 public:
+	bool canAccept(std::size_t submissions) const noexcept override
+	{
+		++capacityChecks;
+		return !resetPending && availableSubmissions >= submissions;
+	}
+
     AudioPcmSubmitResult submit(AudioPcmChunk &&chunk) override
     {
         ++submitCalls;
@@ -165,8 +186,12 @@ public:
 	void reset(std::uint64_t generation) override
 	{
 		currentGeneration = generation;
-        ++resetCalls;
-		 events.push_back("reset:" + std::to_string(generation));
+		++resetCalls;
+			events.push_back("reset:" + std::to_string(generation));
+		if (serviceReopensAdmission) {
+			resetPending = true;
+			availableSubmissions = 0;
+		}
 	}
 
 	void endOfStream() noexcept override
@@ -182,7 +207,17 @@ public:
 	bool serviceSink() noexcept override
 	{
 		++serviceCalls;
+		if (resetPending) {
+			resetPending = false;
+			availableSubmissions = (std::numeric_limits<std::size_t>::max)();
+		}
 		return true;
+	}
+
+	bool setOutputGain(double gain) noexcept override
+	{
+		outputGains.push_back(gain);
+		return nativeOutputGain;
 	}
 
     bool getPlayedSample(std::int64_t &sample) const noexcept override
@@ -199,12 +234,15 @@ public:
     std::vector<AudioPcmChunk> dropped;
     std::vector<AudioPcmChunk> failed;
     std::vector<AudioPcmChunk> rejected;
-    std::vector<std::string> events;
+	std::vector<std::string> events;
+	std::vector<double> outputGains;
     std::int64_t playedSample = -1;
 	std::size_t submitCalls = 0;
 	std::size_t resetCalls = 0;
 	std::size_t endOfStreamCalls = 0;
 	std::size_t serviceCalls = 0;
+	mutable std::size_t capacityChecks = 0;
+	std::size_t availableSubmissions = (std::numeric_limits<std::size_t>::max)();
     bool dropNext = false;
     bool dropAll = false;
     bool failNext = false;
@@ -212,6 +250,9 @@ public:
 	bool clockEnabled = false;
 	bool holdDrain = false;
 	bool drainReleased = false;
+	bool nativeOutputGain = false;
+	bool resetPending = false;
+	bool serviceReopensAdmission = false;
 };
 
 class ManualClock
@@ -220,6 +261,97 @@ public:
     std::int64_t now() const { return microseconds; }
     std::int64_t microseconds = 0;
 };
+
+class EightSlotSink final : public RecordingSink
+{
+public:
+	static constexpr std::size_t SLOT_COUNT = 8;
+
+	EightSlotSink() { availableSubmissions = SLOT_COUNT; }
+
+	AudioPcmSubmitResult submit(AudioPcmChunk &&chunk) override
+	{
+		if (availableSubmissions == 0) {
+			dropped.push_back(std::move(chunk));
+			return AudioPcmSubmitResult::DROPPED;
+		}
+		const AudioPcmSubmitResult result = RecordingSink::submit(std::move(chunk));
+		if (result == AudioPcmSubmitResult::ACCEPTED) {
+			--availableSubmissions;
+		}
+		return result;
+	}
+
+	void reset(std::uint64_t generation) override
+	{
+		RecordingSink::reset(generation);
+		availableSubmissions = SLOT_COUNT;
+	}
+
+	bool isDrained() const noexcept override { return availableSubmissions == SLOT_COUNT; }
+
+	void completePending()
+	{
+		if (!accepted.empty()) {
+			playedSample = accepted.back().startSample + accepted.back().frameCount;
+		}
+		availableSubmissions = SLOT_COUNT;
+	}
+};
+
+static bool deliverTestAudio(FFmpegMoviePlayback &playback, int samples,
+	std::int64_t timestamp, int channels = 2)
+{
+	AVFrame *frame = av_frame_alloc();
+	if (frame == nullptr) {
+		return false;
+	}
+	frame->format = AV_SAMPLE_FMT_FLTP;
+	frame->sample_rate = 48000;
+	frame->nb_samples = samples;
+	frame->pts = timestamp;
+	frame->best_effort_timestamp = timestamp;
+	av_channel_layout_default(&frame->ch_layout, channels);
+	if (av_frame_get_buffer(frame, 0) < 0) {
+		av_frame_free(&frame);
+		return false;
+	}
+	for (int channel = 0; channel < channels; ++channel) {
+		float *plane = reinterpret_cast<float *>(frame->extended_data[channel]);
+		std::fill(plane, plane + samples, channel == 0 ? 0.25f : -0.25f);
+	}
+	FFmpegFrameMetadata metadata;
+	metadata.streamType = AVMEDIA_TYPE_AUDIO;
+	metadata.timeBaseNumerator = 1;
+	metadata.timeBaseDenominator = 48000;
+	metadata.presentationTimestamp = timestamp;
+	const bool result = FFmpegMoviePlaybackTestAccess::deliverFrame(playback, frame, metadata);
+	av_frame_free(&frame);
+	return result;
+}
+
+static bool deliverTestVideo(FFmpegMoviePlayback &playback)
+{
+	AVFrame *frame = av_frame_alloc();
+	if (frame == nullptr) {
+		return false;
+	}
+	frame->format = AV_PIX_FMT_YUV420P;
+	frame->width = 2;
+	frame->height = 2;
+	if (av_frame_get_buffer(frame, 0) < 0) {
+		av_frame_free(&frame);
+		return false;
+	}
+	FFmpegFrameMetadata metadata;
+	metadata.streamType = AVMEDIA_TYPE_VIDEO;
+	metadata.timeBaseNumerator = 1;
+	metadata.timeBaseDenominator = 30;
+	metadata.presentationTimestamp = 0;
+	const bool result = FFmpegMoviePlaybackTestAccess::deliverFrame(playback, frame, metadata);
+	av_frame_free(&frame);
+	return result;
+}
 
 struct VideoTrace
 {
@@ -252,6 +384,198 @@ static bool openFile(const char *path, MemoryTestFile &input, FFmpegFile &file)
         return false;
     }
     return file.open(input);
+}
+
+static bool testManyAudioFramesPrimeBeforeFirstVideo(const char *audioPath)
+{
+	MemoryTestFile input(audioPath);
+	FFmpegFile file;
+	if (!openFile(audioPath, input, file)) {
+		return false;
+	}
+	EightSlotSink sink;
+	ManualClock clock;
+	FFmpegMoviePlaybackOptions options;
+	options.clock = [&clock]() { return clock.now(); };
+	options.gain = 0.5;
+	FFmpegMoviePlayback playback(file, &sink, options);
+	bool audioPublishedBeforeVideo = false;
+	playback.setVideoCallback([&sink, &audioPublishedBeforeVideo](const AVFrame *,
+		const FFmpegFrameMetadata &, void *) {
+		audioPublishedBeforeVideo = sink.accepted.size() == 1;
+	});
+	// Retail BIK packet shape: many 1920-sample planar-float audio frames,
+	// only the first timestamped, before one video frame. No wall-clock time
+	// or hardware completion advances while the constructor primes the file.
+	for (int frame = 0; frame < 19; ++frame) {
+		if (!deliverTestAudio(playback, 1920, frame == 0 ? 0 : AV_NOPTS_VALUE)
+			|| !sink.serviceSink() || !sink.accepted.empty()) {
+			return false;
+		}
+	}
+	if (!deliverTestVideo(playback) || !audioPublishedBeforeVideo
+		|| !playback.hasCurrentFrame() || !playback.isFrameReady()
+		|| sink.accepted.size() != 1 || sink.availableSubmissions != 7
+		|| !sink.dropped.empty() || clock.microseconds != 0) {
+		return false;
+	}
+	const AudioPcmChunk &prefix = sink.accepted.front();
+	if (prefix.frameCount != 19 * 1920 || prefix.startSample != 0
+		|| prefix.sequence != 0 || prefix.generation != 1 || prefix.sourceChannels != 2
+		|| prefix.discontinuity || prefix.data.size() != 19 * 1920 * 4) {
+		return false;
+	}
+	for (std::size_t offset = 0; offset < prefix.data.size(); offset += sizeof(std::int16_t)) {
+		std::int16_t sample = 0;
+		std::memcpy(&sample, prefix.data.data() + offset, sizeof(sample));
+		if (sample != (offset % 4 == 0 ? 4096 : -4096)) {
+			return false;
+		}
+	}
+	// The final partial audio chunk must flush at EOF even without another
+	// video frame, and terminal completion still waits for the native sink.
+	if (!deliverTestAudio(playback, 960, AV_NOPTS_VALUE)
+		|| sink.accepted.size() != 1 || !FFmpegMoviePlaybackTestAccess::endInput(playback)
+		|| playback.state() != FFmpegMoviePlaybackState::DRAINING
+		|| sink.accepted.size() != 2 || sink.endOfStreamCalls != 1
+		|| sink.accepted.back().frameCount != 960 || sink.accepted.back().startSample != 36480
+		|| sink.accepted.back().sequence != 1) {
+		return false;
+	}
+	sink.completePending();
+	return playback.pump(1) && playback.state() == FFmpegMoviePlaybackState::ENDED;
+}
+
+static bool testMovieAggregationBoundAndReset(const char *audioPath)
+{
+	MemoryTestFile input(audioPath);
+	FFmpegFile file;
+	if (!openFile(audioPath, input, file)) {
+		return false;
+	}
+	EightSlotSink sink;
+	FFmpegMoviePlayback playback(file, &sink);
+	for (int frame = 0; frame < 5; ++frame) {
+		if (!deliverTestAudio(playback, 24000, frame == 0 ? 0 : AV_NOPTS_VALUE)) {
+			return false;
+		}
+	}
+	// Two full one-second chunks were flushed as the next input arrived;
+	// the final half-second remains pending and must be discarded on seek.
+	if (sink.accepted.size() != 2 || sink.accepted[0].frameCount != 48000
+		|| sink.accepted[1].frameCount != 48000 || sink.accepted[0].sequence != 0
+		|| sink.accepted[1].sequence != 1 || sink.accepted[1].startSample != 48000
+		|| !playback.seekFrame(0) || !deliverTestAudio(playback, 960, 0)
+		|| !deliverTestVideo(playback) || sink.accepted.size() != 3) {
+		return false;
+	}
+	const AudioPcmChunk &restarted = sink.accepted.back();
+	return restarted.generation == 2 && restarted.sequence == 0 && restarted.startSample == 0
+		&& restarted.frameCount == 960 && !restarted.discontinuity && sink.dropped.empty();
+}
+
+static bool testMovieAggregationPreservesDiscontinuityAndProvenance(const char *audioPath)
+{
+	MemoryTestFile input(audioPath);
+	FFmpegFile file;
+	if (!openFile(audioPath, input, file)) {
+		return false;
+	}
+	EightSlotSink sink;
+	FFmpegMoviePlayback playback(file, &sink);
+	if (!deliverTestAudio(playback, 1920, 0) || !deliverTestAudio(playback, 1920, 1920)
+		|| !deliverTestAudio(playback, 1920, 10000) || !deliverTestAudio(playback, 960, 11920)
+		|| !deliverTestAudio(playback, 960, 12880, 1) || !deliverTestVideo(playback)
+		|| sink.accepted.size() != 3 || !sink.dropped.empty()) {
+		return false;
+	}
+	const AudioPcmChunk &prefix = sink.accepted[0];
+	const AudioPcmChunk &gap = sink.accepted[1];
+	const AudioPcmChunk &mono = sink.accepted[2];
+	return prefix.frameCount == 3840 && prefix.startSample == 0 && !prefix.discontinuity
+		&& prefix.sourceChannels == 2 && prefix.sequence == 0
+		&& gap.frameCount == 2880 && gap.startSample == 10000 && gap.discontinuity
+		&& gap.sourceChannels == 2 && gap.sequence == 1
+		&& mono.frameCount == 960 && mono.startSample == 12880 && mono.discontinuity
+		&& mono.sourceChannels == 1 && mono.sequence == 2;
+}
+
+static bool testMovieAggregationRetainsPerFrameSoftwareGain(const char *audioPath)
+{
+	MemoryTestFile input(audioPath);
+	FFmpegFile file;
+	if (!openFile(audioPath, input, file)) {
+		return false;
+	}
+	RecordingSink sink;
+	FFmpegMoviePlayback playback(file, &sink);
+	if (!deliverTestAudio(playback, 960, 0)) {
+		return false;
+	}
+	playback.setGain(0.0);
+	if (!deliverTestAudio(playback, 960, AV_NOPTS_VALUE) || !deliverTestVideo(playback)
+		|| sink.accepted.size() != 1 || sink.accepted[0].frameCount != 1920) {
+		return false;
+	}
+	const AudioPcmChunk &chunk = sink.accepted[0];
+	for (std::size_t offset = 0; offset < chunk.data.size(); offset += sizeof(std::int16_t)) {
+		std::int16_t sample = 0;
+		std::memcpy(&sample, chunk.data.data() + offset, sizeof(sample));
+		const std::int16_t expected = offset >= 960 * 4 ? 0 : (offset % 4 == 0 ? 8192 : -8192);
+		if (sample != expected) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool runExistingMediaSmoke(const char *path)
+{
+	MemoryTestFile input(path);
+	FFmpegFile file;
+	if (!openFile(path, input, file)) {
+		std::fprintf(stderr, "Could not open existing media: %s\n", path);
+		return false;
+	}
+	EightSlotSink sink;
+	FFmpegMoviePlaybackOptions options;
+	options.mode = FFmpegMoviePlaybackMode::ONCE;
+	FFmpegMoviePlayback playback(file, &sink, options);
+	VideoTrace trace;
+	playback.setVideoCallback(captureVideo, &trace);
+	std::size_t firstVideoSteps = 0;
+	while (firstVideoSteps < 256 && !playback.hasCurrentFrame() && !playback.isTerminal()) {
+		++firstVideoSteps;
+		if (!playback.pump(1) || !sink.serviceSink()) {
+			return false;
+		}
+	}
+	if (!playback.hasCurrentFrame() || playback.state() == FFmpegMoviePlaybackState::FAILED
+		|| !sink.dropped.empty()) {
+		std::fprintf(stderr, "First video did not prime in %zu steps; submitted=%zu dropped=%zu.\n",
+			firstVideoSteps, sink.accepted.size(), sink.dropped.size());
+		return false;
+	}
+	const std::size_t primedBuffers = sink.accepted.size();
+	for (std::size_t call = 0; call < 100000 && !playback.isTerminal(); ++call) {
+		// Completion is allowed only after first-frame priming has succeeded.
+		sink.completePending();
+		if (!playback.pump(64)) {
+			return false;
+		}
+	}
+	std::int64_t totalPcmFrames = 0;
+	std::uint32_t largestChunk = 0;
+	for (const AudioPcmChunk &chunk : sink.accepted) {
+		totalPcmFrames += chunk.frameCount;
+		largestChunk = std::max(largestChunk, chunk.frameCount);
+	}
+	std::fprintf(stderr, "Media smoke: first_video_steps=%zu primed_buffers=%zu video_frames=%zu "
+		"pcm_frames=%lld max_pcm_chunk=%u dropped=%zu state=%u\n", firstVideoSteps, primedBuffers,
+		trace.frames.size(), static_cast<long long>(totalPcmFrames), largestChunk, sink.dropped.size(),
+		static_cast<unsigned int>(playback.state()));
+	return playback.state() == FFmpegMoviePlaybackState::ENDED && sink.dropped.empty()
+		&& largestChunk <= FFmpegAudioDecoder::MAX_CHUNK_FRAMES;
 }
 
 static bool runToEnd(const char *path, PlaybackRun &run, const FFmpegMoviePlaybackOptions &options,
@@ -370,7 +694,78 @@ static bool testAcceptedAudioWaitsForSinkDrain(const char *audioPath)
 	for (const AudioPcmChunk &chunk : sink.accepted) {
 		acceptedFrames += chunk.frameCount;
 	}
-	return acceptedFrames > 19200 && sink.serviceCalls >= 4;
+	return acceptedFrames == 26400 && sink.serviceCalls >= 4;
+}
+
+static bool testNoCallbackDrainFailsBoundedly(const char *audioPath)
+{
+	MemoryTestFile input(audioPath);
+	FFmpegFile file;
+	if (!openFile(audioPath, input, file)) {
+		return false;
+	}
+	RecordingSink sink;
+	// The sink accepts queued audio but never reports completion. This models a
+	// device that has stopped making callback progress without publishing an
+	// explicit error.
+	sink.holdDrain = true;
+	ManualClock clock;
+	FFmpegMoviePlaybackOptions options;
+	options.mode = FFmpegMoviePlaybackMode::SHOW_LAST_FRAME;
+	options.clock = [&clock]() { return clock.now(); };
+	FFmpegMoviePlayback playback(file, &sink, options);
+	for (std::size_t i = 0; i < 256 && playback.state() != FFmpegMoviePlaybackState::DRAINING; ++i) {
+		if (!playback.pump(32)) {
+			return false;
+		}
+	}
+	if (playback.state() != FFmpegMoviePlaybackState::DRAINING
+		|| sink.endOfStreamCalls != 1 || sink.resetCalls != 1) {
+		return false;
+	}
+
+	clock.microseconds = 5000000;
+	if (!playback.pump(1) || playback.state() != FFmpegMoviePlaybackState::DRAINING) {
+		return false;
+	}
+	clock.microseconds = 11000000;
+	const bool failed = !playback.pump(1)
+		&& playback.isTerminal()
+		&& playback.state() == FFmpegMoviePlaybackState::FAILED
+		&& sink.resetCalls == 2;
+	return failed && sink.endOfStreamCalls == 1;
+}
+
+static bool testNoCallbackBackpressureFailsBoundedly(const char *audioPath)
+{
+	MemoryTestFile input(audioPath);
+	FFmpegFile file;
+	if (!openFile(audioPath, input, file)) {
+		return false;
+	}
+	RecordingSink sink;
+	// No completed callbacks ever free an admission slot.  The stream must
+	// remain healthy for a short stall, then fail instead of spinning forever.
+	sink.availableSubmissions = 0;
+	ManualClock clock;
+	FFmpegMoviePlaybackOptions options;
+	options.clock = [&clock]() { return clock.now(); };
+	FFmpegMoviePlayback playback(file, &sink, options);
+	if (playback.state() != FFmpegMoviePlaybackState::ACTIVE
+		|| !playback.pump(1) || playback.state() != FFmpegMoviePlaybackState::ACTIVE
+		|| sink.submitCalls != 0) {
+		return false;
+	}
+	clock.microseconds = 5000000;
+	if (!playback.pump(1) || playback.state() != FFmpegMoviePlaybackState::ACTIVE) {
+		return false;
+	}
+	clock.microseconds = 11000000;
+	const bool failed = !playback.pump(1)
+		&& playback.isTerminal()
+		&& playback.state() == FFmpegMoviePlaybackState::FAILED
+		&& sink.resetCalls == 2;
+	return failed && sink.endOfStreamCalls == 0;
 }
 
 static bool testCallbackDetachesBeforeFileReuse(const char *audioPath)
@@ -427,41 +822,99 @@ static bool testDisabledAudio(const char *audioPath)
         && run.sink.failed.empty() && run.drainCalls == 1;
 }
 
-static bool testDropsAndBoundedCompletion(const char *audioPath)
+static bool testBackpressurePreservesAudioAndVideo(const char *audioPath)
 {
-    PlaybackRun oneDrop;
-    oneDrop.sink.dropNext = true;
-    FFmpegMoviePlaybackOptions options;
-    options.mode = FFmpegMoviePlaybackMode::ONCE;
-    if (!runToEnd(audioPath, oneDrop, options) || oneDrop.pumpCalls >= 256
-        || oneDrop.sink.dropped.empty() || oneDrop.sink.accepted.empty()) {
-        return false;
-    }
-    bool hasDiscontinuity = false;
-    for (const AudioPcmChunk &chunk : oneDrop.sink.accepted) {
-        hasDiscontinuity = hasDiscontinuity || chunk.discontinuity;
-    }
-    if (!hasDiscontinuity || oneDrop.sink.dropped.size() != 1
-        || oneDrop.sink.submitCalls != oneDrop.sink.dropped.size() + oneDrop.sink.accepted.size()) {
-        return false;
-    }
-    const std::uint64_t droppedSequence = oneDrop.sink.dropped.front().sequence;
-    bool continuation = false;
-    for (const AudioPcmChunk &chunk : oneDrop.sink.accepted) {
-        continuation = continuation || (chunk.sequence == droppedSequence + 1 && chunk.discontinuity);
-    }
-    if (!continuation) {
-        return false;
-    }
+	MemoryTestFile input(audioPath);
+	FFmpegFile file;
+	if (!openFile(audioPath, input, file)) {
+		return false;
+	}
+	RecordingSink sink;
+	sink.availableSubmissions = 1;
+	VideoTrace trace;
+	FFmpegMoviePlayback playback(file, &sink);
+	playback.setVideoCallback(captureVideo, &trace);
+	for (std::size_t call = 0; call < 3; ++call) {
+		if (!playback.pump(32)) {
+			return false;
+		}
+	}
+	if (!trace.frames.empty() || sink.submitCalls != 0 || sink.serviceCalls != 3
+		|| sink.capacityChecks < 3 || playback.isTerminal()) {
+		return false;
+	}
 
-    PlaybackRun permanent;
-    permanent.sink.dropAll = true;
-    if (!runToEnd(audioPath, permanent, options) || permanent.pumpCalls >= 256
-        || permanent.sink.accepted.size() != 0 || permanent.sink.dropped.empty()
-        || permanent.sink.submitCalls != permanent.sink.dropped.size()) {
-        return false;
-    }
-	return true;
+	sink.availableSubmissions = (std::numeric_limits<std::size_t>::max)();
+	for (std::size_t call = 0; call < 256 && !playback.isTerminal(); ++call) {
+		if (!playback.pump(32)) {
+			return false;
+		}
+	}
+	if (playback.state() != FFmpegMoviePlaybackState::ENDED || trace.frames.size() != 12
+		|| !sink.dropped.empty() || sink.endOfStreamCalls != 1) {
+		return false;
+	}
+	std::int64_t expectedStart = 0;
+	std::uint64_t expectedSequence = 0;
+	for (const AudioPcmChunk &chunk : sink.accepted) {
+		if (chunk.sequence != expectedSequence++ || chunk.startSample != expectedStart) {
+			return false;
+		}
+		expectedStart += chunk.frameCount;
+	}
+	return expectedStart == 26400;
+}
+
+static bool testResetPendingServiceReopensAdmission(const char *audioPath)
+{
+	MemoryTestFile input(audioPath);
+	FFmpegFile file;
+	if (!openFile(audioPath, input, file)) {
+		return false;
+	}
+	RecordingSink sink;
+	// XAudio2PcmVoice::reset leaves a newly opened voice reset-pending until
+	// owner-side service performs stop/flush.  Admission is unavailable during
+	// that transition and reopens only after service returns.
+	sink.serviceReopensAdmission = true;
+	VideoTrace trace;
+	FFmpegMoviePlayback playback(file, &sink);
+	playback.setVideoCallback(captureVideo, &trace);
+	if (sink.resetCalls != 1 || !sink.resetPending || sink.availableSubmissions != 0
+		|| sink.serviceCalls != 0) {
+		return false;
+	}
+	// A one-step owner call must report the successful reset/service transition
+	// as progress; otherwise FFmpegVideoStream treats the still-healthy stream
+	// as failed before it can attempt its first decode step.
+	if (!playback.pump(1) || playback.state() != FFmpegMoviePlaybackState::ACTIVE
+		|| sink.resetPending || sink.serviceCalls != 1 || sink.submitCalls != 0
+		|| !trace.frames.empty()) {
+		return false;
+	}
+	for (std::size_t step = 0; step < 128 && trace.frames.empty(); ++step) {
+		if (!playback.pump(1)) {
+			return false;
+		}
+	}
+	return trace.frames.size() == 1 && playback.state() == FFmpegMoviePlaybackState::ACTIVE;
+}
+
+static bool testUnexpectedMovieDropFailsBoundedly(const char *audioPath)
+{
+	MemoryTestFile input(audioPath);
+	FFmpegFile file;
+	if (!openFile(audioPath, input, file)) {
+		return false;
+	}
+	RecordingSink sink;
+	sink.dropNext = true;
+	FFmpegMoviePlayback playback(file, &sink);
+	for (std::size_t call = 0; call < 64 && !playback.isTerminal(); ++call) {
+		playback.pump(1);
+	}
+	return playback.state() == FFmpegMoviePlaybackState::FAILED
+		&& sink.dropped.size() == 1 && sink.endOfStreamCalls == 0;
 }
 
 static bool testTerminalResetOwnership(const char *audioPath)
@@ -665,7 +1118,7 @@ static bool testTerminalSinkFailure(const char *audioPath)
         && sink.events.back().find("reset:1") == 0;
 }
 
-static bool testAudioMasterClock(const char *audioPath)
+static bool testMonotonicClockIgnoresCompletedAudioStaircase(const char *audioPath)
 {
     MemoryTestFile input(audioPath);
     FFmpegFile file;
@@ -675,19 +1128,71 @@ static bool testAudioMasterClock(const char *audioPath)
     RecordingSink sink;
     sink.clockEnabled = true;
     sink.playedSample = 0;
+	ManualClock clock;
     FFmpegMoviePlaybackOptions options;
     options.mode = FFmpegMoviePlaybackMode::ONCE;
+	options.clock = [&clock]() { return clock.now(); };
     FFmpegMoviePlayback playback(file, &sink, options);
     VideoTrace trace;
     playback.setVideoCallback(captureVideo, &trace);
-    if (!playback.pump(1) || trace.frames.size() != 1 || !playback.isFrameReady()) {
-        return false;
-    }
+	for (std::size_t step = 0; step < 128 && trace.frames.empty(); ++step) {
+		if (!playback.pump(1)) {
+			return false;
+		}
+	}
+	if (trace.frames.size() != 1 || !playback.isFrameReady()) {
+		return false;
+	}
     if (!playback.pump(64) || trace.frames.size() < 2 || playback.isFrameReady()) {
         return false;
     }
-    sink.playedSample = 2000;
-    return playback.isFrameReady();
+	// A completed-buffer clock can remain at zero for most of a large BIK
+	// audio packet.  It must neither freeze nor prematurely release video.
+	sink.playedSample = 2000;
+	if (playback.isFrameReady()) {
+		return false;
+	}
+	clock.microseconds = playback.videoPresentationTimeUs();
+	return playback.isFrameReady();
+}
+
+static bool testNativeGainAvoidsQueuedPcmRewrite(const char *audioPath)
+{
+	PlaybackRun full;
+	FFmpegMoviePlaybackOptions fullOptions;
+	fullOptions.mode = FFmpegMoviePlaybackMode::ONCE;
+	if (!runToEnd(audioPath, full, fullOptions) || full.sink.accepted.empty()) {
+		return false;
+	}
+
+	MemoryTestFile input(audioPath);
+	FFmpegFile file;
+	if (!openFile(audioPath, input, file)) {
+		return false;
+	}
+	RecordingSink sink;
+	sink.nativeOutputGain = true;
+	FFmpegMoviePlaybackOptions options;
+	options.mode = FFmpegMoviePlaybackMode::ONCE;
+	options.gain = 0.5;
+	FFmpegMoviePlayback playback(file, &sink, options);
+	playback.setGain(0.25);
+	for (std::size_t call = 0; call < 256 && !playback.isTerminal(); ++call) {
+		if (!playback.pump(32)) {
+			return false;
+		}
+	}
+	if (playback.state() != FFmpegMoviePlaybackState::ENDED
+		|| sink.outputGains.size() != 2 || sink.outputGains[0] != 0.5
+		|| sink.outputGains[1] != 0.25 || sink.accepted.size() != full.sink.accepted.size()) {
+		return false;
+	}
+	for (std::size_t index = 0; index < sink.accepted.size(); ++index) {
+		if (sink.accepted[index].data != full.sink.accepted[index].data) {
+			return false;
+		}
+	}
+	return true;
 }
 
 static bool testSeekAndGeneration(const char *audioPath)
@@ -710,17 +1215,27 @@ static bool testSeekAndGeneration(const char *audioPath)
         return false;
     }
     const std::size_t frameCountBeforeSeek = trace.frames.size();
+	if (!playback.pump(1) || trace.frames.size() != frameCountBeforeSeek) {
+		return false;
+	}
     for (std::size_t i = 0; i < 128 && !playback.isTerminal(); ++i) {
         playback.pump(16);
     }
     if (playback.state() == FFmpegMoviePlaybackState::FAILED || !playback.isTerminal()
-        || trace.frames.size() <= frameCountBeforeSeek || sink.rejected.size() != 0) {
+        || trace.frames.size() != frameCountBeforeSeek + 6 || sink.rejected.size() != 0) {
         return false;
     }
+    const std::int64_t videoOriginUs = file.getVideoStartTimeMicroseconds();
+    if (videoOriginUs < 4900000) {
+        return false;
+    }
+    const FFmpegFrameRate rate = file.getVideoFrameRate();
+    if (rate.numerator <= 0 || rate.denominator <= 0) {
+        return false;
+    }
+    const std::int64_t targetUs = videoOriginUs + av_rescale_q(6,
+        AVRational { rate.denominator, rate.numerator }, AVRational { 1, 1000000 });
     for (std::size_t i = frameCountBeforeSeek; i < trace.frames.size(); ++i) {
-        const FFmpegFrameRate rate = file.getVideoFrameRate();
-        const std::int64_t targetUs = av_rescale_q(6,
-            AVRational { rate.denominator, rate.numerator }, AVRational { 1, 1000000 });
         const std::int64_t timestampUs = av_rescale_q(trace.frames[i].presentationTimestamp,
             AVRational { trace.frames[i].timeBaseNumerator, trace.frames[i].timeBaseDenominator },
             AVRational { 1, 1000000 });
@@ -729,6 +1244,38 @@ static bool testSeekAndGeneration(const char *audioPath)
         }
     }
     return playback.drainCount() == 1;
+}
+
+static bool testSeekUsesAbsoluteTimeline(const char *audioPath)
+{
+	MemoryTestFile input(audioPath);
+	FFmpegFile file;
+	if (!openFile(audioPath, input, file)) {
+		return false;
+	}
+	const std::int64_t videoOriginUs = file.getVideoStartTimeMicroseconds();
+	const FFmpegFrameRate rate = file.getVideoFrameRate();
+	if (videoOriginUs < 4900000 || rate.numerator <= 0 || rate.denominator <= 0) {
+		return false;
+	}
+	const std::int64_t targetUs = videoOriginUs + av_rescale_q(6,
+		AVRational { rate.denominator, rate.numerator }, AVRational { 1, 1000000 });
+	FFmpegMoviePlayback playback(file, nullptr);
+	if (!playback.seekFrame(6)) {
+		return false;
+	}
+	FFmpegFrameMetadata metadata;
+	metadata.streamType = AVMEDIA_TYPE_AUDIO;
+	metadata.timeBaseNumerator = 1;
+	metadata.timeBaseDenominator = 48000;
+	metadata.presentationTimestamp = av_rescale_q(targetUs - 1000,
+		AVRational { 1, 1000000 }, AVRational { 1, 48000 });
+	if (FFmpegMoviePlaybackTestAccess::admitAudioFrame(playback, metadata)) {
+		return false;
+	}
+	metadata.presentationTimestamp = av_rescale_q(targetUs + 1000,
+		AVRational { 1, 1000000 }, AVRational { 1, 48000 });
+	return FFmpegMoviePlaybackTestAccess::admitAudioFrame(playback, metadata);
 }
 
 static bool testSeekAdmitsTimestampLessAudio(const char *audioPath)
@@ -780,12 +1327,16 @@ static bool testExplicitEndModesAndLoop(const char *audioPath)
     loopOptions.mode = FFmpegMoviePlaybackMode::LOOP;
     FFmpegMoviePlayback playback(file, &sink, loopOptions);
     playback.setVideoCallback(captureVideo, &trace);
-    for (std::size_t i = 0; i < 512 && playback.generation() < 2; ++i) {
+    for (std::size_t i = 0;
+        i < 512 && (playback.generation() < 2 || trace.frames.size() < 13); ++i) {
         if (!playback.pump(32)) {
             return false;
         }
     }
     if (playback.generation() < 2 || sink.resetCalls < 2 || trace.frames.size() < 13) {
+        std::fprintf(stderr, "loop did not restart: generation=%llu resets=%llu frames=%zu\n",
+            static_cast<unsigned long long>(playback.generation()),
+            static_cast<unsigned long long>(sink.resetCalls), trace.frames.size());
         return false;
     }
     playback.setMode(FFmpegMoviePlaybackMode::ONCE);
@@ -793,11 +1344,22 @@ static bool testExplicitEndModesAndLoop(const char *audioPath)
         playback.pump(32);
     }
     if (!playback.isTerminal() || playback.state() == FFmpegMoviePlaybackState::FAILED) {
+        std::fprintf(stderr, "loop did not terminate after mode switch: state=%d generation=%llu frames=%zu\n",
+            static_cast<int>(playback.state()), static_cast<unsigned long long>(playback.generation()),
+            trace.frames.size());
         return false;
     }
     const std::size_t firstGenerationFrames = once.video.frames.size();
     const bool loopResult = trace.frames[firstGenerationFrames].presentationTimestamp == once.video.frames[0].presentationTimestamp
         && sink.accepted.size() > 1 && sink.accepted.back().generation >= 2;
+    if (!loopResult) {
+        std::fprintf(stderr,
+            "loop result mismatch: first_count=%zu loop_frames=%zu first_pts=%lld loop_pts=%lld accepted=%zu last_generation=%llu\n",
+            firstGenerationFrames, trace.frames.size(),
+            static_cast<long long>(once.video.frames[0].presentationTimestamp),
+            static_cast<long long>(trace.frames[firstGenerationFrames].presentationTimestamp), sink.accepted.size(),
+            static_cast<unsigned long long>(sink.accepted.empty() ? 0 : sink.accepted.back().generation));
+    }
     return loopResult;
 }
 
@@ -888,7 +1450,12 @@ static bool testClockBoundaries(const char *videoPath)
     FFmpegMoviePlayback playback(file, &sink, options);
     VideoTrace trace;
     playback.setVideoCallback(captureVideo, &trace);
-	if (!playback.pump(1) || trace.frames.empty() || !playback.isFrameReady()) {
+	for (std::size_t step = 0; step < 128 && trace.frames.empty(); ++step) {
+		if (!playback.pump(1)) {
+			return false;
+		}
+	}
+	if (trace.frames.size() != 1 || !playback.isFrameReady()) {
 		return false;
 	}
 	clock.microseconds = 0;
@@ -905,6 +1472,9 @@ static bool testClockBoundaries(const char *videoPath)
 
 int main(int argc, char **argv)
 {
+	if (argc == 3 && std::strcmp(argv[1], "--media-smoke") == 0) {
+		return runExistingMediaSmoke(argv[2]) ? 0 : 1;
+	}
     if (argc != 3) {
         std::fputs("Expected generated audio/video and video-only fixture paths.\n", stderr);
         return 1;
@@ -912,19 +1482,29 @@ int main(int argc, char **argv)
 
     struct TestCase { const char *name; bool (*run)(const char *, const char *); };
     const TestCase tests[] = {
+		{ "many audio frames prime before first video", [](const char *audio, const char *) { return testManyAudioFramesPrimeBeforeFirstVideo(audio); } },
+		{ "movie aggregation stays bounded and resets", [](const char *audio, const char *) { return testMovieAggregationBoundAndReset(audio); } },
+		{ "movie aggregation preserves discontinuity and provenance", [](const char *audio, const char *) { return testMovieAggregationPreservesDiscontinuityAndProvenance(audio); } },
+		{ "movie aggregation retains per-frame software gain", [](const char *audio, const char *) { return testMovieAggregationRetainsPerFrameSoftwareGain(audio); } },
         { "integrated audio/video and drain", [](const char *audio, const char *) { return testIntegratedAudioVideoAndDrain(audio); } },
         { "accepted audio waits for sink drain", [](const char *audio, const char *) { return testAcceptedAudioWaitsForSinkDrain(audio); } },
+        { "no-callback drain fails boundedly", [](const char *audio, const char *) { return testNoCallbackDrainFailsBoundedly(audio); } },
+        { "no-callback backpressure fails boundedly", [](const char *audio, const char *) { return testNoCallbackBackpressureFailsBoundedly(audio); } },
         { "terminal reset ownership", [](const char *audio, const char *) { return testTerminalResetOwnership(audio); } },
         { "callback detaches before file reuse", [](const char *audio, const char *) { return testCallbackDetachesBeforeFileReuse(audio); } },
         { "silent video fallback", [](const char *, const char *video) { return testSilentVideoFallback(video); } },
         { "disabled audio fallback", [](const char *audio, const char *) { return testDisabledAudio(audio); } },
-        { "drops and bounded completion", [](const char *audio, const char *) { return testDropsAndBoundedCompletion(audio); } },
-        { "gain and mute", [](const char *audio, const char *) { return testGainAndMute(audio); } },
+		{ "backpressure preserves audio and video", [](const char *audio, const char *) { return testBackpressurePreservesAudioAndVideo(audio); } },
+		{ "reset-pending service reopens admission", [](const char *audio, const char *) { return testResetPendingServiceReopensAdmission(audio); } },
+		{ "unexpected movie drop fails boundedly", [](const char *audio, const char *) { return testUnexpectedMovieDropFailsBoundedly(audio); } },
+		{ "gain and mute", [](const char *audio, const char *) { return testGainAndMute(audio); } },
+		{ "native gain avoids queued PCM rewrite", [](const char *audio, const char *) { return testNativeGainAvoidsQueuedPcmRewrite(audio); } },
         { "read and seek failures do not loop", [](const char *audio, const char *) { return testReadAndSeekFailuresDoNotLoop(audio); } },
         { "truncated input fails and malformed container is rejected", [](const char *audio, const char *) { return testTruncatedInputFailsAndMalformedContainerIsRejected(audio); } },
         { "terminal sink failure", [](const char *audio, const char *) { return testTerminalSinkFailure(audio); } },
-        { "audio master clock", [](const char *audio, const char *) { return testAudioMasterClock(audio); } },
+        { "monotonic clock ignores completed-audio staircase", [](const char *audio, const char *) { return testMonotonicClockIgnoresCompletedAudioStaircase(audio); } },
         { "seek and generation", [](const char *audio, const char *) { return testSeekAndGeneration(audio); } },
+        { "seek uses absolute timeline", [](const char *audio, const char *) { return testSeekUsesAbsoluteTimeline(audio); } },
         { "seek admits timestamp-less audio", [](const char *audio, const char *) { return testSeekAdmitsTimestampLessAudio(audio); } },
         { "explicit end modes and loop", [](const char *audio, const char *) { return testExplicitEndModesAndLoop(audio); } },
         { "loop reset clears frame before new generation", [](const char *audio, const char *) { return testLoopResetClearsFrameBeforeNewGeneration(audio); } },

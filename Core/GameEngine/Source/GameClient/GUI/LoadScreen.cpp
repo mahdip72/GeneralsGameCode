@@ -537,20 +537,28 @@ void SinglePlayerLoadScreen::init( GameInfo *game )
 		// TheSuperHackers @bugfix Originally this movie render loop stopped rendering when the game window was inactive.
 		// This either skipped the movie or caused decompression artifacts. Now the video just keeps playing until it done.
 
-		Int progressUpdateCount = m_videoStream->frameCount() / FRAME_FUDGE_ADD;
+		const Int movieFrameCount = m_videoStream->frameCount();
+		const Bool hasKnownFrameCount = movieFrameCount > 0;
+		Int progressUpdateCount = movieFrameCount / FRAME_FUDGE_ADD;
+		if (progressUpdateCount < 1) {
+			progressUpdateCount = 1;
+		}
 		Int shiftedPercent = -FRAME_FUDGE_ADD + 1;
-		while (m_videoStream->frameIndex() < m_videoStream->frameCount() - 1
-			&& !m_videoStream->isFinished())
+		Bool movieAborted = FALSE;
+		while ((!hasKnownFrameCount || m_videoStream->frameIndex() < movieFrameCount - 1)
+			&& !m_videoStream->isFinished()
+			&& !m_videoStream->isPlaybackFailed())
 		{
 			if (GameClient::isMovieAbortRequested())
 			{
+				movieAborted = TRUE;
 				break;
 			}
 
 			if(!m_videoStream->isFrameReady())
 			{
 				m_videoStream->update();
-				if (m_videoStream->isFinished()) {
+				if (m_videoStream->isPlaybackFailed() || m_videoStream->isFinished()) {
 					break;
 				}
 				Sleep(1);
@@ -586,26 +594,99 @@ void SinglePlayerLoadScreen::init( GameInfo *game )
 			// redraw all views, update the GUI
 			TheDisplay->draw();
 		}
+		const Bool finalFrameReached = hasKnownFrameCount
+			? m_videoStream->frameIndex() >= movieFrameCount - 1
+			: m_videoStream->isFinished();
+		if (!movieAborted && !m_videoStream->isPlaybackFailed() && finalFrameReached) {
+			// The loop advances into the final frame before its frame-count guard
+			// expires. Present that retained frame once, then let native playback
+			// drain accepted tail audio. Legacy backends keep a no-op drain hook.
+			Bool finalFrameReady = FALSE;
+			if (GameClient::isMovieAbortRequested()) {
+				movieAborted = TRUE;
+			} else {
+				finalFrameReady = m_videoStream->isFrameReady();
+			}
+			enum { MAX_FINAL_FRAME_READY_ATTEMPTS = 10000 };
+			for (Int attempt = 0;
+				!finalFrameReady && !m_videoStream->isPlaybackFailed()
+					&& attempt < MAX_FINAL_FRAME_READY_ATTEMPTS;
+				++attempt) {
+				if (GameClient::isMovieAbortRequested()) {
+					movieAborted = TRUE;
+					break;
+				}
+				// Bink reports finished when the final index is selected, but its
+				// BinkWait gate can still leave that frame unready. Always update
+				// before considering the terminal state, and never decode until the
+				// readiness contract succeeds. Native streams retain their frame.
+				m_videoStream->update();
+				if (m_videoStream->isPlaybackFailed()) {
+					break;
+				}
+				if (GameClient::isMovieAbortRequested()) {
+					movieAborted = TRUE;
+					break;
+				}
+				finalFrameReady = m_videoStream->isFrameReady();
+				if (!finalFrameReady && m_videoStream->isFinished()) {
+					Sleep(1);
+					continue;
+				}
+				if (!finalFrameReady) {
+					Sleep(1);
+				}
+			}
+			if (!movieAborted && !m_videoStream->isPlaybackFailed() && finalFrameReady) {
+				m_videoStream->frameDecompress();
+				m_videoStream->frameRender(m_videoBuffer);
+				if (m_videoBuffer) {
+					m_loadScreen->winGetInstanceData()->setVideoBuffer(m_videoBuffer);
+				}
+				TheWindowManager->update();
+				TheDisplay->draw();
+			}
+			enum { MAX_FINISH_PLAYBACK_ATTEMPTS = 10000 };
+			if (!movieAborted && !m_videoStream->isPlaybackFailed() && finalFrameReady) {
+				for (Int attempt = 0;
+					attempt < MAX_FINISH_PLAYBACK_ATTEMPTS && !m_videoStream->isPlaybackFailed();
+					++attempt) {
+					if (m_videoStream->finishPlayback()) {
+						break;
+					}
+					if (GameClient::isMovieAbortRequested()) {
+						break;
+					}
+					Sleep(1);
+				}
+			}
+		}
 
 #if !RTS_GENERALS
 		// let the background image show through
-		m_videoStream->close();
-		m_videoStream = nullptr;
 		m_loadScreen->winGetInstanceData()->setVideoBuffer( nullptr );
 		TheDisplay->draw();
 #endif
+		m_videoStream->close();
+		m_videoStream = nullptr;
 	}
 	else
 	{
 #if RTS_GENERALS
 		// if we're min speced
 		m_videoStream->frameGoto(m_videoStream->frameCount()); // zero based
-		while(!m_videoStream->isFrameReady() && !m_videoStream->isFinished())
+		while(!m_videoStream->isFrameReady() && !m_videoStream->isFinished()
+			&& !m_videoStream->isPlaybackFailed())
 		{
 			m_videoStream->update();
+			if (m_videoStream->isPlaybackFailed()) {
+				break;
+			}
 			Sleep(1);
 		}
-		if (!m_videoStream->isFrameReady()) {
+		if (m_videoStream->isPlaybackFailed() || !m_videoStream->isFrameReady()) {
+			m_videoStream->close();
+			m_videoStream = nullptr;
 			return;
 		}
 		m_videoStream->frameDecompress();
@@ -628,6 +709,8 @@ void SinglePlayerLoadScreen::init( GameInfo *game )
 #else
 		// if we're min spec'ed don't play a movie
 #endif
+		m_videoStream->close();
+		m_videoStream = nullptr;
 
 		Int delay = mission->m_voiceLength * 1000;
 		Int begin = timeGetTime();
@@ -960,6 +1043,10 @@ void ChallengeLoadScreen::init( GameInfo *game )
 
 	// create the new background video stream
 	m_videoStream = TheVideoPlayer->open( TheCampaignManager->getCurrentMission()->m_movieLabel );
+	if (m_videoStream == nullptr)
+	{
+		return;
+	}
 
 	// Create the new buffer
 	m_videoBuffer = TheDisplay->createVideoBuffer();
@@ -1059,20 +1146,28 @@ void ChallengeLoadScreen::init( GameInfo *game )
 		// TheSuperHackers @bugfix Originally this movie render loop stopped rendering when the game window was inactive.
 		// This either skipped the movie or caused decompression artifacts. Now the video just keeps playing until it done.
 
-		Int progressUpdateCount = m_videoStream->frameCount() / FRAME_FUDGE_ADD;
+		const Int movieFrameCount = m_videoStream->frameCount();
+		const Bool hasKnownFrameCount = movieFrameCount > 0;
+		Int progressUpdateCount = movieFrameCount / FRAME_FUDGE_ADD;
+		if (progressUpdateCount < 1) {
+			progressUpdateCount = 1;
+		}
 		Int shiftedPercent = -FRAME_FUDGE_ADD + 1;
-		while (m_videoStream->frameIndex() < m_videoStream->frameCount() - 1
-			&& !m_videoStream->isFinished())
+		Bool movieAborted = FALSE;
+		while ((!hasKnownFrameCount || m_videoStream->frameIndex() < movieFrameCount - 1)
+			&& !m_videoStream->isFinished()
+			&& !m_videoStream->isPlaybackFailed())
 		{
 			if (GameClient::isMovieAbortRequested())
 			{
+				movieAborted = TRUE;
 				break;
 			}
 
 			if(!m_videoStream->isFrameReady())
 			{
 				m_videoStream->update();
-				if (m_videoStream->isFinished()) {
+				if (m_videoStream->isPlaybackFailed() || m_videoStream->isFinished()) {
 					break;
 				}
 				Sleep(1);
@@ -1108,27 +1203,102 @@ void ChallengeLoadScreen::init( GameInfo *game )
 
 			TheAudio->update();
 		}
+		const Bool finalFrameReached = hasKnownFrameCount
+			? m_videoStream->frameIndex() >= movieFrameCount - 1
+			: m_videoStream->isFinished();
+		if (!movieAborted && !m_videoStream->isPlaybackFailed() && finalFrameReached) {
+			Bool finalFrameReady = FALSE;
+			if (GameClient::isMovieAbortRequested()) {
+				movieAborted = TRUE;
+			} else {
+				finalFrameReady = m_videoStream->isFrameReady();
+			}
+			enum { MAX_FINAL_FRAME_READY_ATTEMPTS = 10000 };
+			for (Int attempt = 0;
+				!finalFrameReady && !m_videoStream->isPlaybackFailed()
+					&& attempt < MAX_FINAL_FRAME_READY_ATTEMPTS;
+				++attempt) {
+				if (GameClient::isMovieAbortRequested()) {
+					movieAborted = TRUE;
+					break;
+				}
+				// Bink reports finished when the final index is selected, but its
+				// BinkWait gate can still leave that frame unready. Always update
+				// before considering the terminal state, and never decode until the
+				// readiness contract succeeds. Native streams retain their frame.
+				m_videoStream->update();
+				if (m_videoStream->isPlaybackFailed()) {
+					break;
+				}
+				if (GameClient::isMovieAbortRequested()) {
+					movieAborted = TRUE;
+					break;
+				}
+				finalFrameReady = m_videoStream->isFrameReady();
+				if (!finalFrameReady && m_videoStream->isFinished()) {
+					Sleep(1);
+					continue;
+				}
+				if (!finalFrameReady) {
+					Sleep(1);
+				}
+			}
+			if (!movieAborted && !m_videoStream->isPlaybackFailed() && finalFrameReady) {
+				m_videoStream->frameDecompress();
+				m_videoStream->frameRender(m_videoBuffer);
+				if (m_videoBuffer) {
+					m_loadScreen->winGetInstanceData()->setVideoBuffer(m_videoBuffer);
+				}
+				TheWindowManager->update();
+				m_wndVideoManager->update();
+				TheDisplay->draw();
+			}
+			enum { MAX_FINISH_PLAYBACK_ATTEMPTS = 10000 };
+			if (!movieAborted && !m_videoStream->isPlaybackFailed() && finalFrameReady) {
+				for (Int attempt = 0;
+					attempt < MAX_FINISH_PLAYBACK_ATTEMPTS && !m_videoStream->isPlaybackFailed();
+					++attempt) {
+					if (m_videoStream->finishPlayback()) {
+						break;
+					}
+					if (GameClient::isMovieAbortRequested()) {
+						break;
+					}
+					Sleep(1);
+				}
+			}
+		}
 	}
 	else
 	{
 		// if we're min speced
 		m_videoStream->frameGoto(m_videoStream->frameCount()); // zero based
-		while(!m_videoStream->isFrameReady() && !m_videoStream->isFinished())
+		while(!m_videoStream->isFrameReady() && !m_videoStream->isFinished()
+			&& !m_videoStream->isPlaybackFailed())
 		{
 			m_videoStream->update();
+			if (m_videoStream->isPlaybackFailed()) {
+				break;
+			}
 			if (GameClient::isMovieAbortRequested())
 			{
+				m_videoStream->close();
+				m_videoStream = nullptr;
 				return;
 			}
 			Sleep(1);
 		}
-		if (!m_videoStream->isFrameReady()) {
+		if (m_videoStream->isPlaybackFailed() || !m_videoStream->isFrameReady()) {
+			m_videoStream->close();
+			m_videoStream = nullptr;
 			return;
 		}
 		m_videoStream->frameDecompress();
 		m_videoStream->frameRender(m_videoBuffer);
 		if(m_videoBuffer)
 			m_loadScreen->winGetInstanceData()->setVideoBuffer(m_videoBuffer);
+		m_videoStream->close();
+		m_videoStream = nullptr;
 
 		activatePiecesMinSpec(generalPlayer, generalOpponent);
 
@@ -1155,6 +1325,10 @@ void ChallengeLoadScreen::init( GameInfo *game )
 		m_wndVideoManager->update();
 		TheWindowManager->update();
 		TheDisplay->draw();
+	}
+	if (m_videoStream != nullptr) {
+		m_videoStream->close();
+		m_videoStream = nullptr;
 	}
 	setFPMode();
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -36,6 +37,13 @@ class AudioPcmSink
 {
 public:
 	virtual ~AudioPcmSink() = default;
+	// A producer may reserve capacity before decoding input that cannot be
+	// replayed.  The default keeps unbounded/device-free sinks compatible.
+	virtual bool canAccept(std::size_t submissions) const noexcept
+	{
+		(void)submissions;
+		return true;
+	}
 	// Submission always consumes the chunk. A bounded sink reports DROPPED
 	// instead of asking the decoder to retry consumed input; FAILED is terminal.
 	virtual AudioPcmSubmitResult submit(AudioPcmChunk &&chunk) = 0;
@@ -50,6 +58,13 @@ public:
 	// Owner-side service point for sinks whose completion state is callback
 	// driven. Device-free sinks have nothing to service.
 	virtual bool serviceSink() noexcept { return true; }
+	// Native sinks can apply gain to PCM that is already queued. Returning false
+	// asks wrappers to retain their software-scaling fallback.
+	virtual bool setOutputGain(double gain) noexcept
+	{
+		(void)gain;
+		return false;
+	}
 	// Optional owner-provided playback position for audio-master video timing.
 	// Sinks without a hardware/playback clock use the injected monotonic fallback.
 	virtual bool getPlayedSample(std::int64_t &sample) const noexcept

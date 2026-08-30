@@ -47,7 +47,7 @@ try {
         '-hide_banner', '-loglevel', 'error',
         '-i', $VideoFixturePath, '-i', $audioOnlyFixturePath,
         '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy', '-c:a', 'pcm_s16le',
-        '-ar', '44100', '-ac', '2', '-y', $AudioFixturePath
+        '-ar', '44100', '-ac', '2', '-output_ts_offset', '5', '-y', $AudioFixturePath
     )
 
     Write-Output ("fixture-audio-command: " + $FFmpegExecutable + ' ' + ($audioCommand -join ' '))
@@ -83,12 +83,26 @@ try {
     $probeCommand = "$ffprobeExecutable -v error -count_frames -select_streams {stream}:0 -show_entries stream=nb_read_frames -of default=nw=1:nk=1 {fixture}"
     Write-Output ("fixture-count-command: " + $probeCommand.Replace('{stream}', 'v').Replace('{fixture}', $AudioFixturePath))
     $audioVideoFrames = & $ffprobeExecutable -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of default=nw=1:nk=1 $AudioFixturePath
-    $audioVideoSamples = & $ffprobeExecutable -v error -count_frames -select_streams a:0 -show_entries stream=nb_read_frames -of default=nw=1:nk=1 $AudioFixturePath
-    $videoOnlyFrames = & $ffprobeExecutable -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of default=nw=1:nk=1 $VideoFixturePath
-    if ($LASTEXITCODE -ne 0) {
-        throw 'Failed to inspect deterministic FFmpeg fixture stream counts.'
+    if ($LASTEXITCODE -ne 0 -or ($audioVideoFrames -join '') -ne '12') {
+        throw 'The deterministic audio/video fixture does not contain exactly 12 readable video frames.'
     }
-    Write-Output ("fixture-count audio-video video_frames={0} audio_frames={1}" -f ($audioVideoFrames -join ''), ($audioVideoSamples -join ''))
+    $firstVideoPts = & $ffprobeExecutable -v error -read_intervals '%+#1' -select_streams v:0 -show_entries packet=pts_time -of default=nw=1:nk=1 $AudioFixturePath
+    $firstVideoPtsValue = 0.0
+    if ($LASTEXITCODE -ne 0 -or -not [double]::TryParse(($firstVideoPts -join ''),
+            [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture,
+            [ref]$firstVideoPtsValue) -or $firstVideoPtsValue -lt 4.9) {
+        throw 'The deterministic audio/video fixture does not exercise a nonzero initial presentation timestamp.'
+    }
+    $audioVideoSamples = & $ffprobeExecutable -v error -select_streams a:0 -show_entries stream=sample_rate,duration_ts -of default=nw=1:nk=1 $AudioFixturePath
+    if ($LASTEXITCODE -ne 0 -or $audioVideoSamples.Count -ne 2 -or
+        ($audioVideoSamples -join ',') -ne '44100,24255') {
+        throw 'The deterministic fixture does not contain exactly 24,255 samples at 44.1 kHz (26,400 at the 48 kHz output rate).'
+    }
+    $videoOnlyFrames = & $ffprobeExecutable -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of default=nw=1:nk=1 $VideoFixturePath
+    if ($LASTEXITCODE -ne 0 -or ($videoOnlyFrames -join '') -ne '12') {
+        throw 'The deterministic video-only fixture does not contain exactly 12 readable video frames.'
+    }
+    Write-Output ("fixture-count audio-video video_frames={0} audio_contract={1}" -f ($audioVideoFrames -join ''), ($audioVideoSamples -join ','))
     Write-Output ("fixture-count video-only video_frames={0}" -f ($videoOnlyFrames -join ''))
 
     & $TestExecutable $AudioFixturePath $VideoFixturePath

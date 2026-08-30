@@ -3,12 +3,14 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <cmath>
 #include <cstring>
 #include <deque>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <new>
 
 #if defined(RTS_HAS_FFMPEG)
 extern "C" {
@@ -918,7 +920,7 @@ private:
 	int m_streamIndex = -1;
 	Real m_durationMS = 0.0f;
 	SequentialPcmSink m_sink;
-	FFmpegAudioDecoder m_decoder;
+	FFmpegAudioDecoder m_decoder { FFmpegAudioDecoder::MonoMix::UnityDuplicate };
 	bool m_opened = false;
 	bool m_eof = false;
 	bool m_failed = false;
@@ -1021,7 +1023,7 @@ bool decodeWithFFmpeg(const std::string &path, AudioPcmChunk &chunk,
 		return false;
 	}
 	CapturePcmSink sink(startFrame, maxFrames);
-	FFmpegAudioDecoder decoder;
+	FFmpegAudioDecoder decoder(FFmpegAudioDecoder::MonoMix::UnityDuplicate);
 	decoder.reset(1, sink);
 	auto receiveFrames = [&]() {
 		for (;;) {
@@ -1107,7 +1109,7 @@ bool decodeWithFFmpeg(const std::vector<std::uint8_t> &bytes, AudioPcmChunk &chu
 	}
 	{
 		CapturePcmSink sink(startFrame, maxFrames);
-		FFmpegAudioDecoder decoder;
+		FFmpegAudioDecoder decoder(FFmpegAudioDecoder::MonoMix::UnityDuplicate);
 		decoder.reset(1, sink);
 		auto receiveFrames = [&]() {
 			for (;;) {
@@ -1175,7 +1177,108 @@ void clearFFmpegReadFrameFailure()
 }
 #endif
 
+struct FileAudioAssetSource::SamplePcmCache
+{
+	static constexpr std::size_t MAX_ENTRIES = 256;
+	struct Budget
+	{
+		std::size_t limit = 0;
+		std::size_t bytesInUse = 0;
+	};
+	struct Pcm
+	{
+		Pcm(AudioPcmChunk &&value, std::shared_ptr<Budget> owner) :
+			chunk(std::move(value)), budget(std::move(owner))
+		{
+			budget->bytesInUse += chunk.data.capacity();
+		}
+		~Pcm() { budget->bytesInUse -= chunk.data.capacity(); }
+		AudioPcmChunk chunk;
+		std::shared_ptr<Budget> budget;
+	};
+	class Stream final : public AudioPcmStream
+	{
+	public:
+		explicit Stream(std::shared_ptr<const Pcm> pcm) : m_pcm(std::move(pcm)) {}
+		UnsignedInt sampleRate() const override { return m_pcm->chunk.sampleRate; }
+		Real durationMS() const override
+		{
+			return static_cast<Real>(m_pcm->chunk.frameCount) * 1000.0f / sampleRate();
+		}
+		Bool isEnded() const override { return m_nextFrame == m_pcm->chunk.frameCount; }
+		Bool readPcm(AudioPcmChunk &chunk, UnsignedInt maxFrames) override
+		{
+			chunk = {};
+			if (maxFrames == 0 || isEnded()) return FALSE;
+			const AudioPcmChunk &source = m_pcm->chunk;
+			chunk.sampleRate = source.sampleRate;
+			chunk.channels = source.channels;
+			chunk.sourceChannels = source.sourceChannels;
+			chunk.format = source.format;
+			chunk.frameCount = std::min({ maxFrames, MAX_OUTPUT_FRAMES,
+				source.frameCount - m_nextFrame });
+			chunk.startSample = m_nextFrame;
+			const std::size_t begin = static_cast<std::size_t>(m_nextFrame) * OUTPUT_BYTES_PER_FRAME;
+			const std::size_t end = begin + static_cast<std::size_t>(chunk.frameCount)
+				* OUTPUT_BYTES_PER_FRAME;
+			chunk.data.assign(source.data.begin() + begin, source.data.begin() + end);
+			m_nextFrame += chunk.frameCount;
+			return TRUE;
+		}
+	private:
+		std::shared_ptr<const Pcm> m_pcm;
+		UnsignedInt m_nextFrame = 0;
+	};
+	struct Entry
+	{
+		std::string fileName;
+		std::string path;
+		bool loose = false;
+		std::uintmax_t fileSize = 0;
+		std::filesystem::file_time_type writeTime {};
+		std::shared_ptr<const Pcm> pcm;
+	};
+	std::shared_ptr<Budget> budget = std::make_shared<Budget>();
+	std::list<Entry> entries;
+
+	bool makeRoom(std::size_t bytes)
+	{
+		for (auto it = entries.end(); it != entries.begin()
+			&& (budget->bytesInUse > budget->limit
+				|| bytes > budget->limit - budget->bytesInUse
+				|| entries.size() >= MAX_ENTRIES);) {
+			--it;
+			if (it->pcm.use_count() == 1) it = entries.erase(it);
+		}
+		return budget->bytesInUse <= budget->limit
+			&& bytes <= budget->limit - budget->bytesInUse && entries.size() < MAX_ENTRIES;
+	}
+};
+
 FileAudioAssetSource::FileAudioAssetSource() = default;
+
+FileAudioAssetSource::~FileAudioAssetSource() = default;
+
+void FileAudioAssetSource::setSamplePcmCacheBudget(std::size_t bytes) noexcept
+{
+	if (m_samplePcmCache == nullptr && bytes != 0) {
+		try {
+			m_samplePcmCache = std::make_unique<SamplePcmCache>();
+		} catch (const std::bad_alloc &) {
+			return;
+		}
+	}
+	if (m_samplePcmCache != nullptr) {
+		m_samplePcmCache->budget->limit = bytes;
+		invalidateSamplePcmCache();
+	}
+}
+
+void FileAudioAssetSource::invalidateSamplePcmCache() noexcept
+{
+	if (m_samplePcmCache != nullptr) m_samplePcmCache->entries.clear();
+	// Streams still playing hold the old immutable PCM and its budget charge.
+}
 
 FileAudioAssetSource::FileAudioAssetSource(const AsciiString &rootDirectory) :
 	m_rootDirectory(rootDirectory.isEmpty() ? std::string() : rootDirectory.str())
@@ -1358,6 +1461,103 @@ Bool FileAudioAssetSource::openPcmStream(const AsciiString &fileName,
 	(void)looseExists;
 #endif
 	return FALSE;
+}
+
+Bool FileAudioAssetSource::openPcmSampleStream(const AsciiString &fileName,
+	std::unique_ptr<AudioPcmStream> &stream) const
+{
+	stream.reset();
+	auto openUncached = [&]() -> Bool {
+		stream.reset();
+		try {
+			return openPcmStream(fileName, stream);
+		} catch (const std::bad_alloc &) {
+			stream.reset();
+			return FALSE;
+		}
+	};
+	if (m_samplePcmCache == nullptr || m_samplePcmCache->budget->limit == 0) {
+		return openUncached();
+	}
+	try {
+		SamplePcmCache &cache = *m_samplePcmCache;
+		const std::string key = fileName.str() == nullptr ? "" : fileName.str();
+		for (auto it = cache.entries.begin(); it != cache.entries.end(); ++it) {
+			if (it->fileName != key) continue;
+			bool unchanged = true;
+			if (it->loose) {
+				std::error_code error;
+				const auto size = std::filesystem::file_size(it->path, error);
+				unchanged = !error && size == it->fileSize;
+				if (unchanged) {
+					const auto time = std::filesystem::last_write_time(it->path, error);
+					unchanged = !error && time == it->writeTime;
+				}
+			} else {
+				std::error_code error;
+				const bool looseExists = std::filesystem::exists(it->path, error);
+				unchanged = !error && !looseExists;
+			}
+			if (unchanged) {
+				stream = std::make_unique<SamplePcmCache::Stream>(it->pcm);
+				cache.entries.splice(cache.entries.begin(), cache.entries, it);
+				return TRUE;
+			}
+			cache.entries.erase(it);
+			break;
+		}
+		SamplePcmCache::Entry entry;
+		entry.fileName = key;
+		entry.path = resolvePath(fileName);
+		std::error_code error;
+		entry.loose = std::filesystem::exists(entry.path, error) && !error;
+		if (error) return openUncached();
+		if (entry.loose) {
+			entry.fileSize = std::filesystem::file_size(entry.path, error);
+			if (error) return openUncached();
+			entry.writeTime = std::filesystem::last_write_time(entry.path, error);
+			if (error) return openUncached();
+		}
+		if (!openPcmStream(fileName, stream) || stream == nullptr) return FALSE;
+		const Real duration = stream->durationMS();
+		if (!std::isfinite(duration) || duration <= 0.0f || duration > 1000.0f) return TRUE;
+		const UnsignedInt frameLimit = static_cast<UnsignedInt>(std::min<std::size_t>(
+			MAX_OUTPUT_FRAMES, cache.budget->limit / OUTPUT_BYTES_PER_FRAME));
+		const double expectedFrames = std::ceil(static_cast<double>(duration)
+			* OUTPUT_SAMPLE_RATE / 1000.0);
+		if (frameLimit == 0 || static_cast<double>(duration) * OUTPUT_SAMPLE_RATE / 1000.0
+			> frameLimit || !cache.makeRoom(static_cast<std::size_t>(expectedFrames)
+				* OUTPUT_BYTES_PER_FRAME)) return TRUE;
+
+		AudioPcmChunk pcm;
+		if (!stream->readPcm(pcm, frameLimit) || pcm.frameCount == 0
+			|| pcm.frameCount > frameLimit || pcm.sampleRate != OUTPUT_SAMPLE_RATE
+			|| pcm.channels != OUTPUT_CHANNELS
+			|| pcm.format != AudioPcmFormat::SIGNED_16_INTERLEAVED_LITTLE_ENDIAN
+			|| pcm.data.size() != static_cast<std::size_t>(pcm.frameCount) * OUTPUT_BYTES_PER_FRAME) {
+			return openUncached();
+		}
+		if (!stream->isEnded()) {
+			AudioPcmChunk extra;
+			if (stream->readPcm(extra, 1U) || !stream->isEnded()) return openUncached();
+		}
+		const bool looseExists = std::filesystem::exists(entry.path, error);
+		if (error || looseExists != entry.loose) return openUncached();
+		if (entry.loose) {
+			const auto size = std::filesystem::file_size(entry.path, error);
+			if (error || size != entry.fileSize) return openUncached();
+			const auto time = std::filesystem::last_write_time(entry.path, error);
+			if (error || time != entry.writeTime) return openUncached();
+		}
+		pcm.data.shrink_to_fit();
+		if (!cache.makeRoom(pcm.data.capacity())) return openUncached();
+		entry.pcm = std::make_shared<SamplePcmCache::Pcm>(std::move(pcm), cache.budget);
+		stream = std::make_unique<SamplePcmCache::Stream>(entry.pcm);
+		cache.entries.push_front(std::move(entry));
+		return TRUE;
+	} catch (const std::bad_alloc &) {
+		return openUncached();
+	}
 }
 
 Bool FileAudioAssetSource::decodePcmAt(const AsciiString &fileName, AudioPcmChunk &chunk,
