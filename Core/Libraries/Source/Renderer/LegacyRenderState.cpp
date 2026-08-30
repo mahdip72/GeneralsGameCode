@@ -338,8 +338,16 @@ bool DecodeLegacyShaderBits(unsigned int shaderBits,
 	state->alphaTestEnable = alphaTest != 0;
 	if (state->alphaTestEnable)
 	{
-		state->alphaReference = 0x60U;
-		state->alphaFunction = RENDER_COMPARE_GREATER_EQUAL;
+		if (state->blend.sourceColor == RENDER_BLEND_INVERSE_SOURCE_ALPHA)
+		{
+			state->alphaReference = 0xffU - 0x60U;
+			state->alphaFunction = RENDER_COMPARE_LESS_EQUAL;
+		}
+		else
+		{
+			state->alphaReference = 0x60U;
+			state->alphaFunction = RENDER_COMPARE_GREATER_EQUAL;
+		}
 	}
 
 	switch (fog)
@@ -482,32 +490,42 @@ bool HasLegacyStatePublicationFailure()
 
 void TrackLegacyShaderBits(unsigned int shaderBits)
 {
-	const bool frontCounterClockwise =
-		g_trackedLogicalState.pipeline.rasterizer.frontCounterClockwise;
-	const bool rangeFogEnable =
-		g_trackedLogicalState.pipeline.rangeFogEnable;
 	LegacyPipelineState decoded;
 	g_trackedPipelineStateValid = DecodeLegacyShaderBits(shaderBits, &decoded);
 	if (!g_trackedPipelineStateValid)
 	{
 		return;
 	}
-	for (unsigned int index = 0; index < LEGACY_TEXTURE_STAGE_COUNT; ++index)
+
+	// ShaderClass owns only this subset of D3D8 state.  Decoding into a fresh
+	// LegacyPipelineState and replacing the whole tracked pipeline erases live
+	// lighting, material sources, texture factor, clipping, stencil, fill and
+	// depth-bias state.  The retail Set_Shader path never resets those values.
+	LegacyPipelineState &current = g_trackedLogicalState.pipeline;
+	current.shaderBits = decoded.shaderBits;
+	// ShaderClass::Apply controls blend enable and, when blending is active,
+	// the source/destination factors.  It does not touch BLENDOP,
+	// COLORWRITEENABLE, or the retained factors for an opaque shader.
+	current.blend.blendEnable = decoded.blend.blendEnable;
+	if (decoded.blend.blendEnable)
 	{
-		decoded.textureStages[index] =
-			g_trackedLogicalState.pipeline.textureStages[index];
+		current.blend.sourceColor = decoded.blend.sourceColor;
+		current.blend.destinationColor = decoded.blend.destinationColor;
+		current.blend.sourceAlpha = decoded.blend.sourceAlpha;
+		current.blend.destinationAlpha = decoded.blend.destinationAlpha;
 	}
-	// Shader bits only enable or disable culling. The actual legacy winding is
-	// process state and may be unchanged when the legacy cache suppresses the
-	// corresponding SetRenderState call.
-	decoded.rasterizer.frontCounterClockwise = frontCounterClockwise;
-	// Range fog is an independent D3D8 render state. Selecting a ShaderClass
-	// must not reset it merely because the shader-bit decoder starts from
-	// neutral defaults.
-	decoded.rangeFogEnable = rangeFogEnable;
-	decoded.pixelProgram = g_trackedLogicalState.pipeline.pixelProgram;
-	decoded.vertexProgram = g_trackedLogicalState.pipeline.vertexProgram;
-	g_trackedLogicalState.pipeline = decoded;
+	current.depthStencil.depthWrite = decoded.depthStencil.depthWrite;
+	current.depthStencil.depthFunction = decoded.depthStencil.depthFunction;
+	current.rasterizer.cullMode = decoded.rasterizer.cullMode;
+	current.fogMode = decoded.fogMode;
+	current.secondaryGradientEnable = decoded.secondaryGradientEnable;
+	current.nPatchEnable = decoded.nPatchEnable;
+	current.alphaTestEnable = decoded.alphaTestEnable;
+	if (decoded.alphaTestEnable)
+	{
+		current.alphaFunction = decoded.alphaFunction;
+		current.alphaReference = decoded.alphaReference;
+	}
 }
 
 void TrackLegacyPixelProgram(RenderLegacyPixelProgram program)

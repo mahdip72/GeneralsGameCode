@@ -1,6 +1,8 @@
+#include "Utility/CppMacros.h"
 #include "Renderer/RendererDevice.h"
 #if defined(RTS_RENDERER_HAS_D3D11)
 #include "../../Libraries/Source/WWVegas/WW3D2/d3d11legacybridge.h"
+#include "W3DDevice/GameClient/W3DVideoBuffer.h"
 #include "Renderer/LegacyBridgeValidation.h"
 #endif
 #include "Renderer/LegacyRenderState.h"
@@ -1152,8 +1154,8 @@ int testLegacyShaderBitDecoder()
 		3, 0, 3, 5, 0, 1, 1, 1, 12, 3) | (1U << 17);
 	result |= check(rts::render::DecodeLegacyShaderBits(inverseSourceAlpha, &state) &&
 		state.blend.sourceColor == rts::render::RENDER_BLEND_INVERSE_SOURCE_ALPHA &&
-		state.alphaReference == 0x60U &&
-		state.alphaFunction == rts::render::RENDER_COMPARE_GREATER_EQUAL &&
+		state.alphaReference == 0x9fU &&
+		state.alphaFunction == rts::render::RENDER_COMPARE_LESS_EQUAL &&
 		state.fogMode == rts::render::RENDER_FOG_WHITE && state.nPatchEnable &&
 		state.textureStages[0].colorOperation == rts::render::RENDER_TEXTURE_OP_MODULATE_2X &&
 		state.textureStages[1].colorOperation == rts::render::RENDER_TEXTURE_OP_MODULATE_ALPHA_ADD_COLOR &&
@@ -1174,6 +1176,30 @@ int testLegacyShaderBitDecoder()
 	rts::render::TrackLegacyCullState(true, true);
 	rts::render::GetTrackedLegacyPipelineState(&state);
 	state.rangeFogEnable = true;
+	state.lightingEnable = true;
+	state.normalizeNormals = true;
+	state.textureFactor = 0x80402010U;
+	state.clipPlaneEnableMask = 0x5U;
+	state.ambientMaterialSource = rts::render::RENDER_MATERIAL_SOURCE_COLOR1;
+	state.diffuseMaterialSource = rts::render::RENDER_MATERIAL_SOURCE_COLOR2;
+	state.emissiveMaterialSource = rts::render::RENDER_MATERIAL_SOURCE_COLOR1;
+	state.specularMaterialSource = rts::render::RENDER_MATERIAL_SOURCE_COLOR2;
+	state.depthStencil.stencilEnable = true;
+	state.depthStencil.stencilReference = 7U;
+	state.rasterizer.fillMode = rts::render::RENDER_FILL_WIREFRAME;
+	state.rasterizer.depthBias = 3;
+	state.blend.sourceColor = rts::render::RENDER_BLEND_SOURCE_ALPHA;
+	state.blend.destinationColor =
+		rts::render::RENDER_BLEND_INVERSE_SOURCE_ALPHA;
+	state.blend.sourceAlpha = rts::render::RENDER_BLEND_SOURCE_ALPHA;
+	state.blend.destinationAlpha =
+		rts::render::RENDER_BLEND_INVERSE_SOURCE_ALPHA;
+	state.blend.colorOperation =
+		rts::render::RENDER_BLEND_REVERSE_SUBTRACT;
+	state.blend.alphaOperation = rts::render::RENDER_BLEND_SUBTRACT;
+	state.blend.colorWriteMask = 0x5U;
+	state.alphaFunction = rts::render::RENDER_COMPARE_NOT_EQUAL;
+	state.alphaReference = 37U;
 	rts::render::TrackLegacyPipelineState(state);
 	// Re-selecting an already-applied shader must not erase the effective
 	// D3D8 winding or independent range-fog state when their cached render-state
@@ -1184,13 +1210,62 @@ int testLegacyShaderBitDecoder()
 		state.rasterizer.cullMode == rts::render::RENDER_CULL_BACK &&
 		state.rasterizer.frontCounterClockwise &&
 		state.rangeFogEnable &&
+		state.lightingEnable && state.normalizeNormals &&
+		state.textureFactor == 0x80402010U &&
+		state.clipPlaneEnableMask == 0x5U &&
+		state.ambientMaterialSource ==
+			rts::render::RENDER_MATERIAL_SOURCE_COLOR1 &&
+		state.diffuseMaterialSource ==
+			rts::render::RENDER_MATERIAL_SOURCE_COLOR2 &&
+		state.emissiveMaterialSource ==
+			rts::render::RENDER_MATERIAL_SOURCE_COLOR1 &&
+		state.specularMaterialSource ==
+			rts::render::RENDER_MATERIAL_SOURCE_COLOR2 &&
+		state.depthStencil.stencilEnable &&
+		state.depthStencil.stencilReference == 7U &&
+		state.rasterizer.fillMode == rts::render::RENDER_FILL_WIREFRAME &&
+		state.rasterizer.depthBias == 3 &&
+		!state.blend.blendEnable &&
+		state.blend.sourceColor == rts::render::RENDER_BLEND_SOURCE_ALPHA &&
+		state.blend.destinationColor ==
+			rts::render::RENDER_BLEND_INVERSE_SOURCE_ALPHA &&
+		state.blend.colorOperation ==
+			rts::render::RENDER_BLEND_REVERSE_SUBTRACT &&
+		state.blend.alphaOperation == rts::render::RENDER_BLEND_SUBTRACT &&
+		state.blend.colorWriteMask == 0x5U &&
+		!state.alphaTestEnable &&
+		state.alphaFunction == rts::render::RENDER_COMPARE_NOT_EQUAL &&
+		state.alphaReference == 37U &&
 		state.textureStages[0].colorOperation == rts::render::RENDER_TEXTURE_OP_MODULATE,
-		"legacy shader publication preserves independent cull and range-fog state");
+		"legacy shader publication preserves all independent pipeline state");
 	rts::render::TrackLegacyShaderBits(alphaTested);
 	result |= check(rts::render::GetTrackedLegacyPipelineState(&state) &&
-		state.shaderBits == alphaTested && state.rangeFogEnable,
-		"legacy shader changes preserve independent range-fog state");
+		state.shaderBits == alphaTested && state.rangeFogEnable &&
+		state.lightingEnable && state.normalizeNormals &&
+		state.textureFactor == 0x80402010U &&
+		state.clipPlaneEnableMask == 0x5U &&
+		state.depthStencil.stencilEnable &&
+		state.rasterizer.fillMode == rts::render::RENDER_FILL_WIREFRAME &&
+		state.blend.blendEnable &&
+		state.blend.sourceColor == rts::render::RENDER_BLEND_SOURCE_ALPHA &&
+		state.blend.destinationColor ==
+			rts::render::RENDER_BLEND_INVERSE_SOURCE_ALPHA &&
+		state.blend.colorOperation ==
+			rts::render::RENDER_BLEND_REVERSE_SUBTRACT &&
+		state.blend.alphaOperation == rts::render::RENDER_BLEND_SUBTRACT &&
+		state.blend.colorWriteMask == 0x5U &&
+		state.alphaTestEnable && state.alphaReference == 0x60U &&
+		state.alphaFunction == rts::render::RENDER_COMPARE_GREATER_EQUAL,
+		"legacy shader changes preserve independent lighting and raster state");
 	rts::render::TrackLegacyShaderBits(opaque);
+	result |= check(rts::render::GetTrackedLegacyPipelineState(&state) &&
+		!state.blend.blendEnable &&
+		state.blend.sourceColor == rts::render::RENDER_BLEND_SOURCE_ALPHA &&
+		state.blend.destinationColor ==
+			rts::render::RENDER_BLEND_INVERSE_SOURCE_ALPHA &&
+		!state.alphaTestEnable && state.alphaReference == 0x60U &&
+		state.alphaFunction == rts::render::RENDER_COMPARE_GREATER_EQUAL,
+		"opaque shader selection retains inactive blend and alpha-test parameters");
 	rts::render::GetTrackedLegacyPipelineState(&state);
 	rts::render::LegacyPipelineState effectiveState = state;
 	effectiveState.blend.blendEnable = true;
@@ -2197,6 +2272,14 @@ int testD3D11HiddenSwapChain()
 			{ { 0.8f, -0.8f, 0.0f }, { 0.0f, 0.0f, -1.0f },
 				0xffffffffU, { 1.0f, 1.0f } }
 		};
+		const TexturedVertex treeVertices[3] = {
+			{ { -0.8f, -0.8f, 0.0f }, { 0.0f, 1.0f, 0.0f },
+				0xffffffffU, { 0.0f, 1.0f } },
+			{ { 0.0f, 0.8f, 0.0f }, { 0.0f, 1.0f, 0.0f },
+				0xffffffffU, { 0.5f, 0.0f } },
+			{ { 0.8f, -0.8f, 0.0f }, { 0.0f, 1.0f, 0.0f },
+				0xffffffffU, { 1.0f, 1.0f } }
+		};
 		rts::render::BufferDescriptor texturedVertexDescriptor;
 		texturedVertexDescriptor.byteCount = sizeof(texturedVertices);
 		texturedVertexDescriptor.stride = sizeof(TexturedVertex);
@@ -2205,6 +2288,11 @@ int testD3D11HiddenSwapChain()
 			texturedVertices, sizeof(texturedVertices), &texturedVertexBuffer) ==
 			rts::render::RENDER_RESULT_OK,
 			"D3D11 parity probe creates a textured vertex buffer");
+		rts::render::GpuHandle treeVertexBuffer;
+		result |= check(device->createBuffer(texturedVertexDescriptor,
+			treeVertices, sizeof(treeVertices), &treeVertexBuffer) ==
+			rts::render::RENDER_RESULT_OK,
+			"D3D11 parity probe creates a physical tree vertex buffer");
 		const unsigned int greenPixels[4] = {
 			0xff00ff00U, 0xff00ff00U, 0xff00ff00U, 0xff00ff00U
 		};
@@ -2220,6 +2308,17 @@ int testD3D11HiddenSwapChain()
 		result |= check(device->createTexture(textureDescriptor, &textureData, 1,
 			&texture) == rts::render::RENDER_RESULT_OK,
 			"D3D11 parity probe creates an immutable shader texture");
+		const unsigned int treeShroudPixels[4] = {
+			0xff000000U, 0xffffffffU, 0xffffffffU, 0xffffffffU
+		};
+		rts::render::TextureSubresourceData treeShroudData;
+		treeShroudData.data = treeShroudPixels;
+		treeShroudData.rowPitch = 2 * sizeof(unsigned int);
+		treeShroudData.slicePitch = sizeof(treeShroudPixels);
+		rts::render::GpuHandle treeShroudTexture;
+		result |= check(device->createTexture(textureDescriptor, &treeShroudData,
+			1, &treeShroudTexture) == rts::render::RENDER_RESULT_OK,
+			"D3D11 parity probe creates a tree shroud texture");
 		const unsigned int riverEdgePixels[4] = {
 			0x80000000U, 0x80000000U, 0x80000000U, 0x80000000U
 		};
@@ -2761,6 +2860,65 @@ int testD3D11HiddenSwapChain()
 		center = &pixels[4 * (32 * 64 + 32)];
 		result |= check(center[2] > 240 && center[1] < 16,
 			"textured range fog reaches its color away from the view axis");
+
+		// Trees physically carry only TEXCOORD0. Their legacy vertex program
+		// generates TEXCOORD1 from position and c32/c33 for the shroud lookup.
+		// A black texel at (0,0) catches any regression that consults only the
+		// input-layout coordinate mask and discards that generated coordinate.
+		logicalState.pipeline.vertexProgram =
+			rts::render::RENDER_LEGACY_VERTEX_TREES;
+		logicalState.pipeline.fogMode = rts::render::RENDER_FOG_DISABLED;
+		logicalState.pipeline.rangeFogEnable = false;
+		logicalState.constants.fog.enabled = false;
+		logicalState.constants.vertexShaderConstants[8] =
+			rts::render::RenderFloat4();
+		logicalState.constants.vertexShaderConstants[32] =
+			rts::render::RenderFloat4(1.0f, 1.0f, 0.0f, 0.0f);
+		logicalState.constants.vertexShaderConstants[33] =
+			rts::render::RenderFloat4(0.5f, 0.5f, 1.0f, 1.0f);
+		logicalState.pipeline.textureStages[0].colorOperation =
+			rts::render::RENDER_TEXTURE_OP_MODULATE;
+		logicalState.pipeline.textureStages[0].colorArgument1 =
+			rts::render::RENDER_TEXTURE_ARG_TEXTURE;
+		logicalState.pipeline.textureStages[0].colorArgument2 =
+			rts::render::RENDER_TEXTURE_ARG_DIFFUSE;
+		logicalState.pipeline.textureStages[1].colorOperation =
+			rts::render::RENDER_TEXTURE_OP_MODULATE;
+		logicalState.pipeline.textureStages[1].colorArgument1 =
+			rts::render::RENDER_TEXTURE_ARG_TEXTURE;
+		logicalState.pipeline.textureStages[1].colorArgument2 =
+			rts::render::RENDER_TEXTURE_ARG_CURRENT;
+		logicalState.pipeline.textureStages[1].alphaOperation =
+			rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_2;
+		logicalState.pipeline.textureStages[1].alphaArgument2 =
+			rts::render::RENDER_TEXTURE_ARG_CURRENT;
+		logicalState.pipeline.textureStages[1].textureCoordinateIndex = 1;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyStateForLayout(logicalState, texturedLayout, 3) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(treeVertexBuffer,
+				sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(0, texture) == rts::render::RENDER_RESULT_OK &&
+			context->setTexture(1, treeShroudTexture) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"tree program samples its generated shroud coordinate");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(center[1] > 128 && center[0] < 32 && center[2] < 32,
+			"generated tree TEXCOORD1 preserves the lit foliage color");
+		logicalState.pipeline.textureStages[1] =
+			rts::render::LegacyTextureStageState();
+		logicalState.pipeline.fogMode = rts::render::RENDER_FOG_LINEAR;
+		logicalState.constants.fog.enabled = true;
 		// The tree program derives its diffuse intensity from normal.y. These
 		// vertices deliberately produce black before fog, making the same
 		// off-axis range-fog transition unambiguous without a separate fixture.
@@ -3594,6 +3752,138 @@ int testD3D11HiddenSwapChain()
 				rts::render::RENDER_RESULT_OK &&
 			context->endFrame() == rts::render::RENDER_RESULT_OK,
 			"D3D11 parity boundary accepts legacy bump-environment combiners");
+		// A no-color pass must still update depth/stencil and retain vertex
+		// clipping. Exercise both fixed-function and specialized pixel programs,
+		// then restore an alpha-tested no-color cutout immediately after null PS.
+		const unsigned int cutoutPixels[2] = { 0x00ffffffU, 0xffffffffU };
+		rts::render::TextureDescriptor cutoutDescriptor = textureDescriptor;
+		cutoutDescriptor.height = 1;
+		rts::render::TextureSubresourceData cutoutData;
+		cutoutData.data = cutoutPixels;
+		cutoutData.rowPitch = sizeof(cutoutPixels);
+		cutoutData.slicePitch = sizeof(cutoutPixels);
+		rts::render::GpuHandle cutoutTexture;
+		result |= check(device->createTexture(cutoutDescriptor, &cutoutData, 1,
+			&cutoutTexture) == rts::render::RENDER_RESULT_OK,
+			"D3D11 depth-only probe creates a transparent and opaque cutout texture");
+		for (unsigned int depthOnlyCase = 0; depthOnlyCase < 3; ++depthOnlyCase)
+		{
+			const bool alphaCutout = depthOnlyCase == 2;
+			rts::render::LegacyLogicalState depthOnlyState;
+			depthOnlyState.pipeline.pixelProgram = depthOnlyCase == 1 ?
+				rts::render::RENDER_LEGACY_PIXEL_WATER_FLAT :
+				rts::render::RENDER_LEGACY_PIXEL_FIXED_FUNCTION;
+			depthOnlyState.pipeline.rasterizer.cullMode =
+				rts::render::RENDER_CULL_NONE;
+			depthOnlyState.pipeline.blend.colorWriteMask = 0;
+			depthOnlyState.pipeline.depthStencil.stencilEnable = true;
+			depthOnlyState.pipeline.depthStencil.stencilReference = 37U;
+			depthOnlyState.pipeline.depthStencil.stencilFunction =
+				rts::render::RENDER_COMPARE_ALWAYS;
+			depthOnlyState.pipeline.depthStencil.stencilPass =
+				rts::render::RENDER_STENCIL_REPLACE;
+			depthOnlyState.pipeline.clipPlaneEnableMask = 1U;
+			depthOnlyState.constants.clipPlanes[0] = rts::render::RenderFloat4(
+				1.0f, 0.0f, 0.0f, alphaCutout ? -2.0f : 0.0f);
+			depthOnlyState.pipeline.textureStages[0].colorOperation =
+				rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_1;
+			depthOnlyState.pipeline.textureStages[0].colorArgument1 =
+				rts::render::RENDER_TEXTURE_ARG_TEXTURE;
+			depthOnlyState.pipeline.textureStages[0].alphaOperation =
+				rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_1;
+			depthOnlyState.pipeline.textureStages[0].alphaArgument1 =
+				rts::render::RENDER_TEXTURE_ARG_TEXTURE;
+			depthOnlyState.pipeline.textureStages[0].sampler.minification =
+				rts::render::RENDER_TEXTURE_FILTER_POINT;
+			depthOnlyState.pipeline.textureStages[0].sampler.magnification =
+				rts::render::RENDER_TEXTURE_FILTER_POINT;
+			const unsigned int depthOnlyTextureMask = alphaCutout ? 1U : 0U;
+			result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+				context->clear(clearColor, 1.0f, 0) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->setTexture(0, alphaCutout ? cutoutTexture :
+					rts::render::GpuHandle()) == rts::render::RENDER_RESULT_OK &&
+				context->setLegacyStateForLayout(depthOnlyState, texturedLayout,
+					depthOnlyTextureMask) == rts::render::RENDER_RESULT_OK &&
+				context->setVertexBuffer(texturedVertexBuffer,
+					sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+				context->setPrimitiveTopology(
+					rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->draw(3, 0) == rts::render::RENDER_RESULT_OK,
+				"D3D11 no-color pass retains vertex clipping and depth/stencil writes");
+			if (alphaCutout)
+			{
+				// The first, entirely clipped draw bound null PS. Restoring alpha
+				// testing must execute the texture sample/discard even without color.
+				depthOnlyState.pipeline.clipPlaneEnableMask = 0;
+				depthOnlyState.pipeline.alphaTestEnable = true;
+				depthOnlyState.pipeline.alphaFunction =
+					rts::render::RENDER_COMPARE_GREATER;
+				depthOnlyState.pipeline.alphaReference = 127U;
+				result |= check(context->setLegacyStateForLayout(depthOnlyState,
+						texturedLayout, 1) == rts::render::RENDER_RESULT_OK &&
+					context->setLegacyStateForLayout(depthOnlyState, texturedLayout,
+						1) == rts::render::RENDER_RESULT_OK &&
+					context->draw(3, 0) == rts::render::RENDER_RESULT_OK,
+					"D3D11 alpha-tested no-color cutout restores PS and cached state");
+			}
+			rts::render::LegacyLogicalState revealDepthState;
+			revealDepthState.pipeline.rasterizer.cullMode =
+				rts::render::RENDER_CULL_NONE;
+			revealDepthState.pipeline.depthStencil.depthFunction =
+				rts::render::RENDER_COMPARE_LESS;
+			result |= check(context->setTexture(0, rts::render::GpuHandle()) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->setLegacyState(revealDepthState,
+					rts::render::RENDER_VERTEX_POSITION3_COLOR, 0) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->setVertexBuffer(greenVertexBuffer, sizeof(TestVertex), 0) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+				context->endFrame() == rts::render::RENDER_RESULT_OK &&
+				device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+					&captureFormat) == rts::render::RENDER_RESULT_OK,
+				"D3D11 color pass restores PS after the no-color depth pass");
+			const unsigned char *depthLeft = &pixels[4 * (32 * 64 + 24)];
+			const unsigned char *depthRight = &pixels[4 * (32 * 64 + 40)];
+			result |= check(depthLeft[0] < 16 && depthLeft[1] > 240 &&
+				depthLeft[2] < 16 && depthRight[0] > 240 &&
+				depthRight[1] < 16 && depthRight[2] < 16,
+				"no-color depth writes reject equal depth only on unclipped or opaque pixels");
+			revealDepthState.pipeline.depthStencil.depthEnable = false;
+			revealDepthState.pipeline.depthStencil.depthWrite = false;
+			revealDepthState.pipeline.depthStencil.stencilEnable = true;
+			revealDepthState.pipeline.depthStencil.stencilReference = 37U;
+			revealDepthState.pipeline.depthStencil.stencilFunction =
+				rts::render::RENDER_COMPARE_EQUAL;
+			result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+				context->clearTargets(rts::render::RENDER_CLEAR_COLOR, clearColor,
+					1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+				context->setLegacyState(revealDepthState,
+					rts::render::RENDER_VERTEX_POSITION3_COLOR, 0) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->setVertexBuffer(redVertexBuffer, sizeof(TestVertex), 0) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->setPrimitiveTopology(
+					rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+				context->endFrame() == rts::render::RENDER_RESULT_OK &&
+				device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+					&captureFormat) == rts::render::RENDER_RESULT_OK,
+				"D3D11 color pass observes the preceding no-color stencil writes");
+			const unsigned char *stencilLeft = &pixels[4 * (32 * 64 + 24)];
+			const unsigned char *stencilRight = &pixels[4 * (32 * 64 + 40)];
+			result |= check(stencilLeft[0] > 240 && stencilLeft[1] < 16 &&
+				stencilLeft[2] < 16 && stencilRight[0] < 16 &&
+				stencilRight[1] < 16 && stencilRight[2] > 240,
+				"no-color stencil writes retain clipping and alpha-tested cutout coverage");
+		}
+		result |= check(device->destroyResource(cutoutTexture),
+			"D3D11 depth-only probe releases its cutout texture");
 		// Draw equal-depth red then green triangles while changing LESS_EQUAL to
 		// LESS.  The second draw must fail the strict comparison; a reversed or
 		// collapsed comparison table would incorrectly replace the red result.
@@ -3951,6 +4241,113 @@ int testD3D11HiddenSwapChain()
 			rts::render::LegacyTextureStageState();
 		result |= check(device->destroyResource(mipTexture),
 			"D3D11 parity probe drains the contrasting mip chain");
+		rts::render::TextureDescriptor movieDescriptor;
+		movieDescriptor.width = 16;
+		movieDescriptor.height = 9;
+		movieDescriptor.mipCount = 1;
+		movieDescriptor.arrayCount = 1;
+		movieDescriptor.format = rts::render::RENDER_FORMAT_B8G8R8A8_UNORM;
+		movieDescriptor.usage = rts::render::RENDER_USAGE_DEFAULT;
+		const size_t movieVisibleRowBytes =
+			static_cast<size_t>(movieDescriptor.width) * 4;
+		const size_t movieRowPitch = movieVisibleRowBytes + 16;
+		const size_t movieSlicePitch = movieRowPitch * movieDescriptor.height + 32;
+		std::vector<unsigned char> moviePixels(movieSlicePitch, 0x31);
+		rts::render::TextureSubresourceData movieData;
+		movieData.data = &moviePixels[0];
+		movieData.rowPitch = movieRowPitch;
+		movieData.slicePitch = movieSlicePitch;
+		rts::render::GpuHandle movieTexture;
+		const bool movieCreated = device->createTexture(movieDescriptor, &movieData,
+			1, &movieTexture) == rts::render::RENDER_RESULT_OK &&
+			movieTexture.isValid();
+		result |= check(movieCreated,
+			"D3D11 recovery probe creates an exact-size padded BGRA movie texture");
+		if (movieCreated)
+		{
+			const rts::render::GpuHandle originalMovieTexture = movieTexture;
+			std::fill(moviePixels.begin(), moviePixels.end(),
+				static_cast<unsigned char>(0x72));
+			const bool movieFirstRefresh =
+				device->refreshTexture(movieTexture, movieDescriptor, &movieData, 1) ==
+				rts::render::RENDER_RESULT_OK && movieTexture == originalMovieTexture;
+			std::fill(moviePixels.begin(), moviePixels.end(),
+				static_cast<unsigned char>(0x17));
+			for (unsigned int row = 0; row < movieDescriptor.height; ++row)
+			{
+				const unsigned char latestByte = row == movieDescriptor.height / 2 ?
+					static_cast<unsigned char>(0xa4) :
+					static_cast<unsigned char>(0x33);
+				std::fill(moviePixels.begin() +
+					static_cast<size_t>(row) * movieRowPitch,
+					moviePixels.begin() + static_cast<size_t>(row) * movieRowPitch +
+					movieVisibleRowBytes, latestByte);
+			}
+			const bool movieLatestRefresh =
+				device->refreshTexture(movieTexture, movieDescriptor, &movieData, 1) ==
+				rts::render::RENDER_RESULT_OK && movieTexture == originalMovieTexture;
+			const bool movieRecovered = device->recoverDevice() ==
+				rts::render::RENDER_RESULT_OK && device->isOperational() &&
+				movieTexture == originalMovieTexture;
+			rts::render::LegacyLogicalState movieState;
+			movieState.pipeline.rasterizer.cullMode = rts::render::RENDER_CULL_NONE;
+			movieState.pipeline.textureStages[0].colorOperation =
+				rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_1;
+			movieState.pipeline.textureStages[0].colorArgument1 =
+				rts::render::RENDER_TEXTURE_ARG_TEXTURE;
+			movieState.pipeline.textureStages[0].alphaOperation =
+				rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_1;
+			movieState.pipeline.textureStages[0].alphaArgument1 =
+				rts::render::RENDER_TEXTURE_ARG_TEXTURE;
+			movieState.pipeline.textureStages[0].sampler.minification =
+				rts::render::RENDER_TEXTURE_FILTER_POINT;
+			movieState.pipeline.textureStages[0].sampler.magnification =
+				rts::render::RENDER_TEXTURE_FILTER_POINT;
+			movieState.pipeline.textureStages[0].sampler.mipmapping =
+				rts::render::RENDER_TEXTURE_FILTER_NONE;
+			std::vector<unsigned char> movieCapture(64 * 64 * 4);
+			rts::render::RenderFormat movieCaptureFormat =
+				rts::render::RENDER_FORMAT_UNKNOWN;
+			bool movieFrameSucceeded = false;
+			if (movieRecovered && context->beginFrame() ==
+				rts::render::RENDER_RESULT_OK)
+			{
+				movieFrameSucceeded = context->clear(clearColor, 1.0f, 0) ==
+					rts::render::RENDER_RESULT_OK &&
+					context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setLegacyStateForLayout(movieState, texturedLayout, 1) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setVertexBuffer(texturedVertexBuffer,
+						sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, movieTexture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setPrimitiveTopology(
+						rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->draw(3, 0) == rts::render::RENDER_RESULT_OK;
+				const rts::render::RenderResult movieEndResult = context->endFrame();
+				movieFrameSucceeded = movieFrameSucceeded && movieEndResult ==
+					rts::render::RENDER_RESULT_OK;
+			}
+			const bool movieCaptured = movieFrameSucceeded &&
+				device->captureBackBuffer(&movieCapture[0], movieCapture.size(),
+					64 * 4, &movieCaptureFormat) == rts::render::RENDER_RESULT_OK;
+			const unsigned char *movieCenter =
+				&movieCapture[4 * (32 * 64 + 32)];
+			const unsigned char expectedMovieByte = 0xa4;
+			const bool latestMoviePixelVisible = movieCaptured &&
+				movieCaptureFormat == rts::render::RENDER_FORMAT_B8G8R8A8_UNORM &&
+				movieCenter[0] >= expectedMovieByte - 1 &&
+				movieCenter[0] <= expectedMovieByte + 1 &&
+				movieCenter[1] >= expectedMovieByte - 1 &&
+				movieCenter[1] <= expectedMovieByte + 1 &&
+				movieCenter[2] >= expectedMovieByte - 1 &&
+				movieCenter[2] <= expectedMovieByte + 1;
+			result |= check(movieFirstRefresh && movieLatestRefresh &&
+				movieRecovered && latestMoviePixelVisible,
+				"D3D11 recovery readback preserves the latest BGRA movie pixels across padded rows");
+		}
 		unsigned int resizeRecoveryValue = 0x12345678U;
 		rts::render::RenderBackBufferInfo resizeRecoveryInfo;
 		result |= check(device->recoverDevice() == rts::render::RENDER_RESULT_OK &&
@@ -3978,6 +4375,7 @@ int testD3D11HiddenSwapChain()
 			device->destroyResource(redVertexBuffer) &&
 			device->destroyResource(indexBuffer) &&
 			device->destroyResource(texturedVertexBuffer) &&
+			device->destroyResource(treeVertexBuffer) &&
 			device->destroyResource(waterVertexBuffer) &&
 			device->destroyResource(seaVertexBuffer) &&
 			device->destroyResource(flexibleVertexBuffer) &&
@@ -3985,6 +4383,7 @@ int testD3D11HiddenSwapChain()
 			device->destroyResource(specularVertexBuffer) &&
 			device->destroyResource(preTransformedBuffer) &&
 			device->destroyResource(texture) &&
+			device->destroyResource(treeShroudTexture) &&
 			device->destroyResource(riverEdgeTexture) &&
 			device->destroyResource(seaBumpTexture) &&
 			device->destroyResource(seaReflectionTexture) &&
@@ -4000,6 +4399,11 @@ int testD3D11HiddenSwapChain()
 			device->resize(96, 80) == rts::render::RENDER_RESULT_OK &&
 			device->present() == rts::render::RENDER_RESULT_OK,
 			"hidden flip-model swap chain presents and resizes");
+		if (movieCreated)
+		{
+			result |= check(device->destroyResource(movieTexture),
+				"D3D11 recovery probe drains the movie texture");
+		}
 	std::vector<unsigned char> resizedPixels(96 * 80 * 4);
 	result |= check(device->captureBackBuffer(&resizedPixels[0],
 		resizedPixels.size(), 96 * 4, &captureFormat) ==
@@ -4313,6 +4717,29 @@ int testD3D11HeadlessDevice()
 	return result;
 }
 
+int testW3DVideoBufferDirectPublicationLayout()
+{
+	int result = 0;
+	const unsigned int width = 16;
+	const unsigned int height = 9;
+	const unsigned int paddedPitch = width * 4 + 16;
+	size_t slicePitch = 0;
+	result |= check(W3DVideoBuffer::ComputeDirectBGRA8SlicePitch(
+		VideoBuffer::TYPE_X8R8G8B8, width, height, paddedPitch, &slicePitch) &&
+		slicePitch == static_cast<size_t>(paddedPitch) * height,
+		"W3D video publication accepts a padded BGRA8 pitch and computes its full slice");
+	result |= check(!W3DVideoBuffer::ComputeDirectBGRA8SlicePitch(
+		VideoBuffer::TYPE_X8R8G8B8, width, height, width * 4 - 1, &slicePitch),
+		"W3D video publication rejects a short BGRA8 row");
+	result |= check(!W3DVideoBuffer::ComputeDirectBGRA8SlicePitch(
+		VideoBuffer::TYPE_R8G8B8, width, height, paddedPitch, &slicePitch),
+		"W3D video publication rejects non-BGRA8 formats");
+	result |= check(!W3DVideoBuffer::ComputeDirectBGRA8SlicePitch(
+		VideoBuffer::TYPE_X8R8G8B8, width, height, paddedPitch, 0),
+		"W3D video publication rejects a missing slice output");
+	return result;
+}
+
 int testD3D11TextureRefreshContract()
 {
 	int result = 0;
@@ -4447,6 +4874,48 @@ int testD3D11TextureRefreshContract()
 			&immutableData, 1) == rts::render::RENDER_RESULT_OK,
 		"dynamic textures refresh through the renderer-neutral contract");
 
+	// This is the neutral-renderer shape used by the direct movie bridge.  A
+	// padded row and slice make the exact pitch contract observable while the
+	// repeated refreshes exercise the persistent recovery-shadow storage.
+	rts::render::TextureDescriptor movieDescriptor;
+	movieDescriptor.width = 16;
+	movieDescriptor.height = 9;
+	movieDescriptor.mipCount = 1;
+	movieDescriptor.arrayCount = 1;
+	movieDescriptor.format = rts::render::RENDER_FORMAT_B8G8R8A8_UNORM;
+	movieDescriptor.usage = rts::render::RENDER_USAGE_DEFAULT;
+	const size_t movieRowPitch = movieDescriptor.width * 4 + 16;
+	const size_t movieSlicePitch = movieRowPitch * movieDescriptor.height + 32;
+	std::vector<unsigned char> moviePixels(movieSlicePitch, 0x31);
+	rts::render::TextureSubresourceData movieData;
+	movieData.data = &moviePixels[0];
+	movieData.rowPitch = movieRowPitch;
+	movieData.slicePitch = movieSlicePitch;
+	rts::render::GpuHandle movieTexture;
+	const bool movieCreated = device->createTexture(movieDescriptor, &movieData,
+		1, &movieTexture) == rts::render::RENDER_RESULT_OK &&
+		movieTexture.isValid();
+	result |= check(movieCreated,
+		"D3D11 direct movie probe creates an exact-size BGRA texture");
+	if (movieCreated)
+	{
+		const rts::render::GpuHandle originalMovieTexture = movieTexture;
+		std::fill(moviePixels.begin(), moviePixels.end(),
+			static_cast<unsigned char>(0x72));
+		result |= check(device->refreshTexture(movieTexture, movieDescriptor,
+			&movieData, 1) == rts::render::RENDER_RESULT_OK &&
+			movieTexture == originalMovieTexture,
+			"D3D11 direct movie probe refreshes BGRA pixels in place");
+		std::fill(moviePixels.begin(), moviePixels.end(),
+			static_cast<unsigned char>(0xa4));
+		result |= check(device->refreshTexture(movieTexture, movieDescriptor,
+			&movieData, 1) == rts::render::RENDER_RESULT_OK &&
+			movieTexture == originalMovieTexture &&
+			device->recoverDevice() == rts::render::RENDER_RESULT_OK &&
+			device->isOperational() && movieTexture == originalMovieTexture,
+			"D3D11 direct movie probe retains its latest shadow across recovery");
+	}
+
 	rts::render::IRenderContext *context = device->immediateContext();
 	const bool frameStarted = context->beginFrame() ==
 		rts::render::RENDER_RESULT_OK;
@@ -4525,6 +4994,11 @@ int testD3D11TextureRefreshContract()
 		device->destroyResource(targetTexture) &&
 		device->destroyResource(depthTexture),
 		"refresh contract drains auxiliary texture resources");
+	if (movieCreated)
+	{
+		result |= check(device->destroyResource(movieTexture),
+			"refresh contract drains the direct movie texture");
+	}
 	device->shutdown();
 	delete device;
 	return result;
@@ -4617,6 +5091,8 @@ int testD3D11LegacyBridgeLifecycleContract()
 	typedef bool (D3D11LegacyBridge::*ExpectedPublishBufferChange)(IUnknown *,
 		unsigned int, const void *, size_t, size_t,
 		rts::render::RenderBufferUpdateMode, unsigned int);
+	typedef bool (D3D11LegacyBridge::*ExpectedPublishTextureBGRA8Change)(
+		IDirect3DBaseTexture8 *, const void *, size_t, size_t);
 	result |= check(std::is_same<decltype(static_cast<ExpectedEndFrame>(
 		&D3D11LegacyBridge::End_Frame)), ExpectedEndFrame>::value &&
 		std::is_same<decltype(static_cast<ExpectedEndFrameOutcome>(
@@ -4638,7 +5114,9 @@ int testD3D11LegacyBridgeLifecycleContract()
 		std::is_same<decltype(&D3D11LegacyBridge::Invalidate_Buffer_Range),
 		ExpectedInvalidateBufferRange>::value &&
 		std::is_same<decltype(&D3D11LegacyBridge::Publish_Buffer_Change),
-		ExpectedPublishBufferChange>::value,
+		ExpectedPublishBufferChange>::value &&
+		std::is_same<decltype(&D3D11LegacyBridge::Publish_Texture_BGRA8_Change),
+		ExpectedPublishTextureBGRA8Change>::value,
 		"D3D11 bridge exposes result-bearing lifecycle and pre-present capture methods");
 	return result;
 }
@@ -4750,6 +5228,7 @@ int main()
 	result |= testD3D11PrimitiveTopologyTranslation();
 	result |= testD3D11LegacyStateBoundary();
 	result |= testD3D11HeadlessDevice();
+	result |= testW3DVideoBufferDirectPublicationLayout();
 	result |= testD3D11TextureRefreshContract();
 	result |= testD3D11StateCacheEvictionContract();
 	result |= testD3D11LegacyBridgeLifecycleContract();

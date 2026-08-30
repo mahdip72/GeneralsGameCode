@@ -11,6 +11,7 @@
 #include "Renderer/LegacyBridgeValidation.h"
 #include "Renderer/LegacyRenderState.h"
 #include "Renderer/RendererDevice.h"
+#include "Lib/FrameTimingDiagnostics.h"
 
 #include <limits>
 #include <math.h>
@@ -304,7 +305,8 @@ struct D3D11LegacyBridge::Impl
 		pending_alpha(0.0f), pending_depth(1.0f), pending_stencil(0),
 		active_target(), pending_target(), pending_target_change(false),
 		target_transition_failed(false), primitive_up_vertex_buffer(),
-		primitive_up_vertex_capacity(0), vertex_buffer_index(),
+		primitive_up_vertex_capacity(0), draw_texture_pinning(false),
+		draw_texture_pins(), vertex_buffer_index(),
 		index_buffer_index(), texture_index(), cache_counters() {}
 
 	IRenderDevice *device;
@@ -353,10 +355,31 @@ struct D3D11LegacyBridge::Impl
 	std::vector<BufferEntry> vertex_buffers;
 	std::vector<BufferEntry> index_buffers;
 	std::vector<TextureEntry> textures;
+	bool draw_texture_pinning;
+	rts::render::LegacyBridgeDrawTexturePins<
+		rts::render::LEGACY_TEXTURE_STAGE_COUNT> draw_texture_pins;
 	rts::render::LegacyBridgePointerIndex vertex_buffer_index;
 	rts::render::LegacyBridgePointerIndex index_buffer_index;
 	rts::render::LegacyBridgePointerIndex texture_index;
 	rts::render::LegacyBridgeCacheCounters cache_counters;
+
+	struct Draw_Texture_Scope
+	{
+		explicit Draw_Texture_Scope(Impl &owner) : impl(owner)
+		{
+			impl.draw_texture_pins.Clear();
+			impl.draw_texture_pinning = true;
+		}
+		~Draw_Texture_Scope()
+		{
+			impl.draw_texture_pinning = false;
+			impl.draw_texture_pins.Clear();
+		}
+	private:
+		Draw_Texture_Scope(const Draw_Texture_Scope &);
+		Draw_Texture_Scope &operator=(const Draw_Texture_Scope &);
+		Impl &impl;
+	};
 
 	bool Require_Owner_Thread(const char *operation)
 	{
@@ -564,7 +587,7 @@ struct D3D11LegacyBridge::Impl
 				entry.gpu_copy_valid, entry.gpu_copy_lease_epoch,
 				display_epoch);
 		return active_target_pinned || pending_target_pinned ||
-			copied_content_acquired;
+			copied_content_acquired || draw_texture_pins.Contains(entry.source);
 	}
 
 	void Complete_GPU_Copy_Frame(bool frame_succeeded)
@@ -639,6 +662,7 @@ struct D3D11LegacyBridge::Impl
 
 	void Prune_Stale_Caches()
 	{
+		rts::frame_timing::Scope timing(rts::frame_timing::RendererTexturePrune);
 		for (unsigned int index = 0; index < vertex_buffers.size();)
 		{
 			if (vertex_buffers[index].last_used_frame + CACHE_STALE_FRAME_COUNT <
@@ -1263,6 +1287,7 @@ struct D3D11LegacyBridge::Impl
 			Log(state_message);
 			capture_draw_logged = true;
 		}
+		Draw_Texture_Scope texture_scope(*this);
 		unsigned int texture_mask = 0;
 		for (unsigned int stage = 0;
 			stage < rts::render::LEGACY_TEXTURE_STAGE_COUNT; ++stage)
@@ -1478,6 +1503,7 @@ struct D3D11LegacyBridge::Impl
 		std::vector<TextureSubresourceData> *subresources_out,
 		bool for_render_target, RenderResult *failure_result)
 	{
+		rts::frame_timing::Scope timing(rts::frame_timing::RendererTextureCollect);
 		if (failure_result != 0)
 		{
 			*failure_result = rts::render::RENDER_RESULT_FAILED;
@@ -1811,6 +1837,10 @@ struct D3D11LegacyBridge::Impl
 		if (bind_result != rts::render::RENDER_RESULT_OK)
 		{
 			Fail(bind_result, "draw failure: D3D11 texture binding");
+		}
+		else if (draw_texture_pinning && !draw_texture_pins.Pin(source))
+		{
+			return Fail("draw failure: current draw texture pin capacity");
 		}
 		return bind_result == rts::render::RENDER_RESULT_OK;
 	}
@@ -2986,7 +3016,11 @@ RenderResult D3D11LegacyBridge::End_Frame(bool present_frame,
 			return m_impl->frame_outcome.result();
 		}
 	}
-	const RenderResult present_result = m_impl->device->present();
+	RenderResult present_result;
+	{
+		rts::frame_timing::Scope timing(rts::frame_timing::RendererPresent);
+		present_result = m_impl->device->present();
+	}
 	m_impl->frame_outcome.recordPresentation(present_result);
 	if (present_result == rts::render::RENDER_RESULT_DEVICE_REMOVED)
 	{
@@ -3475,6 +3509,131 @@ bool D3D11LegacyBridge::Publish_Buffer_Change(IUnknown *buffer,
 	return true;
 }
 
+bool D3D11LegacyBridge::Publish_Texture_BGRA8_Change(
+	IDirect3DBaseTexture8 *texture, const void *data, size_t row_pitch,
+	size_t slice_pitch)
+{
+	if (!Is_Active() || texture == 0 || data == 0 || row_pitch == 0 ||
+		slice_pitch == 0 || texture->GetType() != D3DRTYPE_TEXTURE)
+	{
+		return false;
+	}
+	m_impl->Require_Owner_Thread("legacy BGRA8 texture publication");
+
+	IDirect3DTexture8 *source = static_cast<IDirect3DTexture8 *>(texture);
+	D3DSURFACE_DESC source_descriptor;
+	memset(&source_descriptor, 0, sizeof(source_descriptor));
+	if (source->GetLevelCount() != 1 ||
+		FAILED(source->GetLevelDesc(0, &source_descriptor)) ||
+		source_descriptor.Width == 0 || source_descriptor.Height == 0 ||
+		(source_descriptor.Usage &
+			(D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) != 0 ||
+		(source_descriptor.Format != D3DFMT_X8R8G8B8 &&
+		 source_descriptor.Format != D3DFMT_A8R8G8B8))
+	{
+		return false;
+	}
+
+	size_t minimum_row_pitch = 0;
+	size_t minimum_slice_pitch = 0;
+	if (!Checked_Multiply(static_cast<size_t>(source_descriptor.Width), 4,
+			&minimum_row_pitch) || row_pitch < minimum_row_pitch ||
+		!Checked_Multiply(row_pitch,
+			static_cast<size_t>(source_descriptor.Height),
+			&minimum_slice_pitch) || slice_pitch < minimum_slice_pitch ||
+		row_pitch > std::numeric_limits<unsigned int>::max() ||
+		slice_pitch > std::numeric_limits<unsigned int>::max() ||
+		slice_pitch > MAX_TEXTURE_REFRESH_BYTES)
+	{
+		return false;
+	}
+
+	TextureDescriptor descriptor;
+	descriptor.width = source_descriptor.Width;
+	descriptor.height = source_descriptor.Height;
+	descriptor.mipCount = 1;
+	descriptor.arrayCount = 1;
+	descriptor.dimension = rts::render::RENDER_TEXTURE_2D;
+	descriptor.format = rts::render::RENDER_FORMAT_B8G8R8A8_UNORM;
+	descriptor.binding = rts::render::RENDER_TEXTURE_SHADER_RESOURCE;
+	descriptor.usage = rts::render::RENDER_USAGE_DEFAULT;
+	TextureSubresourceData subresource;
+	subresource.data = data;
+	subresource.rowPitch = row_pitch;
+	subresource.slicePitch = slice_pitch;
+
+	Impl::TextureEntry *entry = m_impl->Find_Texture_Entry(texture, 0, false);
+	if (entry == 0)
+	{
+		if (m_impl->textures.size() >= TEXTURE_CACHE_CAPACITY &&
+			!m_impl->Evict_Oldest_Texture())
+		{
+			return false;
+		}
+		Impl::TextureEntry new_entry;
+		new_entry.source = texture;
+		new_entry.source->AddRef();
+		new_entry.last_used_frame = m_impl->frame_id;
+		const RenderResult create_result = m_impl->device->createTexture(
+			descriptor, &subresource, 1, &new_entry.handle);
+		if (create_result != rts::render::RENDER_RESULT_OK)
+		{
+			new_entry.source->Release();
+			return false;
+		}
+		try
+		{
+			m_impl->textures.push_back(new_entry);
+		}
+		catch (...)
+		{
+			m_impl->device->destroyResource(new_entry.handle);
+			new_entry.source->Release();
+			return false;
+		}
+		if (!m_impl->texture_index.Insert(texture,
+			static_cast<unsigned int>(m_impl->textures.size() - 1)))
+		{
+			m_impl->device->destroyResource(m_impl->textures.back().handle);
+			m_impl->textures.back().source->Release();
+			m_impl->textures.pop_back();
+			return false;
+		}
+		entry = &m_impl->textures.back();
+	}
+	else
+	{
+		if (entry->render_target || entry->depth_stencil ||
+			!entry->handle.isValid())
+		{
+			entry->d3d11_authority = false;
+			entry->d3d8_dirty = true;
+			return false;
+		}
+		const RenderResult refresh_result = m_impl->device->refreshTexture(
+			entry->handle, descriptor, &subresource, 1);
+		if (refresh_result != rts::render::RENDER_RESULT_OK)
+		{
+			entry->d3d11_authority = false;
+			entry->d3d8_dirty = true;
+			entry->gpu_copy_valid = false;
+			entry->gpu_copy_lease_epoch = 0;
+			return false;
+		}
+		++m_impl->dynamic_texture_refresh_count;
+		++m_impl->dynamic_texture_in_place_count;
+		m_impl->cache_counters.RecordTextureRefresh();
+	}
+
+	entry->d3d11_authority = false;
+	entry->d3d8_dirty = false;
+	entry->gpu_copy_valid = false;
+	entry->gpu_copy_frame = 0;
+	entry->gpu_copy_lease_epoch = 0;
+	entry->last_used_frame = m_impl->frame_id;
+	return true;
+}
+
 void D3D11LegacyBridge::Invalidate_Texture(IDirect3DBaseTexture8 *texture)
 {
 	if (!Is_Active() || texture == 0)
@@ -3623,6 +3782,7 @@ bool D3D11LegacyBridge::Draw(VertexBufferClass *vertex_buffer,
 		m_impl->Log(state_message);
 		m_impl->capture_draw_logged = true;
 	}
+	Impl::Draw_Texture_Scope texture_scope(*m_impl);
 	unsigned int texture_mask = 0;
 	for (unsigned int stage = 0;
 		stage < rts::render::LEGACY_TEXTURE_STAGE_COUNT; ++stage)
@@ -3904,6 +4064,7 @@ RenderResult D3D11LegacyBridge::Draw_Primitive_UP(
 		m_impl->Fail("draw failure: unavailable legacy logical state");
 		return rts::render::RENDER_RESULT_FAILED;
 	}
+	Impl::Draw_Texture_Scope texture_scope(*m_impl);
 	unsigned int texture_mask = 0;
 	for (unsigned int stage = 0;
 		stage < rts::render::LEGACY_TEXTURE_STAGE_COUNT; ++stage)
@@ -4098,6 +4259,8 @@ void D3D11LegacyBridge::Invalidate_Buffer_Range(IUnknown *, unsigned int,
 bool D3D11LegacyBridge::Publish_Buffer_Change(IUnknown *, unsigned int,
 	const void *, size_t, size_t,
 	rts::render::RenderBufferUpdateMode, unsigned int) { return false; }
+bool D3D11LegacyBridge::Publish_Texture_BGRA8_Change(
+	IDirect3DBaseTexture8 *, const void *, size_t, size_t) { return false; }
 void D3D11LegacyBridge::Invalidate_Texture(IDirect3DBaseTexture8 *) {}
 bool D3D11LegacyBridge::Draw(VertexBufferClass *, IndexBufferClass *,
 	unsigned int, unsigned int, unsigned int, unsigned int, unsigned int,

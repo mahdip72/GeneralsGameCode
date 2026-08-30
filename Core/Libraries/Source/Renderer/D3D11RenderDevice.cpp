@@ -449,6 +449,39 @@ unsigned int CountActiveFixedFunctionStages(
 	return count;
 }
 
+bool CanDisableLegacyPixelShader(const LegacyPipelineState &pipeline)
+{
+	if ((pipeline.blend.colorWriteMask & 0x0fU) != 0U ||
+		pipeline.alphaTestEnable)
+	{
+		return false;
+	}
+	// These shaders only produce color and share the optional alpha-test
+	// discard. They do not write depth/coverage or have UAV side effects;
+	// clipping is still performed by the vertex shader's SV_ClipDistance.
+	// Keep an explicit allowlist so a future program is not silently skipped.
+	switch (pipeline.pixelProgram)
+	{
+	case RENDER_LEGACY_PIXEL_FIXED_FUNCTION:
+	case RENDER_LEGACY_PIXEL_WATER_FLAT:
+	case RENDER_LEGACY_PIXEL_WATER_RIVER:
+	case RENDER_LEGACY_PIXEL_TERRAIN_BASE:
+	case RENDER_LEGACY_PIXEL_TERRAIN_NOISE:
+	case RENDER_LEGACY_PIXEL_TERRAIN_NOISE2:
+	case RENDER_LEGACY_PIXEL_ROAD_NOISE2:
+	case RENDER_LEGACY_PIXEL_FLAT_TERRAIN_BASE0:
+	case RENDER_LEGACY_PIXEL_FLAT_TERRAIN_BASE:
+	case RENDER_LEGACY_PIXEL_FLAT_TERRAIN_NOISE:
+	case RENDER_LEGACY_PIXEL_FLAT_TERRAIN_NOISE2:
+	case RENDER_LEGACY_PIXEL_MONOCHROME:
+	case RENDER_LEGACY_PIXEL_WATER_SEA:
+	case RENDER_LEGACY_PIXEL_PROFILER_SWIZZLE:
+		return true;
+	default:
+		return false;
+	}
+}
+
 class D3D11RenderDevice : public IRenderDevice, public IRenderContext
 {
 public:
@@ -936,13 +969,15 @@ public:
 			return RENDER_RESULT_FAILED;
 		}
 
-		std::vector<unsigned char> shadow;
-		std::vector<size_t> offsets;
-		std::vector<size_t> rowPitches;
-		std::vector<size_t> slicePitches;
+		// Keep the recovery shadow attached to the logical resource.  The movie
+		// path refreshes one fixed-size BGRA texture for every decoded frame; using
+		// temporary vectors here would allocate and release the complete 4K image
+		// on every refresh even though the existing shadow has the exact capacity
+		// needed for recovery.  VideoBuffer allocations use decoder dimensions and
+		// display scaling happens at draw time, so a 4K display does not imply a 4K
+		// shadow unless the movie source itself is 4K.
 		const RenderResult preparationResult = prepareTextureRefreshData(
-			descriptor, data, dataCount, &shadow, &offsets, &rowPitches,
-			&slicePitches);
+			descriptor, data, dataCount, &slot);
 		if (preparationResult != RENDER_RESULT_OK)
 		{
 			return preparationResult;
@@ -1024,10 +1059,30 @@ public:
 			}
 		}
 
-		slot.shadow.swap(shadow);
-		slot.subresourceOffsets.swap(offsets);
-		slot.subresourceRowPitches.swap(rowPitches);
-		slot.subresourceSlicePitches.swap(slicePitches);
+		// The native upload above consumes the caller's owner-thread memory
+		// synchronously.  Commit the same bytes to the reusable recovery shadow
+		// only after all subresources have uploaded successfully; a failed upload
+		// therefore retains no partial image and is invalidated by the paths above.
+		for (unsigned int index = 0; index < subresourceCount; ++index)
+		{
+			const unsigned int mip = index % descriptor.mipCount;
+			const unsigned int mipHeight = mip < 32 ?
+				descriptor.height >> mip : 0;
+			const size_t height = mipHeight == 0 ? 1 : mipHeight;
+			const size_t minimumSlicePitch =
+				slot.subresourceRowPitches[index] * height;
+			const size_t copyBytes = slot.subresourceSlicePitches[index] >
+				minimumSlicePitch ? slot.subresourceSlicePitches[index] :
+				minimumSlicePitch;
+			const size_t offset = slot.subresourceOffsets[index];
+			if (offset > slot.shadow.size() ||
+				copyBytes > slot.shadow.size() - offset)
+			{
+				markTextureRecoverySourceUnavailable(slot);
+				return RENDER_RESULT_FAILED;
+			}
+			memcpy(&slot.shadow[offset], data[index].data, copyBytes);
+		}
 		// A successful CPU upload establishes a new recovery source.  A later
 		// device loss must preserve this upload rather than treating the resource
 		// as GPU-only merely because it was copied earlier in its lifetime.
@@ -2195,6 +2250,10 @@ public:
 			pixelShader = m_terrainPixelShaders[
 				state.pipeline.pixelProgram - RENDER_LEGACY_PIXEL_TERRAIN_BASE];
 		}
+		if (CanDisableLegacyPixelShader(state.pipeline))
+		{
+			pixelShader = 0;
+		}
 		const bool pipelineMatches = m_pipelineStateValid &&
 			!m_transformConstantsChanged &&
 			memcmp(&m_boundBlendDescriptor, &blendDescriptor,
@@ -2931,13 +2990,9 @@ private:
 
 	RenderResult prepareTextureRefreshData(const TextureDescriptor &descriptor,
 		const TextureSubresourceData *data, unsigned int dataCount,
-		std::vector<unsigned char> *shadow,
-		std::vector<size_t> *offsets,
-		std::vector<size_t> *rowPitches,
-		std::vector<size_t> *slicePitches) const
+		ResourceSlot *slot) const
 	{
-		if (data == 0 || shadow == 0 || offsets == 0 || rowPitches == 0 ||
-			slicePitches == 0 || descriptor.arrayCount == 0 ||
+		if (data == 0 || slot == 0 || descriptor.arrayCount == 0 ||
 			descriptor.mipCount == 0 ||
 			descriptor.mipCount > UINT_MAX / descriptor.arrayCount)
 		{
@@ -2958,16 +3013,6 @@ private:
 		if (bytesPerPixel == 0)
 		{
 			return RENDER_RESULT_UNSUPPORTED;
-		}
-		try
-		{
-			offsets->resize(subresourceCount);
-			rowPitches->resize(subresourceCount);
-			slicePitches->resize(subresourceCount);
-		}
-		catch (...)
-		{
-			return RENDER_RESULT_OUT_OF_MEMORY;
 		}
 
 		size_t totalBytes = 0;
@@ -3007,30 +3052,63 @@ private:
 			{
 				return RENDER_RESULT_UNSUPPORTED;
 			}
-			(*offsets)[index] = totalBytes;
-			(*rowPitches)[index] = data[index].rowPitch;
-			(*slicePitches)[index] = data[index].slicePitch;
 			totalBytes += copyBytes;
 		}
+
+		// Reserve before changing any values so a failed allocation leaves the
+		// previous complete recovery description intact.  Once capacity is
+		// established, the steady-state movie refresh only resizes to the same
+		// lengths and writes the new frame in place.
+		const size_t oldShadowSize = slot->shadow.size();
+		const size_t oldOffsetCount = slot->subresourceOffsets.size();
+		const size_t oldRowPitchCount = slot->subresourceRowPitches.size();
+		const size_t oldSlicePitchCount = slot->subresourceSlicePitches.size();
 		try
 		{
-			shadow->resize(totalBytes);
-			for (unsigned int index = 0; index < subresourceCount; ++index)
-			{
-				const unsigned int mip = index % descriptor.mipCount;
-				const unsigned int mipHeight = mip < 32 ?
-					descriptor.height >> mip : 0;
-				const size_t height = mipHeight == 0 ? 1 : mipHeight;
-				const size_t minimumSlicePitch = (*rowPitches)[index] * height;
-				const size_t copyBytes = (*slicePitches)[index] >
-					minimumSlicePitch ? (*slicePitches)[index] : minimumSlicePitch;
-				memcpy(&(*shadow)[(*offsets)[index]], data[index].data,
-					copyBytes);
-			}
+			slot->shadow.reserve(totalBytes);
+			slot->subresourceOffsets.reserve(subresourceCount);
+			slot->subresourceRowPitches.reserve(subresourceCount);
+			slot->subresourceSlicePitches.reserve(subresourceCount);
+			slot->shadow.resize(totalBytes);
+			slot->subresourceOffsets.resize(subresourceCount);
+			slot->subresourceRowPitches.resize(subresourceCount);
+			slot->subresourceSlicePitches.resize(subresourceCount);
 		}
 		catch (...)
 		{
+			// reserve() never shrinks storage, so restoring the old sizes cannot
+			// throw and leaves the old shadow bytes available for recovery.
+			slot->shadow.resize(oldShadowSize);
+			slot->subresourceOffsets.resize(oldOffsetCount);
+			slot->subresourceRowPitches.resize(oldRowPitchCount);
+			slot->subresourceSlicePitches.resize(oldSlicePitchCount);
 			return RENDER_RESULT_OUT_OF_MEMORY;
+		}
+
+		size_t offset = 0;
+		for (unsigned int index = 0; index < subresourceCount; ++index)
+		{
+			const unsigned int mip = index % descriptor.mipCount;
+			const unsigned int mipHeight = mip < 32 ?
+				descriptor.height >> mip : 0;
+			const size_t height = mipHeight == 0 ? 1 : mipHeight;
+			const size_t minimumSlicePitch = data[index].rowPitch * height;
+			const size_t copyBytes = data[index].slicePitch > minimumSlicePitch ?
+				data[index].slicePitch : minimumSlicePitch;
+			slot->subresourceOffsets[index] = offset;
+			slot->subresourceRowPitches[index] = data[index].rowPitch;
+			slot->subresourceSlicePitches[index] = data[index].slicePitch;
+			offset += copyBytes;
+		}
+		if (offset != totalBytes)
+		{
+			// Keep this invariant explicit: the commit loop relies on every
+			// subresource range being inside the reserved shadow.
+			slot->shadow.resize(oldShadowSize);
+			slot->subresourceOffsets.resize(oldOffsetCount);
+			slot->subresourceRowPitches.resize(oldRowPitchCount);
+			slot->subresourceSlicePitches.resize(oldSlicePitchCount);
+			return RENDER_RESULT_FAILED;
 		}
 		return RENDER_RESULT_OK;
 	}
@@ -4462,10 +4540,12 @@ private:
 		slot.binding = 0;
 		slot.byteCount = 0;
 		slot.gpuAuthoritative = false;
-		slot.shadow.clear();
-		slot.subresourceOffsets.clear();
-		slot.subresourceRowPitches.clear();
-		slot.subresourceSlicePitches.clear();
+		// This logical resource is gone, unlike an in-place refresh or device
+		// recovery. Do not retain its largest CPU shadow in the reusable slot.
+		std::vector<unsigned char>().swap(slot.shadow);
+		std::vector<size_t>().swap(slot.subresourceOffsets);
+		std::vector<size_t>().swap(slot.subresourceRowPitches);
+		std::vector<size_t>().swap(slot.subresourceSlicePitches);
 		return m_handles->release(handle);
 	}
 

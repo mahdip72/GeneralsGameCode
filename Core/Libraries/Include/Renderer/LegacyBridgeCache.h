@@ -5,6 +5,47 @@
 
 namespace rts { namespace render {
 
+// A draw binds its stages one at a time. Keep the sources already bound for
+// that draw resident even when frame-based cache ages tie at capacity.
+template <unsigned int Capacity>
+class LegacyBridgeDrawTexturePins
+{
+public:
+	LegacyBridgeDrawTexturePins() : count(0) {}
+
+	bool Pin(const void *source)
+	{
+		if (source == 0 || Contains(source))
+		{
+			return true;
+		}
+		if (count == Capacity)
+		{
+			return false;
+		}
+		sources[count++] = source;
+		return true;
+	}
+
+	bool Contains(const void *source) const
+	{
+		for (unsigned int index = 0; index < count; ++index)
+		{
+			if (sources[index] == source)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void Clear() { count = 0; }
+
+private:
+	const void *sources[Capacity];
+	unsigned int count;
+};
+
 // The D3D11 legacy bridge keeps its entries in vectors so eviction remains
 // deterministic.  This side index makes the per-draw source lookup constant
 // time while preserving vector indices as the eviction-order authority.

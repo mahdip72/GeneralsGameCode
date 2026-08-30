@@ -111,6 +111,11 @@ public:
 		const void *data, size_t byte_count, size_t destination_offset,
 		rts::render::RenderBufferUpdateMode mode,
 		unsigned int source_generation);
+	// Publishes a complete opaque BGRA8 level directly into the neutral renderer
+	// mirror. This owner-thread operation is valid before Begin_Frame because
+	// movie decoding runs during Display::update.
+	bool Publish_Texture_BGRA8_Change(IDirect3DBaseTexture8 *texture,
+		const void *data, size_t row_pitch, size_t slice_pitch);
 	void Invalidate_Texture(IDirect3DBaseTexture8 *texture);
 	bool Draw(VertexBufferClass *vertex_buffer,
 		IndexBufferClass *index_buffer, unsigned int primitive_type,

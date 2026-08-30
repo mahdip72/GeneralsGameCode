@@ -2589,6 +2589,14 @@ bool DX8Wrapper::Publish_D3D11_Buffer_Change(IUnknown *buffer,
 		byte_count, destination_offset, mode, source_generation);
 }
 
+bool DX8Wrapper::Publish_D3D11_Texture_BGRA8_Change(
+	IDirect3DBaseTexture8 *texture, const void *data, size_t row_pitch,
+	size_t slice_pitch)
+{
+	return _D3D11Bridge.Publish_Texture_BGRA8_Change(texture, data, row_pitch,
+		slice_pitch);
+}
+
 void DX8Wrapper::Notify_D3D11_Texture_Changed(
 	IDirect3DBaseTexture8 *texture)
 {
@@ -2609,6 +2617,13 @@ void Notify_Render_Texture_Changed(IDirect3DBaseTexture8 *texture)
 void Notify_Render_Texture_Changed(TextureClass *texture)
 {
 	DX8Wrapper::Notify_D3D11_Texture_Changed(texture);
+}
+
+bool Publish_Render_Texture_BGRA8_Change(IDirect3DBaseTexture8 *texture,
+	const void *data, size_t row_pitch, size_t slice_pitch)
+{
+	return DX8Wrapper::Publish_D3D11_Texture_BGRA8_Change(texture, data,
+		row_pitch, slice_pitch);
 }
 
 void Notify_Render_Buffer_Changed(IUnknown *buffer)
@@ -4573,9 +4588,11 @@ void DX8Wrapper::Set_Light_Environment(LightEnvironmentClass* light_env)
 			render_state_changed|=MATERIAL_CHANGED;
 #endif
 		}
+		// Match the packed D3D8 ambient value exactly. Publishing the original
+		// float after Set_DX8_Render_State made the neutral backend alternate
+		// between quantized and unquantized lighting for the same scene state.
 		rts::render::TrackLegacyGlobalAmbient(
-			rts::render::RenderFloat4(equivalent_ambient.X,
-			equivalent_ambient.Y, equivalent_ambient.Z, 1.0f));
+			rts::render::DecodeLegacyD3D8Ambient(color));
 
 		D3DLIGHT8 light;
 		int l=0;
