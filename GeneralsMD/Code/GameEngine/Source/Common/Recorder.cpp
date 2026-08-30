@@ -25,6 +25,7 @@
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
 
 #include "Common/Recorder.h"
+#include "Lib/FrameTimingDiagnostics.h"
 #include "Common/file.h"
 #include "Common/FileSystem.h"
 #include "Common/PlayerList.h"
@@ -960,6 +961,7 @@ void RecorderClass::reset() {
  * Do the update for this frame.
  */
 void RecorderClass::update() {
+	rts::frame_timing::Scope frameTiming(rts::frame_timing::RecorderUpdate);
 	if (m_mode == RECORDERMODETYPE_RECORD || m_mode == RECORDERMODETYPE_NONE) {
 		updateRecord();
 	} else if (isPlaybackMode()) {
@@ -1084,6 +1086,7 @@ void RecorderClass::updateRecord()
 	}
 
 	if (needFlush) {
+		rts::frame_timing::Scope flushTiming(rts::frame_timing::RecorderFlush);
 		DEBUG_ASSERTCRASH(m_file != nullptr, ("RecorderClass::updateRecord() - unexpected call to fflush(m_file)"));
 		m_file->flush();
 	}
@@ -1421,6 +1424,7 @@ void RecorderClass::archiveReplay(AsciiString fileName)
  * Write this game message to the record file. This also writes the game message's execution frame.
  */
 void RecorderClass::writeToFile(GameMessage * msg) {
+	rts::frame_timing::Scope encodeTiming(rts::frame_timing::RecorderEncode);
 #if defined(_WIN64)
 	std::array<rts::replay_command::Byte, rts::replay_command::kMaxReplayCommandBytes> record = {{}};
 	std::size_t recordBytes = 0U;

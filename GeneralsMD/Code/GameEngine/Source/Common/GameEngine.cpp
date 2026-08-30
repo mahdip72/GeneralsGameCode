@@ -33,6 +33,7 @@
 #include "Common/BuildAssistant.h"
 #include "Common/CRCDebug.h"
 #include "Common/FramePacer.h"
+#include "Lib/FrameTimingDiagnostics.h"
 #include "Common/GameThreadOwnership.h"
 #include "Common/Radar.h"
 #include "Common/PlayerTemplate.h"
@@ -922,6 +923,7 @@ void GameEngine::update()
 
 			{
 				PROFILER_SECTION_NAME("Engine.Update.Radar");
+				rts::frame_timing::Scope frameTiming(rts::frame_timing::Radar);
 				TheRadar->UPDATE();
 			}
 
@@ -929,19 +931,23 @@ void GameEngine::update()
 
 			{
 				PROFILER_SECTION_NAME("Engine.Update.Audio");
+				rts::frame_timing::Scope frameTiming(rts::frame_timing::Audio);
 				TheAudio->UPDATE();
 			}
 			{
 				PROFILER_SECTION_NAME("Engine.Update.Client");
+				rts::frame_timing::Scope frameTiming(rts::frame_timing::Client);
 				TheGameClient->UPDATE();
 			}
 			{
 				PROFILER_SECTION_NAME("Engine.Update.MessageStream");
+				rts::frame_timing::Scope frameTiming(rts::frame_timing::Messages);
 				TheMessageStream->propagateMessages();
 			}
 
 			{
 				PROFILER_SECTION_NAME("Engine.Update.Network");
+				rts::frame_timing::Scope frameTiming(rts::frame_timing::Network);
 				if (TheNetwork != nullptr)
 				{
 					TheNetwork->UPDATE();
@@ -954,12 +960,14 @@ void GameEngine::update()
 		{
 			{
 				PROFILER_SECTION_NAME("Engine.Update.GameLogic");
+				rts::frame_timing::Scope frameTiming(rts::frame_timing::Logic);
 				TheGameLogic->UPDATE();
 			}
 
 			if (!TheFramePacer->isTimeFrozen())
 			{
 				PROFILER_SECTION_NAME("Engine.Update.ClientStep");
+				rts::frame_timing::Scope frameTiming(rts::frame_timing::ClientStep);
 				TheGameClient->step();
 			}
 		}
@@ -976,6 +984,7 @@ extern HWND ApplicationHWnd;
 void GameEngine::execute()
 {
 	ASSERT_GAME_THREAD("GameEngine::execute");
+	rts::frame_timing::Session frameTimingSession("interactive");
 #if defined(RTS_DEBUG)
 	DWORD startTime = timeGetTime() / 1000;
 #endif
@@ -983,6 +992,7 @@ void GameEngine::execute()
 	// pretty basic for now
 	while( !m_quitting )
 	{
+		rts::frame_timing::BeginFrame(TheGameLogic->getFrame());
 
 		//if (TheGlobalData->m_vTune)
 		{
@@ -1047,9 +1057,11 @@ void GameEngine::execute()
 
 			{
 				PROFILER_SECTION_NAME("Engine.FramePacer");
+				rts::frame_timing::Scope frameTiming(rts::frame_timing::Wait);
 				TheFramePacer->update();
 			}
 		}
+		rts::frame_timing::EndFrame(TheGameLogic->getFrame());
 
 #ifdef PERF_TIMERS
 		if (!m_quitting && TheGameLogic->isInGame() && !TheGameLogic->isInShellGame() && !TheGameLogic->isGamePaused())
