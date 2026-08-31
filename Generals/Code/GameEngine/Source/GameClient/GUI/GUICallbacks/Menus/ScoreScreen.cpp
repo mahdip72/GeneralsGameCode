@@ -719,10 +719,9 @@ void PlayMovieAndBlock(AsciiString movieTitle)
 				}
 			}
 			TheGameEngine->serviceWindowsOS();
-			// Bink reports finished when the final index is selected, but its
-			// BinkWait gate can still leave that frame unready. Always update
-			// before considering the terminal state, and never decode until the
-			// readiness contract succeeds. Native streams retain their frame.
+			// The selected final frame can still be waiting on the backend's
+			// clock. Keep servicing the stream and never decode until readiness
+			// succeeds. Native streams retain their frame while audio drains.
 			videoStream->update();
 			if (videoStream->isPlaybackFailed()) {
 				break;

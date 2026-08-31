@@ -270,7 +270,7 @@ void Display::update()
 			{
 				// The last visible frame can precede accepted movie audio. Let the
 				// FFmpeg stream-facing pump reach ENDED before destroying its sink;
-				// legacy backends report finished immediately for compatibility.
+				// Bink reports finished after copying the final frame to the buffer.
 				if (!m_videoStream->isFinished()) {
 					m_videoStream->frameNext();
 				}

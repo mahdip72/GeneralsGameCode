@@ -308,6 +308,7 @@ void BinkVideoPlayer::initializeVideoAudio()
 
 BinkVideoStream::BinkVideoStream()
 : m_handle(nullptr)
+, m_frameRendered(FALSE)
 {
 
 }
@@ -345,7 +346,9 @@ Bool BinkVideoStream::isFrameReady()
 
 Bool BinkVideoStream::isFinished() const
 {
-	return m_handle == nullptr || m_handle->FrameNum - 1 >= m_handle->Frames - 1;
+	// Selecting the last frame does not present it: BinkWait may still defer it.
+	// Hosts that advance after rendering retain the legacy wrap-to-zero signal.
+	return m_handle == nullptr || (m_frameRendered && m_handle->FrameNum >= m_handle->Frames);
 }
 
 //============================================================================
@@ -397,6 +400,7 @@ void BinkVideoStream::frameRender( VideoBuffer *buffer )
 			BinkCopyToBuffer ( m_handle, mem, buffer->pitch(), buffer->height(),
 													buffer->xPos(), buffer->yPos(), flags );
 			buffer->unlock();
+			m_frameRendered = TRUE;
 		}
 	}
 
@@ -409,6 +413,7 @@ void BinkVideoStream::frameRender( VideoBuffer *buffer )
 void BinkVideoStream::frameNext()
 {
 	BinkNextFrame( m_handle );
+	m_frameRendered = FALSE;
 }
 
 //============================================================================
@@ -438,6 +443,7 @@ Bool BinkVideoStream::frameGoto( Int index )
 	if (m_handle == nullptr)
 		return FALSE;
 	BinkGoto(m_handle, index, 0 );
+	m_frameRendered = FALSE;
 	return TRUE;
 }
 
