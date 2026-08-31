@@ -76,6 +76,8 @@ class W3DProjectedShadowManager	: public ProjectedShadowManager
 
 	private:
 		Int renderProjectedTerrainShadow(W3DProjectedShadow *shadow, AABoxClass &box);	///<render shadow on map terrain.
+		Int renderProjectedTerrainShadowParallel(W3DProjectedShadow *shadow, AABoxClass &box);
+		Int queueDecalParallel(W3DProjectedShadow *shadow);
 		void updateShadowNumbers(ShadowType shadowType, Int addNum);
 
 	private:

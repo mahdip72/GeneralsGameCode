@@ -868,6 +868,8 @@ void XAudio2AudioManager::startNextPhase(PlayingAudio &playing)
 
 		{
 			playing.assetFileName = fileName;
+			playing.pendingPcm = {};
+			playing.pendingPcmReady = FALSE;
 			playing.phaseSubmittedFrames = 0;
 			playing.phaseQueuedBuffers = 0;
 			playing.phaseCompletedFrames = 0;
@@ -990,6 +992,13 @@ Bool XAudio2AudioManager::submitPhase(PlayingAudio &playing)
 	if (!playing.voiceOpen || m_assetSource == nullptr) {
 		return FALSE;
 	}
+	auto acceptPending = [&]() {
+		playing.phaseSubmittedFrames += playing.pendingPcm.frameCount;
+		++playing.voiceSequence;
+		playing.pendingPcm = {};
+		playing.pendingPcmReady = FALSE;
+		m_service->setVoiceVolume(playing.voice, outputVolume(playing));
+	};
 	AsciiString fileName;
 	if (playing.phase == PP_Attack) {
 		fileName = playing.event->getAttackFilename();
@@ -1010,6 +1019,23 @@ Bool XAudio2AudioManager::submitPhase(PlayingAudio &playing)
 	}
 	if (playing.phaseSubmittedFrames >= playing.phaseTotalFrames) {
 		return TRUE;
+	}
+	if (playing.pendingPcmReady) {
+		const AudioPcmSubmitResult result = m_service->submitRetained(
+			playing.voice, playing.pendingPcm);
+		if (result == AudioPcmSubmitResult::ACCEPTED) {
+			acceptPending();
+			return TRUE;
+		}
+		if (result == AudioPcmSubmitResult::DROPPED) {
+			// Bounded admission pressure leaves the decoded chunk and sequence in
+			// place. queuePhaseLowWater stops after this one attempt and the next
+			// manager update retries it after owner progress.
+			return TRUE;
+		}
+		playing.pendingPcm = {};
+		playing.pendingPcmReady = FALSE;
+		return FALSE;
 	}
 	const Bool openEndedStream = playing.pcmStream != nullptr
 		&& playing.phaseTotalFrames == std::numeric_limits<UnsignedInt>::max();
@@ -1049,15 +1075,24 @@ Bool XAudio2AudioManager::submitPhase(PlayingAudio &playing)
 			/ static_cast<Real>(playing.pcmStream->sampleRate());
 	}
 	chunk.generation = playing.generation;
-	chunk.sequence = playing.voiceSequence++;
+	chunk.sequence = playing.voiceSequence;
 	chunk.startSample = static_cast<std::int64_t>(playing.phaseSubmittedFrames);
-	const UnsignedInt submittedFrames = chunk.frameCount;
-	if (m_service->submit(playing.voice, std::move(chunk)) != AudioPcmSubmitResult::ACCEPTED) {
-		return FALSE;
+	playing.pendingPcm = std::move(chunk);
+	playing.pendingPcmReady = TRUE;
+	const AudioPcmSubmitResult result = m_service->submitRetained(
+		playing.voice, playing.pendingPcm);
+	if (result == AudioPcmSubmitResult::ACCEPTED) {
+		acceptPending();
+		return TRUE;
 	}
-	playing.phaseSubmittedFrames += submittedFrames;
-	m_service->setVoiceVolume(playing.voice, outputVolume(playing));
-	return TRUE;
+	if (result == AudioPcmSubmitResult::DROPPED) {
+		// Do not read the stream or range-decode again: pendingPcm owns the
+		// original bytes until this exact sequence is accepted.
+		return TRUE;
+	}
+	playing.pendingPcm = {};
+	playing.pendingPcmReady = FALSE;
+	return FALSE;
 }
 
 Bool XAudio2AudioManager::queuePhaseLowWater(PlayingAudio &playing)
@@ -1159,6 +1194,17 @@ void XAudio2AudioManager::processActiveAudio()
 		if (playing.paused && !playing.stopping) {
 			++index;
 			continue;
+		}
+		if (playing.pendingPcmReady && !playing.stopping) {
+			const UnsignedInt submittedBefore = playing.phaseSubmittedFrames;
+			if (!queuePhaseLowWater(playing)) {
+				failPlaying(playing);
+				m_playing.erase(m_playing.begin() + index);
+				continue;
+			}
+			if (playing.phaseSubmittedFrames != submittedBefore) {
+				playing.needsVoiceService = TRUE;
+			}
 		}
 		if (playing.waitingForGeneratedDelay) {
 			if (playing.event->getDelay() > 0.0f) {
@@ -1278,6 +1324,8 @@ void XAudio2AudioManager::releaseVoice(PlayingAudio &playing)
 	playing.voiceOpen = FALSE;
 	playing.voice = {};
 	playing.needsVoiceService = FALSE;
+	playing.pendingPcm = {};
+	playing.pendingPcmReady = FALSE;
 }
 
 void XAudio2AudioManager::stopExistingSpeechForUninterruptible(AudioHandle exceptHandle)

@@ -78,6 +78,26 @@ int main()
 		CHECK(plan.slots[i].teamNumber == (i <= 4 ? 0 : 1));
 	}
 
+	SkirmishAITestPlan plan4v2;
+	BuildSkirmishAITestPlan(1730, SKIRMISH_AI_TEST_SCENARIO_4V2, &plan4v2);
+	CHECK(plan4v2.seed == 1730);
+	CHECK(strcmp(plan4v2.mapName, "Maps\\Twilight Flame\\Twilight Flame.map") == 0);
+	CHECK(plan4v2.slots[0].state == SLOT_PLAYER);
+	CHECK(plan4v2.slots[0].playerTemplate == PLAYERTEMPLATE_OBSERVER);
+	for (Int slot4v2 = 1; slot4v2 <= 6; ++slot4v2)
+	{
+		CHECK(plan4v2.slots[slot4v2].state == SLOT_BRUTAL_AI);
+		CHECK(plan4v2.slots[slot4v2].playerTemplate == PLAYERTEMPLATE_RANDOM);
+		CHECK(plan4v2.slots[slot4v2].color == slot4v2 - 1);
+		CHECK(plan4v2.slots[slot4v2].startPosition == slot4v2 - 1);
+		CHECK(plan4v2.slots[slot4v2].teamNumber == (slot4v2 <= 4 ? 0 : 1));
+	}
+	CHECK(plan4v2.slots[7].state == SLOT_CLOSED);
+	CHECK(plan4v2.slots[7].playerTemplate == -1);
+	CHECK(plan4v2.slots[7].color == -1);
+	CHECK(plan4v2.slots[7].startPosition == -1);
+	CHECK(plan4v2.slots[7].teamNumber == -1);
+
 	const UnsignedInt expectedMapCRC = 0x12345678U;
 	const UnsignedInt expectedMapSize = 0x00123456U;
 	SkirmishAITestLoadedState loadedState = {
@@ -107,6 +127,18 @@ int main()
 	loadedState.mapSize = expectedMapSize;
 	loadedState.seed++;
 	CHECK(!IsExpectedSkirmishAITestLoadedState(plan, expectedMapCRC, expectedMapSize, &loadedState));
+
+	SkirmishAITestLoadedState loaded4v2 = {
+		"maps\\twilight flame\\twilight flame.map",
+		"MAPS\\TWILIGHT FLAME\\TWILIGHT FLAME.MAP",
+		"Maps\\Twilight Flame\\Twilight Flame.map",
+		expectedMapCRC,
+		expectedMapSize,
+		1730
+	};
+	CHECK(IsExpectedSkirmishAITestLoadedState(plan4v2, expectedMapCRC, expectedMapSize, &loaded4v2));
+	loaded4v2.seed = 1729;
+	CHECK(!IsExpectedSkirmishAITestLoadedState(plan4v2, expectedMapCRC, expectedMapSize, &loaded4v2));
 
 	CHECK(EvaluateSkirmishAITestProgress(0, 0) == SKIRMISH_AI_TEST_RUNNING);
 	CHECK(EvaluateSkirmishAITestProgress(0, 107999) == SKIRMISH_AI_TEST_RUNNING);

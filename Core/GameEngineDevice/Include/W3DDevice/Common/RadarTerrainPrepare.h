@@ -25,6 +25,8 @@ class RadarPrepareRowWork
 	public:
 	virtual ~RadarPrepareRowWork();
 	virtual bool executeRows(unsigned rowBegin, unsigned rowEnd) = 0;
+	/* Input-cost grain, not a private worker-count cap. */
+	virtual unsigned minimumRowsPerTask() const { return 1; }
 
 protected:
 	RadarPrepareRowWork();
@@ -124,7 +126,7 @@ public:
 	bool warmup();
 	bool tryAcquire(unsigned consumerId);
 
-	/* Returns true only when both row tasks completed successfully. */
+	/* Returns true only when every admitted row task completed successfully. */
 	bool runRows(RadarTerrainSnapshot *snapshot, unsigned char *output,
 		unsigned rowBegin, unsigned rowEnd, bool *ranParallel = 0);
 	/* Generic row operation shared by later render-preparation consumers. */

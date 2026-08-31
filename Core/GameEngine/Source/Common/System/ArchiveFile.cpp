@@ -183,6 +183,17 @@ void ArchiveFile::getFileListInDirectory(const DetailedArchivedDirectoryInfo *di
 	}
 }
 
+Bool ArchiveFile::getReadLocation(const AsciiString& filename, AsciiString& archivePath,
+	UnsignedInt& offset, UnsignedInt& size) const
+{
+	const ArchivedFileInfo *info = getArchivedFileInfo(filename);
+	if (info == nullptr || m_file == nullptr || info->m_size == 0) return FALSE;
+	archivePath = m_file->getName();
+	offset = info->m_offset;
+	size = info->m_size;
+	return TRUE;
+}
+
 void ArchiveFile::attachFile(File *file)
 {
 	if (m_file != nullptr) {

@@ -58,6 +58,10 @@ public:
 	virtual void					setSearchPriority( Int new_priority ) = 0;	///< Set this archive file's search priority
 	virtual void					close() = 0;													///< Close this archive file
 	void									attachFile(File *file);
+	// Copy an archive member's immutable disk location without opening a pooled
+	// RAMFile or exposing the archive's shared seek cursor to another thread.
+	Bool getReadLocation(const AsciiString& filename, AsciiString& archivePath,
+		UnsignedInt& offset, UnsignedInt& size) const;
 
 	void									getFileListInDirectory(const AsciiString& currentDirectory, const AsciiString& originalDirectory, const AsciiString& searchName, FilenameList &filenameList, Bool searchSubdirectories) const;
 	void									getFileListInDirectory(const DetailedArchivedDirectoryInfo *dirInfo, const AsciiString& currentDirectory, const AsciiString& searchName, FilenameList &filenameList, Bool searchSubdirectories) const;

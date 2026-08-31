@@ -33,14 +33,34 @@ enum JobWorkerPolicy
 	JOB_WORKER_POLICY_ALL = 1
 };
 
+enum JobOwnerRole
+{
+	JOB_OWNER_GAME = 0,
+	JOB_OWNER_RENDER,
+	JOB_OWNER_AUDIO,
+	JOB_OWNER_NETWORK,
+	JOB_OWNER_IO,
+	JOB_OWNER_COUNT
+};
+
+struct JobRange
+{
+	unsigned begin;
+	unsigned end;
+};
+
 struct JobCpuSetInfo
 {
 	JobCpuSetInfo();
 
 	unsigned id;
 	unsigned efficiencyClass;
+	unsigned group;
+	unsigned coreIndex;
+	unsigned logicalProcessorIndex;
 	bool parked;
 	bool allocatedToOtherProcess;
+	bool availableToProcess;
 };
 
 struct JobSystemConfig
@@ -71,8 +91,12 @@ struct JobSystemMetrics
 	JobMetricCounter maximumQueueLatencyNanoseconds;
 	JobMetricCounter workerSleepCount;
 	JobMetricCounter workerWakeCount;
+	JobMetricCounter affinityFailureCount;
 	unsigned injectionHighWater;
 	unsigned maximumActiveWorkers;
+	unsigned availableLogicalCpuCount;
+	unsigned reservedOwnerCpuCount;
+	unsigned selectedWorkerCpuCount;
 };
 
 class JobContext
@@ -174,8 +198,17 @@ class JobSystem
 {
 public:
 	static JobSystem &instance();
+	// Allocation-free partitions of immutable input and disjoint output storage.
+	static unsigned chooseRangeCount(unsigned itemCount,
+		unsigned minimumItemsPerRange, unsigned workerCount);
+	static bool rangeForIndex(unsigned itemCount, unsigned rangeCount,
+		unsigned rangeIndex, JobRange &range);
 	static unsigned chooseWorkerCount(unsigned eligibleLogicalCpuCount,
 		JobWorkerPolicy policy, unsigned explicitWorkerCount);
+	static unsigned selectOwnerCpuSets(const JobCpuSetInfo *cpuSets,
+		unsigned cpuSetCount, JobWorkerPolicy policy,
+		unsigned explicitWorkerCount, unsigned *selectedIds,
+		unsigned selectedIdCapacity);
 	static unsigned selectWorkerCpuSets(const JobCpuSetInfo *cpuSets,
 		unsigned cpuSetCount, JobWorkerPolicy policy,
 		unsigned explicitWorkerCount, unsigned *selectedIds,
@@ -185,8 +218,15 @@ public:
 	static JobSystemConfig startupConfig();
 
 	bool start(const JobSystemConfig &config);
+	// Lazy startup is disabled after shutdown; only explicit start can restart.
 	bool ensureStarted();
 	void shutdown();
+	// One execution thread per role and one role per thread. Registration never
+	// starts compute workers; optional affinity failure is reported in metrics.
+	// Unregister on that thread after native destruction, even after shutdown.
+	bool registerCurrentThread(JobOwnerRole role);
+	bool unregisterCurrentThread(JobOwnerRole role);
+	bool isCurrentThread(JobOwnerRole role) const;
 	bool isRunning() const;
 	bool isWorkerThread() const;
 	unsigned workerCount() const;
@@ -223,6 +263,7 @@ private:
 	~JobSystem();
 	JobSystem(const JobSystem &);
 	JobSystem &operator=(const JobSystem &);
+	bool startInternal(const JobSystemConfig &config, bool allowRestart);
 
 	struct State;
 	State *m_state;

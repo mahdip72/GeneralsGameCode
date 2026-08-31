@@ -208,7 +208,12 @@ NAT::NAT()
 	m_packetID = 0x7f00;
 }
 
-NAT::~NAT() {
+NAT::~NAT()
+{
+	// The network takes ownership explicitly through takeTransport(). Any
+	// transport left here is still owned by NAT and must be stopped and freed.
+	delete m_transport;
+	m_transport = nullptr;
 }
 
 // if we're already finished, change to being idle
@@ -712,8 +717,11 @@ void NAT::generatePortNumbers(GameSlot *slotList[], Int localSlot) {
 	}
 }
 
-Transport * NAT::getTransport() {
-	return m_transport;
+Transport * NAT::takeTransport()
+{
+	Transport *transport = m_transport;
+	m_transport = nullptr;
+	return transport;
 }
 
 // figure out which port I'll be using.

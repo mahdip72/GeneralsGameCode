@@ -162,7 +162,7 @@ RenderFrameOutcome::RenderFrameOutcome() :
 	m_commandFailure(), m_endFrameResult(RENDER_RESULT_OK),
 	m_captureResult(RENDER_RESULT_OK), m_presentationResult(RENDER_RESULT_OK),
 	m_recoveryResult(RENDER_RESULT_OK), m_deviceRemoved(false),
-	m_frameEnded(false), m_presented(false), m_operational(true)
+	m_frameEnded(false), m_submitted(false), m_presented(false), m_operational(true)
 {
 }
 
@@ -216,8 +216,14 @@ void RenderFrameOutcome::markFrameEnded()
 	m_frameEnded = true;
 }
 
+void RenderFrameOutcome::markSubmitted()
+{
+	m_submitted = true;
+}
+
 void RenderFrameOutcome::markPresented()
 {
+	m_submitted = true;
 	m_presented = true;
 }
 
@@ -242,6 +248,11 @@ bool RenderFrameOutcome::hasLifecycleFailure() const
 bool RenderFrameOutcome::hasDeviceRemoval() const
 {
 	return m_deviceRemoved || m_commandFailure.hasDeviceRemoval();
+}
+
+bool RenderFrameOutcome::wasSubmitted() const
+{
+	return m_submitted;
 }
 
 bool RenderFrameOutcome::wasPresented() const

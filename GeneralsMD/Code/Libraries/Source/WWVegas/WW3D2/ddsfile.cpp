@@ -193,6 +193,9 @@ DDSFileClass::DDSFileClass(const char* name,unsigned reduction_factor)
 	CubeFaceSize(0),
 	CubeFaceDataOffset(0)
 {
+	Name[0] = 0;
+	// A null name constructs a private memory-only decoder. No factory call.
+	if (name == nullptr) return;
 	strlcpy(Name,name,sizeof(Name));
 	// The name could be given in .tga or .dds format, so ensure we're opening .dds...
 	int len=strlen(Name);
@@ -234,6 +237,12 @@ DDSFileClass::DDSFileClass(const char* name,unsigned reduction_factor)
 		return;
 	}
 
+	file->Close();
+	Initialize_Header();
+}
+
+void DDSFileClass::Initialize_Header()
+{
 	Format=D3DFormat_To_WW3DFormat((D3DFORMAT)SurfaceDesc.PixelFormat.FourCC);
 	if (!Is_Supported_DDS_Format(Format))
 	{
@@ -255,7 +264,6 @@ DDSFileClass::DDSFileClass(const char* name,unsigned reduction_factor)
 	if (SurfaceDesc.Width==0 || SurfaceDesc.Height==0 ||
 		(Type==DDS_VOLUME && SurfaceDesc.Depth==0))
 	{
-		file->Close();
 		return;
 	}
 
@@ -283,8 +291,8 @@ DDSFileClass::DDSFileClass(const char* name,unsigned reduction_factor)
 
 	unsigned level_offset=0;
 
-	LevelSizes=W3DNEWARRAY unsigned[MipLevels];
-	LevelOffsets=W3DNEWARRAY unsigned[MipLevels];
+	LevelSizes=new unsigned[MipLevels];
+	LevelOffsets=new unsigned[MipLevels];
 	for (unsigned level=0;level<MipLevels;++level)
 	{
 		const unsigned sourceLevel=ReductionFactor+level;
@@ -361,7 +369,50 @@ DDSFileClass::DDSFileClass(const char* name,unsigned reduction_factor)
 			}
 		}
 	}
-	file->Close();
+}
+
+bool DDSFileClass::Set_Memory_Header(const unsigned char *bytes, size_t size)
+{
+	if (bytes == nullptr || size < 128 || LevelSizes != nullptr || DDSMemory != nullptr ||
+		memcmp(bytes, "DDS ", 4) != 0) return false;
+	memcpy(&SurfaceDesc, bytes + 4, sizeof(SurfaceDesc));
+	if (SurfaceDesc.Size != sizeof(SurfaceDesc)) return false;
+	Initialize_Header();
+	return Is_Available();
+}
+
+bool DDSFileClass::Load_From_Memory(const unsigned char *bytes, size_t byteCount)
+{
+	if (!Is_Available() || DDSMemory != nullptr || bytes == nullptr || byteCount < 128 ||
+		byteCount > 0x7fffffffU || memcmp(bytes, "DDS ", 4) != 0 ||
+		memcmp(bytes + 4, &SurfaceDesc, sizeof(SurfaceDesc)) != 0) return false;
+	unsigned offset = 128;
+	if (Type != DDS_CUBEMAP)
+	{
+		for (unsigned i = 0; i < ReductionFactor; ++i)
+		{
+			const unsigned w = Legacy_DDS_Level_Dimension(SurfaceDesc.Width, i);
+			const unsigned h = Legacy_DDS_Level_Dimension(SurfaceDesc.Height, i);
+			const unsigned d = Type == DDS_VOLUME ? Legacy_DDS_Level_Dimension(SurfaceDesc.Depth, i) : 1;
+			const unsigned levelSize = Calculate_DXTC_Surface_Size(w, h, Format);
+			if (levelSize == 0 || d == 0 || levelSize > ((unsigned)-1) / d ||
+				offset > byteCount || levelSize * d > byteCount - offset) return false;
+			offset += levelSize * d;
+		}
+	}
+	if (MipLevels == 0 || LevelOffsets[MipLevels - 1] > ((unsigned)-1) - LevelSizes[MipLevels - 1]) return false;
+	unsigned required = LevelOffsets[MipLevels - 1] + LevelSizes[MipLevels - 1];
+	if (Type == DDS_CUBEMAP)
+	{
+		if (CubeFaceSize == 0 || CubeFaceSize > ((unsigned)-1) / 6U) return false;
+		required = CubeFaceSize * 6U;
+	}
+	if (offset > byteCount || required > byteCount - offset) return false;
+	const unsigned size = static_cast<unsigned>(byteCount - offset);
+	DDSMemory = new unsigned char[size];
+	DDSMemorySize = size;
+	memcpy(DDSMemory, bytes + offset, size);
+	return true;
 }
 
 // ----------------------------------------------------------------------------

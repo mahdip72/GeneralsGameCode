@@ -178,6 +178,10 @@ public:
 #if defined(RTS_DEBUG)
 	virtual void dumpModelAssets(const char *path) = 0;	///< dump all used models/textures to a file.
 #endif
+	// Explicit windows defer only named preload requests, never normal model
+	// creation. Implementations without asynchronous resources remain serial.
+	virtual void beginModelPreload() {}
+	virtual void endModelPreload() {}
 	virtual void preloadModelAssets( AsciiString model ) = 0;	///< preload model asset
 	virtual void preloadTextureAssets( AsciiString texture ) = 0;	///< preload texture asset
 

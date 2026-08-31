@@ -66,6 +66,7 @@ public:
 	virtual int Size() override;
 	virtual int Write(void const *buffer, int len) override;
 	virtual void Close() override;
+	virtual rts::ResourceIoSource *Capture_Resource_Read_Source() override;
 
 protected:
 

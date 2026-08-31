@@ -30,6 +30,9 @@
 
 #include "GameNetwork/udp.h"
 #include "GameNetwork/NetworkDefs.h"
+#if defined(_WIN64)
+#include "Lib/NetworkIoOwner.h"
+#endif
 
 /**
  * The transport layer handles the UDP socket for the game, and will packetize and
@@ -56,7 +59,15 @@ public:
 	Bool queueSend(UnsignedInt addr, UnsignedShort port, const UnsignedByte *buf, Int len /*,
 		NetMessageFlags flags, Int id */);				///< Queue a packet for sending to the specified address and port.  This will be sent on the next update() call.
 
-	Bool allowBroadcasts(Bool val) { if (!m_udpsock) return false; return (m_udpsock->AllowBroadcasts(val))?true:false; }
+	Bool allowBroadcasts(Bool val);
+#if defined(_WIN64)
+	// Set before init to override the shared startup policy for this transport.
+	// A failed asynchronous start selects the serial path after closing its socket.
+	void setAsyncSocketIO(Bool enabled) { m_asyncSocketIO = enabled; m_socketIOPolicyOverride = true; }
+	Bool isAsyncSocketIO() const { return m_ioOwner != nullptr; }
+	rts::network::NetworkIoMetrics getSocketIOMetrics() const;
+	UnsignedInt getSocketIOFallbackCount() const { return m_ioFallbackCount; }
+#endif
 
 	// Latency insertion and packet loss
 	void setLatency( Bool val ) { m_useLatency = val; }
@@ -81,6 +92,21 @@ public:
 private:
 	Bool m_winsockInit;
 	UDP *m_udpsock;
+#if defined(_WIN64)
+	rts::network::NetworkIoOwner *m_ioOwner;
+	rts::network::NetworkIoGeneration m_ioGeneration;
+	rts::network::NetworkIoMetrics m_stoppedIOMetrics;
+	Bool m_ioPending[MAX_MESSAGES];
+	Bool m_asyncSocketIO;
+	Bool m_socketIOPolicyOverride;
+	Int m_ioLastError;
+	UnsignedInt m_ioFallbackCount;
+	Bool collectSocketSends();
+#endif
+	Int readSocket(unsigned char *bytes, UnsignedInt capacity, sockaddr_in *from);
+	Bool hasSocket() const;
+	Bool hasAddressError();
+	Int socketError() const;
 
 	// Latency insertion and packet loss
 	Bool m_useLatency;

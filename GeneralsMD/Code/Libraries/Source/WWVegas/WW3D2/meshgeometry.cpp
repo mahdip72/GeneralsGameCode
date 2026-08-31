@@ -97,6 +97,79 @@
 #include "w3d_file.h"
 #include "WWMath/vp.h"
 #include "htree.h"
+
+#if defined(_WIN64)
+#include "Lib/GeometryTriangleDecode.h"
+#include "Lib/ParallelSkinning.h"
+#include "Lib/PipelineExecutionPolicy.h"
+
+namespace
+{
+bool Try_Parallel_Deformation(const Vector3 *vertices, const Vector3 *normals,
+	const uint16 *links, int vertexCount, const HTreeClass *tree,
+	Vector3 *outputVertices, Vector3 *outputNormals)
+{
+	// Small skins keep the zero-allocation legacy path. Snapshot, scratch and
+	// result storage together stay below 32 MiB, even at these upper bounds.
+	if (!rts::UseParallelPipelines() || vertexCount < 1024 || vertexCount > 262144 || !tree ||
+		tree->Num_Pivots() <= 0 || tree->Num_Pivots() > 16384 ||
+		!vertices || !links || !outputVertices ||
+		rts::JobSystem::instance().isWorkerThread() ||
+		!rts::JobSystem::instance().ensureStarted() ||
+		rts::JobSystem::instance().workerCount() < 2) return false;
+	try
+	{
+		rts::SkinningScratchLease scratch;
+		if (!scratch.prepareSkin(vertexCount, tree->Num_Pivots()))
+		{
+			rts::JobSystem::instance().recordSerialFallback();
+			return false;
+		}
+		rts::SkinningVertex *snapshot = scratch.vertices();
+		rts::SkinningMatrix *bones = scratch.matrices();
+		rts::SkinnedVertex *result = scratch.skinOutput();
+		for (int bone = 0; bone != tree->Num_Pivots(); ++bone)
+		{
+			const Matrix3D &transform = tree->Get_Transform(bone);
+			for (int row = 0; row != 3; ++row)
+				for (int column = 0; column != 4; ++column)
+					bones[bone].row[row][column] = transform[row][column];
+		}
+		for (int vertex = 0; vertex != vertexCount; ++vertex)
+		{
+			snapshot[vertex].position.x = vertices[vertex].X;
+			snapshot[vertex].position.y = vertices[vertex].Y;
+			snapshot[vertex].position.z = vertices[vertex].Z;
+			snapshot[vertex].bone = links[vertex];
+			if (normals)
+			{
+				snapshot[vertex].normal.x = normals[vertex].X;
+				snapshot[vertex].normal.y = normals[vertex].Y;
+				snapshot[vertex].normal.z = normals[vertex].Z;
+			}
+		}
+		rts::SkinningOptions options;
+		options.scratch = &scratch;
+		if (!rts::SkinningCompleted(rts::SkinVertices(&snapshot[0], vertexCount,
+			&bones[0], tree->Num_Pivots(), normals != nullptr,
+			&result[0], options))) return false;
+		// The producer owns publication, and no job survives this call/frame.
+		for (int vertex = 0; vertex != vertexCount; ++vertex)
+		{
+			outputVertices[vertex].Set(result[vertex].position.x, result[vertex].position.y, result[vertex].position.z);
+			if (normals)
+				outputNormals[vertex].Set(result[vertex].normal.x, result[vertex].normal.y, result[vertex].normal.z);
+		}
+		return true;
+	}
+	catch (...)
+	{
+		rts::JobSystem::instance().recordSerialFallback();
+		return false;
+	}
+}
+}
+#endif
 #include "WWMath/matrix4.h"
 #include "rinfo.h"
 #include "camera.h"
@@ -1847,6 +1920,41 @@ WW3DErrorType MeshGeometryClass::read_vertex_normals(ChunkLoadClass & cload)
  *=============================================================================================*/
 WW3DErrorType MeshGeometryClass::read_triangles(ChunkLoadClass & cload)
 {
+#if defined(_WIN64)
+	static_assert(sizeof(W3dTriStruct) == rts::GEOMETRY_TRIANGLE_RECORD_BYTES,
+		"Geometry triangle record layout must match W3D");
+	static_assert(sizeof(TriIndex) == 3 * rts::GEOMETRY_TRIANGLE_INDEX16_BYTES,
+		"Zero Hour indices must remain three packed 16-bit values");
+	static_assert(sizeof(Vector4) == 4 * sizeof(float), "Plane array must remain packed");
+	if (rts::UseParallelPipelines() &&
+		Get_Polygon_Count() >= rts::GEOMETRY_TRIANGLE_MIN_PARALLEL_RECORDS)
+	{
+		rts::GeometryTriangleDecodeScratch scratch;
+		const unsigned count = static_cast<unsigned>(Get_Polygon_Count());
+		// Check the complete byte budget before reading, so a small, oversized,
+		// or short declared chunk retains the original streaming reader below.
+		if (count <= cload.Cur_Chunk_Length() / rts::GEOMETRY_TRIANGLE_RECORD_BYTES &&
+			scratch.prepare(count, rts::GEOMETRY_TRIANGLE_INDEX16_BYTES))
+		{
+			if (cload.Read(scratch.records(), scratch.inputBytes()) != scratch.inputBytes())
+				return WW3D_ERROR_LOAD_FAILED;
+			rts::GeometryTriangleDecodeOptions options;
+			if (!rts::GeometryTriangleDecodeCompleted(rts::DecodeGeometryTriangles(scratch, options)))
+				return WW3D_ERROR_LOAD_FAILED;
+			// Only the owner touches shared geometry and the temporary plane array.
+			// Zero Hour's unsigned 16-bit index narrowing is already prepared.
+			TriIndex *vi = get_polys();
+			Vector4 *peq = get_planes();
+			uint8 *surface_types = Get_Poly_Surface_Type_Array();
+			WWASSERT(scratch.attributesInRange());
+			memcpy(vi, scratch.indices(), count * sizeof(TriIndex));
+			memcpy(peq, scratch.planes(), count * sizeof(Vector4));
+			memcpy(surface_types, scratch.surfaces(), count * sizeof(uint8));
+			Set_Flag(DIRTY_PLANES,false);
+			return WW3D_ERROR_OK;
+		}
+	}
+#endif
 	W3dTriStruct tri;
 
 	// cache pointers to various arrays in the surrender mesh
@@ -2052,6 +2160,9 @@ void MeshGeometryClass::get_deformed_vertices(Vector3 *dst_vert,const HTreeClass
 {
 	Vector3 * src_vert = Vertex->Get_Array();
 	uint16 * bonelink = VertexBoneLink->Get_Array();
+#if defined(_WIN64)
+	if (Try_Parallel_Deformation(src_vert, nullptr, bonelink, Get_Vertex_Count(), htree, dst_vert, nullptr)) return;
+#endif
 	for (int vi = 0; vi < Get_Vertex_Count(); vi++) {
 		const Matrix3D & tm = htree->Get_Transform(bonelink[vi]);
 		Matrix3D::Transform_Vector(tm, src_vert[vi], &(dst_vert[vi]));
@@ -2071,6 +2182,10 @@ void MeshGeometryClass::get_deformed_vertices(Vector3 *dst_vert, Vector3 *dst_no
 	Vector3 * src_norm = VertexNorm->Get_Array();
 #endif
 	uint16 * bonelink = VertexBoneLink->Get_Array();
+
+#if defined(_WIN64)
+	if (Try_Parallel_Deformation(src_vert, src_norm, bonelink, vertex_count, htree, dst_vert, dst_norm)) return;
+#endif
 
 	for (vi = 0; vi < vertex_count;) {
 		const Matrix3D & tm = htree->Get_Transform(bonelink[vi]);

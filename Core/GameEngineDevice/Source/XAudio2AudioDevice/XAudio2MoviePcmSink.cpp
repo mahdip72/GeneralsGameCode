@@ -46,7 +46,14 @@ void XAudio2MoviePcmSink::reset(std::uint64_t generation)
 	std::lock_guard<std::mutex> lock(m_mutex);
 	m_endOfStream = false;
 	if (!m_closed && m_service != nullptr && m_handle.isValid()) {
-		m_service->resetVoice(m_handle, generation);
+		if (m_service->resetVoice(m_handle, generation) && m_service->ownerMetrics().sharedOwner) {
+			// Opening/seek has a bounded decode-attempt budget. Complete the
+			// empty-voice generation transition before that tight producer loop,
+			// rather than spending its attempts waiting for owner scheduling.
+			// This is one lifecycle fence, not a fence for ordinary PCM/gain calls.
+			m_service->serviceVoice(m_handle);
+			m_service->synchronize();
+		}
 	}
 }
 
@@ -80,7 +87,7 @@ bool XAudio2MoviePcmSink::service() noexcept
 		|| !m_service->serviceVoice(m_handle)) {
 		return false;
 	}
-	m_service->discardCompletions();
+	m_service->discardCompletions(m_handle);
 	return !m_service->isVoiceFailed(m_handle);
 }
 

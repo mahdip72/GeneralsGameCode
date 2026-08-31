@@ -9,6 +9,8 @@
 */
 
 #include "W3DDevice/Common/RadarTerrainPrepare.h"
+#include "Lib/JobFloatingPointState.h"
+#include "Lib/PipelineExecutionPolicy.h"
 
 #include <limits.h>
 #include <string.h>
@@ -354,6 +356,7 @@ public:
 
 	virtual void execute(rts::JobContext &context)
 	{
+		rts::JobFloatingPointScope floatScope(m_floatState);
 		const bool completed = m_batch != 0 && m_batch->work != 0 &&
 			m_batch->work->executeRows(m_rowBegin, m_rowEnd);
 		if (m_batch != 0 && m_resultIndex < m_batch->resultCount)
@@ -374,6 +377,7 @@ private:
 	unsigned m_rowBegin;
 	unsigned m_rowEnd;
 	unsigned m_resultIndex;
+	rts::JobFloatingPointState m_floatState;
 };
 
 static RadarPrepareRowTask *radarPrepareAllocateRowTask(
@@ -466,7 +470,7 @@ bool RadarTerrainPrepareService::tryAcquire(unsigned consumerId)
 bool RadarTerrainPrepareService::warmup()
 {
 	return m_initialized && !m_stopping && !m_leaseActive &&
-		rts::JobSystem::instance().ensureStarted();
+		(!rts::UseParallelPipelines() || rts::JobSystem::instance().ensureStarted());
 }
 
 bool RadarTerrainPrepareService::runAttempt(RadarPrepareRowWork *work,
@@ -614,12 +618,12 @@ bool RadarTerrainPrepareService::runRows(RadarPrepareRowWork *work,
 		system.recordSerialFallback();
 		return false;
 	}
+	if (!rts::UseParallelPipelines())
+		return work->executeRows(rowBegin, rowEnd);
 	const unsigned workerCount = system.ensureStarted() ? system.workerCount() : 0;
-	unsigned desiredRangeCount = workerCount;
-	if (desiredRangeCount > 1 && desiredRangeCount <= UINT_MAX / 2)
-	{
-		desiredRangeCount *= 2;
-	}
+	const unsigned desiredRangeCount = workerCount == 0 ? 0 :
+		rts::JobSystem::chooseRangeCount(rowEnd-rowBegin,
+			work->minimumRowsPerTask(), workerCount);
 	if (runAttempt(work, rowBegin, rowEnd, desiredRangeCount, ranParallel))
 	{
 		return true;

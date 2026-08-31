@@ -14,6 +14,29 @@
 #include <x3daudio.h>
 
 class XAudio2PcmVoice;
+class XAudio2AudioServiceOwner;
+
+enum class XAudio2AudioExecutionMode : std::uint8_t
+{
+	SHARED_OWNER,
+	SERIAL_REFERENCE
+};
+
+struct XAudio2AudioOwnerMetrics
+{
+	std::uint64_t commands = 0;
+	std::uint64_t servicePasses = 0;
+	std::uint64_t coalescedControls = 0;
+	std::uint64_t queueWaits = 0;
+	std::uint64_t queueWaitNanoseconds = 0;
+	std::uint64_t fenceWaits = 0;
+	std::uint64_t fenceWaitNanoseconds = 0;
+	std::uint64_t rejectedSubmissions = 0;
+	std::size_t peakQueuedCommands = 0;
+	std::size_t peakBufferedBytes = 0;
+	bool sharedOwner = false;
+	bool forcedSerial = false;
+};
 
 enum class XAudio2AudioServiceState : std::uint8_t
 {
@@ -69,6 +92,8 @@ class XAudio2AudioService
 public:
 	XAudio2AudioService();
 	explicit XAudio2AudioService(std::unique_ptr<IXAudio2AudioEngineBackend> backend);
+	XAudio2AudioService(std::unique_ptr<IXAudio2AudioEngineBackend> backend,
+		XAudio2AudioExecutionMode executionMode);
 	~XAudio2AudioService();
 
 	XAudio2AudioService(const XAudio2AudioService &) = delete;
@@ -79,6 +104,13 @@ public:
 	bool isOpen() const noexcept;
 	XAudio2AudioServiceState state() const noexcept;
 	HRESULT getLastError() const noexcept;
+	// Select before constructing services. Serial mode is an explicit reference
+	// lane, never a silent response to owner creation or native device failure.
+	static void setDefaultExecutionMode(XAudio2AudioExecutionMode mode) noexcept;
+	XAudio2AudioOwnerMetrics ownerMetrics() const noexcept;
+	// A transition/test fence, not a per-frame polling API. Ordinary controls
+	// return admission status; asynchronous native failure is published in status.
+	bool synchronize() noexcept;
 
 	// Owner-thread observation point for the atomically published engine error.
 	// The callback itself never takes this service mutex or touches child voices.
@@ -90,6 +122,12 @@ public:
 	XAudio2PcmVoiceHandle createVoice(float maxFrequencyRatio = 2.0f) noexcept;
 	bool destroyVoice(XAudio2PcmVoiceHandle handle) noexcept;
 	AudioPcmSubmitResult submit(XAudio2PcmVoiceHandle handle, AudioPcmChunk &&chunk) noexcept;
+	// Manager-only retry path. A bounded-admission DROPPED result leaves chunk
+	// intact for a later attempt; ACCEPTED and terminal FAILED consume it. The
+	// sink-facing submit() above intentionally keeps its consume-on-rejection
+	// contract for movie and other non-replayable producers.
+	AudioPcmSubmitResult submitRetained(XAudio2PcmVoiceHandle handle,
+		AudioPcmChunk &chunk) noexcept;
 	bool canVoiceAccept(XAudio2PcmVoiceHandle handle, std::size_t submissions) const noexcept;
 	bool resetVoice(XAudio2PcmVoiceHandle handle, std::uint64_t generation) noexcept;
 	bool serviceVoice(XAudio2PcmVoiceHandle handle) noexcept;
@@ -110,6 +148,12 @@ public:
 	// Dedicated owners such as movie playback do not translate PCM completions
 	// into game events, but they must still consume the bounded callback FIFO.
 	void discardCompletions() noexcept;
+	void discardCompletions(XAudio2PcmVoiceHandle handle) noexcept;
+	bool tryPopCompletion(XAudio2PcmVoiceHandle handle,
+		XAudio2AudioCompletion &completion) noexcept;
+	// Fixed PCM occupancy snapshot used to reserve command-side capacity.
+	bool getVoiceBufferedState(XAudio2PcmVoiceHandle handle,
+		std::size_t &buffers, std::size_t &bytes) const noexcept;
 
 private:
 	struct VoiceRecord
@@ -127,6 +171,7 @@ private:
 	XAudio2PcmVoiceHandle invalidHandle() const noexcept;
 
 	std::unique_ptr<IXAudio2AudioEngineBackend> m_backend;
+	std::unique_ptr<XAudio2AudioServiceOwner> m_executionOwner;
 	mutable std::mutex m_mutex;
 	std::vector<VoiceRecord> m_voices;
 	std::uint64_t m_nextHandleGeneration;

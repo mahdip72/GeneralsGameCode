@@ -63,10 +63,21 @@
 #include "GameLogic/ScriptEngine.h"
 #include "W3DDevice/GameClient/W3DShaderManager.h"
 #include "W3DDevice/Common/LegacyPixelShaderBytecode.h"
+#include "W3DDevice/Common/EffectPrepare.h"
+#include "Lib/PipelineExecutionPolicy.h"
+#include "Lib/JobFloatingPointState.h"
+#include "Lib/JobSystem.h"
+#include "Lib/WaterPolygonKernel.h"
 #include "W3DDevice/GameClient/W3DDisplay.h"
 #include "W3DDevice/GameClient/W3DPoly.h"
 #include "W3DDevice/GameClient/W3DScene.h"
 #include "W3DDevice/GameClient/W3DCustomScene.h"
+
+#include "WWMath/wwmath.h"
+
+#include <new>
+#include <stdlib.h>
+#include <string.h>
 
 
 
@@ -96,7 +107,7 @@
 #define SEA_REFLECTION_SIZE 256		//dimensions of reflection texture
 
 #define SEA_BUMP_SCALE		(0.06f)		//scales the du/dv offsets stored in bump map (~ amount to perturb)
-#define BUMP_SIZE (50.f)
+#define BUMP_SIZE WATER_MESH_BUMP_SIZE
 #define REFLECTION_FACTOR 0.1f
 
 #define PATCH_WIDTH (PATCH_SIZE-1)	//internal defines
@@ -119,6 +130,203 @@ typedef VertexFormatXYZDUV2 MaterMeshVertexFormat;
 
 // Converts a FLOAT to a DWORD for use in SetRenderState() calls
 static inline DWORD F2DW( FLOAT f ) { return *((DWORD*)&f); }
+
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
+#define RTS_WATER_POLYGON_MODERN 1
+#endif
+
+#if defined(RTS_WATER_POLYGON_MODERN)
+namespace
+{
+enum
+{
+	WATER_TRAPEZOID_MAX_JOBS = 256,
+	WATER_TRAPEZOID_MIN_ITEMS_PER_JOB = 256
+};
+
+/* One render owner reuses this bounded CRT storage across trapezoid draws.
+ * Workers only see the immutable snapshot and disjoint arrays; D3D buffers
+ * remain locked and published by the owner after the join. */
+class WaterTrapezoidScratch
+{
+public:
+	WaterTrapezoidScratch()
+		: m_vertices(0), m_indices(0), m_vertexCapacity(0), m_indexCapacity(0) {}
+	~WaterTrapezoidScratch()
+	{
+		free(m_indices);
+		free(m_vertices);
+	}
+
+	bool reserve(unsigned vertexCount, unsigned indexCount)
+	{
+		if (vertexCount > WATER_POLYGON_MAX_VERTICES ||
+			indexCount > WATER_POLYGON_MAX_INDICES)
+			return false;
+		WaterPolygonVertex *vertices = m_vertices;
+		unsigned short *indices = m_indices;
+		if (vertexCount > m_vertexCapacity)
+			vertices = static_cast<WaterPolygonVertex *>(
+				malloc(vertexCount * sizeof(WaterPolygonVertex)));
+		if (indexCount > m_indexCapacity)
+			indices = static_cast<unsigned short *>(
+				malloc(indexCount * sizeof(unsigned short)));
+		if ((vertexCount > m_vertexCapacity && vertices == 0) ||
+			(indexCount > m_indexCapacity && indices == 0))
+		{
+			if (vertices != m_vertices) free(vertices);
+			if (indices != m_indices) free(indices);
+			return false;
+		}
+		if (vertices != m_vertices)
+		{
+			free(m_vertices);
+			m_vertices = vertices;
+			m_vertexCapacity = vertexCount;
+		}
+		if (indices != m_indices)
+		{
+			free(m_indices);
+			m_indices = indices;
+			m_indexCapacity = indexCount;
+		}
+		return true;
+	}
+
+	WaterPolygonVertex *vertices() { return m_vertices; }
+	unsigned short *indices() { return m_indices; }
+	Real *sinTable() { return m_sinTable; }
+	void captureSinTable(const Real *source)
+	{
+		memcpy(m_sinTable, source,
+			WATER_POLYGON_FAST_SIN_TABLE_SIZE * sizeof(Real));
+	}
+
+private:
+	WaterTrapezoidScratch(const WaterTrapezoidScratch &);
+	WaterTrapezoidScratch &operator=(const WaterTrapezoidScratch &);
+	WaterPolygonVertex *m_vertices;
+	unsigned short *m_indices;
+	unsigned m_vertexCapacity;
+	unsigned m_indexCapacity;
+	Real m_sinTable[WATER_POLYGON_FAST_SIN_TABLE_SIZE];
+};
+
+static WaterTrapezoidScratch s_waterTrapezoidScratch;
+
+class WaterTrapezoidJob : public rts::Job
+{
+public:
+	static void *operator new(size_t bytes, const std::nothrow_t &) throw()
+	{
+		return malloc(bytes);
+	}
+	static void operator delete(void *memory) throw() { free(memory); }
+	static void operator delete(void *memory, const std::nothrow_t &) throw()
+	{
+		free(memory);
+	}
+
+	WaterTrapezoidJob(const WaterPolygonSnapshot &snapshot,
+		WaterPolygonVertex *vertices, unsigned short *indices,
+		unsigned begin, unsigned end, bool indexJob)
+		: m_snapshot(snapshot), m_vertices(vertices), m_indices(indices),
+		  m_begin(begin), m_end(end), m_indexJob(indexJob),
+		  m_floatingPointState() {}
+
+	virtual void execute(rts::JobContext &context)
+	{
+		rts::JobFloatingPointScope floatingPointScope(m_floatingPointState);
+		if (context.isCancellationRequested()) return;
+		const bool completed = m_indexJob ?
+			PrepareWaterPolygonIndices(m_snapshot, m_indices, m_begin, m_end) :
+			PrepareWaterPolygonVertices(m_snapshot, m_vertices, m_begin, m_end);
+		if (!completed) context.fail();
+	}
+
+private:
+	const WaterPolygonSnapshot m_snapshot;
+	WaterPolygonVertex *m_vertices;
+	unsigned short *m_indices;
+	unsigned m_begin;
+	unsigned m_end;
+	bool m_indexJob;
+	const rts::JobFloatingPointState m_floatingPointState;
+};
+
+static bool prepareWaterTrapezoidParallel(const WaterPolygonSnapshot &snapshot,
+	WaterTrapezoidScratch &scratch, bool &attempted)
+{
+	attempted = false;
+	rts::JobSystem &system = rts::JobSystem::instance();
+	if (!rts::UseParallelPipelines() ||
+		snapshot.rectangleCount < WATER_POLYGON_MIN_PARALLEL_CELLS)
+		return false;
+	attempted = true;
+	if (system.isWorkerThread())
+		return false;
+	if (!system.ensureStarted() || system.workerCount() < 2)
+		return false;
+	const unsigned vertexCount = snapshot.uCount * snapshot.vCount;
+	const unsigned indexCount = snapshot.rectangleCount * 6;
+	if (!scratch.reserve(vertexCount, indexCount))
+		return false;
+	const unsigned vertexJobCount = rts::JobSystem::chooseRangeCount(
+		vertexCount, WATER_TRAPEZOID_MIN_ITEMS_PER_JOB, system.workerCount());
+	const unsigned indexJobCount = rts::JobSystem::chooseRangeCount(
+		snapshot.rectangleCount, WATER_TRAPEZOID_MIN_ITEMS_PER_JOB,
+		system.workerCount());
+	const unsigned jobCount = vertexJobCount + indexJobCount;
+	if (jobCount == 0 || jobCount > WATER_TRAPEZOID_MAX_JOBS)
+		return false;
+
+	rts::JobSubmission submissions[WATER_TRAPEZOID_MAX_JOBS];
+	rts::JobHandle handles[WATER_TRAPEZOID_MAX_JOBS];
+	const rts::JobGroup group = system.createGroup();
+	unsigned created = 0;
+	if (group.isValid())
+	{
+		for (; created < vertexJobCount; ++created)
+		{
+			rts::JobRange range;
+			if (!rts::JobSystem::rangeForIndex(vertexCount,
+				vertexJobCount, created, range))
+				break;
+			WaterTrapezoidJob *job = new (std::nothrow) WaterTrapezoidJob(
+				snapshot, scratch.vertices(), 0, range.begin, range.end, false);
+			if (job == 0) break;
+			submissions[created].job = job;
+			submissions[created].priority = rts::JOB_PRIORITY_FRAME_CRITICAL;
+		}
+		if (created == vertexJobCount)
+		{
+			for (unsigned index = 0; index < indexJobCount; ++index, ++created)
+			{
+				rts::JobRange range;
+				if (!rts::JobSystem::rangeForIndex(snapshot.rectangleCount,
+					indexJobCount, index, range))
+					break;
+				WaterTrapezoidJob *job = new (std::nothrow) WaterTrapezoidJob(
+					snapshot, 0, scratch.indices(), range.begin, range.end, true);
+				if (job == 0) break;
+				submissions[created].job = job;
+				submissions[created].priority = rts::JOB_PRIORITY_FRAME_CRITICAL;
+			}
+		}
+	}
+	if (created != jobCount ||
+		!system.trySubmitBatch(submissions, jobCount, group, handles))
+	{
+		for (unsigned index = 0; index < created; ++index)
+			delete submissions[index].job;
+		return false;
+	}
+	if (!system.wait(group) || group.failed() || group.wasCancelled())
+		return false;
+	return true;
+}
+}
+#endif
 
 #define DRAW_WATER_WAKES
 /// @todo: Fix clipping of objects that intersect the mirror surface
@@ -2385,6 +2593,49 @@ void WaterRenderObjClass::renderWaterMesh()
 	PhasePerFrameY -= 0.1f;
 #endif
 
+	Int diffuse;
+	diffuse = setting->waterDiffuse&0x00ffffff;
+	Int alpha = (setting->waterDiffuse & 0xff000000)>>24;
+	// Reduce alpha for wave mesh
+	alpha -= 0x20;
+	diffuse |= alpha<<24;
+
+	//I pulled some of these constants out of the loops for speed:
+	Real uvCosScale=0.02*cos(3*m_riverVOrigin);
+	Real sinOffset=25*m_riverVOrigin;
+	Real originScale=m_riverVOrigin/vScale;
+	Real bumpSizeDiv=cellSizeY/BUMP_SIZE;
+	Real bumpSizeDiv2=0.3f*cellSizeY/BUMP_SIZE;
+
+	// Snapshot the live mesh and global sine-table samples before worker admission.
+	// No GPU buffer is locked until all CPU preparation has joined.
+	WaterMeshBatch &preparedMesh = m_preparedMesh;
+	bool meshPrepared = false;
+#ifndef USE_MESH_NORMALS
+	if (rts::UseParallelPipelines() && mx > 0 && my > 0 && preparedMesh.initialize(mx, my))
+	{
+		WaterMeshSnapshot &snapshot = preparedMesh.snapshot();
+		snapshot.cellSizeX = cellSizeX;
+		snapshot.uScale = uScale;
+		snapshot.diffuse = diffuse;
+		for (j=0,pData=m_meshData+mx+2+1; j<my; j++,pData+=2)
+		{
+			const Real y=(float)j*cellSizeY;
+			WaterMeshRowInput &row = preparedMesh.rows()[j];
+			row.y = y;
+#ifdef SCROLL_UV
+			row.v1 = m_riverVOrigin+(float)j*vScale + uvCosScale*WWMath::Fast_Sin(sinOffset+y*PI/(8*MAP_XY_FACTOR));
+#else
+			row.v1 = (float)j*vScale;
+#endif
+			row.v2 = ((float)j+originScale)*bumpSizeDiv + (float)j*bumpSizeDiv2;
+			for (i=0; i<mx; ++i,++pData)
+				preparedMesh.heights()[j*mx+i] = pData->height;
+		}
+		meshPrepared = preparedMesh.run();
+	}
+#endif
+
 	MaterMeshVertexFormat *vb;
 	rts::render::RenderBufferUpdateMode bufferUpdateMode;
 	size_t bufferUpdateOffset;
@@ -2405,20 +2656,16 @@ void WaterRenderObjClass::renderWaterMesh()
 		bufferUpdateOffset = 0;
 	}
 	MaterMeshVertexFormat *const lockedVertices = vb;
-	Int diffuse;
-	diffuse = setting->waterDiffuse&0x00ffffff;
-	Int alpha = (setting->waterDiffuse & 0xff000000)>>24;
-	// Reduce alpha for wave mesh
-	alpha -= 0x20;
-	diffuse |= alpha<<24;
-
-	//I pulled some of these constants out of the loops for speed:
-	Real uvCosScale=0.02*cos(3*m_riverVOrigin);
-	Real sinOffset=25*m_riverVOrigin;
-	Real originScale=m_riverVOrigin/vScale;
-	Real bumpSizeDiv=cellSizeY/BUMP_SIZE;
-	Real bumpSizeDiv2=0.3f*cellSizeY/BUMP_SIZE;
-
+	if (meshPrepared)
+	{
+#ifndef USE_MESH_NORMALS
+		typedef char WaterMeshVertexLayoutMustMatch[
+			sizeof(WaterMeshVertex) == sizeof(MaterMeshVertexFormat) ? 1 : -1];
+		memcpy(vb, preparedMesh.output(), static_cast<size_t>(mx)*my*sizeof(MaterMeshVertexFormat));
+#endif
+	}
+	else
+	{
 	//Data has a 1 vertex padding all around it so we don't need to special-case edges.  Improves performance
 	for (j=0,pData=m_meshData+mx+2+1; j<my; j++,pData+=2)	//skip 2 horizontal border samples after each row
 	{
@@ -2467,6 +2714,7 @@ void WaterRenderObjClass::renderWaterMesh()
 			vb++;
 			pData++;
 		}
+	}
 	}
 
 	const size_t bufferUpdateBytes = static_cast<size_t>(mx) * my *
@@ -3197,28 +3445,7 @@ void WaterRenderObjClass::drawTrapezoidWater(Vector3 points[4])
 	vCount++;
 
 	Int i, j;
-	//allocate 2 triangles per side with 3 indices per triangle
 	DynamicIBAccessClass ib_access(BUFFER_TYPE_DYNAMIC_DX8,(rectangleCount+1)*2*3);
-	{
-		DynamicIBAccessClass::WriteLockClass lockib(&ib_access);
- 		UnsignedShort *curIb = lockib.Get_Index_Array();
-		for (j=0; j<vCount-1; j++)
-		{	for (i=0; i<uCount-1; i++)
-			{
-				//triangle 1
-				curIb[0] = (j)*uCount + i;
-				curIb[1] = (j+1)*uCount + i+1;
-				curIb[2] = (j+1)*uCount + i;
-
-				//triangle 2
-				curIb[3] = (j)*uCount + i;
-				curIb[4] = (j)*uCount + i+1;
-				curIb[5] = (j+1)*uCount + i+1;
-
-				curIb += 6;	//skip the 6 indices we just added.
-			}
-		}
-	}
 
 	Real	waterFactor=150;
 	Real shadeR=TheWaterTransparency->m_standingWaterColor.red;
@@ -3271,12 +3498,108 @@ void WaterRenderObjClass::drawTrapezoidWater(Vector3 points[4])
 	diffuse |= m_settings[m_tod].waterDiffuse & 0xff000000;	//copy alpha/opacity from ini setting
 
 	DynamicVBAccessClass vb_access(BUFFER_TYPE_DYNAMIC_DX8,dynamic_fvf_type,(rectangleCount+1)*2);
+#if defined(RTS_WATER_POLYGON_MODERN)
+	bool waterParallelAttempted = false;
+	bool waterParallelPrepared = false;
+
+	WaterPolygonSnapshot waterSnapshot;
+	waterSnapshot.origin.x = origin.X;
+	waterSnapshot.origin.y = origin.Y;
+	waterSnapshot.origin.z = origin.Z;
+	waterSnapshot.uVector.x = uVec1.X;
+	waterSnapshot.uVector.y = uVec1.Y;
+	waterSnapshot.uVector.z = uVec1.Z;
+	waterSnapshot.vVector.x = vVec1.X;
+	waterSnapshot.vVector.y = vVec1.Y;
+	waterSnapshot.vVector.z = vVec1.Z;
+	Vector3 bilinear(vVec2);
+	bilinear -= vVec1;
+	waterSnapshot.bilinear.x = bilinear.X;
+	waterSnapshot.bilinear.y = bilinear.Y;
+	waterSnapshot.bilinear.z = bilinear.Z;
+	waterSnapshot.uCount = static_cast<unsigned>(uCount);
+	waterSnapshot.vCount = static_cast<unsigned>(vCount);
+	waterSnapshot.rectangleCount = static_cast<unsigned>(rectangleCount);
+	waterSnapshot.diffuse = static_cast<unsigned>(diffuse);
+	waterSnapshot.featherAlpha = 0;
+	if (TheGlobalData->m_featherWater == 5) waterSnapshot.featherAlpha = 80;
+	if (TheGlobalData->m_featherWater == 4) waterSnapshot.featherAlpha = 110;
+	if (TheGlobalData->m_featherWater == 3) waterSnapshot.featherAlpha = 140;
+	if (TheGlobalData->m_featherWater == 2) waterSnapshot.featherAlpha = 200;
+	if (TheGlobalData->m_featherWater == 1) waterSnapshot.featherAlpha = 255;
+	waterSnapshot.wavy = TheGlobalData->m_featherWater != 0;
+	waterSnapshot.waterFactor = waterFactor;
+	waterSnapshot.bumpSize = BUMP_SIZE;
+	waterSnapshot.phaseBase = 25*m_riverVOrigin;
+	waterSnapshot.mapCoeff = PI/(4*MAP_XY_FACTOR);
+	waterSnapshot.amplitude = 0.5f;
+	waterSnapshot.wobbleU = 0.02*cos(11*m_riverVOrigin);
+	waterSnapshot.wobbleV = 0.02*cos(5*m_riverVOrigin);
+	waterSnapshot.wavyWobbleU = 0.02*cos(11*m_riverVOrigin);
+	waterSnapshot.wavyWobbleV = 0.02*cos(5*m_riverVOrigin);
+	waterSnapshot.flatUScale = 1.0f/waterFactor;
+	waterSnapshot.flatVScale = 1.0f/waterFactor;
+	waterSnapshot.flatPhaseBase = 25*m_riverVOrigin;
+	waterSnapshot.flatMapCoeff = PI/(4*MAP_XY_FACTOR);
+	waterSnapshot.flatRowScale = 1.0f/(Real)(vCount-1);
+	waterSnapshot.flatColumnScale = 1.0f/(Real)(uCount-1);
+	waterSnapshot.flatSinScale = static_cast<Real>(SIN_TABLE_SIZE) /
+		(2.0f * WWMATH_PI);
+	s_waterTrapezoidScratch.captureSinTable(&_FastSinTable[0]);
+	waterSnapshot.flatSinTable = s_waterTrapezoidScratch.sinTable();
+	waterParallelPrepared = prepareWaterTrapezoidParallel(
+		waterSnapshot, s_waterTrapezoidScratch, waterParallelAttempted);
+	if (waterParallelAttempted && !waterParallelPrepared)
+		rts::JobSystem::instance().recordSerialFallback();
+#endif
 
 //#define WAVY_WATER
 //#define FEATHER_LAYER_COUNT (3) //LORENZEN
 //#define FEATHER_LAYER_THICKNESS (2.5f)
 //#define FEATHER_WATER
 
+#if defined(RTS_WATER_POLYGON_MODERN)
+if (waterParallelPrepared)
+{
+	typedef char WaterPolygonVertexLayoutMustMatch[
+		sizeof(WaterPolygonVertex) == sizeof(VertexFormatXYZNDUV2) ? 1 : -1];
+	{
+		DynamicIBAccessClass::WriteLockClass lockib(&ib_access);
+		UnsignedShort *curIb = lockib.Get_Index_Array();
+		memcpy(curIb, s_waterTrapezoidScratch.indices(),
+			static_cast<size_t>(rectangleCount) * 6 * sizeof(UnsignedShort));
+	}
+	{
+		DynamicVBAccessClass::WriteLockClass lock(&vb_access);
+		VertexFormatXYZNDUV2 *vb = lock.Get_Formatted_Vertex_Array();
+		memcpy(vb, s_waterTrapezoidScratch.vertices(),
+			static_cast<size_t>(uCount) * vCount * sizeof(VertexFormatXYZNDUV2));
+	}
+}
+else
+#endif
+{
+	//allocate 2 triangles per side with 3 indices per triangle
+	{
+	DynamicIBAccessClass::WriteLockClass lockib(&ib_access);
+	UnsignedShort *curIb = lockib.Get_Index_Array();
+	for (j=0; j<vCount-1; j++)
+	{	for (i=0; i<uCount-1; i++)
+		{
+			//triangle 1
+			curIb[0] = (j)*uCount + i;
+			curIb[1] = (j+1)*uCount + i+1;
+			curIb[2] = (j+1)*uCount + i;
+
+			//triangle 2
+			curIb[3] = (j)*uCount + i;
+			curIb[4] = (j)*uCount + i+1;
+			curIb[5] = (j+1)*uCount + i+1;
+
+			curIb += 6;	//skip the 6 indices we just added.
+		}
+	}
+	}
 //#ifdef WAVY_WATER // the NEW WATER a'la LORENZEN
 	if ( TheGlobalData->m_featherWater )
 	{
@@ -3385,6 +3708,7 @@ void WaterRenderObjClass::drawTrapezoidWater(Vector3 points[4])
 				vb++;
 			}
 		}
+	}
 	}
 
 //#endif // OLD VS NEW WATER

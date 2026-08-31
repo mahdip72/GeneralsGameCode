@@ -97,6 +97,13 @@ static void drawFramerateBar();
 #include "WW3D2/render2dsentence.h"
 #include "WW3D2/sortingrenderer.h"
 #include "WW3D2/textureloader.h"
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
+#define RTS_ASYNC_MODEL_PRELOAD 1
+#include "Lib/ModelAssetBytes.h"
+#include "Lib/PipelineExecutionPolicy.h"
+#include "WWLib/RAMFILE.h"
+#include <memory>
+#endif
 #include "WW3D2/dx8webbrowser.h"
 #include "WW3D2/mesh.h"
 #include "WW3D2/hlod.h"
@@ -113,6 +120,31 @@ static void drawFramerateBar();
 #endif
 
 #include "WinMain.h"
+
+#if RTS_ASYNC_MODEL_PRELOAD
+class W3DModelPreloadState
+{
+public:
+	struct Request
+	{
+		AsciiString model;
+		rts::ResourceIoTicket ticket;
+	};
+	W3DModelPreloadState() : count(0) {}
+	Request requests[rts::ModelAssetReadQueue::MAXIMUM_REQUESTS];
+	unsigned count;
+};
+
+class ModelPreloadRAMFile : public RAMFileClass
+{
+public:
+	ModelPreloadRAMFile(rts::ModelAssetBytes &bytes, const char *name)
+		: RAMFileClass(bytes.data(), static_cast<int>(bytes.size())), m_name(name) {}
+	virtual const char *File_Name() const override { return m_name; }
+private:
+	const char *m_name;
+};
+#endif
 
 
 // DEFINE AND ENUMS ///////////////////////////////////////////////////////////
@@ -338,6 +370,7 @@ inline Int64 getPerformanceCounterFrequency()
 W3DDisplay::W3DDisplay()
 {
 	Int i;
+	m_modelPreloadState = nullptr;
 
 	m_initialized = false;
 	m_assetManager = nullptr;
@@ -375,6 +408,7 @@ W3DDisplay::W3DDisplay()
 //=============================================================================
 W3DDisplay::~W3DDisplay()
 {
+	cancelModelPreloads();
 	ASSERT_GAME_THREAD("W3DDisplay::~W3DDisplay radar preparation");
 	// Display's base destructor runs after WW3D shutdown. Release the movie
 	// buffer here while its texture backend is still loaded.
@@ -1000,6 +1034,7 @@ void W3DDisplay::init()
 //=============================================================================
 void W3DDisplay::reset()
 {
+	cancelModelPreloads();
 
 	Display::reset();
 
@@ -3169,6 +3204,74 @@ void W3DDisplay::dumpModelAssets(const char *path)
 //-------------------------------------------------------------------------------------------------
 /** Preload using the W3D asset manager the model referenced by the string parameter */
 //-------------------------------------------------------------------------------------------------
+void W3DDisplay::beginModelPreload()
+{
+#if RTS_ASYNC_MODEL_PRELOAD
+	ASSERT_GAME_THREAD("W3DDisplay::beginModelPreload");
+	endModelPreload();
+	if (!m_assetManager || TheGlobalData->m_headless || !rts::UseParallelPipelines()) return;
+	// The filename wrapper owns these diagnostic side effects. Preserve it
+	// unchanged when a preload report or detailed load timing is requested.
+#if !defined(DUMP_PERF_STATS)
+#if defined(RTS_DEBUG)
+	if (TheGlobalData->m_preloadReport) return;
+#endif
+	try { m_modelPreloadState = new W3DModelPreloadState; }
+	catch (...) { m_modelPreloadState = nullptr; }
+#endif
+#endif
+}
+
+void W3DDisplay::flushModelPreloads()
+{
+#if RTS_ASYNC_MODEL_PRELOAD
+	ASSERT_GAME_THREAD("W3DDisplay::flushModelPreloads");
+	if (!m_modelPreloadState) return;
+	for (unsigned i = 0; i < m_modelPreloadState->count; ++i)
+	{
+		const W3DModelPreloadState::Request &request = m_modelPreloadState->requests[i];
+		bool succeeded, cancelled;
+		std::unique_ptr<rts::ModelAssetBytes> bytes(
+			TextureLoader::Complete_Model_Read(request.ticket, succeeded, cancelled));
+		// A dependency may have loaded this prototype synchronously while an
+		// earlier model was adopted. Keep the original filename-wrapper guard.
+		if (cancelled || !m_assetManager || m_assetManager->Find_Prototype(request.model.str()))
+			continue;
+		AsciiString filename;
+		filename.format("%s.w3d", request.model.str());
+		bool loaded = false;
+		if (succeeded && bytes.get())
+		{
+			ModelPreloadRAMFile file(*bytes, filename.str());
+			loaded = m_assetManager->WW3DAssetManager::Load_3D_Assets(file);
+		}
+		if (!loaded) m_assetManager->Load_3D_Assets(filename.str());
+	}
+	m_modelPreloadState->count = 0;
+#endif
+}
+
+void W3DDisplay::endModelPreload()
+{
+#if RTS_ASYNC_MODEL_PRELOAD
+	flushModelPreloads();
+	delete m_modelPreloadState;
+	m_modelPreloadState = nullptr;
+#endif
+}
+
+void W3DDisplay::cancelModelPreloads()
+{
+#if RTS_ASYNC_MODEL_PRELOAD
+	if (!m_modelPreloadState) return;
+	ASSERT_GAME_THREAD("W3DDisplay::cancelModelPreloads");
+	for (unsigned i = 0; i < m_modelPreloadState->count; ++i)
+		TextureLoader::Cancel_Model_Read(m_modelPreloadState->requests[i].ticket);
+	delete m_modelPreloadState;
+	m_modelPreloadState = nullptr;
+#endif
+}
+
 void W3DDisplay::preloadModelAssets( AsciiString model )
 {
 
@@ -3177,6 +3280,27 @@ void W3DDisplay::preloadModelAssets( AsciiString model )
 		AsciiString nameWithExtension;
 
 		nameWithExtension.format( "%s.w3d", model.str() );
+#if RTS_ASYNC_MODEL_PRELOAD
+		if (m_modelPreloadState)
+		{
+			if (m_assetManager->Find_Prototype(model.str())) return;
+			if (m_modelPreloadState->count == rts::ModelAssetReadQueue::MAXIMUM_REQUESTS)
+				flushModelPreloads();
+			W3DModelPreloadState::Request &request =
+				m_modelPreloadState->requests[m_modelPreloadState->count];
+			request.model = model;
+			// Oversized/custom sources retain the ordinary synchronous behavior.
+			if (nameWithExtension.getLength() < 512 &&
+				TextureLoader::Request_Model_Read(nameWithExtension.str(), request.ticket))
+			{
+				++m_modelPreloadState->count;
+				return;
+			}
+			// Admission is nonblocking. Retire older models before the serial
+			// fallback so prototype publication still follows request order.
+			flushModelPreloads();
+		}
+#endif
 		m_assetManager->Load_3D_Assets( nameWithExtension.str() );
 
 	}

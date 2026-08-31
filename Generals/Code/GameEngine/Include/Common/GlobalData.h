@@ -65,14 +65,32 @@ public:
 		, m_hasParsedCommandLineForEngineInit(false)
 		, m_hasSkirmishAITestRequest(false)
 		, m_skirmishAITestSeed(0)
+		, m_hasSkirmishAITest4v2Request(false)
+		, m_skirmishAITest4v2Seed(0)
 	{}
 
 	Bool hasSkirmishAITestRequest() const { return m_hasSkirmishAITestRequest; }
 	Int getSkirmishAITestSeed() const { return m_skirmishAITestSeed; }
-	void requestSkirmishAITest(Int seed)
+	Bool requestSkirmishAITest(Int seed)
 	{
+		if (m_hasSkirmishAITestRequest || m_hasSkirmishAITest4v2Request)
+			return false;
+
 		m_hasSkirmishAITestRequest = true;
 		m_skirmishAITestSeed = seed;
+		return true;
+	}
+
+	Bool hasSkirmishAITest4v2Request() const { return m_hasSkirmishAITest4v2Request; }
+	Int getSkirmishAITest4v2Seed() const { return m_skirmishAITest4v2Seed; }
+	Bool requestSkirmishAITest4v2(Int seed)
+	{
+		if (m_hasSkirmishAITestRequest || m_hasSkirmishAITest4v2Request)
+			return false;
+
+		m_hasSkirmishAITest4v2Request = true;
+		m_skirmishAITest4v2Seed = seed;
+		return true;
 	}
 
 private:
@@ -80,6 +98,8 @@ private:
 	Bool m_hasParsedCommandLineForEngineInit;
 	Bool m_hasSkirmishAITestRequest;
 	Int m_skirmishAITestSeed;
+	Bool m_hasSkirmishAITest4v2Request;
+	Int m_skirmishAITest4v2Seed;
 };
 
 //-------------------------------------------------------------------------------------------------

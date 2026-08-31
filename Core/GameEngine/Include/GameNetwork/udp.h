@@ -62,7 +62,11 @@ class UDP
 {
  // DATA
  private:
+#if defined(_WIN64)
+  SOCKET    fd;
+#else
   Int       fd;
+#endif
   UnsignedInt       myIP;
   UnsignedShort       myPort;
   struct       sockaddr_in  addr;
@@ -111,7 +115,11 @@ class UDP
   //int              Wait(Int sec,Int usec,fd_set &givenSet,fd_set &returnSet);
 
   Int             getLocalAddr(UnsignedInt &ip, UnsignedShort &port);
+#if defined(_WIN64)
+  SOCKET        getFD() { return(fd); }
+#else
   Int           getFD() { return(fd); }
+#endif
 
   Int             SetInputBuffer(UnsignedInt bytes);
   Int             SetOutputBuffer(UnsignedInt bytes);

@@ -320,6 +320,46 @@ DX8Wrapper *wrapper;
     $strictClean = Invoke-Audit $fixtureRoot $baseline -StrictD3D8Boundary
     Assert-Fixture ($strictClean.ExitCode -eq 0) 'strict boundary must pass when only explicit migration files retain D3D8'
 
+    # The device-free renderer contract target deliberately extracts and
+    # declares raw-D3D8-shaped doubles.  Permit only its exact intermediate
+    # fixture paths; neighboring test files and product-runtime files must
+    # continue to fail the ordinary ratchet and the strict product gate.
+    Set-FixtureFile $fixtureRoot 'Core/Tools/RendererContractTest/CMakeLists.txt' @'
+add_executable(renderer_contract_fixture)
+set(LEGACY_SURFACE "IDirect3DSurface8")
+'@
+    Set-FixtureFile $fixtureRoot 'Core/Tools/RendererContractTest/LegacyAsyncBridgeCompletionTest.cpp' @'
+struct IDirect3DSurface8 {};
+IDirect3DTexture8 *texture;
+'@
+    Set-FixtureFile $fixtureRoot 'Core/Tools/RendererContractTest/NeighborFixture.cpp' @'
+IDirect3DSurface8 *neighbor;
+'@
+    Set-FixtureFile $fixtureRoot 'Core/GameEngine/RendererContractTestFixture.cpp' @'
+IDirect3DTexture8 *product;
+'@
+    $boundaryFailure = Invoke-Audit $fixtureRoot $baseline
+    Assert-Fixture ($boundaryFailure.ExitCode -ne 0) 'unapproved neighboring and product raw-D3D8 fixtures must fail the intermediate ratchet'
+    Assert-Fixture ($boundaryFailure.Output -match 'NeighborFixture\.cpp.*raw-d3d8-surface-area') 'a neighboring test path must remain rejected'
+    Assert-Fixture ($boundaryFailure.Output -match 'Core/GameEngine/RendererContractTestFixture\.cpp.*raw-d3d8-surface-area') 'a product-runtime path must remain rejected'
+    Assert-Fixture ($boundaryFailure.Output -notmatch 'RendererContractTest/CMakeLists\.txt.*raw-d3d8-surface-area') 'the exact renderer CMake fixture exemption must apply'
+    Assert-Fixture ($boundaryFailure.Output -notmatch 'LegacyAsyncBridgeCompletionTest\.cpp.*raw-d3d8-surface-area') 'the exact async bridge fixture exemption must apply'
+
+    $strictBoundaryFailure = Invoke-Audit $fixtureRoot $baseline -StrictD3D8Boundary
+    Assert-Fixture ($strictBoundaryFailure.ExitCode -ne 0) 'strict product gate must still reject the product fixture'
+    Assert-Fixture ($strictBoundaryFailure.Output -match 'RendererContractTestFixture\.cpp:1: d3d8-interface') 'strict product gate must report the product fixture'
+    Assert-Fixture ($strictBoundaryFailure.Output -notmatch 'LegacyAsyncBridgeCompletionTest\.cpp.*d3d8-interface') 'strict product gate must not scan the device-free test fixture'
+
+    Remove-Item -LiteralPath (Join-Path $fixtureRoot 'Core/Tools/RendererContractTest/NeighborFixture.cpp') -Force
+    Remove-Item -LiteralPath (Join-Path $fixtureRoot 'Core/GameEngine/RendererContractTestFixture.cpp') -Force
+    $boundaryClean = Invoke-Audit $fixtureRoot $baseline
+    Assert-Fixture ($boundaryClean.ExitCode -eq 0) 'the exact temporary renderer fixture paths must pass after neighboring violations are removed'
+    $strictBoundaryClean = Invoke-Audit $fixtureRoot $baseline -StrictD3D8Boundary
+    Assert-Fixture ($strictBoundaryClean.ExitCode -eq 0) 'strict product gate must remain clean with only the exact test fixtures'
+
+    Remove-Item -LiteralPath (Join-Path $fixtureRoot 'Core/Tools/RendererContractTest/CMakeLists.txt') -Force
+    Remove-Item -LiteralPath (Join-Path $fixtureRoot 'Core/Tools/RendererContractTest/LegacyAsyncBridgeCompletionTest.cpp') -Force
+
     $tree = (@(Invoke-FixtureGit $fixtureRoot @('rev-parse', 'HEAD^{tree}'))[0]).Trim()
     $nonAncestor = (@(Invoke-FixtureGit $fixtureRoot @('commit-tree', $tree, '-m', 'unrelated baseline'))[0]).Trim()
     $ancestry = Invoke-Audit $fixtureRoot $nonAncestor

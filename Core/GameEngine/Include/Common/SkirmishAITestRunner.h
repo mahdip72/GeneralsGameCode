@@ -21,6 +21,12 @@ enum
 	SKIRMISH_AI_TEST_MAX_SHUTDOWN_MILLISECONDS = 30000
 };
 
+enum SkirmishAITestScenario
+{
+	SKIRMISH_AI_TEST_SCENARIO_4V3,
+	SKIRMISH_AI_TEST_SCENARIO_4V2
+};
+
 enum SkirmishAITestProgress
 {
 	SKIRMISH_AI_TEST_RUNNING,
@@ -57,6 +63,8 @@ struct SkirmishAITestLoadedState
 Bool TryParseSkirmishAITestSeed(const char *text, Int *seed);
 Bool ShouldBypassFramePacingForSkirmishAITest(Bool runnerArmed);
 void BuildSkirmishAITestPlan(Int seed, SkirmishAITestPlan *plan);
+void BuildSkirmishAITestPlan(Int seed, SkirmishAITestScenario scenario,
+	SkirmishAITestPlan *plan);
 Bool IsExpectedSkirmishAITestLoadedState(const SkirmishAITestPlan &plan,
 	UnsignedInt expectedMapCRC, UnsignedInt expectedMapSize,
 	const SkirmishAITestLoadedState *loadedState);
@@ -68,7 +76,8 @@ Bool IsSkirmishAITestStartupTimedOut(UnsignedInt elapsedMilliseconds);
 Bool IsSkirmishAITestProgressStalled(UnsignedInt elapsedMilliseconds);
 Bool IsSkirmishAITestShutdownTimedOut(UnsignedInt elapsedMilliseconds);
 
-void ArmSkirmishAITestRunner(Int seed);
+void ArmSkirmishAITestRunner(Int seed,
+	SkirmishAITestScenario scenario = SKIRMISH_AI_TEST_SCENARIO_4V3);
 Bool IsSkirmishAITestRunnerArmed();
 Bool StartSkirmishAITestRunner();
 void UpdateSkirmishAITestRunner();

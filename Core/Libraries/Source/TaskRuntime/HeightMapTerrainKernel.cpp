@@ -331,7 +331,8 @@ static bool heightMapTerrainCheckedAdd(unsigned left, unsigned right,
 
 static bool heightMapTerrainValidate(
 	const HeightMapTerrainSnapshot &snapshot,
-	const HeightMapTerrainVertex *output, unsigned yBegin, unsigned yEnd)
+	const HeightMapTerrainVertex *output, unsigned yBegin, unsigned yEnd,
+	bool fullInput = true)
 {
 	unsigned requiredCellCount;
 	unsigned requiredCellRowBytes;
@@ -497,7 +498,8 @@ static bool heightMapTerrainValidate(
 		return false;
 	}
 
-	for (row = 0; row < snapshot.height; ++row)
+	for (row = fullInput ? 0 : yBegin;
+		row < (fullInput ? snapshot.height : yEnd); ++row)
 	{
 		const unsigned char *cellRow =
 			reinterpret_cast<const unsigned char *>(snapshot.cells) +
@@ -821,9 +823,22 @@ static void heightMapTerrainPrepareCell(
 bool PrepareHeightMapTerrainRows(const HeightMapTerrainSnapshot &snapshot,
 	HeightMapTerrainVertex *output, unsigned yBegin, unsigned yEnd)
 {
-	unsigned row;
-
 	if (!heightMapTerrainValidate(snapshot, output, yBegin, yEnd))
+		return false;
+	return PrepareValidatedHeightMapTerrainRows(snapshot, output, yBegin, yEnd);
+}
+
+bool ValidateHeightMapTerrainInput(const HeightMapTerrainSnapshot &snapshot,
+	const HeightMapTerrainVertex *output)
+{
+	return heightMapTerrainValidate(snapshot, output, 0, snapshot.height);
+}
+
+bool PrepareValidatedHeightMapTerrainRows(const HeightMapTerrainSnapshot &snapshot,
+	HeightMapTerrainVertex *output, unsigned yBegin, unsigned yEnd)
+{
+	unsigned row;
+	if (!heightMapTerrainValidate(snapshot, output, yBegin, yEnd, false))
 	{
 		return false;
 	}

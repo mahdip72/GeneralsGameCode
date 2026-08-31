@@ -2,15 +2,26 @@ add_library(core_task_runtime STATIC)
 
 target_sources(core_task_runtime PRIVATE
     TaskRuntime.cpp
+    PipelineExecutionPolicy.cpp
     RadarTerrainKernel.cpp
     RadarOverlayKernel.cpp
     HeightMapTerrainKernel.cpp
     HeightMapDynamicLightKernel.cpp
+    ParallelVisibility.cpp
+    ParallelSkinning.cpp
+    ParticleRenderKernel.cpp
+    WaterMeshKernel.cpp
+    ProjectedTerrainGridKernel.cpp
+    WaterPolygonKernel.cpp
+    SortingTriangleKernel.cpp
+    GeometryTriangleDecode.cpp
 )
 
 if(NOT IS_VS6_BUILD)
     target_sources(core_task_runtime PRIVATE
         JobSystem.cpp
+        ResourceIoPipeline.cpp
+        ModelAssetBytes.cpp
     )
 endif()
 
@@ -18,6 +29,9 @@ if(IS_VS6_BUILD)
     target_sources(core_task_runtime PRIVATE
         JobSystemLegacy.cpp
     )
+    # VC6's native STL and the product's STLport emit incompatible std::vector
+    # implementations. Keep the runtime and every consumer on the same ABI.
+    target_link_libraries(core_task_runtime PUBLIC stlport)
 endif()
 
 target_include_directories(core_task_runtime PUBLIC

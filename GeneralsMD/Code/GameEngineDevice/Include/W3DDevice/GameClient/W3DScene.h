@@ -40,6 +40,7 @@
 #include "WW3D2/rinfo.h"
 #include "WW3D2/coltest.h"
 #include "WW3D2/lightenvironment.h"
+#include "Lib/ParallelVisibility.h"
 
 ///////////////////////////////////////////////////////////////////////////////
 // PROTOTYPES /////////////////////////////////////////////////////////////////
@@ -70,6 +71,7 @@ public:
 	/// customizable renderer for the RTS3DScene
 	virtual void	Customized_Render( RenderInfoClass &rinfo ) override;
 	virtual void	Visibility_Check(CameraClass * camera) override;
+	const rts::ParallelVisibilityMetrics &getVisibilityPrepareMetrics() const { return m_visibilityWorkspace.metrics(); }
 	virtual void  Render(RenderInfoClass & rinfo) override;
 
 	void setCustomPassMode (CustomScenePassModes mode) {m_customPassMode = mode;}
@@ -100,6 +102,7 @@ public:
 
 protected:
 	void renderOneObject(RenderInfoClass &rinfo, RenderObjClass *robj, Int localPlayerIndex);
+	Bool prepareVisibility(CameraClass *camera);
 	void updateFixedLightEnvironments(RenderInfoClass & rinfo);
 	void flushTranslucentObjects(RenderInfoClass & rinfo);
 	void flushOccludedObjects(RenderInfoClass & rinfo);
@@ -136,6 +139,7 @@ protected:
 	Int m_numPotentialOccludees;
 	Int m_numNonOccluderOrOccludee;
 
+	rts::ParallelVisibilityWorkspace m_visibilityWorkspace;
 	CameraClass *m_camera;
 };
 

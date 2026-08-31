@@ -17,6 +17,7 @@ enum Phase
 
 #if defined(_WIN64)
 #include <windows.h>
+#include <atomic>
 #include <stdio.h>
 #include <string.h>
 
@@ -72,7 +73,7 @@ public:
 		flush();
 		++m_session;
 		m_mode = mode != NULL && mode[0] == 'h' ? "headless" : "interactive";
-		m_owner = GetCurrentThreadId();
+		m_owner.store(GetCurrentThreadId(), std::memory_order_release);
 	}
 
 	void endSession()
@@ -85,7 +86,8 @@ public:
 
 	void beginFrame(unsigned int frame)
 	{
-		if (!m_file || m_owner != GetCurrentThreadId())
+		const DWORD owner = m_owner.load(std::memory_order_acquire);
+		if (owner != GetCurrentThreadId() || !m_file)
 			return;
 		m_frameStart = clock();
 		if (!m_bucketStart)
@@ -115,7 +117,10 @@ public:
 
 	bool isActive() const
 	{
-		return m_file != NULL && m_active && m_owner == GetCurrentThreadId();
+		const DWORD owner = m_owner.load(std::memory_order_acquire);
+		if (owner != GetCurrentThreadId())
+			return false;
+		return m_file != NULL && m_active;
 	}
 
 	static __int64 clock()
@@ -210,7 +215,7 @@ private:
 	}
 
 	FILE* m_file;
-	DWORD m_owner;
+	std::atomic<DWORD> m_owner;
 	__int64 m_frequency;
 	bool m_active;
 	__int64 m_frameStart, m_bucketStart;
@@ -225,6 +230,8 @@ class Scope
 {
 public:
 	explicit Scope(Phase phase) : m_capture(Capture::instance()), m_phase(phase),
+		m_start(m_capture.isActive() ? Capture::clock() : 0) {}
+	Scope(Capture& capture, Phase phase) : m_capture(capture), m_phase(phase),
 		m_start(m_capture.isActive() ? Capture::clock() : 0) {}
 	~Scope() { if (m_start) m_capture.add(m_phase, Capture::clock() - m_start); }
 private:

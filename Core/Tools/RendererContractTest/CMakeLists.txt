@@ -1,6 +1,8 @@
 add_executable(core_renderer_contract_tests
     RendererContractTest.cpp
     LegacyResetResourceTest.cpp
+    LegacyAsyncFramePolicyTest.cpp
+    LegacyAsyncBridgeCompletionTest.cpp
 )
 
 # Compile the actual reset/publication methods against device-free doubles so
@@ -23,6 +25,12 @@ function(renderer_reset_source_fragment output source start_marker end_marker)
     set(${output} "${fragment}" PARENT_SCOPE)
 endfunction()
 
+renderer_reset_source_fragment(async_service_methods
+    Core/Libraries/Source/WWVegas/WW3D2/d3d11legacybridge.cpp
+    "\tvoid Service_Render_Completions()" "\n\tRenderResult End_Threaded_Frame(")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/LegacyAsyncServiceMethods.inc"
+    "${async_service_methods}\n")
+
 renderer_reset_source_fragment(reset_methods
     Core/Libraries/Source/WWVegas/WW3D2/dx8wrapper.cpp
     "bool DX8Wrapper::Reset_Device(" "void DX8Wrapper::Release_Device()")
@@ -40,6 +48,25 @@ renderer_reset_source_fragment(texture_apply
     "void TextureClass::Apply_New_Surface\n" "void TextureClass::Apply(unsigned int stage)")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/LegacyResetMethods.inc"
     "${reset_methods}\n${buffer_methods}\n${texture_release}\n${texture_set}\n${texture_apply}\n")
+
+# Exercise the real scene acceptance and HRESULT mapping, including queued
+# native frames, without starting a game or requiring a graphics device.
+renderer_reset_source_fragment(frame_result_mapping
+    Core/Libraries/Source/WWVegas/WW3D2/dx8wrapper.cpp
+    "HRESULT Render_Result_To_HRESULT(" "bool Record_Unavailable_Visible_Submission(")
+renderer_reset_source_fragment(end_scene_method
+    Core/Libraries/Source/WWVegas/WW3D2/dx8wrapper.cpp
+    "void DX8Wrapper::End_Scene(bool flip_frames)" "void DX8Wrapper::Flip_To_Primary()")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/LegacyAsyncFrameMethods.inc"
+    "${frame_result_mapping}\n${end_scene_method}\n")
+
+# Exercise completion-time target retention and cache rebinding using the
+# production bridge methods, independently of a real graphics device.
+renderer_reset_source_fragment(async_target_methods
+    Core/Libraries/Source/WWVegas/WW3D2/d3d11legacybridge.cpp
+    "\tIDirect3DSurface8 *Retain_Target_Surface(" "\n\tvoid Service_Render_Completions()")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/LegacyAsyncTargetMethods.inc"
+    "${async_target_methods}\n")
 
 target_link_libraries(core_renderer_contract_tests PRIVATE
     core_renderer

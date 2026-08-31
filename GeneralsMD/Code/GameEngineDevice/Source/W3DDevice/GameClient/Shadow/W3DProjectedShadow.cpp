@@ -57,6 +57,16 @@
 #include "GameClient/Drawable.h"
 #include "W3DDevice/GameClient/Module/W3DModelDraw.h"
 #include "W3DDevice/GameClient/W3DShadow.h"
+#include "W3DDevice/Common/RadarTerrainPrepare.h"
+#include "Lib/ProjectedTerrainGridKernel.h"
+#include "Lib/PipelineExecutionPolicy.h"
+
+#include <string.h>
+#include "W3DDevice/Common/RadarTerrainPrepare.h"
+#include "Lib/ProjectedTerrainGridKernel.h"
+#include "Lib/PipelineExecutionPolicy.h"
+
+#include <string.h>
 
 
 /** @todo: We're going to have a pool of a couple rendertargets to use
@@ -203,6 +213,125 @@ public:
 	W3DShadowTextureManagerIterator( W3DShadowTextureManager & manager ) : HashTableIteratorClass( *manager.texturePtrTable ) {}
 	W3DShadowTexture * getCurrentTexture() { 	return (W3DShadowTexture *)Get_Current();}
 };
+
+namespace
+{
+
+const unsigned PROJECTED_TERRAIN_SHADOW_CONSUMER = 8;
+const unsigned PROJECTED_TERRAIN_DECAL_CONSUMER = 9;
+ProjectedTerrainGridScratch s_projectedTerrainGridScratch;
+
+class ProjectedTerrainGridRowWork : public RadarPrepareRowWork
+{
+public:
+	ProjectedTerrainGridRowWork(
+		const ProjectedTerrainGridSnapshot &snapshot,
+		ProjectedTerrainGridVertex *vertices, UnsignedShort *indices)
+		: m_snapshot(snapshot), m_vertices(vertices), m_indices(indices)
+	{
+	}
+
+	virtual unsigned minimumRowsPerTask() const
+	{
+		if (m_snapshot.cellWidth == 0)
+			return 1;
+		return (PROJECTED_TERRAIN_GRID_MIN_PARALLEL_CELLS +
+			m_snapshot.cellWidth - 1) / m_snapshot.cellWidth;
+	}
+
+	virtual bool executeRows(unsigned rowBegin, unsigned rowEnd)
+	{
+		return PrepareProjectedTerrainGridRows(m_snapshot, m_vertices,
+			m_indices, rowBegin, rowEnd);
+	}
+
+private:
+	ProjectedTerrainGridRowWork(const ProjectedTerrainGridRowWork &);
+	ProjectedTerrainGridRowWork &operator=(const ProjectedTerrainGridRowWork &);
+
+	ProjectedTerrainGridSnapshot m_snapshot;
+	ProjectedTerrainGridVertex *m_vertices;
+	UnsignedShort *m_indices;
+};
+
+bool RunProjectedTerrainGridParallel(
+	const ProjectedTerrainGridSnapshot &snapshot,
+	ProjectedTerrainGridScratch &scratch, unsigned consumer)
+{
+	unsigned cellCount;
+	RadarTerrainPrepareService &service = GetRadarTerrainPrepareService();
+	bool ranParallel = false;
+	if (!rts::UseParallelPipelines() || snapshot.cellWidth == 0 ||
+		snapshot.cellHeight == 0 ||
+		snapshot.cellWidth > static_cast<unsigned>(-1) /
+			snapshot.cellHeight)
+		return false;
+	cellCount = snapshot.cellWidth * snapshot.cellHeight;
+	if (cellCount < PROJECTED_TERRAIN_GRID_MIN_PARALLEL_CELLS ||
+		!scratch.isAllocated() ||
+		!ValidateProjectedTerrainGridInput(snapshot, scratch.vertices(),
+			scratch.indices()))
+		return false;
+
+	if (!service.tryAcquire(consumer))
+		return false;
+	ProjectedTerrainGridRowWork work(snapshot, scratch.vertices(),
+		scratch.indices());
+	const bool completed = service.runRows(work, 0, snapshot.height,
+		&ranParallel);
+	service.release(consumer);
+	return completed && ValidatePreparedProjectedTerrainGridOutput(snapshot,
+		scratch.vertices(), scratch.indices());
+}
+
+bool CaptureProjectedTerrainGrid(
+	WorldHeightMap *hmap, ProjectedTerrainGridSnapshot *snapshot,
+	ProjectedTerrainGridScratch &scratch, Bool useAlphaFlip)
+{
+	unsigned row;
+	unsigned column;
+	float unusedU[4];
+	float unusedV[4];
+	UnsignedByte unusedAlpha[4];
+
+	if (hmap == 0 || snapshot == 0 || snapshot->width == 0 ||
+		snapshot->height == 0 || snapshot->cellWidth != snapshot->width - 1 ||
+		snapshot->cellHeight != snapshot->height - 1 ||
+		!scratch.ensure(snapshot->width, snapshot->height))
+		return false;
+
+	snapshot->heights = scratch.heights();
+	snapshot->flips = scratch.flips();
+	for (row = 0; row < snapshot->height; ++row)
+	{
+		for (column = 0; column < snapshot->width; ++column)
+		{
+			const Int mapX = snapshot->firstMapX + static_cast<Int>(column);
+			const Int mapY = snapshot->firstMapY + static_cast<Int>(row);
+			scratch.heights()[row * snapshot->width + column] =
+				static_cast<Real>(hmap->getHeight(mapX, mapY));
+		}
+	}
+	for (row = 0; row < snapshot->cellHeight; ++row)
+	{
+		for (column = 0; column < snapshot->cellWidth; ++column)
+		{
+			const Int mapX = snapshot->firstMapX + static_cast<Int>(column);
+			const Int mapY = snapshot->firstMapY + static_cast<Int>(row);
+			Bool flip = FALSE;
+			if (useAlphaFlip)
+				hmap->getAlphaUVData(mapX, mapY, unusedU, unusedV,
+					unusedAlpha, &flip);
+			else
+				flip = hmap->getFlipState(mapX, mapY);
+			scratch.flips()[row * snapshot->cellWidth + column] =
+				flip ? 1 : 0;
+		}
+	}
+	return true;
+}
+
+} // namespace
 
 
 /******************** Start of W3DProjectedShadowManager implementation ***********************/
@@ -353,9 +482,225 @@ void W3DProjectedShadowManager::updateRenderTargetTextures()
 	}
 }
 
+Int W3DProjectedShadowManager::renderProjectedTerrainShadowParallel(
+	W3DProjectedShadow *shadow, AABoxClass &box)
+{
+	WorldHeightMap *hmap;
+	ProjectedTerrainGridSnapshot snapshot;
+	Int startX;
+	Int endX;
+	Int startY;
+	Int endY;
+	Int vertsPerRow;
+	Int vertsPerColumn;
+	Int numVerts;
+	Int numIndex;
+	unsigned cellCount;
+	unsigned row;
+	unsigned column;
+	Int result = -1;
+	const Real mapScaleInv = 1.0f / MAP_XY_FACTOR;
+
+	if (!rts::UseParallelPipelines() ||
+		!GetRadarTerrainPrepareService().isInitialized())
+		return result;
+	if (shadow == 0 || TheTerrainRenderObject == 0 ||
+		!DX8Wrapper::Is_Initted() || shadowVertexBufferD3D == 0 ||
+		shadowIndexBufferD3D == 0 || SHADOW_VERTEX_SIZE <= 0 ||
+		SHADOW_INDEX_SIZE <= 0)
+		return result;
+
+	hmap = TheTerrainRenderObject->getMap();
+	if (hmap == 0)
+		return result;
+
+	startX = REAL_TO_INT_FLOOR((box.Center.X - box.Extent.X) * mapScaleInv);
+	endX = REAL_TO_INT_CEIL((box.Center.X + box.Extent.X) * mapScaleInv);
+	startY = REAL_TO_INT_FLOOR((box.Center.Y - box.Extent.Y) * mapScaleInv);
+	endY = REAL_TO_INT_CEIL((box.Center.Y + box.Extent.Y) * mapScaleInv);
+	startX = __max(startX, 0);
+	endX = __min(endX, hmap->getXExtent() - 1);
+	startY = __max(startY, 0);
+	endY = __min(endY, hmap->getYExtent() - 1);
+
+	if (endX <= startX || endY <= startY)
+		return result;
+	vertsPerRow = endX - startX + 1;
+	vertsPerColumn = endY - startY + 1;
+	if (vertsPerRow <= 1 || vertsPerColumn <= 1)
+		return result;
+	if (vertsPerRow > SHADOW_VERTEX_SIZE ||
+		vertsPerColumn > SHADOW_VERTEX_SIZE ||
+		vertsPerRow > 65536 / vertsPerColumn)
+		return result;
+	numVerts = vertsPerRow * vertsPerColumn;
+	if (endX - startX > 65536 / (endY - startY) ||
+		(endX - startX) * (endY - startY) > SHADOW_INDEX_SIZE / 6)
+		return result;
+	numIndex = (endX - startX) * (endY - startY) * 6;
+	if (numVerts > SHADOW_VERTEX_SIZE || numIndex > SHADOW_INDEX_SIZE)
+		return result;
+	cellCount = static_cast<unsigned>(endX - startX) *
+		static_cast<unsigned>(endY - startY);
+	if (cellCount < PROJECTED_TERRAIN_GRID_MIN_PARALLEL_CELLS)
+		return result;
+
+	memset(&snapshot, 0, sizeof(snapshot));
+	snapshot.width = static_cast<unsigned>(vertsPerRow);
+	snapshot.height = static_cast<unsigned>(vertsPerColumn);
+	snapshot.cellWidth = static_cast<unsigned>(endX - startX);
+	snapshot.cellHeight = static_cast<unsigned>(endY - startY);
+	snapshot.kind = PROJECTED_TERRAIN_GRID_SHADOW;
+	snapshot.firstMapX = startX;
+	snapshot.firstMapY = startY;
+	snapshot.mapXYFactor = MAP_XY_FACTOR;
+	snapshot.mapHeightScale = MAP_HEIGHT_SCALE;
+	if (!CaptureProjectedTerrainGrid(hmap, &snapshot,
+		s_projectedTerrainGridScratch, TRUE) ||
+		!RunProjectedTerrainGridParallel(snapshot,
+			s_projectedTerrainGridScratch, PROJECTED_TERRAIN_SHADOW_CONSUMER))
+		return result;
+
+	{
+		struct SHADOW_VOLUME_VERTEX
+		{
+			float x;
+			float y;
+			float z;
+		};
+		SHADOW_VOLUME_VERTEX *pvVertices = 0;
+		UnsignedShort *pvIndices = 0;
+		SHADOW_VOLUME_VERTEX *vertexStart;
+		UnsignedShort *indexStart;
+		static Matrix4x4 mWorld(true);
+		if (nShadowVertsInBuf > (SHADOW_VERTEX_SIZE - numVerts))
+		{
+			if (shadowVertexBufferD3D->Lock(0,
+				numVerts * sizeof(SHADOW_VOLUME_VERTEX),
+				(unsigned char **)&pvVertices, D3DLOCK_DISCARD) != D3D_OK)
+				return 0;
+			nShadowVertsInBuf = 0;
+			nShadowStartBatchVertex = 0;
+		}
+		else
+		{
+			if (shadowVertexBufferD3D->Lock(
+				nShadowVertsInBuf * sizeof(SHADOW_VOLUME_VERTEX),
+				numVerts * sizeof(SHADOW_VOLUME_VERTEX),
+				(unsigned char **)&pvVertices, D3DLOCK_NOOVERWRITE) != D3D_OK)
+				return 0;
+		}
+		if (pvVertices == 0)
+		{
+			shadowVertexBufferD3D->Unlock();
+			return 0;
+		}
+		vertexStart = pvVertices;
+		for (row = 0; row < static_cast<unsigned>(vertsPerColumn); ++row)
+		{
+			for (column = 0; column < static_cast<unsigned>(vertsPerRow);
+				++column)
+			{
+				const ProjectedTerrainGridVertex &prepared =
+					s_projectedTerrainGridScratch.vertices()[
+						row * static_cast<unsigned>(vertsPerRow) + column];
+				pvVertices->x = prepared.x;
+				pvVertices->y = prepared.y;
+				pvVertices->z = prepared.z;
+				++pvVertices;
+			}
+		}
+		Publish_Render_Buffer_Change(shadowVertexBufferD3D,
+			rts::render::RENDER_BUFFER_VERTEX, vertexStart,
+			static_cast<size_t>(numVerts) * sizeof(SHADOW_VOLUME_VERTEX),
+			static_cast<size_t>(nShadowVertsInBuf) *
+				sizeof(SHADOW_VOLUME_VERTEX),
+			nShadowVertsInBuf == 0 ?
+				rts::render::RENDER_BUFFER_UPDATE_DISCARD :
+				rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE);
+		shadowVertexBufferD3D->Unlock();
+
+		if (nShadowIndicesInBuf > (SHADOW_INDEX_SIZE - numIndex))
+		{
+			if (shadowIndexBufferD3D->Lock(0,
+				numIndex * sizeof(UnsignedShort),
+				(unsigned char **)&pvIndices, D3DLOCK_DISCARD) != D3D_OK)
+				return 0;
+			nShadowIndicesInBuf = 0;
+			nShadowStartBatchIndex = 0;
+		}
+		else
+		{
+			if (shadowIndexBufferD3D->Lock(
+				nShadowIndicesInBuf * sizeof(UnsignedShort),
+				numIndex * sizeof(UnsignedShort),
+				(unsigned char **)&pvIndices, D3DLOCK_NOOVERWRITE) != D3D_OK)
+				return 0;
+		}
+		if (pvIndices == 0)
+		{
+			shadowIndexBufferD3D->Unlock();
+			return 0;
+		}
+		indexStart = pvIndices;
+		memcpy(indexStart, s_projectedTerrainGridScratch.indices(),
+			static_cast<size_t>(numIndex) * sizeof(UnsignedShort));
+		Publish_Render_Buffer_Change(shadowIndexBufferD3D,
+			rts::render::RENDER_BUFFER_INDEX, indexStart,
+			static_cast<size_t>(numIndex) * sizeof(UnsignedShort),
+			static_cast<size_t>(nShadowIndicesInBuf) *
+				sizeof(UnsignedShort),
+			nShadowIndicesInBuf == 0 ?
+				rts::render::RENDER_BUFFER_UPDATE_DISCARD :
+				rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE);
+		shadowIndexBufferD3D->Unlock();
+
+		DX8Wrapper::Set_DX8_Index_Buffer(shadowIndexBufferD3D,
+			nShadowStartBatchVertex);
+		DX8Wrapper::_Set_DX8_Transform(D3DTS_WORLD,
+			*(_D3DMATRIX *)&mWorld);
+		DX8Wrapper::Set_DX8_Vertex_Buffer(shadowVertexBufferD3D,
+			sizeof(SHADOW_VOLUME_VERTEX), D3DFVF_XYZ);
+		DX8Wrapper::Set_Vertex_Shader(D3DFVF_XYZ);
+
+		const Int numPolys = (endX - startX) * (endY - startY) * 2;
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHATESTENABLE, TRUE);
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_STENCILENABLE, TRUE);
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_STENCILFUNC, D3DCMP_ALWAYS);
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_STENCILREF, 0x1);
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_STENCILMASK, 0xffffffff);
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_STENCILWRITEMASK, 0xffffffff);
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_STENCILZFAIL, D3DSTENCILOP_KEEP);
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_STENCILFAIL, D3DSTENCILOP_KEEP);
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_STENCILPASS, D3DSTENCILOP_INCR);
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_LIGHTING, FALSE);
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_SRCBLEND, D3DBLEND_DESTCOLOR);
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_DESTBLEND, D3DBLEND_ZERO);
+		if (DX8Wrapper::_Is_Triangle_Draw_Enabled())
+		{
+			Debug_Statistics::Record_DX8_Polys_And_Vertices(numPolys, numVerts,
+				ShaderClass::_PresetOpaqueShader);
+			DX8Wrapper::Draw_DX8_Indexed_Primitive(D3DPT_TRIANGLELIST, 0,
+				numVerts, nShadowStartBatchIndex, numPolys);
+		}
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHATESTENABLE, FALSE);
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_STENCILENABLE, FALSE);
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_LIGHTING, TRUE);
+		nShadowVertsInBuf += numVerts;
+		nShadowStartBatchVertex = nShadowVertsInBuf;
+		nShadowIndicesInBuf += numIndex;
+		nShadowStartBatchIndex = nShadowIndicesInBuf;
+	}
+	return 1;
+}
+
 ///Renders shadow on part of terrain covered by world-space bounding box.
 Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *shadow, AABoxClass &box)
 {
+	const Int parallelResult = renderProjectedTerrainShadowParallel(shadow, box);
+	if (parallelResult >= 0)
+		return parallelResult;
+
 	static	Matrix4x4 mWorld(true);	//initialize to identity matrix
 	struct SHADOW_VOLUME_VERTEX	//vertex structure passed to D3D
 	{
@@ -847,12 +1192,252 @@ void testShadowDecal()
 */
 
 #define BRIDGE_OFFSET_FACTOR 1.5f
+Int W3DProjectedShadowManager::queueDecalParallel(W3DProjectedShadow *shadow)
+{
+	WorldHeightMap *hmap;
+	RenderObjClass *robj;
+	Vector3 objPos;
+	Matrix3D objXform(1);
+	Vector3 uVector;
+	Vector3 vVector;
+	Real uOffset;
+	Real vOffset;
+	Real vecLength;
+	Real layerHeight = 0.0f;
+	Int borderSize;
+	Int startX;
+	Int endX;
+	Int startY;
+	Int endY;
+	Int vertsPerRow;
+	Int vertsPerColumn;
+	Int numVerts;
+	Int numIndex;
+	unsigned cellCount;
+	unsigned index;
+	ProjectedTerrainGridSnapshot snapshot;
+	const Real mapScaleInv = 1.0f / MAP_XY_FACTOR;
+
+	if (!rts::UseParallelPipelines() ||
+		!GetRadarTerrainPrepareService().isInitialized())
+		return -1;
+	if (shadow == 0 || TheTerrainRenderObject == 0 ||
+		!DX8Wrapper::Is_Initted() || shadowDecalVertexBufferD3D == 0 ||
+		shadowDecalIndexBufferD3D == 0 || SHADOW_DECAL_VERTEX_SIZE <= 0 ||
+		SHADOW_DECAL_INDEX_SIZE <= 0)
+		return -1;
+	hmap = TheTerrainRenderObject->getMap();
+	if (hmap == 0)
+		return -1;
+
+	borderSize = hmap->getBorderSizeInline();
+	robj = shadow->m_robj;
+	if (robj)
+	{
+		objPos = robj->Get_Position();
+		objXform = robj->Get_Transform();
+		if (robj->Get_User_Data())
+		{
+			Drawable *draw = ((DrawableInfo *)robj->Get_User_Data())->m_drawable;
+			const Object *object = draw->getObject();
+			PathfindLayerEnum objectLayer;
+			if (object && (objectLayer = object->getLayer()) != LAYER_GROUND)
+				layerHeight = BRIDGE_OFFSET_FACTOR +
+					TheTerrainLogic->getLayerHeight(objPos.X, objPos.Y,
+						objectLayer);
+		}
+	}
+	else
+	{
+		objPos.Set(shadow->m_x, shadow->m_y, shadow->m_z);
+		objXform.Rotate_Z(shadow->m_localAngle);
+	}
+
+	objPos.Z = 0.0f;
+	uVector = objXform.Get_X_Vector();
+	uVector.Z = 0.0f;
+	vecLength = uVector.Length();
+	if (vecLength != 0.0f)
+	{
+		uVector *= 1.0f / vecLength;
+		vVector = uVector;
+		vVector.Rotate_Z(-1.0f, 0.0f);
+	}
+	else
+	{
+		vVector = objXform.Get_Y_Vector();
+		vVector.Z = 0.0f;
+		vecLength = vVector.Length();
+		if (vecLength != 0.0f)
+			vVector *= 1.0f / vecLength;
+		else
+			vVector.Set(0.0f, -1.0f, 0.0f);
+		uVector = vVector;
+		uVector.Rotate_Z(1.0f, 0.0f);
+	}
+
+	{
+		Vector3 boxCorners[4];
+		const Real dx = shadow->m_decalSizeX;
+		const Real dy = shadow->m_decalSizeY;
+		const Vector3 leftX = -dx *
+			(uVector * (0.5f + shadow->m_decalOffsetU));
+		const Vector3 rightX = dx *
+			(uVector * (0.5f - shadow->m_decalOffsetU));
+		const Vector3 topY = -dy *
+			(vVector * (0.5f + shadow->m_decalOffsetV));
+		const Vector3 bottomY = dy *
+			(vVector * (0.5f - shadow->m_decalOffsetV));
+		Real minX;
+		Real maxX;
+		Real minY;
+		Real maxY;
+		Int corner;
+		boxCorners[0] = leftX + topY;
+		boxCorners[1] = rightX + topY;
+		boxCorners[2] = rightX + bottomY;
+		boxCorners[3] = leftX + bottomY;
+		maxX = minX = boxCorners[0].X;
+		maxY = minY = boxCorners[0].Y;
+		for (corner = 1; corner < 4; ++corner)
+		{
+			maxX = __max(maxX, boxCorners[corner].X);
+			minX = __min(minX, boxCorners[corner].X);
+			maxY = __max(maxY, boxCorners[corner].Y);
+			minY = __min(minY, boxCorners[corner].Y);
+		}
+
+		uVector *= shadow->m_oowDecalSizeX;
+		vVector *= shadow->m_oowDecalSizeY;
+		uOffset = shadow->m_decalOffsetU + 0.5f;
+		vOffset = shadow->m_decalOffsetV + 0.5f;
+
+		startX = REAL_TO_INT_FLOOR((objPos.X + minX) * mapScaleInv) + borderSize;
+		endX = REAL_TO_INT_CEIL((objPos.X + maxX) * mapScaleInv) + borderSize;
+		startY = REAL_TO_INT_FLOOR((objPos.Y + minY) * mapScaleInv) + borderSize;
+		endY = REAL_TO_INT_CEIL((objPos.Y + maxY) * mapScaleInv) + borderSize;
+		startX = __max(startX, m_drawStartX);
+		startX = __min(startX, m_drawEdgeX);
+		startY = __max(startY, m_drawStartY);
+		startY = __min(startY, m_drawEdgeY);
+		endX = __max(endX, m_drawStartX);
+		endX = __min(endX, m_drawEdgeX);
+		endY = __max(endY, m_drawStartY);
+		endY = __min(endY, m_drawEdgeY);
+	}
+
+	if (endX <= startX || endY <= startY)
+		return -1;
+	vertsPerRow = endX - startX + 1;
+	vertsPerColumn = endY - startY + 1;
+	if (vertsPerRow <= 1 || vertsPerColumn <= 1 ||
+		vertsPerRow > 104 || vertsPerColumn > 104 ||
+		vertsPerRow > 65536 / vertsPerColumn)
+		return -1;
+	numVerts = vertsPerRow * vertsPerColumn;
+	if (endX - startX > 65536 / (endY - startY))
+		return -1;
+	numIndex = (endX - startX) * (endY - startY) * 6;
+	cellCount = static_cast<unsigned>(endX - startX) *
+		static_cast<unsigned>(endY - startY);
+	if (numVerts > SHADOW_DECAL_VERTEX_SIZE ||
+		numIndex > SHADOW_DECAL_INDEX_SIZE ||
+		cellCount < PROJECTED_TERRAIN_GRID_MIN_PARALLEL_CELLS)
+		return -1;
+	if (nShadowDecalVertsInBuf < 0 || nShadowDecalIndicesInBuf < 0 ||
+		nShadowDecalVertsInBatch < 0 ||
+		nShadowDecalVertsInBuf > SHADOW_DECAL_VERTEX_SIZE - numVerts ||
+		nShadowDecalIndicesInBuf > SHADOW_DECAL_INDEX_SIZE - numIndex ||
+		nShadowDecalVertsInBatch > SHADOW_DECAL_VERTEX_SIZE - numVerts)
+		return -1;
+
+	memset(&snapshot, 0, sizeof(snapshot));
+	snapshot.width = static_cast<unsigned>(vertsPerRow);
+	snapshot.height = static_cast<unsigned>(vertsPerColumn);
+	snapshot.cellWidth = static_cast<unsigned>(endX - startX);
+	snapshot.cellHeight = static_cast<unsigned>(endY - startY);
+	snapshot.kind = PROJECTED_TERRAIN_GRID_DECAL;
+	snapshot.firstMapX = startX;
+	snapshot.firstMapY = startY;
+	snapshot.coordinateBiasX = borderSize;
+	snapshot.coordinateBiasY = borderSize;
+	snapshot.mapXYFactor = MAP_XY_FACTOR;
+	snapshot.mapHeightScale = MAP_HEIGHT_SCALE;
+	snapshot.clampToLayerHeight = layerHeight != 0.0f ? 1 : 0;
+	snapshot.layerHeight = layerHeight;
+	snapshot.heightBias = 0.01f * MAP_XY_FACTOR;
+	snapshot.diffuse = shadow->m_diffuse;
+	snapshot.uAxisX = uVector.X;
+	snapshot.uAxisY = uVector.Y;
+	snapshot.vAxisX = vVector.X;
+	snapshot.vAxisY = vVector.Y;
+	snapshot.objectX = objPos.X;
+	snapshot.objectY = objPos.Y;
+	snapshot.uOffset = uOffset;
+	snapshot.vOffset = vOffset;
+	if (!CaptureProjectedTerrainGrid(hmap, &snapshot,
+		s_projectedTerrainGridScratch, FALSE) ||
+		!RunProjectedTerrainGridParallel(snapshot,
+			s_projectedTerrainGridScratch, PROJECTED_TERRAIN_DECAL_CONSUMER))
+		return -1;
+
+	{
+		SHADOW_DECAL_VERTEX *pvVertices = 0;
+		UnsignedShort *pvIndices = 0;
+		if (shadowDecalVertexBufferD3D->Lock(
+			nShadowDecalVertsInBuf * sizeof(SHADOW_DECAL_VERTEX),
+			numVerts * sizeof(SHADOW_DECAL_VERTEX),
+			(unsigned char **)&pvVertices, D3DLOCK_NOOVERWRITE) != D3D_OK)
+			return 0;
+		if (pvVertices == 0)
+		{
+			shadowDecalVertexBufferD3D->Unlock();
+			return 0;
+		}
+		memcpy(pvVertices, s_projectedTerrainGridScratch.vertices(),
+			static_cast<size_t>(numVerts) * sizeof(SHADOW_DECAL_VERTEX));
+		if (DX8Wrapper::Is_D3D11_Backend_Active())
+			memcpy(shadowDecalVertexUpload + nShadowDecalVertsInBuf,
+				s_projectedTerrainGridScratch.vertices(),
+				static_cast<size_t>(numVerts) * sizeof(SHADOW_DECAL_VERTEX));
+		shadowDecalVertexBufferD3D->Unlock();
+
+		if (shadowDecalIndexBufferD3D->Lock(
+			nShadowDecalIndicesInBuf * sizeof(UnsignedShort),
+			numIndex * sizeof(UnsignedShort),
+			(unsigned char **)&pvIndices, D3DLOCK_NOOVERWRITE) != D3D_OK)
+			return 0;
+		if (pvIndices == 0)
+		{
+			shadowDecalIndexBufferD3D->Unlock();
+			return 0;
+		}
+		for (index = 0; index < static_cast<unsigned>(numIndex); ++index)
+			pvIndices[index] = static_cast<UnsignedShort>(
+				s_projectedTerrainGridScratch.indices()[index] +
+				nShadowDecalVertsInBatch);
+		if (DX8Wrapper::Is_D3D11_Backend_Active())
+			memcpy(shadowDecalIndexUpload + nShadowDecalIndicesInBuf,
+				pvIndices, static_cast<size_t>(numIndex) *
+					sizeof(UnsignedShort));
+		shadowDecalIndexBufferD3D->Unlock();
+
+		nShadowDecalPolysInBatch += static_cast<Int>(cellCount * 2);
+		nShadowDecalVertsInBuf += numVerts;
+		nShadowDecalVertsInBatch += numVerts;
+		nShadowDecalIndicesInBuf += numIndex;
+	}
+	return 1;
+}
 /**Decals have a low poly count so its better to render large numbers at once.  This system will queue them
-up until the buffers fill up.  It will then flush the buffer (draw decals) and be ready for new decals.  This
-is an optimized system that only uses the render objects bounding box to determine shadow visibility.
-*/
+ up until the buffers fill up.  It will then flush the buffer (draw decals) and be ready for new decals.  This
+ is an optimized system that only uses the render objects bounding box to determine shadow visibility.
+ */
 void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 {
+	if (queueDecalParallel(shadow) >= 0)
+		return;
+
 	int i,j,k;
 	Vector3 hmapVertex,objPos;
 	AABoxClass box;

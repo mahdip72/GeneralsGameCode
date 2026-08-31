@@ -33,6 +33,11 @@ $rawD3D8BoundaryPaths = @(
     'Core/Tools/LegacyTextureCreationTest/LegacyTextureCreationTest.cpp',
     'Core/Tools/RendererContractTest/RendererContractTest.cpp',
     'Core/Tools/RendererContractTest/LegacyResetResourceTest.cpp',
+    # These exact device-free renderer fixtures intentionally mirror the
+    # legacy ABI while exercising production bridge fragments. Keep the
+    # exemption narrow; StrictFinal still scans only product-runtime paths.
+    'Core/Tools/RendererContractTest/CMakeLists.txt',
+    'Core/Tools/RendererContractTest/LegacyAsyncBridgeCompletionTest.cpp',
     'Core/Tools/NativeD3D8CompatibilityTest/NativeD3D8CompatibilityTest.cpp'
 )
 

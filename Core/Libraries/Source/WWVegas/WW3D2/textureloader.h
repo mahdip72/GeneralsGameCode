@@ -53,6 +53,9 @@ class TextureLoadTaskListClass;
 namespace rts
 {
 	class Job;
+	struct ResourceIoMetrics;
+	struct ResourceIoTicket;
+	class ModelAssetBytes;
 }
 
 class TextureLoader
@@ -88,6 +91,16 @@ public:
 
 	static void	Flush_Pending_Load_Tasks();
 	static void Discard_Pending_Background_Load_Tasks();
+	static void Stop_Async_Resource_Loading();
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
+	static rts::ResourceIoMetrics Get_Resource_Load_Metrics();
+	// Model preloading shares the texture I/O owner and compute group. Only
+	// the explicit owner-side preload window may consume these copied bytes.
+	static bool Request_Model_Read(const char *filename, rts::ResourceIoTicket &ticket);
+	static rts::ModelAssetBytes *Complete_Model_Read(const rts::ResourceIoTicket &ticket,
+		bool &succeeded, bool &cancelled);
+	static void Cancel_Model_Read(const rts::ResourceIoTicket &ticket);
+#endif
 	static void Update(void(*network_callback)() = nullptr);
 
 	// returns true if current thread of execution is allowed to make DX8 calls.
@@ -99,6 +112,8 @@ public:
 	static void Set_Texture_Inactive_Override_Time(int time_ms) {TextureInactiveOverrideTime = time_ms;}
 
 private:
+	friend class TextureLoadTaskClass;
+	static void Pump_Resource_Loads();
 	static void Process_Foreground_Load			(TextureLoadTaskClass *task);
 	static void Process_Foreground_Thumbnail	(TextureLoadTaskClass *task);
 
@@ -198,6 +213,7 @@ class SynchronizedTextureLoadTaskListClass : public TextureLoadTaskListClass
 
 class TextureLoadTaskClass : public TextureLoadTaskListNodeClass
 {
+	friend class TextureLoader;
 	public:
 		enum TaskType {
 			TASK_NONE,
@@ -264,6 +280,9 @@ class TextureLoadTaskClass : public TextureLoadTaskListNodeClass
 		void						Set_Prepare_Runtime_Task(void* task) { PrepareRuntimeTask = task; }
 		void*						Get_Prepare_Runtime_Task() const { return PrepareRuntimeTask; }
 		bool						Reserve_Prepare_Memory();
+		bool						Begin_Resource_Read(bool tryCompressed = true);
+		bool						Complete_Resource_Read();
+		void						Cancel_Resource_Read();
 		void						Release_Prepare_Memory_Reservation();
 
 	protected:
@@ -301,6 +320,9 @@ class TextureLoadTaskClass : public TextureLoadTaskListNodeClass
 		Targa*					TargaFile;
 		void*					PrepareCompleteEvent;
 		void*					PrepareRuntimeTask;
+		void*					ResourceRequest;
+		void*					ResourceResult;
+		bool					ResourceTriedDDS;
 		size_t					PrepareMemoryReservation;
 		char					TargaPalette[256 * 4];
 		TextureMipBuffer		PreparedSurface[MIP_LEVELS_MAX];

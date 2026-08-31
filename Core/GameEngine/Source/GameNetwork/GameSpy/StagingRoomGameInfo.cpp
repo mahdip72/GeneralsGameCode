@@ -803,7 +803,7 @@ void GameSpyStagingRoom::launchGame()
 
 	TheNetwork->setLocalAddress(getLocalIP(), (TheNAT)?TheNAT->getSlotPort(getLocalSlotNum()):8888);
 	if (TheNAT)
-		TheNetwork->attachTransport(TheNAT->getTransport());
+		TheNetwork->attachTransport(TheNAT->takeTransport());
 	else
 		TheNetwork->initTransport();
 

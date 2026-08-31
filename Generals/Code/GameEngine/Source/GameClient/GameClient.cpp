@@ -1059,8 +1059,10 @@ void GameClient::preloadAssets( TimeOfDay timeOfDay )
 
 	// first, for every drawable in the map load the assets for all states we care about
 	Drawable *draw;
+	TheDisplay->beginModelPreload();
 	for( draw = firstDrawable(); draw; draw = draw->getNextDrawable() )
 		draw->preloadAssets( timeOfDay );
+	TheDisplay->endModelPreload();
 
 	//
 	// now create a temporary drawable for each of the faction things we can create, preload
@@ -1083,7 +1085,11 @@ void GameClient::preloadAssets( TimeOfDay timeOfDay )
 		{
 
 			// preload the assets
+			// Construction above stays synchronous. Complete this preload before
+			// destroying the drawable or constructing the next template.
+			TheDisplay->beginModelPreload();
 			draw->preloadAssets( timeOfDay );
+			TheDisplay->endModelPreload();
 
 			// destroy the drawable
 			destroyDrawable( draw );
@@ -1114,11 +1120,13 @@ void GameClient::preloadAssets( TimeOfDay timeOfDay )
 
 	GlobalMemoryStatus(&before);
 	extern std::vector<AsciiString>	debrisModelNamesGlobalHack;
+	TheDisplay->beginModelPreload();
 	size_t i=0;
 	for (; i<debrisModelNamesGlobalHack.size(); ++i)
 	{
 		TheDisplay->preloadModelAssets(debrisModelNamesGlobalHack[i]);
 	}
+	TheDisplay->endModelPreload();
 	GlobalMemoryStatus(&after);
 	debrisModelNamesGlobalHack.clear();
 

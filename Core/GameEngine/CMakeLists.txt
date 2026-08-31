@@ -1193,6 +1193,10 @@ target_compile_definitions(corei_gameengine_private INTERFACE
     IG_DEBUG_STACKTRACE
 )
 
+if(TARGET core_network_io)
+    target_link_libraries(corei_gameengine_private INTERFACE core_network_io)
+endif()
+
 target_precompile_headers(corei_gameengine_private INTERFACE
     Include/Precompiled/PreRTS.h
 )

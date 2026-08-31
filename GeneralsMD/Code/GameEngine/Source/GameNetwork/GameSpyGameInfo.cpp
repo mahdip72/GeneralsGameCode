@@ -508,7 +508,7 @@ void GameSpyLaunchGame()
 		else
 		*/
 		TheNetwork->setLocalAddress(TheGameSpyGame->getLocalIP(), TheNAT->getSlotPort(TheGameSpyGame->getLocalSlotNum()));
-		TheNetwork->attachTransport(TheNAT->getTransport());
+		TheNetwork->attachTransport(TheNAT->takeTransport());
 
 		user = TheGameSpyInfo->getLocalName();
 		for (Int i=0; i<MAX_SLOTS; ++i)

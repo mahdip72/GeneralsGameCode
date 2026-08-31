@@ -97,6 +97,11 @@
 #include "w3d_file.h"
 #include "WWMath/vp.h"
 
+#if defined(_WIN64)
+#include "Lib/GeometryTriangleDecode.h"
+#include "Lib/PipelineExecutionPolicy.h"
+#endif
+
 
 #if (OPTIMIZE_PLANEEQ_RAM)
 static SimpleVecClass<Vector4> _PlaneEQArray(1024);
@@ -1835,6 +1840,41 @@ WW3DErrorType MeshGeometryClass::read_vertex_normals(ChunkLoadClass & cload)
  *=============================================================================================*/
 WW3DErrorType MeshGeometryClass::read_triangles(ChunkLoadClass & cload)
 {
+#if defined(_WIN64)
+	static_assert(sizeof(W3dTriStruct) == rts::GEOMETRY_TRIANGLE_RECORD_BYTES,
+		"Geometry triangle record layout must match W3D");
+	static_assert(sizeof(TriIndex) == 3 * rts::GEOMETRY_TRIANGLE_INDEX32_BYTES,
+		"Generals indices must remain three packed 32-bit values");
+	static_assert(sizeof(Vector4) == 4 * sizeof(float), "Plane array must remain packed");
+	if (rts::UseParallelPipelines() &&
+		Get_Polygon_Count() >= rts::GEOMETRY_TRIANGLE_MIN_PARALLEL_RECORDS)
+	{
+		rts::GeometryTriangleDecodeScratch scratch;
+		const unsigned count = static_cast<unsigned>(Get_Polygon_Count());
+		// Check the complete byte budget before reading, so a small, oversized,
+		// or short declared chunk retains the original streaming reader below.
+		if (count <= cload.Cur_Chunk_Length() / rts::GEOMETRY_TRIANGLE_RECORD_BYTES &&
+			scratch.prepare(count, rts::GEOMETRY_TRIANGLE_INDEX32_BYTES))
+		{
+			if (cload.Read(scratch.records(), scratch.inputBytes()) != scratch.inputBytes())
+				return WW3D_ERROR_LOAD_FAILED;
+			rts::GeometryTriangleDecodeOptions options;
+			if (!rts::GeometryTriangleDecodeCompleted(rts::DecodeGeometryTriangles(scratch, options)))
+				return WW3D_ERROR_LOAD_FAILED;
+			// Only the owner touches shared geometry and the temporary plane array.
+			// Generals' signed 32-bit index representations are unchanged.
+			TriIndex *vi = get_polys();
+			Vector4 *peq = get_planes();
+			uint8 *surface_types = Get_Poly_Surface_Type_Array();
+			WWASSERT(scratch.attributesInRange());
+			memcpy(vi, scratch.indices(), count * sizeof(TriIndex));
+			memcpy(peq, scratch.planes(), count * sizeof(Vector4));
+			memcpy(surface_types, scratch.surfaces(), count * sizeof(uint8));
+			Set_Flag(DIRTY_PLANES,false);
+			return WW3D_ERROR_OK;
+		}
+	}
+#endif
 	W3dTriStruct tri;
 
 	// cache pointers to various arrays in the surrender mesh

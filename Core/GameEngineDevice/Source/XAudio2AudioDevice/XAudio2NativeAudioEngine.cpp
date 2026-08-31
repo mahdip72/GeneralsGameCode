@@ -1,6 +1,5 @@
 #include "XAudio2AudioDevice/XAudio2NativeAudioEngine.h"
 
-#include "Lib/FrameTimingDiagnostics.h"
 #include "XAudio2AudioDevice/XAudio2CallbackGate.h"
 #include "XAudio2AudioDevice/XAudio2PcmVoice.h"
 
@@ -208,7 +207,6 @@ public:
 	HRESULT create(const WAVEFORMATEX &format, IXAudio2VoiceCallback *callback,
 		float maxFrequencyRatio) noexcept override
 	{
-		rts::frame_timing::Scope timing(rts::frame_timing::AudioVoiceCreate);
 		if (m_engine == nullptr || m_voice != nullptr) {
 			return E_HANDLE;
 		}
@@ -289,7 +287,6 @@ public:
 
 	HRESULT destroyWithResult() noexcept override
 	{
-		rts::frame_timing::Scope timing(rts::frame_timing::AudioVoiceDestroy);
 		IXAudio2SourceVoice *voice = m_voice;
 		if (voice == nullptr) {
 			m_callback.disableAndWait();

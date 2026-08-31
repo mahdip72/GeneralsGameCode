@@ -44,6 +44,8 @@
 #include "dx8wrapper.h"
 #include "vertmaterial.h"
 #include "texture.h"
+#include "Lib/PipelineExecutionPolicy.h"
+#include "Lib/SortingTriangleKernel.h"
 #include "WWMath/matrix4.h"
 #include "d3d8.h"
 #include "statistics.h"
@@ -79,19 +81,8 @@ void SortingRendererClass::SetMinVertexBufferSize( unsigned val )
 	DEFAULT_SORTING_POLY_COUNT = val/2;	//typically have 2:1 vertex:triangle ratio.
 }
 
-struct ShortVectorIStruct
-{
-	unsigned short i;
-	unsigned short j;
-	unsigned short k;
-};
-
-struct TempIndexStruct
-{
-	ShortVectorIStruct tri;
-	unsigned short idx;
-	float z;
-};
+typedef rts::SortingTriangleIndices ShortVectorIStruct;
+typedef rts::SortingTriangleOutput TempIndexStruct;
 
 bool operator <(const TempIndexStruct &l, const TempIndexStruct &r) { return l.z < r.z; }
 bool operator <=(const TempIndexStruct &l, const TempIndexStruct &r) { return l.z <= r.z; }
@@ -339,6 +330,7 @@ static unsigned overlapping_polygon_count;
 static unsigned overlapping_vertex_count;
 static const unsigned MAX_OVERLAPPING_NODES=4096;
 static SortingNodeStruct* overlapping_nodes[MAX_OVERLAPPING_NODES];
+static rts::SortingTriangleScratchLease sorting_triangle_scratch;
 
 // ----------------------------------------------------------------------------
 
@@ -434,6 +426,15 @@ void SortingRendererClass::Flush_Sorting_Pool()
 
 	// Fill dynamic index buffer with sorting index buffer vertices
 	TempIndexStruct* tis=Get_Temp_Index_Array(overlapping_polygon_count);
+	rts::SortingTriangleOptions triangle_options;
+	const bool try_parallel_triangle_prep =
+		overlapping_polygon_count >= rts::SORTING_TRIANGLE_MIN_PARALLEL_POLYGONS &&
+		rts::UseParallelPipelines() &&
+		rts::JobSystem::instance().isRunning() &&
+		rts::JobSystem::instance().workerCount() > 1;
+	const bool have_parallel_triangle_workspace = try_parallel_triangle_prep &&
+		sorting_triangle_scratch.prepare(overlapping_node_count,
+			overlapping_polygon_count, triangle_options.maximumScratchBytes);
 
 	unsigned vertexAllocCount = overlapping_vertex_count;
 	if (DynamicVBAccessClass::Get_Default_Vertex_Count() < DEFAULT_SORTING_VERTEX_COUNT)
@@ -476,7 +477,36 @@ void SortingRendererClass::Flush_Sorting_Pool()
 			indices+=state->start_index;
 			indices+=state->sorting_state.iba_offset;
 
-			if (mtx[0][2] == 0.0f && mtx[1][2] == 0.0f && mtx[3][2] == 0.0f && mtx[2][2] == 1.0f) {
+			if (have_parallel_triangle_workspace) {
+				rts::SortingTriangleDescriptor *descriptor =
+					sorting_triangle_scratch.descriptors() + node_id;
+				descriptor->vertices = reinterpret_cast<const unsigned char *>(src_verts);
+				descriptor->vertexStrideBytes = sizeof(VertexFormatXYZNDUV2);
+				descriptor->indices = indices;
+				descriptor->minVertexIndex = state->min_vertex_index;
+				descriptor->vertexCount = state->vertex_count;
+				descriptor->polygonCount = state->polygon_count;
+				descriptor->vertexOffset = vertex_array_offset;
+				descriptor->outputOffset = polygon_array_offset;
+				descriptor->nodeIndex = node_id;
+				descriptor->zX = mtx[0][2];
+				descriptor->zY = mtx[1][2];
+				descriptor->zZ = mtx[2][2];
+				descriptor->zTranslation = mtx[3][2];
+				descriptor->commonZ =
+					(mtx[0][2] == 0.0f && mtx[1][2] == 0.0f &&
+					 mtx[3][2] == 0.0f && mtx[2][2] == 1.0f) ? 1u : 0u;
+#ifdef WWDEBUG
+				for (int i=0;i<state->polygon_count;++i) {
+					unsigned short idx1=indices[i*3]-state->min_vertex_index;
+					unsigned short idx2=indices[i*3+1]-state->min_vertex_index;
+					unsigned short idx3=indices[i*3+2]-state->min_vertex_index;
+					WWASSERT(idx1<state->vertex_count);
+					WWASSERT(idx2<state->vertex_count);
+					WWASSERT(idx3<state->vertex_count);
+				}
+#endif
+			} else if (mtx[0][2] == 0.0f && mtx[1][2] == 0.0f && mtx[3][2] == 0.0f && mtx[2][2] == 1.0f) {
 				// The common case for particle systems.
 				for (int i=0;i<state->polygon_count;++i) {
 					unsigned short idx1=indices[i*3]-state->min_vertex_index;
@@ -528,6 +558,31 @@ void SortingRendererClass::Flush_Sorting_Pool()
 			polygon_array_offset+=state->polygon_count;
 			vertex_array_offset+=state->vertex_count;
 		}
+	}
+
+	if (have_parallel_triangle_workspace) {
+		rts::SortingTriangleMetrics triangle_metrics;
+		rts::SortingTriangleResult triangle_result =
+			rts::PrepareSortingTriangles(
+			sorting_triangle_scratch.descriptors(), overlapping_node_count,
+			overlapping_polygon_count, tis, sorting_triangle_scratch.outputs(),
+			triangle_options, &triangle_metrics);
+		if (triangle_result != rts::SORTING_TRIANGLE_PARALLEL) {
+			// Accepted work has been fenced by PrepareSortingTriangles before a
+			// serial fallback can reuse the scratch output storage.
+			triangle_options.parallel = false;
+			triangle_result = rts::PrepareSortingTriangles(
+				sorting_triangle_scratch.descriptors(), overlapping_node_count,
+				overlapping_polygon_count, tis, sorting_triangle_scratch.outputs(),
+				triangle_options, &triangle_metrics);
+		}
+		WWASSERT(triangle_result == rts::SORTING_TRIANGLE_PARALLEL ||
+			triangle_result == rts::SORTING_TRIANGLE_SERIAL);
+#ifdef WWDEBUG
+		for (unsigned triangle_index=0; triangle_index<overlapping_polygon_count; ++triangle_index) {
+			DEBUG_ASSERTCRASH((! _isnan(tis[triangle_index].z) && _finite(tis[triangle_index].z)), ("Triangle has invalid center"));
+		}
+#endif
 	}
 
 	Sort(tis, tis + overlapping_polygon_count);

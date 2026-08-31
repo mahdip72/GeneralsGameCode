@@ -393,10 +393,139 @@ Bool RTS3DScene::castRay(RayCollisionTestClass & raytest, Bool testAll, Int coll
 /** Custom visibility check method for the RTS3DScene, we can put optimized
   * culling methods in here */
 //=============================================================================
+// Snapshot and publication stay on the scene owner. In-flight jobs only receive
+// flat bounds/flags, and every job is fenced before touching RenderList again.
+Bool RTS3DScene::prepareVisibility(CameraClass *camera)
+{
+	const rts::JobMetricCounter snapshotStart = rts::VisibilityClockNanoseconds();
+	const Int count = RenderList.Count();
+	m_visibilityWorkspace.recordSceneReference(static_cast<unsigned>(count), false);
+	if (count < rts::ParallelVisibilityWorkspace::MIN_PARALLEL_OBJECTS) return false;
+	if (!m_visibilityWorkspace.reserve(static_cast<unsigned>(count)))
+	{
+		m_visibilityWorkspace.recordSceneReference(static_cast<unsigned>(count), true);
+		return false;
+	}
+
+	rts::VisibilityFrame frame;
+	frame.reflection = ShaderClass::Is_Backface_Culling_Inverted();
+	frame.resetHiddenDrawableFlags = true;
+	frame.translucentOcclusion = true;
+	frame.behindBuildingMarkers = TheGlobalData->m_enableBehindBuildingMarkers &&
+		TheGameLogic && TheGameLogic->getShowBehindBuildingMarkers();
+	const PlaneClass *planes = camera->Get_Frustum_Planes();
+	for (unsigned p = 0; p < 6; ++p)
+	{
+		frame.planes[p].x = planes[p].N.X;
+		frame.planes[p].y = planes[p].N.Y;
+		frame.planes[p].z = planes[p].N.Z;
+		frame.planes[p].distance = planes[p].D;
+	}
+	Int currentFrame = TheGameLogic ? TheGameLogic->getFrame() : 0;
+	if (currentFrame <= TheGlobalData->m_defaultOcclusionDelay)
+		currentFrame = TheGlobalData->m_defaultOcclusionDelay + 1;
+
+	RefRenderObjListIterator it(&RenderList);
+	unsigned index = 0;
+	for (it.First(); !it.Is_Done(); it.Next(), ++index)
+	{
+		RenderObjClass *robj = it.Peek_Obj();
+		rts::VisibilityInput &input = m_visibilityWorkspace.inputs()[index];
+		input.x = input.y = input.z = input.radius = 0.0f;
+		input.flags = 0;
+		if (robj->Is_Force_Visible())
+		{
+			input.flags = rts::VIS_INPUT_FORCE_VISIBLE;
+			continue;
+		}
+		if (!frame.reflection && robj->Is_Hidden())
+		{
+			input.flags = rts::VIS_INPUT_HIDDEN;
+			continue;
+		}
+		DrawableInfo *drawInfo = static_cast<DrawableInfo *>(robj->Get_User_Data());
+		Drawable *draw = drawInfo ? drawInfo->m_drawable : nullptr;
+		if (draw)
+		{
+			input.flags |= rts::VIS_INPUT_DRAWABLE;
+			if (frame.reflection)
+			{
+				if (!draw->getDrawsInMirror()) continue;
+				input.flags |= rts::VIS_INPUT_MIRROR;
+			}
+			else
+			{
+				if (draw->isDrawableEffectivelyHidden()) input.flags |= rts::VIS_INPUT_EFFECTIVELY_HIDDEN;
+				if (draw->getFullyObscuredByShroud()) input.flags |= rts::VIS_INPUT_SHROUDED;
+				if (draw->getEffectiveOpacity() != 1.0f) input.flags |= rts::VIS_INPUT_TRANSLUCENT;
+				if (frame.behindBuildingMarkers)
+				{
+					if (draw->isKindOf(KINDOF_STRUCTURE)) input.flags |= rts::VIS_INPUT_STRUCTURE;
+					if (draw->getObject() && (draw->isKindOf(KINDOF_SCORE) ||
+						draw->isKindOf(KINDOF_SCORE_CREATE) || draw->isKindOf(KINDOF_SCORE_DESTROY) ||
+						draw->isKindOf(KINDOF_MP_COUNT_FOR_VICTORY)) &&
+						draw->getObject()->getSafeOcclusionFrame() <= currentFrame)
+						input.flags |= rts::VIS_INPUT_OCCLUDEE;
+				}
+			}
+		}
+		const SphereClass &sphere = robj->Get_Bounding_Sphere();
+		input.x = sphere.Center.X;
+		input.y = sphere.Center.Y;
+		input.z = sphere.Center.Z;
+		input.radius = sphere.Radius;
+	}
+	const rts::JobMetricCounter snapshotTime = rts::VisibilityClockNanoseconds() - snapshotStart;
+	if (!m_visibilityWorkspace.prepare(frame, static_cast<unsigned>(count))) return false;
+	const rts::JobMetricCounter publicationStart = rts::VisibilityClockNanoseconds();
+
+	m_numPotentialOccluders = m_numPotentialOccludees = 0;
+	m_translucentObjectsCount = m_numNonOccluderOrOccludee = 0;
+	rts::VisibilityListBudget remaining;
+	remaining.translucent = TheGlobalData->m_maxVisibleTranslucentObjects > 0 ? TheGlobalData->m_maxVisibleTranslucentObjects : 0;
+	remaining.occluders = TheGlobalData->m_maxVisibleOccluderObjects > 0 ? TheGlobalData->m_maxVisibleOccluderObjects : 0;
+	remaining.occludees = TheGlobalData->m_maxVisibleOccludeeObjects > 0 ? TheGlobalData->m_maxVisibleOccludeeObjects : 0;
+	remaining.others = TheGlobalData->m_maxVisibleNonOccluderOrOccludeeObjects > 0 ? TheGlobalData->m_maxVisibleNonOccluderOrOccludeeObjects : 0;
+
+	index = 0;
+	for (it.First(); !it.Is_Done(); it.Next(), ++index)
+	{
+		RenderObjClass *robj = it.Peek_Obj();
+		const rts::VisibilityResult &result = m_visibilityWorkspace.results()[index];
+		if ((result.flags & rts::VIS_RESULT_RESET_DRAW_FLAGS) != 0)
+		{
+			DrawableInfo *drawInfo = static_cast<DrawableInfo *>(robj->Get_User_Data());
+			const rts::VisibilityPublication publication = rts::PlanVisibilityPublication(frame, result, remaining);
+			drawInfo->m_flags = DrawableInfo::ERF_IS_NORMAL;
+			if ((publication.drawFlags & rts::VIS_LIST_TRANSLUCENT) != 0) drawInfo->m_flags |= DrawableInfo::ERF_IS_TRANSLUCENT;
+			if ((publication.drawFlags & rts::VIS_LIST_OCCLUDER) != 0) drawInfo->m_flags |= DrawableInfo::ERF_POTENTIAL_OCCLUDER;
+			if ((publication.drawFlags & rts::VIS_LIST_OCCLUDEE) != 0) drawInfo->m_flags |= DrawableInfo::ERF_POTENTIAL_OCCLUDEE;
+			if ((publication.drawFlags & rts::VIS_LIST_OTHER) != 0) drawInfo->m_flags |= DrawableInfo::ERF_IS_NON_OCCLUDER_OR_OCCLUDEE;
+			if ((publication.lists & rts::VIS_LIST_TRANSLUCENT) != 0) m_translucentObjectsBuffer[m_translucentObjectsCount++] = robj;
+			if ((publication.lists & rts::VIS_LIST_OCCLUDER) != 0) m_potentialOccluders[m_numPotentialOccluders++] = robj;
+			if ((publication.lists & rts::VIS_LIST_OCCLUDEE) != 0) m_potentialOccludees[m_numPotentialOccludees++] = robj;
+			if ((publication.lists & rts::VIS_LIST_OTHER) != 0) m_nonOccludersOrOccludees[m_numNonOccluderOrOccludee++] = robj;
+		}
+		robj->Set_Visible((result.flags & rts::VIS_RESULT_VISIBLE) != 0);
+	}
+	m_visibilityWorkspace.recordOwnerTimings(snapshotTime, rts::VisibilityClockNanoseconds() - publicationStart);
+	return true;
+}
+
 void RTS3DScene::Visibility_Check(CameraClass * camera)
 {
 #ifdef DIRTY_CONDITION_FLAGS
 	StDrawableDirtyStuffLocker lockDirtyStuff;
+#endif
+
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
+	if (!rts::IsParallelVisibilityEnabled())
+		m_visibilityWorkspace.recordSceneReference(static_cast<unsigned>(RenderList.Count()), false);
+	else if (prepareVisibility(camera))
+	{
+		Visibility_Checked = true;
+		return;
+	}
 #endif
 
 	RefRenderObjListIterator it(&RenderList);

@@ -130,6 +130,13 @@ enum
 bool PrepareHeightMapTerrainRows(const HeightMapTerrainSnapshot &snapshot,
 	HeightMapTerrainVertex *output, unsigned yBegin, unsigned yEnd);
 
+/* Owner admission validates the full immutable tile once. The joined worker
+ * entry still validates its range, but does not rescan other workers' cells. */
+bool ValidateHeightMapTerrainInput(const HeightMapTerrainSnapshot &snapshot,
+	const HeightMapTerrainVertex *output);
+bool PrepareValidatedHeightMapTerrainRows(const HeightMapTerrainSnapshot &snapshot,
+	HeightMapTerrainVertex *output, unsigned yBegin, unsigned yEnd);
+
 /* Validate the complete immutable input and every prepared output vertex
  * before the owner publishes any bytes to renderer-owned storage. */
 bool ValidatePreparedHeightMapTerrainOutput(

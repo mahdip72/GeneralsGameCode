@@ -49,7 +49,11 @@ Int GameMain()
 	TheGameEngine = CreateGameEngine();
 	TheGameEngine->init();
 	if (TheGlobalData->m_commandLineData.hasSkirmishAITestRequest())
-		ArmSkirmishAITestRunner(TheGlobalData->m_commandLineData.getSkirmishAITestSeed());
+		ArmSkirmishAITestRunner(TheGlobalData->m_commandLineData.getSkirmishAITestSeed(),
+			SKIRMISH_AI_TEST_SCENARIO_4V3);
+	else if (TheGlobalData->m_commandLineData.hasSkirmishAITest4v2Request())
+		ArmSkirmishAITestRunner(TheGlobalData->m_commandLineData.getSkirmishAITest4v2Seed(),
+			SKIRMISH_AI_TEST_SCENARIO_4V2);
 	const Bool canRun = StartSkirmishAITestRunner();
 
 	if (!canRun)

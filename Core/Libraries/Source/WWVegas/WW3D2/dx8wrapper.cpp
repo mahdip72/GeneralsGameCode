@@ -2187,7 +2187,16 @@ void DX8Wrapper::End_Scene(bool flip_frames)
 			hr=_Get_D3D_Device8()->Present(nullptr, nullptr, nullptr, nullptr);
 		}
 		else if (d3d11_frame_active) {
-			hr = d3d11_command_frame_dropped ? D3D_OK :
+			// Queue admission lets the producer begin its next frame without
+			// claiming the render owner has presented this one. Any reported
+			// execution/lifecycle failure still follows the existing error path.
+			const bool d3d11_frame_queued = d3d11_frame_outcome.frameEnded() &&
+				d3d11_frame_outcome.wasSubmitted() &&
+				!d3d11_frame_outcome.wasPresented() &&
+				d3d11_frame_outcome.isOperational() &&
+				d3d11_frame_outcome.result() == rts::render::RENDER_RESULT_OK &&
+				d3d11_frame_result == rts::render::RENDER_RESULT_OK;
+			hr = (d3d11_command_frame_dropped || d3d11_frame_queued) ? D3D_OK :
 				(d3d11_frame_outcome.wasPresented() &&
 				 d3d11_frame_outcome.presentationResult() ==
 					rts::render::RENDER_RESULT_OK ? D3D_OK :

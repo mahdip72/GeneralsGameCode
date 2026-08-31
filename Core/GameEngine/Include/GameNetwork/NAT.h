@@ -70,7 +70,7 @@ public:
 	void establishConnectionPaths();
 
 	Int getSlotPort(Int slot);
-	Transport * getTransport();	///< return the newly created Transport layer that has all the connections and whatnot.
+	Transport * takeTransport();	///< transfer the Transport layer to its next owner.
 
 	// Notification messages from GameSpy
 	void processGlobalMessage(Int slotNum, const char *options);

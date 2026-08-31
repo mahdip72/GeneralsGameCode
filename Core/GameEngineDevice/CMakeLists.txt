@@ -6,6 +6,7 @@ set(GAMEENGINEDEVICE_SRC
     Include/W3DDevice/Common/RadarTerrainPrepare.h
     Include/W3DDevice/Common/HeightMapTerrainPrepare.h
     Include/W3DDevice/Common/HeightMapDynamicLightPrepare.h
+    Include/W3DDevice/Common/EffectPrepare.h
     Include/W3DDevice/Common/LegacyPixelShaderBytecode.h
     Include/W3DDevice/Common/W3DRadar.h
     Include/W3DDevice/Common/W3DShroudRenderPolicy.h
@@ -102,6 +103,7 @@ set(GAMEENGINEDEVICE_SRC
     Source/W3DDevice/Common/System/RadarTerrainPrepare.cpp
     Source/W3DDevice/Common/System/HeightMapTerrainPrepare.cpp
     Source/W3DDevice/Common/System/HeightMapDynamicLightPrepare.cpp
+    Source/W3DDevice/Common/System/EffectPrepare.cpp
     Source/W3DDevice/Common/System/LegacyPixelShaderBytecode.cpp
     Source/W3DDevice/Common/System/W3DRadar.cpp
     Source/W3DDevice/Common/Thing/W3DModuleFactory.cpp
@@ -373,11 +375,13 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32)
     add_library(rts_xaudio2_audio_service STATIC
         Include/XAudio2AudioDevice/IXAudio2AudioEngineBackend.h
         Include/XAudio2AudioDevice/XAudio2AudioService.h
+        Include/XAudio2AudioDevice/XAudio2AudioServiceOwner.h
         Include/XAudio2AudioDevice/XAudio2CallbackGate.h
         Include/XAudio2AudioDevice/XAudio2FailurePublication.h
         Include/XAudio2AudioDevice/XAudio2MoviePcmSink.h
         Include/XAudio2AudioDevice/XAudio2NativeAudioEngine.h
         Source/XAudio2AudioDevice/XAudio2AudioService.cpp
+        Source/XAudio2AudioDevice/XAudio2AudioServiceOwner.cpp
         Source/XAudio2AudioDevice/XAudio2CallbackGate.cpp
         Source/XAudio2AudioDevice/XAudio2FailurePublication.cpp
         Source/XAudio2AudioDevice/XAudio2MoviePcmSink.cpp
@@ -392,6 +396,13 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32)
         rts_xaudio2_pcm_voice
     )
     target_compile_features(rts_xaudio2_audio_service PUBLIC cxx_std_20)
+    target_compile_definitions(rts_xaudio2_audio_service PRIVATE
+        RTS_XAUDIO2_HAS_JOB_OWNERSHIP=1
+    )
+    target_link_libraries(rts_xaudio2_audio_service PRIVATE
+        core_task_runtime
+        ole32
+    )
     target_link_libraries(corei_gameenginedevice_private INTERFACE rts_xaudio2_audio_service)
 endif()
 
