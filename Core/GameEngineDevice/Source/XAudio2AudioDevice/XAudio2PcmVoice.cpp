@@ -4,6 +4,7 @@
 #include "VideoDevice/FFmpeg/FFmpegAudioDecoder.h"
 #endif
 
+#include <cmath>
 #include <limits>
 
 namespace
@@ -44,7 +45,8 @@ XAudio2PcmVoice::XAudio2PcmVoice(IXAudio2PcmVoiceBackend &backend) :
 	m_resetPending(false),
 	m_started(false),
 	m_paused(false),
-	m_backendCreated(false)
+	m_backendCreated(false),
+	m_maxFrequencyRatio(XAUDIO2_DEFAULT_FREQ_RATIO)
 {
 }
 
@@ -96,13 +98,18 @@ std::uint64_t XAudio2PcmVoice::callbackIdentityState(std::uint64_t identity) noe
 	return identity & CALLBACK_STATE_MASK;
 }
 
-bool XAudio2PcmVoice::open()
+bool XAudio2PcmVoice::open(float maxFrequencyRatio)
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
 	if (m_open.load(std::memory_order_acquire)) {
 		return !m_failed.load(std::memory_order_acquire);
 	}
 	if (m_failed.load(std::memory_order_acquire)) {
+		return false;
+	}
+	if (!std::isfinite(maxFrequencyRatio) || maxFrequencyRatio < 1.0f
+		|| maxFrequencyRatio > XAUDIO2_MAX_FREQ_RATIO) {
+		m_lastError.store(E_INVALIDARG, std::memory_order_release);
 		return false;
 	}
 
@@ -112,7 +119,7 @@ bool XAudio2PcmVoice::open()
 	m_playedSample.store(-1, std::memory_order_release);
 	m_playedGeneration.store(m_requestedGeneration, std::memory_order_release);
 	m_clockPublicationEnabled.store(true, std::memory_order_release);
-	const HRESULT result = m_backend.create(pcmFormat(), this);
+	const HRESULT result = m_backend.create(pcmFormat(), this, maxFrequencyRatio);
 	if (FAILED(result)) {
 		m_lastError.store(result, std::memory_order_release);
 		m_failed.store(true, std::memory_order_release);
@@ -120,6 +127,7 @@ bool XAudio2PcmVoice::open()
 	}
 
 	m_backendCreated = true;
+	m_maxFrequencyRatio = maxFrequencyRatio;
 	m_started = false;
 	m_paused = false;
 	m_activeGeneration = m_requestedGeneration;
@@ -454,6 +462,25 @@ bool XAudio2PcmVoice::pause() noexcept
 	m_started = false;
 	m_paused = true;
 	return true;
+}
+
+bool XAudio2PcmVoice::setFrequencyRatio(float ratio) noexcept
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	if (!m_open.load(std::memory_order_acquire)
+		|| m_failed.load(std::memory_order_acquire) || checkExternalFailure()) {
+		return false;
+	}
+	if (!std::isfinite(ratio) || ratio < XAUDIO2_MIN_FREQ_RATIO
+		|| ratio > m_maxFrequencyRatio) {
+		return false;
+	}
+	const HRESULT result = m_backend.setFrequencyRatio(ratio);
+	if (FAILED(result)) {
+		fail(result);
+		return false;
+	}
+	return !checkExternalFailure();
 }
 
 bool XAudio2PcmVoice::resume() noexcept

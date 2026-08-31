@@ -202,12 +202,18 @@ public:
 
 	HRESULT create(const WAVEFORMATEX &format, IXAudio2VoiceCallback *callback) noexcept override
 	{
+		return create(format, callback, XAUDIO2_DEFAULT_FREQ_RATIO);
+	}
+
+	HRESULT create(const WAVEFORMATEX &format, IXAudio2VoiceCallback *callback,
+		float maxFrequencyRatio) noexcept override
+	{
 		rts::frame_timing::Scope timing(rts::frame_timing::AudioVoiceCreate);
 		if (m_engine == nullptr || m_voice != nullptr) {
 			return E_HANDLE;
 		}
 		m_callback.setSink(callback);
-		HRESULT result = m_engine->CreateSourceVoice(&m_voice, &format, 0, XAUDIO2_DEFAULT_FREQ_RATIO,
+		HRESULT result = m_engine->CreateSourceVoice(&m_voice, &format, 0, maxFrequencyRatio,
 			&m_callback, nullptr, nullptr);
 		if (FAILED(result)) {
 			m_callback.disableAndWait();
@@ -246,6 +252,11 @@ public:
 	HRESULT setVolume(float volume) noexcept override
 	{
 		return m_voice != nullptr ? m_voice->SetVolume(volume) : E_HANDLE;
+	}
+
+	HRESULT setFrequencyRatio(float ratio) noexcept override
+	{
+		return m_voice != nullptr ? m_voice->SetFrequencyRatio(ratio, XAUDIO2_COMMIT_NOW) : E_HANDLE;
 	}
 
 	HRESULT setOutputMatrix(UINT32 sourceChannels, UINT32 destinationChannels,

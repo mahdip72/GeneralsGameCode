@@ -687,6 +687,25 @@ void testCallbackClaimPrecedesOwnerReclamation()
 	voice.close();
 }
 
+void testOptionalPitchControlCompatibility()
+{
+	FakePcmVoiceBackend backend;
+	XAudio2PcmVoice voice(backend);
+	check(!voice.setFrequencyRatio(1.0f) && voice.open(),
+		"closed voices reject pitch and older backends still open at the default range");
+	check(voice.setFrequencyRatio(1.0f) && !voice.isFailed(),
+		"older backends preserve their initial unity pitch without implementing a new control");
+	check(!voice.setFrequencyRatio(1.25f) && voice.isFailed()
+		&& voice.getLastError() == E_NOTIMPL,
+		"older backends cannot silently discard an authored non-unity pitch");
+	voice.close();
+	const int createsBefore = backend.createCalls;
+	check(!voice.open(3.0f) && backend.createCalls == createsBefore
+		&& voice.getLastError() == E_NOTIMPL,
+		"older backends reject larger ranges before creating a voice with an insufficient maximum");
+	voice.close();
+}
+
 void testCompletionOverflowFailsClosed()
 {
 	FakePcmVoiceBackend backend;
@@ -724,6 +743,7 @@ int main()
 	testReopenAndRepeatedCleanup();
 	testStaleCallbackTokenIsIgnoredAfterSlotReuse();
 	testCallbackClaimPrecedesOwnerReclamation();
+	testOptionalPitchControlCompatibility();
 	testCompletionOverflowFailsClosed();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "%d XAudio2PcmVoice checks failed\n", g_failures);

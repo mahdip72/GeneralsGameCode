@@ -318,7 +318,7 @@ bool XAudio2AudioService::isHandleOwnedLocked(XAudio2PcmVoiceHandle handle) cons
 		&& m_voices[handle.index].voice != nullptr;
 }
 
-XAudio2PcmVoiceHandle XAudio2AudioService::createVoice() noexcept
+XAudio2PcmVoiceHandle XAudio2AudioService::createVoice(float maxFrequencyRatio) noexcept
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
 	processPendingFailureLocked();
@@ -364,7 +364,7 @@ XAudio2PcmVoiceHandle XAudio2AudioService::createVoice() noexcept
 		return invalidHandle();
 	}
 
-	if (!voice->open()) {
+	if (!voice->open(maxFrequencyRatio)) {
 		const HRESULT failure = normalizeFailure(voice->getLastError());
 		// XAudio2PcmVoice deliberately does not own a partially-created backend
 		// when create() fails; the service owns this defensive unwind.
@@ -622,6 +622,19 @@ bool XAudio2AudioService::setVoiceSpatialization(XAudio2PcmVoiceHandle handle,
 	}
 	return m_voices[handle.index].voice->setOutputMatrix(settings.SrcChannelCount,
 		settings.DstChannelCount, matrix.data());
+}
+
+bool XAudio2AudioService::setVoiceFrequencyRatio(XAudio2PcmVoiceHandle handle, float ratio) noexcept
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	processPendingFailureLocked();
+	if (m_state.load(std::memory_order_acquire) != XAudio2AudioServiceState::RUNNING
+		|| !isHandleOwnedLocked(handle)) {
+		return false;
+	}
+	const bool changed = m_voices[handle.index].voice->setFrequencyRatio(ratio);
+	processPendingFailureLocked();
+	return changed && m_state.load(std::memory_order_acquire) == XAudio2AudioServiceState::RUNNING;
 }
 
 bool XAudio2AudioService::pauseVoice(XAudio2PcmVoiceHandle handle) noexcept

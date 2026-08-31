@@ -145,6 +145,7 @@ AudioEventRTS &AudioEventRTS::operator=(const AudioEventRTS &right)
 AudioEventRTS::~AudioEventRTS() = default;
 AsciiString AudioEventRTS::getFilename() { return m_filenameToLoad; }
 Real AudioEventRTS::getVolumeShift() const { return m_volumeShift; }
+Real AudioEventRTS::getPitchShift() const { return m_pitchShift; }
 AsciiString AudioEventRTS::getAttackFilename() const { return m_attackName; }
 AsciiString AudioEventRTS::getDecayFilename() const { return m_decayName; }
 Real AudioEventRTS::getDelay() const { return m_delay; }

@@ -968,9 +968,16 @@ Bool XAudio2AudioManager::ensureVoice(PlayingAudio &playing)
 	if (playing.voiceOpen || m_service == nullptr || !m_service->isOpen()) {
 		return playing.voiceOpen;
 	}
-	playing.voice = m_service->createVoice();
+	// Play preparation already selected the event's pitch. Miles applies that
+	// selection to samples only, once across attack/body/decay and loop phases.
+	const Bool sample = playing.event != nullptr
+		&& (playing.channel == Channel::SAMPLE_2D || playing.channel == Channel::SAMPLE_3D);
+	const Real pitchShift = sample ? playing.event->getPitchShift() : 1.0f;
+	playing.voice = sample ? m_service->createVoice(std::max(1.0f, pitchShift))
+		: m_service->createVoice();
 	playing.voiceOpen = playing.voice.isValid();
-	if (playing.voiceOpen && !m_service->resetVoice(playing.voice, playing.generation)) {
+	if (playing.voiceOpen && (!m_service->resetVoice(playing.voice, playing.generation)
+		|| (sample && !m_service->setVoiceFrequencyRatio(playing.voice, pitchShift)))) {
 		m_service->destroyVoice(playing.voice);
 		playing.voice = {};
 		playing.voiceOpen = FALSE;
@@ -1092,7 +1099,10 @@ void XAudio2AudioManager::drainCompletions()
 						playing.phaseTotalFrames,
 						static_cast<UnsignedInt>(completion.endSample));
 				}
-				if (playing.fadeFrames > 0) {
+				if (playing.fadeFrames > 0 && playing.phaseQueuedBuffers == 0
+					&& playing.phaseCompletedFrames >= playing.phaseTotalFrames) {
+					// A PCM chunk is not a stream EOS. Continue replenishing the
+					// outgoing music until its fade expires or its final chunk ends.
 					playing.stopping = TRUE;
 					break;
 				}

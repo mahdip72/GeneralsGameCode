@@ -16,6 +16,12 @@ public:
 	virtual ~IXAudio2PcmVoiceBackend() = default;
 
 	virtual HRESULT create(const WAVEFORMATEX &format, IXAudio2VoiceCallback *callback) noexcept = 0;
+	virtual HRESULT create(const WAVEFORMATEX &format, IXAudio2VoiceCallback *callback,
+		float maxFrequencyRatio) noexcept
+	{
+		return maxFrequencyRatio <= XAUDIO2_DEFAULT_FREQ_RATIO
+			? create(format, callback) : E_NOTIMPL;
+	}
 	virtual HRESULT submit(const XAUDIO2_BUFFER &buffer) noexcept = 0;
 	virtual HRESULT start() noexcept = 0;
 	virtual HRESULT stop() noexcept = 0;
@@ -27,6 +33,12 @@ public:
 	{
 		(void)volume;
 		return E_NOTIMPL;
+	}
+	virtual HRESULT setFrequencyRatio(float ratio) noexcept
+	{
+		// Older backends retain their initial unity pitch, but cannot claim to
+		// have applied a non-unity authored ratio.
+		return ratio == 1.0f ? S_OK : E_NOTIMPL;
 	}
 	virtual HRESULT setOutputMatrix(UINT32 sourceChannels, UINT32 destinationChannels,
 		const float *matrix) noexcept
@@ -66,7 +78,7 @@ public:
 	XAudio2PcmVoice &operator=(const XAudio2PcmVoice &) = delete;
 
 	// These methods are owned by the audio thread. The backend is only touched here.
-	bool open();
+	bool open(float maxFrequencyRatio = XAUDIO2_DEFAULT_FREQ_RATIO);
 	void service();
 	void close() noexcept override;
 
@@ -75,6 +87,7 @@ public:
 	bool isDrained() const noexcept;
 	HRESULT getLastError() const noexcept;
 	bool setVolume(float volume) noexcept;
+	bool setFrequencyRatio(float ratio) noexcept;
 	bool setOutputMatrix(UINT32 sourceChannels, UINT32 destinationChannels,
 		const float *matrix) noexcept;
 	bool pause() noexcept;
@@ -166,4 +179,5 @@ private:
 	bool m_started;
 	bool m_paused;
 	bool m_backendCreated;
+	float m_maxFrequencyRatio;
 };

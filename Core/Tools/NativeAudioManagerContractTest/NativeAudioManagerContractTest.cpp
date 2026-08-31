@@ -123,6 +123,12 @@ namespace
 			m_created = TRUE;
 			return S_OK;
 		}
+		HRESULT create(const WAVEFORMATEX &format, IXAudio2VoiceCallback *callback,
+			float maxRatio) noexcept override
+		{
+			maxFrequencyRatio = maxRatio;
+			return create(format, callback);
+		}
 		HRESULT submit(const XAUDIO2_BUFFER &buffer) noexcept override
 		{
 			if (m_failSubmit) {
@@ -131,6 +137,7 @@ namespace
 			if (submitCalls == 0) {
 				firstSubmitVolumeCalls = volumeCalls;
 				firstSubmitMatrixCalls = matrixCalls;
+				firstSubmitFrequencyRatioCalls = frequencyRatioCalls;
 			}
 			m_lastContext = buffer.pContext;
 			m_pendingContexts.push_back(buffer.pContext);
@@ -159,6 +166,12 @@ namespace
 			lastVolume = volume;
 			++volumeCalls;
 			return S_OK;
+		}
+		HRESULT setFrequencyRatio(float ratio) noexcept override
+		{
+			++frequencyRatioCalls;
+			lastFrequencyRatio = ratio;
+			return frequencyRatioResult;
 		}
 		HRESULT setOutputMatrix(UINT32 sourceChannels, UINT32 destinationChannels,
 			const float *matrix) noexcept override
@@ -217,6 +230,11 @@ namespace
 		Bool playbackStarted = FALSE;
 		int firstSubmitVolumeCalls = 0;
 		int firstSubmitMatrixCalls = 0;
+		int firstSubmitFrequencyRatioCalls = 0;
+		int frequencyRatioCalls = 0;
+		float lastFrequencyRatio = 1.0f;
+		float maxFrequencyRatio = 0.0f;
+		HRESULT frequencyRatioResult = S_OK;
 		float lastVolume = 0.0f;
 		int volumeCalls = 0;
 		UINT32 matrixSourceChannels = 0;
@@ -265,6 +283,7 @@ namespace
 				failVoiceCreate, failSubmit, failStop, failFlush, &totalSubmitCalls,
 				&activeVoiceCount, &peakVoiceCount);
 			lastVoice = created.get();
+			created->frequencyRatioResult = failFrequencyRatio ? E_FAIL : S_OK;
 			voices.push_back(lastVoice);
 			voice = std::move(created);
 			return S_OK;
@@ -284,6 +303,7 @@ namespace
 		Bool failSubmit = FALSE;
 		Bool failStop = FALSE;
 		Bool failFlush = FALSE;
+		Bool failFrequencyRatio = FALSE;
 		int totalSubmitCalls = 0;
 		int activeVoiceCount = 0;
 		int peakVoiceCount = 0;
@@ -302,6 +322,7 @@ namespace
 	public:
 		explicit FixtureEvent(const AsciiString &name) : AudioEventRTS(name) {}
 		void setDelayForTest(Real delay) { m_delay = delay; }
+		void setPitchShiftForTest(Real pitchShift) { m_pitchShift = pitchShift; }
 	};
 
 	class CountingPcmStream final : public AudioPcmStream
@@ -637,6 +658,105 @@ int main()
 	fixtureInfo->m_sounds.push_back(AsciiString("main.wav"));
 	fixtureInfo->m_attackSounds.push_back(AsciiString("attack.wav"));
 	fixtureInfo->m_decaySounds.push_back(AsciiString("decay.wav"));
+	{
+		std::unique_ptr<FakeEngine> pitchOwnedEngine = std::make_unique<FakeEngine>();
+		FakeEngine *pitchEngine = pitchOwnedEngine.get();
+		XAudio2AudioService pitchService(std::move(pitchOwnedEngine));
+		XAudio2AudioManager pitchManager(&pitchService, &catalog);
+		pitchManager.openDevice();
+		const Real ratios[] = { 0.75f, 1.25f, 3.0f };
+		for (int positional = 0; positional != 2; ++positional) {
+			for (Real ratio : ratios) {
+				FixtureEvent pitchEvent(AsciiString("sample-pitch"));
+				pitchEvent.setAudioEventInfo(fixtureInfo);
+				pitchEvent.setPitchShiftForTest(ratio);
+				Coord3D position;
+				position.set(1.0f, 0.0f, 0.0f);
+				if (positional) pitchEvent.setPosition(&position);
+				const AudioHandle pitchHandle = pitchManager.addAudioEvent(&pitchEvent);
+				pitchManager.update();
+				FakeVoice *pitchVoice = pitchEngine->lastVoice;
+				check(pitchVoice != nullptr && pitchVoice->lastFrequencyRatio == ratio
+					&& pitchVoice->maxFrequencyRatio == std::max(1.0f, ratio)
+					&& pitchVoice->firstSubmitFrequencyRatioCalls == 1,
+					"2D and 3D samples apply the selected pitch before their first PCM submission");
+				const AudioAffect affect = positional ? AudioAffect_Sound3D : AudioAffect_Sound;
+				pitchManager.pauseAudio(affect);
+				pitchManager.resumeAudio(affect);
+				for (int phase = 0; phase != 2; ++phase) {
+					check(pitchVoice != nullptr && pitchVoice->completeOldestBuffer(),
+						"pitched sample completes its attack or body phase");
+					pitchManager.update();
+					check(pitchVoice != nullptr && pitchVoice->lastFrequencyRatio == ratio
+						&& pitchVoice->frequencyRatioCalls == 1 && pitchVoice->submitCalls == phase + 2,
+						"sample pitch is retained without reapplying across phases and pause");
+				}
+				check(pitchVoice != nullptr && pitchVoice->completeOldestBuffer(),
+					"pitched sample completes its decay phase");
+				pitchManager.update();
+				check(!pitchManager.isCurrentlyPlaying(pitchHandle) && pitchEngine->activeVoiceCount == 0,
+					"pitched sample releases its voice at the final PCM completion");
+			}
+		}
+		AudioEventInfo *pitchStreamInfo = newInstance(AudioEventInfo);
+		*pitchStreamInfo = *fixtureInfo;
+		pitchStreamInfo->m_attackSounds.clear();
+		pitchStreamInfo->m_decaySounds.clear();
+		pitchStreamInfo->m_filename = AsciiString("main.wav");
+		pitchStreamInfo->m_control = AC_LOOP;
+		pitchStreamInfo->m_loopCount = 2;
+		FixtureEvent pitchLoopEvent(AsciiString("loop-pitch"));
+		pitchLoopEvent.setAudioEventInfo(pitchStreamInfo);
+		pitchLoopEvent.setPitchShiftForTest(0.8f);
+		const AudioHandle pitchLoopHandle = pitchManager.addAudioEvent(&pitchLoopEvent);
+		pitchManager.update();
+		FakeVoice *pitchLoopVoice = pitchEngine->lastVoice;
+		check(pitchLoopVoice != nullptr && pitchLoopVoice->completeOldestBuffer(),
+			"pitched sample completes its first loop");
+		pitchManager.update();
+		check(pitchLoopVoice != nullptr && pitchLoopVoice->submitCalls == 2
+			&& pitchLoopVoice->frequencyRatioCalls == 1 && pitchLoopVoice->lastFrequencyRatio == 0.8f,
+			"a filename regenerated for a sample loop retains the event's selected pitch");
+		pitchManager.killAudioEventImmediately(pitchLoopHandle);
+		pitchStreamInfo->m_control = 0;
+		pitchStreamInfo->m_loopCount = 0;
+		for (AudioType type : { AT_Music, AT_Streaming }) {
+			pitchStreamInfo->m_soundType = type;
+			FixtureEvent streamEvent(AsciiString("unpitched-stream"));
+			streamEvent.setAudioEventInfo(pitchStreamInfo);
+			streamEvent.setPitchShiftForTest(3.0f);
+			const AudioHandle streamHandle = pitchManager.addAudioEvent(&streamEvent);
+			pitchManager.update();
+			check(pitchEngine->lastVoice != nullptr && pitchEngine->lastVoice->frequencyRatioCalls == 0
+				&& pitchEngine->lastVoice->lastFrequencyRatio == 1.0f,
+				"music and speech ignore sample-only pitch shifts like Miles streams");
+			pitchManager.killAudioEventImmediately(streamHandle);
+		}
+		deleteInstance(pitchStreamInfo);
+		FixtureEvent failedPitchEvent(AsciiString("failed-pitch"));
+		failedPitchEvent.setAudioEventInfo(fixtureInfo);
+		failedPitchEvent.setPitchShiftForTest(1.25f);
+		pitchEngine->failFrequencyRatio = TRUE;
+		const int submitsBeforeFailure = pitchEngine->totalSubmitCalls;
+		const AudioHandle failedPitchHandle = pitchManager.addAudioEvent(&failedPitchEvent);
+		pitchManager.update();
+		check(!pitchManager.isCurrentlyPlaying(failedPitchHandle) && pitchEngine->activeVoiceCount == 0
+			&& pitchEngine->totalSubmitCalls == submitsBeforeFailure,
+			"pitch-control failure unwinds the new voice before submitting PCM");
+		pitchEngine->failFrequencyRatio = FALSE;
+		failedPitchEvent.setPitchShiftForTest(0.0f);
+		const AudioHandle invalidPitchHandle = pitchManager.addAudioEvent(&failedPitchEvent);
+		pitchManager.update();
+		check(!pitchManager.isCurrentlyPlaying(invalidPitchHandle) && pitchEngine->activeVoiceCount == 0
+			&& pitchEngine->totalSubmitCalls == submitsBeforeFailure,
+			"invalid zero pitch is rejected without leaving a live or silently unpitched voice");
+		failedPitchEvent.setPitchShiftForTest(1.0f);
+		const AudioHandle recoveredPitchHandle = pitchManager.addAudioEvent(&failedPitchEvent);
+		pitchManager.update();
+		check(pitchManager.isCurrentlyPlaying(recoveredPitchHandle),
+			"a new sample can play after an isolated pitch-control failure");
+		pitchManager.closeDevice();
+	}
 	{
 		std::unique_ptr<FakeEngine> pendingOwnedEngine = std::make_unique<FakeEngine>();
 		FakeEngine *pendingEngine = pendingOwnedEngine.get();
@@ -2075,6 +2195,77 @@ int main()
 		&& std::abs(noFadeVoice->lastVolume - 0.01243619f) < 0.000001f,
 		"disabled configured range fading still retains legacy provider distance attenuation");
 	manager.killAudioEventImmediately(noFadeHandle);
+
+	{
+		StreamingAudioAssetSource fadeSource(120000U);
+		std::unique_ptr<FakeEngine> chunkFadeOwnedEngine = std::make_unique<FakeEngine>();
+		FakeEngine *chunkFadeEngine = chunkFadeOwnedEngine.get();
+		XAudio2AudioService chunkFadeService(std::move(chunkFadeOwnedEngine));
+		XAudio2AudioManager chunkFadeManager(&chunkFadeService, &fadeSource);
+		AudioSettings chunkFadeSettings;
+		chunkFadeSettings.m_minVolume = 0.0f;
+		chunkFadeSettings.m_fadeAudioFrames = 12;
+		chunkFadeManager.setAudioSettingsForTest(&chunkFadeSettings);
+		chunkFadeManager.openDevice();
+		AudioEventInfo *chunkFadeInfo = newInstance(AudioEventInfo);
+		*chunkFadeInfo = *musicOneInfo;
+		chunkFadeInfo->m_audioName = AsciiString("multichunk-fade");
+		FixtureEvent chunkFadeEvent(AsciiString("multichunk-fade"));
+		chunkFadeEvent.setAudioEventInfo(chunkFadeInfo);
+		const AudioHandle chunkFadeHandle = chunkFadeManager.addAudioEvent(&chunkFadeEvent);
+		chunkFadeManager.update();
+		FakeVoice *chunkFadeVoice = chunkFadeEngine->lastVoice;
+		check(chunkFadeVoice != nullptr && chunkFadeVoice->submitCalls == 2,
+			"multichunk fade starts with two queued one-second buffers");
+		chunkFadeManager.removeAudioEvent(AHSV_StopTheMusicFade);
+		chunkFadeManager.update();
+		const float firstFadeVolume = chunkFadeVoice == nullptr ? 0.0f : chunkFadeVoice->lastVolume;
+		check(chunkFadeVoice != nullptr && chunkFadeVoice->completeOldestBuffer(),
+			"outgoing music completes a non-terminal PCM chunk during its fade");
+		chunkFadeManager.update();
+		check(chunkFadeManager.isCurrentlyPlaying(chunkFadeHandle)
+			&& chunkFadeEngine->activeVoiceCount == 1,
+			"a non-terminal chunk completion must not retire fading music");
+		if (chunkFadeManager.isCurrentlyPlaying(chunkFadeHandle)) {
+			check(chunkFadeVoice->submitCalls == 3 && chunkFadeVoice->lastVolume > 0.0f
+				&& chunkFadeVoice->lastVolume < firstFadeVolume,
+				"fading music keeps replenishing PCM while its configured gain ramp continues");
+			check(chunkFadeVoice->completeOldestBuffer(),
+				"fading music completes its penultimate chunk after decoder EOF is known");
+			chunkFadeManager.update();
+			check(chunkFadeManager.isCurrentlyPlaying(chunkFadeHandle),
+				"decoder EOF is not playback EOS while the final chunk remains queued");
+			if (chunkFadeManager.isCurrentlyPlaying(chunkFadeHandle)) {
+				check(chunkFadeVoice->completeOldestBuffer(),
+					"fading music completes its final queued chunk");
+				chunkFadeManager.update();
+			}
+		}
+		check(!chunkFadeManager.isCurrentlyPlaying(chunkFadeHandle)
+			&& chunkFadeEngine->activeVoiceCount == 0
+			&& !chunkFadeManager.hasMusicTrackCompleted(AsciiString("multichunk-fade"), 1),
+			"true EOS retires fading music without looping or recording a natural completion");
+		const AudioHandle cancelledFadeHandle = chunkFadeManager.addAudioEvent(&chunkFadeEvent);
+		chunkFadeManager.update();
+		chunkFadeManager.removeAudioEvent(AHSV_StopTheMusicFade);
+		chunkFadeManager.update();
+		chunkFadeManager.stopAudio(AudioAffect_Music);
+		chunkFadeManager.update();
+		check(!chunkFadeManager.isCurrentlyPlaying(cancelledFadeHandle)
+			&& chunkFadeEngine->activeVoiceCount == 0,
+			"explicit cancellation still retires a multichunk fade immediately");
+		const AudioHandle expiredFadeHandle = chunkFadeManager.addAudioEvent(&chunkFadeEvent);
+		chunkFadeManager.update();
+		chunkFadeManager.removeAudioEvent(AHSV_StopTheMusicFade);
+		for (int frame = 0; frame != chunkFadeSettings.m_fadeAudioFrames + 1; ++frame) {
+			chunkFadeManager.update();
+		}
+		check(!chunkFadeManager.isCurrentlyPlaying(expiredFadeHandle)
+			&& chunkFadeEngine->activeVoiceCount == 0,
+			"the configured fade deadline still stops music without requiring a PCM callback");
+		chunkFadeManager.closeDevice();
+		deleteInstance(chunkFadeInfo);
+	}
 
 	AudioEventInfo *fadeInfo = newInstance(AudioEventInfo);
 	*fadeInfo = *musicOneInfo;
