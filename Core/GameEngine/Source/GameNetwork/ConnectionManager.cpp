@@ -789,6 +789,7 @@ void ConnectionManager::clearNetworkFrameResendRequest()
 
 void ConnectionManager::clearNetworkFrameRecovery()
 {
+	m_networkWrapperAckHistory.clear();
 	for (Int slot = 0; slot < MAX_SLOTS; ++slot)
 	{
 		m_disconnectFrameRecovery[slot] = {};
@@ -838,8 +839,11 @@ Bool ConnectionManager::isNetworkFrameRecoveryAuthorized(const NetCommandMsg *co
 
 void ConnectionManager::ackNetworkFrameRecoveryCommand(NetCommandRef *ref, Int sourceSlot)
 {
-	// Cached third-party data belongs to the direct responder's resend queue,
-	// not the original author's (possibly unreachable) connection.
+	if (sourceSlot < 0 || sourceSlot >= MAX_SLOTS || m_connections[sourceSlot] == nullptr ||
+		m_connections[sourceSlot]->isQuitting())
+		return;
+	// Direct data, including the responder's own origin, belongs to this peer's
+	// resend queue, not a separate packet router's queue.
 	NetAckBothCommandMsg *ack = newInstance(NetAckBothCommandMsg)(ref->getCommand());
 	ack->setPlayerID(m_localSlot);
 	m_connections[sourceSlot]->sendNetCommandMsg(ack, 1U << sourceSlot);
@@ -848,40 +852,67 @@ void ConnectionManager::ackNetworkFrameRecoveryCommand(NetCommandRef *ref, Int s
 
 Bool ConnectionManager::processNetworkFrameRecoveryWrapper(NetCommandRef *ref, Int sourceSlot)
 {
-	if (!isNetworkFrameRecoveryAuthorized(ref->getCommand(), sourceSlot, TRUE))
+	if (sourceSlot < 0 || sourceSlot >= MAX_SLOTS || m_connections[sourceSlot] == nullptr ||
+		m_connections[sourceSlot]->isQuitting())
+		return FALSE;
+	const Bool sourceAuthorized = isNetworkCommandSourceAuthorized(ref->getCommand(), sourceSlot);
+	if (!rts::network_epoch::IsNetworkFrameRecoveryDelivery(TRUE, ref->getRelay(), m_localSlot, MAX_SLOTS))
 		return FALSE;
 	const NetWrapperCommandMsg *wrapper = static_cast<NetWrapperCommandMsg *>(ref->getCommand());
 	if (!rts::network_epoch::IsNetworkRecoveryWrapperBounded(
 		wrapper->getTotalDataLength(), wrapper->getNumChunks()))
 		return FALSE;
+	const size_t receiptSize = wrapper->getSizeForNetPacket();
+	std::array<rts::runtime_epoch::Byte, rts::network_epoch::kNetworkWrapperAckMaxBytes> receiptBytes;
+	if (receiptSize == 0U || receiptSize > receiptBytes.size() ||
+		wrapper->copyBytesForNetPacket(receiptBytes.data(), *ref) != receiptSize)
+		return FALSE;
+	const UnsignedInt receiptKey = rts::network_epoch::MakeNetworkWrapperAckKey(
+		sourceSlot, wrapper->getPlayerID(), wrapper->getID());
+	const UnsignedInt now = static_cast<UnsignedInt>(timeGetTime());
+	if (!sourceAuthorized && !isNetworkFrameRecoveryAuthorized(ref->getCommand(), sourceSlot, TRUE))
+	{
+		// A lost ACK may be retried after catch-up revoked the frame proof.
+		// Only a previously accepted exact chunk may be ACKed without it.
+		if (m_networkWrapperAckHistory.matches(receiptKey, receiptBytes.data(), receiptSize, now))
+			ackNetworkFrameRecoveryCommand(ref, sourceSlot);
+		return FALSE;
+	}
 
-	// Never mix fragments from different observed endpoints or feed recovery
-	// fragments into the ordinary reassembly path, which has no frame proof.
+	// Local-only bounded wrappers always use the same responder-specific list,
+	// even when no proof exists or it expires mid-transfer. Their payload may
+	// be ordinary file/control data: only decoding can distinguish recovery.
 	NetCommandWrapperList *&wrappers = m_networkRecoveryWrappers[sourceSlot];
 	if (wrappers == nullptr)
 	{
 		wrappers = newInstance(NetCommandWrapperList);
 		wrappers->init();
 	}
-	if (!wrappers->processWrapper(ref))
+	if (!processWrapper(ref, wrappers))
 		return FALSE;
+	m_networkWrapperAckHistory.remember(receiptKey, receiptBytes.data(), receiptSize, now);
 	ackNetworkFrameRecoveryCommand(ref, sourceSlot);
 	NetCommandList *ready = wrappers->getReadyCommands();
 	Bool accepted = FALSE;
 	for (NetCommandRef *command = ready->getFirstMessage(); command; command = command->getNext())
 	{
-		// The wrapper has no execution frame. Only the decoded canonical command
-		// can authorize publication; FILE, control and nested WRAPPER fail here.
-		if (!isNetworkFrameRecoveryAuthorized(command->getCommand(), sourceSlot, FALSE))
+		const Bool decodedSourceAuthorized = isNetworkCommandSourceAuthorized(command->getCommand(), sourceSlot);
+		const Bool frameRecoveryDelivery = rts::network_epoch::IsNetworkFrameRecoveryDelivery(
+			isNetworkFrameRecoveryAuthorized(command->getCommand(), sourceSlot, FALSE),
+			command->getRelay(), m_localSlot, MAX_SLOTS);
+		if (!decodedSourceAuthorized && !frameRecoveryDelivery)
 			continue;
-		command->setRelay(1U << m_localSlot);
+		if (frameRecoveryDelivery)
+			command->setRelay(1U << m_localSlot);
+		else if (CommandRequiresAck(command->getCommand()))
+			ackCommand(command, m_localSlot);
 		if (!processNetCommand(command))
 			sendRemoteCommand(command);
-		if (command->getCommand()->getNetCommandType() == NETCOMMANDTYPE_FRAMEINFO &&
+		if (frameRecoveryDelivery && command->getCommand()->getNetCommandType() == NETCOMMANDTYPE_FRAMEINFO &&
 			m_frameResendRequestOutstanding && sourceSlot == m_frameResendRequestResponder &&
 			command->getCommand()->getExecutionFrame() == m_frameResendRequestFrame)
 			m_frameResendRequestReceivedInfoMask |= 1U << command->getCommand()->getPlayerID();
-		accepted = TRUE;
+		accepted = accepted || frameRecoveryDelivery;
 	}
 	deleteInstance(ready);
 	return accepted;
@@ -1162,11 +1193,16 @@ void ConnectionManager::processTransportMessage(const TransportMessage &message)
 		#if defined(_WIN64)
 		NetCommandMsg *command = cmd->getCommand();
 		const Bool sourceAuthorized = isNetworkCommandSourceAuthorized(cmd->getCommand(), sourceSlot);
-		if (!sourceAuthorized && command->getNetCommandType() == NETCOMMANDTYPE_WRAPPER)
+		if (command->getNetCommandType() == NETCOMMANDTYPE_WRAPPER)
 		{
-			if (processNetworkFrameRecoveryWrapper(cmd, sourceSlot))
-				frameResendResponseAccepted = TRUE;
-			continue;
+			const NetWrapperCommandMsg *wrapper = static_cast<NetWrapperCommandMsg *>(command);
+			if (rts::network_epoch::ShouldStageNetworkFrameWrapper(sourceAuthorized,
+				cmd->getRelay(), m_localSlot, MAX_SLOTS, wrapper->getTotalDataLength(), wrapper->getNumChunks()))
+			{
+				if (processNetworkFrameRecoveryWrapper(cmd, sourceSlot))
+					frameResendResponseAccepted = TRUE;
+				continue;
+			}
 		}
 		const Bool isFrameDataCommand = IsCommandSynchronized(command->getNetCommandType());
 		const Bool frameResendResponseAuthorized =
@@ -1182,24 +1218,31 @@ void ConnectionManager::processTransportMessage(const TransportMessage &message)
 				static_cast<std::uint32_t>(command->getExecutionFrame()),
 				static_cast<std::uint32_t>(m_frameResendRequestFrame));
 		const Bool frameRecoveryAuthorized = isNetworkFrameRecoveryAuthorized(command, sourceSlot, FALSE);
-		if (!sourceAuthorized && !frameResendResponseAuthorized && !frameRecoveryAuthorized)
+		const Bool frameRecoveryDelivery = rts::network_epoch::IsNetworkFrameRecoveryDelivery(
+			frameResendResponseAuthorized || frameRecoveryAuthorized, cmd->getRelay(), m_localSlot, MAX_SLOTS);
+		const Bool directFrameAck = frameRecoveryDelivery || rts::network_epoch::ShouldAckNetworkDirectFrame(
+			sourceAuthorized, isFrameDataCommand, cmd->getRelay(), m_localSlot, MAX_SLOTS,
+			command->getExecutionFrame(), TheGameLogic->getFrame());
+		if (!sourceAuthorized && !frameRecoveryDelivery)
 		{
+			if (directFrameAck)
+				ackNetworkFrameRecoveryCommand(cmd, sourceSlot);
 			DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::processTransportMessage - discarding command with mismatched claimed source"));
 			continue;
 		}
-		if (frameResendResponseAuthorized)
+		if (frameResendResponseAuthorized && frameRecoveryDelivery)
 		{
 			frameResendResponseAccepted = TRUE;
 			if (command->getNetCommandType() == NETCOMMANDTYPE_FRAMEINFO)
 				frameResendInfoMask |= 1U << command->getPlayerID();
 		}
-		if (!sourceAuthorized)
+		if (frameRecoveryDelivery)
 		{
 			// A recovery permission is local publication, never relay authority.
 			cmd->setRelay(1U << m_localSlot);
-			if (CommandRequiresAck(command))
-				ackNetworkFrameRecoveryCommand(cmd, sourceSlot);
 		}
+		if (directFrameAck && CommandRequiresAck(command))
+			ackNetworkFrameRecoveryCommand(cmd, sourceSlot);
 		else
 		#endif
 		if (CommandRequiresAck(cmd->getCommand())) {
@@ -1530,8 +1573,10 @@ void ConnectionManager::processFrameResendRequest(NetFrameResendRequestCommandMs
 /**
  * We have received a wrapper for a command too big to fit in a packet.
  */
-void ConnectionManager::processWrapper(NetCommandRef *ref)
+Bool ConnectionManager::processWrapper(NetCommandRef *ref, NetCommandWrapperList *wrappers)
 {
+	if (wrappers == nullptr)
+		wrappers = m_netCommandWrapperList;
 	NetWrapperCommandMsg *wrapperMsg = (NetWrapperCommandMsg *)(ref->getCommand());
 	UnsignedShort commandID = wrapperMsg->getWrappedCommandID();
 	DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::processWrapper() - wrapped commandID is %d, commandID is %d",
@@ -1545,11 +1590,11 @@ void ConnectionManager::processWrapper(NetCommandRef *ref)
 	DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::processWrapper() - origProgress[%d] == %d for command %d",
 		m_localSlot, origProgress, commandID));
 
-	const Bool accepted = m_netCommandWrapperList->processWrapper(ref);
+	const Bool accepted = wrappers->processWrapper(ref);
 
 	if (accepted && fcIt != s_fileCommandMap.end())
 	{
-		Int newProgress = m_netCommandWrapperList->getPercentComplete(wrapperMsg->getPlayerID(), commandID);
+		Int newProgress = wrappers->getPercentComplete(wrapperMsg->getPlayerID(), commandID);
 		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::processWrapper() - newProgress[%d] == %d for command %d",
 			m_localSlot, newProgress, commandID));
 		if (newProgress > origProgress && newProgress < 100)
@@ -1572,6 +1617,7 @@ void ConnectionManager::processWrapper(NetCommandRef *ref)
 			msg->detach();
 		}
 	}
+	return accepted;
 }
 
 /**
@@ -2779,6 +2825,7 @@ PlayerLeaveCode ConnectionManager::disconnectPlayer(Int slot) {
 		m_netCommandWrapperList->removeForPlayer(static_cast<UnsignedByte>(slot));
 #if defined(_WIN64)
 	m_disconnectFrameRecovery[slot] = {};
+	m_networkWrapperAckHistory.removePeer(static_cast<UnsignedInt>(slot));
 	deleteInstance(m_networkRecoveryWrappers[slot]);
 	m_networkRecoveryWrappers[slot] = nullptr;
 	for (Int responder = 0; responder < MAX_SLOTS; ++responder)
@@ -3476,6 +3523,11 @@ void ConnectionManager::notifyOthersOfNewFrame(UnsignedInt frame) {
 }
 
 void ConnectionManager::sendFrameDataToPlayer(UnsignedInt playerID, UnsignedInt startingFrame) {
+#if defined(_WIN64)
+	if (playerID >= MAX_SLOTS || !rts::network_epoch::IsNetworkCachedFrameRangeValid(
+		startingFrame, TheGameLogic->getFrame(), FRAMES_TO_KEEP))
+		return; // Bound the outer loop, not just each attempted frame send.
+#endif
 	DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::sendFrameDataToPlayer - sending frame data to player %d starting with frame %d", playerID, startingFrame));
 	for (UnsignedInt frame = startingFrame; frame < TheGameLogic->getFrame(); ++frame) {
 		sendSingleFrameToPlayer(playerID, frame);
@@ -3486,8 +3538,10 @@ void ConnectionManager::sendFrameDataToPlayer(UnsignedInt playerID, UnsignedInt 
 void ConnectionManager::sendSingleFrameToPlayer(UnsignedInt playerID, UnsignedInt frame) {
 #if defined(_WIN64)
 	const UnsignedInt currentFrame = TheGameLogic->getFrame();
-	if (playerID >= MAX_SLOTS || frame >= currentFrame || currentFrame - frame > FRAMES_TO_KEEP)
+	if (playerID >= MAX_SLOTS || !rts::network_epoch::IsNetworkCachedFrameRangeValid(frame, currentFrame, FRAMES_TO_KEEP))
 		return; // Only completed frames still held by the bounded cache.
+	if (m_connections[playerID] == nullptr || m_connections[playerID]->isQuitting() || !isNetworkHelloReady())
+		return;
 #else
 	if ((TheGameLogic->getFrame() - FRAMES_TO_KEEP) > frame) {
 		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::sendSingleFrameToPlayer - player %d requested frame %d when we are on frame %d, this is too far in the past.", playerID, frame, TheGameLogic->getFrame()));
@@ -3505,7 +3559,11 @@ void ConnectionManager::sendSingleFrameToPlayer(UnsignedInt playerID, UnsignedIn
 				NetCommandRef *ref = list->getFirstMessage();
 				while (ref != nullptr) {
 					DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::sendFrameDataToPlayer - sending command %d from player %d to player %d using relay 0x%x", ref->getCommand()->getID(), i, playerID, relay));
+#if defined(_WIN64)
+					m_connections[playerID]->sendNetCommandMsg(ref->getCommand(), relay, TRUE);
+#else
 					sendLocalCommandDirect(ref->getCommand(), relay);
+#endif
 					ref = ref->getNext();
 				}
 			}
@@ -3518,7 +3576,11 @@ void ConnectionManager::sendSingleFrameToPlayer(UnsignedInt playerID, UnsignedIn
 			}
 			msg->setPlayerID(i);
 			DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::sendFrameDataToPlayer - sending frame info from player %d to player %d for frame %d with command count %d and ID %d and relay %d", i, playerID, msg->getExecutionFrame(), msg->getCommandCount(), msg->getID(), relay));
+#if defined(_WIN64)
+			m_connections[playerID]->sendNetCommandMsg(msg, relay, TRUE);
+#else
 			sendLocalCommandDirect(msg, relay);
+#endif
 			msg->detach();
 		}
 	}

@@ -176,7 +176,7 @@ private:
 	void processProgress( NetProgressCommandMsg *msg );
 	void processLoadComplete( NetCommandMsg *msg );
 	void processTimeOutGameStart( NetCommandMsg *msg );
-	void processWrapper(NetCommandRef *ref);
+	Bool processWrapper(NetCommandRef *ref, NetCommandWrapperList *wrappers = nullptr);
 	void processFrameResendRequest(NetFrameResendRequestCommandMsg *msg);
 
 	void processFile(NetFileCommandMsg *ref);
@@ -274,6 +274,7 @@ private:
 	UnsignedInt m_frameResendRequestReceivedInfoMask;
 	rts::network_epoch::NetworkDisconnectFrameRecovery m_disconnectFrameRecovery[MAX_SLOTS];
 	NetCommandWrapperList *m_networkRecoveryWrappers[MAX_SLOTS];
+	rts::network_epoch::NetworkWrapperAckHistory m_networkWrapperAckHistory;
 	TransportMessage m_networkHelloDeferred[MAX_MESSAGES];
 	UnsignedInt m_networkHelloDeferredCount;
 	NetCommandList *m_networkHelloPendingCommands;

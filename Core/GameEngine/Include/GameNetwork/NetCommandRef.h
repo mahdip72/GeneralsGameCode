@@ -61,6 +61,11 @@ public:
 
 	time_t getTimeLastSent() const;
 	void setTimeLastSent(time_t timeLastSent);
+#if defined(_WIN64)
+	void boundRecoveryRetry(UnsignedInt queuedAt) { m_recoveryRetryBounded = TRUE; m_recoveryQueuedAt = queuedAt; }
+	Bool isRecoveryRetryBounded() const { return m_recoveryRetryBounded; }
+	UnsignedInt getRecoveryQueuedAt() const { return m_recoveryQueuedAt; }
+#endif
 
 protected:
 	NetCommandMsg *m_msg;
@@ -68,6 +73,10 @@ protected:
 	NetCommandRef *m_prev;
 	UnsignedByte m_relay; ///< Need this in the command reference since the relay value will be different depending on where this particular reference is being sent.
 	time_t m_timeLastSent;
+#if defined(_WIN64)
+	Bool m_recoveryRetryBounded;
+	UnsignedInt m_recoveryQueuedAt;
+#endif
 
 #ifdef DEBUG_NETCOMMANDREF
 	UnsignedInt m_id;

@@ -3,8 +3,12 @@
 #include "Lib/RuntimeEpochContract.h"
 
 #include <array>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <map>
+#include <vector>
 
 namespace rts
 {
@@ -178,6 +182,121 @@ inline bool IsNetworkRecoveryWrapperBounded(std::uint32_t bytes, std::uint32_t c
 	return bytes != 0U && bytes <= kNetworkRecoveryMaxWrappedBytes &&
 		chunks != 0U && chunks <= kNetworkRecoveryMaxWrappedChunks;
 }
+
+// A cached response is sent directly to one recipient. A proof for the same
+// frame must not consume an ordinary origin-to-router command's relay work.
+inline bool IsNetworkFrameRecoveryDelivery(bool recoveryAuthorized,
+	std::uint32_t relay, std::uint32_t localSlot, std::uint32_t maxSlots)
+{
+	return recoveryAuthorized && localSlot < maxSlots && localSlot < 32U &&
+		relay == (1U << localSlot);
+}
+
+inline bool ShouldStageNetworkFrameWrapper(bool sourceAuthorized,
+	std::uint32_t relay, std::uint32_t localSlot, std::uint32_t maxSlots,
+	std::uint32_t bytes, std::uint32_t chunks)
+{
+	return !sourceAuthorized ||
+		(IsNetworkFrameRecoveryDelivery(true, relay, localSlot, maxSlots) &&
+		 IsNetworkRecoveryWrapperBounded(bytes, chunks));
+}
+
+inline bool IsNetworkCachedFrameRangeValid(std::uint32_t firstFrame,
+	std::uint32_t currentFrame, std::uint32_t maxCachedFrames)
+{
+	return firstFrame < currentFrame && currentFrame - firstFrame <= maxCachedFrames;
+}
+
+// ACK ownership is separate from permission to publish cached third-party
+// data. Already executed frames are safe to discard, but current/future data
+// must keep retrying if its disconnect progress announcement has not arrived.
+inline bool ShouldAckNetworkDirectFrame(bool sourceAuthorized, bool synchronized,
+	std::uint32_t relay, std::uint32_t localSlot, std::uint32_t maxSlots,
+	std::uint32_t frame, std::uint32_t currentFrame)
+{
+	return synchronized && IsNetworkFrameRecoveryDelivery(true, relay, localSlot, maxSlots) &&
+		(sourceAuthorized || frame < currentFrame);
+}
+
+constexpr std::size_t kNetworkWrapperAckHistoryLimit = 4096U;
+// An expanded canonical record fits the 1100-byte UDP limit plus its explicit
+// command fields. Receipts never retain full reassembled files/game commands.
+constexpr std::size_t kNetworkWrapperAckMaxBytes = 2048U;
+constexpr std::uint32_t kNetworkWrapperAckLifetimeMs = 30000U;
+constexpr std::uint32_t kNetworkRecoveryRetryLifetimeMs = kNetworkWrapperAckLifetimeMs;
+
+// A discarded receipt must not strand its sender forever. Only newly queued
+// cached-recovery copies use this deadline; ordinary reliable traffic does not.
+inline bool IsNetworkRecoveryRetryExpired(bool bounded, std::uint32_t queuedAt,
+	std::uint32_t now)
+{
+	return bounded && static_cast<std::uint32_t>(now - queuedAt) >= kNetworkRecoveryRetryLifetimeMs;
+}
+
+inline std::uint32_t MakeNetworkWrapperAckKey(std::uint32_t peer,
+	std::uint32_t origin, std::uint16_t commandId)
+{
+	return (peer << 24U) | (origin << 16U) | commandId;
+}
+
+// ACK-only receipts outlive a recovery proof; they never authorize publication.
+// Exact canonical bytes prevent command-ID reuse or altered payloads from
+// matching. The endpoint owner removes receipts on peer/session teardown.
+class NetworkWrapperAckHistory
+{
+public:
+	bool matches(std::uint32_t key, const runtime_epoch::Byte *bytes,
+		std::size_t size, std::uint32_t now) const
+	{
+		const auto found = m_receipts.find(key);
+		return bytes != nullptr && found != m_receipts.end() &&
+			static_cast<std::uint32_t>(now - found->second.acceptedAt) < kNetworkWrapperAckLifetimeMs &&
+			size == found->second.bytes.size() &&
+			std::equal(found->second.bytes.begin(), found->second.bytes.end(), bytes);
+	}
+
+	void remember(std::uint32_t key, const runtime_epoch::Byte *bytes,
+		std::size_t size, std::uint32_t now)
+	{
+		if (bytes == nullptr || size == 0U || size > kNetworkWrapperAckMaxBytes)
+			return;
+		if (m_receipts.find(key) == m_receipts.end())
+		{
+			if (m_receipts.size() == kNetworkWrapperAckHistoryLimit)
+			{
+				m_receipts.erase(m_order.front());
+				m_order.pop_front();
+			}
+			m_order.push_back(key);
+		}
+		m_receipts[key] = {now, std::vector<runtime_epoch::Byte>(bytes, bytes + size)};
+	}
+
+	void removePeer(std::uint32_t peer)
+	{
+		for (auto it = m_order.begin(); it != m_order.end();)
+		{
+			if ((*it >> 24U) == peer)
+			{
+				m_receipts.erase(*it);
+				it = m_order.erase(it);
+			}
+			else
+				++it;
+		}
+	}
+	void clear() { m_receipts.clear(); m_order.clear(); }
+	std::size_t size() const { return m_receipts.size(); }
+
+private:
+	struct Receipt
+	{
+		std::uint32_t acceptedAt;
+		std::vector<runtime_epoch::Byte> bytes;
+	};
+	std::map<std::uint32_t, Receipt> m_receipts;
+	std::deque<std::uint32_t> m_order;
+};
 
 enum class NetworkIngressDisposition : std::uint32_t
 {

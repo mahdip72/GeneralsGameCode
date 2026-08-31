@@ -28,6 +28,9 @@
 #include "GameNetwork/Connection.h"
 #include "GameNetwork/networkutil.h"
 #include "GameLogic/GameLogic.h"
+#if defined(_WIN64)
+#include "Lib/NetworkEpochHandshake.h"
+#endif
 
 enum { MaxQuitFlushTime = 30000 }; // wait this many milliseconds at most to retry things before quitting
 
@@ -130,7 +133,11 @@ User * Connection::getUser() {
  * The relay is the mask specifying the people the person we are sending to should send to.
  * The relay mostly has to do with the packet router.
  */
-void Connection::sendNetCommandMsg(NetCommandMsg *msg, UnsignedByte relay) {
+void Connection::sendNetCommandMsg(NetCommandMsg *msg, UnsignedByte relay
+#if defined(_WIN64)
+	, Bool cachedRecovery
+#endif
+) {
 	if (m_isQuitting)
 		return;
 
@@ -154,6 +161,10 @@ void Connection::sendNetCommandMsg(NetCommandMsg *msg, UnsignedByte relay) {
 				for (NetCommandRef* ref1 = list->getFirstMessage(); ref1 != nullptr; ref1 = ref1->getNext()) {
 					if (NetCommandRef* ref2 = m_netCommandList->addMessage(ref1->getCommand())) {
 						ref2->setRelay(relay);
+#if defined(_WIN64)
+						if (cachedRecovery)
+							ref2->boundRecoveryRetry(static_cast<UnsignedInt>(timeGetTime()));
+#endif
 					}
 				}
 
@@ -184,6 +195,10 @@ void Connection::sendNetCommandMsg(NetCommandMsg *msg, UnsignedByte relay) {
 */
 
 			ref->setRelay(relay);
+#if defined(_WIN64)
+			if (cachedRecovery)
+				ref->boundRecoveryRetry(static_cast<UnsignedInt>(timeGetTime()));
+#endif
 		}
 	}
 }
@@ -257,6 +272,16 @@ UnsignedInt Connection::doSend() {
 		// add the command messages until either we run out of messages or the packet is full.
 		while ((msg != nullptr) && notDone) {
 			NetCommandRef *next = msg->getNext(); // Need this since msg could be deleted
+#if defined(_WIN64)
+			if (rts::network_epoch::IsNetworkRecoveryRetryExpired(msg->isRecoveryRetryBounded(),
+				msg->getRecoveryQueuedAt(), static_cast<UnsignedInt>(curtime)))
+			{
+				m_netCommandList->removeMessage(msg);
+				deleteInstance(msg);
+				msg = next;
+				continue;
+			}
+#endif
 
 			time_t timeLastSent = msg->getTimeLastSent();
 

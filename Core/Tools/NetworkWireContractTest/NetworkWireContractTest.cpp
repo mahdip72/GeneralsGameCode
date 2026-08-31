@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cstdio>
+#include <initializer_list>
 #include <limits>
 
 namespace
@@ -474,6 +475,128 @@ int TestNetworkDisconnectFrameRecoveryPolicy()
 	return result;
 }
 
+int TestNetworkFrameRecoveryDeliveryPolicy()
+{
+	using namespace rts::network_epoch;
+	int result = 0;
+	NetworkDisconnectFrameRecovery recovery;
+	TrySetNetworkDisconnectFrameRecovery(recovery, 120U, 125U, 0x14U, 120U, 65U);
+	for (const std::uint32_t origin : {2U, 4U})
+	{
+		const bool sourceAuthorized = IsNetworkCommandSourceAuthorized(2U, origin, 1U);
+		const bool resend = IsNetworkFrameResendResponseAuthorized(
+			2U, 2U, origin, 0x14U, 8U, true, false, true, 120U, 120U);
+		const bool catchUp = IsNetworkDisconnectFrameRecoveryAuthorized(
+			recovery, origin, 8U, 120U, 65U, true, 120U);
+		result |= Check(IsNetworkFrameRecoveryDelivery(resend, 0x01U, 0U, 8U) &&
+			IsNetworkFrameRecoveryDelivery(catchUp, 0x01U, 0U, 8U),
+			"own-origin and third-party direct recovery both retire the responder's wire queue");
+		result |= Check(ShouldStageNetworkFrameWrapper(sourceAuthorized, 0x01U, 0U, 8U, 5000U, 12U),
+			"own-origin and third-party wrapped recovery both retain responder-specific staging");
+	}
+	result |= Check(!IsNetworkFrameRecoveryDelivery(true, 0x09U, 0U, 8U),
+		"an ordinary relay-bearing command retains router ACK and forwarding ownership despite a matching proof");
+	result |= Check(!ShouldStageNetworkFrameWrapper(true, 0x09U, 0U, 8U, 5000U, 12U),
+		"ordinary relay-bearing wrappers retain their normal reassembly path");
+	result |= Check(!IsNetworkFrameRecoveryDelivery(false, 0x01U, 0U, 8U) &&
+		ShouldStageNetworkFrameWrapper(true, 0x01U, 0U, 8U, 5000U, 12U),
+		"ordinary local-only wrappers remain staged without a proof and use ordinary handling after decode");
+	result |= Check(!ShouldStageNetworkFrameWrapper(true, 0x01U, 0U, 8U, 8193U, 20U) &&
+		!ShouldStageNetworkFrameWrapper(true, 0x01U, 0U, 8U, 5000U, 65U),
+		"ordinary large file transfers are not discarded by recovery-only payload or metadata bounds");
+	result |= Check(!IsNetworkFrameRecoveryDelivery(false, 0x01U, 0U, 8U) &&
+		!IsNetworkFrameRecoveryDelivery(true, 0x01U, 8U, 8U),
+		"absent proof and invalid recipient cannot acquire recovery ACK ownership");
+
+	result |= Check(IsNetworkCachedFrameRangeValid(0U, 1U, 65U) &&
+		IsNetworkCachedFrameRangeValid(0U, 65U, 65U) &&
+		IsNetworkCachedFrameRangeValid(1000000U - 65U, 1000000U, 65U),
+		"early frames and the inclusive retained-cache boundary produce at most 65 loop iterations");
+	result |= Check(!IsNetworkCachedFrameRangeValid(100U, 100U, 65U) &&
+		!IsNetworkCachedFrameRangeValid(101U, 100U, 65U) &&
+		!IsNetworkCachedFrameRangeValid(0U, 66U, 65U) &&
+		!IsNetworkCachedFrameRangeValid(0U, 1000000U, 65U) &&
+		!IsNetworkCachedFrameRangeValid(0U, 0xffffffffU, 65U),
+		"equal, future and huge stale ranges are rejected before any per-frame iteration");
+	return result;
+}
+
+int TestNetworkRecoveryLostAckPolicy()
+{
+	using namespace rts::network_epoch;
+	int result = 0;
+	// A requested B's frame 10 with router C. After publication advances A to
+	// 11, B's lost-ACK retry must retire at B, not at C. Proof is already gone.
+	for (const bool sourceAuthorized : {true, false})
+	{
+		result |= Check(ShouldAckNetworkDirectFrame(sourceAuthorized, true, 1U, 0U, 8U, 10U, 11U),
+			"own-origin and third-party stale direct retries ACK the observed responder after catch-up");
+	}
+	result |= Check(ShouldAckNetworkDirectFrame(true, true, 1U, 0U, 8U, 10U, 10U) &&
+		ShouldAckNetworkDirectFrame(true, true, 1U, 0U, 8U, 11U, 10U),
+		"ordinary source-authorized local-only sync keeps direct ACK ownership without a recovery proof");
+	result |= Check(!ShouldAckNetworkDirectFrame(false, true, 1U, 0U, 8U, 10U, 10U) &&
+		!ShouldAckNetworkDirectFrame(false, true, 1U, 0U, 8U, 11U, 10U),
+		"fresh third-party records arriving before progress announcement remain unacknowledged for retry");
+	result |= Check(!ShouldAckNetworkDirectFrame(true, true, 9U, 0U, 8U, 10U, 11U) &&
+		!ShouldAckNetworkDirectFrame(true, false, 1U, 0U, 8U, 10U, 11U),
+		"ordinary relays and non-synchronized control records retain normal ACK routing");
+	NetworkDisconnectFrameRecovery revoked;
+	result |= Check(!IsNetworkDisconnectFrameRecoveryAuthorized(revoked, 4U, 8U, 11U, 65U, true, 10U),
+		"ACK-only stale retry handling does not restore publication permission");
+
+	NetworkWrapperAckHistory receipts;
+	const std::array<rts::runtime_epoch::Byte, 4> bytes = {{1U, 2U, 3U, 4U}};
+	auto altered = bytes;
+	altered[3] ^= 1U;
+	const auto key = MakeNetworkWrapperAckKey(2U, 4U, 77U);
+	result |= Check(!receipts.matches(key, bytes.data(), bytes.size(), 1000U),
+		"unproven fresh wrapper chunks are not ACKed before their progress announcement");
+	receipts.remember(key, bytes.data(), bytes.size(), 1000U);
+	result |= Check(receipts.matches(key, bytes.data(), bytes.size(), 3000U),
+		"an exact accepted wrapper retry remains ACKable after proof expiry and catch-up");
+	result |= Check(!receipts.matches(MakeNetworkWrapperAckKey(3U, 4U, 77U), bytes.data(), bytes.size(), 3000U) &&
+		!receipts.matches(MakeNetworkWrapperAckKey(2U, 3U, 77U), bytes.data(), bytes.size(), 3000U) &&
+		!receipts.matches(MakeNetworkWrapperAckKey(2U, 4U, 78U), bytes.data(), bytes.size(), 3000U) &&
+		!receipts.matches(key, altered.data(), altered.size(), 3000U) &&
+		!receipts.matches(key, bytes.data(), bytes.size() - 1U, 3000U),
+		"wrapper receipts bind endpoint, origin, ID, size and every canonical byte");
+	result |= Check(receipts.matches(key, bytes.data(), bytes.size(), 30999U) &&
+		!receipts.matches(key, bytes.data(), bytes.size(), 31000U),
+		"ACK-only receipt lookup never renews the finite receipt lifetime");
+	result |= Check(kNetworkWrapperAckLifetimeMs >= kNetworkRecoveryRetryLifetimeMs &&
+		!IsNetworkRecoveryRetryExpired(true, 900U, 30899U) &&
+		IsNetworkRecoveryRetryExpired(true, 900U, 30900U) &&
+		IsNetworkRecoveryRetryExpired(true, 900U, 31000U) &&
+		!IsNetworkRecoveryRetryExpired(false, 900U, 31000U) &&
+		!IsNetworkRecoveryRetryExpired(false, 0U, 0xffffffffU),
+		"only cached-recovery refs expire from initial enqueue; ordinary reliable refs never do");
+	const std::uint32_t beforeWrap = 0xfffffff0U;
+	receipts.remember(key, bytes.data(), bytes.size(), beforeWrap);
+	result |= Check(receipts.matches(key, bytes.data(), bytes.size(), beforeWrap + 29999U) &&
+		!receipts.matches(key, bytes.data(), bytes.size(), beforeWrap + 30000U) &&
+		!IsNetworkRecoveryRetryExpired(true, beforeWrap, beforeWrap + 29999U) &&
+		IsNetworkRecoveryRetryExpired(true, beforeWrap, beforeWrap + 30000U),
+		"receipt and recovery-only retry deadlines are safe across the millisecond clock wrap");
+
+	receipts.clear();
+	for (std::uint32_t id = 0; id <= kNetworkWrapperAckHistoryLimit; ++id)
+		receipts.remember(MakeNetworkWrapperAckKey(2U, 4U, static_cast<std::uint16_t>(id)),
+			bytes.data(), bytes.size(), 1000U);
+	result |= Check(receipts.size() == kNetworkWrapperAckHistoryLimit &&
+		!receipts.matches(MakeNetworkWrapperAckKey(2U, 4U, 0U), bytes.data(), bytes.size(), 1001U) &&
+		IsNetworkRecoveryRetryExpired(true, 900U, 30900U),
+		"receipt eviction cannot leave a cached-recovery sender ref retrying forever");
+	receipts.remember(MakeNetworkWrapperAckKey(3U, 4U, 0U), bytes.data(), bytes.size(), 1000U);
+	receipts.removePeer(2U);
+	result |= Check(receipts.size() == 1U &&
+		receipts.matches(MakeNetworkWrapperAckKey(3U, 4U, 0U), bytes.data(), bytes.size(), 1001U),
+		"peer teardown clears only that endpoint's accepted wrapper receipts");
+	receipts.clear();
+	result |= Check(receipts.size() == 0U, "session reset clears every wrapper ACK receipt");
+	return result;
+}
+
 int TestNetworkNatPolicy()
 {
 	using namespace rts::network_nat;
@@ -570,5 +693,7 @@ int main()
 		TestNetworkHelloContract() | TestNetworkFramePublicationGate() |
 		TestNetworkHelloFailureHandlingPolicy() | TestNetworkIngressPolicy() |
 		TestNetworkHelloDropPolicy() | TestNetworkFrameResendPolicy() |
-		TestNetworkDisconnectFrameRecoveryPolicy() | TestNetworkNatPolicy();
+		TestNetworkDisconnectFrameRecoveryPolicy() | TestNetworkFrameRecoveryDeliveryPolicy() |
+		TestNetworkRecoveryLostAckPolicy() |
+		TestNetworkNatPolicy();
 }
