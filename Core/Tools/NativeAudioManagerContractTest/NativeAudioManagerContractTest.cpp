@@ -1792,8 +1792,8 @@ int main()
 		"fake backend completes natural music playback");
 	manager.update();
 	manager.update();
-	check(!manager.isMusicPlaying() && manager.hasMusicTrackCompleted(AsciiString("music-one"), 1),
-		"only natural terminal music completion records history");
+	check(manager.isMusicPlaying() && manager.hasMusicTrackCompleted(AsciiString("music-one"), 1),
+		"natural music EOS loops and records completion on the active track");
 	const AsciiString nextTrack = manager.nextMusicTrack();
 	check(nextTrack == AsciiString("music-two"),
 		"next music selects and enqueues the next configured track");
@@ -1814,6 +1814,163 @@ int main()
 	manager.update();
 	check(!manager.isMusicPlaying() && !manager.hasMusicTrackCompleted(AsciiString("music-two"), 1),
 		"stopped music does not record natural completion");
+
+	{
+		std::unique_ptr<FakeEngine> lifecycleMusicOwnedEngine = std::make_unique<FakeEngine>();
+		FakeEngine *lifecycleMusicEngine = lifecycleMusicOwnedEngine.get();
+		XAudio2AudioService lifecycleMusicService(std::move(lifecycleMusicOwnedEngine));
+		XAudio2AudioManager lifecycleMusicManager(&lifecycleMusicService, &catalog);
+		AudioSettings lifecycleMusicSettings;
+		lifecycleMusicSettings.m_fadeAudioFrames = 3;
+		lifecycleMusicSettings.m_minVolume = 0.0f;
+		lifecycleMusicManager.setAudioSettingsForTest(&lifecycleMusicSettings);
+		lifecycleMusicManager.openDevice();
+		AudioEventInfo *lifecycleMusicInfo = newInstance(AudioEventInfo);
+		*lifecycleMusicInfo = *lowInfo;
+		lifecycleMusicInfo->m_audioName = AsciiString("native-music-loop");
+		lifecycleMusicInfo->m_soundType = AT_Music;
+		lifecycleMusicInfo->m_type = 0;
+		lifecycleMusicInfo->m_sounds.clear();
+		lifecycleMusicInfo->m_attackSounds.clear();
+		lifecycleMusicInfo->m_decaySounds.clear();
+		lifecycleMusicInfo->m_filename = AsciiString("short.wav");
+		lifecycleMusicInfo->m_loopCount = 0;
+		lifecycleMusicInfo->m_control = 0;
+		FixtureEvent lifecycleMusic(AsciiString("native-music-loop"));
+		lifecycleMusic.setAudioEventInfo(lifecycleMusicInfo);
+		const AudioHandle lifecycleMusicHandle = lifecycleMusicManager.addAudioEvent(&lifecycleMusic);
+		lifecycleMusicManager.update();
+		lifecycleMusicManager.update();
+		FakeVoice *lifecycleMusicVoice = lifecycleMusicEngine->lastVoice;
+		const int firstMusicSubmitCalls = lifecycleMusicVoice == nullptr
+			? 0 : lifecycleMusicVoice->submitCalls;
+		check(lifecycleMusicHandle >= AHSV_FirstHandle
+			&& lifecycleMusicManager.isCurrentlyPlaying(lifecycleMusicHandle)
+			&& lifecycleMusicManager.isMusicPlaying()
+			&& !lifecycleMusicManager.hasMusicTrackCompleted(AsciiString("native-music-loop"), 1),
+			"music without AC_LOOP starts as one active track with zero completions");
+		check(lifecycleMusicVoice != nullptr && lifecycleMusicVoice->completeLastBuffer(),
+			"fake backend publishes the first repeated music EOS");
+		lifecycleMusicManager.update();
+		check(lifecycleMusicManager.isMusicPlaying()
+			&& lifecycleMusicManager.hasMusicTrackCompleted(AsciiString("native-music-loop"), 1)
+			&& lifecycleMusicVoice != nullptr
+			&& lifecycleMusicVoice->submitCalls == firstMusicSubmitCalls + 1,
+			"natural music EOS loops without AC_LOOP and records only the live playback");
+		check(lifecycleMusicVoice != nullptr && lifecycleMusicVoice->completeLastBuffer(),
+			"fake backend publishes the second repeated music EOS");
+		lifecycleMusicManager.update();
+		check(lifecycleMusicManager.isMusicPlaying()
+			&& lifecycleMusicManager.hasMusicTrackCompleted(AsciiString("native-music-loop"), 2),
+			"repeated natural music EOS increments the active playback completion count");
+		lifecycleMusicManager.pauseAudio(AudioAffect_Music);
+		check(!lifecycleMusicManager.isMusicPlaying()
+			&& !lifecycleMusicManager.hasMusicTrackCompleted(AsciiString("native-music-loop"), 2),
+			"paused music is excluded from active-track and completion queries");
+		lifecycleMusicManager.resumeAudio(AudioAffect_Music);
+		check(lifecycleMusicManager.isMusicPlaying()
+			&& lifecycleMusicManager.hasMusicTrackCompleted(AsciiString("native-music-loop"), 2),
+			"resuming music restores the same active playback completion count");
+		lifecycleMusicManager.removeAudioEvent(AHSV_StopTheMusicFade);
+		lifecycleMusicManager.update();
+		check(!lifecycleMusicManager.isMusicPlaying()
+			&& !lifecycleMusicManager.hasMusicTrackCompleted(AsciiString("native-music-loop"), 2),
+			"fading music is excluded from active-track and completion queries");
+		check(lifecycleMusicVoice != nullptr && lifecycleMusicVoice->completeLastBuffer(),
+			"fake backend publishes completion for fading music");
+		lifecycleMusicManager.update();
+		lifecycleMusicManager.update();
+		lifecycleMusicManager.update();
+		check(lifecycleMusicManager.getActiveAudioCount() == 0
+			&& !lifecycleMusicManager.isCurrentlyPlaying(lifecycleMusicHandle),
+			"faded music reaches a terminal release without recording another completion");
+		const AudioHandle sameNameMusicHandle = lifecycleMusicManager.addAudioEvent(&lifecycleMusic);
+		lifecycleMusicManager.update();
+		lifecycleMusicManager.update();
+		FakeVoice *sameNameMusicVoice = lifecycleMusicEngine->lastVoice;
+		check(sameNameMusicHandle >= AHSV_FirstHandle
+			&& lifecycleMusicManager.isMusicPlaying()
+			&& !lifecycleMusicManager.hasMusicTrackCompleted(AsciiString("native-music-loop"), 1),
+			"a same-name music restart begins with a fresh completion count");
+		check(sameNameMusicVoice != nullptr && sameNameMusicVoice->completeLastBuffer(),
+			"fake backend publishes EOS for the same-name restart");
+		lifecycleMusicManager.update();
+		check(lifecycleMusicManager.hasMusicTrackCompleted(AsciiString("native-music-loop"), 1),
+			"same-name music restart records its own first completion");
+		lifecycleMusicManager.stopAudio(AudioAffect_Music);
+		check(!lifecycleMusicManager.isMusicPlaying()
+			&& !lifecycleMusicManager.hasMusicTrackCompleted(AsciiString("native-music-loop"), 1),
+			"stopping music immediately removes it from active-track queries");
+		lifecycleMusicManager.update();
+		const AudioHandle resetMusicHandle = lifecycleMusicManager.addAudioEvent(&lifecycleMusic);
+		lifecycleMusicManager.update();
+		lifecycleMusicManager.update();
+		FakeVoice *resetMusicVoice = lifecycleMusicEngine->lastVoice;
+		check(resetMusicVoice != nullptr && resetMusicVoice->completeLastBuffer(),
+			"fake backend publishes EOS before the music reset check");
+		lifecycleMusicManager.update();
+		check(lifecycleMusicManager.hasMusicTrackCompleted(AsciiString("native-music-loop"), 1),
+			"music completion is observable before reset");
+		lifecycleMusicManager.reset();
+		check(lifecycleMusicManager.isOpen()
+			&& lifecycleMusicManager.getActiveAudioCount() == 0
+			&& !lifecycleMusicManager.isCurrentlyPlaying(resetMusicHandle)
+			&& !lifecycleMusicManager.isMusicPlaying()
+			&& !lifecycleMusicManager.hasMusicTrackCompleted(AsciiString("native-music-loop"), 1),
+			"reset clears live music records and their completion history");
+		const AudioHandle afterResetMusicHandle = lifecycleMusicManager.addAudioEvent(&lifecycleMusic);
+		lifecycleMusicManager.update();
+		lifecycleMusicManager.update();
+		check(afterResetMusicHandle >= AHSV_FirstHandle
+			&& lifecycleMusicManager.isMusicPlaying()
+			&& !lifecycleMusicManager.hasMusicTrackCompleted(AsciiString("native-music-loop"), 1),
+			"music after reset starts with zero completions");
+		lifecycleMusicManager.stopAudio(AudioAffect_Music);
+		lifecycleMusicManager.update();
+		catalog.setDurationMS(AsciiString("native-zero-music.wav"), 0.0f);
+		AudioEventInfo *emptyMusicInfo = newInstance(AudioEventInfo);
+		*emptyMusicInfo = *lifecycleMusicInfo;
+		emptyMusicInfo->m_audioName = AsciiString("native-empty-music");
+		emptyMusicInfo->m_filename.clear();
+		FixtureEvent emptyMusic(AsciiString("native-empty-music"));
+		emptyMusic.setAudioEventInfo(emptyMusicInfo);
+		const AudioHandle emptyMusicHandle = lifecycleMusicManager.addAudioEvent(&emptyMusic);
+		lifecycleMusicManager.update();
+		check(emptyMusicHandle >= AHSV_FirstHandle
+			&& !lifecycleMusicManager.isCurrentlyPlaying(emptyMusicHandle)
+			&& lifecycleMusicManager.getActiveAudioCount() == 0,
+			"an all-empty music event fails terminally instead of spinning silently");
+		AudioEventInfo *zeroMusicInfo = newInstance(AudioEventInfo);
+		*zeroMusicInfo = *lifecycleMusicInfo;
+		zeroMusicInfo->m_audioName = AsciiString("native-zero-music");
+		zeroMusicInfo->m_filename = AsciiString("native-zero-music.wav");
+		FixtureEvent zeroMusic(AsciiString("native-zero-music"));
+		zeroMusic.setAudioEventInfo(zeroMusicInfo);
+		const AudioHandle zeroMusicHandle = lifecycleMusicManager.addAudioEvent(&zeroMusic);
+		lifecycleMusicManager.update();
+		check(zeroMusicHandle >= AHSV_FirstHandle
+			&& !lifecycleMusicManager.isCurrentlyPlaying(zeroMusicHandle)
+			&& lifecycleMusicManager.getActiveAudioCount() == 0,
+			"zero-duration music fails terminally instead of spinning silently");
+		AudioEventInfo *missingMusicInfo = newInstance(AudioEventInfo);
+		*missingMusicInfo = *lifecycleMusicInfo;
+		missingMusicInfo->m_audioName = AsciiString("native-missing-music");
+		missingMusicInfo->m_filename = AsciiString("native-missing-music.wav");
+		FixtureEvent missingMusic(AsciiString("native-missing-music"));
+		missingMusic.setAudioEventInfo(missingMusicInfo);
+		const AudioHandle missingMusicHandle = lifecycleMusicManager.addAudioEvent(&missingMusic);
+		lifecycleMusicManager.update();
+		check(missingMusicHandle >= AHSV_FirstHandle
+			&& !lifecycleMusicManager.isCurrentlyPlaying(missingMusicHandle)
+			&& lifecycleMusicManager.getActiveAudioCount() == 0,
+			"music decode failure fails terminally instead of spinning silently");
+		lifecycleMusicManager.closeDevice();
+		lifecycleMusicManager.setAudioSettingsForTest(nullptr);
+		deleteInstance(emptyMusicInfo);
+		deleteInstance(zeroMusicInfo);
+		deleteInstance(missingMusicInfo);
+		deleteInstance(lifecycleMusicInfo);
+	}
 
 	AudioSettings settings;
 	settings.m_use3DSoundRangeVolumeFade = TRUE;
@@ -2042,6 +2199,82 @@ int main()
 	manager.update();
 	manager.setVolume(1.0f,
 		static_cast<AudioAffect>(AudioAffect_Speech | AudioAffect_SystemSetting));
+
+	{
+		FixtureEvent cancelledForcedSpeech(AsciiString("cancelled-forced-speech"));
+		cancelledForcedSpeech.setAudioEventInfo(speechInfo);
+		cancelledForcedSpeech.setDelayForTest(100.0f);
+		for (int repeat = 0; repeat < 3; ++repeat) {
+			manager.friend_forcePlayAudioEventRTS(&cancelledForcedSpeech);
+			check(manager.getForcedAudioReservationCountForTest() == 1
+				&& manager.getPendingAudioRequestCount() == 1,
+				"forced delayed speech reserves exactly one pending handle");
+			manager.stopAudio(AudioAffect_Speech);
+			check(manager.getForcedAudioReservationCountForTest() == 0
+				&& manager.getPendingAudioRequestCount() == 0,
+				"cancelling delayed forced speech releases its reservation");
+		}
+		manager.friend_forcePlayAudioEventRTS(&cancelledForcedSpeech);
+		check(manager.getForcedAudioReservationCountForTest() == 1
+			&& manager.getPendingAudioRequestCount() == 1,
+			"bulk-release fixture queues a delayed forced speech request");
+		manager.closeDevice();
+		check(manager.getForcedAudioReservationCountForTest() == 0
+			&& manager.getPendingAudioRequestCount() == 0,
+			"device close releases forced reservations with all pending requests");
+		manager.openDevice();
+
+		FixtureEvent delayedForcedSpeech(AsciiString("delayed-forced-speech"));
+		delayedForcedSpeech.setAudioEventInfo(speechInfo);
+		delayedForcedSpeech.setDelayForTest(100.0f);
+		manager.friend_forcePlayAudioEventRTS(&delayedForcedSpeech);
+		FixtureEvent forcedTakeoverSpeech(AsciiString("forced-takeover-speech"));
+		forcedTakeoverSpeech.setAudioEventInfo(speechInfo);
+		forcedTakeoverSpeech.setUninterruptible(TRUE);
+		const AudioHandle takeoverSpeechHandle = manager.addAudioEvent(&forcedTakeoverSpeech);
+		check(manager.getForcedAudioReservationCountForTest() == 1
+			&& manager.getPendingAudioRequestCount() == 2,
+			"speech takeover queues behind an older delayed forced request");
+		manager.update();
+		check(manager.isCurrentlyPlaying(takeoverSpeechHandle)
+			&& manager.getActiveAudioCount() == 1
+			&& manager.getPendingAudioRequestCount() == 0
+			&& manager.getForcedAudioReservationCountForTest() == 0
+			&& manager.getDisallowSpeech(),
+			"speech takeover cancels delayed forced speech and releases the cancelled reservation");
+		manager.stopAudio(AudioAffect_Speech);
+		manager.update();
+
+		AudioEventInfo *forcedVoiceInfo = newInstance(AudioEventInfo);
+		*forcedVoiceInfo = *speechInfo;
+		forcedVoiceInfo->m_audioName = AsciiString("forced-duplicate-voice");
+		forcedVoiceInfo->m_type = ST_WORLD | ST_VOICE;
+		FixtureEvent activeVoice(AsciiString("forced-duplicate-voice"));
+		activeVoice.setAudioEventInfo(forcedVoiceInfo);
+		activeVoice.setObjectID(static_cast<ObjectID>(400U));
+		const AudioHandle activeVoiceHandle = manager.addAudioEvent(&activeVoice);
+		manager.update();
+		check(manager.isCurrentlyPlaying(activeVoiceHandle)
+			&& manager.isObjectPlayingVoice(static_cast<UnsignedInt>(400U)),
+			"duplicate-voice fixture starts its existing voice");
+		FixtureEvent duplicateVoice(AsciiString("forced-duplicate-voice"));
+		duplicateVoice.setAudioEventInfo(forcedVoiceInfo);
+		duplicateVoice.setObjectID(static_cast<ObjectID>(400U));
+		duplicateVoice.setUninterruptible(TRUE);
+		manager.friend_forcePlayAudioEventRTS(&duplicateVoice);
+		check(manager.getForcedAudioReservationCountForTest() == 1
+			&& manager.getPendingAudioRequestCount() == 1,
+			"forced duplicate voice queues one reservation before admission");
+		manager.update();
+		check(manager.isCurrentlyPlaying(activeVoiceHandle)
+			&& manager.getActiveAudioCount() == 1
+			&& manager.getPendingAudioRequestCount() == 0
+			&& manager.getForcedAudioReservationCountForTest() == 0,
+			"forced duplicate voice drops without evicting the active voice or leaking its reservation");
+		manager.stopAudio(AudioAffect_Speech);
+		manager.update();
+		deleteInstance(forcedVoiceInfo);
+	}
 
 	std::unique_ptr<FakeEngine> replacementOwnedEngine = std::make_unique<FakeEngine>();
 	FakeEngine *replacementEngine = replacementOwnedEngine.get();

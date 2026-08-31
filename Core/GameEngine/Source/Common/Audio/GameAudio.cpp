@@ -471,6 +471,17 @@ AudioHandle AudioManager::addAudioEvent(const AudioEventRTS *eventToAdd)
 
 	const AudioType soundType = eventToAdd->getAudioEventInfo()->m_soundType;
 
+#if defined(_WIN64) && RETAIL_COMPATIBLE_CRC
+	// Logical audio must consume the synchronized RNG before an x64 local-audio
+	// setting can reject the event. The legacy path below intentionally keeps
+	// its retail ordering for the Win32/VC6 CRC oracle.
+	RefCountPtr<DynamicAudioEventRTS> audioEvent;
+	if (eventToAdd->getIsLogicalAudio()
+		&& !prepareAudioEventForPlayback(eventToAdd, audioEvent, TRUE)) {
+		return AHSV_Error;
+	}
+#endif
+
 	// Check if audio type is on
 	// TheSuperHackers @info Zero audio volume is not a fail condition, because music, speech and sounds
 	// still need to be in flight in case the user raises the volume on runtime after the audio was already triggered.
@@ -508,18 +519,23 @@ AudioHandle AudioManager::addAudioEvent(const AudioEventRTS *eventToAdd)
 		return AHSV_NotForLocal;
 	}
 
+#if !defined(_WIN64) || !RETAIL_COMPATIBLE_CRC
 	RefCountPtr<DynamicAudioEventRTS> audioEvent;
-	audioEvent.Assign_No_Add_Ref(newInstance(DynamicAudioEventRTS)(*eventToAdd));
-	audioEvent->setPlayingHandle( allocateNewHandle() );
-	audioEvent->generateFilename();	// which file are we actually going to play?
-	eventToAdd->setPlayingAudioIndex( audioEvent->getPlayingAudioIndex() );
-	audioEvent->generatePlayInfo();	// generate pitch shift and volume shift now as well
+#endif
+	if (audioEvent == nullptr)
+	{
+		audioEvent.Assign_No_Add_Ref(newInstance(DynamicAudioEventRTS)(*eventToAdd));
+		audioEvent->setPlayingHandle( allocateNewHandle() );
+		audioEvent->generateFilename();	// which file are we actually going to play?
+		eventToAdd->setPlayingAudioIndex( audioEvent->getPlayingAudioIndex() );
+		audioEvent->generatePlayInfo();	// generate pitch shift and volume shift now as well
 
-	std::list<std::pair<AsciiString, Real>/**/>::iterator it;
-	for (it = m_adjustedVolumes.begin(); it != m_adjustedVolumes.end(); ++it) {
-		if (it->first == audioEvent->getEventName()) {
-			audioEvent->setVolume(it->second);
-			break;
+		std::list<std::pair<AsciiString, Real>/**/>::iterator it;
+		for (it = m_adjustedVolumes.begin(); it != m_adjustedVolumes.end(); ++it) {
+			if (it->first == audioEvent->getEventName()) {
+				audioEvent->setVolume(it->second);
+				break;
+			}
 		}
 	}
 

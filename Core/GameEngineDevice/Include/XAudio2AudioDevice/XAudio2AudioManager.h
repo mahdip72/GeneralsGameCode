@@ -89,6 +89,7 @@ public:
 	void closeAnySamplesUsingFile(const void *fileToClose) override;
 
 	void processRequestList() override;
+	void releaseAudioRequest(AudioRequest *requestToRelease) override;
 
 	void setService(XAudio2AudioService *service);
 	XAudio2AudioService *getService() const { return m_service; }
@@ -110,6 +111,7 @@ public:
 	void setChannelLimitsForTest(UnsignedInt samples2D, UnsignedInt samples3D, UnsignedInt streams);
 	void setAudioSettingsForTest(AudioSettings *settings);
 	void setActiveMusicTrackForTest(const AsciiString &track);
+	UnsignedInt getForcedAudioReservationCountForTest() const;
 	void setOwnedServiceForTest(std::unique_ptr<XAudio2AudioService> service);
 #endif
 
@@ -144,6 +146,7 @@ private:
 		UnsignedInt phaseQueuedBuffers = 0;
 		UnsignedInt phaseCompletedFrames = 0;
 		UnsignedInt phaseTotalFrames = 0;
+		Int musicCompletions = 0;
 	};
 
 	DynamicAudioEventRTS *copyEvent(const AudioEventRTS *eventToCopy);
@@ -180,10 +183,11 @@ private:
 	PlayingAudio *findLowestPriority(Channel channel, const AudioEventRTS &incoming);
 	Real effectiveVolume(const PlayingAudio &playing) const;
 	Real outputVolume(const PlayingAudio &playing) const;
-	void recordMusicCompletion(const PlayingAudio &playing);
+	void recordMusicCompletion(PlayingAudio &playing);
 	void updatePlayingVolumes();
 	void updateDisallowSpeechGuard();
 	void clearPlaying();
+	const PlayingAudio *findActiveMusic(const AsciiString *trackName = nullptr) const;
 
 	std::unique_ptr<XAudio2AudioService> m_ownedService;
 	std::unique_ptr<AudioAssetSource> m_ownedAssetSource;
@@ -194,7 +198,6 @@ private:
 	AudioAssetSource *m_assetSource;
 	std::vector<PlayingAudio> m_playing;
 	std::vector<AudioHandle> m_forcePlayHandles;
-	std::vector<std::pair<AsciiString, Int>> m_musicCompletions;
 	AsciiString m_activeMusicTrack;
 	AsciiString m_preferredProvider;
 	AsciiString m_preferredSpeaker;

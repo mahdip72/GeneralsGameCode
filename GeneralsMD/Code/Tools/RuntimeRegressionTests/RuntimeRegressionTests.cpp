@@ -33,6 +33,7 @@
 #include "AudioDevice/AudioAssetSource.h"
 #include "AudioDevice/NullAudioManager.h"
 #include "Common/ArchiveFileSystem.h"
+#include "Common/AudioAffect.h"
 #include "Common/AudioEventInfo.h"
 #include "Common/AudioSettings.h"
 #include "Common/FileSystem.h"
@@ -159,7 +160,8 @@ public:
 	HRESULT close() noexcept override { return S_OK; }
 };
 
-static AudioEventInfo *ConfigureLogicalAudioFixture(AudioManager &manager, Real minimumVolume)
+static AudioEventInfo *ConfigureLogicalAudioFixture(AudioManager &manager, Real minimumVolume,
+	AudioType soundType)
 {
 	TheAudio = &manager;
 	manager.AudioManager::reset();
@@ -171,7 +173,11 @@ static AudioEventInfo *ConfigureLogicalAudioFixture(AudioManager &manager, Real 
 
 	AudioEventInfo *info = manager.newAudioEventInfo("logical-audio-seed");
 	info->m_audioName = "logical-audio-seed";
-	info->m_soundType = AT_SoundEffect;
+	info->m_soundType = soundType;
+	if (soundType == AT_Music || soundType == AT_Streaming)
+	{
+		info->m_filename = "logical-audio-track";
+	}
 	info->m_type = ST_WORLD;
 	info->m_control = AC_RANDOM;
 	info->m_priority = AP_NORMAL;
@@ -208,20 +214,73 @@ static void ConfigureLogicalAudioEvent(AudioEventRTS &event,
 	event.setNextPlayPortion(PP_Sound);
 }
 
-static UnsignedInt NullLogicalAudioSeed(UnsignedInt seed, Bool logical, Int &playingIndex)
+enum LogicalAudioSettingCase
+{
+	LogicalAudioSetting_Enabled,
+	LogicalAudioSetting_SoundOff,
+	LogicalAudioSetting_Sound3DOff,
+	LogicalAudioSetting_MusicOff,
+	LogicalAudioSetting_SpeechOff
+};
+
+static AudioAffect GetLogicalAudioDisabledAffect(LogicalAudioSettingCase setting)
+{
+	switch (setting)
+	{
+		case LogicalAudioSetting_SoundOff: return AudioAffect_Sound;
+		case LogicalAudioSetting_Sound3DOff: return AudioAffect_Sound3D;
+		case LogicalAudioSetting_MusicOff: return AudioAffect_Music;
+		case LogicalAudioSetting_SpeechOff: return AudioAffect_Speech;
+		default: return static_cast<AudioAffect>(0);
+	}
+}
+
+static AudioType GetLogicalAudioSettingType(LogicalAudioSettingCase setting)
+{
+	return setting == LogicalAudioSetting_MusicOff ? AT_Music
+		: setting == LogicalAudioSetting_SpeechOff ? AT_Streaming : AT_SoundEffect;
+}
+
+static Bool IsLogicalAudioSettingPositional(LogicalAudioSettingCase setting)
+{
+	return setting == LogicalAudioSetting_Enabled
+		|| setting == LogicalAudioSetting_Sound3DOff;
+}
+
+static UnsignedInt NullLogicalAudioSeed(UnsignedInt seed, Bool logical, Int &playingIndex,
+	LogicalAudioSettingCase setting, Bool settingEnabled)
 {
 	NullAudioManager manager;
 	// The real common/Null path culls this AFTER filename/play-info generation.
 	// This provides a device-free RNG oracle without initializing SoundManager
 	// or changing any event methods, even when native rejects before queueing.
-	AudioEventInfo *info = ConfigureLogicalAudioFixture(manager, 2.0f);
+	const AudioType soundType = GetLogicalAudioSettingType(setting);
+	AudioEventInfo *info = ConfigureLogicalAudioFixture(manager, 2.0f, soundType);
 	Coord3D nearPosition = { 1.0f, 0.0f, 0.0f };
-	AudioEventRTS event(info->m_audioName, &nearPosition);
+	AudioEventRTS event(info->m_audioName);
+	if (IsLogicalAudioSettingPositional(setting))
+	{
+		event.setPosition(&nearPosition);
+	}
 	ConfigureLogicalAudioEvent(event, info, logical);
+	const AudioAffect disabledAffect = GetLogicalAudioDisabledAffect(setting);
+	if (disabledAffect != static_cast<AudioAffect>(0))
+	{
+		manager.setOn(settingEnabled, disabledAffect);
+	}
 	InitRandom(seed);
-	CHECK(manager.addAudioEvent(&event) == AHSV_Muted);
+	const AudioHandle result = manager.addAudioEvent(&event);
+	CHECK(result == (settingEnabled ? AHSV_Muted : AHSV_NoSound));
 	playingIndex = event.getPlayingAudioIndex();
-	CHECK(playingIndex >= 0 && playingIndex < 3);
+	if (soundType == AT_SoundEffect
+		&& (settingEnabled || RETAIL_COMPATIBLE_CRC))
+	{
+		CHECK(playingIndex >= 0 && playingIndex < 3);
+	}
+	else
+	{
+		CHECK(playingIndex == -1);
+	}
 	return GetGameLogicRandomSeedCRC();
 }
 
@@ -240,7 +299,7 @@ static void CheckNativeLogicalAudioSeed(UnsignedInt seed, Bool logical,
 	XAudio2AudioService service(std::make_unique<LogicalAudioEngineBackend>());
 	AudioAssetCatalog assets;
 	XAudio2AudioManager manager(&service, &assets);
-	AudioEventInfo *info = ConfigureLogicalAudioFixture(manager, 0.01f);
+	AudioEventInfo *info = ConfigureLogicalAudioFixture(manager, 0.01f, AT_SoundEffect);
 	manager.setChannelLimitsForTest(1, 1, 1);
 	manager.openDevice();
 	CHECK(manager.isOpen());
@@ -300,6 +359,55 @@ static void CheckNativeLogicalAudioSeed(UnsignedInt seed, Bool logical,
 	CHECK(manager.getActiveAudioCount() == 0);
 }
 
+static void CheckNativeLogicalAudioSettingSeed(UnsignedInt seed,
+	LogicalAudioSettingCase setting, Bool settingEnabled, UnsignedInt expectedCRC,
+	Int expectedIndex)
+{
+	XAudio2AudioService service(std::make_unique<LogicalAudioEngineBackend>());
+	AudioAssetCatalog assets;
+	XAudio2AudioManager manager(&service, &assets);
+	const AudioType soundType = GetLogicalAudioSettingType(setting);
+	AudioEventInfo *info = ConfigureLogicalAudioFixture(manager, 0.01f, soundType);
+	manager.setChannelLimitsForTest(1, 1, 1);
+	manager.openDevice();
+	CHECK(manager.isOpen());
+	Coord3D position = { 1.0f, 0.0f, 0.0f };
+	AudioEventRTS event(info->m_audioName);
+	if (IsLogicalAudioSettingPositional(setting))
+	{
+		event.setPosition(&position);
+	}
+	ConfigureLogicalAudioEvent(event, info, TRUE);
+	const AudioAffect disabledAffect = GetLogicalAudioDisabledAffect(setting);
+	CHECK(disabledAffect != static_cast<AudioAffect>(0));
+	manager.setOn(settingEnabled, disabledAffect);
+	InitRandom(seed);
+	const AudioHandle result = manager.addAudioEvent(&event);
+	const UnsignedInt actualCRC = GetGameLogicRandomSeedCRC();
+	if (actualCRC != expectedCRC)
+	{
+		printf("Logical audio setting seed mismatch: seed=%u setting=%d null=%u native=%u\n",
+			seed, setting, expectedCRC, actualCRC);
+	}
+	CHECK(actualCRC == expectedCRC);
+#if RETAIL_COMPATIBLE_CRC
+	CHECK(event.getPlayingAudioIndex() == expectedIndex);
+#else
+	(void)expectedIndex;
+#endif
+	if (settingEnabled)
+	{
+		CHECK(result >= AHSV_FirstHandle);
+		CHECK(manager.getPendingAudioRequestCount() == 1);
+	}
+	else
+	{
+		CHECK(result == AHSV_NoSound);
+		CHECK(manager.getPendingAudioRequestCount() == 0);
+	}
+	CHECK(manager.getActiveAudioCount() == 0);
+}
+
 static void TestNativeLogicalAudioSeed()
 {
 	LogicalAudioEnvironment environment;
@@ -311,7 +419,8 @@ static void TestNativeLogicalAudioSeed()
 			InitRandom(seeds[seedIndex]);
 			const UnsignedInt initialCRC = GetGameLogicRandomSeedCRC();
 			Int expectedIndex = -1;
-			const UnsignedInt expectedCRC = NullLogicalAudioSeed(seeds[seedIndex], logical, expectedIndex);
+			const UnsignedInt expectedCRC = NullLogicalAudioSeed(seeds[seedIndex], logical,
+				expectedIndex, LogicalAudioSetting_Enabled, TRUE);
 #if RETAIL_COMPATIBLE_CRC
 			CHECK(logical ? expectedCRC != initialCRC : expectedCRC == initialCRC);
 #else
@@ -321,6 +430,33 @@ static void TestNativeLogicalAudioSeed()
 			{
 				CheckNativeLogicalAudioSeed(seeds[seedIndex], logical,
 					static_cast<LogicalAudioAdmissionCase>(admission), expectedCRC, expectedIndex);
+			}
+			if (logical)
+			{
+				for (Int setting = LogicalAudioSetting_SoundOff;
+					setting <= LogicalAudioSetting_SpeechOff; ++setting)
+				{
+					const LogicalAudioSettingCase settingCase =
+						static_cast<LogicalAudioSettingCase>(setting);
+					Int expectedEnabledIndex = -1;
+					Int expectedDisabledIndex = -1;
+					const UnsignedInt expectedEnabledCRC = NullLogicalAudioSeed(
+						seeds[seedIndex], TRUE, expectedEnabledIndex, settingCase, TRUE);
+					const UnsignedInt expectedDisabledCRC = NullLogicalAudioSeed(
+						seeds[seedIndex], TRUE, expectedDisabledIndex, settingCase, FALSE);
+#if RETAIL_COMPATIBLE_CRC
+					CHECK(expectedEnabledCRC != initialCRC);
+					CHECK(expectedDisabledCRC != initialCRC);
+#else
+					CHECK(expectedEnabledCRC == initialCRC);
+					CHECK(expectedDisabledCRC == initialCRC);
+#endif
+					CHECK(expectedDisabledCRC == expectedEnabledCRC);
+					CheckNativeLogicalAudioSettingSeed(seeds[seedIndex], settingCase, TRUE,
+						expectedEnabledCRC, expectedEnabledIndex);
+					CheckNativeLogicalAudioSettingSeed(seeds[seedIndex], settingCase, FALSE,
+						expectedDisabledCRC, expectedDisabledIndex);
+				}
 			}
 		}
 	}
@@ -1341,7 +1477,7 @@ int main(int argc, char **argv)
 #if defined(_WIN64)
 	if (argc == 2 && strcmp(argv[1], "--native-logical-audio") == 0)
 	{
-		printf("Running 20 production-linked, device-free logical audio cases.\n");
+		printf("Running 36 production-linked, device-free logical audio cases.\n");
 		fflush(stdout);
 		TestNativeLogicalAudioSeed();
 		if (s_failures != 0)

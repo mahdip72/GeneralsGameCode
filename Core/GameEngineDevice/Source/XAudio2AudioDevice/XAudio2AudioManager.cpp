@@ -305,6 +305,11 @@ void XAudio2AudioManager::setActiveMusicTrackForTest(const AsciiString &track)
 	m_activeMusicTrack = track;
 }
 
+UnsignedInt XAudio2AudioManager::getForcedAudioReservationCountForTest() const
+{
+	return static_cast<UnsignedInt>(m_forcePlayHandles.size());
+}
+
 void XAudio2AudioManager::setOwnedServiceForTest(std::unique_ptr<XAudio2AudioService> service)
 {
 	closeDevice();
@@ -418,6 +423,7 @@ void XAudio2AudioManager::reset()
 	AudioManager::reset();
 	removeAllAudioRequests();
 	removeLevelSpecificAudioEventInfos();
+	m_activeMusicTrack.clear();
 	++m_lifecycleGeneration;
 	if (m_lifecycleGeneration == 0) {
 		m_lifecycleGeneration = 1;
@@ -530,6 +536,20 @@ AudioHandle XAudio2AudioManager::addAudioEvent(const AudioEventRTS *eventToAdd)
 		}
 	}
 	const AudioEventInfo *eventInfo = eventToAdd->getAudioEventInfo();
+	RefCountPtr<DynamicAudioEventRTS> prepared;
+#if RETAIL_COMPATIBLE_CRC
+	const Bool logicalAudio = eventToAdd->getIsLogicalAudio();
+#else
+	const Bool logicalAudio = FALSE;
+#endif
+	if (logicalAudio) {
+		// Logical filename/play-info generation advances the synchronized RNG.
+		// Bypass the helper's admission filters only: the checks below still
+		// apply, and this prepared event never receives force-play privileges.
+		if (!prepareAudioEventForPlayback(eventToAdd, prepared, TRUE)) {
+			return AHSV_Error;
+		}
+	}
 	switch (eventInfo->m_soundType) {
 		case AT_Music:
 			if (!isOn(AudioAffect_Music)) return AHSV_NoSound;
@@ -542,20 +562,6 @@ AudioHandle XAudio2AudioManager::addAudioEvent(const AudioEventRTS *eventToAdd)
 			if ((getDisallowSpeech() && !eventToAdd->getUninterruptible())
 				|| !isOn(AudioAffect_Speech)) return AHSV_NoSound;
 			break;
-	}
-#if RETAIL_COMPATIBLE_CRC
-	const Bool logicalAudio = eventToAdd->getIsLogicalAudio();
-#else
-	const Bool logicalAudio = FALSE;
-#endif
-	RefCountPtr<DynamicAudioEventRTS> prepared;
-	if (logicalAudio) {
-		// Logical filename/play-info generation advances the synchronized RNG.
-		// Bypass the helper's admission filters only: the checks below still
-		// apply, and this prepared event never receives force-play privileges.
-		if (!prepareAudioEventForPlayback(eventToAdd, prepared, TRUE)) {
-			return AHSV_Error;
-		}
 	}
 	if (!m_admissionOpen) {
 		return AHSV_NoSound;
@@ -643,6 +649,17 @@ void XAudio2AudioManager::friend_forcePlayAudioEventRTS(const AudioEventRTS *eve
 		&& prepareAudioEventForPlayback(eventToPlay, prepared, TRUE)) {
 		enqueuePlay(prepared.Release(), TRUE);
 	}
+}
+
+void XAudio2AudioManager::releaseAudioRequest(AudioRequest *requestToRelease)
+{
+	if (requestToRelease != nullptr && requestToRelease->m_request == AR_Play
+		&& requestToRelease->m_pendingEvent != nullptr) {
+		const AudioHandle handle = requestToRelease->m_pendingEvent->getPlayingHandle();
+		m_forcePlayHandles.erase(std::remove(m_forcePlayHandles.begin(), m_forcePlayHandles.end(), handle),
+			m_forcePlayHandles.end());
+	}
+	AudioManager::releaseAudioRequest(requestToRelease);
 }
 
 void XAudio2AudioManager::processRequestList()
@@ -870,6 +887,9 @@ void XAudio2AudioManager::startNextPhase(PlayingAudio &playing)
 			}
 			return;
 		}
+	}
+	if (playing.phase == PP_Done) {
+		failPlaying(playing);
 	}
 }
 
@@ -1168,8 +1188,16 @@ void XAudio2AudioManager::processActiveAudio()
 		}
 		if (playing.phaseRemainingMS <= 0.0f) {
 			Bool restartedLoop = FALSE;
-			if (playing.event->getAudioEventInfo() != nullptr
-				&& BitIsSet(playing.event->getAudioEventInfo()->m_control, AC_LOOP)) {
+			const AudioEventInfo *eventInfo = playing.event->getAudioEventInfo();
+			if (eventInfo != nullptr && eventInfo->m_soundType == AT_Music) {
+				if (playing.phase == PP_Sound) {
+					recordMusicCompletion(playing);
+				}
+				playing.event->setNextPlayPortion(PP_Sound);
+				playing.event->generateFilename();
+				playing.waitingForGeneratedDelay = playing.event->getDelay() > 0.0f;
+				restartedLoop = TRUE;
+			} else if (eventInfo != nullptr && BitIsSet(eventInfo->m_control, AC_LOOP)) {
 				// Miles counts a completed attack as the first loop portion and
 				// decrements before deciding whether another body may play.
 				if (playing.event->getNextPlayPortion() == PP_Attack) {
@@ -1306,6 +1334,24 @@ void XAudio2AudioManager::clearPlaying()
 	setDisallowSpeech(FALSE);
 }
 
+const XAudio2AudioManager::PlayingAudio *XAudio2AudioManager::findActiveMusic(
+	const AsciiString *trackName) const
+{
+	for (const PlayingAudio &playing : m_playing) {
+		if (playing.event == nullptr || !playing.voiceOpen
+			|| playing.generation != m_lifecycleGeneration || playing.paused
+			|| playing.stopping || playing.fadeFrames > 0 || playing.phase == PP_Done
+			|| !isMusic(*playing.event)) {
+			continue;
+		}
+		if (trackName != nullptr && *trackName != playing.event->getEventName()) {
+			continue;
+		}
+		return &playing;
+	}
+	return nullptr;
+}
+
 void XAudio2AudioManager::stopAudio(AudioAffect which)
 {
 	for (PlayingAudio &playing : m_playing) {
@@ -1398,12 +1444,15 @@ void XAudio2AudioManager::killAudioEventImmediately(AudioHandle audioEvent)
 
 AsciiString XAudio2AudioManager::nextMusicTrack()
 {
+	const PlayingAudio *activeMusic = findActiveMusic();
+	const AsciiString currentTrack = activeMusic != nullptr
+		? activeMusic->event->getEventName() : AsciiString::TheEmptyString;
 	for (PlayingAudio &playing : m_playing) {
 		if (isMusic(*playing.event)) {
 			playing.stopping = TRUE;
 		}
 	}
-	m_activeMusicTrack = nextTrackName(m_activeMusicTrack);
+	m_activeMusicTrack = nextTrackName(currentTrack);
 	if (m_admissionOpen && !m_activeMusicTrack.isEmpty()) {
 		AudioEventRTS track(m_activeMusicTrack);
 		getInfoForAudioEvent(&track);
@@ -1416,12 +1465,15 @@ AsciiString XAudio2AudioManager::nextMusicTrack()
 
 AsciiString XAudio2AudioManager::prevMusicTrack()
 {
+	const PlayingAudio *activeMusic = findActiveMusic();
+	const AsciiString currentTrack = activeMusic != nullptr
+		? activeMusic->event->getEventName() : AsciiString::TheEmptyString;
 	for (PlayingAudio &playing : m_playing) {
 		if (isMusic(*playing.event)) {
 			playing.stopping = TRUE;
 		}
 	}
-	m_activeMusicTrack = prevTrackName(m_activeMusicTrack);
+	m_activeMusicTrack = prevTrackName(currentTrack);
 	if (m_admissionOpen && !m_activeMusicTrack.isEmpty()) {
 		AudioEventRTS track(m_activeMusicTrack);
 		getInfoForAudioEvent(&track);
@@ -1434,22 +1486,13 @@ AsciiString XAudio2AudioManager::prevMusicTrack()
 
 Bool XAudio2AudioManager::isMusicPlaying() const
 {
-	for (const PlayingAudio &playing : m_playing) {
-		if (isMusic(*playing.event) && !playing.stopping) {
-			return TRUE;
-		}
-	}
-	return FALSE;
+	return findActiveMusic() != nullptr;
 }
 
 Bool XAudio2AudioManager::hasMusicTrackCompleted(const AsciiString &trackName, Int numberOfTimes) const
 {
-	for (const std::pair<AsciiString, Int> &completion : m_musicCompletions) {
-		if (completion.first == trackName) {
-			return completion.second >= numberOfTimes;
-		}
-	}
-	return FALSE;
+	const PlayingAudio *playing = findActiveMusic(&trackName);
+	return playing != nullptr && playing->musicCompletions >= numberOfTimes;
 }
 
 Bool XAudio2AudioManager::isCurrentlyPlaying(AudioHandle handle)
@@ -2083,16 +2126,10 @@ void XAudio2AudioManager::updateDisallowSpeechGuard()
 	setDisallowSpeech(guarded);
 }
 
-void XAudio2AudioManager::recordMusicCompletion(const PlayingAudio &playing)
+void XAudio2AudioManager::recordMusicCompletion(PlayingAudio &playing)
 {
 	if (playing.event == nullptr || !isMusic(*playing.event)) {
 		return;
 	}
-	for (std::pair<AsciiString, Int> &completion : m_musicCompletions) {
-		if (completion.first == playing.event->getEventName()) {
-			++completion.second;
-			return;
-		}
-	}
-	m_musicCompletions.push_back(std::make_pair(playing.event->getEventName(), 1));
+	++playing.musicCompletions;
 }
