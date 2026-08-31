@@ -1,4 +1,11 @@
+#include "Utility/CppMacros.h"
 #include "WWSaveLoad/pointertoken.h"
+#if defined(_WIN32)
+#include "WWLib/RAMFILE.h"
+#include "WWLib/chunkio.h"
+#include "WWSaveLoad/persistfactory.h"
+#include "WWSaveLoad/persist.h"
+#endif
 
 #include <array>
 #include <cstdint>
@@ -87,9 +94,113 @@ int TestPointerTokens()
 	return result;
 }
 
+#if defined(_WIN32)
+
+constexpr int PERSIST_FACTORY_TEST_CHUNK_ID = 0x7f000001;
+
+class PersistFactoryRoundTripObject : public PersistClass
+{
+public:
+	explicit PersistFactoryRoundTripObject(std::uint32_t value = 0U) : Value(value) {}
+
+	virtual const PersistFactoryClass &Get_Factory() const override;
+
+	virtual bool Save(ChunkSaveClass &csave) override
+	{
+		return csave.Write(&Value, static_cast<uint32>(sizeof(Value))) == sizeof(Value);
+	}
+
+	virtual bool Load(ChunkLoadClass &cload) override
+	{
+		return cload.Read(&Value, static_cast<uint32>(sizeof(Value))) == sizeof(Value);
+	}
+
+	std::uint32_t Get_Value() const { return Value; }
+
+private:
+	std::uint32_t Value;
+};
+
+typedef SimplePersistFactoryClass<PersistFactoryRoundTripObject, PERSIST_FACTORY_TEST_CHUNK_ID>
+	PersistFactoryRoundTripFactoryClass;
+PersistFactoryRoundTripFactoryClass PersistFactoryRoundTripFactory;
+
+const PersistFactoryClass &PersistFactoryRoundTripObject::Get_Factory() const
+{
+	return PersistFactoryRoundTripFactory;
+}
+
+int TestPersistFactoryRoundTrip()
+{
+	std::array<std::uint8_t, 128> storage = {{}};
+	RAMFileClass file(storage.data(), static_cast<int>(storage.size()));
+	PersistFactoryRoundTripObject source(UINT32_C(0x1234abcd));
+	const PersistFactoryClass &factory = source.Get_Factory();
+	int result = 0;
+
+	result |= Check(file.Open(FileClass::WRITE), "persist factory RAM file opens for write");
+	ChunkSaveClass save(&file);
+	result |= Check(save.Begin_Chunk(factory.Chunk_ID()),
+		"production persist factory parent chunk opens");
+	factory.Save(save, &source);
+	result |= Check(save.End_Chunk(), "production persist factory parent chunk closes");
+	file.Close();
+	result |= Check(file.Size() > 0, "persist factory writes a production object");
+
+	result |= Check(file.Open(FileClass::READ), "persist factory RAM file reopens for token inspection");
+	ChunkLoadClass token_load(&file);
+	std::array<std::uint8_t, PERSIST_POINTER_TOKEN_CURRENT_SIZE> encoded_token_bytes = {{}};
+	const uint32 token_size = Persist_Pointer_Token_Size();
+	result |= Check(token_load.Open_Chunk() && token_load.Cur_Chunk_ID() == factory.Chunk_ID(),
+		"production persist factory parent chunk has the expected id");
+	result |= Check(token_load.Open_Chunk(), "production pointer chunk opens");
+	result |= Check(token_load.Cur_Chunk_ID() ==
+		PersistFactoryRoundTripFactoryClass::SIMPLEFACTORY_CHUNKID_OBJPOINTER,
+		"production pointer chunk has the expected id");
+	result |= Check(token_load.Cur_Chunk_Length() == token_size,
+		"production pointer chunk uses the active token width");
+	result |= Check(token_load.Read(encoded_token_bytes.data(), token_size) == token_size,
+		"production pointer token reads in full");
+	result |= Check(token_load.Close_Chunk(), "production pointer chunk closes");
+	result |= Check(token_load.Close_Chunk(), "production persist factory parent chunk closes after inspection");
+	file.Close();
+
+	std::uintptr_t encoded_token = 0U;
+	result |= Check(Decode_Persist_Pointer_Token(encoded_token_bytes.data(), token_size,
+		&encoded_token), "production template writes a decodable pointer token");
+	result |= Check(encoded_token == reinterpret_cast<std::uintptr_t>(&source),
+		"production template preserves the source object identity token");
+
+	result |= Check(file.Open(FileClass::READ), "persist factory RAM file reopens for round trip");
+	ChunkLoadClass load(&file);
+	result |= Check(load.Open_Chunk() && load.Cur_Chunk_ID() == factory.Chunk_ID(),
+		"production persist factory parent chunk opens for round trip");
+	PersistClass *loaded_base = factory.Load(load);
+	result |= Check(loaded_base != nullptr, "production persist factory loads an object");
+	if (loaded_base != nullptr) {
+		PersistFactoryRoundTripObject *loaded =
+			static_cast<PersistFactoryRoundTripObject *>(loaded_base);
+		result |= Check(loaded->Get_Value() == source.Get_Value(),
+			"production persist factory preserves object data");
+		delete loaded;
+	}
+	result |= Check(load.Close_Chunk(),
+		"production persist factory parent chunk closes after round trip");
+	result |= Check(load.Cur_Chunk_Depth() == 0,
+		"production persist factory leaves the load stack balanced");
+	file.Close();
+	return result;
+}
+
+#endif // defined(_WIN32)
+
 } // namespace
 
 int main()
 {
-	return TestPointerTokens();
+	int result = TestPointerTokens();
+#if defined(_WIN32)
+	result |= TestPersistFactoryRoundTrip();
+#endif
+	return result;
 }

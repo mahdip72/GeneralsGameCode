@@ -186,8 +186,12 @@ SimplePersistFactoryClass<T,CHUNKID>::Save(ChunkSaveClass & csave,PersistClass *
 #else
 	uint8 token_bytes[PERSIST_POINTER_TOKEN_CURRENT_SIZE] = {};
 	const uint32 token_size = Persist_Pointer_Token_Size();
-	WWASSERT(Encode_Persist_Pointer_Token(reinterpret_cast<std::uintptr_t>(obj), token_bytes,
-		token_size));
+	const bool encoded = Encode_Persist_Pointer_Token(reinterpret_cast<std::uintptr_t>(obj),
+		token_bytes, token_size);
+	WWASSERT(encoded);
+	if (!encoded) {
+		return;
+	}
 	csave.Begin_Chunk(SIMPLEFACTORY_CHUNKID_OBJPOINTER);
 	csave.Write(token_bytes, token_size);
 	csave.End_Chunk();
