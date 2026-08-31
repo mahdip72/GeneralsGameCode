@@ -10,6 +10,10 @@
 #include <string.h>
 #include <vector>
 
+#if defined(_WIN32) && defined(_MSC_VER) && _MSC_VER < 1300 && defined(_M_IX86)
+#include <float.h>
+#endif
+
 #if !defined(_MSC_VER) || _MSC_VER >= 1300
 #include <thread>
 #if defined(_WIN32)
@@ -27,6 +31,28 @@ extern "C" void rts_job_system_release_test_pause(unsigned point);
 
 namespace
 {
+#if defined(_WIN32) && defined(_MSC_VER) && _MSC_VER < 1300 && defined(_M_IX86)
+class GameFloatingPointModeGuard
+{
+public:
+	GameFloatingPointModeGuard() : m_previous(_controlfp(0, 0))
+	{
+		// Match GameLogic::setFPMode for the VC6 WWMath differential oracle.
+		_fpreset();
+		_controlfp(_PC_24 | _RC_NEAR, _MCW_PC | _MCW_RC);
+	}
+	~GameFloatingPointModeGuard()
+	{
+		_controlfp(m_previous, _MCW_PC | _MCW_RC);
+	}
+
+private:
+	unsigned m_previous;
+	GameFloatingPointModeGuard(const GameFloatingPointModeGuard &);
+	GameFloatingPointModeGuard &operator=(const GameFloatingPointModeGuard &);
+};
+#endif
+
 int check(bool value, const char *message)
 {
 	if (value) return 0;
@@ -543,6 +569,9 @@ int floatingPointParity()
 
 int main()
 {
+#if defined(_WIN32) && defined(_MSC_VER) && _MSC_VER < 1300 && defined(_M_IX86)
+	GameFloatingPointModeGuard gameFloatingPointMode;
+#endif
 	int result = 0;
 	result |= scratchReuse();
 	const unsigned workers[] = { 1, 2, 4, 8, 16, 0 };

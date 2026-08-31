@@ -29,6 +29,9 @@ if(IS_VS6_BUILD)
     target_sources(core_task_runtime PRIVATE
         JobSystemLegacy.cpp
     )
+    # VC6's native STL and the product's STLport emit incompatible std::vector
+    # implementations. Keep the runtime and every consumer on the same ABI.
+    target_link_libraries(core_task_runtime PUBLIC stlport)
 endif()
 
 target_include_directories(core_task_runtime PUBLIC
