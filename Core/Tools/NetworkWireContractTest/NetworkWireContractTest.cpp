@@ -107,7 +107,7 @@ int TestNetworkHelloContract()
 	result |= Check(!HasNetworkHelloMagic(encoded.data(), 4U),
 		"a normal payload prefix is not classified as NET3");
 	result |= Check(HasNetworkHelloPrefix(encoded.data(), 4U),
-		"NET3 prefix classification quarantines unsupported record sizes");
+		"NET3 prefix classification routes unsupported record sizes to drop handling");
 	std::array<rts::runtime_epoch::Byte, 52U> obsoleteRecord = {{}};
 	for (std::size_t index = 0; index < obsoleteRecord.size(); ++index)
 		obsoleteRecord[index] = encoded[index];
@@ -310,13 +310,13 @@ int TestNetworkIngressPolicy()
 	int result = 0;
 	result |= Check(ClassifyNetworkIngress(true, false, true, true, false) ==
 		NetworkIngressDisposition::Quarantine,
-		"a malformed NET3-shaped packet from a known peer quarantines only that peer");
+		"a malformed NET3-shaped packet from a known peer reaches the drop-only handler");
 	result |= Check(ClassifyNetworkIngress(true, false, true, false, false) ==
 		NetworkIngressDisposition::Drop,
 		"a malformed NET3-shaped packet from an unknown peer is dropped");
 	result |= Check(ClassifyNetworkIngress(true, true, true, true, false) ==
 		NetworkIngressDisposition::Quarantine,
-		"an invalid exact-size NET3 candidate quarantines its known source");
+		"an invalid exact-size NET3 candidate reaches the drop-only handler");
 	result |= Check(ClassifyNetworkIngress(false, false, true, true, false) ==
 		NetworkIngressDisposition::Defer,
 		"known gameplay traffic is deferred while NET3 is required");
@@ -340,6 +340,35 @@ int TestNetworkIngressPolicy()
 		!IsNetworkPacketRouterEligible(2U, 0U, 8U, true, true) &&
 		!IsNetworkPacketRouterEligible(8U, 0U, 8U, true, false),
 		"router replacement admits only local or active connected peers");
+	return result;
+}
+
+int TestNetworkHelloDropPolicy()
+{
+	using namespace rts::network_epoch;
+	int result = 0;
+	const std::uint32_t expectedPeerMask = 0x06U;
+	std::uint32_t validatedPeerMask = 0x02U;
+	const std::uint32_t acknowledgedPeerMask = 0x06U;
+
+	result |= Check(ClassifyNetworkIngress(true, true, true, true, false) ==
+		NetworkIngressDisposition::Quarantine,
+		"a known malformed NET3 record is admitted only to the drop-only path");
+	result |= Check(!IsNetworkHelloComplete(expectedPeerMask, validatedPeerMask,
+			acknowledgedPeerMask),
+		"the invalid NET3 policy keeps the expected-peer gate closed until validation is complete");
+
+	// A valid retry updates only the validation mask; the original expected set
+	// remains authoritative for completion.
+	validatedPeerMask |= 0x04U;
+	result |= Check(IsNetworkHelloComplete(expectedPeerMask, validatedPeerMask,
+			acknowledgedPeerMask),
+		"the network policy permits a valid Hello retry to complete against the expected set");
+
+	result |= Check(IsNetworkHelloDeferredPeerQuotaExceeded(
+		8U, 64U, 8U) &&
+		!IsNetworkHelloDeferredPeerQuotaExceeded(7U, 64U, 8U),
+		"the deferred quota predicate marks only over-limit packets for drop");
 	return result;
 }
 
@@ -403,6 +432,38 @@ int TestNetworkNatPolicy()
 	result |= Check(IsValidNatPort(1024U) && IsValidNatPort(65535U) &&
 		!IsValidNatPort(1023U),
 		"NAT port parsing has a bounded valid range");
+	NativePortMessage parsedPort = {-1, 0U, 0U, 0U};
+	result |= Check(TryParseNativePortMessage(
+		" 2\t8088 \t0A000102\tA5A5A5A5 \r\n", &parsedPort) &&
+		parsedPort.node == 2 && parsedPort.port == 8088U &&
+		parsedPort.address == 0x0A000102U &&
+		parsedPort.probeCookie == 0xA5A5A5A5U &&
+		IsValidNatAddress(parsedPort.address),
+		"native NAT PORT fields accept bounded inter-token whitespace");
+	result |= Check(!TryParseNativePortMessage(
+		"1 1024abcd ff", &parsedPort),
+		"native NAT PORT rejects adjacent numeric fields without delimiters");
+	result |= Check(TryParseNativePortMessage(
+		"2 8088 00000000 A5A5A5A5", &parsedPort) &&
+		!IsValidNatAddress(parsedPort.address),
+		"native NAT PORT rejects a zero internal address before state mutation");
+	result |= Check(!TryParseNativePortMessage(
+		"2 4294967296 0A000102 A5A5A5A5", &parsedPort) &&
+		!TryParseNativePortMessage(
+			"2 8088 100000000 A5A5A5A5", &parsedPort),
+		"native NAT PORT rejects decimal and hexadecimal numeric overflow");
+	result |= Check(!TryParseNativePortMessage(
+		"2 8088 0A000102 A5A5A5A5junk", &parsedPort),
+		"native NAT PORT rejects trailing non-whitespace junk");
+	result |= Check(TryParseNativePortMessage(
+		"2 65536 0A000102 A5A5A5A5", &parsedPort) &&
+		!IsValidNatPort(parsedPort.port),
+		"native NAT PORT keeps the semantic port range check after parsing");
+	std::array<char, kNativePortMessageMaxLength + 1U> overlongPort = {{}};
+	for (std::size_t index = 0; index + 1U < overlongPort.size(); ++index)
+		overlongPort[index] = '1';
+	result |= Check(!TryParseNativePortMessage(overlongPort.data(), &parsedPort),
+		"native NAT PORT rejects input beyond its bounded option length");
 	#if defined(_WIN64)
 	result |= Check(IsExpectedProbeSource(2, 2, 0xA5A5A5A5U, 0xA5A5A5A5U,
 		0x0a000103U, 3U, 8U),
@@ -449,5 +510,6 @@ int main()
 	return TestFixedSizes() | TestSizeConversion() | TestWrapperCapacity() |
 		TestNetworkHelloContract() | TestNetworkFramePublicationGate() |
 		TestNetworkHelloFailureHandlingPolicy() | TestNetworkIngressPolicy() |
-		TestNetworkFrameResendPolicy() | TestNetworkNatPolicy();
+		TestNetworkHelloDropPolicy() | TestNetworkFrameResendPolicy() |
+		TestNetworkNatPolicy();
 }

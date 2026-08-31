@@ -270,11 +270,58 @@ function Get-TokenViolations {
     }
 
     if ($processStart -ge 0 -and $processEnd -gt $processStart) {
-        $malformedQuarantineIndex = $process.IndexOf('quarantineNetworkHelloPeer(candidateSlot',
+        $malformedDropIndex = $process.IndexOf('dropInvalidNetworkHelloPacket(candidateSlot',
             [StringComparison]::Ordinal)
-        if ($malformedQuarantineIndex -lt 0 -or
-            $process.IndexOf('rejectNetworkHello(-1', [StringComparison]::Ordinal) -ge 0) {
-            $violations.Add('malformed NET3 records must quarantine only their identified peer')
+        if ($malformedDropIndex -lt 0 -or
+            $process.IndexOf('rejectNetworkHello(', [StringComparison]::Ordinal) -ge 0) {
+            $violations.Add('malformed NET3 records must use a nonfatal drop-only handler')
+        }
+    }
+
+    $dropStart = $Source.IndexOf('void ConnectionManager::dropInvalidNetworkHelloPacket(',
+        [StringComparison]::Ordinal)
+    $dropEnd = if ($dropStart -ge 0) {
+        $Source.IndexOf('Bool ConnectionManager::isNetworkHelloCandidate(', $dropStart,
+            [StringComparison]::Ordinal)
+    } else { -1 }
+    if ($dropStart -lt 0 -or $dropEnd -lt 0) {
+        $violations.Add('network invalid-packet drop path is missing')
+    } else {
+        $drop = $Source.Substring($dropStart, $dropEnd - $dropStart)
+        foreach ($forbidden in @(
+                'm_networkHelloExpectedSlots', 'm_networkHelloValidated',
+                'm_networkHelloAckReceived', 'm_networkHelloRemoteToken',
+                'm_networkHelloRequired', 'm_networkHelloFailed',
+                'm_networkHelloDeferred', 'm_networkHelloPending',
+                'm_packetRouterSlot', 'm_packetRouterFallback',
+                'm_frameData', 'setFrameData(', 'setQuitFrame(',
+                'm_connections[', 'setQuitting()', 'rejectNetworkHello(')) {
+            if ($drop.IndexOf($forbidden, [StringComparison]::Ordinal) -ge 0) {
+                $violations.Add('invalid NET3 packet handler must not mutate membership or fail the session')
+                break
+            }
+        }
+    }
+
+    $serviceStart = $Source.IndexOf('void ConnectionManager::serviceNetworkHello()',
+        [StringComparison]::Ordinal)
+    $serviceEnd = if ($serviceStart -ge 0) {
+        $Source.IndexOf('Bool ConnectionManager::sendNetworkHello(', $serviceStart,
+            [StringComparison]::Ordinal)
+    } else { -1 }
+    if ($serviceStart -lt 0 -or $serviceEnd -lt 0) {
+        $violations.Add('network handshake retry/timeout service is missing')
+    } else {
+        $service = $Source.Substring($serviceStart, $serviceEnd - $serviceStart)
+        foreach ($required in @(
+                'm_networkHelloExpectedSlots', 'm_networkHelloAttempts',
+                'm_networkHelloLastSend', 'IsNetworkHelloTimedOut(',
+                'IsNetworkHelloRetryDue(', 'IsNetworkHelloAttemptLimitReached(',
+                'rejectNetworkHello(-1, "NET3 handshake timed out")',
+                'rejectNetworkHello(-1, "NET3 handshake retry limit reached")')) {
+            if ($service.IndexOf($required, [StringComparison]::Ordinal) -lt 0) {
+                $violations.Add("NET3 handshake must retain its bounded retry/timeout failure gate '$required'")
+            }
         }
     }
 
@@ -292,29 +339,26 @@ function Get-TokenViolations {
             ($defer.IndexOf('maxPeerDeferredMessages', [StringComparison]::Ordinal) -lt 0 -and
              $defer.IndexOf('IsNetworkHelloDeferredPeerQuotaExceeded(', [StringComparison]::Ordinal) -lt 0) -or
             $defer.IndexOf('matchesNetworkPeerEndpoint(', [StringComparison]::Ordinal) -lt 0 -or
-            $defer.IndexOf('quarantineNetworkHelloPeer(sourceSlot', [StringComparison]::Ordinal) -lt 0 -or
+             $defer.IndexOf('dropInvalidNetworkHelloPacket(sourceSlot', [StringComparison]::Ordinal) -lt 0 -or
             $defer.IndexOf('m_networkHelloDeferredCount >= static_cast<UnsignedInt>(MAX_MESSAGES)',
                 [StringComparison]::Ordinal) -lt 0 -or
-            $defer.IndexOf('rejectNetworkHello(-1', [StringComparison]::Ordinal) -ge 0) {
-            $violations.Add('deferred NET3 traffic must use a per-peer bound and scoped overflow handling')
+            $defer.IndexOf('rejectNetworkHello(', [StringComparison]::Ordinal) -ge 0) {
+            $violations.Add('deferred NET3 traffic must use a per-peer bound and drop-only overflow handling')
         }
     }
 
-    $quarantineStart = $Source.IndexOf('void ConnectionManager::quarantineNetworkHelloPeer(',
+    $dropStart = $Source.IndexOf('void ConnectionManager::dropInvalidNetworkHelloPacket(',
         [StringComparison]::Ordinal)
-    $quarantineEnd = if ($quarantineStart -ge 0) {
-        $Source.IndexOf('Bool ConnectionManager::isNetworkHelloCandidate(', $quarantineStart,
+    $dropEnd = if ($dropStart -ge 0) {
+        $Source.IndexOf('Bool ConnectionManager::isNetworkHelloCandidate(', $dropStart,
             [StringComparison]::Ordinal)
     } else { -1 }
-    if ($quarantineStart -lt 0 -or $quarantineEnd -lt 0) {
-        $violations.Add('network peer quarantine path is missing')
+    if ($dropStart -lt 0 -or $dropEnd -lt 0) {
+        $violations.Add('network invalid-packet drop path is missing')
     } else {
-        $quarantine = $Source.Substring($quarantineStart, $quarantineEnd - $quarantineStart)
-        if ($quarantine.IndexOf('dropNetworkHelloDeferredForPeer(slot)', [StringComparison]::Ordinal) -lt 0 -or
-            $quarantine.IndexOf('m_networkHelloExpectedSlots &= ~(1U << slot)',
-                [StringComparison]::Ordinal) -lt 0 -or
-            $quarantine.IndexOf('setQuitting()', [StringComparison]::Ordinal) -lt 0) {
-            $violations.Add('scoped network peer quarantine must remove only that peer from the gate')
+        $drop = $Source.Substring($dropStart, $dropEnd - $dropStart)
+        if ($drop.IndexOf('DEBUG_LOG_LEVEL', [StringComparison]::Ordinal) -lt 0) {
+            $violations.Add('invalid NET3 packet drop path must retain bounded diagnostics')
         }
     }
 
@@ -357,7 +401,7 @@ function Get-TokenViolations {
         $prefixIndex = $relay.IndexOf('HasNetworkHelloPrefix(', [StringComparison]::Ordinal)
         $magicIndex = $relay.IndexOf('HasNetworkHelloMagic(', [StringComparison]::Ordinal)
         if ($prefixIndex -lt 0 -or $magicIndex -le $prefixIndex -or $parseIndex -le $magicIndex) {
-            $violations.Add('network relay must quarantine every NET3 prefix before gameplay parsing')
+            $violations.Add('network relay must route every NET3 prefix through bounded drop handling before gameplay parsing')
         }
         $knownEndpointIndex = $relay.IndexOf('isKnownNetworkPeerEndpoint(message)',
             [StringComparison]::Ordinal)
@@ -372,16 +416,13 @@ function Get-TokenViolations {
         if ($ordinaryIndex -lt 0 -or $ordinaryIndex -gt $parseIndex) {
             $violations.Add('network relay must source-bind ordinary gameplay packets after NET3')
         }
-        $malformedIndex = $relay.IndexOf(
-            'quarantineNetworkHelloPeer(sourceSlot, "malformed or unrelated NET3-sized payload")',
+        $malformedIndex = $relay.IndexOf('dropInvalidNetworkHelloPacket(sourceSlot',
             [StringComparison]::Ordinal)
         if ($malformedIndex -lt 0) {
-            $malformedIndex = $relay.IndexOf(
-                'quarantineNetworkHelloPeer(sourceSlot, "malformed or unsupported NET3 payload")',
-                [StringComparison]::Ordinal)
-        }
-        if ($malformedIndex -lt 0) {
-            $violations.Add('known NET3 senders must be quarantined when their identity is malformed')
+            $violations.Add('known NET3 senders must route malformed records to the drop-only handler')
+        } elseif ($relay.IndexOf('message.length = 0;', $malformedIndex,
+                [StringComparison]::Ordinal) -lt 0) {
+            $violations.Add('malformed NET3 packets must be consumed after the drop-only handler')
         }
     }
 
@@ -416,7 +457,10 @@ function Get-TokenViolations {
                 'str.format("PROBE%d %08X %08X"',
                 'options.format("PORT%d %d %08X %08X"',
                 'sscanf(probeText + probePrefixLength, "%d %X %X %c"',
-                'sscanf(c, "%d %u %X %X"')) {
+                'kNativePortMessageMaxLength',
+                'RequireNativePortDelimiter(',
+                'TryParseNativePortMessage(c, &parsedPort)',
+                'IsValidNatAddress(parsedPort.address)')) {
             if ($NATSource.IndexOf($required, [StringComparison]::Ordinal) -lt 0) {
                 $violations.Add("NAT probe cookie contract is missing '$required'")
             }
@@ -566,7 +610,7 @@ function Get-TokenViolations {
         }
 
         $modernPortParser = $NATSource.IndexOf(
-            'sscanf(c, "%d %u %X %X", &node, &intport, &addr, &probeCookie)',
+            'TryParseNativePortMessage(c, &parsedPort)',
             [StringComparison]::Ordinal)
         $legacyPortParser = $NATSource.IndexOf(
             'sscanf(c, "%d %X", &intport, &addr)', [StringComparison]::Ordinal)
@@ -680,7 +724,25 @@ void ConnectionManager::beginNetworkHello() {
     generateNetworkHelloToken(&m_networkHelloLocalToken);
     sendNetworkHello(i);
 }
-void ConnectionManager::serviceNetworkHello() {}
+void ConnectionManager::serviceNetworkHello() {
+    if ((m_networkHelloExpectedSlots & (1U << i)) != 0U) {
+        if (!m_networkHelloValidated[i] || !m_networkHelloAckReceived[i]) {
+            sendNetworkHello(i);
+        }
+    }
+    if (IsNetworkHelloTimedOut(now, m_networkHelloStartTime)) {
+        rejectNetworkHello(-1, "NET3 handshake timed out");
+        return;
+    }
+    if (!IsNetworkHelloRetryDue(now, m_networkHelloLastSend)) { return; }
+    if (IsNetworkHelloAttemptLimitReached(m_networkHelloAttempts)) {
+        rejectNetworkHello(-1, "NET3 handshake retry limit reached");
+        return;
+    }
+    m_networkHelloLastSend = now;
+    ++m_networkHelloAttempts;
+}
+Bool ConnectionManager::sendNetworkHello(Int slot) { return TRUE; }
 Bool ConnectionManager::sendNetworkHelloAck() {
     EncodeNetworkHello(m_networkHelloRemoteToken[slot], NetworkHelloKind::Ack);
 }
@@ -701,13 +763,10 @@ Bool ConnectionManager::isNetworkCommandSourceAuthorized() {
     }
     return IsNetworkCommandSourceAuthorized(sourceSlot, claimedSlot, packetRouterSlot);
 }
-void ConnectionManager::dropNetworkHelloDeferredForPeer() {}
-void ConnectionManager::quarantineNetworkHelloPeer() {
-    dropNetworkHelloDeferredForPeer(slot);
-    m_networkHelloExpectedSlots &= ~(1U << slot);
-    m_connections[slot]->setQuitting();
-}
 void ConnectionManager::rejectNetworkHello() {}
+void ConnectionManager::dropInvalidNetworkHelloPacket() {
+    DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("drop invalid NET3 packet"));
+}
 Bool ConnectionManager::isNetworkHelloCandidate() {
     DecodeNetworkHelloIdentity(message, &identity);
     findNetworkHelloSlot(identity);
@@ -719,7 +778,7 @@ void ConnectionManager::deferNetworkMessage() {
     UnsignedInt peerDeferredMessages = 0U;
     if (matchesNetworkPeerEndpoint(message, sourceSlot)) { ++peerDeferredMessages; }
     if (peerDeferredMessages >= maxPeerDeferredMessages) {
-        quarantineNetworkHelloPeer(sourceSlot, "NET3 deferred packet queue peer limit exceeded");
+        dropInvalidNetworkHelloPacket(sourceSlot, "NET3 deferred packet queue peer limit exceeded");
         return;
     }
     if (m_networkHelloDeferredCount >= static_cast<UnsignedInt>(MAX_MESSAGES)) { return; }
@@ -731,7 +790,7 @@ Bool ConnectionManager::processNetworkHello() {
     if (!result.ok()) {
         if (enforceFailure) {
             Int candidateSlot = slot;
-            quarantineNetworkHelloPeer(candidateSlot, "malformed or incompatible NET3 record");
+            dropInvalidNetworkHelloPacket(candidateSlot, "malformed or incompatible NET3 record");
         }
         return FALSE;
     }
@@ -841,8 +900,9 @@ void ConnectionManager::doRelay() {
         if (!isNetworkHelloCandidate(message)) {
             const Int sourceSlot = findNetworkPeerEndpoint(message);
             if (sourceSlot >= 0) {
-                quarantineNetworkHelloPeer(sourceSlot, "malformed or unrelated NET3-sized payload");
+                dropInvalidNetworkHelloPacket(sourceSlot, "malformed or unrelated NET3-sized payload");
             }
+            message.length = 0;
             return;
         }
     }
@@ -865,6 +925,20 @@ elseif(RTS_BUILD_PRODUCT)
 endif()
 '@
     $goodNAT = @'
+struct NativePortMessage {
+    int node;
+    unsigned int port;
+    unsigned int address;
+    unsigned int probeCookie;
+};
+static const unsigned int kNativePortMessageMaxLength = 64U;
+inline bool RequireNativePortDelimiter(const char *&cursor, const char *end) {
+    return cursor < end;
+}
+inline bool TryParseNativePortMessage(const char *input, NativePortMessage *message) {
+    return input != nullptr && message != nullptr;
+}
+inline bool IsValidNatAddress(unsigned int address) { return address != 0U; }
 #if defined(_WIN64)
 class NATModernFields {
     Int m_expectedProbeNodeNumber;
@@ -901,9 +975,13 @@ void NAT::sendMangledPortNumberToTarget(...) {
 }
 void NAT::processGlobalMessage(...) {
 #if defined(_WIN64)
-    UnsignedInt probeCookie = 0U;
-    if (sscanf(c, "%d %u %X %X", &node, &intport, &addr, &probeCookie) != 4 ||
-        probeCookie == 0U) return;
+    NativePortMessage parsedPort = {-1, 0U, 0U, 0U};
+    if (!TryParseNativePortMessage(c, &parsedPort) ||
+        !IsValidNatAddress(parsedPort.address) || parsedPort.probeCookie == 0U) return;
+    const Int node = parsedPort.node;
+    const UnsignedInt intport = parsedPort.port;
+    const UnsignedInt addr = parsedPort.address;
+    const UnsignedInt probeCookie = parsedPort.probeCookie;
     if (IsNewProbeEpoch(m_expectedProbeNodeNumber, m_expectedProbeCookie,
             node, probeCookie)) {
         m_lastAcceptedProbeGeneration = 0U;
@@ -974,8 +1052,8 @@ void NAT::connectionUpdate() {
     }
     $missingPrefix = $goodSource.Replace('HasNetworkHelloPrefix(message)',
         'HasNetworkHelloMagic(message)')
-    if (-not ((Get-TokenViolations $missingPrefix $goodCMake $goodNAT) -match 'quarantine')) {
-        throw 'missing NET3 prefix quarantine fixture was not rejected'
+    if (-not ((Get-TokenViolations $missingPrefix $goodCMake $goodNAT) -match 'drop')) {
+        throw 'missing NET3 prefix drop fixture was not rejected'
     }
     $unguardedRouter = $goodSource.Replace(
         "#if defined(_WIN64)`n    packetRouterEligible = rts::network_epoch::IsNetworkPacketRouterEligible(`n        m_packetRouterSlot, m_localSlot, MAX_SLOTS, packetRouterHasConnection, packetRouterIsQuitting);`n#else",
@@ -996,16 +1074,35 @@ void NAT::connectionUpdate() {
         throw 'foreign deferred-packet fixture was not rejected'
     }
     $globalMalformed = $goodSource.Replace(
-        'quarantineNetworkHelloPeer(candidateSlot, "malformed or incompatible NET3 record");',
+        'dropInvalidNetworkHelloPacket(candidateSlot, "malformed or incompatible NET3 record");',
         'rejectNetworkHello(-1, "malformed or incompatible NET3 record");')
-    if (-not ((Get-TokenViolations $globalMalformed $goodCMake $goodNAT) -match 'malformed NET3')) {
+    if (-not ((Get-TokenViolations $globalMalformed $goodCMake $goodNAT) -match 'nonfatal drop-only')) {
         throw 'global malformed-NET3 failure fixture was not rejected'
     }
     $globalQueue = $goodSource.Replace(
-        'quarantineNetworkHelloPeer(sourceSlot, "NET3 deferred packet queue peer limit exceeded");',
+        'dropInvalidNetworkHelloPacket(sourceSlot, "NET3 deferred packet queue peer limit exceeded");',
         'rejectNetworkHello(-1, "NET3 deferred packet queue peer limit exceeded");')
     if (-not ((Get-TokenViolations $globalQueue $goodCMake $goodNAT) -match 'deferred NET3')) {
         throw 'global deferred-queue failure fixture was not rejected'
+    }
+    $mutatingInvalidDrop = $goodSource.Replace(
+        'void ConnectionManager::dropInvalidNetworkHelloPacket() {',
+        'void ConnectionManager::dropInvalidNetworkHelloPacket() { m_networkHelloExpectedSlots &= ~(1U << slot);')
+    if ($mutatingInvalidDrop -ceq $goodSource -or
+        -not ((Get-TokenViolations $mutatingInvalidDrop $goodCMake $goodNAT) -match 'must not mutate')) {
+        throw 'invalid-packet membership mutation fixture was not rejected'
+    }
+    $missingTimeoutGate = $goodSource.Replace(
+        'rejectNetworkHello(-1, "NET3 handshake timed out");',
+        'dropInvalidNetworkHelloPacket(-1, "NET3 handshake timed out");')
+    if (-not ((Get-TokenViolations $missingTimeoutGate $goodCMake $goodNAT) -match 'retry/timeout failure gate')) {
+        throw 'missing handshake timeout gate fixture was not rejected'
+    }
+    $missingRetryGate = $goodSource.Replace(
+        'rejectNetworkHello(-1, "NET3 handshake retry limit reached");',
+        'dropInvalidNetworkHelloPacket(-1, "NET3 handshake retry limit reached");')
+    if (-not ((Get-TokenViolations $missingRetryGate $goodCMake $goodNAT) -match 'retry/timeout failure gate')) {
+        throw 'missing handshake retry gate fixture was not rejected'
     }
     $unboundTransport = $goodSource.Replace(
         'const Int sourceSlot = findNetworkPeerEndpoint(message);',

@@ -25,7 +25,7 @@ namespace network_epoch
 //
 // This tokenized 60-byte record is mandatory for the clean Stage 3 runtime
 // epoch. Earlier 52-byte development records and pre-epoch peers are
-// intentionally unsupported and are quarantined by their NET3 prefix.
+// intentionally unsupported and are dropped by their NET3 prefix.
 constexpr std::size_t kNetworkHelloKindSize = sizeof(std::uint32_t);
 constexpr std::size_t kNetworkHelloIdentitySize = 8U;
 constexpr std::size_t kNetworkHelloSessionTokenSize = sizeof(std::uint64_t);
@@ -133,6 +133,8 @@ enum class NetworkIngressDisposition : std::uint32_t
 	Drop = 0U,
 	Defer = 1U,
 	Process = 2U,
+	// Known NET3-shaped traffic is routed to a drop-only handler so a malformed
+	// packet cannot mutate membership while a valid retry remains possible.
 	Quarantine = 3U
 };
 

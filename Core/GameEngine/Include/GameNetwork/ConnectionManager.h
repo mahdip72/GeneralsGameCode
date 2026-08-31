@@ -196,8 +196,7 @@ private:
 	void drainNetworkHelloPendingCommands();
 	void clearNetworkHelloPendingCommands();
 	void rejectNetworkHello(Int slot, const char *reason);
-	void dropNetworkHelloDeferredForPeer(Int slot);
-	void quarantineNetworkHelloPeer(Int slot, const char *reason);
+	void dropInvalidNetworkHelloPacket(Int slot, const char *reason);
 	Int findNetworkHelloSlot(UnsignedInt senderSlot, UnsignedInt recipientSlot) const;
 #endif
 	void sendLocalCommandImmediate(NetCommandMsg *msg, UnsignedByte relay);

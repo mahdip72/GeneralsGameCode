@@ -1309,16 +1309,20 @@ void NAT::processGlobalMessage(Int slotNum, const char *options) {
 		// meant to be a phallic reference, you sicko.
 		const char *c = ptr + strlen("PORT");
 		#if defined(_WIN64)
-		Int node = -1;
-		UnsignedInt intport = 0;
-		UnsignedInt addr = 0;
-		UnsignedInt probeCookie = 0U;
-		if (sscanf(c, "%d %u %X %X", &node, &intport, &addr, &probeCookie) != 4 ||
-			!isNodeOwnedBySlot(node, slotNum) || node != m_targetNodeNumber ||
-			!rts::network_nat::IsValidNatPort(intport) || probeCookie == 0U) {
-			DEBUG_LOG(("NAT::processGlobalMessage - rejecting invalid PORT node %d from slot %d", node, slotNum));
+		rts::network_nat::NativePortMessage parsedPort = {-1, 0U, 0U, 0U};
+		if (!rts::network_nat::TryParseNativePortMessage(c, &parsedPort) ||
+			!isNodeOwnedBySlot(parsedPort.node, slotNum) ||
+			parsedPort.node != m_targetNodeNumber ||
+			!rts::network_nat::IsValidNatPort(parsedPort.port) ||
+			!rts::network_nat::IsValidNatAddress(parsedPort.address) ||
+			parsedPort.probeCookie == 0U) {
+			DEBUG_LOG(("NAT::processGlobalMessage - rejecting invalid PORT node %d from slot %d", parsedPort.node, slotNum));
 			return;
 		}
+		const Int node = parsedPort.node;
+		const UnsignedInt intport = parsedPort.port;
+		const UnsignedInt addr = parsedPort.address;
+		const UnsignedInt probeCookie = parsedPort.probeCookie;
 		UnsignedShort port = static_cast<UnsignedShort>(intport);
 		if (rts::network_nat::IsNewProbeEpoch(m_expectedProbeNodeNumber,
 			m_expectedProbeCookie, node, probeCookie))

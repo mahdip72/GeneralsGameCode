@@ -796,82 +796,13 @@ void ConnectionManager::rejectNetworkHello(Int slot, const char *reason)
 		m_connections[slot]->setQuitting();
 }
 
-void ConnectionManager::dropNetworkHelloDeferredForPeer(Int slot)
+void ConnectionManager::dropInvalidNetworkHelloPacket(Int slot, const char *reason)
 {
-	if (slot < 0 || slot >= MAX_SLOTS || m_connections[slot] == nullptr ||
-		m_connections[slot]->getUser() == nullptr)
-		return;
-
-	UnsignedInt writeIndex = 0U;
-	for (UnsignedInt readIndex = 0U; readIndex < m_networkHelloDeferredCount; ++readIndex)
-	{
-		if (matchesNetworkPeerEndpoint(m_networkHelloDeferred[readIndex], slot))
-		{
-			m_networkHelloDeferred[readIndex].length = 0;
-			continue;
-		}
-
-		if (writeIndex != readIndex)
-			m_networkHelloDeferred[writeIndex] = m_networkHelloDeferred[readIndex];
-		++writeIndex;
-	}
-
-	for (UnsignedInt index = writeIndex; index < m_networkHelloDeferredCount; ++index)
-		m_networkHelloDeferred[index].length = 0;
-	m_networkHelloDeferredCount = writeIndex;
-}
-
-void ConnectionManager::quarantineNetworkHelloPeer(Int slot, const char *reason)
-{
-	if (slot < 0 || slot >= MAX_SLOTS || m_connections[slot] == nullptr)
-	{
-		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::quarantineNetworkHelloPeer - ignoring invalid slot %d: %s",
-			slot, reason != nullptr ? reason : "invalid NET3 peer"));
-		return;
-	}
-
-	// Remove only this peer's deferred traffic. Other peers retain their
-	// already-received packets and can still complete the exchange.
-	dropNetworkHelloDeferredForPeer(slot);
-	m_networkHelloExpectedSlots &= ~(1U << slot);
-	m_networkHelloValidated[slot] = FALSE;
-	m_networkHelloAckReceived[slot] = FALSE;
-	m_networkHelloRemoteToken[slot] = 0U;
-	if (m_packetRouterSlot == static_cast<UnsignedInt>(slot))
-	{
-		UnsignedInt replacement = getNextPacketRouterSlot(static_cast<UnsignedInt>(slot));
-		for (Int attempt = 0; attempt < MAX_SLOTS && replacement < MAX_SLOTS; ++attempt)
-		{
-			const Bool hasConnection = m_connections[replacement] != nullptr;
-			const Bool connectionQuitting = hasConnection && m_connections[replacement]->isQuitting();
-			if (rts::network_epoch::IsNetworkPacketRouterEligible(replacement, m_localSlot,
-				MAX_SLOTS, hasConnection, connectionQuitting))
-				break;
-			replacement = getNextPacketRouterSlot(replacement);
-		}
-
-		const Bool replacementHasConnection = replacement < MAX_SLOTS && m_connections[replacement] != nullptr;
-		const Bool replacementIsQuitting = replacementHasConnection && m_connections[replacement]->isQuitting();
-		if (rts::network_epoch::IsNetworkPacketRouterEligible(replacement, m_localSlot,
-			MAX_SLOTS, replacementHasConnection, replacementIsQuitting))
-		{
-			m_packetRouterSlot = replacement;
-		}
-		else if (m_localSlot < MAX_SLOTS)
-		{
-			// A local route is represented by a null connection and therefore
-			// falls through to the direct-send path.
-			m_packetRouterSlot = m_localSlot;
-		}
-		else
-		{
-			m_packetRouterSlot = static_cast<UnsignedInt>(-1);
-		}
-		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::quarantineNetworkHelloPeer - packet router moved to slot %d",
-			m_packetRouterSlot));
-	}
-	m_connections[slot]->setQuitting();
-	DEBUG_LOG(("ConnectionManager::quarantineNetworkHelloPeer - dropping slot %d: %s",
+	// Invalid NET3 traffic is consumed by the caller, but it must not alter
+	// membership or the handshake gate. A valid retry from the same endpoint
+	// may still complete the bounded exchange; an incomplete exchange reaches
+	// the normal retry/timeout failure path.
+	DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::dropInvalidNetworkHelloPacket - dropping packet for slot %d: %s",
 		slot, reason != nullptr ? reason : "invalid NET3 peer"));
 }
 
@@ -898,7 +829,7 @@ void ConnectionManager::deferNetworkMessage(const TransportMessage &message)
 	const Int sourceSlot = findNetworkPeerEndpoint(message);
 	if (sourceSlot < 0)
 	{
-		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::deferNetworkMessage - discarding packet from unknown or quarantined endpoint"));
+		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::deferNetworkMessage - discarding packet from unknown or unavailable endpoint"));
 		return;
 	}
 
@@ -911,15 +842,15 @@ void ConnectionManager::deferNetworkMessage(const TransportMessage &message)
 	if (rts::network_epoch::IsNetworkHelloDeferredPeerQuotaExceeded(
 		peerDeferredMessages, static_cast<UnsignedInt>(MAX_MESSAGES), static_cast<UnsignedInt>(MAX_SLOTS)))
 	{
-		quarantineNetworkHelloPeer(sourceSlot, "NET3 deferred packet queue peer limit exceeded");
+		dropInvalidNetworkHelloPacket(sourceSlot, "NET3 deferred packet queue peer limit exceeded");
 		return;
 	}
 
 	if (m_networkHelloDeferredCount >= static_cast<UnsignedInt>(MAX_MESSAGES))
 	{
 		// A full shared queue must not let one packet disconnect unrelated peers.
-		// The per-peer limit above quarantines a peer that is flooding; once all
-		// peers have filled their fair share, drop only this incoming packet.
+		// Drop only this incoming packet; the fixed queue remains bounded and the
+		// peer can still complete the exchange with a later valid Hello.
 		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::deferNetworkMessage - dropping packet from slot %d because the shared queue is full",
 			sourceSlot));
 		return;
@@ -1022,7 +953,7 @@ Bool ConnectionManager::processNetworkHello(const TransportMessage &message, Boo
 					candidateIdentity.recipientSlot);
 			}
 			if (candidateSlot >= 0)
-				quarantineNetworkHelloPeer(candidateSlot, "malformed or incompatible NET3 record");
+				dropInvalidNetworkHelloPacket(candidateSlot, "malformed or incompatible NET3 record");
 		}
 		else
 			DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::processNetworkHello - ignoring malformed late NET3 record"));
@@ -1032,7 +963,7 @@ Bool ConnectionManager::processNetworkHello(const TransportMessage &message, Boo
 	const Int slot = findNetworkHelloSlot(identity.senderSlot, identity.recipientSlot);
 	if (slot < 0)
 	{
-		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::processNetworkHello - ignoring unknown or quarantined NET3 identity"));
+		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::processNetworkHello - ignoring unknown or unavailable NET3 identity"));
 		return FALSE;
 	}
 
@@ -1107,7 +1038,7 @@ void ConnectionManager::processTransportMessage(const TransportMessage &message)
 	const Int sourceSlot = findNetworkPeerEndpoint(message);
 	if (sourceSlot < 0)
 	{
-		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::processTransportMessage - discarding packet from unknown or quarantined endpoint"));
+		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::processTransportMessage - discarding packet from unknown or unavailable endpoint"));
 		return;
 	}
 
@@ -1243,7 +1174,7 @@ void ConnectionManager::doRelay() {
 			else if (disposition == rts::network_epoch::NetworkIngressDisposition::Quarantine)
 			{
 				if (sourceSlot >= 0)
-					quarantineNetworkHelloPeer(sourceSlot, "malformed or unsupported NET3 payload");
+					dropInvalidNetworkHelloPacket(sourceSlot, "malformed or unsupported NET3 payload");
 				else
 					DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::doRelay - discarding malformed or unsupported NET3 payload"));
 			}
