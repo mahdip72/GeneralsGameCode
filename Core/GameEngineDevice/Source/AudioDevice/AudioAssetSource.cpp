@@ -1264,7 +1264,9 @@ void FileAudioAssetSource::setSamplePcmCacheBudget(std::size_t bytes) noexcept
 	if (m_samplePcmCache == nullptr && bytes != 0) {
 		try {
 			m_samplePcmCache = std::make_unique<SamplePcmCache>();
-		} catch (const std::bad_alloc &) {
+		// Intentional catch-all at optional cache construction: product
+		// GameMemory may throw legacy ERROR_OUT_OF_MEMORY instead of std::bad_alloc.
+		} catch (...) {
 			return;
 		}
 	}
@@ -1471,7 +1473,9 @@ Bool FileAudioAssetSource::openPcmSampleStream(const AsciiString &fileName,
 		stream.reset();
 		try {
 			return openPcmStream(fileName, stream);
-		} catch (const std::bad_alloc &) {
+		// Keep the existing uncached fallback for either standard or legacy
+		// product allocation failure without coupling this target to GameMemory.
+		} catch (...) {
 			stream.reset();
 			return FALSE;
 		}
@@ -1555,7 +1559,9 @@ Bool FileAudioAssetSource::openPcmSampleStream(const AsciiString &fileName,
 		stream = std::make_unique<SamplePcmCache::Stream>(entry.pcm);
 		cache.entries.push_front(std::move(entry));
 		return TRUE;
-	} catch (const std::bad_alloc &) {
+	// Cache population is optional; contain either allocator's OOM at the
+	// existing fallback boundary and retry without publishing partial cache.
+	} catch (...) {
 		return openUncached();
 	}
 }

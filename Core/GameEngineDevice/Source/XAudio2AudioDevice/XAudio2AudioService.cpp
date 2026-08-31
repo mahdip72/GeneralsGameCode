@@ -349,7 +349,10 @@ XAudio2PcmVoiceHandle XAudio2AudioService::createVoice() noexcept
 	std::unique_ptr<XAudio2PcmVoice> voice;
 	try {
 		voice = std::make_unique<XAudio2PcmVoice>(*backend);
-	} catch (const std::bad_alloc &) {
+	// Intentional catch-all: this block is only the voice allocation boundary.
+	// Product GameMemory may throw legacy ERROR_OUT_OF_MEMORY instead of
+	// std::bad_alloc; keep standalone targets independent of that allocator.
+	} catch (...) {
 		const HRESULT destroyResult = backend->destroyWithResult();
 		if (m_failurePublication.hasFailure()) {
 			processPendingFailureLocked();
@@ -390,7 +393,10 @@ XAudio2PcmVoiceHandle XAudio2AudioService::createVoice() noexcept
 		if (index == m_voices.size()) {
 			m_voices.emplace_back();
 		}
-	} catch (const std::bad_alloc &) {
+	// Intentional catch-all: this block only grows the voice-record storage.
+	// Contain either standard or legacy product allocation failure before the
+	// existing voice teardown and error publication run.
+	} catch (...) {
 		const HRESULT voiceFailure = voice->getLastError();
 		voice->close();
 		const HRESULT teardownFailure = voice->getLastError();

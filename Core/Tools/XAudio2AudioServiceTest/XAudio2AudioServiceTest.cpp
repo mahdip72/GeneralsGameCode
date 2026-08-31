@@ -6,12 +6,217 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
+#include <malloc.h>
 #include <memory>
+#include <new>
 #include <thread>
 #include <string>
 #include <vector>
+
+namespace
+{
+enum class AllocationFailureKind : int
+{
+	NONE,
+	STANDARD_BAD_ALLOC,
+	NON_STANDARD
+};
+
+constexpr std::size_t NO_ALLOCATION_FAILURE = (std::numeric_limits<std::size_t>::max)();
+std::atomic<std::size_t> g_allocationFailureCountdown { NO_ALLOCATION_FAILURE };
+std::atomic<int> g_allocationFailureKind { static_cast<int>(AllocationFailureKind::NONE) };
+
+struct TestNonStdAllocationFailure
+{
+};
+
+void armAllocationFailureAfter(std::size_t successfulAllocations,
+	AllocationFailureKind kind) noexcept
+{
+	g_allocationFailureKind.store(static_cast<int>(kind), std::memory_order_release);
+	g_allocationFailureCountdown.store(successfulAllocations, std::memory_order_release);
+}
+
+void disarmAllocationFailure() noexcept
+{
+	g_allocationFailureCountdown.store(NO_ALLOCATION_FAILURE, std::memory_order_release);
+	g_allocationFailureKind.store(static_cast<int>(AllocationFailureKind::NONE),
+		std::memory_order_release);
+}
+
+AllocationFailureKind consumeAllocationFailure() noexcept
+{
+	std::size_t countdown = g_allocationFailureCountdown.load(std::memory_order_acquire);
+	while (countdown != NO_ALLOCATION_FAILURE) {
+		if (countdown == 0) {
+			if (g_allocationFailureCountdown.compare_exchange_weak(countdown,
+				NO_ALLOCATION_FAILURE, std::memory_order_acq_rel)) {
+				return static_cast<AllocationFailureKind>(g_allocationFailureKind.load(
+					std::memory_order_acquire));
+			}
+		} else if (g_allocationFailureCountdown.compare_exchange_weak(countdown,
+			countdown - 1, std::memory_order_acq_rel)) {
+			return AllocationFailureKind::NONE;
+		}
+	}
+	return AllocationFailureKind::NONE;
+}
+
+void *allocateTestMemory(std::size_t size, std::size_t alignment)
+{
+	switch (consumeAllocationFailure()) {
+	case AllocationFailureKind::STANDARD_BAD_ALLOC:
+		throw std::bad_alloc();
+	case AllocationFailureKind::NON_STANDARD:
+		throw TestNonStdAllocationFailure();
+	case AllocationFailureKind::NONE:
+		break;
+	}
+	const std::size_t allocationSize = size == 0 ? 1 : size;
+	void *memory = alignment <= alignof(std::max_align_t)
+		? std::malloc(allocationSize)
+		: _aligned_malloc(allocationSize, alignment);
+	if (memory == nullptr) {
+		throw std::bad_alloc();
+	}
+	return memory;
+}
+
+void freeTestMemory(void *memory, std::size_t alignment) noexcept
+{
+	if (alignment <= alignof(std::max_align_t)) {
+		std::free(memory);
+	} else {
+		_aligned_free(memory);
+	}
+}
+}
+
+// This executable-local replacement stays disarmed on normal test paths and
+// emulates the product allocator's non-standard OOM only at a selected new.
+void *operator new(std::size_t size)
+{
+	return allocateTestMemory(size, alignof(std::max_align_t));
+}
+
+void *operator new[](std::size_t size)
+{
+	return allocateTestMemory(size, alignof(std::max_align_t));
+}
+
+void operator delete(void *memory) noexcept
+{
+	freeTestMemory(memory, alignof(std::max_align_t));
+}
+
+void operator delete[](void *memory) noexcept
+{
+	freeTestMemory(memory, alignof(std::max_align_t));
+}
+
+void operator delete(void *memory, std::size_t) noexcept
+{
+	freeTestMemory(memory, alignof(std::max_align_t));
+}
+
+void operator delete[](void *memory, std::size_t) noexcept
+{
+	freeTestMemory(memory, alignof(std::max_align_t));
+}
+
+void *operator new(std::size_t size, const std::nothrow_t &) noexcept
+{
+	try {
+		return allocateTestMemory(size, alignof(std::max_align_t));
+	} catch (...) {
+		return nullptr;
+	}
+}
+
+void *operator new[](std::size_t size, const std::nothrow_t &) noexcept
+{
+	try {
+		return allocateTestMemory(size, alignof(std::max_align_t));
+	} catch (...) {
+		return nullptr;
+	}
+}
+
+void operator delete(void *memory, const std::nothrow_t &) noexcept
+{
+	freeTestMemory(memory, alignof(std::max_align_t));
+}
+
+void operator delete[](void *memory, const std::nothrow_t &) noexcept
+{
+	freeTestMemory(memory, alignof(std::max_align_t));
+}
+
+void *operator new(std::size_t size, std::align_val_t alignment)
+{
+	return allocateTestMemory(size, static_cast<std::size_t>(alignment));
+}
+
+void *operator new[](std::size_t size, std::align_val_t alignment)
+{
+	return allocateTestMemory(size, static_cast<std::size_t>(alignment));
+}
+
+void operator delete(void *memory, std::align_val_t alignment) noexcept
+{
+	freeTestMemory(memory, static_cast<std::size_t>(alignment));
+}
+
+void operator delete[](void *memory, std::align_val_t alignment) noexcept
+{
+	freeTestMemory(memory, static_cast<std::size_t>(alignment));
+}
+
+void operator delete(void *memory, std::size_t, std::align_val_t alignment) noexcept
+{
+	freeTestMemory(memory, static_cast<std::size_t>(alignment));
+}
+
+void operator delete[](void *memory, std::size_t, std::align_val_t alignment) noexcept
+{
+	freeTestMemory(memory, static_cast<std::size_t>(alignment));
+}
+
+void *operator new(std::size_t size, std::align_val_t alignment,
+	const std::nothrow_t &) noexcept
+{
+	try {
+		return allocateTestMemory(size, static_cast<std::size_t>(alignment));
+	} catch (...) {
+		return nullptr;
+	}
+}
+
+void *operator new[](std::size_t size, std::align_val_t alignment,
+	const std::nothrow_t &) noexcept
+{
+	try {
+		return allocateTestMemory(size, static_cast<std::size_t>(alignment));
+	} catch (...) {
+		return nullptr;
+	}
+}
+
+void operator delete(void *memory, std::align_val_t alignment,
+	const std::nothrow_t &) noexcept
+{
+	freeTestMemory(memory, static_cast<std::size_t>(alignment));
+}
+
+void operator delete[](void *memory, std::align_val_t alignment,
+	const std::nothrow_t &) noexcept
+{
+	freeTestMemory(memory, static_cast<std::size_t>(alignment));
+}
 
 namespace
 {
@@ -29,10 +234,12 @@ void check(bool condition, const char *message)
 class FakePcmVoiceBackend final : public IXAudio2PcmVoiceBackend
 {
 public:
-	FakePcmVoiceBackend(std::vector<std::string> &calls, int &destroyCount, HRESULT createResult) :
+	FakePcmVoiceBackend(std::vector<std::string> &calls, int &destroyCount, HRESULT createResult,
+		AllocationFailureKind allocationFailureAfterCreate) :
 		m_calls(calls),
 		m_destroyCount(destroyCount),
-		m_createResult(createResult)
+		m_createResult(createResult),
+		m_allocationFailureAfterCreate(allocationFailureAfterCreate)
 	{
 	}
 
@@ -40,6 +247,10 @@ public:
 	{
 		m_callback = callback;
 		m_calls.push_back("voice.create");
+		if (m_allocationFailureAfterCreate != AllocationFailureKind::NONE) {
+			armAllocationFailureAfter(0, m_allocationFailureAfterCreate);
+			m_allocationFailureAfterCreate = AllocationFailureKind::NONE;
+		}
 		return m_createResult;
 	}
 
@@ -114,6 +325,7 @@ private:
 	std::vector<std::string> &m_calls;
 	int &m_destroyCount;
 	HRESULT m_createResult;
+	AllocationFailureKind m_allocationFailureAfterCreate;
 	IXAudio2VoiceCallback *m_callback = nullptr;
 	std::vector<void *> m_submittedContexts;
 	bool m_destroyed = false;
@@ -129,6 +341,8 @@ public:
 	HRESULT createVoiceResult = S_OK;
 	bool returnPartialBackendOnCreateFailure = false;
 	HRESULT voiceCreateResult = S_OK;
+	AllocationFailureKind nextVoiceAllocationFailure = AllocationFailureKind::NONE;
+	AllocationFailureKind nextVoiceRecordGrowthFailure = AllocationFailureKind::NONE;
 	HRESULT stopResult = S_OK;
 	HRESULT closeResult = S_OK;
 	int openCalls = 0;
@@ -188,13 +402,20 @@ public:
 		}
 		if (FAILED(createVoiceResult)) {
 			if (returnPartialBackendOnCreateFailure) {
-				voice = std::make_unique<FakePcmVoiceBackend>(calls, voiceDestroyCount, S_OK);
+				voice = std::make_unique<FakePcmVoiceBackend>(calls, voiceDestroyCount, S_OK,
+					AllocationFailureKind::NONE);
 			}
 			return createVoiceResult;
 		}
-		auto pcmBackend = std::make_unique<FakePcmVoiceBackend>(calls, voiceDestroyCount, voiceCreateResult);
+		auto pcmBackend = std::make_unique<FakePcmVoiceBackend>(calls, voiceDestroyCount,
+			voiceCreateResult, nextVoiceRecordGrowthFailure);
 		lastVoiceBackend = pcmBackend.get();
 		voice = std::move(pcmBackend);
+		if (nextVoiceAllocationFailure != AllocationFailureKind::NONE) {
+			armAllocationFailureAfter(0, nextVoiceAllocationFailure);
+			nextVoiceAllocationFailure = AllocationFailureKind::NONE;
+		}
+		nextVoiceRecordGrowthFailure = AllocationFailureKind::NONE;
 		return createVoiceResult;
 	}
 
@@ -250,6 +471,69 @@ private:
 	CriticalErrorCallback m_callback = nullptr;
 	void *m_context = nullptr;
 };
+
+class AllocationFailureScope final
+{
+public:
+	~AllocationFailureScope()
+	{
+		disarmAllocationFailure();
+	}
+};
+
+void testVoiceAllocationFailure(AllocationFailureKind kind)
+{
+	disarmAllocationFailure();
+	auto backend = std::make_unique<FakeAudioEngine>();
+	FakeAudioEngine *backendView = backend.get();
+	backendView->nextVoiceAllocationFailure = kind;
+	XAudio2AudioService service(std::move(backend));
+	check(service.open(), "voice-allocation failure service opens");
+	XAudio2PcmVoiceHandle failed;
+	{
+		AllocationFailureScope failureScope;
+		failed = service.createVoice();
+	}
+	check(!failed.isValid(), "voice allocation failure returns an invalid handle");
+	check(service.getLastError() == E_OUTOFMEMORY,
+		"voice allocation failure publishes E_OUTOFMEMORY");
+	check(backendView->voiceDestroyCount == 1,
+		"voice allocation failure destroys the native backend exactly once");
+	check(service.createVoice().isValid(),
+		"service remains usable after voice allocation failure");
+	service.shutdown();
+}
+
+void testVoiceRecordGrowthFailure(AllocationFailureKind kind)
+{
+	disarmAllocationFailure();
+	auto backend = std::make_unique<FakeAudioEngine>();
+	FakeAudioEngine *backendView = backend.get();
+	backendView->nextVoiceRecordGrowthFailure = kind;
+	XAudio2AudioService service(std::move(backend));
+	check(service.open(), "voice-record-growth failure service opens");
+	XAudio2PcmVoiceHandle failed;
+	{
+		AllocationFailureScope failureScope;
+		failed = service.createVoice();
+	}
+	check(!failed.isValid(), "voice-record growth failure returns an invalid handle");
+	check(service.getLastError() == E_OUTOFMEMORY,
+		"voice-record growth failure publishes E_OUTOFMEMORY");
+	check(backendView->voiceDestroyCount == 1,
+		"voice-record growth failure tears down the voice exactly once");
+	check(service.createVoice().isValid(),
+		"service remains usable after voice-record growth failure");
+	service.shutdown();
+}
+
+void testAllocationFailureBoundaries()
+{
+	testVoiceAllocationFailure(AllocationFailureKind::STANDARD_BAD_ALLOC);
+	testVoiceAllocationFailure(AllocationFailureKind::NON_STANDARD);
+	testVoiceRecordGrowthFailure(AllocationFailureKind::STANDARD_BAD_ALLOC);
+	testVoiceRecordGrowthFailure(AllocationFailureKind::NON_STANDARD);
+}
 
 void testInjectedLifecycleAndIndependentVoices()
 {
@@ -958,6 +1242,7 @@ void testOtherSpatializationPathsKeepX3DAudio()
 
 int main()
 {
+	testAllocationFailureBoundaries();
 	testFailurePublicationFenceAndOrdering();
 	testCallbackGateAdmissionDrainAndReopen();
 	testHandleScopedOperationsAndConcurrentStaleAccess();
