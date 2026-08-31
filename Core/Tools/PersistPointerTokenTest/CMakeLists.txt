@@ -16,6 +16,7 @@ if(WIN32)
         core_wwsaveload
         core_wwlib
         core_wwdebug
+        core_wwstub
         winmm
     )
 
