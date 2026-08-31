@@ -32,6 +32,7 @@ $rawD3D8BoundaryPaths = @(
     'Core/Tools/TextureMipGeneratorTest/TextureMipGeneratorTest.cpp',
     'Core/Tools/LegacyTextureCreationTest/LegacyTextureCreationTest.cpp',
     'Core/Tools/RendererContractTest/RendererContractTest.cpp',
+    'Core/Tools/RendererContractTest/LegacyResetResourceTest.cpp',
     'Core/Tools/NativeD3D8CompatibilityTest/NativeD3D8CompatibilityTest.cpp'
 )
 
