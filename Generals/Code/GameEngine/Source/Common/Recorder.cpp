@@ -102,8 +102,8 @@ static_assert(static_cast<std::int32_t>(GameMessage::MSG_BEGIN_NETWORK_MESSAGES)
 	 rts::replay_command::kBeginNetworkMessageType, "native replay network ID must remain stable");
 static_assert(static_cast<std::int32_t>(GameMessage::MSG_END_NETWORK_MESSAGES) ==
 	 rts::replay_command::kEndNetworkMessageType, "native replay network end ID must remain stable");
-static_assert(MAX_SLOTS - 1 == rts::replay_command::kMaxReplayPlayerIndex,
-	"native replay player range must remain stable");
+static_assert(MAX_PLAYER_COUNT - 1 == rts::replay_command::kMaxReplayPlayerIndex,
+	"native replay engine player range must remain stable");
 
 static Bool scanNativeReplayPayload(File* file,
 	Int payloadBase,

@@ -190,9 +190,9 @@ int TestMalformedRecordsAreRejected()
 	std::array<Byte, 28> badPlayerIndex = {{}};
 	for (std::size_t i = 0; i < built.bytesWritten; ++i)
 		badPlayerIndex[i] = output[i];
-	badPlayerIndex[12] = 0x08U;
+	badPlayerIndex[12] = 0x10U;
 	result |= Check(ParseCanonicalReplayCommand(badPlayerIndex.data(), badPlayerIndex.size()).error ==
-		ReplayCommandError::InvalidPlayerIndex, "player index outside the replay slot range is rejected");
+		ReplayCommandError::InvalidPlayerIndex, "player index outside the engine player range is rejected");
 
 	return result;
 }
@@ -219,10 +219,46 @@ int TestBuilderRejectsInvalidInput()
 	result |= Check(BuildCanonicalReplayCommand({1U, 1001, 0, std::span<const ReplayCommandDescriptor>(), payload}, output).error ==
 		ReplayCommandError::PayloadSizeMismatch, "builder rejects payload without descriptors");
 
-	result |= Check(BuildCanonicalReplayCommand({1U, 1001, 8, std::span<const ReplayCommandDescriptor>(),
+	result |= Check(BuildCanonicalReplayCommand({1U, 1001, 16, std::span<const ReplayCommandDescriptor>(),
 		std::span<const Byte>()}, output).error == ReplayCommandError::InvalidPlayerIndex,
-		"builder rejects a player index outside the replay slot range");
+		"builder rejects a player index outside the engine player range");
 
+	return result;
+}
+
+int TestEnginePlayerIndicesAreNotLobbySlots()
+{
+	int result = 0;
+	for (const std::int32_t playerIndex : {-1, 0, 7, 8, 15})
+	{
+		std::array<Byte, kMaxReplayCommandBytes> output = {{}};
+		const BuildResult built = BuildCanonicalReplayCommand(
+			{1U, 1001, playerIndex, std::span<const ReplayCommandDescriptor>(),
+			 std::span<const Byte>()}, output);
+		result |= Check(built.ok(), "builder accepts the complete engine PlayerIndex domain");
+		if (!built.ok())
+			continue;
+		const ParseResult parsed = ParseCanonicalReplayCommand(output.data(), built.bytesWritten);
+		result |= Check(parsed.ok() && parsed.view.playerIndex == playerIndex,
+			"engine players including the eighth nonneutral player round-trip unchanged");
+	}
+	for (const std::int32_t playerIndex : {-2, 16})
+	{
+		std::array<Byte, kMaxReplayCommandBytes> output = {{}};
+		result |= Check(BuildCanonicalReplayCommand(
+			{1U, 1001, playerIndex, std::span<const ReplayCommandDescriptor>(),
+			 std::span<const Byte>()}, output).error == ReplayCommandError::InvalidPlayerIndex,
+			"builder rejects indices outside the engine player domain");
+		const BuildResult valid = BuildCanonicalReplayCommand(
+			{1U, 1001, 0, std::span<const ReplayCommandDescriptor>(),
+			 std::span<const Byte>()}, output);
+		result |= Check(valid.ok(), "invalid-player parser fixture starts from a valid command");
+		const std::uint32_t wireIndex = static_cast<std::uint32_t>(playerIndex);
+		for (std::size_t byte = 0; byte < 4; ++byte)
+			output[12U + byte] = static_cast<Byte>(wireIndex >> (byte * 8U));
+		result |= Check(ParseCanonicalReplayCommand(output.data(), valid.bytesWritten).error ==
+			ReplayCommandError::InvalidPlayerIndex, "parser rejects both invalid player-domain boundaries");
+	}
 	return result;
 }
 
@@ -252,5 +288,6 @@ int main()
 		TestAllArgumentTypesAndEmptyCommand() |
 		TestMalformedRecordsAreRejected() |
 		TestBuilderRejectsInvalidInput() |
+		TestEnginePlayerIndicesAreNotLobbySlots() |
 		TestReplayFramesAreMonotonicAndBounded();
 }

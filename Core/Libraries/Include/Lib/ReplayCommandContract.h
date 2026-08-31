@@ -23,7 +23,10 @@ constexpr std::uint8_t kMaxReplayDescriptors = 255U;
 constexpr std::int32_t kClearGameDataMessageType = 27;
 constexpr std::int32_t kBeginNetworkMessageType = 1000;
 constexpr std::int32_t kEndNetworkMessageType = 1999;
-constexpr std::int32_t kMaxReplayPlayerIndex = 7;
+// Commands store engine PlayerIndex values, not lobby slots. Player zero is
+// neutral; eight occupied lobby slots can therefore produce player index 8.
+// Both title recorders assert this bound against MAX_PLAYER_COUNT.
+constexpr std::int32_t kMaxReplayPlayerIndex = 15;
 
 // These are explicit wire IDs.  They intentionally mirror the stable
 // GameMessageArgumentDataType order without depending on that C++ enum's
