@@ -159,6 +159,23 @@ int testRendererFrameLifecycleState()
 	result |= check(!capture.isRequested() && capture.failureCount() == 0,
 		"successful visible capture consumes its request");
 
+	rts::render::RenderFrameOutcome queuedFrame;
+	result |= check(!queuedFrame.wasSubmitted() && !queuedFrame.wasPresented(),
+		"a new frame has neither queue admission nor presentation");
+	queuedFrame.markFrameEnded();
+	queuedFrame.markSubmitted();
+	result |= check(queuedFrame.wasSubmitted() && !queuedFrame.wasPresented() &&
+		queuedFrame.result() == rts::render::RENDER_RESULT_OK,
+		"queue admission does not falsely report presentation");
+	queuedFrame.recordCommandFailure(rts::render::RENDER_RESULT_FAILED);
+	result |= check(queuedFrame.wasSubmitted() && !queuedFrame.wasPresented() &&
+		queuedFrame.hasCommandFailure(),
+		"execution failure remains observable after queue admission");
+	rts::render::RenderFrameOutcome completedFrame;
+	completedFrame.markPresented();
+	result |= check(completedFrame.wasSubmitted() && completedFrame.wasPresented(),
+		"actual presentation also establishes submission");
+
 	rts::render::RenderFrameOutcome rejectedFrame;
 	result |= check(rejectedFrame.recordCommandFailure(
 		rts::render::RENDER_RESULT_FAILED),
@@ -5210,11 +5227,15 @@ int testD3D11LegacyBlendFactors()
 }
 
 int TestLegacyResetResources();
+int TestLegacyAsyncFramePolicy();
+int TestLegacyAsyncBridgeCompletion();
 
 int main()
 {
 	int result = 0;
 	result |= TestLegacyResetResources();
+	result |= TestLegacyAsyncFramePolicy();
+	result |= TestLegacyAsyncBridgeCompletion();
 	result |= testBackendNames();
 	result |= testGenerationSafeHandles();
 	result |= testNeutralDescriptorDefaults();

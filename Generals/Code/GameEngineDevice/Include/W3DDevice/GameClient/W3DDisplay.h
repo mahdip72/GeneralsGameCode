@@ -47,6 +47,7 @@ class RTS3DScene;
 class RTS2DScene;
 class RTS3DInterfaceScene;
 class TextureClass;
+class W3DModelPreloadState;
 
 
 //=============================================================================
@@ -137,6 +138,8 @@ public:
 #if defined(RTS_DEBUG)
 	virtual void dumpModelAssets(const char *path) override;	///< dump all used models/textures to a file.
 #endif
+	virtual void beginModelPreload() override;
+	virtual void endModelPreload() override;
 	virtual void preloadModelAssets( AsciiString model ) override;			///< preload model asset
 	virtual void preloadTextureAssets( AsciiString texture ) override;	///< preload texture asset
 
@@ -152,6 +155,9 @@ public:
 	virtual Int getLastFrameDrawCalls() override;				///< returns the number of draw calls issued in the previous frame
 
 protected:
+	void flushModelPreloads();
+	void cancelModelPreloads();
+	W3DModelPreloadState *m_modelPreloadState;
 
 	void initAssets();									///< init assets for WW3D
 	void init3DScene();									///< init 3D scene for WW3D

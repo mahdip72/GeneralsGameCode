@@ -30,6 +30,12 @@
 #include "GameNetwork/NetworkInterface.h"
 #include "GameNetwork/Transport.h"
 
+#if defined(_WIN64)
+#include "Lib/PipelineExecutionPolicy.h"
+
+static_assert(MAX_NETWORK_MESSAGE_LEN <= rts::network::NETWORK_IO_MAX_DATAGRAM,
+	"Socket I/O datagram budget must cover the configured transport payload");
+#endif
 
 //--------------------------------------------------------------------------
 // Packet-level encryption is an XOR operation, for speed reasons.  To get
@@ -72,6 +78,18 @@ Transport::Transport()
 {
 	m_winsockInit = false;
 	m_udpsock = nullptr;
+	m_useLatency = false;
+	m_usePacketLoss = false;
+#if defined(_WIN64)
+	m_ioOwner = nullptr;
+	m_ioGeneration = 0;
+	m_asyncSocketIO = rts::UseParallelPipelines();
+	m_socketIOPolicyOverride = false;
+	m_ioLastError = 0;
+	m_ioFallbackCount = 0;
+	memset(&m_stoppedIOMetrics, 0, sizeof(m_stoppedIOMetrics));
+	memset(m_ioPending, 0, sizeof(m_ioPending));
+#endif
 }
 
 Transport::~Transport()
@@ -86,6 +104,34 @@ Bool Transport::init( AsciiString ip, UnsignedShort port )
 
 Bool Transport::init( UnsignedInt ip, UnsignedShort port )
 {
+	// A rebind is a session boundary, including callers that omit reset(). Join
+	// the previous I/O owner before clearing buffers or reusing the endpoint.
+	reset();
+#if defined(_WIN64)
+	// Resolve the default at initialization, after command-line policy selection,
+	// and freeze it before creating any socket execution thread.
+	rts::LockPipelineExecutionMode();
+	if (!m_socketIOPolicyOverride) m_asyncSocketIO = rts::UseParallelPipelines();
+	if (m_asyncSocketIO)
+	{
+		m_ioOwner = rts::network::NetworkIoOwner::Create();
+		if (m_ioOwner && m_ioOwner->Start(ip, port))
+		{
+			m_ioGeneration = m_ioOwner->Generation();
+		}
+		else
+		{
+			// Start failure joins and closes before the legacy path can bind.
+			if (m_ioOwner) m_stoppedIOMetrics = m_ioOwner->Metrics();
+			rts::network::NetworkIoOwner::Destroy(m_ioOwner);
+			m_ioOwner = nullptr;
+			++m_ioFallbackCount;
+			DEBUG_LOG(("Transport::init - Socket I/O owner unavailable; using serial socket I/O"));
+		}
+	}
+	if (!m_ioOwner)
+	{
+#endif
 	// ----- Initialize Winsock -----
 	if (!m_winsockInit)
 	{
@@ -124,6 +170,11 @@ Bool Transport::init( UnsignedInt ip, UnsignedShort port )
 		m_udpsock = nullptr;
 		return false;
 	}
+#if defined(_WIN64)
+	}
+	memset(m_ioPending, 0, sizeof(m_ioPending));
+	m_ioLastError = 0;
+#endif
 
 	// ------- Clear buffers --------
 	int i=0;
@@ -162,6 +213,20 @@ Bool Transport::init( UnsignedInt ip, UnsignedShort port )
 
 void Transport::reset()
 {
+#if defined(_WIN64)
+	if (m_ioOwner)
+	{
+		// Lobby leave/quit paths explicitly call doSend before reset. Attempt
+		// accepted datagrams before closing, but never publish old ingress.
+		if (!m_ioOwner->Stop(true))
+			DEBUG_LOG(("Transport::reset - Socket I/O drain failed or cancelled queued sends"));
+		m_stoppedIOMetrics = m_ioOwner->Metrics();
+		rts::network::NetworkIoOwner::Destroy(m_ioOwner);
+		m_ioOwner = nullptr;
+	}
+	m_ioGeneration = 0;
+	memset(m_ioPending, 0, sizeof(m_ioPending));
+#endif
 	delete m_udpsock;
 	m_udpsock = nullptr;
 
@@ -170,26 +235,132 @@ void Transport::reset()
 		WSACleanup();
 		m_winsockInit = false;
 	}
+	for (size_t i = 0; i < ARRAY_SIZE(m_inBuffer); ++i)
+	{
+		m_inBuffer[i].length = 0;
+		m_outBuffer[i].length = 0;
+#if defined(RTS_DEBUG)
+		m_delayedInBuffer[i].message.length = 0;
+#endif
+	}
 }
+
+Bool Transport::hasSocket() const
+{
+#if defined(_WIN64)
+	if (m_ioOwner) return true;
+#endif
+	return m_udpsock != nullptr;
+}
+
+Bool Transport::hasAddressError()
+{
+#if defined(_WIN64)
+	if (m_ioOwner) return m_ioLastError == WSAEADDRNOTAVAIL;
+#endif
+	return m_udpsock && m_udpsock->GetStatus() == UDP::ADDRNOTAVAIL;
+}
+
+Bool Transport::allowBroadcasts(Bool enabled)
+{
+#if defined(_WIN64)
+	if (m_ioOwner) return m_ioOwner->AllowBroadcasts(enabled);
+#endif
+	return m_udpsock && m_udpsock->AllowBroadcasts(enabled);
+}
+
+Int Transport::socketError() const
+{
+#if defined(_WIN64)
+	if (m_ioOwner) return m_ioLastError;
+#endif
+	return WSAGetLastError();
+}
+
+Int Transport::readSocket(unsigned char *bytes, UnsignedInt capacity, sockaddr_in *from)
+{
+#if defined(_WIN64)
+	if (m_ioOwner)
+	{
+		rts::network::NetworkIoDatagram datagram;
+		const rts::network::NetworkIoOwner::Result result = m_ioOwner->Receive(m_ioGeneration, datagram);
+		if (result == rts::network::NetworkIoOwner::EMPTY) return 0;
+		if (result != rts::network::NetworkIoOwner::ACCEPTED)
+		{
+			m_ioLastError = m_ioOwner->LastError();
+			return -1;
+		}
+		// Match recvfrom truncation behavior: reject an oversized datagram,
+		// never publish a truncated prefix as a valid game message.
+		if (datagram.length > capacity) { m_ioLastError = WSAEMSGSIZE; return -1; }
+		memcpy(bytes, datagram.bytes, datagram.length);
+		memset(from, 0, sizeof(*from));
+		from->sin_family = AF_INET;
+		from->sin_addr.s_addr = htonl(datagram.address);
+		from->sin_port = htons(datagram.port);
+		return static_cast<Int>(datagram.length);
+	}
+#endif
+	return m_udpsock->Read(bytes, capacity, from);
+}
+
+#if defined(_WIN64)
+rts::network::NetworkIoMetrics Transport::getSocketIOMetrics() const
+{
+	if (m_ioOwner) return m_ioOwner->Metrics();
+	return m_stoppedIOMetrics;
+}
+
+Bool Transport::collectSocketSends()
+{
+	Bool result = true;
+	rts::network::NetworkIoCompletion completion;
+	while (m_ioOwner->PollSendCompletion(m_ioGeneration, completion) == rts::network::NetworkIoOwner::ACCEPTED)
+	{
+		if (completion.generation != m_ioGeneration || completion.token >= MAX_MESSAGES || !m_ioPending[completion.token])
+			continue;
+		m_ioPending[completion.token] = false;
+		if (completion.sentBytes > 0)
+		{
+			++m_outgoingPackets[m_statisticsSlot];
+			m_outgoingBytes[m_statisticsSlot] += completion.requestedBytes;
+			m_outBuffer[completion.token].length = 0;
+			if (completion.sentBytes != completion.requestedBytes)
+				DEBUG_LOG(("Transport::doSend - wanted to send %u bytes, only sent %d bytes", completion.requestedBytes, completion.sentBytes));
+		}
+		else
+		{
+			// Keep owner-side bytes for the next submission; a socket failure
+			// does not turn an accepted queue entry into a successful send.
+			m_ioLastError = completion.error;
+			result = false;
+		}
+	}
+	return result;
+}
+#endif
 
 Bool Transport::update()
 {
 	Bool retval = TRUE;
-	if (doRecv() == FALSE && m_udpsock && m_udpsock->GetStatus() == UDP::ADDRNOTAVAIL)
+	if (doRecv() == FALSE && hasAddressError())
 	{
 		retval = FALSE;
 	}
-	DEBUG_ASSERTLOG(retval, ("WSA error is %s", GetWSAErrorString(WSAGetLastError()).str()));
-	if (doSend() == FALSE && m_udpsock && m_udpsock->GetStatus() == UDP::ADDRNOTAVAIL)
+	DEBUG_ASSERTLOG(retval, ("WSA error is %s", GetWSAErrorString(socketError()).str()));
+	if (doSend() == FALSE && hasAddressError())
 	{
 		retval = FALSE;
 	}
-	DEBUG_ASSERTLOG(retval, ("WSA error is %s", GetWSAErrorString(WSAGetLastError()).str()));
+	DEBUG_ASSERTLOG(retval, ("WSA error is %s", GetWSAErrorString(socketError()).str()));
 	return retval;
 }
 
 Bool Transport::doSend() {
-	if (!m_udpsock)
+#if defined(_WIN64)
+	m_ioLastError = 0;
+#endif
+	if (!hasSocket())
 	{
 		DEBUG_LOG(("Transport::doSend() - m_udpSock is null!"));
 		return FALSE;
@@ -211,6 +382,10 @@ Bool Transport::doSend() {
 		m_unknownBytes[m_statisticsSlot] = 0;
 	}
 
+#if defined(_WIN64)
+	if (m_ioOwner && !collectSocketSends()) retval = FALSE;
+#endif
+
 	// Send all messages
 	for (size_t i = 0; i < ARRAY_SIZE(m_outBuffer); ++i)
 	{
@@ -222,6 +397,18 @@ Bool Transport::doSend() {
 			// But the max network message size needs to include the bytes of the transport message header and equal the max udp payload
 			// Therefore, transmitted data needs to add the extra bytes of the network header to the payloads length
 			int bytesToSend = m_outBuffer[i].length + sizeof(TransportMessageHeader);
+#if defined(_WIN64)
+			if (m_ioOwner)
+			{
+				if (m_ioPending[i]) continue;
+				const rts::network::NetworkIoOwner::Result submitted = m_ioOwner->Submit(m_ioGeneration,
+					static_cast<unsigned int>(i), m_outBuffer[i].addr, m_outBuffer[i].port,
+					reinterpret_cast<const unsigned char *>(&m_outBuffer[i]), bytesToSend);
+				if (submitted == rts::network::NetworkIoOwner::ACCEPTED) m_ioPending[i] = true;
+				else { retval = FALSE; break; } // Preserve FIFO and keep unsent owner bytes.
+				continue;
+			}
+#endif
 			// Send this message
 			if ((bytesSent = m_udpsock->Write((unsigned char *)(&m_outBuffer[i]), bytesToSend, m_outBuffer[i].addr, m_outBuffer[i].port)) > 0)
 			{
@@ -275,7 +462,10 @@ Bool Transport::doSend() {
 
 Bool Transport::doRecv()
 {
-	if (!m_udpsock)
+#if defined(_WIN64)
+	m_ioLastError = 0;
+#endif
+	if (!hasSocket())
 	{
 		DEBUG_LOG(("Transport::doRecv() - m_udpSock is null!"));
 		return FALSE;
@@ -314,7 +504,7 @@ Bool Transport::doRecv()
 	UnsignedInt processedMessages = 0;
 //	DEBUG_LOG(("Transport::doRecv - checking"));
 	while (ShouldReceiveNetworkMessage(processedMessages, bufferIndex < bufferCapacity) &&
-		(len=m_udpsock->Read(buf, MAX_NETWORK_MESSAGE_LEN, &from)) > 0)
+		(len=readSocket(buf, MAX_NETWORK_MESSAGE_LEN, &from)) > 0)
 	{
 		++processedMessages;
 #if defined(RTS_DEBUG)

@@ -613,13 +613,15 @@ bool HeightMapTerrainBatch::markComplete()
 }
 
 HeightMapTerrainRowWork::HeightMapTerrainRowWork(HeightMapTerrainBatch &batch)
-	: m_snapshot(&batch.snapshot()), m_output(batch.output())
+	: m_snapshot(&batch.snapshot()), m_output(batch.output()),
+	  m_inputValid(ValidateHeightMapTerrainInput(batch.snapshot(), batch.output()))
 {
 }
 
 HeightMapTerrainRowWork::HeightMapTerrainRowWork(
 	const HeightMapTerrainSnapshot &snapshot, HeightMapTerrainVertex *output)
-	: m_snapshot(&snapshot), m_output(output)
+	: m_snapshot(&snapshot), m_output(output),
+	  m_inputValid(ValidateHeightMapTerrainInput(snapshot, output))
 {
 }
 
@@ -629,8 +631,8 @@ HeightMapTerrainRowWork::~HeightMapTerrainRowWork()
 
 bool HeightMapTerrainRowWork::executeRows(unsigned rowBegin, unsigned rowEnd)
 {
-	return m_snapshot != 0 && m_output != 0 &&
-		PrepareHeightMapTerrainRows(*m_snapshot, m_output, rowBegin, rowEnd);
+	return m_inputValid && m_snapshot != 0 && m_output != 0 &&
+		PrepareValidatedHeightMapTerrainRows(*m_snapshot, m_output, rowBegin, rowEnd);
 }
 
 bool RunHeightMapTerrainBatch(HeightMapTerrainBatch &batch,

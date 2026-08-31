@@ -196,6 +196,7 @@ class DDSFileClass
 	char Name[256];
 
 	static unsigned Calculate_DXTC_Surface_Size(unsigned width, unsigned height, WW3DFormat format);
+	void Initialize_Header();
 	bool Get_4x4_Block_From_Memory(
 		const unsigned char* source_memory,
 		unsigned char* dest_ptr,
@@ -284,6 +285,10 @@ public:
 		const Vector3& hsv_shift=Vector3(0.0f,0.0f,0.0f)) const;
 
 	bool Load();
+	// A DDSFileClass(nullptr, reduction) has no filesystem ownership. Header
+	// inspection runs on owner; payload copy/decompression may run on compute.
+	bool Set_Memory_Header(const unsigned char *bytes, size_t size);
+	bool Load_From_Memory(const unsigned char *bytes, size_t size);
 	bool Is_Available() const { return !!LevelSizes; }
 };
 

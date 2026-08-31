@@ -11,6 +11,13 @@
 #include "Renderer/LegacyBridgeValidation.h"
 #include "Renderer/LegacyRenderState.h"
 #include "Renderer/RendererDevice.h"
+#if defined(_WIN64)
+#include "Renderer/ThreadedRenderDevice.h"
+#include "Renderer/LegacyAsyncFramePolicy.h"
+#include "Lib/PipelineExecutionPolicy.h"
+#include "Lib/ResourceIoPipeline.h"
+#include "textureloader.h"
+#endif
 #include "Lib/FrameTimingDiagnostics.h"
 
 #include <limits>
@@ -307,7 +314,19 @@ struct D3D11LegacyBridge::Impl
 		target_transition_failed(false), primitive_up_vertex_buffer(),
 		primitive_up_vertex_capacity(0), draw_texture_pinning(false),
 		draw_texture_pins(), vertex_buffer_index(),
-		index_buffer_index(), texture_index(), cache_counters() {}
+		index_buffer_index(), texture_index(), cache_counters()
+	{
+#if defined(_WIN64)
+		for (unsigned int i = 0; i < ASYNC_FRAME_CAPACITY; ++i)
+		{
+			async_frames[i].sequence = 0;
+			async_frames[i].frame = 0;
+		}
+		deferred_failure_sequence = 0;
+		recovered_failure_sequence = 0;
+		async_resource_failure = false;
+#endif
+	}
 
 	IRenderDevice *device;
 	IRenderContext *context;
@@ -362,6 +381,322 @@ struct D3D11LegacyBridge::Impl
 	rts::render::LegacyBridgePointerIndex index_buffer_index;
 	rts::render::LegacyBridgePointerIndex texture_index;
 	rts::render::LegacyBridgeCacheCounters cache_counters;
+#if defined(_WIN64)
+	enum { ASYNC_FRAME_CAPACITY = 64 };
+	struct AsyncFrame { uint64_t sequence; unsigned int frame; };
+	AsyncFrame async_frames[ASYNC_FRAME_CAPACITY];
+	rts::render::RenderFrameOutcome deferred_failure;
+	uint64_t deferred_failure_sequence;
+	uint64_t recovered_failure_sequence;
+	bool async_resource_failure;
+
+	bool Is_Threaded() const
+	{
+		return rts::render::IsThreadedRenderDevice(device);
+	}
+
+	// All publication is on the game owner. A sequence identifies the original
+	// producer frame even when several newer frames have already been built.
+	void Poll_Render_Completions(uint64_t wanted = 0,
+		rts::render::ThreadedRenderFrameCompletion *matched = 0)
+	{
+		rts::render::ThreadedRenderFrameCompletion completed;
+		while (rts::render::PollThreadedRenderCompletion(device, &completed))
+		{
+			async_resource_failure = async_resource_failure || completed.resourceFailure;
+			for (unsigned int i = 0; i < ASYNC_FRAME_CAPACITY; ++i)
+			{
+				if (async_frames[i].sequence == completed.sequence)
+				{
+					Complete_GPU_Copy_Frame(completed.result ==
+						rts::render::RENDER_RESULT_OK, async_frames[i].frame);
+					async_frames[i].sequence = 0;
+					break;
+				}
+			}
+			if (matched != 0 && wanted == completed.sequence) *matched = completed;
+			if (completed.result != rts::render::RENDER_RESULT_OK)
+			{
+				Log_Result("D3D11 render-owner frame completion failed", completed.result);
+				if (deferred_failure_sequence == 0 ||
+					rts::render::ShouldReplaceLegacyAsyncFrameFailure(deferred_failure, completed.outcome,
+						recovered_failure_sequence == deferred_failure_sequence))
+				{
+					deferred_failure = completed.outcome;
+					deferred_failure_sequence = completed.sequence;
+				}
+			}
+		}
+	}
+
+	bool Remember_Submission(uint64_t previous)
+	{
+		const uint64_t sequence = rts::render::LastThreadedRenderFrameSequence(device);
+		if (sequence == previous || sequence == 0) return false;
+		for (unsigned int i = 0; i < ASYNC_FRAME_CAPACITY; ++i)
+		{
+			if (async_frames[i].sequence == 0)
+			{
+				async_frames[i].sequence = sequence;
+				async_frames[i].frame = frame_id;
+				return true;
+			}
+		}
+		// The proxy reserves one completion slot at BeginFrame. Exhaustion here
+		// is an integration ownership error, not an allocation fallback.
+		Log("D3D11 bridge exhausted reserved frame-completion records");
+		abort();
+		return false;
+	}
+
+	void Cancel_Threaded_Frame(RenderResult reason)
+	{
+		if (!Is_Threaded()) return;
+		const uint64_t previous = rts::render::LastThreadedRenderFrameSequence(device);
+		rts::render::CancelThreadedRenderFrame(device, reason);
+		Remember_Submission(previous);
+	}
+
+	RenderResult Fence_Render()
+	{
+		if (!Is_Threaded()) return rts::render::RENDER_RESULT_OK;
+		const RenderResult result = rts::render::DrainThreadedRenderDevice(device);
+		Poll_Render_Completions();
+		return result;
+	}
+
+	IDirect3DSurface8 *Retain_Target_Surface(const rts::render::RenderTargetSubresource &target)
+	{
+		for (unsigned int index = 0; index < textures.size(); ++index)
+		{
+			TextureEntry &entry = textures[index];
+			if (entry.handle != target.resource || entry.source == 0 ||
+				entry.source->GetType() != D3DRTYPE_TEXTURE) continue;
+			IDirect3DSurface8 *surface = 0;
+			IDirect3DTexture8 *texture = static_cast<IDirect3DTexture8 *>(entry.source);
+			if (FAILED(texture->GetSurfaceLevel(target.mip, &surface)))
+			{
+				if (surface != 0) surface->Release();
+				return 0;
+			}
+			return surface;
+		}
+		return 0;
+	}
+
+	void Rebuild_Resource_Caches()
+	{
+		// A target may have been requested after the failed frame was submitted
+		// but before Begin_Frame polls its completion. Keep its owner-side source
+		// surfaces alive while replacing optimistic handles; never redirect that
+		// already accepted off-screen pass to the visible backbuffer.
+		RenderTargetBinding binding = pending_target_change ? pending_target : active_target;
+		const bool custom_color = binding.hasColor && !binding.useBackBufferColor;
+		const bool custom_depth = binding.hasDepth && !binding.useBackBufferDepth;
+		IDirect3DSurface8 *color = custom_color ? Retain_Target_Surface(binding.color) : 0;
+		IDirect3DSurface8 *depth = custom_depth ? Retain_Target_Surface(binding.depth) : 0;
+		Invalidate_GPU_Copy_Content();
+		Release_Caches();
+		Fence_Render();
+		active_target = RenderTargetBinding();
+		bool restored = true;
+		RenderResult result = rts::render::RENDER_RESULT_FAILED;
+		if (custom_color)
+		{
+			binding.color.resource = GpuHandle();
+			if (color == 0 || !Ensure_Render_Target(color, &binding.color.resource, &result))
+			{
+				binding.color.resource = GpuHandle();
+				restored = false;
+			}
+		}
+		if (custom_depth)
+		{
+			binding.depth.resource = GpuHandle();
+			if (depth == 0 || !Ensure_Depth_Target(depth, &binding.depth.resource, &result))
+			{
+				binding.depth.resource = GpuHandle();
+				restored = false;
+			}
+		}
+		if (color != 0) color->Release();
+		if (depth != 0) depth->Release();
+		pending_target = binding;
+		pending_target_change = true;
+		// A failed restore deliberately retains an invalid custom binding. The
+		// next Begin_Frame then fails closed until the caller requests a new one.
+		target_transition_failed = !restored;
+	}
+
+	void Service_Render_Completions()
+	{
+		if (!Is_Threaded()) return;
+		Require_Owner_Thread("render completion publication");
+		Poll_Render_Completions();
+		if (!device->isOperational() && (deferred_failure_sequence == 0 ||
+			(recovered_failure_sequence == deferred_failure_sequence &&
+				deferred_failure.recoveryResult() == rts::render::RENDER_RESULT_OK)))
+		{
+			// A full upload packet may execute before the first Begin_Frame. Its
+			// failure has no frame completion, so read the owner's retained error
+			// before Is_Active would otherwise suppress every future frame.
+			const RenderResult stalled_result = Fence_Render();
+			if (stalled_result != rts::render::RENDER_RESULT_OK)
+			{
+				rts::render::RenderFrameOutcome stalled_outcome;
+				stalled_outcome.recordCommandFailure(stalled_result);
+				stalled_outcome.setOperational(false);
+				if (deferred_failure_sequence == 0 ||
+					rts::render::ShouldReplaceLegacyAsyncFrameFailure(deferred_failure, stalled_outcome,
+						recovered_failure_sequence == deferred_failure_sequence))
+				{
+					deferred_failure = stalled_outcome;
+					// Reserved identity for a non-frame error. Never enter this value
+					// in async_frames or use it for GPU-copy/capture publication.
+					deferred_failure_sequence = ~static_cast<uint64_t>(0);
+					recovered_failure_sequence = 0;
+					async_resource_failure = true;
+				}
+			}
+		}
+		// The game owner may already have prepared another frame when removal
+		// occurs. Seal/cancel it before the lifecycle fence and never abandon it.
+		if (deferred_failure_sequence != 0 &&
+			(deferred_failure.hasDeviceRemoval() || !device->isOperational()) &&
+			recovered_failure_sequence != deferred_failure_sequence)
+		{
+			if (frame_open)
+			{
+				Cancel_Threaded_Frame(rts::render::RENDER_RESULT_DEVICE_REMOVED);
+				frame_open = false;
+			}
+			Fence_Render();
+			const RenderResult result = Recover_Device();
+			deferred_failure.recordRecovery(result);
+			deferred_failure.setOperational(device->isOperational());
+			Log_Result("D3D11 asynchronous device recovery", result);
+			// Keep the recovered failure until End_Frame reports it. Begin_Frame
+			// resets its current outcome and must not erase delayed failures.
+			recovered_failure_sequence = deferred_failure_sequence;
+		}
+		if (async_resource_failure && device->isOperational())
+		{
+			if (frame_open)
+			{
+				Cancel_Threaded_Frame(rts::render::RENDER_RESULT_FAILED);
+				frame_open = false;
+			}
+			Fence_Render();
+			// Failure can arrive during the fence itself. Keep cache ownership
+			// until the next recovery attempt instead of dropping live handles.
+			if (!device->isOperational()) return;
+			// Admission updated CPU revision caches optimistically. Failed native
+			// allocation/upload requires new handles, not endless reuse of a
+			// virtual handle whose native creation failed. FIFO draining also
+			// prevents the new generation from racing already accepted draws.
+			capture_queue.cancelCurrent(rts::render::RENDER_RESULT_FAILED);
+			Rebuild_Resource_Caches();
+			async_resource_failure = false;
+			Log("D3D11 asynchronous upload failure invalidated bridge resource caches");
+		}
+	}
+
+	RenderResult End_Threaded_Frame(bool visible,
+		rts::render::RenderFrameOutcome *outcome)
+	{
+		Require_Owner_Thread("threaded frame submission");
+		const RenderResult end_result = context->endFrame();
+		frame_open = false;
+		frame_outcome.recordEndFrame(end_result);
+		frame_outcome.markFrameEnded();
+		rts::render::RenderBackBufferInfo info;
+		std::vector<unsigned char> pixels;
+		bool capture_ready = false;
+		const bool requested_capture = visible && capture_queue.pendingCount() != 0;
+		if (requested_capture && frame_outcome.result() == rts::render::RENDER_RESULT_OK)
+		{
+			RenderResult result = device->getBackBufferInfo(&info);
+			size_t row_pitch = 0, bytes = 0;
+			if (result == rts::render::RENDER_RESULT_OK)
+			{
+				if (info.format != rts::render::RENDER_FORMAT_B8G8R8A8_UNORM ||
+					!Checked_Multiply(info.width, 4, &row_pitch) ||
+					!Checked_Multiply(row_pitch, info.height, &bytes) || bytes == 0)
+					result = rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+				else
+				{
+					try
+					{
+						pixels.resize(bytes);
+						result = device->captureBackBuffer(&pixels[0], bytes, row_pitch, &info.format);
+					}
+					catch (...) { result = rts::render::RENDER_RESULT_OUT_OF_MEMORY; }
+				}
+			}
+			frame_outcome.recordCapture(result);
+			capture_ready = result == rts::render::RENDER_RESULT_OK;
+			if (!capture_ready) capture_queue.cancelCurrent(result);
+		}
+		const uint64_t previous = rts::render::LastThreadedRenderFrameSequence(device);
+		RenderResult submitted;
+		if (frame_outcome.hasCommandFailure() || end_result != rts::render::RENDER_RESULT_OK ||
+			frame_outcome.hasDeviceRemoval())
+		{
+			submitted = rts::render::CancelThreadedRenderFrame(device, frame_outcome.result());
+			capture_queue.cancelCurrent(frame_outcome.result());
+			Complete_GPU_Copy_Frame(false, frame_id);
+		}
+		else submitted = rts::render::SubmitThreadedRenderFrame(device, visible);
+		const bool admitted = Remember_Submission(previous);
+		const uint64_t sequence = rts::render::LastThreadedRenderFrameSequence(device);
+		if (admitted) frame_outcome.markSubmitted();
+		else
+		{
+			frame_outcome.recordPresentation(submitted == rts::render::RENDER_RESULT_OK ?
+				rts::render::RENDER_RESULT_FAILED : submitted);
+			Cancel_Threaded_Frame(frame_outcome.result());
+			capture_queue.cancelCurrent(frame_outcome.result());
+			Complete_GPU_Copy_Frame(false, frame_id);
+		}
+		// Ordinary frames remain asynchronous. Captures are rare explicit fences:
+		// pixels were read before flip, and callbacks require actual presentation.
+		if (admitted && requested_capture) rts::render::DrainThreadedRenderDevice(device);
+		rts::render::ThreadedRenderFrameCompletion completed;
+		Poll_Render_Completions(admitted ? sequence : 0, &completed);
+		if (admitted && completed.sequence == sequence)
+		{
+			const RenderResult capture_result = frame_outcome.captureResult();
+			frame_outcome = completed.outcome;
+			frame_outcome.recordCapture(capture_result);
+		}
+		if (requested_capture)
+		{
+			if (capture_ready && frame_outcome.wasPresented())
+			{
+				const RenderResult result = capture_queue.completeVisible(info.width, info.height,
+					static_cast<size_t>(info.width) * 4, info.format, &pixels[0], pixels.size());
+				if (result != rts::render::RENDER_RESULT_OK) capture_queue.cancelCurrent(result);
+			}
+			else capture_queue.cancelCurrent(frame_outcome.result() == rts::render::RENDER_RESULT_OK ?
+				rts::render::RENDER_RESULT_FAILED : frame_outcome.result());
+		}
+		// Report a prior frame's failure once, rather than relabelling queue
+		// admission as success. Do not clear a newer failure with a capture result.
+		if (deferred_failure_sequence != 0)
+		{
+			frame_outcome = deferred_failure;
+			if (!deferred_failure.hasDeviceRemoval() ||
+				recovered_failure_sequence == deferred_failure_sequence)
+			{
+				deferred_failure = rts::render::RenderFrameOutcome();
+				deferred_failure_sequence = 0;
+			}
+		}
+		frame_outcome.setOperational(device->isOperational());
+		if (outcome != 0) *outcome = frame_outcome;
+		return frame_outcome.result();
+	}
+#endif
 
 	struct Draw_Texture_Scope
 	{
@@ -448,6 +783,14 @@ struct D3D11LegacyBridge::Impl
 
 	RenderResult Recover_Device()
 	{
+#if defined(_WIN64)
+		if (Is_Threaded())
+		{
+			Cancel_Threaded_Frame(rts::render::RENDER_RESULT_DEVICE_REMOVED);
+			frame_open = false;
+			Fence_Render();
+		}
+#endif
 		// A target transition requested while no frame was open is deliberately
 		// deferred until Begin_Frame. Preserve that newer request across device
 		// recovery instead of falling back to the previously active target.
@@ -590,13 +933,13 @@ struct D3D11LegacyBridge::Impl
 			copied_content_acquired || draw_texture_pins.Contains(entry.source);
 	}
 
-	void Complete_GPU_Copy_Frame(bool frame_succeeded)
+	void Complete_GPU_Copy_Frame(bool frame_succeeded, unsigned int completed_frame)
 	{
 		for (unsigned int index = 0; index < textures.size(); ++index)
 		{
 			TextureEntry &entry = textures[index];
 			if (rts::render::Should_Invalidate_D3D11_GPU_Copy(
-					entry.gpu_copy_valid, entry.gpu_copy_frame, frame_id,
+					entry.gpu_copy_valid, entry.gpu_copy_frame, completed_frame,
 					frame_succeeded))
 			{
 				entry.gpu_copy_valid = false;
@@ -2487,7 +2830,13 @@ bool D3D11LegacyBridge::Initialize(HWND window,
 	}
 	m_impl->owner_thread_id = Current_D3D11_Bridge_Thread_Id();
 	m_impl->capture_queue.reset();
+#if defined(_WIN64)
+	rts::render::ThreadedRenderOptions render_options;
+	render_options.serial = !rts::UseParallelPipelines();
+	m_impl->device = rts::render::CreateThreadedD3D11RenderDevice(render_options);
+#else
 	m_impl->device = rts::render::CreateD3D11RenderDevice();
+#endif
 	if (m_impl->device == 0)
 	{
 		m_impl->Log("D3D11 render device allocation failed");
@@ -2580,6 +2929,60 @@ void D3D11LegacyBridge::Shutdown()
 		return;
 	}
 	m_impl->Require_Owner_Thread("shutdown");
+#if defined(_WIN64)
+	if (m_impl->Is_Threaded())
+	{
+		m_impl->Cancel_Threaded_Frame(rts::render::RENDER_RESULT_FAILED);
+		m_impl->frame_open = false;
+		m_impl->Fence_Render();
+		rts::render::ThreadedRenderMetrics metrics;
+		if (rts::render::GetThreadedRenderMetrics(m_impl->device, &metrics) && m_impl->log_file != 0)
+		{
+			fprintf(m_impl->log_file,
+				"render_owner_submitted=%llu completed=%llu failed=%llu overlap=%llu waits=%llu wait_ns=%llu execute_ns=%llu peak_packets=%u peak_bytes=%zu\n",
+				static_cast<unsigned long long>(metrics.submittedFrames),
+				static_cast<unsigned long long>(metrics.completedFrames),
+				static_cast<unsigned long long>(metrics.failedFrames),
+				static_cast<unsigned long long>(metrics.producerOverlapFrames),
+				static_cast<unsigned long long>(metrics.backpressureWaits),
+				static_cast<unsigned long long>(metrics.producerWaitNanoseconds),
+				static_cast<unsigned long long>(metrics.ownerExecutionNanoseconds),
+				metrics.peakPendingPackets, metrics.peakPacketBytes);
+		}
+	}
+	if (m_impl->log_file != 0)
+	{
+		// Owner-side shutdown snapshots add no polling or file writes to the
+		// hot path. Resource counters describe the most recent loader session.
+		const rts::ResourceIoMetrics resources = TextureLoader::Get_Resource_Load_Metrics();
+		fprintf(m_impl->log_file,
+			"resource_io_accepted=%llu rejected=%llu reads=%llu decoded=%llu fallback=%llu ownership_failures=%llu io_decode_overlap=%u read_ns=%llu decode_ns=%llu wait_ns=%llu budget_stalls=%llu peak_input_bytes=%zu peak_decode_bytes=%zu\n",
+			static_cast<unsigned long long>(resources.accepted),
+			static_cast<unsigned long long>(resources.rejected),
+			static_cast<unsigned long long>(resources.reads),
+			static_cast<unsigned long long>(resources.decoded),
+			static_cast<unsigned long long>(resources.serialFallbacks),
+			static_cast<unsigned long long>(resources.ownershipFailures),
+			resources.maximumOverlappingIoAndDecode,
+			static_cast<unsigned long long>(resources.readNanoseconds),
+			static_cast<unsigned long long>(resources.decodeNanoseconds),
+			static_cast<unsigned long long>(resources.ownerWaitNanoseconds),
+			static_cast<unsigned long long>(resources.decodeBudgetStalls),
+			resources.inputHighWater, resources.decodeHighWater);
+		const rts::JobSystemMetrics jobs = rts::JobSystem::instance().metrics();
+		fprintf(m_impl->log_file,
+			"job_submitted=%llu executed=%llu steals=%llu owner_help=%llu failures=%llu fallback=%llu affinity_failures=%llu queue_high_water=%u peak_active_workers=%u available_cpus=%u reserved_owner_cpus=%u selected_worker_cpus=%u\n",
+			static_cast<unsigned long long>(jobs.submittedJobCount),
+			static_cast<unsigned long long>(jobs.executedJobCount),
+			static_cast<unsigned long long>(jobs.stealCount),
+			static_cast<unsigned long long>(jobs.ownerHelpCount),
+			static_cast<unsigned long long>(jobs.failedJobCount),
+			static_cast<unsigned long long>(jobs.serialFallbackCount),
+			static_cast<unsigned long long>(jobs.affinityFailureCount),
+			jobs.injectionHighWater, jobs.maximumActiveWorkers,
+			jobs.availableLogicalCpuCount, jobs.reservedOwnerCpuCount, jobs.selectedWorkerCpuCount);
+	}
+#endif
 	if (m_impl->frame_open)
 	{
 		if (m_impl->context != 0 && m_impl->device->isOperational())
@@ -2614,6 +3017,9 @@ void D3D11LegacyBridge::Shutdown()
 		fflush(m_impl->log_file);
 	}
 	m_impl->Release_Caches();
+#if defined(_WIN64)
+	m_impl->Fence_Render();
+#endif
 	if (m_impl->log_file != 0)
 	{
 		fclose(m_impl->log_file);
@@ -2639,10 +3045,19 @@ void D3D11LegacyBridge::Shutdown()
 	m_impl->pending_target_change = false;
 	m_impl->target_transition_failed = true;
 	m_impl->owner_thread_id = 0;
+#if defined(_WIN64)
+	m_impl->deferred_failure = rts::render::RenderFrameOutcome();
+	m_impl->deferred_failure_sequence = 0;
+	m_impl->recovered_failure_sequence = 0;
+	m_impl->async_resource_failure = false;
+#endif
 }
 
 bool D3D11LegacyBridge::Prepare_Legacy_Device_Reset()
 {
+#if defined(_WIN64)
+	if (m_impl != 0 && m_impl->device != 0) m_impl->Service_Render_Completions();
+#endif
 	if (!Is_Active())
 	{
 		return false;
@@ -2665,7 +3080,13 @@ bool D3D11LegacyBridge::Prepare_Legacy_Device_Reset()
 	m_impl->target_transition_failed = false;
 	m_impl->pending_viewport = false;
 	m_impl->pending_clear = false;
+#if defined(_WIN64)
+	m_impl->Fence_Render();
+#endif
 	m_impl->Release_Caches();
+#if defined(_WIN64)
+	m_impl->Fence_Render();
+#endif
 	return Is_Active();
 }
 
@@ -2677,6 +3098,9 @@ bool D3D11LegacyBridge::Is_Active() const
 
 void D3D11LegacyBridge::Begin_Display_Iteration()
 {
+#if defined(_WIN64)
+	if (m_impl != 0 && m_impl->device != 0) m_impl->Service_Render_Completions();
+#endif
 	if (!Is_Active())
 	{
 		return;
@@ -2693,6 +3117,9 @@ void D3D11LegacyBridge::Begin_Display_Iteration()
 
 bool D3D11LegacyBridge::Begin_Frame()
 {
+#if defined(_WIN64)
+	if (m_impl != 0 && m_impl->device != 0) m_impl->Service_Render_Completions();
+#endif
 	if (!Is_Active() || m_impl->frame_open)
 	{
 		return false;
@@ -2725,6 +3152,9 @@ bool D3D11LegacyBridge::Begin_Frame()
 		m_impl->target_transition_failed = true;
 		m_impl->context->endFrame();
 		m_impl->frame_open = false;
+#if defined(_WIN64)
+		m_impl->Cancel_Threaded_Frame(target_result);
+#endif
 		return false;
 	}
 	m_impl->active_target = frame_target;
@@ -2744,6 +3174,9 @@ bool D3D11LegacyBridge::Begin_Frame()
 		{
 			m_impl->context->endFrame();
 			m_impl->frame_open = false;
+#if defined(_WIN64)
+			m_impl->Cancel_Threaded_Frame(viewport_result);
+#endif
 			return false;
 		}
 		m_impl->pending_viewport = false;
@@ -2770,6 +3203,9 @@ bool D3D11LegacyBridge::Begin_Frame()
 		{
 			m_impl->context->endFrame();
 			m_impl->frame_open = false;
+#if defined(_WIN64)
+			m_impl->Cancel_Threaded_Frame(clear_result);
+#endif
 			return false;
 		}
 		m_impl->pending_clear = false;
@@ -2843,6 +3279,12 @@ RenderResult D3D11LegacyBridge::End_Frame(bool present_frame)
 RenderResult D3D11LegacyBridge::End_Frame(bool present_frame,
 	rts::render::RenderFrameOutcome *outcome)
 {
+#if defined(_WIN64)
+	// A backend failure may arrive while the game is recording the next frame.
+	// Still close that recording; Is_Active must not abandon reserved packets.
+	if (m_impl != 0 && m_impl->device != 0 && m_impl->Is_Threaded() && m_impl->frame_open)
+		return m_impl->End_Threaded_Frame(present_frame, outcome);
+#endif
 	if (!Is_Active() || !m_impl->frame_open)
 	{
 		if (outcome != 0)
@@ -2858,7 +3300,7 @@ RenderResult D3D11LegacyBridge::End_Frame(bool present_frame,
 	m_impl->frame_outcome.markFrameEnded();
 	const bool frame_succeeded = end_result == rts::render::RENDER_RESULT_OK &&
 		!m_impl->frame_outcome.hasCommandFailure();
-	m_impl->Complete_GPU_Copy_Frame(frame_succeeded);
+	m_impl->Complete_GPU_Copy_Frame(frame_succeeded, m_impl->frame_id);
 	if (end_result != rts::render::RENDER_RESULT_OK)
 	{
 		m_impl->Log_Result("D3D11 legacy bridge end-frame failed", end_result);
@@ -4131,6 +4573,21 @@ RenderResult D3D11LegacyBridge::Draw_Primitive_UP(
 
 RenderResult D3D11LegacyBridge::Resize(unsigned int width, unsigned int height)
 {
+#if defined(_WIN64)
+	if (m_impl != 0 && m_impl->device != 0)
+	{
+		m_impl->Service_Render_Completions();
+		if (m_impl->Is_Threaded())
+		{
+			if (m_impl->frame_open)
+			{
+				m_impl->Cancel_Threaded_Frame(rts::render::RENDER_RESULT_FAILED);
+				m_impl->frame_open = false;
+			}
+			m_impl->Fence_Render();
+		}
+	}
+#endif
 	if (!Is_Active())
 	{
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;

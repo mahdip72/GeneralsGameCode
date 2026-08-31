@@ -603,6 +603,94 @@ void testSameGenerationResetBarrier()
 	voice.close();
 }
 
+void testRetainedSubmissionAdmissionAndTerminalResults()
+{
+	{
+		FakePcmVoiceBackend backend;
+		XAudio2PcmVoice voice(backend);
+		check(voice.open(), "retained reset voice opens");
+		voice.reset(1);
+		AudioPcmChunk retained = makeChunk(1, 0, 91);
+		check(voice.submitRetained(retained) == AudioPcmSubmitResult::ACCEPTED
+				&& retained.data.empty(),
+			"retained submission accepts current-generation PCM during reset");
+		voice.service();
+		check(backend.submitCalls == 1 && !backend.submissions.empty()
+				&& backend.submissions.front().audio != nullptr
+				&& backend.submissions.front().audio[0] == 91,
+			"reset-pending retained PCM reaches the backend after its barrier");
+		voice.close();
+	}
+
+	{
+		FakePcmVoiceBackend backend;
+		XAudio2PcmVoice voice(backend);
+		check(voice.open(), "retained capacity voice opens");
+		voice.reset(1);
+		for (std::size_t sequence = 0; sequence < XAudio2PcmVoice::SLOT_COUNT; ++sequence) {
+			check(voice.submit(makeChunk(1, sequence, static_cast<std::uint8_t>(sequence)))
+					== AudioPcmSubmitResult::ACCEPTED,
+				"retained capacity voice fills every bounded slot");
+		}
+		AudioPcmChunk retained = makeChunk(1, XAudio2PcmVoice::SLOT_COUNT, 91);
+		const std::vector<std::uint8_t> originalBytes = retained.data;
+		check(voice.submitRetained(retained) == AudioPcmSubmitResult::DROPPED
+				&& retained.data == originalBytes
+				&& retained.sequence == XAudio2PcmVoice::SLOT_COUNT,
+			"full retained admission keeps the original PCM bytes and sequence");
+		voice.service();
+		backend.complete(0);
+		voice.service();
+		check(voice.submitRetained(retained) == AudioPcmSubmitResult::ACCEPTED
+				&& retained.data.empty(),
+			"retained admission retries after one completed slot");
+		voice.service();
+		check(backend.submissions.size() == XAudio2PcmVoice::SLOT_COUNT + 1
+				&& backend.submissions.back().audio != nullptr
+				&& backend.submissions.back().audio[0] == 91,
+			"retry submits the retained bytes without decoding again");
+		voice.close();
+	}
+
+	{
+		FakePcmVoiceBackend backend;
+		XAudio2PcmVoice voice(backend);
+		check(voice.open(), "retained terminal voice opens");
+		voice.reset(5);
+		AudioPcmChunk stale = makeChunk(4, 0, 11);
+		check(voice.submitRetained(stale) == AudioPcmSubmitResult::FAILED
+				&& stale.data.empty(),
+			"stale retained generation is terminal and consumes its PCM");
+		AudioPcmChunk invalid = makeChunk(5, 1, 12);
+		invalid.data.pop_back();
+		check(voice.submitRetained(invalid) == AudioPcmSubmitResult::FAILED
+				&& invalid.data.empty(),
+			"invalid retained PCM is terminal and consumes its bytes");
+		voice.close();
+		AudioPcmChunk closed = makeChunk(5, 2, 13);
+		check(voice.submitRetained(closed) == AudioPcmSubmitResult::FAILED
+				&& closed.data.empty(),
+			"closed retained admission is terminal and consumes its PCM");
+	}
+
+	{
+		FakePcmVoiceBackend backend;
+		XAudio2PcmVoice voice(backend);
+		check(voice.open(), "failed retained voice opens");
+		voice.reset(1);
+		AudioPcmChunk setup = makeChunk(1, 0, 14);
+		check(voice.submitRetained(setup) == AudioPcmSubmitResult::ACCEPTED,
+			"failed retained voice admits the setup PCM");
+		backend.submitResult = E_FAIL;
+		voice.service();
+		AudioPcmChunk failed = makeChunk(1, 1, 15);
+		check(voice.submitRetained(failed) == AudioPcmSubmitResult::FAILED
+				&& failed.data.empty(),
+			"failed retained admission is terminal and consumes its PCM");
+		voice.close();
+	}
+}
+
 void testReopenAndRepeatedCleanup()
 {
 	FakePcmVoiceBackend backend;
@@ -739,6 +827,7 @@ int main()
 	testSameGenerationResetRejectsStaleClockCompletion();
 	testResetBarrierAndGenerationActivation();
 	testSameGenerationResetBarrier();
+	testRetainedSubmissionAdmissionAndTerminalResults();
 	testTerminalFailures();
 	testReopenAndRepeatedCleanup();
 	testStaleCallbackTokenIsIgnoredAfterSlotReuse();

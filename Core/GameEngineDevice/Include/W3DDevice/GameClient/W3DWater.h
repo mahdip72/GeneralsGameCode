@@ -37,6 +37,7 @@
 #include "Lib/BaseType.h"
 #include "Common/GameType.h"
 #include "Common/Snapshot.h"
+#include "W3DDevice/Common/EffectPrepare.h"
 
 #define INVALID_WATER_HEIGHT 0.0f	///water height guaranteed to be below all terrain.
 
@@ -187,6 +188,7 @@ protected:
 		UnsignedByte preferredHeight;		///< the hight we prefer to be
 	};
 	WaterMeshData *m_meshData;  ///< heightmap data for 3D Mesh based water.
+	WaterMeshBatch m_preparedMesh;
 	UnsignedInt m_meshDataSize;	///< size of m_meshData
 	Bool m_meshInMotion;				///< TRUE once we've messed with velocities and are in motion
 	Bool m_doWaterGrid;	///< allows/prevents water grid rendering.

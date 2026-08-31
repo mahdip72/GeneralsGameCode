@@ -116,12 +116,21 @@ AsciiString GetWSAErrorString( Int error )
 
 UDP::UDP()
 {
+#if defined(_WIN64)
+  fd=INVALID_SOCKET;
+  m_lastError=0;
+#else
   fd=0;
+#endif
 }
 
 UDP::~UDP()
 {
+#if defined(_WIN64)
+	if (fd != INVALID_SOCKET)
+#else
 	if (fd)
+#endif
 		closesocket(fd);
 }
 
@@ -146,6 +155,12 @@ Int UDP::Bind(UnsignedInt IP,UnsignedShort Port)
 {
   int retval;
   int status;
+#if defined(_WIN64)
+  // The serial reference/fallback path can retry a failed bind. Retire the
+  // previous native-width handle before creating the next attempt.
+  if (fd != INVALID_SOCKET) closesocket(fd);
+  fd=INVALID_SOCKET;
+#endif
 
   IP=htonl(IP);
   Port=htons(Port);
@@ -185,7 +200,11 @@ Int UDP::Bind(UnsignedInt IP,UnsignedShort Port)
 
   retval=SetBlocking(FALSE);
   if (retval==-1)
+#if defined(_WIN64)
+    return UNKNOWN;
+#else
     fprintf(stderr,"Couldn't set nonblocking mode!\n");
+#endif
 
   return(OK);
 }

@@ -1,0 +1,19 @@
+add_executable(core_threaded_render_device_tests ThreadedRenderDeviceTest.cpp)
+target_link_libraries(core_threaded_render_device_tests PRIVATE core_renderer core_task_runtime)
+set_target_properties(core_threaded_render_device_tests PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+)
+add_test(NAME core_threaded_render_device_tests COMMAND core_threaded_render_device_tests)
+set_tests_properties(core_threaded_render_device_tests PROPERTIES TIMEOUT 30)
+
+add_executable(core_threaded_render_device_native_tests ThreadedRenderDeviceNativeTest.cpp)
+target_link_libraries(core_threaded_render_device_native_tests PRIVATE core_renderer core_task_runtime user32)
+set_target_properties(core_threaded_render_device_native_tests PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+)
+add_test(NAME core_threaded_render_device_native_tests COMMAND core_threaded_render_device_native_tests)
+set_tests_properties(core_threaded_render_device_native_tests PROPERTIES TIMEOUT 60)

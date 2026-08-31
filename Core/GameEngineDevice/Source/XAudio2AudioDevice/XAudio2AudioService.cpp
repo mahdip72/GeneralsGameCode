@@ -1,7 +1,13 @@
 #include "XAudio2AudioDevice/XAudio2AudioService.h"
+#include "XAudio2AudioDevice/XAudio2AudioServiceOwner.h"
 
+#include "Lib/FrameTimingDiagnostics.h"
 #include "XAudio2AudioDevice/XAudio2NativeAudioEngine.h"
 #include "XAudio2AudioDevice/XAudio2PcmVoice.h"
+
+#if defined(RTS_XAUDIO2_HAS_JOB_OWNERSHIP)
+#include "Lib/PipelineExecutionPolicy.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -10,6 +16,21 @@
 
 namespace
 {
+std::atomic<XAudio2AudioExecutionMode> defaultExecutionMode { XAudio2AudioExecutionMode::SHARED_OWNER };
+std::atomic<bool> defaultExecutionModeOverridden { false };
+
+XAudio2AudioExecutionMode configuredExecutionMode() noexcept
+{
+	if (defaultExecutionModeOverridden.load(std::memory_order_acquire))
+		return defaultExecutionMode.load(std::memory_order_acquire);
+#if defined(RTS_XAUDIO2_HAS_JOB_OWNERSHIP)
+	return rts::UseParallelPipelines() ? XAudio2AudioExecutionMode::SHARED_OWNER
+		: XAudio2AudioExecutionMode::SERIAL_REFERENCE;
+#else
+	return XAudio2AudioExecutionMode::SHARED_OWNER;
+#endif
+}
+
 X3DAUDIO_VECTOR makeVector(const float values[3]) noexcept
 {
 	return X3DAUDIO_VECTOR { values[0], values[1], values[2] };
@@ -64,17 +85,25 @@ void makeLegacyStereoPointMatrix(const XAudio2SpatializationPose &listener,
 }
 
 XAudio2AudioService::XAudio2AudioService() :
-	XAudio2AudioService(std::make_unique<XAudio2NativeAudioEngine>())
+	XAudio2AudioService(nullptr, configuredExecutionMode())
 {
 }
 
 XAudio2AudioService::XAudio2AudioService(std::unique_ptr<IXAudio2AudioEngineBackend> backend) :
+	XAudio2AudioService(std::move(backend), XAudio2AudioExecutionMode::SERIAL_REFERENCE)
+{
+}
+
+XAudio2AudioService::XAudio2AudioService(std::unique_ptr<IXAudio2AudioEngineBackend> backend,
+	XAudio2AudioExecutionMode executionMode) :
 	m_backend(std::move(backend)),
 	m_nextHandleGeneration(1),
 	m_state(XAudio2AudioServiceState::CLOSED),
 	m_lastError(S_OK)
 {
-	if (m_backend == nullptr) {
+	if (executionMode == XAudio2AudioExecutionMode::SHARED_OWNER) {
+		m_executionOwner = std::make_unique<XAudio2AudioServiceOwner>(std::move(m_backend));
+	} else if (m_backend == nullptr) {
 		m_backend = std::make_unique<XAudio2NativeAudioEngine>();
 	}
 }
@@ -82,6 +111,27 @@ XAudio2AudioService::XAudio2AudioService(std::unique_ptr<IXAudio2AudioEngineBack
 XAudio2AudioService::~XAudio2AudioService()
 {
 	shutdown();
+}
+
+void XAudio2AudioService::setDefaultExecutionMode(XAudio2AudioExecutionMode mode) noexcept
+{
+	defaultExecutionMode.store(mode, std::memory_order_release);
+	defaultExecutionModeOverridden.store(true, std::memory_order_release);
+}
+
+XAudio2AudioOwnerMetrics XAudio2AudioService::ownerMetrics() const noexcept
+{
+	if (m_executionOwner) return m_executionOwner->metrics();
+	XAudio2AudioOwnerMetrics metrics;
+	metrics.forcedSerial = true;
+	return metrics;
+}
+
+bool XAudio2AudioService::synchronize() noexcept
+{
+	if (m_executionOwner) return m_executionOwner->synchronize();
+	serviceVoices();
+	return isOpen();
 }
 
 HRESULT XAudio2AudioService::normalizeFailure(HRESULT error) noexcept
@@ -96,6 +146,7 @@ XAudio2PcmVoiceHandle XAudio2AudioService::invalidHandle() const noexcept
 
 bool XAudio2AudioService::open()
 {
+	if (m_executionOwner) return m_executionOwner->open();
 	std::lock_guard<std::mutex> lock(m_mutex);
 	const XAudio2AudioServiceState currentState = m_state.load(std::memory_order_acquire);
 	if (currentState == XAudio2AudioServiceState::RUNNING) {
@@ -232,12 +283,14 @@ bool XAudio2AudioService::processPendingFailureLocked() noexcept
 
 bool XAudio2AudioService::processPendingFailure() noexcept
 {
+	if (m_executionOwner) return m_executionOwner->processPendingFailure();
 	std::lock_guard<std::mutex> lock(m_mutex);
 	return processPendingFailureLocked();
 }
 
 void XAudio2AudioService::shutdown()
 {
+	if (m_executionOwner) { m_executionOwner->shutdown(); return; }
 	std::lock_guard<std::mutex> lock(m_mutex);
 	const XAudio2AudioServiceState currentState = m_state.load(std::memory_order_acquire);
 	if (currentState == XAudio2AudioServiceState::CLOSED) {
@@ -297,17 +350,20 @@ void XAudio2AudioService::shutdown()
 
 bool XAudio2AudioService::isOpen() const noexcept
 {
+	if (m_executionOwner) return m_executionOwner->state() == XAudio2AudioServiceState::RUNNING;
 	return m_state.load(std::memory_order_acquire) == XAudio2AudioServiceState::RUNNING
 		&& !m_failurePublication.hasFailure();
 }
 
 XAudio2AudioServiceState XAudio2AudioService::state() const noexcept
 {
+	if (m_executionOwner) return m_executionOwner->state();
 	return m_state.load(std::memory_order_acquire);
 }
 
 HRESULT XAudio2AudioService::getLastError() const noexcept
 {
+	if (m_executionOwner) return m_executionOwner->getLastError();
 	return m_lastError.load(std::memory_order_acquire);
 }
 
@@ -320,6 +376,8 @@ bool XAudio2AudioService::isHandleOwnedLocked(XAudio2PcmVoiceHandle handle) cons
 
 XAudio2PcmVoiceHandle XAudio2AudioService::createVoice(float maxFrequencyRatio) noexcept
 {
+	rts::frame_timing::Scope timing(rts::frame_timing::AudioVoiceCreate);
+	if (m_executionOwner) return m_executionOwner->createVoice(maxFrequencyRatio);
 	std::lock_guard<std::mutex> lock(m_mutex);
 	processPendingFailureLocked();
 	if (m_state.load(std::memory_order_acquire) != XAudio2AudioServiceState::RUNNING) {
@@ -457,6 +515,8 @@ XAudio2PcmVoiceHandle XAudio2AudioService::createVoice(float maxFrequencyRatio) 
 
 bool XAudio2AudioService::destroyVoice(XAudio2PcmVoiceHandle handle) noexcept
 {
+	rts::frame_timing::Scope timing(rts::frame_timing::AudioVoiceDestroy);
+	if (m_executionOwner) return m_executionOwner->destroyVoice(handle);
 	std::lock_guard<std::mutex> lock(m_mutex);
 	processPendingFailureLocked();
 	const XAudio2AudioServiceState currentState = m_state.load(std::memory_order_acquire);
@@ -482,6 +542,7 @@ bool XAudio2AudioService::destroyVoice(XAudio2PcmVoiceHandle handle) noexcept
 
 AudioPcmSubmitResult XAudio2AudioService::submit(XAudio2PcmVoiceHandle handle, AudioPcmChunk &&chunk) noexcept
 {
+	if (m_executionOwner) return m_executionOwner->submit(handle, std::move(chunk));
 	std::lock_guard<std::mutex> lock(m_mutex);
 	processPendingFailureLocked();
 	const XAudio2AudioServiceState currentState = m_state.load(std::memory_order_acquire);
@@ -504,9 +565,40 @@ AudioPcmSubmitResult XAudio2AudioService::submit(XAudio2PcmVoiceHandle handle, A
 	return result;
 }
 
+AudioPcmSubmitResult XAudio2AudioService::submitRetained(
+	XAudio2PcmVoiceHandle handle, AudioPcmChunk &chunk) noexcept
+{
+	if (m_executionOwner) return m_executionOwner->submitRetained(handle, chunk);
+	std::lock_guard<std::mutex> lock(m_mutex);
+	processPendingFailureLocked();
+	const XAudio2AudioServiceState currentState = m_state.load(std::memory_order_acquire);
+	if (currentState == XAudio2AudioServiceState::FAILED) {
+		chunk = {};
+		return AudioPcmSubmitResult::FAILED;
+	}
+	if (currentState != XAudio2AudioServiceState::RUNNING || !isHandleOwnedLocked(handle)) {
+		chunk = {};
+		return AudioPcmSubmitResult::FAILED;
+	}
+	VoiceRecord &record = m_voices[handle.index];
+	const bool voiceFailed = record.voice->isFailed();
+	if (!record.voice->isOpen() || voiceFailed) {
+		chunk = {};
+		return AudioPcmSubmitResult::FAILED;
+	}
+	const bool monoExpandedToStereo = chunk.sourceChannels == 1 && chunk.channels == 2;
+	const AudioPcmSubmitResult result = record.voice->submitRetained(chunk);
+	if (result == AudioPcmSubmitResult::ACCEPTED) {
+		record.monoExpandedToStereo = monoExpandedToStereo;
+		return result;
+	}
+	return result;
+}
+
 bool XAudio2AudioService::canVoiceAccept(XAudio2PcmVoiceHandle handle,
 	std::size_t submissions) const noexcept
 {
+	if (m_executionOwner) return m_executionOwner->canVoiceAccept(handle, submissions);
 	std::lock_guard<std::mutex> lock(m_mutex);
 	return m_state.load(std::memory_order_acquire) == XAudio2AudioServiceState::RUNNING
 		&& !m_failurePublication.hasFailure() && isHandleOwnedLocked(handle)
@@ -515,6 +607,7 @@ bool XAudio2AudioService::canVoiceAccept(XAudio2PcmVoiceHandle handle,
 
 bool XAudio2AudioService::resetVoice(XAudio2PcmVoiceHandle handle, std::uint64_t generation) noexcept
 {
+	if (m_executionOwner) return m_executionOwner->resetVoice(handle, generation);
 	std::lock_guard<std::mutex> lock(m_mutex);
 	processPendingFailureLocked();
 	const XAudio2AudioServiceState currentState = m_state.load(std::memory_order_acquire);
@@ -530,6 +623,7 @@ bool XAudio2AudioService::resetVoice(XAudio2PcmVoiceHandle handle, std::uint64_t
 
 bool XAudio2AudioService::serviceVoice(XAudio2PcmVoiceHandle handle) noexcept
 {
+	if (m_executionOwner) return m_executionOwner->serviceVoice(handle);
 	std::lock_guard<std::mutex> lock(m_mutex);
 	processPendingFailureLocked();
 	const XAudio2AudioServiceState currentState = m_state.load(std::memory_order_acquire);
@@ -544,6 +638,7 @@ bool XAudio2AudioService::serviceVoice(XAudio2PcmVoiceHandle handle) noexcept
 
 bool XAudio2AudioService::setVoiceVolume(XAudio2PcmVoiceHandle handle, float volume) noexcept
 {
+	if (m_executionOwner) return m_executionOwner->setVoiceVolume(handle, volume);
 	std::lock_guard<std::mutex> lock(m_mutex);
 	processPendingFailureLocked();
 	const XAudio2AudioServiceState currentState = m_state.load(std::memory_order_acquire);
@@ -559,6 +654,7 @@ bool XAudio2AudioService::setVoiceSpatialization(XAudio2PcmVoiceHandle handle,
 	const XAudio2SpatializationPose &listenerPose,
 	const XAudio2SpatializationPose &emitterPose) noexcept
 {
+	if (m_executionOwner) return m_executionOwner->setVoiceSpatialization(handle, listenerPose, emitterPose);
 	std::lock_guard<std::mutex> lock(m_mutex);
 	processPendingFailureLocked();
 	if (m_state.load(std::memory_order_acquire) != XAudio2AudioServiceState::RUNNING
@@ -626,6 +722,7 @@ bool XAudio2AudioService::setVoiceSpatialization(XAudio2PcmVoiceHandle handle,
 
 bool XAudio2AudioService::setVoiceFrequencyRatio(XAudio2PcmVoiceHandle handle, float ratio) noexcept
 {
+	if (m_executionOwner) return m_executionOwner->setVoiceFrequencyRatio(handle, ratio);
 	std::lock_guard<std::mutex> lock(m_mutex);
 	processPendingFailureLocked();
 	if (m_state.load(std::memory_order_acquire) != XAudio2AudioServiceState::RUNNING
@@ -639,6 +736,7 @@ bool XAudio2AudioService::setVoiceFrequencyRatio(XAudio2PcmVoiceHandle handle, f
 
 bool XAudio2AudioService::pauseVoice(XAudio2PcmVoiceHandle handle) noexcept
 {
+	if (m_executionOwner) return m_executionOwner->pauseVoice(handle);
 	std::lock_guard<std::mutex> lock(m_mutex);
 	processPendingFailureLocked();
 	const XAudio2AudioServiceState currentState = m_state.load(std::memory_order_acquire);
@@ -652,6 +750,7 @@ bool XAudio2AudioService::pauseVoice(XAudio2PcmVoiceHandle handle) noexcept
 
 bool XAudio2AudioService::resumeVoice(XAudio2PcmVoiceHandle handle) noexcept
 {
+	if (m_executionOwner) return m_executionOwner->resumeVoice(handle);
 	std::lock_guard<std::mutex> lock(m_mutex);
 	processPendingFailureLocked();
 	const XAudio2AudioServiceState currentState = m_state.load(std::memory_order_acquire);
@@ -665,6 +764,7 @@ bool XAudio2AudioService::resumeVoice(XAudio2PcmVoiceHandle handle) noexcept
 
 bool XAudio2AudioService::stopVoice(XAudio2PcmVoiceHandle handle) noexcept
 {
+	if (m_executionOwner) return m_executionOwner->stopVoice(handle);
 	std::lock_guard<std::mutex> lock(m_mutex);
 	processPendingFailureLocked();
 	const XAudio2AudioServiceState currentState = m_state.load(std::memory_order_acquire);
@@ -678,24 +778,28 @@ bool XAudio2AudioService::stopVoice(XAudio2PcmVoiceHandle handle) noexcept
 
 bool XAudio2AudioService::isVoiceOpen(XAudio2PcmVoiceHandle handle) const noexcept
 {
+	if (m_executionOwner) return m_executionOwner->isVoiceOpen(handle);
 	std::lock_guard<std::mutex> lock(m_mutex);
 	return isHandleOwnedLocked(handle) && m_voices[handle.index].voice->isOpen();
 }
 
 bool XAudio2AudioService::isVoiceFailed(XAudio2PcmVoiceHandle handle) const noexcept
 {
+	if (m_executionOwner) return m_executionOwner->isVoiceFailed(handle);
 	std::lock_guard<std::mutex> lock(m_mutex);
 	return isHandleOwnedLocked(handle) && m_voices[handle.index].voice->isFailed();
 }
 
 bool XAudio2AudioService::isVoiceDrained(XAudio2PcmVoiceHandle handle) const noexcept
 {
+	if (m_executionOwner) return m_executionOwner->isVoiceDrained(handle);
 	std::lock_guard<std::mutex> lock(m_mutex);
 	return isHandleOwnedLocked(handle) && m_voices[handle.index].voice->isDrained();
 }
 
 HRESULT XAudio2AudioService::getVoiceLastError(XAudio2PcmVoiceHandle handle) const noexcept
 {
+	if (m_executionOwner) return m_executionOwner->getVoiceLastError(handle);
 	std::lock_guard<std::mutex> lock(m_mutex);
 	return isHandleOwnedLocked(handle) ? m_voices[handle.index].voice->getLastError() : E_HANDLE;
 }
@@ -703,12 +807,14 @@ HRESULT XAudio2AudioService::getVoiceLastError(XAudio2PcmVoiceHandle handle) con
 bool XAudio2AudioService::getVoicePlayedSample(XAudio2PcmVoiceHandle handle,
 	std::int64_t &sample) const noexcept
 {
+	if (m_executionOwner) return m_executionOwner->getVoicePlayedSample(handle, sample);
 	std::lock_guard<std::mutex> lock(m_mutex);
 	return isHandleOwnedLocked(handle) && m_voices[handle.index].voice->getPlayedSample(sample);
 }
 
 bool XAudio2AudioService::tryPopCompletion(XAudio2AudioCompletion &completion) noexcept
 {
+	if (m_executionOwner) return m_executionOwner->tryPopCompletion(completion);
 	std::lock_guard<std::mutex> lock(m_mutex);
 	for (std::size_t index = 0; index < m_voices.size(); ++index) {
 		VoiceRecord &record = m_voices[index];
@@ -733,6 +839,7 @@ bool XAudio2AudioService::tryPopCompletion(XAudio2AudioCompletion &completion) n
 
 void XAudio2AudioService::discardCompletions() noexcept
 {
+	if (m_executionOwner) { m_executionOwner->discardCompletions(); return; }
 	std::lock_guard<std::mutex> lock(m_mutex);
 	for (VoiceRecord &record : m_voices) {
 		if (record.voice == nullptr) {
@@ -744,8 +851,39 @@ void XAudio2AudioService::discardCompletions() noexcept
 	}
 }
 
+bool XAudio2AudioService::tryPopCompletion(XAudio2PcmVoiceHandle handle,
+	XAudio2AudioCompletion &completion) noexcept
+{
+	if (m_executionOwner) return m_executionOwner->tryPopCompletion(handle, completion);
+	std::lock_guard<std::mutex> lock(m_mutex);
+	if (!isHandleOwnedLocked(handle)) return false;
+	XAudio2PcmCompletionRecord record;
+	if (!m_voices[handle.index].voice->tryPopCompletion(record)) return false;
+	completion = { handle, record.generation, record.sequence, record.endSample };
+	return true;
+}
+
+void XAudio2AudioService::discardCompletions(XAudio2PcmVoiceHandle handle) noexcept
+{
+	if (m_executionOwner) { m_executionOwner->discardCompletions(handle); return; }
+	XAudio2AudioCompletion completion;
+	while (tryPopCompletion(handle, completion)) {}
+}
+
+bool XAudio2AudioService::getVoiceBufferedState(XAudio2PcmVoiceHandle handle,
+	std::size_t &buffers, std::size_t &bytes) const noexcept
+{
+	if (m_executionOwner) return m_executionOwner->getVoiceBufferedState(handle, buffers, bytes);
+	std::lock_guard<std::mutex> lock(m_mutex);
+	buffers = bytes = 0;
+	if (!isHandleOwnedLocked(handle)) return false;
+	m_voices[handle.index].voice->getBufferedState(buffers, bytes);
+	return true;
+}
+
 void XAudio2AudioService::serviceVoices() noexcept
 {
+	if (m_executionOwner) { m_executionOwner->serviceVoices(); return; }
 	std::lock_guard<std::mutex> lock(m_mutex);
 	processPendingFailureLocked();
 	const XAudio2AudioServiceState currentState = m_state.load(std::memory_order_acquire);

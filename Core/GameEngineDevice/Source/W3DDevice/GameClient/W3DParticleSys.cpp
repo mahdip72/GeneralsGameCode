@@ -34,6 +34,8 @@
 #include "W3DDevice/GameClient/HeightMap.h"
 #include "W3DDevice/GameClient/W3DSmudge.h"
 #include "W3DDevice/GameClient/W3DSnow.h"
+#include "W3DDevice/Common/EffectPrepare.h"
+#include "Lib/PipelineExecutionPolicy.h"
 #include "WW3D2/camera.h"
 
 
@@ -150,6 +152,14 @@ void W3DParticleSystemManager::doParticles(RenderInfoClass &rinfo)
 	Real beZ = bbox.Extent.Z;
 
 	unsigned int personalities[MAX_POINTS_PER_GROUP];
+	ParticleRenderBatch &preparedParticles = m_preparedParticles;
+	ParticleRenderBounds particleBounds;
+	particleBounds.centerX = bcX;
+	particleBounds.centerY = bcY;
+	particleBounds.centerZ = bcZ;
+	particleBounds.extentX = beX;
+	particleBounds.extentY = beY;
+	particleBounds.extentZ = beZ;
 
 
 	m_fieldParticleCount = 0;
@@ -217,8 +227,60 @@ void W3DParticleSystemManager::doParticles(RenderInfoClass &rinfo)
 
 
 
-		//set-up all the per-particle
-		for (Particle *p = sys->getFirstParticle(); p; p = p->m_systemNext)
+		// Capture on the owner. Workers never see a Particle or shared W3D array.
+		Bool prepared = FALSE;
+		const unsigned particleCount = sys->getParticleCount();
+		if (rts::UseParallelPipelines() && particleCount >= 256 &&
+			preparedParticles.initialize(particleCount))
+		{
+			unsigned captured = 0;
+			Particle *particle = sys->getFirstParticle();
+			for (; particle != nullptr && captured < particleCount;
+				particle = particle->m_systemNext, ++captured)
+			{
+				ParticleRenderInput &input = preparedParticles.input()[captured];
+				const Coord3D *position = particle->getPosition();
+				const RGBColor *particleColor = particle->getColor();
+				input.x = position->x;
+				input.y = position->y;
+				input.z = position->z;
+				input.size = particle->getSize();
+				input.red = particleColor->red;
+				input.green = particleColor->green;
+				input.blue = particleColor->blue;
+				input.alpha = particle->getAlpha();
+				input.angle = particle->getAngle();
+				input.personality = particle->getPersonality();
+			}
+			prepared = captured == particleCount && particle == nullptr &&
+				preparedParticles.run(particleBounds);
+		}
+		if (prepared)
+		{
+			// Stable compaction keeps the first 512 visible particles, field counts,
+			// streak personalities and draw order identical to the reference loop.
+			for (unsigned index = 0; index < particleCount && count < MAX_POINTS_PER_GROUP; ++index)
+			{
+				if (!preparedParticles.output()[index].visible)
+					continue;
+				const ParticleRenderInput &input = preparedParticles.input()[index];
+				m_fieldParticleCount += (sys->getPriority() == AREA_EFFECT && sys->m_isGroundAligned != FALSE);
+				personalities[count] = input.personality;
+				posArray[count].X = input.x;
+				posArray[count].Y = input.y;
+				posArray[count].Z = input.z;
+				sizeArray[count] = input.size;
+				RGBAArray[count].X = input.red;
+				RGBAArray[count].Y = input.green;
+				RGBAArray[count].Z = input.blue;
+				RGBAArray[count].W = input.alpha;
+				angleArray[count] = static_cast<uint8>(preparedParticles.output()[index].angle);
+				++count;
+			}
+		}
+
+		// Small systems and failed capture/allocation retain the legacy path.
+		for (Particle *p = prepared ? nullptr : sys->getFirstParticle(); p; p = p->m_systemNext)
 		{
 			pos = p->getPosition();
 			psize = p->getSize();

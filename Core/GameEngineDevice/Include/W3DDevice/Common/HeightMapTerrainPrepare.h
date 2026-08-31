@@ -130,6 +130,7 @@ private:
 
 	const HeightMapTerrainSnapshot *m_snapshot;
 	HeightMapTerrainVertex *m_output;
+	bool m_inputValid;
 };
 
 /*

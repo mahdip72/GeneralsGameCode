@@ -405,6 +405,19 @@ bool XAudio2PcmVoice::isDrained() const noexcept
 	return true;
 }
 
+void XAudio2PcmVoice::getBufferedState(std::size_t &buffers, std::size_t &bytes) const noexcept
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	buffers = 0;
+	bytes = 0;
+	for (const Slot &slot : m_slots) {
+		if (slot.state.load(std::memory_order_acquire) != SlotState::FREE) {
+			++buffers;
+			bytes += slot.chunk.data.size();
+		}
+	}
+}
+
 HRESULT XAudio2PcmVoice::getLastError() const noexcept
 {
 	return m_lastError.load(std::memory_order_acquire);
@@ -559,27 +572,34 @@ void XAudio2PcmVoice::failFromService(HRESULT error) noexcept
 	}
 }
 
-AudioPcmSubmitResult XAudio2PcmVoice::submit(AudioPcmChunk &&chunk)
+AudioPcmSubmitResult XAudio2PcmVoice::submitLocked(
+	AudioPcmChunk &chunk, bool retainOnCapacity)
 {
-	std::lock_guard<std::mutex> lock(m_mutex);
-	auto drop = [&chunk]() {
+	auto terminalDrop = [&chunk, retainOnCapacity]() {
 		chunk = {};
+		return retainOnCapacity ? AudioPcmSubmitResult::FAILED
+			: AudioPcmSubmitResult::DROPPED;
+	};
+	auto capacityDrop = [&chunk, retainOnCapacity]() {
+		if (!retainOnCapacity) {
+			chunk = {};
+		}
 		return AudioPcmSubmitResult::DROPPED;
 	};
 	if (!m_open.load(std::memory_order_acquire)) {
-		return drop();
+		return terminalDrop();
 	}
 	if (m_failed.load(std::memory_order_acquire)) {
 		chunk = {};
 		return AudioPcmSubmitResult::FAILED;
 	}
 	if (chunk.generation != m_requestedGeneration || !isValidChunk(chunk)) {
-		return drop();
+		return terminalDrop();
 	}
 
 	Slot *slot = findFreeSlot();
 	if (slot == nullptr) {
-		return drop();
+		return capacityDrop();
 	}
 	// The producer owns the chunk until this move completes; the slot then owns all
 	// storage referenced by its stable XAUDIO2_BUFFER.
@@ -603,6 +623,18 @@ AudioPcmSubmitResult XAudio2PcmVoice::submit(AudioPcmChunk &&chunk)
 	slot->cancelled = false;
 	slot->state.store(SlotState::PENDING, std::memory_order_release);
 	return AudioPcmSubmitResult::ACCEPTED;
+}
+
+AudioPcmSubmitResult XAudio2PcmVoice::submit(AudioPcmChunk &&chunk)
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	return submitLocked(chunk, false);
+}
+
+AudioPcmSubmitResult XAudio2PcmVoice::submitRetained(AudioPcmChunk &chunk)
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	return submitLocked(chunk, true);
 }
 
 bool XAudio2PcmVoice::canAccept(std::size_t submissions) const noexcept

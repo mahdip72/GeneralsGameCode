@@ -1,4 +1,5 @@
 #include "Lib/JobSystem.h"
+#include "Lib/PipelineExecutionPolicy.h"
 
 #include <deque>
 #include <limits.h>
@@ -14,6 +15,29 @@ namespace rts
 {
 namespace
 {
+#if defined(_WIN32)
+class LegacyOwnerLock
+{
+public:
+	explicit LegacyOwnerLock(CRITICAL_SECTION &mutex) : m_mutex(mutex)
+	{
+		EnterCriticalSection(&m_mutex);
+	}
+	~LegacyOwnerLock() { LeaveCriticalSection(&m_mutex); }
+private:
+	CRITICAL_SECTION &m_mutex;
+};
+#endif
+
+unsigned long currentOwnerThreadId()
+{
+#if defined(_WIN32)
+	return GetCurrentThreadId();
+#else
+	return 1;
+#endif
+}
+
 struct LegacyGroupRecord
 {
 	LegacyGroupRecord(void *ownerValue, unsigned generationValue)
@@ -155,13 +179,30 @@ struct LegacySystemState
 
 	LegacySystemState()
 		: running(false), stopping(false), configuredWorkerCount(0),
-		  queueCapacity(0), generation(0) {}
+		  queueCapacity(0), generation(0), lazyStartupDisabled(false)
+	{
+		memset(ownerThreadIds, 0, sizeof(ownerThreadIds));
+#if defined(_WIN32)
+		InitializeCriticalSection(&ownerMutex);
+#endif
+	}
+	~LegacySystemState()
+	{
+#if defined(_WIN32)
+		DeleteCriticalSection(&ownerMutex);
+#endif
+	}
 
 	bool running;
 	bool stopping;
 	unsigned configuredWorkerCount;
 	unsigned queueCapacity;
 	unsigned generation;
+	bool lazyStartupDisabled;
+	unsigned long ownerThreadIds[JOB_OWNER_COUNT];
+#if defined(_WIN32)
+	CRITICAL_SECTION ownerMutex;
+#endif
 	std::vector<unsigned char> scratch;
 	std::deque<CompletionItem> completions;
 	JobSystemMetrics metrics;
@@ -170,7 +211,9 @@ struct LegacySystemState
 struct JobSystem::State : public LegacySystemState {};
 
 JobCpuSetInfo::JobCpuSetInfo()
-	: id(0), efficiencyClass(0), parked(false), allocatedToOtherProcess(false) {}
+	: id(0), efficiencyClass(0), group(0), coreIndex(UINT_MAX),
+	  logicalProcessorIndex(0), parked(false), allocatedToOtherProcess(false),
+	  availableToProcess(true) {}
 
 JobSystemConfig::JobSystemConfig()
 	: workerCount(0), queueCapacity(0), scratchBytesPerWorker(0),
@@ -181,8 +224,9 @@ JobSystemMetrics::JobSystemMetrics()
 	  ownerHelpCount(0), waitCount(0), workerWaitRejectionCount(0),
 	  failedJobCount(0), cancelledJobCount(0), serialFallbackCount(0),
 	  totalQueueLatencyNanoseconds(0), maximumQueueLatencyNanoseconds(0),
-	  workerSleepCount(0), workerWakeCount(0), injectionHighWater(0),
-	  maximumActiveWorkers(0) {}
+	  workerSleepCount(0), workerWakeCount(0), affinityFailureCount(0), injectionHighWater(0),
+	  maximumActiveWorkers(0), availableLogicalCpuCount(0), reservedOwnerCpuCount(0),
+	  selectedWorkerCpuCount(0) {}
 
 JobContext::JobContext(State *state) : m_state(state) {}
 
@@ -273,6 +317,34 @@ JobSystem &JobSystem::instance()
 	return *system;
 }
 
+unsigned JobSystem::chooseRangeCount(unsigned itemCount,
+	unsigned minimumItemsPerRange, unsigned workerCount)
+{
+	if (itemCount == 0) return 0;
+	if (workerCount <= 1) return 1;
+	if (minimumItemsPerRange == 0) minimumItemsPerRange = 1;
+	const unsigned usefulRanges = itemCount / minimumItemsPerRange;
+	if (usefulRanges <= 1) return 1;
+	const unsigned parallelRanges = workerCount > UINT_MAX / 4 ?
+		UINT_MAX : workerCount * 4;
+	return usefulRanges < parallelRanges ? usefulRanges : parallelRanges;
+}
+
+bool JobSystem::rangeForIndex(unsigned itemCount, unsigned rangeCount,
+	unsigned rangeIndex, JobRange &range)
+{
+	range.begin = 0;
+	range.end = 0;
+	if (rangeCount == 0 || rangeCount > itemCount || rangeIndex >= rangeCount)
+		return false;
+	const unsigned width = itemCount / rangeCount;
+	const unsigned remainder = itemCount % rangeCount;
+	range.begin = rangeIndex * width +
+		(rangeIndex < remainder ? rangeIndex : remainder);
+	range.end = range.begin + width + (rangeIndex < remainder ? 1 : 0);
+	return true;
+}
+
 unsigned JobSystem::chooseWorkerCount(unsigned eligibleLogicalCpuCount,
 	JobWorkerPolicy policy, unsigned explicitWorkerCount)
 {
@@ -282,6 +354,52 @@ unsigned JobSystem::chooseWorkerCount(unsigned eligibleLogicalCpuCount,
 	const unsigned reserved = eligibleLogicalCpuCount >= 8 ? 2 : 1;
 	return eligibleLogicalCpuCount > reserved ?
 		eligibleLogicalCpuCount - reserved : 1;
+}
+
+unsigned JobSystem::selectOwnerCpuSets(const JobCpuSetInfo *cpuSets,
+	unsigned cpuSetCount, JobWorkerPolicy policy,
+	unsigned explicitWorkerCount, unsigned *selectedIds,
+	unsigned selectedIdCapacity)
+{
+	if (cpuSets == 0 || selectedIds == 0 || selectedIdCapacity == 0 ||
+		policy != JOB_WORKER_POLICY_AUTO || explicitWorkerCount != 0) return 0;
+	unsigned eligibleCount = 0;
+	unsigned first = cpuSetCount;
+	unsigned index;
+	for (index = 0; index < cpuSetCount; ++index)
+	{
+		const JobCpuSetInfo &item = cpuSets[index];
+		if (item.parked || item.allocatedToOtherProcess || !item.availableToProcess)
+			continue;
+		++eligibleCount;
+		if (first == cpuSetCount || item.efficiencyClass > cpuSets[first].efficiencyClass ||
+			(item.efficiencyClass == cpuSets[first].efficiencyClass && item.id < cpuSets[first].id))
+			first = index;
+	}
+	if (eligibleCount <= 1) return 0;
+	selectedIds[0] = cpuSets[first].id;
+	if (eligibleCount < 8 || selectedIdCapacity < 2) return 1;
+	unsigned second = cpuSetCount;
+	bool secondOnDifferentCore = false;
+	for (index = 0; index < cpuSetCount; ++index)
+	{
+		const JobCpuSetInfo &item = cpuSets[index];
+		if (index == first || item.parked || item.allocatedToOtherProcess ||
+			!item.availableToProcess) continue;
+		const bool differentCore = item.coreIndex == UINT_MAX ||
+			cpuSets[first].coreIndex == UINT_MAX || item.group != cpuSets[first].group ||
+			item.coreIndex != cpuSets[first].coreIndex;
+		if (second == cpuSetCount || (differentCore && !secondOnDifferentCore) ||
+			(differentCore == secondOnDifferentCore &&
+			 (item.efficiencyClass > cpuSets[second].efficiencyClass ||
+			  (item.efficiencyClass == cpuSets[second].efficiencyClass && item.id < cpuSets[second].id))))
+		{
+			second = index;
+			secondOnDifferentCore = differentCore;
+		}
+	}
+	selectedIds[1] = cpuSets[second].id;
+	return 2;
 }
 
 unsigned JobSystem::selectWorkerCpuSets(const JobCpuSetInfo *cpuSets,
@@ -296,7 +414,8 @@ unsigned JobSystem::selectWorkerCpuSets(const JobCpuSetInfo *cpuSets,
 		unsigned index;
 		for (index = 0; index < cpuSetCount; ++index)
 		{
-			if (!cpuSets[index].parked && !cpuSets[index].allocatedToOtherProcess)
+			if (cpuSets[index].availableToProcess && !cpuSets[index].parked &&
+				!cpuSets[index].allocatedToOtherProcess)
 				eligible.push_back(cpuSets[index]);
 		}
 		for (index = 1; index < eligible.size(); ++index)
@@ -319,14 +438,20 @@ unsigned JobSystem::selectWorkerCpuSets(const JobCpuSetInfo *cpuSets,
 	const unsigned requested = chooseWorkerCount(eligibleCount, policy,
 		explicitWorkerCount);
 	const unsigned selectedCount = requested < eligibleCount ? requested : eligibleCount;
-	unsigned first = 0;
-	if (explicitWorkerCount == 0 && policy == JOB_WORKER_POLICY_AUTO &&
-		eligibleCount > selectedCount) first = eligibleCount - selectedCount;
+	unsigned ownerIds[2];
+	const unsigned ownerCount = selectOwnerCpuSets(cpuSets, cpuSetCount,
+		policy, explicitWorkerCount, ownerIds, 2);
 	const unsigned writable = selectedCount < selectedIdCapacity ?
 		selectedCount : selectedIdCapacity;
 	unsigned index;
-	for (index = 0; index < writable; ++index) selectedIds[index] = eligible[first + index].id;
-	return writable;
+	unsigned written = 0;
+	for (index = 0; index < eligibleCount && written < writable; ++index)
+	{
+		if ((ownerCount > 0 && eligible[index].id == ownerIds[0]) ||
+			(ownerCount > 1 && eligible[index].id == ownerIds[1])) continue;
+		selectedIds[written++] = eligible[index].id;
+	}
+	return written;
 }
 
 bool JobSystem::setStartupWorkerCount(unsigned workerCount)
@@ -361,10 +486,25 @@ JobSystemConfig JobSystem::startupConfig()
 
 bool JobSystem::start(const JobSystemConfig &config)
 {
+	return startInternal(config, true);
+}
+
+bool JobSystem::startInternal(const JobSystemConfig &config, bool allowRestart)
+{
 #if defined(RTS_BUILD_CORE_EXTRAS)
 	if (consumeJobSystemTestFaultLegacy(1)) return false;
 #endif
-	if (m_state == 0 || m_state->running || config.queueCapacity == 0 ||
+	if (m_state == 0 || m_state->stopping ||
+		(!allowRestart && m_state->lazyStartupDisabled)) return false;
+	if (m_state->running) return !allowRestart;
+	{
+#if defined(_WIN32)
+		LegacyOwnerLock lock(m_state->ownerMutex);
+#endif
+		const unsigned long gameOwner = m_state->ownerThreadIds[JOB_OWNER_GAME];
+		if (gameOwner != 0 && gameOwner != currentOwnerThreadId()) return false;
+	}
+	if (config.queueCapacity == 0 ||
 		config.scratchBytesPerWorker == 0 ||
 		(config.workerPolicy != JOB_WORKER_POLICY_AUTO &&
 		 config.workerPolicy != JOB_WORKER_POLICY_ALL) ||
@@ -378,18 +518,59 @@ bool JobSystem::start(const JobSystemConfig &config)
 		m_state->scratch.resize(config.scratchBytesPerWorker);
 	}
 	catch (...) { return false; }
+	LockPipelineExecutionMode();
 	++m_state->generation;
 	m_state->configuredWorkerCount = count;
 	m_state->queueCapacity = config.queueCapacity;
 	m_state->metrics = JobSystemMetrics();
 	m_state->running = true;
 	m_state->stopping = false;
+	m_state->lazyStartupDisabled = false;
 	return true;
 }
-bool JobSystem::ensureStarted() { return isRunning() || start(startupConfig()); }
+bool JobSystem::ensureStarted() { return isRunning() || startInternal(startupConfig(), false); }
+
+bool JobSystem::registerCurrentThread(JobOwnerRole role)
+{
+	if (m_state == 0 || role < JOB_OWNER_GAME || role >= JOB_OWNER_COUNT) return false;
+#if defined(_WIN32)
+	LegacyOwnerLock lock(m_state->ownerMutex);
+#endif
+	const unsigned long current = currentOwnerThreadId();
+	if (m_state->ownerThreadIds[role] != 0)
+		return m_state->ownerThreadIds[role] == current;
+	unsigned index;
+	for (index = 0; index < JOB_OWNER_COUNT; ++index)
+		if (m_state->ownerThreadIds[index] == current) return false;
+	LockPipelineExecutionMode();
+	m_state->ownerThreadIds[role] = current;
+	return true;
+}
+
+bool JobSystem::unregisterCurrentThread(JobOwnerRole role)
+{
+	if (m_state == 0 || role < JOB_OWNER_GAME || role >= JOB_OWNER_COUNT) return false;
+#if defined(_WIN32)
+	LegacyOwnerLock lock(m_state->ownerMutex);
+#endif
+	if (m_state->ownerThreadIds[role] != currentOwnerThreadId()) return false;
+	m_state->ownerThreadIds[role] = 0;
+	return true;
+}
+
+bool JobSystem::isCurrentThread(JobOwnerRole role) const
+{
+	if (m_state == 0 || role < JOB_OWNER_GAME || role >= JOB_OWNER_COUNT) return false;
+#if defined(_WIN32)
+	LegacyOwnerLock lock(m_state->ownerMutex);
+#endif
+	return m_state->ownerThreadIds[role] == currentOwnerThreadId();
+}
+
 void JobSystem::shutdown()
 {
 	if (m_state == 0) return;
+	m_state->lazyStartupDisabled = true;
 	m_state->stopping = true;
 	pumpOwnerCompletions((unsigned)-1);
 	m_state->completions.clear();

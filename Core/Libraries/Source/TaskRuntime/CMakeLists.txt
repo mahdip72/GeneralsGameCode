@@ -2,15 +2,26 @@ add_library(core_task_runtime STATIC)
 
 target_sources(core_task_runtime PRIVATE
     TaskRuntime.cpp
+    PipelineExecutionPolicy.cpp
     RadarTerrainKernel.cpp
     RadarOverlayKernel.cpp
     HeightMapTerrainKernel.cpp
     HeightMapDynamicLightKernel.cpp
+    ParallelVisibility.cpp
+    ParallelSkinning.cpp
+    ParticleRenderKernel.cpp
+    WaterMeshKernel.cpp
+    ProjectedTerrainGridKernel.cpp
+    WaterPolygonKernel.cpp
+    SortingTriangleKernel.cpp
+    GeometryTriangleDecode.cpp
 )
 
 if(NOT IS_VS6_BUILD)
     target_sources(core_task_runtime PRIVATE
         JobSystem.cpp
+        ResourceIoPipeline.cpp
+        ModelAssetBytes.cpp
     )
 endif()
 

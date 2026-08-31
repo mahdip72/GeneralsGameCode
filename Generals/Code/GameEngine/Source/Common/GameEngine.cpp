@@ -108,6 +108,7 @@
 #include "GameNetwork/NetworkInterface.h"
 #include "GameNetwork/WOLBrowser/WebBrowser.h"
 #include "GameNetwork/LANAPI.h"
+#include "GameNetwork/NAT.h"
 #include "GameNetwork/GameSpy/GameResultsThread.h"
 #include "GameNetwork/GameSpy/PeerDefs.h"
 #include "GameNetwork/GameSpy/PersistentStorageThread.h"
@@ -178,6 +179,7 @@ void initSubsystem(
 //-------------------------------------------------------------------------------------------------
 extern HINSTANCE ApplicationHInstance;  ///< our application instance
 extern CComModule _Module;
+extern LANAPI *TheLAN;
 
 //-------------------------------------------------------------------------------------------------
 static void updateTGAtoDDS();
@@ -265,8 +267,17 @@ GameEngine::GameEngine()
 //-------------------------------------------------------------------------------------------------
 GameEngine::~GameEngine()
 {
+	const Bool releaseJobOwner = !TheGlobalData->m_headless &&
+		rts::JobSystem::instance().isCurrentThread(rts::JOB_OWNER_GAME);
 	//extern std::vector<std::string>	preloadTextureNamesGlobalHack;
 	//preloadTextureNamesGlobalHack.clear();
+
+	// These globals own live transports which use the shared network owner.
+	// Release them while game globals and JobSystem are still available.
+	delete TheLAN;
+	TheLAN = nullptr;
+	delete TheNAT;
+	TheNAT = nullptr;
 
 	delete TheMapCache;
 	TheMapCache = nullptr;
@@ -306,6 +317,11 @@ GameEngine::~GameEngine()
 	Drawable::killStaticImages();
 
 	_Module.Term();
+	if (releaseJobOwner)
+	{
+		if (!rts::JobSystem::instance().unregisterCurrentThread(rts::JOB_OWNER_GAME))
+			DEBUG_LOG(("JobSystem game-owner registration could not be released."));
+	}
 
 #ifdef PERF_TIMERS
 	PerfGather::termPerfDump();
@@ -358,10 +374,18 @@ void GameEngine::init()
 {
 	ASSERT_GAME_THREAD("GameEngine::init");
 	try {
-		if (!TheGlobalData->m_headless &&
-			!rts::JobSystem::instance().ensureStarted())
+		// Headless model/pose queries can reach lazy compute consumers too.
+		// Disable lazy startup before any subsystem loads assets; shutdown on a
+		// never-started scheduler creates no workers and preserves serial paths.
+		if (TheGlobalData->m_headless)
+			rts::JobSystem::instance().shutdown();
+		if (!TheGlobalData->m_headless)
 		{
-			DEBUG_LOG(("JobSystem startup failed; parallel consumers will use their serial fallback."));
+			rts::JobSystem &jobSystem = rts::JobSystem::instance();
+			if (!jobSystem.ensureStarted())
+				DEBUG_LOG(("JobSystem startup failed; parallel consumers will use their serial fallback."));
+			else if (!jobSystem.registerCurrentThread(rts::JOB_OWNER_GAME))
+				RELEASE_CRASH(("JobSystem was initialized by a different game owner."));
 		}
 
 		//create an INI object to use for loading stuff

@@ -23,6 +23,7 @@
 #include "GameClient/GameText.h"
 #include "GameClient/InGameUI.h"
 #include "Lib/JobSystem.h"
+#include "Lib/PipelineExecutionPolicy.h"
 #include "WW3D2/dx8wrapper.h"
 #include "WW3D2/ww3d.h"
 #include "WW3D2/surfaceclass.h"
@@ -240,7 +241,7 @@ public:
 	void submit(ScreenshotBatch* batch)
 	{
 		rts::JobSystem& system = rts::JobSystem::instance();
-		if (!system.ensureStarted())
+		if (!rts::UseParallelPipelines() || !system.ensureStarted())
 		{
 			system.recordSerialFallback();
 			batch->setTaskCount(1);

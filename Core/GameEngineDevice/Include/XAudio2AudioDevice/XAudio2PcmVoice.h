@@ -99,10 +99,14 @@ public:
 	void failFromService(HRESULT error) noexcept;
 
 	AudioPcmSubmitResult submit(AudioPcmChunk &&chunk) override;
+	// Service-only retry path. A bounded slot rejection leaves the producer-owned
+	// chunk intact; terminal validation/lifecycle failures consume it.
+	AudioPcmSubmitResult submitRetained(AudioPcmChunk &chunk);
 	bool canAccept(std::size_t submissions) const noexcept override;
 	void reset(std::uint64_t generation) override;
 	bool getPlayedSample(std::int64_t &sample) const noexcept override;
 	bool tryPopCompletion(XAudio2PcmCompletionRecord &completion) noexcept;
+	void getBufferedState(std::size_t &buffers, std::size_t &bytes) const noexcept;
 
 	void STDMETHODCALLTYPE OnVoiceProcessingPassStart(UINT32 BytesRequired) override;
 	void STDMETHODCALLTYPE OnVoiceProcessingPassEnd() override;
@@ -151,6 +155,7 @@ private:
 	void reclaimCompletedSlots();
 	Slot *findFreeSlot();
 	Slot *findNextPendingSlot();
+	AudioPcmSubmitResult submitLocked(AudioPcmChunk &chunk, bool retainOnCapacity);
 	bool hasSubmittedOldSlot() const;
 	bool consumeCallbackError(HRESULT &error);
 	void publishCallbackError(HRESULT error) noexcept;

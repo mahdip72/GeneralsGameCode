@@ -142,6 +142,8 @@ private:
 		Bool needsVoiceService = FALSE;
 		AsciiString assetFileName;
 		std::unique_ptr<AudioPcmStream> pcmStream;
+		AudioPcmChunk pendingPcm;
+		Bool pendingPcmReady = FALSE;
 		UnsignedInt phaseSubmittedFrames = 0;
 		UnsignedInt phaseQueuedBuffers = 0;
 		UnsignedInt phaseCompletedFrames = 0;

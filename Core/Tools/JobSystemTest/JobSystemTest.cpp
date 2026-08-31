@@ -1,6 +1,7 @@
 #include "Lib/JobSystem.h"
 
 #include <limits.h>
+#include <new>
 #include <stdio.h>
 
 #if !defined(_MSC_VER) || _MSC_VER >= 1300
@@ -9,6 +10,12 @@
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#if defined(_WIN32)
+#if !defined(NOMINMAX)
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #endif
 
 #if defined(RTS_BUILD_CORE_EXTRAS)
@@ -169,7 +176,7 @@ int testBasicStartSubmitWaitShutdown()
 
 int testDeterministicWorkerCounts()
 {
-	const unsigned workerCounts[] = { 1, 2, 4, 8, 16 };
+	const unsigned workerCounts[] = { 1, 2, 4, 8, 16, 0 };
 	const unsigned jobCount = 256;
 	unsigned reference[jobCount];
 	unsigned index;
@@ -199,7 +206,8 @@ int testDeterministicWorkerCounts()
 		result |= check(system.workerCount() == 1,
 			"VC6 reference adapter reports its single execution lane");
 #else
-		result |= check(system.workerCount() == workerCounts[workerIndex],
+		result |= check(workerCounts[workerIndex] == 0 ? system.workerCount() > 0 :
+			system.workerCount() == workerCounts[workerIndex],
 			"configured worker count has no product cap");
 #endif
 		rts::JobGroup group = system.createGroup();
@@ -225,6 +233,233 @@ int testDeterministicWorkerCounts()
 		}
 		system.shutdown();
 	}
+	return result;
+}
+
+int testFlatRangePartitions()
+{
+	int result = 0;
+	const unsigned sizes[] = { 0, 1, 7, 64, 257, 4097, 131071, UINT_MAX };
+	const unsigned grains[] = { 0, 1, 32, 512, UINT_MAX };
+	const unsigned workers[] = { 0, 1, 2, 4, 8, 16, UINT_MAX };
+	unsigned sizeIndex;
+	unsigned grainIndex;
+	unsigned workerIndex;
+	for (sizeIndex = 0; sizeIndex < sizeof(sizes) / sizeof(sizes[0]); ++sizeIndex)
+	for (grainIndex = 0; grainIndex < sizeof(grains) / sizeof(grains[0]); ++grainIndex)
+	for (workerIndex = 0; workerIndex < sizeof(workers) / sizeof(workers[0]); ++workerIndex)
+	{
+		const unsigned size = sizes[sizeIndex];
+		const unsigned count = rts::JobSystem::chooseRangeCount(size,
+			grains[grainIndex], workers[workerIndex]);
+		result |= check(size == 0 ? count == 0 : count > 0 && count <= size,
+			"range count is bounded for empty, small, large and extreme inputs");
+		if (size == 0) continue;
+		result |= check(workers[workerIndex] > 1 || count == 1,
+			"zero/one worker uses the serial reference partition");
+		const unsigned sampleCount = count < 1024 ? count : 3;
+		unsigned previousEnd = 0;
+		for (unsigned sample = 0; sample < sampleCount; ++sample)
+		{
+			const unsigned index = count < 1024 ? sample :
+				(sample == 0 ? 0 : (sample == 1 ? count / 2 : count - 1));
+			rts::JobRange range;
+			result |= check(rts::JobSystem::rangeForIndex(size, count, index, range),
+				"every valid partition can be materialized without allocation");
+			result |= check(range.begin < range.end && range.end <= size,
+				"ranges remain nonempty and inside immutable snapshot bounds");
+			if (count < 1024 || index == 0)
+				result |= check(range.begin == previousEnd,
+					"ordered ranges have no gaps or overlap");
+			previousEnd = range.end;
+		}
+		result |= check(previousEnd == size, "last range covers the exact tail");
+	}
+	rts::JobRange invalid;
+	result |= check(!rts::JobSystem::rangeForIndex(0, 0, 0, invalid) &&
+		invalid.begin == 0 && invalid.end == 0 &&
+		!rts::JobSystem::rangeForIndex(3, 4, 0, invalid) &&
+		!rts::JobSystem::rangeForIndex(3, 3, 3, invalid),
+		"invalid partition metadata fails closed with an empty output");
+	result |= check(rts::JobSystem::chooseRangeCount(4096, 32, 16) == 64 &&
+		rts::JobSystem::chooseRangeCount(UINT_MAX, 1, UINT_MAX) == UINT_MAX,
+		"adaptive ranges scale beyond two workers without unsigned overflow");
+	return result;
+}
+
+class FlatRangeJob : public rts::Job
+{
+public:
+	FlatRangeJob(const rts::JobRange &range, unsigned *executions, unsigned *outputs)
+		: m_range(range), m_executions(executions), m_outputs(outputs) {}
+	virtual void execute(rts::JobContext &)
+	{
+		for (unsigned index = m_range.begin; index < m_range.end; ++index)
+		{
+			++m_executions[index];
+			m_outputs[index] = (index * 2654435761u) ^ (index >> 3);
+		}
+	}
+private:
+	rts::JobRange m_range;
+	unsigned *m_executions;
+	unsigned *m_outputs;
+};
+
+int testFlatRangeKernelAndSaturationFallback()
+{
+	int result = 0;
+	const unsigned itemCount = 4097;
+	const unsigned maximumRanges = itemCount / 32;
+	const unsigned workers[] = { 1, 2, 4, 8, 16, 0 };
+	for (unsigned workerIndex = 0; workerIndex < sizeof(workers) / sizeof(workers[0]); ++workerIndex)
+	for (unsigned saturated = 0; saturated < 2; ++saturated)
+	{
+		rts::JobSystem &system = rts::JobSystem::instance();
+		rts::JobSystemConfig config;
+		config.workerCount = workers[workerIndex];
+		config.queueCapacity = saturated ? 1 : maximumRanges;
+		config.scratchBytesPerWorker = 4096;
+		config.pinWorkers = false;
+		result |= check(system.start(config), "flat-range fixture starts");
+		unsigned executions[itemCount] = { 0 };
+		unsigned outputs[itemCount] = { 0 };
+		const unsigned rangeCount = rts::JobSystem::chooseRangeCount(itemCount, 32,
+			system.workerCount());
+		rts::JobGroup group = system.createGroup();
+		rts::JobSubmission submissions[maximumRanges];
+		rts::JobHandle handles[maximumRanges];
+		unsigned allocated = 0;
+		for (unsigned index = 0; index < rangeCount; ++index)
+		{
+			rts::JobRange range;
+			if (!rts::JobSystem::rangeForIndex(itemCount, rangeCount, index, range)) break;
+			submissions[index].job = new (std::nothrow) FlatRangeJob(range, executions, outputs);
+			submissions[index].priority = rts::JOB_PRIORITY_FRAME_CRITICAL;
+			if (submissions[index].job == 0) break;
+			++allocated;
+		}
+		const bool accepted = allocated == rangeCount &&
+			system.trySubmitBatch(submissions, rangeCount, group, handles);
+		if (accepted)
+		{
+			result |= check(system.wait(group) && !group.failed(),
+				"flat-range batch drains before snapshot storage is released");
+		}
+		else
+		{
+			for (unsigned release = 0; release < allocated; ++release)
+				delete submissions[release].job;
+			system.recordSerialFallback();
+			for (unsigned serial = 0; serial < itemCount; ++serial)
+			{
+				++executions[serial];
+				outputs[serial] = (serial * 2654435761u) ^ (serial >> 3);
+			}
+		}
+		result |= check(accepted == (rangeCount <= config.queueCapacity),
+			"bounded admission either accepts every range or leaves caller ownership");
+		for (unsigned verify = 0; verify < itemCount; ++verify)
+			result |= check(executions[verify] == 1 &&
+				outputs[verify] == ((verify * 2654435761u) ^ (verify >> 3)),
+				"flat-range and saturation fallback match serial output exactly once");
+		result |= check(system.outstandingJobCount() == 0,
+			"flat-range fixture retains no task after publication");
+		system.shutdown();
+	}
+	return result;
+}
+
+int testAvailableCpuSetsAndOwnerReservations()
+{
+	int result = 0;
+	rts::JobCpuSetInfo cpuSets[12];
+	unsigned index;
+	for (index = 0; index < 12; ++index)
+	{
+		cpuSets[index].id = 100 + index;
+		cpuSets[index].efficiencyClass = index < 4 ? 3 : 1;
+		cpuSets[index].group = 0;
+		cpuSets[index].coreIndex = index / 2;
+		cpuSets[index].logicalProcessorIndex = index;
+	}
+	cpuSets[8].parked = true;
+	cpuSets[9].allocatedToOtherProcess = true;
+	cpuSets[10].availableToProcess = false;
+	cpuSets[11].group = 1;
+	cpuSets[11].coreIndex = 0;
+	unsigned owners[2] = { 0, 0 };
+	unsigned workers[12] = { 0 };
+	result |= check(rts::JobSystem::selectOwnerCpuSets(cpuSets, 12,
+		rts::JOB_WORKER_POLICY_AUTO, 0, owners, 2) == 2 &&
+		owners[0] == 100 && owners[1] == 102,
+		"auto reserves separate high-performance physical cores for game and render");
+	const unsigned count = rts::JobSystem::selectWorkerCpuSets(cpuSets, 12,
+		rts::JOB_WORKER_POLICY_AUTO, 0, workers, 12);
+	result |= check(count == 7, "auto derives workers from process-available CPU sets");
+	for (index = 0; index < count; ++index)
+		result |= check(workers[index] != 100 && workers[index] != 102 &&
+			workers[index] != 108 && workers[index] != 109 && workers[index] != 110,
+			"workers avoid owner reservations and unavailable, parked or allocated CPUs");
+	result |= check(rts::JobSystem::selectWorkerCpuSets(cpuSets, 12,
+		rts::JOB_WORKER_POLICY_ALL, 0, workers, 12) == 9 &&
+		rts::JobSystem::selectOwnerCpuSets(cpuSets, 12,
+			rts::JOB_WORKER_POLICY_ALL, 0, owners, 2) == 0,
+		"all retains every eligible CPU without bypassing process availability");
+	result |= check(rts::JobSystem::selectWorkerCpuSets(cpuSets, 12,
+		rts::JOB_WORKER_POLICY_AUTO, 16, workers, 12) == 9 &&
+		rts::JobSystem::chooseWorkerCount(9, rts::JOB_WORKER_POLICY_AUTO, 16) == 16,
+		"explicit oversubscription preserves count but pins only to available CPUs");
+	for (index = 0; index < 12; ++index) cpuSets[index].availableToProcess = index < 2;
+	result |= check(rts::JobSystem::selectOwnerCpuSets(cpuSets, 12,
+		rts::JOB_WORKER_POLICY_AUTO, 0, owners, 2) == 1 &&
+		rts::JobSystem::selectWorkerCpuSets(cpuSets, 12,
+			rts::JOB_WORKER_POLICY_AUTO, 0, workers, 12) == 1 && workers[0] == 101,
+		"two-CPU process affinity keeps one owner and one worker");
+	cpuSets[0].availableToProcess = false;
+	result |= check(rts::JobSystem::selectOwnerCpuSets(cpuSets, 12,
+		rts::JOB_WORKER_POLICY_AUTO, 0, owners, 2) == 0 &&
+		rts::JobSystem::selectWorkerCpuSets(cpuSets, 12,
+			rts::JOB_WORKER_POLICY_AUTO, 0, workers, 12) == 1,
+		"single eligible CPU shares the serial/one-worker fallback without reservation");
+	cpuSets[1].availableToProcess = false;
+	result |= check(rts::JobSystem::selectWorkerCpuSets(cpuSets, 12,
+		rts::JOB_WORKER_POLICY_ALL, 16, workers, 12) == 0,
+		"no available CPU never selects an invalid affinity target");
+	return result;
+}
+
+int testOwnerRoleAndLazyRestartBasics()
+{
+	int result = 0;
+	rts::JobSystem &system = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 1;
+	config.queueCapacity = 8;
+	config.scratchBytesPerWorker = 4096;
+	config.pinWorkers = false;
+	result |= check(system.start(config), "owner-role fixture starts");
+	result |= check(system.registerCurrentThread(rts::JOB_OWNER_GAME) &&
+		system.registerCurrentThread(rts::JOB_OWNER_GAME) &&
+		system.isCurrentThread(rts::JOB_OWNER_GAME),
+		"game owner registration is explicit and idempotent");
+	result |= check(!system.registerCurrentThread(rts::JOB_OWNER_RENDER) &&
+		!system.registerCurrentThread(static_cast<rts::JobOwnerRole>(-1)),
+		"one thread cannot claim conflicting owner roles or invalid roles");
+	system.shutdown();
+	result |= check(!system.ensureStarted() && !system.isRunning() &&
+		system.isCurrentThread(rts::JOB_OWNER_GAME),
+		"shutdown disables lazy restart without destroying owner identities");
+	result |= check(system.unregisterCurrentThread(rts::JOB_OWNER_GAME) &&
+		!system.isCurrentThread(rts::JOB_OWNER_GAME) &&
+		!system.unregisterCurrentThread(rts::JOB_OWNER_GAME),
+		"same-thread owner release remains available after compute shutdown");
+	result |= check(system.registerCurrentThread(rts::JOB_OWNER_IO) &&
+		!system.isRunning() && system.unregisterCurrentThread(rts::JOB_OWNER_IO),
+		"service ownership alone never resurrects compute workers");
+	result |= check(system.start(config) && system.ensureStarted(),
+		"explicit startup alone starts a new scheduler generation");
+	system.shutdown();
 	return result;
 }
 
@@ -1326,6 +1561,141 @@ int testBatchAdmissionAndWorkerWaitRejection()
 	return result;
 }
 
+class OwnerRoleProbeJob : public rts::Job
+{
+public:
+	OwnerRoleProbeJob(std::atomic<bool> *entered, bool *registration)
+		: m_entered(entered), m_registration(registration) {}
+	virtual void execute(rts::JobContext &)
+	{
+		*m_registration = rts::JobSystem::instance().registerCurrentThread(rts::JOB_OWNER_IO);
+		m_entered->store(true, std::memory_order_release);
+	}
+private:
+	std::atomic<bool> *m_entered;
+	bool *m_registration;
+};
+
+int testServiceOwnerLifetimeAndWorkerRoleRejection()
+{
+	int result = 0;
+	rts::JobSystem &system = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 2;
+	config.queueCapacity = 8;
+	config.scratchBytesPerWorker = 4096;
+	config.pinWorkers = false;
+	result |= check(system.start(config) && system.registerCurrentThread(rts::JOB_OWNER_GAME),
+		"service-owner fixture establishes the game owner");
+	Gate serviceLifetime;
+	bool serviceRegistered = false;
+	bool serviceUnregistered = false;
+	bool serviceSurvivedComputeDrain = false;
+	bool serviceWrongGameOwner = true;
+	std::thread service([&]() {
+		serviceWrongGameOwner = system.registerCurrentThread(rts::JOB_OWNER_GAME);
+		serviceRegistered = system.registerCurrentThread(rts::JOB_OWNER_AUDIO);
+		serviceLifetime.waitUntilOpen();
+		serviceSurvivedComputeDrain = system.isCurrentThread(rts::JOB_OWNER_AUDIO) &&
+			!system.isRunning() && !system.ensureStarted() && !system.start(config);
+		serviceUnregistered = system.unregisterCurrentThread(rts::JOB_OWNER_AUDIO);
+	});
+	result |= check(serviceLifetime.waitForEntry(), "service execution owner enters");
+	result |= check(!system.unregisterCurrentThread(rts::JOB_OWNER_AUDIO),
+		"game owner cannot unregister another service execution owner");
+	bool conflictingRegistration = true;
+	std::thread competing([&]() {
+		conflictingRegistration = system.registerCurrentThread(rts::JOB_OWNER_AUDIO);
+	});
+	competing.join();
+	result |= check(!conflictingRegistration, "one role cannot hide a second private service thread");
+	std::atomic<bool> entered(false);
+	bool workerRegistration = true;
+	rts::JobGroup group = system.createGroup();
+	OwnerRoleProbeJob *probe = new OwnerRoleProbeJob(&entered, &workerRegistration);
+	rts::JobHandle handle = system.trySubmit(probe, rts::JOB_PRIORITY_NORMAL, group);
+	if (!handle.isValid()) delete probe;
+	const std::chrono::steady_clock::time_point deadline =
+		std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	while (!entered.load(std::memory_order_acquire) &&
+		std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+	const bool workerEntered = entered.load(std::memory_order_acquire);
+	system.shutdown();
+	serviceLifetime.open();
+	service.join();
+	result |= check(handle.isValid() && workerEntered && !workerRegistration && handle.succeeded(),
+		"compute workers cannot claim native service resource ownership");
+	result |= check(serviceRegistered && serviceUnregistered &&
+		serviceSurvivedComputeDrain && !serviceWrongGameOwner,
+		"service ownership remains valid through compute drain and releases on its owner");
+	result |= check(system.unregisterCurrentThread(rts::JOB_OWNER_GAME),
+		"game owner releases after all services have exited");
+	return result;
+}
+
+int testProcessAffinityLimitsTopology()
+{
+#if defined(_WIN32)
+	DWORD_PTR previousMask = 0;
+	DWORD_PTR systemMask = 0;
+	if (!GetProcessAffinityMask(GetCurrentProcess(), &previousMask, &systemMask) ||
+		previousMask == 0)
+	{
+		printf("Process-affinity topology fixture unavailable on this processor-group layout.\n");
+		return 0;
+	}
+	DWORD_PTR restrictedMask = previousMask & (~previousMask + 1);
+	typedef DWORD (WINAPI *GetCurrentProcessorNumberFunction)();
+	GetCurrentProcessorNumberFunction currentProcessor =
+		reinterpret_cast<GetCurrentProcessorNumberFunction>(
+			GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetCurrentProcessorNumber"));
+	if (currentProcessor != 0)
+	{
+		const DWORD current = currentProcessor();
+		if (current < sizeof(DWORD_PTR) * CHAR_BIT &&
+			(previousMask & (static_cast<DWORD_PTR>(1) << current)) != 0)
+			restrictedMask = static_cast<DWORD_PTR>(1) << current;
+	}
+	if (!SetProcessAffinityMask(GetCurrentProcess(), restrictedMask))
+	{
+		printf("Process-affinity topology fixture could not restrict its test process.\n");
+		return 0;
+	}
+	int result = 0;
+	rts::JobSystem &system = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 0;
+	config.workerPolicy = rts::JOB_WORKER_POLICY_ALL;
+	config.queueCapacity = 8;
+	config.scratchBytesPerWorker = 4096;
+	config.pinWorkers = true;
+	const bool started = system.start(config);
+	result |= check(started && system.workerCount() == 1 &&
+		system.metrics().availableLogicalCpuCount == 1,
+		"live CPU-set enumeration respects this process's single-CPU hard affinity");
+	if (started)
+	{
+		result |= check(system.registerCurrentThread(rts::JOB_OWNER_GAME),
+			"game role registration tolerates a single available logical CPU");
+		rts::JobGroup group = system.createGroup();
+		unsigned executions = 0;
+		CountJob *job = new CountJob(&executions);
+		rts::JobHandle handle = system.trySubmit(job, rts::JOB_PRIORITY_NORMAL, group);
+		if (!handle.isValid()) delete job;
+		result |= check(handle.isValid() && system.wait(group) && executions == 1,
+			"one-CPU worker/owner helping path remains live under real affinity");
+		system.shutdown();
+		result |= check(system.unregisterCurrentThread(rts::JOB_OWNER_GAME),
+			"owner restores its prior CPU-set selection after shutdown");
+	}
+	result |= check(SetProcessAffinityMask(GetCurrentProcess(), previousMask) != 0,
+		"topology fixture restores the test process's original affinity");
+	return result;
+#else
+	return 0;
+#endif
+}
+
 int testLifecycleOwnershipAndResourceLimits()
 {
 	int result = 0;
@@ -1360,8 +1730,20 @@ int testLifecycleOwnershipAndResourceLimits()
 int main()
 {
 	int result = 0;
+	// Match headless startup before any subsystem or test has started workers.
+	// Lazy model/pose preparation must not resurrect a compute pool here.
+	rts::JobSystem &coldSystem = rts::JobSystem::instance();
+	result |= check(!coldSystem.isRunning(), "cold scheduler has no compute workers");
+	coldSystem.shutdown();
+	result |= check(!coldSystem.ensureStarted() && !coldSystem.isRunning() &&
+		coldSystem.workerCount() == 0 && coldSystem.outstandingJobCount() == 0,
+		"headless cold shutdown blocks lazy compute startup");
 	result |= testBasicStartSubmitWaitShutdown();
 	result |= testDeterministicWorkerCounts();
+	result |= testFlatRangePartitions();
+	result |= testFlatRangeKernelAndSaturationFallback();
+	result |= testAvailableCpuSetsAndOwnerReservations();
+	result |= testOwnerRoleAndLazyRestartBasics();
 #if !defined(_MSC_VER) || _MSC_VER >= 1300
 	result |= testPrioritiesAndWorkStealing();
 	result |= testDependenciesContinuationsAndFailurePropagation();
@@ -1371,6 +1753,8 @@ int main()
 	result |= testFaultInjectionAndRecovery();
 #endif
 	result |= testBatchAdmissionAndWorkerWaitRejection();
+	result |= testServiceOwnerLifetimeAndWorkerRoleRejection();
+	result |= testProcessAffinityLimitsTopology();
 	result |= testLifecycleOwnershipAndResourceLimits();
 #endif
 	if (result == 0)

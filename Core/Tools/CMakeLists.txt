@@ -32,6 +32,7 @@ if(RTS_BUILD_CORE_EXTRAS)
         add_subdirectory(XAudio2ContractTest)
         add_subdirectory(XAudio2PcmVoiceTest)
         add_subdirectory(XAudio2AudioServiceTest)
+        add_subdirectory(XAudio2AudioOwnerTest)
         add_subdirectory(XAudio2AudioControlsTest)
         add_subdirectory(NativeAudioManagerContractTest)
         add_subdirectory(NativeAudioAssetCatalogTest)
@@ -183,8 +184,24 @@ if(RTS_BUILD_CORE_EXTRAS)
         endif()
     endif()
     add_subdirectory(JobSystemTest)
+    add_subdirectory(PipelineExecutionPolicyTest)
+    add_subdirectory(ParallelVisibilityTest)
+    add_subdirectory(ParallelSkinningTest)
+    add_subdirectory(EffectPrepareTest)
+    add_subdirectory(ProjectedTerrainGridTest)
+    add_subdirectory(WaterPolygonKernelTest)
+    add_subdirectory(SortingTriangleKernelTest)
+    add_subdirectory(GeometryTriangleDecodeTest)
+    if(WIN32 AND NOT IS_VS6_BUILD)
+        add_subdirectory(ThreadedRenderDeviceTest)
+    endif()
+    if(TARGET core_network_io)
+        add_subdirectory(NetworkIoOwnerTest)
+    endif()
     add_subdirectory(BezierLegacyParityTest)
     if(NOT IS_VS6_BUILD)
+        add_subdirectory(ResourceIoPipelineTest)
+        add_subdirectory(ModelAssetBytesTest)
         add_subdirectory(RuntimeEpochContractTest)
         add_subdirectory(NetworkWireContractTest)
         add_subdirectory(FileTransferTimeoutTest)
@@ -375,6 +392,18 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
 endif()
 
 if(WIN32)
+    add_test(NAME core_network_ownership_lifecycle_audit
+        COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/NetworkOwnershipLifecycleAudit/NetworkOwnershipLifecycleAudit.ps1"
+            -SourceRoot "${CMAKE_SOURCE_DIR}"
+    )
+    add_test(NAME core_network_ownership_lifecycle_audit_self_test
+        COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/NetworkOwnershipLifecycleAudit/NetworkOwnershipLifecycleAudit.ps1"
+            -SelfTest
+    )
+    set_tests_properties(core_network_ownership_lifecycle_audit
+        core_network_ownership_lifecycle_audit_self_test PROPERTIES TIMEOUT 30)
     if(NOT IS_VS6_BUILD)
         add_test(NAME core_windows_sdk_tool_discovery_test
             COMMAND "${CMAKE_COMMAND}"

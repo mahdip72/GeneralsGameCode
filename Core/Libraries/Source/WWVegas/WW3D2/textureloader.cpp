@@ -40,6 +40,12 @@
 
 #include "textureloader.h"
 #include "Lib/JobSystem.h"
+#include "Lib/PipelineExecutionPolicy.h"
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
+#define RTS_ASYNC_RESOURCE_IO 1
+#include "Lib/ResourceIoPipeline.h"
+#include "Lib/ModelAssetBytes.h"
+#endif
 #include "WWLib/mutex.h"
 #include "WWLib/thread.h"
 #include "WWDebug/wwdebug.h"
@@ -322,9 +328,24 @@ static TextureLoadTaskListClass					_VolTexLoadFreeList;
 
 
 static rts::JobGroup _TexturePrepareGroup;
+#if RTS_ASYNC_RESOURCE_IO
+static rts::ResourceIoPipeline _TextureResourcePipeline;
+static rts::ModelAssetReadQueue _ModelResourceQueue;
+static TextureLoadTaskListClass _ResourceQueue;
+static bool _ResourcePipelineStarted = false;
+static rts::JobMetricCounter _ResourceOwnerFallbacks = 0;
+#endif
 static TexturePrepareMemoryBudget _TexturePrepareMemoryBudget(64u * 1024u * 1024u);
 static const unsigned long _TextureForegroundSliceMilliseconds = 4;
 static const unsigned _TextureForegroundMaximumTasksPerUpdate = 8;
+
+static void Record_Texture_Reference_Fallback()
+{
+	rts::JobSystem::instance().recordSerialFallback();
+#if RTS_ASYNC_RESOURCE_IO
+	++_ResourceOwnerFallbacks;
+#endif
+}
 
 static bool Try_Load_For_Owner(TextureLoadTaskClass *task)
 {
@@ -342,35 +363,6 @@ static bool Try_Load_For_Owner(TextureLoadTaskClass *task)
 		return false;
 	}
 }
-
-class TexturePrepareRuntimeTask : public rts::Job
-{
-public:
-	explicit TexturePrepareRuntimeTask(TextureLoadTaskClass *task) : m_task(task) {}
-
-	virtual void execute(rts::JobContext &)
-	{
-		WWASSERT(m_task != nullptr);
-		WWASSERT(m_task->Get_Type() == TextureLoadTaskClass::TASK_LOAD);
-		WWASSERT(m_task->Get_State() == TextureLoadTaskClass::STATE_LOAD_BEGUN);
-		try
-		{
-			m_task->Load();
-		}
-		catch (...)
-		{
-			// JobSystem contains the exception after execute returns, but the
-			// texture owner still needs a completion publication so it can apply
-			// the missing texture and release the task's staged resources.
-			_ForegroundQueue.Publish_Failed(m_task);
-			return;
-		}
-		_ForegroundQueue.Publish_Completed(m_task);
-	}
-
-private:
-	TextureLoadTaskClass *m_task;
-};
 
 // TODO: Legacy - remove this call!
 IDirect3DTexture8* Load_Compressed_Texture(
@@ -465,10 +457,14 @@ void TextureLoader::Init()
 	ThumbnailManagerClass::Init();
 
 	rts::JobSystem &system = rts::JobSystem::instance();
-	if (system.ensureStarted())
+	if (rts::UseParallelPipelines() && system.ensureStarted())
 	{
 		_TexturePrepareGroup = system.createGroup();
 	}
+#if RTS_ASYNC_RESOURCE_IO
+	_ResourcePipelineStarted = rts::UseParallelPipelines() &&
+		_TextureResourcePipeline.start(rts::ResourceIoConfig(), _TexturePrepareGroup);
+#endif
 	{
 		FastCriticalSectionClass::LockClass lock(_ForegroundCriticalSection);
 		_AcceptingTextureRequests = true;
@@ -479,6 +475,7 @@ void TextureLoader::Init()
 
 void TextureLoader::Deinit()
 {
+	Stop_Async_Resource_Loading();
 	{
 		FastCriticalSectionClass::LockClass lock(_ForegroundCriticalSection);
 		_AcceptingTextureRequests = false;
@@ -957,7 +954,11 @@ void TextureLoader::Request_Foreground_Loading(TextureBaseClass *tc)
 			// Take queued work back from the runtime so a foreground request is
 			// not blocked behind unrelated textures. If this task is already
 			// active, wait only for that preparation.
-			if (!task->Is_Async_Prepare_Complete())
+			if (task->ResourceRequest != nullptr)
+			{
+				task->Wait_For_Async_Prepare();
+			}
+			else if (!task->Is_Async_Prepare_Complete())
 			{
 				if (_ForegroundQueue.Has_Prepare_Job(task))
 				{
@@ -990,6 +991,10 @@ void TextureLoader::Request_Foreground_Loading(TextureBaseClass *tc)
 			// Promote queued preparation ahead of streaming work. If a worker
 			// already owns it, publication proceeds normally.
 			_ForegroundQueue.Promote_Prepare_Job(task);
+#if RTS_ASYNC_RESOURCE_IO
+			if (task->ResourceRequest != nullptr)
+				_TextureResourcePipeline.promote(*static_cast<rts::ResourceIoTicket*>(task->ResourceRequest));
+#endif
 
 		} else {
 			// allocate high priority load task
@@ -1012,14 +1017,25 @@ void TextureLoader::Flush_Pending_Load_Tasks()
 	WWASSERT(Is_DX8_Thread());
 
 	for (;;) {
+#if RTS_ASYNC_RESOURCE_IO
+		Pump_Resource_Loads();
+#endif
 		if (_TexturePrepareGroup.isValid())
 		{
 			rts::JobSystem::instance().wait(_TexturePrepareGroup);
 		}
-		if (_ForegroundQueue.Is_Empty()) {
+		if (_ForegroundQueue.Is_Empty()
+#if RTS_ASYNC_RESOURCE_IO
+			&& _ResourceQueue.Is_Empty()
+#endif
+		) {
 			break;
 		}
 		Update();
+#if RTS_ASYNC_RESOURCE_IO
+		if (TextureLoadTaskClass *pending = _ResourceQueue.Peek_Front())
+			_TextureResourcePipeline.wait(*static_cast<rts::ResourceIoTicket*>(pending->ResourceRequest));
+#endif
 	}
 }
 
@@ -1027,6 +1043,21 @@ void TextureLoader::Flush_Pending_Load_Tasks()
 void TextureLoader::Discard_Pending_Background_Load_Tasks()
 {
 	WWASSERT(Is_DX8_Thread());
+	FastCriticalSectionClass::LockClass lock(_ForegroundCriticalSection);
+#if RTS_ASYNC_RESOURCE_IO
+	// A generation boundary rejects every old read/decode before factories,
+	// archive catalogs, or the device can be reset. Keep foreground intent,
+	// but resolve its source again in the new generation.
+	_TextureResourcePipeline.advanceGeneration();
+	_ModelResourceQueue.discard(_TextureResourcePipeline);
+	while (TextureLoadTaskClass *resourceTask = _ResourceQueue.Pop_Front())
+	{
+		resourceTask->Cancel_Resource_Read();
+		if (resourceTask->Get_Priority() == TextureLoadTaskClass::PRIORITY_LOW)
+			resourceTask->Destroy();
+		else _ForegroundQueue.Push_Back(resourceTask);
+	}
+#endif
 	// A prepare job temporarily owns its task outside the foreground queue.
 	// Drain the group before filtering so an outgoing-map task cannot publish
 	// after reset and upload its prepared surfaces into the next map.
@@ -1034,8 +1065,6 @@ void TextureLoader::Discard_Pending_Background_Load_Tasks()
 	{
 		rts::JobSystem::instance().wait(_TexturePrepareGroup);
 	}
-	FastCriticalSectionClass::LockClass lock(_ForegroundCriticalSection);
-
 	TextureLoadTaskListClass retainedTasks;
 	TextureLoadTaskClass *task = nullptr;
 	while ((task = _ForegroundQueue.Pop_Front()) != nullptr)
@@ -1083,6 +1112,7 @@ void TextureLoader::Update(void (*network_callback)())
 	FastCriticalSectionClass::LockClass lock(_ForegroundCriticalSection);
 
 	unsigned long time = timeGetTime();
+	Pump_Resource_Loads();
 	const unsigned long budgetStart = time;
 	unsigned processedTaskCount = 0;
 
@@ -1179,62 +1209,14 @@ void TextureLoader::Process_Foreground_Load(TextureLoadTaskClass *task)
 
 void TextureLoader::Begin_Load_And_Queue(TextureLoadTaskClass *task)
 {
-	// should only be called from the DX8 thread.
 	WWASSERT(Is_DX8_Thread());
-
-	if (task->Begin_Load()) {
-		const bool retainForRuntime = task->Reserve_Prepare_Memory();
-		TexturePrepareRuntimeTask *runtimeTask = nullptr;
-		if (retainForRuntime)
-		{
-			try
-			{
-				runtimeTask = new TexturePrepareRuntimeTask(task);
-			}
-			catch (...)
-			{
-				runtimeTask = nullptr;
-			}
-		}
-
-		if (runtimeTask != nullptr && task->Begin_Async_Prepare())
-		{
-			_ForegroundQueue.Set_Prepare_Job(task, runtimeTask);
-			rts::JobSystem &system = rts::JobSystem::instance();
-			if (!system.isRunning())
-			{
-				system.ensureStarted();
-			}
-			if (!_TexturePrepareGroup.isValid() && system.isRunning())
-			{
-				_TexturePrepareGroup = system.createGroup();
-			}
-			const rts::JobPriority priority =
-				task->Get_Priority() == TextureLoadTaskClass::PRIORITY_HIGH ?
-					rts::JOB_PRIORITY_FRAME_CRITICAL :
-					rts::JOB_PRIORITY_STREAMING;
-			if (_TexturePrepareGroup.isValid() &&
-				system.trySubmit(runtimeTask, priority,
-					_TexturePrepareGroup).isValid())
-			{
-				return;
-			}
-			_ForegroundQueue.Set_Prepare_Job(task, nullptr);
-			system.recordSerialFallback();
-		}
-
-		delete runtimeTask;
-		Try_Load_For_Owner(task);
-		task->Complete_Async_Prepare();
-		task->End_Load();
-		task->Destroy();
-	} else {
-		// unable to load.
-		task->Apply_Missing_Texture();
-		task->Destroy();
-	}
+	if (task->Begin_Resource_Read()) return;
+	// Unsupported factories, source-budget pressure, and the reference lane
+	// stay entirely on owner. Never send pooled tasks or file objects to jobs.
+	Record_Texture_Reference_Fallback();
+	task->Finish_Load();
+	task->Destroy();
 }
-
 
 void TextureLoader::Load_Thumbnail(TextureBaseClass *tc)
 {
@@ -1278,6 +1260,9 @@ TextureLoadTaskClass::TextureLoadTaskClass()
 	TargaFile		(nullptr),
 	PrepareCompleteEvent(nullptr),
 	PrepareRuntimeTask(nullptr),
+	ResourceRequest(nullptr),
+	ResourceResult(nullptr),
+	ResourceTriedDDS(false),
 	PrepareMemoryReservation(0),
 	Type				(TASK_NONE),
 	Priority			(PRIORITY_LOW),
@@ -1338,6 +1323,10 @@ void TextureLoadTaskClass::Fail_Async_Prepare()
 
 bool TextureLoadTaskClass::Is_Async_Prepare_Complete()
 {
+#if RTS_ASYNC_RESOURCE_IO
+	if (ResourceRequest != nullptr)
+		return _TextureResourcePipeline.isComplete(*static_cast<rts::ResourceIoTicket*>(ResourceRequest));
+#endif
 	return PrepareCompleteEvent != nullptr &&
 		WaitForSingleObject((HANDLE)PrepareCompleteEvent, 0) == WAIT_OBJECT_0;
 }
@@ -1345,6 +1334,23 @@ bool TextureLoadTaskClass::Is_Async_Prepare_Complete()
 
 void TextureLoadTaskClass::Wait_For_Async_Prepare()
 {
+#if RTS_ASYNC_RESOURCE_IO
+	if (ResourceRequest != nullptr)
+	{
+		WWASSERT(TextureLoader::Is_DX8_Thread());
+		_ResourceQueue.Remove(this);
+		while (ResourceRequest != nullptr)
+		{
+			const rts::ResourceIoTicket ticket = *static_cast<rts::ResourceIoTicket*>(ResourceRequest);
+			_TextureResourcePipeline.promote(ticket);
+			if (!_TextureResourcePipeline.wait(ticket)) TextureLoader::Pump_Resource_Loads();
+			if (_TextureResourcePipeline.isComplete(ticket)) Complete_Resource_Read();
+			// DDS-to-TGA retry re-enqueues; foreground owns this task until return.
+			_ResourceQueue.Remove(this);
+		}
+		return;
+	}
+#endif
 	if (PrepareCompleteEvent != nullptr)
 	{
 		WaitForSingleObject((HANDLE)PrepareCompleteEvent, INFINITE);
@@ -1447,6 +1453,8 @@ void TextureLoadTaskClass::Init(TextureBaseClass* tc, TaskType type, PriorityTyp
 	TargaFile		= nullptr;
 	PrepareRuntimeTask = nullptr;
 	WWASSERT(PrepareMemoryReservation == 0);
+	WWASSERT(ResourceRequest == nullptr && ResourceResult == nullptr);
+	ResourceTriedDDS = false;
 	if (PrepareCompleteEvent != nullptr)
 	{
 		ResetEvent((HANDLE)PrepareCompleteEvent);
@@ -1934,6 +1942,424 @@ static void Apply_Mip_Reduction(unsigned& mip_level_count, unsigned reduction, u
 }
 
 
+#if RTS_ASYNC_RESOURCE_IO
+// No texture, COM interface, FileClass, global factory, or pooled task is
+// reachable from this operation. prepare is owner-only; decode sees only this
+// captured descriptor, bounded encoded bytes, and its private output buffers.
+class TextureResourceDecode : public rts::ResourceDecodeOperation
+{
+public:
+	TextureResourceDecode(TextureBaseClass *texture, WW3DFormat requestedFormat, bool compressed)
+		: Format(requestedFormat), Width(0), Height(0), Mips(texture->MipLevelCount),
+		Reduction(0), HSV(texture->Get_HSV_Shift()), ReferenceRequired(false), Compressed(compressed),
+		Cube(texture->Get_Asset_Type() == TextureBaseClass::TEX_CUBEMAP),
+		Reducible(texture->Is_Reducible()), RequestedMips(texture->MipLevelCount),
+		HasThumbnail(false), ThumbnailWidth(0), ThumbnailHeight(0), ThumbnailMips(0),
+		ThumbnailFormat(WW3D_FORMAT_UNKNOWN), SourceFormat(WW3D_FORMAT_UNKNOWN),
+		SourceBpp(0), DDS(nullptr), Prepared(false), Workspace(0)
+	{
+		ThumbnailClass *thumbnail = ThumbnailManagerClass::Peek_Thumbnail_Instance_From_Any_Manager(texture->Get_Full_Path());
+		if (thumbnail != nullptr)
+		{
+			HasThumbnail = true;
+			ThumbnailWidth = thumbnail->Get_Original_Texture_Width();
+			ThumbnailHeight = thumbnail->Get_Original_Texture_Height();
+			ThumbnailMips = thumbnail->Get_Original_Texture_Mip_Level_Count();
+			ThumbnailFormat = thumbnail->Get_Original_Texture_Format();
+		}
+	}
+	~TextureResourceDecode() { delete DDS; }
+
+	bool prepare(const unsigned char *bytes, size_t size, size_t &workspace)
+	{
+		WWASSERT(TextureLoader::Is_DX8_Thread());
+		if (Prepared) { workspace = Workspace; return true; }
+		unsigned originalMips = 0;
+		if (Compressed)
+		{
+			DDS = new DDSFileClass(nullptr, 0);
+			if (!DDS->Set_Memory_Header(bytes, size) ||
+				DDS->Get_Type() != (Cube ? DDS_CUBEMAP : DDS_TEXTURE) ||
+				DDS->Get_Full_Width() > 65536 || DDS->Get_Full_Height() > 65536) return false;
+			WW3DFormat sourceFormat = HasThumbnail ? ThumbnailFormat : DDS->Get_Format();
+			if (sourceFormat != WW3D_FORMAT_DXT1 && sourceFormat != WW3D_FORMAT_DXT2 &&
+				sourceFormat != WW3D_FORMAT_DXT3 && sourceFormat != WW3D_FORMAT_DXT4 &&
+				sourceFormat != WW3D_FORMAT_DXT5) return false;
+			Format = Get_Valid_Texture_Format(sourceFormat, true);
+			Width = HasThumbnail ? ThumbnailWidth : DDS->Get_Width(0);
+			Height = HasThumbnail ? ThumbnailHeight : DDS->Get_Height(0);
+			originalMips = HasThumbnail ? ThumbnailMips : DDS->Get_Mip_Level_Count();
+			if (!originalMips || !Width || !Height) return false;
+			Reduction = HasThumbnail ? 0 : Get_Requested_Reduction(Width, Height, originalMips);
+			if (!Reducible || RequestedMips == MIP_LEVELS_1) Reduction = 0;
+			else if (RequestedMips != MIP_LEVELS_ALL && Reduction >= RequestedMips) Reduction = RequestedMips - 1;
+			if (Reduction >= originalMips) Reduction = 0;
+			Apply_Dim_Reduction(Width, Height, Reduction, originalMips);
+			if (Reduction >= (Mips == MIP_LEVELS_ALL ? originalMips : min(Mips, originalMips))) return false;
+			Apply_Mip_Reduction(Mips, Reduction, Width, Height, originalMips);
+			// Keep the parsed header alive until its replacement is allocated. If
+			// allocation throws, the pipeline will destroy this operation after
+			// prepare returns false; leaving DDS valid keeps that destruction safe.
+			DDSFileClass *replacement = nullptr;
+			try { replacement = new DDSFileClass(nullptr, Reduction); }
+			catch (...) { return false; }
+			delete DDS;
+			DDS = replacement;
+			if (!DDS->Set_Memory_Header(bytes, size) || Mips > DDS->Get_Mip_Level_Count()) return false;
+			const WW3DFormat ddsFormat = DDS->Get_Format();
+			if (ddsFormat != WW3D_FORMAT_DXT1 && ddsFormat != WW3D_FORMAT_DXT5 &&
+				(Format != ddsFormat || HSV.X != 0 || HSV.Y != 0 || HSV.Z != 0))
+			{
+				// Legacy DDS conversion has no implementation for DXT2/3/4
+				// format conversion or HSV shifts. Leave ReferenceRequired false so
+				// completion follows the existing TGA/missing-texture failure path,
+				// rather than publishing unwritten owner surfaces as a success.
+				return false;
+			}
+			if (Width != DDS->Get_Width(0) || Height != DDS->Get_Height(0))
+			{
+				ReferenceRequired = true;
+				return false;
+			}
+			// Includes the owned DDS payload; the pipeline separately accounts for
+			// the encoded input range. Conversion routines allocate no scratch.
+			Workspace = size;
+		}
+		else
+		{
+			if (Cube || size < sizeof(TGAHeader)) return false;
+			memcpy(&TGA.Header, bytes, sizeof(TGAHeader));
+			if (TGA.Header.Width <= 0 || TGA.Header.Height <= 0) return false;
+			Get_WW3D_Format(SourceFormat, SourceBpp, TGA);
+			if (SourceFormat == WW3D_FORMAT_UNKNOWN || !SourceBpp) return false;
+			Width = HasThumbnail ? ThumbnailWidth : TGA.Header.Width;
+			Height = HasThumbnail ? ThumbnailHeight : TGA.Header.Height;
+			if (!Width || !Height) return false;
+			unsigned depth = 1;
+			TextureLoader::Validate_Texture_Size(Width, Height, depth);
+			const WW3DFormat originalFormat = HasThumbnail ? ThumbnailFormat : SourceFormat;
+			Format = Get_Valid_Texture_Format(Format == WW3D_FORMAT_UNKNOWN ? originalFormat : Format, false);
+			const unsigned available = CalculateTextureMipLevelCount(Width, Height);
+			if (Mips == MIP_LEVELS_ALL || Mips > available) Mips = available;
+			TextureMipLayout sourceLayout, conversionLayout;
+			if (!CalculateTextureMipLayout(SourceFormat, TGA.Header.Width, TGA.Header.Height, 1, sourceLayout) ||
+				!CalculateTextureMipLayout(WW3D_FORMAT_A8R8G8B8, Width, Height, 1, conversionLayout)) return false;
+			Workspace = sourceLayout.dataSize;
+			if (!Add_Prepare_Memory_Bytes(Workspace, conversionLayout.dataSize) ||
+				!Add_Prepare_Memory_Bytes(Workspace, 1024)) return false;
+		}
+		if (!Mips || Mips > MIP_LEVELS_MAX) return false;
+		unsigned w = Width, h = Height;
+		for (unsigned level = 0; level < Mips; ++level)
+		{
+			TextureMipLayout layout;
+			if (!CalculateTextureMipLayout(Format, w, h, 1, layout) ||
+				layout.dataSize > (size_t)-1 / (Cube ? 6U : 1U) ||
+				!Add_Prepare_Memory_Bytes(Workspace, layout.dataSize * (Cube ? 6U : 1U))) return false;
+			ReduceTextureMipDimensions(w, h);
+		}
+		Prepared = true;
+		workspace = Workspace;
+		return true;
+	}
+
+	bool decode(const unsigned char *bytes, size_t size, const rts::ResourceCancellation &cancel)
+	{
+		const unsigned faces = Cube ? 6 : 1;
+		for (unsigned face = 0; face < faces; ++face)
+		{
+			unsigned w = Width, h = Height;
+			for (unsigned level = 0; level < Mips; ++level)
+			{
+				if (cancel.isCancelled() || !Surface[face][level].allocate(Format, w, h, 1)) return false;
+				ReduceTextureMipDimensions(w, h);
+			}
+		}
+		if (Compressed)
+		{
+			if (!DDS->Load_From_Memory(bytes, size)) return false;
+			for (unsigned face = 0; face < faces; ++face)
+			{
+				unsigned w = Width, h = Height;
+				for (unsigned level = 0; level < Mips; ++level)
+				{
+					if (cancel.isCancelled()) return false;
+					if (Cube) DDS->Copy_CubeMap_Level_To_Surface(face, level, Format, w, h,
+						Surface[face][level].data(), (unsigned)Surface[face][level].layout().rowPitch, HSV);
+					else DDS->Copy_Level_To_Surface(level, Format, w, h,
+						Surface[face][level].data(), (unsigned)Surface[face][level].layout().rowPitch, HSV);
+					w >>= 1; h >>= 1;
+				}
+			}
+			return !cancel.isCancelled();
+		}
+		if (TGA.Load_From_Memory(bytes, size, true) != 0 || cancel.isCancelled()) return false;
+		unsigned srcWidth = TGA.Header.Width, srcHeight = TGA.Header.Height;
+		unsigned srcBpp = SourceBpp;
+		WW3DFormat srcFormat = SourceFormat;
+		unsigned char *source = (unsigned char*)TGA.GetImage();
+		Vector3 hsv = HSV;
+		if (srcFormat == WW3D_FORMAT_A1R5G5B5 || srcFormat == WW3D_FORMAT_R5G6B5 ||
+			srcFormat == WW3D_FORMAT_A4R4G4B4 || srcFormat == WW3D_FORMAT_P8 ||
+			srcFormat == WW3D_FORMAT_L8 || srcWidth != Width || srcHeight != Height)
+		{
+			if (!Conversion.allocate(WW3D_FORMAT_A8R8G8B8, Width, Height, 1)) return false;
+			BitmapHandlerClass::Copy_Image(Conversion.data(), Width, Height, Width * 4,
+				WW3D_FORMAT_A8R8G8B8, source, srcWidth, srcHeight, srcWidth * srcBpp,
+				srcFormat, (unsigned char*)TGA.GetPalette(), TGA.Header.CMapDepth >> 3, false, hsv);
+			hsv = Vector3(0, 0, 0);
+			source = Conversion.data(); srcFormat = WW3D_FORMAT_A8R8G8B8;
+			srcWidth = Width; srcHeight = Height; srcBpp = 4;
+		}
+		const unsigned sourcePitch = srcWidth * srcBpp;
+		unsigned width = Width, height = Height;
+		for (unsigned level = 0; level < Mips; ++level)
+		{
+			if (cancel.isCancelled()) return false;
+			BitmapHandlerClass::Copy_Image(Surface[0][level].data(), width, height,
+				(unsigned)Surface[0][level].layout().rowPitch, Format, source, srcWidth,
+				srcHeight, sourcePitch, srcFormat, nullptr, 0, true, hsv);
+			hsv = Vector3(0, 0, 0);
+			ReduceTextureMipDimensions(width, height);
+			ReduceTextureMipDimensions(srcWidth, srcHeight);
+		}
+		return !cancel.isCancelled();
+	}
+
+	WW3DFormat Format;
+	unsigned Width, Height, Mips, Reduction;
+	Vector3 HSV;
+	bool ReferenceRequired;
+	TextureMipBuffer Surface[6][MIP_LEVELS_MAX];
+private:
+	bool Compressed, Cube, Reducible;
+	unsigned RequestedMips;
+	bool HasThumbnail;
+	unsigned ThumbnailWidth, ThumbnailHeight, ThumbnailMips;
+	WW3DFormat ThumbnailFormat, SourceFormat;
+	unsigned SourceBpp;
+	DDSFileClass *DDS;
+	Targa TGA;
+	TextureMipBuffer Conversion;
+	bool Prepared;
+	size_t Workspace;
+};
+#endif
+
+bool TextureLoadTaskClass::Begin_Resource_Read(bool tryCompressed)
+{
+#if RTS_ASYNC_RESOURCE_IO
+	if (!_ResourcePipelineStarted || !_AcceptingTextureRequests ||
+		Texture->Get_Asset_Type() == TextureBaseClass::TEX_VOLUME || ResourceRequest != nullptr) return false;
+	WWASSERT(TextureLoader::Is_DX8_Thread());
+	ResourceTriedDDS = tryCompressed && CompressionAllowed;
+	char name[_MAX_PATH];
+	strlcpy(name, Filename, ARRAY_SIZE(name));
+	if (ResourceTriedDDS)
+	{
+		const size_t length = strlen(name);
+		if (length < 4 || name[length - 4] != '.') ResourceTriedDDS = false;
+		else memcpy(name + length - 3, "dds", 3);
+	}
+	rts::ResourceIoSource *source = nullptr;
+	{
+		file_auto_ptr file(_TheFileFactory, name);
+		if (file->Is_Available()) source = file->Capture_Resource_Read_Source();
+	}
+	if (source == nullptr)
+	{
+		if (ResourceTriedDDS) return Begin_Resource_Read(false);
+		return false;
+	}
+	TextureResourceDecode *operation = nullptr;
+	rts::ResourceIoTicket *ticket = nullptr;
+	try
+	{
+		operation = new TextureResourceDecode(Texture, Format, ResourceTriedDDS);
+		ticket = new rts::ResourceIoTicket;
+	}
+	catch (...) { delete operation; delete source; return false; }
+	if (!_TextureResourcePipeline.submit(source, operation, Priority == PRIORITY_HIGH ?
+		rts::JOB_PRIORITY_FRAME_CRITICAL : rts::JOB_PRIORITY_STREAMING, *ticket))
+	{
+		delete operation; delete source; delete ticket;
+		return false;
+	}
+	ResourceRequest = ticket;
+	State = STATE_LOAD_BEGUN;
+	_ResourceQueue.Push_Back(this);
+	return true;
+#else
+	(void)tryCompressed;
+	return false;
+#endif
+}
+
+bool TextureLoadTaskClass::Complete_Resource_Read()
+{
+#if RTS_ASYNC_RESOURCE_IO
+	if (ResourceRequest == nullptr) return true;
+	rts::ResourceIoStatus status;
+	rts::ResourceDecodeOperation *operation = nullptr;
+	const rts::ResourceIoTicket ticket = *static_cast<rts::ResourceIoTicket*>(ResourceRequest);
+	if (!_TextureResourcePipeline.take(ticket, status, operation)) return false;
+	delete static_cast<rts::ResourceIoTicket*>(ResourceRequest);
+	ResourceRequest = nullptr;
+	if (status == rts::RESOURCE_IO_SUCCEEDED)
+	{
+		TextureResourceDecode *result = static_cast<TextureResourceDecode*>(operation);
+		ResourceResult = result;
+		Format = result->Format; Width = result->Width; Height = result->Height;
+		MipLevelCount = result->Mips; Reduction = result->Reduction;
+		LoadSucceeded = true;
+		State = STATE_LOAD_MIPMAP;
+		Complete_Async_Prepare();
+		return true;
+	}
+	const bool referenceRequired = operation != nullptr && static_cast<TextureResourceDecode*>(operation)->ReferenceRequired;
+	delete operation;
+	if (referenceRequired && status == rts::RESOURCE_IO_DECODE_FAILED)
+	{
+		State = STATE_NONE;
+		Record_Texture_Reference_Fallback();
+		if (Begin_Load()) Try_Load_For_Owner(this);
+		else Fail_Async_Prepare();
+		return true;
+	}
+	if (status != rts::RESOURCE_IO_CANCELLED && status != rts::RESOURCE_IO_STALE && ResourceTriedDDS)
+	{
+		if (Begin_Resource_Read(false)) return false;
+		// A non-snapshot-capable TGA factory still receives its owner fallback.
+		State = STATE_NONE;
+		Record_Texture_Reference_Fallback();
+		if (Begin_Uncompressed_Load()) { State = STATE_LOAD_BEGUN; Try_Load_For_Owner(this); }
+		else Fail_Async_Prepare();
+		return true;
+	}
+	Fail_Async_Prepare();
+#endif
+	return true;
+}
+
+void TextureLoadTaskClass::Cancel_Resource_Read()
+{
+#if RTS_ASYNC_RESOURCE_IO
+	if (ResourceRequest == nullptr) return;
+	const rts::ResourceIoTicket ticket = *static_cast<rts::ResourceIoTicket*>(ResourceRequest);
+	_TextureResourcePipeline.cancel(ticket);
+	_TextureResourcePipeline.wait(ticket);
+	rts::ResourceIoStatus status;
+	rts::ResourceDecodeOperation *operation = nullptr;
+	_TextureResourcePipeline.take(ticket, status, operation);
+	delete operation;
+	delete static_cast<rts::ResourceIoTicket*>(ResourceRequest);
+	ResourceRequest = nullptr;
+	State = STATE_NONE;
+	LoadSucceeded = false;
+#endif
+}
+
+void TextureLoader::Pump_Resource_Loads()
+{
+#if RTS_ASYNC_RESOURCE_IO
+	_TextureResourcePipeline.pump();
+	_ModelResourceQueue.pump(_TextureResourcePipeline);
+	unsigned count = 0;
+	while (TextureLoadTaskClass *task = _ResourceQueue.Peek_Front())
+	{
+		const rts::ResourceIoTicket ticket = *static_cast<rts::ResourceIoTicket*>(task->ResourceRequest);
+		if (!_TextureResourcePipeline.isComplete(ticket)) break;
+		_ResourceQueue.Remove(task);
+		if (task->Complete_Resource_Read())
+		{
+			// Immediate owner publication consumes the result before admitting
+			// more decoded output, keeping the retained-byte bound meaningful.
+			task->End_Load();
+			task->Destroy();
+		}
+		if (++count >= _TextureForegroundMaximumTasksPerUpdate) break;
+	}
+#endif
+}
+
+void TextureLoader::Stop_Async_Resource_Loading()
+{
+#if RTS_ASYNC_RESOURCE_IO
+	WWASSERT(Is_DX8_Thread());
+	FastCriticalSectionClass::LockClass lock(_ForegroundCriticalSection);
+	if (!_ResourcePipelineStarted) return;
+	_TextureResourcePipeline.advanceGeneration();
+	_ModelResourceQueue.discard(_TextureResourcePipeline);
+	while (TextureLoadTaskClass *task = _ResourceQueue.Pop_Front())
+	{
+		task->Cancel_Resource_Read();
+		task->Destroy();
+	}
+	_TextureResourcePipeline.shutdown();
+	_ResourcePipelineStarted = false;
+#endif
+}
+
+#if RTS_ASYNC_RESOURCE_IO
+bool TextureLoader::Request_Model_Read(const char *filename, rts::ResourceIoTicket &ticket)
+{
+	WWASSERT(Is_DX8_Thread());
+	ticket = rts::ResourceIoTicket();
+	if (!_ResourcePipelineStarted || !_AcceptingTextureRequests || !filename || !_TheFileFactory)
+		return false;
+	Pump_Resource_Loads();
+	rts::ResourceIoSource *source = nullptr;
+	{
+		file_auto_ptr file(_TheFileFactory, filename);
+		if (file.get() && file->Is_Available()) source = file->Capture_Resource_Read_Source();
+	}
+	if (!source) return false;
+	if (_ModelResourceQueue.submit(_TextureResourcePipeline, source, ticket)) return true;
+	delete source;
+	return false;
+}
+
+rts::ModelAssetBytes *TextureLoader::Complete_Model_Read(const rts::ResourceIoTicket &ticket,
+	bool &succeeded, bool &cancelled)
+{
+	WWASSERT(Is_DX8_Thread());
+	succeeded = false;
+	cancelled = true;
+	while (_ModelResourceQueue.contains(ticket))
+	{
+		Pump_Resource_Loads();
+		rts::ResourceIoStatus status;
+		rts::ModelAssetBytes *bytes = nullptr;
+		if (_ModelResourceQueue.take(ticket, status, bytes))
+		{
+			succeeded = status == rts::RESOURCE_IO_SUCCEEDED;
+			cancelled = status == rts::RESOURCE_IO_CANCELLED || status == rts::RESOURCE_IO_STALE;
+			return bytes;
+		}
+		// wait may yield under retained-output pressure. Pump both result
+		// owners before retrying; a model must not strand a foreground texture.
+		_TextureResourcePipeline.wait(ticket);
+	}
+	return nullptr;
+}
+
+void TextureLoader::Cancel_Model_Read(const rts::ResourceIoTicket &ticket)
+{
+	WWASSERT(Is_DX8_Thread());
+	_TextureResourcePipeline.cancel(ticket);
+	bool succeeded, cancelled;
+	delete Complete_Model_Read(ticket, succeeded, cancelled);
+}
+
+rts::ResourceIoMetrics TextureLoader::Get_Resource_Load_Metrics()
+{
+	FastCriticalSectionClass::LockClass lock(_ForegroundCriticalSection);
+	rts::ResourceIoMetrics metrics = _TextureResourcePipeline.metrics();
+	metrics.serialFallbacks += _ResourceOwnerFallbacks;
+	return metrics;
+}
+#endif
+
 bool TextureLoadTaskClass::Begin_Compressed_Load()
 {
 	unsigned orig_width,orig_height,orig_depth,orig_mip_count,orig_reduction;
@@ -2156,11 +2582,16 @@ bool TextureLoadTaskClass::Upload_Prepared_Surfaces()
 {
 	for (unsigned int level = 0; level < MipLevelCount; ++level)
 	{
-		const TextureMipLayout& sourceLayout = PreparedSurface[level].layout();
+		const TextureMipBuffer& source =
+#if RTS_ASYNC_RESOURCE_IO
+			ResourceResult != nullptr ? static_cast<TextureResourceDecode*>(ResourceResult)->Surface[0][level] :
+#endif
+			PreparedSurface[level];
+		const TextureMipLayout& sourceLayout = source.layout();
 		TextureMipLayout destinationLayout;
 		if (!Build_Upload_Layout(sourceLayout, LockedSurfacePitch[level],
 			0, 1, destinationLayout) ||
-			!CopyTextureMipData(PreparedSurface[level].data(), sourceLayout,
+			!CopyTextureMipData(source.data(), sourceLayout,
 				LockedSurfacePtr[level], destinationLayout, 1))
 		{
 			return false;
@@ -2172,6 +2603,10 @@ bool TextureLoadTaskClass::Upload_Prepared_Surfaces()
 
 void TextureLoadTaskClass::Release_Prepared_Surfaces()
 {
+#if RTS_ASYNC_RESOURCE_IO
+	delete static_cast<TextureResourceDecode*>(ResourceResult);
+	ResourceResult = nullptr;
+#endif
 	for (unsigned int level = 0; level < MIP_LEVELS_MAX; ++level)
 	{
 		PreparedSurface[level].reset();
@@ -2513,6 +2948,8 @@ void CubeTextureLoadTaskClass::Init(TextureBaseClass* tc, TaskType type, Priorit
 	TargaFile		= nullptr;
 	PrepareRuntimeTask = nullptr;
 	WWASSERT(PrepareMemoryReservation == 0);
+	WWASSERT(ResourceRequest == nullptr && ResourceResult == nullptr);
+	ResourceTriedDDS = false;
 	strlcpy(Filename, Texture->Get_Full_Path().str(), ARRAY_SIZE(Filename));
 
 
@@ -2844,11 +3281,16 @@ bool CubeTextureLoadTaskClass::Upload_Prepared_Surfaces()
 	{
 		for (unsigned int level = 0; level < MipLevelCount; ++level)
 		{
-			const TextureMipLayout& sourceLayout = PreparedCubeSurface[face][level].layout();
+			const TextureMipBuffer& source =
+#if RTS_ASYNC_RESOURCE_IO
+				ResourceResult != nullptr ? static_cast<TextureResourceDecode*>(ResourceResult)->Surface[face][level] :
+#endif
+				PreparedCubeSurface[face][level];
+			const TextureMipLayout& sourceLayout = source.layout();
 			TextureMipLayout destinationLayout;
 			if (!Build_Upload_Layout(sourceLayout, LockedCubeSurfacePitch[face][level],
 				0, 1, destinationLayout) ||
-				!CopyTextureMipData(PreparedCubeSurface[face][level].data(), sourceLayout,
+				!CopyTextureMipData(source.data(), sourceLayout,
 					LockedCubeSurfacePtr[face][level], destinationLayout, 1))
 			{
 				return false;
@@ -2861,6 +3303,10 @@ bool CubeTextureLoadTaskClass::Upload_Prepared_Surfaces()
 
 void CubeTextureLoadTaskClass::Release_Prepared_Surfaces()
 {
+#if RTS_ASYNC_RESOURCE_IO
+	delete static_cast<TextureResourceDecode*>(ResourceResult);
+	ResourceResult = nullptr;
+#endif
 	for (unsigned int face = 0; face < 6; ++face)
 	{
 		for (unsigned int level = 0; level < MIP_LEVELS_MAX; ++level)

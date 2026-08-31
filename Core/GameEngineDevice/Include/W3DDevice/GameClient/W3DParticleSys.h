@@ -32,6 +32,7 @@
 #include "WW3D2/streak.h"
 #include "WW3D2/rinfo.h"
 #include "WWLib/bittype.h"
+#include "W3DDevice/Common/EffectPrepare.h"
 
 //=============================================================================
 /** W3D implementation of the game display which is responsible for creating
@@ -59,4 +60,5 @@ private:
 	ShareBufferClass<float> *m_sizeBuffer;			///< array of particle sizes
 	ShareBufferClass<uint8> *m_angleBuffer;			///< array of particle orientations
 	Bool m_readyToRender;											///< if true, it is OK to render
+	ParticleRenderBatch m_preparedParticles;
 };

@@ -217,6 +217,7 @@ if(WIN32 AND NOT IS_VS6_BUILD)
 
     target_sources(core_renderer PRIVATE
         D3D11RenderDevice.cpp
+        ThreadedRenderDevice.cpp
         "${renderer_vertex_shader_header}"
         "${renderer_pixel_shader_header}"
         "${renderer_water_flat_pixel_shader_header}"
@@ -243,8 +244,10 @@ if(WIN32 AND NOT IS_VS6_BUILD)
         RTS_RENDERER_HAS_D3D11=1
     )
     target_link_libraries(core_renderer PRIVATE
+        core_task_runtime
         d3d11
         dxgi
+        user32
     )
 endif()
 

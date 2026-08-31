@@ -44,6 +44,10 @@
 #include "Common/Debug.h"
 #include "Common/file.h"
 #include "Common/FileSystem.h"
+#include "Common/LocalFileSystem.h"
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
+#include "Lib/ResourceIoPipeline.h"
+#endif
 #include "Common/GlobalData.h"
 #include "Common/MapObject.h"
 #include "Common/Registry.h"
@@ -352,6 +356,31 @@ int  GameFileClass::Open(char const *filename, int rights)
 //-------------------------------------------------------------------------------------------------
 /** Open the file using the current file name. */
 //-------------------------------------------------------------------------------------------------
+rts::ResourceIoSource *GameFileClass::Capture_Resource_Read_Source()
+{
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
+	if (!m_fileExists) return nullptr;
+	// Set_Name already selected localization/test/user overrides. Match
+	// FileSystem::openFile's local-first and current BIG directory priority.
+	FileInfo info;
+	if (TheLocalFileSystem != nullptr && TheLocalFileSystem->getFileInfo(m_filePath, &info))
+	{
+		if (info.size() <= 0) return nullptr;
+		return rts::ResourceIoSource::openFileRange(m_filePath, 0,
+			static_cast<rts::JobMetricCounter>(info.size()));
+	}
+	if (TheArchiveFileSystem != nullptr)
+	{
+		ArchiveFile *archive = TheArchiveFileSystem->getArchiveFile(m_filePath);
+		AsciiString path;
+		UnsignedInt offset = 0, size = 0;
+		if (archive != nullptr && archive->getReadLocation(m_filePath, path, offset, size))
+			return rts::ResourceIoSource::openFileRange(path.str(), offset, size);
+	}
+#endif
+	return nullptr;
+}
+
 int  GameFileClass::Open(int rights)
 {
 	if( rights != READ )

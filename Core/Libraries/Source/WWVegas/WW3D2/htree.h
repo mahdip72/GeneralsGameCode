@@ -163,6 +163,10 @@ private:
 
 	void					Free();
 	bool					read_pivots(ChunkLoadClass & cload,bool pre30);
+#if defined(_WIN64)
+	bool Try_Parallel_Update(const Matrix3D &root, HAnimClass *motion0,
+		float frame0, HAnimClass *motion1, float frame1, float blend, int mode);
+#endif
 
 	friend class MeshClass;
 

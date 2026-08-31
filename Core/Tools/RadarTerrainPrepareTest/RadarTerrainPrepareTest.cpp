@@ -1027,10 +1027,17 @@ static int testPrepareServiceGenericRowWorkFailureJoinsTasks()
 	unsigned char rows[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
 	RadarPrepareRowWorkProbe work(8, rows, true);
 	RadarTerrainPrepareService service;
+	rts::JobSystem &system = rts::JobSystem::instance();
+	rts::JobSystemConfig config = rts::JobSystem::startupConfig();
+	config.workerCount = 4;
+	config.pinWorkers = false;
+	system.shutdown();
+	CHECK(testName, system.start(config));
 
 	CHECK(testName, service.initialize(2, 2));
 	CHECK(testName, service.tryAcquire(11));
 	CHECK(testName, !service.runRows(&work, 0, 8));
+	CHECK(testName, system.metrics().failedJobCount > 0);
 #if defined(RTS_BUILD_CORE_EXTRAS)
 	CHECK(testName, service.pendingTaskCount() == 0);
 #endif
@@ -1041,9 +1048,9 @@ static int testPrepareServiceGenericRowWorkFailureJoinsTasks()
 	return 0;
 }
 
-static int testPrepareServiceStartFailureRetriesOneWorker()
+static int testPrepareServiceFailedStartupUsesSerialOracle()
 {
-	const char *testName = "testPrepareServiceStartFailureRetriesOneWorker";
+	const char *testName = "testPrepareServiceFailedStartupUsesSerialOracle";
 	RadarTerrainCellInput cells[12];
 	RadarTerrainSnapshot snapshot;
 	unsigned char serialOutput[36];
@@ -1057,6 +1064,10 @@ static int testPrepareServiceStartFailureRetriesOneWorker()
 #if defined(RTS_BUILD_CORE_EXTRAS)
 	rts::JobSystem::instance().shutdown();
 	rts_job_system_set_test_fault(RADAR_JOB_SYSTEM_TEST_FAIL_START, 1);
+	// Explicit startup consumes the fault. A shutdown scheduler must not be
+	// lazily restarted by a late render consumer during engine teardown.
+	CHECK(testName, !rts::JobSystem::instance().start(
+		rts::JobSystem::startupConfig()));
 #endif
 	CHECK(testName, !service.runRows(&snapshot, output, 0, snapshot.height));
 #if defined(RTS_BUILD_CORE_EXTRAS)
@@ -1078,6 +1089,12 @@ static int testPrepareServiceTaskAllocationRetriesOneWorker()
 	unsigned char serialOutput[36];
 	unsigned char output[36];
 	RadarTerrainPrepareService service;
+	rts::JobSystem &system = rts::JobSystem::instance();
+	rts::JobSystemConfig config = rts::JobSystem::startupConfig();
+	config.workerCount = 4;
+	config.pinWorkers = false;
+	system.shutdown();
+	CHECK(testName, system.start(config));
 
 	makeServiceFixture(cells, &snapshot, serialOutput);
 	memset(output, 0xA5, sizeof(output));
@@ -1088,6 +1105,7 @@ static int testPrepareServiceTaskAllocationRetriesOneWorker()
 		RADAR_TERRAIN_PREPARE_TEST_FAIL_TASK_ALLOCATION, 1);
 #endif
 	CHECK(testName, service.runRows(&snapshot, output, 0, snapshot.height));
+	CHECK(testName, system.metrics().serialFallbackCount > 0);
 	CHECK(testName, compareServiceOutput(output, serialOutput,
 		snapshot.rowBytes * snapshot.height, testName) == 0);
 	service.release(1);
@@ -1206,9 +1224,13 @@ static int testPrepareServiceShutdownAfterRunRestartsCleanly()
 	unsigned char serialOutput[36];
 	unsigned char output[36];
 	RadarTerrainPrepareService service;
+	rts::JobSystem &system = rts::JobSystem::instance();
+	rts::JobSystemConfig config = rts::JobSystem::startupConfig();
 
 	makeServiceFixture(cells, &snapshot, serialOutput);
 	memset(output, 0xA5, sizeof(output));
+	system.shutdown();
+	CHECK(testName, system.start(config));
 	CHECK(testName, service.initialize(2, 2));
 	CHECK(testName, service.tryAcquire(1));
 	CHECK(testName, service.runRows(&snapshot, output, 0, snapshot.height));
@@ -1515,7 +1537,7 @@ int main()
 	result |= testPrepareServiceGenericRowWork();
 	result |= testOneWorkerUsesSingleReferenceRange();
 	result |= testPrepareServiceGenericRowWorkFailureJoinsTasks();
-	result |= testPrepareServiceStartFailureRetriesOneWorker();
+	result |= testPrepareServiceFailedStartupUsesSerialOracle();
 #if !defined(_MSC_VER) || _MSC_VER >= 1300
 	result |= testPrepareServiceTaskAllocationRetriesOneWorker();
 	result |= testPrepareServiceQueueBackpressureFallsBackToSerial();

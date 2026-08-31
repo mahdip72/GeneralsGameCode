@@ -53,6 +53,9 @@ struct SkirmishAITestRunnerState
 	UnsignedInt loadedMapCRC;
 	UnsignedInt loadedMapSize;
 	Int loadedSeed;
+	SkirmishAITestScenario scenario;
+	Int actualAiCount;
+	Int actualTeamCounts[2];
 };
 
 SkirmishAITestRunnerState s_runner = {
@@ -88,6 +91,21 @@ void RequestSkirmishAITestStop()
 		TheGameEngine->setQuitting(TRUE);
 	}
 }
+
+Bool IsSkirmishAITest4v2(SkirmishAITestScenario scenario)
+{
+	return scenario == SKIRMISH_AI_TEST_SCENARIO_4V2;
+}
+
+Int ExpectedSkirmishAITestAiCount(SkirmishAITestScenario scenario)
+{
+	return IsSkirmishAITest4v2(scenario) ? 6 : 7;
+}
+
+const char *SkirmishAITestScenarioName(SkirmishAITestScenario scenario)
+{
+	return IsSkirmishAITest4v2(scenario) ? "4v2" : "4v3";
+}
 }
 
 Bool TryParseSkirmishAITestSeed(const char *text, Int *seed)
@@ -112,8 +130,16 @@ Bool ShouldBypassFramePacingForSkirmishAITest(Bool runnerArmed)
 
 void BuildSkirmishAITestPlan(Int seed, SkirmishAITestPlan *plan)
 {
+	BuildSkirmishAITestPlan(seed, SKIRMISH_AI_TEST_SCENARIO_4V3, plan);
+}
+
+void BuildSkirmishAITestPlan(Int seed, SkirmishAITestScenario scenario,
+	SkirmishAITestPlan *plan)
+{
 	if (plan == nullptr)
 		return;
+	if (scenario != SKIRMISH_AI_TEST_SCENARIO_4V2)
+		scenario = SKIRMISH_AI_TEST_SCENARIO_4V3;
 
 	plan->seed = seed;
 	plan->mapName = "Maps\\Twilight Flame\\Twilight Flame.map";
@@ -128,6 +154,15 @@ void BuildSkirmishAITestPlan(Int seed, SkirmishAITestPlan *plan)
 	for (Int i = 1; i < SKIRMISH_AI_TEST_SLOT_COUNT; ++i)
 	{
 		SkirmishAITestSlotPlan &slot = plan->slots[i];
+		if (IsSkirmishAITest4v2(scenario) && i == 7)
+		{
+			slot.state = SLOT_CLOSED;
+			slot.playerTemplate = -1;
+			slot.color = -1;
+			slot.startPosition = -1;
+			slot.teamNumber = -1;
+			continue;
+		}
 		slot.state = SLOT_BRUTAL_AI;
 		slot.playerTemplate = PLAYERTEMPLATE_RANDOM;
 		slot.color = i - 1;
@@ -190,8 +225,10 @@ Bool IsSkirmishAITestProgressStalled(UnsignedInt elapsedMilliseconds)
 	return elapsedMilliseconds >= SKIRMISH_AI_TEST_MAX_STALLED_MILLISECONDS;
 }
 
-void ArmSkirmishAITestRunner(Int seed)
+void ArmSkirmishAITestRunner(Int seed, SkirmishAITestScenario scenario)
 {
+	if (scenario != SKIRMISH_AI_TEST_SCENARIO_4V2)
+		scenario = SKIRMISH_AI_TEST_SCENARIO_4V3;
 	s_runner.armed = TRUE;
 	s_runner.started = FALSE;
 	s_runner.ending = FALSE;
@@ -213,6 +250,10 @@ void ArmSkirmishAITestRunner(Int seed)
 	s_runner.loadedMapCRC = 0;
 	s_runner.loadedMapSize = 0;
 	s_runner.loadedSeed = 0;
+	s_runner.scenario = scenario;
+	s_runner.actualAiCount = 0;
+	s_runner.actualTeamCounts[0] = 0;
+	s_runner.actualTeamCounts[1] = 0;
 }
 
 Bool IsSkirmishAITestRunnerArmed()
@@ -239,9 +280,10 @@ Bool StartSkirmishAITestRunner()
 	DEBUG_LOG(("SkirmishAITestRunner::start phase=dependencies_ready"));
 
 	SkirmishAITestPlan plan;
-	BuildSkirmishAITestPlan(s_runner.seed, &plan);
+	BuildSkirmishAITestPlan(s_runner.seed, s_runner.scenario, &plan);
 	const MapMetaData *map = TheMapCache->findMap(plan.mapName);
-	if (!map || !map->m_doesExist || !map->m_isMultiplayer || map->m_numPlayers < 8)
+	if (!map || !map->m_doesExist || !map->m_isMultiplayer ||
+		map->m_numPlayers < ExpectedSkirmishAITestAiCount(s_runner.scenario) + 1)
 	{
 		FailSkirmishAITest("twilight_flame_unavailable");
 		return FALSE;
@@ -302,8 +344,16 @@ Bool StartSkirmishAITestRunner()
 	message->appendIntegerArgument(0);
 
 	s_runner.started = TRUE;
-	printf("SKIRMISH_AI_TEST_START seed=%d map=\"%s\" expected_ai=7 expected_teams=4v3\n",
-		plan.seed, plan.mapName);
+	if (IsSkirmishAITest4v2(s_runner.scenario))
+	{
+		printf("SKIRMISH_AI_TEST_START seed=%d scenario=%s map=\"%s\" expected_ai=6 expected_teams=4v2\n",
+			plan.seed, SkirmishAITestScenarioName(s_runner.scenario), plan.mapName);
+	}
+	else
+	{
+		printf("SKIRMISH_AI_TEST_START seed=%d map=\"%s\" expected_ai=7 expected_teams=4v3\n",
+			plan.seed, plan.mapName);
+	}
 	fflush(stdout);
 	return TRUE;
 }
@@ -368,7 +418,7 @@ void UpdateSkirmishAITestRunner()
 	}
 
 	SkirmishAITestPlan expectedPlan;
-	BuildSkirmishAITestPlan(s_runner.seed, &expectedPlan);
+	BuildSkirmishAITestPlan(s_runner.seed, s_runner.scenario, &expectedPlan);
 	const AsciiString gameInfoMap = TheGameInfo->getMap();
 	const AsciiString globalMap = TheGlobalData->m_mapName;
 	const AsciiString terrainMap = TheTerrainLogic
@@ -446,31 +496,66 @@ void UpdateSkirmishAITestRunner()
 	Bool validMatch = observer && observer->isHuman() &&
 		observer->getOriginalPlayerTemplate() == PLAYERTEMPLATE_OBSERVER && observerPlayer &&
 		observerPlayer->isPlayerObserver();
-	Int teamCounts[2] = { 0, 0 };
+	Int expectedAiCount = 0;
+	Int expectedTeamCounts[2] = { 0, 0 };
 	for (Int i = 1; i < SKIRMISH_AI_TEST_SLOT_COUNT; ++i)
 	{
-		const GameSlot *slot = TheGameInfo->getConstSlot(i);
-		AsciiString playerName;
-		playerName.format("player%d", i);
-		Player *player = ThePlayerList->findPlayerWithNameKey(NAMEKEY(playerName));
-		const Int expectedTeam = i <= 4 ? 0 : 1;
-		if (!slot || slot->getState() != SLOT_BRUTAL_AI ||
-			slot->getOriginalPlayerTemplate() != PLAYERTEMPLATE_RANDOM ||
-			slot->getOriginalColor() != i - 1 || slot->getOriginalStartPos() != i - 1 ||
-			!player || player->getPlayerType() != PLAYER_COMPUTER ||
-			slot->getTeamNumber() != expectedTeam)
+		const SkirmishAITestSlotPlan &slotPlan = expectedPlan.slots[i];
+		if (slotPlan.state == SLOT_BRUTAL_AI)
 		{
-			validMatch = FALSE;
+			++expectedAiCount;
+			if (slotPlan.teamNumber == 0 || slotPlan.teamNumber == 1)
+				++expectedTeamCounts[slotPlan.teamNumber];
+		}
+	}
+	Int actualAiCount = 0;
+	Int actualTeamCounts[2] = { 0, 0 };
+	for (Int slotIndex = 1; slotIndex < SKIRMISH_AI_TEST_SLOT_COUNT; ++slotIndex)
+	{
+		const SkirmishAITestSlotPlan &expectedSlot = expectedPlan.slots[slotIndex];
+		const GameSlot *slot = TheGameInfo->getConstSlot(slotIndex);
+		AsciiString playerName;
+		playerName.format("player%d", slotIndex);
+		Player *player = ThePlayerList->findPlayerWithNameKey(NAMEKEY(playerName));
+		if (slot && slot->getState() == SLOT_BRUTAL_AI)
+		{
+			++actualAiCount;
+			const Int actualTeam = slot->getTeamNumber();
+			if (actualTeam == 0 || actualTeam == 1)
+				++actualTeamCounts[actualTeam];
+			else
+				validMatch = FALSE;
+		}
+
+		if (expectedSlot.state == SLOT_CLOSED)
+		{
+			if (!slot || slot->getState() != SLOT_CLOSED || player != nullptr)
+				validMatch = FALSE;
 			continue;
 		}
-		++teamCounts[slot->getTeamNumber()];
+
+		if (!slot || slot->getState() != SLOT_BRUTAL_AI ||
+			slot->getOriginalPlayerTemplate() != expectedSlot.playerTemplate ||
+			slot->getOriginalColor() != expectedSlot.color ||
+			slot->getOriginalStartPos() != expectedSlot.startPosition ||
+			!player || player->getPlayerType() != PLAYER_COMPUTER ||
+			slot->getTeamNumber() != expectedSlot.teamNumber)
+		{
+			validMatch = FALSE;
+		}
 	}
-	if (!validMatch || teamCounts[0] != 4 || teamCounts[1] != 3)
+	if (!validMatch || actualAiCount != expectedAiCount ||
+		actualTeamCounts[0] != expectedTeamCounts[0] ||
+		actualTeamCounts[1] != expectedTeamCounts[1])
 	{
-		FailSkirmishAITest("invalid_4v3_setup");
+		FailSkirmishAITest(IsSkirmishAITest4v2(s_runner.scenario)
+			? "invalid_4v2_setup" : "invalid_4v3_setup");
 		RequestSkirmishAITestStop();
 		return;
 	}
+	s_runner.actualAiCount = actualAiCount;
+	s_runner.actualTeamCounts[0] = actualTeamCounts[0];
+	s_runner.actualTeamCounts[1] = actualTeamCounts[1];
 
 	Int winnerTeam = -1;
 	Bool conflictingWinners = FALSE;
@@ -552,10 +637,22 @@ Int FinalizeSkirmishAITestRunner(Int engineExitCode)
 		return 1;
 	}
 
-	printf("SKIRMISH_AI_TEST_COMPLETE seed=%d map=\"%s\" map_crc=%08X map_size=%u loaded_seed=%d "
-		"winner_team=%d end_frame=%u replay=%s\n",
-		s_runner.seed, s_runner.loadedMapName, s_runner.loadedMapCRC, s_runner.loadedMapSize,
-		s_runner.loadedSeed, s_runner.winnerTeam, s_runner.endFrame, replayPath.str());
+	if (IsSkirmishAITest4v2(s_runner.scenario))
+	{
+		printf("SKIRMISH_AI_TEST_COMPLETE seed=%d scenario=%s map=\"%s\" map_crc=%08X map_size=%u loaded_seed=%d "
+			"actual_ai=%d actual_teams=%dv%d winner_team=%d end_frame=%u replay=%s\n",
+			s_runner.seed, SkirmishAITestScenarioName(s_runner.scenario), s_runner.loadedMapName,
+			s_runner.loadedMapCRC, s_runner.loadedMapSize, s_runner.loadedSeed,
+			s_runner.actualAiCount, s_runner.actualTeamCounts[0], s_runner.actualTeamCounts[1],
+			s_runner.winnerTeam, s_runner.endFrame, replayPath.str());
+	}
+	else
+	{
+		printf("SKIRMISH_AI_TEST_COMPLETE seed=%d map=\"%s\" map_crc=%08X map_size=%u loaded_seed=%d "
+			"winner_team=%d end_frame=%u replay=%s\n",
+			s_runner.seed, s_runner.loadedMapName, s_runner.loadedMapCRC, s_runner.loadedMapSize,
+			s_runner.loadedSeed, s_runner.winnerTeam, s_runner.endFrame, replayPath.str());
+	}
 	fflush(stdout);
 	return 0;
 }

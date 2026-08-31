@@ -50,6 +50,8 @@
 #endif
 
 
+namespace rts { class ResourceIoSource; }
+
 class FileClass
 {
 	public:
@@ -80,6 +82,8 @@ class FileClass
 		virtual bool Set_Date_Time(unsigned long ) {return(false);}
 //		virtual void Error(int error, int canretry = false, char const * filename=nullptr) = 0;
 		virtual void * Get_File_Handle() { return reinterpret_cast<void *>(-1); }
+		// Called only by the game owner; default factories retain serial loading.
+		virtual rts::ResourceIoSource *Capture_Resource_Read_Source() { return 0; }
 //		virtual void Bias(int start, int length=-1) = 0;
 
 		operator char const * ()

@@ -165,18 +165,6 @@ static void radarOverlayWriteObjectPoint(
 	}
 }
 
-static bool radarOverlayCoordinateInRange(unsigned coordinate, Int minimum,
-	Int maximum)
-{
-	if (coordinate > static_cast<unsigned>(INT_MAX))
-	{
-		return false;
-	}
-
-	return static_cast<Int>(coordinate) >= minimum &&
-		static_cast<Int>(coordinate) <= maximum;
-}
-
 bool PackRadarObjectRows(const RadarObjectOverlaySnapshot &snapshot,
 	unsigned rowBegin, unsigned rowEnd)
 {
@@ -207,43 +195,32 @@ bool PackRadarObjectRows(const RadarObjectOverlaySnapshot &snapshot,
 bool PackRadarShroudRows(const RadarShroudOverlaySnapshot &snapshot,
 	unsigned rowBegin, unsigned rowEnd)
 {
-	unsigned row;
+	unsigned commandIndex;
 
 	if (!radarOverlayValidateShroudSnapshot(snapshot, rowBegin, rowEnd))
 	{
 		return false;
 	}
 
-	for (row = rowBegin; row < rowEnd; ++row)
+	/* Each stripe applies the original command order, but visits only rows
+	 * touched by each rectangle. Last-writer-wins is unchanged per pixel. */
+	for (commandIndex = 0; commandIndex < snapshot.commandCount; ++commandIndex)
 	{
-		unsigned commandIndex;
-		for (commandIndex = 0; commandIndex < snapshot.commandCount;
-			++commandIndex)
+		const RadarShroudOverlayCommand &command = snapshot.commands[commandIndex];
+		if (command.minX > command.maxX || command.minY > command.maxY ||
+			command.maxX < 0 || command.maxY < 0 ||
+			command.minX >= static_cast<Int>(snapshot.width))
+			continue;
+		const unsigned xBegin = command.minX < 0 ? 0u : static_cast<unsigned>(command.minX);
+		const unsigned xEnd = command.maxX >= static_cast<Int>(snapshot.width) ?
+			snapshot.width-1 : static_cast<unsigned>(command.maxX);
+		unsigned yBegin = command.minY < 0 ? 0u : static_cast<unsigned>(command.minY);
+		unsigned yEnd = static_cast<unsigned>(command.maxY)+1u;
+		if (yBegin < rowBegin) yBegin = rowBegin;
+		if (yEnd > rowEnd) yEnd = rowEnd;
+		for (unsigned row = yBegin; row < yEnd; ++row)
 		{
-			const RadarShroudOverlayCommand &command =
-				snapshot.commands[commandIndex];
-			unsigned x;
-			unsigned xBegin;
-			unsigned xEnd;
-
-			if (command.minX > command.maxX || command.minY > command.maxY ||
-				!radarOverlayCoordinateInRange(row, command.minY,
-					command.maxY))
-			{
-				continue;
-			}
-
-			if (command.maxX < 0 || command.minX >=
-				static_cast<Int>(snapshot.width))
-			{
-				continue;
-			}
-			xBegin = command.minX < 0 ? 0u :
-				static_cast<unsigned>(command.minX);
-			xEnd = command.maxX >= static_cast<Int>(snapshot.width) ?
-				snapshot.width - 1 : static_cast<unsigned>(command.maxX);
-
-			for (x = xBegin; x <= xEnd; ++x)
+			for (unsigned x = xBegin; x <= xEnd; ++x)
 			{
 				radarOverlayWritePixel(command.packedColor,
 					snapshot.bytesPerPixel, snapshot.output,

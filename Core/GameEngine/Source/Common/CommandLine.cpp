@@ -37,6 +37,7 @@
 #include "GameClient/GameText.h"
 #include "GameNetwork/NetworkDefs.h"
 #include "Lib/JobSystem.h"
+#include "Lib/PipelineExecutionPolicy.h"
 #include "Renderer/RendererDevice.h"
 #include "WWLib/trim.h"
 
@@ -481,9 +482,23 @@ Int parseRunSkirmishAITestForStartup(char *args[], int num)
 	return 2;
 }
 
+Int parseRunSkirmishAITest4v2ForStartup(char *args[], int num)
+{
+	Int seed = 0;
+	parseSkirmishAITestSeedArgument(args, num, &seed);
+
+	parseHeadless(args, num);
+	TheWritableGlobalData->m_shellMapOn = FALSE;
+	TheWritableGlobalData->m_useFpsLimit = FALSE;
+	rts::ClientInstance::setMultiInstance(TRUE);
+	rts::ClientInstance::skipPrimaryInstance();
+	return 2;
+}
+
 Int parseRunSkirmishAITest(char *args[], int num)
 {
-	if (TheGlobalData->m_commandLineData.hasSkirmishAITestRequest())
+	if (TheGlobalData->m_commandLineData.hasSkirmishAITestRequest() ||
+		TheGlobalData->m_commandLineData.hasSkirmishAITest4v2Request())
 	{
 		printf("SKIRMISH_AI_TEST_FAIL seed=0 reason=duplicate_option\n");
 		fflush(stdout);
@@ -492,7 +507,33 @@ Int parseRunSkirmishAITest(char *args[], int num)
 
 	Int seed = 0;
 	parseSkirmishAITestSeedArgument(args, num, &seed);
-	TheWritableGlobalData->m_commandLineData.requestSkirmishAITest(seed);
+	if (!TheWritableGlobalData->m_commandLineData.requestSkirmishAITest(seed))
+	{
+		printf("SKIRMISH_AI_TEST_FAIL seed=0 reason=duplicate_option\n");
+		fflush(stdout);
+		exit(2);
+	}
+	return 2;
+}
+
+Int parseRunSkirmishAITest4v2(char *args[], int num)
+{
+	if (TheGlobalData->m_commandLineData.hasSkirmishAITestRequest() ||
+		TheGlobalData->m_commandLineData.hasSkirmishAITest4v2Request())
+	{
+		printf("SKIRMISH_AI_TEST_FAIL seed=0 reason=duplicate_option\n");
+		fflush(stdout);
+		exit(2);
+	}
+
+	Int seed = 0;
+	parseSkirmishAITestSeedArgument(args, num, &seed);
+	if (!TheWritableGlobalData->m_commandLineData.requestSkirmishAITest4v2(seed))
+	{
+		printf("SKIRMISH_AI_TEST_FAIL seed=0 reason=duplicate_option\n");
+		fflush(stdout);
+		exit(2);
+	}
 	return 2;
 }
 
@@ -568,6 +609,21 @@ Int parseWorkerPolicy(char *args[], int num)
 		return 2;
 	}
 	return 1;
+}
+
+Int parsePipelineMode(char *args[], int num)
+{
+	if (num <= 1 || args == 0 || args[1] == 0)
+	{
+		printf("Missing pipeline mode (expected parallel or serial)\n");
+		exit(1);
+	}
+	if (!rts::SetPipelineExecutionMode(args[1]))
+	{
+		printf("Invalid or locked pipeline mode: %s (expected parallel or serial at startup)\n", args[1]);
+		exit(1);
+	}
+	return 2;
 }
 
 Int parseXRes(char *args[], int num)
@@ -1251,6 +1307,8 @@ static CommandLineParam paramsForStartup[] =
 	// This runs the game without a window, graphics, input and audio. You can combine this with -replay
 	{ "-headless", parseHeadless },
 	{ "-runSkirmishAITest", parseRunSkirmishAITestForStartup },
+	// Explicit test-only 4v2 variant; the existing option remains 4v3.
+	{ "-runSkirmishAITest4v2", parseRunSkirmishAITest4v2ForStartup },
 
 	// TheSuperHackers @feature helmutbuhler 13/04/2025
 	// Play back a replay. Pass the filename including .rep afterwards.
@@ -1268,12 +1326,14 @@ static CommandLineParam paramsForStartup[] =
 	// separate from -jobs, which controls replay child processes.
 	{ "-workerCount", parseWorkerCount },
 	{ "-workerPolicy", parseWorkerPolicy },
+	{ "-pipelineMode", parsePipelineMode },
 };
 
 // These Params are parsed during Engine Init before INI data is loaded
 static CommandLineParam paramsForEngineInit[] =
 {
 	{ "-runSkirmishAITest", parseRunSkirmishAITest },
+	{ "-runSkirmishAITest4v2", parseRunSkirmishAITest4v2 },
 	{ "-nologo", parseNoLogo }, // TheSuperHackers @tweak Is now available in Release builds.
 	{ "-noshellmap", parseNoShellMap },
 	{ "-noShellAnim", parseNoWindowAnimation }, // TheSuperHackers @tweak Is now available in Release builds.

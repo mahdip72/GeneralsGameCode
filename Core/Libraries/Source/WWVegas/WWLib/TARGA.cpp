@@ -353,6 +353,76 @@ void Targa::Close()
 *
 ****************************************************************************/
 
+long Targa::Load_From_Memory(const unsigned char* bytes, size_t size, bool flip_y_origin)
+{
+	if (bytes == nullptr || size < sizeof(TGAHeader) || Is_File_Open()) return TGAERR_READ;
+	if (mImage != nullptr || mPalette != nullptr) return TGAERR_NOTSUPPORTED;
+	memcpy(&Header, bytes, sizeof(Header));
+	if (Header.Width <= 0 || Header.Height <= 0 || Header.PixelDepth <= 0 ||
+		Header.PixelDepth > 32) return TGAERR_SYNTAX;
+	const size_t depth = TGA_BytesPerPixel(Header.PixelDepth);
+	const size_t pixels = static_cast<size_t>(Header.Width) * Header.Height;
+	if (pixels > 0x7fffffffU / depth) return TGAERR_SYNTAX;
+	size_t offset = sizeof(TGAHeader) + static_cast<unsigned char>(Header.IDLength);
+	if (offset > size) return TGAERR_READ;
+	if (Header.ColorMapType == 1)
+	{
+		const unsigned paletteDepth = static_cast<unsigned char>(Header.CMapDepth) >> 3;
+		if (Header.CMapStart < 0 || Header.CMapLength < 0 || paletteDepth == 0 ||
+			paletteDepth > 4 || static_cast<unsigned>(Header.CMapStart) + Header.CMapLength > 256)
+			return TGAERR_SYNTAX;
+		const size_t paletteBytes = static_cast<size_t>(Header.CMapLength) * paletteDepth;
+		if (paletteBytes > size - offset) return TGAERR_READ;
+		mPalette = static_cast<char*>(malloc(1024));
+		if (mPalette == nullptr) return TGAERR_NOMEM;
+		mFlags |= TGAF_PAL;
+		memset(mPalette, 0, 1024);
+		memcpy(mPalette + Header.CMapStart * paletteDepth, bytes + offset, paletteBytes);
+		offset += paletteBytes;
+	}
+	else if (Header.ColorMapType != 0) return TGAERR_NOTSUPPORTED;
+	const bool encoded = Header.ImageType == TGA_CMAPPED_ENCODED ||
+		Header.ImageType == TGA_TRUECOLOR_ENCODED;
+	if (!encoded && Header.ImageType != TGA_CMAPPED && Header.ImageType != TGA_TRUECOLOR &&
+		Header.ImageType != TGA_MONO) return TGAERR_NOTSUPPORTED;
+	if ((Header.ImageType == TGA_CMAPPED || Header.ImageType == TGA_CMAPPED_ENCODED) &&
+		(Header.ColorMapType != 1 || depth != 1)) return TGAERR_NOTSUPPORTED;
+	mImage = static_cast<char*>(malloc(pixels * depth));
+	if (mImage == nullptr) return TGAERR_NOMEM;
+	mFlags |= TGAF_IMAGE;
+	if (!encoded)
+	{
+		if (pixels * depth > size - offset) return TGAERR_READ;
+		memcpy(mImage, bytes + offset, pixels * depth);
+	}
+	else
+	{
+		size_t written = 0;
+		while (written < pixels)
+		{
+			if (offset == size) return TGAERR_READ;
+			const unsigned packet = bytes[offset++];
+			const size_t count = (packet & 127) + 1;
+			if (count > pixels - written) return TGAERR_SYNTAX;
+			const size_t sourceBytes = (packet & 128) ? depth : count * depth;
+			if (sourceBytes > size - offset) return TGAERR_READ;
+			if (packet & 128)
+			{
+				for (size_t i = 0; i < count; ++i)
+					memcpy(mImage + (written + i) * depth, bytes + offset, depth);
+			}
+			else memcpy(mImage + written * depth, bytes + offset, sourceBytes);
+			offset += sourceBytes;
+			written += count;
+		}
+	}
+	if (flip_y_origin) Header.ImageDescriptor ^= TGAIDF_YORIGIN;
+	if (Header.ImageDescriptor & TGAIDF_XORIGIN) XFlip();
+	if (Header.ImageDescriptor & TGAIDF_YORIGIN) YFlip();
+	Header.ImageDescriptor &= ~(TGAIDF_XORIGIN | TGAIDF_YORIGIN);
+	return 0;
+}
+
 long Targa::Load(const char* name, char* palette, char* image,bool invert_image)
 {
 	long size;

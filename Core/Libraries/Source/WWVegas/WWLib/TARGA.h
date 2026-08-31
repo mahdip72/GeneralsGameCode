@@ -17,6 +17,7 @@
 */
 
 #pragma once
+#include <stddef.h>
 
 /****************************************************************************
 *
@@ -269,6 +270,9 @@ class Targa
 
 		long Load(const char* name, char* palette, char* image,bool invert_image=true);
 		long Load(const char* name, long flags, bool invert_image=true);
+		// Memory-only texture decoder: no FileClass, factory, or shared cursor.
+		// flip_y_origin matches TextureLoader's descriptor XOR before Load(false).
+		long Load_From_Memory(const unsigned char* bytes, size_t size, bool flip_y_origin);
 		long Save(const char* name, long flags, bool addextension = false);
 
 		void XFlip();

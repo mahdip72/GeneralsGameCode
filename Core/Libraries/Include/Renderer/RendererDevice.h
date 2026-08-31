@@ -301,12 +301,15 @@ public:
 	void recordPresentation(RenderResult result);
 	void recordRecovery(RenderResult result);
 	void markFrameEnded();
+	// Queue admission is not backend execution or visible presentation.
+	void markSubmitted();
 	void markPresented();
 	void setOperational(bool operational);
 
 	bool hasCommandFailure() const;
 	bool hasLifecycleFailure() const;
 	bool hasDeviceRemoval() const;
+	bool wasSubmitted() const;
 	bool wasPresented() const;
 	bool frameEnded() const;
 	bool isOperational() const;
@@ -325,6 +328,7 @@ private:
 	RenderResult m_recoveryResult;
 	bool m_deviceRemoved;
 	bool m_frameEnded;
+	bool m_submitted;
 	bool m_presented;
 	bool m_operational;
 };

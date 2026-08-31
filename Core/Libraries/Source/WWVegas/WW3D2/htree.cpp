@@ -63,6 +63,143 @@
 #include "motchan.h"
 #include "ww3d.h"
 
+#if defined(_WIN64)
+#include "Lib/ParallelSkinning.h"
+#include "Lib/PipelineExecutionPolicy.h"
+
+namespace
+{
+void Copy_Pose_Matrix(const Matrix3D &source, rts::SkinningMatrix &destination)
+{
+	for (int row = 0; row != 3; ++row)
+		for (int column = 0; column != 4; ++column)
+			destination.row[row][column] = source[row][column];
+}
+}
+
+bool HTreeClass::Try_Parallel_Update(const Matrix3D &root, HAnimClass *motion0,
+	float frame0, HAnimClass *motion1, float frame1, float blend, int mode)
+{
+	// Captured controls can affect descendants and stay entirely on the owner.
+	// The common small-skeleton path also retains the original allocation-free loop.
+	if (!rts::UseParallelPipelines() || NumPivots < 64 || NumPivots > 16384 ||
+		rts::JobSystem::instance().isWorkerThread() ||
+		!rts::JobSystem::instance().ensureStarted() ||
+		rts::JobSystem::instance().workerCount() < 2) return false;
+	for (int index = 1; index != NumPivots; ++index)
+		if (Pivot[index].Is_Captured() || !Pivot[index].Parent) return false;
+	try
+	{
+		rts::SkinningScratchLease scratch;
+		if (!scratch.preparePose(NumPivots))
+		{
+			rts::JobSystem::instance().recordSerialFallback();
+			return false;
+		}
+		rts::PoseBone *snapshot = scratch.poseBones();
+		rts::PoseTransform *result = scratch.poseOutput();
+		rts::SkinningMatrix rootSnapshot;
+		Copy_Pose_Matrix(root, rootSnapshot);
+		int animatedPivots = motion0 ? motion0->Get_Num_Pivots() : 0;
+		if (mode == 3) animatedPivots = MIN(animatedPivots, motion1->Get_Num_Pivots());
+		NodeMotionStruct *rawNodes = nullptr;
+		int integerFrame = 0;
+		if (mode == 2)
+		{
+			HRawAnimClass *raw = static_cast<HRawAnimClass *>(motion0);
+			rawNodes = raw->Get_Node_Motion_Array();
+			integerFrame = WWMath::Float_To_Long(frame0);
+			if (integerFrame >= raw->Get_Num_Frames()) integerFrame = 0;
+			if (integerFrame < 0) return false;
+		}
+		// Channels may cache samples. Read them in legacy order on this thread;
+		// neither motion objects nor PivotClass pointers enter a job.
+		for (int index = 1; index != NumPivots; ++index)
+		{
+			const PivotClass &pivot = Pivot[index];
+			rts::PoseBone &bone = snapshot[index];
+			bone.parent = static_cast<unsigned>(pivot.Parent - Pivot);
+			if (bone.parent >= static_cast<unsigned>(index)) return false;
+			Copy_Pose_Matrix(pivot.BaseTransform, bone.base);
+			bone.visible = mode == 0 ? true : pivot.IsVisible;
+			bone.translate = false;
+			bone.rotate = false;
+			if (index < animatedPivots)
+			{
+				Vector3 translation;
+				Quaternion orientation;
+				Matrix3D rotation;
+				if (mode == 2)
+				{
+					NodeMotionStruct &node = rawNodes[index];
+					translation.Set(0.0f, 0.0f, 0.0f);
+					if (node.X) node.X->Get_Vector(integerFrame, &translation[0]);
+					if (node.Y) node.Y->Get_Vector(integerFrame, &translation[1]);
+					if (node.Z) node.Z->Get_Vector(integerFrame, &translation[2]);
+					if (ScaleFactor != 1.0f) translation = translation * ScaleFactor;
+					if (node.Q)
+					{
+						node.Q->Get_Vector_As_Quat(integerFrame, orientation);
+						::Build_Matrix3D(orientation, rotation);
+						bone.rotate = true;
+					}
+					bone.visible = node.Vis ? node.Vis->Get_Bit(integerFrame) == 1 : true;
+				}
+				else if (mode == 3)
+				{
+					Vector3 translation0, translation1;
+					motion0->Get_Translation(translation0, index, frame0);
+					motion1->Get_Translation(translation1, index, frame1);
+					Vector3 lerped = (1.0 - blend) * translation0 + blend * translation1;
+					translation = lerped * ScaleFactor;
+					Quaternion orientation0, orientation1;
+					motion0->Get_Orientation(orientation0, index, frame0);
+					motion1->Get_Orientation(orientation1, index, frame1);
+					Fast_Slerp(orientation, orientation0, orientation1, blend);
+					::Build_Matrix3D(orientation, rotation);
+					bone.rotate = true;
+					bone.visible = motion0->Get_Visibility(index, frame0) || motion1->Get_Visibility(index, frame1);
+				}
+				else
+				{
+					motion0->Get_Translation(translation, index, frame0);
+					translation = translation * ScaleFactor;
+					motion0->Get_Orientation(orientation, index, frame0);
+					::Build_Matrix3D(orientation, rotation);
+					bone.rotate = true;
+					bone.visible = motion0->Get_Visibility(index, frame0);
+				}
+				bone.translation.x = translation.X;
+				bone.translation.y = translation.Y;
+				bone.translation.z = translation.Z;
+				bone.translate = true;
+				if (bone.rotate) Copy_Pose_Matrix(rotation, bone.rotation);
+			}
+		}
+		rts::SkinningOptions options;
+		options.minimumGrain = 16;
+		options.scratch = &scratch;
+		if (!rts::SkinningCompleted(rts::EvaluatePose(&snapshot[0], NumPivots,
+			rootSnapshot, &result[0], options))) return false;
+		// A hierarchy becomes visible only after every parent/child job is done.
+		// No snapshot or result can escape the animation frame that produced it.
+		for (int index = 0; index != NumPivots; ++index)
+		{
+			for (int row = 0; row != 3; ++row)
+				for (int column = 0; column != 4; ++column)
+					Pivot[index].Transform[row][column] = result[index].transform.row[row][column];
+			Pivot[index].IsVisible = result[index].visible;
+		}
+		return true;
+	}
+	catch (...)
+	{
+		rts::JobSystem::instance().recordSerialFallback();
+		return false;
+	}
+}
+#endif
+
 /***********************************************************************************************
  * HTreeClass::HTreeClass -- constructor                                                       *
  *                                                                                             *
@@ -527,6 +664,9 @@ bool HTreeClass::Simple_Evaluate_Pivot
  *=============================================================================================*/
 void HTreeClass::Base_Update(const Matrix3D & root)
 {
+#if defined(_WIN64)
+	if (Try_Parallel_Update(root, nullptr, 0, nullptr, 0, 0, 0)) return;
+#endif
 	PivotClass *pivot;
 
 	Pivot[0].Transform = root;
@@ -558,6 +698,9 @@ void HTreeClass::Base_Update(const Matrix3D & root)
  *=============================================================================================*/
 void HTreeClass::Anim_Update(const Matrix3D & root,HAnimClass * motion,float frame)
 {
+#if defined(_WIN64)
+	if (Try_Parallel_Update(root, motion, frame, nullptr, 0, 0, 1)) return;
+#endif
 	PivotClass *pivot;
 	Matrix3D mtx;
 
@@ -615,6 +758,9 @@ void HTreeClass::Anim_Update_Without_Interpolation(const Matrix3D & root,HRawAni
 		return;
 	}
 
+#if defined(_WIN64)
+	if (Try_Parallel_Update(root, motion, frame, nullptr, 0, 0, 2)) return;
+#endif
 	PivotClass *pivot,*endpivot,*lastAnimPivot;
 
 	Pivot[0].Transform = root;
@@ -711,6 +857,9 @@ void HTreeClass::Blend_Update
 	float									percentage		// 0.0 = motion0.  1.0 = motion1
 )
 {
+#if defined(_WIN64)
+	if (Try_Parallel_Update(root, motion0, frame0, motion1, frame1, percentage, 3)) return;
+#endif
 	PivotClass *pivot;
 	Matrix3D mtx;
 
