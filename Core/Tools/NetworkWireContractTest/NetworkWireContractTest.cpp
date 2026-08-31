@@ -415,6 +415,65 @@ int TestNetworkFrameResendPolicy()
 	return result;
 }
 
+int TestNetworkDisconnectFrameRecoveryPolicy()
+{
+	using namespace rts::network_epoch;
+	int result = 0;
+	NetworkDisconnectFrameRecovery peers[8];
+	result |= Check(!IsNetworkDisconnectFrameRecoveryAuthorized(peers[2],
+		4U, 8U, 120U, 65U, true, 120U), "no disconnect proof means no relayed recovery");
+	result |= Check(TrySetNetworkDisconnectFrameRecovery(peers[2],
+		120U, 125U, 0x14U, 120U, 65U), "accepted ahead-peer progress establishes a bounded cache range");
+	for (std::uint32_t frame = 120U; frame < 125U; ++frame)
+		result |= Check(IsNetworkDisconnectFrameRecoveryAuthorized(peers[2],
+			4U, 8U, 120U, 65U, true, frame), "every retained frame in the announced range is recoverable");
+	result |= Check(!IsNetworkDisconnectFrameRecoveryAuthorized(peers[3],
+		4U, 8U, 120U, 65U, true, 120U), "a different observed responder cannot reuse a peer's recovery proof");
+	result |= Check(!IsNetworkDisconnectFrameRecoveryAuthorized(peers[2],
+		0U, 8U, 120U, 65U, true, 120U) &&
+		!IsNetworkDisconnectFrameRecoveryAuthorized(peers[2],
+			8U, 8U, 120U, 65U, true, 120U), "recovery excludes the local requester and invalid origins");
+	result |= Check(!IsNetworkDisconnectFrameRecoveryAuthorized(peers[2],
+		4U, 8U, 120U, 65U, true, 119U) &&
+		!IsNetworkDisconnectFrameRecoveryAuthorized(peers[2],
+			4U, 8U, 120U, 65U, true, 125U), "recovery never admits frames outside accepted peer progress");
+	result |= Check(!IsNetworkDisconnectFrameRecoveryAuthorized(peers[2],
+		4U, 8U, 121U, 65U, true, 120U) &&
+		!IsNetworkDisconnectFrameRecoveryAuthorized(peers[2],
+			4U, 8U, 125U, 65U, true, 125U), "executed frames and completed catch-up invalidate recovery");
+	result |= Check(!IsNetworkDisconnectFrameRecoveryAuthorized(peers[2],
+		4U, 8U, 120U, 65U, false, 120U), "file/control/nested-wrapper payloads are not synchronized recovery");
+	result |= Check(!TrySetNetworkDisconnectFrameRecovery(peers[3],
+		120U, 186U, 0x14U, 120U, 65U) &&
+		!TrySetNetworkDisconnectFrameRecovery(peers[3],
+			120U, 125U, 0x14U, 121U, 65U) &&
+		!TrySetNetworkDisconnectFrameRecovery(peers[3],
+			120U, 120U, 0x14U, 120U, 65U) &&
+		!TrySetNetworkDisconnectFrameRecovery(peers[3],
+			120U, 125U, 0U, 120U, 65U), "stale local announcements, empty origins and excessive cache spans cannot grant recovery");
+	result |= Check(TrySetNetworkDisconnectFrameRecovery(peers[3],
+		120U, 185U, 0x14U, 120U, 65U), "the full retained-cache boundary is recoverable");
+	peers[2].originMask &= ~0x10U;
+	result |= Check(!IsNetworkDisconnectFrameRecoveryAuthorized(peers[2],
+		4U, 8U, 120U, 65U, true, 120U), "removing an origin revokes its outstanding recovery permission");
+	peers[3] = {};
+	result |= Check(!IsNetworkDisconnectFrameRecoveryAuthorized(peers[3],
+		4U, 8U, 120U, 65U, true, 120U), "disconnect and session reset revoke all responder recovery");
+
+	result |= Check(IsNetworkRecoveryWrapperBounded(8192U, 64U) &&
+		!IsNetworkRecoveryWrapperBounded(8193U, 64U) &&
+		!IsNetworkRecoveryWrapperBounded(8192U, 65U) &&
+		!IsNetworkRecoveryWrapperBounded(0U, 1U) &&
+		!IsNetworkRecoveryWrapperBounded(1U, 0U), "recovery fragments have independent payload and metadata bounds");
+	const std::size_t maxCanonicalGameCommandBytes = 15U + 5U + 255U * (2U + 16U);
+	UnsignedInt chunks = 0U;
+	result |= Check(rts::network_wire::TryGetWrapperChunkCount(maxCanonicalGameCommandBytes,
+		rts::network_wire::kRetailPacketSize, chunks) &&
+		IsNetworkRecoveryWrapperBounded(static_cast<std::uint32_t>(maxCanonicalGameCommandBytes), chunks),
+		"the recovery bound permits the largest canonical game command in retail-size fragments");
+	return result;
+}
+
 int TestNetworkNatPolicy()
 {
 	using namespace rts::network_nat;
@@ -511,5 +570,5 @@ int main()
 		TestNetworkHelloContract() | TestNetworkFramePublicationGate() |
 		TestNetworkHelloFailureHandlingPolicy() | TestNetworkIngressPolicy() |
 		TestNetworkHelloDropPolicy() | TestNetworkFrameResendPolicy() |
-		TestNetworkNatPolicy();
+		TestNetworkDisconnectFrameRecoveryPolicy() | TestNetworkNatPolicy();
 }

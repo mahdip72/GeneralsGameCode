@@ -177,8 +177,12 @@ function Get-TokenViolations {
                 'm_frameResendRequestExpectedInfoMask,',
                 'm_frameResendRequestExpectedInfoMask',
                 'm_frameResendRequestReceivedInfoMask',
-                'NETCOMMANDTYPE_GAMECOMMAND',
+                'IsCommandSynchronized(command->getNetCommandType())',
                 'NETCOMMANDTYPE_FRAMEINFO',
+                'processNetworkFrameRecoveryWrapper(cmd, sourceSlot)',
+                'isNetworkFrameRecoveryAuthorized(command, sourceSlot, FALSE)',
+                'cmd->setRelay(1U << m_localSlot)',
+                'ackNetworkFrameRecoveryCommand(cmd, sourceSlot)',
                 'getExecutionFrame()',
                 'getFrameCommandCount(m_frameResendRequestFrame)',
                 'getCommandCount(m_frameResendRequestFrame)',
@@ -190,13 +194,129 @@ function Get-TokenViolations {
                 $violations.Add("frame resend admission is missing bounded provenance '$required'")
             }
         }
-        if ($transport.IndexOf('if (!sourceAuthorized && !frameResendResponseAuthorized)',
+        if ($transport.IndexOf('if (!sourceAuthorized && !frameResendResponseAuthorized && !frameRecoveryAuthorized)',
                 [StringComparison]::Ordinal) -lt 0 -or
             $transport.IndexOf('frameResendResponseAccepted', [StringComparison]::Ordinal) -lt 0) {
             $violations.Add('frame resend provenance must remain an exception to strict source binding')
         }
         if ($transport.IndexOf('if (frameResendExpired)', [StringComparison]::Ordinal) -lt 0) {
             $violations.Add('frame resend provenance must expire before admission')
+        }
+    }
+
+    # Recovery is a bounded exception, not another router. Check the actual
+    # producer, disconnect proof, responder-specific staging and publication.
+    $recoverySections = @(
+        @{
+            Start = 'void ConnectionManager::allowNetworkDisconnectFrameRecovery('
+            End = 'Bool ConnectionManager::isNetworkFrameRecoveryAuthorized('
+            Required = @('responder >= MAX_SLOTS', 'responder == m_localSlot',
+                'm_connections[responder]->isQuitting()', 'slot != m_localSlot',
+                'm_frameData[slot] != nullptr', 'TrySetNetworkDisconnectFrameRecovery(',
+                'm_disconnectFrameRecovery[responder]', 'TheGameLogic->getFrame(), FRAMES_TO_KEEP')
+        },
+        @{
+            Start = 'Bool ConnectionManager::isNetworkFrameRecoveryAuthorized('
+            End = 'void ConnectionManager::ackNetworkFrameRecoveryCommand('
+            Required = @('sourceSlot < 0 || sourceSlot >= MAX_SLOTS',
+                'm_connections[sourceSlot]->isQuitting()',
+                'IsCommandSynchronized(command->getNetCommandType())',
+                'IsNetworkFrameResendResponseAuthorized(sourceSlot,',
+                'IsNetworkDisconnectFrameRecoveryAuthorized(',
+                'm_disconnectFrameRecovery[sourceSlot]', 'wrapper ? currentFrame : command->getExecutionFrame()')
+        },
+        @{
+            Start = 'void ConnectionManager::ackNetworkFrameRecoveryCommand('
+            End = 'Bool ConnectionManager::processNetworkFrameRecoveryWrapper('
+            Required = @('NetAckBothCommandMsg', 'ack->setPlayerID(m_localSlot)',
+                'm_connections[sourceSlot]->sendNetCommandMsg(ack, 1U << sourceSlot)', 'ack->detach()')
+        },
+        @{
+            Start = 'inline bool TrySetNetworkDisconnectFrameRecovery('
+            End = 'inline bool IsNetworkDisconnectFrameRecoveryAuthorized('
+            Required = @('firstFrame != currentFrame', 'endFrame <= firstFrame',
+                'endFrame - firstFrame > maxCachedFrames', 'originMask == 0U')
+        },
+        @{
+            Start = 'inline bool IsNetworkDisconnectFrameRecoveryAuthorized('
+            End = 'constexpr std::uint32_t kNetworkRecoveryMaxWrappedBytes'
+            Required = @('isFrameDataCommand && claimedSlot < maxSlots',
+                'recovery.originMask & (1U << claimedSlot)',
+                'recovery.endFrame - recovery.firstFrame <= maxCachedFrames',
+                'currentFrame >= recovery.firstFrame && currentFrame < recovery.endFrame',
+                'responseFrame >= currentFrame && responseFrame < recovery.endFrame')
+        },
+        @{
+            Start = 'void DisconnectManager::processDisconnectFrame('
+            End = 'void DisconnectManager::processDisconnectScreenOff('
+            Required = @('if (m_disconnectFramesReceived[localSlot])',
+                'conMgr->allowNetworkDisconnectFrameRecovery(peer,',
+                'm_disconnectFrames[localSlot], m_disconnectFrames[peer]')
+        },
+        @{
+            Start = 'void DisconnectManager::processDisconnectScreenOff('
+            End = 'void DisconnectManager::applyDisconnectVote('
+            Required = @('if (m_disconnectFramesReceived[localSlot])',
+                'conMgr->allowNetworkDisconnectFrameRecovery(playerID,',
+                'm_disconnectFrames[localSlot], newFrame')
+        },
+        @{
+            Start = 'void ConnectionManager::processFrameResendRequest('
+            End = 'void ConnectionManager::processWrapper('
+            Required = @('#if defined(_WIN64)',
+                'sendSingleFrameToPlayer(playerID, msg->getFrameToResend())')
+        },
+        @{
+            Start = 'void ConnectionManager::sendSingleFrameToPlayer('
+            End = 'UnsignedInt ConnectionManager::getNextPacketRouterSlot('
+            Required = @('frame >= currentFrame || currentFrame - frame > FRAMES_TO_KEEP')
+        },
+        @{
+            Start = 'void ConnectionManager::clearNetworkFrameRecovery('
+            End = 'void ConnectionManager::allowNetworkDisconnectFrameRecovery('
+            Required = @('m_disconnectFrameRecovery[slot] = {}',
+                'deleteInstance(m_networkRecoveryWrappers[slot])', 'm_networkRecoveryWrappers[slot] = nullptr')
+        }
+    )
+    foreach ($section in $recoverySections) {
+        $sectionStart = $Source.IndexOf($section.Start, [StringComparison]::Ordinal)
+        $sectionEnd = if ($sectionStart -ge 0) {
+            $Source.IndexOf($section.End, $sectionStart, [StringComparison]::Ordinal)
+        } else { -1 }
+        if ($sectionStart -lt 0 -or $sectionEnd -lt 0) {
+            $violations.Add("bounded frame recovery section is missing '$($section.Start)'")
+            continue
+        }
+        $sectionText = $Source.Substring($sectionStart, $sectionEnd - $sectionStart)
+        foreach ($required in $section.Required) {
+            if ($sectionText.IndexOf($required, [StringComparison]::Ordinal) -lt 0) {
+                $violations.Add("bounded frame recovery is missing '$required'")
+            }
+        }
+    }
+    $wrapperStart = $Source.IndexOf('Bool ConnectionManager::processNetworkFrameRecoveryWrapper(', [StringComparison]::Ordinal)
+    $wrapperEnd = if ($wrapperStart -ge 0) {
+        $Source.IndexOf('void ConnectionManager::rejectNetworkHello(', $wrapperStart, [StringComparison]::Ordinal)
+    } else { -1 }
+    if ($wrapperStart -lt 0 -or $wrapperEnd -lt 0) {
+        $violations.Add('bounded frame recovery wrapper path is missing')
+    } else {
+        $wrapper = $Source.Substring($wrapperStart, $wrapperEnd - $wrapperStart)
+        $previousIndex = -1
+        foreach ($required in @(
+                '!isNetworkFrameRecoveryAuthorized(ref->getCommand(), sourceSlot, TRUE)',
+                'IsNetworkRecoveryWrapperBounded(', 'm_networkRecoveryWrappers[sourceSlot]',
+                'wrappers->processWrapper(ref)', 'wrappers->getReadyCommands()',
+                '!isNetworkFrameRecoveryAuthorized(command->getCommand(), sourceSlot, FALSE)',
+                'command->setRelay(1U << m_localSlot)', 'processNetCommand(command)')) {
+            $requiredIndex = $wrapper.IndexOf($required, [StringComparison]::Ordinal)
+            if ($requiredIndex -le $previousIndex) {
+                $violations.Add("bounded frame recovery wrapper validation is missing or out of order '$required'")
+            }
+            $previousIndex = $requiredIndex
+        }
+        if ($wrapper.Contains('m_netCommandWrapperList')) {
+            $violations.Add('bounded frame recovery must not share ordinary wrapper staging')
         }
     }
 
@@ -763,6 +883,42 @@ Bool ConnectionManager::isNetworkCommandSourceAuthorized() {
     }
     return IsNetworkCommandSourceAuthorized(sourceSlot, claimedSlot, packetRouterSlot);
 }
+void ConnectionManager::clearNetworkFrameRecovery() {
+    m_disconnectFrameRecovery[slot] = {};
+    deleteInstance(m_networkRecoveryWrappers[slot]);
+    m_networkRecoveryWrappers[slot] = nullptr;
+}
+void ConnectionManager::allowNetworkDisconnectFrameRecovery() {
+    if (responder >= MAX_SLOTS || responder == m_localSlot ||
+        m_connections[responder]->isQuitting()) { return; }
+    if (slot != m_localSlot && m_frameData[slot] != nullptr) { originMask |= 1U << slot; }
+    TrySetNetworkDisconnectFrameRecovery(m_disconnectFrameRecovery[responder],
+        firstFrame, endFrame, originMask, TheGameLogic->getFrame(), FRAMES_TO_KEEP);
+}
+Bool ConnectionManager::isNetworkFrameRecoveryAuthorized() {
+    if (sourceSlot < 0 || sourceSlot >= MAX_SLOTS ||
+        m_connections[sourceSlot]->isQuitting()) { return FALSE; }
+    const Bool sync = IsCommandSynchronized(command->getNetCommandType());
+    if (IsNetworkFrameResendResponseAuthorized(sourceSlot, request)) { return TRUE; }
+    return IsNetworkDisconnectFrameRecoveryAuthorized(m_disconnectFrameRecovery[sourceSlot],
+        wrapper ? currentFrame : command->getExecutionFrame());
+}
+void ConnectionManager::ackNetworkFrameRecoveryCommand() {
+    NetAckBothCommandMsg *ack = newInstance(NetAckBothCommandMsg)(ref->getCommand());
+    ack->setPlayerID(m_localSlot);
+    m_connections[sourceSlot]->sendNetCommandMsg(ack, 1U << sourceSlot);
+    ack->detach();
+}
+Bool ConnectionManager::processNetworkFrameRecoveryWrapper() {
+    if (!isNetworkFrameRecoveryAuthorized(ref->getCommand(), sourceSlot, TRUE)) { return FALSE; }
+    if (!IsNetworkRecoveryWrapperBounded(bytes, chunks)) { return FALSE; }
+    NetCommandWrapperList *wrappers = m_networkRecoveryWrappers[sourceSlot];
+    if (!wrappers->processWrapper(ref)) { return FALSE; }
+    NetCommandList *ready = wrappers->getReadyCommands();
+    if (!isNetworkFrameRecoveryAuthorized(command->getCommand(), sourceSlot, FALSE)) { continue; }
+    command->setRelay(1U << m_localSlot);
+    processNetCommand(command);
+}
 void ConnectionManager::rejectNetworkHello() {}
 void ConnectionManager::dropInvalidNetworkHelloPacket() {
     DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("drop invalid NET3 packet"));
@@ -821,6 +977,42 @@ void ConnectionManager::sendLocalCommandImmediate(NetCommandMsg *msg, UnsignedBy
     }
 }
 void ConnectionManager::sendLocalCommandDirect() {}
+inline bool TrySetNetworkDisconnectFrameRecovery() {
+    if (firstFrame != currentFrame || endFrame <= firstFrame ||
+        endFrame - firstFrame > maxCachedFrames || originMask == 0U) { return false; }
+    return true;
+}
+inline bool IsNetworkDisconnectFrameRecoveryAuthorized() {
+    return isFrameDataCommand && claimedSlot < maxSlots &&
+        (recovery.originMask & (1U << claimedSlot)) != 0U &&
+        recovery.endFrame - recovery.firstFrame <= maxCachedFrames &&
+        currentFrame >= recovery.firstFrame && currentFrame < recovery.endFrame &&
+        responseFrame >= currentFrame && responseFrame < recovery.endFrame;
+}
+constexpr std::uint32_t kNetworkRecoveryMaxWrappedBytes = 8192U;
+void DisconnectManager::processDisconnectFrame() {
+    if (m_disconnectFramesReceived[localSlot]) {
+        conMgr->allowNetworkDisconnectFrameRecovery(peer,
+            m_disconnectFrames[localSlot], m_disconnectFrames[peer]);
+    }
+}
+void DisconnectManager::processDisconnectScreenOff() {
+    if (m_disconnectFramesReceived[localSlot]) {
+        conMgr->allowNetworkDisconnectFrameRecovery(playerID,
+            m_disconnectFrames[localSlot], newFrame);
+    }
+}
+void DisconnectManager::applyDisconnectVote() {}
+void ConnectionManager::processFrameResendRequest() {
+#if defined(_WIN64)
+    sendSingleFrameToPlayer(playerID, msg->getFrameToResend());
+#endif
+}
+void ConnectionManager::processWrapper() {}
+void ConnectionManager::sendSingleFrameToPlayer() {
+    if (frame >= currentFrame || currentFrame - frame > FRAMES_TO_KEEP) { return; }
+}
+UnsignedInt ConnectionManager::getNextPacketRouterSlot() {}
 void ConnectionManager::processTransportMessage() {
     const Int sourceSlot = findNetworkPeerEndpoint(message);
     const UnsignedInt now = static_cast<UnsignedInt>(timeGetTime());
@@ -833,15 +1025,23 @@ void ConnectionManager::processTransportMessage() {
     for (NetCommandRef* cmd = cmdList->getFirstMessage(); cmd; cmd = cmd->getNext()) {
         NetCommandMsg *command = cmd->getCommand();
         const Bool sourceAuthorized = isNetworkCommandSourceAuthorized(cmd->getCommand(), sourceSlot);
-        const Bool isFrameDataCommand = command->getNetCommandType() == NETCOMMANDTYPE_GAMECOMMAND ||
-            command->getNetCommandType() == NETCOMMANDTYPE_FRAMEINFO;
+        const Bool isFrameDataCommand = IsCommandSynchronized(command->getNetCommandType());
+        if (!sourceAuthorized && command->getNetCommandType() == NETCOMMANDTYPE_WRAPPER) {
+            processNetworkFrameRecoveryWrapper(cmd, sourceSlot);
+            continue;
+        }
         const Bool frameResendResponseAuthorized =
             IsNetworkFrameResendResponseAuthorized(sourceSlot,
                 m_frameResendRequestResponder, command->getPlayerID(),
                 m_frameResendRequestExpectedInfoMask, MAX_SLOTS,
                 m_frameResendRequestOutstanding, frameResendExpired,
                 isFrameDataCommand, command->getExecutionFrame(), m_frameResendRequestFrame);
-        if (!sourceAuthorized && !frameResendResponseAuthorized) { continue; }
+        const Bool frameRecoveryAuthorized = isNetworkFrameRecoveryAuthorized(command, sourceSlot, FALSE);
+        if (!sourceAuthorized && !frameResendResponseAuthorized && !frameRecoveryAuthorized) { continue; }
+        if (!sourceAuthorized) {
+            cmd->setRelay(1U << m_localSlot);
+            ackNetworkFrameRecoveryCommand(cmd, sourceSlot);
+        }
         if (frameResendResponseAuthorized) {
             frameResendResponseAccepted = TRUE;
             if (command->getNetCommandType() == NETCOMMANDTYPE_FRAMEINFO) {
@@ -1111,7 +1311,7 @@ void NAT::connectionUpdate() {
         throw 'unbound ordinary-gameplay fixture was not rejected'
     }
     $unboundedResend = $goodSource.Replace(
-        'if (!sourceAuthorized && !frameResendResponseAuthorized) { continue; }',
+        'if (!sourceAuthorized && !frameResendResponseAuthorized && !frameRecoveryAuthorized) { continue; }',
         'if (false) { continue; }')
     if (-not ((Get-TokenViolations $unboundedResend $goodCMake $goodNAT) -match 'strict source binding')) {
         throw 'unbounded frame-resend exception fixture was not rejected'
@@ -1150,6 +1350,26 @@ void NAT::connectionUpdate() {
         'true /* missing expected origin mask */')
     if (-not ((Get-TokenViolations $missingResendOriginMask $goodCMake $goodNAT) -match 'expected origin mask')) {
         throw 'missing resend origin-mask admission fixture was not rejected'
+    }
+    foreach ($mutation in @(
+            @('!isNetworkFrameRecoveryAuthorized(command->getCommand(), sourceSlot, FALSE)', 'false'),
+            @('m_networkRecoveryWrappers[sourceSlot]', 'm_netCommandWrapperList'),
+            @('endFrame - firstFrame > maxCachedFrames', 'false'),
+            @('responseFrame >= currentFrame && responseFrame < recovery.endFrame', 'true'),
+            @('conMgr->allowNetworkDisconnectFrameRecovery(playerID,', 'ignorePeerProgress(playerID,'),
+            @('sendSingleFrameToPlayer(playerID, msg->getFrameToResend())', 'sendFrameDataToPlayer(playerID, msg->getFrameToResend())'),
+            @('m_connections[sourceSlot]->sendNetCommandMsg(ack, 1U << sourceSlot)', 'sendAckToOriginalAuthor(ack)'))) {
+        $unboundedRecovery = $goodSource.Replace($mutation[0], $mutation[1])
+        if ($unboundedRecovery -ceq $goodSource -or
+            -not ((Get-TokenViolations $unboundedRecovery $goodCMake $goodNAT) -match 'bounded frame recovery')) {
+            throw "unsafe frame-recovery fixture was not rejected: $($mutation[0])"
+        }
+    }
+    $incompleteSyncRecovery = $goodSource.Replace(
+        'IsCommandSynchronized(command->getNetCommandType())',
+        'command->getNetCommandType() == NETCOMMANDTYPE_GAMECOMMAND')
+    if (-not ((Get-TokenViolations $incompleteSyncRecovery $goodCMake $goodNAT) -match 'bounded provenance')) {
+        throw 'recovery omitting synchronized runahead/leave/destroy commands was not rejected'
     }
     $missingNatProvenance = $goodNAT.Replace(
         'IsExpectedProbeSource(m_expectedProbeNodeNumber, fromNode,',
@@ -1191,7 +1411,8 @@ $root = (Resolve-Path -LiteralPath $SourceRoot).Path
 $source = [IO.File]::ReadAllText((Join-Path $root 'Core/GameEngine/Source/GameNetwork/ConnectionManager.cpp'))
 $runtimeCMake = [IO.File]::ReadAllText((Join-Path $root 'cmake/legacy-product-runtime.cmake'))
 $epochHeader = [IO.File]::ReadAllText((Join-Path $root 'Core/Libraries/Include/Lib/NetworkEpochHandshake.h'))
-$source = $source + "`n" + $epochHeader
+$source = $source + "`n" + $epochHeader + "`n" +
+    [IO.File]::ReadAllText((Join-Path $root 'Core/GameEngine/Source/GameNetwork/DisconnectManager.cpp'))
 $natHeader = [IO.File]::ReadAllText((Join-Path $root 'Core/GameEngine/Include/GameNetwork/NAT.h'))
 $natPolicy = [IO.File]::ReadAllText((Join-Path $root 'Core/Libraries/Include/Lib/NetworkNatPolicy.h'))
 $natSource = $natHeader + "`n" + $natPolicy + "`n" + $epochHeader + "`n" +

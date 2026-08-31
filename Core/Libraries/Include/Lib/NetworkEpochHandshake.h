@@ -88,7 +88,7 @@ inline bool IsNetworkCommandSourceAuthorized(std::uint32_t observedSlot,
 // A direct frame resend carries cached commands originally authored by more
 // than one player.  Permit that deliberate provenance exception only while a
 // local request is outstanding, only from its direct responder, only for the
-// requested frame, and only for the two synchronized frame-data wire types.
+// requested frame, and only for synchronized frame-data commands.
 // The expected-origin mask mirrors the responder's sendSingleFrameToPlayer
 // loop, which excludes the requester and may include the responder's own
 // cached origin.
@@ -126,6 +126,57 @@ inline bool IsNetworkFrameResendResponseComplete(
 	return expectedInfoMask == 0U ||
 		((receivedInfoMask & expectedInfoMask) == expectedInfoMask &&
 		(readyCommandMask & expectedInfoMask) == expectedInfoMask);
+}
+
+// Disconnect recovery uses the local blocked frame and a peer's accepted
+// progress announcement. Keep that proof after screen-off (UDP may reorder
+// data), but never authorize unproven frames or more than the retained cache.
+// Its lifetime ends on catch-up or connection/session reset, not a wall-clock
+// deadline: disconnect recovery must tolerate a temporarily unreachable peer.
+struct NetworkDisconnectFrameRecovery
+{
+	std::uint32_t firstFrame = 0U;
+	std::uint32_t endFrame = 0U;
+	std::uint32_t originMask = 0U;
+};
+
+inline bool TrySetNetworkDisconnectFrameRecovery(NetworkDisconnectFrameRecovery &recovery,
+	std::uint32_t firstFrame, std::uint32_t endFrame, std::uint32_t originMask,
+	std::uint32_t currentFrame, std::uint32_t maxCachedFrames)
+{
+	if (firstFrame != currentFrame || endFrame <= firstFrame ||
+		endFrame - firstFrame > maxCachedFrames || originMask == 0U)
+		return false;
+	recovery.firstFrame = firstFrame;
+	recovery.endFrame = endFrame;
+	recovery.originMask = originMask;
+	return true;
+}
+
+inline bool IsNetworkDisconnectFrameRecoveryAuthorized(
+	const NetworkDisconnectFrameRecovery &recovery,
+	std::uint32_t claimedSlot, std::uint32_t maxSlots,
+	std::uint32_t currentFrame,
+	std::uint32_t maxCachedFrames, bool isFrameDataCommand,
+	std::uint32_t responseFrame)
+{
+	return isFrameDataCommand && claimedSlot < maxSlots && claimedSlot < 32U &&
+		(recovery.originMask & (1U << claimedSlot)) != 0U &&
+		recovery.endFrame > recovery.firstFrame &&
+		recovery.endFrame - recovery.firstFrame <= maxCachedFrames &&
+		currentFrame >= recovery.firstFrame && currentFrame < recovery.endFrame &&
+		responseFrame >= currentFrame && responseFrame < recovery.endFrame;
+}
+
+// The largest canonical game command has at most 255 arguments, each at
+// most 16 bytes, plus descriptors and a small header (< 8 KiB). Recovery is
+// never a file-transfer permission. Fragment metadata has a separate bound.
+constexpr std::uint32_t kNetworkRecoveryMaxWrappedBytes = 8192U;
+constexpr std::uint32_t kNetworkRecoveryMaxWrappedChunks = 64U;
+inline bool IsNetworkRecoveryWrapperBounded(std::uint32_t bytes, std::uint32_t chunks)
+{
+	return bytes != 0U && bytes <= kNetworkRecoveryMaxWrappedBytes &&
+		chunks != 0U && chunks <= kNetworkRecoveryMaxWrappedChunks;
 }
 
 enum class NetworkIngressDisposition : std::uint32_t

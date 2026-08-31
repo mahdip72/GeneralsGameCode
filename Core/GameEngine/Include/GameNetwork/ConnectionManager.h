@@ -31,6 +31,7 @@
 
 #if defined(_WIN64)
 #include <cstdint>
+#include "Lib/NetworkEpochHandshake.h"
 #endif
 
 #include "GameNetwork/Connection.h"
@@ -140,6 +141,9 @@ public:
 	void sendFrameDataToPlayer(UnsignedInt playerID, UnsignedInt startingFrame);
 	void sendSingleFrameToPlayer(UnsignedInt playerID, UnsignedInt frame);
 	void notifyOthersOfNewFrame(UnsignedInt frame);
+#if defined(_WIN64)
+	void allowNetworkDisconnectFrameRecovery(UnsignedInt responder, UnsignedInt firstFrame, UnsignedInt endFrame);
+#endif
 
 	UnsignedInt getNextPacketRouterSlot(UnsignedInt playerID); ///< returns the packet router player that comes after the given player.
 
@@ -191,6 +195,10 @@ private:
 	Bool isKnownNetworkPeerEndpoint(const TransportMessage &message) const;
 	Bool isNetworkCommandSourceAuthorized(const NetCommandMsg *msg, Int sourceSlot) const;
 	void clearNetworkFrameResendRequest();
+	void clearNetworkFrameRecovery();
+	Bool isNetworkFrameRecoveryAuthorized(const NetCommandMsg *command, Int sourceSlot, Bool wrapper) const;
+	Bool processNetworkFrameRecoveryWrapper(NetCommandRef *ref, Int sourceSlot);
+	void ackNetworkFrameRecoveryCommand(NetCommandRef *ref, Int sourceSlot);
 	void deferNetworkMessage(const TransportMessage &message);
 	Bool queueNetworkHelloCommand(NetCommandMsg *msg, UnsignedByte relay);
 	void drainNetworkHelloPendingCommands();
@@ -264,6 +272,8 @@ private:
 	UnsignedInt m_frameResendRequestStartTime;
 	UnsignedInt m_frameResendRequestExpectedInfoMask;
 	UnsignedInt m_frameResendRequestReceivedInfoMask;
+	rts::network_epoch::NetworkDisconnectFrameRecovery m_disconnectFrameRecovery[MAX_SLOTS];
+	NetCommandWrapperList *m_networkRecoveryWrappers[MAX_SLOTS];
 	TransportMessage m_networkHelloDeferred[MAX_MESSAGES];
 	UnsignedInt m_networkHelloDeferredCount;
 	NetCommandList *m_networkHelloPendingCommands;

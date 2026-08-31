@@ -393,6 +393,15 @@ void DisconnectManager::processDisconnectFrame(NetCommandMsg *msg, ConnectionMan
 
 	m_disconnectFrames[playerID] = cmdMsg->getDisconnectFrame();
 	m_disconnectFramesReceived[playerID] = TRUE;
+#if defined(_WIN64)
+	// Either announcement may arrive first. Peer progress also survives a
+	// screen-off message, so reordered catch-up packets retain bounded proof.
+	const UnsignedInt localSlot = conMgr->getLocalPlayerID();
+	if (m_disconnectFramesReceived[localSlot])
+		for (UnsignedInt peer = 0; peer < MAX_SLOTS; ++peer)
+			conMgr->allowNetworkDisconnectFrameRecovery(peer,
+				m_disconnectFrames[localSlot], m_disconnectFrames[peer]);
+#endif
 	DEBUG_LOG(("DisconnectManager::processDisconnectFrame - Got a disconnect frame for player %d, frame = %d, local player is %d, local disconnect frame = %d, command id = %d", cmdMsg->getPlayerID(), cmdMsg->getDisconnectFrame(), conMgr->getLocalPlayerID(), m_disconnectFrames[conMgr->getLocalPlayerID()], cmdMsg->getID()));
 
 	if (playerID == conMgr->getLocalPlayerID()) {
@@ -431,6 +440,12 @@ void DisconnectManager::processDisconnectScreenOff(NetCommandMsg *msg, Connectio
 		DEBUG_LOG(("DisconnectManager::processDisconnectScreenOff - resetting the disconnect screen status for player %d", playerID));
 		m_disconnectFramesReceived[playerID] = FALSE;
 		m_disconnectFrames[playerID] = newFrame; // just in case we get packets out of order and the disconnect screen off message gets here before the disconnect frame message.
+#if defined(_WIN64)
+		const UnsignedInt localSlot = conMgr->getLocalPlayerID();
+		if (m_disconnectFramesReceived[localSlot])
+			conMgr->allowNetworkDisconnectFrameRecovery(playerID,
+				m_disconnectFrames[localSlot], newFrame);
+#endif
 
 		DEBUG_LOG(("DisconnectManager::processDisconnectScreenOff - about to call resetPlayersVotes for player %d", playerID));
 		resetPlayersVotes(playerID, cmdMsg->getNewFrame(), conMgr);
