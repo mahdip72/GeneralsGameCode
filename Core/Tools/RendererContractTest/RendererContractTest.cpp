@@ -5209,9 +5209,12 @@ int testD3D11LegacyBlendFactors()
 #endif
 }
 
+int TestLegacyResetResources();
+
 int main()
 {
 	int result = 0;
+	result |= TestLegacyResetResources();
 	result |= testBackendNames();
 	result |= testGenerationSafeHandles();
 	result |= testNeutralDescriptorDefaults();

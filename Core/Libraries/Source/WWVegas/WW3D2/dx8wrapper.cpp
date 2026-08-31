@@ -794,6 +794,7 @@ bool DX8Wrapper::Reset_Device(bool reload_assets, bool *reset_requires_reacquire
 			Set_Vertex_Buffer (nullptr,i);
 		}
 		Set_Index_Buffer (nullptr, 0);
+		Release_DX8_Buffer_Bindings();
 		if (m_pCleanupHook) {
 			m_pCleanupHook->ReleaseResources();
 		}
@@ -847,6 +848,26 @@ bool DX8Wrapper::Reset_Device(bool reload_assets, bool *reset_requires_reacquire
 	return false;
 }
 
+void DX8Wrapper::Release_DX8_Buffer_Bindings()
+{
+	DX8_Assert();
+	const HRESULT vertex_result = _Get_D3D_Device8()->SetStreamSource(0, nullptr, 0);
+	Increment_DX8_CallCount();
+	const HRESULT index_result = _Get_D3D_Device8()->SetIndices(nullptr, 0);
+	Increment_DX8_CallCount();
+	// These are owned references, independent of the device bindings. A lost
+	// device may reject unbinding, but DEFAULT-pool buffers must not survive Reset.
+	Track_DX8_Vertex_Buffer(nullptr, 0, 0);
+	if (RawIndexBuffer != nullptr)
+	{
+		RawIndexBuffer->Release();
+		RawIndexBuffer = nullptr;
+	}
+	RawIndexBaseVertex = 0;
+	if (FAILED(vertex_result)) Non_Fatal_Log_DX8_ErrorCode(vertex_result, __FILE__, __LINE__);
+	if (FAILED(index_result)) Non_Fatal_Log_DX8_ErrorCode(index_result, __FILE__, __LINE__);
+}
+
 void DX8Wrapper::Release_Device()
 {
 	if (D3DDevice) {
@@ -856,15 +877,7 @@ void DX8Wrapper::Release_Device()
 			DX8CALL(SetTexture(a,nullptr));
 		}
 
-		DX8CALL(SetStreamSource(0, nullptr, 0));	//release reference count on last rendered vertex buffer
-		DX8CALL(SetIndices(nullptr,0));	//release reference count on last rendered index buffer
-		Track_DX8_Vertex_Buffer(nullptr, 0, 0);
-		if (RawIndexBuffer != nullptr)
-		{
-			RawIndexBuffer->Release();
-			RawIndexBuffer = nullptr;
-		}
-		RawIndexBaseVertex = 0;
+		Release_DX8_Buffer_Bindings();
 
 
 		/*

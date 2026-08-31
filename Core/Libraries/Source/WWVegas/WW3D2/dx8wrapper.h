@@ -680,6 +680,7 @@ public:
 protected:
 
 	static bool	Create_Device();
+	static void Release_DX8_Buffer_Bindings();
 	static void Release_Device();
 
 	static void Reset_Statistics();
