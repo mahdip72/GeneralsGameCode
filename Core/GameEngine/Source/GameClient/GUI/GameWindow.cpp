@@ -645,9 +645,9 @@ Int GameWindow::winSetSize( Int width, Int height )
 	m_region.hi.y = m_region.lo.y + height;
 
 	TheWindowManager->winSendSystemMsg( this,
-																			GGM_RESIZED,
-																			(WindowMsgData)width,
-																			(WindowMsgData)height );
+															GGM_RESIZED,
+															WindowMsgDataFromInt(width),
+															WindowMsgDataFromInt(height) );
 
 	return WIN_ERR_OK;
 

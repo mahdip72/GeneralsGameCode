@@ -892,25 +892,37 @@ void TextureClass::Apply_New_Surface
 		return;
 	}
 
-	Set_D3D_Base_Texture(d3d_texture);
-
-	if (initialized) Initialized=true;
-	if (disable_auto_invalidation) InactivationTime = 0;
-
-	WWASSERT(d3d_texture);
-	IDirect3DSurface8* surface;
-	DX8_ErrorCode(Peek_D3D_Texture()->GetSurfaceLevel(0,&surface));
+	// Validate before publishing: even the missing texture can be unavailable
+	// after a failed device reset. Preserve the previous texture on failure.
+	IDirect3DSurface8* surface = nullptr;
+	HRESULT result = static_cast<IDirect3DTexture8*>(d3d_texture)->GetSurfaceLevel(0, &surface);
+	if (FAILED(result) || surface == nullptr)
+	{
+		if (surface != nullptr) surface->Release();
+		WWDEBUG_SAY(("Unable to publish texture surface: GetSurfaceLevel returned 0x%08x",
+			static_cast<unsigned>(result)));
+		return;
+	}
 	D3DSURFACE_DESC d3d_desc;
 	::ZeroMemory(&d3d_desc, sizeof(D3DSURFACE_DESC));
-	DX8_ErrorCode(surface->GetDesc(&d3d_desc));
+	result = surface->GetDesc(&d3d_desc);
+	surface->Release();
+	if (FAILED(result))
+	{
+		WWDEBUG_SAY(("Unable to publish texture surface: GetDesc returned 0x%08x",
+			static_cast<unsigned>(result)));
+		return;
+	}
+
+	Set_D3D_Base_Texture(d3d_texture);
+	if (initialized) Initialized=true;
+	if (disable_auto_invalidation) InactivationTime = 0;
 	if (initialized)
 	{
 		TextureFormat=D3DFormat_To_WW3DFormat(d3d_desc.Format);
 		Width=d3d_desc.Width;
 		Height=d3d_desc.Height;
 	}
-	surface->Release();
-
 }
 
 

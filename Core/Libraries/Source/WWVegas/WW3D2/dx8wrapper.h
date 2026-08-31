@@ -102,6 +102,10 @@ class SurfaceClass;
 // changes without depending on which modern renderer mirrors the resource.
 void Notify_Render_Texture_Changed(IDirect3DBaseTexture8 *texture);
 void Notify_Render_Texture_Changed(TextureClass *texture);
+// Publishes one complete opaque BGRA8 level while its legacy surface remains
+// locked. False tells the caller to retain the normal dirty notification.
+bool Publish_Render_Texture_BGRA8_Change(IDirect3DBaseTexture8 *texture,
+	const void *data, size_t row_pitch, size_t slice_pitch);
 void Notify_Render_Buffer_Changed(IUnknown *buffer);
 void Notify_Render_Buffer_Range_Changed(IUnknown *buffer,
 	unsigned int binding, size_t destination_offset, size_t byte_count,
@@ -492,6 +496,9 @@ public:
 		unsigned int binding, const void *data, size_t byte_count,
 		size_t destination_offset, rts::render::RenderBufferUpdateMode mode,
 		unsigned int source_generation = 0);
+	static bool Publish_D3D11_Texture_BGRA8_Change(
+		IDirect3DBaseTexture8 *texture, const void *data, size_t row_pitch,
+		size_t slice_pitch);
 	static void Notify_D3D11_Texture_Changed(IDirect3DBaseTexture8 *texture);
 	static void Notify_D3D11_Texture_Changed(TextureClass *texture);
 	static void Request_D3D11_Back_Buffer_Capture();
@@ -673,6 +680,7 @@ public:
 protected:
 
 	static bool	Create_Device();
+	static void Release_DX8_Buffer_Bindings();
 	static void Release_Device();
 
 	static void Reset_Statistics();
@@ -1020,9 +1028,10 @@ WWINLINE void DX8Wrapper::Set_Fog(bool enable, const Vector3 &color, float start
 WWINLINE void DX8Wrapper::Set_Ambient(const Vector3& color)
 {
 	Ambient_Color=color;
-	Set_DX8_Render_State(D3DRS_AMBIENT, DX8Wrapper::Convert_Color(color,0.0f));
+	const D3DCOLOR packed_color = DX8Wrapper::Convert_Color(color,0.0f);
+	Set_DX8_Render_State(D3DRS_AMBIENT, packed_color);
 	rts::render::TrackLegacyGlobalAmbient(
-		rts::render::RenderFloat4(color.X, color.Y, color.Z, 1.0f));
+		rts::render::DecodeLegacyD3D8Ambient(packed_color));
 }
 
 // ----------------------------------------------------------------------------
@@ -1428,10 +1437,10 @@ WWINLINE void DX8Wrapper::Set_Material(const VertexMaterialClass* material)
 
 WWINLINE void DX8Wrapper::Set_Shader(const ShaderClass& shader)
 {
-	rts::render::TrackLegacyShaderBits(shader.Get_Bits());
 	if (!ShaderClass::ShaderDirty && ((unsigned&)shader==(unsigned&)render_state.shader)) {
 		return;
 	}
+	rts::render::TrackLegacyShaderBits(shader.Get_Bits());
 	render_state.shader=shader;
 	render_state_changed|=SHADER_CHANGED;
 #ifdef MESH_RENDER_SNAPSHOT_ENABLED

@@ -972,18 +972,19 @@ void W3DDisplay::init()
 		DX8WebBrowser::Initialize();
 	}
 
-	// Keep radar preparation synchronous and owner-bound.  A failed start leaves
-	// W3DRadar's serial path as the compatibility fallback.
-	ASSERT_GAME_THREAD("W3DDisplay::init radar preparation");
-	RadarTerrainPrepareService &radarPrepareService =
-		GetRadarTerrainPrepareService();
-	radarPrepareService.initialize(
-		rts::JobSystem::instance().workerCount(), 64);
-	/* Headless replay never renders terrain.  Defer worker creation until the
-	 * first owner-side preparation so replay teardown does not retain an idle
-	 * thread pool that the renderer never used. */
+	// Headless replay never renders terrain.  Do not instantiate renderer or
+	// scheduler services that the headless lifetime cannot consume.
 	if (!TheGlobalData->m_headless)
+	{
+		// Keep radar preparation synchronous and owner-bound.  A failed start
+		// leaves W3DRadar's serial path as the compatibility fallback.
+		ASSERT_GAME_THREAD("W3DDisplay::init radar preparation");
+		RadarTerrainPrepareService &radarPrepareService =
+			GetRadarTerrainPrepareService();
+		radarPrepareService.initialize(
+			rts::JobSystem::instance().workerCount(), 64);
 		radarPrepareService.warmup();
+	}
 
 	// we're now online
 	m_initialized = true;

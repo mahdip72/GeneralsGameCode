@@ -146,7 +146,7 @@ size_t SmallNetPacketCommandBase::readMessage(NetCommandRef *&ref, CommandBase &
 		}
 		case NetPacketFieldTypes::Repeat:
 		default:
-			DEBUG_CRASH(("SmallNetPacketCommandBase::readBytes: Unexpected field type '%c' encountered.", buf[size]));
+			DEBUG_LOG(("SmallNetPacketCommandBase::readBytes: Rejecting unexpected field type '%c'.", buf[size]));
 			return size + 1;
 		}
 	}
@@ -243,7 +243,7 @@ NetCommandMsg *SmallNetPacketCommandBase::constructNetCommandMsg(const CommandBa
 		msg = newInstance(NetFrameResendRequestCommandMsg);
 		break;
 	default:
-		DEBUG_CRASH(("SmallNetPacketCommandBase::constructNetCommandMsg: Unexpected command type '%d' encountered.", commandType));
+		DEBUG_LOG(("SmallNetPacketCommandBase::constructNetCommandMsg: Rejecting unexpected command type '%d'.", commandType));
 		return nullptr;
 	}
 

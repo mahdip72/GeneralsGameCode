@@ -219,8 +219,8 @@ static void testInvalidLayouts()
 		"zero height is rejected");
 	expectTrue(!CalculateTextureMipLayout(WW3D_FORMAT_A8R8G8B8, 4, 4, 0, layout),
 		"zero depth is rejected");
-	expectTrue(!CalculateTextureMipLayout(WW3D_FORMAT_A8R8G8B8, UINT_MAX, 2, 1, layout),
-		"row pitch overflow is rejected");
+	expectTrue(!CalculateTextureMipLayout(WW3D_FORMAT_A8R8G8B8, UINT_MAX, UINT_MAX, 1, layout),
+		"uncompressed layout size overflow is rejected");
 	expectTrue(!CalculateTextureMipLayout(WW3D_FORMAT_DXT5, UINT_MAX, UINT_MAX, UINT_MAX, layout),
 		"compressed dimension overflow is rejected");
 }

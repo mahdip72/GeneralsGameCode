@@ -146,9 +146,9 @@ const FieldParse ThingTemplate::s_objectFieldParseTable[] =
 	{ "FactoryExitWidth",			INI::parseReal,												nullptr,		offsetof( ThingTemplate, m_factoryExitWidth ) },
 	{ "FactoryExtraBibWidth",	INI::parseReal,												nullptr,		offsetof( ThingTemplate, m_factoryExtraBibWidth ) },
 
-	{ "SkillPointValue",			ThingTemplate::parseIntList,					(void*)LEVEL_COUNT,		offsetof( ThingTemplate, m_skillPointValues ) },
-	{ "ExperienceValue",			ThingTemplate::parseIntList,					(void*)LEVEL_COUNT,		offsetof( ThingTemplate, m_experienceValues ) },
-	{ "ExperienceRequired",		ThingTemplate::parseIntList,					(void*)LEVEL_COUNT,		offsetof( ThingTemplate, m_experienceRequired ) },
+	{ "SkillPointValue",			ThingTemplate::parseIntList,					reinterpret_cast<const void *>(static_cast<uintptr_t>(LEVEL_COUNT)),		offsetof( ThingTemplate, m_skillPointValues ) },
+	{ "ExperienceValue",			ThingTemplate::parseIntList,					reinterpret_cast<const void *>(static_cast<uintptr_t>(LEVEL_COUNT)),		offsetof( ThingTemplate, m_experienceValues ) },
+	{ "ExperienceRequired",		ThingTemplate::parseIntList,					reinterpret_cast<const void *>(static_cast<uintptr_t>(LEVEL_COUNT)),		offsetof( ThingTemplate, m_experienceRequired ) },
 	{ "IsTrainable",					INI::parseBool,												nullptr,									offsetof( ThingTemplate, m_isTrainable ) },
 	{ "EnterGuard",						INI::parseBool,												nullptr,									offsetof( ThingTemplate, m_enterGuard ) },
 	{ "HijackGuard",					INI::parseBool,												nullptr,									offsetof( ThingTemplate, m_hijackGuard ) },
@@ -173,10 +173,10 @@ const FieldParse ThingTemplate::s_objectFieldParseTable[] =
 	{ "BuildVariations",			INI::parseAsciiStringVector,				nullptr,		offsetof( ThingTemplate, m_buildVariations ) },
 
 // NOTE NOTE NOTE -- s_objectFieldParseTable and s_objectReskinFieldParseTable must be updated in tandem -- see comment above
-	{ "Behavior",							ThingTemplate::parseModuleName,		(const void*)MODULETYPE_BEHAVIOR, offsetof(ThingTemplate, m_behaviorModuleInfo) },
-	{ "Body",									ThingTemplate::parseModuleName,		(const void*)999, offsetof(ThingTemplate, m_behaviorModuleInfo) },
-	{ "Draw",									ThingTemplate::parseModuleName,		(const void*)MODULETYPE_DRAW, offsetof(ThingTemplate, m_drawModuleInfo) },
-	{ "ClientUpdate",					ThingTemplate::parseModuleName,		(const void*)MODULETYPE_CLIENT_UPDATE, offsetof(ThingTemplate, m_clientUpdateModuleInfo) },
+	{ "Behavior",							ThingTemplate::parseModuleName,		reinterpret_cast<const void *>(static_cast<uintptr_t>(MODULETYPE_BEHAVIOR)), offsetof(ThingTemplate, m_behaviorModuleInfo) },
+	{ "Body",									ThingTemplate::parseModuleName,		reinterpret_cast<const void *>(static_cast<uintptr_t>(999)), offsetof(ThingTemplate, m_behaviorModuleInfo) },
+	{ "Draw",									ThingTemplate::parseModuleName,		reinterpret_cast<const void *>(static_cast<uintptr_t>(MODULETYPE_DRAW)), offsetof(ThingTemplate, m_drawModuleInfo) },
+	{ "ClientUpdate",					ThingTemplate::parseModuleName,		reinterpret_cast<const void *>(static_cast<uintptr_t>(MODULETYPE_CLIENT_UPDATE)), offsetof(ThingTemplate, m_clientUpdateModuleInfo) },
 // NOTE NOTE NOTE -- s_objectFieldParseTable and s_objectReskinFieldParseTable must be updated in tandem -- see comment above
 
 	{ "SelectPortrait",					INI::parseAsciiString,	nullptr,		offsetof( ThingTemplate, m_selectedPortraitImageName ) },
@@ -274,7 +274,7 @@ const FieldParse ThingTemplate::s_objectFieldParseTable[] =
 // NOTE NOTE NOTE -- s_objectFieldParseTable and s_objectReskinFieldParseTable must be updated in tandem -- see comment above
 const FieldParse ThingTemplate::s_objectReskinFieldParseTable[] =
 {
-	{ "Draw",									ThingTemplate::parseModuleName,		(const void*)MODULETYPE_DRAW, offsetof(ThingTemplate, m_drawModuleInfo) },
+	{ "Draw",									ThingTemplate::parseModuleName,		reinterpret_cast<const void *>(static_cast<uintptr_t>(MODULETYPE_DRAW)), offsetof(ThingTemplate, m_drawModuleInfo) },
 
 	{ "Geometry",							GeometryInfo::parseGeometryType,				nullptr,  offsetof( ThingTemplate, m_geometryInfo ) },
 	{ "GeometryMajorRadius",	GeometryInfo::parseGeometryMajorRadius,	nullptr,		offsetof( ThingTemplate, m_geometryInfo ) },
@@ -527,7 +527,7 @@ void ThingTemplate::parseModuleName(INI* ini, void *instance, void* store, const
 {
 	ThingTemplate* self = (ThingTemplate*)instance;
 	ModuleInfo* mi = (ModuleInfo*)store;
-	ModuleType type = (ModuleType)(UnsignedInt)userData;
+	ModuleType type = static_cast<ModuleType>(reinterpret_cast<uintptr_t>(userData));
 	const char* token = ini->getNextToken();
 	AsciiString tokenStr = token;
 
@@ -634,7 +634,7 @@ void ThingTemplate::parseModuleName(INI* ini, void *instance, void* store, const
 //-------------------------------------------------------------------------------------------------
 void ThingTemplate::parseIntList(INI* ini, void *instance, void* store, const void* userData)
 {
-	Int numberEntries = (Int)userData;
+	Int numberEntries = static_cast<Int>(reinterpret_cast<uintptr_t>(userData));
 	Int *intList = (Int*)store;
 
 	for( Int intIndex = 0; intIndex < numberEntries; intIndex ++ )

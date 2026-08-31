@@ -189,7 +189,19 @@ unsigned long VertexMaterialClass::Compute_CRC() const
 	int i;
 	for (i=0; i<MeshBuilderClass::MAX_STAGES; i++)
 	{
+	#if defined(_WIN64)
+		// The legacy branch below deliberately preserves the retail pointer hash.
+		// Native x64 material identity is independent of pointer width, allocation
+		// order, and ASLR: stage, presence, type, and mapper configuration are
+		// serialized as fixed-width fields instead.
+		const uint32 stage = static_cast<uint32>(i);
+		const uint32 present = Mapper[i] ? 1u : 0u;
+		crc = CRC_Memory(reinterpret_cast<const unsigned char *>(&stage), sizeof(stage), crc);
+		crc = CRC_Memory(reinterpret_cast<const unsigned char *>(&present), sizeof(present), crc);
+		if (Mapper[i]) crc = Mapper[i]->Compute_Canonical_CRC(crc);
+	#else
 		if (Mapper[i]) crc = CRC_Memory(reinterpret_cast<const unsigned char *>(&(Mapper[i])),sizeof(TextureMapperClass*),crc);
+	#endif
 	}
 
 	return crc;

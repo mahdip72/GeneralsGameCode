@@ -4051,7 +4051,7 @@ void PartitionManager::doShroudReveal(Real centerX, Real centerY, Real radius, P
 		const Player *currentPlayer = ThePlayerList->getNthPlayer( currentIndex );
 		if( BitIsSet( playerMask, currentPlayer->getPlayerMask() ) )
 		{
-			circle.drawCircle(hLineAddLooker, (void*)currentIndex);
+			circle.drawCircle(hLineAddLooker, reinterpret_cast<void *>(static_cast<intptr_t>(currentIndex)));
 		}
 	}
 }
@@ -4116,7 +4116,7 @@ void PartitionManager::undoShroudReveal(Real centerX, Real centerY, Real radius,
 		const Player *currentPlayer = ThePlayerList->getNthPlayer( currentIndex );
 		if( BitIsSet( playerMask, currentPlayer->getPlayerMask() ) )
 		{
-			circle.drawCircle(hLineRemoveLooker, (void*)currentIndex);
+			circle.drawCircle(hLineRemoveLooker, reinterpret_cast<void *>(static_cast<intptr_t>(currentIndex)));
 		}
 	}
 }
@@ -4155,7 +4155,7 @@ void PartitionManager::doShroudCover(Real centerX, Real centerY, Real radius, Pl
 		const Player *currentPlayer = ThePlayerList->getNthPlayer( currentIndex );
 		if( BitIsSet( playerMask, currentPlayer->getPlayerMask() ) )
 		{
-			circle.drawCircle(hLineAddShrouder, (void*)currentIndex);
+			circle.drawCircle(hLineAddShrouder, reinterpret_cast<void *>(static_cast<intptr_t>(currentIndex)));
 		}
 	}
 }
@@ -4177,7 +4177,7 @@ void PartitionManager::undoShroudCover(Real centerX, Real centerY, Real radius, 
 		const Player *currentPlayer = ThePlayerList->getNthPlayer( currentIndex );
 		if( BitIsSet( playerMask, currentPlayer->getPlayerMask() ) )
 		{
-			circle.drawCircle(hLineRemoveShrouder, (void*)currentIndex);
+			circle.drawCircle(hLineRemoveShrouder, reinterpret_cast<void *>(static_cast<intptr_t>(currentIndex)));
 		}
 	}
 }
@@ -5636,7 +5636,7 @@ void hLineAddLooker(Int x1, Int x2, Int y, void *playerIndexVoid)
 	if (y < 0 || y >= ThePartitionManager->m_cellCountY || x1 >= ThePartitionManager->m_cellCountX || x2 < 0)
 		return;
 
-	Int playerIndex = (Int)(playerIndexVoid);
+	Int playerIndex = static_cast<Int>(reinterpret_cast<intptr_t>(playerIndexVoid));
 
 	PartitionCell* cell = &ThePartitionManager->m_cells[y * ThePartitionManager->m_cellCountX + x1];	// yes, this could be invalid. we'll skip the bad ones.
 	for (Int x = x1; x <= x2; ++x, ++cell)
@@ -5653,7 +5653,7 @@ void hLineRemoveLooker(Int x1, Int x2, Int y, void *playerIndexVoid)
 	if (y < 0 || y >= ThePartitionManager->m_cellCountY || x1 >= ThePartitionManager->m_cellCountX || x2 < 0)
 		return;
 
-	Int playerIndex = (Int)(playerIndexVoid);
+	Int playerIndex = static_cast<Int>(reinterpret_cast<intptr_t>(playerIndexVoid));
 
 	PartitionCell* cell = &ThePartitionManager->m_cells[y * ThePartitionManager->m_cellCountX + x1];	// yes, this could be invalid. we'll skip the bad ones.
 	for (Int x = x1; x <= x2; ++x, ++cell)
@@ -5670,7 +5670,7 @@ void hLineAddShrouder(Int x1, Int x2, Int y, void *playerIndexVoid)
 	if (y < 0 || y >= ThePartitionManager->m_cellCountY || x1 >= ThePartitionManager->m_cellCountX || x2 < 0)
 		return;
 
-	Int playerIndex = (Int)(playerIndexVoid);
+	Int playerIndex = static_cast<Int>(reinterpret_cast<intptr_t>(playerIndexVoid));
 
 	PartitionCell* cell = &ThePartitionManager->m_cells[y * ThePartitionManager->m_cellCountX + x1];	// yes, this could be invalid. we'll skip the bad ones.
 	for (Int x = x1; x <= x2; ++x, ++cell)
@@ -5687,7 +5687,7 @@ void hLineRemoveShrouder(Int x1, Int x2, Int y, void *playerIndexVoid)
 	if (y < 0 || y >= ThePartitionManager->m_cellCountY || x1 >= ThePartitionManager->m_cellCountX || x2 < 0)
 		return;
 
-	Int playerIndex = (Int)(playerIndexVoid);
+	Int playerIndex = static_cast<Int>(reinterpret_cast<intptr_t>(playerIndexVoid));
 
 	PartitionCell* cell = &ThePartitionManager->m_cells[y * ThePartitionManager->m_cellCountX + x1];	// yes, this could be invalid. we'll skip the bad ones.
 	for (Int x = x1; x <= x2; ++x, ++cell)

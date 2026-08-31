@@ -16,6 +16,7 @@ set(WWSAVELOAD_SRC
     persist.h
     persistfactory.cpp
     persistfactory.h
+    pointertoken.h
     pointerremap.cpp
     pointerremap.h
     postloadable.h

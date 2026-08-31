@@ -282,6 +282,30 @@ int testDepthAwareRenderTargetIdentity()
 }
 
 #if __cplusplus >= 201703L
+int testLegacyBridgeDrawTexturePins()
+{
+	rts::render::LegacyBridgeDrawTexturePins<2> pins;
+	int source_a = 0;
+	int source_b = 0;
+	int source_c = 0;
+	CHECK("first stage is protected during later stage cache insertion",
+		pins.Pin(&source_a) && pins.Contains(&source_a));
+	CHECK("same-frame eviction may still reclaim unrelated textures",
+		!pins.Contains(&source_b) && !pins.Contains(&source_c));
+	CHECK("duplicate and null stages do not consume pin capacity",
+		pins.Pin(&source_a) && pins.Pin(0) && pins.Pin(&source_b));
+	CHECK("all stages remain protected at the fixed pin capacity",
+		pins.Contains(&source_a) && pins.Contains(&source_b) &&
+		!pins.Pin(&source_c) && pins.Contains(&source_a));
+	pins.Clear();
+	CHECK("completed or failed draw releases all temporary pins",
+		!pins.Contains(&source_a) && !pins.Contains(&source_b));
+	CHECK("next draw does not retain previous draw sources",
+		pins.Pin(&source_c) && pins.Contains(&source_c) &&
+		!pins.Contains(&source_a));
+	return 0;
+}
+
 int testLegacyBridgeCacheIndexAndUploadPolicy()
 {
 	rts::render::LegacyBridgePointerIndex index;
@@ -350,6 +374,8 @@ int main()
 	if (testDepthAwareRenderTargetIdentity() != 0)
 		return 1;
 	#if __cplusplus >= 201703L
+	if (testLegacyBridgeDrawTexturePins() != 0)
+		return 1;
 	if (testLegacyBridgeCacheIndexAndUploadPolicy() != 0)
 		return 1;
 	#endif

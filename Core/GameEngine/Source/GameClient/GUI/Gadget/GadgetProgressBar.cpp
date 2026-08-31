@@ -85,12 +85,12 @@ WindowMsgHandledType GadgetProgressBarSystem( GameWindow *window, UnsignedInt ms
 		// ------------------------------------------------------------------------
     case GPM_SET_PROGRESS:
     {
-      Int newPos = (Int)mData1;
+      Int newPos = WindowMsgDataToInt(mData1);
 
       if (newPos < 0 || newPos > 100)
         break;
 
-      window->winSetUserData( (void *)newPos );
+      window->winSetUserData( GadgetItemDataFromInt(newPos) );
 
 			break;
 

@@ -38,6 +38,9 @@
 #include "Common/PlayerList.h"
 #include "GameNetwork/NetworkInterface.h"
 #include "GameNetwork/NetCommandValidation.h"
+#if defined(_WIN64)
+#include "Lib/NetworkEpochHandshake.h"
+#endif
 #include "GameNetwork/udp.h"
 #include "GameNetwork/Transport.h"
 #include "WWLib/strtok_r.h"
@@ -168,6 +171,8 @@ public:
 	virtual void setSawCRCMismatch() override;
 	virtual Bool sawCRCMismatch() override { return m_sawCRCMismatch; }
 	virtual Bool isPlayerConnected( Int playerID ) override;
+	virtual Bool isNetworkHelloReady() override;
+	virtual Bool hasNetworkHelloFailure() override;
 
 	virtual void notifyOthersOfCurrentFrame() override;														///< Tells all the other players what frame we are on.
 	virtual void notifyOthersOfNewFrame(UnsignedInt frame) override;								///< Tells all the other players that we are on a new frame.
@@ -191,6 +196,7 @@ protected:
 	void processDestroyPlayerCommand(NetDestroyPlayerCommandMsg *msg);	///< Do what needs to be done when we need to destroy a player.
 	void endOfGameCheck();																				///< Checks to see if its ok to leave this game.  If it is, send the apropriate command to the game logic.
 	Bool timeForNewFrame();
+	void handleNetworkHelloFailure();
 
 	ConnectionManager *m_conMgr;																	///< The connection manager object
 
@@ -216,6 +222,7 @@ protected:
 	std::vector<UnsignedInt> m_CRC[MAX_SLOTS];
 	std::list<Int> m_playersToDisconnect;
 	GameWindow *m_messageWindow;
+	Bool m_networkHelloFailureHandled;
 
 #if defined(RTS_DEBUG)
 	Bool m_networkOn;
@@ -242,6 +249,16 @@ Bool Network::isPlayerConnected( Int playerID ) {
 		return m_localStatus == NETLOCALSTATUS_INGAME || m_localStatus == NETLOCALSTATUS_LEAVING;
 	}
 	return m_conMgr->isPlayerConnected(playerID);
+}
+
+Bool Network::isNetworkHelloReady()
+{
+	return m_conMgr == nullptr || m_conMgr->isNetworkHelloReady();
+}
+
+Bool Network::hasNetworkHelloFailure()
+{
+	return m_conMgr != nullptr && m_conMgr->hasNetworkHelloFailure();
 }
 
 
@@ -273,6 +290,7 @@ Network::Network()
 	m_sawCRCMismatch = FALSE;
 	m_conMgr = nullptr;
 	m_messageWindow = nullptr;
+	m_networkHelloFailureHandled = FALSE;
 
 #if defined(RTS_DEBUG)
 	m_networkOn = TRUE;
@@ -342,6 +360,7 @@ void Network::init()
 	m_nextFrameTime = 0;
 	m_sawCRCMismatch = FALSE;
 	m_checkCRCsThisFrame = FALSE;
+	m_networkHelloFailureHandled = FALSE;
 
 	DEBUG_LOG(("Network timing values:"));
 	DEBUG_LOG(("NetworkFPSHistoryLength: %d", TheGlobalData->m_networkFPSHistoryLength));
@@ -556,6 +575,17 @@ Bool Network::AllCommandsReady(UnsignedInt frame) {
 		return TRUE;
 	}
 
+#if defined(_WIN64)
+	// The first synchronized frame must not be consumed until every remote
+	// endpoint has validated the fixed-width NET3 epoch/build/content record.
+	// POSTGAME/LEFT teardown retains the existing completion behavior.
+	if (m_localStatus != NETLOCALSTATUS_POSTGAME &&
+		m_localStatus != NETLOCALSTATUS_LEFT &&
+		!m_conMgr->isNetworkHelloReady()) {
+		return FALSE;
+	}
+#endif
+
 	if (m_localStatus == NETLOCALSTATUS_PREGAME) {
 		return TRUE;
 	}
@@ -719,6 +749,15 @@ void Network::update()
 
 	liteupdate();
 
+#if defined(_WIN64)
+	if (!rts::network_epoch::IsNetworkFramePublicationAllowed(
+		m_networkHelloFailureHandled,
+		m_conMgr != nullptr && m_conMgr->hasNetworkHelloFailure()))
+	{
+		return;
+	}
+#endif
+
 	if (m_localStatus == NETLOCALSTATUS_LEFT) {// || (m_localStatus == NETLOCALSTATUS_LEAVING)) {
 		endOfGameCheck();
 	}
@@ -752,7 +791,33 @@ void Network::liteupdate() {
 		} else {
 			m_conMgr->update(TRUE);
 		}
+		#if defined(_WIN64)
+		if (rts::network_epoch::ShouldHandleNetworkHelloFailure(
+				m_networkHelloFailureHandled, m_conMgr->hasNetworkHelloFailure())) {
+			handleNetworkHelloFailure();
+		}
+		#else
+		if (m_localStatus == NETLOCALSTATUS_PREGAME && m_conMgr->hasNetworkHelloFailure()) {
+			handleNetworkHelloFailure();
+		}
+		#endif
 	}
+}
+
+void Network::handleNetworkHelloFailure()
+{
+#if defined(_WIN64)
+	if (m_networkHelloFailureHandled)
+		return;
+
+	m_networkHelloFailureHandled = TRUE;
+	DEBUG_LOG(("Network::handleNetworkHelloFailure - NET3 compatibility exchange failed; leaving network game"));
+	if (m_conMgr != nullptr)
+		m_conMgr->quitGame();
+	if (TheGameLogic != nullptr)
+		TheGameLogic->exitGame();
+	m_localStatus = NETLOCALSTATUS_POSTGAME;
+#endif
 }
 
 void Network::endOfGameCheck() {

@@ -27,6 +27,12 @@
 #include "Common/MessageStream.h"
 #include "GameNetwork/GameInfo.h"
 
+#if defined(_WIN64)
+#include "Lib/ReplayCommandContract.h"
+#include <array>
+#include <cstdint>
+#endif
+
 class File;
 
 /**
@@ -105,6 +111,7 @@ public:
 	UnsignedInt getPlaybackFrameCount() const { return m_playbackFrameCount; }			///< valid during playback only
 	void stopPlayback();															///< Stops playback.  Its fine to call this even if not playing back a file.
 	Bool simulateReplay(AsciiString filename);
+	Bool hasReplayReadError() const { return m_replayReadError; }
 #if defined(RTS_DEBUG)
 	Bool analyzeReplay( AsciiString filename );
 #endif
@@ -168,8 +175,10 @@ protected:
 	void logGameStart(AsciiString options);
 	void logGameEnd();
 
-	AsciiString readAsciiString();										///< Read the next string from m_file using ascii characters.
-	UnicodeString readUnicodeString();								///< Read the next string from m_file using unicode characters.
+	Bool readExact(void *data, Int dataSize);						///< Read one complete fixed-width replay field.
+	Bool readAsciiString(AsciiString &value);					///< Read a bounded, terminated ASCII replay field.
+	Bool readUnicodeString(UnicodeString &value);			///< Read a bounded, terminated Unicode replay field.
+	Bool failReplayHeaderRead();								///< Close a rejected replay and clear transient native state.
 	void readNextFrame();															///< Read the next frame number to execute a command on.
 	void appendNextCommand();													///< Read the next GameMessage and append it to TheCommandList.
 	void writeArgument(GameMessageArgumentDataType type, const GameMessageArgumentType arg);
@@ -177,8 +186,9 @@ protected:
 
 	struct CullBadCommandsResult
 	{
-		CullBadCommandsResult() : hasClearGameDataMessage(false) {}
+		CullBadCommandsResult() : hasClearGameDataMessage(false), hasNewGameMessage(false) {}
 		Bool hasClearGameDataMessage;
+		Bool hasNewGameMessage;
 	};
 
 	CullBadCommandsResult cullBadCommands(); ///< prevent the user from giving mouse commands that he shouldn't be able to do during playback.
@@ -200,6 +210,24 @@ protected:
 	Int m_originalGameMode; // valid in replays
 
 	UnsignedInt m_nextFrame;												///< The Frame that the next message is to be executed on.  This can be -1.
+	Bool m_replayReadError;
+	Bool m_replayWriteError;
+
+#if defined(_WIN64)
+	void failNativeReplayRead(rts::replay_command::ReplayCommandError error, Int offset);
+	Bool appendNativeReplayCommand();
+	Bool readNativeReplayArgument(rts::replay_command::ReplayArgumentType type,
+		const rts::replay_command::Byte *payload,
+		std::size_t payloadSize,
+		std::size_t &payloadOffset,
+		GameMessage *message);
+
+	Bool m_nativeReplayContainer;
+	Int m_nativeReplayPayloadEnd;
+	std::array<rts::replay_command::Byte, rts::replay_command::kMaxReplayCommandBytes> m_nativeReplayRecord;
+	std::size_t m_nativeReplayRecordBytes;
+	rts::replay_command::ParseResult m_nativeReplayParsed;
+#endif
 };
 
 extern RecorderClass *TheRecorder;

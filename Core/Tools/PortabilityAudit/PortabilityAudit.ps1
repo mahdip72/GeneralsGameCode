@@ -31,7 +31,9 @@ $rawD3D8BoundaryPaths = @(
     'Core/Tools/SurfaceBlitTest/SurfaceBlitTest.cpp',
     'Core/Tools/TextureMipGeneratorTest/TextureMipGeneratorTest.cpp',
     'Core/Tools/LegacyTextureCreationTest/LegacyTextureCreationTest.cpp',
-    'Core/Tools/RendererContractTest/RendererContractTest.cpp'
+    'Core/Tools/RendererContractTest/RendererContractTest.cpp',
+    'Core/Tools/RendererContractTest/LegacyResetResourceTest.cpp',
+    'Core/Tools/NativeD3D8CompatibilityTest/NativeD3D8CompatibilityTest.cpp'
 )
 
 # These are the only product-runtime files allowed to mention the legacy
@@ -377,6 +379,21 @@ $rules = @(
         RejectAddedLine = $true
     },
     [pscustomobject]@{
+        Name = 'window-message-implicit-narrowing'
+        # WindowMsgData is pointer-sized on x64.  Scalar payloads must pass
+        # through an explicit width-preserving helper before being assigned to
+        # the legacy 8/16/32-bit gameplay types.
+        Pattern = '(?<![A-Za-z0-9_])(?:UnsignedByte|Byte|char|WideChar|Int|int|UnsignedInt|unsigned|Bool|Color|UnsignedShort|short|long|float|double|NameKeyType)\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*mData[123]\b'
+        RejectAddedLine = $true
+    },
+    [pscustomobject]@{
+        Name = 'window-message-raw-pointer-cast'
+        # A C-style cast hides the ABI boundary and makes accidental pointer
+        # truncation easy to reintroduce.  Use WindowMsgDataToPointer instead.
+        Pattern = '\(\s*(?:const\s+)?[A-Za-z_][A-Za-z0-9_:<>]*\s*\*+\s*\)\s*mData[123]\b'
+        RejectAddedLine = $true
+    },
+    [pscustomobject]@{
         Name = $rawD3D8RuleName
         # The wrapper is the temporary migration facade; calling it is not a
         # raw D3D8 dependency. Ratchet only legacy API types/constants that
@@ -390,11 +407,42 @@ $rules = @(
     }
 )
 
+$stackDumpAddressContracts = @(
+    [pscustomobject]@{
+        Path = 'Generals/Code/GameEngine/Include/Common/StackDump.h'
+        ExpectedCount = 2
+    },
+    [pscustomobject]@{
+        Path = 'GeneralsMD/Code/GameEngine/Include/Common/StackDump.h'
+        ExpectedCount = 2
+    },
+    [pscustomobject]@{
+        Path = 'Generals/Code/GameEngine/Source/Common/System/StackDump.cpp'
+        ExpectedCount = 2
+    },
+    [pscustomobject]@{
+        Path = 'GeneralsMD/Code/GameEngine/Source/Common/System/StackDump.cpp'
+        ExpectedCount = 2
+    }
+)
+$stackDumpAddressPattern = '(?m)^\s*(?:__inline\s+)?void\s+GetFunctionDetails\([^\r\n]*\b(?:std::)?uintptr_t\s*\*\s*address\s*\)'
+
 Test-BaselineAncestry $sourceRootPath $Baseline
 $files = Get-SourceFiles $sourceRootPath
 $untrackedFiles = Get-UntrackedSourceFiles $sourceRootPath
 
 $violations = @()
+foreach ($contract in $stackDumpAddressContracts) {
+    $path = Join-Path $sourceRootPath ($contract.Path -replace '/', '\')
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        continue
+    }
+    $count = Get-RegexMatchCount ([IO.File]::ReadAllText($path)) $stackDumpAddressPattern
+    if ($count -ne $contract.ExpectedCount) {
+        $violations += ('{0}: stackdump-address-width expected={1} current={2}' -f
+            $contract.Path, $contract.ExpectedCount, $count)
+    }
+}
 $rawD3D8Rule = $rules | Where-Object { $_.Name -eq $rawD3D8RuleName }
 $baselineRawCounts = Get-BaselineRegexMatchCounts $sourceRootPath $Baseline $rawD3D8Rule.Pattern
 $currentRawTotal = 0
@@ -471,7 +519,38 @@ foreach ($line in $diff) {
             $allowedPath = $rule.PSObject.Properties['AllowedPath']
             $isAllowed = $null -ne $allowedPath -and
                 $currentFile -match $allowedPath.Value
+            # A 32-bit compatibility branch must still name the legacy
+            # CONTEXT Eip member.  Allow only this explicitly annotated,
+            # pointer-width conversion in the two crash-path adapters; all
+            # assembly and every other context-register addition remain
+            # fail-closed.
+            $isApprovedX86Context = $rule.Name -eq 'x86-inline-assembly-or-context' -and
+                $currentFile -in @(
+                    'Core/Libraries/Source/debug/debug_except.cpp',
+                    'Core/Libraries/Source/WWVegas/WWLib/Except.cpp',
+                    'Generals/Code/GameEngine/Source/Common/System/StackDump.cpp',
+                    'GeneralsMD/Code/GameEngine/Source/Common/System/StackDump.cpp'
+                ) -and
+                ($content -match '^\s*return static_cast<uintptr_t>\((ctx|context)\.Eip\);\s*// portability-audit: x86-context\s*$' -or
+                 $content -match '^\s*MakeStackTrace\(eip,esp,ebp, 0, callback\);\s*// portability-audit: x86-context\s*$' -or
+                 $content -match '^\s*const (?:std::)?uintptr_t instructionPointer = static_cast<(?:std::)?uintptr_t>\(context->Eip\);\s*// portability-audit: x86-context\s*$')
+            # VC6 has no intrinsic/header for obtaining the caller return
+            # address. Permit only the explicitly annotated instruction in
+            # the legacy compatibility branch; every other added assembly
+            # line, including an unannotated line in this file, still fails.
+            $isApprovedVC6CallerAddress =
+                $rule.Name -eq 'x86-inline-assembly-or-context' -and
+                $currentFile -eq 'Core/Libraries/Source/debug/debug_debug.cpp' -and
+                ($content -match '^\s*_asm\s*// portability-audit: vc6-caller-address\s*$' -or
+                 $content -match '^\s*mov eax,\[ebp\+4\]\s*// portability-audit: vc6-caller-address\s*$')
+            $isApprovedWindowMessageBoundary =
+                $rule.Name -eq 'pointer-bearing-window-message' -and
+                $currentFile -eq 'Core/GameEngine/Include/GameClient/GameWindow.h' -and
+                $content -match '^\s*inline\s+WindowMsgData\s+WindowMsgDataFromPointer\(const\s+void\s*\*\s*value\)\s*$'
             if ($rule.RejectAddedLine -and -not $isAllowed -and
+                -not $isApprovedX86Context -and
+                -not $isApprovedVC6CallerAddress -and
+                -not $isApprovedWindowMessageBoundary -and
                 $content -match $rule.Pattern) {
                 $violations += "${currentFile}:${lineNumber}: $($rule.Name)"
             }

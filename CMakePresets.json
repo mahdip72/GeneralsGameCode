@@ -124,6 +124,63 @@
             }
         },
         {
+            "name": "x64",
+            "inherits": "default",
+            "hidden": false,
+            "displayName": "Windows x64 Release Product",
+            "architecture": {
+                "value": "x64",
+                "strategy": "external"
+            },
+            "cacheVariables": {
+                "RTS_FLAGS": "/W3",
+                "RTS_BUILD_CORE_TOOLS": "OFF",
+                "RTS_BUILD_CORE_EXTRAS": "ON",
+                "RTS_BUILD_PRODUCT": "ON",
+                "RTS_BUILD_GENERALS": "ON",
+                "RTS_BUILD_ZEROHOUR": "ON",
+                "RTS_BUILD_GENERALS_TOOLS": "OFF",
+                "RTS_BUILD_ZEROHOUR_TOOLS": "OFF",
+                "RTS_BUILD_GENERALS_EXTRAS": "ON",
+                "RTS_BUILD_ZEROHOUR_EXTRAS": "ON",
+                "RTS_BUILD_OPTION_FFMPEG": "ON"
+            }
+        },
+        {
+            "name": "x64-vcpkg",
+            "inherits": ["x64", "default-vcpkg"],
+            "hidden": false,
+            "displayName": "Windows x64 VCPKG Release Product"
+        },
+        {
+            "name": "x64-debug",
+            "inherits": "x64",
+            "hidden": false,
+            "displayName": "Windows x64 Debug Product",
+            "cacheVariables": {
+                "RTS_BUILD_OPTION_DEBUG": "ON"
+            }
+        },
+        {
+            "name": "x64-profile",
+            "inherits": "x64",
+            "hidden": false,
+            "displayName": "Windows x64 Profile Product",
+            "cacheVariables": {
+                "RTS_BUILD_OPTION_PROFILE": "ON",
+                "RTS_BUILD_OPTION_PROFILE_TRACY": "ON"
+            }
+        },
+        {
+            "name": "x64-asan",
+            "inherits": "x64-debug",
+            "hidden": false,
+            "displayName": "Windows x64 Address Sanitizer Product",
+            "cacheVariables": {
+                "RTS_BUILD_OPTION_ASAN": "ON"
+            }
+        },
+        {
             "name": "win32-vcpkg",
             "inherits": "default-vcpkg",
             "hidden": false,
@@ -161,7 +218,14 @@
             "name": "unix",
             "inherits": "default-vcpkg",
             "hidden": false,
-            "displayName": "Unix 32bit VCPKG Release"
+            "displayName": "Unix Device-Free VCPKG Release",
+            "cacheVariables": {
+                "RTS_BUILD_PRODUCT": "OFF",
+                "RTS_BUILD_CORE_TOOLS": "OFF",
+                "RTS_BUILD_CORE_EXTRAS": "OFF",
+                "RTS_BUILD_GENERALS": "OFF",
+                "RTS_BUILD_ZEROHOUR": "OFF"
+            }
         },
         {
             "name": "mingw-w64-i686",
@@ -269,6 +333,41 @@
             "configuration": "Debug"
         },
         {
+            "name": "x64",
+            "configurePreset": "x64",
+            "displayName": "Build Windows x64 Release Product",
+            "description": "Build Windows x64 Release Product",
+            "configuration": "Release"
+        },
+        {
+            "name": "x64-vcpkg",
+            "configurePreset": "x64-vcpkg",
+            "displayName": "Build Windows x64 VCPKG Release Product",
+            "description": "Build Windows x64 VCPKG Release Product",
+            "configuration": "Release"
+        },
+        {
+            "name": "x64-debug",
+            "configurePreset": "x64-debug",
+            "displayName": "Build Windows x64 Debug Product",
+            "description": "Build Windows x64 Debug Product",
+            "configuration": "Debug"
+        },
+        {
+            "name": "x64-profile",
+            "configurePreset": "x64-profile",
+            "displayName": "Build Windows x64 Profile Product",
+            "description": "Build Windows x64 Profile Product",
+            "configuration": "Release"
+        },
+        {
+            "name": "x64-asan",
+            "configurePreset": "x64-asan",
+            "displayName": "Build Windows x64 Address Sanitizer Product",
+            "description": "Build Windows x64 Address Sanitizer Product",
+            "configuration": "Debug"
+        },
+        {
             "name": "unix",
             "configurePreset": "unix",
             "displayName": "Build Unix 32bit VCPKG Release",
@@ -292,6 +391,68 @@
             "configurePreset": "mingw-w64-i686-profile",
             "displayName": "Build MinGW-w64 32-bit (i686) Profile",
             "description": "Build MinGW-w64 32-bit (i686) Profile"
+        }
+    ],
+    "testPresets": [
+        {
+            "name": "x64",
+            "configurePreset": "x64",
+            "displayName": "Test Windows x64 Release Product",
+            "configuration": "Release",
+            "output": {
+                "outputOnFailure": true
+            },
+            "execution": {
+                "noTestsAction": "error"
+            }
+        },
+        {
+            "name": "x64-vcpkg",
+            "configurePreset": "x64-vcpkg",
+            "displayName": "Test Windows x64 VCPKG Release Product",
+            "configuration": "Release",
+            "output": {
+                "outputOnFailure": true
+            },
+            "execution": {
+                "noTestsAction": "error"
+            }
+        },
+        {
+            "name": "x64-debug",
+            "configurePreset": "x64-debug",
+            "displayName": "Test Windows x64 Debug Product",
+            "configuration": "Debug",
+            "output": {
+                "outputOnFailure": true
+            },
+            "execution": {
+                "noTestsAction": "error"
+            }
+        },
+        {
+            "name": "x64-profile",
+            "configurePreset": "x64-profile",
+            "displayName": "Test Windows x64 Profile Product",
+            "configuration": "Release",
+            "output": {
+                "outputOnFailure": true
+            },
+            "execution": {
+                "noTestsAction": "error"
+            }
+        },
+        {
+            "name": "x64-asan",
+            "configurePreset": "x64-asan",
+            "displayName": "Test Windows x64 Address Sanitizer Product",
+            "configuration": "Debug",
+            "output": {
+                "outputOnFailure": true
+            },
+            "execution": {
+                "noTestsAction": "error"
+            }
         }
     ],
     "workflowPresets": [
@@ -396,6 +557,91 @@
                 {
                     "type": "build",
                     "name": "win32-debug"
+                }
+            ]
+        },
+        {
+            "name": "x64",
+            "steps": [
+                {
+                    "type": "configure",
+                    "name": "x64"
+                },
+                {
+                    "type": "build",
+                    "name": "x64"
+                },
+                {
+                    "type": "test",
+                    "name": "x64"
+                }
+            ]
+        },
+        {
+            "name": "x64-vcpkg",
+            "steps": [
+                {
+                    "type": "configure",
+                    "name": "x64-vcpkg"
+                },
+                {
+                    "type": "build",
+                    "name": "x64-vcpkg"
+                },
+                {
+                    "type": "test",
+                    "name": "x64-vcpkg"
+                }
+            ]
+        },
+        {
+            "name": "x64-debug",
+            "steps": [
+                {
+                    "type": "configure",
+                    "name": "x64-debug"
+                },
+                {
+                    "type": "build",
+                    "name": "x64-debug"
+                },
+                {
+                    "type": "test",
+                    "name": "x64-debug"
+                }
+            ]
+        },
+        {
+            "name": "x64-profile",
+            "steps": [
+                {
+                    "type": "configure",
+                    "name": "x64-profile"
+                },
+                {
+                    "type": "build",
+                    "name": "x64-profile"
+                },
+                {
+                    "type": "test",
+                    "name": "x64-profile"
+                }
+            ]
+        },
+        {
+            "name": "x64-asan",
+            "steps": [
+                {
+                    "type": "configure",
+                    "name": "x64-asan"
+                },
+                {
+                    "type": "build",
+                    "name": "x64-asan"
+                },
+                {
+                    "type": "test",
+                    "name": "x64-asan"
                 }
             ]
         },

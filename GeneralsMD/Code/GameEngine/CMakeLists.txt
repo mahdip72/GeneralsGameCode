@@ -1165,6 +1165,10 @@ target_link_libraries(z_gameengine PRIVATE
     zi_always
 )
 
+if(NOT IS_VS6_BUILD)
+    target_link_libraries(z_gameengine PRIVATE core_replay_command_contract)
+endif()
+
 target_link_libraries(z_gameengine PUBLIC
     corei_gameengine_public
     z_wwvegas

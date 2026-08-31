@@ -624,7 +624,16 @@ SamplerState LegacySampler7 : register(s7);
 
 bool HasTextureCoordinate(uint index)
 {
-	return index < 8U && (VertexLayoutParameters.w & (1U << index)) != 0U;
+	// The legacy tree vertex program synthesizes TEXCOORD1 from world position
+	// and c32/c33.  Its physical XYZNDUV1 layout contains only TEXCOORD0, so
+	// consulting only the input-layout mask incorrectly replaces the generated
+	// shroud coordinate with (0, 0) and multiplies otherwise valid foliage by
+	// the shroud border color.
+	const bool generatedTreeShroudCoordinate =
+		ProgramParameters.x == 1U && index == 1U;
+	return index < 8U &&
+		((VertexLayoutParameters.w & (1U << index)) != 0U ||
+			generatedTreeShroudCoordinate);
 }
 
 float4 GetTextureCoordinate(TexturedVertexOutput input, uint index)

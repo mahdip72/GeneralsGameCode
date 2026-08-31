@@ -9,6 +9,7 @@ namespace render
 {
 class NativeW3DRenderer;
 class NativeW3DResources;
+class NativeW3DRecoveryTestAccess;
 // This is the shared lifetime authority for the native facade and resource
 // tables.  It deliberately owns no game object and exposes no backend COM
 // pointer.  Producers may queue an opaque cleanup token only while the render
@@ -37,6 +38,7 @@ public:
 private:
 	friend class NativeW3DRenderer;
 	friend class NativeW3DResources;
+	friend class NativeW3DRecoveryTestAccess;
 
 	explicit NativeW3DRenderState(unsigned int cleanupCapacity);
 	~NativeW3DRenderState();

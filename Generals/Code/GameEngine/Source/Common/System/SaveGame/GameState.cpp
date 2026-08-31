@@ -564,6 +564,11 @@ SaveResult GameState::saveGame( AsciiString filename, UnicodeString desc,
 
 	// open the save file
 	XferSave xferSave;
+#ifdef _WIN64
+	xferSave.setRuntimeEpochIdentity(
+		static_cast<std::uint32_t>( TheGlobalData->m_exeCRC ),
+		static_cast<std::uint32_t>( TheGlobalData->m_iniCRC ));
+#endif
 	try {
 		xferSave.open( filepath );
 	} catch(...) {
@@ -591,6 +596,10 @@ SaveResult GameState::saveGame( AsciiString filename, UnicodeString desc,
 
 		// save file
 		xferSaveData( &xferSave, which );
+
+#ifdef _WIN64
+		xferSave.finalizeRuntimeEpoch();
+#endif
 
 	}
 	catch( ... )
@@ -641,6 +650,24 @@ SaveCode GameState::loadGame( AvailableGameInfo gameInfo )
 	if( doesSaveGameExist( gameInfo.filename ) == FALSE )
 		return SC_FILE_NOT_FOUND;
 
+	// Open and validate the native x64 container before changing any live game
+	// state.  The payload remains the legacy Xfer stream behind this boundary.
+	AsciiString filepath = getFilePathInSaveDirectory(gameInfo.filename);
+	XferLoad xferLoad;
+#ifdef _WIN64
+	xferLoad.setRuntimeEpochIdentity(
+		static_cast<std::uint32_t>( TheGlobalData->m_exeCRC ),
+		static_cast<std::uint32_t>( TheGlobalData->m_iniCRC ));
+#endif
+	try
+	{
+		xferLoad.open( filepath );
+	}
+	catch( ... )
+	{
+		return SC_INVALID_DATA;
+	}
+
 	// clear game data just like loading from the debug map load screen for mission saves
 	if( gameInfo.saveGameInfo.saveFileType == SAVE_FILE_TYPE_MISSION )
 	{
@@ -655,13 +682,6 @@ SaveCode GameState::loadGame( AvailableGameInfo gameInfo )
 	// from any previously loaded save game files
 	//
 	TheGameStateMap->clearScratchPadMaps();
-
-	// construct path to file
-	AsciiString filepath = getFilePathInSaveDirectory(gameInfo.filename);
-
-	// open the save file
-	XferLoad xferLoad;
-	xferLoad.open( filepath );
 
 	// clear out the game engine
 	TheGameEngine->reset();
@@ -964,6 +984,11 @@ Bool GameState::doesSaveGameExist( AsciiString filename )
 
 	// open file
 	XferLoad xfer;
+#ifdef _WIN64
+	xfer.setRuntimeEpochIdentity(
+		static_cast<std::uint32_t>( TheGlobalData->m_exeCRC ),
+		static_cast<std::uint32_t>( TheGlobalData->m_iniCRC ));
+#endif
 	try
 	{
 
@@ -1007,6 +1032,11 @@ void GameState::getSaveGameInfoFromFile( AsciiString filename, SaveGameInfo *sav
 
 	// open file for partial loading
 	XferLoad xferLoad;
+#ifdef _WIN64
+	xferLoad.setRuntimeEpochIdentity(
+		static_cast<std::uint32_t>( TheGlobalData->m_exeCRC ),
+		static_cast<std::uint32_t>( TheGlobalData->m_iniCRC ));
+#endif
 	xferLoad.open( filename );
 
 	//

@@ -35,6 +35,7 @@
 #include <time.h>
 #include <direct.h>
 #include <errno.h>
+#include "Common/RegistryView.h"
 #include <WWLib/WWCommon.h>
 //#include "wlib/wstring.h"
 
@@ -126,7 +127,7 @@ static bool Use_Non_Blocking_Mode()
 
 
 	// Try and open the named key
-	regRetval=RegOpenKeyEx(HKEY_LOCAL_MACHINE,"SOFTWARE\\Westwood\\Earth And Beyond Beta 2",0,KEY_READ,&regKey);
+	regRetval=OpenRetailRegistryKey(HKEY_LOCAL_MACHINE,"SOFTWARE\\Westwood\\Earth And Beyond Beta 2",0,KEY_READ,&regKey);
 	if (regRetval!=ERROR_SUCCESS)
 		return(TRUE);		// default TRUE
 

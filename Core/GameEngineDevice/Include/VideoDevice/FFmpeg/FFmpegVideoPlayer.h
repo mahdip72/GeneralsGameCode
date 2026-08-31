@@ -39,8 +39,15 @@
 //----------------------------------------------------------------------------
 
 class FFmpegFile;
+class FFmpegMoviePlayback;
+class AudioPcmSink;
 struct AVFrame;
 struct SwsContext;
+struct FFmpegFrameMetadata;
+
+#if defined(_WIN64)
+class XAudio2AudioService;
+#endif
 
 //----------------------------------------------------------------------------
 //           Type Defines
@@ -60,25 +67,31 @@ class FFmpegVideoStream : public VideoStream
 		AVFrame 		*m_frame = nullptr;		///< Current frame
 		SwsContext 		*m_swsContext = nullptr;///< SWSContext for scaling
 		FFmpegFile		*m_ffmpegFile;			///< The AVUI abstraction											///< Bink streaming handle;
+		FFmpegMoviePlayback *m_playback = nullptr;
+		AudioPcmSink		*m_audioSink = nullptr;
 		Char			*m_memFile;				///< Pointer to memory resident file
 		UnsignedInt64	m_startTime = 0;		///< Time the stream started
-		UnsignedByte *	m_audioBuffer = nullptr;///< Audio buffer for the stream
 
-		FFmpegVideoStream(FFmpegFile* file);																///< only BinkVideoPlayer can create these
 		virtual ~FFmpegVideoStream();
+		FFmpegVideoStream(FFmpegFile* file, AudioPcmSink *audioSink, double initialGain);
 
-		static void onFrame(AVFrame *frame, int stream_idx, int stream_type, void *user_data);
+		static void onFrame(const AVFrame *frame, const FFmpegFrameMetadata &metadata, void *user_data);
+		void syncSpeechGain();
+		void markPlaybackFailed();
 	public:
 
 		virtual void update();											///< Update bink stream
 
 		virtual Bool	isFrameReady();								///< Is the frame ready to be displayed
+		virtual Bool	isFinished() const;
+		virtual Bool	isPlaybackFailed() const;
 		virtual void	frameDecompress();						///< Render current frame in to buffer
 		virtual void	frameRender( VideoBuffer *buffer ); ///< Render current frame in to buffer
 		virtual void	frameNext();									///< Advance to next frame
+		virtual Bool	finishPlayback();
 		virtual Int		frameIndex();									///< Returns zero based index of current frame
 		virtual Int		frameCount();									///< Returns the total number of frames in the stream
-		virtual void	frameGoto( Int index );							///< Go to the spcified frame index
+		virtual Bool	frameGoto( Int index );							///< Go to the specified frame index
 		virtual Int		height();											///< Return the height of the video
 		virtual Int		width();											///< Return the width of the video
 
@@ -121,7 +134,15 @@ class FFmpegVideoPlayer : public VideoPlayer
 		virtual VideoStreamInterface*	load( AsciiString movieTitle );	///< Load video file in to memory for playback
 
 		virtual void notifyVideoPlayerOfNewProvider( Bool nowHasValid );
-		virtual void initializeBinkWithMiles();
+
+#if defined(_WIN64)
+		XAudio2AudioService *audioService() const noexcept { return m_audioService; }
+#endif
+
+	private:
+#if defined(_WIN64)
+		XAudio2AudioService *m_audioService = nullptr;
+#endif
 };
 
 

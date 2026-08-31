@@ -270,7 +270,7 @@ WindowMsgHandledType InGameChatInput( GameWindow *window, UnsignedInt msg,
 		// --------------------------------------------------------------------------------------------
 		case GWM_CHAR:
 		{
-			UnsignedByte key = mData1;
+			UnsignedByte key = static_cast<UnsignedByte>(WindowMsgDataToUnsignedInt(mData1));
 //			UnsignedByte state = mData2;
 
 			switch( key )
@@ -317,7 +317,7 @@ WindowMsgHandledType InGameChatSystem( GameWindow *window, UnsignedInt msg,
 		{
 			// if we're givin the opportunity to take the keyboard focus we must say we want it
 			if( mData1 == TRUE )
-				*(Bool *)mData2 = TRUE;
+				*static_cast<Bool *>(WindowMsgDataToPointer(mData2)) = TRUE;
 
 			return MSG_HANDLED;
 		}
@@ -335,7 +335,7 @@ WindowMsgHandledType InGameChatSystem( GameWindow *window, UnsignedInt msg,
 		//---------------------------------------------------------------------------------------------
 		case GBM_SELECTED:
 		{
-			GameWindow *control = (GameWindow *)mData1;
+			GameWindow *control = static_cast<GameWindow *>(WindowMsgDataToPointer(mData1));
 			static NameKeyType buttonClearID = TheNameKeyGenerator->nameToKey( "InGameChat.wnd:ButtonClear" );
 			if (control && control->winGetWindowId() == buttonClearID)
 			{

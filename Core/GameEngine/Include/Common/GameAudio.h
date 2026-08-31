@@ -51,11 +51,13 @@
 
 class AsciiString;
 class AudioEventRTS;
+class DynamicAudioEventRTS;
 class DebugDisplayInterface;
 class Drawable;
 class MusicManager;
 class Object;
 class SoundManager;
+template <class T> class RefCountPtr;
 
 
 enum AudioAffect CPP_11(: Int);
@@ -65,6 +67,12 @@ struct AudioEventInfo;
 struct AudioRequest;
 struct AudioSettings;
 struct MiscAudio;
+struct Coord3D;
+
+// World-aware shroud admission is implemented by the game audio layer.  The
+// device-free native manager uses this narrow seam without importing the full
+// PartitionManager/renderer ABI.
+Bool isAudioEventShroudedForLocalPlayer(const Coord3D *position);
 
 typedef std::hash_map<AsciiString, AudioEventInfo*, rts::hash<AsciiString>, rts::equal_to<AsciiString>/**/> AudioEventInfoHash;
 typedef AudioEventInfoHash::iterator AudioEventInfoHashIt;
@@ -127,6 +135,14 @@ enum
 	-jkmcd
 	-December 2002
 */
+
+class LegacyVideoAudioInterface
+{
+	public:
+		virtual ~LegacyVideoAudioInterface() {}
+		virtual void *getLegacyVideoDirectSoundHandle() = 0;
+		virtual void releaseLegacyVideoAudioHandle() = 0;
+};
 
 class AudioManager : public SubsystemInterface
 {
@@ -198,6 +214,7 @@ class AudioManager : public SubsystemInterface
 		virtual void openDevice() = 0;
 		virtual void closeDevice() = 0;
 		virtual void *getDevice() = 0;
+		virtual LegacyVideoAudioInterface *getLegacyVideoAudioInterface() { return nullptr; }
 
 		// Device Dependent notification functions
 		virtual void notifyOfAudioCompletion( UnsignedInt audioCompleted, UnsignedInt flags ) = 0;
@@ -245,9 +262,6 @@ class AudioManager : public SubsystemInterface
 		virtual void set3DVolumeAdjustment( Real volumeAdjustment );
 
     virtual Bool has3DSensitiveStreamsPlaying() const = 0;
-
- 		virtual void *getHandleForBink() = 0;
- 		virtual void releaseHandleForBink() = 0;
 
 		// this function will play an audio event rts by loading it into memory. It should not be used
 		// by anything except for the load screens.
@@ -312,6 +326,13 @@ class AudioManager : public SubsystemInterface
 
 		// Should this piece of audio play on the local machine?
 		virtual Bool shouldPlayLocally(const AudioEventRTS *audioEvent);
+
+		// Prepare an event for a backend-owned request without handing it to the
+		// legacy SoundManager/MusicManager.  Native backends use this helper so
+		// admission, event metadata ownership, filename selection, volume
+		// overrides, and local filtering remain identical to the base contract.
+		Bool prepareAudioEventForPlayback(const AudioEventRTS *eventToAdd,
+			RefCountPtr<DynamicAudioEventRTS> &preparedEvent, Bool forced = FALSE);
 
 		// Set the Listening position for the device
 		virtual void setDeviceListenerPosition() = 0;

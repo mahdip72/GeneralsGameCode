@@ -9,8 +9,6 @@ on:
     branches:
       - main
   pull_request:
-    branches:
-      - main
   workflow_dispatch:
 
 concurrency:
@@ -44,6 +42,9 @@ jobs:
               - '.github/workflows/**'
               - 'CMakeLists.txt'
               - 'CMakePresets.json'
+              - 'vcpkg.json'
+              - 'vcpkg-lock.json'
+              - 'triplets/**'
               - 'cmake/**'
               - 'Core/**'
               - 'Dependencies/**'
@@ -96,6 +97,18 @@ jobs:
       preset: ${{ matrix.preset }}
       tools: ${{ matrix.tools }}
       extras: ${{ matrix.extras }}
+    secrets: inherit
+
+  build-generals-x64:
+    name: Build Generals x64
+    needs: detect-changes
+    if: ${{ github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.generals == 'true' || needs.detect-changes.outputs.generalsmd == 'true' || needs.detect-changes.outputs.shared == 'true' }}
+    uses: ./.github/workflows/build-toolchain.yml
+    with:
+      game: "Generals"
+      preset: "x64-vcpkg"
+      tools: false
+      extras: true
     secrets: inherit
 
   # Note build-generalsmd is split into two jobs for vc6 and win32 because replaycheck-generalsmd
@@ -160,6 +173,18 @@ jobs:
       preset: ${{ matrix.preset }}
       tools: ${{ matrix.tools }}
       extras: ${{ matrix.extras }}
+    secrets: inherit
+
+  build-generalsmd-x64:
+    name: Build GeneralsMD x64
+    needs: [detect-changes, build-generals-x64]
+    if: ${{ github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.generalsmd == 'true' || needs.detect-changes.outputs.shared == 'true' }}
+    uses: ./.github/workflows/build-toolchain.yml
+    with:
+      game: "GeneralsMD"
+      preset: "x64-vcpkg"
+      tools: false
+      extras: true
     secrets: inherit
 
   replaycheck-generalsmd:

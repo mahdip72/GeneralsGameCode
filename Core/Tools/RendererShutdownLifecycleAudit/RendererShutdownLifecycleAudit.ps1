@@ -37,7 +37,7 @@ function Test-ParticleResetContract {
 
 	$HeaderText = Remove-CppComments $HeaderText
 	$ImplementationText = Remove-CppComments $ImplementationText
-    if ($HeaderText -notmatch 'virtual\s+void\s+reset\s*\(\s*\)\s+override\s*;') { return $false }
+    if ($HeaderText -notmatch '(?s)class\s+W3DParticleSystemManager\b.*?virtual\s+void\s+reset\s*\(\s*\)\s+override\s*;') { return $false }
     $body = Get-FunctionBody $ImplementationText 'void W3DParticleSystemManager::reset()'
     if ($null -eq $body) { return $false }
     $point = $body.IndexOf('m_pointGroup->Set_Texture(nullptr);', [StringComparison]::Ordinal)
@@ -67,10 +67,13 @@ function Test-DisplayContract {
         $ManagerHeader -notmatch 'virtual\s+void\s+releaseGraphicsResources\s*\(\s*\)\s+override\s*;') {
         return $false
     }
+    $managerDestructorBody = Get-FunctionBody $ManagerImplementation 'W3DDisplayStringManager::~W3DDisplayStringManager()'
     $managerBody = Get-FunctionBody $ManagerImplementation 'void W3DDisplayStringManager::releaseGraphicsResources()'
     $displayBody = Get-FunctionBody $DisplayImplementation 'W3DDisplay::~W3DDisplay()'
     $clientBody = Get-FunctionBody $GameClientImplementation 'GameClient::~GameClient()'
-    if ($null -eq $managerBody -or $null -eq $displayBody -or $null -eq $clientBody) { return $false }
+    if ($null -eq $managerDestructorBody -or $null -eq $managerBody -or
+        $null -eq $displayBody -or $null -eq $clientBody) { return $false }
+    if ($managerDestructorBody -notmatch 'releaseGraphicsResources\s*\(\s*\)\s*;') { return $false }
     if ($managerBody -notmatch 'freeDisplayString\s*\(\s*m_groupNumeralStrings\s*\[' -or
         $managerBody -notmatch 'freeDisplayString\s*\(\s*m_formationLetterDisplayString\s*\)') { return $false }
 
@@ -94,7 +97,7 @@ function Test-DisplayContract {
 }
 
 if ($SelfTest) {
-    $header = 'virtual void reset() override;'
+    $header = 'class W3DParticleSystemManager { virtual void reset() override; };'
     $validParticle = @'
 void W3DParticleSystemManager::reset()
 {
@@ -117,10 +120,15 @@ void W3DParticleSystemManager::reset()
 		'm_pointGroup->Set_Texture(nullptr);',
 		'// m_pointGroup->Set_Texture(nullptr);')
 	if (Test-ParticleResetContract $header $commentedParticle) { throw 'Commented particle release accepted.' }
+	$unrelatedHeader = 'class Other { virtual void reset() override; }; class W3DParticleSystemManager {};'
+	if (Test-ParticleResetContract $unrelatedHeader $validParticle) { throw 'Unrelated reset override accepted.' }
 
     $base = 'virtual void releaseGraphicsResources() {}'
     $managerHeader = 'virtual void releaseGraphicsResources() override;'
-	$manager = 'void W3DDisplayStringManager::releaseGraphicsResources() { freeDisplayString(m_groupNumeralStrings[0]); freeDisplayString(m_formationLetterDisplayString); }'
+	$manager = @'
+W3DDisplayStringManager::~W3DDisplayStringManager() { releaseGraphicsResources(); }
+void W3DDisplayStringManager::releaseGraphicsResources() { freeDisplayString(m_groupNumeralStrings[0]); freeDisplayString(m_formationLetterDisplayString); }
+'@
     $display = 'W3DDisplay::~W3DDisplay() { stopMovie(); TheDisplayStringManager->releaseGraphicsResources(); WW3D::Shutdown(); }'
 	$client = 'GameClient::~GameClient() { delete TheSnowManager; delete TheDisplay; delete TheDisplayStringManager; TheFontLibrary->reset(); delete TheFontLibrary; }'
     if (-not (Test-DisplayContract $base $managerHeader $manager $display $client $true)) {
@@ -133,6 +141,12 @@ void W3DParticleSystemManager::reset()
 	$commentedManager = 'void W3DDisplayStringManager::releaseGraphicsResources() { // freeDisplayString(m_groupNumeralStrings[0]);' + "`n" + '// freeDisplayString(m_formationLetterDisplayString);' + "`n}"
 	if (Test-DisplayContract $base $managerHeader $commentedManager $display $client $true) {
 		throw 'Commented display-string release accepted.'
+	}
+	$missingDestructorRelease = $manager.Replace(
+		'W3DDisplayStringManager::~W3DDisplayStringManager() { releaseGraphicsResources(); }',
+		'W3DDisplayStringManager::~W3DDisplayStringManager() {}')
+	if (Test-DisplayContract $base $managerHeader $missingDestructorRelease $display $client $true) {
+		throw 'Missing destructor resource release accepted.'
 	}
 	$lateFont = 'GameClient::~GameClient() { delete TheSnowManager; delete TheDisplay; TheFontLibrary->reset(); delete TheFontLibrary; delete TheDisplayStringManager; }'
 	if (Test-DisplayContract $base $managerHeader $manager $display $lateFont $true) {

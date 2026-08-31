@@ -195,6 +195,35 @@ static bool _D3D11FrameStarted = false;
 
 namespace
 {
+HINSTANCE Load_D3D8_Runtime()
+{
+#if defined(_WIN64)
+	wchar_t module_path[32768];
+	const DWORD module_path_length = GetModuleFileNameW(nullptr, module_path,
+		static_cast<DWORD>(sizeof(module_path) / sizeof(module_path[0])));
+	if (module_path_length == 0 ||
+		module_path_length >= sizeof(module_path) / sizeof(module_path[0]))
+	{
+		return nullptr;
+	}
+
+	wchar_t *const file_name = wcsrchr(module_path, L'\\');
+	static const wchar_t runtime_name[] = L"d3d8.dll";
+	if (file_name == nullptr ||
+		(file_name - module_path) +
+			sizeof(runtime_name) / sizeof(runtime_name[0]) >=
+			sizeof(module_path) / sizeof(module_path[0]))
+	{
+		return nullptr;
+	}
+	memcpy(file_name + 1, runtime_name, sizeof(runtime_name));
+	return LoadLibraryExW(module_path, nullptr,
+		LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+#else
+	return LoadLibrary("D3D8.DLL");
+#endif
+}
+
 bool Get_D3D11_Monitor_Rect(RECT *monitor_rect)
 {
 	if (monitor_rect == nullptr || _Hwnd == nullptr)
@@ -396,12 +425,16 @@ bool DX8Wrapper::Init(void * hwnd, bool lite)
 	Invalidate_Cached_Render_States();
 
 	if (!lite) {
-		D3D8Lib = LoadLibrary("D3D8.DLL");
+		D3D8Lib = Load_D3D8_Runtime();
 
 		if (D3D8Lib == nullptr) return false;	// Return false at this point if init failed
 
 		Direct3DCreate8Ptr = (Direct3DCreate8Type) GetProcAddress(D3D8Lib, "Direct3DCreate8");
-		if (Direct3DCreate8Ptr == nullptr) return false;
+		if (Direct3DCreate8Ptr == nullptr) {
+			FreeLibrary(D3D8Lib);
+			D3D8Lib = nullptr;
+			return false;
+		}
 
 		/*
 		** Create the D3D interface object
@@ -415,6 +448,9 @@ bool DX8Wrapper::Init(void * hwnd, bool lite)
 			D3DInterface = Direct3DCreate8Ptr(D3D_SDK_VERSION);		// TODO: handle failure cases...
 		}
 		if (D3DInterface == nullptr) {
+			Direct3DCreate8Ptr = nullptr;
+			FreeLibrary(D3D8Lib);
+			D3D8Lib = nullptr;
 			return(false);
 		}
 		IsInitted = true;
@@ -758,6 +794,7 @@ bool DX8Wrapper::Reset_Device(bool reload_assets, bool *reset_requires_reacquire
 			Set_Vertex_Buffer (nullptr,i);
 		}
 		Set_Index_Buffer (nullptr, 0);
+		Release_DX8_Buffer_Bindings();
 		if (m_pCleanupHook) {
 			m_pCleanupHook->ReleaseResources();
 		}
@@ -811,6 +848,26 @@ bool DX8Wrapper::Reset_Device(bool reload_assets, bool *reset_requires_reacquire
 	return false;
 }
 
+void DX8Wrapper::Release_DX8_Buffer_Bindings()
+{
+	DX8_Assert();
+	const HRESULT vertex_result = _Get_D3D_Device8()->SetStreamSource(0, nullptr, 0);
+	Increment_DX8_CallCount();
+	const HRESULT index_result = _Get_D3D_Device8()->SetIndices(nullptr, 0);
+	Increment_DX8_CallCount();
+	// These are owned references, independent of the device bindings. A lost
+	// device may reject unbinding, but DEFAULT-pool buffers must not survive Reset.
+	Track_DX8_Vertex_Buffer(nullptr, 0, 0);
+	if (RawIndexBuffer != nullptr)
+	{
+		RawIndexBuffer->Release();
+		RawIndexBuffer = nullptr;
+	}
+	RawIndexBaseVertex = 0;
+	if (FAILED(vertex_result)) Non_Fatal_Log_DX8_ErrorCode(vertex_result, __FILE__, __LINE__);
+	if (FAILED(index_result)) Non_Fatal_Log_DX8_ErrorCode(index_result, __FILE__, __LINE__);
+}
+
 void DX8Wrapper::Release_Device()
 {
 	if (D3DDevice) {
@@ -820,15 +877,7 @@ void DX8Wrapper::Release_Device()
 			DX8CALL(SetTexture(a,nullptr));
 		}
 
-		DX8CALL(SetStreamSource(0, nullptr, 0));	//release reference count on last rendered vertex buffer
-		DX8CALL(SetIndices(nullptr,0));	//release reference count on last rendered index buffer
-		Track_DX8_Vertex_Buffer(nullptr, 0, 0);
-		if (RawIndexBuffer != nullptr)
-		{
-			RawIndexBuffer->Release();
-			RawIndexBuffer = nullptr;
-		}
-		RawIndexBaseVertex = 0;
+		Release_DX8_Buffer_Bindings();
 
 
 		/*
@@ -2553,6 +2602,14 @@ bool DX8Wrapper::Publish_D3D11_Buffer_Change(IUnknown *buffer,
 		byte_count, destination_offset, mode, source_generation);
 }
 
+bool DX8Wrapper::Publish_D3D11_Texture_BGRA8_Change(
+	IDirect3DBaseTexture8 *texture, const void *data, size_t row_pitch,
+	size_t slice_pitch)
+{
+	return _D3D11Bridge.Publish_Texture_BGRA8_Change(texture, data, row_pitch,
+		slice_pitch);
+}
+
 void DX8Wrapper::Notify_D3D11_Texture_Changed(
 	IDirect3DBaseTexture8 *texture)
 {
@@ -2573,6 +2630,13 @@ void Notify_Render_Texture_Changed(IDirect3DBaseTexture8 *texture)
 void Notify_Render_Texture_Changed(TextureClass *texture)
 {
 	DX8Wrapper::Notify_D3D11_Texture_Changed(texture);
+}
+
+bool Publish_Render_Texture_BGRA8_Change(IDirect3DBaseTexture8 *texture,
+	const void *data, size_t row_pitch, size_t slice_pitch)
+{
+	return DX8Wrapper::Publish_D3D11_Texture_BGRA8_Change(texture, data,
+		row_pitch, slice_pitch);
 }
 
 void Notify_Render_Buffer_Changed(IUnknown *buffer)
@@ -4537,9 +4601,11 @@ void DX8Wrapper::Set_Light_Environment(LightEnvironmentClass* light_env)
 			render_state_changed|=MATERIAL_CHANGED;
 #endif
 		}
+		// Match the packed D3D8 ambient value exactly. Publishing the original
+		// float after Set_DX8_Render_State made the neutral backend alternate
+		// between quantized and unquantized lighting for the same scene state.
 		rts::render::TrackLegacyGlobalAmbient(
-			rts::render::RenderFloat4(equivalent_ambient.X,
-			equivalent_ambient.Y, equivalent_ambient.Z, 1.0f));
+			rts::render::DecodeLegacyD3D8Ambient(color));
 
 		D3DLIGHT8 light;
 		int l=0;

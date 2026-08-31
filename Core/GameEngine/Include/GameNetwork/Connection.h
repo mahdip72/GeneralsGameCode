@@ -63,7 +63,11 @@ public:
 	User *getUser();
 	void setFrameGrouping(time_t frameGrouping);
 
-	void sendNetCommandMsg(NetCommandMsg *msg, UnsignedByte relay);
+	void sendNetCommandMsg(NetCommandMsg *msg, UnsignedByte relay
+#if defined(_WIN64)
+		, Bool cachedRecovery = FALSE
+#endif
+	);
 
 	// These two processAck calls do the same thing, just take different types of ACK commands.
 	NetCommandRef * processAck(NetAckBothCommandMsg *msg);

@@ -483,8 +483,8 @@ WindowMsgHandledType KeyboardOptionsMenuInput( GameWindow *window, UnsignedInt m
 		// --------------------------------------------------------------------------------------------
 		case GWM_CHAR:
 		{
-			UnsignedByte key = mData1;
-			UnsignedByte state = mData2;
+			UnsignedByte key = static_cast<UnsignedByte>(WindowMsgDataToUnsignedInt(mData1));
+			UnsignedByte state = static_cast<UnsignedByte>(WindowMsgDataToUnsignedInt(mData2));
 
 			switch( key )
 			{
@@ -719,7 +719,7 @@ WindowMsgHandledType KeyboardTextEntryInput( GameWindow *window, UnsignedInt msg
 		// ------------------------------------------------------------------------
 		case GWM_IME_CHAR:
 		{
-			WideChar ch = (WideChar) mData1;
+			WideChar ch = static_cast<WideChar>(WindowMsgDataToUnsignedInt(mData1));
 
 			// --------------------------------------------------------------------
 			if ( ch == VK_RETURN )
@@ -1016,7 +1016,7 @@ WindowMsgHandledType KeyboardTextEntryInput( GameWindow *window, UnsignedInt msg
 				// doing research to see if this will fix the keyboard stuff
 				/*default:
 				{
-					char ch = mData1;
+					char ch = static_cast<char>(WindowMsgDataToInt(mData1));
 					if( ch && ( BitIsSet( mData2, KEY_STATE_DOWN ) ) )
 					{
 						// Constrain keys based on rules for entry box.

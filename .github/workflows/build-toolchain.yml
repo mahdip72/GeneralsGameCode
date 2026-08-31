@@ -30,7 +30,7 @@ jobs:
   build:
     name: ${{ inputs.preset }}${{ inputs.tools && '+t' || '' }}${{ inputs.extras && '+e' || '' }}
     runs-on: windows-2022
-    timeout-minutes: 30
+    timeout-minutes: ${{ startsWith(inputs.preset, 'x64') && 90 || 30 }}
 
     env:
       VCPKG_FILE_CACHE: ${{ github.workspace }}\vcpkg-bincache
@@ -56,7 +56,7 @@ jobs:
         uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
         with:
           path: build\${{ inputs.preset }}\_deps
-          key: cmake-deps-${{ inputs.preset }}-${{ hashFiles('CMakePresets.json','cmake/**/*.cmake','**/CMakeLists.txt') }}
+          key: cmake-deps-${{ inputs.preset }}-${{ hashFiles('CMakePresets.json','cmake/**/*.cmake','cmake/patches/*.patch','**/CMakeLists.txt') }}
 
       - name: Download VC6 Portable from itsmattkc repo
         if: ${{ startsWith(inputs.preset, 'vc6') && steps.cache-vc6.outputs.cache-hit != 'true' }}
@@ -102,10 +102,10 @@ jobs:
           "LIB=$MSVCDir\LIB;$MSVCDir\MFC\LIB;$env:LIB" >> $env:GITHUB_ENV
 
       - name: Set Up VC2022 Environment
-        if: startsWith(inputs.preset, 'win32')
+        if: startsWith(inputs.preset, 'win32') || startsWith(inputs.preset, 'x64')
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
         with:
-          arch: x86
+          arch: ${{ startsWith(inputs.preset, 'x64') && 'x64' || 'x86' }}
 
       - name: Compute vcpkg cache key parts
         if: contains(inputs.preset, 'vcpkg')
@@ -128,7 +128,7 @@ jobs:
         uses: actions/cache/restore@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
         with:
           path: ${{ github.workspace }}\vcpkg-bincache
-          key: vcpkg-bincache-v3-${{ runner.os }}-baseline${{ steps.vcpkg_key.outputs.baseline }}-${{ steps.vcpkg_key.outputs.triplet }}-${{ hashFiles('triplets/*.cmake') }}
+          key: vcpkg-bincache-v3-${{ runner.os }}-baseline${{ steps.vcpkg_key.outputs.baseline }}-${{ steps.vcpkg_key.outputs.triplet }}-manifest${{ hashFiles('vcpkg.json', 'vcpkg-lock.json') }}-${{ hashFiles('triplets/*.cmake') }}
           restore-keys: |
             vcpkg-bincache-v3-${{ runner.os }}-baseline${{ steps.vcpkg_key.outputs.baseline }}-
             vcpkg-bincache-v3-${{ runner.os }}-
@@ -137,6 +137,9 @@ jobs:
         if: contains(inputs.preset, 'vcpkg')
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:
+          # Keep package versions at the manifest baseline while using the
+          # acquire-msys repair that replaces the retired file-5.45-3 archive.
+          vcpkgGitCommitId: 6fa128f2b6e1dd260ebfb30fdb1c38a191369812
           runVcpkgInstall: false
           doNotCache: false
 
@@ -197,20 +200,68 @@ jobs:
         if: inputs.extras
         shell: pwsh
         run: |
-          $arguments = @('--test-dir', "build\${{ inputs.preset }}", '--output-on-failure')
-          if ('${{ inputs.preset }}' -like 'win32*') {
-            $configuration = if ('${{ inputs.preset }}' -match 'debug') { 'Debug' } else { 'Release' }
+          $arguments = @('--test-dir', "build\${{ inputs.preset }}", '--output-on-failure', '--no-tests=error')
+          if ('${{ inputs.preset }}' -like 'win32*' -or '${{ inputs.preset }}' -like 'x64*') {
+            $configuration = if ('${{ inputs.preset }}' -match 'debug|asan') { 'Debug' } else { 'Release' }
             $arguments += @('-C', $configuration)
           }
           & ctest @arguments
+          exit $LASTEXITCODE
+
+      - name: Install native runtime for ${{ inputs.game }} with ${{ inputs.preset }}
+        if: startsWith(inputs.preset, 'x64')
+        shell: pwsh
+        run: |
+          $configuration = if ('${{ inputs.preset }}' -match 'debug|asan') { 'Debug' } else { 'Release' }
+          $buildDir = "build\${{ inputs.preset }}"
+          $installRoot = Join-Path $buildDir 'installed'
+          cmake --install $buildDir --config $configuration --prefix $installRoot
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          $installedRuntime = Join-Path $installRoot '${{ inputs.game == 'Generals' && 'Generals' || 'ZeroHour' }}'
+          if (-not (Test-Path -LiteralPath $installedRuntime -PathType Container)) {
+            Write-Error "Installed native runtime was not produced at $installedRuntime"
+            exit 1
+          }
+
+      - name: Run installed native contract tests
+        if: ${{ inputs.extras && startsWith(inputs.preset, 'x64') }}
+        shell: pwsh
+        run: |
+          $titleDirectory = '${{ inputs.game == 'Generals' && 'Generals' || 'ZeroHour' }}'
+          $testName = '${{ inputs.game == 'Generals' && 'g_skirmish_ai_runner_contract_tests.exe' || 'z_runtime_regression_tests.exe' }}'
+          $installedRuntime = [IO.Path]::GetFullPath(
+            (Join-Path "build\${{ inputs.preset }}\installed" $titleDirectory))
+          $test = Join-Path $installedRuntime $testName
+          if (-not (Test-Path -LiteralPath $test -PathType Leaf)) {
+            Write-Error "Installed native contract utility was not produced at $test"
+            exit 1
+          }
+
+          $testExitCode = 1
+          Push-Location $installedRuntime
+          try {
+            & $test
+            $testExitCode = $LASTEXITCODE
+            if ($testExitCode -eq 0 -and '${{ inputs.game }}' -eq 'GeneralsMD') {
+              & $test --skirmish-ai-replay-epoch
+              $testExitCode = $LASTEXITCODE
+            }
+          }
+          finally {
+            Pop-Location
+          }
+          exit $testExitCode
 
       - name: Save vcpkg binary cache
         # Only one job should save to avoid "Unable to reserve cache" conflicts.
-        if: ${{ contains(inputs.preset, 'vcpkg') && steps.vcpkg_cache.outputs.cache-hit != 'true' && inputs.game == 'Generals' && inputs.preset == 'win32-vcpkg-debug' }}
+        if: ${{ contains(inputs.preset, 'vcpkg') && steps.vcpkg_cache.outputs.cache-hit != 'true' && inputs.game == 'Generals' && inputs.preset == 'x64-vcpkg' }}
         uses: actions/cache/save@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
         with:
           path: ${{ github.workspace }}\vcpkg-bincache
-          key: vcpkg-bincache-v3-${{ runner.os }}-baseline${{ steps.vcpkg_key.outputs.baseline }}-${{ steps.vcpkg_key.outputs.triplet }}-${{ hashFiles('triplets/*.cmake') }}
+          key: vcpkg-bincache-v3-${{ runner.os }}-baseline${{ steps.vcpkg_key.outputs.baseline }}-${{ steps.vcpkg_key.outputs.triplet }}-manifest${{ hashFiles('vcpkg.json', 'vcpkg-lock.json') }}-${{ hashFiles('triplets/*.cmake') }}
 
       - name: Collect ${{ inputs.game }} ${{ inputs.preset }}${{ inputs.tools && '+t' || '' }}${{ inputs.extras && '+e' || '' }} Artifact
         shell: pwsh
@@ -218,16 +269,23 @@ jobs:
           $buildDir = "build\${{ inputs.preset }}"
           $artifactsDir = New-Item -ItemType Directory -Force -Path "$buildDir\${{ inputs.game }}\artifacts" -Verbose
 
-          if ("${{ inputs.preset }}" -like "win32*") {
-            $configToUse = if ("${{ inputs.preset }}" -match "debug") { "Debug" } else { "Release" }
+          if ('${{ inputs.preset }}' -like 'x64*') {
+            $installedRuntime = Join-Path $buildDir "installed\${{ inputs.game == 'Generals' && 'Generals' || 'ZeroHour' }}"
+            if (-not (Test-Path -LiteralPath $installedRuntime -PathType Container)) {
+              Write-Error "Installed native runtime was not found at $installedRuntime"
+              exit 1
+            }
+            Copy-Item -Path (Join-Path $installedRuntime '*') -Destination $artifactsDir -Recurse -Force -Verbose
+          } elseif ('${{ inputs.preset }}' -like 'win32*') {
+            $configToUse = if ('${{ inputs.preset }}' -match 'debug|asan') { 'Debug' } else { 'Release' }
             $files = Get-ChildItem -Path "$buildDir\Core\$configToUse","$buildDir\${{ inputs.game }}\$configToUse" -File |
               Where-Object { $_.Extension -in @(".exe", ".dll", ".pdb") } -Verbose
+            $files | Move-Item -Destination $artifactsDir -Verbose -Force
           } else {
             $files = Get-ChildItem -Path "$buildDir\Core","$buildDir\${{ inputs.game }}" -File |
               Where-Object { $_.Extension -in @(".exe", ".dll", ".pdb") } -Verbose
+            $files | Move-Item -Destination $artifactsDir -Verbose -Force
           }
-
-          $files | Move-Item -Destination $artifactsDir -Verbose -Force
 
       - name: Upload ${{ inputs.game }} ${{ inputs.preset }}${{ inputs.tools && '+t' || '' }}${{ inputs.extras && '+e' || '' }} Artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0

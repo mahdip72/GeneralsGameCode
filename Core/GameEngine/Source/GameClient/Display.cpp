@@ -268,8 +268,22 @@ void Display::update()
 			}
 			else
 			{
-				stopMovie();
+				// The last visible frame can precede accepted movie audio. Let the
+				// FFmpeg stream-facing pump reach ENDED before destroying its sink;
+				// Bink reports finished after copying the final frame to the buffer.
+				if (!m_videoStream->isFinished()) {
+					m_videoStream->frameNext();
+				}
+				if (m_videoStream->isFinished()) {
+					stopMovie();
+				}
 			}
+		}
+		else if (m_videoStream->isFinished())
+		{
+			// A drained stream may have no repeatable frame. Close it after the
+			// terminal state is observed so FAILED cannot leave this host loop live.
+			stopMovie();
 		}
 	}
 }

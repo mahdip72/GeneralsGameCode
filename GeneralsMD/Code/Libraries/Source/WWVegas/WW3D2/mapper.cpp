@@ -36,6 +36,7 @@
  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 #include "mapper.h"
+#include "WWLib/realcrc.h"
 #include "ww3d.h"
 #include "WWLib/INI.h"
 #include "WWLib/chunkio.h"
@@ -61,6 +62,68 @@ TextureMapperClass::TextureMapperClass(unsigned int stage)
 {
 	Stage = stage;
 	if (Stage >= MeshMatDescClass::MAX_TEX_STAGES) Stage = MeshMatDescClass::MAX_TEX_STAGES - 1;
+}
+
+namespace
+{
+	#if defined(_WIN64)
+	static_assert(sizeof(uint32) == 4, "Canonical mapper CRC requires 32-bit mapper fields");
+	static_assert(sizeof(float) == 4, "Canonical mapper CRC requires IEEE single-precision floats");
+	#endif
+
+	unsigned long append_canonical_bytes(unsigned long crc, const void *data, unsigned long length)
+	{
+		return CRC_Memory(reinterpret_cast<const unsigned char *>(data), length, crc);
+	}
+}
+
+unsigned long TextureMapperClass::Append_Canonical_Header(unsigned long crc, uint32 type_id) const
+{
+	crc = Append_Canonical_UInt(crc, type_id);
+	return Append_Canonical_UInt(crc, static_cast<uint32>(Stage));
+}
+
+unsigned long TextureMapperClass::Append_Canonical_UInt(unsigned long crc, uint32 value) const
+{
+	return append_canonical_bytes(crc, &value, sizeof(value));
+}
+
+unsigned long TextureMapperClass::Append_Canonical_Float(unsigned long crc, float value) const
+{
+	return append_canonical_bytes(crc, &value, sizeof(value));
+}
+
+unsigned long TextureMapperClass::Append_Canonical_Bool(unsigned long crc, bool value) const
+{
+	return Append_Canonical_UInt(crc, value ? 1u : 0u);
+}
+
+unsigned long TextureMapperClass::Append_Canonical_Vector2(unsigned long crc, const Vector2 &value) const
+{
+	crc = Append_Canonical_Float(crc, value.X);
+	return Append_Canonical_Float(crc, value.Y);
+}
+
+unsigned long TextureMapperClass::Append_Canonical_Vector3(unsigned long crc, const Vector3 &value) const
+{
+	crc = Append_Canonical_Float(crc, value.X);
+	crc = Append_Canonical_Float(crc, value.Y);
+	return Append_Canonical_Float(crc, value.Z);
+}
+
+unsigned long TextureMapperClass::Append_Canonical_Matrix4(unsigned long crc, const Matrix4x4 &value) const
+{
+	for (int row = 0; row < 4; ++row) {
+		for (int column = 0; column < 4; ++column) {
+			crc = Append_Canonical_Float(crc, value[row][column]);
+		}
+	}
+	return crc;
+}
+
+unsigned long TextureMapperClass::Compute_Canonical_CRC(unsigned long crc) const
+{
+	return Append_Canonical_Header(crc, static_cast<uint32>(Mapper_ID()));
 }
 
 
@@ -1079,6 +1142,99 @@ void BumpEnvTextureMapperClass::Apply(int uv_array_index)
 	DX8Wrapper::Set_DX8_Texture_Stage_State(Stage,D3DTSS_BUMPENVMAT01, F2DW(-s));
 	DX8Wrapper::Set_DX8_Texture_Stage_State(Stage,D3DTSS_BUMPENVMAT10, F2DW(s));
 	DX8Wrapper::Set_DX8_Texture_Stage_State(Stage,D3DTSS_BUMPENVMAT11, F2DW(c));
+}
+
+unsigned long ScaleTextureMapperClass::Compute_Canonical_CRC(unsigned long crc) const
+{
+	crc = Append_Canonical_Header(crc, static_cast<uint32>(Mapper_ID()));
+	return Append_Canonical_Vector2(crc, Scale);
+}
+
+unsigned long LinearOffsetTextureMapperClass::Compute_Canonical_CRC(unsigned long crc) const
+{
+	crc = Append_Canonical_Header(crc, static_cast<uint32>(Mapper_ID()));
+	crc = Append_Canonical_Vector2(crc, Scale);
+	crc = Append_Canonical_Vector2(crc, StartingUVOffset);
+	crc = Append_Canonical_Bool(crc, ClampFix);
+	return Append_Canonical_Vector2(crc, UVOffsetDeltaPerMS);
+}
+
+unsigned long GridTextureMapperClass::Compute_Canonical_CRC(unsigned long crc) const
+{
+	crc = Append_Canonical_Header(crc, static_cast<uint32>(Mapper_ID()));
+	crc = Append_Canonical_UInt(crc, static_cast<uint32>(Sign));
+	crc = Append_Canonical_UInt(crc, static_cast<uint32>(MSPerFrame));
+	crc = Append_Canonical_Float(crc, OOGridWidth);
+	crc = Append_Canonical_UInt(crc, static_cast<uint32>(GridWidthLog2));
+	crc = Append_Canonical_UInt(crc, static_cast<uint32>(LastFrame));
+	return Append_Canonical_UInt(crc, static_cast<uint32>(Offset));
+}
+
+unsigned long RotateTextureMapperClass::Compute_Canonical_CRC(unsigned long crc) const
+{
+	crc = Append_Canonical_Header(crc, static_cast<uint32>(Mapper_ID()));
+	crc = Append_Canonical_Vector2(crc, Scale);
+	crc = Append_Canonical_Float(crc, RadiansPerMilliSec);
+	return Append_Canonical_Vector2(crc, Center);
+}
+
+unsigned long SineLinearOffsetTextureMapperClass::Compute_Canonical_CRC(unsigned long crc) const
+{
+	crc = Append_Canonical_Header(crc, static_cast<uint32>(Mapper_ID()));
+	crc = Append_Canonical_Vector2(crc, Scale);
+	crc = Append_Canonical_Vector3(crc, UAFP);
+	return Append_Canonical_Vector3(crc, VAFP);
+}
+
+unsigned long StepLinearOffsetTextureMapperClass::Compute_Canonical_CRC(unsigned long crc) const
+{
+	crc = Append_Canonical_Header(crc, static_cast<uint32>(Mapper_ID()));
+	crc = Append_Canonical_Vector2(crc, Scale);
+	crc = Append_Canonical_Vector2(crc, Step);
+	crc = Append_Canonical_Float(crc, StepsPerMilliSec);
+	return Append_Canonical_Bool(crc, ClampFix);
+}
+
+unsigned long ZigZagLinearOffsetTextureMapperClass::Compute_Canonical_CRC(unsigned long crc) const
+{
+	crc = Append_Canonical_Header(crc, static_cast<uint32>(Mapper_ID()));
+	crc = Append_Canonical_Vector2(crc, Scale);
+	crc = Append_Canonical_Vector2(crc, Speed);
+	return Append_Canonical_Float(crc, Period);
+}
+
+unsigned long EdgeMapperClass::Compute_Canonical_CRC(unsigned long crc) const
+{
+	crc = Append_Canonical_Header(crc, static_cast<uint32>(Mapper_ID()));
+	crc = Append_Canonical_Float(crc, VSpeed);
+	return Append_Canonical_Bool(crc, UseReflect);
+}
+
+unsigned long WSEnvMapperClass::Compute_Canonical_CRC(unsigned long crc) const
+{
+	crc = Append_Canonical_Header(crc, static_cast<uint32>(Mapper_ID()));
+	return Append_Canonical_UInt(crc, static_cast<uint32>(Axis));
+}
+
+unsigned long RandomTextureMapperClass::Compute_Canonical_CRC(unsigned long crc) const
+{
+	crc = Append_Canonical_Header(crc, static_cast<uint32>(Mapper_ID()));
+	crc = Append_Canonical_Vector2(crc, Scale);
+	crc = Append_Canonical_Float(crc, FPMS);
+	return Append_Canonical_Vector2(crc, Speed);
+}
+
+unsigned long BumpEnvTextureMapperClass::Compute_Canonical_CRC(unsigned long crc) const
+{
+	crc = LinearOffsetTextureMapperClass::Compute_Canonical_CRC(crc);
+	crc = Append_Canonical_Float(crc, RadiansPerSecond);
+	return Append_Canonical_Float(crc, ScaleFactor);
+}
+
+unsigned long GridWSEnvMapperClass::Compute_Canonical_CRC(unsigned long crc) const
+{
+	crc = GridTextureMapperClass::Compute_Canonical_CRC(crc);
+	return Append_Canonical_UInt(crc, static_cast<uint32>(Axis));
 }
 
 /*

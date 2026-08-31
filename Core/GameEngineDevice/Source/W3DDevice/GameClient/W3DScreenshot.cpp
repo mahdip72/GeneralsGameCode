@@ -17,6 +17,7 @@
 */
 
 #include "W3DDevice/GameClient/W3DScreenshot.h"
+#include <Utility/interlocked_adapter.h>
 #include "W3DDevice/GameClient/W3DScreenshotCodec.h"
 #include "Common/GlobalData.h"
 #include "GameClient/GameText.h"

@@ -2274,14 +2274,15 @@ WW3DErrorType MeshModelClass::write_header(ChunkSaveClass & csave,MeshSaveContex
 		char * name = MeshName->Get_Array();
 		char * mesh_name = strchr(name,'.');
 
-		int hierarchy_name_len = 0;
+		size_t hierarchy_name_len = 0;
 		if (mesh_name == nullptr) {
 			mesh_name = name;
 		} else {
-			hierarchy_name_len = (int)mesh_name - (int)name;
+			const ptrdiff_t hierarchy_name_offset = mesh_name - name;
+			assert(hierarchy_name_offset >= 0 && hierarchy_name_offset < W3D_NAME_LEN);
+			hierarchy_name_len = static_cast<size_t>(hierarchy_name_offset >= 0 && hierarchy_name_offset < W3D_NAME_LEN ? hierarchy_name_offset : W3D_NAME_LEN - 1);
 			mesh_name++;
 		}
-		assert( hierarchy_name_len < W3D_NAME_LEN);
 		strlcpy( header.MeshName, mesh_name, W3D_NAME_LEN);
 		strlcpy( header.ContainerName, name, hierarchy_name_len + 1);
 	} else {

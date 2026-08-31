@@ -70,6 +70,7 @@ class BinkVideoStream : public VideoStream
 
 		HBINK					m_handle;														///< Bink streaming handle;
 		Char					*m_memFile;													///< Pointer to memory resident file
+		Bool m_frameRendered; ///< The selected frame has been copied to a video buffer
 
 		BinkVideoStream();																///< only BinkVideoPlayer can create these
 		virtual ~BinkVideoStream() override;
@@ -79,12 +80,13 @@ class BinkVideoStream : public VideoStream
 		virtual void update() override;											///< Update bink stream
 
 		virtual Bool	isFrameReady() override;								///< Is the frame ready to be displayed
+		virtual Bool	isFinished() const override;
 		virtual void	frameDecompress() override;						///< Render current frame in to buffer
 		virtual void	frameRender( VideoBuffer *buffer ) override; ///< Render current frame in to buffer
 		virtual void	frameNext() override;									///< Advance to next frame
 		virtual Int		frameIndex() override;									///< Returns zero based index of current frame
 		virtual Int		frameCount() override;									///< Returns the total number of frames in the stream
-		virtual void	frameGoto( Int index ) override;							///< Go to the spcified frame index
+		virtual Bool	frameGoto( Int index ) override;							///< Go to the specified frame index
 		virtual Int		height() override;											///< Return the height of the video
 		virtual Int		width() override;											///< Return the width of the video
 
@@ -127,7 +129,7 @@ class BinkVideoPlayer : public VideoPlayer
 		virtual VideoStreamInterface*	load( AsciiString movieTitle ) override;	///< Load video file in to memory for playback
 
 		virtual void notifyVideoPlayerOfNewProvider( Bool nowHasValid ) override;
-		virtual void initializeBinkWithMiles();
+		virtual void initializeVideoAudio();
 };
 
 

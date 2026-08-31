@@ -1,4 +1,5 @@
 #include "Renderer/NativeW3DRenderState.h"
+#include <Utility/interlocked_adapter.h>
 
 #include <new>
 

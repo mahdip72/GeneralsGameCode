@@ -1,8 +1,4 @@
 set(GAMEENGINEDEVICE_SRC
-    Include/MilesAudioDevice/MilesAudioManager.h
-    Include/MilesAudioDevice/MilesAudioCompletionQueue.h
-    Include/MilesAudioDevice/AudioChannelPolicy.h
-    Include/VideoDevice/Bink/BinkVideoPlayer.h
     Include/W3DDevice/Common/W3DConvert.h
     Include/W3DDevice/Common/W3DFunctionLexicon.h
     Include/W3DDevice/Common/W3DModuleFactory.h
@@ -101,9 +97,6 @@ set(GAMEENGINEDEVICE_SRC
     Include/Win32Device/GameClient/Win32DIKeyboard.h
     #Include/Win32Device/GameClient/Win32DIMouse.h
     Include/Win32Device/GameClient/Win32Mouse.h
-    Source/MilesAudioDevice/MilesAudioManager.cpp
-    Source/MilesAudioDevice/AudioChannelPolicy.cpp
-    Source/VideoDevice/Bink/BinkVideoPlayer.cpp
     Source/W3DDevice/Common/System/W3DFunctionLexicon.cpp
     Source/W3DDevice/Common/System/RadarOverlayPrepare.cpp
     Source/W3DDevice/Common/System/RadarTerrainPrepare.cpp
@@ -216,6 +209,28 @@ set(GAMEENGINEDEVICE_SRC
     Source/Win32Device/GameClient/Win32Mouse.cpp
 )
 
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    list(APPEND GAMEENGINEDEVICE_SRC
+        Include/MilesAudioDevice/MilesAudioManager.h
+        Include/MilesAudioDevice/MilesAudioCompletionQueue.h
+        Include/AudioDevice/AudioChannelPolicy.h
+        Include/AudioDevice/AudioManagerFactory.h
+        Source/MilesAudioDevice/MilesAudioManager.cpp
+        Source/MilesAudioDevice/AudioManagerFactory.cpp
+        Source/AudioDevice/AudioChannelPolicy.cpp
+    )
+else()
+    # Native x64 audio manager sources are owned by rts_native_audio_manager
+    # below so runtime and contract tests consume one production target.
+endif()
+
+if(CMAKE_SIZEOF_VOID_P EQUAL 4 AND NOT RTS_BUILD_OPTION_FFMPEG)
+    list(APPEND GAMEENGINEDEVICE_SRC
+        Include/VideoDevice/Bink/BinkVideoPlayer.h
+        Source/VideoDevice/Bink/BinkVideoPlayer.cpp
+    )
+endif()
+
 # Add C++ 17 FileSystem implementation for non-VS6 builds
 if(NOT IS_VS6_BUILD)
     list(APPEND GAMEENGINEDEVICE_SRC
@@ -245,26 +260,172 @@ target_link_libraries(corei_gameenginedevice_private INTERFACE
     stb
 )
 
+if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32)
+    target_link_libraries(corei_gameenginedevice_private INTERFACE rts_xaudio2)
+endif()
+
 target_link_libraries(corei_gameenginedevice_public INTERFACE
-    binkstub
     corei_gameengine_public
-    rts_d3d8lib
-    milesstub
+    rts_legacy_product_runtime
+)
+
+# Emit the configured native-device source/link closure for the architecture
+# audit.  This is generated from target properties after architecture
+# selection, so the audit cannot pass solely on source-text regexes.
+file(GENERATE
+    OUTPUT "${CMAKE_BINARY_DIR}/native_audio_link_closure.txt"
+    CONTENT "target=corei_gameenginedevice_private\nsources=$<JOIN:$<TARGET_PROPERTY:corei_gameenginedevice_private,INTERFACE_SOURCES>,|>\nlinks=$<JOIN:$<TARGET_PROPERTY:corei_gameenginedevice_private,INTERFACE_LINK_LIBRARIES>,|>\n"
 )
 
 if(RTS_BUILD_OPTION_FFMPEG)
     find_package(FFMPEG REQUIRED)
 
     if(FFMPEG_FOUND)
+        add_library(rts_ffmpeg_audio_decoder STATIC
+            Include/AudioDevice/AudioPcmTypes.h
+            Include/VideoDevice/FFmpeg/FFmpegAudioDecoder.h
+            Source/VideoDevice/FFmpeg/FFmpegAudioDecoder.cpp
+        )
+        target_include_directories(rts_ffmpeg_audio_decoder PUBLIC Include)
+        target_link_libraries(rts_ffmpeg_audio_decoder PUBLIC
+            FFMPEG::avutil
+            FFMPEG::swresample
+        )
+        target_compile_features(rts_ffmpeg_audio_decoder PUBLIC cxx_std_20)
+
+        add_library(rts_ffmpeg_movie_playback STATIC
+            Include/VideoDevice/FFmpeg/FFmpegFile.h
+            Include/VideoDevice/FFmpeg/FFmpegMoviePlayback.h
+            Source/VideoDevice/FFmpeg/FFmpegFile.cpp
+            Source/VideoDevice/FFmpeg/FFmpegMoviePlayback.cpp
+        )
+        target_include_directories(rts_ffmpeg_movie_playback PUBLIC Include)
+        target_link_libraries(rts_ffmpeg_movie_playback PUBLIC
+            corei_gameengine_include
+            corei_libraries_include
+            core_utility_no_pch
+            rts_ffmpeg_audio_decoder
+            FFMPEG::avcodec
+            FFMPEG::avformat
+            FFMPEG::avutil
+            FFMPEG::swresample
+            FFMPEG::swscale
+        )
+        target_compile_features(rts_ffmpeg_movie_playback PUBLIC cxx_std_20)
+        target_precompile_headers(rts_ffmpeg_movie_playback PRIVATE <type_traits>)
+
         target_sources(corei_gameenginedevice_private INTERFACE
             Include/VideoDevice/FFmpeg/FFmpegFile.h
             Include/VideoDevice/FFmpeg/FFmpegVideoPlayer.h
-            Source/VideoDevice/FFmpeg/FFmpegFile.cpp
             Source/VideoDevice/FFmpeg/FFmpegVideoPlayer.cpp
         )
-        target_include_directories(corei_gameenginedevice_private INTERFACE ${FFMPEG_INCLUDE_DIRS})
-        target_link_directories(corei_gameenginedevice_private INTERFACE ${FFMPEG_LIBRARY_DIRS})
-        target_link_libraries(corei_gameenginedevice_private INTERFACE ${FFMPEG_LIBRARIES})
+        target_link_libraries(corei_gameenginedevice_private INTERFACE
+            rts_ffmpeg_movie_playback
+        )
         target_compile_definitions(corei_gameenginedevice_public INTERFACE RTS_HAS_FFMPEG)
     endif()
+endif()
+
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    add_library(rts_native_audio_asset_source STATIC
+        Include/AudioDevice/AudioAssetSource.h
+        Source/AudioDevice/AudioAssetSource.cpp
+    )
+    target_include_directories(rts_native_audio_asset_source PUBLIC
+        Include
+        ${CMAKE_SOURCE_DIR}/Core/GameEngine/Include
+        ${CMAKE_SOURCE_DIR}/Core/Libraries/Include
+        ${CMAKE_SOURCE_DIR}/Dependencies/Utility
+    )
+    target_link_libraries(rts_native_audio_asset_source PUBLIC corei_always)
+    target_compile_features(rts_native_audio_asset_source PUBLIC cxx_std_20)
+    if(RTS_BUILD_OPTION_FFMPEG AND FFMPEG_FOUND)
+        target_compile_definitions(rts_native_audio_asset_source PRIVATE RTS_HAS_FFMPEG)
+        if(RTS_BUILD_CORE_EXTRAS)
+            target_compile_definitions(rts_native_audio_asset_source PRIVATE
+                RTS_NATIVE_AUDIO_ASSET_SOURCE_TEST_HOOK)
+        endif()
+        target_link_libraries(rts_native_audio_asset_source PRIVATE
+            rts_ffmpeg_audio_decoder
+            FFMPEG::avcodec
+            FFMPEG::avformat
+            FFMPEG::avutil
+            FFMPEG::swresample
+        )
+    endif()
+    target_link_libraries(corei_gameenginedevice_private INTERFACE rts_native_audio_asset_source)
+endif()
+
+if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32)
+    add_library(rts_xaudio2_pcm_voice STATIC
+        Include/XAudio2AudioDevice/XAudio2PcmVoice.h
+        Source/XAudio2AudioDevice/XAudio2PcmVoice.cpp
+    )
+    target_include_directories(rts_xaudio2_pcm_voice PUBLIC Include)
+    target_link_libraries(rts_xaudio2_pcm_voice PUBLIC rts_xaudio2)
+    target_compile_features(rts_xaudio2_pcm_voice PUBLIC cxx_std_20)
+    if(RTS_BUILD_OPTION_FFMPEG)
+        target_link_libraries(rts_xaudio2_pcm_voice PRIVATE rts_ffmpeg_audio_decoder)
+        target_compile_definitions(rts_xaudio2_pcm_voice PRIVATE RTS_XAUDIO2_PCM_HAS_FFMPEG)
+    endif()
+    target_link_libraries(corei_gameenginedevice_private INTERFACE rts_xaudio2_pcm_voice)
+
+    add_library(rts_xaudio2_audio_service STATIC
+        Include/XAudio2AudioDevice/IXAudio2AudioEngineBackend.h
+        Include/XAudio2AudioDevice/XAudio2AudioService.h
+        Include/XAudio2AudioDevice/XAudio2CallbackGate.h
+        Include/XAudio2AudioDevice/XAudio2FailurePublication.h
+        Include/XAudio2AudioDevice/XAudio2MoviePcmSink.h
+        Include/XAudio2AudioDevice/XAudio2NativeAudioEngine.h
+        Source/XAudio2AudioDevice/XAudio2AudioService.cpp
+        Source/XAudio2AudioDevice/XAudio2CallbackGate.cpp
+        Source/XAudio2AudioDevice/XAudio2FailurePublication.cpp
+        Source/XAudio2AudioDevice/XAudio2MoviePcmSink.cpp
+        Source/XAudio2AudioDevice/XAudio2NativeAudioEngine.cpp
+    )
+    target_include_directories(rts_xaudio2_audio_service
+        PUBLIC Include
+        PRIVATE ${CMAKE_SOURCE_DIR}/Core/Libraries/Include
+    )
+    target_link_libraries(rts_xaudio2_audio_service PUBLIC
+        rts_xaudio2
+        rts_xaudio2_pcm_voice
+    )
+    target_compile_features(rts_xaudio2_audio_service PUBLIC cxx_std_20)
+    target_link_libraries(corei_gameenginedevice_private INTERFACE rts_xaudio2_audio_service)
+endif()
+
+if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32)
+    add_library(rts_native_audio_manager STATIC
+        Include/AudioDevice/AudioChannelPolicy.h
+        Include/AudioDevice/AudioManagerFactory.h
+        Include/AudioDevice/AudioAssetSource.h
+        Include/AudioDevice/NullAudioManager.h
+        Include/XAudio2AudioDevice/XAudio2AudioManager.h
+        Source/AudioDevice/AudioChannelPolicy.cpp
+        Source/AudioDevice/NullAudioManager.cpp
+        Source/XAudio2AudioDevice/AudioManagerFactory.cpp
+        Source/XAudio2AudioDevice/XAudio2AudioManager.cpp
+    )
+    target_include_directories(rts_native_audio_manager PUBLIC
+        Include
+        ${CMAKE_SOURCE_DIR}/Core/GameEngine/Include
+        ${CMAKE_SOURCE_DIR}/Core/Libraries/Include
+        ${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas
+        ${CMAKE_SOURCE_DIR}/Core/Main
+        ${CMAKE_SOURCE_DIR}/Dependencies/Utility
+    )
+    target_compile_features(rts_native_audio_manager PUBLIC cxx_std_20)
+    target_compile_definitions(rts_native_audio_manager PRIVATE
+        RTS_NATIVE_AUDIO_ENGINE_FILESYSTEM
+        RTS_NATIVE_AUDIO_TEST_HOOK
+    )
+    target_link_libraries(rts_native_audio_manager PUBLIC
+        corei_always
+        rts_native_audio_asset_source
+        rts_xaudio2_audio_service
+    )
+    target_link_libraries(corei_gameenginedevice_private INTERFACE
+        rts_native_audio_manager
+    )
 endif()

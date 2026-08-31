@@ -677,10 +677,12 @@ struct JobSystem::State
 			pauseJobSystemTest(8);
 		}
 #endif
-		/* Enqueue and finalization use queued/finalizing as a two-way claim.
-		 * If an enqueue won first, its caller owns eventual execution. */
-		if (record->queued.load(std::memory_order_acquire) ||
-			(!executionOwner && record->executing.load(std::memory_order_acquire)))
+		/* A non-executing caller yields to a queued or active execution.  The
+		 * execution owner must always finish: enqueueReady can transiently claim
+		 * queued while it observes finalizing/executing and rejects a duplicate. */
+		if (!executionOwner &&
+			(record->queued.load(std::memory_order_acquire) ||
+			 record->executing.load(std::memory_order_acquire)))
 		{
 			record->finalizing.store(false, std::memory_order_release);
 			return;

@@ -34,12 +34,18 @@
 #include "Win32Device/Common/Win32GameEngine.h"
 #include "Common/PerfTimer.h"
 #include "Common/GameThreadOwnership.h"
+#include "AudioDevice/AudioManagerFactory.h"
 
 #include "rts/profile.h"
 
 #include "GameNetwork/LANAPICallbacks.h"
 
 extern DWORD TheMessageTime;
+
+AudioManager *Win32GameEngine::createAudioManager(Bool dummy)
+{
+	return AudioManagerFactory::create(dummy);
+}
 
 //-------------------------------------------------------------------------------------------------
 /** Constructor for Win32GameEngine */
@@ -116,8 +122,7 @@ void Win32GameEngine::update()
 			}
 		}
 
-    // When we are alt-tabbed out... the MilesAudioManager seems to go into a coma sometimes
-    // and not regain focus properly when we come back. This seems to wake it up nicely.
+    // Refresh the active audio backend after an alt-tab transition.
     AudioAffect aa = (AudioAffect)0x10;
 		TheAudio->setVolume(TheAudio->getVolume( aa ), aa );
 

@@ -207,7 +207,7 @@ void PopulateColorComboBox(Int comboBox, GameWindow *comboArray[], GameInfo *myG
 	MultiplayerColorDefinition *def = TheMultiplayerSettings->getColor(PLAYERTEMPLATE_RANDOM);
 	Int newIndex = GadgetComboBoxAddEntry(comboArray[comboBox],
 		(isObserver)?TheGameText->fetch("GUI:None"):TheGameText->fetch("GUI:???"), def->getColor());
-	GadgetComboBoxSetItemData(comboArray[comboBox], newIndex, (void *)-1);
+	GadgetComboBoxSetItemData(comboArray[comboBox], newIndex, GadgetItemDataFromInt(-1));
 
 	if (isObserver)
 	{
@@ -223,7 +223,7 @@ void PopulateColorComboBox(Int comboBox, GameWindow *comboArray[], GameInfo *myG
 
 		colorName = TheGameText->fetch(def->getTooltipName().str());
 		newIndex = GadgetComboBoxAddEntry(comboArray[comboBox], colorName, def->getColor());
-		GadgetComboBoxSetItemData(comboArray[comboBox], newIndex, (void *)c);
+	GadgetComboBoxSetItemData(comboArray[comboBox], newIndex, GadgetItemDataFromInt(c));
 	}
 	if (wasObserver)
 		GadgetComboBoxSetSelectedPos(comboArray[comboBox], 0);
@@ -240,7 +240,7 @@ void PopulatePlayerTemplateComboBox(Int comboBox, GameWindow *comboArray[], Game
 
 	MultiplayerColorDefinition *def = TheMultiplayerSettings->getColor(PLAYERTEMPLATE_RANDOM);
 	Int newIndex = GadgetComboBoxAddEntry(comboArray[comboBox], TheGameText->fetch("GUI:Random"), def->getColor());
-	GadgetComboBoxSetItemData(comboArray[comboBox], newIndex, (void *)PLAYERTEMPLATE_RANDOM);
+	GadgetComboBoxSetItemData(comboArray[comboBox], newIndex, GadgetItemDataFromInt(PLAYERTEMPLATE_RANDOM));
 
 	std::set<AsciiString> seenSides;
 
@@ -274,7 +274,7 @@ void PopulatePlayerTemplateComboBox(Int comboBox, GameWindow *comboArray[], Game
 		seenSides.insert(side);
 
 		newIndex = GadgetComboBoxAddEntry(comboArray[comboBox], TheGameText->fetch(side), def->getColor());
-		GadgetComboBoxSetItemData(comboArray[comboBox], newIndex, (void *)c);
+	GadgetComboBoxSetItemData(comboArray[comboBox], newIndex, GadgetItemDataFromInt(c));
 	}
 	seenSides.clear();
 
@@ -283,7 +283,7 @@ void PopulatePlayerTemplateComboBox(Int comboBox, GameWindow *comboArray[], Game
 	{
 		def = TheMultiplayerSettings->getColor(PLAYERTEMPLATE_OBSERVER);
 		newIndex = GadgetComboBoxAddEntry(comboArray[comboBox], TheGameText->fetch("GUI:Observer"), def->getColor());
-		GadgetComboBoxSetItemData(comboArray[comboBox], newIndex, (void *)PLAYERTEMPLATE_OBSERVER);
+	GadgetComboBoxSetItemData(comboArray[comboBox], newIndex, GadgetItemDataFromInt(PLAYERTEMPLATE_OBSERVER));
 	}
 	GadgetComboBoxSetSelectedPos(comboArray[comboBox], 0);
 
@@ -300,7 +300,7 @@ void PopulateTeamComboBox(Int comboBox, GameWindow *comboArray[], GameInfo *myGa
 
 	MultiplayerColorDefinition *def = TheMultiplayerSettings->getColor(PLAYERTEMPLATE_RANDOM);
 	Int newIndex = GadgetComboBoxAddEntry(comboArray[comboBox], TheGameText->fetch("Team:0"), def->getColor());
-	GadgetComboBoxSetItemData(comboArray[comboBox], newIndex, (void *)-1);
+	GadgetComboBoxSetItemData(comboArray[comboBox], newIndex, GadgetItemDataFromInt(-1));
 
 	if (isObserver)
 	{
@@ -314,7 +314,7 @@ void PopulateTeamComboBox(Int comboBox, GameWindow *comboArray[], GameInfo *myGa
 		teamStr.format("Team:%d", c + 1);
 		teamName = TheGameText->fetch(teamStr.str());
 		newIndex = GadgetComboBoxAddEntry(comboArray[comboBox], teamName, def->getColor());
-		GadgetComboBoxSetItemData(comboArray[comboBox], newIndex, (void *)c);
+	GadgetComboBoxSetItemData(comboArray[comboBox], newIndex, GadgetItemDataFromInt(c));
 	}
 	GadgetComboBoxSetSelectedPos(comboArray[comboBox], 0);
 }
@@ -338,7 +338,7 @@ void PopulateStartingCashComboBox(GameWindow *comboBox, GameInfo *myGame)
   {
     Int newIndex = GadgetComboBoxAddEntry(comboBox, formatMoneyForStartingCashComboBox( *it ),
                                           comboBox->winGetEnabled() ? comboBox->winGetEnabledTextColor() : comboBox->winGetDisabledTextColor());
-    GadgetComboBoxSetItemData(comboBox, newIndex, (void *)it->countMoney());
+    GadgetComboBoxSetItemData(comboBox, newIndex, GadgetItemDataFromUnsignedInt(it->countMoney()));
 
     if ( myGame->getStartingCash().amountEqual( *it ) )
     {
@@ -351,7 +351,8 @@ void PopulateStartingCashComboBox(GameWindow *comboBox, GameInfo *myGame)
     DEBUG_CRASH( ("Current selection for starting cash not found in list") );
     currentSelectionIndex = GadgetComboBoxAddEntry(comboBox, formatMoneyForStartingCashComboBox( myGame->getStartingCash() ),
                                           comboBox->winGetEnabled() ? comboBox->winGetEnabledTextColor() : comboBox->winGetDisabledTextColor());
-    GadgetComboBoxSetItemData(comboBox, currentSelectionIndex, (void *)myGame->getStartingCash().countMoney() );
+    GadgetComboBoxSetItemData(comboBox, currentSelectionIndex,
+        GadgetItemDataFromUnsignedInt(myGame->getStartingCash().countMoney()) );
   }
 
   GadgetComboBoxSetSelectedPos(comboBox, currentSelectionIndex);
@@ -473,7 +474,7 @@ void UpdateSlotList( GameInfo *myGame, GameWindow *comboPlayer[],
 				max = GadgetComboBoxGetLength(comboColor[i]);
 				for (idx=0; idx<max; ++idx)
 				{
-					Int color = (Int)GadgetComboBoxGetItemData(comboColor[i], idx);
+					Int color = GadgetItemDataToInt(GadgetComboBoxGetItemData(comboColor[i], idx));
 					if (color == slot->getColor())
 					{
 						GadgetComboBoxSetSelectedPos(comboColor[i], idx, TRUE);
@@ -486,7 +487,7 @@ void UpdateSlotList( GameInfo *myGame, GameWindow *comboPlayer[],
 				max = GadgetComboBoxGetLength(comboTeam[i]);
 				for (idx=0; idx<max; ++idx)
 				{
-					Int team = (Int)GadgetComboBoxGetItemData(comboTeam[i], idx);
+					Int team = GadgetItemDataToInt(GadgetComboBoxGetItemData(comboTeam[i], idx));
 					if (team == slot->getTeamNumber())
 					{
 						GadgetComboBoxSetSelectedPos(comboTeam[i], idx, TRUE);
@@ -499,7 +500,7 @@ void UpdateSlotList( GameInfo *myGame, GameWindow *comboPlayer[],
 				max = GadgetComboBoxGetLength(comboPlayerTemplate[i]);
 				for (idx=0; idx<max; ++idx)
 				{
-					Int playerTemplate = (Int)GadgetComboBoxGetItemData(comboPlayerTemplate[i], idx);
+					Int playerTemplate = GadgetItemDataToInt(GadgetComboBoxGetItemData(comboPlayerTemplate[i], idx));
 					if (playerTemplate == slot->getPlayerTemplate())
 					{
 						GadgetComboBoxSetSelectedPos(comboPlayerTemplate[i], idx, TRUE);

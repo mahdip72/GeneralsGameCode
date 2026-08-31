@@ -47,6 +47,10 @@
 #include "GameNetwork/NAT.h"
 #include "GameNetwork/NetCommandValidation.h"
 #include "GameNetwork/NetCommandWrapperList.h"
+#if defined(_WIN64)
+#include "Lib/NetworkEpochHandshake.h"
+#include <bcrypt.h>
+#endif
 #include "GameNetwork/networkutil.h"
 #include "GameLogic/GameLogic.h"
 #include "GameLogic/ScriptActions.h"
@@ -98,6 +102,25 @@ enum TransferFileType
 	TransferFileType_Wak,
 	TransferFileType_Count
 };
+
+#if defined(_WIN64)
+static Bool generateNetworkHelloToken(std::uint64_t *token)
+{
+	if (token == nullptr)
+		return FALSE;
+
+	*token = 0U;
+	const NTSTATUS status = BCryptGenRandom(nullptr,
+		reinterpret_cast<PUCHAR>(token), static_cast<ULONG>(sizeof(*token)),
+		BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+	if (status != 0 || *token == 0U)
+	{
+		*token = 0U;
+		return FALSE;
+	}
+	return TRUE;
+}
+#endif
 
 struct TransferFileRule
 {
@@ -238,6 +261,12 @@ ConnectionManager::~ConnectionManager()
 	deleteInstance(m_netCommandWrapperList);
 	m_netCommandWrapperList = nullptr;
 
+#if defined(_WIN64)
+	deleteInstance(m_networkHelloPendingCommands);
+	m_networkHelloPendingCommands = nullptr;
+	clearNetworkFrameRecovery();
+#endif
+
 	s_fileCommandMap.clear();
 	s_fileRecipientMaskMap.clear();
 	for (i = 0; i < MAX_SLOTS; ++i) {
@@ -262,6 +291,29 @@ ConnectionManager::ConnectionManager()
 	m_netCommandWrapperList = nullptr;
 	m_localUser = nullptr;
 	m_localUser = newInstance(User);
+#if defined(_WIN64)
+	m_networkHelloStarted = FALSE;
+	m_networkHelloRequired = FALSE;
+	m_networkHelloFailed = FALSE;
+	m_networkHelloStartTime = 0U;
+	m_networkHelloLastSend = 0U;
+	m_networkHelloAttempts = 0U;
+	m_networkHelloLocalToken = 0U;
+	m_networkHelloDeferredCount = 0U;
+	m_networkHelloPendingCommands = nullptr;
+	m_networkHelloPendingCommandCount = 0U;
+	clearNetworkFrameResendRequest();
+	for (Int i = 0; i < MAX_SLOTS; ++i) {
+		m_networkHelloValidated[i] = FALSE;
+		m_networkHelloAckReceived[i] = FALSE;
+		m_networkHelloRemoteToken[i] = 0U;
+		m_networkRecoveryWrappers[i] = nullptr;
+	}
+	m_networkHelloExpectedSlots = 0U;
+	for (Int i = 0; i < MAX_MESSAGES; ++i) {
+		m_networkHelloDeferred[i].length = 0;
+	}
+#endif
 }
 
 /**
@@ -278,6 +330,34 @@ void ConnectionManager::init()
 	for (; i < MAX_SLOTS; ++i) {
 		m_connections[i] = nullptr;
 	}
+
+#if defined(_WIN64)
+	m_networkHelloStarted = FALSE;
+	m_networkHelloRequired = FALSE;
+	m_networkHelloFailed = FALSE;
+	m_networkHelloStartTime = 0U;
+	m_networkHelloLastSend = 0U;
+	m_networkHelloAttempts = 0U;
+	m_networkHelloLocalToken = 0U;
+	m_networkHelloDeferredCount = 0U;
+	for (i = 0; i < MAX_SLOTS; ++i) {
+		m_networkHelloValidated[i] = FALSE;
+		m_networkHelloAckReceived[i] = FALSE;
+		m_networkHelloRemoteToken[i] = 0U;
+	}
+	m_networkHelloExpectedSlots = 0U;
+	for (i = 0; i < MAX_MESSAGES; ++i) {
+		m_networkHelloDeferred[i].length = 0;
+	}
+	if (m_networkHelloPendingCommands == nullptr) {
+		m_networkHelloPendingCommands = newInstance(NetCommandList);
+		m_networkHelloPendingCommands->init();
+	}
+	m_networkHelloPendingCommands->reset();
+	m_networkHelloPendingCommandCount = 0U;
+	clearNetworkFrameResendRequest();
+	clearNetworkFrameRecovery();
+#endif
 
 	if (m_pendingCommands == nullptr) {
 		m_pendingCommands = newInstance(NetCommandList);
@@ -386,6 +466,29 @@ void ConnectionManager::reset()
 #endif
 	m_packetRouterSlot = -1;
 
+#if defined(_WIN64)
+	m_networkHelloStarted = FALSE;
+	m_networkHelloRequired = FALSE;
+	m_networkHelloFailed = FALSE;
+	m_networkHelloStartTime = 0U;
+	m_networkHelloLastSend = 0U;
+	m_networkHelloAttempts = 0U;
+	m_networkHelloLocalToken = 0U;
+	m_networkHelloDeferredCount = 0U;
+	for (i = 0; i < MAX_SLOTS; ++i) {
+		m_networkHelloValidated[i] = FALSE;
+		m_networkHelloAckReceived[i] = FALSE;
+		m_networkHelloRemoteToken[i] = 0U;
+	}
+	m_networkHelloExpectedSlots = 0U;
+	for (i = 0; i < MAX_MESSAGES; ++i) {
+		m_networkHelloDeferred[i].length = 0;
+	}
+	clearNetworkHelloPendingCommands();
+	clearNetworkFrameResendRequest();
+	clearNetworkFrameRecovery();
+#endif
+
 	for (i = 0; i < TheGlobalData->m_networkFPSHistoryLength; ++i) {
 		m_fpsAverages[i] = -1;
 	}
@@ -426,6 +529,611 @@ void ConnectionManager::attachTransport(Transport *transport) {
 	m_transport = transport;
 }
 
+Bool ConnectionManager::isNetworkHelloReady() const
+{
+#if defined(_WIN64)
+	return rts::network_epoch::IsNetworkHelloGateReady(
+		m_networkHelloRequired, m_networkHelloFailed);
+#else
+	return TRUE;
+#endif
+}
+
+Bool ConnectionManager::hasNetworkHelloFailure() const
+{
+#if defined(_WIN64)
+	return m_networkHelloFailed;
+#else
+	return FALSE;
+#endif
+}
+
+#if defined(_WIN64)
+void ConnectionManager::beginNetworkHello()
+{
+	clearNetworkHelloPendingCommands();
+	m_networkHelloDeferredCount = 0U;
+	for (Int i = 0; i < MAX_MESSAGES; ++i)
+		m_networkHelloDeferred[i].length = 0;
+
+	m_networkHelloStarted = TRUE;
+	m_networkHelloRequired = FALSE;
+	m_networkHelloFailed = FALSE;
+	m_networkHelloStartTime = 0U;
+	m_networkHelloLastSend = 0U;
+	m_networkHelloAttempts = 0U;
+	m_networkHelloLocalToken = 0U;
+	m_networkHelloExpectedSlots = 0U;
+
+	Bool hasRemotePeer = FALSE;
+	for (Int i = 0; i < MAX_SLOTS; ++i)
+	{
+		m_networkHelloValidated[i] = FALSE;
+		m_networkHelloAckReceived[i] = FALSE;
+		m_networkHelloRemoteToken[i] = 0U;
+		if (m_connections[i] != nullptr)
+		{
+			hasRemotePeer = TRUE;
+			m_networkHelloExpectedSlots |= (1U << i);
+		}
+	}
+
+	if (!hasRemotePeer)
+		return;
+	if (!generateNetworkHelloToken(&m_networkHelloLocalToken))
+	{
+		rejectNetworkHello(-1, "NET3 session token generation failed");
+		return;
+	}
+
+	// parseUserList is called after the LAN/GameSpy transport has been
+	// initialized.  Keep the compatibility exchange on that common transport
+	// so the legacy lobby and NAT protocols remain byte-for-byte unchanged.
+	m_networkHelloRequired = TRUE;
+	const UnsignedInt now = static_cast<UnsignedInt>(timeGetTime());
+	m_networkHelloStartTime = now;
+	m_networkHelloLastSend = now;
+	m_networkHelloAttempts = 1U;
+	for (Int i = 0; i < MAX_SLOTS; ++i)
+	{
+		if (m_connections[i] != nullptr)
+			sendNetworkHello(i);
+	}
+}
+
+void ConnectionManager::serviceNetworkHello()
+{
+	if (!m_networkHelloRequired || m_networkHelloFailed)
+		return;
+	if (m_transport == nullptr)
+	{
+		rejectNetworkHello(-1, "NET3 handshake has no transport");
+		return;
+	}
+
+	for (Int i = 0; i < MAX_SLOTS; ++i)
+	{
+		if ((m_networkHelloExpectedSlots & (1U << i)) != 0U &&
+			(m_connections[i] == nullptr || m_connections[i]->isQuitting()))
+		{
+			rejectNetworkHello(i, "expected NET3 peer disappeared");
+			return;
+		}
+	}
+
+	UnsignedInt validatedSlots = 0U;
+	UnsignedInt acknowledgedSlots = 0U;
+	for (Int i = 0; i < MAX_SLOTS; ++i)
+	{
+		if (m_networkHelloValidated[i])
+			validatedSlots |= (1U << i);
+		if (m_networkHelloAckReceived[i])
+			acknowledgedSlots |= (1U << i);
+	}
+	if (rts::network_epoch::IsNetworkHelloComplete(m_networkHelloExpectedSlots,
+		validatedSlots, acknowledgedSlots))
+	{
+		m_networkHelloRequired = FALSE;
+		drainNetworkHelloPendingCommands();
+		return;
+	}
+
+	const UnsignedInt now = static_cast<UnsignedInt>(timeGetTime());
+	if (rts::network_epoch::IsNetworkHelloTimedOut(now, m_networkHelloStartTime))
+	{
+		rejectNetworkHello(-1, "NET3 handshake timed out");
+		return;
+	}
+	if (!rts::network_epoch::IsNetworkHelloRetryDue(now, m_networkHelloLastSend))
+		return;
+	if (rts::network_epoch::IsNetworkHelloAttemptLimitReached(m_networkHelloAttempts))
+	{
+		rejectNetworkHello(-1, "NET3 handshake retry limit reached");
+		return;
+	}
+
+	Bool needsHelloRetry = FALSE;
+	for (Int i = 0; i < MAX_SLOTS; ++i)
+	{
+		if ((m_networkHelloExpectedSlots & (1U << i)) != 0U)
+		{
+			if (!m_networkHelloValidated[i] || !m_networkHelloAckReceived[i])
+			{
+				needsHelloRetry = TRUE;
+				sendNetworkHello(i);
+			}
+		}
+	}
+	if (!needsHelloRetry)
+		return;
+	m_networkHelloLastSend = now;
+	++m_networkHelloAttempts;
+}
+
+Bool ConnectionManager::sendNetworkHello(Int slot)
+{
+	if (m_transport == nullptr || slot < 0 || slot >= MAX_SLOTS ||
+		m_connections[slot] == nullptr || m_connections[slot]->getUser() == nullptr)
+		return FALSE;
+
+	const std::array<rts::runtime_epoch::Byte, rts::network_epoch::kNetworkHelloWireSize> encoded =
+		rts::network_epoch::EncodeNetworkHello(TheGlobalData->m_exeCRC, TheGlobalData->m_iniCRC,
+		static_cast<UnsignedInt>(m_localSlot), static_cast<UnsignedInt>(slot),
+		m_networkHelloLocalToken);
+	User *user = m_connections[slot]->getUser();
+	if (m_transport->queueSend(user->GetIPAddr(), user->GetPort(), encoded.data(),
+		static_cast<Int>(encoded.size())))
+	{
+		m_networkHelloLastSend = static_cast<UnsignedInt>(timeGetTime());
+		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::sendNetworkHello - sent NET3 hello to slot %d at %X:%d",
+			slot, user->GetIPAddr(), user->GetPort()));
+		return TRUE;
+	}
+	return FALSE;
+}
+
+Bool ConnectionManager::sendNetworkHelloAck(Int slot)
+{
+	if (m_transport == nullptr || slot < 0 || slot >= MAX_SLOTS ||
+		m_connections[slot] == nullptr || m_connections[slot]->getUser() == nullptr ||
+		m_networkHelloRemoteToken[slot] == 0U)
+		return FALSE;
+
+	const std::array<rts::runtime_epoch::Byte, rts::network_epoch::kNetworkHelloWireSize> encoded =
+		rts::network_epoch::EncodeNetworkHello(TheGlobalData->m_exeCRC, TheGlobalData->m_iniCRC,
+		static_cast<UnsignedInt>(m_localSlot), static_cast<UnsignedInt>(slot),
+		m_networkHelloRemoteToken[slot],
+		rts::network_epoch::NetworkHelloKind::Ack);
+	User *user = m_connections[slot]->getUser();
+	if (m_transport->queueSend(user->GetIPAddr(), user->GetPort(), encoded.data(),
+		static_cast<Int>(encoded.size())))
+	{
+		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::sendNetworkHelloAck - sent NET3 ack to slot %d at %X:%d",
+			slot, user->GetIPAddr(), user->GetPort()));
+		return TRUE;
+	}
+
+	DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::sendNetworkHelloAck - send queue full for slot %d; peer hello retry will request another ack",
+		slot));
+	return FALSE;
+}
+
+Int ConnectionManager::findNetworkHelloSlot(UnsignedInt senderSlot, UnsignedInt recipientSlot) const
+{
+	if (recipientSlot != m_localSlot || senderSlot >= MAX_SLOTS ||
+		senderSlot == m_localSlot || m_connections[senderSlot] == nullptr ||
+		m_connections[senderSlot]->isQuitting())
+		return -1;
+	return static_cast<Int>(senderSlot);
+}
+
+Bool ConnectionManager::matchesNetworkPeerEndpoint(const TransportMessage &message, Int slot) const
+{
+	if (slot < 0 || slot >= MAX_SLOTS || m_connections[slot] == nullptr ||
+		m_connections[slot]->getUser() == nullptr)
+	{
+		return FALSE;
+	}
+
+	User *user = m_connections[slot]->getUser();
+	return rts::network_epoch::IsMatchingNetworkPeerEndpoint(
+		message.addr, message.port, user->GetIPAddr(), user->GetPort());
+}
+
+Int ConnectionManager::findNetworkPeerEndpoint(const TransportMessage &message) const
+{
+	for (Int slot = 0; slot < MAX_SLOTS; ++slot)
+	{
+		if (m_connections[slot] != nullptr && !m_connections[slot]->isQuitting() &&
+			matchesNetworkPeerEndpoint(message, slot))
+		{
+			return slot;
+		}
+	}
+	return -1;
+}
+
+Bool ConnectionManager::isKnownNetworkPeerEndpoint(const TransportMessage &message) const
+{
+	return findNetworkPeerEndpoint(message) >= 0;
+}
+
+Bool ConnectionManager::isNetworkCommandSourceAuthorized(const NetCommandMsg *msg, Int sourceSlot) const
+{
+	if (msg == nullptr || sourceSlot < 0 || sourceSlot >= MAX_SLOTS)
+		return FALSE;
+
+	UnsignedInt packetRouterSlot = MAX_SLOTS;
+	if (m_packetRouterSlot < MAX_SLOTS && m_packetRouterSlot != m_localSlot &&
+		m_connections[m_packetRouterSlot] != nullptr &&
+		!m_connections[m_packetRouterSlot]->isQuitting())
+	{
+		packetRouterSlot = m_packetRouterSlot;
+	}
+
+	return rts::network_epoch::IsNetworkCommandSourceAuthorized(
+		static_cast<std::uint32_t>(sourceSlot),
+		static_cast<std::uint32_t>(msg->getPlayerID()),
+		static_cast<std::uint32_t>(packetRouterSlot));
+}
+
+void ConnectionManager::clearNetworkFrameResendRequest()
+{
+	m_frameResendRequestOutstanding = FALSE;
+	m_frameResendRequestResponder = MAX_SLOTS;
+	m_frameResendRequestFrame = 0U;
+	m_frameResendRequestStartTime = 0U;
+	m_frameResendRequestExpectedInfoMask = 0U;
+	m_frameResendRequestReceivedInfoMask = 0U;
+}
+
+void ConnectionManager::clearNetworkFrameRecovery()
+{
+	m_networkWrapperAckHistory.clear();
+	for (Int slot = 0; slot < MAX_SLOTS; ++slot)
+	{
+		m_disconnectFrameRecovery[slot] = {};
+		deleteInstance(m_networkRecoveryWrappers[slot]);
+		m_networkRecoveryWrappers[slot] = nullptr;
+	}
+}
+
+void ConnectionManager::allowNetworkDisconnectFrameRecovery(UnsignedInt responder,
+	UnsignedInt firstFrame, UnsignedInt endFrame)
+{
+	if (responder >= MAX_SLOTS || responder == m_localSlot ||
+		m_connections[responder] == nullptr || m_connections[responder]->isQuitting())
+		return;
+
+	UnsignedInt originMask = 0U;
+	for (Int slot = 0; slot < MAX_SLOTS; ++slot)
+		if (slot != m_localSlot && m_frameData[slot] != nullptr)
+			originMask |= 1U << slot;
+	rts::network_epoch::TrySetNetworkDisconnectFrameRecovery(m_disconnectFrameRecovery[responder],
+		firstFrame, endFrame, originMask, TheGameLogic->getFrame(), FRAMES_TO_KEEP);
+}
+
+Bool ConnectionManager::isNetworkFrameRecoveryAuthorized(const NetCommandMsg *command,
+	Int sourceSlot, Bool wrapper) const
+{
+	if (sourceSlot < 0 || sourceSlot >= MAX_SLOTS || command == nullptr ||
+		m_connections[sourceSlot] == nullptr || m_connections[sourceSlot]->isQuitting())
+		return FALSE;
+	const UnsignedInt now = static_cast<UnsignedInt>(timeGetTime());
+	const UnsignedInt currentFrame = TheGameLogic->getFrame();
+	const Bool isFrameData = wrapper ? command->getNetCommandType() == NETCOMMANDTYPE_WRAPPER :
+		IsCommandSynchronized(command->getNetCommandType());
+	const Bool requestExpired = static_cast<UnsignedInt>(now - m_frameResendRequestStartTime) >=
+		rts::network_epoch::kNetworkFrameResendResponseTimeoutMs;
+	if (currentFrame <= m_frameResendRequestFrame &&
+		rts::network_epoch::IsNetworkFrameResendResponseAuthorized(sourceSlot,
+			m_frameResendRequestResponder, command->getPlayerID(), m_frameResendRequestExpectedInfoMask,
+			MAX_SLOTS, m_frameResendRequestOutstanding, requestExpired, isFrameData,
+			wrapper ? m_frameResendRequestFrame : command->getExecutionFrame(), m_frameResendRequestFrame))
+		return TRUE;
+	return rts::network_epoch::IsNetworkDisconnectFrameRecoveryAuthorized(
+		m_disconnectFrameRecovery[sourceSlot], command->getPlayerID(), MAX_SLOTS,
+		currentFrame, FRAMES_TO_KEEP, isFrameData,
+		wrapper ? currentFrame : command->getExecutionFrame());
+}
+
+void ConnectionManager::ackNetworkFrameRecoveryCommand(NetCommandRef *ref, Int sourceSlot)
+{
+	if (sourceSlot < 0 || sourceSlot >= MAX_SLOTS || m_connections[sourceSlot] == nullptr ||
+		m_connections[sourceSlot]->isQuitting())
+		return;
+	// Direct data, including the responder's own origin, belongs to this peer's
+	// resend queue, not a separate packet router's queue.
+	NetAckBothCommandMsg *ack = newInstance(NetAckBothCommandMsg)(ref->getCommand());
+	ack->setPlayerID(m_localSlot);
+	m_connections[sourceSlot]->sendNetCommandMsg(ack, 1U << sourceSlot);
+	ack->detach();
+}
+
+Bool ConnectionManager::processNetworkFrameRecoveryWrapper(NetCommandRef *ref, Int sourceSlot)
+{
+	if (sourceSlot < 0 || sourceSlot >= MAX_SLOTS || m_connections[sourceSlot] == nullptr ||
+		m_connections[sourceSlot]->isQuitting())
+		return FALSE;
+	const Bool sourceAuthorized = isNetworkCommandSourceAuthorized(ref->getCommand(), sourceSlot);
+	if (!rts::network_epoch::IsNetworkFrameRecoveryDelivery(TRUE, ref->getRelay(), m_localSlot, MAX_SLOTS))
+		return FALSE;
+	const NetWrapperCommandMsg *wrapper = static_cast<NetWrapperCommandMsg *>(ref->getCommand());
+	if (!rts::network_epoch::IsNetworkRecoveryWrapperBounded(
+		wrapper->getTotalDataLength(), wrapper->getNumChunks()))
+		return FALSE;
+	const size_t receiptSize = wrapper->getSizeForNetPacket();
+	std::array<rts::runtime_epoch::Byte, rts::network_epoch::kNetworkWrapperAckMaxBytes> receiptBytes;
+	if (receiptSize == 0U || receiptSize > receiptBytes.size() ||
+		wrapper->copyBytesForNetPacket(receiptBytes.data(), *ref) != receiptSize)
+		return FALSE;
+	const UnsignedInt receiptKey = rts::network_epoch::MakeNetworkWrapperAckKey(
+		sourceSlot, wrapper->getPlayerID(), wrapper->getID());
+	const UnsignedInt now = static_cast<UnsignedInt>(timeGetTime());
+	if (!sourceAuthorized && !isNetworkFrameRecoveryAuthorized(ref->getCommand(), sourceSlot, TRUE))
+	{
+		// A lost ACK may be retried after catch-up revoked the frame proof.
+		// Only a previously accepted exact chunk may be ACKed without it.
+		if (m_networkWrapperAckHistory.matches(receiptKey, receiptBytes.data(), receiptSize, now))
+			ackNetworkFrameRecoveryCommand(ref, sourceSlot);
+		return FALSE;
+	}
+
+	// Local-only bounded wrappers always use the same responder-specific list,
+	// even when no proof exists or it expires mid-transfer. Their payload may
+	// be ordinary file/control data: only decoding can distinguish recovery.
+	NetCommandWrapperList *&wrappers = m_networkRecoveryWrappers[sourceSlot];
+	if (wrappers == nullptr)
+	{
+		wrappers = newInstance(NetCommandWrapperList);
+		wrappers->init();
+	}
+	if (!processWrapper(ref, wrappers))
+		return FALSE;
+	m_networkWrapperAckHistory.remember(receiptKey, receiptBytes.data(), receiptSize, now);
+	ackNetworkFrameRecoveryCommand(ref, sourceSlot);
+	NetCommandList *ready = wrappers->getReadyCommands();
+	Bool accepted = FALSE;
+	for (NetCommandRef *command = ready->getFirstMessage(); command; command = command->getNext())
+	{
+		const Bool decodedSourceAuthorized = isNetworkCommandSourceAuthorized(command->getCommand(), sourceSlot);
+		const Bool frameRecoveryDelivery = rts::network_epoch::IsNetworkFrameRecoveryDelivery(
+			isNetworkFrameRecoveryAuthorized(command->getCommand(), sourceSlot, FALSE),
+			command->getRelay(), m_localSlot, MAX_SLOTS);
+		if (!decodedSourceAuthorized && !frameRecoveryDelivery)
+			continue;
+		if (frameRecoveryDelivery)
+			command->setRelay(1U << m_localSlot);
+		else if (CommandRequiresAck(command->getCommand()))
+			ackCommand(command, m_localSlot);
+		if (!processNetCommand(command))
+			sendRemoteCommand(command);
+		if (frameRecoveryDelivery && command->getCommand()->getNetCommandType() == NETCOMMANDTYPE_FRAMEINFO &&
+			m_frameResendRequestOutstanding && sourceSlot == m_frameResendRequestResponder &&
+			command->getCommand()->getExecutionFrame() == m_frameResendRequestFrame)
+			m_frameResendRequestReceivedInfoMask |= 1U << command->getCommand()->getPlayerID();
+		accepted = accepted || frameRecoveryDelivery;
+	}
+	deleteInstance(ready);
+	return accepted;
+}
+
+void ConnectionManager::rejectNetworkHello(Int slot, const char *reason)
+{
+	m_networkHelloFailed = TRUE;
+	clearNetworkHelloPendingCommands();
+	for (UnsignedInt index = 0; index < m_networkHelloDeferredCount; ++index)
+		m_networkHelloDeferred[index].length = 0;
+	m_networkHelloDeferredCount = 0U;
+	DEBUG_LOG(("ConnectionManager::rejectNetworkHello - rejecting slot %d: %s",
+		slot, reason != nullptr ? reason : "invalid NET3 record"));
+	if (slot >= 0 && slot < MAX_SLOTS && m_connections[slot] != nullptr)
+		m_connections[slot]->setQuitting();
+}
+
+void ConnectionManager::dropInvalidNetworkHelloPacket(Int slot, const char *reason)
+{
+	// Invalid NET3 traffic is consumed by the caller, but it must not alter
+	// membership or the handshake gate. A valid retry from the same endpoint
+	// may still complete the bounded exchange; an incomplete exchange reaches
+	// the normal retry/timeout failure path.
+	DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::dropInvalidNetworkHelloPacket - dropping packet for slot %d: %s",
+		slot, reason != nullptr ? reason : "invalid NET3 peer"));
+}
+
+Bool ConnectionManager::isNetworkHelloCandidate(const TransportMessage &message) const
+{
+	rts::network_epoch::NetworkHelloIdentity identity;
+	if (!rts::network_epoch::DecodeNetworkHelloIdentity(
+		reinterpret_cast<const rts::runtime_epoch::Byte *>(message.data),
+		message.length > 0 ? static_cast<std::size_t>(message.length) : 0U,
+		&identity))
+	{
+		return FALSE;
+	}
+
+	const Int slot = findNetworkHelloSlot(identity.senderSlot, identity.recipientSlot);
+	return matchesNetworkPeerEndpoint(message, slot);
+}
+
+void ConnectionManager::deferNetworkMessage(const TransportMessage &message)
+{
+	if (m_networkHelloFailed)
+		return;
+
+	const Int sourceSlot = findNetworkPeerEndpoint(message);
+	if (sourceSlot < 0)
+	{
+		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::deferNetworkMessage - discarding packet from unknown or unavailable endpoint"));
+		return;
+	}
+
+	UnsignedInt peerDeferredMessages = 0U;
+	for (UnsignedInt index = 0U; index < m_networkHelloDeferredCount; ++index)
+	{
+		if (matchesNetworkPeerEndpoint(m_networkHelloDeferred[index], sourceSlot))
+			++peerDeferredMessages;
+	}
+	if (rts::network_epoch::IsNetworkHelloDeferredPeerQuotaExceeded(
+		peerDeferredMessages, static_cast<UnsignedInt>(MAX_MESSAGES), static_cast<UnsignedInt>(MAX_SLOTS)))
+	{
+		dropInvalidNetworkHelloPacket(sourceSlot, "NET3 deferred packet queue peer limit exceeded");
+		return;
+	}
+
+	if (m_networkHelloDeferredCount >= static_cast<UnsignedInt>(MAX_MESSAGES))
+	{
+		// A full shared queue must not let one packet disconnect unrelated peers.
+		// Drop only this incoming packet; the fixed queue remains bounded and the
+		// peer can still complete the exchange with a later valid Hello.
+		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::deferNetworkMessage - dropping packet from slot %d because the shared queue is full",
+			sourceSlot));
+		return;
+	}
+
+	m_networkHelloDeferred[m_networkHelloDeferredCount] = message;
+	++m_networkHelloDeferredCount;
+}
+
+Bool ConnectionManager::queueNetworkHelloCommand(NetCommandMsg *msg, UnsignedByte relay)
+{
+	if (msg == nullptr || m_networkHelloFailed || m_networkHelloPendingCommands == nullptr)
+		return FALSE;
+
+	NetCommandRef *existing = m_networkHelloPendingCommands->findMessage(msg);
+	if (existing != nullptr)
+	{
+		// NetCommandList intentionally suppresses equivalent duplicates. Preserve
+		// every destination requested by callers instead of silently retaining
+		// only the first duplicate's relay mask.
+		existing->setRelay(existing->getRelay() | relay);
+		return TRUE;
+	}
+	if (m_networkHelloPendingCommandCount >= static_cast<UnsignedInt>(MAX_MESSAGES))
+	{
+		rejectNetworkHello(-1, "NET3 pending command queue overflow");
+		return FALSE;
+	}
+
+	NetCommandRef *ref = m_networkHelloPendingCommands->addMessage(msg);
+	if (ref == nullptr)
+	{
+		rejectNetworkHello(-1, "NET3 pending command queue insertion failure");
+		return FALSE;
+	}
+
+	ref->setRelay(relay);
+	++m_networkHelloPendingCommandCount;
+	return TRUE;
+}
+
+void ConnectionManager::clearNetworkHelloPendingCommands()
+{
+	if (m_networkHelloPendingCommands != nullptr)
+		m_networkHelloPendingCommands->reset();
+	m_networkHelloPendingCommandCount = 0U;
+}
+
+void ConnectionManager::drainNetworkHelloPendingCommands()
+{
+	if (m_networkHelloPendingCommands == nullptr ||
+		m_networkHelloPendingCommandCount == 0U)
+		return;
+
+	NetCommandRef *ref = m_networkHelloPendingCommands->getFirstMessage();
+	while (ref != nullptr)
+	{
+		NetCommandRef *next = ref->getNext();
+		NetCommandMsg *msg = ref->getCommand();
+		const UnsignedByte relay = ref->getRelay();
+
+		m_networkHelloPendingCommands->removeMessage(ref);
+		if (m_networkHelloPendingCommandCount > 0U)
+			--m_networkHelloPendingCommandCount;
+
+		// The pending reference retains ownership while the normal send path
+		// creates its own references. Release it only after the immediate send
+		// has completed.
+		sendLocalCommandImmediate(msg, relay);
+		deleteInstance(ref);
+		ref = next;
+	}
+
+	m_networkHelloPendingCommandCount = 0U;
+}
+
+Bool ConnectionManager::processNetworkHello(const TransportMessage &message, Bool enforceFailure)
+{
+	rts::network_epoch::NetworkHelloKind kind;
+	rts::network_epoch::NetworkHelloIdentity identity;
+	std::uint64_t receivedSessionToken = 0U;
+	rts::runtime_epoch::NetworkHello hello;
+	const rts::runtime_epoch::ValidationResult result =
+		rts::network_epoch::DecodeAndValidateNetworkHelloRecord(
+			message.data, static_cast<std::size_t>(message.length),
+			TheGlobalData->m_exeCRC, TheGlobalData->m_iniCRC,
+			&hello, &kind, &identity, &receivedSessionToken);
+	if (!result.ok())
+	{
+		if (enforceFailure)
+		{
+			rts::network_epoch::NetworkHelloIdentity candidateIdentity;
+			Int candidateSlot = -1;
+			if (rts::network_epoch::DecodeNetworkHelloIdentity(
+				reinterpret_cast<const rts::runtime_epoch::Byte *>(message.data),
+				message.length > 0 ? static_cast<std::size_t>(message.length) : 0U,
+				&candidateIdentity))
+			{
+				candidateSlot = findNetworkHelloSlot(candidateIdentity.senderSlot,
+					candidateIdentity.recipientSlot);
+			}
+			if (candidateSlot >= 0)
+				dropInvalidNetworkHelloPacket(candidateSlot, "malformed or incompatible NET3 record");
+		}
+		else
+			DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::processNetworkHello - ignoring malformed late NET3 record"));
+		return FALSE;
+	}
+
+	const Int slot = findNetworkHelloSlot(identity.senderSlot, identity.recipientSlot);
+	if (slot < 0)
+	{
+		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::processNetworkHello - ignoring unknown or unavailable NET3 identity"));
+		return FALSE;
+	}
+
+	if (!rts::network_epoch::IsNetworkHelloSessionTokenAccepted(
+		kind, m_networkHelloLocalToken, receivedSessionToken))
+	{
+		// A delayed record from an earlier exchange must not disconnect the
+		// current peer. Keep the gate closed and let the current Hello retry or
+		// the bounded timeout resolve the exchange.
+		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::processNetworkHello - ignoring stale NET3 token from slot %d", slot));
+		return FALSE;
+	}
+
+	if (kind == rts::network_epoch::NetworkHelloKind::Hello)
+	{
+		m_networkHelloRemoteToken[slot] = receivedSessionToken;
+		m_networkHelloValidated[slot] = TRUE;
+		// A duplicate or newer Hello replaces the remembered peer challenge and
+		// is deliberately answered again. This makes the
+		// exchange recover when the first Ack was lost or the send queue was
+		// temporarily full.
+		sendNetworkHelloAck(slot);
+		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::processNetworkHello - accepted NET3 hello from slot %d",
+			slot));
+	}
+	else if (kind == rts::network_epoch::NetworkHelloKind::Ack)
+	{
+		m_networkHelloAckReceived[slot] = TRUE;
+		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::processNetworkHello - accepted NET3 ack from slot %d",
+			slot));
+	}
+	return TRUE;
+}
+#endif
+
 /**
  * zero out the command counts for the given frames.  Presently this is used for
  * the start of a game since there won't be any commands for the first few frames due to runahead.
@@ -459,10 +1167,205 @@ void ConnectionManager::destroyGameMessages() {
  * Get those commands and relay them to the appropriate Connection(s). We make the
  * assumption that a command will only be relayed once.
  */
+void ConnectionManager::processTransportMessage(const TransportMessage &message)
+{
+	#if defined(_WIN64)
+	const Int sourceSlot = findNetworkPeerEndpoint(message);
+	if (sourceSlot < 0)
+	{
+		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::processTransportMessage - discarding packet from unknown or unavailable endpoint"));
+		return;
+	}
+
+	const UnsignedInt now = static_cast<UnsignedInt>(timeGetTime());
+	const Bool frameResendExpired = m_frameResendRequestOutstanding &&
+		static_cast<UnsignedInt>(now - m_frameResendRequestStartTime) >=
+		rts::network_epoch::kNetworkFrameResendResponseTimeoutMs;
+	if (frameResendExpired)
+		clearNetworkFrameResendRequest();
+	Bool frameResendResponseAccepted = FALSE;
+	UnsignedInt frameResendInfoMask = 0U;
+	#endif
+
+	NetPacket packet(message);
+	NetCommandList *cmdList = packet.getCommandList();
+	for (NetCommandRef* cmd = cmdList->getFirstMessage(); cmd; cmd = cmd->getNext()) {
+		#if defined(_WIN64)
+		NetCommandMsg *command = cmd->getCommand();
+		const Bool sourceAuthorized = isNetworkCommandSourceAuthorized(cmd->getCommand(), sourceSlot);
+		if (command->getNetCommandType() == NETCOMMANDTYPE_WRAPPER)
+		{
+			const NetWrapperCommandMsg *wrapper = static_cast<NetWrapperCommandMsg *>(command);
+			if (rts::network_epoch::ShouldStageNetworkFrameWrapper(sourceAuthorized,
+				cmd->getRelay(), m_localSlot, MAX_SLOTS, wrapper->getTotalDataLength(), wrapper->getNumChunks()))
+			{
+				if (processNetworkFrameRecoveryWrapper(cmd, sourceSlot))
+					frameResendResponseAccepted = TRUE;
+				continue;
+			}
+		}
+		const Bool isFrameDataCommand = IsCommandSynchronized(command->getNetCommandType());
+		const Bool frameResendResponseAuthorized =
+			rts::network_epoch::IsNetworkFrameResendResponseAuthorized(
+				static_cast<std::uint32_t>(sourceSlot),
+				m_frameResendRequestResponder,
+				static_cast<std::uint32_t>(command->getPlayerID()),
+				m_frameResendRequestExpectedInfoMask,
+				static_cast<std::uint32_t>(MAX_SLOTS),
+				m_frameResendRequestOutstanding,
+				frameResendExpired,
+				isFrameDataCommand,
+				static_cast<std::uint32_t>(command->getExecutionFrame()),
+				static_cast<std::uint32_t>(m_frameResendRequestFrame));
+		const Bool frameRecoveryAuthorized = isNetworkFrameRecoveryAuthorized(command, sourceSlot, FALSE);
+		const Bool frameRecoveryDelivery = rts::network_epoch::IsNetworkFrameRecoveryDelivery(
+			frameResendResponseAuthorized || frameRecoveryAuthorized, cmd->getRelay(), m_localSlot, MAX_SLOTS);
+		const Bool directFrameAck = frameRecoveryDelivery || rts::network_epoch::ShouldAckNetworkDirectFrame(
+			sourceAuthorized, isFrameDataCommand, cmd->getRelay(), m_localSlot, MAX_SLOTS,
+			command->getExecutionFrame(), TheGameLogic->getFrame());
+		if (!sourceAuthorized && !frameRecoveryDelivery)
+		{
+			if (directFrameAck)
+				ackNetworkFrameRecoveryCommand(cmd, sourceSlot);
+			DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::processTransportMessage - discarding command with mismatched claimed source"));
+			continue;
+		}
+		if (frameResendResponseAuthorized && frameRecoveryDelivery)
+		{
+			frameResendResponseAccepted = TRUE;
+			if (command->getNetCommandType() == NETCOMMANDTYPE_FRAMEINFO)
+				frameResendInfoMask |= 1U << command->getPlayerID();
+		}
+		if (frameRecoveryDelivery)
+		{
+			// A recovery permission is local publication, never relay authority.
+			cmd->setRelay(1U << m_localSlot);
+		}
+		if (directFrameAck && CommandRequiresAck(command))
+			ackNetworkFrameRecoveryCommand(cmd, sourceSlot);
+		else
+		#endif
+		if (CommandRequiresAck(cmd->getCommand())) {
+			ackCommand(cmd, m_localSlot);
+		}
+		if (!processNetCommand(cmd)) {
+			sendRemoteCommand(cmd);
+		}
+	}
+	deleteInstance(cmdList);
+
+	#if defined(_WIN64)
+	if (frameResendInfoMask != 0U)
+		m_frameResendRequestReceivedInfoMask |= frameResendInfoMask;
+	if (frameResendResponseAccepted && m_frameResendRequestOutstanding)
+	{
+		UnsignedInt frameResendReadyCommandMask = 0U;
+		for (Int sourceSlot = 0; sourceSlot < MAX_SLOTS; ++sourceSlot)
+		{
+			const UnsignedInt sourceMask = 1U << sourceSlot;
+			if ((m_frameResendRequestExpectedInfoMask & sourceMask) != 0U &&
+				m_frameData[sourceSlot] != nullptr &&
+				m_frameData[sourceSlot]->getFrameCommandCount(m_frameResendRequestFrame) ==
+				m_frameData[sourceSlot]->getCommandCount(m_frameResendRequestFrame))
+			{
+				frameResendReadyCommandMask |= sourceMask;
+			}
+		}
+		if (rts::network_epoch::IsNetworkFrameResendResponseComplete(
+			m_frameResendRequestExpectedInfoMask,
+			m_frameResendRequestReceivedInfoMask,
+			frameResendReadyCommandMask))
+		{
+			clearNetworkFrameResendRequest();
+		}
+	}
+	#endif
+}
+
 void ConnectionManager::doRelay() {
+	#if defined(_WIN64)
+	if (m_networkHelloFailed)
+	{
+		// Compatibility or CSPRNG failure is terminal for this network
+		// instance. Never allow queued gameplay traffic to bypass the gate.
+		for (size_t i = 0; i < ARRAY_SIZE(m_transport->m_inBuffer); ++i)
+			m_transport->m_inBuffer[i].length = 0;
+		return;
+	}
+	if (!m_networkHelloRequired && m_networkHelloDeferredCount > 0U)
+	{
+		for (UnsignedInt index = 0; index < m_networkHelloDeferredCount; ++index)
+		{
+			if (m_networkHelloDeferred[index].length > 0)
+				processTransportMessage(m_networkHelloDeferred[index]);
+			m_networkHelloDeferred[index].length = 0;
+		}
+		m_networkHelloDeferredCount = 0U;
+	}
+	#endif
+
 	for (size_t i = 0; i < ARRAY_SIZE(m_transport->m_inBuffer); ++i) {
 		if (m_transport->m_inBuffer[i].length > 0) {
 			// This transport buffer has yet to be processed.
+#if defined(_WIN64)
+		TransportMessage &message = m_transport->m_inBuffer[i];
+		const std::size_t messageLength = static_cast<std::size_t>(message.length);
+		const bool hasNetworkHelloPrefix = rts::network_epoch::HasNetworkHelloPrefix(message.data, messageLength);
+		const Int sourceSlot = findNetworkPeerEndpoint(message);
+		const bool endpointKnown = sourceSlot >= 0;
+		if (hasNetworkHelloPrefix)
+		{
+			if (!m_networkHelloStarted)
+			{
+				// A peer may finish sending while this process is still building
+				// its GameInfo connection list. Do not acknowledge pre-start
+				// records: beginNetworkHello() will send a fresh Hello and the
+				// peer will retry its record if needed.
+				DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::doRelay - ignoring pre-start NET3 record"));
+				message.length = 0;
+				continue;
+			}
+
+			const bool hasNetworkHelloMagic = rts::network_epoch::HasNetworkHelloMagic(message.data, messageLength);
+			const rts::network_epoch::NetworkIngressDisposition disposition =
+				rts::network_epoch::ClassifyNetworkIngress(true, hasNetworkHelloMagic,
+					m_networkHelloRequired, endpointKnown, hasNetworkHelloMagic && isNetworkHelloCandidate(message));
+			if (disposition == rts::network_epoch::NetworkIngressDisposition::Process)
+				processNetworkHello(message, m_networkHelloRequired);
+			else if (disposition == rts::network_epoch::NetworkIngressDisposition::Quarantine)
+			{
+				if (sourceSlot >= 0)
+					dropInvalidNetworkHelloPacket(sourceSlot, "malformed or unsupported NET3 payload");
+				else
+					DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::doRelay - discarding malformed or unsupported NET3 payload"));
+			}
+			else
+				DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::doRelay - discarding unknown NET3 payload"));
+			message.length = 0;
+			continue;
+		}
+
+		if (m_networkHelloRequired)
+		{
+			const rts::network_epoch::NetworkIngressDisposition disposition =
+				rts::network_epoch::ClassifyNetworkIngress(false, false, true, endpointKnown, false);
+			if (disposition == rts::network_epoch::NetworkIngressDisposition::Defer)
+				deferNetworkMessage(message);
+			else
+				DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::doRelay - discarding packet from unknown peer endpoint"));
+			message.length = 0;
+			continue;
+		}
+
+		const rts::network_epoch::NetworkIngressDisposition disposition =
+			rts::network_epoch::ClassifyNetworkIngress(false, false, false, endpointKnown, false);
+		if (disposition == rts::network_epoch::NetworkIngressDisposition::Process)
+			processTransportMessage(message);
+		else
+			DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::doRelay - discarding gameplay packet from unknown peer endpoint"));
+		message.length = 0;
+		continue;
+#endif
 
 			// make a NetPacket out of this data so it can be broken up into individual commands.
 			NetPacket packet(m_transport->m_inBuffer[i]);
@@ -491,10 +1394,23 @@ void ConnectionManager::doRelay() {
 
 			// signal that this has been processed.
 			m_transport->m_inBuffer[i].length = 0;
-		} else {
+		}
+#if !defined(_WIN64)
+		else {
 			break;
 		}
+#endif
 	}
+
+#if defined(_WIN64)
+	// Wrapper chunks are ordinary gameplay traffic and must remain held until
+	// every peer has passed the compatibility exchange.
+	if (m_networkHelloRequired)
+		return;
+	for (Int sourceSlot = 0; sourceSlot < MAX_SLOTS; ++sourceSlot)
+		if (m_networkRecoveryWrappers[sourceSlot] != nullptr)
+			m_networkRecoveryWrappers[sourceSlot]->purgeExpired(static_cast<UnsignedInt>(timeGetTime()));
+#endif
 
 	NetCommandList *cmdList = m_netCommandWrapperList->getReadyCommands();
 	for (NetCommandRef* cmd = cmdList->getFirstMessage(); cmd; cmd = cmd->getNext()) {
@@ -645,14 +1561,22 @@ void ConnectionManager::processFrameResendRequest(NetFrameResendRequestCommandMs
 		return;
 	}
 
+#if defined(_WIN64)
+	// Native provenance is exactly the requested frame, not an open-ended
+	// permission for every subsequent command in the responder's cache.
+	sendSingleFrameToPlayer(playerID, msg->getFrameToResend());
+#else
 	sendFrameDataToPlayer(playerID, msg->getFrameToResend());
+#endif
 }
 
 /**
  * We have received a wrapper for a command too big to fit in a packet.
  */
-void ConnectionManager::processWrapper(NetCommandRef *ref)
+Bool ConnectionManager::processWrapper(NetCommandRef *ref, NetCommandWrapperList *wrappers)
 {
+	if (wrappers == nullptr)
+		wrappers = m_netCommandWrapperList;
 	NetWrapperCommandMsg *wrapperMsg = (NetWrapperCommandMsg *)(ref->getCommand());
 	UnsignedShort commandID = wrapperMsg->getWrappedCommandID();
 	DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::processWrapper() - wrapped commandID is %d, commandID is %d",
@@ -666,11 +1590,11 @@ void ConnectionManager::processWrapper(NetCommandRef *ref)
 	DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::processWrapper() - origProgress[%d] == %d for command %d",
 		m_localSlot, origProgress, commandID));
 
-	const Bool accepted = m_netCommandWrapperList->processWrapper(ref);
+	const Bool accepted = wrappers->processWrapper(ref);
 
 	if (accepted && fcIt != s_fileCommandMap.end())
 	{
-		Int newProgress = m_netCommandWrapperList->getPercentComplete(wrapperMsg->getPlayerID(), commandID);
+		Int newProgress = wrappers->getPercentComplete(wrapperMsg->getPlayerID(), commandID);
 		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::processWrapper() - newProgress[%d] == %d for command %d",
 			m_localSlot, newProgress, commandID));
 		if (newProgress > origProgress && newProgress < 100)
@@ -693,6 +1617,7 @@ void ConnectionManager::processWrapper(NetCommandRef *ref)
 			msg->detach();
 		}
 	}
+	return accepted;
 }
 
 /**
@@ -1316,6 +2241,11 @@ void ConnectionManager::update(Bool isInGame) {
 		return;
 	}
 
+#if defined(_WIN64)
+	serviceNetworkHello();
+#endif
+	if (m_transport == nullptr)
+		return;
 	m_transport->doRecv();
 
 	if (isInGame) {
@@ -1620,7 +2550,46 @@ void ConnectionManager::sendLocalGameMessage(GameMessage *msg, UnsignedInt frame
  * in the relay field.  Commands sent in this way go through the packet router.
  */
 void ConnectionManager::sendLocalCommand(NetCommandMsg *msg, UnsignedByte relay /* = 0xff by default*/) {
-	if (CommandRequiresDirectSend(msg) || (m_packetRouterSlot < 0) || (m_packetRouterSlot >= MAX_SLOTS) || (m_connections[m_packetRouterSlot] == nullptr)) {
+	#if defined(_WIN64)
+	if (msg != nullptr && !isNetworkHelloReady())
+	{
+		const NetCommandType commandType = msg->getNetCommandType();
+		const Bool isFileTraffic =
+			commandType == NETCOMMANDTYPE_FILE ||
+			commandType == NETCOMMANDTYPE_FILEANNOUNCE ||
+			commandType == NETCOMMANDTYPE_FILEPROGRESS;
+		if (IsCommandSynchronized(commandType) || isFileTraffic)
+		{
+			if (queueNetworkHelloCommand(msg, relay))
+			{
+				DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::sendLocalCommand - queued command type %d until NET3 is ready", commandType));
+			}
+			return;
+		}
+	}
+	#endif
+
+	sendLocalCommandImmediate(msg, relay);
+}
+
+void ConnectionManager::sendLocalCommandImmediate(NetCommandMsg *msg, UnsignedByte relay) {
+
+	const Bool packetRouterHasConnection = m_packetRouterSlot < MAX_SLOTS &&
+		m_connections[m_packetRouterSlot] != nullptr;
+	const Bool packetRouterIsQuitting = packetRouterHasConnection &&
+		m_connections[m_packetRouterSlot]->isQuitting();
+	Bool packetRouterEligible = FALSE;
+#if defined(_WIN64)
+	packetRouterEligible = rts::network_epoch::IsNetworkPacketRouterEligible(
+		m_packetRouterSlot, m_localSlot, MAX_SLOTS, packetRouterHasConnection, packetRouterIsQuitting);
+#else
+	// Keep the legacy Win32/VC6 router decision local because the NET3 helper
+	// is only available to the native x64 handshake lane.
+	packetRouterEligible = m_packetRouterSlot < MAX_SLOTS &&
+		(m_packetRouterSlot == m_localSlot ||
+		(packetRouterHasConnection && !packetRouterIsQuitting));
+#endif
+	if (CommandRequiresDirectSend(msg) || !packetRouterEligible) {
 		sendLocalCommandDirect(msg, relay);
 		return;
 	}
@@ -1854,6 +2823,22 @@ PlayerLeaveCode ConnectionManager::disconnectPlayer(Int slot) {
 
 	if (m_netCommandWrapperList != nullptr)
 		m_netCommandWrapperList->removeForPlayer(static_cast<UnsignedByte>(slot));
+#if defined(_WIN64)
+	m_disconnectFrameRecovery[slot] = {};
+	m_networkWrapperAckHistory.removePeer(static_cast<UnsignedInt>(slot));
+	deleteInstance(m_networkRecoveryWrappers[slot]);
+	m_networkRecoveryWrappers[slot] = nullptr;
+	for (Int responder = 0; responder < MAX_SLOTS; ++responder)
+	{
+		m_disconnectFrameRecovery[responder].originMask &= ~(1U << slot);
+		if (m_networkRecoveryWrappers[responder] != nullptr)
+			m_networkRecoveryWrappers[responder]->removeForPlayer(static_cast<UnsignedByte>(slot));
+	}
+	if (m_frameResendRequestResponder == static_cast<UnsignedInt>(slot))
+		clearNetworkFrameResendRequest();
+	else
+		m_frameResendRequestExpectedInfoMask &= ~(1U << slot);
+#endif
 
 	if (TheGameInfo)
 	{
@@ -2061,6 +3046,10 @@ void ConnectionManager::parseUserList(const GameInfo *game)
 
 		}
 	}
+
+#if defined(_WIN64)
+	beginNetworkHello();
+#endif
 #ifdef MEMORYPOOL_DEBUG
 	TheMemoryPoolFactory->debugSetInitFillerIndex(m_localSlot);
 #endif
@@ -2263,6 +3252,14 @@ void ConnectionManager::sendDisconnectChat(UnicodeString text) {
 
 UnsignedShort ConnectionManager::sendFileAnnounce(AsciiString path, UnsignedByte playerMask)
 {
+	#if defined(_WIN64)
+	if (!isNetworkHelloReady())
+	{
+		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::sendFileAnnounce - NET3 is not ready"));
+		return 0;
+	}
+	#endif
+
 	File *theFile = TheLocalFileSystem->openFile(path.str());
 	if (!theFile || !theFile->size())
 	{
@@ -2301,6 +3298,14 @@ UnsignedShort ConnectionManager::sendFileAnnounce(AsciiString path, UnsignedByte
 
 void ConnectionManager::sendFile(AsciiString path, UnsignedByte playerMask, UnsignedShort commandID)
 {
+	#if defined(_WIN64)
+	if (!isNetworkHelloReady())
+	{
+		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::sendFile - NET3 is not ready"));
+		return;
+	}
+	#endif
+
 	File *theFile = TheLocalFileSystem->openFile(path.str());
 	if (!theFile || !theFile->size())
 	{
@@ -2518,6 +3523,11 @@ void ConnectionManager::notifyOthersOfNewFrame(UnsignedInt frame) {
 }
 
 void ConnectionManager::sendFrameDataToPlayer(UnsignedInt playerID, UnsignedInt startingFrame) {
+#if defined(_WIN64)
+	if (playerID >= MAX_SLOTS || !rts::network_epoch::IsNetworkCachedFrameRangeValid(
+		startingFrame, TheGameLogic->getFrame(), FRAMES_TO_KEEP))
+		return; // Bound the outer loop, not just each attempted frame send.
+#endif
 	DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::sendFrameDataToPlayer - sending frame data to player %d starting with frame %d", playerID, startingFrame));
 	for (UnsignedInt frame = startingFrame; frame < TheGameLogic->getFrame(); ++frame) {
 		sendSingleFrameToPlayer(playerID, frame);
@@ -2526,10 +3536,18 @@ void ConnectionManager::sendFrameDataToPlayer(UnsignedInt playerID, UnsignedInt 
 }
 
 void ConnectionManager::sendSingleFrameToPlayer(UnsignedInt playerID, UnsignedInt frame) {
+#if defined(_WIN64)
+	const UnsignedInt currentFrame = TheGameLogic->getFrame();
+	if (playerID >= MAX_SLOTS || !rts::network_epoch::IsNetworkCachedFrameRangeValid(frame, currentFrame, FRAMES_TO_KEEP))
+		return; // Only completed frames still held by the bounded cache.
+	if (m_connections[playerID] == nullptr || m_connections[playerID]->isQuitting() || !isNetworkHelloReady())
+		return;
+#else
 	if ((TheGameLogic->getFrame() - FRAMES_TO_KEEP) > frame) {
 		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::sendSingleFrameToPlayer - player %d requested frame %d when we are on frame %d, this is too far in the past.", playerID, frame, TheGameLogic->getFrame()));
 		return;
 	}
+#endif
 
 	UnsignedByte relay = 1 << playerID;
 
@@ -2541,7 +3559,11 @@ void ConnectionManager::sendSingleFrameToPlayer(UnsignedInt playerID, UnsignedIn
 				NetCommandRef *ref = list->getFirstMessage();
 				while (ref != nullptr) {
 					DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::sendFrameDataToPlayer - sending command %d from player %d to player %d using relay 0x%x", ref->getCommand()->getID(), i, playerID, relay));
+#if defined(_WIN64)
+					m_connections[playerID]->sendNetCommandMsg(ref->getCommand(), relay, TRUE);
+#else
 					sendLocalCommandDirect(ref->getCommand(), relay);
+#endif
 					ref = ref->getNext();
 				}
 			}
@@ -2554,7 +3576,11 @@ void ConnectionManager::sendSingleFrameToPlayer(UnsignedInt playerID, UnsignedIn
 			}
 			msg->setPlayerID(i);
 			DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::sendFrameDataToPlayer - sending frame info from player %d to player %d for frame %d with command count %d and ID %d and relay %d", i, playerID, msg->getExecutionFrame(), msg->getCommandCount(), msg->getID(), relay));
+#if defined(_WIN64)
+			m_connections[playerID]->sendNetCommandMsg(msg, relay, TRUE);
+#else
 			sendLocalCommandDirect(msg, relay);
+#endif
 			msg->detach();
 		}
 	}
@@ -2572,6 +3598,12 @@ void ConnectionManager::requestFrameDataResend(Int playerID, UnsignedInt frame) 
 		msg->setID(GenerateNextCommandID());
 	}
 
+#if defined(_WIN64)
+	// A newer resend supersedes any older provenance exception, including a
+	// request that could not find a connected responder.
+	clearNetworkFrameResendRequest();
+#endif
+
 	if (isPlayerConnected(playerID) == FALSE) {
 		playerID = 0;
 		while ((playerID < MAX_SLOTS) && (isPlayerConnected(playerID) == FALSE)) {
@@ -2580,6 +3612,21 @@ void ConnectionManager::requestFrameDataResend(Int playerID, UnsignedInt frame) 
 	}
 
 	if (playerID < MAX_SLOTS) {
+	#if defined(_WIN64)
+		if (static_cast<UnsignedInt>(playerID) != m_localSlot)
+		{
+			for (Int sourceSlot = 0; sourceSlot < MAX_SLOTS; ++sourceSlot)
+			{
+				if (sourceSlot != m_localSlot && m_frameData[sourceSlot] != nullptr)
+					m_frameResendRequestExpectedInfoMask |= 1U << sourceSlot;
+			}
+			m_frameResendRequestResponder = static_cast<UnsignedInt>(playerID);
+			m_frameResendRequestFrame = frame;
+			m_frameResendRequestStartTime = static_cast<UnsignedInt>(timeGetTime());
+			m_frameResendRequestOutstanding =
+				m_frameResendRequestExpectedInfoMask != 0U;
+		}
+	#endif
 		sendLocalCommandDirect(msg, 1 << playerID);
 	}
 

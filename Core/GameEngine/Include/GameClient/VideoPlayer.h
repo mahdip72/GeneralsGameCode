@@ -120,6 +120,10 @@ class VideoBuffer
 		virtual	Bool		allocate( UnsignedInt width, UnsignedInt Height ) = 0; ///< Allocate buffer
 		virtual void		free() = 0;			///< Free the buffer
 		virtual	void*		lock() = 0;			///< Returns memory pointer to start of buffer
+		// Optional renderer publication while the buffer remains locked. Writers
+		// call this only after producing a complete opaque BGRA8 frame; false keeps
+		// the normal unlock/invalidation path for other formats and backends.
+		virtual Bool		publishLockedFrame() { return FALSE; }
 		virtual void		unlock() = 0;		///< Release buffer
 		virtual Bool		valid() = 0;		///< Is the buffer valid to use
 
@@ -162,12 +166,22 @@ class VideoStreamInterface
 		virtual void close() = 0;										///< Close and free stream
 
 		virtual Bool	isFrameReady() = 0;						///< Is the frame ready to be displayed
+		// Legacy backends have no separate audio-drain state. Native FFmpeg
+		// streams override this to expose ENDED/FAILED to host loops.
+		virtual Bool	isFinished() const { return FALSE; }
+		// Legacy backends do not expose a distinct failure result. Native
+		// backends override this so hosts can advance while still reporting a
+		// decode/device failure instead of treating it as clean completion.
+		virtual Bool	isPlaybackFailed() const { return FALSE; }
 		virtual void	frameDecompress() = 0;				///< Render current frame in to buffer
 		virtual void	frameRender( VideoBuffer *buffer ) = 0; ///< Render current frame in to buffer
 		virtual void	frameNext() = 0;							///< Advance to next frame
+		// Normal blocking hosts call this after presenting the final frame. Skip
+		// and shutdown paths continue to use close() as an immediate abort.
+		virtual Bool	finishPlayback() { return TRUE; }
 		virtual Int		frameIndex() = 0;							///< Returns zero based index of current frame
 		virtual Int		frameCount() = 0;							///< Returns the total number of frames in the stream
-		virtual void	frameGoto( Int index ) = 0;					///< Go to the spcified frame index
+		virtual Bool	frameGoto( Int index ) = 0;					///< Go to the specified frame index
 		virtual Int		height() = 0;									///< Return the height of the video
 		virtual Int		width() = 0;									///< Return the width of the video
 
@@ -203,7 +217,7 @@ class VideoStream : public VideoStreamInterface
 		virtual void	frameNext() override;									///< Advance to next frame
 		virtual Int		frameIndex() override;									///< Returns zero based index of current frame
 		virtual Int		frameCount() override;									///< Returns the total number of frames in the stream
-		virtual void	frameGoto( Int index ) override;							///< Go to the spcified frame index
+		virtual Bool	frameGoto( Int index ) override;							///< Go to the specified frame index
 		virtual Int		height() override;											///< Return the height of the video
 		virtual Int		width() override;											///< Return the width of the video
 

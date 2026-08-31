@@ -43,6 +43,7 @@
 // ----------------------------------------------------------------------------
 
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
+#include <Utility/stdint_adapter.h>
 
 // SYSTEM INCLUDES
 
@@ -2248,7 +2249,7 @@ void *DynamicMemoryAllocator::allocateBytesDoNotZeroImplementation(Int numBytes 
 
 #if defined(RTS_DEBUG)
   // check alignment
-  if (unsigned(result)&3)
+  if ((reinterpret_cast<uintptr_t>(result) & 3U) != 0U)
     throw ERROR_OUT_OF_MEMORY;
 #endif
 

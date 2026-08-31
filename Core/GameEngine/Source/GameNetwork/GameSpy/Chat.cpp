@@ -311,7 +311,7 @@ void GameSpyInfo::addChat( PlayerInfo p, UnicodeString msg, Bool isPublic, Bool 
 	Int index = addText(fullMsg, GameSpyColor[style], win);
 	if (index >= 0)
 	{
-		GadgetListBoxSetItemData(win, (void *)p.m_profileID, index);
+		GadgetListBoxSetItemData(win, GadgetItemDataFromInt(p.m_profileID), index);
 	}
 }
 
@@ -334,7 +334,7 @@ Int GameSpyInfo::addText( UnicodeString message, Color c, GameWindow *win )
 		win = *(m_textWindows.begin());
 	}
 	Int index = GadgetListBoxAddEntryText(win, message, c, -1, -1);
-	GadgetListBoxSetItemData(win, (void *)-1, index);
+	GadgetListBoxSetItemData(win, GadgetItemDataFromInt(-1), index);
 
 	return index;
 }

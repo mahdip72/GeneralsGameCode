@@ -146,8 +146,8 @@ WindowMsgHandledType InGamePopupMessageInput( GameWindow *window, UnsignedInt ms
 			// --------------------------------------------------------------------------------------------
 			case GWM_CHAR:
 			{
-				UnsignedByte key = mData1;
-				UnsignedByte state = mData2;
+				UnsignedByte key = static_cast<UnsignedByte>(WindowMsgDataToUnsignedInt(mData1));
+				UnsignedByte state = static_cast<UnsignedByte>(WindowMsgDataToUnsignedInt(mData2));
 	//			if (buttonPushed)
 	//				break;
 
@@ -215,7 +215,7 @@ WindowMsgHandledType InGamePopupMessageSystem( GameWindow *window, UnsignedInt m
 
 			// if we're givin the opportunity to take the keyboard focus we must say we want it
 			if( mData1 == TRUE )
-				*(Bool *)mData2 = TRUE;
+				*static_cast<Bool *>(WindowMsgDataToPointer(mData2)) = TRUE;
 
 			break;
 
@@ -223,7 +223,7 @@ WindowMsgHandledType InGamePopupMessageSystem( GameWindow *window, UnsignedInt m
     //---------------------------------------------------------------------------------------------
 		case GBM_SELECTED:
 		{
-			GameWindow *control = (GameWindow *)mData1;
+			GameWindow *control = static_cast<GameWindow *>(WindowMsgDataToPointer(mData1));
 			Int controlID = control->winGetWindowId();
 
       if( controlID == buttonOkID )

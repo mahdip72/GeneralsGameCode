@@ -213,8 +213,20 @@ void BitFlags<NUMBITS, TAG>::xfer(Xfer* xfer)
 	else if( xfer->getXferMode() == XFER_CRC )
 	{
 
-		// just call the xfer implementation on the data values
-#if RETAIL_COMPATIBLE_CRC
+		// The native epoch hashes logical bits as fixed-width words.  Never
+		// expose std::bitset storage or pointer width to the deterministic CRC.
+#if defined(_WIN64)
+		for (size_t wordIndex = 0; wordIndex < (NUMBITS + 31U) / 32U; ++wordIndex)
+		{
+			UnsignedInt word = 0;
+			for (size_t bit = 0; bit < 32U && wordIndex * 32U + bit < NUMBITS; ++bit)
+			{
+				if (m_bits.test(wordIndex * 32U + bit))
+					word |= static_cast<UnsignedInt>(1U << bit);
+			}
+			xfer->xferUnsignedInt(&word);
+		}
+#elif RETAIL_COMPATIBLE_CRC
 		xfer->xferUser( this, sizeof( this ) );
 #else
 		xfer->xferUser( this, sizeof( *this ) );

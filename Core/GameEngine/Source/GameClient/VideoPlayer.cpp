@@ -479,9 +479,10 @@ Int	VideoStream::frameCount()
 // VideoStream::frameGoto
 //============================================================================
 
-void VideoStream::frameGoto( Int index )
+Bool VideoStream::frameGoto( Int index )
 {
-
+	(void)index;
+	return FALSE;
 }
 
 //============================================================================

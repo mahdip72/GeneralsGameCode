@@ -34,6 +34,7 @@
 #include "GameClient/Shell.h"
 #include "GameNetwork/FileTransfer.h"
 #include "GameNetwork/networkutil.h"
+#include "Lib/FileTransferTimeout.h"
 
 //-------------------------------------------------------------------------------------
 //-------------------------------------------------------------------------------------
@@ -57,21 +58,53 @@ static Bool doFileTransfer( AsciiString filename, MapTransferLoadScreen *ls, Int
 
 		UnsignedShort fileCommandID = 0;
 		Bool sentFile = FALSE;
-		if (TheGameInfo->amIHost())
+		const Bool isHost = TheGameInfo->amIHost();
+		Bool announcedFile = !isHost;
+		// Preserve the legacy Win32 transfer ordering and pacing.  The x64
+		// path deliberately defers this announce until the NET3 handshake has
+		// completed below.
+#if !defined(_WIN64)
+		if (isHost)
 		{
 			Sleep(500);
 			fileCommandID = TheNetwork->sendFileAnnounce(filename, mask);
+			announcedFile = TRUE;
 		}
-		else
-		{
+#endif
+		if (!isHost)
 			sentFile = TRUE;
-		}
 
 		DEBUG_LOG(("Starting file transfer loop"));
 
 		while (!fileTransferDone)
 		{
-			if (!sentFile && TheNetwork->areAllQueuesEmpty())
+			// The x64 runtime exchanges NET3 before any file command is
+			// allowed onto the shared transport.  Keep servicing the existing
+			// load-screen/network pump while that non-blocking state machine is
+			// pending; a failed or timed-out exchange aborts this transfer.
+#if defined(_WIN64)
+			if (TheNetwork != nullptr && !TheNetwork->isNetworkHelloReady())
+			{
+				if (TheNetwork->hasNetworkHelloFailure())
+					return FALSE;
+
+				const UnsignedInt now = timeGetTime();
+				if (rts::file_transfer::IsTimedOut(now, startTime, timeoutPeriod))
+					break;
+				ls->processTimeout(static_cast<Int>(rts::file_transfer::RemainingSeconds(
+					now, startTime, timeoutPeriod)));
+				ls->update(0);
+				continue;
+			}
+#endif
+
+			if (isHost && !announcedFile && TheNetwork->areAllQueuesEmpty())
+			{
+				fileCommandID = TheNetwork->sendFileAnnounce(filename, mask);
+				announcedFile = TRUE;
+			}
+
+			if (isHost && announcedFile && !sentFile && TheNetwork->areAllQueuesEmpty())
 			{
 				TheNetwork->sendFile(filename, mask, fileCommandID);
 				sentFile = TRUE;
@@ -109,15 +142,16 @@ static Bool doFileTransfer( AsciiString filename, MapTransferLoadScreen *ls, Int
 				ls->processProgress(0, fileTransferPercent, "MapTransfer:Done");
 			}
 
-			Int now = timeGetTime();
-			if (now > startTime + timeoutPeriod) // bail if we don't finish in a reasonable amount of time
+			const UnsignedInt now = timeGetTime();
+			if (rts::file_transfer::IsTimedOut(now, startTime, timeoutPeriod)) // bail if we don't finish in a reasonable amount of time
 			{
 				DEBUG_LOG(("Timing out file transfer"));
 				break;
 			}
 			else
 			{
-				ls->processTimeout((startTime + timeoutPeriod - now)/1000);
+				ls->processTimeout(static_cast<Int>(rts::file_transfer::RemainingSeconds(
+					now, startTime, timeoutPeriod)));
 			}
 
 			ls->update(fileTransferPercent);

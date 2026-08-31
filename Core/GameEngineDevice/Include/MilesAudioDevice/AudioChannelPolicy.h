@@ -10,24 +10,6 @@
 
 #pragma once
 
-namespace rts
-{
-	unsigned int GetAdaptive3DChannelTarget(unsigned int configuredCount);
-	bool ShouldGrow3DChannelPool(
-		unsigned int availableCount,
-		unsigned int allocatedCount,
-		unsigned int requestedCount,
-		unsigned int reservedCount);
-
-	bool CanReplace3DChannel(
-		bool incomingInterrupt,
-		int incomingPriority,
-		int victimPriority,
-		bool victimCritical,
-		bool victimVoice,
-		bool victimUI,
-		bool victimGlobal,
-		bool victimLooping);
-
-	bool IsPreferred3DChannelReplacement(int candidatePriority, int currentPriority);
-}
+// Compatibility include for the legacy x86 source lane.  The policy itself is
+// backend-neutral and is implemented from AudioDevice on every architecture.
+#include "AudioDevice/AudioChannelPolicy.h"

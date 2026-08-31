@@ -99,7 +99,7 @@ static void mapListTooltipFunc(GameWindow *window,
 		return;
 	}
 
-	Int imageItemData = (Int)GadgetListBoxGetItemData(window, row, 1);
+	Int imageItemData = GadgetItemDataToInt(GadgetListBoxGetItemData(window, row, 1));
 	UnicodeString tooltip;
 	switch (imageItemData)
 	{
@@ -432,7 +432,7 @@ WindowMsgHandledType SkirmishMapSelectMenuSystem( GameWindow *window, UnsignedIn
 				Int controlID = control->winGetWindowId();
 				if( controlID == listboxMap )
 				{
-					int rowSelected = mData2;
+					int rowSelected = WindowMsgDataToInt(mData2);
 
 					if (rowSelected >= 0)
 					{
@@ -454,7 +454,7 @@ WindowMsgHandledType SkirmishMapSelectMenuSystem( GameWindow *window, UnsignedIn
 				Int controlID = control->winGetWindowId();
 				if( controlID == listboxMap )
 				{
-					int rowSelected = mData2;
+					int rowSelected = WindowMsgDataToInt(mData2);
 					if( rowSelected < 0 )
 					{
 						positionStartSpots( AsciiString::TheEmptyString, buttonMapStartPosition, winMapPreview);

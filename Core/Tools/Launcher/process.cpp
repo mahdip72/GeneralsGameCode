@@ -24,7 +24,29 @@ Process::Process()
   command[0]=0;
   args[0]=0;
   hProcess=nullptr;
+  dwProcessID=0;
   hThread=nullptr;
+  dwThreadID=0;
+}
+
+bit8 Close_Process(Process &process)
+{
+    bit8 result = TRUE;
+    if (process.hThread != nullptr) {
+        if (CloseHandle(process.hThread) == 0) {
+            result = FALSE;
+        }
+        process.hThread = nullptr;
+    }
+    if (process.hProcess != nullptr) {
+        if (CloseHandle(process.hProcess) == 0) {
+            result = FALSE;
+        }
+        process.hProcess = nullptr;
+    }
+    process.dwProcessID = 0;
+    process.dwThreadID = 0;
+    return result;
 }
 
 // Create a process
@@ -33,7 +55,9 @@ bit8 Create_Process(Process &process)
     int                      retval;
     STARTUPINFO              si;
     PROCESS_INFORMATION      piProcess;
+    Close_Process(process);
     ZeroMemory(&si,sizeof(si));
+    ZeroMemory(&piProcess,sizeof(piProcess));
     si.cb=sizeof(si);
 
     char cmdargs[513];
@@ -54,11 +78,16 @@ bit8 Create_Process(Process &process)
       char message_buffer[256];
 	   FormatMessage( FORMAT_MESSAGE_FROM_SYSTEM, nullptr, GetLastError(), MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), &message_buffer[0], 256, nullptr );
       DBGMSG("ERR: "<<message_buffer);
+      return(FALSE);
     }
     process.hProcess=piProcess.hProcess;
 		process.dwProcessID = piProcess.dwProcessId;
-    process.hThread=piProcess.hThread;
 		process.dwThreadID = piProcess.dwThreadId;
+    if (CloseHandle(piProcess.hThread) == 0) {
+      Close_Process(process);
+      return(FALSE);
+    }
+    process.hThread=nullptr;
     return(TRUE);
 }
 
@@ -67,27 +96,31 @@ bit8 Create_Process(Process &process)
 //
 bit8 Wait_Process(Process &process, DWORD *exit_code)
 {
-  DWORD retval;
-  retval=WaitForSingleObject(process.hProcess,INFINITE);
   if (exit_code != nullptr)
     *exit_code=-1;
+  if (process.hProcess == nullptr)
+    return(FALSE);
+
+  DWORD retval=WaitForSingleObject(process.hProcess,INFINITE);
+  bit8 result=FALSE;
   if (retval==WAIT_OBJECT_0)  // process exited
   {
 		// MDC 1/10/2003 Inserting sleep here to let game exit before applying patch
 		Sleep(3000);
 
-    if (exit_code != nullptr)
-      GetExitCodeProcess(process.hProcess,exit_code);
-    return(TRUE);
+    if (exit_code == nullptr || GetExitCodeProcess(process.hProcess,exit_code) != 0)
+      result=TRUE;
   }
-  else                        // can this happen?
-    return(FALSE);
+  if (Close_Process(process) == FALSE)
+    result=FALSE;
+  return(result);
 }
 
 
 //
 // Get the process to run from the config object
 //
+#ifndef RTS_LAUNCHER_PROCESS_ONLY
 bit8 Read_Process_Info(ConfigFile &config,OUT Process &info, IN const char *key)
 {
 
@@ -166,3 +199,4 @@ bit8 Read_Process_Info(ConfigFile &config,OUT Process &info, IN const char *key)
   return(TRUE);
 **********************************************/
 }
+#endif

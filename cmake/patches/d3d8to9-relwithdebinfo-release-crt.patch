@@ -1,0 +1,14 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1049364..e76b779 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -36,7 +36,8 @@ endif()
+ 
+ target_compile_definitions(d3d8to9 PUBLIC
+   $<$<CONFIG:Debug>:D3D_DEBUG_INFO;_DEBUG>
+-  $<$<CONFIG:RelWithDebInfo>:D3D_DEBUG_INFO;_DEBUG>
++  # D3D8TO9_RELWITHDEBINFO_RELEASE_CRT: CMake selects the release CRT here.
++  $<$<CONFIG:RelWithDebInfo>:D3D_DEBUG_INFO>
+   $<$<CONFIG:Release>:D3D8TO9NOLOG>
+   $<$<CONFIG:MinSizeRel>:D3D8TO9NOLOG>
+ )

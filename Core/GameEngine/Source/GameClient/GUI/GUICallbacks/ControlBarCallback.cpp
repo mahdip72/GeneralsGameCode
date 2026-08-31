@@ -136,8 +136,8 @@ WindowMsgHandledType LeftHUDInput( GameWindow *window, UnsignedInt msg,
 
 			// get mouse position
 			ICoord2D mouse;
-			mouse.x = mData1 & 0xFFFF;
-			mouse.y = mData1 >> 16;
+			mouse.x = static_cast<Int>(WindowMsgDataToUnsignedInt(mData1) & 0xFFFF);
+			mouse.y = static_cast<Int>(WindowMsgDataToUnsignedInt(mData1) >> 16);
 
 			// get window screen position
 			ICoord2D screenPos;
@@ -232,8 +232,8 @@ WindowMsgHandledType LeftHUDInput( GameWindow *window, UnsignedInt msg,
 			window->winGetSize( &size.x, &size.y );
 
 			// get mouse position
-			mouse.x = mData1 & 0xFFFF;
-			mouse.y = mData1 >> 16;
+			mouse.x = static_cast<Int>(WindowMsgDataToUnsignedInt(mData1) & 0xFFFF);
+			mouse.y = static_cast<Int>(WindowMsgDataToUnsignedInt(mData1) >> 16);
 
 			// get window screen position
 			window->winGetScreenPosition( &screenPos.x, &screenPos.y );
@@ -367,7 +367,7 @@ WindowMsgHandledType ControlBarSystem( GameWindow *window, UnsignedInt msg,
 		case GBM_MOUSE_ENTERING:
 		case GBM_MOUSE_LEAVING:
 		{
-			GameWindow *control = (GameWindow *)mData1;
+			GameWindow *control = static_cast<GameWindow *>(WindowMsgDataToPointer(mData1));
 
 			TheControlBar->processContextSensitiveButtonTransition( control, (GadgetGameMessage)msg);
 			break;
@@ -377,7 +377,7 @@ WindowMsgHandledType ControlBarSystem( GameWindow *window, UnsignedInt msg,
 		case GBM_SELECTED:
 		case GBM_SELECTED_RIGHT:
 		{
-			GameWindow *control = (GameWindow *)mData1;
+			GameWindow *control = static_cast<GameWindow *>(WindowMsgDataToPointer(mData1));
 			static NameKeyType beaconPlacementButtonID = NAMEKEY("ControlBar.wnd:ButtonPlaceBeacon");
 			static NameKeyType beaconDeleteButtonID = NAMEKEY("ControlBar.wnd:ButtonDeleteBeacon");
 			static NameKeyType beaconClearTextButtonID = NAMEKEY("ControlBar.wnd:ButtonClearBeaconText");
@@ -454,7 +454,7 @@ WindowMsgHandledType ControlBarSystem( GameWindow *window, UnsignedInt msg,
 		//---------------------------------------------------------------------------------------------
 		case GEM_EDIT_DONE:
 		{
-			GameWindow *control = (GameWindow *)mData1;
+			GameWindow *control = static_cast<GameWindow *>(WindowMsgDataToPointer(mData1));
 			Int controlID = control->winGetWindowId();
 			static NameKeyType textID = NAMEKEY("ControlBar.wnd:EditBeaconText");
 			if (controlID == textID)

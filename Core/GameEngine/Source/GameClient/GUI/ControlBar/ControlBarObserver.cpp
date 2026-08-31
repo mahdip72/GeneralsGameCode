@@ -189,7 +189,7 @@ WindowMsgHandledType ControlBarObserverSystem( GameWindow *window, UnsignedInt m
 		case GBM_SELECTED:
 		case GBM_SELECTED_RIGHT:
 		{
-			GameWindow *control = (GameWindow *)mData1;
+			GameWindow *control = static_cast<GameWindow *>(WindowMsgDataToPointer(mData1));
 
 			Int controlID = control->winGetWindowId();
 			if( controlID == buttonCancelID)

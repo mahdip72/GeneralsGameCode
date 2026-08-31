@@ -944,7 +944,9 @@ Int APIENTRY WinMain( HINSTANCE hInstance, HINSTANCE hPrevInstance,
 			DEBUG_LOG(("Generals is already running...Bail!"));
 			delete TheVersion;
 			TheVersion = nullptr;
-			shutdownMemoryManager();
+			// Static AutoPoolClass allocators are destroyed after WinMain returns.
+			// Keep their process-lifetime backing arena valid until CRT teardown;
+			// Windows reclaims that arena when the process terminates.
 			return exitcode;
 		}
 		DEBUG_LOG(("Create Generals Mutex okay."));
@@ -964,7 +966,8 @@ Int APIENTRY WinMain( HINSTANCE hInstance, HINSTANCE hPrevInstance,
 		TheMemoryPoolFactory->memoryPoolUsageReport("AAAMemStats");
 	#endif
 
-		shutdownMemoryManager();
+		// Static AutoPoolClass allocators release their blocks during CRT
+		// teardown, after WinMain. The game memory manager must outlive them.
 
 		// BGC - shut down COM
 	//	OleUninitialize();

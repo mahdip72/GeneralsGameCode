@@ -449,7 +449,7 @@ WindowMsgHandledType GadgetPushButtonSystem( GameWindow *window, UnsignedInt msg
 		case GGM_SET_LABEL:
 		{
 			// set text into the win instance text data field
-			window->winSetText( *(UnicodeString*)mData1 );
+			window->winSetText( *static_cast<UnicodeString *>(WindowMsgDataToPointer(mData1)) );
 			break;
 		}
 
@@ -475,12 +475,12 @@ WindowMsgHandledType GadgetPushButtonSystem( GameWindow *window, UnsignedInt msg
 
 			TheWindowManager->winSendSystemMsg( instData->getOwner(),
 																					GGM_FOCUS_CHANGE,
-																					(WindowMsgData)mData1,
+																	WindowMsgDataFromInt(WindowMsgDataToInt(mData1)),
 																					window->winGetWindowId() );
 			if( mData1 == FALSE )
-				*(Bool*)mData2 = FALSE;
+				*static_cast<Bool *>(WindowMsgDataToPointer(mData2)) = FALSE;
 			else
-				*(Bool*)mData2 = TRUE;
+				*static_cast<Bool *>(WindowMsgDataToPointer(mData2)) = TRUE;
 			break;
 
 		default:

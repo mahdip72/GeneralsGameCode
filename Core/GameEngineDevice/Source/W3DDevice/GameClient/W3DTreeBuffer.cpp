@@ -161,6 +161,14 @@ int W3DTreeBuffer::W3DTreeTextureClass::update(W3DTreeBuffer *buffer)
 		surface_level->Release();
 		return 0;
 	}
+	const Int pixelBytes = 4;
+	const Int requiredRowBytes = static_cast<Int>(surface_desc.Width) * pixelBytes;
+	if (locked_rect.pBits == nullptr || locked_rect.Pitch < requiredRowBytes)
+	{
+		surface_level->UnlockRect();
+		surface_level->Release();
+		return 0;
+	}
 
 	Int tilePixelExtent = TILE_PIXEL_EXTENT;
 //	Int numRows = surface_desc.Height/(tilePixelExtent+TILE_OFFSET);
@@ -170,7 +178,13 @@ int W3DTreeBuffer::W3DTreeTextureClass::update(W3DTreeBuffer *buffer)
 #endif
 	if (surface_desc.Format == D3DFMT_A8R8G8B8) {
 		Int tileNdx;
-		Int pixelBytes = 4;
+		// Tiles do not occupy the complete atlas. Clear every visible row so
+		// mip generation never averages uninitialized texture contents.
+		for (UnsignedInt row = 0; row < surface_desc.Height; ++row)
+		{
+			memset(static_cast<UnsignedByte *>(locked_rect.pBits) +
+				row * locked_rect.Pitch, 0, requiredRowBytes);
+		}
 #if 0 // Fill unused texture for debug display.
 		UnsignedInt cellX, cellY;
 		for (cellX = 0; cellX < surface_desc.Width; cellX++) {
@@ -195,7 +209,7 @@ int W3DTreeBuffer::W3DTreeTextureClass::update(W3DTreeBuffer *buffer)
 				pBGR += (tilePixelExtent-(1+j))*TILE_BYTES_PER_PIXEL*tilePixelExtent; // invert to match.
 				Int row = position.y+j;
 				UnsignedByte *pBGRA = ((UnsignedByte*)locked_rect.pBits) +
-							(row)*surface_desc.Width*pixelBytes;
+							row * locked_rect.Pitch;
 
 				Int column = position.x;
 				pBGRA += column*pixelBytes;
@@ -1505,10 +1519,12 @@ void W3DTreeBuffer::drawTrees(CameraClass * camera, RefRenderObjListIterator *pD
 	Int i;
 	for (i=0; i<MAX_SWAY_TYPES; i++)
 	{
+		swayFactor[i].Set(0.0f, 0.0f, 0.0f);
 		m_curSwayOffset[i] += m_curSwayStep[i] * timeScale;
-		if (m_curSwayOffset[i] > NUM_SWAY_ENTRIES-1) {
-			m_curSwayOffset[i] -= NUM_SWAY_ENTRIES-1;
-		}
+		const Real swayPeriod = static_cast<Real>(NUM_SWAY_ENTRIES - 1);
+		m_curSwayOffset[i] = static_cast<Real>(fmod(m_curSwayOffset[i], swayPeriod));
+		if (m_curSwayOffset[i] < 0.0f)
+			m_curSwayOffset[i] += swayPeriod;
 		Int minOffset = REAL_TO_INT_FLOOR(m_curSwayOffset[i]);
 		if (minOffset>=0 && minOffset+1<NUM_SWAY_ENTRIES) {
 			Real f2 = m_curSwayOffset[i] - minOffset;
@@ -1674,7 +1690,9 @@ void W3DTreeBuffer::drawTrees(CameraClass * camera, RefRenderObjListIterator *pD
 	W3DShaderManager::setShroudTex(1);
 	DX8Wrapper::Apply_Render_State_Changes();
 
-	if (m_dwTreeVertexShader) {
+	const Bool useNeutralTreeProgram =
+		m_dwTreeVertexShader != 0 || DX8Wrapper::Is_D3D11_Backend_Active();
+	if (useNeutralTreeProgram) {
 		D3DMATRIX matProj, matView, matWorld;
 		DX8Wrapper::_Get_DX8_Transform(D3DTS_WORLD, matWorld);
 		DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, matView);
@@ -1718,7 +1736,11 @@ void W3DTreeBuffer::drawTrees(CameraClass * camera, RefRenderObjListIterator *pD
 			DX8Wrapper::Set_Vertex_Shader_Constant(33, &offset, 1);
 		}
 
-		DX8Wrapper::Set_Vertex_Shader(m_dwTreeVertexShader);
+		if (m_dwTreeVertexShader) {
+			DX8Wrapper::Set_Vertex_Shader(m_dwTreeVertexShader);
+		} else {
+			DX8Wrapper::Set_Vertex_Shader(DX8_FVF_XYZNDUV1);
+		}
 		DX8Wrapper::Set_Legacy_Vertex_Program(
 			rts::render::RENDER_LEGACY_VERTEX_TREES);
 #if 0
@@ -1747,8 +1769,12 @@ void W3DTreeBuffer::drawTrees(CameraClass * camera, RefRenderObjListIterator *pD
 		DX8Wrapper::Set_Vertex_Buffer(m_vertexTree[bNdx]);
 		// Render the waving grass
 		DX8Wrapper::Apply_Render_State_Changes();
-		if (m_dwTreeVertexShader) {
-			DX8Wrapper::Set_Vertex_Shader(m_dwTreeVertexShader);
+		if (useNeutralTreeProgram) {
+			if (m_dwTreeVertexShader) {
+				DX8Wrapper::Set_Vertex_Shader(m_dwTreeVertexShader);
+			} else {
+				DX8Wrapper::Set_Vertex_Shader(DX8_FVF_XYZNDUV1);
+			}
 			DX8Wrapper::Set_Legacy_Vertex_Program(
 				rts::render::RENDER_LEGACY_VERTEX_TREES);
 			DX8Wrapper::Set_DX8_Texture_Stage_State(0,  D3DTSS_TEXCOORDINDEX, 0);

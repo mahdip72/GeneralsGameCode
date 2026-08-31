@@ -125,7 +125,7 @@ enum CallbackType
 
 void callbackWrapper( GPConnection *con, void *arg, void *param )
 {
-	CallbackType info = (CallbackType)(Int)param;
+	CallbackType info = static_cast<CallbackType>(reinterpret_cast<uintptr_t>(param));
 	BuddyThreadClass *thread = MESSAGE_QUEUE->getThread() ? MESSAGE_QUEUE->getThread() : nullptr /*(TheGameSpyBuddyMessageQueue)?TheGameSpyBuddyMessageQueue->getThread():nullptr*/;
 	if (!thread)
 		return;
@@ -268,10 +268,14 @@ void BuddyThreadClass::Thread_Function()
 	gpInitialize( con, productID, 0, GP_PARTNERID_GAMESPY );
 	m_isConnected = m_isConnecting = false;
 
-	gpSetCallback( con, GP_ERROR,								callbackWrapper,	(void *)CALLBACK_ERROR );
-	gpSetCallback( con, GP_RECV_BUDDY_MESSAGE,	callbackWrapper,	(void *)CALLBACK_RECVMESSAGE );
-	gpSetCallback( con, GP_RECV_BUDDY_REQUEST,	callbackWrapper,	(void *)CALLBACK_RECVREQUEST );
-	gpSetCallback( con, GP_RECV_BUDDY_STATUS,		callbackWrapper,	(void *)CALLBACK_RECVSTATUS );
+	gpSetCallback( con, GP_ERROR, callbackWrapper,
+		reinterpret_cast<void *>(static_cast<uintptr_t>(CALLBACK_ERROR)) );
+	gpSetCallback( con, GP_RECV_BUDDY_MESSAGE, callbackWrapper,
+		reinterpret_cast<void *>(static_cast<uintptr_t>(CALLBACK_RECVMESSAGE)) );
+	gpSetCallback( con, GP_RECV_BUDDY_REQUEST, callbackWrapper,
+		reinterpret_cast<void *>(static_cast<uintptr_t>(CALLBACK_RECVREQUEST)) );
+	gpSetCallback( con, GP_RECV_BUDDY_STATUS, callbackWrapper,
+		reinterpret_cast<void *>(static_cast<uintptr_t>(CALLBACK_RECVSTATUS)) );
 
 	GPEnum lastStatus = GP_OFFLINE;
 	std::string lastStatusString;
@@ -291,14 +295,16 @@ void BuddyThreadClass::Thread_Function()
 				m_pass = incomingRequest.arg.login.password;
 				m_isConnected = (gpConnect( con, incomingRequest.arg.login.nick, incomingRequest.arg.login.email,
 					incomingRequest.arg.login.password, (incomingRequest.arg.login.hasFirewall)?GP_FIREWALL:GP_NO_FIREWALL,
-					GP_BLOCKING, callbackWrapper, (void *)CALLBACK_CONNECT ) == GP_NO_ERROR);
+					GP_BLOCKING, callbackWrapper,
+					reinterpret_cast<void *>(static_cast<uintptr_t>(CALLBACK_CONNECT)) ) == GP_NO_ERROR);
 				m_isConnecting = false;
 				break;
 
 			case BuddyRequest::BUDDYREQUEST_RELOGIN:
 				m_isConnecting = true;
 				m_isConnected = (gpConnect( con, m_nick.c_str(), m_email.c_str(), m_pass.c_str(), GP_FIREWALL,
-					GP_BLOCKING, callbackWrapper, (void *)CALLBACK_CONNECT ) == GP_NO_ERROR);
+					GP_BLOCKING, callbackWrapper,
+					reinterpret_cast<void *>(static_cast<uintptr_t>(CALLBACK_CONNECT)) ) == GP_NO_ERROR);
 				m_isConnecting = false;
 				break;
 			case BuddyRequest::BUDDYREQUEST_DELETEACCT:
@@ -327,7 +333,8 @@ void BuddyThreadClass::Thread_Function()
 					// TheSuperHackers @tweak OmniBlade API was updated since Generals release to require uniquenick which is the same as nick and cdkey is an empty string here.
 					m_isConnected = (gpConnectNewUser( con, incomingRequest.arg.login.nick, incomingRequest.arg.login.nick, incomingRequest.arg.login.email,
 						incomingRequest.arg.login.password, "", (incomingRequest.arg.login.hasFirewall)?GP_FIREWALL:GP_NO_FIREWALL,
-						GP_BLOCKING, callbackWrapper, (void *)CALLBACK_CONNECT ) == GP_NO_ERROR);
+						GP_BLOCKING, callbackWrapper,
+						reinterpret_cast<void *>(static_cast<uintptr_t>(CALLBACK_CONNECT)) ) == GP_NO_ERROR);
 					if (m_isNewAccount) // if we didn't re-login
 					{
 						gpSetInfoMask( con, GP_MASK_NONE ); // don't share info

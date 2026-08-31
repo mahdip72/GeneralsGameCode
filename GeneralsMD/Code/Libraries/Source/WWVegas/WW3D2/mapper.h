@@ -40,6 +40,7 @@
 #pragma once
 
 #include "WWLib/always.h"
+#include "WWLib/bittype.h"
 #include "w3d_file.h"
 #include "WW3D2/w3derr.h"
 #include "WWMath/vector2.h"
@@ -88,6 +89,10 @@ class TextureMapperClass : public RefCountClass
 
 		virtual ~TextureMapperClass() override { }
 
+		// The legacy material CRC hashes mapper addresses.  The native x64
+		// material path uses this semantic, fixed-width representation instead.
+		virtual unsigned long						Compute_Canonical_CRC(unsigned long crc = 0) const;
+
 		virtual int								Mapper_ID() const { return MAPPER_ID_UNKNOWN;}
 
 		virtual TextureMapperClass *		Clone() const = 0;
@@ -104,6 +109,14 @@ class TextureMapperClass : public RefCountClass
 		virtual void							Calculate_Texture_Matrix(Matrix4x4 &tex_matrix) = 0;
 
 	protected:
+		unsigned long							Append_Canonical_Header(unsigned long crc, uint32 type_id) const;
+		unsigned long							Append_Canonical_UInt(unsigned long crc, uint32 value) const;
+		unsigned long							Append_Canonical_Float(unsigned long crc, float value) const;
+		unsigned long							Append_Canonical_Bool(unsigned long crc, bool value) const;
+		unsigned long							Append_Canonical_Vector2(unsigned long crc, const Vector2 &value) const;
+		unsigned long							Append_Canonical_Vector3(unsigned long crc, const Vector3 &value) const;
+		unsigned long							Append_Canonical_Matrix4(unsigned long crc, const Matrix4x4 &value) const;
+
 		unsigned int							Stage;
 };
 
@@ -120,6 +133,7 @@ public:
 	ScaleTextureMapperClass(const ScaleTextureMapperClass & src);
 
 	virtual int	Mapper_ID() const override { return MAPPER_ID_SCALE;}
+	virtual unsigned long					Compute_Canonical_CRC(unsigned long crc = 0) const override;
 
 	virtual TextureMapperClass *Clone() const override { return NEW_REF( ScaleTextureMapperClass, (*this)); }
 
@@ -144,6 +158,7 @@ public:
 	LinearOffsetTextureMapperClass(const LinearOffsetTextureMapperClass & src);
 
 	virtual int	Mapper_ID() const override { return MAPPER_ID_LINEAR_OFFSET;}
+	virtual unsigned long					Compute_Canonical_CRC(unsigned long crc = 0) const override;
 
 	virtual TextureMapperClass *Clone() const override { return NEW_REF( LinearOffsetTextureMapperClass, (*this)); }
 
@@ -186,6 +201,7 @@ public:
 	GridTextureMapperClass(const GridTextureMapperClass & src);
 
 	virtual int	Mapper_ID() const override { return MAPPER_ID_GRID;}
+	virtual unsigned long					Compute_Canonical_CRC(unsigned long crc = 0) const override;
 
 	virtual TextureMapperClass *Clone() const override { return NEW_REF( GridTextureMapperClass, (*this)); }
 
@@ -230,6 +246,7 @@ public:
 	RotateTextureMapperClass(const RotateTextureMapperClass & src);
 
 	virtual int	Mapper_ID() const override { return MAPPER_ID_ROTATE;}
+	virtual unsigned long					Compute_Canonical_CRC(unsigned long crc = 0) const override;
 
 	virtual TextureMapperClass *Clone() const override { return NEW_REF( RotateTextureMapperClass, (*this)); }
 
@@ -257,6 +274,7 @@ public:
 	SineLinearOffsetTextureMapperClass(const SineLinearOffsetTextureMapperClass & src);
 
 	virtual int	Mapper_ID() const override { return MAPPER_ID_SINE_LINEAR_OFFSET;}
+	virtual unsigned long					Compute_Canonical_CRC(unsigned long crc = 0) const override;
 
 	virtual TextureMapperClass *Clone() const override { return NEW_REF( SineLinearOffsetTextureMapperClass, (*this)); }
 
@@ -285,6 +303,7 @@ public:
 	StepLinearOffsetTextureMapperClass(const StepLinearOffsetTextureMapperClass & src);
 
 	virtual int	Mapper_ID() const override { return MAPPER_ID_STEP_LINEAR_OFFSET;}
+	virtual unsigned long					Compute_Canonical_CRC(unsigned long crc = 0) const override;
 
 	virtual TextureMapperClass *Clone() const override { return NEW_REF( StepLinearOffsetTextureMapperClass, (*this)); }
 
@@ -314,6 +333,7 @@ public:
 	ZigZagLinearOffsetTextureMapperClass(const ZigZagLinearOffsetTextureMapperClass & src);
 
 	virtual int	Mapper_ID() const override { return MAPPER_ID_ZIGZAG_LINEAR_OFFSET;}
+	virtual unsigned long					Compute_Canonical_CRC(unsigned long crc = 0) const override;
 
 	virtual TextureMapperClass *Clone() const override { return NEW_REF( ZigZagLinearOffsetTextureMapperClass, (*this)); }
 
@@ -370,6 +390,7 @@ public:
 	EdgeMapperClass(const INIClass &ini, const char *section, unsigned int stage);
 	EdgeMapperClass(const EdgeMapperClass & src);
 	virtual int	Mapper_ID() const override { return MAPPER_ID_EDGE;}
+	virtual unsigned long					Compute_Canonical_CRC(unsigned long crc = 0) const override;
 	virtual TextureMapperClass* Clone() const override { return NEW_REF( EdgeMapperClass, (*this)); }
 	virtual void Apply(int uv_array_index) override;
 	virtual void Reset() override;
@@ -391,6 +412,7 @@ public:
 	WSEnvMapperClass(const WSEnvMapperClass & src) : TextureMapperClass(src), Axis(src.Axis) { }
 	WSEnvMapperClass(const INIClass &ini, const char *section, unsigned int stage);
 	virtual bool Needs_Normals() override { return true; }
+	virtual unsigned long					Compute_Canonical_CRC(unsigned long crc = 0) const override;
 	virtual void Calculate_Texture_Matrix(Matrix4x4 &tex_matrix) override;
 protected:
 	AxisType		Axis;
@@ -481,6 +503,7 @@ public:
 	RandomTextureMapperClass(const RandomTextureMapperClass & src);
 
 	virtual int	Mapper_ID() const override { return MAPPER_ID_RANDOM;}
+	virtual unsigned long					Compute_Canonical_CRC(unsigned long crc = 0) const override;
 
 	virtual TextureMapperClass *Clone() const override { return NEW_REF( RandomTextureMapperClass, (*this)); }
 
@@ -513,6 +536,7 @@ public:
 	BumpEnvTextureMapperClass(const BumpEnvTextureMapperClass & src);
 
 	virtual int	Mapper_ID() const override { return MAPPER_ID_BUMPENV;}
+	virtual unsigned long					Compute_Canonical_CRC(unsigned long crc = 0) const override;
 
 	virtual TextureMapperClass *Clone() const override { return NEW_REF( BumpEnvTextureMapperClass, (*this)); }
 
@@ -535,6 +559,7 @@ public:
 	GridWSEnvMapperClass(const INIClass &ini, const char *section, unsigned int stage);
 	virtual void Calculate_Texture_Matrix(Matrix4x4 &tex_matrix) override;
 	virtual bool Needs_Normals() override { return true; }
+	virtual unsigned long					Compute_Canonical_CRC(unsigned long crc = 0) const override;
 protected:
 	AxisType		Axis;
 };

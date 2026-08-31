@@ -2,7 +2,7 @@ add_executable(core_camera_audio_policy_tests)
 
 target_sources(core_camera_audio_policy_tests PRIVATE
     CameraAudioPolicyTest.cpp
-    ../../GameEngineDevice/Source/MilesAudioDevice/AudioChannelPolicy.cpp
+    ../../GameEngineDevice/Source/AudioDevice/AudioChannelPolicy.cpp
     ../../GameEngineDevice/Source/W3DDevice/GameClient/TerrainDrawSizing.cpp
 )
 

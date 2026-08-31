@@ -130,7 +130,7 @@ void	BinkVideoPlayer::init()
 	// Need to load the stuff from the ini file.
 	VideoPlayer::init();
 
-	initializeBinkWithMiles();
+	initializeVideoAudio();
 }
 
 //============================================================================
@@ -139,7 +139,10 @@ void	BinkVideoPlayer::init()
 
 void BinkVideoPlayer::deinit()
 {
-	TheAudio->releaseHandleForBink();
+	LegacyVideoAudioInterface *audio = TheAudio != nullptr ? TheAudio->getLegacyVideoAudioInterface() : nullptr;
+	if (audio != nullptr) {
+		audio->releaseLegacyVideoAudioHandle();
+	}
 	VideoPlayer::deinit();
 }
 
@@ -271,19 +274,23 @@ VideoStreamInterface*	BinkVideoPlayer::load( AsciiString movieTitle )
 void BinkVideoPlayer::notifyVideoPlayerOfNewProvider( Bool nowHasValid )
 {
 	if (!nowHasValid) {
-		TheAudio->releaseHandleForBink();
+		LegacyVideoAudioInterface *audio = TheAudio != nullptr ? TheAudio->getLegacyVideoAudioInterface() : nullptr;
+		if (audio != nullptr) {
+			audio->releaseLegacyVideoAudioHandle();
+		}
 		BinkSetSoundTrack(0, nullptr);
 	} else {
-		initializeBinkWithMiles();
+		initializeVideoAudio();
 	}
 }
 
 //============================================================================
 //============================================================================
-void BinkVideoPlayer::initializeBinkWithMiles()
+void BinkVideoPlayer::initializeVideoAudio()
 {
 	Int retVal = 0;
-	void *driver = TheAudio->getHandleForBink();
+	LegacyVideoAudioInterface *audio = TheAudio != nullptr ? TheAudio->getLegacyVideoAudioInterface() : nullptr;
+	void *driver = audio != nullptr ? audio->getLegacyVideoDirectSoundHandle() : nullptr;
 
 	if ( driver )
 	{
@@ -301,6 +308,7 @@ void BinkVideoPlayer::initializeBinkWithMiles()
 
 BinkVideoStream::BinkVideoStream()
 : m_handle(nullptr)
+, m_frameRendered(FALSE)
 {
 
 }
@@ -334,6 +342,13 @@ void BinkVideoStream::update()
 Bool BinkVideoStream::isFrameReady()
 {
 	return !BinkWait( m_handle );
+}
+
+Bool BinkVideoStream::isFinished() const
+{
+	// Selecting the last frame does not present it: BinkWait may still defer it.
+	// Hosts that advance after rendering retain the legacy wrap-to-zero signal.
+	return m_handle == nullptr || (m_frameRendered && m_handle->FrameNum >= m_handle->Frames);
 }
 
 //============================================================================
@@ -385,6 +400,7 @@ void BinkVideoStream::frameRender( VideoBuffer *buffer )
 			BinkCopyToBuffer ( m_handle, mem, buffer->pitch(), buffer->height(),
 													buffer->xPos(), buffer->yPos(), flags );
 			buffer->unlock();
+			m_frameRendered = TRUE;
 		}
 	}
 
@@ -397,6 +413,7 @@ void BinkVideoStream::frameRender( VideoBuffer *buffer )
 void BinkVideoStream::frameNext()
 {
 	BinkNextFrame( m_handle );
+	m_frameRendered = FALSE;
 }
 
 //============================================================================
@@ -421,9 +438,13 @@ Int	BinkVideoStream::frameCount()
 // BinkVideoStream::frameGoto
 //============================================================================
 
-void BinkVideoStream::frameGoto( Int index )
+Bool BinkVideoStream::frameGoto( Int index )
 {
+	if (m_handle == nullptr)
+		return FALSE;
 	BinkGoto(m_handle, index, 0 );
+	m_frameRendered = FALSE;
+	return TRUE;
 }
 
 //============================================================================

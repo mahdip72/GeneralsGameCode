@@ -35,7 +35,11 @@ void StackDump(void (*callback)(const char*));
 
 // Writes a stackdump (provide a callback : gets called per line)
 // If callback is nullptr then will write using OuputDebugString
+#if defined(_WIN64)
+void StackDumpFromContext(const CONTEXT &context, void (*callback)(const char*));
+#else
 void StackDumpFromContext(DWORD eip,DWORD esp,DWORD ebp, void (*callback)(const char*));
+#endif
 
 // Gets count* addresses from the current stack
 void FillStackAddresses(void**addresses, unsigned int count, unsigned int skip = 0);
@@ -43,7 +47,7 @@ void FillStackAddresses(void**addresses, unsigned int count, unsigned int skip =
 // Do full stack dump using an address array
 void StackDumpFromAddresses(void**addresses, unsigned int count, void (*callback)(const char*));
 
-void GetFunctionDetails(void *pointer, char*name, char*filename, unsigned int* linenumber, unsigned int* address);
+void GetFunctionDetails(void *pointer, char*name, char*filename, unsigned int* linenumber, uintptr_t* address);
 
 // Dumps out the exception info and stack trace.
 void DumpExceptionInfo( unsigned int u, EXCEPTION_POINTERS* e_info );
@@ -58,7 +62,7 @@ __inline void FillStackAddresses(void**addresses, unsigned int count, unsigned i
 // Do full stack dump using an address array
 __inline void StackDumpFromAddresses(void**addresses, unsigned int count, void (*callback)(const char*)) {}
 
-__inline void GetFunctionDetails(void *pointer, char*name, char*filename, unsigned int* linenumber, unsigned int* address) {}
+__inline void GetFunctionDetails(void *pointer, char*name, char*filename, unsigned int* linenumber, uintptr_t* address) {}
 
 // Dumps out the exception info and stack trace.
 __inline void DumpExceptionInfo( unsigned int u, EXCEPTION_POINTERS* e_info ) {};

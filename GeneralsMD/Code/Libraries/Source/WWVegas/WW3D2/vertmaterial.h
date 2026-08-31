@@ -185,6 +185,7 @@ public:
 	inline void							Set_Mapper(TextureMapperClass *mapper,int stage=0);
 	inline TextureMapperClass *	Get_Mapper(int stage=0);
 	inline TextureMapperClass *	Peek_Mapper(int stage=0);
+	inline const TextureMapperClass * Peek_Mapper(int stage=0) const;
 	inline void							Reset_Mappers();
 
 	/*
@@ -273,6 +274,11 @@ inline TextureMapperClass * VertexMaterialClass::Get_Mapper(int stage)
 }
 
 inline TextureMapperClass * VertexMaterialClass::Peek_Mapper(int stage)
+{
+	return Mapper[stage];
+}
+
+inline const TextureMapperClass * VertexMaterialClass::Peek_Mapper(int stage) const
 {
 	return Mapper[stage];
 }

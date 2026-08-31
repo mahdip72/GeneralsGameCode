@@ -192,7 +192,23 @@ inline static bool Equal_Material(const VertexMaterialClass* mat1,const VertexMa
 {
 	int crc0 = mat1 ? mat1->Get_CRC() : 0;
 	int crc1 = mat2 ? mat2->Get_CRC() : 0;
-	return (crc0 == crc1);
+	if (crc0 != crc1) {
+		return false;
+	}
+	if (mat1 == nullptr || mat2 == nullptr) {
+		return mat1 == mat2;
+	}
+	// Native x64 CRCs deliberately describe mapper configuration rather than
+	// hashing pointer bytes. Render batching still has to preserve the retail
+	// identity rule: two independent mapper instances can carry different
+	// animation phase and per-object matrices even when their configuration
+	// CRCs match.
+	for (int stage = 0; stage < MeshBuilderClass::MAX_STAGES; ++stage) {
+		if (mat1->Peek_Mapper(stage) != mat2->Peek_Mapper(stage)) {
+			return false;
+		}
+	}
+	return true;
 }
 
 

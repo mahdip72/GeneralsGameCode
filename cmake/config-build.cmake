@@ -1,6 +1,7 @@
 # Do we want to build extra SDK stuff or just the game binary?
 option(RTS_BUILD_CORE_TOOLS "Build core tools" ON)
 option(RTS_BUILD_CORE_EXTRAS "Build core extra tools/tests" OFF)
+option(RTS_BUILD_PRODUCT "Build at least one game product target" ON)
 option(RTS_BUILD_ZEROHOUR "Build Zero Hour code." ON)
 option(RTS_BUILD_GENERALS "Build Generals code." ON)
 option(RTS_BUILD_OPTION_PROFILE "Build code with the \"Profile\" configuration." OFF)
@@ -10,7 +11,7 @@ option(RTS_BUILD_OPTION_ASAN "Build code with Address Sanitizer." OFF)
 option(RTS_BUILD_OPTION_VC6_FULL_DEBUG "Build VC6 with full debug info." OFF)
 option(RTS_BUILD_OPTION_FFMPEG "Enable FFmpeg support" OFF)
 
-if(NOT RTS_BUILD_ZEROHOUR AND NOT RTS_BUILD_GENERALS)
+if(RTS_BUILD_PRODUCT AND NOT RTS_BUILD_ZEROHOUR AND NOT RTS_BUILD_GENERALS)
     set(RTS_BUILD_ZEROHOUR TRUE)
     message("You must select one project to build, building Zero Hour by default.")
 endif()
@@ -61,6 +62,13 @@ endif()
 # This disables a lot of warnings steering developers to use windows only functions/function names.
 if(MSVC)
     target_compile_definitions(core_config INTERFACE _CRT_NONSTDC_NO_WARNINGS _CRT_SECURE_NO_WARNINGS $<$<CONFIG:DEBUG>:_DEBUG_CRT>)
+
+    # Pointer truncation is always a correctness defect in native x64 code.
+    # Keep the legacy 32-bit/VC6 oracle unchanged while making modern x64
+    # targets fail at compile time if one is reintroduced.
+    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+        target_compile_options(core_x64_portability_config INTERFACE /we4302 /we4311)
+    endif()
 endif()
 
 if(UNIX)
@@ -74,7 +82,12 @@ else()
 endif()
 
 if(RTS_BUILD_OPTION_PROFILE)
-    target_compile_definitions(core_config INTERFACE RTS_PROFILE_LEGACY)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+        target_compile_definitions(core_config INTERFACE RTS_PROFILE_LEGACY)
+        message(STATUS "Legacy function-entry profiling enabled for 32-bit profile build")
+    else()
+        message(STATUS "Legacy function-entry profiling disabled for ${CMAKE_SIZEOF_VOID_P}-byte pointer profile build; enable RTS_BUILD_OPTION_PROFILE_TRACY for portable tracing")
+    endif()
 endif()
 
 # Define a dummy Tracy target when the build option is disabled.

@@ -105,7 +105,10 @@
 W3DVideoBuffer::W3DVideoBuffer( VideoBuffer::Type format )
 : VideoBuffer(format),
 	m_texture(nullptr),
-	m_surface(nullptr)
+	m_surface(nullptr),
+	m_surfaceLocked(FALSE),
+	m_lockedMemory(nullptr),
+	m_framePublished(FALSE)
 {
 
 }
@@ -123,8 +126,26 @@ Bool W3DVideoBuffer::allocate( UnsignedInt width, UnsignedInt height )
 	m_height = height;
 	m_textureWidth = width;
 	m_textureHeight = height;
-	unsigned int temp_depth=1;
-	TextureLoader::Validate_Texture_Size( m_textureWidth, m_textureHeight, temp_depth);
+	if (DX8Wrapper::Is_D3D11_Backend_Active())
+	{
+		// Preserve native 4K dimensions without accepting malformed movies that
+		// exceed the bridge's bounded full-level publication contract.
+		const UnsignedInt max_texture_dimension = 16384;
+		const size_t max_texture_bytes = 256U * 1024U * 1024U;
+		if (m_textureWidth == 0 || m_textureHeight == 0 ||
+			m_textureWidth > max_texture_dimension ||
+			m_textureHeight > max_texture_dimension ||
+			static_cast<size_t>(m_textureWidth) > max_texture_bytes / 4U /
+				static_cast<size_t>(m_textureHeight))
+		{
+			return FALSE;
+		}
+	}
+	else
+	{
+		unsigned int temp_depth=1;
+		TextureLoader::Validate_Texture_Size( m_textureWidth, m_textureHeight, temp_depth);
+	}
 
 	WW3DFormat w3dFormat = TypeToW3DFormat(  m_format );
 
@@ -184,9 +205,42 @@ void*		W3DVideoBuffer::lock()
 	if ( m_surface )
 	{
 		mem = m_surface->Lock( (Int*) &m_pitch );
+		m_surfaceLocked = mem != nullptr;
+		m_lockedMemory = mem;
+		m_framePublished = FALSE;
+		if (!m_surfaceLocked)
+		{
+			m_surface->Release_Ref();
+			m_surface = nullptr;
+			m_lockedMemory = nullptr;
+		}
 	}
 
 	return mem;
+}
+
+//============================================================================
+// W3DVideoBuffer::publishLockedFrame
+//============================================================================
+
+Bool W3DVideoBuffer::publishLockedFrame()
+{
+	size_t slice_pitch = 0;
+	if (!m_surfaceLocked || m_lockedMemory == nullptr || m_texture == nullptr ||
+		m_format != TYPE_X8R8G8B8 || m_xPos != 0 || m_yPos != 0 ||
+		m_width != m_textureWidth || m_height != m_textureHeight ||
+		!ComputeDirectBGRA8SlicePitch(m_format, m_textureWidth,
+			m_textureHeight, m_pitch, &slice_pitch))
+	{
+		return FALSE;
+	}
+
+	const size_t row_pitch = static_cast<size_t>(m_pitch);
+
+	m_framePublished = Publish_Render_Texture_BGRA8_Change(
+		m_texture->Peek_D3D_Base_Texture(), m_lockedMemory, row_pitch,
+		slice_pitch) ? TRUE : FALSE;
+	return m_framePublished;
 }
 
 //============================================================================
@@ -197,12 +251,21 @@ void		W3DVideoBuffer::unlock()
 {
 	if ( m_surface != nullptr )
 	{
-		m_surface->Unlock();
+		const Bool frame_published = m_framePublished;
+		if (m_surfaceLocked)
+		{
+			m_surface->Unlock();
+		}
 		m_surface->Release_Ref();
 		m_surface = nullptr;
+		m_surfaceLocked = FALSE;
+		m_lockedMemory = nullptr;
+		m_framePublished = FALSE;
 		// Decoded frames update the same managed legacy texture in place. Discard
-		// the D3D11 conversion so the next video draw uploads the new frame.
-		if ( m_texture != nullptr )
+		// the D3D11 conversion unless the locked BGRA8 contents were published
+		// directly. Other formats, backends, and publication failures retain the
+		// conservative D3D8/Bink path.
+		if ( !frame_published && m_texture != nullptr )
 		{
 			Notify_Render_Texture_Changed(
 				m_texture->Peek_D3D_Base_Texture());

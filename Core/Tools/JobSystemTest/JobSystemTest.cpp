@@ -1263,6 +1263,40 @@ int testBatchAdmissionAndWorkerWaitRejection()
 		}
 	}
 
+	/* Tiny failing jobs can complete while batch admission publishes handles.
+	 * Repeat the race window so an execution owner can never be stranded by a
+	 * transient duplicate-enqueue claim. */
+	for (unsigned iteration = 0; iteration < 128; ++iteration)
+	{
+		rts::JobGroup group = system.createGroup();
+		rts::JobSubmission submissions[8];
+		rts::JobHandle handles[8];
+		for (unsigned index = 0; index < 8; ++index)
+		{
+			submissions[index].job = new FailJob;
+			submissions[index].priority = rts::JOB_PRIORITY_FRAME_CRITICAL;
+		}
+		const bool accepted = system.trySubmitBatch(submissions, 8, group,
+			handles);
+		result |= check(accepted,
+			"fast-failure race batch is admitted");
+		if (!accepted)
+		{
+			for (unsigned index = 0; index < 8; ++index)
+			{
+				delete submissions[index].job;
+			}
+			break;
+		}
+		result |= check(system.wait(group) && group.failed(),
+			"fast-failure race batch drains with explicit failure");
+		for (unsigned index = 0; index < 8; ++index)
+		{
+			result |= check(handles[index].failed(),
+				"fast-failure race handle reaches terminal failure");
+		}
+	}
+
 	{
 		rts::JobGroup group = system.createGroup();
 		bool workerWaitResult = true;

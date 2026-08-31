@@ -270,7 +270,8 @@ AttackStateMachine::AttackStateMachine( Object *obj, AIAttackState* att, AsciiSt
 	{
 		StateConditionInfo(outOfWeaponRangeObject, AttackStateMachine::CHASE_TARGET, nullptr),
 		StateConditionInfo(wantToSquishTarget, AttackStateMachine::CHASE_TARGET, nullptr),
-		StateConditionInfo(cannotPossiblyAttackObject, EXIT_MACHINE_WITH_FAILURE, (void*)ATTACK_CONTINUED_TARGET),
+	StateConditionInfo(cannotPossiblyAttackObject, EXIT_MACHINE_WITH_FAILURE,
+		reinterpret_cast<void *>(static_cast<uintptr_t>(ATTACK_CONTINUED_TARGET))),
 		StateConditionInfo(nullptr, INVALID_STATE_ID, nullptr)
 	};
 
@@ -278,7 +279,8 @@ AttackStateMachine::AttackStateMachine( Object *obj, AIAttackState* att, AsciiSt
 	static const StateConditionInfo objectConditionsForced[] =
 	{
 		StateConditionInfo(outOfWeaponRangeObject, AttackStateMachine::CHASE_TARGET, nullptr),
-		StateConditionInfo(cannotPossiblyAttackObject, EXIT_MACHINE_WITH_FAILURE, (void*)ATTACK_CONTINUED_TARGET_FORCED),
+	StateConditionInfo(cannotPossiblyAttackObject, EXIT_MACHINE_WITH_FAILURE,
+		reinterpret_cast<void *>(static_cast<uintptr_t>(ATTACK_CONTINUED_TARGET_FORCED))),
 		StateConditionInfo(wantToSquishTarget, AttackStateMachine::CHASE_TARGET, nullptr),
 		StateConditionInfo(nullptr, INVALID_STATE_ID, nullptr)
 	};
@@ -1241,7 +1243,7 @@ Bool outOfWeaponRangePosition( State *thisState, void* userData )
  */
 static Bool cannotPossiblyAttackObject( State *thisState, void* userData )
 {
-	AbleToAttackType attackType = (AbleToAttackType)(UnsignedInt)userData;
+	AbleToAttackType attackType = static_cast<AbleToAttackType>(reinterpret_cast<uintptr_t>(userData));
 	Object *obj = thisState->getMachineOwner();
 	Object *victim = thisState->getMachineGoalObject();
 

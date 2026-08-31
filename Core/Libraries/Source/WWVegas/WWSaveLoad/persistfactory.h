@@ -42,6 +42,9 @@
 #include "WWDebug/wwdebug.h"
 #include "saveload.h"
 #include "persist.h"
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
+#include "pointertoken.h"
+#endif
 
 /*
 ** PersistFactoryClass
@@ -95,6 +98,27 @@ public:
 	};
 };
 
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
+namespace PersistFactoryDetail
+{
+
+inline bool Open_Expected_Chunk(ChunkLoadClass &cload, uint32 expected_chunk_id)
+{
+	if (!cload.Open_Chunk())
+	{
+		return false;
+	}
+	if (cload.Cur_Chunk_ID() == expected_chunk_id)
+	{
+		return true;
+	}
+	cload.Close_Chunk();
+	return false;
+}
+
+} // namespace PersistFactoryDetail
+#endif
+
 
 template<class T, int CHUNKID> PersistClass *
 SimplePersistFactoryClass<T,CHUNKID>::Load(ChunkLoadClass & cload) const
@@ -102,13 +126,47 @@ SimplePersistFactoryClass<T,CHUNKID>::Load(ChunkLoadClass & cload) const
 	T * new_obj = W3DNEW T;
 	T * old_obj = nullptr;
 
+#if defined(_MSC_VER) && _MSC_VER < 1300
 	cload.Open_Chunk();
 	WWASSERT(cload.Cur_Chunk_ID() == SIMPLEFACTORY_CHUNKID_OBJPOINTER);
 	cload.Read(&old_obj,sizeof(T *));
 	cload.Close_Chunk();
+#else
+	if (!PersistFactoryDetail::Open_Expected_Chunk(
+		cload, SIMPLEFACTORY_CHUNKID_OBJPOINTER))
+	{
+		WWASSERT(0);
+		delete new_obj;
+		return nullptr;
+	}
+	const uint32 token_size = cload.Cur_Chunk_Length();
+	uint8 token_bytes[PERSIST_POINTER_TOKEN_CURRENT_SIZE] = {};
+	std::uintptr_t old_token = 0U;
+	if (token_size > sizeof(token_bytes) ||
+		cload.Read(token_bytes, token_size) != token_size ||
+		!Decode_Persist_Pointer_Token(token_bytes, token_size, &old_token))
+	{
+		WWASSERT(0);
+		cload.Close_Chunk();
+		delete new_obj;
+		return nullptr;
+	}
+	old_obj = reinterpret_cast<T *>(old_token);
+	cload.Close_Chunk();
+#endif
 
+#if defined(_MSC_VER) && _MSC_VER < 1300
 	cload.Open_Chunk();
 	WWASSERT(cload.Cur_Chunk_ID() == SIMPLEFACTORY_CHUNKID_OBJDATA);
+#else
+	if (!PersistFactoryDetail::Open_Expected_Chunk(
+		cload, SIMPLEFACTORY_CHUNKID_OBJDATA))
+	{
+		WWASSERT(0);
+		delete new_obj;
+		return nullptr;
+	}
+#endif
 	new_obj->Load(cload);
 	cload.Close_Chunk();
 
@@ -120,10 +178,24 @@ SimplePersistFactoryClass<T,CHUNKID>::Load(ChunkLoadClass & cload) const
 template<class T, int CHUNKID> void
 SimplePersistFactoryClass<T,CHUNKID>::Save(ChunkSaveClass & csave,PersistClass * obj) const
 {
+#if defined(_MSC_VER) && _MSC_VER < 1300
 	uint32 objptr = (uint32)obj;
 	csave.Begin_Chunk(SIMPLEFACTORY_CHUNKID_OBJPOINTER);
 	csave.Write(&objptr,sizeof(uint32));
 	csave.End_Chunk();
+#else
+	uint8 token_bytes[PERSIST_POINTER_TOKEN_CURRENT_SIZE] = {};
+	const uint32 token_size = Persist_Pointer_Token_Size();
+	const bool encoded = Encode_Persist_Pointer_Token(reinterpret_cast<std::uintptr_t>(obj),
+		token_bytes, token_size);
+	WWASSERT(encoded);
+	if (!encoded) {
+		return;
+	}
+	csave.Begin_Chunk(SIMPLEFACTORY_CHUNKID_OBJPOINTER);
+	csave.Write(token_bytes, token_size);
+	csave.End_Chunk();
+#endif
 
 	csave.Begin_Chunk(SIMPLEFACTORY_CHUNKID_OBJDATA);
 	obj->Save(csave);

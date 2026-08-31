@@ -7,6 +7,8 @@ include(gitinfo/git_watcher.cmake)
 # Create resources library
 add_library(resources STATIC)
 
+target_link_libraries(resources PRIVATE core_x64_portability_config)
+
 target_sources(resources PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/gitinfo.cpp"
     gitinfo/gitinfo.h

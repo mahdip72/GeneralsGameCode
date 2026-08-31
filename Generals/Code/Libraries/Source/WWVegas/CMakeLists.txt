@@ -3,8 +3,7 @@ add_library(g_wwcommon INTERFACE)
 
 target_link_libraries(g_wwcommon INTERFACE
     core_wwcommon
-    rts_d3d8lib
-    milesstub
+    rts_legacy_product_runtime
     stlport
 )
 
@@ -12,7 +11,9 @@ target_include_directories(g_wwcommon INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-add_subdirectory(WWAudio)
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    add_subdirectory(WWAudio)
+endif()
 add_subdirectory(WW3D2)
 add_subdirectory(WWDownload)
 

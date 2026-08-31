@@ -273,9 +273,9 @@ static void adjustDisplay( GameWindow *window, Int adjustment,
 
 		if( updateSlider )
 			TheWindowManager->winSendSystemMsg( list->slider,
-																					GSM_SET_SLIDER,
-																					(sData->maxVal - list->displayPos),
-																					0 );
+																								GSM_SET_SLIDER,
+																									WindowMsgDataFromInt(sData->maxVal - list->displayPos),
+																									0 );
 	}
 
 }
@@ -727,7 +727,7 @@ WindowMsgHandledType GadgetListBoxInput( GameWindow *window, UnsignedInt msg,
 									continue;
 								for(j = 0; j < TheKeyboard->MAX_KEY_STATES; ++j)
 								{
-									if(dString->getText().getCharAt(0) == TheKeyboard->getPrintableKey((KeyDefType)mData1, j))
+									if(dString->getText().getCharAt(0) == TheKeyboard->getPrintableKey(static_cast<KeyDefType>(WindowMsgDataToUnsignedInt(mData1)), j))
 									{
 										list->selectPos = position;
 										Int prevPos = getListboxTopEntry(list);
@@ -787,7 +787,7 @@ WindowMsgHandledType GadgetListBoxInput( GameWindow *window, UnsignedInt msg,
 		{
 			TheWindowManager->winSetFocus( window );
 //			Int mousex = mData1 & 0xFFFF;
-			Int mousey = mData1 >> 16;
+			Int mousey = static_cast<Int>(WindowMsgDataToUnsignedInt(mData1) >> 16);
 			Int x, y, i;
 			Int oldPos = list->selectPos;
 
@@ -868,8 +868,8 @@ WindowMsgHandledType GadgetListBoxInput( GameWindow *window, UnsignedInt msg,
 		{
 			TheWindowManager->winSetFocus( window );
 			Int pos;
-			Int mousex = mData1 & 0xFFFF;
-			Int mousey = mData1 >> 16;
+			Int mousex = static_cast<Int>(WindowMsgDataToUnsignedInt(mData1) & 0xFFFF);
+			Int mousey = static_cast<Int>(WindowMsgDataToUnsignedInt(mData1) >> 16);
 			Int x, y, i;
 			RightClickStruct rc;
 
@@ -1019,7 +1019,7 @@ WindowMsgHandledType GadgetListBoxMultiInput( GameWindow *window, UnsignedInt ms
 //			Int *selections = list->selections;
 			Int selectPos = -2;
 //			Int mousex = mData1 & 0xFFFF;
-			Int mousey = mData1 >> 16;
+			Int mousey = static_cast<Int>(WindowMsgDataToUnsignedInt(mData1) >> 16);
 			Int x, y, i;
 			Bool removed = FALSE;
 
@@ -1124,8 +1124,8 @@ WindowMsgHandledType GadgetListBoxMultiInput( GameWindow *window, UnsignedInt ms
 																					selectPos );*/
 			TheWindowManager->winSetFocus( window );
 			Int pos;
-			Int mousex = mData1 & 0xFFFF;
-			Int mousey = mData1 >> 16;
+			Int mousex = static_cast<Int>(WindowMsgDataToUnsignedInt(mData1) & 0xFFFF);
+			Int mousey = static_cast<Int>(WindowMsgDataToUnsignedInt(mData1) >> 16);
 			Int x, y, i;
 			RightClickStruct rc;
 
@@ -1272,7 +1272,7 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 		// ------------------------------------------------------------------------
 		case GGM_SET_LABEL:
 		{
-			instData->setText(*(UnicodeString*)mData1);
+			instData->setText(*static_cast<UnicodeString *>(WindowMsgDataToPointer(mData1)));
 			break;
 
 		}
@@ -1280,8 +1280,8 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 		// ------------------------------------------------------------------------
 		case GLM_GET_TEXT:
 		{
-			pos = (ICoord2D *)mData1;
-			TextAndColor *tAndC = (TextAndColor *)mData2;
+			pos = static_cast<ICoord2D *>(WindowMsgDataToPointer(mData1));
+			TextAndColor *tAndC = static_cast<TextAndColor *>(WindowMsgDataToPointer(mData2));
 
 			if(pos->x >= list->columns || pos->y >= list->listLength ||
 					list->listData[pos->y].cell[pos->x].cellType != LISTBOX_TEXT)
@@ -1302,12 +1302,12 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 		{
 
 			// See if the up button was selected
-			if( (GameWindow *)mData1 == list->upButton )
+			if( static_cast<GameWindow *>(WindowMsgDataToPointer(mData1)) == list->upButton )
 			{
 				if( list->displayPos > 0 )
 					adjustDisplay( window, -1, TRUE );
 			}
-			else if( (GameWindow *)mData1 == list->downButton )
+			else if( static_cast<GameWindow *>(WindowMsgDataToPointer(mData1)) == list->downButton )
 			{
 				if( list->displayPos + list->displayHeight <= list->totalHeight )
 					adjustDisplay( window, 1, TRUE );
@@ -1321,12 +1321,12 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 		case GGM_LEFT_DRAG:
 		{
 
-			if( (GameWindow *)mData1 == list->upButton )
+			if( static_cast<GameWindow *>(WindowMsgDataToPointer(mData1)) == list->upButton )
 			{
 				if( list->displayPos > 0 )
 					adjustDisplay( window, -1, TRUE );
 			}
-			else if( (GameWindow *)mData1 == list->downButton )
+			else if( static_cast<GameWindow *>(WindowMsgDataToPointer(mData1)) == list->downButton )
 			{
 				if( list->displayPos + list->displayHeight <= list->totalHeight )
 					adjustDisplay( window, 1, TRUE );
@@ -1394,11 +1394,12 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 		case GLM_DEL_ENTRY:
 		{
 			Int i;
+			const Int row = WindowMsgDataToInt(mData1);
 
-			if( list->endPos <= (Int)mData1 )
+			if( list->endPos <= row )
 				break;
 
-			ListEntryCell *cells = list->listData[mData1].cell;
+			ListEntryCell *cells = list->listData[row].cell;
 			if(cells)
 				for( i = 0; i <= list->columns; i ++ )
 				{
@@ -1408,11 +1409,11 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 					cells[i].userData = nullptr;
 				}
 
-			delete[](list->listData[mData1].cell);
-			list->listData[mData1].cell = nullptr;
+			delete[](list->listData[row].cell);
+			list->listData[row].cell = nullptr;
 
-			memcpy( &list->listData[mData1], &list->listData[(mData1+1)],
-							(list->endPos - mData1 - 1) * sizeof(ListEntryRow) );
+			memcpy( &list->listData[row], &list->listData[(row + 1)],
+							(list->endPos - row - 1) * sizeof(ListEntryRow) );
 
 			list->endPos--;
 			list->insertPos = list->endPos;
@@ -1423,9 +1424,9 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 
 				while( list->selections[i] >= 0 )
 				{
-					if( (Int)mData1 < list->selections[i] )
+					if( row < list->selections[i] )
 						list->selections[i]--;
-					else if ( (Int)mData1 == list->selections[i] )
+					else if ( row == list->selections[i] )
 					{
 						removeSelection( list, i );
 						i--;									// compensate for lost entry
@@ -1436,9 +1437,9 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 			}
 			else
 			{
-				if( (Int)mData1 < list->selectPos )
+				if( row < list->selectPos )
 					list->selectPos--;
-				else if ( (Int)mData1 == list->selectPos )
+				else if ( row == list->selectPos )
 					list->selectPos = -1;
 			}
 
@@ -1452,7 +1453,8 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 		{
 			Bool success = TRUE;
 			Int addedIndex = -1;
-			AddMessageStruct *addInfo = (AddMessageStruct*)mData1;
+			const Color color = WindowMsgDataToInt(mData2);
+			AddMessageStruct *addInfo = static_cast<AddMessageStruct *>(WindowMsgDataToPointer(mData1));
 			if (addInfo->row >= list->insertPos)
 				addInfo->row = -1;
 
@@ -1483,11 +1485,14 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 			{
 				if( addInfo->type == LISTBOX_TEXT )
 				{
-					addedIndex = addEntry( (UnicodeString *)addInfo->data, mData2, addInfo->row, addInfo->column, window, addInfo->overwrite );
+					addedIndex = addEntry( (UnicodeString *)addInfo->data, color,
+						addInfo->row, addInfo->column, window, addInfo->overwrite );
 				}
 				else if ( addInfo->type == LISTBOX_IMAGE )
 				{
-					addedIndex = addImageEntry( (const Image *)addInfo->data, mData2, addInfo->row, addInfo->column, window, addInfo->overwrite,addInfo->width, addInfo->height );
+					addedIndex = addImageEntry( (const Image *)addInfo->data, color,
+						addInfo->row, addInfo->column, window, addInfo->overwrite,
+						addInfo->width, addInfo->height );
 				}
 				else
 					success = FALSE;
@@ -1553,8 +1558,9 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 		// ------------------------------------------------------------------------
 		case GLM_TOGGLE_MULTI_SELECTION:
 		{
+			const Int index = WindowMsgDataToInt(mData1);
 
-			if( (Int)mData1 < 0 )
+			if( index < 0 )
 			{
 				// a negative number will purge the entire list.
 				if( list->multiSelect )
@@ -1568,7 +1574,7 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 			}
 
 			// if there is no cells we shouldn't be selecting this entry
-			if( !list->listData[ mData1 ].cell )
+			if( !list->listData[ index ].cell )
 				break;
 
 			if( list->multiSelect )
@@ -1578,7 +1584,7 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 
 				while( list->selections[i] >= 0 )
 				{
-					if( list->selections[i] == (Int)mData1 )
+					if( list->selections[i] == index )
 					{
 						removeSelection( list, i );
 						removed = TRUE;
@@ -1590,7 +1596,7 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 
 				if( removed == FALSE )
 				{
-					list->selections[i] = (Int)mData1;
+					list->selections[i] = index;
 					list->selections[i+1] = -1;
 				}
 			}
@@ -1606,8 +1612,8 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 		// ------------------------------------------------------------------------
 		case GLM_SET_SELECTION:
 		{
-			const Int *selectList = (const Int *)mData1;
-			Int selectCount = (Int)mData2;
+			const Int *selectList = static_cast<const Int *>(WindowMsgDataToPointer(mData1));
+			Int selectCount = WindowMsgDataToInt(mData2);
 			DEBUG_ASSERTCRASH( list->multiSelect || selectCount == 1, ("Bad selection size"));
 
 			if( selectList[0] < 0 || list->listLength <= selectList[0] )
@@ -1700,8 +1706,9 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 		// ------------------------------------------------------------------------
 		case GLM_SCROLL_BUFFER:
 		{
+			const Int count = WindowMsgDataToInt(mData1);
 
-			if( list->endPos < (Int)mData1 )
+			if( list->endPos < count )
 				break;
 
 			//
@@ -1715,7 +1722,7 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 			//
 			ListEntryCell *cells = nullptr;
 			Int i = 0;
-			for (; i < (Int)mData1; i++)
+			for (; i < count; i++)
 			{
 				cells = list->listData[i].cell;
 
@@ -1740,16 +1747,16 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 			//
 			// copy the cells up
 			//
-			memcpy(list->listData, &list->listData[mData1],
-						(list->endPos - mData1) * sizeof(ListEntryRow) );
+			memcpy(list->listData, &list->listData[count],
+						(list->endPos - count) * sizeof(ListEntryRow) );
 
-			list->endPos -= mData1;
+			list->endPos -= count;
 			list->insertPos = list->endPos;
 
 			//
 			// remove the display or links to images after the shift
 			//
-			for(i = 0; i < (Int)mData1; i ++)
+			for(i = 0; i < count; i ++)
 			{
 				list->listData[list->endPos + i].cell = nullptr;
 			}
@@ -1761,8 +1768,8 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 
 				while( list->selections[i] >= 0 )
 				{
-					if( (Int)mData1 >= list->selections[i] )
-						list->selections[i] -= (Int)mData1;
+					if( count >= list->selections[i] )
+						list->selections[i] -= count;
 					else
 					{
 						removeSelection( list, i );
@@ -1775,11 +1782,11 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 			else
 			{
 				if( list->selectPos > 0 )
-					list->selectPos -= mData1;
+					list->selectPos -= count;
 			}
 
 			if( list->displayPos > 0 )
-				adjustDisplay( window, (-1 * mData1), TRUE );
+				adjustDisplay( window, (-1 * count), TRUE );
 
 			computeTotalHeight( window );
 
@@ -1790,11 +1797,12 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 		// ------------------------------------------------------------------------
 		case GLM_GET_SELECTION:
 		{
+			void *selectionOutput = WindowMsgDataToPointer(mData2);
 
 			if( list->multiSelect )
-				*(Int*)mData2 = (Int)list->selections;
+				*(Int **)selectionOutput = list->selections;
 			else
-				*(Int*)mData2 = list->selectPos;
+				*(Int *)selectionOutput = list->selectPos;
 
 			break;
 
@@ -1802,17 +1810,17 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 
 		// ------------------------------------------------------------------------
 		case GLM_SET_UP_BUTTON:
-			list->upButton = (GameWindow *)mData1;
+			list->upButton = static_cast<GameWindow *>(WindowMsgDataToPointer(mData1));
 			break;
 
 		// ------------------------------------------------------------------------
 		case GLM_SET_DOWN_BUTTON:
-			list->downButton = (GameWindow *)mData1;
+			list->downButton = static_cast<GameWindow *>(WindowMsgDataToPointer(mData1));
 			break;
 
 		// ------------------------------------------------------------------------
 		case GLM_SET_SLIDER:
-			list->slider = (GameWindow *)mData1;
+			list->slider = static_cast<GameWindow *>(WindowMsgDataToPointer(mData1));
 			break;
 
 		// ------------------------------------------------------------------------
@@ -1822,8 +1830,8 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 		// ------------------------------------------------------------------------
 		case GGM_RESIZED:
 		{
-			Int width = (Int)mData1;
-			Int height = (Int)mData2;
+			Int width = WindowMsgDataToInt(mData1);
+			Int height = WindowMsgDataToInt(mData2);
 			ICoord2D downSize = {0, 0};
 			ICoord2D upSize = {0, 0};
 			ICoord2D sliderSize = {0, 0};
@@ -1919,10 +1927,11 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 		case GLM_UPDATE_DISPLAY:
 		{
 
-			if( mData1 > 0 )
+			const Int firstEntry = WindowMsgDataToInt(mData1);
+			if( firstEntry > 0 )
 				// set the display to the top of a specific entry
 				// which is the previous listHeight + 1
-				list->displayPos = list->listData[(mData1 - 1)].listHeight + 1;
+				list->displayPos = list->listData[(firstEntry - 1)].listHeight + 1;
 			else
 				list->displayPos = 0;
 
@@ -1986,7 +1995,7 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 		{
 
 			// If we're losing focus
-			if( mData1 == FALSE )
+			if( WindowMsgDataToInt(mData1) == FALSE )
 			{
 				BitClear( instData->m_state, WIN_STATE_HILITED );
 			}
@@ -1996,11 +2005,11 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 			}
 
 			TheWindowManager->winSendSystemMsg( window->winGetOwner(),
-																					GGM_FOCUS_CHANGE,
-																					mData1,
-																					window->winGetWindowId() );
+																									GGM_FOCUS_CHANGE,
+																									WindowMsgDataFromInt(WindowMsgDataToInt(mData1)),
+																									WindowMsgDataFromInt(window->winGetWindowId()) );
 
-			*(Bool*)mData2 = TRUE;
+			*(Bool*)WindowMsgDataToPointer(mData2) = TRUE;
 			break;
 
 		}
@@ -2008,7 +2017,7 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 		case GSM_SLIDER_TRACK:
 		{
 			SliderData *sData = (SliderData *)list->slider->winGetUserData();
-			list->displayPos = sData->maxVal - mData2;
+			list->displayPos = sData->maxVal - WindowMsgDataToInt(mData2);
 
 			if( list->displayPos > (list->totalHeight - list->displayHeight + 1) )
 				list->displayPos = (list->totalHeight - list->displayHeight + 1);
@@ -2023,8 +2032,8 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 		// ------------------------------------------------------------------------
 		case GLM_SET_ITEM_DATA:
 		{
-			void *data = (void *)mData2;
-			pos = (ICoord2D *)mData1;
+			void *data = static_cast<void *>(WindowMsgDataToPointer(mData2));
+			pos = static_cast<ICoord2D *>(WindowMsgDataToPointer(mData1));
 
 			if (pos->y >= 0 && pos->y < list->endPos && list->listData[pos->y].cell)
 				list->listData[pos->y].cell[pos->x].userData = data;
@@ -2034,8 +2043,8 @@ WindowMsgHandledType GadgetListBoxSystem( GameWindow *window, UnsignedInt msg,
 		// ------------------------------------------------------------------------
 		case GLM_GET_ITEM_DATA:
 		{
-			pos = (ICoord2D *)mData1;
-			void **data = (void **)mData2;
+			pos = static_cast<ICoord2D *>(WindowMsgDataToPointer(mData1));
+			void **data = static_cast<void **>(WindowMsgDataToPointer(mData2));
 
 			*data = nullptr;  // initialize to nullptr
 			if (pos->y >= 0 && pos->y < list->endPos && list->listData[pos->y].cell)
@@ -2185,7 +2194,8 @@ UnicodeString GadgetListBoxGetTextAndColor( GameWindow *listbox, Color *color, I
 	ICoord2D pos;
 	pos.x = column;
 	pos.y = row;
-	TheWindowManager->winSendSystemMsg( listbox, GLM_GET_TEXT, (WindowMsgData)&pos, (WindowMsgData)&tAndC );
+	TheWindowManager->winSendSystemMsg( listbox, GLM_GET_TEXT,
+		WindowMsgDataFromPointer(&pos), WindowMsgDataFromPointer(&tAndC) );
 
 
 		*color = tAndC.color;
@@ -2224,7 +2234,8 @@ Int GadgetListBoxAddEntryText( GameWindow *listbox,
 	Int oldBottomIndex = GadgetListBoxGetBottomVisibleEntry(listbox);
 
 	/// @TODO: Don't do this type cast!
-	index = (Int) TheWindowManager->winSendSystemMsg( listbox, GLM_ADD_ENTRY, (WindowMsgData)&addInfo, color );
+	index = WindowMsgDataToInt(TheWindowManager->winSendSystemMsg(
+		listbox, GLM_ADD_ENTRY, WindowMsgDataFromPointer(&addInfo), WindowMsgDataFromInt(color) ));
 
 	//DEBUG_ASSERTLOG(!listData->scrollIfAtEnd, ("Adding line %d (orig end was %d, newEntryOffset is %d, (%d-%d)?=%d, isFull=%d/%d ll=%d, end=%d",
 		//index, oldBottomIndex, newEntryOffset, index, oldBottomIndex, newEntryOffset, wasFull, GadgetListBoxIsFull(listbox), listData->listLength, listData->endPos));
@@ -2254,7 +2265,8 @@ Int GadgetListBoxAddEntryImage( GameWindow *listbox, const Image *image,
 	addInfo.height = hight;
 	addInfo.width = width;
 	/// @TODO: Don't do this type cast!
-	index = (Int) TheWindowManager->winSendSystemMsg( listbox, GLM_ADD_ENTRY, (WindowMsgData)&addInfo, color );
+	index = WindowMsgDataToInt(TheWindowManager->winSendSystemMsg(
+		listbox, GLM_ADD_ENTRY, WindowMsgDataFromPointer(&addInfo), WindowMsgDataFromInt(color) ));
 	return (index);
 }
 
@@ -2627,7 +2639,8 @@ void GadgetListBoxGetSelected( GameWindow *listbox, Int *selectList )
 		return;
 
 	// get selected indices via system message
-	TheWindowManager->winSendSystemMsg( listbox, GLM_GET_SELECTION, 0, (WindowMsgData)selectList );
+	TheWindowManager->winSendSystemMsg( listbox, GLM_GET_SELECTION, 0,
+		WindowMsgDataFromPointer(selectList) );
 
 }
 
@@ -2643,7 +2656,8 @@ void GadgetListBoxSetSelected( GameWindow *listbox, Int selectIndex )
 		return;
 
 	// set selected index via system message
-	TheWindowManager->winSendSystemMsg( listbox, GLM_SET_SELECTION, (WindowMsgData)(&selectIndex), 1 );
+	TheWindowManager->winSendSystemMsg( listbox, GLM_SET_SELECTION,
+		WindowMsgDataFromPointer(&selectIndex), WindowMsgDataFromInt(1) );
 
 }
 
@@ -2656,7 +2670,8 @@ void GadgetListBoxSetSelected( GameWindow *listbox, const Int *selectList, Int s
 	if( listbox == nullptr )
 		return;
 	// set selected index via system message
-	TheWindowManager->winSendSystemMsg( listbox, GLM_SET_SELECTION, (WindowMsgData)selectList, selectCount );
+	TheWindowManager->winSendSystemMsg( listbox, GLM_SET_SELECTION,
+		WindowMsgDataFromPointer(selectList), WindowMsgDataFromInt(selectCount) );
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -2683,7 +2698,8 @@ void GadgetListBoxSetItemData( GameWindow *listbox, void *data, Int row, Int col
 	pos.y = row;
 
 	if (listbox)
-		TheWindowManager->winSendSystemMsg( listbox, GLM_SET_ITEM_DATA, (WindowMsgData)&pos, (WindowMsgData)data);
+		TheWindowManager->winSendSystemMsg( listbox, GLM_SET_ITEM_DATA,
+			WindowMsgDataFromPointer(&pos), WindowMsgDataFromPointer(data));
 
 }
 
@@ -2698,7 +2714,8 @@ void *GadgetListBoxGetItemData( GameWindow *listbox, Int row, Int column)
 
 	if (listbox)
 	{
-		TheWindowManager->winSendSystemMsg( listbox, GLM_GET_ITEM_DATA, (WindowMsgData)&pos, (WindowMsgData)&data);
+		TheWindowManager->winSendSystemMsg( listbox, GLM_GET_ITEM_DATA,
+			WindowMsgDataFromPointer(&pos), WindowMsgDataFromPointer(&data));
 	}
 	return (data);
 

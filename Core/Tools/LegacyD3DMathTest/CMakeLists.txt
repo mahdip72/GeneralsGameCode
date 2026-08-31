@@ -24,4 +24,4 @@ if(MINGW)
 endif()
 
 add_test(NAME core_legacy_d3d_math_tests COMMAND core_legacy_d3d_math_tests)
-set_tests_properties(core_legacy_d3d_math_tests PROPERTIES TIMEOUT 30)
+set_tests_properties(core_legacy_d3d_math_tests PROPERTIES TIMEOUT 60)

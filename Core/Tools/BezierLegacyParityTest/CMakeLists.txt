@@ -40,5 +40,5 @@ set_tests_properties(core_bezier_legacy_parity_test PROPERTIES TIMEOUT 30)
 
 install(TARGETS core_bezier_legacy_parity_test
     RUNTIME DESTINATION tests
-    COMPONENT Stage2FocusedTests
+    COMPONENT Stage3FocusedTests
 )

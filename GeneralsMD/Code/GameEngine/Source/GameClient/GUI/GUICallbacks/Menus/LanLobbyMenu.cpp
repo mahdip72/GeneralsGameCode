@@ -344,7 +344,8 @@ static void playerTooltip(GameWindow *window,
 		return;
 	}
 
-	UnsignedInt playerIP = (UnsignedInt)GadgetListBoxGetItemData( window, row, col );
+	UnsignedInt playerIP = GadgetItemDataToUnsignedInt(
+		GadgetListBoxGetItemData( window, row, col ) );
 	LANPlayer *player = TheLAN->LookupPlayer(playerIP);
 	if (!player)
 	{
@@ -715,7 +716,7 @@ WindowMsgHandledType LanLobbyMenuSystem( GameWindow *window, UnsignedInt msg,
 				Int controlID = control->winGetWindowId();
 				if( controlID == listboxGamesID )
 				{
-					int rowSelected = mData2;
+					int rowSelected = WindowMsgDataToInt(mData2);
 
 					if (rowSelected >= 0)
 					{
@@ -736,7 +737,7 @@ WindowMsgHandledType LanLobbyMenuSystem( GameWindow *window, UnsignedInt msg,
 				Int controlID = control->winGetWindowId();
 				if( controlID == listboxGamesID )
 				{
-					int rowSelected = mData2;
+					int rowSelected = WindowMsgDataToInt(mData2);
 					if( rowSelected < 0 )
 					{
 						HideGameInfoWindow(TRUE);

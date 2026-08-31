@@ -9,6 +9,7 @@ namespace render
 {
 class NativeW3DResources;
 class NativeW3DRenderState;
+class NativeW3DRecoveryTestAccess;
 // Native facade inputs are intentionally logical and handle-based.  Game code
 // never receives a backend COM pointer or a legacy-adapter header.
 struct NativeW3DRendererDescriptor
@@ -76,6 +77,7 @@ public:
 
 private:
 	friend class NativeW3DResources;
+	friend class NativeW3DRecoveryTestAccess;
 	NativeW3DRenderer(const NativeW3DRenderer &);
 	NativeW3DRenderer &operator=(const NativeW3DRenderer &);
 
@@ -83,6 +85,8 @@ private:
 	bool m_frameOpen;
 
 	bool IsOwnerThread() const;
+	static RenderResult DrainFailedRecoveryCleanup(
+		NativeW3DRenderState *state, unsigned int *drained);
 };
 }
 }

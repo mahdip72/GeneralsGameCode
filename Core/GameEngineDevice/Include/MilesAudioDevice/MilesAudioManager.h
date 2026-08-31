@@ -138,7 +138,7 @@ class AudioFileCache
 		const char *m_mutexName;
 };
 
-class MilesAudioManager : public AudioManager
+class MilesAudioManager : public AudioManager, public LegacyVideoAudioInterface
 {
 
 	public:
@@ -188,8 +188,9 @@ class MilesAudioManager : public AudioManager
 		virtual void setSpeakerType( UnsignedInt speakerType ) override;
 		virtual UnsignedInt getSpeakerType() override;
 
- 		virtual void *getHandleForBink() override;
- 		virtual void releaseHandleForBink() override;
+		virtual void *getLegacyVideoDirectSoundHandle();
+		virtual void releaseLegacyVideoAudioHandle();
+		virtual LegacyVideoAudioInterface *getLegacyVideoAudioInterface() override { return this; }
 
 		virtual void friend_forcePlayAudioEventRTS(const AudioEventRTS* eventToPlay) override;
 
@@ -331,7 +332,7 @@ class MilesAudioManager : public AudioManager
 		CriticalSectionClass m_fadingAudioCS;
 
 		AudioFileCache *m_audioCache;
-		PlayingAudio *m_binkHandle;
+		PlayingAudio *m_legacyVideoHandle;
 		UnsignedInt m_num2DSamples;
 		UnsignedInt m_num3DSamples;
 		UnsignedInt m_numStreams;
@@ -390,8 +391,8 @@ class MilesAudioManagerDummy : public MilesAudioManager
 	virtual void removePlayingAudio(AsciiString eventName) override {}
 	virtual void removeAllDisabledAudio() override {}
 	virtual Bool has3DSensitiveStreamsPlaying() const override { return false; }
-	virtual void* getHandleForBink() override { return nullptr; }
-	virtual void releaseHandleForBink() override {}
+	void* getLegacyVideoDirectSoundHandle() override { return nullptr; }
+	void releaseLegacyVideoAudioHandle() override {}
 	virtual void friend_forcePlayAudioEventRTS(const AudioEventRTS* eventToPlay) override {}
 	virtual void setPreferredProvider(AsciiString providerNdx) override {}
 	virtual void setPreferredSpeaker(AsciiString speakerType) override {}

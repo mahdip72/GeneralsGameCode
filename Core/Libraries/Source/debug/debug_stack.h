@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <Utility/stdint_adapter.h>
+
 /// \brief stack walker class (singleton)
 class DebugStackwalk
 {
@@ -46,6 +48,10 @@ public:
   /// \brief a stack trace signature
   class Signature
   {
+  public:
+    typedef uintptr_t Address;
+
+  private:
     // makes life easier :)
     friend class DebugStackwalk;
 
@@ -55,8 +61,8 @@ public:
     /// number of addresses
     unsigned m_numAddr;
 
-    /// addresses
-    unsigned m_addr[MAX_ADDR];
+    /// addresses.  A code address is pointer-sized on the native build.
+    Address m_addr[MAX_ADDR];
 
   public:
     explicit Signature(): m_numAddr(0) {}
@@ -78,7 +84,7 @@ public:
       \param n index, 0..Size()-1
       \return signature address
     */
-    unsigned GetAddress(int n) const;
+    Address GetAddress(int n) const;
 
     /**
       \brief Strong ordering operator.
@@ -110,7 +116,7 @@ public:
       \param buf return buffer
       \param bufSize size of return buffer, minimum is 64 bytes (256 recommended)
     */
-    static void GetSymbol(unsigned addr, char *buf, unsigned bufSize);
+    static void GetSymbol(Address addr, char *buf, unsigned bufSize);
 
     /**
       \brief Determines symbol for given address.
@@ -127,7 +133,7 @@ public:
       \param line line number, may be nullptr
       \param relLine relative address within line, may be nullptr
     */
-    static void GetSymbol(unsigned addr,
+    static void GetSymbol(Address addr,
                           char *bufMod, unsigned sizeMod, unsigned *relMod,
                           char *bufSym, unsigned sizeSym, unsigned *relSym,
                           char *bufFile, unsigned sizeFile, unsigned *line, unsigned *relLine);

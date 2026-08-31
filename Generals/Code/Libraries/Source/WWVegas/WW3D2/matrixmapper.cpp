@@ -46,6 +46,10 @@
 #include "matrixmapper.h"
 #include "dx8wrapper.h"
 
+namespace
+{
+	const uint32 CANONICAL_MAPPER_MATRIX = 0x100u;
+}
 
 /***********************************************************************************************
  * MatrixMapperClass::MatrixMapperClass -- Constructor                                         *
@@ -64,11 +68,26 @@
 MatrixMapperClass::MatrixMapperClass(int stage) :
 	TextureMapperClass(stage),
 	Flags(0),
+	Type(ORTHO_PROJECTION),
 	ViewToTexture(true),
 	ViewToPixel(true),
 	GradientUCoord(0.5f)
 {
 	ViewSpaceProjectionNormal = Vector3(0.0f,0.0f,0.0f);
+}
+
+unsigned long MatrixMapperClass::Compute_Canonical_Matrix_CRC(unsigned long crc, uint32 type_id) const
+{
+	crc = Append_Canonical_Header(crc, type_id);
+	crc = Append_Canonical_UInt(crc, Flags);
+	crc = Append_Canonical_UInt(crc, static_cast<uint32>(Type));
+	crc = Append_Canonical_Matrix4(crc, ViewToTexture);
+	return Append_Canonical_Float(crc, GradientUCoord);
+}
+
+unsigned long MatrixMapperClass::Compute_Canonical_CRC(unsigned long crc) const
+{
+	return Compute_Canonical_Matrix_CRC(crc, CANONICAL_MAPPER_MATRIX);
 }
 
 /***********************************************************************************************

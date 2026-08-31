@@ -93,12 +93,14 @@ public:
 	float						Get_Gradient_U_Coord() { return GradientUCoord; }
 
 	void						Compute_Texture_Coordinate(const Vector3 & point,Vector3 * set_stq);
+	virtual unsigned long					Compute_Canonical_CRC(unsigned long crc = 0) const override;
 
 	virtual TextureMapperClass*	Clone() const override { 	WWASSERT(0);	return nullptr; }
 
 	virtual void			Apply(int uv_array_index) override;
 
 protected:
+	unsigned long							Compute_Canonical_Matrix_CRC(unsigned long crc, uint32 type_id) const;
 
 	void						Update_View_To_Pixel_Transform(float texsize);
 

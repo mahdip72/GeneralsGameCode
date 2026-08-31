@@ -1,0 +1,6 @@
+add_executable(core_frame_timing_diagnostics_test FrameTimingDiagnosticsTest.cpp)
+target_include_directories(core_frame_timing_diagnostics_test PRIVATE
+    "${CMAKE_SOURCE_DIR}/Core/Libraries/Include")
+target_compile_features(core_frame_timing_diagnostics_test PRIVATE cxx_std_20)
+add_test(NAME core_frame_timing_diagnostics_test COMMAND core_frame_timing_diagnostics_test)
+set_tests_properties(core_frame_timing_diagnostics_test PROPERTIES TIMEOUT 30)

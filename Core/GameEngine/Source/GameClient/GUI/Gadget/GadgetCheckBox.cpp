@@ -270,7 +270,7 @@ WindowMsgHandledType GadgetCheckBoxSystem( GameWindow *window, UnsignedInt msg,
 		// ------------------------------------------------------------------------
 		case GGM_SET_LABEL:
 		{
-			window->winSetText( *(UnicodeString*)mData1 );
+			window->winSetText( *static_cast<UnicodeString *>(WindowMsgDataToPointer(mData1)) );
 			break;
 		}
 
@@ -294,9 +294,9 @@ WindowMsgHandledType GadgetCheckBoxSystem( GameWindow *window, UnsignedInt msg,
 																					mData1,
 																					window->winGetWindowId() );
 			if( mData1 == FALSE )
-				*(Bool*)mData2 = FALSE;
+				*static_cast<Bool *>(WindowMsgDataToPointer(mData2)) = FALSE;
 			else
-				*(Bool*)mData2 = TRUE;
+				*static_cast<Bool *>(WindowMsgDataToPointer(mData2)) = TRUE;
 
 			break;
 

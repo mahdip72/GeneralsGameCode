@@ -381,6 +381,77 @@ void AudioManager::getInfoForAudioEvent( const AudioEventRTS *eventToFindAndFill
 }
 
 //-------------------------------------------------------------------------------------------------
+Bool AudioManager::prepareAudioEventForPlayback(
+	const AudioEventRTS *eventToAdd,
+	RefCountPtr<DynamicAudioEventRTS> &preparedEvent,
+	Bool forced)
+{
+	preparedEvent.Clear();
+	if (eventToAdd == nullptr || eventToAdd->getEventName().isEmpty()
+		|| eventToAdd->getEventName() == "NoSound") {
+		return FALSE;
+	}
+
+	if (!eventToAdd->getAudioEventInfo()) {
+		getInfoForAudioEvent(eventToAdd);
+	}
+	if (!eventToAdd->getAudioEventInfo()) {
+		return FALSE;
+	}
+
+	const AudioEventInfo *eventInfo = eventToAdd->getAudioEventInfo();
+	if (!forced) {
+		switch (eventInfo->m_soundType) {
+			case AT_Music:
+				if (!isOn(AudioAffect_Music)) return FALSE;
+				break;
+			case AT_SoundEffect:
+				if (eventToAdd->isPositionalAudio()
+					? !isOn(AudioAffect_Sound3D) : !isOn(AudioAffect_Sound)) {
+					return FALSE;
+				}
+				break;
+			case AT_Streaming:
+				if ((getDisallowSpeech() && !eventToAdd->getUninterruptible())
+					|| !isOn(AudioAffect_Speech)) return FALSE;
+				break;
+		}
+
+#if RETAIL_COMPATIBLE_CRC
+		const Bool logicalAudio = eventToAdd->getIsLogicalAudio();
+#else
+		const Bool logicalAudio = FALSE;
+#endif
+		if (!logicalAudio && !eventToAdd->getUninterruptible()
+			&& !shouldPlayLocally(eventToAdd)) {
+			return FALSE;
+		}
+	}
+
+	preparedEvent.Assign_No_Add_Ref(newInstance(DynamicAudioEventRTS)(*eventToAdd));
+	preparedEvent->setPlayingHandle(allocateNewHandle());
+	preparedEvent->generateFilename();
+	eventToAdd->setPlayingAudioIndex(preparedEvent->getPlayingAudioIndex());
+	preparedEvent->generatePlayInfo();
+
+	std::list<std::pair<AsciiString, Real>/**/>::const_iterator adjustedVolumeIt;
+	for (adjustedVolumeIt = m_adjustedVolumes.begin(); adjustedVolumeIt != m_adjustedVolumes.end();
+		++adjustedVolumeIt) {
+		if (adjustedVolumeIt->first == preparedEvent->getEventName()) {
+			preparedEvent->setVolume(adjustedVolumeIt->second);
+			break;
+		}
+	}
+
+	if (!forced && m_audioSettings != nullptr
+		&& preparedEvent->getVolume() < m_audioSettings->m_minVolume) {
+		preparedEvent.Clear();
+		return FALSE;
+	}
+	return TRUE;
+}
+
+//-------------------------------------------------------------------------------------------------
 AudioHandle AudioManager::addAudioEvent(const AudioEventRTS *eventToAdd)
 {
 	if (eventToAdd->getEventName().isEmpty() || eventToAdd->getEventName() == "NoSound") {
@@ -399,6 +470,17 @@ AudioHandle AudioManager::addAudioEvent(const AudioEventRTS *eventToAdd)
 	}
 
 	const AudioType soundType = eventToAdd->getAudioEventInfo()->m_soundType;
+
+#if defined(_WIN64) && RETAIL_COMPATIBLE_CRC
+	// Logical audio must consume the synchronized RNG before an x64 local-audio
+	// setting can reject the event. The legacy path below intentionally keeps
+	// its retail ordering for the Win32/VC6 CRC oracle.
+	RefCountPtr<DynamicAudioEventRTS> audioEvent;
+	if (eventToAdd->getIsLogicalAudio()
+		&& !prepareAudioEventForPlayback(eventToAdd, audioEvent, TRUE)) {
+		return AHSV_Error;
+	}
+#endif
 
 	// Check if audio type is on
 	// TheSuperHackers @info Zero audio volume is not a fail condition, because music, speech and sounds
@@ -437,18 +519,23 @@ AudioHandle AudioManager::addAudioEvent(const AudioEventRTS *eventToAdd)
 		return AHSV_NotForLocal;
 	}
 
+#if !defined(_WIN64) || !RETAIL_COMPATIBLE_CRC
 	RefCountPtr<DynamicAudioEventRTS> audioEvent;
-	audioEvent.Assign_No_Add_Ref(newInstance(DynamicAudioEventRTS)(*eventToAdd));
-	audioEvent->setPlayingHandle( allocateNewHandle() );
-	audioEvent->generateFilename();	// which file are we actually going to play?
-	eventToAdd->setPlayingAudioIndex( audioEvent->getPlayingAudioIndex() );
-	audioEvent->generatePlayInfo();	// generate pitch shift and volume shift now as well
+#endif
+	if (audioEvent == nullptr)
+	{
+		audioEvent.Assign_No_Add_Ref(newInstance(DynamicAudioEventRTS)(*eventToAdd));
+		audioEvent->setPlayingHandle( allocateNewHandle() );
+		audioEvent->generateFilename();	// which file are we actually going to play?
+		eventToAdd->setPlayingAudioIndex( audioEvent->getPlayingAudioIndex() );
+		audioEvent->generatePlayInfo();	// generate pitch shift and volume shift now as well
 
-	std::list<std::pair<AsciiString, Real>/**/>::iterator it;
-	for (it = m_adjustedVolumes.begin(); it != m_adjustedVolumes.end(); ++it) {
-		if (it->first == audioEvent->getEventName()) {
-			audioEvent->setVolume(it->second);
-			break;
+		std::list<std::pair<AsciiString, Real>/**/>::iterator it;
+		for (it = m_adjustedVolumes.begin(); it != m_adjustedVolumes.end(); ++it) {
+			if (it->first == audioEvent->getEventName()) {
+				audioEvent->setVolume(it->second);
+				break;
+			}
 		}
 	}
 

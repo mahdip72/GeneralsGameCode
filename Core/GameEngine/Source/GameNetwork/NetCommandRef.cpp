@@ -49,6 +49,10 @@ NetCommandRef::NetCommandRef(NetCommandMsg *msg)
 	m_prev = nullptr;
 	m_relay = 0;
 	m_timeLastSent = -1;
+#if defined(_WIN64)
+	m_recoveryRetryBounded = FALSE;
+	m_recoveryQueuedAt = 0;
+#endif
 
 #ifdef DEBUG_NETCOMMANDREF
 	m_id = ++refNum;

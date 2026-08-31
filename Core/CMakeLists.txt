@@ -1,3 +1,6 @@
+# Apply native x64 pointer diagnostics to all Core runtime and test targets.
+link_libraries(core_x64_portability_config)
+
 # i stands for Interface
 add_library(corei_gameengine_include INTERFACE)
 add_library(corei_libraries_include INTERFACE)
@@ -12,6 +15,7 @@ target_include_directories(corei_libraries_source_wwvegas INTERFACE "Libraries/S
 target_include_directories(corei_main INTERFACE "Main")
 
 target_sources(corei_libraries_include PRIVATE
+    Libraries/Include/Common/RegistryView.h
     Libraries/Include/Lib/BaseType.h
     Libraries/Include/Lib/BaseTypeCore.h
     Libraries/Include/Lib/trig.h
@@ -34,6 +38,9 @@ target_link_libraries(corei_always_no_pch INTERFACE
 
 # Set where the build results will end up
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+if(COMMAND rts_stage_asan_runtime)
+    rts_stage_asan_runtime("${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+endif()
 
 # Contains internal libraries
 add_subdirectory(Libraries)

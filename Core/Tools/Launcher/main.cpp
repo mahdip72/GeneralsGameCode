@@ -125,7 +125,8 @@ void RunGame(char *thePath, ConfigFile &config, Process &proc)
 void RunLauncher(char *thePath, Process &proc)
 {
 	myChdir(thePath);
-	Create_Process(proc);
+	if (Create_Process(proc))
+		Close_Process(proc);
 }
 
 //

@@ -35,12 +35,9 @@
 
 // forward declarations
 
-struct CommandPacket;
 class GameMessage;
 class GameInfo;
 
-void ClearCommandPacket(UnsignedInt frame);										///< ClearCommandPacket clears the command packet at the start of the frame.
-CommandPacket *GetCommandPacket();											///< TheNetwork calls GetCommandPacket to get commands to send.
 
 
 
@@ -107,6 +104,12 @@ public:
 	virtual void setSawCRCMismatch() = 0;
 
 	virtual Bool isPlayerConnected(Int playerID) = 0;
+
+	// The native x64 runtime performs a bounded NET3 compatibility exchange
+	// before map-transfer/gameplay traffic.  Win32 retains the legacy-ready
+	// behavior through the same interface.
+	virtual Bool isNetworkHelloReady() = 0;
+	virtual Bool hasNetworkHelloFailure() = 0;
 
 	virtual void notifyOthersOfCurrentFrame() = 0;					///< Tells all the other players what frame we are on.
 	virtual void notifyOthersOfNewFrame(UnsignedInt frame) = 0;							///< Tells all the other players that we are on a new frame.

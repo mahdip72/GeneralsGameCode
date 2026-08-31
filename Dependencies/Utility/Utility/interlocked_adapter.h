@@ -18,7 +18,26 @@
 
 #pragma once
 
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
 #if defined(_MSC_VER) && _MSC_VER < 1300
+
+inline long InterlockedExchange(long volatile *Target, long Value)
+{
+	return ::InterlockedExchange(const_cast<long *>(Target), Value);
+}
+
+inline long InterlockedIncrement(long volatile *Addend)
+{
+	return ::InterlockedIncrement(const_cast<long *>(Addend));
+}
+
+inline long InterlockedDecrement(long volatile *Addend)
+{
+	return ::InterlockedDecrement(const_cast<long *>(Addend));
+}
 
 inline long InterlockedCompareExchange(long volatile *Destination, long Exchange, long Comparand)
 {

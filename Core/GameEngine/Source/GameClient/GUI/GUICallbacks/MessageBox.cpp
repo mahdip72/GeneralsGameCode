@@ -121,7 +121,7 @@ WindowMsgHandledType MessageBoxSystem( GameWindow *window, UnsignedInt msg,
 
 			// if we're givin the opportunity to take the keyboard focus we must say we want it
 			if( mData1 == TRUE )
-				*(Bool *)mData2 = TRUE;
+				*static_cast<Bool *>(WindowMsgDataToPointer(mData2)) = TRUE;
 
 			break;
 
@@ -130,7 +130,7 @@ WindowMsgHandledType MessageBoxSystem( GameWindow *window, UnsignedInt msg,
 		//---------------------------------------------------------------------------------------------
 		case GBM_SELECTED:
 		{
-			GameWindow *control = (GameWindow *)mData1;
+			GameWindow *control = static_cast<GameWindow *>(WindowMsgDataToPointer(mData1));
 			Int controlID = control->winGetWindowId();
 			static NameKeyType buttonOkID = TheNameKeyGenerator->nameToKey( "MessageBox.wnd:ButtonOk" );
 			static NameKeyType buttonYesID = TheNameKeyGenerator->nameToKey( "MessageBox.wnd:ButtonYes" );
@@ -205,7 +205,7 @@ WindowMsgHandledType QuitMessageBoxSystem( GameWindow *window, UnsignedInt msg,
 
 			// if we're givin the opportunity to take the keyboard focus we must say we want it
 			if( mData1 == TRUE )
-				*(Bool *)mData2 = TRUE;
+				*static_cast<Bool *>(WindowMsgDataToPointer(mData2)) = TRUE;
 
 			break;
 
@@ -214,7 +214,7 @@ WindowMsgHandledType QuitMessageBoxSystem( GameWindow *window, UnsignedInt msg,
 		//---------------------------------------------------------------------------------------------
 		case GBM_SELECTED:
 		{
-			GameWindow *control = (GameWindow *)mData1;
+			GameWindow *control = static_cast<GameWindow *>(WindowMsgDataToPointer(mData1));
 			Int controlID = control->winGetWindowId();
 			static NameKeyType buttonOkID = TheNameKeyGenerator->nameToKey( "QuitMessageBox.wnd:ButtonOk" );
 			static NameKeyType buttonYesID = TheNameKeyGenerator->nameToKey( "QuitMessageBox.wnd:ButtonYes" );

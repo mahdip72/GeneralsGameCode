@@ -95,7 +95,7 @@ WindowMsgHandledType GadgetTextEntryInput( GameWindow *window, UnsignedInt msg,
 		// ------------------------------------------------------------------------
 		case GWM_IME_CHAR:
 		{
-			WideChar ch = (WideChar) mData1;
+			WideChar ch = static_cast<WideChar>(WindowMsgDataToUnsignedInt(mData1));
 
 			// --------------------------------------------------------------------
 			if ( ch == VK_RETURN )
@@ -323,14 +323,14 @@ WindowMsgHandledType GadgetTextEntrySystem( GameWindow *window, UnsignedInt msg,
 
 		// ------------------------------------------------------------------------
 		case GEM_GET_TEXT:
-			*(UnicodeString*)mData2 = e->text->getText();
+			*static_cast<UnicodeString *>(WindowMsgDataToPointer(mData2)) = e->text->getText();
 			break;
 
 		// ------------------------------------------------------------------------
 		case GEM_SET_TEXT:
 		{
 
-			const UnicodeString* ustr = (const UnicodeString*)mData1;
+			const UnicodeString* ustr = static_cast<const UnicodeString *>(WindowMsgDataToPointer(mData1));
 			e->text->setText( *ustr );
 			e->charPos = ustr->getLength();
 			e->constructText->setText( UnicodeString::TheEmptyString );
@@ -404,7 +404,7 @@ WindowMsgHandledType GadgetTextEntrySystem( GameWindow *window, UnsignedInt msg,
 																					mData1,
 																					window->winGetWindowId() );
 
-			*(Bool*)mData2 = TRUE;
+			*static_cast<Bool *>(WindowMsgDataToPointer(mData2)) = TRUE;
 			break;
 
 		default:

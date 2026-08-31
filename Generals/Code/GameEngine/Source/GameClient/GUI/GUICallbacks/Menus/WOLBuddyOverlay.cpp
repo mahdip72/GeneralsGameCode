@@ -215,8 +215,10 @@ WindowMsgHandledType BuddyControlSystem( GameWindow *window, UnsignedInt msg,
 					if(rc->pos < 0)
 						break;
 
-					GPProfile profileID = (GPProfile)GadgetListBoxGetItemData(control, rc->pos, 0);
-					RCItemType itemType = (RCItemType)(Int)GadgetListBoxGetItemData(control, rc->pos, 1);
+					GPProfile profileID = GadgetItemDataToInt(
+						GadgetListBoxGetItemData(control, rc->pos, 0));
+					RCItemType itemType = static_cast<RCItemType>(GadgetItemDataToInt(
+						GadgetListBoxGetItemData(control, rc->pos, 1)));
 					UnicodeString nick = GadgetListBoxGetText(control, rc->pos);
 
 					GadgetListBoxSetSelected(control, rc->pos);
@@ -267,7 +269,8 @@ WindowMsgHandledType BuddyControlSystem( GameWindow *window, UnsignedInt msg,
 				GadgetListBoxGetSelected(buddyControls.listboxBuddies, &selected);
 				if (selected >= 0)
 				{
-					GPProfile selectedProfile = (GPProfile)GadgetListBoxGetItemData(buddyControls.listboxBuddies, selected);
+		GPProfile selectedProfile = GadgetItemDataToInt(
+			GadgetListBoxGetItemData(buddyControls.listboxBuddies, selected));
 					BuddyInfoMap *m = TheGameSpyInfo->getBuddyMap();
 					BuddyInfoMap::iterator recipIt = m->find(selectedProfile);
 					if (recipIt == m->end())
@@ -393,7 +396,8 @@ void updateBuddyInfo()
 
 	GadgetListBoxGetSelected(buddyControls.listboxBuddies, &selected);
 	if (selected >= 0)
-		selectedProfile = (GPProfile)GadgetListBoxGetItemData(buddyControls.listboxBuddies, selected);
+		selectedProfile = GadgetItemDataToInt(
+			GadgetListBoxGetItemData(buddyControls.listboxBuddies, selected));
 
 	selected = -1;
 	GadgetListBoxReset(buddyControls.listboxBuddies);
@@ -445,8 +449,10 @@ void updateBuddyInfo()
 			formatStr = info.m_statusString;
 		}
 		GadgetListBoxAddEntryText(buddyControls.listboxBuddies, formatStr, GameSpyColor[GSCOLOR_DEFAULT], index, 1);
-		GadgetListBoxSetItemData(buddyControls.listboxBuddies, (void *)(profileID), index, 0 );
-		GadgetListBoxSetItemData(buddyControls.listboxBuddies, (void *)(ITEM_BUDDY), index, 1 );
+		GadgetListBoxSetItemData(buddyControls.listboxBuddies,
+			GadgetItemDataFromInt(profileID), index, 0 );
+		GadgetListBoxSetItemData(buddyControls.listboxBuddies,
+			GadgetItemDataFromInt(ITEM_BUDDY), index, 1 );
 
 		if (profileID == selectedProfile)
 			selected = index;
@@ -463,12 +469,14 @@ void updateBuddyInfo()
 		UnicodeString formatStr;
 		formatStr.translate(info.m_name.str());
 		int index = GadgetListBoxAddEntryText(buddyControls.listboxBuddies, formatStr, GameSpyColor[GSCOLOR_DEFAULT], -1, -1);
-		GadgetListBoxSetItemData(buddyControls.listboxBuddies, (void *)(profileID), index, 0 );
+		GadgetListBoxSetItemData(buddyControls.listboxBuddies,
+			GadgetItemDataFromInt(profileID), index, 0 );
 
 		// insert status into box
 		formatStr = TheGameText->fetch("GUI:BuddyAddReq");
 		GadgetListBoxAddEntryText(buddyControls.listboxBuddies, formatStr, GameSpyColor[GSCOLOR_DEFAULT], index, 1);
-		GadgetListBoxSetItemData(buddyControls.listboxBuddies, (void *)(ITEM_REQUEST), index, 1 );
+		GadgetListBoxSetItemData(buddyControls.listboxBuddies,
+			GadgetItemDataFromInt(ITEM_REQUEST), index, 1 );
 
 		if (profileID == selectedProfile)
 			selected = index;
@@ -883,7 +891,8 @@ WindowMsgHandledType WOLBuddyOverlaySystem( GameWindow *window, UnsignedInt msg,
 						break;
 
 					Bool isBuddy = false, isRequest = false;
-					GPProfile profileID = (GPProfile)GadgetListBoxGetItemData(control, rc->pos);
+					GPProfile profileID = GadgetItemDataToInt(
+						GadgetListBoxGetItemData(control, rc->pos));
 					UnicodeString nick = GadgetListBoxGetText(control, rc->pos);
 					BuddyInfoMap *buddies = TheGameSpyInfo->getBuddyMap();
 					BuddyInfoMap::iterator bIt;
@@ -973,7 +982,8 @@ WindowMsgHandledType WOLBuddyOverlaySystem( GameWindow *window, UnsignedInt msg,
 
 					GadgetListBoxGetSelected(listbox, &selected);
 					if (selected >= 0)
-						selectedName = TheNameKeyGenerator->keyToName((NameKeyType)(int)GadgetListBoxGetItemData(listbox, selected));
+						selectedName = TheNameKeyGenerator->keyToName(static_cast<NameKeyType>(
+							GadgetItemDataToInt(GadgetListBoxGetItemData(listbox, selected))));
 
 					if (!selectedName.isEmpty())
 					{
@@ -990,7 +1000,7 @@ WindowMsgHandledType WOLBuddyOverlaySystem( GameWindow *window, UnsignedInt msg,
 				Int controlID = control->winGetWindowId();
 				if( controlID == listboxBuddyID )
 				{
-					int rowSelected = mData2;
+					int rowSelected = WindowMsgDataToInt(mData2);
 
 					if (rowSelected >= 0)
 					{
@@ -999,7 +1009,8 @@ WindowMsgHandledType WOLBuddyOverlaySystem( GameWindow *window, UnsignedInt msg,
 
 							// get text of buddy name
 						buddyName = GadgetListBoxGetText( listboxWindow, rowSelected,0 );
-						GPProfile buddyID = (GPProfile)GadgetListBoxGetItemData( listboxWindow, rowSelected, 0 );
+				GPProfile buddyID = GadgetItemDataToInt(
+					GadgetListBoxGetItemData( listboxWindow, rowSelected, 0 ));
 
 						Int index = -1;
 						gpGetBuddyIndex(TheGPConnection, buddyID, &index);
@@ -1413,7 +1424,7 @@ void refreshIgnoreList()
 		UnicodeString name;
 		name.translate(it->second);
 		Int pos = GadgetListBoxAddEntryText(listboxIgnore, name, GameMakeColor(255,100,100,255),-1);
-		GadgetListBoxSetItemData(listboxIgnore, (void *)it->first,pos );
+		GadgetListBoxSetItemData(listboxIgnore, GadgetItemDataFromInt(it->first),pos );
 		++it;
 	}
 	IgnoreList tempList;
