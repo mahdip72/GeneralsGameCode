@@ -32,11 +32,17 @@
 #include "Common/PerfTimer.h"
 #include "Common/Player.h"
 #include "Common/PlayerList.h"
+#include "Common/Recorder.h"
+#include "Common/RandomValue.h"
+#include "Common/SkirmishAIReplayEpoch.h"
 #include "Common/ThingTemplate.h"
 #include "Common/Xfer.h"
 #include "Common/XferCRC.h"
 
 #include "GameLogic/AI.h"
+#include "GameLogic/AIPlayer.h"
+#include "GameLogic/AISkirmishPlayer.h"
+#include "GameLogic/GameLogic.h"
 #include "GameLogic/PartitionManager.h"
 #include "GameLogic/Module/AIUpdate.h"
 #include "GameLogic/Module/ContainModule.h"
@@ -44,6 +50,14 @@
 #include "GameLogic/SidesList.h"
 #include "GameLogic/AIPathfind.h"
 #include "GameLogic/Weapon.h"
+
+#if defined(_WIN64)
+#include "GameNetwork/MultiplayerSimulationRuntimePolicy.h"
+#include "Lib/DeterministicAIPlanning.h"
+#include "Lib/SimulationExecutionPolicy.h"
+#include <new>
+#include <vector>
+#endif
 
 extern void addIcon(const Coord3D *pos, Real width, Int numFramesDuration, RGBColor color);
 
@@ -353,10 +367,247 @@ void AI::reset()
 /**
  * Update the AI system
  */
+#if defined(_WIN64)
+namespace
+{
+Bool ShouldRunCounterBasedEnemyPlanning()
+{
+	return ShouldUseSkirmishAICounterRng(
+		TheGameLogic->isInReplayGame(),
+		TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() :
+			SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+}
+
+rts::AIPlanningExecutionMode GetEnemyPlanningExecutionMode()
+{
+	if (TheGameLogic->isInMultiplayerGame() &&
+		(TheNetwork == nullptr ||
+		 !rts::ShouldPrepareLiveSimulationKernelOffThread(
+			rts::MULTIPLAYER_SIMULATION_KERNEL_AI_PLANNING)))
+		return rts::AI_PLANNING_EXECUTION_SERIAL;
+	switch (rts::GetSimulationExecutionMode())
+	{
+		case rts::SIMULATION_EXECUTION_PARALLEL:
+			return rts::AI_PLANNING_EXECUTION_PARALLEL;
+		case rts::SIMULATION_EXECUTION_SHADOW:
+			return rts::AI_PLANNING_EXECUTION_SHADOW;
+		default:
+			return rts::AI_PLANNING_EXECUTION_SERIAL;
+	}
+}
+
+rts::AICounterRngKey MakeProductionPlanningRandomKey(UnsignedInt playerIndex)
+{
+	rts::AICounterRngKey key;
+	rts::ClearAICounterRngKey(&key);
+	key.simulationEpoch = SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG;
+	key.matchSeed = GetGameLogicRandomSeed();
+	key.frame = TheGameLogic->getFrame();
+	key.domain = rts::AI_COUNTER_RNG_DOMAIN_PLAYER_PLANNING;
+	key.playerIndex = playerIndex;
+	key.ownerStableId = playerIndex;
+	key.sourceStableId = 0U;
+	key.eventKind = rts::AI_COUNTER_RNG_EVENT_PRODUCTION_TIE;
+	key.eventOrdinal = 0U;
+	key.drawOrdinal = 0U;
+	return key;
+}
+
+Bool RunSkirmishEnemyPlanningBatch()
+{
+	if (!ShouldRunCounterBasedEnemyPlanning())
+		return true;
+
+	try
+	{
+	std::vector<AISkirmishPlayer *> owners;
+	std::vector<rts::AIPlayerPlanningSnapshot> snapshots;
+	for (Int sourceOrdinal = 0; sourceOrdinal < ThePlayerList->getPlayerCount(); ++sourceOrdinal)
+	{
+		Player *player = ThePlayerList->getNthPlayer(sourceOrdinal);
+		if (!player || !player->isSkirmishAIPlayer())
+			continue;
+		AIPlayer *aiPlayer = player->getAIPlayerForPlanning();
+		AISkirmishPlayer *owner = static_cast<AISkirmishPlayer *>(aiPlayer);
+		if (!owner || !owner->isEnemyPlanningDue())
+			continue;
+		if (snapshots.size() >= rts::AI_PLANNING_MAX_PLAYERS)
+		{
+			rts::RecordAIPlanningOwnerCommit(false);
+			return false;
+		}
+
+		rts::AIPlayerPlanningSnapshot snapshot;
+		rts::ClearAIPlayerPlanningSnapshot(&snapshot);
+		snapshot.frame = TheGameLogic->getFrame();
+		snapshot.playerIndex = (UnsignedInt)player->getPlayerIndex();
+		snapshot.planEnemyTarget = 1U;
+		if (!owner->captureEnemyPlanningSnapshot(&snapshot.enemyTarget))
+		{
+			rts::RecordAIPlanningOwnerCommit(false);
+			return false;
+		}
+		rts::RecordAIPlanningOwnerCapture(snapshot.enemyTarget.candidateCount);
+		owners.push_back(owner);
+		snapshots.push_back(snapshot);
+	}
+	if (snapshots.empty())
+		return true;
+
+	std::vector<rts::AIPlayerPlanningResult> committed(snapshots.size());
+	std::vector<rts::AIPlayerPlanningResult> serialScratch(snapshots.size());
+	std::vector<rts::AIPlayerPlanningResult> parallelScratch(snapshots.size());
+	rts::AIPlanningBatchStatus status;
+	if (!rts::ExecuteAIPlanningBatchOnJobSystem(GetEnemyPlanningExecutionMode(),
+		&snapshots[0], (UnsignedInt)snapshots.size(), &committed[0],
+		&serialScratch[0], &parallelScratch[0], &status))
+	{
+		rts::RecordAIPlanningOwnerCommit(false);
+		return false;
+	}
+
+	// commitEnemyPlanningResult performs the sole canonical/live membership
+	// validation immediately before each ordered owner mutation. Do not run the
+	// same enemy oracle once during precommit and again during commit.
+	for (UnsignedInt i = 0; i < snapshots.size(); ++i)
+	{
+		if (!owners[i]->commitEnemyPlanningResult(
+			snapshots[i].enemyTarget, committed[i].enemyTarget))
+		{
+			rts::RecordAIPlanningOwnerCommit(false);
+			return false;
+		}
+	}
+	rts::RecordAIPlanningOwnerCommit(true, &status);
+	return true;
+	}
+	catch (const std::bad_alloc &)
+	{
+		// The capture is owner-only and queue markers are consumed by the normal
+		// owner update. A failed batch therefore returns control to that
+		// deterministic serial boundary without publishing a partial result.
+		rts::RecordAIPlanningOwnerCommit(false);
+		return false;
+	}
+}
+
+Bool RunSkirmishProductionPlanningBatch()
+{
+	if (!ShouldRunCounterBasedEnemyPlanning())
+		return true;
+
+	try
+	{
+	std::vector<AISkirmishPlayer *> owners;
+	std::vector<rts::AIPlayerPlanningSnapshot> snapshots;
+	for (Int sourceOrdinal = 0; sourceOrdinal < ThePlayerList->getPlayerCount(); ++sourceOrdinal)
+	{
+		Player *player = ThePlayerList->getNthPlayer(sourceOrdinal);
+		if (!player || !player->isSkirmishAIPlayer())
+			continue;
+		AIPlayer *aiPlayer = player->getAIPlayerForPlanning();
+		AISkirmishPlayer *owner = static_cast<AISkirmishPlayer *>(aiPlayer);
+		if (!owner || !owner->isProductionPlanningDue())
+			continue;
+		if (snapshots.size() >= rts::AI_PLANNING_MAX_PLAYERS)
+		{
+			rts::RecordAIPlanningOwnerCommit(false);
+			return false;
+		}
+
+		rts::AIPlayerPlanningSnapshot snapshot;
+		rts::ClearAIPlayerPlanningSnapshot(&snapshot);
+		snapshot.frame = TheGameLogic->getFrame();
+		snapshot.playerIndex = (UnsignedInt)player->getPlayerIndex();
+		owner->prepareProductionPlanningQueue();
+		Bool handled = false;
+		Bool overflowed = false;
+		if (!owner->prepareAdaptiveProductionPlanningSnapshot(
+			&snapshot.production,
+			MakeProductionPlanningRandomKey(snapshot.playerIndex),
+			&handled, &overflowed))
+		{
+			// The per-player overflow/failure lane remains the owner-side serial
+			// implementation and will run at the normal process boundary.
+			if (overflowed)
+				continue;
+			rts::RecordAIPlanningOwnerCommit(false);
+			return false;
+		}
+		if (handled)
+			continue;
+		if (snapshot.production.candidateCount == 0U)
+		{
+			owner->markProductionPlanningHandled();
+			continue;
+		}
+		snapshot.planProduction = 1U;
+		rts::RecordAIPlanningOwnerCapture(snapshot.production.candidateCount);
+		owners.push_back(owner);
+		snapshots.push_back(snapshot);
+	}
+	if (snapshots.empty())
+		return true;
+
+	std::vector<rts::AIPlayerPlanningResult> committed(snapshots.size());
+	std::vector<rts::AIPlayerPlanningResult> serialScratch(snapshots.size());
+	std::vector<rts::AIPlayerPlanningResult> parallelScratch(snapshots.size());
+	rts::AIPlanningBatchStatus status;
+	if (!rts::ExecuteAIPlanningBatchOnJobSystem(GetEnemyPlanningExecutionMode(),
+		&snapshots[0], (UnsignedInt)snapshots.size(), &committed[0],
+		&serialScratch[0], &parallelScratch[0], &status))
+	{
+		rts::RecordAIPlanningOwnerCommit(false);
+		return false;
+	}
+
+	// Validate all owner memberships before staging any result. The actual queue
+	// mutation remains in PlayerList order at the normal team subphase.
+	for (UnsignedInt i = 0; i < snapshots.size(); ++i)
+	{
+		if (!owners[i]->validateProductionPlanningBatchCommit(
+			snapshots[i].production, committed[i].production))
+		{
+			rts::RecordAIPlanningOwnerCommit(false);
+			return false;
+		}
+	}
+	for (UnsignedInt i = 0; i < snapshots.size(); ++i)
+	{
+		if (!owners[i]->stageProductionPlanningResult(
+			snapshots[i].production, committed[i].production))
+		{
+			for (UnsignedInt prior = 0; prior < i; ++prior)
+				owners[prior]->discardStagedProductionPlanningResult();
+			rts::RecordAIPlanningOwnerCommit(false);
+			return false;
+		}
+	}
+	rts::RecordAIPlanningOwnerCommit(true, &status);
+	return true;
+	}
+	catch (const std::bad_alloc &)
+	{
+		// No result has been staged when allocation fails. PlayerList::UPDATE
+		// consumes any owner queue marker and runs the legacy serial selector.
+		rts::RecordAIPlanningOwnerCommit(false);
+		return false;
+	}
+}
+}
+#endif
+
 void AI::update()
 {
 	// Do pathfinding.
 	m_pathfinder->processPathfindQueue();
+
+#if defined(_WIN64)
+	// A failed capture/validation simply leaves the existing per-player serial
+	// acquisition path in charge during PlayerList::UPDATE.
+	if (RunSkirmishEnemyPlanningBatch())
+		RunSkirmishProductionPlanningBatch();
+#endif
 
 	// run player updates
 	{

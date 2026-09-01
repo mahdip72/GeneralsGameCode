@@ -32,11 +32,20 @@
 #include "Common/PerfTimer.h"
 #include "Common/Player.h"
 #include "Common/PlayerList.h"
+#include "Common/Recorder.h"
+#include "Common/RandomValue.h"
 #include "Common/ThingTemplate.h"
 #include "Common/Xfer.h"
 #include "Common/XferCRC.h"
 
 #include "GameLogic/AI.h"
+#include "GameLogic/AIPlayer.h"
+#include "GameLogic/AISkirmishPlayer.h"
+#include "GameLogic/GameLogic.h"
+#if defined(_WIN64)
+#include "GameLogic/GeneralsAIPlanningRuntime.h"
+#include "GameNetwork/MultiplayerSimulationRuntimePolicy.h"
+#endif
 #include "GameLogic/PartitionManager.h"
 #include "GameLogic/Module/AIUpdate.h"
 #include "GameLogic/Module/ContainModule.h"
@@ -44,6 +53,11 @@
 #include "GameLogic/SidesList.h"
 #include "GameLogic/AIPathfind.h"
 #include "GameLogic/Weapon.h"
+
+#if defined(_WIN64)
+#include <vector>
+#include <new>
+#endif
 
 extern void addIcon(const Coord3D *pos, Real width, Int numFramesDuration, RGBColor color);
 
@@ -350,10 +364,250 @@ void AI::reset()
 /**
  * Update the AI system
  */
+#if defined(_WIN64)
+namespace
+{
+Bool IsEnemyPlanningMultiplayerPolicyBlocked()
+{
+	return TheGameLogic->isInMultiplayerGame() &&
+		(TheNetwork == nullptr ||
+		 !rts::ShouldPrepareLiveSimulationKernelOffThread(
+			rts::MULTIPLAYER_SIMULATION_KERNEL_AI_PLANNING));
+}
+
+rts::AIPlanningExecutionMode GetEnemyPlanningExecutionMode()
+{
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	const Bool ready = jobs.isRunning() && !jobs.isWorkerThread() &&
+		jobs.isCurrentThread(rts::JOB_OWNER_GAME);
+	return GetGeneralsAIPlanningExecutionMode(
+		IsEnemyPlanningMultiplayerPolicyBlocked(),
+		rts::GetSimulationExecutionMode(), jobs.workerCount(), ready);
+}
+
+rts::AICounterRngKey MakeProductionPlanningRandomKey(UnsignedInt playerIndex)
+{
+	rts::AICounterRngKey key;
+	rts::ClearAICounterRngKey(&key);
+	key.simulationEpoch = SKIRMISH_AI_REPLAY_EPOCH_CURRENT;
+	key.matchSeed = GetGameLogicRandomSeed();
+	key.frame = TheGameLogic->getFrame();
+	key.domain = rts::AI_COUNTER_RNG_DOMAIN_PLAYER_PLANNING;
+	key.playerIndex = playerIndex;
+	key.ownerStableId = playerIndex;
+	key.sourceStableId = 0U;
+	key.eventKind = rts::AI_COUNTER_RNG_EVENT_PRODUCTION_TIE;
+	key.eventOrdinal = 0U;
+	key.drawOrdinal = 0U;
+	return key;
+}
+
+Bool ShouldUseCanonicalEnemyPlanning()
+{
+	const Bool recording = TheRecorder && TheRecorder->hasOpenRecordingFile();
+	const Bool replayCurrent = TheRecorder &&
+		TheRecorder->replayUsesSkirmishAIDeterministicPlanning();
+	// The negotiated network bit is consumed by GetEnemyPlanningExecutionMode:
+	// disabled/serial network sessions still use the owner canonical oracle,
+	// while only the current epoch can opt into this lane. Keep the policy probe
+	// here so the same network admission evidence is observed once per frame.
+	const Bool networkPolicyBlocked = IsEnemyPlanningMultiplayerPolicyBlocked();
+	const Bool networkSerialFallback = networkPolicyBlocked &&
+		GetEnemyPlanningExecutionMode() == rts::AI_PLANNING_EXECUTION_SERIAL;
+	return ( !networkPolicyBlocked || networkSerialFallback ) &&
+		ShouldUseGeneralsAICanonicalPlanning(
+		TheGameLogic->isInMultiplayerGame(), recording,
+		TheGameLogic->isInReplayGame(), replayCurrent,
+		IsGeneralsAICanonicalRuntimeEpoch());
+}
+
+Bool RunSkirmishEnemyPlanningBatch()
+{
+	if (!ShouldUseCanonicalEnemyPlanning())
+		return true;
+	const rts::AIPlanningExecutionMode executionMode =
+		GetEnemyPlanningExecutionMode();
+	if (ThePlayerList->getPlayerCount() >
+		GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS)
+	{
+		rts::RecordAIPlanningOwnerCommit(false);
+		return false;
+	}
+
+	AISkirmishPlayer *owners[GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS] = { nullptr };
+	GeneralsAIEnemyPlanningSnapshot snapshots[
+		GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS];
+	UnsignedInt ownerCount = 0U;
+	for (Int sourceOrdinal = 0;
+		sourceOrdinal < ThePlayerList->getPlayerCount(); ++sourceOrdinal)
+	{
+		Player *player = ThePlayerList->getNthPlayer(sourceOrdinal);
+		if (!player || !player->isSkirmishAIPlayer())
+			continue;
+		AIPlayer *aiPlayer = player->getAIPlayerForPlanning();
+		AISkirmishPlayer *owner = static_cast<AISkirmishPlayer *>(aiPlayer);
+		if (!owner || !owner->isEnemyPlanningDue())
+			continue;
+		if (ownerCount >= GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS)
+		{
+			rts::RecordAIPlanningOwnerCommit(false);
+			return false;
+		}
+
+		if (!owner->captureEnemyPlanningSnapshot(&snapshots[ownerCount]))
+		{
+			rts::RecordAIPlanningOwnerCommit(false);
+			return false;
+		}
+		rts::RecordAIPlanningOwnerCapture(snapshots[ownerCount].candidateCount);
+		owners[ownerCount++] = owner;
+	}
+	if (ownerCount == 0U)
+		return true;
+
+	GeneralsAIEnemyPlanningResult committed[
+		GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS];
+	rts::AIPlanningBatchStatus status;
+	if (!ExecuteGeneralsAIEnemyPlanningBatch(executionMode,
+		IsEnemyPlanningMultiplayerPolicyBlocked(), snapshots, ownerCount, committed,
+		rts::AI_PLANNING_INVALID_ORDINAL, &status))
+	{
+		rts::RecordAIPlanningOwnerCommit(false);
+		return false;
+	}
+
+	Player *resolved[GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS] = { nullptr };
+	// Resolve the complete live membership set before publishing any target.
+	for (UnsignedInt i = 0U; i < ownerCount; ++i)
+	{
+		if (!owners[i]->resolveEnemyPlanningCommit(
+			snapshots[i], committed[i], &resolved[i]))
+		{
+			rts::RecordAIPlanningOwnerCommit(false);
+			return false;
+		}
+	}
+	for (UnsignedInt i = 0U; i < ownerCount; ++i)
+	{
+		owners[i]->applyEnemyPlanningCommit(resolved[i]);
+	}
+	rts::RecordAIPlanningOwnerCommit(true, &status);
+	return true;
+}
+
+Bool RunSkirmishProductionPlanningBatch()
+{
+	if (!ShouldUseCanonicalEnemyPlanning())
+		return true;
+
+	try
+	{
+	std::vector<AIPlayer *> owners;
+	std::vector<rts::AIPlayerPlanningSnapshot> snapshots;
+	for (Int sourceOrdinal = 0; sourceOrdinal < ThePlayerList->getPlayerCount(); ++sourceOrdinal)
+	{
+		Player *player = ThePlayerList->getNthPlayer(sourceOrdinal);
+		if (!player || !player->isSkirmishAIPlayer())
+			continue;
+		AIPlayer *owner = player->getAIPlayerForPlanning();
+		if (!owner || !owner->isProductionPlanningDue())
+			continue;
+		if (snapshots.size() >= rts::AI_PLANNING_MAX_PLAYERS)
+		{
+			rts::RecordAIPlanningOwnerCommit(false);
+			return false;
+		}
+
+		rts::AIPlayerPlanningSnapshot snapshot;
+		rts::ClearAIPlayerPlanningSnapshot(&snapshot);
+		snapshot.frame = TheGameLogic->getFrame();
+		snapshot.playerIndex = (UnsignedInt)player->getPlayerIndex();
+		owner->prepareProductionPlanningQueue();
+		Bool handled = false;
+		if (!owner->prepareLegacyProductionPlanningSnapshot(
+			&snapshot.production,
+			MakeProductionPlanningRandomKey(snapshot.playerIndex), &handled))
+		{
+			rts::RecordAIPlanningOwnerCommit(false);
+			return false;
+		}
+		if (handled)
+			continue;
+		if (snapshot.production.candidateCount == 0U)
+		{
+			owner->markProductionPlanningHandled();
+			continue;
+		}
+		snapshot.planProduction = 1U;
+		rts::RecordAIPlanningOwnerCapture(snapshot.production.candidateCount);
+		owners.push_back(owner);
+		snapshots.push_back(snapshot);
+	}
+	if (snapshots.empty())
+		return true;
+
+	std::vector<rts::AIPlayerPlanningResult> committed(snapshots.size());
+	std::vector<rts::AIPlayerPlanningResult> serialScratch(snapshots.size());
+	std::vector<rts::AIPlayerPlanningResult> parallelScratch(snapshots.size());
+	rts::AIPlanningBatchStatus status;
+	if (!rts::ExecuteAIPlanningBatchOnJobSystem(GetEnemyPlanningExecutionMode(),
+		&snapshots[0], (UnsignedInt)snapshots.size(), &committed[0],
+		&serialScratch[0], &parallelScratch[0], &status))
+	{
+		rts::RecordAIPlanningOwnerCommit(false);
+		return false;
+	}
+
+	// Validate all owner memberships before publishing any staged result. The
+	// actual queue mutation remains in PlayerList order at the normal team
+	// production subphase.
+	for (UnsignedInt i = 0; i < snapshots.size(); ++i)
+	{
+		if (!owners[i]->validateProductionPlanningBatchCommit(
+			snapshots[i].production, committed[i].production))
+		{
+			rts::RecordAIPlanningOwnerCommit(false);
+			return false;
+		}
+	}
+	for (UnsignedInt i = 0; i < snapshots.size(); ++i)
+	{
+		if (!owners[i]->stageProductionPlanningResult(
+			snapshots[i].production, committed[i].production))
+		{
+			for (UnsignedInt prior = 0; prior < i; ++prior)
+				owners[prior]->discardStagedProductionPlanningResult();
+			rts::RecordAIPlanningOwnerCommit(false);
+			return false;
+		}
+	}
+	rts::RecordAIPlanningOwnerCommit(true, &status);
+	return true;
+	}
+	catch (const std::bad_alloc &)
+	{
+		// The owner queue marker is consumed by the normal update boundary; no
+		// partial batched result is visible, so allocation failure falls back to
+		// the deterministic owner-side selector.
+		rts::RecordAIPlanningOwnerCommit(false);
+		return false;
+	}
+}
+}
+#endif
+
 void AI::update()
 {
 	// Do pathfinding.
 	m_pathfinder->processPathfindQueue();
+
+#if defined(_WIN64)
+	// Current-epoch planning captures one immutable owner batch. The executor
+	// preserves that policy with a canonical serial path on every topology or
+	// execution fallback before PlayerList::UPDATE observes the committed targets.
+	if (RunSkirmishEnemyPlanningBatch())
+		RunSkirmishProductionPlanningBatch();
+#endif
 
 	// run player updates
 	{
