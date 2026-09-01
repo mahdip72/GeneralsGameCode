@@ -36,6 +36,8 @@
 #include "Common/LatchRestore.h"
 #include "Common/ThingTemplate.h"
 #include "Common/ThingFactory.h"
+#include "Common/Recorder.h"
+#include "Common/SkirmishAIReplayEpoch.h"
 
 #include "GameClient/Line2D.h"
 
@@ -49,9 +51,7 @@
 #include "GameLogic/PartitionManager.h"
 #include "GameLogic/TerrainLogic.h"
 #include "GameLogic/Weapon.h"
-#if RTS_ZEROHOUR
-#include "Common/Recorder.h"
-#endif
+#include "GameNetwork/NetworkDefs.h"
 #if RETAIL_COMPATIBLE_PATHFINDING
 #include "GameClient/InGameUI.h"
 #include "GameClient/GameText.h"
@@ -71,6 +71,18 @@
 
 #include "Common/Xfer.h"
 #include "Common/XferCRC.h"
+#include "Lib/BoundedFreeCounter.h"
+
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
+#include "GameNetwork/MultiplayerSimulationRuntimePolicy.h"
+#include "Lib/DeterministicPathBatch.h"
+#include "Lib/JobSystem.h"
+#include "Lib/SimulationExecutionPolicy.h"
+#include <algorithm>
+#include <array>
+#include <limits>
+#include <vector>
+#endif
 
 //------------------------------------------------------------------------------ Performance Timers
 #include "Common/PerfMetrics.h"
@@ -133,6 +145,105 @@ constexpr const UnsignedInt CURRENT_PATHFIND_CELL_INFO_CAPACITY = 150000;
 // to leave modern eight-player matches room for transient A* records.
 static UnsignedInt s_cellInfosToAllocate = CELL_INFOS_TO_ALLOCATE;
 
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
+struct DirectPathQueueBatchEntry
+{
+	DirectPathQueueBatchEntry() : objectId(INVALID_ID), queueOrder(-1),
+		batchIndex(0), radius(0), centerInCell(FALSE), isHuman(FALSE),
+		consumed(FALSE)
+	{
+		snapshot = {};
+		rawFrom.zero();
+		rawTo.zero();
+	}
+
+	ObjectID objectId;
+	Int queueOrder;
+	std::size_t batchIndex;
+	Int radius;
+	Bool centerInCell;
+	Bool isHuman;
+	Bool consumed;
+	Coord3D rawFrom;
+	Coord3D rawTo;
+	std::vector<rts::DirectPathCellFact> callbackFacts;
+	std::array<rts::DirectPathCellFact,
+		rts::DETERMINISTIC_DIRECT_PATH_NEIGHBOR_COUNT> neighborFacts;
+	rts::DirectPathSnapshot snapshot;
+};
+
+struct DirectPathQueueBatchContext
+{
+	DirectPathQueueBatchContext() : generation(0), ready(FALSE),
+		multiWorkerExecution(FALSE), activeQueueOrder(-1),
+		activeObjectId(INVALID_ID) {}
+
+	std::vector<DirectPathQueueBatchEntry> entries;
+	rts::DeterministicDirectPathBatch batch;
+	UnsignedInt generation;
+	Bool ready;
+	Bool multiWorkerExecution;
+	Int activeQueueOrder;
+	ObjectID activeObjectId;
+};
+
+struct OrdinaryPathQueueBatchEntry
+{
+	OrdinaryPathQueueBatchEntry() : objectId(INVALID_ID), queueOrder(-1),
+		batchIndex(0), radius(0), centerInCell(FALSE), isHuman(FALSE),
+		consumed(FALSE), ownerToken(0)
+	{
+		request = {};
+		rawFrom.zero();
+		rawTo.zero();
+	}
+
+	ObjectID objectId;
+	Int queueOrder;
+	std::size_t batchIndex;
+	Int radius;
+	Bool centerInCell;
+	Bool isHuman;
+	Bool consumed;
+	std::uint64_t ownerToken;
+	Coord3D rawFrom;
+	Coord3D rawTo;
+	rts::DeterministicPathRequest request;
+};
+
+struct OrdinaryPathQueueBatchContext
+{
+	OrdinaryPathQueueBatchContext() : generation(0), ready(FALSE),
+		multiWorkerExecution(FALSE), activeQueueOrder(-1),
+		activeObjectId(INVALID_ID), pendingShadowEntry(
+			std::numeric_limits<std::size_t>::max())
+	{
+		grid = {};
+	}
+
+	std::vector<rts::DeterministicPathCell> navigationCells;
+	rts::ImmutableNavigationGrid grid;
+	std::vector<OrdinaryPathQueueBatchEntry> entries;
+	std::vector<rts::DeterministicOrdinaryPathBatchRequest> requests;
+	rts::DeterministicOrdinaryPathBatch batch;
+	UnsignedInt generation;
+	Bool ready;
+	Bool multiWorkerExecution;
+	Int activeQueueOrder;
+	ObjectID activeObjectId;
+	std::size_t pendingShadowEntry;
+};
+
+namespace
+{
+rts::DirectPathAuthorityPolicy BuildDirectPathAuthorityPolicy();
+Bool ShouldUseDirectPathAuthority();
+Bool ShouldPrepareOrdinaryPathWork();
+Bool ShouldUseOrdinaryPathAuthority();
+Bool ShouldUseCurrentNativeFixedPathfinding();
+}
+#endif
+
 static UnsignedInt GetPathfindCellInfoCapacity()
 {
 #if RTS_ZEROHOUR
@@ -164,6 +275,56 @@ static UnsignedInt s_pathfindZoneDeferCount = 0;
 static UnsignedInt s_pathfindCellInfoInUse = 0;
 static UnsignedInt s_pathfindCellInfoHighWater = 0;
 static UnsignedInt s_pathfindCellInfoAllocationFailureCount = 0;
+#endif
+
+// Path-slice counters remain available in native release builds so installed
+// lifecycle validation can prove real worker execution and owner authority.
+// They remain process-local diagnostics outside Pathfinder's xfer/CRC state.
+static UnsignedInt s_directPathEligibleCount = 0;
+static UnsignedInt s_directPathSubmittedCount = 0;
+static UnsignedInt s_directPathExecutedCount = 0;
+static UnsignedInt s_directPathWorkerExecutedCount = 0;
+static UnsignedInt s_directPathOwnerHelpedCount = 0;
+static UnsignedInt s_directPathAuthoritativeCommitCount = 0;
+static UnsignedInt s_directPathAuthoritativeMultiWorkerCommitCount = 0;
+static UnsignedInt s_directPathStaleCount = 0;
+static UnsignedInt s_directPathFailureCount = 0;
+static UnsignedInt s_directPathSerialFallbackCount = 0;
+static UnsignedInt s_directPathUnsupportedAuthorityCount = 0;
+static UnsignedInt s_directPathShadowAuthorityCount = 0;
+static UnsignedInt s_directPathStaleAuthorityCount = 0;
+static UnsignedInt s_directPathMalformedAuthorityCount = 0;
+static UnsignedInt s_directPathShadowOnlyCount = 0;
+static UnsignedInt s_directPathTimeoutCount = 0;
+static UnsignedInt s_directPathPeakActiveWorkers = 0;
+static UnsignedInt s_directPathMinCallbackCount = 0;
+static UnsignedInt s_directPathMaxCallbackCount = 0;
+static UnsignedInt s_directPathResetEpoch = 0;
+static UnsignedInt s_directPathLateDrainBaseline = 0;
+static UnsignedInt s_ordinaryPathResetEpoch = 0;
+static UnsignedInt s_ordinaryPathEligibleCount = 0;
+static UnsignedInt s_ordinaryPathSubmittedRequestCount = 0;
+static UnsignedInt s_ordinaryPathSubmittedRangeCount = 0;
+static UnsignedInt s_ordinaryPathWorkerExecutedRequestCount = 0;
+static UnsignedInt s_ordinaryPathWorkerExecutedRangeCount = 0;
+static UnsignedInt s_ordinaryPathOwnerHelpedRangeCount = 0;
+static UnsignedInt s_ordinaryPathFailedRangeCount = 0;
+static UnsignedInt s_ordinaryPathPhysicalWorkerMask = 0;
+static UnsignedInt s_ordinaryPathAuthoritativeCommitCount = 0;
+static UnsignedInt s_ordinaryPathAuthoritativeMultiWorkerCommitCount = 0;
+static UnsignedInt s_ordinaryPathStaleCount = 0;
+static UnsignedInt s_ordinaryPathValidationFailureCount = 0;
+static UnsignedInt s_ordinaryPathSerialFallbackCount = 0;
+static UnsignedInt s_ordinaryPathShadowComparisonCount = 0;
+static UnsignedInt s_ordinaryPathShadowMismatchCount = 0;
+static UnsignedInt s_ordinaryPathTimeoutCount = 0;
+static UnsignedInt s_ordinaryPathLateDrainBaseline = 0;
+static UnsignedInt s_ordinaryPathPeakActiveWorkers = 0;
+static UnsignedInt s_ordinaryPathMaximumBatchRequests = 0;
+static UnsignedInt s_ordinaryPathMaximumRangeCount = 0;
+static UnsignedInt s_ordinaryPathMaximumGrainSize = 0;
+
+#if defined(RTS_DEBUG) || defined(PATHFIND_DIAGNOSTICS)
 static UnsignedInt s_pathfindStatsLastReportFrame = 0;
 
 static Int GetPathfindQueueDepth(Int head, Int tail)
@@ -173,7 +334,155 @@ static Int GetPathfindQueueDepth(Int head, Int tail)
 		depth += PATHFIND_QUEUE_LEN;
 	return depth;
 }
+
 #endif
+
+DirectPathRuntimeMetrics GetDirectPathRuntimeMetrics()
+{
+	DirectPathRuntimeMetrics metrics = { 0 };
+	metrics.resetEpoch = s_directPathResetEpoch;
+	metrics.eligibleRequests = s_directPathEligibleCount;
+	metrics.submittedJobs = s_directPathSubmittedCount;
+	metrics.executedJobs = s_directPathExecutedCount;
+	metrics.workerExecutedJobs = s_directPathWorkerExecutedCount;
+	metrics.ownerHelpedJobs = s_directPathOwnerHelpedCount;
+	metrics.authoritativeCommits = s_directPathAuthoritativeCommitCount;
+	metrics.authoritativeMultiWorkerCommits =
+		s_directPathAuthoritativeMultiWorkerCommitCount;
+	metrics.staleRejections = s_directPathStaleCount;
+	metrics.validationFailures = s_directPathFailureCount;
+	metrics.serialFallbacks = s_directPathSerialFallbackCount;
+	metrics.unsupportedAuthoritativeCommits =
+		s_directPathUnsupportedAuthorityCount;
+	metrics.shadowAuthoritativeCommits = s_directPathShadowAuthorityCount;
+	metrics.staleAuthoritativeCommits = s_directPathStaleAuthorityCount;
+	metrics.malformedAuthoritativeCommits = s_directPathMalformedAuthorityCount;
+	metrics.shadowOnlyExecutions = s_directPathShadowOnlyCount;
+	metrics.timeoutCancellations = s_directPathTimeoutCount;
+	#if !defined(_MSC_VER) || _MSC_VER >= 1300
+	const UnsignedInt lateDrainCount =
+		rts::GetDeterministicDirectPathLateDrainExecutionCount();
+	metrics.lateDrainExecutions = lateDrainCount >= s_directPathLateDrainBaseline ?
+		lateDrainCount - s_directPathLateDrainBaseline : lateDrainCount;
+	#endif
+	metrics.peakActiveWorkers = s_directPathPeakActiveWorkers;
+	metrics.minimumCallbackCount = s_directPathMinCallbackCount;
+	metrics.maximumCallbackCount = s_directPathMaxCallbackCount;
+	return metrics;
+}
+
+void ResetDirectPathRuntimeMetrics()
+{
+	++s_directPathResetEpoch;
+	if (s_directPathResetEpoch == 0)
+		++s_directPathResetEpoch;
+	#if !defined(_MSC_VER) || _MSC_VER >= 1300
+	s_directPathLateDrainBaseline =
+		rts::GetDeterministicDirectPathLateDrainExecutionCount();
+	#else
+	s_directPathLateDrainBaseline = 0;
+	#endif
+	s_directPathEligibleCount = 0;
+	s_directPathSubmittedCount = 0;
+	s_directPathExecutedCount = 0;
+	s_directPathWorkerExecutedCount = 0;
+	s_directPathOwnerHelpedCount = 0;
+	s_directPathAuthoritativeCommitCount = 0;
+	s_directPathAuthoritativeMultiWorkerCommitCount = 0;
+	s_directPathStaleCount = 0;
+	s_directPathFailureCount = 0;
+	s_directPathSerialFallbackCount = 0;
+	s_directPathUnsupportedAuthorityCount = 0;
+	s_directPathShadowAuthorityCount = 0;
+	s_directPathStaleAuthorityCount = 0;
+	s_directPathMalformedAuthorityCount = 0;
+	s_directPathShadowOnlyCount = 0;
+	s_directPathTimeoutCount = 0;
+	s_directPathPeakActiveWorkers = 0;
+	s_directPathMinCallbackCount = 0;
+	s_directPathMaxCallbackCount = 0;
+}
+
+OrdinaryPathRuntimeMetrics GetOrdinaryPathRuntimeMetrics()
+{
+	OrdinaryPathRuntimeMetrics metrics = { 0 };
+	metrics.resetEpoch = s_ordinaryPathResetEpoch;
+	metrics.eligibleRequests = s_ordinaryPathEligibleCount;
+	metrics.submittedRequests = s_ordinaryPathSubmittedRequestCount;
+	metrics.submittedRangeJobs = s_ordinaryPathSubmittedRangeCount;
+	metrics.workerExecutedRequests = s_ordinaryPathWorkerExecutedRequestCount;
+	metrics.workerExecutedRangeJobs = s_ordinaryPathWorkerExecutedRangeCount;
+	metrics.ownerHelpedRangeJobs = s_ordinaryPathOwnerHelpedRangeCount;
+	metrics.failedRangeJobs = s_ordinaryPathFailedRangeCount;
+	metrics.physicalWorkerMask = s_ordinaryPathPhysicalWorkerMask;
+	for (UnsignedInt mask = s_ordinaryPathPhysicalWorkerMask; mask != 0;
+		mask &= mask - 1)
+	{
+		++metrics.distinctPhysicalWorkers;
+	}
+	metrics.authoritativeCommits = s_ordinaryPathAuthoritativeCommitCount;
+	metrics.authoritativeMultiWorkerCommits =
+		s_ordinaryPathAuthoritativeMultiWorkerCommitCount;
+	metrics.staleRejections = s_ordinaryPathStaleCount;
+	metrics.validationFailures = s_ordinaryPathValidationFailureCount;
+	metrics.serialFallbacks = s_ordinaryPathSerialFallbackCount;
+	metrics.shadowComparisons = s_ordinaryPathShadowComparisonCount;
+	metrics.shadowMismatches = s_ordinaryPathShadowMismatchCount;
+	metrics.timeoutCancellations = s_ordinaryPathTimeoutCount;
+	#if !defined(_MSC_VER) || _MSC_VER >= 1300
+	const UnsignedInt lateDrainCount =
+		rts::GetDeterministicOrdinaryPathLateDrainExecutionCount();
+	metrics.lateDrainExecutions = lateDrainCount >= s_ordinaryPathLateDrainBaseline ?
+		lateDrainCount - s_ordinaryPathLateDrainBaseline : lateDrainCount;
+	#endif
+	metrics.peakActiveWorkers = s_ordinaryPathPeakActiveWorkers;
+	metrics.maximumBatchRequests = s_ordinaryPathMaximumBatchRequests;
+	metrics.maximumRangeCount = s_ordinaryPathMaximumRangeCount;
+	metrics.maximumGrainSize = s_ordinaryPathMaximumGrainSize;
+	return metrics;
+}
+
+void ResetOrdinaryPathRuntimeMetrics()
+{
+	++s_ordinaryPathResetEpoch;
+	if (s_ordinaryPathResetEpoch == 0)
+		++s_ordinaryPathResetEpoch;
+	#if !defined(_MSC_VER) || _MSC_VER >= 1300
+	s_ordinaryPathLateDrainBaseline =
+		rts::GetDeterministicOrdinaryPathLateDrainExecutionCount();
+	#else
+	s_ordinaryPathLateDrainBaseline = 0;
+	#endif
+	s_ordinaryPathEligibleCount = 0;
+	s_ordinaryPathSubmittedRequestCount = 0;
+	s_ordinaryPathSubmittedRangeCount = 0;
+	s_ordinaryPathWorkerExecutedRequestCount = 0;
+	s_ordinaryPathWorkerExecutedRangeCount = 0;
+	s_ordinaryPathOwnerHelpedRangeCount = 0;
+	s_ordinaryPathFailedRangeCount = 0;
+	s_ordinaryPathPhysicalWorkerMask = 0;
+	s_ordinaryPathAuthoritativeCommitCount = 0;
+	s_ordinaryPathAuthoritativeMultiWorkerCommitCount = 0;
+	s_ordinaryPathStaleCount = 0;
+	s_ordinaryPathValidationFailureCount = 0;
+	s_ordinaryPathSerialFallbackCount = 0;
+	s_ordinaryPathShadowComparisonCount = 0;
+	s_ordinaryPathShadowMismatchCount = 0;
+	s_ordinaryPathTimeoutCount = 0;
+	s_ordinaryPathPeakActiveWorkers = 0;
+	s_ordinaryPathMaximumBatchRequests = 0;
+	s_ordinaryPathMaximumRangeCount = 0;
+	s_ordinaryPathMaximumGrainSize = 0;
+}
+
+static UnsignedInt HashPathfindRequestObjectID(ObjectID id)
+{
+	UnsignedInt value = static_cast<UnsignedInt>(id);
+	value ^= value >> 16;
+	value *= 0x7feb352dU;
+	value ^= value >> 15;
+	return value & (PATHFIND_QUEUE_MEMBERSHIP_LEN - 1);
+}
 
 //-----------------------------------------------------------------------------------
 PathNode::PathNode() :
@@ -1162,6 +1471,7 @@ Real Path::computeFlightDistToGoal( const Coord3D *pos, Coord3D& goalPos )
 
 PathfindCellInfo *PathfindCellInfo::s_infoArray = nullptr;
 PathfindCellInfo *PathfindCellInfo::s_firstFree = nullptr;
+UnsignedInt PathfindCellInfo::s_freeCount = 0;
 
 #if RETAIL_COMPATIBLE_PATHFINDING
 // TheSuperHackers @info This variable is here so the code will run down the retail compatible path till a failure mode is hit
@@ -1218,22 +1528,9 @@ void PathfindCellInfo::allocateCellInfos()
 {
 	const UnsignedInt desiredCapacity = GetPathfindCellInfoCapacity();
 	PathfindCellInfo *oldInfoArray = s_infoArray;
-	PathfindCellInfo *oldFirstFree = s_firstFree;
 	const UnsignedInt oldCapacity = s_cellInfosToAllocate;
 	if (oldInfoArray != nullptr) {
-		UnsignedInt freeCount = 0;
-		Bool oldPoolIsFree = true;
-		PathfindCellInfo *oldFree = oldFirstFree;
-		// Bound the validation by the known pool size.  A duplicate release can
-		// otherwise create a self-link and make this owner-thread scan spin
-		// forever while trying to resize the pool.
-		while (oldFree != nullptr && freeCount < oldCapacity) {
-			++freeCount;
-			if (!oldFree->m_isFree)
-				oldPoolIsFree = false;
-			oldFree = oldFree->m_pathParent;
-		}
-		if (!oldPoolIsFree || freeCount != oldCapacity || oldFree != nullptr) {
+		if (s_freeCount != oldCapacity) {
 			DEBUG_CRASH(("Cannot replace pathfind cell pool while records are in use."));
 			return;
 		}
@@ -1263,6 +1560,7 @@ void PathfindCellInfo::allocateCellInfos()
 	s_infoArray = newInfoArray;
 	s_firstFree = newInfoArray;
 	s_cellInfosToAllocate = desiredCapacity;
+	s_freeCount = desiredCapacity;
 	delete[] oldInfoArray;
 #if defined(RTS_DEBUG) || defined(PATHFIND_DIAGNOSTICS)
 	s_pathfindCellInfoInUse = 0;
@@ -1277,21 +1575,35 @@ void PathfindCellInfo::allocateCellInfos()
 void PathfindCellInfo::releaseCellInfos()
 {
 	if (s_infoArray==nullptr) {
+		DEBUG_ASSERTCRASH(s_freeCount == 0,
+			("Missing pathfind cell pool has a nonzero free count."));
+		s_freeCount = 0;
 		return; // haven't allocated any yet.
 	}
-	Int count=0;
-	while (s_firstFree) {
+	UnsignedInt count=0;
+	while (s_firstFree && count < s_cellInfosToAllocate) {
 		count++;
 		DEBUG_ASSERTCRASH(s_firstFree->m_isFree, ("Should be freed."));
 		s_firstFree = s_firstFree->m_pathParent;
 	}
-	DEBUG_ASSERTCRASH(count==s_cellInfosToAllocate, ("Error - Allocated cellinfos."));
+	DEBUG_ASSERTCRASH(s_firstFree == nullptr &&
+		count == s_cellInfosToAllocate && s_freeCount == s_cellInfosToAllocate,
+		("Error - Allocated cellinfos or corrupt free count."));
 	delete[] s_infoArray;
 	s_infoArray = nullptr;
 	s_firstFree = nullptr;
+	s_freeCount = 0;
 #if defined(RTS_DEBUG) || defined(PATHFIND_DIAGNOSTICS)
 	s_pathfindCellInfoInUse = 0;
 #endif
+}
+
+UnsignedInt PathfindCellInfo::countFreeCellInfos()
+{
+	DEBUG_ASSERTCRASH(rts::IsBoundedFreeCountValid(s_cellInfosToAllocate,
+		s_freeCount), ("Pathfind cell free count exceeds pool capacity."));
+	return rts::IsBoundedFreeCountValid(s_cellInfosToAllocate, s_freeCount) ?
+		s_freeCount : 0;
 }
 
 /**
@@ -1302,6 +1614,12 @@ PathfindCellInfo *PathfindCellInfo::getACellInfo(PathfindCell *cell,const ICoord
 	PathfindCellInfo *info = s_firstFree;
 	if (s_firstFree) {
 		DEBUG_ASSERTCRASH(s_firstFree->m_isFree, ("Should be freed."));
+		if (!rts::TryConsumeBoundedFreeCount(s_cellInfosToAllocate,
+			s_freeCount))
+		{
+			DEBUG_CRASH(("Pathfind cell free count underflow or corruption."));
+			return nullptr;
+		}
 		s_firstFree = s_firstFree->m_pathParent;
 		info->m_isFree = false;  // Just allocated it.
 		info->m_cell = cell;
@@ -1326,10 +1644,11 @@ PathfindCellInfo *PathfindCellInfo::getACellInfo(PathfindCell *cell,const ICoord
 		if (s_pathfindCellInfoInUse > s_pathfindCellInfoHighWater)
 			s_pathfindCellInfoHighWater = s_pathfindCellInfoInUse;
 #endif
-	}
-#if defined(RTS_DEBUG) || defined(PATHFIND_DIAGNOSTICS)
-	else
+	} else
 	{
+		DEBUG_ASSERTCRASH(s_freeCount == 0,
+			("Empty pathfind free list has a nonzero free count."));
+#if defined(RTS_DEBUG) || defined(PATHFIND_DIAGNOSTICS)
 		++s_pathfindCellInfoAllocationFailureCount;
 		if (s_pathfindCellInfoAllocationFailureCount == 1 ||
 			(s_pathfindCellInfoAllocationFailureCount & 1023) == 0)
@@ -1338,8 +1657,8 @@ PathfindCellInfo *PathfindCellInfo::getACellInfo(PathfindCell *cell,const ICoord
 				s_pathfindCellInfoAllocationFailureCount,
 				s_pathfindCellInfoInUse));
 		}
-	}
 #endif
+	}
 	return info;
 }
 
@@ -1348,7 +1667,16 @@ PathfindCellInfo *PathfindCellInfo::getACellInfo(PathfindCell *cell,const ICoord
  */
 void PathfindCellInfo::releaseACellInfo(PathfindCellInfo *theInfo)
 {
-	DEBUG_ASSERTCRASH(!theInfo->m_isFree, ("Shouldn't be free."));
+	if (theInfo == nullptr || theInfo->m_isFree)
+	{
+		DEBUG_CRASH(("Attempted to release an invalid or already-free pathfind cell info."));
+		return;
+	}
+	if (!rts::TryRestoreBoundedFreeCount(s_cellInfosToAllocate, s_freeCount))
+	{
+		DEBUG_CRASH(("Pathfind cell free count overflow or corruption."));
+		return;
+	}
 	//@ todo -fix this assert on usa04.  jba.
 	//DEBUG_ASSERTCRASH(theInfo->m_obstacleID==0, ("Shouldn't be obstacle."));
 	theInfo->m_pathParent = s_firstFree;
@@ -4174,7 +4502,89 @@ void PathfindLayer::classifyWallMapCell( Int i, Int j , PathfindCell *cell, Obje
 
 //----------------------- Pathfinder ---------------------------------------
 
-Pathfinder::Pathfinder() :m_map(nullptr)
+Int Pathfinder::findPathfindRequestMembership(ObjectID id) const
+{
+	UnsignedInt slot = HashPathfindRequestObjectID(id);
+	for (UnsignedInt probe = 0; probe < PATHFIND_QUEUE_MEMBERSHIP_LEN; ++probe)
+	{
+		const PathfindRequestMembershipEntry &entry = m_pathfindRequestMembership[slot];
+		if (entry.queueSlot == PATHFIND_QUEUE_MEMBERSHIP_EMPTY)
+			return -1;
+		if (entry.queueSlot >= 0 && entry.objectID == id)
+			return static_cast<Int>(slot);
+		slot = (slot + 1) & (PATHFIND_QUEUE_MEMBERSHIP_LEN - 1);
+	}
+	return -1;
+}
+
+Int Pathfinder::findPathfindRequestMembershipInsertSlot(ObjectID id) const
+{
+	UnsignedInt slot = HashPathfindRequestObjectID(id);
+	for (UnsignedInt probe = 0; probe < PATHFIND_QUEUE_MEMBERSHIP_LEN; ++probe)
+	{
+		const PathfindRequestMembershipEntry &entry = m_pathfindRequestMembership[slot];
+		if (entry.queueSlot == PATHFIND_QUEUE_MEMBERSHIP_EMPTY)
+			return static_cast<Int>(slot);
+		if (entry.objectID == id)
+			return static_cast<Int>(slot);
+		slot = (slot + 1) & (PATHFIND_QUEUE_MEMBERSHIP_LEN - 1);
+	}
+	return -1;
+}
+
+void Pathfinder::erasePathfindRequestMembership(ObjectID id, Int queueSlot)
+{
+	const Int membershipSlot = findPathfindRequestMembership(id);
+	if (membershipSlot < 0)
+		return;
+	DEBUG_ASSERTCRASH(m_pathfindRequestMembership[membershipSlot].queueSlot == queueSlot,
+		("Pathfind request membership points at the wrong FIFO slot."));
+	// Close the linear-probing cluster instead of accumulating tombstones for
+	// the lifetime of a long match.  The queue slot itself remains stable.
+	m_pathfindRequestMembership[membershipSlot].objectID = INVALID_ID;
+	m_pathfindRequestMembership[membershipSlot].queueSlot = PATHFIND_QUEUE_MEMBERSHIP_EMPTY;
+	UnsignedInt slot = (static_cast<UnsignedInt>(membershipSlot) + 1) &
+		(PATHFIND_QUEUE_MEMBERSHIP_LEN - 1);
+	while (m_pathfindRequestMembership[slot].queueSlot != PATHFIND_QUEUE_MEMBERSHIP_EMPTY)
+	{
+		const PathfindRequestMembershipEntry entry = m_pathfindRequestMembership[slot];
+		m_pathfindRequestMembership[slot].objectID = INVALID_ID;
+		m_pathfindRequestMembership[slot].queueSlot = PATHFIND_QUEUE_MEMBERSHIP_EMPTY;
+		if (entry.queueSlot >= 0)
+		{
+			const Int insertSlot = findPathfindRequestMembershipInsertSlot(entry.objectID);
+			DEBUG_ASSERTCRASH(insertSlot >= 0,
+				("Pathfind request membership cluster reinsertion failed."));
+			if (insertSlot >= 0)
+				m_pathfindRequestMembership[insertSlot] = entry;
+		}
+		slot = (slot + 1) & (PATHFIND_QUEUE_MEMBERSHIP_LEN - 1);
+	}
+}
+
+void Pathfinder::resetPathfindRequestTracking()
+{
+	Int i;
+	for (i = 0; i < PATHFIND_QUEUE_LEN; ++i)
+		m_queuedPathfindRequests[i] = INVALID_ID;
+	for (i = 0; i < PATHFIND_QUEUE_MEMBERSHIP_LEN; ++i)
+	{
+		m_pathfindRequestMembership[i].objectID = INVALID_ID;
+		m_pathfindRequestMembership[i].queueSlot = PATHFIND_QUEUE_MEMBERSHIP_EMPTY;
+	}
+	m_queuePRHead = 0;
+	m_queuePRTail = 0;
+}
+
+Pathfinder::Pathfinder() :
+	m_map(nullptr),
+	m_navigationRevision(1),
+	m_directPathRequestToken(0),
+	m_ordinaryPathRequestToken(0)
+	#if !defined(_MSC_VER) || _MSC_VER >= 1300
+	,m_directPathBatchContext(nullptr),
+	m_ordinaryPathBatchContext(nullptr)
+	#endif
 {
 	debugPath = nullptr;
 	PathfindCellInfo::allocateCellInfos();
@@ -4188,6 +4598,11 @@ Pathfinder::~Pathfinder()
 
 void Pathfinder::reset()
 {
+	#if !defined(_MSC_VER) || _MSC_VER >= 1300
+	m_directPathBatchContext = nullptr;
+	m_ordinaryPathBatchContext = nullptr;
+	#endif
+	markNavigationChanged();
 	frameToShowObstacles = 0;
 	#if defined(RTS_DEBUG) || defined(PATHFIND_DIAGNOSTICS)
 	s_pathfindQueueEnqueueCount = 0;
@@ -4202,6 +4617,8 @@ void Pathfinder::reset()
 	s_pathfindCellInfoHighWater = 0;
 	s_pathfindCellInfoAllocationFailureCount = 0;
 	#endif
+	ResetDirectPathRuntimeMetrics();
+	ResetOrdinaryPathRuntimeMetrics();
 	DEBUG_LOG(("Pathfind cell is %d bytes, PathfindCellInfo is %d bytes", sizeof(PathfindCell), sizeof(PathfindCellInfo)));
 
 	delete [] m_blockOfMapCells;
@@ -4239,11 +4656,9 @@ void Pathfinder::reset()
 
 	m_frameToShowObstacles = 0;
 
-	for (m_queuePRHead=0; m_queuePRHead<PATHFIND_QUEUE_LEN; m_queuePRHead++) {
-		m_queuedPathfindRequests[m_queuePRHead] = INVALID_ID;
-	}
-	m_queuePRHead = 0;
-	m_queuePRTail = 0;
+	resetPathfindRequestTracking();
+	m_directPathRequestToken = 0;
+	m_ordinaryPathRequestToken = 0;
 
 	m_numWallPieces = 0;
 	for (i=0; i<MAX_WALL_PIECES; ++i)
@@ -4276,6 +4691,7 @@ void Pathfinder::reset()
 void Pathfinder::addWallPiece(Object *wallPiece)
 {
 	if (m_numWallPieces<MAX_WALL_PIECES-1) {
+		markNavigationChanged();
 		m_wallPieces[m_numWallPieces] = wallPiece->getID();
 		m_numWallPieces++;
 	}
@@ -4298,6 +4714,7 @@ void Pathfinder::removeWallPiece(Object *wallPiece)
 		// match by id
 		if( m_wallPieces[ i ] == wallPiece->getID() )
 		{
+			markNavigationChanged();
 
 			// put the last id in the wall piece array here
 			m_wallPieces[ i ] = m_wallPieces[ m_numWallPieces - 1 ];
@@ -4337,6 +4754,7 @@ Bool Pathfinder::isPointOnWall(const Coord3D *pos)
  */
 PathfindLayerEnum Pathfinder::addBridge(Bridge *theBridge)
 {
+	markNavigationChanged();
 	Int layer = LAYER_GROUND+1;
 	while (layer<=LAYER_WALL) {
 		if (m_layers[layer].isUnused()) {
@@ -4362,6 +4780,8 @@ void Pathfinder::updateLayer(Object *obj, PathfindLayerEnum layer)
 			layer = LAYER_GROUND;
 		}
 	}
+	if (obj->getLayer() != layer)
+		markNavigationChanged();
 	//DEBUG_LOG(("Object layer is %d", layer));
 	obj->setLayer(layer);
 }
@@ -4373,6 +4793,7 @@ void Pathfinder::updateLayer(Object *obj, PathfindLayerEnum layer)
  */
 void Pathfinder::classifyFence( Object *obj, Bool insert )
 {
+	markNavigationChanged();
 #if RTS_GENERALS && RETAIL_COMPATIBLE_PATHFINDING
 	m_zoneManager.markZonesDirty();
 #endif
@@ -4571,8 +4992,16 @@ void Pathfinder::classifyObjectFootprint( Object *obj, Bool insert )
 	internal_classifyObjectFootprint(obj, insert);
 }
 
+void Pathfinder::markNavigationChanged()
+{
+	++m_navigationRevision;
+	if (m_navigationRevision == 0)
+		m_navigationRevision = 1;
+}
+
 void Pathfinder::internal_classifyObjectFootprint( Object *obj, Bool insert )
 {
+	markNavigationChanged();
 	const Coord3D *pos = obj->getPosition();
 
 #if !(RTS_GENERALS && RETAIL_COMPATIBLE_PATHFINDING)
@@ -4896,6 +5325,15 @@ void Pathfinder::classifyMapCell( Int i, Int j , PathfindCell *cell)
  */
 void Pathfinder::newMap()
 {
+	markNavigationChanged();
+	#if RETAIL_COMPATIBLE_PATHFINDING
+		#if !defined(_MSC_VER) || _MSC_VER >= 1300
+	s_useFixedPathfinding = ShouldUseCurrentNativeFixedPathfinding();
+		#else
+	// VC6 and every legacy product lane retain the original retail behavior.
+	s_useFixedPathfinding = false;
+		#endif
+	#endif
 	const UnsignedInt desiredCellInfoCapacity = GetPathfindCellInfoCapacity();
 	if ((desiredCellInfoCapacity != s_cellInfosToAllocate || !PathfindCellInfo::hasCellInfos()) &&
 		m_map == nullptr && m_blockOfMapCells == nullptr)
@@ -5039,6 +5477,7 @@ void Pathfinder::classifyMap()
  */
 void Pathfinder::forceMapRecalculation()
 {
+	markNavigationChanged();
 	classifyMap();
 }
 
@@ -5997,18 +6436,20 @@ Bool Pathfinder::queueForPath(ObjectID id)
 #endif
 
 	/* Check & see if we are already queued. */
-	Int slot = m_queuePRHead;
-	while (slot != m_queuePRTail) {
-		if (m_queuedPathfindRequests[slot] == id) {
+	Int membershipSlot = findPathfindRequestMembership(id);
+	if (membershipSlot >= 0)
+	{
+		const Int queueSlot = m_pathfindRequestMembership[membershipSlot].queueSlot;
+		if (queueSlot >= 0 && queueSlot < PATHFIND_QUEUE_LEN &&
+			m_queuedPathfindRequests[queueSlot] == id)
+		{
 #if defined(RTS_DEBUG) || defined(PATHFIND_DIAGNOSTICS)
 			++s_pathfindQueueDuplicateCount;
 #endif
 			return true;
 		}
-		slot++;
-		if (slot >= PATHFIND_QUEUE_LEN) {
-			slot = 0;
-		}
+		DEBUG_CRASH(("Stale pathfind request membership entry."));
+		erasePathfindRequestMembership(id, queueSlot);
 	}
 
 	// Tail is the first available slot.
@@ -6031,6 +6472,15 @@ Bool Pathfinder::queueForPath(ObjectID id)
 		DEBUG_CRASH(("Ran out of pathfind queue slots."));
 		return false;
 	}
+	membershipSlot = findPathfindRequestMembershipInsertSlot(id);
+	if (membershipSlot < 0)
+	{
+		DEBUG_CRASH(("Ran out of pathfind request membership slots."));
+		return false;
+	}
+	PathfindRequestMembershipEntry &membership = m_pathfindRequestMembership[membershipSlot];
+	membership.objectID = id;
+	membership.queueSlot = m_queuePRTail;
 	m_queuedPathfindRequests[m_queuePRTail] = id;
 	m_queuePRTail = nextSlot;
 #if defined(RTS_DEBUG) || defined(PATHFIND_DIAGNOSTICS)
@@ -6224,7 +6674,6 @@ Path *Pathfinder::getAircraftPath( const Object *obj, const Coord3D *to )
 	return thePath;
 }
 
-
 /**
  * Process some path requests in the pathfind queue.
  */
@@ -6271,13 +6720,280 @@ void Pathfinder::processPathfindQueue()
 
 	m_cumulativeCellsAllocated = 0;	// Number of pathfind cells examined.
 	Int pathsFound = 0;
+	Int queueOrder = 0;
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
+	DirectPathQueueBatchContext directPathBatchContext;
+	OrdinaryPathQueueBatchContext ordinaryPathBatchContext;
+	m_directPathBatchContext = nullptr;
+	m_ordinaryPathBatchContext = nullptr;
+	if (rts::UseParallelSimulation() && ShouldUseDirectPathAuthority())
+	{
+		rts::JobSystem &jobs = rts::JobSystem::instance();
+		if (jobs.isRunning() && jobs.isCurrentThread(rts::JOB_OWNER_GAME) &&
+			jobs.workerCount() > 1)
+		{
+			directPathBatchContext.generation = m_navigationRevision;
+			Bool storageReady = TRUE;
+			try
+			{
+				directPathBatchContext.entries.reserve(
+					rts::DETERMINISTIC_DIRECT_PATH_MAX_BATCH_REQUESTS);
+			}
+			catch (...)
+			{
+				storageReady = FALSE;
+			}
+			Int scanSlot = m_queuePRHead;
+			Int scanOrder = 0;
+			while (storageReady && scanSlot != m_queuePRTail &&
+				scanOrder < rts::DETERMINISTIC_DIRECT_PATH_MAX_BATCH_REQUESTS)
+			{
+				const ObjectID requestID = m_queuedPathfindRequests[scanSlot];
+				Object *obj = TheGameLogic->findObjectByID(requestID);
+				AIUpdateInterface *ai = obj ? obj->getAIUpdateInterface() : nullptr;
+				if (ai && ai->isOrdinaryFinalPathRequestForBatch())
+				{
+					try
+					{
+						directPathBatchContext.entries.emplace_back();
+					}
+					catch (...)
+					{
+						storageReady = FALSE;
+						break;
+					}
+					DirectPathQueueBatchEntry &entry =
+						directPathBatchContext.entries.back();
+					if (!captureDirectPathBatchEntry(obj, ai, obj->getPosition(),
+						ai->getRequestedPathDestinationForBatch(), scanOrder, entry))
+					{
+						directPathBatchContext.entries.pop_back();
+					}
+				}
+				scanSlot = scanSlot + 1;
+				if (scanSlot >= PATHFIND_QUEUE_LEN)
+					scanSlot = 0;
+				++scanOrder;
+			}
+
+			if (!directPathBatchContext.entries.empty())
+			{
+				m_directPathBatchContext = &directPathBatchContext;
+				const std::size_t requestCount =
+					directPathBatchContext.entries.size();
+				if (requestCount >= 2 &&
+					m_navigationRevision == directPathBatchContext.generation)
+				{
+					std::array<rts::DirectPathSnapshot,
+						rts::DETERMINISTIC_DIRECT_PATH_MAX_BATCH_REQUESTS> snapshots;
+					for (std::size_t i = 0; i < requestCount; ++i)
+					{
+						DirectPathQueueBatchEntry &entry =
+							directPathBatchContext.entries[i];
+						entry.batchIndex = i;
+						entry.snapshot.callbacks = entry.callbackFacts.data();
+						entry.snapshot.startNeighbors = entry.neighborFacts.data();
+						snapshots[i] = entry.snapshot;
+					}
+					const Bool completed = directPathBatchContext.batch.executeSynchronously(
+						jobs, snapshots.data(), requestCount) ? TRUE : FALSE;
+					const rts::DeterministicDirectPathBatchExecutionSnapshot execution =
+						directPathBatchContext.batch.executionSnapshot();
+					s_directPathSubmittedCount += static_cast<UnsignedInt>(
+						execution.submittedJobCount);
+					s_directPathWorkerExecutedCount += static_cast<UnsignedInt>(
+						execution.workerExecutedJobCount);
+					s_directPathOwnerHelpedCount += static_cast<UnsignedInt>(
+						execution.ownerExecutedJobCount);
+					s_directPathExecutedCount += static_cast<UnsignedInt>(
+						execution.workerExecutedJobCount +
+						execution.ownerExecutedJobCount);
+					if (execution.peakActiveWorkers > s_directPathPeakActiveWorkers)
+						s_directPathPeakActiveWorkers = execution.peakActiveWorkers;
+					directPathBatchContext.multiWorkerExecution =
+						rts::IsDeterministicDirectPathConcurrentMultiWorkerBatch(
+							execution) ? TRUE : FALSE;
+					if (execution.timedOut)
+						++s_directPathTimeoutCount;
+					if (completed && execution.completed &&
+						m_navigationRevision == directPathBatchContext.generation)
+					{
+						directPathBatchContext.ready = TRUE;
+					}
+					else if (completed && execution.completed)
+					{
+						s_directPathStaleCount += static_cast<UnsignedInt>(requestCount);
+					}
+					else if (execution.submittedJobCount != 0 && !execution.timedOut)
+					{
+						s_directPathFailureCount += static_cast<UnsignedInt>(requestCount);
+					}
+				}
+			}
+		}
+	}
+	if (ShouldPrepareOrdinaryPathWork())
+	{
+		rts::JobSystem &jobs = rts::JobSystem::instance();
+		if (jobs.isRunning() && jobs.isCurrentThread(rts::JOB_OWNER_GAME) &&
+			jobs.workerCount() > 0)
+		{
+			// First capture only request-local owner facts.  The full immutable
+			// grid is expensive and is published only when this exact FIFO scan
+			// finds enough admissible work for the selected execution mode.
+			ordinaryPathBatchContext.generation = m_navigationRevision;
+			Bool storageReady = TRUE;
+			Int scanSlot = m_queuePRHead;
+			Int scanOrder = 0;
+			while (storageReady && scanSlot != m_queuePRTail)
+			{
+				const ObjectID requestID = m_queuedPathfindRequests[scanSlot];
+				Object *obj = TheGameLogic->findObjectByID(requestID);
+				AIUpdateInterface *ai = obj ? obj->getAIUpdateInterface() : nullptr;
+				if (ai && ai->isOrdinaryFinalPathRequestForBatch())
+				{
+					try
+					{
+						ordinaryPathBatchContext.entries.emplace_back();
+					}
+					catch (...)
+					{
+						storageReady = FALSE;
+						break;
+					}
+					OrdinaryPathQueueBatchEntry &entry =
+						ordinaryPathBatchContext.entries.back();
+					if (!captureOrdinaryPathBatchEntry(obj, ai, obj->getPosition(),
+						ai->getRequestedPathDestinationForBatch(), scanOrder, entry,
+						ordinaryPathBatchContext))
+					{
+						ordinaryPathBatchContext.entries.pop_back();
+					}
+				}
+				scanSlot = scanSlot + 1;
+				if (scanSlot >= PATHFIND_QUEUE_LEN)
+					scanSlot = 0;
+				++scanOrder;
+			}
+
+			const std::size_t requestCount =
+				ordinaryPathBatchContext.entries.size();
+			const Bool shadowMode = rts::UseSimulationShadowOracle() ? TRUE : FALSE;
+			const Bool authorityMode = ShouldUseOrdinaryPathAuthority();
+			const Bool enoughEligibleRequests =
+				rts::ShouldCaptureOrdinaryNavigationSnapshot(requestCount,
+					shadowMode != FALSE, authorityMode != FALSE,
+					jobs.workerCount()) ? TRUE : FALSE;
+			const Bool executeBatch = storageReady && enoughEligibleRequests &&
+				m_navigationRevision == ordinaryPathBatchContext.generation &&
+				captureOrdinaryNavigationSnapshot(ordinaryPathBatchContext);
+			if (executeBatch)
+			{
+				try
+				{
+					ordinaryPathBatchContext.requests.resize(requestCount);
+				}
+				catch (...)
+				{
+					storageReady = FALSE;
+				}
+			}
+			if (executeBatch && storageReady)
+			{
+				for (std::size_t i = 0; i < requestCount; ++i)
+				{
+					OrdinaryPathQueueBatchEntry &entry =
+						ordinaryPathBatchContext.entries[i];
+					entry.batchIndex = i;
+					ordinaryPathBatchContext.requests[i].search = entry.request;
+					ordinaryPathBatchContext.requests[i].ownerToken = entry.ownerToken;
+				}
+				const Bool completed = ordinaryPathBatchContext.batch.executeSynchronously(
+					jobs, ordinaryPathBatchContext.grid,
+					ordinaryPathBatchContext.requests.data(), requestCount, 100) ?
+					TRUE : FALSE;
+				const rts::DeterministicOrdinaryPathBatchExecutionSnapshot execution =
+					ordinaryPathBatchContext.batch.executionSnapshot();
+				if (execution.submittedRangeJobCount != 0)
+					s_ordinaryPathSubmittedRequestCount +=
+						static_cast<UnsignedInt>(requestCount);
+				s_ordinaryPathSubmittedRangeCount += static_cast<UnsignedInt>(
+					execution.submittedRangeJobCount);
+				s_ordinaryPathWorkerExecutedRangeCount += static_cast<UnsignedInt>(
+					execution.workerExecutedRangeJobCount);
+				s_ordinaryPathOwnerHelpedRangeCount += static_cast<UnsignedInt>(
+					execution.ownerExecutedRangeJobCount);
+				s_ordinaryPathFailedRangeCount += static_cast<UnsignedInt>(
+					execution.failedRangeJobCount);
+				s_ordinaryPathPhysicalWorkerMask |= static_cast<UnsignedInt>(
+					execution.physicalWorkerMask & 0xffffffffU);
+				for (std::size_t i = 0; i < requestCount; ++i)
+				{
+					if (ordinaryPathBatchContext.batch.requestExecutionSnapshot(i).state ==
+						rts::DIRECT_PATH_EXECUTION_WORKER)
+					{
+						++s_ordinaryPathWorkerExecutedRequestCount;
+					}
+				}
+				if (execution.peakActiveWorkers > s_ordinaryPathPeakActiveWorkers)
+					s_ordinaryPathPeakActiveWorkers = execution.peakActiveWorkers;
+				if (requestCount >
+					static_cast<std::size_t>(s_ordinaryPathMaximumBatchRequests))
+					s_ordinaryPathMaximumBatchRequests =
+						static_cast<UnsignedInt>(requestCount);
+				if (execution.rangeCount > s_ordinaryPathMaximumRangeCount)
+					s_ordinaryPathMaximumRangeCount = execution.rangeCount;
+				if (execution.grainSize > s_ordinaryPathMaximumGrainSize)
+					s_ordinaryPathMaximumGrainSize = execution.grainSize;
+				ordinaryPathBatchContext.multiWorkerExecution =
+					rts::IsDeterministicOrdinaryPathConcurrentMultiWorkerBatch(
+						execution) ? TRUE : FALSE;
+				if (execution.timedOut)
+					++s_ordinaryPathTimeoutCount;
+				if (completed && execution.completed &&
+					m_navigationRevision == ordinaryPathBatchContext.generation)
+				{
+					ordinaryPathBatchContext.ready = TRUE;
+					m_ordinaryPathBatchContext = &ordinaryPathBatchContext;
+				}
+				else if (completed && execution.completed)
+				{
+					s_ordinaryPathStaleCount +=
+						static_cast<UnsignedInt>(requestCount);
+				}
+				else if (execution.submittedRangeJobCount != 0 &&
+					!execution.timedOut)
+				{
+					s_ordinaryPathValidationFailureCount +=
+						static_cast<UnsignedInt>(requestCount);
+				}
+			}
+		}
+	}
+#endif
 	while (m_cumulativeCellsAllocated < PATHFIND_CELLS_PER_FRAME &&
 		m_queuePRTail!=m_queuePRHead) {
-		Object *obj = TheGameLogic->findObjectByID(m_queuedPathfindRequests[m_queuePRHead]);
+		const ObjectID requestID = m_queuedPathfindRequests[m_queuePRHead];
+		erasePathfindRequestMembership(requestID, m_queuePRHead);
+		Object *obj = TheGameLogic->findObjectByID(requestID);
 		m_queuedPathfindRequests[m_queuePRHead] = INVALID_ID;
 		if (obj) {
 			AIUpdateInterface *ai = obj->getAIUpdateInterface();
 			if (ai) {
+			#if !defined(_MSC_VER) || _MSC_VER >= 1300
+				if (m_directPathBatchContext)
+				{
+					m_directPathBatchContext->activeQueueOrder = queueOrder;
+					m_directPathBatchContext->activeObjectId = requestID;
+				}
+				if (m_ordinaryPathBatchContext)
+				{
+					m_ordinaryPathBatchContext->activeQueueOrder = queueOrder;
+					m_ordinaryPathBatchContext->activeObjectId = requestID;
+					m_ordinaryPathBatchContext->pendingShadowEntry =
+						std::numeric_limits<std::size_t>::max();
+				}
+			#endif
 				ai->doPathfind(this);
 				pathsFound++;
 			}
@@ -6289,7 +7005,12 @@ void Pathfinder::processPathfindQueue()
 		if (m_queuePRHead >= PATHFIND_QUEUE_LEN) {
 			m_queuePRHead = 0;
 		}
+		++queueOrder;
 	}
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
+	m_directPathBatchContext = nullptr;
+	m_ordinaryPathBatchContext = nullptr;
+#endif
 	if (pathsFound > 0) {
 		PROFILER_PLOT("PathfindCells", (double)m_cumulativeCellsAllocated);
 		PROFILER_PLOT("PathfindPaths", (double)pathsFound);
@@ -6298,7 +7019,7 @@ void Pathfinder::processPathfindQueue()
 	const UnsignedInt currentFrame = TheGameLogic->getFrame();
 	if (s_pathfindStatsLastReportFrame == 0 || currentFrame >= s_pathfindStatsLastReportFrame + 300)
 	{
-		DEBUG_LOG(("PATHFIND_STATS frame %u queue_depth %d queue_high_water %u enqueues %u duplicates %u full %u dequeues %u map_defers %u zone_defers %u cell_info_capacity %u cell_info_in_use %u cell_info_high_water %u cell_info_alloc_failures %u cells_cumulative %d paths_found_this_frame %d",
+		DEBUG_LOG(("PATHFIND_STATS frame %u queue_depth %d queue_high_water %u enqueues %u duplicates %u full %u dequeues %u map_defers %u zone_defers %u cell_info_capacity %u cell_info_in_use %u cell_info_high_water %u cell_info_alloc_failures %u cells_cumulative %d paths_found_this_frame %d direct_eligible %u direct_submitted %u direct_executed %u direct_worker_executed %u direct_owner_helped %u direct_authoritative_commits %u direct_authoritative_multiworker_commits %u direct_stale_rejections %u direct_failures %u direct_serial_fallbacks %u direct_unsupported_authority %u direct_shadow_authority %u direct_stale_acceptance %u direct_malformed_acceptance %u direct_shadow_only %u direct_peak_active_workers %u direct_callback_range %u-%u",
 			currentFrame,
 			GetPathfindQueueDepth(m_queuePRHead, m_queuePRTail),
 			s_pathfindQueueHighWater,
@@ -6313,7 +7034,25 @@ void Pathfinder::processPathfindQueue()
 			s_pathfindCellInfoHighWater,
 			s_pathfindCellInfoAllocationFailureCount,
 			m_cumulativeCellsAllocated,
-			pathsFound));
+			pathsFound,
+			s_directPathEligibleCount,
+			s_directPathSubmittedCount,
+			s_directPathExecutedCount,
+			s_directPathWorkerExecutedCount,
+			s_directPathOwnerHelpedCount,
+			s_directPathAuthoritativeCommitCount,
+			s_directPathAuthoritativeMultiWorkerCommitCount,
+			s_directPathStaleCount,
+			s_directPathFailureCount,
+			s_directPathSerialFallbackCount,
+			s_directPathUnsupportedAuthorityCount,
+			s_directPathShadowAuthorityCount,
+			s_directPathStaleAuthorityCount,
+			s_directPathMalformedAuthorityCount,
+			s_directPathShadowOnlyCount,
+			s_directPathPeakActiveWorkers,
+			s_directPathMinCallbackCount,
+			s_directPathMaxCallbackCount));
 		s_pathfindStatsLastReportFrame = currentFrame;
 	}
 #endif
@@ -6480,15 +7219,15 @@ struct ExamineCellsStruct
 
 
 Int Pathfinder::examineNeighboringCells(PathfindCell *parentCell, PathfindCell *goalCell, const LocomotorSet& locomotorSet,
-																				 Bool isHuman, Bool centerInCell, Int radius, const ICoord2D &startCellNdx,
-																				 const Object *obj, Int attackDistance)
+																		 Bool isHuman, Bool centerInCell, Int radius, const ICoord2D &startCellNdx,
+																		 const Object *obj, Int attackDistance, Bool skipDirectLine)
 {
 		Bool canPathThroughUnits = false;
 		if (obj && obj->getAIUpdateInterface()) {
 			canPathThroughUnits = obj->getAIUpdateInterface()->canPathThroughUnits();
 		}
 		Bool isCrusher = obj ? obj->getCrusherLevel() > 0 : false;
-		if (attackDistance==NO_ATTACK && !m_isTunneling && !locomotorSet.isDownhillOnly() && goalCell) {
+		if (!skipDirectLine && attackDistance==NO_ATTACK && !m_isTunneling && !locomotorSet.isDownhillOnly() && goalCell) {
 			ExamineCellsStruct info;
 			info.thePathfinder = this;
 			info.theLoco = &locomotorSet;
@@ -6715,13 +7454,1457 @@ Int Pathfinder::examineNeighboringCells(PathfindCell *parentCell, PathfindCell *
 	return cellCount;
 }
 
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
+namespace
+{
+Bool ShouldUseCurrentNativeFixedPathfinding()
+{
+	// Pathfinder::reset runs during AI bootstrap before GameLogic/Recorder are
+	// available.  newMap calls this after compatibility metadata is installed.
+	// Fail closed if that lifecycle contract is not satisfied.
+	if (!TheGameLogic || !TheRecorder)
+		return FALSE;
+	rts::FixedPathfindingSemanticsPolicy policy = {};
+#if defined(_WIN64)
+	policy.nativeRuntime = true;
+#endif
+#if RTS_ZEROHOUR
+	policy.zeroHourTitle = true;
+#endif
+	policy.networkGame = TheNetwork != nullptr;
+	policy.multiplayerGame = TheGameLogic->isInMultiplayerGame();
+	policy.recordingGame = TheRecorder->hasOpenRecordingFile();
+	policy.replayGame = TheGameLogic->isInReplayGame();
+#if RTS_ZEROHOUR
+	policy.replayUsesCurrentPathEpoch =
+		TheRecorder->replayUsesPathfindQueueCapacity();
+#else
+	policy.runtimeUsesCurrentGeneralsEpoch =
+		IsGeneralsAICanonicalRuntimeEpoch();
+#endif
+	return rts::IsFixedPathfindingSemanticsAllowed(policy) ? TRUE : FALSE;
+}
+
+rts::DirectPathAuthorityPolicy BuildDirectPathAuthorityPolicy()
+{
+	rts::DirectPathAuthorityPolicy policy = {};
+	policy.parallelExecutionMode = rts::UseParallelSimulation();
+	policy.shadowExecutionMode = rts::UseSimulationShadowOracle();
+#if RTS_ZEROHOUR
+	policy.zeroHourTitle = true;
+#endif
+	policy.networkGame = TheNetwork != nullptr;
+	policy.multiplayerGame = TheGameLogic &&
+		TheGameLogic->isInMultiplayerGame();
+	policy.multiplayerPolicyEnabled = policy.networkGame &&
+		rts::ShouldPrepareLiveSimulationKernelOffThread(
+			rts::MULTIPLAYER_SIMULATION_KERNEL_PATH);
+	policy.recordingGame = TheRecorder &&
+		TheRecorder->hasOpenRecordingFile();
+	policy.replayGame = TheGameLogic && TheGameLogic->isInReplayGame();
+#if RTS_ZEROHOUR
+	policy.replayUsesCurrentPathEpoch = TheRecorder &&
+		TheRecorder->replayUsesPathfindQueueCapacity();
+#else
+	policy.runtimeUsesCurrentGeneralsEpoch =
+		IsGeneralsAICanonicalRuntimeEpoch();
+#endif
+	return policy;
+}
+
+Bool ShouldUseDirectPathAuthority()
+{
+	return rts::IsDirectPathAuthorityAllowed(
+		BuildDirectPathAuthorityPolicy()) ? TRUE : FALSE;
+}
+
+Bool ShouldPrepareOrdinaryPathWork()
+{
+	// Ordinary A* has its own installed physical-worker/owner-commit evidence;
+	// the compact direct counters cannot proxy it.  Multiplayer and replay still
+	// have no ordinary-path proven bit, so fixed semantics and worker preparation
+	// both fail closed there. Shadow remains serial-authoritative.
+	const Bool replayGame = TheGameLogic && TheGameLogic->isInReplayGame();
+	if (!ShouldUseCurrentNativeFixedPathfinding() || replayGame)
+		return FALSE;
+	return (rts::UseParallelSimulation() && ShouldUseDirectPathAuthority()) ||
+		rts::UseSimulationShadowOracle();
+}
+
+Bool ShouldUseOrdinaryPathAuthority()
+{
+	return rts::IsOrdinaryPathAuthorityAllowed(
+		BuildDirectPathAuthorityPolicy(),
+		ShouldUseCurrentNativeFixedPathfinding() != FALSE) ? TRUE : FALSE;
+}
+}
+
+Bool Pathfinder::captureOrdinaryNavigationSnapshot(
+	OrdinaryPathQueueBatchContext &context)
+{
+	if (!m_isMapReady || m_extent.hi.x < m_extent.lo.x ||
+		m_extent.hi.y < m_extent.lo.y || !m_openList.empty() ||
+		!m_closedList.empty())
+	{
+		return FALSE;
+	}
+	#if RETAIL_COMPATIBLE_PATHFINDING
+	if (!s_useFixedPathfinding)
+		return FALSE;
+	#endif
+	const std::uint64_t width = static_cast<std::uint64_t>(
+		static_cast<std::int64_t>(m_extent.hi.x) - m_extent.lo.x + 1);
+	const std::uint64_t height = static_cast<std::uint64_t>(
+		static_cast<std::int64_t>(m_extent.hi.y) - m_extent.lo.y + 1);
+	if (width == 0 || height == 0 ||
+		width > std::numeric_limits<std::uint32_t>::max() ||
+		height > std::numeric_limits<std::uint32_t>::max() ||
+		width > std::numeric_limits<std::size_t>::max() / height)
+	{
+		return FALSE;
+	}
+	const std::size_t cellCount = static_cast<std::size_t>(width * height);
+	if (cellCount > std::numeric_limits<std::uint32_t>::max())
+		return FALSE;
+	const UnsignedInt generation = m_navigationRevision;
+	if (context.generation != 0 && context.generation != generation)
+		return FALSE;
+	try
+	{
+		context.navigationCells.resize(cellCount);
+	}
+	catch (...)
+	{
+		return FALSE;
+	}
+
+	std::size_t output = 0;
+	for (Int y = m_extent.lo.y; y <= m_extent.hi.y; ++y)
+	{
+		for (Int x = m_extent.lo.x; x <= m_extent.hi.x; ++x)
+		{
+			PathfindCell *cell = getCell(LAYER_GROUND, x, y);
+			if (!cell)
+				return FALSE;
+			rts::DeterministicPathCell &snapshotCell =
+				context.navigationCells[output++];
+			snapshotCell = {};
+			snapshotCell.traversalMask = static_cast<std::uint32_t>(
+				validLocomotorSurfacesForCellType(cell->getType()));
+			snapshotCell.obstacleObjectId = static_cast<std::uint32_t>(
+				cell->getObstacleID());
+			snapshotCell.positionObjectId = static_cast<std::uint32_t>(
+				cell->getPosUnit());
+			snapshotCell.goalObjectId = static_cast<std::uint32_t>(
+				cell->getGoalUnit());
+			snapshotCell.blockZone = static_cast<std::uint16_t>(
+				m_zoneManager.getBlockZone(LOCOMOTORSURFACE_GROUND, FALSE,
+					x, y, m_map));
+			snapshotCell.globalZone = static_cast<std::uint16_t>(
+				m_zoneManager.getEffectiveZone(LOCOMOTORSURFACE_GROUND, FALSE,
+					snapshotCell.blockZone));
+			snapshotCell.zone = static_cast<std::uint16_t>(cell->getZone());
+			snapshotCell.type = static_cast<std::uint8_t>(cell->getType());
+			snapshotCell.flags = static_cast<std::uint8_t>(cell->getFlags());
+			snapshotCell.layer = static_cast<std::uint8_t>(cell->getLayer());
+			snapshotCell.connectsToLayer = static_cast<std::uint8_t>(
+				cell->getConnectLayer());
+			snapshotCell.pinched = cell->getPinched() ? 1 : 0;
+			// Per-request hierarchy passability is rebuilt by the worker from the
+			// immutable block/global-zone facts and is validated owner-side after
+			// the unchanged legacy hierarchy preflight.
+			snapshotCell.blockPassable = 1;
+		if (x >= m_logicalExtent.lo.x && x <= m_logicalExtent.hi.x &&
+			y >= m_logicalExtent.lo.y && y <= m_logicalExtent.hi.y)
+		{
+			snapshotCell.navigationFlags |=
+				rts::DETERMINISTIC_PATH_INSIDE_LOGICAL_EXTENT;
+		}
+			if (cell->hasInfo())
+			{
+				snapshotCell.navigationFlags |=
+					rts::DETERMINISTIC_PATH_HAS_CELL_INFO;
+				if (cell->getOpen() || cell->getClosed())
+					snapshotCell.navigationFlags |=
+						rts::DETERMINISTIC_PATH_METADATA_DIRTY;
+			}
+			if (cell->isBlockedByAlly())
+				snapshotCell.navigationFlags |=
+					rts::DETERMINISTIC_PATH_BLOCKED_BY_ALLY;
+			if (m_zoneManager.interactsWithBridge(x, y))
+				snapshotCell.navigationFlags |=
+					rts::DETERMINISTIC_PATH_BLOCK_INTERACTS_WITH_BRIDGE;
+		}
+	}
+	if (m_navigationRevision != generation || output != cellCount)
+		return FALSE;
+	context.generation = generation;
+	context.grid = {};
+	context.grid.cells = context.navigationCells.data();
+	context.grid.width = static_cast<std::uint32_t>(width);
+	context.grid.height = static_cast<std::uint32_t>(height);
+	context.grid.originX = m_extent.lo.x;
+	context.grid.originY = m_extent.lo.y;
+	context.grid.snapshotGeneration = generation;
+	return TRUE;
+}
+
+Bool Pathfinder::captureOrdinaryPathBatchEntry(Object *obj,
+	AIUpdateInterface *ai, const Coord3D *from, const Coord3D *rawTo,
+	Int queueOrder, OrdinaryPathQueueBatchEntry &entry,
+	const OrdinaryPathQueueBatchContext &context)
+{
+	if (!obj || !ai || !from || !rawTo || !m_isMapReady ||
+		context.generation == 0 || context.generation != m_navigationRevision ||
+		m_extent.hi.x < m_extent.lo.x || m_extent.hi.y < m_extent.lo.y ||
+		obj->getLayer() != LAYER_GROUND || obj->getCrusherLevel() > 0 ||
+		obj->isKindOf(KINDOF_DOZER) || obj->isKindOf(KINDOF_HARVESTER) ||
+		ai->getLocomotorSet().getValidSurfaces() != LOCOMOTORSURFACE_GROUND ||
+		ai->getLocomotorSet().isDownhillOnly() || ai->isBlockedAndStuck() ||
+		ai->canPathThroughUnits() ||
+		(ai->getCurLocomotor() && ai->getCurLocomotor()->isUltraAccurate()) ||
+		m_ignoreObstacleID != INVALID_ID ||
+		(rawTo->x == 0.0f && rawTo->y == 0.0f) ||
+		!m_openList.empty() || !m_closedList.empty() ||
+		(TheGlobalData && TheGlobalData->m_debugAI == AI_DEBUG_PATHS))
+	{
+		return FALSE;
+	}
+	#if RETAIL_COMPATIBLE_PATHFINDING
+	if (!s_useFixedPathfinding)
+		return FALSE;
+	#endif
+	const LocomotorSet &locomotorSet = ai->getLocomotorSet();
+	const Bool isHuman = !obj->getControllingPlayer() ||
+		obj->getControllingPlayer()->getPlayerType() != PLAYER_COMPUTER;
+	Int radius = 0;
+	Bool centerInCell = TRUE;
+	getRadiusAndCenter(obj, radius, centerInCell);
+	if (radius < 0 || radius > 255)
+		return FALSE;
+
+	Coord3D adjustedTo = *rawTo;
+	Coord3D clippedFrom = *from;
+	clip(&clippedFrom, &adjustedTo);
+	const Bool rawStartValid = validMovementPosition(FALSE, LAYER_GROUND,
+		locomotorSet, from);
+	if (!rts::IsDirectPathRawStartEligible(from->x, from->y, from->z,
+		clippedFrom.x, clippedFrom.y, clippedFrom.z, rawStartValid))
+	{
+		return FALSE;
+	}
+	if (!centerInCell)
+	{
+		adjustedTo.x += PATHFIND_CELL_SIZE_F / 2;
+		adjustedTo.y += PATHFIND_CELL_SIZE_F / 2;
+	}
+	if (TheTerrainLogic->getLayerForDestination(&adjustedTo) != LAYER_GROUND)
+		return FALSE;
+	ICoord2D startIndex;
+	ICoord2D goalIndex;
+	if (worldToCell(&clippedFrom, &startIndex) ||
+		worldToCell(&adjustedTo, &goalIndex))
+	{
+		return FALSE;
+	}
+	PathfindCell *startCell = getClippedCell(LAYER_GROUND, &clippedFrom);
+	PathfindCell *goalCell = getCell(LAYER_GROUND, goalIndex.x, goalIndex.y);
+	if (!startCell || !goalCell ||
+		startCell->getXIndex() != startIndex.x ||
+		startCell->getYIndex() != startIndex.y ||
+		startCell->getType() != PathfindCell::CELL_CLEAR ||
+		goalCell->getType() != PathfindCell::CELL_CLEAR ||
+		startCell->getZone() == PathfindZoneManager::UNINITIALIZED_ZONE ||
+		startCell->getZone() != goalCell->getZone() ||
+		startCell->getPinched() || goalCell->getPinched() ||
+		startCell->getConnectLayer() != LAYER_INVALID ||
+		goalCell->getConnectLayer() != LAYER_INVALID ||
+		(startCell->hasInfo() && (startCell->getOpen() || startCell->getClosed())) ||
+		(goalCell->hasInfo() && (goalCell->getOpen() || goalCell->getClosed())) ||
+		!checkDestination(obj, goalIndex.x, goalIndex.y, LAYER_GROUND,
+			radius, centerInCell) ||
+		!validMovementPosition(FALSE, LAYER_GROUND, locomotorSet, &adjustedTo))
+	{
+		return FALSE;
+	}
+	if (m_zoneManager.getEffectiveZone(locomotorSet.getValidSurfaces(), FALSE,
+		startCell->getZone()) !=
+		m_zoneManager.getEffectiveZone(locomotorSet.getValidSurfaces(), FALSE,
+			goalCell->getZone()))
+	{
+		return FALSE;
+	}
+
+	++m_ordinaryPathRequestToken;
+	if (m_ordinaryPathRequestToken == 0)
+		++m_ordinaryPathRequestToken;
+	entry.objectId = obj->getID();
+	entry.queueOrder = queueOrder;
+	entry.radius = radius;
+	entry.centerInCell = centerInCell;
+	entry.isHuman = isHuman;
+	entry.rawFrom = *from;
+	entry.rawTo = *rawTo;
+	entry.ownerToken =
+		(static_cast<std::uint64_t>(context.generation) << 32) |
+		m_ordinaryPathRequestToken;
+	entry.request = {};
+	entry.request.expectedSnapshotGeneration = context.generation;
+	entry.request.objectId = static_cast<std::uint32_t>(obj->getID());
+	entry.request.startX = startIndex.x;
+	entry.request.startY = startIndex.y;
+	entry.request.goalX = goalIndex.x;
+	entry.request.goalY = goalIndex.y;
+	entry.request.traversalMask = LOCOMOTORSURFACE_GROUND;
+	const std::uint64_t width = static_cast<std::uint64_t>(
+		static_cast<std::int64_t>(m_extent.hi.x) - m_extent.lo.x + 1);
+	const std::uint64_t height = static_cast<std::uint64_t>(
+		static_cast<std::int64_t>(m_extent.hi.y) - m_extent.lo.y + 1);
+	const std::uint64_t cellCount = width >
+		std::numeric_limits<std::uint64_t>::max() / height ?
+		std::numeric_limits<std::uint64_t>::max() : width * height;
+	const std::uint64_t expansionBudget = cellCount >
+		std::numeric_limits<std::uint64_t>::max() / 8U ?
+		std::numeric_limits<std::uint64_t>::max() : cellCount * 8U;
+	entry.request.maximumExpandedNodes = expansionBudget >
+		std::numeric_limits<std::uint32_t>::max() ?
+		std::numeric_limits<std::uint32_t>::max() :
+		static_cast<std::uint32_t>(expansionBudget);
+	entry.request.availableCellInfoCount =
+		PathfindCellInfo::countFreeCellInfos();
+	entry.request.requiredZone = static_cast<std::uint16_t>(startCell->getZone());
+	entry.request.footprintRadius = static_cast<std::uint8_t>(radius);
+	entry.request.centerInCell = centerInCell ? 1 : 0;
+	entry.request.allowDiagonal = 1;
+	entry.request.allowBlockedStart = 0;
+	entry.request.expectedLayer = rts::DETERMINISTIC_PATH_LAYER_GROUND;
+	entry.request.requireLegacyDirectLine = 0;
+	entry.request.requireObstructedSearch = 1;
+	entry.request.isHuman = isHuman ? 1 : 0;
+	#if RTS_GENERALS
+	entry.request.hierarchyMode =
+		rts::DETERMINISTIC_PATH_HIERARCHY_GENERALS;
+	#else
+	entry.request.hierarchyMode =
+		rts::DETERMINISTIC_PATH_HIERARCHY_ZERO_HOUR;
+	#endif
+	entry.request.hierarchyBlockSize = PathfindZoneManager::ZONE_BLOCK_SIZE;
+	++s_ordinaryPathEligibleCount;
+	return TRUE;
+}
+
+void Pathfinder::captureDirectPathCellFact(Object *obj,
+	const LocomotorSet& locomotorSet, Int requiredZone, Int radius,
+	Bool centerInCell, Bool isHuman, Bool useCurrentHierarchyPassability,
+	Int x, Int y, rts::DirectPathCellFact &fact)
+{
+	fact = {};
+	fact.x = x;
+	fact.y = y;
+	PathfindCell *center = getCell(LAYER_GROUND, x, y);
+	if (!center)
+		return;
+	fact.zone = static_cast<std::uint16_t>(center->getZone());
+	fact.hasPathfindInfo = center->hasInfo() ? 1 : 0;
+	Bool clearGround = TRUE;
+	Bool hierarchyPassable = TRUE;
+	Bool insideLogical = TRUE;
+	Bool footprintClear = TRUE;
+	Bool noForeignOccupancy = TRUE;
+	Bool noLayerConnection = TRUE;
+	Bool notPinched = TRUE;
+	const Int upper = centerInCell ? radius + 1 : radius;
+	for (Int cellX = x - radius; cellX < x + upper; ++cellX)
+	{
+		for (Int cellY = y - radius; cellY < y + upper; ++cellY)
+		{
+			PathfindCell *cell = getCell(LAYER_GROUND, cellX, cellY);
+			if (!cell)
+			{
+				clearGround = hierarchyPassable = insideLogical = FALSE;
+				footprintClear = noForeignOccupancy = FALSE;
+				noLayerConnection = notPinched = FALSE;
+				continue;
+			}
+			clearGround = clearGround &&
+				cell->getType() == PathfindCell::CELL_CLEAR &&
+				cell->getLayer() == LAYER_GROUND;
+			if (useCurrentHierarchyPassability)
+				hierarchyPassable = hierarchyPassable &&
+					m_zoneManager.isPassable(cellX, cellY);
+			insideLogical = insideLogical && (!isHuman ||
+				(cellX >= m_logicalExtent.lo.x && cellX <= m_logicalExtent.hi.x &&
+				 cellY >= m_logicalExtent.lo.y && cellY <= m_logicalExtent.hi.y));
+			footprintClear = footprintClear && cell->getZone() == requiredZone &&
+				(validLocomotorSurfacesForCellType(cell->getType()) &
+					locomotorSet.getValidSurfaces()) != 0;
+			const ObjectID obstacle = cell->getObstacleID();
+			const ObjectID position = cell->getPosUnit();
+			const ObjectID goal = cell->getGoalUnit();
+			noForeignOccupancy = noForeignOccupancy &&
+				(obstacle == INVALID_ID || obstacle == obj->getID()) &&
+				(position == INVALID_ID || position == obj->getID()) &&
+				(goal == INVALID_ID || goal == obj->getID()) &&
+				(cell->getFlags() == PathfindCell::NO_UNITS ||
+				 position == obj->getID() || goal == obj->getID());
+			noLayerConnection = noLayerConnection &&
+				cell->getConnectLayer() == LAYER_INVALID;
+			notPinched = notPinched && !cell->getPinched();
+		}
+	}
+	if (clearGround) fact.flags |= rts::DIRECT_PATH_FACT_CLEAR_GROUND;
+	if (hierarchyPassable) fact.flags |= rts::DIRECT_PATH_FACT_HIERARCHY_PASSABLE;
+	if (insideLogical) fact.flags |= rts::DIRECT_PATH_FACT_INSIDE_LOGICAL_EXTENT;
+	if (footprintClear) fact.flags |= rts::DIRECT_PATH_FACT_FOOTPRINT_CLEAR;
+	if (noForeignOccupancy) fact.flags |= rts::DIRECT_PATH_FACT_NO_FOREIGN_OCCUPANCY;
+	if (noLayerConnection) fact.flags |= rts::DIRECT_PATH_FACT_NO_LAYER_CONNECTION;
+	if (notPinched) fact.flags |= rts::DIRECT_PATH_FACT_NOT_PINCHED;
+	if (!center->hasInfo() || (!center->getOpen() && !center->getClosed()))
+		fact.flags |= rts::DIRECT_PATH_FACT_METADATA_CLEAN;
+}
+
+Bool Pathfinder::captureDirectPathBatchEntry(Object *obj,
+	AIUpdateInterface *ai, const Coord3D *from, const Coord3D *rawTo,
+	Int queueOrder, DirectPathQueueBatchEntry &entry)
+{
+	if (!obj || !ai || !from || !rawTo || !m_isMapReady ||
+		obj->getLayer() != LAYER_GROUND || obj->getCrusherLevel() > 0 ||
+		obj->isKindOf(KINDOF_DOZER) || obj->isKindOf(KINDOF_HARVESTER) ||
+		ai->getLocomotorSet().getValidSurfaces() != LOCOMOTORSURFACE_GROUND ||
+		ai->getLocomotorSet().isDownhillOnly() || ai->isBlockedAndStuck() ||
+		ai->canPathThroughUnits() ||
+		(ai->getCurLocomotor() && ai->getCurLocomotor()->isUltraAccurate()) ||
+		m_ignoreObstacleID != INVALID_ID ||
+		(rawTo->x == 0.0f && rawTo->y == 0.0f) ||
+		!m_openList.empty() || !m_closedList.empty())
+	{
+		return FALSE;
+	}
+	const LocomotorSet &locomotorSet = ai->getLocomotorSet();
+	const Bool isHuman = !obj->getControllingPlayer() ||
+		obj->getControllingPlayer()->getPlayerType() != PLAYER_COMPUTER;
+
+	Int radius = 0;
+	Bool centerInCell = TRUE;
+	getRadiusAndCenter(obj, radius, centerInCell);
+	if (radius < 0 || radius > 255)
+		return FALSE;
+	Coord3D adjustedTo = *rawTo;
+	Coord3D clippedFrom = *from;
+	clip(&clippedFrom, &adjustedTo);
+	const Bool rawStartValid = validMovementPosition(FALSE, LAYER_GROUND,
+		locomotorSet, from);
+	if (!rts::IsDirectPathRawStartEligible(from->x, from->y, from->z,
+		clippedFrom.x, clippedFrom.y, clippedFrom.z, rawStartValid))
+	{
+		return FALSE;
+	}
+	if (!centerInCell)
+	{
+		adjustedTo.x += PATHFIND_CELL_SIZE_F / 2;
+		adjustedTo.y += PATHFIND_CELL_SIZE_F / 2;
+	}
+	if (TheTerrainLogic->getLayerForDestination(&adjustedTo) != LAYER_GROUND)
+		return FALSE;
+	ICoord2D startIndex;
+	ICoord2D goalIndex;
+	if (worldToCell(&clippedFrom, &startIndex) ||
+		worldToCell(&adjustedTo, &goalIndex))
+	{
+		return FALSE;
+	}
+	PathfindCell *startCell = getClippedCell(LAYER_GROUND, &clippedFrom);
+	PathfindCell *goalCell = getCell(LAYER_GROUND, goalIndex.x, goalIndex.y);
+	if (!startCell || !goalCell ||
+		startCell->getXIndex() != startIndex.x ||
+		startCell->getYIndex() != startIndex.y ||
+		startCell->getType() != PathfindCell::CELL_CLEAR ||
+		goalCell->getType() != PathfindCell::CELL_CLEAR ||
+		startCell->getZone() == PathfindZoneManager::UNINITIALIZED_ZONE ||
+		startCell->getZone() != goalCell->getZone() ||
+		startCell->getPinched() || goalCell->getPinched() ||
+		startCell->getConnectLayer() != LAYER_INVALID ||
+		goalCell->getConnectLayer() != LAYER_INVALID ||
+		!checkDestination(obj, goalIndex.x, goalIndex.y, LAYER_GROUND,
+			radius, centerInCell) ||
+		!validMovementPosition(FALSE, LAYER_GROUND, locomotorSet, &adjustedTo))
+	{
+		return FALSE;
+	}
+	const zoneStorageType requiredZone = startCell->getZone();
+	if (m_zoneManager.getEffectiveZone(locomotorSet.getValidSurfaces(), FALSE,
+		startCell->getZone()) !=
+		m_zoneManager.getEffectiveZone(locomotorSet.getValidSurfaces(), FALSE,
+			goalCell->getZone()))
+	{
+		return FALSE;
+	}
+	const UnsignedInt generation = m_navigationRevision;
+
+	std::vector<rts::DeterministicPathPoint> callbackPoints;
+	std::vector<rts::DirectPathCellFact> callbackFacts;
+	try
+	{
+		callbackPoints.resize(rts::DETERMINISTIC_DIRECT_PATH_MAX_CALLBACKS);
+	}
+	catch (...)
+	{
+		return FALSE;
+	}
+	std::size_t callbackCount = 0;
+	if (!rts::BuildLegacySupercoverCallbacks(startIndex.x, startIndex.y,
+		goalIndex.x, goalIndex.y, callbackPoints.data(), callbackPoints.size(),
+		callbackCount) || callbackCount == 0 ||
+		callbackCount > rts::DETERMINISTIC_DIRECT_PATH_MAX_CALLBACKS)
+	{
+		return FALSE;
+	}
+	callbackPoints.resize(callbackCount);
+	try
+	{
+		callbackFacts.resize(callbackCount);
+	}
+	catch (...)
+	{
+		return FALSE;
+	}
+
+	for (std::size_t i = 0; i < callbackCount; ++i)
+		captureDirectPathCellFact(obj, locomotorSet, requiredZone, radius,
+			centerInCell, isHuman, FALSE, callbackPoints[i].x,
+			callbackPoints[i].y, callbackFacts[i]);
+	static const Int neighborX[rts::DETERMINISTIC_DIRECT_PATH_NEIGHBOR_COUNT] =
+		{1, 0, -1, 0, 1, -1, -1, 1};
+	static const Int neighborY[rts::DETERMINISTIC_DIRECT_PATH_NEIGHBOR_COUNT] =
+		{0, 1, 0, -1, 1, 1, -1, -1};
+	rts::DirectPathCellFact neighborFacts[rts::DETERMINISTIC_DIRECT_PATH_NEIGHBOR_COUNT];
+	for (Int i = 0; i < rts::DETERMINISTIC_DIRECT_PATH_NEIGHBOR_COUNT; ++i)
+		captureDirectPathCellFact(obj, locomotorSet, requiredZone, radius,
+			centerInCell, isHuman, FALSE, startIndex.x + neighborX[i],
+			startIndex.y + neighborY[i], neighborFacts[i]);
+
+	// Fact capture is read-only on the game owner.  A generation change here
+	// rejects future owner-thread reentrancy before a job or any legacy metadata
+	// mutation exists; worker threads never read this live counter.
+	if (m_navigationRevision != generation)
+		return FALSE;
+	++m_directPathRequestToken;
+	if (m_directPathRequestToken == 0)
+		++m_directPathRequestToken;
+	const UnsignedInt requestToken = m_directPathRequestToken;
+	entry.objectId = obj->getID();
+	entry.queueOrder = queueOrder;
+	entry.radius = radius;
+	entry.centerInCell = centerInCell;
+	entry.isHuman = isHuman;
+	entry.rawFrom = *from;
+	entry.rawTo = *rawTo;
+	entry.callbackFacts.swap(callbackFacts);
+	for (Int i = 0; i < rts::DETERMINISTIC_DIRECT_PATH_NEIGHBOR_COUNT; ++i)
+		entry.neighborFacts[i] = neighborFacts[i];
+	entry.snapshot = {};
+	entry.snapshot.callbacks = entry.callbackFacts.data();
+	entry.snapshot.callbackCount = entry.callbackFacts.size();
+	entry.snapshot.startNeighbors = entry.neighborFacts.data();
+	entry.snapshot.startNeighborCount =
+		rts::DETERMINISTIC_DIRECT_PATH_NEIGHBOR_COUNT;
+	entry.snapshot.topologyOccupancyGeneration = generation;
+	entry.snapshot.requestToken = requestToken;
+	entry.snapshot.objectId = static_cast<std::uint32_t>(obj->getID());
+	entry.snapshot.availableCellInfoCount =
+		PathfindCellInfo::countFreeCellInfos();
+	entry.snapshot.startX = startIndex.x;
+	entry.snapshot.startY = startIndex.y;
+	entry.snapshot.goalX = goalIndex.x;
+	entry.snapshot.goalY = goalIndex.y;
+	entry.snapshot.requiredZone = static_cast<std::uint16_t>(requiredZone);
+	entry.snapshot.expectedLayer = rts::DETERMINISTIC_PATH_LAYER_GROUND;
+
+	++s_directPathEligibleCount;
+	if (s_directPathMinCallbackCount == 0 || callbackCount < s_directPathMinCallbackCount)
+		s_directPathMinCallbackCount = static_cast<UnsignedInt>(callbackCount);
+	if (callbackCount > s_directPathMaxCallbackCount)
+		s_directPathMaxCallbackCount = static_cast<UnsignedInt>(callbackCount);
+	return TRUE;
+}
+
+Path *Pathfinder::tryDirectPathBatchResult(Object *obj,
+	const LocomotorSet& locomotorSet, const Coord3D *from,
+	const Coord3D *rawTo, Bool isHuman, Bool &materializationBegan)
+{
+	materializationBegan = FALSE;
+	DirectPathQueueBatchContext *context = m_directPathBatchContext;
+	if (!context || !obj || !from || !rawTo ||
+		context->activeObjectId != obj->getID())
+	{
+		return nullptr;
+	}
+	DirectPathQueueBatchEntry *entry = nullptr;
+	for (std::size_t i = 0; i < context->entries.size(); ++i)
+	{
+		DirectPathQueueBatchEntry &candidate = context->entries[i];
+		if (!candidate.consumed &&
+			candidate.queueOrder == context->activeQueueOrder &&
+			candidate.objectId == obj->getID())
+		{
+			entry = &candidate;
+			break;
+		}
+	}
+	if (!entry)
+		return nullptr;
+	entry->consumed = TRUE;
+	if (!context->ready || !rts::UseParallelSimulation() ||
+		!ShouldUseDirectPathAuthority() ||
+		from->x != entry->rawFrom.x || from->y != entry->rawFrom.y ||
+		from->z != entry->rawFrom.z || rawTo->x != entry->rawTo.x ||
+		rawTo->y != entry->rawTo.y || rawTo->z != entry->rawTo.z ||
+		isHuman != entry->isHuman)
+	{
+		return nullptr;
+	}
+
+	Int radius = 0;
+	Bool centerInCell = TRUE;
+	getRadiusAndCenter(obj, radius, centerInCell);
+	if (radius != entry->radius || centerInCell != entry->centerInCell)
+		return nullptr;
+	Coord3D adjustedTo = *rawTo;
+	Coord3D clippedFrom = *from;
+	clip(&clippedFrom, &adjustedTo);
+	const Bool rawStartValid = validMovementPosition(FALSE, LAYER_GROUND,
+		locomotorSet, from);
+	if (!rts::IsDirectPathRawStartEligible(from->x, from->y, from->z,
+		clippedFrom.x, clippedFrom.y, clippedFrom.z, rawStartValid))
+	{
+		return nullptr;
+	}
+	if (!centerInCell)
+	{
+		adjustedTo.x += PATHFIND_CELL_SIZE_F / 2;
+		adjustedTo.y += PATHFIND_CELL_SIZE_F / 2;
+	}
+	ICoord2D startIndex;
+	ICoord2D goalIndex;
+	if (worldToCell(&clippedFrom, &startIndex) ||
+		worldToCell(&adjustedTo, &goalIndex) ||
+		startIndex.x != entry->snapshot.startX ||
+		startIndex.y != entry->snapshot.startY ||
+		goalIndex.x != entry->snapshot.goalX ||
+		goalIndex.y != entry->snapshot.goalY)
+	{
+		return nullptr;
+	}
+	PathfindCell *startCell = getClippedCell(LAYER_GROUND, &clippedFrom);
+	PathfindCell *goalCell = getCell(LAYER_GROUND, goalIndex.x, goalIndex.y);
+	if (!startCell || !goalCell || !m_openList.empty() || !m_closedList.empty())
+		return nullptr;
+
+	const auto sameFact = [](const rts::DirectPathCellFact &left,
+		const rts::DirectPathCellFact &right)
+	{
+		return left.x == right.x && left.y == right.y &&
+			left.zone == right.zone && left.flags == right.flags &&
+			left.hasPathfindInfo == right.hasPathfindInfo;
+	};
+	for (std::size_t i = 0; i < entry->callbackFacts.size(); ++i)
+	{
+		rts::DirectPathCellFact current;
+		captureDirectPathCellFact(obj, locomotorSet,
+			entry->snapshot.requiredZone, radius, centerInCell, isHuman, TRUE,
+			entry->callbackFacts[i].x, entry->callbackFacts[i].y, current);
+		if (!sameFact(current, entry->callbackFacts[i]))
+		{
+			++s_directPathStaleCount;
+			return nullptr;
+		}
+	}
+	for (std::size_t i = 0; i < entry->neighborFacts.size(); ++i)
+	{
+		rts::DirectPathCellFact current;
+		captureDirectPathCellFact(obj, locomotorSet,
+			entry->snapshot.requiredZone, radius, centerInCell, isHuman, TRUE,
+			entry->neighborFacts[i].x, entry->neighborFacts[i].y, current);
+		if (!sameFact(current, entry->neighborFacts[i]))
+		{
+			++s_directPathStaleCount;
+			return nullptr;
+		}
+	}
+	const rts::DeterministicDirectPathExecutionSnapshot execution =
+		context->batch.requestExecutionSnapshot(entry->batchIndex);
+	if (!execution.submitted || !execution.succeeded ||
+		execution.state != rts::DIRECT_PATH_EXECUTION_WORKER)
+	{
+		return nullptr;
+	}
+	const rts::DirectPathSearchResult &result =
+		context->batch.result(entry->batchIndex);
+	const rts::DirectPathSnapshot &snapshot = entry->snapshot;
+	const Bool resultCurrent = rts::IsDirectPathResultCurrent(result,
+		snapshot.topologyOccupancyGeneration, snapshot.requestToken,
+		static_cast<std::uint32_t>(obj->getID()));
+	if (!resultCurrent)
+	{
+		if (result.topologyOccupancyGeneration !=
+			snapshot.topologyOccupancyGeneration ||
+			result.requestToken != snapshot.requestToken ||
+			result.objectId != static_cast<std::uint32_t>(obj->getID()))
+		{
+			++s_directPathStaleCount;
+		}
+		else if (!rts::IsDirectPathAdvisoryFallbackStatus(result.status))
+		{
+			++s_directPathFailureCount;
+		}
+		return nullptr;
+	}
+	const Bool materializationPlanValid =
+		rts::IsDirectPathMaterializationPlanValid(snapshot, result,
+			PathfindCellInfo::countFreeCellInfos());
+	if (!materializationPlanValid)
+	{
+		++s_directPathFailureCount;
+		return nullptr;
+	}
+	const std::vector<rts::DirectPathCellFact> &callbackFacts =
+		entry->callbackFacts;
+
+	// Every serial-fallback condition ends above.  From this point onward the
+	// request owns any legacy metadata/list/debug mutation and must terminate
+	// here even if a defensive release check catches an internal inconsistency.
+	materializationBegan = TRUE;
+	ICoord2D cellPosition = goalIndex;
+	Bool allocationSucceeded = goalCell->allocateInfo(cellPosition);
+	DEBUG_ASSERTCRASH(allocationSucceeded,
+		("Validated direct path could not allocate goal metadata."));
+	if (startCell != goalCell)
+	{
+		cellPosition = startIndex;
+		allocationSucceeded = allocationSucceeded && startCell->allocateInfo(cellPosition);
+		DEBUG_ASSERTCRASH(allocationSucceeded,
+			("Validated direct path could not allocate start metadata."));
+	}
+	if (!allocationSucceeded)
+	{
+		goalCell->releaseInfo();
+		++s_directPathFailureCount;
+		return nullptr;
+	}
+	m_isTunneling = false;
+	startCell->startPathfind(goalCell);
+#if RETAIL_COMPATIBLE_PATHFINDING
+	if (!s_useFixedPathfinding)
+		m_openList.reset(startCell);
+	else
+#endif
+	{
+		m_openList.reset();
+		startCell->putOnSortedOpenList(m_openList);
+	}
+	m_closedList.reset();
+	PathfindCell *parentCell = m_openList.getHead();
+	parentCell->removeFromOpenList(m_openList);
+	if (parentCell != goalCell)
+	{
+		parentCell->putOnClosedList(m_closedList);
+		PathfindCell *fromCell = startCell;
+		for (std::size_t i = 1; i < callbackFacts.size(); ++i)
+		{
+			const rts::DirectPathCellFact &fact = callbackFacts[i];
+			PathfindCell *toCell = getCell(LAYER_GROUND, fact.x, fact.y);
+			ICoord2D callbackPosition = {fact.x, fact.y};
+			const Bool callbackAllocated = toCell && toCell->allocateInfo(callbackPosition);
+			DEBUG_ASSERTCRASH(callbackAllocated,
+				("Validated direct path callback allocation failed."));
+			if (!callbackAllocated)
+			{
+				cleanOpenAndClosedLists();
+				goalCell->releaseInfo();
+				++s_directPathFailureCount;
+				return nullptr;
+			}
+			toCell->setBlockedByAlly(false);
+			const UnsignedInt newCostSoFar = fromCell->getCostSoFar() +
+				0.5f * COST_ORTHOGONAL;
+			if (!(toCell->getOpen() || toCell->getClosed()) ||
+				toCell->getCostSoFar() > newCostSoFar)
+			{
+				toCell->setCostSoFar(newCostSoFar);
+				toCell->setParentCell(fromCell);
+				toCell->setTotalCost(toCell->getCostSoFar() +
+					toCell->costToGoal(goalCell));
+				if (toCell->getClosed()) toCell->removeFromClosedList(m_closedList);
+				if (toCell->getOpen()) toCell->removeFromOpenList(m_openList);
+				toCell->putOnSortedOpenList(m_openList);
+			}
+			fromCell = toCell;
+		}
+		const Int neighborAllocations = examineNeighboringCells(startCell, goalCell,
+			locomotorSet, isHuman, centerInCell, radius, startIndex, obj,
+			NO_ATTACK, TRUE);
+		const Bool neighborAccountingMatches =
+			static_cast<std::size_t>(neighborAllocations) ==
+			result.startNeighborAllocationCount;
+		DEBUG_ASSERTCRASH(neighborAccountingMatches,
+			("Direct path start-ring allocation accounting changed."));
+		if (!neighborAccountingMatches)
+		{
+			cleanOpenAndClosedLists();
+			goalCell->releaseInfo();
+			++s_directPathFailureCount;
+			return nullptr;
+		}
+		parentCell = m_openList.getHead();
+		DEBUG_ASSERTCRASH(parentCell == goalCell,
+			("Direct path materialization did not preserve the legacy goal pop."));
+		if (parentCell != goalCell)
+		{
+			cleanOpenAndClosedLists();
+			goalCell->releaseInfo();
+			++s_directPathFailureCount;
+			return nullptr;
+		}
+		parentCell->removeFromOpenList(m_openList);
+	}
+
+	if (TheGlobalData->m_debugAI == AI_DEBUG_PATHS)
+		debugShowSearch(true);
+	Path *path = buildActualPath(obj, locomotorSet.getValidSurfaces(), from,
+		goalCell, centerInCell, false);
+	const Int cumulativeBeforeCleanup = m_cumulativeCellsAllocated;
+#if RETAIL_COMPATIBLE_PATHFINDING
+	if (!s_useFixedPathfinding)
+	{
+		parentCell->releaseInfo();
+		cleanOpenAndClosedLists();
+	}
+	else
+#endif
+	{
+		cleanOpenAndClosedLists();
+		parentCell->releaseInfo();
+	}
+	const Bool cumulativeAccountingMatches =
+		static_cast<std::size_t>(m_cumulativeCellsAllocated -
+			cumulativeBeforeCleanup) == result.cumulativeCellCount;
+	DEBUG_ASSERTCRASH(cumulativeAccountingMatches,
+		("Direct path cumulative-cell accounting changed."));
+	if (path)
+	{
+		const Bool unsupportedAuthority = !rts::UseParallelSimulation() ||
+			!ShouldUseDirectPathAuthority();
+		const Bool shadowAuthority = rts::UseSimulationShadowOracle();
+		const Bool staleAuthority = !resultCurrent;
+		const Bool malformedAuthority = !materializationPlanValid ||
+			!cumulativeAccountingMatches;
+		if (unsupportedAuthority) ++s_directPathUnsupportedAuthorityCount;
+		if (shadowAuthority) ++s_directPathShadowAuthorityCount;
+		if (staleAuthority) ++s_directPathStaleAuthorityCount;
+		if (malformedAuthority) ++s_directPathMalformedAuthorityCount;
+		if (!unsupportedAuthority && !shadowAuthority && !staleAuthority &&
+			!malformedAuthority)
+		{
+			++s_directPathAuthoritativeCommitCount;
+			if (context->multiWorkerExecution)
+				++s_directPathAuthoritativeMultiWorkerCommitCount;
+		}
+	}
+	else
+		++s_directPathFailureCount;
+	return path;
+}
+
+Path *Pathfinder::tryOrdinaryPathBatchResult(Object *obj,
+	const LocomotorSet& locomotorSet, const Coord3D *from,
+	const Coord3D *rawTo, Bool isHuman, Bool hierarchyUnrestricted,
+	Bool &materializationBegan)
+{
+	materializationBegan = FALSE;
+	OrdinaryPathQueueBatchContext *context = m_ordinaryPathBatchContext;
+	if (!context || !obj || !from || !rawTo || !context->ready ||
+		context->activeObjectId != obj->getID())
+	{
+		return nullptr;
+	}
+	OrdinaryPathQueueBatchEntry *entry = nullptr;
+	std::size_t entryIndex = 0;
+	for (; entryIndex < context->entries.size(); ++entryIndex)
+	{
+		OrdinaryPathQueueBatchEntry &candidate = context->entries[entryIndex];
+		if (!candidate.consumed &&
+			candidate.queueOrder == context->activeQueueOrder &&
+			candidate.objectId == obj->getID())
+		{
+			entry = &candidate;
+			break;
+		}
+	}
+	if (!entry)
+		return nullptr;
+	entry->consumed = TRUE;
+	if (from->x != entry->rawFrom.x || from->y != entry->rawFrom.y ||
+		from->z != entry->rawFrom.z || rawTo->x != entry->rawTo.x ||
+		rawTo->y != entry->rawTo.y || rawTo->z != entry->rawTo.z ||
+		isHuman != entry->isHuman ||
+		m_navigationRevision != context->generation ||
+		!m_openList.empty() || !m_closedList.empty())
+	{
+		++s_ordinaryPathStaleCount;
+		++s_ordinaryPathSerialFallbackCount;
+		return nullptr;
+	}
+
+	Int radius = 0;
+	Bool centerInCell = TRUE;
+	getRadiusAndCenter(obj, radius, centerInCell);
+	if (radius != entry->radius || centerInCell != entry->centerInCell)
+	{
+		++s_ordinaryPathStaleCount;
+		++s_ordinaryPathSerialFallbackCount;
+		return nullptr;
+	}
+	Coord3D adjustedTo = *rawTo;
+	Coord3D clippedFrom = *from;
+	clip(&clippedFrom, &adjustedTo);
+	const Bool rawStartValid = validMovementPosition(FALSE, LAYER_GROUND,
+		locomotorSet, from);
+	if (!rts::IsDirectPathRawStartEligible(from->x, from->y, from->z,
+		clippedFrom.x, clippedFrom.y, clippedFrom.z, rawStartValid))
+	{
+		++s_ordinaryPathSerialFallbackCount;
+		return nullptr;
+	}
+	if (!centerInCell)
+	{
+		adjustedTo.x += PATHFIND_CELL_SIZE_F / 2;
+		adjustedTo.y += PATHFIND_CELL_SIZE_F / 2;
+	}
+	ICoord2D startIndex;
+	ICoord2D goalIndex;
+	if (worldToCell(&clippedFrom, &startIndex) ||
+		worldToCell(&adjustedTo, &goalIndex) ||
+		startIndex.x != entry->request.startX ||
+		startIndex.y != entry->request.startY ||
+		goalIndex.x != entry->request.goalX ||
+		goalIndex.y != entry->request.goalY)
+	{
+		++s_ordinaryPathStaleCount;
+		++s_ordinaryPathSerialFallbackCount;
+		return nullptr;
+	}
+	PathfindCell *startCell = getClippedCell(LAYER_GROUND, &clippedFrom);
+	PathfindCell *goalCell = getCell(LAYER_GROUND, goalIndex.x, goalIndex.y);
+	if (!startCell || !goalCell || startCell->getPinched() ||
+		goalCell->getPinched() || startCell->getConnectLayer() != LAYER_INVALID ||
+		goalCell->getConnectLayer() != LAYER_INVALID ||
+		static_cast<std::uint16_t>(startCell->getZone()) !=
+			entry->request.requiredZone ||
+		static_cast<std::uint16_t>(goalCell->getZone()) !=
+			entry->request.requiredZone ||
+		!checkDestination(obj, goalIndex.x, goalIndex.y, LAYER_GROUND,
+			radius, centerInCell) ||
+		!validMovementPosition(FALSE, LAYER_GROUND, locomotorSet, &adjustedTo))
+	{
+		++s_ordinaryPathStaleCount;
+		++s_ordinaryPathSerialFallbackCount;
+		return nullptr;
+	}
+
+	const rts::DeterministicDirectPathExecutionSnapshot execution =
+		context->batch.requestExecutionSnapshot(entry->batchIndex);
+	const rts::DeterministicOrdinaryPathBatchResult result =
+		context->batch.result(entry->batchIndex);
+	if (!execution.submitted || !execution.succeeded ||
+		execution.state != rts::DIRECT_PATH_EXECUTION_WORKER ||
+		result.snapshotGeneration != context->generation ||
+		result.objectId != static_cast<std::uint32_t>(obj->getID()) ||
+		result.ownerToken != entry->ownerToken)
+	{
+		++s_ordinaryPathValidationFailureCount;
+		++s_ordinaryPathSerialFallbackCount;
+		return nullptr;
+	}
+	if (result.status != rts::DETERMINISTIC_PATH_FOUND)
+	{
+		++s_ordinaryPathSerialFallbackCount;
+		return nullptr;
+	}
+	const std::size_t cellCount = context->navigationCells.size();
+	const std::size_t hierarchyBlockSize =
+		entry->request.hierarchyBlockSize;
+	const std::size_t hierarchyBlockWidth = hierarchyBlockSize == 0 ? 0 :
+		(static_cast<std::size_t>(context->grid.width) +
+			hierarchyBlockSize - 1) / hierarchyBlockSize;
+	const std::size_t hierarchyBlockHeight = hierarchyBlockSize == 0 ? 0 :
+		(static_cast<std::size_t>(context->grid.height) +
+			hierarchyBlockSize - 1) / hierarchyBlockSize;
+	const std::size_t hierarchyBlockCount =
+		hierarchyBlockWidth != 0 && hierarchyBlockHeight <=
+			std::numeric_limits<std::size_t>::max() / hierarchyBlockWidth ?
+			hierarchyBlockWidth * hierarchyBlockHeight : 0;
+	if (cellCount == 0 || result.points == nullptr || result.pointCount == 0 ||
+		result.pointCount > cellCount || result.allocationCount > cellCount ||
+		result.cleanupCount > cellCount ||
+		result.cleanupCount > static_cast<std::size_t>(
+			std::numeric_limits<Int>::max()) ||
+		result.cleanupCount !=
+			static_cast<std::size_t>(result.cumulativeCellCount) ||
+		result.cleanupCount == std::numeric_limits<std::size_t>::max() ||
+		static_cast<std::size_t>(result.discoveredNodeCount) !=
+			result.cleanupCount + 1 ||
+		(result.allocationCount != 0 && result.allocationOrder == nullptr) ||
+		(result.cleanupCount != 0 && result.cleanupOrder == nullptr) ||
+		(result.passableBlockCount != 0 &&
+			result.passableBlockIndices == nullptr) ||
+		result.passableBlockCount > hierarchyBlockCount ||
+		(result.hierarchyAllPassable && result.passableBlockCount != 0) ||
+		(!result.hierarchyAllPassable && result.passableBlockCount == 0) ||
+		result.hierarchyAllPassable != (hierarchyUnrestricted != FALSE) ||
+		hierarchyBlockCount == 0 ||
+		result.materializationPlanHash == 0 ||
+		rts::ComputeDeterministicOrdinaryPathPlanHash(result.points,
+			result.pointCount, result.allocationOrder, result.allocationCount,
+			result.cleanupOrder, result.cleanupCount,
+			result.passableBlockIndices, result.passableBlockCount,
+			result.hierarchyAllPassable,
+			result.snapshotGeneration, result.objectId, result.ownerToken) !=
+			result.materializationPlanHash)
+	{
+		++s_ordinaryPathValidationFailureCount;
+		++s_ordinaryPathSerialFallbackCount;
+		return nullptr;
+	}
+	std::vector<unsigned char> expectedPassable;
+	try
+	{
+		expectedPassable.assign(hierarchyBlockCount,
+			result.hierarchyAllPassable ? 1 : 0);
+	}
+	catch (...)
+	{
+		++s_ordinaryPathValidationFailureCount;
+		++s_ordinaryPathSerialFallbackCount;
+		return nullptr;
+	}
+	if (!result.hierarchyAllPassable)
+	{
+		for (std::size_t i = 0; i < result.passableBlockCount; ++i)
+		{
+			const std::uint32_t block = result.passableBlockIndices[i];
+			if (block >= hierarchyBlockCount || expectedPassable[block] != 0)
+			{
+				++s_ordinaryPathValidationFailureCount;
+				++s_ordinaryPathSerialFallbackCount;
+				return nullptr;
+			}
+			expectedPassable[block] = 1;
+		}
+	}
+	for (std::size_t blockY = 0; blockY < hierarchyBlockHeight; ++blockY)
+	{
+		for (std::size_t blockX = 0; blockX < hierarchyBlockWidth; ++blockX)
+		{
+			const Int x = context->grid.originX + static_cast<Int>(
+				blockX * hierarchyBlockSize);
+			const Int y = context->grid.originY + static_cast<Int>(
+				blockY * hierarchyBlockSize);
+			const Bool livePassable = m_zoneManager.clipIsPassable(x, y);
+			if ((livePassable ? 1 : 0) != expectedPassable[
+				blockY * hierarchyBlockWidth + blockX])
+			{
+				++s_ordinaryPathStaleCount;
+				++s_ordinaryPathSerialFallbackCount;
+				return nullptr;
+			}
+		}
+	}
+	if (rts::UseSimulationShadowOracle())
+	{
+		context->pendingShadowEntry = entryIndex;
+		++s_ordinaryPathSerialFallbackCount;
+		return nullptr;
+	}
+	if (!ShouldUseOrdinaryPathAuthority())
+	{
+		++s_ordinaryPathValidationFailureCount;
+		++s_ordinaryPathSerialFallbackCount;
+		return nullptr;
+	}
+
+	if (result.allocationCount > static_cast<std::size_t>(
+			PathfindCellInfo::countFreeCellInfos()))
+	{
+		++s_ordinaryPathValidationFailureCount;
+		++s_ordinaryPathSerialFallbackCount;
+		return nullptr;
+	}
+
+	std::vector<unsigned char> discovered;
+	std::vector<unsigned char> allocations;
+	std::vector<PathfindCell *> pathCells;
+	std::vector<PathfindCell *> cleanupCells;
+	std::vector<PathfindCell *> allocationCells;
+	try
+	{
+		discovered.assign(cellCount, 0);
+		allocations.assign(cellCount, 0);
+		pathCells.reserve(result.pointCount);
+		cleanupCells.reserve(result.cleanupCount);
+		allocationCells.reserve(result.allocationCount);
+	}
+	catch (...)
+	{
+		++s_ordinaryPathValidationFailureCount;
+		++s_ordinaryPathSerialFallbackCount;
+		return nullptr;
+	}
+	const auto indexToCoordinates = [&](std::uint32_t index, Int &x, Int &y)
+	{
+		if (index >= cellCount)
+			return FALSE;
+		x = context->grid.originX +
+			static_cast<Int>(index % context->grid.width);
+		y = context->grid.originY +
+			static_cast<Int>(index / context->grid.width);
+		return TRUE;
+	};
+	const auto pointToIndex = [&](const rts::DeterministicPathPoint &point,
+		std::uint32_t &index)
+	{
+		if (point.x < context->grid.originX || point.y < context->grid.originY)
+			return FALSE;
+		const std::uint64_t localX = static_cast<std::uint64_t>(
+			static_cast<std::int64_t>(point.x) - context->grid.originX);
+		const std::uint64_t localY = static_cast<std::uint64_t>(
+			static_cast<std::int64_t>(point.y) - context->grid.originY);
+		if (localX >= context->grid.width || localY >= context->grid.height)
+			return FALSE;
+		index = static_cast<std::uint32_t>(localY * context->grid.width + localX);
+		return TRUE;
+	};
+	std::uint32_t goalCellIndex = 0;
+	rts::DeterministicPathPoint goalPoint = {};
+	goalPoint.x = goalIndex.x;
+	goalPoint.y = goalIndex.y;
+	if (!pointToIndex(goalPoint, goalCellIndex))
+	{
+		++s_ordinaryPathValidationFailureCount;
+		++s_ordinaryPathSerialFallbackCount;
+		return nullptr;
+	}
+	discovered[goalCellIndex] = 1;
+	for (std::size_t i = 0; i < result.cleanupCount; ++i)
+	{
+		const std::uint32_t index = result.cleanupOrder[i];
+		Int x = 0;
+		Int y = 0;
+		if (!indexToCoordinates(index, x, y) || index == goalCellIndex ||
+			discovered[index] != 0)
+		{
+			++s_ordinaryPathValidationFailureCount;
+			++s_ordinaryPathSerialFallbackCount;
+			return nullptr;
+		}
+		PathfindCell *cell = getCell(LAYER_GROUND, x, y);
+		if (!cell)
+		{
+			++s_ordinaryPathValidationFailureCount;
+			++s_ordinaryPathSerialFallbackCount;
+			return nullptr;
+		}
+		discovered[index] = 1;
+		cleanupCells.push_back(cell);
+	}
+
+	std::uint32_t previousPathIndex = 0;
+	for (std::size_t i = 0; i < result.pointCount; ++i)
+	{
+		const rts::DeterministicPathPoint &point = result.points[i];
+		std::uint32_t index = 0;
+		if (point.layer != rts::DETERMINISTIC_PATH_LAYER_GROUND ||
+			!pointToIndex(point, index) || discovered[index] == 0)
+		{
+			++s_ordinaryPathValidationFailureCount;
+			++s_ordinaryPathSerialFallbackCount;
+			return nullptr;
+		}
+		if (i == 0 && (point.x != startIndex.x || point.y != startIndex.y))
+		{
+			++s_ordinaryPathValidationFailureCount;
+			++s_ordinaryPathSerialFallbackCount;
+			return nullptr;
+		}
+		if (i + 1 == result.pointCount && index != goalCellIndex)
+		{
+			++s_ordinaryPathValidationFailureCount;
+			++s_ordinaryPathSerialFallbackCount;
+			return nullptr;
+		}
+		if (i != 0)
+		{
+			const Int dx = IABS(static_cast<Int>(index % context->grid.width) -
+				static_cast<Int>(previousPathIndex % context->grid.width));
+			const Int dy = IABS(static_cast<Int>(index / context->grid.width) -
+				static_cast<Int>(previousPathIndex / context->grid.width));
+			if ((dx == 0 && dy == 0) || dx > 1 || dy > 1)
+			{
+				++s_ordinaryPathValidationFailureCount;
+				++s_ordinaryPathSerialFallbackCount;
+				return nullptr;
+			}
+		}
+		PathfindCell *cell = getCell(LAYER_GROUND, point.x, point.y);
+		if (!cell)
+		{
+			++s_ordinaryPathValidationFailureCount;
+			++s_ordinaryPathSerialFallbackCount;
+			return nullptr;
+		}
+		pathCells.push_back(cell);
+		previousPathIndex = index;
+	}
+
+	std::size_t expectedAllocationCount = 0;
+	for (std::size_t i = 0; i < cellCount; ++i)
+	{
+		if (discovered[i] == 0)
+			continue;
+		Int x = 0;
+		Int y = 0;
+		if (!indexToCoordinates(static_cast<std::uint32_t>(i), x, y))
+			continue;
+		PathfindCell *cell = getCell(LAYER_GROUND, x, y);
+		const rts::DeterministicPathCell &snapshotCell =
+			context->navigationCells[i];
+		const Bool expectedHasInfo = (snapshotCell.navigationFlags &
+			rts::DETERMINISTIC_PATH_HAS_CELL_INFO) != 0;
+		const Bool insideLogical = x >= m_logicalExtent.lo.x &&
+			x <= m_logicalExtent.hi.x && y >= m_logicalExtent.lo.y &&
+			y <= m_logicalExtent.hi.y;
+		const zoneStorageType liveBlockZone = m_zoneManager.getBlockZone(
+			LOCOMOTORSURFACE_GROUND, FALSE, x, y, m_map);
+		const zoneStorageType liveGlobalZone = m_zoneManager.getEffectiveZone(
+			LOCOMOTORSURFACE_GROUND, FALSE, liveBlockZone);
+		const Bool liveBridgeInteraction =
+			m_zoneManager.interactsWithBridge(x, y);
+		if (!cell || cell->hasInfo() != expectedHasInfo ||
+			static_cast<std::uint32_t>(validLocomotorSurfacesForCellType(
+				cell->getType())) != snapshotCell.traversalMask ||
+			static_cast<std::uint32_t>(cell->getObstacleID()) !=
+				snapshotCell.obstacleObjectId ||
+			static_cast<std::uint32_t>(cell->getPosUnit()) !=
+				snapshotCell.positionObjectId ||
+			static_cast<std::uint32_t>(cell->getGoalUnit()) !=
+				snapshotCell.goalObjectId ||
+			static_cast<std::uint16_t>(liveBlockZone) != snapshotCell.blockZone ||
+			static_cast<std::uint16_t>(liveGlobalZone) != snapshotCell.globalZone ||
+			static_cast<std::uint16_t>(cell->getZone()) != snapshotCell.zone ||
+			static_cast<std::uint8_t>(cell->getType()) != snapshotCell.type ||
+			static_cast<std::uint8_t>(cell->getFlags()) != snapshotCell.flags ||
+			static_cast<std::uint8_t>(cell->getLayer()) != snapshotCell.layer ||
+			static_cast<std::uint8_t>(cell->getConnectLayer()) !=
+				snapshotCell.connectsToLayer ||
+			(cell->getPinched() ? 1 : 0) != snapshotCell.pinched ||
+			(cell->isBlockedByAlly() ? 1 : 0) !=
+				((snapshotCell.navigationFlags &
+					rts::DETERMINISTIC_PATH_BLOCKED_BY_ALLY) ? 1 : 0) ||
+			(cell->hasInfo() && (cell->getOpen() || cell->getClosed()) ? 1 : 0) !=
+				((snapshotCell.navigationFlags &
+					rts::DETERMINISTIC_PATH_METADATA_DIRTY) ? 1 : 0) ||
+			(insideLogical ? 1 : 0) != ((snapshotCell.navigationFlags &
+				rts::DETERMINISTIC_PATH_INSIDE_LOGICAL_EXTENT) ? 1 : 0) ||
+			(liveBridgeInteraction ? 1 : 0) !=
+				((snapshotCell.navigationFlags &
+					rts::DETERMINISTIC_PATH_BLOCK_INTERACTS_WITH_BRIDGE) ? 1 : 0))
+		{
+			++s_ordinaryPathStaleCount;
+			++s_ordinaryPathSerialFallbackCount;
+			return nullptr;
+		}
+		if (!expectedHasInfo)
+			++expectedAllocationCount;
+	}
+	if (expectedAllocationCount != result.allocationCount)
+	{
+		++s_ordinaryPathValidationFailureCount;
+		++s_ordinaryPathSerialFallbackCount;
+		return nullptr;
+	}
+	for (std::size_t i = 0; i < result.allocationCount; ++i)
+	{
+		const std::uint32_t index = result.allocationOrder[i];
+		Int x = 0;
+		Int y = 0;
+		if (!indexToCoordinates(index, x, y) || discovered[index] == 0 ||
+			allocations[index] != 0 ||
+			(context->navigationCells[index].navigationFlags &
+				rts::DETERMINISTIC_PATH_HAS_CELL_INFO) != 0)
+		{
+			++s_ordinaryPathValidationFailureCount;
+			++s_ordinaryPathSerialFallbackCount;
+			return nullptr;
+		}
+		allocations[index] = 1;
+		PathfindCell *allocationCell = getCell(LAYER_GROUND, x, y);
+		if (!allocationCell)
+		{
+			++s_ordinaryPathValidationFailureCount;
+			++s_ordinaryPathSerialFallbackCount;
+			return nullptr;
+		}
+		allocationCells.push_back(allocationCell);
+	}
+	std::size_t expectedPrefix = 0;
+	if (allocations[goalCellIndex] != 0)
+	{
+		if (result.allocationOrder[expectedPrefix++] != goalCellIndex)
+		{
+			++s_ordinaryPathValidationFailureCount;
+			++s_ordinaryPathSerialFallbackCount;
+			return nullptr;
+		}
+	}
+	std::uint32_t startCellIndex = 0;
+	if (!pointToIndex(result.points[0], startCellIndex))
+	{
+		++s_ordinaryPathValidationFailureCount;
+		++s_ordinaryPathSerialFallbackCount;
+		return nullptr;
+	}
+	if (startCellIndex != goalCellIndex && allocations[startCellIndex] != 0)
+	{
+		if (expectedPrefix >= result.allocationCount ||
+			result.allocationOrder[expectedPrefix++] != startCellIndex)
+		{
+			++s_ordinaryPathValidationFailureCount;
+			++s_ordinaryPathSerialFallbackCount;
+			return nullptr;
+		}
+	}
+	// No fallback is allowed beyond this line. Every allocation, chain and
+	// cleanup-order proof above is immutable against the owner generation.
+	materializationBegan = TRUE;
+	std::size_t allocatedCount = 0;
+	for (; allocatedCount < allocationCells.size(); ++allocatedCount)
+	{
+		const std::uint32_t index = result.allocationOrder[allocatedCount];
+		ICoord2D position;
+		position.x = context->grid.originX +
+			static_cast<Int>(index % context->grid.width);
+		position.y = context->grid.originY +
+			static_cast<Int>(index / context->grid.width);
+		if (!allocationCells[allocatedCount]->allocateInfo(position))
+			break;
+	}
+	if (allocatedCount != allocationCells.size())
+	{
+		while (allocatedCount != 0)
+			allocationCells[--allocatedCount]->releaseInfo();
+		++s_ordinaryPathValidationFailureCount;
+		return nullptr;
+	}
+	m_isTunneling = false;
+	pathCells.front()->startPathfind(pathCells.back());
+	for (std::size_t i = 1; i < pathCells.size(); ++i)
+	{
+		pathCells[i]->setBlockedByAlly(false);
+		pathCells[i]->setParentCell(pathCells[i - 1]);
+	}
+	Path *path = buildActualPath(obj, locomotorSet.getValidSurfaces(), from,
+		pathCells.back(), centerInCell, false);
+	for (std::size_t i = 0; i < cleanupCells.size(); ++i)
+		cleanupCells[i]->releaseInfo();
+	pathCells.back()->releaseInfo();
+	m_cumulativeCellsAllocated += static_cast<Int>(result.cleanupCount);
+	if (path)
+	{
+		++s_ordinaryPathAuthoritativeCommitCount;
+		if (context->multiWorkerExecution)
+			++s_ordinaryPathAuthoritativeMultiWorkerCommitCount;
+	}
+	else
+	{
+		++s_ordinaryPathValidationFailureCount;
+	}
+	return path;
+}
+
+void Pathfinder::completeOrdinaryPathShadowComparison(Object *obj,
+	PathfindCell *serialGoalCell)
+{
+	OrdinaryPathQueueBatchContext *context = m_ordinaryPathBatchContext;
+	if (!context || context->pendingShadowEntry ==
+		std::numeric_limits<std::size_t>::max() ||
+		context->pendingShadowEntry >= context->entries.size())
+	{
+		return;
+	}
+	const std::size_t entryIndex = context->pendingShadowEntry;
+	context->pendingShadowEntry = std::numeric_limits<std::size_t>::max();
+	const OrdinaryPathQueueBatchEntry &entry = context->entries[entryIndex];
+	if (!obj || entry.objectId != obj->getID())
+		return;
+	const rts::DeterministicOrdinaryPathBatchResult result =
+		context->batch.result(entry.batchIndex);
+	if (result.status != rts::DETERMINISTIC_PATH_FOUND ||
+		result.points == nullptr || result.pointCount == 0)
+	{
+		return;
+	}
+	++s_ordinaryPathShadowComparisonCount;
+	if (!serialGoalCell)
+	{
+		++s_ordinaryPathShadowMismatchCount;
+		return;
+	}
+	std::vector<PathfindCell *> reversePath;
+	try
+	{
+		reversePath.reserve(result.pointCount);
+		for (PathfindCell *cell = serialGoalCell; cell;
+			cell = cell->getParentCell())
+		{
+			if (reversePath.size() >= result.pointCount)
+			{
+				++s_ordinaryPathShadowMismatchCount;
+				return;
+			}
+			reversePath.push_back(cell);
+		}
+	}
+	catch (...)
+	{
+		++s_ordinaryPathShadowMismatchCount;
+		return;
+	}
+	if (reversePath.size() != result.pointCount)
+	{
+		++s_ordinaryPathShadowMismatchCount;
+		return;
+	}
+	for (std::size_t i = 0; i < result.pointCount; ++i)
+	{
+		PathfindCell *cell = reversePath[result.pointCount - 1 - i];
+		if (result.points[i].x != cell->getXIndex() ||
+			result.points[i].y != cell->getYIndex() ||
+			result.points[i].layer !=
+				static_cast<std::uint8_t>(cell->getLayer()))
+		{
+			++s_ordinaryPathShadowMismatchCount;
+			return;
+		}
+	}
+}
+#endif
+
 
 /**
  * Find a short, valid path between given locations.
  * Uses A* algorithm.
  */
 Path *Pathfinder::findPath( Object *obj, const LocomotorSet& locomotorSet, const Coord3D *from,
-													 const Coord3D *rawTo)
+											 const Coord3D *rawTo, Bool allowDirectPathOffload)
 {
 	if (!clientSafeQuickDoesPathExist(locomotorSet, from, rawTo)) {
 		return nullptr;
@@ -6733,13 +8916,40 @@ Path *Pathfinder::findPath( Object *obj, const LocomotorSet& locomotorSet, const
 
 	m_zoneManager.clearPassableFlags();
 	Path *hPat = findHierarchicalPath(isHuman, locomotorSet, from, rawTo, false);
+	Bool hierarchyUnrestricted = FALSE;
 	if (hPat) {
 		deleteInstance(hPat);
 	}	else {
 		m_zoneManager.setAllPassable();
+		hierarchyUnrestricted = TRUE;
 	}
 
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
+	if (allowDirectPathOffload)
+	{
+		Bool directMaterializationBegan = FALSE;
+		Path *directPath = tryDirectPathBatchResult(obj, locomotorSet, from, rawTo,
+			isHuman, directMaterializationBegan);
+		if (directPath || directMaterializationBegan)
+			return directPath;
+		Bool ordinaryMaterializationBegan = FALSE;
+		Path *ordinaryPath = tryOrdinaryPathBatchResult(obj, locomotorSet,
+			from, rawTo, isHuman, hierarchyUnrestricted,
+			ordinaryMaterializationBegan);
+		if (ordinaryPath || ordinaryMaterializationBegan)
+			return ordinaryPath;
+		++s_directPathSerialFallbackCount;
+	}
+#else
+	(void)allowDirectPathOffload;
+	(void)hierarchyUnrestricted;
+#endif
+
 	Path *pat = internalFindPath(obj, locomotorSet, from, rawTo);
+	#if !defined(_MSC_VER) || _MSC_VER >= 1300
+	if (pat == nullptr)
+		completeOrdinaryPathShadowComparison(obj, nullptr);
+	#endif
 	if (pat!=nullptr) {
 		return pat;
 	}
@@ -6937,6 +9147,9 @@ Path *Pathfinder::internalFindPath( Object *obj, const LocomotorSet& locomotorSe
 				debugShowSearch(true);
 
 			m_isTunneling = false;
+			#if !defined(_MSC_VER) || _MSC_VER >= 1300
+			completeOrdinaryPathShadowComparison(obj, goalCell);
+			#endif
 			// construct and return path
 			Path *path =  buildActualPath( obj, locomotorSet.getValidSurfaces(), from, goalCell, centerInCell, false );
 #if RETAIL_COMPATIBLE_PATHFINDING
@@ -7902,6 +10115,7 @@ Path *Pathfinder::internal_findHierarchicalPath( Bool isHuman, const LocomotorSu
 	PathfindLayerEnum layer = TheTerrainLogic->getLayerForDestination(from);
 	PathfindCell *parentCell = getClippedCell( layer,&clipFrom );
 	if (!parentCell) {
+		goalCell->releaseInfo();
 		return nullptr;
 	}
 
@@ -8608,7 +10822,7 @@ Bool Pathfinder::slowDoesPathExist( Object *obj,
 	}
 	const LocomotorSet &locoSet = ai->getLocomotorSet();
 	m_ignoreObstacleID = ignoreObject;
-	Path *path = findPath(obj, locoSet, from, to);
+	Path *path = findPath(obj, locoSet, from, to, FALSE);
 	m_ignoreObstacleID = INVALID_ID;
 	Bool found = (path!=nullptr);
 
@@ -10056,6 +12270,7 @@ Bool Pathfinder::isGroundPathPassable( Bool isCrusher, const Coord3D& startWorld
  */
 void Pathfinder::changeBridgeState( PathfindLayerEnum layer, Bool repaired)
 {
+	markNavigationChanged();
 	if (m_layers[layer].isUnused()) return;
 	if (m_layers[layer].setDestroyed(!repaired)) {
 		m_zoneManager.markZonesDirty();
@@ -10148,6 +12363,7 @@ void Pathfinder::updateGoal( Object *obj, const Coord3D *newGoalPos, PathfindLay
 	if (!layerChanged && newCell.x==goalCell.x && newCell.y == goalCell.y) {
 		return;
 	}
+	markNavigationChanged();
 	removeGoal(obj);
 
 	obj->setDestinationLayer(layer);
@@ -10226,6 +12442,7 @@ void Pathfinder::updateAircraftGoal( Object *obj, const Coord3D *newGoalPos)
 		return;
 	}
 
+	markNavigationChanged();
 	ai->setPathfindGoalCell(newCell);
 	Int i,j;
 	ICoord2D cellNdx;
@@ -10272,6 +12489,7 @@ void Pathfinder::removeGoal( Object *obj)
 	if (newCell.x==goalCell.x && newCell.y == goalCell.y) {
 		return;
 	}
+	markNavigationChanged();
 	ICoord2D cellNdx;
 	ai->setPathfindGoalCell(newCell);
 	Int i,j;
@@ -10354,6 +12572,7 @@ void Pathfinder::updatePos( Object *obj, const Coord3D *newPos)
 	{
 		return;
 	}
+	markNavigationChanged();
 
 	PathfindLayerEnum layer = obj->getLayer();
 	Bool doGround=false;
@@ -10428,6 +12647,8 @@ void Pathfinder::removePos( Object *obj)
 	AIUpdateInterface *ai = obj->getAIUpdateInterface();
 	if (!ai) return; // only consider ai objects.
 	ICoord2D curCell = *ai->getCurPathfindCell();
+	if (curCell.x == -1 && curCell.y == -1) return;
+	markNavigationChanged();
 	Bool centerInCell;
 	Int radius;
 	getRadiusAndCenter(obj, radius, centerInCell);
@@ -10609,7 +12830,7 @@ Path *Pathfinder::getMoveAwayFromPath(Object* obj, Object *otherObj,
 	Coord3D startPos = *obj->getPosition();
 	if (!centerInCell) {
 		startPos.x += PATHFIND_CELL_SIZE_F*0.5f;
-		startPos.x += PATHFIND_CELL_SIZE_F*0.5f;
+		startPos.y += PATHFIND_CELL_SIZE_F*0.5f;
 	}
 	worldToCell(&startPos, &startCellNdx);
 	PathfindCell *parentCell = getClippedCell( obj->getLayer(), obj->getPosition() );
@@ -10800,7 +13021,7 @@ Path *Pathfinder::patchPath( const Object *obj, const LocomotorSet& locomotorSet
 	Coord3D startPos = *obj->getPosition();
 	if (!centerInCell) {
 		startPos.x += PATHFIND_CELL_SIZE_F*0.5f;
-		startPos.x += PATHFIND_CELL_SIZE_F*0.5f;
+		startPos.y += PATHFIND_CELL_SIZE_F*0.5f;
 	}
 	worldToCell(&startPos, &startCellNdx);
 	//worldToCell(obj->getPosition(), &startCellNdx);
@@ -10901,10 +13122,24 @@ Path *Pathfinder::patchPath( const Object *obj, const LocomotorSet& locomotorSet
 	PathfindCell *candidateGoal;
 	candidateGoal = getCell(LAYER_GROUND, &goalPos); // just using for cost estimates.
 	ICoord2D goalCellNdx;
-	worldToCell(&goalPos, &goalCellNdx);
+	if (!candidateGoal || worldToCell(&goalPos, &goalCellNdx)) {
+#if RETAIL_COMPATIBLE_PATHFINDING
+		if (!s_useFixedPathfinding) {
+			cleanOpenAndClosedLists();
+		}
+		else
+#endif
+		{
+			parentCell->releaseInfo();
+		}
+		return nullptr;
+	}
 	if (!candidateGoal->allocateInfo(goalCellNdx)) {
 #if RETAIL_COMPATIBLE_PATHFINDING
-		if (s_useFixedPathfinding)
+		if (!s_useFixedPathfinding) {
+			cleanOpenAndClosedLists();
+		}
+		else
 #endif
 		{
 			parentCell->releaseInfo();
@@ -11105,10 +13340,13 @@ Path *Pathfinder::findAttackPath( const Object *obj, const LocomotorSet& locomot
 
 	// determine goal cell
 	PathfindCell *goalCell = getCell( LAYER_GROUND, victimCellNdx.x, victimCellNdx.y );
-	if (!goalCell)
+	if (!goalCell) {
+		parentCell->releaseInfo();
 		return nullptr;
+	}
 
- 	if (!goalCell->allocateInfo(victimCellNdx)) {
+	if (!goalCell->allocateInfo(victimCellNdx)) {
+		parentCell->releaseInfo();
 		return nullptr;
 	}
 

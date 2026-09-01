@@ -36,10 +36,83 @@
 #include "GameLogic/GameLogic.h"
 
 class Bridge;
+class AIUpdateInterface;
 class Object;
 class Weapon;
 class PathfindZoneManager;
 class PathfindCell;
+
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
+namespace rts { struct DirectPathCellFact; }
+struct DirectPathQueueBatchContext;
+struct DirectPathQueueBatchEntry;
+struct OrdinaryPathQueueBatchContext;
+struct OrdinaryPathQueueBatchEntry;
+#endif
+
+// Owner-side diagnostics only.  These counters are never serialized or added
+// to CRC state and distinguish bounded direct-path work from global scheduler,
+// AI-planning, and collision activity.
+struct DirectPathRuntimeMetrics
+{
+	// Incremented whenever Pathfinder::reset starts a new diagnostics epoch.
+	// A lifecycle consumer must freeze the last same-epoch sample rather than
+	// replacing it with the zeroed counters from a later epoch.
+	UnsignedInt resetEpoch;
+	UnsignedInt eligibleRequests;
+	UnsignedInt submittedJobs;
+	UnsignedInt executedJobs;
+	UnsignedInt workerExecutedJobs;
+	UnsignedInt ownerHelpedJobs;
+	UnsignedInt authoritativeCommits;
+	UnsignedInt authoritativeMultiWorkerCommits;
+	UnsignedInt staleRejections;
+	UnsignedInt validationFailures;
+	UnsignedInt serialFallbacks;
+	UnsignedInt unsupportedAuthoritativeCommits;
+	UnsignedInt shadowAuthoritativeCommits;
+	UnsignedInt staleAuthoritativeCommits;
+	UnsignedInt malformedAuthoritativeCommits;
+	UnsignedInt shadowOnlyExecutions;
+	UnsignedInt timeoutCancellations;
+	UnsignedInt lateDrainExecutions;
+	UnsignedInt peakActiveWorkers;
+	UnsignedInt minimumCallbackCount;
+	UnsignedInt maximumCallbackCount;
+};
+
+DirectPathRuntimeMetrics GetDirectPathRuntimeMetrics();
+void ResetDirectPathRuntimeMetrics();
+
+struct OrdinaryPathRuntimeMetrics
+{
+	UnsignedInt resetEpoch;
+	UnsignedInt eligibleRequests;
+	UnsignedInt submittedRequests;
+	UnsignedInt submittedRangeJobs;
+	UnsignedInt workerExecutedRequests;
+	UnsignedInt workerExecutedRangeJobs;
+	UnsignedInt ownerHelpedRangeJobs;
+	UnsignedInt failedRangeJobs;
+	UnsignedInt physicalWorkerMask;
+	UnsignedInt distinctPhysicalWorkers;
+	UnsignedInt authoritativeCommits;
+	UnsignedInt authoritativeMultiWorkerCommits;
+	UnsignedInt staleRejections;
+	UnsignedInt validationFailures;
+	UnsignedInt serialFallbacks;
+	UnsignedInt shadowComparisons;
+	UnsignedInt shadowMismatches;
+	UnsignedInt timeoutCancellations;
+	UnsignedInt lateDrainExecutions;
+	UnsignedInt peakActiveWorkers;
+	UnsignedInt maximumBatchRequests;
+	UnsignedInt maximumRangeCount;
+	UnsignedInt maximumGrainSize;
+};
+
+OrdinaryPathRuntimeMetrics GetOrdinaryPathRuntimeMetrics();
+void ResetOrdinaryPathRuntimeMetrics();
 
 // How close is close enough when moving.
 
@@ -215,6 +288,7 @@ public:
 	static void allocateCellInfos();
 	static void releaseCellInfos();
 	static Bool hasCellInfos() { return s_infoArray != nullptr; }
+	static UnsignedInt countFreeCellInfos();
 
 	static PathfindCellInfo * getACellInfo(PathfindCell *cell, const ICoord2D &pos);
 	static void releaseACellInfo(PathfindCellInfo *theInfo);
@@ -222,6 +296,7 @@ public:
 protected:
 	static PathfindCellInfo *s_infoArray;
 	static PathfindCellInfo *s_firstFree;							///<
+	static UnsignedInt s_freeCount;
 
 
 	PathfindCellInfo *m_nextOpen, *m_prevOpen;						///< for A* "open" list, shared by closed list
@@ -492,7 +567,18 @@ private:
 #define PATHFIND_CELL_SIZE		10
 #define PATHFIND_CELL_SIZE_F	10.0f
 
-enum { PATHFIND_QUEUE_LEN=512};
+enum
+{
+	PATHFIND_QUEUE_LEN = 512,
+	PATHFIND_QUEUE_MEMBERSHIP_LEN = 1024,
+	PATHFIND_QUEUE_MEMBERSHIP_EMPTY = -1
+};
+
+struct PathfindRequestMembershipEntry
+{
+	ObjectID objectID;
+	Int queueSlot;
+};
 
 struct TCheckMovementInfo;
 
@@ -613,7 +699,7 @@ private:
 class PathfindServicesInterface {
 public:
 	virtual Path *findPath( Object *obj, const LocomotorSet& locomotorSet, const Coord3D *from,
-		const Coord3D *to )=0;	///< Find a short, valid path between given locations
+		const Coord3D *to, Bool allowDirectPathOffload )=0;	///< Find a short, valid path between given locations
 	/** Find a short, valid path to a location NEAR the to location.
 		This succeeds when the destination is unreachable (like inside a building).
 		If the destination is unreachable, it will adjust the to point.  */
@@ -642,7 +728,8 @@ class Pathfinder : PathfindServicesInterface, public Snapshot
 {
 // The following routines are private, but available through the doPathfind callback to aiInterface. jba.
 private:
-	virtual Path *findPath( Object *obj, const LocomotorSet& locomotorSet, const Coord3D *from, const Coord3D *to) override;	///< Find a short, valid path between given locations
+	virtual Path *findPath( Object *obj, const LocomotorSet& locomotorSet, const Coord3D *from,
+		const Coord3D *to, Bool allowDirectPathOffload) override;	///< Find a short, valid path between given locations
 	/** Find a short, valid path to a location NEAR the to location.
 		This succeeds when the destination is unreachable (like inside a building).
 		If the destination is unreachable, it will adjust the to point.  */
@@ -814,7 +901,8 @@ protected:
 	Int examineNeighboringCells(PathfindCell *parentCell, PathfindCell *goalCell,
 										const LocomotorSet& locomotorSet, Bool isHumanPlayer,
 										Bool centerInCell, Int radius, const ICoord2D &startCellNdx,
-										const Object *obj, Int attackDistance);
+										const Object *obj, Int attackDistance,
+										Bool skipDirectLine = FALSE);
 
 	Int checkPathCost(Object *obj, const LocomotorSet& locomotorSet, const Coord3D *from,
 		const Coord3D *to);
@@ -878,6 +966,37 @@ protected:
 
 	bool checkCellOutsideExtents(ICoord2D& cell);
 
+	Int findPathfindRequestMembership(ObjectID id) const;
+	Int findPathfindRequestMembershipInsertSlot(ObjectID id) const;
+	void erasePathfindRequestMembership(ObjectID id, Int queueSlot);
+	void resetPathfindRequestTracking();
+	void markNavigationChanged();
+	#if !defined(_MSC_VER) || _MSC_VER >= 1300
+	void captureDirectPathCellFact(Object *obj,
+		const LocomotorSet& locomotorSet, Int requiredZone, Int radius,
+		Bool centerInCell, Bool isHuman, Bool useCurrentHierarchyPassability,
+		Int x, Int y, rts::DirectPathCellFact &fact);
+	Bool captureDirectPathBatchEntry(Object *obj, AIUpdateInterface *ai,
+		const Coord3D *from, const Coord3D *rawTo, Int queueOrder,
+		DirectPathQueueBatchEntry &entry);
+	Path *tryDirectPathBatchResult(Object *obj,
+		const LocomotorSet& locomotorSet,
+		const Coord3D *from, const Coord3D *rawTo, Bool isHuman,
+		Bool &materializationBegan);
+	Bool captureOrdinaryNavigationSnapshot(
+		OrdinaryPathQueueBatchContext &context);
+	Bool captureOrdinaryPathBatchEntry(Object *obj, AIUpdateInterface *ai,
+		const Coord3D *from, const Coord3D *rawTo, Int queueOrder,
+		OrdinaryPathQueueBatchEntry &entry,
+		const OrdinaryPathQueueBatchContext &context);
+	Path *tryOrdinaryPathBatchResult(Object *obj,
+		const LocomotorSet& locomotorSet, const Coord3D *from,
+		const Coord3D *rawTo, Bool isHuman, Bool hierarchyUnrestricted,
+		Bool &materializationBegan);
+	void completeOrdinaryPathShadowComparison(Object *obj,
+		PathfindCell *serialGoalCell);
+	#endif
+
 #if defined(RTS_DEBUG)
 	void doDebugIcons() ;
 #endif
@@ -915,9 +1034,18 @@ private:
 
 	// Pathfind queue
 	ObjectID			m_queuedPathfindRequests[PATHFIND_QUEUE_LEN];
+	// Membership is only an index into the authoritative replay-ordered ring.
+	PathfindRequestMembershipEntry m_pathfindRequestMembership[PATHFIND_QUEUE_MEMBERSHIP_LEN];
 	Int						m_queuePRHead;
 	Int						m_queuePRTail;
 	Int						m_cumulativeCellsAllocated;
+	UnsignedInt		m_navigationRevision;
+	UnsignedInt		m_directPathRequestToken;
+	UnsignedInt		m_ordinaryPathRequestToken;
+	#if !defined(_MSC_VER) || _MSC_VER >= 1300
+	DirectPathQueueBatchContext *m_directPathBatchContext;
+	OrdinaryPathQueueBatchContext *m_ordinaryPathBatchContext;
+	#endif
 
 #if RTS_ZEROHOUR && RETAIL_COMPATIBLE_CRC
 public:
