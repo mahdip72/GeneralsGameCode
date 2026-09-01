@@ -561,6 +561,71 @@ private:
 	unsigned *m_physicalWorkerIndex;
 };
 
+class BlockingExecutionIdentityJob : public rts::Job
+{
+public:
+	BlockingExecutionIdentityJob(Gate *gate, bool *physicalWorker,
+		unsigned *physicalWorkerIndex, std::thread::id *threadId)
+		: m_gate(gate), m_physicalWorker(physicalWorker),
+		  m_physicalWorkerIndex(physicalWorkerIndex), m_threadId(threadId) {}
+
+	virtual void execute(rts::JobContext &context)
+	{
+		*m_physicalWorker = context.isPhysicalWorkerExecution();
+		*m_physicalWorkerIndex = context.physicalWorkerIndex();
+		*m_threadId = std::this_thread::get_id();
+		m_gate->waitUntilOpen();
+	}
+
+private:
+	Gate *m_gate;
+	bool *m_physicalWorker;
+	unsigned *m_physicalWorkerIndex;
+	std::thread::id *m_threadId;
+};
+
+bool runPhysicalWorkerIdentityWave(rts::JobSystem &system,
+	bool physicalWorkers[4], unsigned physicalWorkerIndices[4],
+	std::thread::id threadIds[4])
+{
+	Gate gates[4];
+	rts::JobHandle handles[4];
+	rts::JobGroup group = system.createGroup();
+	bool submitted = true;
+	bool anySubmitted = false;
+	bool entered = true;
+	unsigned index;
+
+	for (index = 0; index != 4; ++index)
+	{
+		physicalWorkers[index] = false;
+		physicalWorkerIndices[index] = rts::JOB_INVALID_PHYSICAL_WORKER_INDEX;
+		threadIds[index] = std::thread::id();
+		rts::Job *job = new BlockingExecutionIdentityJob(&gates[index],
+			&physicalWorkers[index], &physicalWorkerIndices[index],
+			&threadIds[index]);
+		handles[index] = system.trySubmit(job, rts::JOB_PRIORITY_NORMAL, group);
+		if (!handles[index].isValid())
+		{
+			delete job;
+			submitted = false;
+		}
+		else
+		{
+			anySubmitted = true;
+		}
+	}
+
+	if (submitted)
+	{
+		for (index = 0; index != 4; ++index)
+			entered = gates[index].waitForEntry() && entered;
+	}
+	for (index = 0; index != 4; ++index) gates[index].open();
+	if (anySubmitted) entered = system.wait(group) && entered;
+	return submitted && entered;
+}
+
 int testExecutionScopedPhysicalWorkerIdentity()
 {
 	int result = 0;
@@ -628,6 +693,62 @@ int testExecutionScopedPhysicalWorkerIdentity()
 		blocker.open();
 		result |= check(system.wait(blockerGroup),
 			"held physical worker drains after identity probe");
+	}
+	system.shutdown();
+
+	config.workerCount = 4;
+	config.queueCapacity = 32;
+	const bool multiWorkerStarted = system.start(config);
+	result |= check(multiWorkerStarted && system.workerCount() == 4,
+		"multi-worker identity fixture starts four physical workers");
+	if (multiWorkerStarted && system.workerCount() == 4)
+	{
+		bool firstPhysical[4];
+		bool secondPhysical[4];
+		unsigned firstIndices[4];
+		unsigned secondIndices[4];
+		std::thread::id firstThreads[4];
+		std::thread::id secondThreads[4];
+		const bool firstWave = runPhysicalWorkerIdentityWave(system,
+			firstPhysical, firstIndices, firstThreads);
+		const bool secondWave = runPhysicalWorkerIdentityWave(system,
+			secondPhysical, secondIndices, secondThreads);
+		result |= check(firstWave && secondWave,
+			"all physical workers execute both identity waves without owner help");
+
+		bool validRange = firstWave && secondWave;
+		bool distinct = firstWave && secondWave;
+		bool stableByThread = firstWave && secondWave;
+		for (unsigned first = 0; first != 4; ++first)
+		{
+			validRange = validRange && firstPhysical[first] &&
+				secondPhysical[first] && firstIndices[first] < 4 &&
+				secondIndices[first] < 4;
+			for (unsigned other = first + 1; other != 4; ++other)
+			{
+				distinct = distinct && firstIndices[first] != firstIndices[other] &&
+					secondIndices[first] != secondIndices[other];
+			}
+
+			bool foundThread = false;
+			for (unsigned second = 0; second != 4; ++second)
+			{
+				if (firstThreads[first] == secondThreads[second])
+				{
+					foundThread = true;
+					stableByThread = stableByThread &&
+						firstIndices[first] == secondIndices[second];
+					break;
+				}
+			}
+			stableByThread = stableByThread && foundThread;
+		}
+		result |= check(validRange,
+			"physical worker indices remain within the configured worker range");
+		result |= check(distinct,
+			"simultaneously occupied physical workers expose distinct indices");
+		result |= check(stableByThread,
+			"each physical scheduler thread retains its index across jobs");
 	}
 	system.shutdown();
 	return result;
