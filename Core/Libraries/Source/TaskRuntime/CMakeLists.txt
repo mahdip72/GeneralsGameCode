@@ -3,6 +3,9 @@ add_library(core_task_runtime STATIC)
 target_sources(core_task_runtime PRIVATE
     TaskRuntime.cpp
     PipelineExecutionPolicy.cpp
+    SimulationExecutionPolicy.cpp
+    SimulationCommandBuffer.cpp
+    SimulationReadView.cpp
     SimulationPhaseGraph.cpp
     DeterministicCrcStream.cpp
     ImmutableSpatialQuery.cpp
@@ -22,6 +25,11 @@ target_sources(core_task_runtime PRIVATE
 
 if(NOT IS_VS6_BUILD)
     target_sources(core_task_runtime PRIVATE
+        ImmutableSpatialQueryRuntime.cpp
+        CounterBasedRng.cpp
+        DeterministicAIPlanning.cpp
+        DeterministicPathSearch.cpp
+        DeterministicPathBatch.cpp
         JobSystem.cpp
         ResourceIoPipeline.cpp
         ModelAssetBytes.cpp

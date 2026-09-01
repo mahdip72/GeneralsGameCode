@@ -21,6 +21,7 @@ set(GAMEENGINE_SRC
 #    Include/Common/BuildAssistant.h
 #    Include/Common/ClientUpdateModule.h
     Include/Common/CommandLine.h
+    Include/GameLogic/ImmutableSpatialQueryRuntime.h
     Include/Common/SkirmishAITestRunner.h
     Include/Common/crc.h
     Include/Common/CRCDebug.h
@@ -1104,6 +1105,7 @@ set(GAMEENGINE_SRC
     Source/GameLogic/System/Damage.cpp
 #    Source/GameLogic/System/GameLogic.cpp
     Source/GameLogic/System/GameLogicDispatch.cpp
+    Source/GameLogic/System/ImmutableSpatialQueryRuntime.cpp
     Source/GameLogic/System/RankInfo.cpp
     Source/GameNetwork/Connection.cpp
     Source/GameNetwork/ConnectionManager.cpp
