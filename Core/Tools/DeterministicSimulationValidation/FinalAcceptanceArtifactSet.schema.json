@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://generalsgamecode.invalid/schemas/stage5-final-artifact-set.json",
+  "title": "GeneralsGameCode Stage 5 final artifact set",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "sourceCommit", "productSet", "architecture", "artifacts"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "productSet": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "uniqueItems": true,
+      "items": { "enum": ["Generals", "ZeroHour"] }
+    },
+    "architecture": { "const": "x64" },
+    "artifacts": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["role", "path", "sha256"],
+        "properties": {
+          "role": {
+            "enum": [
+              "generals-executable", "generals-launcher", "generals-launcher-config",
+              "zerohour-executable", "zerohour-launcher", "zerohour-launcher-config"
+            ]
+          },
+          "path": { "type": "string", "minLength": 1 },
+          "sha256": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "PerformanceScalingEvidence.schema.json",
+  "title": "Stage 5 physical-core scaling acceptance evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "evidenceKind", "status", "sourceCommit", "artifactSetSha256", "title", "executableSha256", "stage3BaselineSha256", "measurementMode", "installedRuntime", "topology", "selectedLanes", "oneWorkerPhases", "amdahl", "kernelTimings", "fixtures"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "evidenceKind": { "const": "stage5-performance-scaling" },
+    "status": { "const": "passed" },
+    "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "artifactSetSha256": { "$ref": "#/$defs/sha256" },
+    "title": { "const": "ZeroHour" },
+    "executableSha256": { "$ref": "#/$defs/sha256" },
+    "stage3BaselineSha256": { "$ref": "#/$defs/sha256" },
+    "measurementMode": { "const": "headless-throughput" },
+    "installedRuntime": { "const": true },
+    "topology": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source", "topologySha256", "physicalCoreCount", "logicalProcessorCount"],
+      "properties": {
+        "source": { "const": "GetSystemCpuSetInformation" },
+        "topologySha256": { "$ref": "#/$defs/sha256" },
+        "physicalCoreCount": { "type": "integer", "minimum": 16 },
+        "logicalProcessorCount": { "type": "integer", "minimum": 16 }
+      }
+    },
+    "selectedLanes": { "type": "array", "minItems": 3, "maxItems": 3, "items": { "$ref": "#/$defs/lane" } },
+    "oneWorkerPhases": { "type": "array", "minItems": 7, "maxItems": 7, "items": { "$ref": "#/$defs/phase" } },
+    "amdahl": {
+      "type": "object", "additionalProperties": false,
+      "required": ["totalOneWorkerMilliseconds", "totalSerialMilliseconds", "serialFraction", "maximumSpeedup", "reachesTwoX"],
+      "properties": {
+        "totalOneWorkerMilliseconds": { "type": "number", "exclusiveMinimum": 0 },
+        "totalSerialMilliseconds": { "type": "number", "minimum": 0 },
+        "serialFraction": { "type": "number", "minimum": 0, "maximum": 0.5 },
+        "maximumSpeedup": { "type": "number", "minimum": 2 },
+        "reachesTwoX": { "const": true }
+      }
+    },
+    "kernelTimings": { "type": "array", "minItems": 6, "maxItems": 6, "items": { "$ref": "#/$defs/kernel" } },
+    "fixtures": { "type": "array", "minItems": 4, "maxItems": 4, "items": { "$ref": "#/$defs/fixture" } }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9A-F]{64}$" },
+    "lane": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "requestedWorkers", "selectedLogicalProcessors", "selectedDistinctPhysicalCores", "selectedPhysicalCoreMask"],
+      "properties": {
+        "name": { "enum": ["forced-one", "physical-8", "physical-16"] },
+        "requestedWorkers": { "enum": [1, 8, 16] },
+        "selectedLogicalProcessors": { "enum": [1, 8, 16] },
+        "selectedDistinctPhysicalCores": { "enum": [1, 8, 16] },
+        "selectedPhysicalCoreMask": { "type": "string", "pattern": "^[0-9A-F]{16}$" }
+      }
+    },
+    "phase": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "elapsedMilliseconds", "serialMilliseconds"],
+      "properties": {
+        "name": { "enum": ["owner-intake", "world-queries", "pathfinding", "object-computation", "spatial-work", "deterministic-commit", "verification-publication"] },
+        "elapsedMilliseconds": { "type": "number", "exclusiveMinimum": 0 },
+        "serialMilliseconds": { "type": "number", "minimum": 0 }
+      }
+    },
+    "kernel": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "admittedSlices", "captureMilliseconds", "scheduleMilliseconds", "waitMilliseconds", "validateMilliseconds", "commitMilliseconds", "totalParallelMilliseconds", "exactSerialOperationMilliseconds", "netSpeedup"],
+      "properties": {
+        "name": { "enum": ["physics", "status", "collision", "ai-planning", "spatial", "path"] },
+        "admittedSlices": { "type": "integer", "minimum": 1 },
+        "captureMilliseconds": { "type": "number", "minimum": 0 },
+        "scheduleMilliseconds": { "type": "number", "minimum": 0 },
+        "waitMilliseconds": { "type": "number", "minimum": 0 },
+        "validateMilliseconds": { "type": "number", "minimum": 0 },
+        "commitMilliseconds": { "type": "number", "minimum": 0 },
+        "totalParallelMilliseconds": { "type": "number", "exclusiveMinimum": 0 },
+        "exactSerialOperationMilliseconds": { "type": "number", "exclusiveMinimum": 0 },
+        "netSpeedup": { "type": "number", "exclusiveMinimum": 1 }
+      }
+    },
+    "fixture": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "playerCount", "peakUnitCount", "repeats", "stage3OneWorkerMilliseconds", "stage5OneWorkerMilliseconds", "eightPhysicalCoreMilliseconds", "sixteenPhysicalCoreMilliseconds", "oneWorkerRegressionRatio", "eightPhysicalCoreSpeedup", "eightToSixteenSpeedup"],
+      "properties": {
+        "name": { "enum": ["one-thousand-units", "four-thousand-units", "eight-thousand-units", "dense-eight-player"] },
+        "playerCount": { "const": 8 },
+        "peakUnitCount": { "type": "integer", "minimum": 1000 },
+        "repeats": { "type": "integer", "minimum": 3 },
+        "stage3OneWorkerMilliseconds": { "type": "number", "exclusiveMinimum": 0 },
+        "stage5OneWorkerMilliseconds": { "type": "number", "exclusiveMinimum": 0 },
+        "eightPhysicalCoreMilliseconds": { "type": "number", "exclusiveMinimum": 0 },
+        "sixteenPhysicalCoreMilliseconds": { "type": "number", "exclusiveMinimum": 0 },
+        "oneWorkerRegressionRatio": { "type": "number", "exclusiveMinimum": 0, "maximum": 1.05 },
+        "eightPhysicalCoreSpeedup": { "type": "number", "minimum": 2 },
+        "eightToSixteenSpeedup": { "type": "number", "exclusiveMinimum": 1 }
+      }
+    }
+  }
+}

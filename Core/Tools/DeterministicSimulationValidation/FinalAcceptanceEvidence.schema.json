@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://generalsgamecode.invalid/schemas/stage5-final-evidence.json",
+  "title": "GeneralsGameCode Stage 5 final acceptance evidence envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion", "evidenceKind", "status", "sourceCommit", "title",
+    "architecture", "artifactSetSha256", "recordedUtc", "attachments", "details"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "evidenceKind": {
+      "enum": [
+        "deterministic-runtime", "replay-determinism", "fresh-ai",
+        "performance-scaling", "mixed-worker-multiplayer",
+        "combined-stage4-stage5-installed-runtime", "premium-review", "manual-acceptance"
+      ]
+    },
+    "status": { "const": "passed" },
+    "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "title": { "enum": ["Generals", "ZeroHour", "Both"] },
+    "architecture": { "const": "x64" },
+    "artifactSetSha256": { "type": "string", "pattern": "^[0-9A-F]{64}$" },
+    "recordedUtc": { "type": "string", "format": "date-time" },
+    "attachments": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["role", "path", "sha256"],
+        "properties": {
+          "role": { "type": "string", "minLength": 1 },
+          "path": { "type": "string", "minLength": 1 },
+          "sha256": { "type": "string", "pattern": "^[0-9A-F]{64}$" }
+        }
+      }
+    },
+    "details": { "type": "object" }
+  }
+}
