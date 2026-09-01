@@ -10,6 +10,9 @@ target_sources(core_task_runtime PRIVATE
     SimulationPhaseGraph.cpp
     SimulationPhaseGraphOwnerAdapter.cpp
     DeterministicCrcStream.cpp
+    DeterministicCrcRuntimeAdapter.cpp
+    DeterministicCrcSnapshot.cpp
+    DeterministicCrcJobSystemAdapter.cpp
     PhysicsIntegrationKernel.cpp
     ObjectStatusTimerKernel.cpp
     ImmutableSpatialQuery.cpp

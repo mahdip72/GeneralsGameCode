@@ -65,6 +65,8 @@ void ReferenceLegacyEvent(uint32_t *state, const uint8_t *bytes,
 	size_t index = 0U;
 	while (byteCount - index >= 4U)
 	{
+		// XferCRC reads a native little-endian uint32, but addCRC applies
+		// htobe() before mixing. This reference models that internal swap.
 		const uint32_t value =
 			(static_cast<uint32_t>(bytes[index + 0U]) << 24U) |
 			(static_cast<uint32_t>(bytes[index + 1U]) << 16U) |

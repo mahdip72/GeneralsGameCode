@@ -392,6 +392,8 @@ bool DeterministicCrcPartitionCapture::writeXferEvent(
 		{
 			DeterministicLegacyXferOperation &operation =
 				m_legacyStorage[m_result->legacyOperationCount++];
+			// XferCRC loads a native little-endian word, then addCRC applies
+			// htobe() before mixing it. Store that post-swap value directly.
 			operation.value =
 				(static_cast<uint32_t>(bytes[sourceIndex + 0U]) << 24U) |
 				(static_cast<uint32_t>(bytes[sourceIndex + 1U]) << 16U) |
