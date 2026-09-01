@@ -295,6 +295,9 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD)
     target_link_libraries(core_ww3d2_native PUBLIC
         core_renderer
     )
+    target_link_libraries(corei_ww3d2 INTERFACE
+        core_ww3d2_native
+    )
     set_target_properties(core_ww3d2_native PROPERTIES
         CXX_STANDARD 20
         CXX_STANDARD_REQUIRED YES

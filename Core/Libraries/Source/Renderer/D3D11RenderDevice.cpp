@@ -1548,7 +1548,19 @@ public:
 		size_t byteCount, size_t destinationOffset,
 		RenderBufferUpdateMode mode)
 	{
-		if (!isOwner() || !m_frameOpen || data == 0 || byteCount == 0 ||
+		if (!m_frameOpen)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		return updateBufferResource(buffer, data, byteCount,
+			destinationOffset, mode);
+	}
+
+	virtual RenderResult updateBufferResource(GpuHandle buffer,
+		const void *data, size_t byteCount, size_t destinationOffset,
+		RenderBufferUpdateMode mode)
+	{
+		if (!isOwner() || data == 0 || byteCount == 0 ||
 			!m_handles->isLive(buffer))
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;

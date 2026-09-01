@@ -3,6 +3,8 @@
 
 #include "Renderer/RendererDevice.h"
 
+class NativeW3D2;
+
 namespace rts
 {
 namespace render
@@ -62,7 +64,9 @@ public:
 		const NativeW3DRendererDescriptor &descriptor);
 	// The facade and its immediate context are render-owner objects.  Shutdown,
 	// recovery, resize, and submission reject calls from another thread rather
-	// than releasing backend state from an arbitrary caller.
+	// than releasing backend state from an arbitrary caller. In borrowed mode,
+	// Shutdown releases only this facade's state reference; it never shuts down
+	// or detaches the borrowed device/context.
 	RenderResult Shutdown();
 	RenderResult BeginFrame();
 	RenderResult SetViewport(const RenderViewport &viewport);
@@ -79,13 +83,18 @@ public:
 private:
 	friend class NativeW3DResources;
 	friend class NativeW3DRecoveryTestAccess;
+	friend class ::NativeW3D2;
 	NativeW3DRenderer(const NativeW3DRenderer &);
 	NativeW3DRenderer &operator=(const NativeW3DRenderer &);
 
 	NativeW3DRenderState *m_state;
 	bool m_frameOpen;
+	bool m_ownsBackend;
+	bool m_borrowedMode;
 
 	bool IsOwnerThread() const;
+	RenderResult AttachBorrowedState(NativeW3DRenderState *state);
+	RenderResult DetachBorrowedState();
 	static RenderResult DrainFailedRecoveryCleanup(
 		NativeW3DRenderState *state, unsigned int *drained);
 };

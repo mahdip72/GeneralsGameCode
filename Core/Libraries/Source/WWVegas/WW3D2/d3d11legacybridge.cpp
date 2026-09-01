@@ -6,6 +6,7 @@
 #include "dx8fvf.h"
 #include "dx8indexbuffer.h"
 #include "dx8vertexbuffer.h"
+#include "nativew3d2.h"
 #include "surfaceblit.h"
 #include "Renderer/LegacyBridgeCache.h"
 #include "Renderer/LegacyBridgeValidation.h"
@@ -296,7 +297,7 @@ struct D3D11LegacyBridge::Impl
 		GpuHandle handle;
 	};
 
-	Impl() : device(0), context(0), legacy_device(0), frame_open(false),
+	Impl() : native_w3d(0), device(0), context(0), legacy_device(0), frame_open(false),
 		log_file(0), frame_id(0), display_epoch(1), draw_count(0),
 		draw_failure_count(0),
 		raw_indexed_draw_count(0),
@@ -328,6 +329,7 @@ struct D3D11LegacyBridge::Impl
 #endif
 	}
 
+	NativeW3D2 *native_w3d;
 	IRenderDevice *device;
 	IRenderContext *context;
 	IDirect3DDevice8 *legacy_device;
@@ -403,6 +405,18 @@ struct D3D11LegacyBridge::Impl
 		rts::render::ThreadedRenderFrameCompletion completed;
 		while (rts::render::PollThreadedRenderCompletion(device, &completed))
 		{
+			if (native_w3d != 0 && native_w3d->IsAttachedToBorrowedBackend())
+			{
+				const RenderResult publication =
+					native_w3d->PublishThreadedCompletion(completed.sequence,
+						completed.resourceFailure);
+				if (publication != rts::render::RENDER_RESULT_OK)
+				{
+					async_resource_failure = true;
+					Log_Result("D3D11 native resource completion publication failed",
+						publication);
+				}
+			}
 			async_resource_failure = async_resource_failure || completed.resourceFailure;
 			for (unsigned int i = 0; i < ASYNC_FRAME_CAPACITY; ++i)
 			{
@@ -813,6 +827,16 @@ struct D3D11LegacyBridge::Impl
 		{
 			target_transition_failed = true;
 			return rts::render::RENDER_RESULT_FAILED;
+		}
+		if (native_w3d != 0 && native_w3d->IsAttachedToBorrowedBackend())
+		{
+			const RenderResult replace_result =
+				native_w3d->ReplaceBackendContext(context);
+			if (replace_result != rts::render::RENDER_RESULT_OK)
+			{
+				target_transition_failed = true;
+				return replace_result;
+			}
 		}
 		// Recovery recreates the swap-chain target.  Reapply the target that was
 		// active before recovery at the next Begin_Frame; logical GPU handles are
@@ -2899,6 +2923,22 @@ bool D3D11LegacyBridge::Initialize(HWND window,
 		Shutdown();
 		return false;
 	}
+	m_impl->native_w3d = new(std::nothrow) NativeW3D2;
+	if (m_impl->native_w3d == 0)
+	{
+		m_impl->Log("D3D11 native WW3D resource host allocation failed");
+		Shutdown();
+		return false;
+	}
+	const RenderResult attach_result = m_impl->native_w3d->AttachBackend(
+		m_impl->device, m_impl->context);
+	if (attach_result != rts::render::RENDER_RESULT_OK)
+	{
+		m_impl->Log_Result("D3D11 native WW3D resource host attachment failed",
+			attach_result);
+		Shutdown();
+		return false;
+	}
 	return true;
 }
 
@@ -2915,6 +2955,12 @@ void D3D11LegacyBridge::Shutdown()
 			m_impl->Require_Owner_Thread("failed initialization shutdown");
 		}
 		m_impl->capture_queue.shutdown(rts::render::RENDER_RESULT_FAILED);
+		if (m_impl->native_w3d != 0)
+		{
+			m_impl->native_w3d->Shutdown();
+			delete m_impl->native_w3d;
+			m_impl->native_w3d = 0;
+		}
 		if (m_impl->log_file != 0)
 		{
 			fclose(m_impl->log_file);
@@ -3020,6 +3066,17 @@ void D3D11LegacyBridge::Shutdown()
 #if defined(_WIN64)
 	m_impl->Fence_Render();
 #endif
+	const RenderResult native_shutdown_result = m_impl->native_w3d == 0 ?
+		rts::render::RENDER_RESULT_OK : m_impl->native_w3d->Shutdown();
+	if (native_shutdown_result != rts::render::RENDER_RESULT_OK)
+	{
+		m_impl->Log_Result(
+			"D3D11 native WW3D resources blocked backend shutdown",
+			native_shutdown_result);
+		return;
+	}
+	delete m_impl->native_w3d;
+	m_impl->native_w3d = 0;
 	if (m_impl->log_file != 0)
 	{
 		fclose(m_impl->log_file);
@@ -3122,6 +3179,17 @@ bool D3D11LegacyBridge::Begin_Frame()
 #endif
 	if (!Is_Active() || m_impl->frame_open)
 	{
+		return false;
+	}
+	unsigned int drained_cleanup = 0;
+	const RenderResult cleanup_result = m_impl->native_w3d == 0 ?
+		rts::render::RENDER_RESULT_INVALID_ARGUMENT :
+		m_impl->native_w3d->DrainResourceCleanup(0, &drained_cleanup);
+	if (cleanup_result != rts::render::RENDER_RESULT_OK)
+	{
+		m_impl->Log_Result(
+			"D3D11 native WW3D deferred resource cleanup failed",
+			cleanup_result);
 		return false;
 	}
 	++m_impl->frame_id;
@@ -4634,6 +4702,28 @@ RenderResult D3D11LegacyBridge::Resize(unsigned int width, unsigned int height)
 		}
 	}
 	else if (width != 0 && height != 0)
+	{
+		IRenderContext *resized_context = m_impl->device->immediateContext();
+		if (resized_context == 0)
+		{
+			result = rts::render::RENDER_RESULT_FAILED;
+			m_impl->Log("D3D11 immediate context is unavailable after resize");
+		}
+		else
+		{
+			m_impl->context = resized_context;
+			result = m_impl->native_w3d == 0 ?
+				rts::render::RENDER_RESULT_INVALID_ARGUMENT :
+				m_impl->native_w3d->ReplaceBackendContext(resized_context);
+			if (result != rts::render::RENDER_RESULT_OK)
+			{
+				m_impl->Log_Result(
+					"D3D11 native WW3D context replacement failed after resize",
+					result);
+			}
+		}
+	}
+	if (result == rts::render::RENDER_RESULT_OK && width != 0 && height != 0)
 	{
 		// D3D11RenderDevice deliberately treats a minimized 0x0 resize as a
 		// successful no-op so its last valid swap-chain targets survive.  Mirror

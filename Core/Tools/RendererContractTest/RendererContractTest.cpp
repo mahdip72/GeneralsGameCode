@@ -4564,6 +4564,11 @@ int testD3D11HeadlessDevice()
 		sizeof(rangeValues), 0, rts::render::RENDER_BUFFER_UPDATE_DISCARD) ==
 			rts::render::RENDER_RESULT_INVALID_ARGUMENT,
 		"dynamic range updates require an open owner frame");
+	result |= check(device->updateBufferResource(buffer, rangeValues,
+		sizeof(unsigned int) * 2, 0,
+		rts::render::RENDER_BUFFER_UPDATE_DISCARD) ==
+			rts::render::RENDER_RESULT_OK,
+		"device-owner buffer publication is legal before an owner frame");
 	result |= check(rangeContext->beginFrame() ==
 		rts::render::RENDER_RESULT_OK &&
 		rangeContext->updateBuffer(buffer, rangeValues, sizeof(unsigned int) * 2,

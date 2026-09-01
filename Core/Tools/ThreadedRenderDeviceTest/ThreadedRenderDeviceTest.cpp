@@ -294,7 +294,7 @@ void OwnershipAndDeepCopy()
 	CHECK(context->setLegacyState(state, RENDER_VERTEX_POSITION3_COLOR, 0) == RENDER_RESULT_OK);
 	LegacyVertexLayout layout; layout.stride = 24; layout.elementCount = 1; layout.elements[0].byteOffset = 12;
 	CHECK(context->setLegacyStateForLayout(state, layout, 0) == RENDER_RESULT_OK);
-	CHECK(context->setVertexBuffer(vertex, 24, 0) == RENDER_RESULT_OK);
+	CHECK(context->setVertexBuffer(vertex, sizeof(unsigned int), 0) == RENDER_RESULT_OK);
 	CHECK(context->setIndexBuffer(index, RENDER_FORMAT_R16_UINT, 0) == RENDER_RESULT_OK);
 	CHECK(context->setTexture(0, texture) == RENDER_RESULT_OK);
 	CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_TRIANGLE_LIST) == RENDER_RESULT_OK);
@@ -458,14 +458,18 @@ void BufferUpdateFailureRecoveryRestoresBinding()
 	// Explicit recovery recreates the device after a failed buffer map/update.
 	CHECK(device->recoverDevice() == RENDER_RESULT_OK && device->isOperational());
 	f.failUpdate = false;
+	// Aggregate mutation failure cleared initialized-range authority. Republish
+	// bytes before the resource can be bound again after recovery.
 	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(context->updateBuffer(buffer, bytes, sizeof(bytes), 0,
+		RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK);
 	CHECK(context->setVertexBuffer(buffer, 16, 0) == RENDER_RESULT_OK);
 	CHECK(context->endFrame() == RENDER_RESULT_OK);
 	CHECK(device->present() == RENDER_RESULT_OK);
 	const ThreadedRenderFrameCompletion recovered = Complete(device.get());
-	// The recovered durable CPU buffer binds without a replacement upload.
+	// The recovered buffer binds only after a replacement upload republishes it.
 	CHECK(recovered.result == RENDER_RESULT_OK && recovered.presented
-		&& static_cast<std::size_t>(std::count(f.events.begin(), f.events.end(), UPDATE)) == updates);
+		&& static_cast<std::size_t>(std::count(f.events.begin(), f.events.end(), UPDATE)) == updates + 1);
 }
 
 void ResourcePreambleRemovalRemainsObservable()
@@ -488,7 +492,7 @@ void ResourcePreambleRemovalRemainsObservable()
 	CHECK(Complete(device.get()).presented);
 }
 
-void RecoveryPreservesPreambleResourceFailure()
+void RecoveryClearsPreambleResourceFailure()
 {
 	Fixture f;
 	auto device = Device(f);
@@ -501,8 +505,10 @@ void RecoveryPreservesPreambleResourceFailure()
 	f.failCreate = false;
 	EmptyFrame(device.get());
 	const ThreadedRenderFrameCompletion completion = Complete(device.get());
-	// Recovery preserves the failed preamble resource flag on the next successful frame.
-	CHECK(completion.result == RENDER_RESULT_OK && completion.presented && completion.resourceFailure);
+	// Successful recovery consumes the failed preamble resource latch; a later
+	// successful frame must not invalidate newly republished resources.
+	CHECK(completion.result == RENDER_RESULT_OK && completion.presented &&
+		!completion.resourceFailure);
 	CHECK(device->destroyResource(handle));
 	// Reclaim the failed preamble handle after its resource failure is observed.
 	CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
@@ -813,7 +819,7 @@ int main()
 		FailurePublicationAndRecovery();
 		BufferUpdateFailureRecoveryRestoresBinding();
 		ResourcePreambleRemovalRemainsObservable();
-		RecoveryPreservesPreambleResourceFailure();
+		RecoveryClearsPreambleResourceFailure();
 		CaptureResizeAndNonVisibleOrdering();
 		OpenFrameReportIsRejectedBeforeExecution();
 		FailedGpuCopyDependencies();

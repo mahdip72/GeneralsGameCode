@@ -45,7 +45,7 @@ NativeDrawPacket::NativeDrawPacket() :
 }
 
 NativeW3DRenderer::NativeW3DRenderer() :
-	m_state(0), m_frameOpen(false)
+	m_state(0), m_frameOpen(false), m_ownsBackend(false), m_borrowedMode(false)
 {
 }
 
@@ -58,14 +58,22 @@ NativeW3DRenderer::~NativeW3DRenderer()
 		{
 			return;
 		}
-		Shutdown();
+		if (m_ownsBackend)
+		{
+			Shutdown();
+		}
+		else
+		{
+			m_state->Release();
+			m_state = 0;
+		}
 	}
 }
 
 RenderResult NativeW3DRenderer::Initialize(void *window,
 	const NativeW3DRendererDescriptor &descriptor)
 {
-	if (m_state != 0 || window == 0 || descriptor.width == 0 ||
+	if (m_state != 0 || m_borrowedMode || window == 0 || descriptor.width == 0 ||
 		descriptor.height == 0)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
@@ -114,6 +122,7 @@ RenderResult NativeW3DRenderer::Initialize(void *window,
 		return RENDER_RESULT_FAILED;
 	}
 	m_state = state;
+	m_ownsBackend = true;
 	return RENDER_RESULT_OK;
 }
 
@@ -124,6 +133,21 @@ RenderResult NativeW3DRenderer::Shutdown()
 		return RENDER_RESULT_OK;
 	}
 	if (!IsOwnerThread())
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	if (!m_ownsBackend)
+	{
+		if (m_frameOpen)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		m_state->Release();
+		m_state = 0;
+		m_frameOpen = false;
+		return RENDER_RESULT_OK;
+	}
+	if (m_state->BoundResourceTables() != 0)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
@@ -141,6 +165,7 @@ RenderResult NativeW3DRenderer::Shutdown()
 	m_state->Release();
 	m_state = 0;
 	m_frameOpen = false;
+	m_ownsBackend = false;
 	return cleanupResult;
 }
 
@@ -290,7 +315,7 @@ RenderResult NativeW3DRenderer::DrainFailedRecoveryCleanup(
 	// Recovery has already made the backend non-operational.  Unpublish it
 	// before accepted cleanup runs so callbacks can release their tokens
 	// without calling through a stale backend pointer.
-	const RenderResult detachResult = state->DetachBackend();
+	const RenderResult detachResult = state->DetachBackend(true);
 	if (detachResult != RENDER_RESULT_OK)
 	{
 		return detachResult;
@@ -301,7 +326,7 @@ RenderResult NativeW3DRenderer::DrainFailedRecoveryCleanup(
 RenderResult NativeW3DRenderer::RecoverDevice()
 {
 	IRenderDevice *device = m_state == 0 ? 0 : m_state->Device();
-	if (device == 0 || m_frameOpen || !IsOwnerThread())
+	if (device == 0 || m_frameOpen || !IsOwnerThread() || !m_ownsBackend)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
@@ -339,7 +364,7 @@ RenderResult NativeW3DRenderer::RecoverDevice()
 RenderResult NativeW3DRenderer::Resize(unsigned int width, unsigned int height)
 {
 	IRenderDevice *device = m_state == 0 ? 0 : m_state->Device();
-	if (device == 0 || m_frameOpen || !IsOwnerThread())
+	if (device == 0 || m_frameOpen || !IsOwnerThread() || !m_ownsBackend)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
@@ -366,6 +391,39 @@ unsigned int NativeW3DRenderer::PendingCleanup() const
 bool NativeW3DRenderer::IsOwnerThread() const
 {
 	return m_state != 0 && m_state->IsOwnerThread();
+}
+
+RenderResult NativeW3DRenderer::AttachBorrowedState(
+	NativeW3DRenderState *state)
+{
+	if (m_state != 0 || m_borrowedMode || state == 0 || !state->IsOperational() ||
+		!state->IsOwnerThread())
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	state->AddRef();
+	m_state = state;
+	m_frameOpen = false;
+	m_ownsBackend = false;
+	m_borrowedMode = true;
+	return RENDER_RESULT_OK;
+}
+
+RenderResult NativeW3DRenderer::DetachBorrowedState()
+{
+	if (m_state == 0)
+	{
+		m_borrowedMode = false;
+		return RENDER_RESULT_OK;
+	}
+	if (m_ownsBackend || m_frameOpen || !m_state->IsOwnerThread())
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	m_state->Release();
+	m_state = 0;
+	m_borrowedMode = false;
+	return RENDER_RESULT_OK;
 }
 }
 }

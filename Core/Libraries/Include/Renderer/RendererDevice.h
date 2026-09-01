@@ -525,6 +525,19 @@ public:
 	virtual RenderResult createTexture(const TextureDescriptor &descriptor,
 		const TextureSubresourceData *initialData,
 		unsigned int initialDataCount, GpuHandle *texture) = 0;
+	// Owner-thread resource publication is legal independently of frame state.
+	// Backends that do not specialize this seam retain their existing immediate-
+	// context behavior; native and threaded backends override it so transient
+	// asset-loader bytes can be published before BeginFrame and freed on return.
+	virtual RenderResult updateBufferResource(GpuHandle buffer,
+		const void *data, size_t byteCount, size_t destinationOffset,
+		RenderBufferUpdateMode mode = RENDER_BUFFER_UPDATE_PRESERVE)
+	{
+		IRenderContext *context = immediateContext();
+		return context == 0 ? RENDER_RESULT_INVALID_ARGUMENT :
+			context->updateBuffer(buffer, data, byteCount, destinationOffset,
+				mode);
+	}
 	// Refreshes every texture subresource in place when the existing resource
 	// has compatible shape, format, binding, and update capability.  A
 	// RENDER_RESULT_UNSUPPORTED result means callers may recreate the resource;

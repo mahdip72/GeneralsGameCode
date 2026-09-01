@@ -15,7 +15,21 @@ public:
 
 	rts::render::RenderResult Initialize(void *window,
 		const rts::render::NativeW3DRendererDescriptor &descriptor);
+	// Product cutover seam: borrow the bridge-owned backend instead of creating
+	// a second device.  The bridge retains backend ownership and publishes a
+	// replacement context after successful recovery.
+	rts::render::RenderResult AttachBackend(
+		rts::render::IRenderDevice *device,
+		rts::render::IRenderContext *context);
+	rts::render::RenderResult ReplaceBackendContext(
+		rts::render::IRenderContext *context);
+	rts::render::RenderResult DrainResourceCleanup(
+		unsigned int maxCommands, unsigned int *drained);
+	rts::render::RenderResult PublishThreadedCompletion(
+		rts::render::NativeW3DSubmissionSequence submissionSequence,
+		bool resourceFailure);
 	rts::render::RenderResult Shutdown();
+	bool IsAttachedToBorrowedBackend() const;
 	rts::render::NativeW3DRenderer &Renderer();
 	rts::render::NativeW3DResources &Resources();
 
@@ -24,7 +38,9 @@ private:
 	NativeW3D2 &operator=(const NativeW3D2 &);
 
 	rts::render::NativeW3DRenderer m_renderer;
+	rts::render::NativeW3DResourceHost m_resourceHost;
 	rts::render::NativeW3DResources m_resources;
+	bool m_borrowedBackend;
 };
 
 #endif

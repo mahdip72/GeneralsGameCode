@@ -3,7 +3,7 @@ add_executable(core_native_w3d_resources_tests
 )
 
 target_link_libraries(core_native_w3d_resources_tests PRIVATE
-    core_renderer
+    core_ww3d2_native
 )
 
 set_target_properties(core_native_w3d_resources_tests PROPERTIES

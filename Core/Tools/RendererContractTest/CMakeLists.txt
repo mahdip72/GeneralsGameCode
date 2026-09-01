@@ -72,6 +72,11 @@ target_link_libraries(core_renderer_contract_tests PRIVATE
     core_renderer
     d3d8lib
 )
+if(TARGET core_ww3d2_native)
+    target_link_libraries(core_renderer_contract_tests PRIVATE
+        core_ww3d2_native
+    )
+endif()
 
 target_include_directories(core_renderer_contract_tests PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}

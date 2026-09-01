@@ -73,6 +73,12 @@ bool PollThreadedRenderCompletion(IRenderDevice *device,
 // idle fence. Readback supplies its own GPU synchronization. Drain also flushes
 // pending resource commands, but never implicitly presents an open frame.
 RenderResult DrainThreadedRenderDevice(IRenderDevice *device);
+// Roll back one unpublished logical resource transaction. The render owner
+// destroys any native allocation first; only then is the producer handle
+// released for reuse. This reports the rollback itself, independently of an
+// earlier aggregate resource failure retained by Drain.
+RenderResult RollbackThreadedRenderResource(IRenderDevice *device,
+	GpuHandle handle);
 bool GetThreadedRenderMetrics(const IRenderDevice *device,
 	ThreadedRenderMetrics *metrics);
 

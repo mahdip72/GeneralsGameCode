@@ -9,6 +9,7 @@ namespace render
 {
 class NativeW3DRenderer;
 class NativeW3DResources;
+class NativeW3DResourceHost;
 class NativeW3DRecoveryTestAccess;
 // This is the shared lifetime authority for the native facade and resource
 // tables.  It deliberately owns no game object and exposes no backend COM
@@ -20,7 +21,8 @@ class NativeW3DRecoveryTestAccess;
 class NativeW3DRenderState
 {
 public:
-	static NativeW3DRenderState *Create(unsigned int cleanupCapacity = 256);
+	static NativeW3DRenderState *Create(unsigned int cleanupCapacity = 256,
+		unsigned int initialGeneration = 1);
 
 	void AddRef();
 	void Release();
@@ -29,27 +31,36 @@ public:
 	RenderResult BeginShutdown();
 	RenderResult EnqueueCleanup(NativeW3DOwnerCommand command,
 		NativeW3DOwnerToken *token);
+	RenderResult EnqueueFallbackCleanup(NativeW3DOwnerCommand command,
+		void *context, NativeW3DOwnerContextRelease release,
+		NativeW3DOwnerFallbackEntry *entry);
 	RenderResult DrainCleanup(unsigned int maxCommands, unsigned int *drained);
 
 	bool IsOwnerThread() const;
 	bool IsAcceptingCleanup() const;
 	unsigned int PendingCleanup() const;
+	unsigned int BoundResourceTables() const;
 
 private:
 	friend class NativeW3DRenderer;
 	friend class NativeW3DResources;
+	friend class NativeW3DResourceHost;
 	friend class NativeW3DRecoveryTestAccess;
 
-	explicit NativeW3DRenderState(unsigned int cleanupCapacity);
+	NativeW3DRenderState(unsigned int cleanupCapacity,
+		unsigned int initialGeneration);
 	~NativeW3DRenderState();
 	NativeW3DRenderState(const NativeW3DRenderState &);
 	NativeW3DRenderState &operator=(const NativeW3DRenderState &);
 
 	RenderResult AttachBackend(IRenderDevice *device, IRenderContext *context);
 	RenderResult ReplaceContext(IRenderContext *context);
-	RenderResult DetachBackend();
+	RenderResult DetachBackend(bool allowBoundResourceTables = false);
+	RenderResult RegisterResourceTable();
+	void UnregisterResourceTable();
 	bool IsOperational() const;
 	unsigned int Generation() const;
+	unsigned int BackendEpoch() const;
 	IRenderDevice *Device() const;
 	IRenderContext *Context() const;
 
@@ -58,6 +69,8 @@ private:
 	IRenderDevice *m_device;
 	IRenderContext *m_context;
 	unsigned int m_generation;
+	unsigned int m_backendEpoch;
+	volatile long m_boundResourceTables;
 };
 }
 }
