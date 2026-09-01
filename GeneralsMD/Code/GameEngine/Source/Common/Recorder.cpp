@@ -1203,7 +1203,7 @@ void RecorderClass::startRecording(GameDifficulty diff, Int originalGameMode, In
 	// deterministic behavior without changing the retail replay header layout. Keep the existing
 	// SkirmishAI marker last because its parser intentionally requires a final suffix.
 	MarkReplayVersionForPathfindQueueCurrentEpoch(versionTimeString);
-	MarkReplayVersionForSkirmishAICurrentEpoch(versionTimeString);
+	MarkReplayVersionForSkirmishAIRecordingEpoch(versionTimeString);
 	UnsignedInt versionNumber = TheVersion->getVersionNumber();
 	#if defined(_WIN64)
 	nativeHeaderWriteOk = writeNativeReplayWideString(m_file, versionString.str()) && nativeHeaderWriteOk;
@@ -1882,8 +1882,13 @@ Bool RecorderClass::playbackFile(AsciiString filename)
 	UnicodeString pathLivenessMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
 	MarkReplayVersionForPathfindQueueCurrentEpoch(pathLivenessMarkedVersionTimeString);
 	MarkReplayVersionForSkirmishAILivenessRecovery(pathLivenessMarkedVersionTimeString);
-	UnicodeString legacyCurrentMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
-	MarkReplayVersionForSkirmishAICurrentEpoch(legacyCurrentMarkedVersionTimeString);
+	UnicodeString adaptiveGlobalRngMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
+	MarkReplayVersionForSkirmishAIAdaptiveGlobalRngEpoch(adaptiveGlobalRngMarkedVersionTimeString);
+	UnicodeString pathAdaptiveGlobalRngMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
+	MarkReplayVersionForPathfindQueueCurrentEpoch(pathAdaptiveGlobalRngMarkedVersionTimeString);
+	MarkReplayVersionForSkirmishAIAdaptiveGlobalRngEpoch(pathAdaptiveGlobalRngMarkedVersionTimeString);
+	UnicodeString counterRngMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
+	MarkReplayVersionForSkirmishAICurrentEpoch(counterRngMarkedVersionTimeString);
 	UnicodeString currentMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
 	MarkReplayVersionForPathfindQueueCurrentEpoch(currentMarkedVersionTimeString);
 	MarkReplayVersionForSkirmishAICurrentEpoch(currentMarkedVersionTimeString);
@@ -1891,7 +1896,9 @@ Bool RecorderClass::playbackFile(AsciiString filename)
 		&& header.versionTimeString != pathMarkedVersionTimeString
 		&& header.versionTimeString != livenessMarkedVersionTimeString
 		&& header.versionTimeString != pathLivenessMarkedVersionTimeString
-		&& header.versionTimeString != legacyCurrentMarkedVersionTimeString
+		&& header.versionTimeString != adaptiveGlobalRngMarkedVersionTimeString
+		&& header.versionTimeString != pathAdaptiveGlobalRngMarkedVersionTimeString
+		&& header.versionTimeString != counterRngMarkedVersionTimeString
 		&& header.versionTimeString != currentMarkedVersionTimeString;
 	Bool versionNumberDiff = header.versionNumber != TheVersion->getVersionNumber();
 	Bool exeCRCDiff = header.exeCRC != TheGlobalData->m_exeCRC;

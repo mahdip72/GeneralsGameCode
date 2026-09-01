@@ -51,6 +51,7 @@
 #include "Lib/ReplayFieldReader.h"
 
 #if defined(_WIN64)
+#include "GameLogic/GeneralsAIReplayPolicy.h"
 #include "Lib/RuntimeEpochContract.h"
 #include "Lib/ReplayCommandContract.h"
 #include <array>
@@ -935,6 +936,7 @@ void RecorderClass::init() {
 	m_nativeReplayPayloadEnd = 0;
 	m_nativeReplayRecordBytes = 0U;
 #endif
+	m_skirmishAIReplayEpoch = SKIRMISH_AI_REPLAY_EPOCH_LEGACY;
 
 	OptionPreferences optionPref;
 	m_archiveReplays = optionPref.getArchiveReplaysEnabled();
@@ -1194,6 +1196,19 @@ void RecorderClass::startRecording(GameDifficulty diff, Int originalGameMode, In
 	// write out version info
 	UnicodeString versionString = TheVersion->getUnicodeVersion();
 	UnicodeString versionTimeString = TheVersion->getUnicodeBuildTime();
+	#if defined(_WIN64)
+	// A current-epoch local recording must replay through the same canonical
+	// planning policy regardless of scheduler mode. Network recordings stay
+	// unmarked until the mixed-worker multiplayer epoch gate is available.
+	m_skirmishAIReplayEpoch = GetGeneralsAIRecordingEpoch(originalGameMode,
+		IsGeneralsAICanonicalRuntimeEpoch());
+	if (m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_CURRENT)
+	{
+		MarkReplayVersionForSkirmishAICurrentEpoch(versionTimeString);
+	}
+	#else
+	m_skirmishAIReplayEpoch = SKIRMISH_AI_REPLAY_EPOCH_LEGACY;
+	#endif
 	UnsignedInt versionNumber = TheVersion->getVersionNumber();
 	#if defined(_WIN64)
 	nativeHeaderWriteOk = writeNativeReplayWideString(m_file, versionString.str()) && nativeHeaderWriteOk;
@@ -1832,6 +1847,7 @@ Bool RecorderClass::replayMatchesGameVersion(const ReplayHeader& header)
 Bool RecorderClass::playbackFile(AsciiString filename)
 {
 	m_replayReadError = FALSE;
+	m_skirmishAIReplayEpoch = SKIRMISH_AI_REPLAY_EPOCH_LEGACY;
 #if defined(_WIN64)
 	m_nativeReplayContainer = FALSE;
 	m_nativeReplayRecordBytes = 0U;
@@ -1852,10 +1868,15 @@ Bool RecorderClass::playbackFile(AsciiString filename)
 	{
 		return FALSE;
 	}
+	m_skirmishAIReplayEpoch = GetSkirmishAIReplayEpoch(
+		header.versionTimeString);
 
 #ifdef DEBUG_CRASHING
 	Bool versionStringDiff = header.versionString != TheVersion->getUnicodeVersion();
-	Bool versionTimeStringDiff = header.versionTimeString != TheVersion->getUnicodeBuildTime();
+	UnicodeString planningMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
+	MarkReplayVersionForSkirmishAICurrentEpoch(planningMarkedVersionTimeString);
+	Bool versionTimeStringDiff = header.versionTimeString != TheVersion->getUnicodeBuildTime() &&
+		header.versionTimeString != planningMarkedVersionTimeString;
 	Bool versionNumberDiff = header.versionNumber != TheVersion->getVersionNumber();
 	Bool exeCRCDiff = header.exeCRC != TheGlobalData->m_exeCRC;
 	Bool exeDifferent = versionStringDiff || versionTimeStringDiff || versionNumberDiff || exeCRCDiff;
