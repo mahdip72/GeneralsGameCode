@@ -397,9 +397,10 @@ extern "C" void rts_job_system_release_test_pause(unsigned pausePoint)
 struct JobContext::State
 {
 	State(GroupRecord *groupValue, unsigned char *scratchValue,
-		unsigned scratchCapacityValue)
+		unsigned scratchCapacityValue, unsigned physicalWorkerIndexValue)
 		: group(groupValue), scratch(scratchValue),
-		  scratchCapacity(scratchCapacityValue), scratchUsed(0), failed(false)
+		  scratchCapacity(scratchCapacityValue), scratchUsed(0), failed(false),
+		  physicalWorkerIndex(physicalWorkerIndexValue)
 	{
 	}
 
@@ -408,6 +409,7 @@ struct JobContext::State
 	unsigned scratchCapacity;
 	unsigned scratchUsed;
 	bool failed;
+	unsigned physicalWorkerIndex;
 };
 
 struct JobHandle::State
@@ -901,7 +903,8 @@ struct JobSystem::State
 #endif
 			JobContext::State contextState(record->group.get(),
 				worker.scratch.empty() ? 0 : &worker.scratch[0],
-				static_cast<unsigned>(worker.scratch.size()));
+				static_cast<unsigned>(worker.scratch.size()),
+				poolWorker ? worker.index : JOB_INVALID_PHYSICAL_WORKER_INDEX);
 			JobContext context(&contextState);
 			try
 			{
@@ -1076,6 +1079,17 @@ bool JobContext::isCancellationRequested() const
 {
 	return m_state != 0 && m_state->group != 0 &&
 		m_state->group->cancelled.load(std::memory_order_acquire);
+}
+
+bool JobContext::isPhysicalWorkerExecution() const
+{
+	return physicalWorkerIndex() != JOB_INVALID_PHYSICAL_WORKER_INDEX;
+}
+
+unsigned JobContext::physicalWorkerIndex() const
+{
+	return m_state != 0 ? m_state->physicalWorkerIndex :
+		JOB_INVALID_PHYSICAL_WORKER_INDEX;
 }
 
 void JobContext::fail()

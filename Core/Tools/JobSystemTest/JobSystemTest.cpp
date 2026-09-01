@@ -80,6 +80,24 @@ private:
 	unsigned *m_count;
 };
 
+class ExecutionIdentityJob : public rts::Job
+{
+public:
+	ExecutionIdentityJob(bool *physicalWorker, unsigned *physicalWorkerIndex)
+		: m_physicalWorker(physicalWorker),
+		  m_physicalWorkerIndex(physicalWorkerIndex) {}
+
+	virtual void execute(rts::JobContext &context)
+	{
+		*m_physicalWorker = context.isPhysicalWorkerExecution();
+		*m_physicalWorkerIndex = context.physicalWorkerIndex();
+	}
+
+private:
+	bool *m_physicalWorker;
+	unsigned *m_physicalWorkerIndex;
+};
+
 class DeterministicJob : public rts::Job
 {
 public:
@@ -126,6 +144,21 @@ int testBasicStartSubmitWaitShutdown()
 	result |= check(handle.isComplete(), "submitted handle completes");
 	result |= check(handle.succeeded(), "submitted handle succeeds");
 	result |= check(executions == 1, "submitted job executes exactly once");
+
+#if defined(_MSC_VER) && _MSC_VER < 1300
+	bool physicalWorker = true;
+	unsigned physicalWorkerIndex = 0;
+	rts::JobGroup identityGroup = system.createGroup();
+	rts::Job *identityJob = new ExecutionIdentityJob(&physicalWorker,
+		&physicalWorkerIndex);
+	rts::JobHandle identityHandle = system.trySubmit(identityJob,
+		rts::JOB_PRIORITY_NORMAL, identityGroup);
+	if (!identityHandle.isValid()) delete identityJob;
+	result |= check(identityHandle.isValid() && system.wait(identityGroup) &&
+		!physicalWorker &&
+		physicalWorkerIndex == rts::JOB_INVALID_PHYSICAL_WORKER_INDEX,
+		"legacy inline execution has no physical-worker identity");
+#endif
 
 	system.shutdown();
 	result |= check(!system.isRunning(), "shutdown stops the job system");
@@ -506,6 +539,99 @@ public:
 private:
 	Gate *m_gate;
 };
+
+class SignalledExecutionIdentityJob : public rts::Job
+{
+public:
+	SignalledExecutionIdentityJob(std::atomic<bool> *executed,
+		bool *physicalWorker, unsigned *physicalWorkerIndex)
+		: m_executed(executed), m_physicalWorker(physicalWorker),
+		  m_physicalWorkerIndex(physicalWorkerIndex) {}
+
+	virtual void execute(rts::JobContext &context)
+	{
+		*m_physicalWorker = context.isPhysicalWorkerExecution();
+		*m_physicalWorkerIndex = context.physicalWorkerIndex();
+		m_executed->store(true, std::memory_order_release);
+	}
+
+private:
+	std::atomic<bool> *m_executed;
+	bool *m_physicalWorker;
+	unsigned *m_physicalWorkerIndex;
+};
+
+int testExecutionScopedPhysicalWorkerIdentity()
+{
+	int result = 0;
+	rts::JobSystemConfig config;
+	config.workerCount = 1;
+	config.queueCapacity = 8;
+	config.scratchBytesPerWorker = 4096;
+	config.pinWorkers = false;
+
+	rts::JobSystem &system = rts::JobSystem::instance();
+	const bool started = system.start(config);
+	result |= check(started, "physical-worker identity job system starts");
+	if (!started) return result;
+
+	bool physicalWorker = false;
+	unsigned physicalWorkerIndex = rts::JOB_INVALID_PHYSICAL_WORKER_INDEX;
+	std::atomic<bool> executed(false);
+	rts::JobGroup physicalGroup = system.createGroup();
+	rts::Job *physicalJob = new SignalledExecutionIdentityJob(&executed,
+		&physicalWorker, &physicalWorkerIndex);
+	rts::JobHandle physicalHandle = system.trySubmit(physicalJob,
+		rts::JOB_PRIORITY_NORMAL, physicalGroup);
+	if (!physicalHandle.isValid()) delete physicalJob;
+	const std::chrono::steady_clock::time_point physicalDeadline =
+		std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	while (!executed.load(std::memory_order_acquire) &&
+		std::chrono::steady_clock::now() < physicalDeadline)
+		std::this_thread::yield();
+	const bool workerExecuted = executed.load(std::memory_order_acquire);
+	result |= check(physicalHandle.isValid() && workerExecuted,
+		"physical worker executes identity probe without owner help");
+	result |= check(workerExecuted && physicalWorker && physicalWorkerIndex == 0,
+		"physical worker exposes its stable zero-based scheduler index");
+	if (physicalHandle.isValid())
+		result |= check(system.wait(physicalGroup),
+			"physical-worker identity probe drains");
+
+	Gate blocker;
+	rts::JobGroup blockerGroup = system.createGroup();
+	rts::Job *blockerJob = new GateJob(&blocker);
+	rts::JobHandle blockerHandle = system.trySubmit(blockerJob,
+		rts::JOB_PRIORITY_FRAME_CRITICAL, blockerGroup);
+	if (!blockerHandle.isValid()) delete blockerJob;
+	const bool workerBlocked = blockerHandle.isValid() && blocker.waitForEntry();
+	result |= check(workerBlocked,
+		"physical worker is held before the owner-help identity probe");
+
+	bool ownerPhysicalWorker = true;
+	unsigned ownerPhysicalWorkerIndex = 0;
+	rts::JobGroup ownerGroup = system.createGroup();
+	rts::Job *ownerJob = new ExecutionIdentityJob(&ownerPhysicalWorker,
+		&ownerPhysicalWorkerIndex);
+	rts::JobHandle ownerHandle = system.trySubmit(ownerJob,
+		rts::JOB_PRIORITY_NORMAL, ownerGroup);
+	if (!ownerHandle.isValid()) delete ownerJob;
+	const bool ownerWaited = ownerHandle.isValid() && system.wait(ownerGroup);
+	result |= check(ownerWaited,
+		"registered scheduler owner executes queued identity probe while worker is held");
+	result |= check(ownerWaited && !ownerPhysicalWorker &&
+		ownerPhysicalWorkerIndex == rts::JOB_INVALID_PHYSICAL_WORKER_INDEX,
+		"owner help cannot impersonate a physical scheduler worker");
+
+	if (blockerHandle.isValid())
+	{
+		blocker.open();
+		result |= check(system.wait(blockerGroup),
+			"held physical worker drains after identity probe");
+	}
+	system.shutdown();
+	return result;
+}
 
 class OrderedJob : public rts::Job
 {
@@ -1745,6 +1871,7 @@ int main()
 	result |= testAvailableCpuSetsAndOwnerReservations();
 	result |= testOwnerRoleAndLazyRestartBasics();
 #if !defined(_MSC_VER) || _MSC_VER >= 1300
+	result |= testExecutionScopedPhysicalWorkerIdentity();
 	result |= testPrioritiesAndWorkStealing();
 	result |= testDependenciesContinuationsAndFailurePropagation();
 	result |= testCancellationOwnerHelpingAndCompletions();

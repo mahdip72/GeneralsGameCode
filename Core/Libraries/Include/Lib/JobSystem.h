@@ -99,10 +99,16 @@ struct JobSystemMetrics
 	unsigned selectedWorkerCpuCount;
 };
 
+const unsigned JOB_INVALID_PHYSICAL_WORKER_INDEX = ~0u;
+
 class JobContext
 {
 public:
 	bool isCancellationRequested() const;
+	// Execution-scoped scheduler identity. Owner help and the synchronous
+	// legacy runtime deliberately have no physical-worker index.
+	bool isPhysicalWorkerExecution() const;
+	unsigned physicalWorkerIndex() const;
 	void fail();
 	void *allocateScratch(unsigned byteCount, unsigned alignment);
 

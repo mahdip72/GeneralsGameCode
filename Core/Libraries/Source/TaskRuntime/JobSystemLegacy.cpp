@@ -235,6 +235,16 @@ bool JobContext::isCancellationRequested() const
 	return m_state != 0 && m_state->group != 0 && m_state->group->cancelled;
 }
 
+bool JobContext::isPhysicalWorkerExecution() const
+{
+	return false;
+}
+
+unsigned JobContext::physicalWorkerIndex() const
+{
+	return JOB_INVALID_PHYSICAL_WORKER_INDEX;
+}
+
 void JobContext::fail()
 {
 	if (m_state != 0) m_state->failed = true;
