@@ -76,14 +76,14 @@ function Test-NativeX64CIWorkflow {
     )
 
     foreach ($contract in @(
-        @{ Name = 'build-generals-x64'; Game = 'Generals' },
-        @{ Name = 'build-generalsmd-x64'; Game = 'GeneralsMD' }
+        @{ Name = 'build-generals-x64'; Game = 'Generals'; Preset = 'x64-generals-vcpkg-product' },
+        @{ Name = 'build-generalsmd-x64'; Game = 'GeneralsMD'; Preset = 'x64-zerohour-vcpkg-product' }
     )) {
         $body = Get-JobBody -Workflow $CIWorkflow -JobName $contract.Name
         $titleChangeOutput = if ($contract.Game -eq 'GeneralsMD') { 'generalsmd' } else { 'generals' }
         Assert-Contains $body "(?m)^      game: `"$([Regex]::Escape($contract.Game))`"\r?$" `
             "$($contract.Name) does not select $($contract.Game)"
-        Assert-Contains $body '(?m)^      preset: "x64-vcpkg"\r?$' `
+        Assert-Contains $body "(?m)^      preset: `"$([Regex]::Escape($contract.Preset))`"\r?$" `
             "$($contract.Name) does not select the dependency-complete native x64 preset"
         Assert-Contains $body '(?m)^      extras: true\r?$' `
             "$($contract.Name) does not enable the native test graph"
@@ -104,6 +104,20 @@ function Test-NativeX64CIWorkflow {
                 'Zero Hour x64 can race the dependency-cache producer'
         }
     }
+
+    $focusedBody = Get-JobBody -Workflow $CIWorkflow -JobName 'build-native-x64-focused-runtime'
+    Assert-Contains $focusedBody '(?m)^      max-parallel: 2\r?$' `
+        'focused native x64 checks are not bounded to two concurrent configurations'
+    foreach ($focusedPreset in @('x64-debug-core', 'x64-profile-core', 'x64-asan-core')) {
+        Assert-Contains $focusedBody "(?m)^          - preset: `"$([Regex]::Escape($focusedPreset))`"\r?$" `
+            "focused native x64 checks do not select $focusedPreset"
+    }
+    Assert-Contains $focusedBody '(?m)^      product: false\r?$' `
+        'focused native x64 checks rebuild a full game product instead of shared runtime targets'
+    Assert-Contains $focusedBody '(?m)^      focused_targets: ' `
+        'focused native x64 checks do not declare bounded build targets'
+    Assert-Contains $focusedBody '(?m)^      focused_test_regex: ' `
+        'focused native x64 checks do not declare a focused CTest selection'
 
     Assert-Contains $CIWorkflow '(?m)^  pull_request:\r?$' `
         'stacked pull requests are excluded from CI'
@@ -128,7 +142,7 @@ function Test-NativeX64CIWorkflow {
         "arch: \$\{\{ startsWith\(inputs\.preset, 'x64'\) && 'x64' \|\| 'x86' \}\}" `
         'the MSVC environment does not select the x64 host/target architecture'
     Assert-Contains $BuildWorkflow `
-        "inputs\.game == 'Generals' && inputs\.preset == 'x64-vcpkg'" `
+        "inputs\.game == 'Generals' && inputs\.preset == 'x64-generals-vcpkg-product'" `
         'no active native x64 job can save the vcpkg binary cache'
     Assert-Contains $BuildWorkflow `
         "timeout-minutes: \$\{\{ startsWith\(inputs\.preset, 'x64'\) && 90 \|\| 30 \}\}" `
@@ -149,8 +163,9 @@ function Test-NativeX64CIWorkflow {
         'CTest failures are not propagated to the workflow result'
 
     $installStep = Get-StepBody -Workflow $BuildWorkflow -StepNamePrefix 'Install native runtime'
-    Assert-Contains $installStep "if: startsWith\(inputs\.preset, 'x64'\)" `
-        'the installed-runtime step is not limited to native x64 builds'
+    Assert-Contains $installStep `
+        "if: \$\{\{ inputs\.product && startsWith\(inputs\.preset, 'x64'\) \}\}" `
+        'the installed-runtime step is not limited to native x64 product builds'
     Assert-Contains $installStep 'cmake --install ' `
         'the native CI artifact is not produced through CMake install rules'
 
@@ -160,7 +175,7 @@ function Test-NativeX64CIWorkflow {
         -EarlierStepNamePrefix 'Install native runtime' `
         -LaterStepNamePrefix 'Run installed native contract tests'
     Assert-Contains $runtimeContractStep `
-        '(?m)^        if: \$\{\{ inputs\.extras && startsWith\(inputs\.preset, ''x64''\) \}\}\r?$' `
+        '(?m)^        if: \$\{\{ inputs\.product && inputs\.extras && startsWith\(inputs\.preset, ''x64''\) \}\}\r?$' `
         'the installed contract gate is not enabled for both native title extras lanes'
     Assert-Contains $runtimeContractStep `
         "\$titleDirectory = '\$\{\{ inputs\.game == 'Generals' && 'Generals' \|\| 'ZeroHour' \}\}'" `
@@ -224,15 +239,68 @@ function Test-NativeX64CMakeContract {
     )
 
     $parsedPresets = $Presets | ConvertFrom-Json
-    $x64VcpkgPreset = @($parsedPresets.configurePresets | Where-Object {
-        $_.name -eq 'x64-vcpkg'
-    })
-    if ($x64VcpkgPreset.Count -ne 1) {
-        throw 'Native x64 CI workflow audit failed: x64-vcpkg configure preset is missing or ambiguous'
+    foreach ($contract in @(
+        @{ Name = 'x64-generals-vcpkg-product'; Base = 'x64-generals-product'; Selected = 'GENERALS'; Other = 'ZEROHOUR' },
+        @{ Name = 'x64-zerohour-vcpkg-product'; Base = 'x64-zerohour-product'; Selected = 'ZEROHOUR'; Other = 'GENERALS' }
+    )) {
+        $x64VcpkgPreset = @($parsedPresets.configurePresets | Where-Object {
+            $_.name -eq $contract.Name
+        })
+        if ($x64VcpkgPreset.Count -ne 1) {
+            throw "Native x64 CI workflow audit failed: $($contract.Name) configure preset is missing or ambiguous"
+        }
+        $inheritedPresets = @($x64VcpkgPreset[0].inherits)
+        if ($inheritedPresets -notcontains $contract.Base -or
+            $inheritedPresets -notcontains 'default-vcpkg') {
+            throw "Native x64 CI workflow audit failed: $($contract.Name) does not inherit the title product and dependency contracts"
+        }
+        $basePreset = @($parsedPresets.configurePresets | Where-Object {
+            $_.name -eq $contract.Base
+        })
+        if ($basePreset.Count -ne 1) {
+            throw "Native x64 CI workflow audit failed: $($contract.Base) configure preset is missing or ambiguous"
+        }
+        foreach ($option in @(
+            @{ Name = 'RTS_BUILD_PRODUCT'; Value = 'ON' },
+            @{ Name = "RTS_BUILD_$($contract.Selected)"; Value = 'ON' },
+            @{ Name = "RTS_BUILD_$($contract.Other)"; Value = 'OFF' },
+            @{ Name = "RTS_BUILD_$($contract.Selected)_PRODUCT"; Value = 'ON' },
+            @{ Name = "RTS_BUILD_$($contract.Selected)_TOOLS"; Value = 'OFF' }
+        )) {
+            $property = $basePreset[0].cacheVariables.PSObject.Properties[$option.Name]
+            if ($null -eq $property -or $property.Value -ne $option.Value) {
+                throw "Native x64 CI workflow audit failed: $($contract.Base) does not set $($option.Name)=$($option.Value)"
+            }
+        }
     }
-    $inheritedPresets = @($x64VcpkgPreset[0].inherits)
-    if ($inheritedPresets -notcontains 'x64' -or $inheritedPresets -notcontains 'default-vcpkg') {
-        throw 'Native x64 CI workflow audit failed: x64-vcpkg does not inherit the product and dependency contracts'
+
+    foreach ($corePreset in @(
+        @{ Name = 'x64-debug-core'; Base = 'x64-debug' },
+        @{ Name = 'x64-profile-core'; Base = 'x64-profile' },
+        @{ Name = 'x64-asan-core'; Base = 'x64-asan' }
+    )) {
+        $coreConfigurePreset = @($parsedPresets.configurePresets | Where-Object {
+            $_.name -eq $corePreset.Name
+        })
+        if ($coreConfigurePreset.Count -ne 1) {
+            throw "Native x64 CI workflow audit failed: $($corePreset.Name) configure preset is missing or ambiguous"
+        }
+        $coreInheritedPresets = @($coreConfigurePreset[0].inherits)
+        if ($coreInheritedPresets -notcontains $corePreset.Base) {
+            throw "Native x64 CI workflow audit failed: $($corePreset.Name) does not inherit $($corePreset.Base)"
+        }
+        foreach ($option in @(
+            @{ Name = 'RTS_BUILD_PRODUCT'; Value = 'OFF' },
+            @{ Name = 'RTS_BUILD_GENERALS'; Value = 'OFF' },
+            @{ Name = 'RTS_BUILD_ZEROHOUR'; Value = 'OFF' },
+            @{ Name = 'RTS_BUILD_CORE_TOOLS'; Value = 'OFF' },
+            @{ Name = 'RTS_BUILD_CORE_EXTRAS'; Value = 'ON' }
+        )) {
+            $property = $coreConfigurePreset[0].cacheVariables.PSObject.Properties[$option.Name]
+            if ($null -eq $property -or $property.Value -ne $option.Value) {
+                throw "Native x64 CI workflow audit failed: $($corePreset.Name) does not set $($option.Name)=$($option.Value)"
+            }
+        }
     }
 
     $unixPreset = @($parsedPresets.configurePresets | Where-Object {
@@ -315,7 +383,7 @@ jobs:
     uses: ./.github/workflows/build-toolchain.yml
     with:
       game: "Generals"
-      preset: "x64-vcpkg"
+      preset: "x64-generals-vcpkg-product"
       extras: true
   build-generalsmd-x64:
     needs: [detect-changes, build-generals-x64]
@@ -323,15 +391,29 @@ jobs:
     uses: ./.github/workflows/build-toolchain.yml
     with:
       game: "GeneralsMD"
-      preset: "x64-vcpkg"
+      preset: "x64-zerohour-vcpkg-product"
       extras: true
+  build-native-x64-focused-runtime:
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - preset: "x64-debug-core"
+          - preset: "x64-profile-core"
+          - preset: "x64-asan-core"
+    uses: ./.github/workflows/build-toolchain.yml
+    with:
+      product: false
+      focused_targets: "core_deterministic_simulation_tests,core_job_system_tests,core_pipeline_execution_policy_tests"
+      focused_test_regex: '^core_'
 '@
     $goodBuild = @'
 if: startsWith(inputs.preset, 'win32') || startsWith(inputs.preset, 'x64')
 arch: ${{ startsWith(inputs.preset, 'x64') && 'x64' || 'x86' }}
 timeout-minutes: ${{ startsWith(inputs.preset, 'x64') && 90 || 30 }}
 key: cmake-deps-${{ hashFiles('cmake/patches/*.patch') }}
-if: inputs.game == 'Generals' && inputs.preset == 'x64-vcpkg'
+if: inputs.game == 'Generals' && inputs.preset == 'x64-generals-vcpkg-product'
       - name: Run Core extras tests for game
         if: inputs.extras
         run: |
@@ -340,11 +422,11 @@ if: inputs.game == 'Generals' && inputs.preset == 'x64-vcpkg'
           & ctest @arguments
           exit $LASTEXITCODE
       - name: Install native runtime for game
-        if: startsWith(inputs.preset, 'x64')
+        if: ${{ inputs.product && startsWith(inputs.preset, 'x64') }}
         run: |
           cmake --install build
       - name: Run installed native contract tests
-        if: ${{ inputs.extras && startsWith(inputs.preset, 'x64') }}
+        if: ${{ inputs.product && inputs.extras && startsWith(inputs.preset, 'x64') }}
         run: |
           $titleDirectory = '${{ inputs.game == 'Generals' && 'Generals' || 'ZeroHour' }}'
           $testName = '${{ inputs.game == 'Generals' && 'g_skirmish_ai_runner_contract_tests.exe' || 'z_runtime_regression_tests.exe' }}'
@@ -379,7 +461,7 @@ if: inputs.game == 'Generals' && inputs.preset == 'x64-vcpkg'
           if-no-files-found: error
 '@
     $goodPresets = @'
-{"configurePresets":[{"name":"x64-vcpkg","inherits":["x64","default-vcpkg"]},{"name":"unix","cacheVariables":{"RTS_BUILD_PRODUCT":"OFF","RTS_BUILD_CORE_TOOLS":"OFF","RTS_BUILD_CORE_EXTRAS":"OFF","RTS_BUILD_GENERALS":"OFF","RTS_BUILD_ZEROHOUR":"OFF"}}]}
+{"configurePresets":[{"name":"x64-generals-product","cacheVariables":{"RTS_BUILD_PRODUCT":"ON","RTS_BUILD_GENERALS":"ON","RTS_BUILD_ZEROHOUR":"OFF","RTS_BUILD_GENERALS_PRODUCT":"ON","RTS_BUILD_GENERALS_TOOLS":"OFF"}},{"name":"x64-generals-vcpkg-product","inherits":["x64-generals-product","default-vcpkg"]},{"name":"x64-zerohour-product","cacheVariables":{"RTS_BUILD_PRODUCT":"ON","RTS_BUILD_ZEROHOUR":"ON","RTS_BUILD_GENERALS":"OFF","RTS_BUILD_ZEROHOUR_PRODUCT":"ON","RTS_BUILD_ZEROHOUR_TOOLS":"OFF"}},{"name":"x64-zerohour-vcpkg-product","inherits":["x64-zerohour-product","default-vcpkg"]},{"name":"x64-debug-core","inherits":"x64-debug","cacheVariables":{"RTS_BUILD_PRODUCT":"OFF","RTS_BUILD_GENERALS":"OFF","RTS_BUILD_ZEROHOUR":"OFF","RTS_BUILD_CORE_TOOLS":"OFF","RTS_BUILD_CORE_EXTRAS":"ON"}},{"name":"x64-profile-core","inherits":"x64-profile","cacheVariables":{"RTS_BUILD_PRODUCT":"OFF","RTS_BUILD_GENERALS":"OFF","RTS_BUILD_ZEROHOUR":"OFF","RTS_BUILD_CORE_TOOLS":"OFF","RTS_BUILD_CORE_EXTRAS":"ON"}},{"name":"x64-asan-core","inherits":"x64-asan","cacheVariables":{"RTS_BUILD_PRODUCT":"OFF","RTS_BUILD_GENERALS":"OFF","RTS_BUILD_ZEROHOUR":"OFF","RTS_BUILD_CORE_TOOLS":"OFF","RTS_BUILD_CORE_EXTRAS":"ON"}},{"name":"unix","cacheVariables":{"RTS_BUILD_PRODUCT":"OFF","RTS_BUILD_CORE_TOOLS":"OFF","RTS_BUILD_CORE_EXTRAS":"OFF","RTS_BUILD_GENERALS":"OFF","RTS_BUILD_ZEROHOUR":"OFF"}}]}
 '@
     $goodCoreToolsCMake = @'
 set(audit_root "$ENV{RUNNER_TEMP}/GeneralsGameCode")
@@ -429,6 +511,23 @@ $arguments += "-DFFMPEG_RUNTIME_DIR=$FFmpegRuntimeDir"
     }
     if (-not $caughtMissingTitle) {
         throw 'Native x64 CI workflow audit self-test failed to reject missing Zero Hour coverage'
+    }
+
+    $caughtMissingFocusedPreset = $false
+    try {
+        Test-NativeX64CMakeContract `
+            -Presets ($goodPresets -replace '"x64-asan-core"', '"x64-asan-core-removed"') `
+            -CoreToolsCMake $goodCoreToolsCMake `
+            -FindFFmpegCMake $goodFindFFmpegCMake `
+            -CompressionCMake $goodCompressionCMake `
+            -GeneralsCMake $goodGeneralsCMake `
+            -ZeroHourCMake $goodZeroHourCMake `
+            -NativeProductRuntimeAudit $goodNativeProductRuntimeAudit
+    } catch {
+        $caughtMissingFocusedPreset = $true
+    }
+    if (-not $caughtMissingFocusedPreset) {
+        throw 'Native x64 CI workflow audit self-test failed to reject missing ASan core coverage'
     }
 
     $caughtWrongReusableWorkflow = $false

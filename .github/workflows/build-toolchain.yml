@@ -25,6 +25,21 @@ on:
         default: false
         type: boolean
         description: "Build extras"
+      product:
+        required: false
+        default: true
+        type: boolean
+        description: "Build the selected game product; disable for focused shared-runtime checks"
+      focused_targets:
+        required: false
+        default: ""
+        type: string
+        description: "Comma-separated CMake targets for a bounded focused build"
+      focused_test_regex:
+        required: false
+        default: ""
+        type: string
+        description: "Optional CTest regex for a bounded focused test run"
 
 jobs:
   build:
@@ -162,9 +177,22 @@ jobs:
       - name: Configure ${{ inputs.game }} with CMake Using ${{ inputs.preset }}${{ inputs.tools && '+t' || '' }}${{ inputs.extras && '+e' || '' }} Preset
         shell: pwsh
         run: |
+          $buildProduct = '${{ inputs.product }}' -eq 'true'
+          $productFlag = if ($buildProduct) { 'ON' } else { 'OFF' }
+          # Select the requested title subtree independently from its product
+          # executable.  Authoring jobs intentionally keep the subtree ON but
+          # pass product=OFF so the reusable workflow cannot resurrect a game
+          # executable that the preset explicitly disabled.
+          $generalsFlag = if ('${{ inputs.game }}' -eq 'Generals') { 'ON' } else { 'OFF' }
+          $zeroHourFlag = if ('${{ inputs.game }}' -eq 'GeneralsMD') { 'ON' } else { 'OFF' }
+          $generalsProductFlag = if ($buildProduct -and $generalsFlag -eq 'ON') { 'ON' } else { 'OFF' }
+          $zeroHourProductFlag = if ($buildProduct -and $zeroHourFlag -eq 'ON') { 'ON' } else { 'OFF' }
           $buildFlags = @(
-            "-DRTS_BUILD_ZEROHOUR=${{ inputs.game == 'GeneralsMD' && 'ON' || 'OFF' }}",
-            "-DRTS_BUILD_GENERALS=${{ inputs.game == 'Generals' && 'ON' || 'OFF' }}"
+            "-DRTS_BUILD_PRODUCT=$productFlag",
+            "-DRTS_BUILD_ZEROHOUR=$zeroHourFlag",
+            "-DRTS_BUILD_GENERALS=$generalsFlag",
+            "-DRTS_BUILD_GENERALS_PRODUCT=$generalsProductFlag",
+            "-DRTS_BUILD_ZEROHOUR_PRODUCT=$zeroHourProductFlag"
           )
 
           $gamePrefix = "${{ inputs.game == 'Generals' && 'GENERALS' || 'ZEROHOUR' }}"
@@ -179,7 +207,22 @@ jobs:
       - name: Build ${{ inputs.game }} with CMake Using ${{ inputs.preset }}${{ inputs.tools && '+t' || '' }}${{ inputs.extras && '+e' || '' }} Preset
         shell: pwsh
         run: |
-          cmake --build --preset ${{ inputs.preset }}
+          $focusedTargets = '${{ inputs.focused_targets }}'
+          if ([string]::IsNullOrWhiteSpace($focusedTargets)) {
+            cmake --build --preset ${{ inputs.preset }}
+            exit $LASTEXITCODE
+          }
+          $configuration = if ('${{ inputs.preset }}' -match 'debug|asan') { 'Debug' } else { 'Release' }
+          $targets = @($focusedTargets.Split(',') | ForEach-Object { $_.Trim() } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          if ($targets.Count -eq 0) {
+            Write-Error 'focused_targets must contain at least one CMake target.'
+            exit 1
+          }
+          foreach ($target in $targets) {
+            cmake --build "build\${{ inputs.preset }}" --config $configuration --target $target --parallel 2
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
 
       - name: Run runtime regression tests
         # The standalone harness links only in the release configuration. Debug validation
@@ -201,6 +244,9 @@ jobs:
         shell: pwsh
         run: |
           $arguments = @('--test-dir', "build\${{ inputs.preset }}", '--output-on-failure', '--no-tests=error')
+          if (-not [string]::IsNullOrWhiteSpace('${{ inputs.focused_test_regex }}')) {
+            $arguments += @('-R', '${{ inputs.focused_test_regex }}')
+          }
           if ('${{ inputs.preset }}' -like 'win32*' -or '${{ inputs.preset }}' -like 'x64*') {
             $configuration = if ('${{ inputs.preset }}' -match 'debug|asan') { 'Debug' } else { 'Release' }
             $arguments += @('-C', $configuration)
@@ -209,7 +255,7 @@ jobs:
           exit $LASTEXITCODE
 
       - name: Install native runtime for ${{ inputs.game }} with ${{ inputs.preset }}
-        if: startsWith(inputs.preset, 'x64')
+        if: ${{ inputs.product && startsWith(inputs.preset, 'x64') }}
         shell: pwsh
         run: |
           $configuration = if ('${{ inputs.preset }}' -match 'debug|asan') { 'Debug' } else { 'Release' }
@@ -227,7 +273,7 @@ jobs:
           }
 
       - name: Run installed native contract tests
-        if: ${{ inputs.extras && startsWith(inputs.preset, 'x64') }}
+        if: ${{ inputs.product && inputs.extras && startsWith(inputs.preset, 'x64') }}
         shell: pwsh
         run: |
           $titleDirectory = '${{ inputs.game == 'Generals' && 'Generals' || 'ZeroHour' }}'
@@ -257,13 +303,14 @@ jobs:
 
       - name: Save vcpkg binary cache
         # Only one job should save to avoid "Unable to reserve cache" conflicts.
-        if: ${{ contains(inputs.preset, 'vcpkg') && steps.vcpkg_cache.outputs.cache-hit != 'true' && inputs.game == 'Generals' && inputs.preset == 'x64-vcpkg' }}
+        if: ${{ contains(inputs.preset, 'vcpkg') && steps.vcpkg_cache.outputs.cache-hit != 'true' && inputs.game == 'Generals' && inputs.preset == 'x64-generals-vcpkg-product' }}
         uses: actions/cache/save@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
         with:
           path: ${{ github.workspace }}\vcpkg-bincache
           key: vcpkg-bincache-v3-${{ runner.os }}-baseline${{ steps.vcpkg_key.outputs.baseline }}-${{ steps.vcpkg_key.outputs.triplet }}-manifest${{ hashFiles('vcpkg.json', 'vcpkg-lock.json') }}-${{ hashFiles('triplets/*.cmake') }}
 
       - name: Collect ${{ inputs.game }} ${{ inputs.preset }}${{ inputs.tools && '+t' || '' }}${{ inputs.extras && '+e' || '' }} Artifact
+        if: ${{ inputs.product }}
         shell: pwsh
         run: |
           $buildDir = "build\${{ inputs.preset }}"
@@ -288,6 +335,7 @@ jobs:
           }
 
       - name: Upload ${{ inputs.game }} ${{ inputs.preset }}${{ inputs.tools && '+t' || '' }}${{ inputs.extras && '+e' || '' }} Artifact
+        if: ${{ inputs.product }}
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: ${{ inputs.game }}-${{ inputs.preset }}${{ inputs.tools && '+t' || '' }}${{ inputs.extras && '+e' || '' }}

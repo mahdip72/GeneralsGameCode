@@ -59,7 +59,8 @@ function Invoke-Audit {
         [string]$Root,
         [Parameter(Mandatory = $true)]
         [string]$Baseline,
-        [switch]$StrictD3D8Boundary
+        [switch]$StrictD3D8Boundary,
+        [switch]$StrictFinal
     )
 
     $powershellPath = (Get-Command powershell.exe -CommandType Application).Source
@@ -74,6 +75,9 @@ function Invoke-Audit {
         ' -Baseline "' + $escapedBaseline + '"'
     if ($StrictD3D8Boundary) {
         $startInfo.Arguments += ' -StrictD3D8Boundary'
+    }
+    if ($StrictFinal) {
+        $startInfo.Arguments += ' -StrictFinal'
     }
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
@@ -288,7 +292,24 @@ void GetFunctionDetails(void *pointer, char *name, char *filename, unsigned int 
 D3DFVF_XYZ;
 '@
     Set-FixtureFile $fixtureRoot 'Core/GameEngine/CMakeLists.txt' @'
-target_link_libraries(game d3d8lib)
+target_link_libraries(game d3d8lib rts_d3d8_headers rts_native_d3d8_compat_boundary d3d8to9)
+'@
+    Set-FixtureFile $fixtureRoot 'Core/GameEngine/NativeCutoverLeak.cpp' @'
+HMODULE LoadLegacyRuntime()
+{
+  HMODULE module = LoadLibraryA("d3d8.dll");
+  HMODULE moduleExWide = LoadLibraryExW(L"d3d8.dll", nullptr, 0);
+  HMODULE moduleExUtf8 = LoadLibraryExA(u8"d3d8.dll", nullptr, 0);
+  HMODULE moduleLowerL = LoadLibrary(l"d3d8.dll");
+  HMODULE moduleLowerU = LoadLibrary(u"d3d8.dll");
+  HMODULE moduleUpperU = LoadLibraryEx(U"d3d8.dll", nullptr, 0);
+  HMODULE moduleText = LoadLibrary(TEXT("d3d8.dll"));
+  HMODULE unrelated = LoadLibraryA("d3d9.dll");
+  HMODULE suffixed = LoadLibraryA("d3d8.dll.bak");
+  HMODULE extended = LoadLibraryA(u8"d3d8.dllx");
+  GetProcAddress(module, "Direct3DCreate8");
+  return module;
+}
 '@
     $strictFailure = Invoke-Audit $fixtureRoot $baseline -StrictD3D8Boundary
     $strictFailureRepeat = Invoke-Audit $fixtureRoot $baseline -StrictD3D8Boundary
@@ -298,7 +319,28 @@ target_link_libraries(game d3d8lib)
     Assert-Fixture ($strictFailure.Output -match 'W3DWater\.cpp:2: d3d8-fvf') 'strict audit must report active raw D3D8 tokens'
     Assert-Fixture ($strictFailure.Output -match 'W3DWater\.cpp:1: d3d8-fvf') 'strict audit must report raw D3D8 tokens in comments'
     Assert-Fixture ($strictFailure.Output -match 'CMakeLists\.txt:1: d3d8-build-dependency') 'strict audit must report product build dependencies'
+    Assert-Fixture ($strictFailure.Output -match 'CMakeLists\.txt:1: native-d3d8-compat-build-dependency') 'strict audit must report native compatibility dependency leakage'
+    foreach ($line in @(3, 4, 5, 6, 7, 8, 9)) {
+        Assert-Fixture ($strictFailure.Output -match ('NativeCutoverLeak\.cpp:{0}: d3d8-dynamic-library-load' -f $line)) `
+            ('strict audit must report dynamic D3D8 library loading on fixture line {0}' -f $line)
+    }
+    foreach ($line in @(10, 11, 12)) {
+        Assert-Fixture ($strictFailure.Output -notmatch ('NativeCutoverLeak\.cpp:{0}: d3d8-dynamic-library-load' -f $line)) `
+            ('strict audit must not classify a near-miss dynamic library literal on fixture line {0}' -f $line)
+    }
+    Assert-Fixture ($strictFailure.Output -match 'NativeCutoverLeak\.cpp:13: direct3dcreate8-dynamic-lookup') 'strict audit must report Direct3DCreate8 dynamic lookup'
     Assert-Fixture ($strictFailure.Output -notmatch 'authoring\.cpp') 'authoring paths must remain outside product-runtime scope'
+
+    $strictFinalFailure = Invoke-Audit $fixtureRoot $baseline -StrictFinal
+    Assert-Fixture ($strictFinalFailure.ExitCode -ne 0) 'strict final must reject dynamic D3D8 library loading'
+    foreach ($line in @(3, 4, 5, 6, 7, 8, 9)) {
+        Assert-Fixture ($strictFinalFailure.Output -match ('NativeCutoverLeak\.cpp:{0}: d3d8-dynamic-library-load' -f $line)) `
+            ('strict final must report dynamic D3D8 library loading on fixture line {0}' -f $line)
+    }
+    foreach ($line in @(10, 11, 12)) {
+        Assert-Fixture ($strictFinalFailure.Output -notmatch ('NativeCutoverLeak\.cpp:{0}: d3d8-dynamic-library-load' -f $line)) `
+            ('strict final must not classify a near-miss dynamic library literal on fixture line {0}' -f $line)
+    }
 
     Set-FixtureFile $fixtureRoot 'existing-grow.cpp' @'
 IDirect3DDevice8 *device;
@@ -314,11 +356,32 @@ DX8Wrapper *wrapper;
     Remove-Item -LiteralPath (Join-Path $fixtureRoot 'Generals/Code/GameEngine/Include/Common/StackDump.h') -Force
     Remove-Item -LiteralPath (Join-Path $fixtureRoot 'Core/Libraries/Source/WWVegas/WW3D2/W3DWater.cpp') -Force
     Remove-Item -LiteralPath (Join-Path $fixtureRoot 'Core/GameEngine/CMakeLists.txt') -Force
+    Remove-Item -LiteralPath (Join-Path $fixtureRoot 'Core/GameEngine/NativeCutoverLeak.cpp') -Force
 
     $clean = Invoke-Audit $fixtureRoot $baseline
     Assert-Fixture ($clean.ExitCode -eq 0) 'same-count edits and temporary backend additions must pass'
     $strictClean = Invoke-Audit $fixtureRoot $baseline -StrictD3D8Boundary
     Assert-Fixture ($strictClean.ExitCode -eq 0) 'strict boundary must pass when only explicit migration files retain D3D8'
+    $finalBlocked = Invoke-Audit $fixtureRoot $baseline -StrictFinal
+    Assert-Fixture ($finalBlocked.ExitCode -ne 0 -and
+        $finalBlocked.Output -match 'strict-final native-d3d8-free occurrences=') 'final cutover must remain blocked while an explicit migration file retains D3D8'
+
+    Set-FixtureFile $fixtureRoot 'Core/Libraries/Source/WWVegas/WW3D2/d3d11legacybridge.cpp' @'
+int NativeBridgeImplementation();
+'@
+    Set-FixtureFile $fixtureRoot 'Core/Libraries/Source/WWVegas/WW3D2/d3d11legacybridge.h' @'
+int NativeBridgeContract();
+'@
+    Set-FixtureFile $fixtureRoot 'Core/Libraries/Source/WWVegas/WW3D2/dx8wrapper.cpp' @'
+int NativeRendererImplementation();
+'@
+    Set-FixtureFile $fixtureRoot 'Core/Libraries/Source/WWVegas/WW3D2/dx8wrapper.h' @'
+int NativeRendererContract();
+'@
+    $finalClean = Invoke-Audit $fixtureRoot $baseline -StrictFinal
+    Assert-Fixture ($finalClean.ExitCode -eq 0) (
+        'final cutover must pass after the product migration boundary is D3D8-free: ' +
+        $finalClean.Output.Trim())
 
     # The device-free renderer contract target deliberately extracts and
     # declares raw-D3D8-shaped doubles.  Permit only its exact intermediate

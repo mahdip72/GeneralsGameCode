@@ -29,6 +29,14 @@ Process::Process()
   dwThreadID=0;
 }
 
+void Append_Process_Arguments(Process &process, int argc, char *argv[])
+{
+    for (int i = 0; i < argc; ++i) {
+        strcat(process.args, " ");
+        strcat(process.args, argv[i]);
+    }
+}
+
 bit8 Close_Process(Process &process)
 {
     bit8 result = TRUE;

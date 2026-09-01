@@ -17,7 +17,10 @@
                 "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL",
                 "CMAKE_MSVC_DEBUG_INFORMATION_FORMAT": "",
                 "CMAKE_BUILD_TYPE": "Release",
-                "RTS_FLAGS": "/W3"
+                "RTS_FLAGS": "/W3",
+                "RTS_TASK_OWNED_INSTALL_ROOT": "${sourceDir}/build/${presetName}/install",
+                "RTS_INSTALL_PREFIX_GENERALS": "${sourceDir}/build/${presetName}/install/Generals",
+                "RTS_INSTALL_PREFIX_ZEROHOUR": "${sourceDir}/build/${presetName}/install/ZeroHour"
             },
             "vendor": {
                 "jetbrains.com/clion": {
@@ -60,6 +63,38 @@
             "inherits": "vc6",
             "cacheVariables": {
                 "RTS_BUILD_OPTION_VC6_FULL_DEBUG": "ON"
+            }
+        },
+        {
+            "name": "vc6-generals-oracle",
+            "displayName": "Windows 32bit VC6 Generals Optimized Oracle",
+            "inherits": "vc6",
+            "cacheVariables": {
+                "RTS_BUILD_CORE_TOOLS": "OFF",
+                "RTS_BUILD_CORE_EXTRAS": "OFF",
+                "RTS_BUILD_PRODUCT": "ON",
+                "RTS_BUILD_GENERALS": "ON",
+                "RTS_BUILD_ZEROHOUR": "OFF",
+                "RTS_BUILD_GENERALS_PRODUCT": "ON",
+                "RTS_BUILD_GENERALS_TOOLS": "OFF",
+                "RTS_BUILD_GENERALS_EXTRAS": "OFF",
+                "RTS_BUILD_OPTION_FFMPEG": "OFF"
+            }
+        },
+        {
+            "name": "vc6-zerohour-oracle",
+            "displayName": "Windows 32bit VC6 Zero Hour Optimized Oracle",
+            "inherits": "vc6",
+            "cacheVariables": {
+                "RTS_BUILD_CORE_TOOLS": "OFF",
+                "RTS_BUILD_CORE_EXTRAS": "OFF",
+                "RTS_BUILD_PRODUCT": "ON",
+                "RTS_BUILD_GENERALS": "OFF",
+                "RTS_BUILD_ZEROHOUR": "ON",
+                "RTS_BUILD_ZEROHOUR_PRODUCT": "ON",
+                "RTS_BUILD_ZEROHOUR_TOOLS": "OFF",
+                "RTS_BUILD_ZEROHOUR_EXTRAS": "OFF",
+                "RTS_BUILD_OPTION_FFMPEG": "OFF"
             }
         },
         {
@@ -124,6 +159,38 @@
             }
         },
         {
+            "name": "win32-generals-authoring",
+            "inherits": "win32",
+            "displayName": "Windows 32bit Generals Authoring Tools",
+            "cacheVariables": {
+                "RTS_BUILD_CORE_TOOLS": "ON",
+                "RTS_BUILD_CORE_EXTRAS": "OFF",
+                "RTS_BUILD_PRODUCT": "OFF",
+                "RTS_BUILD_GENERALS": "ON",
+                "RTS_BUILD_ZEROHOUR": "OFF",
+                "RTS_BUILD_GENERALS_PRODUCT": "OFF",
+                "RTS_BUILD_GENERALS_TOOLS": "ON",
+                "RTS_BUILD_GENERALS_EXTRAS": "OFF",
+                "RTS_BUILD_OPTION_FFMPEG": "OFF"
+            }
+        },
+        {
+            "name": "win32-zerohour-authoring",
+            "inherits": "win32",
+            "displayName": "Windows 32bit Zero Hour Authoring Tools",
+            "cacheVariables": {
+                "RTS_BUILD_CORE_TOOLS": "ON",
+                "RTS_BUILD_CORE_EXTRAS": "OFF",
+                "RTS_BUILD_PRODUCT": "OFF",
+                "RTS_BUILD_GENERALS": "OFF",
+                "RTS_BUILD_ZEROHOUR": "ON",
+                "RTS_BUILD_ZEROHOUR_PRODUCT": "OFF",
+                "RTS_BUILD_ZEROHOUR_TOOLS": "ON",
+                "RTS_BUILD_ZEROHOUR_EXTRAS": "OFF",
+                "RTS_BUILD_OPTION_FFMPEG": "OFF"
+            }
+        },
+        {
             "name": "x64",
             "inherits": "default",
             "hidden": false,
@@ -153,6 +220,48 @@
             "displayName": "Windows x64 VCPKG Release Product"
         },
         {
+            "name": "x64-generals-product",
+            "inherits": "x64",
+            "hidden": false,
+            "displayName": "Windows x64 Generals Release Product",
+            "cacheVariables": {
+                "RTS_BUILD_CORE_EXTRAS": "OFF",
+                "RTS_BUILD_PRODUCT": "ON",
+                "RTS_BUILD_GENERALS": "ON",
+                "RTS_BUILD_ZEROHOUR": "OFF",
+                "RTS_BUILD_GENERALS_PRODUCT": "ON",
+                "RTS_BUILD_GENERALS_TOOLS": "OFF",
+                "RTS_BUILD_GENERALS_EXTRAS": "OFF"
+            }
+        },
+        {
+            "name": "x64-generals-vcpkg-product",
+            "inherits": ["x64-generals-product", "default-vcpkg"],
+            "hidden": false,
+            "displayName": "Windows x64 Generals VCPKG Release Product"
+        },
+        {
+            "name": "x64-zerohour-product",
+            "inherits": "x64",
+            "hidden": false,
+            "displayName": "Windows x64 Zero Hour Release Product",
+            "cacheVariables": {
+                "RTS_BUILD_CORE_EXTRAS": "OFF",
+                "RTS_BUILD_PRODUCT": "ON",
+                "RTS_BUILD_GENERALS": "OFF",
+                "RTS_BUILD_ZEROHOUR": "ON",
+                "RTS_BUILD_ZEROHOUR_PRODUCT": "ON",
+                "RTS_BUILD_ZEROHOUR_TOOLS": "OFF",
+                "RTS_BUILD_ZEROHOUR_EXTRAS": "OFF"
+            }
+        },
+        {
+            "name": "x64-zerohour-vcpkg-product",
+            "inherits": ["x64-zerohour-product", "default-vcpkg"],
+            "hidden": false,
+            "displayName": "Windows x64 Zero Hour VCPKG Release Product"
+        },
+        {
             "name": "x64-debug",
             "inherits": "x64",
             "hidden": false,
@@ -178,6 +287,51 @@
             "displayName": "Windows x64 Address Sanitizer Product",
             "cacheVariables": {
                 "RTS_BUILD_OPTION_ASAN": "ON"
+            }
+        },
+        {
+            "name": "x64-debug-core",
+            "inherits": "x64-debug",
+            "hidden": false,
+            "displayName": "Windows x64 Debug Core Focus",
+            "cacheVariables": {
+                "RTS_BUILD_PRODUCT": "OFF",
+                "RTS_BUILD_GENERALS": "OFF",
+                "RTS_BUILD_ZEROHOUR": "OFF",
+                "RTS_BUILD_GENERALS_PRODUCT": "OFF",
+                "RTS_BUILD_ZEROHOUR_PRODUCT": "OFF",
+                "RTS_BUILD_CORE_TOOLS": "OFF",
+                "RTS_BUILD_CORE_EXTRAS": "ON"
+            }
+        },
+        {
+            "name": "x64-profile-core",
+            "inherits": "x64-profile",
+            "hidden": false,
+            "displayName": "Windows x64 Profile Core Focus",
+            "cacheVariables": {
+                "RTS_BUILD_PRODUCT": "OFF",
+                "RTS_BUILD_GENERALS": "OFF",
+                "RTS_BUILD_ZEROHOUR": "OFF",
+                "RTS_BUILD_GENERALS_PRODUCT": "OFF",
+                "RTS_BUILD_ZEROHOUR_PRODUCT": "OFF",
+                "RTS_BUILD_CORE_TOOLS": "OFF",
+                "RTS_BUILD_CORE_EXTRAS": "ON"
+            }
+        },
+        {
+            "name": "x64-asan-core",
+            "inherits": "x64-asan",
+            "hidden": false,
+            "displayName": "Windows x64 Address Sanitizer Core Focus",
+            "cacheVariables": {
+                "RTS_BUILD_PRODUCT": "OFF",
+                "RTS_BUILD_GENERALS": "OFF",
+                "RTS_BUILD_ZEROHOUR": "OFF",
+                "RTS_BUILD_GENERALS_PRODUCT": "OFF",
+                "RTS_BUILD_ZEROHOUR_PRODUCT": "OFF",
+                "RTS_BUILD_CORE_TOOLS": "OFF",
+                "RTS_BUILD_CORE_EXTRAS": "ON"
             }
         },
         {
@@ -291,6 +445,18 @@
             "description": "Build Windows 32bit VC6 Weekly Release"
         },
         {
+            "name": "vc6-generals-oracle",
+            "configurePreset": "vc6-generals-oracle",
+            "displayName": "Build Windows 32bit VC6 Generals Optimized Oracle",
+            "description": "Build the isolated Generals legacy replay oracle"
+        },
+        {
+            "name": "vc6-zerohour-oracle",
+            "configurePreset": "vc6-zerohour-oracle",
+            "displayName": "Build Windows 32bit VC6 Zero Hour Optimized Oracle",
+            "description": "Build the isolated Zero Hour legacy replay oracle"
+        },
+        {
             "name": "win32",
             "configurePreset": "win32",
             "displayName": "Build Windows 32bit Release",
@@ -310,6 +476,20 @@
             "displayName": "Build Windows 32bit Debug",
             "description": "Build Windows 32bit Debug",
             "configuration": "Debug"
+        },
+        {
+            "name": "win32-generals-authoring",
+            "configurePreset": "win32-generals-authoring",
+            "displayName": "Build Windows 32bit Generals Authoring Tools",
+            "description": "Build Generals authoring tools without the game executable",
+            "configuration": "Release"
+        },
+        {
+            "name": "win32-zerohour-authoring",
+            "configurePreset": "win32-zerohour-authoring",
+            "displayName": "Build Windows 32bit Zero Hour Authoring Tools",
+            "description": "Build Zero Hour authoring tools without the game executable",
+            "configuration": "Release"
         },
         {
             "name": "win32-vcpkg",
@@ -347,6 +527,34 @@
             "configuration": "Release"
         },
         {
+            "name": "x64-generals-product",
+            "configurePreset": "x64-generals-product",
+            "displayName": "Build Windows x64 Generals Release Product",
+            "description": "Build the isolated Generals native product",
+            "configuration": "Release"
+        },
+        {
+            "name": "x64-generals-vcpkg-product",
+            "configurePreset": "x64-generals-vcpkg-product",
+            "displayName": "Build Windows x64 Generals VCPKG Release Product",
+            "description": "Build the isolated Generals native VCPKG product",
+            "configuration": "Release"
+        },
+        {
+            "name": "x64-zerohour-product",
+            "configurePreset": "x64-zerohour-product",
+            "displayName": "Build Windows x64 Zero Hour Release Product",
+            "description": "Build the isolated Zero Hour native product",
+            "configuration": "Release"
+        },
+        {
+            "name": "x64-zerohour-vcpkg-product",
+            "configurePreset": "x64-zerohour-vcpkg-product",
+            "displayName": "Build Windows x64 Zero Hour VCPKG Release Product",
+            "description": "Build the isolated Zero Hour native VCPKG product",
+            "configuration": "Release"
+        },
+        {
             "name": "x64-debug",
             "configurePreset": "x64-debug",
             "displayName": "Build Windows x64 Debug Product",
@@ -365,6 +573,27 @@
             "configurePreset": "x64-asan",
             "displayName": "Build Windows x64 Address Sanitizer Product",
             "description": "Build Windows x64 Address Sanitizer Product",
+            "configuration": "Debug"
+        },
+        {
+            "name": "x64-debug-core",
+            "configurePreset": "x64-debug-core",
+            "displayName": "Build Windows x64 Debug Core Focus",
+            "description": "Build only focused shared runtime tests for x64 Debug",
+            "configuration": "Debug"
+        },
+        {
+            "name": "x64-profile-core",
+            "configurePreset": "x64-profile-core",
+            "displayName": "Build Windows x64 Profile Core Focus",
+            "description": "Build only focused shared runtime tests for x64 Profile",
+            "configuration": "Release"
+        },
+        {
+            "name": "x64-asan-core",
+            "configurePreset": "x64-asan-core",
+            "displayName": "Build Windows x64 Address Sanitizer Core Focus",
+            "description": "Build only focused shared runtime tests for x64 ASan",
             "configuration": "Debug"
         },
         {
@@ -446,6 +675,42 @@
             "name": "x64-asan",
             "configurePreset": "x64-asan",
             "displayName": "Test Windows x64 Address Sanitizer Product",
+            "configuration": "Debug",
+            "output": {
+                "outputOnFailure": true
+            },
+            "execution": {
+                "noTestsAction": "error"
+            }
+        },
+        {
+            "name": "x64-debug-core",
+            "configurePreset": "x64-debug-core",
+            "displayName": "Test Windows x64 Debug Core Focus",
+            "configuration": "Debug",
+            "output": {
+                "outputOnFailure": true
+            },
+            "execution": {
+                "noTestsAction": "error"
+            }
+        },
+        {
+            "name": "x64-profile-core",
+            "configurePreset": "x64-profile-core",
+            "displayName": "Test Windows x64 Profile Core Focus",
+            "configuration": "Release",
+            "output": {
+                "outputOnFailure": true
+            },
+            "execution": {
+                "noTestsAction": "error"
+            }
+        },
+        {
+            "name": "x64-asan-core",
+            "configurePreset": "x64-asan-core",
+            "displayName": "Test Windows x64 Address Sanitizer Core Focus",
             "configuration": "Debug",
             "output": {
                 "outputOnFailure": true

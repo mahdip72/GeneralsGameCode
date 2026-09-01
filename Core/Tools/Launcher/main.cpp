@@ -208,16 +208,10 @@ int main(int argc, char *argv[])
 
 	DBGMSG("Read process info");
 
-	for (int i = 1; i < argc; i++)
+	Append_Process_Arguments(proc, argc - 1, argv + 1);
+	if (hasSecondEXE)
 	{
-		strcat(proc.args, " ");
-		strcat(proc.args, argv[i]);
-
-		if (hasSecondEXE)
-		{
-			strcat(proc2.args, " ");
-			strcat(proc2.args, argv[i]);
-		}
+		Append_Process_Arguments(proc2, argc - 1, argv + 1);
 	}
 
 	DBGMSG("ARGS: "<<proc.args);

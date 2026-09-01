@@ -42,11 +42,11 @@ $rawD3D8BoundaryPaths = @(
 )
 
 # These are the only product-runtime files allowed to mention the legacy
-# D3D8 ABI after the final renderer cutover.  Keep this list explicit: a
+# D3D8 ABI during the staged renderer cutover.  Keep this list explicit: a
 # wildcard here would allow an entire subsystem to silently remain on D3D8.
-# The strict audit is intentionally not enabled by the intermediate-stage
-# CTest; it is the final-cutover gate while the D3D8 backend still exists as a
-# differential oracle.
+# StrictD3D8Boundary enforces this temporary containment list. StrictFinal
+# permits no matches at all and must remain red until native device ownership
+# replaces the compatibility bridge.
 $strictD3D8BoundaryPaths = @(
     'Core/Libraries/Source/WWVegas/WW3D2/d3d11legacybridge.cpp',
     'Core/Libraries/Source/WWVegas/WW3D2/d3d11legacybridge.h',
@@ -125,6 +125,23 @@ $strictD3D8Rules = @(
         # reported a second time as a linker dependency.
         Pattern = '(?i)(?<![A-Za-z0-9_])d3dx?8(?:lib|\.lib)?(?![A-Za-z0-9_])'
         Scope = 'build'
+    },
+    [pscustomobject]@{
+        Name = 'native-d3d8-compat-build-dependency'
+        Pattern = '(?i)(?<![A-Za-z0-9_])(?:rts_d3d8_headers|rts_native_d3d8_compat_boundary|d3d8to9|native-d3d8-compat)(?![A-Za-z0-9_])'
+        Scope = 'build'
+    },
+    [pscustomobject]@{
+        Name = 'd3d8-dynamic-library-load'
+        # Match the ANSI, wide, and UTF-prefixed literal spellings accepted by
+        # the Win32 loader APIs.  The optional TEXT wrapper remains supported
+        # for the legacy source while the literal suffix keeps near-misses
+        # (such as d3d8.dll.bak) out of this rule.
+        Pattern = '(?i)\bLoadLibrary(?:Ex)?[AW]?\s*\(\s*(?:TEXT\s*\(\s*)?(?:u8|[lu])?["'']d3d8\.dll["'']'
+    },
+    [pscustomobject]@{
+        Name = 'direct3dcreate8-dynamic-lookup'
+        Pattern = '(?i)\bGetProcAddress\s*\([^\r\n,]+,\s*["'']Direct3DCreate8["'']\s*\)'
     },
     [pscustomobject]@{
         Name = 'd3d8-legacy-descriptor-or-constant'
@@ -334,6 +351,7 @@ function Get-StrictD3D8Matches {
 function Write-StrictD3D8Report {
     param(
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [object[]]$Matches
     )
 
@@ -567,13 +585,17 @@ foreach ($line in $diff) {
 }
 
 if ($StrictFinal -or $StrictD3D8Boundary) {
-    $strictMatches = Get-StrictD3D8Matches $sourceRootPath $files
+    $strictMatches = @(Get-StrictD3D8Matches $sourceRootPath $files)
     Write-StrictD3D8Report $strictMatches
     $strictOutsideCount = @($strictMatches |
         Where-Object { -not $_.Boundary }).Count
-    if ($strictOutsideCount -ne 0) {
+    if ($StrictFinal -and $strictMatches.Count -ne 0) {
         $violations +=
-            "strict-final raw-d3d8-boundary outside-occurrences=$strictOutsideCount"
+            "strict-final native-d3d8-free occurrences=$($strictMatches.Count)"
+    }
+    elseif ($strictOutsideCount -ne 0) {
+        $violations +=
+            "strict-boundary raw-d3d8 outside-occurrences=$strictOutsideCount"
     }
 }
 

@@ -936,15 +936,25 @@ function Get-TokenViolations {
         }
     }
 
-    $nativeStart = $RuntimeCMake.IndexOf('elseif(RTS_BUILD_PRODUCT', [StringComparison]::Ordinal)
+    $moduleMarker = "# RTS_NATIVE_PRODUCT_RUNTIME_MODULE`n"
+    $nativeStart = $RuntimeCMake.IndexOf($moduleMarker, [StringComparison]::Ordinal)
+    if ($nativeStart -ge 0) {
+        $win32Block = $RuntimeCMake.Substring(0, $nativeStart)
+        $nativeBlock = $RuntimeCMake.Substring($nativeStart + $moduleMarker.Length)
+    } else {
+        # Retain the compact combined-block fixture accepted by the self-test.
+        $nativeStart = $RuntimeCMake.IndexOf('elseif(RTS_BUILD_PRODUCT', [StringComparison]::Ordinal)
+        if ($nativeStart -ge 0) {
+            $win32Block = $RuntimeCMake.Substring(0, $nativeStart)
+            $nativeBlock = $RuntimeCMake.Substring($nativeStart)
+        }
+    }
     if ($nativeStart -lt 0) {
         $violations.Add('native runtime dependency block is missing')
     } else {
-        $nativeBlock = $RuntimeCMake.Substring($nativeStart)
-        if ($nativeBlock -notmatch '(?m)^        bcrypt$') {
+        if ($nativeBlock -notmatch '(?m)^\s*bcrypt$') {
             $violations.Add('native runtime dependency block does not link bcrypt')
         }
-        $win32Block = $RuntimeCMake.Substring(0, $nativeStart)
         if ($win32Block -match '(?m)^\s*bcrypt$') {
             $violations.Add('Win32 legacy runtime must not link bcrypt')
         }
@@ -1680,7 +1690,9 @@ if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
 }
 $root = (Resolve-Path -LiteralPath $SourceRoot).Path
 $source = [IO.File]::ReadAllText((Join-Path $root 'Core/GameEngine/Source/GameNetwork/ConnectionManager.cpp'))
-$runtimeCMake = [IO.File]::ReadAllText((Join-Path $root 'cmake/legacy-product-runtime.cmake'))
+$runtimeCMake = [IO.File]::ReadAllText((Join-Path $root 'cmake/legacy-product-runtime.cmake')) +
+    "`n# RTS_NATIVE_PRODUCT_RUNTIME_MODULE`n" +
+    [IO.File]::ReadAllText((Join-Path $root 'cmake/native-product-runtime.cmake'))
 $epochHeader = [IO.File]::ReadAllText((Join-Path $root 'Core/Libraries/Include/Lib/NetworkEpochHandshake.h'))
 $source = $source + "`n" + $epochHeader + "`n" +
     [IO.File]::ReadAllText((Join-Path $root 'Core/GameEngine/Source/GameNetwork/DisconnectManager.cpp')) + "`n" +
