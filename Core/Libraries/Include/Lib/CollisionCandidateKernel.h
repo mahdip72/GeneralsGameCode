@@ -137,6 +137,7 @@ struct CollisionCandidateMetrics
 	unsigned ownerHelpedJobs;
 	JobMetricCounter physicalWorkerMask;
 	unsigned distinctPhysicalWorkers;
+	bool physicalWorkerMaskComplete;
 };
 
 struct CollisionCandidateRuntimeMetrics
@@ -167,6 +168,10 @@ struct CollisionCandidateRuntimeMetrics
 	JobMetricCounter physicalWorkerJobs;
 	JobMetricCounter ownerHelpedJobs;
 	JobMetricCounter physicalWorkerMask;
+	// Maximum exact distinct-worker count observed in one accepted batch.  The
+	// fixed-width mask is diagnostic only and may be incomplete on large hosts.
+	unsigned distinctPhysicalWorkers;
+	bool physicalWorkerMaskComplete;
 };
 
 typedef bool (*CollisionCandidateGenerationResolver)(unsigned objectID,

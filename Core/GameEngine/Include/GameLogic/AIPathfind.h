@@ -94,8 +94,12 @@ struct OrdinaryPathRuntimeMetrics
 	UnsignedInt workerExecutedRangeJobs;
 	UnsignedInt ownerHelpedRangeJobs;
 	UnsignedInt failedRangeJobs;
+	// The mask is retained as a compact legacy diagnostic.  On hosts with more
+	// than 32 workers, use distinctPhysicalWorkers and consult completeness.
 	UnsignedInt physicalWorkerMask;
+	// Maximum exact distinct-worker count observed in one ordinary-path batch.
 	UnsignedInt distinctPhysicalWorkers;
+	Bool physicalWorkerMaskComplete;
 	UnsignedInt authoritativeCommits;
 	UnsignedInt authoritativeMultiWorkerCommits;
 	UnsignedInt staleRejections;

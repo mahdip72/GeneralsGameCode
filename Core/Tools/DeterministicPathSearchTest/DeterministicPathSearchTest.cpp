@@ -132,6 +132,15 @@ void TestConcurrentMultiWorkerAuthorityCorrelation()
 	assert(rts::IsDeterministicDirectPathConcurrentMultiWorkerBatch(execution));
 	execution.distinctPhysicalWorkerCount = 1;
 	assert(!rts::IsDeterministicDirectPathConcurrentMultiWorkerBatch(execution));
+
+	rts::DeterministicOrdinaryPathBatchExecutionSnapshot ordinary = {};
+	ordinary.physicalWorkerMask = ~std::uint64_t(0);
+	ordinary.distinctPhysicalWorkerCount = 65;
+	ordinary.physicalWorkerMaskComplete = false;
+	ordinary.peakActiveWorkers = 2;
+	assert(rts::IsDeterministicOrdinaryPathConcurrentMultiWorkerBatch(ordinary));
+	ordinary.distinctPhysicalWorkerCount = 1;
+	assert(!rts::IsDeterministicOrdinaryPathConcurrentMultiWorkerBatch(ordinary));
 }
 
 void AssertCallbacks(std::int32_t startX, std::int32_t startY,
@@ -1491,6 +1500,7 @@ void TestOrdinaryOneWorkerSerialParity()
 	assert(execution.workerExecutedRangeJobCount == 1);
 	assert(execution.ownerExecutedRangeJobCount == 0);
 	assert(execution.distinctPhysicalWorkerCount == 1);
+	assert(execution.physicalWorkerMaskComplete);
 	assert(execution.peakActiveWorkers == 1);
 	assert(!rts::IsDeterministicOrdinaryPathConcurrentMultiWorkerBatch(execution));
 	assert(jobs.metrics().ownerHelpCount == ownerHelpBefore);
@@ -1577,6 +1587,7 @@ void TestOrdinaryAdaptiveLargeObstructedBatchAndFaults()
 	assert(largeExecution.workerExecutedRangeJobCount == 4);
 	assert(largeExecution.ownerExecutedRangeJobCount == 0);
 	assert(largeExecution.distinctPhysicalWorkerCount == 4);
+	assert(largeExecution.physicalWorkerMaskComplete);
 	assert(largeExecution.peakActiveWorkers == 4);
 	assert(rts::IsDeterministicOrdinaryPathConcurrentMultiWorkerBatch(
 		largeExecution));

@@ -310,6 +310,8 @@ static UnsignedInt s_ordinaryPathWorkerExecutedRangeCount = 0;
 static UnsignedInt s_ordinaryPathOwnerHelpedRangeCount = 0;
 static UnsignedInt s_ordinaryPathFailedRangeCount = 0;
 static UnsignedInt s_ordinaryPathPhysicalWorkerMask = 0;
+static UnsignedInt s_ordinaryPathDistinctPhysicalWorkerCount = 0;
+static Bool s_ordinaryPathPhysicalWorkerMaskComplete = TRUE;
 static UnsignedInt s_ordinaryPathAuthoritativeCommitCount = 0;
 static UnsignedInt s_ordinaryPathAuthoritativeMultiWorkerCommitCount = 0;
 static UnsignedInt s_ordinaryPathStaleCount = 0;
@@ -415,11 +417,10 @@ OrdinaryPathRuntimeMetrics GetOrdinaryPathRuntimeMetrics()
 	metrics.ownerHelpedRangeJobs = s_ordinaryPathOwnerHelpedRangeCount;
 	metrics.failedRangeJobs = s_ordinaryPathFailedRangeCount;
 	metrics.physicalWorkerMask = s_ordinaryPathPhysicalWorkerMask;
-	for (UnsignedInt mask = s_ordinaryPathPhysicalWorkerMask; mask != 0;
-		mask &= mask - 1)
-	{
-		++metrics.distinctPhysicalWorkers;
-	}
+	metrics.distinctPhysicalWorkers =
+		s_ordinaryPathDistinctPhysicalWorkerCount;
+	metrics.physicalWorkerMaskComplete =
+		s_ordinaryPathPhysicalWorkerMaskComplete;
 	metrics.authoritativeCommits = s_ordinaryPathAuthoritativeCommitCount;
 	metrics.authoritativeMultiWorkerCommits =
 		s_ordinaryPathAuthoritativeMultiWorkerCommitCount;
@@ -461,6 +462,8 @@ void ResetOrdinaryPathRuntimeMetrics()
 	s_ordinaryPathOwnerHelpedRangeCount = 0;
 	s_ordinaryPathFailedRangeCount = 0;
 	s_ordinaryPathPhysicalWorkerMask = 0;
+	s_ordinaryPathDistinctPhysicalWorkerCount = 0;
+	s_ordinaryPathPhysicalWorkerMaskComplete = TRUE;
 	s_ordinaryPathAuthoritativeCommitCount = 0;
 	s_ordinaryPathAuthoritativeMultiWorkerCommitCount = 0;
 	s_ordinaryPathStaleCount = 0;
@@ -6927,6 +6930,17 @@ void Pathfinder::processPathfindQueue()
 					execution.failedRangeJobCount);
 				s_ordinaryPathPhysicalWorkerMask |= static_cast<UnsignedInt>(
 					execution.physicalWorkerMask & 0xffffffffU);
+				if (execution.distinctPhysicalWorkerCount >
+					s_ordinaryPathDistinctPhysicalWorkerCount)
+				{
+					s_ordinaryPathDistinctPhysicalWorkerCount =
+						execution.distinctPhysicalWorkerCount;
+				}
+				if (!execution.physicalWorkerMaskComplete ||
+					(execution.physicalWorkerMask >> 32) != 0)
+				{
+					s_ordinaryPathPhysicalWorkerMaskComplete = FALSE;
+				}
 				for (std::size_t i = 0; i < requestCount; ++i)
 				{
 					if (ordinaryPathBatchContext.batch.requestExecutionSnapshot(i).state ==

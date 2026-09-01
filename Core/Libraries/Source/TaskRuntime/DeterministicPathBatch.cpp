@@ -1328,6 +1328,7 @@ DeterministicOrdinaryPathBatchExecutionSnapshot
 DeterministicOrdinaryPathBatch::executionSnapshot() const
 {
 	DeterministicOrdinaryPathBatchExecutionSnapshot snapshot = {};
+	snapshot.physicalWorkerMaskComplete = true;
 	if (m_state == nullptr)
 		return snapshot;
 	snapshot.requestCount = m_state->requestCount;
@@ -1366,6 +1367,8 @@ DeterministicOrdinaryPathBatch::executionSnapshot() const
 				if (workerIndex < 64)
 					snapshot.physicalWorkerMask |=
 						std::uint64_t(1) << workerIndex;
+				else
+					snapshot.physicalWorkerMaskComplete = false;
 			}
 		}
 		else if (state == DIRECT_PATH_WORK_OWNER)

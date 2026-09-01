@@ -139,6 +139,9 @@ struct DeterministicOrdinaryPathBatchExecutionSnapshot
 	unsigned grainSize;
 	std::uint64_t physicalWorkerMask;
 	unsigned distinctPhysicalWorkerCount;
+	// False when one or more exact worker identities cannot be represented by
+	// the fixed-width diagnostic mask.  Authority uses the explicit count.
+	bool physicalWorkerMaskComplete;
 	unsigned peakActiveWorkers;
 	bool completed;
 	bool timedOut;

@@ -26,7 +26,8 @@ CollisionCandidateMetrics::CollisionCandidateMetrics()
 	  completedJobs(0), serialFallbacks(0), localSortRuns(0),
 	  locallyUniqueCandidates(0), ownerMergeComparisons(0),
 	  maximumRangeInputs(0), physicalWorkerJobs(0), ownerHelpedJobs(0),
-	  physicalWorkerMask(0), distinctPhysicalWorkers(0)
+	  physicalWorkerMask(0), distinctPhysicalWorkers(0),
+	  physicalWorkerMaskComplete(true)
 
 {
 }
@@ -40,7 +41,8 @@ CollisionCandidateRuntimeMetrics::CollisionCandidateRuntimeMetrics()
 	  preparedPairs(0), uniqueCandidates(0), submittedJobs(0),
 	  completedJobs(0), localSortRuns(0), locallyUniqueCandidates(0),
 	  ownerMergeComparisons(0), maximumRangeInputs(0), physicalWorkerJobs(0),
-	  ownerHelpedJobs(0), physicalWorkerMask(0)
+	  ownerHelpedJobs(0), physicalWorkerMask(0), distinctPhysicalWorkers(0),
+	  physicalWorkerMaskComplete(true)
 {
 }
 
@@ -298,17 +300,6 @@ unsigned sortAndDeduplicateRange(CollisionCandidate *scratch,
 	return uniqueCount;
 }
 
-unsigned countBits(JobMetricCounter value)
-{
-	unsigned count = 0;
-	while (value != 0)
-	{
-		value &= value - 1;
-		++count;
-	}
-	return count;
-}
-
 void collectRangeMetrics(CollisionCandidateRangeState *ranges,
 	unsigned rangeCount, CollisionCandidateMetrics *metrics)
 {
@@ -326,6 +317,18 @@ void collectRangeMetrics(CollisionCandidateRangeState *ranges,
 		if (range.physicalWorker)
 		{
 			++metrics->physicalWorkerJobs;
+			bool firstRangeForWorker = true;
+			for (unsigned prior = 0; prior != rangeIndex; ++prior)
+			{
+				if (ranges[prior].completed && ranges[prior].physicalWorker &&
+					ranges[prior].physicalWorkerIndex == range.physicalWorkerIndex)
+				{
+					firstRangeForWorker = false;
+					break;
+				}
+			}
+			if (firstRangeForWorker)
+				++metrics->distinctPhysicalWorkers;
 			if (range.physicalWorkerIndex <
 				sizeof(JobMetricCounter) * 8)
 			{
@@ -333,13 +336,16 @@ void collectRangeMetrics(CollisionCandidateRangeState *ranges,
 					static_cast<JobMetricCounter>(1) <<
 					range.physicalWorkerIndex;
 			}
+			else
+			{
+				metrics->physicalWorkerMaskComplete = false;
+			}
 		}
 		else
 		{
 			++metrics->ownerHelpedJobs;
 		}
 	}
-	metrics->distinctPhysicalWorkers = countBits(metrics->physicalWorkerMask);
 }
 
 unsigned mergeSortedRanges(CollisionCandidate *scratch,
@@ -1102,6 +1108,14 @@ void RecordCollisionCandidateParallelWork(
 	s_runtimeMetrics.physicalWorkerJobs += metrics.physicalWorkerJobs;
 	s_runtimeMetrics.ownerHelpedJobs += metrics.ownerHelpedJobs;
 	s_runtimeMetrics.physicalWorkerMask |= metrics.physicalWorkerMask;
+	if (metrics.distinctPhysicalWorkers >
+		s_runtimeMetrics.distinctPhysicalWorkers)
+	{
+		s_runtimeMetrics.distinctPhysicalWorkers =
+			metrics.distinctPhysicalWorkers;
+	}
+	if (!metrics.physicalWorkerMaskComplete)
+		s_runtimeMetrics.physicalWorkerMaskComplete = false;
 }
 
 void RecordCollisionCandidateIneligibleSlice()

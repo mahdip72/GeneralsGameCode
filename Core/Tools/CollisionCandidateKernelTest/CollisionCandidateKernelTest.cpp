@@ -657,6 +657,7 @@ void testPartitionOrderingGenerationAndCallbackDestruction()
 	parallelWork.ownerHelpedJobs = 1;
 	parallelWork.physicalWorkerMask = 5;
 	parallelWork.distinctPhysicalWorkers = 2;
+	parallelWork.physicalWorkerMaskComplete = true;
 	rts::RecordCollisionCandidateParallelWork(parallelWork);
 	rts::RecordCollisionCandidateIneligibleSlice();
 	rts::RecordCollisionCandidateOwnerFallback(true, true);
@@ -674,8 +675,18 @@ void testPartitionOrderingGenerationAndCallbackDestruction()
 		runtime.ownerMergeComparisons == 12 &&
 		runtime.maximumRangeInputs == 2 &&
 		runtime.physicalWorkerJobs == 3 && runtime.ownerHelpedJobs == 1 &&
-		runtime.physicalWorkerMask == 5,
+		runtime.physicalWorkerMask == 5 &&
+		runtime.distinctPhysicalWorkers == 2 &&
+		runtime.physicalWorkerMaskComplete,
 		"runtime metrics separate commits, shadows, failures, useful work, and jobs");
+	parallelWork.distinctPhysicalWorkers = 65;
+	parallelWork.physicalWorkerMaskComplete = false;
+	rts::RecordCollisionCandidateParallelWork(parallelWork);
+	const rts::CollisionCandidateRuntimeMetrics highCoreRuntime =
+		rts::GetCollisionCandidateRuntimeMetrics();
+	expect(highCoreRuntime.distinctPhysicalWorkers == 65 &&
+		!highCoreRuntime.physicalWorkerMaskComplete,
+		"runtime authority retains exact high-core identity count when its mask truncates");
 	rts::ResetCollisionCandidateRuntimeMetrics();
 	const rts::CollisionCandidateRuntimeMetrics resetRuntime =
 		rts::GetCollisionCandidateRuntimeMetrics();
@@ -698,7 +709,9 @@ void testPartitionOrderingGenerationAndCallbackDestruction()
 		resetRuntime.maximumRangeInputs == 0 &&
 		resetRuntime.physicalWorkerJobs == 0 &&
 		resetRuntime.ownerHelpedJobs == 0 &&
-		resetRuntime.physicalWorkerMask == 0,
+		resetRuntime.physicalWorkerMask == 0 &&
+		resetRuntime.distinctPhysicalWorkers == 0 &&
+		resetRuntime.physicalWorkerMaskComplete,
 		"runtime metric lifecycle reset advances its epoch and clears every collision counter");
 }
 
@@ -798,6 +811,7 @@ void testActualWorkerMatrixParity()
 			expect(metrics.physicalWorkerJobs + metrics.ownerHelpedJobs ==
 				metrics.completedJobs && metrics.physicalWorkerJobs != 0 &&
 				metrics.distinctPhysicalWorkers != 0 &&
+				metrics.physicalWorkerMaskComplete &&
 				(metrics.physicalWorkerMask >> workerCounts[worker]) == 0,
 				"range identities distinguish physical workers from owner help");
 			expect(parallelCount == serialCount && sameCandidates(
@@ -918,7 +932,9 @@ void testOwnerHelpIdentityAndParity()
 			"owner-help execution preserves exact reverse-pair parity");
 		expect(metrics.ownerHelpedJobs == metrics.completedJobs &&
 			metrics.physicalWorkerJobs == 0 &&
-			metrics.physicalWorkerMask == 0,
+			metrics.physicalWorkerMask == 0 &&
+			metrics.distinctPhysicalWorkers == 0 &&
+			metrics.physicalWorkerMaskComplete,
 			"owner-help identity cannot masquerade as a physical worker");
 	}
 
