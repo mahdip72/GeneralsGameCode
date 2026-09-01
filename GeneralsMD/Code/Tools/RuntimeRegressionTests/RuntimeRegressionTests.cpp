@@ -20,6 +20,7 @@
 #include "Common/SkirmishAITestRunner.h"
 #include "Common/SkirmishAIReplayEpoch.h"
 #include "Common/PathfindQueueReplayEpoch.h"
+#include "XferCrcSnapshotTest.h"
 #include "GameLogic/SkirmishAIDecision.h"
 #include "GameLogic/SkirmishAILiveness.h"
 #include "WW3D2/textureloader.h"
@@ -1517,6 +1518,12 @@ static void TestSkirmishAITestRunnerContract()
 int main(int argc, char **argv)
 {
 	initMemoryManager();
+	if (argc == 2 && strcmp(argv[1], "--xfer-crc-snapshot") == 0)
+	{
+		const int result = RunXferCrcSnapshotTests();
+		shutdownMemoryManager();
+		return result;
+	}
 #if defined(_WIN64)
 	if (argc == 2 && strcmp(argv[1], "--native-logical-audio") == 0)
 	{

@@ -10,6 +10,7 @@
 
 #include "Common/INI.h"
 #include "Common/SkirmishAITestRunner.h"
+#include "XferCrcSnapshotTest.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -45,8 +46,11 @@ static void Check(Bool result, const char *expression, Int line)
 	}
 }
 
-int main()
+int main(int argc, char **argv)
 {
+	if (argc == 2 && strcmp(argv[1], "--xfer-crc-snapshot") == 0)
+		return RunXferCrcSnapshotTests();
+
 	CHECK(!IsSkirmishAITestRunnerArmed());
 	Int seed = 0;
 	CHECK(TryParseSkirmishAITestSeed("1729", &seed));

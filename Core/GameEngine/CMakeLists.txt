@@ -21,6 +21,7 @@ set(GAMEENGINE_SRC
 #    Include/Common/BuildAssistant.h
 #    Include/Common/ClientUpdateModule.h
     Include/Common/CommandLine.h
+    Include/Common/DeterministicCrcLiveVerifier.h
     Include/GameLogic/ImmutableSpatialQueryRuntime.h
     Include/Common/SkirmishAITestRunner.h
     Include/Common/crc.h
@@ -141,6 +142,7 @@ set(GAMEENGINE_SRC
     Include/Common/WorkerProcess.h
     Include/Common/Xfer.h
     Include/Common/XferCRC.h
+    Include/Common/XferCRCSnapshot.h
     Include/Common/XferDeepCRC.h
     Include/Common/XferLoad.h
     Include/Common/XferSave.h
@@ -687,6 +689,8 @@ set(GAMEENGINE_SRC
 #    Source/Common/System/Upgrade.cpp
     Source/Common/System/Xfer.cpp
     Source/Common/System/XferCRC.cpp
+    Source/Common/System/DeterministicCrcLiveVerifier.cpp
+    Source/Common/System/XferCRCSnapshot.cpp
     Source/Common/System/XferLoad.cpp
     Source/Common/System/XferSave.cpp
     Source/Common/TerrainTypes.cpp

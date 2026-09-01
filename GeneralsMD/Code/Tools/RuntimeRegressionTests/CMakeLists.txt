@@ -1,7 +1,23 @@
+add_library(z_xcrc OBJECT
+    "${CMAKE_SOURCE_DIR}/Core/Tools/XferCrcSnapshotTest/XferCrcSnapshotTest.cpp"
+)
+target_include_directories(z_xcrc PRIVATE
+    "${CMAKE_SOURCE_DIR}/Core/Tools/XferCrcSnapshotTest"
+)
+target_link_libraries(z_xcrc PRIVATE
+    z_gameengine
+    zi_always
+)
+set_target_properties(z_xcrc PROPERTIES DISABLE_PRECOMPILE_HEADERS ON)
+
 add_executable(z_runtime_regression_tests)
 
 target_sources(z_runtime_regression_tests PRIVATE
     RuntimeRegressionTests.cpp
+    $<TARGET_OBJECTS:z_xcrc>
+)
+target_include_directories(z_runtime_regression_tests PRIVATE
+    "${CMAKE_SOURCE_DIR}/Core/Tools/XferCrcSnapshotTest"
 )
 
 if(CMAKE_SIZEOF_VOID_P EQUAL 4)
@@ -53,6 +69,10 @@ set_tests_properties(z_skirmish_ai_replay_epoch_tests PROPERTIES TIMEOUT 30)
 
 add_test(NAME z_skirmish_ai_runner_contract_tests COMMAND z_runtime_regression_tests --skirmish-ai-runner-contract)
 set_tests_properties(z_skirmish_ai_runner_contract_tests PROPERTIES TIMEOUT 30)
+
+add_test(NAME z_xfer_crc_snapshot_tests
+    COMMAND z_runtime_regression_tests --xfer-crc-snapshot)
+set_tests_properties(z_xfer_crc_snapshot_tests PROPERTIES TIMEOUT 30)
 
 if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD)
 	# Exercise the real product AudioEventRTS/GameAudio implementations, not the
