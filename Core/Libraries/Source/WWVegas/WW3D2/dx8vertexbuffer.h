@@ -53,7 +53,11 @@ class Vector4;
 class StringClass;
 class DX8VertexBufferClass;
 class FVFInfoClass;
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+namespace rts { namespace render { class GpuHandle; class NativeW3DBufferOwner; } }
+#else
 struct IDirect3DVertexBuffer8;
+#endif
 class VertexBufferClass;
 struct VertexFormatXYZNDUV2;
 
@@ -62,11 +66,14 @@ class VertexBufferLockClass
 protected:
 	VertexBufferClass* VertexBuffer;
 	void* Vertices;
+	bool Locked;
 
 	// This class can't be used directly, so constructor as to be protected
-	VertexBufferLockClass(VertexBufferClass* vertex_buffer_) : VertexBuffer(vertex_buffer_) {}
+	VertexBufferLockClass(VertexBufferClass* vertex_buffer_) :
+		VertexBuffer(vertex_buffer_), Vertices(nullptr), Locked(false) {}
 public:
 	void* Get_Vertex_Array() { return Vertices; }
+	bool Is_Locked() const { return Locked; }
 };
 
 /**
@@ -99,6 +106,7 @@ public:
 	public:
 		WriteLockClass(VertexBufferClass* vertex_buffer, int flags=0);
 		~WriteLockClass();
+		bool Commit();
 	};
 
 	class AppendLockClass : public VertexBufferLockClass
@@ -106,6 +114,7 @@ public:
 	public:
 		AppendLockClass(VertexBufferClass* vertex_buffer,unsigned start_index, unsigned index_range);
 		~AppendLockClass();
+		bool Commit();
 	};
 
 	static unsigned Get_Total_Buffer_Count();
@@ -165,6 +174,7 @@ public:
 	const FVFInfoClass& FVF_Info() const { return FVFInfo; }
 	unsigned Get_Type() const { return Type; }
 	unsigned short Get_Vertex_Count() const { return VertexCount; }
+	bool Is_Valid() const;
 
 	// Call at the end of the execution, or at whatever time you wish to release
 	// the recycled dynamic vertex buffer.
@@ -178,9 +188,12 @@ public:
 	{
 		DynamicVBAccessClass* DynamicVBAccess;
 		VertexFormatXYZNDUV2 * Vertices;
+		bool Locked;
 	public:
 		WriteLockClass(DynamicVBAccessClass* vb_access);
 		~WriteLockClass();
+		bool Is_Locked() const { return Locked; }
+		bool Commit();
 
 		// Use this function to get a pointer to the first vertex you can write into.
 		// If we ever change the format used by DynamicVBAccessClass, then the
@@ -195,6 +208,10 @@ public:
 
 inline VertexFormatXYZNDUV2 * DynamicVBAccessClass::WriteLockClass::Get_Formatted_Vertex_Array()
 {
+	if (!Locked || DynamicVBAccess == nullptr || !DynamicVBAccess->Is_Valid())
+	{
+		return nullptr;
+	}
 	// assert that the format of the dynamic vertex buffer is still what we think it is.
 	WWASSERT(DynamicVBAccess->VertexBuffer->FVF_Info().Get_FVF() == (D3DFVF_XYZ|D3DFVF_NORMAL|D3DFVF_TEX2|D3DFVF_DIFFUSE));
 	return Vertices;
@@ -209,6 +226,9 @@ inline VertexFormatXYZNDUV2 * DynamicVBAccessClass::WriteLockClass::Get_Formatte
 class DX8VertexBufferClass : public VertexBufferClass
 {
 	W3DMPO_CODE(DX8VertexBufferClass)
+	friend VertexBufferClass::WriteLockClass;
+	friend VertexBufferClass::AppendLockClass;
+	friend DynamicVBAccessClass::WriteLockClass;
 protected:
 	virtual ~DX8VertexBufferClass() override;
 public:
@@ -224,18 +244,40 @@ public:
 	DX8VertexBufferClass(const Vector3* vertices, const Vector3* normals, const Vector4* diffuse, const Vector2* tex_coords, unsigned short VertexCount,UsageType usage=USAGE_DEFAULT);
 	DX8VertexBufferClass(const Vector3* vertices, const Vector4* diffuse, const Vector2* tex_coords, unsigned short VertexCount,UsageType usage=USAGE_DEFAULT);
 	DX8VertexBufferClass(const Vector3* vertices, const Vector2* tex_coords, unsigned short VertexCount,UsageType usage=USAGE_DEFAULT);
+	bool Is_Valid() const;
+	bool Lock_Buffer(size_t byte_offset, size_t byte_count, int flags,
+		void **data);
+	bool Unlock_Buffer();
+	// Compatibility-shaped calls retain the historical error contract while
+	// dispatching through the backend-neutral owner on native builds.
+	long Lock(unsigned int byte_offset, unsigned int byte_count,
+		unsigned char **data, unsigned long flags);
+	long Unlock();
 
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	bool Acquire_Native_Vertex_Buffer(unsigned int stride, unsigned int offset,
+		unsigned int start_vertex, unsigned int vertex_count,
+		rts::render::GpuHandle *validated) const;
+#else
 	IDirect3DVertexBuffer8* Get_DX8_Vertex_Buffer() { return VertexBuffer; }
+#endif
 
-	void Copy(const Vector3* loc, unsigned first_vertex, unsigned count);
-	void Copy(const Vector3* loc, const Vector2* uv, unsigned first_vertex, unsigned count);
-	void Copy(const Vector3* loc, const Vector3* norm, unsigned first_vertex, unsigned count);
-	void Copy(const Vector3* loc, const Vector3* norm, const Vector2* uv, unsigned first_vertex, unsigned count);
-	void Copy(const Vector3* loc, const Vector3* norm, const Vector2* uv, const Vector4* diffuse, unsigned first_vertex, unsigned count);
-	void Copy(const Vector3* loc, const Vector2* uv, const Vector4* diffuse, unsigned first_vertex, unsigned count);
+	bool Copy(const Vector3* loc, unsigned first_vertex, unsigned count);
+	bool Copy(const Vector3* loc, const Vector2* uv, unsigned first_vertex, unsigned count);
+	bool Copy(const Vector3* loc, const Vector3* norm, unsigned first_vertex, unsigned count);
+	bool Copy(const Vector3* loc, const Vector3* norm, const Vector2* uv, unsigned first_vertex, unsigned count);
+	bool Copy(const Vector3* loc, const Vector3* norm, const Vector2* uv, const Vector4* diffuse, unsigned first_vertex, unsigned count);
+	bool Copy(const Vector3* loc, const Vector2* uv, const Vector4* diffuse, unsigned first_vertex, unsigned count);
 
 protected:
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	rts::render::NativeW3DBufferOwner *NativeBuffer;
+	bool Lock_Native_Buffer(size_t offset, size_t byte_count, int flags,
+		void **data);
+	bool Unlock_Native_Buffer();
+#else
 	IDirect3DVertexBuffer8*		VertexBuffer;
+#endif
 
 	void Create_Vertex_Buffer(UsageType usage);
 };

@@ -1,4 +1,5 @@
 #include "WW3D2/dx8fvf.h"
+#include "Renderer/LegacyFvfLayout.h"
 
 #include <stdio.h>
 
@@ -38,6 +39,8 @@ int testPositionSizes()
 	{
 		FVFInfoClass info(positions[index]);
 		CHECK("position sizes", info.Get_FVF_Size() == sizes[index]);
+		CHECK("neutral position sizes",
+			rts::render::LegacyFvfVertexSize(positions[index]) == sizes[index]);
 	}
 
 	for (index = 2; index < sizeof(positions) / sizeof(positions[0]); ++index)
@@ -48,6 +51,12 @@ int testPositionSizes()
 		CHECK("last beta color sizes",
 			FVFInfoClass(positions[index] | kLastBetaD3DColorFlag).
 				Get_FVF_Size() == sizes[index]);
+		CHECK("neutral last beta sizes",
+			rts::render::LegacyFvfVertexSize(positions[index] |
+				D3DFVF_LASTBETA_UBYTE4) == sizes[index]);
+		CHECK("neutral last beta color sizes",
+			rts::render::LegacyFvfVertexSize(positions[index] |
+				kLastBetaD3DColorFlag) == sizes[index]);
 	}
 	return 0;
 }
@@ -83,6 +92,9 @@ int testVertexAttributes()
 			((attributes[index] & D3DFVF_DIFFUSE) != 0 ? 4 : 0) +
 			((attributes[index] & D3DFVF_SPECULAR) != 0 ? 4 : 0);
 		CHECK("vertex attributes", info.Get_FVF_Size() == 12 + attributeCount);
+		CHECK("neutral vertex attributes",
+			rts::render::LegacyFvfVertexSize(D3DFVF_XYZ | attributes[index]) ==
+				12 + attributeCount);
 	}
 
 	CHECK("RHW point size",
@@ -109,8 +121,10 @@ int checkAllEightTextureEncodings(unsigned stage, unsigned fvf, unsigned expecte
 	if (stage == 8)
 	{
 		FVFInfoClass info(fvf);
-		return check(info.Get_FVF_Size() == expected,
-			"all texture coordinate encodings", "info.Get_FVF_Size() == expected");
+		return check(info.Get_FVF_Size() == expected &&
+			rts::render::LegacyFvfVertexSize(fvf) == expected,
+			"all texture coordinate encodings",
+			"legacy and neutral FVF sizes equal expected");
 	}
 
 	for (encoding = 0; encoding < 4; ++encoding)
@@ -137,6 +151,10 @@ int testTextureCoordinateSizes()
 	{
 		FVFInfoClass info(D3DFVF_XYZ | (textureCount << D3DFVF_TEXCOUNT_SHIFT));
 		CHECK("texture count defaults", info.Get_FVF_Size() == 12 + textureCount * 8);
+		CHECK("neutral texture count defaults",
+			rts::render::LegacyFvfVertexSize(D3DFVF_XYZ |
+				(textureCount << D3DFVF_TEXCOUNT_SHIFT)) ==
+				12 + textureCount * 8);
 	}
 
 	for (textureCount = 1; textureCount <= 8; ++textureCount)
@@ -152,6 +170,8 @@ int testTextureCoordinateSizes()
 					componentCounts[encoding] * 4 - 8;
 				FVFInfoClass info(fvf);
 				CHECK("texture coordinate sizes", info.Get_FVF_Size() == expected);
+				CHECK("neutral texture coordinate sizes",
+					rts::render::LegacyFvfVertexSize(fvf) == expected);
 			}
 		}
 	}
@@ -184,7 +204,64 @@ int testInvalidFormats()
 	{
 		FVFInfoClass info(invalidFormats[index]);
 		CHECK("invalid FVF rejection", info.Get_FVF_Size() == 0);
+		CHECK("neutral invalid FVF rejection",
+			rts::render::LegacyFvfVertexSize(invalidFormats[index]) == 0);
 	}
+	return 0;
+}
+
+int testNeutralVertexLayout()
+{
+	const unsigned fvf = D3DFVF_XYZ | D3DFVF_NORMAL |
+		D3DFVF_DIFFUSE | D3DFVF_SPECULAR | D3DFVF_TEX2;
+	const unsigned requiredStride = rts::render::LegacyFvfVertexSize(fvf);
+	rts::render::RenderVertexLayout layout;
+	CHECK("neutral layout decode",
+		rts::render::DecodeLegacyFvfVertexLayout(fvf, requiredStride, &layout));
+	CHECK("neutral layout stride", layout.stride == 48);
+	CHECK("neutral layout element count", layout.elementCount == 6);
+	CHECK("neutral layout position",
+		layout.elements[0].semantic == rts::render::RENDER_VERTEX_SEMANTIC_POSITION &&
+		layout.elements[0].format == rts::render::RENDER_VERTEX_DATA_FLOAT3 &&
+		layout.elements[0].byteOffset == 0);
+	CHECK("neutral layout normal",
+		layout.elements[1].semantic == rts::render::RENDER_VERTEX_SEMANTIC_NORMAL &&
+		layout.elements[1].byteOffset == 12);
+	CHECK("neutral layout diffuse",
+		layout.elements[2].semantic == rts::render::RENDER_VERTEX_SEMANTIC_DIFFUSE &&
+		layout.elements[2].byteOffset == 24);
+	CHECK("neutral layout specular",
+		layout.elements[3].semantic == rts::render::RENDER_VERTEX_SEMANTIC_SPECULAR &&
+		layout.elements[3].byteOffset == 28);
+	CHECK("neutral layout texture offsets",
+		layout.elements[4].semantic ==
+			rts::render::RENDER_VERTEX_SEMANTIC_TEXTURE_COORDINATE &&
+		layout.elements[4].semanticIndex == 0 &&
+		layout.elements[4].byteOffset == 32 &&
+		layout.elements[5].semanticIndex == 1 &&
+		layout.elements[5].byteOffset == 40);
+
+	const unsigned paddedStride = requiredStride + 16;
+	CHECK("neutral padded packet stride",
+		rts::render::DecodeLegacyFvfVertexLayout(fvf, paddedStride, &layout) &&
+		layout.stride == paddedStride);
+	CHECK("neutral short packet rejection",
+		!rts::render::DecodeLegacyFvfVertexLayout(fvf, requiredStride - 1,
+			&layout));
+	CHECK("neutral blended layout rejection",
+		!rts::render::DecodeLegacyFvfVertexLayout(D3DFVF_XYZB1,
+			rts::render::LegacyFvfVertexSize(D3DFVF_XYZB1), &layout));
+
+	const unsigned rhwFvf = D3DFVF_XYZRHW | kPsizeFlag |
+		D3DFVF_DIFFUSE | D3DFVF_SPECULAR | D3DFVF_TEX1;
+	CHECK("neutral pretransformed layout",
+		rts::render::DecodeLegacyFvfVertexLayout(rhwFvf,
+			rts::render::LegacyFvfVertexSize(rhwFvf), &layout) &&
+		layout.preTransformed && layout.elementCount == 4 &&
+		layout.elements[0].format == rts::render::RENDER_VERTEX_DATA_FLOAT4 &&
+		layout.elements[1].byteOffset == 20 &&
+		layout.elements[2].byteOffset == 24 &&
+		layout.elements[3].byteOffset == 28);
 	return 0;
 }
 }
@@ -196,5 +273,6 @@ int main()
 	result |= testVertexAttributes();
 	result |= testTextureCoordinateSizes();
 	result |= testInvalidFormats();
+	result |= testNeutralVertexLayout();
 	return result;
 }

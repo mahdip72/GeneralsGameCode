@@ -82,8 +82,26 @@ static FVFCategoryList								fvf_category_container_delete_list;
 // The native D3D8 path keeps its historical capability-based behavior.
 static bool Supports_NPatch_Geometry()
 {
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	return false;
+#else
 	return !DX8Wrapper::Is_D3D11_Backend_Active() &&
 		DX8Wrapper::Get_Current_Caps()->Support_NPatches();
+#endif
+}
+
+static bool Is_Usable_Static_Vertex_Buffer(VertexBufferClass *buffer)
+{
+	return buffer != nullptr &&
+		(buffer->Type() != BUFFER_TYPE_DX8 ||
+		 static_cast<DX8VertexBufferClass *>(buffer)->Is_Valid());
+}
+
+static bool Is_Usable_Static_Index_Buffer(IndexBufferClass *buffer)
+{
+	return buffer != nullptr &&
+		(buffer->Type() != BUFFER_TYPE_DX8 ||
+		 static_cast<DX8IndexBufferClass *>(buffer)->Is_Valid());
 }
 
 // helper data structure
@@ -858,6 +876,7 @@ bool DX8RigidFVFCategoryContainer::Check_If_Mesh_Fits(MeshModelClass* mmc)
 		required_polygons+=mmc->Get_Gap_Filler()->Get_Polygon_Count();
 	}
 	unsigned required_indices=required_polygons*3*mmc->Get_Pass_Count();
+	if (!index_buffer) return required_vertices<=available_vertices;
 	unsigned available_indices=index_buffer->Get_Index_Count()-used_indices;
 	if (
 		required_vertices<=available_vertices &&
@@ -1023,12 +1042,14 @@ void DX8RigidFVFCategoryContainer::Add_Mesh(MeshModelClass* mmc_)
 
 	Vertex_Split_Table split_table(mmc_);
 	int needed_vertices=split_table.Get_Vertex_Count();
+	bool created_vertex_buffer=false;
 
 	/*
 	** This FVFCategoryContainer doesn't have a vertex buffer yet so allocate one big
 	** enough to contain this mesh.
 	*/
 	if (!vertex_buffer) {
+		created_vertex_buffer=true;
 		int vb_size=4000;
 		if (vb_size<needed_vertices) vb_size=needed_vertices;
 		if (sorting) {
@@ -1042,6 +1063,10 @@ void DX8RigidFVFCategoryContainer::Add_Mesh(MeshModelClass* mmc_)
 				(Supports_NPatch_Geometry() && WW3D::Get_NPatches_Level()>1) ? DX8VertexBufferClass::USAGE_NPATCHES : DX8VertexBufferClass::USAGE_DEFAULT));
 		}
 	}
+	if (!Is_Usable_Static_Vertex_Buffer(vertex_buffer)) {
+		if (created_vertex_buffer) REF_PTR_RELEASE(vertex_buffer);
+		return;
+	}
 
 	/*
 	** Append this mesh's vertices to the vertex buffer.
@@ -1050,6 +1075,10 @@ void DX8RigidFVFCategoryContainer::Add_Mesh(MeshModelClass* mmc_)
 	VertexBufferClass::AppendLockClass l(vertex_buffer,used_vertices,split_table.Get_Vertex_Count());
 	const FVFInfoClass fi=vertex_buffer->FVF_Info();
 	unsigned char *vb=(unsigned char*) l.Get_Vertex_Array();
+	if (!l.Is_Locked() || vb == nullptr) {
+		if (created_vertex_buffer) REF_PTR_RELEASE(vertex_buffer);
+		return;
+	}
 	unsigned int i;
 	const Vector3 *locs=split_table.Get_Vertex_Array();
 	const Vector3 *norms=split_table.Get_Vertex_Normal_Array();
@@ -1124,12 +1153,19 @@ void DX8RigidFVFCategoryContainer::Add_Mesh(MeshModelClass* mmc_)
 		}
 	}
 
-	Generate_Texture_Categories(split_table,used_vertices);
+	if (!l.Commit()) {
+		if (created_vertex_buffer) REF_PTR_RELEASE(vertex_buffer);
+		return;
+	}
+
+	if (!Generate_Texture_Categories(split_table,used_vertices)) {
+		return;
+	}
 
 	used_vertices+=needed_vertices;//vertex_count;
 }
 
-void DX8FVFCategoryContainer::Insert_To_Texture_Category(
+bool DX8FVFCategoryContainer::Insert_To_Texture_Category(
 	Vertex_Split_Table& split_table,
 	TextureClass** texs,
 	VertexMaterialClass* mat,
@@ -1151,7 +1187,12 @@ void DX8FVFCategoryContainer::Insert_To_Texture_Category(
 			all_textures_same = all_textures_same && (tex_category->Peek_Texture(stage) == texs[stage]);
 		}
 		if (all_textures_same && Equal_Material(tex_category->Peek_Material(),mat) && tex_category->Get_Shader()==shader) {
-			used_indices+=tex_category->Add_Mesh(split_table,vertex_offset,used_indices,index_buffer,pass);
+			const unsigned added_indices=tex_category->Add_Mesh(
+				split_table,vertex_offset,used_indices,index_buffer,pass);
+			if (added_indices == 0) {
+				return false;
+			}
+			used_indices+=added_indices;
 			fit_in_existing_category = true;
 			break;
 		}
@@ -1161,7 +1202,16 @@ void DX8FVFCategoryContainer::Insert_To_Texture_Category(
 	if (!fit_in_existing_category) {
 
 		DX8TextureCategoryClass * new_tex_category=W3DNEW DX8TextureCategoryClass(this,texs,shader,mat,pass);
-		used_indices+=new_tex_category->Add_Mesh(split_table,vertex_offset,used_indices,index_buffer,pass);
+		if (new_tex_category == nullptr) {
+			return false;
+		}
+		const unsigned added_indices=new_tex_category->Add_Mesh(
+			split_table,vertex_offset,used_indices,index_buffer,pass);
+		if (added_indices == 0) {
+			delete new_tex_category;
+			return false;
+		}
+		used_indices+=added_indices;
 
 		/*
 		** Add the texture category object into the list, immediately after any existing
@@ -1184,6 +1234,7 @@ void DX8FVFCategoryContainer::Insert_To_Texture_Category(
 			texture_category_list[pass].Add_Tail(new_tex_category);
 		}
 	}
+	return true;
 }
 
 const unsigned MAX_ADDED_TYPE_COUNT=64;
@@ -1219,7 +1270,7 @@ struct Textures_Material_And_Shader_Booking_Struct
 	}
 };
 
-void DX8FVFCategoryContainer::Generate_Texture_Categories(Vertex_Split_Table& split_table,unsigned vertex_offset)
+bool DX8FVFCategoryContainer::Generate_Texture_Categories(Vertex_Split_Table& split_table,unsigned vertex_offset)
 {
 	int polygon_count=split_table.Get_Polygon_Count();
 	int index_count=polygon_count*3*split_table.Get_Pass_Count();
@@ -1228,7 +1279,9 @@ void DX8FVFCategoryContainer::Generate_Texture_Categories(Vertex_Split_Table& sp
 	** If we don't have an index buffer yet, allocate one.  Make it hold at least 12000 entries,
 	** more if the mesh requires it.
 	*/
+	bool created_index_buffer=false;
 	if (!index_buffer) {
+		created_index_buffer=true;
 		int ib_size=12000;
 		if (ib_size<index_count) ib_size=index_count;
 		if (sorting) {
@@ -1239,6 +1292,12 @@ void DX8FVFCategoryContainer::Generate_Texture_Categories(Vertex_Split_Table& sp
 				ib_size,
 				(Supports_NPatch_Geometry() && WW3D::Get_NPatches_Level()>1) ? DX8IndexBufferClass::USAGE_NPATCHES : DX8IndexBufferClass::USAGE_DEFAULT));
 		}
+	}
+	if (!Is_Usable_Static_Index_Buffer(index_buffer)) {
+		if (created_index_buffer || used_indices == 0) {
+			REF_PTR_RELEASE(index_buffer);
+		}
+		return false;
 	}
 
 	for (unsigned pass=0;pass<split_table.Get_Pass_Count();++pass) {
@@ -1258,12 +1317,16 @@ void DX8FVFCategoryContainer::Generate_Texture_Categories(Vertex_Split_Table& sp
 			ShaderClass shader=split_table.Peek_Shader(i,pass);
 			if (!textures_material_and_shader_booking.Add_Textures_Material_And_Shader(textures,mat,shader)) continue;
 
-			Insert_To_Texture_Category(split_table,textures,mat,shader,pass,vertex_offset);
+			if (!Insert_To_Texture_Category(split_table,textures,mat,shader,
+				pass,vertex_offset)) {
+				return false;
+			}
 		}
 
 		int new_inds=used_indices-old_used_indices;
 		WWASSERT(new_inds<=polygon_count*3);
 	}
+	return true;
 }
 
 // ----------------------------------------------------------------------------
@@ -1338,13 +1401,18 @@ void DX8SkinFVFCategoryContainer::Render()
 	SNAPSHOT_SAY(("DynamicVBAccess - %s - %d vertices",sorting ? "sorting" : "non-sorting",VisibleVertexCount));
 
 	unsigned int renderedVertexCount=0;
+	bool dynamic_buffer_failed = !vb.Is_Valid();
 
 	MeshClass * mesh = VisibleSkinHead;
 	MeshClass * remainingMesh = VisibleSkinHead;
-	while (renderedVertexCount < VisibleVertexCount)
+	while (!dynamic_buffer_failed && renderedVertexCount < VisibleVertexCount)
 	{	mesh = remainingMesh;
 		{	DynamicVBAccessClass::WriteLockClass l(&vb);
 			VertexFormatXYZNDUV2 * dest_verts = l.Get_Formatted_Vertex_Array();
+			if (!l.Is_Locked() || dest_verts == nullptr) {
+				dynamic_buffer_failed = true;
+				break;
+			}
 			unsigned vertex_offset=0;
 			remainingMesh = nullptr;
 
@@ -1423,11 +1491,18 @@ void DX8SkinFVFCategoryContainer::Render()
 
 				mesh = mesh->Peek_Next_Visible_Skin();
 			}
+			if (!l.Commit()) {
+				dynamic_buffer_failed = true;
+				break;
+			}
 		}
 
 		SNAPSHOT_SAY(("Set vb: %x ib: %x",&vb.FVF_Info(),index_buffer));
 
-		DX8Wrapper::Set_Vertex_Buffer(vb);
+		if (!DX8Wrapper::Set_Vertex_Buffer(vb)) {
+			dynamic_buffer_failed = true;
+			break;
+		}
 		DX8Wrapper::Set_Index_Buffer(index_buffer,0);
 
 		//Flush the meshes which fit in the vertex buffer, applying all texture variations
@@ -1450,7 +1525,7 @@ void DX8SkinFVFCategoryContainer::Render()
 		}
 	}
 
-	WWASSERT(renderedVertexCount==VisibleVertexCount);
+	WWASSERT(dynamic_buffer_failed || renderedVertexCount==VisibleVertexCount);
 
 	clearVisibleSkinList();
 }
@@ -1531,6 +1606,9 @@ unsigned DX8TextureCategoryClass::Add_Mesh(
 	IndexBufferClass* index_buffer,
 	unsigned pass)
 {
+	if (!Is_Usable_Static_Index_Buffer(index_buffer)) {
+		return 0;
+	}
 	int poly_count=split_table.Get_Polygon_Count();
 
 	unsigned index_count=0;
@@ -1571,6 +1649,9 @@ unsigned DX8TextureCategoryClass::Add_Mesh(
 
 		if (stripify) {
 			int* triangles=W3DNEWARRAY int[index_count];
+			if (triangles == nullptr) {
+				return 0;
+			}
 			int triangle_index_count=0;
 			for (int i=0;i<poly_count;++i) {
 				bool all_textures_same = true;
@@ -1589,31 +1670,30 @@ unsigned DX8TextureCategoryClass::Add_Mesh(
 
 			int* strips=StripOptimizerClass::Stripify(triangles, triangle_index_count/3);
 			delete[] triangles;
+			if (strips == nullptr) {
+				return 0;
+			}
 			int* strip=StripOptimizerClass::Combine_Strips(strips+1,strips[0]);
 			delete[] strips;
+			if (strip == nullptr) {
+				return 0;
+			}
 
 			if (index_count<unsigned(strip[0])) {
 				stripify=false;
 			}
 			else {
 				index_count=strip[0];
-
-				DX8PolygonRendererClass* p_renderer=W3DNEW DX8PolygonRendererClass(
-					index_count,
-					split_table.Get_Mesh_Model_Class(),
-					this,
-					vertex_offset,
-					index_offset,
-					true,
-					pass);
-				PolygonRendererList.Add_Tail(p_renderer);
+				unsigned short vmin=0xffff;
+				unsigned short vmax=0;
 
 				{
 					IndexBufferClass::AppendLockClass l(index_buffer,index_offset,index_count);
 					unsigned short* dst_indices=l.Get_Index_Array();
-
-					unsigned short vmin=0xffff;
-					unsigned short vmax=0;
+					if (!l.Is_Locked() || dst_indices == nullptr) {
+						delete[] strip;
+						return 0;
+					}
 
 					/*
 					** Iterate over the polys for this pass, adding each one that matches this texture+material+shader
@@ -1627,29 +1707,36 @@ unsigned DX8TextureCategoryClass::Add_Mesh(
 						*dst_indices++=idx;
 					}
 
-					/*
-					** Remember the min and max vertex indices that these polygons used (for optimization)
-					*/
-					p_renderer->Set_Vertex_Index_Range(vmin,vmax-vmin+1);
+					if (!l.Commit()) {
+						delete[] strip;
+						return 0;
+					}
 				}
+				DX8PolygonRendererClass* p_renderer=W3DNEW DX8PolygonRendererClass(
+					index_count,
+					split_table.Get_Mesh_Model_Class(),
+					this,
+					vertex_offset,
+					index_offset,
+					true,
+					pass);
+				if (p_renderer == nullptr) {
+					delete[] strip;
+					return 0;
+				}
+				p_renderer->Set_Vertex_Index_Range(vmin,vmax-vmin+1);
+				PolygonRendererList.Add_Tail(p_renderer);
 			}
 			delete[] strip;
 		}
 
 		// Need to check stripify again as it may be changed to false by the previous statement
 		if (!stripify ) {
-			DX8PolygonRendererClass* p_renderer=W3DNEW DX8PolygonRendererClass(
-				index_count,
-				split_table.Get_Mesh_Model_Class(),
-				this,
-				vertex_offset,
-				index_offset,
-				false,
-				pass);
-			PolygonRendererList.Add_Tail(p_renderer);
-
 			IndexBufferClass::AppendLockClass l(index_buffer,index_offset,index_count);
 			unsigned short* dst_indices=l.Get_Index_Array();
+			if (!l.Is_Locked() || dst_indices == nullptr) {
+				return 0;
+			}
 
 			unsigned short vmin=0xffff;
 			unsigned short vmax=0;
@@ -1690,11 +1777,23 @@ unsigned DX8TextureCategoryClass::Add_Mesh(
 
 			WWASSERT((vmax-vmin)<split_table.Get_Mesh_Model_Class()->Get_Vertex_Count());
 
-			/*
-			** Remember the min and max vertex indices that these polygons used (for optimization)
-			*/
-			p_renderer->Set_Vertex_Index_Range(vmin,vmax-vmin+1);
 			WWASSERT(index_count<=unsigned(split_table.Get_Polygon_Count()*3));
+			if (!l.Commit()) {
+				return 0;
+			}
+			DX8PolygonRendererClass* p_renderer=W3DNEW DX8PolygonRendererClass(
+				index_count,
+				split_table.Get_Mesh_Model_Class(),
+				this,
+				vertex_offset,
+				index_offset,
+				false,
+				pass);
+			if (p_renderer == nullptr) {
+				return 0;
+			}
+			p_renderer->Set_Vertex_Index_Range(vmin,vmax-vmin+1);
+			PolygonRendererList.Add_Tail(p_renderer);
 		}
 	}
 

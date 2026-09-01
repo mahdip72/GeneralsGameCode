@@ -86,8 +86,15 @@ extern const FrustumClass *shadowCameraFrustum;	//defined in W3DShadow.
 ///@todo: Externs from volumetric shadow renderer - these need to be moved into W3DBufferManager
 // These are bridge-facing aliases. The owning DX8 wrapper objects live in
 // W3DVolumetricShadow.cpp so a reset can release each resource exactly once.
-extern LPDIRECT3DVERTEXBUFFER8 shadowVertexBufferD3D;		///<D3D vertex buffer
-extern LPDIRECT3DINDEXBUFFER8	shadowIndexBufferD3D;	///<D3D index buffer
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+typedef DX8VertexBufferClass *ShadowVertexBufferHandle;
+typedef DX8IndexBufferClass *ShadowIndexBufferHandle;
+#else
+typedef LPDIRECT3DVERTEXBUFFER8 ShadowVertexBufferHandle;
+typedef LPDIRECT3DINDEXBUFFER8 ShadowIndexBufferHandle;
+#endif
+extern ShadowVertexBufferHandle shadowVertexBufferD3D;
+extern ShadowIndexBufferHandle shadowIndexBufferD3D;
 extern int nShadowVertsInBuf;	//model vetices in vertex buffer
 extern int nShadowStartBatchVertex;
 extern int nShadowIndicesInBuf;	//model vetices in vertex buffer
@@ -105,8 +112,8 @@ struct SHADOW_DECAL_VERTEX	//vertex structure passed to D3D
 
 #define SHADOW_DECAL_FVF	D3DFVF_XYZ|D3DFVF_TEX1|D3DFVF_DIFFUSE
 
-LPDIRECT3DVERTEXBUFFER8 shadowDecalVertexBufferD3D=nullptr;		///<bridge-facing D3D vertex-buffer handle
-LPDIRECT3DINDEXBUFFER8	shadowDecalIndexBufferD3D=nullptr;	///<bridge-facing D3D index-buffer handle
+ShadowVertexBufferHandle shadowDecalVertexBufferD3D=nullptr;
+ShadowIndexBufferHandle shadowDecalIndexBufferD3D=nullptr;
 DX8VertexBufferClass *shadowDecalVertexBufferOwner=nullptr;
 DX8IndexBufferClass *shadowDecalIndexBufferOwner=nullptr;
 int nShadowDecalVertsInBuf=0;	//model vetices in vertex buffer
@@ -119,6 +126,26 @@ int SHADOW_DECAL_VERTEX_SIZE=32768;
 int SHADOW_DECAL_INDEX_SIZE=65536;
 static SHADOW_DECAL_VERTEX shadowDecalVertexUpload[32768];
 static unsigned short shadowDecalIndexUpload[65536];
+
+static ShadowVertexBufferHandle Get_Shadow_Vertex_Buffer_Handle(
+	DX8VertexBufferClass *owner)
+{
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	return owner != nullptr && owner->Is_Valid() ? owner : nullptr;
+#else
+	return owner != nullptr ? owner->Get_DX8_Vertex_Buffer() : nullptr;
+#endif
+}
+
+static ShadowIndexBufferHandle Get_Shadow_Index_Buffer_Handle(
+	DX8IndexBufferClass *owner)
+{
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	return owner != nullptr && owner->Is_Valid() ? owner : nullptr;
+#else
+	return owner != nullptr ? owner->Get_DX8_Index_Buffer() : nullptr;
+#endif
+}
 
 
 class W3DShadowTexture;	//forward reference
@@ -401,7 +428,9 @@ Bool W3DProjectedShadowManager::ReAcquireResources()
 			m_dynamicRenderTarget=DX8Wrapper::Create_Render_Target (DEFAULT_RENDER_TARGET_WIDTH, DEFAULT_RENDER_TARGET_HEIGHT);
 	}
 
-	if (m_dynamicRenderTarget == nullptr || !DX8Wrapper::Is_Initted())
+	if (m_dynamicRenderTarget == nullptr ||
+		!m_dynamicRenderTarget->Is_Initialized() ||
+		!DX8Wrapper::Is_Initted())
 	{
 		REF_PTR_RELEASE(m_dynamicRenderTarget);
 		return FALSE;
@@ -419,10 +448,10 @@ Bool W3DProjectedShadowManager::ReAcquireResources()
 		(static_cast<unsigned short>(SHADOW_DECAL_INDEX_SIZE-1),
 		DX8IndexBufferClass::USAGE_DYNAMIC));
 	if (shadowDecalIndexBufferOwner == nullptr ||
-		(shadowDecalIndexBufferD3D=shadowDecalIndexBufferOwner->Get_DX8_Index_Buffer()) == nullptr)
+		(shadowDecalIndexBufferD3D=Get_Shadow_Index_Buffer_Handle(
+			shadowDecalIndexBufferOwner)) == nullptr)
 	{
-		REF_PTR_RELEASE(shadowDecalIndexBufferOwner);
-		shadowDecalIndexBufferD3D=nullptr;
+		ReleaseResources();
 		return FALSE;
 	}
 
@@ -430,12 +459,10 @@ Bool W3DProjectedShadowManager::ReAcquireResources()
 		(SHADOW_DECAL_FVF, static_cast<unsigned short>(SHADOW_DECAL_VERTEX_SIZE),
 		DX8VertexBufferClass::USAGE_DYNAMIC));
 	if (shadowDecalVertexBufferOwner == nullptr ||
-		(shadowDecalVertexBufferD3D=shadowDecalVertexBufferOwner->Get_DX8_Vertex_Buffer()) == nullptr)
+		(shadowDecalVertexBufferD3D=Get_Shadow_Vertex_Buffer_Handle(
+			shadowDecalVertexBufferOwner)) == nullptr)
 	{
-		REF_PTR_RELEASE(shadowDecalVertexBufferOwner);
-		REF_PTR_RELEASE(shadowDecalIndexBufferOwner);
-		shadowDecalVertexBufferD3D=nullptr;
-		shadowDecalIndexBufferD3D=nullptr;
+		ReleaseResources();
 		return FALSE;
 	}
 
@@ -2792,7 +2819,7 @@ void W3DProjectedShadow::updateTexture(Vector3 &lightPos)
 			SurfaceClass *oldSurface=shadow_texture->Get_Surface_Level();
 			SurfaceClass *newSurface=TheW3DProjectedShadowManager->getRenderTarget()->Get_Surface_Level();
 			oldSurface->Copy(0,0,0,0,DEFAULT_RENDER_TARGET_WIDTH,DEFAULT_RENDER_TARGET_HEIGHT,newSurface);
-			Notify_Render_Texture_Changed(shadow_texture->Peek_D3D_Base_Texture());
+			Notify_Render_Texture_Changed(shadow_texture);
 			REF_PTR_RELEASE(newSurface);
 			REF_PTR_RELEASE(oldSurface);
 		}
@@ -2847,7 +2874,7 @@ void W3DProjectedShadow::update()
 	const bool missing_d3d11_projection =
 		m_type == SHADOW_PROJECTION && DX8Wrapper::Is_D3D11_Backend_Active() &&
 		!DX8Wrapper::Acquire_D3D11_Copied_Texture_Content(
-			m_shadowTexture[0]->getTexture()->Peek_D3D_Base_Texture());
+			m_shadowTexture[0]->getTexture());
 	if (missing_d3d11_projection ||
 		m_shadowTexture[0]->getLightPosHistory() != TheW3DShadowManager->getLightPosWorld(0))
 	{	//light has moved since last time this shadow was calculated. Need update

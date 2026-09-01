@@ -239,7 +239,7 @@ Bool W3DSmudgeManager::testHardwareSupport()
 			// capability probe must not draw/read a hidden legacy back buffer, since
 			// that target is no longer authoritative for the visible frame.
 			m_hardwareSupportStatus = m_backgroundTexture != nullptr &&
-				m_backgroundTexture->Peek_D3D_Base_Texture() != nullptr ?
+				m_backgroundTexture->Is_Initialized() ?
 				SMUDGE_SUPPORT_YES : SMUDGE_SUPPORT_NO;
 			return m_hardwareSupportStatus == SMUDGE_SUPPORT_YES;
 		}
@@ -498,13 +498,13 @@ void W3DSmudgeManager::render(RenderInfoClass &rinfo)
 	if (d3d11_active)
 	{
 		if (m_backgroundTexture == nullptr ||
-			m_backgroundTexture->Peek_D3D_Base_Texture() == nullptr)
+			!m_backgroundTexture->Is_Initialized())
 		{
 			return;
 		}
 		const rts::render::RenderResult copy_result =
 			DX8Wrapper::Copy_Active_Render_Target_To_Texture(
-				m_backgroundTexture->Peek_D3D_Base_Texture());
+				m_backgroundTexture);
 		if (copy_result != rts::render::RENDER_RESULT_OK)
 		{
 			return;
@@ -513,8 +513,7 @@ void W3DSmudgeManager::render(RenderInfoClass &rinfo)
 	else
 	{
 		background->Copy(0,0,0,0,surface_desc.Width,surface_desc.Height,backBuffer);
-		Notify_Render_Texture_Changed(
-			m_backgroundTexture->Peek_D3D_Base_Texture());
+		Notify_Render_Texture_Changed(m_backgroundTexture);
 	}
 
 	REF_PTR_RELEASE(background);

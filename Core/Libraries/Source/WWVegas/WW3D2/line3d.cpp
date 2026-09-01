@@ -276,10 +276,16 @@ void Line3DClass::Render(RenderInfoClass & rinfo)
 	DX8Wrapper::Set_Transform(D3DTS_WORLD,Transform);
 
 	DynamicVBAccessClass vb(BUFFER_TYPE_DYNAMIC_DX8,dynamic_fvf_type,8);
+	if (!vb.Is_Valid()) {
+		return;
+	}
 	{
 		DynamicVBAccessClass::WriteLockClass Lock(&vb);
 		const FVFInfoClass &fi=vb.FVF_Info();
 		unsigned char *vb=(unsigned char*)Lock.Get_Formatted_Vertex_Array();
+		if (!Lock.Is_Locked() || vb == nullptr) {
+			return;
+		}
 		int i;
 		unsigned int color=DX8Wrapper::Convert_Color(Color);
 
@@ -289,18 +295,32 @@ void Line3DClass::Render(RenderInfoClass & rinfo)
 			*(unsigned int*)(vb+fi.Get_Diffuse_Offset())=color;
 			vb+=fi.Get_FVF_Size();
 		}
+		if (!Lock.Commit()) {
+			return;
+		}
 	}
 
 	DynamicIBAccessClass ib(BUFFER_TYPE_DYNAMIC_DX8,36);
+	if (!ib.Is_Valid()) {
+		return;
+	}
 	{
 		DynamicIBAccessClass::WriteLockClass Lock(&ib);
 		unsigned short *mem=Lock.Get_Index_Array();
+		if (!Lock.Is_Locked() || mem == nullptr) {
+			return;
+		}
 		for (int i=0; i<36; i++)
 			mem[i]=Indices[i];
+		if (!Lock.Commit()) {
+			return;
+		}
 	}
 
-	DX8Wrapper::Set_Vertex_Buffer(vb);
-	DX8Wrapper::Set_Index_Buffer(ib,0);
+	if (!DX8Wrapper::Set_Vertex_Buffer(vb) ||
+		!DX8Wrapper::Set_Index_Buffer(ib,0)) {
+		return;
+	}
 	DX8Wrapper::Draw_Triangles(0,36/3,0,8);
 }
 

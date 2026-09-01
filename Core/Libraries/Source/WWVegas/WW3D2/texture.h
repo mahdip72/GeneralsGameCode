@@ -61,6 +61,16 @@ class TextureLoadTaskClass;
 class TextureClass;
 class CubeTextureClass;
 class VolumeTextureClass;
+#if defined(_WIN64)
+struct NativeTextureStorage;
+namespace rts { namespace render {
+	struct NativeW3DTextureHandle;
+	struct NativeW3DSurfaceHandle;
+	struct NativeW3DGpuContentLease;
+	struct TextureDescriptor;
+	struct TextureSubresourceData;
+} }
+#endif
 
 class TextureBaseClass : public RefCountClass
 {
@@ -200,12 +210,47 @@ public:
 	IDirect3DVolumeTexture8* Peek_D3D_VolumeTexture() const { return (IDirect3DVolumeTexture8*)Peek_D3D_Base_Texture(); }
 	IDirect3DCubeTexture8* Peek_D3D_CubeTexture() const { return (IDirect3DCubeTexture8*)Peek_D3D_Base_Texture(); }
 
+#if defined(_WIN64)
+	// Product-facing x64 texture publication. These methods expose only typed
+	// generation-safe handles; the retained CPU view supports SurfaceClass
+	// read/modify paths without retaining a native COM resource.
+	bool Apply_Native_Texture(const rts::render::TextureDescriptor &descriptor,
+		const rts::render::TextureSubresourceData *subresources,
+		unsigned int subresource_count, WW3DFormat source_format,
+		bool initialized, bool disable_auto_invalidation = false,
+		bool missing_texture = false);
+	bool Apply_Native_Missing_Texture();
+	bool Acquire_Native_Texture(rts::render::NativeW3DTextureHandle *handle,
+		rts::render::NativeW3DGpuContentLease *gpu_lease = 0) const;
+	bool Acquire_Native_Surface(unsigned int mip_level,
+		unsigned int array_slice, bool for_output,
+		rts::render::NativeW3DSurfaceHandle *surface,
+		rts::render::NativeW3DGpuContentLease *gpu_lease = 0) const;
+	bool Publish_Native_Output(rts::render::NativeW3DSurfaceHandle surface,
+		rts::render::NativeW3DGpuContentLease *gpu_lease) const;
+	bool Copy_Native_Active_Color_Target();
+	bool Publish_Native_BGRA8(const void *data, size_t row_pitch,
+		size_t slice_pitch);
+	bool Generate_Native_Mip_Levels();
+	bool Refresh_Native_CPU_Content() const;
+	bool Get_Native_Subresource_Data(unsigned int mip_level,
+		unsigned int array_slice, const unsigned char **data,
+		size_t *row_pitch, size_t *slice_pitch) const;
+	bool Update_Native_Subresource_Data(unsigned int mip_level,
+		unsigned int array_slice, const unsigned char *data,
+		size_t row_pitch, size_t slice_pitch);
+	size_t Get_Native_Texture_Byte_Count() const;
+#endif
+
 protected:
 
 	void Load_Locked_Surface();
 	// Release the owned legacy resource in one place so all lifecycle paths keep
 	// the pointer/ref-count transition identical.
 	void Release_D3D_Texture();
+#if defined(_WIN64)
+	void Release_Native_Texture();
+#endif
 	void Poke_Texture(IDirect3DBaseTexture8* tex) { D3DTexture = tex; }
 
 	bool Initialized;
@@ -234,6 +279,9 @@ private:
 
 	// Direct3D texture object
 	IDirect3DBaseTexture8 *D3DTexture;
+#if defined(_WIN64)
+	NativeTextureStorage *NativeTexture;
+#endif
 
 	// Name
 	StringClass Name;

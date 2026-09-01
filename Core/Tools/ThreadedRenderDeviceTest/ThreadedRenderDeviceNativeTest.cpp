@@ -204,6 +204,7 @@ std::vector<Pixels> runTexturePipeline(bool threaded, bool serial,
 	BufferDescriptor vertexDescriptor;
 	vertexDescriptor.byteCount = sizeof(vertices);
 	vertexDescriptor.stride = sizeof(TexturedVertex);
+	vertexDescriptor.usage = RENDER_USAGE_DEFAULT;
 	GpuHandle vertexBuffer;
 	require(device->createBuffer(vertexDescriptor, vertices, sizeof(vertices),
 		&vertexBuffer) == RENDER_RESULT_OK,
@@ -317,6 +318,10 @@ std::vector<Pixels> runTexturePipeline(bool threaded, bool serial,
 		{
 			require(device->recoverDevice() == RENDER_RESULT_OK,
 				"recover native texture pipeline with live logical resources");
+			require(device->updateBufferResource(vertexBuffer, vertices,
+				sizeof(vertices), 0, RENDER_BUFFER_UPDATE_PRESERVE) ==
+					RENDER_RESULT_OK,
+				"republish descriptor-only vertex bytes after native recovery");
 			// Recovery intentionally invalidates GPU-authoritative copies. The
 			// source texture must instead come back from its latest refreshed
 			// two-mip shadow on this frame.

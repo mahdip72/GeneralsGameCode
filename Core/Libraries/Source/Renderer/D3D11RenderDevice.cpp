@@ -89,6 +89,23 @@ RenderResult TranslateResult(HRESULT result)
 	return RENDER_RESULT_FAILED;
 }
 
+HRESULT TranslateInjectedFault(RenderResult result)
+{
+	switch (result)
+	{
+	case RENDER_RESULT_INVALID_ARGUMENT:
+		return E_INVALIDARG;
+	case RENDER_RESULT_UNSUPPORTED:
+		return DXGI_ERROR_UNSUPPORTED;
+	case RENDER_RESULT_OUT_OF_MEMORY:
+		return E_OUTOFMEMORY;
+	case RENDER_RESULT_DEVICE_REMOVED:
+		return DXGI_ERROR_DEVICE_REMOVED;
+	default:
+		return E_FAIL;
+	}
+}
+
 DXGI_FORMAT TranslateFormat(RenderFormat format)
 {
 	switch (format)
@@ -327,7 +344,7 @@ struct ResourceSlot
 	ResourceSlot() : resource(0), view(0), renderTarget(0), depthStencil(0),
 		kind(RESOURCE_NONE),
 		usage(RENDER_USAGE_DEFAULT), binding(0), byteCount(0),
-		gpuAuthoritative(false)
+		gpuAuthoritative(false), bufferContentValid(false)
 	{
 	}
 
@@ -343,8 +360,14 @@ struct ResourceSlot
 	// that distinction explicit so device recovery cannot silently restore the
 	// texture contents from data that predates the copy.
 	bool gpuAuthoritative;
+	// Buffer descriptors survive recovery, but their bytes do not. Consumers
+	// must republish before a recovered buffer can be rebound.
+	bool bufferContentValid;
 	BufferDescriptor bufferDescriptor;
 	TextureDescriptor textureDescriptor;
+	// Immutable buffers cannot be republished through updateBufferResource.
+	// Retain their explicit creation source only; mutable buffers retain none.
+	std::vector<unsigned char> immutableBufferRecoverySource;
 	std::vector<unsigned char> shadow;
 	std::vector<size_t> subresourceOffsets;
 	std::vector<size_t> subresourceRowPitches;
@@ -496,7 +519,9 @@ public:
 		m_waterFlatPixelShader(0), m_waterRiverPixelShader(0),
 		m_seaWaveVertexShader(0), m_seaWavePixelShader(0),
 		m_seaWaveLayout(0),
-		m_handles(0), m_stateUseSerial(0), m_ownerThread(0), m_initialized(false),
+		m_handles(0), m_faultPoint(RENDER_RESOURCE_FAULT_NONE),
+		m_faultCountdown(0), m_faultResult(RENDER_RESULT_FAILED),
+		m_stateUseSerial(0), m_ownerThread(0), m_initialized(false),
 		m_frameOpen(false), m_pipelineBound(false), m_vertexBufferBound(false),
 		m_indexBufferBound(false), m_topologyBound(false),
 		m_enableVsync(true), m_transformConstantCursor(0), m_width(0), m_height(0),
@@ -688,18 +713,22 @@ public:
 		slot.binding = descriptor.binding;
 		slot.byteCount = descriptor.byteCount;
 		slot.bufferDescriptor = descriptor;
-		try
+		slot.bufferContentValid = initialData != 0 &&
+			initialDataBytes == descriptor.byteCount;
+		if (descriptor.usage == RENDER_USAGE_IMMUTABLE)
 		{
-			slot.shadow.assign(descriptor.byteCount, 0);
-			if (initialData != 0)
+			try
 			{
-				memcpy(&slot.shadow[0], initialData, descriptor.byteCount);
+				slot.immutableBufferRecoverySource.assign(
+					static_cast<const unsigned char *>(initialData),
+					static_cast<const unsigned char *>(initialData) +
+						descriptor.byteCount);
 			}
-		}
-		catch (...)
-		{
-			releaseSlot(handle, slot);
-			return RENDER_RESULT_OUT_OF_MEMORY;
+			catch (...)
+			{
+				releaseSlot(handle, slot);
+				return RENDER_RESULT_OUT_OF_MEMORY;
+			}
 		}
 		*buffer = handle;
 		return RENDER_RESULT_OK;
@@ -709,36 +738,31 @@ public:
 		const TextureSubresourceData *initialData,
 		unsigned int initialDataCount, GpuHandle *texture)
 	{
-		const DXGI_FORMAT format = TranslateFormat(descriptor.format);
-		if (descriptor.arrayCount != 0 &&
-			descriptor.mipCount > UINT_MAX / descriptor.arrayCount)
-		{
-			return RENDER_RESULT_INVALID_ARGUMENT;
-		}
-		const unsigned int subresourceCount = descriptor.mipCount * descriptor.arrayCount;
-		if (!isOwner() || texture == 0 || descriptor.width == 0 ||
-			descriptor.height == 0 || descriptor.mipCount == 0 ||
-			descriptor.arrayCount == 0 || format == DXGI_FORMAT_UNKNOWN ||
-			(descriptor.dimension != RENDER_TEXTURE_2D &&
-				descriptor.dimension != RENDER_TEXTURE_CUBE) ||
-			// The fixed-function shader contract exposes Texture2D and TextureCube
-			// resources only.  Do not create native array resources that would bind
-			// successfully but fail validation (or sample as black) at draw time.
-			(descriptor.dimension == RENDER_TEXTURE_2D &&
-				descriptor.arrayCount != 1) ||
-			(descriptor.dimension == RENDER_TEXTURE_CUBE &&
-				(descriptor.width != descriptor.height ||
-				descriptor.arrayCount != 6 ||
-				(descriptor.binding & (RENDER_TEXTURE_RENDER_TARGET |
-					RENDER_TEXTURE_DEPTH_STENCIL)) != 0)) ||
-			descriptor.binding == 0 ||
-			(initialData == 0 && initialDataCount != 0) ||
-			(initialData != 0 && initialDataCount != subresourceCount) ||
-			(descriptor.usage == RENDER_USAGE_IMMUTABLE && initialData == 0))
+		if (texture == 0)
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		*texture = GpuHandle();
+		size_t uploadBytes = 0;
+		const RenderResult validationResult = ValidateTextureUpload(descriptor,
+			initialData, initialDataCount, false, MAX_TEXTURE_REFRESH_BYTES,
+			&uploadBytes);
+		const DXGI_FORMAT format = TranslateFormat(descriptor.format);
+		if (!isOwner() || validationResult != RENDER_RESULT_OK)
+		{
+			return !isOwner() ? RENDER_RESULT_INVALID_ARGUMENT : validationResult;
+		}
+		const unsigned int subresourceCount = descriptor.mipCount * descriptor.arrayCount;
+		if (format == DXGI_FORMAT_UNKNOWN)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		RenderResult injectedResult = RENDER_RESULT_OK;
+		if (consumeResourceFault(RENDER_RESOURCE_FAULT_TEXTURE_ALLOCATION,
+			&injectedResult))
+		{
+			return injectedResult;
+		}
 
 		D3D11_TEXTURE2D_DESC nativeDescriptor;
 		memset(&nativeDescriptor, 0, sizeof(nativeDescriptor));
@@ -835,6 +859,12 @@ public:
 		slot.binding = descriptor.binding;
 		slot.byteCount = 0;
 		slot.textureDescriptor = descriptor;
+		if (consumeResourceFault(RENDER_RESOURCE_FAULT_TEXTURE_VIEW,
+			&injectedResult))
+		{
+			releaseSlot(handle, slot);
+			return injectedResult;
+		}
 		if ((descriptor.binding & RENDER_TEXTURE_SHADER_RESOURCE) != 0)
 		{
 			D3D11_SHADER_RESOURCE_VIEW_DESC viewDescriptor;
@@ -887,6 +917,12 @@ public:
 				releaseSlot(handle, slot);
 				return TranslateResult(viewResult);
 			}
+		}
+		if (consumeResourceFault(RENDER_RESOURCE_FAULT_TEXTURE_SHADOW,
+			&injectedResult))
+		{
+			releaseSlot(handle, slot);
+			return injectedResult;
 		}
 		if (initialData != 0)
 		{
@@ -957,6 +993,12 @@ public:
 		{
 			return RENDER_RESULT_UNSUPPORTED;
 		}
+		if ((slot.binding & RENDER_TEXTURE_DEPTH_STENCIL) != 0)
+		{
+			// UpdateSubresource is illegal for depth-stencil resources. Reject the
+			// capability before preparing a shadow or touching backend state.
+			return RENDER_RESULT_UNSUPPORTED;
+		}
 		if (slot.resource == m_activeColorResource ||
 			slot.resource == m_activeDepthResource)
 		{
@@ -967,6 +1009,13 @@ public:
 		if (m_context == 0)
 		{
 			return RENDER_RESULT_FAILED;
+		}
+		size_t uploadBytes = 0;
+		const RenderResult validationResult = ValidateTextureUpload(descriptor,
+			data, dataCount, true, MAX_TEXTURE_REFRESH_BYTES, &uploadBytes);
+		if (validationResult != RENDER_RESULT_OK)
+		{
+			return validationResult;
 		}
 
 		// Keep the recovery shadow attached to the logical resource.  The movie
@@ -1191,6 +1240,12 @@ public:
 			return false;
 		}
 		ResourceSlot &slot = m_resources[resource.index()];
+		RenderResult injectedResult = RENDER_RESULT_OK;
+		if (slot.kind == RESOURCE_TEXTURE && consumeResourceFault(
+			RENDER_RESOURCE_FAULT_TEXTURE_DESTRUCTION, &injectedResult))
+		{
+			return false;
+		}
 		if (slot.kind == RESOURCE_TEXTURE)
 		{
 			unbindTextureResource(resource);
@@ -1281,6 +1336,13 @@ public:
 			if (slot.kind == RESOURCE_BUFFER)
 			{
 				result = recreateBuffer(slot);
+				if (SUCCEEDED(result))
+				{
+					slot.bufferContentValid =
+						slot.bufferDescriptor.usage == RENDER_USAGE_IMMUTABLE &&
+						slot.immutableBufferRecoverySource.size() ==
+							slot.bufferDescriptor.byteCount;
+				}
 			}
 			else if (slot.kind == RESOURCE_TEXTURE)
 			{
@@ -1589,11 +1651,19 @@ public:
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
-		memcpy(&slot.shadow[destinationOffset], data, byteCount);
 		if (slot.usage == RENDER_USAGE_DYNAMIC)
 		{
 			D3D11_MAPPED_SUBRESOURCE mapped;
-			const D3D11_MAP mapMode = mode == RENDER_BUFFER_UPDATE_NO_OVERWRITE ?
+			const bool fullWrite = destinationOffset == 0 &&
+				byteCount == slot.byteCount;
+			if (mode == RENDER_BUFFER_UPDATE_PRESERVE && !fullWrite &&
+				(slot.binding & (RENDER_BUFFER_VERTEX | RENDER_BUFFER_INDEX)) == 0)
+			{
+				return RENDER_RESULT_UNSUPPORTED;
+			}
+			const D3D11_MAP mapMode =
+				mode == RENDER_BUFFER_UPDATE_NO_OVERWRITE ||
+				(mode == RENDER_BUFFER_UPDATE_PRESERVE && !fullWrite) ?
 				D3D11_MAP_WRITE_NO_OVERWRITE : D3D11_MAP_WRITE_DISCARD;
 			const HRESULT result = m_context->Map(slot.resource, 0,
 				mapMode, 0, &mapped);
@@ -1606,16 +1676,10 @@ public:
 				m_context->Unmap(slot.resource, 0);
 				return RENDER_RESULT_FAILED;
 			}
-			if (mode == RENDER_BUFFER_UPDATE_PRESERVE)
-			{
-				memcpy(mapped.pData, &slot.shadow[0], slot.byteCount);
-			}
-			else
-			{
-				memcpy(static_cast<unsigned char *>(mapped.pData) +
-					destinationOffset, data, byteCount);
-			}
+			memcpy(static_cast<unsigned char *>(mapped.pData) +
+				destinationOffset, data, byteCount);
 			m_context->Unmap(slot.resource, 0);
+			slot.bufferContentValid = true;
 			return RENDER_RESULT_OK;
 		}
 
@@ -1627,6 +1691,7 @@ public:
 		destination.front = 0;
 		destination.back = 1;
 		m_context->UpdateSubresource(slot.resource, 0, &destination, data, 0, 0);
+		slot.bufferContentValid = true;
 		return RENDER_RESULT_OK;
 	}
 
@@ -2427,7 +2492,7 @@ public:
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		ResourceSlot &slot = m_resources[buffer.index()];
-		if (slot.kind != RESOURCE_BUFFER ||
+		if (slot.kind != RESOURCE_BUFFER || !slot.bufferContentValid ||
 			(slot.binding & RENDER_BUFFER_VERTEX) == 0 || offset >= slot.byteCount)
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
@@ -2461,7 +2526,7 @@ public:
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		ResourceSlot &slot = m_resources[buffer.index()];
-		if (slot.kind != RESOURCE_BUFFER ||
+		if (slot.kind != RESOURCE_BUFFER || !slot.bufferContentValid ||
 			(slot.binding & RENDER_BUFFER_INDEX) == 0 || offset >= slot.byteCount ||
 			(offset % indexSize) != 0)
 		{
@@ -2774,6 +2839,96 @@ public:
 		return RENDER_RESULT_OK;
 	}
 
+	virtual RenderResult configureResourceFaultInjection(
+		RenderResourceFaultPoint point, unsigned int failOnInvocation,
+		RenderResult result)
+	{
+		if (!isOwner() || m_frameOpen)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		if (point == RENDER_RESOURCE_FAULT_NONE)
+		{
+			m_faultPoint = RENDER_RESOURCE_FAULT_NONE;
+			m_faultCountdown = 0;
+			m_faultResult = RENDER_RESULT_FAILED;
+			return RENDER_RESULT_OK;
+		}
+		if (point < RENDER_RESOURCE_FAULT_TEXTURE_ALLOCATION ||
+			point > RENDER_RESOURCE_FAULT_TEXTURE_DESTRUCTION ||
+			failOnInvocation == 0 ||
+			(result != RENDER_RESULT_OUT_OF_MEMORY &&
+			 result != RENDER_RESULT_DEVICE_REMOVED &&
+			 result != RENDER_RESULT_FAILED))
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		m_faultPoint = point;
+		m_faultCountdown = failOnInvocation;
+		m_faultResult = result;
+		return RENDER_RESULT_OK;
+	}
+
+	virtual RenderResult getDebugResourceStatistics(
+		RenderResourceStatistics *statistics) const
+	{
+		if (!isOwner() || statistics == 0 || m_handles == 0)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		*statistics = RenderResourceStatistics();
+		statistics->liveHandles = m_handles->liveCount();
+		for (unsigned int index = 0; index < m_resources.size(); ++index)
+		{
+			const ResourceSlot &slot = m_resources[index];
+			if (slot.kind == RESOURCE_BUFFER)
+			{
+				++statistics->bufferCount;
+			}
+			else if (slot.kind == RESOURCE_TEXTURE)
+			{
+				++statistics->textureCount;
+			}
+			if (slot.resource != 0)
+			{
+				++statistics->nativeResourceCount;
+			}
+			if (slot.view != 0)
+			{
+				++statistics->shaderResourceViewCount;
+			}
+			if (slot.renderTarget != 0)
+			{
+				++statistics->renderTargetViewCount;
+			}
+			if (slot.depthStencil != 0)
+			{
+				++statistics->depthStencilViewCount;
+			}
+			if (slot.kind == RESOURCE_TEXTURE &&
+				slot.shadow.size() > (size_t)-1 -
+				statistics->recoveryShadowBytes)
+			{
+				return RENDER_RESULT_FAILED;
+			}
+			if (slot.kind == RESOURCE_TEXTURE)
+			{
+				statistics->recoveryShadowBytes += slot.shadow.size();
+			}
+			if (slot.kind == RESOURCE_BUFFER)
+			{
+				if (slot.immutableBufferRecoverySource.size() > (size_t)-1 -
+					statistics->recoveryShadowBytes)
+				{
+					return RENDER_RESULT_FAILED;
+				}
+				statistics->recoveryShadowBytes +=
+					slot.immutableBufferRecoverySource.size();
+			}
+		}
+		return RENDER_RESULT_OK;
+	}
+
 	virtual RenderResult reportDebugLiveObjects()
 	{
 		if (!isOwner() || m_frameOpen)
@@ -2806,6 +2961,25 @@ private:
 	bool isOwner() const
 	{
 		return m_initialized && GetCurrentThreadId() == m_ownerThread;
+	}
+
+	bool consumeResourceFault(RenderResourceFaultPoint point,
+		RenderResult *result)
+	{
+		if (result == 0 || point == RENDER_RESOURCE_FAULT_NONE ||
+			m_faultPoint != point || m_faultCountdown == 0)
+		{
+			return false;
+		}
+		--m_faultCountdown;
+		if (m_faultCountdown != 0)
+		{
+			return false;
+		}
+		*result = m_faultResult;
+		m_faultPoint = RENDER_RESOURCE_FAULT_NONE;
+		m_faultResult = RENDER_RESULT_FAILED;
+		return true;
 	}
 
 	void cacheLegacyState(const LegacyLogicalState &state,
@@ -3586,6 +3760,13 @@ private:
 	HRESULT recreateBuffer(ResourceSlot &slot)
 	{
 		const BufferDescriptor &descriptor = slot.bufferDescriptor;
+		const bool immutable = descriptor.usage == RENDER_USAGE_IMMUTABLE;
+		if ((immutable && slot.immutableBufferRecoverySource.size() !=
+			descriptor.byteCount) ||
+			(!immutable && !slot.immutableBufferRecoverySource.empty()))
+		{
+			return E_FAIL;
+		}
 		D3D11_BUFFER_DESC nativeDescriptor;
 		memset(&nativeDescriptor, 0, sizeof(nativeDescriptor));
 		nativeDescriptor.ByteWidth = static_cast<UINT>(descriptor.byteCount);
@@ -3605,7 +3786,8 @@ private:
 			&nativeDescriptor.CPUAccessFlags);
 		D3D11_SUBRESOURCE_DATA initialData;
 		memset(&initialData, 0, sizeof(initialData));
-		initialData.pSysMem = slot.shadow.empty() ? 0 : &slot.shadow[0];
+		initialData.pSysMem = immutable ?
+			&slot.immutableBufferRecoverySource[0] : 0;
 		return m_device->CreateBuffer(&nativeDescriptor,
 			initialData.pSysMem == 0 ? 0 : &initialData,
 			reinterpret_cast<ID3D11Buffer **>(&slot.resource));
@@ -3613,6 +3795,12 @@ private:
 
 	HRESULT recreateTexture(ResourceSlot &slot)
 	{
+		RenderResult injectedResult = RENDER_RESULT_OK;
+		if (consumeResourceFault(RENDER_RESOURCE_FAULT_TEXTURE_RECOVERY,
+			&injectedResult))
+		{
+			return TranslateInjectedFault(injectedResult);
+		}
 		const TextureDescriptor &descriptor = slot.textureDescriptor;
 		if ((descriptor.dimension != RENDER_TEXTURE_2D &&
 			descriptor.dimension != RENDER_TEXTURE_CUBE) ||
@@ -4552,8 +4740,11 @@ private:
 		slot.binding = 0;
 		slot.byteCount = 0;
 		slot.gpuAuthoritative = false;
+		slot.bufferContentValid = false;
+		slot.bufferDescriptor = BufferDescriptor();
 		// This logical resource is gone, unlike an in-place refresh or device
 		// recovery. Do not retain its largest CPU shadow in the reusable slot.
+		std::vector<unsigned char>().swap(slot.immutableBufferRecoverySource);
 		std::vector<unsigned char>().swap(slot.shadow);
 		std::vector<size_t>().swap(slot.subresourceOffsets);
 		std::vector<size_t>().swap(slot.subresourceRowPitches);
@@ -4616,6 +4807,9 @@ private:
 		m_activeDepthStencil = 0;
 		m_activeColorResource = 0;
 		m_activeDepthResource = 0;
+		m_faultPoint = RENDER_RESOURCE_FAULT_NONE;
+		m_faultCountdown = 0;
+		m_faultResult = RENDER_RESULT_FAILED;
 		m_initialized = false;
 		m_width = 0;
 		m_height = 0;
@@ -4793,6 +4987,9 @@ private:
 	ID3D11PixelShader *m_seaWavePixelShader;
 	ID3D11InputLayout *m_seaWaveLayout;
 	GpuHandleAllocator *m_handles;
+	RenderResourceFaultPoint m_faultPoint;
+	unsigned int m_faultCountdown;
+	RenderResult m_faultResult;
 	std::vector<ResourceSlot> m_resources;
 	std::vector<BlendStateEntry> m_blendStates;
 	std::vector<DepthStencilStateEntry> m_depthStates;

@@ -29,6 +29,7 @@ rts::render::RenderResult NativeW3D2::Initialize(void *window,
 		m_renderer.Shutdown();
 		return bindResult;
 	}
+	m_renderer.m_recoveryResources = &m_resources;
 	return rts::render::RENDER_RESULT_OK;
 }
 
@@ -84,6 +85,12 @@ rts::render::RenderResult NativeW3D2::PublishThreadedCompletion(
 			resourceFailure);
 }
 
+rts::render::RenderResult NativeW3D2::RecoverDevice()
+{
+	return m_borrowedBackend ? rts::render::RENDER_RESULT_INVALID_ARGUMENT :
+		m_renderer.RecoverDevice();
+}
+
 rts::render::RenderResult NativeW3D2::Shutdown()
 {
 	if (m_borrowedBackend && m_renderer.IsFrameOpen())
@@ -95,6 +102,7 @@ rts::render::RenderResult NativeW3D2::Shutdown()
 	{
 		return resourcesResult;
 	}
+	m_renderer.m_recoveryResources = 0;
 	if (m_borrowedBackend)
 	{
 		const rts::render::RenderResult hostResult = m_resourceHost.Detach();

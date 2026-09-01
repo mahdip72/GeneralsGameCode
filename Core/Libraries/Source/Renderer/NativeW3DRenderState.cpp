@@ -47,12 +47,26 @@ long ReadAtomic(volatile const long *value)
 	return __sync_add_and_fetch(const_cast<long *>(value), 0);
 #endif
 }
+
+void WriteAtomic(volatile long *value, long replacement)
+{
+#ifdef _WIN32
+#if defined(_MSC_VER) && _MSC_VER < 1300
+	InterlockedExchange(const_cast<long *>(value), replacement);
+#else
+	InterlockedExchange(value, replacement);
+#endif
+#else
+	__sync_lock_test_and_set(value, replacement);
+#endif
+}
 }
 
 NativeW3DRenderState::NativeW3DRenderState(unsigned int cleanupCapacity,
 	unsigned int initialGeneration) :
 	m_references(1), m_cleanup(cleanupCapacity), m_device(0), m_context(0),
-	m_generation(initialGeneration), m_backendEpoch(1), m_boundResourceTables(0)
+	m_generation(initialGeneration), m_backendEpoch(1), m_bufferEpoch(1),
+	m_backendTerminal(1), m_boundResourceTables(0)
 {
 }
 
@@ -99,10 +113,16 @@ RenderResult NativeW3DRenderState::AttachBackend(IRenderDevice *device,
 	}
 	m_device = device;
 	m_context = context;
+	WriteAtomic(&m_backendTerminal, 0);
 	++m_backendEpoch;
 	if (m_backendEpoch == 0)
 	{
 		m_backendEpoch = 1;
+	}
+	++m_bufferEpoch;
+	if (m_bufferEpoch == 0)
+	{
+		m_bufferEpoch = 1;
 	}
 	return RENDER_RESULT_OK;
 }
@@ -119,6 +139,20 @@ RenderResult NativeW3DRenderState::ReplaceContext(IRenderContext *context)
 	if (m_backendEpoch == 0)
 	{
 		m_backendEpoch = 1;
+	}
+	return RENDER_RESULT_OK;
+}
+
+RenderResult NativeW3DRenderState::AdvanceBufferEpoch()
+{
+	if (!IsOwnerThread() || m_device == 0 || !IsAcceptingCleanup())
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	++m_bufferEpoch;
+	if (m_bufferEpoch == 0)
+	{
+		m_bufferEpoch = 1;
 	}
 	return RENDER_RESULT_OK;
 }
@@ -142,6 +176,14 @@ RenderResult NativeW3DRenderState::DetachBackend(bool allowBoundResourceTables)
 	{
 		m_backendEpoch = 1;
 	}
+	++m_bufferEpoch;
+	if (m_bufferEpoch == 0)
+	{
+		m_bufferEpoch = 1;
+	}
+	// Publish terminal detachment only after every owner-thread backend field and
+	// epoch has reached its final value.
+	WriteAtomic(&m_backendTerminal, 1);
 	return RENDER_RESULT_OK;
 }
 
@@ -209,6 +251,16 @@ unsigned int NativeW3DRenderState::BoundResourceTables() const
 	return count > 0 ? static_cast<unsigned int>(count) : 0;
 }
 
+void NativeW3DRenderState::MarkBackendTerminal()
+{
+	WriteAtomic(&m_backendTerminal, 1);
+}
+
+bool NativeW3DRenderState::IsBackendTerminal() const
+{
+	return ReadAtomic(&m_backendTerminal) != 0;
+}
+
 bool NativeW3DRenderState::IsOperational() const
 {
 	return IsOwnerThread() && IsAcceptingCleanup() && m_device != 0 &&
@@ -223,6 +275,11 @@ unsigned int NativeW3DRenderState::Generation() const
 unsigned int NativeW3DRenderState::BackendEpoch() const
 {
 	return IsOwnerThread() ? m_backendEpoch : 0;
+}
+
+unsigned int NativeW3DRenderState::BufferEpoch() const
+{
+	return IsOwnerThread() ? m_bufferEpoch : 0;
 }
 
 IRenderDevice *NativeW3DRenderState::Device() const

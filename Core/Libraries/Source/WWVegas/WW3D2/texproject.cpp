@@ -1188,7 +1188,7 @@ bool TexProjectClass::Compute_Texture
 			DX8Wrapper::Is_D3D11_Backend_Active())
 		{
 			copy_succeeded = DX8Wrapper::Copy_Active_Render_Target_To_Texture(
-				d3d11_copy_target->Peek_D3D_Base_Texture()) ==
+				d3d11_copy_target) ==
 				rts::render::RENDER_RESULT_OK;
 		}
 		SNAPSHOT_SAY(("TexProjectCLass::End_Render()"));
@@ -1202,7 +1202,7 @@ bool TexProjectClass::Compute_Texture
 			// shadow's bounds/history and suppressing regeneration.
 			copy_succeeded =
 				DX8Wrapper::Acquire_D3D11_Copied_Texture_Content(
-					d3d11_copy_target->Peek_D3D_Base_Texture());
+					d3d11_copy_target);
 		}
 
 		Restore_Default_Render_Target();

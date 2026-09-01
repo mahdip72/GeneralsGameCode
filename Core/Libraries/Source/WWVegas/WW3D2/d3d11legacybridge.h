@@ -54,6 +54,7 @@ struct D3D11LegacyBridgeCacheStats
 
 class IndexBufferClass;
 class VertexBufferClass;
+class TextureBaseClass;
 
 class D3D11LegacyBridge
 {
@@ -61,6 +62,8 @@ public:
 	D3D11LegacyBridge();
 	~D3D11LegacyBridge();
 
+	// Native x64 passes no legacy device. The optional pointer remains only for
+	// the 32-bit differential bridge diagnostics.
 	bool Initialize(HWND window, IDirect3DDevice8 *legacy_device,
 		unsigned int width, unsigned int height, bool enable_vsync);
 	void Shutdown();
@@ -95,6 +98,11 @@ public:
 		IDirect3DSurface8 *color_surface,
 		IDirect3DSurface8 *depth_surface, bool use_default_depth);
 	rts::render::RenderResult Set_Render_Target_Default();
+#if defined(_WIN64)
+	rts::render::RenderResult Set_Render_Target_Textures(
+		TextureBaseClass *color_texture, TextureBaseClass *depth_texture,
+		bool use_default_depth);
+#endif
 	// Copies the current D3D11 color target into a legacy texture's neutral
 	// renderer allocation. The legacy D3D8 path remains untouched.
 	rts::render::RenderResult Copy_Active_Color_Target_To_Texture(

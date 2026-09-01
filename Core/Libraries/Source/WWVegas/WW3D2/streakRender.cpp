@@ -1323,11 +1323,19 @@ void StreakRendererClass::RenderStreak
 		*/
 
 		DynamicVBAccessClass Verts((sorting?BUFFER_TYPE_DYNAMIC_SORTING:BUFFER_TYPE_DYNAMIC_DX8),dynamic_fvf_type,vnum);
+		if (!Verts.Is_Valid()) {
+			DX8Wrapper::Set_Transform(D3DTS_VIEW,view);
+			return;
+		}
 		// Copy in the data to the  VB
 		{
 			DynamicVBAccessClass::WriteLockClass Lock(&Verts);
 			unsigned int i;
 			unsigned char *vb=(unsigned char*)Lock.Get_Formatted_Vertex_Array();
+			if (!Lock.Is_Locked() || vb == nullptr) {
+				DX8Wrapper::Set_Transform(D3DTS_VIEW,view);
+				return;
+			}
 			const FVFInfoClass& fvfinfo=Verts.FVF_Info();
 			int segIdx = 0;
 			unsigned int argb = 0x00000000;
@@ -1355,13 +1363,25 @@ void StreakRendererClass::RenderStreak
 				texture->V = vertexArray[i].v1;
 				vb += vbSize;
 			}
+			if (!Lock.Commit()) {
+				DX8Wrapper::Set_Transform(D3DTS_VIEW,view);
+				return;
+			}
 		}
 
 		DynamicIBAccessClass ib_access((sorting?BUFFER_TYPE_DYNAMIC_SORTING:BUFFER_TYPE_DYNAMIC_DX8),triangleIndex*3);
+		if (!ib_access.Is_Valid()) {
+			DX8Wrapper::Set_Transform(D3DTS_VIEW,view);
+			return;
+		}
 		{
 			unsigned int i;
 			DynamicIBAccessClass::WriteLockClass lock(&ib_access);
 			unsigned short* inds=lock.Get_Index_Array();
+			if (!lock.Is_Locked() || inds == nullptr) {
+				DX8Wrapper::Set_Transform(D3DTS_VIEW,view);
+				return;
+			}
 
 			for (i=0; i<triangleIndex; i++)
 			{
@@ -1369,11 +1389,18 @@ void StreakRendererClass::RenderStreak
 				*inds++=v_index_array[i].J;
 				*inds++=v_index_array[i].K;
 			}
+			if (!lock.Commit()) {
+				DX8Wrapper::Set_Transform(D3DTS_VIEW,view);
+				return;
+			}
 		}
 
 
-		DX8Wrapper::Set_Index_Buffer(ib_access,0);
-		DX8Wrapper::Set_Vertex_Buffer(Verts);
+		if (!DX8Wrapper::Set_Index_Buffer(ib_access,0) ||
+			!DX8Wrapper::Set_Vertex_Buffer(Verts)) {
+			DX8Wrapper::Set_Transform(D3DTS_VIEW,view);
+			return;
+		}
 		DX8Wrapper::Set_Texture(0,Texture);
 		DX8Wrapper::Set_Shader(shader);
 

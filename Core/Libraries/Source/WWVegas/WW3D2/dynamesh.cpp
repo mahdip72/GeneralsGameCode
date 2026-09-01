@@ -187,12 +187,18 @@ void DynamicMeshModel::Render(RenderInfoClass & rinfo)
 	** these components, the code will fail.
 	*/
 	DynamicVBAccessClass dynamic_vb(buffer_type,dynamic_fvf_type,DynamicMeshVNum);
+	if (!dynamic_vb.Is_Valid()) {
+		return;
+	}
 	const FVFInfoClass &fvf_info = dynamic_vb.FVF_Info();
 
 	{ // scope for lock
 
 		DynamicVBAccessClass::WriteLockClass lock(&dynamic_vb);
 		unsigned char *vertices = (unsigned char*)lock.Get_Formatted_Vertex_Array();
+		if (!lock.Is_Locked() || vertices == nullptr) {
+			return;
+		}
 		const Vector3 *locs = Get_Vertex_Array();
 		const Vector3 *normals = Get_Vertex_Normal_Array();
 		const Vector2 *uvs = MatDesc->Get_UV_Array_By_Index(0, false);
@@ -223,33 +229,45 @@ void DynamicMeshModel::Render(RenderInfoClass & rinfo)
 			}
 			vertices += fvf_info.Get_FVF_Size();
 		}
-
+		if (!lock.Commit()) {
+			return;
+		}
 	}
 
 	/*
 	** Write index data to index buffers
 	*/
 	DynamicIBAccessClass dynamic_ib(buffer_type,DynamicMeshPNum * 3);
+	if (!dynamic_ib.Is_Valid()) {
+		return;
+	}
 	const TriIndex *tris = Get_Polygon_Array();
 
 	{ // scope for lock
 
 		DynamicIBAccessClass::WriteLockClass lock(&dynamic_ib);
 		unsigned short * indices = lock.Get_Index_Array();
+		if (!lock.Is_Locked() || indices == nullptr) {
+			return;
+		}
 		for (int i=0; i < DynamicMeshPNum; i++)
 		{
 			indices[i*3 + 0] = (unsigned short)tris[i][0];
 			indices[i*3 + 1] = (unsigned short)tris[i][1];
 			indices[i*3 + 2] = (unsigned short)tris[i][2];
 		}
-
+		if (!lock.Commit()) {
+			return;
+		}
 	}
 
 	/*
 	** Set vertex and index buffers
 	*/
-	DX8Wrapper::Set_Vertex_Buffer(dynamic_vb);
-	DX8Wrapper::Set_Index_Buffer(dynamic_ib,0);
+	if (!DX8Wrapper::Set_Vertex_Buffer(dynamic_vb) ||
+		!DX8Wrapper::Set_Index_Buffer(dynamic_ib,0)) {
+		return;
+	}
 
 	/*
 	** Draw dynamesh, one pass at a time

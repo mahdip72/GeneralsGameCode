@@ -500,6 +500,79 @@ DX8Caps::DX8Caps(
 	Compute_Caps(display_format,adapter_id);
 }
 
+#if defined(_WIN64)
+DX8Caps::DX8Caps(WW3DFormat display_format)
+	:
+	Direct3D(nullptr),
+	MaxDisplayWidth(16384),
+	MaxDisplayHeight(16384)
+{
+	(void)display_format;
+	memset(&Caps, 0, sizeof(Caps));
+	Caps.DeviceType = D3DDEVTYPE_HAL;
+	Caps.DevCaps = D3DDEVCAPS_HWTRANSFORMANDLIGHT;
+	Caps.RasterCaps = D3DPRASTERCAPS_FOGRANGE | D3DPRASTERCAPS_ZBIAS;
+	Caps.TextureCaps = D3DPTEXTURECAPS_CUBEMAP | D3DPTEXTURECAPS_VOLUMEMAP;
+	Caps.TextureFilterCaps = D3DPTFILTERCAPS_MINFPOINT |
+		D3DPTFILTERCAPS_MINFLINEAR | D3DPTFILTERCAPS_MINFANISOTROPIC |
+		D3DPTFILTERCAPS_MAGFPOINT | D3DPTFILTERCAPS_MAGFLINEAR |
+		D3DPTFILTERCAPS_MAGFANISOTROPIC | D3DPTFILTERCAPS_MIPFPOINT |
+		D3DPTFILTERCAPS_MIPFLINEAR;
+	Caps.TextureOpCaps = D3DTEXOPCAPS_MODULATEALPHA_ADDCOLOR |
+		D3DTEXOPCAPS_DOTPRODUCT3 | D3DTEXOPCAPS_BUMPENVMAP |
+		D3DTEXOPCAPS_BUMPENVMAPLUMINANCE;
+	Caps.MaxTextureWidth = 16384;
+	Caps.MaxTextureHeight = 16384;
+	Caps.MaxVolumeExtent = 2048;
+	Caps.MaxTextureAspectRatio = 16384;
+	Caps.MaxPointSize = 256.0f;
+	Caps.MaxSimultaneousTextures = 8;
+	Caps.VertexShaderVersion = D3DVS_VERSION(1, 1);
+	Caps.PixelShaderVersion = D3DPS_VERSION(1, 4);
+
+	SupportTnL = true;
+	SupportDXTC = true;
+	supportGamma = false;
+	SupportNPatches = false;
+	SupportBumpEnvmap = true;
+	SupportBumpEnvmapLuminance = true;
+	SupportZBias = true;
+	SupportAnisotropicFiltering = true;
+	SupportModAlphaAddClr = true;
+	SupportDot3 = true;
+	SupportPointSprites = true;
+	SupportCubemaps = true;
+	CanDoMultiPass = true;
+	IsFogAllowed = true;
+	MaxTexturesPerPass = 8;
+	VertexShaderVersion = Caps.VertexShaderVersion;
+	PixelShaderVersion = Caps.PixelShaderVersion;
+	MaxSimultaneousTextures = Caps.MaxSimultaneousTextures;
+	DeviceId = 0;
+	DriverBuildVersion = 0;
+	DriverVersionStatus = DRIVER_STATUS_GOOD;
+	VendorId = VENDOR_UNKNOWN;
+	DriverDLL = "d3d11.dll";
+	CapsLog = "Native D3D11 feature-level 11 product capabilities\r\n";
+	CompactLog = "Native D3D11\tFeature Level 11\t";
+
+	for (unsigned int format = 0; format < WW3D_FORMAT_COUNT; ++format)
+	{
+		const bool supported = format != WW3D_FORMAT_UNKNOWN &&
+			format != WW3D_FORMAT_P8 && format != WW3D_FORMAT_A8P8;
+		SupportTextureFormat[format] = supported;
+		SupportRenderToTextureFormat[format] =
+			format == WW3D_FORMAT_A8R8G8B8 ||
+			format == WW3D_FORMAT_X8R8G8B8;
+	}
+	for (unsigned int format = 0; format < WW3D_ZFORMAT_COUNT; ++format)
+	{
+		SupportDepthStencilFormat[format] =
+			format == WW3D_ZFORMAT_D24S8;
+	}
+}
+#endif
+
 //Don't really need this but I added this function to free static variables so
 //they don't show up in our memory manager as a leak. -MW 7-22-03
 void DX8Caps::Shutdown()

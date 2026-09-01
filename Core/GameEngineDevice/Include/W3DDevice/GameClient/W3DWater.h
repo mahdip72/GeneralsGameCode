@@ -159,8 +159,13 @@ protected:
 	};
 
 	LPDIRECT3DDEVICE8 m_pDev;						///<pointer to D3D Device
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	DX8VertexBufferClass *m_vertexBufferD3D;		///<native WW3D vertex-buffer owner
+	DX8IndexBufferClass *m_indexBufferD3D;		///<native WW3D index-buffer owner
+#else
 	LPDIRECT3DVERTEXBUFFER8 m_vertexBufferD3D;		///<D3D vertex buffer
 	LPDIRECT3DINDEXBUFFER8	m_indexBufferD3D;	///<D3D index buffer
+#endif
 	Int						m_vertexBufferD3DOffset;	///<location to start writing vertices
 	DWORD					m_dwWavePixelShader;	///<handle to D3D pixel shader
 	DWORD					m_dwWaveVertexShader;	///<handle to D3D vertex shader

@@ -472,6 +472,90 @@ void BufferUpdateFailureRecoveryRestoresBinding()
 		&& static_cast<std::size_t>(std::count(f.events.begin(), f.events.end(), UPDATE)) == updates + 1);
 }
 
+void BufferMutationFailureIsIsolated()
+{
+	Fixture f;
+	auto device = Device(f);
+	IRenderContext *context = device->immediateContext();
+	BufferDescriptor failedDescriptor;
+	failedDescriptor.byteCount = 16;
+	failedDescriptor.stride = 16;
+	failedDescriptor.usage = RENDER_USAGE_DYNAMIC;
+	failedDescriptor.binding = RENDER_BUFFER_VERTEX;
+	BufferDescriptor stableDescriptor = failedDescriptor;
+	stableDescriptor.usage = RENDER_USAGE_DEFAULT;
+	unsigned char failedBytes[16]; std::memset(failedBytes, 31, sizeof(failedBytes));
+	unsigned char stableBytes[16]; std::memset(stableBytes, 47, sizeof(stableBytes));
+	GpuHandle failedBuffer, stableBuffer;
+	CHECK(device->createBuffer(failedDescriptor, failedBytes,
+		sizeof(failedBytes), &failedBuffer) == RENDER_RESULT_OK);
+	CHECK(device->createBuffer(stableDescriptor, stableBytes,
+		sizeof(stableBytes), &stableBuffer) == RENDER_RESULT_OK);
+	f.failUpdate = true;
+	f.updateFailureResult = RENDER_RESULT_FAILED;
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(context->updateBuffer(failedBuffer, failedBytes,
+		sizeof(failedBytes), 0, RENDER_BUFFER_UPDATE_DISCARD) ==
+		RENDER_RESULT_OK);
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(device->present() == RENDER_RESULT_OK);
+	const ThreadedRenderFrameCompletion failed = Complete(device.get(),
+		RENDER_RESULT_FAILED);
+	CHECK(failed.resourceFailure && device->isOperational());
+	f.failUpdate = false;
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(context->setVertexBuffer(stableBuffer, 16, 0) == RENDER_RESULT_OK);
+	CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+		RENDER_RESULT_OK);
+	CHECK(context->draw(1, 0) == RENDER_RESULT_OK);
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(device->present() == RENDER_RESULT_OK);
+	CHECK(Complete(device.get()).presented);
+	CHECK(device->destroyResource(failedBuffer));
+	CHECK(device->destroyResource(stableBuffer));
+	CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
+}
+
+void SuccessfulCpuUploadSurvivesUnrelatedFrameFailure()
+{
+	Fixture f;
+	auto device = Device(f);
+	IRenderContext *context = device->immediateContext();
+	BufferDescriptor descriptor;
+	descriptor.byteCount = 16;
+	descriptor.stride = 16;
+	descriptor.usage = RENDER_USAGE_DYNAMIC;
+	descriptor.binding = RENDER_BUFFER_VERTEX;
+	unsigned char bytes[16]; std::memset(bytes, 61, sizeof(bytes));
+	GpuHandle buffer;
+	CHECK(device->createBuffer(descriptor, bytes, sizeof(bytes), &buffer) ==
+		RENDER_RESULT_OK);
+	f.failDraw = true;
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(context->updateBuffer(buffer, bytes, sizeof(bytes), 0,
+		RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK);
+	// This deliberately failing draw does not consume the uploaded buffer.
+	CHECK(context->draw(3, 0) == RENDER_RESULT_OK);
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(device->present() == RENDER_RESULT_OK);
+	const ThreadedRenderFrameCompletion failed = Complete(device.get(),
+		RENDER_RESULT_FAILED);
+	CHECK(failed.outcome.hasCommandFailure() && !failed.presented &&
+		!failed.resourceFailure);
+	f.failDraw = false;
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(context->setVertexBuffer(buffer, descriptor.stride, 0) ==
+		RENDER_RESULT_OK);
+	CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+		RENDER_RESULT_OK);
+	CHECK(context->draw(1, 0) == RENDER_RESULT_OK);
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(device->present() == RENDER_RESULT_OK);
+	CHECK(Complete(device.get()).presented);
+	CHECK(device->destroyResource(buffer));
+	CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
+}
+
 void ResourcePreambleRemovalRemainsObservable()
 {
 	Fixture f;
@@ -818,6 +902,8 @@ int main()
 		GenerationsAndResourceFailure();
 		FailurePublicationAndRecovery();
 		BufferUpdateFailureRecoveryRestoresBinding();
+		BufferMutationFailureIsIsolated();
+		SuccessfulCpuUploadSurvivesUnrelatedFrameFailure();
 		ResourcePreambleRemovalRemainsObservable();
 		RecoveryClearsPreambleResourceFailure();
 		CaptureResizeAndNonVisibleOrdering();

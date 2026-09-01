@@ -45,6 +45,19 @@
 #include "dx8caps.h"
 #include "WWLib/thread.h"
 #include "WWDebug/wwmemlog.h"
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+#include "nativew3dbufferowner.h"
+#endif
+
+static bool Use_Vertex_Range_Lock(unsigned int first_vertex,
+	unsigned int count, unsigned int vertex_count)
+{
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	return first_vertex != 0 || count != vertex_count;
+#else
+	return first_vertex != 0;
+#endif
+}
 
 #define DEFAULT_VB_SIZE 5000
 
@@ -66,6 +79,35 @@ static int _DX8VertexBufferCount=0;
 static int _VertexBufferCount;
 static int _VertexBufferTotalVertices;
 static int _VertexBufferTotalSize;
+
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+static bool Get_Native_Buffer_Update_Mode(int flags,
+	rts::render::RenderBufferUpdateMode *mode)
+{
+	const unsigned int supported_flags = D3DLOCK_DISCARD |
+		D3DLOCK_NOOVERWRITE | D3DLOCK_NOSYSLOCK;
+	if (mode == nullptr ||
+		(static_cast<unsigned int>(flags) & ~supported_flags) != 0 ||
+		((flags & D3DLOCK_DISCARD) != 0 &&
+		 (flags & D3DLOCK_NOOVERWRITE) != 0))
+	{
+		return false;
+	}
+	if ((flags & D3DLOCK_DISCARD) != 0)
+	{
+		*mode = rts::render::RENDER_BUFFER_UPDATE_DISCARD;
+	}
+	else if ((flags & D3DLOCK_NOOVERWRITE) != 0)
+	{
+		*mode = rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE;
+	}
+	else
+	{
+		*mode = rts::render::RENDER_BUFFER_UPDATE_PRESERVE;
+	}
+	return true;
+}
+#endif
 
 // ----------------------------------------------------------------------------
 //
@@ -210,15 +252,22 @@ VertexBufferClass::WriteLockClass::WriteLockClass(VertexBufferClass* VertexBuffe
 			fvf_name));
 		}
 #endif
-		DX8_Assert();
-		DX8_ErrorCode(static_cast<DX8VertexBufferClass*>(VertexBuffer)->Get_DX8_Vertex_Buffer()->Lock(
-			0,
-			0,
-			(unsigned char**)&Vertices,
-			flags));	//flags
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		Locked = static_cast<DX8VertexBufferClass *>(VertexBuffer)->
+			Lock_Native_Buffer(0, 0, flags, &Vertices);
+#else
+		{
+			DX8_Assert();
+			const HRESULT result = static_cast<DX8VertexBufferClass*>(VertexBuffer)->Get_DX8_Vertex_Buffer()->Lock(
+				0, 0, (unsigned char**)&Vertices, flags);
+			DX8_ErrorCode(result);
+			Locked = SUCCEEDED(result);
+		}
+#endif
 		break;
 	case BUFFER_TYPE_SORTING:
 		Vertices=static_cast<SortingVertexBufferClass*>(VertexBuffer)->VertexBuffer;
+		Locked = true;
 		break;
 	default:
 		WWASSERT(0);
@@ -231,13 +280,34 @@ VertexBufferClass::WriteLockClass::WriteLockClass(VertexBufferClass* VertexBuffe
 VertexBufferClass::WriteLockClass::~WriteLockClass()
 {
 	DX8_THREAD_ASSERT();
+	Commit();
+	VertexBuffer->Release_Ref();
+}
+
+bool VertexBufferClass::WriteLockClass::Commit()
+{
+	if (!Locked)
+	{
+		return false;
+	}
+	bool changed = Locked;
 	switch (VertexBuffer->Type()) {
 	case BUFFER_TYPE_DX8:
 #ifdef VERTEX_BUFFER_LOG
 		WWDEBUG_SAY(("VertexBuffer->Unlock()"));
 #endif
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		changed = Locked && static_cast<DX8VertexBufferClass *>(VertexBuffer)->
+			Unlock_Native_Buffer();
+#else
 		DX8_Assert();
-		DX8_ErrorCode(static_cast<DX8VertexBufferClass*>(VertexBuffer)->Get_DX8_Vertex_Buffer()->Unlock());
+		if (Locked)
+		{
+			const HRESULT result = static_cast<DX8VertexBufferClass*>(VertexBuffer)->Get_DX8_Vertex_Buffer()->Unlock();
+			DX8_ErrorCode(result);
+			changed = SUCCEEDED(result);
+		}
+#endif
 		break;
 	case BUFFER_TYPE_SORTING:
 		break;
@@ -245,8 +315,13 @@ VertexBufferClass::WriteLockClass::~WriteLockClass()
 		WWASSERT(0);
 		break;
 	}
-	VertexBuffer->Mark_Changed();
-	VertexBuffer->Release_Ref();
+	if (changed)
+	{
+		VertexBuffer->Mark_Changed();
+	}
+	Locked = false;
+	Vertices = nullptr;
+	return changed;
 }
 
 // ----------------------------------------------------------------------------
@@ -277,15 +352,27 @@ VertexBufferClass::AppendLockClass::AppendLockClass(VertexBufferClass* VertexBuf
 			fvf_name));
 		}
 #endif
-		DX8_Assert();
-		DX8_ErrorCode(static_cast<DX8VertexBufferClass*>(VertexBuffer)->Get_DX8_Vertex_Buffer()->Lock(
-			start_index*VertexBuffer->FVF_Info().Get_FVF_Size(),
-			index_range*VertexBuffer->FVF_Info().Get_FVF_Size(),
-			(unsigned char**)&Vertices,
-			0));	// Default (no) flags
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		Locked = static_cast<DX8VertexBufferClass *>(VertexBuffer)->
+			Lock_Native_Buffer(
+				static_cast<size_t>(start_index) * VertexBuffer->FVF_Info().Get_FVF_Size(),
+				static_cast<size_t>(index_range) * VertexBuffer->FVF_Info().Get_FVF_Size(),
+				0, &Vertices);
+#else
+		{
+			DX8_Assert();
+			const HRESULT result = static_cast<DX8VertexBufferClass*>(VertexBuffer)->Get_DX8_Vertex_Buffer()->Lock(
+				start_index*VertexBuffer->FVF_Info().Get_FVF_Size(),
+				index_range*VertexBuffer->FVF_Info().Get_FVF_Size(),
+				(unsigned char**)&Vertices, 0);
+			DX8_ErrorCode(result);
+			Locked = SUCCEEDED(result);
+		}
+#endif
 		break;
 	case BUFFER_TYPE_SORTING:
 		Vertices=static_cast<SortingVertexBufferClass*>(VertexBuffer)->VertexBuffer+start_index;
+		Locked = true;
 		break;
 	default:
 		WWASSERT(0);
@@ -298,13 +385,34 @@ VertexBufferClass::AppendLockClass::AppendLockClass(VertexBufferClass* VertexBuf
 VertexBufferClass::AppendLockClass::~AppendLockClass()
 {
 	DX8_THREAD_ASSERT();
+	Commit();
+	VertexBuffer->Release_Ref();
+}
+
+bool VertexBufferClass::AppendLockClass::Commit()
+{
+	if (!Locked)
+	{
+		return false;
+	}
+	bool changed = Locked;
 	switch (VertexBuffer->Type()) {
 	case BUFFER_TYPE_DX8:
-		DX8_Assert();
 #ifdef VERTEX_BUFFER_LOG
 		WWDEBUG_SAY(("VertexBuffer->Unlock()"));
 #endif
-		DX8_ErrorCode(static_cast<DX8VertexBufferClass*>(VertexBuffer)->Get_DX8_Vertex_Buffer()->Unlock());
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		changed = Locked && static_cast<DX8VertexBufferClass *>(VertexBuffer)->
+			Unlock_Native_Buffer();
+#else
+		DX8_Assert();
+		if (Locked)
+		{
+			const HRESULT result = static_cast<DX8VertexBufferClass*>(VertexBuffer)->Get_DX8_Vertex_Buffer()->Unlock();
+			DX8_ErrorCode(result);
+			changed = SUCCEEDED(result);
+		}
+#endif
 		break;
 	case BUFFER_TYPE_SORTING:
 		break;
@@ -312,8 +420,13 @@ VertexBufferClass::AppendLockClass::~AppendLockClass()
 		WWASSERT(0);
 		break;
 	}
-	VertexBuffer->Mark_Changed();
-	VertexBuffer->Release_Ref();
+	if (changed)
+	{
+		VertexBuffer->Mark_Changed();
+	}
+	Locked = false;
+	Vertices = nullptr;
+	return changed;
 }
 
 // ----------------------------------------------------------------------------
@@ -349,7 +462,11 @@ SortingVertexBufferClass::~SortingVertexBufferClass()
 DX8VertexBufferClass::DX8VertexBufferClass(unsigned FVF, unsigned short vertex_count_, UsageType usage)
 	:
 	VertexBufferClass(BUFFER_TYPE_DX8, FVF, vertex_count_),
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	NativeBuffer(nullptr)
+#else
 	VertexBuffer(nullptr)
+#endif
 {
 	Create_Vertex_Buffer(usage);
 }
@@ -364,14 +481,27 @@ DX8VertexBufferClass::DX8VertexBufferClass(
 	UsageType usage)
 	:
 	VertexBufferClass(BUFFER_TYPE_DX8, D3DFVF_XYZ|D3DFVF_TEX1|D3DFVF_NORMAL, VertexCount),
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	NativeBuffer(nullptr)
+#else
 	VertexBuffer(nullptr)
+#endif
 {
 	WWASSERT(vertices);
 	WWASSERT(normals);
 	WWASSERT(tex_coords);
 
 	Create_Vertex_Buffer(usage);
-	Copy(vertices,normals,tex_coords,0,VertexCount);
+	if (!Copy(vertices,normals,tex_coords,0,VertexCount))
+	{
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		delete NativeBuffer;
+		NativeBuffer = nullptr;
+#else
+		if (VertexBuffer != nullptr) VertexBuffer->Release();
+		VertexBuffer = nullptr;
+#endif
+	}
 }
 
 // ----------------------------------------------------------------------------
@@ -385,7 +515,11 @@ DX8VertexBufferClass::DX8VertexBufferClass(
 	UsageType usage)
 	:
 	VertexBufferClass(BUFFER_TYPE_DX8, D3DFVF_XYZ|D3DFVF_TEX1|D3DFVF_NORMAL|D3DFVF_DIFFUSE, VertexCount),
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	NativeBuffer(nullptr)
+#else
 	VertexBuffer(nullptr)
+#endif
 {
 	WWASSERT(vertices);
 	WWASSERT(normals);
@@ -393,7 +527,16 @@ DX8VertexBufferClass::DX8VertexBufferClass(
 	WWASSERT(diffuse);
 
 	Create_Vertex_Buffer(usage);
-	Copy(vertices,normals,tex_coords,diffuse,0,VertexCount);
+	if (!Copy(vertices,normals,tex_coords,diffuse,0,VertexCount))
+	{
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		delete NativeBuffer;
+		NativeBuffer = nullptr;
+#else
+		if (VertexBuffer != nullptr) VertexBuffer->Release();
+		VertexBuffer = nullptr;
+#endif
+	}
 }
 
 // ----------------------------------------------------------------------------
@@ -406,14 +549,27 @@ DX8VertexBufferClass::DX8VertexBufferClass(
 	UsageType usage)
 	:
 	VertexBufferClass(BUFFER_TYPE_DX8, D3DFVF_XYZ|D3DFVF_TEX1|D3DFVF_DIFFUSE, VertexCount),
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	NativeBuffer(nullptr)
+#else
 	VertexBuffer(nullptr)
+#endif
 {
 	WWASSERT(vertices);
 	WWASSERT(tex_coords);
 	WWASSERT(diffuse);
 
 	Create_Vertex_Buffer(usage);
-	Copy(vertices,tex_coords,diffuse,0,VertexCount);
+	if (!Copy(vertices,tex_coords,diffuse,0,VertexCount))
+	{
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		delete NativeBuffer;
+		NativeBuffer = nullptr;
+#else
+		if (VertexBuffer != nullptr) VertexBuffer->Release();
+		VertexBuffer = nullptr;
+#endif
+	}
 }
 
 // ----------------------------------------------------------------------------
@@ -425,13 +581,26 @@ DX8VertexBufferClass::DX8VertexBufferClass(
 	UsageType usage)
 	:
 	VertexBufferClass(BUFFER_TYPE_DX8, D3DFVF_XYZ|D3DFVF_TEX1, VertexCount),
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	NativeBuffer(nullptr)
+#else
 	VertexBuffer(nullptr)
+#endif
 {
 	WWASSERT(vertices);
 	WWASSERT(tex_coords);
 
 	Create_Vertex_Buffer(usage);
-	Copy(vertices,tex_coords,0,VertexCount);
+	if (!Copy(vertices,tex_coords,0,VertexCount))
+	{
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		delete NativeBuffer;
+		NativeBuffer = nullptr;
+#else
+		if (VertexBuffer != nullptr) VertexBuffer->Release();
+		VertexBuffer = nullptr;
+#endif
+	}
 }
 
 // ----------------------------------------------------------------------------
@@ -443,7 +612,82 @@ DX8VertexBufferClass::~DX8VertexBufferClass()
 	_DX8VertexBufferCount--;
 	WWDEBUG_SAY(("Current vertex buffer count: %d",_DX8VertexBufferCount));
 #endif
-	VertexBuffer->Release();
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	delete NativeBuffer;
+	NativeBuffer = nullptr;
+#else
+	if (VertexBuffer != nullptr)
+	{
+		VertexBuffer->Release();
+	}
+#endif
+}
+
+bool DX8VertexBufferClass::Is_Valid() const
+{
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	return NativeBuffer != nullptr && !NativeBuffer->HasFailedMutation();
+#else
+	return VertexBuffer != nullptr;
+#endif
+}
+
+bool DX8VertexBufferClass::Lock_Buffer(size_t byte_offset,
+	size_t byte_count, int flags, void **data)
+{
+	if (data == nullptr)
+	{
+		return false;
+	}
+	*data = nullptr;
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	return Lock_Native_Buffer(byte_offset, byte_count, flags, data);
+#else
+	if (VertexBuffer == nullptr)
+	{
+		return false;
+	}
+	DX8_Assert();
+	const HRESULT result = VertexBuffer->Lock(
+		static_cast<unsigned int>(byte_offset),
+		static_cast<unsigned int>(byte_count),
+		reinterpret_cast<unsigned char **>(data), flags);
+	DX8_ErrorCode(result);
+	return SUCCEEDED(result);
+#endif
+}
+
+bool DX8VertexBufferClass::Unlock_Buffer()
+{
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	const bool changed = Unlock_Native_Buffer();
+#else
+	if (VertexBuffer == nullptr)
+	{
+		return false;
+	}
+	DX8_Assert();
+	const HRESULT result = VertexBuffer->Unlock();
+	DX8_ErrorCode(result);
+	const bool changed = SUCCEEDED(result);
+#endif
+	if (changed)
+	{
+		Mark_Changed();
+	}
+	return changed;
+}
+
+HRESULT DX8VertexBufferClass::Lock(UINT byte_offset, UINT byte_count,
+	unsigned char **data, DWORD flags)
+{
+	return Lock_Buffer(byte_offset, byte_count, flags,
+		reinterpret_cast<void **>(data)) ? D3D_OK : E_FAIL;
+}
+
+HRESULT DX8VertexBufferClass::Unlock()
+{
+	return Unlock_Buffer() ? D3D_OK : E_FAIL;
 }
 
 // ----------------------------------------------------------------------------
@@ -455,6 +699,31 @@ DX8VertexBufferClass::~DX8VertexBufferClass()
 void DX8VertexBufferClass::Create_Vertex_Buffer(UsageType usage)
 {
 	DX8_THREAD_ASSERT();
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	WWASSERT(!NativeBuffer);
+	NativeBuffer = W3DNEW rts::render::NativeW3DBufferOwner;
+	if (NativeBuffer == nullptr)
+	{
+		WWDEBUG_SAY(("Native vertex buffer owner allocation failed"));
+		return;
+	}
+	rts::render::BufferDescriptor descriptor;
+	descriptor.byteCount = static_cast<size_t>(FVF_Info().Get_FVF_Size()) *
+		VertexCount;
+	descriptor.stride = FVF_Info().Get_FVF_Size();
+	descriptor.binding = rts::render::RENDER_BUFFER_VERTEX;
+	descriptor.usage = (usage & USAGE_DYNAMIC) != 0 ?
+		rts::render::RENDER_USAGE_DYNAMIC : rts::render::RENDER_USAGE_DEFAULT;
+	const rts::render::RenderResult result = NativeBuffer->Create(descriptor);
+	if (result != rts::render::RENDER_RESULT_OK)
+	{
+		WWDEBUG_SAY(("Native vertex buffer creation failed: %d",
+			static_cast<int>(result)));
+		delete NativeBuffer;
+		NativeBuffer = nullptr;
+	}
+	return;
+#else
 	WWASSERT(!VertexBuffer);
 
 #ifdef VERTEX_BUFFER_LOG
@@ -527,21 +796,66 @@ void DX8VertexBufferClass::Create_Vertex_Buffer(UsageType usage)
 		(usage&USAGE_DYNAMIC) ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED,
 		&VertexBuffer));
 	*/
+#endif
 }
+
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+bool DX8VertexBufferClass::Acquire_Native_Vertex_Buffer(unsigned int stride,
+	unsigned int offset, unsigned int start_vertex, unsigned int vertex_count,
+	rts::render::GpuHandle *validated) const
+{
+	if (validated == nullptr)
+	{
+		return false;
+	}
+	*validated = rts::render::GpuHandle();
+	return NativeBuffer != nullptr &&
+		NativeBuffer->AcquireVertexRange(stride, offset, start_vertex,
+			vertex_count, validated) == rts::render::RENDER_RESULT_OK;
+}
+
+bool DX8VertexBufferClass::Lock_Native_Buffer(size_t offset,
+	size_t byte_count, int flags, void **data)
+{
+	if (data == nullptr)
+	{
+		return false;
+	}
+	*data = nullptr;
+	rts::render::RenderBufferUpdateMode mode;
+	return NativeBuffer != nullptr && Get_Native_Buffer_Update_Mode(flags, &mode) &&
+		NativeBuffer->Lock(offset, byte_count, mode, data) ==
+			rts::render::RENDER_RESULT_OK;
+}
+
+bool DX8VertexBufferClass::Unlock_Native_Buffer()
+{
+	return NativeBuffer != nullptr &&
+		NativeBuffer->Unlock() == rts::render::RENDER_RESULT_OK;
+}
+#endif
 
 // ----------------------------------------------------------------------------
 
-void DX8VertexBufferClass::Copy(const Vector3* loc, const Vector3* norm, const Vector2* uv, unsigned first_vertex,unsigned count)
+bool DX8VertexBufferClass::Copy(const Vector3* loc, const Vector3* norm, const Vector2* uv, unsigned first_vertex,unsigned count)
 {
 	WWASSERT(loc);
 	WWASSERT(norm);
 	WWASSERT(uv);
 	WWASSERT(count<=VertexCount);
 	WWASSERT(FVF_Info().Get_FVF()==DX8_FVF_XYZNUV1);
+	if (loc == nullptr || norm == nullptr || uv == nullptr ||
+		first_vertex > VertexCount || count > VertexCount - first_vertex ||
+		FVF_Info().Get_FVF() != DX8_FVF_XYZNUV1)
+	{
+		return false;
+	}
+	if (count == 0) return true;
 
-	if (first_vertex) {
+	if (Use_Vertex_Range_Lock(first_vertex, count, Get_Vertex_Count())) {
 		VertexBufferClass::AppendLockClass l(this,first_vertex,count);
 		VertexFormatXYZNUV1* verts=(VertexFormatXYZNUV1*)l.Get_Vertex_Array();
+		if (!l.Is_Locked() || verts == nullptr) return false;
 		for (unsigned v=0;v<count;++v) {
 			verts[v].x=(*loc)[0];
 			verts[v].y=(*loc)[1];
@@ -552,10 +866,12 @@ void DX8VertexBufferClass::Copy(const Vector3* loc, const Vector3* norm, const V
 			verts[v].u1=(*uv)[0];
 			verts[v].v1=(*uv++)[1];
 		}
+		return l.Commit();
 	}
 	else {
 		VertexBufferClass::WriteLockClass l(this);
 		VertexFormatXYZNUV1* verts=(VertexFormatXYZNUV1*)l.Get_Vertex_Array();
+		if (!l.Is_Locked() || verts == nullptr) return false;
 		for (unsigned v=0;v<count;++v) {
 			verts[v].x=(*loc)[0];
 			verts[v].y=(*loc)[1];
@@ -566,50 +882,69 @@ void DX8VertexBufferClass::Copy(const Vector3* loc, const Vector3* norm, const V
 			verts[v].u1=(*uv)[0];
 			verts[v].v1=(*uv++)[1];
 		}
+		return l.Commit();
 	}
 }
 
 // ----------------------------------------------------------------------------
 
-void DX8VertexBufferClass::Copy(const Vector3* loc, unsigned first_vertex, unsigned count)
+bool DX8VertexBufferClass::Copy(const Vector3* loc, unsigned first_vertex, unsigned count)
 {
 	WWASSERT(loc);
 	WWASSERT(count<=VertexCount);
 	WWASSERT(FVF_Info().Get_FVF()==DX8_FVF_XYZ);
+	if (loc == nullptr || first_vertex > VertexCount ||
+		count > VertexCount - first_vertex ||
+		FVF_Info().Get_FVF() != DX8_FVF_XYZ)
+	{
+		return false;
+	}
+	if (count == 0) return true;
 
-	if (first_vertex) {
+	if (Use_Vertex_Range_Lock(first_vertex, count, Get_Vertex_Count())) {
 		VertexBufferClass::AppendLockClass l(this,first_vertex,count);
 		VertexFormatXYZ* verts=(VertexFormatXYZ*)l.Get_Vertex_Array();
+		if (!l.Is_Locked() || verts == nullptr) return false;
 		for (unsigned v=0;v<count;++v) {
 			verts[v].x=(*loc)[0];
 			verts[v].y=(*loc)[1];
 			verts[v].z=(*loc++)[2];
 		}
+		return l.Commit();
 	}
 	else {
 		VertexBufferClass::WriteLockClass l(this);
 		VertexFormatXYZ* verts=(VertexFormatXYZ*)l.Get_Vertex_Array();
+		if (!l.Is_Locked() || verts == nullptr) return false;
 		for (unsigned v=0;v<count;++v) {
 			verts[v].x=(*loc)[0];
 			verts[v].y=(*loc)[1];
 			verts[v].z=(*loc++)[2];
 		}
+		return l.Commit();
 	}
-
 }
 
 // ----------------------------------------------------------------------------
 
-void DX8VertexBufferClass::Copy(const Vector3* loc, const Vector2* uv, unsigned first_vertex, unsigned count)
+bool DX8VertexBufferClass::Copy(const Vector3* loc, const Vector2* uv, unsigned first_vertex, unsigned count)
 {
 	WWASSERT(loc);
 	WWASSERT(uv);
 	WWASSERT(count<=VertexCount);
 	WWASSERT(FVF_Info().Get_FVF()==DX8_FVF_XYZUV1);
+	if (loc == nullptr || uv == nullptr || first_vertex > VertexCount ||
+		count > VertexCount - first_vertex ||
+		FVF_Info().Get_FVF() != DX8_FVF_XYZUV1)
+	{
+		return false;
+	}
+	if (count == 0) return true;
 
-	if (first_vertex) {
+	if (Use_Vertex_Range_Lock(first_vertex, count, Get_Vertex_Count())) {
 		VertexBufferClass::AppendLockClass l(this,first_vertex,count);
 		VertexFormatXYZUV1* verts=(VertexFormatXYZUV1*)l.Get_Vertex_Array();
+		if (!l.Is_Locked() || verts == nullptr) return false;
 		for (unsigned v=0;v<count;++v) {
 			verts[v].x=(*loc)[0];
 			verts[v].y=(*loc)[1];
@@ -617,10 +952,12 @@ void DX8VertexBufferClass::Copy(const Vector3* loc, const Vector2* uv, unsigned 
 			verts[v].u1=(*uv)[0];
 			verts[v].v1=(*uv++)[1];
 		}
+		return l.Commit();
 	}
 	else {
 		VertexBufferClass::WriteLockClass l(this);
 		VertexFormatXYZUV1* verts=(VertexFormatXYZUV1*)l.Get_Vertex_Array();
+		if (!l.Is_Locked() || verts == nullptr) return false;
 		for (unsigned v=0;v<count;++v) {
 			verts[v].x=(*loc)[0];
 			verts[v].y=(*loc)[1];
@@ -628,21 +965,30 @@ void DX8VertexBufferClass::Copy(const Vector3* loc, const Vector2* uv, unsigned 
 			verts[v].u1=(*uv)[0];
 			verts[v].v1=(*uv++)[1];
 		}
+		return l.Commit();
 	}
 }
 
 // ----------------------------------------------------------------------------
 
-void DX8VertexBufferClass::Copy(const Vector3* loc, const Vector3* norm, unsigned first_vertex, unsigned count)
+bool DX8VertexBufferClass::Copy(const Vector3* loc, const Vector3* norm, unsigned first_vertex, unsigned count)
 {
 	WWASSERT(loc);
 	WWASSERT(norm);
 	WWASSERT(count<=VertexCount);
 	WWASSERT(FVF_Info().Get_FVF()==DX8_FVF_XYZN);
+	if (loc == nullptr || norm == nullptr || first_vertex > VertexCount ||
+		count > VertexCount - first_vertex ||
+		FVF_Info().Get_FVF() != DX8_FVF_XYZN)
+	{
+		return false;
+	}
+	if (count == 0) return true;
 
-	if (first_vertex) {
+	if (Use_Vertex_Range_Lock(first_vertex, count, Get_Vertex_Count())) {
 		VertexBufferClass::AppendLockClass l(this,first_vertex,count);
 		VertexFormatXYZN* verts=(VertexFormatXYZN*)l.Get_Vertex_Array();
+		if (!l.Is_Locked() || verts == nullptr) return false;
 		for (unsigned v=0;v<count;++v) {
 			verts[v].x=(*loc)[0];
 			verts[v].y=(*loc)[1];
@@ -651,10 +997,12 @@ void DX8VertexBufferClass::Copy(const Vector3* loc, const Vector3* norm, unsigne
 			verts[v].ny=(*norm)[1];
 			verts[v].nz=(*norm++)[2];
 		}
+		return l.Commit();
 	}
 	else {
 		VertexBufferClass::WriteLockClass l(this);
 		VertexFormatXYZN* verts=(VertexFormatXYZN*)l.Get_Vertex_Array();
+		if (!l.Is_Locked() || verts == nullptr) return false;
 		for (unsigned v=0;v<count;++v) {
 			verts[v].x=(*loc)[0];
 			verts[v].y=(*loc)[1];
@@ -663,12 +1011,13 @@ void DX8VertexBufferClass::Copy(const Vector3* loc, const Vector3* norm, unsigne
 			verts[v].ny=(*norm)[1];
 			verts[v].nz=(*norm++)[2];
 		}
+		return l.Commit();
 	}
 }
 
 // ----------------------------------------------------------------------------
 
-void DX8VertexBufferClass::Copy(const Vector3* loc, const Vector3* norm, const Vector2* uv, const Vector4* diffuse, unsigned first_vertex, unsigned count)
+bool DX8VertexBufferClass::Copy(const Vector3* loc, const Vector3* norm, const Vector2* uv, const Vector4* diffuse, unsigned first_vertex, unsigned count)
 {
 	WWASSERT(loc);
 	WWASSERT(norm);
@@ -676,10 +1025,19 @@ void DX8VertexBufferClass::Copy(const Vector3* loc, const Vector3* norm, const V
 	WWASSERT(diffuse);
 	WWASSERT(count<=VertexCount);
 	WWASSERT(FVF_Info().Get_FVF()==DX8_FVF_XYZNDUV1);
+	if (loc == nullptr || norm == nullptr || uv == nullptr ||
+		diffuse == nullptr || first_vertex > VertexCount ||
+		count > VertexCount - first_vertex ||
+		FVF_Info().Get_FVF() != DX8_FVF_XYZNDUV1)
+	{
+		return false;
+	}
+	if (count == 0) return true;
 
-	if (first_vertex) {
+	if (Use_Vertex_Range_Lock(first_vertex, count, Get_Vertex_Count())) {
 		VertexBufferClass::AppendLockClass l(this,first_vertex,count);
 		VertexFormatXYZNDUV1* verts=(VertexFormatXYZNDUV1*)l.Get_Vertex_Array();
+		if (!l.Is_Locked() || verts == nullptr) return false;
 		for (unsigned v=0;v<count;++v) {
 			verts[v].x=(*loc)[0];
 			verts[v].y=(*loc)[1];
@@ -691,10 +1049,12 @@ void DX8VertexBufferClass::Copy(const Vector3* loc, const Vector3* norm, const V
 			verts[v].v1=(*uv++)[1];
 			verts[v].diffuse=DX8Wrapper::Convert_Color(diffuse[v]);
 		}
+		return l.Commit();
 	}
 	else {
 		VertexBufferClass::WriteLockClass l(this);
 		VertexFormatXYZNDUV1* verts=(VertexFormatXYZNDUV1*)l.Get_Vertex_Array();
+		if (!l.Is_Locked() || verts == nullptr) return false;
 		for (unsigned v=0;v<count;++v) {
 			verts[v].x=(*loc)[0];
 			verts[v].y=(*loc)[1];
@@ -706,22 +1066,31 @@ void DX8VertexBufferClass::Copy(const Vector3* loc, const Vector3* norm, const V
 			verts[v].v1=(*uv++)[1];
 			verts[v].diffuse=DX8Wrapper::Convert_Color(diffuse[v]);
 		}
+		return l.Commit();
 	}
 }
 
 // ----------------------------------------------------------------------------
 
-void DX8VertexBufferClass::Copy(const Vector3* loc, const Vector2* uv, const Vector4* diffuse, unsigned first_vertex, unsigned count)
+bool DX8VertexBufferClass::Copy(const Vector3* loc, const Vector2* uv, const Vector4* diffuse, unsigned first_vertex, unsigned count)
 {
 	WWASSERT(loc);
 	WWASSERT(uv);
 	WWASSERT(diffuse);
 	WWASSERT(count<=VertexCount);
 	WWASSERT(FVF_Info().Get_FVF()==DX8_FVF_XYZDUV1);
+	if (loc == nullptr || uv == nullptr || diffuse == nullptr ||
+		first_vertex > VertexCount || count > VertexCount - first_vertex ||
+		FVF_Info().Get_FVF() != DX8_FVF_XYZDUV1)
+	{
+		return false;
+	}
+	if (count == 0) return true;
 
-	if (first_vertex) {
+	if (Use_Vertex_Range_Lock(first_vertex, count, Get_Vertex_Count())) {
 		VertexBufferClass::AppendLockClass l(this,first_vertex,count);
 		VertexFormatXYZDUV1* verts=(VertexFormatXYZDUV1*)l.Get_Vertex_Array();
+		if (!l.Is_Locked() || verts == nullptr) return false;
 		for (unsigned v=0;v<count;++v) {
 			verts[v].x=(*loc)[0];
 			verts[v].y=(*loc)[1];
@@ -730,10 +1099,12 @@ void DX8VertexBufferClass::Copy(const Vector3* loc, const Vector2* uv, const Vec
 			verts[v].v1=(*uv++)[1];
 			verts[v].diffuse=DX8Wrapper::Convert_Color(diffuse[v]);
 		}
+		return l.Commit();
 	}
 	else {
 		VertexBufferClass::WriteLockClass l(this);
 		VertexFormatXYZDUV1* verts=(VertexFormatXYZDUV1*)l.Get_Vertex_Array();
+		if (!l.Is_Locked() || verts == nullptr) return false;
 		for (unsigned v=0;v<count;++v) {
 			verts[v].x=(*loc)[0];
 			verts[v].y=(*loc)[1];
@@ -742,6 +1113,7 @@ void DX8VertexBufferClass::Copy(const Vector3* loc, const Vector2* uv, const Vec
 			verts[v].v1=(*uv++)[1];
 			verts[v].diffuse=DX8Wrapper::Convert_Color(diffuse[v]);
 		}
+		return l.Commit();
 	}
 }
 
@@ -756,6 +1128,7 @@ DynamicVBAccessClass::DynamicVBAccessClass(unsigned t,unsigned fvf,unsigned shor
 	Type(t),
 	FVFInfo(_DynamicFVFInfo),
 	VertexCount(vertex_count_),
+	VertexBufferOffset(0),
 	VertexBuffer(nullptr)
 {
 	WWASSERT(fvf==dynamic_fvf_type);
@@ -771,16 +1144,27 @@ DynamicVBAccessClass::DynamicVBAccessClass(unsigned t,unsigned fvf,unsigned shor
 
 DynamicVBAccessClass::~DynamicVBAccessClass()
 {
+	const bool valid = Is_Valid();
 	if (Type==BUFFER_TYPE_DYNAMIC_DX8) {
 		_DynamicDX8VertexBufferInUse=false;
-		_DynamicDX8VertexBufferOffset+=(unsigned) VertexCount;
+		if (valid) _DynamicDX8VertexBufferOffset+=(unsigned) VertexCount;
 	}
 	else {
 		_DynamicSortingVertexArrayInUse=false;
-		_DynamicSortingVertexArrayOffset+=VertexCount;
+		if (valid) _DynamicSortingVertexArrayOffset+=VertexCount;
 	}
 
 	REF_PTR_RELEASE (VertexBuffer);
+}
+
+bool DynamicVBAccessClass::Is_Valid() const
+{
+	if (VertexBuffer == nullptr)
+	{
+		return false;
+	}
+	return Type != BUFFER_TYPE_DYNAMIC_DX8 ||
+		static_cast<DX8VertexBufferClass *>(VertexBuffer)->Is_Valid();
 }
 
 // ----------------------------------------------------------------------------
@@ -818,15 +1202,22 @@ void DynamicVBAccessClass::Allocate_DX8_Dynamic_Buffer()
 	// Create a new vb if one doesn't exist currently
 	if (!_DynamicDX8VertexBuffer) {
 		unsigned usage=DX8VertexBufferClass::USAGE_DYNAMIC;
+#if !defined(_WIN64) || !defined(RTS_RENDERER_HAS_D3D11)
 		if (DX8Wrapper::Get_Current_Caps()->Support_NPatches()) {
 			usage|=DX8VertexBufferClass::USAGE_NPATCHES;
 		}
+#endif
 
 		_DynamicDX8VertexBuffer=NEW_REF(DX8VertexBufferClass,(
 			dynamic_fvf_type,
 			_DynamicDX8VertexBufferSize,
 			(DX8VertexBufferClass::UsageType)usage));
 		_DynamicDX8VertexBufferOffset=0;
+	}
+	if (_DynamicDX8VertexBuffer != nullptr &&
+		!_DynamicDX8VertexBuffer->Is_Valid())
+	{
+		REF_PTR_RELEASE(_DynamicDX8VertexBuffer);
 	}
 
 	// Any room at the end of the buffer?
@@ -865,9 +1256,13 @@ void DynamicVBAccessClass::Allocate_Sorting_Dynamic_Buffer()
 static int dx8_lock;
 DynamicVBAccessClass::WriteLockClass::WriteLockClass(DynamicVBAccessClass* dynamic_vb_access_)
 	:
-	DynamicVBAccess(dynamic_vb_access_)
+	DynamicVBAccess(dynamic_vb_access_), Vertices(nullptr), Locked(false)
 {
 	DX8_THREAD_ASSERT();
+	if (DynamicVBAccess == nullptr || !DynamicVBAccess->Is_Valid())
+	{
+		return;
+	}
 	switch (DynamicVBAccess->Get_Type()) {
 	case BUFFER_TYPE_DYNAMIC_DX8:
 #ifdef VERTEX_BUFFER_LOG
@@ -888,15 +1283,32 @@ DynamicVBAccessClass::WriteLockClass::WriteLockClass(DynamicVBAccessClass* dynam
 
 		DX8_Assert();
 		// Lock with discard contents if the buffer offset is zero
-		DX8_ErrorCode(static_cast<DX8VertexBufferClass*>(DynamicVBAccess->VertexBuffer)->Get_DX8_Vertex_Buffer()->Lock(
-			DynamicVBAccess->VertexBufferOffset*_DynamicDX8VertexBuffer->FVF_Info().Get_FVF_Size(),
-			DynamicVBAccess->Get_Vertex_Count()*DynamicVBAccess->VertexBuffer->FVF_Info().Get_FVF_Size(),
-			(unsigned char**)&Vertices,
-			D3DLOCK_NOSYSLOCK | (!DynamicVBAccess->VertexBufferOffset ? D3DLOCK_DISCARD : D3DLOCK_NOOVERWRITE)));
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		Locked = static_cast<DX8VertexBufferClass *>(
+			DynamicVBAccess->VertexBuffer)->Lock_Native_Buffer(
+				static_cast<size_t>(DynamicVBAccess->VertexBufferOffset) *
+					_DynamicDX8VertexBuffer->FVF_Info().Get_FVF_Size(),
+				static_cast<size_t>(DynamicVBAccess->Get_Vertex_Count()) *
+					DynamicVBAccess->VertexBuffer->FVF_Info().Get_FVF_Size(),
+				D3DLOCK_NOSYSLOCK | (!DynamicVBAccess->VertexBufferOffset ?
+					D3DLOCK_DISCARD : D3DLOCK_NOOVERWRITE),
+				reinterpret_cast<void **>(&Vertices));
+#else
+		{
+			const HRESULT result = static_cast<DX8VertexBufferClass*>(DynamicVBAccess->VertexBuffer)->Get_DX8_Vertex_Buffer()->Lock(
+				DynamicVBAccess->VertexBufferOffset*_DynamicDX8VertexBuffer->FVF_Info().Get_FVF_Size(),
+				DynamicVBAccess->Get_Vertex_Count()*DynamicVBAccess->VertexBuffer->FVF_Info().Get_FVF_Size(),
+				(unsigned char**)&Vertices,
+				D3DLOCK_NOSYSLOCK | (!DynamicVBAccess->VertexBufferOffset ? D3DLOCK_DISCARD : D3DLOCK_NOOVERWRITE));
+			DX8_ErrorCode(result);
+			Locked = SUCCEEDED(result);
+		}
+#endif
 		break;
 	case BUFFER_TYPE_DYNAMIC_SORTING:
 		Vertices=static_cast<SortingVertexBufferClass*>(DynamicVBAccess->VertexBuffer)->VertexBuffer;
 		Vertices+=DynamicVBAccess->VertexBufferOffset;
+		Locked = true;
 //		vertices=_DynamicSortingVertexArray+_DynamicSortingVertexArrayOffset;
 		break;
 	default:
@@ -910,12 +1322,20 @@ DynamicVBAccessClass::WriteLockClass::WriteLockClass(DynamicVBAccessClass* dynam
 DynamicVBAccessClass::WriteLockClass::~WriteLockClass()
 {
 	DX8_THREAD_ASSERT();
+	Commit();
+}
+
+bool DynamicVBAccessClass::WriteLockClass::Commit()
+{
+	if (!Locked || DynamicVBAccess == nullptr ||
+		!DynamicVBAccess->Is_Valid())
+	{
+		return false;
+	}
 	const unsigned int change_flags =
 		!DynamicVBAccess->VertexBufferOffset ?
 			D3DLOCK_DISCARD : D3DLOCK_NOOVERWRITE;
-	DynamicVBAccess->VertexBuffer->Mark_Changed_Range(
-		DynamicVBAccess->VertexBufferOffset,
-		DynamicVBAccess->Get_Vertex_Count(), change_flags);
+	bool changed = Locked;
 	switch (DynamicVBAccess->Get_Type()) {
 	case BUFFER_TYPE_DYNAMIC_DX8:
 #ifdef VERTEX_BUFFER_LOG
@@ -923,6 +1343,10 @@ DynamicVBAccessClass::WriteLockClass::~WriteLockClass()
 		WWASSERT(!dx8_lock);
 		WWDEBUG_SAY(("DynamicVertexBuffer->Unlock()"));
 #endif
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		changed = Locked && static_cast<DX8VertexBufferClass *>(
+			DynamicVBAccess->VertexBuffer)->Unlock_Native_Buffer();
+#else
 		DX8_Assert();
 		Publish_Render_Buffer_Change(
 			static_cast<DX8VertexBufferClass *>(
@@ -936,7 +1360,13 @@ DynamicVBAccessClass::WriteLockClass::~WriteLockClass()
 				rts::render::RENDER_BUFFER_UPDATE_DISCARD :
 				rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE,
 			DynamicVBAccess->VertexBuffer->Get_Generation());
-		DX8_ErrorCode(static_cast<DX8VertexBufferClass*>(DynamicVBAccess->VertexBuffer)->Get_DX8_Vertex_Buffer()->Unlock());
+		if (Locked)
+		{
+			const HRESULT result = static_cast<DX8VertexBufferClass*>(DynamicVBAccess->VertexBuffer)->Get_DX8_Vertex_Buffer()->Unlock();
+			DX8_ErrorCode(result);
+			changed = SUCCEEDED(result);
+		}
+#endif
 		break;
 	case BUFFER_TYPE_DYNAMIC_SORTING:
 		break;
@@ -944,6 +1374,15 @@ DynamicVBAccessClass::WriteLockClass::~WriteLockClass()
 		WWASSERT(0);
 		break;
 	}
+	if (changed)
+	{
+		DynamicVBAccess->VertexBuffer->Mark_Changed_Range(
+			DynamicVBAccess->VertexBufferOffset,
+			DynamicVBAccess->Get_Vertex_Count(), change_flags);
+	}
+	Locked = false;
+	Vertices = nullptr;
+	return changed;
 }
 
 // ----------------------------------------------------------------------------

@@ -268,7 +268,7 @@ endif()
 
 target_link_libraries(corei_gameenginedevice_public INTERFACE
     corei_gameengine_public
-    rts_legacy_product_runtime
+    rts_product_runtime
 )
 
 # Emit the configured native-device source/link closure for the architecture

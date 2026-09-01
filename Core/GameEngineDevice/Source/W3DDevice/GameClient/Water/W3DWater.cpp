@@ -437,7 +437,7 @@ void WaterRenderObjClass::setupJbaWaterShader()
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ALPHAOP,   D3DTOP_ADD );
 	if (!m_riverAlphaEdge->Is_Initialized())
 		m_riverAlphaEdge->Init();
-	DX8Wrapper::Set_DX8_Texture(3,m_riverAlphaEdge->Peek_D3D_Texture());
+	DX8Wrapper::Set_Texture(3, m_riverAlphaEdge);
 	DX8Wrapper::Set_DX8_Texture_Stage_State(3,  D3DTSS_ADDRESSU, D3DTADDRESS_WRAP);
 	DX8Wrapper::Set_DX8_Texture_Stage_State(3,  D3DTSS_ADDRESSV, D3DTADDRESS_WRAP);
 	DX8Wrapper::Set_DX8_Texture_Stage_State(0,  D3DTSS_TEXCOORDINDEX, 0);
@@ -449,11 +449,11 @@ void WaterRenderObjClass::setupJbaWaterShader()
 	if (m_riverWaterPixelShader && doSparkles) {
 		if (!m_waterSparklesTexture->Is_Initialized())
 			m_waterSparklesTexture->Init();
-		DX8Wrapper::Set_DX8_Texture(1,m_waterSparklesTexture->Peek_D3D_Texture());
+		DX8Wrapper::Set_Texture(1, m_waterSparklesTexture);
 
 		if (!m_waterNoiseTexture->Is_Initialized())
 			m_waterNoiseTexture->Init();
-		DX8Wrapper::Set_DX8_Texture(2,m_waterNoiseTexture->Peek_D3D_Texture());
+		DX8Wrapper::Set_Texture(2, m_waterNoiseTexture);
 
 		DX8Wrapper::Set_DX8_Texture_Stage_State(1,  D3DTSS_ADDRESSU, D3DTADDRESS_WRAP);
 		DX8Wrapper::Set_DX8_Texture_Stage_State(1,  D3DTSS_ADDRESSV, D3DTADDRESS_WRAP);
@@ -661,6 +661,14 @@ RenderObjClass *	 WaterRenderObjClass::Clone() const
 //-------------------------------------------------------------------------------------------------
 HRESULT WaterRenderObjClass::initBumpMap(LPDIRECT3DTEXTURE8 *pTex, TextureClass *pBumpSource)
 {
+#if defined(_WIN64)
+	// This legacy member retains a raw D3D8 texture and therefore cannot own a
+	// native sampled-resource handle. Keep it deterministically unbound on x64;
+	// ordinary water textures remain native and no D3D8 texture is created.
+	if (pTex != nullptr) *pTex = nullptr;
+	(void)pBumpSource;
+	return S_OK;
+#else
     SurfaceClass::SurfaceDescription    d3dsd;
 	SurfaceClass * surf;
     D3DLOCKED_RECT     d3dlr;
@@ -855,7 +863,8 @@ HRESULT WaterRenderObjClass::initBumpMap(LPDIRECT3DTEXTURE8 *pTex, TextureClass 
 	REF_PTR_RELEASE(surf);
 #endif
 
-    return S_OK;
+	return S_OK;
+#endif
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -872,7 +881,9 @@ HRESULT WaterRenderObjClass::generateVertexBuffer( Int sizeX, Int sizeY, Int ver
 
 	Setting *setting=&m_settings[m_tod];
 
+#if !defined(_WIN64) || !defined(RTS_RENDERER_HAS_D3D11)
 	HRESULT hr;
+#endif
 
 	//default setting for a dynamic vertex buffer
 	D3DPOOL pool = D3DPOOL_DEFAULT;
@@ -889,7 +900,22 @@ HRESULT WaterRenderObjClass::generateVertexBuffer( Int sizeX, Int sizeY, Int ver
 
 	if (m_vertexBufferD3D == nullptr)
 	{	// Create vertex buffer
-
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		if (m_numVertices <= 0 || m_numVertices > 0xffff ||
+			vertexSize != (doStatic ? static_cast<Int>(sizeof(SEA_PATCH_VERTEX)) :
+				static_cast<Int>(sizeof(MaterMeshVertexFormat))))
+			return E_INVALIDARG;
+		m_vertexBufferD3D=NEW_REF(DX8VertexBufferClass,
+			(doStatic ? SEA_PATCH_FVF : WATER_MESH_FVF,
+			static_cast<unsigned short>(m_numVertices), doStatic ?
+				DX8VertexBufferClass::USAGE_DEFAULT :
+				DX8VertexBufferClass::USAGE_DYNAMIC));
+		if (m_vertexBufferD3D == nullptr || !m_vertexBufferD3D->Is_Valid())
+		{
+			REF_PTR_RELEASE(m_vertexBufferD3D);
+			return E_FAIL;
+		}
+#else
 		if (FAILED(hr=m_pDev->CreateVertexBuffer
 		(
 			m_numVertices*vertexSize,
@@ -899,6 +925,7 @@ HRESULT WaterRenderObjClass::generateVertexBuffer( Int sizeX, Int sizeY, Int ver
 			&m_vertexBufferD3D
 		)))
 			return hr;
+#endif
 	}
 
 	m_vertexBufferD3DOffset=0;
@@ -907,6 +934,12 @@ HRESULT WaterRenderObjClass::generateVertexBuffer( Int sizeX, Int sizeY, Int ver
 		return S_OK;	//only create the buffer, other code will fill it.
 
 	// load results into buffer
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	if (!m_vertexBufferD3D->Lock_Buffer(0,
+		static_cast<size_t>(m_numVertices) * sizeof(SEA_PATCH_VERTEX), 0,
+		reinterpret_cast<void **>(&pVertices)))
+		return E_FAIL;
+#else
 	if (FAILED(hr=m_vertexBufferD3D->Lock
 	(
 		0,
@@ -915,6 +948,7 @@ HRESULT WaterRenderObjClass::generateVertexBuffer( Int sizeX, Int sizeY, Int ver
 		0//D3DLOCK_DISCARD
 	)))
 		return hr;
+#endif
 
 	Int x,z;
 	for (z=0; z<sizeY; z++)
@@ -932,8 +966,12 @@ HRESULT WaterRenderObjClass::generateVertexBuffer( Int sizeX, Int sizeY, Int ver
 		}
 	}
 
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	if (!m_vertexBufferD3D->Unlock_Buffer()) return E_FAIL;
+#else
 	if (FAILED(hr=m_vertexBufferD3D->Unlock())) return hr;
 	Notify_Render_Buffer_Changed(m_vertexBufferD3D);
+#endif
 
 	return S_OK;
 }
@@ -943,7 +981,9 @@ HRESULT WaterRenderObjClass::generateVertexBuffer( Int sizeX, Int sizeY, Int ver
 //-------------------------------------------------------------------------------------------------
 HRESULT WaterRenderObjClass::generateIndexBuffer(Int sizeX, Int sizeY)
 {
+#if !defined(_WIN64) || !defined(RTS_RENDERER_HAS_D3D11)
 	HRESULT hr;
+#endif
 
 	//Will need SizeY-1 strips, each of length SizeX*2 (2 indices per strip segment).
 	//Will also need 2 extra indices to connect each strip to next one (except last strip)
@@ -956,6 +996,18 @@ HRESULT WaterRenderObjClass::generateIndexBuffer(Int sizeX, Int sizeY)
 	// Create index buffer
 	WORD* pIndices;
 
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	if (m_numIndices <= 0 || m_numIndices + 2 > 0xffff)
+		return E_INVALIDARG;
+	m_indexBufferD3D=NEW_REF(DX8IndexBufferClass,
+		(static_cast<unsigned short>(m_numIndices + 2),
+		DX8IndexBufferClass::USAGE_DEFAULT));
+	if (m_indexBufferD3D == nullptr || !m_indexBufferD3D->Is_Valid())
+	{
+		REF_PTR_RELEASE(m_indexBufferD3D);
+		return E_FAIL;
+	}
+#else
 	if (FAILED(hr=m_pDev->CreateIndexBuffer
 	(
 		(m_numIndices+2)*sizeof(WORD),
@@ -965,7 +1017,14 @@ HRESULT WaterRenderObjClass::generateIndexBuffer(Int sizeX, Int sizeY)
 		&m_indexBufferD3D
 	)))
 		return hr;
+#endif
 
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	if (!m_indexBufferD3D->Lock_Buffer(0,
+		static_cast<size_t>(m_numIndices) * sizeof(WORD), 0,
+		reinterpret_cast<void **>(&pIndices)))
+		return E_FAIL;
+#else
 	if (FAILED(hr=m_indexBufferD3D->Lock
 	(
 		0,
@@ -974,6 +1033,7 @@ HRESULT WaterRenderObjClass::generateIndexBuffer(Int sizeX, Int sizeY)
 		0
 	)))
 		return hr;
+#endif
 
 	Int i,j,k;
 
@@ -1035,8 +1095,12 @@ HRESULT WaterRenderObjClass::generateIndexBuffer(Int sizeX, Int sizeY)
 		s_toggle=!s_toggle;
 	}
 */
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	if (!m_indexBufferD3D->Unlock_Buffer()) return E_FAIL;
+#else
 	if (FAILED(hr=m_indexBufferD3D->Unlock())) return hr;
 	Notify_Render_Buffer_Changed(m_indexBufferD3D);
+#endif
 
 	return S_OK;
 }
@@ -1051,26 +1115,33 @@ void WaterRenderObjClass::ReleaseResources()
 
 	REF_PTR_RELEASE(m_pReflectionTexture);
 	REF_PTR_RELEASE(m_pReflectionDepthTexture);
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	REF_PTR_RELEASE(m_vertexBufferD3D);
+	REF_PTR_RELEASE(m_indexBufferD3D);
+#else
 	SAFE_RELEASE(m_vertexBufferD3D);
 	SAFE_RELEASE(m_indexBufferD3D);
+#endif
 
 	if (m_waterTrackSystem)
 		m_waterTrackSystem->ReleaseResources();
 
-	if (m_dwWavePixelShader)
+#if !(defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11))
+	if (m_dwWavePixelShader && m_pDev)
 		m_pDev->DeletePixelShader(m_dwWavePixelShader);
 
-	if (m_dwWaveVertexShader)
+	if (m_dwWaveVertexShader && m_pDev)
 		m_pDev->DeleteVertexShader(m_dwWaveVertexShader);
 
-	if (m_waterPixelShader)
+	if (m_waterPixelShader && m_pDev)
 		m_pDev->DeletePixelShader(m_waterPixelShader);
 
-	if (m_trapezoidWaterPixelShader)
+	if (m_trapezoidWaterPixelShader && m_pDev)
 		m_pDev->DeletePixelShader(m_trapezoidWaterPixelShader);
 
-	if (m_riverWaterPixelShader)
+	if (m_riverWaterPixelShader && m_pDev)
 		m_pDev->DeletePixelShader(m_riverWaterPixelShader);
+#endif
 
 	m_dwWavePixelShader=0;
 	m_dwWaveVertexShader=0;
@@ -1155,7 +1226,8 @@ void WaterRenderObjClass::ReAcquireResources()
 				&m_pReflectionDepthTexture);
 			if (m_pReflectionTexture == nullptr ||
 				m_pReflectionDepthTexture == nullptr ||
-				m_pReflectionDepthTexture->Peek_D3D_Base_Texture() == nullptr)
+				!m_pReflectionTexture->Is_Initialized() ||
+				!m_pReflectionDepthTexture->Is_Initialized())
 			{
 				REF_PTR_RELEASE(m_pReflectionTexture);
 				REF_PTR_RELEASE(m_pReflectionDepthTexture);
@@ -1211,8 +1283,7 @@ void WaterRenderObjClass::ReAcquireResources()
 		const unsigned int bytesPerPixel = surface->Get_Bytes_Per_Pixel();
 		surface->Draw_Pixel(0, 0, 0xffffffff, bytesPerPixel, pBits, pitch);
 		surface->Unlock();
-		Notify_Render_Texture_Changed(
-			m_whiteTexture->Peek_D3D_Base_Texture());
+		Notify_Render_Texture_Changed(m_whiteTexture);
 		REF_PTR_RELEASE(surface);
 	}
 }
@@ -1358,8 +1429,7 @@ Int WaterRenderObjClass::init(Real waterLevel, Real dx, Real dy, SceneClass *par
 	const unsigned int bytesPerPixel = surface->Get_Bytes_Per_Pixel();
 	surface->Draw_Pixel(0, 0, 0xffffffff, bytesPerPixel, pBits, pitch);
 	surface->Unlock();
-	Notify_Render_Texture_Changed(
-		m_whiteTexture->Peek_D3D_Base_Texture());
+	Notify_Render_Texture_Changed(m_whiteTexture);
 	REF_PTR_RELEASE(surface);
 
 	m_waterNoiseTexture=WW3DAssetManager::Get_Instance()->Get_Texture("Noise0000.tga");
@@ -1441,8 +1511,13 @@ void WaterRenderObjClass::enableWaterGrid(Bool state)
 		reset();
 
 		//Release existing grid data
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		REF_PTR_RELEASE(m_vertexBufferD3D);
+		REF_PTR_RELEASE(m_indexBufferD3D);
+#else
 		SAFE_RELEASE(m_vertexBufferD3D);
 		SAFE_RELEASE(m_indexBufferD3D);
+#endif
 
 		//Create new grid data
 		if (FAILED(generateIndexBuffer(m_gridCellsX+1,m_gridCellsY+1)))
@@ -2172,7 +2247,7 @@ void WaterRenderObjClass::drawSea(RenderInfoClass & rinfo)
 	DX8Wrapper::Set_DX8_Render_State(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
 
 	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE, TRUE);
-	DX8Wrapper::Set_DX8_Texture(1, m_pReflectionTexture->Peek_D3D_Texture());
+	DX8Wrapper::Set_Texture(1, m_pReflectionTexture);
 
 //	m_pDev->SetRenderState(D3DRS_FILLMODE,D3DFILL_WIREFRAME);//LORENZEN
 
@@ -2185,9 +2260,14 @@ void WaterRenderObjClass::drawSea(RenderInfoClass & rinfo)
 	patchMatrix._33=PATCH_SCALE;
 	patchMatrix._44=1.0f;
 
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	DX8Wrapper::Set_Vertex_Buffer(m_vertexBufferD3D);
+	DX8Wrapper::Set_Index_Buffer(m_indexBufferD3D, 0);
+#else
 	DX8Wrapper::Set_DX8_Vertex_Buffer(m_vertexBufferD3D,
 		sizeof(WaterRenderObjClass::SEA_PATCH_VERTEX), SEA_PATCH_FVF);
 	DX8Wrapper::Set_DX8_Index_Buffer(m_indexBufferD3D, 0);
+#endif
 
 	for (startY=patchY=(seaBox.Center.Y-seaBox.Extent.Y)/(PATCH_WIDTH*PATCH_SCALE); (patchY*PATCH_WIDTH*PATCH_SCALE)<(seaBox.Center.Y+seaBox.Extent.Y); patchY++)
 	{
@@ -2265,9 +2345,14 @@ void WaterRenderObjClass::drawSea(RenderInfoClass & rinfo)
 			rts::render::RENDER_LEGACY_PIXEL_FIXED_FUNCTION);
 		DX8Wrapper::Set_Legacy_Vertex_Program(
 			rts::render::RENDER_LEGACY_VERTEX_FIXED_FUNCTION);
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		DX8Wrapper::Set_Vertex_Buffer(m_vertexBufferD3D);
+		DX8Wrapper::Set_Index_Buffer(m_indexBufferD3D, 0);
+#else
 		DX8Wrapper::Set_DX8_Vertex_Buffer(m_vertexBufferD3D,
 			sizeof(WaterRenderObjClass::SEA_PATCH_VERTEX), SEA_PATCH_FVF);
 		DX8Wrapper::Set_DX8_Index_Buffer(m_indexBufferD3D, 0);
+#endif
 		for (startY=patchY=(seaBox.Center.Y-seaBox.Extent.Y)/(PATCH_WIDTH*PATCH_SCALE); (patchY*PATCH_WIDTH*PATCH_SCALE)<(seaBox.Center.Y+seaBox.Extent.Y); patchY++)
 		{
 			for (startX=patchX=(seaBox.Center.X-seaBox.Extent.X)/(PATCH_WIDTH*PATCH_SCALE); (patchX*PATCH_WIDTH*PATCH_SCALE)<(seaBox.Center.X+seaBox.Extent.X); patchX++)
@@ -2637,25 +2722,48 @@ void WaterRenderObjClass::renderWaterMesh()
 #endif
 
 	MaterMeshVertexFormat *vb;
+#if !defined(_WIN64) || !defined(RTS_RENDERER_HAS_D3D11)
 	rts::render::RenderBufferUpdateMode bufferUpdateMode;
 	size_t bufferUpdateOffset;
+#endif
 	if (m_vertexBufferD3DOffset < m_numVertices)
 	{	//we have room in current VB, append new verts
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		if (!m_vertexBufferD3D->Lock_Buffer(
+			static_cast<size_t>(m_vertexBufferD3DOffset) * sizeof(MaterMeshVertexFormat),
+			static_cast<size_t>(mx) * my * sizeof(MaterMeshVertexFormat),
+			D3DLOCK_NOOVERWRITE, reinterpret_cast<void **>(&vb)))
+			return;
+#else
 		if(m_vertexBufferD3D->Lock(m_vertexBufferD3DOffset*sizeof(MaterMeshVertexFormat),mx*my*sizeof(MaterMeshVertexFormat),(unsigned char**)&vb,D3DLOCK_NOOVERWRITE) != D3D_OK)
 			return;
+#endif
+#if !defined(_WIN64) || !defined(RTS_RENDERER_HAS_D3D11)
 		bufferUpdateMode = rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE;
 		bufferUpdateOffset = static_cast<size_t>(m_vertexBufferD3DOffset) *
 			sizeof(MaterMeshVertexFormat);
+#endif
 	}
 	else
 	{	//ran out of room in last VB, request a substitute VB.
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		if (!m_vertexBufferD3D->Lock_Buffer(0,
+			static_cast<size_t>(mx) * my * sizeof(MaterMeshVertexFormat),
+			D3DLOCK_DISCARD, reinterpret_cast<void **>(&vb)))
+			return;
+#else
 		if(m_vertexBufferD3D->Lock(0,mx*my*sizeof(MaterMeshVertexFormat),(unsigned char**)&vb,D3DLOCK_DISCARD) != D3D_OK)
 			return;
+#endif
 		m_vertexBufferD3DOffset=0;	//reset start of page to first vertex
+		#if !defined(_WIN64) || !defined(RTS_RENDERER_HAS_D3D11)
 		bufferUpdateMode = rts::render::RENDER_BUFFER_UPDATE_DISCARD;
 		bufferUpdateOffset = 0;
+		#endif
 	}
+#if !defined(_WIN64) || !defined(RTS_RENDERER_HAS_D3D11)
 	MaterMeshVertexFormat *const lockedVertices = vb;
+#endif
 	if (meshPrepared)
 	{
 #ifndef USE_MESH_NORMALS
@@ -2717,6 +2825,10 @@ void WaterRenderObjClass::renderWaterMesh()
 	}
 	}
 
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	if (!m_vertexBufferD3D->Unlock_Buffer())
+		return;
+#else
 	const size_t bufferUpdateBytes = static_cast<size_t>(mx) * my *
 		sizeof(MaterMeshVertexFormat);
 	const bool bufferPublished = Publish_Render_Buffer_Change(
@@ -2727,6 +2839,7 @@ void WaterRenderObjClass::renderWaterMesh()
 	{
 		Notify_Render_Buffer_Changed(m_vertexBufferD3D);
 	}
+#endif
 
 	DX8Wrapper::Set_Transform(D3DTS_WORLD,Transform);	//position the water surface
 	DX8Wrapper::Set_Material(m_meshVertexMaterialClass);
@@ -2762,10 +2875,16 @@ void WaterRenderObjClass::renderWaterMesh()
 
 //	m_pDev->SetRenderState(D3DRS_ZFUNC,D3DCMP_ALWAYS);	//used to display grid under map.
 
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	DX8Wrapper::Set_Index_Buffer(m_indexBufferD3D,
+		static_cast<unsigned short>(m_vertexBufferD3DOffset));
+	DX8Wrapper::Set_Vertex_Buffer(m_vertexBufferD3D);
+#else
 	DX8Wrapper::Set_DX8_Index_Buffer(m_indexBufferD3D,
 		m_vertexBufferD3DOffset);
 	DX8Wrapper::Set_DX8_Vertex_Buffer(m_vertexBufferD3D,
 		sizeof(MaterMeshVertexFormat), WATER_MESH_FVF);
+#endif
 	DX8Wrapper::Set_Vertex_Shader(WATER_MESH_FVF);
 
 
@@ -3275,8 +3394,7 @@ void WaterRenderObjClass::drawRiverWater(PolygonTrigger *pTrig)
 		DX8Wrapper::Set_Legacy_Pixel_Program(
 			rts::render::RENDER_LEGACY_PIXEL_WATER_RIVER);
 	}
- 	DWORD cull;
-	DX8Wrapper::_Get_D3D_Device8()->GetRenderState(D3DRS_CULLMODE, &cull);
+	DWORD cull=DX8Wrapper::Get_DX8_Render_State(D3DRS_CULLMODE);
 	DX8Wrapper::Set_DX8_Render_State(D3DRS_CULLMODE, D3DCULL_NONE);
 
 
@@ -3345,11 +3463,10 @@ void WaterRenderObjClass::setupFlatWaterShader()
 				const unsigned int bytesPerPixel = surface->Get_Bytes_Per_Pixel();
 				surface->Draw_Pixel(0, 0, 0xffffffff, bytesPerPixel, pBits, pitch);
 				surface->Unlock();
-				Notify_Render_Texture_Changed(
-					m_whiteTexture->Peek_D3D_Base_Texture());
+				Notify_Render_Texture_Changed(m_whiteTexture);
 				REF_PTR_RELEASE(surface);
 			}
-			DX8Wrapper::Set_DX8_Texture(3,m_whiteTexture->Peek_D3D_Texture());
+			DX8Wrapper::Set_Texture(3, m_whiteTexture);
 		}
 	}
 
@@ -3364,12 +3481,12 @@ void WaterRenderObjClass::setupFlatWaterShader()
 		if (!m_waterSparklesTexture->Is_Initialized())
 			m_waterSparklesTexture->Init();
 
-		DX8Wrapper::Set_DX8_Texture(1,m_waterSparklesTexture->Peek_D3D_Texture());
+		DX8Wrapper::Set_Texture(1, m_waterSparklesTexture);
 
 		if (!m_waterNoiseTexture->Is_Initialized())
 			m_waterNoiseTexture->Init();
 
-		DX8Wrapper::Set_DX8_Texture(2,m_waterNoiseTexture->Peek_D3D_Texture());
+		DX8Wrapper::Set_Texture(2, m_waterNoiseTexture);
 
 		DX8Wrapper::Set_DX8_Texture_Stage_State(1,  D3DTSS_ADDRESSU, D3DTADDRESS_WRAP);
 		DX8Wrapper::Set_DX8_Texture_Stage_State(1,  D3DTSS_ADDRESSV, D3DTADDRESS_WRAP);
@@ -3731,8 +3848,7 @@ else
 	}
 
 
- 	DWORD cull;
-	DX8Wrapper::_Get_D3D_Device8()->GetRenderState(D3DRS_CULLMODE, &cull);
+	DWORD cull=DX8Wrapper::Get_DX8_Render_State(D3DRS_CULLMODE);
 	DX8Wrapper::Set_DX8_Render_State(D3DRS_CULLMODE, D3DCULL_NONE);
 
 

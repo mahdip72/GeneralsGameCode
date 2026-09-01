@@ -44,6 +44,14 @@
 struct IDirect3DSurface8;
 class Vector2i;
 class Vector3;
+class TextureBaseClass;
+#if defined(_WIN64)
+struct NativeSurfaceStorage;
+namespace rts { namespace render {
+	struct NativeW3DSurfaceHandle;
+	struct NativeW3DGpuContentLease;
+} }
+#endif
 
 /*************************************************************************
 **                             SurfaceClass
@@ -143,10 +151,23 @@ class SurfaceClass : public RefCountClass
 
 		WW3DFormat Get_Surface_Format() const { return SurfaceFormat; }
 
+#if defined(_WIN64)
+		bool Acquire_Native_Surface(bool for_output,
+			rts::render::NativeW3DSurfaceHandle *surface,
+			rts::render::NativeW3DGpuContentLease *gpu_lease = 0) const;
+#endif
+
 	private:
+#if defined(_WIN64)
+		SurfaceClass(TextureBaseClass *texture, unsigned int mip_level,
+			unsigned int array_slice);
+#endif
 
 		// Direct3D surface object
 		IDirect3DSurface8 *D3DSurface;
+#if defined(_WIN64)
+		NativeSurfaceStorage *NativeSurface;
+#endif
 
 		WW3DFormat SurfaceFormat;
 	friend class TextureClass;

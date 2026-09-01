@@ -88,6 +88,9 @@ private:
 	NativeW3DRenderer &operator=(const NativeW3DRenderer &);
 
 	NativeW3DRenderState *m_state;
+	// Set only by the owning NativeW3D2 aggregate. Borrowed product recovery is
+	// orchestrated by the bridge that owns the backend.
+	NativeW3DResources *m_recoveryResources;
 	bool m_frameOpen;
 	bool m_ownsBackend;
 	bool m_borrowedMode;

@@ -150,8 +150,8 @@ protected:
 	bool														AnythingToRender;
 	bool														AnyDelayedPassesToRender;
 
-	void Generate_Texture_Categories(Vertex_Split_Table& split_table,unsigned vertex_offset);
-	void Insert_To_Texture_Category(
+	bool Generate_Texture_Categories(Vertex_Split_Table& split_table,unsigned vertex_offset);
+	bool Insert_To_Texture_Category(
 		Vertex_Split_Table& split_table,
 		TextureClass** textures,
 		VertexMaterialClass* mat,

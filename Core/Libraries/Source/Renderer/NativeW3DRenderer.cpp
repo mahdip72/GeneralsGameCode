@@ -45,7 +45,8 @@ NativeDrawPacket::NativeDrawPacket() :
 }
 
 NativeW3DRenderer::NativeW3DRenderer() :
-	m_state(0), m_frameOpen(false), m_ownsBackend(false), m_borrowedMode(false)
+	m_state(0), m_recoveryResources(0), m_frameOpen(false),
+	m_ownsBackend(false), m_borrowedMode(false)
 {
 }
 
@@ -217,9 +218,11 @@ RenderResult NativeW3DRenderer::Submit(const NativeW3DResources &resources,
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
-	if (!resources.IsVertexRangeValid(packet.vertexBuffer, packet.vertexStride,
+	if (!resources.IsVertexRangeValidForSubmission(packet.vertexBuffer,
+		packet.vertexStride,
 		packet.vertexOffset, packet.startVertex, packet.vertexCount) ||
-		(packet.indexed && (!resources.IsIndexRangeValid(packet.indexBuffer,
+		(packet.indexed && (!resources.IsIndexRangeValidForSubmission(
+		packet.indexBuffer,
 		packet.indexFormat, packet.indexOffset, packet.startIndex,
 		packet.indexCount))))
 	{
@@ -307,6 +310,9 @@ RenderResult NativeW3DRenderer::DrainFailedRecoveryCleanup(
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
+	// A failed recovery has already discarded the backend allocation table.
+	// Publish that terminal authority before queue Close races any producer.
+	state->MarkBackendTerminal();
 	const RenderResult closeResult = state->BeginShutdown();
 	if (closeResult != RENDER_RESULT_OK)
 	{
@@ -344,6 +350,7 @@ RenderResult NativeW3DRenderer::RecoverDevice()
 		m_state->Release();
 		m_state = 0;
 		m_frameOpen = false;
+		m_ownsBackend = false;
 		return result;
 	}
 	IRenderContext *context = device->immediateContext();
@@ -356,9 +363,36 @@ RenderResult NativeW3DRenderer::RecoverDevice()
 		m_state->Release();
 		m_state = 0;
 		m_frameOpen = false;
+		m_ownsBackend = false;
 		return RENDER_RESULT_FAILED;
 	}
-	return m_state->ReplaceContext(context);
+	const unsigned int expectedResourceTables = m_recoveryResources == 0 ? 0U : 1U;
+	RenderResult publicationResult =
+		m_state->BoundResourceTables() == expectedResourceTables &&
+		(m_recoveryResources == 0 ||
+			m_recoveryResources->IsBoundTo(this)) ?
+			m_state->ReplaceContext(context) : RENDER_RESULT_INVALID_ARGUMENT;
+	if (publicationResult == RENDER_RESULT_OK && m_recoveryResources != 0)
+	{
+		publicationResult =
+			m_recoveryResources->RestoreStaticBuffersAfterRecovery();
+	}
+	if (publicationResult != RENDER_RESULT_OK)
+	{
+		// Context publication and buffer restoration are one transaction. A
+		// partially restored facade must become terminal before any later frame
+		// can observe stale mutable bytes or only a subset of static geometry.
+		unsigned int drained = 0;
+		DrainFailedRecoveryCleanup(m_state, &drained);
+		device->shutdown();
+		delete device;
+		m_state->Release();
+		m_state = 0;
+		m_frameOpen = false;
+		m_ownsBackend = false;
+		return publicationResult;
+	}
+	return RENDER_RESULT_OK;
 }
 
 RenderResult NativeW3DRenderer::Resize(unsigned int width, unsigned int height)
@@ -368,7 +402,31 @@ RenderResult NativeW3DRenderer::Resize(unsigned int width, unsigned int height)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
-	return device->resize(width, height);
+	const unsigned int expectedResourceTables = m_recoveryResources == 0 ? 0U : 1U;
+	if (m_state->BoundResourceTables() != expectedResourceTables ||
+		(m_recoveryResources != 0 &&
+			!m_recoveryResources->IsBoundTo(this)))
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	RenderResult result = device->resize(width, height);
+	if (result == RENDER_RESULT_OK && width != 0 && height != 0 &&
+		m_recoveryResources != 0)
+	{
+		result = m_recoveryResources->RepublishStaticBuffersAfterResize();
+	}
+	if (result != RENDER_RESULT_OK)
+	{
+		unsigned int drained = 0;
+		DrainFailedRecoveryCleanup(m_state, &drained);
+		device->shutdown();
+		delete device;
+		m_state->Release();
+		m_state = 0;
+		m_frameOpen = false;
+		m_ownsBackend = false;
+	}
+	return result;
 }
 
 bool NativeW3DRenderer::IsInitialized() const

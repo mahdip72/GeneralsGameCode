@@ -119,6 +119,20 @@ int main()
 		result |= Check(w3d.Resources().CreateBuffer(bufferDescriptor, vertices,
 			sizeof(vertices), &vertexBuffer) == rts::render::RENDER_RESULT_OK,
 			"native WW3D2 creates a logical vertex buffer");
+		rts::render::BufferDescriptor staticDescriptor = bufferDescriptor;
+		staticDescriptor.usage = rts::render::RENDER_USAGE_DEFAULT;
+		rts::render::GpuHandle staticVertexBuffer;
+		result |= Check(w3d.Resources().CreateBuffer(staticDescriptor, vertices,
+			sizeof(vertices), &staticVertexBuffer) ==
+				rts::render::RENDER_RESULT_OK,
+			"native WW3D2 creates recoverable static geometry");
+		rts::render::BufferDescriptor dynamicDescriptor = bufferDescriptor;
+		dynamicDescriptor.usage = rts::render::RENDER_USAGE_DYNAMIC;
+		rts::render::GpuHandle dynamicVertexBuffer;
+		result |= Check(w3d.Resources().CreateBuffer(dynamicDescriptor, vertices,
+			sizeof(vertices), &dynamicVertexBuffer) ==
+				rts::render::RENDER_RESULT_OK,
+			"native WW3D2 creates explicitly unrestorable dynamic geometry");
 		rts::render::NativeDrawPacket packet;
 		ConfigurePacket(&packet, vertexBuffer);
 		rts::render::LegacyLogicalState state;
@@ -140,13 +154,23 @@ int main()
 			"native WW3D2 bounds neutral vertex layout descriptors");
 		result |= Check(w3d.Renderer().EndFrame(true) == rts::render::RENDER_RESULT_OK,
 			"native WW3D2 presents a hidden D3D11 frame");
-		result |= Check(w3d.Renderer().RecoverDevice() == rts::render::RENDER_RESULT_OK,
+		result |= Check(w3d.RecoverDevice() == rts::render::RENDER_RESULT_OK,
 			"native WW3D2 recovers a hidden D3D11 device");
 		result |= Check(w3d.Renderer().BeginFrame() == rts::render::RENDER_RESULT_OK,
 			"native WW3D2 begins a frame after device recovery");
 		result |= Check(w3d.Renderer().Submit(w3d.Resources(), state, packet) ==
 			rts::render::RENDER_RESULT_OK,
-			"native WW3D2 preserves logical resources through device recovery");
+			"native WW3D2 republishes immutable creation bytes through recovery");
+		rts::render::NativeDrawPacket staticPacket;
+		ConfigurePacket(&staticPacket, staticVertexBuffer);
+		result |= Check(w3d.Renderer().Submit(w3d.Resources(), state,
+			staticPacket) == rts::render::RENDER_RESULT_OK,
+			"native WW3D2 republishes DEFAULT static bytes through recovery");
+		rts::render::NativeDrawPacket dynamicPacket;
+		ConfigurePacket(&dynamicPacket, dynamicVertexBuffer);
+		result |= Check(w3d.Renderer().Submit(w3d.Resources(), state,
+			dynamicPacket) == rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+			"native WW3D2 fails closed for dynamic bytes after recovery");
 		result |= Check(w3d.Renderer().EndFrame(true) == rts::render::RENDER_RESULT_OK,
 			"native WW3D2 presents after device recovery");
 

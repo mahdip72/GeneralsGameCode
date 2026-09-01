@@ -56,6 +56,14 @@
 #include "meshmatdesc.h"
 #include "texturethumbnail.h"
 #include "WWDebug/wwprofile.h"
+#if defined(_WIN64)
+#include "nativew3dsampledtexture.h"
+#include "nativew3dtextureowner.h"
+#include "texturemipbuffer.h"
+#include "texturemipgenerator.h"
+#include <new>
+#include <vector>
+#endif
 
 const unsigned DEFAULT_INACTIVATION_TIME=20000;
 
@@ -64,6 +72,71 @@ const unsigned DEFAULT_INACTIVATION_TIME=20000;
 */
 
 static unsigned unused_texture_id;
+
+#if defined(_WIN64)
+struct NativeTextureStorage
+{
+	NativeTextureStorage() : owner(), descriptor(), pixels(), rowPitches(),
+		slicePitches(), gpuLease(), sourceFormat(WW3D_FORMAT_UNKNOWN),
+		missing(false) {}
+
+	rts::render::NativeW3DTextureOwner owner;
+	rts::render::TextureDescriptor descriptor;
+	std::vector<std::vector<unsigned char> > pixels;
+	std::vector<size_t> rowPitches;
+	std::vector<size_t> slicePitches;
+	mutable rts::render::NativeW3DGpuContentLease gpuLease;
+	WW3DFormat sourceFormat;
+	bool missing;
+};
+
+static bool Apply_Native_Empty_Texture(TextureBaseClass *texture,
+	unsigned int width, unsigned int height, WW3DFormat format,
+	MipCountType requested_mips, unsigned int array_count, bool render_target)
+{
+	if (texture == nullptr || width == 0 || height == 0 || array_count == 0 ||
+		!rts::render::NativeW3DSampledTextureUpload::SupportsSourceFormat(format))
+		return false;
+	unsigned int mip_count = requested_mips == MIP_LEVELS_ALL ?
+		CalculateTextureMipLevelCount(width, height) :
+		static_cast<unsigned int>(requested_mips);
+	if (mip_count == 0 || mip_count > MIP_LEVELS_MAX || array_count > 6)
+		return false;
+
+	TextureMipBuffer buffers[6][MIP_LEVELS_MAX];
+	rts::render::NativeW3DSampledTextureMipView
+		views[6 * MIP_LEVELS_MAX];
+	for (unsigned int slice = 0; slice < array_count; ++slice)
+	{
+		unsigned int mip_width = width;
+		unsigned int mip_height = height;
+		for (unsigned int mip = 0; mip < mip_count; ++mip)
+		{
+			const unsigned int index = slice * mip_count + mip;
+			if (!buffers[slice][mip].allocate(format, mip_width, mip_height, 1))
+				return false;
+			memset(buffers[slice][mip].data(), 0,
+				buffers[slice][mip].layout().dataSize);
+			views[index].data = buffers[slice][mip].data();
+			views[index].dataSize = buffers[slice][mip].layout().dataSize;
+			views[index].rowPitch = buffers[slice][mip].layout().rowPitch;
+			ReduceTextureMipDimensions(mip_width, mip_height);
+		}
+	}
+
+	rts::render::NativeW3DSampledTextureUpload upload;
+	if (!upload.Prepare(format, width, height, mip_count, array_count, views,
+		array_count * mip_count)) return false;
+	rts::render::TextureDescriptor descriptor = upload.Descriptor();
+	if (render_target)
+	{
+		descriptor.binding |= rts::render::RENDER_TEXTURE_RENDER_TARGET;
+		descriptor.usage = rts::render::RENDER_USAGE_DEFAULT;
+	}
+	return texture->Apply_Native_Texture(descriptor, upload.Subresources(),
+		upload.SubresourceCount(), format, true);
+}
+#endif
 
 // This throttles submissions to the background texture loading queue.
 static unsigned TexturesAppliedPerFrame;
@@ -84,6 +157,9 @@ TextureBaseClass::TextureBaseClass
 )
 :	MipLevelCount(mip_level_count),
 	D3DTexture(nullptr),
+#if defined(_WIN64)
+	NativeTexture(nullptr),
+#endif
 	Initialized(false),
    Name(""),
 	FullPath(""),
@@ -119,9 +195,372 @@ TextureBaseClass::~TextureBaseClass()
 	ThumbnailLoadTask=nullptr;
 
 	Release_D3D_Texture();
+#if defined(_WIN64)
+	Release_Native_Texture();
+#endif
 
 	DX8TextureManagerClass::Remove(this);
 }
+
+#if defined(_WIN64)
+void TextureBaseClass::Release_Native_Texture()
+{
+	if (NativeTexture != nullptr)
+	{
+		NativeTexture->owner.Reset();
+		delete NativeTexture;
+		NativeTexture = nullptr;
+	}
+}
+
+bool TextureBaseClass::Apply_Native_Texture(
+	const rts::render::TextureDescriptor &descriptor,
+	const rts::render::TextureSubresourceData *subresources,
+	unsigned int subresource_count, WW3DFormat source_format,
+	bool initialized, bool disable_auto_invalidation, bool missing_texture)
+{
+	const unsigned int expected_count = descriptor.mipCount * descriptor.arrayCount;
+	if (descriptor.width == 0 || descriptor.height == 0 ||
+		descriptor.mipCount == 0 || descriptor.arrayCount == 0 ||
+		subresources == nullptr || subresource_count != expected_count)
+	{
+		return false;
+	}
+	// TextureClass retains the complete canonical CPU image specifically so a
+	// recovered native device can republish it. D3D11 immutable resources cannot
+	// be refreshed in place, so promote prepared immutable uploads to DEFAULT at
+	// this product boundary while preserving every other descriptor field.
+	rts::render::TextureDescriptor product_descriptor = descriptor;
+	if (product_descriptor.usage == rts::render::RENDER_USAGE_IMMUTABLE)
+		product_descriptor.usage = rts::render::RENDER_USAGE_DEFAULT;
+
+	NativeTextureStorage *storage = NativeTexture;
+	if (storage == nullptr)
+	{
+		storage = new(std::nothrow) NativeTextureStorage;
+		if (storage == nullptr) return false;
+	}
+
+	rts::render::NativeW3DTextureCandidate candidate;
+	if (storage->owner.CreateCandidate(product_descriptor, subresources,
+		subresource_count, &candidate) != rts::render::RENDER_RESULT_OK)
+	{
+		if (NativeTexture == nullptr) delete storage;
+		return false;
+	}
+
+	std::vector<std::vector<unsigned char> > pixels;
+	std::vector<size_t> row_pitches;
+	std::vector<size_t> slice_pitches;
+	try
+	{
+		pixels.resize(subresource_count);
+		row_pitches.resize(subresource_count);
+		slice_pitches.resize(subresource_count);
+		for (unsigned int index = 0; index < subresource_count; ++index)
+		{
+			if (subresources[index].data == nullptr ||
+				subresources[index].rowPitch == 0 ||
+				subresources[index].slicePitch == 0)
+			{
+				if (NativeTexture == nullptr) delete storage;
+				return false;
+			}
+			pixels[index].resize(subresources[index].slicePitch);
+			memcpy(&pixels[index][0], subresources[index].data,
+				subresources[index].slicePitch);
+			row_pitches[index] = subresources[index].rowPitch;
+			slice_pitches[index] = subresources[index].slicePitch;
+		}
+	}
+	catch (...)
+	{
+		if (NativeTexture == nullptr) delete storage;
+		return false;
+	}
+
+	const unsigned int publication = storage->owner.PublicationGeneration();
+	if (storage->owner.PublishCandidate(&candidate, publication) !=
+		rts::render::RENDER_RESULT_OK)
+	{
+		if (NativeTexture == nullptr) delete storage;
+		return false;
+	}
+	storage->descriptor = product_descriptor;
+	storage->pixels.swap(pixels);
+	storage->rowPitches.swap(row_pitches);
+	storage->slicePitches.swap(slice_pitches);
+	storage->gpuLease = rts::render::NativeW3DGpuContentLease();
+	storage->sourceFormat = source_format;
+	storage->missing = missing_texture;
+	NativeTexture = storage;
+	Release_D3D_Texture();
+	Width = static_cast<int>(product_descriptor.width);
+	Height = static_cast<int>(product_descriptor.height);
+	MipLevelCount = static_cast<MipCountType>(product_descriptor.mipCount);
+	if (initialized) Initialized = true;
+	if (disable_auto_invalidation) InactivationTime = 0;
+	return true;
+}
+
+bool TextureBaseClass::Apply_Native_Missing_Texture()
+{
+	static const unsigned char pixels[16] = {
+		0xff, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0xff,
+		0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0xff, 0xff
+	};
+	rts::render::TextureDescriptor descriptor;
+	descriptor.width = 2;
+	descriptor.height = 2;
+	descriptor.mipCount = 1;
+	descriptor.arrayCount = 1;
+	descriptor.dimension = rts::render::RENDER_TEXTURE_2D;
+	descriptor.format = rts::render::RENDER_FORMAT_B8G8R8A8_UNORM;
+	descriptor.binding = rts::render::RENDER_TEXTURE_SHADER_RESOURCE;
+	descriptor.usage = rts::render::RENDER_USAGE_IMMUTABLE;
+	rts::render::TextureSubresourceData subresource;
+	subresource.data = pixels;
+	subresource.rowPitch = 8;
+	subresource.slicePitch = sizeof(pixels);
+	return Apply_Native_Texture(descriptor, &subresource, 1,
+		WW3D_FORMAT_A8R8G8B8, true, false, true);
+}
+
+bool TextureBaseClass::Acquire_Native_Texture(
+	rts::render::NativeW3DTextureHandle *handle,
+	rts::render::NativeW3DGpuContentLease *gpu_lease) const
+{
+	if (handle == nullptr || NativeTexture == nullptr) return false;
+	rts::render::NativeW3DGpuContentLease *lease = gpu_lease == nullptr ?
+		&NativeTexture->gpuLease : gpu_lease;
+	const bool caller_requested_generation = handle->isValid() ||
+		(gpu_lease != nullptr && gpu_lease->isValid());
+	if (NativeTexture->owner.AcquireForSampling(handle, lease) ==
+		rts::render::RENDER_RESULT_OK) return true;
+	if (caller_requested_generation) return false;
+	if (!Refresh_Native_CPU_Content()) return false;
+	*handle = rts::render::NativeW3DTextureHandle();
+	*lease = rts::render::NativeW3DGpuContentLease();
+	return NativeTexture->owner.AcquireForSampling(handle, lease) ==
+		rts::render::RENDER_RESULT_OK;
+}
+
+bool TextureBaseClass::Acquire_Native_Surface(unsigned int mip_level,
+	unsigned int array_slice, bool for_output,
+	rts::render::NativeW3DSurfaceHandle *surface,
+	rts::render::NativeW3DGpuContentLease *gpu_lease) const
+{
+	if (surface == nullptr || NativeTexture == nullptr) return false;
+	if (for_output)
+	{
+		if (NativeTexture->owner.AcquireOutputSurface(mip_level, array_slice,
+			surface) == rts::render::RENDER_RESULT_OK) return true;
+		// A cached typed surface expires across backend recovery. The owner has
+		// cleared it on failure, so reacquire the same logical output once.
+		return NativeTexture->owner.AcquireOutputSurface(mip_level, array_slice,
+			surface) == rts::render::RENDER_RESULT_OK;
+	}
+	rts::render::NativeW3DGpuContentLease *lease = gpu_lease == nullptr ?
+		&NativeTexture->gpuLease : gpu_lease;
+	const bool caller_requested_generation = surface->isValid() ||
+		(gpu_lease != nullptr && gpu_lease->isValid());
+	if (NativeTexture->owner.AcquireSurface(mip_level, array_slice, surface,
+		lease) == rts::render::RENDER_RESULT_OK) return true;
+	if (caller_requested_generation) return false;
+	if (!Refresh_Native_CPU_Content()) return false;
+	*surface = rts::render::NativeW3DSurfaceHandle();
+	*lease = rts::render::NativeW3DGpuContentLease();
+	return NativeTexture->owner.AcquireSurface(mip_level, array_slice, surface,
+		lease) == rts::render::RENDER_RESULT_OK;
+}
+
+bool TextureBaseClass::Publish_Native_Output(
+	rts::render::NativeW3DSurfaceHandle surface,
+	rts::render::NativeW3DGpuContentLease *gpu_lease) const
+{
+	if (NativeTexture == nullptr) return false;
+	rts::render::NativeW3DGpuContentLease *lease = gpu_lease == nullptr ?
+		&NativeTexture->gpuLease : gpu_lease;
+	return NativeTexture->owner.PublishOutputWrite(surface, lease) ==
+		rts::render::RENDER_RESULT_OK;
+}
+
+bool TextureBaseClass::Copy_Native_Active_Color_Target()
+{
+	if (NativeTexture == nullptr) return false;
+	return NativeTexture->owner.CopyActiveColorTarget(
+		&NativeTexture->gpuLease) == rts::render::RENDER_RESULT_OK;
+}
+
+bool TextureBaseClass::Publish_Native_BGRA8(const void *data,
+	size_t row_pitch, size_t slice_pitch)
+{
+	if (NativeTexture == nullptr || data == nullptr ||
+		NativeTexture->descriptor.dimension != rts::render::RENDER_TEXTURE_2D ||
+		NativeTexture->descriptor.format !=
+			rts::render::RENDER_FORMAT_B8G8R8A8_UNORM ||
+		NativeTexture->descriptor.arrayCount != 1 ||
+		NativeTexture->descriptor.mipCount != 1)
+	{
+		return false;
+	}
+	return Update_Native_Subresource_Data(0, 0,
+		static_cast<const unsigned char *>(data), row_pitch, slice_pitch);
+}
+
+bool TextureBaseClass::Generate_Native_Mip_Levels()
+{
+	if (NativeTexture == nullptr || NativeTexture->descriptor.width == 0 ||
+		NativeTexture->descriptor.height == 0) return false;
+	rts::render::NativeW3DTextureHandle cpu_handle;
+	if (NativeTexture->owner.AcquireForSampling(&cpu_handle) !=
+		rts::render::RENDER_RESULT_OK) return false;
+	const unsigned int mip_count = NativeTexture->descriptor.mipCount;
+	if (mip_count < 2) return true;
+	const WW3DFormat mip_format = NativeTexture->descriptor.format ==
+		rts::render::RENDER_FORMAT_B8G8R8A8_UNORM ?
+		WW3D_FORMAT_A8R8G8B8 : NativeTexture->sourceFormat;
+	const unsigned int array_count = NativeTexture->descriptor.arrayCount;
+	const unsigned int count = mip_count * array_count;
+	if (count != NativeTexture->pixels.size() ||
+		count != NativeTexture->rowPitches.size() ||
+		count != NativeTexture->slicePitches.size()) return false;
+	for (unsigned int slice = 0; slice < array_count; ++slice)
+	{
+		unsigned int width = NativeTexture->descriptor.width;
+		unsigned int height = NativeTexture->descriptor.height;
+		for (unsigned int mip = 1; mip < mip_count; ++mip)
+		{
+			const unsigned int source = slice * mip_count + mip - 1;
+			const unsigned int destination = source + 1;
+			if (NativeTexture->pixels[source].empty() ||
+				NativeTexture->pixels[destination].empty() ||
+				NativeTexture->rowPitches[source] > UINT_MAX ||
+				NativeTexture->rowPitches[destination] > UINT_MAX ||
+				!Generate_Texture_Mip_Level_Box(
+					&NativeTexture->pixels[source][0],
+					static_cast<unsigned int>(NativeTexture->rowPitches[source]),
+					width, height, &NativeTexture->pixels[destination][0],
+					static_cast<unsigned int>(NativeTexture->rowPitches[destination]),
+					mip_format))
+			{
+				return false;
+			}
+			ReduceTextureMipDimensions(width, height);
+		}
+	}
+	std::vector<rts::render::TextureSubresourceData> subresources;
+	try { subresources.resize(count); }
+	catch (...) { return false; }
+	for (unsigned int index = 0; index < count; ++index)
+	{
+		subresources[index].data = &NativeTexture->pixels[index][0];
+		subresources[index].rowPitch = NativeTexture->rowPitches[index];
+		subresources[index].slicePitch = NativeTexture->slicePitches[index];
+	}
+	return Apply_Native_Texture(NativeTexture->descriptor, &subresources[0],
+		count, NativeTexture->sourceFormat, true, InactivationTime == 0,
+		NativeTexture->missing);
+}
+
+bool TextureBaseClass::Refresh_Native_CPU_Content() const
+{
+	if (NativeTexture == nullptr) return false;
+	const unsigned int count = NativeTexture->descriptor.mipCount *
+		NativeTexture->descriptor.arrayCount;
+	if (count == 0 || count != NativeTexture->pixels.size() ||
+		count != NativeTexture->rowPitches.size() ||
+		count != NativeTexture->slicePitches.size()) return false;
+	std::vector<rts::render::TextureSubresourceData> subresources;
+	try { subresources.resize(count); }
+	catch (...) { return false; }
+	for (unsigned int index = 0; index < count; ++index)
+	{
+		if (NativeTexture->pixels[index].empty()) return false;
+		subresources[index].data = &NativeTexture->pixels[index][0];
+		subresources[index].rowPitch = NativeTexture->rowPitches[index];
+		subresources[index].slicePitch = NativeTexture->slicePitches[index];
+	}
+	const bool refreshed = NativeTexture->owner.RefreshCpuContent(
+		NativeTexture->descriptor, &subresources[0], count) ==
+		rts::render::RENDER_RESULT_OK;
+	if (refreshed)
+		NativeTexture->gpuLease = rts::render::NativeW3DGpuContentLease();
+	return refreshed;
+}
+
+bool TextureBaseClass::Get_Native_Subresource_Data(unsigned int mip_level,
+	unsigned int array_slice, const unsigned char **data, size_t *row_pitch,
+	size_t *slice_pitch) const
+{
+	if (data == nullptr || row_pitch == nullptr || slice_pitch == nullptr)
+		return false;
+	*data = nullptr;
+	*row_pitch = 0;
+	*slice_pitch = 0;
+	if (NativeTexture == nullptr || mip_level >= NativeTexture->descriptor.mipCount ||
+		array_slice >= NativeTexture->descriptor.arrayCount)
+		return false;
+	// A retained upload image is authoritative only while the registry still
+	// reports CPU content. Never expose the stale pre-render bytes of a GPU
+	// render target as a lockable surface view.
+	rts::render::NativeW3DTextureHandle cpu_handle;
+	if (NativeTexture->owner.AcquireForSampling(&cpu_handle) !=
+		rts::render::RENDER_RESULT_OK) return false;
+	const unsigned int index = array_slice * NativeTexture->descriptor.mipCount +
+		mip_level;
+	if (index >= NativeTexture->pixels.size() ||
+		NativeTexture->pixels[index].empty()) return false;
+	*data = &NativeTexture->pixels[index][0];
+	*row_pitch = NativeTexture->rowPitches[index];
+	*slice_pitch = NativeTexture->slicePitches[index];
+	return true;
+}
+
+bool TextureBaseClass::Update_Native_Subresource_Data(unsigned int mip_level,
+	unsigned int array_slice, const unsigned char *data, size_t row_pitch,
+	size_t slice_pitch)
+{
+	if (NativeTexture == nullptr || data == nullptr || row_pitch == 0 ||
+		slice_pitch == 0 || mip_level >= NativeTexture->descriptor.mipCount ||
+		array_slice >= NativeTexture->descriptor.arrayCount) return false;
+	rts::render::NativeW3DTextureHandle cpu_handle;
+	if (NativeTexture->owner.AcquireForSampling(&cpu_handle) !=
+		rts::render::RENDER_RESULT_OK) return false;
+	const unsigned int count = NativeTexture->descriptor.mipCount *
+		NativeTexture->descriptor.arrayCount;
+	const unsigned int replaced = array_slice * NativeTexture->descriptor.mipCount +
+		mip_level;
+	if (replaced >= count || count != NativeTexture->pixels.size() ||
+		count != NativeTexture->rowPitches.size() ||
+		count != NativeTexture->slicePitches.size() ||
+		row_pitch != NativeTexture->rowPitches[replaced] ||
+		slice_pitch != NativeTexture->slicePitches[replaced]) return false;
+	std::vector<rts::render::TextureSubresourceData> subresources;
+	try { subresources.resize(count); }
+	catch (...) { return false; }
+	for (unsigned int index = 0; index < count; ++index)
+	{
+		if (NativeTexture->pixels[index].empty()) return false;
+		subresources[index].data = index == replaced ? data :
+			&NativeTexture->pixels[index][0];
+		subresources[index].rowPitch = NativeTexture->rowPitches[index];
+		subresources[index].slicePitch = NativeTexture->slicePitches[index];
+	}
+	return Apply_Native_Texture(NativeTexture->descriptor, &subresources[0],
+		count, NativeTexture->sourceFormat, true, InactivationTime == 0,
+		NativeTexture->missing);
+}
+
+size_t TextureBaseClass::Get_Native_Texture_Byte_Count() const
+{
+	if (NativeTexture == nullptr) return 0;
+	size_t size = 0;
+	for (unsigned int index = 0; index < NativeTexture->slicePitches.size(); ++index)
+		size += NativeTexture->slicePitches[index];
+	return size;
+}
+#endif
 
 void TextureBaseClass::Release_D3D_Texture()
 {
@@ -206,6 +645,9 @@ void TextureBaseClass::Invalidate()
 	}
 
 	Release_D3D_Texture();
+#if defined(_WIN64)
+	Release_Native_Texture();
+#endif
 
 	Initialized=false;
 
@@ -296,6 +738,9 @@ void TextureBaseClass::Load_Locked_Surface()
 */
 bool TextureBaseClass::Is_Missing_Texture()
 {
+#if defined(_WIN64)
+	return NativeTexture != nullptr && NativeTexture->missing;
+#else
 	bool flag = false;
 	IDirect3DBaseTexture8 *missing_texture = MissingTexture::_Get_Missing_Texture();
 
@@ -308,6 +753,7 @@ bool TextureBaseClass::Is_Missing_Texture()
 	}
 
 	return flag;
+#endif
 }
 
 
@@ -329,6 +775,9 @@ void TextureBaseClass::Set_Texture_Name(const char * name)
 */
 unsigned int TextureBaseClass::Get_Priority()
 {
+#if defined(_WIN64)
+	return 0;
+#else
 	if (!D3DTexture)
 	{
 		WWASSERT_PRINT(0, "Get_Priority: D3DTexture is null!");
@@ -336,6 +785,7 @@ unsigned int TextureBaseClass::Get_Priority()
 	}
 
 	return D3DTexture->GetPriority();
+#endif
 }
 
 
@@ -345,6 +795,10 @@ unsigned int TextureBaseClass::Get_Priority()
 */
 unsigned int TextureBaseClass::Set_Priority(unsigned int priority)
 {
+#if defined(_WIN64)
+	(void)priority;
+	return 0;
+#else
 	if (!D3DTexture)
 	{
 		WWASSERT_PRINT(0, "Set_Priority: D3DTexture is null!");
@@ -352,6 +806,7 @@ unsigned int TextureBaseClass::Set_Priority(unsigned int priority)
 	}
 
 	return D3DTexture->SetPriority(priority);
+#endif
 }
 
 
@@ -387,7 +842,11 @@ unsigned TextureBaseClass::Get_Reduction() const
 void TextureBaseClass::Apply_Null(unsigned int stage)
 {
 	// This function sets the render states for a "null" texture
+#if defined(_WIN64)
+	DX8Wrapper::Set_Native_Texture(stage, nullptr);
+#else
 	DX8Wrapper::Set_DX8_Texture(stage, nullptr);
+#endif
 }
 
 // ----------------------------------------------------------------------------
@@ -610,6 +1069,13 @@ TextureClass::TextureClass
 	default : break;
 	}
 
+#if defined(_WIN64)
+	if (!Apply_Native_Empty_Texture(this, width, height, format,
+		mip_level_count, 1, rendertarget))
+	{
+		Initialized = false;
+	}
+#else
 	D3DPOOL d3dpool=(D3DPOOL)0;
 	switch(pool)
 	{
@@ -646,6 +1112,7 @@ TextureClass::TextureClass
 		);
 		DX8TextureManagerClass::Add(track);
 	}
+#endif
 	LastAccessed=WW3D::Get_Sync_Time();
 }
 
@@ -779,19 +1246,65 @@ TextureClass::TextureClass
 	default: break;
 	}
 
-	Poke_Texture
-	(
-		DX8Wrapper::_Create_DX8_Texture
-		(
-			surface->Peek_D3D_Surface(),
-			mip_level_count
-		)
-	);
+#if defined(_WIN64)
+	int pitch = 0;
+	unsigned char *data = static_cast<unsigned char *>(surface->Lock(&pitch));
+	TextureMipLayout layout;
+	if (data == nullptr || pitch <= 0 ||
+		!CalculateTextureMipLayout(sd.Format, sd.Width, sd.Height, 1, layout))
+	{
+		Initialized = false;
+	}
+	else
+	{
+		rts::render::NativeW3DSampledTextureMipView view;
+		view.data = data;
+		view.rowPitch = static_cast<size_t>(pitch);
+		view.dataSize = static_cast<size_t>(pitch) * layout.rowCount;
+		rts::render::NativeW3DSampledTextureUpload upload;
+		const bool prepared = upload.Prepare(sd.Format, sd.Width, sd.Height,
+			1, 1, &view, 1);
+		bool published = false;
+		if (prepared && mip_level_count == MIP_LEVELS_1)
+		{
+			published = Apply_Native_Texture(upload.Descriptor(),
+				upload.Subresources(), upload.SubresourceCount(), sd.Format, true);
+		}
+		else if (prepared && Apply_Native_Empty_Texture(this, sd.Width,
+			sd.Height, sd.Format, mip_level_count, 1, false))
+		{
+			const rts::render::TextureSubresourceData &top =
+				upload.Subresources()[0];
+			published = Update_Native_Subresource_Data(0, 0,
+				static_cast<const unsigned char *>(top.data), top.rowPitch,
+				top.slicePitch) && Generate_Native_Mip_Levels();
+		}
+		if (!published)
+		{
+			Initialized = false;
+		}
+	}
+	if (data != nullptr) surface->Unlock();
+#else
+	Poke_Texture(DX8Wrapper::_Create_DX8_Texture(surface->Peek_D3D_Surface(),
+		mip_level_count));
+#endif
 	LastAccessed=WW3D::Get_Sync_Time();
 }
 
 // ----------------------------------------------------------------------------
 TextureClass::TextureClass(IDirect3DBaseTexture8* d3d_texture)
+#if defined(_WIN64)
+: TextureBaseClass(0, 0, MIP_LEVELS_1), Filter(MIP_LEVELS_1),
+	TextureFormat(WW3D_FORMAT_UNKNOWN)
+{
+	(void)d3d_texture;
+	Initialized = Apply_Native_Missing_Texture();
+	IsProcedural = true;
+	IsReducible = false;
+	LastAccessed = WW3D::Get_Sync_Time();
+}
+#else
 :	TextureBaseClass
 	(
 		0,
@@ -827,6 +1340,7 @@ TextureClass::TextureClass(IDirect3DBaseTexture8* d3d_texture)
 
 	LastAccessed=WW3D::Get_Sync_Time();
 }
+#endif
 
 //**********************************************************************************************
 //! Initialise the texture
@@ -851,8 +1365,16 @@ void TextureClass::Init()
 	}
 
 
-	if (!Peek_D3D_Base_Texture())
+	bool has_texture = Peek_D3D_Base_Texture() != nullptr;
+#if defined(_WIN64)
+	rts::render::NativeW3DTextureHandle native_handle;
+	has_texture = Acquire_Native_Texture(&native_handle);
+#endif
+	if (!has_texture)
 	{
+#if defined(_WIN64)
+		TextureLoader::Request_Foreground_Loading(this);
+#else
 		if (!WW3D::Get_Thumbnail_Enabled() || MipLevelCount==MIP_LEVELS_1)
 		{
 //		if (MipLevelCount==MIP_LEVELS_1) {
@@ -864,6 +1386,7 @@ void TextureClass::Init()
 			Load_Locked_Surface();
 			TextureFormat=format;
 		}
+#endif
 	}
 
 	if (!Initialized)
@@ -885,6 +1408,27 @@ void TextureClass::Apply_New_Surface
 	bool disable_auto_invalidation
 )
 {
+#if defined(_WIN64)
+	(void)disable_auto_invalidation;
+	// A D3D8 pointer is never a valid x64 product publication. The native
+	// loader owns conversion; retain a deterministic fallback for residual
+	// thumbnail/legacy callers without keeping or dereferencing the COM object.
+	if (d3d_texture == nullptr)
+	{
+		Release_Native_Texture();
+		Initialized = false;
+		return;
+	}
+	if (!Apply_Native_Missing_Texture())
+	{
+		Initialized = false;
+	}
+	else if (!initialized)
+	{
+		Initialized = false;
+	}
+	return;
+#else
 	if (d3d_texture == nullptr)
 	{
 		Release_D3D_Texture();
@@ -923,6 +1467,7 @@ void TextureClass::Apply_New_Surface
 		Width=d3d_desc.Width;
 		Height=d3d_desc.Height;
 	}
+#endif
 }
 
 
@@ -970,11 +1515,19 @@ void TextureClass::Apply(unsigned int stage)
 	// Set texture itself
 	if (WW3D::Is_Texturing_Enabled())
 	{
+#if defined(_WIN64)
+		DX8Wrapper::Set_Native_Texture(stage, this);
+#else
 		DX8Wrapper::Set_DX8_Texture(stage, Peek_D3D_Base_Texture());
+#endif
 	}
 	else
 	{
+#if defined(_WIN64)
+		DX8Wrapper::Set_Native_Texture(stage, nullptr);
+#else
 		DX8Wrapper::Set_DX8_Texture(stage, nullptr);
+#endif
 	}
 
 	Filter.Apply(stage);
@@ -986,6 +1539,14 @@ void TextureClass::Apply(unsigned int stage)
 */
 SurfaceClass *TextureClass::Get_Surface_Level(unsigned int level)
 {
+#if defined(_WIN64)
+	rts::render::NativeW3DSurfaceHandle surface_handle;
+	if (!Acquire_Native_Surface(level, 0, false, &surface_handle))
+	{
+		return nullptr;
+	}
+	return new SurfaceClass(this, level, 0);
+#else
 	if (!Peek_D3D_Texture())
 	{
 		WWASSERT_PRINT(0, "Get_Surface_Level: D3DTexture is null!");
@@ -998,6 +1559,7 @@ SurfaceClass *TextureClass::Get_Surface_Level(unsigned int level)
 	d3d_surface->Release();
 
 	return surface;
+#endif
 }
 
 //**********************************************************************************************
@@ -1019,6 +1581,10 @@ void TextureClass::Get_Level_Description( SurfaceClass::SurfaceDescription & des
 */
 IDirect3DSurface8 *TextureClass::Get_D3D_Surface_Level(unsigned int level)
 {
+#if defined(_WIN64)
+	(void)level;
+	return nullptr;
+#else
 	if (!Peek_D3D_Texture())
 	{
 		WWASSERT_PRINT(0, "Get_D3D_Surface_Level: D3DTexture is null!");
@@ -1028,6 +1594,7 @@ IDirect3DSurface8 *TextureClass::Get_D3D_Surface_Level(unsigned int level)
 	IDirect3DSurface8 *d3d_surface = nullptr;
 	DX8_ErrorCode(Peek_D3D_Texture()->GetSurfaceLevel(level, &d3d_surface));
 	return d3d_surface;
+#endif
 }
 
 //**********************************************************************************************
@@ -1036,6 +1603,11 @@ IDirect3DSurface8 *TextureClass::Get_D3D_Surface_Level(unsigned int level)
 */
 unsigned TextureClass::Get_Texture_Memory_Usage() const
 {
+#if defined(_WIN64)
+	size_t size = Get_Native_Texture_Byte_Count();
+	return size > static_cast<size_t>(UINT_MAX) ? UINT_MAX :
+		static_cast<unsigned int>(size);
+#else
 	int size=0;
 	if (!Peek_D3D_Texture()) return 0;
 	for (unsigned i=0;i<Peek_D3D_Texture()->GetLevelCount();++i)
@@ -1045,6 +1617,7 @@ unsigned TextureClass::Get_Texture_Memory_Usage() const
 		size+=desc.Size;
 	}
 	return size;
+#endif
 }
 
 
@@ -1218,6 +1791,29 @@ ZTextureClass::ZTextureClass
 :	TextureBaseClass(width,height, mip_level_count, pool),
 	DepthStencilTextureFormat(zformat)
 {
+#if defined(_WIN64)
+	rts::render::TextureDescriptor descriptor;
+	descriptor.width = width;
+	descriptor.height = height;
+	descriptor.mipCount = 1;
+	descriptor.arrayCount = 1;
+	descriptor.dimension = rts::render::RENDER_TEXTURE_2D;
+	descriptor.format = rts::render::RENDER_FORMAT_D24_UNORM_S8_UINT;
+	descriptor.binding = rts::render::RENDER_TEXTURE_DEPTH_STENCIL;
+	descriptor.usage = rts::render::RENDER_USAGE_DEFAULT;
+	std::vector<unsigned char> zero_depth;
+	try { zero_depth.resize(static_cast<size_t>(width) * height * 4U, 0); }
+	catch (...) { zero_depth.clear(); }
+	rts::render::TextureSubresourceData subresource;
+	if (!zero_depth.empty())
+	{
+		subresource.data = &zero_depth[0];
+		subresource.rowPitch = static_cast<size_t>(width) * 4U;
+		subresource.slicePitch = zero_depth.size();
+	}
+	Initialized = !zero_depth.empty() && Apply_Native_Texture(descriptor,
+		&subresource, 1, WW3D_FORMAT_UNKNOWN, true);
+#else
 	D3DPOOL d3dpool=(D3DPOOL)0;
 	switch (pool)
 	{
@@ -1253,6 +1849,7 @@ ZTextureClass::ZTextureClass
 		DX8TextureManagerClass::Add(track);
 	}
 	Initialized=true;
+#endif
 	IsProcedural=true;
 	IsReducible=false;
 
@@ -1266,7 +1863,11 @@ ZTextureClass::ZTextureClass
 */
 void ZTextureClass::Apply(unsigned int stage)
 {
+#if defined(_WIN64)
+	DX8Wrapper::Set_Native_Texture(stage, nullptr);
+#else
 	DX8Wrapper::Set_DX8_Texture(stage, Peek_D3D_Base_Texture());
+#endif
 }
 
 //**********************************************************************************************
@@ -1280,6 +1881,12 @@ void ZTextureClass::Apply_New_Surface
 	bool disable_auto_invalidation
 )
 {
+#if defined(_WIN64)
+	(void)d3d_texture;
+	(void)initialized;
+	(void)disable_auto_invalidation;
+	return;
+#else
 	IDirect3DBaseTexture8* d3d_tex=Peek_D3D_Base_Texture();
 
 	if (d3d_tex) d3d_tex->Release();
@@ -1303,6 +1910,7 @@ void ZTextureClass::Apply_New_Surface
 		Height=d3d_desc.Height;
 	}
 	surface->Release();
+#endif
 }
 
 //**********************************************************************************************
@@ -1311,6 +1919,10 @@ void ZTextureClass::Apply_New_Surface
 */
 IDirect3DSurface8* ZTextureClass::Get_D3D_Surface_Level(unsigned int level)
 {
+#if defined(_WIN64)
+	(void)level;
+	return nullptr;
+#else
 	if (!Peek_D3D_Texture())
 	{
 		WWASSERT_PRINT(0, "Get_D3D_Surface_Level: D3DTexture is null!");
@@ -1320,6 +1932,7 @@ IDirect3DSurface8* ZTextureClass::Get_D3D_Surface_Level(unsigned int level)
 	IDirect3DSurface8 *d3d_surface = nullptr;
 	DX8_ErrorCode(Peek_D3D_Texture()->GetSurfaceLevel(level, &d3d_surface));
 	return d3d_surface;
+#endif
 }
 
 //**********************************************************************************************
@@ -1328,6 +1941,11 @@ IDirect3DSurface8* ZTextureClass::Get_D3D_Surface_Level(unsigned int level)
 */
 unsigned ZTextureClass::Get_Texture_Memory_Usage() const
 {
+#if defined(_WIN64)
+	const size_t size = Get_Native_Texture_Byte_Count();
+	return size > static_cast<size_t>(UINT_MAX) ? UINT_MAX :
+		static_cast<unsigned int>(size);
+#else
 	int size=0;
 	if (!Peek_D3D_Texture()) return 0;
 	for (unsigned i=0;i<Peek_D3D_Texture()->GetLevelCount();++i)
@@ -1337,6 +1955,7 @@ unsigned ZTextureClass::Get_Texture_Memory_Usage() const
 		size+=desc.Size;
 	}
 	return size;
+#endif
 }
 
 
@@ -1372,6 +1991,14 @@ CubeTextureClass::CubeTextureClass
 	default : break;
 	}
 
+#if defined(_WIN64)
+	if (rendertarget || width != height ||
+		!Apply_Native_Empty_Texture(this, width, height, format,
+			mip_level_count, 6, false))
+	{
+		Initialized = Apply_Native_Missing_Texture();
+	}
+#else
 	D3DPOOL d3dpool=(D3DPOOL)0;
 	switch(pool)
 	{
@@ -1408,6 +2035,7 @@ CubeTextureClass::CubeTextureClass
 		);
 		DX8TextureManagerClass::Add(track);
 	}
+#endif
 	LastAccessed=WW3D::Get_Sync_Time();
 }
 
@@ -1599,6 +2227,12 @@ void CubeTextureClass::Apply_New_Surface
 	bool disable_auto_invalidation
 )
 {
+#if defined(_WIN64)
+	(void)d3d_texture;
+	(void)disable_auto_invalidation;
+	if (initialized && !Apply_Native_Missing_Texture()) Initialized = false;
+	return;
+#else
 	IDirect3DBaseTexture8* d3d_tex=Peek_D3D_Base_Texture();
 
 	if (d3d_tex) d3d_tex->Release();
@@ -1620,6 +2254,7 @@ void CubeTextureClass::Apply_New_Surface
 		Width=d3d_desc.Width;
 		Height=d3d_desc.Height;
 	}
+#endif
 }
 
 
@@ -1656,6 +2291,14 @@ VolumeTextureClass::VolumeTextureClass
 	default : break;
 	}
 
+#if defined(_WIN64)
+	// The neutral product renderer intentionally has no 3D-texture dimension.
+	// Publish a visible deterministic fallback instead of retaining a D3D8
+	// volume facade or leaving all subsequent textured draws broken.
+	(void)pool;
+	(void)rendertarget;
+	Initialized = Apply_Native_Missing_Texture();
+#else
 	D3DPOOL d3dpool=(D3DPOOL)0;
 	switch(pool)
 	{
@@ -1692,6 +2335,7 @@ VolumeTextureClass::VolumeTextureClass
 		);
 		DX8TextureManagerClass::Add(track);
 	}
+#endif
 	LastAccessed=WW3D::Get_Sync_Time();
 }
 
@@ -1887,6 +2531,12 @@ void VolumeTextureClass::Apply_New_Surface
 	bool disable_auto_invalidation
 )
 {
+#if defined(_WIN64)
+	(void)d3d_texture;
+	(void)disable_auto_invalidation;
+	if (initialized && !Apply_Native_Missing_Texture()) Initialized = false;
+	return;
+#else
 	IDirect3DBaseTexture8* d3d_tex=Peek_D3D_Base_Texture();
 
 	if (d3d_tex) d3d_tex->Release();
@@ -1910,4 +2560,5 @@ void VolumeTextureClass::Apply_New_Surface
 		Height=d3d_desc.Height;
 		Depth=d3d_desc.Depth;
 	}
+#endif
 }

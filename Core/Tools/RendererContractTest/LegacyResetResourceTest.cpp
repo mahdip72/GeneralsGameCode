@@ -226,19 +226,52 @@ class TextureBaseClass
 public:
 	IDirect3DBaseTexture8 *D3DTexture;
 	unsigned LastAccessed;
-	TextureBaseClass() : D3DTexture(nullptr), LastAccessed(7) {}
+	bool Initialized;
+	bool NativeTexturePresent;
+	bool NativeMissingResult;
+	bool InitializedAtNativeRelease;
+	bool InitializedAtNativeMissing;
+	int NativeLifecycleSequence;
+	int NativeReleaseOrder;
+	int NativeMissingOrder;
+	int NativeReleaseCalls;
+	int NativeMissingCalls;
+	TextureBaseClass() : D3DTexture(nullptr), LastAccessed(7),
+		Initialized(false), NativeTexturePresent(false),
+		NativeMissingResult(true), InitializedAtNativeRelease(false),
+		InitializedAtNativeMissing(false), NativeLifecycleSequence(0),
+		NativeReleaseOrder(0), NativeMissingOrder(0), NativeReleaseCalls(0),
+		NativeMissingCalls(0) {}
 	void Release_D3D_Texture();
 	void Set_D3D_Base_Texture(IDirect3DBaseTexture8 *);
+	void Release_Native_Texture()
+	{
+		++NativeReleaseCalls;
+		NativeReleaseOrder = ++NativeLifecycleSequence;
+		InitializedAtNativeRelease = Initialized;
+		NativeTexturePresent = false;
+	}
+	bool Apply_Native_Missing_Texture()
+	{
+		++NativeMissingCalls;
+		NativeMissingOrder = ++NativeLifecycleSequence;
+		InitializedAtNativeMissing = Initialized;
+		if (NativeMissingResult)
+		{
+			NativeTexturePresent = true;
+			Initialized = true;
+		}
+		return NativeMissingResult;
+	}
 };
 class TextureClass : public TextureBaseClass
 {
 public:
-	bool Initialized;
 	unsigned InactivationTime;
 	unsigned TextureFormat;
 	unsigned Width;
 	unsigned Height;
-	TextureClass() : Initialized(false), InactivationTime(100),
+	TextureClass() : InactivationTime(100),
 		TextureFormat(0), Width(8), Height(4) {}
 	IDirect3DTexture8 *Peek_D3D_Texture()
 	{
@@ -388,6 +421,58 @@ int testTextureSuccess()
 		"null publication retains the existing explicit-clear contract");
 	return result;
 }
+
+#if defined(_WIN64)
+int testNativeTexturePublicationLifecycle()
+{
+	int result = 0;
+	IDirect3DTexture8 incoming;
+
+	TextureClass cleared;
+	cleared.NativeTexturePresent = true;
+	cleared.Initialized = true;
+	cleared.Apply_New_Surface(nullptr, true, true);
+	result |= check(cleared.NativeReleaseCalls == 1 &&
+		cleared.NativeMissingCalls == 0 && cleared.NativeReleaseOrder == 1 &&
+		cleared.InitializedAtNativeRelease &&
+		!cleared.NativeTexturePresent && !cleared.Initialized,
+		"x64 null publication retires native ownership before clearing initialization");
+	result |= check(cleared.D3DTexture == nullptr,
+		"x64 null publication never creates or retains a D3D8 texture");
+
+	TextureClass published;
+	published.Apply_New_Surface(&incoming, true, true);
+	result |= check(published.NativeReleaseCalls == 0 &&
+		published.NativeMissingCalls == 1 && published.NativeMissingOrder == 1 &&
+		!published.InitializedAtNativeMissing &&
+		published.NativeTexturePresent && published.Initialized,
+		"x64 residual raw publication deterministically publishes the native missing texture");
+	result |= check(published.D3DTexture == nullptr && incoming.references == 1 &&
+		incoming.surface.references == 1 && incoming.surface.descCalls == 0 &&
+		published.InactivationTime == 100,
+		"x64 fallback neither retains nor queries the raw candidate and preserves invalidation policy");
+
+	TextureClass deferred;
+	deferred.Apply_New_Surface(&incoming, false, true);
+	result |= check(deferred.NativeMissingCalls == 1 &&
+		deferred.NativeMissingOrder == 1 &&
+		!deferred.InitializedAtNativeMissing && deferred.NativeTexturePresent &&
+		!deferred.Initialized,
+		"x64 deferred publication installs deterministic fallback content before leaving initialization pending");
+
+	TextureClass failed;
+	failed.NativeTexturePresent = true;
+	failed.Initialized = true;
+	failed.NativeMissingResult = false;
+	failed.Apply_New_Surface(&incoming, true, true);
+	result |= check(failed.NativeMissingCalls == 1 &&
+		failed.NativeReleaseCalls == 0 && failed.InitializedAtNativeMissing &&
+		failed.NativeTexturePresent && !failed.Initialized &&
+		failed.D3DTexture == nullptr,
+		"x64 fallback failure preserves prior native ownership but fails initialization closed");
+	return result;
+}
+#endif
 }
 
 int TestLegacyResetResources()
@@ -402,11 +487,15 @@ int TestLegacyResetResources()
 		result |= testReset(backend != 0, false, false, false, false);
 	}
 	result |= testResetPreflight();
+#if defined(_WIN64)
+	result |= testNativeTexturePublicationLifecycle();
+#else
 	for (int failure = 0; failure != 4; ++failure)
 	{
 		result |= testTextureFailure(failure, false);
 		result |= testTextureFailure(failure, true);
 	}
 	result |= testTextureSuccess();
+#endif
 	return result;
 }

@@ -16,6 +16,8 @@ enum RenderBackend
 
 const char *RenderBackendName(RenderBackend backend);
 bool ParseRenderBackend(const char *name, RenderBackend *backend);
+RenderBackend DefaultRenderBackend();
+bool IsRenderBackendSupported(RenderBackend backend);
 void SetRequestedRenderBackend(RenderBackend backend);
 RenderBackend RequestedRenderBackend();
 
@@ -185,6 +187,40 @@ enum RenderResult
 	RENDER_RESULT_OUT_OF_MEMORY,
 	RENDER_RESULT_DEVICE_REMOVED,
 	RENDER_RESULT_FAILED
+};
+
+// Validates the complete neutral texture contract before caller-owned bytes are
+// copied or a backend allocation is attempted.  A zero maximumUploadBytes
+// disables the byte budget; uploadBytes is cleared on every failure.
+RenderResult ValidateTextureUpload(const TextureDescriptor &descriptor,
+	const TextureSubresourceData *data, unsigned int dataCount,
+	bool dataRequired, size_t maximumUploadBytes, size_t *uploadBytes);
+
+// Explicit deterministic failure points for focused backend ownership tests.
+// Production callers never need to configure these; unsupported backends retain
+// the default fail-closed implementation on IRenderDevice.
+enum RenderResourceFaultPoint
+{
+	RENDER_RESOURCE_FAULT_NONE,
+	RENDER_RESOURCE_FAULT_TEXTURE_ALLOCATION,
+	RENDER_RESOURCE_FAULT_TEXTURE_VIEW,
+	RENDER_RESOURCE_FAULT_TEXTURE_SHADOW,
+	RENDER_RESOURCE_FAULT_TEXTURE_RECOVERY,
+	RENDER_RESOURCE_FAULT_TEXTURE_DESTRUCTION
+};
+
+struct RenderResourceStatistics
+{
+	RenderResourceStatistics();
+
+	unsigned int liveHandles;
+	unsigned int bufferCount;
+	unsigned int textureCount;
+	unsigned int nativeResourceCount;
+	unsigned int shaderResourceViewCount;
+	unsigned int renderTargetViewCount;
+	unsigned int depthStencilViewCount;
+	size_t recoveryShadowBytes;
 };
 
 struct RenderBackBufferInfo
@@ -562,6 +598,11 @@ public:
 		size_t destinationBytes, size_t destinationRowPitch,
 		RenderFormat *format) = 0;
 	virtual RenderResult getDebugValidationErrorCount(unsigned int *count) const = 0;
+	virtual RenderResult configureResourceFaultInjection(
+		RenderResourceFaultPoint point, unsigned int failOnInvocation,
+		RenderResult result);
+	virtual RenderResult getDebugResourceStatistics(
+		RenderResourceStatistics *statistics) const;
 	// Requests the D3D11 debug-layer live-object report while the device is
 	// still alive. The report is emitted through the normal graphics-debug
 	// output channel; retail devices without the optional SDK layer return

@@ -55,12 +55,16 @@ private:
 
 	RenderResult AttachBackend(IRenderDevice *device, IRenderContext *context);
 	RenderResult ReplaceContext(IRenderContext *context);
+	RenderResult AdvanceBufferEpoch();
 	RenderResult DetachBackend(bool allowBoundResourceTables = false);
 	RenderResult RegisterResourceTable();
 	void UnregisterResourceTable();
+	void MarkBackendTerminal();
+	bool IsBackendTerminal() const;
 	bool IsOperational() const;
 	unsigned int Generation() const;
 	unsigned int BackendEpoch() const;
+	unsigned int BufferEpoch() const;
 	IRenderDevice *Device() const;
 	IRenderContext *Context() const;
 
@@ -70,6 +74,8 @@ private:
 	IRenderContext *m_context;
 	unsigned int m_generation;
 	unsigned int m_backendEpoch;
+	unsigned int m_bufferEpoch;
+	volatile long m_backendTerminal;
 	volatile long m_boundResourceTables;
 };
 }

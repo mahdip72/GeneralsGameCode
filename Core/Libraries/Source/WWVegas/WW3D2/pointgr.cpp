@@ -952,12 +952,18 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 	{
 		delta=MIN(vnum-current,MAX_VB_SIZE);
 		DynamicVBAccessClass PointVerts (sort ? BUFFER_TYPE_DYNAMIC_SORTING : BUFFER_TYPE_DYNAMIC_DX8, dynamic_fvf_type, delta);
+		if (!PointVerts.Is_Valid()) {
+			break;
+		}
 
 		// Copy in the data to the VB
 		{
 			DynamicVBAccessClass::WriteLockClass Lock(&PointVerts);
 			int i;
 			unsigned char *vb=(unsigned char*)Lock.Get_Formatted_Vertex_Array();
+			if (!Lock.Is_Locked() || vb == nullptr) {
+				break;
+			}
 			const FVFInfoClass& fvfinfo=PointVerts.FVF_Info();
 
 			for (i = current; i < current + delta; i++)
@@ -979,10 +985,15 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 				*(Vector2*)(vb+fvfinfo.Get_Tex_Offset(1))=Vector2(0.0f,0.0f);
 				vb+=fvfinfo.Get_FVF_Size();
 			}
+			if (!Lock.Commit()) {
+				break;
+			}
 		}
 
 		DX8Wrapper::Set_Index_Buffer (indexbuffer, 0);
-		DX8Wrapper::Set_Vertex_Buffer (PointVerts);
+		if (!DX8Wrapper::Set_Vertex_Buffer (PointVerts)) {
+			break;
+		}
 
 		if ( sort )
 		{
@@ -1447,7 +1458,7 @@ void PointGroupClass::Update_Arrays(
  * HISTORY:                                                               *
  *   06/28/2000 NH  : Created.                                            *
  *========================================================================*/
-void PointGroupClass::_Init()
+bool PointGroupClass::_Init()
 {
 	int i, j;
 
@@ -1512,6 +1523,11 @@ void PointGroupClass::_Init()
 
 		Vector2 *tri_table = _TriVertexUVFrameTable[i] = W3DNEWARRAY Vector2[count * 3];
 		Vector2 *quad_table = _QuadVertexUVFrameTable[i] = W3DNEWARRAY Vector2[count * 4];
+		if (tri_table == nullptr || quad_table == nullptr)
+		{
+			_Shutdown();
+			return false;
+		}
 
 		Vector2 corner(0.0f, 0.0f);
 		float scale = 1.0f / (float)rows;
@@ -1539,21 +1555,44 @@ void PointGroupClass::_Init()
 
 	// Create the IBs
 	Tris=NEW_REF(DX8IndexBufferClass,(MAX_TRI_IB_SIZE));
-	Quads=NEW_REF(DX8IndexBufferClass,(MAX_QUAD_IB_SIZE));
-	SortingTris=NEW_REF(SortingIndexBufferClass,(MAX_TRI_IB_SIZE));
-	SortingQuads=NEW_REF(SortingIndexBufferClass,(MAX_QUAD_IB_SIZE));
+	if (Tris == nullptr || !Tris->Is_Valid())
+	{
+		_Shutdown();
+		return false;
+	}
 
 	// Fill up the IBs
 	{
 		DX8IndexBufferClass::WriteLockClass locktris(Tris);
 		unsigned short *ib=locktris.Get_Index_Array();
+		if (!locktris.Is_Locked() || ib == nullptr)
+		{
+			_Shutdown();
+			return false;
+		}
 		for (i=0; i<MAX_TRI_IB_SIZE; i++) ib[i]=(unsigned short) i;
+		if (!locktris.Commit())
+		{
+			_Shutdown();
+			return false;
+		}
 	}
 
+	Quads=NEW_REF(DX8IndexBufferClass,(MAX_QUAD_IB_SIZE));
+	if (Quads == nullptr || !Quads->Is_Valid())
+	{
+		_Shutdown();
+		return false;
+	}
 	{
 		unsigned short vert=0;
 		DX8IndexBufferClass::WriteLockClass lockquads(Quads);
 		unsigned short *ib=lockquads.Get_Index_Array();
+		if (!lockquads.Is_Locked() || ib == nullptr)
+		{
+			_Shutdown();
+			return false;
+		}
 		vert=0;
 		for (i=0; i<MAX_QUAD_IB_SIZE; i+=6)
 		{
@@ -1568,8 +1607,20 @@ void PointGroupClass::_Init()
 			ib[i+5]=vert;
 			vert+=4;
 		}
+		if (!lockquads.Commit())
+		{
+			_Shutdown();
+			return false;
+		}
 	}
 
+	SortingTris=NEW_REF(SortingIndexBufferClass,(MAX_TRI_IB_SIZE));
+	SortingQuads=NEW_REF(SortingIndexBufferClass,(MAX_QUAD_IB_SIZE));
+	if (SortingTris == nullptr || SortingQuads == nullptr)
+	{
+		_Shutdown();
+		return false;
+	}
 	{
 		SortingIndexBufferClass::WriteLockClass locktris(SortingTris);
 		unsigned short *ib=locktris.Get_Index_Array();
@@ -1596,6 +1647,12 @@ void PointGroupClass::_Init()
 	}
 
 	PointMaterial=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
+	if (PointMaterial == nullptr)
+	{
+		_Shutdown();
+		return false;
+	}
+	return true;
 }
 
 
@@ -1616,6 +1673,8 @@ void PointGroupClass::_Shutdown()
 	for (int i = 0; i < 5; i++) {
 		delete [] _TriVertexUVFrameTable[i];
 		delete [] _QuadVertexUVFrameTable[i];
+		_TriVertexUVFrameTable[i] = nullptr;
+		_QuadVertexUVFrameTable[i] = nullptr;
 	}
 	REF_PTR_RELEASE(PointMaterial);
 	REF_PTR_RELEASE(SortingQuads);
@@ -1875,12 +1934,18 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 		{
 			delta=MIN(vnum-current,MAX_VB_SIZE);
 			DynamicVBAccessClass PointVerts (sort ? BUFFER_TYPE_DYNAMIC_SORTING : BUFFER_TYPE_DYNAMIC_DX8, dynamic_fvf_type, delta);
+			if (!PointVerts.Is_Valid()) {
+				break;
+			}
 
 			// Copy in the data to the VB
 			{
 				DynamicVBAccessClass::WriteLockClass Lock(&PointVerts);
 				int i;
 				unsigned char *vb=(unsigned char*)Lock.Get_Formatted_Vertex_Array();
+				if (!Lock.Is_Locked() || vb == nullptr) {
+					break;
+				}
 				const FVFInfoClass& fvfinfo = PointVerts.FVF_Info();
 
 
@@ -1904,10 +1969,15 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 					*(Vector2*)(vb+fvfinfo.Get_Tex_Offset(1))=Vector2(0.0f,0.0f);
 					vb+=fvfinfo.Get_FVF_Size();
 				}
+				if (!Lock.Commit()) {
+					break;
+				}
 			}
 
 			DX8Wrapper::Set_Index_Buffer (indexbuffer, 0);
-			DX8Wrapper::Set_Vertex_Buffer (PointVerts);
+			if (!DX8Wrapper::Set_Vertex_Buffer (PointVerts)) {
+				break;
+			}
 
 			/// @todo lorenzen sez: precompute these params, above
 

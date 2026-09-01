@@ -1133,11 +1133,21 @@ void SegLineRendererClass::Render
 		*/
 
 		DynamicVBAccessClass Verts((sorting?BUFFER_TYPE_DYNAMIC_SORTING:BUFFER_TYPE_DYNAMIC_DX8),dynamic_fvf_type,vnum);
+		if (!Verts.Is_Valid()) {
+			REF_PTR_RELEASE(mat);
+			DX8Wrapper::Set_Transform(D3DTS_VIEW,view);
+			return;
+		}
 		// Copy in the data to the  VB
 		{
 			DynamicVBAccessClass::WriteLockClass Lock(&Verts);
 			unsigned int i;
 			unsigned char *vb=(unsigned char*)Lock.Get_Formatted_Vertex_Array();
+			if (!Lock.Is_Locked() || vb == nullptr) {
+				REF_PTR_RELEASE(mat);
+				DX8Wrapper::Set_Transform(D3DTS_VIEW,view);
+				return;
+			}
 			const FVFInfoClass& fvfinfo=Verts.FVF_Info();
 
 			const unsigned int verticesOffset = fvfinfo.Get_Location_Offset();
@@ -1158,13 +1168,28 @@ void SegLineRendererClass::Render
 				texture->V = vArray[i].v1;
 				vb += vbSize;
 			}
+			if (!Lock.Commit()) {
+				REF_PTR_RELEASE(mat);
+				DX8Wrapper::Set_Transform(D3DTS_VIEW,view);
+				return;
+			}
 		}
 
 		DynamicIBAccessClass ib_access((sorting?BUFFER_TYPE_DYNAMIC_SORTING:BUFFER_TYPE_DYNAMIC_DX8),tidx*3);
+		if (!ib_access.Is_Valid()) {
+			REF_PTR_RELEASE(mat);
+			DX8Wrapper::Set_Transform(D3DTS_VIEW,view);
+			return;
+		}
 		{
 			unsigned int i;
 			DynamicIBAccessClass::WriteLockClass lock(&ib_access);
 			unsigned short* inds=lock.Get_Index_Array();
+			if (!lock.Is_Locked() || inds == nullptr) {
+				REF_PTR_RELEASE(mat);
+				DX8Wrapper::Set_Transform(D3DTS_VIEW,view);
+				return;
+			}
 
 			for (i=0; i<tidx; i++)
 			{
@@ -1172,10 +1197,19 @@ void SegLineRendererClass::Render
 				*inds++=v_index_array[i].J;
 				*inds++=v_index_array[i].K;
 			}
+			if (!lock.Commit()) {
+				REF_PTR_RELEASE(mat);
+				DX8Wrapper::Set_Transform(D3DTS_VIEW,view);
+				return;
+			}
 		}
 
-		DX8Wrapper::Set_Index_Buffer(ib_access,0);
-		DX8Wrapper::Set_Vertex_Buffer(Verts);
+		if (!DX8Wrapper::Set_Index_Buffer(ib_access,0) ||
+			!DX8Wrapper::Set_Vertex_Buffer(Verts)) {
+			REF_PTR_RELEASE(mat);
+			DX8Wrapper::Set_Transform(D3DTS_VIEW,view);
+			return;
+		}
 		DX8Wrapper::Set_Material(mat);
 		DX8Wrapper::Set_Texture(0,Texture);
 		DX8Wrapper::Set_Shader(shader);

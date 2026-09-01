@@ -46,6 +46,24 @@ bool nearlyEqual(float left, float right, float epsilon = 0.00001f)
 int testBackendNames()
 {
 	int result = 0;
+	result |= check(rts::render::RequestedRenderBackend() ==
+		rts::render::DefaultRenderBackend(),
+		"the requested renderer starts at the platform default");
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	result |= check(rts::render::DefaultRenderBackend() ==
+		rts::render::RENDER_BACKEND_D3D11 &&
+		rts::render::IsRenderBackendSupported(
+			rts::render::RENDER_BACKEND_D3D11) &&
+		!rts::render::IsRenderBackendSupported(
+			rts::render::RENDER_BACKEND_DX8),
+		"native x64 defaults to D3D11 and rejects the DX8 command-line backend");
+#else
+	result |= check(rts::render::DefaultRenderBackend() ==
+		rts::render::RENDER_BACKEND_DX8 &&
+		rts::render::IsRenderBackendSupported(
+			rts::render::RENDER_BACKEND_DX8),
+		"legacy Win32 retains the DX8 renderer default");
+#endif
 	rts::render::RenderBackend backend = rts::render::RENDER_BACKEND_D3D11;
 	result |= check(rts::render::ParseRenderBackend("dx8", &backend) &&
 		backend == rts::render::RENDER_BACKEND_DX8,
@@ -68,6 +86,14 @@ int testBackendNames()
 		rts::render::RENDER_BACKEND_D3D11,
 		"startup command-line selection reaches the renderer boundary");
 	rts::render::SetRequestedRenderBackend(rts::render::RENDER_BACKEND_DX8);
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	result |= check(rts::render::RequestedRenderBackend() ==
+		rts::render::RENDER_BACKEND_DX8 &&
+		!rts::render::IsRenderBackendSupported(
+			rts::render::RequestedRenderBackend()),
+		"unsupported native command-line selection remains observable for fail-closed startup");
+#endif
+	rts::render::SetRequestedRenderBackend(rts::render::DefaultRenderBackend());
 	return result;
 }
 
@@ -4537,9 +4563,73 @@ int testD3D11HeadlessDevice()
 	result |= check(device->createBuffer(descriptor, 0, 0, &buffer) ==
 		rts::render::RENDER_RESULT_OK && buffer.isValid(),
 		"D3D11 dynamic buffer receives a logical handle");
+	rts::render::RenderResourceStatistics bufferStatistics;
+	result |= check(device->getDebugResourceStatistics(&bufferStatistics) ==
+		rts::render::RENDER_RESULT_OK && bufferStatistics.bufferCount == 1 &&
+		bufferStatistics.recoveryShadowBytes == 0,
+		"D3D11 buffer ownership retains descriptors without a persistent CPU shadow");
+	rts::render::BufferDescriptor immutableRecoveryDescriptor;
+	immutableRecoveryDescriptor.byteCount = 16;
+	immutableRecoveryDescriptor.stride = 4;
+	unsigned int immutableRecoveryBytes[4] = { 7, 8, 9, 10 };
+	rts::render::GpuHandle immutableRecoveryBuffer;
+	result |= check(device->createBuffer(immutableRecoveryDescriptor,
+		immutableRecoveryBytes, sizeof(immutableRecoveryBytes),
+		&immutableRecoveryBuffer) == rts::render::RENDER_RESULT_OK &&
+		device->getDebugResourceStatistics(&bufferStatistics) ==
+			rts::render::RENDER_RESULT_OK && bufferStatistics.bufferCount == 2 &&
+		bufferStatistics.recoveryShadowBytes == sizeof(immutableRecoveryBytes),
+		"only immutable buffer creation sources contribute recovery bytes");
 	result |= check(device->recoverDevice() ==
 		rts::render::RENDER_RESULT_OK && device->isOperational(),
 		"D3D11 recovery recreates live logical resources without changing handles");
+	result |= check(device->immediateContext()->beginFrame() ==
+		rts::render::RENDER_RESULT_OK &&
+		device->immediateContext()->setVertexBuffer(immutableRecoveryBuffer,
+			immutableRecoveryDescriptor.stride, 0) ==
+			rts::render::RENDER_RESULT_OK &&
+		device->immediateContext()->setVertexBuffer(buffer, descriptor.stride, 0) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+		device->immediateContext()->endFrame() ==
+			rts::render::RENDER_RESULT_OK &&
+		device->destroyResource(immutableRecoveryBuffer),
+		"a recovered descriptor-only buffer fails closed until owner republish");
+	rts::render::BufferDescriptor largerMutableDescriptor;
+	largerMutableDescriptor.byteCount = 64;
+	largerMutableDescriptor.stride = 16;
+	largerMutableDescriptor.usage = rts::render::RENDER_USAGE_DYNAMIC;
+	rts::render::GpuHandle largerMutableBuffer;
+	result |= check(device->createBuffer(largerMutableDescriptor, 0, 0,
+		&largerMutableBuffer) == rts::render::RENDER_RESULT_OK &&
+		largerMutableBuffer.index() == immutableRecoveryBuffer.index() &&
+		largerMutableBuffer.generation() != immutableRecoveryBuffer.generation() &&
+		device->getDebugResourceStatistics(&bufferStatistics) ==
+			rts::render::RENDER_RESULT_OK && bufferStatistics.bufferCount == 2 &&
+		bufferStatistics.recoveryShadowBytes == 0,
+		"destroyed immutable recovery bytes do not survive slot reuse");
+	result |= check(device->recoverDevice() ==
+		rts::render::RENDER_RESULT_OK && device->isOperational() &&
+		device->immediateContext()->beginFrame() ==
+			rts::render::RENDER_RESULT_OK &&
+		device->immediateContext()->setVertexBuffer(largerMutableBuffer,
+			largerMutableDescriptor.stride, 0) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+		device->immediateContext()->endFrame() ==
+			rts::render::RENDER_RESULT_OK,
+		"reused mutable buffer recovers only its descriptor shell");
+	unsigned int largerMutableBytes[16] = { 0 };
+	result |= check(device->updateBufferResource(largerMutableBuffer,
+		largerMutableBytes, sizeof(largerMutableBytes), 0,
+		rts::render::RENDER_BUFFER_UPDATE_DISCARD) ==
+			rts::render::RENDER_RESULT_OK &&
+		device->immediateContext()->beginFrame() ==
+			rts::render::RENDER_RESULT_OK &&
+		device->immediateContext()->setVertexBuffer(largerMutableBuffer,
+			largerMutableDescriptor.stride, 0) == rts::render::RENDER_RESULT_OK &&
+		device->immediateContext()->endFrame() ==
+			rts::render::RENDER_RESULT_OK &&
+		device->destroyResource(largerMutableBuffer),
+		"reused mutable buffer becomes bindable only after full republish");
 	unsigned int values[4] = { 1, 2, 3, 4 };
 	result |= check(device->immediateContext()->beginFrame() ==
 		rts::render::RENDER_RESULT_OK &&
@@ -4558,6 +4648,10 @@ int testD3D11HeadlessDevice()
 		device->immediateContext()->endFrame() ==
 			rts::render::RENDER_RESULT_OK,
 		"recreated dynamic buffers retain their logical handle and update path");
+	result |= check(device->getDebugResourceStatistics(&bufferStatistics) ==
+		rts::render::RENDER_RESULT_OK && bufferStatistics.bufferCount == 1 &&
+		bufferStatistics.recoveryShadowBytes == 0,
+		"buffer recovery recreates descriptor shells without allocating CPU bytes");
 	unsigned int rangeValues[4] = { 10, 20, 30, 40 };
 	rts::render::IRenderContext *rangeContext = device->immediateContext();
 	result |= check(rangeContext->updateBuffer(buffer, rangeValues,

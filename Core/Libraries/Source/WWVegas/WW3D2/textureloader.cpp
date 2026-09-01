@@ -39,6 +39,10 @@
  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 #include "textureloader.h"
+#if defined(_WIN64)
+#include "nativew3dsampledtexture.h"
+#include "Renderer/NativeW3DResources.h"
+#endif
 #include "Lib/JobSystem.h"
 #include "Lib/PipelineExecutionPolicy.h"
 #if !defined(_MSC_VER) || _MSC_VER >= 1300
@@ -371,6 +375,13 @@ IDirect3DTexture8* Load_Compressed_Texture(
 	MipCountType mip_level_count,
 	WW3DFormat dest_format)
 {
+#if defined(_WIN64)
+	(void)filename;
+	(void)reduction_factor;
+	(void)mip_level_count;
+	(void)dest_format;
+	return nullptr;
+#else
 	// If DDS file isn't available, use TGA file to convert to DDS.
 
 	DDSFileClass dds_file(filename,reduction_factor);
@@ -411,6 +422,7 @@ IDirect3DTexture8* Load_Compressed_Texture(
 		d3d_surface->Release();
 	}
 	return d3d_texture;
+#endif
 }
 
 static bool Is_Format_Compressed(WW3DFormat texture_format,bool allow_compression)
@@ -589,6 +601,11 @@ void TextureLoader::Validate_Texture_Size
 IDirect3DTexture8* TextureLoader::Load_Thumbnail(const StringClass& filename, const Vector3& hsv_shift)//,WW3DFormat texture_format)
 {
 	WWASSERT(Is_DX8_Thread());
+#if defined(_WIN64)
+	(void)filename;
+	(void)hsv_shift;
+	return nullptr;
+#else
 
 	ThumbnailClass* thumb=nullptr;
 	thumb=ThumbnailManagerClass::Peek_Thumbnail_Instance_From_Any_Manager(filename);
@@ -702,6 +719,7 @@ IDirect3DTexture8* TextureLoader::Load_Thumbnail(const StringClass& filename, co
 	WWDEBUG_SAY(("Created non-managed texture (%s)",filename));
 	return d3d_texture;
 #endif
+#endif
 }
 
 
@@ -718,6 +736,12 @@ IDirect3DSurface8* TextureLoader::Load_Surface_Immediate(
 	bool allow_compression)
 {
 	WWASSERT(Is_DX8_Thread());
+#if defined(_WIN64)
+	(void)filename;
+	(void)texture_format;
+	(void)allow_compression;
+	return nullptr;
+#else
 
 	bool compressed=Is_Format_Compressed(texture_format,allow_compression);
 
@@ -836,11 +860,21 @@ IDirect3DSurface8* TextureLoader::Load_Surface_Immediate(
 	delete[] converted_surface;
 
 	return d3d_surface;
+#endif
 }
 
 
 void TextureLoader::Request_Thumbnail(TextureBaseClass *tc)
 {
+#if defined(_WIN64)
+	// The native product has no D3D8 thumbnail object. A request promotes the
+	// same prepared-mip pipeline used by the full typed texture publication.
+	if (tc == nullptr) return;
+	rts::render::NativeW3DTextureHandle native_handle;
+	if (!tc->Acquire_Native_Texture(&native_handle))
+		Request_Foreground_Loading(tc);
+	return;
+#else
 	// Grab the foreground lock. This prevents the foreground thread
 	// from retiring any tasks related to this texture. It also
 	// serializes calls to Request_Thumbnail from multiple threads.
@@ -880,6 +914,7 @@ void TextureLoader::Request_Thumbnail(TextureBaseClass *tc)
 			_ForegroundQueue.Publish_Thumbnail(task, load_task);
 		}
 	}
+#endif
 }
 
 
@@ -1222,6 +1257,10 @@ void TextureLoader::Load_Thumbnail(TextureBaseClass *tc)
 {
 	// All D3D operations must run from main thread
 	WWASSERT(Is_DX8_Thread());
+#if defined(_WIN64)
+	if (tc != nullptr && !tc->Is_Initialized()) Request_Foreground_Loading(tc);
+	return;
+#else
 
 	// load thumbnail texture
 	IDirect3DTexture8 *d3d_texture = Load_Thumbnail(tc->Get_Full_Path(),tc->Get_HSV_Shift());
@@ -1235,6 +1274,7 @@ void TextureLoader::Load_Thumbnail(TextureBaseClass *tc)
 	// release our reference to thumbnail texture
 	d3d_texture->Release();
 	d3d_texture = nullptr;
+#endif
 }
 
 
@@ -1675,6 +1715,16 @@ void TextureLoadTaskClass::End_Load()
 {
 	WWASSERT(TextureLoader::Is_DX8_Thread());
 
+#if defined(_WIN64)
+	if (LoadSucceeded && Publish_Native_Prepared_Texture())
+	{
+		PROFILER_SECTION_NAME("Texture.Upload.Native");
+	}
+	else
+	{
+		Apply_Missing_Texture();
+	}
+#else
 	if (LoadSucceeded && Create_D3D_Texture())
 	{
 		PROFILER_SECTION_NAME("Texture.Upload");
@@ -1697,6 +1747,7 @@ void TextureLoadTaskClass::End_Load()
 	{
 		Apply_Missing_Texture();
 	}
+#endif
 
 	Release_Prepared_Surfaces();
 	delete DDSFile;
@@ -1739,13 +1790,25 @@ void TextureLoadTaskClass::Apply_Missing_Texture()
 	WWASSERT(TextureLoader::Is_DX8_Thread());
 	WWASSERT(!D3DTexture);
 
+#if defined(_WIN64)
+	if (!Texture->Apply_Native_Missing_Texture())
+	{
+		Texture->Apply_New_Surface(nullptr, false);
+	}
+#else
 	D3DTexture = MissingTexture::_Get_Missing_Texture();
 	Apply(true);
+#endif
 }
 
 
 void TextureLoadTaskClass::Apply(bool initialize)
 {
+#if defined(_WIN64)
+	(void)initialize;
+	WWASSERT(!D3DTexture);
+	return;
+#else
 	WWASSERT(D3DTexture);
 
 	// Verify that none of the mip levels are locked
@@ -1757,6 +1820,7 @@ void TextureLoadTaskClass::Apply(bool initialize)
 
 	D3DTexture->Release();
 	D3DTexture = nullptr;
+#endif
 }
 
 
@@ -2600,6 +2664,34 @@ bool TextureLoadTaskClass::Upload_Prepared_Surfaces()
 	return true;
 }
 
+#if defined(_WIN64)
+bool TextureLoadTaskClass::Publish_Native_Prepared_Texture()
+{
+	if (Texture == nullptr || MipLevelCount == 0 ||
+		MipLevelCount > MIP_LEVELS_MAX) return false;
+	rts::render::NativeW3DSampledTextureMipView views[MIP_LEVELS_MAX];
+	for (unsigned int level = 0; level < MipLevelCount; ++level)
+	{
+		const TextureMipBuffer &source =
+#if RTS_ASYNC_RESOURCE_IO
+			ResourceResult != nullptr ?
+				static_cast<TextureResourceDecode *>(ResourceResult)->Surface[0][level] :
+#endif
+			PreparedSurface[level];
+		if (source.data() == nullptr || source.layout().dataSize == 0 ||
+			source.layout().rowPitch == 0) return false;
+		views[level].data = source.data();
+		views[level].dataSize = source.layout().dataSize;
+		views[level].rowPitch = source.layout().rowPitch;
+	}
+	rts::render::NativeW3DSampledTextureUpload upload;
+	if (!upload.Prepare(Format, Width, Height, MipLevelCount, 1, views,
+		MipLevelCount)) return false;
+	return Texture->Apply_Native_Texture(upload.Descriptor(),
+		upload.Subresources(), upload.SubresourceCount(), Format, true);
+}
+#endif
+
 
 void TextureLoadTaskClass::Release_Prepared_Surfaces()
 {
@@ -3300,6 +3392,38 @@ bool CubeTextureLoadTaskClass::Upload_Prepared_Surfaces()
 	return true;
 }
 
+#if defined(_WIN64)
+bool CubeTextureLoadTaskClass::Publish_Native_Prepared_Texture()
+{
+	if (Texture == nullptr || Width == 0 || Width != Height ||
+		MipLevelCount == 0 || MipLevelCount > MIP_LEVELS_MAX) return false;
+	rts::render::NativeW3DSampledTextureMipView views[6 * MIP_LEVELS_MAX];
+	for (unsigned int face = 0; face < 6; ++face)
+	{
+		for (unsigned int level = 0; level < MipLevelCount; ++level)
+		{
+			const unsigned int index = face * MipLevelCount + level;
+			const TextureMipBuffer &source =
+#if RTS_ASYNC_RESOURCE_IO
+				ResourceResult != nullptr ?
+					static_cast<TextureResourceDecode *>(ResourceResult)->Surface[face][level] :
+#endif
+				PreparedCubeSurface[face][level];
+			if (source.data() == nullptr || source.layout().dataSize == 0 ||
+				source.layout().rowPitch == 0) return false;
+			views[index].data = source.data();
+			views[index].dataSize = source.layout().dataSize;
+			views[index].rowPitch = source.layout().rowPitch;
+		}
+	}
+	rts::render::NativeW3DSampledTextureUpload upload;
+	if (!upload.Prepare(Format, Width, Height, MipLevelCount, 6, views,
+		6 * MipLevelCount)) return false;
+	return Texture->Apply_Native_Texture(upload.Descriptor(),
+		upload.Subresources(), upload.SubresourceCount(), Format, true);
+}
+#endif
+
 
 void CubeTextureLoadTaskClass::Release_Prepared_Surfaces()
 {
@@ -3358,3 +3482,12 @@ bool VolumeTextureLoadTaskClass::Begin_Uncompressed_Load()
 	// The legacy loader has no defined TGA-to-volume source layout.
 	return false;
 }
+
+#if defined(_WIN64)
+bool VolumeTextureLoadTaskClass::Publish_Native_Prepared_Texture()
+{
+	// The neutral renderer does not expose a volume-texture descriptor. Never
+	// reinterpret a volume load as a sampleable 2D texture on the x64 product.
+	return false;
+}
+#endif

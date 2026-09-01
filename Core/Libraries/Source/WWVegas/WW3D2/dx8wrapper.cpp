@@ -73,6 +73,7 @@
 #include "light.h"
 #include "assetmgr.h"
 #include "textureloader.h"
+#include "texture.h"
 #include "missingtexture.h"
 #include "WWLib/thread.h"
 #include "WWMath/pot.h"
@@ -87,8 +88,12 @@
 #include "legacytexturecompat.h"
 #include "WWLib/bound.h"
 #include "WWLib/DbgHelpGuard.h"
+#include "Renderer/NativeProductDeviceLifecycle.h"
 #include "Renderer/RendererDevice.h"
 #include "Renderer/WindowPresentation.h"
+#if defined(_WIN64)
+#include "Renderer/NativeW3DResources.h"
+#endif
 
 #include "shdlib.h"
 
@@ -144,6 +149,9 @@ bool								DX8Wrapper::world_identity;
 unsigned							DX8Wrapper::RenderStates[256];
 unsigned							DX8Wrapper::TextureStageStates[MAX_TEXTURE_STAGES][32];
 IDirect3DBaseTexture8 *		DX8Wrapper::Textures[MAX_TEXTURE_STAGES];
+#if defined(_WIN64)
+TextureBaseClass *			DX8Wrapper::NativeTextures[MAX_TEXTURE_STAGES];
+#endif
 RenderStateStruct				DX8Wrapper::render_state;
 unsigned							DX8Wrapper::render_state_changed;
 
@@ -192,37 +200,55 @@ static bool _UseD3D11Backend = false;
 static D3D11LegacyBridge _D3D11Bridge;
 static rts::render::WindowPresentationState _D3D11WindowPresentationState;
 static bool _D3D11FrameStarted = false;
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+static rts::render::NativeProductDeviceLifecycle _NativeProductDeviceLifecycle;
+#endif
 
 namespace
 {
+#if !defined(_WIN64)
 HINSTANCE Load_D3D8_Runtime()
 {
-#if defined(_WIN64)
-	wchar_t module_path[32768];
-	const DWORD module_path_length = GetModuleFileNameW(nullptr, module_path,
-		static_cast<DWORD>(sizeof(module_path) / sizeof(module_path[0])));
-	if (module_path_length == 0 ||
-		module_path_length >= sizeof(module_path) / sizeof(module_path[0]))
-	{
-		return nullptr;
-	}
-
-	wchar_t *const file_name = wcsrchr(module_path, L'\\');
-	static const wchar_t runtime_name[] = L"d3d8.dll";
-	if (file_name == nullptr ||
-		(file_name - module_path) +
-			sizeof(runtime_name) / sizeof(runtime_name[0]) >=
-			sizeof(module_path) / sizeof(module_path[0]))
-	{
-		return nullptr;
-	}
-	memcpy(file_name + 1, runtime_name, sizeof(runtime_name));
-	return LoadLibraryExW(module_path, nullptr,
-		LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
-#else
 	return LoadLibrary("D3D8.DLL");
-#endif
 }
+#endif
+
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+bool Initialize_Native_Product_Device(void *, unsigned int width,
+	unsigned int height, bool enable_vsync)
+{
+	return _D3D11Bridge.Initialize(_Hwnd, nullptr, width, height,
+		enable_vsync);
+}
+
+bool Prepare_Native_Product_Device_Resize(void *)
+{
+	return _D3D11Bridge.Prepare_Legacy_Device_Reset();
+}
+
+bool Resize_Native_Product_Device(void *, unsigned int width,
+	unsigned int height)
+{
+	return _D3D11Bridge.Resize(width, height) ==
+		rts::render::RENDER_RESULT_OK;
+}
+
+void Shutdown_Native_Product_Device(void *)
+{
+	_D3D11Bridge.Shutdown();
+}
+
+bool Bind_Native_Product_Device_Lifecycle()
+{
+	rts::render::NativeProductDeviceOperations operations;
+	operations.context = &_D3D11Bridge;
+	operations.initialize = Initialize_Native_Product_Device;
+	operations.prepareResize = Prepare_Native_Product_Device_Resize;
+	operations.resize = Resize_Native_Product_Device;
+	operations.shutdown = Shutdown_Native_Product_Device;
+	return _NativeProductDeviceLifecycle.bind(operations);
+}
+#endif
 
 bool Get_D3D11_Monitor_Rect(RECT *monitor_rect)
 {
@@ -300,9 +326,11 @@ bool Record_Unavailable_Visible_Submission(
 }
 
 
+#if !defined(_WIN64)
 typedef IDirect3D8* (WINAPI *Direct3DCreate8Type) (UINT SDKVersion);
-Direct3DCreate8Type	Direct3DCreate8Ptr = nullptr;
+Direct3DCreate8Type Direct3DCreate8Ptr = nullptr;
 HINSTANCE D3D8Lib = nullptr;
+#endif
 
 DX8_CleanupHook	 *DX8Wrapper::m_pCleanupHook=nullptr;
 #ifdef EXTENDED_STATS
@@ -367,21 +395,21 @@ void MoveRectIntoOtherRect(const RECT& inner, const RECT& outer, int* x, int* y)
 bool DX8Wrapper::Init(void * hwnd, bool lite)
 {
 	WWASSERT(!IsInitted);
+	const rts::render::RenderBackend requested_backend =
+		rts::render::RequestedRenderBackend();
+	if (!rts::render::IsRenderBackendSupported(requested_backend))
+	{
+		WWDEBUG_SAY(("Renderer backend '%s' is unavailable; native x64 requires d3d11.",
+			rts::render::RenderBackendName(requested_backend)));
+		return false;
+	}
+	_UseD3D11Backend = requested_backend == rts::render::RENDER_BACKEND_D3D11;
 	// The neutral D3D11 shadow starts with the same device-default state as a
 	// newly created D3D8 device.  Ordinary cache invalidations below must not
 	// repeat this reset: legacy shader helpers invalidate wrapper caches without
 	// resetting the actual D3D8 device state.
 	rts::render::ResetTrackedLegacyState();
 	rts::render::SeedTrackedLegacyPipelineState();
-	_UseD3D11Backend = rts::render::RequestedRenderBackend() ==
-		rts::render::RENDER_BACKEND_D3D11;
-#if !defined(RTS_RENDERER_HAS_D3D11)
-	if (_UseD3D11Backend)
-	{
-		WWDEBUG_SAY(("The D3D11 renderer is unavailable in this build."));
-		return false;
-	}
-#endif
 
 	// zero memory
 	memset(Textures,0,sizeof(IDirect3DBaseTexture8*)*MAX_TEXTURE_STAGES);
@@ -425,6 +453,22 @@ bool DX8Wrapper::Init(void * hwnd, bool lite)
 	Invalidate_Cached_Render_States();
 
 	if (!lite) {
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		if (!_UseD3D11Backend || !Bind_Native_Product_Device_Lifecycle())
+		{
+			WWDEBUG_SAY(("Failed to bind the native product device lifecycle."));
+			return false;
+		}
+		IsInitted = true;
+		Enumerate_Devices();
+		if (_RenderDeviceDescriptionTable.Count() == 0)
+		{
+			_NativeProductDeviceLifecycle.shutdown();
+			IsInitted = false;
+			return false;
+		}
+		WWDEBUG_SAY(("DX8Wrapper native facade initialization completed"));
+#else
 		D3D8Lib = Load_D3D8_Runtime();
 
 		if (D3D8Lib == nullptr) return false;	// Return false at this point if init failed
@@ -461,6 +505,7 @@ bool DX8Wrapper::Init(void * hwnd, bool lite)
 		WWDEBUG_SAY(("Enumerate devices"));
 		Enumerate_Devices();
 		WWDEBUG_SAY(("DX8Wrapper Init completed"));
+#endif
 	}
 
 	return(true);
@@ -468,11 +513,33 @@ bool DX8Wrapper::Init(void * hwnd, bool lite)
 
 void DX8Wrapper::Shutdown()
 {
-	_D3D11Bridge.Shutdown();
-	if (D3DDevice) {
-
-		Set_Render_Target ((IDirect3DSurface8 *)nullptr);
-		Release_Device();
+	if (_UseD3D11Backend)
+	{
+		if (D3DDevice
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+			|| _NativeProductDeviceLifecycle.ownsDeviceResources()
+#endif
+			)
+		{
+			// Native owners must release their registry handles while the
+			// bridge-owned resource host and render owner are still live.
+			Release_Device();
+		}
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		_NativeProductDeviceLifecycle.shutdown();
+#else
+		_D3D11Bridge.Shutdown();
+#endif
+	}
+	else
+	{
+		// Preserve the legacy D3D8 shutdown sequence exactly.
+		_D3D11Bridge.Shutdown();
+		if (D3DDevice)
+		{
+			Set_Render_Target ((IDirect3DSurface8 *)nullptr);
+			Release_Device();
+		}
 	}
 
 	if (D3DInterface) {
@@ -491,13 +558,18 @@ void DX8Wrapper::Shutdown()
 				Textures[i]->Release();
 				Textures[i] = nullptr;
 			}
+#if defined(_WIN64)
+			REF_PTR_RELEASE(NativeTextures[i]);
+#endif
 		}
 	}
 
+	#if !defined(_WIN64)
 	if (D3D8Lib) {
 		FreeLibrary(D3D8Lib);
 		D3D8Lib = nullptr;
 	}
+	#endif
 
 	_RenderDeviceNameTable.Clear();		 // note - Delete_All() resizes the vector, causing a reallocation.  Clear is better. jba.
 	_RenderDeviceShortNameTable.Clear();
@@ -507,7 +579,7 @@ void DX8Wrapper::Shutdown()
 	IsInitted = false;		// 010803 srj
 }
 
-void DX8Wrapper::Do_Onetime_Device_Dependent_Inits()
+bool DX8Wrapper::Do_Onetime_Device_Dependent_Inits()
 {
 	/*
 	** Set Global render states (some of which depend on caps)
@@ -526,11 +598,22 @@ void DX8Wrapper::Do_Onetime_Device_Dependent_Inits()
 	SHD_INIT;
 	BoxRenderObjClass::Init();
 	VertexMaterialClass::Init();
-	PointGroupClass::_Init(); // This needs the VertexMaterialClass to be initted
+	if (!PointGroupClass::_Init()) // This needs the VertexMaterialClass to be initted
+	{
+		VertexMaterialClass::Shutdown();
+		BoxRenderObjClass::Shutdown();
+		SHD_SHUTDOWN;
+		TheDX8MeshRenderer.Shutdown();
+		MissingTexture::_Deinit();
+		delete CurrentCaps;
+		CurrentCaps = nullptr;
+		return false;
+	}
 	ShatterSystem::Init();
 	TextureLoader::Init();
 
 	Set_Default_Global_Render_States();
+	return true;
 }
 
 inline DWORD F2DW(float f) { return *((unsigned*)&f); }
@@ -578,6 +661,9 @@ void DX8Wrapper::Invalidate_Cached_Render_States()
 			Textures[a]->Release();
 		}
 		Textures[a]=nullptr;
+#if defined(_WIN64)
+		REF_PTR_RELEASE(NativeTextures[a]);
+#endif
 		rts::render::TrackLegacyTexturePresence(a, false);
 	}
 
@@ -628,6 +714,24 @@ bool DX8Wrapper::Create_Device()
 {
 	WWASSERT(D3DDevice==nullptr);	// for now, once you've created a device, you're stuck with it!
 
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	if (!_UseD3D11Backend ||
+		_NativeProductDeviceLifecycle.state() !=
+			rts::render::NativeProductDeviceLifecycle::READY)
+	{
+		return false;
+	}
+	::ZeroMemory(&CurrentAdapterIdentifier,
+		sizeof(CurrentAdapterIdentifier));
+	if (CurRenderDevice >= 0 &&
+		CurRenderDevice < _RenderDeviceDescriptionTable.Count())
+	{
+		CurrentAdapterIdentifier =
+			_RenderDeviceDescriptionTable[CurRenderDevice].AdapterIdentifier;
+	}
+	Vertex_Processing_Behavior = 0;
+	_DX8SingleThreaded = true;
+#else
 	D3DCAPS8 caps;
 	if
 	(
@@ -735,31 +839,78 @@ bool DX8Wrapper::Create_Device()
 	}
 
 	dbgHelpGuard.deactivate();
+#endif
 	rts::render::ResetTrackedLegacyState();
 	rts::render::SeedTrackedLegacyPipelineState();
 	Invalidate_Cached_Render_States();
+	bool bridge_initialized = false;
+	bool subsystems_initialized = false;
 
 	/*
 	** Initialize all subsystems
 	*/
-	Do_Onetime_Device_Dependent_Inits();
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	if (_UseD3D11Backend)
+	{
+		bridge_initialized = _NativeProductDeviceLifecycle.create(
+			ResolutionWidth, ResolutionHeight,
+			_PresentParameters.FullScreen_PresentationInterval !=
+				D3DPRESENT_INTERVAL_IMMEDIATE);
+		if (!bridge_initialized)
+		{
+			WWDEBUG_SAY(("Failed to initialize the D3D11 renderer backend."));
+			goto device_initialization_failed;
+		}
+	}
+#endif
+	if (!Do_Onetime_Device_Dependent_Inits())
+	{
+		WWDEBUG_SAY(("Failed to initialize WW3D device-dependent subsystems."));
+		goto device_initialization_failed;
+	}
+	subsystems_initialized = true;
+#if !(defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11))
 	if (_UseD3D11Backend && !_D3D11Bridge.Initialize(_Hwnd, D3DDevice,
 		ResolutionWidth, ResolutionHeight,
 		_PresentParameters.FullScreen_PresentationInterval !=
 			D3DPRESENT_INTERVAL_IMMEDIATE))
 	{
 		WWDEBUG_SAY(("Failed to initialize the D3D11 renderer backend."));
-		_D3D11Bridge.Shutdown();
-		Do_Onetime_Device_Dependent_Shutdowns();
-		D3DDevice->Release();
-		D3DDevice = nullptr;
-		return false;
+		goto device_initialization_failed;
 	}
+	bridge_initialized = _UseD3D11Backend;
+#endif
 	if (_D3D11Bridge.Is_Active())
 	{
 		WWDEBUG_SAY(("Renderer backend: d3d11"));
 	}
 	return true;
+
+device_initialization_failed:
+	if (subsystems_initialized)
+	{
+		Do_Onetime_Device_Dependent_Shutdowns();
+		subsystems_initialized = false;
+	}
+	if (bridge_initialized || _UseD3D11Backend)
+	{
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		_NativeProductDeviceLifecycle.shutdown();
+		if (IsInitted)
+		{
+			Bind_Native_Product_Device_Lifecycle();
+		}
+#else
+		_D3D11Bridge.Shutdown();
+#endif
+		bridge_initialized = false;
+	}
+	if (D3DDevice != nullptr)
+	{
+		D3DDevice->Release();
+		D3DDevice = nullptr;
+	}
+	return false;
 }
 
 bool DX8Wrapper::Reset_Device(bool reload_assets, bool *reset_requires_reacquire)
@@ -770,6 +921,27 @@ bool DX8Wrapper::Reset_Device(bool reload_assets, bool *reset_requires_reacquire
 	{
 		*reset_requires_reacquire = false;
 	}
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11) && \
+	!defined(RTS_RENDERER_RESET_TEST_LEGACY_FRAGMENT)
+	if (IsInitted && _UseD3D11Backend &&
+		_NativeProductDeviceLifecycle.isActive())
+	{
+		FrameCount = 0;
+		if (!_NativeProductDeviceLifecycle.reset(ResolutionWidth,
+			ResolutionHeight))
+		{
+			IsDeviceLost = true;
+			return false;
+		}
+		rts::render::ResetTrackedLegacyState();
+		rts::render::SeedTrackedLegacyPipelineState();
+		Invalidate_Cached_Render_States();
+		Set_Default_Global_Render_States();
+		IsDeviceLost = false;
+		WWDEBUG_SAY(("Native product device reset completed"));
+		return true;
+	}
+#endif
 	if ((IsInitted) && (D3DDevice != nullptr)) {
 		HRESULT hr=_Get_D3D_Device8()->TestCooperativeLevel();
 		if (hr == D3DERR_DEVICELOST)
@@ -809,7 +981,7 @@ bool DX8Wrapper::Reset_Device(bool reload_assets, bool *reset_requires_reacquire
 		memset(Vertex_Shader_Constants,0,sizeof(Vector4)*MAX_VERTEX_SHADER_CONSTANTS);
 		memset(Pixel_Shader_Constants,0,sizeof(Vector4)*MAX_PIXEL_SHADER_CONSTANTS);
 
-		DX8CALL_HRES(Reset(&_PresentParameters),hr)
+		DX8CALL_HRES(Reset(&_PresentParameters),hr);
 		if (hr != D3D_OK)
 			return false;	//reset failed.
 		rts::render::ResetTrackedLegacyState();
@@ -851,13 +1023,25 @@ bool DX8Wrapper::Reset_Device(bool reload_assets, bool *reset_requires_reacquire
 void DX8Wrapper::Release_DX8_Buffer_Bindings()
 {
 	DX8_Assert();
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11) && \
+	!defined(RTS_RENDERER_RESET_TEST_LEGACY_FRAGMENT)
+	Track_DX8_Vertex_Buffer(
+		static_cast<IDirect3DVertexBuffer8 *>(nullptr), 0, 0);
+	if (RawIndexBuffer != nullptr)
+	{
+		RawIndexBuffer->Release();
+		RawIndexBuffer = nullptr;
+	}
+	RawIndexBaseVertex = 0;
+#else
 	const HRESULT vertex_result = _Get_D3D_Device8()->SetStreamSource(0, nullptr, 0);
 	Increment_DX8_CallCount();
 	const HRESULT index_result = _Get_D3D_Device8()->SetIndices(nullptr, 0);
 	Increment_DX8_CallCount();
 	// These are owned references, independent of the device bindings. A lost
 	// device may reject unbinding, but DEFAULT-pool buffers must not survive Reset.
-	Track_DX8_Vertex_Buffer(nullptr, 0, 0);
+	Track_DX8_Vertex_Buffer(
+		static_cast<IDirect3DVertexBuffer8 *>(nullptr), 0, 0);
 	if (RawIndexBuffer != nullptr)
 	{
 		RawIndexBuffer->Release();
@@ -866,14 +1050,24 @@ void DX8Wrapper::Release_DX8_Buffer_Bindings()
 	RawIndexBaseVertex = 0;
 	if (FAILED(vertex_result)) Non_Fatal_Log_DX8_ErrorCode(vertex_result, __FILE__, __LINE__);
 	if (FAILED(index_result)) Non_Fatal_Log_DX8_ErrorCode(index_result, __FILE__, __LINE__);
+#endif
 }
 
 void DX8Wrapper::Release_Device()
 {
-	if (D3DDevice) {
+	if (D3DDevice
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		|| _NativeProductDeviceLifecycle.ownsDeviceResources()
+#endif
+		) {
 
 		for (int a=0;a<MAX_TEXTURE_STAGES;++a)
 		{	//release references to any textures that were used in last rendering call
+#if defined(_WIN64)
+			// Native texture owners must drop their registry handles before the
+			// lifecycle tears down the resource host and immediate-context owner.
+			Set_Native_Texture(a, nullptr);
+#endif
 			DX8CALL(SetTexture(a,nullptr));
 		}
 
@@ -900,8 +1094,11 @@ void DX8Wrapper::Release_Device()
 		** Release the device
 		*/
 
-		D3DDevice->Release();
-		D3DDevice=nullptr;
+		if (D3DDevice != nullptr)
+		{
+			D3DDevice->Release();
+			D3DDevice=nullptr;
+		}
 	}
 }
 
@@ -909,6 +1106,48 @@ void DX8Wrapper::Enumerate_Devices()
 {
 	DX8_Assert();
 
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	RenderDeviceDescClass desc;
+	::ZeroMemory(&desc.Caps, sizeof(desc.Caps));
+	::ZeroMemory(&desc.AdapterIdentifier, sizeof(desc.AdapterIdentifier));
+	DX8Caps native_caps(WW3D_FORMAT_A8R8G8B8);
+	desc.Caps = native_caps.Get_DX8_Caps();
+	strncpy(desc.AdapterIdentifier.Description,
+		"Native D3D11 hardware adapter",
+		sizeof(desc.AdapterIdentifier.Description) - 1);
+	strncpy(desc.AdapterIdentifier.Driver, "d3d11.dll",
+		sizeof(desc.AdapterIdentifier.Driver) - 1);
+	desc.set_device_name(desc.AdapterIdentifier.Description);
+	desc.set_driver_name(desc.AdapterIdentifier.Driver);
+	desc.set_driver_version("Feature Level 11.0");
+	desc.set_device_platform("Native x64");
+	desc.set_hardware_name("D3D11 hardware adapter");
+	desc.reset_resolution_list();
+
+	DEVMODE mode;
+	::ZeroMemory(&mode, sizeof(mode));
+	mode.dmSize = sizeof(mode);
+	for (DWORD mode_index = 0;
+		EnumDisplaySettings(nullptr, mode_index, &mode); ++mode_index)
+	{
+		if (mode.dmPelsWidth != 0 && mode.dmPelsHeight != 0 &&
+			mode.dmBitsPerPel >= 32)
+		{
+			desc.add_resolution(static_cast<int>(mode.dmPelsWidth),
+				static_cast<int>(mode.dmPelsHeight), 32);
+		}
+		::ZeroMemory(&mode, sizeof(mode));
+		mode.dmSize = sizeof(mode);
+	}
+	if (desc.Enumerate_Resolutions().Count() == 0)
+	{
+		desc.add_resolution(DEFAULT_RESOLUTION_WIDTH,
+			DEFAULT_RESOLUTION_HEIGHT, DEFAULT_BIT_DEPTH);
+	}
+	_RenderDeviceNameTable.Add(StringClass(desc.Get_Device_Name(), true));
+	_RenderDeviceShortNameTable.Add(StringClass(desc.Get_Device_Name(), true));
+	_RenderDeviceDescriptionTable.Add(desc);
+#else
 	int adapter_count = D3DInterface->GetAdapterCount();
 	for (int adapter_index=0; adapter_index<adapter_count; adapter_index++) {
 
@@ -995,6 +1234,7 @@ void DX8Wrapper::Enumerate_Devices()
 			}
 		}
 	}
+#endif
 }
 
 bool DX8Wrapper::Set_Any_Render_Device()
@@ -1347,6 +1587,20 @@ bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int
 	** - if in windowed mode, the backbuffer must use the current display format.
 	** - the depth buffer must use
 	*/
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	DisplayFormat = D3DFMT_X8R8G8B8;
+	_PresentParameters.BackBufferFormat = D3DFMT_A8R8G8B8;
+	_PresentParameters.AutoDepthStencilFormat = D3DFMT_D24S8;
+	BitDepth = 32;
+	if (MultiSampleAntiAliasing != D3DMULTISAMPLE_NONE)
+	{
+		// The neutral D3D11 swap chain owns sample policy. Until multisampled
+		// resolve targets are part of that API, fail closed to one sample rather
+		// than querying a legacy adapter.
+		WWDEBUG_SAY(("Native D3D11 product currently disables requested MSAA."));
+		MultiSampleAntiAliasing = D3DMULTISAMPLE_NONE;
+	}
+#else
 	if (presentation_windowed) {
 
 		D3DDISPLAYMODE desktop_mode;
@@ -1443,6 +1697,7 @@ bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int
 			MultiSampleAntiAliasing = D3DMULTISAMPLE_NONE;
 		}
 	}
+#endif
 
 	_PresentParameters.MultiSampleType = MultiSampleAntiAliasing;
 
@@ -1615,7 +1870,11 @@ const char * DX8Wrapper::Get_Render_Device_Name(int device_index)
 
 bool DX8Wrapper::Set_Device_Resolution(int width,int height,int bits,int windowed, bool resize_window)
 {
-	if (D3DDevice != nullptr) {
+	if (D3DDevice != nullptr
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		|| _NativeProductDeviceLifecycle.isActive()
+#endif
+		) {
 		const bool previous_windowed = IsWindowed;
 		bool reset_requires_reacquire = false;
 		bool window_rollback_failed = false;
@@ -2119,7 +2378,14 @@ unsigned long DX8Wrapper::Get_FrameCount() {return FrameCount;}
 
 void DX8_Assert()
 {
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	WWASSERT(_UseD3D11Backend &&
+		(_NativeProductDeviceLifecycle.state() ==
+			rts::render::NativeProductDeviceLifecycle::READY ||
+		 _NativeProductDeviceLifecycle.isActive()));
+#else
 	WWASSERT(DX8Wrapper::_Get_D3D8());
+#endif
 	DX8_THREAD_ASSERT();
 }
 
@@ -2239,23 +2505,29 @@ void DX8Wrapper::End_Scene(bool flip_frames)
 
 		// If the device was lost we need to check for cooperative level and possibly reset the device
 		if (hr==D3DERR_DEVICELOST) {
-			hr=_Get_D3D_Device8()->TestCooperativeLevel();
-			if (hr==D3DERR_DEVICENOTRESET) {
-				WWDEBUG_SAY(("DX8Wrapper::End_Scene is resetting the device."));
-				bool reset_requires_reacquire = false;
-				if (!Reset_Device(true, &reset_requires_reacquire) &&
-					reset_requires_reacquire)
-				{
-					IsDeviceLost = true;
-					if (_UseD3D11Backend)
+			if (_UseD3D11Backend)
+			{
+				// The bridge/render owner reports and performs native recovery.
+				// There is no cooperative-level device behind the x64 facade.
+				IsDeviceLost = true;
+			}
+			else
+			{
+				hr=_Get_D3D_Device8()->TestCooperativeLevel();
+				if (hr==D3DERR_DEVICENOTRESET) {
+					WWDEBUG_SAY(("DX8Wrapper::End_Scene is resetting the device."));
+					bool reset_requires_reacquire = false;
+					if (!Reset_Device(true, &reset_requires_reacquire) &&
+						reset_requires_reacquire)
 					{
+						IsDeviceLost = true;
 						_D3D11Bridge.Shutdown();
 					}
 				}
-			}
-			else {
-				// Sleep it not active
-				ThreadClass::Sleep_Ms(200);
+				else {
+					// Sleep it not active
+					ThreadClass::Sleep_Ms(200);
+				}
 			}
 		}
 		else {
@@ -2583,10 +2855,76 @@ rts::render::RenderResult DX8Wrapper::Copy_Active_Render_Target_To_Texture(
 	return _D3D11Bridge.Copy_Active_Color_Target_To_Texture(destination);
 }
 
+HRESULT DX8Wrapper::Set_DX8_Vertex_Buffer(DX8VertexBufferClass *vb,
+	UINT stride, DWORD fvf)
+{
+	if (vb == nullptr || !vb->Is_Valid()) return E_FAIL;
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	(void)stride;
+	(void)fvf;
+	Set_Vertex_Buffer(vb);
+	return D3D_OK;
+#else
+	return Set_DX8_Vertex_Buffer(vb->Get_DX8_Vertex_Buffer(), stride, fvf);
+#endif
+}
+
+void DX8Wrapper::Track_DX8_Vertex_Buffer(DX8VertexBufferClass *vb,
+	UINT stride, DWORD fvf)
+{
+	if (vb == nullptr || !vb->Is_Valid()) return;
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	(void)stride;
+	(void)fvf;
+	Set_Vertex_Buffer(vb);
+#else
+	Track_DX8_Vertex_Buffer(vb->Get_DX8_Vertex_Buffer(), stride, fvf);
+#endif
+}
+
+HRESULT DX8Wrapper::Set_DX8_Index_Buffer(DX8IndexBufferClass *ib,
+	UINT base_vertex)
+{
+	if (ib == nullptr || !ib->Is_Valid() || base_vertex > 0xffff)
+		return E_FAIL;
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	Set_Index_Buffer(ib, static_cast<unsigned short>(base_vertex));
+	return D3D_OK;
+#else
+	return Set_DX8_Index_Buffer(ib->Get_DX8_Index_Buffer(), base_vertex);
+#endif
+}
+
+rts::render::RenderResult DX8Wrapper::Copy_Active_Render_Target_To_Texture(
+	TextureClass *destination)
+{
+#if defined(_WIN64)
+	return destination != nullptr &&
+		destination->Copy_Native_Active_Color_Target() ?
+		rts::render::RENDER_RESULT_OK : rts::render::RENDER_RESULT_FAILED;
+#else
+	return Copy_Active_Render_Target_To_Texture(destination != nullptr ?
+		destination->Peek_D3D_Base_Texture() : nullptr);
+#endif
+}
+
 bool DX8Wrapper::Acquire_D3D11_Copied_Texture_Content(
 	IDirect3DBaseTexture8 *texture)
 {
 	return _D3D11Bridge.Acquire_Copied_Texture_Content(texture);
+}
+
+bool DX8Wrapper::Acquire_D3D11_Copied_Texture_Content(TextureClass *texture)
+{
+#if defined(_WIN64)
+	if (texture == nullptr) return false;
+	rts::render::NativeW3DTextureHandle handle;
+	rts::render::NativeW3DGpuContentLease lease;
+	return texture->Acquire_Native_Texture(&handle, &lease);
+#else
+	return Acquire_D3D11_Copied_Texture_Content(texture != nullptr ?
+		texture->Peek_D3D_Base_Texture() : nullptr);
+#endif
 }
 
 void DX8Wrapper::Notify_D3D11_Buffer_Changed(IUnknown *buffer)
@@ -2619,6 +2957,19 @@ bool DX8Wrapper::Publish_D3D11_Texture_BGRA8_Change(
 		slice_pitch);
 }
 
+bool DX8Wrapper::Publish_D3D11_Texture_BGRA8_Change(TextureClass *texture,
+	const void *data, size_t row_pitch, size_t slice_pitch)
+{
+#if defined(_WIN64)
+	return texture != nullptr && texture->Publish_Native_BGRA8(data, row_pitch,
+		slice_pitch);
+#else
+	return Publish_D3D11_Texture_BGRA8_Change(texture != nullptr ?
+		texture->Peek_D3D_Base_Texture() : nullptr, data, row_pitch,
+		slice_pitch);
+#endif
+}
+
 void DX8Wrapper::Notify_D3D11_Texture_Changed(
 	IDirect3DBaseTexture8 *texture)
 {
@@ -2648,6 +2999,13 @@ bool Publish_Render_Texture_BGRA8_Change(IDirect3DBaseTexture8 *texture,
 		row_pitch, slice_pitch);
 }
 
+bool Publish_Render_Texture_BGRA8_Change(TextureClass *texture,
+	const void *data, size_t row_pitch, size_t slice_pitch)
+{
+	return DX8Wrapper::Publish_D3D11_Texture_BGRA8_Change(texture, data,
+		row_pitch, slice_pitch);
+}
+
 void Notify_Render_Buffer_Changed(IUnknown *buffer)
 {
 	DX8Wrapper::Notify_D3D11_Buffer_Changed(buffer);
@@ -2667,6 +3025,42 @@ bool Publish_Render_Buffer_Change(IUnknown *buffer, unsigned int binding,
 {
 	return DX8Wrapper::Publish_D3D11_Buffer_Change(buffer, binding, data,
 		byte_count, destination_offset, mode, source_generation);
+}
+
+bool Publish_Render_Buffer_Change(DX8VertexBufferClass *buffer,
+	unsigned int binding, const void *data, size_t byte_count,
+	size_t destination_offset, rts::render::RenderBufferUpdateMode mode,
+	unsigned int source_generation)
+{
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	(void)binding;
+	(void)destination_offset;
+	(void)mode;
+	(void)source_generation;
+	return buffer != nullptr && data != nullptr && byte_count != 0;
+#else
+	return buffer != nullptr && Publish_Render_Buffer_Change(
+		buffer->Get_DX8_Vertex_Buffer(), binding, data, byte_count,
+		destination_offset, mode, source_generation);
+#endif
+}
+
+bool Publish_Render_Buffer_Change(DX8IndexBufferClass *buffer,
+	unsigned int binding, const void *data, size_t byte_count,
+	size_t destination_offset, rts::render::RenderBufferUpdateMode mode,
+	unsigned int source_generation)
+{
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	(void)binding;
+	(void)destination_offset;
+	(void)mode;
+	(void)source_generation;
+	return buffer != nullptr && data != nullptr && byte_count != 0;
+#else
+	return buffer != nullptr && Publish_Render_Buffer_Change(
+		buffer->Get_DX8_Index_Buffer(), binding, data, byte_count,
+		destination_offset, mode, source_generation);
+#endif
 }
 
 void DX8Wrapper::Request_D3D11_Back_Buffer_Capture()
@@ -2764,11 +3158,15 @@ void DX8Wrapper::Set_Index_Buffer(const IndexBufferClass* ib,unsigned short inde
 //
 // ----------------------------------------------------------------------------
 
-void DX8Wrapper::Set_Vertex_Buffer(const DynamicVBAccessClass& vba_)
+bool DX8Wrapper::Set_Vertex_Buffer(const DynamicVBAccessClass& vba_)
 {
 	// Release all streams (only one stream allowed in the legacy pipeline)
 	for (int i=1;i<MAX_VERTEX_STREAMS;++i) {
 		DX8Wrapper::Set_Vertex_Buffer(nullptr, i);
+	}
+	if (!vba_.Is_Valid()) {
+		DX8Wrapper::Set_Vertex_Buffer(nullptr, 0);
+		return false;
 	}
 
 	if (render_state.vertex_buffers[0]) render_state.vertex_buffers[0]->Release_Engine_Ref();
@@ -2780,6 +3178,7 @@ void DX8Wrapper::Set_Vertex_Buffer(const DynamicVBAccessClass& vba_)
 	render_state.vertex_buffers[0]->Add_Engine_Ref();
 	render_state_changed|=VERTEX_BUFFER_CHANGED;
 	render_state_changed|=INDEX_BUFFER_CHANGED;		// vba_offset changes so index buffer needs to be reset as well.
+	return true;
 }
 
 // ----------------------------------------------------------------------------
@@ -2788,8 +3187,12 @@ void DX8Wrapper::Set_Vertex_Buffer(const DynamicVBAccessClass& vba_)
 //
 // ----------------------------------------------------------------------------
 
-void DX8Wrapper::Set_Index_Buffer(const DynamicIBAccessClass& iba_,unsigned short index_base_offset)
+bool DX8Wrapper::Set_Index_Buffer(const DynamicIBAccessClass& iba_,unsigned short index_base_offset)
 {
+	if (!iba_.Is_Valid()) {
+		DX8Wrapper::Set_Index_Buffer(nullptr, index_base_offset);
+		return false;
+	}
 	if (render_state.index_buffer) render_state.index_buffer->Release_Engine_Ref();
 
 	DynamicIBAccessClass& iba=const_cast<DynamicIBAccessClass&>(iba_);
@@ -2799,7 +3202,30 @@ void DX8Wrapper::Set_Index_Buffer(const DynamicIBAccessClass& iba_,unsigned shor
 	REF_PTR_SET(render_state.index_buffer,iba.IndexBuffer);
 	render_state.index_buffer->Add_Engine_Ref();
 	render_state_changed|=INDEX_BUFFER_CHANGED;
+	return true;
 }
+
+#if defined(_WIN64)
+void DX8Wrapper::Set_Native_Texture(unsigned int stage,
+	TextureBaseClass *texture)
+{
+	if (stage >= MAX_TEXTURE_STAGES) return;
+	rts::render::TrackLegacyTexturePresence(stage, texture != nullptr);
+	if (NativeTextures[stage] == texture) return;
+	REF_PTR_SET(NativeTextures[stage], texture);
+	if (Textures[stage] != nullptr)
+	{
+		Textures[stage]->Release();
+		Textures[stage] = nullptr;
+	}
+	DX8_RECORD_TEXTURE_CHANGE();
+}
+
+TextureBaseClass *DX8Wrapper::Get_Tracked_Native_Texture(unsigned int stage)
+{
+	return stage < MAX_TEXTURE_STAGES ? NativeTextures[stage] : nullptr;
+}
+#endif
 
 // ----------------------------------------------------------------------------
 //
@@ -2820,10 +3246,16 @@ void DX8Wrapper::Draw_Sorting_IB_VB(
 
 	// Fill dynamic vertex buffer with sorting vertex buffer vertices
 	DynamicVBAccessClass dyn_vb_access(BUFFER_TYPE_DYNAMIC_DX8,dynamic_fvf_type,vertex_count);
+	if (!dyn_vb_access.Is_Valid()) {
+		return;
+	}
 	{
 		DynamicVBAccessClass::WriteLockClass lock(&dyn_vb_access);
 		VertexFormatXYZNDUV2* src = static_cast<SortingVertexBufferClass*>(render_state.vertex_buffers[0])->VertexBuffer;
 		VertexFormatXYZNDUV2* dest= lock.Get_Formatted_Vertex_Array();
+		if (!lock.Is_Locked() || dest == nullptr) {
+			return;
+		}
 		src += render_state.vba_offset + render_state.index_base_offset + min_vertex_index;
 		unsigned  size = dyn_vb_access.FVF_Info().Get_FVF_Size()*vertex_count/sizeof(unsigned);
 		unsigned *dest_u =(unsigned*) dest;
@@ -2832,18 +3264,25 @@ void DX8Wrapper::Draw_Sorting_IB_VB(
 		for (unsigned i=0;i<size;++i) {
 			*dest_u++=*src_u++;
 		}
+		if (!lock.Commit()) {
+			return;
+		}
 	}
 
+#if !(defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11))
 	DX8CALL(SetStreamSource(
 		0,
 		static_cast<DX8VertexBufferClass*>(dyn_vb_access.VertexBuffer)->Get_DX8_Vertex_Buffer(),
 		dyn_vb_access.FVF_Info().Get_FVF_Size()));
+#endif
 	// If using FVF format VB, set the FVF as vertex shader (may not be needed here KM)
 	unsigned fvf=dyn_vb_access.FVF_Info().Get_FVF();
 	if (fvf!=0) {
 		DX8CALL(SetVertexShader(fvf));
 	}
+#if !(defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11))
 	DX8_RECORD_VERTEX_BUFFER_CHANGE();
+#endif
 
 	unsigned index_count=0;
 	switch (primitive_type) {
@@ -2855,9 +3294,15 @@ void DX8Wrapper::Draw_Sorting_IB_VB(
 
 	// Fill dynamic index buffer with sorting index buffer vertices
 	DynamicIBAccessClass dyn_ib_access(BUFFER_TYPE_DYNAMIC_DX8,index_count);
+	if (!dyn_ib_access.Is_Valid()) {
+		return;
+	}
 	{
 		DynamicIBAccessClass::WriteLockClass lock(&dyn_ib_access);
 		unsigned short* dest=lock.Get_Index_Array();
+		if (!lock.Is_Locked() || dest == nullptr) {
+			return;
+		}
 		unsigned short* src=nullptr;
 		src=static_cast<SortingIndexBufferClass*>(render_state.index_buffer)->index_buffer;
 		src+=render_state.iba_offset+start_index;
@@ -2868,12 +3313,17 @@ void DX8Wrapper::Draw_Sorting_IB_VB(
 			WWASSERT(index<vertex_count);
 			*dest++=index;
 		}
+		if (!lock.Commit()) {
+			return;
+		}
 	}
 
+#if !(defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11))
 	DX8CALL(SetIndices(
 		static_cast<DX8IndexBufferClass*>(dyn_ib_access.IndexBuffer)->Get_DX8_Index_Buffer(),
 		dyn_vb_access.VertexBufferOffset));
 	DX8_RECORD_INDEX_BUFFER_CHANGE();
+#endif
 
 	DX8_RECORD_DRAW_CALLS();
 	const rts::render::RenderSubmissionDecision submission =
@@ -2920,6 +3370,20 @@ void DX8Wrapper::Draw(
 	unsigned short min_vertex_index,
 	unsigned short vertex_count)
 {
+	if (render_state.vertex_buffers[0] == nullptr ||
+		render_state.index_buffer == nullptr ||
+		render_state.vertex_buffer_types[0] == BUFFER_TYPE_INVALID ||
+		render_state.index_buffer_type == BUFFER_TYPE_INVALID ||
+		((render_state.vertex_buffer_types[0] == BUFFER_TYPE_DX8 ||
+		  render_state.vertex_buffer_types[0] == BUFFER_TYPE_DYNAMIC_DX8) &&
+		 !static_cast<DX8VertexBufferClass *>(
+			render_state.vertex_buffers[0])->Is_Valid()) ||
+		((render_state.index_buffer_type == BUFFER_TYPE_DX8 ||
+		  render_state.index_buffer_type == BUFFER_TYPE_DYNAMIC_DX8) &&
+		 !static_cast<DX8IndexBufferClass *>(
+			render_state.index_buffer)->Is_Valid())) {
+		return;
+	}
 	if (DrawPolygonLowBoundLimit && DrawPolygonLowBoundLimit>=polygon_count) return;
 
 	DX8_THREAD_ASSERT();
@@ -2934,7 +3398,11 @@ void DX8Wrapper::Draw(
 	if (WW3D::Is_Snapshot_Activated()) {
 		unsigned long passes=0;
 		SNAPSHOT_SAY(("ValidateDevice:"));
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		HRESULT res = _D3D11Bridge.Is_Active() ? D3D_OK : D3DERR_DEVICELOST;
+#else
 		HRESULT res=D3DDevice->ValidateDevice(&passes);
+#endif
 		switch (res) {
 		case D3D_OK:
 			SNAPSHOT_SAY(("OK"));
@@ -3217,11 +3685,13 @@ void DX8Wrapper::Apply_Render_State_Changes()
 				switch (render_state.vertex_buffer_types[i]) {//->Type()) {
 				case BUFFER_TYPE_DX8:
 				case BUFFER_TYPE_DYNAMIC_DX8:
+#if !(defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11))
 					DX8CALL(SetStreamSource(
 						i,
 						static_cast<DX8VertexBufferClass*>(render_state.vertex_buffers[i])->Get_DX8_Vertex_Buffer(),
 						render_state.vertex_buffers[i]->FVF_Info().Get_FVF_Size()));
 					DX8_RECORD_VERTEX_BUFFER_CHANGE();
+#endif
 					{
 						// If the VB format is FVF, set the FVF as a vertex shader
 						unsigned fvf=render_state.vertex_buffers[i]->FVF_Info().Get_FVF();
@@ -3248,10 +3718,12 @@ void DX8Wrapper::Apply_Render_State_Changes()
 			switch (render_state.index_buffer_type) {//->Type()) {
 			case BUFFER_TYPE_DX8:
 			case BUFFER_TYPE_DYNAMIC_DX8:
+#if !(defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11))
 				DX8CALL(SetIndices(
 					static_cast<DX8IndexBufferClass*>(render_state.index_buffer)->Get_DX8_Index_Buffer(),
 					render_state.index_base_offset+render_state.vba_offset));
 				DX8_RECORD_INDEX_BUFFER_CHANGE();
+#endif
 				break;
 			case BUFFER_TYPE_SORTING:
 			case BUFFER_TYPE_DYNAMIC_SORTING:
@@ -3285,6 +3757,17 @@ IDirect3DTexture8 * DX8Wrapper::_Create_DX8_Texture
 {
 	DX8_THREAD_ASSERT();
 	DX8_Assert();
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	(void)width;
+	(void)height;
+	(void)format;
+	(void)mip_level_count;
+	(void)pool;
+	(void)rendertarget;
+	// Texture ownership has not crossed the native resource boundary yet. Fail
+	// closed instead of dereferencing the intentionally absent D3D8 device.
+	return nullptr;
+#else
 	IDirect3DTexture8 *texture = nullptr;
 
 	// Paletted textures not supported!
@@ -3388,6 +3871,7 @@ IDirect3DTexture8 * DX8Wrapper::_Create_DX8_Texture
 	DX8_ErrorCode(ret);
 
 	return texture;
+#endif
 }
 
 IDirect3DTexture8 * DX8Wrapper::_Create_DX8_Texture
@@ -3398,6 +3882,11 @@ IDirect3DTexture8 * DX8Wrapper::_Create_DX8_Texture
 {
 	DX8_THREAD_ASSERT();
 	DX8_Assert();
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	(void)filename;
+	(void)mip_level_count;
+	return nullptr;
+#else
 	IDirect3DTexture8 *texture = nullptr;
 
 	// NOTE: If the original image format is not supported as a texture format, it will
@@ -3432,6 +3921,7 @@ IDirect3DTexture8 * DX8Wrapper::_Create_DX8_Texture
 		return MissingTexture::_Get_Missing_Texture();
 	}
 	return texture;
+#endif
 }
 
 IDirect3DTexture8 * DX8Wrapper::_Create_DX8_Texture
@@ -3442,6 +3932,11 @@ IDirect3DTexture8 * DX8Wrapper::_Create_DX8_Texture
 {
 	DX8_THREAD_ASSERT();
 	DX8_Assert();
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	(void)surface;
+	(void)mip_level_count;
+	return nullptr;
+#else
 	IDirect3DTexture8 *texture = nullptr;
 
 	D3DSURFACE_DESC surface_desc;
@@ -3476,6 +3971,7 @@ IDirect3DTexture8 * DX8Wrapper::_Create_DX8_Texture
 
 	return texture;
 
+#endif
 }
 
 /*!
@@ -3492,6 +3988,14 @@ IDirect3DTexture8 * DX8Wrapper::_Create_DX8_ZTexture
 {
 	DX8_THREAD_ASSERT();
 	DX8_Assert();
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	(void)width;
+	(void)height;
+	(void)zformat;
+	(void)mip_level_count;
+	(void)pool;
+	return nullptr;
+#else
 	IDirect3DTexture8* texture = nullptr;
 
 	D3DFORMAT zfmt=WW3DZFormat_To_D3DFormat(zformat);
@@ -3557,6 +4061,7 @@ IDirect3DTexture8 * DX8Wrapper::_Create_DX8_ZTexture
 	// allowed for render targets.
 
 	return texture;
+#endif
 }
 
 /*!
@@ -3575,6 +4080,13 @@ IDirect3DCubeTexture8* DX8Wrapper::_Create_DX8_Cube_Texture
 	WWASSERT(width==height);
 	DX8_THREAD_ASSERT();
 	DX8_Assert();
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	(void)format;
+	(void)mip_level_count;
+	(void)pool;
+	(void)rendertarget;
+	return nullptr;
+#else
 	IDirect3DCubeTexture8* texture=nullptr;
 
 	// Paletted textures not supported!
@@ -3695,6 +4207,7 @@ IDirect3DCubeTexture8* DX8Wrapper::_Create_DX8_Cube_Texture
 	DX8_ErrorCode(ret);
 
 	return texture;
+#endif
 }
 
 /*!
@@ -3712,6 +4225,15 @@ IDirect3DVolumeTexture8* DX8Wrapper::_Create_DX8_Volume_Texture
 {
 	DX8_THREAD_ASSERT();
 	DX8_Assert();
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	(void)width;
+	(void)height;
+	(void)depth;
+	(void)format;
+	(void)mip_level_count;
+	(void)pool;
+	return nullptr;
+#else
 	IDirect3DVolumeTexture8* texture=nullptr;
 
 	// Paletted textures not supported!
@@ -3774,6 +4296,7 @@ IDirect3DVolumeTexture8* DX8Wrapper::_Create_DX8_Volume_Texture
 	DX8_ErrorCode(ret);
 
 	return texture;
+#endif
 }
 
 
@@ -3782,6 +4305,15 @@ IDirect3DSurface8 * DX8Wrapper::_Create_DX8_Surface(unsigned int width, unsigned
 	DX8_THREAD_ASSERT();
 	DX8_Assert();
 
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	// A native surface is not ABI-compatible with IDirect3DSurface8. Native
+	// callers must construct SurfaceClass or acquire a typed surface handle;
+	// this raw compatibility API therefore fails closed.
+	(void)width;
+	(void)height;
+	(void)format;
+	return nullptr;
+#else
 	IDirect3DSurface8 *surface = nullptr;
 
 	// Paletted surfaces not supported!
@@ -3790,6 +4322,7 @@ IDirect3DSurface8 * DX8Wrapper::_Create_DX8_Surface(unsigned int width, unsigned
 	DX8CALL(CreateImageSurface(width, height, WW3DFormat_To_D3DFormat(format), &surface));
 
 	return surface;
+#endif
 }
 
 IDirect3DSurface8 * DX8Wrapper::_Create_DX8_Surface(const char *filename_)
@@ -3797,6 +4330,10 @@ IDirect3DSurface8 * DX8Wrapper::_Create_DX8_Surface(const char *filename_)
 	DX8_THREAD_ASSERT();
 	DX8_Assert();
 
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	(void)filename_;
+	return nullptr;
+#else
 	// The file-to-surface path is intentionally kept behind TextureLoader's
 	// centralized legacy decoder.  It preserves the original-file dimensions
 	// and format conversion behavior without leaking that dependency into
@@ -3835,6 +4372,7 @@ IDirect3DSurface8 * DX8Wrapper::_Create_DX8_Surface(const char *filename_)
 		WW3D_FORMAT_UNKNOWN,
 		true);
 	return surface;
+#endif
 }
 
 
@@ -3879,7 +4417,11 @@ void DX8Wrapper::Compute_Caps(WW3DFormat display_format)
 	DX8_THREAD_ASSERT();
 	DX8_Assert();
 	delete CurrentCaps;
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	CurrentCaps = new DX8Caps(display_format);
+#else
 	CurrentCaps=new DX8Caps(_Get_D3D8(),D3DDevice,display_format,Get_Current_Adapter_Identifier());
+#endif
 }
 
 namespace
@@ -4679,7 +5221,11 @@ void DX8Wrapper::Set_Light_Environment(LightEnvironmentClass* light_env)
 IDirect3DSurface8 * DX8Wrapper::_Get_DX8_Front_Buffer()
 {
 	DX8_THREAD_ASSERT();
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	return nullptr;
+#else
 	D3DDISPLAYMODE mode;
+	::ZeroMemory(&mode, sizeof(mode));
 
 	DX8CALL(GetDisplayMode(&mode));
 
@@ -4689,15 +5235,20 @@ IDirect3DSurface8 * DX8Wrapper::_Get_DX8_Front_Buffer()
 
 	DX8CALL(GetFrontBuffer(fb));
 	return fb;
+#endif
 }
 
 SurfaceClass * DX8Wrapper::_Get_DX8_Back_Buffer(unsigned int num)
 {
 	DX8_THREAD_ASSERT();
 
-	IDirect3DSurface8 * bb;
+	IDirect3DSurface8 * bb = nullptr;
 	SurfaceClass *surf=nullptr;
+#if !defined(_WIN64) || !defined(RTS_RENDERER_HAS_D3D11)
 	DX8CALL(GetBackBuffer(num,D3DBACKBUFFER_TYPE_MONO,&bb));
+#else
+	(void)num;
+#endif
 	if (bb)
 	{
 		surf=NEW_REF(SurfaceClass,(bb));
@@ -4714,6 +5265,57 @@ DX8Wrapper::Create_Render_Target (int width, int height, WW3DFormat format)
 	DX8_THREAD_ASSERT();
 	DX8_Assert();
 	DX8_RECORD_DX8_CALLS();
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	if (width <= 0 || height <= 0)
+	{
+		return nullptr;
+	}
+	if (format == WW3D_FORMAT_UNKNOWN)
+	{
+		format = WW3D_FORMAT_X8R8G8B8;
+	}
+	if (Get_Current_Caps() == nullptr ||
+		!Get_Current_Caps()->Support_Render_To_Texture_Format(format))
+	{
+		WWDEBUG_SAY(("DX8Wrapper - Native render target format is not supported"));
+		return nullptr;
+	}
+
+	// Preserve the legacy factory's square power-of-two contract even though
+	// D3D11 itself permits non-square and non-power-of-two render targets.
+	const D3DCAPS8 &caps = Get_Current_Caps()->Get_DX8_Caps();
+	float power_of_two_size = width;
+	if (height < width)
+	{
+		power_of_two_size = height;
+	}
+	power_of_two_size = ::Find_POT(power_of_two_size);
+	if (power_of_two_size > caps.MaxTextureWidth)
+	{
+		power_of_two_size = caps.MaxTextureWidth;
+	}
+	if (power_of_two_size > caps.MaxTextureHeight)
+	{
+		power_of_two_size = caps.MaxTextureHeight;
+	}
+	width = height = static_cast<int>(power_of_two_size);
+	if (width <= 0)
+	{
+		return nullptr;
+	}
+
+	TextureClass *texture = NEW_REF(TextureClass,(width, height, format,
+		MIP_LEVELS_1, TextureClass::POOL_DEFAULT, true));
+	rts::render::NativeW3DSurfaceHandle output_surface;
+	if (texture == nullptr || !texture->Is_Initialized() ||
+		!texture->Acquire_Native_Surface(0, 0, true, &output_surface) ||
+		!output_surface.isValid())
+	{
+		WWDEBUG_SAY(("DX8Wrapper - Native render target creation failed!"));
+		REF_PTR_RELEASE(texture);
+	}
+	return texture;
+#else
 
 	// Use the current display format if format isn't specified
 	if (format==WW3D_FORMAT_UNKNOWN) {
@@ -4761,6 +5363,7 @@ DX8Wrapper::Create_Render_Target (int width, int height, WW3DFormat format)
 	}
 
 	return tex;
+#endif
 }
 
 //**********************************************************************************************
@@ -4780,6 +5383,40 @@ void DX8Wrapper::Create_Render_Target
 	DX8_THREAD_ASSERT();
 	DX8_Assert();
 	DX8_RECORD_DX8_CALLS();
+	if (target != nullptr)
+	{
+		*target = nullptr;
+	}
+	if (depth_buffer != nullptr)
+	{
+		*depth_buffer = nullptr;
+	}
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	if (target == nullptr || depth_buffer == nullptr || width <= 0 || height <= 0)
+		return;
+	if (format == WW3D_FORMAT_UNKNOWN) format = WW3D_FORMAT_A8R8G8B8;
+	if (Get_Current_Caps() == nullptr ||
+		!Get_Current_Caps()->Support_Render_To_Texture_Format(format) ||
+		!Get_Current_Caps()->Support_Depth_Stencil_Format(zformat)) return;
+	TextureClass *color = NEW_REF(TextureClass,(width, height, format,
+		MIP_LEVELS_1, TextureClass::POOL_DEFAULT, true));
+	ZTextureClass *depth = NEW_REF(ZTextureClass,(width, height, zformat,
+		MIP_LEVELS_1, TextureClass::POOL_DEFAULT));
+	rts::render::NativeW3DSurfaceHandle color_output;
+	rts::render::NativeW3DSurfaceHandle depth_output;
+	if (color == nullptr || depth == nullptr || !color->Is_Initialized() ||
+		!depth->Is_Initialized() ||
+		!color->Acquire_Native_Surface(0, 0, true, &color_output) ||
+		!depth->Acquire_Native_Surface(0, 0, true, &depth_output))
+	{
+		REF_PTR_RELEASE(color);
+		REF_PTR_RELEASE(depth);
+		return;
+	}
+	*target = color;
+	*depth_buffer = depth;
+	return;
+#else
 
 	// Use the current display format if format isn't specified
 	if (format==WW3D_FORMAT_UNKNOWN)
@@ -4846,6 +5483,7 @@ void DX8Wrapper::Create_Render_Target
 			TextureClass::POOL_DEFAULT
 		)
 	);
+#endif
 }
 
 /*!
@@ -4859,6 +5497,13 @@ void DX8Wrapper::Set_Render_Target_With_Z
 	bool use_default_depth_if_missing
 )
 {
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	const rts::render::RenderResult result =
+		_D3D11Bridge.Set_Render_Target_Textures(texture, ztexture,
+			ztexture == nullptr && use_default_depth_if_missing);
+	IsRenderToTexture = result == rts::render::RENDER_RESULT_OK;
+	return;
+#else
 	WWASSERT(texture!=nullptr);
 	IDirect3DSurface8 * d3d_surf = texture->Get_D3D_Surface_Level();
 	WWASSERT(d3d_surf != nullptr);
@@ -4886,6 +5531,7 @@ void DX8Wrapper::Set_Render_Target_With_Z
 	// publishing true in that case suppresses the visible back-buffer path and
 	// leaves the frame black.  Failed transitions must therefore fail closed.
 	IsRenderToTexture = SUCCEEDED(target_result);
+#endif
 }
 
 void
@@ -4893,6 +5539,11 @@ DX8Wrapper::Set_Render_Target(IDirect3DSwapChain8 *swap_chain)
 {
 	DX8_THREAD_ASSERT();
 	WWASSERT (swap_chain != nullptr);
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	(void)swap_chain;
+	IsRenderToTexture = false;
+	return;
+#else
 
 	//
 	//	Get the back buffer for the swap chain
@@ -4914,6 +5565,7 @@ DX8Wrapper::Set_Render_Target(IDirect3DSwapChain8 *swap_chain)
 	}
 
 	IsRenderToTexture = false;
+#endif
 }
 
 HRESULT
@@ -4923,6 +5575,14 @@ DX8Wrapper::Set_Render_Target(IDirect3DSurface8 *render_target, bool use_default
 	DX8_Assert();
 	const bool restoring_default = render_target == nullptr ||
 		render_target == DefaultRenderTarget;
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	if (!restoring_default)
+	{
+		(void)use_default_depth_buffer;
+		IsRenderToTexture = false;
+		return E_FAIL;
+	}
+#endif
 	if (_UseD3D11Backend && !_D3D11Bridge.Is_Active() && !restoring_default)
 	{
 		IsRenderToTexture = false;
@@ -5095,6 +5755,14 @@ HRESULT DX8Wrapper::Set_Render_Target
 	DX8_Assert();
 	const bool restoring_default = render_target == nullptr ||
 		render_target == DefaultRenderTarget;
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	if (!restoring_default)
+	{
+		(void)depth_buffer;
+		IsRenderToTexture = false;
+		return E_FAIL;
+	}
+#endif
 	if (_UseD3D11Backend && !_D3D11Bridge.Is_Active() && !restoring_default)
 	{
 		IsRenderToTexture = false;
@@ -5310,7 +5978,14 @@ unsigned int DX8Wrapper::Get_Free_Texture_RAM()
 {
 	DX8_Assert();
 	DX8_RECORD_DX8_CALLS();
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	// The old API exposes only a 32-bit estimate. Keep it conservative and
+	// deterministic; allocation failures remain authoritative in the native
+	// resource registry.
+	return 512U * 1024U * 1024U;
+#else
 	return DX8Wrapper::_Get_D3D_Device8()->GetAvailableTextureMem();
+#endif
 }
 
 // Converts a linear gamma ramp to one that is controlled by:

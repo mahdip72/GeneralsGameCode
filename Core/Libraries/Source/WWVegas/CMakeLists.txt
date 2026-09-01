@@ -7,9 +7,16 @@ target_compile_definitions(core_wwcommon INTERFACE
 )
 
 target_link_libraries(core_wwcommon INTERFACE
-    rts_legacy_product_runtime
+    rts_product_runtime
     stlport
 )
+
+# WW3D's public compatibility facade still spells serialized packet and state
+# types with the legacy SDK declarations. Keep that compile-only header surface
+# local to WWVegas; it is not part of either product runtime link boundary.
+if(TARGET rts_d3d8_headers)
+    target_link_libraries(core_wwcommon INTERFACE rts_d3d8_headers)
+endif()
 
 target_include_directories(core_wwcommon INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}

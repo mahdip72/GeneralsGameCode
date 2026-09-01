@@ -91,8 +91,10 @@ class CameraClass;
 class LightEnvironmentClass;
 class RenderDeviceDescClass;
 class VertexBufferClass;
+class DX8VertexBufferClass;
 class DynamicVBAccessClass;
 class IndexBufferClass;
+class DX8IndexBufferClass;
 class DynamicIBAccessClass;
 class TextureClass;
 class LightClass;
@@ -106,6 +108,8 @@ void Notify_Render_Texture_Changed(TextureClass *texture);
 // locked. False tells the caller to retain the normal dirty notification.
 bool Publish_Render_Texture_BGRA8_Change(IDirect3DBaseTexture8 *texture,
 	const void *data, size_t row_pitch, size_t slice_pitch);
+bool Publish_Render_Texture_BGRA8_Change(TextureClass *texture,
+	const void *data, size_t row_pitch, size_t slice_pitch);
 void Notify_Render_Buffer_Changed(IUnknown *buffer);
 void Notify_Render_Buffer_Range_Changed(IUnknown *buffer,
 	unsigned int binding, size_t destination_offset, size_t byte_count,
@@ -113,6 +117,14 @@ void Notify_Render_Buffer_Range_Changed(IUnknown *buffer,
 bool Publish_Render_Buffer_Change(IUnknown *buffer, unsigned int binding,
 	const void *data, size_t byte_count, size_t destination_offset,
 	rts::render::RenderBufferUpdateMode mode,
+	unsigned int source_generation = 0);
+bool Publish_Render_Buffer_Change(DX8VertexBufferClass *buffer,
+	unsigned int binding, const void *data, size_t byte_count,
+	size_t destination_offset, rts::render::RenderBufferUpdateMode mode,
+	unsigned int source_generation = 0);
+bool Publish_Render_Buffer_Change(DX8IndexBufferClass *buffer,
+	unsigned int binding, const void *data, size_t byte_count,
+	size_t destination_offset, rts::render::RenderBufferUpdateMode mode,
 	unsigned int source_generation = 0);
 
 struct DX8FrameStatistics
@@ -172,7 +184,15 @@ WWINLINE void DX8_ErrorCode(unsigned res)
 	Log_DX8_ErrorCode(res);
 }
 
-#ifdef WWDEBUG
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+// The x64 wrapper is a state/packet facade. Calls expressed through the old
+// macros are shadowed by the neutral state publishers and must never dereference
+// or manufacture a legacy device.
+#define DX8CALL_HRES(x,res) do { DX8_Assert(); (res) = D3D_OK; DX8Wrapper::Increment_DX8_CallCount(); } while (0)
+#define DX8CALL(x) do { DX8_Assert(); DX8Wrapper::Increment_DX8_CallCount(); } while (0)
+#define DX8CALL_D3D(x) do { DX8_Assert(); DX8Wrapper::Increment_DX8_CallCount(); } while (0)
+#define DX8_THREAD_ASSERT() if (_DX8SingleThreaded) { WWASSERT_PRINT(DX8Wrapper::_Get_Main_Thread_ID()==ThreadClass::_Get_Current_Thread_ID(),"DX8Wrapper native facade calls must be made from the main thread!"); }
+#elif defined(WWDEBUG)
 #define DX8CALL_HRES(x,res) DX8_Assert(); res = DX8Wrapper::_Get_D3D_Device8()->x; DX8_ErrorCode(res); DX8Wrapper::Increment_DX8_CallCount();
 #define DX8CALL(x) DX8_Assert(); DX8_ErrorCode(DX8Wrapper::_Get_D3D_Device8()->x); DX8Wrapper::Increment_DX8_CallCount();
 #define DX8CALL_D3D(x) DX8_Assert(); DX8_ErrorCode(DX8Wrapper::_Get_D3D8()->x); DX8Wrapper::Increment_DX8_CallCount();
@@ -306,7 +326,7 @@ public:
 	** Some WW3D sub-systems need to be initialized after the device is created and shutdown
 	** before the device is released.
 	*/
-	static void	Do_Onetime_Device_Dependent_Inits();
+	static bool	Do_Onetime_Device_Dependent_Inits();
 	static void Do_Onetime_Device_Dependent_Shutdowns();
 
 	static bool Is_Device_Lost() { return IsDeviceLost; }
@@ -338,6 +358,12 @@ public:
 		UINT stride, DWORD fvf);
 	static HRESULT Set_DX8_Index_Buffer(IDirect3DIndexBuffer8 *ib,
 		UINT base_vertex);
+	static HRESULT Set_DX8_Vertex_Buffer(DX8VertexBufferClass *vb,
+		UINT stride, DWORD fvf);
+	static void Track_DX8_Vertex_Buffer(DX8VertexBufferClass *vb,
+		UINT stride, DWORD fvf);
+	static HRESULT Set_DX8_Index_Buffer(DX8IndexBufferClass *ib,
+		UINT base_vertex);
 	static HRESULT Draw_DX8_Indexed_Primitive(
 		D3DPRIMITIVETYPE primitive_type, UINT min_vertex_index,
 		UINT vertex_count, UINT start_index, UINT primitive_count);
@@ -346,9 +372,9 @@ public:
 	static void	Set_Viewport(CONST D3DVIEWPORT8* pViewport);
 
 	static void Set_Vertex_Buffer(const VertexBufferClass* vb, unsigned stream=0);
-	static void Set_Vertex_Buffer(const DynamicVBAccessClass& vba);
+	static bool Set_Vertex_Buffer(const DynamicVBAccessClass& vba);
 	static void Set_Index_Buffer(const IndexBufferClass* ib,unsigned short index_base_offset);
-	static void Set_Index_Buffer(const DynamicIBAccessClass& iba,unsigned short index_base_offset);
+	static bool Set_Index_Buffer(const DynamicIBAccessClass& iba,unsigned short index_base_offset);
 	static void Set_Index_Buffer_Index_Offset(unsigned offset);
 
 	static void Get_Render_State(RenderStateStruct& state);
@@ -397,6 +423,10 @@ public:
 	// Returns the wrapper-owned texture shadow without changing its reference
 	// count.  The caller must consume it before the next texture-state change.
 	static IDirect3DBaseTexture8 *Get_Tracked_DX8_Texture(unsigned int stage);
+#if defined(_WIN64)
+	static void Set_Native_Texture(unsigned int stage, TextureBaseClass *texture);
+	static TextureBaseClass *Get_Tracked_Native_Texture(unsigned int stage);
+#endif
 	static void Set_Light_Environment(LightEnvironmentClass* light_env);
 	static LightEnvironmentClass* Get_Light_Environment() { return Light_Environment; }
 	static void Set_Fog(bool enable, const Vector3 &color, float start, float end);
@@ -486,8 +516,11 @@ public:
 		rts::render::RenderBackBufferInfo *info);
 	static rts::render::RenderResult Copy_Active_Render_Target_To_Texture(
 		IDirect3DBaseTexture8 *destination);
+	static rts::render::RenderResult Copy_Active_Render_Target_To_Texture(
+		TextureClass *destination);
 	static bool Acquire_D3D11_Copied_Texture_Content(
 		IDirect3DBaseTexture8 *texture);
+	static bool Acquire_D3D11_Copied_Texture_Content(TextureClass *texture);
 	static void Notify_D3D11_Buffer_Changed(IUnknown *buffer);
 	static void Notify_D3D11_Buffer_Range_Changed(IUnknown *buffer,
 		unsigned int binding, size_t destination_offset, size_t byte_count,
@@ -499,6 +532,8 @@ public:
 	static bool Publish_D3D11_Texture_BGRA8_Change(
 		IDirect3DBaseTexture8 *texture, const void *data, size_t row_pitch,
 		size_t slice_pitch);
+	static bool Publish_D3D11_Texture_BGRA8_Change(TextureClass *texture,
+		const void *data, size_t row_pitch, size_t slice_pitch);
 	static void Notify_D3D11_Texture_Changed(IDirect3DBaseTexture8 *texture);
 	static void Notify_D3D11_Texture_Changed(TextureClass *texture);
 	static void Request_D3D11_Back_Buffer_Capture();
@@ -785,6 +820,9 @@ protected:
 	static unsigned						RenderStates[256];
 	static unsigned						TextureStageStates[MAX_TEXTURE_STAGES][32];
 	static IDirect3DBaseTexture8 *	Textures[MAX_TEXTURE_STAGES];
+#if defined(_WIN64)
+	static TextureBaseClass *		NativeTextures[MAX_TEXTURE_STAGES];
+#endif
 
 	// These fog settings are constant for all objects in a given scene,
 	// unlike the matching renderstates which vary based on shader settings.

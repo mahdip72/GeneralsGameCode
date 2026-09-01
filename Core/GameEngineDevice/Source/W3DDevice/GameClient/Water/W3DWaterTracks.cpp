@@ -314,14 +314,19 @@ Int WaterTracksObj::render(DX8VertexBufferClass	*vertexBuffer, Int batchStart)
 	{	//we have room in current VB, append new verts
 		lockFlags = D3DLOCK_NOOVERWRITE;
 		bufferUpdateMode = rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE;
-		if(vertexBuffer->Get_DX8_Vertex_Buffer()->Lock(batchStart*vertexBuffer->FVF_Info().Get_FVF_Size(),m_x*m_y*vertexBuffer->FVF_Info().Get_FVF_Size(),(unsigned char**)&vb,lockFlags) != D3D_OK)
+		if (!vertexBuffer->Lock_Buffer(
+			static_cast<size_t>(batchStart) * vertexBuffer->FVF_Info().Get_FVF_Size(),
+			static_cast<size_t>(m_x) * m_y * vertexBuffer->FVF_Info().Get_FVF_Size(),
+			lockFlags, reinterpret_cast<void **>(&vb)))
 			return batchStart;
 	}
 	else
 	{	//ran out of room in last VB, request a substitute VB.
 		lockFlags = D3DLOCK_DISCARD;
 		bufferUpdateMode = rts::render::RENDER_BUFFER_UPDATE_DISCARD;
-		if(vertexBuffer->Get_DX8_Vertex_Buffer()->Lock(0,m_x*m_y*vertexBuffer->FVF_Info().Get_FVF_Size(),(unsigned char**)&vb,lockFlags) != D3D_OK)
+		if (!vertexBuffer->Lock_Buffer(0,
+			static_cast<size_t>(m_x) * m_y * vertexBuffer->FVF_Info().Get_FVF_Size(),
+			lockFlags, reinterpret_cast<void **>(&vb)))
 			return batchStart;
 		batchStart=0;	//reset start of page to first vertex
 	}
@@ -482,10 +487,11 @@ Int WaterTracksObj::render(DX8VertexBufferClass	*vertexBuffer, Int batchStart)
 		vertexBuffer->FVF_Info().Get_FVF_Size();
 	vertexBuffer->Mark_Changed_Range(batchStart, m_x * m_y, lockFlags);
 	Publish_Render_Buffer_Change(
-		vertexBuffer->Get_DX8_Vertex_Buffer(),
+		vertexBuffer,
 		rts::render::RENDER_BUFFER_VERTEX, lockedVertices, bufferUpdateBytes,
 		bufferUpdateOffset, bufferUpdateMode, vertexBuffer->Get_Generation());
-	vertexBuffer->Get_DX8_Vertex_Buffer()->Unlock();
+	if (!vertexBuffer->Unlock_Buffer())
+		return batchStart;
 
 	Int idxCount=(m_y-1)*(m_x*2+2) - 2;	//index count
 

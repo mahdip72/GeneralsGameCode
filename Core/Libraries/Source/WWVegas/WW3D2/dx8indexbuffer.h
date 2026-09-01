@@ -44,7 +44,11 @@
 
 class DX8Wrapper;
 class SortingRendererClass;
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+namespace rts { namespace render { class GpuHandle; class NativeW3DBufferOwner; } }
+#else
 struct IDirect3DIndexBuffer8;
+#endif
 class DX8IndexBufferClass;
 class SortingIndexBufferClass;
 
@@ -57,8 +61,8 @@ protected:
 public:
 	IndexBufferClass(unsigned type, unsigned short index_count);
 
-	void Copy(unsigned int* indices,unsigned start_index,unsigned index_count);
-	void Copy(unsigned short* indices,unsigned start_index,unsigned index_count);
+	bool Copy(unsigned int* indices,unsigned start_index,unsigned index_count);
+	bool Copy(unsigned short* indices,unsigned start_index,unsigned index_count);
 
 	unsigned short Get_Index_Count() const { return index_count; }
 	unsigned int Get_Generation() const { return generation; }
@@ -78,22 +82,28 @@ public:
 	{
 		IndexBufferClass* index_buffer;
 		unsigned short* indices;
+		bool locked;
 	public:
 		WriteLockClass(IndexBufferClass* index_buffer, int flags=0);
 		~WriteLockClass();
 
 		unsigned short* Get_Index_Array() { return indices; }
+		bool Is_Locked() const { return locked; }
+		bool Commit();
 	};
 
 	class AppendLockClass
 	{
 		IndexBufferClass* index_buffer;
 		unsigned short* indices;
+		bool locked;
 	public:
 		AppendLockClass(IndexBufferClass* index_buffer,unsigned start_index, unsigned index_range);
 		~AppendLockClass();
 
 		unsigned short* Get_Index_Array() { return indices; }
+		bool Is_Locked() const { return locked; }
+		bool Commit();
 	};
 
 	static unsigned Get_Total_Buffer_Count();
@@ -135,6 +145,7 @@ public:
 
 	unsigned Get_Type() const { return Type; }
 	unsigned short Get_Index_Count() const { return IndexCount; }
+	bool Is_Valid() const;
 
 	// Call at the end of the execution, or at whatever time you wish to release
 	// the recycled dynamic index buffer.
@@ -148,10 +159,14 @@ public:
 	{
 		DynamicIBAccessClass* DynamicIBAccess;
 		unsigned short* Indices;
+		bool Locked;
+		bool Referenced;
 	public:
 		WriteLockClass(DynamicIBAccessClass* ib_access);
 		~WriteLockClass();
 		unsigned short* Get_Index_Array() { return Indices; }
+		bool Is_Locked() const { return Locked; }
+		bool Commit();
 	};
 
 	friend WriteLockClass;
@@ -168,6 +183,7 @@ class DX8IndexBufferClass : public IndexBufferClass
 
 	friend IndexBufferClass::WriteLockClass;
 	friend IndexBufferClass::AppendLockClass;
+	friend DynamicIBAccessClass::WriteLockClass;
 public:
 	enum UsageType {
 		USAGE_DEFAULT=0,
@@ -178,14 +194,31 @@ public:
 
 	DX8IndexBufferClass(unsigned short index_count,UsageType usage=USAGE_DEFAULT);
 	virtual ~DX8IndexBufferClass() override;
+	bool Is_Valid() const;
+	bool Lock_Buffer(size_t byte_offset, size_t byte_count, int flags,
+		void **data);
+	bool Unlock_Buffer();
+	long Lock(unsigned int byte_offset, unsigned int byte_count,
+		unsigned char **data, unsigned long flags);
+	long Unlock();
 
-	void Copy(unsigned int* indices,unsigned start_index,unsigned index_count);
-	void Copy(unsigned short* indices,unsigned start_index,unsigned index_count);
-
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	bool Acquire_Native_Index_Buffer(unsigned int offset,
+		unsigned int start_index, unsigned int index_count,
+		rts::render::GpuHandle *validated) const;
+#else
 	IDirect3DIndexBuffer8* Get_DX8_Index_Buffer()	{ return index_buffer; }
+#endif
 
 private:
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	rts::render::NativeW3DBufferOwner *native_buffer;
+	bool Lock_Native_Buffer(size_t offset, size_t byte_count, int flags,
+		void **data);
+	bool Unlock_Native_Buffer();
+#else
 	IDirect3DIndexBuffer8*	index_buffer;		// actual dx8 index buffer
+#endif
 };
 
 

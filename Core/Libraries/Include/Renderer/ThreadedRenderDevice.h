@@ -66,6 +66,11 @@ bool IsThreadedRenderDevice(const IRenderDevice *device);
 // bounded completion mailbox rejects admission if the consumer stops polling.
 RenderResult SubmitThreadedRenderFrame(IRenderDevice *device, bool presentFrame);
 uint64_t LastThreadedRenderFrameSequence(const IRenderDevice *device);
+// Returns the producer's currently open frame sequence, or zero when resource
+// commands are being recorded outside a frame. A nonzero sequence lets a
+// resource registry defer publication to the matching completion without a
+// per-upload render-owner fence.
+uint64_t CurrentThreadedRenderFrameSequence(const IRenderDevice *device);
 bool PollThreadedRenderCompletion(IRenderDevice *device,
 	ThreadedRenderFrameCompletion *completion);
 

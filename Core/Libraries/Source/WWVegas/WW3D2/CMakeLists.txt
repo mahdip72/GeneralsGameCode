@@ -286,15 +286,23 @@ target_link_libraries(corei_ww3d2 INTERFACE
 # inherit the D3D8 compatibility PCH or the legacy WW3D source list.
 if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD)
     add_library(core_ww3d2_native STATIC
+        nativew3dbufferowner.cpp
+		nativew3dbufferowner.h
+		nativew3dsampledtexture.cpp
+		nativew3dsampledtexture.h
+		nativew3dtextureowner.cpp
+        nativew3dtextureowner.h
         nativew3d2.cpp
         nativew3d2.h
     )
-    target_include_directories(core_ww3d2_native PUBLIC
-        "${CMAKE_CURRENT_SOURCE_DIR}"
-    )
-    target_link_libraries(core_ww3d2_native PUBLIC
-        core_renderer
-    )
+	target_include_directories(core_ww3d2_native PUBLIC
+		"${CMAKE_CURRENT_SOURCE_DIR}"
+		"${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas"
+	)
+	target_link_libraries(core_ww3d2_native PUBLIC
+		core_renderer
+		core_utility_no_pch
+	)
     target_link_libraries(corei_ww3d2 INTERFACE
         core_ww3d2_native
     )

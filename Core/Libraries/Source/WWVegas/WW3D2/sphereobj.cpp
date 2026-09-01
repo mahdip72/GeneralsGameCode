@@ -477,9 +477,15 @@ void SphereRenderObjClass::render_sphere()
  	const unsigned int buffer_type = sort ? BUFFER_TYPE_DYNAMIC_SORTING : BUFFER_TYPE_DYNAMIC_DX8;
 
 	DynamicVBAccessClass vb(buffer_type, dynamic_fvf_type, mesh.Vertex_ct);
+	if (!vb.Is_Valid()) {
+		return;
+	}
 	{
 		DynamicVBAccessClass::WriteLockClass Lock(&vb);
 		VertexFormatXYZNDUV2 *vb = Lock.Get_Formatted_Vertex_Array();
+		if (!Lock.Is_Locked() || vb == nullptr) {
+			return;
+		}
 
 		for (int i=0; i<mesh.Vertex_ct; i++)
 		{
@@ -503,22 +509,36 @@ void SphereRenderObjClass::render_sphere()
 			}
 			vb++;
 		}
+		if (!Lock.Commit()) {
+			return;
+		}
 	}
 
 	DynamicIBAccessClass ib(buffer_type, mesh.face_ct*3);
+	if (!ib.Is_Valid()) {
+		return;
+	}
 	{
 		DynamicIBAccessClass::WriteLockClass Lock(&ib);
 		unsigned short *mem=Lock.Get_Index_Array();
+		if (!Lock.Is_Locked() || mem == nullptr) {
+			return;
+		}
 		for (int i=0; i<mesh.face_ct; i++)
 		{
 			mem[3*i]=mesh.tri_poly[i].I;
 			mem[3*i+1]=mesh.tri_poly[i].J;
 			mem[3*i+2]=mesh.tri_poly[i].K;
 		}
+		if (!Lock.Commit()) {
+			return;
+		}
 	}
 
-	DX8Wrapper::Set_Vertex_Buffer(vb);
-	DX8Wrapper::Set_Index_Buffer(ib,0);
+	if (!DX8Wrapper::Set_Vertex_Buffer(vb) ||
+		!DX8Wrapper::Set_Index_Buffer(ib,0)) {
+		return;
+	}
 
 	if (sort) {
 		SortingRendererClass::Insert_Triangles(Get_Bounding_Sphere(), 0, mesh.face_ct, 0, mesh.Vertex_ct);

@@ -139,7 +139,13 @@ MetalMapManagerClass::MetalMapManagerClass(INIClass &ini) :
 	bool windowed;
 
 	WW3D::Get_Device_Resolution(w,h,bits,windowed);
+#if defined(_WIN64)
+	// Native surfaces expose the canonical four-byte sampled representation,
+	// independent of the legacy display-mode bit depth.
+	Use16Bit=false;
+#else
 	Use16Bit=(bits<=16);
+#endif
 
 	WW3DFormat format=(Use16Bit?WW3D_FORMAT_A4R4G4B4:WW3D_FORMAT_A8R8G8B8);
 
@@ -341,8 +347,7 @@ void MetalMapManagerClass::Update_Textures()
 		}
 		metal_map_surface->Unlock();
 		REF_PTR_RELEASE(metal_map_surface);
-		Notify_Render_Texture_Changed(
-			Textures[i]->Peek_D3D_Base_Texture());
+		Notify_Render_Texture_Changed(Textures[i]);
 	}
 }
 

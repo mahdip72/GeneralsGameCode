@@ -28,6 +28,7 @@ public:
 	rts::render::RenderResult PublishThreadedCompletion(
 		rts::render::NativeW3DSubmissionSequence submissionSequence,
 		bool resourceFailure);
+	rts::render::RenderResult RecoverDevice();
 	rts::render::RenderResult Shutdown();
 	bool IsAttachedToBorrowedBackend() const;
 	rts::render::NativeW3DRenderer &Renderer();

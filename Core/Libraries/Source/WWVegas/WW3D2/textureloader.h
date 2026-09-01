@@ -294,6 +294,9 @@ class TextureLoadTaskClass : public TextureLoadTaskListNodeClass
 		virtual bool			Allocate_Prepared_Surfaces();
 		virtual bool			Create_D3D_Texture		();
 		virtual bool			Upload_Prepared_Surfaces();
+#if defined(_WIN64)
+		virtual bool			Publish_Native_Prepared_Texture();
+#endif
 		virtual void			Release_Prepared_Surfaces();
 		virtual size_t			Get_Prepare_Memory_Byte_Count() const;
 
@@ -352,6 +355,9 @@ protected:
 	virtual bool			Allocate_Prepared_Surfaces() override;
 	virtual bool			Create_D3D_Texture		() override;
 	virtual bool			Upload_Prepared_Surfaces() override;
+#if defined(_WIN64)
+	virtual bool			Publish_Native_Prepared_Texture() override;
+#endif
 	virtual void			Release_Prepared_Surfaces() override;
 	virtual size_t			Get_Prepare_Memory_Byte_Count() const override;
 //	virtual bool			Load_Uncompressed_Mipmap() override;
@@ -378,4 +384,7 @@ public:
 protected:
 	virtual bool			Begin_Compressed_Load	() override;
 	virtual bool			Begin_Uncompressed_Load	() override;
+#if defined(_WIN64)
+	virtual bool			Publish_Native_Prepared_Texture() override;
+#endif
 };

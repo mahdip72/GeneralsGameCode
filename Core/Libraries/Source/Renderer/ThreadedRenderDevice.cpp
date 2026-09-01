@@ -319,6 +319,10 @@ public:
 	RenderResult rollbackResource(GpuHandle);
 	bool poll(ThreadedRenderFrameCompletion *);
 	uint64_t lastSequence() const { return producer() ? m_lastSequence : 0; }
+	uint64_t currentSequence() const
+	{
+		return producer() && m_recording ? m_sequence : 0;
+	}
 	bool metrics(ThreadedRenderMetrics *) const;
 
 private:
@@ -1063,7 +1067,10 @@ RenderResult ThreadedRenderDevice::executeCommand(const Packet &packet, const Co
 		}
 		slot.contentValid = result == RENDER_RESULT_OK && slot.backend.isValid() &&
 			IsInitializedRange(slot.initializedBytes, 0, slot.byteCount);
-		slot.recoverySourceValid = slot.contentValid;
+		// Only immutable buffers have an explicit recreatable creation source.
+		// Mutable buffers retain no persistent byte shadow and must republish.
+		slot.recoverySourceValid = descriptor.usage == RENDER_USAGE_IMMUTABLE &&
+			slot.contentValid;
 		return result == RENDER_RESULT_OK && !slot.backend.isValid() ? RENDER_RESULT_FAILED : result;
 	}
 	case OP_CREATE_TEXTURE: case OP_REFRESH_TEXTURE:
@@ -1142,7 +1149,6 @@ RenderResult ThreadedRenderDevice::executeCommand(const Packet &packet, const Co
 			slot.initializedBytes.swap(nextRanges);
 			slot.contentValid = IsInitializedRange(slot.initializedBytes, 0,
 				slot.byteCount);
-			slot.recoverySourceValid = slot.recoverySourceValid || slot.contentValid;
 			slot.writtenSequence = m_ownerFrameActive ? m_ownerSequence : 0;
 		}
 		else
@@ -1392,10 +1398,20 @@ void ThreadedRenderDevice::execute(Packet &packet)
 				m_ownerDeviceRemoved = false;
 				for (OwnerResource &slot : m_ownerResources)
 				{
-					if (slot.gpuAuthoritative) slot.contentValid = false;
-					else if (!slot.texture && slot.recoverySourceValid)
-						slot.contentValid = IsInitializedRange(slot.initializedBytes,
-							0, slot.byteCount);
+					if (!slot.texture)
+					{
+						slot.contentValid = slot.recoverySourceValid &&
+							IsInitializedRange(slot.initializedBytes, 0,
+								slot.byteCount);
+						if (!slot.contentValid)
+						{
+							slot.initializedBytes.clear();
+						}
+					}
+					else if (slot.gpuAuthoritative)
+					{
+						slot.contentValid = false;
+					}
 				}
 				m_drainFailure = m_outsideFailure = m_ownerFrameResult = RENDER_RESULT_OK;
 				m_outsideResourceFailure = false;
@@ -1469,24 +1485,16 @@ void ThreadedRenderDevice::execute(Packet &packet)
 		// Later CPU frames may already be queued with these handles. Invalidate
 		// the failed producer's GPU results before executing any dependent frame,
 		// independently of when the game owner polls completion/cache revisions.
+		// A successful CPU upload is already fenced owner state and survives an
+		// unrelated draw/end/present failure in the same frame.
 		for (OwnerResource &slot : m_ownerResources)
 		{
-			if (slot.writtenSequence == packet.sequence)
+			if (slot.gpuAuthoritative &&
+				slot.writtenSequence == packet.sequence)
 			{
 				slot.contentValid = false;
 				slot.initializedBytes.clear();
 				m_ownerResourceFailure = true;
-			}
-		}
-		if (m_ownerResourceFailure)
-		{
-			for (OwnerResource &slot : m_ownerResources)
-			{
-				if (!slot.texture)
-				{
-					slot.contentValid = false;
-					slot.initializedBytes.clear();
-				}
 			}
 		}
 	}
@@ -1601,6 +1609,12 @@ uint64_t LastThreadedRenderFrameSequence(const IRenderDevice *device)
 {
 	const ThreadedRenderDevice *threaded = dynamic_cast<const ThreadedRenderDevice *>(device);
 	return threaded ? threaded->lastSequence() : 0;
+}
+uint64_t CurrentThreadedRenderFrameSequence(const IRenderDevice *device)
+{
+	const ThreadedRenderDevice *threaded =
+		dynamic_cast<const ThreadedRenderDevice *>(device);
+	return threaded ? threaded->currentSequence() : 0;
 }
 bool PollThreadedRenderCompletion(IRenderDevice *device, ThreadedRenderFrameCompletion *completion)
 {

@@ -128,6 +128,14 @@ Bool W3DVideoBuffer::allocate( UnsignedInt width, UnsignedInt height )
 	m_textureHeight = height;
 	if (DX8Wrapper::Is_D3D11_Backend_Active())
 	{
+		// The native lock surface exposes canonical BGRA8 bytes. Refuse legacy
+		// packed decoder layouts instead of allowing them to partially overwrite
+		// a four-byte native row; the video player can select its deterministic
+		// unsupported-format fallback.
+		if (m_format != TYPE_X8R8G8B8)
+		{
+			return FALSE;
+		}
 		// Preserve native 4K dimensions without accepting malformed movies that
 		// exceed the bridge's bounded full-level publication contract.
 		const UnsignedInt max_texture_dimension = 16384;
@@ -238,7 +246,7 @@ Bool W3DVideoBuffer::publishLockedFrame()
 	const size_t row_pitch = static_cast<size_t>(m_pitch);
 
 	m_framePublished = Publish_Render_Texture_BGRA8_Change(
-		m_texture->Peek_D3D_Base_Texture(), m_lockedMemory, row_pitch,
+		m_texture, m_lockedMemory, row_pitch,
 		slice_pitch) ? TRUE : FALSE;
 	return m_framePublished;
 }
@@ -267,8 +275,7 @@ void		W3DVideoBuffer::unlock()
 		// conservative D3D8/Bink path.
 		if ( !frame_published && m_texture != nullptr )
 		{
-			Notify_Render_Texture_Changed(
-				m_texture->Peek_D3D_Base_Texture());
+			Notify_Render_Texture_Changed(m_texture);
 		}
 	}
 }

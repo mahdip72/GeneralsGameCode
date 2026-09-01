@@ -104,8 +104,36 @@ struct SHADOW_STATIC_VOLUME_VERTEX	//vertex structure passed to D3D
 	#define SHADOW_DYNAMIC_VOLUME_FVF	D3DFVF_XYZ
 #endif
 
-LPDIRECT3DVERTEXBUFFER8 shadowVertexBufferD3D=nullptr;		///<bridge-facing D3D vertex-buffer handle
-LPDIRECT3DINDEXBUFFER8	shadowIndexBufferD3D=nullptr;	///<bridge-facing D3D index-buffer handle
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+typedef DX8VertexBufferClass *ShadowVertexBufferHandle;
+typedef DX8IndexBufferClass *ShadowIndexBufferHandle;
+#else
+typedef LPDIRECT3DVERTEXBUFFER8 ShadowVertexBufferHandle;
+typedef LPDIRECT3DINDEXBUFFER8 ShadowIndexBufferHandle;
+#endif
+
+static ShadowVertexBufferHandle Get_Shadow_Vertex_Buffer_Handle(
+	DX8VertexBufferClass *owner)
+{
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	return owner != nullptr && owner->Is_Valid() ? owner : nullptr;
+#else
+	return owner != nullptr ? owner->Get_DX8_Vertex_Buffer() : nullptr;
+#endif
+}
+
+static ShadowIndexBufferHandle Get_Shadow_Index_Buffer_Handle(
+	DX8IndexBufferClass *owner)
+{
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	return owner != nullptr && owner->Is_Valid() ? owner : nullptr;
+#else
+	return owner != nullptr ? owner->Get_DX8_Index_Buffer() : nullptr;
+#endif
+}
+
+ShadowVertexBufferHandle shadowVertexBufferD3D=nullptr;
+ShadowIndexBufferHandle shadowIndexBufferD3D=nullptr;
 DX8VertexBufferClass *shadowVertexBufferOwner=nullptr;
 DX8IndexBufferClass *shadowIndexBufferOwner=nullptr;
 int nShadowVertsInBuf=0;	//model vetices in vertex buffer
@@ -124,7 +152,7 @@ static Real beX;
 static Real beY;
 static Real beZ;
 
-static LPDIRECT3DVERTEXBUFFER8 lastActiveVertexBuffer=nullptr;
+static ShadowVertexBufferHandle lastActiveVertexBuffer=nullptr;
 
 /** A simple structure to hold random geometry (vertices, polygons, etc.).  We'll use this
 * to store shadow volumes. */
@@ -1251,8 +1279,10 @@ void W3DVolumetricShadow::RenderMeshVolume(Int meshIndex, Int lightIndex, const 
 	W3DBufferManager::W3DVertexBufferSlot *vbSlot=m_shadowVolumeVB[lightIndex][ meshIndex ];
 	if (!vbSlot)
 		return;
-	if (vbSlot->m_VB->m_DX8VertexBuffer->Get_DX8_Vertex_Buffer() != lastActiveVertexBuffer)
-	{	lastActiveVertexBuffer=vbSlot->m_VB->m_DX8VertexBuffer->Get_DX8_Vertex_Buffer();
+	if (Get_Shadow_Vertex_Buffer_Handle(
+		vbSlot->m_VB->m_DX8VertexBuffer) != lastActiveVertexBuffer)
+	{	lastActiveVertexBuffer=Get_Shadow_Vertex_Buffer_Handle(
+			vbSlot->m_VB->m_DX8VertexBuffer);
 		DX8Wrapper::Set_DX8_Vertex_Buffer(lastActiveVertexBuffer,
 			vbSlot->m_VB->m_DX8VertexBuffer->FVF_Info().Get_FVF_Size(),
 			D3DFVF_XYZ);	//12 bytes per vertex.
@@ -1273,7 +1303,8 @@ void W3DVolumetricShadow::RenderMeshVolume(Int meshIndex, Int lightIndex, const 
 	DEBUG_ASSERTCRASH(ibSlot->m_size >= numIndex,("Overflowing Shadow Index Buffer Slot"));
 
 	DX8Wrapper::Set_DX8_Index_Buffer(
-		ibSlot->m_IB->m_DX8IndexBuffer->Get_DX8_Index_Buffer(), vbSlot->m_start);
+		Get_Shadow_Index_Buffer_Handle(ibSlot->m_IB->m_DX8IndexBuffer),
+		vbSlot->m_start);
 
 	if (DX8Wrapper::_Is_Triangle_Draw_Enabled())
 	{
@@ -3373,7 +3404,8 @@ void W3DVolumetricShadowManager::renderShadows( Bool forceStencilFill )
 	#else
 		//disable writes to color buffer
 		if (DX8Wrapper::Get_Current_Caps()->Get_DX8_Caps().PrimitiveMiscCaps & D3DPMISCCAPS_COLORWRITEENABLE)
-		{	DX8Wrapper::_Get_D3D_Device8()->GetRenderState(D3DRS_COLORWRITEENABLE, &oldColorWriteEnable);
+		{	oldColorWriteEnable=DX8Wrapper::Get_DX8_Render_State(
+				D3DRS_COLORWRITEENABLE);
 			DX8Wrapper::Set_DX8_Render_State(D3DRS_COLORWRITEENABLE,0);
 		}
 		else
@@ -3643,7 +3675,8 @@ Bool W3DVolumetricShadowManager::ReAcquireResources()
 		(static_cast<unsigned short>(SHADOW_INDEX_SIZE),
 		DX8IndexBufferClass::USAGE_DYNAMIC));
 	if (shadowIndexBufferOwner == nullptr ||
-		(shadowIndexBufferD3D=shadowIndexBufferOwner->Get_DX8_Index_Buffer()) == nullptr)
+		(shadowIndexBufferD3D=Get_Shadow_Index_Buffer_Handle(
+			shadowIndexBufferOwner)) == nullptr)
 	{
 		REF_PTR_RELEASE(shadowIndexBufferOwner);
 		shadowIndexBufferD3D=nullptr;
@@ -3655,7 +3688,8 @@ Bool W3DVolumetricShadowManager::ReAcquireResources()
 		static_cast<unsigned short>(SHADOW_VERTEX_SIZE),
 		DX8VertexBufferClass::USAGE_DYNAMIC));
 	if (shadowVertexBufferOwner == nullptr ||
-		(shadowVertexBufferD3D=shadowVertexBufferOwner->Get_DX8_Vertex_Buffer()) == nullptr)
+		(shadowVertexBufferD3D=Get_Shadow_Vertex_Buffer_Handle(
+			shadowVertexBufferOwner)) == nullptr)
 	{
 		REF_PTR_RELEASE(shadowVertexBufferOwner);
 		REF_PTR_RELEASE(shadowIndexBufferOwner);

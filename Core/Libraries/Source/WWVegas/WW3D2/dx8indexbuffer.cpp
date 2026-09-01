@@ -44,6 +44,9 @@
 #include "WWMath/sphere.h"
 #include "WWLib/thread.h"
 #include "WWDebug/wwmemlog.h"
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+#include "nativew3dbufferowner.h"
+#endif
 
 #define DEFAULT_IB_SIZE 5000
 
@@ -60,6 +63,45 @@ static unsigned short _DynamicDX8IndexBufferOffset=0;
 static int _IndexBufferCount;
 static int _IndexBufferTotalIndices;
 static int _IndexBufferTotalSize;
+
+static bool Use_Index_Range_Lock(unsigned int first_index,
+	unsigned int count, unsigned int index_count)
+{
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	return first_index != 0 || count != index_count;
+#else
+	return first_index != 0;
+#endif
+}
+
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+static bool Get_Native_Buffer_Update_Mode(int flags,
+	rts::render::RenderBufferUpdateMode *mode)
+{
+	const unsigned int supported_flags = D3DLOCK_DISCARD |
+		D3DLOCK_NOOVERWRITE | D3DLOCK_NOSYSLOCK;
+	if (mode == nullptr ||
+		(static_cast<unsigned int>(flags) & ~supported_flags) != 0 ||
+		((flags & D3DLOCK_DISCARD) != 0 &&
+		 (flags & D3DLOCK_NOOVERWRITE) != 0))
+	{
+		return false;
+	}
+	if ((flags & D3DLOCK_DISCARD) != 0)
+	{
+		*mode = rts::render::RENDER_BUFFER_UPDATE_DISCARD;
+	}
+	else if ((flags & D3DLOCK_NOOVERWRITE) != 0)
+	{
+		*mode = rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE;
+	}
+	else
+	{
+		*mode = rts::render::RENDER_BUFFER_UPDATE_PRESERVE;
+	}
+	return true;
+}
+#endif
 
 // ----------------------------------------------------------------------------
 //
@@ -172,45 +214,83 @@ bool IndexBufferClass::Get_Change_Since(unsigned int uploaded_generation,
 //
 // ----------------------------------------------------------------------------
 
-void IndexBufferClass::Copy(unsigned int* indices,unsigned first_index,unsigned count)
+bool IndexBufferClass::Copy(unsigned int* indices,unsigned first_index,unsigned count)
 {
 	WWASSERT(indices);
+	if (indices == nullptr || first_index > Get_Index_Count() ||
+		count > Get_Index_Count() - first_index)
+	{
+		return false;
+	}
+	if (count == 0)
+	{
+		return true;
+	}
 
-	if (first_index) {
+	if (Use_Index_Range_Lock(first_index, count, Get_Index_Count())) {
 		DX8IndexBufferClass::AppendLockClass l(this,first_index,count);
 		unsigned short* inds=l.Get_Index_Array();
+		if (!l.Is_Locked() || inds == nullptr)
+		{
+			return false;
+		}
 		for (unsigned v=0;v<count;++v) {
 			*inds++=(unsigned short)(*indices++);
 		}
+		return l.Commit();
 	}
 	else {
 		DX8IndexBufferClass::WriteLockClass l(this);
 		unsigned short* inds=l.Get_Index_Array();
+		if (!l.Is_Locked() || inds == nullptr)
+		{
+			return false;
+		}
 		for (unsigned v=0;v<count;++v) {
 			*inds++=(unsigned short)(*indices++);
 		}
+		return l.Commit();
 	}
 }
 
 // ----------------------------------------------------------------------------
 
-void IndexBufferClass::Copy(unsigned short* indices,unsigned first_index,unsigned count)
+bool IndexBufferClass::Copy(unsigned short* indices,unsigned first_index,unsigned count)
 {
 	WWASSERT(indices);
+	if (indices == nullptr || first_index > Get_Index_Count() ||
+		count > Get_Index_Count() - first_index)
+	{
+		return false;
+	}
+	if (count == 0)
+	{
+		return true;
+	}
 
-	if (first_index) {
+	if (Use_Index_Range_Lock(first_index, count, Get_Index_Count())) {
 		DX8IndexBufferClass::AppendLockClass l(this,first_index,count);
 		unsigned short* inds=l.Get_Index_Array();
+		if (!l.Is_Locked() || inds == nullptr)
+		{
+			return false;
+		}
 		for (unsigned v=0;v<count;++v) {
 			*inds++=*indices++;
 		}
+		return l.Commit();
 	}
 	else {
 		DX8IndexBufferClass::WriteLockClass l(this);
 		unsigned short* inds=l.Get_Index_Array();
+		if (!l.Is_Locked() || inds == nullptr)
+		{
+			return false;
+		}
 		for (unsigned v=0;v<count;++v) {
 			*inds++=*indices++;
 		}
+		return l.Commit();
 	}
 }
 
@@ -220,7 +300,8 @@ void IndexBufferClass::Copy(unsigned short* indices,unsigned first_index,unsigne
 // ----------------------------------------------------------------------------
 
 
-IndexBufferClass::WriteLockClass::WriteLockClass(IndexBufferClass* index_buffer_, int flags) : index_buffer(index_buffer_)
+IndexBufferClass::WriteLockClass::WriteLockClass(IndexBufferClass* index_buffer_, int flags) :
+	index_buffer(index_buffer_), indices(nullptr), locked(false)
 {
 	DX8_THREAD_ASSERT();
 	WWASSERT(index_buffer);
@@ -228,15 +309,25 @@ IndexBufferClass::WriteLockClass::WriteLockClass(IndexBufferClass* index_buffer_
 	index_buffer->Add_Ref();
 	switch (index_buffer->Type()) {
 	case BUFFER_TYPE_DX8:
-		DX8_Assert();
-		DX8_ErrorCode(static_cast<DX8IndexBufferClass*>(index_buffer)->Get_DX8_Index_Buffer()->Lock(
-			0,
-			index_buffer->Get_Index_Count()*sizeof(WORD),
-			(unsigned char**)&indices,
-			flags));
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		locked = static_cast<DX8IndexBufferClass *>(index_buffer)->
+			Lock_Native_Buffer(0,
+				static_cast<size_t>(index_buffer->Get_Index_Count()) * sizeof(WORD),
+				flags, reinterpret_cast<void **>(&indices));
+#else
+		{
+			DX8_Assert();
+			const HRESULT result = static_cast<DX8IndexBufferClass*>(index_buffer)->Get_DX8_Index_Buffer()->Lock(
+				0, index_buffer->Get_Index_Count()*sizeof(WORD),
+				(unsigned char**)&indices, flags);
+			DX8_ErrorCode(result);
+			locked = SUCCEEDED(result);
+		}
+#endif
 		break;
 	case BUFFER_TYPE_SORTING:
 		indices=static_cast<SortingIndexBufferClass*>(index_buffer)->index_buffer;
+		locked = true;
 		break;
 	default:
 		WWASSERT(0);
@@ -252,10 +343,31 @@ IndexBufferClass::WriteLockClass::WriteLockClass(IndexBufferClass* index_buffer_
 IndexBufferClass::WriteLockClass::~WriteLockClass()
 {
 	DX8_THREAD_ASSERT();
+	Commit();
+	index_buffer->Release_Ref();
+}
+
+bool IndexBufferClass::WriteLockClass::Commit()
+{
+	if (!locked)
+	{
+		return false;
+	}
+	bool changed = true;
 	switch (index_buffer->Type()) {
 	case BUFFER_TYPE_DX8:
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		changed = locked && static_cast<DX8IndexBufferClass *>(index_buffer)->
+			Unlock_Native_Buffer();
+#else
 		DX8_Assert();
-		DX8_ErrorCode(static_cast<DX8IndexBufferClass*>(index_buffer)->index_buffer->Unlock());
+		if (locked)
+		{
+			const HRESULT result = static_cast<DX8IndexBufferClass*>(index_buffer)->index_buffer->Unlock();
+			DX8_ErrorCode(result);
+			changed = SUCCEEDED(result);
+		}
+#endif
 		break;
 	case BUFFER_TYPE_SORTING:
 		break;
@@ -263,15 +375,20 @@ IndexBufferClass::WriteLockClass::~WriteLockClass()
 		WWASSERT(0);
 		break;
 	}
-	index_buffer->Mark_Changed();
-	index_buffer->Release_Ref();
+	if (changed)
+	{
+		index_buffer->Mark_Changed();
+	}
+	locked = false;
+	indices = nullptr;
+	return changed;
 }
 
 // ----------------------------------------------------------------------------
 
 IndexBufferClass::AppendLockClass::AppendLockClass(IndexBufferClass* index_buffer_,unsigned start_index, unsigned index_range)
 	:
-	index_buffer(index_buffer_)
+	index_buffer(index_buffer_), indices(nullptr), locked(false)
 {
 	DX8_THREAD_ASSERT();
 	WWASSERT(start_index+index_range<=index_buffer->Get_Index_Count());
@@ -280,15 +397,27 @@ IndexBufferClass::AppendLockClass::AppendLockClass(IndexBufferClass* index_buffe
 	index_buffer->Add_Ref();
 	switch (index_buffer->Type()) {
 	case BUFFER_TYPE_DX8:
-		DX8_Assert();
-		DX8_ErrorCode(static_cast<DX8IndexBufferClass*>(index_buffer)->index_buffer->Lock(
-			start_index*sizeof(unsigned short),
-			index_range*sizeof(unsigned short),
-			(unsigned char**)&indices,
-			0));
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		locked = static_cast<DX8IndexBufferClass *>(index_buffer)->
+			Lock_Native_Buffer(
+				static_cast<size_t>(start_index) * sizeof(unsigned short),
+				static_cast<size_t>(index_range) * sizeof(unsigned short), 0,
+				reinterpret_cast<void **>(&indices));
+#else
+		{
+			DX8_Assert();
+			const HRESULT result = static_cast<DX8IndexBufferClass*>(index_buffer)->index_buffer->Lock(
+				start_index*sizeof(unsigned short),
+				index_range*sizeof(unsigned short),
+				(unsigned char**)&indices, 0);
+			DX8_ErrorCode(result);
+			locked = SUCCEEDED(result);
+		}
+#endif
 		break;
 	case BUFFER_TYPE_SORTING:
 		indices=static_cast<SortingIndexBufferClass*>(index_buffer)->index_buffer+start_index;
+		locked = true;
 		break;
 	default:
 		WWASSERT(0);
@@ -301,10 +430,31 @@ IndexBufferClass::AppendLockClass::AppendLockClass(IndexBufferClass* index_buffe
 IndexBufferClass::AppendLockClass::~AppendLockClass()
 {
 	DX8_THREAD_ASSERT();
+	Commit();
+	index_buffer->Release_Ref();
+}
+
+bool IndexBufferClass::AppendLockClass::Commit()
+{
+	if (!locked)
+	{
+		return false;
+	}
+	bool changed = locked;
 	switch (index_buffer->Type()) {
 	case BUFFER_TYPE_DX8:
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		changed = locked && static_cast<DX8IndexBufferClass *>(index_buffer)->
+			Unlock_Native_Buffer();
+#else
 		DX8_Assert();
-		DX8_ErrorCode(static_cast<DX8IndexBufferClass*>(index_buffer)->index_buffer->Unlock());
+		if (locked)
+		{
+			const HRESULT result = static_cast<DX8IndexBufferClass*>(index_buffer)->index_buffer->Unlock();
+			DX8_ErrorCode(result);
+			changed = SUCCEEDED(result);
+		}
+#endif
 		break;
 	case BUFFER_TYPE_SORTING:
 		break;
@@ -312,8 +462,13 @@ IndexBufferClass::AppendLockClass::~AppendLockClass()
 		WWASSERT(0);
 		break;
 	}
-	index_buffer->Mark_Changed();
-	index_buffer->Release_Ref();
+	if (changed)
+	{
+		index_buffer->Mark_Changed();
+	}
+	locked = false;
+	indices = nullptr;
+	return changed;
 }
 
 // ----------------------------------------------------------------------------
@@ -325,9 +480,36 @@ IndexBufferClass::AppendLockClass::~AppendLockClass()
 DX8IndexBufferClass::DX8IndexBufferClass(unsigned short index_count_,UsageType usage)
 	:
 	IndexBufferClass(BUFFER_TYPE_DX8,index_count_)
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	,native_buffer(nullptr)
+#else
+	,index_buffer(nullptr)
+#endif
 {
 	DX8_THREAD_ASSERT();
 	WWASSERT(index_count);
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	native_buffer = W3DNEW rts::render::NativeW3DBufferOwner;
+	if (native_buffer == nullptr)
+	{
+		WWDEBUG_SAY(("Native index buffer owner allocation failed"));
+		return;
+	}
+	rts::render::BufferDescriptor descriptor;
+	descriptor.byteCount = static_cast<size_t>(index_count) * sizeof(WORD);
+	descriptor.stride = sizeof(WORD);
+	descriptor.binding = rts::render::RENDER_BUFFER_INDEX;
+	descriptor.usage = (usage & USAGE_DYNAMIC) != 0 ?
+		rts::render::RENDER_USAGE_DYNAMIC : rts::render::RENDER_USAGE_DEFAULT;
+	const rts::render::RenderResult result = native_buffer->Create(descriptor);
+	if (result != rts::render::RENDER_RESULT_OK)
+	{
+		WWDEBUG_SAY(("Native index buffer creation failed: %d",
+			static_cast<int>(result)));
+		delete native_buffer;
+		native_buffer = nullptr;
+	}
+#else
 	unsigned usage_flags=
 		D3DUSAGE_WRITEONLY|
 		((usage&USAGE_DYNAMIC) ? D3DUSAGE_DYNAMIC : 0)|
@@ -372,14 +554,128 @@ DX8IndexBufferClass::DX8IndexBufferClass(unsigned short index_count_,UsageType u
 
 	// If it still fails it is fatal
 	DX8_ErrorCode(ret);
+#endif
 }
 
 // ----------------------------------------------------------------------------
 
 DX8IndexBufferClass::~DX8IndexBufferClass()
 {
-	index_buffer->Release();
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	delete native_buffer;
+	native_buffer = nullptr;
+#else
+	if (index_buffer != nullptr)
+	{
+		index_buffer->Release();
+	}
+#endif
 }
+
+bool DX8IndexBufferClass::Is_Valid() const
+{
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	return native_buffer != nullptr && !native_buffer->HasFailedMutation();
+#else
+	return index_buffer != nullptr;
+#endif
+}
+
+bool DX8IndexBufferClass::Lock_Buffer(size_t byte_offset,
+	size_t byte_count, int flags, void **data)
+{
+	if (data == nullptr)
+	{
+		return false;
+	}
+	*data = nullptr;
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	return Lock_Native_Buffer(byte_offset, byte_count, flags, data);
+#else
+	if (index_buffer == nullptr)
+	{
+		return false;
+	}
+	DX8_Assert();
+	const HRESULT result = index_buffer->Lock(
+		static_cast<unsigned int>(byte_offset),
+		static_cast<unsigned int>(byte_count),
+		reinterpret_cast<unsigned char **>(data), flags);
+	DX8_ErrorCode(result);
+	return SUCCEEDED(result);
+#endif
+}
+
+bool DX8IndexBufferClass::Unlock_Buffer()
+{
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	const bool changed = Unlock_Native_Buffer();
+#else
+	if (index_buffer == nullptr)
+	{
+		return false;
+	}
+	DX8_Assert();
+	const HRESULT result = index_buffer->Unlock();
+	DX8_ErrorCode(result);
+	const bool changed = SUCCEEDED(result);
+#endif
+	if (changed)
+	{
+		Mark_Changed();
+	}
+	return changed;
+}
+
+HRESULT DX8IndexBufferClass::Lock(UINT byte_offset, UINT byte_count,
+	unsigned char **data, DWORD flags)
+{
+	return Lock_Buffer(byte_offset, byte_count, flags,
+		reinterpret_cast<void **>(data)) ? D3D_OK : E_FAIL;
+}
+
+HRESULT DX8IndexBufferClass::Unlock()
+{
+	return Unlock_Buffer() ? D3D_OK : E_FAIL;
+}
+
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+bool DX8IndexBufferClass::Acquire_Native_Index_Buffer(unsigned int offset,
+	unsigned int start_index, unsigned int index_count,
+	rts::render::GpuHandle *validated) const
+{
+	if (validated == nullptr)
+	{
+		return false;
+	}
+	*validated = rts::render::GpuHandle();
+	return native_buffer != nullptr &&
+		native_buffer->AcquireIndexRange(rts::render::RENDER_FORMAT_R16_UINT,
+			offset, start_index, index_count, validated) ==
+			rts::render::RENDER_RESULT_OK;
+}
+
+bool DX8IndexBufferClass::Lock_Native_Buffer(size_t offset,
+	size_t byte_count, int flags, void **data)
+{
+	if (data == nullptr)
+	{
+		return false;
+	}
+	*data = nullptr;
+	rts::render::RenderBufferUpdateMode mode;
+	return native_buffer != nullptr &&
+		Get_Native_Buffer_Update_Mode(flags, &mode) &&
+		native_buffer->Lock(offset, byte_count, mode, data) ==
+			rts::render::RENDER_RESULT_OK;
+}
+
+bool DX8IndexBufferClass::Unlock_Native_Buffer()
+{
+	return native_buffer != nullptr &&
+		native_buffer->Unlock() == rts::render::RENDER_RESULT_OK;
+}
+#endif
 
 // ----------------------------------------------------------------------------
 //
@@ -412,9 +708,10 @@ SortingIndexBufferClass::~SortingIndexBufferClass()
 
 DynamicIBAccessClass::DynamicIBAccessClass(unsigned short type_, unsigned short index_count_)
 	:
+	Type(type_),
 	IndexCount(index_count_),
-	IndexBuffer(nullptr),
-	Type(type_)
+	IndexBufferOffset(0),
+	IndexBuffer(nullptr)
 {
 	WWASSERT(Type==BUFFER_TYPE_DYNAMIC_DX8 || Type==BUFFER_TYPE_DYNAMIC_SORTING);
 	if (Type==BUFFER_TYPE_DYNAMIC_DX8) {
@@ -427,15 +724,26 @@ DynamicIBAccessClass::DynamicIBAccessClass(unsigned short type_, unsigned short 
 
 DynamicIBAccessClass::~DynamicIBAccessClass()
 {
+	const bool valid = Is_Valid();
 	REF_PTR_RELEASE(IndexBuffer);
 	if (Type==BUFFER_TYPE_DYNAMIC_DX8) {
 		_DynamicDX8IndexBufferInUse=false;
-		_DynamicDX8IndexBufferOffset+=IndexCount;
+		if (valid) _DynamicDX8IndexBufferOffset+=IndexCount;
 	}
 	else {
 		_DynamicSortingIndexArrayInUse=false;
-		_DynamicSortingIndexArrayOffset+=IndexCount;
+		if (valid) _DynamicSortingIndexArrayOffset+=IndexCount;
 	}
+}
+
+bool DynamicIBAccessClass::Is_Valid() const
+{
+	if (IndexBuffer == nullptr)
+	{
+		return false;
+	}
+	return Type != BUFFER_TYPE_DYNAMIC_DX8 ||
+		static_cast<DX8IndexBufferClass *>(IndexBuffer)->Is_Valid();
 }
 
 void DynamicIBAccessClass::_Deinit()
@@ -461,25 +769,44 @@ void DynamicIBAccessClass::_Deinit()
 
 DynamicIBAccessClass::WriteLockClass::WriteLockClass(DynamicIBAccessClass* ib_access_)
 	:
-	DynamicIBAccess(ib_access_)
+	DynamicIBAccess(ib_access_), Indices(nullptr), Locked(false), Referenced(false)
 {
 	DX8_THREAD_ASSERT();
+	if (DynamicIBAccess == nullptr || !DynamicIBAccess->Is_Valid())
+	{
+		return;
+	}
 	DynamicIBAccess->IndexBuffer->Add_Ref();
+	Referenced = true;
 	switch (DynamicIBAccess->Get_Type()) {
 	case BUFFER_TYPE_DYNAMIC_DX8:
 		WWASSERT(DynamicIBAccess);
 //		WWASSERT(!dynamic_dx8_index_buffer->Engine_Refs());
-		DX8_Assert();
-		DX8_ErrorCode(
-			static_cast<DX8IndexBufferClass*>(DynamicIBAccess->IndexBuffer)->Get_DX8_Index_Buffer()->Lock(
-			DynamicIBAccess->IndexBufferOffset*sizeof(WORD),
-			DynamicIBAccess->Get_Index_Count()*sizeof(WORD),
-			(unsigned char**)&Indices,
-			!DynamicIBAccess->IndexBufferOffset ? D3DLOCK_DISCARD : D3DLOCK_NOOVERWRITE));
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		Locked = static_cast<DX8IndexBufferClass *>(
+			DynamicIBAccess->IndexBuffer)->Lock_Native_Buffer(
+				static_cast<size_t>(DynamicIBAccess->IndexBufferOffset) * sizeof(WORD),
+				static_cast<size_t>(DynamicIBAccess->Get_Index_Count()) * sizeof(WORD),
+				!DynamicIBAccess->IndexBufferOffset ?
+					D3DLOCK_DISCARD : D3DLOCK_NOOVERWRITE,
+				reinterpret_cast<void **>(&Indices));
+#else
+		{
+			DX8_Assert();
+			const HRESULT result = static_cast<DX8IndexBufferClass*>(DynamicIBAccess->IndexBuffer)->Get_DX8_Index_Buffer()->Lock(
+				DynamicIBAccess->IndexBufferOffset*sizeof(WORD),
+				DynamicIBAccess->Get_Index_Count()*sizeof(WORD),
+				(unsigned char**)&Indices,
+				!DynamicIBAccess->IndexBufferOffset ? D3DLOCK_DISCARD : D3DLOCK_NOOVERWRITE);
+			DX8_ErrorCode(result);
+			Locked = SUCCEEDED(result);
+		}
+#endif
 		break;
 	case BUFFER_TYPE_DYNAMIC_SORTING:
 		Indices=static_cast<SortingIndexBufferClass*>(DynamicIBAccess->IndexBuffer)->index_buffer;
 		Indices+=DynamicIBAccess->IndexBufferOffset;
+		Locked = true;
 		break;
 	default:
 		WWASSERT(0);
@@ -490,14 +817,31 @@ DynamicIBAccessClass::WriteLockClass::WriteLockClass(DynamicIBAccessClass* ib_ac
 DynamicIBAccessClass::WriteLockClass::~WriteLockClass()
 {
 	DX8_THREAD_ASSERT();
+	Commit();
+	if (Referenced && DynamicIBAccess != nullptr &&
+		DynamicIBAccess->IndexBuffer != nullptr)
+	{
+		DynamicIBAccess->IndexBuffer->Release_Ref();
+	}
+	Referenced = false;
+}
+
+bool DynamicIBAccessClass::WriteLockClass::Commit()
+{
+	if (!Locked || DynamicIBAccess == nullptr || !DynamicIBAccess->Is_Valid())
+	{
+		return false;
+	}
 	const unsigned int change_flags =
 		!DynamicIBAccess->IndexBufferOffset ?
 			D3DLOCK_DISCARD : D3DLOCK_NOOVERWRITE;
-	DynamicIBAccess->IndexBuffer->Mark_Changed_Range(
-		DynamicIBAccess->IndexBufferOffset,
-		DynamicIBAccess->Get_Index_Count(), change_flags);
+	bool changed = Locked;
 	switch (DynamicIBAccess->Get_Type()) {
 	case BUFFER_TYPE_DYNAMIC_DX8:
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		changed = Locked && static_cast<DX8IndexBufferClass *>(
+			DynamicIBAccess->IndexBuffer)->Unlock_Native_Buffer();
+#else
 		DX8_Assert();
 		Publish_Render_Buffer_Change(
 			static_cast<DX8IndexBufferClass *>(
@@ -509,7 +853,13 @@ DynamicIBAccessClass::WriteLockClass::~WriteLockClass()
 				rts::render::RENDER_BUFFER_UPDATE_DISCARD :
 				rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE,
 			DynamicIBAccess->IndexBuffer->Get_Generation());
-		DX8_ErrorCode(static_cast<DX8IndexBufferClass*>(DynamicIBAccess->IndexBuffer)->Get_DX8_Index_Buffer()->Unlock());
+		if (Locked)
+		{
+			const HRESULT result = static_cast<DX8IndexBufferClass*>(DynamicIBAccess->IndexBuffer)->Get_DX8_Index_Buffer()->Unlock();
+			DX8_ErrorCode(result);
+			changed = SUCCEEDED(result);
+		}
+#endif
 		break;
 	case BUFFER_TYPE_DYNAMIC_SORTING:
 		break;
@@ -517,7 +867,15 @@ DynamicIBAccessClass::WriteLockClass::~WriteLockClass()
 		WWASSERT(0);
 		break;
 	}
-	DynamicIBAccess->IndexBuffer->Release_Ref();
+	if (changed)
+	{
+		DynamicIBAccess->IndexBuffer->Mark_Changed_Range(
+			DynamicIBAccess->IndexBufferOffset,
+			DynamicIBAccess->Get_Index_Count(), change_flags);
+	}
+	Locked = false;
+	Indices = nullptr;
+	return changed;
 }
 
 // ----------------------------------------------------------------------------
@@ -543,14 +901,21 @@ void DynamicIBAccessClass::Allocate_DX8_Dynamic_Buffer()
 	// Create a new vb if one doesn't exist currently
 	if (!_DynamicDX8IndexBuffer) {
 		unsigned usage=DX8IndexBufferClass::USAGE_DYNAMIC;
+#if !defined(_WIN64) || !defined(RTS_RENDERER_HAS_D3D11)
 		if (DX8Wrapper::Get_Current_Caps()->Support_NPatches()) {
 			usage|=DX8IndexBufferClass::USAGE_NPATCHES;
 		}
+#endif
 
 		_DynamicDX8IndexBuffer=NEW_REF(DX8IndexBufferClass,(
 			_DynamicDX8IndexBufferSize,
 			(DX8IndexBufferClass::UsageType)usage));
 		_DynamicDX8IndexBufferOffset=0;
+	}
+	if (_DynamicDX8IndexBuffer != nullptr &&
+		!_DynamicDX8IndexBuffer->Is_Valid())
+	{
+		REF_PTR_RELEASE(_DynamicDX8IndexBuffer);
 	}
 
 	// Any room at the end of the buffer?

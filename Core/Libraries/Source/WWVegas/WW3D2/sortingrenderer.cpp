@@ -332,6 +332,18 @@ static const unsigned MAX_OVERLAPPING_NODES=4096;
 static SortingNodeStruct* overlapping_nodes[MAX_OVERLAPPING_NODES];
 static rts::SortingTriangleScratchLease sorting_triangle_scratch;
 
+static void Release_Overlapping_Nodes()
+{
+	for (unsigned node_id=0;node_id<overlapping_node_count;++node_id) {
+		SortingNodeStruct* state=overlapping_nodes[node_id];
+		Release_Refs(state);
+		clean_list.push_front(state);
+	}
+	overlapping_node_count=0;
+	overlapping_polygon_count=0;
+	overlapping_vertex_count=0;
+}
+
 // ----------------------------------------------------------------------------
 
 void SortingRendererClass::Insert_To_Sorted_List(SortingNodeStruct *state)
@@ -443,9 +455,17 @@ void SortingRendererClass::Flush_Sorting_Pool()
 		vertexAllocCount = overlapping_vertex_count;
 	WWASSERT(DEFAULT_SORTING_VERTEX_COUNT == 1 || vertexAllocCount <= DEFAULT_SORTING_VERTEX_COUNT);
 	DynamicVBAccessClass dyn_vb_access(BUFFER_TYPE_DYNAMIC_DX8,dynamic_fvf_type,vertexAllocCount/*overlapping_vertex_count*/);
+	if (!dyn_vb_access.Is_Valid()) {
+		Release_Overlapping_Nodes();
+		return;
+	}
 	{
 		DynamicVBAccessClass::WriteLockClass lock(&dyn_vb_access);
 		VertexFormatXYZNDUV2* dest_verts=(VertexFormatXYZNDUV2 *)lock.Get_Formatted_Vertex_Array();
+		if (!lock.Is_Locked() || dest_verts == nullptr) {
+			Release_Overlapping_Nodes();
+			return;
+		}
 
 		unsigned polygon_array_offset=0;
 		unsigned vertex_array_offset=0;
@@ -558,6 +578,10 @@ void SortingRendererClass::Flush_Sorting_Pool()
 			polygon_array_offset+=state->polygon_count;
 			vertex_array_offset+=state->vertex_count;
 		}
+		if (!lock.Commit()) {
+			Release_Overlapping_Nodes();
+			return;
+		}
 	}
 
 	if (have_parallel_triangle_workspace) {
@@ -600,19 +624,34 @@ void SortingRendererClass::Flush_Sorting_Pool()
 		const unsigned chunkEnd = chunkOffset + chunkCount;
 
 		DynamicIBAccessClass dyn_ib_access(BUFFER_TYPE_DYNAMIC_DX8,chunkCount*3);
+		if (!dyn_ib_access.Is_Valid()) {
+			Release_Overlapping_Nodes();
+			return;
+		}
 		{
 			DynamicIBAccessClass::WriteLockClass lock(&dyn_ib_access);
 			ShortVectorIStruct* sorted_polygon_index_array=(ShortVectorIStruct*)lock.Get_Index_Array();
+			if (!lock.Is_Locked() || sorted_polygon_index_array == nullptr) {
+				Release_Overlapping_Nodes();
+				return;
+			}
 
 			for (unsigned a=0;a<chunkCount;++a) {
 				sorted_polygon_index_array[a]=tis[chunkOffset + a].tri;
+			}
+			if (!lock.Commit()) {
+				Release_Overlapping_Nodes();
+				return;
 			}
 		}
 
 		// Set index buffer and render!
 
-		DX8Wrapper::Set_Index_Buffer(dyn_ib_access,0); // Override with this buffer (do something to prevent need for this!)
-		DX8Wrapper::Set_Vertex_Buffer(dyn_vb_access); // Override with this buffer (do something to prevent need for this!)
+		if (!DX8Wrapper::Set_Index_Buffer(dyn_ib_access,0) ||
+			!DX8Wrapper::Set_Vertex_Buffer(dyn_vb_access)) {
+			Release_Overlapping_Nodes();
+			return;
+		}
 
 		DX8Wrapper::Apply_Render_State_Changes();
 
@@ -653,14 +692,7 @@ void SortingRendererClass::Flush_Sorting_Pool()
 	}
 
 	// Release all references and return nodes back to the clean list for the frame...
-	for (unsigned node_id=0;node_id<overlapping_node_count;++node_id) {
-		SortingNodeStruct* state=overlapping_nodes[node_id];
-		Release_Refs(state);
-		clean_list.push_front(state);
-	}
-	overlapping_node_count=0;
-	overlapping_polygon_count=0;
-	overlapping_vertex_count=0;
+	Release_Overlapping_Nodes();
 
 	SNAPSHOT_SAY(("SortingSystem - Done flushing"));
 

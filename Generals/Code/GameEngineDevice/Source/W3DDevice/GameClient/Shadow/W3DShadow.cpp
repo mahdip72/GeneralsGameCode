@@ -131,15 +131,17 @@ Bool W3DShadowManager::init()
 {
 	Bool result=TRUE;
 
-	if	(TheW3DVolumetricShadowManager && TheW3DVolumetricShadowManager->init())
+	if	(TheW3DVolumetricShadowManager &&
+		(!TheW3DVolumetricShadowManager->init() ||
+		 !TheW3DVolumetricShadowManager->ReAcquireResources()))
 	{
-		if (TheW3DVolumetricShadowManager->ReAcquireResources())
-			result = TRUE;
+		result = FALSE;
 	}
-	if ( TheW3DProjectedShadowManager && TheW3DProjectedShadowManager->init())
+	if (TheW3DProjectedShadowManager &&
+		(!TheW3DProjectedShadowManager->init() ||
+		 !TheW3DProjectedShadowManager->ReAcquireResources()))
 	{
-		if (TheW3DProjectedShadowManager->ReAcquireResources())
-			result = TRUE;
+		result = FALSE;
 	}
 
 	return result;

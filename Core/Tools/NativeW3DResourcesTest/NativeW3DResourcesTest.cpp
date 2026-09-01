@@ -328,7 +328,15 @@ public:
 			}
 			if (!resource.texture)
 			{
-				resource.liveBytes = resource.recoveryBytes;
+				if (resource.buffer.usage == RENDER_USAGE_IMMUTABLE)
+				{
+					resource.liveBytes = resource.recoveryBytes;
+				}
+				else if (!resource.liveBytes.empty())
+				{
+					std::memset(&resource.liveBytes[0], 0,
+						resource.liveBytes.size());
+				}
 			}
 			else if (resource.gpuAuthority)
 			{
@@ -583,6 +591,58 @@ int TestThreadedResourceCompletion()
 		sizeof(unsigned int), 0, 2, 1, &validated) ==
 		RENDER_RESULT_INVALID_ARGUMENT && !validated.isValid(),
 		"pre-frame partial DISCARD rejects adjacent unwritten bytes");
+	IRenderContext *context = device->immediateContext();
+	result |= Check(context->beginFrame() == RENDER_RESULT_OK &&
+		CurrentThreadedRenderFrameSequence(device) != 0 &&
+		resources.UpdateBuffer(buffer, bytes, sizeof(bytes), 0,
+			RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK &&
+		ReadCount(&control.updateCalls) == 1,
+		"in-frame upload returns without a per-unlock render-owner fence");
+	validated = GpuHandle(1, 1);
+	result |= Check(resources.AcquireVertexBufferRange(buffer,
+		sizeof(unsigned int), 0, 0, 4, &validated) ==
+		RENDER_RESULT_INVALID_ARGUMENT && !validated.isValid() &&
+		context->endFrame() == RENDER_RESULT_OK &&
+		SubmitThreadedRenderFrame(device, false) == RENDER_RESULT_OK &&
+		DrainThreadedRenderDevice(device) == RENDER_RESULT_OK &&
+		ReadCount(&control.updateCalls) == 2,
+		"accepted in-frame bytes remain fail-closed until owner completion");
+	ThreadedRenderFrameCompletion asynchronousUploadCompletion;
+	result |= Check(PollThreadedRenderCompletion(device,
+		&asynchronousUploadCompletion) &&
+		asynchronousUploadCompletion.result == RENDER_RESULT_OK &&
+		!asynchronousUploadCompletion.resourceFailure &&
+		resources.PublishThreadedCompletion(
+			asynchronousUploadCompletion.sequence, false) == RENDER_RESULT_OK &&
+		resources.AcquireVertexBufferRange(buffer, sizeof(unsigned int), 0,
+			0, 4, &validated) == RENDER_RESULT_OK && validated == buffer,
+		"matching completion publishes the exact accepted in-frame range");
+	InterlockedExchange(&control.failUpdate, 1);
+	result |= Check(context->beginFrame() == RENDER_RESULT_OK &&
+		resources.UpdateBuffer(buffer, bytes, sizeof(bytes) / 2, 0,
+			RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK &&
+		ReadCount(&control.updateCalls) == 2 &&
+		context->endFrame() == RENDER_RESULT_OK &&
+		SubmitThreadedRenderFrame(device, false) == RENDER_RESULT_OK &&
+		DrainThreadedRenderDevice(device) == RENDER_RESULT_FAILED,
+		"owner-side asynchronous upload failure remains observable at completion");
+	ThreadedRenderFrameCompletion failedUploadCompletion;
+	validated = buffer;
+	result |= Check(PollThreadedRenderCompletion(device,
+		&failedUploadCompletion) && failedUploadCompletion.resourceFailure &&
+		resources.PublishThreadedCompletion(failedUploadCompletion.sequence,
+			true) == RENDER_RESULT_OK &&
+		resources.AcquireVertexBufferRange(buffer, sizeof(unsigned int), 0,
+			0, 2, &validated) == RENDER_RESULT_INVALID_ARGUMENT &&
+		!validated.isValid(),
+		"failed completion invalidates only its pending buffer publication");
+	InterlockedExchange(&control.failUpdate, 0);
+	result |= Check(device->recoverDevice() == RENDER_RESULT_OK &&
+		host.ReplaceContext(device->immediateContext()) == RENDER_RESULT_OK &&
+		resources.RestoreStaticBuffersAfterRecovery() == RENDER_RESULT_OK &&
+		resources.UpdateBuffer(buffer, bytes, sizeof(bytes), 0,
+			RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK,
+		"dynamic owner recovers explicitly after asynchronous upload failure");
 	unsigned short indices[3] = { 0, 1, 0 };
 	BufferDescriptor indexDescriptor;
 	indexDescriptor.byteCount = 4 * sizeof(unsigned short);
@@ -605,7 +665,6 @@ int TestThreadedResourceCompletion()
 		RENDER_FORMAT_R16_UINT, 0, 3, 1, &validated) ==
 		RENDER_RESULT_INVALID_ARGUMENT && !validated.isValid(),
 		"threaded exact index acquisition rejects adjacent unwritten bytes");
-	IRenderContext *context = device->immediateContext();
 	LegacyLogicalState drawState;
 	LegacyVertexLayout drawLayout;
 	drawLayout.stride = sizeof(unsigned int);
@@ -656,23 +715,25 @@ int TestThreadedResourceCompletion()
 	validated = buffer;
 	result |= Check(resources.AcquireVertexBufferRange(buffer,
 		sizeof(unsigned int), 0, 0, 2, &validated) ==
-		RENDER_RESULT_INVALID_ARGUMENT && !validated.isValid() &&
+		RENDER_RESULT_OK && validated == buffer &&
 		device->recoverDevice() == RENDER_RESULT_OK &&
-		host.ReplaceContext(device->immediateContext()) == RENDER_RESULT_OK,
-		"failed threaded draw clears central exact-range acquisition before recovery");
+		host.ReplaceContext(device->immediateContext()) == RENDER_RESULT_OK &&
+		resources.RestoreStaticBuffersAfterRecovery() == RENDER_RESULT_OK,
+		"failed indexed draw preserves an unrelated initialized vertex range before recovery");
 	result |= Check(resources.Destroy(indexBuffer),
 		"exact owner destruction releases the invalidated threaded index slot");
 
 	InterlockedExchange(&control.failUpdate, 1);
 	result |= Check(resources.UpdateBuffer(buffer, bytes, sizeof(bytes), 0,
 		RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_FAILED &&
-		ReadCount(&control.updateCalls) == 3 &&
+		ReadCount(&control.updateCalls) == 6 &&
 		resources.DescribeBuffer(buffer, &bufferDescription) == RENDER_RESULT_OK &&
 		bufferDescription.authority == NATIVE_W3D_CONTENT_INVALID,
 		"failed pre-frame threaded upload invalidates publication authority");
 	InterlockedExchange(&control.failUpdate, 0);
 	result |= Check(device->recoverDevice() == RENDER_RESULT_OK &&
 		host.ReplaceContext(device->immediateContext()) == RENDER_RESULT_OK &&
+		resources.RestoreStaticBuffersAfterRecovery() == RENDER_RESULT_OK &&
 		resources.UpdateBuffer(buffer, bytes, sizeof(bytes), 0,
 			RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK &&
 		resources.DescribeBuffer(buffer, &bufferDescription) == RENDER_RESULT_OK &&
@@ -713,7 +774,8 @@ int TestThreadedResourceCompletion()
 			"threaded owner-side create failure never publishes a logical handle");
 		InterlockedExchange(&control.failCreate, 0);
 		result |= Check(device->recoverDevice() == RENDER_RESULT_OK &&
-			host.ReplaceContext(device->immediateContext()) == RENDER_RESULT_OK,
+			host.ReplaceContext(device->immediateContext()) == RENDER_RESULT_OK &&
+			resources.RestoreStaticBuffersAfterRecovery() == RENDER_RESULT_OK,
 			"threaded owner recovers after an asynchronous create failure");
 	}
 	GpuHandle replacementBuffer;
@@ -753,7 +815,8 @@ int TestThreadedResourceCompletion()
 		"threaded owner-side refresh failure invalidates optimistic authority");
 	InterlockedExchange(&control.failRefresh, 0);
 	result |= Check(device->recoverDevice() == RENDER_RESULT_OK &&
-		host.ReplaceContext(device->immediateContext()) == RENDER_RESULT_OK,
+		host.ReplaceContext(device->immediateContext()) == RENDER_RESULT_OK &&
+		resources.RestoreStaticBuffersAfterRecovery() == RENDER_RESULT_OK,
 		"threaded owner recovers after an asynchronous refresh failure");
 
 	InterlockedExchange(&control.failCopy, 1);
@@ -774,6 +837,7 @@ int TestThreadedResourceCompletion()
 	InterlockedExchange(&control.failCopy, 0);
 	result |= Check(device->recoverDevice() == RENDER_RESULT_OK &&
 		host.ReplaceContext(device->immediateContext()) == RENDER_RESULT_OK &&
+		resources.RestoreStaticBuffersAfterRecovery() == RENDER_RESULT_OK &&
 		resources.Shutdown() == RENDER_RESULT_OK &&
 		host.Detach() == RENDER_RESULT_OK,
 		"threaded resource shutdown destroys owner handles before host detach");
@@ -932,13 +996,52 @@ int main()
 		resources.DescribeBuffer(buffer, &bufferDescription) ==
 		RENDER_RESULT_OK && bufferDescription.authorityEpoch > createEpoch,
 		"accepted buffer update advances CPU authority");
+	BufferDescriptor staticBufferDescriptor = bufferDescriptor;
+	staticBufferDescriptor.usage = RENDER_USAGE_DEFAULT;
+	GpuHandle persistentStaticBuffer;
+	result |= Check(resources.CreateBuffer(staticBufferDescriptor, latestBytes,
+		sizeof(latestBytes), &persistentStaticBuffer) == RENDER_RESULT_OK &&
+		resources.DescribeBuffer(persistentStaticBuffer, &bufferDescription) ==
+			RENDER_RESULT_OK,
+		"persistent static geometry records one authoritative CPU image");
+	const unsigned int persistentStaticEpoch = bufferDescription.authorityEpoch;
+	result |= Check(device.resize(800, 600) == RENDER_RESULT_OK &&
+		host.ReplaceContext(device.immediateContext()) == RENDER_RESULT_OK &&
+		resources.RepublishStaticBuffersAfterResize() == RENDER_RESULT_OK &&
+		device.BufferEquals(persistentStaticBuffer, latestBytes,
+			sizeof(latestBytes)) &&
+		resources.DescribeBuffer(persistentStaticBuffer, &bufferDescription) ==
+			RENDER_RESULT_OK &&
+		bufferDescription.authority == NATIVE_W3D_CONTENT_CPU &&
+		bufferDescription.authorityEpoch == persistentStaticEpoch &&
+		resources.AcquireVertexBufferRange(persistentStaticBuffer,
+			sizeof(unsigned int), 0, 0, 4, &validatedRange) ==
+			RENDER_RESULT_OK && validatedRange == persistentStaticBuffer,
+		"ordinary resize republishes static geometry without advancing its invalidation epoch");
 	result |= Check(device.recoverDevice() == RENDER_RESULT_OK &&
 		host.ReplaceContext(device.immediateContext()) == RENDER_RESULT_OK &&
-		device.BufferEquals(buffer, latestBytes, sizeof(latestBytes)) &&
+		resources.RestoreStaticBuffersAfterRecovery() == RENDER_RESULT_OK &&
+		device.BufferEquals(persistentStaticBuffer, latestBytes,
+			sizeof(latestBytes)) &&
+		resources.DescribeBuffer(persistentStaticBuffer, &bufferDescription) ==
+			RENDER_RESULT_OK &&
+		bufferDescription.authority == NATIVE_W3D_CONTENT_CPU &&
+		bufferDescription.authorityEpoch == persistentStaticEpoch &&
+		resources.AcquireVertexBufferRange(persistentStaticBuffer,
+			sizeof(unsigned int), 0, 0, 4, &validatedRange) ==
+			RENDER_RESULT_OK && validatedRange == persistentStaticBuffer &&
+		!device.BufferEquals(buffer, latestBytes, sizeof(latestBytes)) &&
 		resources.DescribeBuffer(buffer, &bufferDescription) ==
 		RENDER_RESULT_OK &&
-		bufferDescription.authority == NATIVE_W3D_CONTENT_CPU,
-		"device recovery restores the latest backend-owned buffer bytes");
+		bufferDescription.authority == NATIVE_W3D_CONTENT_INVALID &&
+		resources.AcquireVertexBufferRange(buffer, sizeof(unsigned int), 0,
+			0, 1, &validatedRange) == RENDER_RESULT_INVALID_ARGUMENT &&
+		!validatedRange.isValid() &&
+		resources.UpdateBuffer(buffer, latestBytes, sizeof(latestBytes), 0,
+			RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK,
+		"device recovery restores static geometry and invalidates unrestorable dynamic bytes");
+	result |= Check(resources.Destroy(persistentStaticBuffer),
+		"persistent static recovery fixture releases its exact resource");
 	result |= Check(resources.PublishThreadedCompletion(1, false) ==
 		RENDER_RESULT_OK &&
 		resources.DescribeBuffer(buffer, &bufferDescription) ==
@@ -951,13 +1054,11 @@ int main()
 		RENDER_RESULT_OK &&
 		resources.DescribeBuffer(buffer, &bufferDescription) ==
 		RENDER_RESULT_OK &&
-		bufferDescription.authority == NATIVE_W3D_CONTENT_INVALID &&
+		bufferDescription.authority == NATIVE_W3D_CONTENT_CPU &&
 		resources.AcquireVertexBufferRange(buffer, sizeof(unsigned int), 0,
-			0, 1, &validatedRange) == RENDER_RESULT_INVALID_ARGUMENT &&
-		!validatedRange.isValid() &&
-		resources.UpdateBuffer(buffer, latestBytes, sizeof(latestBytes), 0,
-			RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK,
-		"aggregate threaded resource failure invalidates authority and exact ranges by submission sequence");
+			0, 1, &validatedRange) == RENDER_RESULT_OK &&
+		validatedRange == buffer,
+		"aggregate threaded failure preserves synchronously fenced buffer authority");
 
 	unsigned int texturePixels[16] = { 0 };
 	TextureDescriptor textureDescriptor;
@@ -1051,6 +1152,7 @@ int main()
 		RENDER_RESULT_OK && context->endFrame() == RENDER_RESULT_OK &&
 		device.recoverDevice() == RENDER_RESULT_OK &&
 		host.ReplaceContext(device.immediateContext()) == RENDER_RESULT_OK &&
+		resources.RestoreStaticBuffersAfterRecovery() == RENDER_RESULT_OK &&
 		resources.DescribeTexture(texture, &textureDescription) ==
 		RENDER_RESULT_OK &&
 		textureDescription.authority == NATIVE_W3D_CONTENT_INVALID &&
@@ -1231,14 +1333,32 @@ int main()
 		productResources.AttachBackend(&device, device.immediateContext()) ==
 			RENDER_RESULT_OK,
 		"borrowed renderer shutdown releases only its state reference and permits safe product reattach");
+	BufferDescriptor productStaticDescriptor = bufferDescriptor;
+	productStaticDescriptor.usage = RENDER_USAGE_DEFAULT;
+	BufferDescriptor productImmutableDescriptor = bufferDescriptor;
+	productImmutableDescriptor.usage = RENDER_USAGE_IMMUTABLE;
 	GpuHandle productBuffer;
-	result |= Check(productResources.Resources().CreateBuffer(bufferDescriptor,
+	GpuHandle productImmutableBuffer;
+	GpuHandle productValidated;
+	result |= Check(productResources.Resources().CreateBuffer(
+		productStaticDescriptor,
 		latestBytes, sizeof(latestBytes), &productBuffer) == RENDER_RESULT_OK &&
+		productResources.Resources().CreateBuffer(productImmutableDescriptor,
+			latestBytes, sizeof(latestBytes), &productImmutableBuffer) ==
+			RENDER_RESULT_OK &&
 		device.recoverDevice() == RENDER_RESULT_OK &&
 		productResources.ReplaceBackendContext(device.immediateContext()) ==
-		RENDER_RESULT_OK && device.BufferEquals(productBuffer, latestBytes,
-			sizeof(latestBytes)),
-		"product seam publishes recovery context while retaining latest bytes");
+		RENDER_RESULT_OK && productResources.Resources().
+			RestoreStaticBuffersAfterRecovery() == RENDER_RESULT_OK &&
+		device.BufferEquals(productBuffer, latestBytes,
+			sizeof(latestBytes)) &&
+		device.BufferEquals(productImmutableBuffer, latestBytes,
+			sizeof(latestBytes)) &&
+		productResources.Resources().AcquireVertexBufferRange(
+			productImmutableBuffer, sizeof(unsigned int), 0, 0, 4,
+			&productValidated) == RENDER_RESULT_OK &&
+		productValidated == productImmutableBuffer,
+		"product seam republishes DEFAULT and immutable bytes after recovery");
 	GpuHandle partialProductBuffer;
 	result |= Check(productResources.Resources().CreateBuffer(bufferDescriptor,
 		0, 0, &partialProductBuffer) == RENDER_RESULT_OK &&

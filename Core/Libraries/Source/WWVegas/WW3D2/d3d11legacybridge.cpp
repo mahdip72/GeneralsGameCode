@@ -7,9 +7,15 @@
 #include "dx8indexbuffer.h"
 #include "dx8vertexbuffer.h"
 #include "nativew3d2.h"
+#if defined(_WIN64)
+#include "nativew3dbufferowner.h"
+#include "nativew3dtextureowner.h"
+#include "texture.h"
+#endif
 #include "surfaceblit.h"
 #include "Renderer/LegacyBridgeCache.h"
 #include "Renderer/LegacyBridgeValidation.h"
+#include "Renderer/LegacyFvfLayout.h"
 #include "Renderer/LegacyRenderState.h"
 #include "Renderer/RendererDevice.h"
 #if defined(_WIN64)
@@ -60,30 +66,14 @@ using rts::render::GpuHandle;
 using rts::render::IRenderContext;
 using rts::render::IRenderDevice;
 using rts::render::LegacyLogicalState;
-using rts::render::LegacyVertexDataFormat;
 using rts::render::LegacyVertexElement;
 using rts::render::LegacyVertexLayout;
+using rts::render::RenderVertexLayout;
 using rts::render::RenderResult;
 using rts::render::RenderBufferUpdateMode;
 using rts::render::RenderTargetBinding;
 using rts::render::TextureDescriptor;
 using rts::render::TextureSubresourceData;
-
-bool Append_Element(LegacyVertexLayout *layout,
-	rts::render::LegacyVertexSemantic semantic, unsigned int semantic_index,
-	LegacyVertexDataFormat format, unsigned int byte_offset)
-{
-	if (layout->elementCount >= LegacyVertexLayout::MAX_ELEMENT_COUNT)
-	{
-		return false;
-	}
-	LegacyVertexElement &element = layout->elements[layout->elementCount++];
-	element.semantic = semantic;
-	element.semanticIndex = semantic_index;
-	element.format = format;
-	element.byteOffset = byte_offset;
-	return true;
-}
 
 bool Checked_Multiply(size_t left, size_t right, size_t *result)
 {
@@ -96,80 +86,30 @@ bool Checked_Multiply(size_t left, size_t right, size_t *result)
 	return true;
 }
 
-LegacyVertexDataFormat Texture_Format_From_Bytes(unsigned int byte_count)
-{
-	switch (byte_count)
-	{
-	case 4: return rts::render::RENDER_VERTEX_DATA_FLOAT1;
-	case 8: return rts::render::RENDER_VERTEX_DATA_FLOAT2;
-	case 12: return rts::render::RENDER_VERTEX_DATA_FLOAT3;
-	default: return rts::render::RENDER_VERTEX_DATA_FLOAT4;
-	}
-}
-
-bool Build_Vertex_Layout(const FVFInfoClass &fvf_info,
+bool Build_Vertex_Layout(unsigned int fvf, unsigned int vertex_stride,
 	LegacyVertexLayout *layout)
 {
 	if (layout == 0)
 	{
 		return false;
 	}
+	RenderVertexLayout native_layout;
+	if (!rts::render::DecodeLegacyFvfVertexLayout(fvf, vertex_stride,
+		&native_layout))
+	{
+		return false;
+	}
 	*layout = LegacyVertexLayout();
-	layout->stride = fvf_info.Get_FVF_Size();
-	const unsigned int fvf = fvf_info.Get_FVF();
-	const unsigned int position_format = fvf & D3DFVF_POSITION_MASK;
-	if (position_format != D3DFVF_XYZ && position_format != D3DFVF_XYZRHW)
+	layout->stride = native_layout.stride;
+	layout->preTransformed = native_layout.preTransformed;
+	layout->elementCount = native_layout.elementCount;
+	for (unsigned int index = 0; index < native_layout.elementCount; ++index)
 	{
-		return false;
-	}
-	layout->preTransformed = position_format == D3DFVF_XYZRHW;
-	if (!Append_Element(layout, rts::render::RENDER_VERTEX_SEMANTIC_POSITION,
-		0, layout->preTransformed ?
-			rts::render::RENDER_VERTEX_DATA_FLOAT4 :
-			rts::render::RENDER_VERTEX_DATA_FLOAT3,
-		fvf_info.Get_Location_Offset()))
-	{
-		return false;
-	}
-	if ((fvf & D3DFVF_NORMAL) != 0 &&
-		!Append_Element(layout, rts::render::RENDER_VERTEX_SEMANTIC_NORMAL,
-			0, rts::render::RENDER_VERTEX_DATA_FLOAT3,
-			fvf_info.Get_Normal_Offset()))
-	{
-		return false;
-	}
-	if ((fvf & D3DFVF_DIFFUSE) != 0 &&
-		!Append_Element(layout, rts::render::RENDER_VERTEX_SEMANTIC_DIFFUSE,
-			0, rts::render::RENDER_VERTEX_DATA_COLOR_BGRA8,
-			fvf_info.Get_Diffuse_Offset()))
-	{
-		return false;
-	}
-	if ((fvf & D3DFVF_SPECULAR) != 0 &&
-		!Append_Element(layout, rts::render::RENDER_VERTEX_SEMANTIC_SPECULAR,
-			0, rts::render::RENDER_VERTEX_DATA_COLOR_BGRA8,
-			fvf_info.Get_Specular_Offset()))
-	{
-		return false;
-	}
-	const unsigned int texture_count =
-		(fvf & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT;
-	if (texture_count > rts::render::LEGACY_TEXTURE_STAGE_COUNT)
-	{
-		return false;
-	}
-	for (unsigned int index = 0; index < texture_count; ++index)
-	{
-		const unsigned int offset = fvf_info.Get_Tex_Offset(index);
-		const unsigned int next_offset = index + 1 < texture_count ?
-			fvf_info.Get_Tex_Offset(index + 1) : fvf_info.Get_FVF_Size();
-		if (next_offset <= offset || next_offset - offset > 16 ||
-			!Append_Element(layout,
-				rts::render::RENDER_VERTEX_SEMANTIC_TEXTURE_COORDINATE,
-				index, Texture_Format_From_Bytes(next_offset - offset), offset))
-		{
-			return false;
-		}
+		layout->elements[index].semantic = native_layout.elements[index].semantic;
+		layout->elements[index].semanticIndex =
+			native_layout.elements[index].semanticIndex;
+		layout->elements[index].format = native_layout.elements[index].format;
+		layout->elements[index].byteOffset = native_layout.elements[index].byteOffset;
 	}
 	return true;
 }
@@ -297,7 +237,9 @@ struct D3D11LegacyBridge::Impl
 		GpuHandle handle;
 	};
 
-	Impl() : native_w3d(0), device(0), context(0), legacy_device(0), frame_open(false),
+	Impl() : native_w3d(0), native_buffer_resources_bound(false),
+		native_texture_resources_bound(false), device(0),
+		context(0), legacy_device(0), frame_open(false),
 		log_file(0), frame_id(0), display_epoch(1), draw_count(0),
 		draw_failure_count(0),
 		raw_indexed_draw_count(0),
@@ -330,6 +272,8 @@ struct D3D11LegacyBridge::Impl
 	}
 
 	NativeW3D2 *native_w3d;
+	bool native_buffer_resources_bound;
+	bool native_texture_resources_bound;
 	IRenderDevice *device;
 	IRenderContext *context;
 	IDirect3DDevice8 *legacy_device;
@@ -817,6 +761,11 @@ struct D3D11LegacyBridge::Impl
 		if (recovery_result != rts::render::RENDER_RESULT_OK)
 		{
 			target_transition_failed = true;
+			if (device->isOperational())
+			{
+				device->shutdown();
+			}
+			context = 0;
 			return recovery_result;
 		}
 		// GPU-only render-to-texture contents are not reconstructible by the
@@ -826,6 +775,7 @@ struct D3D11LegacyBridge::Impl
 		if (context == 0)
 		{
 			target_transition_failed = true;
+			device->shutdown();
 			return rts::render::RENDER_RESULT_FAILED;
 		}
 		if (native_w3d != 0 && native_w3d->IsAttachedToBorrowedBackend())
@@ -835,7 +785,18 @@ struct D3D11LegacyBridge::Impl
 			if (replace_result != rts::render::RENDER_RESULT_OK)
 			{
 				target_transition_failed = true;
+				device->shutdown();
+				context = 0;
 				return replace_result;
+			}
+			const RenderResult buffer_result = native_w3d->Resources().
+				RestoreStaticBuffersAfterRecovery();
+			if (buffer_result != rts::render::RENDER_RESULT_OK)
+			{
+				target_transition_failed = true;
+				device->shutdown();
+				context = 0;
+				return buffer_result;
 			}
 		}
 		// Recovery recreates the swap-chain target.  Reapply the target that was
@@ -1081,9 +1042,34 @@ struct D3D11LegacyBridge::Impl
 		}
 	}
 
-	bool Upload_Vertex_Buffer(VertexBufferClass *vertex_buffer,
-		GpuHandle *handle)
+	bool Acquire_Vertex_Buffer(VertexBufferClass *vertex_buffer,
+		unsigned int stride, unsigned int offset, unsigned int start_vertex,
+		unsigned int vertex_count, GpuHandle *handle)
 	{
+#if defined(_WIN64)
+		if (handle != 0)
+		{
+			*handle = GpuHandle();
+		}
+		if (vertex_buffer == 0 || handle == 0 ||
+			(vertex_buffer->Type() != BUFFER_TYPE_DX8 &&
+			 vertex_buffer->Type() != BUFFER_TYPE_DYNAMIC_DX8))
+		{
+			return Fail("draw failure: unsupported native vertex buffer");
+		}
+		if (!static_cast<DX8VertexBufferClass *>(vertex_buffer)->
+			Acquire_Native_Vertex_Buffer(stride, offset, start_vertex,
+				vertex_count, handle))
+		{
+			return Fail(rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+				"draw failure: native vertex range is unavailable");
+		}
+		return true;
+#else
+		(void)stride;
+		(void)offset;
+		(void)start_vertex;
+		(void)vertex_count;
 		if (vertex_buffer == 0 || handle == 0 ||
 			(vertex_buffer->Type() != BUFFER_TYPE_DX8 &&
 			 vertex_buffer->Type() != BUFFER_TYPE_DYNAMIC_DX8))
@@ -1210,10 +1196,35 @@ struct D3D11LegacyBridge::Impl
 		entry->source_dirty = false;
 		*handle = entry->handle;
 		return true;
+#endif
 	}
 
-	bool Upload_Index_Buffer(IndexBufferClass *index_buffer, GpuHandle *handle)
+	bool Acquire_Index_Buffer(IndexBufferClass *index_buffer,
+		unsigned int offset, unsigned int start_index, unsigned int index_count,
+		GpuHandle *handle)
 	{
+#if defined(_WIN64)
+		if (handle != 0)
+		{
+			*handle = GpuHandle();
+		}
+		if (index_buffer == 0 || handle == 0 ||
+			(index_buffer->Type() != BUFFER_TYPE_DX8 &&
+			 index_buffer->Type() != BUFFER_TYPE_DYNAMIC_DX8))
+		{
+			return Fail("draw failure: unsupported native index buffer");
+		}
+		if (!static_cast<DX8IndexBufferClass *>(index_buffer)->
+			Acquire_Native_Index_Buffer(offset, start_index, index_count, handle))
+		{
+			return Fail(rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+				"draw failure: native index range is unavailable");
+		}
+		return true;
+#else
+		(void)offset;
+		(void)start_index;
+		(void)index_count;
 		if (index_buffer == 0 || handle == 0 ||
 			(index_buffer->Type() != BUFFER_TYPE_DX8 &&
 			 index_buffer->Type() != BUFFER_TYPE_DYNAMIC_DX8))
@@ -1339,6 +1350,7 @@ struct D3D11LegacyBridge::Impl
 		entry->source_dirty = false;
 		*handle = entry->handle;
 		return true;
+#endif
 	}
 
 	bool Upload_Raw_Vertex_Buffer(IDirect3DVertexBuffer8 *source,
@@ -1612,7 +1624,8 @@ struct D3D11LegacyBridge::Impl
 			D3DMATRIX actual_view;
 			D3DMATRIX actual_projection;
 			float maximum_difference[3] = { 0.0f, 0.0f, 0.0f };
-			if (SUCCEEDED(legacy_device->GetTransform(D3DTS_WORLD,
+			if (legacy_device != 0 &&
+				SUCCEEDED(legacy_device->GetTransform(D3DTS_WORLD,
 					&actual_world)) && SUCCEEDED(legacy_device->GetTransform(
 					D3DTS_VIEW, &actual_view)) && SUCCEEDED(
 					legacy_device->GetTransform(D3DTS_PROJECTION,
@@ -1638,7 +1651,10 @@ struct D3D11LegacyBridge::Impl
 			}
 			D3DVIEWPORT8 actual_viewport;
 			memset(&actual_viewport, 0, sizeof(actual_viewport));
-			legacy_device->GetViewport(&actual_viewport);
+			if (legacy_device != 0)
+			{
+				legacy_device->GetViewport(&actual_viewport);
+			}
 			char state_message[320];
 			snprintf(state_message, sizeof(state_message),
 				"capture first draw fvf=0x%08x primitives=%u start=%u base=%u cull=%u ccw=%u color_mask=0x%x depth=%u matrix_diff=%g,%g,%g viewport=%u,%u,%u,%u,%g,%g",
@@ -1660,9 +1676,15 @@ struct D3D11LegacyBridge::Impl
 			stage < rts::render::LEGACY_TEXTURE_STAGE_COUNT; ++stage)
 		{
 			GpuHandle texture_handle;
+#if defined(_WIN64)
+			TextureBaseClass *source =
+				DX8Wrapper::Get_Tracked_Native_Texture(stage);
+			if (!Bind_Native_Texture(stage, source, &texture_handle))
+#else
 			IDirect3DBaseTexture8 *source =
 				DX8Wrapper::Get_Tracked_DX8_Texture(stage);
 			if (!Bind_Texture(stage, source, &texture_handle))
+#endif
 			{
 				return Fail("draw failure: texture conversion or binding");
 			}
@@ -2211,6 +2233,35 @@ struct D3D11LegacyBridge::Impl
 		}
 		return bind_result == rts::render::RENDER_RESULT_OK;
 	}
+
+#if defined(_WIN64)
+	bool Bind_Native_Texture(unsigned int stage, TextureBaseClass *source,
+		GpuHandle *handle)
+	{
+		if (handle == 0) return false;
+		*handle = GpuHandle();
+		if (source != 0)
+		{
+			rts::render::NativeW3DTextureHandle texture;
+			if (!source->Acquire_Native_Texture(&texture) || !texture.isValid())
+			{
+				const RenderResult unbind_result = context->setTexture(stage,
+					GpuHandle());
+				if (unbind_result != rts::render::RENDER_RESULT_OK)
+					Fail(unbind_result, "draw failure: native texture fallback unbind");
+				return false;
+			}
+			*handle = texture.resource;
+		}
+		const RenderResult bind_result = context->setTexture(stage, *handle);
+		if (bind_result != rts::render::RENDER_RESULT_OK)
+		{
+			Fail(bind_result, "draw failure: native texture binding");
+			return false;
+		}
+		return true;
+	}
+#endif
 
 	RenderResult Copy_Active_Color_Target_To_Texture(
 		IDirect3DBaseTexture8 *destination)
@@ -2837,7 +2888,11 @@ bool D3D11LegacyBridge::Initialize(HWND window,
 		m_impl->Log("D3D11 legacy bridge rejected initialization while active");
 		return false;
 	}
-	if (window == 0 || legacy_device == 0 || width == 0 || height == 0)
+	if (window == 0 || width == 0 || height == 0
+#if !defined(_WIN64)
+		|| legacy_device == 0
+#endif
+		)
 	{
 		m_impl->Log("D3D11 legacy bridge rejected invalid initialization state");
 		if (m_impl->log_file != 0)
@@ -2901,7 +2956,10 @@ bool D3D11LegacyBridge::Initialize(HWND window,
 	m_impl->width = width;
 	m_impl->height = height;
 	m_impl->legacy_device = legacy_device;
-	m_impl->legacy_device->AddRef();
+	if (m_impl->legacy_device != 0)
+	{
+		m_impl->legacy_device->AddRef();
+	}
 	m_impl->active_target = RenderTargetBinding();
 	m_impl->pending_target = RenderTargetBinding();
 	m_impl->pending_target_change = false;
@@ -2939,6 +2997,29 @@ bool D3D11LegacyBridge::Initialize(HWND window,
 		Shutdown();
 		return false;
 	}
+#if defined(_WIN64)
+	const RenderResult bind_result = rts::render::BindNativeW3DBufferResources(
+		&m_impl->native_w3d->Resources());
+	if (bind_result != rts::render::RENDER_RESULT_OK)
+	{
+		m_impl->Log_Result("D3D11 native buffer resource binding failed",
+			bind_result);
+		Shutdown();
+		return false;
+	}
+	m_impl->native_buffer_resources_bound = true;
+	const RenderResult texture_bind_result =
+		rts::render::BindNativeW3DTextureResources(
+			&m_impl->native_w3d->Resources());
+	if (texture_bind_result != rts::render::RENDER_RESULT_OK)
+	{
+		m_impl->Log_Result("D3D11 native texture resource binding failed",
+			texture_bind_result);
+		Shutdown();
+		return false;
+	}
+	m_impl->native_texture_resources_bound = true;
+#endif
 	return true;
 }
 
@@ -2957,6 +3038,36 @@ void D3D11LegacyBridge::Shutdown()
 		m_impl->capture_queue.shutdown(rts::render::RENDER_RESULT_FAILED);
 		if (m_impl->native_w3d != 0)
 		{
+#if defined(_WIN64)
+			if (m_impl->native_texture_resources_bound)
+			{
+				const RenderResult unbind_result =
+					rts::render::UnbindNativeW3DTextureResources(
+						&m_impl->native_w3d->Resources());
+				if (unbind_result != rts::render::RENDER_RESULT_OK)
+				{
+					m_impl->Log_Result(
+						"D3D11 native texture resource unbind failed",
+						unbind_result);
+					return;
+				}
+				m_impl->native_texture_resources_bound = false;
+			}
+			if (m_impl->native_buffer_resources_bound)
+			{
+				const RenderResult unbind_result =
+					rts::render::UnbindNativeW3DBufferResources(
+						&m_impl->native_w3d->Resources());
+				if (unbind_result != rts::render::RENDER_RESULT_OK)
+				{
+					m_impl->Log_Result(
+						"D3D11 native buffer resource unbind failed",
+						unbind_result);
+					return;
+				}
+				m_impl->native_buffer_resources_bound = false;
+			}
+#endif
 			m_impl->native_w3d->Shutdown();
 			delete m_impl->native_w3d;
 			m_impl->native_w3d = 0;
@@ -3065,6 +3176,32 @@ void D3D11LegacyBridge::Shutdown()
 	m_impl->Release_Caches();
 #if defined(_WIN64)
 	m_impl->Fence_Render();
+	if (m_impl->native_texture_resources_bound)
+	{
+		const RenderResult unbind_result =
+			rts::render::UnbindNativeW3DTextureResources(
+				&m_impl->native_w3d->Resources());
+		if (unbind_result != rts::render::RENDER_RESULT_OK)
+		{
+			m_impl->Log_Result("D3D11 native texture resource unbind failed",
+				unbind_result);
+			return;
+		}
+		m_impl->native_texture_resources_bound = false;
+	}
+	if (m_impl->native_buffer_resources_bound)
+	{
+		const RenderResult unbind_result =
+			rts::render::UnbindNativeW3DBufferResources(
+				&m_impl->native_w3d->Resources());
+		if (unbind_result != rts::render::RENDER_RESULT_OK)
+		{
+			m_impl->Log_Result("D3D11 native buffer resource unbind failed",
+				unbind_result);
+			return;
+		}
+		m_impl->native_buffer_resources_bound = false;
+	}
 #endif
 	const RenderResult native_shutdown_result = m_impl->native_w3d == 0 ?
 		rts::render::RENDER_RESULT_OK : m_impl->native_w3d->Shutdown();
@@ -3149,8 +3286,19 @@ bool D3D11LegacyBridge::Prepare_Legacy_Device_Reset()
 
 bool D3D11LegacyBridge::Is_Active() const
 {
-	return m_impl != 0 && m_impl->device != 0 &&
-		m_impl->context != 0 && m_impl->device->isOperational();
+	if (m_impl == 0 || m_impl->device == 0 || m_impl->context == 0 ||
+		!m_impl->device->isOperational())
+	{
+		return false;
+	}
+#if defined(_WIN64)
+	return m_impl->native_buffer_resources_bound &&
+		m_impl->native_texture_resources_bound &&
+		m_impl->native_w3d != 0 &&
+		m_impl->native_w3d->IsAttachedToBorrowedBackend();
+#else
+	return true;
+#endif
 }
 
 void D3D11LegacyBridge::Begin_Display_Iteration()
@@ -3775,6 +3923,75 @@ rts::render::RenderResult D3D11LegacyBridge::Set_Render_Target_Surfaces(
 	return result;
 }
 
+#if defined(_WIN64)
+rts::render::RenderResult D3D11LegacyBridge::Set_Render_Target_Textures(
+	TextureBaseClass *color_texture, TextureBaseClass *depth_texture,
+	bool use_default_depth)
+{
+	if (!Is_Active()) return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	m_impl->Require_Owner_Thread("native render-target transition");
+	if (color_texture == 0) return Set_Render_Target_Default();
+
+	rts::render::NativeW3DSurfaceHandle color_surface;
+	if (!color_texture->Acquire_Native_Surface(0, 0, true, &color_surface) ||
+		!color_surface.isValid())
+	{
+		m_impl->target_transition_failed = true;
+		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	RenderTargetBinding binding;
+	binding.useBackBufferColor = false;
+	binding.hasColor = true;
+	binding.color.resource = color_surface.texture.resource;
+	binding.color.mip = color_surface.mipLevel;
+	binding.color.arraySlice = color_surface.arraySlice;
+
+	rts::render::NativeW3DSurfaceHandle depth_surface;
+	if (use_default_depth)
+	{
+		binding.useBackBufferDepth = true;
+	}
+	else if (depth_texture != 0)
+	{
+		if (!depth_texture->Acquire_Native_Surface(0, 0, true, &depth_surface) ||
+			!depth_surface.isValid())
+		{
+			m_impl->target_transition_failed = true;
+			return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		binding.useBackBufferDepth = false;
+		binding.hasDepth = true;
+		binding.depth.resource = depth_surface.texture.resource;
+		binding.depth.mip = depth_surface.mipLevel;
+		binding.depth.arraySlice = depth_surface.arraySlice;
+	}
+	else
+	{
+		binding.useBackBufferDepth = false;
+	}
+
+	const RenderResult result = m_impl->Apply_Target(binding);
+	if (result != rts::render::RENDER_RESULT_OK)
+		return result;
+	rts::render::NativeW3DGpuContentLease color_lease;
+	if (!color_texture->Publish_Native_Output(color_surface, &color_lease))
+	{
+		m_impl->target_transition_failed = true;
+		return rts::render::RENDER_RESULT_FAILED;
+	}
+	if (binding.hasDepth)
+	{
+		rts::render::NativeW3DGpuContentLease depth_lease;
+		if (!depth_texture->Publish_Native_Output(depth_surface, &depth_lease))
+		{
+			m_impl->target_transition_failed = true;
+			return rts::render::RENDER_RESULT_FAILED;
+		}
+	}
+	return rts::render::RENDER_RESULT_OK;
+}
+#endif
+
 void D3D11LegacyBridge::Invalidate_Buffer(IUnknown *buffer)
 {
 	if (!Is_Active() || buffer == 0)
@@ -4209,17 +4426,20 @@ bool D3D11LegacyBridge::Draw(VertexBufferClass *vertex_buffer,
 	{
 		return m_impl->Fail("draw failure: vertex range exceeds buffer");
 	}
-	GpuHandle vertex_handle;
-	GpuHandle index_handle;
-	if (!m_impl->Upload_Vertex_Buffer(vertex_buffer, &vertex_handle) ||
-		!m_impl->Upload_Index_Buffer(index_buffer, &index_handle))
-	{
-		return false;
-	}
 	LegacyVertexLayout layout;
-	if (!Build_Vertex_Layout(vertex_buffer->FVF_Info(), &layout))
+	if (!Build_Vertex_Layout(vertex_buffer->FVF_Info().Get_FVF(),
+		vertex_buffer->FVF_Info().Get_FVF_Size(), &layout))
 	{
 		return m_impl->Fail("draw failure: unsupported legacy vertex layout");
+	}
+	GpuHandle vertex_handle;
+	GpuHandle index_handle;
+	if (!m_impl->Acquire_Vertex_Buffer(vertex_buffer, layout.stride, 0,
+			base_vertex + min_vertex_index, vertex_count, &vertex_handle) ||
+		!m_impl->Acquire_Index_Buffer(index_buffer, 0, start_index,
+			index_count, &index_handle))
+	{
+		return false;
 	}
 	LegacyLogicalState state;
 	if (!rts::render::GetTrackedLegacyLogicalState(&state))
@@ -4249,7 +4469,8 @@ bool D3D11LegacyBridge::Draw(VertexBufferClass *vertex_buffer,
 		D3DMATRIX actual_view;
 		D3DMATRIX actual_projection;
 		float maximum_difference[3] = { 0.0f, 0.0f, 0.0f };
-		if (SUCCEEDED(m_impl->legacy_device->GetTransform(D3DTS_WORLD,
+		if (m_impl->legacy_device != 0 &&
+			SUCCEEDED(m_impl->legacy_device->GetTransform(D3DTS_WORLD,
 				&actual_world)) && SUCCEEDED(m_impl->legacy_device->GetTransform(
 				D3DTS_VIEW, &actual_view)) && SUCCEEDED(
 				m_impl->legacy_device->GetTransform(D3DTS_PROJECTION,
@@ -4275,7 +4496,10 @@ bool D3D11LegacyBridge::Draw(VertexBufferClass *vertex_buffer,
 		}
 		D3DVIEWPORT8 actual_viewport;
 		memset(&actual_viewport, 0, sizeof(actual_viewport));
-		m_impl->legacy_device->GetViewport(&actual_viewport);
+		if (m_impl->legacy_device != 0)
+		{
+			m_impl->legacy_device->GetViewport(&actual_viewport);
+		}
 		char state_message[320];
 		snprintf(state_message, sizeof(state_message),
 			"capture first draw fvf=0x%08x primitives=%u start=%u base=%u cull=%u ccw=%u color_mask=0x%x depth=%u matrix_diff=%g,%g,%g viewport=%u,%u,%u,%u,%g,%g",
@@ -4298,12 +4522,19 @@ bool D3D11LegacyBridge::Draw(VertexBufferClass *vertex_buffer,
 		stage < rts::render::LEGACY_TEXTURE_STAGE_COUNT; ++stage)
 	{
 		GpuHandle texture_handle;
+#if defined(_WIN64)
+		TextureBaseClass *source =
+			DX8Wrapper::Get_Tracked_Native_Texture(stage);
+		const bool bound = m_impl->Bind_Native_Texture(stage, source,
+			&texture_handle);
+#else
 		// DX8Wrapper owns and maintains this shadow.  Reading it avoids the
 		// eight per-draw GetTexture/AddRef/Release round trips and keeps the
 		// D3D11 bridge from asking the legacy device for mutable state.
 		IDirect3DBaseTexture8 *source =
 			DX8Wrapper::Get_Tracked_DX8_Texture(stage);
 		const bool bound = m_impl->Bind_Texture(stage, source, &texture_handle);
+#endif
 		if (!bound)
 		{
 			return m_impl->Fail("draw failure: texture conversion or binding");
@@ -4432,19 +4663,19 @@ bool D3D11LegacyBridge::Draw(IDirect3DVertexBuffer8 *vertex_buffer,
 		return m_impl->Fail(rts::render::RENDER_RESULT_INVALID_ARGUMENT,
 			"raw draw failure: zero vertex stride");
 	}
-	const FVFInfoClass fvf_info(fvf);
-	if (fvf_info.Get_FVF_Size() == 0 ||
-		vertex_stride < fvf_info.Get_FVF_Size())
+	const unsigned int required_fvf_stride =
+		rts::render::LegacyFvfVertexSize(fvf);
+	if (required_fvf_stride == 0 || vertex_stride < required_fvf_stride)
 	{
 		return m_impl->Fail(rts::render::RENDER_RESULT_INVALID_ARGUMENT,
 			"raw draw failure: vertex stride is smaller than its FVF");
 	}
 	LegacyVertexLayout layout;
-	if (!Build_Vertex_Layout(fvf_info, &layout))
+	if (!Build_Vertex_Layout(fvf, vertex_stride, &layout))
 	{
-		return m_impl->Fail("raw draw failure: unsupported legacy vertex layout");
+		return m_impl->Fail(
+			"raw draw failure: unsupported legacy vertex layout");
 	}
-	layout.stride = vertex_stride;
 	const size_t index_start = static_cast<size_t>(start_index) *
 		sizeof(unsigned short);
 	const size_t index_bytes = static_cast<size_t>(index_count) *
@@ -4530,6 +4761,14 @@ RenderResult D3D11LegacyBridge::Draw_Primitive_UP(
 			"draw failure: invalid DrawPrimitiveUP arguments");
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 	}
+	const unsigned int required_fvf_stride =
+		rts::render::LegacyFvfVertexSize(fvf);
+	if (required_fvf_stride == 0 || vertex_stride < required_fvf_stride)
+	{
+		m_impl->Fail(rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+			"draw failure: DrawPrimitiveUP stride is smaller than its FVF");
+		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	}
 	size_t vertex_count = 0;
 	if (!Primitive_Up_Vertex_Count(primitive_type, primitive_count,
 		&vertex_count) || vertex_count > UINT_MAX)
@@ -4537,14 +4776,6 @@ RenderResult D3D11LegacyBridge::Draw_Primitive_UP(
 		m_impl->Fail(rts::render::RENDER_RESULT_UNSUPPORTED,
 			"draw failure: unsupported DrawPrimitiveUP topology or count");
 		return rts::render::RENDER_RESULT_UNSUPPORTED;
-	}
-	const FVFInfoClass fvf_info(fvf);
-	const unsigned int fvf_stride = fvf_info.Get_FVF_Size();
-	if (fvf_stride == 0 || vertex_stride < fvf_stride)
-	{
-		m_impl->Fail(rts::render::RENDER_RESULT_INVALID_ARGUMENT,
-			"draw failure: DrawPrimitiveUP stride is smaller than its FVF");
-		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	size_t byte_count = 0;
 	if (!Checked_Multiply(vertex_count, static_cast<size_t>(vertex_stride),
@@ -4555,13 +4786,12 @@ RenderResult D3D11LegacyBridge::Draw_Primitive_UP(
 		return rts::render::RENDER_RESULT_UNSUPPORTED;
 	}
 	LegacyVertexLayout layout;
-	if (!Build_Vertex_Layout(fvf_info, &layout))
+	if (!Build_Vertex_Layout(fvf, vertex_stride, &layout))
 	{
 		m_impl->Fail(rts::render::RENDER_RESULT_UNSUPPORTED,
 			"draw failure: unsupported DrawPrimitiveUP FVF");
 		return rts::render::RENDER_RESULT_UNSUPPORTED;
 	}
-	layout.stride = vertex_stride;
 	GpuHandle vertex_handle;
 	if (!m_impl->Upload_Primitive_Up(vertex_data, byte_count,
 		&vertex_handle))
@@ -4580,9 +4810,15 @@ RenderResult D3D11LegacyBridge::Draw_Primitive_UP(
 		stage < rts::render::LEGACY_TEXTURE_STAGE_COUNT; ++stage)
 	{
 		GpuHandle texture_handle;
+#if defined(_WIN64)
+		TextureBaseClass *source =
+			DX8Wrapper::Get_Tracked_Native_Texture(stage);
+		if (!m_impl->Bind_Native_Texture(stage, source, &texture_handle))
+#else
 		IDirect3DBaseTexture8 *source =
 			DX8Wrapper::Get_Tracked_DX8_Texture(stage);
 		if (!m_impl->Bind_Texture(stage, source, &texture_handle))
+#endif
 		{
 			m_impl->Fail("draw failure: DrawPrimitiveUP texture binding");
 			return rts::render::RENDER_RESULT_FAILED;
@@ -4641,6 +4877,7 @@ RenderResult D3D11LegacyBridge::Draw_Primitive_UP(
 
 RenderResult D3D11LegacyBridge::Resize(unsigned int width, unsigned int height)
 {
+	bool native_buffer_publication_failed = false;
 #if defined(_WIN64)
 	if (m_impl != 0 && m_impl->device != 0)
 	{
@@ -4715,13 +4952,28 @@ RenderResult D3D11LegacyBridge::Resize(unsigned int width, unsigned int height)
 			result = m_impl->native_w3d == 0 ?
 				rts::render::RENDER_RESULT_INVALID_ARGUMENT :
 				m_impl->native_w3d->ReplaceBackendContext(resized_context);
+			if (result == rts::render::RENDER_RESULT_OK)
+			{
+				result = m_impl->native_w3d->Resources().
+					RepublishStaticBuffersAfterResize();
+			}
+			native_buffer_publication_failed =
+				result != rts::render::RENDER_RESULT_OK;
 			if (result != rts::render::RENDER_RESULT_OK)
 			{
 				m_impl->Log_Result(
-					"D3D11 native WW3D context replacement failed after resize",
+					"D3D11 native WW3D resize publication failed",
 					result);
 			}
 		}
+	}
+	if (native_buffer_publication_failed &&
+		m_impl != 0 && m_impl->device != 0 &&
+		m_impl->context != 0 && m_impl->device->isOperational())
+	{
+		// Resize may have recovered the native device internally. Once static
+		// geometry cannot be republished, no later draw may use that backend.
+		Shutdown();
 	}
 	if (result == rts::render::RENDER_RESULT_OK && width != 0 && height != 0)
 	{
@@ -4793,6 +5045,13 @@ rts::render::RenderResult D3D11LegacyBridge::Set_Render_Target_Default()
 {
 	return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 }
+#if defined(_WIN64)
+rts::render::RenderResult D3D11LegacyBridge::Set_Render_Target_Textures(
+	TextureBaseClass *, TextureBaseClass *, bool)
+{
+	return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+}
+#endif
 rts::render::RenderResult D3D11LegacyBridge::Copy_Active_Color_Target_To_Texture(
 	IDirect3DBaseTexture8 *)
 {

@@ -72,6 +72,9 @@ target_link_libraries(core_renderer_contract_tests PRIVATE
     core_renderer
     d3d8lib
 )
+target_compile_definitions(core_renderer_contract_tests PRIVATE
+    RTS_RENDERER_RESET_TEST_LEGACY_FRAGMENT=1
+)
 if(TARGET core_ww3d2_native)
     target_link_libraries(core_renderer_contract_tests PRIVATE
         core_ww3d2_native

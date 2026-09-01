@@ -58,6 +58,7 @@ enum
 #include "W3DDevice/GameClient/W3DTreeBuffer.h"
 
 #include <WW3D2/assetmgr.h>
+#include <WW3D2/surfaceclass.h>
 #include <WW3D2/texture.h>
 #include "Common/FramePacer.h"
 #include "Common/GameUtility.h"
@@ -128,7 +129,7 @@ W3DTreeBuffer::W3DTreeTextureClass::W3DTreeTextureClass(unsigned width, unsigned
 //=============================================================================
 int W3DTreeBuffer::W3DTreeTextureClass::update(W3DTreeBuffer *buffer)
 {
-	if (buffer == nullptr || Peek_D3D_Texture() == nullptr)
+	if (buffer == nullptr)
 	{
 		return 0;
 	}
@@ -137,6 +138,28 @@ int W3DTreeBuffer::W3DTreeTextureClass::update(W3DTreeBuffer *buffer)
 	Get_Filter().Set_U_Addr_Mode(TextureFilterClass::TEXTURE_ADDRESS_CLAMP);
 	Get_Filter().Set_V_Addr_Mode(TextureFilterClass::TEXTURE_ADDRESS_CLAMP);
 
+	unsigned int surface_width = 0;
+	unsigned int surface_height = 0;
+	WW3DFormat surface_format = WW3D_FORMAT_UNKNOWN;
+	UnsignedByte *surface_bits = nullptr;
+	Int surface_pitch = 0;
+#if defined(_WIN64)
+	SurfaceClass *surface_level = Get_Surface_Level(0);
+	if (surface_level == nullptr) return 0;
+	SurfaceClass::SurfaceDescription surface_desc;
+	surface_level->Get_Description(surface_desc);
+	surface_width = surface_desc.Width;
+	surface_height = surface_desc.Height;
+	surface_format = surface_desc.Format;
+	surface_bits = static_cast<UnsignedByte *>(surface_level->Lock(
+		&surface_pitch));
+	if (surface_bits == nullptr)
+	{
+		surface_level->Release_Ref();
+		return 0;
+	}
+#else
+	if (Peek_D3D_Texture() == nullptr) return 0;
 	IDirect3DSurface8 *surface_level = nullptr;
 	D3DSURFACE_DESC surface_desc;
 	D3DLOCKED_RECT locked_rect;
@@ -161,12 +184,23 @@ int W3DTreeBuffer::W3DTreeTextureClass::update(W3DTreeBuffer *buffer)
 		surface_level->Release();
 		return 0;
 	}
+	surface_width = surface_desc.Width;
+	surface_height = surface_desc.Height;
+	surface_format = D3DFormat_To_WW3DFormat(surface_desc.Format);
+	surface_bits = static_cast<UnsignedByte *>(locked_rect.pBits);
+	surface_pitch = locked_rect.Pitch;
+#endif
 	const Int pixelBytes = 4;
-	const Int requiredRowBytes = static_cast<Int>(surface_desc.Width) * pixelBytes;
-	if (locked_rect.pBits == nullptr || locked_rect.Pitch < requiredRowBytes)
+	const Int requiredRowBytes = static_cast<Int>(surface_width) * pixelBytes;
+	if (surface_bits == nullptr || surface_pitch < requiredRowBytes)
 	{
+#if defined(_WIN64)
+		surface_level->Unlock();
+		surface_level->Release_Ref();
+#else
 		surface_level->UnlockRect();
 		surface_level->Release();
+#endif
 		return 0;
 	}
 
@@ -176,14 +210,13 @@ int W3DTreeBuffer::W3DTreeTextureClass::update(W3DTreeBuffer *buffer)
 	//DASSERT_MSG(tilesPerRow*numRows >= htMap->m_numBitmapTiles,Debug::Format ("Too many tiles."));
 	//DEBUG_ASSERTCRASH((Int)surface_desc.Width >= tilePixelExtent*tilesPerRow, ("Bitmap too small."));
 #endif
-	if (surface_desc.Format == D3DFMT_A8R8G8B8) {
+	if (surface_format == WW3D_FORMAT_A8R8G8B8) {
 		Int tileNdx;
 		// Tiles do not occupy the complete atlas. Clear every visible row so
 		// mip generation never averages uninitialized texture contents.
-		for (UnsignedInt row = 0; row < surface_desc.Height; ++row)
+		for (UnsignedInt row = 0; row < surface_height; ++row)
 		{
-			memset(static_cast<UnsignedByte *>(locked_rect.pBits) +
-				row * locked_rect.Pitch, 0, requiredRowBytes);
+			memset(surface_bits + row * surface_pitch, 0, requiredRowBytes);
 		}
 #if 0 // Fill unused texture for debug display.
 		UnsignedInt cellX, cellY;
@@ -208,8 +241,7 @@ int W3DTreeBuffer::W3DTreeTextureClass::update(W3DTreeBuffer *buffer)
 				UnsignedByte *pBGR = pTile->getRGBDataForWidth(tilePixelExtent);
 				pBGR += (tilePixelExtent-(1+j))*TILE_BYTES_PER_PIXEL*tilePixelExtent; // invert to match.
 				Int row = position.y+j;
-				UnsignedByte *pBGRA = ((UnsignedByte*)locked_rect.pBits) +
-							row * locked_rect.Pitch;
+				UnsignedByte *pBGRA = surface_bits + row * surface_pitch;
 
 				Int column = position.x;
 				pBGRA += column*pixelBytes;
@@ -223,19 +255,25 @@ int W3DTreeBuffer::W3DTreeTextureClass::update(W3DTreeBuffer *buffer)
 		}
 
 	}
+	#if defined(_WIN64)
+	surface_level->Unlock();
+	surface_level->Release_Ref();
+	if (!Generate_Native_Mip_Levels()) return 0;
+	Notify_Render_Texture_Changed(this);
+	#else
 	result = surface_level->UnlockRect();
 	DX8_ErrorCode(result);
 	surface_level->Release();
-	if (FAILED(result))
-	{
-		return 0;
-	}
+	if (FAILED(result)) return 0;
 	DX8_ErrorCode(Generate_DX8_Texture_Mip_Levels(Peek_D3D_Texture()));
 	Notify_Render_Texture_Changed(Peek_D3D_Base_Texture());
+	#endif
 	if (WW3D::Get_Texture_Reduction()) {
+	#if !defined(_WIN64)
 		DX8_ErrorCode(Peek_D3D_Texture()->SetLOD((DWORD)WW3D::Get_Texture_Reduction()));
+	#endif
 	}
-	return(surface_desc.Height);
+	return(surface_height);
 }
 
 

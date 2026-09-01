@@ -1759,8 +1759,7 @@ void BaseHeightMapRenderObjClass::initDestAlphaLUT()
 				pData++;
 			}
 			surf->Unlock();
-			Notify_Render_Texture_Changed(
-				m_destAlphaTexture->Peek_D3D_Base_Texture());
+			Notify_Render_Texture_Changed(m_destAlphaTexture);
 		}
 
 		m_destAlphaTexture->Get_Filter().Set_U_Addr_Mode(TextureFilterClass::TEXTURE_ADDRESS_CLAMP);
