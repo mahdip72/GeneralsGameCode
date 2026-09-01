@@ -45,12 +45,69 @@ inline void addMetric(PhysicsMetricAtomic &value, PhysicsIntegrationMetricCounte
 }
 #endif
 
+#if defined(_MSC_VER) && _MSC_VER < 1300
+typedef unsigned PhysicsJobAtomicUnsigned;
+inline unsigned incrementJobCounter(PhysicsJobAtomicUnsigned &value) { return ++value; }
+inline void decrementJobCounter(PhysicsJobAtomicUnsigned &value) { --value; }
+inline unsigned loadJobCounter(const PhysicsJobAtomicUnsigned &value) { return value; }
+inline void maximizeJobCounter(PhysicsJobAtomicUnsigned &value, unsigned candidate)
+{
+	if (candidate > value) value = candidate;
+}
+#else
+typedef std::atomic<unsigned> PhysicsJobAtomicUnsigned;
+inline unsigned incrementJobCounter(PhysicsJobAtomicUnsigned &value)
+{
+	return value.fetch_add(1, std::memory_order_acq_rel) + 1;
+}
+inline void decrementJobCounter(PhysicsJobAtomicUnsigned &value)
+{
+	value.fetch_sub(1, std::memory_order_acq_rel);
+}
+inline unsigned loadJobCounter(const PhysicsJobAtomicUnsigned &value)
+{
+	return value.load(std::memory_order_relaxed);
+}
+inline void maximizeJobCounter(PhysicsJobAtomicUnsigned &value, unsigned candidate)
+{
+	unsigned observed = value.load(std::memory_order_relaxed);
+	while (observed < candidate && !value.compare_exchange_weak(observed,
+		candidate, std::memory_order_relaxed, std::memory_order_relaxed)) {}
+}
+#endif
+
+inline void orMetric(PhysicsMetricAtomic &value, PhysicsIntegrationMetricCounter mask)
+{
+#if defined(_MSC_VER) && _MSC_VER < 1300
+	value |= mask;
+#else
+	value.fetch_or(mask, std::memory_order_relaxed);
+#endif
+}
+
+inline void maximizeMetric(PhysicsMetricAtomic &value,
+	PhysicsIntegrationMetricCounter candidate)
+{
+#if defined(_MSC_VER) && _MSC_VER < 1300
+	if (candidate > value) value = candidate;
+#else
+	PhysicsIntegrationMetricCounter observed = value.load(std::memory_order_relaxed);
+	while (observed < candidate && !value.compare_exchange_weak(observed,
+		candidate, std::memory_order_relaxed, std::memory_order_relaxed)) {}
+#endif
+}
+
 PhysicsMetricAtomic s_acceptedBatches;
 PhysicsMetricAtomic s_resetEpoch;
 PhysicsMetricAtomic s_acceptedPrefixes;
 PhysicsMetricAtomic s_acceptedRanges;
 PhysicsMetricAtomic s_acceptedSubmittedJobs;
 PhysicsMetricAtomic s_acceptedCompletedJobs;
+PhysicsMetricAtomic s_acceptedPhysicalWorkerJobs;
+PhysicsMetricAtomic s_acceptedOwnerHelpedJobs;
+PhysicsMetricAtomic s_acceptedPhysicalWorkerMask;
+PhysicsMetricAtomic s_maximumAcceptedDistinctPhysicalWorkers;
+PhysicsMetricAtomic s_maximumAcceptedPeakConcurrentPhysicalWorkers;
 PhysicsMetricAtomic s_acceptedAllocatedBytes;
 PhysicsMetricAtomic s_acceptedCaptureNanoseconds;
 PhysicsMetricAtomic s_acceptedPrepareNanoseconds;
@@ -216,23 +273,67 @@ bool validOutputValues(const PhysicsIntegrationOutput &output)
 			static_cast<unsigned>(sizeof(scalarValues) / sizeof(scalarValues[0])));
 }
 
+struct PhysicsIntegrationExecutionRecord
+{
+	PhysicsIntegrationExecutionRecord()
+		: completed(false), physicalWorker(false), ownerHelped(false),
+		  physicalWorkerIndex(JOB_INVALID_PHYSICAL_WORKER_INDEX) {}
+	bool completed;
+	bool physicalWorker;
+	bool ownerHelped;
+	unsigned physicalWorkerIndex;
+};
+
+class PhysicsPhysicalExecutionScope
+{
+public:
+	PhysicsPhysicalExecutionScope(bool physicalWorker,
+		PhysicsJobAtomicUnsigned *active, PhysicsJobAtomicUnsigned *peak)
+		: m_active(physicalWorker ? active : 0)
+	{
+		if (m_active != 0)
+		{
+			const unsigned current = incrementJobCounter(*m_active);
+			maximizeJobCounter(*peak, current);
+		}
+	}
+	~PhysicsPhysicalExecutionScope()
+	{
+		if (m_active != 0)
+			decrementJobCounter(*m_active);
+	}
+private:
+	PhysicsJobAtomicUnsigned *m_active;
+};
+
 class PhysicsIntegrationJob : public Job
 {
 public:
 	PhysicsIntegrationJob(const PhysicsIntegrationSnapshot *snapshots,
 		PhysicsIntegrationOutput *scratch, unsigned rangeIndex,
 		unsigned begin, unsigned end, const JobFloatingPointState &floatingPointState,
-		PhysicsIntegrationTestFault testFault, unsigned testOrdinal)
+		PhysicsIntegrationTestFault testFault, unsigned testOrdinal,
+		PhysicsIntegrationExecutionRecord *execution,
+		PhysicsJobAtomicUnsigned *activePhysicalWorkers,
+		PhysicsJobAtomicUnsigned *peakPhysicalWorkers)
 		: m_snapshots(snapshots), m_scratch(scratch),
 		  m_rangeIndex(rangeIndex), m_begin(begin), m_end(end),
 		  m_floatingPointState(floatingPointState), m_testFault(testFault),
-		  m_testOrdinal(testOrdinal)
+		  m_testOrdinal(testOrdinal), m_execution(execution),
+		  m_activePhysicalWorkers(activePhysicalWorkers),
+		  m_peakPhysicalWorkers(peakPhysicalWorkers)
 	{
 	}
 
 	virtual void execute(JobContext &context)
 	{
 		JobFloatingPointScope floatingPointScope(m_floatingPointState);
+		m_execution->physicalWorker = context.isPhysicalWorkerExecution();
+		m_execution->ownerHelped = !m_execution->physicalWorker;
+		if (m_execution->physicalWorker)
+			m_execution->physicalWorkerIndex = context.physicalWorkerIndex();
+		PhysicsPhysicalExecutionScope physicalScope(m_execution->physicalWorker,
+			m_activePhysicalWorkers, m_peakPhysicalWorkers);
 		if (m_testFault == PHYSICS_INTEGRATION_TEST_WORKER_FAILURE &&
 			m_rangeIndex == m_testOrdinal)
 		{
@@ -254,6 +355,7 @@ public:
 		}
 		if (context.isCancellationRequested())
 			return;
+		m_execution->completed = true;
 	}
 
 private:
@@ -265,6 +367,9 @@ private:
 	JobFloatingPointState m_floatingPointState;
 	PhysicsIntegrationTestFault m_testFault;
 	unsigned m_testOrdinal;
+	PhysicsIntegrationExecutionRecord *m_execution;
+	PhysicsJobAtomicUnsigned *m_activePhysicalWorkers;
+	PhysicsJobAtomicUnsigned *m_peakPhysicalWorkers;
 };
 
 PhysicsIntegrationBatchResult fallback(JobSystem *jobs,
@@ -286,7 +391,9 @@ PhysicsIntegrationOptions::PhysicsIntegrationOptions()
 
 PhysicsIntegrationMetrics::PhysicsIntegrationMetrics()
 	: snapshotCount(0), rangeCount(0), effectiveMinimumGrain(0),
-	  submittedJobs(0), completedJobs(0), serialFallbacks(0), allocatedBytes(0),
+	  submittedJobs(0), completedJobs(0), physicalWorkerJobs(0),
+	  ownerHelpedJobs(0), physicalWorkerMask(0), distinctPhysicalWorkers(0),
+	  peakConcurrentPhysicalWorkers(0), serialFallbacks(0), allocatedBytes(0),
 	  captureNanoseconds(0), prepareNanoseconds(0), waitNanoseconds(0),
 	  commitNanoseconds(0), storageBytes(0), storageCapacityBytes(0),
 	  storageAllocations(0)
@@ -296,6 +403,9 @@ PhysicsIntegrationMetrics::PhysicsIntegrationMetrics()
 PhysicsIntegrationRuntimeMetrics::PhysicsIntegrationRuntimeMetrics()
 	: resetEpoch(0), acceptedBatches(0), acceptedPrefixes(0), acceptedRanges(0),
 	  acceptedSubmittedJobs(0), acceptedCompletedJobs(0),
+	  acceptedPhysicalWorkerJobs(0), acceptedOwnerHelpedJobs(0),
+	  acceptedPhysicalWorkerMask(0), maximumAcceptedDistinctPhysicalWorkers(0),
+	  maximumAcceptedPeakConcurrentPhysicalWorkers(0),
 	  acceptedAllocatedBytes(0),
 	  acceptedCaptureNanoseconds(0), acceptedPrepareNanoseconds(0),
 	  acceptedWaitNanoseconds(0), acceptedCommitNanoseconds(0),
@@ -583,22 +693,27 @@ PhysicsIntegrationBatchResult PreparePhysicsIntegrationPrefixes(
 
 	if (rangeCount > static_cast<unsigned>(~static_cast<unsigned>(0)) /
 		(sizeof(JobSubmission) + sizeof(JobHandle) +
-		 sizeof(PhysicsIntegrationJob *) + sizeof(PhysicsIntegrationJob)))
+		 sizeof(PhysicsIntegrationJob *) + sizeof(PhysicsIntegrationJob) +
+		 sizeof(PhysicsIntegrationExecutionRecord)))
 		return fallback(&jobs, *metrics);
 	metrics->allocatedBytes = rangeCount * static_cast<unsigned>(
 		sizeof(JobSubmission) + sizeof(JobHandle) +
-		sizeof(PhysicsIntegrationJob *) + sizeof(PhysicsIntegrationJob));
+		sizeof(PhysicsIntegrationJob *) + sizeof(PhysicsIntegrationJob) +
+		sizeof(PhysicsIntegrationExecutionRecord));
 	if (options.testFault == PHYSICS_INTEGRATION_TEST_ALLOCATION_FAILURE)
 		return fallback(&jobs, *metrics);
 	JobSubmission *submissions = new (std::nothrow) JobSubmission[rangeCount];
 	JobHandle *handles = new (std::nothrow) JobHandle[rangeCount];
 	PhysicsIntegrationJob **jobPointers = new (std::nothrow)
 		PhysicsIntegrationJob *[rangeCount];
-	if (submissions == 0 || handles == 0 || jobPointers == 0)
+	PhysicsIntegrationExecutionRecord *executions = new (std::nothrow)
+		PhysicsIntegrationExecutionRecord[rangeCount];
+	if (submissions == 0 || handles == 0 || jobPointers == 0 || executions == 0)
 	{
 		delete[] submissions;
 		delete[] handles;
 		delete[] jobPointers;
+		delete[] executions;
 		return fallback(&jobs, *metrics);
 	}
 	for (unsigned pointerIndex = 0; pointerIndex != rangeCount; ++pointerIndex)
@@ -612,10 +727,13 @@ PhysicsIntegrationBatchResult PreparePhysicsIntegrationPrefixes(
 		delete[] submissions;
 		delete[] handles;
 		delete[] jobPointers;
+		delete[] executions;
 		return fallback(&jobs, *metrics);
 	}
 
 	const JobFloatingPointState floatingPointState;
+	PhysicsJobAtomicUnsigned activePhysicalWorkers(0);
+	PhysicsJobAtomicUnsigned peakPhysicalWorkers(0);
 	bool jobsReady = true;
 	for (unsigned rangeIndex = 0; rangeIndex != rangeCount; ++rangeIndex)
 	{
@@ -633,7 +751,9 @@ PhysicsIntegrationBatchResult PreparePhysicsIntegrationPrefixes(
 		}
 		jobPointers[rangeIndex] = new (std::nothrow) PhysicsIntegrationJob(
 			snapshots, scratch, rangeIndex, range.begin, range.end,
-			floatingPointState, options.testFault, options.testOrdinal);
+			floatingPointState, options.testFault, options.testOrdinal,
+			executions + rangeIndex, &activePhysicalWorkers,
+			&peakPhysicalWorkers);
 		if (jobPointers[rangeIndex] == 0)
 		{
 			jobsReady = false;
@@ -654,6 +774,7 @@ PhysicsIntegrationBatchResult PreparePhysicsIntegrationPrefixes(
 		delete[] submissions;
 		delete[] handles;
 		delete[] jobPointers;
+		delete[] executions;
 		return fallback(&jobs, *metrics);
 	}
 	metrics->submittedJobs = rangeCount;
@@ -663,20 +784,64 @@ PhysicsIntegrationBatchResult PreparePhysicsIntegrationPrefixes(
 		prepareStart;
 	const PhysicsIntegrationMetricCounter waitStart =
 		PhysicsIntegrationClockNowNanoseconds();
-	jobs.wait(group);
+	const unsigned physicalCompletionTimeoutMilliseconds = 8;
+	const bool forcePhysicalTimeout = options.testFault ==
+		PHYSICS_INTEGRATION_TEST_PHYSICAL_WAIT_TIMEOUT;
+	const bool physicalFenceCompleted = !forcePhysicalTimeout &&
+		jobs.waitWithoutOwnerHelp(group, physicalCompletionTimeoutMilliseconds);
+	if (!physicalFenceCompleted)
+	{
+		jobs.cancel(group);
+		jobs.wait(group);
+	}
+	else
+	{
+		// The passive fence proved that every job completed without owner help.
+		jobs.wait(group);
+	}
 	metrics->waitNanoseconds = PhysicsIntegrationClockNowNanoseconds() - waitStart;
 	const PhysicsIntegrationMetricCounter finalizeStart =
 		PhysicsIntegrationClockNowNanoseconds();
 	for (unsigned completionIndex = 0; completionIndex != rangeCount; ++completionIndex)
 	{
-		if (handles[completionIndex].succeeded())
+		if (handles[completionIndex].succeeded() && executions[completionIndex].completed)
+		{
 			++metrics->completedJobs;
+			if (executions[completionIndex].physicalWorker)
+			{
+				++metrics->physicalWorkerJobs;
+				const unsigned workerIndex =
+					executions[completionIndex].physicalWorkerIndex;
+				if (workerIndex < sizeof(PhysicsIntegrationMetricCounter) * 8)
+					metrics->physicalWorkerMask |=
+						static_cast<PhysicsIntegrationMetricCounter>(1) << workerIndex;
+				bool firstWorker = true;
+				for (unsigned previous = 0; previous != completionIndex; ++previous)
+				{
+					if (handles[previous].succeeded() && executions[previous].completed &&
+						executions[previous].physicalWorker &&
+						executions[previous].physicalWorkerIndex == workerIndex)
+					{
+						firstWorker = false;
+						break;
+					}
+				}
+				if (firstWorker)
+					++metrics->distinctPhysicalWorkers;
+			}
+			else if (executions[completionIndex].ownerHelped)
+				++metrics->ownerHelpedJobs;
+		}
 	}
+	metrics->peakConcurrentPhysicalWorkers = loadJobCounter(peakPhysicalWorkers);
 
 	PhysicsIntegrationBatchResult result = PHYSICS_INTEGRATION_PARALLEL;
-	if (group.wasCancelled())
+	if (!physicalFenceCompleted || group.wasCancelled())
 		result = fallback(&jobs, *metrics, PHYSICS_INTEGRATION_CANCELLED);
 	else if (group.failed() || metrics->completedJobs != metrics->submittedJobs)
+		result = fallback(&jobs, *metrics);
+	else if (metrics->physicalWorkerJobs != metrics->completedJobs ||
+		metrics->ownerHelpedJobs != 0)
 		result = fallback(&jobs, *metrics);
 	if (result == PHYSICS_INTEGRATION_PARALLEL)
 	{
@@ -695,6 +860,7 @@ PhysicsIntegrationBatchResult PreparePhysicsIntegrationPrefixes(
 	delete[] submissions;
 	delete[] handles;
 	delete[] jobPointers;
+	delete[] executions;
 	// prepareNanoseconds is owner CPU overhead on both sides of the fence:
 	// validation/allocation/submission plus validation/publication/reclamation.
 	metrics->prepareNanoseconds +=
@@ -856,6 +1022,11 @@ void ResetPhysicsIntegrationRuntimeMetrics()
 	resetMetric(s_acceptedRanges);
 	resetMetric(s_acceptedSubmittedJobs);
 	resetMetric(s_acceptedCompletedJobs);
+	resetMetric(s_acceptedPhysicalWorkerJobs);
+	resetMetric(s_acceptedOwnerHelpedJobs);
+	resetMetric(s_acceptedPhysicalWorkerMask);
+	resetMetric(s_maximumAcceptedDistinctPhysicalWorkers);
+	resetMetric(s_maximumAcceptedPeakConcurrentPhysicalWorkers);
 	resetMetric(s_acceptedAllocatedBytes);
 	resetMetric(s_acceptedCaptureNanoseconds);
 	resetMetric(s_acceptedPrepareNanoseconds);
@@ -887,6 +1058,13 @@ PhysicsIntegrationRuntimeMetrics GetPhysicsIntegrationRuntimeMetrics()
 	metrics.acceptedRanges = loadMetric(s_acceptedRanges);
 	metrics.acceptedSubmittedJobs = loadMetric(s_acceptedSubmittedJobs);
 	metrics.acceptedCompletedJobs = loadMetric(s_acceptedCompletedJobs);
+	metrics.acceptedPhysicalWorkerJobs = loadMetric(s_acceptedPhysicalWorkerJobs);
+	metrics.acceptedOwnerHelpedJobs = loadMetric(s_acceptedOwnerHelpedJobs);
+	metrics.acceptedPhysicalWorkerMask = loadMetric(s_acceptedPhysicalWorkerMask);
+	metrics.maximumAcceptedDistinctPhysicalWorkers = static_cast<unsigned>(
+		loadMetric(s_maximumAcceptedDistinctPhysicalWorkers));
+	metrics.maximumAcceptedPeakConcurrentPhysicalWorkers = static_cast<unsigned>(
+		loadMetric(s_maximumAcceptedPeakConcurrentPhysicalWorkers));
 	metrics.acceptedAllocatedBytes = loadMetric(s_acceptedAllocatedBytes);
 	metrics.acceptedCaptureNanoseconds = loadMetric(s_acceptedCaptureNanoseconds);
 	metrics.acceptedPrepareNanoseconds = loadMetric(s_acceptedPrepareNanoseconds);
@@ -919,10 +1097,27 @@ void RecordPhysicsIntegrationAuthoritativeCommit(unsigned prefixCount)
 void RecordPhysicsIntegrationAuthoritativeSlice(unsigned prefixCount,
 	const PhysicsIntegrationMetrics &sliceMetrics)
 {
+	if (prefixCount == 0 || sliceMetrics.submittedJobs < 2 ||
+		sliceMetrics.completedJobs != sliceMetrics.submittedJobs ||
+		sliceMetrics.physicalWorkerJobs != sliceMetrics.completedJobs ||
+		sliceMetrics.ownerHelpedJobs != 0 ||
+		sliceMetrics.distinctPhysicalWorkers <= 1 ||
+		sliceMetrics.peakConcurrentPhysicalWorkers <= 1)
+	{
+		addMetric(s_ownerFallbacks, 1);
+		return;
+	}
 	RecordPhysicsIntegrationAuthoritativeCommit(prefixCount);
 	addMetric(s_acceptedRanges, sliceMetrics.rangeCount);
 	addMetric(s_acceptedSubmittedJobs, sliceMetrics.submittedJobs);
 	addMetric(s_acceptedCompletedJobs, sliceMetrics.completedJobs);
+	addMetric(s_acceptedPhysicalWorkerJobs, sliceMetrics.physicalWorkerJobs);
+	addMetric(s_acceptedOwnerHelpedJobs, sliceMetrics.ownerHelpedJobs);
+	orMetric(s_acceptedPhysicalWorkerMask, sliceMetrics.physicalWorkerMask);
+	maximizeMetric(s_maximumAcceptedDistinctPhysicalWorkers,
+		sliceMetrics.distinctPhysicalWorkers);
+	maximizeMetric(s_maximumAcceptedPeakConcurrentPhysicalWorkers,
+		sliceMetrics.peakConcurrentPhysicalWorkers);
 	addMetric(s_acceptedAllocatedBytes, sliceMetrics.allocatedBytes);
 	addMetric(s_acceptedCaptureNanoseconds, sliceMetrics.captureNanoseconds);
 	addMetric(s_acceptedPrepareNanoseconds, sliceMetrics.prepareNanoseconds);

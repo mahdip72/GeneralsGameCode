@@ -8,6 +8,9 @@
 #include "Lib/SimulationCommandBuffer.h"
 
 #include <new>
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
+#include <atomic>
+#endif
 
 namespace rts
 {
@@ -19,9 +22,123 @@ enum
 	OBJECT_STATUS_TIMER_CLEAR_EXPIRED = 1
 };
 
+#if defined(_MSC_VER) && _MSC_VER < 1300
+typedef ObjectStatusTimerMetricCounter StatusMetricAtomic;
+typedef unsigned StatusJobAtomicUnsigned;
+inline ObjectStatusTimerMetricCounter loadMetric(const StatusMetricAtomic &value) { return value; }
+inline void resetMetric(StatusMetricAtomic &value) { value = 0; }
+inline void addMetric(StatusMetricAtomic &value, ObjectStatusTimerMetricCounter amount) { value += amount; }
+inline void orMetric(StatusMetricAtomic &value, ObjectStatusTimerMetricCounter mask) { value |= mask; }
+inline void maximizeMetric(StatusMetricAtomic &value, ObjectStatusTimerMetricCounter candidate)
+{
+	if (candidate > value) value = candidate;
+}
+inline unsigned incrementJobCounter(StatusJobAtomicUnsigned &value) { return ++value; }
+inline void decrementJobCounter(StatusJobAtomicUnsigned &value) { --value; }
+inline unsigned loadJobCounter(const StatusJobAtomicUnsigned &value) { return value; }
+inline void maximizeJobCounter(StatusJobAtomicUnsigned &value, unsigned candidate)
+{
+	if (candidate > value) value = candidate;
+}
+#else
+typedef std::atomic<ObjectStatusTimerMetricCounter> StatusMetricAtomic;
+typedef std::atomic<unsigned> StatusJobAtomicUnsigned;
+inline ObjectStatusTimerMetricCounter loadMetric(const StatusMetricAtomic &value)
+{
+	return value.load(std::memory_order_relaxed);
+}
+inline void resetMetric(StatusMetricAtomic &value)
+{
+	value.store(0, std::memory_order_relaxed);
+}
+inline void addMetric(StatusMetricAtomic &value, ObjectStatusTimerMetricCounter amount)
+{
+	value.fetch_add(amount, std::memory_order_relaxed);
+}
+inline void orMetric(StatusMetricAtomic &value, ObjectStatusTimerMetricCounter mask)
+{
+	value.fetch_or(mask, std::memory_order_relaxed);
+}
+inline void maximizeMetric(StatusMetricAtomic &value,
+	ObjectStatusTimerMetricCounter candidate)
+{
+	ObjectStatusTimerMetricCounter observed = value.load(std::memory_order_relaxed);
+	while (observed < candidate && !value.compare_exchange_weak(observed,
+		candidate, std::memory_order_relaxed, std::memory_order_relaxed)) {}
+}
+inline unsigned incrementJobCounter(StatusJobAtomicUnsigned &value)
+{
+	return value.fetch_add(1, std::memory_order_acq_rel) + 1;
+}
+inline void decrementJobCounter(StatusJobAtomicUnsigned &value)
+{
+	value.fetch_sub(1, std::memory_order_acq_rel);
+}
+inline unsigned loadJobCounter(const StatusJobAtomicUnsigned &value)
+{
+	return value.load(std::memory_order_relaxed);
+}
+inline void maximizeJobCounter(StatusJobAtomicUnsigned &value, unsigned candidate)
+{
+	unsigned observed = value.load(std::memory_order_relaxed);
+	while (observed < candidate && !value.compare_exchange_weak(observed,
+		candidate, std::memory_order_relaxed, std::memory_order_relaxed)) {}
+}
+#endif
+
+StatusMetricAtomic s_resetEpoch;
+StatusMetricAtomic s_authoritativeBatches;
+StatusMetricAtomic s_committedCommands;
+StatusMetricAtomic s_submittedJobs;
+StatusMetricAtomic s_completedJobs;
+StatusMetricAtomic s_physicalWorkerJobs;
+StatusMetricAtomic s_ownerHelpedJobs;
+StatusMetricAtomic s_physicalWorkerMask;
+StatusMetricAtomic s_maximumDistinctPhysicalWorkers;
+StatusMetricAtomic s_maximumPeakConcurrentPhysicalWorkers;
+StatusMetricAtomic s_shadowExecutions;
+StatusMetricAtomic s_shadowCommands;
+StatusMetricAtomic s_shadowMatches;
+StatusMetricAtomic s_shadowMismatches;
+StatusMetricAtomic s_ownerFallbacks;
+StatusMetricAtomic s_staleRejections;
+
 struct ObjectStatusTimerPayload
 {
 	unsigned expiredMask;
+};
+
+struct ObjectStatusTimerExecutionRecord
+{
+	ObjectStatusTimerExecutionRecord()
+		: completed(false), physicalWorker(false), ownerHelped(false),
+		  physicalWorkerIndex(JOB_INVALID_PHYSICAL_WORKER_INDEX) {}
+	bool completed;
+	bool physicalWorker;
+	bool ownerHelped;
+	unsigned physicalWorkerIndex;
+};
+
+class ObjectStatusPhysicalExecutionScope
+{
+public:
+	ObjectStatusPhysicalExecutionScope(bool physicalWorker,
+		StatusJobAtomicUnsigned *active, StatusJobAtomicUnsigned *peak)
+		: m_active(physicalWorker ? active : 0)
+	{
+		if (m_active != 0)
+		{
+			const unsigned current = incrementJobCounter(*m_active);
+			maximizeJobCounter(*peak, current);
+		}
+	}
+	~ObjectStatusPhysicalExecutionScope()
+	{
+		if (m_active != 0)
+			decrementJobCounter(*m_active);
+	}
+private:
+	StatusJobAtomicUnsigned *m_active;
 };
 
 bool evaluateRange(const ObjectStatusTimerSnapshot *snapshots,
@@ -63,15 +180,26 @@ public:
 	ObjectStatusTimerJob(const ObjectStatusTimerSnapshot *snapshots,
 		unsigned begin, unsigned end, unsigned currentFrame,
 		unsigned disabledTypeCount, SimulationCommandBuffer *buffer,
-		bool *completed)
+		ObjectStatusTimerExecutionRecord *execution,
+		StatusJobAtomicUnsigned *activePhysicalWorkers,
+		StatusJobAtomicUnsigned *peakPhysicalWorkers)
 		: m_snapshots(snapshots), m_begin(begin), m_end(end),
 		  m_currentFrame(currentFrame), m_disabledTypeCount(disabledTypeCount),
-		  m_buffer(buffer), m_completed(completed)
+		  m_buffer(buffer), m_execution(execution),
+		  m_activePhysicalWorkers(activePhysicalWorkers),
+		  m_peakPhysicalWorkers(peakPhysicalWorkers)
 	{
 	}
 
 	virtual void execute(JobContext &context)
 	{
+		m_execution->physicalWorker = context.isPhysicalWorkerExecution();
+		m_execution->ownerHelped = !m_execution->physicalWorker;
+		if (m_execution->physicalWorker)
+			m_execution->physicalWorkerIndex = context.physicalWorkerIndex();
+		ObjectStatusPhysicalExecutionScope physicalScope(
+			m_execution->physicalWorker, m_activePhysicalWorkers,
+			m_peakPhysicalWorkers);
 		if (context.isCancellationRequested() ||
 			!evaluateRange(m_snapshots, m_begin, m_end, m_currentFrame,
 				m_disabledTypeCount, *m_buffer, &context) ||
@@ -80,7 +208,7 @@ public:
 			m_buffer->fail();
 			return;
 		}
-		*m_completed = true;
+		m_execution->completed = true;
 	}
 
 private:
@@ -90,7 +218,9 @@ private:
 	unsigned m_currentFrame;
 	unsigned m_disabledTypeCount;
 	SimulationCommandBuffer *m_buffer;
-	bool *m_completed;
+	ObjectStatusTimerExecutionRecord *m_execution;
+	StatusJobAtomicUnsigned *m_activePhysicalWorkers;
+	StatusJobAtomicUnsigned *m_peakPhysicalWorkers;
 };
 
 void deleteBuffers(SimulationCommandBuffer **buffers, unsigned count)
@@ -116,7 +246,19 @@ ObjectStatusTimerOptions::ObjectStatusTimerOptions()
 
 ObjectStatusTimerMetrics::ObjectStatusTimerMetrics()
 	: evaluatedSnapshots(0), emittedCommands(0), submittedJobs(0),
-	  completedJobs(0), serialFallbacks(0)
+	  completedJobs(0), physicalWorkerJobs(0), ownerHelpedJobs(0),
+	  physicalWorkerMask(0), distinctPhysicalWorkers(0),
+	  peakConcurrentPhysicalWorkers(0), serialFallbacks(0)
+{
+}
+
+ObjectStatusTimerRuntimeMetrics::ObjectStatusTimerRuntimeMetrics()
+	: resetEpoch(0), authoritativeBatches(0), committedCommands(0),
+	  submittedJobs(0), completedJobs(0), physicalWorkerJobs(0),
+	  ownerHelpedJobs(0), physicalWorkerMask(0),
+	  maximumDistinctPhysicalWorkers(0), maximumPeakConcurrentPhysicalWorkers(0),
+	  shadowExecutions(0), shadowCommands(0), shadowMatches(0),
+	  shadowMismatches(0), ownerFallbacks(0), staleRejections(0)
 {
 }
 
@@ -192,7 +334,10 @@ ObjectStatusTimerResult PrepareObjectStatusTimerCommands(
 	SimulationCommandBuffer *buffers[OBJECT_STATUS_TIMER_MAXIMUM_JOBS] = { 0 };
 	const SimulationCommandBuffer *producerSlots[
 		OBJECT_STATUS_TIMER_MAXIMUM_JOBS] = { 0 };
-	bool completed[OBJECT_STATUS_TIMER_MAXIMUM_JOBS] = { false };
+	ObjectStatusTimerExecutionRecord executions[
+		OBJECT_STATUS_TIMER_MAXIMUM_JOBS];
+	StatusJobAtomicUnsigned activePhysicalWorkers(0);
+	StatusJobAtomicUnsigned peakPhysicalWorkers(0);
 	unsigned createdBuffers = 0;
 	unsigned submitted = 0;
 	ObjectStatusTimerResult result = useParallel ?
@@ -255,7 +400,8 @@ ObjectStatusTimerResult PrepareObjectStatusTimerCommands(
 			ObjectStatusTimerJob *job = new (std::nothrow)
 				ObjectStatusTimerJob(snapshots, range.begin, range.end,
 					currentFrame, disabledTypeCount, buffers[producer],
-					completed + producer);
+					executions + producer, &activePhysicalWorkers,
+					&peakPhysicalWorkers);
 			JobHandle handle = job != 0 ? jobs.trySubmit(job,
 				JOB_PRIORITY_FRAME_CRITICAL, group) : JobHandle();
 			if (!handle.isValid())
@@ -269,16 +415,62 @@ ObjectStatusTimerResult PrepareObjectStatusTimerCommands(
 		}
 		if (result != OBJECT_STATUS_TIMER_PARALLEL && group.isValid())
 			jobs.cancel(group);
+		bool physicalFenceCompleted = true;
 		if (submitted != 0)
-			jobs.wait(group);
+		{
+			const unsigned physicalCompletionTimeoutMilliseconds = 8;
+			physicalFenceCompleted = jobs.waitWithoutOwnerHelp(group,
+				physicalCompletionTimeoutMilliseconds);
+			if (!physicalFenceCompleted)
+			{
+				jobs.cancel(group);
+				jobs.wait(group);
+			}
+			else
+			{
+				jobs.wait(group);
+			}
+		}
 		for (unsigned index = 0; index != submitted; ++index)
 		{
-			if (completed[index])
+			if (executions[index].completed)
+			{
 				++metrics->completedJobs;
+				if (executions[index].physicalWorker)
+				{
+					++metrics->physicalWorkerJobs;
+					const unsigned workerIndex =
+						executions[index].physicalWorkerIndex;
+					if (workerIndex < sizeof(ObjectStatusTimerMetricCounter) * 8)
+						metrics->physicalWorkerMask |=
+							static_cast<ObjectStatusTimerMetricCounter>(1) <<
+							workerIndex;
+					bool firstWorker = true;
+					for (unsigned previous = 0; previous != index; ++previous)
+					{
+						if (executions[previous].completed &&
+							executions[previous].physicalWorker &&
+							executions[previous].physicalWorkerIndex == workerIndex)
+						{
+							firstWorker = false;
+							break;
+						}
+					}
+					if (firstWorker)
+						++metrics->distinctPhysicalWorkers;
+				}
+				else if (executions[index].ownerHelped)
+					++metrics->ownerHelpedJobs;
+			}
 		}
+		metrics->peakConcurrentPhysicalWorkers =
+			loadJobCounter(peakPhysicalWorkers);
 		if (result == OBJECT_STATUS_TIMER_PARALLEL &&
-			(group.failed() || group.wasCancelled() || submitted != jobCount ||
-			 metrics->completedJobs != metrics->submittedJobs))
+			(!physicalFenceCompleted || group.failed() || group.wasCancelled() ||
+			 submitted != jobCount ||
+			 metrics->completedJobs != metrics->submittedJobs ||
+			 metrics->physicalWorkerJobs != metrics->completedJobs ||
+			 metrics->ownerHelpedJobs != 0))
 			result = recordFallback(&jobs, *metrics);
 	}
 
@@ -371,5 +563,101 @@ bool ObjectStatusTimerCommandsEqual(const ObjectStatusTimerCommand *left,
 		return false;
 	}
 	return true;
+}
+
+void ResetObjectStatusTimerRuntimeMetrics()
+{
+	addMetric(s_resetEpoch, 1);
+	resetMetric(s_authoritativeBatches);
+	resetMetric(s_committedCommands);
+	resetMetric(s_submittedJobs);
+	resetMetric(s_completedJobs);
+	resetMetric(s_physicalWorkerJobs);
+	resetMetric(s_ownerHelpedJobs);
+	resetMetric(s_physicalWorkerMask);
+	resetMetric(s_maximumDistinctPhysicalWorkers);
+	resetMetric(s_maximumPeakConcurrentPhysicalWorkers);
+	resetMetric(s_shadowExecutions);
+	resetMetric(s_shadowCommands);
+	resetMetric(s_shadowMatches);
+	resetMetric(s_shadowMismatches);
+	resetMetric(s_ownerFallbacks);
+	resetMetric(s_staleRejections);
+}
+
+ObjectStatusTimerRuntimeMetrics GetObjectStatusTimerRuntimeMetrics()
+{
+	ObjectStatusTimerRuntimeMetrics metrics;
+	metrics.resetEpoch = loadMetric(s_resetEpoch);
+	metrics.authoritativeBatches = loadMetric(s_authoritativeBatches);
+	metrics.committedCommands = loadMetric(s_committedCommands);
+	metrics.submittedJobs = loadMetric(s_submittedJobs);
+	metrics.completedJobs = loadMetric(s_completedJobs);
+	metrics.physicalWorkerJobs = loadMetric(s_physicalWorkerJobs);
+	metrics.ownerHelpedJobs = loadMetric(s_ownerHelpedJobs);
+	metrics.physicalWorkerMask = loadMetric(s_physicalWorkerMask);
+	metrics.maximumDistinctPhysicalWorkers = static_cast<unsigned>(
+		loadMetric(s_maximumDistinctPhysicalWorkers));
+	metrics.maximumPeakConcurrentPhysicalWorkers = static_cast<unsigned>(
+		loadMetric(s_maximumPeakConcurrentPhysicalWorkers));
+	metrics.shadowExecutions = loadMetric(s_shadowExecutions);
+	metrics.shadowCommands = loadMetric(s_shadowCommands);
+	metrics.shadowMatches = loadMetric(s_shadowMatches);
+	metrics.shadowMismatches = loadMetric(s_shadowMismatches);
+	metrics.ownerFallbacks = loadMetric(s_ownerFallbacks);
+	metrics.staleRejections = loadMetric(s_staleRejections);
+	return metrics;
+}
+
+void RecordObjectStatusTimerAuthoritativeCommit(unsigned preparedCommandCount,
+	unsigned committedCommandCount, const ObjectStatusTimerMetrics &sliceMetrics)
+{
+	if (preparedCommandCount == 0)
+		return;
+	const bool stale = preparedCommandCount != committedCommandCount;
+	const bool qualifying = !stale &&
+		sliceMetrics.submittedJobs >= 2 &&
+		sliceMetrics.completedJobs == sliceMetrics.submittedJobs &&
+		sliceMetrics.physicalWorkerJobs == sliceMetrics.completedJobs &&
+		sliceMetrics.ownerHelpedJobs == 0 &&
+		sliceMetrics.distinctPhysicalWorkers > 1 &&
+		sliceMetrics.peakConcurrentPhysicalWorkers > 1;
+	if (!qualifying)
+	{
+		addMetric(s_ownerFallbacks, 1);
+		if (stale)
+			addMetric(s_staleRejections, 1);
+		return;
+	}
+	addMetric(s_authoritativeBatches, 1);
+	addMetric(s_committedCommands, committedCommandCount);
+	addMetric(s_submittedJobs, sliceMetrics.submittedJobs);
+	addMetric(s_completedJobs, sliceMetrics.completedJobs);
+	addMetric(s_physicalWorkerJobs, sliceMetrics.physicalWorkerJobs);
+	addMetric(s_ownerHelpedJobs, sliceMetrics.ownerHelpedJobs);
+	orMetric(s_physicalWorkerMask, sliceMetrics.physicalWorkerMask);
+	maximizeMetric(s_maximumDistinctPhysicalWorkers,
+		sliceMetrics.distinctPhysicalWorkers);
+	maximizeMetric(s_maximumPeakConcurrentPhysicalWorkers,
+		sliceMetrics.peakConcurrentPhysicalWorkers);
+}
+
+void RecordObjectStatusTimerShadow(bool matched, unsigned commandCount,
+	const ObjectStatusTimerMetrics &sliceMetrics)
+{
+	addMetric(s_shadowExecutions, 1);
+	addMetric(s_shadowCommands, commandCount);
+	addMetric(matched ? s_shadowMatches : s_shadowMismatches, 1);
+	// Shadow work never proves live authority, but preserve unexpected owner-help
+	// as a fail-closed diagnostic in the same evidence surface.
+	if (sliceMetrics.ownerHelpedJobs != 0)
+		addMetric(s_ownerFallbacks, sliceMetrics.ownerHelpedJobs);
+}
+
+void RecordObjectStatusTimerOwnerFallback(bool stale)
+{
+	addMetric(s_ownerFallbacks, 1);
+	if (stale)
+		addMetric(s_staleRejections, 1);
 }
 }

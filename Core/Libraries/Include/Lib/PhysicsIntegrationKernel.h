@@ -111,7 +111,8 @@ enum PhysicsIntegrationTestFault
 	PHYSICS_INTEGRATION_TEST_ADMISSION_FAILURE,
 	PHYSICS_INTEGRATION_TEST_WORKER_FAILURE,
 	PHYSICS_INTEGRATION_TEST_CANCEL_AFTER_ADMISSION,
-	PHYSICS_INTEGRATION_TEST_NONFINITE_OUTPUT
+	PHYSICS_INTEGRATION_TEST_NONFINITE_OUTPUT,
+	PHYSICS_INTEGRATION_TEST_PHYSICAL_WAIT_TIMEOUT
 };
 
 struct PhysicsIntegrationOptions
@@ -130,6 +131,11 @@ struct PhysicsIntegrationMetrics
 	unsigned effectiveMinimumGrain;
 	unsigned submittedJobs;
 	unsigned completedJobs;
+	unsigned physicalWorkerJobs;
+	unsigned ownerHelpedJobs;
+	PhysicsIntegrationMetricCounter physicalWorkerMask;
+	unsigned distinctPhysicalWorkers;
+	unsigned peakConcurrentPhysicalWorkers;
 	unsigned serialFallbacks;
 	unsigned allocatedBytes;
 	PhysicsIntegrationMetricCounter captureNanoseconds;
@@ -150,6 +156,11 @@ struct PhysicsIntegrationRuntimeMetrics
 	PhysicsIntegrationMetricCounter acceptedRanges;
 	PhysicsIntegrationMetricCounter acceptedSubmittedJobs;
 	PhysicsIntegrationMetricCounter acceptedCompletedJobs;
+	PhysicsIntegrationMetricCounter acceptedPhysicalWorkerJobs;
+	PhysicsIntegrationMetricCounter acceptedOwnerHelpedJobs;
+	PhysicsIntegrationMetricCounter acceptedPhysicalWorkerMask;
+	unsigned maximumAcceptedDistinctPhysicalWorkers;
+	unsigned maximumAcceptedPeakConcurrentPhysicalWorkers;
 	PhysicsIntegrationMetricCounter acceptedAllocatedBytes;
 	PhysicsIntegrationMetricCounter acceptedCaptureNanoseconds;
 	PhysicsIntegrationMetricCounter acceptedPrepareNanoseconds;

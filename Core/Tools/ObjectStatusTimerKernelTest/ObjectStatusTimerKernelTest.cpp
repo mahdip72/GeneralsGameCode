@@ -228,6 +228,10 @@ void testRealJobSystemPathAndFailure()
 		">=256 snapshots execute through the real job system");
 	expect(outputCount == SNAPSHOT_COUNT && metrics.submittedJobs >= 2 &&
 		metrics.submittedJobs == metrics.completedJobs &&
+		metrics.physicalWorkerJobs == metrics.completedJobs &&
+		metrics.ownerHelpedJobs == 0 && metrics.physicalWorkerMask != 0 &&
+		metrics.distinctPhysicalWorkers != 0 &&
+		metrics.peakConcurrentPhysicalWorkers != 0 &&
 		metrics.serialFallbacks == 0,
 		"parallel metrics report a complete fenced wave");
 	unsigned firstDifference = 99;
@@ -260,6 +264,52 @@ void testRealJobSystemPathAndFailure()
 	jobs.shutdown();
 }
 #endif
+
+void testRuntimeAuthorityRequiresPhysicalWorkers()
+{
+	const rts::ObjectStatusTimerRuntimeMetrics before =
+		rts::GetObjectStatusTimerRuntimeMetrics();
+	rts::ResetObjectStatusTimerRuntimeMetrics();
+	rts::ObjectStatusTimerMetrics metrics;
+	metrics.submittedJobs = 4;
+	metrics.completedJobs = 4;
+	metrics.physicalWorkerJobs = 4;
+	metrics.physicalWorkerMask = 0xf;
+	metrics.distinctPhysicalWorkers = 4;
+	metrics.peakConcurrentPhysicalWorkers = 3;
+	rts::RecordObjectStatusTimerAuthoritativeCommit(8, 8, metrics);
+	rts::ObjectStatusTimerRuntimeMetrics runtime =
+		rts::GetObjectStatusTimerRuntimeMetrics();
+	expect(runtime.resetEpoch == before.resetEpoch + 1 &&
+		runtime.authoritativeBatches == 1 && runtime.committedCommands == 8 &&
+		runtime.submittedJobs == 4 && runtime.completedJobs == 4 &&
+		runtime.physicalWorkerJobs == 4 && runtime.ownerHelpedJobs == 0 &&
+		runtime.physicalWorkerMask == 0xf &&
+		runtime.maximumDistinctPhysicalWorkers == 4 &&
+		runtime.maximumPeakConcurrentPhysicalWorkers == 3,
+		"qualifying physical status work records live authority");
+
+	metrics.physicalWorkerJobs = 3;
+	metrics.ownerHelpedJobs = 1;
+	rts::RecordObjectStatusTimerAuthoritativeCommit(8, 8, metrics);
+	rts::RecordObjectStatusTimerAuthoritativeCommit(8, 7, metrics);
+	runtime = rts::GetObjectStatusTimerRuntimeMetrics();
+	expect(runtime.authoritativeBatches == 1 && runtime.committedCommands == 8 &&
+		runtime.ownerFallbacks == 2 && runtime.staleRejections == 1,
+		"owner-help and stale status commits cannot certify live authority");
+
+	rts::RecordObjectStatusTimerShadow(true, 8, metrics);
+	rts::RecordObjectStatusTimerShadow(false, 8, metrics);
+	runtime = rts::GetObjectStatusTimerRuntimeMetrics();
+	expect(runtime.shadowExecutions == 2 && runtime.shadowCommands == 16 &&
+		runtime.shadowMatches == 1 && runtime.shadowMismatches == 1,
+		"status shadow evidence remains separate from live authority");
+	rts::ResetObjectStatusTimerRuntimeMetrics();
+	runtime = rts::GetObjectStatusTimerRuntimeMetrics();
+	expect(runtime.authoritativeBatches == 0 && runtime.committedCommands == 0 &&
+		runtime.physicalWorkerMask == 0 && runtime.shadowExecutions == 0,
+		"status runtime reset clears prior-match authority");
+}
 }
 
 int main()
@@ -271,6 +321,7 @@ int main()
 #if !defined(_MSC_VER) || _MSC_VER >= 1300
 	testRealJobSystemPathAndFailure();
 #endif
+	testRuntimeAuthorityRequiresPhysicalWorkers();
 	if (failures != 0)
 		return 1;
 	printf("Object status timer kernel tests passed.\n");

@@ -18,6 +18,7 @@
 #endif
 
 #if defined(_MSC_VER)
+#include <crtdbg.h>
 #include <stdlib.h>
 #endif
 
@@ -572,6 +573,13 @@ void RunWorkerCount(unsigned workerCount)
 		assert(metrics.allocatedBytes > arrayBytes);
 		assert(metrics.submittedJobs == metrics.rangeCount);
 		assert(metrics.completedJobs == metrics.submittedJobs);
+		assert(metrics.physicalWorkerJobs == metrics.completedJobs);
+		assert(metrics.ownerHelpedJobs == 0);
+		assert(metrics.physicalWorkerMask != 0);
+		assert(metrics.distinctPhysicalWorkers != 0 &&
+			metrics.distinctPhysicalWorkers <= workerCount);
+		assert(metrics.peakConcurrentPhysicalWorkers != 0 &&
+			metrics.peakConcurrentPhysicalWorkers <= workerCount);
 		for (unsigned index = 0; index != count; ++index)
 		{
 			assert(SameBytes(&outputs[index], &expected[index],
@@ -715,6 +723,9 @@ void TestTransactionalFailurePaths()
 	}
 	ExpectTransactionalFailure(
 		rts::PHYSICS_INTEGRATION_TEST_CANCEL_AFTER_ADMISSION,
+		0, rts::PHYSICS_INTEGRATION_CANCELLED);
+	ExpectTransactionalFailure(
+		rts::PHYSICS_INTEGRATION_TEST_PHYSICAL_WAIT_TIMEOUT,
 		0, rts::PHYSICS_INTEGRATION_CANCELLED);
 
 	jobs.shutdown();
@@ -906,6 +917,11 @@ void TestRuntimeMetricsCountOnlyExplicitEvents()
 	sliceMetrics.rangeCount = 4;
 	sliceMetrics.submittedJobs = 4;
 	sliceMetrics.completedJobs = 4;
+	sliceMetrics.physicalWorkerJobs = 4;
+	sliceMetrics.ownerHelpedJobs = 0;
+	sliceMetrics.physicalWorkerMask = 0xf;
+	sliceMetrics.distinctPhysicalWorkers = 4;
+	sliceMetrics.peakConcurrentPhysicalWorkers = 3;
 	sliceMetrics.allocatedBytes = 4096;
 	sliceMetrics.captureNanoseconds = 101;
 	sliceMetrics.prepareNanoseconds = 202;
@@ -930,6 +946,11 @@ void TestRuntimeMetricsCountOnlyExplicitEvents()
 	assert(metrics.acceptedRanges == 4);
 	assert(metrics.acceptedSubmittedJobs == 4);
 	assert(metrics.acceptedCompletedJobs == 4);
+	assert(metrics.acceptedPhysicalWorkerJobs == 4);
+	assert(metrics.acceptedOwnerHelpedJobs == 0);
+	assert(metrics.acceptedPhysicalWorkerMask == 0xf);
+	assert(metrics.maximumAcceptedDistinctPhysicalWorkers == 4);
+	assert(metrics.maximumAcceptedPeakConcurrentPhysicalWorkers == 3);
 	assert(metrics.acceptedAllocatedBytes == 4096);
 	assert(metrics.acceptedCaptureNanoseconds == 101);
 	assert(metrics.acceptedPrepareNanoseconds == 202);
@@ -956,6 +977,8 @@ void TestRuntimeMetricsCountOnlyExplicitEvents()
 	assert(afterSecondReset.resetEpoch == metrics.resetEpoch + 1);
 	assert(afterSecondReset.acceptedBatches == 0);
 	assert(afterSecondReset.acceptedPrefixes == 0);
+	assert(afterSecondReset.acceptedPhysicalWorkerJobs == 0);
+	assert(afterSecondReset.acceptedPhysicalWorkerMask == 0);
 	assert(afterSecondReset.shadowBatches == 0);
 	assert(afterSecondReset.shadowPrefixes == 0);
 	assert(afterSecondReset.shadowRanges == 0);
@@ -969,6 +992,8 @@ int main()
 {
 #if defined(_MSC_VER)
 	_set_error_mode(_OUT_TO_STDERR);
+	_CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+	_CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
 #endif
 	TestScalarByteAndFieldParity();
 	TestLoadedTransportMassUsesLegacyOracle();

@@ -9,6 +9,12 @@
 
 namespace rts
 {
+#if defined(_MSC_VER) && _MSC_VER < 1300
+typedef unsigned __int64 ObjectStatusTimerMetricCounter;
+#else
+typedef unsigned long long ObjectStatusTimerMetricCounter;
+#endif
+
 enum
 {
 	OBJECT_STATUS_TIMER_MAX_TYPES = 16,
@@ -57,7 +63,33 @@ struct ObjectStatusTimerMetrics
 	unsigned emittedCommands;
 	unsigned submittedJobs;
 	unsigned completedJobs;
+	unsigned physicalWorkerJobs;
+	unsigned ownerHelpedJobs;
+	ObjectStatusTimerMetricCounter physicalWorkerMask;
+	unsigned distinctPhysicalWorkers;
+	unsigned peakConcurrentPhysicalWorkers;
 	unsigned serialFallbacks;
+};
+
+struct ObjectStatusTimerRuntimeMetrics
+{
+	ObjectStatusTimerRuntimeMetrics();
+	ObjectStatusTimerMetricCounter resetEpoch;
+	ObjectStatusTimerMetricCounter authoritativeBatches;
+	ObjectStatusTimerMetricCounter committedCommands;
+	ObjectStatusTimerMetricCounter submittedJobs;
+	ObjectStatusTimerMetricCounter completedJobs;
+	ObjectStatusTimerMetricCounter physicalWorkerJobs;
+	ObjectStatusTimerMetricCounter ownerHelpedJobs;
+	ObjectStatusTimerMetricCounter physicalWorkerMask;
+	unsigned maximumDistinctPhysicalWorkers;
+	unsigned maximumPeakConcurrentPhysicalWorkers;
+	ObjectStatusTimerMetricCounter shadowExecutions;
+	ObjectStatusTimerMetricCounter shadowCommands;
+	ObjectStatusTimerMetricCounter shadowMatches;
+	ObjectStatusTimerMetricCounter shadowMismatches;
+	ObjectStatusTimerMetricCounter ownerFallbacks;
+	ObjectStatusTimerMetricCounter staleRejections;
 };
 
 // Cheap live-adapter admission must run before the owner scans or allocates a
@@ -86,4 +118,12 @@ ObjectStatusTimerResult PrepareObjectStatusTimerCommands(
 bool ObjectStatusTimerCommandsEqual(const ObjectStatusTimerCommand *left,
 	unsigned leftCount, const ObjectStatusTimerCommand *right,
 	unsigned rightCount, unsigned *firstDifference);
+
+void ResetObjectStatusTimerRuntimeMetrics();
+ObjectStatusTimerRuntimeMetrics GetObjectStatusTimerRuntimeMetrics();
+void RecordObjectStatusTimerAuthoritativeCommit(unsigned preparedCommandCount,
+	unsigned committedCommandCount, const ObjectStatusTimerMetrics &sliceMetrics);
+void RecordObjectStatusTimerShadow(bool matched, unsigned commandCount,
+	const ObjectStatusTimerMetrics &sliceMetrics);
+void RecordObjectStatusTimerOwnerFallback(bool stale);
 }
