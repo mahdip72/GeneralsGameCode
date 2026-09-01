@@ -15,6 +15,7 @@ target_sources(core_task_runtime PRIVATE
     DeterministicCrcJobSystemAdapter.cpp
     PhysicsIntegrationKernel.cpp
     ObjectStatusTimerKernel.cpp
+    CollisionCandidateKernel.cpp
     ImmutableSpatialQuery.cpp
     RadarTerrainKernel.cpp
     RadarOverlayKernel.cpp
