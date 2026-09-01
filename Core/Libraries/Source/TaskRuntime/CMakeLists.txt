@@ -3,6 +3,7 @@ add_library(core_task_runtime STATIC)
 target_sources(core_task_runtime PRIVATE
     TaskRuntime.cpp
     PipelineExecutionPolicy.cpp
+    SimulationPhaseGraph.cpp
     DeterministicCrcStream.cpp
     ImmutableSpatialQuery.cpp
     RadarTerrainKernel.cpp
