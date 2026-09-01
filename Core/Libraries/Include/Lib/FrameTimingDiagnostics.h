@@ -7,6 +7,10 @@ namespace rts { namespace frame_timing {
 enum Phase
 {
 	FrameTotal, Radar, Audio, Client, Messages, Network, Logic, ClientStep, Wait,
+	SimulationSnapshot, SimulationSerial, SimulationParallel, SimulationWait,
+	SimulationReduce, SimulationShadowCompare, SimulationCommit,
+	CollisionAdmission, CollisionLiveValidation, CollisionExistingFilter,
+	CollisionCommitPrepare,
 	RecorderUpdate, RecorderEncode, RecorderFlush,
 	AudioVoiceCreate, AudioVoiceDestroy, AudioDecodeOpen, AudioDecodeRead,
 	RendererPresent, RendererTextureCollect, RendererTexturePrune,
@@ -106,8 +110,10 @@ public:
 		const __int64 end = clock();
 		add(FrameTotal, end - m_frameStart);
 		if (frame >= m_frameEnd)
+		{
 			m_logicFrames += frame - m_frameEnd;
-		m_frameEnd = frame;
+			m_frameEnd = frame;
+		}
 		m_active = false;
 		// Headless buckets are simulation-time based for early/late comparison.
 		if ((m_mode[0] == 'h' && m_logicFrames >= 900) ||
@@ -186,6 +192,10 @@ private:
 		static const char* names[PhaseCount] =
 		{
 			"frame", "radar", "audio", "client", "messages", "network", "logic", "client_step", "wait",
+			"simulation_snapshot", "simulation_serial", "simulation_parallel", "simulation_wait",
+			"simulation_reduce", "simulation_shadow_compare", "simulation_commit",
+			"collision_admission", "collision_live_validation", "collision_existing_filter",
+			"collision_commit_prepare",
 			"recorder_update", "recorder_encode", "recorder_flush",
 			"audio_voice_create", "audio_voice_destroy", "audio_decode_open", "audio_decode_read",
 			"renderer_present", "renderer_texture_collect", "renderer_texture_prune"

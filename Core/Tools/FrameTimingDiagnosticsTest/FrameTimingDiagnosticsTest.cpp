@@ -97,10 +97,25 @@ void enabled(const std::string& directory, __int64 frequency)
 		for (int i = 0; i < 19; ++i)
 			capture.add(rts::frame_timing::Logic, frequency / 1000);
 		capture.add(rts::frame_timing::Logic, frequency / 10);
+		const rts::frame_timing::Phase simulationPhases[] = {
+			rts::frame_timing::SimulationSnapshot,
+			rts::frame_timing::SimulationSerial,
+			rts::frame_timing::SimulationParallel,
+			rts::frame_timing::SimulationWait,
+			rts::frame_timing::SimulationReduce,
+			rts::frame_timing::SimulationShadowCompare,
+			rts::frame_timing::SimulationCommit,
+			rts::frame_timing::CollisionAdmission,
+			rts::frame_timing::CollisionLiveValidation,
+			rts::frame_timing::CollisionExistingFilter,
+			rts::frame_timing::CollisionCommitPrepare
+		};
+		for (std::size_t phase = 0; phase < sizeof(simulationPhases) / sizeof(simulationPhases[0]); ++phase)
+			capture.add(simulationPhases[phase], frequency / 2000);
 		capture.endFrame(1000); // Forces the headless periodic bucket without sleeping.
 		std::vector<Row> data = rows(directory);
-		check(data.size() == 2, "periodic flush writes frame and logic before session ends");
-		if (data.size() == 2)
+		check(data.size() == 13, "periodic flush writes frame, logic, and simulation phases before session ends");
+		if (data.size() == 13)
 		{
 			const Row& logic = data[1];
 			check(strcmp(logic.phase, "logic") == 0 && logic.samples == 20, "logic sample count");
@@ -109,19 +124,34 @@ void enabled(const std::string& directory, __int64 frequency)
 				"histogram percentile upper bounds retain the tail");
 			check(logic.maximum >= 99.0 && logic.over33 == 1, "max and stall threshold counter");
 			check(logic.total > 118.0 && logic.total < 120.0, "sample totals");
+			const char *simulationNames[] = {
+				"simulation_snapshot", "simulation_serial", "simulation_parallel", "simulation_wait",
+				"simulation_reduce", "simulation_shadow_compare", "simulation_commit",
+				"collision_admission", "collision_live_validation", "collision_existing_filter",
+				"collision_commit_prepare"
+			};
+			for (std::size_t phase = 0; phase < sizeof(simulationNames) / sizeof(simulationNames[0]); ++phase)
+			{
+				check(strcmp(data[phase + 2].phase, simulationNames[phase]) == 0 &&
+					data[phase + 2].samples == 1, "simulation phase name and sample count");
+			}
 		}
 		capture.beginFrame(1000);
 		capture.endFrame(1005);
+		capture.beginFrame(1005);
+		capture.endFrame(0); // Game teardown can reset GameLogic before EndFrame.
 		capture.endSession();
 		data = rows(directory);
-		check(data.size() == 3 && data.back().frames == 5, "session end flushes partial bucket");
+		check(data.size() == 14 && data.back().frames == 5 &&
+			data.back().first == 1000 && data.back().last == 1005,
+			"session end preserves the final pre-reset frame range");
 		capture.beginSession("interactive");
 		capture.beginFrame(0);
 		capture.endFrame(1);
 		// Destructor must retain this final partial bucket without endSession.
 	}
 	const std::vector<Row> data = rows(directory);
-	check(data.size() == 4 && data.back().session == 2 && data.back().frames == 1 &&
+	check(data.size() == 15 && data.back().session == 2 && data.back().frames == 1 &&
 		strcmp(data.back().mode, "interactive") == 0, "destructor/session reset retains only new frame counts");
 }
 
