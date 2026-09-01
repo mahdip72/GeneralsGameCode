@@ -10,8 +10,9 @@
 
 #pragma once
 
-#include <d3d8.h>
+#include <Utility/CppMacros.h>
 
+#include "ww3dformat.h"
 #include <vector>
 
 // Keep the legacy filter values independent of any image service.  Native
@@ -24,17 +25,35 @@ enum SurfaceBlitFilter
 	SURFACE_BLIT_FILTER_BOX = 2
 };
 
-// Copy a source rectangle into a destination rectangle.  Equal-format,
-// equal-sized rectangles use IDirect3DDevice8::CopyRects.  Other characterized
-// combinations are staged and converted/scaled on the CPU.
-HRESULT SurfaceBlit_Copy(
-	IDirect3DSurface8 *destination,
-	const RECT *destination_rect,
-	IDirect3DSurface8 *source,
-	const RECT *source_rect,
+struct SurfaceBlitRectangle
+{
+	int left;
+	int top;
+	int right;
+	int bottom;
+};
+
+struct SurfaceBlitImageDescription
+{
+	unsigned int width;
+	unsigned int height;
+	WW3DFormat format;
+};
+
+// Backend-neutral geometry contract shared by native byte-image users and the
+// legacy D3D8 adapter below.
+bool SurfaceBlit_Can_Copy_Direct(
+	const SurfaceBlitImageDescription &destination,
+	const SurfaceBlitRectangle &destination_rect,
+	const SurfaceBlitImageDescription &source,
+	const SurfaceBlitRectangle &source_rect,
 	SurfaceBlitFilter filter);
 
-// Convert a locked D3D8 surface into tightly packed A8R8G8B8 bytes.  This
+SurfaceBlitFilter SurfaceBlit_Filter_For_Full_Copy(
+	const SurfaceBlitImageDescription &destination,
+	const SurfaceBlitImageDescription &source);
+
+// Convert a pitched byte image into tightly packed A8R8G8B8 bytes.  This
 // covers the production uncompressed formats and DXT1-5 block layouts.  A
 // format without a documented color interpretation is rejected.
 bool SurfaceBlit_Convert_To_A8R8G8B8(
@@ -42,7 +61,7 @@ bool SurfaceBlit_Convert_To_A8R8G8B8(
 	int source_pitch,
 	unsigned int width,
 	unsigned int height,
-	D3DFORMAT source_format,
+	WW3DFormat source_format,
 	std::vector<unsigned char> *pixels);
 
 // Resample tightly packed A8R8G8B8 pixels for the characterized filter modes.
@@ -57,8 +76,30 @@ bool SurfaceBlit_Resample_A8R8G8B8(
 	unsigned int destination_height,
 	SurfaceBlitFilter filter);
 
-// Encode tightly packed A8R8G8B8 pixels into a lockable D3D8 surface layout.
+// Encode tightly packed A8R8G8B8 pixels into a pitched byte-image layout.
 // Paletted, bump-map, depth, and compressed destinations are rejected.
+bool SurfaceBlit_Write_A8R8G8B8(
+	const unsigned char *source,
+	unsigned int width,
+	unsigned int height,
+	unsigned char *destination,
+	int destination_pitch,
+	WW3DFormat destination_format);
+
+#if defined(BUILD_WITH_D3D8)
+
+#include <d3d8.h>
+
+// D3D8-format shims retained only for legacy callers.  They translate the
+// format enum and immediately enter the byte-image kernels above.
+bool SurfaceBlit_Convert_To_A8R8G8B8(
+	const unsigned char *source,
+	int source_pitch,
+	unsigned int width,
+	unsigned int height,
+	D3DFORMAT source_format,
+	std::vector<unsigned char> *pixels);
+
 bool SurfaceBlit_Write_A8R8G8B8(
 	const unsigned char *source,
 	unsigned int width,
@@ -67,6 +108,15 @@ bool SurfaceBlit_Write_A8R8G8B8(
 	int destination_pitch,
 	D3DFORMAT destination_format);
 
+// Copy a source rectangle into a destination rectangle.  Equal-format,
+// equal-sized rectangles use IDirect3DDevice8::CopyRects.  Other characterized
+// combinations are staged and converted/scaled on the CPU.
+HRESULT SurfaceBlit_Copy(
+	IDirect3DSurface8 *destination,
+	const RECT *destination_rect,
+	IDirect3DSurface8 *source,
+	const RECT *source_rect,
+	SurfaceBlitFilter filter);
 // Copy and convert a surface to tightly packed A8R8G8B8 bytes.  The source is
 // first copied to a lockable system-memory surface with CopyRects, so this is
 // valid for both managed/system-memory and default-pool render-target sources.
@@ -92,3 +142,5 @@ bool SurfaceBlit_Can_Use_CopyRects(
 SurfaceBlitFilter SurfaceBlit_Filter_For_Full_Copy(
 	const D3DSURFACE_DESC &destination,
 	const D3DSURFACE_DESC &source);
+
+#endif

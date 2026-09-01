@@ -25,7 +25,9 @@
 #include "WWLib/wwstring.h"
 #include "WWMath/vector3.h"
 
+#if defined(BUILD_WITH_D3D8)
 struct IDirect3DSurface8;
+#endif
 
 // ----------------------------------------------------------------------------
 //
@@ -154,6 +156,9 @@ struct LegacyDDSURFACEDESC2 {
 	unsigned TextureStage;
 };
 
+typedef char LegacyDDSURFACEDESC2_Must_Remain_124_Bytes[
+	sizeof(LegacyDDSURFACEDESC2)==124 ? 1 : -1];
+
 
 enum DDSType
 {
@@ -206,6 +211,17 @@ class DDSFileClass
 		unsigned source_x,
 		unsigned source_y,
 		const Vector3& hsv_shift) const;
+	bool Copy_4x4_Block_From_Memory_Clipped(
+		const unsigned char* source_memory,
+		unsigned char* dest_ptr,
+		unsigned dest_pitch,
+		WW3DFormat dest_format,
+		unsigned level,
+		unsigned source_x,
+		unsigned source_y,
+		unsigned dest_width,
+		unsigned dest_height,
+		const Vector3& hsv_shift) const;
 
 public:
 	// You can pass the name in .tga or .dds format, the class will automatically try and load .dds file.
@@ -230,7 +246,9 @@ public:
 	DDSType Get_Type() const { return Type; }
 
 	// Copy pixels to the destination surface.
+#if defined(BUILD_WITH_D3D8)
 	void Copy_Level_To_Surface(unsigned level,IDirect3DSurface8* d3d_surface,const Vector3& hsv_shift=Vector3(0.0f,0.0f,0.0f));
+#endif
 	void Copy_Level_To_Surface(
 		unsigned level,
 		WW3DFormat dest_format,

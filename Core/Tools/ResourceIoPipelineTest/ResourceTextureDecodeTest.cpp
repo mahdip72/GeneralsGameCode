@@ -2,24 +2,39 @@
 #include "WWLib/ffactory.h"
 #include "WWLib/WWFILE.h"
 #include "WW3D2/ddsfile.h"
-#include "WW3D2/bitmaphandler.h"
 #include "WW3D2/texturemipbuffer.h"
-#include "WW3D2/formconv.h"
-#include "WW3D2/legacytexturecompat.h"
 #include "Lib/ResourceIoPipeline.h"
 #include <atomic>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <thread>
 #include <vector>
 
-// The fixture exercises real CPU loaders, not a GPU/device singleton.
-void Log_DX8_ErrorCode(unsigned) {}
-void LegacyTextureCreation_Register_DDS_Decode_Callback(LegacyTextureDDSDecodeCallback) {}
 unsigned Get_Bytes_Per_Pixel(WW3DFormat format)
 {
-	WW3DFormatDescriptor descriptor;
-	return Try_Get_WW3DFormat_Descriptor(format, &descriptor) ? descriptor.bytesPerPixel : 0;
+	switch (format)
+	{
+	case WW3D_FORMAT_R8G8B8: return 3;
+	case WW3D_FORMAT_A8R8G8B8:
+	case WW3D_FORMAT_X8R8G8B8: return 4;
+	case WW3D_FORMAT_R5G6B5:
+	case WW3D_FORMAT_X1R5G5B5:
+	case WW3D_FORMAT_A1R5G5B5:
+	case WW3D_FORMAT_A4R4G4B4:
+	case WW3D_FORMAT_A8R3G3B2:
+	case WW3D_FORMAT_X4R4G4B4:
+	case WW3D_FORMAT_A8P8:
+	case WW3D_FORMAT_A8L8:
+	case WW3D_FORMAT_U8V8:
+	case WW3D_FORMAT_L6V5U5: return 2;
+	case WW3D_FORMAT_R3G3B2:
+	case WW3D_FORMAT_A8:
+	case WW3D_FORMAT_P8:
+	case WW3D_FORMAT_L8:
+	case WW3D_FORMAT_A4L4: return 1;
+	default: return 0;
+	}
 }
 
 namespace
@@ -30,6 +45,19 @@ std::atomic<unsigned> factoryWorkerCalls(0);
 void check(bool condition, const char *message)
 {
 	if (!condition) { ++failures; std::printf("FAIL: %s\n", message); }
+}
+
+unsigned ddsFourCC(WW3DFormat format)
+{
+	switch (format)
+	{
+	case WW3D_FORMAT_DXT1: return 0x31545844;
+	case WW3D_FORMAT_DXT2: return 0x32545844;
+	case WW3D_FORMAT_DXT3: return 0x33545844;
+	case WW3D_FORMAT_DXT4: return 0x34545844;
+	case WW3D_FORMAT_DXT5: return 0x35545844;
+	default: return 0;
+	}
 }
 class MemoryFile : public FileClass
 {
@@ -92,16 +120,25 @@ private:
 	std::vector<unsigned char> bytes;
 };
 
-std::vector<unsigned char> makeDDS(WW3DFormat format, bool cube)
+std::vector<unsigned char> makeDDS(WW3DFormat format, bool cube,
+	unsigned width = 8, unsigned height = 8, unsigned mipCount = 4)
 {
 	LegacyDDSURFACEDESC2 header;
 	std::memset(&header, 0, sizeof(header));
-	header.Size = sizeof(header); header.Width = header.Height = 8; header.MipMapCount = 4;
+	header.Size = sizeof(header); header.Width = width; header.Height = height;
+	header.MipMapCount = mipCount;
 	header.PixelFormat.Size = sizeof(header.PixelFormat);
-	header.PixelFormat.FourCC = WW3DFormat_To_D3DFormat(format);
+	header.PixelFormat.FourCC = ddsFourCC(format);
 	header.Caps.Caps2 = cube ? 0x200 : 0;
 	const unsigned blockBytes = format == WW3D_FORMAT_DXT1 ? 8 : 16;
-	const unsigned faceBytes = 7 * blockBytes;
+	unsigned faceBytes = 0;
+	unsigned levelWidth = width, levelHeight = height;
+	for (unsigned level = 0; level != mipCount; ++level)
+	{
+		faceBytes += ((levelWidth + 3) / 4) * ((levelHeight + 3) / 4) * blockBytes;
+		levelWidth = levelWidth > 1 ? levelWidth / 2 : 1;
+		levelHeight = levelHeight > 1 ? levelHeight / 2 : 1;
+	}
 	std::vector<unsigned char> bytes(128 + faceBytes * (cube ? 6 : 1));
 	std::memcpy(bytes.data(), "DDS ", 4);
 	std::memcpy(bytes.data() + 4, &header, sizeof(header));
@@ -150,6 +187,184 @@ public:
 
 void testDDS(MemoryFactory &factory, rts::ResourceIoPipeline &pipeline)
 {
+	check(sizeof(LegacyDDSURFACEDESC2) == 124,
+		"DDS disk descriptor remains exactly 124 bytes");
+	check(offsetof(LegacyDDSURFACEDESC2, Surface) == 36,
+		"DDS Surface disk field remains at byte offset 36");
+	check(sizeof(((LegacyDDSURFACEDESC2*)0)->Surface) == 4,
+		"DDS Surface disk field remains exactly 32 bits");
+	LegacyDDSURFACEDESC2 layoutHeader;
+	std::memset(&layoutHeader, 0, sizeof(layoutHeader));
+	layoutHeader.Surface = 0x78563412U;
+	unsigned char layoutBytes[sizeof(layoutHeader)];
+	std::memcpy(layoutBytes, &layoutHeader, sizeof(layoutHeader));
+	check(layoutBytes[36] == 0x12 && layoutBytes[37] == 0x34 &&
+		layoutBytes[38] == 0x56 && layoutBytes[39] == 0x78,
+		"DDS Surface value retains its byte-exact little-endian disk layout");
+
+	std::vector<unsigned char> twoDBytes = makeDDS(WW3D_FORMAT_DXT1, false);
+	// Make the retained 4x4 mip alternate pure red and green.  Its R3G3B2
+	// expansion must pack those channels into exactly one byte per pixel.
+	const unsigned char r3g3b2Block[8] = {0x00, 0xF8, 0xE0, 0x07,
+		0x44, 0x44, 0x44, 0x44};
+	std::memcpy(twoDBytes.data() + 160, r3g3b2Block, sizeof(r3g3b2Block));
+	DDSFileClass twoD(nullptr, 0);
+	check(twoD.Set_Memory_Header(twoDBytes.data(), twoDBytes.size()) &&
+		twoD.Load_From_Memory(twoDBytes.data(), twoDBytes.size()),
+		"byte-exact 2D DDS fixture loads from memory");
+	check(twoD.Get_Mip_Level_Count() == 2 &&
+		twoD.Get_Level_Size(0) == 32 && twoD.Get_Level_Size(1) == 8,
+		"2D DDS retained mip sizes match the disk block layout");
+	check(std::memcmp(twoD.Get_Memory_Pointer(0), twoDBytes.data() + 128, 32) == 0 &&
+		std::memcmp(twoD.Get_Memory_Pointer(1), twoDBytes.data() + 160, 8) == 0,
+		"2D DDS mip pointers select the exact payload bytes");
+	std::vector<unsigned char> pitched2D(40, 0xCC);
+	twoD.Copy_Level_To_Surface(0, WW3D_FORMAT_DXT1, 8, 8,
+		pitched2D.data(), 20, Vector3(0, 0, 0));
+	check(std::memcmp(pitched2D.data(), twoDBytes.data() + 128, 16) == 0 &&
+		std::memcmp(pitched2D.data() + 20, twoDBytes.data() + 144, 16) == 0,
+		"2D DDS copy preserves exact block bytes across pitched rows");
+	bool twoDPaddingUntouched = true;
+	for (unsigned row = 0; row != 2; ++row)
+		for (unsigned byte = 16; byte != 20; ++byte)
+			twoDPaddingUntouched = twoDPaddingUntouched && pitched2D[row * 20 + byte] == 0xCC;
+	check(twoDPaddingUntouched,
+		"2D DDS copy leaves destination pitch padding untouched");
+
+	unsigned char tightR3G3B2[18];
+	std::memset(tightR3G3B2, 0xCC, sizeof(tightR3G3B2));
+	twoD.Copy_Level_To_Surface(1, WW3D_FORMAT_R3G3B2, 4, 4,
+		tightR3G3B2 + 1, 4, Vector3(0, 0, 0));
+	bool tightR3G3B2Exact = true;
+	const unsigned char expectedR3G3B2Row[4] = {0xE0, 0x1C, 0xE0, 0x1C};
+	for (unsigned row = 0; row != 4; ++row)
+		tightR3G3B2Exact = tightR3G3B2Exact &&
+			std::memcmp(tightR3G3B2 + 1 + row * 4,
+				expectedR3G3B2Row, sizeof(expectedR3G3B2Row)) == 0;
+	check(tightR3G3B2Exact,
+		"tight-pitch R3G3B2 conversion writes the exact sixteen bytes");
+	check(tightR3G3B2[0] == 0xCC && tightR3G3B2[17] == 0xCC,
+		"tight-pitch R3G3B2 conversion preserves both canaries");
+
+	unsigned char paddedR3G3B2[29];
+	std::memset(paddedR3G3B2, 0xCC, sizeof(paddedR3G3B2));
+	twoD.Copy_Level_To_Surface(1, WW3D_FORMAT_R3G3B2, 4, 4,
+		paddedR3G3B2, 7, Vector3(0, 0, 0));
+	bool paddedR3G3B2Exact = true;
+	for (unsigned row = 0; row != 4; ++row)
+	{
+		paddedR3G3B2Exact = paddedR3G3B2Exact &&
+			std::memcmp(paddedR3G3B2 + row * 7,
+				expectedR3G3B2Row, sizeof(expectedR3G3B2Row)) == 0;
+		for (unsigned byte = 4; byte != 7; ++byte)
+			paddedR3G3B2Exact = paddedR3G3B2Exact &&
+				paddedR3G3B2[row * 7 + byte] == 0xCC;
+	}
+	check(paddedR3G3B2Exact && paddedR3G3B2[28] == 0xCC,
+		"R3G3B2 conversion writes exact active bytes and preserves row padding");
+
+	const unsigned char edgeBlock[8] = {0x00, 0xF8, 0xE0, 0x07,
+		0x44, 0x44, 0x44, 0x44};
+	std::vector<unsigned char> edge2DBytes = makeDDS(
+		WW3D_FORMAT_DXT1, false, 5, 5, 1);
+	for (unsigned block = 0; block != 4; ++block)
+		std::memcpy(edge2DBytes.data() + 128 + block * 8,
+			edgeBlock, sizeof(edgeBlock));
+	DDSFileClass edge2D(nullptr, 0);
+	check(edge2D.Set_Memory_Header(edge2DBytes.data(), edge2DBytes.size()) &&
+		edge2D.Load_From_Memory(edge2DBytes.data(), edge2DBytes.size()),
+		"5x5 2D DDS fixture loads from memory");
+	const unsigned edgeGuardSize = 96;
+	const unsigned edge2DPitch = 20;
+	std::vector<unsigned char> edge2DSurface(
+		edgeGuardSize + edge2DPitch * 5 + edgeGuardSize, 0xCC);
+	edge2D.Copy_Level_To_Surface(0, WW3D_FORMAT_A8R8G8B8, 5, 5,
+		edge2DSurface.data() + edgeGuardSize, edge2DPitch, Vector3(0, 0, 0));
+	// Preserve the legacy RGB565 expansion exactly (high bits are shifted,
+	// not replicated into the low bits).
+	const unsigned char redPixel[4] = {0x00, 0x00, 0xF8, 0xFF};
+	const unsigned char greenPixel[4] = {0x00, 0xFC, 0x00, 0xFF};
+	bool edge2DExact = true;
+	for (unsigned row = 0; row != 5; ++row)
+		for (unsigned column = 0; column != 5; ++column)
+			edge2DExact = edge2DExact && std::memcmp(
+				edge2DSurface.data() + edgeGuardSize + row * edge2DPitch + column * 4,
+				(column & 1) ? greenPixel : redPixel, 4) == 0;
+	bool edge2DCanaries = true;
+	for (unsigned byte = 0; byte != edgeGuardSize; ++byte)
+	{
+		edge2DCanaries = edge2DCanaries && edge2DSurface[byte] == 0xCC;
+		edge2DCanaries = edge2DCanaries &&
+			edge2DSurface[edgeGuardSize + edge2DPitch * 5 + byte] == 0xCC;
+	}
+	check(edge2DExact,
+		"5x5 2D DDS conversion clips edge blocks with exact active pixels");
+	check(edge2DCanaries,
+		"5x5 2D DDS conversion preserves allocation canaries");
+
+	std::vector<unsigned char> edgeCubeBytes = makeDDS(
+		WW3D_FORMAT_DXT1, true, 5, 5, 1);
+	const unsigned edgeCubeFace = 3;
+	const unsigned edgeCubeFaceBytes = 32;
+	for (unsigned block = 0; block != 4; ++block)
+		std::memcpy(edgeCubeBytes.data() + 128 +
+			edgeCubeFace * edgeCubeFaceBytes + block * 8,
+			edgeBlock, sizeof(edgeBlock));
+	DDSFileClass edgeCube(nullptr, 0);
+	check(edgeCube.Set_Memory_Header(edgeCubeBytes.data(), edgeCubeBytes.size()) &&
+		edgeCube.Load_From_Memory(edgeCubeBytes.data(), edgeCubeBytes.size()),
+		"5x5 cube DDS fixture loads from memory");
+	const unsigned edgeCubePitch = 23;
+	std::vector<unsigned char> edgeCubeSurface(
+		edgeGuardSize + edgeCubePitch * 5 + edgeGuardSize, 0xCC);
+	edgeCube.Copy_CubeMap_Level_To_Surface(edgeCubeFace, 0,
+		WW3D_FORMAT_A8R8G8B8, 5, 5, edgeCubeSurface.data() + edgeGuardSize,
+		edgeCubePitch, Vector3(0, 0, 0));
+	bool edgeCubeExact = true;
+	for (unsigned row = 0; row != 5; ++row)
+	{
+		edgeCubeExact = edgeCubeExact && std::memcmp(
+			edgeCubeSurface.data() + edgeGuardSize + row * edgeCubePitch,
+			edge2DSurface.data() + edgeGuardSize + row * edge2DPitch,
+			edge2DPitch) == 0;
+		for (unsigned byte = edge2DPitch; byte != edgeCubePitch; ++byte)
+			edgeCubeExact = edgeCubeExact &&
+				edgeCubeSurface[edgeGuardSize + row * edgeCubePitch + byte] == 0xCC;
+	}
+	bool edgeCubeCanaries = true;
+	for (unsigned byte = 0; byte != edgeGuardSize; ++byte)
+	{
+		edgeCubeCanaries = edgeCubeCanaries && edgeCubeSurface[byte] == 0xCC;
+		edgeCubeCanaries = edgeCubeCanaries &&
+			edgeCubeSurface[edgeGuardSize + edgeCubePitch * 5 + byte] == 0xCC;
+	}
+	check(edgeCubeExact,
+		"5x5 cube DDS conversion clips edge blocks and preserves pitch padding");
+	check(edgeCubeCanaries,
+		"5x5 cube DDS conversion preserves allocation canaries");
+
+	std::vector<unsigned char> cubeBytes = makeDDS(WW3D_FORMAT_DXT1, true);
+	DDSFileClass cubeDDS(nullptr, 0);
+	check(cubeDDS.Set_Memory_Header(cubeBytes.data(), cubeBytes.size()) &&
+		cubeDDS.Load_From_Memory(cubeBytes.data(), cubeBytes.size()),
+		"byte-exact cube DDS fixture loads from memory");
+	const unsigned face = 4;
+	const unsigned faceBytes = 56;
+	check(std::memcmp(cubeDDS.Get_CubeMap_Memory_Pointer(face, 0),
+		cubeBytes.data() + 128 + face * faceBytes, 32) == 0 &&
+		std::memcmp(cubeDDS.Get_CubeMap_Memory_Pointer(face, 1),
+		cubeBytes.data() + 128 + face * faceBytes + 32, 8) == 0,
+		"cube DDS face and mip pointers select exact face-major bytes");
+	std::vector<unsigned char> pitchedCube(12, 0xCC);
+	cubeDDS.Copy_CubeMap_Level_To_Surface(face, 1, WW3D_FORMAT_DXT1,
+		4, 4, pitchedCube.data(), 12, Vector3(0, 0, 0));
+	check(std::memcmp(pitchedCube.data(),
+		cubeBytes.data() + 128 + face * faceBytes + 32, 8) == 0,
+		"cube DDS mip copy preserves the exact selected face bytes");
+	check(pitchedCube[8] == 0xCC && pitchedCube[9] == 0xCC &&
+		pitchedCube[10] == 0xCC && pitchedCube[11] == 0xCC,
+		"cube DDS mip copy leaves destination pitch padding untouched");
+
 	const WW3DFormat formats[] = {WW3D_FORMAT_DXT1, WW3D_FORMAT_DXT2, WW3D_FORMAT_DXT3, WW3D_FORMAT_DXT4, WW3D_FORMAT_DXT5};
 	for (WW3DFormat format : formats)
 	for (unsigned cube = 0; cube != 2; ++cube)

@@ -23,9 +23,7 @@ if(WIN32)
         add_executable(${target}
             ResourceTextureDecodeTest.cpp
             "${_title_wwvegas}/WW3D2/ddsfile.cpp"
-            "${_core_wwvegas}/WW3D2/bitmaphandler.cpp"
             "${_core_wwvegas}/WW3D2/texturemipbuffer.cpp"
-            "${_core_wwvegas}/WW3D2/formconv.cpp"
         )
         target_include_directories(${target} PRIVATE
             "${_title_wwvegas}"
@@ -45,7 +43,6 @@ if(WIN32)
             core_wwdebug
             core_wwstub
             core_utility
-            d3d8lib
             winmm
         )
         set_target_properties(${target} PROPERTIES

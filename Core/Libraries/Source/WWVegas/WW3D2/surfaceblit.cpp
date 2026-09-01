@@ -40,19 +40,19 @@ static bool Checked_A8R8G8B8_Byte_Size(unsigned int width,
 		*result <= SURFACE_BLIT_MAX_BYTES;
 }
 
-static bool Is_Dxt(D3DFORMAT format)
+static bool Is_Dxt(WW3DFormat format)
 {
-	return format == D3DFMT_DXT1 || format == D3DFMT_DXT2 ||
-		format == D3DFMT_DXT3 || format == D3DFMT_DXT4 ||
-		format == D3DFMT_DXT5;
+	return format == WW3D_FORMAT_DXT1 || format == WW3D_FORMAT_DXT2 ||
+		format == WW3D_FORMAT_DXT3 || format == WW3D_FORMAT_DXT4 ||
+		format == WW3D_FORMAT_DXT5;
 }
 
-static unsigned Dxt_Block_Bytes(D3DFORMAT format)
+static unsigned Dxt_Block_Bytes(WW3DFormat format)
 {
-	return format == D3DFMT_DXT1 ? 8U : (Is_Dxt(format) ? 16U : 0U);
+	return format == WW3D_FORMAT_DXT1 ? 8U : (Is_Dxt(format) ? 16U : 0U);
 }
 
-static bool Bytes_Per_Pixel(D3DFORMAT format, unsigned int *bytes)
+static bool Bytes_Per_Pixel(WW3DFormat format, unsigned int *bytes)
 {
 	if (bytes == 0)
 	{
@@ -60,26 +60,26 @@ static bool Bytes_Per_Pixel(D3DFORMAT format, unsigned int *bytes)
 	}
 	switch (format)
 	{
-	case D3DFMT_A8R8G8B8:
-	case D3DFMT_X8R8G8B8:
+	case WW3D_FORMAT_A8R8G8B8:
+	case WW3D_FORMAT_X8R8G8B8:
 		*bytes = 4U;
 		return true;
-	case D3DFMT_R8G8B8:
+	case WW3D_FORMAT_R8G8B8:
 		*bytes = 3U;
 		return true;
-	case D3DFMT_A1R5G5B5:
-	case D3DFMT_X1R5G5B5:
-	case D3DFMT_A4R4G4B4:
-	case D3DFMT_X4R4G4B4:
-	case D3DFMT_R5G6B5:
-	case D3DFMT_A8R3G3B2:
-	case D3DFMT_A8L8:
+	case WW3D_FORMAT_A1R5G5B5:
+	case WW3D_FORMAT_X1R5G5B5:
+	case WW3D_FORMAT_A4R4G4B4:
+	case WW3D_FORMAT_X4R4G4B4:
+	case WW3D_FORMAT_R5G6B5:
+	case WW3D_FORMAT_A8R3G3B2:
+	case WW3D_FORMAT_A8L8:
 		*bytes = 2U;
 		return true;
-	case D3DFMT_R3G3B2:
-	case D3DFMT_A8:
-	case D3DFMT_L8:
-	case D3DFMT_A4L4:
+	case WW3D_FORMAT_R3G3B2:
+	case WW3D_FORMAT_A8:
+	case WW3D_FORMAT_L8:
+	case WW3D_FORMAT_A4L4:
 		*bytes = 1U;
 		return true;
 	default:
@@ -87,7 +87,7 @@ static bool Bytes_Per_Pixel(D3DFORMAT format, unsigned int *bytes)
 	}
 }
 
-static bool Is_Cpu_Color_Format(D3DFORMAT format)
+static bool Is_Cpu_Color_Format(WW3DFormat format)
 {
 	unsigned bytes;
 	return Bytes_Per_Pixel(format, &bytes) || Is_Dxt(format);
@@ -180,14 +180,14 @@ static void Read_Dxt_Color(unsigned index, unsigned short color0,
 	}
 }
 
-static unsigned Dxt_Alpha(const unsigned char *block, D3DFORMAT format,
+static unsigned Dxt_Alpha(const unsigned char *block, WW3DFormat format,
 	unsigned pixelIndex)
 {
-	if (format == D3DFMT_DXT1)
+	if (format == WW3D_FORMAT_DXT1)
 	{
 		return 255U;
 	}
-	if (format == D3DFMT_DXT2 || format == D3DFMT_DXT3)
+	if (format == WW3D_FORMAT_DXT2 || format == WW3D_FORMAT_DXT3)
 	{
 		const unsigned short alpha = Read_Word(block + (pixelIndex / 4U) * 2U);
 		return (unsigned)((alpha >> ((pixelIndex & 3U) * 4U)) & 0xfU) * 17U;
@@ -234,7 +234,7 @@ static unsigned Dxt_Alpha(const unsigned char *block, D3DFORMAT format,
 }
 
 static bool Read_Dxt_Pixel(const unsigned char *source, int source_pitch,
-	unsigned width, unsigned height, D3DFORMAT format, unsigned x, unsigned y,
+	unsigned width, unsigned height, WW3DFormat format, unsigned x, unsigned y,
 	unsigned char *pixel)
 {
 	const unsigned blockBytes = Dxt_Block_Bytes(format);
@@ -258,7 +258,7 @@ static bool Read_Dxt_Pixel(const unsigned char *source, int source_pitch,
 	// BC2/BC3 (D3D8 DXT2-5) store alpha in the first eight bytes and the
 	// BC1-compatible color payload in the second eight.  DXT1 consists only
 	// of that color payload.
-	colorBlock = format == D3DFMT_DXT1 ? block : block + 8;
+	colorBlock = format == WW3D_FORMAT_DXT1 ? block : block + 8;
 	color0 = Read_Word(colorBlock);
 	color1 = Read_Word(colorBlock + 2);
 	colorIndexes = (unsigned long)colorBlock[4] |
@@ -266,8 +266,8 @@ static bool Read_Dxt_Pixel(const unsigned char *source, int source_pitch,
 		((unsigned long)colorBlock[6] << 16) |
 		((unsigned long)colorBlock[7] << 24);
 	Read_Dxt_Color((colorIndexes >> (2U * localIndex)) & 3U,
-		color0, color1, format != D3DFMT_DXT1, pixel);
-	if (format == D3DFMT_DXT1 && color0 <= color1 &&
+		color0, color1, format != WW3D_FORMAT_DXT1, pixel);
+	if (format == WW3D_FORMAT_DXT1 && color0 <= color1 &&
 		((colorIndexes >> (2U * localIndex)) & 3U) == 3U)
 	{
 		pixel[3] = 0;
@@ -280,7 +280,7 @@ static bool Read_Dxt_Pixel(const unsigned char *source, int source_pitch,
 }
 
 static bool Read_Pixel(const unsigned char *source, int source_pitch,
-	unsigned width, unsigned height, D3DFORMAT format, unsigned x, unsigned y,
+	unsigned width, unsigned height, WW3DFormat format, unsigned x, unsigned y,
 	unsigned char *pixel)
 {
 	unsigned bytes;
@@ -302,64 +302,64 @@ static bool Read_Pixel(const unsigned char *source, int source_pitch,
 		(size_t)x * bytes;
 	switch (format)
 	{
-	case D3DFMT_A8R8G8B8:
+	case WW3D_FORMAT_A8R8G8B8:
 		memcpy(pixel, source_pixel, 4);
 		return true;
-	case D3DFMT_X8R8G8B8:
-	case D3DFMT_R8G8B8:
+	case WW3D_FORMAT_X8R8G8B8:
+	case WW3D_FORMAT_R8G8B8:
 		memcpy(pixel, source_pixel, 3);
 		pixel[3] = 0xff;
 		return true;
-	case D3DFMT_A1R5G5B5:
-	case D3DFMT_X1R5G5B5:
+	case WW3D_FORMAT_A1R5G5B5:
+	case WW3D_FORMAT_X1R5G5B5:
 	{
 		const unsigned short value = Read_Word(source_pixel);
 		pixel[0] = (unsigned char)Expand_5(value & 0x1f);
 		pixel[1] = (unsigned char)Expand_5((value >> 5) & 0x1f);
 		pixel[2] = (unsigned char)Expand_5((value >> 10) & 0x1f);
-		pixel[3] = format == D3DFMT_A1R5G5B5 && (value & 0x8000) ? 0xff :
-			(format == D3DFMT_X1R5G5B5 ? 0xff : 0);
+		pixel[3] = format == WW3D_FORMAT_A1R5G5B5 && (value & 0x8000) ? 0xff :
+			(format == WW3D_FORMAT_X1R5G5B5 ? 0xff : 0);
 		return true;
 	}
-	case D3DFMT_A4R4G4B4:
-	case D3DFMT_X4R4G4B4:
+	case WW3D_FORMAT_A4R4G4B4:
+	case WW3D_FORMAT_X4R4G4B4:
 	{
 		const unsigned short value = Read_Word(source_pixel);
 		pixel[0] = (unsigned char)Expand_4(value & 0x000f);
 		pixel[1] = (unsigned char)Expand_4((value >> 4) & 0x000f);
 		pixel[2] = (unsigned char)Expand_4((value >> 8) & 0x000f);
-		pixel[3] = format == D3DFMT_A4R4G4B4 ?
+		pixel[3] = format == WW3D_FORMAT_A4R4G4B4 ?
 			(unsigned char)Expand_4((value >> 12) & 0x000f) : 0xff;
 		return true;
 	}
-	case D3DFMT_R5G6B5:
+	case WW3D_FORMAT_R5G6B5:
 		Read_565(Read_Word(source_pixel), pixel);
 		return true;
-	case D3DFMT_R3G3B2:
+	case WW3D_FORMAT_R3G3B2:
 		pixel[0] = (unsigned char)Expand_2(source_pixel[0] & 3U);
 		pixel[1] = (unsigned char)Expand_3((source_pixel[0] >> 2) & 7U);
 		pixel[2] = (unsigned char)Expand_3((source_pixel[0] >> 5) & 7U);
 		pixel[3] = 0xff;
 		return true;
-	case D3DFMT_A8R3G3B2:
+	case WW3D_FORMAT_A8R3G3B2:
 		pixel[0] = (unsigned char)Expand_2(source_pixel[0] & 3U);
 		pixel[1] = (unsigned char)Expand_3((source_pixel[0] >> 2) & 7U);
 		pixel[2] = (unsigned char)Expand_3((source_pixel[0] >> 5) & 7U);
 		pixel[3] = source_pixel[1];
 		return true;
-	case D3DFMT_L8:
+	case WW3D_FORMAT_L8:
 		pixel[0] = pixel[1] = pixel[2] = source_pixel[0];
 		pixel[3] = 0xff;
 		return true;
-	case D3DFMT_A8:
+	case WW3D_FORMAT_A8:
 		pixel[0] = pixel[1] = pixel[2] = 0;
 		pixel[3] = source_pixel[0];
 		return true;
-	case D3DFMT_A8L8:
+	case WW3D_FORMAT_A8L8:
 		pixel[0] = pixel[1] = pixel[2] = source_pixel[0];
 		pixel[3] = source_pixel[1];
 		return true;
-	case D3DFMT_A4L4:
+	case WW3D_FORMAT_A4L4:
 		pixel[0] = pixel[1] = pixel[2] = (unsigned char)Expand_4(source_pixel[0] & 0xf);
 		pixel[3] = (unsigned char)Expand_4(source_pixel[0] >> 4);
 		return true;
@@ -368,7 +368,7 @@ static bool Read_Pixel(const unsigned char *source, int source_pitch,
 	}
 }
 
-static bool Write_Pixel(unsigned char *destination, D3DFORMAT format,
+static bool Write_Pixel(unsigned char *destination, WW3DFormat format,
 	const unsigned char *pixel)
 {
 	if (destination == 0 || pixel == 0)
@@ -377,17 +377,17 @@ static bool Write_Pixel(unsigned char *destination, D3DFORMAT format,
 	}
 	switch (format)
 	{
-	case D3DFMT_A8R8G8B8:
-	case D3DFMT_X8R8G8B8:
+	case WW3D_FORMAT_A8R8G8B8:
+	case WW3D_FORMAT_X8R8G8B8:
 		destination[0] = pixel[0];
 		destination[1] = pixel[1];
 		destination[2] = pixel[2];
-		destination[3] = format == D3DFMT_X8R8G8B8 ? 0xff : pixel[3];
+		destination[3] = format == WW3D_FORMAT_X8R8G8B8 ? 0xff : pixel[3];
 		return true;
-	case D3DFMT_R8G8B8:
+	case WW3D_FORMAT_R8G8B8:
 		memcpy(destination, pixel, 3);
 		return true;
-	case D3DFMT_A1R5G5B5:
+	case WW3D_FORMAT_A1R5G5B5:
 	{
 		const unsigned short value = (unsigned short)
 			(((pixel[0] & 0xf8) >> 3) |
@@ -397,7 +397,7 @@ static bool Write_Pixel(unsigned char *destination, D3DFORMAT format,
 		Write_Word(destination, value);
 		return true;
 	}
-	case D3DFMT_X1R5G5B5:
+	case WW3D_FORMAT_X1R5G5B5:
 	{
 		const unsigned short value = (unsigned short)
 			(0x8000 | ((pixel[0] & 0xf8) >> 3) |
@@ -405,42 +405,42 @@ static bool Write_Pixel(unsigned char *destination, D3DFORMAT format,
 		Write_Word(destination, value);
 		return true;
 	}
-	case D3DFMT_A4R4G4B4:
-	case D3DFMT_X4R4G4B4:
+	case WW3D_FORMAT_A4R4G4B4:
+	case WW3D_FORMAT_X4R4G4B4:
 	{
 		const unsigned short value = (unsigned short)
 			(((pixel[0] & 0xf0) >> 4) |
 			 (pixel[1] & 0xf0) | ((pixel[2] & 0xf0) << 4) |
-			 (format == D3DFMT_A4R4G4B4 ? (pixel[3] & 0xf0) << 8 : 0xf000));
+			 (format == WW3D_FORMAT_A4R4G4B4 ? (pixel[3] & 0xf0) << 8 : 0xf000));
 		Write_Word(destination, value);
 		return true;
 	}
-	case D3DFMT_R5G6B5:
+	case WW3D_FORMAT_R5G6B5:
 		Write_Word(destination, (unsigned short)(((pixel[0] & 0xf8) >> 3) |
 			((pixel[1] & 0xfc) << 3) | ((pixel[2] & 0xf8) << 8)));
 		return true;
-	case D3DFMT_R3G3B2:
+	case WW3D_FORMAT_R3G3B2:
 		destination[0] = (unsigned char)(((pixel[0] & 0xc0) >> 6) |
 			((pixel[1] & 0xe0) >> 3) | (pixel[2] & 0xe0));
 		return true;
-	case D3DFMT_A8R3G3B2:
+	case WW3D_FORMAT_A8R3G3B2:
 		destination[0] = (unsigned char)((pixel[2] & 0xe0) |
 			((pixel[1] & 0xe0) >> 3) | ((pixel[0] & 0xc0) >> 6));
 		destination[1] = pixel[3];
 		return true;
-	case D3DFMT_L8:
+	case WW3D_FORMAT_L8:
 		destination[0] = (unsigned char)(((unsigned)pixel[0] * 0x1275U +
 			(unsigned)pixel[1] * 0xb725U + (unsigned)pixel[2] * 0x3666U) >> 16);
 		return true;
-	case D3DFMT_A8:
+	case WW3D_FORMAT_A8:
 		destination[0] = pixel[3];
 		return true;
-	case D3DFMT_A8L8:
+	case WW3D_FORMAT_A8L8:
 		destination[0] = (unsigned char)(((unsigned)pixel[0] * 0x1275U +
 			(unsigned)pixel[1] * 0xb725U + (unsigned)pixel[2] * 0x3666U) >> 16);
 		destination[1] = pixel[3];
 		return true;
-	case D3DFMT_A4L4:
+	case WW3D_FORMAT_A4L4:
 	{
 		const unsigned luminance = ((unsigned)pixel[0] * 0x1275U +
 			(unsigned)pixel[1] * 0xb725U + (unsigned)pixel[2] * 0x3666U) >> 16;
@@ -452,19 +452,71 @@ static bool Write_Pixel(unsigned char *destination, D3DFORMAT format,
 	}
 }
 
+static bool Rect_Is_Valid(const SurfaceBlitRectangle &rect,
+	const SurfaceBlitImageDescription &description)
+{
+	return rect.left >= 0 && rect.top >= 0 && rect.right > rect.left &&
+		rect.bottom > rect.top && (unsigned int)rect.right <= description.width &&
+		(unsigned int)rect.bottom <= description.height;
+}
+
+#if defined(BUILD_WITH_D3D8)
+
+static bool Legacy_D3D8_Format_To_WW3D(D3DFORMAT format,
+	WW3DFormat *neutral_format)
+{
+	if (neutral_format == 0) return false;
+	switch (format)
+	{
+	case D3DFMT_R8G8B8: *neutral_format = WW3D_FORMAT_R8G8B8; return true;
+	case D3DFMT_A8R8G8B8: *neutral_format = WW3D_FORMAT_A8R8G8B8; return true;
+	case D3DFMT_X8R8G8B8: *neutral_format = WW3D_FORMAT_X8R8G8B8; return true;
+	case D3DFMT_R5G6B5: *neutral_format = WW3D_FORMAT_R5G6B5; return true;
+	case D3DFMT_X1R5G5B5: *neutral_format = WW3D_FORMAT_X1R5G5B5; return true;
+	case D3DFMT_A1R5G5B5: *neutral_format = WW3D_FORMAT_A1R5G5B5; return true;
+	case D3DFMT_A4R4G4B4: *neutral_format = WW3D_FORMAT_A4R4G4B4; return true;
+	case D3DFMT_R3G3B2: *neutral_format = WW3D_FORMAT_R3G3B2; return true;
+	case D3DFMT_A8: *neutral_format = WW3D_FORMAT_A8; return true;
+	case D3DFMT_A8R3G3B2: *neutral_format = WW3D_FORMAT_A8R3G3B2; return true;
+	case D3DFMT_X4R4G4B4: *neutral_format = WW3D_FORMAT_X4R4G4B4; return true;
+	case D3DFMT_L8: *neutral_format = WW3D_FORMAT_L8; return true;
+	case D3DFMT_A8L8: *neutral_format = WW3D_FORMAT_A8L8; return true;
+	case D3DFMT_A4L4: *neutral_format = WW3D_FORMAT_A4L4; return true;
+	case D3DFMT_DXT1: *neutral_format = WW3D_FORMAT_DXT1; return true;
+	case D3DFMT_DXT2: *neutral_format = WW3D_FORMAT_DXT2; return true;
+	case D3DFMT_DXT3: *neutral_format = WW3D_FORMAT_DXT3; return true;
+	case D3DFMT_DXT4: *neutral_format = WW3D_FORMAT_DXT4; return true;
+	case D3DFMT_DXT5: *neutral_format = WW3D_FORMAT_DXT5; return true;
+	default: *neutral_format = WW3D_FORMAT_UNKNOWN; return false;
+	}
+}
+
+static SurfaceBlitImageDescription Legacy_D3D8_Description(
+	const D3DSURFACE_DESC &description, WW3DFormat format)
+{
+	SurfaceBlitImageDescription neutral;
+	neutral.width = description.Width;
+	neutral.height = description.Height;
+	neutral.format = format;
+	return neutral;
+}
+
+static SurfaceBlitRectangle Legacy_D3D8_Rect(const RECT &rect)
+{
+	SurfaceBlitRectangle neutral;
+	neutral.left = rect.left;
+	neutral.top = rect.top;
+	neutral.right = rect.right;
+	neutral.bottom = rect.bottom;
+	return neutral;
+}
+
 static void Full_Rect(const D3DSURFACE_DESC &description, RECT *rect)
 {
 	rect->left = 0;
 	rect->top = 0;
 	rect->right = (LONG)description.Width;
 	rect->bottom = (LONG)description.Height;
-}
-
-static bool Rect_Is_Valid(const RECT &rect, const D3DSURFACE_DESC &description)
-{
-	return rect.left >= 0 && rect.top >= 0 && rect.right > rect.left &&
-		rect.bottom > rect.top && rect.right <= (LONG)description.Width &&
-		rect.bottom <= (LONG)description.Height;
 }
 
 static HRESULT Create_Staging_Surface(IDirect3DDevice8 *device, unsigned width,
@@ -477,7 +529,9 @@ static HRESULT Create_Staging_Surface(IDirect3DDevice8 *device, unsigned width,
 	*surface = 0;
 	*textureOwner = 0;
 	result = device->CreateImageSurface(width, height, format, surface);
-	if (SUCCEEDED(result) || !Is_Dxt(format)) return result;
+	WW3DFormat neutral_format;
+	if (SUCCEEDED(result) || !Legacy_D3D8_Format_To_WW3D(format,
+		&neutral_format) || !Is_Dxt(neutral_format)) return result;
 	result = device->CreateTexture(width, height, 1, 0, format,
 		D3DPOOL_SYSTEMMEM, textureOwner);
 	if (SUCCEEDED(result)) result = (*textureOwner)->GetSurfaceLevel(0, surface);
@@ -488,6 +542,8 @@ static HRESULT Create_Staging_Surface(IDirect3DDevice8 *device, unsigned width,
 	}
 	return result;
 }
+
+#endif
 
 static bool Resample_Area(const unsigned char *source, unsigned source_width,
 	unsigned source_height, unsigned char *destination, unsigned destination_width,
@@ -578,15 +634,15 @@ static bool Resample_Bilinear(const unsigned char *source, unsigned source_width
 }
 }
 
-bool SurfaceBlit_Can_Use_CopyRects(
-	const D3DSURFACE_DESC &destination,
-	const RECT &destination_rect,
-	const D3DSURFACE_DESC &source,
-	const RECT &source_rect,
+bool SurfaceBlit_Can_Copy_Direct(
+	const SurfaceBlitImageDescription &destination,
+	const SurfaceBlitRectangle &destination_rect,
+	const SurfaceBlitImageDescription &source,
+	const SurfaceBlitRectangle &source_rect,
 	SurfaceBlitFilter filter)
 {
 	return filter == SURFACE_BLIT_FILTER_NONE &&
-		destination.Format == source.Format &&
+		destination.format == source.format &&
 		Rect_Is_Valid(destination_rect, destination) &&
 		Rect_Is_Valid(source_rect, source) &&
 		destination_rect.right - destination_rect.left ==
@@ -596,20 +652,60 @@ bool SurfaceBlit_Can_Use_CopyRects(
 }
 
 SurfaceBlitFilter SurfaceBlit_Filter_For_Full_Copy(
+	const SurfaceBlitImageDescription &destination,
+	const SurfaceBlitImageDescription &source)
+{
+	return destination.format == source.format &&
+		destination.width == source.width && destination.height == source.height ?
+		SURFACE_BLIT_FILTER_NONE : SURFACE_BLIT_FILTER_BOX;
+}
+
+#if defined(BUILD_WITH_D3D8)
+
+bool SurfaceBlit_Can_Use_CopyRects(
+	const D3DSURFACE_DESC &destination,
+	const RECT &destination_rect,
+	const D3DSURFACE_DESC &source,
+	const RECT &source_rect,
+	SurfaceBlitFilter filter)
+{
+	WW3DFormat destination_format;
+	WW3DFormat source_format;
+	return Legacy_D3D8_Format_To_WW3D(destination.Format,
+		&destination_format) &&
+		Legacy_D3D8_Format_To_WW3D(source.Format, &source_format) &&
+		SurfaceBlit_Can_Copy_Direct(
+			Legacy_D3D8_Description(destination, destination_format),
+			Legacy_D3D8_Rect(destination_rect),
+			Legacy_D3D8_Description(source, source_format),
+			Legacy_D3D8_Rect(source_rect), filter);
+}
+
+SurfaceBlitFilter SurfaceBlit_Filter_For_Full_Copy(
 	const D3DSURFACE_DESC &destination,
 	const D3DSURFACE_DESC &source)
 {
-	return destination.Format == source.Format &&
-		destination.Width == source.Width && destination.Height == source.Height ?
-		SURFACE_BLIT_FILTER_NONE : SURFACE_BLIT_FILTER_BOX;
+	WW3DFormat destination_format;
+	WW3DFormat source_format;
+	if (!Legacy_D3D8_Format_To_WW3D(destination.Format,
+		&destination_format) ||
+		!Legacy_D3D8_Format_To_WW3D(source.Format, &source_format))
+	{
+		return SURFACE_BLIT_FILTER_BOX;
+	}
+	return SurfaceBlit_Filter_For_Full_Copy(
+		Legacy_D3D8_Description(destination, destination_format),
+		Legacy_D3D8_Description(source, source_format));
 }
+
+#endif
 
 bool SurfaceBlit_Convert_To_A8R8G8B8(
 	const unsigned char *source,
 	int source_pitch,
 	unsigned int width,
 	unsigned int height,
-	D3DFORMAT source_format,
+	WW3DFormat source_format,
 	std::vector<unsigned char> *pixels)
 {
 	size_t total_bytes;
@@ -715,7 +811,7 @@ bool SurfaceBlit_Write_A8R8G8B8(
 	unsigned int height,
 	unsigned char *destination,
 	int destination_pitch,
-	D3DFORMAT destination_format)
+	WW3DFormat destination_format)
 {
 	unsigned bytes;
 	if (source == 0 || destination == 0 || width == 0 || height == 0 ||
@@ -731,6 +827,36 @@ bool SurfaceBlit_Write_A8R8G8B8(
 		}
 	}
 	return true;
+}
+
+#if defined(BUILD_WITH_D3D8)
+
+bool SurfaceBlit_Convert_To_A8R8G8B8(
+	const unsigned char *source,
+	int source_pitch,
+	unsigned int width,
+	unsigned int height,
+	D3DFORMAT source_format,
+	std::vector<unsigned char> *pixels)
+{
+	WW3DFormat neutral_format;
+	return Legacy_D3D8_Format_To_WW3D(source_format, &neutral_format) &&
+		SurfaceBlit_Convert_To_A8R8G8B8(source, source_pitch, width,
+			height, neutral_format, pixels);
+}
+
+bool SurfaceBlit_Write_A8R8G8B8(
+	const unsigned char *source,
+	unsigned int width,
+	unsigned int height,
+	unsigned char *destination,
+	int destination_pitch,
+	D3DFORMAT destination_format)
+{
+	WW3DFormat neutral_format;
+	return Legacy_D3D8_Format_To_WW3D(destination_format, &neutral_format) &&
+		SurfaceBlit_Write_A8R8G8B8(source, width, height, destination,
+			destination_pitch, neutral_format);
 }
 
 HRESULT SurfaceBlit_Copy(
@@ -753,6 +879,8 @@ HRESULT SurfaceBlit_Copy(
 	IDirect3DTexture8 *destination_staging_owner = 0;
 	D3DLOCKED_RECT source_locked;
 	D3DLOCKED_RECT destination_locked;
+	WW3DFormat destination_format;
+	WW3DFormat source_format;
 	bool source_is_locked = false;
 	bool destination_is_locked = false;
 	HRESULT result;
@@ -761,14 +889,20 @@ HRESULT SurfaceBlit_Copy(
 	if (destination == 0 || source == 0 ||
 		FAILED(destination->GetDesc(&destination_description)) ||
 		FAILED(source->GetDesc(&source_description)) ) return D3DERR_INVALIDCALL;
+	if (!Legacy_D3D8_Format_To_WW3D(destination_description.Format,
+		&destination_format) ||
+		!Legacy_D3D8_Format_To_WW3D(source_description.Format, &source_format))
+		return D3DERR_NOTAVAILABLE;
 	Full_Rect(destination_description, &full_destination);
 	Full_Rect(source_description, &full_source);
 	resolved_destination = destination_rect != 0 ? *destination_rect : full_destination;
 	resolved_source = source_rect != 0 ? *source_rect : full_source;
-	if (!Rect_Is_Valid(resolved_destination, destination_description) ||
-		!Rect_Is_Valid(resolved_source, source_description) ||
-		!Is_Cpu_Color_Format(source_description.Format) ||
-		!Is_Cpu_Color_Format(destination_description.Format)) return D3DERR_NOTAVAILABLE;
+	if (!Rect_Is_Valid(Legacy_D3D8_Rect(resolved_destination),
+		Legacy_D3D8_Description(destination_description, destination_format)) ||
+		!Rect_Is_Valid(Legacy_D3D8_Rect(resolved_source),
+		Legacy_D3D8_Description(source_description, source_format)) ||
+		!Is_Cpu_Color_Format(source_format) ||
+		!Is_Cpu_Color_Format(destination_format)) return D3DERR_NOTAVAILABLE;
 	if (SurfaceBlit_Can_Use_CopyRects(destination_description,
 		resolved_destination, source_description, resolved_source, filter))
 	{
@@ -792,7 +926,7 @@ HRESULT SurfaceBlit_Copy(
 	// DXT destinations cannot be written by the CPU fallback.  An exact,
 	// same-format copy was already attempted above and remains valid through
 	// the native CopyRects path.
-	if (Is_Dxt(destination_description.Format)) return D3DERR_NOTAVAILABLE;
+	if (Is_Dxt(destination_format)) return D3DERR_NOTAVAILABLE;
 
 	result = source->GetDevice(&device);
 	if (FAILED(result) || device == 0) return FAILED(result) ? result : D3DERR_INVALIDCALL;
@@ -819,7 +953,7 @@ HRESULT SurfaceBlit_Copy(
 		(const unsigned char *)source_locked.pBits, source_locked.Pitch,
 		resolved_source.right - resolved_source.left,
 		resolved_source.bottom - resolved_source.top,
-		source_description.Format, &source_pixels) ? D3D_OK : D3DERR_NOTAVAILABLE;
+		source_format, &source_pixels) ? D3D_OK : D3DERR_NOTAVAILABLE;
 	if (source_is_locked)
 	{
 		HRESULT unlock_result = source_staging->UnlockRect();
@@ -849,7 +983,7 @@ HRESULT SurfaceBlit_Copy(
 		const unsigned destination_height = resolved_destination.bottom - resolved_destination.top;
 		unsigned y;
 		unsigned bytes;
-		if (!Bytes_Per_Pixel(destination_description.Format, &bytes)) result = D3DERR_NOTAVAILABLE;
+		if (!Bytes_Per_Pixel(destination_format, &bytes)) result = D3DERR_NOTAVAILABLE;
 		for (y = 0; SUCCEEDED(result) && y < destination_height; ++y)
 		{
 			unsigned x;
@@ -857,7 +991,7 @@ HRESULT SurfaceBlit_Copy(
 			{
 				if (!Write_Pixel((unsigned char *)destination_locked.pBits +
 					(size_t)y * destination_locked.Pitch + (size_t)x * bytes,
-					destination_description.Format,
+					destination_format,
 					&destination_pixels[((size_t)y * destination_width + x) * 4U]))
 				{
 					result = D3DERR_NOTAVAILABLE;
@@ -898,12 +1032,14 @@ HRESULT SurfaceBlit_Copy_Surface_To_A8R8G8B8(
 	IDirect3DSurface8 *staging = 0;
 	IDirect3DTexture8 *staging_owner = 0;
 	D3DLOCKED_RECT locked;
+	WW3DFormat source_format;
 	bool is_locked = false;
 	std::vector<unsigned char> source_pixels;
 	HRESULT result;
 	if (source == 0 || pixels == 0 || width == 0 || height == 0 ||
 		FAILED(source->GetDesc(&description)) ||
-		!Is_Cpu_Color_Format(description.Format)) return D3DERR_NOTAVAILABLE;
+		!Legacy_D3D8_Format_To_WW3D(description.Format, &source_format) ||
+		!Is_Cpu_Color_Format(source_format)) return D3DERR_NOTAVAILABLE;
 	// Managed video textures are CPU-lockable.  Reading those surfaces through
 	// CopyRects first introduces a synchronous device copy on every animated
 	// frame, even though the source pixels are already available to the caller.
@@ -918,7 +1054,7 @@ HRESULT SurfaceBlit_Copy_Surface_To_A8R8G8B8(
 		const bool converted = direct_locked.pBits != 0 &&
 			SurfaceBlit_Convert_To_A8R8G8B8(
 				(const unsigned char *)direct_locked.pBits, direct_locked.Pitch,
-				description.Width, description.Height, description.Format,
+				description.Width, description.Height, source_format,
 				&source_pixels);
 		const HRESULT unlock_result = source->UnlockRect();
 		if (SUCCEEDED(unlock_result) && converted)
@@ -954,7 +1090,7 @@ HRESULT SurfaceBlit_Copy_Surface_To_A8R8G8B8(
 	if (SUCCEEDED(result)) is_locked = true;
 	if (SUCCEEDED(result) && !SurfaceBlit_Convert_To_A8R8G8B8(
 		(const unsigned char *)locked.pBits, locked.Pitch, description.Width,
-		description.Height, description.Format, &source_pixels))
+		description.Height, source_format, &source_pixels))
 		result = D3DERR_NOTAVAILABLE;
 	if (is_locked)
 	{
@@ -978,3 +1114,5 @@ HRESULT SurfaceBlit_Copy_Surface_To_A8R8G8B8(
 	device->Release();
 	return result;
 }
+
+#endif

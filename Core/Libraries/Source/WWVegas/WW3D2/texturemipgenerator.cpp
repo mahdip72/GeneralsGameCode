@@ -9,7 +9,10 @@
 */
 
 #include "texturemipgenerator.h"
+
+#if defined(BUILD_WITH_D3D8)
 #include "d3d8.h"
+#endif
 
 static unsigned minUnsigned(unsigned left, unsigned right)
 {
@@ -171,6 +174,8 @@ bool Generate_Texture_Mip_Level_Box(
 	return true;
 }
 
+#if defined(BUILD_WITH_D3D8)
+
 static bool getWW3DFormat(D3DFORMAT format, WW3DFormat& result)
 {
 	switch (format)
@@ -317,3 +322,5 @@ unsigned Generate_DX8_Texture_Mip_Levels(IDirect3DTexture8* texture)
 
 	return D3D_OK;
 }
+
+#endif

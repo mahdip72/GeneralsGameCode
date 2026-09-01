@@ -7,6 +7,8 @@
 
 static int failures = 0;
 
+#if defined(BUILD_WITH_D3D8)
+
 class FakeSurface;
 
 // SurfaceBlit_Copy_Surface_To_A8R8G8B8 is deliberately tested through the
@@ -250,6 +252,8 @@ HRESULT STDMETHODCALLTYPE FakeDevice::CopyRects(
 	return D3D_OK;
 }
 
+#endif
+
 static void expectTrue(bool condition, const char *message)
 {
 	if (!condition)
@@ -268,6 +272,8 @@ static void expectBytes(const unsigned char *actual,
 		printf("FAIL: %s\n", message);
 	}
 }
+
+#if defined(BUILD_WITH_D3D8)
 
 static D3DSURFACE_DESC description(D3DFORMAT format,
 	unsigned int width, unsigned int height)
@@ -346,6 +352,40 @@ static void testFullCopyRoutingMatrix()
 		"full format conversion retains the legacy boundary");
 }
 
+#endif
+
+static SurfaceBlitImageDescription neutralDescription(WW3DFormat format,
+	unsigned int width, unsigned int height)
+{
+	SurfaceBlitImageDescription result;
+	result.format = format;
+	result.width = width;
+	result.height = height;
+	return result;
+}
+
+static void testNeutralCopyRoutingMatrix()
+{
+	const SurfaceBlitImageDescription source = neutralDescription(
+		WW3D_FORMAT_A8R8G8B8, 8, 8);
+	const SurfaceBlitImageDescription destination = neutralDescription(
+		WW3D_FORMAT_A8R8G8B8, 16, 16);
+	const SurfaceBlitRectangle sourceRect = { 1, 2, 5, 6 };
+	const SurfaceBlitRectangle destinationRect = { 4, 3, 8, 7 };
+	expectTrue(SurfaceBlit_Can_Copy_Direct(destination, destinationRect,
+		source, sourceRect, SURFACE_BLIT_FILTER_NONE),
+		"neutral same-format equal rectangles permit a direct copy");
+	expectTrue(!SurfaceBlit_Can_Copy_Direct(destination, destinationRect,
+		source, sourceRect, SURFACE_BLIT_FILTER_BOX),
+		"neutral filtered rectangles remain on the CPU resample path");
+	expectTrue(SurfaceBlit_Filter_For_Full_Copy(source, source) ==
+		SURFACE_BLIT_FILTER_NONE,
+		"neutral equal full images select an exact byte copy");
+	expectTrue(SurfaceBlit_Filter_For_Full_Copy(destination, source) ==
+		SURFACE_BLIT_FILTER_BOX,
+		"neutral unequal full images select BOX resampling");
+}
+
 static void testConversionReferenceMatrix()
 {
 	static const unsigned char a8r8g8b8Source[] = { 3, 8, 12, 64 };
@@ -360,24 +400,45 @@ static void testConversionReferenceMatrix()
 	std::vector<unsigned char> pixels;
 
 	expectTrue(SurfaceBlit_Convert_To_A8R8G8B8(a8r8g8b8Source, 4, 1, 1,
-		D3DFMT_X8R8G8B8, &pixels),
+		WW3D_FORMAT_X8R8G8B8, &pixels),
 		"X8R8G8B8 conversion is supported");
 	expectBytes(&pixels[0], x8r8g8b8Expected, 4,
 		"X8R8G8B8 conversion supplies opaque alpha (native D3DX8 reference)");
 
 	expectTrue(SurfaceBlit_Convert_To_A8R8G8B8(r8g8b8Source, 3, 1, 1,
-		D3DFMT_R8G8B8, &pixels),
+		WW3D_FORMAT_R8G8B8, &pixels),
 		"R8G8B8 conversion is supported");
 	expectBytes(&pixels[0], r8g8b8Expected, 4,
 		"R8G8B8 conversion supplies opaque alpha");
 
 	expectTrue(SurfaceBlit_Convert_To_A8R8G8B8(sourceWithPadding, 8, 1, 2,
-		D3DFMT_A8R8G8B8, &pixels),
+		WW3D_FORMAT_A8R8G8B8, &pixels),
 		"conversion accepts a padded source pitch");
 	memcpy(expected, sourceWithPadding, 4);
 	memcpy(expected + 4, sourceWithPadding + 8, 4);
 	expectBytes(&pixels[0], expected, 8,
 		"conversion ignores source row padding");
+
+	static const unsigned char writeSource[] = {
+		1, 2, 3, 4, 5, 6, 7, 8,
+		9, 10, 11, 12, 13, 14, 15, 16
+	};
+	unsigned char pitchedDestination[24];
+	memset(pitchedDestination, 0xCC, sizeof(pitchedDestination));
+	expectTrue(SurfaceBlit_Write_A8R8G8B8(writeSource, 2, 2,
+		pitchedDestination, 12, WW3D_FORMAT_A8R8G8B8),
+		"neutral byte writer accepts a padded destination pitch");
+	expectBytes(pitchedDestination, writeSource, 8,
+		"neutral byte writer preserves the first row exactly");
+	expectBytes(pitchedDestination + 12, writeSource + 8, 8,
+		"neutral byte writer preserves the second row exactly");
+	bool writePaddingUntouched = true;
+	for (unsigned int row = 0; row != 2; ++row)
+		for (unsigned int byte = 8; byte != 12; ++byte)
+			writePaddingUntouched = writePaddingUntouched &&
+				pitchedDestination[row * 12 + byte] == 0xCC;
+	expectTrue(writePaddingUntouched,
+		"neutral byte writer leaves destination row padding untouched");
 
 	// These are the uncompressed production formats used by terrain, trees,
 	// image loading, and render-target readback.  The conversion must retain
@@ -409,20 +470,20 @@ static void testConversionReferenceMatrix()
 	const struct ConversionCase {
 		const unsigned char *source;
 		unsigned pitch;
-		D3DFORMAT format;
+		WW3DFormat format;
 		unsigned expectedOffset;
 	} cases[] = {
-		{ a1Source, 2, D3DFMT_A1R5G5B5, 0 },
-		{ x1Source, 2, D3DFMT_X1R5G5B5, 4 },
-		{ a4Source, 2, D3DFMT_A4R4G4B4, 8 },
-		{ x4Source, 2, D3DFMT_X4R4G4B4, 12 },
-		{ r565Source, 2, D3DFMT_R5G6B5, 16 },
-		{ a8r3g3b2Source, 2, D3DFMT_A8R3G3B2, 20 },
-		{ a8l8Source, 2, D3DFMT_A8L8, 24 },
-		{ a4l4Source, 1, D3DFMT_A4L4, 28 },
-		{ l8Source, 1, D3DFMT_L8, 32 },
-		{ a8Source, 1, D3DFMT_A8, 36 },
-		{ r3g3b2Source, 1, D3DFMT_R3G3B2, 40 }
+		{ a1Source, 2, WW3D_FORMAT_A1R5G5B5, 0 },
+		{ x1Source, 2, WW3D_FORMAT_X1R5G5B5, 4 },
+		{ a4Source, 2, WW3D_FORMAT_A4R4G4B4, 8 },
+		{ x4Source, 2, WW3D_FORMAT_X4R4G4B4, 12 },
+		{ r565Source, 2, WW3D_FORMAT_R5G6B5, 16 },
+		{ a8r3g3b2Source, 2, WW3D_FORMAT_A8R3G3B2, 20 },
+		{ a8l8Source, 2, WW3D_FORMAT_A8L8, 24 },
+		{ a4l4Source, 1, WW3D_FORMAT_A4L4, 28 },
+		{ l8Source, 1, WW3D_FORMAT_L8, 32 },
+		{ a8Source, 1, WW3D_FORMAT_A8, 36 },
+		{ r3g3b2Source, 1, WW3D_FORMAT_R3G3B2, 40 }
 	};
 	unsigned i;
 	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i)
@@ -442,7 +503,7 @@ static void testConversionReferenceMatrix()
 	};
 	static const unsigned char dxt1Expected[4] = { 0x00, 0x00, 0xff, 0xff };
 	expectTrue(SurfaceBlit_Convert_To_A8R8G8B8(dxt1Source, 8, 1, 1,
-		D3DFMT_DXT1, &pixels),
+		WW3D_FORMAT_DXT1, &pixels),
 		"DXT1 block decode is supported for D3D11 readback");
 	expectBytes(&pixels[0], dxt1Expected,
 		4, "DXT1 block decode preserves the source color");
@@ -456,7 +517,7 @@ static void testConversionReferenceMatrix()
 	};
 	static const unsigned char dxt3Expected[4] = { 0x00, 0x00, 0xff, 0x88 };
 	expectTrue(SurfaceBlit_Convert_To_A8R8G8B8(dxt3Source, 16, 1, 1,
-		D3DFMT_DXT3, &pixels),
+		WW3D_FORMAT_DXT3, &pixels),
 		"DXT3 block decode is supported for D3D11 readback");
 	expectBytes(&pixels[0], dxt3Expected, 4,
 		"DXT3 block decode keeps explicit alpha separate from color");
@@ -469,7 +530,7 @@ static void testConversionReferenceMatrix()
 	};
 	static const unsigned char dxt5Expected[4] = { 0x00, 0xff, 0x00, 0xcc };
 	expectTrue(SurfaceBlit_Convert_To_A8R8G8B8(dxt5Source, 16, 1, 1,
-		D3DFMT_DXT5, &pixels),
+		WW3D_FORMAT_DXT5, &pixels),
 		"DXT5 block decode is supported for D3D11 readback");
 	expectBytes(&pixels[0], dxt5Expected, 4,
 		"DXT5 block decode keeps interpolated alpha separate from color");
@@ -485,7 +546,7 @@ static void testConversionReferenceMatrix()
 		0x00, 0xff, 0x00, 0x2c
 	};
 	expectTrue(SurfaceBlit_Convert_To_A8R8G8B8(dxt5BoundarySource, 16, 4, 4,
-		D3DFMT_DXT5, &pixels),
+		WW3D_FORMAT_DXT5, &pixels),
 		"DXT5 full-block decode stays within the terminal alpha payload");
 	expectTrue(pixels.size() == 64,
 		"DXT5 full-block decode produces all sixteen pixels");
@@ -500,21 +561,43 @@ static void testConversionReferenceMatrix()
 
 	// DXT2 and DXT4 share the same physical layouts as DXT3 and DXT5.
 	expectTrue(SurfaceBlit_Convert_To_A8R8G8B8(dxt3Source, 16, 1, 1,
-		D3DFMT_DXT2, &pixels),
+		WW3D_FORMAT_DXT2, &pixels),
 		"DXT2 shares the characterized BC2 layout");
 	expectBytes(&pixels[0], dxt3Expected, 4,
 		"DXT2 reads the BC2 color and alpha halves in the correct order");
 	expectTrue(SurfaceBlit_Convert_To_A8R8G8B8(dxt5Source, 16, 1, 1,
-		D3DFMT_DXT4, &pixels),
+		WW3D_FORMAT_DXT4, &pixels),
 		"DXT4 shares the characterized BC3 layout");
 	expectBytes(&pixels[0], dxt5Expected, 4,
 		"DXT4 reads the BC3 color and alpha halves in the correct order");
 
 	static const unsigned char unsupported[] = { 0, 0, 0, 0 };
 	expectTrue(!SurfaceBlit_Convert_To_A8R8G8B8(unsupported, 4, 1, 1,
-		D3DFMT_V8U8, &pixels),
+		WW3D_FORMAT_U8V8, &pixels),
 		"bump-map V8U8 conversion fails closed outside the color readback path");
 }
+
+#if defined(BUILD_WITH_D3D8)
+
+static void testLegacyFormatAdapters()
+{
+	static const unsigned char source[] = { 3, 8, 12, 64 };
+	static const unsigned char expected[] = { 3, 8, 12, 255 };
+	unsigned char written[4] = { 0, 0, 0, 0 };
+	std::vector<unsigned char> pixels;
+	expectTrue(SurfaceBlit_Convert_To_A8R8G8B8(source, 4, 1, 1,
+		D3DFMT_X8R8G8B8, &pixels),
+		"legacy D3DFORMAT reader forwards to the neutral byte kernel");
+	expectBytes(&pixels[0], expected, 4,
+		"legacy D3DFORMAT reader preserves byte-exact conversion");
+	expectTrue(SurfaceBlit_Write_A8R8G8B8(&pixels[0], 1, 1, written, 4,
+		D3DFMT_X8R8G8B8),
+		"legacy D3DFORMAT writer forwards to the neutral byte kernel");
+	expectBytes(written, expected, 4,
+		"legacy D3DFORMAT writer preserves byte-exact output");
+}
+
+#endif
 
 static void testCpuResampling()
 {
@@ -542,6 +625,8 @@ static void testCpuResampling()
 		smallBuffer, 1, 1, SURFACE_BLIT_FILTER_NONE),
 		"oversized source dimensions fail before 32-bit byte-size overflow");
 }
+
+#if defined(BUILD_WITH_D3D8)
 
 static void testSurfaceReadbackLockPaths()
 {
@@ -603,12 +688,20 @@ static void testSurfaceReadbackLockPaths()
 		"test releases the device's original reference");
 }
 
+#endif
+
 int main()
 {
+	testNeutralCopyRoutingMatrix();
+#if defined(BUILD_WITH_D3D8)
 	testCopyRectsAcceptanceMatrix();
 	testFullCopyRoutingMatrix();
+	testLegacyFormatAdapters();
+#endif
 	testConversionReferenceMatrix();
 	testCpuResampling();
+#if defined(BUILD_WITH_D3D8)
 	testSurfaceReadbackLockPaths();
+#endif
 	return failures;
 }

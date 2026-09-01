@@ -13,9 +13,7 @@
 #include <Utility/CppMacros.h>
 #include "ww3dformat.h"
 
-struct IDirect3DTexture8;
-
-// Generate one legacy box-filter-compatible level from a locked texture level.
+// Generate one legacy box-filter-compatible level from a pitched byte image.
 // The source and destination pitches are in bytes. Only the format's active
 // pixels are written; row padding remains untouched. Each component uses the
 // The legacy box conversion's round-to-nearest average is (sum + 2) / 4. The
@@ -30,9 +28,14 @@ bool Generate_Texture_Mip_Level_Box(
 	unsigned destination_pitch,
 	WW3DFormat format);
 
+#if defined(BUILD_WITH_D3D8)
+
+struct IDirect3DTexture8;
+
 // Generate all remaining levels of a D3D8 texture from its level zero data.
 // Characterized formats use the CPU box helper; unsupported formats/layouts
 // return D3DERR_NOTAVAILABLE instead of silently invoking an external image
-// service. The returned value is a D3D HRESULT represented without requiring
-// D3D8 in callers that only use the CPU filter.
+// service. The returned value is the D3D HRESULT from this legacy-only adapter.
 unsigned Generate_DX8_Texture_Mip_Levels(IDirect3DTexture8* texture);
+
+#endif
