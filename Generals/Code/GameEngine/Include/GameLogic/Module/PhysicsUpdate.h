@@ -34,6 +34,17 @@
 #include "GameLogic/Module/UpdateModule.h"
 #include "GameLogic/Module/CollideModule.h"
 
+namespace rts
+{
+#if defined(_MSC_VER) && _MSC_VER < 1300
+typedef unsigned __int64 PhysicsIntegrationMetricCounter;
+#else
+typedef unsigned long long PhysicsIntegrationMetricCounter;
+#endif
+struct PhysicsIntegrationSnapshot;
+struct PhysicsIntegrationOutput;
+}
+
 enum ObjectID CPP_11(: Int);
 
 enum PhysicsTurningType CPP_11(: Int)
@@ -98,6 +109,19 @@ public:
 
 	// UpdateModuleInterface
 	virtual UpdateSleepTime update() override;
+	UpdateSleepTime updateFromPreparedIntegrationPrefix(
+		const rts::PhysicsIntegrationSnapshot &snapshot,
+		const rts::PhysicsIntegrationOutput &output,
+		rts::PhysicsIntegrationMetricCounter commitStart,
+		rts::PhysicsIntegrationMetricCounter &commitNanoseconds);
+	Bool captureIntegrationPrefixSnapshot(
+		rts::PhysicsIntegrationSnapshot &snapshot, UnsignedInt frame,
+		UnsignedInt worldEpoch, UnsignedInt wakePriority,
+		UnsignedInt heapOrdinal) const;
+	static Bool computeIntegrationPrefixSerialOracle(
+		const rts::PhysicsIntegrationSnapshot &snapshot,
+		rts::PhysicsIntegrationOutput &output);
+	UnsignedInt getPhysicsGeneration() const { return m_physicsGeneration; }
 	// Disabled conditions to process -- all
 	virtual DisabledMaskType getDisabledTypesToProcess() const override { return DISABLEDMASK_ALL; }
 
@@ -112,7 +136,7 @@ public:
 
 	/** This is a force clear for when objects are going out of bounds, so the locomotor
 		can push them back into legal space. */
-	void clearAcceleration() { m_accel.zero(); }
+	void clearAcceleration() { m_accel.zero(); touchPhysicsGeneration(); }
 
 	/**
 		add the velocity of 'this' to 'that'... useful when a unit disgorges another unit
@@ -124,7 +148,7 @@ public:
 
 	void setAngles( Real yaw, Real pitch, Real roll );
 	Real getMass() const;
-	void setMass( Real mass ) { m_mass = mass; }
+	void setMass( Real mass ) { m_mass = mass; touchPhysicsGeneration(); }
 	Real getCenterOfMassOffset() const { return getPhysicsBehaviorModuleData()->m_centerOfMassOffset; }
 
 	const Coord3D *getAcceleration() const { return &m_prevAccel; }		///< get last frame's acceleration
@@ -143,7 +167,7 @@ public:
 	Bool isMotive() const;
 
 	PhysicsTurningType getTurning() const { return m_turning; }		///< 0 = not turning, -1 = turn negative, 1 = turn positive.
-	void setTurning(PhysicsTurningType turning) { m_turning = turning; }
+	void setTurning(PhysicsTurningType turning) { m_turning = turning; touchPhysicsGeneration(); }
 
 	/** This is a force scrub for velocity when ai objects are colliding. */
 	void scrubVelocity2D( Real desiredVelocity );
@@ -179,8 +203,8 @@ public:
 
 	Bool getIsStunned() const { return getFlag(IS_STUNNED); }
 
-	void setExtraBounciness(Real b) { m_extraBounciness = b; }
-	void setExtraFriction(Real b) { m_extraFriction = b; }
+	void setExtraBounciness(Real b) { m_extraBounciness = b; touchPhysicsGeneration(); }
+	void setExtraFriction(Real b) { m_extraFriction = b; touchPhysicsGeneration(); }
 
 	void setBounceSound(const AudioEventRTS* bounceSound);
 	const AudioEventRTS* getBounceSound() { return m_bounceSound ? m_bounceSound.Peek() : TheAudio->getValidSilentAudioEvent(); }
@@ -269,9 +293,15 @@ private:
 	Real												m_extraFriction;					///< modifier to friction(s)
 	ProjectileUpdateInterface*	m_pui;
 	mutable Real								m_velMag;									///< magnitude of cur vel (recalced when m_vel changes)
+	UnsignedInt m_physicsGeneration;
 
-	void setFlag(PhysicsFlagsType f, Bool set) { if (set) m_flags |= f; else m_flags &= ~f; }
+	void touchPhysicsGeneration() { if (++m_physicsGeneration == 0) m_physicsGeneration = 1; }
+	void setFlag(PhysicsFlagsType f, Bool set) { if (set) m_flags |= f; else m_flags &= ~f; touchPhysicsGeneration(); }
 	Bool getFlag(PhysicsFlagsType f) const { return (m_flags & f) != 0; }
+	UpdateSleepTime updateImpl(const rts::PhysicsIntegrationSnapshot *snapshot,
+		const rts::PhysicsIntegrationOutput *output,
+		rts::PhysicsIntegrationMetricCounter commitStart,
+		rts::PhysicsIntegrationMetricCounter *commitNanoseconds);
 
 
 };
