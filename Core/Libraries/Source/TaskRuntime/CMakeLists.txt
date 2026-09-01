@@ -6,6 +6,7 @@ target_sources(core_task_runtime PRIVATE
     SimulationExecutionPolicy.cpp
     SimulationCommandBuffer.cpp
     SimulationReadView.cpp
+    ObjectComputationIsland.cpp
     SimulationPhaseGraph.cpp
     DeterministicCrcStream.cpp
     ImmutableSpatialQuery.cpp

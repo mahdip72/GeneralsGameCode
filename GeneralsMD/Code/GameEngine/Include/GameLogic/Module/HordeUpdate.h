@@ -133,12 +133,39 @@ public:
 	virtual Bool isAllowedNationalism() const override;
 	virtual HordeActionType getHordeActionType() const override { return getHordeUpdateModuleData()->m_action; };
 
+#if defined(_WIN64)
+	struct ObjectComputationOwnerSnapshot
+	{
+		UnsignedInt frame;
+		UnsignedInt wakePriority;
+		UnsignedInt motionGeneration;
+		UnsignedInt lastRefreshFrame;
+		UnsignedInt moduleOrdinal;
+		Bool inHorde;
+		Bool trueHordeMember;
+		const HordeUpdateModuleData *moduleData;
+	};
+	Bool captureObjectComputationOwnerSnapshot(UnsignedInt frame,
+		UnsignedInt moduleOrdinal,
+		ObjectComputationOwnerSnapshot &snapshot) const;
+	Bool validateObjectComputationOwnerSnapshot(
+		const ObjectComputationOwnerSnapshot &snapshot) const;
+	Bool isObjectComputationScanDue(UnsignedInt frame) const;
+	UpdateSleepTime objectComputationSleepTime() const;
+	Bool collectObjectComputationCandidateOracle(ObjectID *objectIDs,
+		UnsignedInt capacity, UnsignedInt *count) const;
+	UpdateSleepTime updateFromObjectComputationCandidates(
+		Object *const *candidates, UnsignedInt candidateCount);
+#endif
+
 protected:
 
 	void showHideFlag(Bool show);
 	void joinOrLeaveHorde(SimpleObjectIterator *iter, Bool join);
 
 private:
+	UpdateSleepTime updateImpl(Object *const *preparedCandidates,
+		UnsignedInt preparedCandidateCount, Bool usePreparedCandidates);
 	UnsignedInt m_lastHordeRefreshFrame; //Just like it sounds
 	Bool				m_inHorde;				 //I may be a true member, or I may merely inherit hordehood from a neighbor who is
 	Bool				m_trueHordeMember; //meaning, I have enough hordesmen near me to qualify
