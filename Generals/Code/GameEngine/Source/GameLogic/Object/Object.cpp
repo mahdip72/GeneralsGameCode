@@ -2117,6 +2117,24 @@ void Object::setDisabledUntil( DisabledType type, UnsignedInt frame )
 }
 
 //-------------------------------------------------------------------------------------------------
+UnsignedInt Object::getDisabledUntil( DisabledType type ) const
+{
+	if( type == DISABLED_ANY )
+	{
+		UnsignedInt highestFrame = 0;
+		for( Int i = 0; i < DISABLED_COUNT; i++ )
+		{
+			if( m_disabledMask.test( i ) && m_disabledTillFrame[ i ] > highestFrame )
+				highestFrame = m_disabledTillFrame[ i ];
+		}
+		return highestFrame;
+	}
+	if( m_disabledMask.test( type ) )
+		return m_disabledTillFrame[ type ];
+	return 0;
+}
+
+//-------------------------------------------------------------------------------------------------
 Bool Object::clearDisabled( DisabledType type )
 {
 	if( type < 0 || type >= DISABLED_COUNT )

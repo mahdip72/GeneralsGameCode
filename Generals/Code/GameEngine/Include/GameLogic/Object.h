@@ -565,6 +565,7 @@ public:
 	void setDisabled( DisabledType type );
 	void setDisabledUntil( DisabledType type, UnsignedInt frame );
 	Bool isDisabledByType( DisabledType type ) const { return TEST_DISABLEDMASK( m_disabledMask, type ); }
+	UnsignedInt getDisabledUntil( DisabledType type = DISABLED_ANY ) const;
 
 	void pauseAllSpecialPowers( const Bool disabling ) const;
 

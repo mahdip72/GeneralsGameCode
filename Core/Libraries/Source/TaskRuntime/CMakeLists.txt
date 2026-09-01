@@ -10,6 +10,7 @@ target_sources(core_task_runtime PRIVATE
     SimulationPhaseGraph.cpp
     DeterministicCrcStream.cpp
     PhysicsIntegrationKernel.cpp
+    ObjectStatusTimerKernel.cpp
     ImmutableSpatialQuery.cpp
     RadarTerrainKernel.cpp
     RadarOverlayKernel.cpp
