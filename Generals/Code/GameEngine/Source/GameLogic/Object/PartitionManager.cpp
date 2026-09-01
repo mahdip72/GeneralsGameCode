@@ -66,6 +66,7 @@
 
 #include "GameLogic/AIPathfind.h"
 #include "GameLogic/GameLogic.h"
+#include "GameLogic/ImmutableSpatialQueryRuntime.h"
 #include "GameLogic/Object.h"
 #include "GameLogic/Module/AIUpdate.h"
 #include "GameLogic/Module/BodyModule.h"
@@ -79,6 +80,15 @@
 
 #include "GameClient/Line2D.h"
 #include "GameClient/ControlBar.h"
+
+#if defined(_WIN64)
+#include "GameNetwork/MultiplayerSimulationRuntimePolicy.h"
+#include "Lib/CollisionCandidateKernel.h"
+#include "Lib/FrameTimingDiagnostics.h"
+#include "Lib/JobSystem.h"
+#include "Lib/SimulationExecutionPolicy.h"
+#include <new>
+#endif
 
 #ifdef RTS_DEBUG
 //#include "GameClient/InGameUI.h"	// for debugHints
@@ -992,6 +1002,169 @@ public:
 	Int														m_hashValue;///< index into hash table
 };
 
+#if defined(_WIN64)
+struct LivePartitionCollisionSnapshotContext
+{
+	PartitionData *owner;
+	PartitionData **participants;
+	UnsignedInt participantCount;
+};
+
+class LivePartitionCollisionWorkspace
+{
+public:
+	LivePartitionCollisionWorkspace()
+		: cellSnapshots(nullptr), occupants(nullptr),
+		  participants(nullptr), prepared(nullptr), scratch(nullptr),
+		  shadowScratch(nullptr), cellCapacity(0), occupantCapacity(0)
+	{
+	}
+
+	~LivePartitionCollisionWorkspace()
+	{
+		delete[] shadowScratch;
+		delete[] scratch;
+		delete[] prepared;
+		delete[] participants;
+		delete[] occupants;
+		delete[] cellSnapshots;
+	}
+
+	Bool reserve(UnsignedInt requiredCells, UnsignedInt requiredOccupants)
+	{
+		if (requiredCells > cellCapacity)
+		{
+			rts::PartitionCollisionCellSnapshot *newCellSnapshots =
+				new (std::nothrow) rts::PartitionCollisionCellSnapshot[requiredCells];
+			if (newCellSnapshots == nullptr)
+			{
+				delete[] newCellSnapshots;
+				return FALSE;
+			}
+			delete[] cellSnapshots;
+			cellSnapshots = newCellSnapshots;
+			cellCapacity = requiredCells;
+		}
+		if (requiredOccupants > occupantCapacity)
+		{
+			rts::PartitionCollisionOccupantSnapshot *newOccupants =
+				new (std::nothrow) rts::PartitionCollisionOccupantSnapshot[
+					requiredOccupants];
+			PartitionData **newParticipants = new (std::nothrow)
+				PartitionData *[requiredOccupants];
+			rts::CollisionCandidate *newPrepared = new (std::nothrow)
+				rts::CollisionCandidate[requiredOccupants];
+			rts::CollisionCandidate *newScratch = new (std::nothrow)
+				rts::CollisionCandidate[requiredOccupants];
+			rts::CollisionCandidate *newShadowScratch = new (std::nothrow)
+				rts::CollisionCandidate[requiredOccupants];
+			if (newOccupants == nullptr || newParticipants == nullptr ||
+				newPrepared == nullptr || newScratch == nullptr ||
+				newShadowScratch == nullptr)
+			{
+				delete[] newShadowScratch;
+				delete[] newScratch;
+				delete[] newPrepared;
+				delete[] newParticipants;
+				delete[] newOccupants;
+				return FALSE;
+			}
+			delete[] shadowScratch;
+			delete[] scratch;
+			delete[] prepared;
+			delete[] participants;
+			delete[] occupants;
+			occupants = newOccupants;
+			participants = newParticipants;
+			prepared = newPrepared;
+			scratch = newScratch;
+			shadowScratch = newShadowScratch;
+			occupantCapacity = requiredOccupants;
+		}
+		return TRUE;
+	}
+
+	rts::PartitionCollisionCellSnapshot *cellSnapshots;
+	rts::PartitionCollisionOccupantSnapshot *occupants;
+	PartitionData **participants;
+	rts::CollisionCandidate *prepared;
+	rts::CollisionCandidate *scratch;
+	rts::CollisionCandidate *shadowScratch;
+
+private:
+	UnsignedInt cellCapacity;
+	UnsignedInt occupantCapacity;
+	LivePartitionCollisionWorkspace(
+		const LivePartitionCollisionWorkspace &);
+	LivePartitionCollisionWorkspace &operator=(
+		const LivePartitionCollisionWorkspace &);
+};
+
+static LivePartitionCollisionWorkspace &livePartitionCollisionWorkspace()
+{
+	// The game owner is the only caller. Persistence removes per-dirty-object
+	// allocation churn without making this storage visible to workers.
+	static LivePartitionCollisionWorkspace workspace;
+	return workspace;
+}
+
+static const char *collisionCandidateDifferenceName(
+	const rts::CollisionCandidate *expected, UnsignedInt expectedCount,
+	const rts::CollisionCandidate *actual, UnsignedInt actualCount,
+	UnsignedInt firstDifference)
+{
+	if (firstDifference >= expectedCount || firstDifference >= actualCount)
+		return "count";
+	const rts::CollisionCandidate &left = expected[firstDifference];
+	const rts::CollisionCandidate &right = actual[firstDifference];
+	if (left.key.lowID != right.key.lowID) return "key_low";
+	if (left.key.highID != right.key.highID) return "key_high";
+	if (left.firstID != right.firstID) return "first_id";
+	if (left.secondID != right.secondID) return "second_id";
+	if (left.firstGeneration != right.firstGeneration) return "first_generation";
+	if (left.secondGeneration != right.secondGeneration) return "second_generation";
+	if (left.discoveryOrder != right.discoveryOrder) return "discovery_order";
+	return "unknown";
+}
+
+static bool resolveLivePartitionCollisionGeneration(UnsignedInt objectID,
+	UnsignedInt generation, void *contextPtr)
+{
+	LivePartitionCollisionSnapshotContext *context =
+		static_cast<LivePartitionCollisionSnapshotContext *>(contextPtr);
+	PartitionData *partition = nullptr;
+	if (generation == 1)
+		partition = context->owner;
+	else if (generation >= 2 && generation - 2 < context->participantCount)
+		partition = context->participants[generation - 2];
+	if (partition == nullptr || partition->getObject() == nullptr)
+		return false;
+	Object *object = partition->getObject();
+	return static_cast<UnsignedInt>(object->getID()) == objectID &&
+		TheGameLogic->findObjectByID(object->getID()) == object &&
+		object->friend_getPartitionData() == partition;
+}
+
+static bool livePartitionOwnerMatchesSnapshot(PartitionData *partition,
+	const rts::PartitionCollisionObjectSnapshot &snapshot)
+{
+	if (partition == nullptr || partition->getObject() == nullptr)
+		return false;
+	Object *object = partition->getObject();
+	const GeometryInfo &geometry = object->getGeometryInfo();
+	const Coord3D *position = object->getPosition();
+	return static_cast<UnsignedInt>(object->getID()) == snapshot.objectID &&
+		position->x == snapshot.positionX && position->y == snapshot.positionY &&
+		position->z == snapshot.positionZ &&
+		object->getOrientation() == snapshot.orientation &&
+		geometry.getMajorRadius() == snapshot.majorRadius &&
+		geometry.getMinorRadius() == snapshot.minorRadius &&
+		static_cast<UnsignedInt>(geometry.getGeomType()) ==
+			snapshot.geometryType &&
+		(geometry.getIsSmall() != FALSE) == snapshot.smallGeometry;
+}
+#endif
+
 inline PartitionContactListNode::~PartitionContactListNode() { }
 
 //-----------------------------------------------------------------------------
@@ -1033,7 +1206,8 @@ public:
 		Note that it is OK for other==null (this indicates a collisions with
 		the ground) but it is not OK for obj==null.
 	*/
-	void addToContactList(PartitionData *obj, PartitionData *other);
+	Bool addToContactList(PartitionData *obj, PartitionData *other);
+	Bool containsContact(PartitionData *obj, PartitionData *other) const;
 
 	/**
 		process all pairs in the contact list: first, determine if they
@@ -1053,6 +1227,31 @@ public:
 	void removeSpecificPartitionData(PartitionData* data);
 
 };
+
+#if defined(_WIN64)
+static UnsignedInt commitCapturedLegacyPossibleCollisions(
+	PartitionData *owner, PartitionContactList *contactList,
+	const rts::PartitionCollisionCellSnapshot *cells, UnsignedInt cellCount,
+	PartitionData *const *participants)
+{
+	UnsignedInt insertedCount = 0;
+	for (UnsignedInt cellIndex = 0; cellIndex != cellCount; ++cellIndex)
+	{
+		const rts::PartitionCollisionCellSnapshot &cell = cells[cellIndex];
+		if (cell.occupantCount < 2)
+			continue;
+		const UnsignedInt end = cell.occupantBegin + cell.occupantCount;
+		for (UnsignedInt index = cell.occupantBegin; index != end; ++index)
+		{
+			PartitionData *participant = participants[index];
+			if (owner != participant &&
+				contactList->addToContactList(owner, participant))
+				++insertedCount;
+		}
+	}
+	return insertedCount;
+}
+#endif
 
 //-----------------------------------------------------------------------------
 //-----------------------------------------------------------------------------
@@ -1721,12 +1920,49 @@ ObjectShroudStatus PartitionData::getShroudedStatus(Int playerIndex)
 //-----------------------------------------------------------------------------
 void PartitionData::removeAllTouchedCells()
 {
+#if defined(_WIN64)
+	if (ThePartitionManager != nullptr)
+	{
+		DEBUG_ASSERTCRASH(ThePartitionManager->m_immutableSpatialMemberCount >=
+			static_cast<UnsignedInt>(m_coiInUseCount),
+			("immutable spatial member count underflow"));
+		if (ThePartitionManager->m_immutableSpatialMemberCount >=
+			static_cast<UnsignedInt>(m_coiInUseCount))
+			ThePartitionManager->m_immutableSpatialMemberCount -=
+				static_cast<UnsignedInt>(m_coiInUseCount);
+		else
+			ThePartitionManager->m_immutableSpatialMemberCount = 0;
+	}
+#endif
 	CellAndObjectIntersection *coi = m_coiArray;
 	for (Int i = m_coiArrayCount; i > 0; --i, ++coi)
 	{
 		if (coi->getModule())
 		{
 			DEBUG_ASSERTCRASH(coi->getModule() == this, ("coi uses wrong module"));
+#if defined(_WIN64)
+			PartitionCell *coveredCell = coi->getCell();
+			if (ThePartitionManager != nullptr &&
+				ThePartitionManager->m_immutableSpatialCellMemberCounts != nullptr &&
+				coveredCell != nullptr)
+			{
+				const Int cellIndex = coveredCell->getCellY() *
+					ThePartitionManager->m_cellCountX + coveredCell->getCellX();
+				DEBUG_ASSERTCRASH(cellIndex >= 0 &&
+					cellIndex < ThePartitionManager->m_totalCellCount,
+					("immutable spatial cell index out of range"));
+				if (cellIndex >= 0 &&
+					cellIndex < ThePartitionManager->m_totalCellCount)
+				{
+					UnsignedInt &cellMembers = ThePartitionManager->
+						m_immutableSpatialCellMemberCounts[cellIndex];
+					DEBUG_ASSERTCRASH(cellMembers != 0,
+						("immutable spatial cell member count underflow"));
+					if (cellMembers != 0)
+						--cellMembers;
+				}
+			}
+#endif
 			coi->removeAllCoverage();
 			DEBUG_ASSERTCRASH(!coi->getModule(), ("coi should no longer be in use"));
 			--m_coiInUseCount;
@@ -1757,6 +1993,32 @@ void PartitionData::addSubPixToCoverage(PartitionCell *cell)
 		{
 			// nope, no coi for this cell, allocate a new one
 			coiToUse = &m_coiArray[m_coiInUseCount++];
+#if defined(_WIN64)
+			if (ThePartitionManager != nullptr)
+			{
+				++ThePartitionManager->m_immutableSpatialMemberCount;
+				if (ThePartitionManager->m_immutableSpatialCellMemberCounts !=
+					nullptr)
+				{
+					const Int cellIndex = cell->getCellY() *
+						ThePartitionManager->m_cellCountX + cell->getCellX();
+					DEBUG_ASSERTCRASH(cellIndex >= 0 &&
+						cellIndex < ThePartitionManager->m_totalCellCount,
+						("immutable spatial cell index out of range"));
+					if (cellIndex >= 0 &&
+						cellIndex < ThePartitionManager->m_totalCellCount)
+					{
+						UnsignedInt &cellMembers = ThePartitionManager->
+							m_immutableSpatialCellMemberCounts[cellIndex];
+						DEBUG_ASSERTCRASH(cellMembers !=
+							~static_cast<UnsignedInt>(0),
+							("immutable spatial cell member count overflow"));
+						if (cellMembers != ~static_cast<UnsignedInt>(0))
+							++cellMembers;
+					}
+				}
+			}
+#endif
 		}
 		if (coiToUse)
 		{
@@ -1948,6 +2210,25 @@ void PartitionData::doSmallFill(
 			if (cell)
 			{
 				m_coiArray[m_coiInUseCount++].addCoverage(cell, this);
+#if defined(_WIN64)
+				if (ThePartitionManager != nullptr)
+				{
+					++ThePartitionManager->m_immutableSpatialMemberCount;
+					if (ThePartitionManager->m_immutableSpatialCellMemberCounts !=
+						nullptr)
+					{
+						const Int cellIndex = cell->getCellY() *
+							ThePartitionManager->m_cellCountX + cell->getCellX();
+						UnsignedInt &cellMembers = ThePartitionManager->
+							m_immutableSpatialCellMemberCounts[cellIndex];
+						DEBUG_ASSERTCRASH(cellMembers !=
+							~static_cast<UnsignedInt>(0),
+							("immutable spatial cell member count overflow"));
+						if (cellMembers != ~static_cast<UnsignedInt>(0))
+							++cellMembers;
+					}
+				}
+#endif
 			}
 		}
 	}
@@ -1981,6 +2262,366 @@ void PartitionData::addPossibleCollisions(PartitionContactList *ctList)
 #endif
 
 	//DEBUG_LOG(("adding possible collision for %s",getObject()->getTemplate()->getName().str()));
+
+#if defined(_WIN64)
+	const Bool authoritativeRequested = rts::UseParallelSimulation();
+	const Bool shadowRequested = rts::UseSimulationShadowOracle();
+	if (authoritativeRequested || shadowRequested)
+	{
+		rts::JobSystem &jobs = rts::JobSystem::instance();
+		const Bool schedulerReady = jobs.isRunning() &&
+			!jobs.isWorkerThread() && jobs.isCurrentThread(rts::JOB_OWNER_GAME) &&
+			jobs.workerCount() > 1;
+		const Bool multiplayerPolicyBlocked =
+			TheGameLogic->isInMultiplayerGame() &&
+			(TheNetwork == nullptr ||
+			 !rts::ShouldPrepareLiveSimulationKernelOffThread(
+				rts::MULTIPLAYER_SIMULATION_KERNEL_COLLISION));
+		if (multiplayerPolicyBlocked || !schedulerReady)
+		{
+			rts::RecordCollisionCandidateOwnerFallback(false);
+		}
+		else
+		{
+			UnsignedInt occupantCount = 0;
+			Object *admissionOwner = getObject();
+			const UnsignedInt admissionOwnerID = admissionOwner != nullptr ?
+				static_cast<UnsignedInt>(admissionOwner->getID()) : 0;
+			Bool countValid = admissionOwnerID != 0;
+			{
+				rts::frame_timing::Scope admissionTiming(
+					rts::frame_timing::CollisionAdmission);
+				for (Int cellIndex = 0; cellIndex < m_coiInUseCount; ++cellIndex)
+				{
+					PartitionCell *cell = m_coiArray[cellIndex].getCell();
+					if (cell == nullptr)
+					{
+						countValid = FALSE;
+						break;
+					}
+					const Int cellOccupantCount = cell->getCoiCount();
+					if (cellOccupantCount < 0 ||
+						static_cast<UnsignedInt>(cellOccupantCount) >
+							rts::COLLISION_CANDIDATE_MAXIMUM_INPUTS - occupantCount)
+					{
+						countValid = FALSE;
+						break;
+					}
+					occupantCount += static_cast<UnsignedInt>(cellOccupantCount);
+				}
+			}
+
+			if (!countValid)
+			{
+				rts::RecordCollisionCandidateOwnerFallback(false, true);
+			}
+			else
+			{
+				LivePartitionCollisionWorkspace &workspace =
+					livePartitionCollisionWorkspace();
+				Bool workspaceReady = FALSE;
+				{
+					rts::frame_timing::Scope snapshotReserveTiming(
+						rts::frame_timing::SimulationSnapshot);
+					workspaceReady = workspace.reserve(
+						static_cast<UnsignedInt>(m_coiInUseCount), occupantCount);
+				}
+				rts::PartitionCollisionCellSnapshot *cellSnapshots =
+					workspace.cellSnapshots;
+				rts::PartitionCollisionOccupantSnapshot *occupants =
+					workspace.occupants;
+				rts::CollisionCandidate *prepared = workspace.prepared;
+				rts::CollisionCandidate *scratch = workspace.scratch;
+				rts::CollisionCandidate *shadowScratch = workspace.shadowScratch;
+				PartitionData **participants = workspace.participants;
+				Bool authoritativeCommit = FALSE;
+				Bool shadowExecution = FALSE;
+				Bool stale = FALSE;
+				Bool fallbackRecorded = FALSE;
+
+				if (workspaceReady)
+				{
+					rts::CollisionAdmissionSampler admissionSampler;
+					UnsignedInt flatIndex = 0;
+					Bool snapshotValid = TRUE;
+					{
+						rts::frame_timing::Scope snapshotTiming(
+							rts::frame_timing::SimulationSnapshot);
+						for (Int cellIndex = 0;
+							cellIndex < m_coiInUseCount && snapshotValid; ++cellIndex)
+						{
+							PartitionCell *cell = m_coiArray[cellIndex].getCell();
+							cellSnapshots[cellIndex].occupantBegin = flatIndex;
+							cellSnapshots[cellIndex].discoveryBase = flatIndex;
+							for (CellAndObjectIntersection *coi =
+								cell->getFirstCoiInCell(); coi;
+								coi = coi->getNextCoi())
+							{
+								if (flatIndex >= occupantCount)
+								{
+									snapshotValid = FALSE;
+									break;
+								}
+								PartitionData *participant = coi->getModule();
+								participants[flatIndex] = participant;
+								Object *participantObject = participant != nullptr ?
+									participant->getObject() : nullptr;
+								occupants[flatIndex].objectID =
+									participantObject != nullptr ?
+									static_cast<UnsignedInt>(participantObject->getID()) : 0;
+								occupants[flatIndex].generation = flatIndex + 2;
+								if (occupants[flatIndex].objectID != 0 &&
+									occupants[flatIndex].objectID != admissionOwnerID)
+									admissionSampler.observe(
+										occupants[flatIndex].objectID);
+								++flatIndex;
+							}
+							cellSnapshots[cellIndex].occupantCount = flatIndex -
+								cellSnapshots[cellIndex].occupantBegin;
+						}
+					}
+					snapshotValid = snapshotValid && flatIndex == occupantCount;
+
+					Object *ownerObject = getObject();
+					rts::PartitionCollisionObjectSnapshot ownerSnapshot;
+					if (snapshotValid && ownerObject != nullptr)
+					{
+						const Coord3D *position = ownerObject->getPosition();
+						const GeometryInfo &geometry = ownerObject->getGeometryInfo();
+						ownerSnapshot.objectID =
+							static_cast<UnsignedInt>(ownerObject->getID());
+						ownerSnapshot.generation = 1;
+						// The outer legacy dirty loop remains authoritative, so this
+						// local slice starts at order zero for its one owner.
+						ownerSnapshot.dirtyOrder = 0;
+						ownerSnapshot.positionX = position->x;
+						ownerSnapshot.positionY = position->y;
+						ownerSnapshot.positionZ = position->z;
+						ownerSnapshot.orientation = ownerObject->getOrientation();
+						ownerSnapshot.majorRadius = geometry.getMajorRadius();
+						ownerSnapshot.minorRadius = geometry.getMinorRadius();
+						ownerSnapshot.geometryType =
+							static_cast<UnsignedInt>(geometry.getGeomType());
+						ownerSnapshot.smallGeometry =
+							geometry.getIsSmall() != FALSE;
+
+						if (occupantCount <
+								rts::COLLISION_CANDIDATE_MINIMUM_PARALLEL_INPUTS ||
+							!admissionSampler.hasUsefulSpread())
+						{
+							rts::RecordCollisionCandidateIneligibleSlice();
+							commitCapturedLegacyPossibleCollisions(this, ctList,
+								cellSnapshots,
+								static_cast<UnsignedInt>(m_coiInUseCount),
+								participants);
+							return;
+						}
+
+						rts::CollisionCandidateOptions options;
+						options.parallel = true;
+						options.order = rts::COLLISION_CANDIDATE_REVERSE_DISCOVERY;
+						UnsignedInt preparedCount = 0;
+						rts::CollisionCandidateMetrics preparationMetrics;
+						rts::CollisionCandidateResult result;
+						{
+							rts::frame_timing::Scope parallelTiming(
+								rts::frame_timing::SimulationParallel);
+							result = rts::PreparePartitionCollisionCandidates(
+								ownerSnapshot, cellSnapshots,
+								static_cast<UnsignedInt>(m_coiInUseCount), occupants,
+								occupantCount, prepared, occupantCount, scratch,
+								occupantCount, options, &preparedCount,
+								&preparationMetrics);
+						}
+						rts::RecordCollisionCandidateParallelWork(
+							preparationMetrics);
+						if (result == rts::COLLISION_CANDIDATE_PARALLEL)
+						{
+							LivePartitionCollisionSnapshotContext context;
+							context.owner = this;
+							context.participants = participants;
+							context.participantCount = occupantCount;
+							UnsignedInt firstStale = 0;
+							Bool liveValid = FALSE;
+							{
+								rts::frame_timing::Scope validationTiming(
+									rts::frame_timing::CollisionLiveValidation);
+								liveValid = livePartitionOwnerMatchesSnapshot(this,
+									ownerSnapshot) &&
+									rts::ValidateCollisionCandidateGenerations(prepared,
+										preparedCount,
+										resolveLivePartitionCollisionGeneration, &context,
+										&firstStale);
+							}
+							if (liveValid)
+							{
+								if (shadowRequested)
+								{
+									// Expected is the final prepended prefix. Existing pairs
+									// remain below it and are excluded from both sides.
+									UnsignedInt expectedCount = 0;
+									{
+										rts::frame_timing::Scope filterTiming(
+											rts::frame_timing::CollisionExistingFilter);
+										for (UnsignedInt index = 0; index != preparedCount;
+											++index)
+										{
+											const UnsignedInt generation =
+												prepared[index].secondGeneration;
+											if (!ctList->containsContact(this,
+													participants[generation - 2]))
+												scratch[expectedCount++] = prepared[index];
+										}
+									}
+
+									UnsignedInt actualCount = 0;
+									UnsignedInt actualDiscovery = 0;
+									{
+										rts::frame_timing::Scope commitTiming(
+											rts::frame_timing::SimulationCommit);
+										for (Int cellIndex = 0;
+											cellIndex < m_coiInUseCount; ++cellIndex)
+										{
+											PartitionCell *cell =
+												m_coiArray[cellIndex].getCell();
+											if (cell->getCoiCount() < 2)
+											{
+												actualDiscovery +=
+													cellSnapshots[cellIndex].occupantCount;
+												continue;
+											}
+											for (CellAndObjectIntersection *coi =
+												cell->getFirstCoiInCell(); coi;
+												coi = coi->getNextCoi(), ++actualDiscovery)
+											{
+												PartitionData *that = coi->getModule();
+												if (this != that &&
+													ctList->addToContactList(this, that))
+												{
+													Object *thatObject = that->getObject();
+													rts::CollisionCandidate &actual =
+														shadowScratch[actualCount++];
+													actual.firstID = ownerSnapshot.objectID;
+													actual.secondID = thatObject != nullptr ?
+														static_cast<UnsignedInt>(thatObject->getID()) : 0;
+													actual.firstGeneration = 1;
+													actual.secondGeneration = actualDiscovery + 2;
+													actual.discoveryOrder = actualDiscovery;
+													rts::MakeCollisionCandidateKey(actual.firstID,
+														actual.secondID, actual.key);
+												}
+											}
+										}
+									}
+									{
+										rts::frame_timing::Scope prepareTiming(
+											rts::frame_timing::CollisionCommitPrepare);
+										for (UnsignedInt first = 0, last = actualCount;
+											first < last && first < --last; ++first)
+										{
+											rts::CollisionCandidate temporary =
+												shadowScratch[first];
+											shadowScratch[first] = shadowScratch[last];
+											shadowScratch[last] = temporary;
+										}
+									}
+
+									UnsignedInt firstDifference = 0;
+									Bool matches = FALSE;
+									{
+										rts::frame_timing::Scope compareTiming(
+											rts::frame_timing::SimulationShadowCompare);
+										matches = rts::CollisionCandidatesEqual(scratch,
+											expectedCount, shadowScratch, actualCount,
+											&firstDifference) ? TRUE : FALSE;
+									}
+									if (!matches)
+									{
+										rts::RecordCollisionCandidateShadowMismatch();
+										rts::RecordCollisionCandidateOwnerFallback(false,
+											true);
+										fallbackRecorded = TRUE;
+										const UnsignedInt expectedFirst =
+											firstDifference < expectedCount ?
+												scratch[firstDifference].firstID : 0;
+										const UnsignedInt expectedSecond =
+											firstDifference < expectedCount ?
+												scratch[firstDifference].secondID : 0;
+										const UnsignedInt actualFirst =
+											firstDifference < actualCount ?
+												shadowScratch[firstDifference].firstID : 0;
+										const UnsignedInt actualSecond =
+											firstDifference < actualCount ?
+												shadowScratch[firstDifference].secondID : 0;
+										printf("SIMULATION_COLLISION_MISMATCH frame=%u phase=partition_contact_commit item=%u diff=%s expected_count=%u actual_count=%u expected_first=%u expected_second=%u actual_first=%u actual_second=%u\n",
+											static_cast<UnsignedInt>(TheGameLogic->getFrame()),
+											firstDifference,
+											collisionCandidateDifferenceName(scratch,
+												expectedCount, shadowScratch, actualCount,
+												firstDifference), expectedCount, actualCount,
+											expectedFirst, expectedSecond, actualFirst,
+											actualSecond);
+										fflush(stdout);
+									}
+									else
+									{
+										rts::RecordCollisionCandidateOwnerCommit(false,
+											true, actualCount);
+									}
+									// The real legacy prefix is already published in either
+									// case, so callbacks and destruction stay on legacy data.
+									shadowExecution = TRUE;
+								}
+								else
+								{
+									// Prepared is reverse discovery. Insert it backwards
+									// because PartitionContactList prepends each contact.
+									UnsignedInt committedCount = 0;
+									{
+										rts::frame_timing::Scope commitTiming(
+											rts::frame_timing::SimulationCommit);
+										for (UnsignedInt index = preparedCount;
+											index != 0; --index)
+										{
+											const UnsignedInt generation =
+												prepared[index - 1].secondGeneration;
+											if (ctList->addToContactList(this,
+													participants[generation - 2]))
+												++committedCount;
+										}
+									}
+									rts::RecordCollisionCandidateOwnerCommit(true,
+										false, committedCount);
+									authoritativeCommit = TRUE;
+								}
+							}
+							else
+							{
+								stale = TRUE;
+							}
+						}
+						else
+						{
+							rts::RecordCollisionCandidateOwnerFallback(false,
+								true);
+							commitCapturedLegacyPossibleCollisions(this, ctList,
+								cellSnapshots,
+								static_cast<UnsignedInt>(m_coiInUseCount),
+								participants);
+							return;
+						}
+					}
+				}
+
+				if (authoritativeCommit || shadowExecution)
+					return;
+				if (!fallbackRecorded)
+					rts::RecordCollisionCandidateOwnerFallback(stale != FALSE,
+						true);
+			}
+		}
+	}
+#endif
 
 	CellAndObjectIntersection *myCoi = m_coiArray;
 	for (Int i = m_coiInUseCount; i > 0; --i, ++myCoi)
@@ -2163,6 +2804,13 @@ void PartitionData::updateCellsTouched()
 			}
 		}
 	}
+#endif
+
+#if defined(_WIN64)
+	// removeAllTouchedCells followed by addCoverage can move even a same-cell
+	// non-head COI to the list head. FASTEST traversal observes that order, so
+	// every touched-cell rebuild invalidates the immutable topology.
+	InvalidateLiveImmutableSpatialTopology();
 #endif
 
 }
@@ -2402,17 +3050,34 @@ void PartitionData::detachFromGhostObject()
 //-----------------------------------------------------------------------------
 inline UnsignedInt hash2ints(Int a, Int b)
 {
-	// do it this way so that [a,b] always hashes to the same value as [b,a].
-	// this is unsophisticated but reasonable, since all ObjectIDs will
-	// quite likely be well below 65536...
+	// Preserve the historical hash while avoiding signed-left-shift overflow.
 	if (a < b)
+		return (static_cast<UnsignedInt>(a) << 16) +
+			static_cast<UnsignedInt>(b);
+	return (static_cast<UnsignedInt>(b) << 16) +
+		static_cast<UnsignedInt>(a);
+}
+
+//-----------------------------------------------------------------------------
+Bool PartitionContactList::containsContact(PartitionData *obj,
+	PartitionData *other) const
+{
+	if (obj == other || obj == nullptr || other == nullptr)
+		return FALSE;
+	Object *objObject = obj->getObject();
+	Object *otherObject = other->getObject();
+	if (objObject == nullptr || otherObject == nullptr)
+		return FALSE;
+	UnsignedInt hashValue = hash2ints(objObject->getID(),
+		otherObject->getID()) % PartitionContactList_SOCKET_COUNT;
+	for (PartitionContactListNode *contact = m_contactHash[hashValue];
+		contact; contact = contact->m_nextHash)
 	{
-		return (a<<16)+b;
+		if ((contact->m_obj == obj && contact->m_other == other) ||
+			(contact->m_obj == other && contact->m_other == obj))
+			return TRUE;
 	}
-	else
-	{
-		return (b<<16)+a;
-	}
+	return FALSE;
 }
 
 
@@ -2421,15 +3086,15 @@ inline UnsignedInt hash2ints(Int a, Int b)
 //-----------------------------------------------------------------------------
 
 //-----------------------------------------------------------------------------
-void PartitionContactList::addToContactList( PartitionData *obj, PartitionData *other )
+Bool PartitionContactList::addToContactList( PartitionData *obj, PartitionData *other )
 {
 	if (obj == other || obj == nullptr || other == nullptr)
-		return;
+		return FALSE;
 
 	Object* obj_obj = obj->getObject();
 	Object* other_obj = other->getObject();
 	if (obj_obj == nullptr || other_obj == nullptr)
-		return;
+		return FALSE;
 
 	// compute hash index based on object's ids.
 	UnsignedInt hashValue = hash2ints(obj_obj->getID(), other_obj->getID());
@@ -2442,7 +3107,7 @@ void PartitionContactList::addToContactList( PartitionData *obj, PartitionData *
 				(cd->m_obj == other && cd->m_other == obj))
 		{
 			// already noted
-			return;
+			return FALSE;
 		}
 	}
 
@@ -2459,7 +3124,6 @@ void PartitionContactList::addToContactList( PartitionData *obj, PartitionData *
 	// add to list of contacts for this frame
 	ncd->m_next = m_contactList;
 	m_contactList = ncd;
-
 
 #if 0
 
@@ -2506,7 +3170,7 @@ DEBUG_ASSERTLOG(((Int)aggcount)%1000!=0,("avg hash depth at %f is %f, fullness %
 aggcount,aggtotal/(aggcount*PartitionContactList_SOCKET_COUNT),(aggfull*100)/(aggcount*PartitionContactList_SOCKET_COUNT)));
 #endif
 
-
+	return TRUE;
 }
 
 //-----------------------------------------------------------------------------
@@ -2615,6 +3279,11 @@ PartitionManager::PartitionManager()
 	m_worldExtents.hi.zero();
 	m_dirtyModules = nullptr;
 	m_updatedSinceLastReset = false;
+#if defined(_WIN64)
+	m_immutableSpatialObjectCount = 0;
+	m_immutableSpatialMemberCount = 0;
+	m_immutableSpatialCellMemberCounts = nullptr;
+#endif
 #ifdef FASTER_GCO
 	m_maxGcoRadius = 0;
 #endif
@@ -2678,6 +3347,13 @@ void PartitionManager::init()
 		m_cellCountY = REAL_TO_INT_CEIL(m_worldExtents.height() * m_cellSizeInv);
 		m_totalCellCount = m_cellCountX * m_cellCountY;
 		m_cells = MSGNEW("PartitionManager_Cells") PartitionCell[m_totalCellCount];
+#if defined(_WIN64)
+		m_immutableSpatialCellMemberCounts = new (std::nothrow)
+			UnsignedInt[m_totalCellCount];
+		if (m_immutableSpatialCellMemberCounts != nullptr)
+			memset(m_immutableSpatialCellMemberCounts, 0,
+				static_cast<size_t>(m_totalCellCount) * sizeof(UnsignedInt));
+#endif
 		for (Int x = 0; x < m_cellCountX; x++)
 		{
 			for (Int y = 0; y < m_cellCountY; y++)
@@ -2726,6 +3402,9 @@ void PartitionManager::getPMStats(double& gcoTimeThisFrameTotal, double& gcoTime
 //-----------------------------------------------------------------------------
 void PartitionManager::reset()
 {
+#if defined(_WIN64)
+	InvalidateLiveImmutableSpatialLifecycle();
+#endif
 #ifdef DUMP_PERF_STATS
 	s_countInClosestObjects = 0;
 	s_timeInClosestObjects = 0;
@@ -2764,6 +3443,10 @@ void PartitionManager::shutdown()
 
 	resetPendingUndoShroudRevealQueue();
 
+#if defined(_WIN64)
+	delete [] m_immutableSpatialCellMemberCounts;
+	m_immutableSpatialCellMemberCounts = nullptr;
+#endif
 	delete [] m_cells;
 	m_cells = nullptr;
 
@@ -2773,6 +3456,10 @@ void PartitionManager::shutdown()
 	m_totalCellCount = 0;
 	m_worldExtents.lo.zero();
 	m_worldExtents.hi.zero();
+#if defined(_WIN64)
+	m_immutableSpatialObjectCount = 0;
+	m_immutableSpatialMemberCount = 0;
+#endif
 }
 
 //-----------------------------------------------------------------------------
@@ -2920,6 +3607,10 @@ void PartitionManager::registerObject( Object* object )
 
 	// add module to object
 	mod->attachToObject( object );
+#if defined(_WIN64)
+	++m_immutableSpatialObjectCount;
+	InvalidateLiveImmutableSpatialTopology();
+#endif
 
 }
 
@@ -2934,6 +3625,12 @@ void PartitionManager::unRegisterObject( Object* object )
 	PartitionData *mod = object->friend_getPartitionData();
 	if( mod == nullptr )
 		return;
+#if defined(_WIN64)
+	DEBUG_ASSERTCRASH(m_immutableSpatialObjectCount != 0,
+		("immutable spatial object count underflow"));
+	if (m_immutableSpatialObjectCount != 0)
+		--m_immutableSpatialObjectCount;
+#endif
 
 	GhostObject *ghost;
 
@@ -2947,6 +3644,9 @@ void PartitionManager::unRegisterObject( Object* object )
 		mod->friend_setObject(nullptr);
 		//Tell the ghost object that its parent is dead.
 		ghost->updateParentObject(nullptr, mod);
+#if defined(_WIN64)
+		InvalidateLiveImmutableSpatialTopology();
+#endif
 		return;
 	}
 
@@ -2965,6 +3665,9 @@ void PartitionManager::unRegisterObject( Object* object )
 
 	// delete module
 	deleteInstance(mod);
+#if defined(_WIN64)
+	InvalidateLiveImmutableSpatialTopology();
+#endif
 
 }
 
@@ -2994,6 +3697,9 @@ void PartitionManager::registerGhostObject( GhostObject* object)
 
 	// add module to object
 	mod->attachToGhostObject( object);
+#if defined(_WIN64)
+	InvalidateLiveImmutableSpatialTopology();
+#endif
 }
 
 //------------------------------------------------------------------------------
@@ -3023,6 +3729,9 @@ void PartitionManager::unRegisterGhostObject( GhostObject* object )
 
 	// delete module
 	deleteInstance(mod);
+#if defined(_WIN64)
+	InvalidateLiveImmutableSpatialTopology();
+#endif
 }
 
 /**
@@ -5638,7 +6347,10 @@ void hLineAddLooker(Int x1, Int x2, Int y, void *playerIndexVoid)
 
 	Int playerIndex = static_cast<Int>(reinterpret_cast<intptr_t>(playerIndexVoid));
 
-	PartitionCell* cell = &ThePartitionManager->m_cells[y * ThePartitionManager->m_cellCountX + x1];	// yes, this could be invalid. we'll skip the bad ones.
+	if (x1 < 0) x1 = 0;
+	if (x2 >= ThePartitionManager->m_cellCountX) x2 = ThePartitionManager->m_cellCountX - 1;
+	if (x1 > x2) return;
+	PartitionCell* cell = &ThePartitionManager->m_cells[y * ThePartitionManager->m_cellCountX + x1];
 	for (Int x = x1; x <= x2; ++x, ++cell)
 	{
 		if (x < 0 || x >= ThePartitionManager->m_cellCountX)
@@ -5655,7 +6367,10 @@ void hLineRemoveLooker(Int x1, Int x2, Int y, void *playerIndexVoid)
 
 	Int playerIndex = static_cast<Int>(reinterpret_cast<intptr_t>(playerIndexVoid));
 
-	PartitionCell* cell = &ThePartitionManager->m_cells[y * ThePartitionManager->m_cellCountX + x1];	// yes, this could be invalid. we'll skip the bad ones.
+	if (x1 < 0) x1 = 0;
+	if (x2 >= ThePartitionManager->m_cellCountX) x2 = ThePartitionManager->m_cellCountX - 1;
+	if (x1 > x2) return;
+	PartitionCell* cell = &ThePartitionManager->m_cells[y * ThePartitionManager->m_cellCountX + x1];
 	for (Int x = x1; x <= x2; ++x, ++cell)
 	{
 		if (x < 0 || x >= ThePartitionManager->m_cellCountX)
@@ -5672,7 +6387,10 @@ void hLineAddShrouder(Int x1, Int x2, Int y, void *playerIndexVoid)
 
 	Int playerIndex = static_cast<Int>(reinterpret_cast<intptr_t>(playerIndexVoid));
 
-	PartitionCell* cell = &ThePartitionManager->m_cells[y * ThePartitionManager->m_cellCountX + x1];	// yes, this could be invalid. we'll skip the bad ones.
+	if (x1 < 0) x1 = 0;
+	if (x2 >= ThePartitionManager->m_cellCountX) x2 = ThePartitionManager->m_cellCountX - 1;
+	if (x1 > x2) return;
+	PartitionCell* cell = &ThePartitionManager->m_cells[y * ThePartitionManager->m_cellCountX + x1];
 	for (Int x = x1; x <= x2; ++x, ++cell)
 	{
 		if (x < 0 || x >= ThePartitionManager->m_cellCountX)
@@ -5689,7 +6407,10 @@ void hLineRemoveShrouder(Int x1, Int x2, Int y, void *playerIndexVoid)
 
 	Int playerIndex = static_cast<Int>(reinterpret_cast<intptr_t>(playerIndexVoid));
 
-	PartitionCell* cell = &ThePartitionManager->m_cells[y * ThePartitionManager->m_cellCountX + x1];	// yes, this could be invalid. we'll skip the bad ones.
+	if (x1 < 0) x1 = 0;
+	if (x2 >= ThePartitionManager->m_cellCountX) x2 = ThePartitionManager->m_cellCountX - 1;
+	if (x1 > x2) return;
+	PartitionCell* cell = &ThePartitionManager->m_cells[y * ThePartitionManager->m_cellCountX + x1];
 	for (Int x = x1; x <= x2; ++x, ++cell)
 	{
 		if (x < 0 || x >= ThePartitionManager->m_cellCountX)
@@ -5709,7 +6430,10 @@ void hLineAddThreat(Int x1, Int x2, Int y, void *threatValueParms)
 	Real distance;
 	Real mulVal = 1.0f;
 
-	PartitionCell* cell = &ThePartitionManager->m_cells[y * ThePartitionManager->m_cellCountX + x1];	// yes, this could be invalid. we'll skip the bad ones.
+	if (x1 < 0) x1 = 0;
+	if (x2 >= ThePartitionManager->m_cellCountX) x2 = ThePartitionManager->m_cellCountX - 1;
+	if (x1 > x2) return;
+	PartitionCell* cell = &ThePartitionManager->m_cells[y * ThePartitionManager->m_cellCountX + x1];
 	for (Int x = x1; x <= x2; ++x, ++cell)
 	{
 		if (x < 0 || x >= ThePartitionManager->m_cellCountX)
@@ -5737,7 +6461,10 @@ void hLineRemoveThreat(Int x1, Int x2, Int y, void *threatValueParms)
 	Real distance;
 	Real mulVal = 1.0f;
 
-	PartitionCell* cell = &ThePartitionManager->m_cells[y * ThePartitionManager->m_cellCountX + x1];	// yes, this could be invalid. we'll skip the bad ones.
+	if (x1 < 0) x1 = 0;
+	if (x2 >= ThePartitionManager->m_cellCountX) x2 = ThePartitionManager->m_cellCountX - 1;
+	if (x1 > x2) return;
+	PartitionCell* cell = &ThePartitionManager->m_cells[y * ThePartitionManager->m_cellCountX + x1];
 	for (Int x = x1; x <= x2; ++x, ++cell)
 	{
 		if (x < 0 || x >= ThePartitionManager->m_cellCountX)
@@ -5765,7 +6492,10 @@ void hLineAddValue(Int x1, Int x2, Int y, void *threatValueParms)
 	Real distance;
 	Real mulVal = 1.0f;
 
-	PartitionCell* cell = &ThePartitionManager->m_cells[y * ThePartitionManager->m_cellCountX + x1];	// yes, this could be invalid. we'll skip the bad ones.
+	if (x1 < 0) x1 = 0;
+	if (x2 >= ThePartitionManager->m_cellCountX) x2 = ThePartitionManager->m_cellCountX - 1;
+	if (x1 > x2) return;
+	PartitionCell* cell = &ThePartitionManager->m_cells[y * ThePartitionManager->m_cellCountX + x1];
 	for (Int x = x1; x <= x2; ++x, ++cell)
 	{
 		if (x < 0 || x >= ThePartitionManager->m_cellCountX)
@@ -5793,7 +6523,10 @@ void hLineRemoveValue(Int x1, Int x2, Int y, void *threatValueParms)
 	Real distance;
 	Real mulVal = 1.0f;
 
-	PartitionCell* cell = &ThePartitionManager->m_cells[y * ThePartitionManager->m_cellCountX + x1];	// yes, this could be invalid. we'll skip the bad ones.
+	if (x1 < 0) x1 = 0;
+	if (x2 >= ThePartitionManager->m_cellCountX) x2 = ThePartitionManager->m_cellCountX - 1;
+	if (x1 > x2) return;
+	PartitionCell* cell = &ThePartitionManager->m_cells[y * ThePartitionManager->m_cellCountX + x1];
 	for (Int x = x1; x <= x2; ++x, ++cell)
 	{
 		if (x < 0 || x >= ThePartitionManager->m_cellCountX)
