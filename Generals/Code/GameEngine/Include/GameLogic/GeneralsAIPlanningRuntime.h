@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <new>
+#include <thread>
 
 class GeneralsAIEnemyPlanningJob : public rts::Job
 {
@@ -38,13 +39,17 @@ public:
 		UnsignedInt jobOrdinal, UnsignedInt injectedFailureOrdinal,
 		std::atomic<UnsignedInt> *activePhysicalWorkers,
 		std::atomic<UnsignedInt> *peakPhysicalWorkers,
-		const rts::JobFloatingPointState &floatingPointState) :
+		const rts::JobFloatingPointState &floatingPointState,
+		std::atomic<UnsignedInt> *testRendezvous = 0,
+		UnsignedInt testRendezvousTarget = 0U) :
 		m_snapshot(snapshot), m_result(result), m_execution(execution),
 		m_jobOrdinal(jobOrdinal),
 		m_injectedFailureOrdinal(injectedFailureOrdinal),
 		m_activePhysicalWorkers(activePhysicalWorkers),
 		m_peakPhysicalWorkers(peakPhysicalWorkers),
-		m_floatingPointState(floatingPointState) {}
+		m_floatingPointState(floatingPointState),
+		m_testRendezvous(testRendezvous),
+		m_testRendezvousTarget(testRendezvousTarget) {}
 
 	void execute(rts::JobContext &context) override
 	{
@@ -62,6 +67,15 @@ public:
 				!m_peakPhysicalWorkers->compare_exchange_weak(observed, active,
 					std::memory_order_relaxed, std::memory_order_relaxed))
 			{
+			}
+			// Focused tests may hold tiny jobs at this point until every expected
+			// physical worker has arrived. Production never supplies this hook.
+			if (m_testRendezvous && m_testRendezvousTarget > 1U)
+			{
+				m_testRendezvous->fetch_add(1U, std::memory_order_acq_rel);
+				while (m_testRendezvous->load(std::memory_order_acquire) <
+					m_testRendezvousTarget && !context.isCancellationRequested())
+					std::this_thread::yield();
 			}
 		}
 
@@ -87,6 +101,8 @@ private:
 	std::atomic<UnsignedInt> *m_activePhysicalWorkers;
 	std::atomic<UnsignedInt> *m_peakPhysicalWorkers;
 	const rts::JobFloatingPointState m_floatingPointState;
+	std::atomic<UnsignedInt> *m_testRendezvous;
+	UnsignedInt m_testRendezvousTarget;
 };
 
 struct GeneralsAIPlanningJobSystemEvidence
@@ -220,7 +236,8 @@ inline Bool ExecuteGeneralsAIEnemyPlanningBatch(
 	const GeneralsAIEnemyPlanningSnapshot *snapshots, UnsignedInt snapshotCount,
 	GeneralsAIEnemyPlanningResult *results,
 	UnsignedInt injectedFailureOrdinal = rts::AI_PLANNING_INVALID_ORDINAL,
-	rts::AIPlanningBatchStatus *status = 0)
+	rts::AIPlanningBatchStatus *status = 0,
+	std::atomic<UnsignedInt> *testRendezvous = 0)
 {
 	InitializeGeneralsAIPlanningBatchStatus(status, executionMode);
 	// A negotiated network serial lane is still the current canonical owner
@@ -271,7 +288,8 @@ inline Bool ExecuteGeneralsAIEnemyPlanningBatch(
 			GeneralsAIEnemyPlanningJob(snapshots + submitted,
 				results + submitted, execution + submitted, submitted,
 				injectedFailureOrdinal, &activePhysicalWorkers,
-				&peakPhysicalWorkers, floatingPointState);
+				&peakPhysicalWorkers, floatingPointState, testRendezvous,
+				testRendezvous ? snapshotCount : 0U);
 		rts::JobHandle handle = job ? jobs.trySubmit(job,
 			rts::JOB_PRIORITY_FRAME_CRITICAL, group) : rts::JobHandle();
 		if (!handle.isValid())
@@ -297,7 +315,8 @@ inline Bool ExecuteGeneralsAIEnemyPlanningBatch(
 	// Never let the owner execute queued work while deciding whether this batch
 	// earned physical-worker authority.  A bounded passive fence either proves
 	// the requested topology or the group is cancelled and recomputed serially.
-	const UnsignedInt physicalCompletionTimeoutMilliseconds = 8U;
+	const UnsignedInt physicalCompletionTimeoutMilliseconds =
+		testRendezvous ? 1000U : 8U;
 	if (!jobs.waitWithoutOwnerHelp(group,
 		physicalCompletionTimeoutMilliseconds))
 	{

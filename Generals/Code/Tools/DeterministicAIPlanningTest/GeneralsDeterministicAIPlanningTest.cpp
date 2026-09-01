@@ -311,9 +311,10 @@ void TestCanonicalBatchAcrossTopologiesAndFailure()
 	AssertEqualBatch(canonical, results, 2U);
 	assert(!ExecuteGeneralsAIEnemyPlanningBatch(
 		rts::AI_PLANNING_EXECUTION_PARALLEL, true, snapshots, 2U, results));
+	std::atomic<UnsignedInt> physicalRendezvous(0U);
 	assert(ExecuteGeneralsAIEnemyPlanningBatch(
 		rts::AI_PLANNING_EXECUTION_PARALLEL, false, snapshots, 2U, results,
-		rts::AI_PLANNING_INVALID_ORDINAL, &status));
+		rts::AI_PLANNING_INVALID_ORDINAL, &status, &physicalRendezvous));
 	AssertEqualBatch(canonical, results, 2U);
 	assert(status.parallelSucceeded == 1U);
 	assert(status.committedMode == rts::AI_PLANNING_EXECUTION_PARALLEL);
@@ -329,12 +330,13 @@ void TestCanonicalBatchAcrossTopologiesAndFailure()
 	const unsigned ownerMxcsr =
 		(savedMxcsr & ~_MM_ROUND_MASK) | _MM_ROUND_UP;
 	_mm_setcsr(ownerMxcsr);
+	physicalRendezvous.store(0U, std::memory_order_release);
 	GeneralsAIEnemyPlanningResult floatingPointOracle[2];
 	assert(PlanGeneralsAIEnemyPlanningBatchSerial(
 		snapshots, 2U, floatingPointOracle));
 	assert(ExecuteGeneralsAIEnemyPlanningBatch(
 		rts::AI_PLANNING_EXECUTION_PARALLEL, false, snapshots, 2U, results,
-		rts::AI_PLANNING_INVALID_ORDINAL, &status));
+		rts::AI_PLANNING_INVALID_ORDINAL, &status, &physicalRendezvous));
 	AssertEqualBatch(floatingPointOracle, results, 2U);
 	assert((_mm_getcsr() & ~0x3fU) == (ownerMxcsr & ~0x3fU));
 	_mm_setcsr(savedMxcsr);
@@ -347,9 +349,10 @@ void TestCanonicalBatchAcrossTopologiesAndFailure()
 	assert(status.committedMode == rts::AI_PLANNING_EXECUTION_SERIAL);
 	assert(status.usedSerialFallback == 1U);
 	assert(jobs.metrics().failedJobCount >= 1U);
+	physicalRendezvous.store(0U, std::memory_order_release);
 	assert(ExecuteGeneralsAIEnemyPlanningBatch(
 		rts::AI_PLANNING_EXECUTION_SHADOW, false, snapshots, 2U, results,
-		rts::AI_PLANNING_INVALID_ORDINAL, &status));
+		rts::AI_PLANNING_INVALID_ORDINAL, &status, &physicalRendezvous));
 	AssertEqualBatch(canonical, results, 2U);
 	assert(status.requestedMode == rts::AI_PLANNING_EXECUTION_SHADOW);
 	assert(status.parallelSucceeded == 1U);
