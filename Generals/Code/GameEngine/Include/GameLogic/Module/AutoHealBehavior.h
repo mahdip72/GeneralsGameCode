@@ -129,6 +129,13 @@ public:
 	virtual UpdateSleepTime update() override;
 	virtual DisabledMaskType getDisabledTypesToProcess() const override { return MAKE_DISABLED_MASK( DISABLED_HELD ); }
 
+#if defined(_WIN64)
+	Bool canQueueImmutableSpatialQuery();
+	Bool measureImmutableSpatialQueryCost(UnsignedInt *cellVisits,
+		UnsignedInt *memberVisits);
+	Bool queueImmutableSpatialQuery();
+#endif
+
 	void stopHealing();
 	void undoUpgrade(); ///<pretend like we have not been activated yet, so we can be reactivated later
 
@@ -162,6 +169,11 @@ protected:
 private:
 
 	void pulseHealObject( Object *obj );
+	void pulseHealObjectWithRadiusUI( Object *obj );
+#if defined(_WIN64)
+	Bool tryImmutableRadiusHeal();
+	static void commitImmutableRadiusHealObject(Object *obj, void *context);
+#endif
 	void createEmitters();
 
 	ParticleSystemID m_radiusParticleSystemID;

@@ -278,6 +278,17 @@ ImmutableSpatialStatus BuildImmutableSpatialArena(
 	ImmutableSpatialUInt32 destinationCapacity,
 	ImmutableSpatialUInt32 *arenaBytes);
 
+// Refreshes only the sorted object-fact prefix and arena generation. The
+// already validated cell/member/radius topology remains byte-identical, so a
+// live owner can reuse it until its exact partition-topology generation
+// changes. Validation completes before either header or object bytes mutate.
+ImmutableSpatialStatus RefreshImmutableSpatialArenaObjects(
+	void *arena,
+	ImmutableSpatialUInt32 arenaCapacity,
+	const ImmutableSpatialGeneration &generation,
+	const ImmutableSpatialObjectRecord *objects,
+	ImmutableSpatialUInt32 objectCount);
+
 // Performs complete linear validation. Query execution subsequently uses the
 // immutable build token plus constant-time structural validation; it never
 // repeats whole-arena object/offset uniqueness work per batch.

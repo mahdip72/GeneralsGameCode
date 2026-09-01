@@ -4,9 +4,11 @@
 ** SPDX-License-Identifier: GPL-3.0-or-later
 */
 #include "Lib/ImmutableSpatialQuery.h"
+#include "Lib/ImmutableSpatialQueryRuntime.h"
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
@@ -14,6 +16,10 @@
 #include <limits>
 #include <thread>
 #include <vector>
+
+#if defined(_WIN64)
+#include <xmmintrin.h>
+#endif
 
 namespace
 {
@@ -824,6 +830,63 @@ void testWorkerCountsAndMoreThanSixtyFourRanges()
 	}
 }
 
+void testSameCellNonHeadMovementTraversalParity()
+{
+	Fixture before;
+	before.objects.clear();
+	before.objects.push_back(objectRecord(201, 1.0f, 0.0f, 0.0f, 0, 1));
+	before.objects.push_back(objectRecord(202, 2.0f, 0.0f, 0.0f, 0, 1));
+	before.members.clear();
+	before.cells.assign(9, ImmutableSpatialCellRecord{});
+	for (ImmutableSpatialUInt32 cellIndex = 0; cellIndex != 9; ++cellIndex)
+	{
+		before.cells[cellIndex].memberBegin =
+			static_cast<ImmutableSpatialUInt32>(before.members.size());
+		if (cellIndex == 4)
+		{
+			before.members.push_back({ 0 }); // current list head
+			before.members.push_back({ 1 }); // non-head mover
+			before.cells[cellIndex].memberCount = 2;
+		}
+	}
+	before.build();
+	ImmutableSpatialQuery beforeQuery = baseQuery(before);
+	beforeQuery.selfObjectIndex = IMMUTABLE_SPATIAL_INVALID_OBJECT_INDEX;
+	std::vector<ImmutableSpatialQuery> beforeQueries(1, beforeQuery);
+	ImmutableSpatialExecutionOptions options;
+	RunStorage beforeStorage(1, 1, 2, 2);
+	expect(execute(before, beforeQueries, options, beforeStorage) ==
+		IMMUTABLE_SPATIAL_SUCCESS,
+		"two-object one-cell traversal executes before non-head movement");
+	expectIDs(beforeStorage, { 202, 201 },
+		"FASTEST preserves the legacy reverse-discovery list order");
+
+	Fixture after = before;
+	std::swap(after.members[0], after.members[1]);
+	++after.arenaGeneration.topology;
+	after.build();
+	ImmutableSpatialQuery afterQuery = beforeQuery;
+	afterQuery.expectedArenaGeneration = after.arenaGeneration;
+	std::vector<ImmutableSpatialQuery> afterQueries(1, afterQuery);
+	RunStorage afterStorage(1, 1, 2, 2);
+	expect(execute(after, afterQueries, options, afterStorage) ==
+		IMMUTABLE_SPATIAL_SUCCESS,
+		"same-cell non-head remove/re-add traversal executes after rebuild");
+	expectIDs(afterStorage, { 201, 202 },
+		"topology rebuild matches the legacy non-head move-to-head traversal");
+
+	GenerationContext movedGeneration;
+	movedGeneration.arenaGeneration = after.arenaGeneration;
+	options.resolveArenaGeneration = resolveArena;
+	options.resolveObjectGeneration = resolveObject;
+	options.generationContext = &movedGeneration;
+	RunStorage staleStorage(1, 1, 2, 2);
+	expect(execute(before, beforeQueries, options, staleStorage) ==
+		IMMUTABLE_SPATIAL_GENERATION_MISMATCH &&
+		outputStillSentinel(staleStorage),
+		"topology generation rejects the stale pre-movement traversal");
+}
+
 void testLargeCanonicalTopologyAndCheapBatchValidation()
 {
 	const ImmutableSpatialUInt32 width = 128;
@@ -1097,6 +1160,512 @@ void testGenerationAndMalformedArenaFailClosed()
 	expect(outputStillSentinel(malformedStorage),
 		"malformed arena publishes nothing");
 }
+
+void testJobSystemWrapperPhysicalTransactionalAndFaults()
+{
+	expect(!ShouldDispatchImmutableSpatialQueryCollection(0, 16) &&
+		!ShouldDispatchImmutableSpatialQueryCollection(1, 16) &&
+		!ShouldDispatchImmutableSpatialQueryCollection(16, 1) &&
+		ShouldDispatchImmutableSpatialQueryCollection(2, 2) &&
+		ShouldDispatchImmutableSpatialQueryCollection(16, 16) &&
+		ShouldDispatchImmutableSpatialQueryCollection(130, 96),
+		"live collection gate has no fixed sixty-four-worker rejection");
+	Fixture fixture;
+	std::vector<ImmutableSpatialQuery> queries(4, baseQuery(fixture));
+	GenerationContext generationContext;
+	generationContext.arenaGeneration = fixture.arenaGeneration;
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 2;
+	config.queueCapacity = 64;
+	config.scratchBytesPerWorker = 4096;
+	config.pinWorkers = false;
+	expect(jobs.start(config), "immutable spatial wrapper workers start");
+	expect(jobs.registerCurrentThread(rts::JOB_OWNER_GAME),
+		"immutable spatial wrapper registers game owner");
+
+	auto run = [&](const ImmutableSpatialJobSystemOptions &options,
+		RunStorage &storage, ImmutableSpatialJobSystemMetrics &jobMetrics,
+		ImmutableSpatialStatus &kernelStatus)
+	{
+		ImmutableSpatialBatchScratch scratch = storage.scratch();
+		return ExecuteImmutableSpatialQueryBatchOnJobSystem(
+			fixture.arena.data(), fixture.arenaBytes, queries.data(),
+			static_cast<ImmutableSpatialUInt32>(queries.size()), resolveArena,
+			resolveObject, &generationContext, scratch, storage.output.data(),
+			static_cast<ImmutableSpatialUInt32>(storage.output.size()),
+			storage.spans.data(),
+			static_cast<ImmutableSpatialUInt32>(storage.spans.size()),
+			&storage.outputCount, options, &jobMetrics, nullptr, &kernelStatus);
+	};
+
+	ImmutableSpatialJobSystemOptions options;
+	RunStorage success(4, 2, 5, 16);
+	ImmutableSpatialJobSystemMetrics successMetrics;
+	ImmutableSpatialStatus kernelStatus = IMMUTABLE_SPATIAL_INVALID_ARGUMENT;
+	expect(run(options, success, successMetrics, kernelStatus) ==
+		IMMUTABLE_SPATIAL_JOB_SYSTEM_SUCCESS &&
+		kernelStatus == IMMUTABLE_SPATIAL_SUCCESS,
+		"immutable spatial wrapper completes through physical workers");
+	expect(success.outputCount == 12 && successMetrics.dispatches == 2 &&
+		successMetrics.ranges == 4 && successMetrics.submittedJobs == 4 &&
+		successMetrics.completedJobs == 4 &&
+		successMetrics.physicalWorkerJobs == 4 &&
+		successMetrics.ownerHelpedJobs == 0 &&
+		successMetrics.physicalWorkerMask != 0 &&
+		successMetrics.distinctPhysicalWorkers >= 1,
+		"immutable spatial wrapper jobs are balanced and never owner-helped");
+
+	const ImmutableSpatialJobSystemTestFault faults[] = {
+		IMMUTABLE_SPATIAL_JOB_SYSTEM_TEST_GROUP_FAILURE,
+		IMMUTABLE_SPATIAL_JOB_SYSTEM_TEST_ADMISSION_FAILURE,
+		IMMUTABLE_SPATIAL_JOB_SYSTEM_TEST_CANCEL_AFTER_ADMISSION,
+		IMMUTABLE_SPATIAL_JOB_SYSTEM_TEST_RANGE_FAILURE,
+		IMMUTABLE_SPATIAL_JOB_SYSTEM_TEST_TIMEOUT
+	};
+	for (ImmutableSpatialJobSystemTestFault fault : faults)
+	{
+		options = ImmutableSpatialJobSystemOptions();
+		options.testFault = fault;
+		options.testDispatchOrdinal = 1;
+		options.testRangeOrdinal = 0;
+		RunStorage failed(4, 2, 5, 16);
+		ImmutableSpatialJobSystemMetrics failedMetrics;
+		kernelStatus = IMMUTABLE_SPATIAL_SUCCESS;
+		expect(run(options, failed, failedMetrics, kernelStatus) !=
+			IMMUTABLE_SPATIAL_JOB_SYSTEM_SUCCESS,
+			"immutable spatial wrapper injected fault fails closed");
+		expect(outputStillSentinel(failed),
+			"immutable spatial wrapper injected fault publishes nothing");
+		expect(failedMetrics.ownerHelpedJobs == 0,
+			"immutable spatial failure and timeout paths never execute on owner");
+		if (fault == IMMUTABLE_SPATIAL_JOB_SYSTEM_TEST_CANCEL_AFTER_ADMISSION)
+		{
+			expect(failedMetrics.ownerHelpedJobs == 0 &&
+				failedMetrics.physicalWorkerJobs < failedMetrics.submittedJobs,
+				"cancelled-before-run jobs are not counted as owner help");
+		}
+	}
+
+	expect(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME),
+		"immutable spatial wrapper unregisters game owner");
+	jobs.shutdown();
+	config.workerCount = 1;
+	expect(jobs.start(config) &&
+		jobs.registerCurrentThread(rts::JOB_OWNER_GAME),
+		"immutable spatial one-worker fallback fixture starts");
+	RunStorage ineligible(4, 1, 5, 16);
+	ImmutableSpatialJobSystemMetrics ineligibleMetrics;
+	kernelStatus = IMMUTABLE_SPATIAL_SUCCESS;
+	expect(run(ImmutableSpatialJobSystemOptions(), ineligible,
+		ineligibleMetrics, kernelStatus) ==
+		IMMUTABLE_SPATIAL_JOB_SYSTEM_INELIGIBLE,
+		"immutable spatial wrapper rejects one physical worker");
+	expect(outputStillSentinel(ineligible),
+		"one-worker fallback leaves publication untouched");
+	expect(ineligibleMetrics.submittedJobs == 0 &&
+		ineligibleMetrics.physicalWorkerMask == 0 &&
+		ineligibleMetrics.distinctPhysicalWorkers == 0,
+		"one-worker fallback publishes no physical-worker identity");
+	expect(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME),
+		"immutable spatial one-worker fixture unregisters game owner");
+	jobs.shutdown();
+
+	ResetImmutableSpatialRuntimeMetrics();
+	RecordImmutableSpatialArenaCapture(true);
+	RecordImmutableSpatialEligibleQuery(IMMUTABLE_SPATIAL_CONSUMER_HEALING);
+	RecordImmutableSpatialAuthoritativeQuery(
+		IMMUTABLE_SPATIAL_CONSUMER_HEALING, 3, successMetrics);
+	RecordImmutableSpatialShadowQuery(
+		IMMUTABLE_SPATIAL_CONSUMER_POINT_DEFENSE_LASER, true,
+		successMetrics);
+	RecordImmutableSpatialSuccessfulCollection(1, 1, successMetrics);
+	RecordImmutableSpatialSuccessfulCollection(4, 2, successMetrics);
+	ImmutableSpatialRuntimeMetrics metrics = GetImmutableSpatialRuntimeMetrics();
+	expect(metrics.resetEpoch != 0 && metrics.capturedArenas == 1 &&
+		metrics.successfulCollections == 1 &&
+		metrics.successfulCollectionQueries == 4 &&
+		metrics.successfulCollectionRanges == 2 &&
+		metrics.multiRangeCollections == 1 &&
+		metrics.collectionSubmittedJobs == 4 &&
+		metrics.collectionCompletedJobs == 4 &&
+		metrics.collectionPhysicalWorkerJobs == 4 &&
+		metrics.collectionOwnerHelpedJobs == 0 &&
+		metrics.collectionPhysicalWorkerMask == successMetrics.physicalWorkerMask &&
+		metrics.maximumCollectionQueries == 4 &&
+		metrics.maximumCollectionRanges == 2 &&
+		metrics.maximumCollectionDistinctPhysicalWorkers ==
+			successMetrics.distinctPhysicalWorkers &&
+		metrics.healing.eligibleQueries == 1 &&
+		metrics.healing.authoritativeQueries == 1 &&
+		metrics.healing.authoritativeCandidates == 3 &&
+		metrics.healing.physicalWorkerJobs == 4 &&
+		metrics.pointDefenseLaser.shadowQueries == 1 &&
+		metrics.pointDefenseLaser.shadowMatches == 1 &&
+		metrics.pointDefenseLaser.shadowMismatches == 0,
+		"immutable spatial consumer metrics reset and remain independent");
+	ResetImmutableSpatialRuntimeMetrics();
+	metrics = GetImmutableSpatialRuntimeMetrics();
+	expect(metrics.successfulCollections == 0 &&
+		metrics.successfulCollectionQueries == 0 &&
+		metrics.successfulCollectionRanges == 0 &&
+		metrics.multiRangeCollections == 0 &&
+		metrics.collectionSubmittedJobs == 0 &&
+		metrics.collectionCompletedJobs == 0 &&
+		metrics.collectionPhysicalWorkerJobs == 0 &&
+		metrics.collectionOwnerHelpedJobs == 0 &&
+		metrics.collectionPhysicalWorkerMask == 0 &&
+		metrics.maximumCollectionQueries == 0 &&
+		metrics.maximumCollectionRanges == 0 &&
+		metrics.maximumCollectionDistinctPhysicalWorkers == 0,
+		"immutable spatial collection metrics reset at the lifecycle boundary");
+}
+
+void testJobSystemWrapperOwnerFloatingPointParityAndFallback()
+{
+#if defined(_WIN64)
+	Fixture fixture;
+	for (auto &object : fixture.objects)
+		object.admissionMask = 0;
+	ImmutableSpatialObjectRecord &target = fixture.objects[1];
+	target.admissionMask = 1;
+	target.positionX = 1.0e-20f;
+	target.positionY = 0.0f;
+	target.positionZ = 0.0f;
+	fixture.build();
+
+	ImmutableSpatialQuery query = baseQuery(fixture);
+	query.selfObjectIndex = static_cast<ImmutableSpatialUInt32>(
+		IMMUTABLE_SPATIAL_INVALID_OBJECT_INDEX);
+	query.maximumDistance = 1.0001e-20f;
+	query.distanceType = IMMUTABLE_SPATIAL_FROM_CENTER_2D;
+	const ImmutableSpatialUInt32 queryCount = 16;
+	std::vector<ImmutableSpatialQuery> queries(queryCount, query);
+
+	const unsigned savedMxcsr = _mm_getcsr();
+	const unsigned workerMxcsr = savedMxcsr & ~_MM_FLUSH_ZERO_MASK;
+	const unsigned ownerMxcsr = workerMxcsr | _MM_FLUSH_ZERO_ON;
+	_mm_setcsr(workerMxcsr);
+	ImmutableSpatialExecutionOptions serialOptions;
+	RunStorage unscoped(queryCount, 1, 5, queryCount);
+	expect(execute(fixture, queries, serialOptions, unscoped) ==
+		IMMUTABLE_SPATIAL_SUCCESS && unscoped.outputCount == queryCount,
+		"near-boundary fixture distinguishes unscoped worker MXCSR");
+	_mm_setcsr(ownerMxcsr);
+	RunStorage baseline(queryCount, 1, 5, queryCount);
+	expect(execute(fixture, queries, serialOptions, baseline) ==
+		IMMUTABLE_SPATIAL_SUCCESS && baseline.outputCount == 0,
+		"altered owner MXCSR produces the serial near-boundary oracle");
+
+	const unsigned workerCounts[] = { 1, 2, 4, 8, 16 };
+	for (unsigned workerIndex = 0;
+		workerIndex != sizeof(workerCounts) / sizeof(workerCounts[0]);
+		++workerIndex)
+	{
+		const unsigned workerCount = workerCounts[workerIndex];
+		_mm_setcsr(workerMxcsr);
+		JobSystem &jobs = JobSystem::instance();
+		JobSystemConfig config;
+		config.workerCount = workerCount;
+		config.queueCapacity = 64;
+		config.scratchBytesPerWorker = 4096;
+		config.pinWorkers = false;
+		expect(jobs.start(config),
+			"floating-point parity workers start with default MXCSR");
+		expect(jobs.registerCurrentThread(JOB_OWNER_GAME),
+			"floating-point parity registers the game owner");
+		_mm_setcsr(ownerMxcsr);
+
+		GenerationContext generationContext;
+		generationContext.arenaGeneration = fixture.arenaGeneration;
+		RunStorage storage(queryCount, workerCount, 5, queryCount);
+		ImmutableSpatialBatchScratch scratch = storage.scratch();
+		ImmutableSpatialJobSystemMetrics metrics;
+		ImmutableSpatialStatus kernelStatus =
+			IMMUTABLE_SPATIAL_INVALID_ARGUMENT;
+		ImmutableSpatialJobSystemOptions workerOptions;
+		if (workerCount >= 4)
+			workerOptions.testSpinIterations = 200000;
+		const ImmutableSpatialJobSystemResult result =
+			ExecuteImmutableSpatialQueryBatchOnJobSystem(
+				fixture.arena.data(), fixture.arenaBytes, queries.data(),
+				queryCount, resolveArena, resolveObject, &generationContext,
+				scratch, storage.output.data(),
+				static_cast<ImmutableSpatialUInt32>(storage.output.size()),
+				storage.spans.data(),
+				static_cast<ImmutableSpatialUInt32>(storage.spans.size()),
+				&storage.outputCount, workerOptions,
+				&metrics, nullptr, &kernelStatus);
+		expect((_mm_getcsr() & ~0x3fu) == (ownerMxcsr & ~0x3fu),
+			"immutable spatial dispatch preserves altered owner MXCSR");
+
+		if (workerCount == 1)
+		{
+			expect(result == IMMUTABLE_SPATIAL_JOB_SYSTEM_INELIGIBLE &&
+				outputStillSentinel(storage),
+				"one-worker immutable spatial dispatch falls back transactionally");
+			expect(execute(fixture, queries, serialOptions, storage) ==
+				IMMUTABLE_SPATIAL_SUCCESS,
+				"one-worker owner fallback executes the serial oracle");
+		}
+		else
+		{
+			expect(result == IMMUTABLE_SPATIAL_JOB_SYSTEM_SUCCESS &&
+				kernelStatus == IMMUTABLE_SPATIAL_SUCCESS &&
+				metrics.dispatches == 2 &&
+				metrics.ranges == workerCount * 2 &&
+				metrics.submittedJobs == workerCount * 2 &&
+				metrics.completedJobs == metrics.submittedJobs &&
+				metrics.physicalWorkerJobs == metrics.submittedJobs &&
+				metrics.ownerHelpedJobs == 0 &&
+				metrics.physicalWorkerMask != 0 &&
+				metrics.distinctPhysicalWorkers >= 1 &&
+				(workerCount < 4 || metrics.distinctPhysicalWorkers > 1),
+				"2/4/8/16 immutable spatial ranges use only physical workers");
+		}
+		expect(storage.outputCount == baseline.outputCount &&
+			std::memcmp(storage.spans.data(), baseline.spans.data(),
+				queryCount * sizeof(ImmutableSpatialResultSpan)) == 0,
+			"1/2/4/8/16 workers preserve altered-MXCSR near-boundary parity");
+
+		if (workerCount == 4)
+		{
+			ImmutableSpatialJobSystemOptions faultOptions;
+			faultOptions.testFault =
+				IMMUTABLE_SPATIAL_JOB_SYSTEM_TEST_RANGE_FAILURE;
+			faultOptions.testDispatchOrdinal = 1;
+			faultOptions.testRangeOrdinal = 0;
+			RunStorage failed(queryCount, workerCount, 5, queryCount);
+			scratch = failed.scratch();
+			generationContext.arenaCalls = 0;
+			kernelStatus = IMMUTABLE_SPATIAL_SUCCESS;
+			expect(ExecuteImmutableSpatialQueryBatchOnJobSystem(
+				fixture.arena.data(), fixture.arenaBytes, queries.data(),
+				queryCount, resolveArena, resolveObject, &generationContext,
+				scratch, failed.output.data(),
+				static_cast<ImmutableSpatialUInt32>(failed.output.size()),
+				failed.spans.data(),
+				static_cast<ImmutableSpatialUInt32>(failed.spans.size()),
+				&failed.outputCount, faultOptions, &metrics, nullptr,
+				&kernelStatus) == IMMUTABLE_SPATIAL_JOB_SYSTEM_FAILED &&
+				outputStillSentinel(failed),
+				"altered-MXCSR physical-worker failure publishes no authority");
+			expect((_mm_getcsr() & ~0x3fu) == (ownerMxcsr & ~0x3fu) &&
+				execute(fixture, queries, serialOptions, failed) ==
+					IMMUTABLE_SPATIAL_SUCCESS &&
+				failed.outputCount == baseline.outputCount &&
+				std::memcmp(failed.spans.data(), baseline.spans.data(),
+					queryCount * sizeof(ImmutableSpatialResultSpan)) == 0,
+				"failed altered-MXCSR batch falls back safely to the owner oracle");
+		}
+
+		expect(jobs.unregisterCurrentThread(JOB_OWNER_GAME),
+			"floating-point parity unregisters the game owner");
+		jobs.shutdown();
+	}
+	_mm_setcsr(savedMxcsr);
+#endif
+}
+
+void testPersistentArenaRefreshBenchmarks()
+{
+	const ImmutableSpatialUInt32 objectCounts[] = { 1000, 4000, 8000 };
+	for (ImmutableSpatialUInt32 scaleIndex = 0; scaleIndex != 3; ++scaleIndex)
+	{
+		const ImmutableSpatialUInt32 objectCount = objectCounts[scaleIndex];
+		std::vector<ImmutableSpatialObjectRecord> objects(objectCount);
+		std::vector<ImmutableSpatialMemberRecord> members(objectCount);
+		for (ImmutableSpatialUInt32 index = 0; index != objectCount; ++index)
+		{
+			objects[index] = objectRecord(index + 1,
+				static_cast<float>(index), 0.0f, 0.0f, 0, 0);
+			members[index].objectIndex = index;
+		}
+		ImmutableSpatialCellRecord cell = { 0, objectCount };
+		ImmutableSpatialRadiusRecord radii[3] = {
+			{ 0, 1 }, { 1, 0 }, { 1, 0 }
+		};
+		ImmutableSpatialOffsetRecord offset = { 0, 0 };
+		ImmutableSpatialArenaInput input = {};
+		input.generation = generation(10, 20, 30);
+		input.gridWidth = 1;
+		input.gridHeight = 1;
+		input.cellSize = 1.0f;
+		input.objects = objects.data();
+		input.objectCount = objectCount;
+		input.cells = &cell;
+		input.cellCount = 1;
+		input.members = members.data();
+		input.memberCount = objectCount;
+		input.radii = radii;
+		input.radiusCount = 3;
+		input.offsets = &offset;
+		input.offsetCount = 1;
+
+		ImmutableSpatialUInt32 arenaBytes = 0;
+		expect(MeasureImmutableSpatialArena(input, &arenaBytes) ==
+			IMMUTABLE_SPATIAL_SUCCESS,
+			"1k/4k/8k persistent arena benchmark input measures");
+		std::vector<ImmutableSpatialUInt32> arena((arenaBytes + 3) / 4);
+		ImmutableSpatialUInt32 builtBytes = 0;
+		const auto buildBegin = std::chrono::steady_clock::now();
+		expect(BuildImmutableSpatialArena(input, arena.data(), arenaBytes,
+			&builtBytes) == IMMUTABLE_SPATIAL_SUCCESS && builtBytes == arenaBytes,
+			"1k/4k/8k persistent arena benchmark builds");
+		const auto buildEnd = std::chrono::steady_clock::now();
+
+		const auto *beforeHeader = reinterpret_cast<
+			const ImmutableSpatialArenaHeader *>(arena.data());
+		const ImmutableSpatialUInt32 topologyOffset = beforeHeader->cellOffset;
+		std::vector<unsigned char> topology(
+			reinterpret_cast<const unsigned char *>(arena.data()) + topologyOffset,
+			reinterpret_cast<const unsigned char *>(arena.data()) + arenaBytes);
+		const ImmutableSpatialGeneration refreshedGeneration =
+			generation(10, 20, 31);
+		for (ImmutableSpatialUInt32 index = 0; index != objectCount; ++index)
+		{
+			objects[index].generation = refreshedGeneration;
+			objects[index].positionY = static_cast<float>(index % 17);
+		}
+		const auto refreshBegin = std::chrono::steady_clock::now();
+		expect(RefreshImmutableSpatialArenaObjects(arena.data(), arenaBytes,
+			refreshedGeneration, objects.data(), objectCount) ==
+			IMMUTABLE_SPATIAL_SUCCESS,
+			"1k/4k/8k persistent arena refresh succeeds");
+		const auto refreshEnd = std::chrono::steady_clock::now();
+		const auto *afterHeader = reinterpret_cast<
+			const ImmutableSpatialArenaHeader *>(arena.data());
+		expect(afterHeader->generation.facts == 31 &&
+			ValidateImmutableSpatialArena(arena.data(), arenaBytes),
+			"persistent fact refresh publishes a valid new generation");
+		expect(std::memcmp(topology.data(),
+			reinterpret_cast<const unsigned char *>(arena.data()) + topologyOffset,
+			topology.size()) == 0,
+			"persistent fact refresh leaves cell/member/radius topology unchanged");
+		const auto buildNanoseconds = std::chrono::duration_cast<
+			std::chrono::nanoseconds>(buildEnd - buildBegin).count();
+		const auto refreshNanoseconds = std::chrono::duration_cast<
+			std::chrono::nanoseconds>(refreshEnd - refreshBegin).count();
+		std::cout << "Immutable spatial persistent benchmark objects=" <<
+			objectCount << " build_ns=" << buildNanoseconds <<
+			" refresh_ns=" << refreshNanoseconds << '\n';
+	}
+}
+
+void testDeterministicAdmissionCostInversion()
+{
+	ImmutableSpatialAdmissionCost cost;
+	cost.queryCount = 16;
+	cost.workerCount = 16;
+	cost.objectCount = 8000;
+	cost.cellCount = 16384;
+	cost.memberCount = 32000;
+	cost.radiusOffsetCount = 131072;
+	cost.queryCellVisits = 16;
+	cost.queryMemberVisits = 64;
+	expect(EvaluateImmutableSpatialQueryAdmission(cost) ==
+		IMMUTABLE_SPATIAL_ADMISSION_POLICY_INELIGIBLE,
+		"tiny local batches stay scalar even with sixteen workers");
+	cost.rebuildTopology = true;
+	cost.queryCellVisits = 64;
+	cost.queryMemberVisits = 8;
+	cost.maximumRangeCost = 44;
+	expect(EvaluateImmutableSpatialQueryAdmission(cost) ==
+		IMMUTABLE_SPATIAL_ADMISSION_POLICY_INELIGIBLE,
+		"sparse cold local occupancy rejects full-arena rebuild end to end");
+	cost.rebuildTopology = false;
+
+	cost.queryCellVisits = 16384;
+	cost.queryMemberVisits = 256000;
+	cost.maximumRangeCost = 392192;
+	cost.ownerScanCount = 16000;
+	cost.ownerSortComparisons = 64;
+	cost.ownerLookupComparisons = 64;
+	ImmutableSpatialMetricCounter legacyCost = 0;
+	ImmutableSpatialMetricCounter parallelCost = 0;
+	expect(EvaluateImmutableSpatialQueryAdmission(cost, &legacyCost,
+		&parallelCost) == IMMUTABLE_SPATIAL_ADMISSION_ELIGIBLE &&
+		parallelCost < legacyCost,
+		"warm broad batches invert the complete transaction cost in favor of workers");
+
+	struct ScaleCase
+	{
+		ImmutableSpatialMetricCounter objects;
+		ImmutableSpatialMetricCounter cells;
+		ImmutableSpatialMetricCounter members;
+		ImmutableSpatialMetricCounter offsets;
+		ImmutableSpatialMetricCounter queryCells;
+		ImmutableSpatialMetricCounter queryMembers;
+	};
+	const ScaleCase scales[] = {
+		{ 1000, 4096, 4000, 16000, 4096, 64000 },
+		{ 4000, 16384, 16000, 65536, 8192, 128000 },
+		{ 8000, 32768, 32000, 131072, 16384, 256000 }
+	};
+	for (unsigned index = 0; index != 3; ++index)
+	{
+		cost.objectCount = scales[index].objects;
+		cost.cellCount = scales[index].cells;
+		cost.memberCount = scales[index].members;
+		cost.radiusOffsetCount = scales[index].offsets;
+		cost.queryCellVisits = scales[index].queryCells;
+		cost.queryMemberVisits = scales[index].queryMembers;
+		cost.maximumRangeCost = (scales[index].queryCells * 8 +
+			scales[index].queryMembers * 24 + 15) / 16;
+		cost.rebuildTopology = true;
+		cost.refreshFacts = false;
+		expect(EvaluateImmutableSpatialQueryAdmission(cost, &legacyCost,
+			&parallelCost) == IMMUTABLE_SPATIAL_ADMISSION_ELIGIBLE &&
+			parallelCost < legacyCost,
+			"1k/4k/8k cold capture is admitted only when measured local work amortizes it");
+	}
+
+	cost.queryCount = 8;
+	cost.workerCount = 8;
+	cost.objectCount = 8000;
+	cost.cellCount = 32768;
+	cost.memberCount = 32000;
+	cost.radiusOffsetCount = 131072;
+	cost.queryCellVisits = 1024;
+	cost.queryMemberVisits = 8000;
+	cost.maximumRangeCost = 25024;
+	cost.ownerScanCount = 256;
+	cost.ownerSortComparisons = 24;
+	cost.ownerLookupComparisons = 24;
+	cost.rebuildTopology = false;
+	cost.refreshFacts = false;
+	expect(EvaluateImmutableSpatialQueryAdmission(cost) ==
+		IMMUTABLE_SPATIAL_ADMISSION_ELIGIBLE,
+		"warm cache admits a medium repeated collection");
+	cost.maximumRangeCost = 180000;
+	expect(EvaluateImmutableSpatialQueryAdmission(cost) ==
+		IMMUTABLE_SPATIAL_ADMISSION_POLICY_INELIGIBLE,
+		"a skewed contiguous range is rejected using its actual maximum cost");
+	cost.maximumRangeCost = 25024;
+	cost.ownerScanCount = 20000;
+	cost.ownerSortComparisons = 20000;
+	cost.ownerLookupComparisons = 20000;
+	expect(EvaluateImmutableSpatialQueryAdmission(cost) ==
+		IMMUTABLE_SPATIAL_ADMISSION_POLICY_INELIGIBLE,
+		"end-to-end rejected work includes owner scan sort and lookup cost");
+	cost.ownerScanCount = 256;
+	cost.ownerSortComparisons = 24;
+	cost.ownerLookupComparisons = 24;
+	cost.refreshFacts = true;
+	expect(EvaluateImmutableSpatialQueryAdmission(cost) ==
+		IMMUTABLE_SPATIAL_ADMISSION_POLICY_INELIGIBLE,
+		"fact-refresh cost can invert a medium collection back to scalar");
+	cost.refreshFacts = false;
+	cost.rebuildTopology = true;
+	expect(EvaluateImmutableSpatialQueryAdmission(cost) ==
+		IMMUTABLE_SPATIAL_ADMISSION_POLICY_INELIGIBLE,
+		"cold topology rebuild cost can invert a medium collection back to scalar");
+	cost.rebuildTopology = false;
+	cost.workerCount = 1;
+	expect(EvaluateImmutableSpatialQueryAdmission(cost) ==
+		IMMUTABLE_SPATIAL_ADMISSION_POLICY_INELIGIBLE,
+		"forced-one policy rejects before spatial preparation");
+}
 }
 
 int main()
@@ -1108,11 +1677,16 @@ int main()
 	testEdgeAndOutOfMapTraversal();
 	testRelocatedExecutionAndSpanValidation();
 	testWorkerCountsAndMoreThanSixtyFourRanges();
+	testSameCellNonHeadMovementTraversalParity();
 	testLargeCanonicalTopologyAndCheapBatchValidation();
 	testAliasingIsRejectedBeforeWork();
 	testWin32SizeOverflowGuards();
 	testFailureCancellationCapacityAndNoPublication();
 	testGenerationAndMalformedArenaFailClosed();
+	testJobSystemWrapperPhysicalTransactionalAndFaults();
+	testJobSystemWrapperOwnerFloatingPointParityAndFallback();
+	testPersistentArenaRefreshBenchmarks();
+	testDeterministicAdmissionCostInversion();
 
 	if (g_failures != 0)
 	{

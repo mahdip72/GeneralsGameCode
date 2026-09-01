@@ -41,8 +41,13 @@
 #include "GameLogic/Module/AutoHealBehavior.h"
 #include "GameLogic/Module/BodyModule.h"
 #include "GameLogic/GameLogic.h"
+#include "GameLogic/ImmutableSpatialQueryRuntime.h"
 #include "GameLogic/Object.h"
 #include "GameLogic/PartitionManager.h"
+
+#if defined(_WIN64)
+#include "Lib/SimulationExecutionPolicy.h"
+#endif
 
 
 //-------------------------------------------------------------------------------------------------
@@ -230,6 +235,10 @@ UpdateSleepTime AutoHealBehavior::update()
 	else
 	{
 		//EXPANDED SYSTEM -- HEAL FRIENDLIES IN RADIUS
+#if defined(_WIN64)
+		if( tryImmutableRadiusHeal() )
+			return UPDATE_SLEEP( d->m_singleBurst ? UPDATE_SLEEP_FOREVER : d->m_healingDelay );
+#endif
 		// setup scan filters
 		PartitionFilterRelationship relationship( obj, PartitionFilterRelationship::ALLOW_ALLIES );
 		PartitionFilterSameMapStatus filterMapStatus(obj);
@@ -249,32 +258,241 @@ UpdateSleepTime AutoHealBehavior::update()
 				{
 					if( !d->m_skipSelfForHealing || obj != getObject() )
 					{
-						pulseHealObject( obj );
-
-						if( d->m_singleBurst && TheGameLogic->getDrawIconUI() )
-						{
-							if( TheAnim2DCollection && TheGlobalData->m_getHealedAnimationName.isEmpty() == FALSE )
-							{
-								Anim2DTemplate *animTemplate = TheAnim2DCollection->findTemplate( TheGlobalData->m_getHealedAnimationName );
-
-								if ( animTemplate )
-								{
-									Coord3D iconPosition;
-									iconPosition.set(obj->getPosition()->x,
-																	 obj->getPosition()->y,
-																	 obj->getPosition()->z + obj->getGeometryInfo().getMaxHeightAbovePosition() );
-									TheInGameUI->addWorldAnimation( animTemplate,	&iconPosition, WORLD_ANIM_FADE_ON_EXPIRE,
-																									TheGlobalData->m_getHealedAnimationDisplayTimeInSeconds,
-																									TheGlobalData->m_getHealedAnimationZRisePerSecond);
-								}
-							}
-						}
+						pulseHealObjectWithRadiusUI( obj );
 					}
 				}
 			}
 		}
 
 		return UPDATE_SLEEP( d->m_singleBurst ? UPDATE_SLEEP_FOREVER : d->m_healingDelay );
+	}
+}
+
+#if defined(_WIN64)
+//-------------------------------------------------------------------------------------------------
+Bool AutoHealBehavior::canQueueImmutableSpatialQuery()
+{
+	const AutoHealBehaviorModuleData *d = getAutoHealBehaviorModuleData();
+	Object *healer = getObject();
+	if( m_stopped || !isUpgradeActive() || healer == nullptr ||
+		healer->isEffectivelyDead() || d->m_affectsWholePlayer ||
+		d->m_radius == 0.0f || ThePartitionManager == nullptr ||
+		TheGameLogic == nullptr || healer->getID() == INVALID_ID ||
+		healer->getPosition() == nullptr ||
+		TheGameLogic->findObjectByID( healer->getID() ) != healer ||
+		!IsLiveImmutableSpatialConsumerQueueable(
+			LIVE_IMMUTABLE_SPATIAL_HEALING ) )
+		return FALSE;
+	return TRUE;
+}
+
+//-------------------------------------------------------------------------------------------------
+Bool AutoHealBehavior::queueImmutableSpatialQuery()
+{
+	if( !canQueueImmutableSpatialQuery() )
+		return FALSE;
+	const AutoHealBehaviorModuleData *d = getAutoHealBehaviorModuleData();
+	Object *healer = getObject();
+	return QueueLiveImmutableSpatialQuery( this, ThePartitionManager,
+		healer->getPosition(), d->m_radius, TheGameLogic->getFrame(),
+		LIVE_IMMUTABLE_SPATIAL_HEALING );
+}
+
+//-------------------------------------------------------------------------------------------------
+Bool AutoHealBehavior::measureImmutableSpatialQueryCost(
+	UnsignedInt *cellVisits, UnsignedInt *memberVisits)
+{
+	if( !canQueueImmutableSpatialQuery() )
+		return FALSE;
+	const AutoHealBehaviorModuleData *d = getAutoHealBehaviorModuleData();
+	Object *healer = getObject();
+	return MeasureLiveImmutableSpatialQueryCost( ThePartitionManager,
+		healer->getPosition(), d->m_radius, cellVisits, memberVisits );
+}
+
+//-------------------------------------------------------------------------------------------------
+Bool AutoHealBehavior::tryImmutableRadiusHeal()
+{
+	const AutoHealBehaviorModuleData *d = getAutoHealBehaviorModuleData();
+	Object *healer = getObject();
+	LiveImmutableSpatialResultView view;
+	if( QueryLiveImmutableSpatialCandidates( this, ThePartitionManager,
+		healer->getPosition(), d->m_radius, TheGameLogic->getFrame(),
+		LIVE_IMMUTABLE_SPATIAL_HEALING, &view ) !=
+		LIVE_IMMUTABLE_SPATIAL_QUERY_SUCCESS )
+		return FALSE;
+
+	ObjectID *workerIDs = nullptr;
+	ObjectID *oracleIDs = nullptr;
+	UnsignedInt capacity = 0;
+	if( !GetLiveImmutableSpatialIDBuffers( &workerIDs, &oracleIDs, &capacity ) )
+	{
+		RecordLiveImmutableSpatialUnexpectedFallback(
+			LIVE_IMMUTABLE_SPATIAL_HEALING, FALSE, TRUE );
+		DisableLiveImmutableSpatialConsumer( LIVE_IMMUTABLE_SPATIAL_HEALING );
+		return FALSE;
+	}
+
+	const Real radiusSquared = d->m_radius * d->m_radius;
+	UnsignedInt workerCount = 0;
+	for( UnsignedInt index = 0; index != view.count; ++index )
+	{
+		Object *candidate = ResolveLiveImmutableSpatialResult( view.results[index] );
+		if( candidate == nullptr )
+		{
+			RecordLiveImmutableSpatialUnexpectedFallback(
+				LIVE_IMMUTABLE_SPATIAL_HEALING, TRUE, FALSE );
+			DisableLiveImmutableSpatialConsumer( LIVE_IMMUTABLE_SPATIAL_HEALING );
+			return FALSE;
+		}
+		if( healer->getRelationship( candidate ) != ALLIES )
+			continue;
+		if( candidate->isEffectivelyDead() )
+			continue;
+		if( candidate->isOffMap() != healer->isOffMap() )
+			continue;
+		BodyModuleInterface *body = candidate->getBodyModule();
+		if( body->getHealth() >= body->getMaxHealth() )
+			continue;
+		if( !candidate->isAnyKindOf( d->m_kindOf ) )
+			continue;
+		if( candidate->isAnyKindOf( d->m_forbiddenKindOf ) )
+			continue;
+		if( d->m_skipSelfForHealing && candidate == healer )
+			continue;
+		if( ThePartitionManager->getDistanceSquared( candidate,
+			healer->getPosition(), FROM_CENTER_2D ) >= radiusSquared )
+			continue;
+		if( workerCount == capacity )
+		{
+			RecordLiveImmutableSpatialUnexpectedFallback(
+				LIVE_IMMUTABLE_SPATIAL_HEALING, FALSE, TRUE );
+			DisableLiveImmutableSpatialConsumer( LIVE_IMMUTABLE_SPATIAL_HEALING );
+			return FALSE;
+		}
+		workerIDs[workerCount++] = candidate->getID();
+	}
+	if( !ValidateLiveImmutableSpatialResultView( view ) )
+	{
+		RecordLiveImmutableSpatialUnexpectedFallback(
+			LIVE_IMMUTABLE_SPATIAL_HEALING, TRUE, FALSE );
+		DisableLiveImmutableSpatialConsumer( LIVE_IMMUTABLE_SPATIAL_HEALING );
+		return FALSE;
+	}
+
+	ObjectID *commitIDs = workerIDs;
+	UnsignedInt commitCount = workerCount;
+	if( rts::UseSimulationShadowOracle() )
+	{
+		UnsignedInt oracleCount = 0;
+		PartitionFilterRelationship relationship( healer,
+			PartitionFilterRelationship::ALLOW_ALLIES );
+		PartitionFilterSameMapStatus filterMapStatus( healer );
+		PartitionFilterAlive filterAlive;
+		PartitionFilter *filters[] = { &relationship, &filterAlive,
+			&filterMapStatus, nullptr };
+		ObjectIterator *iter = ThePartitionManager->iterateObjectsInRange(
+			healer->getPosition(), d->m_radius, FROM_CENTER_2D, filters );
+		MemoryPoolObjectHolder hold( iter );
+		for( Object *candidate = iter->first(); candidate;
+			candidate = iter->next() )
+		{
+			BodyModuleInterface *body = candidate->getBodyModule();
+			if( body->getHealth() < body->getMaxHealth() )
+			{
+				if( candidate->isAnyKindOf( d->m_kindOf ) &&
+					!candidate->isAnyKindOf( d->m_forbiddenKindOf ) )
+				{
+					if( !d->m_skipSelfForHealing || candidate != healer )
+					{
+						if( oracleCount == capacity )
+						{
+							RecordLiveImmutableSpatialUnexpectedFallback(
+								LIVE_IMMUTABLE_SPATIAL_HEALING, FALSE, TRUE );
+							DisableLiveImmutableSpatialConsumer(
+								LIVE_IMMUTABLE_SPATIAL_HEALING );
+							return FALSE;
+						}
+						oracleIDs[oracleCount++] = candidate->getID();
+					}
+				}
+			}
+		}
+		Bool matched = workerCount == oracleCount;
+		for( UnsignedInt index = 0; matched && index != oracleCount; ++index )
+			matched = workerIDs[index] == oracleIDs[index];
+		RecordLiveImmutableSpatialShadowQuery(
+			LIVE_IMMUTABLE_SPATIAL_HEALING, matched );
+		if( !matched )
+			DisableLiveImmutableSpatialConsumer(
+				LIVE_IMMUTABLE_SPATIAL_HEALING );
+		commitIDs = oracleIDs;
+		commitCount = oracleCount;
+	}
+	Object **commitObjects = nullptr;
+	UnsignedInt commitCapacity = 0;
+	if( !GetLiveImmutableSpatialCommitBuffer( &commitObjects, &commitCapacity ) ||
+		commitCount > commitCapacity )
+	{
+		RecordLiveImmutableSpatialUnexpectedFallback(
+			LIVE_IMMUTABLE_SPATIAL_HEALING, FALSE, TRUE );
+		DisableLiveImmutableSpatialConsumer( LIVE_IMMUTABLE_SPATIAL_HEALING );
+		return FALSE;
+	}
+	for( UnsignedInt index = 0; index != commitCount; ++index )
+	{
+		commitObjects[index] = ResolveLiveImmutableSpatialObjectID(commitIDs[index]);
+		if( commitObjects[index] == nullptr )
+		{
+			RecordLiveImmutableSpatialUnexpectedFallback(
+				LIVE_IMMUTABLE_SPATIAL_HEALING, TRUE, FALSE );
+			DisableLiveImmutableSpatialConsumer( LIVE_IMMUTABLE_SPATIAL_HEALING );
+			return FALSE;
+		}
+	}
+	CommitLiveImmutableSpatialObjectSequence( commitObjects, commitCount,
+		&AutoHealBehavior::commitImmutableRadiusHealObject, this );
+	if( !rts::UseSimulationShadowOracle() )
+	{
+		RecordLiveImmutableSpatialAuthoritativeQuery(
+			LIVE_IMMUTABLE_SPATIAL_HEALING, workerCount );
+	}
+	return TRUE;
+}
+
+//-------------------------------------------------------------------------------------------------
+void AutoHealBehavior::commitImmutableRadiusHealObject(Object *obj,
+	void *context)
+{
+	static_cast<AutoHealBehavior *>(context)->pulseHealObjectWithRadiusUI(obj);
+}
+#endif
+
+//-------------------------------------------------------------------------------------------------
+void AutoHealBehavior::pulseHealObjectWithRadiusUI( Object *obj )
+{
+	pulseHealObject( obj );
+	const AutoHealBehaviorModuleData *d = getAutoHealBehaviorModuleData();
+	if( d->m_singleBurst && TheGameLogic->getDrawIconUI() )
+	{
+		if( TheAnim2DCollection &&
+			TheGlobalData->m_getHealedAnimationName.isEmpty() == FALSE )
+		{
+			Anim2DTemplate *animTemplate = TheAnim2DCollection->findTemplate(
+				TheGlobalData->m_getHealedAnimationName );
+			if( animTemplate )
+			{
+				Coord3D iconPosition;
+				iconPosition.set( obj->getPosition()->x,
+					obj->getPosition()->y,
+					obj->getPosition()->z +
+						obj->getGeometryInfo().getMaxHeightAbovePosition() );
+				TheInGameUI->addWorldAnimation( animTemplate, &iconPosition,
+					WORLD_ANIM_FADE_ON_EXPIRE,
+					TheGlobalData->m_getHealedAnimationDisplayTimeInSeconds,
+					TheGlobalData->m_getHealedAnimationZRisePerSecond );
+			}
+		}
 	}
 }
 

@@ -38,12 +38,17 @@
 #include "GameClient/Drawable.h"
 
 #include "GameLogic/GameLogic.h"
+#include "GameLogic/ImmutableSpatialQueryRuntime.h"
 #include "GameLogic/PartitionManager.h"
 #include "GameLogic/Object.h"
 #include "GameLogic/ObjectIter.h"
 #include "GameLogic/Module/PointDefenseLaserUpdate.h"
 #include "GameLogic/Module/PhysicsUpdate.h"
 #include "GameLogic/Weapon.h"
+
+#if defined(_WIN64)
+#include "Lib/SimulationExecutionPolicy.h"
+#endif
 
 
 
@@ -146,7 +151,7 @@ UpdateSleepTime PointDefenseLaserUpdate::update()
 	m_nextScanFrames = data->m_scanFrames;
 
 	//Periodic scanning (expensive)
-	if( scanClosestTarget() )
+	if( scanClosestTargetScheduled() )
 	{
 		//1 frame can make a big difference so fire ASAP!
 		fireWhenReady();
@@ -240,6 +245,13 @@ void PointDefenseLaserUpdate::fireWhenReady()
 //-------------------------------------------------------------------------------------------------
 Object* PointDefenseLaserUpdate::scanClosestTarget()
 {
+	return scanClosestTargetOwner( nullptr, 0, nullptr );
+}
+
+//-------------------------------------------------------------------------------------------------
+Object* PointDefenseLaserUpdate::scanClosestTargetOwner( ObjectID *orderedIDs,
+	UnsignedInt orderedCapacity, UnsignedInt *orderedCount )
+{
 	const PointDefenseLaserUpdateModuleData *data = getPointDefenseLaserUpdateModuleData();
 	Object *me = getObject();
 	Object *bestTargetOutOfRange[2] = { nullptr, nullptr };
@@ -283,6 +295,13 @@ Object* PointDefenseLaserUpdate::scanClosestTarget()
 		{
 			//We can't see it.
 			continue;
+		}
+
+		if( orderedCount != nullptr )
+		{
+			if( *orderedCount < orderedCapacity )
+				orderedIDs[*orderedCount] = other->getID();
+			++*orderedCount;
 		}
 
 		Real fDist = sqrt( ThePartitionManager->getDistanceSquared( me, other, FROM_CENTER_2D ) );
@@ -362,6 +381,216 @@ Object* PointDefenseLaserUpdate::scanClosestTarget()
 	m_inRange = false;
 	return nullptr;
 }
+
+//-------------------------------------------------------------------------------------------------
+Object* PointDefenseLaserUpdate::scanClosestTargetScheduled()
+{
+#if defined(_WIN64)
+	const PointDefenseLaserUpdateModuleData *data =
+		getPointDefenseLaserUpdateModuleData();
+	Object *me = getObject();
+	LiveImmutableSpatialResultView view;
+	if( QueryLiveImmutableSpatialCandidates( this, ThePartitionManager,
+		me->getPosition(), data->m_scanRange, TheGameLogic->getFrame(),
+		LIVE_IMMUTABLE_SPATIAL_POINT_DEFENSE_LASER, &view ) ==
+		LIVE_IMMUTABLE_SPATIAL_QUERY_SUCCESS )
+	{
+		ObjectID *workerIDs = nullptr;
+		ObjectID *oracleIDs = nullptr;
+		UnsignedInt capacity = 0;
+		if( !GetLiveImmutableSpatialIDBuffers( &workerIDs, &oracleIDs,
+			&capacity ) )
+		{
+			RecordLiveImmutableSpatialUnexpectedFallback(
+				LIVE_IMMUTABLE_SPATIAL_POINT_DEFENSE_LASER, FALSE, TRUE );
+			DisableLiveImmutableSpatialConsumer(
+				LIVE_IMMUTABLE_SPATIAL_POINT_DEFENSE_LASER );
+			return scanClosestTarget();
+		}
+
+		Object *bestTargetOutOfRange[2] = { nullptr, nullptr };
+		Object *bestTargetInRange[2] = { nullptr, nullptr };
+		Real closestDist[2];
+		Real closestOutsideRange[2];
+		WeaponBonus bonus;
+		bonus.clear();
+		const Real fireRange = data->m_weaponTemplate->getAttackRange( bonus );
+		const Real scanRangeSquared = data->m_scanRange * data->m_scanRange;
+		UnsignedInt workerCount = 0;
+		for( UnsignedInt resultIndex = 0; resultIndex != view.count;
+			++resultIndex )
+		{
+			Object *other = ResolveLiveImmutableSpatialResult(
+				view.results[resultIndex] );
+			if( other == nullptr )
+			{
+				RecordLiveImmutableSpatialUnexpectedFallback(
+					LIVE_IMMUTABLE_SPATIAL_POINT_DEFENSE_LASER, TRUE, FALSE );
+				DisableLiveImmutableSpatialConsumer(
+					LIVE_IMMUTABLE_SPATIAL_POINT_DEFENSE_LASER );
+				return scanClosestTarget();
+			}
+			Int targetIndex;
+			if( other->isAnyKindOf( data->m_primaryTargetKindOf ) )
+				targetIndex = 0;
+			else if( other->isAnyKindOf( data->m_secondaryTargetKindOf ) )
+				targetIndex = 1;
+			else
+				continue;
+			if( me->getRelationship( other ) != ENEMIES )
+				continue;
+			if( other->testStatus( OBJECT_STATUS_STEALTHED ) &&
+				!other->testStatus( OBJECT_STATUS_DETECTED ) )
+				continue;
+			if( ThePartitionManager->getDistanceSquared( other,
+				me->getPosition(), FROM_CENTER_2D ) >= scanRangeSquared )
+				continue;
+			if( workerCount == capacity )
+			{
+				RecordLiveImmutableSpatialUnexpectedFallback(
+					LIVE_IMMUTABLE_SPATIAL_POINT_DEFENSE_LASER, FALSE, TRUE );
+				DisableLiveImmutableSpatialConsumer(
+					LIVE_IMMUTABLE_SPATIAL_POINT_DEFENSE_LASER );
+				return scanClosestTarget();
+			}
+			workerIDs[workerCount++] = other->getID();
+
+			Real fDist = sqrt( ThePartitionManager->getDistanceSquared(
+				me, other, FROM_CENTER_2D ) );
+			if( fDist <= fireRange )
+			{
+				if( !bestTargetInRange[targetIndex] ||
+					fDist < closestDist[targetIndex] )
+				{
+					closestDist[targetIndex] = fDist;
+					bestTargetInRange[targetIndex] = other;
+				}
+			}
+			else if( !bestTargetInRange[targetIndex] )
+			{
+				if( data->m_velocityFactor != 0.0f &&
+					!other->isKindOf( KINDOF_IMMOBILE ) )
+				{
+					Coord3D pos;
+					PhysicsBehavior *physics = other->getPhysics();
+					if( physics )
+					{
+						pos.set( *physics->getVelocity() );
+						pos.scale( data->m_velocityFactor );
+						pos.add( *other->getPosition() );
+						// Preserve the legacy velocity-prediction no-op.
+						fDist = sqrt( ThePartitionManager->getDistanceSquared(
+							me, other, FROM_CENTER_2D ) );
+					}
+				}
+				if( !bestTargetOutOfRange[targetIndex] ||
+					fDist < closestOutsideRange[targetIndex] )
+				{
+					closestOutsideRange[targetIndex] = fDist;
+					bestTargetOutOfRange[targetIndex] = other;
+				}
+			}
+		}
+
+		if( !ValidateLiveImmutableSpatialResultView( view ) )
+		{
+			RecordLiveImmutableSpatialUnexpectedFallback(
+				LIVE_IMMUTABLE_SPATIAL_POINT_DEFENSE_LASER, TRUE, FALSE );
+			DisableLiveImmutableSpatialConsumer(
+				LIVE_IMMUTABLE_SPATIAL_POINT_DEFENSE_LASER );
+			return scanClosestTarget();
+		}
+
+		Object *workerTarget = bestTargetInRange[0] ? bestTargetInRange[0] :
+			(bestTargetInRange[1] ? bestTargetInRange[1] :
+			(bestTargetOutOfRange[0] ? bestTargetOutOfRange[0] :
+			bestTargetOutOfRange[1]));
+		const Bool workerInRange = bestTargetInRange[0] != nullptr ||
+			bestTargetInRange[1] != nullptr;
+		if( rts::UseSimulationShadowOracle() )
+		{
+			UnsignedInt oracleCount = 0;
+			Object *oracleTarget = scanClosestTargetOwner( oracleIDs, capacity,
+				&oracleCount );
+			Bool matched = oracleCount <= capacity &&
+				workerCount == oracleCount;
+			for( UnsignedInt index = 0; matched && index != oracleCount;
+				++index )
+				matched = workerIDs[index] == oracleIDs[index];
+			matched = matched &&
+				(workerTarget ? workerTarget->getID() : INVALID_ID) ==
+				(oracleTarget ? oracleTarget->getID() : INVALID_ID) &&
+				workerInRange == m_inRange;
+			RecordLiveImmutableSpatialShadowQuery(
+				LIVE_IMMUTABLE_SPATIAL_POINT_DEFENSE_LASER, matched );
+			if( !matched )
+				DisableLiveImmutableSpatialConsumer(
+					LIVE_IMMUTABLE_SPATIAL_POINT_DEFENSE_LASER );
+			return oracleTarget;
+		}
+
+		for( UnsignedInt index = 0; index != workerCount; ++index )
+		{
+			if( ResolveLiveImmutableSpatialObjectID( workerIDs[index] ) == nullptr )
+			{
+				RecordLiveImmutableSpatialUnexpectedFallback(
+					LIVE_IMMUTABLE_SPATIAL_POINT_DEFENSE_LASER, TRUE, FALSE );
+				DisableLiveImmutableSpatialConsumer(
+					LIVE_IMMUTABLE_SPATIAL_POINT_DEFENSE_LASER );
+				return scanClosestTarget();
+			}
+		}
+		m_bestTargetID = workerTarget ? workerTarget->getID() : INVALID_ID;
+		m_inRange = workerInRange;
+		RecordLiveImmutableSpatialAuthoritativeQuery(
+			LIVE_IMMUTABLE_SPATIAL_POINT_DEFENSE_LASER, workerCount );
+		return workerTarget;
+	}
+#endif
+	return scanClosestTarget();
+}
+
+#if defined(_WIN64)
+//-------------------------------------------------------------------------------------------------
+Bool PointDefenseLaserUpdate::canQueueImmutableSpatialQuery()
+{
+	Object *me = getObject();
+	if( me == nullptr || me->isEffectivelyDead() || m_nextScanFrames > 0 ||
+		ThePartitionManager == nullptr || TheGameLogic == nullptr ||
+		me->getID() == INVALID_ID || me->getPosition() == nullptr ||
+		TheGameLogic->findObjectByID( me->getID() ) != me ||
+		!IsLiveImmutableSpatialConsumerQueueable(
+			LIVE_IMMUTABLE_SPATIAL_POINT_DEFENSE_LASER ) )
+		return FALSE;
+	return TRUE;
+}
+
+//-------------------------------------------------------------------------------------------------
+Bool PointDefenseLaserUpdate::queueImmutableSpatialQuery()
+{
+	if( !canQueueImmutableSpatialQuery() )
+		return FALSE;
+	Object *me = getObject();
+	const PointDefenseLaserUpdateModuleData *data =
+		getPointDefenseLaserUpdateModuleData();
+	return QueueLiveImmutableSpatialQuery( this, ThePartitionManager,
+		me->getPosition(), data->m_scanRange, TheGameLogic->getFrame(),
+		LIVE_IMMUTABLE_SPATIAL_POINT_DEFENSE_LASER );
+}
+
+//-------------------------------------------------------------------------------------------------
+Bool PointDefenseLaserUpdate::measureImmutableSpatialQueryCost(
+	UnsignedInt *cellVisits, UnsignedInt *memberVisits)
+{
+	if( !canQueueImmutableSpatialQuery() )
+		return FALSE;
+	Object *me = getObject();
+	const PointDefenseLaserUpdateModuleData *data =
+		getPointDefenseLaserUpdateModuleData();
+	return MeasureLiveImmutableSpatialQueryCost( ThePartitionManager,
+		me->getPosition(), data->m_scanRange, cellVisits, memberVisits );
+}
+#endif
 
 // ------------------------------------------------------------------------------------------------
 /** CRC */

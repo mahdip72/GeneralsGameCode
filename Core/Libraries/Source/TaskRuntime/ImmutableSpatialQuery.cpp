@@ -960,6 +960,57 @@ ImmutableSpatialStatus BuildImmutableSpatialArena(
 	return IMMUTABLE_SPATIAL_SUCCESS;
 }
 
+ImmutableSpatialStatus RefreshImmutableSpatialArenaObjects(
+	void *arena, ImmutableSpatialUInt32 arenaCapacity,
+	const ImmutableSpatialGeneration &generation,
+	const ImmutableSpatialObjectRecord *objects,
+	ImmutableSpatialUInt32 objectCount)
+{
+	const ImmutableSpatialArenaHeader *existingHeader = 0;
+	if (!validateArenaHeader(arena, arenaCapacity, existingHeader))
+		return IMMUTABLE_SPATIAL_MALFORMED_ARENA;
+	if (objectCount != existingHeader->objectCount ||
+		(objectCount != 0 && objects == 0))
+		return IMMUTABLE_SPATIAL_INVALID_ARGUMENT;
+
+	ImmutableSpatialUInt32 previousObjectID = 0;
+	for (ImmutableSpatialUInt32 index = 0; index != objectCount; ++index)
+	{
+		const ImmutableSpatialObjectRecord &object = objects[index];
+		if (object.objectID == 0 || object.objectID <= previousObjectID ||
+			!finiteFloat(object.positionX) ||
+			!finiteFloat(object.positionY) ||
+			!finiteFloat(object.positionZ) ||
+			!finiteFloat(object.boundingCircleRadius) ||
+			!finiteFloat(object.boundingSphereRadius) ||
+			!finiteFloat(object.zCenterOffset) ||
+			object.boundingCircleRadius < 0.0f ||
+			object.boundingSphereRadius < 0.0f)
+			return IMMUTABLE_SPATIAL_INVALID_ARGUMENT;
+		previousObjectID = object.objectID;
+	}
+
+	size_t objectBytes = 0;
+	if (!checkedByteCount(objectCount,
+		sizeof(ImmutableSpatialObjectRecord), objectBytes))
+		return IMMUTABLE_SPATIAL_OVERFLOW;
+	const MemoryRegion regions[] = {
+		{ arena, existingHeader->arenaBytes },
+		{ objects, objectBytes }
+	};
+	if (!regionsAreDisjoint(regions, sizeof(regions) / sizeof(regions[0])))
+		return IMMUTABLE_SPATIAL_INVALID_ARGUMENT;
+
+	ImmutableSpatialArenaHeader refreshedHeader = *existingHeader;
+	refreshedHeader.generation = generation;
+	refreshedHeader.validationToken = arenaValidationToken(refreshedHeader);
+	unsigned char *base = static_cast<unsigned char *>(arena);
+	if (objectBytes != 0)
+		memcpy(base + refreshedHeader.objectOffset, objects, objectBytes);
+	memcpy(base, &refreshedHeader, sizeof(refreshedHeader));
+	return IMMUTABLE_SPATIAL_SUCCESS;
+}
+
 bool ValidateImmutableSpatialArena(const void *arena,
 	ImmutableSpatialUInt32 arenaCapacity)
 {

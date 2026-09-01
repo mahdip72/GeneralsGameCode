@@ -76,8 +76,17 @@ public:
 
 	Object* scanClosestTarget();
 	void fireWhenReady();
+#if defined(_WIN64)
+	Bool canQueueImmutableSpatialQuery();
+	Bool measureImmutableSpatialQueryCost(UnsignedInt *cellVisits,
+		UnsignedInt *memberVisits);
+	Bool queueImmutableSpatialQuery();
+#endif
 
 protected:
+	Object* scanClosestTargetScheduled();
+	Object* scanClosestTargetOwner( ObjectID *orderedIDs,
+		UnsignedInt orderedCapacity, UnsignedInt *orderedCount );
 
 	ObjectID m_bestTargetID;
 	Bool m_inRange;
