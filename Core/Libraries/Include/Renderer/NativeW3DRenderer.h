@@ -35,8 +35,8 @@ struct NativeDrawPacket
 	unsigned int vertexOffset;
 	unsigned int indexOffset;
 	RenderFormat indexFormat;
-	LegacyVertexFormat vertexFormat;
-	LegacyVertexLayout vertexLayout;
+	RenderVertexFormat vertexFormat;
+	RenderVertexLayout vertexLayout;
 	RenderPrimitiveTopology topology;
 	unsigned int texturePresenceMask;
 	unsigned int vertexCount;
@@ -65,6 +65,7 @@ public:
 	// than releasing backend state from an arbitrary caller.
 	RenderResult Shutdown();
 	RenderResult BeginFrame();
+	RenderResult SetViewport(const RenderViewport &viewport);
 	RenderResult Submit(const NativeW3DResources &resources,
 		const LegacyLogicalState &state,
 		const NativeDrawPacket &packet);

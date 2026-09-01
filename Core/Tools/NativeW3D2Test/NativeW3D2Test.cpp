@@ -122,11 +122,22 @@ int main()
 		rts::render::NativeDrawPacket packet;
 		ConfigurePacket(&packet, vertexBuffer);
 		rts::render::LegacyLogicalState state;
+		const rts::render::RenderViewport viewport(0.0f, 0.0f, 64.0f,
+			64.0f, 0.0f, 1.0f);
 		result |= Check(w3d.Renderer().BeginFrame() == rts::render::RENDER_RESULT_OK,
 			"native WW3D2 begins a hidden frame");
+		result |= Check(w3d.Renderer().SetViewport(viewport) ==
+			rts::render::RENDER_RESULT_OK,
+			"native WW3D2 applies a neutral viewport descriptor");
 		result |= Check(w3d.Renderer().Submit(w3d.Resources(), state, packet) ==
 			rts::render::RENDER_RESULT_OK,
 			"native WW3D2 submits a triangle through the logical facade");
+		rts::render::NativeDrawPacket invalidLayoutPacket = packet;
+		invalidLayoutPacket.vertexLayout.elementCount =
+			rts::render::RenderVertexLayout::MAX_ELEMENT_COUNT + 1;
+		result |= Check(w3d.Renderer().Submit(w3d.Resources(), state,
+			invalidLayoutPacket) == rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+			"native WW3D2 bounds neutral vertex layout descriptors");
 		result |= Check(w3d.Renderer().EndFrame(true) == rts::render::RENDER_RESULT_OK,
 			"native WW3D2 presents a hidden D3D11 frame");
 		result |= Check(w3d.Renderer().RecoverDevice() == rts::render::RENDER_RESULT_OK,

@@ -355,13 +355,17 @@ private:
 	unsigned int m_failureCount;
 };
 
-enum LegacyVertexFormat
+enum RenderVertexFormat
 {
 	RENDER_VERTEX_POSITION3_COLOR = 1,
 	RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1 = 2
 };
 
-enum LegacyVertexSemantic
+// Temporary source-compatible spellings for the legacy backend.  Remove them
+// after that adapter consumes the neutral descriptor types directly.
+typedef RenderVertexFormat LegacyVertexFormat;
+
+enum RenderVertexSemantic
 {
 	RENDER_VERTEX_SEMANTIC_POSITION,
 	RENDER_VERTEX_SEMANTIC_NORMAL,
@@ -370,7 +374,9 @@ enum LegacyVertexSemantic
 	RENDER_VERTEX_SEMANTIC_TEXTURE_COORDINATE
 };
 
-enum LegacyVertexDataFormat
+typedef RenderVertexSemantic LegacyVertexSemantic;
+
+enum RenderVertexDataFormat
 {
 	RENDER_VERTEX_DATA_FLOAT1,
 	RENDER_VERTEX_DATA_FLOAT2,
@@ -378,6 +384,10 @@ enum LegacyVertexDataFormat
 	RENDER_VERTEX_DATA_FLOAT4,
 	RENDER_VERTEX_DATA_COLOR_BGRA8
 };
+
+// Compatibility spelling for the existing backend adapter.  The native API
+// above remains the source of truth and carries no API-specific FVF value.
+typedef RenderVertexDataFormat LegacyVertexDataFormat;
 
 struct LegacyVertexElement
 {
@@ -403,12 +413,59 @@ struct LegacyVertexLayout
 	LegacyVertexElement elements[MAX_ELEMENT_COUNT];
 };
 
+// Backend-neutral description of one vertex stream.  Keep this independent of
+// LegacyVertexLayout so native consumers can be compiled without the legacy
+// FVF adapter.
+struct RenderVertexElement
+{
+	RenderVertexElement() : semantic(RENDER_VERTEX_SEMANTIC_POSITION),
+		semanticIndex(0), format(RENDER_VERTEX_DATA_FLOAT3), byteOffset(0) {}
+
+	RenderVertexSemantic semantic;
+	unsigned int semanticIndex;
+	RenderVertexDataFormat format;
+	unsigned int byteOffset;
+};
+
+struct RenderVertexLayout
+{
+	enum { MAX_ELEMENT_COUNT = 12 };
+
+	RenderVertexLayout() : stride(0), elementCount(0), preTransformed(false) {}
+
+	unsigned int stride;
+	unsigned int elementCount;
+	// Pre-transformed positions are already in viewport space.
+	bool preTransformed;
+	RenderVertexElement elements[MAX_ELEMENT_COUNT];
+};
+
 enum RenderPrimitiveTopology
 {
 	RENDER_PRIMITIVE_TRIANGLE_LIST,
 	RENDER_PRIMITIVE_TRIANGLE_STRIP,
 	RENDER_PRIMITIVE_LINE_LIST,
 	RENDER_PRIMITIVE_LINE_STRIP
+};
+
+// Coordinates and dimensions are pixels; depth remains in the neutral [0, 1]
+// renderer range.  The descriptor deliberately uses floats so conversion from
+// integer legacy viewports preserves the existing backend call exactly.
+struct RenderViewport
+{
+	RenderViewport() : x(0.0f), y(0.0f), width(0.0f), height(0.0f),
+		minimumDepth(0.0f), maximumDepth(1.0f) {}
+	RenderViewport(float xValue, float yValue, float widthValue,
+		float heightValue, float minimumDepthValue, float maximumDepthValue) :
+		x(xValue), y(yValue), width(widthValue), height(heightValue),
+		minimumDepth(minimumDepthValue), maximumDepth(maximumDepthValue) {}
+
+	float x;
+	float y;
+	float width;
+	float height;
+	float minimumDepth;
+	float maximumDepth;
 };
 
 enum RenderClearFlags

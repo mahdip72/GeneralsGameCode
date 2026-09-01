@@ -9,6 +9,25 @@ namespace rts
 {
 namespace render
 {
+namespace
+{
+void PopulateLegacyLayout(const RenderVertexLayout &source,
+	LegacyVertexLayout &destination)
+{
+	destination.stride = source.stride;
+	destination.elementCount = source.elementCount;
+	destination.preTransformed = source.preTransformed;
+	for (unsigned int index = 0; index < source.elementCount; ++index)
+	{
+		destination.elements[index].semantic = source.elements[index].semantic;
+		destination.elements[index].semanticIndex =
+			source.elements[index].semanticIndex;
+		destination.elements[index].format = source.elements[index].format;
+		destination.elements[index].byteOffset = source.elements[index].byteOffset;
+	}
+}
+}
+
 NativeW3DRendererDescriptor::NativeW3DRendererDescriptor() :
 	width(0), height(0), adapterIndex(UINT_MAX), enableDebugLayer(false),
 	enableVsync(true), allowSoftwareFallback(true)
@@ -149,6 +168,17 @@ RenderResult NativeW3DRenderer::BeginFrame()
 	return result;
 }
 
+RenderResult NativeW3DRenderer::SetViewport(const RenderViewport &viewport)
+{
+	IRenderContext *context = m_state == 0 ? 0 : m_state->Context();
+	if (context == 0 || !m_frameOpen || !IsOwnerThread())
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	return context->setViewport(viewport.x, viewport.y, viewport.width,
+		viewport.height, viewport.minimumDepth, viewport.maximumDepth);
+}
+
 RenderResult NativeW3DRenderer::Submit(const NativeW3DResources &resources,
 	const LegacyLogicalState &state,
 	const NativeDrawPacket &packet)
@@ -157,7 +187,8 @@ RenderResult NativeW3DRenderer::Submit(const NativeW3DResources &resources,
 	if (context == 0 || !m_frameOpen || !IsOwnerThread() || !resources.IsBoundTo(this) ||
 		!packet.vertexBuffer.isValid() ||
 		packet.vertexStride == 0 || packet.vertexLayout.stride != packet.vertexStride ||
-		packet.vertexCount == 0)
+		packet.vertexCount == 0 ||
+		packet.vertexLayout.elementCount > RenderVertexLayout::MAX_ELEMENT_COUNT)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
@@ -182,8 +213,12 @@ RenderResult NativeW3DRenderer::Submit(const NativeW3DResources &resources,
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 	}
+	// Temporary compatibility seam: the native packet remains backend-neutral
+	// while the legacy context interface is migrated by a later package.
+	LegacyVertexLayout legacyLayout;
+	PopulateLegacyLayout(packet.vertexLayout, legacyLayout);
 	RenderResult result = context->setLegacyStateForLayout(state,
-		packet.vertexLayout, packet.texturePresenceMask);
+		legacyLayout, packet.texturePresenceMask);
 	if (result != RENDER_RESULT_OK)
 	{
 		return result;

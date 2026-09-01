@@ -51,9 +51,9 @@
 ** The D3DFORMAT functions below are intentionally kept as a small DX8
 ** compatibility adapter.  New renderer code should consume the descriptor
 ** and RenderFormat helpers instead of carrying D3DFORMAT values across a
-** renderer boundary.  The descriptor explicitly records when D3D11 needs a
-** CPU expansion; silently treating every legacy format as a native texture is
-** unsafe and can produce black or missing textures.
+** renderer boundary.  The descriptor explicitly records when a native upload
+** needs a CPU expansion; silently treating every legacy format as a native
+** texture is unsafe and can produce black or missing textures.
 */
 
 enum WW3DFormatDescriptorFlags
@@ -61,8 +61,8 @@ enum WW3DFormatDescriptorFlags
 	WW3D_FORMAT_DESCRIPTOR_NONE = 0,
 	WW3D_FORMAT_DESCRIPTOR_COMPRESSED = 1 << 0,
 	WW3D_FORMAT_DESCRIPTOR_SIGNED_NORMALIZED = 1 << 1,
-	WW3D_FORMAT_DESCRIPTOR_D3D11_NATIVE = 1 << 2,
-	WW3D_FORMAT_DESCRIPTOR_D3D11_CPU_CONVERSION = 1 << 3
+	WW3D_FORMAT_DESCRIPTOR_RENDER_NATIVE = 1 << 2,
+	WW3D_FORMAT_DESCRIPTOR_REQUIRES_CPU_CONVERSION = 1 << 3
 };
 
 struct WW3DFormatDescriptor
@@ -73,7 +73,7 @@ struct WW3DFormatDescriptor
 	unsigned int blockHeight;
 	unsigned int blockBytes;
 	unsigned int flags;
-	rts::render::RenderFormat d3d11Format;
+	rts::render::RenderFormat renderFormat;
 };
 
 /* Returns false for WW3D_FORMAT_UNKNOWN or an out-of-range value. */
@@ -81,7 +81,7 @@ bool Try_Get_WW3DFormat_Descriptor(WW3DFormat format,
 	WW3DFormatDescriptor *descriptor);
 
 /*
-** Resolve a logical format to the neutral renderer format used by D3D11.
+** Resolve a logical format to the neutral renderer upload format.
 ** requires_cpu_conversion is true when the source bytes must be expanded or
 ** decoded before uploading (for example R5G6B5 or DXT textures); pass null
 ** when that detail is not needed.  A false return means there is no safe
