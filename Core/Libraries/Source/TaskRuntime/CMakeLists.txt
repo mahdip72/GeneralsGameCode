@@ -8,6 +8,7 @@ target_sources(core_task_runtime PRIVATE
     SimulationReadView.cpp
     ObjectComputationIsland.cpp
     SimulationPhaseGraph.cpp
+    SimulationPhaseGraphOwnerAdapter.cpp
     DeterministicCrcStream.cpp
     PhysicsIntegrationKernel.cpp
     ObjectStatusTimerKernel.cpp
