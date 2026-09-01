@@ -312,6 +312,35 @@ SimulationPhaseGraphConfigurationStatus configureSinglePhase(Fixture &fixture,
 	return fixture.graph.configure(&phase, 1, definitions.data(), jobCount);
 }
 
+SimulationPhaseGraphConfigurationStatus configureDiagnosticShape(
+	Fixture &fixture, bool twoPhases)
+{
+	initializeInput(fixture, 0, 5);
+	SimulationPhaseDefinition phases[2] = {
+		{ 5, nullptr, 0, &fixture.inputs[0], sizeof(PhaseInput) },
+		{}
+	};
+	SimulationPhaseJobDefinition definitions[2] = {
+		jobDefinition(5, 0, fixture.outputs[0]),
+		{}
+	};
+	unsigned phaseCount = 1;
+	unsigned jobCount = 1;
+	if (twoPhases)
+	{
+		initializeInput(fixture, 1, 10);
+		phases[0] = { 10, nullptr, 0, &fixture.inputs[0],
+			sizeof(PhaseInput) };
+		phases[1] = { 20, nullptr, 0, &fixture.inputs[1],
+			sizeof(PhaseInput) };
+		definitions[0] = jobDefinition(10, 0, fixture.outputs[0]);
+		definitions[1] = jobDefinition(20, 0, fixture.outputs[1]);
+		phaseCount = 2;
+		jobCount = 2;
+	}
+	return fixture.graph.configure(phases, phaseCount, definitions, jobCount);
+}
+
 bool executeUntilTerminal(Fixture &fixture, unsigned workerCount)
 {
 	for (unsigned iteration = 0; iteration < 64; ++iteration)
@@ -999,8 +1028,12 @@ void testSnapshotResetPublicationIsConsistent()
 	executeAllClaimed(fixture, SimulationPhaseExecutionIdentity::ownerHelp());
 	fixture.graph.advanceOwner();
 	std::atomic<bool> stop{ false };
+	std::atomic<bool> readerStarted{ false };
+	std::atomic<bool> observeGraphDiagnostics{ false };
 	std::atomic<unsigned> invalidSnapshots{ 0 };
+	std::atomic<unsigned> graphObservations{ 0 };
 	std::thread reader([&]() {
+		readerStarted.store(true, std::memory_order_seq_cst);
 		while (!stop.load(std::memory_order_seq_cst))
 		{
 			SimulationPhaseJobSnapshot snapshot;
@@ -1019,10 +1052,71 @@ void testSnapshotResetPublicationIsConsistent()
 				snapshot.state == SIMULATION_PHASE_JOB_COMMITTED;
 			if (terminal != snapshot.executionIdentity.isValid())
 				invalidSnapshots.fetch_add(1, std::memory_order_relaxed);
+			if (observeGraphDiagnostics.load(std::memory_order_seq_cst))
+			{
+				const unsigned generationBefore = fixture.graph.generation();
+				const unsigned epoch = fixture.graph.internalEpoch();
+				const unsigned generationAfter = fixture.graph.generation();
+				if (generationBefore == 0 || generationBefore > 128 ||
+					generationAfter == 0 || generationAfter > 128 ||
+					epoch < 2 || epoch > 129 ||
+					(generationBefore == generationAfter &&
+					 epoch != generationBefore + 1))
+				{
+					invalidSnapshots.fetch_add(1,
+						std::memory_order_relaxed);
+				}
+				if (fixture.graph.phaseCount() != 1 ||
+					fixture.graph.jobCount() != 1 ||
+					fixture.graph.phaseIdAt(0) != 5 ||
+					fixture.graph.phaseIdAt(1) !=
+						SIMULATION_PHASE_INVALID_ID)
+				{
+					invalidSnapshots.fetch_add(1,
+						std::memory_order_relaxed);
+				}
+				const SimulationPhaseNodeState phaseState =
+					fixture.graph.phaseState(5);
+				if (phaseState < SIMULATION_PHASE_NODE_BLOCKED ||
+					phaseState > SIMULATION_PHASE_NODE_STALE_GENERATION)
+				{
+					invalidSnapshots.fetch_add(1,
+						std::memory_order_relaxed);
+				}
+				const unsigned quiescentGenerationBefore =
+					fixture.graph.generation();
+				const SimulationPhaseGraphState stateBefore =
+					fixture.graph.state();
+				if (stateBefore != SIMULATION_PHASE_GRAPH_READY &&
+					stateBefore != SIMULATION_PHASE_GRAPH_RUNNING &&
+					stateBefore != SIMULATION_PHASE_GRAPH_COMPLETED)
+				{
+					invalidSnapshots.fetch_add(1,
+						std::memory_order_relaxed);
+				}
+				const bool quiescent = fixture.graph.isQuiescent();
+				const SimulationPhaseGraphState stateAfter =
+					fixture.graph.state();
+				const unsigned quiescentGenerationAfter =
+					fixture.graph.generation();
+				if (quiescentGenerationBefore == quiescentGenerationAfter &&
+					stateBefore == SIMULATION_PHASE_GRAPH_COMPLETED &&
+					stateAfter == SIMULATION_PHASE_GRAPH_COMPLETED &&
+					!quiescent)
+				{
+					invalidSnapshots.fetch_add(1,
+						std::memory_order_relaxed);
+				}
+				graphObservations.fetch_add(1, std::memory_order_relaxed);
+			}
 		}
 	});
+	while (!readerStarted.load(std::memory_order_seq_cst))
+		std::this_thread::yield();
 	for (unsigned generation = 2; generation <= 128; ++generation)
 	{
+		if (generation == 2)
+			observeGraphDiagnostics.store(true, std::memory_order_seq_cst);
 		expect(fixture.graph.reset(generation),
 			"snapshot stress generation resets");
 		SimulationPhaseJobTicket ticket;
@@ -1032,11 +1126,124 @@ void testSnapshotResetPublicationIsConsistent()
 				SIMULATION_PHASE_WORK_SUCCEEDED &&
 			fixture.graph.advanceOwner(),
 			"snapshot stress generation completes");
+		if (generation == 2)
+		{
+			while (graphObservations.load(std::memory_order_relaxed) == 0)
+				std::this_thread::yield();
+		}
 	}
+	observeGraphDiagnostics.store(false, std::memory_order_seq_cst);
 	stop.store(true, std::memory_order_seq_cst);
 	reader.join();
 	expect(invalidSnapshots.load(std::memory_order_relaxed) == 0,
 		"snapshot never mixes reset generations or identity publication");
+	expect(graphObservations.load(std::memory_order_relaxed) != 0,
+		"graph diagnostics are observed during reset activity");
+}
+
+void testGraphDiagnosticsAreSafeDuringResetAndReconfigure()
+{
+	Fixture fixture;
+	expect(configureDiagnosticShape(fixture, false) ==
+			SIMULATION_PHASE_GRAPH_CONFIGURATION_VALID &&
+		fixture.graph.reset(1),
+		"graph diagnostic stress fixture starts");
+	executeAllClaimed(fixture, SimulationPhaseExecutionIdentity::ownerHelp());
+	expect(fixture.graph.advanceOwner() &&
+		fixture.graph.state() == SIMULATION_PHASE_GRAPH_COMPLETED,
+		"graph diagnostic stress fixture completes its first generation");
+
+	std::atomic<bool> stop{ false };
+	std::atomic<bool> readerStarted{ false };
+	std::atomic<bool> observeGraphDiagnostics{ false };
+	std::atomic<unsigned> invalidDiagnostics{ 0 };
+	std::atomic<unsigned> graphObservations{ 0 };
+	std::thread reader([&]() {
+		readerStarted.store(true, std::memory_order_seq_cst);
+		while (!stop.load(std::memory_order_seq_cst))
+		{
+			if (!observeGraphDiagnostics.load(std::memory_order_seq_cst))
+			{
+				std::this_thread::yield();
+				continue;
+			}
+			const unsigned generation = fixture.graph.generation();
+			if (generation > 96)
+				invalidDiagnostics.fetch_add(1, std::memory_order_relaxed);
+			const unsigned epoch = fixture.graph.internalEpoch();
+			if (epoch < 2 || epoch > 192)
+				invalidDiagnostics.fetch_add(1, std::memory_order_relaxed);
+			const unsigned phaseCount = fixture.graph.phaseCount();
+			if (phaseCount != 1 && phaseCount != 2)
+				invalidDiagnostics.fetch_add(1, std::memory_order_relaxed);
+			const unsigned jobCount = fixture.graph.jobCount();
+			if (jobCount != 1 && jobCount != 2)
+				invalidDiagnostics.fetch_add(1, std::memory_order_relaxed);
+			const SimulationPhaseId firstPhase = fixture.graph.phaseIdAt(0);
+			if (firstPhase != 5 && firstPhase != 10)
+				invalidDiagnostics.fetch_add(1, std::memory_order_relaxed);
+			const SimulationPhaseId secondPhase = fixture.graph.phaseIdAt(1);
+			if (secondPhase != SIMULATION_PHASE_INVALID_ID && secondPhase != 20)
+				invalidDiagnostics.fetch_add(1, std::memory_order_relaxed);
+			const SimulationPhaseNodeState firstState =
+				fixture.graph.phaseState(firstPhase);
+			if (firstState < SIMULATION_PHASE_NODE_BLOCKED ||
+				firstState > SIMULATION_PHASE_NODE_STALE_GENERATION)
+			{
+				invalidDiagnostics.fetch_add(1, std::memory_order_relaxed);
+			}
+			const unsigned quiescentEpochBefore =
+				fixture.graph.internalEpoch();
+			const SimulationPhaseGraphState stateBefore =
+				fixture.graph.state();
+			const bool quiescent = fixture.graph.isQuiescent();
+			const SimulationPhaseGraphState stateAfter =
+				fixture.graph.state();
+			const unsigned quiescentEpochAfter =
+				fixture.graph.internalEpoch();
+			if (quiescentEpochBefore == quiescentEpochAfter &&
+				stateBefore == stateAfter &&
+				(stateBefore == SIMULATION_PHASE_GRAPH_CONFIGURED ||
+				 stateBefore == SIMULATION_PHASE_GRAPH_COMPLETED) &&
+				!quiescent)
+			{
+				invalidDiagnostics.fetch_add(1, std::memory_order_relaxed);
+			}
+			graphObservations.fetch_add(1, std::memory_order_relaxed);
+			std::this_thread::yield();
+		}
+	});
+	while (!readerStarted.load(std::memory_order_seq_cst))
+		std::this_thread::yield();
+
+	for (unsigned generation = 2; generation <= 96; ++generation)
+	{
+		if (generation == 2)
+			observeGraphDiagnostics.store(true, std::memory_order_seq_cst);
+		const bool configured = configureDiagnosticShape(fixture,
+			(generation & 1u) == 0) ==
+				SIMULATION_PHASE_GRAPH_CONFIGURATION_VALID;
+		const bool reset = configured && fixture.graph.reset(generation);
+		expect(reset, "graph diagnostic stress reconfigures and resets");
+		if (!reset) break;
+		executeAllClaimed(fixture,
+			SimulationPhaseExecutionIdentity::ownerHelp());
+		expect(fixture.graph.advanceOwner() &&
+			fixture.graph.state() == SIMULATION_PHASE_GRAPH_COMPLETED,
+			"graph diagnostic stress generation completes");
+		if (generation == 2)
+		{
+			while (graphObservations.load(std::memory_order_relaxed) == 0)
+				std::this_thread::yield();
+		}
+	}
+	observeGraphDiagnostics.store(false, std::memory_order_seq_cst);
+	stop.store(true, std::memory_order_seq_cst);
+	reader.join();
+	expect(invalidDiagnostics.load(std::memory_order_relaxed) == 0,
+		"graph diagnostics never expose a partial reset or configuration");
+	expect(graphObservations.load(std::memory_order_relaxed) != 0,
+		"graph diagnostics are observed during reconfiguration activity");
 }
 
 SimulationPhaseGraphConfigurationStatus configureStoragePairAlias(
@@ -1348,6 +1555,7 @@ int main()
 	testAdvanceOwnerReentrancyFailsClosed();
 	testMixedTerminalPrecedenceIsCanonical();
 	testSnapshotResetPublicationIsConsistent();
+	testGraphDiagnosticsAreSafeDuringResetAndReconfigure();
 	testGraphValidation();
 
 	if (g_failures != 0)

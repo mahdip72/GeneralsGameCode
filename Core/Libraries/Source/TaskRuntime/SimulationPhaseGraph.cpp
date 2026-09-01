@@ -540,7 +540,8 @@ SimulationPhaseGraphConfigurationStatus SimulationPhaseGraph::configure(
 	{
 		return SIMULATION_PHASE_GRAPH_INVALID_ARGUMENT;
 	}
-	if (!isQuiescent()) return SIMULATION_PHASE_GRAPH_INVALID_ARGUMENT;
+	if (!isQuiescentUnlocked())
+		return SIMULATION_PHASE_GRAPH_INVALID_ARGUMENT;
 	const SimulationPhaseGraphState current = state();
 	if (current != SIMULATION_PHASE_GRAPH_UNCONFIGURED &&
 		current != SIMULATION_PHASE_GRAPH_CONFIGURED &&
@@ -871,7 +872,7 @@ bool SimulationPhaseGraph::reset(unsigned generationValue)
 	ScopedAtomicLock controlLock(&m_controlLock);
 	if (generationValue == 0 ||
 		generationValue <= m_lastGeneration || m_phaseCount == 0 ||
-		!isQuiescent())
+		!isQuiescentUnlocked())
 	{
 		return false;
 	}
@@ -1249,11 +1250,13 @@ SimulationPhaseGraphState SimulationPhaseGraph::state() const
 
 unsigned SimulationPhaseGraph::generation() const
 {
+	ScopedAtomicLock controlLock(&m_controlLock);
 	return m_generation;
 }
 
 unsigned SimulationPhaseGraph::internalEpoch() const
 {
+	ScopedAtomicLock controlLock(&m_controlLock);
 	return m_internalEpoch;
 }
 
@@ -1272,15 +1275,23 @@ SimulationPhaseWorkStatus SimulationPhaseGraph::terminalCause() const
 
 unsigned SimulationPhaseGraph::phaseCount() const
 {
+	ScopedAtomicLock controlLock(&m_controlLock);
 	return m_phaseCount;
 }
 
 unsigned SimulationPhaseGraph::jobCount() const
 {
+	ScopedAtomicLock controlLock(&m_controlLock);
 	return m_jobCount;
 }
 
 bool SimulationPhaseGraph::isQuiescent() const
+{
+	ScopedAtomicLock controlLock(&m_controlLock);
+	return isQuiescentUnlocked();
+}
+
+bool SimulationPhaseGraph::isQuiescentUnlocked() const
 {
 	if (AtomicLoad(&m_activeExecutors) != 0) return false;
 	unsigned jobOrdinal;
@@ -1301,6 +1312,7 @@ bool SimulationPhaseGraph::isQuiescent() const
 SimulationPhaseId SimulationPhaseGraph::phaseIdAt(
 	unsigned topologicalOrdinal) const
 {
+	ScopedAtomicLock controlLock(&m_controlLock);
 	return topologicalOrdinal < m_phaseCount ?
 		m_nodes[topologicalOrdinal].m_id : SIMULATION_PHASE_INVALID_ID;
 }
@@ -1308,6 +1320,7 @@ SimulationPhaseId SimulationPhaseGraph::phaseIdAt(
 SimulationPhaseNodeState SimulationPhaseGraph::phaseState(
 	SimulationPhaseId phaseId) const
 {
+	ScopedAtomicLock controlLock(&m_controlLock);
 	const unsigned ordinal = findPhaseOrdinal(phaseId);
 	return ordinal < m_phaseCount ? static_cast<SimulationPhaseNodeState>(
 		AtomicLoad(&m_nodes[ordinal].m_state)) : SIMULATION_PHASE_NODE_BLOCKED;
@@ -1350,7 +1363,7 @@ bool SimulationPhaseGraph::forceInternalEpochExhaustionForTest()
 {
 	if (!isOwner()) return false;
 	ScopedAtomicLock controlLock(&m_controlLock);
-	if (!isQuiescent()) return false;
+	if (!isQuiescentUnlocked()) return false;
 	m_internalEpoch = ~0u;
 	return true;
 }

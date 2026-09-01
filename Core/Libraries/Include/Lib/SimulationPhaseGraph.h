@@ -351,6 +351,7 @@ private:
 	SimulationPhaseGraph &operator=(const SimulationPhaseGraph &);
 
 	bool isOwner() const;
+	bool isQuiescentUnlocked() const;
 	bool cancellationRequested(unsigned generation,
 		unsigned internalEpoch) const;
 	unsigned findPhaseOrdinal(SimulationPhaseId phaseId) const;
