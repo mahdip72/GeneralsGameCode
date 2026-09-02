@@ -120,10 +120,6 @@ class VideoBuffer
 		virtual	Bool		allocate( UnsignedInt width, UnsignedInt Height ) = 0; ///< Allocate buffer
 		virtual void		free() = 0;			///< Free the buffer
 		virtual	void*		lock() = 0;			///< Returns memory pointer to start of buffer
-		// Optional renderer publication while the buffer remains locked. Writers
-		// call this only after producing a complete opaque BGRA8 frame; false keeps
-		// the normal unlock/invalidation path for other formats and backends.
-		virtual Bool		publishLockedFrame() { return FALSE; }
 		virtual void		unlock() = 0;		///< Release buffer
 		virtual Bool		valid() = 0;		///< Is the buffer valid to use
 

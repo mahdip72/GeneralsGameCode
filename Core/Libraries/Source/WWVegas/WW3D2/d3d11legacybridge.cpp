@@ -17,6 +17,7 @@
 #include "Renderer/LegacyBridgeValidation.h"
 #include "Renderer/LegacyFvfLayout.h"
 #include "Renderer/LegacyRenderState.h"
+#include "Renderer/RenderTexturePublication.h"
 #include "Renderer/RendererDevice.h"
 #if defined(_WIN64)
 #include "Renderer/ThreadedRenderDevice.h"
@@ -1678,7 +1679,7 @@ struct D3D11LegacyBridge::Impl
 			GpuHandle texture_handle;
 #if defined(_WIN64)
 			TextureBaseClass *source =
-				DX8Wrapper::Get_Tracked_Native_Texture(stage);
+				rts::render::GetPublishedTextureStage(stage);
 			if (!Bind_Native_Texture(stage, source, &texture_handle))
 #else
 			IDirect3DBaseTexture8 *source =
@@ -4524,7 +4525,7 @@ bool D3D11LegacyBridge::Draw(VertexBufferClass *vertex_buffer,
 		GpuHandle texture_handle;
 #if defined(_WIN64)
 		TextureBaseClass *source =
-			DX8Wrapper::Get_Tracked_Native_Texture(stage);
+			rts::render::GetPublishedTextureStage(stage);
 		const bool bound = m_impl->Bind_Native_Texture(stage, source,
 			&texture_handle);
 #else
@@ -4812,7 +4813,7 @@ RenderResult D3D11LegacyBridge::Draw_Primitive_UP(
 		GpuHandle texture_handle;
 #if defined(_WIN64)
 		TextureBaseClass *source =
-			DX8Wrapper::Get_Tracked_Native_Texture(stage);
+			rts::render::GetPublishedTextureStage(stage);
 		if (!m_impl->Bind_Native_Texture(stage, source, &texture_handle))
 #else
 		IDirect3DBaseTexture8 *source =

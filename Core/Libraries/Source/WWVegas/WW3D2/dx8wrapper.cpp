@@ -51,6 +51,7 @@
 #endif
 
 #include "dx8wrapper.h"
+#include "Renderer/RenderTexturePublication.h"
 #include "dx8webbrowser.h"
 #include "dx8fvf.h"
 #include "dx8vertexbuffer.h"
@@ -395,6 +396,9 @@ void MoveRectIntoOtherRect(const RECT& inner, const RECT& outer, int* x, int* y)
 bool DX8Wrapper::Init(void * hwnd, bool lite)
 {
 	WWASSERT(!IsInitted);
+	// A failed or previously torn-down device must not leak its old lost bit
+	// into the next initialization attempt or pre-frame texture publication.
+	IsDeviceLost = false;
 	const rts::render::RenderBackend requested_backend =
 		rts::render::RequestedRenderBackend();
 	if (!rts::render::IsRenderBackendSupported(requested_backend))
@@ -513,6 +517,9 @@ bool DX8Wrapper::Init(void * hwnd, bool lite)
 
 void DX8Wrapper::Shutdown()
 {
+	// Shutdown is a terminal non-lost state. Clear this before releasing any
+	// tracked resources so callers cannot observe a stale recovery latch.
+	IsDeviceLost = false;
 	if (_UseD3D11Backend)
 	{
 		if (D3DDevice
@@ -559,6 +566,7 @@ void DX8Wrapper::Shutdown()
 				Textures[i] = nullptr;
 			}
 #if defined(_WIN64)
+			rts::render::UnpublishTexture(NativeTextures[i]);
 			REF_PTR_RELEASE(NativeTextures[i]);
 #endif
 		}
@@ -662,9 +670,9 @@ void DX8Wrapper::Invalidate_Cached_Render_States()
 		}
 		Textures[a]=nullptr;
 #if defined(_WIN64)
+		rts::render::PublishTextureStage(a, nullptr);
 		REF_PTR_RELEASE(NativeTextures[a]);
 #endif
-		rts::render::TrackLegacyTexturePresence(a, false);
 	}
 
 	ShaderClass::Invalidate();
@@ -1013,6 +1021,7 @@ bool DX8Wrapper::Reset_Device(bool reload_assets, bool *reset_requires_reacquire
 				return false;
 			}
 		}
+		IsDeviceLost = false;
 		WWDEBUG_SAY(("Device reset completed"));
 		return true;
 	}
@@ -3006,6 +3015,22 @@ bool Publish_Render_Texture_BGRA8_Change(TextureClass *texture,
 		row_pitch, slice_pitch);
 }
 
+bool Is_Render_D3D11_Backend_Active()
+{
+#if defined(_WIN64)
+	return DX8Wrapper::Is_D3D11_Backend_Active();
+#else
+	return false;
+#endif
+}
+
+bool Is_Render_Texture_Publication_Operational()
+{
+	return rts::render::IsRenderTexturePublicationOperationalState(
+		DX8Wrapper::Is_Initted(), DX8Wrapper::Is_Device_Lost(),
+		_UseD3D11Backend, DX8Wrapper::Is_D3D11_Backend_Active());
+}
+
 void Notify_Render_Buffer_Changed(IUnknown *buffer)
 {
 	DX8Wrapper::Notify_D3D11_Buffer_Changed(buffer);
@@ -3210,7 +3235,7 @@ void DX8Wrapper::Set_Native_Texture(unsigned int stage,
 	TextureBaseClass *texture)
 {
 	if (stage >= MAX_TEXTURE_STAGES) return;
-	rts::render::TrackLegacyTexturePresence(stage, texture != nullptr);
+	rts::render::PublishTextureStage(stage, texture);
 	if (NativeTextures[stage] == texture) return;
 	REF_PTR_SET(NativeTextures[stage], texture);
 	if (Textures[stage] != nullptr)
@@ -3223,7 +3248,7 @@ void DX8Wrapper::Set_Native_Texture(unsigned int stage,
 
 TextureBaseClass *DX8Wrapper::Get_Tracked_Native_Texture(unsigned int stage)
 {
-	return stage < MAX_TEXTURE_STAGES ? NativeTextures[stage] : nullptr;
+	return rts::render::GetPublishedTextureStage(stage);
 }
 #endif
 

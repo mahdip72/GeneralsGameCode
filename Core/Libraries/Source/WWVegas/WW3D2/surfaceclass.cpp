@@ -48,9 +48,11 @@
  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 #include "surfaceclass.h"
+#if !defined(_WIN64)
 #include "formconv.h"
 #include "dx8wrapper.h"
 #include "surfaceblit.h"
+#endif
 #include "WWMath/vector2i.h"
 #include "colorspace.h"
 #include "WWLib/bound.h"
@@ -116,10 +118,10 @@ static bool Allocate_Native_Surface(NativeSurfaceStorage *storage,
 	return true;
 }
 
-static void Publish_Native_Surface(NativeSurfaceStorage *storage)
+static bool Publish_Native_Surface(NativeSurfaceStorage *storage)
 {
 	if (storage == nullptr || storage->texture == nullptr ||
-		storage->bytes.empty() || storage->pitch == 0) return;
+		storage->bytes.empty() || storage->pitch == 0) return false;
 	if (storage->texture->Update_Native_Subresource_Data(storage->mipLevel,
 		storage->arraySlice, &storage->bytes[0], storage->pitch,
 		storage->bytes.size()))
@@ -128,7 +130,45 @@ static void Publish_Native_Surface(NativeSurfaceStorage *storage)
 		// sampling/output operation to acquire the new exact typed surface.
 		storage->surface = rts::render::NativeW3DSurfaceHandle();
 		storage->lease = rts::render::NativeW3DGpuContentLease();
+		return true;
 	}
+	return false;
+}
+
+static bool Copy_Native_Surface_Data(
+	NativeSurfaceStorage *destination, const NativeSurfaceStorage *source,
+	unsigned int dstx, unsigned int dsty, unsigned int srcx, unsigned int srcy,
+	unsigned int width, unsigned int height, unsigned int bytes_per_pixel)
+{
+	if (destination == nullptr || source == nullptr ||
+		destination->bytes.empty() || source->bytes.empty() ||
+		destination->pitch == 0 || source->pitch == 0 ||
+		destination->width == 0 || destination->height == 0 ||
+		source->width == 0 || source->height == 0 || width == 0 || height == 0 ||
+		bytes_per_pixel == 0)
+	{
+		return false;
+	}
+	if (dstx >= destination->width || dsty >= destination->height ||
+		srcx >= source->width || srcy >= source->height)
+	{
+		return false;
+	}
+	width = min(width, min(destination->width - dstx, source->width - srcx));
+	height = min(height, min(destination->height - dsty, source->height - srcy));
+	if (width == 0 || height == 0)
+	{
+		return false;
+	}
+	for (unsigned int row = 0; row < height; ++row)
+	{
+		memcpy(&destination->bytes[(dsty + row) * destination->pitch +
+			dstx * bytes_per_pixel],
+			&source->bytes[(srcy + row) * source->pitch +
+				srcx * bytes_per_pixel],
+			static_cast<size_t>(width) * bytes_per_pixel);
+	}
+	return true;
 }
 #endif
 
@@ -336,10 +376,12 @@ SurfaceClass::SurfaceClass(TextureBaseClass *texture, unsigned int mip_level,
 
 SurfaceClass::~SurfaceClass()
 {
+#if !defined(_WIN64)
 	if (D3DSurface) {
 		D3DSurface->Release();
 		D3DSurface = nullptr;
 	}
+#endif
 #if defined(_WIN64)
 	delete NativeSurface;
 	NativeSurface = nullptr;
@@ -359,7 +401,7 @@ void SurfaceClass::Get_Description(SurfaceDescription &surface_desc)
 		surface_desc.Height = NativeSurface->height;
 	}
 	return;
-#endif
+#else
 	if (D3DSurface == nullptr)
 	{
 		return;
@@ -375,6 +417,7 @@ void SurfaceClass::Get_Description(SurfaceDescription &surface_desc)
 	surface_desc.Format = D3DFormat_To_WW3DFormat(d3d_desc.Format);
 	surface_desc.Height = d3d_desc.Height;
 	surface_desc.Width = d3d_desc.Width;
+#endif
 }
 
 unsigned int SurfaceClass::Get_Bytes_Per_Pixel()
@@ -455,13 +498,46 @@ void SurfaceClass::Unlock()
 	if (NativeSurface != nullptr && NativeSurface->locked)
 	{
 		NativeSurface->locked = false;
-		Publish_Native_Surface(NativeSurface);
+		(void)Publish_Native_Surface(NativeSurface);
 	}
 #else
 	if (D3DSurface != nullptr)
 	{
 		DX8_ErrorCode(D3DSurface->UnlockRect());
 	}
+#endif
+}
+
+#if defined(_WIN64)
+bool SurfaceClass::Unlock_Native_Surface()
+{
+	if (NativeSurface == nullptr)
+	{
+		return false;
+	}
+	if (!NativeSurface->locked)
+	{
+		return true;
+	}
+	NativeSurface->locked = false;
+	return Publish_Native_Surface(NativeSurface);
+}
+#endif
+
+void SurfaceClass::Unlock_Read_Only()
+{
+#if defined(_WIN64)
+	if (NativeSurface != nullptr && NativeSurface->locked)
+	{
+		// The CPU shadow was only inspected. Leave the current native
+		// generation and typed surface lease intact; publishing here would
+		// allocate/retire an equivalent resource for every source mip read.
+		NativeSurface->locked = false;
+	}
+#else
+	// The legacy API has no separate CPU-shadow publication boundary. Its
+	// UnlockRect is still mandatory even when callers only inspect the bits.
+	Unlock();
 #endif
 }
 
@@ -509,7 +585,7 @@ void SurfaceClass::Clear()
 		Publish_Native_Surface(NativeSurface);
 	}
 	return;
-#endif
+#else
 	if (D3DSurface == nullptr)
 	{
 		return;
@@ -542,6 +618,7 @@ void SurfaceClass::Clear()
 	}
 
 	DX8_ErrorCode(D3DSurface->UnlockRect());
+#endif
 }
 
 
@@ -572,7 +649,7 @@ void SurfaceClass::Copy(const unsigned char *other)
 			other + row * row_bytes, row_bytes);
 	Publish_Native_Surface(NativeSurface);
 	return;
-#endif
+#else
 	if (D3DSurface == nullptr || other == nullptr)
 	{
 		return;
@@ -605,6 +682,7 @@ void SurfaceClass::Copy(const unsigned char *other)
 	}
 
 	DX8_ErrorCode(D3DSurface->UnlockRect());
+#endif
 }
 
 
@@ -640,7 +718,7 @@ void SurfaceClass::Copy(const Vector2i &min, const Vector2i &max, const unsigned
 			row_bytes);
 	Publish_Native_Surface(NativeSurface);
 	return;
-#endif
+#else
 	if (D3DSurface == nullptr || other == nullptr || min.I < 0 || min.J < 0 ||
 		max.I <= min.I || max.J <= min.J)
 	{
@@ -681,6 +759,7 @@ void SurfaceClass::Copy(const Vector2i &min, const Vector2i &max, const unsigned
 	}
 
 	DX8_ErrorCode(D3DSurface->UnlockRect());
+#endif
 }
 
 
@@ -724,7 +803,7 @@ unsigned char *SurfaceClass::CreateCopy(int *width,int *height,int*size,bool fli
 			&NativeSurface->bytes[row * NativeSurface->pitch], row_bytes);
 	}
 	return copy;
-#endif
+#else
 	if (width == nullptr || height == nullptr || size == nullptr ||
 		D3DSurface == nullptr)
 	{
@@ -774,6 +853,7 @@ unsigned char *SurfaceClass::CreateCopy(int *width,int *height,int*size,bool fli
 	DX8_ErrorCode(D3DSurface->UnlockRect());
 
 	return other;
+#endif
 }
 
 
@@ -792,6 +872,44 @@ unsigned char *SurfaceClass::CreateCopy(int *width,int *height,int*size,bool fli
  * HISTORY:                                                                                    *
  *   2/13/2001  hy : Created.                                                                  *
  *=============================================================================================*/
+#if defined(_WIN64)
+bool SurfaceClass::Copy_Native(
+	unsigned int dstx, unsigned int dsty,
+	unsigned int srcx, unsigned int srcy,
+	unsigned int width, unsigned int height,
+	const SurfaceClass *other)
+{
+	if (!Copy_Native_No_Publish(dstx, dsty, srcx, srcy, width, height,
+		other))
+	{
+		return false;
+	}
+	return Publish_Native_Changes();
+}
+
+bool SurfaceClass::Copy_Native_No_Publish(
+	unsigned int dstx, unsigned int dsty,
+	unsigned int srcx, unsigned int srcy,
+	unsigned int width, unsigned int height,
+	const SurfaceClass *other)
+{
+	if (NativeSurface == nullptr || other == nullptr ||
+		other->NativeSurface == nullptr ||
+		SurfaceFormat != other->SurfaceFormat)
+	{
+		return false;
+	}
+	return Copy_Native_Surface_Data(NativeSurface, other->NativeSurface,
+		dstx, dsty, srcx, srcy, width, height,
+		::Get_Bytes_Per_Pixel(SurfaceFormat));
+}
+
+bool SurfaceClass::Publish_Native_Changes()
+{
+	return Publish_Native_Surface(NativeSurface);
+}
+#endif
+
 void SurfaceClass::Copy(
 	unsigned int dstx, unsigned int dsty,
 	unsigned int srcx, unsigned int srcy,
@@ -802,26 +920,9 @@ void SurfaceClass::Copy(
 	WWASSERT(width);
 	WWASSERT(height);
 #if defined(_WIN64)
-	if (NativeSurface == nullptr || other == nullptr || other->NativeSurface == nullptr ||
-		NativeSurface->bytes.empty() || other->NativeSurface->bytes.empty() ||
-		SurfaceFormat != other->SurfaceFormat || width == 0 || height == 0)
-		return;
-	const unsigned int size = ::Get_Bytes_Per_Pixel(SurfaceFormat);
-	if (size == 0 || dstx >= NativeSurface->width || dsty >= NativeSurface->height ||
-		srcx >= other->NativeSurface->width || srcy >= other->NativeSurface->height)
-		return;
-	width = min(width, min(NativeSurface->width - dstx,
-		other->NativeSurface->width - srcx));
-	height = min(height, min(NativeSurface->height - dsty,
-		other->NativeSurface->height - srcy));
-	for (unsigned int row = 0; row < height; ++row)
-		memcpy(&NativeSurface->bytes[(dsty + row) * NativeSurface->pitch +
-			dstx * size],
-			&other->NativeSurface->bytes[(srcy + row) * other->NativeSurface->pitch +
-				srcx * size], static_cast<size_t>(width) * size);
-	Publish_Native_Surface(NativeSurface);
+	(void)Copy_Native(dstx, dsty, srcx, srcy, width, height, other);
 	return;
-#endif
+#else
 	if (D3DSurface == nullptr || other == nullptr || width == 0 || height == 0)
 	{
 		return;
@@ -861,6 +962,7 @@ void SurfaceClass::Copy(
 		DX8_ErrorCode(SurfaceBlit_Copy(D3DSurface, &dest, other->D3DSurface,
 			&src, SURFACE_BLIT_FILTER_NONE));
 	}
+#endif
 }
 
 /***********************************************************************************************
@@ -912,7 +1014,7 @@ void SurfaceClass::Stretch_Copy(
 	}
 	Publish_Native_Surface(NativeSurface);
 	return;
-#endif
+#else
 	if (D3DSurface == nullptr || other == nullptr || dstwidth == 0 ||
 		dstheight == 0 || srcwidth == 0 || srcheight == 0)
 	{
@@ -937,6 +1039,7 @@ void SurfaceClass::Stretch_Copy(
 
 	DX8_ErrorCode(SurfaceBlit_Copy(D3DSurface, &dest, other->D3DSurface,
 		&src, SURFACE_BLIT_FILTER_TRIANGLE));
+#endif
 }
 
 /***********************************************************************************************
@@ -984,7 +1087,7 @@ void SurfaceClass::FindBB(Vector2i *min,Vector2i*max)
 	*min = real_min;
 	*max = real_max;
 	return;
-#endif
+#else
 	if (D3DSurface == nullptr || min == nullptr || max == nullptr)
 	{
 		return;
@@ -1055,6 +1158,7 @@ void SurfaceClass::FindBB(Vector2i *min,Vector2i*max)
 
 	*max=realmax;
 	*min=realmin;
+#endif
 }
 
 
@@ -1093,7 +1197,7 @@ bool SurfaceClass::Is_Transparent_Column(unsigned int column)
 		}
 	}
 	return true;
-#endif
+#else
 	if (D3DSurface == nullptr)
 	{
 		return true;
@@ -1161,6 +1265,7 @@ bool SurfaceClass::Is_Transparent_Column(unsigned int column)
 
 	DX8_ErrorCode(D3DSurface->UnlockRect());
 	return true;
+#endif
 }
 
 /***********************************************************************************************

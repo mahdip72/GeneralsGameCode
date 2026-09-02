@@ -1,8 +1,9 @@
 #include "Utility/CppMacros.h"
 #include "Renderer/RendererDevice.h"
+#include "Renderer/RenderTexturePublication.h"
+#include "W3DDevice/GameClient/W3DVideoBuffer.h"
 #if defined(RTS_RENDERER_HAS_D3D11)
 #include "../../Libraries/Source/WWVegas/WW3D2/d3d11legacybridge.h"
-#include "W3DDevice/GameClient/W3DVideoBuffer.h"
 #include "Renderer/LegacyBridgeValidation.h"
 #endif
 #include "Renderer/LegacyRenderState.h"
@@ -10,6 +11,7 @@
 #include <stdio.h>
 #include <algorithm>
 #include <math.h>
+#include <string>
 #include <string.h>
 #include <vector>
 
@@ -41,6 +43,72 @@ int check(bool condition, const char *message)
 bool nearlyEqual(float left, float right, float epsilon = 0.00001f)
 {
 	return fabs(left - right) <= epsilon;
+}
+
+bool ExpectedNativeVideoPublicationSelection(
+	rts::render::RenderBackend backend, bool backendSupported, bool ownerActive)
+{
+#if defined(_WIN64)
+	return backend == rts::render::RENDER_BACKEND_D3D11 &&
+		backendSupported && ownerActive;
+#else
+	(void)backend;
+	(void)backendSupported;
+	(void)ownerActive;
+	return false;
+#endif
+}
+
+bool ReadSourceText(const char *relativePath, std::string *contents)
+{
+	if (relativePath == 0 || contents == 0)
+	{
+		return false;
+	}
+	std::string path = RTS_SOURCE_ROOT;
+	path += "/";
+	path += relativePath;
+	FILE *input = fopen(path.c_str(), "rb");
+	if (input == 0 || fseek(input, 0, SEEK_END) != 0)
+	{
+		if (input != 0)
+		{
+			fclose(input);
+		}
+		return false;
+	}
+	const long byteCount = ftell(input);
+	if (byteCount <= 0 || fseek(input, 0, SEEK_SET) != 0)
+	{
+		fclose(input);
+		return false;
+	}
+	std::vector<char> bytes(static_cast<size_t>(byteCount));
+	const size_t bytesRead = fread(&bytes[0], 1,
+		static_cast<size_t>(byteCount), input);
+	fclose(input);
+	if (bytesRead != static_cast<size_t>(byteCount))
+	{
+		return false;
+	}
+	contents->assign(&bytes[0], bytesRead);
+	return true;
+}
+
+unsigned CountSourceOccurrences(const std::string &source, const char *needle)
+{
+	if (needle == 0 || *needle == '\0')
+	{
+		return 0;
+	}
+	unsigned count = 0;
+	for (std::string::size_type position = source.find(needle);
+		position != std::string::npos;
+		position = source.find(needle, position + 1))
+	{
+		++count;
+	}
+	return count;
 }
 
 int testBackendNames()
@@ -94,6 +162,307 @@ int testBackendNames()
 		"unsupported native command-line selection remains observable for fail-closed startup");
 #endif
 	rts::render::SetRequestedRenderBackend(rts::render::DefaultRenderBackend());
+	return result;
+}
+
+int testRenderTexturePublicationOperationalStates()
+{
+	int result = 0;
+	result |= check(
+		rts::render::IsRenderTexturePublicationOperationalState(
+			true, false, false, false),
+		"legacy texture publication is operational before a scene bracket");
+	result |= check(
+		!rts::render::IsRenderTexturePublicationOperationalState(
+			true, true, false, false),
+		"legacy texture publication is suppressed while lost or resetting");
+	result |= check(
+		!rts::render::IsRenderTexturePublicationOperationalState(
+			false, false, false, false),
+		"texture publication is suppressed after renderer shutdown");
+	result |= check(
+		rts::render::IsRenderTexturePublicationOperationalState(
+			true, false, true, true),
+		"native texture publication is operational after bridge recovery");
+	result |= check(
+		!rts::render::IsRenderTexturePublicationOperationalState(
+			true, false, true, false),
+		"native texture publication is suppressed while the bridge is lost");
+	return result;
+}
+
+int testRendererTextureLifecycleContracts()
+{
+	int result = 0;
+	std::string surfaceHeader;
+	std::string surfaceSource;
+	std::string textureSource;
+	std::string waterSource;
+	std::string videoHeader;
+	std::string videoSource;
+	std::string videoPlayerHeader;
+	std::string ffmpegSource;
+	std::string generalsShroudSource;
+	std::string generalsMDShroudSource;
+	result |= check(ReadSourceText(
+		"Core/Libraries/Source/WWVegas/WW3D2/surfaceclass.h",
+		&surfaceHeader), "surface lock contract source is available");
+	result |= check(ReadSourceText(
+		"Core/Libraries/Source/WWVegas/WW3D2/surfaceclass.cpp",
+		&surfaceSource), "surface lock implementation source is available");
+	result |= check(ReadSourceText(
+		"Core/Libraries/Source/WWVegas/WW3D2/texture.cpp",
+		&textureSource), "texture construction source is available");
+	result |= check(ReadSourceText(
+		"Core/GameEngineDevice/Source/W3DDevice/GameClient/Water/W3DWater.cpp",
+		&waterSource), "water upload source is available");
+	result |= check(ReadSourceText(
+		"Core/GameEngineDevice/Include/W3DDevice/GameClient/W3DVideoBuffer.h",
+		&videoHeader), "video buffer state header is available");
+	result |= check(ReadSourceText(
+		"Core/GameEngineDevice/Source/W3DDevice/GameClient/W3DVideoBuffer.cpp",
+		&videoSource), "video buffer publication source is available");
+	result |= check(ReadSourceText(
+		"Core/GameEngine/Include/GameClient/VideoPlayer.h",
+		&videoPlayerHeader), "video player interface source is available");
+	result |= check(ReadSourceText(
+		"Core/GameEngineDevice/Source/VideoDevice/FFmpeg/FFmpegVideoPlayer.cpp",
+		&ffmpegSource), "FFmpeg video source is available");
+	result |= check(ReadSourceText(
+		"Generals/Code/GameEngineDevice/Source/W3DDevice/GameClient/W3DShroud.cpp",
+		&generalsShroudSource), "Generals shroud source is available");
+	result |= check(ReadSourceText(
+		"GeneralsMD/Code/GameEngineDevice/Source/W3DDevice/GameClient/W3DShroud.cpp",
+		&generalsMDShroudSource), "Zero Hour shroud source is available");
+
+	const std::string::size_type readOnlyDeclaration =
+		surfaceHeader.find("void Unlock_Read_Only();");
+	const std::string::size_type readOnlyMethod = surfaceSource.find(
+		"void SurfaceClass::Unlock_Read_Only()");
+	const std::string::size_type readOnlyMethodEnd = surfaceSource.find(
+		"#if defined(_WIN64)\nbool SurfaceClass::Acquire_Native_Surface",
+		readOnlyMethod);
+	result |= check(readOnlyDeclaration != std::string::npos &&
+		readOnlyMethod != std::string::npos && readOnlyMethodEnd > readOnlyMethod,
+		"surface exposes an explicit read-only lock completion boundary");
+	if (readOnlyMethod != std::string::npos &&
+		readOnlyMethodEnd > readOnlyMethod)
+	{
+		const std::string readOnlyBody = surfaceSource.substr(readOnlyMethod,
+			readOnlyMethodEnd - readOnlyMethod);
+		result |= check(readOnlyBody.find("NativeSurface->locked = false") !=
+			std::string::npos && readOnlyBody.find("Publish_Native_Surface") ==
+			std::string::npos,
+			"native read-only completion releases the lock without republishing");
+	}
+
+	result |= check(textureSource.find(
+		"TextureClass *TextureClass::Create_Native_From_Prepared") !=
+			std::string::npos &&
+		waterSource.find("TextureClass::Create_Native_From_Prepared") !=
+			std::string::npos,
+		"water publishes prepared mips through the direct native texture factory");
+	result |= check(waterSource.find("surface->Unlock_Read_Only()") !=
+		std::string::npos && waterSource.find("NEW_REF(TextureClass") ==
+			std::string::npos,
+		"water source reads do not republish or allocate an empty native texture");
+	const std::string::size_type whiteUpdate = waterSource.find(
+		"Bool WaterRenderObjClass::updateWhiteTexture()");
+	const std::string::size_type whiteUpdateEnd = waterSource.find(
+		"void WaterRenderObjClass::ReAcquireResources()", whiteUpdate);
+	result |= check(whiteUpdate != std::string::npos &&
+		whiteUpdateEnd > whiteUpdate,
+		"water white-texture writes use one bounded completion helper");
+	if (whiteUpdate != std::string::npos && whiteUpdateEnd > whiteUpdate)
+	{
+		const std::string whiteUpdateBody = waterSource.substr(whiteUpdate,
+			whiteUpdateEnd - whiteUpdate);
+		result |= check(whiteUpdateBody.find(
+			"surface->Unlock_Native_Surface()") != std::string::npos &&
+			whiteUpdateBody.find("m_whiteTexturePublishPending=TRUE") !=
+			std::string::npos && whiteUpdateBody.find(
+			"m_whiteTexturePublishPending=publicationSucceeded ? FALSE : TRUE") !=
+			std::string::npos,
+			"native white-texture publication retains a retryable failure state");
+		result |= check(whiteUpdateBody.find("surface->Unlock();") !=
+			std::string::npos && whiteUpdateBody.find(
+			"Notify_Render_Texture_Changed(m_whiteTexture)") !=
+			std::string::npos,
+			"legacy white-texture publication keeps Unlock and notification behavior");
+	}
+	unsigned whiteUpdateCallCount = 0;
+	for (std::string::size_type call = waterSource.find(
+		"updateWhiteTexture();"); call != std::string::npos; call =
+		waterSource.find("updateWhiteTexture();", call + 1))
+	{
+		++whiteUpdateCallCount;
+	}
+	result |= check(whiteUpdateCallCount == 3,
+		"water reset, initialization, and shader paths retry white publication");
+
+	// The Win32/VC6 procedural constructors must report the result of the
+	// actual D3D8 allocation.  Keep this as a source contract because the
+	// device-free renderer test cannot create a real legacy device, while the
+	// VC6 oracle compile proves the guarded implementation remains valid.
+	const char *legacyCreationMarkers[] = {
+		"Poke_Texture(DX8Wrapper::_Create_DX8_Texture\n",
+		"Poke_Texture(DX8Wrapper::_Create_DX8_Texture(\n\t\tsurface->",
+		"Poke_Texture(DX8Wrapper::_Create_DX8_ZTexture\n",
+		"Poke_Texture(DX8Wrapper::_Create_DX8_Cube_Texture\n",
+		"Poke_Texture(DX8Wrapper::_Create_DX8_Volume_Texture\n"
+	};
+	const unsigned legacyCreationMarkerCount =
+		static_cast<unsigned>(sizeof(legacyCreationMarkers) /
+			sizeof(legacyCreationMarkers[0]));
+	for (unsigned i = 0; i != legacyCreationMarkerCount; ++i)
+	{
+		const std::string::size_type creation = textureSource.find(
+			legacyCreationMarkers[i]);
+		const std::string::size_type branchEnd = textureSource.find(
+			"#endif", creation);
+		bool derivesInitialization = false;
+		if (creation != std::string::npos && branchEnd > creation)
+		{
+			const std::string legacyBranch = textureSource.substr(
+				creation, branchEnd - creation);
+			derivesInitialization = legacyBranch.find(
+				"Initialized = Peek_D3D_Base_Texture() != nullptr;") !=
+				std::string::npos;
+		}
+		result |= check(derivesInitialization,
+			"legacy procedural allocation failure leaves initialization false");
+	}
+
+	std::string wrapperSource;
+	result |= check(ReadSourceText(
+		"Core/Libraries/Source/WWVegas/WW3D2/dx8wrapper.cpp",
+		&wrapperSource), "renderer wrapper source is available");
+	const std::string::size_type init = wrapperSource.find(
+		"bool DX8Wrapper::Init(void * hwnd, bool lite)");
+	const std::string::size_type shutdown = wrapperSource.find(
+		"void DX8Wrapper::Shutdown()", init);
+	const std::string::size_type reset = wrapperSource.find(
+		"bool DX8Wrapper::Reset_Device(", shutdown);
+	const std::string::size_type resetEnd = wrapperSource.find(
+		"void DX8Wrapper::Release_DX8_Buffer_Bindings()", reset);
+	result |= check(init != std::string::npos && shutdown > init &&
+		reset > shutdown && resetEnd > reset,
+		"renderer lifecycle methods remain source-addressable");
+	if (init != std::string::npos && shutdown > init &&
+		reset > shutdown && resetEnd > reset)
+	{
+		result |= check(wrapperSource.find("IsDeviceLost = false;", init) < shutdown,
+			"renderer initialization clears stale lost state");
+		result |= check(wrapperSource.find("IsDeviceLost = false;", shutdown) < reset,
+			"renderer shutdown clears stale lost state");
+		result |= check(wrapperSource.find("IsDeviceLost = false;", reset) < resetEnd,
+			"successful legacy reset clears stale lost state");
+	}
+
+	const std::string::size_type updateBegin = textureSource.find(
+		"bool TextureBaseClass::Update_Native_Subresource_Data");
+	const std::string::size_type updateEnd = textureSource.find(
+		"size_t TextureBaseClass::Get_Native_Texture_Byte_Count", updateBegin);
+	result |= check(updateBegin != std::string::npos && updateEnd > updateBegin,
+		"native texture update source is bounded for the in-place contract");
+	if (updateBegin != std::string::npos && updateEnd > updateBegin)
+	{
+		const std::string updateBody = textureSource.substr(updateBegin,
+			updateEnd - updateBegin);
+		result |= check(updateBody.find("RefreshCpuContent") !=
+			std::string::npos && updateBody.find("Apply_Native_Texture") ==
+			std::string::npos,
+			"steady-state texture updates refresh the existing native resource");
+	}
+	result |= check(surfaceHeader.find("bool Unlock_Native_Surface();") !=
+		std::string::npos && surfaceSource.find(
+		"bool SurfaceClass::Unlock_Native_Surface()") != std::string::npos,
+		"native surface publication exposes a status-returning unlock beside legacy ABI");
+	result |= check(surfaceHeader.find("bool Copy_Native_No_Publish(") !=
+		std::string::npos && surfaceHeader.find(
+		"bool Publish_Native_Changes();") != std::string::npos &&
+		surfaceSource.find("bool SurfaceClass::Copy_Native_No_Publish(") !=
+		std::string::npos && surfaceSource.find(
+		"bool SurfaceClass::Publish_Native_Changes()") != std::string::npos,
+		"native surfaces expose a separate batch-copy and publication boundary");
+	const std::string::size_type noPublishBegin = surfaceSource.find(
+		"bool SurfaceClass::Copy_Native_No_Publish(");
+	const std::string::size_type publishChangesBegin = surfaceSource.find(
+		"bool SurfaceClass::Publish_Native_Changes()", noPublishBegin);
+	if (noPublishBegin != std::string::npos &&
+		publishChangesBegin > noPublishBegin)
+	{
+		const std::string noPublishBody = surfaceSource.substr(noPublishBegin,
+			publishChangesBegin - noPublishBegin);
+		result |= check(noPublishBody.find("Publish_Native_Surface") ==
+			std::string::npos,
+			"native batch copies mutate the CPU shadow without publishing");
+	}
+	if (publishChangesBegin != std::string::npos)
+	{
+		const std::string publishBody = surfaceSource.substr(publishChangesBegin);
+		result |= check(publishBody.find("Publish_Native_Surface") !=
+			std::string::npos,
+			"native batch completion retains a retryable publication boundary");
+	}
+	result |= check(videoHeader.find("m_nativePublicationPending") !=
+		std::string::npos && videoSource.find("Unlock_Native_Surface()") !=
+		std::string::npos && videoSource.find(
+		"m_nativePublicationPending = publicationSucceeded ? FALSE : TRUE") !=
+		std::string::npos && videoSource.find(
+		"!m_nativePublicationPending") != std::string::npos,
+		"video retains and visibly reports failed native publication for retry");
+	result |= check(videoPlayerHeader.find("publishLockedFrame") ==
+		std::string::npos && ffmpegSource.find("publishLockedFrame") ==
+		std::string::npos,
+		"FFmpeg uses the single VideoBuffer unlock publication boundary");
+	const char *shroudSources[] = {
+		generalsShroudSource.c_str(), generalsMDShroudSource.c_str()
+	};
+	for (unsigned int shroudIndex = 0; shroudIndex < 2; ++shroudIndex)
+	{
+		const std::string shroud(shroudSources[shroudIndex]);
+		const std::string::size_type borderBegin = shroud.find(
+			"Bool W3DShroud::fillBorderShroudData(");
+		const std::string::size_type borderEnd = shroud.find(
+			"/**Set the shroud color within the border area", borderBegin);
+		const std::string::size_type syncUnlock = shroud.find(
+			"m_pSrcTexture->Unlock_Native_Surface()");
+		const std::string::size_type syncDirty = shroud.find(
+			"m_srcTextureDirty=FALSE;", syncUnlock);
+		const std::string::size_type borderCall = shroud.find(
+			"fillBorderShroudData(m_boderShroudLevel, pDestSurface)");
+		const std::string::size_type borderClear = shroud.find(
+			"m_clearDstTexture=FALSE;", borderCall);
+		result |= check(syncUnlock != std::string::npos &&
+			syncDirty > syncUnlock && shroud.find("Copy_Native") !=
+			std::string::npos && borderCall != std::string::npos &&
+			borderClear > borderCall && shroud.find(
+			"m_clearDstTexture = TRUE;") != std::string::npos,
+			"both shroud copies retain dirty state until native publication succeeds");
+		if (borderBegin != std::string::npos && borderEnd > borderBegin)
+		{
+			const std::string borderBody = shroud.substr(borderBegin,
+				borderEnd - borderBegin);
+			const std::string::size_type rowLoop = borderBody.find(
+				"for (y=0; y<m_dstTextureHeight; y++)");
+			const std::string::size_type lastBatchCopy = borderBody.rfind(
+				"Copy_Native_No_Publish(");
+			const std::string::size_type batchPublish = borderBody.find(
+				"Publish_Native_Changes()");
+			result |= check(rowLoop != std::string::npos &&
+				lastBatchCopy != std::string::npos && batchPublish > lastBatchCopy &&
+				CountSourceOccurrences(borderBody, "Publish_Native_Changes()") == 1,
+				"both shroud border fills publish once after all native row mutations");
+		}
+		const std::string::size_type borderFailure = shroud.rfind(
+			"if (!fillBorderShroudData", borderCall);
+		const std::string::size_type borderFailureReturn = shroud.find(
+			"return;", borderFailure);
+		result |= check(borderFailure != std::string::npos &&
+			borderFailureReturn > borderFailure && borderFailureReturn < borderClear,
+			"both shroud border publication failures retain the retry latch");
+	}
 	return result;
 }
 
@@ -4833,9 +5202,60 @@ int testD3D11HeadlessDevice()
 	return result;
 }
 
+#endif
+
 int testW3DVideoBufferDirectPublicationLayout()
 {
 	int result = 0;
+	result |= check(ExpectedNativeVideoPublicationSelection(
+		rts::render::RENDER_BACKEND_DX8, true, true) == false,
+		"W3D video keeps the legacy publication policy for DX8");
+	result |= check(ExpectedNativeVideoPublicationSelection(
+		rts::render::RENDER_BACKEND_D3D11, true, true),
+		"W3D video selection requires a supported active native owner");
+	result |= check(!ExpectedNativeVideoPublicationSelection(
+		rts::render::RENDER_BACKEND_D3D11, true, false),
+		"W3D video selection rejects a requested but inactive native owner");
+	result |= check(!ExpectedNativeVideoPublicationSelection(
+		rts::render::RENDER_BACKEND_D3D11, false, true),
+		"W3D video selection rejects an unsupported native backend");
+
+	std::string source;
+	result |= check(ReadSourceText(
+		"Core/GameEngineDevice/Source/W3DDevice/GameClient/W3DVideoBuffer.cpp",
+		&source), "W3D video source is available for policy-contract checks");
+	if (!source.empty())
+	{
+		const std::string::size_type method = source.find(
+			"Bool W3DVideoBuffer::UsesNativeD3D11PublicationPath()");
+		const std::string::size_type methodEnd = source.find(
+			"// W3DVideoBuffer::SetBuffer", method);
+		const std::string::size_type nativeGuard = source.find(
+			"#if defined(_WIN64)", method);
+		const std::string::size_type fallbackBranch = source.find(
+			"#else", nativeGuard);
+		const std::string::size_type fallbackReturn = source.find(
+			"return FALSE;", fallbackBranch);
+		const std::string::size_type activeOwnerQuery = source.find(
+			"IsNativeD3D11PublicationActive()", method);
+		result |= check(method != std::string::npos &&
+			methodEnd != std::string::npos && nativeGuard > method &&
+			nativeGuard < methodEnd && fallbackBranch > nativeGuard &&
+			fallbackBranch < methodEnd && fallbackReturn > fallbackBranch &&
+			fallbackReturn < methodEnd,
+			"W3D video native selection is compile-time disabled outside x64");
+		result |= check(activeOwnerQuery > method &&
+			activeOwnerQuery < methodEnd,
+			"W3D video selection consults the actual active native owner");
+		result |= check(source.find("publishLockedFrame") ==
+			std::string::npos && source.find(
+			"Publish_Render_Texture_BGRA8_Change") == std::string::npos,
+			"W3D video has no second pre-unlock native frame publisher");
+		result |= check(source.find("m_surface->Unlock()") !=
+			std::string::npos,
+			"W3D video retains the SurfaceClass unlock publication boundary");
+	}
+
 	const unsigned int width = 16;
 	const unsigned int height = 9;
 	const unsigned int paddedPitch = width * 4 + 16;
@@ -4856,6 +5276,7 @@ int testW3DVideoBufferDirectPublicationLayout()
 	return result;
 }
 
+#if defined(RTS_RENDERER_HAS_D3D11)
 int testD3D11TextureRefreshContract()
 {
 	int result = 0;
@@ -5336,6 +5757,8 @@ int main()
 	result |= TestLegacyAsyncFramePolicy();
 	result |= TestLegacyAsyncBridgeCompletion();
 	result |= testBackendNames();
+	result |= testRenderTexturePublicationOperationalStates();
+	result |= testRendererTextureLifecycleContracts();
 	result |= testGenerationSafeHandles();
 	result |= testNeutralDescriptorDefaults();
 	result |= testLegacyLogicalState();
@@ -5347,11 +5770,11 @@ int main()
 	result |= testLegacyShaderBitDecoder();
 	result |= testRendererFrameLifecycleState();
 	result |= testRenderCaptureQueue();
+	result |= testW3DVideoBufferDirectPublicationLayout();
 #if defined(RTS_RENDERER_HAS_D3D11)
 	result |= testD3D11PrimitiveTopologyTranslation();
 	result |= testD3D11LegacyStateBoundary();
 	result |= testD3D11HeadlessDevice();
-	result |= testW3DVideoBufferDirectPublicationLayout();
 	result |= testD3D11TextureRefreshContract();
 	result |= testD3D11StateCacheEvictionContract();
 	result |= testD3D11LegacyBridgeLifecycleContract();

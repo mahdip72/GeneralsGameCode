@@ -30,7 +30,6 @@
 #include "Lib/BaseType.h"
 #include "WW3D2/camera.h"
 #include "WWLib/simplevec.h"
-#include "WW3D2/dx8wrapper.h"
 #include "Common/MapObject.h"
 #include "Common/PerfTimer.h"
 #include "W3DDevice/GameClient/HeightMap.h"
@@ -40,6 +39,7 @@
 #include "WW3D2/surfaceclass.h"
 #include "W3DDevice/GameClient/W3DShroud.h"
 #include "W3DDevice/Common/W3DShroudRenderPolicy.h"
+#include "Renderer/RenderTexturePublication.h"
 #include "WW3D2/textureloader.h"
 #include "Common/GlobalData.h"
 #include "GameLogic/PartitionManager.h"
@@ -335,7 +335,18 @@ Bool W3DShroud::syncSourceTexture()
 	}
 #endif
 
+	Bool publicationSucceeded = TRUE;
+#if defined(_WIN64)
+	publicationSucceeded = m_pSrcTexture->Unlock_Native_Surface() ? TRUE : FALSE;
+#else
 	m_pSrcTexture->Unlock();
+#endif
+	if (!publicationSucceeded)
+	{
+		// Keep the CPU-owned source image dirty. SurfaceClass retains the
+		// converted bytes, so the next render can retry after device recovery.
+		return FALSE;
+	}
 	m_srcTextureDirty=FALSE;
 	return TRUE;
 }
@@ -496,11 +507,11 @@ void W3DShroud::fillShroudData(W3DShroudLevel level)
 	m_srcTextureDirty=TRUE;
 }
 
-void W3DShroud::fillBorderShroudData(W3DShroudLevel level, SurfaceClass* pDestSurface)
+Bool W3DShroud::fillBorderShroudData(W3DShroudLevel level, SurfaceClass* pDestSurface)
 {
 	if (!pDestSurface || m_numCellsX <= 0 ||
 		m_dstTextureWidth <= 0 || m_dstTextureHeight <= 0)
-		return;
+		return FALSE;
 
 	Int x,y;
 	UnsignedShort pixel;
@@ -543,7 +554,7 @@ void W3DShroud::fillBorderShroudData(W3DShroudLevel level, SurfaceClass* pDestSu
 			ptr[x]=pixel;
 	m_srcTextureDirty=TRUE;
 	if (!syncSourceTexture())
-		return;
+		return FALSE;
 
 	//Fill destination texture with border color
 
@@ -570,21 +581,44 @@ void W3DShroud::fillBorderShroudData(W3DShroudLevel level, SurfaceClass* pDestSu
 		{
 			dstPoint.x = x * srcRect.right;	//advance to next set of pixel in row.
 
+#if defined(_WIN64)
+			if (!pDestSurface->Copy_Native_No_Publish(dstPoint.x, dstPoint.y, srcRect.left,
+				srcRect.top, srcRect.right - srcRect.left, 1,
+				m_pSrcTexture))
+			{
+				return FALSE;
+			}
+#else
 			pDestSurface->Copy(dstPoint.x, dstPoint.y, srcRect.left,
 				srcRect.top, srcRect.right - srcRect.left, 1,
 				m_pSrcTexture);
+#endif
 		}
 		if (numExtraPixels)
 		{	Int oldVal=srcRect.right;
 			dstPoint.x = numFullCopies * oldVal;
 			srcRect.right = numExtraPixels;
+#if defined(_WIN64)
+			if (!pDestSurface->Copy_Native_No_Publish(dstPoint.x, dstPoint.y, srcRect.left,
+				srcRect.top, srcRect.right - srcRect.left, 1,
+				m_pSrcTexture))
+			{
+				return FALSE;
+			}
+#else
 			pDestSurface->Copy(dstPoint.x, dstPoint.y, srcRect.left,
 				srcRect.top, srcRect.right - srcRect.left, 1,
 				m_pSrcTexture);
+#endif
 			srcRect.right = oldVal;
 		}
 	}
 
+#if defined(_WIN64)
+	return pDestSurface->Publish_Native_Changes();
+#else
+	return TRUE;
+#endif
 }
 
 /**Set the shroud color within the border area of the map*/
@@ -610,8 +644,14 @@ void W3DShroud::render(CameraClass *cam)
 	if (!m_pSrcTexture)
 		return; //nothing to update from.  Must be in reset state.
 
-	if (!DX8Wrapper::Is_Initted() || DX8Wrapper::Is_Device_Lost())
-		return;	//device not ready to render anything
+	// Shroud updates are published before WW3D::Begin_Render brackets the
+	// scene.  The publication owner, rather than the transient scene flag,
+	// reports whether the backend/device is initialized and operational; the
+	// destination texture must still own an initialized resource.
+	if (!rts::render::IsRenderTexturePublicationOperational() ||
+		!m_pDstTexture ||
+		!m_pDstTexture->Is_Initialized())
+		return;
 
 #if defined(RTS_DEBUG)
 	if (TheGlobalData && TheGlobalData->m_fogOfWarOn != m_drawFogOfWar)
@@ -807,17 +847,34 @@ void W3DShroud::render(CameraClass *cam)
 	if (destinationBorderDirty)
 	{	//we need to clear unused parts of the destination texture to a known
 		//color in order to keep map border in the state we want.
+		if (!fillBorderShroudData(m_boderShroudLevel, pDestSurface))
+		{
+			REF_PTR_RELEASE(pDestSurface);
+			return;
+		}
+		// Clear the retry latch only after every native border publication has
+		// succeeded. A failed copy leaves the CPU source and destination work
+		// dirty for the next render.
 		m_clearDstTexture=FALSE;
-
-		fillBorderShroudData(m_boderShroudLevel, pDestSurface);
 	}
 
 	if (updateDecision.copySource)
 	{
 		//USE_PERF_TIMER(shroudCopy)
+#if defined(_WIN64)
+		if (!pDestSurface->Copy_Native(dstPoint.x, dstPoint.y, srcRect.left,
+			srcRect.top, srcRect.right - srcRect.left,
+			srcRect.bottom - srcRect.top, m_pSrcTexture))
+		{
+			m_clearDstTexture = TRUE;
+			REF_PTR_RELEASE(pDestSurface);
+			return;
+		}
+#else
 		pDestSurface->Copy(dstPoint.x, dstPoint.y, srcRect.left,
 			srcRect.top, srcRect.right - srcRect.left,
 			srcRect.bottom - srcRect.top, m_pSrcTexture);
+#endif
 	}
 	if (updateDecision.notifyTexture)
 	{

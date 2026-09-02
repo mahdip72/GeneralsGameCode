@@ -43,6 +43,10 @@
 #include "WW3D2/camera.h"
 #include "WW3D2/scene.h"
 #include "WW3D2/dx8wrapper.h"
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+#include "WW3D2/nativew3dsampledtexture.h"
+#include "WW3D2/texturemipbuffer.h"
+#endif
 #include "Renderer/LegacyD3DMath.h"
 #include "WW3D2/light.h"
 #include "WWLib/simplevec.h"
@@ -530,8 +534,14 @@ WaterRenderObjClass::~WaterRenderObjClass()
 
 	i=NUM_BUMP_FRAMES;
 	while (i--)
-	{	SAFE_RELEASE( m_pBumpTexture[i]);
-		SAFE_RELEASE( m_pBumpTexture2[i]);
+	{
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+		REF_PTR_RELEASE(m_pBumpTexture[i]);
+		REF_PTR_RELEASE(m_pBumpTexture2[i]);
+#else
+		SAFE_RELEASE(m_pBumpTexture[i]);
+		SAFE_RELEASE(m_pBumpTexture2[i]);
+#endif
 	}
 
 	delete [] m_meshData;
@@ -600,6 +610,9 @@ WaterRenderObjClass::WaterRenderObjClass()
 	m_riverVOrigin=0;
 	m_riverTexture=nullptr;
 	m_whiteTexture=nullptr;
+#if defined(_WIN64)
+	m_whiteTexturePublishPending=FALSE;
+#endif
 	m_waterNoiseTexture=nullptr;
 	m_riverAlphaEdge=nullptr;
 	m_waterPixelShader=0;		///<D3D handle to pixel shader.
@@ -659,16 +672,149 @@ RenderObjClass *	 WaterRenderObjClass::Clone() const
 /** Copies raw bits from pBumpSrc (a regular grayscale texture) into a D3D
 	*   bump-map format. */
 //-------------------------------------------------------------------------------------------------
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+HRESULT WaterRenderObjClass::initBumpMap(TextureClass **pTex, TextureClass *pBumpSource)
+{
+	if (pTex == nullptr)
+	{
+		return E_POINTER;
+	}
+	*pTex = nullptr;
+	if (pBumpSource == nullptr)
+	{
+		return S_OK;
+	}
+
+	SurfaceClass::SurfaceDescription source_desc;
+	pBumpSource->Get_Level_Description(source_desc);
+	if (source_desc.Width == 0 || source_desc.Height == 0 ||
+		Get_Bytes_Per_Pixel(source_desc.Format) != 4)
+	{
+		// Match the legacy loader's tolerant handling of compressed or missing
+		// source images while leaving the native destination unbound.
+		return S_OK;
+	}
+
+	const unsigned int num_levels = pBumpSource->Get_Mip_Level_Count();
+	if (num_levels == 0 || num_levels > MIP_LEVELS_MAX)
+	{
+		return S_OK;
+	}
+
+	TextureMipBuffer bump_mips[MIP_LEVELS_MAX];
+	rts::render::NativeW3DSampledTextureMipView views[MIP_LEVELS_MAX];
+	unsigned int mip_width = source_desc.Width;
+	unsigned int mip_height = source_desc.Height;
+
+	for (unsigned int level = 0; level < num_levels; ++level)
+	{
+		SurfaceClass *surface = pBumpSource->Get_Surface_Level(level);
+		if (surface == nullptr)
+		{
+			return S_OK;
+		}
+
+		SurfaceClass::SurfaceDescription level_desc;
+		surface->Get_Description(level_desc);
+		if (level_desc.Width != mip_width || level_desc.Height != mip_height ||
+			Get_Bytes_Per_Pixel(level_desc.Format) != 4)
+		{
+			REF_PTR_RELEASE(surface);
+			return S_OK;
+		}
+
+		int source_pitch = 0;
+		BYTE *source = static_cast<BYTE *>(surface->Lock(&source_pitch));
+		if (source == nullptr || source_pitch <= 0 ||
+			static_cast<unsigned int>(source_pitch) < mip_width * 4U)
+		{
+			REF_PTR_RELEASE(surface);
+			return S_OK;
+		}
+
+		if (!bump_mips[level].allocate(WW3D_FORMAT_U8V8,
+			mip_width, mip_height, 1))
+		{
+			surface->Unlock_Read_Only();
+			REF_PTR_RELEASE(surface);
+			return E_OUTOFMEMORY;
+		}
+
+		const TextureMipLayout &destination_layout =
+			bump_mips[level].layout();
+		BYTE *destination = bump_mips[level].data();
+		for (unsigned int y = 0; y < mip_height; ++y)
+		{
+			const BYTE *source_row = source +
+				static_cast<size_t>(y) * static_cast<size_t>(source_pitch);
+			const BYTE *source_below = y + 1 < mip_height ?
+				source_row + source_pitch : source_row;
+			const BYTE *source_above = y != 0 ?
+				source_row - source_pitch : source_row;
+			BYTE *destination_row = destination +
+				static_cast<size_t>(y) * destination_layout.rowPitch;
+
+			for (unsigned int x = 0; x < mip_width; ++x)
+			{
+				const BYTE *source_pixel = source_row + x * 4U;
+				const BYTE *source_right = x + 1 < mip_width ?
+					source_pixel + 4 : source_pixel;
+				const BYTE *source_left = x != 0 ?
+					source_pixel - 4 : source_pixel;
+
+				const LONG v00 = 256 - source_pixel[0];
+				const LONG v01 = 256 - source_right[0];
+				const LONG vM1 = 256 - source_left[0];
+				const LONG v10 = 256 - source_below[x * 4U];
+				const LONG v1M = 256 - source_above[x * 4U];
+
+				LONG iDu = vM1 - v01;
+				const LONG iDv = v1M - v10;
+				if ((v00 < vM1) && (v00 < v01))
+				{
+					iDu = vM1 - v00;
+					if (iDu < v00 - v01)
+					{
+						iDu = v00 - v01;
+					}
+				}
+
+				BYTE *destination_pixel = destination_row + x * 2U;
+				*destination_pixel++ = static_cast<BYTE>(iDu);
+				*destination_pixel = static_cast<BYTE>(iDv);
+			}
+		}
+
+		surface->Unlock_Read_Only();
+		REF_PTR_RELEASE(surface);
+
+		views[level].data = bump_mips[level].data();
+		views[level].dataSize = destination_layout.dataSize;
+		views[level].rowPitch = destination_layout.rowPitch;
+		ReduceTextureMipDimensions(mip_width, mip_height);
+	}
+
+	rts::render::NativeW3DSampledTextureUpload upload;
+	if (!upload.Prepare(WW3D_FORMAT_U8V8, source_desc.Width,
+		source_desc.Height, num_levels, 1, views, num_levels))
+	{
+		return E_FAIL;
+	}
+
+	TextureClass *native_texture = TextureClass::Create_Native_From_Prepared(
+		upload.Descriptor(), upload.Subresources(),
+		upload.SubresourceCount(), WW3D_FORMAT_U8V8);
+	if (native_texture == nullptr)
+	{
+		return E_OUTOFMEMORY;
+	}
+
+	*pTex = native_texture;
+	return S_OK;
+}
+#else
 HRESULT WaterRenderObjClass::initBumpMap(LPDIRECT3DTEXTURE8 *pTex, TextureClass *pBumpSource)
 {
-#if defined(_WIN64)
-	// This legacy member retains a raw D3D8 texture and therefore cannot own a
-	// native sampled-resource handle. Keep it deterministically unbound on x64;
-	// ordinary water textures remain native and no D3D8 texture is created.
-	if (pTex != nullptr) *pTex = nullptr;
-	(void)pBumpSource;
-	return S_OK;
-#else
     SurfaceClass::SurfaceDescription    d3dsd;
 	SurfaceClass * surf;
     D3DLOCKED_RECT     d3dlr;
@@ -864,8 +1010,8 @@ HRESULT WaterRenderObjClass::initBumpMap(LPDIRECT3DTEXTURE8 *pTex, TextureClass 
 #endif
 
 	return S_OK;
-#endif
 }
+#endif
 
 //-------------------------------------------------------------------------------------------------
 /** Create and fill a D3D vertex buffer with water surface vertices */
@@ -1151,6 +1297,70 @@ void WaterRenderObjClass::ReleaseResources()
 }
 
 //-------------------------------------------------------------------------------------------------
+/** Publish the white pixel used when the water shader has no shroud texture.
+
+    The legacy path retains its original Unlock/notification ABI. Native x64
+    surfaces have a CPU shadow and a status-returning completion boundary; a
+    failed publication leaves that shadow available and marks the logical
+    pixel dirty so the next water setup/reacquire retries it. */
+//-------------------------------------------------------------------------------------------------
+Bool WaterRenderObjClass::updateWhiteTexture()
+{
+	if (m_whiteTexture == nullptr)
+	{
+#if defined(_WIN64)
+		m_whiteTexturePublishPending=TRUE;
+#endif
+		return FALSE;
+	}
+
+	if (!m_whiteTexture->Is_Initialized())
+		m_whiteTexture->Init();
+
+	SurfaceClass *surface=m_whiteTexture->Get_Surface_Level();
+	if (surface == nullptr)
+	{
+#if defined(_WIN64)
+		m_whiteTexturePublishPending=TRUE;
+#endif
+		return FALSE;
+	}
+
+	int pitch=0;
+	void *pBits = surface->Lock(&pitch);
+	const unsigned int bytesPerPixel = surface->Get_Bytes_Per_Pixel();
+	if (pBits == nullptr || pitch <= 0 || bytesPerPixel == 0)
+	{
+		// A successful Lock must still be completed before releasing the wrapper.
+		// On x64 this completion is status-bearing; the failed logical write stays
+		// pending even if the unlock itself can only release the CPU lock.
+#if defined(_WIN64)
+		if (pBits != nullptr)
+			(void)surface->Unlock_Native_Surface();
+		m_whiteTexturePublishPending=TRUE;
+#else
+		if (pBits != nullptr)
+			surface->Unlock();
+#endif
+		REF_PTR_RELEASE(surface);
+		return FALSE;
+	}
+
+	surface->Draw_Pixel(0, 0, 0xffffffff, bytesPerPixel, pBits, pitch);
+	Bool publicationSucceeded=FALSE;
+#if defined(_WIN64)
+	publicationSucceeded=surface->Unlock_Native_Surface() ? TRUE : FALSE;
+	m_whiteTexturePublishPending=publicationSucceeded ? FALSE : TRUE;
+#else
+	surface->Unlock();
+	publicationSucceeded=TRUE;
+	Notify_Render_Texture_Changed(m_whiteTexture);
+#endif
+	REF_PTR_RELEASE(surface);
+	return publicationSucceeded;
+}
+
+//-------------------------------------------------------------------------------------------------
 /** (Re)allocates all W3D assets after a reset.. */
 //-------------------------------------------------------------------------------------------------
 void WaterRenderObjClass::ReAcquireResources()
@@ -1176,7 +1386,9 @@ void WaterRenderObjClass::ReAcquireResources()
 		ib[5]=1;
 	}
 
+#if !defined(_WIN64) || !defined(RTS_RENDERER_HAS_D3D11)
 	m_pDev=DX8Wrapper::_Get_D3D_Device8();
+#endif
 
 	//We're using the same grid for either 3D Water Mesh or Pixel/Vertex shader.  Just
 	//allocate the right size depending on usage
@@ -1275,17 +1487,12 @@ void WaterRenderObjClass::ReAcquireResources()
 		m_riverAlphaEdge->Init();
 	if (m_waterSparklesTexture && !m_waterSparklesTexture->Is_Initialized())
 		m_waterSparklesTexture->Init();
-	if (m_whiteTexture && !m_whiteTexture->Is_Initialized())
-	{	m_whiteTexture->Init();
-		SurfaceClass *surface=m_whiteTexture->Get_Surface_Level();
-		int pitch;
-		void *pBits = surface->Lock(&pitch);
-		const unsigned int bytesPerPixel = surface->Get_Bytes_Per_Pixel();
-		surface->Draw_Pixel(0, 0, 0xffffffff, bytesPerPixel, pBits, pitch);
-		surface->Unlock();
-		Notify_Render_Texture_Changed(m_whiteTexture);
-		REF_PTR_RELEASE(surface);
-	}
+	if (m_whiteTexture && (!m_whiteTexture->Is_Initialized()
+#if defined(_WIN64)
+		|| m_whiteTexturePublishPending
+#endif
+		))
+		updateWhiteTexture();
 }
 
 void WaterRenderObjClass::load()
@@ -1358,7 +1565,9 @@ Int WaterRenderObjClass::init(Real waterLevel, Real dx, Real dy, SceneClass *par
 	ReAcquireResources();
 	if (type == WATER_TYPE_2_PVSHADER)
 	{	//geforce3 specific water requires some extra D3D assets
+#if !defined(_WIN64) || !defined(RTS_RENDERER_HAS_D3D11)
 		m_pDev=DX8Wrapper::_Get_D3D_Device8();
+#endif
 		//save previous thumbnail mode
 		bool thumbnails_enabled = WW3D::Get_Thumbnail_Enabled();
 		WW3D::Set_Thumbnail_Enabled(false);
@@ -1423,14 +1632,7 @@ Int WaterRenderObjClass::init(Real waterLevel, Real dx, Real dy, SceneClass *par
 
 	//For some reason setting a null texture does not result in 0xffffffff for pixel shaders so using explicit "white" texture.
 	m_whiteTexture=MSGNEW("TextureClass") TextureClass(1,1,WW3D_FORMAT_A4R4G4B4,MIP_LEVELS_1);
-	SurfaceClass *surface=m_whiteTexture->Get_Surface_Level();
-	int pitch;
-	void *pBits = surface->Lock(&pitch);
-	const unsigned int bytesPerPixel = surface->Get_Bytes_Per_Pixel();
-	surface->Draw_Pixel(0, 0, 0xffffffff, bytesPerPixel, pBits, pitch);
-	surface->Unlock();
-	Notify_Render_Texture_Changed(m_whiteTexture);
-	REF_PTR_RELEASE(surface);
+	updateWhiteTexture();
 
 	m_waterNoiseTexture=WW3DAssetManager::Get_Instance()->Get_Texture("Noise0000.tga");
 	m_riverAlphaEdge=WW3DAssetManager::Get_Instance()->Get_Texture("TWAlphaEdge.tga");
@@ -2192,7 +2394,11 @@ void WaterRenderObjClass::drawSea(RenderInfoClass & rinfo)
 	DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP);
 	DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP);
 
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	DX8Wrapper::Set_Texture(0, m_pBumpTexture[(Int)m_fBumpFrame]);
+#else
 	DX8Wrapper::Set_DX8_Texture(0, m_pBumpTexture[(Int)m_fBumpFrame]);
+#endif
 #ifdef MIPMAP_BUMP_TEXTURE
 	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MIPFILTER, D3DTEXF_POINT);
 	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
@@ -2297,7 +2503,11 @@ void WaterRenderObjClass::drawSea(RenderInfoClass & rinfo)
 	}
 //	m_pDev->SetRenderState(D3DRS_FILLMODE,D3DFILL_SOLID);
 	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE, FALSE);
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	DX8Wrapper::Set_Texture(0, nullptr);	//release reference to bump texture
+#else
 	DX8Wrapper::Set_DX8_Texture(0, nullptr);	//release reference to bump texture
+#endif
 	DX8Wrapper::Set_DX8_Texture(1, nullptr);	//release reference to reflection texture
 	DX8Wrapper::Set_DX8_Texture(2, nullptr);	//release reference to reflection texture
 
@@ -3455,17 +3665,12 @@ void WaterRenderObjClass::setupFlatWaterShader()
 		else
 		{	//Assume no shroud, so stage 3 will be null texture but using actual white because
 			//pixel shader on GF4 generates random colors with SetTexture(3,nullptr).
-			if (!m_whiteTexture->Is_Initialized())
-			{	m_whiteTexture->Init();
-				SurfaceClass *surface=m_whiteTexture->Get_Surface_Level();
-				int pitch;
-				void *pBits = surface->Lock(&pitch);
-				const unsigned int bytesPerPixel = surface->Get_Bytes_Per_Pixel();
-				surface->Draw_Pixel(0, 0, 0xffffffff, bytesPerPixel, pBits, pitch);
-				surface->Unlock();
-				Notify_Render_Texture_Changed(m_whiteTexture);
-				REF_PTR_RELEASE(surface);
-			}
+			if (m_whiteTexture != nullptr && (!m_whiteTexture->Is_Initialized()
+#if defined(_WIN64)
+				|| m_whiteTexturePublishPending
+#endif
+				))
+				updateWhiteTexture();
 			DX8Wrapper::Set_Texture(3, m_whiteTexture);
 		}
 	}

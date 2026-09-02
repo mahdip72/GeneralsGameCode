@@ -130,8 +130,8 @@ public:
 
 	FakeRenderDevice() : m_allocator(64), m_operational(true),
 		m_failCreate(false), m_failRefresh(false), m_failDestroy(false),
-		m_failRecovery(false), m_destroyCount(0),
-		m_recoveryCount(0), m_textures(64)
+		m_failRecovery(false), m_createCount(0), m_refreshCount(0),
+		m_destroyCount(0), m_recoveryCount(0), m_textures(64)
 	{
 	}
 
@@ -169,12 +169,14 @@ public:
 		slot.handle = created;
 		slot.descriptor = descriptor;
 		*texture = created;
+		++m_createCount;
 		return RENDER_RESULT_OK;
 	}
 	RenderResult refreshTexture(GpuHandle texture,
 		const TextureDescriptor &descriptor, const TextureSubresourceData *,
 		unsigned int) override
 	{
+		++m_refreshCount;
 		if (m_failRefresh)
 		{
 			return RENDER_RESULT_FAILED;
@@ -242,6 +244,8 @@ public:
 	void FailRefresh(bool fail) { m_failRefresh = fail; }
 	void FailDestroy(bool fail) { m_failDestroy = fail; }
 	void FailRecovery(bool fail) { m_failRecovery = fail; }
+	unsigned int CreateCount() const { return m_createCount; }
+	unsigned int RefreshCount() const { return m_refreshCount; }
 	unsigned int DestroyCount() const { return m_destroyCount; }
 	unsigned int RecoveryCount() const { return m_recoveryCount; }
 	unsigned int LiveCount() const { return m_allocator.liveCount(); }
@@ -264,6 +268,8 @@ private:
 	bool m_failRefresh;
 	bool m_failDestroy;
 	bool m_failRecovery;
+	unsigned int m_createCount;
+	unsigned int m_refreshCount;
 	unsigned int m_destroyCount;
 	unsigned int m_recoveryCount;
 	std::vector<Texture> m_textures;
@@ -402,6 +408,31 @@ int TestNeutralTextureOwnership()
 	result |= Check(owner.AcquireForSampling(&firstHandle) == RENDER_RESULT_OK &&
 		firstHandle.isValid(),
 		"CPU-authoritative content acquires its exact typed sampling handle");
+	const unsigned int steadyStateCreates = device.CreateCount();
+	const unsigned int steadyStateDestroys = device.DestroyCount();
+	const unsigned int steadyStateRefreshes = device.RefreshCount();
+	std::fill(&topBytes[0], &topBytes[sizeof(topBytes)],
+		static_cast<unsigned char>(0x2a));
+	std::fill(&lowerBytes[0], &lowerBytes[sizeof(lowerBytes)],
+		static_cast<unsigned char>(0x35));
+	NativeW3DTextureHandle refreshedHandle;
+	result |= Check(owner.RefreshCpuContent(cpuDescriptor, cpuData, 2) ==
+		RENDER_RESULT_OK &&
+		owner.AcquireForSampling(&refreshedHandle) == RENDER_RESULT_OK &&
+		refreshedHandle.resource == firstHandle.resource &&
+		refreshedHandle.attachmentGeneration ==
+			firstHandle.attachmentGeneration &&
+		device.CreateCount() == steadyStateCreates &&
+		device.DestroyCount() == steadyStateDestroys &&
+		device.RefreshCount() == steadyStateRefreshes + 1,
+		"steady-state CPU refresh updates the existing native resource in place");
+	std::fill(&topBytes[0], &topBytes[sizeof(topBytes)],
+		static_cast<unsigned char>(0x4c));
+	result |= Check(owner.RefreshCpuContent(cpuDescriptor, cpuData, 2) ==
+		RENDER_RESULT_OK && device.CreateCount() == steadyStateCreates &&
+		device.DestroyCount() == steadyStateDestroys &&
+		device.RefreshCount() == steadyStateRefreshes + 2,
+		"repeated CPU refresh does not allocate or retire a native resource");
 	const unsigned int generationBeforeRawPublicationDestroy =
 		owner.PublicationGeneration();
 	result |= Check(!resources.DestroyTexture(firstHandle) &&
@@ -647,10 +678,14 @@ int TestNeutralTextureOwnership()
 		staleGpuHandle.resource == gpuHandle.resource,
 		"regenerated output is sampleable only with its new exact lease");
 
+	const unsigned int failureRetryCreates = device.CreateCount();
+	const unsigned int failureRetryDestroys = device.DestroyCount();
 	device.FailRefresh(true);
 	result |= Check(owner.RefreshCpuContent(gpuDescriptor,
 		&gpuCpuData, 1) == RENDER_RESULT_FAILED &&
-		resources.IsValid(gpuHandle),
+		resources.IsValid(gpuHandle) &&
+		device.CreateCount() == failureRetryCreates &&
+		device.DestroyCount() == failureRetryDestroys,
 		"a mutation fault leaves the typed resource live while invalidating content");
 	NativeW3DTextureHandle authorityRejected = gpuHandle;
 	const RenderResult authorityResult =
@@ -661,8 +696,11 @@ int TestNeutralTextureOwnership()
 	device.FailRefresh(false);
 	result |= Check(owner.RefreshCpuContent(gpuDescriptor,
 		&gpuCpuData, 1) == RENDER_RESULT_OK &&
-		owner.AcquireForSampling(&authorityRejected) == RENDER_RESULT_OK,
-		"a complete republish restores CPU sampling after authority invalidation");
+		owner.AcquireForSampling(&authorityRejected) == RENDER_RESULT_OK &&
+		authorityRejected.resource == gpuHandle.resource &&
+		device.CreateCount() == failureRetryCreates &&
+		device.DestroyCount() == failureRetryDestroys,
+		"a complete in-place retry restores CPU sampling without replacing the resource");
 
 	const unsigned int resetDestroys = device.DestroyCount();
 	const unsigned int generationBeforeReset = owner.PublicationGeneration();

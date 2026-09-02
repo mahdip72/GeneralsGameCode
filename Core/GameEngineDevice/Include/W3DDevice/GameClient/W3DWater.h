@@ -158,7 +158,9 @@ protected:
 		float tu, tv;
 	};
 
+#if !defined(_WIN64) || !defined(RTS_RENDERER_HAS_D3D11)
 	LPDIRECT3DDEVICE8 m_pDev;						///<pointer to D3D Device
+#endif
 #if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
 	DX8VertexBufferClass *m_vertexBufferD3D;		///<native WW3D vertex-buffer owner
 	DX8IndexBufferClass *m_indexBufferD3D;		///<native WW3D index-buffer owner
@@ -171,8 +173,13 @@ protected:
 	DWORD					m_dwWaveVertexShader;	///<handle to D3D vertex shader
 	Int	m_numVertices;				///<number of vertices in D3D vertex buffer
 	Int m_numIndices;				///<number of indices in D3D index buffer
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	TextureClass *m_pBumpTexture[NUM_BUMP_FRAMES];	///<native animation frames
+	TextureClass *m_pBumpTexture2[NUM_BUMP_FRAMES];	///<native animation frames
+#else
 	LPDIRECT3DTEXTURE8 m_pBumpTexture[NUM_BUMP_FRAMES]; ///<animation frames
 	LPDIRECT3DTEXTURE8 m_pBumpTexture2[NUM_BUMP_FRAMES]; ///<animation frames
+#endif
 	Real				m_fBumpFrame;	///<current animation frame
 	Real				m_fBumpScale;	///<scales bump map uv perturbation
 	TextureClass * m_pReflectionTexture;	///<render target for reflection
@@ -216,6 +223,12 @@ protected:
 	Real m_riverVOrigin;
 	TextureClass *m_riverTexture;
 	TextureClass *m_whiteTexture;		///< a texture containing only white used for null pixel shader stages.
+#if defined(_WIN64)
+	// A native white-texture publication can fail independently of texture
+	// allocation (for example while the bridge is recovering). Keep the
+	// logical pixel dirty until a later water setup/reacquire retries it.
+	Bool m_whiteTexturePublishPending;
+#endif
 	TextureClass *m_waterNoiseTexture;
 	DWORD	m_waterPixelShader;		///<D3D handle to pixel shader.
 	DWORD	m_riverWaterPixelShader;		///<D3D handle to pixel shader.
@@ -253,12 +266,17 @@ protected:
 	void testCurvedWater();	///<draw the sky layer (clouds, stars, etc.)
 	void renderSkyBody(Matrix3D *mat);	///<draw the sky body (sun, moon, etc.)
 	void renderWaterMesh();			///<draw the water surface mesh (deformed 3d mesh).
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	HRESULT initBumpMap(TextureClass **pTex, TextureClass *pBumpSource);	///<publishes native signed bump-map data.
+#else
 	HRESULT initBumpMap(LPDIRECT3DTEXTURE8 *pTex, TextureClass *pBumpSource);	///<copies data into bump-map format.
+#endif
 	void renderMirror(CameraClass *cam);	///< Draw reflected scene into texture
 	void drawSea(RenderInfoClass & rinfo);	///< Draw the surface of the water
 	///bounding box of frustum clipped polygon plane
 	Bool getClippedWaterPlane(CameraClass *cam, AABoxClass *box);
 
+	Bool updateWhiteTexture();
 	void setupFlatWaterShader();
 	void setupJbaWaterShader();
 	void cleanupJbaWaterShader();

@@ -94,6 +94,15 @@ class SurfaceClass : public RefCountClass
 		LockedSurfacePtr Lock(int *pitch);
 		LockedSurfacePtr Lock(int *pitch, const Vector2i &min, const Vector2i &max);
 		void Unlock();
+		// Complete a read-only lock without republishing an unchanged native
+		// subresource. Legacy D3D8 still performs its required UnlockRect call.
+		void Unlock_Read_Only();
+#if defined(_WIN64)
+		// Native callers need the publication result so a device/ownership or
+		// upload failure can retain its dirty CPU image for a later retry. Keep
+		// Unlock() above unchanged for the legacy ABI and callers.
+		bool Unlock_Native_Surface();
+#endif
 
 		// HY -- The following functions are support functions for font3d
 		// zaps the surface memory to zero
@@ -105,6 +114,25 @@ class SurfaceClass : public RefCountClass
 			unsigned int srcx, unsigned int srcy,
 			unsigned int width, unsigned int height,
 			const SurfaceClass *other);
+#if defined(_WIN64)
+		// Status-returning native counterpart used by migrated callers. The
+		// legacy void Copy overload remains source/ABI compatible.
+		bool Copy_Native(
+			unsigned int dstx, unsigned int dsty,
+			unsigned int srcx, unsigned int srcy,
+			unsigned int width, unsigned int height,
+			const SurfaceClass *other);
+		// Mutate the native CPU shadow without publishing it.  Batch callers
+		// must finish with Publish_Native_Changes so a multi-region update only
+		// refreshes the owning texture once.  A failed publication leaves the
+		// retained shadow available for a later retry.
+		bool Copy_Native_No_Publish(
+			unsigned int dstx, unsigned int dsty,
+			unsigned int srcx, unsigned int srcy,
+			unsigned int width, unsigned int height,
+			const SurfaceClass *other);
+		bool Publish_Native_Changes();
+#endif
 
 		// support for copying from a byte array
 		void Copy(const unsigned char *other);
@@ -127,7 +155,7 @@ class SurfaceClass : public RefCountClass
 		// makes a copy of the surface into a byte array
 		unsigned char *CreateCopy(int *width,int *height,int*size,bool flip=false);
 
-			// For use by TextureClass:
+		// For use by TextureClass:
 		IDirect3DSurface8 *Peek_D3D_Surface() { return D3DSurface; }
 
 		// Attaching and detaching a surface pointer

@@ -2,6 +2,9 @@
 
 #include <math.h>
 
+class TextureBaseClass;
+class TextureClass;
+
 namespace rts
 {
 namespace render
@@ -11,6 +14,8 @@ namespace
 LegacyLogicalState g_trackedLogicalState;
 bool g_trackedPipelineStateValid = false;
 bool g_legacyStatePublicationFailed = false;
+TextureBaseClass *g_publishedRenderTextures[LEGACY_TEXTURE_STAGE_COUNT] = { 0 };
+unsigned int g_renderTextureUseCount = 0;
 }
 
 RenderFloat4::RenderFloat4() : x(0.0f), y(0.0f), z(0.0f), w(0.0f) {}
@@ -465,6 +470,11 @@ void ResetTrackedLegacyState()
 	g_trackedLogicalState = LegacyLogicalState();
 	g_trackedPipelineStateValid = false;
 	g_legacyStatePublicationFailed = false;
+	for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
+	{
+		g_publishedRenderTextures[stage] = 0;
+	}
+	g_renderTextureUseCount = 0;
 }
 
 void SeedTrackedLegacyPipelineState()
@@ -688,6 +698,51 @@ bool GetTrackedLegacyTextureStage(unsigned int index,
 	}
 	*textureStage = g_trackedLogicalState.pipeline.textureStages[index];
 	return true;
+}
+
+void Publish_Render_Texture_Stage(unsigned int stage,
+	TextureBaseClass *texture)
+{
+	if (stage >= LEGACY_TEXTURE_STAGE_COUNT)
+	{
+		return;
+	}
+	g_publishedRenderTextures[stage] = texture;
+	TrackLegacyTexturePresence(stage, texture != 0);
+}
+
+TextureBaseClass *Get_Published_Render_Texture_Stage(unsigned int stage)
+{
+	return stage < LEGACY_TEXTURE_STAGE_COUNT ?
+		g_publishedRenderTextures[stage] : 0;
+}
+
+void Unpublish_Render_Texture(TextureBaseClass *texture)
+{
+	if (texture == 0)
+	{
+		return;
+	}
+	for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
+	{
+		if (g_publishedRenderTextures[stage] == texture)
+		{
+			Publish_Render_Texture_Stage(stage, 0);
+		}
+	}
+}
+
+void Record_Render_Texture_Use(TextureClass *texture)
+{
+	if (texture != 0)
+	{
+		++g_renderTextureUseCount;
+	}
+}
+
+unsigned int Get_Render_Texture_Use_Count()
+{
+	return g_renderTextureUseCount;
 }
 
 bool TrackLegacyTexturePresence(unsigned int index, bool present)

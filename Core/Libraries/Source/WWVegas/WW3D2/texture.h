@@ -329,7 +329,20 @@ public:
 		PoolType pool=POOL_MANAGED,
 		bool rendertarget=false,
 		bool allow_reduction=true
+#if defined(_WIN64)
+		, bool initialize_native_resource=true
+#endif
 	);
+
+#if defined(_WIN64)
+	// Build a texture directly from a validated native upload. This avoids
+	// allocating an empty resource that is immediately retired by the first
+	// prepared publication.
+	static TextureClass *Create_Native_From_Prepared(
+		const rts::render::TextureDescriptor &descriptor,
+		const rts::render::TextureSubresourceData *subresources,
+		unsigned int subresource_count, WW3DFormat source_format);
+#endif
 
 	// Create texture from a file. If format is specified the texture is converted to that format.
 	// Note that the format must be supported by the current device and that a texture can't exist

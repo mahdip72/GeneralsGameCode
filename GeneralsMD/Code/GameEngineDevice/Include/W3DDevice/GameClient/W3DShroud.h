@@ -25,7 +25,6 @@
 #pragma once
 
 #include "WW3D2/matpass.h"
-#include "WW3D2/dx8wrapper.h"
 
 class AABoxClass;
 class WorldHeightMap;
@@ -123,5 +122,5 @@ protected:
 	W3DShroudLevel *m_currentFogData;		///<copy of intermediate logical shroud while it's interpolated.
 	Bool syncSourceTexture();							///<upload the CPU backing store while the source surface is locked
 	void interpolateFogLevels(RECT *rect);		///<fade current fog levels to actual logic side levels.
-	void fillBorderShroudData(W3DShroudLevel level, SurfaceClass* pDestSurface);	///<fill the destination texture with a known value
+	Bool fillBorderShroudData(W3DShroudLevel level, SurfaceClass* pDestSurface);	///<fill the destination texture with a known value
 };

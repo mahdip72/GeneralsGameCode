@@ -74,6 +74,7 @@ target_link_libraries(core_renderer_contract_tests PRIVATE
 )
 target_compile_definitions(core_renderer_contract_tests PRIVATE
     RTS_RENDERER_RESET_TEST_LEGACY_FRAGMENT=1
+    RTS_SOURCE_ROOT="${CMAKE_SOURCE_DIR}"
 )
 if(TARGET core_ww3d2_native)
     target_link_libraries(core_renderer_contract_tests PRIVATE

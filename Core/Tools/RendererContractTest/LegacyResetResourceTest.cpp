@@ -140,6 +140,7 @@ class DX8Wrapper
 {
 public:
 	static bool IsInitted;
+	static bool IsDeviceLost;
 	static FakeDevice *D3DDevice;
 	static CleanupHook *m_pCleanupHook;
 	static IDirect3DVertexBuffer8 *RawVertexBuffer;
@@ -167,6 +168,7 @@ public:
 	static HRESULT Set_DX8_Index_Buffer(IDirect3DIndexBuffer8 *, UINT);
 };
 bool DX8Wrapper::IsInitted = true;
+bool DX8Wrapper::IsDeviceLost = false;
 FakeDevice *DX8Wrapper::D3DDevice = nullptr;
 CleanupHook *DX8Wrapper::m_pCleanupHook = nullptr;
 IDirect3DVertexBuffer8 *DX8Wrapper::RawVertexBuffer = nullptr;
@@ -293,6 +295,7 @@ int testReset(bool nativeBackend, bool failStream, bool failIndices,
 	DX8Wrapper::D3DDevice = &device;
 	DX8Wrapper::m_pCleanupHook = &cleanup;
 	_UseD3D11Backend = nativeBackend;
+	DX8Wrapper::IsDeviceLost = true;
 	_D3D11Bridge = FakeBridge();
 	DX8Wrapper::Set_DX8_Vertex_Buffer(&vertex, 12, 2);
 	DX8Wrapper::Set_DX8_Index_Buffer(&index, 2788);
@@ -305,6 +308,8 @@ int testReset(bool nativeBackend, bool failStream, bool failIndices,
 	const bool reset = DX8Wrapper::Reset_Device(reloadAssets, &requiresReacquire);
 	result |= check(reset == !failReset && requiresReacquire,
 		"reset reaches the device with all DEFAULT-pool application references released");
+	result |= check(DX8Wrapper::IsDeviceLost == !reset,
+		"successful legacy reset clears the device-lost publication latch");
 	result |= check(device.resetCalls == 1 && vertex.references == 0 && index.references == 0,
 		"both raw references are released before Reset, including rejected unbinds");
 	result |= check(device.streamCalls == 2 && device.indicesCalls == 2,
@@ -321,6 +326,8 @@ int testReset(bool nativeBackend, bool failStream, bool failIndices,
 		device.resetResult = D3D_OK;
 		result |= check(DX8Wrapper::Reset_Device(reloadAssets, &requiresReacquire),
 			"a failed reset can be retried without stale raw references");
+		result |= check(!DX8Wrapper::IsDeviceLost,
+			"a successful reset retry also clears the device-lost publication latch");
 	}
 	DX8Wrapper::Release_DX8_Buffer_Bindings();
 	result |= check(vertex.references == 0 && index.references == 0,

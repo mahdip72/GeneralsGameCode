@@ -550,7 +550,6 @@ void FFmpegVideoStream::frameRender( VideoBuffer *buffer )
 
 	AVPixelFormat dst_pix_fmt;
 	UnsignedInt bytes_per_pixel;
-	Bool direct_bgra8_publication = FALSE;
 
 	switch (buffer->format()) {
 		case VideoBuffer::TYPE_R8G8B8:
@@ -563,12 +562,6 @@ void FFmpegVideoStream::frameRender( VideoBuffer *buffer )
 			// conversion supplied before DRAW_IMAGE_ALPHA sampling.
 			dst_pix_fmt = AV_PIX_FMT_BGRA;
 			bytes_per_pixel = 4;
-			{
-				const AVPixFmtDescriptor *source_descriptor = av_pix_fmt_desc_get(
-					static_cast<AVPixelFormat>(m_frame->format));
-				direct_bgra8_publication = source_descriptor != nullptr &&
-					(source_descriptor->flags & AV_PIX_FMT_FLAG_ALPHA) == 0;
-			}
 			break;
 		case VideoBuffer::TYPE_R5G6B5:
 			dst_pix_fmt = AV_PIX_FMT_RGB565;
@@ -611,10 +604,6 @@ void FFmpegVideoStream::frameRender( VideoBuffer *buffer )
 	const int result =
 		sws_scale(m_swsContext, m_frame->data, m_frame->linesize, 0, height(), dst_data, dst_strides);
 	DEBUG_ASSERTLOG(result >= 0, ("Failed to scale frame"));
-	if (result == static_cast<int>(buffer->height()) &&
-		direct_bgra8_publication) {
-		buffer->publishLockedFrame();
-	}
 	buffer->unlock();
 }
 

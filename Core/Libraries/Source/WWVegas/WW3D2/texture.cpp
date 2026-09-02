@@ -41,18 +41,23 @@
 
 #include "texture.h"
 
-#include <d3d8.h>
+#if defined(_WIN64)
+#include "Renderer/RenderTexturePublication.h"
+#else
 #include "dx8wrapper.h"
+#endif
 #include "WWLib/TARGA.h"
 #include <WWLib/nstrdup.h>
 #include "w3d_file.h"
 #include "assetmgr.h"
+#if !defined(_WIN64)
 #include "formconv.h"
-#include "textureloader.h"
 #include "missingtexture.h"
-#include "WWLib/ffactory.h"
 #include "dx8caps.h"
 #include "dx8texman.h"
+#endif
+#include "textureloader.h"
+#include "WWLib/ffactory.h"
 #include "meshmatdesc.h"
 #include "texturethumbnail.h"
 #include "WWDebug/wwprofile.h"
@@ -136,6 +141,17 @@ static bool Apply_Native_Empty_Texture(TextureBaseClass *texture,
 	return texture->Apply_Native_Texture(descriptor, upload.Subresources(),
 		upload.SubresourceCount(), format, true);
 }
+
+// Native sampled uploads are the x64 format authority.  In particular, the
+// old bump-capability query was a legacy device query and could report a format
+// that the native conversion path could not actually publish.  Keep the
+// legacy query in the Win32/VC6 branch and use this single neutral predicate
+// everywhere the texture constructors select a requested format.
+static bool Is_Native_Texture_Format_Supported(WW3DFormat format)
+{
+	return rts::render::NativeW3DSampledTextureUpload::SupportsSourceFormat(
+		format);
+}
 #endif
 
 // This throttles submissions to the background texture loading queue.
@@ -196,10 +212,11 @@ TextureBaseClass::~TextureBaseClass()
 
 	Release_D3D_Texture();
 #if defined(_WIN64)
+	rts::render::UnpublishTexture(this);
 	Release_Native_Texture();
-#endif
-
+#else
 	DX8TextureManagerClass::Remove(this);
+#endif
 }
 
 #if defined(_WIN64)
@@ -524,9 +541,6 @@ bool TextureBaseClass::Update_Native_Subresource_Data(unsigned int mip_level,
 	if (NativeTexture == nullptr || data == nullptr || row_pitch == 0 ||
 		slice_pitch == 0 || mip_level >= NativeTexture->descriptor.mipCount ||
 		array_slice >= NativeTexture->descriptor.arrayCount) return false;
-	rts::render::NativeW3DTextureHandle cpu_handle;
-	if (NativeTexture->owner.AcquireForSampling(&cpu_handle) !=
-		rts::render::RENDER_RESULT_OK) return false;
 	const unsigned int count = NativeTexture->descriptor.mipCount *
 		NativeTexture->descriptor.arrayCount;
 	const unsigned int replaced = array_slice * NativeTexture->descriptor.mipCount +
@@ -535,21 +549,36 @@ bool TextureBaseClass::Update_Native_Subresource_Data(unsigned int mip_level,
 		count != NativeTexture->rowPitches.size() ||
 		count != NativeTexture->slicePitches.size() ||
 		row_pitch != NativeTexture->rowPitches[replaced] ||
-		slice_pitch != NativeTexture->slicePitches[replaced]) return false;
+		slice_pitch != NativeTexture->slicePitches[replaced] ||
+		NativeTexture->pixels[replaced].size() != slice_pitch) return false;
+	// Keep the new image in the owner-side CPU shadow before attempting the
+	// backend mutation. A lost device, ownership rejection, or apply failure
+	// can invalidate native authority; the next lock then retries this exact
+	// image without requiring the transient SurfaceClass to stay alive.
+	memcpy(&NativeTexture->pixels[replaced][0], data, slice_pitch);
 	std::vector<rts::render::TextureSubresourceData> subresources;
 	try { subresources.resize(count); }
 	catch (...) { return false; }
 	for (unsigned int index = 0; index < count; ++index)
 	{
 		if (NativeTexture->pixels[index].empty()) return false;
-		subresources[index].data = index == replaced ? data :
-			&NativeTexture->pixels[index][0];
+		subresources[index].data = &NativeTexture->pixels[index][0];
 		subresources[index].rowPitch = NativeTexture->rowPitches[index];
 		subresources[index].slicePitch = NativeTexture->slicePitches[index];
 	}
-	return Apply_Native_Texture(NativeTexture->descriptor, &subresources[0],
-		count, NativeTexture->sourceFormat, true, InactivationTime == 0,
-		NativeTexture->missing);
+	// RefreshCpuContent is the in-place NativeW3DResources update path. It
+	// preserves the existing resource/generation for steady-state video and
+	// shroud writes; full candidate publication is reserved for initial
+	// publication or an explicit descriptor/generation rebuild.
+	const rts::render::RenderResult result =
+		NativeTexture->owner.RefreshCpuContent(NativeTexture->descriptor,
+			&subresources[0], count);
+	if (result != rts::render::RENDER_RESULT_OK)
+	{
+		return false;
+	}
+	NativeTexture->gpuLease = rts::render::NativeW3DGpuContentLease();
+	return true;
 }
 
 size_t TextureBaseClass::Get_Native_Texture_Byte_Count() const
@@ -564,11 +593,18 @@ size_t TextureBaseClass::Get_Native_Texture_Byte_Count() const
 
 void TextureBaseClass::Release_D3D_Texture()
 {
+#if defined(_WIN64)
+	// The x64 product owns only NativeTextureStorage.  D3DTexture is retained
+	// as an ABI-compatible legacy slot, but must never be released or allowed
+	// to become a second resource authority.
+	D3DTexture = nullptr;
+#else
 	if (D3DTexture != nullptr)
 	{
 		D3DTexture->Release();
 		D3DTexture = nullptr;
 	}
+#endif
 }
 
 
@@ -696,7 +732,11 @@ void TextureBaseClass::Invalidate()
 IDirect3DBaseTexture8 * TextureBaseClass::Peek_D3D_Base_Texture() const
 {
 	LastAccessed=WW3D::Get_Sync_Time();
+#if defined(_WIN64)
+	return nullptr;
+#else
 	return D3DTexture;
+#endif
 }
 
 //**********************************************************************************************
@@ -709,6 +749,13 @@ void TextureBaseClass::Set_D3D_Base_Texture(IDirect3DBaseTexture8* tex)
 	// reset the access timer whenever someon messes with this pointer.
 	LastAccessed=WW3D::Get_Sync_Time();
 
+#if defined(_WIN64)
+	// Native texture publication is explicit and typed.  Residual x64 callers
+	// may still pass the old ABI pointer, but accepting it here would reintroduce
+	// an unmanaged compatibility lifetime alongside NativeTextureStorage.
+	(void)tex;
+	D3DTexture = nullptr;
+#else
 	if (D3DTexture != nullptr) {
 		D3DTexture->Release();
 	}
@@ -716,6 +763,7 @@ void TextureBaseClass::Set_D3D_Base_Texture(IDirect3DBaseTexture8* tex)
 	if (D3DTexture != nullptr) {
 		D3DTexture->AddRef();
 	}
+#endif
 }
 
 
@@ -843,7 +891,7 @@ void TextureBaseClass::Apply_Null(unsigned int stage)
 {
 	// This function sets the render states for a "null" texture
 #if defined(_WIN64)
-	DX8Wrapper::Set_Native_Texture(stage, nullptr);
+	rts::render::PublishTextureStage(stage, nullptr);
 #else
 	DX8Wrapper::Set_DX8_Texture(stage, nullptr);
 #endif
@@ -1048,12 +1096,19 @@ TextureClass::TextureClass
 	PoolType pool,
 	bool rendertarget,
 	bool allow_reduction
+#if defined(_WIN64)
+	, bool initialize_native_resource
+#endif
 )
 :	TextureBaseClass(width, height, mip_level_count, pool, rendertarget,allow_reduction),
 	Filter(mip_level_count),
 	TextureFormat(format)
 {
+#if defined(_WIN64)
+	Initialized=initialize_native_resource;
+#else
 	Initialized=true;
+#endif
 	IsProcedural=true;
 	IsReducible=false;
 
@@ -1070,7 +1125,7 @@ TextureClass::TextureClass
 	}
 
 #if defined(_WIN64)
-	if (!Apply_Native_Empty_Texture(this, width, height, format,
+	if (initialize_native_resource && !Apply_Native_Empty_Texture(this, width, height, format,
 		mip_level_count, 1, rendertarget))
 	{
 		Initialized = false;
@@ -1085,20 +1140,18 @@ TextureClass::TextureClass
 	default: WWASSERT(0);
 	}
 
-	Poke_Texture
+	Poke_Texture(DX8Wrapper::_Create_DX8_Texture
 	(
-		DX8Wrapper::_Create_DX8_Texture
-		(
-			width,
-			height,
-			format,
-			mip_level_count,
-			d3dpool,
-			rendertarget
-		)
-	);
+		width,
+		height,
+		format,
+		mip_level_count,
+		d3dpool,
+		rendertarget
+	));
+	Initialized = Peek_D3D_Base_Texture() != nullptr;
 
-	if (pool==POOL_DEFAULT)
+	if (Initialized && pool==POOL_DEFAULT)
 	{
 		Set_Dirty();
 		DX8TextureTrackerClass *track=new DX8TextureTrackerClass
@@ -1115,6 +1168,38 @@ TextureClass::TextureClass
 #endif
 	LastAccessed=WW3D::Get_Sync_Time();
 }
+
+#if defined(_WIN64)
+TextureClass *TextureClass::Create_Native_From_Prepared(
+	const rts::render::TextureDescriptor &descriptor,
+	const rts::render::TextureSubresourceData *subresources,
+	unsigned int subresource_count, WW3DFormat source_format)
+{
+	if (descriptor.width == 0 || descriptor.height == 0 ||
+		descriptor.mipCount == 0 || descriptor.arrayCount != 1 ||
+		descriptor.dimension != rts::render::RENDER_TEXTURE_2D ||
+		subresources == nullptr || subresource_count == 0)
+	{
+		return nullptr;
+	}
+
+	TextureClass *texture = NEW_REF(TextureClass,
+		(descriptor.width, descriptor.height, source_format,
+		static_cast<MipCountType>(descriptor.mipCount),
+		TextureBaseClass::POOL_MANAGED, false, false, false));
+	if (texture == nullptr)
+	{
+		return nullptr;
+	}
+	if (!texture->Apply_Native_Texture(descriptor, subresources,
+		subresource_count, source_format, true))
+	{
+		REF_PTR_RELEASE(texture);
+		return nullptr;
+	}
+	return texture;
+}
+#endif
 
 
 
@@ -1151,7 +1236,11 @@ TextureClass::TextureClass
 		// If requesting bumpmap format that isn't available we'll just return the surface in whatever color
 		// format the texture file is in. (This is illegal case, the format support should always be queried
 		// before creating a bump texture!)
+	#if defined(_WIN64)
+		if (!Is_Native_Texture_Format_Supported(TextureFormat))
+	#else
 		if (!DX8Wrapper::Is_Initted() || !DX8Wrapper::Get_Current_Caps()->Support_Texture_Format(TextureFormat))
+	#endif
 		{
 			TextureFormat=WW3D_FORMAT_UNKNOWN;
 		}
@@ -1284,10 +1373,11 @@ TextureClass::TextureClass
 			Initialized = false;
 		}
 	}
-	if (data != nullptr) surface->Unlock();
+	if (data != nullptr) surface->Unlock_Read_Only();
 #else
-	Poke_Texture(DX8Wrapper::_Create_DX8_Texture(surface->Peek_D3D_Surface(),
-		mip_level_count));
+	Poke_Texture(DX8Wrapper::_Create_DX8_Texture(
+		surface->Peek_D3D_Surface(), mip_level_count));
+	Initialized = Peek_D3D_Base_Texture() != nullptr;
 #endif
 	LastAccessed=WW3D::Get_Sync_Time();
 }
@@ -1365,10 +1455,11 @@ void TextureClass::Init()
 	}
 
 
-	bool has_texture = Peek_D3D_Base_Texture() != nullptr;
 #if defined(_WIN64)
 	rts::render::NativeW3DTextureHandle native_handle;
-	has_texture = Acquire_Native_Texture(&native_handle);
+	const bool has_texture = Acquire_Native_Texture(&native_handle);
+#else
+	const bool has_texture = Peek_D3D_Base_Texture() != nullptr;
 #endif
 	if (!has_texture)
 	{
@@ -1410,7 +1501,7 @@ void TextureClass::Apply_New_Surface
 {
 #if defined(_WIN64)
 	(void)disable_auto_invalidation;
-	// A D3D8 pointer is never a valid x64 product publication. The native
+	// A legacy pointer is never a valid x64 product publication. The native
 	// loader owns conversion; retain a deterministic fallback for residual
 	// thumbnail/legacy callers without keeping or dereferencing the COM object.
 	if (d3d_texture == nullptr)
@@ -1510,13 +1601,17 @@ void TextureClass::Apply(unsigned int stage)
 	}
 	LastAccessed=WW3D::Get_Sync_Time();
 
+#if defined(_WIN64)
+	rts::render::RecordTextureUse(this);
+#else
 	DX8_RECORD_TEXTURE(this);
+#endif
 
 	// Set texture itself
 	if (WW3D::Is_Texturing_Enabled())
 	{
 #if defined(_WIN64)
-		DX8Wrapper::Set_Native_Texture(stage, this);
+		rts::render::PublishTextureStage(stage, this);
 #else
 		DX8Wrapper::Set_DX8_Texture(stage, Peek_D3D_Base_Texture());
 #endif
@@ -1524,7 +1619,7 @@ void TextureClass::Apply(unsigned int stage)
 	else
 	{
 #if defined(_WIN64)
-		DX8Wrapper::Set_Native_Texture(stage, nullptr);
+		rts::render::PublishTextureStage(stage, nullptr);
 #else
 		DX8Wrapper::Set_DX8_Texture(stage, nullptr);
 #endif
@@ -1704,6 +1799,14 @@ TextureClass* Load_Texture(ChunkLoadClass & cload)
 
 				case W3DTEXTURE_TYPE_BUMPMAP:
 				{
+	#if defined(_WIN64)
+					// NativeW3DSampledTextureUpload is the only x64 authority for
+					// bump payloads.  U8V8 is converted to R8G8_SNORM; the packed
+					// Legacy packed alternatives remain unavailable by contract.
+					mipcount=MIP_LEVELS_1;
+					if (Is_Native_Texture_Format_Supported(WW3D_FORMAT_U8V8))
+						format=WW3D_FORMAT_U8V8;
+	#else
 					if (DX8Wrapper::Is_Initted() && DX8Wrapper::Get_Current_Caps()->Support_Bump_Envmap())
 					{
 						// No mipmaps to bumpmap for now
@@ -1713,6 +1816,7 @@ TextureClass* Load_Texture(ChunkLoadClass & cload)
 						else if (DX8Wrapper::Get_Current_Caps()->Support_Texture_Format(WW3D_FORMAT_X8L8V8U8)) format=WW3D_FORMAT_X8L8V8U8;
 						else if (DX8Wrapper::Get_Current_Caps()->Support_Texture_Format(WW3D_FORMAT_L6V5U5)) format=WW3D_FORMAT_L6V5U5;
 					}
+	#endif
 					break;
 				}
 
@@ -1823,19 +1927,16 @@ ZTextureClass::ZTextureClass
 	default:	WWASSERT(0);
 	}
 
-	Poke_Texture
+	Poke_Texture(DX8Wrapper::_Create_DX8_ZTexture
 	(
-		DX8Wrapper::_Create_DX8_ZTexture
-		(
-			width,
-			height,
-			zformat,
-			mip_level_count,
-			d3dpool
-		)
-	);
+		width,
+		height,
+		zformat,
+		mip_level_count,
+		d3dpool
+	));
 
-	if (pool==POOL_DEFAULT)
+	if (Peek_D3D_Base_Texture() != nullptr && pool==POOL_DEFAULT)
 	{
 		Set_Dirty();
 		DX8ZTextureTrackerClass *track=new DX8ZTextureTrackerClass
@@ -1848,7 +1949,7 @@ ZTextureClass::ZTextureClass
 		);
 		DX8TextureManagerClass::Add(track);
 	}
-	Initialized=true;
+	Initialized = Peek_D3D_Base_Texture() != nullptr;
 #endif
 	IsProcedural=true;
 	IsReducible=false;
@@ -1864,7 +1965,7 @@ ZTextureClass::ZTextureClass
 void ZTextureClass::Apply(unsigned int stage)
 {
 #if defined(_WIN64)
-	DX8Wrapper::Set_Native_Texture(stage, nullptr);
+	rts::render::PublishTextureStage(stage, nullptr);
 #else
 	DX8Wrapper::Set_DX8_Texture(stage, Peek_D3D_Base_Texture());
 #endif
@@ -2008,20 +2109,18 @@ CubeTextureClass::CubeTextureClass
 	default: WWASSERT(0);
 	}
 
-	Poke_Texture
+	Poke_Texture(DX8Wrapper::_Create_DX8_Cube_Texture
 	(
-		DX8Wrapper::_Create_DX8_Cube_Texture
-		(
-			width,
-			height,
-			format,
-			mip_level_count,
-			d3dpool,
-			rendertarget
-		)
-	);
+		width,
+		height,
+		format,
+		mip_level_count,
+		d3dpool,
+		rendertarget
+	));
+	Initialized = Peek_D3D_Base_Texture() != nullptr;
 
-	if (pool==POOL_DEFAULT)
+	if (Initialized && pool==POOL_DEFAULT)
 	{
 		Set_Dirty();
 		DX8TextureTrackerClass *track=new DX8TextureTrackerClass
@@ -2071,7 +2170,11 @@ CubeTextureClass::CubeTextureClass
 		// If requesting bumpmap format that isn't available we'll just return the surface in whatever color
 		// format the texture file is in. (This is illegal case, the format support should always be queried
 		// before creating a bump texture!)
+	#if defined(_WIN64)
+		if (!Is_Native_Texture_Format_Supported(TextureFormat))
+	#else
 		if (!DX8Wrapper::Is_Initted() || !DX8Wrapper::Get_Current_Caps()->Support_Texture_Format(TextureFormat))
+	#endif
 		{
 			TextureFormat=WW3D_FORMAT_UNKNOWN;
 		}
@@ -2293,7 +2396,7 @@ VolumeTextureClass::VolumeTextureClass
 
 #if defined(_WIN64)
 	// The neutral product renderer intentionally has no 3D-texture dimension.
-	// Publish a visible deterministic fallback instead of retaining a D3D8
+	// Publish a visible deterministic fallback instead of retaining a legacy
 	// volume facade or leaving all subsequent textured draws broken.
 	(void)pool;
 	(void)rendertarget;
@@ -2308,20 +2411,17 @@ VolumeTextureClass::VolumeTextureClass
 	default: WWASSERT(0);
 	}
 
-	Poke_Texture
+	Poke_Texture(DX8Wrapper::_Create_DX8_Volume_Texture
 	(
-		DX8Wrapper::_Create_DX8_Volume_Texture
-		(
-			width,
-			height,
-			depth,
-			format,
-			mip_level_count,
-			d3dpool
-		)
-	);
+		width,
+		height,
+		depth,
+		format,
+		mip_level_count,
+		d3dpool
+	));
 
-	if (pool==POOL_DEFAULT)
+	if (Peek_D3D_Base_Texture() != nullptr && pool==POOL_DEFAULT)
 	{
 		Set_Dirty();
 		DX8TextureTrackerClass *track=new DX8TextureTrackerClass
@@ -2335,6 +2435,7 @@ VolumeTextureClass::VolumeTextureClass
 		);
 		DX8TextureManagerClass::Add(track);
 	}
+	Initialized = Peek_D3D_Base_Texture() != nullptr;
 #endif
 	LastAccessed=WW3D::Get_Sync_Time();
 }
@@ -2372,7 +2473,11 @@ VolumeTextureClass::VolumeTextureClass
 		// If requesting bumpmap format that isn't available we'll just return the surface in whatever color
 		// format the texture file is in. (This is illegal case, the format support should always be queried
 		// before creating a bump texture!)
+	#if defined(_WIN64)
+		if (!Is_Native_Texture_Format_Supported(TextureFormat))
+	#else
 		if (!DX8Wrapper::Is_Initted() || !DX8Wrapper::Get_Current_Caps()->Support_Texture_Format(TextureFormat))
+	#endif
 		{
 			TextureFormat=WW3D_FORMAT_UNKNOWN;
 		}
