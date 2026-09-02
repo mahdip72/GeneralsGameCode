@@ -402,6 +402,48 @@ if(RTS_BUILD_CORE_EXTRAS)
 endif()
 
 if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    add_test(NAME core_native_renderer_graph_audit_self_test
+        COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeRendererGraphAudit/NativeRendererGraphAudit.ps1"
+            -SelfTest
+    )
+    set_tests_properties(core_native_renderer_graph_audit_self_test PROPERTIES TIMEOUT 30)
+    if(NOT IS_VS6_BUILD AND RTS_BUILD_PRODUCT AND
+            (RTS_BUILD_GENERALS OR RTS_BUILD_ZEROHOUR))
+        set(_native_renderer_graph_audit_product_targets)
+        set(_native_renderer_graph_audit_migration_targets)
+        if(RTS_BUILD_GENERALS)
+            list(APPEND _native_renderer_graph_audit_product_targets g_generals)
+            list(APPEND _native_renderer_graph_audit_migration_targets
+                g_ww3d2 g_gameenginedevice)
+        endif()
+        if(RTS_BUILD_ZEROHOUR)
+            list(APPEND _native_renderer_graph_audit_product_targets z_generals)
+            list(APPEND _native_renderer_graph_audit_migration_targets
+                z_ww3d2 z_gameenginedevice)
+        endif()
+        set(_native_renderer_graph_audit_configuration "Release")
+        if(CMAKE_CONFIGURATION_TYPES)
+            set(_native_renderer_graph_audit_configuration "$<CONFIG>")
+        elseif(CMAKE_BUILD_TYPE)
+            set(_native_renderer_graph_audit_configuration "${CMAKE_BUILD_TYPE}")
+        endif()
+        add_test(NAME core_native_renderer_graph_audit
+            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeRendererGraphAudit/NativeRendererGraphAudit.ps1"
+                -SourceRoot "${CMAKE_SOURCE_DIR}"
+                -BuildRoot "${CMAKE_BINARY_DIR}"
+                -Configuration "${_native_renderer_graph_audit_configuration}"
+                -Targets core_renderer,core_ww3d2_native
+                -MigrationTargets "${_native_renderer_graph_audit_migration_targets}"
+                -ProductTargets "${_native_renderer_graph_audit_product_targets}"
+                -AuthorityOnly
+        )
+        set_tests_properties(core_native_renderer_graph_audit PROPERTIES TIMEOUT 120)
+        unset(_native_renderer_graph_audit_configuration)
+        unset(_native_renderer_graph_audit_migration_targets)
+        unset(_native_renderer_graph_audit_product_targets)
+    endif()
     add_test(NAME core_network_session_token_audit
         COMMAND powershell -NoProfile -ExecutionPolicy Bypass
             -File "${CMAKE_CURRENT_SOURCE_DIR}/NetworkSessionTokenAudit/NetworkSessionTokenAudit.ps1"
