@@ -534,6 +534,7 @@ void RunWorkerCount(unsigned workerCount)
 	config.pinWorkers = false;
 	assert(jobs.start(config));
 	assert(jobs.registerCurrentThread(rts::JOB_OWNER_GAME));
+	const unsigned actualWorkerCount = jobs.workerCount();
 
 	const unsigned count = 257;
 	std::vector<rts::PhysicsIntegrationSnapshot> snapshots(count);
@@ -553,7 +554,7 @@ void RunWorkerCount(unsigned workerCount)
 	const rts::PhysicsIntegrationBatchResult result =
 		rts::PreparePhysicsIntegrationPrefixes(&snapshots[0], count,
 			&outputs[0], count, &scratch[0], count, options, &metrics);
-	if (workerCount == 1)
+	if (actualWorkerCount <= 1)
 	{
 		assert(result == rts::PHYSICS_INTEGRATION_POLICY_INELIGIBLE);
 		assert(SameBytes(&outputs[0], &sentinel[0],
@@ -566,7 +567,7 @@ void RunWorkerCount(unsigned workerCount)
 	{
 		assert(result == rts::PHYSICS_INTEGRATION_PARALLEL);
 		assert(metrics.rangeCount == rts::JobSystem::chooseRangeCount(
-			count, options.minimumGrain, workerCount));
+			count, options.minimumGrain, actualWorkerCount));
 		const unsigned arrayBytes = metrics.rangeCount * static_cast<unsigned>(
 			sizeof(rts::JobSubmission) + sizeof(rts::JobHandle) +
 			sizeof(void *));
@@ -577,9 +578,9 @@ void RunWorkerCount(unsigned workerCount)
 		assert(metrics.ownerHelpedJobs == 0);
 		assert(metrics.physicalWorkerMask != 0);
 		assert(metrics.distinctPhysicalWorkers != 0 &&
-			metrics.distinctPhysicalWorkers <= workerCount);
+			metrics.distinctPhysicalWorkers <= actualWorkerCount);
 		assert(metrics.peakConcurrentPhysicalWorkers != 0 &&
-			metrics.peakConcurrentPhysicalWorkers <= workerCount);
+			metrics.peakConcurrentPhysicalWorkers <= actualWorkerCount);
 		for (unsigned index = 0; index != count; ++index)
 		{
 			assert(SameBytes(&outputs[index], &expected[index],
@@ -616,6 +617,7 @@ void RunShadowWorkerCount(unsigned workerCount)
 	config.pinWorkers = false;
 	assert(jobs.start(config));
 	assert(jobs.registerCurrentThread(rts::JOB_OWNER_GAME));
+	const unsigned actualWorkerCount = jobs.workerCount();
 
 	const unsigned count = 257;
 	std::vector<rts::PhysicsIntegrationSnapshot> snapshots(count);
@@ -630,9 +632,20 @@ void RunShadowWorkerCount(unsigned workerCount)
 	rts::PhysicsIntegrationOptions options;
 	options.minimumGrain = 1;
 	rts::PhysicsIntegrationMetrics sliceMetrics;
-	assert(rts::PreparePhysicsIntegrationPrefixes(&snapshots[0], count,
-		&outputs[0], count, &scratch[0], count, options, &sliceMetrics) ==
-		rts::PHYSICS_INTEGRATION_PARALLEL);
+	const rts::PhysicsIntegrationBatchResult result =
+		rts::PreparePhysicsIntegrationPrefixes(&snapshots[0], count,
+		&outputs[0], count, &scratch[0], count, options, &sliceMetrics);
+	if (actualWorkerCount <= 1)
+	{
+		assert(result == rts::PHYSICS_INTEGRATION_POLICY_INELIGIBLE);
+		assert(sliceMetrics.rangeCount == 0);
+		assert(sliceMetrics.submittedJobs == 0);
+		assert(sliceMetrics.completedJobs == 0);
+		jobs.shutdown();
+		assert(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME));
+		return;
+	}
+	assert(result == rts::PHYSICS_INTEGRATION_PARALLEL);
 	bool matched = true;
 	for (unsigned outputIndex = 0; outputIndex != count; ++outputIndex)
 	{
@@ -685,8 +698,12 @@ void ExpectTransactionalFailure(rts::PhysicsIntegrationTestFault fault,
 	options.testFault = fault;
 	options.testOrdinal = ordinal;
 	rts::PhysicsIntegrationMetrics metrics;
+	const rts::PhysicsIntegrationBatchResult runtimeExpectedResult =
+		rts::JobSystem::instance().workerCount() <= 1 ?
+		rts::PHYSICS_INTEGRATION_POLICY_INELIGIBLE : expectedResult;
 	assert(rts::PreparePhysicsIntegrationPrefixes(&snapshots[0], count,
-		&outputs[0], count, &scratch[0], count, options, &metrics) == expectedResult);
+		&outputs[0], count, &scratch[0], count, options, &metrics) ==
+		runtimeExpectedResult);
 	assert(SameBytes(&outputs[0], &sentinel[0],
 		count * sizeof(rts::PhysicsIntegrationOutput)));
 }
@@ -830,6 +847,7 @@ void TestPolicyIneligibleIsDistinctFromSafetyFallback()
 	config.pinWorkers = false;
 	assert(jobs.start(config));
 	assert(jobs.registerCurrentThread(rts::JOB_OWNER_RENDER));
+	const unsigned actualWorkerCount = jobs.workerCount();
 	jobs.resetMetrics();
 	assert(rts::PreflightPhysicsIntegrationPrefixes() ==
 		rts::PHYSICS_INTEGRATION_SERIAL_FALLBACK);
@@ -842,8 +860,12 @@ void TestPolicyIneligibleIsDistinctFromSafetyFallback()
 	assert(jobs.metrics().serialFallbackCount == 1);
 	assert(jobs.unregisterCurrentThread(rts::JOB_OWNER_RENDER));
 	assert(jobs.registerCurrentThread(rts::JOB_OWNER_GAME));
-	assert(rts::PreflightPhysicsIntegrationPrefixes() ==
-		rts::PHYSICS_INTEGRATION_PARALLEL);
+	if (actualWorkerCount <= 1)
+		assert(rts::PreflightPhysicsIntegrationPrefixes() ==
+			rts::PHYSICS_INTEGRATION_POLICY_INELIGIBLE);
+	else
+		assert(rts::PreflightPhysicsIntegrationPrefixes() ==
+			rts::PHYSICS_INTEGRATION_PARALLEL);
 
 	rts::PhysicsIntegrationBatchResult workerResult =
 		rts::PHYSICS_INTEGRATION_INVALID_INPUT;
@@ -860,9 +882,18 @@ void TestPolicyIneligibleIsDistinctFromSafetyFallback()
 	assert(handle.isValid());
 	assert(jobs.wait(group));
 	assert(handle.succeeded());
-	assert(workerResult == rts::PHYSICS_INTEGRATION_SERIAL_FALLBACK);
-	assert(workerFallbacks == 1);
-	assert(jobs.metrics().serialFallbackCount == 1);
+	if (actualWorkerCount <= 1)
+	{
+		assert(workerResult == rts::PHYSICS_INTEGRATION_POLICY_INELIGIBLE);
+		assert(workerFallbacks == 0);
+		assert(jobs.metrics().serialFallbackCount == 0);
+	}
+	else
+	{
+		assert(workerResult == rts::PHYSICS_INTEGRATION_SERIAL_FALLBACK);
+		assert(workerFallbacks == 1);
+		assert(jobs.metrics().serialFallbackCount == 1);
+	}
 
 	jobs.resetMetrics();
 	assert(rts::PreparePhysicsIntegrationPrefixes(&snapshots[0], 1,
