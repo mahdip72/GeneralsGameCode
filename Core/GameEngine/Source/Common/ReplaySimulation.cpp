@@ -311,7 +311,7 @@ void capturePerformanceReceiptMetrics(
 		spatial.collectionPhysicalWorkerMask,
 		static_cast<unsigned>(spatial.maximumCollectionDistinctPhysicalWorkers),
 		spatial.maximumCollectionDistinctPhysicalWorkers <= 64U);
-	appendPerformanceReceiptKernel(receipt, "pathfinding", false, 0, 0, 0,
+	appendPerformanceReceiptKernel(receipt, "path", false, 0, 0, 0,
 		0, 0, 0, false);
 }
 
@@ -367,8 +367,11 @@ bool writePerformanceReceiptRawDiagnostic(
 	fprintf(file, "game_owned=1\n");
 	fprintf(file, "run_id=%s\n", receipt.runId.c_str());
 	fprintf(file, "process_id=%u\n", receipt.processId);
+	fprintf(file, "process_creation_time_utc_100ns=%llu\n",
+		static_cast<unsigned long long>(receipt.processCreationTimeUtc100ns));
 	fprintf(file, "executable_sha256=%s\n",
 		receipt.executableSha256.c_str());
+	fprintf(file, "command_line=%s\n", receipt.commandLine.c_str());
 	fprintf(file, "fixture_id=%s\n", receipt.fixtureId.c_str());
 	fprintf(file, "fixture_sha256=%s\n",
 		receipt.fixtureContentSha256.c_str());

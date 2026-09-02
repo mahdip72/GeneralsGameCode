@@ -92,35 +92,41 @@ rts::performance::PerformanceReceipt makeCompleteReceipt()
 	{
 		PerformanceReceiptPhase phase;
 		phase.name = phaseNames[index];
-		phase.available = index == 0 || index == 4 || index == 6;
-		phase.totalNanoseconds = phase.available ? 1000 + index : 0;
+		phase.available = true;
+		phase.totalNanoseconds = 1000 + index;
 		phase.maximumNanoseconds = phase.totalNanoseconds;
-		phase.sampleCount = phase.available ? 1 : 0;
+		phase.sampleCount = 1;
 		receipt.phases.push_back(phase);
 	}
 	const char *kernelNames[] =
 	{
 		"physics", "status", "collision", "ai-planning", "spatial",
-		"pathfinding"
+		"path"
 	};
 	for (unsigned index = 0; index < sizeof(kernelNames) / sizeof(kernelNames[0]);
 		++index)
 	{
 		PerformanceReceiptKernel kernel;
 		kernel.name = kernelNames[index];
-		kernel.available = index != 5;
-		kernel.submittedJobs = kernel.available ? 8 : 0;
+		kernel.available = true;
+		kernel.submittedJobs = 8;
 		kernel.completedJobs = kernel.submittedJobs;
-		kernel.physicalWorkerJobs = kernel.available ? 8 : 0;
-		kernel.physicalWorkerMask = kernel.available ? 0xff : 0;
-		kernel.distinctPhysicalWorkers = kernel.available ? 8 : 0;
-		kernel.physicalWorkerMaskComplete = kernel.available;
+		kernel.physicalWorkerJobs = 8;
+		kernel.physicalWorkerMask = 0xff;
+		kernel.distinctPhysicalWorkers = 8;
+		kernel.physicalWorkerMaskComplete = true;
+		kernel.elapsedNanoseconds = 2000 + index;
+		kernel.elapsedNanosecondsKnown = true;
 		receipt.kernels.push_back(kernel);
 	}
 	receipt.rawEvidence.verifierBoundary =
 		"game-receipt-before-host-log-close";
 	receipt.rawEvidence.rawLogPath = "H:\\evidence\\run.log";
+	receipt.rawEvidence.rawLogSha256 =
+		"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 	receipt.rawEvidence.timingPath = "H:\\evidence\\timing.csv";
+	receipt.rawEvidence.timingSha256 =
+		"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 	return receipt;
 }
 
@@ -173,6 +179,27 @@ int testStrictValidation()
 	receipt.processExitCodeKnown = false;
 	result |= check(!ValidatePerformanceReceipt(receipt, &reason),
 		"unknown process exit fails closed");
+	receipt = makeCompleteReceipt();
+	receipt.phases[0].name = "world-queries";
+	result |= check(!ValidatePerformanceReceipt(receipt, &reason) &&
+		reason.find("exact canonical set") != std::string::npos,
+		"phase name/order substitution fails closed");
+	receipt = makeCompleteReceipt();
+	receipt.kernels[5].name = "pathfinding";
+	result |= check(!ValidatePerformanceReceipt(receipt, &reason) &&
+		reason.find("exact canonical set") != std::string::npos,
+		"legacy pathfinding kernel name fails closed");
+	receipt = makeCompleteReceipt();
+	receipt.phases[1].available = false;
+	result |= check(!ValidatePerformanceReceipt(receipt, &reason) &&
+		reason.find("unavailable phase") != std::string::npos,
+		"unavailable phase cannot carry timing data");
+	receipt = makeCompleteReceipt();
+	receipt.kernels[0].elapsedNanosecondsKnown = true;
+	receipt.kernels[0].elapsedNanoseconds = 0;
+	result |= check(!ValidatePerformanceReceipt(receipt, &reason) &&
+		reason.find("known kernel timing") != std::string::npos,
+		"zero known kernel timing fails closed");
 	return result;
 }
 

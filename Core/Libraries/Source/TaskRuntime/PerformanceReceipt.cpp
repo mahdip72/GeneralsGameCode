@@ -43,7 +43,7 @@ const char *const REQUIRED_KERNEL_NAMES[] =
 	"collision",
 	"ai-planning",
 	"spatial",
-	"pathfinding"
+	"path"
 };
 
 void setReason(std::string *reason, const char *value)
@@ -71,6 +71,16 @@ bool isHexString(const std::string &value, unsigned length)
 			(character >= 'A' && character <= 'F')))
 			return false;
 	}
+	return true;
+}
+
+bool isLowerHexString(const std::string &value, unsigned length)
+{
+	if (!isHexString(value, length))
+		return false;
+	for (std::size_t index = 0; index < value.size(); ++index)
+		if (value[index] >= 'A' && value[index] <= 'F')
+			return false;
 	return true;
 }
 
@@ -187,22 +197,38 @@ void appendBoolField(std::ostringstream &json, const char *key,
 	if (comma) json << ',';
 }
 
-bool containsName(const std::vector<PerformanceReceiptPhase> &phases,
-	const char *name)
+bool hasUniqueNamesAndExactOrder(
+	const std::vector<PerformanceReceiptPhase> &phases,
+	const char *const *requiredNames, unsigned requiredCount)
 {
-	for (std::size_t index = 0; index < phases.size(); ++index)
-		if (phases[index].name == name)
-			return true;
-	return false;
+	if (phases.size() != requiredCount)
+		return false;
+	for (unsigned index = 0; index < requiredCount; ++index)
+	{
+		if (phases[index].name != requiredNames[index])
+			return false;
+		for (unsigned prior = 0; prior < index; ++prior)
+			if (phases[index].name == phases[prior].name)
+				return false;
+	}
+	return true;
 }
 
-bool containsName(const std::vector<PerformanceReceiptKernel> &kernels,
-	const char *name)
+bool hasUniqueNamesAndExactOrder(
+	const std::vector<PerformanceReceiptKernel> &kernels,
+	const char *const *requiredNames, unsigned requiredCount)
 {
-	for (std::size_t index = 0; index < kernels.size(); ++index)
-		if (kernels[index].name == name)
-			return true;
-	return false;
+	if (kernels.size() != requiredCount)
+		return false;
+	for (unsigned index = 0; index < requiredCount; ++index)
+	{
+		if (kernels[index].name != requiredNames[index])
+			return false;
+		for (unsigned prior = 0; prior < index; ++prior)
+			if (kernels[index].name == kernels[prior].name)
+				return false;
+	}
+	return true;
 }
 
 bool findCpuSet(const PerformanceReceipt &receipt, unsigned id,
@@ -680,7 +706,11 @@ bool SetPerformanceReceiptReplayResult(PerformanceReceipt &receipt,
 	receipt.processExitCodeKnown = processExitCodeKnown;
 	receipt.processExitBoundary = exitBoundary;
 #if defined(_WIN32)
-	currentFileTime(receipt.processEndTimeUtc100ns);
+	if (!currentFileTime(receipt.processEndTimeUtc100ns))
+	{
+		setReason(reason, "process end time capture was unavailable");
+		return false;
+	}
 #endif
 	receipt.status = clean ? "complete" : "failed";
 	return true;
@@ -869,7 +899,8 @@ bool ValidatePerformanceReceipt(const PerformanceReceipt &receipt,
 	if (receipt.title.empty() || receipt.runId.empty() ||
 		receipt.sourceCommit.empty() || receipt.commandLine.empty() ||
 		receipt.fixtureId.empty() || !isSafeToken(receipt.runId) ||
-		!isSafeToken(receipt.sourceCommit) || !isSafeToken(receipt.fixtureId))
+		!isLowerHexString(receipt.sourceCommit, 40) ||
+		!isSafeToken(receipt.fixtureId))
 	{
 		setReason(reason, "receipt identity fields are incomplete");
 		return false;
@@ -913,8 +944,9 @@ bool ValidatePerformanceReceipt(const PerformanceReceipt &receipt,
 	}
 	if (receipt.cpuSets.empty() ||
 		receipt.selectedWorkerCpuSetIds.size() !=
-		receipt.selectedWorkerCpuCount ||
-	receipt.ownerCpuSetIds.size() != receipt.reservedOwnerCpuCount)
+			receipt.selectedWorkerCpuCount ||
+		receipt.ownerCpuSetIds.size() != receipt.reservedOwnerCpuCount ||
+		receipt.availableLogicalCpuCount < receipt.selectedWorkerCpuCount)
 	{
 		setReason(reason, "CPU-set topology arrays are incomplete");
 		return false;
@@ -945,53 +977,106 @@ bool ValidatePerformanceReceipt(const PerformanceReceipt &receipt,
 		}
 		selectedIds.push_back(id);
 	}
+	for (std::size_t first = 0; first < selectedIds.size(); ++first)
+	{
+		PerformanceReceiptCpuSet firstSet;
+		findCpuSet(receipt, selectedIds[first], &firstSet);
+		for (std::size_t second = first + 1; second < selectedIds.size();
+			++second)
+		{
+			PerformanceReceiptCpuSet secondSet;
+			findCpuSet(receipt, selectedIds[second], &secondSet);
+			if (firstSet.group == secondSet.group &&
+				firstSet.coreIndex == secondSet.coreIndex)
+			{
+				setReason(reason, "selected CPU-sets share one physical core");
+				return false;
+			}
+		}
+	}
+	if (selectedIds.size() != receipt.selectedWorkerPhysicalCoreCount)
+	{
+		setReason(reason, "selected physical-core count does not match CPU sets");
+		return false;
+	}
 	std::vector<unsigned> ownerIds;
 	for (std::size_t index = 0; index < receipt.ownerCpuSetIds.size(); ++index)
+	{
+		PerformanceReceiptCpuSet ownerSet;
 		if (containsUnsigned(ownerIds, receipt.ownerCpuSetIds[index]) ||
-			!findCpuSet(receipt, receipt.ownerCpuSetIds[index]))
+			!findCpuSet(receipt, receipt.ownerCpuSetIds[index], &ownerSet) ||
+			!ownerSet.availableToProcess || ownerSet.parked ||
+			ownerSet.allocatedToOtherProcess)
 		{
 			setReason(reason, "owner CPU-set is absent or duplicated");
 			return false;
 		}
 		else
 			ownerIds.push_back(receipt.ownerCpuSetIds[index]);
+	}
 	if (receipt.rawEvidence.verifierBoundary.empty() ||
-		(!receipt.rawEvidence.rawLogSha256.empty() &&
-			!isHexString(receipt.rawEvidence.rawLogSha256, 64)) ||
-		(!receipt.rawEvidence.timingSha256.empty() &&
-			!isHexString(receipt.rawEvidence.timingSha256, 64)) ||
-		(receipt.rawEvidence.rawLogPath.empty() &&
-			!isHexString(receipt.rawEvidence.rawLogSha256, 64)) ||
-		(receipt.rawEvidence.timingPath.empty() &&
-			!isHexString(receipt.rawEvidence.timingSha256, 64)))
+		receipt.rawEvidence.rawLogPath.empty() ||
+		receipt.rawEvidence.timingPath.empty() ||
+		!isHexString(receipt.rawEvidence.rawLogSha256, 64) ||
+		!isHexString(receipt.rawEvidence.timingSha256, 64))
 	{
 		setReason(reason, "raw log or timing evidence boundary is incomplete");
 		return false;
 	}
-	for (unsigned index = 0;
-		index < sizeof(REQUIRED_PHASE_NAMES) / sizeof(REQUIRED_PHASE_NAMES[0]);
-		++index)
-		if (!containsName(receipt.phases, REQUIRED_PHASE_NAMES[index]))
-		{
-			setReason(reason, "required executable phase metric is missing");
-			return false;
-		}
+	const unsigned requiredPhaseCount =
+		static_cast<unsigned>(sizeof(REQUIRED_PHASE_NAMES) /
+			sizeof(REQUIRED_PHASE_NAMES[0]));
+	if (!hasUniqueNamesAndExactOrder(receipt.phases, REQUIRED_PHASE_NAMES,
+		requiredPhaseCount))
+	{
+		setReason(reason, "executable phase metrics are not the exact canonical set");
+		return false;
+	}
 	for (std::size_t index = 0; index < receipt.phases.size(); ++index)
-		if (receipt.phases[index].name.empty() ||
-			(receipt.phases[index].available &&
-				receipt.phases[index].sampleCount == 0))
+	{
+		const PerformanceReceiptPhase &phase = receipt.phases[index];
+		if (phase.available && (phase.sampleCount == 0 ||
+			phase.totalNanoseconds == 0 || phase.maximumNanoseconds == 0))
 		{
-			setReason(reason, "phase metric is malformed");
+			setReason(reason, "available phase metric has no positive timing");
 			return false;
 		}
-	for (unsigned index = 0;
-		index < sizeof(REQUIRED_KERNEL_NAMES) / sizeof(REQUIRED_KERNEL_NAMES[0]);
-		++index)
-		if (!containsName(receipt.kernels, REQUIRED_KERNEL_NAMES[index]))
+		if (!phase.available && (phase.totalNanoseconds != 0 ||
+			phase.maximumNanoseconds != 0 || phase.sampleCount != 0))
 		{
-			setReason(reason, "required executable kernel metric is missing");
+			setReason(reason, "unavailable phase metric contains timing data");
 			return false;
 		}
+	}
+	const unsigned requiredKernelCount =
+		static_cast<unsigned>(sizeof(REQUIRED_KERNEL_NAMES) /
+			sizeof(REQUIRED_KERNEL_NAMES[0]));
+	if (!hasUniqueNamesAndExactOrder(receipt.kernels, REQUIRED_KERNEL_NAMES,
+		requiredKernelCount))
+	{
+		setReason(reason, "executable kernel metrics are not the exact canonical set");
+		return false;
+	}
+	for (std::size_t index = 0; index < receipt.kernels.size(); ++index)
+	{
+		const PerformanceReceiptKernel &kernel = receipt.kernels[index];
+		if (!kernel.available && (kernel.submittedJobs != 0 ||
+			kernel.completedJobs != 0 || kernel.physicalWorkerJobs != 0 ||
+			kernel.ownerHelpedJobs != 0 || kernel.physicalWorkerMask != 0 ||
+			kernel.distinctPhysicalWorkers != 0 ||
+			kernel.physicalWorkerMaskComplete ||
+			kernel.elapsedNanoseconds != 0 || kernel.elapsedNanosecondsKnown))
+		{
+			setReason(reason, "unavailable kernel metric contains evidence");
+			return false;
+		}
+		if (kernel.elapsedNanosecondsKnown &&
+			kernel.elapsedNanoseconds == 0)
+		{
+			setReason(reason, "known kernel timing is not positive");
+			return false;
+		}
+	}
 	return true;
 }
 

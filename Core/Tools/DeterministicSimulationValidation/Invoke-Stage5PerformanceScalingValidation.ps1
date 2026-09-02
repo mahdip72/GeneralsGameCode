@@ -22,14 +22,17 @@ param(
     [Parameter(ParameterSetName = 'Run', Mandatory = $true)]
     [string]$ExpectedFixtureManifestSha256,
 
-    [Parameter(ParameterSetName = 'Run', Mandatory = $true)]
+    [Parameter(ParameterSetName = 'Run')]
     [string]$Stage3BaselinePath,
 
-    [Parameter(ParameterSetName = 'Run', Mandatory = $true)]
+    [Parameter(ParameterSetName = 'Run')]
     [string]$ExpectedStage3BaselineSha256,
 
-    [Parameter(ParameterSetName = 'Run', Mandatory = $true)]
+    [Parameter(ParameterSetName = 'Run')]
     [string]$ExpectedStage3ExecutableSha256,
+
+    [Parameter(ParameterSetName = 'Run')]
+    [string]$ExpectedStage3SourceCommit,
 
     [Parameter(ParameterSetName = 'Run', Mandatory = $true)]
     [string]$TaskRoot,
@@ -41,6 +44,10 @@ param(
     [Parameter(ParameterSetName = 'Run')]
     [ValidateRange(1, 86400)]
     [int]$TimeoutSeconds = 7200,
+
+    [Parameter(ParameterSetName = 'Run')]
+    [ValidateSet('External16Core', 'LocalCapacitySmoke')]
+    [string]$QualificationMode = 'External16Core',
 
     # This parameter set exists only for host-side contract tests. It consumes
     # already-created synthetic receipts and can never reach Process.Start().
@@ -58,10 +65,24 @@ $script:CanonicalFixtureIds = @(
     'dense-eight-player'
 )
 $script:CanonicalFixtureUnits = @(1000, 4000, 8000, 8000)
-$script:CanonicalLaneNames = @('forced-one', 'physical-8', 'physical-16')
-$script:CanonicalLaneWorkers = @(1, 8, 16)
+$script:ExternalLaneNames = @('forced-one', 'physical-8', 'physical-16')
+$script:ExternalLaneWorkers = @(1, 8, 16)
+$script:LocalLaneNames = @('forced-one', 'physical-2', 'physical-4')
+$script:LocalLaneWorkers = @(1, 2, 4)
 $script:WarmupRuns = 1
 $script:VerifierBoundary = 'stage5-host-independent-correlation-v1'
+
+function Get-Stage5LaneNames {
+    param([string]$Mode)
+    if ($Mode -ceq 'LocalCapacitySmoke') { return $script:LocalLaneNames }
+    return $script:ExternalLaneNames
+}
+
+function Get-Stage5LaneWorkers {
+    param([string]$Mode)
+    if ($Mode -ceq 'LocalCapacitySmoke') { return $script:LocalLaneWorkers }
+    return $script:ExternalLaneWorkers
+}
 
 function Assert-Stage5PerformanceCondition {
     param([bool]$Condition, [string]$Message)
@@ -89,6 +110,23 @@ function Assert-Stage5PerformanceHash {
     param([string]$Value, [string]$Name)
     Assert-Stage5PerformanceCondition ($Value -cmatch '^[0-9A-F]{64}$') `
         "$Name must be an independently supplied uppercase SHA-256."
+}
+
+function Assert-Stage5PerformanceSourceCommit {
+    param([string]$Value, [string]$Name)
+    Assert-Stage5PerformanceCondition ($Value -cmatch '^[0-9a-f]{40}$') `
+        "$Name must be an independently supplied lowercase 40-hex commit."
+    $repository = $null
+    try {
+        $repository = (& git -C $PSScriptRoot rev-parse --show-toplevel 2>$null |
+            Select-Object -First 1)
+    }
+    catch { }
+    Assert-Stage5PerformanceCondition (-not [string]::IsNullOrWhiteSpace([string]$repository)) `
+        "Cannot resolve a Git repository to verify $Name."
+    & git -C ([string]$repository).Trim() cat-file -e "${Value}^{commit}" 2>$null
+    Assert-Stage5PerformanceCondition ($LASTEXITCODE -eq 0) `
+        "$Name object is not present in the checked-out repository."
 }
 
 function Assert-Stage5PerformanceFileHash {
@@ -252,20 +290,24 @@ function Read-Stage5ScalingFixtureManifest {
 
 function Read-Stage5ScalingBaseline {
     param([string]$Path, [string]$ExpectedHash, [string]$ExpectedExecutableHash,
-        [string]$ExpectedTitle, [string]$FixtureManifestHash, [object[]]$Fixtures)
+        [string]$ExpectedTitle, [string]$FixtureManifestHash, [object[]]$Fixtures,
+        [string]$ExpectedSourceCommit)
     $full = [IO.Path]::GetFullPath($Path)
     Assert-Stage5PerformanceFileHash $full $ExpectedHash `
         'Stage 3 baseline SHA-256' | Out-Null
     $document = Read-Stage5PerformanceJson $full 'Stage 3 performance baseline'
     Assert-Stage5PerformanceProperties $document @('schemaVersion', 'stage',
         'architecture', 'title', 'executableSha256', 'fixtureManifestSha256',
-        'physicalCoreCount', 'logicalProcessorCount', 'warmupRuns', 'fixtures') `
+        'configuration', 'physicalCoreCount', 'availableCpus',
+        'logicalProcessorCount', 'warmupRuns', 'fixtures') `
         'Stage 3 performance baseline'
     Assert-Stage5PerformanceCondition ($document.schemaVersion -eq 1 -and
         $document.stage -ceq 'Stage3' -and $document.architecture -ceq 'x64' -and
         $document.title -ceq $ExpectedTitle -and
         $document.executableSha256 -ceq $ExpectedExecutableHash -and
         $document.fixtureManifestSha256 -ceq $FixtureManifestHash -and
+        $document.configuration -ceq 'parallel-1' -and
+        [int]$document.availableCpus -ge [int]$document.physicalCoreCount -and
         [int]$document.warmupRuns -eq 1) `
         'Stage 3 baseline identity or exact hash binding is invalid.'
     Assert-Stage5PerformanceCondition ([int]$document.physicalCoreCount -ge 16 -and
@@ -301,7 +343,9 @@ function Read-Stage5ScalingBaseline {
         path = $full
         sha256 = $ExpectedHash
         executableSha256 = $ExpectedExecutableHash
+        stage3SourceCommit = $ExpectedSourceCommit
         physicalCoreCount = [int]$document.physicalCoreCount
+        availableCpus = [int]$document.availableCpus
         logicalProcessorCount = [int]$document.logicalProcessorCount
         fixtures = $result
     }
@@ -362,14 +406,27 @@ public static class Stage5PerformanceNative {
 }
 
 function Get-Stage5HostTopology {
+    param(
+        [int]$MinimumPhysicalCores = 16,
+        [int]$MaximumPhysicalCores = 0,
+        [int]$MaximumLogicalProcessors = 0
+    )
     $cpuSets = @(Get-Stage5SystemCpuSets)
     $available = @($cpuSets | Where-Object { $_.available })
     $physical = @{}
     foreach ($cpuSet in $available) {
         $physical["$($cpuSet.group):$($cpuSet.coreIndex)"] = $true
     }
-    Assert-Stage5PerformanceCondition ($physical.Count -ge 16) `
-        "Stage 5 performance qualification requires at least 16 available physical cores; host exposes $($physical.Count)."
+    Assert-Stage5PerformanceCondition ($physical.Count -ge $MinimumPhysicalCores) `
+        "Stage 5 performance qualification requires at least $MinimumPhysicalCores available physical cores; host exposes $($physical.Count)."
+    if ($MaximumPhysicalCores -gt 0) {
+        Assert-Stage5PerformanceCondition ($physical.Count -le $MaximumPhysicalCores) `
+            "Local capacity smoke requires at most $MaximumPhysicalCores physical cores; host exposes $($physical.Count)."
+    }
+    if ($MaximumLogicalProcessors -gt 0) {
+        Assert-Stage5PerformanceCondition ($available.Count -le $MaximumLogicalProcessors) `
+            "Local capacity smoke requires at most $MaximumLogicalProcessors available logical processors; host exposes $($available.Count)."
+    }
     return [pscustomobject]@{
         source = 'GetSystemCpuSetInformation'
         physicalCoreCount = $physical.Count
@@ -430,6 +487,118 @@ function Get-Stage5ProcessCommandLine {
     throw "Host could not independently capture command line for PID $ProcessId."
 }
 
+function Get-Stage5LauncherContract {
+    param([string]$RuntimeDirectory, [string]$Executable)
+    $runtimeFull = [IO.Path]::GetFullPath($RuntimeDirectory)
+    $launcherPath = Join-Path $runtimeFull 'launcher.exe'
+    $configPath = Join-Path $runtimeFull 'launcher.lcf'
+    Assert-Stage5PerformanceCondition (Test-Path -LiteralPath $launcherPath -PathType Leaf) `
+        "Installed runtime launcher was not found: $launcherPath"
+    Assert-Stage5PerformanceCondition (Test-Path -LiteralPath $configPath -PathType Leaf) `
+        "Installed runtime launcher configuration was not found: $configPath"
+    $runLines = @(Get-Content -LiteralPath $configPath |
+        Where-Object { $_ -match '^\s*RUN\s*=' })
+    Assert-Stage5PerformanceCondition ($runLines.Count -eq 1) `
+        'launcher.lcf must contain exactly one RUN entry for performance validation.'
+    $match = [regex]::Match($runLines[0],
+        '^\s*RUN\s*=\s*(?<directory>\S+)\s+(?<executable>"[^"]+"|\S+)(?<arguments>.*)$')
+    Assert-Stage5PerformanceCondition $match.Success `
+        'launcher.lcf RUN entry has an unsupported shape.'
+    $directory = $match.Groups['directory'].Value
+    Assert-Stage5PerformanceCondition ($directory -ceq '.') `
+        "launcher.lcf RUN working directory must be '.', got '$directory'."
+    $configuredExecutable = $match.Groups['executable'].Value.Trim('"')
+    Assert-Stage5PerformanceCondition ($configuredExecutable -match '^[A-Za-z0-9._-]+\.exe$') `
+        'launcher.lcf RUN target must be a leaf executable name.'
+    $expectedExecutable = [IO.Path]::GetFileName([IO.Path]::GetFullPath($Executable))
+    Assert-Stage5PerformanceCondition ($configuredExecutable -ceq $expectedExecutable) `
+        "launcher.lcf target '$configuredExecutable' does not match '$expectedExecutable'."
+    $argumentText = $match.Groups['arguments'].Value.Trim()
+    $arguments = @()
+    if (-not [string]::IsNullOrWhiteSpace($argumentText)) {
+        $argumentMatches = [regex]::Matches($argumentText,
+            '"(?<quoted>(?:[^"]|"")*)"|(?<bare>\S+)')
+        $consumed = 0
+        foreach ($argumentMatch in $argumentMatches) {
+            Assert-Stage5PerformanceCondition (
+                $argumentMatch.Index -eq $consumed -or
+                $argumentText.Substring($consumed,
+                    $argumentMatch.Index - $consumed) -match '^\s+$') `
+                'launcher.lcf RUN arguments contain an unsupported token.'
+            $arguments += if ($argumentMatch.Groups['quoted'].Success) {
+                $argumentMatch.Groups['quoted'].Value.Replace('""', '"')
+            } else { $argumentMatch.Groups['bare'].Value }
+            $consumed = $argumentMatch.Index + $argumentMatch.Length
+        }
+        Assert-Stage5PerformanceCondition ($consumed -eq $argumentText.Length) `
+            'launcher.lcf RUN arguments contain an unsupported trailing token.'
+    }
+    Assert-Stage5PerformanceCondition ($arguments.Count -eq 0 -or
+        ($arguments.Count -eq 4 -and $arguments[0] -ceq '-simulationMode' -and
+            $arguments[1] -ceq 'parallel' -and $arguments[2] -ceq '-workerPolicy' -and
+            $arguments[3] -ceq 'auto')) `
+        'launcher.lcf may only contribute the reviewed native Stage 5 defaults.'
+    return [pscustomobject]@{
+        launcherPath = [IO.Path]::GetFullPath($launcherPath)
+        launcherSha256 = Get-Stage5PerformanceSha256 $launcherPath
+        configPath = [IO.Path]::GetFullPath($configPath)
+        configSha256 = Get-Stage5PerformanceSha256 $configPath
+        directory = $directory
+        executable = $configuredExecutable
+        arguments = @($arguments)
+        workingDirectory = $runtimeFull
+        directException = 'launcher-main-does-not-propagate-child-exit-code'
+    }
+}
+
+function Get-Stage5ProcessIdentity {
+    param([Diagnostics.Process]$Process)
+    $Process.Refresh()
+    $path = [IO.Path]::GetFullPath($Process.MainModule.FileName)
+    $parentId = 0
+    try {
+        $record = Get-CimInstance Win32_Process -Filter "ProcessId = $($Process.Id)" `
+            -ErrorAction Stop
+        if ($null -ne $record) { $parentId = [int]$record.ParentProcessId }
+    }
+    catch { }
+    $parentCreation = [Int64]0
+    if ($parentId -gt 0) {
+        try {
+            $parent = Get-Process -Id $parentId -ErrorAction Stop
+            $parentCreation = $parent.StartTime.ToUniversalTime().ToFileTimeUtc()
+        }
+        catch { }
+    }
+    return [pscustomobject]@{
+        processId = [int]$Process.Id
+        creationTimeUtc100ns = [Int64]$Process.StartTime.ToUniversalTime().ToFileTimeUtc()
+        executablePath = $path
+        executableSha256 = Get-Stage5PerformanceSha256 $path
+        commandLine = Get-Stage5ProcessCommandLine $Process.Id
+        parentProcessId = $parentId
+        parentCreationTimeUtc100ns = $parentCreation
+    }
+}
+
+function Stop-Stage5ProcessSafely {
+    param([Diagnostics.Process]$Process, [object]$ExpectedIdentity)
+    $Process.Refresh()
+    if ($Process.HasExited) { return }
+    $current = Get-Stage5ProcessIdentity $Process
+    Assert-Stage5PerformanceCondition ($current.processId -eq $ExpectedIdentity.processId -and
+        $current.creationTimeUtc100ns -eq $ExpectedIdentity.creationTimeUtc100ns -and
+        $current.executableSha256 -ceq $ExpectedIdentity.executableSha256 -and
+        [String]::Equals($current.executablePath, $ExpectedIdentity.executablePath,
+            [StringComparison]::OrdinalIgnoreCase) -and
+        $current.commandLine -ceq $ExpectedIdentity.commandLine -and
+        $current.parentProcessId -eq $ExpectedIdentity.parentProcessId -and
+        $current.parentCreationTimeUtc100ns -eq $ExpectedIdentity.parentCreationTimeUtc100ns) `
+        'Refusing to terminate a process whose identity or parent changed.'
+    $Process.Kill()
+    $Process.WaitForExit()
+}
+
 function Resolve-Stage5RunEvidenceFile {
     param([string]$TaskRootPath, [string]$Path, [string]$Context)
     Assert-Stage5PerformanceCondition (-not [string]::IsNullOrWhiteSpace($Path)) `
@@ -456,7 +625,8 @@ function Assert-Stage5RawDiagnostic {
         }
     }
     foreach ($name in @('producer', 'game_owned', 'run_id', 'process_id',
-            'executable_sha256', 'fixture_id', 'fixture_sha256', 'frame',
+            'process_creation_time_utc_100ns', 'executable_sha256',
+            'command_line', 'fixture_id', 'fixture_sha256', 'frame',
             'final_crc', 'close_boundary')) {
         Assert-Stage5PerformanceCondition ($fields.ContainsKey($name)) `
             "$Context raw diagnostic is missing '$name'."
@@ -466,12 +636,77 @@ function Assert-Stage5RawDiagnostic {
         $fields.game_owned -ceq '1' -and
         $fields.run_id -ceq [string]$Receipt.runId -and
         [int]$fields.process_id -eq [int]$Receipt.process.id -and
+        [Int64]$fields.process_creation_time_utc_100ns -eq
+            [Int64]$Receipt.process.creationTimeUtc100ns -and
         $fields.executable_sha256 -ceq [string]$Receipt.executableSha256 -and
+        $fields.command_line -ceq [string]$Receipt.commandLine -and
         $fields.fixture_id -ceq [string]$Receipt.fixture.id -and
         $fields.fixture_sha256 -ceq [string]$Receipt.fixture.contentSha256 -and
         [UInt32]$fields.frame -eq [UInt32]$Receipt.frames.final -and
         $fields.close_boundary -ceq 'game-owned-raw-diagnostic-closed-v1') `
         "$Context raw diagnostic identity does not match its executable receipt."
+}
+
+function Assert-Stage5ReceiptMetricContract {
+    param([object]$Receipt, [object]$Context, [string]$Label)
+    $phaseNames = @('owner-intake', 'world-queries', 'pathfinding',
+        'object-computation', 'spatial-work', 'deterministic-commit',
+        'verification-publication')
+    $kernelNames = @('physics', 'status', 'collision', 'ai-planning', 'spatial',
+        'path')
+    $phases = @($Receipt.phases)
+    $kernels = @($Receipt.kernels)
+    Assert-Stage5PerformanceCondition ($phases.Count -eq $phaseNames.Count) `
+        "$Label must contain exactly seven phase metrics."
+    Assert-Stage5PerformanceCondition ($kernels.Count -eq $kernelNames.Count) `
+        "$Label must contain exactly six kernel metrics."
+    for ($index = 0; $index -lt $phaseNames.Count; ++$index) {
+        Assert-Stage5PerformanceCondition ([string]$phases[$index].name -ceq
+            $phaseNames[$index]) "$Label phase order/name is not canonical."
+        Assert-Stage5PerformanceCondition (
+            $phases[$index].available -or
+            ([Int64]$phases[$index].totalNanoseconds -eq 0 -and
+                [Int64]$phases[$index].maximumNanoseconds -eq 0 -and
+                [Int64]$phases[$index].sampleCount -eq 0)) `
+            "$Label phase '$($phaseNames[$index])' is malformed."
+        if ([bool]$phases[$index].available) {
+            Assert-Stage5PerformanceCondition ([Int64]$phases[$index].sampleCount -gt 0 -and
+                [Int64]$phases[$index].totalNanoseconds -gt 0 -and
+                [Int64]$phases[$index].maximumNanoseconds -gt 0) `
+                "$Label available phase '$($phaseNames[$index])' lacks positive timing."
+        }
+        elseif ($Context.qualificationMode -ceq 'External16Core') {
+            throw "$Label external qualification cannot use unavailable phase '$($phaseNames[$index])'."
+        }
+    }
+    for ($index = 0; $index -lt $kernelNames.Count; ++$index) {
+        Assert-Stage5PerformanceCondition ([string]$kernels[$index].name -ceq
+            $kernelNames[$index]) "$Label kernel order/name is not canonical."
+        if (-not [bool]$kernels[$index].available) {
+            Assert-Stage5PerformanceCondition (
+                [Int64]$kernels[$index].submittedJobs -eq 0 -and
+                [Int64]$kernels[$index].completedJobs -eq 0 -and
+                [Int64]$kernels[$index].physicalWorkerJobs -eq 0 -and
+                [Int64]$kernels[$index].ownerHelpedJobs -eq 0 -and
+                [UInt64]$kernels[$index].physicalWorkerMask -eq 0 -and
+                [int]$kernels[$index].distinctPhysicalWorkers -eq 0 -and
+                -not [bool]$kernels[$index].physicalWorkerMaskComplete -and
+                [Int64]$kernels[$index].elapsedNanoseconds -eq 0 -and
+                -not [bool]$kernels[$index].elapsedNanosecondsKnown) `
+                "$Label unavailable kernel '$($kernelNames[$index])' contains evidence."
+            if ($Context.qualificationMode -ceq 'External16Core') {
+                throw "$Label external qualification cannot use unavailable kernel '$($kernelNames[$index])'."
+            }
+            continue
+        }
+        if ([bool]$kernels[$index].elapsedNanosecondsKnown) {
+            Assert-Stage5PerformanceCondition ([Int64]$kernels[$index].elapsedNanoseconds -gt 0) `
+                "$Label known kernel '$($kernelNames[$index])' lacks positive timing."
+        }
+        elseif ($Context.qualificationMode -ceq 'External16Core') {
+            throw "$Label external qualification cannot use unknown kernel '$($kernelNames[$index])' timing."
+        }
+    }
 }
 
 function Assert-Stage5Receipt {
@@ -494,6 +729,7 @@ function Assert-Stage5Receipt {
         'artifactSetSha256', 'executablePath', 'executableSha256', 'commandLine',
         'process', 'fixture', 'frames', 'worker', 'topology', 'rawEvidence',
         'schedulerMetrics', 'phases', 'kernels') "$label receipt"
+    Assert-Stage5ReceiptMetricContract $receipt $Context "$label receipt"
     Assert-Stage5PerformanceCondition ($receipt.schemaVersion -eq 1 -and
         $receipt.producer -ceq 'game-executable-performance-receipt-v1' -and
         $receipt.evidenceKind -ceq 'stage5-performance-receipt' -and
@@ -507,6 +743,10 @@ function Assert-Stage5Receipt {
     Assert-Stage5PerformanceCondition ([int]$receipt.process.id -eq [int]$hostObservation.processId -and
         [Int64]$receipt.process.creationTimeUtc100ns -eq
             [Int64]$hostObservation.creationTimeUtc100ns -and
+        [Int64]$receipt.process.startTimeUtc100ns -ge
+            [Int64]$receipt.process.creationTimeUtc100ns -and
+        [Int64]$receipt.process.endTimeUtc100ns -ge
+            [Int64]$receipt.process.startTimeUtc100ns -and
         [bool]$receipt.process.identityAvailable -and
         [bool]$receipt.process.exitCodeKnown -and
         [int]$receipt.process.exitCode -eq [int]$hostObservation.exitCode -and
@@ -544,8 +784,16 @@ function Assert-Stage5Receipt {
         [bool]$receipt.fixture.unitCountKnown -and
         [int]$receipt.fixture.unitCount -eq $fixture.peakUnitCount) `
         "$label fixture receipt does not match canonical reviewed metadata."
-    $laneIndex = [Array]::IndexOf($script:CanonicalLaneNames, [string]$Run.lane)
-    $workers = $script:CanonicalLaneWorkers[$laneIndex]
+    $contextLaneNames = if ($Context.PSObject.Properties.Name -contains 'laneNames') {
+        @($Context.laneNames)
+    } else { @(Get-Stage5LaneNames ([string]$Context.qualificationMode)) }
+    $contextLaneWorkers = if ($Context.PSObject.Properties.Name -contains 'laneWorkers') {
+        @($Context.laneWorkers)
+    } else { @(Get-Stage5LaneWorkers ([string]$Context.qualificationMode)) }
+    $laneIndex = [Array]::IndexOf([object[]]$contextLaneNames, [string]$Run.lane)
+    Assert-Stage5PerformanceCondition ($laneIndex -ge 0) `
+        "$label contains an unsupported qualification lane."
+    $workers = $contextLaneWorkers[$laneIndex]
     Assert-Stage5PerformanceCondition ([int]$receipt.worker.requestedCount -eq $workers -and
         [int]$receipt.worker.effectiveCount -eq $workers -and
         $receipt.worker.policy -ceq 'auto' -and [bool]$receipt.worker.pinned -and
@@ -615,6 +863,20 @@ function Assert-Stage5Receipt {
         rawLogSha256 = $rawHash
         timingPath = $timingPath
         timingSha256 = $timingHash
+        receiptBinding = [pscustomobject]@{
+            path = $receiptPath
+            sha256 = $receiptHash
+            runId = [string]$receipt.runId
+            processId = [int]$receipt.process.id
+            processCreationTimeUtc100ns = [Int64]$receipt.process.creationTimeUtc100ns
+            executablePath = [string]$receipt.executablePath
+            executableSha256 = [string]$receipt.executableSha256
+            commandLine = [string]$receipt.commandLine
+            rawLogPath = $rawPath
+            rawLogSha256 = $rawHash
+            timingPath = $timingPath
+            timingSha256 = $timingHash
+        }
         selectedWorkerCpuSetIds = @($selectedIds | ForEach-Object { [UInt32]$_ })
         selectedPhysicalCoreMask = ([UInt64]$receipt.worker.selectedWorkerPhysicalCoreMask).ToString('X16')
     }
@@ -623,41 +885,58 @@ function Assert-Stage5Receipt {
 function Assert-Stage5PerformanceRunSet {
     param([object]$Document)
     Assert-Stage5PerformanceProperties $Document @('schemaVersion', 'title',
+        'qualificationMode', 'stage3SourceCommit',
         'sourceCommit', 'artifactSetSha256', 'executablePath', 'executableSha256',
         'fixtureManifestSha256', 'stage3BaselineSha256', 'taskRoot', 'warmupRuns',
         'measuredRuns', 'fixtures', 'stage3Fixtures', 'topology', 'runs') `
         'Stage 5 host validation manifest'
+    $mode = [string]$Document.qualificationMode
+    Assert-Stage5PerformanceCondition (@('External16Core', 'LocalCapacitySmoke') -ccontains $mode) `
+        'Stage 5 host validation manifest qualification mode is invalid.'
+    $laneNames = @(Get-Stage5LaneNames $mode)
+    $laneWorkers = @(Get-Stage5LaneWorkers $mode)
     Assert-Stage5PerformanceCondition ($Document.schemaVersion -eq 1 -and
         @('Generals', 'ZeroHour') -ccontains [string]$Document.title -and
         $Document.sourceCommit -cmatch '^[0-9a-f]{40}$' -and
         $Document.artifactSetSha256 -cmatch '^[0-9A-F]{64}$' -and
         $Document.executableSha256 -cmatch '^[0-9A-F]{64}$' -and
         $Document.fixtureManifestSha256 -cmatch '^[0-9A-F]{64}$' -and
-        $Document.stage3BaselineSha256 -cmatch '^[0-9A-F]{64}$' -and
+        ($mode -ceq 'LocalCapacitySmoke' -or
+            $Document.stage3SourceCommit -cmatch '^[0-9a-f]{40}$') -and
+        ($mode -ceq 'LocalCapacitySmoke' -or
+            $Document.stage3BaselineSha256 -cmatch '^[0-9A-F]{64}$') -and
         [int]$Document.warmupRuns -eq 1 -and [int]$Document.measuredRuns -ge 3) `
         'Stage 5 host validation manifest identity is invalid.'
     Assert-Stage5PerformanceCondition ($Document.topology.source -ceq
         'GetSystemCpuSetInformation' -and
-        [int]$Document.topology.physicalCoreCount -ge 16 -and
-        [int]$Document.topology.logicalProcessorCount -ge 16) `
-        'Stage 5 performance validation requires at least 16 physical cores.'
+        (($mode -ceq 'External16Core' -and
+            [int]$Document.topology.physicalCoreCount -ge 16 -and
+            [int]$Document.topology.logicalProcessorCount -ge 16) -or
+         ($mode -ceq 'LocalCapacitySmoke' -and
+            [int]$Document.topology.physicalCoreCount -ge 4 -and
+            [int]$Document.topology.physicalCoreCount -le 6 -and
+            [int]$Document.topology.logicalProcessorCount -le 12))) `
+        'Stage 5 performance validation topology does not match its qualification mode.'
     $fixtures = @($Document.fixtures)
     $stage3 = @($Document.stage3Fixtures)
-    Assert-Stage5PerformanceCondition ($fixtures.Count -eq 4 -and $stage3.Count -eq 4) `
-        'Stage 5 validation manifest requires four current and Stage 3 fixtures.'
+    Assert-Stage5PerformanceCondition ($fixtures.Count -eq 4 -and
+        (($mode -ceq 'External16Core' -and $stage3.Count -eq 4) -or
+         ($mode -ceq 'LocalCapacitySmoke' -and $stage3.Count -eq 0))) `
+        'Stage 5 validation manifest has invalid current/Stage 3 fixture coverage.'
     for ($index = 0; $index -lt 4; ++$index) {
         Assert-Stage5PerformanceCondition ($fixtures[$index].id -ceq
             $script:CanonicalFixtureIds[$index] -and
             [int]$fixtures[$index].playerCount -eq 8 -and
             [int]$fixtures[$index].peakUnitCount -ge
                 $script:CanonicalFixtureUnits[$index] -and
-            $stage3[$index].id -ceq $fixtures[$index].id -and
-            (Test-Stage5PerformanceFinitePositive `
-                $stage3[$index].measuredMedianMilliseconds)) `
+            ($mode -ceq 'LocalCapacitySmoke' -or
+                ($stage3[$index].id -ceq $fixtures[$index].id -and
+                    (Test-Stage5PerformanceFinitePositive `
+                        $stage3[$index].measuredMedianMilliseconds)))) `
             "Stage 5 validation manifest fixture $index is not canonical."
     }
     $expectedPerLane = 1 + [int]$Document.measuredRuns
-    $expectedTotal = 4 * 3 * $expectedPerLane
+    $expectedTotal = 4 * $laneNames.Count * $expectedPerLane
     $runs = @($Document.runs)
     Assert-Stage5PerformanceCondition ($runs.Count -eq $expectedTotal) `
         "Stage 5 run schedule requires exactly $expectedTotal runs."
@@ -666,7 +945,7 @@ function Assert-Stage5PerformanceRunSet {
     $seenReceiptHashes = @{}
     $validated = @()
     foreach ($fixture in $fixtures) {
-        foreach ($lane in $script:CanonicalLaneNames) {
+        foreach ($lane in $laneNames) {
             $scheduled = @($runs | Where-Object {
                 $_.fixtureId -ceq $fixture.id -and $_.lane -ceq $lane
             } | Sort-Object ordinal)
@@ -684,43 +963,58 @@ function Assert-Stage5PerformanceRunSet {
     $fixtureResults = @()
     for ($fixtureIndex = 0; $fixtureIndex -lt 4; ++$fixtureIndex) {
         $fixture = $fixtures[$fixtureIndex]
-        $oneValues = @($validated | Where-Object {
-            $_.fixtureId -ceq $fixture.id -and $_.lane -ceq 'forced-one' -and -not $_.warmup
-        } | ForEach-Object { [double]$_.elapsedMilliseconds })
-        $eightValues = @($validated | Where-Object {
-            $_.fixtureId -ceq $fixture.id -and $_.lane -ceq 'physical-8' -and -not $_.warmup
-        } | ForEach-Object { [double]$_.elapsedMilliseconds })
-        $sixteenValues = @($validated | Where-Object {
-            $_.fixtureId -ceq $fixture.id -and $_.lane -ceq 'physical-16' -and -not $_.warmup
-        } | ForEach-Object { [double]$_.elapsedMilliseconds })
-        $one = Get-Stage5PerformanceMedian $oneValues
-        $eight = Get-Stage5PerformanceMedian $eightValues
-        $sixteen = Get-Stage5PerformanceMedian $sixteenValues
-        $baseline = [double]$stage3[$fixtureIndex].measuredMedianMilliseconds
-        $regression = $one / $baseline
-        $speedup8 = $one / $eight
-        $scale16 = $eight / $sixteen
-        Assert-Stage5PerformanceCondition ($regression -le 1.05) `
-            "Fixture '$($fixture.id)' forced-one regression ratio $regression exceeds 1.05."
-        Assert-Stage5PerformanceCondition ($speedup8 -ge 2.0) `
-            "Fixture '$($fixture.id)' physical-8 speedup $speedup8 is below 2.0x."
-        Assert-Stage5PerformanceCondition ($scale16 -gt 1.0) `
-            "Fixture '$($fixture.id)' physical-16 does not scale positively from physical-8."
-        $fixtureResults += [pscustomobject]@{
-            id = [string]$fixture.id
-            playerCount = 8
-            peakUnitCount = [int]$fixture.peakUnitCount
-            measuredRuns = [int]$Document.measuredRuns
-            stage3ForcedOneMedianMilliseconds = $baseline
-            stage5ForcedOneMedianMilliseconds = $one
-            physical8MedianMilliseconds = $eight
-            physical16MedianMilliseconds = $sixteen
-            forcedOneRegressionRatio = $regression
-            physical8Speedup = $speedup8
-            physical8To16Speedup = $scale16
+        $laneMedians = @{}
+        foreach ($lane in $laneNames) {
+            $values = @($validated | Where-Object {
+                $_.fixtureId -ceq $fixture.id -and $_.lane -ceq $lane -and
+                    -not $_.warmup
+            } | ForEach-Object { [double]$_.elapsedMilliseconds })
+            $laneMedians[$lane] = Get-Stage5PerformanceMedian $values
+        }
+        if ($mode -ceq 'External16Core') {
+            $one = [double]$laneMedians['forced-one']
+            $eight = [double]$laneMedians['physical-8']
+            $sixteen = [double]$laneMedians['physical-16']
+            $baseline = [double]$stage3[$fixtureIndex].measuredMedianMilliseconds
+            $regression = $one / $baseline
+            $speedup8 = $one / $eight
+            $scale16 = $eight / $sixteen
+            Assert-Stage5PerformanceCondition ($regression -le 1.05) `
+                "Fixture '$($fixture.id)' forced-one regression ratio $regression exceeds 1.05."
+            Assert-Stage5PerformanceCondition ($speedup8 -ge 2.0) `
+                "Fixture '$($fixture.id)' physical-8 speedup $speedup8 is below 2.0x."
+            Assert-Stage5PerformanceCondition ($scale16 -gt 1.0) `
+                "Fixture '$($fixture.id)' physical-16 does not scale positively from physical-8."
+            $fixtureResults += [pscustomobject]@{
+                id = [string]$fixture.id
+                playerCount = 8
+                peakUnitCount = [int]$fixture.peakUnitCount
+                measuredRuns = [int]$Document.measuredRuns
+                stage3ForcedOneMedianMilliseconds = $baseline
+                stage5ForcedOneMedianMilliseconds = $one
+                physical8MedianMilliseconds = $eight
+                physical16MedianMilliseconds = $sixteen
+                forcedOneRegressionRatio = $regression
+                physical8Speedup = $speedup8
+                physical8To16Speedup = $scale16
+            }
+        }
+        else {
+            $fixtureResults += [pscustomobject]@{
+                id = [string]$fixture.id
+                playerCount = 8
+                peakUnitCount = [int]$fixture.peakUnitCount
+                measuredRuns = [int]$Document.measuredRuns
+                laneMedians = [pscustomobject]$laneMedians
+                qualificationClass = 'local-capacity-smoke'
+            }
         }
     }
-    return [pscustomobject]@{ runs = $validated; fixtures = $fixtureResults }
+    return [pscustomobject]@{
+        qualificationMode = $mode
+        runs = $validated
+        fixtures = $fixtureResults
+    }
 }
 
 function New-Stage5ProcessStartInfo {
@@ -790,16 +1084,17 @@ function Invoke-Stage5InstalledPerformanceRun {
     Assert-Stage5PerformanceCondition ($process.Start()) `
         "Failed to start installed performance run '$runId'."
     try {
-        $hostProcessId = $process.Id
-        $hostCreationTime = $process.StartTime.ToUniversalTime().ToFileTimeUtc()
-        $hostExecutablePath = $process.MainModule.FileName
-        $hostExecutableHash = Get-Stage5PerformanceSha256 $hostExecutablePath
-        $hostCommandLine = Get-Stage5ProcessCommandLine $hostProcessId
+        $processIdentity = Get-Stage5ProcessIdentity $process
+        $hostProcessId = $processIdentity.processId
+        $hostCreationTime = $processIdentity.creationTimeUtc100ns
+        $hostExecutablePath = $processIdentity.executablePath
+        $hostExecutableHash = $processIdentity.executableSha256
+        $hostCommandLine = $processIdentity.commandLine
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
         $exited = $process.WaitForExit($Timeout * 1000)
         if (-not $exited) {
-            try { $process.Kill() } catch { }
+            Stop-Stage5ProcessSafely $process $processIdentity
             throw "Installed performance run '$runId' exceeded $Timeout seconds."
         }
         $process.WaitForExit()
@@ -830,6 +1125,8 @@ function Invoke-Stage5InstalledPerformanceRun {
             executablePath = $hostExecutablePath
             executableSha256 = $hostExecutableHash
             commandLine = $hostCommandLine
+            parentProcessId = [int]$processIdentity.parentProcessId
+            parentCreationTimeUtc100ns = [Int64]$processIdentity.parentCreationTimeUtc100ns
             argumentString = $arguments
             exitCode = $exitCode
             elapsedMilliseconds = $stopwatch.Elapsed.TotalMilliseconds
@@ -862,15 +1159,22 @@ if ($PSCmdlet.ParameterSetName -ceq 'SelfTest') {
     return
 }
 
-Assert-Stage5PerformanceCondition ($ExpectedSourceCommit -cmatch '^[0-9a-f]{40}$') `
-    'ExpectedSourceCommit must be an independently supplied lowercase 40-hex commit.'
+Assert-Stage5PerformanceSourceCommit $ExpectedSourceCommit 'ExpectedSourceCommit'
 foreach ($binding in @(
         @('ExpectedExecutableSha256', $ExpectedExecutableSha256),
         @('ExpectedArtifactSetSha256', $ExpectedArtifactSetSha256),
-        @('ExpectedFixtureManifestSha256', $ExpectedFixtureManifestSha256),
-        @('ExpectedStage3BaselineSha256', $ExpectedStage3BaselineSha256),
-        @('ExpectedStage3ExecutableSha256', $ExpectedStage3ExecutableSha256))) {
+        @('ExpectedFixtureManifestSha256', $ExpectedFixtureManifestSha256))) {
     Assert-Stage5PerformanceHash ([string]$binding[1]) ([string]$binding[0])
+}
+$isExternalQualification = $QualificationMode -ceq 'External16Core'
+if ($isExternalQualification) {
+    Assert-Stage5PerformanceSourceCommit $ExpectedStage3SourceCommit `
+        'ExpectedStage3SourceCommit'
+    foreach ($binding in @(
+            @('ExpectedStage3BaselineSha256', $ExpectedStage3BaselineSha256),
+            @('ExpectedStage3ExecutableSha256', $ExpectedStage3ExecutableSha256))) {
+        Assert-Stage5PerformanceHash ([string]$binding[1]) ([string]$binding[0])
+    }
 }
 $executableFull = [IO.Path]::GetFullPath($InstalledExecutablePath)
 Assert-Stage5PerformanceCondition (Test-Path -LiteralPath $executableFull -PathType Leaf) `
@@ -882,6 +1186,8 @@ Assert-Stage5PerformanceCondition ((Get-Stage5PeMachine $executableFull) -eq 0x8
     'Installed executable machine is not AMD64 (0x8664).'
 Assert-Stage5PerformanceFileHash $executableFull $ExpectedExecutableSha256 `
     'Installed executable SHA-256' | Out-Null
+$runtimeFull = Split-Path -Parent $executableFull
+$launcherContract = Get-Stage5LauncherContract $runtimeFull $executableFull
 $taskFull = [IO.Path]::GetFullPath($TaskRoot).TrimEnd('\', '/')
 Assert-Stage5PerformanceCondition ($taskFull.StartsWith('H:\',
     [StringComparison]::OrdinalIgnoreCase)) `
@@ -891,41 +1197,61 @@ Assert-Stage5PerformanceCondition (-not (Test-Path -LiteralPath $taskFull)) `
 
 $fixtureManifest = Read-Stage5ScalingFixtureManifest $FixtureManifestPath `
     $ExpectedFixtureManifestSha256 $Title $ExpectedExecutableSha256
-$baseline = Read-Stage5ScalingBaseline $Stage3BaselinePath `
-    $ExpectedStage3BaselineSha256 $ExpectedStage3ExecutableSha256 $Title `
-    $ExpectedFixtureManifestSha256 $fixtureManifest.fixtures
-$hostTopology = Get-Stage5HostTopology
-Assert-Stage5PerformanceCondition ($baseline.physicalCoreCount -eq
-    $hostTopology.physicalCoreCount -and $baseline.logicalProcessorCount -eq
-    $hostTopology.logicalProcessorCount) `
-    'Stage 3 baseline physical/logical topology does not match the qualification host.'
+$baseline = $null
+if ($isExternalQualification) {
+    $baseline = Read-Stage5ScalingBaseline $Stage3BaselinePath `
+        $ExpectedStage3BaselineSha256 $ExpectedStage3ExecutableSha256 $Title `
+        $ExpectedFixtureManifestSha256 $fixtureManifest.fixtures `
+        $ExpectedStage3SourceCommit
+}
+$hostTopology = if ($isExternalQualification) {
+    Get-Stage5HostTopology -MinimumPhysicalCores 16
+} else {
+    Get-Stage5HostTopology -MinimumPhysicalCores 4 -MaximumPhysicalCores 6 `
+        -MaximumLogicalProcessors 12
+}
+if ($isExternalQualification) {
+    Assert-Stage5PerformanceCondition ($baseline.physicalCoreCount -eq
+        $hostTopology.physicalCoreCount -and $baseline.logicalProcessorCount -eq
+        $hostTopology.logicalProcessorCount) `
+        'Stage 3 baseline physical/logical topology does not match the qualification host.'
+}
 New-Item -ItemType Directory -Path $taskFull | Out-Null
 
 $context = [pscustomobject]@{
     schemaVersion = 1
     title = $Title
+    qualificationMode = $QualificationMode
+    laneNames = @(Get-Stage5LaneNames $QualificationMode)
+    laneWorkers = @(Get-Stage5LaneWorkers $QualificationMode)
     sourceCommit = $ExpectedSourceCommit
+    stage3SourceCommit = if ($isExternalQualification) {
+        $ExpectedStage3SourceCommit
+    } else { '' }
     artifactSetSha256 = $ExpectedArtifactSetSha256
     executablePath = $executableFull
     executableSha256 = $ExpectedExecutableSha256
     fixtureManifestSha256 = $ExpectedFixtureManifestSha256
-    stage3BaselineSha256 = $ExpectedStage3BaselineSha256
+    stage3BaselineSha256 = if ($isExternalQualification) {
+        $ExpectedStage3BaselineSha256
+    } else { '' }
     taskRoot = $taskFull
     warmupRuns = 1
     measuredRuns = $MeasuredRuns
     fixtures = $fixtureManifest.fixtures
-    stage3Fixtures = $baseline.fixtures
+    stage3Fixtures = if ($isExternalQualification) { $baseline.fixtures } else { @() }
     topology = $hostTopology
+    launcherContract = $launcherContract
     runs = @()
 }
 
 $scheduledRuns = New-Object 'Collections.Generic.List[object]'
 foreach ($fixture in $fixtureManifest.fixtures) {
-    for ($laneIndex = 0; $laneIndex -lt 3; ++$laneIndex) {
+    for ($laneIndex = 0; $laneIndex -lt $context.laneNames.Count; ++$laneIndex) {
         for ($ordinal = 0; $ordinal -lt (1 + $MeasuredRuns); ++$ordinal) {
             $scheduledRuns.Add((Invoke-Stage5InstalledPerformanceRun $context $fixture `
-                $script:CanonicalLaneNames[$laneIndex] $ordinal `
-                $script:CanonicalLaneWorkers[$laneIndex] $TimeoutSeconds)) | Out-Null
+                $context.laneNames[$laneIndex] $ordinal `
+                $context.laneWorkers[$laneIndex] $TimeoutSeconds)) | Out-Null
         }
     }
 }
@@ -934,12 +1260,28 @@ $validated = Assert-Stage5PerformanceRunSet $context
 
 # This is the only aggregate write. Any missing/tampered receipt, topology,
 # command, exit, raw file, timing file, or threshold failure leaves it absent.
+$stage3Summary = if ($isExternalQualification) {
+    [ordered]@{
+        path = $baseline.path
+        sha256 = $ExpectedStage3BaselineSha256
+        sourceCommit = $ExpectedStage3SourceCommit
+        executableSha256 = $ExpectedStage3ExecutableSha256
+    }
+} else { $null }
 $aggregate = [ordered]@{
     schemaVersion = 1
-    evidenceKind = 'stage5-performance-scaling-host-qualification'
+    evidenceKind = if ($isExternalQualification) {
+        'stage5-performance-scaling-host-qualification'
+    } else { 'stage5-performance-scaling-local-capacity-smoke' }
     producer = 'Invoke-Stage5PerformanceScalingValidation.ps1'
     status = 'passed'
     recordedUtc = [DateTime]::UtcNow.ToString('o')
+    qualificationMode = $QualificationMode
+    qualificationClass = if ($isExternalQualification) {
+        'external-16-core-qualification'
+    } else { 'local-capacity-smoke' }
+    measurementMode = 'headless-throughput'
+    installedRuntime = $true
     sourceCommit = $ExpectedSourceCommit
     artifactSetSha256 = $ExpectedArtifactSetSha256
     title = $Title
@@ -947,21 +1289,26 @@ $aggregate = [ordered]@{
     fixtureManifest = [ordered]@{
         path = $fixtureManifest.path; sha256 = $ExpectedFixtureManifestSha256
     }
-    stage3Baseline = [ordered]@{
-        path = $baseline.path
-        sha256 = $ExpectedStage3BaselineSha256
-        executableSha256 = $ExpectedStage3ExecutableSha256
-    }
+    stage3Baseline = $stage3Summary
+    launcher = $launcherContract
     schedule = [ordered]@{ warmupRuns = 1; measuredRuns = $MeasuredRuns }
     topology = $hostTopology
-    thresholds = [ordered]@{
-        maximumForcedOneRegressionRatio = 1.05
-        minimumPhysical8Speedup = 2.0
-        minimumPhysical8To16SpeedupExclusive = 1.0
-    }
+    thresholds = if ($isExternalQualification) {
+        [ordered]@{
+            maximumForcedOneRegressionRatio = 1.05
+            minimumPhysical8Speedup = 2.0
+            minimumPhysical8To16SpeedupExclusive = 1.0
+        }
+    } else { $null }
+    nativeReceiptBindings = @($validated.runs | ForEach-Object {
+        $_.receiptBinding
+    })
     fixtures = $validated.fixtures
     runs = $validated.runs
 }
-$aggregatePath = Join-Path $taskFull 'Stage5PerformanceScalingQualification.json'
+$aggregateName = if ($isExternalQualification) {
+    'Stage5PerformanceScalingQualification.json'
+} else { 'Stage5PerformanceLocalCapacitySmoke.json' }
+$aggregatePath = Join-Path $taskFull $aggregateName
 Write-Stage5JsonAtomically $aggregatePath $aggregate
 Write-Output $aggregatePath

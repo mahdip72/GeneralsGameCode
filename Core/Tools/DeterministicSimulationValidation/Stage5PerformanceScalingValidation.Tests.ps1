@@ -54,6 +54,30 @@ function Write-RunReceipt {
         }
     }
     $selected = @(1..$Workers)
+    $phaseNames = @('owner-intake', 'world-queries', 'pathfinding',
+        'object-computation', 'spatial-work', 'deterministic-commit',
+        'verification-publication')
+    $phases = @()
+    for ($phaseIndex = 0; $phaseIndex -lt $phaseNames.Count; ++$phaseIndex) {
+        $phases += [ordered]@{
+            name = $phaseNames[$phaseIndex]; available = $true
+            totalNanoseconds = 1000 + $phaseIndex
+            maximumNanoseconds = 1000 + $phaseIndex; sampleCount = 1
+        }
+    }
+    $kernelNames = @('physics', 'status', 'collision', 'ai-planning', 'spatial',
+        'path')
+    $kernels = @()
+    for ($kernelIndex = 0; $kernelIndex -lt $kernelNames.Count; ++$kernelIndex) {
+        $kernels += [ordered]@{
+            name = $kernelNames[$kernelIndex]; available = $true
+            submittedJobs = 8; completedJobs = 8; physicalWorkerJobs = 8
+            ownerHelpedJobs = 0; physicalWorkerMask = 255
+            distinctPhysicalWorkers = 8; physicalWorkerMaskComplete = $true
+            elapsedNanoseconds = 2000 + $kernelIndex
+            elapsedNanosecondsKnown = $true
+        }
+    }
     $receipt = [ordered]@{
         schemaVersion = 1
         producer = 'game-executable-performance-receipt-v1'
@@ -99,12 +123,14 @@ function Write-RunReceipt {
             timingPath = $timingPath; timingSha256 = ''
         }
         schedulerMetrics = [ordered]@{}
-        phases = @()
-        kernels = @()
+        phases = $phases
+        kernels = $kernels
     }
     $raw = @(
         'producer=game-executable-performance-receipt-v1', 'game_owned=1',
-        "run_id=$runId", "process_id=$ProcessId", "executable_sha256=$('A' * 64)",
+        "run_id=$runId", "process_id=$ProcessId",
+        "process_creation_time_utc_100ns=$creation",
+        "executable_sha256=$('A' * 64)", "command_line=$commandLine",
         "fixture_id=$FixtureId", "fixture_sha256=$('C' * 64)", 'frame=100',
         'final_crc=12345678', 'close_boundary=game-owned-raw-diagnostic-closed-v1'
     ) -join [Environment]::NewLine
@@ -130,7 +156,7 @@ function Write-RunReceipt {
 }
 
 function New-ValidationFixture {
-    param([string]$Root)
+    param([string]$Root, [string]$Mode = 'External16Core')
     New-Item -ItemType Directory -Path $Root | Out-Null
     $executable = Join-Path $Root 'generalszh.exe'
     [IO.File]::WriteAllText($executable, 'self-test only; never executed')
@@ -149,13 +175,23 @@ function New-ValidationFixture {
             sha256 = ('C' * 64); seed = 7; playerCount = 8
             peakUnitCount = $unitCounts[$fixtureIndex]
         }
-        $stage3 += [ordered]@{
-            id = $fixtureIds[$fixtureIndex]; measuredMedianMilliseconds = 100.0
+        if ($Mode -ceq 'External16Core') {
+            $stage3 += [ordered]@{
+                id = $fixtureIds[$fixtureIndex]; measuredMedianMilliseconds = 100.0
+            }
         }
-        foreach ($lane in @(
+        $lanes = if ($Mode -ceq 'LocalCapacitySmoke') {
+            @(
+                [pscustomobject]@{ name = 'forced-one'; workers = 1; elapsed = 100.0 },
+                [pscustomobject]@{ name = 'physical-2'; workers = 2; elapsed = 60.0 },
+                [pscustomobject]@{ name = 'physical-4'; workers = 4; elapsed = 40.0 })
+        } else {
+            @(
                 [pscustomobject]@{ name = 'forced-one'; workers = 1; elapsed = 100.0 },
                 [pscustomobject]@{ name = 'physical-8'; workers = 8; elapsed = 40.0 },
-                [pscustomobject]@{ name = 'physical-16'; workers = 16; elapsed = 30.0 })) {
+                [pscustomobject]@{ name = 'physical-16'; workers = 16; elapsed = 30.0 })
+        }
+        foreach ($lane in $lanes) {
             for ($ordinal = 0; $ordinal -lt 4; ++$ordinal) {
                 ++$processId
                 $runs.Add((Write-RunReceipt $Root $executable $fixtureIds[$fixtureIndex] `
@@ -165,15 +201,20 @@ function New-ValidationFixture {
         }
     }
     $document = [ordered]@{
-        schemaVersion = 1; title = 'ZeroHour'; sourceCommit = ('a' * 40)
+        schemaVersion = 1; title = 'ZeroHour'; qualificationMode = $Mode
+        stage3SourceCommit = if ($Mode -ceq 'External16Core') { ('b' * 40) } else { '' }
+        sourceCommit = ('a' * 40)
         artifactSetSha256 = ('B' * 64); executablePath = $executable
         executableSha256 = ('A' * 64); fixtureManifestSha256 = ('D' * 64)
-        stage3BaselineSha256 = ('E' * 64); taskRoot = $Root
+        stage3BaselineSha256 = if ($Mode -ceq 'External16Core') { ('E' * 64) } else { '' }
+        taskRoot = $Root
         warmupRuns = 1; measuredRuns = 3; fixtures = $fixtures
         stage3Fixtures = $stage3
         topology = [ordered]@{
-            source = 'GetSystemCpuSetInformation'; physicalCoreCount = 16
-            logicalProcessorCount = 16; cpuSets = @()
+            source = 'GetSystemCpuSetInformation'
+            physicalCoreCount = if ($Mode -ceq 'External16Core') { 16 } else { 6 }
+            logicalProcessorCount = if ($Mode -ceq 'External16Core') { 16 } else { 12 }
+            cpuSets = @()
         }
         runs = $runs.ToArray()
     }
@@ -221,6 +262,17 @@ try {
     New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
     $validManifest = New-ValidationFixture (Join-Path $testRoot 'valid')
     & $runner -SelfTestValidationManifestPath $validManifest | Out-Null
+    $localManifest = New-ValidationFixture (Join-Path $testRoot 'local') `
+        'LocalCapacitySmoke'
+    $localResult = & $runner -SelfTestValidationManifestPath $localManifest
+    $localDocument = Get-Content -LiteralPath $localManifest -Raw | ConvertFrom-Json
+    Assert-True (@($localDocument.runs).Count -eq 48) `
+        'Local capacity smoke must schedule four fixtures across 1/2/4 workers.'
+    Assert-True ((@($localDocument.runs | Where-Object {
+        @('forced-one', 'physical-2', 'physical-4') -ccontains $_.lane
+    }).Count) -eq 48) 'Local capacity smoke contains an unexpected lane.'
+    Assert-True ($localResult -match '48 runs') `
+        'Local capacity smoke self-test did not report its complete schedule.'
 
     Assert-Rejected 'missing-lane' {
         param($document)
@@ -237,6 +289,30 @@ try {
     Assert-Rejected 'command-mismatch' {
         param($document)
         Update-Receipt $document.runs[0] { param($receipt) $receipt.commandLine += ' -forged' }
+    }
+    Assert-Rejected 'missing-phase-timing' {
+        param($document)
+        Update-Receipt $document.runs[0] {
+            param($receipt)
+            $receipt.phases[0].available = $false
+            $receipt.phases[0].totalNanoseconds = 0
+            $receipt.phases[0].maximumNanoseconds = 0
+            $receipt.phases[0].sampleCount = 0
+        }
+    }
+    Assert-Rejected 'unknown-kernel-timing' {
+        param($document)
+        Update-Receipt $document.runs[0] {
+            param($receipt)
+            $receipt.kernels[0].elapsedNanosecondsKnown = $false
+        }
+    }
+    Assert-Rejected 'legacy-pathfinding-kernel-name' {
+        param($document)
+        Update-Receipt $document.runs[0] {
+            param($receipt)
+            $receipt.kernels[5].name = 'pathfinding'
+        }
     }
     Assert-Rejected 'exit-mismatch' {
         param($document)
@@ -285,7 +361,10 @@ try {
         $runnerSource -match 'RTS_PERFORMANCE_VERIFIER_BOUNDARY') `
         'Runner must set the executable performance receipt contract.'
     Assert-True ($runnerSource -match 'GetSystemCpuSetInformation' -and
-        $runnerSource -match 'physicalCoreCount -ge 16') `
+        $runnerSource -match 'physicalCoreCount -ge 16' -and
+        $runnerSource -match 'LocalCapacitySmoke' -and
+        $runnerSource -match 'Stop-Stage5ProcessSafely' -and
+        $runnerSource -match 'Get-Stage5LauncherContract') `
         'Runner must fail closed on insufficient physical topology.'
     Write-Output 'Stage 5 performance scaling host validation self-tests passed.'
 }

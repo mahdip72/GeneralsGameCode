@@ -32,7 +32,7 @@
     "status": { "const": "complete" },
     "title": { "type": "string", "minLength": 1 },
     "runId": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,256}$" },
-    "sourceCommit": { "type": "string", "minLength": 1 },
+    "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
     "artifactSetSha256": { "$ref": "#/$defs/sha256" },
     "executablePath": { "type": "string", "minLength": 1 },
     "executableSha256": { "$ref": "#/$defs/sha256" },
@@ -175,25 +175,11 @@
       "required": ["verifierBoundary", "rawLogPath", "rawLogSha256", "timingPath", "timingSha256"],
       "properties": {
         "verifierBoundary": { "type": "string", "minLength": 1 },
-        "rawLogPath": { "type": "string" },
-        "rawLogSha256": { "type": "string" },
-        "timingPath": { "type": "string" },
-        "timingSha256": { "type": "string" }
-      },
-      "allOf": [
-        {
-          "anyOf": [
-            { "properties": { "rawLogPath": { "minLength": 1 } } },
-            { "properties": { "rawLogSha256": { "$ref": "#/$defs/sha256" } } }
-          ]
-        },
-        {
-          "anyOf": [
-            { "properties": { "timingPath": { "minLength": 1 } } },
-            { "properties": { "timingSha256": { "$ref": "#/$defs/sha256" } } }
-          ]
-        }
-      ]
+        "rawLogPath": { "type": "string", "minLength": 1 },
+        "rawLogSha256": { "$ref": "#/$defs/sha256" },
+        "timingPath": { "type": "string", "minLength": 1 },
+        "timingSha256": { "$ref": "#/$defs/sha256" }
+      }
     },
     "schedulerMetrics": {
       "type": "object",
@@ -238,12 +224,13 @@
     "phases": {
       "type": "array",
       "minItems": 7,
+      "maxItems": 7,
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": ["name", "available", "totalNanoseconds", "maximumNanoseconds", "sampleCount"],
         "properties": {
-          "name": { "type": "string", "minLength": 1 },
+          "name": { "enum": ["owner-intake", "world-queries", "pathfinding", "object-computation", "spatial-work", "deterministic-commit", "verification-publication"] },
           "available": { "type": "boolean" },
           "totalNanoseconds": { "type": "integer", "minimum": 0 },
           "maximumNanoseconds": { "type": "integer", "minimum": 0 },
@@ -254,6 +241,7 @@
     "kernels": {
       "type": "array",
       "minItems": 6,
+      "maxItems": 6,
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -271,7 +259,7 @@
           "elapsedNanosecondsKnown"
         ],
         "properties": {
-          "name": { "type": "string", "minLength": 1 },
+          "name": { "enum": ["physics", "status", "collision", "ai-planning", "spatial", "path"] },
           "available": { "type": "boolean" },
           "submittedJobs": { "type": "integer", "minimum": 0 },
           "completedJobs": { "type": "integer", "minimum": 0 },
