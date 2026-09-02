@@ -306,7 +306,8 @@ target_include_directories(core_renderer PUBLIC
     ${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas
 )
 
-target_link_libraries(core_renderer PRIVATE
+# Public renderer headers use the fixed-width integer compatibility adapter.
+target_link_libraries(core_renderer PUBLIC
     core_utility_no_pch
 )
 
