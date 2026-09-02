@@ -187,7 +187,9 @@ void testTransactionalFailureAndShadowComparison()
 	serial[1].objectID = 9;
 	serial[1].ownerOrder = 5;
 	serial[1].expiredMask = 4;
-	rts::ObjectStatusTimerCommand parallel[2] = { serial[0], serial[1] };
+	rts::ObjectStatusTimerCommand parallel[2];
+	parallel[0] = serial[0];
+	parallel[1] = serial[1];
 	unsigned firstDifference = 99;
 	expect(rts::ObjectStatusTimerCommandsEqual(serial, 2, parallel, 2,
 		&firstDifference), "shadow comparison accepts identical commands");

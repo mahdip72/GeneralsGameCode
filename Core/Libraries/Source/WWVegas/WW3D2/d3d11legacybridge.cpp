@@ -1,6 +1,6 @@
 #include "d3d11legacybridge.h"
 
-#if defined(RTS_RENDERER_HAS_D3D11)
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
 
 #include "dx8wrapper.h"
 #include "dx8fvf.h"

@@ -13,6 +13,12 @@
 #include <stdio.h>
 #include <string.h>
 
+#if defined(_MSC_VER) && _MSC_VER < 1300
+// VC6 reports optimizer-selected inline expansion as C4711 at /W4. It is
+// informational and otherwise trips this test target's intentional /WX gate.
+#pragma warning(disable : 4711)
+#endif
+
 namespace
 {
 
