@@ -73,22 +73,102 @@ function Assert-NativeD3D8FreeClosure([string]$Content)
     }
 }
 
-function Assert-ProductRuntimeSelector([string]$Content)
+function Get-ProductRuntimeSelectorBranches([string]$Content)
 {
+    # Keep selector discovery line-oriented.  The previous whole-file
+    # multiline expression was sensitive to the PowerShell/.NET runtime used
+    # by CI even after line-ending normalization.  The selector conditions
+    # must be complete commands on one line; branch bodies may still contain
+    # multiline CMake commands and are returned unchanged for the existing
+    # dependency checks below.
     $withoutComments = Remove-CMakeComments $Content
-    $selection = [regex]::Match($withoutComments, @'
-(?is)if\s*\(\s*WIN32\s+AND\s+CMAKE_SIZEOF_VOID_P\s+EQUAL\s+8\s*\)
-(?<Native>.*?)
-elseif\s*\(\s*CMAKE_SIZEOF_VOID_P\s+EQUAL\s+4\s*\)
-(?<Legacy>.*?)
-elseif\s*\(
-'@)
-    if (-not $selection.Success) {
+    $lines = @($withoutComments -split "`n")
+    $nativeCondition = '^\s*if\s*\(\s*WIN32\s+AND\s+CMAKE_SIZEOF_VOID_P\s+EQUAL\s+8\s*\)\s*$'
+    $legacyCondition = '^\s*elseif\s*\(\s*CMAKE_SIZEOF_VOID_P\s+EQUAL\s+4\s*\)\s*$'
+    $nativeLine = -1
+    $legacyLine = -1
+    $elseLine = -1
+    $depth = 0
+    $invalidBranchOrder = $false
+
+    for ($lineIndex = 0; $lineIndex -lt $lines.Count; $lineIndex++) {
+        $line = $lines[$lineIndex].Trim()
+        if ($line -match '^endif\s*\(' -or $line -match '^endif\b') {
+            if ($depth -gt 0) {
+                $depth = $depth - 1
+            }
+            continue
+        }
+        if ($line -match '^if\s*\(') {
+            if ($depth -eq 0 -and $nativeLine -lt 0 -and
+                $line -match $nativeCondition) {
+                $nativeLine = $lineIndex
+            }
+            $depth = $depth + 1
+            continue
+        }
+        if ($line -match '^elseif\s*\(' -and $depth -eq 1) {
+            if ($nativeLine -ge 0 -and $legacyLine -lt 0) {
+                if ($line -match $legacyCondition) {
+                    $legacyLine = $lineIndex
+                }
+                else {
+                    $invalidBranchOrder = $true
+                }
+            }
+            elseif ($legacyLine -ge 0 -and $elseLine -lt 0) {
+                $elseLine = $lineIndex
+            }
+            elseif ($elseLine -ge 0) {
+                $invalidBranchOrder = $true
+            }
+        }
+    }
+
+    if ($invalidBranchOrder -or $nativeLine -lt 0 -or
+        $legacyLine -le $nativeLine -or $elseLine -le $legacyLine) {
         throw 'Product runtime selector does not expose distinct native x64 and 32-bit branches.'
     }
 
-    $nativeBranch = $selection.Groups['Native'].Value
-    $legacyBranch = $selection.Groups['Legacy'].Value
+    $nativeBranch = if ($legacyLine -gt ($nativeLine + 1)) {
+        ($lines[($nativeLine + 1)..($legacyLine - 1)] -join "`n")
+    }
+    else {
+        ''
+    }
+    $legacyBranch = if ($elseLine -gt ($legacyLine + 1)) {
+        ($lines[($legacyLine + 1)..($elseLine - 1)] -join "`n")
+    }
+    else {
+        ''
+    }
+    $outsideLines = New-Object 'System.Collections.Generic.List[string]'
+    if ($nativeLine -gt 0) {
+        foreach ($lineIndex in 0..($nativeLine - 1)) {
+            [void]$outsideLines.Add($lines[$lineIndex])
+        }
+    }
+    # The first non-legacy top-level elseif is the unselected/else branch.
+    # Keep its condition in the outside text so architecture-specific tokens
+    # there remain subject to the same check as before.
+    if ($elseLine -lt $lines.Count) {
+        foreach ($lineIndex in $elseLine..($lines.Count - 1)) {
+            [void]$outsideLines.Add($lines[$lineIndex])
+        }
+    }
+
+    return [pscustomobject]@{
+        NativeBranch = $nativeBranch
+        LegacyBranch = $legacyBranch
+        OutsideSelection = ($outsideLines -join "`n")
+    }
+}
+
+function Assert-ProductRuntimeSelector([string]$Content)
+{
+    $selection = Get-ProductRuntimeSelectorBranches $Content
+    $nativeBranch = $selection.NativeBranch
+    $legacyBranch = $selection.LegacyBranch
     if ($nativeBranch -notmatch '(?i)include\s*\([^\)]*native-product-runtime\.cmake' -or
         $nativeBranch -notmatch '(?is)target_link_libraries\s*\(\s*rts_product_runtime\s+INTERFACE\s+rts_native_product_runtime\s*\)' -or
         (Test-DependencyToken $nativeBranch 'rts_legacy_product_runtime')) {
@@ -100,8 +180,7 @@ elseif\s*\(
         throw 'The 32-bit product selection does not resolve exclusively through rts_legacy_product_runtime.'
     }
 
-    $outsideSelection = $withoutComments.Remove($selection.Index,
-        $selection.Length)
+    $outsideSelection = $selection.OutsideSelection
     foreach ($architectureSpecificToken in @(
         'native-product-runtime.cmake',
         'legacy-product-runtime.cmake',
@@ -586,6 +665,40 @@ endif()
 '@
     Assert-ProductRuntimeSelector $goodSelector
     Assert-ProductRuntimeSelector ($goodSelector -replace "`n", "`r`n")
+    $formattedSelector = @'
+  IF (  WIN32   AND   CMAKE_SIZEOF_VOID_P   EQUAL   8 )
+      include ( "${CMAKE_CURRENT_LIST_DIR}/native-product-runtime.cmake" )
+      target_link_libraries ( rts_product_runtime INTERFACE rts_native_product_runtime )
+  ELSEIF ( CMAKE_SIZEOF_VOID_P EQUAL 4 )
+      include ( "${CMAKE_CURRENT_LIST_DIR}/legacy-product-runtime.cmake" )
+      target_link_libraries ( rts_product_runtime INTERFACE rts_legacy_product_runtime )
+  ELSEIF ( RTS_BUILD_PRODUCT )
+  ENDIF()
+'@
+    Assert-ProductRuntimeSelector ($formattedSelector -replace "`n", "`r`n")
+    foreach ($multilineSelector in @(
+            $goodSelector.Replace(
+                'if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)',
+                "if(WIN32 AND CMAKE_SIZEOF_VOID_P`n    EQUAL 8)"),
+            $goodSelector.Replace(
+                'elseif(CMAKE_SIZEOF_VOID_P EQUAL 4)',
+                "elseif(CMAKE_SIZEOF_VOID_P`n    EQUAL 4)"),
+            $goodSelector.Replace(
+                'elseif(RTS_BUILD_PRODUCT)',
+                "elseif`n    (RTS_BUILD_PRODUCT)")
+        )) {
+        $multilineCaught = $false
+        try {
+            Assert-ProductRuntimeSelector $multilineSelector
+        }
+        catch {
+            $multilineCaught = $_.Exception.Message -match
+                'distinct native x64 and 32-bit branches'
+        }
+        if (-not $multilineCaught) {
+            throw 'Legacy product runtime audit self-test accepted a multiline selector condition.'
+        }
+    }
     $selectorCaught = $false
     try {
         Assert-ProductRuntimeSelector $goodSelector.Replace(
@@ -610,6 +723,20 @@ target_link_libraries(rts_product_runtime INTERFACE rts_legacy_product_runtime)
     }
     if (-not $outsideSelectorCaught) {
         throw 'Legacy product runtime audit self-test accepted an architecture-specific link outside the selector branches.'
+    }
+    $outsideElseConditionCaught = $false
+    $outsideElseCondition = $goodSelector.Replace(
+        'elseif(RTS_BUILD_PRODUCT)',
+        'elseif(RTS_BUILD_PRODUCT AND rts_native_product_runtime)')
+    try {
+        Assert-ProductRuntimeSelector $outsideElseCondition
+    }
+    catch {
+        $outsideElseConditionCaught = $_.Exception.Message -match
+            'outside the selected architecture branches'
+    }
+    if (-not $outsideElseConditionCaught) {
+        throw 'Legacy product runtime audit self-test accepted an architecture-specific token in the else condition.'
     }
     if (-not (Test-ExactCMakeLine "include(cmake/product-runtime.cmake)`r`n" `
             'include(cmake/product-runtime.cmake)')) {
