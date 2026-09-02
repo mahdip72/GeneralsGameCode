@@ -462,7 +462,7 @@ LRESULT CALLBACK WndProc( HWND hWnd, UINT message,
 			{
 				if ((bool) wParam != isWinMainActive)
 				{
-					// TheSuperHackers @bugfix xezon 11/05/2025 This event originally called DX8Wrapper::Reset_Device,
+					// TheSuperHackers @bugfix xezon 11/05/2025 This event originally reset the compatibility device,
 					// intended to clear resources on a lost device in fullscreen, but effectively also in
 					// windowed mode, if the DXMaximizedWindowedMode shim was applied in newer versions of Windows,
 					// which lead to unfortunate application crashing. Resetting the device on WM_ACTIVATEAPP instead
@@ -737,7 +737,7 @@ static Bool initializeAppWindows( HINSTANCE hInstance, Int nCmdShow, Bool runWin
 	else
 	{
 		// The VC6 SDK hides the multimonitor declarations behind WINVER 0x0500.
-		// This path is only used by the legacy D3D8 fullscreen bootstrap; D3D11
+		// This path is only used by the legacy fullscreen bootstrap; the native renderer
 		// fullscreen takes the windowed bootstrap above and positions the window
 		// through its modern presentation path.
 		rect.left = 0;

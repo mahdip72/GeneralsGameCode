@@ -10,7 +10,7 @@ namespace render
 
 // The FVF value is part of the serialized WW3D vertex-stream contract.  Keep
 // its bit layout in this API-neutral header so native renderer code can decode
-// an old stream without importing the D3D8 SDK.  The Win32/VC6 oracle may
+// an old stream without importing the retired graphics SDK.  The Win32/VC6 oracle may
 // still spell the same values with the SDK macros in its compatibility lane.
 enum LegacyFvfFlag
 {

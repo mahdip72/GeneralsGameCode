@@ -225,14 +225,14 @@ void W3DShroud::reset()
 }
 
 //-----------------------------------------------------------------------------
-///Release any resources that can't survive a D3D device reset.
+///Release any resources that can't survive a graphics-device reset.
 void W3DShroud::ReleaseResources()
 {
 	REF_PTR_RELEASE (m_pDstTexture);
 }
 
 //-----------------------------------------------------------------------------
-///Restore resources that are lost on D3D device reset.
+///Restore resources that are lost on a graphics-device reset.
 Bool W3DShroud::ReAcquireResources()
 {
 		if (!m_dstTextureWidth)
@@ -271,7 +271,7 @@ Bool W3DShroud::ReAcquireResources()
 //-----------------------------------------------------------------------------
 // Upload the CPU-owned source image while the legacy surface is locked. The
 // surface pointer is deliberately scoped to this operation; callers never
-// retain D3DLOCKED_RECT::pBits after UnlockRect().
+// retain the mapped pixel pointer after the texture is unlocked.
 Bool W3DShroud::syncSourceTexture()
 {
 	if (!m_srcTextureDirty || !m_pSrcTexture || !m_srcTextureData)

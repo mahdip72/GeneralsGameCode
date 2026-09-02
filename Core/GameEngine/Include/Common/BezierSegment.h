@@ -36,7 +36,7 @@
 class BezierSegment
 {
 	protected:
-		// The legacy implementation used D3DXMATRIX only as a four-by-four
+		// The legacy implementation used its matrix type only as a four-by-four
 		// coefficient table.  Keep the table in engine-native storage so the
 		// Bezier code has no dependency on the renderer math ABI.
 		static const float s_bezBasisMatrix[4][4];

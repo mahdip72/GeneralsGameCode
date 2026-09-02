@@ -31,7 +31,7 @@ inline bool IsNativeD3D11PublicationActive()
 
 // This is the state policy used by the bridge-backed implementation.  Keeping
 // the state inputs explicit makes the lifecycle contract testable without
-// creating a graphics device or mutating DX8Wrapper's protected state.
+// creating a graphics device or mutating the compatibility renderer's protected state.
 inline bool IsRenderTexturePublicationOperationalState(
 	bool renderer_initialized, bool device_lost,
 	bool native_backend_selected, bool native_backend_active)
@@ -48,7 +48,7 @@ inline bool IsRenderTexturePublicationOperational()
 	return ::Is_Render_Texture_Publication_Operational();
 }
 
-// Texture stage publication is renderer state, not a D3D8 device operation.
+// Texture stage publication is renderer state, not a backend device operation.
 // The compatibility bridge may mirror this state while the native renderer
 // owns the actual resource handle.
 void Publish_Render_Texture_Stage(unsigned int stage,
