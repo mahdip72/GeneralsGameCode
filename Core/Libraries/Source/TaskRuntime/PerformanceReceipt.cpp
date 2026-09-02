@@ -84,6 +84,54 @@ bool isLowerHexString(const std::string &value, unsigned length)
 	return true;
 }
 
+bool isCanonicalUuid(const std::string &value)
+{
+	if (value.size() != 36 || value[8] != '-' || value[13] != '-' ||
+		value[18] != '-' || value[23] != '-')
+		return false;
+	for (std::size_t index = 0; index < value.size(); ++index)
+	{
+		if (index == 8 || index == 13 || index == 18 || index == 23)
+			continue;
+		const unsigned char character =
+			static_cast<unsigned char>(value[index]);
+		if (!((character >= '0' && character <= '9') ||
+			(character >= 'a' && character <= 'f') ||
+			(character >= 'A' && character <= 'F')))
+			return false;
+	}
+	const char version = value[14];
+	const char variant = value[19];
+	return version >= '1' && version <= '5' &&
+		((variant >= '8' && variant <= '9') ||
+		 (variant >= 'a' && variant <= 'b') ||
+		 (variant >= 'A' && variant <= 'B'));
+}
+
+bool isIsoUtcTimestamp(const std::string &value)
+{
+	if (value.size() < 20 || value[4] != '-' || value[7] != '-' ||
+		value[10] != 'T' || value[13] != ':' || value[16] != ':')
+		return false;
+	for (std::size_t index = 0; index < 19; ++index)
+	{
+		if (index == 4 || index == 7 || index == 10 || index == 13 ||
+			index == 16)
+			continue;
+		if (value[index] < '0' || value[index] > '9')
+			return false;
+	}
+	if (value[19] == 'Z')
+		return true;
+	if (value[19] != '.')
+		return false;
+	std::size_t index = 20;
+	while (index < value.size() && value[index] >= '0' && value[index] <= '9')
+		++index;
+	return index > 20 && index < value.size() && index + 1 == value.size() &&
+		value[index] == 'Z';
+}
+
 bool isSafeToken(const std::string &value)
 {
 	if (value.empty() || value.size() > 256)
@@ -261,6 +309,20 @@ bool currentFileTime(JobMetricCounter &value)
 	integer.HighPart = fileTime.dwHighDateTime;
 	value = static_cast<JobMetricCounter>(integer.QuadPart);
 	return value != 0;
+}
+
+bool currentUtcTimestamp(std::string &value)
+{
+	SYSTEMTIME now;
+	GetSystemTime(&now);
+	std::ostringstream text;
+	text << std::setfill('0') << std::setw(4) << now.wYear << '-'
+		<< std::setw(2) << now.wMonth << '-' << std::setw(2) << now.wDay
+		<< 'T' << std::setw(2) << now.wHour << ':' << std::setw(2)
+		<< now.wMinute << ':' << std::setw(2) << now.wSecond << '.'
+		<< std::setw(3) << now.wMilliseconds << 'Z';
+	value = text.str();
+	return isIsoUtcTimestamp(value);
 }
 
 bool calculateSha256(const void *bytes, std::size_t byteCount,
@@ -501,6 +563,53 @@ void appendKernel(std::ostringstream &json,
 	if (comma) json << ',';
 }
 
+void appendRawLog(std::ostringstream &json, const char *name,
+	const std::string &path, const std::string &sha256, bool comma)
+{
+	json << "{\n";
+	appendStringField(json, "name", name);
+	appendStringField(json, "path", path);
+	appendStringField(json, "sha256", sha256, false);
+	json << "\n}";
+	if (comma) json << ',';
+}
+
+void appendRuntimeClosure(std::ostringstream &json,
+	const PerformanceReceipt &receipt)
+{
+	json << "\"runtimeClosure\":{\n";
+	appendStringField(json, "dependencyManifestSha256",
+		receipt.runtimeClosureDependencyManifestSha256);
+	appendStringField(json, "closureSha256", receipt.runtimeClosureSha256,
+		false);
+	json << "\n},\n";
+}
+
+#if defined(_WIN32)
+bool fileTimeToUtcTimestamp(JobMetricCounter fileTimeValue,
+	std::string &value)
+{
+	ULARGE_INTEGER integer;
+	integer.QuadPart = static_cast<ULONGLONG>(fileTimeValue);
+	FILETIME fileTime;
+	fileTime.dwLowDateTime = integer.LowPart;
+	fileTime.dwHighDateTime = integer.HighPart;
+	SYSTEMTIME systemTime;
+	if (!FileTimeToSystemTime(&fileTime, &systemTime))
+		return false;
+	std::ostringstream text;
+	text << std::setfill('0') << std::setw(4) << systemTime.wYear << '-'
+		<< std::setw(2) << systemTime.wMonth << '-' << std::setw(2)
+		<< systemTime.wDay << 'T' << std::setw(2) << systemTime.wHour << ':'
+		<< std::setw(2) << systemTime.wMinute << ':' << std::setw(2)
+		<< systemTime.wSecond << '.' << std::setw(7)
+		<< static_cast<unsigned long long>(integer.QuadPart % 10000000ULL)
+		<< 'Z';
+	value = text.str();
+	return isIsoUtcTimestamp(value);
+}
+#endif
+
 } // namespace
 
 PerformanceReceiptCpuSet::PerformanceReceiptCpuSet()
@@ -532,6 +641,7 @@ PerformanceReceipt::PerformanceReceipt()
 	: schemaVersion(PERFORMANCE_RECEIPT_SCHEMA_VERSION),
 	  producer(PERFORMANCE_RECEIPT_PRODUCER),
 	  evidenceKind(PERFORMANCE_RECEIPT_EVIDENCE_KIND), status("pending"),
+	  role("performance-report"), producerVersion("2"), architecture("x64"),
 	  processId(0), processCreationTimeUtc100ns(0),
 	  processStartTimeUtc100ns(0), processEndTimeUtc100ns(0),
 	  processIdentityAvailable(false), processExitCode(0),
@@ -560,12 +670,21 @@ bool BeginPerformanceReceipt(PerformanceReceipt &receipt, const char *title,
 	receipt.title = title;
 	receipt.replayPath = replayPath;
 
-	if (!readEnvironment("RTS_PERFORMANCE_RUN_ID", receipt.runId) ||
+	if (!readEnvironment("RTS_PERFORMANCE_ROLE", receipt.role) ||
+		!readEnvironment("RTS_PERFORMANCE_RUN_ID", receipt.runId) ||
+		!readEnvironment("RTS_PERFORMANCE_RUN_NONCE", receipt.runNonce) ||
+		!readEnvironment("RTS_PERFORMANCE_COHORT_NONCE", receipt.cohortNonce) ||
+		!readEnvironment("RTS_PERFORMANCE_COHORT_CREATED_UTC",
+			receipt.cohortCreatedUtc) ||
 		!readEnvironment("RTS_PERFORMANCE_RECEIPT_DIR",
 			receipt.outputDirectory) ||
 		!readEnvironment("RTS_PERFORMANCE_SOURCE_COMMIT", receipt.sourceCommit) ||
 		!readEnvironment("RTS_PERFORMANCE_ARTIFACT_SET_SHA256",
 			receipt.artifactSetSha256) ||
+		!readEnvironment("RTS_PERFORMANCE_RUNTIME_MANIFEST_SHA256",
+			receipt.runtimeClosureDependencyManifestSha256) ||
+		!readEnvironment("RTS_PERFORMANCE_RUNTIME_CLOSURE_SHA256",
+			receipt.runtimeClosureSha256) ||
 		!readEnvironment("RTS_PERFORMANCE_FIXTURE_ID", receipt.fixtureId) ||
 		!readEnvironment("RTS_PERFORMANCE_FIXTURE_SHA256",
 			receipt.fixtureContentSha256) ||
@@ -577,6 +696,15 @@ bool BeginPerformanceReceipt(PerformanceReceipt &receipt, const char *title,
 			receipt.rawEvidence.verifierBoundary))
 	{
 		setReason(reason, "required performance receipt environment is missing");
+		return false;
+	}
+	if (receipt.role != "performance-report" ||
+		!isCanonicalUuid(receipt.runNonce) ||
+		!isCanonicalUuid(receipt.cohortNonce) ||
+		!isIsoUtcTimestamp(receipt.cohortCreatedUtc) ||
+		!currentUtcTimestamp(receipt.recordedUtc))
+	{
+		setReason(reason, "performance receipt role, nonce, or cohort timestamp is invalid");
 		return false;
 	}
 	std::string seedText;
@@ -712,7 +840,7 @@ bool SetPerformanceReceiptReplayResult(PerformanceReceipt &receipt,
 		return false;
 	}
 #endif
-	receipt.status = clean ? "complete" : "failed";
+	receipt.status = clean ? "passed" : "failed";
 	return true;
 }
 
@@ -726,10 +854,18 @@ bool SerializePerformanceReceipt(const PerformanceReceipt &receipt,
 	appendStringField(json, "producer", receipt.producer);
 	appendStringField(json, "evidenceKind", receipt.evidenceKind);
 	appendStringField(json, "status", receipt.status);
+	appendStringField(json, "role", receipt.role);
+	appendStringField(json, "producerVersion", receipt.producerVersion);
 	appendStringField(json, "title", receipt.title);
 	appendStringField(json, "runId", receipt.runId);
+	appendStringField(json, "runNonce", receipt.runNonce);
+	appendStringField(json, "cohortNonce", receipt.cohortNonce);
+	appendStringField(json, "cohortCreatedUtc", receipt.cohortCreatedUtc);
+	appendStringField(json, "recordedUtc", receipt.recordedUtc);
+	appendStringField(json, "architecture", receipt.architecture);
 	appendStringField(json, "sourceCommit", receipt.sourceCommit);
 	appendStringField(json, "artifactSetSha256", receipt.artifactSetSha256);
+	appendRuntimeClosure(json, receipt);
 	appendStringField(json, "executablePath", receipt.executablePath);
 	appendStringField(json, "executableSha256", receipt.executableSha256);
 	appendStringField(json, "commandLine", receipt.commandLine);
@@ -819,6 +955,32 @@ bool SerializePerformanceReceipt(const PerformanceReceipt &receipt,
 	appendStringField(json, "timingSha256",
 		receipt.rawEvidence.timingSha256, false);
 	json << "\n},\n";
+	json << "\"rawLogs\":[\n";
+	appendRawLog(json, "raw-log", receipt.rawEvidence.rawLogPath,
+		receipt.rawEvidence.rawLogSha256, true);
+	appendRawLog(json, "timing", receipt.rawEvidence.timingPath,
+		receipt.rawEvidence.timingSha256, false);
+	json << "\n],\n";
+	std::string processCreationUtc;
+#if defined(_WIN32)
+	if (!fileTimeToUtcTimestamp(receipt.processCreationTimeUtc100ns,
+		processCreationUtc))
+	{
+		setReason(reason, "process creation timestamp serialization failed");
+		return false;
+	}
+#endif
+	json << "\"provenance\":{\n";
+	appendStringField(json, "kind", "native-executable-observation");
+	appendStringField(json, "receiptPath", receipt.receiptPath);
+	appendUnsignedField(json, "processId", receipt.processId);
+	appendStringField(json, "processCreationUtc", processCreationUtc);
+	appendStringField(json, "executablePath", receipt.executablePath);
+	appendStringField(json, "executableSha256", receipt.executableSha256);
+	appendStringField(json, "commandLine", receipt.commandLine);
+	appendUnsignedField(json, "exitCode",
+		static_cast<unsigned>(receipt.processExitCode), false);
+	json << "\n},\n";
 	json << "\"schedulerMetrics\":{\n";
 	appendCounterField(json, "submittedJobCount",
 		receipt.schedulerMetrics.submittedJobCount);
@@ -886,26 +1048,36 @@ bool ValidatePerformanceReceipt(const PerformanceReceipt &receipt,
 {
 	if (receipt.schemaVersion != PERFORMANCE_RECEIPT_SCHEMA_VERSION ||
 		receipt.producer != PERFORMANCE_RECEIPT_PRODUCER ||
-		receipt.evidenceKind != PERFORMANCE_RECEIPT_EVIDENCE_KIND)
+		receipt.evidenceKind != PERFORMANCE_RECEIPT_EVIDENCE_KIND ||
+		receipt.producerVersion != "2" || receipt.role != "performance-report" ||
+		receipt.architecture != "x64")
 	{
 		setReason(reason, "receipt schema or producer is not recognized");
 		return false;
 	}
-	if (receipt.status != "complete")
+	if (receipt.status != "passed")
 	{
 		setReason(reason, "receipt is not complete");
 		return false;
 	}
 	if (receipt.title.empty() || receipt.runId.empty() ||
+		receipt.runNonce.empty() || receipt.cohortNonce.empty() ||
+		receipt.cohortCreatedUtc.empty() || receipt.recordedUtc.empty() ||
 		receipt.sourceCommit.empty() || receipt.commandLine.empty() ||
 		receipt.fixtureId.empty() || !isSafeToken(receipt.runId) ||
+		!isCanonicalUuid(receipt.runNonce) || !isCanonicalUuid(receipt.cohortNonce) ||
+		!isIsoUtcTimestamp(receipt.cohortCreatedUtc) ||
+		!isIsoUtcTimestamp(receipt.recordedUtc) ||
+		receipt.recordedUtc < receipt.cohortCreatedUtc ||
 		!isLowerHexString(receipt.sourceCommit, 40) ||
-		!isSafeToken(receipt.fixtureId))
+		!isSafeToken(receipt.fixtureId) || receipt.receiptPath.empty())
 	{
 		setReason(reason, "receipt identity fields are incomplete");
 		return false;
 	}
 	if (!isHexString(receipt.artifactSetSha256, 64) ||
+		!isHexString(receipt.runtimeClosureDependencyManifestSha256, 64) ||
+		!isHexString(receipt.runtimeClosureSha256, 64) ||
 		!isHexString(receipt.fixtureContentSha256, 64) ||
 		!isHexString(receipt.executableSha256, 64) ||
 		receipt.executablePath.empty())
@@ -1090,6 +1262,16 @@ bool WritePerformanceReceiptAtomically(PerformanceReceipt &receipt,
 		setReason(reason, "receipt destination directory is missing");
 		return false;
 	}
+	std::ostringstream finalName;
+	finalName << directory;
+	const std::string directoryText(directory);
+	if (!directoryText.empty() && directoryText[directoryText.size() - 1] != '\\' &&
+		directoryText[directoryText.size() - 1] != '/')
+		finalName << '\\';
+	finalName << "performance-receipt-" << receipt.runId << '-'
+		<< receipt.processId << ".json";
+	const std::string finalPath = finalName.str();
+	receipt.receiptPath = finalPath;
 #if defined(_WIN32)
 	if (receipt.rawEvidence.rawLogSha256.empty() &&
 		!receipt.rawEvidence.rawLogPath.empty())
@@ -1108,15 +1290,6 @@ bool WritePerformanceReceiptAtomically(PerformanceReceipt &receipt,
 		setReason(reason, "receipt serialization failed");
 		return false;
 	}
-	std::ostringstream finalName;
-	finalName << directory;
-	const std::string directoryText(directory);
-	if (!directoryText.empty() && directoryText[directoryText.size() - 1] != '\\' &&
-		directoryText[directoryText.size() - 1] != '/')
-		finalName << '\\';
-	finalName << "performance-receipt-" << receipt.runId << '-'
-		<< receipt.processId << ".json";
-	const std::string finalPath = finalName.str();
 #if defined(_WIN32)
 	const DWORD attributes = GetFileAttributesA(directory);
 	if (attributes == INVALID_FILE_ATTRIBUTES ||

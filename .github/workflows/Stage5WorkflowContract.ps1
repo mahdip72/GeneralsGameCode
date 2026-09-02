@@ -132,6 +132,12 @@ Assert-Stage5WorkflowContains $workflowContractJob `
     'CI workflow contract gate condition'
 Assert-Stage5WorkflowContains $ci 'stage5_acceptance_manifest:' `
     'CI final acceptance input'
+Assert-Stage5WorkflowContains $ci 'stage5-execution-cohort:' `
+    'CI fresh execution cohort producer'
+Assert-Stage5WorkflowContains $ci 'New-Stage5CombinedHostRunnerReceipt\.ps1' `
+    'CI combined host-runner producer'
+Assert-Stage5WorkflowContains $ci 'Stage5-Simulation-Validation-combined' `
+    'CI combined host-runner artifact'
 $generalsX64Build = Get-Stage5IndentedBlock $ci 'build-generals-x64:' 2
 Assert-Stage5WorkflowContains $generalsX64Build 'outputs\.stage5\s*==\s*.true.' `
     'Generals x64 build Stage 5 prerequisite'
@@ -139,7 +145,7 @@ $generalsMdX64Build = Get-Stage5IndentedBlock $ci 'build-generalsmd-x64:' 2
 Assert-Stage5WorkflowContains $generalsMdX64Build 'outputs\.stage5\s*==\s*.true.' `
     'GeneralsMD x64 build Stage 5 prerequisite'
 $zeroHourStage5Job = Get-Stage5IndentedBlock $ci 'stage5-replaycheck-generalsmd-x64:' 2
-Assert-Stage5WorkflowLiteral $zeroHourStage5Job 'needs: [detect-changes, build-generalsmd-x64]' `
+Assert-Stage5WorkflowLiteral $zeroHourStage5Job 'needs: [detect-changes, build-generalsmd-x64, stage5-execution-cohort]' `
     'Zero Hour Stage 5 build dependency'
 Assert-Stage5WorkflowLiteral $zeroHourStage5Job "github.event_name == 'workflow_dispatch'" `
     'Zero Hour Stage 5 manual-dispatch gate'
@@ -153,8 +159,12 @@ foreach ($requiredInput in @(
 }
 Assert-Stage5WorkflowNotContains $zeroHourStage5Job 'needs\.detect-changes\.outputs\.stage5' `
     'Zero Hour Stage 5 manual-only qualification job'
+Assert-Stage5WorkflowLiteral $zeroHourStage5Job 'stage5_execution_cohort_nonce:' `
+    'Zero Hour Stage 5 fresh execution cohort binding'
+Assert-Stage5WorkflowLiteral $zeroHourStage5Job 'stage5_execution_cohort_created_utc:' `
+    'Zero Hour Stage 5 cohort creation timestamp binding'
 $generalsStage5Job = Get-Stage5IndentedBlock $ci 'stage5-replaycheck-generals-x64:' 2
-Assert-Stage5WorkflowLiteral $generalsStage5Job 'needs: [detect-changes, build-generals-x64]' `
+Assert-Stage5WorkflowLiteral $generalsStage5Job 'needs: [detect-changes, build-generals-x64, stage5-execution-cohort]' `
     'Generals Stage 5 build dependency'
 Assert-Stage5WorkflowLiteral $generalsStage5Job "github.event_name == 'workflow_dispatch'" `
     'Generals Stage 5 manual-dispatch gate'
@@ -168,6 +178,10 @@ foreach ($requiredInput in @(
 }
 Assert-Stage5WorkflowNotContains $generalsStage5Job 'needs\.detect-changes\.outputs\.stage5' `
     'Generals Stage 5 manual-only qualification job'
+Assert-Stage5WorkflowLiteral $generalsStage5Job 'stage5_execution_cohort_nonce:' `
+    'Generals Stage 5 fresh execution cohort binding'
+Assert-Stage5WorkflowLiteral $generalsStage5Job 'stage5_execution_cohort_created_utc:' `
+    'Generals Stage 5 cohort creation timestamp binding'
 Assert-Stage5WorkflowContains $ci 'vc6-zerohour-oracle' `
     'legacy VC6 replay oracle'
 
@@ -179,6 +193,10 @@ Assert-Stage5WorkflowNotContains $legacyBlock 'stage5:\s*true' `
 
 Assert-Stage5WorkflowContains $check 'stage5_acceptance_manifest:' `
     'reusable Stage 5 final acceptance input'
+Assert-Stage5WorkflowContains $check 'stage5_execution_cohort_nonce:' `
+    'reusable Stage 5 fresh execution cohort nonce input'
+Assert-Stage5WorkflowContains $check 'stage5_execution_cohort_created_utc:' `
+    'reusable Stage 5 cohort creation timestamp input'
 Assert-Stage5WorkflowContains $check `
     'Stage 5 requires the reviewed ten-replay corpus' `
     'reviewed ten-replay corpus preflight'
@@ -199,6 +217,14 @@ Assert-Stage5WorkflowContains $check `
 Assert-Stage5WorkflowContains $check `
     'Normalize-Stage5EvidenceForUpload\.ps1' `
     'evidence upload normalizer invocation'
+Assert-Stage5WorkflowContains $check 'ExecutionCohortNonce' `
+    'Stage 5 runner cohort nonce binding'
+Assert-Stage5WorkflowContains $check 'ExecutionCohortCreatedUtc' `
+    'Stage 5 runner cohort timestamp binding'
+Assert-Stage5WorkflowContains $check 'AcceptanceRuntimeDependencyManifestSha256' `
+    'Stage 5 runner runtime dependency-manifest binding'
+Assert-Stage5WorkflowContains $check 'AcceptanceRuntimeClosureSha256' `
+    'Stage 5 runner runtime-closure binding'
 Assert-Stage5WorkflowContains $check `
     'path:\s+\$\{\{\s*runner\.temp\s*\}\}\\Stage5SimulationValidation-upload' `
     'normalized evidence upload path'

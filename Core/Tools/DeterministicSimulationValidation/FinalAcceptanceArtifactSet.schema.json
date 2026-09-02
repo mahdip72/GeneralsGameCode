@@ -4,7 +4,8 @@
   "title": "GeneralsGameCode Stage 5 final artifact set",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "sourceCommit", "productSet", "architecture", "artifacts"],
+  "required": ["schemaVersion", "sourceCommit", "productSet", "architecture",
+    "artifacts", "runtimeClosure"],
   "properties": {
     "schemaVersion": { "const": 1 },
     "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
@@ -16,6 +17,7 @@
       "items": { "enum": ["Generals", "ZeroHour"] }
     },
     "architecture": { "const": "x64" },
+    "runtimeClosure": { "$ref": "#/$defs/runtimeClosure" },
     "artifacts": {
       "type": "array",
       "minItems": 6,
@@ -31,9 +33,36 @@
               "zerohour-executable", "zerohour-launcher", "zerohour-launcher-config"
             ]
           },
-          "path": { "type": "string", "minLength": 1 },
+          "path": { "$ref": "#/$defs/relativePath" },
           "sha256": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" }
         }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "not": { "pattern": "^(?:[A-Za-z]:|[\\/])" },
+      "pattern": "^(?!.*(?:^|[\\/])\\.\\.(?:[\\/]|$)).+$"
+    },
+    "runtimeClosure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dependencyManifest", "closureSha256"],
+      "properties": {
+        "dependencyManifest": { "$ref": "#/$defs/fileReference" },
+        "closureSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "fileReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "$ref": "#/$defs/relativePath" },
+        "sha256": { "$ref": "#/$defs/sha256" }
       }
     }
   }

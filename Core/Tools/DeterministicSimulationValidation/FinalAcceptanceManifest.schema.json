@@ -4,16 +4,19 @@
   "title": "GeneralsGameCode Stage 5 final acceptance request",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "gateName", "sourceCommit", "artifactSet", "evidence"],
+  "required": ["schemaVersion", "gateName", "sourceCommit", "cohortNonce",
+    "cohortCreatedUtc", "artifactSet", "evidence"],
   "properties": {
     "schemaVersion": { "const": 1 },
     "gateName": { "const": "final-stage5-acceptance" },
     "sourceCommit": { "type": "string", "pattern": "^[0-9A-Fa-f]{40}$" },
+    "cohortNonce": { "type": "string", "format": "uuid" },
+    "cohortCreatedUtc": { "type": "string", "format": "date-time" },
     "artifactSet": { "$ref": "#/$defs/fileReference" },
     "evidence": {
       "type": "array",
-      "minItems": 8,
-      "maxItems": 8,
+      "minItems": 6,
+      "maxItems": 6,
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -26,9 +29,7 @@
               "fresh-ai",
               "performance-scaling",
               "mixed-worker-multiplayer",
-              "combined-stage4-stage5-installed-runtime",
-              "premium-review",
-              "manual-acceptance"
+              "combined-stage4-stage5-installed-runtime"
             ]
           },
           "path": { "$ref": "#/$defs/relativePath" },
@@ -41,7 +42,8 @@
     "relativePath": {
       "type": "string",
       "minLength": 1,
-      "not": { "pattern": "^(?:[A-Za-z]:|[\\/])" }
+      "not": { "pattern": "^(?:[A-Za-z]:|[\\/])" },
+      "pattern": "^(?!.*(?:^|[\\/])\\.\\.(?:[\\/]|$)).+$"
     },
     "sha256": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" },
     "fileReference": {

@@ -25,7 +25,11 @@ param(
     [string]$Stage3PerformanceBaselinePath = '',
     [string]$ExpectedStage3ExecutableSha256 = '',
     [string]$AcceptanceSourceCommit = '',
-    [string]$AcceptanceArtifactSetSha256 = ''
+    [string]$AcceptanceArtifactSetSha256 = '',
+    [string]$ExecutionCohortNonce = '',
+    [string]$ExecutionCohortCreatedUtc = '',
+    [string]$AcceptanceRuntimeDependencyManifestSha256 = '',
+    [string]$AcceptanceRuntimeClosureSha256 = ''
 )
 
 Set-StrictMode -Version 2.0
@@ -59,6 +63,62 @@ function Get-Sha256Text {
     finally { $sha.Dispose() }
 }
 
+function Get-Sha256Bytes {
+    param([byte[]]$Bytes)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return (($sha.ComputeHash($Bytes) | ForEach-Object {
+            $_.ToString('x2')
+        }) -join '').ToUpperInvariant()
+    }
+    finally { $sha.Dispose() }
+}
+
+function Get-Stage5FileSnapshot {
+    param([string]$Path, [string]$Context)
+    $full = [IO.Path]::GetFullPath($Path)
+    Assert-Condition (Test-Path -LiteralPath $full -PathType Leaf) `
+        "$Context file was not found: $full"
+    Assert-ContainedPathNoReparse (Split-Path -Parent $full) $full $Context
+    $before = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+    Assert-Condition (($before -is [IO.FileInfo]) -and
+        (($before.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)) `
+        "$Context file is not a regular non-reparse file: $full"
+    $stream = [IO.File]::Open($full, [IO.FileMode]::Open,
+        [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $beforeLength = [Int64]$before.Length
+        Assert-Condition ($stream.Length -eq $beforeLength) `
+            "$Context file changed before its immutable copy began: $full"
+        $memory = New-Object IO.MemoryStream
+        try {
+            $stream.CopyTo($memory)
+            $bytes = $memory.ToArray()
+        }
+        finally { $memory.Dispose() }
+        }
+    finally { $stream.Dispose() }
+    $after = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+    Assert-Condition (($after -is [IO.FileInfo]) -and
+        (($after.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) -and
+        [Int64]$after.Length -eq $beforeLength -and
+        [Int64]$bytes.LongLength -eq $beforeLength -and
+        [DateTime]$after.CreationTimeUtc -eq [DateTime]$before.CreationTimeUtc -and
+        [DateTime]$after.LastWriteTimeUtc -eq [DateTime]$before.LastWriteTimeUtc) `
+        "$Context file changed or was replaced while it was snapshotted: $full"
+    return [pscustomobject]@{
+        path = $full
+        bytes = $bytes
+        sha256 = Get-Sha256Bytes $bytes
+        length = $beforeLength
+        creationTimeUtc = ([DateTime]$before.CreationTimeUtc).ToString('o')
+        lastWriteTimeUtc = ([DateTime]$before.LastWriteTimeUtc).ToString('o')
+        identity = '{0}|{1}|{2}' -f $beforeLength,
+            ([DateTime]$before.CreationTimeUtc).Ticks,
+            ([DateTime]$before.LastWriteTimeUtc).Ticks
+    }
+}
+
 function ConvertTo-UtcIsoTimestamp {
     param([AllowNull()][object]$Value)
     if ($null -eq $Value) { return '' }
@@ -90,13 +150,39 @@ function ConvertTo-OutputRelativePath {
     Assert-Condition (-not [string]::IsNullOrWhiteSpace($Path)) "$Context path is empty."
     $rootFull = [IO.Path]::GetFullPath($OutputRoot).TrimEnd('\')
     $candidate = [IO.Path]::GetFullPath($Path)
-    $inside = [String]::Equals($candidate, $rootFull, [StringComparison]::OrdinalIgnoreCase) -or
-        $candidate.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar,
-            [StringComparison]::OrdinalIgnoreCase)
+    $rootValue = Get-Item -LiteralPath $rootFull -Force -ErrorAction Stop
+    Assert-Condition (($rootValue.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) `
+        "$Context output root is a reparse point: $rootFull"
+    $rootDrive = [IO.Path]::GetPathRoot($rootFull)
+    $candidateDrive = [IO.Path]::GetPathRoot($candidate)
+    Assert-Condition ($rootDrive -is [string] -and $candidateDrive -is [string] -and
+        $rootDrive.Equals($candidateDrive, [StringComparison]::OrdinalIgnoreCase)) `
+        "$Context path is on a different volume: $candidate"
+    $rootParts = @($rootFull.Substring($rootDrive.Length) -split '[\\/]' |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $candidateParts = @($candidate.Substring($candidateDrive.Length) -split '[\\/]' |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $inside = $candidateParts.Count -gt $rootParts.Count
+    if ($inside) {
+        for ($index = 0; $index -lt $rootParts.Count; ++$index) {
+            if (-not $candidateParts[$index].Equals($rootParts[$index],
+                    [StringComparison]::OrdinalIgnoreCase)) {
+                $inside = $false
+                break
+            }
+        }
+    }
     Assert-Condition $inside "$Context path must remain below output root '$rootFull': $candidate"
+    $current = $rootFull
+    foreach ($segment in @($candidateParts[$rootParts.Count..($candidateParts.Count - 1)])) {
+        $current = Join-Path $current $segment
+        $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+        Assert-Condition (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) `
+            "$Context path component '$segment' is a reparse point: $current"
+    }
     Assert-Condition (-not [String]::Equals($candidate, $rootFull,
         [StringComparison]::OrdinalIgnoreCase)) "$Context path must name a file below output root."
-    return $candidate.Substring($rootFull.Length + 1).Replace('/', '\')
+    return ($candidateParts[$rootParts.Count..($candidateParts.Count - 1)] -join '\')
 }
 
 function Get-NativeV2ReceiptReference {
@@ -108,7 +194,14 @@ function Get-NativeV2ReceiptReference {
         [string]$SourceCommit,
         [string]$ArtifactSetSha256,
         [string]$ExecutableSha256,
-        [string]$RunNonce
+        [string]$RunNonce,
+        [string]$CohortNonce,
+        [Collections.IDictionary]$RuntimeClosure,
+        [string]$ExpectedTitle,
+        [int]$ProcessId,
+        [string]$ProcessCreationUtc,
+        [string]$ExpectedExecutablePath,
+        [string[]]$ExpectedProducers = @('game-executable-stage5-performance-report-v2')
     )
     if ([string]::IsNullOrWhiteSpace($OutputText) -or
         [string]::IsNullOrWhiteSpace($OutputRoot)) { return $null }
@@ -124,10 +217,13 @@ function Get-NativeV2ReceiptReference {
             else {
                 [IO.Path]::GetFullPath((Join-Path $WorkingDirectory $candidateText))
             }
+            Assert-ContainedPathNoReparse $OutputRoot $candidate `
+                'Native receipt reference' | Out-Null
             $relative = ConvertTo-OutputRelativePath $candidate $OutputRoot `
                 'Native receipt reference'
-            if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
-            $nativeText = [IO.File]::ReadAllText($candidate)
+            $nativeSnapshot = Get-Stage5FileSnapshot $candidate `
+                'Native receipt reference'
+            $nativeText = [Text.Encoding]::UTF8.GetString([byte[]]$nativeSnapshot.bytes)
             $native = if ($PSVersionTable.PSVersion.Major -ge 6) {
                 $nativeText | ConvertFrom-Json -AsHashtable
             }
@@ -137,23 +233,78 @@ function Get-NativeV2ReceiptReference {
                 $serializer.DeserializeObject($nativeText)
             }
             if ($native -isnot [Collections.IDictionary]) { continue }
-            $expectedProducer = "game-executable-stage5-$Role-v2"
+            $expectedProducer = [string]$native['producer']
+            if ($ExpectedProducers -notcontains $expectedProducer) { continue }
+            $nativeRuntimeClosure = $native['runtimeClosure']
+            $nativeProvenance = $native['provenance']
+            $nativeRawLogs = $native['rawLogs']
+            if ($native['schemaVersion'] -ne 1 -or
+                [string]$native['role'] -cne 'performance-report' -or
+                [string]$native['title'] -cne $ExpectedTitle -or
+                [string]$native['architecture'] -cne 'x64' -or
+                [string]$native['cohortCreatedUtc'] -notmatch
+                    '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$' -or
+                [string]$native['recordedUtc'] -notmatch
+                    '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$' -or
+                [string]$native['recordedUtc'] -lt [string]$native['cohortCreatedUtc'] -or
+                [string]$native['producerVersion'] -cne '2' -or
+                $null -eq $nativeRuntimeClosure -or
+                [string]$nativeRuntimeClosure['dependencyManifestSha256'].ToUpperInvariant() -cne
+                    [string]$RuntimeClosure['dependencyManifestSha256'].ToUpperInvariant() -or
+                [string]$nativeRuntimeClosure['closureSha256'].ToUpperInvariant() -cne
+                    [string]$RuntimeClosure['closureSha256'].ToUpperInvariant() -or
+                $nativeRawLogs -isnot [Array] -or $nativeRawLogs.Count -ne 2 -or
+                $nativeProvenance -isnot [Collections.IDictionary]) { continue }
+            $rawLogsValid = $true
+            foreach ($rawLog in $nativeRawLogs) {
+                if ($rawLog -isnot [Collections.IDictionary] -or
+                    [string]$rawLog['sha256'] -notmatch '^[0-9A-Fa-f]{64}$' -or
+                    [string]::IsNullOrWhiteSpace([string]$rawLog['path'])) {
+                    $rawLogsValid = $false; break
+                }
+                try {
+                    $rawCandidateText = [string]$rawLog['path']
+                    $rawCandidate = if ([IO.Path]::IsPathRooted($rawCandidateText)) {
+                        [IO.Path]::GetFullPath($rawCandidateText)
+                    } else {
+                        [IO.Path]::GetFullPath((Join-Path $WorkingDirectory $rawCandidateText))
+                    }
+                    Assert-ContainedPathNoReparse $OutputRoot $rawCandidate `
+                        'Native receipt raw evidence' | Out-Null
+                    $rawSnapshot = Get-Stage5FileSnapshot $rawCandidate `
+                        'Native receipt raw evidence'
+                    if ($rawSnapshot.sha256 -cne ([string]$rawLog['sha256']).ToUpperInvariant()) {
+                        $rawLogsValid = $false; break
+                    }
+                } catch { $rawLogsValid = $false; break }
+            }
+            if (-not $rawLogsValid) { continue }
+            if ([string]$nativeProvenance['kind'] -cne 'native-executable-observation' -or
+                [int]$nativeProvenance['processId'] -ne $ProcessId -or
+                [string]$nativeProvenance['processCreationUtc'] -cne $ProcessCreationUtc -or
+                [IO.Path]::GetFullPath([string]$nativeProvenance['executablePath']) -cne
+                    [IO.Path]::GetFullPath($ExpectedExecutablePath) -or
+                [string]$nativeProvenance['executableSha256'].ToUpperInvariant() -cne
+                    $ExecutableSha256.ToUpperInvariant() -or
+                [int]$nativeProvenance['exitCode'] -ne 0 -or
+                [string]::IsNullOrWhiteSpace([string]$nativeProvenance['commandLine'])) { continue }
             if ($native['schemaVersion'] -ne 1 -or
                 [string]$native['evidenceKind'] -cne 'stage5-executable-originated-receipt' -or
                 [string]$native['status'] -cne 'passed' -or
-                [string]$native['producer'] -cne $expectedProducer -or
-                [string]$native['producerVersion'] -cne '2' -or
+                [string]$native['producer'] -notin $ExpectedProducers -or
                 [string]$native['runNonce'] -cne $RunNonce -or
                 [string]$native['sourceCommit'] -cne $SourceCommit -or
                 [string]$native['artifactSetSha256'].ToUpperInvariant() -cne
                     $ArtifactSetSha256.ToUpperInvariant() -or
                 [string]$native['executableSha256'].ToUpperInvariant() -cne
-                    $ExecutableSha256.ToUpperInvariant()) { continue }
+                    $ExecutableSha256.ToUpperInvariant() -or
+                [string]$native['cohortNonce'] -cne $CohortNonce) { continue }
             return [pscustomobject]@{
                 path = $relative
-                sha256 = Get-Sha256 $candidate
+                sha256 = $nativeSnapshot.sha256
                 producer = $expectedProducer
                 runNonce = $RunNonce
+                cohortNonce = $CohortNonce
             }
         }
         catch {
@@ -223,14 +374,91 @@ function Test-Sha256Text {
     return $null -ne $Value -and $Value -match '^[0-9A-Fa-f]{64}$'
 }
 
+function Assert-CanonicalUuid {
+    param([string]$Value, [string]$Context)
+    Assert-Condition ($Value -is [string] -and
+        $Value -match '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-5][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$') `
+        "$Context must be a canonical UUID."
+    return $Value
+}
+
+function Get-HostRunnerRuntimeClosure {
+    param([string]$Context)
+    Assert-Condition ((Test-Sha256Text $AcceptanceRuntimeDependencyManifestSha256) -and
+        (Test-Sha256Text $AcceptanceRuntimeClosureSha256)) `
+        "$Context requires independently supplied dependency-manifest and closure SHA-256 values."
+    return [ordered]@{
+        dependencyManifestSha256 = $AcceptanceRuntimeDependencyManifestSha256.ToUpperInvariant()
+        closureSha256 = $AcceptanceRuntimeClosureSha256.ToUpperInvariant()
+    }
+}
+
+function Assert-ContainedPathNoReparse {
+    param(
+        [string]$BaseDirectory,
+        [string]$CandidatePath,
+        [string]$Context,
+        [switch]$AllowBase
+    )
+    $base = [IO.Path]::GetFullPath($BaseDirectory).TrimEnd('\')
+    $candidate = [IO.Path]::GetFullPath($CandidatePath)
+    $baseRoot = [IO.Path]::GetPathRoot($base)
+    $candidateRoot = [IO.Path]::GetPathRoot($candidate)
+    Assert-Condition ($baseRoot -is [string] -and $candidateRoot -is [string] -and
+        $baseRoot.Equals($candidateRoot, [StringComparison]::OrdinalIgnoreCase)) `
+        "$Context path is on a different volume or share."
+    $baseParts = @($base.Substring($baseRoot.Length) -split '[\\/]' |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $candidateParts = @($candidate.Substring($candidateRoot.Length) -split '[\\/]' |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $minimumParts = if ($AllowBase) { $baseParts.Count } else { $baseParts.Count + 1 }
+    Assert-Condition ($candidateParts.Count -ge $minimumParts) `
+        "$Context path escapes or is not below its containing directory."
+    for ($index = 0; $index -lt $baseParts.Count; ++$index) {
+        Assert-Condition ($candidateParts[$index].Equals(
+            $baseParts[$index], [StringComparison]::OrdinalIgnoreCase)) `
+            "$Context path escapes its containing directory."
+    }
+    $rootCurrent = $baseRoot
+    foreach ($segment in @($candidate.Substring($candidateRoot.Length) -split '[\\/]')) {
+        if ([string]::IsNullOrWhiteSpace($segment)) { continue }
+        $rootCurrent = Join-Path $rootCurrent $segment
+        if (-not (Test-Path -LiteralPath $rootCurrent)) { break }
+        $rootItem = Get-Item -LiteralPath $rootCurrent -Force -ErrorAction Stop
+        Assert-Condition (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) `
+            "$Context ancestor path component '$segment' is a reparse point."
+    }
+    $baseItem = Get-Item -LiteralPath $base -Force -ErrorAction Stop
+    Assert-Condition (($baseItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) `
+        "$Context containing directory is a reparse point."
+    $current = $base
+    for ($index = $baseParts.Count; $index -lt $candidateParts.Count; ++$index) {
+        $current = Join-Path $current $candidateParts[$index]
+        if (-not (Test-Path -LiteralPath $current)) { break }
+        $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+        Assert-Condition (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) `
+            "$Context path component '$($candidateParts[$index])' is a reparse point."
+    }
+    if (-not $AllowBase) {
+        Assert-Condition (-not [String]::Equals($candidate, $base,
+            [StringComparison]::OrdinalIgnoreCase)) `
+            "$Context path must not be the containing directory itself."
+    }
+    return $candidate
+}
+
 function Resolve-ManifestFile {
     param([string]$ManifestDirectory, [string]$RelativePath, [string]$Context)
     Assert-Condition (-not [string]::IsNullOrWhiteSpace($RelativePath)) "$Context path is empty."
     Assert-Condition (-not [IO.Path]::IsPathRooted($RelativePath)) "$Context path must be manifest-relative."
     $manifestFull = [IO.Path]::GetFullPath($ManifestDirectory)
     $candidate = [IO.Path]::GetFullPath((Join-Path $manifestFull $RelativePath))
-    Assert-Condition ($candidate.StartsWith($manifestFull + [IO.Path]::DirectorySeparatorChar,
-        [StringComparison]::OrdinalIgnoreCase)) "$Context path escapes the manifest directory."
+    try {
+        Assert-ContainedPathNoReparse $manifestFull $candidate $Context | Out-Null
+    }
+    catch {
+        throw "$Context path escapes the manifest directory: $($_.Exception.Message)"
+    }
     Assert-Condition (Test-Path -LiteralPath $candidate -PathType Leaf) "$Context file was not found: $RelativePath"
     return $candidate
 }
@@ -268,20 +496,8 @@ function Resolve-ExplicitTaskRoot {
 
 function Assert-TaskOwnedPath {
     param([string]$Path, [string]$TaskRoot, [string]$Context, [bool]$AllowRoot = $false)
-    $rootFull = [IO.Path]::GetFullPath($TaskRoot).TrimEnd('\')
-    $candidate = [IO.Path]::GetFullPath($Path)
-    $inside = $candidate.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar,
-        [StringComparison]::OrdinalIgnoreCase)
-    if ($AllowRoot) {
-        $inside = $inside -or [String]::Equals($candidate, $rootFull,
-            [StringComparison]::OrdinalIgnoreCase)
-    }
-    Assert-Condition $inside "$Context must remain below the task-owned root '$rootFull': $candidate"
-    if (-not $AllowRoot) {
-        Assert-Condition (-not [String]::Equals($candidate, $rootFull,
-            [StringComparison]::OrdinalIgnoreCase)) "$Context must not be the task root itself."
-    }
-    return $candidate
+    return Assert-ContainedPathNoReparse $TaskRoot $Path $Context `
+        -AllowBase:$AllowRoot
 }
 
 function Remove-TaskOwnedDirectory {
@@ -1063,6 +1279,50 @@ function Invoke-ValidationProcess {
     }
     $processRunNonce = [Guid]::NewGuid().ToString()
     $startInfo.EnvironmentVariables['RTS_STAGE5_RUN_NONCE'] = $processRunNonce
+    $startInfo.EnvironmentVariables['RTS_STAGE5_COHORT_NONCE'] = $executionCohortNonce
+    $startInfo.EnvironmentVariables['RTS_STAGE5_COHORT_CREATED_UTC'] = $executionCohortCreatedUtc
+    if ($null -ne $hostRunnerRuntimeClosure) {
+        $startInfo.EnvironmentVariables['RTS_STAGE5_RUNTIME_CLOSURE_SHA256'] =
+            [string]$hostRunnerRuntimeClosure.closureSha256
+        $startInfo.EnvironmentVariables['RTS_STAGE5_RUNTIME_MANIFEST_SHA256'] =
+            [string]$hostRunnerRuntimeClosure.dependencyManifestSha256
+
+        $nativeReceiptDirectory = Join-Path $EvidenceRoot `
+            ('native-performance-receipts\' + $processRunNonce)
+        if (-not (Test-Path -LiteralPath $nativeReceiptDirectory -PathType Container)) {
+            New-Item -ItemType Directory -Path $nativeReceiptDirectory -Force | Out-Null
+        }
+        $nativeRawLogPath = Join-Path $nativeReceiptDirectory 'performance-raw.log'
+        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_ROLE'] = 'performance-report'
+        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_RUN_ID'] =
+            ('stage5-' + [string]$Entry.sequence + '-' + $processRunNonce)
+        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_RUN_NONCE'] = $processRunNonce
+        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_COHORT_NONCE'] =
+            $executionCohortNonce
+        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_COHORT_CREATED_UTC'] =
+            $executionCohortCreatedUtc
+        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_RECEIPT_DIR'] =
+            $nativeReceiptDirectory
+        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_SOURCE_COMMIT'] =
+            $AcceptanceSourceCommit
+        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_ARTIFACT_SET_SHA256'] =
+            $AcceptanceArtifactSetSha256
+        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_RUNTIME_MANIFEST_SHA256'] =
+            [string]$hostRunnerRuntimeClosure.dependencyManifestSha256
+        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_RUNTIME_CLOSURE_SHA256'] =
+            [string]$hostRunnerRuntimeClosure.closureSha256
+        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_FIXTURE_ID'] =
+            [string]$Entry.caseId
+        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_FIXTURE_SHA256'] =
+            [string]$Entry.fixtureSha256
+        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_RAW_LOG_PATH'] =
+            $nativeRawLogPath
+        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_TIMING_PATH'] =
+            $Entry.timingDirectory
+        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_VERIFIER_BOUNDARY'] =
+            'stage5-host-runner-closed-native-evidence'
+        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_SEED'] = [string]$Entry.seed
+    }
     $process = New-Object Diagnostics.Process
     $process.StartInfo = $startInfo
     $startedAt = [DateTime]::UtcNow
@@ -1145,7 +1405,13 @@ function Invoke-ValidationProcess {
                     -Role $nativeRole -SourceCommit $AcceptanceSourceCommit `
                     -ArtifactSetSha256 $AcceptanceArtifactSetSha256 `
                     -ExecutableSha256 $manifestData.executableSha256 `
-                    -RunNonce $processRunNonce
+                    -RunNonce $processRunNonce `
+                    -CohortNonce $executionCohortNonce `
+                    -RuntimeClosure $hostRunnerRuntimeClosure `
+                    -ExpectedTitle $manifestData.title `
+                    -ProcessId ([int]$process.Id) `
+                    -ProcessCreationUtc $processCreationUtc `
+                    -ExpectedExecutablePath ([IO.Path]::GetFullPath($Executable))
             }
         }
         $runtimeLogText = New-Object 'Collections.Generic.List[string]'
@@ -1211,19 +1477,17 @@ function Get-Stage5ReceiptRawLogBindings {
         $path = [IO.Path]::GetFullPath([string]$pathValue)
         Assert-Condition (Test-Path -LiteralPath $path -PathType Leaf) `
             "$Context raw log was not written: $path"
-        $item = Get-Item -LiteralPath $path -Force
-        Assert-Condition (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) `
-            "$Context raw log is a reparse point; refusing to bind it: $path"
         $relative = ConvertTo-OutputRelativePath $path $OutputRoot "$Context raw log"
         Assert-Condition $seenPaths.Add($relative) `
             "$Context repeats raw log path '$relative'."
         $name = [IO.Path]::GetFileName($relative)
         Assert-Condition (-not [string]::IsNullOrWhiteSpace($name) -and $seenNames.Add($name)) `
             "$Context repeats raw log name '$name'."
+        $snapshot = Get-Stage5FileSnapshot $path "$Context raw log"
         $bindings.Add([ordered]@{
             name = $name
             path = $relative
-            sha256 = Get-Sha256 $path
+            sha256 = $snapshot.sha256
         }) | Out-Null
     }
     Assert-Condition ($bindings.Count -gt 0) "$Context must retain at least one raw log."
@@ -1236,8 +1500,10 @@ function New-Stage5HostChildBinding {
         [string]$Role,
         [string]$Title,
         [string]$ReceiptNonce,
+        [string]$CohortNonce,
         [string]$OutputRoot,
         [string]$ExecutableSha256,
+        [Collections.IDictionary]$RuntimeClosure,
         [string]$Context
     )
     Assert-Condition ($null -ne $ChildRun -and $null -ne $ChildRun.childProcess) `
@@ -1251,9 +1517,8 @@ function New-Stage5HostChildBinding {
     $entry = $ChildRun.entry
     $stdoutPath = [IO.Path]::GetFullPath([string]$entry.stdout)
     $stderrPath = [IO.Path]::GetFullPath([string]$entry.stderr)
-    Assert-Condition ((Test-Path -LiteralPath $stdoutPath -PathType Leaf) -and
-        (Test-Path -LiteralPath $stderrPath -PathType Leaf)) `
-        "$Context retained child streams are missing."
+    $stdoutSnapshot = Get-Stage5FileSnapshot $stdoutPath "$Context stdout"
+    $stderrSnapshot = Get-Stage5FileSnapshot $stderrPath "$Context stderr"
     $binding = [ordered]@{
         role = $Role
         title = $Title
@@ -1266,24 +1531,26 @@ function New-Stage5HostChildBinding {
         exitCode = [int]$ChildRun.run.exitCode
         stdout = [ordered]@{
             path = ConvertTo-OutputRelativePath $stdoutPath $OutputRoot "$Context stdout"
-            sha256 = Get-Sha256 $stdoutPath
+            sha256 = $stdoutSnapshot.sha256
         }
         stderr = [ordered]@{
             path = ConvertTo-OutputRelativePath $stderrPath $OutputRoot "$Context stderr"
-            sha256 = Get-Sha256 $stderrPath
+            sha256 = $stderrSnapshot.sha256
         }
     }
-    if ($null -ne $child.nativeReceipt -and
-        [string]$child.nativeReceipt.runNonce -ceq $ReceiptNonce) {
-        $nativePath = Join-Path $OutputRoot ([string]$child.nativeReceipt.path)
-        Assert-Condition (Test-Path -LiteralPath $nativePath -PathType Leaf) `
-            "$Context native v2 receipt was not retained: $nativePath"
-        $binding.nativeReceipt = [ordered]@{
-            path = ConvertTo-OutputRelativePath $nativePath $OutputRoot "$Context native receipt"
-            sha256 = Get-Sha256 $nativePath
-            producer = [string]$child.nativeReceipt.producer
-            runNonce = [string]$child.nativeReceipt.runNonce
-        }
+    Assert-Condition ($null -ne $child.nativeReceipt -and
+        [string]$child.nativeReceipt.runNonce -ceq $ReceiptNonce -and
+        [string]$child.nativeReceipt.cohortNonce -ceq $CohortNonce) `
+        "$Context lacks a native executable receipt bound to the same run and execution cohort."
+    $nativePath = Join-Path $OutputRoot ([string]$child.nativeReceipt.path)
+    $nativeSnapshot = Get-Stage5FileSnapshot $nativePath `
+        "$Context native v2 receipt"
+    $binding.nativeReceipt = [ordered]@{
+        path = ConvertTo-OutputRelativePath $nativePath $OutputRoot "$Context native receipt"
+        sha256 = $nativeSnapshot.sha256
+        producer = [string]$child.nativeReceipt.producer
+        runNonce = [string]$child.nativeReceipt.runNonce
+        cohortNonce = $CohortNonce
     }
     return $binding
 }
@@ -1299,7 +1566,10 @@ function Write-Stage5HostRunnerReceipt {
         [string]$ExecutableSha256,
         [object[]]$RawLogPaths,
         [object[]]$ChildRuns,
-        [Collections.IDictionary]$Details
+        [Collections.IDictionary]$Details,
+        [string]$CohortNonce,
+        [string]$CohortCreatedUtc,
+        [Collections.IDictionary]$RuntimeClosure
     )
     Assert-Condition ($Role -in @('validation-plan', 'validation-results',
         'replay-results', 'ai-results', 'performance-report')) `
@@ -1310,6 +1580,15 @@ function Write-Stage5HostRunnerReceipt {
         'AcceptanceArtifactSetSha256 must contain exactly 64 hexadecimal characters.'
     Assert-Condition ($ExecutableSha256 -match '^[0-9A-Fa-f]{64}$') `
         'Host-runner receipt executable SHA-256 is invalid.'
+    Assert-CanonicalUuid $CohortNonce 'Host-runner receipt cohortNonce' | Out-Null
+    [DateTimeOffset]$cohortCreated = [DateTimeOffset]::MinValue
+    Assert-Condition ($CohortCreatedUtc -is [string] -and
+        [DateTimeOffset]::TryParse($CohortCreatedUtc, [ref]$cohortCreated)) `
+        'Host-runner receipt cohortCreatedUtc is not a valid timestamp.'
+    Assert-Condition (($RuntimeClosure -is [Collections.IDictionary]) -and
+        (Test-Sha256Text ([string]$RuntimeClosure['dependencyManifestSha256'])) -and
+        (Test-Sha256Text ([string]$RuntimeClosure['closureSha256']))) `
+        'Host-runner receipt runtime closure binding is incomplete.'
     $receiptFull = [IO.Path]::GetFullPath($ReceiptPath)
     Assert-Condition (-not (Test-Path -LiteralPath $receiptFull)) `
         "Host-runner receipt output already exists: $receiptFull"
@@ -1322,9 +1601,17 @@ function Write-Stage5HostRunnerReceipt {
         # each role receipt.  The complete execution set remains covered by
         # the role's hashed result log; selecting a real child here avoids
         # inventing a process identity or a synthetic native receipt.
-        $candidate = @($ChildRuns | Where-Object { $null -ne $_.childProcess }) | Select-Object -First 1
+        $expectedNativeProducers = switch ($Role) {
+            default { @('game-executable-stage5-performance-report-v2') }
+        }
+        $candidate = @($ChildRuns | Where-Object {
+            $null -ne $_.childProcess -and
+            $null -ne $_.childProcess.nativeReceipt -and
+            $expectedNativeProducers -ccontains
+                [string]$_.childProcess.nativeReceipt.producer
+        }) | Select-Object -First 1
         Assert-Condition ($null -ne $candidate) `
-            "Host-runner '$Role' receipt cannot pass without retained child process provenance."
+            "Host-runner '$Role' receipt cannot pass without a retained child process and native receipt from '$($expectedNativeProducers -join ', ')'."
         $childTitle = $Title
         Assert-Condition ($childTitle -in @('Generals', 'ZeroHour')) `
             "Host-runner '$Role' receipt must bind a concrete title child."
@@ -1341,9 +1628,12 @@ function Write-Stage5HostRunnerReceipt {
     }
     if ($null -ne $candidate) {
         $children.Add((New-Stage5HostChildBinding $candidate $Role $childTitle `
-            $receiptNonce $OutputRoot $ExecutableSha256 `
+            $receiptNonce $CohortNonce $OutputRoot $ExecutableSha256 $RuntimeClosure `
             "Host-runner '$Role' child")) | Out-Null
     }
+    $recordedUtc = [DateTimeOffset]::UtcNow
+    Assert-Condition ($recordedUtc -ge $cohortCreated) `
+        "Host-runner '$Role' receipt recordedUtc predates the execution cohort."
     $document = [ordered]@{
         schemaVersion = 1
         evidenceKind = 'stage5-host-runner-receipt'
@@ -1358,7 +1648,12 @@ function Write-Stage5HostRunnerReceipt {
         architecture = 'x64'
         artifactSetSha256 = $ArtifactSetSha256.ToUpperInvariant()
         executableSha256 = $ExecutableSha256.ToUpperInvariant()
-        recordedUtc = [DateTime]::UtcNow.ToString('o')
+        cohortNonce = $CohortNonce
+        runtimeClosure = [ordered]@{
+            dependencyManifestSha256 = ([string]$RuntimeClosure['dependencyManifestSha256']).ToUpperInvariant()
+            closureSha256 = ([string]$RuntimeClosure['closureSha256']).ToUpperInvariant()
+        }
+        recordedUtc = $recordedUtc.ToString('o')
         rawLogs = $rawLogs
         provenance = [ordered]@{
             kind = 'host-runner-observation'
@@ -1375,6 +1670,7 @@ function Write-Stage5HostRunnerReceipt {
         sha256 = Get-Sha256 $receiptFull
         role = $Role
         runNonce = $receiptNonce
+        cohortNonce = $CohortNonce
     }
 }
 
@@ -1424,13 +1720,35 @@ Assert-Condition (-not $EnforcePerformance -or
     ($ReplayMatrixRepeats * $StressRepeats) -ge 4) `
     'Performance validation requires one warm-up and at least three measured stress runs per configuration.'
 $acceptanceBindingsRequested = -not [string]::IsNullOrWhiteSpace($AcceptanceSourceCommit) -or
-    -not [string]::IsNullOrWhiteSpace($AcceptanceArtifactSetSha256)
+    -not [string]::IsNullOrWhiteSpace($AcceptanceArtifactSetSha256) -or
+    -not [string]::IsNullOrWhiteSpace($AcceptanceRuntimeDependencyManifestSha256) -or
+    -not [string]::IsNullOrWhiteSpace($AcceptanceRuntimeClosureSha256)
 if ($acceptanceBindingsRequested) {
     Assert-Condition ($AcceptanceSourceCommit -cmatch '^[0-9a-f]{40}$') `
         'AcceptanceSourceCommit must be an independently supplied lowercase 40-hex commit.'
     Assert-Condition ($AcceptanceArtifactSetSha256 -match '^[0-9A-Fa-f]{64}$') `
         'AcceptanceArtifactSetSha256 must contain exactly 64 hexadecimal characters.'
+    Assert-Condition ((Test-Sha256Text $AcceptanceRuntimeDependencyManifestSha256) -and
+        (Test-Sha256Text $AcceptanceRuntimeClosureSha256)) `
+        'Acceptance runtime closure requires independently supplied dependency-manifest and closure SHA-256 values.'
 }
+$executionCohortNonce = if ([string]::IsNullOrWhiteSpace($ExecutionCohortNonce)) {
+    [Guid]::NewGuid().ToString()
+} else {
+    Assert-CanonicalUuid $ExecutionCohortNonce 'ExecutionCohortNonce'
+}
+$executionCohortCreated = [DateTimeOffset]::UtcNow
+if (-not [string]::IsNullOrWhiteSpace($ExecutionCohortCreatedUtc)) {
+    [DateTimeOffset]$providedCohortCreated = [DateTimeOffset]::MinValue
+    Assert-Condition ([DateTimeOffset]::TryParse($ExecutionCohortCreatedUtc,
+        [ref]$providedCohortCreated)) `
+        'ExecutionCohortCreatedUtc must be a valid timestamp.'
+    $executionCohortCreated = $providedCohortCreated.ToUniversalTime()
+}
+$executionCohortCreatedUtc = $executionCohortCreated.ToString('o')
+$hostRunnerRuntimeClosure = if ($acceptanceBindingsRequested) {
+    Get-HostRunnerRuntimeClosure 'Acceptance-bound host-runner execution'
+} else { $null }
 if (-not $PlanOnly) {
     Assert-Condition ([bool]$AllowHeadlessDirectExecution) `
         'Installed validation requires the reviewed -AllowHeadlessDirectExecution exception.'
@@ -1531,6 +1849,9 @@ $planDocument = [pscustomobject]@{
     schemaVersion = 1
     gateName = 'deterministic-runtime'
     generatedUtc = [DateTime]::UtcNow.ToString('o')
+    cohortNonce = $executionCohortNonce
+    cohortCreatedUtc = $executionCohortCreatedUtc
+    runtimeClosure = $hostRunnerRuntimeClosure
     runtimeRoot = $runtimeFull
     executable = $executableFull
     title = $manifestData.title
@@ -1602,6 +1923,9 @@ if ($PlanOnly) {
             'STAGE5_HOST_RUNNER_PLAN_V2'
             "sourceCommit=$AcceptanceSourceCommit"
             "artifactSetSha256=$($AcceptanceArtifactSetSha256.ToUpperInvariant())"
+            "cohortNonce=$executionCohortNonce"
+            "cohortCreatedUtc=$executionCohortCreatedUtc"
+            "runtimeClosureSha256=$($hostRunnerRuntimeClosure.closureSha256)"
             "title=$($manifestData.title)"
             "validationSet=$ValidationSet"
             "entryCount=$($plan.Count)"
@@ -1621,7 +1945,10 @@ if ($PlanOnly) {
                 gateName = 'deterministic-runtime'
                 validationSet = 'All'
                 entryCount = $plan.Count
-            }) | Out-Null
+            }) `
+            -CohortNonce $executionCohortNonce `
+            -CohortCreatedUtc $executionCohortCreatedUtc `
+            -RuntimeClosure $hostRunnerRuntimeClosure | Out-Null
     }
     if (-not $deterministicRuntimeEligible) {
         Write-Output "Stage 5 focused/diagnostic deterministic-runtime plan completed: $($plan.Count) synchronous installed-runtime executions."
@@ -1764,6 +2091,9 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
             'STAGE5_HOST_RUNNER_PLAN_V2'
             "sourceCommit=$AcceptanceSourceCommit"
             "artifactSetSha256=$($AcceptanceArtifactSetSha256.ToUpperInvariant())"
+            "cohortNonce=$executionCohortNonce"
+            "cohortCreatedUtc=$executionCohortCreatedUtc"
+            "runtimeClosureSha256=$($hostRunnerRuntimeClosure.closureSha256)"
             "title=$($manifestData.title)"
             "validationSet=$ValidationSet"
             "entryCount=$($plan.Count)"
@@ -1783,7 +2113,10 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
                 gateName = 'deterministic-runtime'
                 validationSet = 'All'
                 entryCount = $plan.Count
-            }) | Out-Null
+            }) `
+            -CohortNonce $executionCohortNonce `
+            -CohortCreatedUtc $executionCohortCreatedUtc `
+            -RuntimeClosure $hostRunnerRuntimeClosure | Out-Null
     }
 
     foreach ($entry in $plan) {
@@ -1918,7 +2251,10 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
                 resultCount = $resultArray.Count
                 allExecutionsPassed = $true
                 resultsSha256 = Get-Sha256 $resultsPath
-            }) | Out-Null
+            }) `
+            -CohortNonce $executionCohortNonce `
+            -CohortCreatedUtc $executionCohortCreatedUtc `
+            -RuntimeClosure $hostRunnerRuntimeClosure | Out-Null
         Write-Stage5HostRunnerReceipt -Role 'replay-results' `
             -OutputRoot $outputFull `
             -ReceiptPath (Join-Path $outputFull 'replay-results-receipt.json') `
@@ -1933,7 +2269,10 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
                 executionCount = $replayResults.Count
                 crcTreeSha256 = Get-Stage5ResultTreeSha256 $resultArray 'replay'
                 allExecutionsPassed = $true
-            }) | Out-Null
+            }) `
+            -CohortNonce $executionCohortNonce `
+            -CohortCreatedUtc $executionCohortCreatedUtc `
+            -RuntimeClosure $hostRunnerRuntimeClosure | Out-Null
         Write-Stage5HostRunnerReceipt -Role 'ai-results' `
             -OutputRoot $outputFull `
             -ReceiptPath (Join-Path $outputFull 'ai-results-receipt.json') `
@@ -1949,7 +2288,10 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
                 repeatCount = $manifestData.ai.repeats
                 allGamesCompleted = $true
                 digestTreeSha256 = Get-Stage5ResultTreeSha256 $resultArray 'ai'
-            }) | Out-Null
+            }) `
+            -CohortNonce $executionCohortNonce `
+            -CohortCreatedUtc $executionCohortCreatedUtc `
+            -RuntimeClosure $hostRunnerRuntimeClosure | Out-Null
         if ($EnforcePerformance) {
             $performanceReportPath = Join-Path $outputFull 'performance-report.json'
             Write-Stage5HostRunnerReceipt -Role 'performance-report' `
@@ -1961,7 +2303,10 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
                 -ExecutableSha256 $manifestData.executableSha256 `
                 -RawLogPaths (@($performanceReportPath, $resultsPath) + $allChildStreamPaths) `
                 -ChildRuns $replayRuns `
-                -Details ([ordered]@{}) | Out-Null
+                -Details ([ordered]@{}) `
+                -CohortNonce $executionCohortNonce `
+                -CohortCreatedUtc $executionCohortCreatedUtc `
+                -RuntimeClosure $hostRunnerRuntimeClosure | Out-Null
         }
     }
 }

@@ -47,6 +47,128 @@ function Assert-Stage5JsonShape {
     }
 }
 
+function Assert-Stage5JsonProperties {
+    param([object]$Object, [string[]]$Names, [string]$Context)
+    Assert-Stage5Condition ($Object -is [Collections.IDictionary]) "$Context must be a JSON object."
+    foreach ($name in $Names) { Get-Stage5JsonValue $Object $name $Context | Out-Null }
+}
+
+function Assert-Stage5NativeV2ReceiptProvenance {
+    param(
+        [object]$Document,
+        [string]$Context,
+        [string]$ExpectedTitle,
+        [string]$ExpectedExecutablePath,
+        [string]$ExpectedExecutableSha256,
+        [int]$ExpectedProcessId,
+        [string]$ExpectedProcessCreationUtc,
+        [string]$ExpectedCohortCreatedUtc,
+        [string]$ExpectedReceiptPath,
+        [string]$ExpectedEvidenceDirectory = ''
+    )
+    Assert-Stage5Condition ((Get-Stage5JsonValue $Document 'role' $Context) -ceq
+        'performance-report' -and
+        (Get-Stage5JsonValue $Document 'title' $Context) -ceq $ExpectedTitle -and
+        (Get-Stage5JsonValue $Document 'architecture' $Context) -ceq 'x64') `
+        "$Context role/title/architecture is not bound to the installed run."
+    [DateTimeOffset]$cohortCreated = [DateTimeOffset]::MinValue
+    [DateTimeOffset]$recorded = [DateTimeOffset]::MinValue
+    Assert-Stage5Condition ([DateTimeOffset]::TryParse(
+        [string](Get-Stage5JsonValue $Document 'cohortCreatedUtc' $Context),
+        [ref]$cohortCreated) -and
+        [DateTimeOffset]::TryParse(
+        [string](Get-Stage5JsonValue $Document 'recordedUtc' $Context),
+        [ref]$recorded) -and $recorded -ge $cohortCreated) `
+        "$Context recordedUtc/cohortCreatedUtc is invalid or stale."
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedCohortCreatedUtc)) {
+        [DateTimeOffset]$expectedCohortCreated = [DateTimeOffset]::MinValue
+        Assert-Stage5Condition ([DateTimeOffset]::TryParse($ExpectedCohortCreatedUtc,
+            [ref]$expectedCohortCreated) -and $cohortCreated -eq $expectedCohortCreated) `
+            "$Context cohortCreatedUtc is detached from the requested execution cohort."
+    }
+    $rawLogs = Get-Stage5JsonValue $Document 'rawLogs' $Context
+    Assert-Stage5Condition ($rawLogs -is [Array] -and $rawLogs.Count -eq 2) `
+        "$Context rawLogs must contain exactly raw-log and timing observations."
+    $seenRawNames = @{}
+    $nativeReceiptDirectory = Split-Path -Parent ([IO.Path]::GetFullPath($ExpectedReceiptPath))
+    $evidenceDirectory = if ([string]::IsNullOrWhiteSpace($ExpectedEvidenceDirectory)) {
+        $nativeReceiptDirectory
+    }
+    else { [IO.Path]::GetFullPath($ExpectedEvidenceDirectory) }
+    foreach ($rawLog in $rawLogs) {
+        Assert-Stage5JsonShape $rawLog @('name', 'path', 'sha256') "$Context raw log"
+        $rawName = [string](Get-Stage5JsonValue $rawLog 'name' "$Context raw log")
+        $rawPathText = [string](Get-Stage5JsonValue $rawLog 'path' "$Context raw log")
+        $rawExpectedHash = [string](Get-Stage5JsonValue $rawLog 'sha256' "$Context raw log")
+        Assert-Stage5Condition (($rawName -ceq 'raw-log' -or $rawName -ceq 'timing') -and
+            -not $seenRawNames.ContainsKey($rawName) -and
+            -not [string]::IsNullOrWhiteSpace($rawPathText) -and
+            $rawExpectedHash -cmatch '^[0-9A-Fa-f]{64}$') `
+            "$Context raw log is missing an executable-observed path/hash binding."
+        $rawPath = $null
+        if ([IO.Path]::IsPathRooted($rawPathText)) {
+            $rawPath = [IO.Path]::GetFullPath($rawPathText)
+        }
+        else {
+            # Native receipts normally serialize absolute paths.  Relative
+            # paths are accepted only for an immutable staged copy, and are
+            # resolved beside the native receipt first so combined receipts
+            # remain self-contained after source staging.
+            try {
+                $rawPath = Resolve-Stage5FinalAcceptanceFile $nativeReceiptDirectory `
+                    $rawPathText "$Context raw log '$rawName'"
+            }
+            catch {
+                $rawPath = Resolve-Stage5FinalAcceptanceFile $evidenceDirectory `
+                    $rawPathText "$Context raw log '$rawName'"
+            }
+        }
+        Assert-Stage5Condition ([IO.Path]::GetFullPath($rawPath) -ceq $rawPath) `
+            "$Context raw log '$rawName' path could not be canonicalized."
+        Assert-Stage5FinalAcceptancePathContained $evidenceDirectory $rawPath `
+            "$Context raw log '$rawName'"
+        $rawSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $rawPath `
+            "$Context raw log '$rawName'"
+        Assert-Stage5FinalAcceptanceSnapshotSha256 $rawSnapshot $rawExpectedHash `
+            "$Context raw log '$rawName'" | Out-Null
+        $seenRawNames[$rawName] = $true
+    }
+    Assert-Stage5Condition ($seenRawNames.ContainsKey('raw-log') -and
+        $seenRawNames.ContainsKey('timing')) "$Context rawLogs are incomplete."
+    $provenance = Get-Stage5JsonValue $Document 'provenance' $Context
+    Assert-Stage5JsonShape $provenance @('kind', 'receiptPath', 'processId',
+        'processCreationUtc', 'executablePath', 'executableSha256',
+        'commandLine', 'exitCode') "$Context native provenance"
+    $nativeProcessCreation = [DateTimeOffset]::MinValue
+    $expectedProcessCreation = [DateTimeOffset]::MinValue
+    Assert-Stage5Condition ([DateTimeOffset]::TryParse(
+        [string](Get-Stage5JsonValue $provenance 'processCreationUtc' $Context),
+        [ref]$nativeProcessCreation) -and
+        [DateTimeOffset]::TryParse($ExpectedProcessCreationUtc,
+        [ref]$expectedProcessCreation) -and
+        $nativeProcessCreation.UtcTicks -eq $expectedProcessCreation.UtcTicks -and
+        [int](Get-Stage5JsonValue $provenance 'processId' $Context) -eq $ExpectedProcessId -and
+        [IO.Path]::GetFullPath([string](Get-Stage5JsonValue $provenance 'executablePath' $Context)) -ceq
+            [IO.Path]::GetFullPath($ExpectedExecutablePath) -and
+        [string](Get-Stage5JsonValue $provenance 'executableSha256' $Context) -cmatch '^[0-9A-Fa-f]{64}$' -and
+        [string](Get-Stage5JsonValue $provenance 'executableSha256' $Context).ToUpperInvariant() -ceq
+            $ExpectedExecutableSha256.ToUpperInvariant() -and
+        -not [string]::IsNullOrWhiteSpace([string](Get-Stage5JsonValue $provenance 'commandLine' $Context)) -and
+        [int](Get-Stage5JsonValue $provenance 'exitCode' $Context) -eq 0) `
+        "$Context native process provenance is stale, substituted, or detached."
+    $provenanceReceiptPathText = [string](Get-Stage5JsonValue $provenance 'receiptPath' $Context)
+    $provenanceReceiptPath = if ([IO.Path]::IsPathRooted($provenanceReceiptPathText)) {
+        [IO.Path]::GetFullPath($provenanceReceiptPathText)
+    }
+    else {
+        Resolve-Stage5FinalAcceptanceFile $nativeReceiptDirectory `
+            $provenanceReceiptPathText "$Context native provenance receiptPath"
+    }
+    Assert-Stage5Condition ($provenanceReceiptPath -ceq
+        [IO.Path]::GetFullPath($ExpectedReceiptPath)) `
+        "$Context native provenance receipt path is detached from the immutable receipt."
+}
+
 function Test-Stage5JsonInteger {
     param([object]$Value)
     return $Value -is [byte] -or $Value -is [sbyte] -or $Value -is [int16] -or
@@ -2518,6 +2640,11 @@ function Get-Stage5FinalAcceptanceFileSha256 {
 
 function Assert-Stage5FinalAcceptancePathContained {
     param([string]$BaseDirectory, [string]$CandidatePath, [string]$Context)
+    foreach ($rawPath in @($BaseDirectory, $CandidatePath)) {
+        Assert-Stage5Condition (-not [string]::IsNullOrWhiteSpace($rawPath) -and
+            $rawPath -notmatch '(^|[\\/])\.(?:\.?)(?:[\\/]|$)') `
+            "$Context path contains an explicit dot segment and is not an immutable canonical path."
+    }
     $base = [IO.Path]::GetFullPath($BaseDirectory)
     $candidate = [IO.Path]::GetFullPath($CandidatePath)
     $baseRoot = [IO.Path]::GetPathRoot($base)
@@ -2543,6 +2670,7 @@ function Assert-Stage5FinalAcceptanceNoReparsePath {
     param([string]$BaseDirectory, [string]$CandidatePath, [string]$Context)
     $base = [IO.Path]::GetFullPath($BaseDirectory)
     $candidate = [IO.Path]::GetFullPath($CandidatePath)
+    Assert-Stage5FinalAcceptancePathContained $base $candidate $Context
     $baseRoot = [IO.Path]::GetPathRoot($base)
     if ($base.Length -gt $baseRoot.Length) {
         $base = $base.TrimEnd([char[]]@(
@@ -2561,16 +2689,44 @@ function Assert-Stage5FinalAcceptanceNoReparsePath {
         Assert-Stage5Condition (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) `
             "$Context path component '$segment' is a reparse point."
     }
+    # The manifest base can itself be below a junction/symlink.  Walk from the
+    # volume root as well; checking only the lexical manifest prefix is not a
+    # containment proof when an ancestor is later reparsed.
+    $candidateRoot = [IO.Path]::GetPathRoot($candidate)
+    $rootRelative = $candidate.Substring($candidateRoot.Length)
+    $rootCurrent = $candidateRoot
+    foreach ($segment in @($rootRelative -split '[\\/]')) {
+        if ([string]::IsNullOrWhiteSpace($segment)) { continue }
+        $rootCurrent = Join-Path $rootCurrent $segment
+        $rootItem = Get-Item -LiteralPath $rootCurrent -Force -ErrorAction Stop
+        Assert-Stage5Condition (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) `
+            "$Context ancestor path component '$segment' is a reparse point."
+    }
 }
 
 function Get-Stage5FinalAcceptanceFileSnapshot {
     param([string]$Path, [string]$Context)
     $fullPath = [IO.Path]::GetFullPath($Path)
-    Assert-Stage5Condition (Test-Path -LiteralPath $fullPath -PathType Leaf) `
-        "$Context file was not found: $Path"
-    $stream = [IO.File]::Open($fullPath, [IO.FileMode]::Open,
-        [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    # Capture and validate one immutable read.  The reader below never opens
+    # this path again: it parses the returned bytes.  FileShare.Read prevents
+    # replacement/deletion on Windows while the handle is live; the metadata
+    # comparison after the copy catches a same-path replacement on hosts where
+    # sharing semantics are weaker.  The digest is independently recomputed
+    # from the copied bytes, so a caller cannot forge the snapshot metadata.
+    Assert-Stage5FinalAcceptanceNoReparsePath (Split-Path -Parent $fullPath) `
+        $fullPath $Context
+    $before = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop
+    Assert-Stage5Condition (($before -is [IO.FileInfo]) -and
+        (($before.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) -and
+        -not [string]::IsNullOrWhiteSpace([string]$before.FullName)) `
+        "$Context file is missing, not a regular file, or is a reparse point: $Path"
+    $stream = New-Object IO.FileStream($fullPath, [IO.FileMode]::Open,
+        [IO.FileAccess]::Read, [IO.FileShare]::Read, 65536,
+        [IO.FileOptions]::SequentialScan)
     try {
+        $beforeLength = [Int64]$before.Length
+        Assert-Stage5Condition ($stream.Length -eq $beforeLength) `
+            "$Context file changed before its immutable copy began: $Path"
         $memory = New-Object IO.MemoryStream
         try {
             $stream.CopyTo($memory)
@@ -2578,16 +2734,29 @@ function Get-Stage5FinalAcceptanceFileSnapshot {
         }
         finally { $memory.Dispose() }
         $sha = [Security.Cryptography.SHA256]::Create()
-        try {
-            $hash = (($sha.ComputeHash($bytes) | ForEach-Object {
+        try { $hash = (($sha.ComputeHash($bytes) | ForEach-Object {
                 $_.ToString('x2')
-            }) -join '').ToUpperInvariant()
-        }
+            }) -join '').ToUpperInvariant() }
         finally { $sha.Dispose() }
+        $beforeCreation = [DateTime]$before.CreationTimeUtc
+        $beforeWrite = [DateTime]$before.LastWriteTimeUtc
+        $after = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop
+        Assert-Stage5Condition (($after -is [IO.FileInfo]) -and
+            (($after.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) -and
+            [Int64]$after.Length -eq $beforeLength -and
+            [Int64]$bytes.LongLength -eq $beforeLength -and
+            [DateTime]$after.CreationTimeUtc -eq $beforeCreation -and
+            [DateTime]$after.LastWriteTimeUtc -eq $beforeWrite) `
+            "$Context file changed or was replaced while it was snapshotted: $Path"
         return [pscustomobject]@{
             path = $fullPath
             bytes = $bytes
             sha256 = $hash
+            length = $beforeLength
+            creationTimeUtc = $beforeCreation.ToString('o')
+            lastWriteTimeUtc = $beforeWrite.ToString('o')
+            identity = '{0}|{1}|{2}' -f $beforeLength,
+                $beforeCreation.Ticks, $beforeWrite.Ticks
         }
     }
     finally { $stream.Dispose() }
@@ -2616,8 +2785,10 @@ function Resolve-Stage5FinalAcceptanceFile {
     $base = [IO.Path]::GetFullPath($BaseDirectory)
     $candidate = [IO.Path]::GetFullPath((Join-Path $base $RelativePath))
     Assert-Stage5FinalAcceptancePathContained $base $candidate $Context
-    Assert-Stage5Condition (Test-Path -LiteralPath $candidate -PathType Leaf) `
-        "$Context file was not found: $RelativePath"
+    # Keep the early component check for callers that use Resolve directly, but
+    # every reader still repeats it inside the copy-once snapshot immediately
+    # before opening.  That second check plus the single immutable snapshot is
+    # the race boundary; Resolve never supplies bytes to a reader by itself.
     Assert-Stage5FinalAcceptanceNoReparsePath $base $candidate $Context
     return $candidate
 }
@@ -2634,12 +2805,212 @@ function Assert-Stage5FinalAcceptanceSnapshotSha256 {
         $Expected -match '^[0-9A-Fa-f]{64}$') `
         "$Context SHA-256 must contain exactly 64 hexadecimal characters."
     Assert-Stage5Condition ($null -ne $Snapshot -and
-        $Snapshot.PSObject.Properties.Name -contains 'sha256') `
-        "$Context does not contain a hashed file snapshot."
+        $Snapshot.PSObject.Properties.Name -contains 'sha256' -and
+        $Snapshot.PSObject.Properties.Name -contains 'bytes' -and
+        $Snapshot.PSObject.Properties.Name -contains 'identity') `
+        "$Context does not contain a complete immutable file snapshot."
     $actual = [string]$Snapshot.sha256
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $rehashed = (($sha.ComputeHash([byte[]]$Snapshot.bytes) | ForEach-Object {
+            $_.ToString('x2')
+        }) -join '').ToUpperInvariant()
+    }
+    finally { $sha.Dispose() }
+    Assert-Stage5Condition ($actual -match '^[0-9A-Fa-f]{64}$' -and
+        $actual.ToUpperInvariant() -ceq $rehashed) `
+        "$Context snapshot digest is not bound to its copied bytes."
     Assert-Stage5Condition ($actual -ceq $Expected.ToUpperInvariant()) `
         "$Context SHA-256 mismatch. Expected $Expected, got $actual."
     return $actual
+}
+
+function Get-Stage5FinalAcceptanceSha256FromBytes {
+    param([byte[]]$Bytes)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return (($sha.ComputeHash($Bytes) | ForEach-Object {
+            $_.ToString('x2')
+        }) -join '').ToUpperInvariant()
+    }
+    finally { $sha.Dispose() }
+}
+
+function Assert-Stage5CanonicalUuid {
+    param([object]$Value, [string]$Context)
+    Assert-Stage5Condition ($Value -is [string] -and
+        $Value -cmatch '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-5][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$') `
+        "$Context must be a canonical UUID."
+    return [string]$Value
+}
+
+function Assert-Stage5RuntimeClosureBinding {
+    param([object]$Value, [object]$Expected, [string]$Context)
+    Assert-Stage5JsonShape $Value @('dependencyManifestSha256', 'closureSha256') `
+        "$Context runtime closure"
+    $manifestHash = Get-Stage5JsonValue $Value 'dependencyManifestSha256' `
+        "$Context runtime closure"
+    $closureHash = Get-Stage5JsonValue $Value 'closureSha256' `
+        "$Context runtime closure"
+    Assert-Stage5Condition ($manifestHash -is [string] -and
+        $manifestHash -cmatch '^[0-9A-Fa-f]{64}$' -and
+        $closureHash -is [string] -and $closureHash -cmatch '^[0-9A-Fa-f]{64}$') `
+        "$Context runtime closure hashes are not canonical."
+    Assert-Stage5Condition ($null -ne $Expected -and
+        (($Expected -is [Collections.IDictionary]) -or
+            $Expected.PSObject.Properties.Name -contains 'dependencyManifestSha256')) `
+        "$Context has no independently verified runtime closure expectation."
+    $expectedManifestHash = [string]$Expected.dependencyManifestSha256
+    $expectedClosureHash = [string]$Expected.closureSha256
+    Assert-Stage5Condition ($expectedManifestHash -cmatch '^[0-9A-Fa-f]{64}$' -and
+        $expectedClosureHash -cmatch '^[0-9A-Fa-f]{64}$') `
+        "$Context independently verified runtime closure expectation is malformed."
+    Assert-Stage5Condition ($manifestHash.ToUpperInvariant() -ceq
+        $expectedManifestHash.ToUpperInvariant() -and
+        $closureHash.ToUpperInvariant() -ceq $expectedClosureHash.ToUpperInvariant()) `
+        "$Context runtime closure is stale or substituted."
+    return [pscustomobject]@{
+        dependencyManifestSha256 = $manifestHash.ToUpperInvariant()
+        closureSha256 = $closureHash.ToUpperInvariant()
+    }
+}
+
+function Get-Stage5RuntimeClosureBinding {
+    param(
+        [object]$ArtifactSet,
+        [string]$ArtifactDirectory,
+        [string]$ExpectedSourceCommit,
+        [string]$Context = 'Artifact set runtime closure'
+    )
+    Assert-Stage5JsonShape $ArtifactSet @('schemaVersion', 'sourceCommit',
+        'productSet', 'architecture', 'artifacts', 'runtimeClosure') $Context
+    $runtimeClosure = Get-Stage5JsonValue $ArtifactSet 'runtimeClosure' $Context
+    Assert-Stage5JsonShape $runtimeClosure @('dependencyManifest', 'closureSha256') `
+        "$Context runtime closure"
+    $manifestReference = Get-Stage5JsonValue $runtimeClosure `
+        'dependencyManifest' "$Context runtime closure"
+    Assert-Stage5JsonShape $manifestReference @('path', 'sha256') `
+        "$Context dependency manifest reference"
+    $manifestRelative = Get-Stage5JsonValue $manifestReference 'path' `
+        "$Context dependency manifest reference"
+    $manifestExpectedHash = Get-Stage5JsonValue $manifestReference 'sha256' `
+        "$Context dependency manifest reference"
+    Assert-Stage5Condition ($manifestRelative -is [string] -and
+        $manifestExpectedHash -is [string] -and
+        $manifestExpectedHash -cmatch '^[0-9A-Fa-f]{64}$') `
+        "$Context dependency manifest reference is malformed."
+    $manifestPath = Resolve-Stage5FinalAcceptanceFile $ArtifactDirectory `
+        $manifestRelative "$Context dependency manifest"
+    $manifestSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $manifestPath `
+        "$Context dependency manifest"
+    $manifestHash = Assert-Stage5FinalAcceptanceSnapshotSha256 $manifestSnapshot `
+        $manifestExpectedHash "$Context dependency manifest"
+    $manifest = ConvertFrom-Stage5FinalAcceptanceJsonSnapshot $manifestSnapshot `
+        "$Context dependency manifest"
+    Assert-Stage5JsonShape $manifest @('schemaVersion', 'sourceCommit',
+        'productSet', 'architecture', 'files') "$Context dependency manifest"
+    Assert-Stage5Condition ((Test-Stage5JsonInteger $manifest.schemaVersion) -and
+        [Int64]$manifest.schemaVersion -eq 1 -and
+        [string]$manifest.sourceCommit -ceq $ExpectedSourceCommit -and
+        [string]$manifest.architecture -ceq 'x64') `
+        "$Context dependency manifest identity is stale or substituted."
+    Assert-Stage5FinalAcceptanceStringSet $manifest.productSet `
+        @('Generals', 'ZeroHour') "$Context dependency manifest productSet"
+    $dependencyFiles = Get-Stage5JsonValue $manifest 'files' `
+        "$Context dependency manifest"
+    Assert-Stage5Condition ($dependencyFiles -is [Array] -and
+        $dependencyFiles.Count -ge 8) `
+        "$Context must contain the complete installed runtime closure, including dependency DLLs and assets."
+    $seenPaths = New-Object 'Collections.Generic.HashSet[string]' `
+        ([StringComparer]::OrdinalIgnoreCase)
+    $seenKindsByTitle = @{}
+    $canonicalLines = New-Object 'Collections.Generic.List[string]'
+    $validatedFiles = New-Object 'Collections.Generic.List[object]'
+    foreach ($dependency in $dependencyFiles) {
+        Assert-Stage5JsonShape $dependency @('title', 'kind', 'path', 'sha256') `
+            "$Context dependency manifest file"
+        $title = Get-Stage5JsonValue $dependency 'title' "$Context dependency manifest file"
+        $kind = Get-Stage5JsonValue $dependency 'kind' "$Context dependency manifest file"
+        $relative = Get-Stage5JsonValue $dependency 'path' "$Context dependency manifest file"
+        $expectedHash = Get-Stage5JsonValue $dependency 'sha256' "$Context dependency manifest file"
+        Assert-Stage5Condition ($title -is [string] -and
+            @('Generals', 'ZeroHour') -ccontains $title -and
+            $kind -is [string] -and
+            @('executable', 'launcher', 'launcher-config', 'dll', 'asset') -ccontains $kind -and
+            $relative -is [string] -and $expectedHash -is [string] -and
+            $expectedHash -cmatch '^[0-9A-Fa-f]{64}$') `
+            "$Context dependency manifest file is malformed."
+        $fullPath = Resolve-Stage5FinalAcceptanceFile $ArtifactDirectory $relative `
+            "$Context dependency '$title/$kind'"
+        $pathKey = $fullPath.ToLowerInvariant()
+        Assert-Stage5Condition $seenPaths.Add($pathKey) `
+            "$Context dependency manifest repeats path '$relative'."
+        $snapshot = Get-Stage5FinalAcceptanceFileSnapshot $fullPath `
+            "$Context dependency '$title/$kind'"
+        $verifiedHash = Assert-Stage5FinalAcceptanceSnapshotSha256 $snapshot `
+            $expectedHash "$Context dependency '$title/$kind'"
+        $normalizedRelative = ([string]$relative).Replace('\', '/')
+        $canonicalLines.Add(('{0}|{1}|{2}|{3}' -f $title, $kind,
+            $normalizedRelative, $verifiedHash.ToUpperInvariant())) | Out-Null
+        if (-not $seenKindsByTitle.ContainsKey($title)) {
+            $seenKindsByTitle[$title] = New-Object 'Collections.Generic.HashSet[string]' `
+                ([StringComparer]::Ordinal)
+        }
+        $seenKindsByTitle[$title].Add($kind) | Out-Null
+        $validatedFiles.Add([pscustomobject]@{
+            title = [string]$title; kind = [string]$kind; path = [string]$relative
+            sha256 = [string]$verifiedHash; fullPath = [string]$fullPath
+            snapshot = $snapshot
+        }) | Out-Null
+    }
+    foreach ($title in @('Generals', 'ZeroHour')) {
+        foreach ($requiredKind in @('executable', 'launcher', 'launcher-config',
+            'dll', 'asset')) {
+            Assert-Stage5Condition ($seenKindsByTitle.ContainsKey($title) -and
+                $seenKindsByTitle[$title].Contains($requiredKind)) `
+                "$Context runtime closure lacks '$requiredKind' for $title."
+        }
+    }
+    $artifactEntries = Get-Stage5JsonValue $ArtifactSet 'artifacts' $Context
+    foreach ($artifact in $artifactEntries) {
+        Assert-Stage5JsonShape $artifact @('role', 'path', 'sha256') `
+            "$Context artifact entry"
+        $artifactRole = [string](Get-Stage5JsonValue $artifact 'role' "$Context artifact entry")
+        $artifactPath = ([string](Get-Stage5JsonValue $artifact 'path' "$Context artifact entry")).Replace('\', '/')
+        $artifactHash = [string](Get-Stage5JsonValue $artifact 'sha256' "$Context artifact entry")
+        Assert-Stage5Condition ($artifactHash -cmatch '^[0-9A-Fa-f]{64}$') `
+            "$Context artifact '$artifactRole' has a noncanonical SHA-256."
+        $matching = @($validatedFiles | Where-Object {
+            $_.path.Replace('\', '/') -ceq $artifactPath -and
+            $_.sha256.ToUpperInvariant() -ceq $artifactHash.ToUpperInvariant()
+        })
+        Assert-Stage5Condition ($matching.Count -eq 1) `
+            "$Context core artifact '$artifactRole' is not included in the hashed runtime closure."
+        Assert-Stage5Condition ([IO.Path]::GetFullPath([string]$matching[0].fullPath) -ceq
+            [IO.Path]::GetFullPath((Join-Path $ArtifactDirectory ([string](Get-Stage5JsonValue `
+                $artifact 'path' "$Context artifact entry"))))) `
+            "$Context artifact '$artifactRole' resolved outside the hashed runtime closure snapshot."
+        Assert-Stage5FinalAcceptanceSnapshotSha256 $matching[0].snapshot `
+            $artifactHash "$Context artifact '$artifactRole' runtime closure snapshot" | Out-Null
+    }
+    $lineArray = $canonicalLines.ToArray()
+    [Array]::Sort($lineArray, [StringComparer]::Ordinal)
+    $closureText = ($lineArray -join "`n") + "`n"
+    $closureHash = Get-Stage5FinalAcceptanceSha256FromBytes `
+        ([Text.Encoding]::UTF8.GetBytes($closureText))
+    $expectedClosureHash = Get-Stage5JsonValue $runtimeClosure 'closureSha256' `
+        "$Context runtime closure"
+    Assert-Stage5Condition ($expectedClosureHash -is [string] -and
+        $expectedClosureHash -cmatch '^[0-9A-Fa-f]{64}$' -and
+        $expectedClosureHash.ToUpperInvariant() -ceq $closureHash) `
+        "$Context closureSha256 does not match the independently rehashed dependency closure."
+    return [pscustomobject]@{
+        dependencyManifestPath = [string]$manifestRelative
+        dependencyManifestSha256 = [string]$manifestHash.ToUpperInvariant()
+        closureSha256 = [string]$closureHash
+        fileCount = [int]$validatedFiles.Count
+        files = $validatedFiles.ToArray()
+    }
 }
 
 function Assert-Stage5FinalAcceptanceBoolean {
@@ -2683,7 +3054,8 @@ function Get-Stage5FinalAcceptanceReceiptContract {
             currentProducer = 'Run-DeterministicSimulationValidation.ps1'
             trustDomain = 'host-runner'
             allowedTrustDomains = @('host-runner', 'executable')
-            executableProducer = 'game-executable-stage5-validation-results-v2'
+            executableProducer = 'game-executable-stage5-performance-report-v2'
+            hostChildNativeProducers = @('game-executable-stage5-performance-report-v2')
             evidenceKind = 'stage5-host-runner-receipt'
             requiresChildProvenance = $true
             detailNames = @('resultCount', 'allExecutionsPassed', 'resultsSha256')
@@ -2694,7 +3066,8 @@ function Get-Stage5FinalAcceptanceReceiptContract {
             currentProducer = 'Run-DeterministicSimulationValidation.ps1'
             trustDomain = 'host-runner'
             allowedTrustDomains = @('host-runner', 'executable')
-            executableProducer = 'game-executable-stage5-replay-results-v2'
+            executableProducer = 'game-executable-stage5-performance-report-v2'
+            hostChildNativeProducers = @('game-executable-stage5-performance-report-v2')
             evidenceKind = 'stage5-host-runner-receipt'
             requiresChildProvenance = $true
             detailNames = @('uniqueReplayCount', 'executionCount',
@@ -2717,7 +3090,8 @@ function Get-Stage5FinalAcceptanceReceiptContract {
             currentProducer = 'Run-DeterministicSimulationValidation.ps1'
             trustDomain = 'host-runner'
             allowedTrustDomains = @('host-runner', 'executable')
-            executableProducer = 'game-executable-stage5-ai-results-v2'
+            executableProducer = 'game-executable-stage5-performance-report-v2'
+            hostChildNativeProducers = @('game-executable-stage5-performance-report-v2')
             evidenceKind = 'stage5-host-runner-receipt'
             requiresChildProvenance = $true
             detailNames = @('scenarioCount', 'distinctSeedCount', 'repeatCount',
@@ -2726,13 +3100,14 @@ function Get-Stage5FinalAcceptanceReceiptContract {
         'combined-results' = [pscustomobject]@{
             producer = 'installed-runtime-combined-results-v2'
             producerVersion = '2'
-            currentProducer = 'Run-DeterministicSimulationValidation.ps1'
+            currentProducer = 'New-Stage5CombinedHostRunnerReceipt.ps1'
             trustDomain = 'host-runner'
             allowedTrustDomains = @('host-runner')
+            hostChildNativeProducers = @('game-executable-stage5-performance-report-v2')
             evidenceKind = 'stage5-host-runner-receipt'
             requiresChildProvenance = $true
             detailNames = @('pipelineMode', 'simulationMode', 'workerPolicy',
-                'renderer', 'renderThread', 'bothTitlesPassed')
+                'renderer', 'renderThread', 'bothTitlesPassed', 'sourceReceipts')
         }
         'performance-report' = [pscustomobject]@{
             producer = 'installed-runtime-performance-report-v2'
@@ -2741,6 +3116,7 @@ function Get-Stage5FinalAcceptanceReceiptContract {
             trustDomain = 'host-runner'
             allowedTrustDomains = @('host-runner', 'executable')
             executableProducer = 'game-executable-stage5-performance-report-v2'
+            hostChildNativeProducers = @('game-executable-stage5-performance-report-v2')
             evidenceKind = 'stage5-host-runner-receipt'
             requiresChildProvenance = $true
             detailNames = @()
@@ -2780,6 +3156,9 @@ function Read-Stage5FinalAcceptanceProtectedAttestation {
         [string]$ExpectedSourceCommit, [string]$ExpectedArtifactSetSha256
     )
     $context = "Final acceptance '$Kind' attachment '$Role'"
+    if ($TrustDomain -in @('premium-review', 'manual-approval')) {
+        throw "$context requires a genuinely independent $TrustDomain authority; writable local JSON attestations cannot mint final acceptance."
+    }
     $protection = Get-Stage5JsonValue $Document 'protection' $context
     Assert-Stage5JsonShape $protection @('kind', 'path', 'sha256') "$context protected attestation"
     $protectionKind = Get-Stage5JsonValue $protection 'kind' "$context protected attestation"
@@ -2839,6 +3218,145 @@ function Read-Stage5FinalAcceptanceProtectedAttestation {
     return $protection
 }
 
+function Assert-Stage5CombinedHostSourceBindings {
+    param(
+        [string]$Path,
+        [object]$Details,
+        [object[]]$ValidatedRawLogs,
+        [object[]]$Children,
+        [string]$ExpectedSourceCommit,
+        [string]$ExpectedArtifactSetSha256,
+        [Collections.IDictionary]$ArtifactHashes,
+        [Collections.IDictionary]$SeenRunNonces,
+        [string]$CombinedRunNonce,
+        [string]$ExpectedCohortNonce = $null,
+        [object]$ExpectedRuntimeClosure = $null
+    )
+    $context = "Final acceptance combined-results source bindings '$Path'"
+    $sourceReferences = Get-Stage5JsonValue $Details 'sourceReceipts' "$context details"
+    Assert-Stage5Condition ($sourceReferences -is [Array] -and
+        $sourceReferences.Count -eq 2) `
+        "$context must contain exactly two source receipt references."
+    $rawByPath = @{}
+    foreach ($raw in @($ValidatedRawLogs)) {
+        $rawPath = ([string]$raw.path).Replace('/', '\').ToLowerInvariant()
+        $rawByPath[$rawPath] = $raw
+    }
+    $sourceByTitle = @{}
+    $sourceNonces = New-Object 'Collections.Generic.HashSet[string]' `
+        ([StringComparer]::Ordinal)
+    foreach ($source in $sourceReferences) {
+        Assert-Stage5JsonShape $source @('title', 'path', 'sha256', 'runNonce', 'cohortNonce') `
+            "$context source receipt"
+        $sourceTitle = Get-Stage5JsonValue $source 'title' "$context source receipt"
+        $sourceRelative = Get-Stage5JsonValue $source 'path' "$context source receipt"
+        $sourceExpectedHash = Get-Stage5JsonValue $source 'sha256' "$context source receipt"
+        $sourceExpectedNonce = Get-Stage5JsonValue $source 'runNonce' "$context source receipt"
+        $sourceExpectedCohort = Assert-Stage5CanonicalUuid `
+            (Get-Stage5JsonValue $source 'cohortNonce' "$context source receipt") `
+            "$context source receipt cohortNonce"
+        Assert-Stage5Condition ($sourceTitle -is [string] -and
+            @('Generals', 'ZeroHour') -ccontains $sourceTitle -and
+            -not $sourceByTitle.ContainsKey($sourceTitle) -and
+            $sourceRelative -is [string] -and
+            -not [IO.Path]::IsPathRooted($sourceRelative) -and
+            $sourceRelative -notmatch '(^|[\\/])\.\.([\\/]|$)' -and
+            $sourceExpectedHash -is [string] -and
+            $sourceExpectedHash -match '^[0-9A-Fa-f]{64}$' -and
+            $sourceExpectedNonce -is [string] -and
+            $sourceExpectedNonce -match '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-5][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$' -and
+            ($null -eq $ExpectedCohortNonce -or $sourceExpectedCohort -ceq $ExpectedCohortNonce) -and
+            $sourceNonces.Add([string]$sourceExpectedNonce)) `
+            "$context source receipt reference is malformed, duplicated, or unsafe."
+        $sourcePath = Resolve-Stage5FinalAcceptanceFile (Split-Path -Parent $Path) `
+            $sourceRelative "$context $sourceTitle source receipt"
+        Assert-Stage5Condition (-not [String]::Equals(
+            [IO.Path]::GetFullPath($sourcePath), [IO.Path]::GetFullPath($Path),
+            [StringComparison]::OrdinalIgnoreCase)) `
+            "$context source receipt aliases the combined receipt."
+        $rawKey = $sourceRelative.Replace('/', '\').ToLowerInvariant()
+        Assert-Stage5Condition ($rawByPath.ContainsKey($rawKey) -and
+            [string]$rawByPath[$rawKey].sha256 -ceq
+                $sourceExpectedHash.ToUpperInvariant()) `
+            "$context $sourceTitle source receipt is not hash-bound as a combined raw log."
+        $sourceSnapshot = $rawByPath[$rawKey].snapshot
+        $sourceHash = Assert-Stage5FinalAcceptanceSnapshotSha256 $sourceSnapshot `
+            $sourceExpectedHash "$context $sourceTitle source receipt"
+        $sourceRead = Read-Stage5FinalAcceptanceImmutableReceipt `
+            -Path $sourcePath -Kind 'deterministic-runtime' -Role 'validation-results' `
+            -EvidenceTitle $sourceTitle -ExpectedSourceCommit $ExpectedSourceCommit `
+            -ExpectedArtifactSetSha256 $ExpectedArtifactSetSha256 `
+            -ArtifactHashes $ArtifactHashes -SeenRunNonces $SeenRunNonces `
+            -ExpectedEvidenceSha256 $sourceHash -EvidenceSnapshot $sourceSnapshot `
+            -ExpectedCohortNonce $ExpectedCohortNonce `
+            -ExpectedRuntimeClosure $ExpectedRuntimeClosure
+        Assert-Stage5Condition ([string]$sourceRead.trustDomain -ceq 'host-runner' -and
+            [string]$sourceRead.producer -ceq 'installed-runtime-validation-results-v2' -and
+            [string]$sourceRead.runNonce -ceq [string]$sourceExpectedNonce -and
+            [string]$sourceRead.runNonce -cne $CombinedRunNonce) `
+            "$context $sourceTitle source receipt is not the distinct host-runner v2 input claimed by the adapter."
+        $sourceChildren = @($sourceRead.provenance.children)
+        Assert-Stage5Condition ($sourceChildren.Count -eq 1) `
+            "$context $sourceTitle source receipt must contain exactly one child process."
+        $sourceByTitle[$sourceTitle] = [pscustomobject]@{
+            read = $sourceRead
+            child = $sourceChildren[0]
+            hash = $sourceHash
+        }
+    }
+    Assert-Stage5FinalAcceptanceStringSet @($sourceByTitle.Keys) `
+        @('Generals', 'ZeroHour') "$context source receipt titles"
+    Assert-Stage5Condition (@($Children).Count -eq 2) `
+        "$context must bind exactly two combined child processes."
+    foreach ($title in @('Generals', 'ZeroHour')) {
+        $combinedChildren = @($Children | Where-Object {
+            [string]$_.title -ceq $title
+        })
+        Assert-Stage5Condition ($combinedChildren.Count -eq 1) `
+            "$context does not bind exactly one combined child for $title."
+        $combinedChild = $combinedChildren[0]
+        $sourceChild = $sourceByTitle[$title].child
+        foreach ($field in @('runNonce', 'processId', 'processCreationUtc',
+            'executablePath', 'executableSha256', 'commandLine', 'exitCode')) {
+            Assert-Stage5Condition ([string]$combinedChild[$field] -ceq
+                [string]$sourceChild[$field]) `
+                "$context $title child field '$field' does not bind the source receipt."
+        }
+        foreach ($streamName in @('stdout', 'stderr')) {
+            $sourceStream = Get-Stage5JsonValue $sourceChild $streamName `
+                "$context $title source child"
+            $combinedStream = Get-Stage5JsonValue $combinedChild $streamName `
+                "$context $title combined child"
+            Assert-Stage5JsonShape $sourceStream @('path', 'sha256') `
+                "$context $title source child $streamName"
+            Assert-Stage5JsonShape $combinedStream @('path', 'sha256') `
+                "$context $title combined child $streamName"
+            Assert-Stage5Condition ([string]$combinedStream.sha256 -ceq
+                [string]$sourceStream.sha256) `
+                "$context $title child $streamName hash does not bind the source receipt."
+        }
+        $sourceHasNative = @($sourceChild.Keys | Where-Object {
+            [string]$_ -ceq 'nativeReceipt'
+        }).Count -gt 0
+        $combinedHasNative = @($combinedChild.Keys | Where-Object {
+            [string]$_ -ceq 'nativeReceipt'
+        }).Count -gt 0
+        Assert-Stage5Condition ($sourceHasNative -and $combinedHasNative) `
+            "$context $title child must carry the executable native receipt required for readiness."
+        $sourceNative = Get-Stage5JsonValue $sourceChild 'nativeReceipt' "$context $title source child"
+        $combinedNative = Get-Stage5JsonValue $combinedChild 'nativeReceipt' "$context $title combined child"
+        Assert-Stage5JsonShape $sourceNative @('path', 'sha256', 'producer', 'runNonce', 'cohortNonce') `
+            "$context $title source native receipt"
+        Assert-Stage5JsonShape $combinedNative @('path', 'sha256', 'producer', 'runNonce', 'cohortNonce') `
+            "$context $title combined native receipt"
+        foreach ($field in @('sha256', 'producer', 'runNonce', 'cohortNonce')) {
+            Assert-Stage5Condition ([string]$combinedNative[$field] -ceq
+                [string]$sourceNative[$field]) `
+                "$context $title native receipt field '$field' does not bind the source receipt."
+        }
+    }
+}
+
 function Read-Stage5FinalAcceptanceImmutableReceipt {
     param(
         [string]$Path,
@@ -2849,17 +3367,40 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
         [string]$ExpectedArtifactSetSha256,
         [Collections.IDictionary]$ArtifactHashes,
         [Collections.IDictionary]$SeenRunNonces = $null,
-        [string]$ExpectedEvidenceSha256 = $null
+        [string]$ExpectedEvidenceSha256 = $null,
+        [object]$EvidenceSnapshot = $null,
+        [string]$ExpectedCohortNonce = $null,
+        [string]$ExpectedCohortCreatedUtc = $null,
+        [object]$ExpectedRuntimeClosure = $null,
+        [Collections.IDictionary]$ArtifactPaths = $null
     )
     $context = "Final acceptance '$Kind' attachment '$Role'"
     $contract = Get-Stage5FinalAcceptanceReceiptContract $Role
     $receiptBaseDirectory = Split-Path -Parent ([IO.Path]::GetFullPath($Path))
-    Assert-Stage5FinalAcceptanceNoReparsePath $receiptBaseDirectory $Path $context
-    $documentSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $Path $context
-    if (-not [string]::IsNullOrWhiteSpace($ExpectedEvidenceSha256)) {
-        Assert-Stage5FinalAcceptanceSnapshotSha256 $documentSnapshot `
-            $ExpectedEvidenceSha256 "$context receipt file" | Out-Null
+    if ($null -eq $EvidenceSnapshot) {
+        Assert-Stage5FinalAcceptanceNoReparsePath $receiptBaseDirectory $Path $context
     }
+    $documentSnapshot = if ($null -eq $EvidenceSnapshot) {
+        Get-Stage5FinalAcceptanceFileSnapshot $Path $context
+    }
+    else { $EvidenceSnapshot }
+    if ($null -ne $EvidenceSnapshot) {
+        Assert-Stage5Condition (-not [string]::IsNullOrWhiteSpace($ExpectedEvidenceSha256)) `
+            "$context caller-supplied snapshot must include its independently expected SHA-256."
+    }
+    Assert-Stage5Condition ($null -ne $documentSnapshot -and
+        $documentSnapshot.PSObject.Properties.Name -contains 'path' -and
+        [IO.Path]::GetFullPath([string]$documentSnapshot.path) -ceq
+            [IO.Path]::GetFullPath($Path)) `
+        "$context receipt snapshot is bound to a different path."
+    if ([string]::IsNullOrWhiteSpace($ExpectedEvidenceSha256)) {
+        # Internally captured snapshots are already immutable and are checked
+        # against their own recomputed digest below.  A caller-provided
+        # snapshot never takes this path.
+        $ExpectedEvidenceSha256 = [string]$documentSnapshot.sha256
+    }
+    Assert-Stage5FinalAcceptanceSnapshotSha256 $documentSnapshot `
+        $ExpectedEvidenceSha256 "$context receipt file" | Out-Null
     $document = ConvertFrom-Stage5FinalAcceptanceJsonSnapshot $documentSnapshot $context
     Assert-Stage5Condition ($document -is [Collections.IDictionary]) `
         "$context is not a JSON receipt object."
@@ -2870,7 +3411,8 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
         "$context trustDomain is substituted or not an allowlisted producer domain: '$documentTrustDomain' for role '$Role'."
     $commonNames = @('schemaVersion', 'evidenceKind', 'status', 'role',
         'trustDomain', 'producer', 'producerVersion', 'sourceCommit', 'title',
-        'architecture', 'artifactSetSha256', 'recordedUtc', 'details')
+        'architecture', 'artifactSetSha256', 'recordedUtc', 'cohortNonce',
+        'runtimeClosure', 'details')
     $names = @($commonNames)
     if ($documentTrustDomain -eq 'host-runner' -or
         $documentTrustDomain -eq 'executable') {
@@ -2942,6 +3484,28 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
     [DateTimeOffset]$recorded = [DateTimeOffset]::MinValue
     Assert-Stage5Condition ([DateTimeOffset]::TryParse($recordedUtc, [ref]$recorded)) `
         "$context recordedUtc is not a valid timestamp."
+    $cohortNonce = Assert-Stage5CanonicalUuid `
+        (Get-Stage5JsonValue $document 'cohortNonce' $context) "$context cohortNonce"
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedCohortNonce)) {
+        Assert-Stage5CanonicalUuid $ExpectedCohortNonce "$context expected cohortNonce" | Out-Null
+        Assert-Stage5Condition ($cohortNonce -ceq $ExpectedCohortNonce) `
+            "$context cohortNonce is stale or detached from the execution cohort."
+    }
+    $runtimeClosure = Get-Stage5JsonValue $document 'runtimeClosure' $context
+    if ($null -ne $ExpectedRuntimeClosure) {
+        [void](Assert-Stage5RuntimeClosureBinding $runtimeClosure `
+            $ExpectedRuntimeClosure "$context")
+    }
+    else {
+        Assert-Stage5JsonShape $runtimeClosure `
+            @('dependencyManifestSha256', 'closureSha256') "$context runtime closure"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedCohortCreatedUtc)) {
+        [DateTimeOffset]$cohortCreated = [DateTimeOffset]::MinValue
+        Assert-Stage5Condition ([DateTimeOffset]::TryParse($ExpectedCohortCreatedUtc,
+            [ref]$cohortCreated) -and $recorded -ge $cohortCreated) `
+            "$context recordedUtc predates the execution cohort."
+    }
 
     $details = Get-Stage5JsonValue $document 'details' $context
     try {
@@ -3009,12 +3573,15 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
                 $rawRelative "$context raw log '$rawName'"
             Assert-Stage5Condition (-not ($rawPaths -contains $rawPath.ToLowerInvariant())) `
                 "$context aliases raw log path '$rawRelative'."
-            $rawHash = Assert-Stage5FinalAcceptanceSha256 $rawPath $rawExpectedHash `
+            $rawSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $rawPath `
                 "$context raw log '$rawName'"
+            $rawHash = Assert-Stage5FinalAcceptanceSnapshotSha256 $rawSnapshot `
+                $rawExpectedHash "$context raw log '$rawName'"
             $rawNames.Add($rawName) | Out-Null
             $rawPaths.Add($rawPath.ToLowerInvariant()) | Out-Null
             $validatedRawLogs.Add([pscustomobject]@{
                 name = $rawName; path = $rawRelative; sha256 = $rawHash
+                snapshot = $rawSnapshot
             }) | Out-Null
         }
         if ($documentTrustDomain -eq 'host-runner') {
@@ -3028,9 +3595,9 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
                 "$context host provenance is not bound to the registered runner."
             $childProvenance = Get-Stage5JsonValue $provenance 'childProvenance' "$context host provenance"
             $children = Get-Stage5JsonValue $provenance 'children' "$context host provenance"
-            Assert-Stage5Condition (($childProvenance -ceq 'bound') -or
-                ($childProvenance -ceq 'not-applicable')) `
-                "$context host provenance has an invalid childProvenance state."
+                Assert-Stage5Condition (($childProvenance -ceq 'bound') -or
+                    ($childProvenance -ceq 'not-applicable')) `
+                    "$context host provenance has an invalid childProvenance state."
             if ([bool]$contract.requiresChildProvenance) {
                 Assert-Stage5Condition ($childProvenance -ceq 'bound' -and
                     $children -is [Array] -and $children.Count -gt 0) `
@@ -3044,10 +3611,14 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
             $seenChildTitles = New-Object 'Collections.Generic.List[string]'
             $seenChildProcesses = New-Object 'Collections.Generic.List[string]'
             foreach ($child in $children) {
-                Assert-Stage5JsonShape $child @('role', 'title', 'runNonce',
+                $childNames = @('role', 'title', 'runNonce',
                     'processId', 'processCreationUtc', 'executablePath',
                     'executableSha256', 'commandLine', 'exitCode', 'stdout',
-                    'stderr') "$context host child"
+                    'stderr')
+                if ([bool]$contract.requiresChildProvenance) {
+                    $childNames += 'nativeReceipt'
+                }
+                Assert-Stage5JsonShape $child $childNames "$context host child"
                 $childRole = Get-Stage5JsonValue $child 'role' "$context host child"
                 $childTitle = Get-Stage5JsonValue $child 'title' "$context host child"
                 $childNonce = Get-Stage5JsonValue $child 'runNonce' "$context host child"
@@ -3057,10 +3628,17 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
                 $childExecutableHash = Get-Stage5JsonValue $child 'executableSha256' "$context host child"
                 $childCommandLine = Get-Stage5JsonValue $child 'commandLine' "$context host child"
                 $childExitCode = Get-Stage5JsonValue $child 'exitCode' "$context host child"
+                $childNonceMatchesReceipt = if ($Role -ceq 'combined-results') {
+                    $childNonce -is [string] -and
+                    $childNonce -match '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-5][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$'
+                }
+                else {
+                    $childNonce -ceq $runNonce
+                }
                 Assert-Stage5Condition ($childRole -is [string] -and $childRole -ceq $Role -and
                     $childTitle -is [string] -and @('Generals', 'ZeroHour') -ccontains $childTitle -and
                     -not ($seenChildTitles -contains $childTitle) -and
-                    $childNonce -is [string] -and $childNonce -ceq $runNonce -and
+                    $childNonceMatchesReceipt -and
                     (Test-Stage5JsonInteger $childPid) -and [Int64]$childPid -gt 0 -and
                     $childCreation -is [string] -and $childExecutablePath -is [string] -and
                     -not [string]::IsNullOrWhiteSpace($childExecutablePath) -and
@@ -3083,24 +3661,57 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
                     $childExecutableHash -match '^[0-9A-Fa-f]{64}$' -and
                     $childExecutableHash.ToUpperInvariant() -ceq $childExpectedHash.ToUpperInvariant()) `
                     "$context host child executable SHA-256 binding is stale or substituted."
+                if ($ArtifactPaths -is [Collections.IDictionary]) {
+                    $childRolePath = if ($childTitle -ceq 'Generals') {
+                        'generals-executable'
+                    } else { 'zerohour-executable' }
+                    if ($ArtifactPaths.Contains($childRolePath)) {
+                        Assert-Stage5Condition ([IO.Path]::GetFullPath($childExecutablePath) -ceq
+                            [IO.Path]::GetFullPath([string]$ArtifactPaths[$childRolePath])) `
+                            "$context host child executable path is not the canonical installed artifact."
+                    }
+                }
                 foreach ($streamName in @('stdout', 'stderr')) {
                     $stream = Get-Stage5JsonValue $child $streamName "$context host child"
                     Assert-Stage5JsonShape $stream @('path', 'sha256') "$context host child $streamName"
                     $streamPath = Resolve-Stage5FinalAcceptanceFile (Split-Path -Parent $Path) `
                         (Get-Stage5JsonValue $stream 'path' "$context host child $streamName") `
                         "$context host child $streamName"
-                    Assert-Stage5FinalAcceptanceSha256 $streamPath `
+                    $streamSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $streamPath `
+                        "$context host child $streamName"
+                    Assert-Stage5FinalAcceptanceSnapshotSha256 $streamSnapshot `
                         (Get-Stage5JsonValue $stream 'sha256' "$context host child $streamName") `
                         "$context host child $streamName" | Out-Null
                 }
-                if (@($child.Keys | Where-Object { [string]$_ -ceq 'nativeReceipt' }).Count -gt 0) {
+                if ([bool]$contract.requiresChildProvenance -or
+                    @($child.Keys | Where-Object { [string]$_ -ceq 'nativeReceipt' }).Count -gt 0) {
                     $native = Get-Stage5JsonValue $child 'nativeReceipt' "$context host child"
                     Assert-Stage5JsonShape $native @('path', 'sha256', 'producer',
-                        'runNonce') "$context host child nativeReceipt"
-                    $expectedNativeProducer = "game-executable-stage5-$Role-v2"
-                    Assert-Stage5Condition ((Get-Stage5JsonValue $native 'producer' "$context host child nativeReceipt") -is [string] -and
-                        (Get-Stage5JsonValue $native 'producer' "$context host child nativeReceipt") -ceq $expectedNativeProducer -and
-                        (Get-Stage5JsonValue $native 'runNonce' "$context host child nativeReceipt") -ceq $runNonce) `
+                        'runNonce', 'cohortNonce') "$context host child nativeReceipt"
+                    $nativeProducer = Get-Stage5JsonValue $native 'producer' "$context host child nativeReceipt"
+                    $nativeProducerAllowlist = @()
+                    if (@($contract.PSObject.Properties.Name) -contains
+                        'hostChildNativeProducers') {
+                        $nativeProducerAllowlist = @($contract.hostChildNativeProducers)
+                    }
+                    if ($nativeProducerAllowlist.Count -eq 0) {
+                        throw "$context has no installed native producer contract for role '$Role'."
+                    }
+                    $expectedNativeProducer = ($nativeProducerAllowlist | ForEach-Object {
+                        [regex]::Escape([string]$_)
+                    }) -join '|'
+                    $nativeCohortValid = (Get-Stage5JsonValue $native 'cohortNonce' `
+                        "$context host child nativeReceipt") -ceq $cohortNonce
+                    $nativeNonceValid = if ($Role -ceq 'combined-results') {
+                        (Get-Stage5JsonValue $native 'runNonce' "$context host child nativeReceipt") -match
+                            '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-5][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$'
+                    }
+                    else {
+                        (Get-Stage5JsonValue $native 'runNonce' "$context host child nativeReceipt") -ceq $runNonce
+                    }
+                    Assert-Stage5Condition ($nativeProducer -is [string] -and
+                        $nativeProducer -match "^(?:$expectedNativeProducer)$" -and
+                        $nativeNonceValid -and $nativeCohortValid) `
                         "$context host child native receipt producer or nonce is invalid."
                     $nativePath = Resolve-Stage5FinalAcceptanceFile (Split-Path -Parent $Path) `
                         (Get-Stage5JsonValue $native 'path' "$context host child nativeReceipt") `
@@ -3112,10 +3723,13 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
                         "$context host child nativeReceipt" | Out-Null
                     $nativeDocument = ConvertFrom-Stage5FinalAcceptanceJsonSnapshot $nativeSnapshot `
                         "$context host child nativeReceipt"
-                    Assert-Stage5JsonShape $nativeDocument @('schemaVersion',
+                    Assert-Stage5JsonProperties $nativeDocument @('schemaVersion',
                         'evidenceKind', 'status', 'producer', 'producerVersion',
                         'runNonce', 'sourceCommit', 'artifactSetSha256',
-                        'executableSha256') "$context host child nativeReceipt"
+                        'executableSha256', 'cohortNonce', 'runtimeClosure',
+                        'role', 'title', 'architecture', 'cohortCreatedUtc',
+                        'recordedUtc', 'rawLogs', 'provenance') `
+                        "$context host child nativeReceipt"
                     $nativeReceiptExecutableHash = Get-Stage5JsonValue $nativeDocument `
                         'executableSha256' "$context host child nativeReceipt"
                     Assert-Stage5Condition ((Get-Stage5JsonValue $nativeDocument `
@@ -3126,11 +3740,12 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
                         (Get-Stage5JsonValue $nativeDocument 'status' `
                             "$context host child nativeReceipt") -ceq 'passed' -and
                         (Get-Stage5JsonValue $nativeDocument 'producer' `
-                            "$context host child nativeReceipt") -ceq $expectedNativeProducer -and
+                            "$context host child nativeReceipt") -match "^(?:$expectedNativeProducer)$" -and
                         (Get-Stage5JsonValue $nativeDocument 'producerVersion' `
                             "$context host child nativeReceipt") -ceq '2' -and
-                        (Get-Stage5JsonValue $nativeDocument 'runNonce' `
-                            "$context host child nativeReceipt") -ceq $runNonce -and
+                        ((Get-Stage5JsonValue $nativeDocument 'runNonce' `
+                            "$context host child nativeReceipt") -match
+                            '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-5][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$') -and
                         (Get-Stage5JsonValue $nativeDocument 'sourceCommit' `
                             "$context host child nativeReceipt") -ceq $ExpectedSourceCommit -and
                         (Get-Stage5JsonValue $nativeDocument 'artifactSetSha256' `
@@ -3140,6 +3755,18 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
                         $nativeReceiptExecutableHash.ToUpperInvariant() -ceq
                             $childExpectedHash.ToUpperInvariant()) `
                         "$context host child native receipt is stale, substituted, or from the wrong role."
+                    Assert-Stage5Condition ((Get-Stage5JsonValue $nativeDocument 'cohortNonce' `
+                        "$context host child nativeReceipt") -ceq $cohortNonce) `
+                        "$context host child native receipt cohort is stale or detached."
+                    [void](Assert-Stage5RuntimeClosureBinding `
+                        (Get-Stage5JsonValue $nativeDocument 'runtimeClosure' `
+                            "$context host child nativeReceipt") $runtimeClosure `
+                        "$context host child nativeReceipt")
+                    [void](Assert-Stage5NativeV2ReceiptProvenance `
+                        $nativeDocument "$context host child nativeReceipt" `
+                        $childTitle $childExecutablePath $childExpectedHash `
+                        ([int]$childPid) $childCreation $ExpectedCohortCreatedUtc `
+                        $nativePath (Split-Path -Parent $Path))
                 }
                 $seenChildTitles.Add($childTitle) | Out-Null
             }
@@ -3147,6 +3774,17 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
                 Assert-Stage5Condition ($seenChildTitles -contains 'Generals' -and
                     $seenChildTitles -contains 'ZeroHour') `
                     "$context host provenance does not bind both title processes."
+            }
+            if ($Role -ceq 'combined-results') {
+                Assert-Stage5CombinedHostSourceBindings `
+                    -Path $Path -Details $details `
+                    -ValidatedRawLogs $validatedRawLogs.ToArray() `
+                    -Children $children -ExpectedSourceCommit $ExpectedSourceCommit `
+                    -ExpectedArtifactSetSha256 $ExpectedArtifactSetSha256 `
+                    -ArtifactHashes $ArtifactHashes -SeenRunNonces $SeenRunNonces `
+                    -CombinedRunNonce $runNonce `
+                    -ExpectedCohortNonce $cohortNonce `
+                    -ExpectedRuntimeClosure $runtimeClosure
             }
         }
         else {
@@ -3172,25 +3810,41 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
                 "$context native provenance receipt" | Out-Null
             $nativeDocument = ConvertFrom-Stage5FinalAcceptanceJsonSnapshot $nativeSnapshot `
                 "$context native receipt"
-            Assert-Stage5JsonShape $nativeDocument @('schemaVersion', 'evidenceKind',
+            Assert-Stage5JsonProperties $nativeDocument @('schemaVersion', 'evidenceKind',
                 'status', 'producer', 'producerVersion', 'runNonce',
-                'sourceCommit', 'artifactSetSha256', 'executableSha256') `
+                'sourceCommit', 'artifactSetSha256', 'executableSha256',
+                'cohortNonce', 'runtimeClosure', 'role', 'title', 'architecture',
+                'cohortCreatedUtc', 'recordedUtc', 'rawLogs', 'provenance') `
                 "$context native receipt"
-            Assert-Stage5Condition ((Get-Stage5JsonValue $nativeDocument 'evidenceKind' "$context native receipt") -ceq
-                'stage5-executable-originated-receipt' -and
-                (Get-Stage5JsonValue $nativeDocument 'status' "$context native receipt") -ceq 'passed' -and
-                (Get-Stage5JsonValue $nativeDocument 'producer' "$context native receipt") -ceq
-                    "game-executable-stage5-$Role-v2" -and
-                (Get-Stage5JsonValue $nativeDocument 'producerVersion' "$context native receipt") -ceq '2' -and
-                (Get-Stage5JsonValue $nativeDocument 'runNonce' "$context native receipt") -ceq $runNonce -and
-                (Get-Stage5JsonValue $nativeDocument 'sourceCommit' "$context native receipt") -ceq $ExpectedSourceCommit -and
-                (Get-Stage5JsonValue $nativeDocument 'artifactSetSha256' "$context native receipt").ToUpperInvariant() -ceq
-                    $ExpectedArtifactSetSha256.ToUpperInvariant()) `
-                "$context native receipt identity is stale, substituted, or from the wrong role."
             $nativeExpectedExecutable = if ($EvidenceTitle -ceq 'Generals') {
                 $expectedGenerals
             }
             else { $expectedZeroHour }
+            [void](Assert-Stage5NativeV2ReceiptProvenance `
+                $nativeDocument "$context native receipt" $EvidenceTitle `
+                ([string](Get-Stage5JsonValue $provenance 'executablePath' `
+                    "$context native provenance")) `
+                $nativeExpectedExecutable `
+                ([int](Get-Stage5JsonValue $provenance 'processId' `
+                    "$context native provenance")) `
+                ([string](Get-Stage5JsonValue $provenance 'processCreationUtc' `
+                    "$context native provenance")) `
+                $ExpectedCohortCreatedUtc $nativeReceiptPath (Split-Path -Parent $Path))
+            Assert-Stage5Condition ((Get-Stage5JsonValue $nativeDocument 'evidenceKind' "$context native receipt") -ceq
+                'stage5-executable-originated-receipt' -and
+                (Get-Stage5JsonValue $nativeDocument 'status' "$context native receipt") -ceq 'passed' -and
+                (Get-Stage5JsonValue $nativeDocument 'producer' "$context native receipt") -ceq
+                    'game-executable-stage5-performance-report-v2' -and
+                (Get-Stage5JsonValue $nativeDocument 'producerVersion' "$context native receipt") -ceq '2' -and
+                (Get-Stage5JsonValue $nativeDocument 'runNonce' "$context native receipt") -ceq $runNonce -and
+                (Get-Stage5JsonValue $nativeDocument 'sourceCommit' "$context native receipt") -ceq $ExpectedSourceCommit -and
+                (Get-Stage5JsonValue $nativeDocument 'artifactSetSha256' "$context native receipt").ToUpperInvariant() -ceq
+                    $ExpectedArtifactSetSha256.ToUpperInvariant() -and
+                (Get-Stage5JsonValue $nativeDocument 'cohortNonce' "$context native receipt") -ceq $cohortNonce) `
+                "$context native receipt identity is stale, substituted, or from the wrong role."
+            [void](Assert-Stage5RuntimeClosureBinding `
+                (Get-Stage5JsonValue $nativeDocument 'runtimeClosure' "$context native receipt") `
+                $runtimeClosure "$context native receipt")
             $nativeReceiptExecutableHash = Get-Stage5JsonValue $nativeDocument `
                 'executableSha256' "$context native receipt"
             Assert-Stage5Condition ($nativeReceiptExecutableHash -is [string] -and
@@ -3271,7 +3925,9 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
                 $fixtureStress -is [bool]) "$context reviewed fixture entry is malformed or duplicated."
             $fixturePath = Resolve-Stage5FinalAcceptanceFile (Split-Path -Parent $manifestPath) `
                 $fixtureSource "$context reviewed fixture '$fixtureId'"
-            Assert-Stage5FinalAcceptanceSha256 $fixturePath $fixtureExpectedHash `
+            $fixtureSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $fixturePath `
+                "$context reviewed fixture '$fixtureId'"
+            Assert-Stage5FinalAcceptanceSnapshotSha256 $fixtureSnapshot $fixtureExpectedHash `
                 "$context reviewed fixture '$fixtureId'" | Out-Null
             if ([bool]$fixtureStress) { ++$stressCount }
             $fixtureIds.Add($fixtureId) | Out-Null
@@ -3284,7 +3940,9 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
                     $mapPath = Resolve-Stage5FinalAcceptanceFile (Split-Path -Parent $manifestPath) `
                         (Get-Stage5JsonValue $map 'source' "$context reviewed fixture '$fixtureId' map") `
                         "$context reviewed fixture '$fixtureId' map"
-                    Assert-Stage5FinalAcceptanceSha256 $mapPath `
+                    $mapSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $mapPath `
+                        "$context reviewed fixture '$fixtureId' map"
+                    Assert-Stage5FinalAcceptanceSnapshotSha256 $mapSnapshot `
                         (Get-Stage5JsonValue $map 'sha256' "$context reviewed fixture '$fixtureId' map") `
                         "$context reviewed fixture '$fixtureId' map" | Out-Null
                 }
@@ -3382,6 +4040,40 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
                 (Get-Stage5JsonValue $details 'bothTitlesPassed' "$context details") -is [bool] -and
                 (Get-Stage5JsonValue $details 'bothTitlesPassed' "$context details")) `
                 "$context role details are not semantically valid."
+            $sourceReceipts = Get-Stage5JsonValue $details 'sourceReceipts' "$context details"
+            Assert-Stage5Condition ($sourceReceipts -is [Array] -and
+                $sourceReceipts.Count -eq 2) `
+                "$context must identify exactly one Generals and one Zero Hour source receipt."
+            $sourceTitles = New-Object 'Collections.Generic.List[string]'
+            $sourcePaths = New-Object 'Collections.Generic.List[string]'
+            $sourceNonces = New-Object 'Collections.Generic.List[string]'
+            foreach ($source in $sourceReceipts) {
+                Assert-Stage5JsonShape $source @('title', 'path', 'sha256', 'runNonce',
+                    'cohortNonce') `
+                    "$context source receipt"
+                $sourceTitle = Get-Stage5JsonValue $source 'title' "$context source receipt"
+                $sourcePath = Get-Stage5JsonValue $source 'path' "$context source receipt"
+                $sourceHash = Get-Stage5JsonValue $source 'sha256' "$context source receipt"
+                $sourceNonce = Get-Stage5JsonValue $source 'runNonce' "$context source receipt"
+                Assert-Stage5Condition ($sourceTitle -is [string] -and
+                    @('Generals', 'ZeroHour') -ccontains $sourceTitle -and
+                    -not ($sourceTitles -contains $sourceTitle) -and
+                    $sourcePath -is [string] -and
+                    -not [IO.Path]::IsPathRooted($sourcePath) -and
+                    $sourcePath -notmatch '(^|[\\/])\.\.([\\/]|$)' -and
+                    $sourceHash -is [string] -and
+                    $sourceHash -match '^[0-9A-Fa-f]{64}$' -and
+                    $sourceNonce -is [string] -and
+                    $sourceNonce -match '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-5][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$' -and
+                    -not ($sourcePaths -contains $sourcePath.ToLowerInvariant()) -and
+                    -not ($sourceNonces -contains $sourceNonce)) `
+                    "$context source receipt binding is malformed, duplicated, or unsafe."
+                $sourceTitles.Add($sourceTitle) | Out-Null
+                $sourcePaths.Add($sourcePath.ToLowerInvariant()) | Out-Null
+                $sourceNonces.Add($sourceNonce) | Out-Null
+            }
+            Assert-Stage5FinalAcceptanceStringSet $sourceTitles.ToArray() `
+                @('Generals', 'ZeroHour') "$context source receipt titles"
         }
         'premium-review-results' {
             $reviewedCommit = Get-Stage5JsonValue $details 'reviewedCommit' "$context details"
@@ -3425,6 +4117,8 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
         runNonce = $runNonce
         producer = $producer
         producerVersion = $producerVersion
+        cohortNonce = $cohortNonce
+        runtimeClosure = $runtimeClosure
         rawLogs = $validatedRawLogs.ToArray()
         provenance = $provenance
         protection = $protection
@@ -3435,7 +4129,8 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
 function Assert-Stage5FinalAcceptanceDetails {
     param([string]$Kind, [object]$Details, [string]$SourceCommit,
         [Collections.IDictionary]$EvidenceHashes,
-        [string]$MixedNativeEvidenceSha256 = $null)
+        [string]$MixedNativeEvidenceSha256 = $null,
+        [object]$MixedNativeEvidence = $null)
     $workerConfigurations = @('serial-1', 'parallel-1', 'parallel-2',
         'parallel-4', 'parallel-8', 'parallel-16', 'parallel-auto')
     switch ($Kind) {
@@ -3582,6 +4277,16 @@ function Assert-Stage5FinalAcceptanceDetails {
                 'crossEpochRejected', 'contentMismatchRejected')) {
                 Assert-Stage5FinalAcceptanceBoolean `
                     (Get-Stage5JsonValue $Details $name "$Kind details") "$Kind $name"
+            }
+            if ($null -ne $MixedNativeEvidence) {
+                Assert-Stage5Condition ([bool]$MixedNativeEvidence.crossEpochRejected -and
+                    [bool]$MixedNativeEvidence.contentMismatchRejected) `
+                    "$Kind native lockstep evidence did not prove both observed negative probes."
+                Assert-Stage5Condition ([bool](Get-Stage5JsonValue $Details 'crossEpochRejected' "$Kind details") -eq
+                    [bool]$MixedNativeEvidence.crossEpochRejected -and
+                    [bool](Get-Stage5JsonValue $Details 'contentMismatchRejected' "$Kind details") -eq
+                    [bool]$MixedNativeEvidence.contentMismatchRejected) `
+                    "$Kind negative-probe summary is detached from the native lockstep evidence."
             }
             $nativeBindingHash = $MixedNativeEvidenceSha256
             if ([string]::IsNullOrWhiteSpace($nativeBindingHash) -and
@@ -4107,8 +4812,27 @@ function Get-Stage5ScalingRunCommand {
 
 function Read-Stage5PerformanceScalingTopologyReceipt {
     param([string]$Path, [string]$ExpectedSourceCommit,
-        [string]$ExpectedExecutableSha256, [string]$ExpectedTitle)
-    $document = ConvertFrom-Stage5JsonDictionary $Path
+        [string]$ExpectedExecutableSha256, [string]$ExpectedTitle,
+        [object]$Snapshot = $null, [string]$ExpectedSnapshotSha256 = '')
+    $full = [IO.Path]::GetFullPath($Path)
+    if ($null -eq $Snapshot) {
+        $Snapshot = Get-Stage5FinalAcceptanceFileSnapshot $full `
+            'Stage 5 scaling topology receipt'
+    }
+    else {
+        Assert-Stage5Condition (-not [string]::IsNullOrWhiteSpace($ExpectedSnapshotSha256)) `
+            'Stage 5 scaling topology caller-supplied snapshot must include its independently expected SHA-256.'
+    }
+    Assert-Stage5Condition ($Snapshot.PSObject.Properties.Name -contains 'path' -and
+        [IO.Path]::GetFullPath([string]$Snapshot.path) -ceq $full) `
+        'Stage 5 scaling topology snapshot is bound to a different path.'
+    if ([string]::IsNullOrWhiteSpace($ExpectedSnapshotSha256)) {
+        $ExpectedSnapshotSha256 = [string]$Snapshot.sha256
+    }
+    Assert-Stage5FinalAcceptanceSnapshotSha256 $Snapshot $ExpectedSnapshotSha256 `
+        'Stage 5 scaling topology receipt' | Out-Null
+    $document = ConvertFrom-Stage5FinalAcceptanceJsonSnapshot $Snapshot `
+        'Stage 5 scaling topology receipt'
     Assert-Stage5JsonShape $document @('schemaVersion', 'producer', 'source',
         'sourceCommit', 'executableSha256', 'processId', 'commandLine',
         'logicalProcessors', 'selectedLanes') 'Stage 5 scaling topology receipt'
@@ -4206,9 +4930,27 @@ function Read-Stage5PerformanceScalingTopologyReceipt {
 function Read-Stage5PerformanceScalingRawSamples {
     param([string]$Path, [string]$ExpectedSourceCommit,
         [string]$ExpectedArtifactSetSha256, [string]$ExpectedExecutableSha256,
-        [string]$ExpectedStage3BaselineSha256, [string]$ExpectedTitle)
+        [string]$ExpectedStage3BaselineSha256, [string]$ExpectedTitle,
+        [object]$Snapshot = $null, [string]$ExpectedSnapshotSha256 = '')
     $full = [IO.Path]::GetFullPath($Path)
-    $document = ConvertFrom-Stage5JsonDictionary $full
+    if ($null -eq $Snapshot) {
+        $Snapshot = Get-Stage5FinalAcceptanceFileSnapshot $full `
+            'Stage 5 scaling raw-sample manifest'
+    }
+    else {
+        Assert-Stage5Condition (-not [string]::IsNullOrWhiteSpace($ExpectedSnapshotSha256)) `
+            'Stage 5 scaling raw-sample caller-supplied snapshot must include its independently expected SHA-256.'
+    }
+    Assert-Stage5Condition ($Snapshot.PSObject.Properties.Name -contains 'path' -and
+        [IO.Path]::GetFullPath([string]$Snapshot.path) -ceq $full) `
+        'Stage 5 scaling raw-sample snapshot is bound to a different path.'
+    if ([string]::IsNullOrWhiteSpace($ExpectedSnapshotSha256)) {
+        $ExpectedSnapshotSha256 = [string]$Snapshot.sha256
+    }
+    Assert-Stage5FinalAcceptanceSnapshotSha256 $Snapshot $ExpectedSnapshotSha256 `
+        'Stage 5 scaling raw-sample manifest' | Out-Null
+    $document = ConvertFrom-Stage5FinalAcceptanceJsonSnapshot $Snapshot `
+        'Stage 5 scaling raw-sample manifest'
     Assert-Stage5JsonShape $document @('schemaVersion', 'evidenceKind', 'producer',
         'sourceCommit', 'artifactSetSha256', 'title', 'executableSha256',
         'stage3SourceCommit', 'stage3ExecutableSha256', 'stage3BaselineSha256',
@@ -4247,11 +4989,14 @@ function Read-Stage5PerformanceScalingRawSamples {
     $topologyPath = Resolve-Stage5FinalAcceptanceFile (Split-Path -Parent $full) `
         (Get-Stage5JsonValue $topologyEntry 'path' 'Stage 5 scaling topology receipt reference') `
         'Stage 5 scaling topology receipt'
-    $topologySha256 = Assert-Stage5FinalAcceptanceSha256 $topologyPath `
+    $topologySnapshot = Get-Stage5FinalAcceptanceFileSnapshot $topologyPath `
+        'Stage 5 scaling topology receipt'
+    $topologySha256 = Assert-Stage5FinalAcceptanceSnapshotSha256 $topologySnapshot `
         (Get-Stage5JsonValue $topologyEntry 'sha256' 'Stage 5 scaling topology receipt reference') `
         'Stage 5 scaling topology receipt'
     $topology = Read-Stage5PerformanceScalingTopologyReceipt $topologyPath `
-        $ExpectedSourceCommit $ExpectedExecutableSha256 $ExpectedTitle
+        $ExpectedSourceCommit $ExpectedExecutableSha256 $ExpectedTitle `
+        $topologySnapshot $topologySha256
 
     $fixtureNames = @('one-thousand-units', 'four-thousand-units',
         'eight-thousand-units', 'dense-eight-player')
@@ -4433,7 +5178,7 @@ function Read-Stage5PerformanceScalingRawSamples {
         }
     }
     return [pscustomobject]@{
-        manifestSha256 = Get-Stage5FinalAcceptanceFileSha256 $full
+        manifestSha256 = [string]$Snapshot.sha256
         topologySha256 = $topologySha256
         topology = $topology
         repeatCount = $repeatCount
@@ -4450,11 +5195,26 @@ function Read-Stage5PerformanceScalingEvidence {
         [string]$ExpectedArtifactSetSha256,
         [string]$ExpectedExecutableSha256,
         [string]$ExpectedStage3BaselineSha256,
-        [ValidateSet('Generals', 'ZeroHour')][string]$ExpectedTitle = 'ZeroHour'
+        [ValidateSet('Generals', 'ZeroHour')][string]$ExpectedTitle = 'ZeroHour',
+        [object]$Snapshot = $null, [string]$ExpectedSnapshotSha256 = ''
     )
     $full = [IO.Path]::GetFullPath($Path)
-    Assert-Stage5Condition (Test-Path -LiteralPath $full -PathType Leaf) `
-        "Stage 5 scaling evidence was not found: $full"
+    if ($null -eq $Snapshot) {
+        $Snapshot = Get-Stage5FinalAcceptanceFileSnapshot $full `
+            'Stage 5 scaling evidence'
+    }
+    else {
+        Assert-Stage5Condition (-not [string]::IsNullOrWhiteSpace($ExpectedSnapshotSha256)) `
+            'Stage 5 scaling evidence caller-supplied snapshot must include its independently expected SHA-256.'
+    }
+    Assert-Stage5Condition ($Snapshot.PSObject.Properties.Name -contains 'path' -and
+        [IO.Path]::GetFullPath([string]$Snapshot.path) -ceq $full) `
+        'Stage 5 scaling evidence snapshot is bound to a different path.'
+    if ([string]::IsNullOrWhiteSpace($ExpectedSnapshotSha256)) {
+        $ExpectedSnapshotSha256 = [string]$Snapshot.sha256
+    }
+    Assert-Stage5FinalAcceptanceSnapshotSha256 $Snapshot $ExpectedSnapshotSha256 `
+        'Stage 5 scaling evidence' | Out-Null
     Assert-Stage5Condition ($ExpectedSourceCommit -match '^[0-9a-f]{40}$') `
         'ExpectedSourceCommit must be an independently supplied lowercase 40-hex commit.'
     foreach ($binding in @(
@@ -4465,7 +5225,8 @@ function Read-Stage5PerformanceScalingEvidence {
         Assert-Stage5Condition ($binding[1] -match '^[0-9A-F]{64}$') `
             "$($binding[0]) must be an independently supplied uppercase SHA-256."
     }
-    $document = ConvertFrom-Stage5JsonDictionary $full
+    $document = ConvertFrom-Stage5FinalAcceptanceJsonSnapshot $Snapshot `
+        'Stage 5 scaling evidence'
     Assert-Stage5JsonShape $document @('schemaVersion', 'evidenceKind', 'status',
         'sourceCommit', 'artifactSetSha256', 'title', 'executableSha256',
         'stage3BaselineSha256', 'rawSampleManifest', 'topology',
@@ -4497,12 +5258,14 @@ function Read-Stage5PerformanceScalingEvidence {
     $rawPath = Resolve-Stage5FinalAcceptanceFile (Split-Path -Parent $full) `
         (Get-Stage5JsonValue $rawEntry 'path' 'Stage 5 scaling raw-sample manifest reference') `
         'Stage 5 scaling raw-sample manifest'
-    $rawManifestSha256 = Assert-Stage5FinalAcceptanceSha256 $rawPath `
+    $rawSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $rawPath `
+        'Stage 5 scaling raw-sample manifest'
+    $rawManifestSha256 = Assert-Stage5FinalAcceptanceSnapshotSha256 $rawSnapshot `
         (Get-Stage5JsonValue $rawEntry 'sha256' 'Stage 5 scaling raw-sample manifest reference') `
         'Stage 5 scaling raw-sample manifest'
     $raw = Read-Stage5PerformanceScalingRawSamples $rawPath $ExpectedSourceCommit `
         $ExpectedArtifactSetSha256 $ExpectedExecutableSha256 `
-        $ExpectedStage3BaselineSha256 $ExpectedTitle
+        $ExpectedStage3BaselineSha256 $ExpectedTitle $rawSnapshot $rawManifestSha256
     Assert-Stage5Condition ($raw.manifestSha256 -ceq $rawManifestSha256) `
         'Stage 5 scaling raw-sample manifest hash changed during validation.'
 
@@ -4710,7 +5473,7 @@ function Read-Stage5PerformanceScalingEvidence {
     return [pscustomobject]@{
         sourceCommit = $ExpectedSourceCommit
         artifactSetSha256 = $ExpectedArtifactSetSha256
-        evidenceManifestSha256 = Get-Stage5FinalAcceptanceFileSha256 $full
+        evidenceManifestSha256 = [string]$Snapshot.sha256
         rawSampleManifestSha256 = $rawManifestSha256
         executableSha256 = $ExpectedExecutableSha256
         physicalCoreCount = [int]$physicalCores
@@ -4796,16 +5559,69 @@ function Get-Stage5LockstepReceiptDigest {
     return $hash
 }
 
+function Get-Stage5LockstepReceiptAIPlanningDigest {
+    param([Collections.IDictionary]$Pairs)
+    Add-Type -AssemblyName System.Numerics
+    [Numerics.BigInteger]$hash = [Numerics.BigInteger]::Parse('14695981039346656037')
+    [Numerics.BigInteger]$prime = [Numerics.BigInteger]::Parse('1099511628211')
+    [Numerics.BigInteger]$mask = [Numerics.BigInteger]::Parse('18446744073709551615')
+    function Update-Stage5LockstepAIPlanningFnv {
+        param([Numerics.BigInteger]$Hash, [UInt64]$Value, [int]$Bytes,
+            [Numerics.BigInteger]$Prime, [Numerics.BigInteger]$Mask)
+        $updated = $Hash
+        for ($byteIndex = 0; $byteIndex -lt $Bytes; ++$byteIndex) {
+            $updated = (($updated -bxor
+                ([Numerics.BigInteger]($Value -band 255))) * $Prime) -band $Mask
+            $Value = $Value -shr 8
+        }
+        return $updated
+    }
+    $hash = Update-Stage5LockstepAIPlanningFnv $hash `
+        (ConvertTo-Stage5LockstepReceiptUInt32 $Pairs['simulation_roster_mask'] `
+            'simulation_roster_mask') 4 $prime $mask
+    $hash = Update-Stage5LockstepAIPlanningFnv $hash `
+        (ConvertTo-Stage5LockstepReceiptUInt32 $Pairs['ai_roster_mask'] `
+            'ai_roster_mask') 4 $prime $mask
+    foreach ($field in @(
+        'captured_snapshots', 'captured_candidates', 'requested_batches',
+        'submitted_jobs', 'completed_jobs', 'serial_fallbacks',
+        'shadow_matches', 'shadow_mismatches', 'validation_failures',
+        'canonical_validation_invocations', 'committed_batches',
+        'parallel_authoritative_commits', 'rejected_commits',
+        'owner_helped_executions')) {
+        $hash = Update-Stage5LockstepAIPlanningFnv $hash `
+            (ConvertTo-Stage5LockstepReceiptUInt64 $Pairs["ai_planning_$field"] `
+                "ai_planning_$field") 8 $prime $mask
+    }
+    return $hash
+}
+
 function Get-Stage5LockstepReceiptProjectionSha256 {
     param([Collections.IDictionary]$Pairs)
     $projection = [ordered]@{}
     foreach ($key in @('mode', 'schema', 'protocol_epoch', 'peer_count', 'roster_mask',
-        'build_compatibility_crc', 'content_crc', 'map_crc', 'common_stop_frame',
+        'simulation_roster_mask', 'ai_roster_mask', 'build_compatibility_crc',
+        'content_crc', 'map_crc', 'common_stop_frame',
         'proven_kernel_mask', 'packet_router_slot', 'origin_mode', 'session_nonce',
         'executable_sha256', 'source_revision', 'final_frame', 'frame_count',
         'contributed_peer_mask', 'checkpoint_count', 'validation_authority_mask',
         'executable_origin', 'worker_telemetry_executable_origin',
-        'transport_path_used', 'handshake_validated', 'clean_shutdown')) {
+        'transport_path_used', 'handshake_validated', 'clean_shutdown',
+        'ai_planning_captured_snapshots', 'ai_planning_captured_candidates',
+        'ai_planning_requested_batches', 'ai_planning_submitted_jobs',
+        'ai_planning_completed_jobs', 'ai_planning_serial_fallbacks',
+        'ai_planning_shadow_matches', 'ai_planning_shadow_mismatches',
+        'ai_planning_validation_failures',
+        'ai_planning_canonical_validation_invocations',
+        'ai_planning_committed_batches',
+        'ai_planning_parallel_authoritative_commits',
+        'ai_planning_rejected_commits',
+        'ai_planning_physical_worker_executions',
+        'ai_planning_owner_helped_executions',
+        'ai_planning_observed_physical_worker_mask',
+        'ai_planning_maximum_distinct_physical_workers',
+        'ai_planning_maximum_concurrent_physical_workers',
+        'ai_planning_digest')) {
         $projection[$key] = $Pairs[$key]
     }
     for ($slot = 0; $slot -lt 8; ++$slot) {
@@ -4832,11 +5648,20 @@ function Get-Stage5LockstepReceiptProjectionSha256 {
 }
 
 function Get-Stage5LockstepReceiptPairs {
-    param([string]$Path)
+    param(
+        [string]$Path,
+        [object]$Snapshot = $null
+    )
     $full = [IO.Path]::GetFullPath($Path)
-    Assert-Stage5Condition (Test-Path -LiteralPath $full -PathType Leaf) `
-        "Lockstep-v2 receipt was not found: $full"
-    $text = [IO.File]::ReadAllText($full)
+    if ($null -eq $Snapshot) {
+        $Snapshot = Get-Stage5FinalAcceptanceFileSnapshot $full `
+            'Lockstep-v2 receipt'
+    }
+    Assert-Stage5Condition ($null -ne $Snapshot -and
+        $Snapshot.PSObject.Properties.Name -contains 'path' -and
+        [IO.Path]::GetFullPath([string]$Snapshot.path) -ceq $full) `
+        "Lockstep-v2 receipt snapshot is bound to a different path: $full"
+    $text = [Text.Encoding]::UTF8.GetString([byte[]]$Snapshot.bytes)
     Assert-Stage5Condition ($text.IndexOf("`r", [StringComparison]::Ordinal) -lt 0) `
         "Lockstep-v2 receipt contains non-canonical CR line endings: $full"
     $lines = $text.Split(@("`n"), [StringSplitOptions]::None)
@@ -4869,13 +5694,29 @@ function Get-Stage5LockstepReceiptPairs {
         "Lockstep-v2 receipt must contain exactly 129 checkpoints: $full"
     $expectedKeys = New-Object 'Collections.Generic.List[string]'
     foreach ($key in @('producer', 'mode', 'schema', 'protocol_epoch', 'local_slot',
-        'peer_count', 'roster_mask', 'build_compatibility_crc', 'content_crc',
+        'peer_count', 'roster_mask', 'simulation_roster_mask', 'ai_roster_mask',
+        'build_compatibility_crc', 'content_crc',
         'map_crc', 'common_stop_frame', 'proven_kernel_mask', 'packet_router_slot',
         'origin_mode', 'run_nonce', 'session_nonce', 'executable_sha256',
-        'source_revision', 'network_session_token', 'final_frame', 'frame_count',
-        'contributed_peer_mask', 'checkpoint_count', 'validation_authority_mask',
-        'executable_origin', 'worker_telemetry_executable_origin',
-        'transport_path_used', 'handshake_validated', 'clean_shutdown')) {
+         'source_revision', 'network_session_token', 'final_frame', 'frame_count',
+         'contributed_peer_mask', 'checkpoint_count', 'validation_authority_mask',
+         'executable_origin', 'worker_telemetry_executable_origin',
+         'transport_path_used', 'handshake_validated', 'clean_shutdown',
+         'ai_planning_captured_snapshots', 'ai_planning_captured_candidates',
+         'ai_planning_requested_batches', 'ai_planning_submitted_jobs',
+         'ai_planning_completed_jobs', 'ai_planning_serial_fallbacks',
+         'ai_planning_shadow_matches', 'ai_planning_shadow_mismatches',
+         'ai_planning_validation_failures',
+         'ai_planning_canonical_validation_invocations',
+         'ai_planning_committed_batches',
+         'ai_planning_parallel_authoritative_commits',
+         'ai_planning_rejected_commits',
+         'ai_planning_physical_worker_executions',
+         'ai_planning_owner_helped_executions',
+         'ai_planning_observed_physical_worker_mask',
+         'ai_planning_maximum_distinct_physical_workers',
+         'ai_planning_maximum_concurrent_physical_workers',
+         'ai_planning_digest')) {
         $expectedKeys.Add($key) | Out-Null
     }
     for ($slot = 0; $slot -lt 8; ++$slot) {
@@ -4904,7 +5745,9 @@ function Get-Stage5LockstepReceiptPairs {
         Assert-Stage5Condition ($actualKeys[$index] -ceq $expectedKeys[$index]) `
             "Lockstep-v2 receipt field order/shape mismatch at ${index}: $full"
     }
-    return [pscustomobject]@{ path = $full; pairs = $pairs; text = $text }
+    return [pscustomobject]@{
+        path = $full; pairs = $pairs; text = $text; snapshot = $Snapshot
+    }
 }
 
 function Read-Stage5LockstepV2Receipt {
@@ -4916,9 +5759,10 @@ function Read-Stage5LockstepV2Receipt {
         [string]$ExpectedRunNonce,
         [string]$ExpectedSessionNonce,
         [string]$ExpectedExecutableSha256,
-        [string]$ExpectedSourceCommit
+        [string]$ExpectedSourceCommit,
+        [object]$Snapshot = $null
     )
-    $parsed = Get-Stage5LockstepReceiptPairs $Path
+    $parsed = Get-Stage5LockstepReceiptPairs $Path $Snapshot
     $pairs = $parsed.pairs
     $context = "Lockstep-v2 receipt '$Path'"
     Assert-Stage5Condition ($pairs['producer'] -ceq 'installed-lockstep-v2' -and
@@ -4928,6 +5772,7 @@ function Read-Stage5LockstepV2Receipt {
         @('schema', 2), @('protocol_epoch', 2),
         @('local_slot', $ExpectedLocalSlot), @('peer_count', $ExpectedPeerCount),
         @('roster_mask', ((1 -shl $ExpectedPeerCount) - 1)),
+        @('simulation_roster_mask', 63), @('ai_roster_mask', 60),
         @('map_crc', $ExpectedMapCrc), @('common_stop_frame', 4096),
         @('proven_kernel_mask', 63), @('packet_router_slot', 0),
         @('origin_mode', 2), @('final_frame', 4096),
@@ -4944,6 +5789,49 @@ function Read-Stage5LockstepV2Receipt {
             $pairs[$crcField] $crcField) -gt 0) `
             "$context field '$crcField' is not a positive executable-originated CRC."
     }
+    $aiPlanningFields = @(
+        'captured_snapshots', 'captured_candidates', 'requested_batches',
+        'submitted_jobs', 'completed_jobs', 'serial_fallbacks',
+        'shadow_matches', 'shadow_mismatches', 'validation_failures',
+        'canonical_validation_invocations', 'committed_batches',
+        'parallel_authoritative_commits', 'rejected_commits',
+        'physical_worker_executions', 'owner_helped_executions',
+        'observed_physical_worker_mask', 'maximum_distinct_physical_workers',
+        'maximum_concurrent_physical_workers')
+    $aiValues = @{}
+    foreach ($field in $aiPlanningFields) {
+        $aiValues[$field] = ConvertTo-Stage5LockstepReceiptUInt64 `
+            $pairs["ai_planning_$field"] "ai_planning_$field"
+    }
+    Assert-Stage5Condition ($aiValues['captured_snapshots'] -ge 4 -and
+        $aiValues['captured_candidates'] -ge $aiValues['captured_snapshots'] -and
+        $aiValues['requested_batches'] -gt 0 -and
+        $aiValues['submitted_jobs'] -gt 0 -and
+        $aiValues['completed_jobs'] -eq $aiValues['submitted_jobs'] -and
+        $aiValues['serial_fallbacks'] -eq 0 -and
+        $aiValues['shadow_matches'] -gt 0 -and
+        $aiValues['shadow_mismatches'] -eq 0 -and
+        $aiValues['validation_failures'] -eq 0 -and
+        $aiValues['canonical_validation_invocations'] -gt 0 -and
+        $aiValues['committed_batches'] -gt 0 -and
+        $aiValues['parallel_authoritative_commits'] -gt 0 -and
+        $aiValues['parallel_authoritative_commits'] -le $aiValues['committed_batches'] -and
+        $aiValues['rejected_commits'] -eq 0 -and
+        $aiValues['physical_worker_executions'] -ge $aiValues['submitted_jobs'] -and
+        $aiValues['owner_helped_executions'] -eq 0 -and
+        $aiValues['observed_physical_worker_mask'] -ne 0 -and
+        (Get-Stage5UInt64BitCount $aiValues['observed_physical_worker_mask']) -ge 2 -and
+        $aiValues['maximum_distinct_physical_workers'] -ge 2 -and
+        $aiValues['maximum_concurrent_physical_workers'] -ge 2 -and
+        $aiValues['maximum_concurrent_physical_workers'] -le
+            $aiValues['maximum_distinct_physical_workers']) `
+        "$context AI planning telemetry is incomplete, nonparallel, or reports a failure."
+    $aiDigest = ConvertTo-Stage5LockstepReceiptUInt64 `
+        $pairs['ai_planning_digest'] 'ai_planning_digest'
+    Assert-Stage5Condition ($aiDigest -gt 0 -and
+        [Numerics.BigInteger]$aiDigest -eq
+            [Numerics.BigInteger](Get-Stage5LockstepReceiptAIPlanningDigest $pairs)) `
+        "$context AI planning digest is not canonical."
     Assert-Stage5Condition ((ConvertTo-Stage5LockstepReceiptUInt64 `
         $pairs['network_session_token'] 'network_session_token') -gt 0) `
         "$context has no network session token."
@@ -5056,7 +5944,9 @@ function Assert-Stage5LockstepLauncherContract {
         [object]$Contract,
         [string]$Title,
         [Collections.IDictionary]$ArtifactHashes,
-        [string]$Context
+        [string]$Context,
+        [Collections.IDictionary]$ArtifactPaths = $null,
+        [string]$ArtifactRootDirectory = $null
     )
     Assert-Stage5JsonShape $Contract @('schemaVersion', 'mode', 'configPath',
         'configSha256', 'launcherPath', 'launcherSha256', 'directory',
@@ -5131,6 +6021,53 @@ function Assert-Stage5LockstepLauncherContract {
     Assert-Stage5Condition ($Contract['launcherTarget'] -ceq $Contract['directExecutable'] -and
         $Contract['launcherWorkingDirectory'] -ceq $Contract['directWorkingDirectory']) `
         "$Context launcher target is not the direct executable identity."
+    $canonicalPathRoles = @($executableRole, $launcherRole, $configRole)
+    $hasCanonicalArtifactPaths = $ArtifactPaths -is [Collections.IDictionary]
+    foreach ($canonicalRole in $canonicalPathRoles) {
+        if ($hasCanonicalArtifactPaths -and
+            -not $ArtifactPaths.Contains($canonicalRole)) {
+            $hasCanonicalArtifactPaths = $false
+            break
+        }
+    }
+    if ($hasCanonicalArtifactPaths) {
+        $expectedExecutablePath = [IO.Path]::GetFullPath(
+            [string]$ArtifactPaths[$executableRole])
+        $expectedLauncherPath = [IO.Path]::GetFullPath(
+            [string]$ArtifactPaths[$launcherRole])
+        $expectedConfigPath = [IO.Path]::GetFullPath(
+            [string]$ArtifactPaths[$configRole])
+        Assert-Stage5Condition ($expectedExecutablePath -ne '' -and
+            $expectedLauncherPath -ne '' -and $expectedConfigPath -ne '') `
+            "$Context canonical artifact paths are empty."
+        if (-not [string]::IsNullOrWhiteSpace($ArtifactRootDirectory)) {
+            Assert-Stage5FinalAcceptanceNoReparsePath $ArtifactRootDirectory `
+                $expectedExecutablePath "$Context canonical executable"
+            Assert-Stage5FinalAcceptanceNoReparsePath $ArtifactRootDirectory `
+                $expectedLauncherPath "$Context canonical launcher"
+            Assert-Stage5FinalAcceptanceNoReparsePath $ArtifactRootDirectory `
+                $expectedConfigPath "$Context canonical launcher configuration"
+        }
+        else {
+            foreach ($canonicalPath in @($expectedExecutablePath,
+                $expectedLauncherPath, $expectedConfigPath)) {
+                $canonicalItem = Get-Item -LiteralPath $canonicalPath -Force -ErrorAction Stop
+                Assert-Stage5Condition (($canonicalItem.Attributes -band
+                    [IO.FileAttributes]::ReparsePoint) -eq 0) `
+                    "$Context canonical artifact is a reparse point: $canonicalPath"
+            }
+        }
+        Assert-Stage5Condition ([string]$Contract['directExecutable'] -ceq
+            $expectedExecutablePath -and
+            [string]$Contract['launcherTarget'] -ceq $expectedExecutablePath -and
+            [string]$Contract['launcherPath'] -ceq $expectedLauncherPath -and
+            [string]$Contract['configPath'] -ceq $expectedConfigPath -and
+            [string]$Contract['launcherWorkingDirectory'] -ceq
+                ([IO.Path]::GetDirectoryName($expectedExecutablePath)) -and
+            [string]$Contract['directWorkingDirectory'] -ceq
+                ([IO.Path]::GetDirectoryName($expectedExecutablePath))) `
+            "$Context launch paths are not bound to the canonical artifact-set files."
+    }
     return $Contract
 }
 
@@ -5377,7 +6314,7 @@ function Assert-Stage5LockstepPeerLaunchBinding {
         "$Context process arguments do not bind the executable worker override."
     $configuration = $arguments[$markerIndices[0] + 1]
     $portsText = ($Ports | ForEach-Object { [string]$_ }) -join ','
-    $pattern = '^peer=(?<peer>[0-9]+);peers=(?<peers>[0-9]+);ports=(?<ports>[0-9,]+);run=(?<run>[0-9A-F]{32});session=(?<session>[0-9A-F]{32});exe=(?<exe>[0-9A-F]{64});source=(?<source>[0-9a-f]{40});map=(?<map>[^;]+);map_crc=(?<mapCrc>[0-9]+);seed=(?<seed>[0-9]+);dir=(?<dir>[^;]+);receipt=(?<receipt>[^;]+);mode=trusted-router;router=0$'
+    $pattern = '^peer=(?<peer>[0-9]+);peers=(?<peers>[0-9]+);ports=(?<ports>[0-9,]+);run=(?<run>[0-9A-F]{32});session=(?<session>[0-9A-F]{32});exe=(?<exe>[0-9A-F]{64});source=(?<source>[0-9a-f]{40});map=(?<map>[^;]+);map_crc=(?<mapCrc>[0-9]+);seed=(?<seed>[0-9]+);dir=(?<dir>[^;]+);receipt=(?<receipt>[^;]+);mode=trusted-router;router=(?<router>0);network_roster=(?<networkRoster>[0-9]+);simulation_roster=(?<simulationRoster>[0-9]+);ai_roster=(?<aiRoster>[0-9]+)$'
     $match = [regex]::Match($configuration, $pattern)
     Assert-Stage5Condition ($match.Success -and
         $match.Groups['peer'].Value -ceq [string]$PeerIndex -and
@@ -5392,7 +6329,11 @@ function Assert-Stage5LockstepPeerLaunchBinding {
         $match.Groups['seed'].Value -ceq [string]$Seed -and
         [IO.Path]::GetFullPath($match.Groups['dir'].Value) -ceq
             [IO.Path]::GetFullPath($SessionDirectory) -and
-        $match.Groups['receipt'].Value -ceq [string]$Peer['receiptPath']) `
+        $match.Groups['receipt'].Value -ceq [string]$Peer['receiptPath'] -and
+        $match.Groups['router'].Value -ceq '0' -and
+        $match.Groups['networkRoster'].Value -ceq '3' -and
+        $match.Groups['simulationRoster'].Value -ceq '63' -and
+        $match.Groups['aiRoster'].Value -ceq '60') `
         "$Context configuration does not bind the exact peer, port, run, map, or receipt identity."
     Assert-Stage5Condition ($Peer['commandLine'] -is [string] -and
         ([string]$Peer['commandLine']).StartsWith('"' + [string]$LauncherContract['directExecutable'] + '" ',
@@ -5485,16 +6426,266 @@ function Assert-Stage5LockstepWorkerEvidence {
     }
 }
 
+function Get-Stage5LockstepNegativeProbePairs {
+    param(
+        [string]$Path,
+        [object]$Snapshot = $null
+    )
+    $full = [IO.Path]::GetFullPath($Path)
+    if ($null -eq $Snapshot) {
+        $Snapshot = Get-Stage5FinalAcceptanceFileSnapshot $full `
+            'Lockstep-v2 negative probe proof'
+    }
+    Assert-Stage5Condition ($null -ne $Snapshot -and
+        $Snapshot.PSObject.Properties.Name -contains 'path' -and
+        [IO.Path]::GetFullPath([string]$Snapshot.path) -ceq $full) `
+        "Lockstep-v2 negative probe snapshot is bound to a different path: $full"
+    $text = [Text.Encoding]::UTF8.GetString([byte[]]$Snapshot.bytes)
+    Assert-Stage5Condition ($text.IndexOf("`r", [StringComparison]::Ordinal) -lt 0) `
+        "Lockstep-v2 negative probe proof contains non-canonical CR line endings: $full"
+    $lines = $text.Split(@("`n"), [StringSplitOptions]::None)
+    if ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq '') {
+        $lines = $lines[0..($lines.Count - 2)]
+    }
+    $expectedKeys = @(
+        'producer', 'mode', 'schema', 'protocol_epoch', 'run_nonce',
+        'session_nonce', 'executable_sha256', 'source_revision',
+        'probe_build_compatibility_crc', 'probe_content_crc', 'mutation',
+        'baseline_input_sha256', 'input_sha256', 'baseline_accepted',
+        'mutated_accepted', 'expected_error', 'observed_error', 'process_id')
+    Assert-Stage5Condition ($lines.Count -eq ($expectedKeys.Count + 2) -and
+        $lines[0] -ceq 'RTS_LOCKSTEP_V2_NEGATIVE_PROBE' -and
+        $lines[$lines.Count - 1] -ceq 'END') `
+        "Lockstep-v2 negative probe proof is not a canonical v2 document: $full"
+    $pairs = [ordered]@{}
+    for ($index = 0; $index -lt $expectedKeys.Count; ++$index) {
+        $line = $lines[$index + 1]
+        Assert-Stage5Condition ($line.Length -gt 0) `
+            "Lockstep-v2 negative probe proof contains an empty line: $full"
+        $equals = $line.IndexOf('=', [StringComparison]::Ordinal)
+        Assert-Stage5Condition ($equals -gt 0 -and $equals -lt ($line.Length - 1) -and
+            $line.Substring(0, $equals) -match '^[A-Za-z_][A-Za-z0-9_]*$') `
+            "Lockstep-v2 negative probe proof contains a malformed key/value line: $full"
+        $key = $line.Substring(0, $equals)
+        Assert-Stage5Condition ($key -ceq $expectedKeys[$index] -and
+            -not $pairs.Contains($key)) `
+            "Lockstep-v2 negative probe proof field order/shape mismatch at ${index}: $full"
+        $pairs[$key] = $line.Substring($equals + 1)
+    }
+    return [pscustomobject]@{
+        path = $full; pairs = $pairs; text = $text; snapshot = $Snapshot
+    }
+}
+
+function Get-Stage5LockstepNegativeStdoutProof {
+    param([object]$Snapshot, [string]$Context)
+    Assert-Stage5Condition ($null -ne $Snapshot -and
+        $Snapshot.PSObject.Properties.Name -contains 'bytes') `
+        "$Context does not contain a stdout snapshot."
+    $text = [Text.Encoding]::UTF8.GetString([byte[]]$Snapshot.bytes)
+    Assert-Stage5Condition (-not [string]::IsNullOrEmpty($text)) `
+        "$Context did not provide stdout."
+    $lines = @($text -split "`n" | ForEach-Object { $_.TrimEnd("`r") })
+    $passLines = @($lines | Where-Object {
+        $_.StartsWith('LOCKSTEP_V2_NEGATIVE_PROBE_PASS ',
+            [StringComparison]::Ordinal)
+    })
+    Assert-Stage5Condition ($passLines.Count -eq 1) `
+        "$Context must provide exactly one negative-probe pass marker."
+    $match = [regex]::Match($passLines[0],
+        '^LOCKSTEP_V2_NEGATIVE_PROBE_PASS mode=(?<mode>negative-(?:cross-epoch|content-mismatch)) pid=(?<pid>[0-9]+) rejection=(?<error>[A-Za-z]+)$')
+    Assert-Stage5Condition ($match.Success) `
+        "$Context negative-probe pass marker has an unsupported shape."
+    Assert-Stage5Condition ($text -notmatch 'NET3_VALIDATION_PEER_PASS') `
+        "$Context contains a diagnostic NET3 pass marker."
+    return [pscustomobject]@{
+        marker = $passLines[0]
+        mode = $match.Groups['mode'].Value
+        pid = [int]$match.Groups['pid'].Value
+        rejection = $match.Groups['error'].Value
+    }
+}
+
+function Assert-Stage5LockstepNegativeProbeEvidence {
+    param(
+        [object]$Entry,
+        [string]$EvidenceRoot,
+        [string]$ExpectedTitle,
+        [string]$ExpectedMode,
+        [string]$ExpectedSourceCommit,
+        [string]$ExpectedExecutableSha256,
+        [UInt32]$ExpectedMapCrc,
+        [int]$ExpectedSeed,
+        [string]$ExpectedExecutablePath = $null,
+        [string]$ExpectedCohortCreatedUtc = $null
+    )
+    $context = "Lockstep-v2 $ExpectedTitle/$ExpectedMode negative probe"
+    $required = @(
+        'title', 'mode', 'producer', 'processId', 'processCreationUtc',
+        'executablePath', 'runNonce', 'sessionNonce',
+        'executableSha256', 'sourceCommit', 'proofPath', 'proofSha256',
+        'stdoutPath', 'stdoutSha256', 'stderrPath', 'stderrSha256',
+        'inputSha256', 'baselineAccepted', 'mutatedAccepted', 'mutation',
+        'expectedError', 'observedError', 'exitCode', 'commandLine',
+        'arguments', 'probeBuildCrc', 'probeContentCrc')
+    Assert-Stage5JsonShape $Entry $required $context
+    $entryTitle = Get-Stage5JsonValue $Entry 'title' $context
+    $entryMode = Get-Stage5JsonValue $Entry 'mode' $context
+    $entryProducer = Get-Stage5JsonValue $Entry 'producer' $context
+    $processId = Get-Stage5JsonValue $Entry 'processId' $context
+    $processCreationUtc = Get-Stage5JsonValue $Entry 'processCreationUtc' $context
+    $executablePath = Get-Stage5JsonValue $Entry 'executablePath' $context
+    $runNonce = Get-Stage5JsonValue $Entry 'runNonce' $context
+    $sessionNonce = Get-Stage5JsonValue $Entry 'sessionNonce' $context
+    $executableSha256 = Get-Stage5JsonValue $Entry 'executableSha256' $context
+    $sourceCommit = Get-Stage5JsonValue $Entry 'sourceCommit' $context
+    Assert-Stage5Condition ($entryTitle -is [string] -and $entryTitle -ceq $ExpectedTitle -and
+        $entryMode -is [string] -and $entryMode -ceq $ExpectedMode -and
+        $entryProducer -is [string] -and $entryProducer -ceq 'installed-lockstep-v2' -and
+        (Test-Stage5JsonInteger $processId) -and [Int64]$processId -gt 0 -and
+        $processCreationUtc -is [string] -and
+        $executablePath -is [string] -and
+        -not [string]::IsNullOrWhiteSpace($executablePath) -and
+        $runNonce -is [string] -and $runNonce -cmatch '^[0-9A-F]{32}$' -and
+        $sessionNonce -is [string] -and $sessionNonce -cmatch '^[0-9A-F]{32}$' -and
+        $executableSha256 -is [string] -and $executableSha256 -cmatch '^[0-9A-F]{64}$' -and
+        $executableSha256 -ceq $ExpectedExecutableSha256.ToUpperInvariant() -and
+        $sourceCommit -is [string] -and $sourceCommit -cmatch '^[0-9a-f]{40}$' -and
+        $sourceCommit -ceq $ExpectedSourceCommit) `
+        "$context identity is stale, substituted, or noncanonical."
+    [DateTimeOffset]$processCreated = [DateTimeOffset]::MinValue
+    Assert-Stage5Condition ([DateTimeOffset]::TryParse($processCreationUtc,
+        [ref]$processCreated)) "$context processCreationUtc is not a valid timestamp."
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedCohortCreatedUtc)) {
+        [DateTimeOffset]$cohortCreated = [DateTimeOffset]::MinValue
+        Assert-Stage5Condition ([DateTimeOffset]::TryParse($ExpectedCohortCreatedUtc,
+            [ref]$cohortCreated) -and $processCreated -ge $cohortCreated) `
+            "$context processCreationUtc predates the execution cohort."
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedExecutablePath)) {
+        Assert-Stage5Condition ([IO.Path]::GetFullPath($executablePath) -ceq
+            [IO.Path]::GetFullPath($ExpectedExecutablePath)) `
+            "$context executablePath is not the canonical installed executable."
+    }
+    $expectedError = if ($ExpectedMode -ceq 'negative-cross-epoch') {
+        'UnsupportedEngineEpoch'
+    }
+    else { 'ContentHashMismatch' }
+    $expectedMutation = if ($ExpectedMode -ceq 'negative-cross-epoch') {
+        'engine-epoch'
+    }
+    else { 'content-hash' }
+    $expectedProof = Get-Stage5JsonValue $Entry 'proofPath' $context
+    $expectedStdout = Get-Stage5JsonValue $Entry 'stdoutPath' $context
+    $expectedStderr = Get-Stage5JsonValue $Entry 'stderrPath' $context
+    foreach ($relative in @($expectedProof, $expectedStdout, $expectedStderr)) {
+        Assert-Stage5Condition ($relative -is [string]) "$context evidence path is not a JSON string."
+    }
+    $proofPath = Resolve-Stage5FinalAcceptanceFile $EvidenceRoot $expectedProof "$context proof"
+    $stdoutPath = Resolve-Stage5FinalAcceptanceFile $EvidenceRoot $expectedStdout "$context stdout"
+    $stderrPath = Resolve-Stage5FinalAcceptanceFile $EvidenceRoot $expectedStderr "$context stderr"
+    $proofSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $proofPath "$context proof"
+    $stdoutSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $stdoutPath "$context stdout"
+    $stderrSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $stderrPath "$context stderr"
+    foreach ($binding in @(
+        @($proofSnapshot, (Get-Stage5JsonValue $Entry 'proofSha256' $context), 'proof'),
+        @($stdoutSnapshot, (Get-Stage5JsonValue $Entry 'stdoutSha256' $context), 'stdout'),
+        @($stderrSnapshot, (Get-Stage5JsonValue $Entry 'stderrSha256' $context), 'stderr')
+    )) {
+        Assert-Stage5FinalAcceptanceSnapshotSha256 $binding[0] $binding[1] `
+            "$context $($binding[2]) SHA-256 binding" | Out-Null
+    }
+    $parsed = Get-Stage5LockstepNegativeProbePairs $proofPath $proofSnapshot
+    $pairs = $parsed.pairs
+    Assert-Stage5Condition ($pairs['producer'] -ceq 'installed-lockstep-v2' -and
+        $pairs['mode'] -ceq $ExpectedMode -and $pairs['schema'] -ceq '2' -and
+        $pairs['protocol_epoch'] -ceq '2' -and
+        $pairs['run_nonce'] -ceq $runNonce -and
+        $pairs['session_nonce'] -ceq $sessionNonce -and
+        $pairs['executable_sha256'] -ceq $executableSha256 -and
+        $pairs['source_revision'] -ceq $ExpectedSourceCommit -and
+        $pairs['mutation'] -ceq $expectedMutation -and
+        $pairs['expected_error'] -ceq $expectedError -and
+        $pairs['observed_error'] -ceq $expectedError -and
+        $pairs['baseline_input_sha256'] -match '^[0-9A-F]{64}$' -and
+        $pairs['input_sha256'] -match '^[0-9A-F]{64}$' -and
+        $pairs['baseline_input_sha256'] -cne $pairs['input_sha256'] -and
+        $pairs['baseline_accepted'] -ceq '1' -and
+        $pairs['mutated_accepted'] -ceq '0' -and
+        [UInt64](ConvertTo-Stage5LockstepReceiptUInt64 $pairs['probe_build_compatibility_crc'] 'probe_build_compatibility_crc') -eq [UInt64]$ExpectedMapCrc -and
+        [UInt64](ConvertTo-Stage5LockstepReceiptUInt64 $pairs['probe_content_crc'] 'probe_content_crc') -eq [UInt64]$ExpectedSeed -and
+        [UInt64](ConvertTo-Stage5LockstepReceiptUInt64 $pairs['process_id'] 'process_id') -eq [UInt64]$processId) `
+        "$context raw proof is not bound to the expected observed rejection."
+    $stdoutProof = Get-Stage5LockstepNegativeStdoutProof $stdoutSnapshot "$context stdout"
+    $entryInput = Get-Stage5JsonValue $Entry 'inputSha256' $context
+    $entryExpectedError = Get-Stage5JsonValue $Entry 'expectedError' $context
+    $entryObservedError = Get-Stage5JsonValue $Entry 'observedError' $context
+    $entryMutation = Get-Stage5JsonValue $Entry 'mutation' $context
+    $entryBaseline = Get-Stage5JsonValue $Entry 'baselineAccepted' $context
+    $entryMutated = Get-Stage5JsonValue $Entry 'mutatedAccepted' $context
+    $exitCode = Get-Stage5JsonValue $Entry 'exitCode' $context
+    $commandLine = Get-Stage5JsonValue $Entry 'commandLine' $context
+    $arguments = Get-Stage5JsonValue $Entry 'arguments' $context
+    $probeBuildCrc = Get-Stage5JsonValue $Entry 'probeBuildCrc' $context
+    $probeContentCrc = Get-Stage5JsonValue $Entry 'probeContentCrc' $context
+    Assert-Stage5Condition ($entryInput -is [string] -and
+        $entryInput -cmatch '^[0-9A-F]{64}$' -and
+        $entryInput -ceq $pairs['input_sha256'] -and
+        $entryExpectedError -is [string] -and $entryExpectedError -ceq $expectedError -and
+        $entryObservedError -is [string] -and $entryObservedError -ceq $expectedError -and
+        $entryMutation -is [string] -and $entryMutation -ceq $expectedMutation -and
+        $entryBaseline -is [bool] -and [bool]$entryBaseline -and
+        $entryMutated -is [bool] -and -not [bool]$entryMutated -and
+        (Test-Stage5JsonInteger $exitCode) -and [Int64]$exitCode -eq 0 -and
+        $commandLine -is [string] -and
+        $commandLine -match [regex]::Escape($ExpectedMode) -and
+        $arguments -is [Array] -and @($arguments).Count -ge 2 -and
+        @($arguments | Where-Object {
+            [string]$_ -ceq '-installedLockstepV2Validation'
+        }).Count -eq 1 -and
+        (Test-Stage5JsonInteger $probeBuildCrc) -and
+        [UInt64]$probeBuildCrc -eq [UInt64]$ExpectedMapCrc -and
+        (Test-Stage5JsonInteger $probeContentCrc) -and
+        [UInt64]$probeContentCrc -eq [UInt64]$ExpectedSeed -and
+        $stdoutProof.mode -ceq $ExpectedMode -and
+        $stdoutProof.pid -eq [Int64]$processId -and
+        $stdoutProof.rejection -ceq $expectedError) `
+        "$context metadata is stale, substituted, or detached from the raw proof."
+    return [pscustomobject]@{
+        title = $ExpectedTitle; mode = $ExpectedMode
+        processId = [int]$processId; runNonce = [string]$runNonce
+        processCreationUtc = [string]$processCreationUtc
+        executablePath = [string]$executablePath
+        sessionNonce = [string]$sessionNonce; proofPath = $proofPath
+        stdoutPath = $stdoutPath; stderrPath = $stderrPath
+        proofSha256 = [string]$proofSnapshot.sha256
+        stdoutSha256 = [string]$stdoutSnapshot.sha256
+        stderrSha256 = [string]$stderrSnapshot.sha256
+        inputSha256 = [string]$pairs['input_sha256']
+        baselineAccepted = $true; mutatedAccepted = $false
+        expectedError = $expectedError; observedError = $expectedError
+    }
+}
+
 function Read-Stage5LockstepV2Evidence {
     param(
         [string]$Path,
         [string]$ExpectedSourceCommit,
         [string]$ExpectedArtifactSetSha256,
-        [Collections.IDictionary]$ArtifactHashes
+        [Collections.IDictionary]$ArtifactHashes,
+        [Collections.IDictionary]$ArtifactPaths = $null,
+        [string]$ArtifactRootDirectory = $null,
+        [string]$ExpectedEvidenceSha256 = $null,
+        [object]$EvidenceSnapshot = $null,
+        [string]$ExpectedCohortNonce = $null,
+        [string]$ExpectedCohortCreatedUtc = $null,
+        [object]$ExpectedRuntimeClosure = $null
     )
     $full = [IO.Path]::GetFullPath($Path)
-    Assert-Stage5Condition (Test-Path -LiteralPath $full -PathType Leaf) `
-        "Lockstep-v2 multiplayer evidence was not found: $full"
+    if ($null -eq $EvidenceSnapshot) {
+        Assert-Stage5Condition (Test-Path -LiteralPath $full -PathType Leaf) `
+            "Lockstep-v2 multiplayer evidence was not found: $full"
+    }
     Assert-Stage5Condition ($ExpectedSourceCommit -cmatch '^[0-9a-f]{40}$') `
         'Lockstep-v2 ExpectedSourceCommit must be an independently supplied lowercase 40-hex commit.'
     Assert-Stage5Condition ($ExpectedArtifactSetSha256 -cmatch '^[0-9A-Fa-f]{64}$') `
@@ -5503,7 +6694,25 @@ function Read-Stage5LockstepV2Evidence {
         $ArtifactHashes.Contains('generals-executable') -and
         $ArtifactHashes.Contains('zerohour-executable')) `
         'Lockstep-v2 executable bindings are incomplete.'
-    $document = ConvertFrom-Stage5JsonDictionary $full
+    $documentSnapshot = if ($null -eq $EvidenceSnapshot) {
+        Get-Stage5FinalAcceptanceFileSnapshot $full 'Lockstep-v2 multiplayer evidence'
+    }
+    else { $EvidenceSnapshot }
+    if ($null -ne $EvidenceSnapshot) {
+        Assert-Stage5Condition (-not [string]::IsNullOrWhiteSpace($ExpectedEvidenceSha256)) `
+            'Lockstep-v2 multiplayer evidence caller-supplied snapshot must include its independently expected SHA-256.'
+    }
+    Assert-Stage5Condition ($null -ne $documentSnapshot -and
+        $documentSnapshot.PSObject.Properties.Name -contains 'path' -and
+        [IO.Path]::GetFullPath([string]$documentSnapshot.path) -ceq $full) `
+        'Lockstep-v2 multiplayer evidence snapshot is bound to a different path.'
+    if ([string]::IsNullOrWhiteSpace($ExpectedEvidenceSha256)) {
+        $ExpectedEvidenceSha256 = [string]$documentSnapshot.sha256
+    }
+    Assert-Stage5FinalAcceptanceSnapshotSha256 $documentSnapshot `
+        $ExpectedEvidenceSha256 'Lockstep-v2 multiplayer evidence' | Out-Null
+    $document = ConvertFrom-Stage5FinalAcceptanceJsonSnapshot $documentSnapshot `
+        'Lockstep-v2 multiplayer evidence'
     Assert-Stage5Condition ($document -is [Collections.IDictionary]) `
         'Lockstep-v2 multiplayer evidence must be a JSON object.'
     $isDiagnosticV1 = $false
@@ -5523,10 +6732,12 @@ function Read-Stage5LockstepV2Evidence {
     }
     $names = @('schemaVersion', 'evidenceKind', 'status', 'producer',
         'validationMode', 'architecture', 'sourceCommit', 'artifactSetSha256',
-        'recordedUtc', 'allowHeadlessDirectExecution', 'launcherEquivalence',
+        'recordedUtc', 'cohortNonce', 'runtimeClosure',
+        'allowHeadlessDirectExecution', 'launcherEquivalence',
         'commonStopFrame', 'peerCount', 'networkRosterMask',
         'simulationRosterMask', 'aiRosterMask', 'aiPlayerCount',
         'mapName', 'mapCrc', 'seed',
+        'negativeProbes',
         'v1Accepted', 'profileStrategy', 'registryViews',
         'environmentVariables', 'profileConcurrency', 'sessions')
     Assert-Stage5JsonShape $document $names 'Lockstep-v2 multiplayer evidence'
@@ -5551,7 +6762,7 @@ function Read-Stage5LockstepV2Evidence {
             $ExpectedArtifactSetSha256.ToUpperInvariant()) `
         'Lockstep-v2 multiplayer evidence artifactSetSha256 does not match the independently hashed artifact set.'
     Assert-Stage5Condition ([Int64]$document['commonStopFrame'] -eq 4096 -and
-        [Int64]$document['peerCount'] -ge 2 -and [Int64]$document['peerCount'] -le 8 -and
+        [Int64]$document['peerCount'] -eq 2 -and
         [Int64]$document['networkRosterMask'] -eq 3 -and
         [Int64]$document['simulationRosterMask'] -eq 63 -and
         [Int64]$document['aiRosterMask'] -eq 60 -and
@@ -5566,6 +6777,30 @@ function Read-Stage5LockstepV2Evidence {
     [DateTimeOffset]$recorded = [DateTimeOffset]::MinValue
     Assert-Stage5Condition ([DateTimeOffset]::TryParse($document['recordedUtc'], [ref]$recorded)) `
         'Lockstep-v2 multiplayer evidence recordedUtc is not a valid timestamp.'
+    $cohortNonce = Assert-Stage5CanonicalUuid $document['cohortNonce'] `
+        'Lockstep-v2 multiplayer evidence cohortNonce'
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedCohortNonce)) {
+        Assert-Stage5CanonicalUuid $ExpectedCohortNonce `
+            'Lockstep-v2 expected cohortNonce' | Out-Null
+        Assert-Stage5Condition ($cohortNonce -ceq $ExpectedCohortNonce) `
+            'Lockstep-v2 multiplayer evidence cohortNonce is stale or detached.'
+    }
+    $runtimeClosure = $document['runtimeClosure']
+    if ($null -ne $ExpectedRuntimeClosure) {
+        [void](Assert-Stage5RuntimeClosureBinding $runtimeClosure `
+            $ExpectedRuntimeClosure 'Lockstep-v2 multiplayer evidence')
+    }
+    else {
+        Assert-Stage5JsonShape $runtimeClosure `
+            @('dependencyManifestSha256', 'closureSha256') `
+            'Lockstep-v2 multiplayer evidence runtime closure'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedCohortCreatedUtc)) {
+        [DateTimeOffset]$cohortCreated = [DateTimeOffset]::MinValue
+        Assert-Stage5Condition ([DateTimeOffset]::TryParse($ExpectedCohortCreatedUtc,
+            [ref]$cohortCreated) -and $recorded -ge $cohortCreated) `
+            'Lockstep-v2 multiplayer evidence recordedUtc predates the execution cohort.'
+    }
     Assert-Stage5Condition ($document['allowHeadlessDirectExecution'] -is [bool] -and
         [bool]$document['allowHeadlessDirectExecution']) `
         'Lockstep-v2 multiplayer evidence did not record the reviewed direct-execution opt-in.'
@@ -5589,12 +6824,21 @@ function Read-Stage5LockstepV2Evidence {
         (@($document['environmentVariables'] | ForEach-Object { [string]$_ }) -join '|') -ceq
             ($expectedEnvironmentVariables -join '|')) `
         'Lockstep-v2 multiplayer evidence does not retain the reviewed peer environment boundary.'
+    $negativeProbes = $document['negativeProbes']
+    Assert-Stage5JsonShape $negativeProbes @('crossEpoch', 'contentMismatch') `
+        'Lockstep-v2 native negative-probe collection'
+    Assert-Stage5Condition ($negativeProbes['crossEpoch'] -is [Array] -and
+        $negativeProbes['crossEpoch'].Count -eq 2 -and
+        $negativeProbes['contentMismatch'] -is [Array] -and
+        $negativeProbes['contentMismatch'].Count -eq 2) `
+        'Lockstep-v2 native evidence must contain one observed negative proof per title and mode.'
     $aggregateLauncherContracts = $document['launcherEquivalence']
     Assert-Stage5JsonShape $aggregateLauncherContracts @('Generals', 'ZeroHour') `
         'Lockstep-v2 launcher-equivalence aggregate'
     foreach ($launcherTitle in @('Generals', 'ZeroHour')) {
         [void](Assert-Stage5LockstepLauncherContract $aggregateLauncherContracts[$launcherTitle] `
-            $launcherTitle $ArtifactHashes "Lockstep-v2 $launcherTitle launcher-equivalence"
+            $launcherTitle $ArtifactHashes "Lockstep-v2 $launcherTitle launcher-equivalence" `
+            $ArtifactPaths $ArtifactRootDirectory
         )
     }
 
@@ -5619,7 +6863,8 @@ function Read-Stage5LockstepV2Evidence {
             'profileReadOnlyVerified', 'profileFilesAfterRun')
         Assert-Stage5JsonShape $session $sessionNames $sessionContext
         [void](Assert-Stage5LockstepLauncherContract $session['launcherEquivalence'] `
-            $title $ArtifactHashes "$sessionContext launcher-equivalence")
+            $title $ArtifactHashes "$sessionContext launcher-equivalence" `
+            $ArtifactPaths $ArtifactRootDirectory)
         Assert-Stage5Condition (
             ($session['launcherEquivalence'] | ConvertTo-Json -Compress -Depth 8) -ceq
             ($aggregateLauncherContracts[$title] | ConvertTo-Json -Compress -Depth 8)) `
@@ -5761,7 +7006,8 @@ function Read-Stage5LockstepV2Evidence {
                 $peer['v1ReceiptAccepted'] -is [bool] -and -not [bool]$peer['v1ReceiptAccepted']) `
                 "$peerContext has a stale, substituted, or non-clean process identity."
             [void](Assert-Stage5LockstepLauncherContract $peer['launcherEquivalence'] `
-                $title $ArtifactHashes "$peerContext launcher-equivalence")
+                $title $ArtifactHashes "$peerContext launcher-equivalence" `
+                $ArtifactPaths $ArtifactRootDirectory)
             Assert-Stage5Condition (
                 ($peer['launcherEquivalence'] | ConvertTo-Json -Compress -Depth 8) -ceq
                 ($session['launcherEquivalence'] | ConvertTo-Json -Compress -Depth 8)) `
@@ -5827,16 +7073,22 @@ function Read-Stage5LockstepV2Evidence {
                 $stdoutLeaf "$peerContext stdout"
             $stderrPath = Resolve-Stage5FinalAcceptanceFile $sessionDirectory `
                 $stderrLeaf "$peerContext stderr"
-            Assert-Stage5Condition ((Get-Stage5FinalAcceptanceFileSha256 $receiptPath) -ceq
-                [string]$peer['receiptSha256']) `
-                "$peerContext receipt SHA-256 binding does not match the producer file."
-            Assert-Stage5Condition ((Get-Stage5FinalAcceptanceFileSha256 $stdoutPath) -ceq
-                [string]$peer['stdoutSha256']) `
-                "$peerContext stdout SHA-256 binding does not match the producer file."
-            Assert-Stage5Condition ((Get-Stage5FinalAcceptanceFileSha256 $stderrPath) -ceq
-                [string]$peer['stderrSha256']) `
-                "$peerContext stderr SHA-256 binding does not match the producer file."
-            $stdoutText = [IO.File]::ReadAllText($stdoutPath)
+            $receiptSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $receiptPath `
+                "$peerContext receipt"
+            Assert-Stage5FinalAcceptanceSnapshotSha256 $receiptSnapshot `
+                ([string]$peer['receiptSha256']) `
+                "$peerContext receipt SHA-256 binding does not match the producer file" | Out-Null
+            $stdoutSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $stdoutPath `
+                "$peerContext stdout"
+            Assert-Stage5FinalAcceptanceSnapshotSha256 $stdoutSnapshot `
+                ([string]$peer['stdoutSha256']) `
+                "$peerContext stdout SHA-256 binding does not match the producer file" | Out-Null
+            $stderrSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $stderrPath `
+                "$peerContext stderr"
+            Assert-Stage5FinalAcceptanceSnapshotSha256 $stderrSnapshot `
+                ([string]$peer['stderrSha256']) `
+                "$peerContext stderr SHA-256 binding does not match the producer file" | Out-Null
+            $stdoutText = [Text.Encoding]::UTF8.GetString([byte[]]$stdoutSnapshot.bytes)
             $stdoutLines = @($stdoutText -split "`n" | ForEach-Object {
                 $_.TrimEnd("`r")
             })
@@ -5873,7 +7125,8 @@ function Read-Stage5LockstepV2Evidence {
             $receipt = Read-Stage5LockstepV2Receipt $receiptPath $peerIndex `
                 ([int]$document['peerCount']) ([UInt32]$document['mapCrc']) `
                 ([string]$peer['runNonce']) ([string]$session['sessionNonce']) `
-                ([string]$peer['executableSha256']) $ExpectedSourceCommit
+                ([string]$peer['executableSha256']) $ExpectedSourceCommit `
+                $receiptSnapshot
             for ($kernel = 0; $kernel -lt 6; ++$kernel) {
                 $receiptMask = ConvertTo-Stage5LockstepReceiptUInt64 `
                     $receipt.parsed.pairs["kernel_${kernel}_physical_worker_mask"] `
@@ -5902,7 +7155,10 @@ function Read-Stage5LockstepV2Evidence {
             $rawLeaf = "peer-$peerIndex.raw.json"
             $rawPath = Resolve-Stage5FinalAcceptanceFile $sessionDirectory $rawLeaf `
                 "$peerContext raw receipt index"
-            $raw = ConvertFrom-Stage5JsonDictionary $rawPath
+            $rawSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $rawPath `
+                "$peerContext raw receipt index"
+            $raw = ConvertFrom-Stage5FinalAcceptanceJsonSnapshot $rawSnapshot `
+                "$peerContext raw receipt index"
             Assert-Stage5JsonShape $raw $peerNames "$peerContext raw receipt index"
             foreach ($field in $peerNames) {
                 $aggregateValue = $peer[$field]
@@ -5931,14 +7187,75 @@ function Read-Stage5LockstepV2Evidence {
             peers = $peerReports.ToArray()
         }) | Out-Null
     }
+    $validatedNegativeCrossEpoch = New-Object 'Collections.Generic.List[object]'
+    $validatedNegativeContentMismatch = New-Object 'Collections.Generic.List[object]'
+    $negativeRunNonces = @{}
+    $negativeSessionNonces = @{}
+    $negativePaths = @{}
+    foreach ($negativeSpec in @(
+        @('crossEpoch', 'negative-cross-epoch'),
+        @('contentMismatch', 'negative-content-mismatch')
+    )) {
+        $collectionName = [string]$negativeSpec[0]
+        $mode = [string]$negativeSpec[1]
+        $entries = @($negativeProbes[$collectionName] | Where-Object {
+            [string]$_.mode -ceq $mode
+        })
+        Assert-Stage5Condition ($entries.Count -eq 2) `
+            "Lockstep-v2 native negative-probe collection '$collectionName' must contain one entry per title."
+        foreach ($titleIndex in 0..1) {
+            $title = if ($titleIndex -eq 0) { 'Generals' } else { 'ZeroHour' }
+            $titleEntries = @($entries | Where-Object {
+                [string]$_.title -ceq $title
+            })
+            Assert-Stage5Condition ($titleEntries.Count -eq 1) `
+                "Lockstep-v2 native negative-probe collection '$collectionName' must contain one $title entry."
+            $expectedExecutableSha256 = [string]$sessions[$titleIndex]['peers'][0]['executableSha256']
+            $validated = Assert-Stage5LockstepNegativeProbeEvidence `
+                $titleEntries[0] (Split-Path -Parent $full) $title $mode `
+                $ExpectedSourceCommit $expectedExecutableSha256 `
+                ([UInt32]$document['mapCrc']) ([int]$document['seed']) `
+                ([string]$sessions[$titleIndex]['peers'][0]['launcherEquivalence']['directExecutable']) `
+                $ExpectedCohortCreatedUtc
+            Assert-Stage5Condition (-not $seenRunNonces.ContainsKey($validated.runNonce) -and
+                -not $negativeRunNonces.ContainsKey($validated.runNonce) -and
+                -not $seenSessionNonces.ContainsKey($validated.sessionNonce) -and
+                -not $negativeSessionNonces.ContainsKey($validated.sessionNonce)) `
+                "Lockstep-v2 native negative probe $title/$mode reuses a positive or negative nonce."
+            $negativeRunNonces[$validated.runNonce] = $true
+            $negativeSessionNonces[$validated.sessionNonce] = $true
+            foreach ($probePath in @($validated.proofPath, $validated.stdoutPath,
+                $validated.stderrPath)) {
+                $probePathKey = [IO.Path]::GetFullPath([string]$probePath).ToLowerInvariant()
+                Assert-Stage5Condition (-not $negativePaths.ContainsKey($probePathKey) -and
+                    $probePathKey -cne $full.ToLowerInvariant()) `
+                    "Lockstep-v2 native negative probe $title/$mode reuses an evidence path."
+                $negativePaths[$probePathKey] = $true
+            }
+            if ($collectionName -ceq 'crossEpoch') {
+                $validatedNegativeCrossEpoch.Add($validated) | Out-Null
+            }
+            else {
+                $validatedNegativeContentMismatch.Add($validated) | Out-Null
+            }
+        }
+    }
     return [pscustomobject]@{
         schemaVersion = 2; evidenceKind = 'lockstep-v2-multiplayer'
         producer = 'installed-lockstep-v2'
         validationMode = 'installed-lockstep-v2-production'
         sourceCommit = $ExpectedSourceCommit
         artifactSetSha256 = $ExpectedArtifactSetSha256.ToUpperInvariant()
+        cohortNonce = $cohortNonce
+        runtimeClosure = $runtimeClosure
         commonStopFrame = 4096; peerCount = [int]$document['peerCount']
         sessions = $sessionReports.ToArray()
+        negativeProbes = [pscustomobject]@{
+            crossEpoch = $validatedNegativeCrossEpoch.ToArray()
+            contentMismatch = $validatedNegativeContentMismatch.ToArray()
+        }
+        crossEpochRejected = ($validatedNegativeCrossEpoch.Count -eq 2)
+        contentMismatchRejected = ($validatedNegativeContentMismatch.Count -eq 2)
     }
 }
 
@@ -5948,11 +7265,20 @@ function Get-Stage5LockstepV2AcceptanceFailure {
         [string]$Context,
         [string]$ExpectedSourceCommit,
         [string]$ExpectedArtifactSetSha256,
-        [Collections.IDictionary]$ArtifactHashes
+        [Collections.IDictionary]$ArtifactHashes,
+        [Collections.IDictionary]$ArtifactPaths = $null,
+        [string]$ArtifactRootDirectory = $null,
+        [string]$ExpectedEvidenceSha256 = $null,
+        [object]$EvidenceSnapshot = $null,
+        [string]$ExpectedCohortNonce = $null,
+        [string]$ExpectedCohortCreatedUtc = $null,
+        [object]$ExpectedRuntimeClosure = $null
     )
     try {
         [void](Read-Stage5LockstepV2Evidence $Path $ExpectedSourceCommit `
-            $ExpectedArtifactSetSha256 $ArtifactHashes)
+            $ExpectedArtifactSetSha256 $ArtifactHashes $ArtifactPaths `
+            $ArtifactRootDirectory $ExpectedEvidenceSha256 $EvidenceSnapshot `
+            $ExpectedCohortNonce $ExpectedCohortCreatedUtc $ExpectedRuntimeClosure)
         return $null
     }
     catch {
@@ -5963,13 +7289,11 @@ function Get-Stage5LockstepV2AcceptanceFailure {
 function Invoke-Stage5FinalAcceptanceAggregation {
     param(
         [string]$AcceptanceManifestPath,
-        [string]$ReadinessMode = 'final-acceptance',
+        [string]$ReadinessMode = 'development-readiness',
         [switch]$DevelopmentReadiness
     )
-    $preManualReadiness = $DevelopmentReadiness -or
-        $ReadinessMode -in @('development', 'development-readiness', 'pre-manual')
-    Assert-Stage5Condition ($preManualReadiness -or
-        $ReadinessMode -in @('final', 'final-acceptance')) `
+    Assert-Stage5Condition ($DevelopmentReadiness -or
+        $ReadinessMode -in @('development', 'development-readiness', 'pre-manual')) `
         "Unsupported Stage 5 acceptance readiness mode '$ReadinessMode'."
     $requestPath = [IO.Path]::GetFullPath($AcceptanceManifestPath)
     Assert-Stage5Condition (Test-Path -LiteralPath $requestPath -PathType Leaf) `
@@ -5981,7 +7305,8 @@ function Invoke-Stage5FinalAcceptanceAggregation {
         'Final acceptance manifest'
     $request = ConvertFrom-Stage5FinalAcceptanceJsonSnapshot $requestSnapshot `
         'Final acceptance manifest'
-    $requestNames = @('schemaVersion', 'gateName', 'sourceCommit', 'artifactSet', 'evidence')
+    $requestNames = @('schemaVersion', 'gateName', 'sourceCommit', 'cohortNonce',
+        'cohortCreatedUtc', 'artifactSet', 'evidence')
     Assert-Stage5JsonShape $request $requestNames 'Final acceptance manifest'
     $schemaVersion = Get-Stage5JsonValue $request 'schemaVersion' 'Final acceptance manifest'
     $gateName = Get-Stage5JsonValue $request 'gateName' 'Final acceptance manifest'
@@ -5991,6 +7316,15 @@ function Invoke-Stage5FinalAcceptanceAggregation {
         $sourceCommit -is [string] -and $sourceCommit -match '^[0-9A-Fa-f]{40}$') `
         'Final acceptance manifest identity is invalid.'
     $sourceCommit = $sourceCommit.ToLowerInvariant()
+    $cohortNonce = Assert-Stage5CanonicalUuid `
+        (Get-Stage5JsonValue $request 'cohortNonce' 'Final acceptance manifest') `
+        'Final acceptance manifest cohortNonce'
+    $cohortCreatedUtc = Get-Stage5JsonValue $request 'cohortCreatedUtc' `
+        'Final acceptance manifest'
+    [DateTimeOffset]$cohortCreated = [DateTimeOffset]::MinValue
+    Assert-Stage5Condition ($cohortCreatedUtc -is [string] -and
+        [DateTimeOffset]::TryParse($cohortCreatedUtc, [ref]$cohortCreated)) `
+        'Final acceptance manifest cohortCreatedUtc is not a valid timestamp.'
 
     $artifactEntry = Get-Stage5JsonValue $request 'artifactSet' 'Final acceptance manifest'
     Assert-Stage5JsonShape $artifactEntry @('path', 'sha256') 'Final acceptance artifactSet'
@@ -6006,7 +7340,8 @@ function Invoke-Stage5FinalAcceptanceAggregation {
     $artifactDirectory = Split-Path -Parent $artifactPath
     $artifactSet = ConvertFrom-Stage5FinalAcceptanceJsonSnapshot $artifactSetSnapshot `
         'Artifact set manifest'
-    $artifactNames = @('schemaVersion', 'sourceCommit', 'productSet', 'architecture', 'artifacts')
+    $artifactNames = @('schemaVersion', 'sourceCommit', 'productSet', 'architecture',
+        'artifacts', 'runtimeClosure')
     Assert-Stage5JsonShape $artifactSet $artifactNames 'Artifact set manifest'
     Assert-Stage5Condition ((Get-Stage5JsonValue $artifactSet 'schemaVersion' 'Artifact set manifest') -eq 1 -and
         (Get-Stage5JsonValue $artifactSet 'sourceCommit' 'Artifact set manifest') -ceq $sourceCommit -and
@@ -6015,6 +7350,12 @@ function Invoke-Stage5FinalAcceptanceAggregation {
     Assert-Stage5FinalAcceptanceStringSet `
         (Get-Stage5JsonValue $artifactSet 'productSet' 'Artifact set manifest') `
         @('Generals', 'ZeroHour') 'Artifact set productSet'
+    $runtimeClosureResult = Get-Stage5RuntimeClosureBinding $artifactSet `
+        $artifactDirectory $sourceCommit 'Artifact set runtime closure'
+    $expectedRuntimeClosure = [pscustomobject]@{
+        dependencyManifestSha256 = $runtimeClosureResult.dependencyManifestSha256
+        closureSha256 = $runtimeClosureResult.closureSha256
+    }
     $requiredArtifactRoles = @('generals-executable', 'generals-launcher',
         'generals-launcher-config', 'zerohour-executable', 'zerohour-launcher',
         'zerohour-launcher-config')
@@ -6023,6 +7364,19 @@ function Invoke-Stage5FinalAcceptanceAggregation {
     $artifactRoles = New-Object 'Collections.Generic.List[string]'
     $artifactPaths = New-Object 'Collections.Generic.List[string]'
     $artifactHashes = @{}
+    $artifactPathsByRole = @{}
+    $runtimeClosureFilesByPath = @{}
+    foreach ($closureFile in @($runtimeClosureResult.files)) {
+        Assert-Stage5Condition ($null -ne $closureFile -and
+            @('path', 'sha256', 'fullPath', 'snapshot' | Where-Object {
+                @($closureFile.PSObject.Properties.Name) -contains $_
+            }).Count -eq 4) `
+            'Artifact set runtime closure snapshot is incomplete.'
+        $closureKey = ([string]$closureFile.path).Replace('\', '/').ToLowerInvariant()
+        Assert-Stage5Condition (-not $runtimeClosureFilesByPath.ContainsKey($closureKey)) `
+            "Artifact set runtime closure repeats path '$($closureFile.path)'."
+        $runtimeClosureFilesByPath[$closureKey] = $closureFile
+    }
     foreach ($artifact in $artifacts) {
         Assert-Stage5JsonShape $artifact @('role', 'path', 'sha256') 'Artifact set entry'
         $role = Get-Stage5JsonValue $artifact 'role' 'Artifact set entry'
@@ -6032,26 +7386,33 @@ function Invoke-Stage5FinalAcceptanceAggregation {
             'Artifact set role and path must be JSON strings.'
         Assert-Stage5Condition (-not ($artifactRoles -contains $role)) `
             "Artifact set repeats role '$role'."
-        $artifactFile = Resolve-Stage5FinalAcceptanceFile $artifactDirectory $relative `
-            "Artifact set role '$role'"
+        $artifactKey = ([string]$relative).Replace('\', '/').ToLowerInvariant()
+        Assert-Stage5Condition ($runtimeClosureFilesByPath.ContainsKey($artifactKey)) `
+            "Artifact set role '$role' is not bound to a snapshotted runtime-closure file."
+        $closureFile = $runtimeClosureFilesByPath[$artifactKey]
+        $artifactFile = [IO.Path]::GetFullPath([string]$closureFile.fullPath)
+        $expectedArtifactPath = [IO.Path]::GetFullPath((Join-Path $artifactDirectory $relative))
+        Assert-Stage5Condition ($artifactFile -ceq $expectedArtifactPath) `
+            "Artifact set role '$role' resolved outside its snapshotted runtime-closure file."
         Assert-Stage5Condition (-not ($artifactPaths -contains $artifactFile.ToLowerInvariant())) `
             "Artifact set aliases path '$relative'."
-        $verifiedArtifactHash = Assert-Stage5FinalAcceptanceSha256 $artifactFile $expectedHash `
-            "Artifact set role '$role'"
+        $verifiedArtifactHash = Assert-Stage5FinalAcceptanceSnapshotSha256 `
+            $closureFile.snapshot $expectedHash "Artifact set role '$role' snapshot"
         $artifactRoles.Add($role) | Out-Null
         $artifactPaths.Add($artifactFile.ToLowerInvariant()) | Out-Null
         $artifactHashes[$role] = $verifiedArtifactHash
+        $artifactPathsByRole[$role] = $artifactFile
     }
     Assert-Stage5FinalAcceptanceStringSet $artifactRoles.ToArray() $requiredArtifactRoles `
         'Artifact set roles'
 
-    $allEvidenceKinds = @('deterministic-runtime', 'replay-determinism',
+    # Local acceptance has exactly one authority: development evidence ready
+    # for a later, external manual decision.  Premium review and manual
+    # approval are deliberately out-of-band and can never be entries in this
+    # manifest or local JSON output.
+    $requiredEvidenceKinds = @('deterministic-runtime', 'replay-determinism',
         'fresh-ai', 'performance-scaling', 'mixed-worker-multiplayer',
-        'combined-stage4-stage5-installed-runtime', 'premium-review', 'manual-acceptance')
-    $requiredEvidenceKinds = if ($preManualReadiness) {
-        @($allEvidenceKinds | Where-Object { $_ -cne 'manual-acceptance' })
-    }
-    else { $allEvidenceKinds }
+        'combined-stage4-stage5-installed-runtime')
     $evidenceEntries = Get-Stage5JsonValue $request 'evidence' 'Final acceptance manifest'
     Assert-Stage5Condition ($evidenceEntries -is [Array]) `
         'Final acceptance evidence must be a JSON array.'
@@ -6066,7 +7427,7 @@ function Invoke-Stage5FinalAcceptanceAggregation {
         Assert-Stage5Condition ($kind -is [string] -and $relative -is [string]) `
             'Final acceptance evidence kind and path must be JSON strings.'
         Assert-Stage5Condition ($requiredEvidenceKinds -ccontains $kind) `
-            "Final acceptance evidence kind '$kind' is unsupported."
+            "Final acceptance evidence kind '$kind' is not part of the local pre-manual contract; premium review and manual approval are out-of-band."
         Assert-Stage5Condition (-not $evidenceByKind.ContainsKey($kind)) `
             "Final acceptance evidence repeats kind '$kind'."
         $evidencePath = Resolve-Stage5FinalAcceptanceFile $requestDirectory $relative `
@@ -6081,7 +7442,7 @@ function Invoke-Stage5FinalAcceptanceAggregation {
             "Evidence '$kind'"
         $evidenceNames = @('schemaVersion', 'evidenceKind', 'status', 'sourceCommit',
             'title', 'architecture', 'artifactSetSha256', 'recordedUtc',
-            'attachments', 'details')
+            'cohortNonce', 'runtimeClosure', 'attachments', 'details')
         Assert-Stage5JsonShape $evidenceDocument $evidenceNames "Evidence '$kind'"
         Assert-Stage5Condition ((Get-Stage5JsonValue $evidenceDocument 'schemaVersion' "Evidence '$kind'") -eq 1 -and
             (Get-Stage5JsonValue $evidenceDocument 'evidenceKind' "Evidence '$kind'") -ceq $kind -and
@@ -6090,6 +7451,14 @@ function Invoke-Stage5FinalAcceptanceAggregation {
             (Get-Stage5JsonValue $evidenceDocument 'architecture' "Evidence '$kind'") -ceq 'x64' -and
             (Get-Stage5JsonValue $evidenceDocument 'artifactSetSha256' "Evidence '$kind'") -ceq $artifactSetHash) `
             "Evidence '$kind' does not identify the same passed x64 commit and artifact set."
+        $evidenceCohortNonce = Assert-Stage5CanonicalUuid `
+            (Get-Stage5JsonValue $evidenceDocument 'cohortNonce' "Evidence '$kind'") `
+            "Evidence '$kind' cohortNonce"
+        Assert-Stage5Condition ($evidenceCohortNonce -ceq $cohortNonce) `
+            "Evidence '$kind' is stale or detached from the requested execution cohort."
+        [void](Assert-Stage5RuntimeClosureBinding `
+            (Get-Stage5JsonValue $evidenceDocument 'runtimeClosure' "Evidence '$kind'") `
+            $expectedRuntimeClosure "Evidence '$kind'")
         $title = Get-Stage5JsonValue $evidenceDocument 'title' "Evidence '$kind'"
         Assert-Stage5Condition ($title -is [string] -and
             @('Generals', 'ZeroHour', 'Both') -ccontains $title) `
@@ -6104,6 +7473,8 @@ function Invoke-Stage5FinalAcceptanceAggregation {
         Assert-Stage5Condition ($recordedUtc -is [string] -and
             [DateTimeOffset]::TryParse($recordedUtc, [ref]$recorded)) `
             "Evidence '$kind' recordedUtc is not a valid timestamp."
+        Assert-Stage5Condition ($recorded -ge $cohortCreated) `
+            "Evidence '$kind' recordedUtc predates the requested execution cohort."
         $evidenceByKind[$kind] = [pscustomobject]@{
             relativePath = $relative
             fullPath = $evidencePath
@@ -6113,8 +7484,10 @@ function Invoke-Stage5FinalAcceptanceAggregation {
         $evidenceHashes[$kind] = $evidenceHash
         $evidencePaths.Add($evidencePath.ToLowerInvariant()) | Out-Null
     }
-    Assert-Stage5FinalAcceptanceStringSet @($evidenceByKind.Keys) $requiredEvidenceKinds `
-        'Final acceptance evidence kinds'
+    foreach ($requiredKind in $requiredEvidenceKinds) {
+        Assert-Stage5Condition ($evidenceByKind.ContainsKey($requiredKind)) `
+            "Final acceptance evidence is missing required kind '$requiredKind'."
+    }
 
     $attachmentRoles = @{
         'deterministic-runtime' = @('validation-plan', 'validation-results', 'performance-report')
@@ -6146,6 +7519,7 @@ function Invoke-Stage5FinalAcceptanceAggregation {
     $receiptFailures = New-Object 'Collections.Generic.List[string]'
     $receiptRunNonces = @{}
     $reportEvidence = New-Object 'Collections.Generic.List[object]'
+    $mixedNativeEvidenceRead = $null
     foreach ($kind in $requiredEvidenceKinds) {
         $record = $evidenceByKind[$kind]
         $document = $record.document
@@ -6181,8 +7555,10 @@ function Invoke-Stage5FinalAcceptanceAggregation {
                 "Evidence '$kind' attachment '$role'"
             Assert-Stage5Condition (-not ($seenPaths -contains $attachmentPath.ToLowerInvariant())) `
                 "Evidence '$kind' aliases attachment path '$relative'."
-            $attachmentHash = Assert-Stage5FinalAcceptanceSha256 $attachmentPath $expectedHash `
+            $attachmentSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $attachmentPath `
                 "Evidence '$kind' attachment '$role'"
+            $attachmentHash = Assert-Stage5FinalAcceptanceSnapshotSha256 `
+                $attachmentSnapshot $expectedHash "Evidence '$kind' attachment '$role'"
             $readGenericReceipt = $immutableReceiptRoles -ccontains $role -or
                 ($kind -ceq 'deterministic-runtime' -and $role -ceq 'performance-report')
             if ($readGenericReceipt) {
@@ -6194,7 +7570,11 @@ function Invoke-Stage5FinalAcceptanceAggregation {
                         -ExpectedArtifactSetSha256 $artifactSetHash `
                         -ArtifactHashes $artifactHashes `
                         -SeenRunNonces $receiptRunNonces `
-                        -ExpectedEvidenceSha256 $attachmentHash
+                        -ExpectedEvidenceSha256 $attachmentHash `
+                        -EvidenceSnapshot $attachmentSnapshot `
+                        -ExpectedCohortNonce $cohortNonce `
+                        -ExpectedCohortCreatedUtc $cohortCreatedUtc `
+                        -ExpectedRuntimeClosure $expectedRuntimeClosure
                     if ($null -ne $receipt.acceptanceFailure) {
                         $receiptFailures.Add($receipt.acceptanceFailure) | Out-Null
                     }
@@ -6210,9 +7590,17 @@ function Invoke-Stage5FinalAcceptanceAggregation {
                 # producer accepted by the final gate; defer this failure until
                 # all other evidence checks have run so negative tests remain
                 # specific.
-                $lockstepV2Failure = Get-Stage5LockstepV2AcceptanceFailure `
-                    $attachmentPath 'Mixed-worker multiplayer attachment' `
-                    $sourceCommit $artifactSetHash $artifactHashes
+                try {
+                    $mixedNativeEvidenceRead = Read-Stage5LockstepV2Evidence `
+                        $attachmentPath $sourceCommit $artifactSetHash $artifactHashes `
+                        $artifactPathsByRole $artifactDirectory $attachmentHash $attachmentSnapshot `
+                        $cohortNonce $cohortCreatedUtc $expectedRuntimeClosure
+                    $lockstepV2Failure = $null
+                }
+                catch {
+                    $mixedNativeEvidenceRead = $null
+                    $lockstepV2Failure = $_.Exception.Message
+                }
                 if ($null -eq $lockstepV2Failure) {
                     # The v2 details hash is the independently rehashed native
                     # attachment, not the outer acceptance envelope hash.
@@ -6251,11 +7639,13 @@ function Invoke-Stage5FinalAcceptanceAggregation {
         }
         Assert-Stage5FinalAcceptanceDetails $kind `
             (Get-Stage5JsonValue $document 'details' "Evidence '$kind'") `
-            $sourceCommit $evidenceHashes $mixedNativeEvidenceAttachmentHash
+            $sourceCommit $evidenceHashes $mixedNativeEvidenceAttachmentHash `
+            $mixedNativeEvidenceRead
         $reportEvidence.Add([pscustomobject]@{
             kind = $kind
             path = $record.relativePath
             sha256 = $record.sha256
+            freshness = 'current-cohort'
             recordedUtc = Get-Stage5JsonValue $document 'recordedUtc' "Evidence '$kind'"
             attachments = $attachmentReport.ToArray()
         }) | Out-Null
@@ -6270,31 +7660,22 @@ function Invoke-Stage5FinalAcceptanceAggregation {
     if ($null -ne $lockstepV2Failure) {
         throw $lockstepV2Failure
     }
-    if ($preManualReadiness) {
-        return [pscustomobject]@{
-            schemaVersion = 1
-            gateName = 'stage5-development-readiness'
-            status = 'ready-for-manual-approval'
-            readiness = 'pre-manual'
-            manualApprovalRequired = $true
-            finalAcceptanceClaim = $false
-            generatedUtc = [DateTime]::UtcNow.ToString('o')
-            sourceCommit = $sourceCommit
-            artifactSet = [pscustomobject]@{
-                path = [string]$artifactRelative
-                sha256 = $artifactSetHash
-            }
-            evidence = $reportEvidence.ToArray()
-        }
-    }
     return [pscustomobject]@{
         schemaVersion = 1
-        gateName = 'final-stage5-acceptance'
-        status = 'passed'
-        readiness = 'final-manual-approved'
-        manualApprovalRequired = $false
-        finalAcceptanceClaim = $true
-        manualAcceptanceVerified = $true
+        gateName = 'stage5-development-readiness'
+        status = 'ready-for-manual-approval'
+        readiness = 'pre-manual'
+        cohortNonce = $cohortNonce
+        cohortCreatedUtc = $cohortCreatedUtc
+        runtimeClosure = [pscustomobject]@{
+            dependencyManifestSha256 = $expectedRuntimeClosure.dependencyManifestSha256
+            closureSha256 = $expectedRuntimeClosure.closureSha256
+        }
+        evidenceFreshness = 'current-cohort'
+        premiumReviewRequired = $true
+        manualApprovalRequired = $true
+        externalApprovalRequired = @('premium-review', 'manual-acceptance')
+        finalAcceptanceClaim = $false
         generatedUtc = [DateTime]::UtcNow.ToString('o')
         sourceCommit = $sourceCommit
         artifactSet = [pscustomobject]@{
@@ -6320,4 +7701,4 @@ Export-ModuleMember -Function ConvertFrom-Stage5JsonDictionary, Get-Stage5JsonVa
     Test-Stage5RegistryLeafRemoval, Invoke-Stage5CreatedRegistryKeyCleanup, `
     Invoke-Stage5FinalAcceptanceAggregation, Read-Stage5Net3LoopbackEvidence, `
     Read-Stage5PerformanceScalingEvidence, Read-Stage5FinalAcceptanceImmutableReceipt, `
-    Read-Stage5LockstepV2Evidence
+    Read-Stage5LockstepV2Evidence, Get-Stage5RuntimeClosureBinding

@@ -11,6 +11,14 @@ param(
     [ValidateRange(1, 2147483646)][int]$Seed = 23063,
     [ValidateRange(1024, 65000)][int]$BasePort = 41000,
     [ValidateRange(30, 1800)][int]$PeerTimeoutSeconds = 300,
+    # The workflow mints one cohort before any title/component run and passes
+    # the same identity into this producer.  Direct invocations may mint a
+    # cohort only when they are not participating in a final acceptance run;
+    # all emitted evidence still carries a canonical cohort and closure.
+    [string]$ExecutionCohortNonce = '',
+    [string]$ExecutionCohortCreatedUtc = '',
+    [string]$RuntimeClosureDependencyManifestSha256 = '',
+    [string]$RuntimeClosureSha256 = '',
     [switch]$AllowHeadlessDirectExecution,
     [switch]$SelfTest
 )
@@ -51,6 +59,27 @@ function Test-CanonicalHex {
 function Test-LowerHex40 {
     param([string]$Value)
     return $null -ne $Value -and $Value -cmatch '^[0-9a-f]{40}$'
+}
+
+function Assert-LockstepCanonicalUuid {
+    param([string]$Value, [string]$Context)
+    if ($Value -notmatch '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-5][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$') {
+        throw "$Context must be a canonical UUID."
+    }
+    return $Value
+}
+
+function Assert-LockstepRuntimeClosure {
+    param([object]$Value, [string]$Context)
+    if ($null -eq $Value -or
+        [string]$Value.dependencyManifestSha256 -notmatch '^[0-9A-Fa-f]{64}$' -or
+        [string]$Value.closureSha256 -notmatch '^[0-9A-Fa-f]{64}$') {
+        throw "$Context runtime closure must contain canonical dependency-manifest and closure SHA-256 values."
+    }
+    return [pscustomobject]@{
+        dependencyManifestSha256 = ([string]$Value.dependencyManifestSha256).ToUpperInvariant()
+        closureSha256 = ([string]$Value.closureSha256).ToUpperInvariant()
+    }
 }
 
 function Test-SafeHDirectory {
@@ -232,14 +261,25 @@ function ConvertTo-ReceiptBool {
 function Resolve-BoundedArtifactPath {
     param([string]$Manifest, [string]$RelativePath)
     if ([string]::IsNullOrWhiteSpace($RelativePath) -or
-        [IO.Path]::IsPathRooted($RelativePath)) {
+        [IO.Path]::IsPathRooted($RelativePath) -or
+        $RelativePath -match '(^|[\\/])\.([\\/]|$)' -or
+        $RelativePath -match '(^|[\\/])\.\.([\\/]|$)') {
         throw "Artifact path must be a nonempty manifest-relative path: $RelativePath"
     }
-    $root = [IO.Path]::GetFullPath((Split-Path -Parent $Manifest)).TrimEnd('\') + '\'
+    $root = [IO.Path]::GetFullPath((Split-Path -Parent $Manifest)).TrimEnd('\')
     $candidate = [IO.Path]::GetFullPath((Join-Path $root $RelativePath))
-    if (-not $candidate.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+    $rootParts = @($root.Split([char[]]@([char]92, [char]47)) | Where-Object { $_ -ne '' })
+    $candidateParts = @($candidate.Split([char[]]@([char]92, [char]47)) | Where-Object { $_ -ne '' })
+    if ($candidateParts.Count -lt $rootParts.Count) {
         throw "Artifact path escapes its manifest root: $RelativePath"
     }
+    for ($partIndex = 0; $partIndex -lt $rootParts.Count; ++$partIndex) {
+        if (-not [StringComparer]::OrdinalIgnoreCase.Equals(
+                [string]$candidateParts[$partIndex], [string]$rootParts[$partIndex])) {
+            throw "Artifact path escapes its manifest root: $RelativePath"
+        }
+    }
+    Assert-LockstepNoReparse $candidate 'artifact-set path' $root
     return $candidate
 }
 
@@ -582,15 +622,20 @@ function New-LockstepTitleSessionContract {
     $dumpRoot = Join-Path $sessionFull 'Dumps'
     $localAppDataRoot = Join-Path $sessionFull 'LocalAppData'
     $appDataRoot = Join-Path $sessionFull 'AppData'
-    $homePath = $sessionFull.Substring(2)
-    if (-not $homePath.StartsWith('')) { $homePath = '' + $homePath }
+    # Production sessions are constrained to H: by Test-SafeHDirectory.  The
+    # host self-test also exercises this contract from its one bounded scratch
+    # root, which can live on another drive on hosted runners.  Derive the
+    # process home pair from the validated session path so that exception does
+    # not accidentally refer back to an unmounted H: volume.
+    $homeDrive = [IO.Path]::GetPathRoot($sessionFull).TrimEnd([char]92)
+    $homePath = $sessionFull.Substring($homeDrive.Length)
     $environmentValues = [ordered]@{
         TEMP = $tempRoot
         TMP = $tmpRoot
         LOCALAPPDATA = $localAppDataRoot
         APPDATA = $appDataRoot
         USERPROFILE = $sessionFull
-        HOMEDRIVE = 'H:'
+        HOMEDRIVE = $homeDrive
         HOMEPATH = $homePath
         RTS_STAGE5_VALIDATION_PROFILE_ROOT = $profileRoot
         RTS_STAGE5_VALIDATION_CACHE_ROOT = $cacheRoot
@@ -691,6 +736,33 @@ function Get-LockstepPeerEnvironment {
         values = $values
         variableNames = @($values.Keys)
     }
+}
+
+function Get-LockstepExecutionEnvironment {
+    param(
+        [pscustomobject]$PeerEnvironment,
+        [string]$CohortNonce,
+        [string]$CohortCreatedUtc,
+        [pscustomobject]$RuntimeClosure
+    )
+    Assert-LockstepCanonicalUuid $CohortNonce 'Lockstep-v2 execution cohortNonce' | Out-Null
+    [DateTimeOffset]$cohortCreated = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParse($CohortCreatedUtc, [ref]$cohortCreated)) {
+        throw 'Lockstep-v2 execution cohortCreatedUtc is invalid.'
+    }
+    $closure = Assert-LockstepRuntimeClosure $RuntimeClosure 'Lockstep-v2 execution'
+    $values = [ordered]@{}
+    foreach ($key in $PeerEnvironment.values.Keys) {
+        $values[[string]$key] = [string]$PeerEnvironment.values[$key]
+    }
+    # These dynamic bindings are intentionally kept out of the reviewed
+    # environment-equivalence list: they identify this fresh run cohort and
+    # cannot be replaced by a caller's static profile fixture.
+    $values['RTS_STAGE5_COHORT_NONCE'] = $CohortNonce
+    $values['RTS_STAGE5_COHORT_CREATED_UTC'] = $CohortCreatedUtc
+    $values['RTS_STAGE5_RUNTIME_MANIFEST_SHA256'] = $closure.dependencyManifestSha256
+    $values['RTS_STAGE5_RUNTIME_CLOSURE_SHA256'] = $closure.closureSha256
+    return $values
 }
 
 function Set-LockstepRegistryValue {
@@ -911,7 +983,7 @@ function Read-AndValidateArtifactSet {
     }
     $document = ConvertFrom-Stage5JsonDictionary $full
     Assert-Stage5JsonShape $document @('schemaVersion', 'sourceCommit',
-        'productSet', 'architecture', 'artifacts') 'Artifact set manifest'
+        'productSet', 'architecture', 'artifacts', 'runtimeClosure') 'Artifact set manifest'
     if ((Get-Stage5JsonValue $document 'schemaVersion' 'Artifact set manifest') -ne 1 -or
         (Get-Stage5JsonValue $document 'sourceCommit' 'Artifact set manifest') -cne
             $ExpectedSourceCommit -or
@@ -923,6 +995,20 @@ function Read-AndValidateArtifactSet {
         -not ($productSet -ccontains 'Generals') -or
         -not ($productSet -ccontains 'ZeroHour')) {
         throw 'Artifact set must contain exactly Generals and ZeroHour.'
+    }
+    # The six launcher-facing entries are not the complete installed runtime.
+    # Reuse the authoritative evidence-module validator so this producer binds
+    # every declared DLL/asset as well as the dependency manifest and closure
+    # digest before any lockstep process is launched.
+    $artifactDirectory = Split-Path -Parent $full
+    $runtimeClosureBinding = Get-Stage5RuntimeClosureBinding `
+        -ArtifactSet $document `
+        -ArtifactDirectory $artifactDirectory `
+        -ExpectedSourceCommit $ExpectedSourceCommit `
+        -Context 'Artifact set runtime closure'
+    $runtimeClosure = [pscustomobject]@{
+        dependencyManifestSha256 = [string]$runtimeClosureBinding.dependencyManifestSha256
+        closureSha256 = [string]$runtimeClosureBinding.closureSha256
     }
     $requiredRoles = @('generals-executable', 'generals-launcher',
         'generals-launcher-config', 'zerohour-executable', 'zerohour-launcher',
@@ -965,6 +1051,7 @@ function Read-AndValidateArtifactSet {
         path = $full
         sha256 = Get-UpperSha256 $full
         artifacts = $resolved
+        runtimeClosure = $runtimeClosure
     }
 }
 
@@ -1219,14 +1306,27 @@ function Resolve-LockstepEvidenceFile {
     param([string]$Root, [string]$RelativePath, [string]$Context)
     if ([string]::IsNullOrWhiteSpace($RelativePath) -or
         [IO.Path]::IsPathRooted($RelativePath) -or
+        $RelativePath -match '(^|[\\/])\.([\\/]|$)' -or
         $RelativePath -match '(^|[\\/])\.\.([\\/]|$)') {
         throw "$Context path is not a bounded evidence-relative path: $RelativePath"
     }
-    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\') + '\'
+    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\')
     $candidate = [IO.Path]::GetFullPath((Join-Path $rootFull $RelativePath))
-    if (-not $candidate.StartsWith($rootFull,
-            [StringComparison]::OrdinalIgnoreCase) -or
-        -not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+    $rootParts = @($rootFull.Split([char[]]@([char]92, [char]47)) |
+        Where-Object { $_ -ne '' })
+    $candidateParts = @($candidate.Split([char[]]@([char]92, [char]47)) |
+        Where-Object { $_ -ne '' })
+    if ($candidateParts.Count -lt $rootParts.Count) {
+        throw "$Context path is missing or escapes the native evidence root: $RelativePath"
+    }
+    for ($partIndex = 0; $partIndex -lt $rootParts.Count; ++$partIndex) {
+        if (-not [StringComparer]::OrdinalIgnoreCase.Equals(
+                [string]$candidateParts[$partIndex], [string]$rootParts[$partIndex])) {
+            throw "$Context path is missing or escapes the native evidence root: $RelativePath"
+        }
+    }
+    Assert-LockstepNoReparse $candidate $Context $rootFull
+    if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
         throw "$Context path is missing or escapes the native evidence root: $RelativePath"
     }
     return $candidate
@@ -1241,12 +1341,14 @@ function Assert-LockstepNegativeProbeEvidence {
         [string]$ExpectedSourceCommit,
         [string]$ExpectedExecutableSha256,
         [uint32]$ExpectedMapCrc,
-        [int]$ExpectedSeed
+        [int]$ExpectedSeed,
+        [string]$ExpectedExecutablePath = $null
     )
     if ($null -eq $Entry) { throw 'Native lockstep-v2 negative probe entry is missing.' }
     $required = @(
-        'title', 'mode', 'producer', 'processId', 'runNonce', 'sessionNonce',
-        'executableSha256', 'sourceCommit', 'proofPath', 'proofSha256',
+        'title', 'mode', 'producer', 'processId', 'processCreationUtc',
+        'executablePath', 'runNonce', 'sessionNonce', 'executableSha256',
+        'sourceCommit', 'proofPath', 'proofSha256',
         'stdoutPath', 'stdoutSha256', 'stderrPath', 'stderrSha256',
         'inputSha256', 'baselineAccepted', 'mutatedAccepted', 'mutation',
         'expectedError', 'observedError', 'exitCode', 'commandLine',
@@ -1271,6 +1373,19 @@ function Assert-LockstepNegativeProbeEvidence {
         [string]$Entry.sourceCommit -notmatch '^[0-9a-f]{40}$' -or
         [int]$Entry.processId -le 0 -or [int]$Entry.exitCode -ne 0) {
         throw "Native lockstep-v2 negative probe identity is not bound to $ExpectedTitle/$ExpectedMode."
+    }
+    [DateTimeOffset]$processCreated = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParse([string]$Entry.processCreationUtc,
+            [ref]$processCreated)) {
+        throw "Native lockstep-v2 negative probe process creation time is not valid for $ExpectedTitle/$ExpectedMode."
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$Entry.executablePath)) {
+        throw "Native lockstep-v2 negative probe executable path is missing for $ExpectedTitle/$ExpectedMode."
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedExecutablePath) -and
+        [IO.Path]::GetFullPath([string]$Entry.executablePath) -cne
+        [IO.Path]::GetFullPath($ExpectedExecutablePath)) {
+        throw "Native lockstep-v2 negative probe executable path is not the installed $ExpectedTitle executable."
     }
     $proofPath = Resolve-LockstepEvidenceFile $EvidenceRoot `
         ([string]$Entry.proofPath) "$ExpectedTitle/$ExpectedMode proof"
@@ -1354,7 +1469,7 @@ function Assert-LockstepNegativeProbeEvidence {
 }
 
 function Get-ReceiptProjection {
-    param([pscustomobject]$Parsed)
+    param([pscustomobject]$Parsed, [switch]$DeterministicOnly)
     $pairs = $Parsed.pairs
     $projection = [ordered]@{}
     foreach ($key in @('mode', 'schema', 'protocol_epoch', 'peer_count', 'roster_mask',
@@ -1374,8 +1489,24 @@ function Get-ReceiptProjection {
          'ai_planning_committed_batches',
          'ai_planning_parallel_authoritative_commits',
          'ai_planning_rejected_commits',
+         'ai_planning_physical_worker_executions',
          'ai_planning_owner_helped_executions',
+         'ai_planning_observed_physical_worker_mask',
+         'ai_planning_maximum_distinct_physical_workers',
+         'ai_planning_maximum_concurrent_physical_workers',
          'ai_planning_digest')) {
+        # These observations prove that the executable actually used physical
+        # workers, but they are intentionally topology-dependent.  The full
+        # projection retains them for evidence binding; only the cross-peer
+        # deterministic comparison omits them, matching the native planning
+        # digest contract in LockstepV2Contract.cpp.
+        if ($DeterministicOnly -and $key -in @(
+                'ai_planning_physical_worker_executions',
+                'ai_planning_observed_physical_worker_mask',
+                'ai_planning_maximum_distinct_physical_workers',
+                'ai_planning_maximum_concurrent_physical_workers')) {
+            continue
+        }
         $projection[$key] = $pairs[$key]
     }
     for ($slot = 0; $slot -lt 8; ++$slot) {
@@ -1686,7 +1817,7 @@ function Build-LockstepNegativeProbeConfiguration {
 
 function Get-ComparableReceiptHash {
     param([pscustomobject]$Parsed)
-    $projection = Get-ReceiptProjection $Parsed
+    $projection = Get-ReceiptProjection $Parsed -DeterministicOnly
     $bytes = [Text.Encoding]::UTF8.GetBytes($projection)
     $sha = [Security.Cryptography.SHA256]::Create()
     try { return ([BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '') }
@@ -1708,7 +1839,10 @@ function Invoke-LockstepSession {
         [int]$PeerTimeoutSeconds,
         [pscustomobject]$LauncherContract,
         [bool]$AllowHeadlessDirectExecution,
-        [pscustomobject]$TitleSessionContract
+        [pscustomobject]$TitleSessionContract,
+        [string]$ExecutionCohortNonce,
+        [string]$ExecutionCohortCreatedUtc,
+        [pscustomobject]$RuntimeClosure
     )
     Assert-HeadlessDirectExecutionOptIn $AllowHeadlessDirectExecution
     if ($PeerCount -ne $LockstepNetworkPeerCount) {
@@ -1784,7 +1918,10 @@ function Invoke-LockstepSession {
             }
             $environmentSnapshot = $null
             try {
-                $environmentSnapshot = Set-LockstepProcessEnvironment $peerEnvironment.values
+                $executionEnvironment = Get-LockstepExecutionEnvironment `
+                    $peerEnvironment $ExecutionCohortNonce `
+                    $ExecutionCohortCreatedUtc $RuntimeClosure
+                $environmentSnapshot = Set-LockstepProcessEnvironment $executionEnvironment
                 $process = Start-Process -FilePath $Executable -ArgumentList $argumentString `
                     -WorkingDirectory $workingDirectory -PassThru `
                     -WindowStyle Hidden -RedirectStandardOutput $stdout `
@@ -1985,7 +2122,10 @@ function Invoke-LockstepNegativeProbe {
         [pscustomobject]$LauncherContract,
         [bool]$AllowHeadlessDirectExecution,
         [pscustomobject]$TitleSessionContract,
-        [string]$Mode
+        [string]$Mode,
+        [string]$ExecutionCohortNonce,
+        [string]$ExecutionCohortCreatedUtc,
+        [pscustomobject]$RuntimeClosure
     )
     Assert-HeadlessDirectExecutionOptIn $AllowHeadlessDirectExecution
     if ($Mode -cne 'negative-cross-epoch' -and
@@ -2052,7 +2192,10 @@ function Invoke-LockstepNegativeProbe {
     try {
         $environmentSnapshot = $null
         try {
-            $environmentSnapshot = Set-LockstepProcessEnvironment $peerEnvironment.values
+            $executionEnvironment = Get-LockstepExecutionEnvironment `
+                $peerEnvironment $ExecutionCohortNonce `
+                $ExecutionCohortCreatedUtc $RuntimeClosure
+            $environmentSnapshot = Set-LockstepProcessEnvironment $executionEnvironment
             $process = Start-Process -FilePath $Executable -ArgumentList $argumentString `
                 -WorkingDirectory $workingDirectory -PassThru -WindowStyle Hidden `
                 -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
@@ -2066,6 +2209,7 @@ function Invoke-LockstepNegativeProbe {
         Wait-ForLeaf $proofPath $process $deadline
         $process.Refresh()
         $processId = [int]$process.Id
+        $processCreationUtc = $process.StartTime.ToUniversalTime().ToString('o')
         $observedPath = [IO.Path]::GetFullPath($process.Path)
         if ($observedPath -cne $Executable -or
             (Get-UpperSha256 $observedPath) -cne $ExecutableSha256) {
@@ -2115,6 +2259,8 @@ function Invoke-LockstepNegativeProbe {
             mode = $Mode
             producer = $LockstepProducer
             processId = $processId
+            processCreationUtc = $processCreationUtc
+            executablePath = $observedPath
             runNonce = $runNonce
             sessionNonce = $sessionNonce
             executableSha256 = $ExecutableSha256
@@ -2138,7 +2284,8 @@ function Invoke-LockstepNegativeProbe {
             probeContentCrc = [uint32](ConvertTo-ReceiptUInt32 $pairs['probe_content_crc'] 'probe_content_crc')
         }
         [void](Assert-LockstepNegativeProbeEvidence ([pscustomobject]$entry) `
-            $EvidenceRoot $Title $Mode $SourceCommit $ExecutableSha256 $MapCrc $Seed)
+            $EvidenceRoot $Title $Mode $SourceCommit $ExecutableSha256 $MapCrc $Seed `
+            $Executable)
         return [pscustomobject]$entry
     }
     finally {
@@ -2232,7 +2379,10 @@ function New-LockstepV2FinalAcceptanceEnvelope {
         [uint32]$MapCrc,
         [int]$Seed,
         [int]$PeerCount,
-        [object[]]$Sessions
+        [object[]]$Sessions,
+        [string]$CohortNonce,
+        [string]$CohortCreatedUtc,
+        [object]$RuntimeClosure
     )
     $nativeFull = [IO.Path]::GetFullPath($NativeEvidencePath)
     if (-not (Test-Path -LiteralPath $nativeFull -PathType Leaf)) {
@@ -2242,6 +2392,16 @@ function New-LockstepV2FinalAcceptanceEnvelope {
         $ArtifactSetSha256 -notmatch '^[0-9A-F]{64}$' -or
         [string]::IsNullOrWhiteSpace($RecordedUtc)) {
         throw 'Lockstep-v2 final-acceptance envelope identity is incomplete.'
+    }
+    Assert-LockstepCanonicalUuid $CohortNonce 'Lockstep-v2 final-acceptance envelope cohortNonce' | Out-Null
+    $validatedRuntimeClosure = Assert-LockstepRuntimeClosure $RuntimeClosure `
+        'Lockstep-v2 final-acceptance envelope'
+    [DateTimeOffset]$recorded = [DateTimeOffset]::MinValue
+    [DateTimeOffset]$cohortCreated = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParse($RecordedUtc, [ref]$recorded) -or
+        -not [DateTimeOffset]::TryParse($CohortCreatedUtc, [ref]$cohortCreated) -or
+        $recorded -lt $cohortCreated) {
+        throw 'Lockstep-v2 final-acceptance envelope timestamp predates its execution cohort or is invalid.'
     }
     if ($PeerCount -ne $LockstepNetworkPeerCount -or
         $MapCrc -eq 0 -or -not (Test-SafeMapName $MapName) -or
@@ -2259,6 +2419,14 @@ function New-LockstepV2FinalAcceptanceEnvelope {
     }
     if ($null -eq $nativeDocument -or $null -eq $nativeDocument.negativeProbes) {
         throw 'Lockstep-v2 native evidence has no observed negative-probe collection.'
+    }
+    if ([string]$nativeDocument.cohortNonce -cne $CohortNonce -or
+        $null -eq $nativeDocument.runtimeClosure -or
+        [string]$nativeDocument.runtimeClosure.dependencyManifestSha256 -cne
+            $validatedRuntimeClosure.dependencyManifestSha256 -or
+        [string]$nativeDocument.runtimeClosure.closureSha256 -cne
+            $validatedRuntimeClosure.closureSha256) {
+        throw 'Lockstep-v2 native evidence is detached from the execution cohort/runtime closure.'
     }
     $negativeProbeProperties = @($nativeDocument.negativeProbes.PSObject.Properties |
         ForEach-Object { $_.Name })
@@ -2313,14 +2481,21 @@ function New-LockstepV2FinalAcceptanceEnvelope {
         if ($crossEntry.Count -ne 1 -or $contentEntry.Count -ne 1) {
             throw "Lockstep-v2 $($session.title) is missing a unique observed negative proof pair."
         }
+        $expectedExecutablePath = $null
+        if ($peerRecords[0].PSObject.Properties.Name -contains 'launcherEquivalence' -and
+            $null -ne $peerRecords[0].launcherEquivalence) {
+            $expectedExecutablePath = [string]$peerRecords[0].launcherEquivalence.directExecutable
+        }
         $validatedCrossEpoch += Assert-LockstepNegativeProbeEvidence `
             ([pscustomobject]$crossEntry[0]) `
             (Split-Path -Parent $nativeFull) $session.title `
-            'negative-cross-epoch' $SourceCommit $expectedExecutableSha256 $MapCrc $Seed
+            'negative-cross-epoch' $SourceCommit $expectedExecutableSha256 $MapCrc $Seed `
+            $expectedExecutablePath
         $validatedContentMismatch += Assert-LockstepNegativeProbeEvidence `
             ([pscustomobject]$contentEntry[0]) `
             (Split-Path -Parent $nativeFull) $session.title `
-            'negative-content-mismatch' $SourceCommit $expectedExecutableSha256 $MapCrc $Seed
+            'negative-content-mismatch' $SourceCommit $expectedExecutableSha256 $MapCrc $Seed `
+            $expectedExecutablePath
         $effectiveCounts = @($session.effectiveWorkerCounts | ForEach-Object {
             [int]$_
         })
@@ -2361,6 +2536,8 @@ function New-LockstepV2FinalAcceptanceEnvelope {
         architecture = 'x64'
         artifactSetSha256 = $ArtifactSetSha256.ToUpperInvariant()
         recordedUtc = $RecordedUtc
+        cohortNonce = $CohortNonce
+        runtimeClosure = $validatedRuntimeClosure
         attachments = @([ordered]@{
             role = 'multiplayer-results'
             path = [IO.Path]::GetFileName($nativeFull)
@@ -2459,6 +2636,8 @@ function New-SyntheticNegativeProbeEvidence {
         mode = $Mode
         producer = $LockstepProducer
         processId = $ProcessId
+        processCreationUtc = '2026-09-02T00:00:00.0000000Z'
+        executablePath = [IO.Path]::GetFullPath((Join-Path $Root ("$Title.exe")))
         runNonce = $runNonce
         sessionNonce = $sessionNonce
         executableSha256 = $ExecutableSha256
@@ -2560,6 +2739,12 @@ function Invoke-SelfTest {
         $syntheticContentZeroHour = New-SyntheticNegativeProbeEvidence $root `
             'ZeroHour' ([string]::new('B', 64)) $syntheticSourceCommit `
             'negative-content-mismatch' 1004 1 23063
+        $selfTestCohortNonce = [Guid]::NewGuid().ToString()
+        $selfTestCohortCreatedUtc = '2026-09-02T00:00:00.0000000Z'
+        $selfTestRuntimeClosure = [pscustomobject]@{
+            dependencyManifestSha256 = [string]::new('D', 64)
+            closureSha256 = [string]::new('E', 64)
+        }
         $adapterSessions = @(
             [pscustomobject]@{
                 title = 'Generals'; peerCount = 2; sessionNonce = [string]::new('1', 32)
@@ -2597,6 +2782,8 @@ function Invoke-SelfTest {
             schemaVersion = 2
             evidenceKind = 'lockstep-v2-multiplayer'
             producer = $LockstepProducer
+            cohortNonce = $selfTestCohortNonce
+            runtimeClosure = $selfTestRuntimeClosure
             negativeProbes = [ordered]@{
                 crossEpoch = @($syntheticCrossGenerals, $syntheticCrossZeroHour)
                 contentMismatch = @($syntheticContentGenerals, $syntheticContentZeroHour)
@@ -2610,7 +2797,10 @@ function Invoke-SelfTest {
             -ArtifactSetSha256 ('B' * 64) `
             -RecordedUtc '2026-09-02T00:00:00Z' `
             -MapName 'Stage5Validation.map' -MapCrc 1 -Seed 23063 `
-            -PeerCount 2 -Sessions $adapterSessions
+            -PeerCount 2 -Sessions $adapterSessions `
+            -CohortNonce $selfTestCohortNonce `
+            -CohortCreatedUtc $selfTestCohortCreatedUtc `
+            -RuntimeClosure $selfTestRuntimeClosure
         $adapterAttachment = $adapter.document.attachments[0]
         if ($adapter.document.schemaVersion -ne 1 -or
             $adapter.document.evidenceKind -cne 'mixed-worker-multiplayer' -or
@@ -2650,7 +2840,10 @@ function Invoke-SelfTest {
                     -ArtifactSetSha256 ([string]::new('B', 64)) `
                     -RecordedUtc '2026-09-02T00:00:00Z' `
                     -MapName 'Stage5Validation.map' -MapCrc 1 -Seed 23063 `
-                    -PeerCount 2 -Sessions $adapterSessions | Out-Null
+                    -PeerCount 2 -Sessions $adapterSessions `
+                    -CohortNonce $selfTestCohortNonce `
+                    -CohortCreatedUtc $selfTestCohortCreatedUtc `
+                    -RuntimeClosure $selfTestRuntimeClosure | Out-Null
             }
             catch { $tamperRejected = $true }
         }
@@ -2666,7 +2859,10 @@ function Invoke-SelfTest {
                 -NativeEvidencePath $adapterNativePath -SourceCommit ('a' * 40) `
                 -ArtifactSetSha256 ('B' * 64) -RecordedUtc '2026-09-02T00:00:00Z' `
                 -MapName 'Stage5Validation.map' -MapCrc 1 -Seed 23063 `
-                -PeerCount 3 -Sessions $adapterSessions | Out-Null
+                -PeerCount 3 -Sessions $adapterSessions `
+                -CohortNonce $selfTestCohortNonce `
+                -CohortCreatedUtc $selfTestCohortCreatedUtc `
+                -RuntimeClosure $selfTestRuntimeClosure | Out-Null
         }
         catch { $adapterTopologyRejected = $true }
         if (-not $adapterTopologyRejected) {
@@ -2679,23 +2875,28 @@ function Invoke-SelfTest {
                 -NativeEvidencePath $adapterNativePath -SourceCommit ('a' * 40) `
                 -ArtifactSetSha256 ('B' * 64) -RecordedUtc '2026-09-02T00:00:00Z' `
                 -MapName 'Stage5Validation.map' -MapCrc 1 -Seed 23063 `
-                -PeerCount 2 -Sessions $adapterSessions | Out-Null
+                -PeerCount 2 -Sessions $adapterSessions `
+                -CohortNonce $selfTestCohortNonce `
+                -CohortCreatedUtc $selfTestCohortCreatedUtc `
+                -RuntimeClosure $selfTestRuntimeClosure | Out-Null
         }
         catch { $adapterRosterRejected = $true }
         if (-not $adapterRosterRejected) {
             throw 'Lockstep-v2 host self-test accepted a substituted AI/network roster mask.'
         }
         $titleSession = New-LockstepTitleSessionContract 'Generals' `
-            'H:\GGC-LockstepV2HostSelfTest-TitleSession' `
-            'H:\GGC-LockstepV2HostSelfTest-Runtime'
+            (Join-Path $root 'TitleSessionContract') `
+            (Join-Path $root 'RuntimeContract')
         $peerEnvironment0 = Get-LockstepPeerEnvironment $titleSession 0
         $peerEnvironment1 = Get-LockstepPeerEnvironment $titleSession 1
-        if ([IO.Path]::GetPathRoot($titleSession.profileRoot) -cne 'H:\' -or
+        $selfTestDriveRoot = [IO.Path]::GetPathRoot($root)
+        if ([IO.Path]::GetPathRoot($titleSession.profileRoot) -cne $selfTestDriveRoot -or
             @($titleSession.registryValues).Count -ne 3 -or
             $peerEnvironment0.values['TEMP'] -ceq $peerEnvironment1.values['TEMP'] -or
-            [IO.Path]::GetPathRoot($peerEnvironment0.values['TEMP']) -cne 'H:\' -or
+            [IO.Path]::GetPathRoot($peerEnvironment0.values['TEMP']) -cne $selfTestDriveRoot -or
+            $peerEnvironment0.values['HOMEDRIVE'] -cne $selfTestDriveRoot.TrimEnd([char]92) -or
             @($titleSession.environmentVariableNames) -notcontains 'TEMP') {
-            throw 'Lockstep-v2 host self-test did not isolate H: profile/environment paths.'
+            throw 'Lockstep-v2 host self-test did not isolate profile/environment paths to its bounded scratch drive.'
         }
         $scriptText = [IO.File]::ReadAllText((Join-Path $PSScriptRoot `
             'Invoke-InstalledLockstepV2Validation.ps1'))
@@ -2926,6 +3127,31 @@ if (-not (Test-SafeHDirectory $OutputDirectory) -or (Test-Path -LiteralPath $Out
 [IO.Directory]::CreateDirectory($OutputDirectory) | Out-Null
 $outputFull = [IO.Path]::GetFullPath($OutputDirectory)
 $artifactSet = Read-AndValidateArtifactSet $ArtifactSetManifestPath $SourceCommit
+$executionCohortNonce = if ([string]::IsNullOrWhiteSpace($ExecutionCohortNonce)) {
+    [Guid]::NewGuid().ToString()
+}
+else { $ExecutionCohortNonce }
+Assert-LockstepCanonicalUuid $executionCohortNonce 'ExecutionCohortNonce' | Out-Null
+$executionCohortCreatedUtc = if ([string]::IsNullOrWhiteSpace($ExecutionCohortCreatedUtc)) {
+    [DateTimeOffset]::UtcNow.ToString('o')
+}
+else { $ExecutionCohortCreatedUtc }
+[DateTimeOffset]$cohortCreated = [DateTimeOffset]::MinValue
+if (-not [DateTimeOffset]::TryParse($executionCohortCreatedUtc,
+        [ref]$cohortCreated)) {
+    throw 'ExecutionCohortCreatedUtc must be a valid timestamp.'
+}
+$runtimeClosure = Assert-LockstepRuntimeClosure $artifactSet.runtimeClosure `
+    'Artifact-set runtime closure'
+if (-not [string]::IsNullOrWhiteSpace($RuntimeClosureDependencyManifestSha256) -and
+    $runtimeClosure.dependencyManifestSha256 -cne
+        $RuntimeClosureDependencyManifestSha256.ToUpperInvariant()) {
+    throw 'Requested runtime dependency-manifest closure hash does not match the artifact set.'
+}
+if (-not [string]::IsNullOrWhiteSpace($RuntimeClosureSha256) -and
+    $runtimeClosure.closureSha256 -cne $RuntimeClosureSha256.ToUpperInvariant()) {
+    throw 'Requested runtime closure hash does not match the artifact set.'
+}
 $generalsFull = [IO.Path]::GetFullPath($GeneralsExecutable)
 $zeroHourFull = [IO.Path]::GetFullPath($ZeroHourExecutable)
 if ($generalsFull -cne $artifactSet.artifacts['generals-executable'].path -or
@@ -2988,7 +3214,8 @@ try {
             ([string]$artifactSet.artifacts[$role].path) `
             $executables[$title] $SourceCommit $titleRoot $PeerCount `
             ($BasePort + ($titleIndex * $PeerCount)) $MapName $MapCrc $Seed $PeerTimeoutSeconds `
-            $launcherContracts[$title] ([bool]$AllowHeadlessDirectExecution) $titleSession
+            $launcherContracts[$title] ([bool]$AllowHeadlessDirectExecution) $titleSession `
+            $executionCohortNonce $executionCohortCreatedUtc $runtimeClosure
         $profileFiles = @(Assert-LockstepProfileReadOnly $titleSession.profileRoot)
         $sessionResults[-1] | Add-Member -NotePropertyName profileReadOnlyVerified `
             -NotePropertyValue $true -Force
@@ -3020,7 +3247,8 @@ try {
                 $executables[$title] $SourceCommit $outputFull $titleRoot `
                 $probePortBase $MapName $MapCrc $Seed $PeerTimeoutSeconds `
                 $launcherContracts[$title] ([bool]$AllowHeadlessDirectExecution) `
-                $titleSession $probeMode
+                $titleSession $probeMode $executionCohortNonce `
+                $executionCohortCreatedUtc $runtimeClosure
             $negativeProbeResults += $negativeProbe
             foreach ($port in @($probePortBase, $probePortBase + 1)) {
                 if ($allPorts -contains $port) {
@@ -3047,6 +3275,8 @@ try {
         sourceCommit = $SourceCommit
         artifactSetSha256 = $artifactSet.sha256
         recordedUtc = $recordedUtc
+        cohortNonce = $executionCohortNonce
+        runtimeClosure = $runtimeClosure
         allowHeadlessDirectExecution = [bool]$AllowHeadlessDirectExecution
         launcherEquivalence = $launcherContracts
         commonStopFrame = $CommonStopFrame
@@ -3111,7 +3341,10 @@ $finalAcceptanceEnvelope = New-LockstepV2FinalAcceptanceEnvelope `
     -MapCrc $MapCrc `
     -Seed $Seed `
     -PeerCount $PeerCount `
-    -Sessions $sessionResults
+    -Sessions $sessionResults `
+    -CohortNonce $executionCohortNonce `
+    -CohortCreatedUtc $executionCohortCreatedUtc `
+    -RuntimeClosure $runtimeClosure
 $finalAcceptancePath = Join-Path $outputFull 'mixed-worker-multiplayer.json'
 Write-AtomicText $finalAcceptancePath `
     ($finalAcceptanceEnvelope.document | ConvertTo-Json -Depth 12)

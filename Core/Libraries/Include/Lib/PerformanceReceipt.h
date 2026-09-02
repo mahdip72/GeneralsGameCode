@@ -25,9 +25,9 @@ namespace rts { namespace performance {
 
 const unsigned PERFORMANCE_RECEIPT_SCHEMA_VERSION = 1;
 const char *const PERFORMANCE_RECEIPT_PRODUCER =
-	"game-executable-performance-receipt-v1";
+	"game-executable-stage5-performance-report-v2";
 const char *const PERFORMANCE_RECEIPT_EVIDENCE_KIND =
-	"stage5-performance-receipt";
+	"stage5-executable-originated-receipt";
 
 struct PerformanceReceiptCpuSet
 {
@@ -93,14 +93,24 @@ struct PerformanceReceipt
 	std::string producer;
 	std::string evidenceKind;
 	std::string status;
+	std::string role;
+	std::string producerVersion;
 	std::string title;
 	std::string runId;
+	std::string runNonce;
+	std::string cohortNonce;
+	std::string cohortCreatedUtc;
+	std::string recordedUtc;
+	std::string architecture;
 	// Transport-only destination supplied by the installed-runtime host.  It
 	// is required to publish the receipt but is intentionally not serialized as
 	// evidence because it is not part of executable provenance.
 	std::string outputDirectory;
+	std::string receiptPath;
 	std::string sourceCommit;
 	std::string artifactSetSha256;
+	std::string runtimeClosureDependencyManifestSha256;
+	std::string runtimeClosureSha256;
 	std::string executablePath;
 	std::string executableSha256;
 	std::string commandLine;

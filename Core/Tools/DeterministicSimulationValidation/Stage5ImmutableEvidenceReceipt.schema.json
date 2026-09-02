@@ -7,7 +7,8 @@
   "required": [
     "schemaVersion", "evidenceKind", "status", "role", "trustDomain",
     "producer", "producerVersion", "sourceCommit", "title", "architecture",
-    "artifactSetSha256", "recordedUtc", "details", "provenance"
+    "artifactSetSha256", "recordedUtc", "cohortNonce", "runtimeClosure",
+    "details", "provenance"
   ],
   "properties": {
     "schemaVersion": { "const": 1 },
@@ -45,9 +46,6 @@
         "reviewed-replay-fixture-manifest-v2",
         "stage5-premium-review-receipt-v2",
         "installed-runtime-manual-acceptance-v2",
-        "game-executable-stage5-validation-results-v2",
-        "game-executable-stage5-replay-results-v2",
-        "game-executable-stage5-ai-results-v2",
         "game-executable-stage5-performance-report-v2"
       ]
     },
@@ -78,6 +76,8 @@
       ]
     },
     "recordedUtc": { "type": "string", "format": "date-time" },
+    "cohortNonce": { "type": "string", "format": "uuid" },
+    "runtimeClosure": { "$ref": "#/$defs/runtimeClosureBinding" },
     "rawLogs": {
       "type": "array",
       "minItems": 1,
@@ -115,6 +115,15 @@
         "sha256": { "$ref": "#/$defs/sha256" }
       }
     },
+    "runtimeClosureBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dependencyManifestSha256", "closureSha256"],
+      "properties": {
+        "dependencyManifestSha256": { "$ref": "#/$defs/sha256" },
+        "closureSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
     "childStream": {
       "type": "object",
       "additionalProperties": false,
@@ -127,15 +136,16 @@
     "nativeReceiptReference": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["path", "sha256", "producer", "runNonce"],
+      "required": ["path", "sha256", "producer", "runNonce", "cohortNonce"],
       "properties": {
         "path": { "$ref": "#/$defs/relativePath" },
         "sha256": { "$ref": "#/$defs/sha256" },
         "producer": {
           "type": "string",
-          "pattern": "^game-executable-stage5-[a-z0-9-]+-v2$"
+          "const": "game-executable-stage5-performance-report-v2"
         },
-        "runNonce": { "type": "string", "format": "uuid" }
+        "runNonce": { "type": "string", "format": "uuid" },
+        "cohortNonce": { "type": "string", "format": "uuid" }
       }
     },
     "hostChild": {
@@ -144,7 +154,7 @@
       "required": [
         "role", "title", "runNonce", "processId", "processCreationUtc",
         "executablePath", "executableSha256", "commandLine", "exitCode",
-        "stdout", "stderr"
+        "stdout", "stderr", "nativeReceipt"
       ],
       "properties": {
         "role": { "type": "string", "minLength": 1 },
@@ -241,6 +251,40 @@
         "sha256": { "$ref": "#/$defs/sha256" }
       }
     },
+    "combinedSourceReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "path", "sha256", "runNonce", "cohortNonce"],
+      "properties": {
+        "title": { "enum": ["Generals", "ZeroHour"] },
+        "path": { "$ref": "#/$defs/relativePath" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "runNonce": { "type": "string", "format": "uuid" },
+        "cohortNonce": { "type": "string", "format": "uuid" }
+      }
+    },
+    "combinedDetails": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pipelineMode", "simulationMode", "workerPolicy", "renderer",
+        "renderThread", "bothTitlesPassed", "sourceReceipts"
+      ],
+      "properties": {
+        "pipelineMode": { "const": "parallel" },
+        "simulationMode": { "const": "parallel" },
+        "workerPolicy": { "const": "auto" },
+        "renderer": { "const": "d3d11" },
+        "renderThread": { "const": "dedicated" },
+        "bothTitlesPassed": { "const": true },
+        "sourceReceipts": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "$ref": "#/$defs/combinedSourceReceipt" }
+        }
+      }
+    },
     "commonHostProperties": {
       "type": "object",
       "properties": {
@@ -298,7 +342,8 @@
               "required": ["role", "producer"],
               "properties": {
                 "role": { "const": "combined-results" },
-                "producer": { "const": "installed-runtime-combined-results-v2" }
+                "producer": { "const": "installed-runtime-combined-results-v2" },
+                "details": { "$ref": "#/$defs/combinedDetails" }
               }
             }
           ]
@@ -320,12 +365,7 @@
           ]
         },
         "producer": {
-          "enum": [
-            "game-executable-stage5-validation-results-v2",
-            "game-executable-stage5-replay-results-v2",
-            "game-executable-stage5-ai-results-v2",
-            "game-executable-stage5-performance-report-v2"
-          ]
+          "const": "game-executable-stage5-performance-report-v2"
         },
         "provenance": { "$ref": "#/$defs/nativeProvenance" }
       },
@@ -335,19 +375,19 @@
             {
               "properties": {
                 "role": { "const": "validation-results" },
-                "producer": { "const": "game-executable-stage5-validation-results-v2" }
+                "producer": { "const": "game-executable-stage5-performance-report-v2" }
               }
             },
             {
               "properties": {
                 "role": { "const": "replay-results" },
-                "producer": { "const": "game-executable-stage5-replay-results-v2" }
+                "producer": { "const": "game-executable-stage5-performance-report-v2" }
               }
             },
             {
               "properties": {
                 "role": { "const": "ai-results" },
-                "producer": { "const": "game-executable-stage5-ai-results-v2" }
+                "producer": { "const": "game-executable-stage5-performance-report-v2" }
               }
             },
             {

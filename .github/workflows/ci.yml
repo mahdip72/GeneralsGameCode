@@ -263,6 +263,82 @@ jobs:
       extras: true
     secrets: inherit
 
+  stage5-combined-host-runner:
+    name: Stage 5 Combined Host-Runner Receipt
+    needs: [stage5-execution-cohort, stage5-replaycheck-generalsmd-x64, stage5-replaycheck-generals-x64]
+    if: >-
+      ${{ always() && github.event_name == 'workflow_dispatch' &&
+          inputs.stage5_fixture_manifest != '' &&
+          inputs.stage5_generals_fixture_manifest != '' &&
+          inputs.stage5_acceptance_manifest != '' }}
+    runs-on: windows-2022
+    timeout-minutes: 15
+    env:
+      STAGE5_ACCEPTANCE_MANIFEST: ${{ inputs.stage5_acceptance_manifest }}
+      STAGE5_COHORT_NONCE: ${{ needs['stage5-execution-cohort'].outputs.nonce }}
+      STAGE5_COHORT_CREATED_UTC: ${{ needs['stage5-execution-cohort'].outputs.created_utc }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Provision isolated Stage 5 volume
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath 'H:\')) {
+            & subst.exe H: "$env:RUNNER_TEMP"
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath 'H:\')) { throw 'Stage 5 could not provision H:.' }
+          }
+
+      - name: Download Generals Stage 5 evidence
+        uses: actions/download-artifact@70fc10c6e5e1ceaa63e36b76f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: Stage5-Simulation-Validation-Generals-x64-generals-vcpkg-product+e
+          path: ${{ runner.temp }}\Stage5CombinedSources\Generals
+
+      - name: Download Zero Hour Stage 5 evidence
+        uses: actions/download-artifact@70fc10c6e5e1ceaa63e36b76fdaad77386f024f # v8.0.0
+        with:
+          name: Stage5-Simulation-Validation-GeneralsMD-x64-zerohour-vcpkg-product+e
+          path: ${{ runner.temp }}\Stage5CombinedSources\ZeroHour
+
+      - name: Produce combined host-runner receipt
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $acceptancePath = [IO.Path]::GetFullPath((Join-Path "${{ github.workspace }}" $env:STAGE5_ACCEPTANCE_MANIFEST))
+          $acceptance = Get-Content -LiteralPath $acceptancePath -Raw | ConvertFrom-Json
+          $sourceCommit = ([string]$acceptance.sourceCommit).ToLowerInvariant()
+          if ($sourceCommit -notmatch '^[0-9a-f]{40}$' -or $sourceCommit -cne $env:GITHUB_SHA.ToLowerInvariant()) { throw 'Stage 5 acceptance sourceCommit is stale.' }
+          $artifactPath = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $acceptancePath) ([string]$acceptance.artifactSet.path)))
+          $artifactHash = (Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256).Hash
+          if ($artifactHash -cne ([string]$acceptance.artifactSet.sha256).ToUpperInvariant()) { throw 'Stage 5 artifact-set hash is stale.' }
+          $artifactSet = Get-Content -LiteralPath $artifactPath -Raw | ConvertFrom-Json
+          $artifactByRole = @{}
+          foreach ($artifact in @($artifactSet.artifacts)) { $artifactByRole[[string]$artifact.role] = [string]$artifact.sha256 }
+          $generalsReceipts = @(Get-ChildItem -LiteralPath "${{ runner.temp }}\Stage5CombinedSources\Generals" -Recurse -Filter 'validation-results-receipt.json' -File)
+          $zeroHourReceipts = @(Get-ChildItem -LiteralPath "${{ runner.temp }}\Stage5CombinedSources\ZeroHour" -Recurse -Filter 'validation-results-receipt.json' -File)
+          if ($generalsReceipts.Count -ne 1 -or $zeroHourReceipts.Count -ne 1) { throw 'Stage 5 combined producer requires exactly one fresh receipt for each title.' }
+          $combinedOutput = 'H:\Stage5CombinedSimulationTask\Evidence\combined-results-receipt.json'
+          & 'Core/Tools/DeterministicSimulationValidation/New-Stage5CombinedHostRunnerReceipt.ps1' `
+            -GeneralsReceiptPath $generalsReceipts[0].FullName `
+            -ZeroHourReceiptPath $zeroHourReceipts[0].FullName `
+            -OutputPath $combinedOutput `
+            -ExpectedSourceCommit $sourceCommit `
+            -ExpectedArtifactSetSha256 $artifactHash `
+            -ExpectedGeneralsExecutableSha256 ([string]$artifactByRole['generals-executable']) `
+            -ExpectedZeroHourExecutableSha256 ([string]$artifactByRole['zerohour-executable']) `
+            -ExpectedCohortNonce $env:STAGE5_COHORT_NONCE `
+            -ExpectedCohortCreatedUtc $env:STAGE5_COHORT_CREATED_UTC
+          if (-not $?) { throw 'Stage 5 combined host-runner producer failed.' }
+          Write-Host 'Stage 5 combined host-runner receipt is ready for cross-title pre-manual aggregation.'
+
+      - name: Upload combined Stage 5 evidence
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: Stage5-Simulation-Validation-combined
+          path: H:\Stage5CombinedSimulationTask\Evidence
+          retention-days: 30
+          if-no-files-found: error
   build-native-x64-focused-runtime:
     name: Native x64 ${{ matrix.preset }} Shared Runtime Focus
     needs: detect-changes
@@ -323,10 +399,31 @@ jobs:
         shell: pwsh
         run: |
           & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5WorkflowContract.ps1" -SelfTest
+  stage5-execution-cohort:
+    name: Stage 5 Fresh Execution Cohort
+    needs: detect-changes
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' &&
+          inputs.stage5_acceptance_manifest != '' &&
+          (inputs.stage5_fixture_manifest != '' || inputs.stage5_generals_fixture_manifest != '') }}
+    runs-on: windows-2022
+    timeout-minutes: 5
+    outputs:
+      nonce: ${{ steps.mint.outputs.nonce }}
+      created_utc: ${{ steps.mint.outputs.created_utc }}
+    steps:
+      - name: Mint fresh execution cohort
+        id: mint
+        shell: pwsh
+        run: |
+          $nonce = [Guid]::NewGuid().ToString()
+          $created = [DateTimeOffset]::UtcNow.ToString('o')
+          "nonce=$nonce" >> $env:GITHUB_OUTPUT
+          "created_utc=$created" >> $env:GITHUB_OUTPUT
 
   stage5-replaycheck-generalsmd-x64:
     name: Stage 5 Installed Runtime Replay Matrix GeneralsMD x64
-    needs: [detect-changes, build-generalsmd-x64]
+    needs: [detect-changes, build-generalsmd-x64, stage5-execution-cohort]
     if: >-
       ${{ github.event_name == 'workflow_dispatch' &&
           inputs.stage5_fixture_manifest != '' &&
@@ -344,13 +441,15 @@ jobs:
       stage5_performance_baseline: ${{ inputs.stage5_performance_baseline }}
       stage5_expected_stage3_executable_sha256: ${{ inputs.stage5_expected_stage3_executable_sha256 }}
       stage5_acceptance_manifest: ${{ inputs.stage5_acceptance_manifest }}
+      stage5_execution_cohort_nonce: ${{ needs.stage5-execution-cohort.outputs.nonce }}
+      stage5_execution_cohort_created_utc: ${{ needs.stage5-execution-cohort.outputs.created_utc }}
       stage5_replay_matrix_repeats: 2
       stage5_stress_repeats: 3
     secrets: inherit
 
   stage5-replaycheck-generals-x64:
     name: Stage 5 Installed Runtime Replay Matrix Generals x64
-    needs: [detect-changes, build-generals-x64]
+    needs: [detect-changes, build-generals-x64, stage5-execution-cohort]
     if: >-
       ${{ github.event_name == 'workflow_dispatch' &&
           inputs.stage5_generals_fixture_manifest != '' &&
@@ -368,6 +467,8 @@ jobs:
       stage5_performance_baseline: ${{ inputs.stage5_generals_performance_baseline }}
       stage5_expected_stage3_executable_sha256: ${{ inputs.stage5_generals_expected_stage3_executable_sha256 }}
       stage5_acceptance_manifest: ${{ inputs.stage5_acceptance_manifest }}
+      stage5_execution_cohort_nonce: ${{ needs.stage5-execution-cohort.outputs.nonce }}
+      stage5_execution_cohort_created_utc: ${{ needs.stage5-execution-cohort.outputs.created_utc }}
       stage5_replay_matrix_repeats: 2
       stage5_stress_repeats: 3
     secrets: inherit

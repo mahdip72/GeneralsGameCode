@@ -59,6 +59,16 @@ on:
         type: string
         default: ""
         description: "Repository-relative reviewed final Stage 5 acceptance manifest"
+      stage5_execution_cohort_nonce:
+        required: false
+        type: string
+        default: ""
+        description: "Fresh execution cohort UUID minted by the caller before either title runs"
+      stage5_execution_cohort_created_utc:
+        required: false
+        type: string
+        default: ""
+        description: "UTC creation timestamp for the caller-minted execution cohort"
 
 jobs:
   build:
@@ -549,6 +559,8 @@ jobs:
           STAGE5_PERFORMANCE_BASELINE: ${{ inputs.stage5_performance_baseline }}
           STAGE5_EXPECTED_STAGE3_EXECUTABLE_SHA256: ${{ inputs.stage5_expected_stage3_executable_sha256 }}
           STAGE5_ACCEPTANCE_MANIFEST: ${{ inputs.stage5_acceptance_manifest }}
+          STAGE5_EXECUTION_COHORT_NONCE: ${{ inputs.stage5_execution_cohort_nonce }}
+          STAGE5_EXECUTION_COHORT_CREATED_UTC: ${{ inputs.stage5_execution_cohort_created_utc }}
         run: |
           $ErrorActionPreference = 'Stop'
           $workspaceFull = [IO.Path]::GetFullPath("${{ github.workspace }}")
@@ -559,9 +571,34 @@ jobs:
               throw "$Context must be a non-empty repository-relative path."
             }
             $candidate = [IO.Path]::GetFullPath((Join-Path $workspaceFull $RelativePath))
-            $prefix = $workspaceFull.TrimEnd('\') + '\'
-            if (-not $candidate.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+            $base = $workspaceFull.TrimEnd('\')
+            $baseRoot = [IO.Path]::GetPathRoot($base)
+            $candidateRoot = [IO.Path]::GetPathRoot($candidate)
+            if ($baseRoot -isnot [string] -or $candidateRoot -isnot [string] -or
+                -not $baseRoot.Equals($candidateRoot, [StringComparison]::OrdinalIgnoreCase)) {
               throw "$Context must stay below the checked-out repository."
+            }
+            $baseParts = @($base.Substring($baseRoot.Length) -split '[\\/]' |
+              Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            $candidateParts = @($candidate.Substring($candidateRoot.Length) -split '[\\/]' |
+              Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            if ($candidateParts.Count -le $baseParts.Count) {
+              throw "$Context must stay below the checked-out repository."
+            }
+            for ($index = 0; $index -lt $baseParts.Count; ++$index) {
+              if (-not $candidateParts[$index].Equals($baseParts[$index],
+                  [StringComparison]::OrdinalIgnoreCase)) {
+                throw "$Context must stay below the checked-out repository."
+              }
+            }
+            $current = $base
+            foreach ($segment in @($candidateParts[$baseParts.Count..($candidateParts.Count - 1)])) {
+              $current = Join-Path $current $segment
+              if (-not (Test-Path -LiteralPath $current)) { break }
+              $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+              if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "$Context contains a reparse-point path component: $current"
+              }
             }
             if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
               throw "$Context was not found: $RelativePath"
@@ -633,6 +670,45 @@ jobs:
           if ([IO.Path]::GetFileName($acceptancePath) -match '(?i)\.(?:example|sample)\.') {
             throw 'Stage 5 final acceptance requires a reviewed manifest; example/sample manifests are not accepted.'
           }
+          $acceptanceDocument = Get-Content -LiteralPath $acceptancePath -Raw | ConvertFrom-Json
+          $acceptanceSourceCommit = ([string]$acceptanceDocument.sourceCommit).ToLowerInvariant()
+          if ([int]$acceptanceDocument.schemaVersion -ne 1 -or
+              [string]$acceptanceDocument.gateName -cne 'final-stage5-acceptance' -or
+              $acceptanceSourceCommit -notmatch '^[0-9a-f]{40}$' -or
+              $acceptanceSourceCommit -cne $env:GITHUB_SHA.ToLowerInvariant()) {
+            throw 'Stage 5 final acceptance manifest is stale or has an unsupported schema.'
+          }
+          $acceptanceArtifactReference = $acceptanceDocument.artifactSet
+          if ($null -eq $acceptanceArtifactReference -or
+              [string]::IsNullOrWhiteSpace([string]$acceptanceArtifactReference.path)) {
+            throw 'Stage 5 final acceptance manifest is missing its artifact-set reference.'
+          }
+          $artifactSetPath = Resolve-Stage5RepositoryFile (Join-Path (Split-Path -Parent $acceptancePath) ([string]$acceptanceArtifactReference.path)) 'Stage 5 artifact set'
+          $artifactSetHash = (Get-FileHash -LiteralPath $artifactSetPath -Algorithm SHA256).Hash
+          if ($artifactSetHash -cne ([string]$acceptanceArtifactReference.sha256).ToUpperInvariant()) {
+            throw 'Stage 5 artifact-set SHA-256 does not match the reviewed acceptance manifest.'
+          }
+          $artifactSetDocument = Get-Content -LiteralPath $artifactSetPath -Raw | ConvertFrom-Json
+          if ([int]$artifactSetDocument.schemaVersion -ne 1 -or
+              [string]$artifactSetDocument.sourceCommit -cne $acceptanceSourceCommit -or
+              [string]$artifactSetDocument.architecture -cne 'x64') {
+            throw 'Stage 5 artifact set is stale or not an x64 artifact set for the checked-out commit.'
+          }
+          $runtimeClosure = $artifactSetDocument.runtimeClosure
+          if ($null -eq $runtimeClosure -or $null -eq $runtimeClosure.dependencyManifest -or
+              [string]$runtimeClosure.dependencyManifest.sha256 -notmatch '^[0-9A-Fa-f]{64}$' -or
+              [string]$runtimeClosure.closureSha256 -notmatch '^[0-9A-Fa-f]{64}$') {
+            throw 'Stage 5 artifact set is missing canonical runtime-closure hashes.'
+          }
+          $executionCohortNonce = [string]$env:STAGE5_EXECUTION_COHORT_NONCE
+          $executionCohortCreatedUtc = [string]$env:STAGE5_EXECUTION_COHORT_CREATED_UTC
+          if ($executionCohortNonce -notmatch '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-5][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$') {
+            throw 'Stage 5 requires a fresh caller-minted execution cohort nonce.'
+          }
+          [DateTimeOffset]$executionCohortCreated = [DateTimeOffset]::MinValue
+          if (-not [DateTimeOffset]::TryParse($executionCohortCreatedUtc, [ref]$executionCohortCreated)) {
+            throw 'Stage 5 requires a valid caller-minted execution cohort creation timestamp.'
+          }
 
           $candidateName = [string]$manifestDocument.executable
           if ($candidateName -notmatch '^[A-Za-z0-9._-]+\.exe$') {
@@ -691,19 +767,26 @@ jobs:
             '-MinimumFreeBytes', '2147483648',
             '-EnforcePerformance',
             '-Stage3PerformanceBaselinePath', $baselinePath,
-            '-ExpectedStage3ExecutableSha256', $expectedStage3Hash
+            '-ExpectedStage3ExecutableSha256', $expectedStage3Hash,
+            '-AcceptanceSourceCommit', $acceptanceSourceCommit,
+            '-AcceptanceArtifactSetSha256', $artifactSetHash,
+            '-ExecutionCohortNonce', $executionCohortNonce,
+            '-ExecutionCohortCreatedUtc', $executionCohortCreatedUtc,
+            '-AcceptanceRuntimeDependencyManifestSha256', ([string]$runtimeClosure.dependencyManifest.sha256),
+            '-AcceptanceRuntimeClosureSha256', ([string]$runtimeClosure.closureSha256)
           )
           if ($requireX64) { $validationArguments += '-RequireX64' }
           & "Core/Tools/DeterministicSimulationValidation/Run-DeterministicSimulationValidation.ps1" @validationArguments
           if (-not $?) {
             throw 'Stage 5 ValidationSet All runner failed.'
           }
-          $acceptanceOutput = Join-Path $outputRoot 'final-acceptance-report.json'
-          & "Core/Tools/DeterministicSimulationValidation/Invoke-Stage5FinalAcceptance.ps1" `
-            -AcceptanceManifestPath $acceptancePath -OutputPath $acceptanceOutput
-          if (-not $?) {
-            throw 'Stage 5 final acceptance failed.'
-          }
+        # This title lane produces fresh, host-bound receipts. Cross-title
+        # pre-manual aggregation runs only after both title lanes and the
+        # combined host producer have been assembled; the reviewed
+        # repository manifest is never treated as fresh H: evidence here.
+        # Invoke-Stage5FinalAcceptance.ps1 is reserved for that assembled
+        # cross-title pre-manual step.
+        Write-Host 'Stage 5 fresh title receipts are ready for cross-title pre-manual aggregation.'
 
       - name: Normalize Stage 5 Evidence Paths for Upload
         if: ${{ always() && inputs.stage5 }}

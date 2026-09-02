@@ -2,9 +2,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$AcceptanceManifestPath,
     [Parameter(Mandatory = $true)][string]$OutputPath,
-    [ValidateSet('final-acceptance', 'final', 'development',
-        'development-readiness', 'pre-manual')]
-    [string]$ReadinessMode = 'final-acceptance',
+    [ValidateSet('development', 'development-readiness', 'pre-manual')]
+    [string]$ReadinessMode = 'development-readiness',
     [switch]$DevelopmentReadiness
 )
 
@@ -22,20 +21,13 @@ if (-not (Test-Path -LiteralPath $outputDirectory -PathType Container)) {
     New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
 }
 
-# The module validates and independently rehashes the artifact set, all eight
-# evidence manifests, and every evidence attachment before returning a passed
-# report. Any absent, stale, mismatched, or non-passing input throws before the
-# report can be written.
+# The module validates and independently rehashes the artifact set, all
+# development evidence manifests, and every evidence attachment before
+# returning a pre-manual readiness report. External premium review and user
+# approval are never represented as local JSON authority.
 $report = Invoke-Stage5FinalAcceptanceAggregation `
     -AcceptanceManifestPath $AcceptanceManifestPath `
     -ReadinessMode $ReadinessMode `
     -DevelopmentReadiness:$DevelopmentReadiness
 [IO.File]::WriteAllText($outputFull, ($report | ConvertTo-Json -Depth 10))
-$hasFinalAcceptanceClaim = @($report.PSObject.Properties.Name) -contains 'finalAcceptanceClaim'
-if ($hasFinalAcceptanceClaim -and $report.finalAcceptanceClaim -is [bool] -and
-    -not [bool]$report.finalAcceptanceClaim) {
-    Write-Output "Stage 5 development readiness passed for commit $($report.sourceCommit); final user manual approval remains required."
-}
-else {
-    Write-Output "Stage 5 final acceptance passed for commit $($report.sourceCommit)."
-}
+Write-Output "Stage 5 development readiness passed for commit $($report.sourceCommit); final user manual approval remains required."

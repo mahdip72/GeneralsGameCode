@@ -8,10 +8,18 @@
     "producer",
     "evidenceKind",
     "status",
+    "role",
+    "producerVersion",
     "title",
     "runId",
+    "runNonce",
+    "cohortNonce",
+    "cohortCreatedUtc",
+    "recordedUtc",
+    "architecture",
     "sourceCommit",
     "artifactSetSha256",
+    "runtimeClosure",
     "executablePath",
     "executableSha256",
     "commandLine",
@@ -21,19 +29,37 @@
     "worker",
     "topology",
     "rawEvidence",
+    "rawLogs",
+    "provenance",
     "schedulerMetrics",
     "phases",
     "kernels"
   ],
   "properties": {
     "schemaVersion": { "const": 1 },
-    "producer": { "const": "game-executable-performance-receipt-v1" },
-    "evidenceKind": { "const": "stage5-performance-receipt" },
-    "status": { "const": "complete" },
+    "producer": { "const": "game-executable-stage5-performance-report-v2" },
+    "evidenceKind": { "const": "stage5-executable-originated-receipt" },
+    "status": { "const": "passed" },
+    "role": { "const": "performance-report" },
+    "producerVersion": { "const": "2" },
     "title": { "type": "string", "minLength": 1 },
     "runId": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,256}$" },
+    "runNonce": { "type": "string", "format": "uuid" },
+    "cohortNonce": { "type": "string", "format": "uuid" },
+    "cohortCreatedUtc": { "type": "string", "format": "date-time" },
+    "recordedUtc": { "type": "string", "format": "date-time" },
+    "architecture": { "const": "x64" },
     "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
     "artifactSetSha256": { "$ref": "#/$defs/sha256" },
+    "runtimeClosure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dependencyManifestSha256", "closureSha256"],
+      "properties": {
+        "dependencyManifestSha256": { "$ref": "#/$defs/sha256" },
+        "closureSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
     "executablePath": { "type": "string", "minLength": 1 },
     "executableSha256": { "$ref": "#/$defs/sha256" },
     "commandLine": { "type": "string", "minLength": 1 },
@@ -179,6 +205,39 @@
         "rawLogSha256": { "$ref": "#/$defs/sha256" },
         "timingPath": { "type": "string", "minLength": 1 },
         "timingSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "rawLogs": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "path", "sha256"],
+        "properties": {
+          "name": { "enum": ["raw-log", "timing"] },
+          "path": { "type": "string", "minLength": 1 },
+          "sha256": { "$ref": "#/$defs/sha256" }
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind", "receiptPath", "processId", "processCreationUtc",
+        "executablePath", "executableSha256", "commandLine", "exitCode"
+      ],
+      "properties": {
+        "kind": { "const": "native-executable-observation" },
+        "receiptPath": { "type": "string", "minLength": 1 },
+        "processId": { "type": "integer", "minimum": 1 },
+        "processCreationUtc": { "type": "string", "format": "date-time" },
+        "executablePath": { "type": "string", "minLength": 1 },
+        "executableSha256": { "$ref": "#/$defs/sha256" },
+        "commandLine": { "type": "string", "minLength": 1 },
+        "exitCode": { "const": 0 }
       }
     },
     "schedulerMetrics": {

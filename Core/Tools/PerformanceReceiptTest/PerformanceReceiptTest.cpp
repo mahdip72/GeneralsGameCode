@@ -18,13 +18,25 @@ rts::performance::PerformanceReceipt makeCompleteReceipt()
 {
 	using namespace rts::performance;
 	PerformanceReceipt receipt;
-	receipt.status = "complete";
+	receipt.status = "passed";
 	receipt.title = "Generals";
 	receipt.runId = "run-20260901-0001";
+	receipt.runNonce = "11111111-1111-4111-8111-111111111111";
+	receipt.cohortNonce = "22222222-2222-4222-8222-222222222222";
+	receipt.cohortCreatedUtc = "2026-09-01T00:00:00.000Z";
+	receipt.recordedUtc = "2026-09-01T00:01:00.000Z";
+	receipt.receiptPath = "H:\\evidence\\performance-receipt-run-20260901-0001-4242.json";
+	receipt.role = "performance-report";
+	receipt.producerVersion = "2";
+	receipt.architecture = "x64";
 	receipt.sourceCommit =
 		"0123456789abcdef0123456789abcdef01234567";
 	receipt.artifactSetSha256 =
 		"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+	receipt.runtimeClosureDependencyManifestSha256 =
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+	receipt.runtimeClosureSha256 =
+		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 	receipt.executablePath = "H:\\installed\\generals.exe";
 	receipt.executableSha256 =
 		"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
@@ -138,7 +150,7 @@ int testSerializationAndEscaping()
 	int result = 0;
 	result |= check(rts::performance::SerializePerformanceReceipt(receipt,
 		document), "complete receipt serializes");
-	result |= check(document.find("game-executable-performance-receipt-v1") !=
+	result |= check(document.find("game-executable-stage5-performance-report-v2") !=
 		std::string::npos, "serialized producer is explicit");
 	result |= check(document.find("\\\"dense\\\\8\\\"") !=
 		std::string::npos, "JSON string escaping is deterministic");
