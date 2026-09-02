@@ -114,6 +114,31 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD)
     add_test(NAME g_native_render_target_texture_tests
         COMMAND g_native_render_target_texture_tests)
     set_tests_properties(g_native_render_target_texture_tests PROPERTIES TIMEOUT 30)
+
+    add_executable(g_native_line3d_render_tests
+        "${CMAKE_SOURCE_DIR}/Core/Tools/NativeW3DLineTest/line3dprod.cpp"
+    )
+    target_include_directories(g_native_line3d_render_tests PRIVATE
+        "${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas"
+        "${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas/WW3D2"
+        "${CMAKE_SOURCE_DIR}/Generals/Code/Libraries/Source/WWVegas"
+        "${CMAKE_SOURCE_DIR}/Generals/Code/Libraries/Source/WWVegas/WW3D2"
+    )
+    target_link_libraries(g_native_line3d_render_tests PRIVATE
+        core_wwstub
+        core_ww3d2_native
+        g_ww3d2
+        vfw32
+        winmm
+    )
+    set_target_properties(g_native_line3d_render_tests PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED YES
+        CXX_EXTENSIONS NO
+    )
+    add_test(NAME g_native_line3d_render_tests
+        COMMAND g_native_line3d_render_tests)
+    set_tests_properties(g_native_line3d_render_tests PROPERTIES TIMEOUT 60)
 endif()
 
 if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD

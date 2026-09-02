@@ -46,9 +46,10 @@
  *   MMMC::initialize_metal_params -- Utility function (shared CTor code)                      *
  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
+#include "Utility/CppMacros.h"
 #include "metalmap.h"
 #include "texture.h"
-#include "dx8wrapper.h"
+#include "Renderer/RenderTexturePublication.h"
 #include "ww3dformat.h"
 #include "ww3d.h"
 #include <WWMath/vp.h>
@@ -314,8 +315,15 @@ void MetalMapManagerClass::Update_Textures()
 		Vector3 white(1.0f, 1.0f, 1.0f);
 
 		SurfaceClass * metal_map_surface = Textures[i]->Get_Surface_Level(0);
-		int pitch;
+		if (metal_map_surface == nullptr) {
+			continue;
+		}
+		int pitch = 0;
 		unsigned char *map=(unsigned char *) metal_map_surface->Lock(&pitch);
+		if (map == nullptr || pitch <= 0) {
+			REF_PTR_RELEASE(metal_map_surface);
+			continue;
+		}
 		int idx=0;
 		for (int y = 0; y < METALMAP_SIZE; y++) {
 			for (int x = 0; x < METALMAP_SIZE; x++) {
@@ -345,9 +353,16 @@ void MetalMapManagerClass::Update_Textures()
 			}
 			map+=pitch;
 		}
+		bool published = true;
+#if defined(_WIN64)
+		published = metal_map_surface->Unlock_Native_Surface();
+#else
 		metal_map_surface->Unlock();
+#endif
 		REF_PTR_RELEASE(metal_map_surface);
-		Notify_Render_Texture_Changed(Textures[i]);
+		if (published) {
+			rts::render::NotifyTextureChanged(Textures[i]);
+		}
 	}
 }
 

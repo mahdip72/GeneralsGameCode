@@ -2,6 +2,7 @@
 #define RTS_RENDERER_NATIVEW3DRESOURCES_H
 
 #include "Renderer/NativeW3DRenderer.h"
+#include "Renderer/NativeW3DOwnerQueue.h"
 
 #include <vector>
 
@@ -14,6 +15,29 @@ class NativeW3DBufferOwner;
 class NativeW3DTextureCandidate;
 class NativeW3DTextureOwner;
 class NativeW3DTextureCleanupTicket;
+
+// A buffer owner cleanup ticket is drawn from the resource table's bounded
+// pool.  The ticket retains the table implementation until an owner-thread
+// callback retires the exact handle, so a foreign owner destructor never
+// leaves a raw resource-table pointer behind.
+class NativeW3DBufferCleanupTicket
+{
+public:
+	NativeW3DBufferCleanupTicket();
+	bool IsInUse() const;
+
+private:
+	friend class NativeW3DResources;
+	NativeW3DBufferCleanupTicket(const NativeW3DBufferCleanupTicket &);
+	NativeW3DBufferCleanupTicket &operator=(
+		const NativeW3DBufferCleanupTicket &);
+
+	void *m_table;
+	GpuHandle m_handle;
+	NativeW3DOwnerFallbackEntry m_fallback;
+	NativeW3DBufferCleanupTicket *m_next;
+	bool m_inUse;
+};
 
 #if defined(_MSC_VER)
 typedef unsigned __int64 NativeW3DSubmissionSequence;
@@ -200,6 +224,10 @@ public:
 		unsigned int indexCount, GpuHandle *validated) const;
 	bool Destroy(GpuHandle handle);
 	bool DestroyTexture(NativeW3DTextureHandle handle);
+	// Transfers an owned buffer to registry cleanup.  A backend refusal marks
+	// only this exact slot retired; Shutdown retries physical destruction while
+	// all other resources remain available.
+	bool RetireBuffer(GpuHandle handle);
 	// Transfers an owned texture to registry cleanup.  A backend refusal hides
 	// only this texture and defers physical destruction until Shutdown.
 	bool RetireTexture(NativeW3DTextureHandle handle);
@@ -264,15 +292,25 @@ private:
 		NativeW3DTextureCleanupTicket **ticket);
 	static RenderResult ReleaseTextureCleanupTicket(
 		NativeW3DTextureCleanupTicket *ticket);
+	RenderResult CreateBufferCleanupTicket(GpuHandle handle,
+		NativeW3DBufferCleanupTicket **ticket);
+	static RenderResult ReleaseBufferCleanupTicket(
+		NativeW3DBufferCleanupTicket *ticket);
 	static bool RetireTextureImpl(Impl *impl,
 		NativeW3DTextureHandle handle);
+	static bool RetireBufferImpl(Impl *impl, GpuHandle handle);
 	static bool HasTextureCleanupTicket(const Impl *impl, GpuHandle handle);
+	static bool HasBufferCleanupTicket(const Impl *impl, GpuHandle handle);
 	static void AddImplReference(Impl *impl);
 	static void ReleaseImplReference(Impl *impl);
 	static void ForgetTextureCleanupTicket(Impl *impl,
 		NativeW3DTextureCleanupTicket *ticket);
+	static void ForgetBufferCleanupTicket(Impl *impl,
+		NativeW3DBufferCleanupTicket *ticket);
 	static void DestroyTransferredTexture(void *context);
 	static void ReleaseTransferredTexture(void *context);
+	static void DestroyTransferredBuffer(void *context);
+	static void ReleaseTransferredBuffer(void *context);
 	static void DestroyDeferredResourceTable(void *context);
 	static void ReleaseDeferredResourceTable(void *context);
 

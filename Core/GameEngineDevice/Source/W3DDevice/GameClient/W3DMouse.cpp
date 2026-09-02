@@ -29,7 +29,7 @@
 
 
 #include "Common/GameMemory.h"
-#include "WW3D2/dx8wrapper.h"
+#include "Renderer/RenderGameClient.h"
 #include "WW3D2/rendobj.h"
 #include "WW3D2/hanim.h"
 #include "WW3D2/camera.h"
@@ -118,9 +118,9 @@ W3DMouse::~W3DMouse()
 
 	// Keep the existing final Win32 cursor reset, but only touch the legacy
 	// hardware cursor while that mode is actually in use.
-	if (m_currentRedrawMode == RM_DX8 && !DX8Wrapper::Is_D3D11_Backend_Active())
+	if (m_currentRedrawMode == RM_DX8 && !rts::render::IsNativeGameRendererActive())
 	{
-		DX8Wrapper::Set_Cursor_Visible(false);
+		rts::render::SetGameCursorVisible(false);
 	}
 	Win32Mouse::setCursor(ARROW); //enable default windows cursor
 
@@ -355,7 +355,7 @@ void W3DMouse::init()
 	// device and cannot display a cursor owned by the hidden legacy device.
 	const RedrawMode configuredRedrawMode = m_currentRedrawMode;
 	m_currentRedrawMode = resolveHardwareCursorMode(
-		m_currentRedrawMode, !DX8Wrapper::Is_D3D11_Backend_Active());
+		m_currentRedrawMode, !rts::render::IsNativeGameRendererActive());
 	if (configuredRedrawMode != m_currentRedrawMode)
 	{
 		freeD3DAssets();
@@ -392,7 +392,7 @@ void W3DMouse::setCursor( MouseCursor cursor )
 
 	CriticalSectionClass::LockClass m(mutex);
 	if (m_currentRedrawMode == RM_DX8 &&
-		DX8Wrapper::Is_D3D11_Backend_Active())
+		rts::render::IsNativeGameRendererActive())
 	{
 		// A mode change can be requested before the device transition has
 		// completed.  Do not let that transient state call into the hidden DX8
@@ -425,12 +425,11 @@ void W3DMouse::setCursor( MouseCursor cursor )
 	{
 		SetCursor(nullptr);	//Kill Windows Cursor
 
-		LPDIRECT3DDEVICE8 m_pDev=DX8Wrapper::_Get_D3D_Device8();
 		Bool doImageChange=FALSE;
 
-		if (m_pDev != nullptr)
+		if (rts::render::IsGameRendererInitialized())
 		{
-			m_pDev->ShowCursor(FALSE);	//disable DX8 cursor
+			rts::render::SetGameCursorVisible(false);
 			if (cursor != m_currentD3DCursor)
 			{	if (!isThread)
 				{	releaseD3DCursorTextures(m_currentD3DCursor);
@@ -446,12 +445,13 @@ void W3DMouse::setCursor( MouseCursor cursor )
 		//it didn't change.  This is needed to prevent the cursor from flickering.
 		if (doImageChange)
 		{
-			HRESULT res;
 			m_currentHotSpot = m_cursorInfo[cursor].hotSpotPosition;
 			m_currentFMS = m_cursorInfo[cursor].fps/1000.0f;
 			m_currentAnimFrame = 0;	//reset animation when cursor changes
-			res = m_pDev->SetCursorProperties(m_currentHotSpot.x,m_currentHotSpot.y,m_currentD3DSurface[(Int)m_currentAnimFrame]->Peek_D3D_Surface());
-			m_pDev->ShowCursor(TRUE);	//Enable DX8 cursor
+			rts::render::SetGameCursorProperties(m_currentHotSpot.x,
+				m_currentHotSpot.y,
+				m_currentD3DSurface[(Int)m_currentAnimFrame]);
+			rts::render::SetGameCursorVisible(true);
 			m_currentD3DFrame=(Int)m_currentAnimFrame;
 			m_currentD3DCursor = cursor;
 			m_lastAnimTime=timeGetTime();
@@ -518,14 +518,14 @@ void W3DMouse::draw()
 	setCursor(m_currentCursor);
 
 	if (m_currentRedrawMode == RM_DX8 &&
-		!DX8Wrapper::Is_D3D11_Backend_Active() &&
+		!rts::render::IsNativeGameRendererActive() &&
 		m_currentD3DCursor != NONE)
 	{
 		//called from update thread or rendering loop.  Tells D3D where
 		//to draw the mouse cursor.
-		LPDIRECT3DDEVICE8 m_pDev=DX8Wrapper::_Get_D3D_Device8();
-		if (m_pDev)
-		{	m_pDev->ShowCursor(TRUE);	//Enable DX8 cursor
+		if (rts::render::IsGameRendererInitialized())
+		{
+			rts::render::SetGameCursorVisible(true);
 
 			if (TheDisplay && !TheDisplay->getWindowed())
 			{	//if we're full-screen, need to manually move cursor image
@@ -533,7 +533,7 @@ void W3DMouse::draw()
 
 				GetCursorPos( &ptCursor );
 				ScreenToClient( ApplicationHWnd, &ptCursor );
-				m_pDev->SetCursorPosition( ptCursor.x, ptCursor.y, D3DCURSOR_IMMEDIATE_UPDATE);
+				 rts::render::SetGameCursorPosition(ptCursor.x, ptCursor.y);
 			}
 			//Check if animated cursor and new frame
 			if (m_currentFrames > 1)
@@ -546,7 +546,9 @@ void W3DMouse::draw()
 				if ((Int)m_currentAnimFrame != m_currentD3DFrame)
 				{
 					m_currentD3DFrame=(Int)m_currentAnimFrame;
-					m_pDev->SetCursorProperties(m_currentHotSpot.x,m_currentHotSpot.y,m_currentD3DSurface[m_currentD3DFrame]->Peek_D3D_Surface());
+					rts::render::SetGameCursorProperties(m_currentHotSpot.x,
+						m_currentHotSpot.y,
+						m_currentD3DSurface[m_currentD3DFrame]);
 				}
 			}
 		}
@@ -631,9 +633,9 @@ void W3DMouse::draw()
 
 void W3DMouse::setRedrawMode(RedrawMode mode)
 {
-	mode = resolveHardwareCursorMode(mode, !DX8Wrapper::Is_D3D11_Backend_Active());
+	mode = resolveHardwareCursorMode(mode, !rts::render::IsNativeGameRendererActive());
 	m_currentRedrawMode = resolveHardwareCursorMode(
-		m_currentRedrawMode, !DX8Wrapper::Is_D3D11_Backend_Active());
+		m_currentRedrawMode, !rts::render::IsNativeGameRendererActive());
 	MouseCursor cursor = getMouseCursor();
 
 	//Turn off the previous cursor mode

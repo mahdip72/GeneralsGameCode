@@ -189,6 +189,12 @@ enum RenderResult
 	RENDER_RESULT_FAILED
 };
 
+// The legacy display contract exposes immediate presentation (0) and up to
+// three queued vertical blanks.  Keep this bound independent of the backend's
+// wider DXGI Present range so every owner/producer adapter validates the same
+// game-facing values.
+enum { RENDER_SWAP_INTERVAL_MAX = 3 };
+
 // Validates the complete neutral texture contract before caller-owned bytes are
 // copied or a backend allocation is attempted.  A zero maximumUploadBytes
 // disables the byte budget; uploadBytes is cleared on every failure.
@@ -206,7 +212,14 @@ enum RenderResourceFaultPoint
 	RENDER_RESOURCE_FAULT_TEXTURE_VIEW,
 	RENDER_RESOURCE_FAULT_TEXTURE_SHADOW,
 	RENDER_RESOURCE_FAULT_TEXTURE_RECOVERY,
-	RENDER_RESOURCE_FAULT_TEXTURE_DESTRUCTION
+	RENDER_RESOURCE_FAULT_TEXTURE_DESTRUCTION,
+	// Appended so existing fault-point values remain stable.  This is used by
+	// sorted-batch tests to force a temporary vertex/index cleanup refusal.
+	RENDER_RESOURCE_FAULT_BUFFER_DESTRUCTION,
+	// A presentation-pass failure is injected after the optional postprocess
+	// draw but before DXGI Present, allowing native tests to read the transformed
+	// back buffer without depending on the flip queue.
+	RENDER_RESOURCE_FAULT_PRESENTATION_PASS
 };
 
 struct RenderResourceStatistics
@@ -230,6 +243,22 @@ struct RenderBackBufferInfo
 	unsigned int width;
 	unsigned int height;
 	RenderFormat format;
+};
+
+// Texture filtering is queried from the live backend rather than inferred
+// from a logical texture format or a legacy capability bitfield.  The base
+// contract is deliberately non-pure so test devices and older adapters remain
+// source-compatible; its conservative answer prevents callers from enabling
+// filtering that the backend has not positively advertised.
+struct RenderTextureFilterCapabilities
+{
+	RenderTextureFilterCapabilities() : supportsPoint(false),
+		supportsLinear(false), supportsAnisotropic(false), maxAnisotropy(1) {}
+
+	bool supportsPoint;
+	bool supportsLinear;
+	bool supportsAnisotropic;
+	unsigned int maxAnisotropy;
 };
 
 enum RenderCaptureKind
@@ -431,12 +460,12 @@ enum RenderVertexDataFormat
 	RENDER_VERTEX_DATA_FLOAT3,
 	RENDER_VERTEX_DATA_FLOAT4,
 	RENDER_VERTEX_DATA_COLOR_BGRA8,
-	// Raw four-byte integer fields are used by LASTBETA_UBYTE4.  D3DCOLOR is
+	// Raw four-byte integer fields are used by LASTBETA_UBYTE4.  Packed color is
 	// kept as a separate neutral format because its byte ordering/normalization
 	// contract differs from an ordinary packed diffuse colour.
 	RENDER_VERTEX_DATA_UBYTE4,
-	RENDER_VERTEX_DATA_D3DCOLOR,
-	RENDER_VERTEX_DATA_COLOR_D3DCOLOR = RENDER_VERTEX_DATA_D3DCOLOR
+	RENDER_VERTEX_DATA_PACKED_COLOR,
+	RENDER_VERTEX_DATA_COLOR_PACKED = RENDER_VERTEX_DATA_PACKED_COLOR
 };
 
 // Compatibility spelling for the existing backend adapter.  The native API
@@ -613,7 +642,49 @@ public:
 	// callers can submit the next non-zero size when the window is restored.
 	virtual RenderResult resize(unsigned int width, unsigned int height) = 0;
 	virtual RenderResult present() = 0;
+	// Optional presentation controls are deliberately non-pure so legacy and
+	// test-only devices remain source-compatible.  Native D3D11 overrides these
+	// with owner-thread implementations; unsupported devices fail closed.
+	virtual RenderResult setSwapInterval(unsigned int interval)
+	{
+		return interval > RENDER_SWAP_INTERVAL_MAX ?
+			RENDER_RESULT_INVALID_ARGUMENT : RENDER_RESULT_UNSUPPORTED;
+	}
+	virtual RenderResult getSwapInterval(unsigned int *interval) const
+	{
+		if (interval == 0)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		*interval = 0;
+		return RENDER_RESULT_UNSUPPORTED;
+	}
+	// Gamma remains a renderer-local presentation transform.  The second bool
+	// preserves the legacy curve's use-limit switch; calibrate is retained as
+	// metadata for parity with the old ramp API and never changes desktop state.
+	virtual RenderResult setGamma(float gamma, float brightness, float contrast,
+		bool calibrate, bool useLimit = true)
+	{
+		(void)gamma; (void)brightness; (void)contrast;
+		(void)calibrate; (void)useLimit;
+		return RENDER_RESULT_UNSUPPORTED;
+	}
+	virtual RenderResult getGamma(float *gamma, float *brightness,
+		float *contrast, bool *calibrate, bool *useLimit) const
+	{
+		if (gamma == 0 || brightness == 0 || contrast == 0 ||
+			calibrate == 0 || useLimit == 0)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		*gamma = 1.0f; *brightness = 0.0f; *contrast = 1.0f;
+		*calibrate = false; *useLimit = true;
+		return RENDER_RESULT_UNSUPPORTED;
+	}
 	virtual RenderResult getBackBufferInfo(RenderBackBufferInfo *info) const = 0;
+	virtual RenderResult getTextureFilterCapabilities(
+		RenderTextureFilterCapabilities *capabilities) const
+	{
+		if (capabilities != 0)
+			*capabilities = RenderTextureFilterCapabilities();
+		return RENDER_RESULT_UNSUPPORTED;
+	}
 	virtual RenderResult captureBackBuffer(void *destination,
 		size_t destinationBytes, size_t destinationRowPitch,
 		RenderFormat *format) = 0;

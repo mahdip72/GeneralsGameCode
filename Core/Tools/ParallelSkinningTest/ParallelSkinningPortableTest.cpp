@@ -4,6 +4,7 @@
 ** SPDX-License-Identifier: GPL-3.0-or-later
 */
 #include "Lib/ParallelSkinning.h"
+#include "../TestSupport/LocalCapacityTestLane.h"
 #include <stdio.h>
 #include <string.h>
 #include <vector>
@@ -26,8 +27,15 @@ int check(bool value, const char *message)
 }
 }
 
-int main()
+int main(int argc, char **argv)
 {
+	bool localCapacity = false;
+	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity))
+	{
+		fprintf(stderr, "Usage: core_parallel_skinning_portable_tests [--local-capacity]\n");
+		return 2;
+	}
+	rts_test::PrintTestCapacityLane(localCapacity);
 	int result = 0;
 	rts::JobSystem &jobs = rts::JobSystem::instance();
 	std::vector<rts::SkinningMatrix> matrices(65, identity());
@@ -63,8 +71,13 @@ int main()
 	const unsigned configurations[] = { 1, 2, 4, 8, 16, 0 };
 	for (unsigned configuration = 0; configuration != 6; ++configuration)
 	{
+		const unsigned effectiveWorkerCount =
+			rts_test::ResolveActualWorkerCount(configurations[configuration],
+			localCapacity);
+		rts_test::PrintWorkerCountSubstitution("parallel skinning portable",
+			configurations[configuration], effectiveWorkerCount, localCapacity);
 		rts::JobSystemConfig config = rts::JobSystem::startupConfig();
-		config.workerCount = configurations[configuration];
+		config.workerCount = effectiveWorkerCount;
 		config.queueCapacity = 8192;
 		result |= check(jobs.start(config), "start portable worker configuration");
 		rts::SkinningOptions options;

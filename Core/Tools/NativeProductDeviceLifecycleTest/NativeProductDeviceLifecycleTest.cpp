@@ -7,16 +7,19 @@ namespace
 struct FakeDevice
 {
 	FakeDevice() : initializeCalls(0), prepareCalls(0), resizeCalls(0),
-		shutdownCalls(0), failInitialize(false), failPrepare(false),
-		failResize(false), width(0), height(0), vsync(false) {}
+		shutdownCalls(0), shutdownResultCalls(0), failInitialize(false),
+		failPrepare(false), failResize(false), failShutdown(false), width(0),
+		height(0), vsync(false) {}
 
 	unsigned int initializeCalls;
 	unsigned int prepareCalls;
 	unsigned int resizeCalls;
 	unsigned int shutdownCalls;
+	unsigned int shutdownResultCalls;
 	bool failInitialize;
 	bool failPrepare;
 	bool failResize;
+	bool failShutdown;
 	unsigned int width;
 	unsigned int height;
 	bool vsync;
@@ -54,6 +57,13 @@ void Shutdown(void *context)
 	++static_cast<FakeDevice *>(context)->shutdownCalls;
 }
 
+bool ShutdownResult(void *context)
+{
+	FakeDevice *device = static_cast<FakeDevice *>(context);
+	++device->shutdownResultCalls;
+	return !device->failShutdown;
+}
+
 rts::render::NativeProductDeviceOperations Operations(FakeDevice *device)
 {
 	rts::render::NativeProductDeviceOperations operations;
@@ -62,6 +72,13 @@ rts::render::NativeProductDeviceOperations Operations(FakeDevice *device)
 	operations.prepareResize = PrepareResize;
 	operations.resize = Resize;
 	operations.shutdown = Shutdown;
+	return operations;
+}
+
+rts::render::NativeProductDeviceOperations ResultOperations(FakeDevice *device)
+{
+	rts::render::NativeProductDeviceOperations operations = Operations(device);
+	operations.shutdownResult = ShutdownResult;
 	return operations;
 }
 
@@ -124,6 +141,38 @@ int main()
 	lifecycle.shutdown();
 	if (!Check(failedInitialize.shutdownCalls == 0,
 		"failed initialize does not own shutdown"))
+	{
+		return 1;
+	}
+
+	FakeDevice failedShutdown;
+	if (!Check(lifecycle.bind(ResultOperations(&failedShutdown)),
+			"bind failed-shutdown fixture") ||
+		!Check(lifecycle.create(800, 600, false),
+			"create failed-shutdown fixture"))
+	{
+		return 1;
+	}
+	failedShutdown.failShutdown = true;
+	if (!Check(!lifecycle.shutdown(), "failed shutdown") ||
+		!Check(lifecycle.state() ==
+			rts::render::NativeProductDeviceLifecycle::ACTIVE,
+			"failed shutdown retains active state") ||
+		!Check(lifecycle.ownsDeviceResources(),
+			"failed shutdown retains device-resource ownership") ||
+		!Check(failedShutdown.shutdownResultCalls == 1 &&
+			failedShutdown.shutdownCalls == 0,
+			"result callback is authoritative"))
+	{
+		return 1;
+	}
+	failedShutdown.failShutdown = false;
+	if (!Check(lifecycle.shutdown(), "retry shutdown") ||
+		!Check(failedShutdown.shutdownResultCalls == 2,
+			"retry invokes result callback") ||
+		!Check(lifecycle.state() ==
+			rts::render::NativeProductDeviceLifecycle::UNBOUND,
+			"retry reaches unbound state"))
 	{
 		return 1;
 	}

@@ -4,6 +4,7 @@
 ** SPDX-License-Identifier: GPL-3.0-or-later
 */
 #include "Lib/CollisionCandidateKernel.h"
+#include "../TestSupport/LocalCapacityTestLane.h"
 
 #include <limits.h>
 #include <stdio.h>
@@ -721,7 +722,7 @@ void testPartitionOrderingGenerationAndCallbackDestruction()
 }
 
 #if !defined(_MSC_VER) || _MSC_VER >= 1300
-void testActualWorkerMatrixParity()
+void testActualWorkerMatrixParity(bool localCapacity)
 {
 	enum { OCCUPANT_COUNT = 65536, UNIQUE_COUNT = 24000, CELL_COUNT = 16 };
 	static rts::PartitionCollisionOccupantSnapshot occupants[OCCUPANT_COUNT];
@@ -775,10 +776,16 @@ void testActualWorkerMatrixParity()
 	for (unsigned worker = 0;
 		worker != sizeof(workerCounts) / sizeof(workerCounts[0]); ++worker)
 	{
-		if (!startJobSystem(workerCounts[worker]))
+		const unsigned requestedWorkerCount = workerCounts[worker];
+		const unsigned workerCount = rts_test::ResolveActualWorkerCount(
+			requestedWorkerCount, localCapacity);
+		rts_test::PrintWorkerCountSubstitution(
+			"Collision candidate kernel", requestedWorkerCount, workerCount,
+			localCapacity);
+		if (!startJobSystem(workerCount))
 			continue;
 		rts::JobSystem &jobs = rts::JobSystem::instance();
-		expect(jobs.workerCount() == workerCounts[worker],
+		expect(jobs.workerCount() == workerCount,
 			"worker-matrix fixture starts the exact requested lane count");
 		unsigned parallelCount = 71;
 		setSentinel(parallelOutput, OCCUPANT_COUNT);
@@ -788,7 +795,7 @@ void testActualWorkerMatrixParity()
 			CELL_COUNT, occupants, OCCUPANT_COUNT, parallelOutput,
 			OCCUPANT_COUNT, parallelScratch, OCCUPANT_COUNT, options,
 			&parallelCount, &metrics);
-		if (workerCounts[worker] == 1)
+		if (workerCount == 1)
 		{
 			expect(result == rts::COLLISION_CANDIDATE_SERIAL_FALLBACK &&
 				parallelCount == 71 && isSentinel(parallelOutput[0]),
@@ -797,12 +804,12 @@ void testActualWorkerMatrixParity()
 		else
 		{
 			const unsigned expectedRanges = rts::JobSystem::chooseRangeCount(
-				OCCUPANT_COUNT, options.minimumGrain, workerCounts[worker]);
+				OCCUPANT_COUNT, options.minimumGrain, workerCount);
 			const unsigned expectedMaximumRange =
 				(OCCUPANT_COUNT + expectedRanges - 1) / expectedRanges;
 			expect(result == rts::COLLISION_CANDIDATE_PARALLEL,
-				"2/4/8/16-worker partition fixture uses actual ranged jobs");
-			expect(metrics.submittedJobs >= workerCounts[worker] &&
+				"worker-matrix partition fixture uses actual ranged jobs");
+			expect(metrics.submittedJobs >= workerCount &&
 				metrics.completedJobs == metrics.submittedJobs &&
 				metrics.serialFallbacks == 0,
 				"large partition wave queues at least one range per configured lane");
@@ -819,16 +826,16 @@ void testActualWorkerMatrixParity()
 				metrics.peakConcurrentPhysicalWorkers != 0 &&
 				metrics.peakConcurrentPhysicalWorkers <=
 					metrics.distinctPhysicalWorkers &&
-				metrics.distinctPhysicalWorkers <= workerCounts[worker] &&
+				metrics.distinctPhysicalWorkers <= workerCount &&
 				metrics.physicalWorkerMaskComplete &&
-				(metrics.physicalWorkerMask >> workerCounts[worker]) == 0,
+				(metrics.physicalWorkerMask >> workerCount) == 0,
 				"range identities distinguish physical workers from owner help");
 			expect(parallelCount == serialCount && sameCandidates(
 				serialOutput, parallelOutput, serialCount),
 				"all worker counts preserve exact serial partition ordering");
 			expect(metrics.peakConcurrentPhysicalWorkers <=
-				workerCounts[worker] && metrics.peakConcurrentPhysicalWorkers != 0 &&
-				(workerCounts[worker] < 4 ||
+				workerCount && metrics.peakConcurrentPhysicalWorkers != 0 &&
+				(workerCount < 4 ||
 					metrics.peakConcurrentPhysicalWorkers >= 2),
 				"large collision wave records bounded physical-worker peak occupancy");
 		}
@@ -840,7 +847,7 @@ void testActualWorkerMatrixParity()
 			PARITY_INPUT_COUNT, genericParallel, PARITY_INPUT_COUNT,
 			genericParallelScratch, PARITY_INPUT_COUNT, options,
 			&genericParallelCount, &genericMetrics);
-		if (workerCounts[worker] == 1)
+		if (workerCount == 1)
 		{
 			expect(result == rts::COLLISION_CANDIDATE_SERIAL_FALLBACK &&
 				genericParallelCount == 72 && isSentinel(genericParallel[0]),
@@ -1099,8 +1106,17 @@ void testInjectedAllocationFailure()
 #endif
 }
 
-int main()
+int main(int argc, char **argv)
 {
+	bool localCapacity = false;
+	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity))
+	{
+		fprintf(stderr,
+			"Usage: core_collision_candidate_kernel_tests "
+			"[--local-capacity]\n");
+		return 2;
+	}
+	rts_test::PrintTestCapacityLane(localCapacity);
 	testUnsignedKey();
 	testAdmissionSamplesWholeEncounterSpan();
 	testOrderAndDedup();
@@ -1111,7 +1127,7 @@ int main()
 	testOneWorkerFallbackAndCancellation();
 	testPartitionOrderingGenerationAndCallbackDestruction();
 #if !defined(_MSC_VER) || _MSC_VER >= 1300
-	testActualWorkerMatrixParity();
+	testActualWorkerMatrixParity(localCapacity);
 	testOwnerHelpIdentityAndParity();
 	testPartitionInputLimitTransactional();
 #endif

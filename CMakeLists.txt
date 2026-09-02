@@ -68,7 +68,8 @@ if(WIN32 OR "${CMAKE_SYSTEM}" MATCHES "Windows")
     if(${CMAKE_SIZEOF_VOID_P} EQUAL 4 AND NOT RTS_BUILD_OPTION_FFMPEG)
         include(cmake/bink.cmake)
     endif()
-    if(_RTS_BUILD_REQUIRES_DX8 AND NOT RTS_VIDEO_BACKEND_GRAPH_AUDIT)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 4 AND _RTS_BUILD_REQUIRES_DX8 AND
+            NOT RTS_VIDEO_BACKEND_GRAPH_AUDIT)
         include(cmake/dx8.cmake)
     endif()
 endif()
@@ -127,6 +128,15 @@ endif()
 add_subdirectory(resources)
 
 add_subdirectory(Core)
+
+include(cmake/legacy-renderer.cmake)
+
+# The x86 renderer lane is created only after Core has defined the shared
+# CPU-side libraries; native x64 targets never link it.
+if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4 AND
+        NOT RTS_VIDEO_BACKEND_GRAPH_AUDIT)
+    rts_add_legacy_renderer_targets()
+endif()
 
 # Add main build targets
 if(RTS_BUILD_ZEROHOUR)

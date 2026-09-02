@@ -123,7 +123,7 @@ function Test-LegacyStateInvalidationContract {
     $textureLoop = [regex]::Match($invalidate,
         'for\s*\(\s*a\s*=\s*0\s*;\s*a\s*<\s*MAX_TEXTURE_STAGES\s*;\s*\+\+a\s*\)')
     $texturePresence = [regex]::Match($invalidate,
-        '\bTrackLegacyTexturePresence\s*\(\s*a\s*,\s*false\s*\)')
+        '\brts::render::PublishTextureStage\s*\(\s*a\s*,\s*nullptr\s*\)')
     if (-not $textureLoop.Success -or -not $texturePresence.Success -or
         $textureLoop.Index -gt $texturePresence.Index -or
         (Get-BraceDepthAt $invalidate $texturePresence.Index) -ne 1) {
@@ -297,6 +297,31 @@ function Test-PointParticleVertexContract {
     return $true
 }
 
+function Test-PublishedTextureStageDelegationContract {
+    param([Parameter(Mandatory = $true)][string]$PublicationImplementationText)
+
+    $text = Remove-CppComments $PublicationImplementationText
+    $publish = Get-FunctionBody $text `
+        'void Publish_Render_Texture_Stage(unsigned int stage,'
+    if ($null -eq $publish) { return $false }
+    $guard = $publish.IndexOf(
+        'if (stage >= LEGACY_TEXTURE_STAGE_COUNT)', [StringComparison]::Ordinal)
+    $assignment = $publish.IndexOf(
+        'g_publishedRenderTextures[stage] = texture;', [StringComparison]::Ordinal)
+    $tracked = $publish.IndexOf(
+        'TrackLegacyTexturePresence(stage, texture != 0);',
+        [StringComparison]::Ordinal)
+    if ($guard -lt 0 -or $assignment -lt 0 -or $tracked -lt 0 -or
+        $guard -gt $assignment -or $assignment -gt $tracked -or
+        [regex]::Matches($publish,
+            '\bTrackLegacyTexturePresence\s*\(\s*stage\s*,\s*texture\s*!=\s*0\s*\)').Count -ne 1 -or
+        (Get-BraceDepthAt $publish $assignment) -ne 0 -or
+        (Get-BraceDepthAt $publish $tracked) -ne 0) {
+        return $false
+    }
+    return $true
+}
+
 if ($SelfTest) {
     $valid = @'
 bool DX8Wrapper::Init(void * hwnd, bool lite)
@@ -309,7 +334,7 @@ void DX8Wrapper::Invalidate_Cached_Render_States()
 {
     ClearLegacyWrapperCaches();
     for (a=0; a<MAX_TEXTURE_STAGES; ++a) {
-        TrackLegacyTexturePresence(a, false);
+        rts::render::PublishTextureStage(a, nullptr);
     }
 }
 void DX8Wrapper::Set_DX8_Light(int index, D3DLIGHT8* light)
@@ -373,17 +398,47 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
     }
 }
 '@
+    $validPublication = @'
+void Publish_Render_Texture_Stage(unsigned int stage,
+    TextureBaseClass *texture)
+{
+    if (stage >= LEGACY_TEXTURE_STAGE_COUNT)
+    {
+        return;
+    }
+    g_publishedRenderTextures[stage] = texture;
+    TrackLegacyTexturePresence(stage, texture != 0);
+}
+'@
     $valid = $valid -replace "`r`n", "`n"
     $validBridge = $validBridge -replace "`r`n", "`n"
     $validPointGroup = $validPointGroup -replace "`r`n", "`n"
+    $validPublication = $validPublication -replace "`r`n", "`n"
     $validNative = $valid.Replace(
         "bool DX8Wrapper::Reset_Device(bool reload_assets, bool *reset_requires_reacquire)`n{`n",
         "bool DX8Wrapper::Reset_Device(bool reload_assets, bool *reset_requires_reacquire)`n{`n    if (IsInitted && _UseD3D11Backend && _NativeProductDeviceLifecycle.isActive()) {`n        if (!_NativeProductDeviceLifecycle.reset(640, 480)) {`n            return false;`n        }`n        ResetTrackedLegacyState();`n        SeedTrackedLegacyPipelineState();`n        Invalidate_Cached_Render_States();`n        return true;`n    }`n")
     if (-not (Test-LegacyStateInvalidationContract $valid) -or
         -not (Test-LegacyStateInvalidationContract $validNative) -or
         -not (Test-LegacyBridgeResetContract $validBridge) -or
-        -not (Test-PointParticleVertexContract $validPointGroup)) {
+        -not (Test-PointParticleVertexContract $validPointGroup) -or
+        -not (Test-PublishedTextureStageDelegationContract $validPublication)) {
         throw 'Valid cache-invalidation fixture rejected.'
+    }
+    $missingTexturePresenceDelegation = $validPublication.Replace(
+        "    TrackLegacyTexturePresence(stage, texture != 0);`n", '')
+    $earlyTexturePresenceDelegation = $validPublication.Replace(
+        "    g_publishedRenderTextures[stage] = texture;`n    TrackLegacyTexturePresence(stage, texture != 0);",
+        "    TrackLegacyTexturePresence(stage, texture != 0);`n    g_publishedRenderTextures[stage] = texture;")
+    $wrongTextureStage = $valid.Replace(
+        'rts::render::PublishTextureStage(a, nullptr);',
+        'rts::render::PublishTextureStage(0, nullptr);')
+    if ($missingTexturePresenceDelegation -eq $validPublication -or
+        (Test-PublishedTextureStageDelegationContract $missingTexturePresenceDelegation) -or
+        $earlyTexturePresenceDelegation -eq $validPublication -or
+        (Test-PublishedTextureStageDelegationContract $earlyTexturePresenceDelegation) -or
+        $wrongTextureStage -eq $valid -or
+        (Test-LegacyStateInvalidationContract $wrongTextureStage)) {
+        throw 'Texture-stage publication without tracked-state delegation was accepted.'
     }
     if ($validNative -eq $valid) {
         throw 'Native reset fixture mutation did not change the fixture.'
@@ -409,7 +464,7 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
         throw 'Ordinary cache invalidation was allowed to reset tracked device state.'
     }
     $missingTextureClear = $valid.Replace(
-        "        TrackLegacyTexturePresence(a, false);`n", '')
+        "        rts::render::PublishTextureStage(a, nullptr);`n", '')
     if ($missingTextureClear -eq $valid -or
         (Test-LegacyStateInvalidationContract $missingTextureClear)) {
         throw 'Ordinary invalidation without texture-presence clearing was accepted.'
@@ -482,8 +537,8 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
         throw 'Unreachable bridge reset preparation was accepted.'
     }
     $unreachableTextureClear = $valid.Replace(
-        "    for (a=0; a<MAX_TEXTURE_STAGES; ++a) {`n        TrackLegacyTexturePresence(a, false);`n    }",
-        "    TrackLegacyTexturePresence(a, false);`n    for (a=0; a<MAX_TEXTURE_STAGES; ++a) {`n    }")
+        "    for (a=0; a<MAX_TEXTURE_STAGES; ++a) {`n        rts::render::PublishTextureStage(a, nullptr);`n    }",
+        "    rts::render::PublishTextureStage(a, nullptr);`n    for (a=0; a<MAX_TEXTURE_STAGES; ++a) {`n    }")
     if ($unreachableTextureClear -eq $valid -or
         (Test-LegacyStateInvalidationContract $unreachableTextureClear)) {
         throw 'Texture-presence clear outside the stage loop was accepted.'
@@ -526,15 +581,18 @@ if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
     throw 'SourceRoot is required unless SelfTest is specified.'
 }
 
-$implementationPath = Join-Path $SourceRoot 'Core/Libraries/Source/WWVegas/WW3D2/dx8wrapper.cpp'
-$bridgeImplementationPath = Join-Path $SourceRoot 'Core/Libraries/Source/WWVegas/WW3D2/d3d11legacybridge.cpp'
+$implementationPath = Join-Path $SourceRoot 'Core/LegacyRenderer/WWVegas/WW3D2/dx8wrapper.cpp'
+$bridgeImplementationPath = Join-Path $SourceRoot 'Core/LegacyRenderer/WWVegas/WW3D2/d3d11legacybridge.cpp'
 $pointGroupImplementationPath = Join-Path $SourceRoot 'Core/Libraries/Source/WWVegas/WW3D2/pointgr.cpp'
+$publicationImplementationPath = Join-Path $SourceRoot 'Core/Libraries/Source/Renderer/LegacyRenderState.cpp'
 $implementation = [IO.File]::ReadAllText($implementationPath)
 $bridgeImplementation = [IO.File]::ReadAllText($bridgeImplementationPath)
 $pointGroupImplementation = [IO.File]::ReadAllText($pointGroupImplementationPath)
+$publicationImplementation = [IO.File]::ReadAllText($publicationImplementationPath)
 if (-not (Test-LegacyStateInvalidationContract $implementation) -or
     -not (Test-LegacyBridgeResetContract $bridgeImplementation) -or
-    -not (Test-PointParticleVertexContract $pointGroupImplementation)) {
+    -not (Test-PointParticleVertexContract $pointGroupImplementation) -or
+    -not (Test-PublishedTextureStageDelegationContract $publicationImplementation)) {
     throw 'Legacy state cache invalidation does not preserve tracked D3D11 device state.'
 }
 

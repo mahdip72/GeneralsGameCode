@@ -141,11 +141,14 @@ IDirect3DTexture8 *texture;
     Set-FixtureFile $fixtureRoot 'existing-grow.cpp' @'
 IDirect3DDevice8 *device;
 '@
-    Set-FixtureFile $fixtureRoot 'Core/Libraries/Source/WWVegas/WW3D2/dx8wrapper.cpp' @'
+    Set-FixtureFile $fixtureRoot 'Core/LegacyRenderer/WWVegas/WW3D2/dx8wrapper.cpp' @'
 DX8Wrapper *wrapper;
 '@
-    Set-FixtureFile $fixtureRoot 'Core/Libraries/Source/WWVegas/WW3D2/dx8wrapper.h' @'
+    Set-FixtureFile $fixtureRoot 'Core/LegacyRenderer/WWVegas/WW3D2/dx8wrapper.h' @'
 DX8Wrapper *wrapper;
+'@
+    Set-FixtureFile $fixtureRoot 'Core/LegacyRenderer/WWVegas/WW3D2/dx8webbrowser.cpp' @'
+int ExistingLegacyBrowser();
 '@
     Set-FixtureFile $fixtureRoot 'Core/Tools/W3DView/authoring.cpp' @'
 // Authoring tools are intentionally outside the product-runtime audit scope.
@@ -181,18 +184,38 @@ IDirect3DDevice8 *device;
 IDirect3DDevice8 *device;
 IDirect3DTexture8 *texture;
 '@
-    Set-FixtureFile $fixtureRoot 'Core/Libraries/Source/WWVegas/WW3D2/dx8wrapper.cpp' @'
+    Set-FixtureFile $fixtureRoot 'Core/LegacyRenderer/WWVegas/WW3D2/dx8wrapper.cpp' @'
 DX8Wrapper *wrapper;
 IDirect3DDevice8 *device;
 '@
-    Set-FixtureFile $fixtureRoot 'Core/Libraries/Source/WWVegas/WW3D2/dx8wrapper.h' @'
+    Set-FixtureFile $fixtureRoot 'Core/LegacyRenderer/WWVegas/WW3D2/dx8wrapper.h' @'
 DX8Wrapper *wrapper;
 IDirect3DDevice8 *device;
+void LegacyWrapperAssembly()
+{
+  __asm mov eax, ebx;
+}
+int WrapperPointerConversion = reinterpret_cast<int>(wrapper);
 '@
-    Set-FixtureFile $fixtureRoot 'Core/Libraries/Source/WWVegas/WW3D2/d3d11legacybridge.cpp' @'
+    Set-FixtureFile $fixtureRoot 'Core/LegacyRenderer/WWVegas/WW3D2/dx8webbrowser.cpp' @'
+int ExistingLegacyBrowser();
+int BrowserHandle = reinterpret_cast<int>(nativeWindow);
+void BrowserLegacyAssembly()
+{
+  __asm mov eax, ebx;
+}
+'@
+    Set-FixtureFile $fixtureRoot 'Core/LegacyRenderer/WWVegas/WW3D2/dx8webbrowser.h' @'
+int BrowserHeaderHandle = reinterpret_cast<int>(nativeWindow);
+'@
+    Set-FixtureFile $fixtureRoot 'Core/LegacyRenderer/GameEngineDevice/Source/W3DDevice/GameClient/W3DProfilerFrameCaptureLegacy.cpp' @'
+IDirect3DDevice8 *legacyDevice;
+IDirect3DTexture8 *legacyTexture;
+'@
+    Set-FixtureFile $fixtureRoot 'Core/LegacyRenderer/WWVegas/WW3D2/d3d11legacybridge.cpp' @'
 IDirect3DDevice8 *legacyDevice;
 '@
-    Set-FixtureFile $fixtureRoot 'Core/Libraries/Source/WWVegas/WW3D2/d3d11legacybridge.h' @'
+    Set-FixtureFile $fixtureRoot 'Core/LegacyRenderer/WWVegas/WW3D2/d3d11legacybridge.h' @'
 IDirect3DTexture8 *legacyTexture;
 '@
     Set-FixtureFile $fixtureRoot 'untracked.cpp' @'
@@ -242,6 +265,12 @@ __inline void GetFunctionDetails(void *pointer, char *name, char *filename, unsi
     $failure = Invoke-Audit $fixtureRoot $baseline
     Assert-Fixture ($failure.ExitCode -ne 0) 'growth fixture must fail closed'
     Assert-Fixture ($failure.Output -match 'existing-grow\.cpp.*baseline=1.*current=2') 'per-file growth must be reported with baseline and current counts'
+    Assert-Fixture ($failure.Output -notmatch 'W3DProfilerFrameCaptureLegacy\.cpp.*raw-d3d8-surface-area') 'the exact relocated profiler implementation must remain in the explicit raw-D3D8 boundary'
+    Assert-Fixture ($failure.Output -notmatch 'dx8webbrowser\.cpp.*pointer-to-32-bit-cast') 'the exact relocated browser implementation may retain its pointer-width conversion'
+    Assert-Fixture ($failure.Output -match 'dx8webbrowser\.cpp.*x86-inline-assembly-or-context') 'the relocated browser implementation must not allow unrelated x86 assembly'
+    Assert-Fixture ($failure.Output -notmatch 'dx8wrapper\.h.*x86-inline-assembly-or-context') 'the exact relocated wrapper header may retain its x86 assembly'
+    Assert-Fixture ($failure.Output -match 'dx8wrapper\.h.*pointer-to-32-bit-cast') 'the relocated wrapper header must not allow an unrelated pointer-width cast'
+    Assert-Fixture ($failure.Output -match 'dx8webbrowser\.h.*pointer-to-32-bit-cast') 'a neighboring browser path must not inherit the relocated implementation allowance'
     Assert-Fixture ($failure.Output -notmatch 'dx8wrapper\.(cpp|h).*raw-d3d8-surface-area') 'the explicit wrapper boundary may grow during migration'
     Assert-Fixture ($failure.Output -notmatch 'd3d11legacybridge\.(cpp|h).*raw-d3d8-surface-area') 'the explicit bridge boundary may grow during migration'
     Assert-Fixture ($failure.Output -match 'untracked\.cpp.*baseline=0.*current=1') 'untracked raw-D3D8 files must be included in the fail-closed ratchet'
@@ -423,14 +452,22 @@ HMODULE LoadLegacyRuntime()
     Set-FixtureFile $fixtureRoot 'existing-grow.cpp' @'
 IDirect3DDevice8 *device;
 '@
-    Set-FixtureFile $fixtureRoot 'Core/Libraries/Source/WWVegas/WW3D2/dx8wrapper.cpp' @'
+    Set-FixtureFile $fixtureRoot 'Core/LegacyRenderer/WWVegas/WW3D2/dx8wrapper.cpp' @'
 DX8Wrapper *wrapper;
+'@
+    Set-FixtureFile $fixtureRoot 'Core/LegacyRenderer/WWVegas/WW3D2/dx8wrapper.h' @'
+DX8Wrapper *wrapper;
+'@
+    Set-FixtureFile $fixtureRoot 'Core/LegacyRenderer/WWVegas/WW3D2/dx8webbrowser.cpp' @'
+int ExistingLegacyBrowser();
 '@
     Remove-Item -LiteralPath (Join-Path $fixtureRoot 'untracked.cpp') -Force
     Remove-Item -LiteralPath (Join-Path $fixtureRoot 'untracked-pointer.cpp') -Force
     Remove-Item -LiteralPath (Join-Path $fixtureRoot 'untracked-serialization.cpp') -Force
     Remove-Item -LiteralPath (Join-Path $fixtureRoot 'untracked-asm.cpp') -Force
     Remove-Item -LiteralPath (Join-Path $fixtureRoot 'untracked-window-message.cpp') -Force
+    Remove-Item -LiteralPath (Join-Path $fixtureRoot 'Core/LegacyRenderer/WWVegas/WW3D2/dx8webbrowser.h') -Force
+    Remove-Item -LiteralPath (Join-Path $fixtureRoot 'Core/LegacyRenderer/GameEngineDevice/Source/W3DDevice/GameClient/W3DProfilerFrameCaptureLegacy.cpp') -Force
     Remove-Item -LiteralPath (Join-Path $fixtureRoot 'Generals/Code/GameEngine/Include/Common/StackDump.h') -Force
     Remove-Item -LiteralPath (Join-Path $fixtureRoot 'Core/Libraries/Source/WWVegas/WW3D2/W3DWater.cpp') -Force
     Remove-Item -LiteralPath (Join-Path $fixtureRoot 'Core/GameEngine/CMakeLists.txt') -Force
@@ -440,20 +477,27 @@ DX8Wrapper *wrapper;
     Assert-Fixture ($clean.ExitCode -eq 0) 'same-count edits and temporary backend additions must pass'
     $strictClean = Invoke-Audit $fixtureRoot $baseline -StrictD3D8Boundary
     Assert-Fixture ($strictClean.ExitCode -eq 0) 'strict boundary must pass when only explicit migration files retain D3D8'
+    # The relocated legacy implementations are outside the product-runtime
+    # prefixes. Keep the final-cutover negative fixture in the shipped surface
+    # so this gate still proves that StrictFinal rejects product D3D8.
+    Set-FixtureFile $fixtureRoot 'Core/GameEngine/FinalCutoverLeak.cpp' @'
+IDirect3DDevice8 *legacyDevice;
+'@
     $finalBlocked = Invoke-Audit $fixtureRoot $baseline -StrictFinal
     Assert-Fixture ($finalBlocked.ExitCode -ne 0 -and
         $finalBlocked.Output -match 'strict-final native-d3d8-free occurrences=') 'final cutover must remain blocked while an explicit migration file retains D3D8'
+    Remove-Item -LiteralPath (Join-Path $fixtureRoot 'Core/GameEngine/FinalCutoverLeak.cpp') -Force
 
-    Set-FixtureFile $fixtureRoot 'Core/Libraries/Source/WWVegas/WW3D2/d3d11legacybridge.cpp' @'
+    Set-FixtureFile $fixtureRoot 'Core/LegacyRenderer/WWVegas/WW3D2/d3d11legacybridge.cpp' @'
 int NativeBridgeImplementation();
 '@
-    Set-FixtureFile $fixtureRoot 'Core/Libraries/Source/WWVegas/WW3D2/d3d11legacybridge.h' @'
+    Set-FixtureFile $fixtureRoot 'Core/LegacyRenderer/WWVegas/WW3D2/d3d11legacybridge.h' @'
 int NativeBridgeContract();
 '@
-    Set-FixtureFile $fixtureRoot 'Core/Libraries/Source/WWVegas/WW3D2/dx8wrapper.cpp' @'
+    Set-FixtureFile $fixtureRoot 'Core/LegacyRenderer/WWVegas/WW3D2/dx8wrapper.cpp' @'
 int NativeRendererImplementation();
 '@
-    Set-FixtureFile $fixtureRoot 'Core/Libraries/Source/WWVegas/WW3D2/dx8wrapper.h' @'
+    Set-FixtureFile $fixtureRoot 'Core/LegacyRenderer/WWVegas/WW3D2/dx8wrapper.h' @'
 int NativeRendererContract();
 '@
     $finalClean = Invoke-Audit $fixtureRoot $baseline -StrictFinal

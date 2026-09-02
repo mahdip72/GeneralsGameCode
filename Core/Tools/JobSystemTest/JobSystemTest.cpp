@@ -3,6 +3,7 @@
 #include <limits.h>
 #include <new>
 #include <stdio.h>
+#include <string.h>
 #if defined(_WIN32)
 #if !defined(NOMINMAX)
 #define NOMINMAX
@@ -59,6 +60,45 @@ extern "C" void rts_job_system_release_test_pause(unsigned pausePoint);
 
 namespace
 {
+enum JobSystemTestLane
+{
+	JOB_SYSTEM_TEST_LANE_FULL = 0,
+	JOB_SYSTEM_TEST_LANE_LOCAL_CAPACITY
+};
+
+const unsigned kLocalCapacityWorkerLimit = 12;
+JobSystemTestLane g_testLane = JOB_SYSTEM_TEST_LANE_FULL;
+
+bool parseJobSystemTestLane(int argc, const char *selector,
+	JobSystemTestLane *lane)
+{
+	if (lane == 0 || argc < 1)
+		return false;
+	*lane = JOB_SYSTEM_TEST_LANE_FULL;
+	if (argc == 1)
+		return true;
+	if (argc == 2 && selector != 0 &&
+		strcmp(selector, "--local-capacity") == 0)
+	{
+		*lane = JOB_SYSTEM_TEST_LANE_LOCAL_CAPACITY;
+		return true;
+	}
+	return false;
+}
+
+bool isLocalCapacityLane()
+{
+	return g_testLane == JOB_SYSTEM_TEST_LANE_LOCAL_CAPACITY;
+}
+
+unsigned workerCountForTest(unsigned requested, bool localCapacity)
+{
+	if (!localCapacity ||
+		(requested != 0 && requested <= kLocalCapacityWorkerLimit))
+		return requested;
+	return kLocalCapacityWorkerLimit;
+}
+
 int check(bool condition, const char *message)
 {
 	if (!condition)
@@ -67,6 +107,29 @@ int check(bool condition, const char *message)
 		return 1;
 	}
 	return 0;
+}
+
+int testJobSystemTestLaneSelection()
+{
+	int result = 0;
+	JobSystemTestLane lane = JOB_SYSTEM_TEST_LANE_LOCAL_CAPACITY;
+	result |= check(parseJobSystemTestLane(1, 0, &lane) &&
+		lane == JOB_SYSTEM_TEST_LANE_FULL,
+		"test lane defaults to the full high-core qualification lane");
+	result |= check(parseJobSystemTestLane(2, "--local-capacity", &lane) &&
+		lane == JOB_SYSTEM_TEST_LANE_LOCAL_CAPACITY,
+		"local capacity selector chooses the bounded test lane explicitly");
+	result |= check(!parseJobSystemTestLane(3, "--local-capacity", &lane),
+		"unknown test lane arguments are rejected");
+	result |= check(workerCountForTest(16, false) == 16 &&
+		workerCountForTest(32, false) == 32,
+		"full test lane retains its high-core worker requests");
+	result |= check(workerCountForTest(0, true) == kLocalCapacityWorkerLimit &&
+		workerCountForTest(16, true) == kLocalCapacityWorkerLimit &&
+		workerCountForTest(kLocalCapacityWorkerLimit, true) ==
+			kLocalCapacityWorkerLimit,
+		"local capacity lane bounds automatic and oversized worker requests");
+	return result;
 }
 
 class CountJob : public rts::Job
@@ -243,6 +306,8 @@ int testBasicStartSubmitWaitShutdown()
 
 int testDeterministicWorkerCounts()
 {
+	// The local lane keeps the worker-count matrix visible while replacing
+	// direct starts above the local capacity with an explicit bounded request.
 	const unsigned workerCounts[] = { 1, 2, 4, 8, 16, 0 };
 	const unsigned jobCount = 256;
 	unsigned reference[jobCount];
@@ -262,7 +327,8 @@ int testDeterministicWorkerCounts()
 		unsigned outputs[jobCount] = { 0 };
 		rts::JobHandle handles[jobCount];
 		rts::JobSystemConfig config;
-		config.workerCount = workerCounts[workerIndex];
+		config.workerCount = workerCountForTest(workerCounts[workerIndex],
+			isLocalCapacityLane());
 		config.queueCapacity = jobCount;
 		config.scratchBytesPerWorker = 4096;
 		config.pinWorkers = false;
@@ -273,9 +339,16 @@ int testDeterministicWorkerCounts()
 		result |= check(system.workerCount() == 1,
 			"VC6 reference adapter reports its single execution lane");
 #else
-		result |= check(workerCounts[workerIndex] == 0 ? system.workerCount() > 0 :
-			system.workerCount() == workerCounts[workerIndex],
-			"configured worker count has no product cap");
+		const unsigned expectedWorkerCount = workerCountForTest(
+			workerCounts[workerIndex], isLocalCapacityLane());
+		const bool workerCountMatches = isLocalCapacityLane() ?
+			system.workerCount() == expectedWorkerCount :
+			(workerCounts[workerIndex] == 0 ? system.workerCount() > 0 :
+				system.workerCount() == expectedWorkerCount);
+		result |= check(workerCountMatches,
+			isLocalCapacityLane() ?
+				"local lane uses its bounded worker request" :
+				"configured worker count has no product cap");
 #endif
 		rts::JobGroup group = system.createGroup();
 		for (index = 0; index < jobCount; ++index)
@@ -308,6 +381,7 @@ int testFlatRangePartitions()
 	int result = 0;
 	const unsigned sizes[] = { 0, 1, 7, 64, 257, 4097, 131071, UINT_MAX };
 	const unsigned grains[] = { 0, 1, 32, 512, UINT_MAX };
+	// These values exercise pure range arithmetic and do not start workers.
 	const unsigned workers[] = { 0, 1, 2, 4, 8, 16, UINT_MAX };
 	unsigned sizeIndex;
 	unsigned grainIndex;
@@ -378,17 +452,23 @@ int testFlatRangeKernelAndSaturationFallback()
 	int result = 0;
 	const unsigned itemCount = 4097;
 	const unsigned maximumRanges = itemCount / 32;
+	// The 16-worker case remains in the full matrix; local direct starts are
+	// reduced to the explicit 12-worker capacity by workerCountForTest.
 	const unsigned workers[] = { 1, 2, 4, 8, 16, 0 };
 	for (unsigned workerIndex = 0; workerIndex < sizeof(workers) / sizeof(workers[0]); ++workerIndex)
 	for (unsigned saturated = 0; saturated < 2; ++saturated)
 	{
 		rts::JobSystem &system = rts::JobSystem::instance();
 		rts::JobSystemConfig config;
-		config.workerCount = workers[workerIndex];
+		config.workerCount = workerCountForTest(workers[workerIndex],
+			isLocalCapacityLane());
 		config.queueCapacity = saturated ? 1 : maximumRanges;
 		config.scratchBytesPerWorker = 4096;
 		config.pinWorkers = false;
 		result |= check(system.start(config), "flat-range fixture starts");
+		if (isLocalCapacityLane())
+			result |= check(system.workerCount() <= kLocalCapacityWorkerLimit,
+				"local flat-range fixture stays within worker capacity");
 		unsigned executions[itemCount] = { 0 };
 		unsigned outputs[itemCount] = { 0 };
 		const unsigned rangeCount = rts::JobSystem::chooseRangeCount(itemCount, 32,
@@ -1325,9 +1405,14 @@ int testWideWorkerPriorityThroughput()
 {
 	int result = 0;
 	rts::JobSystem &system = rts::JobSystem::instance();
-	const unsigned workerCounts[2] = { 16, 32 };
+	const unsigned fullWorkerCounts[2] = { 16, 32 };
+	const unsigned localWorkerCounts[3] = { 4, 8, 12 };
+	const unsigned *workerCounts = isLocalCapacityLane() ?
+		localWorkerCounts : fullWorkerCounts;
+	const unsigned configurationCount = isLocalCapacityLane() ? 3 : 2;
 	const unsigned jobsPerPriority = 256;
-	for (unsigned configuration = 0; configuration < 2; ++configuration)
+	for (unsigned configuration = 0; configuration < configurationCount;
+		++configuration)
 	{
 		rts::JobSystemConfig config;
 		config.workerCount = workerCounts[configuration];
@@ -1336,6 +1421,9 @@ int testWideWorkerPriorityThroughput()
 		config.pinWorkers = false;
 		result |= check(system.start(config),
 			"wide priority-throughput scheduler starts");
+		if (isLocalCapacityLane())
+			result |= check(system.workerCount() <= kLocalCapacityWorkerLimit,
+				"local priority-throughput fixture stays within worker capacity");
 		rts::JobGroup group = system.createGroup();
 		std::atomic<unsigned> counts[rts::JOB_PRIORITY_COUNT];
 		for (unsigned priority = 0; priority < rts::JOB_PRIORITY_COUNT; ++priority)
@@ -1578,6 +1666,8 @@ int testTopologyPoliciesAndStartupOptions()
 	result |= check(rts::JobSystem::chooseWorkerCount(8,
 		rts::JOB_WORKER_POLICY_AUTO, 16) == 16,
 		"explicit worker count has no product hard cap");
+	// The wide topology values below exercise selection/mask arithmetic only;
+	// this test does not start a scheduler for those synthetic topologies.
 
 	rts::JobCpuSetInfo cpuSets[34];
 	for (unsigned index = 0; index < 32; ++index)
@@ -1611,6 +1701,7 @@ int testTopologyPoliciesAndStartupOptions()
 	result |= check(!containsReserved,
 		"auto reserves the two stable highest-performance CPU sets");
 
+	// This verifies command-line state storage only; it does not start workers.
 	result |= check(rts::JobSystem::setStartupWorkerCount(16),
 		"startup worker override accepts 16");
 	result |= check(rts::JobSystem::setStartupWorkerPolicy("all"),
@@ -2293,6 +2384,8 @@ int testLifecycleOwnershipAndResourceLimits()
 		"scheduler remains usable after rejected non-owner shutdown");
 	system.shutdown();
 
+	// The pathological request is rejected by JobSystem before allocation and
+	// intentionally remains outside the local worker-start matrix.
 	config.workerCount = UINT_MAX;
 	result |= check(!system.start(config) && !system.isRunning(),
 		"topology-derived resource limit rejects pathological worker counts");
@@ -2301,7 +2394,7 @@ int testLifecycleOwnershipAndResourceLimits()
 #endif
 }
 
-int main()
+int main(int argc, char **argv)
 {
 #if defined(_WIN32)
 	SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX |
@@ -2314,7 +2407,35 @@ int main()
 	_CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
 	_CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
 #endif
+	JobSystemTestLane selectedLane = JOB_SYSTEM_TEST_LANE_FULL;
+	const char *selector = argv != 0 && argc > 1 ? argv[1] : 0;
+	if (!parseJobSystemTestLane(argc, selector, &selectedLane))
+	{
+		fprintf(stderr, "Usage: %s [--local-capacity]\n",
+			argv != 0 && argc > 0 && argv[0] != 0 ? argv[0] :
+				"core_job_system_tests");
+		return 2;
+	}
+	g_testLane = selectedLane;
+	if (isLocalCapacityLane())
+	{
+		printf("JobSystem test lane: local-capacity (maximum test-created "
+			"workers=%u).\n", kLocalCapacityWorkerLimit);
+		printf("External high-core throughput lane explicitly excluded: "
+			"worker counts 16 and 32; the no-argument lane retains it.\n");
+		printf("Local priority-throughput worker counts: 4, 8 and 12.\n");
+		printf("Local deterministic and flat-range starts above 12, including "
+			"automatic requests, use explicit 12-worker requests.\n");
+		printf("Synthetic topology counts above 12 and the UINT_MAX rejection "
+			"probe do not create worker threads.\n");
+	}
+	else
+	{
+		printf("JobSystem test lane: full (includes high-core throughput "
+			"worker counts 16 and 32).\n");
+	}
 	int result = 0;
+	result |= testJobSystemTestLaneSelection();
 	// Match headless startup before any subsystem or test has started workers.
 	// Lazy model/pose preparation must not resurrect a compute pool here.
 	rts::JobSystem &coldSystem = rts::JobSystem::instance();

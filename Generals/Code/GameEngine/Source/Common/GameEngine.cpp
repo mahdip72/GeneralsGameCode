@@ -1122,8 +1122,6 @@ void GameEngine::update()
 	}
 }
 
-// Horrible reference, but we really, really need to know if we are windowed.
-extern bool DX8Wrapper_IsWindowed;
 extern HWND ApplicationHWnd;
 
 /** -----------------------------------------------------------------------------------------------

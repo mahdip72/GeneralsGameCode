@@ -12,6 +12,7 @@
 // CMake registration is intentionally owned by the integration lane.
 #include "Lib/JobSystem.h"
 #include "Lib/ObjectComputationIsland.h"
+#include "../TestSupport/LocalCapacityTestLane.h"
 
 #include <chrono>
 #include <cstdio>
@@ -24,8 +25,14 @@ struct Evidence
 	unsigned candidates;
 };
 
-bool run(unsigned objectCount, unsigned workerCount)
+bool run(unsigned objectCount, unsigned requestedWorkerCount,
+	bool localCapacity)
 {
+	const unsigned workerCount = rts_test::ResolveActualWorkerCount(
+		requestedWorkerCount, localCapacity);
+	rts_test::PrintWorkerCountSubstitution(
+		"Object computation island benchmark", requestedWorkerCount,
+		workerCount, localCapacity);
 	const unsigned cellCountX = 64;
 	const unsigned cellCountY = (objectCount + cellCountX - 1) / cellCountX;
 	const unsigned moduleCount = objectCount / 8 < 1024 ?
@@ -78,7 +85,7 @@ bool run(unsigned objectCount, unsigned workerCount)
 		return false;
 	const std::chrono::steady_clock::time_point islandBegin =
 		std::chrono::steady_clock::now();
-	rts::SimulationReadView view(600, objectCount + workerCount,
+	rts::SimulationReadView view(600, objectCount + requestedWorkerCount,
 		objects.data(), objectCount, modules.data(), moduleCount,
 		schedule.data(), moduleCount, cellCountX, cellCountY, cells.data(),
 		objectCount, members.data(), objectCount);
@@ -135,13 +142,22 @@ bool run(unsigned objectCount, unsigned workerCount)
 }
 }
 
-int main()
+int main(int argc, char **argv)
 {
+	bool localCapacity = false;
+	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity))
+	{
+		std::fprintf(stderr,
+			"Usage: core_object_computation_island_benchmark "
+			"[--local-capacity]\n");
+		return 2;
+	}
+	rts_test::PrintTestCapacityLane(localCapacity);
 	const unsigned sizes[] = { 1000, 4000, 8000 };
 	const unsigned workers[] = { 1, 2, 4, 8, 16 };
 	for (unsigned size = 0; size != sizeof(sizes) / sizeof(sizes[0]); ++size)
 		for (unsigned worker = 0;
 			worker != sizeof(workers) / sizeof(workers[0]); ++worker)
-			if (!run(sizes[size], workers[worker])) return 1;
+			if (!run(sizes[size], workers[worker], localCapacity)) return 1;
 	return 0;
 }

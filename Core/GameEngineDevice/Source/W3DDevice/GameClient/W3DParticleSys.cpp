@@ -92,7 +92,7 @@ void W3DParticleSystemManager::reset()
 	// particle manager is destroyed later and its reusable render helpers can
 	// still retain the last particle textures. Drop those references while the
 	// graphics runtime is alive so their eventual destructors never release a
-	// legacy COM object after the D3D8 compatibility module has been unloaded.
+	// stale graphics-runtime object after the renderer has been unloaded.
 	if (m_pointGroup != nullptr)
 		m_pointGroup->Set_Texture(nullptr);
 	if (m_streakLine != nullptr)

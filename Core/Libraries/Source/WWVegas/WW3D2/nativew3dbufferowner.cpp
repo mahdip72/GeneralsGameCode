@@ -20,11 +20,12 @@ bool IsSupportedUpdateMode(RenderBufferUpdateMode mode)
 		mode == RENDER_BUFFER_UPDATE_DISCARD ||
 		mode == RENDER_BUFFER_UPDATE_NO_OVERWRITE;
 }
+
 }
 
 RenderResult BindNativeW3DBufferResources(NativeW3DResources *resources)
 {
-	if (resources == 0 ||
+	if (resources == 0 || !resources->IsOwnerThread() ||
 		(g_nativeW3DBufferResources != 0 &&
 		 g_nativeW3DBufferResources != resources))
 	{
@@ -51,7 +52,8 @@ RenderResult UnbindNativeW3DBufferResources(NativeW3DResources *resources)
 	{
 		return RENDER_RESULT_OK;
 	}
-	if (resources == 0 || g_nativeW3DBufferResources != resources)
+	if (resources == 0 || g_nativeW3DBufferResources != resources ||
+		!resources->IsOwnerThread())
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
@@ -59,9 +61,15 @@ RenderResult UnbindNativeW3DBufferResources(NativeW3DResources *resources)
 	return RENDER_RESULT_OK;
 }
 
+bool IsNativeW3DBufferOwnerThread()
+{
+	return g_nativeW3DBufferResources != 0 &&
+		g_nativeW3DBufferResources->IsOwnerThread();
+}
+
 NativeW3DBufferOwner::NativeW3DBufferOwner() :
 	m_resources(0), m_bindingGeneration(0), m_descriptor(), m_handle(),
-	m_deferredHandle(),
+	m_cleanupTicket(0), m_deferredHandle(), m_deferredCleanupTicket(0),
 	m_authoritative(0), m_authoritativeBytes(0), m_staging(0),
 	m_lockOffset(0), m_lockBytes(0),
 	m_lockMode(RENDER_BUFFER_UPDATE_PRESERVE), m_locked(false),
@@ -71,7 +79,15 @@ NativeW3DBufferOwner::NativeW3DBufferOwner() :
 
 NativeW3DBufferOwner::~NativeW3DBufferOwner()
 {
-	Reset();
+	// Reset transfers foreign-thread destruction to the resource table's
+	// allocation-free fallback ticket.  A failed transfer deliberately leaves
+	// the ticket linked, keeping the table alive and making shutdown fail closed;
+	// this destructor must never allocate or discard a live backend handle.
+	(void)Reset();
+	ReleaseStaging();
+	delete[] m_authoritative;
+	m_authoritative = 0;
+	m_authoritativeBytes = 0;
 }
 
 RenderResult NativeW3DBufferOwner::Create(
@@ -118,7 +134,25 @@ RenderResult NativeW3DBufferOwner::Create(
 		m_failedMutation = true;
 		return result == RENDER_RESULT_OK ? RENDER_RESULT_FAILED : result;
 	}
+	NativeW3DBufferCleanupTicket *cleanupTicket = 0;
+	const RenderResult ticketResult =
+		m_resources->CreateBufferCleanupTicket(created, &cleanupTicket);
+	if (ticketResult != RENDER_RESULT_OK || cleanupTicket == 0)
+	{
+		if (!m_resources->Destroy(created))
+		{
+			(void)m_resources->RetireBuffer(created);
+		}
+		delete[] authoritative;
+		m_resources = 0;
+		m_bindingGeneration = 0;
+		m_descriptor = BufferDescriptor();
+		m_failedMutation = true;
+		return ticketResult == RENDER_RESULT_OK ? RENDER_RESULT_FAILED :
+			ticketResult;
+	}
 	m_handle = created;
+	m_cleanupTicket = cleanupTicket;
 	m_authoritative = authoritative;
 	m_authoritativeBytes = descriptor.byteCount;
 	m_failedMutation = false;
@@ -129,41 +163,47 @@ RenderResult NativeW3DBufferOwner::Reset()
 {
 	ReleaseStaging();
 	RenderResult result = RENDER_RESULT_OK;
-	NativeW3DResources *resources = ActiveResources();
-	if (resources != 0 && m_deferredHandle.isValid() &&
-		resources->IsValid(m_deferredHandle) &&
-		!resources->Destroy(m_deferredHandle))
+	if (m_deferredCleanupTicket != 0)
 	{
-		result = RENDER_RESULT_FAILED;
+		const RenderResult releaseResult =
+			NativeW3DResources::ReleaseBufferCleanupTicket(
+				m_deferredCleanupTicket);
+		if (releaseResult == RENDER_RESULT_OK)
+		{
+			m_deferredCleanupTicket = 0;
+			m_deferredHandle = GpuHandle();
+		}
+		else
+		{
+			result = releaseResult;
+		}
 	}
-	else if (resources != 0 && m_deferredHandle.isValid())
+	if (m_cleanupTicket != 0)
 	{
-		m_deferredHandle = GpuHandle();
-	}
-	if (resources != 0 && m_handle.isValid() &&
-		resources->IsValid(m_handle) && !resources->Destroy(m_handle))
-	{
-		result = RENDER_RESULT_FAILED;
-	}
-	else if (resources != 0 && m_handle.isValid())
-	{
-		m_handle = GpuHandle();
-	}
-	if (resources == 0)
-	{
-		// The registry has already been detached; it owns any remaining table
-		// cleanup, so the product owner can release its local references.
-		m_deferredHandle = GpuHandle();
-		m_handle = GpuHandle();
+		const RenderResult releaseResult =
+			NativeW3DResources::ReleaseBufferCleanupTicket(m_cleanupTicket);
+		if (releaseResult == RENDER_RESULT_OK)
+		{
+			m_cleanupTicket = 0;
+			m_handle = GpuHandle();
+		}
+		else
+		{
+			result = releaseResult;
+		}
 	}
 	if (result != RENDER_RESULT_OK)
 	{
-		// Keep failed-destruction handles reachable for a later render-owner
-		// retry.  Clearing them here would strand live registry slots.
+		// A closed operational queue keeps its intrusive ticket linked.  The
+		// table reference prevents resource destruction until the owner can drain
+		// or explicitly resolve that ticket.
+		m_failedMutation = true;
 		return result;
 	}
 	m_deferredHandle = GpuHandle();
 	m_handle = GpuHandle();
+	m_deferredCleanupTicket = 0;
+	m_cleanupTicket = 0;
 	m_resources = 0;
 	m_bindingGeneration = 0;
 	m_descriptor = BufferDescriptor();
@@ -177,20 +217,25 @@ RenderResult NativeW3DBufferOwner::Reset()
 RenderResult NativeW3DBufferOwner::RecreateForDiscard()
 {
 	NativeW3DResources *resources = ActiveResources();
-	if (resources == 0 || !m_handle.isValid() ||
+	if (resources == 0 || !m_handle.isValid() || m_cleanupTicket == 0 ||
 		!resources->IsValid(m_handle))
 	{
 		return RENDER_RESULT_FAILED;
 	}
 	if (m_deferredHandle.isValid())
 	{
-		if (resources->IsValid(m_deferredHandle))
+		if (m_deferredCleanupTicket == 0)
 		{
-			if (!resources->Destroy(m_deferredHandle))
-			{
-				return RENDER_RESULT_FAILED;
-			}
+			return RENDER_RESULT_FAILED;
 		}
+		const RenderResult deferredResult =
+			NativeW3DResources::ReleaseBufferCleanupTicket(
+				m_deferredCleanupTicket);
+		if (deferredResult != RENDER_RESULT_OK)
+		{
+			return deferredResult;
+		}
+		m_deferredCleanupTicket = 0;
 		m_deferredHandle = GpuHandle();
 	}
 	const GpuHandle previous = m_handle;
@@ -209,15 +254,33 @@ RenderResult NativeW3DBufferOwner::RecreateForDiscard()
 	{
 		return result == RENDER_RESULT_OK ? RENDER_RESULT_FAILED : result;
 	}
-	if (!resources->Destroy(previous))
+	NativeW3DBufferCleanupTicket *replacementTicket = 0;
+	const RenderResult ticketResult = resources->CreateBufferCleanupTicket(
+		replacement, &replacementTicket);
+	if (ticketResult != RENDER_RESULT_OK || replacementTicket == 0)
 	{
-		// Destroying the old handle can fail after the replacement has already
-		// entered the resource table.  Keep that replacement reachable and retry
-		// its cleanup before allocating another one on the next DISCARD.
-		m_deferredHandle = replacement;
-		return RENDER_RESULT_FAILED;
+		if (!resources->Destroy(replacement))
+		{
+			(void)resources->RetireBuffer(replacement);
+		}
+		return ticketResult == RENDER_RESULT_OK ? RENDER_RESULT_FAILED :
+			ticketResult;
 	}
+	const RenderResult previousResult =
+		NativeW3DResources::ReleaseBufferCleanupTicket(m_cleanupTicket);
+	if (previousResult != RENDER_RESULT_OK)
+	{
+		// Keep the replacement ticket owner-reachable when a closed queue or
+		// generation mismatch prevents retiring the previous handle.  The next
+		// DISCARD first releases this replacement before trying again.
+		m_deferredHandle = replacement;
+		m_deferredCleanupTicket = replacementTicket;
+		return previousResult;
+	}
+	m_cleanupTicket = 0;
+	m_handle = GpuHandle();
 	m_handle = replacement;
+	m_cleanupTicket = replacementTicket;
 	if (m_authoritative != 0 && m_authoritativeBytes != 0)
 	{
 		memset(m_authoritative, 0, m_authoritativeBytes);
@@ -399,7 +462,8 @@ NativeW3DResources *NativeW3DBufferOwner::ActiveResources() const
 {
 	return m_resources != 0 && m_resources == g_nativeW3DBufferResources &&
 		m_bindingGeneration != 0 &&
-		m_bindingGeneration == g_nativeW3DBufferBindingGeneration ?
+		m_bindingGeneration == g_nativeW3DBufferBindingGeneration &&
+		m_resources->IsOwnerThread() ?
 		m_resources : 0;
 }
 

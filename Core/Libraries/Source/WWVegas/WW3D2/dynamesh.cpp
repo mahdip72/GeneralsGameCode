@@ -37,12 +37,21 @@
 #include "dynamesh.h"
 #include "dx8vertexbuffer.h"
 #include "dx8indexbuffer.h"
-#include "dx8wrapper.h"
-#include "sortingrenderer.h"
+#include "Renderer/RenderGameClient.h"
+#include "Renderer/LegacyColorPacking.h"
 #include "rinfo.h"
 #include "camera.h"
-#include "dx8fvf.h"
 
+static rts::render::GameBoundingSphere ToGameBoundingSphere(
+	const SphereClass &sphere)
+{
+	rts::render::GameBoundingSphere result;
+	result.centerX = sphere.Center.X;
+	result.centerY = sphere.Center.Y;
+	result.centerZ = sphere.Center.Z;
+	result.radius = sphere.Radius;
+	return result;
+}
 
 
 /*
@@ -179,7 +188,10 @@ void DynamicMeshModel::Render(RenderInfoClass & rinfo)
 	// Process texture reductions:
 //	MatInfo->Process_Texture_Reduction();
 
-	unsigned buffer_type=(Get_Flag(MeshGeometryClass::SORT)&& WW3D::Is_Sorting_Enabled()) ? BUFFER_TYPE_DYNAMIC_SORTING : BUFFER_TYPE_DYNAMIC_DX8;
+	rts::render::GameBufferType buffer_type =
+		(Get_Flag(MeshGeometryClass::SORT) && WW3D::Is_Sorting_Enabled()) ?
+		rts::render::GAME_BUFFER_TYPE_DYNAMIC_SORTED :
+		rts::render::GAME_BUFFER_TYPE_DYNAMIC_IMMEDIATE;
 
 	/*
 	** Write the vertex data to the vertex buffer. We assume the FVF contains positions, normals,
@@ -264,8 +276,8 @@ void DynamicMeshModel::Render(RenderInfoClass & rinfo)
 	/*
 	** Set vertex and index buffers
 	*/
-	if (!DX8Wrapper::Set_Vertex_Buffer(dynamic_vb) ||
-		!DX8Wrapper::Set_Index_Buffer(dynamic_ib,0)) {
+	if (!rts::render::SetGameVertexBuffer(dynamic_vb) ||
+		!rts::render::SetGameIndexBuffer(dynamic_ib, 0)) {
 		return;
 	}
 
@@ -317,28 +329,28 @@ void DynamicMeshModel::Render(RenderInfoClass & rinfo)
 		}
 		ShaderClass *shader_array = MatDesc->Get_Shader_Array(pass, false);
 
-		// Set the DX8 state to the first triangle's state
+		// Set the renderer state to the first triangle's state
 		if (texture_array0) {
-			DX8Wrapper::Set_Texture(0,texture_array0[0]);
+			rts::render::SetGameTexture(0, texture_array0[0]);
 		} else {
-			DX8Wrapper::Set_Texture(0,MatDesc->Peek_Single_Texture(pass, 0));
+			rts::render::SetGameTexture(0, MatDesc->Peek_Single_Texture(pass, 0));
 		}
 
 		if (texture_array1) {
-			DX8Wrapper::Set_Texture(1,texture_array1[0]);
+			rts::render::SetGameTexture(1, texture_array1[0]);
 		} else {
-			DX8Wrapper::Set_Texture(1,MatDesc->Peek_Single_Texture(pass, 1));
+			rts::render::SetGameTexture(1, MatDesc->Peek_Single_Texture(pass, 1));
 		}
 
 		if (material_array) {
-			DX8Wrapper::Set_Material(material_array[tris[0].I]);
+			rts::render::SetGameMaterial(material_array[tris[0].I]);
 		} else {
-			DX8Wrapper::Set_Material(MatDesc->Peek_Single_Material(pass));
+			rts::render::SetGameMaterial(MatDesc->Peek_Single_Material(pass));
 		}
 		if (shader_array) {
-			DX8Wrapper::Set_Shader(shader_array[0]);
+			rts::render::SetGameShader(shader_array[0]);
 		} else {
-			DX8Wrapper::Set_Shader(MatDesc->Get_Single_Shader(pass));
+			rts::render::SetGameShader(MatDesc->Get_Single_Shader(pass));
 		}
 
 		SphereClass sphere;
@@ -346,11 +358,13 @@ void DynamicMeshModel::Render(RenderInfoClass & rinfo)
 
 		// If no texture, shader or material arrays for this pass just draw and go to next pass
 		if (!texture_array0 && !texture_array1 && !material_array && !shader_array) {
-			if (buffer_type==BUFFER_TYPE_DYNAMIC_SORTING) {
-				SortingRendererClass::Insert_Triangles(sphere,0, DynamicMeshPNum, 0, DynamicMeshVNum);
+			if (buffer_type == rts::render::GAME_BUFFER_TYPE_DYNAMIC_SORTED) {
+				rts::render::DrawGameSortedTriangles(ToGameBoundingSphere(sphere), 0, DynamicMeshPNum,
+					0, DynamicMeshVNum);
 			}
 			else {
-				DX8Wrapper::Draw_Triangles(0, DynamicMeshPNum, 0, DynamicMeshVNum);
+				rts::render::DrawGameTriangles(0, DynamicMeshPNum, 0,
+					DynamicMeshVNum);
 			}
 			continue;
 		}
@@ -380,17 +394,18 @@ void DynamicMeshModel::Render(RenderInfoClass & rinfo)
 			}
 
 			// If run ends (mesh ends or state changes) draw, reset indices, set state for next run.
-			if (done || texture_changed || material_changed || shader_changed) {
-				if (buffer_type==BUFFER_TYPE_DYNAMIC_SORTING) {
-					SortingRendererClass::Insert_Triangles(
-						sphere,
+			if (done || texture_changed || texture1_changed || material_changed ||
+				shader_changed) {
+				if (buffer_type == rts::render::GAME_BUFFER_TYPE_DYNAMIC_SORTED) {
+					rts::render::DrawGameSortedTriangles(
+					ToGameBoundingSphere(sphere),
 						(start_tri_idx * 3),
 						(1 + cur_tri_idx - start_tri_idx),
 						min_vert_idx,
 						1 + max_vert_idx - min_vert_idx);
 				}
 				else {
-					DX8Wrapper::Draw_Triangles(
+					rts::render::DrawGameTriangles(
 						(start_tri_idx * 3),
 						(1 + cur_tri_idx - start_tri_idx),
 						min_vert_idx,
@@ -399,10 +414,14 @@ void DynamicMeshModel::Render(RenderInfoClass & rinfo)
 				start_tri_idx = next_tri_idx;
 				min_vert_idx = DynamicMeshVNum - 1;
 				max_vert_idx = 0;
-				if (texture_changed) DX8Wrapper::Set_Texture(0,texture_array0[next_tri_idx]);
-				if (texture1_changed) DX8Wrapper::Set_Texture(1,texture_array1[next_tri_idx]);
-				if (material_changed) DX8Wrapper::Set_Material(material_array[tris[next_tri_idx].I]);
-				if (shader_changed) DX8Wrapper::Set_Shader(shader_array[next_tri_idx]);
+				if (texture_changed) rts::render::SetGameTexture(0,
+					texture_array0[next_tri_idx]);
+				if (texture1_changed) rts::render::SetGameTexture(1,
+					texture_array1[next_tri_idx]);
+				if (material_changed) rts::render::SetGameMaterial(
+					material_array[tris[next_tri_idx].I]);
+				if (shader_changed) rts::render::SetGameShader(
+					shader_array[next_tri_idx]);
 			}
 
 			cur_tri_idx = next_tri_idx;
@@ -448,7 +467,8 @@ void DynamicMeshClass::Render(RenderInfoClass & rinfo)
 		const FrustumClass & frustum = rinfo.Camera.Get_Frustum();
 
 		if (CollisionMath::Overlap_Test(frustum, Get_Bounding_Box()) != CollisionMath::OUTSIDE) {
-			DX8Wrapper::Set_Transform(D3DTS_WORLD, Transform);
+			rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_WORLD,
+				Transform);
 			Model->Render(rinfo);
 		}
 	}
@@ -479,7 +499,11 @@ bool DynamicMeshClass::End_Vertex()
 //			color->Z = CurVertexColor[color_array_index].Z;
 //			color->W = CurVertexColor[color_array_index].W;
 			unsigned * color = &((Model->Get_Color_Array(color_array_index))[VertCount]);
-			*color=DX8Wrapper::Convert_Color_Clamp(CurVertexColor[color_array_index]);
+			*color = rts::render::PackLegacyARGB(
+				CurVertexColor[color_array_index].X,
+				CurVertexColor[color_array_index].Y,
+				CurVertexColor[color_array_index].Z,
+				CurVertexColor[color_array_index].W);
 		}
 	}
 

@@ -4,7 +4,9 @@ param(
     [Parameter(Mandatory = $true)][string]$FixtureManifestPath,
     [Parameter(Mandatory = $true)][string]$OutputRoot,
     [string]$TaskRoot = '',
+    [string]$CorpusExportRoot = '',
     [ValidateSet('Replay', 'AI', 'All')][string]$ValidationSet = 'All',
+    [ValidateSet('Canonical', 'LocalCapacity')][string]$CapacityMode = 'Canonical',
     [int]$ReplayMatrixRepeats = 2,
     [int]$StressRepeats = 3,
     [int]$ReplayTimeoutSeconds = 600,
@@ -36,6 +38,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'DeterministicSimulationEvidence.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'Stage5ReplayCorpusExporter.psm1') -Force
 
 function Get-Sha256 {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -500,6 +503,28 @@ function Assert-TaskOwnedPath {
         -AllowBase:$AllowRoot
 }
 
+function Resolve-TaskOwnedChildPath {
+    param([string]$Path, [string]$TaskRoot, [string]$Context)
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace($Path)) `
+        "$Context is required."
+    $candidate = if ([IO.Path]::IsPathRooted($Path)) {
+        [IO.Path]::GetFullPath($Path)
+    }
+    else {
+        [IO.Path]::GetFullPath((Join-Path $TaskRoot $Path))
+    }
+    Assert-TaskOwnedPath $candidate $TaskRoot $Context | Out-Null
+    return $candidate.TrimEnd('\')
+}
+
+function Test-PathWithin {
+    param([string]$BaseDirectory, [string]$CandidatePath)
+    $base = [IO.Path]::GetFullPath($BaseDirectory).TrimEnd('\')
+    $candidate = [IO.Path]::GetFullPath($CandidatePath).TrimEnd('\')
+    return [String]::Equals($candidate, $base, [StringComparison]::OrdinalIgnoreCase) -or
+        $candidate.StartsWith($base + '\', [StringComparison]::OrdinalIgnoreCase)
+}
+
 function Remove-TaskOwnedDirectory {
     param([string]$Path, [string]$TaskRoot, [string]$Context)
     if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
@@ -645,13 +670,54 @@ function Assert-LauncherEquivalenceContract {
     }
 }
 
-function Get-PhysicalCoreCount {
+function Get-ProcessorTopology {
     try {
         $processors = @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop)
-        if ($processors.Count -eq 0) { return 0 }
-        return [int](($processors | Measure-Object -Property NumberOfCores -Sum).Sum)
+        if ($processors.Count -eq 0) {
+            return [pscustomobject]@{
+                source = 'Win32_Processor'
+                physicalCoreCount = 0
+                logicalProcessorCount = 0
+            }
+        }
+        return [pscustomobject]@{
+            source = 'Win32_Processor'
+            physicalCoreCount = [int](($processors |
+                Measure-Object -Property NumberOfCores -Sum).Sum)
+            logicalProcessorCount = [int](($processors |
+                Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum)
+        }
     }
-    catch { return 0 }
+    catch {
+        return [pscustomobject]@{
+            source = 'Win32_Processor'
+            physicalCoreCount = 0
+            logicalProcessorCount = 0
+        }
+    }
+}
+
+function Get-PhysicalCoreCount {
+    return [int](Get-ProcessorTopology).physicalCoreCount
+}
+
+function Get-LocalCapacityTopology {
+    $topology = Get-ProcessorTopology
+    Assert-Condition ($topology.physicalCoreCount -ge 4 -and
+        $topology.physicalCoreCount -le 6) `
+        "LocalCapacity requires between 4 and 6 physical cores; host exposes $($topology.physicalCoreCount)."
+    Assert-Condition ($topology.logicalProcessorCount -ge $topology.physicalCoreCount -and
+        $topology.logicalProcessorCount -le 12) `
+        "LocalCapacity requires at most 12 logical processors; host exposes $($topology.logicalProcessorCount)."
+    return [pscustomobject]@{
+        source = $topology.source
+        physicalCoreCount = [int]$topology.physicalCoreCount
+        logicalProcessorCount = [int]$topology.logicalProcessorCount
+        minimumPhysicalCoreCount = 4
+        maximumPhysicalCoreCount = 6
+        maximumLogicalProcessorCount = 12
+        autoWorkerCap = 12
+    }
 }
 
 function Assert-X64PeExecutable {
@@ -678,6 +744,17 @@ function Assert-X64PeExecutable {
 }
 
 function Get-WorkerConfigurations {
+    param([ValidateSet('Canonical', 'LocalCapacity')][string]$CapacityMode = 'Canonical')
+    if ($CapacityMode -ceq 'LocalCapacity') {
+        return @(
+            [pscustomobject]@{ Id = 'serial-1'; Mode = 'serial'; WorkerCount = 1; HasWorkerCount = $true },
+            [pscustomobject]@{ Id = 'parallel-1'; Mode = 'parallel'; WorkerCount = 1; HasWorkerCount = $true },
+            [pscustomobject]@{ Id = 'parallel-2'; Mode = 'parallel'; WorkerCount = 2; HasWorkerCount = $true },
+            [pscustomobject]@{ Id = 'parallel-4'; Mode = 'parallel'; WorkerCount = 4; HasWorkerCount = $true },
+            [pscustomobject]@{ Id = 'parallel-8'; Mode = 'parallel'; WorkerCount = 8; HasWorkerCount = $true },
+            [pscustomobject]@{ Id = 'parallel-auto'; Mode = 'parallel'; WorkerCount = 0; HasWorkerCount = $false }
+        )
+    }
     return @(
         [pscustomobject]@{ Id = 'serial-1'; Mode = 'serial'; WorkerCount = 1; HasWorkerCount = $true },
         [pscustomobject]@{ Id = 'parallel-1'; Mode = 'parallel'; WorkerCount = 1; HasWorkerCount = $true },
@@ -690,6 +767,12 @@ function Get-WorkerConfigurations {
 }
 
 function Get-CollisionShadowConfiguration {
+    param([ValidateSet('Canonical', 'LocalCapacity')][string]$CapacityMode = 'Canonical')
+    if ($CapacityMode -ceq 'LocalCapacity') {
+        return [pscustomobject]@{
+            Id = 'shadow-8'; Mode = 'shadow'; WorkerCount = 8; HasWorkerCount = $true
+        }
+    }
     return [pscustomobject]@{
         Id = 'shadow-16'; Mode = 'shadow'; WorkerCount = 16; HasWorkerCount = $true
     }
@@ -774,7 +857,8 @@ function Add-PlanEntry {
 
 function Get-ManifestData {
     param([string]$Path, [string]$Set, [bool]$AllowNonStandard,
-        [string]$ExecutableHashOverride, [string]$ExpectedTitle = 'ZeroHour')
+        [string]$ExecutableHashOverride, [string]$ExpectedTitle = 'ZeroHour',
+        [bool]$AllowEmptyReplayCorpus = $false)
     $manifestFile = [IO.Path]::GetFullPath($Path)
     Assert-Condition (Test-Path -LiteralPath $manifestFile -PathType Leaf) "Fixture manifest was not found: $manifestFile"
     $manifestDirectory = Split-Path -Parent $manifestFile
@@ -826,8 +910,10 @@ function Get-ManifestData {
     $fixtureItemsValue = Get-RequiredProperty $manifest 'fixtures' 'Fixture manifest'
     Assert-JsonArray $fixtureItemsValue 'Fixture manifest fixtures'
     $fixtureItems = @($fixtureItemsValue)
-    Assert-Condition ($fixtureItems.Count -gt 0 -and $fixtureItems.Count -le 100) `
-        'Fixture manifest fixtures must contain between 1 and 100 entries.'
+    $minimumFixtureCount = if ($AllowEmptyReplayCorpus -and $Set -ceq 'AI') { 0 } else { 1 }
+    Assert-Condition ($fixtureItems.Count -ge $minimumFixtureCount -and
+        $fixtureItems.Count -le 100) `
+        "Fixture manifest fixtures must contain between $minimumFixtureCount and 100 entries."
     foreach ($fixture in $fixtureItems) {
             Assert-JsonObjectShape $fixture @('id', 'source', 'sha256', 'stress') `
                 @('id', 'source', 'sha256', 'stress', 'maps') 'Replay fixture'
@@ -945,9 +1031,10 @@ function Get-ManifestData {
 
 function New-ValidationPlan {
     param([object]$Data, [string]$Set, [int]$ReplayPasses, [int]$StressRunCount,
-        [int]$ReplayTimeout, [int]$AiTimeout, [string]$Executable, [string]$OutputDirectory)
+        [int]$ReplayTimeout, [int]$AiTimeout, [string]$Executable, [string]$OutputDirectory,
+        [ValidateSet('Canonical', 'LocalCapacity')][string]$CapacityMode = 'Canonical')
     $plan = New-Object 'Collections.Generic.List[object]'
-    foreach ($configuration in Get-WorkerConfigurations) {
+    foreach ($configuration in Get-WorkerConfigurations -CapacityMode $CapacityMode) {
         $common = @(New-CommonArguments $configuration $Data.executableSha256)
         if ($Set -ne 'AI') {
             for ($matrixRepeat = 1; $matrixRepeat -le $ReplayPasses; ++$matrixRepeat) {
@@ -979,7 +1066,7 @@ function New-ValidationPlan {
     if ($Set -ne 'Replay' -and $Data.ai.scenarios -ccontains '4v2') {
         # One bounded installed-runtime shadow stress execution proves the
         # post-legacy collision oracle without multiplying the full matrix.
-        $shadowConfiguration = Get-CollisionShadowConfiguration
+        $shadowConfiguration = Get-CollisionShadowConfiguration -CapacityMode $CapacityMode
         $shadowSeed = [int]$Data.ai.seeds[0]
         $shadowCommon = @(New-CommonArguments $shadowConfiguration $Data.executableSha256)
         $shadowArguments = @($shadowCommon) + @('-runSkirmishAITest4v2', [string]$shadowSeed)
@@ -1674,6 +1761,213 @@ function Write-Stage5HostRunnerReceipt {
     }
 }
 
+function Write-LocalCapacityReceipt {
+    param(
+        [string]$Path,
+        [string]$Status,
+        [string]$ValidationSet,
+        [object[]]$Entries,
+        [object[]]$Results,
+        [object[]]$Configurations,
+        [object]$ShadowConfiguration,
+        [object]$Topology,
+        [string]$PlanPath,
+        [string]$ResultsPath,
+        [string]$CorpusExportRoot = '',
+        [object]$CorpusExport = $null
+    )
+    Assert-Condition ($Status -in @('planned-non-acceptance',
+        'passed-non-acceptance')) `
+        "Unsupported LocalCapacity receipt status '$Status'."
+    $receiptFull = [IO.Path]::GetFullPath($Path)
+    Assert-Condition (-not (Test-Path -LiteralPath $receiptFull)) `
+        "LocalCapacity receipt output already exists: $receiptFull"
+    $entryArray = @($Entries)
+    $resultArray = @($Results)
+    $corpusExportRequested = -not [string]::IsNullOrWhiteSpace($CorpusExportRoot)
+    $corpusExportDocument = $null
+    if ($corpusExportRequested) {
+        Assert-Condition ($null -ne $CorpusExport -and
+            [string]$CorpusExport.status -ceq 'passed') `
+            'LocalCapacity corpus export was requested but did not complete.'
+        Assert-Condition ($null -ne $CorpusExport.artifactIndex -and
+            -not [string]::IsNullOrWhiteSpace([string]$CorpusExport.artifactIndex.path) -and
+            [string]$CorpusExport.artifactIndex.sha256 -match '^[0-9A-Fa-f]{64}$') `
+            'LocalCapacity corpus export did not return a valid artifact-index binding.'
+        $artifactIndexPath = [IO.Path]::GetFullPath([string]$CorpusExport.artifactIndex.path)
+        Assert-Condition (Test-Path -LiteralPath $artifactIndexPath -PathType Leaf) `
+            "LocalCapacity artifact index was not found: $artifactIndexPath"
+        $artifactIndexSha256 = Get-Sha256 $artifactIndexPath
+        Assert-Condition ($artifactIndexSha256 -ceq
+            ([string]$CorpusExport.artifactIndex.sha256).ToUpperInvariant()) `
+            'LocalCapacity artifact index SHA-256 changed before receipt binding.'
+        $corpusExportDocument = [ordered]@{
+            status = 'passed'
+            artifactIndexPath = $artifactIndexPath
+            artifactIndexSha256 = $artifactIndexSha256
+            recordCount = [int]$CorpusExport.recordCount
+            records = @($CorpusExport.records)
+        }
+    }
+    $document = [ordered]@{
+        schemaVersion = 1
+        receiptKind = 'stage5-local-capacity-receipt'
+        status = $Status
+        validationMode = 'LocalCapacity'
+        capacityMode = 'LocalCapacity'
+        notAnAcceptanceEnvelope = $true
+        acceptanceEligible = $false
+        externalAcceptanceEligible = $false
+        deterministicRuntimeEligible = $false
+        finalAcceptanceEligible = $false
+        canonicalFinalAcceptanceEligible = $false
+        validationSet = $ValidationSet
+        generatedUtc = [DateTime]::UtcNow.ToString('o')
+        topology = $Topology
+        regularConfigurations = @($Configurations | ForEach-Object { $_.Id })
+        shadowConfiguration = $ShadowConfiguration.Id
+        entryCount = $entryArray.Count
+        resultCount = $resultArray.Count
+        replayResultCount = @($resultArray | Where-Object {
+            $_.kind -ceq 'replay'
+        }).Count
+        aiResultCount = @($resultArray | Where-Object {
+            $_.kind -ceq 'ai'
+        }).Count
+        corpusExportRequested = $corpusExportRequested
+        corpusExportRoot = if ($corpusExportRequested) {
+            [IO.Path]::GetFullPath($CorpusExportRoot)
+        } else { $null }
+        corpusExport = $corpusExportDocument
+        replayDeterminismAsserted = $Status -ceq 'passed-non-acceptance' -and
+            $ValidationSet -ne 'AI'
+        aiDeterminismAsserted = $Status -ceq 'passed-non-acceptance' -and
+            $ValidationSet -ne 'Replay'
+        planSha256 = if (Test-Path -LiteralPath $PlanPath -PathType Leaf) {
+            Get-Sha256 $PlanPath
+        } else { $null }
+        resultsSha256 = if (Test-Path -LiteralPath $ResultsPath -PathType Leaf) {
+            Get-Sha256 $ResultsPath
+        } else { $null }
+    }
+    [IO.File]::WriteAllText($receiptFull, ($document | ConvertTo-Json -Depth 12))
+    return [pscustomobject]@{
+        path = $receiptFull
+        sha256 = Get-Sha256 $receiptFull
+    }
+}
+
+function Export-LocalCapacityAiCorpus {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$TaskRoot,
+        [Parameter(Mandatory = $true)][string]$TaskRunRoot,
+        [Parameter(Mandatory = $true)][string]$ProfileRoot,
+        [Parameter(Mandatory = $true)][string]$CorpusExportRoot,
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][string]$ExecutableSha256,
+        [Parameter(Mandatory = $true)][object[]]$ChildRuns,
+        [Parameter(Mandatory = $true)][object[]]$Results,
+        [Parameter(Mandatory = $true)][string]$ValidationResultsPath
+    )
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace($TaskRoot) -and
+        -not [string]::IsNullOrWhiteSpace($TaskRunRoot) -and
+        -not [string]::IsNullOrWhiteSpace($ProfileRoot) -and
+        -not [string]::IsNullOrWhiteSpace($CorpusExportRoot)) `
+        'LocalCapacity corpus export requires explicit task-owned paths.'
+    Assert-Condition (-not (Test-PathWithin $TaskRunRoot $CorpusExportRoot) -and
+        -not (Test-PathWithin $CorpusExportRoot $TaskRunRoot)) `
+        'CorpusExportRoot must be a durable TaskRoot sibling of the ephemeral validation run root.'
+    $childRunArray = @($ChildRuns)
+    $resultArray = @($Results)
+    Assert-Condition ($childRunArray.Count -gt 0 -and $resultArray.Count -gt 0) `
+        'LocalCapacity corpus export requires completed AI executions.'
+    Assert-Condition (@($childRunArray | Where-Object {
+        $null -eq $_.entry -or $_.entry.kind -cne 'ai'
+    }).Count -eq 0 -and @($resultArray | Where-Object {
+        $null -eq $_ -or $_.kind -cne 'ai'
+    }).Count -eq 0) `
+        'LocalCapacity corpus export accepts AI-only completed records.'
+    $aiRuns = @($childRunArray | Sort-Object { [int]$_.entry.sequence })
+    $aiResults = @($resultArray | Sort-Object { [int]$_.sequence })
+    Assert-Condition ($aiRuns.Count -eq $aiResults.Count) `
+        'LocalCapacity corpus export child-run and result counts differ.'
+    $seenSequences = New-Object 'Collections.Generic.HashSet[int]'
+    $records = New-Object 'Collections.Generic.List[object]'
+    foreach ($child in $aiRuns) {
+        $entry = $child.entry
+        $run = $child.run
+        Assert-Condition ($null -ne $run -and $run.exitCode -eq 0 -and
+            -not [bool]$run.timedOut) `
+            "LocalCapacity corpus export requires a completed AI run at sequence $($entry.sequence)."
+        Assert-Condition $seenSequences.Add([int]$entry.sequence) `
+            "LocalCapacity corpus export repeats AI sequence $($entry.sequence)."
+        $matchingResults = @($aiResults | Where-Object {
+            [int]$_.sequence -eq [int]$entry.sequence
+        })
+        Assert-Condition ($matchingResults.Count -eq 1 -and
+            $null -ne $matchingResults[0].aiEvidence) `
+            "LocalCapacity corpus export has no parsed AI result for sequence $($entry.sequence)."
+        $completion = Get-Stage5ReplayCompletionFields `
+            -Output ([string]$run.stdout) -ExpectedSeed ([int]$entry.seed) `
+            -ExpectedScenario ([string]$entry.scenario) `
+            -Context "LocalCapacity AI sequence $($entry.sequence) completion"
+        $artifact = Export-Stage5FreshReplayArtifact `
+            -SourcePath $completion.replayRetained `
+            -ExpectedSha256 $completion.replaySha256 `
+            -TaskRoot $TaskRoot -TaskRunRoot $TaskRunRoot `
+            -ProfileRoot $ProfileRoot -CorpusExportRoot $CorpusExportRoot `
+            -Metadata ([ordered]@{
+                title = $Title
+                category = 'local-capacity-ai'
+                scenario = [string]$entry.scenario
+                seed = [string]$entry.seed
+                runNonce = $completion.runNonce
+                executableSha256 = $ExecutableSha256
+                origin = 'native-fresh-runtime'
+            })
+        $records.Add([pscustomobject]@{
+            sequence = [int]$entry.sequence
+            configuration = [string]$entry.configuration
+            repeat = [int]$entry.repeat
+            scenario = [string]$entry.scenario
+            seed = [int]$entry.seed
+            runNonce = $completion.runNonce
+            replayEpoch = $completion.replayEpoch
+            replaySha256 = $completion.replaySha256
+            origin = $artifact.origin
+            title = $artifact.title
+            category = $artifact.category
+            executableSha256 = $artifact.executableSha256
+            sourceProfileRoot = $artifact.sourceProfileRoot
+            sourcePath = $artifact.sourcePath
+            sourceSha256 = $artifact.sourceSha256
+            destinationPath = $artifact.destinationPath
+            destinationSha256 = $artifact.destinationSha256
+            length = $artifact.length
+            containerMagic = $artifact.containerMagic
+            containerSchemaVersion = $artifact.containerSchemaVersion
+            containerEngineEpoch = $artifact.containerEngineEpoch
+            payloadMagic = $artifact.payloadMagic
+            skirmishAiReplayEpoch = $artifact.skirmishAiReplayEpoch
+            exportedUtc = $artifact.exportedUtc
+        }) | Out-Null
+    }
+    Assert-Condition ($records.Count -gt 0) `
+        'LocalCapacity corpus export produced no replay records.'
+    $artifactIndex = Write-Stage5FreshReplayArtifactIndex `
+        -TaskRoot $TaskRoot -CorpusExportRoot $CorpusExportRoot `
+        -Title $Title -ExecutableSha256 $ExecutableSha256 `
+        -Records $records.ToArray() -ValidationResultsPath $ValidationResultsPath
+    return [pscustomobject]@{
+        status = 'passed'
+        corpusExportRoot = [IO.Path]::GetFullPath($CorpusExportRoot)
+        artifactIndex = $artifactIndex
+        recordCount = $records.Count
+        records = $records.ToArray()
+    }
+}
+
 function Get-Stage5ResultTreeSha256 {
     param([object[]]$Results, [string]$Kind)
     $lines = New-Object 'Collections.Generic.List[string]'
@@ -1699,8 +1993,12 @@ Assert-Condition ($ReplayMatrixRepeats -gt 0 -and $ReplayMatrixRepeats -le 10) `
     'ReplayMatrixRepeats must be between 1 and 10.'
 Assert-Condition ($StressRepeats -gt 0 -and $StressRepeats -le 10) `
     'StressRepeats must be between 1 and 10.'
+$localCapacityRequested = $CapacityMode -ceq 'LocalCapacity'
+$corpusExportRequested = -not [string]::IsNullOrWhiteSpace($CorpusExportRoot)
+$diagnosticNonAcceptanceRequested = [bool]$DiagnosticNonAcceptance -or
+    $localCapacityRequested
 $deterministicRuntimeContractRequested = $ValidationSet -ceq 'All' -and
-    -not [bool]$DiagnosticNonAcceptance -and -not [bool]$AllowNonStandardCorpus
+    -not $diagnosticNonAcceptanceRequested -and -not [bool]$AllowNonStandardCorpus
 Assert-Condition (-not $deterministicRuntimeContractRequested -or $ReplayMatrixRepeats -eq 2) `
     'The deterministic-runtime gate requires exactly two complete replay matrix passes.'
 Assert-Condition (-not $deterministicRuntimeContractRequested -or $StressRepeats -eq 3) `
@@ -1710,11 +2008,11 @@ Assert-Condition ($ReplayTimeoutSeconds -gt 0 -and $ReplayTimeoutSeconds -le 864
     'Timeouts must be between 1 and 86400 seconds.'
 Assert-Condition (-not $EnforcePerformance -or $ValidationSet -ne 'AI') `
     'Performance validation requires the replay matrix.'
-Assert-Condition (-not $AllowNonStandardCorpus -or $PlanOnly -or $DiagnosticNonAcceptance) `
+Assert-Condition (-not $AllowNonStandardCorpus -or $PlanOnly -or $diagnosticNonAcceptanceRequested) `
     'AllowNonStandardCorpus is limited to PlanOnly or DiagnosticNonAcceptance; accepting execution requires exactly 10 unique replay sources.'
-Assert-Condition (-not $DisableFrameTiming -or $DiagnosticNonAcceptance) `
+Assert-Condition (-not $DisableFrameTiming -or $diagnosticNonAcceptanceRequested) `
     'DisableFrameTiming is allowed only with DiagnosticNonAcceptance; timing is mandatory for an accepting gate.'
-Assert-Condition (-not $EnforcePerformance -or (-not $DisableFrameTiming -and -not $DiagnosticNonAcceptance)) `
+Assert-Condition (-not $EnforcePerformance -or (-not $DisableFrameTiming -and -not $diagnosticNonAcceptanceRequested)) `
     'Performance validation cannot run in non-acceptance diagnostic mode or without frame timing.'
 Assert-Condition (-not $EnforcePerformance -or
     ($ReplayMatrixRepeats * $StressRepeats) -ge 4) `
@@ -1732,6 +2030,13 @@ if ($acceptanceBindingsRequested) {
         (Test-Sha256Text $AcceptanceRuntimeClosureSha256)) `
         'Acceptance runtime closure requires independently supplied dependency-manifest and closure SHA-256 values.'
 }
+Assert-Condition (-not ($localCapacityRequested -and $EnforcePerformance)) `
+    'LocalCapacity cannot request performance enforcement; use the canonical performance lane.'
+Assert-Condition (-not ($localCapacityRequested -and $acceptanceBindingsRequested)) `
+    'LocalCapacity cannot request canonical acceptance bindings or receipts.'
+Assert-Condition (-not $corpusExportRequested -or
+    ($localCapacityRequested -and $ValidationSet -ceq 'AI' -and -not $PlanOnly)) `
+    'CorpusExportRoot requires an executing LocalCapacity AI-only validation.'
 $executionCohortNonce = if ([string]::IsNullOrWhiteSpace($ExecutionCohortNonce)) {
     [Guid]::NewGuid().ToString()
 } else {
@@ -1756,7 +2061,8 @@ if (-not $PlanOnly) {
 
 $runtimeFull = [IO.Path]::GetFullPath($RuntimeRoot)
 $manifestData = Get-ManifestData $FixtureManifestPath $ValidationSet `
-    ([bool]$AllowNonStandardCorpus) $ExpectedExecutableSha256 $Title
+    ([bool]$AllowNonStandardCorpus) $ExpectedExecutableSha256 $Title `
+    ($localCapacityRequested -and $ValidationSet -ceq 'AI')
 $executableFull = Join-Path $runtimeFull $manifestData.executable
 Assert-Condition (Test-Path -LiteralPath $runtimeFull -PathType Container) "Installed runtime root was not found: $runtimeFull"
 Assert-Condition (Test-Path -LiteralPath (Join-Path $runtimeFull 'launcher.exe') -PathType Leaf) `
@@ -1770,6 +2076,8 @@ $launcherConfigFull = [IO.Path]::GetFullPath((Join-Path $runtimeFull 'launcher.l
 $launcherContract = Get-LauncherRunContract $launcherConfigFull $runtimeFull $executableFull
 
 $physicalCoreCount = 0
+$logicalProcessorCount = 0
+$localCapacityTopology = $null
 $stage3PerformanceBaseline = $null
 $stage3PerformanceBaselineEvidencePath = $null
 if ($RequireX64 -or $EnforcePerformance) {
@@ -1783,16 +2091,29 @@ if ($EnforcePerformance) {
         $Stage3PerformanceBaselinePath $stressFixtures[0].sha256 $ExpectedStage3ExecutableSha256
     $physicalCoreCount = Get-PhysicalCoreCount
 }
+if ($localCapacityRequested) {
+    $localCapacityTopology = Get-LocalCapacityTopology
+    $physicalCoreCount = $localCapacityTopology.physicalCoreCount
+    $logicalProcessorCount = $localCapacityTopology.logicalProcessorCount
+}
 
 $outputFull = [IO.Path]::GetFullPath($OutputRoot)
 Assert-Condition (-not (Test-Path -LiteralPath $outputFull)) `
     'OutputRoot must not already exist; every validation run owns a fresh evidence directory.'
+$taskRootFull = $null
+$corpusExportRootFull = $null
 if (-not $PlanOnly) {
     $taskRootFull = Resolve-ExplicitTaskRoot $TaskRoot 'TaskRoot'
     Assert-Condition (Test-Path -LiteralPath $taskRootFull -PathType Container) `
         "TaskRoot must already exist as a task-owned directory: $taskRootFull"
     Assert-TaskOwnedPath $outputFull $taskRootFull 'OutputRoot' | Out-Null
     Assert-FreeSpace $taskRootFull $MinimumFreeBytes 'Validation task volume'
+    if ($corpusExportRequested) {
+        $corpusExportRootFull = Resolve-TaskOwnedChildPath $CorpusExportRoot `
+            $taskRootFull 'CorpusExportRoot'
+        Assert-Condition (-not (Test-Path -LiteralPath $corpusExportRootFull)) `
+            "CorpusExportRoot must be a fresh task-owned directory: $corpusExportRootFull"
+    }
 }
 Assert-FreeSpace (Split-Path -Parent $outputFull) $MinimumFreeBytes 'Validation output volume'
 New-Item -ItemType Directory -Path $outputFull | Out-Null
@@ -1804,14 +2125,16 @@ if ($null -ne $stage3PerformanceBaseline) {
     $stage3PerformanceBaseline.evidenceFile = $stage3PerformanceBaselineEvidencePath
 }
 
+$workerConfigurations = @(Get-WorkerConfigurations -CapacityMode $CapacityMode)
+$collisionShadowConfiguration = Get-CollisionShadowConfiguration -CapacityMode $CapacityMode
 $plan = @(New-ValidationPlan $manifestData $ValidationSet $ReplayMatrixRepeats $StressRepeats `
-    $ReplayTimeoutSeconds $AiTimeoutSeconds $executableFull $outputFull)
+    $ReplayTimeoutSeconds $AiTimeoutSeconds $executableFull $outputFull $CapacityMode)
 Assert-Condition ($plan.Count -gt 0) 'The fixture manifest produced an empty validation plan.'
 Assert-Condition ($plan.Count -le 10000) 'The fixture manifest produced more than 10000 validation entries.'
 $launcherEquivalence = Assert-LauncherEquivalenceContract $launcherContract `
     $executableFull $runtimeFull $plan
 if ($deterministicRuntimeContractRequested) {
-    foreach ($configuration in @(Get-WorkerConfigurations | ForEach-Object { $_.Id })) {
+    foreach ($configuration in @($workerConfigurations | ForEach-Object { $_.Id })) {
         $configurationReplayPlan = @($plan | Where-Object {
             $_.kind -ceq 'replay' -and $_.configuration -ceq $configuration
         })
@@ -1830,9 +2153,9 @@ if ($deterministicRuntimeContractRequested) {
     }
 }
 if ($ValidationSet -ne 'Replay') {
-    $workerConfigurationCount = @(Get-WorkerConfigurations).Count
+    $workerConfigurationCount = $workerConfigurations.Count
     $regularAiPlan = @($plan | Where-Object {
-        $_.kind -ceq 'ai' -and $_.configuration -cne 'shadow-16'
+        $_.kind -ceq 'ai' -and $_.configuration -cne $collisionShadowConfiguration.Id
     })
     $expectedRegularAiCount = $workerConfigurationCount * $manifestData.ai.scenarios.Count *
         $manifestData.ai.seeds.Count * $manifestData.ai.repeats
@@ -1855,10 +2178,14 @@ $planDocument = [pscustomobject]@{
     runtimeRoot = $runtimeFull
     executable = $executableFull
     title = $manifestData.title
+    capacityMode = $CapacityMode
+    validationMode = if ($localCapacityRequested) { 'LocalCapacity' } else { 'Canonical' }
     executableSha256 = $manifestData.executableSha256
     executableSha256Source = $manifestData.executableSha256Source
     fixtureManifest = $manifestData.file
     validationSet = $ValidationSet
+    replayCorpusRequired = $ValidationSet -ne 'AI'
+    replayFixtureCount = @($manifestData.fixtures).Count
     replayMatrixRepeats = $ReplayMatrixRepeats
     stressRepeats = $StressRepeats
     x64Required = [bool]($RequireX64 -or $EnforcePerformance)
@@ -1866,7 +2193,7 @@ $planDocument = [pscustomobject]@{
     performanceRequiredForDeterministicRuntimeGate = $true
     performanceMeasurementScope = 'aggregate-stage5-stress-replay-throughput'
     collisionSpecificReplayPerformanceClaim = $false
-    diagnosticNonAcceptance = [bool]$DiagnosticNonAcceptance
+    diagnosticNonAcceptance = $diagnosticNonAcceptanceRequested
     directExecutionExceptionRequested = [bool]$AllowHeadlessDirectExecution
     frameTimingRequired = -not [bool]$DisableFrameTiming
     authoritativeWorkEvidenceRequired = $deterministicRuntimeEligible
@@ -1884,6 +2211,22 @@ $planDocument = [pscustomobject]@{
     taskRoot = $(if ($PlanOnly) { $null } else { $taskRootFull })
     launcherContract = $launcherEquivalence
     physicalCoreCount = $physicalCoreCount
+    logicalProcessorCount = $logicalProcessorCount
+    localCapacity = if ($localCapacityRequested) {
+        [pscustomobject]@{
+            hostTopology = $localCapacityTopology
+            minimumPhysicalCoreCount = $localCapacityTopology.minimumPhysicalCoreCount
+            maximumPhysicalCoreCount = $localCapacityTopology.maximumPhysicalCoreCount
+            maximumLogicalProcessorCount = $localCapacityTopology.maximumLogicalProcessorCount
+            regularConfigurations = @($workerConfigurations | ForEach-Object { $_.Id })
+            shadowConfiguration = $collisionShadowConfiguration.Id
+            externalAcceptanceEligible = $false
+            canonicalFinalAcceptanceEligible = $false
+        }
+    } else { $null }
+    corpusExportRequested = [bool]$corpusExportRequested
+    corpusExportRoot = $corpusExportRootFull
+    corpusExportMode = if ($corpusExportRequested) { 'local-capacity-ai' } else { $null }
     stage3PerformanceBaseline = $(if ($null -ne $stage3PerformanceBaseline) {
         [pscustomobject]@{
             file = $stage3PerformanceBaseline.file
@@ -1903,6 +2246,19 @@ $planDocument = [pscustomobject]@{
 }
 $planPath = Join-Path $outputFull 'validation-plan.json'
 [IO.File]::WriteAllText($planPath, ($planDocument | ConvertTo-Json -Depth 8))
+if ($localCapacityRequested) {
+    Write-LocalCapacityReceipt `
+        -Path (Join-Path $outputFull 'local-capacity-plan-receipt.json') `
+        -Status 'planned-non-acceptance' `
+        -ValidationSet $ValidationSet `
+        -Entries $plan `
+        -Results @() `
+        -Configurations $workerConfigurations `
+        -ShadowConfiguration $collisionShadowConfiguration `
+        -Topology $localCapacityTopology `
+        -PlanPath $planPath `
+        -ResultsPath (Join-Path $outputFull 'validation-results.json') | Out-Null
+}
 if ($EnforcePerformance -and $physicalCoreCount -lt 8) {
     $unsupportedPerformance = [pscustomobject]@{
         schemaVersion = 1
@@ -1978,6 +2334,11 @@ $taskRunRoot = [IO.Path]::GetFullPath((Join-Path $taskRootFull `
 Assert-TaskOwnedPath $taskRunRoot $taskRootFull 'Validation run root' | Out-Null
 Assert-Condition (-not (Test-Path -LiteralPath $taskRunRoot)) `
     'The generated task validation run root already exists.'
+if ($corpusExportRequested) {
+    Assert-Condition (-not (Test-PathWithin $taskRunRoot $corpusExportRootFull) -and
+        -not (Test-PathWithin $corpusExportRootFull $taskRunRoot)) `
+        'CorpusExportRoot must be a durable TaskRoot sibling of the ephemeral validation run root.'
+}
 $documentsRoot = Join-Path $taskRunRoot 'Documents'
 $profileFull = [IO.Path]::GetFullPath((Join-Path $documentsRoot $ProfileLeafName))
 Assert-TaskOwnedPath $documentsRoot $taskRootFull 'Validation Documents root' | Out-Null
@@ -2004,6 +2365,8 @@ $validationEnvironment = @{
 $registrySnapshots = New-Object 'Collections.Generic.List[object]'
 $results = New-Object 'Collections.Generic.List[object]'
 $childRuns = New-Object 'Collections.Generic.List[object]'
+$corpusExport = $null
+$localCapacityReceipt = $null
 $resultsPath = Join-Path $outputFull 'validation-results.json'
 $fatalPattern = '(?i)(CRC Mismatch|game thread ownership violation|assertion failed|fatal error|missing map|replay read error|SKIRMISH_AI_TEST_FAIL|SIMULATION_JOB_SYSTEM_FALLBACK|SIMULATION_SHADOW_(?:MISMATCH|FAIL)|SIMULATION_COLLISION_MISMATCH)'
 try {
@@ -2192,7 +2555,10 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
         }) | Out-Null
         [IO.File]::WriteAllText($resultsPath, ($results.ToArray() | ConvertTo-Json -Depth 5))
     }
-    $workerConfigurationIds = @(Get-WorkerConfigurations | ForEach-Object { $_.Id })
+    $workerConfigurationIds = @($workerConfigurations | ForEach-Object { $_.Id })
+    $shadowConfigurationId = if ($manifestData.ai.scenarios -ccontains '4v2') {
+        [string]$collisionShadowConfiguration.Id
+    } else { '' }
     if ($ValidationSet -ne 'Replay') {
         $expectedAiDeterminismKeys = @(
             foreach ($scenario in $manifestData.ai.scenarios) {
@@ -2202,7 +2568,7 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
             }
         )
         Assert-Stage5AiDeterminism $results.ToArray() $workerConfigurationIds `
-            $manifestData.ai.repeats 'shadow-16' $expectedAiDeterminismKeys
+            $manifestData.ai.repeats $shadowConfigurationId $expectedAiDeterminismKeys
     }
     if ($deterministicRuntimeEligible) {
         Assert-Stage5AuthoritativeWorkEvidence $results.ToArray()
@@ -2223,6 +2589,44 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
             "Stage 5 performance validation status is '$($performanceReport.status)': $($performanceReport.failures -join ' ')"
     }
     Assert-FileHash $executableFull $manifestData.executableSha256 'Installed runtime executable after matrix' | Out-Null
+
+    if ($corpusExportRequested) {
+        $corpusExport = Export-LocalCapacityAiCorpus `
+            -TaskRoot $taskRootFull -TaskRunRoot $taskRunRoot `
+            -ProfileRoot $profileFull -CorpusExportRoot $corpusExportRootFull `
+            -Title $manifestData.title -ExecutableSha256 $manifestData.executableSha256 `
+            -ChildRuns $childRuns.ToArray() -Results $results.ToArray() `
+            -ValidationResultsPath $resultsPath
+    }
+
+    if ($localCapacityRequested) {
+        $localCapacityReceipt = Write-LocalCapacityReceipt `
+            -Path (Join-Path $outputFull 'local-capacity-receipt.json') `
+            -Status 'passed-non-acceptance' `
+            -ValidationSet $ValidationSet `
+            -Entries $plan `
+            -Results $results.ToArray() `
+            -Configurations $workerConfigurations `
+            -ShadowConfiguration $collisionShadowConfiguration `
+            -Topology $localCapacityTopology `
+            -PlanPath $planPath `
+            -ResultsPath $resultsPath `
+            -CorpusExportRoot $corpusExportRootFull `
+            -CorpusExport $corpusExport
+    }
+
+    if ($corpusExportRequested) {
+        Assert-Condition ($null -ne $localCapacityReceipt -and
+            (Test-Path -LiteralPath $localCapacityReceipt.path -PathType Leaf)) `
+            'LocalCapacity corpus export requires the final receipt before manifest emission.'
+        $corpusManifest = Write-Stage5FreshReplayCorpusManifest `
+            -TaskRoot $taskRootFull -CorpusExportRoot $corpusExportRootFull `
+            -Title $manifestData.title -ExecutableSha256 $manifestData.executableSha256 `
+            -Records $corpusExport.records -ValidationResultsPath $resultsPath `
+            -ValidationReceiptPath $localCapacityReceipt.path
+        $corpusExport | Add-Member -NotePropertyName manifest `
+            -NotePropertyValue $corpusManifest -Force
+    }
 
     if ($deterministicRuntimeEligible -and $acceptanceBindingsRequested) {
         $resultArray = @($results.ToArray())

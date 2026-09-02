@@ -3,6 +3,7 @@
 #include "Lib/PipelineExecutionPolicy.h"
 #include "Lib/HeightMapTerrainKernel.h"
 #include "Lib/RadarOverlayKernel.h"
+#include "../TestSupport/LocalCapacityTestLane.h"
 #include "W3DDevice/Common/EffectPrepare.h"
 #include "W3DDevice/Common/RadarTerrainPrepare.h"
 
@@ -408,15 +409,28 @@ static int serialPolicy()
 
 int main(int argc, char **argv)
 {
-	if (argc > 1 && strcmp(argv[1], "--serial") == 0)
+	bool localCapacity = false;
+	bool serialPipelines = false;
+	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity,
+		&serialPipelines, "--serial"))
+	{
+		fprintf(stderr, "Usage: effect_prepare_tests [--local-capacity] [--serial]\n");
+		return 2;
+	}
+	rts_test::PrintTestCapacityLane(localCapacity);
+	if (serialPipelines)
 		return serialPolicy();
 	const unsigned workers[] = {1,2,4,8,16,0};
 	const unsigned counts[] = {0,1,127,256,4096,65536};
 	rts::JobSystem &system = rts::JobSystem::instance();
 	for (unsigned worker = 0; worker < sizeof(workers)/sizeof(workers[0]); ++worker)
 	{
+		const unsigned effectiveWorkerCount =
+			rts_test::ResolveActualWorkerCount(workers[worker], localCapacity);
+		rts_test::PrintWorkerCountSubstitution("effect preparation",
+			workers[worker], effectiveWorkerCount, localCapacity);
 		rts::JobSystemConfig config = rts::JobSystem::startupConfig();
-		config.workerCount = workers[worker];
+		config.workerCount = effectiveWorkerCount;
 		config.queueCapacity = 1024;
 		config.pinWorkers = false;
 		CHECK(system.start(config));

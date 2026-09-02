@@ -103,7 +103,9 @@ enum Operation
 };
 enum Control { CONTROL_NONE, CONTROL_FENCE, CONTROL_CAPTURE,
 	CONTROL_RESIZE, CONTROL_RECOVER, CONTROL_DEBUG_COUNT, CONTROL_REPORT,
-	CONTROL_ROLLBACK_RESOURCE };
+	CONTROL_ROLLBACK_RESOURCE, CONTROL_SET_SWAP_INTERVAL,
+	CONTROL_GET_SWAP_INTERVAL, CONTROL_SET_GAMMA, CONTROL_GET_GAMMA,
+	CONTROL_CONFIGURE_RESOURCE_FAULT, CONTROL_GET_RESOURCE_STATISTICS };
 
 struct Command
 {
@@ -176,12 +178,22 @@ bool IsInitializedRange(const std::vector<InitializedRange> &ranges,
 struct Reply
 {
 	Reply() : done(false), result(RENDER_RESULT_OK), format(RENDER_FORMAT_UNKNOWN),
-		rowPitch(0), count(0), width(0), height(0), handle() {}
+		rowPitch(0), count(0), width(0), height(0), interval(0),
+		gamma(1.0f), brightness(0.0f), contrast(1.0f), calibrate(false),
+		useLimit(true), faultPoint(RENDER_RESOURCE_FAULT_NONE),
+		faultFailOnInvocation(0), faultResult(RENDER_RESULT_FAILED),
+		statistics(), handle() {}
 	bool done;
 	RenderResult result;
 	RenderFormat format;
 	size_t rowPitch;
-	unsigned int count, width, height;
+	unsigned int count, width, height, interval;
+	float gamma, brightness, contrast;
+	bool calibrate, useLimit;
+	RenderResourceFaultPoint faultPoint;
+	unsigned int faultFailOnInvocation;
+	RenderResult faultResult;
+	RenderResourceStatistics statistics;
 	GpuHandle handle;
 	std::vector<unsigned char> pixels;
 };
@@ -286,6 +298,17 @@ public:
 	RenderResult recoverDevice() override { return lifecycle(CONTROL_RECOVER, 0, 0); }
 	RenderResult resize(unsigned int w, unsigned int h) override { return lifecycle(CONTROL_RESIZE, w, h); }
 	RenderResult present() override { return submitFrame(true); }
+	RenderResult setSwapInterval(unsigned int interval) override;
+	RenderResult getSwapInterval(unsigned int *interval) const override;
+	RenderResult setGamma(float gamma, float brightness, float contrast,
+		bool calibrate, bool useLimit = true) override;
+	RenderResult getGamma(float *gamma, float *brightness, float *contrast,
+		bool *calibrate, bool *useLimit) const override;
+	RenderResult configureResourceFaultInjection(
+		RenderResourceFaultPoint point, unsigned int failOnInvocation,
+		RenderResult result) override;
+	RenderResult getDebugResourceStatistics(
+		RenderResourceStatistics *statistics) const override;
 	RenderResult getBackBufferInfo(RenderBackBufferInfo *info) const override
 	{
 		if (!info) return RENDER_RESULT_INVALID_ARGUMENT;
@@ -653,6 +676,129 @@ RenderResult ThreadedRenderDevice::lifecycle(Control control, unsigned int width
 		return sync(control, reply);
 	}
 	catch (...) { return fail(RENDER_RESULT_OUT_OF_MEMORY); }
+}
+
+RenderResult ThreadedRenderDevice::setSwapInterval(unsigned int interval)
+{
+	if (!usable() || m_recording || interval > RENDER_SWAP_INTERVAL_MAX)
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	try
+	{
+		std::shared_ptr<Reply> reply = std::make_shared<Reply>();
+		reply->interval = interval;
+		return sync(CONTROL_SET_SWAP_INTERVAL, reply);
+	}
+	catch (...) { return RENDER_RESULT_OUT_OF_MEMORY; }
+}
+
+RenderResult ThreadedRenderDevice::getSwapInterval(unsigned int *interval) const
+{
+	if (!interval || !usable() || m_recording)
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	try
+	{
+		std::shared_ptr<Reply> reply = std::make_shared<Reply>();
+		const RenderResult result = const_cast<ThreadedRenderDevice *>(this)->sync(
+			CONTROL_GET_SWAP_INTERVAL, reply);
+		if (result == RENDER_RESULT_OK)
+			*interval = reply->interval;
+		return result;
+	}
+	catch (...) { return RENDER_RESULT_OUT_OF_MEMORY; }
+}
+
+RenderResult ThreadedRenderDevice::setGamma(float gamma, float brightness,
+	float contrast, bool calibrate, bool useLimit)
+{
+	if (!usable() || m_recording || gamma != gamma || brightness != brightness ||
+		contrast != contrast)
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	// Preserve the legacy Set_Gamma contract at the producer boundary so both
+	// direct and threaded devices publish identical effective parameters.
+	gamma = gamma < 0.6f ? 0.6f : (gamma > 6.0f ? 6.0f : gamma);
+	brightness = brightness < -0.5f ? -0.5f :
+		(brightness > 0.5f ? 0.5f : brightness);
+	contrast = contrast < 0.5f ? 0.5f :
+		(contrast > 2.0f ? 2.0f : contrast);
+	try
+	{
+		std::shared_ptr<Reply> reply = std::make_shared<Reply>();
+		reply->gamma = gamma;
+		reply->brightness = brightness;
+		reply->contrast = contrast;
+		reply->calibrate = calibrate;
+		reply->useLimit = useLimit;
+		return sync(CONTROL_SET_GAMMA, reply);
+	}
+	catch (...) { return RENDER_RESULT_OUT_OF_MEMORY; }
+}
+
+RenderResult ThreadedRenderDevice::getGamma(float *gamma, float *brightness,
+	float *contrast, bool *calibrate, bool *useLimit) const
+{
+	if (!gamma || !brightness || !contrast || !calibrate || !useLimit ||
+		!usable() || m_recording)
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	try
+	{
+		std::shared_ptr<Reply> reply = std::make_shared<Reply>();
+		const RenderResult result =
+			const_cast<ThreadedRenderDevice *>(this)->sync(
+				CONTROL_GET_GAMMA, reply);
+		if (result == RENDER_RESULT_OK)
+		{
+			*gamma = reply->gamma;
+			*brightness = reply->brightness;
+			*contrast = reply->contrast;
+			*calibrate = reply->calibrate;
+			*useLimit = reply->useLimit;
+		}
+		return result;
+	}
+	catch (...) { return RENDER_RESULT_OUT_OF_MEMORY; }
+}
+
+RenderResult ThreadedRenderDevice::configureResourceFaultInjection(
+	RenderResourceFaultPoint point, unsigned int failOnInvocation,
+	RenderResult result)
+{
+	if (!usable() || m_recording)
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	if (point != RENDER_RESOURCE_FAULT_NONE &&
+		(point < RENDER_RESOURCE_FAULT_TEXTURE_ALLOCATION ||
+		 point > RENDER_RESOURCE_FAULT_PRESENTATION_PASS ||
+		 failOnInvocation == 0 ||
+		 (result != RENDER_RESULT_OUT_OF_MEMORY &&
+		  result != RENDER_RESULT_DEVICE_REMOVED &&
+		  result != RENDER_RESULT_FAILED)))
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	try
+	{
+		std::shared_ptr<Reply> reply = std::make_shared<Reply>();
+		reply->faultPoint = point;
+		reply->faultFailOnInvocation = failOnInvocation;
+		reply->faultResult = result;
+		return sync(CONTROL_CONFIGURE_RESOURCE_FAULT, reply);
+	}
+	catch (...) { return RENDER_RESULT_OUT_OF_MEMORY; }
+}
+
+RenderResult ThreadedRenderDevice::getDebugResourceStatistics(
+	RenderResourceStatistics *statistics) const
+{
+	if (!statistics || !usable())
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	try
+	{
+		std::shared_ptr<Reply> reply = std::make_shared<Reply>();
+		const RenderResult result =
+			const_cast<ThreadedRenderDevice *>(this)->sync(
+				CONTROL_GET_RESOURCE_STATISTICS, reply);
+		if (result == RENDER_RESULT_OK)
+			*statistics = reply->statistics;
+		return result;
+	}
+	catch (...) { return RENDER_RESULT_OUT_OF_MEMORY; }
 }
 
 void ThreadedRenderDevice::shutdown()
@@ -1421,6 +1567,33 @@ void ThreadedRenderDevice::execute(Packet &packet)
 			break;
 		case CONTROL_DEBUG_COUNT: result = BackendCall([&] { return m_backend->getDebugValidationErrorCount(&packet.reply->count); }); break;
 		case CONTROL_REPORT: result = BackendCall([&] { return m_backend->reportDebugLiveObjects(); }); break;
+		case CONTROL_SET_SWAP_INTERVAL:
+			result = BackendCall([&] { return m_backend->setSwapInterval(packet.reply->interval); });
+			break;
+		case CONTROL_GET_SWAP_INTERVAL:
+			result = BackendCall([&] { return m_backend->getSwapInterval(&packet.reply->interval); });
+			break;
+		case CONTROL_SET_GAMMA:
+			result = BackendCall([&] { return m_backend->setGamma(
+				packet.reply->gamma, packet.reply->brightness,
+				packet.reply->contrast, packet.reply->calibrate,
+				packet.reply->useLimit); });
+			break;
+		case CONTROL_GET_GAMMA:
+			result = BackendCall([&] { return m_backend->getGamma(
+				&packet.reply->gamma, &packet.reply->brightness,
+				&packet.reply->contrast, &packet.reply->calibrate,
+				&packet.reply->useLimit); });
+			break;
+		case CONTROL_CONFIGURE_RESOURCE_FAULT:
+			result = BackendCall([&] { return m_backend->configureResourceFaultInjection(
+				packet.reply->faultPoint, packet.reply->faultFailOnInvocation,
+				packet.reply->faultResult); });
+			break;
+		case CONTROL_GET_RESOURCE_STATISTICS:
+			result = BackendCall([&] { return m_backend->getDebugResourceStatistics(
+				&packet.reply->statistics); });
+			break;
 		case CONTROL_ROLLBACK_RESOURCE:
 		{
 			const GpuHandle logical = packet.reply->handle;

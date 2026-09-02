@@ -10,6 +10,8 @@
 
 #pragma once
 
+// Legacy renderer declarations; native code includes the neutral header.
+
 #include <Utility/CppMacros.h>
 #include "ww3dformat.h"
 
@@ -27,15 +29,3 @@ bool Generate_Texture_Mip_Level_Box(
 	unsigned char* destination,
 	unsigned destination_pitch,
 	WW3DFormat format);
-
-#if defined(BUILD_WITH_D3D8)
-
-struct IDirect3DTexture8;
-
-// Generate all remaining levels of a D3D8 texture from its level zero data.
-// Characterized formats use the CPU box helper; unsupported formats/layouts
-// return D3DERR_NOTAVAILABLE instead of silently invoking an external image
-// service. The returned value is the D3D HRESULT from this legacy-only adapter.
-unsigned Generate_DX8_Texture_Mip_Levels(IDirect3DTexture8* texture);
-
-#endif

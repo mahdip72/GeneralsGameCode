@@ -45,7 +45,7 @@
 #include "w3derr.h"
 #include "WWLib/INI.h"
 #include "WWLib/XSTRAW.h"
-#include "dx8wrapper.h"
+#include "Renderer/RenderGameClient.h"
 
 
 static unsigned int unique=1;
@@ -896,7 +896,7 @@ void VertexMaterialClass::Apply() const
 			state.textureStageResetMask |= 1U << i;
 		}
 	}
-	DX8Wrapper::Set_Legacy_Vertex_Material(state);
+	rts::render::SetGameMaterial(this);
 	for (unsigned int stage=0; stage<MeshBuilderClass::MAX_STAGES; stage++) {
 		if (Mapper[stage]) Mapper[stage]->Apply(UVSource[stage]);
 	}
@@ -904,7 +904,7 @@ void VertexMaterialClass::Apply() const
 
 void VertexMaterialClass::Apply_Null()
 {
-	DX8Wrapper::Set_Legacy_Vertex_Material_Null();
+	rts::render::SetGameMaterial(nullptr);
 }
 
 

@@ -25,10 +25,6 @@
 #include "WWLib/wwstring.h"
 #include "WWMath/vector3.h"
 
-#if defined(BUILD_WITH_D3D8)
-struct IDirect3DSurface8;
-#endif
-
 // ----------------------------------------------------------------------------
 //
 // This structure represents the old DX7 color key structure. It is needed
@@ -246,9 +242,6 @@ public:
 	DDSType Get_Type() const { return Type; }
 
 	// Copy pixels to the destination surface.
-#if defined(BUILD_WITH_D3D8)
-	void Copy_Level_To_Surface(unsigned level,IDirect3DSurface8* d3d_surface,const Vector3& hsv_shift=Vector3(0.0f,0.0f,0.0f));
-#endif
 	void Copy_Level_To_Surface(
 		unsigned level,
 		WW3DFormat dest_format,

@@ -21,6 +21,7 @@ class NativeW3DOwnerFallbackEntry
 public:
 	NativeW3DOwnerFallbackEntry();
 	~NativeW3DOwnerFallbackEntry();
+	bool IsQueued() const;
 
 private:
 	friend class NativeW3DOwnerQueue;

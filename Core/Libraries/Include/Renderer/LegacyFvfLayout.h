@@ -38,7 +38,7 @@ enum LegacyFvfFlag
 	LEGACY_FVF_TEXCOUNT_MASK = 0x00000f00U,
 	LEGACY_FVF_TEXCOUNT_SHIFT = 8U,
 	LEGACY_FVF_LASTBETA_UBYTE4 = 0x00001000U,
-	LEGACY_FVF_LASTBETA_D3DCOLOR = 0x00008000U,
+	LEGACY_FVF_LASTBETA_PACKED_COLOR = 0x00008000U,
 	LEGACY_FVF_TEXCOORD_MASK = 0xffff0000U,
 
 	LEGACY_FVF_XYZNDUV1TG3 = LEGACY_FVF_XYZ | LEGACY_FVF_NORMAL |
@@ -55,7 +55,7 @@ inline unsigned int LegacyFvfVertexSize(unsigned int fvf)
 	const unsigned int KNOWN_MASK = LEGACY_FVF_POSITION_MASK |
 		LEGACY_FVF_NORMAL | LEGACY_FVF_PSIZE | LEGACY_FVF_DIFFUSE |
 		LEGACY_FVF_SPECULAR | LEGACY_FVF_TEXCOUNT_MASK |
-		LEGACY_FVF_LASTBETA_UBYTE4 | LEGACY_FVF_LASTBETA_D3DCOLOR |
+		LEGACY_FVF_LASTBETA_UBYTE4 | LEGACY_FVF_LASTBETA_PACKED_COLOR |
 		LEGACY_FVF_TEXCOORD_MASK;
 
 	if ((fvf & ~KNOWN_MASK) != 0U)
@@ -77,12 +77,12 @@ inline unsigned int LegacyFvfVertexSize(unsigned int fvf)
 	default: return 0;
 	}
 	const unsigned int lastBeta = fvf &
-		(LEGACY_FVF_LASTBETA_UBYTE4 | LEGACY_FVF_LASTBETA_D3DCOLOR);
+		(LEGACY_FVF_LASTBETA_UBYTE4 | LEGACY_FVF_LASTBETA_PACKED_COLOR);
 	if ((position == LEGACY_FVF_XYZRHW &&
 			(fvf & LEGACY_FVF_NORMAL) != 0U) ||
 		(blendFieldCount == 0U && lastBeta != 0U) ||
 		lastBeta == (LEGACY_FVF_LASTBETA_UBYTE4 |
-			LEGACY_FVF_LASTBETA_D3DCOLOR))
+			LEGACY_FVF_LASTBETA_PACKED_COLOR))
 	{
 		return 0;
 	}
@@ -127,7 +127,7 @@ inline unsigned int LegacyFvfBlendFieldCount(unsigned int fvf)
 inline bool LegacyFvfHasLastBeta(unsigned int fvf)
 {
 	return (fvf & (LEGACY_FVF_LASTBETA_UBYTE4 |
-		LEGACY_FVF_LASTBETA_D3DCOLOR)) != 0U;
+		LEGACY_FVF_LASTBETA_PACKED_COLOR)) != 0U;
 }
 
 // Decode the serialized legacy FVF bit layout without including a graphics
@@ -139,7 +139,7 @@ inline bool DecodeLegacyFvfVertexLayout(unsigned int fvf,
 	const unsigned int KNOWN_MASK = LEGACY_FVF_POSITION_MASK |
 		LEGACY_FVF_NORMAL | LEGACY_FVF_PSIZE | LEGACY_FVF_DIFFUSE |
 		LEGACY_FVF_SPECULAR | LEGACY_FVF_TEXCOUNT_MASK |
-		LEGACY_FVF_LASTBETA_UBYTE4 | LEGACY_FVF_LASTBETA_D3DCOLOR |
+		LEGACY_FVF_LASTBETA_UBYTE4 | LEGACY_FVF_LASTBETA_PACKED_COLOR |
 		LEGACY_FVF_TEXCOORD_MASK;
 
 	if (layout == 0 || vertexStride == 0 || (fvf & ~KNOWN_MASK) != 0U)
@@ -205,7 +205,7 @@ inline bool DecodeLegacyFvfVertexLayout(unsigned int fvf,
 
 	// XYZB<n> stores n four-byte blend fields immediately after XYZ.  In the
 	// ordinary form all fields are floating-point weights.  LASTBETA replaces
-	// the final field with either UBYTE4 or D3DCOLOR indices, while preserving
+	// the final field with either UBYTE4 or packed-color indices, while preserving
 	// the serialized stride and all subsequent offsets.
 	const unsigned int blendFieldCount = LegacyFvfBlendFieldCount(fvf);
 	const bool hasLastBeta = LegacyFvfHasLastBeta(fvf);
@@ -255,7 +255,7 @@ inline bool DecodeLegacyFvfVertexLayout(unsigned int fvf,
 		element.semantic = RENDER_VERTEX_SEMANTIC_BLEND_INDEX;
 		element.semanticIndex = 0;
 		element.format = (fvf & LEGACY_FVF_LASTBETA_UBYTE4) != 0U ?
-			RENDER_VERTEX_DATA_UBYTE4 : RENDER_VERTEX_DATA_D3DCOLOR;
+			RENDER_VERTEX_DATA_UBYTE4 : RENDER_VERTEX_DATA_PACKED_COLOR;
 		element.byteOffset = offset;
 		offset += sizeof(unsigned int);
 	}

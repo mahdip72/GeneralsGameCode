@@ -24,6 +24,8 @@
 #include "LegacyTexturedPS.h"
 #include "LegacyTexturedVS.h"
 #include "LegacyTexturedUnweightedVS.h"
+#include "PresentationColorTransformPS.h"
+#include "PresentationColorTransformVS.h"
 
 #include <float.h>
 #include <limits.h>
@@ -313,10 +315,10 @@ DXGI_FORMAT TranslateVertexDataFormat(LegacyVertexDataFormat format)
 	case RENDER_VERTEX_DATA_FLOAT4: return DXGI_FORMAT_R32G32B32A32_FLOAT;
 	case RENDER_VERTEX_DATA_COLOR_BGRA8: return DXGI_FORMAT_B8G8R8A8_UNORM;
 	case RENDER_VERTEX_DATA_UBYTE4: return DXGI_FORMAT_R8G8B8A8_UINT;
-	// DXGI has no B8G8R8A8_UINT variant. LASTBETA_D3DCOLOR is a four-byte
+	// DXGI has no B8G8R8A8_UINT variant. LASTBETA packed-color is a four-byte
 	// integer stream, so bind it as the byte-equivalent UINT declaration; the
 	// neutral decoder keeps the source spelling distinct from UBYTE4.
-	case RENDER_VERTEX_DATA_D3DCOLOR: return DXGI_FORMAT_R8G8B8A8_UINT;
+	case RENDER_VERTEX_DATA_PACKED_COLOR: return DXGI_FORMAT_R8G8B8A8_UINT;
 	default: return DXGI_FORMAT_UNKNOWN;
 	}
 }
@@ -449,6 +451,14 @@ struct LegacyTransformConstants
 	unsigned int fogStateParameters[4];
 };
 
+struct PresentationColorConstants
+{
+	float gamma;
+	float brightness;
+	float contrast;
+	float limit;
+};
+
 void MultiplyMatrices(const float *left, const float *right, float *product)
 {
 	for (unsigned int row = 0; row < 4; ++row)
@@ -539,9 +549,11 @@ bool CanDisableLegacyPixelShader(const LegacyPipelineState &pipeline)
 class D3D11RenderDevice : public IRenderDevice, public IRenderContext
 {
 public:
-	D3D11RenderDevice() : m_device(0), m_context(0), m_debugLayer(0),
+	D3D11RenderDevice() : m_device(0), m_context(0),
+		m_featureLevel(D3D_FEATURE_LEVEL_9_1), m_debugLayer(0),
 		m_debugLayerActive(false), m_swapChain(0),
 		m_renderTarget(0), m_renderTargetResource(0), m_depthTexture(0), m_depthStencil(0),
+		m_presentationSource(0), m_presentationSourceView(0),
 		m_activeRenderTarget(0), m_activeDepthStencil(0),
 		m_activeColorResource(0), m_activeDepthResource(0),
 		m_vertexShader(0), m_pixelShader(0), m_positionColorLayout(0),
@@ -550,13 +562,17 @@ public:
 		m_texturedFixed1PixelShader(0), m_texturedFixed2PixelShader(0),
 		m_waterFlatPixelShader(0), m_waterRiverPixelShader(0),
 		m_seaWaveVertexShader(0), m_seaWavePixelShader(0),
-		m_seaWaveLayout(0),
+		m_seaWaveLayout(0), m_presentationVertexShader(0),
+		m_presentationPixelShader(0), m_presentationConstants(0),
+		m_presentationSampler(0),
 		m_handles(0), m_faultPoint(RENDER_RESOURCE_FAULT_NONE),
 		m_faultCountdown(0), m_faultResult(RENDER_RESULT_FAILED),
 		m_stateUseSerial(0), m_ownerThread(0), m_initialized(false),
 		m_frameOpen(false), m_pipelineBound(false), m_vertexBufferBound(false),
 		m_indexBufferBound(false), m_topologyBound(false),
-		m_enableVsync(true), m_transformConstantCursor(0), m_width(0), m_height(0),
+		m_swapInterval(1), m_gamma(1.0f), m_brightness(0.0f),
+		m_contrast(1.0f), m_gammaCalibrate(false), m_gammaUseLimit(true),
+		m_transformConstantCursor(0), m_width(0), m_height(0),
 		m_viewportX(0.0f), m_viewportY(0.0f), m_viewportWidth(0.0f),
 		m_viewportHeight(0.0f), m_hasVertexLayoutFlagsOverride(false),
 		m_vertexLayoutFlagsOverride(0), m_parameters(),
@@ -645,7 +661,7 @@ public:
 		}
 
 		m_ownerThread = GetCurrentThreadId();
-		m_enableVsync = parameters.enableVsync;
+		m_swapInterval = parameters.enableVsync ? 1 : 0;
 		m_width = parameters.width;
 		m_height = parameters.height;
 		if (parameters.window != 0)
@@ -1273,8 +1289,10 @@ public:
 		}
 		ResourceSlot &slot = m_resources[resource.index()];
 		RenderResult injectedResult = RENDER_RESULT_OK;
-		if (slot.kind == RESOURCE_TEXTURE && consumeResourceFault(
-			RENDER_RESOURCE_FAULT_TEXTURE_DESTRUCTION, &injectedResult))
+		if ((slot.kind == RESOURCE_TEXTURE && consumeResourceFault(
+			RENDER_RESOURCE_FAULT_TEXTURE_DESTRUCTION, &injectedResult)) ||
+			(slot.kind == RESOURCE_BUFFER && consumeResourceFault(
+				RENDER_RESOURCE_FAULT_BUFFER_DESTRUCTION, &injectedResult)))
 		{
 			return false;
 		}
@@ -1559,13 +1577,82 @@ public:
 			// silently reporting success after a lost GPU.
 			return TranslateResult(m_device->GetDeviceRemovedReason());
 		}
+		if (!isPresentationIdentity() && isDefaultBackBufferTarget())
+		{
+			const RenderResult transformResult = applyPresentationGamma();
+			if (transformResult != RENDER_RESULT_OK)
+				return transformResult;
+		}
 		const HRESULT presentResult = m_swapChain->Present(
-			m_enableVsync ? 1 : 0, 0);
+			m_swapInterval, 0);
 		if (FAILED(presentResult))
 		{
 			return TranslateResult(presentResult);
 		}
 		return TranslateResult(m_device->GetDeviceRemovedReason());
+	}
+
+	virtual RenderResult setSwapInterval(unsigned int interval)
+	{
+		if (interval > RENDER_SWAP_INTERVAL_MAX || !isOwner() || m_frameOpen)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		if (!isOperational())
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		if (m_swapChain == 0)
+			return RENDER_RESULT_UNSUPPORTED;
+		m_swapInterval = interval;
+		return RENDER_RESULT_OK;
+	}
+
+	virtual RenderResult getSwapInterval(unsigned int *interval) const
+	{
+		if (interval == 0 || !isOwner() || m_frameOpen)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		if (!isOperational())
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		if (m_swapChain == 0)
+			return RENDER_RESULT_UNSUPPORTED;
+		*interval = m_swapInterval;
+		return RENDER_RESULT_OK;
+	}
+
+	virtual RenderResult setGamma(float gamma, float brightness, float contrast,
+		bool calibrate, bool useLimit)
+	{
+		if (!isOwner() || m_frameOpen || !isOperational())
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		if (m_swapChain == 0)
+			return RENDER_RESULT_UNSUPPORTED;
+		if (gamma != gamma || brightness != brightness || contrast != contrast)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		// Match DX8Wrapper::Set_Gamma: finite values outside the legacy UI
+		// range are clamped, while NaN is rejected instead of propagating an
+		// undefined pow() result into the presentation shader.
+		m_gamma = gamma < 0.6f ? 0.6f : (gamma > 6.0f ? 6.0f : gamma);
+		m_brightness = brightness < -0.5f ? -0.5f :
+			(brightness > 0.5f ? 0.5f : brightness);
+		m_contrast = contrast < 0.5f ? 0.5f :
+			(contrast > 2.0f ? 2.0f : contrast);
+		m_gammaCalibrate = calibrate;
+		m_gammaUseLimit = useLimit;
+		return RENDER_RESULT_OK;
+	}
+
+	virtual RenderResult getGamma(float *gamma, float *brightness,
+		float *contrast, bool *calibrate, bool *useLimit) const
+	{
+		if (gamma == 0 || brightness == 0 || contrast == 0 ||
+			calibrate == 0 || useLimit == 0 || !isOwner() || m_frameOpen ||
+			!isOperational())
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		if (m_swapChain == 0)
+			return RENDER_RESULT_UNSUPPORTED;
+		*gamma = m_gamma;
+		*brightness = m_brightness;
+		*contrast = m_contrast;
+		*calibrate = m_gammaCalibrate;
+		*useLimit = m_gammaUseLimit;
+		return RENDER_RESULT_OK;
 	}
 
 	virtual RenderResult getBackBufferInfo(RenderBackBufferInfo *info) const
@@ -2306,8 +2393,8 @@ public:
 				}
 				else
 				{
-					// D3DTSS_MAXMIPLEVEL excludes higher-detail levels.  D3D11's
-					// equivalent is a minimum LOD, not a maximum LOD.
+					// The historical maximum-mip-level state excludes higher-detail
+					// levels. The native equivalent is a minimum LOD, not a maximum LOD.
 					samplerDescriptor.MinLOD =
 						static_cast<float>(sampler.maximumMipLevel);
 					samplerDescriptor.MaxLOD = FLT_MAX;
@@ -2889,6 +2976,30 @@ public:
 		return RENDER_RESULT_OK;
 	}
 
+	virtual RenderResult getTextureFilterCapabilities(
+		RenderTextureFilterCapabilities *capabilities) const
+	{
+		if (capabilities == 0)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		*capabilities = RenderTextureFilterCapabilities();
+		if (!isOwner() || !isOperational())
+			return RENDER_RESULT_INVALID_ARGUMENT;
+
+		// This renderer requests feature level 11_0 and rejects lower levels in
+		// createNativeDevice.  D3D11 feature level 11_0 guarantees point and
+		// linear sampler filtering; D3D11_REQ_MAXANISOTROPY is the API minimum
+		// contract for the sampler MaxAnisotropy field.  Keep the capability
+		// derivation here, beside the actual device and obtained feature level,
+		// so the game-owner layer never invents a backend limit.
+		if (m_featureLevel < D3D_FEATURE_LEVEL_11_0)
+			return RENDER_RESULT_UNSUPPORTED;
+		capabilities->supportsPoint = true;
+		capabilities->supportsLinear = true;
+		capabilities->supportsAnisotropic = true;
+		capabilities->maxAnisotropy = D3D11_REQ_MAXANISOTROPY;
+		return RENDER_RESULT_OK;
+	}
+
 	virtual RenderResult configureResourceFaultInjection(
 		RenderResourceFaultPoint point, unsigned int failOnInvocation,
 		RenderResult result)
@@ -2905,7 +3016,7 @@ public:
 			return RENDER_RESULT_OK;
 		}
 		if (point < RENDER_RESOURCE_FAULT_TEXTURE_ALLOCATION ||
-			point > RENDER_RESOURCE_FAULT_TEXTURE_DESTRUCTION ||
+			point > RENDER_RESOURCE_FAULT_PRESENTATION_PASS ||
 			failOnInvocation == 0 ||
 			(result != RENDER_RESULT_OUT_OF_MEMORY &&
 			 result != RENDER_RESULT_DEVICE_REMOVED &&
@@ -2989,6 +3100,173 @@ public:
 	}
 
 private:
+	bool isPresentationIdentity() const
+	{
+		return m_gamma == 1.0f && m_brightness == 0.0f &&
+			m_contrast == 1.0f;
+	}
+
+	bool isDefaultBackBufferTarget() const
+	{
+		return m_renderTarget != 0 && m_renderTargetResource != 0 &&
+			m_activeRenderTarget == m_renderTarget &&
+			m_activeColorResource == m_renderTargetResource;
+	}
+
+	HRESULT createPresentationResources()
+	{
+		if (m_presentationSource != 0 && m_presentationSourceView != 0)
+			return S_OK;
+		if (m_device == 0 || m_width == 0 || m_height == 0)
+			return E_INVALIDARG;
+		releasePresentationResources();
+		D3D11_TEXTURE2D_DESC descriptor;
+		memset(&descriptor, 0, sizeof(descriptor));
+		descriptor.Width = m_width;
+		descriptor.Height = m_height;
+		descriptor.MipLevels = 1;
+		descriptor.ArraySize = 1;
+		descriptor.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+		descriptor.SampleDesc.Count = 1;
+		descriptor.Usage = D3D11_USAGE_DEFAULT;
+		descriptor.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		HRESULT result = m_device->CreateTexture2D(&descriptor, 0,
+			&m_presentationSource);
+		if (FAILED(result))
+			return result;
+
+		D3D11_SHADER_RESOURCE_VIEW_DESC viewDescriptor;
+		memset(&viewDescriptor, 0, sizeof(viewDescriptor));
+		viewDescriptor.Format = descriptor.Format;
+		viewDescriptor.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		viewDescriptor.Texture2D.MipLevels = 1;
+		result = m_device->CreateShaderResourceView(m_presentationSource,
+			&viewDescriptor, &m_presentationSourceView);
+		if (FAILED(result))
+			releasePresentationResources();
+		return result;
+	}
+
+	void releasePresentationResources()
+	{
+		if (m_presentationSourceView != 0)
+		{
+			m_presentationSourceView->Release();
+			m_presentationSourceView = 0;
+		}
+		if (m_presentationSource != 0)
+		{
+			m_presentationSource->Release();
+			m_presentationSource = 0;
+		}
+	}
+
+	void clearPresentationBindings()
+	{
+		if (m_context == 0)
+			return;
+		ID3D11ShaderResourceView *emptyViews[LEGACY_TEXTURE_STAGE_COUNT * 2] =
+			{ 0 };
+		m_context->PSSetShaderResources(0, LEGACY_TEXTURE_STAGE_COUNT * 2,
+			emptyViews);
+		ID3D11SamplerState *emptySamplers[LEGACY_TEXTURE_STAGE_COUNT] = { 0 };
+		m_context->PSSetSamplers(0, LEGACY_TEXTURE_STAGE_COUNT,
+			emptySamplers);
+		ID3D11Buffer *emptyConstantBuffer = 0;
+		m_context->VSSetConstantBuffers(0, 1, &emptyConstantBuffer);
+		m_context->PSSetConstantBuffers(0, 1, &emptyConstantBuffer);
+		m_context->VSSetShader(0, 0, 0);
+		m_context->PSSetShader(0, 0, 0);
+		m_context->IASetInputLayout(0);
+		ID3D11Buffer *emptyBuffers[1] = { 0 };
+		const UINT zero = 0;
+		m_context->IASetVertexBuffers(0, 1, emptyBuffers, &zero, &zero);
+		m_context->IASetIndexBuffer(0, DXGI_FORMAT_UNKNOWN, 0);
+		m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED);
+		const float blendFactor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+		m_context->OMSetBlendState(0, blendFactor, 0xffffffffU);
+		m_context->OMSetDepthStencilState(0, 0);
+		m_context->RSSetState(0);
+		m_context->OMSetRenderTargets(0, 0, 0);
+		m_context->RSSetViewports(0, 0);
+		invalidateContextBindings();
+	}
+
+	RenderResult applyPresentationGamma()
+	{
+		if (m_device == 0 || m_context == 0 || m_renderTarget == 0 ||
+			m_renderTargetResource == 0 || m_presentationVertexShader == 0 ||
+			m_presentationPixelShader == 0 || m_presentationConstants == 0 ||
+			m_presentationSampler == 0)
+			return RENDER_RESULT_UNSUPPORTED;
+		HRESULT result = createPresentationResources();
+		if (FAILED(result))
+			return TranslateResult(result);
+
+		D3D11_MAPPED_SUBRESOURCE mapped;
+		result = m_context->Map(m_presentationConstants, 0,
+			D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+		if (FAILED(result))
+			return TranslateResult(result);
+		if (mapped.pData == 0)
+		{
+			m_context->Unmap(m_presentationConstants, 0);
+			return RENDER_RESULT_FAILED;
+		}
+		PresentationColorConstants *constants =
+			static_cast<PresentationColorConstants *>(mapped.pData);
+		constants->gamma = m_gamma;
+		constants->brightness = m_brightness;
+		constants->contrast = m_contrast;
+		constants->limit = m_gammaUseLimit ?
+			(m_contrast - 1.0f) / 2.0f * m_contrast : 0.0f;
+		m_context->Unmap(m_presentationConstants, 0);
+
+		m_context->CopyResource(m_presentationSource, m_renderTargetResource);
+		result = m_device->GetDeviceRemovedReason();
+		if (FAILED(result))
+			return TranslateResult(result);
+
+		// The swap-chain resource was the current output, so no legacy SRV may
+		// remain bound while the intermediate is sampled into that output.
+		unbindTextureResources();
+		const float blendFactor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+		m_context->OMSetBlendState(0, blendFactor, 0xffffffffU);
+		m_context->OMSetDepthStencilState(0, 0);
+		m_context->RSSetState(0);
+		m_context->OMSetRenderTargets(1, &m_renderTarget, 0);
+		m_context->IASetInputLayout(0);
+		ID3D11Buffer *emptyBuffers[1] = { 0 };
+		const UINT zero = 0;
+		m_context->IASetVertexBuffers(0, 1, emptyBuffers, &zero, &zero);
+		m_context->IASetIndexBuffer(0, DXGI_FORMAT_UNKNOWN, 0);
+		m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		m_context->VSSetShader(m_presentationVertexShader, 0, 0);
+		m_context->PSSetShader(m_presentationPixelShader, 0, 0);
+		m_context->VSSetConstantBuffers(0, 1, &m_presentationConstants);
+		m_context->PSSetConstantBuffers(0, 1, &m_presentationConstants);
+		m_context->PSSetShaderResources(0, 1, &m_presentationSourceView);
+		m_context->PSSetSamplers(0, 1, &m_presentationSampler);
+		D3D11_VIEWPORT viewport;
+		viewport.TopLeftX = 0.0f;
+		viewport.TopLeftY = 0.0f;
+		viewport.Width = static_cast<float>(m_width);
+		viewport.Height = static_cast<float>(m_height);
+		viewport.MinDepth = 0.0f;
+		viewport.MaxDepth = 1.0f;
+		m_context->RSSetViewports(1, &viewport);
+		m_context->Draw(3, 0);
+		RenderResult passResult = TranslateResult(
+			m_device->GetDeviceRemovedReason());
+		RenderResult injectedResult = RENDER_RESULT_OK;
+		const bool injected = consumeResourceFault(
+			RENDER_RESOURCE_FAULT_PRESENTATION_PASS, &injectedResult);
+		clearPresentationBindings();
+		if (injected)
+			return injectedResult;
+		return passResult;
+	}
+
 	RenderResult reportLiveObjects()
 	{
 		if (!m_debugLayerActive || m_debugLayer == 0)
@@ -3487,8 +3765,52 @@ private:
 	};
 	result = m_device->CreateInputLayout(seaWaveElements,
 		static_cast<UINT>(sizeof(seaWaveElements) /
-			sizeof(seaWaveElements[0])), g_LegacySeaWaveVS,
-		sizeof(g_LegacySeaWaveVS), &m_seaWaveLayout);
+			 sizeof(seaWaveElements[0])), g_LegacySeaWaveVS,
+		 sizeof(g_LegacySeaWaveVS), &m_seaWaveLayout);
+	if (FAILED(result))
+	{
+		return result;
+	}
+	result = m_device->CreateVertexShader(g_PresentationColorTransformVS,
+		sizeof(g_PresentationColorTransformVS), 0,
+		&m_presentationVertexShader);
+	if (FAILED(result))
+	{
+		return result;
+	}
+	result = m_device->CreatePixelShader(g_PresentationColorTransformPS,
+		sizeof(g_PresentationColorTransformPS), 0,
+		&m_presentationPixelShader);
+	if (FAILED(result))
+	{
+		return result;
+	}
+	D3D11_BUFFER_DESC presentationConstantsDescriptor;
+	memset(&presentationConstantsDescriptor, 0,
+		sizeof(presentationConstantsDescriptor));
+	presentationConstantsDescriptor.ByteWidth =
+		static_cast<UINT>(sizeof(PresentationColorConstants));
+	presentationConstantsDescriptor.Usage = D3D11_USAGE_DYNAMIC;
+	presentationConstantsDescriptor.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	presentationConstantsDescriptor.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+	result = m_device->CreateBuffer(&presentationConstantsDescriptor, 0,
+		&m_presentationConstants);
+	if (FAILED(result))
+	{
+		return result;
+	}
+	D3D11_SAMPLER_DESC presentationSamplerDescriptor;
+	memset(&presentationSamplerDescriptor, 0,
+		sizeof(presentationSamplerDescriptor));
+	presentationSamplerDescriptor.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+	presentationSamplerDescriptor.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+	presentationSamplerDescriptor.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+	presentationSamplerDescriptor.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+	presentationSamplerDescriptor.ComparisonFunc = D3D11_COMPARISON_NEVER;
+	presentationSamplerDescriptor.MinLOD = 0.0f;
+	presentationSamplerDescriptor.MaxLOD = FLT_MAX;
+	result = m_device->CreateSamplerState(&presentationSamplerDescriptor,
+		&m_presentationSampler);
 	if (FAILED(result))
 	{
 		return result;
@@ -4064,6 +4386,7 @@ private:
 
 	void releaseBackBufferTargets()
 	{
+		releasePresentationResources();
 		m_activeRenderTarget = 0;
 		m_activeDepthStencil = 0;
 		m_activeColorResource = 0;
@@ -4537,7 +4860,7 @@ private:
 			case RENDER_VERTEX_SEMANTIC_BLEND_INDEX:
 				if (hasBlendIndex || semanticIndex != 0U ||
 					(element.format != RENDER_VERTEX_DATA_UBYTE4 &&
-					 element.format != RENDER_VERTEX_DATA_D3DCOLOR))
+						 element.format != RENDER_VERTEX_DATA_PACKED_COLOR))
 				{
 					return E_INVALIDARG;
 				}
@@ -4858,6 +5181,7 @@ private:
 		}
 		if (SUCCEEDED(result))
 		{
+			m_featureLevel = obtainedLevel;
 			m_debugLayerActive = false;
 			if ((flags & D3D11_CREATE_DEVICE_DEBUG) != 0)
 			{
@@ -4963,6 +5287,7 @@ private:
 		reportLiveObjects();
 		releaseDeviceObjects();
 		m_ownerThread = 0;
+		m_featureLevel = D3D_FEATURE_LEVEL_9_1;
 		m_activeRenderTarget = 0;
 		m_activeDepthStencil = 0;
 		m_activeColorResource = 0;
@@ -4970,6 +5295,12 @@ private:
 		m_faultPoint = RENDER_RESOURCE_FAULT_NONE;
 		m_faultCountdown = 0;
 		m_faultResult = RENDER_RESULT_FAILED;
+		m_swapInterval = 1;
+		m_gamma = 1.0f;
+		m_brightness = 0.0f;
+		m_contrast = 1.0f;
+		m_gammaCalibrate = false;
+		m_gammaUseLimit = true;
 		m_initialized = false;
 		m_width = 0;
 		m_height = 0;
@@ -4977,6 +5308,26 @@ private:
 
 	void releasePipelineResources()
 	{
+		if (m_presentationSampler != 0)
+		{
+			m_presentationSampler->Release();
+			m_presentationSampler = 0;
+		}
+		if (m_presentationConstants != 0)
+		{
+			m_presentationConstants->Release();
+			m_presentationConstants = 0;
+		}
+		if (m_presentationPixelShader != 0)
+		{
+			m_presentationPixelShader->Release();
+			m_presentationPixelShader = 0;
+		}
+		if (m_presentationVertexShader != 0)
+		{
+			m_presentationVertexShader->Release();
+			m_presentationVertexShader = 0;
+		}
 		for (unsigned int index = 0; index < m_inputLayouts.size(); ++index)
 		{
 			m_inputLayouts[index].layout->Release();
@@ -5126,11 +5477,14 @@ private:
 
 	ID3D11Device *m_device;
 	ID3D11DeviceContext *m_context;
+	D3D_FEATURE_LEVEL m_featureLevel;
 	ID3D11Debug *m_debugLayer;
 	bool m_debugLayerActive;
 	IDXGISwapChain1 *m_swapChain;
 	ID3D11RenderTargetView *m_renderTarget;
 	ID3D11Resource *m_renderTargetResource;
+	ID3D11Texture2D *m_presentationSource;
+	ID3D11ShaderResourceView *m_presentationSourceView;
 	ID3D11Texture2D *m_depthTexture;
 	ID3D11DepthStencilView *m_depthStencil;
 	ID3D11RenderTargetView *m_activeRenderTarget;
@@ -5152,6 +5506,10 @@ private:
 	ID3D11VertexShader *m_seaWaveVertexShader;
 	ID3D11PixelShader *m_seaWavePixelShader;
 	ID3D11InputLayout *m_seaWaveLayout;
+	ID3D11VertexShader *m_presentationVertexShader;
+	ID3D11PixelShader *m_presentationPixelShader;
+	ID3D11Buffer *m_presentationConstants;
+	ID3D11SamplerState *m_presentationSampler;
 	GpuHandleAllocator *m_handles;
 	RenderResourceFaultPoint m_faultPoint;
 	unsigned int m_faultCountdown;
@@ -5170,7 +5528,12 @@ private:
 	bool m_vertexBufferBound;
 	bool m_indexBufferBound;
 	bool m_topologyBound;
-	bool m_enableVsync;
+	unsigned int m_swapInterval;
+	float m_gamma;
+	float m_brightness;
+	float m_contrast;
+	bool m_gammaCalibrate;
+	bool m_gammaUseLimit;
 	unsigned int m_transformConstantCursor;
 	unsigned int m_width;
 	unsigned int m_height;

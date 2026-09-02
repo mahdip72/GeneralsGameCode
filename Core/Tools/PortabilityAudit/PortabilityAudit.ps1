@@ -15,18 +15,58 @@ $rawD3D8BoundaryPaths = @(
     # The product's temporary D3D8 compatibility ABI is declared once here;
     # it remains deliberately outside the final-cutover boundary list below.
     'cmake/dx8.cmake',
-    'Core/Libraries/Source/WWVegas/WW3D2/dx8wrapper.cpp',
-    'Core/Libraries/Source/WWVegas/WW3D2/dx8wrapper.h',
-    'Core/Libraries/Source/WWVegas/WW3D2/d3d11legacybridge.cpp',
-    'Core/Libraries/Source/WWVegas/WW3D2/d3d11legacybridge.h',
-    'Core/Libraries/Source/WWVegas/WW3D2/surfaceblit.cpp',
-    'Core/Libraries/Source/WWVegas/WW3D2/surfaceblit.h',
-    'Core/Libraries/Source/WWVegas/WW3D2/dx8fvf.cpp',
-    'Core/Libraries/Source/WWVegas/WW3D2/dx8fvf.h',
-    'Core/Libraries/Source/WWVegas/WW3D2/texturemipgenerator.cpp',
-    'Core/Libraries/Source/WWVegas/WW3D2/texturemipgenerator.h',
-    'Core/Libraries/Source/WWVegas/WW3D2/legacytexturecompat.cpp',
-    'Core/Libraries/Source/WWVegas/WW3D2/legacytexturecompat.h',
+    # Raw compatibility adapters live outside the product prefixes. Keep the
+    # inventory explicit so a newly relocated module cannot be silently added.
+    'Core/LegacyRenderer/GameEngineDevice/Include/W3DDevice/Common/LegacyPixelShaderBytecode.h',
+    'Core/LegacyRenderer/GameEngineDevice/Source/W3DDevice/Common/System/LegacyPixelShaderBytecode.cpp',
+    'Core/LegacyRenderer/GameEngineDevice/Source/W3DDevice/GameClient/RenderTextureOperationsLegacy.cpp',
+    'Core/LegacyRenderer/GameEngineDevice/Source/W3DDevice/GameClient/W3DProfilerFrameCaptureLegacy.cpp',
+    'Core/LegacyRenderer/Generals/WW3D2/DDSFileLegacy.cpp',
+    'Core/LegacyRenderer/Generals/WW3D2/DDSFileLegacy.h',
+    'Core/LegacyRenderer/Generals/WW3D2/RenderGameClientLegacy.cpp',
+    'Core/LegacyRenderer/GeneralsMD/WW3D2/DDSFileLegacy.cpp',
+    'Core/LegacyRenderer/GeneralsMD/WW3D2/DDSFileLegacy.h',
+    'Core/LegacyRenderer/GeneralsMD/WW3D2/RenderGameClientLegacy.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/d3d11legacybridge.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/d3d11legacybridge.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8caps.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8caps.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8fvf.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8fvf.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8indexbuffer.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8indexbuffer.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8polygonrenderer.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8polygonrenderer.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8renderer.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8renderer.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8rendererdebugger.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8rendererdebugger.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8texman.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8texman.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8vertexbuffer.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8vertexbuffer.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8webbrowser.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8webbrowser.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8wrapper.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8wrapper.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/formconv.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/formconv_legacy.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/legacytexturecompat.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/legacytexturecompat.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/line3d_legacy.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/missingtexture_legacy.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/sortingrenderer_legacy.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/surfaceblit.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/surfaceblit_legacy.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/surfaceclass.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/surfaceclass_legacy.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/texture.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/texture_legacy.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/textureloader.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/textureloader_legacy.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/texturemipgenerator.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/texturemipgenerator_legacy.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/ww3dformat_legacy.cpp',
     'Core/Tools/FVFStrideTest/FVFStrideTest.cpp',
     'Core/Tools/SurfaceBlitTest/SurfaceBlitTest.cpp',
     'Core/Tools/TextureMipGeneratorTest/TextureMipGeneratorTest.cpp',
@@ -48,34 +88,59 @@ $rawD3D8BoundaryPaths = @(
 # permits no matches at all and must remain red until native device ownership
 # replaces the compatibility bridge.
 $strictD3D8BoundaryPaths = @(
-    'Core/Libraries/Source/WWVegas/WW3D2/d3d11legacybridge.cpp',
-    'Core/Libraries/Source/WWVegas/WW3D2/d3d11legacybridge.h',
-    'Core/Libraries/Source/WWVegas/WW3D2/dx8caps.cpp',
-    'Core/Libraries/Source/WWVegas/WW3D2/dx8caps.h',
-    'Core/Libraries/Source/WWVegas/WW3D2/dx8fvf.cpp',
-    'Core/Libraries/Source/WWVegas/WW3D2/dx8fvf.h',
-    'Core/Libraries/Source/WWVegas/WW3D2/dx8indexbuffer.cpp',
-    'Core/Libraries/Source/WWVegas/WW3D2/dx8indexbuffer.h',
-    'Core/Libraries/Source/WWVegas/WW3D2/dx8polygonrenderer.cpp',
-    'Core/Libraries/Source/WWVegas/WW3D2/dx8polygonrenderer.h',
-    'Core/Libraries/Source/WWVegas/WW3D2/dx8renderer.cpp',
-    'Core/Libraries/Source/WWVegas/WW3D2/dx8renderer.h',
-    'Core/Libraries/Source/WWVegas/WW3D2/dx8rendererdebugger.cpp',
-    'Core/Libraries/Source/WWVegas/WW3D2/dx8rendererdebugger.h',
-    'Core/Libraries/Source/WWVegas/WW3D2/dx8texman.cpp',
-    'Core/Libraries/Source/WWVegas/WW3D2/dx8texman.h',
-    'Core/Libraries/Source/WWVegas/WW3D2/dx8vertexbuffer.cpp',
-    'Core/Libraries/Source/WWVegas/WW3D2/dx8vertexbuffer.h',
-    'Core/Libraries/Source/WWVegas/WW3D2/dx8webbrowser.cpp',
-    'Core/Libraries/Source/WWVegas/WW3D2/dx8webbrowser.h',
-    'Core/Libraries/Source/WWVegas/WW3D2/dx8wrapper.cpp',
-    'Core/Libraries/Source/WWVegas/WW3D2/dx8wrapper.h',
-    'Core/Libraries/Source/WWVegas/WW3D2/legacytexturecompat.cpp',
-    'Core/Libraries/Source/WWVegas/WW3D2/legacytexturecompat.h',
-    'Core/Libraries/Source/WWVegas/WW3D2/surfaceblit.cpp',
-    'Core/Libraries/Source/WWVegas/WW3D2/surfaceblit.h',
-    'Core/Libraries/Source/WWVegas/WW3D2/texturemipgenerator.cpp',
-    'Core/Libraries/Source/WWVegas/WW3D2/texturemipgenerator.h'
+    # These are retained only as an explicit external-adapter inventory. They
+    # are outside product-runtime prefixes, so StrictFinal still requires zero
+    # matches in every shipped product source and build file.
+    'Core/LegacyRenderer/GameEngineDevice/Include/W3DDevice/Common/LegacyPixelShaderBytecode.h',
+    'Core/LegacyRenderer/GameEngineDevice/Source/W3DDevice/Common/System/LegacyPixelShaderBytecode.cpp',
+    'Core/LegacyRenderer/GameEngineDevice/Source/W3DDevice/GameClient/RenderTextureOperationsLegacy.cpp',
+    'Core/LegacyRenderer/GameEngineDevice/Source/W3DDevice/GameClient/W3DProfilerFrameCaptureLegacy.cpp',
+    'Core/LegacyRenderer/Generals/WW3D2/DDSFileLegacy.cpp',
+    'Core/LegacyRenderer/Generals/WW3D2/DDSFileLegacy.h',
+    'Core/LegacyRenderer/Generals/WW3D2/RenderGameClientLegacy.cpp',
+    'Core/LegacyRenderer/GeneralsMD/WW3D2/DDSFileLegacy.cpp',
+    'Core/LegacyRenderer/GeneralsMD/WW3D2/DDSFileLegacy.h',
+    'Core/LegacyRenderer/GeneralsMD/WW3D2/RenderGameClientLegacy.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/d3d11legacybridge.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/d3d11legacybridge.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8caps.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8caps.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8fvf.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8fvf.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8indexbuffer.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8indexbuffer.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8polygonrenderer.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8polygonrenderer.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8renderer.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8renderer.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8rendererdebugger.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8rendererdebugger.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8texman.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8texman.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8vertexbuffer.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8vertexbuffer.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8webbrowser.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8webbrowser.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8wrapper.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8wrapper.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/formconv.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/formconv_legacy.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/legacytexturecompat.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/legacytexturecompat.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/line3d_legacy.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/missingtexture_legacy.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/sortingrenderer_legacy.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/surfaceblit.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/surfaceblit_legacy.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/surfaceclass.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/surfaceclass_legacy.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/texture.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/texture_legacy.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/textureloader.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/textureloader_legacy.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/texturemipgenerator.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/texturemipgenerator_legacy.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/ww3dformat_legacy.cpp'
 )
 
 # Product code is deliberately narrower than the repository source set.  In
@@ -156,6 +221,41 @@ $strictD3D8Rules = @(
         Pattern = '(?i)(?:\bDX8Wrapper::(?:_Get_D3D_Device8|Get_D3D_Device8)\s*\(\s*\)\s*->\s*[A-Za-z_][A-Za-z0-9_]*\s*\(|\bDX8CALL(?:_HRES)?\s*\(|\b(?:D3DDevice|m_pDev|pDev|d3dDevice|d3d_device)\s*->\s*(?:Set|Get|Create|Delete|Draw|Present|Clear|Reset|Lock|Unlock|Test|Process|Resource|Stretch|Begin|End|Light|Color|Validate)[A-Za-z0-9_]*\s*\()'
     }
 )
+
+# These two files are physically relocated x86 implementations. Their
+# historical ABI requires the browser's 32-bit handle conversion and the VC6
+# inline color/FPU helpers; keep the exception exact and scoped to the named
+# portability rules. StrictFinal still scans product-runtime paths normally.
+$relocatedLegacyAuditAllowances = @(
+    [pscustomobject]@{
+        Path = 'Core/LegacyRenderer/WWVegas/WW3D2/dx8webbrowser.cpp'
+        Rule = 'pointer-to-32-bit-cast'
+    },
+    [pscustomobject]@{
+        Path = 'Core/LegacyRenderer/WWVegas/WW3D2/dx8wrapper.h'
+        Rule = 'x86-inline-assembly-or-context'
+    }
+)
+
+$relocatedLegacyAuditAllowanceIndex =
+    New-Object 'System.Collections.Generic.HashSet[string]' (
+        [StringComparer]::OrdinalIgnoreCase)
+foreach ($allowance in $relocatedLegacyAuditAllowances) {
+    [void]$relocatedLegacyAuditAllowanceIndex.Add(
+        $allowance.Path + [char]0 + $allowance.Rule)
+}
+
+function Test-RelocatedLegacyAuditAllowance {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RelativePath,
+        [Parameter(Mandatory = $true)]
+        [string]$RuleName
+    )
+
+    return $relocatedLegacyAuditAllowanceIndex.Contains(
+        $RelativePath + [char]0 + $RuleName)
+}
 
 function Test-BaselineAncestry {
     param(
@@ -431,11 +531,12 @@ $rules = @(
         # Require at least one type-name character between D3D and the legacy
         # generation suffix. This intentionally matches D3DLIGHT8 and
         # IDirect3DTexture8, but not neutral helper names containing the plain
-        # label "D3D8" (for example Checked_D3D8_Primitive_Index_Count).
+        # label "D3D8" (for example a backend-specific primitive-count helper).
         Pattern = '(IDirect3D[A-Za-z0-9_]*8|D3D[A-Z0-9_]+8)'
         RejectAddedLine = $false
     }
 )
+$addedLineRules = @($rules | Where-Object { $_.RejectAddedLine })
 
 $stackDumpAddressContracts = @(
     [pscustomobject]@{
@@ -518,10 +619,14 @@ foreach ($relativePath in $untrackedFiles) {
         continue
     }
     $content = [IO.File]::ReadAllText($path)
-    foreach ($rule in $rules | Where-Object { $_.RejectAddedLine }) {
-        if ($content -match $rule.Pattern) {
-            $violations += "${relativePath}: $($rule.Name)"
+    foreach ($rule in $addedLineRules) {
+        if ($content -notmatch $rule.Pattern) {
+            continue
         }
+        if (Test-RelocatedLegacyAuditAllowance $relativePath $rule.Name) {
+            continue
+        }
+        $violations += "${relativePath}: $($rule.Name)"
     }
 }
 
@@ -545,7 +650,11 @@ foreach ($line in $diff) {
     }
     if ($line.StartsWith('+') -and -not $line.StartsWith('+++')) {
         $content = $line.Substring(1)
-        foreach ($rule in $rules) {
+        foreach ($rule in $addedLineRules) {
+            $matchesRule = $content -match $rule.Pattern
+            if (-not $matchesRule) {
+                continue
+            }
             $allowedPath = $rule.PSObject.Properties['AllowedPath']
             $isAllowed = $null -ne $allowedPath -and
                 $currentFile -match $allowedPath.Value
@@ -591,12 +700,15 @@ foreach ($line in $diff) {
                 $rule.Name -eq 'pointer-bearing-window-message' -and
                 $currentFile -eq 'Core/GameEngine/Include/GameClient/GameWindow.h' -and
                 $content -match '^\s*inline\s+WindowMsgData\s+WindowMsgDataFromPointer\(const\s+void\s*\*\s*value\)\s*$'
+            $isApprovedRelocatedLegacy =
+                Test-RelocatedLegacyAuditAllowance $currentFile $rule.Name
             if ($rule.RejectAddedLine -and -not $isAllowed -and
                 -not $isApprovedX86Context -and
                 -not $isApprovedVC6CallerAddress -and
                 -not $isApprovedX87ControlWord -and
                 -not $isApprovedWindowMessageBoundary -and
-                $content -match $rule.Pattern) {
+                -not $isApprovedRelocatedLegacy -and
+                $matchesRule) {
                 $violations += "${currentFile}:${lineNumber}: $($rule.Name)"
             }
         }

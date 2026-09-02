@@ -10,6 +10,7 @@
 
 #include "Lib/DeterministicCrcJobSystemAdapter.h"
 #include "Lib/DeterministicCrcSnapshot.h"
+#include "../TestSupport/LocalCapacityTestLane.h"
 
 #include <stdio.h>
 
@@ -54,7 +55,7 @@ uint32_t ReferenceLegacyChecksum(const uint32_t *values, size_t valueCount)
 }
 
 #if !defined(_MSC_VER) || _MSC_VER >= 1300
-int TestFixedWorkerCountsPreserveOracle()
+int TestFixedWorkerCountsPreserveOracle(bool localCapacity)
 {
 	const unsigned workerCounts[] = { 1U, 2U, 4U, 8U, 16U };
 	uint8_t snapshotStorage[PARTITION_COUNT][SNAPSHOT_CAPACITY];
@@ -94,8 +95,14 @@ int TestFixedWorkerCountsPreserveOracle()
 	for (size_t run = 0U;
 		run < sizeof(workerCounts) / sizeof(workerCounts[0]); ++run)
 	{
+		const unsigned requestedWorkerCount = workerCounts[run];
+		const unsigned workerCount = rts_test::ResolveActualWorkerCount(
+			requestedWorkerCount, localCapacity);
+		rts_test::PrintWorkerCountSubstitution(
+			"Deterministic CRC JobSystem adapter", requestedWorkerCount,
+			workerCount, localCapacity);
 		rts::JobSystemConfig config;
-		config.workerCount = workerCounts[run];
+		config.workerCount = workerCount;
 		config.queueCapacity = PARTITION_COUNT;
 		config.scratchBytesPerWorker = 4096U;
 		config.pinWorkers = false;
@@ -118,7 +125,7 @@ int TestFixedWorkerCountsPreserveOracle()
 			"1/2/4/8/16 physical workers preserve the serial CRC oracle");
 		for (size_t index = 0U; index < PARTITION_COUNT; ++index)
 		{
-			result |= Check(results[index].physicalWorkerId < workerCounts[run],
+			result |= Check(results[index].physicalWorkerId < workerCount,
 				"every accepted partition records a real scheduler worker index");
 		}
 		result |= Check(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME),
@@ -131,15 +138,23 @@ int TestFixedWorkerCountsPreserveOracle()
 
 } // namespace
 
-int main()
+int main(int argc, char **argv)
 {
+	bool localCapacity = false;
+	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity))
+	{
+		fprintf(stderr,
+			"Usage: core_crc_job_adapter_tests [--local-capacity]\n");
+		return 2;
+	}
+	rts_test::PrintTestCapacityLane(localCapacity);
 	int result = 0;
 #if defined(_MSC_VER) && _MSC_VER < 1300
 	// The production adapter is deliberately gated off from the synchronous
 	// reference runtime; JobSystemTest covers its invalid identity directly.
 	printf("Deterministic CRC JobSystem adapter unavailable on VC6 as expected.\n");
 #else
-	result |= TestFixedWorkerCountsPreserveOracle();
+	result |= TestFixedWorkerCountsPreserveOracle(localCapacity);
 	if (result == 0)
 		printf("Deterministic CRC JobSystem adapter tests passed.\n");
 #endif

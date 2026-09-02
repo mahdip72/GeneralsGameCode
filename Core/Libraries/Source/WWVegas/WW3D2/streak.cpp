@@ -34,6 +34,7 @@
  * Functions:                                                                                  *
  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
+#include "Utility/CppMacros.h"
 #include "streak.h"
 #include "ww3d.h"
 #include "rinfo.h"
@@ -43,7 +44,6 @@
 #include "coltest.h"
 #include "w3d_file.h"
 #include "texture.h"
-#include "dx8wrapper.h"
 #include "WWMath/vp.h"
 #include "WWMath/Vector3i.h"
 #include "sortingrenderer.h"

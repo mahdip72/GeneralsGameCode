@@ -74,7 +74,7 @@
 #include "camera.h"
 #include "ww3d.h"
 #include "WWMath/matrix4.h"
-#include "dx8wrapper.h"
+#include "Renderer/RenderGameClient.h"
 
 
 /***********************************************************************************************
@@ -738,19 +738,17 @@ void CameraClass::Apply()
 	bool windowed;
 	WW3D::Get_Render_Target_Resolution(width,height,bits,windowed);
 
-	D3DVIEWPORT8 vp;
-	vp.X = (DWORD)(Viewport.Min.X * (float)width);
-	vp.Y = (DWORD)(Viewport.Min.Y * (float)height);
-	vp.Width = (DWORD)((Viewport.Max.X - Viewport.Min.X) * (float)width);
-	vp.Height = (DWORD)((Viewport.Max.Y - Viewport.Min.Y) * (float)height);
-	vp.MinZ = ZBufferMin;
-	vp.MaxZ = ZBufferMax;
-	DX8Wrapper::Set_Viewport(&vp);
+	rts::render::SetGameViewport(
+		static_cast<unsigned int>(Viewport.Min.X * (float)width),
+		static_cast<unsigned int>(Viewport.Min.Y * (float)height),
+		static_cast<unsigned int>((Viewport.Max.X - Viewport.Min.X) * (float)width),
+		static_cast<unsigned int>((Viewport.Max.Y - Viewport.Min.Y) * (float)height),
+		ZBufferMin,ZBufferMax);
 
 	Matrix4x4 d3dprojection;
 	Get_D3D_Projection_Matrix(&d3dprojection);
-	DX8Wrapper::Set_Projection_Transform_With_Z_Bias(d3dprojection,ZNear,ZFar);
-	DX8Wrapper::Set_Transform(D3DTS_VIEW,CameraInvTransform);
+	rts::render::SetGameProjectionTransformWithZBias(d3dprojection,ZNear,ZFar);
+	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW,CameraInvTransform);
 }
 
 void CameraClass::Set_Clip_Planes(float znear,float zfar)

@@ -8,6 +8,7 @@ endif()
 
 # Build less useful tool/test binaries.
 if(RTS_BUILD_CORE_EXTRAS)
+    add_subdirectory(TestSupport)
     if(WIN32 AND NOT IS_VS6_BUILD)
         add_subdirectory(LauncherProcessContractTest)
     endif()
@@ -21,6 +22,9 @@ if(RTS_BUILD_CORE_EXTRAS)
 		add_subdirectory(NativeW3DSampledTextureTest)
         add_subdirectory(NativeW3DTextureOwnerTest)
         add_subdirectory(NativeW3D2Test)
+        add_subdirectory(NativeGameRenderClientLifecycleTest)
+        add_subdirectory(NativeSortingRendererTest)
+        add_subdirectory(NativeW3DLineTest)
         add_subdirectory(NativeProductDeviceLifecycleTest)
         add_subdirectory(X64PortabilityTest)
         add_subdirectory(FrameTimingDiagnosticsTest)
@@ -181,6 +185,12 @@ if(RTS_BUILD_CORE_EXTRAS)
                     -SourceRoot "${CMAKE_SOURCE_DIR}"
             )
             set_tests_properties(core_ffmpeg_movie_playback_audit PROPERTIES TIMEOUT 30)
+            add_test(NAME core_ffmpeg_movie_playback_audit_self_test
+                COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                    -File "${CMAKE_CURRENT_SOURCE_DIR}/FFmpegMoviePlaybackAudit/FFmpegMoviePlaybackAudit.ps1"
+                    -SelfTest
+            )
+            set_tests_properties(core_ffmpeg_movie_playback_audit_self_test PROPERTIES TIMEOUT 30)
         endif()
     endif()
     add_subdirectory(JobSystemTest)
@@ -368,19 +378,25 @@ if(RTS_BUILD_CORE_EXTRAS)
         add_subdirectory(MilesAudioCompletionTest)
     endif()
     add_subdirectory(ScreenshotCodecTest)
-    add_subdirectory(TextureMipBufferTest)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+        add_subdirectory(TextureMipBufferTest)
+    endif()
     add_subdirectory(TextureMipGeneratorTest)
     add_subdirectory(SurfaceBlitTest)
     add_subdirectory(CameraAudioPolicyTest)
     add_subdirectory(MovieFinalFrameTest)
     add_subdirectory(RendererContractTest)
+    add_subdirectory(RenderGameClientCommandSinkTest)
+    add_subdirectory(LegacyColorPackingTest)
     add_subdirectory(MouseCursorModeTest)
     add_subdirectory(RenderSubmissionPolicyTest)
     add_subdirectory(ShroudDestinationUpdateTest)
     add_subdirectory(VisualParityAnalyzer)
     add_subdirectory(FVFStrideTest)
     add_subdirectory(LegacyPixelShaderBytecodeTest)
-    add_subdirectory(LegacyD3DMathTest)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+        add_subdirectory(LegacyD3DMathTest)
+    endif()
     add_subdirectory(LegacyTextureOperationTest)
     add_subdirectory(LegacyTextureCreationTest)
     if(CMAKE_SIZEOF_VOID_P EQUAL 4)
@@ -402,6 +418,12 @@ if(RTS_BUILD_CORE_EXTRAS)
 endif()
 
 if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    add_test(NAME core_native_game_render_client_lifecycle_audit
+        COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeGameRenderClientLifecycleAudit/NativeGameRenderClientLifecycleAudit.ps1"
+            -SourceRoot "${CMAKE_SOURCE_DIR}"
+    )
+    set_tests_properties(core_native_game_render_client_lifecycle_audit PROPERTIES TIMEOUT 30)
     add_test(NAME core_native_renderer_graph_audit_self_test
         COMMAND powershell -NoProfile -ExecutionPolicy Bypass
             -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeRendererGraphAudit/NativeRendererGraphAudit.ps1"

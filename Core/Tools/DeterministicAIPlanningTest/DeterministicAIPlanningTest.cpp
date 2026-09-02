@@ -2,6 +2,7 @@
 #include "Lib/DeterministicAIPlanning.h"
 #include "Lib/JobFloatingPointState.h"
 #include "Lib/JobSystem.h"
+#include "../TestSupport/LocalCapacityTestLane.h"
 
 #if defined(NDEBUG)
 #undef NDEBUG
@@ -571,11 +572,15 @@ void TestCanonicalValidationInvocationCount()
 	assert(rts::GetAIPlanningRuntimeMetrics().canonicalValidationInvocations == 2U);
 }
 
-void TestPhysicalIdentityAndPeakByBatchShape()
+void TestPhysicalIdentityAndPeakByBatchShape(bool localCapacity)
 {
 	rts::JobSystem &jobs = rts::JobSystem::instance();
 	rts::JobSystemConfig config;
-	config.workerCount = 16U;
+	config.workerCount = rts_test::ResolveActualWorkerCount(16U,
+		localCapacity);
+	rts_test::PrintWorkerCountSubstitution(
+		"Deterministic AI planning", 16U, config.workerCount,
+		localCapacity);
 	config.queueCapacity = 64U;
 	config.scratchBytesPerWorker = 64U * 1024U;
 	config.pinWorkers = false;
@@ -871,8 +876,16 @@ void TestRealJobSystemRunner()
 }
 }
 
-int main()
+int main(int argc, char **argv)
 {
+	bool localCapacity = false;
+	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity))
+	{
+		std::cerr << "Usage: core_deterministic_ai_planning_tests "
+			"[--local-capacity]\n";
+		return 2;
+	}
+	rts_test::PrintTestCapacityLane(localCapacity);
 	TestCounterRngGoldenVector();
 	TestEnemyScoringAndHysteresis();
 	TestProductionScoringTieAndRetry();
@@ -885,7 +898,7 @@ int main()
 	TestCanonicalValidationInvocationCount();
 	TestModeSpecificOwnerCommitAuthorityMetrics();
 	TestRealJobSystemRunner();
-	TestPhysicalIdentityAndPeakByBatchShape();
+	TestPhysicalIdentityAndPeakByBatchShape(localCapacity);
 	std::cout << "Deterministic AI planning tests passed.\n";
 	return 0;
 }

@@ -41,7 +41,6 @@
 #include "WWLib/always.h"
 #include "ww3dformat.h"
 
-struct IDirect3DSurface8;
 class Vector2i;
 class Vector3;
 class TextureBaseClass;
@@ -56,7 +55,8 @@ namespace rts { namespace render {
 /*************************************************************************
 **                             SurfaceClass
 **
-** This is our surface class, which wraps IDirect3DSurface8.
+** This is our surface class, which owns a CPU image and an optional native
+** surface view.
 **
 ** Hector Yee 2/12/01 - added in fills, blits etc for font3d class
 **
@@ -79,8 +79,10 @@ class SurfaceClass : public RefCountClass
 		// Create surface from a file.
 		SurfaceClass(const char *filename);
 
-		// Create the surface from a D3D pointer
-		SurfaceClass(IDirect3DSurface8 *d3d_surface);
+		// Create the surface from an opaque renderer handle.  The native product
+		// never interprets this value; the external legacy adapter owns typed
+		// renderer interop.
+		SurfaceClass(void *surface_handle);
 
 		virtual ~SurfaceClass() override;
 
@@ -95,7 +97,7 @@ class SurfaceClass : public RefCountClass
 		LockedSurfacePtr Lock(int *pitch, const Vector2i &min, const Vector2i &max);
 		void Unlock();
 		// Complete a read-only lock without republishing an unchanged native
-		// subresource. Legacy D3D8 still performs its required UnlockRect call.
+		// subresource. The external legacy adapter performs its required unlock.
 		void Unlock_Read_Only();
 #if defined(_WIN64)
 		// Native callers need the publication result so a device/ownership or
@@ -155,11 +157,12 @@ class SurfaceClass : public RefCountClass
 		// makes a copy of the surface into a byte array
 		unsigned char *CreateCopy(int *width,int *height,int*size,bool flip=false);
 
-		// For use by TextureClass:
-		IDirect3DSurface8 *Peek_D3D_Surface() { return D3DSurface; }
+		// For use by renderer adapters.  The native product exposes no typed
+		// graphics object through this compatibility accessor.
+		void *Peek_Surface_Handle() { return SurfaceHandle; }
 
 		// Attaching and detaching a surface pointer
-		void	Attach (IDirect3DSurface8 *surface);
+		void	Attach (void *surface_handle);
 		void	Detach ();
 
 		// draws a horizontal line
@@ -191,8 +194,8 @@ class SurfaceClass : public RefCountClass
 			unsigned int array_slice);
 #endif
 
-		// Direct3D surface object
-		IDirect3DSurface8 *D3DSurface;
+		// Opaque compatibility handle. Native paths leave it null.
+		void *SurfaceHandle;
 #if defined(_WIN64)
 		NativeSurfaceStorage *NativeSurface;
 #endif

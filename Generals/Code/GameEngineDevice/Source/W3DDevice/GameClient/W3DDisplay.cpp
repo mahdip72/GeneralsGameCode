@@ -87,15 +87,14 @@ static void drawFramerateBar();
 #include "WWMath/wwmath.h"
 #include "WWLib/registry.h"
 #include "WW3D2/ww3d.h"
-#include "WW3D2/dx8wrapper.h"
 #include "WW3D2/predlod.h"
 #include "WW3D2/part_emt.h"
 #include "WW3D2/part_ldr.h"
-#include "WW3D2/dx8caps.h"
 #include "WW3D2/ww3dformat.h"
 #include "WW3D2/agg_def.h"
 #include "WW3D2/render2dsentence.h"
 #include "WW3D2/sortingrenderer.h"
+#include "WW3D2/statistics.h"
 #include "WW3D2/textureloader.h"
 #if !defined(_MSC_VER) || _MSC_VER >= 1300
 #define RTS_ASYNC_MODEL_PRELOAD 1
@@ -104,13 +103,14 @@ static void drawFramerateBar();
 #include "WWLib/RAMFILE.h"
 #include <memory>
 #endif
-#include "WW3D2/dx8webbrowser.h"
+#include "Renderer/GameWebBrowser.h"
 #include "WW3D2/mesh.h"
 #include "WW3D2/hlod.h"
 #include "WW3D2/meshmatdesc.h"
 #include "WW3D2/meshmdl.h"
 #include "WW3D2/rddesc.h"
 #include "WWLib/TARGA.h"
+#include "Renderer/RenderGameClient.h"
 #include "Renderer/RenderSubmissionPolicy.h"
 
 #include "GameLogic/ScriptEngine.h"		// For TheScriptEngine - jkmcd
@@ -155,6 +155,14 @@ static W3DDynamicLight * theDynamicLight = nullptr;
 static Real theLightXOffset = 0.1f;
 static Real theLightYOffset = 0.07f;
 static Int theFlashCount = 0;
+#endif
+
+#if defined(EXTENDED_STATS)
+// All extended-stat consumers share the neutral render-owner state.  The
+// alias preserves the existing display code's field-level updates while
+// ensuring W3DScene, water, and the native owner observe the same toggles.
+static rts::render::GameDebugRenderStats &s_w3dDisplayDebugStats =
+	rts::render::GetMutableGameDebugRenderStats();
 #endif
 
 //*****************************************************************************************
@@ -493,7 +501,7 @@ W3DDisplay::~W3DDisplay()
 #endif
 	WWMath::Shutdown();
 	if (!TheGlobalData->m_headless)
-		DX8WebBrowser::Shutdown();
+		rts::render::GameWebBrowser::Shutdown();
 	delete TheW3DFileSystem;
 	TheW3DFileSystem = nullptr;
 
@@ -567,7 +575,7 @@ void W3DDisplay::setGamma(Real gamma, Real bright, Real contrast, Bool calibrate
 	if (m_windowed)
 		return;	//we don't allow gamma to change in window because it would affect desktop.
 
-	DX8Wrapper::Set_Gamma(gamma,bright,contrast,calibrate, false);
+	WW3D::Set_Gamma(gamma, bright, contrast, calibrate);
 }
 
 /** Set resolution of display */
@@ -1003,7 +1011,7 @@ void W3DDisplay::init()
 			m_nativeDebugDisplay->setFontWidth( 9 );
 		}
 
-		DX8WebBrowser::Initialize();
+		rts::render::GameWebBrowser::Initialize();
 	}
 
 	// Headless replay never renders terrain.  Do not instantiate renderer or
@@ -1252,76 +1260,76 @@ void W3DDisplay::gatherDebugStats()
 		} else if (statMode == gameOverhead) {
 			gameOverheadMS = ms;
 			statMode = console;
-			DX8Wrapper::stats.m_disableTerrain = true;
-			DX8Wrapper::stats.m_disableOverhead = true;
-			DX8Wrapper::stats.m_disableWater = true;
-			DX8Wrapper::stats.m_disableObjects = true;
-			DX8Wrapper::stats.m_disableConsole = false;
-			DX8Wrapper::stats.m_debugLinesToShow = 1;
+			s_w3dDisplayDebugStats.disableTerrain = true;
+			s_w3dDisplayDebugStats.disableOverhead = true;
+			s_w3dDisplayDebugStats.disableWater = true;
+			s_w3dDisplayDebugStats.disableObjects = true;
+			s_w3dDisplayDebugStats.disableConsole = false;
+			s_w3dDisplayDebugStats.debugLinesToShow = 1;
 		} else if (statMode == console) {
 			consoleMS = ms;
 			statMode = threeDOverhead;
-			DX8Wrapper::stats.m_disableTerrain = true;
-			DX8Wrapper::stats.m_disableOverhead = true;
-			DX8Wrapper::stats.m_disableWater = true;
-			DX8Wrapper::stats.m_disableObjects = true;
-			DX8Wrapper::stats.m_disableConsole = true;
-			DX8Wrapper::stats.m_debugLinesToShow = 1;
+			s_w3dDisplayDebugStats.disableTerrain = true;
+			s_w3dDisplayDebugStats.disableOverhead = true;
+			s_w3dDisplayDebugStats.disableWater = true;
+			s_w3dDisplayDebugStats.disableObjects = true;
+			s_w3dDisplayDebugStats.disableConsole = true;
+			s_w3dDisplayDebugStats.debugLinesToShow = 1;
 		} else if (statMode == threeDOverhead) {
 			threeDOverheadMS = ms;
 			statMode = terrain;
-			DX8Wrapper::stats.m_disableTerrain = false;
-			DX8Wrapper::stats.m_disableOverhead = true;
-			DX8Wrapper::stats.m_disableWater = true;
-			DX8Wrapper::stats.m_disableObjects = true;
-			DX8Wrapper::stats.m_disableConsole = true;
-			DX8Wrapper::stats.m_debugLinesToShow = 1;
+			s_w3dDisplayDebugStats.disableTerrain = false;
+			s_w3dDisplayDebugStats.disableOverhead = true;
+			s_w3dDisplayDebugStats.disableWater = true;
+			s_w3dDisplayDebugStats.disableObjects = true;
+			s_w3dDisplayDebugStats.disableConsole = true;
+			s_w3dDisplayDebugStats.debugLinesToShow = 1;
 		} else if (statMode == terrain) {
 			terrainMS = ms;
 			statMode = objects;
-			DX8Wrapper::stats.m_disableOverhead = true;
-			DX8Wrapper::stats.m_disableTerrain = true;
-			DX8Wrapper::stats.m_disableWater = true;
-			DX8Wrapper::stats.m_disableObjects = false;
-			DX8Wrapper::stats.m_disableConsole = true;
-			DX8Wrapper::stats.m_debugLinesToShow = 1;
+			s_w3dDisplayDebugStats.disableOverhead = true;
+			s_w3dDisplayDebugStats.disableTerrain = true;
+			s_w3dDisplayDebugStats.disableWater = true;
+			s_w3dDisplayDebugStats.disableObjects = false;
+			s_w3dDisplayDebugStats.disableConsole = true;
+			s_w3dDisplayDebugStats.debugLinesToShow = 1;
 		} else if (statMode == objects) {
 			objectMS = ms;
 			statMode = overlap;
-			DX8Wrapper::stats.m_disableOverhead = false;
-			DX8Wrapper::stats.m_disableTerrain = false;
-			DX8Wrapper::stats.m_disableWater = false;
-			DX8Wrapper::stats.m_disableObjects = false;
-			DX8Wrapper::stats.m_disableConsole = true;
-			DX8Wrapper::stats.m_sleepTime = (int)(terrainMS);
-			DX8Wrapper::stats.m_debugLinesToShow = 1;
+			s_w3dDisplayDebugStats.disableOverhead = false;
+			s_w3dDisplayDebugStats.disableTerrain = false;
+			s_w3dDisplayDebugStats.disableWater = false;
+			s_w3dDisplayDebugStats.disableObjects = false;
+			s_w3dDisplayDebugStats.disableConsole = true;
+			s_w3dDisplayDebugStats.sleepTime = (int)(terrainMS);
+			s_w3dDisplayDebugStats.debugLinesToShow = 1;
 		} else if (statMode == overlap) {
 			overlapMS = ms;
 			statMode = normal;
-			DX8Wrapper::stats.m_disableOverhead = false;
-			DX8Wrapper::stats.m_disableTerrain = false;
-			DX8Wrapper::stats.m_disableWater = false;
-			DX8Wrapper::stats.m_disableObjects = false;
-			DX8Wrapper::stats.m_disableConsole = true;
-			DX8Wrapper::stats.m_sleepTime = 0;
-			DX8Wrapper::stats.m_debugLinesToShow = 1;
+			s_w3dDisplayDebugStats.disableOverhead = false;
+			s_w3dDisplayDebugStats.disableTerrain = false;
+			s_w3dDisplayDebugStats.disableWater = false;
+			s_w3dDisplayDebugStats.disableObjects = false;
+			s_w3dDisplayDebugStats.disableConsole = true;
+			s_w3dDisplayDebugStats.sleepTime = 0;
+			s_w3dDisplayDebugStats.debugLinesToShow = 1;
 		} else if (statMode == normal) {
 			overlapMS = (ms + ((int)terrainMS) - overlapMS );
 			statMode = disabled;
 			extendedStats = SHOW_STATS_TIME;
 
 			// Done collecting stats. Re-enable stuff
-			DX8Wrapper::stats.m_disableConsole = false;
-			DX8Wrapper::stats.m_debugLinesToShow = -1;
-		} else if (!DX8Wrapper::stats.m_showingStats) {
+			s_w3dDisplayDebugStats.disableConsole = false;
+			s_w3dDisplayDebugStats.debugLinesToShow = -1;
+		} else if (!s_w3dDisplayDebugStats.showingStats) {
 			// start collecting extended info.
-			DX8Wrapper::stats.m_showingStats = true;
-			DX8Wrapper::stats.m_disableOverhead = false;
-			DX8Wrapper::stats.m_disableTerrain = true;
-			DX8Wrapper::stats.m_disableWater = true;
-			DX8Wrapper::stats.m_disableObjects = true;
-			DX8Wrapper::stats.m_disableConsole = true;
-			DX8Wrapper::stats.m_debugLinesToShow = 1;
+			s_w3dDisplayDebugStats.showingStats = true;
+			s_w3dDisplayDebugStats.disableOverhead = false;
+			s_w3dDisplayDebugStats.disableTerrain = true;
+			s_w3dDisplayDebugStats.disableWater = true;
+			s_w3dDisplayDebugStats.disableObjects = true;
+			s_w3dDisplayDebugStats.disableConsole = true;
+			s_w3dDisplayDebugStats.debugLinesToShow = 1;
 			statMode = sync;
 			gameOverheadMS = 0.0f;
 			threeDOverheadMS = 0.0f;
@@ -1664,9 +1672,9 @@ void W3DDisplay::drawDebugStats()
 
 	int linesOfStrings = DisplayStringCount;
 #ifdef EXTENDED_STATS
-	if (DX8Wrapper::stats.m_debugLinesToShow > -1)
+	if (s_w3dDisplayDebugStats.debugLinesToShow > -1)
 	{
-		linesOfStrings = DX8Wrapper::stats.m_debugLinesToShow;
+		linesOfStrings = s_w3dDisplayDebugStats.debugLinesToShow;
 	}
 
 #endif
@@ -1731,11 +1739,11 @@ void W3DDisplay::drawCurrentDebugDisplay()
 //=============================================================================
 void W3DDisplay::calculateTerrainLOD()
 {
-	// D3D11 targets hardware where the maximum terrain LOD is the stable
-	// baseline.  The legacy calibration presents terrain-only frames before the
-	// D3D11 display-iteration boundary, hiding the shell map and UI while shader
-	// and resource caches are cold.  Keep the D3D8 calibration unchanged.
-	if (DX8Wrapper::Is_D3D11_Backend_Active())
+	// The native renderer targets hardware where the maximum terrain LOD is the
+	// stable baseline.  The compatibility calibration presents terrain-only
+	// frames before the display-iteration boundary, hiding the shell map and UI
+	// while shader and resource caches are cold.
+	if (rts::render::IsNativeGameRendererActive())
 	{
 		TheWritableGlobalData->m_terrainLOD = TERRAIN_LOD_MAX;
 		m_3DScene->drawTerrainOnly(false);
@@ -1911,7 +1919,7 @@ AGAIN:
 #ifdef EXTENDED_STATS
 	else
 	{
-		DX8Wrapper::stats.m_showingStats = false;
+		s_w3dDisplayDebugStats.showingStats = false;
 	}
 #endif
 
@@ -1992,17 +2000,14 @@ AGAIN:
 	}
 
 	do {
-		// Retire last iteration's transient GPU-copy leases even if rendering was
-		// disabled or the visible frame could not begin.  Hidden RTT passes below
-		// acquire fresh leases which remain valid through this iteration's draw.
-		DX8Wrapper::Begin_D3D11_Display_Iteration();
+		// The native render owner retires transient GPU-copy leases at its frame
+		// boundary.  The display only submits semantic render work here.
 
 		// update all views of the world - recomputes data which will affect drawing
-		// The D3D8 device is intentionally absent when the D3D11 compatibility
-		// backend owns presentation.  Use the wrapper lifecycle state here so
-		// view preparation is not accidentally skipped (or tied to a raw D3D8
-		// cooperative-level query) on the modern path.
-		if (DX8Wrapper::Is_Initted() && !DX8Wrapper::Is_Device_Lost())
+		// View preparation must remain available while the native render target is
+		// operational, including frames where the compatibility device is absent.
+		if (rts::render::IsGameRendererInitialized() &&
+			rts::render::IsGameRenderTargetOperational())
 		{	//Checking if we have the device before updating views because the heightmap crashes otherwise while
 			//trying to refresh the visible terrain geometry.
 //			if(TheGlobalData->m_loadScreenRender != TRUE)
@@ -2041,14 +2046,15 @@ AGAIN:
 					if( TheMouse )
 						TheMouse->draw();	//keep applying the current cursor style so it remains hidden if needed.
 					const bool captureArmed = rendererCaptureFrameGate.arm(
-						DX8Wrapper::Is_D3D11_Backend_Active());
+						rts::render::IsNativeGameRendererActive());
 					const unsigned long captureFrameCount = captureArmed ?
-						DX8Wrapper::Get_FrameCount() : 0;
+						static_cast<unsigned long>(WW3D::Get_Frame_Count()) : 0;
 					if (captureArmed)
-						DX8Wrapper::Request_D3D11_Back_Buffer_Capture();
+						rts::render::RequestGameBackBufferCapture();
 					WW3D::End_Render();
 					if (captureArmed && rendererCaptureFrameGate.complete(
-						DX8Wrapper::Get_FrameCount() != captureFrameCount))
+						static_cast<unsigned long>(WW3D::Get_Frame_Count()) !=
+						captureFrameCount))
 					{
 						TheWritableGlobalData->m_rendererCaptureFrame = FALSE;
 					}
@@ -2143,14 +2149,15 @@ AGAIN:
 #endif
 				// render is all done!
 				const bool captureArmed = rendererCaptureFrameGate.arm(
-					DX8Wrapper::Is_D3D11_Backend_Active());
+					rts::render::IsNativeGameRendererActive());
 				const unsigned long captureFrameCount = captureArmed ?
-					DX8Wrapper::Get_FrameCount() : 0;
+					static_cast<unsigned long>(WW3D::Get_Frame_Count()) : 0;
 				if (captureArmed)
-					DX8Wrapper::Request_D3D11_Back_Buffer_Capture();
+					rts::render::RequestGameBackBufferCapture();
 				WW3D::End_Render();
 				if (captureArmed && rendererCaptureFrameGate.complete(
-					DX8Wrapper::Get_FrameCount() != captureFrameCount))
+					static_cast<unsigned long>(WW3D::Get_Frame_Count()) !=
+					captureFrameCount))
 				{
 					TheWritableGlobalData->m_rendererCaptureFrame = FALSE;
 				}
@@ -2173,7 +2180,7 @@ AGAIN:
 	} while (freezeTime && !TheTacticalView->isCameraMovementFinished());
 
 #ifdef EXTENDED_STATS
-	if (DX8Wrapper::stats.m_disableOverhead) {
+	if (s_w3dDisplayDebugStats.disableOverhead) {
 		goto AGAIN;
 	}
 #endif
@@ -2953,41 +2960,23 @@ VideoBuffer*	W3DDisplay::createVideoBuffer()
 
 	/// @todo query video player for supported formats - we assume bink formats here
 
-	// first try to use the native format
+	// The render owner publishes the actual back-buffer format.  Native video
+	// publication currently accepts the canonical four-byte format only; the
+	// legacy lane may still expose the historical packed formats.
+	WW3DFormat displayFormat = rts::render::GetGameBackBufferFormat();
+	if (displayFormat != WW3D_FORMAT_UNKNOWN)
+		format = W3DVideoBuffer::W3DFormatToType(displayFormat);
 
-	WW3DFormat displayFormat = DX8Wrapper::getBackBufferFormat();
+	if (format == VideoBuffer::TYPE_UNKNOWN &&
+		rts::render::IsNativeGameRendererActive())
+		format = VideoBuffer::TYPE_X8R8G8B8;
 
-	if ( DX8Wrapper::Get_Current_Caps()->Support_Texture_Format( displayFormat ))
-	{
-		format = W3DVideoBuffer::W3DFormatToType( displayFormat );
-	}
-
-	if ( format == VideoBuffer::TYPE_UNKNOWN )
-	{
-		if ( DX8Wrapper::Get_Current_Caps()->Support_Texture_Format( WW3D_FORMAT_X8R8G8B8 ))
-		{
-			format = VideoBuffer::TYPE_X8R8G8B8;
-		}
-		else if ( DX8Wrapper::Get_Current_Caps()->Support_Texture_Format( WW3D_FORMAT_R8G8B8 ))
-		{
-			format = VideoBuffer::TYPE_R8G8B8;
-		}
-		else if ( DX8Wrapper::Get_Current_Caps()->Support_Texture_Format( WW3D_FORMAT_R5G6B5 ))
-		{
-			format = VideoBuffer::TYPE_R5G6B5;
-		}
-		else if ( DX8Wrapper::Get_Current_Caps()->Support_Texture_Format( WW3D_FORMAT_X1R5G5B5 ))
-		{
-			format = VideoBuffer::TYPE_X1R5G5B5;
-		}
-		else
-		{
-			// card does not support any of the formats we need
-			return nullptr;
-		}
-	}
+	if (format == VideoBuffer::TYPE_UNKNOWN)
+		return nullptr;
 	// on low mem machines, render every video in 16bit
-	if (TheGameLODManager && (!TheGameLODManager->didMemPass() || W3DShaderManager::getChipset() == DC_GEFORCE2))
+	if (!rts::render::IsNativeGameRendererActive() && TheGameLODManager &&
+		(!TheGameLODManager->didMemPass() ||
+		 W3DShaderManager::getChipset() == DC_GEFORCE2))
 		format = VideoBuffer::TYPE_R5G6B5;
 
 	W3DVideoBuffer *buffer = NEW W3DVideoBuffer( format );

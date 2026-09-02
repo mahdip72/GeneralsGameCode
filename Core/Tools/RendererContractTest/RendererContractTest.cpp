@@ -2,10 +2,10 @@
 #include "Renderer/RendererDevice.h"
 #include "Renderer/RenderTexturePublication.h"
 #include "W3DDevice/GameClient/W3DVideoBuffer.h"
-#if defined(RTS_RENDERER_HAS_D3D11)
-#include "../../Libraries/Source/WWVegas/WW3D2/d3d11legacybridge.h"
-#include "Renderer/LegacyBridgeValidation.h"
+#if defined(RTS_RENDERER_HAS_D3D11) && !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
+#include "d3d11legacybridge.h"
 #endif
+#include "Renderer/LegacyBridgeValidation.h"
 #include "Renderer/LegacyRenderState.h"
 
 #include <stdio.h>
@@ -15,7 +15,7 @@
 #include <string.h>
 #include <vector>
 
-#if defined(RTS_RENDERER_HAS_D3D11)
+#if defined(RTS_RENDERER_HAS_D3D11) && !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
 #include <type_traits>
 #endif
 #if defined(_WIN32)
@@ -196,7 +196,9 @@ int testRendererTextureLifecycleContracts()
 	int result = 0;
 	std::string surfaceHeader;
 	std::string surfaceSource;
+	std::string legacySurfaceSource;
 	std::string textureSource;
+	std::string legacyTextureSource;
 	std::string waterSource;
 	std::string videoHeader;
 	std::string videoSource;
@@ -210,9 +212,19 @@ int testRendererTextureLifecycleContracts()
 	result |= check(ReadSourceText(
 		"Core/Libraries/Source/WWVegas/WW3D2/surfaceclass.cpp",
 		&surfaceSource), "surface lock implementation source is available");
+#if !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
+	result |= check(ReadSourceText(
+		"Core/LegacyRenderer/WWVegas/WW3D2/surfaceclass_legacy.cpp",
+		&legacySurfaceSource), "legacy surface lock implementation source is available");
+#endif
 	result |= check(ReadSourceText(
 		"Core/Libraries/Source/WWVegas/WW3D2/texture.cpp",
 		&textureSource), "texture construction source is available");
+#if !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
+	result |= check(ReadSourceText(
+		"Core/LegacyRenderer/WWVegas/WW3D2/texture_legacy.cpp",
+		&legacyTextureSource), "legacy texture construction source is available");
+#endif
 	result |= check(ReadSourceText(
 		"Core/GameEngineDevice/Source/W3DDevice/GameClient/Water/W3DWater.cpp",
 		&waterSource), "water upload source is available");
@@ -235,17 +247,51 @@ int testRendererTextureLifecycleContracts()
 		"GeneralsMD/Code/GameEngineDevice/Source/W3DDevice/GameClient/W3DShroud.cpp",
 		&generalsMDShroudSource), "Zero Hour shroud source is available");
 
+	const std::string::size_type bumpMapMethod = waterSource.find(
+		"HRESULT WaterRenderObjClass::initBumpMap");
+	const std::string::size_type bumpMapNativeGuard = waterSource.rfind(
+		"#if defined(_WIN64)", bumpMapMethod);
+	const std::string::size_type bumpMapLegacyBranch = waterSource.find(
+		"#else", bumpMapNativeGuard);
+	const std::string::size_type bumpMapEnd = waterSource.find(
+		"HRESULT WaterRenderObjClass::generateVertexBuffer",
+		bumpMapLegacyBranch);
+	result |= check(bumpMapMethod != std::string::npos &&
+		bumpMapNativeGuard != std::string::npos &&
+		bumpMapLegacyBranch != std::string::npos &&
+		bumpMapLegacyBranch > bumpMapNativeGuard &&
+		bumpMapEnd != std::string::npos && bumpMapEnd > bumpMapLegacyBranch,
+		"water bump upload keeps native and compatibility branches bounded");
+	std::string nativeBumpMapSource;
+	std::string legacyBumpMapSource;
+	if (bumpMapNativeGuard != std::string::npos &&
+		bumpMapLegacyBranch != std::string::npos &&
+		bumpMapLegacyBranch > bumpMapNativeGuard)
+	{
+		nativeBumpMapSource = waterSource.substr(bumpMapNativeGuard,
+			bumpMapLegacyBranch - bumpMapNativeGuard);
+	}
+	if (bumpMapLegacyBranch != std::string::npos &&
+		bumpMapEnd != std::string::npos && bumpMapEnd > bumpMapLegacyBranch)
+	{
+		legacyBumpMapSource = waterSource.substr(bumpMapLegacyBranch,
+			bumpMapEnd - bumpMapLegacyBranch);
+	}
+
+#if defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
 	const std::string::size_type readOnlyDeclaration =
 		surfaceHeader.find("void Unlock_Read_Only();");
 	const std::string::size_type readOnlyMethod = surfaceSource.find(
 		"void SurfaceClass::Unlock_Read_Only()");
 	const std::string::size_type readOnlyMethodEnd = surfaceSource.find(
-		"#if defined(_WIN64)\nbool SurfaceClass::Acquire_Native_Surface",
-		readOnlyMethod);
+		"bool SurfaceClass::Acquire_Native_Surface", readOnlyMethod);
 	result |= check(readOnlyDeclaration != std::string::npos &&
-		readOnlyMethod != std::string::npos && readOnlyMethodEnd > readOnlyMethod,
+		readOnlyMethod != std::string::npos &&
+		readOnlyMethodEnd != std::string::npos &&
+		readOnlyMethodEnd > readOnlyMethod,
 		"surface exposes an explicit read-only lock completion boundary");
 	if (readOnlyMethod != std::string::npos &&
+		readOnlyMethodEnd != std::string::npos &&
 		readOnlyMethodEnd > readOnlyMethod)
 	{
 		const std::string readOnlyBody = surfaceSource.substr(readOnlyMethod,
@@ -259,13 +305,44 @@ int testRendererTextureLifecycleContracts()
 	result |= check(textureSource.find(
 		"TextureClass *TextureClass::Create_Native_From_Prepared") !=
 			std::string::npos &&
-		waterSource.find("TextureClass::Create_Native_From_Prepared") !=
+		nativeBumpMapSource.find("TextureClass::Create_Native_From_Prepared") !=
 			std::string::npos,
 		"water publishes prepared mips through the direct native texture factory");
-	result |= check(waterSource.find("surface->Unlock_Read_Only()") !=
-		std::string::npos && waterSource.find("NEW_REF(TextureClass") ==
+	result |= check(nativeBumpMapSource.find("Unlock_Read_Only()") !=
+		std::string::npos && nativeBumpMapSource.find("NEW_REF(TextureClass") ==
 			std::string::npos,
 		"water source reads do not republish or allocate an empty native texture");
+#else
+	const std::string::size_type legacyReadOnlyMethod =
+		legacySurfaceSource.find("void SurfaceClass::Unlock_Read_Only()");
+	const std::string::size_type legacyReadOnlyMethodEnd =
+		legacySurfaceSource.find("bool SurfaceClass::Acquire_Native_Surface",
+			legacyReadOnlyMethod);
+	result |= check(legacyReadOnlyMethod != std::string::npos &&
+		legacyReadOnlyMethodEnd != std::string::npos &&
+		legacyReadOnlyMethodEnd > legacyReadOnlyMethod,
+		"legacy surface exposes a bounded read-only lock completion boundary");
+	if (legacyReadOnlyMethod != std::string::npos &&
+		legacyReadOnlyMethodEnd != std::string::npos &&
+		legacyReadOnlyMethodEnd > legacyReadOnlyMethod)
+	{
+		const std::string legacyReadOnlyBody = legacySurfaceSource.substr(
+			legacyReadOnlyMethod, legacyReadOnlyMethodEnd - legacyReadOnlyMethod);
+		result |= check(legacyReadOnlyBody.find("Unlock();") !=
+			std::string::npos,
+			"legacy read-only completion closes the compatibility surface lock");
+	}
+
+	result |= check(legacyBumpMapSource.find(
+		"TextureClass::Create_Native_From_Prepared") == std::string::npos &&
+		legacyBumpMapSource.find("destinationSurface->Unlock();") !=
+			std::string::npos,
+		"legacy water publishes destination mips through the compatibility surface path");
+	result |= check(legacyBumpMapSource.find("Unlock_Read_Only()") !=
+		std::string::npos && legacyBumpMapSource.find("NEW_REF(TextureClass") !=
+			std::string::npos,
+		"legacy water reads source mips while owning a compatibility destination texture");
+#endif
 	const std::string::size_type whiteUpdate = waterSource.find(
 		"Bool WaterRenderObjClass::updateWhiteTexture()");
 	const std::string::size_type whiteUpdateEnd = waterSource.find(
@@ -284,11 +361,16 @@ int testRendererTextureLifecycleContracts()
 			"m_whiteTexturePublishPending=publicationSucceeded ? FALSE : TRUE") !=
 			std::string::npos,
 			"native white-texture publication retains a retryable failure state");
+#if defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
+		// The native branch is checked above; the source also retains the
+		// compatibility branch for the shared game-client implementation.
+#else
 		result |= check(whiteUpdateBody.find("surface->Unlock();") !=
 			std::string::npos && whiteUpdateBody.find(
-			"Notify_Render_Texture_Changed(m_whiteTexture)") !=
+			"rts::render::NotifyTextureChanged(m_whiteTexture)") !=
 			std::string::npos,
 			"legacy white-texture publication keeps Unlock and notification behavior");
+#endif
 	}
 	unsigned whiteUpdateCallCount = 0;
 	for (std::string::size_type call = waterSource.find(
@@ -301,9 +383,10 @@ int testRendererTextureLifecycleContracts()
 		"water reset, initialization, and shader paths retry white publication");
 
 	// The Win32/VC6 procedural constructors must report the result of the
-	// actual D3D8 allocation.  Keep this as a source contract because the
-	// device-free renderer test cannot create a real legacy device, while the
-	// VC6 oracle compile proves the guarded implementation remains valid.
+	// actual compatibility allocation.  Keep this as a source contract because
+	// the device-free renderer test cannot create a real legacy device, while
+	// the VC6 oracle compile proves the guarded implementation remains valid.
+#if !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
 	const char *legacyCreationMarkers[] = {
 		"Poke_Texture(DX8Wrapper::_Create_DX8_Texture\n",
 		"Poke_Texture(DX8Wrapper::_Create_DX8_Texture(\n\t\tsurface->",
@@ -316,14 +399,14 @@ int testRendererTextureLifecycleContracts()
 			sizeof(legacyCreationMarkers[0]));
 	for (unsigned i = 0; i != legacyCreationMarkerCount; ++i)
 	{
-		const std::string::size_type creation = textureSource.find(
+		const std::string::size_type creation = legacyTextureSource.find(
 			legacyCreationMarkers[i]);
-		const std::string::size_type branchEnd = textureSource.find(
+		const std::string::size_type branchEnd = legacyTextureSource.find(
 			"#endif", creation);
 		bool derivesInitialization = false;
 		if (creation != std::string::npos && branchEnd > creation)
 		{
-			const std::string legacyBranch = textureSource.substr(
+			const std::string legacyBranch = legacyTextureSource.substr(
 				creation, branchEnd - creation);
 			derivesInitialization = legacyBranch.find(
 				"Initialized = Peek_D3D_Base_Texture() != nullptr;") !=
@@ -332,10 +415,12 @@ int testRendererTextureLifecycleContracts()
 		result |= check(derivesInitialization,
 			"legacy procedural allocation failure leaves initialization false");
 	}
+#endif
 
+#if !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
 	std::string wrapperSource;
 	result |= check(ReadSourceText(
-		"Core/Libraries/Source/WWVegas/WW3D2/dx8wrapper.cpp",
+		"Core/LegacyRenderer/WWVegas/WW3D2/dx8wrapper.cpp",
 		&wrapperSource), "renderer wrapper source is available");
 	const std::string::size_type init = wrapperSource.find(
 		"bool DX8Wrapper::Init(void * hwnd, bool lite)");
@@ -358,6 +443,87 @@ int testRendererTextureLifecycleContracts()
 		result |= check(wrapperSource.find("IsDeviceLost = false;", reset) < resetEnd,
 			"successful legacy reset clears stale lost state");
 	}
+
+	const std::string::size_type setRenderDevice = wrapperSource.find(
+		"bool DX8Wrapper::Set_Render_Device(int dev", resetEnd);
+	const std::string::size_type setRenderDeviceEnd = wrapperSource.find(
+		"bool DX8Wrapper::Set_Device_Resolution(", setRenderDevice);
+	const std::string::size_type setDeviceResolution = setRenderDeviceEnd;
+	const std::string::size_type setDeviceResolutionEnd = wrapperSource.find(
+		"void DX8Wrapper::Get_Device_Resolution(", setDeviceResolution);
+	const std::string::size_type toggleWindowed = wrapperSource.find(
+		"bool DX8Wrapper::Toggle_Windowed()", setRenderDevice);
+	const std::string::size_type toggleWindowedEnd = wrapperSource.find(
+		"void DX8Wrapper::Set_Swap_Interval(", toggleWindowed);
+	const std::string::size_type shutdownEnd = wrapperSource.find(
+		"bool DX8Wrapper::Do_Onetime_Device_Dependent_Inits()", shutdown);
+	result |= check(init != std::string::npos && shutdown > init &&
+		wrapperSource.find("rts::render::GameRenderer_IsWindowed = false;", init) <
+			shutdown && wrapperSource.find(
+			"IsWindowed = rts::render::GameRenderer_IsWindowed;", init) <
+			shutdown,
+		"legacy initialization synchronizes neutral window state and ABI mirror");
+	if (setRenderDevice != std::string::npos &&
+		setRenderDeviceEnd > setRenderDevice)
+	{
+		const std::string setRenderBody = wrapperSource.substr(setRenderDevice,
+			setRenderDeviceEnd - setRenderDevice);
+		result |= check(setRenderBody.find(
+			"rts::render::GameRenderer_IsWindowed = (windowed != 0);") !=
+			std::string::npos && setRenderBody.find(
+			"IsWindowed = rts::render::GameRenderer_IsWindowed;") !=
+			std::string::npos && setRenderBody.find(
+			"rts::render::GameRenderer_IsWindowed = previous_windowed;") !=
+			std::string::npos,
+			"legacy device selection updates and rolls back one canonical window state");
+	}
+	else
+	{
+		result |= check(false,
+			"legacy device-selection synchronization boundary is source-addressable");
+	}
+	if (setDeviceResolution != std::string::npos &&
+		setDeviceResolutionEnd > setDeviceResolution)
+	{
+		const std::string setResolutionBody = wrapperSource.substr(
+			setDeviceResolution, setDeviceResolutionEnd - setDeviceResolution);
+		result |= check(setResolutionBody.find(
+			"const bool previous_windowed = rts::render::GameRenderer_IsWindowed;") !=
+			std::string::npos && setResolutionBody.find(
+			"const bool requested_windowed = windowed == -1 ?") !=
+			std::string::npos && setResolutionBody.find(
+			"rts::render::GameRenderer_IsWindowed = windowed != 0;") !=
+			std::string::npos && setResolutionBody.find(
+			"IsWindowed = rts::render::GameRenderer_IsWindowed;") !=
+			std::string::npos && setResolutionBody.find(
+			"rts::render::GameRenderer_IsWindowed = previous_windowed;") !=
+			std::string::npos,
+			"legacy resolution changes and rollback use the canonical window state");
+	}
+	else
+	{
+		result |= check(false,
+			"legacy resolution synchronization boundary is source-addressable");
+	}
+	if (toggleWindowed != std::string::npos &&
+		toggleWindowedEnd > toggleWindowed)
+	{
+		const std::string toggleBody = wrapperSource.substr(toggleWindowed,
+			toggleWindowedEnd - toggleWindowed);
+		result |= check(toggleBody.find(
+			"!rts::render::GameRenderer_IsWindowed") != std::string::npos,
+			"legacy window toggle reads the canonical neutral state");
+	}
+	else
+	{
+		result |= check(false,
+			"legacy window-toggle synchronization boundary is source-addressable");
+	}
+	result |= check(shutdownEnd > shutdown && wrapperSource.find(
+		"IsWindowed = rts::render::GameRenderer_IsWindowed;", shutdown) <
+			shutdownEnd,
+		"legacy shutdown reconciles the retained ABI window-state mirror");
+#endif
 
 	const std::string::size_type updateBegin = textureSource.find(
 		"bool TextureBaseClass::Update_Native_Subresource_Data");
@@ -463,6 +629,40 @@ int testRendererTextureLifecycleContracts()
 			borderFailureReturn > borderFailure && borderFailureReturn < borderClear,
 			"both shroud border publication failures retain the retry latch");
 	}
+	return result;
+}
+
+int testNativeMeshPrelitStageResetContract()
+{
+	int result = 0;
+	result |= check(rts::render::LEGACY_TEXTURE_STAGE_COUNT == 8,
+		"the neutral renderer preserves all eight legacy texture stages");
+
+#if defined(RTS_SOURCE_ROOT)
+	std::string meshSource;
+	result |= check(ReadSourceText(
+		"Core/Libraries/Source/WWVegas/WW3D2/nativew3dmeshrenderer.cpp",
+		&meshSource), "native mesh source is available for prelit reset checks");
+	if (!meshSource.empty())
+	{
+		const std::string::size_type multiPass = meshSource.find(
+			"case MeshGeometryClass::PRELIT_LIGHTMAP_MULTI_PASS");
+		const std::string::size_type allStageReset = meshSource.find(
+			"for (i = 0; i < rts::render::LEGACY_TEXTURE_STAGE_COUNT; i++)",
+			multiPass);
+		const std::string::size_type resetCall = meshSource.find(
+			"rts::render::SetGameTexture(i, nullptr);", allStageReset);
+		const std::string::size_type nextPrelitCase = meshSource.find(
+			"case MeshGeometryClass::PRELIT_LIGHTMAP_MULTI_TEXTURE", multiPass);
+		result |= check(multiPass != std::string::npos &&
+			allStageReset != std::string::npos &&
+			resetCall != std::string::npos &&
+			(nextPrelitCase == std::string::npos ||
+				allStageReset < nextPrelitCase) &&
+			(resetCall < nextPrelitCase),
+			"no-texture PRELIT multi-pass reset clears every legacy stage");
+	}
+#endif
 	return result;
 }
 
@@ -1174,7 +1374,7 @@ int testLegacyResetSeedAndAmbientUpdate()
 		pipeline.rasterizer.fillMode == rts::render::RENDER_FILL_SOLID,
 		"explicit neutral pipeline seed restores valid deterministic defaults");
 	const rts::render::RenderFloat4 rawAmbient =
-		rts::render::DecodeLegacyD3D8Ambient(0x80402010U);
+		rts::render::DecodeLegacyAmbientColor(0x80402010U);
 	result |= check(rawAmbient.x == (64.0f / 255.0f) &&
 		rawAmbient.y == (32.0f / 255.0f) &&
 		rawAmbient.z == (16.0f / 255.0f) && rawAmbient.w == 1.0f,
@@ -1830,6 +2030,7 @@ int testLegacyStatePublicationFailureLatch()
 }
 
 #if defined(RTS_RENDERER_HAS_D3D11)
+#if !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
 int testD3D11PrimitiveTopologyTranslation()
 {
 	int result = 0;
@@ -1887,6 +2088,7 @@ int testD3D11PrimitiveTopologyTranslation()
 	rts::render::ResetLegacyStatePublicationFailure();
 	return result;
 }
+#endif
 
 int testD3D11LegacyStateBoundary()
 {
@@ -1902,35 +2104,37 @@ int testD3D11LegacyStateBoundary()
 		!rts::render::Is_D3D11_Clip_Plane_Mask_Supported(0x40U),
 		"D3D11 clip-plane publication preserves the six-plane boundary");
 	result |= check(rts::render::Is_D3D11_Shade_Mode_Value_Supported(
-		D3DSHADE_GOURAUD) &&
-		!rts::render::Is_D3D11_Shade_Mode_Value_Supported(D3DSHADE_FLAT),
+		rts::render::LEGACY_VOLUMETRIC_SHADOW_SHADE_GOURAUD) &&
+		!rts::render::Is_D3D11_Shade_Mode_Value_Supported(
+			rts::render::LEGACY_VOLUMETRIC_SHADOW_SHADE_FLAT),
 		"D3D11 keeps Gouraud shading and rejects unrepresented flat shading");
 	result |= check(
 		rts::render::Is_D3D11_Default_Render_State_Value_Supported(
-			D3DRS_COLORVERTEX, TRUE) &&
+			rts::render::LEGACY_D3DRS_COLORVERTEX, TRUE) &&
 		!rts::render::Is_D3D11_Default_Render_State_Value_Supported(
-			D3DRS_COLORVERTEX, FALSE) &&
+			rts::render::LEGACY_D3DRS_COLORVERTEX, FALSE) &&
 		rts::render::Is_D3D11_Default_Render_State_Value_Supported(
-			D3DRS_DITHERENABLE, FALSE) &&
+			rts::render::LEGACY_D3DRS_DITHERENABLE, FALSE) &&
 		!rts::render::Is_D3D11_Default_Render_State_Value_Supported(
-			D3DRS_DITHERENABLE, TRUE) &&
+			rts::render::LEGACY_D3DRS_DITHERENABLE, TRUE) &&
 		rts::render::Is_D3D11_Default_Render_State_Value_Supported(
-			D3DRS_CLIPPING, TRUE) &&
+			rts::render::LEGACY_D3DRS_CLIPPING, TRUE) &&
 		!rts::render::Is_D3D11_Default_Render_State_Value_Supported(
-			D3DRS_CLIPPING, FALSE) &&
+			rts::render::LEGACY_D3DRS_CLIPPING, FALSE) &&
 		rts::render::Is_D3D11_Default_Render_State_Value_Supported(
-			D3DRS_SOFTWAREVERTEXPROCESSING, FALSE) &&
+			rts::render::LEGACY_D3DRS_SOFTWAREVERTEXPROCESSING, FALSE) &&
 		!rts::render::Is_D3D11_Default_Render_State_Value_Supported(
-			D3DRS_SOFTWAREVERTEXPROCESSING, TRUE),
+			rts::render::LEGACY_D3DRS_SOFTWAREVERTEXPROCESSING, TRUE),
 		"D3D11 accepts only the exact harmless legacy default-state values");
 	result |= check(
 		rts::render::Is_D3D11_Irrelevant_Render_State(
-			D3DRS_FOGTABLEMODE) &&
-		!rts::render::Is_D3D11_Irrelevant_Render_State(D3DRS_COLORVERTEX) &&
+			rts::render::LEGACY_D3DRS_FOGTABLEMODE) &&
+		!rts::render::Is_D3D11_Irrelevant_Render_State(
+			rts::render::LEGACY_D3DRS_COLORVERTEX) &&
 		!rts::render::Should_Poison_D3D11_Render_State(
-			D3DRS_FOGTABLEMODE, false) &&
+			rts::render::LEGACY_D3DRS_FOGTABLEMODE, false) &&
 		rts::render::Should_Poison_D3D11_Render_State(
-			D3DRS_COLORVERTEX, false),
+			rts::render::LEGACY_D3DRS_COLORVERTEX, false),
 		"D3D8 fog and color-vertex numeric states cannot alias in the allowlist");
 	result |= check(
 		rts::render::Select_D3D11_Volumetric_Shadow_Shade_Mode(false, true) ==
@@ -5210,9 +5414,15 @@ int testW3DVideoBufferDirectPublicationLayout()
 	result |= check(ExpectedNativeVideoPublicationSelection(
 		rts::render::RENDER_BACKEND_DX8, true, true) == false,
 		"W3D video keeps the legacy publication policy for DX8");
+#if defined(_WIN64)
 	result |= check(ExpectedNativeVideoPublicationSelection(
 		rts::render::RENDER_BACKEND_D3D11, true, true),
 		"W3D video selection requires a supported active native owner");
+#else
+	result |= check(!ExpectedNativeVideoPublicationSelection(
+		rts::render::RENDER_BACKEND_D3D11, true, true),
+		"W3D video keeps the compatibility publication policy on x86");
+#endif
 	result |= check(!ExpectedNativeVideoPublicationSelection(
 		rts::render::RENDER_BACKEND_D3D11, true, false),
 		"W3D video selection rejects a requested but inactive native owner");
@@ -5607,6 +5817,7 @@ int testD3D11StateCacheEvictionContract()
 	return result;
 }
 
+#if !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
 int testD3D11LegacyBridgeLifecycleContract()
 {
 	int result = 0;
@@ -5623,6 +5834,8 @@ int testD3D11LegacyBridgeLifecycleContract()
 	typedef void (D3D11LegacyBridge::*ExpectedCaptureRequest)();
 	typedef bool (D3D11LegacyBridge::*ExpectedBeginFrame)();
 	typedef bool (D3D11LegacyBridge::*ExpectedPrepareReset)();
+	typedef void (D3D11LegacyBridge::*ExpectedShutdown)();
+	typedef rts::render::RenderResult (D3D11LegacyBridge::*ExpectedShutdownResult)();
 	typedef void (D3D11LegacyBridge::*ExpectedInvalidateBufferRange)(IUnknown *,
 		unsigned int, size_t, size_t, rts::render::RenderBufferUpdateMode);
 	typedef bool (D3D11LegacyBridge::*ExpectedPublishBufferChange)(IUnknown *,
@@ -5648,6 +5861,10 @@ int testD3D11LegacyBridgeLifecycleContract()
 		ExpectedBeginFrame>::value &&
 		std::is_same<decltype(&D3D11LegacyBridge::Prepare_Legacy_Device_Reset),
 		ExpectedPrepareReset>::value &&
+		std::is_same<decltype(&D3D11LegacyBridge::Shutdown),
+		ExpectedShutdown>::value &&
+		std::is_same<decltype(&D3D11LegacyBridge::Shutdown_Result),
+		ExpectedShutdownResult>::value &&
 		std::is_same<decltype(&D3D11LegacyBridge::Invalidate_Buffer_Range),
 		ExpectedInvalidateBufferRange>::value &&
 		std::is_same<decltype(&D3D11LegacyBridge::Publish_Buffer_Change),
@@ -5657,6 +5874,7 @@ int testD3D11LegacyBridgeLifecycleContract()
 		"D3D11 bridge exposes result-bearing lifecycle and pre-present capture methods");
 	return result;
 }
+#endif
 
 int testD3D11LegacyBlendFactors()
 {
@@ -5746,19 +5964,30 @@ int testD3D11LegacyBlendFactors()
 #endif
 }
 
+#if !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
 int TestLegacyResetResources();
 int TestLegacyAsyncFramePolicy();
 int TestLegacyAsyncBridgeCompletion();
+#if defined(RTS_RENDERER_WAVE_SHADER_CONTRACT_TEST)
+int RunLegacyWaveShaderContractTests();
+#endif
+#endif
 
 int main()
 {
 	int result = 0;
+#if !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
 	result |= TestLegacyResetResources();
 	result |= TestLegacyAsyncFramePolicy();
 	result |= TestLegacyAsyncBridgeCompletion();
+#if defined(RTS_RENDERER_WAVE_SHADER_CONTRACT_TEST)
+	result |= RunLegacyWaveShaderContractTests();
+#endif
+#endif
 	result |= testBackendNames();
 	result |= testRenderTexturePublicationOperationalStates();
 	result |= testRendererTextureLifecycleContracts();
+	result |= testNativeMeshPrelitStageResetContract();
 	result |= testGenerationSafeHandles();
 	result |= testNeutralDescriptorDefaults();
 	result |= testLegacyLogicalState();
@@ -5772,12 +6001,16 @@ int main()
 	result |= testRenderCaptureQueue();
 	result |= testW3DVideoBufferDirectPublicationLayout();
 #if defined(RTS_RENDERER_HAS_D3D11)
+#if !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
 	result |= testD3D11PrimitiveTopologyTranslation();
+#endif
 	result |= testD3D11LegacyStateBoundary();
 	result |= testD3D11HeadlessDevice();
 	result |= testD3D11TextureRefreshContract();
 	result |= testD3D11StateCacheEvictionContract();
+#if !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
 	result |= testD3D11LegacyBridgeLifecycleContract();
+#endif
 	result |= testD3D11LegacyBlendFactors();
 	result |= testD3D11HiddenSwapChain();
 #endif

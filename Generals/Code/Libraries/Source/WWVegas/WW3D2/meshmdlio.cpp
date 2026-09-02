@@ -75,6 +75,7 @@
  *   MeshSaveContextClass::~MeshSaveContextClass -- destructor                                 *
  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
+#include <Utility/CppMacros.h>
 #include "meshmdl.h"
 #include "aabtree.h"
 #include "matinfo.h"
@@ -88,28 +89,8 @@
 #include "assetmgr.h"
 #include "WWLib/simplevec.h"
 #include "WWLib/realcrc.h"
-
-namespace
-{
-// Mesh color chunks are CPU-side file data.  Keep their packed ARGB
-// conversion independent from the renderer/backend so the loader can be
-// shared by native and legacy render paths without importing device state.
-static unsigned int Pack_Mesh_Color(const Vector4 &color)
-{
-	return static_cast<unsigned int>(
-		Vector3(color.X, color.Y, color.Z).Convert_To_ARGB(color.W));
-}
-
-static Vector4 Unpack_Mesh_Color(unsigned int color)
-{
-	Vector4 unpacked;
-	unpacked.W = static_cast<float>((color >> 24) & 0xff) / 255.0f;
-	unpacked.X = static_cast<float>((color >> 16) & 0xff) / 255.0f;
-	unpacked.Y = static_cast<float>((color >> 8) & 0xff) / 255.0f;
-	unpacked.Z = static_cast<float>(color & 0xff) / 255.0f;
-	return unpacked;
-}
-}
+#include <WWMath/vector4.h>
+#include "Renderer/LegacyColorPacking.h"
 
 #ifdef _UNIX
 #include "osdep/osdep.h"
@@ -919,7 +900,7 @@ WW3DErrorType MeshModelClass::read_vertex_colors(ChunkLoadClass & cload,MeshLoad
 
 			Vector4 col;
 			col.Set((float)color.R / 255.0f,(float)color.G / 255.0f,(float)color.B / 255.0f, 1.0f);
-			dcg[i]=Pack_Mesh_Color(col);
+			dcg[i]=rts::render::PackLegacyARGB(col.X, col.Y, col.Z, col.W);
 		}
 	}
 	CurMatDesc->Set_DCG_Source(context->CurPass,VertexMaterialClass::COLOR1);
@@ -1285,7 +1266,7 @@ WW3DErrorType MeshModelClass::read_dcg(ChunkLoadClass & cload,MeshLoadContextCla
 			cload.Read(&color,sizeof(color));
 			Vector4 col;
 			W3dUtilityClass::Convert_Color(color,&col);
-			dcg[i]=Pack_Mesh_Color(col);
+			dcg[i]=rts::render::PackLegacyARGB(col.X, col.Y, col.Z, col.W);
 		}
 	} else if (context->PrelitChunkID==W3D_CHUNK_PRELIT_VERTEX) {
 
@@ -1295,9 +1276,10 @@ WW3DErrorType MeshModelClass::read_dcg(ChunkLoadClass & cload,MeshLoadContextCla
 		for (int i=0; i<Get_Vertex_Count(); i++) {
 			cload.Read(&color,sizeof(color));
 			Vector4 col;
-			col=Unpack_Mesh_Color(dcg[i]);
+			const rts::render::LegacyPackedColor unpacked = rts::render::UnpackLegacyARGB(dcg[i]);
+			col.Set(unpacked.red, unpacked.green, unpacked.blue, unpacked.alpha);
 			col.W = float(color.A)/255.0f;
-			dcg[i]=Pack_Mesh_Color(col);
+			dcg[i]=rts::render::PackLegacyARGB(col.X, col.Y, col.Z, col.W);
 		}
 	}
 
@@ -1347,7 +1329,7 @@ WW3DErrorType MeshModelClass::read_dig(ChunkLoadClass & cload,MeshLoadContextCla
 			col.Y = float(color.G)/255.0f;
 			col.Z = float(color.B)/255.0f;
 			col.W = 1.0f;
-			dcg[i]=Pack_Mesh_Color(col);
+			dcg[i]=rts::render::PackLegacyARGB(col.X, col.Y, col.Z, col.W);
 
 
 		}
@@ -1355,11 +1337,12 @@ WW3DErrorType MeshModelClass::read_dig(ChunkLoadClass & cload,MeshLoadContextCla
 		unsigned * dcg = matdesc->Get_Color_Array(0);
 		for (int i=0; i<Get_Vertex_Count(); i++) {
 			cload.Read(&color,sizeof(color));
-			Vector4 col=Unpack_Mesh_Color(dcg[i]);
+			const rts::render::LegacyPackedColor unpacked = rts::render::UnpackLegacyARGB(dcg[i]);
+			Vector4 col(unpacked.red, unpacked.green, unpacked.blue, unpacked.alpha);
 			col.X *= float(color.R)/255.0f;
 			col.Y *= float(color.G)/255.0f;
 			col.Z *= float(color.B)/255.0f;
-			dcg[i]=Pack_Mesh_Color(col);
+			dcg[i]=rts::render::PackLegacyARGB(col.X, col.Y, col.Z, col.W);
 		}
 	}
 

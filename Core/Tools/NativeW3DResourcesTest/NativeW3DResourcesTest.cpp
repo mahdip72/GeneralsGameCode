@@ -1,3 +1,4 @@
+#include "Utility/CppMacros.h"
 #include "Renderer/NativeW3DResources.h"
 #include "Renderer/ThreadedRenderDevice.h"
 #include "nativew3dbufferowner.h"

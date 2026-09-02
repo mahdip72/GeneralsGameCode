@@ -80,13 +80,12 @@
 #include "WWLib/Vector.h"
 #include "WWMath/vp.h"
 #include "WWMath/matrix4.h"
-#include "dx8wrapper.h"
 #include "dx8vertexbuffer.h"
 #include "dx8indexbuffer.h"
+#include "Renderer/RenderGameClient.h"
+#include "Renderer/LegacyColorPacking.h"
 #include "rinfo.h"
 #include "camera.h"
-#include "dx8fvf.h"
-#include "sortingrenderer.h"
 
 // Upgraded to DX8 2/2/01 HY
 
@@ -879,7 +878,7 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 
 	// Get the world and view matrices
 	Matrix4x4 view;
-	DX8Wrapper::Get_Transform(D3DTS_VIEW,view);
+	rts::render::GetGameTransform(rts::render::GAME_TRANSFORM_VIEW, &view);
 
 	// Transform the point locations from worldspace to camera space if needed
 	// (i.e. if they are not already in camera space):
@@ -895,7 +894,7 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 			transformed_loc.Resize(PointCount * 2);
 		}
 		// Not using vector processor class because we are discarding w
-		// Not using T&L in DX8 because we don't want DX8 to transform
+		// Keep the CPU-side transform so the active renderer does not transform
 		// 3 times per particle when we can do it once
 		for (int i=0; i<PointCount; i++)
 		{
@@ -918,12 +917,14 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 	// so set world and view matrices to identity and render
 
 	Matrix4x4 identity(true);
-	DX8Wrapper::Set_Transform(D3DTS_WORLD,identity);
-	DX8Wrapper::Set_Transform(D3DTS_VIEW,identity);
+	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_WORLD,
+		identity);
+	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW,
+		identity);
 
-	DX8Wrapper::Set_Material(PointMaterial);
-	DX8Wrapper::Set_Shader(Shader);
-	DX8Wrapper::Set_Texture(0,Texture);
+	rts::render::SetGameMaterial(PointMaterial);
+	rts::render::SetGameShader(Shader);
+	rts::render::SetGameTexture(0, Texture);
 
 	// Enable sorting if the primitives are translucent and alpha testing is not enabled.
 	// TheSuperHackers @bugfix stephanmeesters 30/06/2026 However, do not apply sorting to ground-aligned particles.
@@ -951,7 +952,10 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 	while (current<vnum)
 	{
 		delta=MIN(vnum-current,MAX_VB_SIZE);
-		DynamicVBAccessClass PointVerts (sort ? BUFFER_TYPE_DYNAMIC_SORTING : BUFFER_TYPE_DYNAMIC_DX8, dynamic_fvf_type, delta);
+		DynamicVBAccessClass PointVerts(
+			sort ? rts::render::GAME_BUFFER_TYPE_DYNAMIC_SORTED :
+			rts::render::GAME_BUFFER_TYPE_DYNAMIC_IMMEDIATE,
+			dynamic_fvf_type, delta);
 		if (!PointVerts.Is_Valid()) {
 			break;
 		}
@@ -975,12 +979,15 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 				*(Vector3*)(vb+fvfinfo.Get_Location_Offset())=VertexLoc[i];
 				*(Vector3*)(vb+fvfinfo.Get_Normal_Offset())=Vector3(0.0f,0.0f,1.0f);
 				if (current_diffuse) {
-					unsigned color=DX8Wrapper::Convert_Color_Clamp(VertexDiffuse[i]);
+					unsigned color = rts::render::PackLegacyARGB(
+						VertexDiffuse[i].X, VertexDiffuse[i].Y,
+						VertexDiffuse[i].Z, VertexDiffuse[i].W);
 					*(unsigned int*)(vb+fvfinfo.Get_Diffuse_Offset())=color;
 				}
 				else
 					*(unsigned int*)(vb+fvfinfo.Get_Diffuse_Offset())=
-						DX8Wrapper::Convert_Color_Clamp(Vector4(DefaultPointColor[0],DefaultPointColor[1],DefaultPointColor[2],DefaultPointAlpha));
+						rts::render::PackLegacyARGB(DefaultPointColor[0],
+						DefaultPointColor[1], DefaultPointColor[2], DefaultPointAlpha);
 				*(Vector2*)(vb+fvfinfo.Get_Tex_Offset(0))=VertexUV[i];
 				*(Vector2*)(vb+fvfinfo.Get_Tex_Offset(1))=Vector2(0.0f,0.0f);
 				vb+=fvfinfo.Get_FVF_Size();
@@ -990,25 +997,27 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 			}
 		}
 
-		DX8Wrapper::Set_Index_Buffer (indexbuffer, 0);
-		if (!DX8Wrapper::Set_Vertex_Buffer (PointVerts)) {
+		rts::render::SetGameIndexBuffer(indexbuffer, 0);
+		if (!rts::render::SetGameVertexBuffer(PointVerts)) {
 			break;
 		}
 
 		if ( sort )
 		{
-				SortingRendererClass::Insert_Triangles (0, delta / verticesperprimitive, 0, delta);
+				rts::render::DrawGameSortedTriangles(
+					0, delta / verticesperprimitive, 0, delta);
 		}
 		else
 		{
-			DX8Wrapper::Draw_Triangles (0, delta / verticesperprimitive, 0, delta);
+			rts::render::DrawGameTriangles(0, delta / verticesperprimitive, 0,
+				delta);
 		}
 
 		current+=delta;
 	}
 
 	// restore the matrices
-	DX8Wrapper::Set_Transform(D3DTS_VIEW,view);
+	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW, view);
 }
 
 
@@ -1220,7 +1229,8 @@ void PointGroupClass::Update_Arrays(
 				Matrix4x4 view;
 				Vector4 result;
 				if (!Billboard) {
-					DX8Wrapper::Get_Transform(D3DTS_VIEW,view);
+					rts::render::GetGameTransform(
+						rts::render::GAME_TRANSFORM_VIEW, &view);
 				}
 
 				// Scale vertex offsets and add them to point locations to get vertex locations
@@ -1762,7 +1772,7 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 
 		// Get the world and view matrices
 		Matrix4x4 view;
-		DX8Wrapper::Get_Transform(D3DTS_VIEW,view);
+		rts::render::GetGameTransform(rts::render::GAME_TRANSFORM_VIEW, &view);
 
 
 
@@ -1852,7 +1862,7 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 				transformed_loc.Resize(PointCount * 2);
 			}
 			// Not using vector processor class because we are discarding w
-			// Not using T&L in DX8 because we don't want DX8 to transform
+			// Keep the CPU-side transform so the active renderer does not transform
 			// 3 times per particle when we can do it once
 			float recipDepth = 0.1f / (float)depth;
 
@@ -1900,12 +1910,14 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 		// so set world and view matrices to identity and render
 
 		Matrix4x4 identity(true);
-		DX8Wrapper::Set_Transform(D3DTS_WORLD,identity);
-		DX8Wrapper::Set_Transform(D3DTS_VIEW,identity);
+		rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_WORLD,
+			identity);
+		rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW,
+			identity);
 
-		DX8Wrapper::Set_Material(PointMaterial);
-		DX8Wrapper::Set_Shader(Shader);
-		DX8Wrapper::Set_Texture(0,Texture);
+		rts::render::SetGameMaterial(PointMaterial);
+		rts::render::SetGameShader(Shader);
+		rts::render::SetGameTexture(0, Texture);
 
 		// Enable sorting if the primitives are translucent and alpha testing is not enabled.
 		// TheSuperHackers @info Volumetric particles, both billboarded and ground-aligned, must have sorting enabled to
@@ -1933,7 +1945,10 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 		while (current<vnum)
 		{
 			delta=MIN(vnum-current,MAX_VB_SIZE);
-			DynamicVBAccessClass PointVerts (sort ? BUFFER_TYPE_DYNAMIC_SORTING : BUFFER_TYPE_DYNAMIC_DX8, dynamic_fvf_type, delta);
+			DynamicVBAccessClass PointVerts(
+				sort ? rts::render::GAME_BUFFER_TYPE_DYNAMIC_SORTED :
+				rts::render::GAME_BUFFER_TYPE_DYNAMIC_IMMEDIATE,
+				dynamic_fvf_type, delta);
 			if (!PointVerts.Is_Valid()) {
 				break;
 			}
@@ -1959,12 +1974,15 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 					*(Vector3*)(vb+fvfinfo.Get_Normal_Offset()) = Vector3(0.0f,0.0f,1.0f);
 
 					if (current_diffuse) {
-						unsigned color=DX8Wrapper::Convert_Color_Clamp(VertexDiffuse[i]);
+						unsigned color = rts::render::PackLegacyARGB(
+							VertexDiffuse[i].X, VertexDiffuse[i].Y,
+							VertexDiffuse[i].Z, VertexDiffuse[i].W);
 						*(unsigned int*)(vb+fvfinfo.Get_Diffuse_Offset())=color;
 					}
 					else
 						*(unsigned int*)(vb+fvfinfo.Get_Diffuse_Offset())=
-							DX8Wrapper::Convert_Color_Clamp(Vector4(DefaultPointColor[0],DefaultPointColor[1],DefaultPointColor[2],DefaultPointAlpha));
+							rts::render::PackLegacyARGB(DefaultPointColor[0],
+							DefaultPointColor[1], DefaultPointColor[2], DefaultPointAlpha);
 					*(Vector2*)(vb+fvfinfo.Get_Tex_Offset(0))=VertexUV[i];
 					*(Vector2*)(vb+fvfinfo.Get_Tex_Offset(1))=Vector2(0.0f,0.0f);
 					vb+=fvfinfo.Get_FVF_Size();
@@ -1974,8 +1992,8 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 				}
 			}
 
-			DX8Wrapper::Set_Index_Buffer (indexbuffer, 0);
-			if (!DX8Wrapper::Set_Vertex_Buffer (PointVerts)) {
+			rts::render::SetGameIndexBuffer(indexbuffer, 0);
+			if (!rts::render::SetGameVertexBuffer(PointVerts)) {
 				break;
 			}
 
@@ -1983,9 +2001,11 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 
 
 			if ( sort )
-					SortingRendererClass::Insert_Triangles (0, delta / verticesperprimitive, 0, delta);
+					rts::render::DrawGameSortedTriangles(
+						0, delta / verticesperprimitive, 0, delta);
 			else
-				DX8Wrapper::Draw_Triangles (0, delta / verticesperprimitive, 0, delta);
+				rts::render::DrawGameTriangles(0, delta / verticesperprimitive,
+					0, delta);
 
 
 			current+=delta;
@@ -1999,5 +2019,5 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 
 
 	// restore the matrices
-	DX8Wrapper::Set_Transform(D3DTS_VIEW,view);
+	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW, view);
 }

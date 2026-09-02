@@ -108,7 +108,7 @@ public:
 	void setTimeOfDay(TimeOfDay tod); ///<change sky/water for time of day
 	void toggleCloudLayer(Bool state)	{	m_useCloudLayer=state;}	///<enables/disables the cloud layer
 	void updateRenderTargetTextures(CameraClass *cam);	///< renders into any required textures.
-	void ReleaseResources();	///< Release all dx8 resources so the device can be reset.
+	void ReleaseResources();	///< Release all renderer resources so the device can be reset.
 	void ReAcquireResources();  ///< Reacquire all resources after device reset.
 	Real getWaterHeight(Real x, Real y);	///<return water height at given point - for use by WB.
 	void setGridHeightClamps(Real minz, Real maxz);	///<set min/max height values alllowed in grid
@@ -149,37 +149,27 @@ protected:
 	WaterType	m_waterType;		///<type of water being used
 	Int			m_sortLevel;		///<sort order after main scene is rendered
 
-	//Data used in GeForce3 bump-mapped water (uses direct D3D resources for better
-	//performance and compatibility (most of these featues are not supported by W3D).
-	struct SEA_PATCH_VERTEX	//vertex structure passed to D3D
+	// Data used by the high-detail bump-mapped water path.  Buffer and texture
+	// ownership remains behind the product renderer facade.
+	struct SEA_PATCH_VERTEX	//vertex structure passed to the renderer
 	{
 		float x,y,z;
 		unsigned int c;
 		float tu, tv;
 	};
 
-#if !defined(_WIN64) || !defined(RTS_RENDERER_HAS_D3D11)
-	LPDIRECT3DDEVICE8 m_pDev;						///<pointer to D3D Device
-#endif
-#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
-	DX8VertexBufferClass *m_vertexBufferD3D;		///<native WW3D vertex-buffer owner
-	DX8IndexBufferClass *m_indexBufferD3D;		///<native WW3D index-buffer owner
-#else
-	LPDIRECT3DVERTEXBUFFER8 m_vertexBufferD3D;		///<D3D vertex buffer
-	LPDIRECT3DINDEXBUFFER8	m_indexBufferD3D;	///<D3D index buffer
-#endif
-	Int						m_vertexBufferD3DOffset;	///<location to start writing vertices
-	DWORD					m_dwWavePixelShader;	///<handle to D3D pixel shader
-	DWORD					m_dwWaveVertexShader;	///<handle to D3D vertex shader
-	Int	m_numVertices;				///<number of vertices in D3D vertex buffer
-	Int m_numIndices;				///<number of indices in D3D index buffer
-#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
-	TextureClass *m_pBumpTexture[NUM_BUMP_FRAMES];	///<native animation frames
-	TextureClass *m_pBumpTexture2[NUM_BUMP_FRAMES];	///<native animation frames
-#else
-	LPDIRECT3DTEXTURE8 m_pBumpTexture[NUM_BUMP_FRAMES]; ///<animation frames
-	LPDIRECT3DTEXTURE8 m_pBumpTexture2[NUM_BUMP_FRAMES]; ///<animation frames
-#endif
+	// Kept as an opaque slot for the x86/VC6 object layout.  The product path
+	// never dereferences or interprets this pointer.
+	void *m_pDev;
+	DX8VertexBufferClass *m_vertexBuffer;		///<water vertex-buffer owner
+	DX8IndexBufferClass *m_waterIndexBuffer;	///<water index-buffer owner
+	Int						m_vertexBufferOffset;	///<location to start writing vertices
+	unsigned int				m_wavePixelShader;	///<logical wave pixel program
+	unsigned int				m_waveVertexShader;	///<logical wave vertex program
+	Int	m_numVertices;				///<number of vertices in the water vertex buffer
+	Int m_numIndices;				///<number of indices in the water index buffer
+	TextureClass *m_pBumpTexture[NUM_BUMP_FRAMES];	///<animation frames
+	TextureClass *m_pBumpTexture2[NUM_BUMP_FRAMES];	///<animation frames
 	Real				m_fBumpFrame;	///<current animation frame
 	Real				m_fBumpScale;	///<scales bump map uv perturbation
 	TextureClass * m_pReflectionTexture;	///<render target for reflection
@@ -230,9 +220,9 @@ protected:
 	Bool m_whiteTexturePublishPending;
 #endif
 	TextureClass *m_waterNoiseTexture;
-	DWORD	m_waterPixelShader;		///<D3D handle to pixel shader.
-	DWORD	m_riverWaterPixelShader;		///<D3D handle to pixel shader.
-	DWORD	m_trapezoidWaterPixelShader;	///<handle to D3D vertex shader
+	unsigned int	m_waterPixelShader;		///<logical water pixel program
+	unsigned int	m_riverWaterPixelShader;		///<logical river pixel program
+	unsigned int	m_trapezoidWaterPixelShader;	///<logical trapezoid pixel program
 	TextureClass *m_waterSparklesTexture;
 	Real m_riverXOffset;
 	Real m_riverYOffset;
@@ -266,11 +256,7 @@ protected:
 	void testCurvedWater();	///<draw the sky layer (clouds, stars, etc.)
 	void renderSkyBody(Matrix3D *mat);	///<draw the sky body (sun, moon, etc.)
 	void renderWaterMesh();			///<draw the water surface mesh (deformed 3d mesh).
-#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
-	HRESULT initBumpMap(TextureClass **pTex, TextureClass *pBumpSource);	///<publishes native signed bump-map data.
-#else
-	HRESULT initBumpMap(LPDIRECT3DTEXTURE8 *pTex, TextureClass *pBumpSource);	///<copies data into bump-map format.
-#endif
+	HRESULT initBumpMap(TextureClass **pTex, TextureClass *pBumpSource);	///<copies data into bump-map format.
 	void renderMirror(CameraClass *cam);	///< Draw reflected scene into texture
 	void drawSea(RenderInfoClass & rinfo);	///< Draw the surface of the water
 	///bounding box of frustum clipped polygon plane

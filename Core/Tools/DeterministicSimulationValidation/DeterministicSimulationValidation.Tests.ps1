@@ -12,6 +12,7 @@ $script:TestRuntimeClosure = [ordered]@{
 }
 
 Import-Module (Join-Path $PSScriptRoot 'DeterministicSimulationEvidence.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'Stage5ReplayCorpusExporter.psm1') -Force
 
 function Get-Sha256 {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -44,6 +45,11 @@ function Assert-True {
         Write-Error "FAIL: $Message" -ErrorAction Continue
         ++$script:Failures
     }
+}
+
+function Assert-Condition {
+    param([bool]$Condition, [string]$Message)
+    if (-not $Condition) { throw $Message }
 }
 
 function Assert-InstalledNet3ModuleBoundary {
@@ -548,7 +554,7 @@ function Write-Stage5ExternalReceiptTestDocument {
         recordedUtc = '2026-09-01T00:00:00Z'
         provenance = [ordered]@{
             kind = $TrustDomain; reviewedBy = if ($TrustDomain -ceq 'manual-approval') {
-                'Mahdi'
+                'manual-tester'
             }
             else { 'premium-reviewer' }
             reviewedUtc = '2026-09-01T00:00:00Z'
@@ -1567,6 +1573,74 @@ function Write-StandardTestManifest {
     [IO.File]::WriteAllText($Path, ($manifest | ConvertTo-Json -Depth 8))
 }
 
+function Write-AiOnlyTestManifest {
+    param([string]$Path, [string]$ExecutableHash,
+        [int[]]$Seeds = @(1729, 1730, 1731),
+        [string[]]$Scenarios = @('4v3', '4v2'), [int]$AiRepeats = 2)
+    $manifest = [ordered]@{
+        schemaVersion = 1
+        title = 'ZeroHour'
+        executable = 'generalszh.exe'
+        executableSha256 = $ExecutableHash
+        fixtures = @()
+        ai = [ordered]@{
+            seeds = $Seeds
+            scenarios = $Scenarios
+            repeats = $AiRepeats
+        }
+    }
+    [IO.File]::WriteAllText($Path, ($manifest | ConvertTo-Json -Depth 8))
+}
+
+function Write-MinimalRpl3TestFile {
+    param([string]$Path)
+    $payloadStream = New-Object IO.MemoryStream
+    $payloadWriter = New-Object IO.BinaryWriter($payloadStream)
+    try {
+        $payloadWriter.Write([Text.Encoding]::ASCII.GetBytes('GENREP'))
+        $payloadWriter.Write([UInt32]1)
+        $payloadWriter.Write([UInt32]2)
+        $payloadWriter.Write([UInt32]42000)
+        $payloadWriter.Write([byte]0)
+        $payloadWriter.Write([byte]0)
+        for ($index = 0; $index -lt 8; ++$index) {
+            $payloadWriter.Write([byte]0)
+        }
+        $payloadWriter.Write([Text.Encoding]::Unicode.GetBytes('Stage5 AI test'))
+        $payloadWriter.Write([UInt16]0)
+        for ($index = 0; $index -lt 8; ++$index) {
+            $payloadWriter.Write([UInt16]0)
+        }
+        $payloadWriter.Write([Text.Encoding]::Unicode.GetBytes('GeneralsGameCode'))
+        $payloadWriter.Write([UInt16]0)
+        $payloadWriter.Write([Text.Encoding]::Unicode.GetBytes(
+            'native [SkirmishAIEpoch=3]'))
+        $payloadWriter.Write([UInt16]0)
+        $payloadBytes = $payloadStream.ToArray()
+    }
+    finally {
+        $payloadWriter.Dispose()
+        $payloadStream.Dispose()
+    }
+    $fileStream = New-Object IO.MemoryStream
+    $fileWriter = New-Object IO.BinaryWriter($fileStream)
+    try {
+        $fileWriter.Write([Text.Encoding]::ASCII.GetBytes('RPL3'))
+        $fileWriter.Write([UInt32]2)
+        $fileWriter.Write([UInt32]1)
+        $fileWriter.Write([UInt64]0)
+        $fileWriter.Write([UInt64]0)
+        $fileWriter.Write([UInt64]$payloadBytes.Length)
+        $fileWriter.Write([UInt32]0)
+        $fileWriter.Write($payloadBytes)
+        [IO.File]::WriteAllBytes($Path, $fileStream.ToArray())
+    }
+    finally {
+        $fileWriter.Dispose()
+        $fileStream.Dispose()
+    }
+}
+
 function New-AiCompletionOutput {
     param([int]$Seed = 1729, [string]$Mode = 'parallel', [string]$RequestedWorkers = '2',
         [int]$EffectiveWorkers = 2, [string]$Digest = 'A1B2C3D4', [int]$EndFrame = 42000,
@@ -2411,6 +2485,158 @@ try {
         $shadowEntries[0].arguments[$shadowModeIndex + 1] -ceq 'shadow') `
         'shadow stress execution passes simulationMode=shadow to the installed runtime'
 
+    $localCapacityOutput = Join-Path $root 'local-capacity-plan-output'
+    $localCapacityProcessors = @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop)
+    $localCapacityPhysical = [int](($localCapacityProcessors |
+        Measure-Object -Property NumberOfCores -Sum).Sum)
+    $localCapacityLogical = [int](($localCapacityProcessors |
+        Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum)
+    $localCapacityHostSupported = $localCapacityPhysical -ge 4 -and
+        $localCapacityPhysical -le 6 -and $localCapacityLogical -ge $localCapacityPhysical -and
+        $localCapacityLogical -le 12
+    if ($localCapacityHostSupported) {
+        & $scriptPath -RuntimeRoot $runtime -FixtureManifestPath $manifest `
+            -OutputRoot $localCapacityOutput -ValidationSet All `
+            -ReplayMatrixRepeats 2 -StressRepeats 3 -MinimumFreeBytes 1 `
+            -AllowNonStandardCorpus -CapacityMode LocalCapacity -PlanOnly | Out-Null
+        $localCapacityPlan = Get-Content -LiteralPath `
+            (Join-Path $localCapacityOutput 'validation-plan.json') -Raw | ConvertFrom-Json
+        $localCapacityReceipt = Get-Content -LiteralPath `
+            (Join-Path $localCapacityOutput 'local-capacity-plan-receipt.json') -Raw | ConvertFrom-Json
+        $localRegularConfigurationIds = @($localCapacityPlan.entries |
+            Where-Object { $_.configuration -ne 'shadow-8' } |
+            ForEach-Object { $_.configuration } | Sort-Object -Unique)
+        Assert-True ($localCapacityPlan.capacityMode -ceq 'LocalCapacity' -and
+            $localCapacityPlan.validationMode -ceq 'LocalCapacity' -and
+            $localCapacityPlan.diagnosticNonAcceptance -and
+            -not $localCapacityPlan.deterministicRuntimeEligible -and
+            -not $localCapacityPlan.finalAcceptanceEligible -and
+            -not $localCapacityPlan.acceptanceReceiptRequested) `
+            'LocalCapacity plans are explicitly diagnostic and ineligible for canonical acceptance'
+        Assert-True ($localRegularConfigurationIds.Count -eq 6 -and
+            @('serial-1', 'parallel-1', 'parallel-2', 'parallel-4',
+                'parallel-8', 'parallel-auto' | Where-Object {
+                    $localRegularConfigurationIds -notcontains $_
+                }).Count -eq 0 -and
+            @($localCapacityPlan.entries | Where-Object {
+                $_.configuration -eq 'parallel-16' -or
+                $_.configuration -eq 'shadow-16'
+            }).Count -eq 0) `
+            'LocalCapacity selects only serial-1, parallel-1/2/4/8/auto and omits 16-worker configurations'
+        Assert-True (@($localCapacityPlan.entries).Count -eq 121 -and
+            @($localCapacityPlan.entries | Where-Object { $_.kind -eq 'replay' }).Count -eq 48 -and
+            @($localCapacityPlan.entries | Where-Object { $_.kind -eq 'ai' }).Count -eq 73) `
+            'LocalCapacity preserves the complete selected replay/AI cross-product and one shadow run'
+        $localAutoEntries = @($localCapacityPlan.entries | Where-Object {
+            $_.configuration -ceq 'parallel-auto'
+        })
+        $localShadowEntries = @($localCapacityPlan.entries | Where-Object {
+            $_.configuration -ceq 'shadow-8'
+        })
+        Assert-True ($localAutoEntries.Count -gt 0 -and
+            @($localAutoEntries | Where-Object { $_.arguments -contains '-workerCount' }).Count -eq 0 -and
+            @($localCapacityPlan.entries | Where-Object {
+                $_.requestedWorkers -match '^(?:16|shadow-16)$'
+            }).Count -eq 0 -and
+            $localShadowEntries.Count -eq 1 -and
+            $localShadowEntries[0].requestedWorkers -ceq '8' -and
+            $localShadowEntries[0].simulationMode -ceq 'shadow') `
+            'LocalCapacity keeps auto unforced and bounds the collision shadow plan to eight workers'
+        Assert-True ($localCapacityPlan.localCapacity.hostTopology.physicalCoreCount -eq
+            $localCapacityPhysical -and
+            $localCapacityPlan.localCapacity.hostTopology.logicalProcessorCount -eq
+            $localCapacityLogical -and
+            $localCapacityPlan.localCapacity.maximumPhysicalCoreCount -eq 6 -and
+            $localCapacityPlan.localCapacity.maximumLogicalProcessorCount -eq 12 -and
+            -not $localCapacityPlan.localCapacity.externalAcceptanceEligible -and
+            -not $localCapacityPlan.localCapacity.canonicalFinalAcceptanceEligible) `
+            'LocalCapacity records the bounded host topology and non-acceptance limits'
+        Assert-True ($localCapacityReceipt.receiptKind -ceq
+            'stage5-local-capacity-receipt' -and
+            $localCapacityReceipt.validationMode -ceq 'LocalCapacity' -and
+            $localCapacityReceipt.status -ceq 'planned-non-acceptance' -and
+            -not $localCapacityReceipt.acceptanceEligible -and
+            -not $localCapacityReceipt.finalAcceptanceEligible -and
+            -not $localCapacityReceipt.externalAcceptanceEligible) `
+            'LocalCapacity writes a visibly non-acceptance report instead of a canonical final envelope'
+        Assert-True (-not (Test-Path -LiteralPath `
+            (Join-Path $localCapacityOutput 'validation-plan-receipt.json')) -and
+            -not (Test-Path -LiteralPath `
+                (Join-Path $localCapacityOutput 'local-capacity-receipt.json'))) `
+            'LocalCapacity plan-only output does not emit a canonical or completed receipt'
+    }
+    else {
+        Assert-Throws {
+            & $scriptPath -RuntimeRoot $runtime -FixtureManifestPath $manifest `
+                -OutputRoot $localCapacityOutput -ValidationSet All `
+                -ReplayMatrixRepeats 2 -StressRepeats 3 -MinimumFreeBytes 1 `
+                -AllowNonStandardCorpus -CapacityMode LocalCapacity -PlanOnly | Out-Null
+        } 'LocalCapacity.*(?:physical|logical)' `
+            'LocalCapacity fails closed when the host is outside the bounded local topology'
+    }
+
+    $localAiOnlyManifest = Join-Path $root 'local-ai-only-manifest.json'
+    Write-AiOnlyTestManifest $localAiOnlyManifest $executableHash
+    $localAiOnlyOutput = Join-Path $root 'local-ai-only-plan-output'
+    if ($localCapacityHostSupported) {
+        & $scriptPath -RuntimeRoot $runtime -FixtureManifestPath $localAiOnlyManifest `
+            -OutputRoot $localAiOnlyOutput -ValidationSet AI -MinimumFreeBytes 1 `
+            -CapacityMode LocalCapacity -PlanOnly | Out-Null
+        $localAiOnlyPlan = Get-Content -LiteralPath `
+            (Join-Path $localAiOnlyOutput 'validation-plan.json') -Raw | ConvertFrom-Json
+        Assert-True ($localAiOnlyPlan.validationSet -ceq 'AI' -and
+            $localAiOnlyPlan.capacityMode -ceq 'LocalCapacity' -and
+            -not $localAiOnlyPlan.replayCorpusRequired -and
+            $localAiOnlyPlan.replayFixtureCount -eq 0 -and
+            @($localAiOnlyPlan.entries | Where-Object { $_.kind -ceq 'replay' }).Count -eq 0 -and
+            @($localAiOnlyPlan.entries | Where-Object { $_.kind -ceq 'ai' }).Count -eq 73 -and
+            -not $localAiOnlyPlan.finalAcceptanceEligible) `
+            'LocalCapacity AI-only corpus seeding does not require or execute old replay fixtures'
+        $exportGuardTaskRoot = Join-Path $root 'export-guard-task'
+        New-Item -ItemType Directory -Path $exportGuardTaskRoot -Force | Out-Null
+        Assert-Throws {
+            & $scriptPath -RuntimeRoot $runtime -FixtureManifestPath $localAiOnlyManifest `
+                -OutputRoot (Join-Path $root 'export-guard-outside-output') `
+                -TaskRoot $exportGuardTaskRoot -ValidationSet AI -MinimumFreeBytes 1 `
+                -CapacityMode LocalCapacity -CorpusExportRoot 'fresh-native-corpus' `
+                -AllowHeadlessDirectExecution | Out-Null
+        } 'OutputRoot.*(?:task-owned|TaskRoot|containing)' `
+            'CorpusExportRoot rejects execution when OutputRoot is outside TaskRoot before any game run'
+    }
+    else {
+        Assert-Throws {
+            & $scriptPath -RuntimeRoot $runtime -FixtureManifestPath $localAiOnlyManifest `
+                -OutputRoot $localAiOnlyOutput -ValidationSet AI -MinimumFreeBytes 1 `
+                -CapacityMode LocalCapacity -PlanOnly | Out-Null
+        } 'LocalCapacity.*(?:physical|logical)' `
+            'LocalCapacity AI-only corpus seeding still fails closed outside the bounded local topology'
+    }
+    Assert-Throws {
+        & $scriptPath -RuntimeRoot $runtime -FixtureManifestPath $manifest `
+            -OutputRoot (Join-Path $root 'canonical-corpus-export-plan-output') `
+            -ValidationSet AI -MinimumFreeBytes 1 -CorpusExportRoot `
+            (Join-Path $root 'canonical-corpus-export') -PlanOnly | Out-Null
+    } 'CorpusExportRoot.*LocalCapacity.*AI' `
+        'CorpusExportRoot is restricted to an executing LocalCapacity AI-only lane'
+    Assert-Throws {
+        & $scriptPath -RuntimeRoot $runtime -FixtureManifestPath $manifest `
+            -OutputRoot (Join-Path $root 'local-capacity-acceptance-output') `
+            -ValidationSet Replay -MinimumFreeBytes 1 -AllowNonStandardCorpus `
+            -CapacityMode LocalCapacity -PlanOnly `
+            -AcceptanceSourceCommit ('a' * 40) `
+            -AcceptanceArtifactSetSha256 ('B' * 64) `
+            -AcceptanceRuntimeDependencyManifestSha256 ('C' * 64) `
+            -AcceptanceRuntimeClosureSha256 ('D' * 64) | Out-Null
+    } 'LocalCapacity.*acceptance' `
+        'LocalCapacity cannot request canonical acceptance bindings'
+    Assert-Throws {
+        & $scriptPath -RuntimeRoot $runtime -FixtureManifestPath $manifest `
+            -OutputRoot (Join-Path $root 'local-capacity-performance-output') `
+            -ValidationSet Replay -MinimumFreeBytes 1 -AllowNonStandardCorpus `
+            -CapacityMode LocalCapacity -PlanOnly -EnforcePerformance | Out-Null
+    } 'LocalCapacity.*performance|Performance.*diagnostic' `
+        'LocalCapacity cannot request canonical performance enforcement'
+
     $standardManifest = Join-Path $root 'standard-manifest.json'
     Write-StandardTestManifest $standardManifest $executableHash $fixtures
     Assert-Throws {
@@ -2475,6 +2701,238 @@ try {
         $validationSource -match 'manifestData\.title' -and
         $validationSource -match 'expectedExecutablePrefix') `
         'the installed-runtime runner binds title-specific manifest and executable evidence'
+    $runnerTokens = $null
+    $runnerParseErrors = $null
+    $runnerAst = [System.Management.Automation.Language.Parser]::ParseFile(
+        $scriptPath, [ref]$runnerTokens, [ref]$runnerParseErrors)
+    $localReceiptFunctionAst = $runnerAst.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Write-LocalCapacityReceipt'
+    }, $true)
+    Assert-True ($null -ne $localReceiptFunctionAst) `
+        'LocalCapacity receipt writer is present for lifecycle testing'
+    if ($null -ne $localReceiptFunctionAst) {
+        Invoke-Expression $localReceiptFunctionAst.Extent.Text
+        $lifecyclePlanPath = Join-Path $root 'local-capacity-lifecycle-plan.json'
+        $lifecycleResultsPath = Join-Path $root 'local-capacity-lifecycle-results.json'
+        Write-JsonDocument $lifecyclePlanPath ([ordered]@{ stage = 'plan' })
+        Write-JsonDocument $lifecycleResultsPath ([ordered]@{ stage = 'results' })
+        $lifecycleEntries = @(
+            [pscustomobject]@{ kind = 'replay' }
+            [pscustomobject]@{ kind = 'ai' }
+        )
+        $lifecycleResults = @(
+            [pscustomobject]@{ kind = 'replay' }
+            [pscustomobject]@{ kind = 'ai' }
+        )
+        $lifecycleConfigurations = @(
+            [pscustomobject]@{ Id = 'serial-1' }
+            [pscustomobject]@{ Id = 'parallel-1' }
+        )
+        $lifecycleShadow = [pscustomobject]@{ Id = 'shadow-8' }
+        $lifecycleTopology = [pscustomobject]@{
+            source = 'Win32_Processor'; physicalCoreCount = 6; logicalProcessorCount = 12
+        }
+        $lifecyclePlanReceiptPath = Join-Path $root 'local-capacity-lifecycle-plan-receipt.json'
+        $lifecycleFinalReceiptPath = Join-Path $root 'local-capacity-lifecycle-receipt.json'
+        Write-LocalCapacityReceipt -Path $lifecyclePlanReceiptPath `
+            -Status 'planned-non-acceptance' -ValidationSet 'All' `
+            -Entries $lifecycleEntries -Results @() `
+            -Configurations $lifecycleConfigurations -ShadowConfiguration $lifecycleShadow `
+            -Topology $lifecycleTopology -PlanPath $lifecyclePlanPath `
+            -ResultsPath $lifecycleResultsPath | Out-Null
+        Write-LocalCapacityReceipt -Path $lifecycleFinalReceiptPath `
+            -Status 'passed-non-acceptance' -ValidationSet 'All' `
+            -Entries $lifecycleEntries -Results $lifecycleResults `
+            -Configurations $lifecycleConfigurations -ShadowConfiguration $lifecycleShadow `
+            -Topology $lifecycleTopology -PlanPath $lifecyclePlanPath `
+            -ResultsPath $lifecycleResultsPath | Out-Null
+        $plannedLifecycleReceipt = Get-Content -LiteralPath $lifecyclePlanReceiptPath -Raw |
+            ConvertFrom-Json
+        $finalLifecycleReceipt = Get-Content -LiteralPath $lifecycleFinalReceiptPath -Raw |
+            ConvertFrom-Json
+        Assert-True ($plannedLifecycleReceipt.status -ceq 'planned-non-acceptance' -and
+            -not $plannedLifecycleReceipt.replayDeterminismAsserted -and
+            -not $plannedLifecycleReceipt.aiDeterminismAsserted -and
+            $finalLifecycleReceipt.status -ceq 'passed-non-acceptance' -and
+            $finalLifecycleReceipt.replayDeterminismAsserted -and
+            $finalLifecycleReceipt.aiDeterminismAsserted -and
+            -not $finalLifecycleReceipt.finalAcceptanceEligible -and
+            $lifecyclePlanReceiptPath -ne $lifecycleFinalReceiptPath) `
+            'LocalCapacity planned and completed receipts use distinct paths and report assertions only after completion'
+    }
+    $localCorpusExportFunctionAst = $runnerAst.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Export-LocalCapacityAiCorpus'
+    }, $true)
+    $pathWithinFunctionAst = $runnerAst.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Test-PathWithin'
+    }, $true)
+    Assert-True ($null -ne $localCorpusExportFunctionAst) `
+        'LocalCapacity corpus export integration helper is present for mocked-run testing'
+    Assert-True ($null -ne $pathWithinFunctionAst) `
+        'LocalCapacity corpus export integration path guard is present for mocked-run testing'
+    if ($null -ne $pathWithinFunctionAst) {
+        Invoke-Expression $pathWithinFunctionAst.Extent.Text
+    }
+    if ($null -ne $localCorpusExportFunctionAst -and $null -ne $localReceiptFunctionAst -and
+        $null -ne $pathWithinFunctionAst) {
+        Invoke-Expression $localCorpusExportFunctionAst.Extent.Text
+        $corpusTaskRoot = Join-Path $root 'mock-corpus-task'
+        $corpusTaskRunRoot = Join-Path $corpusTaskRoot 'validation-run-mock'
+        $corpusProfileRoot = Join-Path $corpusTaskRunRoot 'Documents\Profile'
+        $corpusReplayRoot = Join-Path $corpusProfileRoot 'Replays\Stage5Validation'
+        $corpusExportRoot = Join-Path $corpusTaskRoot 'fresh-native-corpus'
+        New-Item -ItemType Directory -Path $corpusReplayRoot -Force | Out-Null
+        $mockReplayPath = Join-Path $corpusReplayRoot 'SkirmishAI-4v3-1729-mock.rep'
+        Write-MinimalRpl3TestFile $mockReplayPath
+        $mockReplayHash = Get-Sha256 $mockReplayPath
+        $mockRunNonce = '11111111-22222222-33333333'
+        $mockCompletion = 'SKIRMISH_AI_TEST_COMPLETE seed=1729 scenario=4v3 ' +
+            "run_nonce=$mockRunNonce replay_epoch=3 replay_sha256=$mockReplayHash " +
+            ('replay_retained="' + $mockReplayPath + '"')
+        $mockEntry = [pscustomobject]@{
+            kind = 'ai'; sequence = 1; scenario = '4v3'; seed = 1729
+            configuration = 'serial-1'; repeat = 1
+        }
+        $mockChildRuns = @(
+            [pscustomobject]@{
+                entry = $mockEntry
+                run = [pscustomobject]@{
+                    exitCode = 0; timedOut = $false; stdout = $mockCompletion
+                }
+            }
+        )
+        $mockResults = @(
+            [pscustomobject]@{
+                kind = 'ai'; sequence = 1; scenario = '4v3'; seed = 1729
+                aiEvidence = [pscustomobject]@{ finalDigest = 'A1B2C3D4' }
+            }
+        )
+        $mockResultsPath = Join-Path $corpusTaskRoot 'validation-results.json'
+        New-Item -ItemType Directory -Path $corpusTaskRoot -Force | Out-Null
+        Write-JsonDocument $mockResultsPath ([ordered]@{ results = $mockResults })
+        Assert-Throws {
+            Export-LocalCapacityAiCorpus `
+                -TaskRoot $corpusTaskRoot -TaskRunRoot $corpusTaskRunRoot `
+                -ProfileRoot $corpusProfileRoot `
+                -CorpusExportRoot (Join-Path $corpusTaskRunRoot 'bad-corpus') `
+                -Title 'ZeroHour' -ExecutableSha256 ('A' * 64) `
+                -ChildRuns $mockChildRuns -Results $mockResults `
+                -ValidationResultsPath $mockResultsPath | Out-Null
+        } 'CorpusExportRoot.*durable.*sibling' `
+            'LocalCapacity corpus export refuses a corpus root inside the ephemeral task-run root'
+        $mockExport = Export-LocalCapacityAiCorpus `
+            -TaskRoot $corpusTaskRoot -TaskRunRoot $corpusTaskRunRoot `
+            -ProfileRoot $corpusProfileRoot -CorpusExportRoot $corpusExportRoot `
+            -Title 'ZeroHour' -ExecutableSha256 ('A' * 64) `
+            -ChildRuns $mockChildRuns -Results $mockResults `
+            -ValidationResultsPath $mockResultsPath
+        $mockReceiptPath = Join-Path $corpusTaskRoot 'local-capacity-receipt.json'
+        Write-LocalCapacityReceipt -Path $mockReceiptPath `
+            -Status 'passed-non-acceptance' -ValidationSet 'AI' `
+            -Entries @($mockEntry) -Results $mockResults `
+            -Configurations @([pscustomobject]@{ Id = 'serial-1' }) `
+            -ShadowConfiguration ([pscustomobject]@{ Id = 'shadow-8' }) `
+            -Topology ([pscustomobject]@{
+                source = 'Win32_Processor'; physicalCoreCount = 6; logicalProcessorCount = 12
+            }) -PlanPath $mockResultsPath -ResultsPath $mockResultsPath `
+            -CorpusExportRoot $corpusExportRoot -CorpusExport $mockExport | Out-Null
+        $mockManifest = Write-Stage5FreshReplayCorpusManifest `
+            -TaskRoot $corpusTaskRoot -CorpusExportRoot $corpusExportRoot `
+            -Title 'ZeroHour' -ExecutableSha256 ('A' * 64) `
+            -Records $mockExport.records -ValidationResultsPath $mockResultsPath `
+            -ValidationReceiptPath $mockReceiptPath
+        Assert-True ($mockExport.status -ceq 'passed' -and
+            $mockExport.recordCount -eq 1 -and
+            (Test-Path -LiteralPath $mockExport.artifactIndex.path -PathType Leaf) -and
+            (Test-Path -LiteralPath $mockManifest.path -PathType Leaf)) `
+            'LocalCapacity exports one mocked completed AI recording, artifact index, and final corpus manifest'
+        Assert-Throws {
+            Write-Stage5FreshReplayArtifactIndex `
+                -TaskRoot $corpusTaskRoot -CorpusExportRoot $corpusExportRoot `
+                -Title 'ZeroHour' -ExecutableSha256 ('A' * 64) `
+                -Records $mockExport.records -ValidationResultsPath $mockResultsPath | Out-Null
+        } 'already exists|refusing overwrite' `
+            'artifact index refuses a second write'
+        Assert-Throws {
+            Write-Stage5FreshReplayCorpusManifest `
+                -TaskRoot $corpusTaskRoot -CorpusExportRoot $corpusExportRoot `
+                -Title 'ZeroHour' -ExecutableSha256 ('A' * 64) `
+                -Records $mockExport.records -ValidationResultsPath $mockResultsPath `
+                -ValidationReceiptPath $mockReceiptPath | Out-Null
+        } 'already exists|refusing overwrite' `
+            'final corpus manifest refuses a second write'
+        $mockManifestDocument = Get-Content -LiteralPath $mockManifest.path -Raw | ConvertFrom-Json
+        $mockReceipt = Get-Content -LiteralPath $mockReceiptPath -Raw | ConvertFrom-Json
+        $artifactIndexDocument = Get-Content -LiteralPath $mockExport.artifactIndex.path -Raw | ConvertFrom-Json
+        $artifactIndexHash = Get-Sha256 $mockExport.artifactIndex.path
+        $receiptHash = Get-Sha256 $mockReceiptPath
+        Assert-True ($mockReceipt.corpusExport.artifactIndexPath -ceq
+            $mockExport.artifactIndex.path -and
+            $mockReceipt.corpusExport.artifactIndexSha256 -ceq $artifactIndexHash -and
+            $mockManifestDocument.validationReceipt.path -ceq $mockReceiptPath -and
+            $mockManifestDocument.validationReceipt.sha256 -ceq $receiptHash -and
+            $artifactIndexDocument.kind -ceq 'stage5-native-replay-artifact-index') `
+            'final corpus manifest binds the exact final receipt, which binds the immutable artifact index'
+        $originalReceiptText = Get-Content -LiteralPath $mockReceiptPath -Raw
+        [IO.File]::WriteAllText($mockReceiptPath, '{"tampered":true}')
+        Assert-Throws {
+            Convert-Stage5FreshReplayCorpusManifestToFixtures `
+                -CorpusManifestPath $mockManifest.path `
+                -FixtureManifestPath (Join-Path $corpusExportRoot 'tampered-receipt-fixtures.json') `
+                -ProvenancePath (Join-Path $corpusExportRoot 'tampered-receipt-provenance.json') `
+                -Executable 'generalszh.exe' | Out-Null
+        } 'receipt.*SHA|binding' 'corpus conversion rejects a tampered final receipt'
+        [IO.File]::WriteAllText($mockReceiptPath, $originalReceiptText)
+        $originalIndexText = Get-Content -LiteralPath $mockExport.artifactIndex.path -Raw
+        [IO.File]::WriteAllText($mockExport.artifactIndex.path, '{"tampered":true}')
+        Assert-Throws {
+            Convert-Stage5FreshReplayCorpusManifestToFixtures `
+                -CorpusManifestPath $mockManifest.path `
+                -FixtureManifestPath (Join-Path $corpusExportRoot 'tampered-index-fixtures.json') `
+                -ProvenancePath (Join-Path $corpusExportRoot 'tampered-index-provenance.json') `
+                -Executable 'generalszh.exe' | Out-Null
+        } 'artifact index.*SHA|binding' 'corpus conversion rejects a tampered artifact index'
+        [IO.File]::WriteAllText($mockExport.artifactIndex.path, $originalIndexText)
+        $originalManifestText = Get-Content -LiteralPath $mockManifest.path -Raw
+        $tamperedManifestDocument = $mockManifestDocument
+        $tamperedManifestDocument.validationReceipt.sha256 = ('0' * 64)
+        Write-JsonDocument $mockManifest.path $tamperedManifestDocument
+        Assert-Throws {
+            Convert-Stage5FreshReplayCorpusManifestToFixtures `
+                -CorpusManifestPath $mockManifest.path `
+                -FixtureManifestPath (Join-Path $corpusExportRoot 'tampered-manifest-fixtures.json') `
+                -ProvenancePath (Join-Path $corpusExportRoot 'tampered-manifest-provenance.json') `
+                -Executable 'generalszh.exe' | Out-Null
+        } 'receipt.*SHA|binding' 'corpus conversion rejects a tampered final corpus manifest'
+        [IO.File]::WriteAllText($mockManifest.path, $originalManifestText)
+        Remove-Item -LiteralPath $corpusTaskRunRoot -Recurse -Force
+        $mockManifestDocument = Get-Content -LiteralPath $mockManifest.path -Raw | ConvertFrom-Json
+        $mockReceipt = Get-Content -LiteralPath $mockReceiptPath -Raw | ConvertFrom-Json
+        $mockExportedPath = [string]$mockManifestDocument.records[0].destinationPath
+        $mockExportedBytes = [IO.File]::ReadAllBytes($mockExportedPath)
+        $mockExportedText = [Text.Encoding]::Unicode.GetString($mockExportedBytes)
+        Assert-True ((Test-Path -LiteralPath $corpusExportRoot -PathType Container) -and
+            $mockManifestDocument.kind -ceq 'stage5-native-replay-corpus' -and
+            $mockManifestDocument.origin -ceq 'native-fresh-runtime' -and
+            $mockManifestDocument.records.Count -eq 1 -and
+            (Test-Path -LiteralPath $mockExportedPath -PathType Leaf) -and
+            [Text.Encoding]::ASCII.GetString($mockExportedBytes[0..3]) -ceq 'RPL3' -and
+            [BitConverter]::ToUInt32($mockExportedBytes, 4) -eq 2 -and
+            [BitConverter]::ToUInt32($mockExportedBytes, 8) -eq 1 -and
+            $mockExportedText -match '\[SkirmishAIEpoch=3\]' -and
+            $mockReceipt.corpusExportRequested -and
+            $mockReceipt.corpusExportRoot -ceq $corpusExportRoot -and
+            $mockReceipt.corpusExport.recordCount -eq 1 -and
+            -not $mockReceipt.finalAcceptanceEligible -and
+            -not $mockReceipt.externalAcceptanceEligible) `
+            'LocalCapacity export preserves validated RPL3 schema/epochs and survives task-run cleanup without becoming acceptance evidence'
+    }
     $unboundedTerminationFixture = $validationSource -replace `
         '\$Process\.WaitForExit\(\$PostKillWaitMilliseconds\)', '$Process.WaitForExit()'
     Assert-Throws {

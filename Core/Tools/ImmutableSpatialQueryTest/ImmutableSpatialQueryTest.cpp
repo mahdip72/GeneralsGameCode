@@ -5,6 +5,7 @@
 */
 #include "Lib/ImmutableSpatialQuery.h"
 #include "Lib/ImmutableSpatialQueryRuntime.h"
+#include "../TestSupport/LocalCapacityTestLane.h"
 
 #include <algorithm>
 #include <atomic>
@@ -786,7 +787,7 @@ void testRelocatedExecutionAndSpanValidation()
 		moved.outputCount), "gapped result span is rejected");
 }
 
-void testWorkerCountsAndMoreThanSixtyFourRanges()
+void testWorkerCountsAndMoreThanSixtyFourRanges(bool localCapacity)
 {
 	Fixture fixture;
 	const ImmutableSpatialQuery query = baseQuery(fixture);
@@ -794,8 +795,15 @@ void testWorkerCountsAndMoreThanSixtyFourRanges()
 	std::vector<ImmutableSpatialResult> baselineResults;
 	std::vector<ImmutableSpatialResultSpan> baselineSpans;
 	const ImmutableSpatialUInt32 workerCounts[] = { 1, 2, 4, 8, 16, 96 };
-	for (ImmutableSpatialUInt32 workerCount : workerCounts)
+	for (ImmutableSpatialUInt32 requestedWorkerCount : workerCounts)
 	{
+		// 96 is a deliberate synthetic >64-range traversal case, not a thread count.
+		const ImmutableSpatialUInt32 workerCount = requestedWorkerCount == 16 ?
+			static_cast<ImmutableSpatialUInt32>(rts_test::ResolveActualWorkerCount(
+				requestedWorkerCount, localCapacity)) : requestedWorkerCount;
+		rts_test::PrintWorkerCountSubstitution(
+			"Immutable spatial query", requestedWorkerCount, workerCount,
+			localCapacity);
 		DispatchContext dispatch;
 		dispatch.parallel = workerCount > 1 && workerCount <= 16;
 		dispatch.reverse = workerCount > 64;
@@ -1347,7 +1355,7 @@ void testJobSystemWrapperPhysicalTransactionalAndFaults()
 		"immutable spatial collection metrics reset at the lifecycle boundary");
 }
 
-void testJobSystemWrapperOwnerFloatingPointParityAndFallback()
+void testJobSystemWrapperOwnerFloatingPointParityAndFallback(bool localCapacity)
 {
 #if defined(_WIN64)
 	Fixture fixture;
@@ -1388,7 +1396,12 @@ void testJobSystemWrapperOwnerFloatingPointParityAndFallback()
 		workerIndex != sizeof(workerCounts) / sizeof(workerCounts[0]);
 		++workerIndex)
 	{
-		const unsigned workerCount = workerCounts[workerIndex];
+		const unsigned requestedWorkerCount = workerCounts[workerIndex];
+		const unsigned workerCount = rts_test::ResolveActualWorkerCount(
+			requestedWorkerCount, localCapacity);
+		rts_test::PrintWorkerCountSubstitution(
+			"Immutable spatial query MXCSR parity", requestedWorkerCount,
+			workerCount, localCapacity);
 		_mm_setcsr(workerMxcsr);
 		JobSystem &jobs = JobSystem::instance();
 		JobSystemConfig config;
@@ -1494,6 +1507,8 @@ void testJobSystemWrapperOwnerFloatingPointParityAndFallback()
 		jobs.shutdown();
 	}
 	_mm_setcsr(savedMxcsr);
+#else
+	(void)localCapacity;
 #endif
 }
 
@@ -1698,15 +1713,22 @@ void testDeterministicAdmissionCostInversion()
 }
 }
 
-int main()
+int main(int argc, char **argv)
 {
+	bool localCapacity = false;
+	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity))
+	{
+		std::cerr << "usage: immutable_spatial_query_tests [--local-capacity]\n";
+		return 2;
+	}
+	rts_test::PrintTestCapacityLane(localCapacity);
 	testArenaBuildRelocationAndMalformedInput();
 	testLegacyTraversalDuplicateNullSelfAndOrders();
 	testStrictDistanceBoundariesAndDistanceKinds();
 	testNearBoundaryFloatingPointDifferential();
 	testEdgeAndOutOfMapTraversal();
 	testRelocatedExecutionAndSpanValidation();
-	testWorkerCountsAndMoreThanSixtyFourRanges();
+	testWorkerCountsAndMoreThanSixtyFourRanges(localCapacity);
 	testSameCellNonHeadMovementTraversalParity();
 	testLargeCanonicalTopologyAndCheapBatchValidation();
 	testAliasingIsRejectedBeforeWork();
@@ -1714,7 +1736,7 @@ int main()
 	testFailureCancellationCapacityAndNoPublication();
 	testGenerationAndMalformedArenaFailClosed();
 	testJobSystemWrapperPhysicalTransactionalAndFaults();
-	testJobSystemWrapperOwnerFloatingPointParityAndFallback();
+	testJobSystemWrapperOwnerFloatingPointParityAndFallback(localCapacity);
 	testPersistentArenaRefreshBenchmarks();
 	testDeterministicAdmissionCostInversion();
 

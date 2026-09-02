@@ -1,13 +1,13 @@
 #include "nativew3dbufferowner.h"
+#include "nativew3dbuffercompat.h"
 #include "dx8indexbuffer.h"
-#include "dx8renderer.h"
 #include "dx8vertexbuffer.h"
-#include "dx8wrapper.h"
-#include "meshmdl.h"
-#include "WWMath/vector3.h"
+#include "Renderer/NativeW3DRenderer.h"
+#include "nativew3dline.h"
 
 #include <cstdio>
 #include <cstring>
+#include <new>
 #include <vector>
 
 namespace
@@ -22,6 +22,33 @@ int Check(bool condition, const char *message)
 		return 1;
 	}
 	return 0;
+}
+
+int RunNativeBufferPublicationContract()
+{
+	unsigned char byte = 0x5a;
+	DX8VertexBufferClass *opaqueBuffer =
+		reinterpret_cast<DX8VertexBufferClass *>(&byte);
+	const unsigned int binding = RENDER_BUFFER_VERTEX;
+	const RenderBufferUpdateMode mode = RENDER_BUFFER_UPDATE_NO_OVERWRITE;
+	int result = 0;
+
+	// NativeW3DBufferOwner::Unlock is authoritative for the upload.  This
+	// compatibility notification must validate its old call shape without
+	// allocating or dereferencing a native buffer.
+	result |= Check(!Publish_Render_Buffer_Change(nullptr, binding, &byte,
+		sizeof(byte), 0, mode, 7),
+		"native publication rejects a null buffer");
+	result |= Check(!Publish_Render_Buffer_Change(opaqueBuffer, binding,
+		nullptr, sizeof(byte), 0, mode, 7),
+		"native publication rejects null source data");
+	result |= Check(!Publish_Render_Buffer_Change(opaqueBuffer, binding,
+		&byte, 0, 0, mode, 7),
+		"native publication rejects an empty source range");
+	result |= Check(Publish_Render_Buffer_Change(opaqueBuffer, binding,
+		&byte, sizeof(byte), 3, mode, 7),
+		"native publication accepts a valid compatibility notification");
+	return result;
 }
 
 class FakeRenderDevice;
@@ -286,47 +313,6 @@ private:
 	std::vector<Buffer> m_buffers;
 };
 
-class InspectableRigidContainer : public DX8RigidFVFCategoryContainer
-{
-public:
-	InspectableRigidContainer() :
-		DX8RigidFVFCategoryContainer(D3DFVF_XYZ, false) {}
-
-	int UsedVertices() const { return used_vertices; }
-	int UsedIndices() const { return used_indices; }
-	int CategoryCount(unsigned int pass)
-		{ return texture_category_list[pass].Count(); }
-	int RendererCount(unsigned int pass)
-	{
-		DX8TextureCategoryClass *category=
-			texture_category_list[pass].Peek_Head();
-		return category == nullptr ? 0 :
-			category->Get_Polygon_Renderer_List().Count();
-	}
-	bool HasVertexBuffer() const { return vertex_buffer != nullptr; }
-	bool HasIndexBuffer() const { return index_buffer != nullptr; }
-};
-
-void ConfigureTriangleMesh(MeshModelClass *mesh)
-{
-	mesh->Reset(1, 3, 1);
-	Vector3 *vertices=mesh->Get_Vertex_Array();
-	vertices[0]=Vector3(0.0f, 0.0f, 0.0f);
-	vertices[1]=Vector3(1.0f, 0.0f, 0.0f);
-	vertices[2]=Vector3(0.0f, 1.0f, 0.0f);
-	TriIndex *triangles=const_cast<TriIndex *>(mesh->Get_Polygon_Array());
-	(*triangles)[0]=0;
-	(*triangles)[1]=1;
-	(*triangles)[2]=2;
-	mesh->Set_Single_Shader(ShaderClass());
-}
-
-bool HasNoPublishedMesh(InspectableRigidContainer *container)
-{
-	return container->UsedVertices() == 0 && container->UsedIndices() == 0 &&
-		container->CategoryCount(0) == 0 && container->RendererCount(0) == 0;
-}
-
 RenderResult FakeRenderContext::updateBuffer(GpuHandle buffer,
 	const void *data, size_t byteCount, size_t destinationOffset,
 	RenderBufferUpdateMode mode)
@@ -338,12 +324,123 @@ void Fill(void *data, size_t byteCount, unsigned char value)
 {
 	std::memset(data, value, byteCount);
 }
+
+int RunNativeLine3DDestroyFailureContract()
+{
+	using namespace rts::render;
+	FakeRenderDevice device;
+	NativeW3DResourceHost host(8);
+	NativeW3DResources resources(8);
+	NativeW3DRenderer renderer;
+	int result = Check(host.Attach(&device, device.immediateContext()) ==
+		RENDER_RESULT_OK && resources.BindHost(&host) == RENDER_RESULT_OK,
+		"Line3D failure fixture binds its owner resource table");
+	NativeLine3DRenderContext context(&renderer, &resources);
+	NativeLine3DBufferSet *buffers =
+		new (std::nothrow) NativeLine3DBufferSet;
+	result |= Check(buffers != 0,
+		"Line3D failure fixture allocates its buffer sidecar");
+	if (buffers == 0)
+	{
+		result |= Check(resources.Shutdown() == RENDER_RESULT_OK &&
+			host.Detach() == RENDER_RESULT_OK,
+			"Line3D failure fixture unwinds after sidecar allocation failure");
+		return result;
+	}
+	buffers->lineOwned = true;
+	unsigned char vertexBytes[sizeof(NativeLine3DVertex) *
+		NATIVE_LINE3D_VERTEX_COUNT] = {};
+	unsigned char indexBytes[sizeof(unsigned short) *
+		NATIVE_LINE3D_INDEX_COUNT] = {};
+	BufferDescriptor vertexDescriptor;
+	vertexDescriptor.byteCount = sizeof(vertexBytes);
+	vertexDescriptor.stride = sizeof(NativeLine3DVertex);
+	vertexDescriptor.binding = RENDER_BUFFER_VERTEX;
+	vertexDescriptor.usage = RENDER_USAGE_DEFAULT;
+	BufferDescriptor indexDescriptor;
+	indexDescriptor.byteCount = sizeof(indexBytes);
+	indexDescriptor.stride = sizeof(unsigned short);
+	indexDescriptor.binding = RENDER_BUFFER_INDEX;
+	indexDescriptor.usage = RENDER_USAGE_DEFAULT;
+	const RenderResult createResult = resources.CreateBuffer(vertexDescriptor,
+		vertexBytes, sizeof(vertexBytes), &buffers->vertexBuffer);
+	const RenderResult indexResult = createResult == RENDER_RESULT_OK ?
+		resources.CreateBuffer(indexDescriptor, indexBytes, sizeof(indexBytes),
+			&buffers->indexBuffer) : RENDER_RESULT_FAILED;
+	result |= Check(createResult == RENDER_RESULT_OK &&
+		indexResult == RENDER_RESULT_OK,
+		"Line3D failure fixture creates both native buffer handles");
+	if (createResult != RENDER_RESULT_OK || indexResult != RENDER_RESULT_OK)
+	{
+		device.FailDestroy(false);
+		if (buffers->vertexBuffer.isValid())
+		{
+			(void)resources.Destroy(buffers->vertexBuffer);
+		}
+		if (buffers->indexBuffer.isValid())
+		{
+			(void)resources.Destroy(buffers->indexBuffer);
+		}
+		delete buffers;
+		result |= Check(resources.Shutdown() == RENDER_RESULT_OK &&
+			host.Detach() == RENDER_RESULT_OK && device.LiveCount() == 0,
+			"Line3D failure fixture unwinds partial buffer creation");
+		return result;
+	}
+	const GpuHandle vertexHandle = buffers->vertexBuffer;
+	const GpuHandle indexHandle = buffers->indexBuffer;
+	NativeLine3DGeometry geometry = {};
+	LegacyLogicalState state;
+	result |= Check(context.SubmitLine3D(geometry, state, buffers) ==
+		RENDER_RESULT_INVALID_ARGUMENT && context.PendingLine3DCount() == 1,
+		"Line3D failure fixture registers its sidecar before draw rejection");
+	if (context.PendingLine3DCount() == 1)
+	{
+		device.FailDestroy(true);
+		context.DrainLine3D();
+		result |= Check(context.PendingLine3DCount() == 1 &&
+			buffers->vertexBuffer == vertexHandle &&
+			buffers->indexBuffer == indexHandle &&
+			resources.IsValid(vertexHandle) && resources.IsValid(indexHandle) &&
+			device.LiveCount() == 2,
+			"failed Line3D destruction retains exact handles for owner retry");
+		device.FailDestroy(false);
+		context.DrainLine3D();
+		result |= Check(context.PendingLine3DCount() == 0 &&
+			!resources.IsValid(vertexHandle) && !resources.IsValid(indexHandle) &&
+			device.LiveCount() == 0,
+			"Line3D owner retry drains retained handles after backend recovery");
+		// The successful owner drain deletes line-owned sidecars once both handles
+		// have been released.
+		buffers = 0;
+	}
+	else
+	{
+		device.FailDestroy(false);
+		if (buffers->vertexBuffer.isValid())
+		{
+			(void)resources.Destroy(buffers->vertexBuffer);
+		}
+		if (buffers->indexBuffer.isValid())
+		{
+			(void)resources.Destroy(buffers->indexBuffer);
+		}
+		delete buffers;
+		buffers = 0;
+	}
+	result |= Check(resources.Shutdown() == RENDER_RESULT_OK &&
+		host.Detach() == RENDER_RESULT_OK && device.LiveCount() == 0,
+		"Line3D failure fixture shuts down after retry completion");
+	return result;
+}
+
 }
 
 int main()
 {
 	using namespace rts::render;
 	int result = 0;
+	result |= RunNativeBufferPublicationContract();
 
 	BufferDescriptor staticDescriptor;
 	staticDescriptor.byteCount = 16;
@@ -354,20 +451,14 @@ int main()
 	result |= Check(unbound.Create(staticDescriptor) ==
 		RENDER_RESULT_INVALID_ARGUMENT,
 		"an unbound native buffer owner fails closed");
-	unsigned short legacyIndices[3] = { 0, 1, 2 };
-	Vector3 legacyVertices[3] = {
-		Vector3(0.0f, 0.0f, 0.0f),
-		Vector3(1.0f, 0.0f, 0.0f),
-		Vector3(0.0f, 1.0f, 0.0f)
-	};
 	DX8IndexBufferClass *unboundIndex = NEW_REF(DX8IndexBufferClass,(3));
 	DX8VertexBufferClass *unboundVertex = NEW_REF(DX8VertexBufferClass,(
 		DX8_FVF_XYZ, 3));
 	result |= Check(unboundIndex != nullptr && unboundVertex != nullptr &&
 		!unboundIndex->Is_Valid() && !unboundVertex->Is_Valid() &&
-		!unboundIndex->Copy(legacyIndices, 0, 3) &&
-		!unboundVertex->Copy(legacyVertices, 0, 3),
-		"legacy buffer construction and Copy expose an unbound resource table");
+		!unboundIndex->Lock_Buffer(0, 0, 0, nullptr) &&
+		!unboundVertex->Lock_Buffer(0, 0, 0, nullptr),
+		"native compatibility-shaped buffers fail closed without a resource table");
 	{
 		IndexBufferClass::WriteLockClass indexLock(unboundIndex);
 		VertexBufferClass::WriteLockClass vertexLock(unboundVertex);
@@ -411,9 +502,9 @@ int main()
 		DX8_FVF_XYZ, 3));
 	result |= Check(failedIndex != nullptr && failedVertex != nullptr &&
 		!failedIndex->Is_Valid() && !failedVertex->Is_Valid() &&
-		!failedIndex->Copy(legacyIndices, 0, 3) &&
-		!failedVertex->Copy(legacyVertices, 0, 3),
-		"device allocation failure leaves observable invalid legacy buffers");
+		!failedIndex->Lock_Buffer(0, 0, 0, nullptr) &&
+		!failedVertex->Lock_Buffer(0, 0, 0, nullptr),
+		"device allocation failure leaves native buffers unavailable");
 	failedIndex->Release_Ref();
 	failedVertex->Release_Ref();
 	{
@@ -421,11 +512,8 @@ int main()
 		DynamicVBAccessClass failedDynamicVertex(BUFFER_TYPE_DYNAMIC_DX8,
 			dynamic_fvf_type, 3);
 		result |= Check(!failedDynamicIndex.Is_Valid() &&
-			!failedDynamicVertex.Is_Valid() &&
-			!DX8Wrapper::Set_Index_Buffer(failedDynamicIndex, 0) &&
-			!DX8Wrapper::Set_Vertex_Buffer(failedDynamicVertex),
-			"failed dynamic creation is rejected by both binding boundaries");
-		DX8Wrapper::Draw_Triangles(0, 1, 0, 3);
+			!failedDynamicVertex.Is_Valid(),
+			"failed dynamic creation is rejected by both native buffer boundaries");
 		result |= Check(device.DrawCount() == 0,
 			"a failed-create dynamic draw stops before backend submission");
 	}
@@ -456,11 +544,8 @@ int main()
 		const bool indexPublished = indexLock.Commit();
 		const bool vertexPublished = vertexLock.Commit();
 		result |= Check(!indexPublished && !vertexPublished &&
-			!failedUpdateIndex.Is_Valid() && !failedUpdateVertex.Is_Valid() &&
-			!DX8Wrapper::Set_Index_Buffer(failedUpdateIndex, 0) &&
-			!DX8Wrapper::Set_Vertex_Buffer(failedUpdateVertex),
-			"failed dynamic publication invalidates and rejects both bindings");
-		DX8Wrapper::Draw_Triangles(0, 1, 0, 3);
+			!failedUpdateIndex.Is_Valid() && !failedUpdateVertex.Is_Valid(),
+			"failed dynamic publication invalidates both native buffers");
 		result |= Check(device.DrawCount() == 0,
 			"a failed-publication dynamic draw stops before backend submission");
 		device.FailUpdate(false);
@@ -487,106 +572,36 @@ int main()
 	}
 	DynamicIBAccessClass::_Deinit();
 	DynamicVBAccessClass::_Deinit();
-	DX8IndexBufferClass *legacyIndex = NEW_REF(DX8IndexBufferClass,(3));
-	DX8VertexBufferClass *legacyVertex = NEW_REF(DX8VertexBufferClass,(
+	DX8IndexBufferClass *nativeIndex = NEW_REF(DX8IndexBufferClass,(3));
+	DX8VertexBufferClass *nativeVertex = NEW_REF(DX8VertexBufferClass,(
 		DX8_FVF_XYZ, 3));
-	result |= Check(legacyIndex != nullptr && legacyVertex != nullptr &&
-		legacyIndex->Is_Valid() && legacyVertex->Is_Valid() &&
-		legacyIndex->Copy(legacyIndices, 0, 3) &&
-		legacyVertex->Copy(legacyVertices, 0, 3),
-		"successful legacy construction and Copy publish exact native buffers");
-	unsigned char *lockedIndexBytes = nullptr;
-	unsigned char *lockedVertexBytes = nullptr;
-	result |= Check(legacyIndex->Lock(0,
-		static_cast<UINT>(sizeof(legacyIndices)), &lockedIndexBytes, 0) ==
-		D3D_OK && lockedIndexBytes != nullptr &&
-		legacyVertex->Lock(0,
-			static_cast<UINT>(sizeof(legacyVertices)), &lockedVertexBytes, 0) ==
-			D3D_OK && lockedVertexBytes != nullptr,
-		"compatibility-shaped locks expose typed native owner storage");
-	result |= Check(legacyIndex->Unlock() == D3D_OK &&
-		legacyVertex->Unlock() == D3D_OK,
-		"compatibility-shaped unlocks publish through the native owner");
-	legacyIndex->Release_Ref();
-	legacyVertex->Release_Ref();
-	result |= Check(device.LiveCount() == 0,
-		"legacy buffer fixture releases every successful native allocation");
-
-	MeshModelClass rigidMesh;
-	ConfigureTriangleMesh(&rigidMesh);
-	const unsigned int rigidDrawBaseline=device.DrawCount();
+	result |= Check(nativeIndex != nullptr && nativeVertex != nullptr &&
+		nativeIndex->Is_Valid() && nativeVertex->Is_Valid(),
+		"successful native buffer construction publishes valid owners");
+	unsigned char indexBytes[3 * sizeof(unsigned short)] = {};
+	unsigned char vertexBytes[3 * 3 * sizeof(float)] = {};
+	void *lockedIndexBytes = nullptr;
+	void *lockedVertexBytes = nullptr;
+	result |= Check(nativeIndex->Lock_Buffer(0, sizeof(indexBytes), 0,
+		&lockedIndexBytes) && lockedIndexBytes != nullptr &&
+		nativeVertex->Lock_Buffer(0, sizeof(vertexBytes), 0,
+		&lockedVertexBytes) && lockedVertexBytes != nullptr,
+		"native compatibility-shaped locks expose owner storage");
+	if (lockedIndexBytes != nullptr)
 	{
-		InspectableRigidContainer container;
-		device.FailCreate(true);
-		container.Add_Mesh(&rigidMesh);
-		device.FailCreate(false);
-		container.Render();
-		result |= Check(HasNoPublishedMesh(&container) &&
-			!container.HasVertexBuffer() && !container.HasIndexBuffer() &&
-			device.DrawCount() == rigidDrawBaseline,
-			"rigid VB creation failure publishes no geometry metadata or draw");
+		std::memcpy(lockedIndexBytes, indexBytes, sizeof(indexBytes));
 	}
-	result |= Check(device.LiveCount() == 0,
-		"rigid VB creation failure leaves no native allocation");
+	if (lockedVertexBytes != nullptr)
 	{
-		InspectableRigidContainer container;
-		device.FailUpdateOnAttempt(device.UpdateAttemptCount() + 1);
-		container.Add_Mesh(&rigidMesh);
-		device.FailUpdateOnAttempt(0);
-		container.Render();
-		result |= Check(HasNoPublishedMesh(&container) &&
-			!container.HasVertexBuffer() && !container.HasIndexBuffer() &&
-			device.DrawCount() == rigidDrawBaseline,
-			"rigid VB commit failure resets its candidate before publication");
+		std::memcpy(lockedVertexBytes, vertexBytes, sizeof(vertexBytes));
 	}
+	result |= Check(nativeIndex->Unlock_Buffer() &&
+		nativeVertex->Unlock_Buffer(),
+		"native compatibility-shaped unlocks publish through the owner");
+	nativeIndex->Release_Ref();
+	nativeVertex->Release_Ref();
 	result |= Check(device.LiveCount() == 0,
-		"rigid VB commit failure releases its failed candidate");
-	{
-		InspectableRigidContainer container;
-		device.FailCreateOnAttempt(device.CreateAttemptCount() + 2);
-		container.Add_Mesh(&rigidMesh);
-		device.FailCreateOnAttempt(0);
-		container.Render();
-		result |= Check(HasNoPublishedMesh(&container) &&
-			container.HasVertexBuffer() && !container.HasIndexBuffer() &&
-			device.DrawCount() == rigidDrawBaseline,
-			"rigid IB creation failure publishes no category, renderer, or draw");
-		container.Add_Mesh(&rigidMesh);
-		result |= Check(container.UsedVertices() == 3 &&
-			container.UsedIndices() == 3 && container.CategoryCount(0) == 1 &&
-			container.RendererCount(0) == 1,
-			"rigid IB construction retries without publishing the failed attempt");
-	}
-	result |= Check(device.LiveCount() == 0,
-		"rigid IB creation failure retains no allocation after container release");
-	{
-		InspectableRigidContainer container;
-		device.FailUpdateOnAttempt(device.UpdateAttemptCount() + 2);
-		container.Add_Mesh(&rigidMesh);
-		device.FailUpdateOnAttempt(0);
-		container.Render();
-		result |= Check(HasNoPublishedMesh(&container) &&
-			container.HasVertexBuffer() && container.HasIndexBuffer() &&
-			device.DrawCount() == rigidDrawBaseline,
-			"rigid IB commit failure publishes no category, renderer, or draw");
-		container.Add_Mesh(&rigidMesh);
-		container.Render();
-		result |= Check(HasNoPublishedMesh(&container) &&
-			device.DrawCount() == rigidDrawBaseline,
-			"a failed static IB is rejected before a later lock or publication");
-	}
-	result |= Check(device.LiveCount() == 0,
-		"rigid IB failure fixture releases every native allocation");
-	{
-		InspectableRigidContainer container;
-		container.Add_Mesh(&rigidMesh);
-		result |= Check(container.UsedVertices() == 3 &&
-			container.UsedIndices() == 3 && container.CategoryCount(0) == 1 &&
-			container.RendererCount(0) == 1,
-			"successful rigid publication advances metadata only after both commits");
-	}
-	result |= Check(device.LiveCount() == 0,
-		"successful rigid fixture releases its static VB and IB");
+		"native buffer fixture releases every successful native allocation");
 
 	NativeW3DBufferOwner staticBuffer;
 	result |= Check(staticBuffer.Create(staticDescriptor) == RENDER_RESULT_OK,
@@ -763,9 +778,8 @@ int main()
 		"successful recovery publishes a replacement before retiring the stale generation");
 
 	// A replacement allocation is already live when destruction of the old
-	// handle refuses the transaction.  Keep it owner-reachable until a later
-	// DISCARD can retire it; otherwise the failed recovery strands a registry
-	// slot and every subsequent retry consumes another allocation.
+	// handle refuses the transaction.  Retire only the exact old registry slot;
+	// keep its native allocation for Shutdown while publishing the replacement.
 	NativeW3DBufferOwner deferredDestroyBuffer;
 	result |= Check(deferredDestroyBuffer.Create(dynamicDescriptor) ==
 		RENDER_RESULT_OK, "discard cleanup fixture creates its owner");
@@ -778,8 +792,11 @@ int main()
 	{
 		Fill(deferredBytes, 4, 0x19);
 	}
-	result |= Check(deferredDestroyBuffer.Unlock() == RENDER_RESULT_OK,
-		"discard cleanup fixture publishes its initial mutation");
+	GpuHandle deferredOldHandle;
+	result |= Check(deferredDestroyBuffer.Unlock() == RENDER_RESULT_OK &&
+		deferredDestroyBuffer.AcquireIndexRange(RENDER_FORMAT_R16_UINT, 0, 2, 2,
+			&deferredOldHandle) == RENDER_RESULT_OK,
+		"discard cleanup fixture publishes its initial mutation and binding");
 	device.FailUpdate(true);
 	result |= Check(deferredDestroyBuffer.Lock(4, 4,
 		RENDER_BUFFER_UPDATE_NO_OVERWRITE, &deferredBytes) ==
@@ -800,29 +817,31 @@ int main()
 	deferredBytes = nullptr;
 	result |= Check(deferredDestroyBuffer.Lock(0, 16,
 		RENDER_BUFFER_UPDATE_DISCARD, &deferredBytes) ==
-		RENDER_RESULT_FAILED && deferredBytes == nullptr &&
-		device.LiveCount() == deferredLiveBeforeRecovery + 1 &&
-		device.CreateCount() == deferredCreatesBeforeRecovery + 1,
-		"old-handle destruction failure retains the replacement allocation");
-	device.FailDestroy(false);
-	deferredBytes = nullptr;
-	result |= Check(deferredDestroyBuffer.Lock(0, 16,
-		RENDER_BUFFER_UPDATE_DISCARD, &deferredBytes) ==
 		RENDER_RESULT_OK && deferredBytes != nullptr &&
-		device.LiveCount() == deferredLiveBeforeRecovery,
-		"discard retry retires the deferred replacement before recreating");
+		device.LiveCount() == deferredLiveBeforeRecovery + 1 &&
+		device.CreateCount() == deferredCreatesBeforeRecovery + 1 &&
+		!resources.IsValid(deferredOldHandle),
+		"old-handle destruction failure retires only the old slot");
 	if (deferredBytes != nullptr)
 	{
 		Fill(deferredBytes, 16, 0x39);
 	}
+	GpuHandle deferredReplacementHandle;
 	result |= Check(deferredDestroyBuffer.Unlock() == RENDER_RESULT_OK &&
 		!deferredDestroyBuffer.HasFailedMutation() &&
-		device.CreateCount() == deferredCreatesBeforeRecovery + 2 &&
-		device.DestroyCount() == deferredDestroysBeforeRecovery + 2,
-		"successful discard retry leaves one current allocation and no orphan");
+		device.CreateCount() == deferredCreatesBeforeRecovery + 1 &&
+		device.DestroyCount() == deferredDestroysBeforeRecovery &&
+		deferredDestroyBuffer.AcquireIndexRange(RENDER_FORMAT_R16_UINT, 0, 0, 8,
+			&deferredReplacementHandle) == RENDER_RESULT_OK &&
+		deferredReplacementHandle != deferredOldHandle,
+		"replacement publication leaves the retired allocation hidden");
+	device.FailDestroy(false);
 	result |= Check(deferredDestroyBuffer.Reset() == RENDER_RESULT_OK &&
-		device.LiveCount() == deferredLiveBeforeRecovery - 1,
-		"discard cleanup fixture releases its sole current allocation");
+		device.LiveCount() == deferredLiveBeforeRecovery &&
+		device.DestroyCount() == deferredDestroysBeforeRecovery + 1 &&
+		!resources.IsValid(deferredOldHandle) &&
+		!resources.IsValid(deferredReplacementHandle),
+		"discard cleanup fixture releases the replacement and retains the old slot for shutdown");
 
 	rejectedHandle = GpuHandle(1, 1);
 	result |= Check(device.recoverDevice() == RENDER_RESULT_OK &&
@@ -859,6 +878,7 @@ int main()
 		!resources.IsValid(staticHandle) &&
 		!resources.IsValid(recoveredHandle),
 		"owner reset invalidates every exported handle generation");
+	const unsigned int retainedRetiredLiveCount = device.LiveCount();
 
 	const unsigned int pointGroupTriIndices = 3U * (2048U / 3U);
 	const unsigned int pointGroupQuadIndices = 6U * (2048U / 4U);
@@ -890,10 +910,11 @@ int main()
 			pointGroupTriIndices, &pointGroupTrisHandle) == RENDER_RESULT_OK &&
 		pointGroupQuads.AcquireIndexRange(RENDER_FORMAT_R16_UINT, 0, 0,
 			pointGroupQuadIndices, &pointGroupQuadsHandle) == RENDER_RESULT_OK &&
-		device.LiveCount() == 2,
+		device.LiveCount() == retainedRetiredLiveCount + 2,
 		"PointGroup-shaped startup exposes both exact initialized draw ranges");
 	result |= Check(pointGroupQuads.Reset() == RENDER_RESULT_OK &&
-		pointGroupTris.Reset() == RENDER_RESULT_OK && device.LiveCount() == 0,
+		pointGroupTris.Reset() == RENDER_RESULT_OK &&
+		device.LiveCount() == retainedRetiredLiveCount,
 		"PointGroup-shaped owner deinitialization releases both live handles");
 
 	NativeW3DBufferOwner partialPointGroupTris;
@@ -905,10 +926,12 @@ int main()
 		RENDER_RESULT_FAILED && partialPointGroupQuads.HasFailedMutation(),
 		"injected second PointGroup owner creation fails closed");
 	device.FailCreate(false);
-	result |= Check(partialPointGroupQuads.Reset() == RENDER_RESULT_OK &&
-		partialPointGroupTris.Reset() == RENDER_RESULT_OK &&
-		device.LiveCount() == 0,
-		"partial PointGroup startup unwind leaves no live native handles");
+	result |= Check(partialPointGroupQuads.Reset() == RENDER_RESULT_OK,
+		"partial PointGroup startup resets the failed second owner");
+	result |= Check(partialPointGroupTris.Reset() == RENDER_RESULT_OK,
+		"partial PointGroup startup resets the first owner");
+	result |= Check(device.LiveCount() == retainedRetiredLiveCount,
+		"partial PointGroup startup unwind leaves only the retired recovery handle");
 
 	NativeW3DBufferOwner staleBindingBuffer;
 	result |= Check(staleBindingBuffer.Create(staticDescriptor) ==
@@ -929,7 +952,7 @@ int main()
 		staleBindingBuffer.AcquireVertexRange(4, 0, 0, 4,
 			&rejectedHandle) == RENDER_RESULT_FAILED &&
 		!rejectedHandle.isValid() && staleBindingBuffer.Reset() == RENDER_RESULT_OK &&
-		resources.IsValid(staleBindingHandle) &&
+		!resources.IsValid(staleBindingHandle) &&
 		UnbindNativeW3DBufferResources(&resources) == RENDER_RESULT_OK,
 		"only the borrowed registry can unbind the native buffer boundary");
 	NativeW3DBufferOwner afterUnbind;
@@ -939,6 +962,7 @@ int main()
 	result |= Check(resources.Shutdown() == RENDER_RESULT_OK &&
 		host.Detach() == RENDER_RESULT_OK && device.LiveCount() == 0,
 		"registry shutdown leaves no native buffer resource alive");
+	result |= RunNativeLine3DDestroyFailureContract();
 
 	return result;
 }

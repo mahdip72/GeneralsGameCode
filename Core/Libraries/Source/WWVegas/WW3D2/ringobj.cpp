@@ -88,15 +88,26 @@
 #include "camera.h"
 #include "statistics.h"
 #include "predlod.h"
-#include "dx8wrapper.h"
 #include "dx8indexbuffer.h"
 #include "dx8vertexbuffer.h"
-#include "sortingrenderer.h"
+#include "Renderer/RenderGameClient.h"
+#include "Renderer/LegacyColorPacking.h"
 #include "WWMath/Vector3i.h"
 #include "visrasterizer.h"
 
 
 static bool Ring_Array_Valid = false;
+
+static rts::render::GameBoundingSphere ToGameBoundingSphere(
+	const SphereClass &sphere)
+{
+	rts::render::GameBoundingSphere result;
+	result.centerX = sphere.Center.X;
+	result.centerY = sphere.Center.Y;
+	result.centerZ = sphere.Center.Z;
+	result.radius = sphere.Radius;
+	return result;
+}
 
 
 /**
@@ -531,13 +542,15 @@ void RingRenderObjClass::render_ring(RenderInfoClass & rinfo,const Vector3 & cen
 	} else {
 		RingShader.Set_Texturing (ShaderClass::TEXTURING_DISABLE);
 	}
-	DX8Wrapper::Set_Shader(RingShader);
-	DX8Wrapper::Set_Texture(0,RingTexture);
-	DX8Wrapper::Set_Material(RingMaterial);
+	rts::render::SetGameShader(RingShader);
+	rts::render::SetGameTexture(0, RingTexture);
+	rts::render::SetGameMaterial(RingMaterial);
 
 	// Enable sorting if the primitive is translucent, alpha testing is not enabled, and sorting is enabled globally.
 	const bool sort = (RingShader.Get_Dst_Blend_Func() != ShaderClass::DSTBLEND_ZERO) && (RingShader.Get_Alpha_Test() == ShaderClass::ALPHATEST_DISABLE) && (WW3D::Is_Sorting_Enabled());
-	const unsigned int buffer_type = sort ? BUFFER_TYPE_DYNAMIC_SORTING : BUFFER_TYPE_DYNAMIC_DX8;
+	const rts::render::GameBufferType buffer_type = sort ?
+		rts::render::GAME_BUFFER_TYPE_DYNAMIC_SORTED :
+		rts::render::GAME_BUFFER_TYPE_DYNAMIC_IMMEDIATE;
 
 	DynamicVBAccessClass vb(buffer_type, dynamic_fvf_type, ring.Vertex_ct);
 	if (!vb.Is_Valid()) {
@@ -555,9 +568,11 @@ void RingRenderObjClass::render_ring(RenderInfoClass & rinfo,const Vector3 & cen
 		//
 		unsigned color;
 		if (RingShader.Get_Dst_Blend_Func () == ShaderClass::DSTBLEND_ONE) {
-			color = DX8Wrapper::Convert_Color(Alpha * Color,1.0f);
+			color = rts::render::PackLegacyARGB(Alpha * Color.X,
+				Alpha * Color.Y, Alpha * Color.Z, 1.0f);
 		} else {
-			color = DX8Wrapper::Convert_Color(Color,Alpha);
+			color = rts::render::PackLegacyARGB(Color.X, Color.Y, Color.Z,
+				Alpha);
 		}
 
 		for (int i=0; i<ring.Vertex_ct; i++)
@@ -604,15 +619,17 @@ void RingRenderObjClass::render_ring(RenderInfoClass & rinfo,const Vector3 & cen
 		}
 	}
 
-	if (!DX8Wrapper::Set_Vertex_Buffer(vb) ||
-		!DX8Wrapper::Set_Index_Buffer(ib,0)) {
+	if (!rts::render::SetGameVertexBuffer(vb) ||
+		!rts::render::SetGameIndexBuffer(ib, 0)) {
 		return;
 	}
 
 	if (sort) {
-		SortingRendererClass::Insert_Triangles(Get_Bounding_Sphere(), 0, ring.face_ct, 0, ring.Vertex_ct);
+		rts::render::DrawGameSortedTriangles(
+			ToGameBoundingSphere(Get_Bounding_Sphere()), 0, ring.face_ct, 0,
+			ring.Vertex_ct);
 	} else {
-		DX8Wrapper::Draw_Triangles(0, ring.face_ct, 0, ring.Vertex_ct);
+		rts::render::DrawGameTriangles(0, ring.face_ct, 0, ring.Vertex_ct);
 	}
 
 }
@@ -742,13 +759,15 @@ void RingRenderObjClass::Render(RenderInfoClass & rinfo)
 
 			Matrix3D temp;
 			temp.Look_At(obj_position, obj_position + camera_z_vector, 0.0f);
-			DX8Wrapper::Set_Transform(D3DTS_WORLD, temp);
+			rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_WORLD,
+				temp);
 		} else {
-			DX8Wrapper::Set_Transform(D3DTS_WORLD, Transform);
+			rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_WORLD,
+				Transform);
 		}
 
 		//
-		//	Pass the geometry on to DX8
+		//	Pass the geometry on to the active renderer.
 		//
 		render_ring (rinfo, ObjSpaceCenter, ObjSpaceExtent);
 	}

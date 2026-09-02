@@ -43,6 +43,7 @@
 #include "Lib/JobSystem.h"
 #include "Lib/PipelineExecutionPolicy.h"
 #include "Lib/SimulationExecutionPolicy.h"
+#include "Renderer/RenderGameClient.h"
 #include "Renderer/RendererDevice.h"
 #include "WWLib/trim.h"
 
@@ -53,7 +54,6 @@
 
 
 Bool TheDebugIgnoreSyncErrors = FALSE;
-extern Int DX8Wrapper_PreserveFPU;
 
 #ifdef DEBUG_CRC
 Int TheCRCFirstFrameToLog = -1;
@@ -193,7 +193,7 @@ Int parseFPUPreserve(char *args[], int argc)
 {
 	if (argc > 1)
 	{
-		DX8Wrapper_PreserveFPU = atoi(args[1]);
+		rts::render::GameRenderer_PreserveFPU = atoi(args[1]);
 	}
 	return 2;
 }
@@ -460,11 +460,10 @@ Int parseHeadless(char *args[], int num)
 	TheWritableGlobalData->m_playIntro = FALSE;
 	TheWritableGlobalData->m_playSizzle = FALSE;
 
-	// TheSuperHackers @fix bobtista 03/02/2026 Set DX8Wrapper_IsWindowed to false in headless
-	// mode so that ignoringAsserts() works correctly throughout the entire process lifetime,
-	// including during shutdown after TheGlobalData has been destroyed.
-	extern bool DX8Wrapper_IsWindowed;
-	DX8Wrapper_IsWindowed = false;
+	// TheSuperHackers @fix bobtista 03/02/2026 Set the renderer window mode to
+	// false in headless mode so that ignoringAsserts() works correctly throughout
+	// the entire process lifetime, including shutdown after TheGlobalData is gone.
+	rts::render::GameRenderer_IsWindowed = false;
 
 	return 1;
 }

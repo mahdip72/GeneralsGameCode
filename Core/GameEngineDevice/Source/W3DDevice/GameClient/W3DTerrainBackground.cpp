@@ -54,8 +54,13 @@
 #include "GameClient/View.h"
 #include "W3DDevice/GameClient/TerrainTex.h"
 #include "W3DDevice/GameClient/HeightMap.h"
-#include "WW3D2/dx8wrapper.h"
-#include "WW3D2/dx8renderer.h"
+#include "Renderer/RenderGameClient.h"
+
+// Keep the source-level contract explicit without importing the renderer namespace.
+using rts::render::GAME_BUFFER_TYPE_DYNAMIC_IMMEDIATE;
+using rts::render::GAME_VERTEX_XYZDUV1;
+using rts::render::GAME_VERTEX_XYZDUV2;
+
 #include "WW3D2/camera.h"
 
 
@@ -125,7 +130,7 @@ void W3DTerrainBackground::doPartialUpdate(const IRegion2D &partialRange, WorldH
 		m_vertexTerrainSize = requiredVertexSize;
 		REF_PTR_RELEASE(m_vertexTerrain);
 		REF_PTR_RELEASE(m_indexTerrain);
-		m_vertexTerrain=NEW_REF(DX8VertexBufferClass,(DX8_FVF_XYZDUV1,m_vertexTerrainSize+4,DX8VertexBufferClass::USAGE_DEFAULT));
+		m_vertexTerrain=NEW_REF(DX8VertexBufferClass,(GAME_VERTEX_XYZDUV1,m_vertexTerrainSize+4,DX8VertexBufferClass::USAGE_DEFAULT));
 	}
 
 	Int requiredIndexSize = (m_width+1) * (m_width+1) + 6;
@@ -506,7 +511,7 @@ void W3DTerrainBackground::doTesselatedUpdate(const IRegion2D &partialRange, Wor
 	if (m_vertexTerrainSize<requiredVertex || m_vertexTerrain==nullptr) {
 		m_vertexTerrainSize = requiredVertex;
 		REF_PTR_RELEASE(m_vertexTerrain);
-		m_vertexTerrain=NEW_REF(DX8VertexBufferClass,(DX8_FVF_XYZDUV2,m_vertexTerrainSize+4,DX8VertexBufferClass::USAGE_DEFAULT));
+		m_vertexTerrain=NEW_REF(DX8VertexBufferClass,(GAME_VERTEX_XYZDUV2,m_vertexTerrainSize+4,DX8VertexBufferClass::USAGE_DEFAULT));
 	}
 
 	m_curNumTerrainVertices = 0;
@@ -763,18 +768,18 @@ void W3DTerrainBackground::drawVisiblePolys(RenderInfoClass & rinfo, Bool disabl
 		return;
 	}
 	// Setup the vertex buffer, shader & texture.
-	DX8Wrapper::Set_Index_Buffer(m_indexTerrain,0);
-	DX8Wrapper::Set_Vertex_Buffer(m_vertexTerrain);
+	rts::render::SetGameIndexBuffer(m_indexTerrain,0);
+	rts::render::SetGameVertexBuffer(m_vertexTerrain);
   if (!disableTextures) {
 		if (m_terrainTexture4X) {
-			DX8Wrapper::Set_Texture(1, m_terrainTexture4X);
+			rts::render::SetGameTexture(1, m_terrainTexture4X);
 		}	else if (m_terrainTexture2X) {
-			DX8Wrapper::Set_Texture(1, m_terrainTexture2X);
+			rts::render::SetGameTexture(1, m_terrainTexture2X);
 		}	else {
-			DX8Wrapper::Set_Texture(1, m_terrainTexture);
+			rts::render::SetGameTexture(1, m_terrainTexture);
 		}
 	}
-	DX8Wrapper::Draw_Triangles(	0, m_curNumTerrainIndices/3, 0,	m_curNumTerrainVertices);
+	rts::render::DrawGameTriangles(	0, m_curNumTerrainIndices/3, 0,	m_curNumTerrainVertices);
 #else
 	if (m_curNumTerrainIndices == 0) {
 		return;
@@ -783,18 +788,18 @@ void W3DTerrainBackground::drawVisiblePolys(RenderInfoClass & rinfo, Bool disabl
 		return;
 	}
 	// Setup the vertex buffer, shader & texture.
-	DX8Wrapper::Set_Index_Buffer(m_indexTerrain,0);
-	DX8Wrapper::Set_Vertex_Buffer(m_vertexTerrain);
+	rts::render::SetGameIndexBuffer(m_indexTerrain,0);
+	rts::render::SetGameVertexBuffer(m_vertexTerrain);
   if (!disableTextures) {
 		if (m_terrainTexture4X) {
-			DX8Wrapper::Set_Texture(0, m_terrainTexture4X);
+			rts::render::SetGameTexture(0, m_terrainTexture4X);
 		}	else if (m_terrainTexture2X) {
-			DX8Wrapper::Set_Texture(0, m_terrainTexture2X);
+			rts::render::SetGameTexture(0, m_terrainTexture2X);
 		}	else {
-			DX8Wrapper::Set_Texture(0, m_terrainTexture);
+			rts::render::SetGameTexture(0, m_terrainTexture);
 		}
 	}
-	DX8Wrapper::Draw_Triangles(	0, m_curNumTerrainIndices/3, 0,	m_curNumTerrainVertices);
+	rts::render::DrawGameTriangles(	0, m_curNumTerrainIndices/3, 0,	m_curNumTerrainVertices);
 #endif
 }
 

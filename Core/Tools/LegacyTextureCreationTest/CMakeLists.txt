@@ -1,11 +1,16 @@
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
+    return()
+endif()
+
 add_executable(core_legacy_texture_creation_tests
     LegacyTextureCreationTest.cpp
     LegacyTextureCreationTestDecoderStub.cpp
-    ../../Libraries/Source/WWVegas/WW3D2/legacytexturecompat.cpp
-    ../../Libraries/Source/WWVegas/WW3D2/surfaceblit.cpp
+    ${CMAKE_SOURCE_DIR}/Core/LegacyRenderer/WWVegas/WW3D2/legacytexturecompat.cpp
+    ${CMAKE_SOURCE_DIR}/Core/LegacyRenderer/WWVegas/WW3D2/surfaceblit_legacy.cpp
 )
 
 target_include_directories(core_legacy_texture_creation_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/Core/LegacyRenderer/WWVegas
     ${CMAKE_SOURCE_DIR}/Core/Libraries/Source
     ${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas
     ${CMAKE_SOURCE_DIR}/Core/Libraries/Include

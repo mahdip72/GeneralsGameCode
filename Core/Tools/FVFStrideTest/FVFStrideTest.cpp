@@ -6,7 +6,7 @@
 namespace
 {
 const unsigned kPsizeFlag = rts::render::LEGACY_FVF_PSIZE;
-const unsigned kLastBetaD3DColorFlag = rts::render::LEGACY_FVF_LASTBETA_D3DCOLOR;
+const unsigned kLastBetaPackedColorFlag = rts::render::LEGACY_FVF_LASTBETA_PACKED_COLOR;
 
 int check(bool condition, const char *testName, const char *expression)
 {
@@ -49,14 +49,14 @@ int testPositionSizes()
 			FVFInfoClass(positions[index] | rts::render::LEGACY_FVF_LASTBETA_UBYTE4).
 				Get_FVF_Size() == sizes[index]);
 		CHECK("last beta color sizes",
-			FVFInfoClass(positions[index] | kLastBetaD3DColorFlag).
+			FVFInfoClass(positions[index] | kLastBetaPackedColorFlag).
 				Get_FVF_Size() == sizes[index]);
 		CHECK("neutral last beta sizes",
 			rts::render::LegacyFvfVertexSize(positions[index] |
 				rts::render::LEGACY_FVF_LASTBETA_UBYTE4) == sizes[index]);
 		CHECK("neutral last beta color sizes",
 			rts::render::LegacyFvfVertexSize(positions[index] |
-				kLastBetaD3DColorFlag) == sizes[index]);
+				kLastBetaPackedColorFlag) == sizes[index]);
 	}
 	return 0;
 }
@@ -98,7 +98,7 @@ int testWeightedVertexOffsets()
 		const unsigned ubyte4Fvf = fvf |
 			rts::render::LEGACY_FVF_LASTBETA_UBYTE4;
 		const unsigned colorFvf = fvf |
-			rts::render::LEGACY_FVF_LASTBETA_D3DCOLOR;
+			rts::render::LEGACY_FVF_LASTBETA_PACKED_COLOR;
 		CHECK("weighted LASTBETA_UBYTE4 stride",
 			FVFInfoClass(ubyte4Fvf).Get_FVF_Size() == positionBytes[index] + 24);
 		CHECK("weighted LASTBETA_UBYTE4 offsets",
@@ -111,13 +111,13 @@ int testWeightedVertexOffsets()
 			FVFInfoClass(ubyte4Fvf).Get_Blend_Index_Offset() ==
 				12 + index * 4);
 #endif
-		CHECK("weighted LASTBETA_D3DCOLOR stride",
+		CHECK("weighted LASTBETA packed-color stride",
 			FVFInfoClass(colorFvf).Get_FVF_Size() == positionBytes[index] + 24);
-		CHECK("weighted LASTBETA_D3DCOLOR offsets",
+		CHECK("weighted LASTBETA packed-color offsets",
 			FVFInfoClass(colorFvf).Get_Normal_Offset() == positionBytes[index] &&
 			FVFInfoClass(colorFvf).Get_Tex_Offset(0) == positionBytes[index] + 16);
 #if defined(_WIN64)
-		CHECK("weighted LASTBETA_D3DCOLOR blend offsets",
+		CHECK("weighted LASTBETA packed-color blend offsets",
 			FVFInfoClass(colorFvf).Get_Blend_Weight_Offset() ==
 				(index == 0 ? 0U : 12U) &&
 			FVFInfoClass(colorFvf).Get_Blend_Index_Offset() ==
@@ -264,7 +264,7 @@ int testInvalidFormats()
 		rts::render::LEGACY_FVF_XYZRHW | rts::render::LEGACY_FVF_LASTBETA_UBYTE4,
 		rts::render::LEGACY_FVF_XYZ | rts::render::LEGACY_FVF_LASTBETA_UBYTE4,
 		rts::render::LEGACY_FVF_XYZB5 |
-			rts::render::LEGACY_FVF_LASTBETA_UBYTE4 | kLastBetaD3DColorFlag,
+			rts::render::LEGACY_FVF_LASTBETA_UBYTE4 | kLastBetaPackedColorFlag,
 		rts::render::LEGACY_FVF_XYZ | rts::render::LEGACY_FVF_TEX1 | (1u << 18),
 		rts::render::LEGACY_FVF_XYZ | rts::render::LEGACY_FVF_TEX1 | (1u << 22),
 		rts::render::LEGACY_FVF_XYZ |
@@ -379,7 +379,7 @@ int testAllWeightedNeutralLayouts()
 		{
 			const unsigned int betaFlag = betaKind == 0 ? 0U :
 				(betaKind == 1 ? rts::render::LEGACY_FVF_LASTBETA_UBYTE4 :
-				 rts::render::LEGACY_FVF_LASTBETA_D3DCOLOR);
+				 rts::render::LEGACY_FVF_LASTBETA_PACKED_COLOR);
 			const unsigned int fvf = positions[positionIndex] | betaFlag |
 				rts::render::LEGACY_FVF_NORMAL |
 				rts::render::LEGACY_FVF_PSIZE |
@@ -444,7 +444,7 @@ int testAllWeightedNeutralLayouts()
 						12 + (fieldCount - 1) * 4 &&
 						indices->format == (betaKind == 1 ?
 							rts::render::RENDER_VERTEX_DATA_UBYTE4 :
-							rts::render::RENDER_VERTEX_DATA_D3DCOLOR));
+							rts::render::RENDER_VERTEX_DATA_PACKED_COLOR));
 			}
 			else
 			{

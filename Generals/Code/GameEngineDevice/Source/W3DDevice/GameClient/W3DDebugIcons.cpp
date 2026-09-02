@@ -51,7 +51,10 @@
 #include "Common/GlobalData.h"
 #include "GameLogic/GameLogic.h"
 #include "Common/MapObject.h"
-#include "WW3D2/dx8wrapper.h"
+#include "Renderer/RenderGameClient.h"
+#include "WW3D2/dx8vertexbuffer.h"
+#include "WW3D2/dx8indexbuffer.h"
+#include "WW3D2/shader.h"
 
 #if defined(RTS_DEBUG)
 
@@ -215,14 +218,14 @@ void W3DDebugIcons::Render(RenderInfoClass & rinfo)
 	//
 	Bool anyVanished = false;
 	if (m_numDebugIcons==0) return;
-	DX8Wrapper::Apply_Render_State_Changes();
+	rts::render::ApplyGameRenderStateChanges();
 
-	DX8Wrapper::Set_Material(m_vertexMaterialClass);
-	DX8Wrapper::Set_Texture(0, nullptr);
-	DX8Wrapper::Apply_Render_State_Changes();
+	rts::render::SetGameMaterial(m_vertexMaterialClass);
+	rts::render::SetGameTexture(0, nullptr);
+	rts::render::ApplyGameRenderStateChanges();
 
 	Matrix3D tm(Transform);
-	DX8Wrapper::Set_Transform(D3DTS_WORLD,tm);
+	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_WORLD,tm);
 
 	Int numRect = m_numDebugIcons;
 	static Real offset = 30;
@@ -233,8 +236,9 @@ void W3DDebugIcons::Render(RenderInfoClass & rinfo)
 	for (k=0; k<m_numDebugIcons;) {
 		Int curIndex = 0;
 		Int	numVertex = 0;
-		DynamicVBAccessClass vb_access(BUFFER_TYPE_DYNAMIC_DX8,DX8_FVF_XYZNDUV2,numRect*4);
-		DynamicIBAccessClass ib_access(BUFFER_TYPE_DYNAMIC_DX8,numRect*6);
+		DynamicVBAccessClass vb_access(rts::render::GAME_BUFFER_TYPE_DYNAMIC_IMMEDIATE,
+			rts::render::GAME_VERTEX_XYZNDUV2,numRect*4);
+		DynamicIBAccessClass ib_access(rts::render::GAME_BUFFER_TYPE_DYNAMIC_IMMEDIATE,numRect*6);
 		{
 		DynamicVBAccessClass::WriteLockClass lock(&vb_access);
 		VertexFormatXYZNDUV2* vb= lock.Get_Formatted_Vertex_Array();
@@ -303,10 +307,10 @@ void W3DDebugIcons::Render(RenderInfoClass & rinfo)
 		}
 		}
 		if (numVertex == 0) break;
-		DX8Wrapper::Set_Shader(ShaderClass(SC_ALPHA));
-		DX8Wrapper::Set_Index_Buffer(ib_access,0);
-		DX8Wrapper::Set_Vertex_Buffer(vb_access);
-		DX8Wrapper::Draw_Triangles(	0,curIndex/3, 0,	numVertex);	//draw a quad, 2 triangles, 4 verts
+		rts::render::SetGameShader(ShaderClass(SC_ALPHA));
+		rts::render::SetGameIndexBuffer(ib_access,0);
+		rts::render::SetGameVertexBuffer(vb_access);
+		rts::render::DrawGameTriangles(	0,curIndex/3, 0,	numVertex);	//draw a quad, 2 triangles, 4 verts
 	}
 
 	if (anyVanished) {

@@ -201,11 +201,7 @@ target_link_libraries(g_gameenginedevice PRIVATE
     stb
 )
 
-if(TARGET rts_d3d8_headers)
-    # Public W3DDevice headers expose the legacy render-packet declarations.
-    # Propagate only their compile surface; rts_d3d8_headers has no import ABI.
-    target_link_libraries(g_gameenginedevice PUBLIC rts_d3d8_headers)
-endif()
+rts_attach_title_game_engine_device(g_gameenginedevice GENERALS)
 
 target_link_libraries(g_gameenginedevice PUBLIC
     corei_gameenginedevice_public

@@ -5,6 +5,7 @@
 */
 
 #include "Lib/SimulationPhaseGraph.h"
+#include "../TestSupport/LocalCapacityTestLane.h"
 
 #include <algorithm>
 #include <array>
@@ -397,12 +398,17 @@ void executeAllClaimed(Fixture &fixture,
 		fixture.graph.executeClaimedJob(ticket, identity);
 }
 
-void testStableGraphAndWorkerCounts()
+void testStableGraphAndWorkerCounts(bool localCapacity)
 {
 	const unsigned workerCounts[] = { 1, 2, 4, 8, 16 };
 	std::vector<unsigned> baselineCommits;
-	for (unsigned workerCount : workerCounts)
+	for (unsigned requestedWorkerCount : workerCounts)
 	{
+		const unsigned workerCount = rts_test::ResolveActualWorkerCount(
+			requestedWorkerCount, localCapacity);
+		rts_test::PrintWorkerCountSubstitution(
+			"Simulation phase graph", requestedWorkerCount, workerCount,
+			localCapacity);
 		Fixture fixture;
 		expect(configureCanonicalGraph(fixture) ==
 			SIMULATION_PHASE_GRAPH_CONFIGURATION_VALID,
@@ -412,7 +418,7 @@ void testStableGraphAndWorkerCounts()
 			fixture.graph.phaseIdAt(2) == 30 &&
 			fixture.graph.phaseIdAt(3) == 40,
 			"acyclic graph uses stable phase-ID topological order");
-		expect(fixture.graph.reset(100 + workerCount),
+		expect(fixture.graph.reset(100 + requestedWorkerCount),
 			"canonical graph resets for worker-count frame");
 		expect(executeUntilTerminal(fixture, workerCount),
 			"canonical graph completes on requested physical workers");
@@ -1540,9 +1546,17 @@ void testGraphValidation()
 
 } // namespace
 
-int main()
+int main(int argc, char **argv)
 {
-	testStableGraphAndWorkerCounts();
+	bool localCapacity = false;
+	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity))
+	{
+		std::cerr << "Usage: simulation_phase_graph_tests "
+			"[--local-capacity]\n";
+		return 2;
+	}
+	rts_test::PrintTestCapacityLane(localCapacity);
+	testStableGraphAndWorkerCounts(localCapacity);
 	testDependenciesAreNonblockingTickets();
 	testCancellationFailureAndStaleFaults();
 	testWorkerFailureCancelsCooperativePeer();

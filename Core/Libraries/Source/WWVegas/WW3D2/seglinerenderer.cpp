@@ -37,16 +37,22 @@
  * Functions:                                                                                  *
  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
+#include "Utility/CppMacros.h"
 #include "seglinerenderer.h"
 #include "ww3d.h"
+#include "w3d_file.h"
 #include "rinfo.h"
-#include "dx8wrapper.h"
-#include "sortingrenderer.h"
+#include "Renderer/LegacyColorPacking.h"
+#include "Renderer/RenderGameClient.h"
+#include "WWMath/sphere.h"
 #include "WWMath/vp.h"
 #include "WWMath/Vector3i.h"
 #include "WWLib/RANDOM.h"
 #include "WWMath/v3_rnd.h"
+#include "dx8indexbuffer.h"
+#include "dx8vertexbuffer.h"
 #include "meshgeometry.h"
+#include "vertmaterial.h"
 
 
 /* We have chunking logic which handles N segments at a time. To simplify the subdivision logic,
@@ -218,11 +224,11 @@ void SegLineRendererClass::Render
 )
 {
 	Matrix4x4 view;
-	DX8Wrapper::Get_Transform(D3DTS_VIEW,view);
+	rts::render::GetGameTransform(rts::render::GAME_TRANSFORM_VIEW, &view);
 
 	Matrix4x4 identity(true);
-	DX8Wrapper::Set_Transform(D3DTS_WORLD,identity);
-	DX8Wrapper::Set_Transform(D3DTS_VIEW,identity);
+	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_WORLD, identity);
+	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW, identity);
 
 	/*
 	** Handle texture UV offset animation (done once for entire line).
@@ -942,14 +948,22 @@ void SegLineRendererClass::Render
 		vArray[vidx].x = top.X;
 		vArray[vidx].y = top.Y;
 		vArray[vidx].z = top.Z;
-		vArray[vidx].diffuse = DX8Wrapper::Convert_Color(intersection[1][TOP_EDGE].RGBA);
+		vArray[vidx].diffuse = rts::render::PackLegacyARGB(
+			intersection[1][TOP_EDGE].RGBA[0],
+			intersection[1][TOP_EDGE].RGBA[1],
+			intersection[1][TOP_EDGE].RGBA[2],
+			intersection[1][TOP_EDGE].RGBA[3]);
 		vArray[vidx].u1 = u_values[0] + uv_offset.X;
 		vArray[vidx].v1 = intersection[1][TOP_EDGE].TexV + uv_offset.Y;
 		vidx++;
 		vArray[vidx].x = bottom.X;
 		vArray[vidx].y = bottom.Y;
 		vArray[vidx].z = bottom.Z;
-		vArray[vidx].diffuse = DX8Wrapper::Convert_Color(intersection[1][BOTTOM_EDGE].RGBA);
+		vArray[vidx].diffuse = rts::render::PackLegacyARGB(
+			intersection[1][BOTTOM_EDGE].RGBA[0],
+			intersection[1][BOTTOM_EDGE].RGBA[1],
+			intersection[1][BOTTOM_EDGE].RGBA[2],
+			intersection[1][BOTTOM_EDGE].RGBA[3]);
 		vArray[vidx].u1 = u_values[1] + uv_offset.X;
 		vArray[vidx].v1 = intersection[1][BOTTOM_EDGE].TexV + uv_offset.Y;
 		vidx++;
@@ -1003,14 +1017,22 @@ void SegLineRendererClass::Render
 				vArray[vidx].x = top.X;
 				vArray[vidx].y = top.Y;
 				vArray[vidx].z = top.Z;
-				vArray[vidx].diffuse = DX8Wrapper::Convert_Color(intersection[top_int_idx][TOP_EDGE].RGBA);
+				vArray[vidx].diffuse = rts::render::PackLegacyARGB(
+					intersection[top_int_idx][TOP_EDGE].RGBA[0],
+					intersection[top_int_idx][TOP_EDGE].RGBA[1],
+					intersection[top_int_idx][TOP_EDGE].RGBA[2],
+					intersection[top_int_idx][TOP_EDGE].RGBA[3]);
 				vArray[vidx].u1 = u_values[0] + uv_offset.X;
 				vArray[vidx].v1 = intersection[top_int_idx][TOP_EDGE].TexV + uv_offset.Y;
 				vidx++;
 				vArray[vidx].x = bottom.X;
 				vArray[vidx].y = bottom.Y;
 				vArray[vidx].z = bottom.Z;
-				vArray[vidx].diffuse = DX8Wrapper::Convert_Color(intersection[bottom_int_idx][BOTTOM_EDGE].RGBA);
+				vArray[vidx].diffuse = rts::render::PackLegacyARGB(
+					intersection[bottom_int_idx][BOTTOM_EDGE].RGBA[0],
+					intersection[bottom_int_idx][BOTTOM_EDGE].RGBA[1],
+					intersection[bottom_int_idx][BOTTOM_EDGE].RGBA[2],
+					intersection[bottom_int_idx][BOTTOM_EDGE].RGBA[3]);
 				vArray[vidx].u1 = u_values[1] + uv_offset.X;
 				vArray[vidx].v1 = intersection[bottom_int_idx][BOTTOM_EDGE].TexV + uv_offset.Y;
 				vidx++;
@@ -1039,7 +1061,11 @@ void SegLineRendererClass::Render
 					vArray[vidx].x = bottom.X;
 					vArray[vidx].y = bottom.Y;
 					vArray[vidx].z = bottom.Z;
-					vArray[vidx].diffuse = DX8Wrapper::Convert_Color(intersection[bottom_int_idx][BOTTOM_EDGE].RGBA);
+					vArray[vidx].diffuse = rts::render::PackLegacyARGB(
+						intersection[bottom_int_idx][BOTTOM_EDGE].RGBA[0],
+						intersection[bottom_int_idx][BOTTOM_EDGE].RGBA[1],
+						intersection[bottom_int_idx][BOTTOM_EDGE].RGBA[2],
+						intersection[bottom_int_idx][BOTTOM_EDGE].RGBA[3]);
 					vArray[vidx].u1 = u_values[1] + uv_offset.X;
 					vArray[vidx].v1 = intersection[bottom_int_idx][BOTTOM_EDGE].TexV + uv_offset.Y;
 					vidx++;
@@ -1068,7 +1094,11 @@ void SegLineRendererClass::Render
 					vArray[vidx].x = top.X;
 					vArray[vidx].y = top.Y;
 					vArray[vidx].z = top.Z;
-					vArray[vidx].diffuse = DX8Wrapper::Convert_Color(intersection[top_int_idx][TOP_EDGE].RGBA);
+					vArray[vidx].diffuse = rts::render::PackLegacyARGB(
+						intersection[top_int_idx][TOP_EDGE].RGBA[0],
+						intersection[top_int_idx][TOP_EDGE].RGBA[1],
+						intersection[top_int_idx][TOP_EDGE].RGBA[2],
+						intersection[top_int_idx][TOP_EDGE].RGBA[3]);
 					vArray[vidx].u1 = u_values[0] + uv_offset.X;
 					vArray[vidx].v1 = intersection[top_int_idx][TOP_EDGE].TexV + uv_offset.Y;
 					vidx++;
@@ -1099,7 +1129,7 @@ void SegLineRendererClass::Render
 
 		// If color is not white or opacity not 100%, enable gradient in shader and in renderer - otherwise disable.
 		unsigned int rgba;
-		rgba=DX8Wrapper::Convert_Color(Color,Opacity);
+		rgba=rts::render::PackLegacyARGB(Color[0], Color[1], Color[2], Opacity);
 		bool rgba_all=(rgba==0xFFFFFFFF);
 
 		// Enable sorting if sorting has not been disabled and line is translucent and alpha testing is not enabled.
@@ -1132,10 +1162,13 @@ void SegLineRendererClass::Render
 		** Render
 		*/
 
-		DynamicVBAccessClass Verts((sorting?BUFFER_TYPE_DYNAMIC_SORTING:BUFFER_TYPE_DYNAMIC_DX8),dynamic_fvf_type,vnum);
+		DynamicVBAccessClass Verts((sorting ?
+			rts::render::GAME_BUFFER_TYPE_DYNAMIC_SORTED :
+			rts::render::GAME_BUFFER_TYPE_DYNAMIC_IMMEDIATE),
+			dynamic_fvf_type, vnum);
 		if (!Verts.Is_Valid()) {
 			REF_PTR_RELEASE(mat);
-			DX8Wrapper::Set_Transform(D3DTS_VIEW,view);
+			rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW, view);
 			return;
 		}
 		// Copy in the data to the  VB
@@ -1145,7 +1178,7 @@ void SegLineRendererClass::Render
 			unsigned char *vb=(unsigned char*)Lock.Get_Formatted_Vertex_Array();
 			if (!Lock.Is_Locked() || vb == nullptr) {
 				REF_PTR_RELEASE(mat);
-				DX8Wrapper::Set_Transform(D3DTS_VIEW,view);
+				rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW, view);
 				return;
 			}
 			const FVFInfoClass& fvfinfo=Verts.FVF_Info();
@@ -1170,15 +1203,18 @@ void SegLineRendererClass::Render
 			}
 			if (!Lock.Commit()) {
 				REF_PTR_RELEASE(mat);
-				DX8Wrapper::Set_Transform(D3DTS_VIEW,view);
+				rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW, view);
 				return;
 			}
 		}
 
-		DynamicIBAccessClass ib_access((sorting?BUFFER_TYPE_DYNAMIC_SORTING:BUFFER_TYPE_DYNAMIC_DX8),tidx*3);
+		DynamicIBAccessClass ib_access((sorting ?
+			rts::render::GAME_BUFFER_TYPE_DYNAMIC_SORTED :
+			rts::render::GAME_BUFFER_TYPE_DYNAMIC_IMMEDIATE),
+			tidx * 3);
 		if (!ib_access.Is_Valid()) {
 			REF_PTR_RELEASE(mat);
-			DX8Wrapper::Set_Transform(D3DTS_VIEW,view);
+			rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW, view);
 			return;
 		}
 		{
@@ -1187,7 +1223,7 @@ void SegLineRendererClass::Render
 			unsigned short* inds=lock.Get_Index_Array();
 			if (!lock.Is_Locked() || inds == nullptr) {
 				REF_PTR_RELEASE(mat);
-				DX8Wrapper::Set_Transform(D3DTS_VIEW,view);
+				rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW, view);
 				return;
 			}
 
@@ -1199,32 +1235,35 @@ void SegLineRendererClass::Render
 			}
 			if (!lock.Commit()) {
 				REF_PTR_RELEASE(mat);
-				DX8Wrapper::Set_Transform(D3DTS_VIEW,view);
+				rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW, view);
 				return;
 			}
 		}
 
-		if (!DX8Wrapper::Set_Index_Buffer(ib_access,0) ||
-			!DX8Wrapper::Set_Vertex_Buffer(Verts)) {
+		if (!rts::render::SetGameIndexBuffer(ib_access, 0) ||
+			!rts::render::SetGameVertexBuffer(Verts)) {
 			REF_PTR_RELEASE(mat);
-			DX8Wrapper::Set_Transform(D3DTS_VIEW,view);
+			rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW, view);
 			return;
 		}
-		DX8Wrapper::Set_Material(mat);
-		DX8Wrapper::Set_Texture(0,Texture);
-		DX8Wrapper::Set_Shader(shader);
+		rts::render::SetGameMaterial(mat);
+		rts::render::SetGameTexture(0, Texture);
+		rts::render::SetGameShader(shader);
 
 		if (sorting) {
-			SortingRendererClass::Insert_Triangles(obj_sphere,0,tidx,0,vnum);
+			const rts::render::GameBoundingSphere sort_sphere(
+				obj_sphere.Center.X, obj_sphere.Center.Y, obj_sphere.Center.Z,
+				obj_sphere.Radius);
+			rts::render::DrawGameSortedTriangles(sort_sphere, 0, tidx, 0, vnum);
 		} else {
-			DX8Wrapper::Draw_Triangles(0,tidx,0,vnum);
+			rts::render::DrawGameTriangles(0, tidx, 0, vnum);
 		}
 
 		REF_PTR_RELEASE(mat);
 
 	}
 
-	DX8Wrapper::Set_Transform(D3DTS_VIEW,view);
+	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW, view);
 
 }
 

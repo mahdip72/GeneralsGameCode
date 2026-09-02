@@ -1,6 +1,7 @@
 #include "Lib/JobSystem.h"
 #include "Lib/PipelineExecutionPolicy.h"
 #include "Lib/ProjectedTerrainGridKernel.h"
+#include "../TestSupport/LocalCapacityTestLane.h"
 #include "W3DDevice/Common/RadarTerrainPrepare.h"
 
 #include <stdio.h>
@@ -379,16 +380,29 @@ static int serialPolicy()
 
 int main(int argc, char **argv)
 {
+	bool localCapacity = false;
+	bool serialPipelines = false;
+	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity,
+		&serialPipelines, "--serial"))
+	{
+		fprintf(stderr, "Usage: projected_terrain_grid_tests [--local-capacity] [--serial]\n");
+		return 2;
+	}
+	rts_test::PrintTestCapacityLane(localCapacity);
 	const unsigned workers[] = { 1, 2, 4, 8, 16, 0 };
 	unsigned worker;
 	rts::JobSystem &system = rts::JobSystem::instance();
-	if (argc > 1 && strcmp(argv[1], "--serial") == 0)
+	if (serialPipelines)
 		return serialPolicy();
 
 	for (worker = 0; worker < sizeof(workers) / sizeof(workers[0]); ++worker)
 	{
+		const unsigned effectiveWorkerCount =
+			rts_test::ResolveActualWorkerCount(workers[worker], localCapacity);
+		rts_test::PrintWorkerCountSubstitution("projected terrain grid",
+			workers[worker], effectiveWorkerCount, localCapacity);
 		rts::JobSystemConfig config = rts::JobSystem::startupConfig();
-		config.workerCount = workers[worker];
+		config.workerCount = effectiveWorkerCount;
 		config.queueCapacity = 128;
 		config.scratchBytesPerWorker = 4096;
 		config.pinWorkers = false;

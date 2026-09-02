@@ -13,6 +13,10 @@ namespace render
 // shutdown. No backend object or COM interface crosses this boundary.
 RenderResult BindNativeW3DBufferResources(NativeW3DResources *resources);
 RenderResult UnbindNativeW3DBufferResources(NativeW3DResources *resources);
+// All buffer facade calls are render-owner operations.  This query is used by
+// the compatibility-shaped lock wrappers before they touch either a native
+// resource or a sorting allocation.
+bool IsNativeW3DBufferOwnerThread();
 
 class NativeW3DBufferOwner
 {
@@ -48,9 +52,11 @@ private:
 	unsigned int m_bindingGeneration;
 	BufferDescriptor m_descriptor;
 	GpuHandle m_handle;
+	NativeW3DBufferCleanupTicket *m_cleanupTicket;
 	// A replacement must remain owner-reachable when the old backend handle
 	// refuses destruction.  It is retried before the next discard recreation.
 	GpuHandle m_deferredHandle;
+	NativeW3DBufferCleanupTicket *m_deferredCleanupTicket;
 	// A private byte image keeps PRESERVE/NO_OVERWRITE staging deterministic
 	// even when the backend only exposes a write mapping. It is deliberately
 	// owner-local: no renderer resource or API object crosses this boundary.

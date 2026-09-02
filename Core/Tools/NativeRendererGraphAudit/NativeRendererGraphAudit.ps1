@@ -39,14 +39,63 @@ $AuthorityTargets = @($AuthorityTargets | ForEach-Object { $_ -split '[,;]' } | 
 $ProductTargets = @($ProductTargets | ForEach-Object { $_ -split '[,;]' } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 
 $legacySourcePattern = '(?i)(?:^|[\\/])(?:dx8[^\\/]*|d3d11legacybridge|legacytexturecompat)\.(?:cpp|cxx|cc|h)$'
-$legacyGraphPattern = '(?i)(?:BUILD_WITH_D3D8|rts_d3d8_headers|rts_d3d8lib|d3d8(?:\.lib|to9)|dx8wrapper|d3d11legacybridge|(?:^|[\\/])dx8[^\\/]*\.(?:cpp|cxx|cc|obj))'
-$legacyIncludePattern = '(?i)(?:[\\/]_deps[\\/]dx8-src(?:[\\/]|$|[\s"])|min-dx8-sdk|(?:^|[\\/])d3d8(?:types|caps)?\.h(?:$|[\s"<>])|(?:^|[\\/])dx8wrapper\.h(?:$|[\s"<>]))'
+$legacyGraphPattern = '(?i)(?:BUILD_WITH_D3D8|rts_d3d8_headers|rts_d3d8lib|d3d8(?:\.lib|to9)|dx8wrapper|dx8webbrowser|d3d11legacybridge|(?:^|[\\/])dx8[^\\/]*\.(?:cpp|cxx|cc|obj))'
+$legacyIncludePattern = '(?i)(?:[\\/]_deps[\\/]dx8-src(?:[\\/]|$|[\s"])|min-dx8-sdk|(?:^|[\\/])d3d8(?:types|caps)?\.h(?:$|[\s"<>])|(?:^|[\\/])dx8(?:wrapper|webbrowser)\.h(?:$|[\s"<>]))'
+
+# Browser ownership is deliberately explicit in the inventory.  The neutral
+# facade and native implementation must remain in the product tree, while
+# the typed compatibility adapter is allowed only in the external x86 lane.
+$nativeBrowserInventory = @(
+    [pscustomobject]@{
+        Path = 'Core/Libraries/Include/Renderer/GameWebBrowser.h'
+        Role = 'neutral browser facade header'
+    },
+    [pscustomobject]@{
+        Path = 'Core/Libraries/Source/WWVegas/WW3D2/gamewebbrowser.cpp'
+        Role = 'native browser implementation'
+    }
+)
+$legacyBrowserInventory = @(
+    [pscustomobject]@{
+        Path = 'Core/LegacyRenderer/WWVegas/WW3D2/dx8webbrowser.h'
+        Role = 'x86 browser compatibility header'
+    },
+    [pscustomobject]@{
+        Path = 'Core/LegacyRenderer/WWVegas/WW3D2/dx8webbrowser.cpp'
+        Role = 'x86 browser compatibility adapter'
+    }
+)
+
+# GameEngineDevice has the same paired source-selection contract.  Native x64
+# targets compile the product implementations, while the external Win32 lane
+# supplies the historical adapters.  Keep both sides in the audit inventory
+# so a source list cannot silently regress to the wrong ABI.
+$nativeGameEngineDeviceInventory = @(
+    [pscustomobject]@{
+        Path = 'Core/GameEngineDevice/Source/W3DDevice/GameClient/W3DProfilerFrameCapture.cpp'
+        Role = 'native profiler frame-capture implementation'
+    },
+    [pscustomobject]@{
+        Path = 'Core/GameEngineDevice/Source/W3DDevice/GameClient/W3DSnow.cpp'
+        Role = 'native snow implementation'
+    }
+)
+$legacyGameEngineDeviceInventory = @(
+    [pscustomobject]@{
+        Path = 'Core/LegacyRenderer/GameEngineDevice/Source/W3DDevice/GameClient/W3DProfilerFrameCaptureLegacy.cpp'
+        Role = 'x86 profiler frame-capture compatibility adapter'
+    },
+    [pscustomobject]@{
+        Path = 'Core/LegacyRenderer/GameEngineDevice/Source/W3DDevice/GameClient/W3DSnowLegacy.cpp'
+        Role = 'x86 snow compatibility adapter'
+    }
+)
 
 # The title WW3D2/GameEngineDevice graph still contains the compatibility
 # facade while it is being ported.  AuthorityOnly therefore proves the
 # native renderer/device ownership and final PE/link closure, while
 # StrictFinal remains the hard migration gate over the complete title graph.
-$legacySourceEdgePattern = '(?im)^\s*#\s*include\s*[<"](?:[^">]*[\\/]\s*)?(?:dx8wrapper|d3d8(?:types|caps)?)\.h[>"]|\b(?:DX8Wrapper|IDirect3[A-Za-z]*8|D3D(?:FVF|TS|RS|TSS|LOCK|POOL|USAGE|PRIMITIVE|FORMAT|CAPS)8?)_[A-Za-z0-9_]*|\bD3D[A-Z0-9_]*8\b'
+$legacySourceEdgePattern = '(?im)^\s*#\s*include\s*[<"](?:[^">]*[\\/]\s*)?(?:dx8wrapper|dx8webbrowser|d3d8(?:types|caps)?)\.h[>"]|\b(?:DX8Wrapper|IDirect3[A-Za-z]*8|D3D(?:FVF|TS|RS|TSS|LOCK|POOL|USAGE|PRIMITIVE|FORMAT|CAPS)8?)_[A-Za-z0-9_]*|\bD3D[A-Z0-9_]*8\b'
 
 function Add-Finding {
     param(
@@ -56,6 +105,22 @@ function Add-Finding {
     )
 
     [void] $Findings.Add("[$Priority] $Message")
+}
+
+function Get-ConfiguredNativeTitleTargets {
+    param(
+        [string[]] $MigrationTargets,
+        [string] $TargetSuffix
+    )
+
+    if ([string]::IsNullOrWhiteSpace($TargetSuffix)) {
+        return @()
+    }
+
+    $targetPattern = '(?i)^(?:g|z)_' + [regex]::Escape($TargetSuffix) + '$'
+    return @($MigrationTargets | Where-Object {
+        $_ -match $targetPattern
+    } | Select-Object -Unique)
 }
 
 function Test-EntryConfiguration {
@@ -316,7 +381,9 @@ function Get-DumpbinPath {
 
 function Get-NativeAuthorityFindings {
     param(
+        [string] $SourceRoot,
         [string] $BuildRoot,
+        [string[]] $MigrationTargets,
         [string[]] $ProductTargets,
         [string[]] $NinjaContents,
         [object[]] $NativeEntries,
@@ -324,7 +391,7 @@ function Get-NativeAuthorityFindings {
     )
 
     $findings = [System.Collections.Generic.List[string]]::new()
-    $authorityForbiddenPattern = '(?i)(?:\bd3d8(?:\.lib|\.dll)?\b|\bd3dx8(?:\.lib|\.dll)?\b|[\\/]_deps[\\/]dx8-src|rts_d3d8lib|d3d11legacybridge|(?:^|\s)dx8[^\s]*\.obj\b)'
+    $authorityForbiddenPattern = '(?i)(?:\bd3d8(?:\.lib|\.dll)?\b|\bd3dx8(?:\.lib|\.dll)?\b|[\\/]_deps[\\/]dx8-src|rts_d3d8lib|d3d11legacybridge|dx8webbrowser|(?:^|\s)dx8[^\s]*\.obj\b)'
 
     $expectedNativeSources = @{
         'core_renderer' = @(
@@ -353,6 +420,55 @@ function Get-NativeAuthorityFindings {
         foreach ($expectedSource in $expectedNativeSources[$nativeTarget]) {
             if ($sourceNames -notcontains $expectedSource) {
                 Add-Finding $findings 'P0' "native authority source inventory is incomplete for ${nativeTarget}: $expectedSource"
+            }
+        }
+    }
+
+    foreach ($inventoryEntry in @(
+            $nativeBrowserInventory + $legacyBrowserInventory +
+            $nativeGameEngineDeviceInventory + $legacyGameEngineDeviceInventory)) {
+        $inventoryPath = Join-Path $SourceRoot $inventoryEntry.Path
+        if (-not (Test-Path -LiteralPath $inventoryPath)) {
+            Add-Finding $findings 'P0' "native/legacy renderer source inventory is incomplete: $($inventoryEntry.Role) ($($inventoryEntry.Path))"
+        }
+    }
+
+    # The native facade is part of both title WW3D2 targets. Check the
+    # generated graph explicitly so a product cannot silently fall back to
+    # the external adapter merely because the neutral header remains present.
+    $nativeWw3d2Targets = @(Get-ConfiguredNativeTitleTargets `
+        -MigrationTargets $MigrationTargets `
+        -TargetSuffix 'ww3d2')
+    foreach ($titleTarget in $nativeWw3d2Targets) {
+        $nativeBrowserPattern = '(?i)CMakeFiles[\\/]' + [regex]::Escape($titleTarget) +
+            '\.dir[\\/].*gamewebbrowser\.cpp\.obj\b'
+        $nativeBrowserEntries = @($NinjaContents | ForEach-Object {
+            $_ -split '\r?\n'
+        } | Where-Object {
+            $_ -match $nativeBrowserPattern
+        })
+        if ($nativeBrowserEntries.Count -eq 0) {
+            Add-Finding $findings 'P0' "native browser implementation is absent from the generated $titleTarget graph"
+        }
+    }
+
+    # These paired GameEngineDevice sources must follow the architecture split
+    # in both native title graphs.  The external adapter paths are checked by
+    # inventory above; only native product objects may appear in x64 Ninja.
+    $nativeGameEngineDeviceTargets = @(Get-ConfiguredNativeTitleTargets `
+        -MigrationTargets $MigrationTargets `
+        -TargetSuffix 'gameenginedevice')
+    foreach ($titleTarget in $nativeGameEngineDeviceTargets) {
+        foreach ($nativeDeviceSource in @('W3DProfilerFrameCapture.cpp', 'W3DSnow.cpp')) {
+            $nativeDevicePattern = '(?i)CMakeFiles[\\/]' + [regex]::Escape($titleTarget) +
+                '\.dir[\\/].*' + [regex]::Escape($nativeDeviceSource) + '\.obj\b'
+            $nativeDeviceEntries = @($NinjaContents | ForEach-Object {
+                $_ -split '\r?\n'
+            } | Where-Object {
+                $_ -match $nativeDevicePattern
+            })
+            if ($nativeDeviceEntries.Count -eq 0) {
+                Add-Finding $findings 'P0' "native $nativeDeviceSource is absent from the generated $titleTarget graph"
             }
         }
     }
@@ -493,6 +609,44 @@ function Invoke-SelfTest {
     if ($badFindings.Count -lt 4) {
         Write-Output ($badFindings -join '; ')
         throw "legacy graph fixture did not expose all strict edges (findings=$($badFindings.Count))"
+    }
+
+    $browserCleanEntries = @(
+        [pscustomobject]@{
+            Target = 'g_ww3d2'
+            file = 'Core/Libraries/Source/WWVegas/WW3D2/gamewebbrowser.cpp'
+            command = 'cl.exe /ICore/Libraries/Include -c gamewebbrowser.cpp'
+        }
+    )
+    $browserCleanFindings = @(Get-GraphFindings -Entries $browserCleanEntries -TargetNames @('g_ww3d2') -SkipSourceRead)
+    if ($browserCleanFindings.Count -ne 0) {
+        throw "neutral browser graph fixture unexpectedly failed: $($browserCleanFindings -join '; ')"
+    }
+
+    $browserLegacyEntries = @(
+        [pscustomobject]@{
+            Target = 'g_ww3d2'
+            file = 'Core/LegacyRenderer/WWVegas/WW3D2/dx8webbrowser.cpp'
+            command = 'cl.exe /ICore/LegacyRenderer/WWVegas /ICore/LegacyRenderer/WWVegas/WW3D2/dx8webbrowser.h -c dx8webbrowser.cpp'
+        }
+    )
+    $browserLegacyFindings = @(Get-GraphFindings -Entries $browserLegacyEntries -TargetNames @('g_ww3d2') -NinjaContents @('build CMakeFiles/g_ww3d2.dir/dx8webbrowser.obj: CXX_COMPILER') -SkipSourceRead)
+    if ($browserLegacyFindings.Count -lt 3) {
+        throw "browser legacy graph fixture did not expose adapter/include/object edges (findings=$($browserLegacyFindings.Count))"
+    }
+
+    $singleTitleMigrationTargets = @('g_ww3d2', 'g_gameenginedevice')
+    $singleTitleWw3d2Targets = @(Get-ConfiguredNativeTitleTargets `
+        -MigrationTargets $singleTitleMigrationTargets `
+        -TargetSuffix 'ww3d2')
+    $singleTitleGameEngineDeviceTargets = @(Get-ConfiguredNativeTitleTargets `
+        -MigrationTargets $singleTitleMigrationTargets `
+        -TargetSuffix 'gameenginedevice')
+    if ($singleTitleWw3d2Targets.Count -ne 1 -or
+            $singleTitleWw3d2Targets[0] -ne 'g_ww3d2' -or
+            $singleTitleGameEngineDeviceTargets.Count -ne 1 -or
+            $singleTitleGameEngineDeviceTargets[0] -ne 'g_gameenginedevice') {
+        throw "single-title migration target fixture selected the wrong native title graph"
     }
 
     # StrictFinal must continue to evaluate migration targets even when a
@@ -690,7 +844,9 @@ if ($AuthorityOnly -and -not $StrictFinal) {
         -NinjaContents @($ninjaContents) `
         -SkipDirectSourceEdge)
     $authorityFindings = @(Get-NativeAuthorityFindings `
+        -SourceRoot $SourceRoot `
         -BuildRoot $BuildRoot `
+        -MigrationTargets $MigrationTargets `
         -ProductTargets $ProductTargets `
         -NinjaContents @($ninjaContents) `
         -NativeEntries @($authorityTargetEntries) `
@@ -722,7 +878,9 @@ elseif ($StrictFinal) {
         -PchContents @($migrationPchContents) `
         -NinjaContents @($ninjaContents))
     $authorityFindings = @(Get-NativeAuthorityFindings `
+        -SourceRoot $SourceRoot `
         -BuildRoot $BuildRoot `
+        -MigrationTargets $MigrationTargets `
         -ProductTargets $ProductTargets `
         -NinjaContents @($ninjaContents) `
         -NativeEntries @($authorityTargetEntries) `

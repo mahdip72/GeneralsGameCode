@@ -1,6 +1,7 @@
 #include "Lib/JobSystem.h"
 #include "Lib/MultiplayerSimulationPolicy.h"
 #include "MixedWorkerMultiplayerLoopbackContract.h"
+#include "../TestSupport/LocalCapacityTestLane.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -678,7 +679,7 @@ int TestPolicyNegotiation()
 	return result;
 }
 
-int TestMixedWorkerSoak()
+int TestMixedWorkerSoak(bool localCapacity)
 {
 	const unsigned workerCounts[] = { 1, 2, 4, 8, 16 };
 	const rts::MultiplayerSimulationPeerPolicy local = MakePeerPolicy(
@@ -727,8 +728,13 @@ int TestMixedWorkerSoak()
 		workerIndex < sizeof(workerCounts) / sizeof(workerCounts[0]);
 		++workerIndex)
 	{
+		const unsigned requestedWorkerCount = workerCounts[workerIndex];
+		const unsigned workerCount = rts_test::ResolveActualWorkerCount(
+			requestedWorkerCount, localCapacity);
+		rts_test::PrintWorkerCountSubstitution("Mixed-worker multiplayer",
+			requestedWorkerCount, workerCount, localCapacity);
 		const bool started = StartSoakScheduler(jobs,
-			workerCounts[workerIndex]);
+			workerCount);
 		result |= Check(started,
 			"one scheduler startup succeeds for a logical worker configuration");
 		if (!started) return result;
@@ -778,7 +784,7 @@ int TestMixedWorkerSoak()
 #endif
 		}
 
-		if (workerCounts[workerIndex] == 16)
+		if (requestedWorkerCount == 16)
 		{
 			CanonicalTrace partialProof;
 			result |= Check(RunSoakOnStartedScheduler(jobs, partialPolicy,
@@ -1034,13 +1040,22 @@ int TestInstalledLoopbackContract()
 
 }
 
-int main()
+int main(int argc, char **argv)
 {
+	bool localCapacity = false;
+	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity))
+	{
+		fprintf(stderr,
+			"Usage: core_mixed_worker_multiplayer_policy_tests "
+			"[--local-capacity]\n");
+		return 2;
+	}
+	rts_test::PrintTestCapacityLane(localCapacity);
 	int result = 0;
 	result |= TestReleaseEvidenceGate();
 	result |= TestNetworkPolicyLifecycle();
 	result |= TestPolicyNegotiation();
-	result |= TestMixedWorkerSoak();
+	result |= TestMixedWorkerSoak(localCapacity);
 	result |= TestInstalledLoopbackContract();
 	if (result == 0)
 		printf("Mixed-worker multiplayer policy and soak tests passed.\n");

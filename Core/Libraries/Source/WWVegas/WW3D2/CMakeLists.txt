@@ -43,36 +43,14 @@ set(WW3D2_SRC
     distlod.cpp
     distlod.h
     dllist.h
-    dx8caps.cpp
-    dx8caps.h
-    dx8fvf.cpp
     dx8fvf.h
-    dx8indexbuffer.cpp
     dx8indexbuffer.h
     dx8list.h
-    d3d11legacybridge.cpp
-    d3d11legacybridge.h
-    dx8polygonrenderer.cpp
-    dx8polygonrenderer.h
-    dx8renderer.cpp
-    dx8renderer.h
-    dx8rendererdebugger.cpp
-    dx8rendererdebugger.h
-    dx8texman.cpp
-    dx8texman.h
-    dx8vertexbuffer.cpp
     dx8vertexbuffer.h
-    dx8webbrowser.cpp
-    dx8webbrowser.h
-    dx8wrapper.cpp
-    dx8wrapper.h
-    legacytexturecompat.cpp
-    legacytexturecompat.h
     dynamesh.cpp
     dynamesh.h
     font3d.cpp
     font3d.h
-    formconv.cpp
     formconv.h
     FramGrab.cpp
     framgrab.h
@@ -104,7 +82,6 @@ set(WW3D2_SRC
     #light.h
     #lightenvironment.cpp
     #lightenvironment.h
-    line3d.cpp
     line3d.h
     #linegrp.cpp
     #linegrp.h
@@ -131,7 +108,6 @@ set(WW3D2_SRC
     #meshmdlio.cpp
     metalmap.cpp
     metalmap.h
-    missingtexture.cpp
     missingtexture.h
     #motchan.cpp
     #motchan.h
@@ -185,7 +161,6 @@ set(WW3D2_SRC
     shdlib.h
     snappts.cpp
     snapPts.h
-    sortingrenderer.cpp
     sortingrenderer.h
     soundlibrarybridge.h
     # The legacy sound render object owns WWAudio/Miles objects and is used by
@@ -202,23 +177,18 @@ set(WW3D2_SRC
     streakRender.h
     stripoptimizer.cpp
     stripoptimizer.h
-    surfaceclass.cpp
     surfaceclass.h
-    surfaceblit.cpp
     surfaceblit.h
     texproject.cpp
     texproject.h
     #textdraw.cpp # unused
     textdraw.h
-    texture.cpp
     texture.h
     texturefilter.cpp
     texturefilter.h
-    textureloader.cpp
     textureloader.h
     texturemipbuffer.cpp
     texturemipbuffer.h
-    texturemipgenerator.cpp
     texturemipgenerator.h
     texturethumbnail.cpp
     texturethumbnail.h
@@ -237,13 +207,28 @@ set(WW3D2_SRC
     w3dexclusionlist.h
     ww3d.cpp
     ww3d.h
-    ww3dformat.cpp
     ww3dformat.h
     ww3dids.h
     ww3dtrig.h
 )
 
-if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    # These implementations are the device-neutral product path. The x86
+    # compatibility lane gets the original implementations from the external
+    # legacy-renderer targets wired by the top-level build graph.
+    list(APPEND WW3D2_SRC
+        formconv.cpp
+        missingtexture.cpp
+        sortingrenderer.cpp
+        surfaceclass.cpp
+        surfaceblit.cpp
+        texture.cpp
+        textureloader.cpp
+        texturemipgenerator.cpp
+        ww3dformat.cpp
+        gamewebbrowser.cpp
+    )
+elseif(CMAKE_SIZEOF_VOID_P EQUAL 4)
     list(APPEND WW3D2_SRC
         soundrobj.cpp
         soundrobj.h
@@ -283,15 +268,24 @@ target_link_libraries(corei_ww3d2 INTERFACE
 )
 
 # The native runtime path is deliberately a separate target.  It must never
-# inherit the D3D8 compatibility PCH or the legacy WW3D source list.
+# inherit the compatibility PCH or the legacy WW3D source list.
 if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD)
     add_library(core_ww3d2_native STATIC
+        nativew3dline.cpp
+        nativew3dline.h
         nativew3dbufferowner.cpp
 		nativew3dbufferowner.h
+		nativew3dfvf.cpp
+		nativew3dbuffers.cpp
+		nativew3dbuffercompat.h
 		nativew3dsampledtexture.cpp
 		nativew3dsampledtexture.h
-		nativew3dtextureowner.cpp
+        nativew3dtextureowner.cpp
         nativew3dtextureowner.h
+        nativew3dsorting.cpp
+        nativew3dsorting.h
+        nativew3dgameclient.cpp
+        nativew3dgameclientcommands.cpp
         nativew3d2.cpp
         nativew3d2.h
     )
@@ -301,6 +295,7 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD)
 	)
 	target_link_libraries(core_ww3d2_native PUBLIC
 		core_renderer
+		core_task_runtime
 		core_utility_no_pch
 	)
     target_link_libraries(corei_ww3d2 INTERFACE

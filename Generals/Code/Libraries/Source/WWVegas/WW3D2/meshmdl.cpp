@@ -35,6 +35,7 @@
  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 #include "meshmdl.h"
+#include "dx8fvf.h"
 #include "matinfo.h"
 #include "aabtree.h"
 #include "htree.h"

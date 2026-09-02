@@ -164,7 +164,7 @@ LegacyFixedFunctionConstants::LegacyFixedFunctionConstants() :
 	world(), view(), projection(), material(), fog(),
 	globalAmbient(0.0f, 0.0f, 0.0f, 1.0f)
 {
-	// Keep an uninitialized-but-enabled D3D8 clip plane on the accepted side
+	// Keep an uninitialized-but-enabled legacy clip plane on the accepted side
 	// of the plane. This prevents a neutral state from clipping the whole
 	// frame before the caller supplies its equation.
 	for (unsigned int index = 0; index < LEGACY_CLIP_PLANE_COUNT; ++index)
@@ -507,7 +507,7 @@ void TrackLegacyShaderBits(unsigned int shaderBits)
 		return;
 	}
 
-	// ShaderClass owns only this subset of D3D8 state.  Decoding into a fresh
+	// ShaderClass owns only this subset of legacy state. Decoding into a fresh
 	// LegacyPipelineState and replacing the whole tracked pipeline erases live
 	// lighting, material sources, texture factor, clipping, stencil, fill and
 	// depth-bias state.  The retail Set_Shader path never resets those values.
@@ -782,7 +782,7 @@ bool TrackLegacyClipPlane(unsigned int index, const float *plane)
 	return true;
 }
 
-RenderFloat4 DecodeLegacyD3D8Ambient(unsigned int color)
+RenderFloat4 DecodeLegacyAmbientColor(unsigned int color)
 {
 	return RenderFloat4(
 		static_cast<float>((color >> 16) & 0xffU) / 255.0f,
@@ -818,7 +818,7 @@ bool IsLegacyProjectedTextureTransformValid(unsigned int count,
 	{
 		return false;
 	}
-	// D3D8 projection is defined for COUNT2/COUNT3/COUNT4.  COUNT1 has no
+	// Legacy projection is defined for COUNT2/COUNT3/COUNT4. COUNT1 has no
 	// homogeneous divisor and D3DTTFF_PROJECTED must not be accepted with it.
 	return !projected || count >= 2U;
 }

@@ -12,14 +12,19 @@ namespace render
 struct NativeProductDeviceOperations
 {
 	NativeProductDeviceOperations() : context(0), initialize(0), prepareResize(0),
-		resize(0), shutdown(0) {}
+		resize(0), shutdown(0), shutdownResult(0) {}
 
 	void *context;
 	bool (*initialize)(void *context, unsigned int width,
 		unsigned int height, bool enableVsync);
 	bool (*prepareResize)(void *context);
 	bool (*resize)(void *context, unsigned int width, unsigned int height);
+	// Optional truthful shutdown callback.  The historical void callback is
+	// retained for existing integrations; when both are present the result
+	// callback owns completion and a false result keeps lifecycle ownership
+	// retryable.
 	void (*shutdown)(void *context);
+	bool (*shutdownResult)(void *context);
 };
 
 class NativeProductDeviceLifecycle
@@ -39,7 +44,8 @@ public:
 	{
 		if (m_state != UNBOUND || operations.context == 0 ||
 			operations.initialize == 0 || operations.prepareResize == 0 ||
-			operations.resize == 0 || operations.shutdown == 0)
+			operations.resize == 0 ||
+			(operations.shutdown == 0 && operations.shutdownResult == 0))
 		{
 			return false;
 		}
@@ -78,14 +84,27 @@ public:
 		return true;
 	}
 
-	void shutdown()
+	bool shutdown()
 	{
 		if (m_state == ACTIVE || m_state == LOST)
 		{
-			m_operations.shutdown(m_operations.context);
+			if (m_operations.shutdownResult != 0)
+			{
+				if (!m_operations.shutdownResult(m_operations.context))
+				{
+					// Keep ACTIVE/LOST and the callbacks intact so the owner can
+					// retry after the native resource failure is cleared.
+					return false;
+				}
+			}
+			else if (m_operations.shutdown != 0)
+			{
+				m_operations.shutdown(m_operations.context);
+			}
 		}
 		m_operations = NativeProductDeviceOperations();
 		m_state = UNBOUND;
+		return true;
 	}
 
 	State state() const { return m_state; }

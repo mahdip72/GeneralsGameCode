@@ -1,3 +1,7 @@
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
+    return()
+endif()
+
 add_executable(g_w3dview WIN32)
 
 target_link_libraries(g_w3dview PRIVATE
@@ -15,6 +19,8 @@ target_link_libraries(g_w3dview PRIVATE
     vfw32
     winmm
 )
+
+rts_attach_title_legacy_renderer(g_w3dview GENERALS)
 
 if(WIN32 OR "${CMAKE_SYSTEM}" MATCHES "Windows")
     target_compile_definitions(g_w3dview PRIVATE _AFXDLL)

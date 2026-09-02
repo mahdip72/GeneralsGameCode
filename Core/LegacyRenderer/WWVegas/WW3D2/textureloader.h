@@ -1,0 +1,392 @@
+/*
+**	Command & Conquer Generals Zero Hour(tm)
+**	Copyright 2025 Electronic Arts Inc.
+**
+**	This program is free software: you can redistribute it and/or modify
+**	it under the terms of the GNU General Public License as published by
+**	the Free Software Foundation, either version 3 of the License, or
+**	(at your option) any later version.
+**
+**	This program is distributed in the hope that it will be useful,
+**	but WITHOUT ANY WARRANTY; without even the implied warranty of
+**	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+**	GNU General Public License for more details.
+**
+**	You should have received a copy of the GNU General Public License
+**	along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+/***********************************************************************************************
+ ***              C O N F I D E N T I A L  ---  W E S T W O O D  S T U D I O S               ***
+ ***********************************************************************************************
+ *                                                                                             *
+ *                 Project Name : DX8 Texture Manager                                          *
+ *                                                                                             *
+ *                     $Archive:: /Commando/Code/ww3d2/textureloader.h                            $*
+ *                                                                                             *
+ *              Original Author:: vss_sync                                                   *
+ *                                                                                             *
+ *                       Author : Kenny Mitchell                                               *
+ *                                                                                             *
+ *                     $Modtime:: 06/27/02 1:27p                                              $*
+ *                                                                                             *
+ *                    $Revision:: 2                                                           $*
+ *                                                                                             *
+ * 06/27/02 KM Texture class abstraction																			*
+ *---------------------------------------------------------------------------------------------*
+ * Functions:                                                                                  *
+ * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+#pragma once
+
+// Legacy renderer declarations; native code uses the product header.
+
+#include "texturemipbuffer.h"
+
+#include "WWLib/always.h"
+#include "texture.h"
+
+class StringClass;
+struct IDirect3DTexture8;
+class TextureLoadTaskClass;
+class DDSFileClass;
+class Targa;
+class TextureLoadTaskListClass;
+namespace rts
+{
+	class Job;
+	struct ResourceIoMetrics;
+	struct ResourceIoTicket;
+	class ModelAssetBytes;
+}
+
+class TextureLoader
+{
+public:
+	static void Init();
+	static void Deinit();
+
+	// Modify given texture size to nearest valid size on current hardware.
+	static void Validate_Texture_Size(unsigned& width, unsigned& height, unsigned& depth);
+
+	static IDirect3DTexture8 * Load_Thumbnail(
+		const StringClass& filename,const Vector3& hsv_shift);
+//		WW3DFormat texture_format);	// Pass WW3D_FORMAT_UNKNOWN if you don't care
+
+	static IDirect3DSurface8 *		Load_Surface_Immediate(
+		const StringClass& filename,
+		WW3DFormat surface_format,		// Pass WW3D_FORMAT_UNKNOWN if you don't care
+		bool allow_compression);
+
+	static void	Request_Thumbnail(TextureBaseClass* tc);
+
+	// Adds a loading task to the system. The task if processed in a separate
+	// thread as soon as possible. The task will appear in finished tasks list
+	// when it's been completed. The texture will be refreshed on the next
+	// update call after appearing to the finished tasks list.
+	static void Request_Background_Loading(TextureBaseClass* tc);
+
+	// Textures can only be created and locked by the main thread so this function sends a request to the texture
+	// handling system to load the texture immediatelly next time it enters the main thread. If this function
+	// is called from the main thread the texture is loaded immediatelly.
+	static void Request_Foreground_Loading(TextureBaseClass* tc);
+
+	static void	Flush_Pending_Load_Tasks();
+	static void Discard_Pending_Background_Load_Tasks();
+	static void Stop_Async_Resource_Loading();
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
+	static rts::ResourceIoMetrics Get_Resource_Load_Metrics();
+	// Model preloading shares the texture I/O owner and compute group. Only
+	// the explicit owner-side preload window may consume these copied bytes.
+	static bool Request_Model_Read(const char *filename, rts::ResourceIoTicket &ticket);
+	static rts::ModelAssetBytes *Complete_Model_Read(const rts::ResourceIoTicket &ticket,
+		bool &succeeded, bool &cancelled);
+	static void Cancel_Model_Read(const rts::ResourceIoTicket &ticket);
+#endif
+	static void Update(void(*network_callback)() = nullptr);
+
+	// returns true if current thread of execution is allowed to make DX8 calls.
+	static bool Is_DX8_Thread();
+
+	static void Suspend_Texture_Load();
+	static void Continue_Texture_Load();
+
+	static void Set_Texture_Inactive_Override_Time(int time_ms) {TextureInactiveOverrideTime = time_ms;}
+
+private:
+	friend class TextureLoadTaskClass;
+	static void Pump_Resource_Loads();
+	static void Process_Foreground_Load			(TextureLoadTaskClass *task);
+	static void Process_Foreground_Thumbnail	(TextureLoadTaskClass *task);
+
+	static void Begin_Load_And_Queue				(TextureLoadTaskClass *task);
+	static void Load_Thumbnail						(TextureBaseClass *tc);
+
+	static bool TextureLoadSuspended;
+
+	// The time in ms before a texture is thrown out.
+	// The default is zero.  The scripted movies set this to reduce texture stalls in movies.
+	static int	TextureInactiveOverrideTime;
+};
+
+class TextureLoadTaskListNodeClass
+{
+	friend class TextureLoadTaskListClass;
+
+	public:
+		TextureLoadTaskListNodeClass() : Next(0), Prev(0) { }
+
+		TextureLoadTaskListClass *Get_List()		{ return List; }
+
+		TextureLoadTaskListNodeClass *Next;
+		TextureLoadTaskListNodeClass *Prev;
+		TextureLoadTaskListClass *		List;
+};
+
+
+class TextureLoadTaskListClass
+{
+	// This class implements an unsynchronized, double-linked list of TextureLoadTaskClass
+	// objects, using an embedded list node.
+
+	public:
+		TextureLoadTaskListClass();
+
+		// Returns true if list is empty, false otherwise.
+		bool									Is_Empty		() const		{ return (Root.Next == &Root); }
+
+		// Add a task to beginning of list
+		void									Push_Front	(TextureLoadTaskClass *task);
+
+		// Add a task to end of list
+		void									Push_Back	(TextureLoadTaskClass *task);
+
+		// Remove and return a task from beginning of list, or null if list is empty.
+		TextureLoadTaskClass *			Pop_Front	();
+
+		// Remove and return a task from end of list, or null if list is empty
+		TextureLoadTaskClass *			Pop_Back		();
+
+		// Return the first task without removing it, or null if list is empty.
+		TextureLoadTaskClass *			Peek_Front	() const;
+
+		// Remove specified task from list, if present
+		void									Remove		(TextureLoadTaskClass *task);
+
+	private:
+		// This list is implemented using a sentinel node.
+		TextureLoadTaskListNodeClass	Root;
+};
+
+
+class SynchronizedTextureLoadTaskListClass : public TextureLoadTaskListClass
+{
+	// This class added thread-safety to the basic TextureLoadTaskListClass.
+
+	public:
+		SynchronizedTextureLoadTaskListClass();
+
+		// See comments above for description of member functions.
+		void									Push_Front	(TextureLoadTaskClass *task);
+		void									Push_Back	(TextureLoadTaskClass *task);
+		void									Publish_Completed(TextureLoadTaskClass *task);
+		void									Publish_Failed	(TextureLoadTaskClass *task);
+		void									Publish_Thumbnail(TextureLoadTaskClass *task, TextureLoadTaskClass *loadTask);
+		bool								Has_Prepare_Job(TextureLoadTaskClass *task);
+		void								Set_Prepare_Job(TextureLoadTaskClass *task, void *prepareJob);
+		bool								Promote_Prepare_Job(TextureLoadTaskClass *task);
+		TextureLoadTaskClass *			Pop_Front	();
+		TextureLoadTaskClass *			Pop_Back		();
+		void									Remove		(TextureLoadTaskClass *task);
+		bool									Is_Empty		();
+
+	private:
+		FastCriticalSectionClass		CriticalSection;
+		TextureLoadTaskListClass		ReadyQueue;
+};
+
+/*
+** (gth) The allocation system we're using for TextureLoadTaskClass has gotten a little
+** complicated since Kenny added the new task types for Cube and Volume textures.  The
+** ::Destroy member is used to return a task to the pool now and must be over-ridden in
+** each derived class to put the task back into the correct free list.
+*/
+
+
+class TextureLoadTaskClass : public TextureLoadTaskListNodeClass
+{
+	friend class TextureLoader;
+	public:
+		enum TaskType {
+			TASK_NONE,
+			TASK_THUMBNAIL,
+			TASK_LOAD,
+		};
+
+		enum PriorityType {
+			PRIORITY_LOW,
+			PRIORITY_HIGH,
+		};
+
+		enum StateType {
+			STATE_NONE,
+
+			STATE_LOAD_BEGUN,
+			STATE_LOAD_MIPMAP,
+			STATE_LOAD_COMPLETE,
+
+			STATE_COMPLETE,
+		};
+
+
+		TextureLoadTaskClass();
+		~TextureLoadTaskClass();
+
+		static TextureLoadTaskClass *	Create			(TextureBaseClass *tc, TaskType type, PriorityType priority);
+		static void				Delete_Free_Pool			();
+
+		virtual void			Destroy						();
+		virtual void			Init							(TextureBaseClass *tc, TaskType type, PriorityType priority);
+		virtual void			Deinit						();
+
+		TaskType					Get_Type						() const		{ return Type;				}
+		PriorityType			Get_Priority				() const		{ return Priority;		}
+		StateType				Get_State					() const		{ return State;			}
+
+		WW3DFormat				Get_Format					() const		{ return Format;			}
+		unsigned int			Get_Width					() const		{ return Width;			}
+		unsigned int			Get_Height					() const		{ return Height;			}
+		unsigned int			Get_Mip_Level_Count		() const		{ return MipLevelCount; }
+		unsigned int			Get_Reduction				() const		{ return Reduction;		}
+
+		unsigned char *		Get_Locked_Surface_Ptr	(unsigned int level);
+		unsigned int			Get_Locked_Surface_Pitch(unsigned int level) const;
+
+		TextureBaseClass *	Peek_Texture				()				{ return Texture;			}
+		IDirect3DTexture8	*	Peek_D3D_Texture			()				{ return (IDirect3DTexture8*)D3DTexture;		}
+
+		void						Set_Type						(TaskType t)		{ Type		= t;			}
+		void						Set_Priority				(PriorityType p)	{ Priority	= p;			}
+		void						Set_State					(StateType s)		{ State		= s;			}
+
+		bool						Begin_Load					();
+		bool						Load							();
+		void						End_Load						();
+		void						Finish_Load					();
+		void						Apply_Missing_Texture	();
+		bool						Begin_Async_Prepare		();
+		void						Complete_Async_Prepare	();
+		void						Fail_Async_Prepare		();
+		bool						Is_Async_Prepare_Complete();
+		void						Wait_For_Async_Prepare	();
+		void						Set_Prepare_Runtime_Task(void* task) { PrepareRuntimeTask = task; }
+		void*						Get_Prepare_Runtime_Task() const { return PrepareRuntimeTask; }
+		bool						Reserve_Prepare_Memory();
+		bool						Begin_Resource_Read(bool tryCompressed = true);
+		bool						Complete_Resource_Read();
+		void						Cancel_Resource_Read();
+		void						Release_Prepare_Memory_Reservation();
+
+	protected:
+		virtual bool			Begin_Compressed_Load	();
+		virtual bool			Begin_Uncompressed_Load	();
+
+		virtual bool			Load_Compressed_Mipmap	();
+		virtual bool			Load_Uncompressed_Mipmap();
+		virtual bool			Allocate_Prepared_Surfaces();
+		virtual bool			Create_D3D_Texture		();
+		virtual bool			Upload_Prepared_Surfaces();
+#if defined(_WIN64)
+		virtual bool			Publish_Native_Prepared_Texture();
+#endif
+		virtual void			Release_Prepared_Surfaces();
+		virtual size_t			Get_Prepare_Memory_Byte_Count() const;
+
+		virtual bool			Lock_Surfaces				();
+		virtual void			Unlock_Surfaces			();
+
+		void						Apply							(bool initialize);
+
+		TextureBaseClass*		Texture;
+		IDirect3DBaseTexture8*	D3DTexture;
+		WW3DFormat				Format;
+
+		unsigned int			Width;
+		unsigned	int			Height;
+		unsigned	int			MipLevelCount;
+		unsigned	int			Reduction;
+		Vector3					HSVShift;
+		WW3DFormat				SourceFormat;
+		unsigned int			SourceBytesPerPixel;
+		bool					CompressionAllowed;
+		bool					LoadSucceeded;
+		char					Filename[_MAX_PATH];
+		DDSFileClass*			DDSFile;
+		Targa*					TargaFile;
+		void*					PrepareCompleteEvent;
+		void*					PrepareRuntimeTask;
+		void*					ResourceRequest;
+		void*					ResourceResult;
+		bool					ResourceTriedDDS;
+		size_t					PrepareMemoryReservation;
+		char					TargaPalette[256 * 4];
+		TextureMipBuffer		PreparedSurface[MIP_LEVELS_MAX];
+
+		unsigned char *		LockedSurfacePtr[MIP_LEVELS_MAX];
+		unsigned	int			LockedSurfacePitch[MIP_LEVELS_MAX];
+
+		TaskType					Type;
+		PriorityType			Priority;
+		StateType				State;
+};
+
+class CubeTextureLoadTaskClass : public TextureLoadTaskClass
+{
+public:
+	CubeTextureLoadTaskClass();
+
+	virtual void			Destroy						() override;
+	virtual void			Init							(TextureBaseClass *tc, TaskType type, PriorityType priority) override;
+	virtual void			Deinit						() override;
+
+protected:
+	virtual bool			Begin_Compressed_Load	() override;
+	virtual bool			Begin_Uncompressed_Load	() override;
+
+	virtual bool			Load_Compressed_Mipmap	() override;
+	virtual bool			Allocate_Prepared_Surfaces() override;
+	virtual bool			Create_D3D_Texture		() override;
+	virtual bool			Upload_Prepared_Surfaces() override;
+#if defined(_WIN64)
+	virtual bool			Publish_Native_Prepared_Texture() override;
+#endif
+	virtual void			Release_Prepared_Surfaces() override;
+	virtual size_t			Get_Prepare_Memory_Byte_Count() const override;
+//	virtual bool			Load_Uncompressed_Mipmap() override;
+
+	virtual bool			Lock_Surfaces				() override;
+	virtual void			Unlock_Surfaces			() override;
+
+private:
+	unsigned char*			Get_Locked_CubeMap_Surface_Pointer(unsigned int face, unsigned int level);
+	unsigned int			Get_Locked_CubeMap_Surface_Pitch(unsigned int face, unsigned int level) const;
+
+	IDirect3DCubeTexture8*	Peek_D3D_Cube_Texture()				{ return (IDirect3DCubeTexture8*)D3DTexture;		}
+
+	unsigned char*			LockedCubeSurfacePtr[6][MIP_LEVELS_MAX];
+	unsigned int			LockedCubeSurfacePitch[6][MIP_LEVELS_MAX];
+	TextureMipBuffer		PreparedCubeSurface[6][MIP_LEVELS_MAX];
+};
+
+class VolumeTextureLoadTaskClass : public TextureLoadTaskClass
+{
+public:
+	virtual void			Destroy						() override;
+
+protected:
+	virtual bool			Begin_Compressed_Load	() override;
+	virtual bool			Begin_Uncompressed_Load	() override;
+#if defined(_WIN64)
+	virtual bool			Publish_Native_Prepared_Texture() override;
+#endif
+};

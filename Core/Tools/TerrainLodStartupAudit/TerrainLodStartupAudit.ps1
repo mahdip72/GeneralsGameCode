@@ -45,7 +45,7 @@ function Test-TerrainLodStartupContract {
     $body = Get-BracedBody $text $signature
     if ($null -eq $body) { return $false }
 
-    $predicate = $body.IndexOf('if (DX8Wrapper::Is_D3D11_Backend_Active())',
+    $predicate = $body.IndexOf('if (rts::render::IsNativeGameRendererActive())',
         [StringComparison]::Ordinal)
     $terrainOnly = $body.IndexOf('m_3DScene->drawTerrainOnly(true);',
         [StringComparison]::Ordinal)
@@ -81,7 +81,7 @@ if ($SelfTest) {
     $valid = @'
 void W3DDisplay::calculateTerrainLOD()
 {
-    if (DX8Wrapper::Is_D3D11_Backend_Active())
+    if (rts::render::IsNativeGameRendererActive())
     {
         TheWritableGlobalData->m_terrainLOD = TERRAIN_LOD_MAX;
         m_3DScene->drawTerrainOnly(false);
@@ -99,7 +99,7 @@ void W3DDisplay::calculateTerrainLOD()
         throw 'Valid D3D11 terrain LOD fixture rejected.'
     }
     $mutations = @(
-        $valid.Replace('DX8Wrapper::Is_D3D11_Backend_Active()', 'false'),
+        $valid.Replace('rts::render::IsNativeGameRendererActive()', 'false'),
         $valid.Replace('TERRAIN_LOD_MAX', 'TERRAIN_LOD_NO_WATER'),
         $valid.Replace("        return;`n", ''),
         $valid.Replace("        m_3DScene->drawTerrainOnly(false);`n", ''),

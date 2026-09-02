@@ -1213,7 +1213,7 @@ foreach ($relativePath in $requiredConsumers) {
 }
 
 $dx8WrapperSource = Get-Content -LiteralPath (
-    Join-Path $SourceRoot 'Core/Libraries/Source/WWVegas/WW3D2/dx8wrapper.cpp') -Raw
+    Join-Path $SourceRoot 'Core/LegacyRenderer/WWVegas/WW3D2/dx8wrapper.cpp') -Raw
 Assert-NativeDeviceBootstrapContract $dx8WrapperSource
 Assert-NativeDeviceShutdownOwnershipContract $dx8WrapperSource
 Assert-NativeColorRenderTargetContract $dx8WrapperSource

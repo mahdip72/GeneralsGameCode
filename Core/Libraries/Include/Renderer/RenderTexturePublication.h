@@ -6,10 +6,9 @@
 class TextureClass;
 class TextureBaseClass;
 
-// The legacy bridge owns these entry points because it is the only component
-// that can translate a TextureClass into the active native resource handle.
-// Product code consumes the renderer-neutral wrappers below instead of
-// including the bridge's legacy graphics header.
+// Each architecture supplies these entry points through its own texture owner.
+// Native surface unlocks already publish their CPU writes, so notification is
+// only a compatibility-cache operation on the historical lane.
 void Notify_Render_Texture_Changed(TextureClass *texture);
 bool Publish_Render_Texture_BGRA8_Change(TextureClass *texture,
 	const void *data, size_t row_pitch, size_t slice_pitch);
@@ -23,7 +22,7 @@ namespace render
 {
 
 // Requested backend capability is not proof that the native owner is alive;
-// this query reflects the bridge's current operational state.
+// this query reflects the published owner's current operational state.
 inline bool IsNativeD3D11PublicationActive()
 {
 	return ::Is_Render_D3D11_Backend_Active();

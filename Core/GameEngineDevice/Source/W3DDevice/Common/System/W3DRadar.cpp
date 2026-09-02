@@ -55,8 +55,9 @@
 #include "W3DDevice/Common/RadarTerrainPrepare.h"
 #include "W3DDevice/GameClient/HeightMap.h"
 #include "W3DDevice/GameClient/W3DShroud.h"
+#include "Renderer/RenderGameClient.h"
+#include "Renderer/RenderTexturePublication.h"
 #include "WW3D2/texture.h"
-#include "WW3D2/dx8caps.h"
 #include "WWMath/vector2i.h"
 
 #include <limits.h>
@@ -91,7 +92,7 @@ static WW3DFormat findFormat(const WW3DFormat formats[])
 	for( Int i = 0; formats[ i ] != WW3D_FORMAT_UNKNOWN; i++ )
 	{
 
-		if( DX8Wrapper::Get_Current_Caps()->Support_Texture_Format( formats[ i ] ) )
+		if (rts::render::IsGameTextureFormatSupported(formats[i]))
 		{
 
 			return formats[ i ];
@@ -654,12 +655,12 @@ static Bool mapRadarOverlayFormat( WW3DFormat surfaceFormat,
 }
 
 /* Surface locks and CopyRects update the legacy texture storage directly.
- * Tell the D3D11 bridge only after the complete owner-thread write is done so
+ * Tell the native renderer only after the complete owner-thread write is done so
  * it cannot sample a partially updated radar image. */
 static void notifyRadarTextureChanged( TextureClass *texture )
 {
 	if( texture != nullptr )
-		Notify_Render_Texture_Changed(texture);
+		rts::render::NotifyTextureChanged(texture);
 }
 
 static Bool countRadarObjectOverlayList( const RadarObject *listHead,
@@ -1576,7 +1577,7 @@ void W3DRadar::newMap( TerrainLogic *terrain )
 }
 
 // Map the owner-visible surface enum explicitly.  The radar kernel has its
-// own D3D-free format codes; relying on matching enum ordinals would make a
+// own neutral format codes; relying on matching enum ordinals would make a
 // future WW3DFormat insertion silently change the bytes written by workers.
 static Bool mapRadarTerrainFormat( WW3DFormat surfaceFormat,
 	unsigned *kernelFormat )
@@ -1690,7 +1691,7 @@ private:
 };
 
 // ------------------------------------------------------------------------------------------------
-// Copy all live terrain/radar inputs needed by the D3D-free raster kernel.
+// Copy all live terrain/radar inputs needed by the neutral raster kernel.
 // This remains on the owner thread; the resulting batch contains no engine
 // pointers and is complete before any future worker task is admitted.
 // ------------------------------------------------------------------------------------------------
@@ -1876,7 +1877,7 @@ void W3DRadar::buildTerrainTexture( TerrainLogic *terrain )
 	surface->Get_Description(surfaceDesc);
 
 	/*
-	 * Stage the complete owner snapshot before locking the D3D surface.  A
+	 * Stage the complete owner snapshot before locking the renderer surface.  A
 	 * failed allocation, capture, or kernel validation deliberately falls
 	 * through to the unchanged allocation-free owner loop below.
 	 */
@@ -2231,7 +2232,7 @@ void W3DRadar::setShroudLevel(Int shroudX, Int shroudY, CellShroudStatus setting
 			return;
 		}
 
-		/* Fold a full prefix into the owner CPU image without touching D3D,
+		/* Fold a full prefix into the owner CPU image without touching the renderer,
 		 * then retain the same bounded storage for the next ordered chunk. */
 		if( PackRadarShroudRows( m_shroudOverlayBatch.snapshot(), 0,
 			m_shroudOverlayBatch.snapshot().height ) )
@@ -2358,7 +2359,7 @@ void W3DRadar::beginSetShroudLevel()
 	m_shroudBatchFallback = FALSE;
 	if( m_shroudBatchPendingCommit && m_shroudOverlayBatch.isAllocated() )
 	{
-		/* A prior D3D commit failed after the complete ordered image was
+		/* A prior renderer commit failed after the complete ordered image was
 		 * prepared.  Keep that image as this batch's base and merge new
 		 * commands into it until an owner-thread upload succeeds. */
 		m_shroudBatchFolded = TRUE;
@@ -2469,7 +2470,7 @@ void W3DRadar::endSetShroudLevel()
 		{
 			if( outputReady )
 			{
-				/* Do not discard a complete image on a transient D3D failure.
+				/* Do not discard a complete image on a transient renderer failure.
 				 * The next begin/end cycle retries it before accepting loss. */
 				m_shroudOverlayBatch.clearCommands();
 				m_shroudBatchFolded = TRUE;

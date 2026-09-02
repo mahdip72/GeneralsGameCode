@@ -1,9 +1,88 @@
 param(
-    [Parameter(Mandatory = $true)]
-    [string]$SourceRoot
+    [string]$SourceRoot,
+    [switch]$SelfTest
 )
 
 $ErrorActionPreference = 'Stop'
+
+function Get-SurfaceUnlockBlock {
+    param([Parameter(Mandatory = $true)][string]$SurfaceText)
+
+    return [regex]::Match($SurfaceText,
+        '(?s)void SurfaceClass::Unlock\(\)\s*\{(?<body>.*?)\r?\n\}\r?\n\r?\nbool SurfaceClass::Unlock_Native_Surface').Groups['body'].Value
+}
+
+function Test-SurfaceUnlockPublicationContract {
+    param([Parameter(Mandatory = $true)][string]$SurfaceText)
+
+    $unlock = Get-SurfaceUnlockBlock $SurfaceText
+    if ([string]::IsNullOrWhiteSpace($unlock)) {
+        return $false
+    }
+    $guard = [regex]::Match($unlock,
+        '(?s)if\s*\(\s*NativeSurface\s*!=\s*nullptr\s*&&\s*NativeSurface->locked\s*\)\s*\{(?<body>.*?)\r?\n\s*\}')
+    if (-not $guard.Success) {
+        return $false
+    }
+    $guardBody = $guard.Groups['body'].Value
+    $publicationPattern = '\bPublish_Native_Surface\s*\(\s*NativeSurface\b'
+    $publication = [regex]::Matches($unlock, $publicationPattern)
+    $guardPublication = [regex]::Matches($guardBody, $publicationPattern)
+    $locked = $guardBody.IndexOf('NativeSurface->locked = false;',
+        [StringComparison]::Ordinal)
+    return $publication.Count -eq 1 -and $guardPublication.Count -eq 1 -and
+        $locked -ge 0 -and
+        $locked -lt $guardBody.IndexOf($guardPublication[0].Value,
+            [StringComparison]::Ordinal)
+}
+
+if ($SelfTest) {
+    $validSurface = @'
+void SurfaceClass::Unlock()
+{
+    if (NativeSurface != nullptr && NativeSurface->locked)
+    {
+        NativeSurface->locked = false;
+        (void)Publish_Native_Surface(NativeSurface);
+    }
+}
+
+bool SurfaceClass::Unlock_Native_Surface()
+{
+    return true;
+}
+'@
+    if (-not (Test-SurfaceUnlockPublicationContract $validSurface)) {
+        throw 'Valid neutral SurfaceClass unlock fixture rejected.'
+    }
+    $duplicatePublication = $validSurface.Replace(
+        '(void)Publish_Native_Surface(NativeSurface);',
+        "(void)Publish_Native_Surface(NativeSurface);`n        (void)Publish_Native_Surface(NativeSurface);")
+    $missingPublication = $validSurface.Replace(
+        '(void)Publish_Native_Surface(NativeSurface);', '')
+    $unguardedPublication = $validSurface.Replace(
+        'if (NativeSurface != nullptr && NativeSurface->locked)',
+        'if (NativeSurface != nullptr)')
+    $wrongPublicationTarget = $validSurface.Replace(
+        'Publish_Native_Surface(NativeSurface)',
+        'Publish_Native_Surface(OtherSurface)')
+    foreach ($mutation in @(
+        $duplicatePublication,
+        $missingPublication,
+        $unguardedPublication,
+        $wrongPublicationTarget)) {
+        if ($mutation -eq $validSurface -or
+            (Test-SurfaceUnlockPublicationContract $mutation)) {
+            throw 'Invalid neutral SurfaceClass unlock fixture accepted.'
+        }
+    }
+    Write-Output 'FFmpeg movie playback audit self-test passed.'
+    exit 0
+}
+
+if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
+    throw 'SourceRoot is required unless SelfTest is specified.'
+}
 
 $coreFiles = @(
     'Core/GameEngineDevice/Include/VideoDevice/FFmpeg/FFmpegMoviePlayback.h',
@@ -181,15 +260,8 @@ if ([string]::IsNullOrWhiteSpace($unlockBlock) -or
 
 $surfacePath = Join-Path $SourceRoot 'Core/Libraries/Source/WWVegas/WW3D2/surfaceclass.cpp'
 $surfaceSource = Get-Content -LiteralPath $surfacePath -Raw
-$surfaceUnlockBlock = [regex]::Match($surfaceSource,
-    '(?s)void SurfaceClass::Unlock\(\)\s*\{(.*?)\r?\n\}\r?\n\r?\n#if\s+defined\(_WIN64\)').Groups[1].Value
-if ([string]::IsNullOrWhiteSpace($surfaceUnlockBlock) -or
-    $surfaceUnlockBlock -notmatch '(?s)#if\s+defined\(_WIN64\).*?NativeSurface->locked\s*=\s*false;.*?Publish_Native_Surface\(NativeSurface\)') {
+if (-not (Test-SurfaceUnlockPublicationContract $surfaceSource)) {
     throw 'SurfaceClass::Unlock is not the sole native video publication boundary.'
-}
-if (([regex]::Matches($surfaceUnlockBlock,
-    '\bPublish_Native_Surface\(\s*NativeSurface\b')).Count -ne 1) {
-    throw 'SurfaceClass::Unlock has more than one native video publication call.'
 }
 
 $frameRenderBlock = [regex]::Match($streamSource,
@@ -205,7 +277,7 @@ if ($frameRenderBlock -match 'AV_PIX_FMT_BGR0') {
     throw 'The video conversion path can expose a zero alpha channel to DRAW_IMAGE_ALPHA.'
 }
 
-$bridgePath = Join-Path $SourceRoot 'Core/Libraries/Source/WWVegas/WW3D2/d3d11legacybridge.cpp'
+$bridgePath = Join-Path $SourceRoot 'Core/LegacyRenderer/WWVegas/WW3D2/d3d11legacybridge.cpp'
 $bridgeSource = Get-Content -LiteralPath $bridgePath -Raw
 $bridgePublishBlock = [regex]::Match($bridgeSource,
     '(?s)bool D3D11LegacyBridge::Publish_Texture_BGRA8_Change\(.*?\)\s*\{(.*?)\r?\n\}\r?\n\r?\nvoid D3D11LegacyBridge::Invalidate_Texture').Groups[1].Value

@@ -162,6 +162,11 @@ NativeW3DOwnerFallbackEntry::~NativeW3DOwnerFallbackEntry()
 {
 }
 
+bool NativeW3DOwnerFallbackEntry::IsQueued() const
+{
+	return m_queued;
+}
+
 struct NativeW3DOwnerToken::Impl
 {
 	Impl(void *requestedContext, NativeW3DOwnerContextRelease requestedRelease) :

@@ -34,12 +34,14 @@
  * Functions:                                                                                  *
  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
+#include "Utility/CppMacros.h"
 #include "render2dsentence.h"
+#include "ww3d.h"
 #include "surfaceclass.h"
 #include "texture.h"
 #include "WWDebug/wwprofile.h"
 #include "WWDebug/wwmemlog.h"
-#include "dx8wrapper.h"
+#include "Renderer/RenderGameClient.h"
 
 
 ////////////////////////////////////////////////////////////////////////////////////
@@ -370,8 +372,27 @@ Render2DSentenceClass::Build_Textures ()
 		//
 		//	Copy the contents of the texture from the surface
 		//
-		DX8Wrapper::_Copy_DX8_Rects (curr_surface->Peek_D3D_Surface (), nullptr, 0, texture_surface->Peek_D3D_Surface (), nullptr);
+		bool copy_succeeded = texture_surface != nullptr;
+#if defined(_WIN64)
+		if (copy_succeeded) {
+			copy_succeeded = texture_surface->Copy_Native(
+				0, 0, 0, 0, desc.Width, desc.Height, curr_surface);
+		}
+#else
+		if (copy_succeeded) {
+			texture_surface->Copy(
+				0, 0, 0, 0, desc.Width, desc.Height, curr_surface);
+		}
+#endif
 		REF_PTR_RELEASE (texture_surface);
+		if (!copy_succeeded) {
+			// A native publication failure must not install a texture whose
+			// contents are stale or undefined.  Keep the pending renderer
+			// untouched and continue building independent sentence surfaces.
+			REF_PTR_RELEASE (new_texture);
+			REF_PTR_RELEASE (curr_surface);
+			continue;
+		}
 
 		//
 		//	Assign this texture to any renderers that need it

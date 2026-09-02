@@ -10,6 +10,8 @@
 
 #pragma once
 
+// Legacy renderer declarations; native code includes the neutral header.
+
 #include <Utility/CppMacros.h>
 
 #include "ww3dformat.h"
@@ -41,7 +43,7 @@ struct SurfaceBlitImageDescription
 };
 
 // Backend-neutral geometry contract shared by native byte-image users and the
-// legacy D3D8 adapter below.
+// legacy adapter below.
 bool SurfaceBlit_Can_Copy_Direct(
 	const SurfaceBlitImageDescription &destination,
 	const SurfaceBlitRectangle &destination_rect,
@@ -85,62 +87,3 @@ bool SurfaceBlit_Write_A8R8G8B8(
 	unsigned char *destination,
 	int destination_pitch,
 	WW3DFormat destination_format);
-
-#if defined(BUILD_WITH_D3D8)
-
-#include <d3d8.h>
-
-// D3D8-format shims retained only for legacy callers.  They translate the
-// format enum and immediately enter the byte-image kernels above.
-bool SurfaceBlit_Convert_To_A8R8G8B8(
-	const unsigned char *source,
-	int source_pitch,
-	unsigned int width,
-	unsigned int height,
-	D3DFORMAT source_format,
-	std::vector<unsigned char> *pixels);
-
-bool SurfaceBlit_Write_A8R8G8B8(
-	const unsigned char *source,
-	unsigned int width,
-	unsigned int height,
-	unsigned char *destination,
-	int destination_pitch,
-	D3DFORMAT destination_format);
-
-// Copy a source rectangle into a destination rectangle.  Equal-format,
-// equal-sized rectangles use IDirect3DDevice8::CopyRects.  Other characterized
-// combinations are staged and converted/scaled on the CPU.
-HRESULT SurfaceBlit_Copy(
-	IDirect3DSurface8 *destination,
-	const RECT *destination_rect,
-	IDirect3DSurface8 *source,
-	const RECT *source_rect,
-	SurfaceBlitFilter filter);
-// Copy and convert a surface to tightly packed A8R8G8B8 bytes.  The source is
-// first copied to a lockable system-memory surface with CopyRects, so this is
-// valid for both managed/system-memory and default-pool render-target sources.
-// Unsupported formats return D3DERR_NOTAVAILABLE.
-HRESULT SurfaceBlit_Copy_Surface_To_A8R8G8B8(
-	IDirect3DSurface8 *source,
-	unsigned int width,
-	unsigned int height,
-	std::vector<unsigned char> *pixels);
-
-// Pure geometry predicate used by tests and by SurfaceBlit_Copy.  It records
-// the exact CopyRects acceptance rule without creating a D3D device.
-bool SurfaceBlit_Can_Use_CopyRects(
-	const D3DSURFACE_DESC &destination,
-	const RECT &destination_rect,
-	const D3DSURFACE_DESC &source,
-	const RECT &source_rect,
-	SurfaceBlitFilter filter);
-
-// Select the full-surface operation used by the legacy texture-from-surface
-// path.  Exact format/size matches are byte copies; all other cases retain
-// the characterized BOX conversion boundary.
-SurfaceBlitFilter SurfaceBlit_Filter_For_Full_Copy(
-	const D3DSURFACE_DESC &destination,
-	const D3DSURFACE_DESC &source);
-
-#endif

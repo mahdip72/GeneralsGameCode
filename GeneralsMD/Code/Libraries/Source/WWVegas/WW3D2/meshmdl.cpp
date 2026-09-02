@@ -38,6 +38,7 @@
  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 #include "meshmdl.h"
+#include "dx8fvf.h"
 #include "matinfo.h"
 #include "aabtree.h"
 #include "htree.h"
@@ -48,6 +49,7 @@
 #include "camera.h"
 #include "dx8renderer.h"
 #include "WWLib/hashtemplate.h"
+#include "Renderer/RenderGameClient.h"
 
 
 /*
@@ -639,7 +641,7 @@ void GapFillerClass::Shrink_Buffers()
 
 void MeshModelClass::Init_For_NPatch_Rendering()
 {
-	if (!DX8Wrapper::Get_Current_Caps()->Support_NPatches()) return;
+	if (!rts::render::GameRendererSupportsNPatches()) return;
 	if (!Get_Flag(MeshGeometryClass::ALLOW_NPATCHES)) return;
 	if (GapFiller) return;
 

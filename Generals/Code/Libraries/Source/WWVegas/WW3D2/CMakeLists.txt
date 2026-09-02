@@ -43,25 +43,6 @@ set(WW3D2_SRC
     #distlod.cpp
     #distlod.h
     #dllist.h
-#    dx8caps.cpp
-#    dx8caps.h
-#    dx8fvf.cpp
-#    dx8fvf.h
-#    dx8indexbuffer.cpp
-#    dx8indexbuffer.h
-    #dx8list.h
-    #dx8polygonrenderer.cpp
-    #dx8polygonrenderer.h
-#    dx8renderer.cpp
-#    dx8renderer.h
-    #dx8texman.cpp
-    #dx8texman.h
-#    dx8vertexbuffer.cpp
-#    dx8vertexbuffer.h
-    #dx8webbrowser.cpp
-    #dx8webbrowser.h
-#    dx8wrapper.cpp
-#    dx8wrapper.h
     #dynamesh.cpp
     #dynamesh.h
     #font3d.cpp
@@ -233,6 +214,36 @@ set_target_properties(g_ww3d2 PROPERTIES OUTPUT_NAME ww3d2)
 
 target_sources(g_ww3d2 PRIVATE ${WW3D2_SRC})
 
+# Mesh loading is CPU-side file parsing and does not require the renderer PCH.
+# Keep the native translation unit independent from the compatibility PCH.
+if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD)
+    set_source_files_properties(
+        "${CMAKE_CURRENT_SOURCE_DIR}/meshmdlio.cpp"
+        PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+endif()
+
+# Line3D's native implementation consumes this title's ShaderClass ABI. Keep
+# it in the product target so the two titles do not share title headers through
+# core_ww3d2_native.
+if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD)
+    set(_g_native_line3d
+        "${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas/WW3D2/nativeLine3d.cpp")
+    target_sources(g_ww3d2 PRIVATE ${_g_native_line3d})
+    set(_g_native_title_renderer_sources
+        "${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas/WW3D2/nativew3dmeshrenderer.cpp"
+        "${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas/WW3D2/nativew3dpolygonrenderer.cpp"
+        "${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas/WW3D2/nativew3drendererdebugger.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/RenderGameClientNativeTitle.cpp")
+    target_sources(g_ww3d2 PRIVATE ${_g_native_title_renderer_sources})
+    set_source_files_properties(${_g_native_line3d}
+        PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+    set_source_files_properties(${_g_native_title_renderer_sources}
+        PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+    target_include_directories(g_ww3d2 PRIVATE
+        "${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas/WW3D2"
+    )
+endif()
+
 target_include_directories(g_ww3d2 PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"
 )
@@ -241,16 +252,7 @@ target_compile_definitions(g_ww3d2 PRIVATE
     $<$<BOOL:${IS_VS6_BUILD}>:WINVER=0x0500>
 )
 
-target_precompile_headers(g_ww3d2 PRIVATE
-    [["Utility/CppMacros.h"]] # Must be first, to be removed when abandoning VC6
-    [["dx8wrapper.h"]]
-    [["WWLib/always.h"]]
-    [["WWLib/STLUtils.h"]]
-    [["WWLib/win.h"]]
-    [["WWLib/WWCommon.h"]]
-    [["WWLib/wwstring.h"]]
-    <windows.h>
-)
+rts_configure_title_ww3d2(g_ww3d2 GENERALS)
 
 target_link_libraries(g_ww3d2 PUBLIC
 	core_config

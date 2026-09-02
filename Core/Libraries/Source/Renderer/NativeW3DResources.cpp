@@ -354,18 +354,25 @@ private:
 		const NativeW3DTextureCleanupTicket &);
 };
 
+NativeW3DBufferCleanupTicket::NativeW3DBufferCleanupTicket() :
+	m_table(0), m_handle(), m_fallback(), m_next(0), m_inUse(false)
+{
+}
+
+bool NativeW3DBufferCleanupTicket::IsInUse() const
+{
+	return m_inUse;
+}
+
 struct NativeW3DResources::Impl
 {
 	Impl(unsigned int capacity) : references(1), state(0), generation(0),
 		stateGeneration(0),
 		nextAuthorityEpoch(0), lastThreadedCompletionSequence(0), slots(capacity),
-		cleanupTickets(0) {}
-	~Impl()
-	{
-		// Each ticket owns one table reference, so the final table release can
-		// occur only after every external candidate/publication token is gone.
-		assert(cleanupTickets == 0);
-	}
+		bufferCleanupTicketPool(new (std::nothrow)
+			NativeW3DBufferCleanupTicket[capacity]),
+		bufferCleanupTicketCapacity(capacity), cleanupTickets(0),
+		bufferCleanupTickets(0) {}
 	volatile long references;
 	mutable ResourceTableLock cleanupLock;
 	NativeW3DRenderState *state;
@@ -376,8 +383,22 @@ struct NativeW3DResources::Impl
 	unsigned int nextAuthorityEpoch;
 	NativeW3DSubmissionSequence lastThreadedCompletionSequence;
 	std::vector<Slot> slots;
+	// Buffer owners draw tickets from this fixed-size pool.  The pool is sized
+	// with the resource slots, so a live buffer slot always has room for its
+	// owner ticket without a destructor-time allocation.
+	NativeW3DBufferCleanupTicket *bufferCleanupTicketPool;
+	unsigned int bufferCleanupTicketCapacity;
 	NativeW3DOwnerFallbackEntry fallbackCleanup;
 	NativeW3DTextureCleanupTicket *cleanupTickets;
+	NativeW3DBufferCleanupTicket *bufferCleanupTickets;
+
+	~Impl()
+	{
+		// Each ticket owns one table reference, so the final table release can
+		// occur only after every external candidate/publication token is gone.
+		assert(cleanupTickets == 0 && bufferCleanupTickets == 0);
+		delete[] bufferCleanupTicketPool;
+	}
 };
 
 namespace
@@ -543,7 +564,8 @@ NativeW3DResources::NativeW3DResources(unsigned int capacity) : m_impl(0)
 	try
 	{
 		m_impl = new Impl(capacity);
-		if (!m_impl->cleanupLock.IsInitialized())
+		if (!m_impl->cleanupLock.IsInitialized() ||
+			m_impl->bufferCleanupTicketPool == 0)
 		{
 			delete m_impl;
 			m_impl = 0;
@@ -662,7 +684,9 @@ RenderResult NativeW3DResources::BindState(NativeW3DRenderState *state)
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
-		if (m_impl->cleanupTickets != 0 || m_impl->generation == UINT_MAX)
+		if (m_impl->cleanupTickets != 0 ||
+			m_impl->bufferCleanupTickets != 0 ||
+			m_impl->generation == UINT_MAX)
 		{
 			// A prior attachment's externally held tokens must reach zero before
 			// this table can publish a new backend identity. Epoch exhaustion is
@@ -723,7 +747,8 @@ RenderResult NativeW3DResources::Shutdown()
 	bool hasCleanupTickets = false;
 	{
 		ScopedResourceTableLock lock(m_impl->cleanupLock);
-		hasCleanupTickets = m_impl->cleanupTickets != 0;
+		hasCleanupTickets = m_impl->cleanupTickets != 0 ||
+			m_impl->bufferCleanupTickets != 0;
 	}
 	if (hasCleanupTickets && !terminallyDetached && !terminallyUnavailable)
 	{
@@ -1747,6 +1772,7 @@ bool NativeW3DResources::Destroy(GpuHandle handle)
 	IRenderDevice *device = m_impl == 0 || m_impl->state == 0 ? 0 :
 		m_impl->state->Device();
 	if (slot == 0 || HasTextureCleanupTicket(m_impl, handle) ||
+		HasBufferCleanupTicket(m_impl, handle) ||
 		device == 0 || !device->isOperational() ||
 		!m_impl->state->IsOperational() ||
 		m_impl->stateGeneration != m_impl->state->Generation())
@@ -1774,6 +1800,15 @@ bool NativeW3DResources::DestroyTexture(NativeW3DTextureHandle handle)
 	const Slot *slot = Find(handle.resource);
 	return IsValid(handle) && slot != 0 && slot->kind == 2 ?
 		Destroy(handle.resource) : false;
+}
+
+bool NativeW3DResources::RetireBuffer(GpuHandle handle)
+{
+	if (!IsOwnerThread() || HasBufferCleanupTicket(m_impl, handle))
+	{
+		return false;
+	}
+	return RetireBufferImpl(m_impl, handle);
 }
 
 bool NativeW3DResources::RetireTexture(NativeW3DTextureHandle handle)
@@ -1831,6 +1866,65 @@ bool NativeW3DResources::RetireTextureImpl(Impl *impl,
 	return true;
 }
 
+bool NativeW3DResources::RetireBufferImpl(Impl *impl, GpuHandle handle)
+{
+	Slot *slot = 0;
+	if (impl != 0)
+	{
+		for (size_t index = 0; index < impl->slots.size(); ++index)
+		{
+			if (impl->slots[index].handle == handle)
+			{
+				slot = &impl->slots[index];
+				break;
+			}
+		}
+	}
+	IRenderDevice *device = impl == 0 || impl->state == 0 ? 0 :
+		impl->state->Device();
+	if (!handle.isValid() || slot == 0 || slot->kind != 1 || slot->retired ||
+		device == 0 || !device->isOperational() ||
+		!impl->state->IsOperational() || impl->stateGeneration !=
+		impl->state->Generation())
+	{
+		return false;
+	}
+	if (DestroyResourceAndWait(device, handle) == RENDER_RESULT_OK)
+	{
+		*slot = Slot();
+		return true;
+	}
+
+	// The owner has transferred the exact slot to the registry even though the
+	// backend refused this release.  Retiring it makes all typed acquisitions
+	// fail closed while Shutdown retains the live handle for a later retry.
+	// This helper is an instance method because it advances the table-owned
+	// authority epoch, while this cleanup path only retains the implementation
+	// pointer.  Keep the equivalent invalidation inline here so the fallback
+	// callback remains static and can operate without a facade object.
+	slot->authority = NATIVE_W3D_CONTENT_INVALID;
+	slot->initializedBytes.clear();
+	slot->submissionInitializedBytes.clear();
+	slot->pendingBufferPublications.clear();
+	slot->submissionAuthority = NATIVE_W3D_CONTENT_INVALID;
+	slot->backendEpoch = 0;
+	slot->submissionBackendEpoch = 0;
+	if (slot->buffer.usage != RENDER_USAGE_DEFAULT)
+	{
+		slot->recoveryInitializedBytes.clear();
+		slot->recoveryBytes.clear();
+	}
+	slot->authorityFailure = true;
+	++impl->nextAuthorityEpoch;
+	if (impl->nextAuthorityEpoch == 0)
+	{
+		++impl->nextAuthorityEpoch;
+	}
+	slot->authorityEpoch = impl->nextAuthorityEpoch;
+	slot->retired = true;
+	return true;
+}
+
 bool NativeW3DResources::HasTextureCleanupTicket(const Impl *impl,
 	GpuHandle handle)
 {
@@ -1843,6 +1937,25 @@ bool NativeW3DResources::HasTextureCleanupTicket(const Impl *impl,
 		impl->cleanupTickets; ticket != 0; ticket = ticket->m_next)
 	{
 		if (ticket->m_handle.resource == handle)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+bool NativeW3DResources::HasBufferCleanupTicket(const Impl *impl,
+	GpuHandle handle)
+{
+	if (impl == 0 || !handle.isValid())
+	{
+		return false;
+	}
+	ScopedResourceTableLock lock(impl->cleanupLock);
+	for (const NativeW3DBufferCleanupTicket *ticket =
+		impl->bufferCleanupTickets; ticket != 0; ticket = ticket->m_next)
+	{
+		if (ticket->m_handle == handle)
 		{
 			return true;
 		}
@@ -1924,6 +2037,118 @@ RenderResult NativeW3DResources::ReleaseTextureCleanupTicket(
 	return result;
 }
 
+RenderResult NativeW3DResources::CreateBufferCleanupTicket(
+	GpuHandle handle, NativeW3DBufferCleanupTicket **ticket)
+{
+	if (ticket == 0)
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	*ticket = 0;
+	if (!IsOwnerThread() || !IsValid(handle))
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+
+	NativeW3DBufferCleanupTicket *created = 0;
+	{
+		ScopedResourceTableLock lock(m_impl->cleanupLock);
+		for (unsigned int index = 0;
+			index < m_impl->bufferCleanupTicketCapacity; ++index)
+		{
+			NativeW3DBufferCleanupTicket &candidate =
+				m_impl->bufferCleanupTicketPool[index];
+			if (candidate.m_inUse)
+			{
+				continue;
+			}
+			candidate.m_table = m_impl;
+			candidate.m_handle = handle;
+			candidate.m_next = m_impl->bufferCleanupTickets;
+			candidate.m_inUse = true;
+			m_impl->bufferCleanupTickets = &candidate;
+			created = &candidate;
+			break;
+		}
+	}
+	if (created == 0)
+	{
+		// The pool is sized to the resource-slot capacity.  Reaching this path
+		// means another producer owns a direct slot without a ticket; fail the
+		// owner creation before publishing an untracked handle.
+		return RENDER_RESULT_OUT_OF_MEMORY;
+	}
+	AddImplReference(m_impl);
+	*ticket = created;
+	return RENDER_RESULT_OK;
+}
+
+RenderResult NativeW3DResources::ReleaseBufferCleanupTicket(
+	NativeW3DBufferCleanupTicket *ticket)
+{
+	Impl *impl = ticket == 0 ? 0 : static_cast<Impl *>(ticket->m_table);
+	if (impl == 0 || !ticket->m_inUse)
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	NativeW3DRenderState *state = 0;
+	{
+		ScopedResourceTableLock lock(impl->cleanupLock);
+		state = impl->state;
+		if (state != 0)
+		{
+			state->AddRef();
+		}
+	}
+	if (state == 0)
+	{
+		// A terminal table cleanup may already be queued ahead of this ticket.
+		// Never recycle the pool node while that fallback still references it.
+		if (!ticket->m_fallback.IsQueued())
+		{
+			ForgetBufferCleanupTicket(impl, ticket);
+		}
+		return RENDER_RESULT_OK;
+	}
+	if (ticket->m_fallback.IsQueued())
+	{
+		// The render owner already owns the queued fallback.  This call merely
+		// detaches the dying facade from that owner-thread cleanup path.
+		state->Release();
+		return RENDER_RESULT_OK;
+	}
+	if (state->IsOwnerThread() && RetireBufferImpl(impl, ticket->m_handle))
+	{
+		ForgetBufferCleanupTicket(impl, ticket);
+		state->Release();
+		return RENDER_RESULT_OK;
+	}
+	RenderResult result = state->EnqueueFallbackCleanup(
+		DestroyTransferredBuffer, ticket, ReleaseTransferredBuffer,
+		&ticket->m_fallback);
+	if (result != RENDER_RESULT_OK && state->IsBackendTerminal())
+	{
+		// A terminal backend has already discarded native allocations.  Clear
+		// only this exact slot, then recycle the node; an operational closed
+		// queue instead keeps the ticket linked so Shutdown remains blocked.
+		{
+			ScopedResourceTableLock lock(impl->cleanupLock);
+			for (size_t index = 0; index < impl->slots.size(); ++index)
+			{
+				if (impl->slots[index].handle == ticket->m_handle)
+				{
+					impl->slots[index] = Slot();
+					break;
+				}
+			}
+		}
+		ForgetBufferCleanupTicket(impl, ticket);
+		result = RENDER_RESULT_OK;
+	}
+	state->Release();
+	return result;
+}
+
 void NativeW3DResources::ForgetTextureCleanupTicket(
 	Impl *impl, NativeW3DTextureCleanupTicket *ticket)
 {
@@ -1950,6 +2175,37 @@ void NativeW3DResources::ForgetTextureCleanupTicket(
 	if (forgotten)
 	{
 		delete ticket;
+		ReleaseImplReference(impl);
+	}
+}
+
+void NativeW3DResources::ForgetBufferCleanupTicket(
+	Impl *impl, NativeW3DBufferCleanupTicket *ticket)
+{
+	if (ticket == 0 || impl == 0)
+	{
+		return;
+	}
+	bool forgotten = false;
+	{
+		ScopedResourceTableLock lock(impl->cleanupLock);
+		NativeW3DBufferCleanupTicket **link = &impl->bufferCleanupTickets;
+		while (*link != 0 && *link != ticket)
+		{
+			link = &(*link)->m_next;
+		}
+		if (*link == ticket)
+		{
+			*link = ticket->m_next;
+			ticket->m_next = 0;
+			ticket->m_table = 0;
+			ticket->m_handle = GpuHandle();
+			ticket->m_inUse = false;
+			forgotten = true;
+		}
+	}
+	if (forgotten)
+	{
 		ReleaseImplReference(impl);
 	}
 }
@@ -2020,6 +2276,63 @@ void NativeW3DResources::ReleaseTransferredTexture(void *context)
 	if (impl != 0)
 	{
 		ForgetTextureCleanupTicket(impl, ticket);
+	}
+}
+
+void NativeW3DResources::DestroyTransferredBuffer(void *context)
+{
+	NativeW3DBufferCleanupTicket *ticket =
+		static_cast<NativeW3DBufferCleanupTicket *>(context);
+	Impl *impl = ticket == 0 ? 0 : static_cast<Impl *>(ticket->m_table);
+	if (impl == 0)
+	{
+		throw 1;
+	}
+	NativeW3DRenderState *state = 0;
+	{
+		ScopedResourceTableLock lock(impl->cleanupLock);
+		state = impl->state;
+		if (state != 0)
+		{
+			state->AddRef();
+		}
+	}
+	if (state == 0)
+	{
+		return;
+	}
+	if (state->IsBackendTerminal())
+	{
+		{
+			ScopedResourceTableLock lock(impl->cleanupLock);
+			for (size_t index = 0; index < impl->slots.size(); ++index)
+			{
+				if (impl->slots[index].handle == ticket->m_handle)
+				{
+					impl->slots[index] = Slot();
+					break;
+				}
+			}
+		}
+		state->Release();
+		return;
+	}
+	const bool retired = RetireBufferImpl(impl, ticket->m_handle);
+	state->Release();
+	if (!retired)
+	{
+		throw 1;
+	}
+}
+
+void NativeW3DResources::ReleaseTransferredBuffer(void *context)
+{
+	NativeW3DBufferCleanupTicket *ticket =
+		static_cast<NativeW3DBufferCleanupTicket *>(context);
+	Impl *impl = ticket == 0 ? 0 : static_cast<Impl *>(ticket->m_table);
+	if (impl != 0)
+	{
+		ForgetBufferCleanupTicket(impl, ticket);
 	}
 }
 

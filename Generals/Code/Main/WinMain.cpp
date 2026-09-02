@@ -466,7 +466,7 @@ LRESULT CALLBACK WndProc( HWND hWnd, UINT message,
 					// intended to clear resources on a lost device in fullscreen, but effectively also in
 					// windowed mode, if the DXMaximizedWindowedMode shim was applied in newer versions of Windows,
 					// which lead to unfortunate application crashing. Resetting the device on WM_ACTIVATEAPP instead
-					// of TestCooperativeLevel() == D3DERR_DEVICENOTRESET is not a requirement. There are other code
+					// of the cooperative-level reset signal is not a requirement. There are other code
 					// paths that take care of that.
 
 					isWinMainActive = (BOOL) wParam;

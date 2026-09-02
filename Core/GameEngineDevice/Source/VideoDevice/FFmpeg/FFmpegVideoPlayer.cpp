@@ -604,6 +604,7 @@ void FFmpegVideoStream::frameRender( VideoBuffer *buffer )
 	const int result =
 		sws_scale(m_swsContext, m_frame->data, m_frame->linesize, 0, height(), dst_data, dst_strides);
 	DEBUG_ASSERTLOG(result >= 0, ("Failed to scale frame"));
+	(void)result;
 	buffer->unlock();
 }
 
