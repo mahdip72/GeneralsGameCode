@@ -3,7 +3,7 @@
 
 #include "Renderer/RendererDevice.h"
 
-#include <stdint.h>
+#include <Utility/stdint_adapter.h>
 
 class NativeW3D2;
 

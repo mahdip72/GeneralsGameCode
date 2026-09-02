@@ -7,6 +7,9 @@
 #endif
 #include "Renderer/LegacyBridgeValidation.h"
 #include "Renderer/LegacyRenderState.h"
+#if !defined(RTS_RENDERER_HAS_D3D11)
+#include "Renderer/NativeW3DRenderer.h"
+#endif
 
 #include <stdio.h>
 #include <algorithm>
@@ -190,6 +193,19 @@ int testRenderTexturePublicationOperationalStates()
 		"native texture publication is suppressed while the bridge is lost");
 	return result;
 }
+
+#if !defined(RTS_RENDERER_HAS_D3D11)
+int testNativeRendererRejectsUnavailableBackend()
+{
+	rts::render::NativeW3DRenderer renderer;
+	rts::render::NativeW3DRendererDescriptor descriptor;
+	descriptor.width = 64;
+	descriptor.height = 64;
+	return check(renderer.Initialize(&renderer, descriptor) ==
+		rts::render::RENDER_RESULT_UNSUPPORTED,
+		"native renderer reports unsupported when its backend is unavailable");
+}
+#endif
 
 int testRendererTextureLifecycleContracts()
 {
@@ -2924,6 +2940,68 @@ int testD3D11HiddenSwapChain()
 		result |= check(device->createTexture(textureDescriptor, &textureData, 1,
 			&texture) == rts::render::RENDER_RESULT_OK,
 			"D3D11 parity probe creates an immutable shader texture");
+		// Texture type masks are packed into the legacy constant buffer.  Keep
+		// deliberately contrasting resources here so a first draw can expose a
+		// state-before-texture publication, rather than only proving that the SRV
+		// binding itself succeeded.
+		const unsigned int typeProbeCubePixels[6] = {
+			0xff0000ffU, 0xff0000ffU, 0xff0000ffU,
+			0xff0000ffU, 0xff0000ffU, 0xff0000ffU
+		};
+		rts::render::TextureSubresourceData typeProbeCubeData[6];
+		for (unsigned int face = 0; face < 6; ++face)
+		{
+			typeProbeCubeData[face].data = &typeProbeCubePixels[face];
+			typeProbeCubeData[face].rowPitch = sizeof(unsigned int);
+			typeProbeCubeData[face].slicePitch = sizeof(unsigned int);
+		}
+		rts::render::TextureDescriptor typeProbeCubeDescriptor = textureDescriptor;
+		typeProbeCubeDescriptor.width = 1;
+		typeProbeCubeDescriptor.height = 1;
+		typeProbeCubeDescriptor.arrayCount = 6;
+		typeProbeCubeDescriptor.dimension = rts::render::RENDER_TEXTURE_CUBE;
+		rts::render::GpuHandle typeProbeCubeTexture;
+		const unsigned int typeProbeGradientPixels[2] = {
+			0xff0000ffU, 0xffff0000U
+		};
+		rts::render::TextureDescriptor typeProbeGradientDescriptor = textureDescriptor;
+		typeProbeGradientDescriptor.width = 2;
+		typeProbeGradientDescriptor.height = 1;
+		rts::render::TextureSubresourceData typeProbeGradientData;
+		typeProbeGradientData.data = typeProbeGradientPixels;
+		typeProbeGradientData.rowPitch = 2 * sizeof(unsigned int);
+		typeProbeGradientData.slicePitch = sizeof(typeProbeGradientPixels);
+		rts::render::GpuHandle typeProbeGradientTexture;
+		const unsigned char typeProbeSignedPixels[2] = { 0xc0, 0x00 };
+		rts::render::TextureDescriptor typeProbeSignedDescriptor = textureDescriptor;
+		typeProbeSignedDescriptor.width = 1;
+		typeProbeSignedDescriptor.height = 1;
+		typeProbeSignedDescriptor.format = rts::render::RENDER_FORMAT_R8G8_SNORM;
+		rts::render::TextureSubresourceData typeProbeSignedData;
+		typeProbeSignedData.data = typeProbeSignedPixels;
+		typeProbeSignedData.rowPitch = 2;
+		typeProbeSignedData.slicePitch = sizeof(typeProbeSignedPixels);
+		rts::render::GpuHandle typeProbeSignedTexture;
+		const unsigned int typeProbeUnsignedPixels[1] = { 0xff000040U };
+		rts::render::TextureDescriptor typeProbeUnsignedDescriptor = textureDescriptor;
+		typeProbeUnsignedDescriptor.width = 1;
+		typeProbeUnsignedDescriptor.height = 1;
+		rts::render::TextureSubresourceData typeProbeUnsignedData;
+		typeProbeUnsignedData.data = typeProbeUnsignedPixels;
+		typeProbeUnsignedData.rowPitch = sizeof(unsigned int);
+		typeProbeUnsignedData.slicePitch = sizeof(typeProbeUnsignedPixels);
+		rts::render::GpuHandle typeProbeUnsignedTexture;
+		const bool typeProbeResourcesCreated =
+			device->createTexture(typeProbeCubeDescriptor, typeProbeCubeData, 6,
+				&typeProbeCubeTexture) == rts::render::RENDER_RESULT_OK &&
+			device->createTexture(typeProbeGradientDescriptor, &typeProbeGradientData,
+				1, &typeProbeGradientTexture) == rts::render::RENDER_RESULT_OK &&
+			device->createTexture(typeProbeSignedDescriptor, &typeProbeSignedData, 1,
+				&typeProbeSignedTexture) == rts::render::RENDER_RESULT_OK &&
+			device->createTexture(typeProbeUnsignedDescriptor, &typeProbeUnsignedData,
+				1, &typeProbeUnsignedTexture) == rts::render::RENDER_RESULT_OK;
+		result |= check(typeProbeResourcesCreated,
+			"D3D11 creates contrasting cube, signed, and unsigned texture probes");
 		const unsigned int treeShroudPixels[4] = {
 			0xff000000U, 0xffffffffU, 0xffffffffU, 0xffffffffU
 		};
@@ -4083,6 +4161,48 @@ int testD3D11HiddenSwapChain()
 		result |= check(center[1] > 240 && center[0] < 16 && center[2] < 16 &&
 			outside[0] > 240 && outside[1] < 16 && outside[2] < 16,
 			"XYZRHW conversion preserves viewport offset, extent, and diffuse color");
+		// POSITIONT constants include the viewport transform.  Change the native
+		// viewport after publishing the same logical state so draw-boundary refresh
+		// must update the cached constants without rebinding the pipeline.
+		bool viewportRefreshFrameStarted = context->beginFrame() ==
+			rts::render::RENDER_RESULT_OK;
+		bool viewportRefreshFrameSucceeded = false;
+		if (viewportRefreshFrameStarted)
+		{
+			viewportRefreshFrameSucceeded =
+				context->clear(clearColor, 1.0f, 0) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->setLegacyStateForLayout(logicalState,
+					preTransformedLayout, 0) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->setViewport(16.0f, 16.0f, 32.0f, 32.0f, 0.0f, 1.0f) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->setVertexBuffer(preTransformedBuffer,
+					sizeof(PreTransformedVertex), 0) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->setPrimitiveTopology(
+					rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->draw(6, 0) == rts::render::RENDER_RESULT_OK &&
+				context->setLegacyStateForLayout(logicalState,
+					preTransformedLayout, 0) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->draw(6, 0) == rts::render::RENDER_RESULT_OK;
+			const rts::render::RenderResult viewportRefreshEndResult =
+				context->endFrame();
+			viewportRefreshFrameSucceeded = viewportRefreshFrameSucceeded &&
+				viewportRefreshEndResult == rts::render::RENDER_RESULT_OK;
+		}
+		const bool viewportRefreshCaptured = viewportRefreshFrameSucceeded &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK;
+		const unsigned char *viewportRefreshEdge =
+			&pixels[4 * (32 * 64 + 20)];
+		result |= check(viewportRefreshCaptured && viewportRefreshEdge[1] > 240 &&
+			viewportRefreshEdge[0] < 16 && viewportRefreshEdge[2] < 16,
+			"draw refreshes POSITIONT constants after a cached viewport change");
 		rts::render::LegacyLogicalState preTransformedClipState = logicalState;
 		preTransformedClipState.pipeline.clipPlaneEnableMask = 1U;
 		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
@@ -4857,6 +4977,392 @@ int testD3D11HiddenSwapChain()
 			rts::render::LegacyTextureStageState();
 		result |= check(device->destroyResource(mipTexture),
 			"D3D11 parity probe drains the contrasting mip chain");
+		if (typeProbeResourcesCreated)
+		{
+			rts::render::LegacyLogicalState typeProbeState;
+			typeProbeState.pipeline.rasterizer.cullMode =
+				rts::render::RENDER_CULL_NONE;
+			typeProbeState.pipeline.textureStages[0].colorOperation =
+				rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_1;
+			typeProbeState.pipeline.textureStages[0].colorArgument1 =
+				rts::render::RENDER_TEXTURE_ARG_TEXTURE;
+			typeProbeState.pipeline.textureStages[0].alphaOperation =
+				rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_1;
+			typeProbeState.pipeline.textureStages[0].alphaArgument1 =
+				rts::render::RENDER_TEXTURE_ARG_TEXTURE;
+			std::vector<unsigned char> typeProbeCapture(64 * 64 * 4);
+			rts::render::RenderFormat typeProbeCaptureFormat =
+				rts::render::RENDER_FORMAT_UNKNOWN;
+
+			// The first draw deliberately publishes state before the cube SRV.  A
+			// stale cube mask makes the shader read the empty 2D slot instead of the
+			// red cube slot.
+			bool typeProbeFrameStarted = context->beginFrame() ==
+				rts::render::RENDER_RESULT_OK;
+			bool typeProbeFrameSucceeded = false;
+			if (typeProbeFrameStarted)
+			{
+				typeProbeFrameSucceeded =
+					context->clear(clearColor, 1.0f, 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, rts::render::GpuHandle()) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setLegacyStateForLayout(typeProbeState, texturedLayout,
+						1) == rts::render::RENDER_RESULT_OK &&
+					context->setVertexBuffer(texturedVertexBuffer,
+						sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, typeProbeCubeTexture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setPrimitiveTopology(
+						rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->draw(3, 0) == rts::render::RENDER_RESULT_OK;
+				const rts::render::RenderResult typeProbeEndResult =
+					context->endFrame();
+				typeProbeFrameSucceeded = typeProbeFrameSucceeded &&
+					typeProbeEndResult == rts::render::RENDER_RESULT_OK;
+			}
+			const bool typeProbeCubeCaptured = typeProbeFrameSucceeded &&
+				device->captureBackBuffer(&typeProbeCapture[0],
+					typeProbeCapture.size(), 64 * 4, &typeProbeCaptureFormat) ==
+					rts::render::RENDER_RESULT_OK;
+			const unsigned char *typeProbeCenter =
+				&typeProbeCapture[4 * (32 * 64 + 32)];
+			result |= check(typeProbeCubeCaptured && typeProbeCenter[2] > 240 &&
+				typeProbeCenter[0] < 16 && typeProbeCenter[1] < 16,
+				"D3D11 first draw refreshes cube type constants after state publication");
+
+			// Texture-before-state is the control ordering: setLegacyState sees the
+			// current 2D mask and must produce the green 2D sample.
+			typeProbeFrameStarted = context->beginFrame() ==
+				rts::render::RENDER_RESULT_OK;
+			typeProbeFrameSucceeded = false;
+			if (typeProbeFrameStarted)
+			{
+				typeProbeFrameSucceeded =
+					context->clear(clearColor, 1.0f, 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, texture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setLegacyStateForLayout(typeProbeState, texturedLayout,
+						1) == rts::render::RENDER_RESULT_OK &&
+					context->setVertexBuffer(texturedVertexBuffer,
+						sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+					context->setPrimitiveTopology(
+						rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->draw(3, 0) == rts::render::RENDER_RESULT_OK;
+				const rts::render::RenderResult typeProbeEndResult =
+					context->endFrame();
+				typeProbeFrameSucceeded = typeProbeFrameSucceeded &&
+					typeProbeEndResult == rts::render::RENDER_RESULT_OK;
+			}
+			const bool typeProbe2DCaptured = typeProbeFrameSucceeded &&
+				device->captureBackBuffer(&typeProbeCapture[0],
+					typeProbeCapture.size(), 64 * 4, &typeProbeCaptureFormat) ==
+					rts::render::RENDER_RESULT_OK;
+			typeProbeCenter = &typeProbeCapture[4 * (32 * 64 + 32)];
+			result |= check(typeProbe2DCaptured && typeProbeCenter[1] > 240 &&
+				typeProbeCenter[0] < 16 && typeProbeCenter[2] < 16,
+				"D3D11 texture-before-state ordering publishes the 2D type mask");
+
+			// Once a cube state has been bound, replacing its SRV with a 2D SRV
+			// without rebinding the logical state must refresh constants at draw time.
+			typeProbeFrameStarted = context->beginFrame() ==
+				rts::render::RENDER_RESULT_OK;
+			typeProbeFrameSucceeded = false;
+			if (typeProbeFrameStarted)
+			{
+				typeProbeFrameSucceeded =
+					context->clear(clearColor, 1.0f, 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, typeProbeCubeTexture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setLegacyStateForLayout(typeProbeState, texturedLayout,
+						1) == rts::render::RENDER_RESULT_OK &&
+					context->setVertexBuffer(texturedVertexBuffer,
+						sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+					context->setPrimitiveTopology(
+						rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, texture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->draw(3, 0) == rts::render::RENDER_RESULT_OK;
+				const rts::render::RenderResult typeProbeEndResult =
+					context->endFrame();
+				typeProbeFrameSucceeded = typeProbeFrameSucceeded &&
+					typeProbeEndResult == rts::render::RENDER_RESULT_OK;
+			}
+			const bool typeProbeCubeTo2DCaptured = typeProbeFrameSucceeded &&
+				device->captureBackBuffer(&typeProbeCapture[0],
+					typeProbeCapture.size(), 64 * 4, &typeProbeCaptureFormat) ==
+					rts::render::RENDER_RESULT_OK;
+			typeProbeCenter = &typeProbeCapture[4 * (32 * 64 + 32)];
+			result |= check(typeProbeCubeTo2DCaptured && typeProbeCenter[1] > 240 &&
+				typeProbeCenter[0] < 16 && typeProbeCenter[2] < 16,
+				"D3D11 draw-boundary refresh handles cube-to-2D transitions");
+
+			// Repeating the same state and 2D binding must remain a cached fast path;
+			// use indexed draws here so both draw entry points share the refresh path.
+			typeProbeFrameStarted = context->beginFrame() ==
+				rts::render::RENDER_RESULT_OK;
+			typeProbeFrameSucceeded = false;
+			if (typeProbeFrameStarted)
+			{
+				typeProbeFrameSucceeded =
+					context->clear(clearColor, 1.0f, 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, texture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setLegacyStateForLayout(typeProbeState, texturedLayout,
+						1) == rts::render::RENDER_RESULT_OK &&
+					context->setVertexBuffer(texturedVertexBuffer,
+						sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+					context->setIndexBuffer(indexBuffer,
+						rts::render::RENDER_FORMAT_R16_UINT, 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setPrimitiveTopology(
+						rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->drawIndexed(3, 0, 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, texture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setLegacyStateForLayout(typeProbeState, texturedLayout,
+						1) == rts::render::RENDER_RESULT_OK &&
+					context->drawIndexed(3, 0, 0) ==
+						rts::render::RENDER_RESULT_OK;
+				const rts::render::RenderResult typeProbeEndResult =
+					context->endFrame();
+				typeProbeFrameSucceeded = typeProbeFrameSucceeded &&
+					typeProbeEndResult == rts::render::RENDER_RESULT_OK;
+			}
+			const bool typeProbeCachedCaptured = typeProbeFrameSucceeded &&
+				device->captureBackBuffer(&typeProbeCapture[0],
+					typeProbeCapture.size(), 64 * 4, &typeProbeCaptureFormat) ==
+					rts::render::RENDER_RESULT_OK;
+			typeProbeCenter = &typeProbeCapture[4 * (32 * 64 + 32)];
+			result |= check(typeProbeCachedCaptured && typeProbeCenter[1] > 240 &&
+				typeProbeCenter[0] < 16 && typeProbeCenter[2] < 16,
+				"D3D11 unchanged texture state stays on the cached indexed path");
+
+			// The indexed draw also covers the opposite transition.  The first 2D
+			// draw establishes constants with no cube bit; the final cube draw must
+			// not reuse that stale mask.
+			typeProbeFrameStarted = context->beginFrame() ==
+				rts::render::RENDER_RESULT_OK;
+			typeProbeFrameSucceeded = false;
+			if (typeProbeFrameStarted)
+			{
+				typeProbeFrameSucceeded =
+					context->clear(clearColor, 1.0f, 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, texture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setLegacyStateForLayout(typeProbeState, texturedLayout,
+						1) == rts::render::RENDER_RESULT_OK &&
+					context->setVertexBuffer(texturedVertexBuffer,
+						sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+					context->setIndexBuffer(indexBuffer,
+						rts::render::RENDER_FORMAT_R16_UINT, 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setPrimitiveTopology(
+						rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->drawIndexed(3, 0, 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, typeProbeCubeTexture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->drawIndexed(3, 0, 0) ==
+						rts::render::RENDER_RESULT_OK;
+				const rts::render::RenderResult typeProbeEndResult =
+					context->endFrame();
+				typeProbeFrameSucceeded = typeProbeFrameSucceeded &&
+					typeProbeEndResult == rts::render::RENDER_RESULT_OK;
+			}
+			const bool typeProbe2DToCubeCaptured = typeProbeFrameSucceeded &&
+				device->captureBackBuffer(&typeProbeCapture[0],
+					typeProbeCapture.size(), 64 * 4, &typeProbeCaptureFormat) ==
+					rts::render::RENDER_RESULT_OK;
+			typeProbeCenter = &typeProbeCapture[4 * (32 * 64 + 32)];
+			result |= check(typeProbe2DToCubeCaptured && typeProbeCenter[2] > 240 &&
+				typeProbeCenter[0] < 16 && typeProbeCenter[1] < 16,
+				"D3D11 indexed draw-boundary refresh handles 2D-to-cube transitions");
+
+			rts::render::LegacyLogicalState signedBumpState;
+			signedBumpState.pipeline.rasterizer.cullMode =
+				rts::render::RENDER_CULL_NONE;
+			signedBumpState.pipeline.textureStages[0].colorOperation =
+				rts::render::RENDER_TEXTURE_OP_BUMP_ENVIRONMENT;
+			signedBumpState.pipeline.textureStages[0].bumpEnvironmentMatrix00 =
+			1.0f;
+			signedBumpState.pipeline.textureStages[1].colorOperation =
+				rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_1;
+			signedBumpState.pipeline.textureStages[1].colorArgument1 =
+				rts::render::RENDER_TEXTURE_ARG_TEXTURE;
+			signedBumpState.pipeline.textureStages[1].alphaOperation =
+				rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_1;
+			signedBumpState.pipeline.textureStages[1].alphaArgument1 =
+				rts::render::RENDER_TEXTURE_ARG_TEXTURE;
+			signedBumpState.pipeline.textureStages[0].sampler.addressU =
+				rts::render::RENDER_TEXTURE_ADDRESS_CLAMP;
+			signedBumpState.pipeline.textureStages[0].sampler.addressV =
+				rts::render::RENDER_TEXTURE_ADDRESS_CLAMP;
+			signedBumpState.pipeline.textureStages[1].sampler.addressU =
+				rts::render::RENDER_TEXTURE_ADDRESS_CLAMP;
+			signedBumpState.pipeline.textureStages[1].sampler.addressV =
+				rts::render::RENDER_TEXTURE_ADDRESS_CLAMP;
+			signedBumpState.pipeline.textureStages[0].sampler.minification =
+				rts::render::RENDER_TEXTURE_FILTER_POINT;
+			signedBumpState.pipeline.textureStages[0].sampler.magnification =
+				rts::render::RENDER_TEXTURE_FILTER_POINT;
+			signedBumpState.pipeline.textureStages[0].sampler.mipmapping =
+				rts::render::RENDER_TEXTURE_FILTER_NONE;
+			signedBumpState.pipeline.textureStages[1].sampler.minification =
+				rts::render::RENDER_TEXTURE_FILTER_POINT;
+			signedBumpState.pipeline.textureStages[1].sampler.magnification =
+				rts::render::RENDER_TEXTURE_FILTER_POINT;
+			signedBumpState.pipeline.textureStages[1].sampler.mipmapping =
+				rts::render::RENDER_TEXTURE_FILTER_NONE;
+
+			// With the signed R8G8_SNORM probe, the correct bump offset selects the
+			// red left texel.  Retain this passing signed-format control alongside
+			// the cube regression so the refresh cannot change bump interpretation.
+			typeProbeFrameStarted = context->beginFrame() ==
+				rts::render::RENDER_RESULT_OK;
+			typeProbeFrameSucceeded = false;
+			if (typeProbeFrameStarted)
+			{
+				typeProbeFrameSucceeded =
+					context->clear(clearColor, 1.0f, 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, rts::render::GpuHandle()) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(1, rts::render::GpuHandle()) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setLegacyStateForLayout(signedBumpState, texturedLayout,
+						3) == rts::render::RENDER_RESULT_OK &&
+					context->setVertexBuffer(texturedVertexBuffer,
+						sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, typeProbeSignedTexture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(1, typeProbeGradientTexture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setPrimitiveTopology(
+						rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->draw(3, 0) == rts::render::RENDER_RESULT_OK;
+				const rts::render::RenderResult typeProbeEndResult =
+					context->endFrame();
+				typeProbeFrameSucceeded = typeProbeFrameSucceeded &&
+					typeProbeEndResult == rts::render::RENDER_RESULT_OK;
+			}
+			const bool signedBumpCaptured = typeProbeFrameSucceeded &&
+				device->captureBackBuffer(&typeProbeCapture[0],
+					typeProbeCapture.size(), 64 * 4, &typeProbeCaptureFormat) ==
+					rts::render::RENDER_RESULT_OK;
+			typeProbeCenter = &typeProbeCapture[4 * (32 * 64 + 32)];
+			result |= check(signedBumpCaptured && typeProbeCenter[2] > 240 &&
+				typeProbeCenter[0] < 16 && typeProbeCenter[1] < 16,
+				"D3D11 first draw preserves signed bump interpretation after state publication");
+
+			// The reverse order remains a valid control and must select the same
+			// signed result when setLegacyState sees the already-bound SNORM SRV.
+			typeProbeFrameStarted = context->beginFrame() ==
+				rts::render::RENDER_RESULT_OK;
+			typeProbeFrameSucceeded = false;
+			if (typeProbeFrameStarted)
+			{
+				typeProbeFrameSucceeded =
+					context->clear(clearColor, 1.0f, 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, typeProbeSignedTexture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(1, typeProbeGradientTexture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setLegacyStateForLayout(signedBumpState, texturedLayout,
+						3) == rts::render::RENDER_RESULT_OK &&
+					context->setVertexBuffer(texturedVertexBuffer,
+						sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+					context->setPrimitiveTopology(
+						rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->draw(3, 0) == rts::render::RENDER_RESULT_OK;
+				const rts::render::RenderResult typeProbeEndResult =
+					context->endFrame();
+				typeProbeFrameSucceeded = typeProbeFrameSucceeded &&
+					typeProbeEndResult == rts::render::RENDER_RESULT_OK;
+			}
+			const bool signedBumpReverseCaptured = typeProbeFrameSucceeded &&
+				device->captureBackBuffer(&typeProbeCapture[0],
+					typeProbeCapture.size(), 64 * 4, &typeProbeCaptureFormat) ==
+					rts::render::RENDER_RESULT_OK;
+			typeProbeCenter = &typeProbeCapture[4 * (32 * 64 + 32)];
+			result |= check(signedBumpReverseCaptured && typeProbeCenter[2] > 240 &&
+				typeProbeCenter[0] < 16 && typeProbeCenter[1] < 16,
+				"D3D11 signed bump reverse ordering matches the state-first path");
+
+			// Change only the stage-0 resource from signed to unsigned after the
+			// state has been published.  The unsigned 0.25 sample must be remapped
+			// to -0.5 and therefore still select the red left texel.
+			typeProbeFrameStarted = context->beginFrame() ==
+				rts::render::RENDER_RESULT_OK;
+			typeProbeFrameSucceeded = false;
+			if (typeProbeFrameStarted)
+			{
+				typeProbeFrameSucceeded =
+					context->clear(clearColor, 1.0f, 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, typeProbeSignedTexture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(1, typeProbeGradientTexture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setLegacyStateForLayout(signedBumpState, texturedLayout,
+						3) == rts::render::RENDER_RESULT_OK &&
+					context->setVertexBuffer(texturedVertexBuffer,
+						sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+					context->setIndexBuffer(indexBuffer,
+						rts::render::RENDER_FORMAT_R16_UINT, 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setPrimitiveTopology(
+						rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, typeProbeUnsignedTexture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->drawIndexed(3, 0, 0) ==
+						rts::render::RENDER_RESULT_OK;
+				const rts::render::RenderResult typeProbeEndResult =
+					context->endFrame();
+				typeProbeFrameSucceeded = typeProbeFrameSucceeded &&
+					typeProbeEndResult == rts::render::RENDER_RESULT_OK;
+			}
+			const bool signedBumpTransitionCaptured = typeProbeFrameSucceeded &&
+				device->captureBackBuffer(&typeProbeCapture[0],
+					typeProbeCapture.size(), 64 * 4, &typeProbeCaptureFormat) ==
+					rts::render::RENDER_RESULT_OK;
+			typeProbeCenter = &typeProbeCapture[4 * (32 * 64 + 32)];
+			result |= check(signedBumpTransitionCaptured &&
+				typeProbeCenter[2] > 240 && typeProbeCenter[0] < 16 &&
+				typeProbeCenter[1] < 16,
+				"D3D11 indexed draw refreshes signed-mask transitions");
+		}
 		rts::render::TextureDescriptor movieDescriptor;
 		movieDescriptor.width = 16;
 		movieDescriptor.height = 9;
@@ -4985,6 +5491,26 @@ int testD3D11HiddenSwapChain()
 			rts::render::RENDER_RESULT_OK && debugErrorCount == 0) ||
 			debugValidationResult == rts::render::RENDER_RESULT_UNSUPPORTED,
 			"D3D11 debug layer reports no validation errors or is unavailable");
+		if (typeProbeCubeTexture.isValid())
+		{
+			result |= check(device->destroyResource(typeProbeCubeTexture),
+				"D3D11 releases the cube type-mask probe");
+		}
+		if (typeProbeGradientTexture.isValid())
+		{
+			result |= check(device->destroyResource(typeProbeGradientTexture),
+				"D3D11 releases the gradient type-mask probe");
+		}
+		if (typeProbeSignedTexture.isValid())
+		{
+			result |= check(device->destroyResource(typeProbeSignedTexture),
+				"D3D11 releases the signed type-mask probe");
+		}
+		if (typeProbeUnsignedTexture.isValid())
+		{
+			result |= check(device->destroyResource(typeProbeUnsignedTexture),
+				"D3D11 releases the unsigned type-mask probe");
+		}
 		result |= check(device->destroyResource(vertexBuffer) &&
 			device->destroyResource(greenVertexBuffer) &&
 			device->destroyResource(halfAlphaVertexBuffer) &&
@@ -5986,6 +6512,9 @@ int main()
 #endif
 	result |= testBackendNames();
 	result |= testRenderTexturePublicationOperationalStates();
+#if !defined(RTS_RENDERER_HAS_D3D11)
+	result |= testNativeRendererRejectsUnavailableBackend();
+#endif
 	result |= testRendererTextureLifecycleContracts();
 	result |= testNativeMeshPrelitStageResetContract();
 	result |= testGenerationSafeHandles();

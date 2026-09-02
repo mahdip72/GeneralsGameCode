@@ -1005,6 +1005,8 @@ void W3DDisplay::init()
 		bool actualWindowed;
 		WW3D::Get_Device_Resolution(actualWidth, actualHeight,
 			actualBitDepth, actualWindowed);
+		Render2DClass::Set_Screen_Resolution(
+			RectClass(0, 0, actualWidth, actualHeight));
 		setWidth(actualWidth);
 		setHeight(actualHeight);
 		setBitDepth(actualBitDepth);

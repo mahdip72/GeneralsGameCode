@@ -1,8 +1,10 @@
 #include "Renderer/NativeW3DRenderer.h"
 #include "Renderer/NativeW3DResources.h"
 #include "Renderer/NativeW3DRenderState.h"
+#if defined(RTS_RENDERER_HAS_D3D11)
 #include "Renderer/ThreadedRenderDevice.h"
 #include "Lib/PipelineExecutionPolicy.h"
+#endif
 
 #include <assert.h>
 #include <limits.h>
@@ -100,6 +102,15 @@ RenderResult NativeW3DRenderer::Initialize(void *window,
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
 
+#if !defined(RTS_RENDERER_HAS_D3D11)
+	// The native facade has no backend implementation on the legacy compiler
+	// lane.  Keep the public neutral contract linkable and fail explicitly
+	// instead of naming the C++20 threaded factory or manufacturing an OOM
+	// result for an unavailable backend.
+	(void)window;
+	(void)descriptor;
+	return RENDER_RESULT_UNSUPPORTED;
+#else
 	ThreadedRenderOptions threadedOptions;
 	// Native product rendering owns one dedicated backend thread.  Preserve the
 	// process-wide serial policy as a mode switch: serial remains a dedicated
@@ -151,6 +162,7 @@ RenderResult NativeW3DRenderer::Initialize(void *window,
 	m_state = state;
 	m_ownsBackend = true;
 	return RENDER_RESULT_OK;
+#endif
 }
 
 RenderResult NativeW3DRenderer::Shutdown()
@@ -428,14 +440,18 @@ RenderResult NativeW3DRenderer::EndFrame(bool present)
 		// returning a producer-side command failure. A visible direct caller still
 		// needs a sealed packet; the aggregate's non-present path finalizes it
 		// explicitly after any readback/cancellation work.
+	#if defined(RTS_RENDERER_HAS_D3D11)
 		if (IsThreadedRenderDevice(m_state->Device()))
 			FinalizeEndedFrame(false);
+	#endif
 		return endResult;
 	}
 	if (frameFailure != RENDER_RESULT_OK)
 	{
+	#if defined(RTS_RENDERER_HAS_D3D11)
 		if (IsThreadedRenderDevice(m_state->Device()))
 			FinalizeEndedFrame(false);
+	#endif
 		return frameFailure;
 	}
 	if (!present)
@@ -450,8 +466,10 @@ RenderResult NativeW3DRenderer::FinalizeEndedFrame(bool present)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
+	#if defined(RTS_RENDERER_HAS_D3D11)
 	if (IsThreadedRenderDevice(device))
 		return SubmitThreadedRenderFrame(device, present);
+	#endif
 	if (!present)
 		return RENDER_RESULT_OK;
 	return device->present();
@@ -647,7 +665,12 @@ bool NativeW3DRenderer::HasBackendState() const
 bool NativeW3DRenderer::IsThreaded() const
 {
 	IRenderDevice *device = m_state == 0 ? 0 : m_state->Device();
+#if defined(RTS_RENDERER_HAS_D3D11)
 	return device != 0 && IsThreadedRenderDevice(device);
+#else
+	(void)device;
+	return false;
+#endif
 }
 
 bool NativeW3DRenderer::IsBackendOperational() const
@@ -667,15 +690,26 @@ bool NativeW3DRenderer::CanRecoverDevice() const
 uint64_t NativeW3DRenderer::LastThreadedSubmissionSequence() const
 {
 	IRenderDevice *device = m_state == 0 ? 0 : m_state->Device();
+#if defined(RTS_RENDERER_HAS_D3D11)
 	return device == 0 ? 0 : LastThreadedRenderFrameSequence(device);
+#else
+	(void)device;
+	return 0;
+#endif
 }
 
 bool NativeW3DRenderer::PollThreadedCompletion(
 	ThreadedRenderFrameCompletion *completion)
 {
 	IRenderDevice *device = m_state == 0 ? 0 : m_state->Device();
+#if defined(RTS_RENDERER_HAS_D3D11)
 	return device != 0 && IsThreadedRenderDevice(device) && IsOwnerThread() &&
 		PollThreadedRenderCompletion(device, completion);
+#else
+	(void)device;
+	(void)completion;
+	return false;
+#endif
 }
 
 RenderResult NativeW3DRenderer::DrainThreaded()
@@ -683,8 +717,13 @@ RenderResult NativeW3DRenderer::DrainThreaded()
 	IRenderDevice *device = m_state == 0 ? 0 : m_state->Device();
 	if (device == 0 || !IsOwnerThread())
 		return RENDER_RESULT_INVALID_ARGUMENT;
+#if defined(RTS_RENDERER_HAS_D3D11)
 	return IsThreadedRenderDevice(device) ? DrainThreadedRenderDevice(device) :
 		RENDER_RESULT_UNSUPPORTED;
+#else
+	(void)device;
+	return RENDER_RESULT_UNSUPPORTED;
+#endif
 }
 
 RenderResult NativeW3DRenderer::CancelThreadedFrame(RenderResult reason)
@@ -692,6 +731,7 @@ RenderResult NativeW3DRenderer::CancelThreadedFrame(RenderResult reason)
 	IRenderDevice *device = m_state == 0 ? 0 : m_state->Device();
 	if (device == 0 || !IsOwnerThread())
 		return RENDER_RESULT_INVALID_ARGUMENT;
+#if defined(RTS_RENDERER_HAS_D3D11)
 	if (!IsThreadedRenderDevice(device))
 		return RENDER_RESULT_UNSUPPORTED;
 	const RenderResult result = CancelThreadedRenderFrame(device, reason);
@@ -704,13 +744,24 @@ RenderResult NativeW3DRenderer::CancelThreadedFrame(RenderResult reason)
 		m_frameFailure = RENDER_RESULT_OK;
 	}
 	return result;
+#else
+	(void)device;
+	(void)reason;
+	return RENDER_RESULT_UNSUPPORTED;
+#endif
 }
 
 bool NativeW3DRenderer::GetThreadedMetrics(ThreadedRenderMetrics *metrics) const
 {
 	IRenderDevice *device = m_state == 0 ? 0 : m_state->Device();
+#if defined(RTS_RENDERER_HAS_D3D11)
 	return device != 0 && IsThreadedRenderDevice(device) && IsOwnerThread() &&
 		GetThreadedRenderMetrics(device, metrics);
+#else
+	(void)device;
+	(void)metrics;
+	return false;
+#endif
 }
 
 void NativeW3DRenderer::RecordFrameFailure(RenderResult result)

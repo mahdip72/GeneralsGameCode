@@ -2148,7 +2148,11 @@ public:
 		m_viewportMinimumDepth = minimumDepth;
 		m_viewportMaximumDepth = maximumDepth;
 		m_viewportBound = true;
-		m_cachedLegacyStateValid = false;
+		// Viewport coordinates are part of the transform constant payload, not
+		// the native pipeline object.  Keep the published logical state cached so
+		// the draw boundary can republish those constants without rebuilding the
+		// entire pipeline.
+		m_transformConstantsChanged = true;
 		return RENDER_RESULT_OK;
 	}
 
@@ -2810,6 +2814,11 @@ public:
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
+		const RenderResult transformResult = refreshTransformConstantsForDraw();
+		if (transformResult != RENDER_RESULT_OK)
+		{
+			return transformResult;
+		}
 		m_context->Draw(vertexCount, startVertex);
 		return RENDER_RESULT_OK;
 	}
@@ -2831,6 +2840,11 @@ public:
 			m_boundIndexOffset, indexSize, startIndex, indexCount))
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		const RenderResult transformResult = refreshTransformConstantsForDraw();
+		if (transformResult != RENDER_RESULT_OK)
+		{
+			return transformResult;
 		}
 		m_context->DrawIndexed(indexCount, startIndex, baseVertex);
 		return RENDER_RESULT_OK;
@@ -3308,6 +3322,37 @@ private:
 		m_faultPoint = RENDER_RESOURCE_FAULT_NONE;
 		m_faultResult = RENDER_RESULT_FAILED;
 		return true;
+	}
+
+	RenderResult refreshTransformConstantsForDraw()
+	{
+		if (!m_transformConstantsChanged)
+		{
+			return RENDER_RESULT_OK;
+		}
+		if (!m_cachedLegacyStateValid)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		// The cached state is deliberately byte storage to avoid imposing an
+		// alignment requirement on the member.  Copy it into a typed value before
+		// handing it back to the constant-packing routine.
+		LegacyLogicalState state;
+		memcpy(&state, m_cachedLegacyState, sizeof(state));
+		const HRESULT result = updateTransformConstants(state,
+			m_cachedLegacyVertexLayoutFlags,
+			m_cachedLegacyTexturePresenceMask, m_boundCubeTextureMask);
+		if (FAILED(result))
+		{
+			return TranslateResult(result);
+		}
+		// The native SRV bindings are now represented by the published constants;
+		// retain the logical-state cache so a later setLegacyState can stay on its
+		// cached path instead of forcing a redundant pipeline bind.
+		m_cachedLegacyCubeTextureMask = m_boundCubeTextureMask;
+		m_cachedLegacySignedTextureMask = m_boundSignedTextureMask;
+		m_transformConstantsChanged = false;
+		return RENDER_RESULT_OK;
 	}
 
 	void cacheLegacyState(const LegacyLogicalState &state,

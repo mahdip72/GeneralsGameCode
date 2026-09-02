@@ -83,7 +83,7 @@ public:
 	void shutdown() override { m_operational = false; }
 	IRenderContext *immediateContext() override { return &m_context; }
 	RenderResult createBuffer(const BufferDescriptor &descriptor,
-		const void *, size_t initialDataBytes, GpuHandle *buffer) override
+		const void *initialData, size_t initialDataBytes, GpuHandle *buffer) override
 	{
 		if (buffer == nullptr)
 		{
@@ -96,7 +96,8 @@ public:
 			return RENDER_RESULT_OUT_OF_MEMORY;
 		}
 		if (!m_operational || descriptor.byteCount == 0 ||
-			initialDataBytes != 0)
+			(initialData == nullptr && initialDataBytes != 0) ||
+			(initialData != nullptr && initialDataBytes != descriptor.byteCount))
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}

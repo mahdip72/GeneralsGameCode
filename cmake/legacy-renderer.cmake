@@ -54,6 +54,10 @@ function(rts_add_legacy_renderer_targets)
 
     add_library(rts_legacy_renderer STATIC ${_legacy_renderer_sources})
     target_include_directories(rts_legacy_renderer BEFORE PUBLIC
+        # Moved compatibility headers retain a few repository-rooted includes;
+        # expose that root only to this x86 target rather than widening product
+        # include precedence for the neutral renderer graph.
+        "${CMAKE_SOURCE_DIR}"
         "${_legacy_root}/WWVegas"
         "${_legacy_ww3d2}"
         "${_product_ww3d2}"
@@ -64,6 +68,10 @@ function(rts_add_legacy_renderer_targets)
         "${_legacy_gameengine_device}/Include"
         "${CMAKE_SOURCE_DIR}/Core/GameEngineDevice/Include"
         "${CMAKE_SOURCE_DIR}/Dependencies/Utility")
+    # The common compatibility target has no title PCH.  Include the neutral
+    # C++-compatibility macro surface before STLUtils.h uses CPP_11(...).
+    target_precompile_headers(rts_legacy_renderer PRIVATE
+        [["Utility/CppMacros.h"]])
     target_compile_definitions(rts_legacy_renderer PUBLIC
         BUILD_WITH_D3D8=1
         RTS_ENABLE_LEGACY_EMBEDDED_BROWSER=1)

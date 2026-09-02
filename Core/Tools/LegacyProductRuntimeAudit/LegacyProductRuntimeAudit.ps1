@@ -292,11 +292,122 @@ function Assert-NativeRendererAbiPropagation([string]$Content, [string]$Target)
 }
 
 function Assert-LegacyRenderHeaderAbiPropagation([string]$Content,
-    [string]$Target)
+    [string]$Target, [string]$LegacyRendererContent = '')
 {
-    if (-not (Test-CMakeTargetLinkDependency $Content $Target `
-            'rts_d3d8_headers' 'PUBLIC')) {
+    if (Test-CMakeTargetLinkDependency $Content $Target `
+            'rts_d3d8_headers' 'PUBLIC') {
+        return
+    }
+
+    # The x86 compatibility link moved behind the architecture-owned helper
+    # in cmake/legacy-renderer.cmake.  Accept that transitive route only when
+    # the helper is explicitly x86-gated and its selected legacy renderer
+    # publicly carries rts_d3d8_headers; native x64 remains header-free.
+    $helperCall = '(?im)^\s*rts_attach_title_game_engine_device\s*\(\s*' +
+        [regex]::Escape($Target) + '\s+(?<Title>GENERALS|ZEROHOUR)\s*\)\s*$'
+    $helperMatch = [regex]::Match($Content, $helperCall)
+    if (-not $helperMatch.Success -or
+        [string]::IsNullOrWhiteSpace($LegacyRendererContent)) {
         throw "Target $Target does not publicly propagate its compile-only legacy render declarations."
+    }
+    $helperStart = $LegacyRendererContent.IndexOf(
+        'function(rts_attach_title_game_engine_device target title)',
+        [StringComparison]::Ordinal)
+    $helperEnd = if ($helperStart -ge 0) {
+        $LegacyRendererContent.IndexOf('endfunction()', $helperStart,
+            [StringComparison]::Ordinal)
+    } else { -1 }
+    if ($helperStart -lt 0 -or $helperEnd -le $helperStart) {
+        throw "Target $Target does not use a complete x86 legacy renderer attachment helper."
+    }
+    $helperBody = $LegacyRendererContent.Substring($helperStart,
+        $helperEnd - $helperStart)
+    $expectedTitle = $helperMatch.Groups['Title'].Value.ToUpperInvariant()
+    $legacyTarget = if ($expectedTitle -eq 'GENERALS') {
+        'rts_generals_legacy_renderer'
+    } else {
+        'rts_zerohour_legacy_renderer'
+    }
+
+    # Check branch containment, rather than merely finding an x86 guard and a
+    # public link somewhere in the same function.  A link after endif() or in
+    # the non-x86 else() branch would leak the D3D8 ABI into native x64.
+    $withoutComments = Remove-CMakeComments $helperBody
+    $stack = New-Object System.Collections.Generic.List[object]
+    $publicLinkInX86Branch = $false
+    $expectedMappingInX86TitleBranch = $false
+    foreach ($line in @($withoutComments -split "`n")) {
+        $trimmedLine = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmedLine)) {
+            continue
+        }
+        if ($trimmedLine -match '^(?i)if\s*\((?<condition>.*)\)\s*$') {
+            $condition = ($Matches['condition'] -replace '\s+', ' ').Trim().ToUpperInvariant()
+            $isExpectedTitle = $condition -match (
+                '^TITLE\s+STREQUAL\s+["'']?' +
+                [regex]::Escape($expectedTitle) + '["'']?$')
+            $stack.Add([pscustomobject]@{
+                X86True = $condition -eq 'CMAKE_SIZEOF_VOID_P EQUAL 4'
+                TitleName = if ($isExpectedTitle) { $expectedTitle } else { '' }
+            })
+            continue
+        }
+        if ($trimmedLine -match '^(?i)elseif\s*\((?<condition>.*)\)\s*$') {
+            if ($stack.Count -eq 0) {
+                throw "Target $Target legacy renderer attachment has an unmatched elseif()."
+            }
+            $condition = ($Matches['condition'] -replace '\s+', ' ').Trim().ToUpperInvariant()
+            $isExpectedTitle = $condition -match (
+                '^TITLE\s+STREQUAL\s+["'']?' +
+                [regex]::Escape($expectedTitle) + '["'']?$')
+            $currentBranch = $stack[$stack.Count - 1]
+            $currentBranch.X86True = $condition -eq 'CMAKE_SIZEOF_VOID_P EQUAL 4'
+            $currentBranch.TitleName = if ($isExpectedTitle) { $expectedTitle } else { '' }
+            continue
+        }
+        if ($trimmedLine -match '^(?i)else\s*(?:\(\s*\))?\s*$') {
+            if ($stack.Count -eq 0) {
+                throw "Target $Target legacy renderer attachment has an unmatched else()."
+            }
+            $currentBranch = $stack[$stack.Count - 1]
+            $currentBranch.X86True = $false
+            $currentBranch.TitleName = ''
+            continue
+        }
+        if ($trimmedLine -match '^(?i)endif\s*(?:\(\s*\))?\s*$') {
+            if ($stack.Count -eq 0) {
+                throw "Target $Target legacy renderer attachment has an unmatched endif()."
+            }
+            $stack.RemoveAt($stack.Count - 1)
+            continue
+        }
+
+        $inX86TrueBranch = @($stack | Where-Object { $_.X86True }).Count -gt 0
+        $inExpectedTitleBranch = @($stack |
+            Where-Object { $_.TitleName -eq $expectedTitle }).Count -gt 0
+        if ($trimmedLine -match
+                '(?i)target_link_libraries\s*\(\s*\$\{target\}\s+PUBLIC\s+\$\{_legacy_target\}\s*\)' -and
+            $inX86TrueBranch) {
+            $publicLinkInX86Branch = $true
+        }
+        if ($trimmedLine -match
+                '(?i)^set\s*\(\s*_legacy_target\s+(?<legacyTarget>[A-Za-z0-9_]+)\s*\)$' -and
+            $Matches['legacyTarget'] -eq $legacyTarget -and
+            $inX86TrueBranch -and $inExpectedTitleBranch) {
+            $expectedMappingInX86TitleBranch = $true
+        }
+    }
+    if ($stack.Count -ne 0 -or -not $publicLinkInX86Branch -or
+        -not $expectedMappingInX86TitleBranch) {
+        throw "Target $Target legacy renderer attachment is not x86-only and public."
+    }
+    if (-not (Test-CMakeTargetLinkDependency $LegacyRendererContent `
+            'rts_legacy_renderer' 'rts_d3d8_headers' 'PUBLIC')) {
+        throw 'The common x86 legacy renderer target does not publicly carry rts_d3d8_headers.'
+    }
+    if (-not (Test-CMakeTargetLinkDependency $LegacyRendererContent `
+            $legacyTarget 'rts_legacy_renderer' 'PUBLIC')) {
+        throw "The selected x86 legacy renderer target '$legacyTarget' does not publicly carry the common compatibility target."
     }
 }
 
@@ -353,17 +464,24 @@ function Assert-ProjectedShadowRenderTargetContract([string]$Content,
         throw "$Title projected-shadow ReAcquireResources body is missing or ambiguous."
     }
     $body = $Content.Substring($start, $end - $start)
+    # Native product code now reaches the same typed color-target contract
+    # through the backend-neutral facade; legacy x86 keeps the old factory.
     $createCalls = [regex]::Matches($body,
-        '\bDX8Wrapper::Create_Render_Target\s*\(').Count
+        '(?:\bDX8Wrapper::Create_Render_Target|\brts::render::CreateGameRenderTarget)\s*\(').Count
     if ($createCalls -lt 2 -or
         $body -notmatch '!\s*m_dynamicRenderTarget->Is_Initialized\s*\(\s*\)' -or
         $body -notmatch '(?s)REF_PTR_RELEASE\s*\(\s*m_dynamicRenderTarget\s*\).*?return\s+FALSE\s*;') {
         throw "$Title projected-shadow reset path does not reject and release an invalid color target."
     }
-    foreach ($handleFactory in @('Get_Shadow_Index_Buffer_Handle',
-            'Get_Shadow_Vertex_Buffer_Handle')) {
-        $handleStart = $body.IndexOf($handleFactory,
-            [StringComparison]::Ordinal)
+    $resourcePatterns = @(
+        '(?:\bGet_Shadow_Index_Buffer_Handle\s*\(|\bshadowDecalIndexBufferOwner\s*=\s*NEW_REF\s*\()',
+        '(?:\bGet_Shadow_Vertex_Buffer_Handle\s*\(|\bshadowDecalVertexBufferOwner\s*=\s*NEW_REF\s*\()'
+    )
+    foreach ($resourcePattern in $resourcePatterns) {
+        $resourceMatch = [regex]::Match($body, $resourcePattern)
+        $handleStart = if ($resourceMatch.Success) {
+            $resourceMatch.Index
+        } else { -1 }
         $failureEnd = if ($handleStart -ge 0) {
             $body.IndexOf('return FALSE;', $handleStart,
                 [StringComparison]::Ordinal)
@@ -430,9 +548,15 @@ function Assert-NativeDeviceShutdownOwnershipContract([string]$Content)
         $shutdownEnd - $shutdownStart)
     $release = $shutdownBody.IndexOf('Release_Device();',
         [StringComparison]::Ordinal)
-    $hostShutdown = $shutdownBody.IndexOf(
-        '_NativeProductDeviceLifecycle.shutdown();',
-        [StringComparison]::Ordinal)
+    # The native lifecycle exposes a truthful bool shutdown result.  Product
+    # code commonly consumes it in `if (!_NativeProductDeviceLifecycle.shutdown())`
+    # rather than as a bare void statement; audit the call, not that spelling.
+    $hostShutdownMatch = [regex]::Match($shutdownBody,
+        '_NativeProductDeviceLifecycle\.shutdown\s*\(\s*\)')
+    $hostShutdown = -1
+    if ($hostShutdownMatch.Success) {
+        $hostShutdown = $hostShutdownMatch.Index
+    }
     if ($shutdownBody -notmatch '\.ownsDeviceResources\s*\(\s*\)' -or
         $release -lt 0 -or $hostShutdown -lt 0 -or $release -ge $hostShutdown) {
         throw 'Native shutdown must release owners before the active-or-lost device host.'
@@ -773,6 +897,46 @@ D3DInterface->CreateDevice();
     if (-not $authorityCaught) {
         throw 'Legacy product runtime audit self-test accepted x64-visible D3D8 device authority.'
     }
+    Assert-NativeDeviceShutdownOwnershipContract @'
+void DX8Wrapper::Shutdown()
+{
+    if (_NativeProductDeviceLifecycle.ownsDeviceResources()) {
+        Release_Device();
+    }
+    if (!_NativeProductDeviceLifecycle.shutdown()) {
+        return;
+    }
+}
+bool DX8Wrapper::Do_Onetime_Device_Dependent_Inits()
+{
+    return true;
+}
+'@
+    $shutdownOrderCaught = $false
+    try {
+        Assert-NativeDeviceShutdownOwnershipContract @'
+void DX8Wrapper::Shutdown()
+{
+    if (!_NativeProductDeviceLifecycle.shutdown()) {
+        return;
+    }
+    if (_NativeProductDeviceLifecycle.ownsDeviceResources()) {
+        Release_Device();
+    }
+}
+bool DX8Wrapper::Do_Onetime_Device_Dependent_Inits()
+{
+    return true;
+}
+'@
+    }
+    catch {
+        $shutdownOrderCaught = $_.Exception.Message -match
+            'Native shutdown must release owners before the active-or-lost device host'
+    }
+    if (-not $shutdownOrderCaught) {
+        throw 'Legacy product runtime audit self-test accepted host shutdown before native owner release.'
+    }
     Assert-NativeDeviceBootstrapContract @'
 #if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
 bool InitializeNative() { return _D3D11Bridge.Initialize(_Hwnd, nullptr, width, height); }
@@ -823,6 +987,69 @@ target_link_libraries(z_gameenginedevice PRIVATE rts_d3d8_headers)
     }
     if (-not $headerPropagationCaught) {
         throw 'Legacy product runtime audit self-test accepted private legacy render-header ABI propagation.'
+    }
+    $transitiveLegacyRenderer = @'
+function(rts_attach_title_game_engine_device target title)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+        if(title STREQUAL "GENERALS")
+            set(_legacy_target rts_generals_legacy_renderer)
+        elseif(title STREQUAL "ZEROHOUR")
+            set(_legacy_target rts_zerohour_legacy_renderer)
+        endif()
+        target_link_libraries(${target} PUBLIC ${_legacy_target})
+    endif()
+endfunction()
+target_link_libraries(rts_legacy_renderer PUBLIC
+    rts_d3d8_headers)
+target_link_libraries(rts_generals_legacy_renderer PUBLIC
+    rts_legacy_renderer)
+'@
+    Assert-LegacyRenderHeaderAbiPropagation @'
+rts_attach_title_game_engine_device(g_gameenginedevice GENERALS)
+'@ 'g_gameenginedevice' $transitiveLegacyRenderer
+    $missingGuardCaught = $false
+    try {
+        Assert-LegacyRenderHeaderAbiPropagation @'
+rts_attach_title_game_engine_device(g_gameenginedevice GENERALS)
+'@ 'g_gameenginedevice' @'
+function(rts_attach_title_game_engine_device target title)
+    target_link_libraries(${target} PUBLIC ${_legacy_target})
+endfunction()
+target_link_libraries(rts_legacy_renderer PUBLIC rts_d3d8_headers)
+target_link_libraries(rts_generals_legacy_renderer PUBLIC rts_legacy_renderer)
+'@
+    }
+    catch {
+        $missingGuardCaught = $_.Exception.Message -match
+            'not x86-only and public'
+    }
+    if (-not $missingGuardCaught) {
+        throw 'Legacy product runtime audit self-test accepted an ungated transitive legacy renderer link.'
+    }
+    $branchLeakCaught = $false
+    try {
+        Assert-LegacyRenderHeaderAbiPropagation @'
+rts_attach_title_game_engine_device(g_gameenginedevice GENERALS)
+'@ 'g_gameenginedevice' @'
+function(rts_attach_title_game_engine_device target title)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+        if(title STREQUAL "GENERALS")
+            set(_legacy_target rts_generals_legacy_renderer)
+        endif()
+    else()
+        target_link_libraries(${target} PUBLIC ${_legacy_target})
+    endif()
+endfunction()
+target_link_libraries(rts_legacy_renderer PUBLIC rts_d3d8_headers)
+target_link_libraries(rts_generals_legacy_renderer PUBLIC rts_legacy_renderer)
+'@
+    }
+    catch {
+        $branchLeakCaught = $_.Exception.Message -match
+            'not x86-only and public'
+    }
+    if (-not $branchLeakCaught) {
+        throw 'Legacy product runtime audit self-test accepted a link outside the active x86 branch.'
     }
     Assert-WW3DPublicAbiPropagation @'
 target_link_libraries(z_ww3d2 PUBLIC core_config core_renderer)
@@ -901,6 +1128,34 @@ Bool W3DProjectedShadowManager::ReAcquireResources()
 }
 void W3DProjectedShadowManager::ReleaseResources()
 '@ 'fixture'
+    Assert-ProjectedShadowRenderTargetContract @'
+Bool W3DProjectedShadowManager::ReAcquireResources()
+{
+    m_dynamicRenderTarget = rts::render::CreateGameRenderTarget(1, 1, alpha);
+    if (m_dynamicRenderTarget == nullptr)
+        m_dynamicRenderTarget = rts::render::CreateGameRenderTarget(1, 1, unknown);
+    if (m_dynamicRenderTarget == nullptr ||
+        !m_dynamicRenderTarget->Is_Initialized() ||
+        !rts::render::IsGameRendererInitialized()) {
+        REF_PTR_RELEASE(m_dynamicRenderTarget);
+        return FALSE;
+    }
+    shadowDecalIndexBufferOwner = NEW_REF(DX8IndexBufferClass, (1, usage));
+    if (shadowDecalIndexBufferOwner == nullptr ||
+        !shadowDecalIndexBufferOwner->Is_Valid()) {
+        ReleaseResources();
+        return FALSE;
+    }
+    shadowDecalVertexBufferOwner = NEW_REF(DX8VertexBufferClass, (fvf, size, usage));
+    if (shadowDecalVertexBufferOwner == nullptr ||
+        !shadowDecalVertexBufferOwner->Is_Valid()) {
+        ReleaseResources();
+        return FALSE;
+    }
+    return TRUE;
+}
+void W3DProjectedShadowManager::ReleaseResources()
+'@ 'native-facade-fixture'
     $shadowTargetCaught = $false
     try {
         Assert-ProjectedShadowRenderTargetContract @'
@@ -1214,21 +1469,23 @@ foreach ($relativePath in $requiredConsumers) {
 
 $dx8WrapperSource = Get-Content -LiteralPath (
     Join-Path $SourceRoot 'Core/LegacyRenderer/WWVegas/WW3D2/dx8wrapper.cpp') -Raw
+$legacyRendererCMake = Get-Content -LiteralPath (
+    Join-Path $SourceRoot 'cmake/legacy-renderer.cmake') -Raw
 Assert-NativeDeviceBootstrapContract $dx8WrapperSource
 Assert-NativeDeviceShutdownOwnershipContract $dx8WrapperSource
 Assert-NativeColorRenderTargetContract $dx8WrapperSource
-Assert-NativeRendererAbiPropagation (Get-Content -LiteralPath (
-    Join-Path $SourceRoot 'Generals/Code/GameEngineDevice/CMakeLists.txt') -Raw) `
+$generalsGameEngineDeviceCMake = Get-Content -LiteralPath (
+    Join-Path $SourceRoot 'Generals/Code/GameEngineDevice/CMakeLists.txt') -Raw
+Assert-NativeRendererAbiPropagation $generalsGameEngineDeviceCMake `
     'g_gameenginedevice'
-Assert-LegacyRenderHeaderAbiPropagation (Get-Content -LiteralPath (
-    Join-Path $SourceRoot 'Generals/Code/GameEngineDevice/CMakeLists.txt') -Raw) `
-    'g_gameenginedevice'
-Assert-NativeRendererAbiPropagation (Get-Content -LiteralPath (
-    Join-Path $SourceRoot 'GeneralsMD/Code/GameEngineDevice/CMakeLists.txt') -Raw) `
+Assert-LegacyRenderHeaderAbiPropagation $generalsGameEngineDeviceCMake `
+    'g_gameenginedevice' $legacyRendererCMake
+$zeroHourGameEngineDeviceCMake = Get-Content -LiteralPath (
+    Join-Path $SourceRoot 'GeneralsMD/Code/GameEngineDevice/CMakeLists.txt') -Raw
+Assert-NativeRendererAbiPropagation $zeroHourGameEngineDeviceCMake `
     'z_gameenginedevice'
-Assert-LegacyRenderHeaderAbiPropagation (Get-Content -LiteralPath (
-    Join-Path $SourceRoot 'GeneralsMD/Code/GameEngineDevice/CMakeLists.txt') -Raw) `
-    'z_gameenginedevice'
+Assert-LegacyRenderHeaderAbiPropagation $zeroHourGameEngineDeviceCMake `
+    'z_gameenginedevice' $legacyRendererCMake
 Assert-WW3DPublicAbiPropagation (Get-Content -LiteralPath (
     Join-Path $SourceRoot 'Generals/Code/Libraries/Source/WWVegas/WW3D2/CMakeLists.txt') -Raw) `
     'g_ww3d2'

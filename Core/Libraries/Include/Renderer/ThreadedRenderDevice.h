@@ -2,7 +2,7 @@
 #define RTS_RENDERER_THREADEDRENDERDEVICE_H
 
 #include "Renderer/RendererDevice.h"
-#include <stdint.h>
+#include <Utility/stdint_adapter.h>
 
 namespace rts
 {
