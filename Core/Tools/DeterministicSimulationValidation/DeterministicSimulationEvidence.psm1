@@ -6,9 +6,9 @@ function Assert-Stage5Condition {
     if (-not $Condition) { throw $Message }
 }
 
-function ConvertFrom-Stage5JsonDictionary {
-    param([string]$Path)
-    $json = Get-Content -LiteralPath $Path -Raw
+function ConvertFrom-Stage5JsonTextDictionary {
+    param([string]$Json)
+    $json = [string]$Json
     if ($PSVersionTable.PSVersion.Major -ge 6) {
         $convertFromJson = Get-Command ConvertFrom-Json
         if ($convertFromJson.Parameters.ContainsKey('DateKind')) {
@@ -20,6 +20,11 @@ function ConvertFrom-Stage5JsonDictionary {
     $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
     $serializer.MaxJsonLength = 10485760
     return $serializer.DeserializeObject($json)
+}
+
+function ConvertFrom-Stage5JsonDictionary {
+    param([string]$Path)
+    return ConvertFrom-Stage5JsonTextDictionary (Get-Content -LiteralPath $Path -Raw)
 }
 
 function Get-Stage5JsonValue {
@@ -2508,17 +2513,98 @@ function Invoke-Stage5CreatedRegistryKeyCleanup {
 
 function Get-Stage5FinalAcceptanceFileSha256 {
     param([string]$Path)
-    $stream = [IO.File]::OpenRead($Path)
+    return (Get-Stage5FinalAcceptanceFileSnapshot $Path 'final-acceptance file').sha256
+}
+
+function Assert-Stage5FinalAcceptancePathContained {
+    param([string]$BaseDirectory, [string]$CandidatePath, [string]$Context)
+    $base = [IO.Path]::GetFullPath($BaseDirectory)
+    $candidate = [IO.Path]::GetFullPath($CandidatePath)
+    $baseRoot = [IO.Path]::GetPathRoot($base)
+    $candidateRoot = [IO.Path]::GetPathRoot($candidate)
+    Assert-Stage5Condition ($baseRoot -is [string] -and
+        $candidateRoot -is [string] -and
+        $baseRoot.Equals($candidateRoot, [StringComparison]::OrdinalIgnoreCase)) `
+        "$Context path is on a different volume or share."
+    $baseParts = @($base.Substring($baseRoot.Length) -split '[\\/]' |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $candidateParts = @($candidate.Substring($candidateRoot.Length) -split '[\\/]' |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    Assert-Stage5Condition ($candidateParts.Count -gt $baseParts.Count) `
+        "$Context path must identify a file below its manifest directory."
+    for ($index = 0; $index -lt $baseParts.Count; ++$index) {
+        Assert-Stage5Condition ($candidateParts[$index].Equals(
+            $baseParts[$index], [StringComparison]::OrdinalIgnoreCase)) `
+            "$Context path escapes its manifest directory."
+    }
+}
+
+function Assert-Stage5FinalAcceptanceNoReparsePath {
+    param([string]$BaseDirectory, [string]$CandidatePath, [string]$Context)
+    $base = [IO.Path]::GetFullPath($BaseDirectory)
+    $candidate = [IO.Path]::GetFullPath($CandidatePath)
+    $baseRoot = [IO.Path]::GetPathRoot($base)
+    if ($base.Length -gt $baseRoot.Length) {
+        $base = $base.TrimEnd([char[]]@(
+            [IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar))
+    }
+    $baseItem = Get-Item -LiteralPath $base -Force -ErrorAction Stop
+    Assert-Stage5Condition (($baseItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) `
+        "$Context base directory is a reparse point."
+    $relative = $candidate.Substring($base.Length).TrimStart([char[]]@(
+        [IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar))
+    $current = $base
+    foreach ($segment in @($relative -split '[\\/]')) {
+        if ([string]::IsNullOrWhiteSpace($segment)) { continue }
+        $current = Join-Path $current $segment
+        $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+        Assert-Stage5Condition (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) `
+            "$Context path component '$segment' is a reparse point."
+    }
+}
+
+function Get-Stage5FinalAcceptanceFileSnapshot {
+    param([string]$Path, [string]$Context)
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    Assert-Stage5Condition (Test-Path -LiteralPath $fullPath -PathType Leaf) `
+        "$Context file was not found: $Path"
+    $stream = [IO.File]::Open($fullPath, [IO.FileMode]::Open,
+        [IO.FileAccess]::Read, [IO.FileShare]::Read)
     try {
+        $memory = New-Object IO.MemoryStream
+        try {
+            $stream.CopyTo($memory)
+            $bytes = $memory.ToArray()
+        }
+        finally { $memory.Dispose() }
         $sha = [Security.Cryptography.SHA256]::Create()
         try {
-            return (($sha.ComputeHash($stream) | ForEach-Object {
+            $hash = (($sha.ComputeHash($bytes) | ForEach-Object {
                 $_.ToString('x2')
             }) -join '').ToUpperInvariant()
         }
         finally { $sha.Dispose() }
+        return [pscustomobject]@{
+            path = $fullPath
+            bytes = $bytes
+            sha256 = $hash
+        }
     }
     finally { $stream.Dispose() }
+}
+
+function ConvertFrom-Stage5FinalAcceptanceJsonSnapshot {
+    param([object]$Snapshot, [string]$Context)
+    Assert-Stage5Condition ($null -ne $Snapshot -and
+        $Snapshot.PSObject.Properties.Name -contains 'bytes') `
+        "$Context does not contain a file snapshot."
+    try {
+        return ConvertFrom-Stage5JsonTextDictionary `
+            ([Text.Encoding]::UTF8.GetString([byte[]]$Snapshot.bytes))
+    }
+    catch {
+        throw "$Context is not valid JSON: $($_.Exception.Message)"
+    }
 }
 
 function Resolve-Stage5FinalAcceptanceFile {
@@ -2529,21 +2615,28 @@ function Resolve-Stage5FinalAcceptanceFile {
         "$Context path must be manifest-relative."
     $base = [IO.Path]::GetFullPath($BaseDirectory)
     $candidate = [IO.Path]::GetFullPath((Join-Path $base $RelativePath))
-    Assert-Stage5Condition ($candidate.StartsWith(
-        $base + [IO.Path]::DirectorySeparatorChar,
-        [StringComparison]::OrdinalIgnoreCase)) `
-        "$Context path escapes its manifest directory."
+    Assert-Stage5FinalAcceptancePathContained $base $candidate $Context
     Assert-Stage5Condition (Test-Path -LiteralPath $candidate -PathType Leaf) `
         "$Context file was not found: $RelativePath"
+    Assert-Stage5FinalAcceptanceNoReparsePath $base $candidate $Context
     return $candidate
 }
 
 function Assert-Stage5FinalAcceptanceSha256 {
     param([string]$Path, [object]$Expected, [string]$Context)
+    $snapshot = Get-Stage5FinalAcceptanceFileSnapshot $Path $Context
+    return Assert-Stage5FinalAcceptanceSnapshotSha256 $snapshot $Expected $Context
+}
+
+function Assert-Stage5FinalAcceptanceSnapshotSha256 {
+    param([object]$Snapshot, [object]$Expected, [string]$Context)
     Assert-Stage5Condition ($Expected -is [string] -and
         $Expected -match '^[0-9A-Fa-f]{64}$') `
         "$Context SHA-256 must contain exactly 64 hexadecimal characters."
-    $actual = Get-Stage5FinalAcceptanceFileSha256 $Path
+    Assert-Stage5Condition ($null -ne $Snapshot -and
+        $Snapshot.PSObject.Properties.Name -contains 'sha256') `
+        "$Context does not contain a hashed file snapshot."
+    $actual = [string]$Snapshot.sha256
     Assert-Stage5Condition ($actual -ceq $Expected.ToUpperInvariant()) `
         "$Context SHA-256 mismatch. Expected $Expected, got $actual."
     return $actual
@@ -2578,25 +2671,43 @@ function Get-Stage5FinalAcceptanceReceiptContract {
             producer = 'installed-runtime-validation-plan-v2'
             producerVersion = '2'
             currentProducer = 'Run-DeterministicSimulationValidation.ps1'
+            trustDomain = 'host-runner'
+            allowedTrustDomains = @('host-runner')
+            evidenceKind = 'stage5-host-runner-receipt'
+            requiresChildProvenance = $false
             detailNames = @('gateName', 'validationSet', 'entryCount')
         }
         'validation-results' = [pscustomobject]@{
             producer = 'installed-runtime-validation-results-v2'
             producerVersion = '2'
             currentProducer = 'Run-DeterministicSimulationValidation.ps1'
+            trustDomain = 'host-runner'
+            allowedTrustDomains = @('host-runner', 'executable')
+            executableProducer = 'game-executable-stage5-validation-results-v2'
+            evidenceKind = 'stage5-host-runner-receipt'
+            requiresChildProvenance = $true
             detailNames = @('resultCount', 'allExecutionsPassed', 'resultsSha256')
         }
         'replay-results' = [pscustomobject]@{
             producer = 'installed-runtime-replay-results-v2'
             producerVersion = '2'
             currentProducer = 'Run-DeterministicSimulationValidation.ps1'
+            trustDomain = 'host-runner'
+            allowedTrustDomains = @('host-runner', 'executable')
+            executableProducer = 'game-executable-stage5-replay-results-v2'
+            evidenceKind = 'stage5-host-runner-receipt'
+            requiresChildProvenance = $true
             detailNames = @('uniqueReplayCount', 'executionCount',
                 'crcTreeSha256', 'allExecutionsPassed')
         }
         'replay-fixture-manifest' = [pscustomobject]@{
             producer = 'reviewed-replay-fixture-manifest-v2'
             producerVersion = '2'
-            currentProducer = 'caller-supplied replay fixture manifest'
+            currentProducer = 'external reviewed fixture authority'
+            trustDomain = 'reviewed-fixture'
+            allowedTrustDomains = @('reviewed-fixture')
+            evidenceKind = 'stage5-reviewed-fixture-receipt'
+            requiresChildProvenance = $false
             detailNames = @('fixtureCount', 'stressFixtureCount',
                 'fixtureSetSha256')
         }
@@ -2604,20 +2715,44 @@ function Get-Stage5FinalAcceptanceReceiptContract {
             producer = 'installed-runtime-ai-results-v2'
             producerVersion = '2'
             currentProducer = 'Run-DeterministicSimulationValidation.ps1'
+            trustDomain = 'host-runner'
+            allowedTrustDomains = @('host-runner', 'executable')
+            executableProducer = 'game-executable-stage5-ai-results-v2'
+            evidenceKind = 'stage5-host-runner-receipt'
+            requiresChildProvenance = $true
             detailNames = @('scenarioCount', 'distinctSeedCount', 'repeatCount',
                 'allGamesCompleted', 'digestTreeSha256')
         }
         'combined-results' = [pscustomobject]@{
             producer = 'installed-runtime-combined-results-v2'
             producerVersion = '2'
-            currentProducer = 'none'
+            currentProducer = 'Run-DeterministicSimulationValidation.ps1'
+            trustDomain = 'host-runner'
+            allowedTrustDomains = @('host-runner')
+            evidenceKind = 'stage5-host-runner-receipt'
+            requiresChildProvenance = $true
             detailNames = @('pipelineMode', 'simulationMode', 'workerPolicy',
                 'renderer', 'renderThread', 'bothTitlesPassed')
+        }
+        'performance-report' = [pscustomobject]@{
+            producer = 'installed-runtime-performance-report-v2'
+            producerVersion = '2'
+            currentProducer = 'Run-DeterministicSimulationValidation.ps1'
+            trustDomain = 'host-runner'
+            allowedTrustDomains = @('host-runner', 'executable')
+            executableProducer = 'game-executable-stage5-performance-report-v2'
+            evidenceKind = 'stage5-host-runner-receipt'
+            requiresChildProvenance = $true
+            detailNames = @()
         }
         'premium-review-results' = [pscustomobject]@{
             producer = 'stage5-premium-review-receipt-v2'
             producerVersion = '2'
             currentProducer = 'none'
+            trustDomain = 'premium-review'
+            allowedTrustDomains = @('premium-review')
+            evidenceKind = 'stage5-premium-review-receipt'
+            requiresChildProvenance = $false
             detailNames = @('reviewedCommit', 'reviewRounds',
                 'independentReviewers', 'openP0', 'openP1', 'openP2')
         }
@@ -2625,6 +2760,10 @@ function Get-Stage5FinalAcceptanceReceiptContract {
             producer = 'installed-runtime-manual-acceptance-v2'
             producerVersion = '2'
             currentProducer = 'none'
+            trustDomain = 'manual-approval'
+            allowedTrustDomains = @('manual-approval')
+            evidenceKind = 'stage5-manual-approval-receipt'
+            requiresChildProvenance = $false
             detailNames = @('approvalScope', 'candidateHashVerified',
                 'bothTitlesTested', 'cleanExitPassed')
         }
@@ -2632,6 +2771,72 @@ function Get-Stage5FinalAcceptanceReceiptContract {
     Assert-Stage5Condition ($contracts.ContainsKey($Role)) `
         "No immutable final-acceptance receipt contract exists for attachment role '$Role'."
     return $contracts[$Role]
+}
+
+function Read-Stage5FinalAcceptanceProtectedAttestation {
+    param(
+        [string]$Path, [Collections.IDictionary]$Document, [string]$Kind,
+        [string]$Role, [string]$EvidenceTitle, [string]$TrustDomain,
+        [string]$ExpectedSourceCommit, [string]$ExpectedArtifactSetSha256
+    )
+    $context = "Final acceptance '$Kind' attachment '$Role'"
+    $protection = Get-Stage5JsonValue $Document 'protection' $context
+    Assert-Stage5JsonShape $protection @('kind', 'path', 'sha256') "$context protected attestation"
+    $protectionKind = Get-Stage5JsonValue $protection 'kind' "$context protected attestation"
+    $expectedProtectionKind = switch ($TrustDomain) {
+        'reviewed-fixture' { 'external-reviewed-fixture-attestation' }
+        'premium-review' { 'external-premium-review-attestation' }
+        default { 'external-user-manual-approval-attestation' }
+    }
+    Assert-Stage5Condition ($protectionKind -ceq $expectedProtectionKind) `
+        "$context protection kind is not external/protected."
+    $protectionPath = Resolve-Stage5FinalAcceptanceFile (Split-Path -Parent $Path) `
+        (Get-Stage5JsonValue $protection 'path' "$context protected attestation") `
+        "$context protected attestation"
+    $protectionSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $protectionPath `
+        "$context protected attestation"
+    Assert-Stage5FinalAcceptanceSnapshotSha256 $protectionSnapshot `
+        (Get-Stage5JsonValue $protection 'sha256' "$context protected attestation") `
+        "$context protected attestation" | Out-Null
+    $attestation = ConvertFrom-Stage5FinalAcceptanceJsonSnapshot $protectionSnapshot `
+        "$context external attestation"
+    Assert-Stage5JsonShape $attestation @('schemaVersion', 'evidenceKind',
+        'trustDomain', 'role', 'sourceCommit', 'artifactSetSha256',
+        'subjectKey', 'authority', 'issuedUtc') "$context external attestation"
+    $expectedSubjectKey = '{0}|{1}|{2}|{3}|{4}' -f $ExpectedSourceCommit,
+        $ExpectedArtifactSetSha256.ToUpperInvariant(), $Kind, $Role, $EvidenceTitle
+    Assert-Stage5Condition ((Get-Stage5JsonValue $attestation 'schemaVersion' "$context external attestation") -eq 1 -and
+        (Get-Stage5JsonValue $attestation 'evidenceKind' "$context external attestation") -ceq 'stage5-external-attestation' -and
+        (Get-Stage5JsonValue $attestation 'trustDomain' "$context external attestation") -ceq $TrustDomain -and
+        (Get-Stage5JsonValue $attestation 'role' "$context external attestation") -ceq $Role -and
+        (Get-Stage5JsonValue $attestation 'sourceCommit' "$context external attestation") -ceq $ExpectedSourceCommit -and
+        (Get-Stage5JsonValue $attestation 'artifactSetSha256' "$context external attestation").ToUpperInvariant() -ceq $ExpectedArtifactSetSha256.ToUpperInvariant() -and
+        (Get-Stage5JsonValue $attestation 'subjectKey' "$context external attestation") -ceq $expectedSubjectKey -and
+        (Get-Stage5JsonValue $attestation 'authority' "$context external attestation") -is [string] -and
+        -not [string]::IsNullOrWhiteSpace((Get-Stage5JsonValue $attestation 'authority' "$context external attestation"))) `
+        "$context external attestation is stale, substituted, or not bound to a protected authority."
+    $expectedAuthority = switch ($TrustDomain) {
+        'reviewed-fixture' { 'fixture-review-authority' }
+        'premium-review' { 'premium-review-authority' }
+        default { 'user-approval-authority' }
+    }
+    Assert-Stage5Condition ((Get-Stage5JsonValue $attestation 'authority' "$context external attestation") -ceq
+        $expectedAuthority) `
+        "$context external attestation authority is not the protected authority for trust domain '$TrustDomain'."
+    [DateTimeOffset]$attestationIssued = [DateTimeOffset]::MinValue
+    Assert-Stage5Condition ([DateTimeOffset]::TryParse((Get-Stage5JsonValue $attestation 'issuedUtc' "$context external attestation"), [ref]$attestationIssued)) `
+        "$context external attestation issuedUtc is not a valid timestamp."
+    $receiptProvenance = Get-Stage5JsonValue $Document 'provenance' $context
+    $receiptReviewedUtc = Get-Stage5JsonValue $receiptProvenance 'reviewedUtc' "$context external provenance"
+    [DateTimeOffset]$receiptReviewed = [DateTimeOffset]::MinValue
+    Assert-Stage5Condition ([DateTimeOffset]::TryParse($receiptReviewedUtc, [ref]$receiptReviewed) -and
+        $attestationIssued -eq $receiptReviewed) `
+        "$context external attestation timestamp is stale or does not bind the receipt review time."
+    [DateTimeOffset]$receiptRecorded = [DateTimeOffset]::MinValue
+    Assert-Stage5Condition ([DateTimeOffset]::TryParse((Get-Stage5JsonValue $Document 'recordedUtc' $context), [ref]$receiptRecorded) -and
+        $attestationIssued -le $receiptRecorded) `
+        "$context external attestation is recorded after the receipt timestamp."
+    return $protection
 }
 
 function Read-Stage5FinalAcceptanceImmutableReceipt {
@@ -2643,17 +2848,37 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
         [string]$ExpectedSourceCommit,
         [string]$ExpectedArtifactSetSha256,
         [Collections.IDictionary]$ArtifactHashes,
-        [Collections.IDictionary]$SeenRunNonces = $null
+        [Collections.IDictionary]$SeenRunNonces = $null,
+        [string]$ExpectedEvidenceSha256 = $null
     )
     $context = "Final acceptance '$Kind' attachment '$Role'"
     $contract = Get-Stage5FinalAcceptanceReceiptContract $Role
-    $document = ConvertFrom-Stage5JsonDictionary $Path
+    $receiptBaseDirectory = Split-Path -Parent ([IO.Path]::GetFullPath($Path))
+    Assert-Stage5FinalAcceptanceNoReparsePath $receiptBaseDirectory $Path $context
+    $documentSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $Path $context
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedEvidenceSha256)) {
+        Assert-Stage5FinalAcceptanceSnapshotSha256 $documentSnapshot `
+            $ExpectedEvidenceSha256 "$context receipt file" | Out-Null
+    }
+    $document = ConvertFrom-Stage5FinalAcceptanceJsonSnapshot $documentSnapshot $context
     Assert-Stage5Condition ($document -is [Collections.IDictionary]) `
-        "missing-producer: $context is not an executable-originated JSON receipt."
-    $names = @('schemaVersion', 'evidenceKind', 'status', 'role', 'producer',
-        'producerVersion', 'runNonce', 'sourceCommit', 'title', 'architecture',
-        'artifactSetSha256', 'executableSha256', 'recordedUtc', 'rawLogs',
-        'details')
+        "$context is not a JSON receipt object."
+    $documentTrustDomain = Get-Stage5JsonValue $document 'trustDomain' $context
+    $allowedTrustDomains = @($contract.allowedTrustDomains)
+    Assert-Stage5Condition ($documentTrustDomain -is [string] -and
+        $allowedTrustDomains -ccontains [string]$documentTrustDomain) `
+        "$context trustDomain is substituted or not an allowlisted producer domain: '$documentTrustDomain' for role '$Role'."
+    $commonNames = @('schemaVersion', 'evidenceKind', 'status', 'role',
+        'trustDomain', 'producer', 'producerVersion', 'sourceCommit', 'title',
+        'architecture', 'artifactSetSha256', 'recordedUtc', 'details')
+    $names = @($commonNames)
+    if ($documentTrustDomain -eq 'host-runner' -or
+        $documentTrustDomain -eq 'executable') {
+        $names += @('runNonce', 'executableSha256', 'rawLogs', 'provenance')
+    }
+    else {
+        $names += @('provenance', 'protection')
+    }
     $missing = New-Object 'Collections.Generic.List[string]'
     foreach ($name in $names) {
         if (@($document.Keys | Where-Object { [string]$_ -ceq $name }).Count -eq 0) {
@@ -2661,38 +2886,45 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
         }
     }
     if ($missing.Count -gt 0) {
-        throw "missing-producer: $context lacks immutable receipt fields '$($missing -join ', ')'. Expected producer '$($contract.producer)' version $($contract.producerVersion); current producer '$($contract.currentProducer)' does not emit this receipt."
+        throw "$context lacks required '$documentTrustDomain' receipt fields '$($missing -join ', ')'."
     }
     Assert-Stage5JsonShape $document $names $context
     $schemaVersion = Get-Stage5JsonValue $document 'schemaVersion' $context
     $evidenceKind = Get-Stage5JsonValue $document 'evidenceKind' $context
     $status = Get-Stage5JsonValue $document 'status' $context
     $receiptRole = Get-Stage5JsonValue $document 'role' $context
+    $trustDomain = Get-Stage5JsonValue $document 'trustDomain' $context
     $producer = Get-Stage5JsonValue $document 'producer' $context
     $producerVersion = Get-Stage5JsonValue $document 'producerVersion' $context
-    $runNonce = Get-Stage5JsonValue $document 'runNonce' $context
     $sourceCommit = Get-Stage5JsonValue $document 'sourceCommit' $context
     $title = Get-Stage5JsonValue $document 'title' $context
     $architecture = Get-Stage5JsonValue $document 'architecture' $context
     $artifactSetSha256 = Get-Stage5JsonValue $document 'artifactSetSha256' $context
-    $executableSha256 = Get-Stage5JsonValue $document 'executableSha256' $context
     $recordedUtc = Get-Stage5JsonValue $document 'recordedUtc' $context
+    $expectedProducer = if ($documentTrustDomain -ceq 'executable') {
+        [string]$contract.executableProducer
+    }
+    else { [string]$contract.producer }
+    $expectedEvidenceKind = if ($documentTrustDomain -ceq 'executable') {
+        'stage5-executable-originated-receipt'
+    }
+    else { [string]$contract.evidenceKind }
     Assert-Stage5Condition ((Test-Stage5JsonInteger $schemaVersion) -and
         [Int64]$schemaVersion -eq 1 -and
         $evidenceKind -is [string] -and
-        $evidenceKind -ceq 'stage5-executable-originated-receipt' -and
+        $evidenceKind -ceq $expectedEvidenceKind -and
         $status -is [string] -and $status -ceq 'passed') `
-        "$context has an invalid immutable receipt identity."
+        "$context has an invalid receipt identity for trust domain '$documentTrustDomain'."
     Assert-Stage5Condition ($receiptRole -is [string] -and $receiptRole -ceq $Role) `
         "$context role is substituted; receipt role must be '$Role'."
+    Assert-Stage5Condition ($trustDomain -is [string] -and
+        $trustDomain -ceq [string]$documentTrustDomain) `
+        "$context trustDomain is substituted; expected '$documentTrustDomain'."
     Assert-Stage5Condition ($producer -is [string] -and
-        $producer -ceq [string]$contract.producer -and
+        $producer -ceq $expectedProducer -and
         $producerVersion -is [string] -and
         $producerVersion -ceq [string]$contract.producerVersion) `
-        "missing-producer: $context has an unregistered producer/version. Expected '$($contract.producer)' version $($contract.producerVersion); current producer '$($contract.currentProducer)' does not emit this receipt."
-    Assert-Stage5Condition ($runNonce -is [string] -and
-        $runNonce -match '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-5][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$') `
-        "$context runNonce is not a canonical UUID nonce."
+        "$context has an unregistered producer/version for trust domain '$documentTrustDomain'. Expected '$expectedProducer' version $($contract.producerVersion)."
     Assert-Stage5Condition ($sourceCommit -is [string] -and
         $sourceCommit -ceq $ExpectedSourceCommit) `
         "$context sourceCommit is stale or does not match the final acceptance commit."
@@ -2711,62 +2943,6 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
     Assert-Stage5Condition ([DateTimeOffset]::TryParse($recordedUtc, [ref]$recorded)) `
         "$context recordedUtc is not a valid timestamp."
 
-    $expectedGenerals = [string]$ArtifactHashes['generals-executable']
-    $expectedZeroHour = [string]$ArtifactHashes['zerohour-executable']
-    if ($EvidenceTitle -ceq 'Both') {
-        Assert-Stage5JsonShape $executableSha256 @('Generals', 'ZeroHour') `
-            "$context executableSha256"
-        Assert-Stage5Condition (
-            (Get-Stage5JsonValue $executableSha256 'Generals' "$context executableSha256") -is [string] -and
-            (Get-Stage5JsonValue $executableSha256 'ZeroHour' "$context executableSha256") -is [string] -and
-            (Get-Stage5JsonValue $executableSha256 'Generals' "$context executableSha256").ToUpperInvariant() -ceq
-                $expectedGenerals.ToUpperInvariant() -and
-            (Get-Stage5JsonValue $executableSha256 'ZeroHour' "$context executableSha256").ToUpperInvariant() -ceq
-                $expectedZeroHour.ToUpperInvariant()) `
-            "$context executable SHA-256 binding does not match the artifact set."
-    }
-    else {
-        $expectedExecutable = if ($EvidenceTitle -ceq 'Generals') {
-            $expectedGenerals
-        }
-        else { $expectedZeroHour }
-        Assert-Stage5Condition ($executableSha256 -is [string] -and
-            $executableSha256 -match '^[0-9A-Fa-f]{64}$' -and
-            $executableSha256.ToUpperInvariant() -ceq $expectedExecutable.ToUpperInvariant()) `
-            "$context executable SHA-256 binding does not match the artifact set."
-    }
-
-    $rawLogs = Get-Stage5JsonValue $document 'rawLogs' $context
-    Assert-Stage5Condition ($rawLogs -is [Array] -and $rawLogs.Count -gt 0) `
-        "missing-producer: $context has no executable-originated raw-log hash bindings."
-    $rawNames = New-Object 'Collections.Generic.List[string]'
-    $rawPaths = New-Object 'Collections.Generic.List[string]'
-    $validatedRawLogs = New-Object 'Collections.Generic.List[object]'
-    foreach ($rawLog in $rawLogs) {
-        Assert-Stage5JsonShape $rawLog @('name', 'path', 'sha256') `
-            "$context raw log"
-        $rawName = Get-Stage5JsonValue $rawLog 'name' "$context raw log"
-        $rawRelative = Get-Stage5JsonValue $rawLog 'path' "$context raw log"
-        $rawExpectedHash = Get-Stage5JsonValue $rawLog 'sha256' "$context raw log"
-        Assert-Stage5Condition ($rawName -is [string] -and
-            $rawRelative -is [string] -and
-            $rawExpectedHash -is [string]) `
-            "$context raw log name, path, and SHA-256 must be strings."
-        Assert-Stage5Condition (-not ($rawNames -contains $rawName)) `
-            "$context repeats raw log '$rawName'."
-        $rawPath = Resolve-Stage5FinalAcceptanceFile (Split-Path -Parent $Path) `
-            $rawRelative "$context raw log '$rawName'"
-        Assert-Stage5Condition (-not ($rawPaths -contains $rawPath.ToLowerInvariant())) `
-            "$context aliases raw log path '$rawRelative'."
-        $rawHash = Assert-Stage5FinalAcceptanceSha256 $rawPath $rawExpectedHash `
-            "$context raw log '$rawName'"
-        $rawNames.Add($rawName) | Out-Null
-        $rawPaths.Add($rawPath.ToLowerInvariant()) | Out-Null
-        $validatedRawLogs.Add([pscustomobject]@{
-            name = $rawName; path = $rawRelative; sha256 = $rawHash
-        }) | Out-Null
-    }
-
     $details = Get-Stage5JsonValue $document 'details' $context
     try {
         foreach ($detailName in $contract.detailNames) {
@@ -2774,7 +2950,378 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
         }
     }
     catch {
-        throw "missing-producer: $context does not contain semantically parsed role-specific details. Current producer '$($contract.currentProducer)' does not emit the required immutable receipt: $($_.Exception.Message)"
+        throw "$context does not contain semantically parsed role-specific details: $($_.Exception.Message)"
+    }
+
+    $runNonce = $null
+    $validatedRawLogs = New-Object 'Collections.Generic.List[object]'
+    $provenance = Get-Stage5JsonValue $document 'provenance' $context
+    $protection = $null
+    $expectedGenerals = [string]$ArtifactHashes['generals-executable']
+    $expectedZeroHour = [string]$ArtifactHashes['zerohour-executable']
+    if ($documentTrustDomain -eq 'host-runner' -or
+        $documentTrustDomain -eq 'executable') {
+        $runNonce = Get-Stage5JsonValue $document 'runNonce' $context
+        Assert-Stage5Condition ($runNonce -is [string] -and
+            $runNonce -match '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-5][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$') `
+            "$context runNonce is not a canonical UUID nonce."
+        $executableSha256 = Get-Stage5JsonValue $document 'executableSha256' $context
+        if ($EvidenceTitle -ceq 'Both') {
+            Assert-Stage5JsonShape $executableSha256 @('Generals', 'ZeroHour') `
+                "$context executableSha256"
+            Assert-Stage5Condition (
+                (Get-Stage5JsonValue $executableSha256 'Generals' "$context executableSha256") -is [string] -and
+                (Get-Stage5JsonValue $executableSha256 'ZeroHour' "$context executableSha256") -is [string] -and
+                (Get-Stage5JsonValue $executableSha256 'Generals' "$context executableSha256").ToUpperInvariant() -ceq
+                    $expectedGenerals.ToUpperInvariant() -and
+                (Get-Stage5JsonValue $executableSha256 'ZeroHour' "$context executableSha256").ToUpperInvariant() -ceq
+                    $expectedZeroHour.ToUpperInvariant()) `
+                "$context executable SHA-256 binding does not match the artifact set."
+        }
+        else {
+            $expectedExecutable = if ($EvidenceTitle -ceq 'Generals') {
+                $expectedGenerals
+            }
+            else { $expectedZeroHour }
+            Assert-Stage5Condition ($executableSha256 -is [string] -and
+                $executableSha256 -match '^[0-9A-Fa-f]{64}$' -and
+                $executableSha256.ToUpperInvariant() -ceq $expectedExecutable.ToUpperInvariant()) `
+                "$context executable SHA-256 binding does not match the artifact set."
+        }
+        $rawLogs = Get-Stage5JsonValue $document 'rawLogs' $context
+        Assert-Stage5Condition ($rawLogs -is [Array] -and $rawLogs.Count -gt 0) `
+            "$context has no raw-log hash bindings for trust domain '$documentTrustDomain'."
+        $rawNames = New-Object 'Collections.Generic.List[string]'
+        $rawPaths = New-Object 'Collections.Generic.List[string]'
+        foreach ($rawLog in $rawLogs) {
+            Assert-Stage5JsonShape $rawLog @('name', 'path', 'sha256') `
+                "$context raw log"
+            $rawName = Get-Stage5JsonValue $rawLog 'name' "$context raw log"
+            $rawRelative = Get-Stage5JsonValue $rawLog 'path' "$context raw log"
+            $rawExpectedHash = Get-Stage5JsonValue $rawLog 'sha256' "$context raw log"
+            Assert-Stage5Condition ($rawName -is [string] -and
+                $rawRelative -is [string] -and
+                $rawExpectedHash -is [string]) `
+                "$context raw log name, path, and SHA-256 must be strings."
+            Assert-Stage5Condition (-not ($rawNames -contains $rawName)) `
+                "$context repeats raw log '$rawName'."
+            $rawPath = Resolve-Stage5FinalAcceptanceFile (Split-Path -Parent $Path) `
+                $rawRelative "$context raw log '$rawName'"
+            Assert-Stage5Condition (-not ($rawPaths -contains $rawPath.ToLowerInvariant())) `
+                "$context aliases raw log path '$rawRelative'."
+            $rawHash = Assert-Stage5FinalAcceptanceSha256 $rawPath $rawExpectedHash `
+                "$context raw log '$rawName'"
+            $rawNames.Add($rawName) | Out-Null
+            $rawPaths.Add($rawPath.ToLowerInvariant()) | Out-Null
+            $validatedRawLogs.Add([pscustomobject]@{
+                name = $rawName; path = $rawRelative; sha256 = $rawHash
+            }) | Out-Null
+        }
+        if ($documentTrustDomain -eq 'host-runner') {
+            Assert-Stage5JsonShape $provenance @('kind', 'runner', 'runnerVersion',
+                'childProvenance', 'children') "$context host provenance"
+            Assert-Stage5Condition ((Get-Stage5JsonValue $provenance 'kind' "$context host provenance") -ceq
+                'host-runner-observation' -and
+                (Get-Stage5JsonValue $provenance 'runner' "$context host provenance") -ceq
+                [string]$contract.currentProducer -and
+                (Get-Stage5JsonValue $provenance 'runnerVersion' "$context host provenance") -ceq '1') `
+                "$context host provenance is not bound to the registered runner."
+            $childProvenance = Get-Stage5JsonValue $provenance 'childProvenance' "$context host provenance"
+            $children = Get-Stage5JsonValue $provenance 'children' "$context host provenance"
+            Assert-Stage5Condition (($childProvenance -ceq 'bound') -or
+                ($childProvenance -ceq 'not-applicable')) `
+                "$context host provenance has an invalid childProvenance state."
+            if ([bool]$contract.requiresChildProvenance) {
+                Assert-Stage5Condition ($childProvenance -ceq 'bound' -and
+                    $children -is [Array] -and $children.Count -gt 0) `
+                    "$context host receipt lacks required child/native provenance."
+            }
+            else {
+                Assert-Stage5Condition ($childProvenance -ceq 'not-applicable' -and
+                    $children -is [Array] -and $children.Count -eq 0) `
+                    "$context host receipt claims child provenance where no child was available."
+            }
+            $seenChildTitles = New-Object 'Collections.Generic.List[string]'
+            $seenChildProcesses = New-Object 'Collections.Generic.List[string]'
+            foreach ($child in $children) {
+                Assert-Stage5JsonShape $child @('role', 'title', 'runNonce',
+                    'processId', 'processCreationUtc', 'executablePath',
+                    'executableSha256', 'commandLine', 'exitCode', 'stdout',
+                    'stderr') "$context host child"
+                $childRole = Get-Stage5JsonValue $child 'role' "$context host child"
+                $childTitle = Get-Stage5JsonValue $child 'title' "$context host child"
+                $childNonce = Get-Stage5JsonValue $child 'runNonce' "$context host child"
+                $childPid = Get-Stage5JsonValue $child 'processId' "$context host child"
+                $childCreation = Get-Stage5JsonValue $child 'processCreationUtc' "$context host child"
+                $childExecutablePath = Get-Stage5JsonValue $child 'executablePath' "$context host child"
+                $childExecutableHash = Get-Stage5JsonValue $child 'executableSha256' "$context host child"
+                $childCommandLine = Get-Stage5JsonValue $child 'commandLine' "$context host child"
+                $childExitCode = Get-Stage5JsonValue $child 'exitCode' "$context host child"
+                Assert-Stage5Condition ($childRole -is [string] -and $childRole -ceq $Role -and
+                    $childTitle -is [string] -and @('Generals', 'ZeroHour') -ccontains $childTitle -and
+                    -not ($seenChildTitles -contains $childTitle) -and
+                    $childNonce -is [string] -and $childNonce -ceq $runNonce -and
+                    (Test-Stage5JsonInteger $childPid) -and [Int64]$childPid -gt 0 -and
+                    $childCreation -is [string] -and $childExecutablePath -is [string] -and
+                    -not [string]::IsNullOrWhiteSpace($childExecutablePath) -and
+                    $childCommandLine -is [string] -and
+                    -not [string]::IsNullOrWhiteSpace($childCommandLine) -and
+                    (Test-Stage5JsonInteger $childExitCode) -and [Int64]$childExitCode -eq 0) `
+                    "$context host child process provenance is invalid or stale."
+                [DateTimeOffset]$childRecorded = [DateTimeOffset]::MinValue
+                Assert-Stage5Condition ([DateTimeOffset]::TryParse($childCreation, [ref]$childRecorded)) `
+                    "$context host child processCreationUtc is not a valid timestamp."
+                $childProcessKey = '{0}|{1}' -f $childPid, $childCreation
+                Assert-Stage5Condition (-not ($seenChildProcesses -contains $childProcessKey)) `
+                    "$context host provenance reuses a child process identity."
+                $seenChildProcesses.Add($childProcessKey) | Out-Null
+                $childExpectedHash = if ($childTitle -ceq 'Generals') {
+                    $expectedGenerals
+                }
+                else { $expectedZeroHour }
+                Assert-Stage5Condition ($childExecutableHash -is [string] -and
+                    $childExecutableHash -match '^[0-9A-Fa-f]{64}$' -and
+                    $childExecutableHash.ToUpperInvariant() -ceq $childExpectedHash.ToUpperInvariant()) `
+                    "$context host child executable SHA-256 binding is stale or substituted."
+                foreach ($streamName in @('stdout', 'stderr')) {
+                    $stream = Get-Stage5JsonValue $child $streamName "$context host child"
+                    Assert-Stage5JsonShape $stream @('path', 'sha256') "$context host child $streamName"
+                    $streamPath = Resolve-Stage5FinalAcceptanceFile (Split-Path -Parent $Path) `
+                        (Get-Stage5JsonValue $stream 'path' "$context host child $streamName") `
+                        "$context host child $streamName"
+                    Assert-Stage5FinalAcceptanceSha256 $streamPath `
+                        (Get-Stage5JsonValue $stream 'sha256' "$context host child $streamName") `
+                        "$context host child $streamName" | Out-Null
+                }
+                if (@($child.Keys | Where-Object { [string]$_ -ceq 'nativeReceipt' }).Count -gt 0) {
+                    $native = Get-Stage5JsonValue $child 'nativeReceipt' "$context host child"
+                    Assert-Stage5JsonShape $native @('path', 'sha256', 'producer',
+                        'runNonce') "$context host child nativeReceipt"
+                    $expectedNativeProducer = "game-executable-stage5-$Role-v2"
+                    Assert-Stage5Condition ((Get-Stage5JsonValue $native 'producer' "$context host child nativeReceipt") -is [string] -and
+                        (Get-Stage5JsonValue $native 'producer' "$context host child nativeReceipt") -ceq $expectedNativeProducer -and
+                        (Get-Stage5JsonValue $native 'runNonce' "$context host child nativeReceipt") -ceq $runNonce) `
+                        "$context host child native receipt producer or nonce is invalid."
+                    $nativePath = Resolve-Stage5FinalAcceptanceFile (Split-Path -Parent $Path) `
+                        (Get-Stage5JsonValue $native 'path' "$context host child nativeReceipt") `
+                        "$context host child nativeReceipt"
+                    $nativeSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $nativePath `
+                        "$context host child nativeReceipt"
+                    Assert-Stage5FinalAcceptanceSnapshotSha256 $nativeSnapshot `
+                        (Get-Stage5JsonValue $native 'sha256' "$context host child nativeReceipt") `
+                        "$context host child nativeReceipt" | Out-Null
+                    $nativeDocument = ConvertFrom-Stage5FinalAcceptanceJsonSnapshot $nativeSnapshot `
+                        "$context host child nativeReceipt"
+                    Assert-Stage5JsonShape $nativeDocument @('schemaVersion',
+                        'evidenceKind', 'status', 'producer', 'producerVersion',
+                        'runNonce', 'sourceCommit', 'artifactSetSha256',
+                        'executableSha256') "$context host child nativeReceipt"
+                    $nativeReceiptExecutableHash = Get-Stage5JsonValue $nativeDocument `
+                        'executableSha256' "$context host child nativeReceipt"
+                    Assert-Stage5Condition ((Get-Stage5JsonValue $nativeDocument `
+                        'schemaVersion' "$context host child nativeReceipt") -eq 1 -and
+                        (Get-Stage5JsonValue $nativeDocument 'evidenceKind' `
+                            "$context host child nativeReceipt") -ceq
+                            'stage5-executable-originated-receipt' -and
+                        (Get-Stage5JsonValue $nativeDocument 'status' `
+                            "$context host child nativeReceipt") -ceq 'passed' -and
+                        (Get-Stage5JsonValue $nativeDocument 'producer' `
+                            "$context host child nativeReceipt") -ceq $expectedNativeProducer -and
+                        (Get-Stage5JsonValue $nativeDocument 'producerVersion' `
+                            "$context host child nativeReceipt") -ceq '2' -and
+                        (Get-Stage5JsonValue $nativeDocument 'runNonce' `
+                            "$context host child nativeReceipt") -ceq $runNonce -and
+                        (Get-Stage5JsonValue $nativeDocument 'sourceCommit' `
+                            "$context host child nativeReceipt") -ceq $ExpectedSourceCommit -and
+                        (Get-Stage5JsonValue $nativeDocument 'artifactSetSha256' `
+                            "$context host child nativeReceipt").ToUpperInvariant() -ceq
+                            $ExpectedArtifactSetSha256.ToUpperInvariant() -and
+                        $nativeReceiptExecutableHash -is [string] -and
+                        $nativeReceiptExecutableHash.ToUpperInvariant() -ceq
+                            $childExpectedHash.ToUpperInvariant()) `
+                        "$context host child native receipt is stale, substituted, or from the wrong role."
+                }
+                $seenChildTitles.Add($childTitle) | Out-Null
+            }
+            if ($EvidenceTitle -ceq 'Both' -and [bool]$contract.requiresChildProvenance) {
+                Assert-Stage5Condition ($seenChildTitles -contains 'Generals' -and
+                    $seenChildTitles -contains 'ZeroHour') `
+                    "$context host provenance does not bind both title processes."
+            }
+        }
+        else {
+            Assert-Stage5Condition ($EvidenceTitle -ne 'Both') `
+                "$context executable trust-domain receipts must bind one title process."
+            Assert-Stage5JsonShape $provenance @('kind', 'receiptPath',
+                'receiptSha256', 'processId', 'processCreationUtc',
+                'executablePath', 'executableSha256', 'commandLine',
+                'exitCode') "$context native provenance"
+            Assert-Stage5Condition ((Get-Stage5JsonValue $provenance 'kind' "$context native provenance") -ceq
+                'native-executable-observation') `
+                "$context native provenance kind is invalid."
+            $nativeReceiptPath = Resolve-Stage5FinalAcceptanceFile (Split-Path -Parent $Path) `
+                (Get-Stage5JsonValue $provenance 'receiptPath' "$context native provenance") `
+                "$context native provenance receipt"
+            Assert-Stage5Condition ($nativeReceiptPath.ToLowerInvariant() -ne
+                ([IO.Path]::GetFullPath($Path)).ToLowerInvariant()) `
+                "$context native provenance receipt aliases the wrapper receipt."
+            $nativeSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $nativeReceiptPath `
+                "$context native provenance receipt"
+            Assert-Stage5FinalAcceptanceSnapshotSha256 $nativeSnapshot `
+                (Get-Stage5JsonValue $provenance 'receiptSha256' "$context native provenance") `
+                "$context native provenance receipt" | Out-Null
+            $nativeDocument = ConvertFrom-Stage5FinalAcceptanceJsonSnapshot $nativeSnapshot `
+                "$context native receipt"
+            Assert-Stage5JsonShape $nativeDocument @('schemaVersion', 'evidenceKind',
+                'status', 'producer', 'producerVersion', 'runNonce',
+                'sourceCommit', 'artifactSetSha256', 'executableSha256') `
+                "$context native receipt"
+            Assert-Stage5Condition ((Get-Stage5JsonValue $nativeDocument 'evidenceKind' "$context native receipt") -ceq
+                'stage5-executable-originated-receipt' -and
+                (Get-Stage5JsonValue $nativeDocument 'status' "$context native receipt") -ceq 'passed' -and
+                (Get-Stage5JsonValue $nativeDocument 'producer' "$context native receipt") -ceq
+                    "game-executable-stage5-$Role-v2" -and
+                (Get-Stage5JsonValue $nativeDocument 'producerVersion' "$context native receipt") -ceq '2' -and
+                (Get-Stage5JsonValue $nativeDocument 'runNonce' "$context native receipt") -ceq $runNonce -and
+                (Get-Stage5JsonValue $nativeDocument 'sourceCommit' "$context native receipt") -ceq $ExpectedSourceCommit -and
+                (Get-Stage5JsonValue $nativeDocument 'artifactSetSha256' "$context native receipt").ToUpperInvariant() -ceq
+                    $ExpectedArtifactSetSha256.ToUpperInvariant()) `
+                "$context native receipt identity is stale, substituted, or from the wrong role."
+            $nativeExpectedExecutable = if ($EvidenceTitle -ceq 'Generals') {
+                $expectedGenerals
+            }
+            else { $expectedZeroHour }
+            $nativeReceiptExecutableHash = Get-Stage5JsonValue $nativeDocument `
+                'executableSha256' "$context native receipt"
+            Assert-Stage5Condition ($nativeReceiptExecutableHash -is [string] -and
+                $nativeReceiptExecutableHash -match '^[0-9A-Fa-f]{64}$' -and
+                $nativeReceiptExecutableHash.ToUpperInvariant() -ceq
+                    $nativeExpectedExecutable.ToUpperInvariant()) `
+                "$context native receipt executable SHA-256 binding is stale or substituted."
+            Assert-Stage5Condition ((Test-Stage5JsonInteger (Get-Stage5JsonValue $provenance 'processId' "$context native provenance")) -and
+                [Int64](Get-Stage5JsonValue $provenance 'processId' "$context native provenance") -gt 0 -and
+                (Get-Stage5JsonValue $provenance 'executablePath' "$context native provenance") -is [string] -and
+                -not [string]::IsNullOrWhiteSpace((Get-Stage5JsonValue $provenance 'executablePath' "$context native provenance")) -and
+                (Get-Stage5JsonValue $provenance 'commandLine' "$context native provenance") -is [string] -and
+                (Test-Stage5JsonInteger (Get-Stage5JsonValue $provenance 'exitCode' "$context native provenance")) -and
+                [Int64](Get-Stage5JsonValue $provenance 'exitCode' "$context native provenance") -eq 0) `
+                "$context native process observation is invalid."
+            [DateTimeOffset]$nativeRecorded = [DateTimeOffset]::MinValue
+            Assert-Stage5Condition ([DateTimeOffset]::TryParse((Get-Stage5JsonValue $provenance 'processCreationUtc' "$context native provenance"), [ref]$nativeRecorded)) `
+                "$context native processCreationUtc is not a valid timestamp."
+            $nativeExecutableHash = Get-Stage5JsonValue $provenance 'executableSha256' "$context native provenance"
+            Assert-Stage5Condition ($nativeExecutableHash -is [string] -and
+                $nativeExecutableHash -match '^[0-9A-Fa-f]{64}$' -and
+                $nativeExecutableHash.ToUpperInvariant() -ceq
+                    $nativeExpectedExecutable.ToUpperInvariant()) `
+                "$context native process executable hash is substituted."
+        }
+    }
+    elseif ($documentTrustDomain -eq 'reviewed-fixture') {
+        $protection = Read-Stage5FinalAcceptanceProtectedAttestation `
+            -Path $Path -Document $document -Kind $Kind -Role $Role `
+            -EvidenceTitle $EvidenceTitle -TrustDomain $documentTrustDomain `
+            -ExpectedSourceCommit $ExpectedSourceCommit `
+            -ExpectedArtifactSetSha256 $ExpectedArtifactSetSha256
+        Assert-Stage5JsonShape $provenance @('kind', 'reviewedBy', 'reviewedUtc',
+            'fixtureManifest') "$context reviewed-fixture provenance"
+        Assert-Stage5Condition ((Get-Stage5JsonValue $provenance 'kind' "$context reviewed-fixture provenance") -ceq
+            'reviewed-fixture' -and
+            (Get-Stage5JsonValue $provenance 'reviewedBy' "$context reviewed-fixture provenance") -is [string] -and
+            -not [string]::IsNullOrWhiteSpace((Get-Stage5JsonValue $provenance 'reviewedBy' "$context reviewed-fixture provenance"))) `
+            "$context reviewed-fixture provenance is not an external review record."
+        [DateTimeOffset]$reviewed = [DateTimeOffset]::MinValue
+        Assert-Stage5Condition ([DateTimeOffset]::TryParse((Get-Stage5JsonValue $provenance 'reviewedUtc' "$context reviewed-fixture provenance"), [ref]$reviewed)) `
+            "$context reviewed-fixture reviewedUtc is not a valid timestamp."
+        $manifestReference = Get-Stage5JsonValue $provenance 'fixtureManifest' "$context reviewed-fixture provenance"
+        Assert-Stage5JsonShape $manifestReference @('path', 'sha256') "$context fixture manifest reference"
+        $manifestPath = Resolve-Stage5FinalAcceptanceFile (Split-Path -Parent $Path) `
+            (Get-Stage5JsonValue $manifestReference 'path' "$context fixture manifest reference") `
+            "$context fixture manifest reference"
+        $manifestSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $manifestPath `
+            "$context fixture manifest reference"
+        $manifestHash = Assert-Stage5FinalAcceptanceSnapshotSha256 $manifestSnapshot `
+            (Get-Stage5JsonValue $manifestReference 'sha256' "$context fixture manifest reference") `
+            "$context fixture manifest reference"
+        $fixtureDocument = ConvertFrom-Stage5FinalAcceptanceJsonSnapshot $manifestSnapshot `
+            "$context reviewed fixture manifest"
+        Assert-Stage5JsonShape $fixtureDocument @('schemaVersion', 'title',
+            'executable', 'executableSha256', 'fixtures', 'ai') `
+            "$context reviewed fixture manifest"
+        Assert-Stage5Condition ((Get-Stage5JsonValue $fixtureDocument 'schemaVersion' "$context reviewed fixture manifest") -eq 1 -and
+            (Get-Stage5JsonValue $fixtureDocument 'title' "$context reviewed fixture manifest") -ceq $EvidenceTitle) `
+            "$context reviewed fixture manifest title/schema is stale or substituted."
+        $manifestExecutableHash = Get-Stage5JsonValue $fixtureDocument 'executableSha256' "$context reviewed fixture manifest"
+        $expectedManifestExecutable = if ($EvidenceTitle -ceq 'Generals') { $expectedGenerals } else { $expectedZeroHour }
+        Assert-Stage5Condition ($manifestExecutableHash -is [string] -and
+            $manifestExecutableHash.ToUpperInvariant() -ceq $expectedManifestExecutable.ToUpperInvariant()) `
+            "$context reviewed fixture manifest executable binding is stale."
+        $fixtureEntries = Get-Stage5JsonValue $fixtureDocument 'fixtures' "$context reviewed fixture manifest"
+        Assert-Stage5Condition ($fixtureEntries -is [Array]) "$context reviewed fixture list is not an array."
+        $fixtureIds = New-Object 'Collections.Generic.List[string]'
+        $stressCount = 0
+        foreach ($fixture in $fixtureEntries) {
+            Assert-Stage5JsonShape $fixture @('id', 'source', 'sha256', 'stress') "$context reviewed fixture"
+            $fixtureId = Get-Stage5JsonValue $fixture 'id' "$context reviewed fixture"
+            $fixtureSource = Get-Stage5JsonValue $fixture 'source' "$context reviewed fixture"
+            $fixtureExpectedHash = Get-Stage5JsonValue $fixture 'sha256' "$context reviewed fixture"
+            $fixtureStress = Get-Stage5JsonValue $fixture 'stress' "$context reviewed fixture"
+            Assert-Stage5Condition ($fixtureId -is [string] -and -not ($fixtureIds -contains $fixtureId) -and
+                $fixtureSource -is [string] -and $fixtureExpectedHash -is [string] -and
+                $fixtureStress -is [bool]) "$context reviewed fixture entry is malformed or duplicated."
+            $fixturePath = Resolve-Stage5FinalAcceptanceFile (Split-Path -Parent $manifestPath) `
+                $fixtureSource "$context reviewed fixture '$fixtureId'"
+            Assert-Stage5FinalAcceptanceSha256 $fixturePath $fixtureExpectedHash `
+                "$context reviewed fixture '$fixtureId'" | Out-Null
+            if ([bool]$fixtureStress) { ++$stressCount }
+            $fixtureIds.Add($fixtureId) | Out-Null
+            if (@($fixture.Keys | Where-Object { [string]$_ -ceq 'maps' }).Count -gt 0) {
+                $maps = Get-Stage5JsonValue $fixture 'maps' "$context reviewed fixture '$fixtureId'"
+                Assert-Stage5Condition ($maps -is [Array]) "$context reviewed fixture '$fixtureId' maps is not an array."
+                foreach ($map in $maps) {
+                    Assert-Stage5JsonShape $map @('source', 'profileRelativePath', 'sha256') `
+                        "$context reviewed fixture '$fixtureId' map"
+                    $mapPath = Resolve-Stage5FinalAcceptanceFile (Split-Path -Parent $manifestPath) `
+                        (Get-Stage5JsonValue $map 'source' "$context reviewed fixture '$fixtureId' map") `
+                        "$context reviewed fixture '$fixtureId' map"
+                    Assert-Stage5FinalAcceptanceSha256 $mapPath `
+                        (Get-Stage5JsonValue $map 'sha256' "$context reviewed fixture '$fixtureId' map") `
+                        "$context reviewed fixture '$fixtureId' map" | Out-Null
+                }
+            }
+        }
+        $fixtureDetails = Get-Stage5JsonValue $details 'fixtureCount' "$context details"
+        $stressDetails = Get-Stage5JsonValue $details 'stressFixtureCount' "$context details"
+        $fixtureSetDetails = Get-Stage5JsonValue $details 'fixtureSetSha256' "$context details"
+        Assert-Stage5Condition ((Test-Stage5JsonInteger $fixtureDetails) -and
+            [Int64]$fixtureDetails -eq $fixtureEntries.Count -and
+            (Test-Stage5JsonInteger $stressDetails) -and [Int64]$stressDetails -eq $stressCount -and
+            $fixtureSetDetails -is [string] -and $fixtureSetDetails.ToUpperInvariant() -ceq $manifestHash.ToUpperInvariant()) `
+            "$context reviewed fixture details do not match the independently hashed fixture manifest."
+    }
+    else {
+        Assert-Stage5JsonShape $provenance @('kind', 'reviewedBy', 'reviewedUtc') `
+            "$context external provenance"
+        $expectedKind = if ($documentTrustDomain -eq 'premium-review') {
+            'premium-review'
+        }
+        else { 'manual-approval' }
+        Assert-Stage5Condition ((Get-Stage5JsonValue $provenance 'kind' "$context external provenance") -ceq $expectedKind -and
+            (Get-Stage5JsonValue $provenance 'reviewedBy' "$context external provenance") -is [string] -and
+            -not [string]::IsNullOrWhiteSpace((Get-Stage5JsonValue $provenance 'reviewedBy' "$context external provenance"))) `
+            "$context external provenance is not an authorized protected record."
+        [DateTimeOffset]$externalRecorded = [DateTimeOffset]::MinValue
+        Assert-Stage5Condition ([DateTimeOffset]::TryParse((Get-Stage5JsonValue $provenance 'reviewedUtc' "$context external provenance"), [ref]$externalRecorded)) `
+            "$context external provenance reviewedUtc is not a valid timestamp."
+        $protection = Read-Stage5FinalAcceptanceProtectedAttestation `
+            -Path $Path -Document $document -Kind $Kind -Role $Role `
+            -EvidenceTitle $EvidenceTitle -TrustDomain $documentTrustDomain `
+            -ExpectedSourceCommit $ExpectedSourceCommit `
+            -ExpectedArtifactSetSha256 $ExpectedArtifactSetSha256
+        if ($documentTrustDomain -eq 'manual-approval') {
+            Assert-Stage5Condition ((Get-Stage5JsonValue $provenance 'reviewedBy' "$context external provenance") -notmatch '(?i)runner|script|automation|pipeline') `
+                "$context manual approval is attributed to an automated producer."
+        }
     }
     switch ($Role) {
         'validation-plan' {
@@ -2809,14 +3356,8 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
                 "$context role details are not semantically valid."
         }
         'replay-fixture-manifest' {
-            $fixtureCount = Get-Stage5JsonValue $details 'fixtureCount' "$context details"
-            $stressCount = Get-Stage5JsonValue $details 'stressFixtureCount' "$context details"
-            $fixtureHash = Get-Stage5JsonValue $details 'fixtureSetSha256' "$context details"
-            Assert-Stage5Condition ((Test-Stage5JsonInteger $fixtureCount) -and
-                [Int64]$fixtureCount -ge 10 -and (Test-Stage5JsonInteger $stressCount) -and
-                [Int64]$stressCount -eq 1 -and $fixtureHash -is [string] -and
-                $fixtureHash -match '^[0-9A-Fa-f]{64}$') `
-                "$context role details are not semantically valid."
+            # Reviewed fixture semantics, including independent fixture and map
+            # rehashes, are validated in the reviewed-fixture trust-domain branch.
         }
         'ai-results' {
             $scenarioCount = Get-Stage5JsonValue $details 'scenarioCount' "$context details"
@@ -2871,24 +3412,30 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
         }
     }
     if ($null -ne $SeenRunNonces) {
-        if ($SeenRunNonces.Contains($runNonce)) {
+        if ($null -ne $runNonce -and $SeenRunNonces.Contains($runNonce)) {
             throw "replayed: $context reuses runNonce '$runNonce' already bound to '$($SeenRunNonces[$runNonce])'."
         }
-        $SeenRunNonces[$runNonce] = "$Kind/$Role"
+        if ($null -ne $runNonce) {
+            $SeenRunNonces[$runNonce] = "$Kind/$Role"
+        }
     }
     return [pscustomobject]@{
         role = $Role
+        trustDomain = $documentTrustDomain
         runNonce = $runNonce
         producer = $producer
         producerVersion = $producerVersion
         rawLogs = $validatedRawLogs.ToArray()
-        acceptanceFailure = "missing-producer: $context is structurally valid but no executable-originated producer is registered. Expected '$($contract.producer)' version $($contract.producerVersion); current producer '$($contract.currentProducer)' does not emit immutable run-nonce receipts."
+        provenance = $provenance
+        protection = $protection
+        acceptanceFailure = $null
     }
 }
 
 function Assert-Stage5FinalAcceptanceDetails {
     param([string]$Kind, [object]$Details, [string]$SourceCommit,
-        [Collections.IDictionary]$EvidenceHashes)
+        [Collections.IDictionary]$EvidenceHashes,
+        [string]$MixedNativeEvidenceSha256 = $null)
     $workerConfigurations = @('serial-1', 'parallel-1', 'parallel-2',
         'parallel-4', 'parallel-8', 'parallel-16', 'parallel-auto')
     switch ($Kind) {
@@ -2998,32 +3545,54 @@ function Assert-Stage5FinalAcceptanceDetails {
             }
         }
         'mixed-worker-multiplayer' {
-            $names = @('workerCounts', 'matchRecords', 'peerRecords', 'fixedSeeds',
-                'topologies', 'provenKernelMask', 'allMatchesCompleted',
-                'stateTracesIdentical', 'crossEpochRejected', 'contentMismatchRejected')
+            # The NET3 diagnostic receipt used matchRecords=16, peerRecords=40,
+            # two fixed seeds, and a single provenKernelMask.  Those counts are
+            # not the lockstep-v2 contract and must never be accepted as a
+            # substitute for the installed lockstep producer.  The v2 envelope
+            # binds its native evidence by content hash and states the exact
+            # roster/session topology instead.
+            $names = @('nativeEvidenceKind', 'producer', 'nativeEvidenceSha256',
+                'networkRosterMask', 'simulationRosterMask', 'aiRosterMask',
+                'aiPlayerCount', 'title', 'sessionCount', 'peerCount',
+                'commonStopFrame', 'allMatchesCompleted', 'stateTracesIdentical',
+                'crossEpochRejected', 'contentMismatchRejected')
             Assert-Stage5JsonShape $Details $names "$Kind details"
-            Assert-Stage5FinalAcceptanceStringSet `
-                (Get-Stage5JsonValue $Details 'workerCounts' "$Kind details") `
-                @('1', '2', '4', '8', 'auto') "$Kind workerCounts"
-            Assert-Stage5FinalAcceptanceStringSet `
-                (Get-Stage5JsonValue $Details 'topologies' "$Kind details") `
-                @('two-peer-1-v-16', 'two-peer-2-v-auto', 'two-peer-4-v-8',
-                    'four-peer-mixed-workers') "$Kind topologies"
-            $seeds = Get-Stage5JsonValue $Details 'fixedSeeds' "$Kind details"
-            Assert-Stage5Condition ($seeds -is [Array] -and $seeds.Count -eq 2 -and
-                $seeds[0] -eq 23063 -and $seeds[1] -eq 49374) `
-                'Mixed-worker multiplayer evidence requires the exact two fixed seeds.'
-            foreach ($metric in @(@('matchRecords', 16), @('peerRecords', 40),
-                @('provenKernelMask', 63))) {
+            Assert-Stage5Condition ((Get-Stage5JsonValue $Details 'nativeEvidenceKind' "$Kind details") -ceq
+                'lockstep-v2-multiplayer' -and
+                (Get-Stage5JsonValue $Details 'producer' "$Kind details") -ceq
+                'installed-lockstep-v2') `
+                "$Kind details are not bound to the installed lockstep-v2 native producer."
+            $nativeHash = Get-Stage5JsonValue $Details 'nativeEvidenceSha256' "$Kind details"
+            Assert-Stage5Condition ($nativeHash -is [string] -and
+                $nativeHash -match '^[0-9A-Fa-f]{64}$') `
+                "$Kind nativeEvidenceSha256 is not a canonical SHA-256."
+            foreach ($metric in @(
+                @('networkRosterMask', 3), @('simulationRosterMask', 63),
+                @('aiRosterMask', 60), @('aiPlayerCount', 4),
+                @('sessionCount', 2), @('peerCount', 2),
+                @('commonStopFrame', 4096))) {
                 $value = Get-Stage5JsonValue $Details $metric[0] "$Kind details"
                 Assert-Stage5Condition ((Test-Stage5JsonInteger $value) -and
                     [Int64]$value -eq [Int64]$metric[1]) `
-                    "Mixed-worker multiplayer $($metric[0]) must equal $($metric[1])."
+                    "Mixed-worker multiplayer $($metric[0]) must equal $($metric[1]) in the lockstep-v2 contract."
             }
+            Assert-Stage5Condition ((Get-Stage5JsonValue $Details 'title' "$Kind details") -ceq 'Both') `
+                "$Kind details must cover both title sessions."
             foreach ($name in @('allMatchesCompleted', 'stateTracesIdentical',
                 'crossEpochRejected', 'contentMismatchRejected')) {
                 Assert-Stage5FinalAcceptanceBoolean `
                     (Get-Stage5JsonValue $Details $name "$Kind details") "$Kind $name"
+            }
+            $nativeBindingHash = $MixedNativeEvidenceSha256
+            if ([string]::IsNullOrWhiteSpace($nativeBindingHash) -and
+                $null -ne $EvidenceHashes -and
+                $EvidenceHashes.Contains('mixed-worker-multiplayer-native')) {
+                $nativeBindingHash = [string]$EvidenceHashes['mixed-worker-multiplayer-native']
+            }
+            if (-not [string]::IsNullOrWhiteSpace($nativeBindingHash)) {
+                Assert-Stage5Condition ($nativeHash.ToUpperInvariant() -ceq
+                    $nativeBindingHash.ToUpperInvariant()) `
+                    "$Kind nativeEvidenceSha256 does not bind the independently hashed lockstep-v2 native evidence."
             }
         }
         'combined-stage4-stage5-installed-runtime' {
@@ -4955,11 +5524,15 @@ function Read-Stage5LockstepV2Evidence {
     $names = @('schemaVersion', 'evidenceKind', 'status', 'producer',
         'validationMode', 'architecture', 'sourceCommit', 'artifactSetSha256',
         'recordedUtc', 'allowHeadlessDirectExecution', 'launcherEquivalence',
-        'commonStopFrame', 'peerCount', 'mapName', 'mapCrc', 'seed',
+        'commonStopFrame', 'peerCount', 'networkRosterMask',
+        'simulationRosterMask', 'aiRosterMask', 'aiPlayerCount',
+        'mapName', 'mapCrc', 'seed',
         'v1Accepted', 'profileStrategy', 'registryViews',
         'environmentVariables', 'profileConcurrency', 'sessions')
     Assert-Stage5JsonShape $document $names 'Lockstep-v2 multiplayer evidence'
-    foreach ($field in @('schemaVersion', 'commonStopFrame', 'peerCount', 'mapCrc', 'seed')) {
+    foreach ($field in @('schemaVersion', 'commonStopFrame', 'peerCount',
+        'networkRosterMask', 'simulationRosterMask', 'aiRosterMask',
+        'aiPlayerCount', 'mapCrc', 'seed')) {
         Assert-Stage5Condition (Test-Stage5JsonInteger $document[$field]) `
             "Lockstep-v2 multiplayer evidence field '$field' must be an integer."
     }
@@ -4979,6 +5552,10 @@ function Read-Stage5LockstepV2Evidence {
         'Lockstep-v2 multiplayer evidence artifactSetSha256 does not match the independently hashed artifact set.'
     Assert-Stage5Condition ([Int64]$document['commonStopFrame'] -eq 4096 -and
         [Int64]$document['peerCount'] -ge 2 -and [Int64]$document['peerCount'] -le 8 -and
+        [Int64]$document['networkRosterMask'] -eq 3 -and
+        [Int64]$document['simulationRosterMask'] -eq 63 -and
+        [Int64]$document['aiRosterMask'] -eq 60 -and
+        [Int64]$document['aiPlayerCount'] -eq 4 -and
         [Int64]$document['mapCrc'] -gt 0 -and [Int64]$document['mapCrc'] -le 4294967295 -and
         [Int64]$document['seed'] -gt 0 -and $document['mapName'] -is [string] -and
         (Test-Stage5LockstepSafeMapName $document['mapName']) -and
@@ -5034,7 +5611,8 @@ function Read-Stage5LockstepV2Evidence {
         $session = $sessions[$sessionIndex]
         $title = $sessionTitles[$sessionIndex]
         $sessionContext = "Lockstep-v2 '$title' session"
-        $sessionNames = @('title', 'peerCount', 'ports', 'sessionNonce',
+        $sessionNames = @('title', 'peerCount', 'networkRosterMask',
+            'simulationRosterMask', 'aiRosterMask', 'aiPlayerCount', 'ports', 'sessionNonce',
             'launcherEquivalence', 'titleSessionProfile',
             'registryEquivalence', 'workerProfiles', 'effectiveWorkerCounts',
             'mixedWorkerProof', 'comparableProjectionSha256', 'peers',
@@ -5051,6 +5629,13 @@ function Read-Stage5LockstepV2Evidence {
             (Test-Stage5JsonInteger $session['peerCount']) -and
             [Int64]$session['peerCount'] -eq [Int64]$document['peerCount']) `
             "$sessionContext title or peer count is substituted."
+        Assert-Stage5Condition ([Int64]$session['networkRosterMask'] -eq
+            [Int64]$document['networkRosterMask'] -and
+            [Int64]$session['simulationRosterMask'] -eq
+            [Int64]$document['simulationRosterMask'] -and
+            [Int64]$session['aiRosterMask'] -eq [Int64]$document['aiRosterMask'] -and
+            [Int64]$session['aiPlayerCount'] -eq [Int64]$document['aiPlayerCount']) `
+            "$sessionContext roster masks or AI player count are stale or substituted."
         Assert-Stage5Condition ($session['sessionNonce'] -is [string] -and
             $session['sessionNonce'] -cmatch '^[0-9A-F]{32}$' -and
             -not $seenSessionNonces.ContainsKey($session['sessionNonce'])) `
@@ -5132,7 +5717,9 @@ function Read-Stage5LockstepV2Evidence {
             $peer = $peers[$peerIndex]
             $peerContext = "$sessionContext peer $peerIndex"
             $peerNames = @('schemaVersion', 'producer', 'validationMode', 'title',
-                'processId', 'peer', 'peerCount', 'port', 'runNonce', 'sessionNonce',
+                'processId', 'peer', 'peerCount', 'networkRosterMask',
+                'simulationRosterMask', 'aiRosterMask', 'aiPlayerCount', 'port',
+                'runNonce', 'sessionNonce',
                 'executableSha256', 'sourceCommit', 'launcherEquivalence',
                 'launcherPath', 'launcherSha256', 'launcherConfigPath',
                 'launcherConfigSha256', 'directExecutionOptIn', 'workingDirectory',
@@ -5146,7 +5733,8 @@ function Read-Stage5LockstepV2Evidence {
                 'v1ReceiptAccepted')
             Assert-Stage5JsonShape $peer $peerNames $peerContext
             foreach ($field in @('schemaVersion', 'processId', 'peer', 'peerCount',
-                'port', 'exitCode', 'finalFrame', 'finalCRC')) {
+                'networkRosterMask', 'simulationRosterMask', 'aiRosterMask',
+                'aiPlayerCount', 'port', 'exitCode', 'finalFrame', 'finalCRC')) {
                 Assert-Stage5Condition (Test-Stage5JsonInteger $peer[$field]) `
                     "$peerContext field '$field' must be an integer."
             }
@@ -5158,6 +5746,10 @@ function Read-Stage5LockstepV2Evidence {
                 [string]$peer['validationMode'] -ceq 'installed-lockstep-v2-production' -and
                 [string]$peer['title'] -ceq $title -and [Int64]$peer['peer'] -eq $peerIndex -and
                 [Int64]$peer['peerCount'] -eq [Int64]$document['peerCount'] -and
+                [Int64]$peer['networkRosterMask'] -eq [Int64]$document['networkRosterMask'] -and
+                [Int64]$peer['simulationRosterMask'] -eq [Int64]$document['simulationRosterMask'] -and
+                [Int64]$peer['aiRosterMask'] -eq [Int64]$document['aiRosterMask'] -and
+                [Int64]$peer['aiPlayerCount'] -eq [Int64]$document['aiPlayerCount'] -and
                 [Int64]$peer['port'] -eq $sessionPorts[$peerIndex] -and
                 [Int64]$peer['processId'] -gt 0 -and
                 [Int64]$peer['exitCode'] -eq 0 -and [Int64]$peer['finalFrame'] -eq 4096 -and
@@ -5369,12 +5961,26 @@ function Get-Stage5LockstepV2AcceptanceFailure {
 }
 
 function Invoke-Stage5FinalAcceptanceAggregation {
-    param([string]$AcceptanceManifestPath)
+    param(
+        [string]$AcceptanceManifestPath,
+        [string]$ReadinessMode = 'final-acceptance',
+        [switch]$DevelopmentReadiness
+    )
+    $preManualReadiness = $DevelopmentReadiness -or
+        $ReadinessMode -in @('development', 'development-readiness', 'pre-manual')
+    Assert-Stage5Condition ($preManualReadiness -or
+        $ReadinessMode -in @('final', 'final-acceptance')) `
+        "Unsupported Stage 5 acceptance readiness mode '$ReadinessMode'."
     $requestPath = [IO.Path]::GetFullPath($AcceptanceManifestPath)
     Assert-Stage5Condition (Test-Path -LiteralPath $requestPath -PathType Leaf) `
         "Final acceptance manifest was not found: $requestPath"
     $requestDirectory = Split-Path -Parent $requestPath
-    $request = ConvertFrom-Stage5JsonDictionary $requestPath
+    Assert-Stage5FinalAcceptanceNoReparsePath $requestDirectory $requestPath `
+        'Final acceptance manifest'
+    $requestSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $requestPath `
+        'Final acceptance manifest'
+    $request = ConvertFrom-Stage5FinalAcceptanceJsonSnapshot $requestSnapshot `
+        'Final acceptance manifest'
     $requestNames = @('schemaVersion', 'gateName', 'sourceCommit', 'artifactSet', 'evidence')
     Assert-Stage5JsonShape $request $requestNames 'Final acceptance manifest'
     $schemaVersion = Get-Stage5JsonValue $request 'schemaVersion' 'Final acceptance manifest'
@@ -5393,10 +5999,13 @@ function Invoke-Stage5FinalAcceptanceAggregation {
     Assert-Stage5Condition ($artifactRelative -is [string]) 'Final acceptance artifactSet path must be a JSON string.'
     $artifactPath = Resolve-Stage5FinalAcceptanceFile $requestDirectory $artifactRelative `
         'Final acceptance artifactSet'
-    $artifactSetHash = Assert-Stage5FinalAcceptanceSha256 $artifactPath $artifactExpectedHash `
+    $artifactSetSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $artifactPath `
         'Final acceptance artifactSet'
+    $artifactSetHash = Assert-Stage5FinalAcceptanceSnapshotSha256 $artifactSetSnapshot `
+        $artifactExpectedHash 'Final acceptance artifactSet'
     $artifactDirectory = Split-Path -Parent $artifactPath
-    $artifactSet = ConvertFrom-Stage5JsonDictionary $artifactPath
+    $artifactSet = ConvertFrom-Stage5FinalAcceptanceJsonSnapshot $artifactSetSnapshot `
+        'Artifact set manifest'
     $artifactNames = @('schemaVersion', 'sourceCommit', 'productSet', 'architecture', 'artifacts')
     Assert-Stage5JsonShape $artifactSet $artifactNames 'Artifact set manifest'
     Assert-Stage5Condition ((Get-Stage5JsonValue $artifactSet 'schemaVersion' 'Artifact set manifest') -eq 1 -and
@@ -5436,9 +6045,13 @@ function Invoke-Stage5FinalAcceptanceAggregation {
     Assert-Stage5FinalAcceptanceStringSet $artifactRoles.ToArray() $requiredArtifactRoles `
         'Artifact set roles'
 
-    $requiredEvidenceKinds = @('deterministic-runtime', 'replay-determinism',
+    $allEvidenceKinds = @('deterministic-runtime', 'replay-determinism',
         'fresh-ai', 'performance-scaling', 'mixed-worker-multiplayer',
         'combined-stage4-stage5-installed-runtime', 'premium-review', 'manual-acceptance')
+    $requiredEvidenceKinds = if ($preManualReadiness) {
+        @($allEvidenceKinds | Where-Object { $_ -cne 'manual-acceptance' })
+    }
+    else { $allEvidenceKinds }
     $evidenceEntries = Get-Stage5JsonValue $request 'evidence' 'Final acceptance manifest'
     Assert-Stage5Condition ($evidenceEntries -is [Array]) `
         'Final acceptance evidence must be a JSON array.'
@@ -5460,9 +6073,12 @@ function Invoke-Stage5FinalAcceptanceAggregation {
             "Final acceptance evidence '$kind'"
         Assert-Stage5Condition (-not ($evidencePaths -contains $evidencePath.ToLowerInvariant())) `
             "Final acceptance evidence aliases path '$relative'."
-        $evidenceHash = Assert-Stage5FinalAcceptanceSha256 $evidencePath $expectedHash `
+        $evidenceSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $evidencePath `
             "Final acceptance evidence '$kind'"
-        $evidenceDocument = ConvertFrom-Stage5JsonDictionary $evidencePath
+        $evidenceHash = Assert-Stage5FinalAcceptanceSnapshotSha256 $evidenceSnapshot `
+            $expectedHash "Final acceptance evidence '$kind'"
+        $evidenceDocument = ConvertFrom-Stage5FinalAcceptanceJsonSnapshot $evidenceSnapshot `
+            "Evidence '$kind'"
         $evidenceNames = @('schemaVersion', 'evidenceKind', 'status', 'sourceCommit',
             'title', 'architecture', 'artifactSetSha256', 'recordedUtc',
             'attachments', 'details')
@@ -5510,6 +6126,19 @@ function Invoke-Stage5FinalAcceptanceAggregation {
         'premium-review' = @('premium-review-results')
         'manual-acceptance' = @('manual-checklist')
     }
+    $attachmentTrustDomains = @{
+        'validation-plan' = 'host-runner'
+        'validation-results' = 'host-runner'
+        'replay-results' = 'host-runner'
+        'replay-fixture-manifest' = 'reviewed-fixture'
+        'ai-results' = 'host-runner'
+        'performance-report' = 'host-runner'
+        'stage3-baseline' = 'reviewed-fixture'
+        'multiplayer-results' = 'host-runner'
+        'combined-results' = 'host-runner'
+        'premium-review-results' = 'premium-review'
+        'manual-checklist' = 'manual-approval'
+    }
     $lockstepV2Failure = $null
     $immutableReceiptRoles = @('validation-plan', 'validation-results',
         'replay-results', 'replay-fixture-manifest', 'ai-results',
@@ -5529,16 +6158,23 @@ function Invoke-Stage5FinalAcceptanceAggregation {
         $scalingAttachmentPath = $null
         $scalingAttachmentHash = $null
         $stage3BaselineAttachmentHash = $null
+        $mixedNativeEvidenceAttachmentHash = $null
         $evidenceDirectory = Split-Path -Parent $record.fullPath
         $evidenceTitle = Get-Stage5JsonValue $document 'title' "Evidence '$kind'"
         foreach ($attachment in $attachments) {
-            Assert-Stage5JsonShape $attachment @('role', 'path', 'sha256') `
+            Assert-Stage5JsonShape $attachment @('role', 'path', 'sha256', 'trustDomain') `
                 "Evidence '$kind' attachment"
             $role = Get-Stage5JsonValue $attachment 'role' "Evidence '$kind' attachment"
             $relative = Get-Stage5JsonValue $attachment 'path' "Evidence '$kind' attachment"
             $expectedHash = Get-Stage5JsonValue $attachment 'sha256' "Evidence '$kind' attachment"
+            $attachmentTrustDomain = Get-Stage5JsonValue $attachment 'trustDomain' `
+                "Evidence '$kind' attachment"
             Assert-Stage5Condition ($role -is [string] -and $relative -is [string]) `
                 "Evidence '$kind' attachment role and path must be JSON strings."
+            Assert-Stage5Condition ($attachmentTrustDomains.ContainsKey($role) -and
+                $attachmentTrustDomain -is [string] -and
+                $attachmentTrustDomain -ceq [string]$attachmentTrustDomains[$role]) `
+                "Evidence '$kind' attachment '$role' has the wrong trust domain."
             Assert-Stage5Condition (-not ($seenRoles -contains $role)) `
                 "Evidence '$kind' repeats attachment role '$role'."
             $attachmentPath = Resolve-Stage5FinalAcceptanceFile $evidenceDirectory $relative `
@@ -5547,7 +6183,9 @@ function Invoke-Stage5FinalAcceptanceAggregation {
                 "Evidence '$kind' aliases attachment path '$relative'."
             $attachmentHash = Assert-Stage5FinalAcceptanceSha256 $attachmentPath $expectedHash `
                 "Evidence '$kind' attachment '$role'"
-            if ($immutableReceiptRoles -ccontains $role) {
+            $readGenericReceipt = $immutableReceiptRoles -ccontains $role -or
+                ($kind -ceq 'deterministic-runtime' -and $role -ceq 'performance-report')
+            if ($readGenericReceipt) {
                 try {
                     $receipt = Read-Stage5FinalAcceptanceImmutableReceipt `
                         -Path $attachmentPath -Kind $kind -Role $role `
@@ -5555,7 +6193,8 @@ function Invoke-Stage5FinalAcceptanceAggregation {
                         -ExpectedSourceCommit $sourceCommit `
                         -ExpectedArtifactSetSha256 $artifactSetHash `
                         -ArtifactHashes $artifactHashes `
-                        -SeenRunNonces $receiptRunNonces
+                        -SeenRunNonces $receiptRunNonces `
+                        -ExpectedEvidenceSha256 $attachmentHash
                     if ($null -ne $receipt.acceptanceFailure) {
                         $receiptFailures.Add($receipt.acceptanceFailure) | Out-Null
                     }
@@ -5574,6 +6213,11 @@ function Invoke-Stage5FinalAcceptanceAggregation {
                 $lockstepV2Failure = Get-Stage5LockstepV2AcceptanceFailure `
                     $attachmentPath 'Mixed-worker multiplayer attachment' `
                     $sourceCommit $artifactSetHash $artifactHashes
+                if ($null -eq $lockstepV2Failure) {
+                    # The v2 details hash is the independently rehashed native
+                    # attachment, not the outer acceptance envelope hash.
+                    $mixedNativeEvidenceAttachmentHash = $attachmentHash
+                }
             }
             if ($kind -ceq 'performance-scaling' -and $role -ceq 'performance-report') {
                 $scalingAttachmentPath = $attachmentPath
@@ -5586,6 +6230,7 @@ function Invoke-Stage5FinalAcceptanceAggregation {
             $seenPaths.Add($attachmentPath.ToLowerInvariant()) | Out-Null
             $attachmentReport.Add([pscustomobject]@{
                 role = $role; path = $relative; sha256 = $attachmentHash
+                trustDomain = $attachmentTrustDomain
             }) | Out-Null
         }
         Assert-Stage5FinalAcceptanceStringSet $seenRoles.ToArray() $attachmentRoles[$kind] `
@@ -5606,7 +6251,7 @@ function Invoke-Stage5FinalAcceptanceAggregation {
         }
         Assert-Stage5FinalAcceptanceDetails $kind `
             (Get-Stage5JsonValue $document 'details' "Evidence '$kind'") `
-            $sourceCommit $evidenceHashes
+            $sourceCommit $evidenceHashes $mixedNativeEvidenceAttachmentHash
         $reportEvidence.Add([pscustomobject]@{
             kind = $kind
             path = $record.relativePath
@@ -5625,10 +6270,31 @@ function Invoke-Stage5FinalAcceptanceAggregation {
     if ($null -ne $lockstepV2Failure) {
         throw $lockstepV2Failure
     }
+    if ($preManualReadiness) {
+        return [pscustomobject]@{
+            schemaVersion = 1
+            gateName = 'stage5-development-readiness'
+            status = 'ready-for-manual-approval'
+            readiness = 'pre-manual'
+            manualApprovalRequired = $true
+            finalAcceptanceClaim = $false
+            generatedUtc = [DateTime]::UtcNow.ToString('o')
+            sourceCommit = $sourceCommit
+            artifactSet = [pscustomobject]@{
+                path = [string]$artifactRelative
+                sha256 = $artifactSetHash
+            }
+            evidence = $reportEvidence.ToArray()
+        }
+    }
     return [pscustomobject]@{
         schemaVersion = 1
         gateName = 'final-stage5-acceptance'
         status = 'passed'
+        readiness = 'final-manual-approved'
+        manualApprovalRequired = $false
+        finalAcceptanceClaim = $true
+        manualAcceptanceVerified = $true
         generatedUtc = [DateTime]::UtcNow.ToString('o')
         sourceCommit = $sourceCommit
         artifactSet = [pscustomobject]@{

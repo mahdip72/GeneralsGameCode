@@ -23,7 +23,9 @@ param(
     [switch]$EnforcePerformance,
     [ValidateSet('Generals', 'ZeroHour')][string]$Title = 'ZeroHour',
     [string]$Stage3PerformanceBaselinePath = '',
-    [string]$ExpectedStage3ExecutableSha256 = ''
+    [string]$ExpectedStage3ExecutableSha256 = '',
+    [string]$AcceptanceSourceCommit = '',
+    [string]$AcceptanceArtifactSetSha256 = ''
 )
 
 Set-StrictMode -Version 2.0
@@ -42,6 +44,124 @@ function Get-Sha256 {
         finally { $sha.Dispose() }
     }
     finally { $stream.Dispose() }
+}
+
+function Get-Sha256Text {
+    param([Parameter(Mandatory = $true)][string]$Value)
+    $encoding = New-Object Text.UTF8Encoding($false)
+    $bytes = $encoding.GetBytes($Value)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return (($sha.ComputeHash($bytes) | ForEach-Object {
+            $_.ToString('x2')
+        }) -join '').ToUpperInvariant()
+    }
+    finally { $sha.Dispose() }
+}
+
+function ConvertTo-UtcIsoTimestamp {
+    param([AllowNull()][object]$Value)
+    if ($null -eq $Value) { return '' }
+    if ($Value -is [DateTimeOffset]) {
+        return $Value.ToUniversalTime().ToString('o')
+    }
+    if ($Value -is [DateTime]) {
+        return $Value.ToUniversalTime().ToString('o')
+    }
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) { return '' }
+    try {
+        $date = [Management.ManagementDateTimeConverter]::ToDateTime($text)
+        return $date.ToUniversalTime().ToString('o')
+    }
+    catch { }
+    try {
+        [DateTimeOffset]$parsed = [DateTimeOffset]::MinValue
+        if ([DateTimeOffset]::TryParse($text, [ref]$parsed)) {
+            return $parsed.ToUniversalTime().ToString('o')
+        }
+    }
+    catch { }
+    return ''
+}
+
+function ConvertTo-OutputRelativePath {
+    param([string]$Path, [string]$OutputRoot, [string]$Context)
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace($Path)) "$Context path is empty."
+    $rootFull = [IO.Path]::GetFullPath($OutputRoot).TrimEnd('\')
+    $candidate = [IO.Path]::GetFullPath($Path)
+    $inside = [String]::Equals($candidate, $rootFull, [StringComparison]::OrdinalIgnoreCase) -or
+        $candidate.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar,
+            [StringComparison]::OrdinalIgnoreCase)
+    Assert-Condition $inside "$Context path must remain below output root '$rootFull': $candidate"
+    Assert-Condition (-not [String]::Equals($candidate, $rootFull,
+        [StringComparison]::OrdinalIgnoreCase)) "$Context path must name a file below output root."
+    return $candidate.Substring($rootFull.Length + 1).Replace('/', '\')
+}
+
+function Get-NativeV2ReceiptReference {
+    param(
+        [string]$OutputText,
+        [string]$OutputRoot,
+        [string]$WorkingDirectory,
+        [string]$Role,
+        [string]$SourceCommit,
+        [string]$ArtifactSetSha256,
+        [string]$ExecutableSha256,
+        [string]$RunNonce
+    )
+    if ([string]::IsNullOrWhiteSpace($OutputText) -or
+        [string]::IsNullOrWhiteSpace($OutputRoot)) { return $null }
+    $matches = [regex]::Matches($OutputText,
+        '(?m)^SIMULATION_PERFORMANCE_RECEIPT\s+status=written\s+path=(?<path>[^\r\n]+)$')
+    foreach ($match in $matches) {
+        $candidateText = $match.Groups['path'].Value.Trim().Trim('"')
+        if ([string]::IsNullOrWhiteSpace($candidateText)) { continue }
+        try {
+            $candidate = if ([IO.Path]::IsPathRooted($candidateText)) {
+                [IO.Path]::GetFullPath($candidateText)
+            }
+            else {
+                [IO.Path]::GetFullPath((Join-Path $WorkingDirectory $candidateText))
+            }
+            $relative = ConvertTo-OutputRelativePath $candidate $OutputRoot `
+                'Native receipt reference'
+            if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+            $nativeText = [IO.File]::ReadAllText($candidate)
+            $native = if ($PSVersionTable.PSVersion.Major -ge 6) {
+                $nativeText | ConvertFrom-Json -AsHashtable
+            }
+            else {
+                Add-Type -AssemblyName System.Web.Extensions
+                $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+                $serializer.DeserializeObject($nativeText)
+            }
+            if ($native -isnot [Collections.IDictionary]) { continue }
+            $expectedProducer = "game-executable-stage5-$Role-v2"
+            if ($native['schemaVersion'] -ne 1 -or
+                [string]$native['evidenceKind'] -cne 'stage5-executable-originated-receipt' -or
+                [string]$native['status'] -cne 'passed' -or
+                [string]$native['producer'] -cne $expectedProducer -or
+                [string]$native['producerVersion'] -cne '2' -or
+                [string]$native['runNonce'] -cne $RunNonce -or
+                [string]$native['sourceCommit'] -cne $SourceCommit -or
+                [string]$native['artifactSetSha256'].ToUpperInvariant() -cne
+                    $ArtifactSetSha256.ToUpperInvariant() -or
+                [string]$native['executableSha256'].ToUpperInvariant() -cne
+                    $ExecutableSha256.ToUpperInvariant()) { continue }
+            return [pscustomobject]@{
+                path = $relative
+                sha256 = Get-Sha256 $candidate
+                producer = $expectedProducer
+                runNonce = $RunNonce
+            }
+        }
+        catch {
+            # A legacy or malformed marker is diagnostic only.  It must never
+            # be promoted to a v2 native provenance reference.
+        }
+    }
+    return $null
 }
 
 function Assert-Condition {
@@ -836,6 +956,7 @@ function Get-ValidationProcessIdentity {
         processId = [int]$processInfo.ProcessId
         executablePath = [IO.Path]::GetFullPath([string]$processInfo.ExecutablePath)
         creationToken = [string]$processInfo.CreationDate
+        processCreationUtc = ConvertTo-UtcIsoTimestamp $processInfo.CreationDate
         parentProcessId = [int]$processInfo.ParentProcessId
         parentCreationToken = if ($null -eq $parentInfo) { '' } else { [string]$parentInfo.CreationDate }
     }
@@ -907,7 +1028,8 @@ function Invoke-ValidationProcess {
         [string]$WorkingDirectory,
         [object]$Entry,
         [bool]$CaptureTiming,
-        [hashtable]$Environment
+        [hashtable]$Environment,
+        [string]$EvidenceRoot = ''
     )
     $processName = [IO.Path]::GetFileNameWithoutExtension($Executable)
     Assert-Condition (@(Get-Process -Name $processName -ErrorAction SilentlyContinue).Count -eq 0) `
@@ -939,12 +1061,15 @@ function Invoke-ValidationProcess {
     elseif ($startInfo.EnvironmentVariables.ContainsKey('RTS_FRAME_TIMING_DIR')) {
         $startInfo.EnvironmentVariables.Remove('RTS_FRAME_TIMING_DIR')
     }
+    $processRunNonce = [Guid]::NewGuid().ToString()
+    $startInfo.EnvironmentVariables['RTS_STAGE5_RUN_NONCE'] = $processRunNonce
     $process = New-Object Diagnostics.Process
     $process.StartInfo = $startInfo
     $startedAt = [DateTime]::UtcNow
     $started = $false
     $terminationAttempted = $false
     $processIdentity = $null
+    $processCreationUtc = ''
     $stdoutTask = $null
     $stderrTask = $null
     $exited = $false
@@ -953,6 +1078,10 @@ function Invoke-ValidationProcess {
     try {
         Assert-Condition ($process.Start()) "Failed to start installed runtime process."
         $started = $true
+        try {
+            $processCreationUtc = ConvertTo-UtcIsoTimestamp $process.StartTime
+        }
+        catch { $processCreationUtc = '' }
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
         try {
@@ -969,6 +1098,10 @@ function Invoke-ValidationProcess {
                 -not [String]::Equals($processIdentity.executablePath,
                     [IO.Path]::GetFullPath($Executable), [StringComparison]::OrdinalIgnoreCase)) {
             throw "Validation process path does not match the requested executable: $($processIdentity.executablePath)"
+        }
+        if ($null -ne $processIdentity -and
+            -not [string]::IsNullOrWhiteSpace([string]$processIdentity.processCreationUtc)) {
+            $processCreationUtc = [string]$processIdentity.processCreationUtc
         }
 
         $exited = $process.WaitForExit($Entry.timeoutSeconds * 1000)
@@ -993,6 +1126,28 @@ function Invoke-ValidationProcess {
         $stderr = $stderrTask.Result
         [IO.File]::WriteAllText($Entry.stdout, $stdout)
         [IO.File]::WriteAllText($Entry.stderr, $stderr)
+        $childProcess = $null
+        if (-not [string]::IsNullOrWhiteSpace($processCreationUtc)) {
+            $childProcess = [pscustomobject]@{
+                processId = [int]$process.Id
+                runNonce = $processRunNonce
+                processCreationUtc = $processCreationUtc
+                executablePath = [IO.Path]::GetFullPath($Executable)
+                commandLine = [string]$Entry.command
+                nativeReceipt = $null
+            }
+            if (-not [string]::IsNullOrWhiteSpace($EvidenceRoot) -and
+                $acceptanceBindingsRequested) {
+                $nativeRole = if ($Entry.kind -ceq 'ai') { 'ai-results' } else { 'replay-results' }
+                $childProcess.nativeReceipt = Get-NativeV2ReceiptReference `
+                    -OutputText ($stdout + "`n" + $stderr) `
+                    -OutputRoot $EvidenceRoot -WorkingDirectory $WorkingDirectory `
+                    -Role $nativeRole -SourceCommit $AcceptanceSourceCommit `
+                    -ArtifactSetSha256 $AcceptanceArtifactSetSha256 `
+                    -ExecutableSha256 $manifestData.executableSha256 `
+                    -RunNonce $processRunNonce
+            }
+        }
         $runtimeLogText = New-Object 'Collections.Generic.List[string]'
         foreach ($runtimeLog in @(Get-ChildItem -LiteralPath $WorkingDirectory -Filter '*DebugLogFile*.txt' -File |
             Where-Object { $_.LastWriteTimeUtc -ge $startedAt.AddSeconds(-2) })) {
@@ -1010,6 +1165,7 @@ function Invoke-ValidationProcess {
             stdout = $stdout
             stderr = $stderr
             runtimeLogText = $runtimeLogText.ToArray() -join "`n"
+            childProcess = $childProcess
         }
     }
     finally {
@@ -1037,6 +1193,212 @@ function Invoke-ValidationProcess {
     }
 }
 
+function Get-Stage5ReceiptRawLogBindings {
+    param(
+        [string]$OutputRoot,
+        [object[]]$Paths,
+        [string]$Context
+    )
+    $bindings = New-Object 'Collections.Generic.List[object]'
+    $seenPaths = New-Object 'Collections.Generic.HashSet[string]' `
+        ([StringComparer]::OrdinalIgnoreCase)
+    $seenNames = New-Object 'Collections.Generic.HashSet[string]' `
+        ([StringComparer]::Ordinal)
+    foreach ($pathValue in @($Paths)) {
+        if ($null -eq $pathValue -or [string]::IsNullOrWhiteSpace([string]$pathValue)) {
+            continue
+        }
+        $path = [IO.Path]::GetFullPath([string]$pathValue)
+        Assert-Condition (Test-Path -LiteralPath $path -PathType Leaf) `
+            "$Context raw log was not written: $path"
+        $item = Get-Item -LiteralPath $path -Force
+        Assert-Condition (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) `
+            "$Context raw log is a reparse point; refusing to bind it: $path"
+        $relative = ConvertTo-OutputRelativePath $path $OutputRoot "$Context raw log"
+        Assert-Condition $seenPaths.Add($relative) `
+            "$Context repeats raw log path '$relative'."
+        $name = [IO.Path]::GetFileName($relative)
+        Assert-Condition (-not [string]::IsNullOrWhiteSpace($name) -and $seenNames.Add($name)) `
+            "$Context repeats raw log name '$name'."
+        $bindings.Add([ordered]@{
+            name = $name
+            path = $relative
+            sha256 = Get-Sha256 $path
+        }) | Out-Null
+    }
+    Assert-Condition ($bindings.Count -gt 0) "$Context must retain at least one raw log."
+    return ,$bindings.ToArray()
+}
+
+function New-Stage5HostChildBinding {
+    param(
+        [object]$ChildRun,
+        [string]$Role,
+        [string]$Title,
+        [string]$ReceiptNonce,
+        [string]$OutputRoot,
+        [string]$ExecutableSha256,
+        [string]$Context
+    )
+    Assert-Condition ($null -ne $ChildRun -and $null -ne $ChildRun.childProcess) `
+        "$Context has no retained process provenance."
+    $child = $ChildRun.childProcess
+    Assert-Condition (([int]$child.processId) -gt 0 -and
+        -not [string]::IsNullOrWhiteSpace([string]$child.processCreationUtc) -and
+        -not [string]::IsNullOrWhiteSpace([string]$child.executablePath) -and
+        -not [string]::IsNullOrWhiteSpace([string]$child.commandLine)) `
+        "$Context retained process provenance is incomplete."
+    $entry = $ChildRun.entry
+    $stdoutPath = [IO.Path]::GetFullPath([string]$entry.stdout)
+    $stderrPath = [IO.Path]::GetFullPath([string]$entry.stderr)
+    Assert-Condition ((Test-Path -LiteralPath $stdoutPath -PathType Leaf) -and
+        (Test-Path -LiteralPath $stderrPath -PathType Leaf)) `
+        "$Context retained child streams are missing."
+    $binding = [ordered]@{
+        role = $Role
+        title = $Title
+        runNonce = $ReceiptNonce
+        processId = [int]$child.processId
+        processCreationUtc = [string]$child.processCreationUtc
+        executablePath = [IO.Path]::GetFullPath([string]$child.executablePath)
+        executableSha256 = $ExecutableSha256.ToUpperInvariant()
+        commandLine = [string]$child.commandLine
+        exitCode = [int]$ChildRun.run.exitCode
+        stdout = [ordered]@{
+            path = ConvertTo-OutputRelativePath $stdoutPath $OutputRoot "$Context stdout"
+            sha256 = Get-Sha256 $stdoutPath
+        }
+        stderr = [ordered]@{
+            path = ConvertTo-OutputRelativePath $stderrPath $OutputRoot "$Context stderr"
+            sha256 = Get-Sha256 $stderrPath
+        }
+    }
+    if ($null -ne $child.nativeReceipt -and
+        [string]$child.nativeReceipt.runNonce -ceq $ReceiptNonce) {
+        $nativePath = Join-Path $OutputRoot ([string]$child.nativeReceipt.path)
+        Assert-Condition (Test-Path -LiteralPath $nativePath -PathType Leaf) `
+            "$Context native v2 receipt was not retained: $nativePath"
+        $binding.nativeReceipt = [ordered]@{
+            path = ConvertTo-OutputRelativePath $nativePath $OutputRoot "$Context native receipt"
+            sha256 = Get-Sha256 $nativePath
+            producer = [string]$child.nativeReceipt.producer
+            runNonce = [string]$child.nativeReceipt.runNonce
+        }
+    }
+    return $binding
+}
+
+function Write-Stage5HostRunnerReceipt {
+    param(
+        [string]$Role,
+        [string]$OutputRoot,
+        [string]$ReceiptPath,
+        [string]$Title,
+        [string]$SourceCommit,
+        [string]$ArtifactSetSha256,
+        [string]$ExecutableSha256,
+        [object[]]$RawLogPaths,
+        [object[]]$ChildRuns,
+        [Collections.IDictionary]$Details
+    )
+    Assert-Condition ($Role -in @('validation-plan', 'validation-results',
+        'replay-results', 'ai-results', 'performance-report')) `
+        "Unsupported host-runner receipt role '$Role'."
+    Assert-Condition ($SourceCommit -cmatch '^[0-9a-f]{40}$') `
+        'AcceptanceSourceCommit must be an independently supplied lowercase 40-hex commit.'
+    Assert-Condition ($ArtifactSetSha256 -match '^[0-9A-Fa-f]{64}$') `
+        'AcceptanceArtifactSetSha256 must contain exactly 64 hexadecimal characters.'
+    Assert-Condition ($ExecutableSha256 -match '^[0-9A-Fa-f]{64}$') `
+        'Host-runner receipt executable SHA-256 is invalid.'
+    $receiptFull = [IO.Path]::GetFullPath($ReceiptPath)
+    Assert-Condition (-not (Test-Path -LiteralPath $receiptFull)) `
+        "Host-runner receipt output already exists: $receiptFull"
+    $rawLogs = Get-Stage5ReceiptRawLogBindings $OutputRoot $RawLogPaths `
+        "Host-runner '$Role' receipt"
+    $children = New-Object 'Collections.Generic.List[object]'
+    $candidate = $null
+    if ($Role -ne 'validation-plan') {
+        # The immutable receipt contract binds one observed child identity to
+        # each role receipt.  The complete execution set remains covered by
+        # the role's hashed result log; selecting a real child here avoids
+        # inventing a process identity or a synthetic native receipt.
+        $candidate = @($ChildRuns | Where-Object { $null -ne $_.childProcess }) | Select-Object -First 1
+        Assert-Condition ($null -ne $candidate) `
+            "Host-runner '$Role' receipt cannot pass without retained child process provenance."
+        $childTitle = $Title
+        Assert-Condition ($childTitle -in @('Generals', 'ZeroHour')) `
+            "Host-runner '$Role' receipt must bind a concrete title child."
+    }
+    $receiptNonce = [Guid]::NewGuid().ToString()
+    if ($null -ne $candidate -and $null -ne $candidate.childProcess.nativeReceipt -and
+        [string]$candidate.childProcess.runNonce -match
+            '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-5][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$') {
+        # A native v2 receipt is only carried when its producer-bound nonce can
+        # also identify this host child.  If multiple role receipts select the
+        # same process, the host-domain nonce remains fresh and the native
+        # reference is omitted rather than weakening the global replay check.
+        $receiptNonce = [string]$candidate.childProcess.runNonce
+    }
+    if ($null -ne $candidate) {
+        $children.Add((New-Stage5HostChildBinding $candidate $Role $childTitle `
+            $receiptNonce $OutputRoot $ExecutableSha256 `
+            "Host-runner '$Role' child")) | Out-Null
+    }
+    $document = [ordered]@{
+        schemaVersion = 1
+        evidenceKind = 'stage5-host-runner-receipt'
+        status = 'passed'
+        role = $Role
+        trustDomain = 'host-runner'
+        producer = "installed-runtime-$Role-v2"
+        producerVersion = '2'
+        runNonce = $receiptNonce
+        sourceCommit = $SourceCommit
+        title = $Title
+        architecture = 'x64'
+        artifactSetSha256 = $ArtifactSetSha256.ToUpperInvariant()
+        executableSha256 = $ExecutableSha256.ToUpperInvariant()
+        recordedUtc = [DateTime]::UtcNow.ToString('o')
+        rawLogs = $rawLogs
+        provenance = [ordered]@{
+            kind = 'host-runner-observation'
+            runner = 'Run-DeterministicSimulationValidation.ps1'
+            runnerVersion = '1'
+            childProvenance = if ($Role -eq 'validation-plan') { 'not-applicable' } else { 'bound' }
+            children = @($children.ToArray())
+        }
+        details = $Details
+    }
+    [IO.File]::WriteAllText($receiptFull, ($document | ConvertTo-Json -Depth 12))
+    return [pscustomobject]@{
+        path = $receiptFull
+        sha256 = Get-Sha256 $receiptFull
+        role = $Role
+        runNonce = $receiptNonce
+    }
+}
+
+function Get-Stage5ResultTreeSha256 {
+    param([object[]]$Results, [string]$Kind)
+    $lines = New-Object 'Collections.Generic.List[string]'
+    foreach ($result in @($Results | Where-Object { $_.kind -ceq $Kind } |
+        Sort-Object sequence)) {
+        if ($Kind -ceq 'replay') {
+            $lines.Add(('{0}|{1}|{2}|{3}|{4}|{5}' -f
+                $result.sequence, $result.determinismKey, $result.matrixRepeat,
+                $result.repeat, $result.replayResult.finalFrame,
+                $result.replayResult.finalCRC)) | Out-Null
+        }
+        else {
+            $lines.Add(('{0}|{1}|{2}|{3}|{4}|{5}' -f
+                $result.sequence, $result.scenario, $result.seed,
+                $result.configuration, $result.repeat,
+                $result.aiEvidence.finalDigest)) | Out-Null
+        }
+    }
+    return Get-Sha256Text ((($lines.ToArray()) -join "`n") + "`n")
+}
+
 Assert-Condition ($ReplayMatrixRepeats -gt 0 -and $ReplayMatrixRepeats -le 10) `
     'ReplayMatrixRepeats must be between 1 and 10.'
 Assert-Condition ($StressRepeats -gt 0 -and $StressRepeats -le 10) `
@@ -1061,6 +1423,14 @@ Assert-Condition (-not $EnforcePerformance -or (-not $DisableFrameTiming -and -n
 Assert-Condition (-not $EnforcePerformance -or
     ($ReplayMatrixRepeats * $StressRepeats) -ge 4) `
     'Performance validation requires one warm-up and at least three measured stress runs per configuration.'
+$acceptanceBindingsRequested = -not [string]::IsNullOrWhiteSpace($AcceptanceSourceCommit) -or
+    -not [string]::IsNullOrWhiteSpace($AcceptanceArtifactSetSha256)
+if ($acceptanceBindingsRequested) {
+    Assert-Condition ($AcceptanceSourceCommit -cmatch '^[0-9a-f]{40}$') `
+        'AcceptanceSourceCommit must be an independently supplied lowercase 40-hex commit.'
+    Assert-Condition ($AcceptanceArtifactSetSha256 -match '^[0-9A-Fa-f]{64}$') `
+        'AcceptanceArtifactSetSha256 must contain exactly 64 hexadecimal characters.'
+}
 if (-not $PlanOnly) {
     Assert-Condition ([bool]$AllowHeadlessDirectExecution) `
         'Installed validation requires the reviewed -AllowHeadlessDirectExecution exception.'
@@ -1181,6 +1551,15 @@ $planDocument = [pscustomobject]@{
     authoritativeWorkEvidenceRequired = $deterministicRuntimeEligible
     deterministicRuntimeEligible = $deterministicRuntimeEligible
     finalAcceptanceEligible = $false
+    acceptanceReceiptRequested = $acceptanceBindingsRequested
+    acceptanceReceiptEligible = $deterministicRuntimeEligible -and
+        $acceptanceBindingsRequested
+    acceptanceSourceCommit = if ($acceptanceBindingsRequested) {
+        $AcceptanceSourceCommit
+    } else { $null }
+    acceptanceArtifactSetSha256 = if ($acceptanceBindingsRequested) {
+        $AcceptanceArtifactSetSha256.ToUpperInvariant()
+    } else { $null }
     taskRoot = $(if ($PlanOnly) { $null } else { $taskRootFull })
     launcherContract = $launcherEquivalence
     physicalCoreCount = $physicalCoreCount
@@ -1217,6 +1596,33 @@ if ($EnforcePerformance -and $physicalCoreCount -lt 8) {
     throw 'Stage 5 performance validation is unsupported: fewer than eight physical cores were detected.'
 }
 if ($PlanOnly) {
+    if ($deterministicRuntimeEligible -and $acceptanceBindingsRequested) {
+        $planRawPath = Join-Path $outputFull 'validation-plan.raw.log'
+        $planRawText = @(
+            'STAGE5_HOST_RUNNER_PLAN_V2'
+            "sourceCommit=$AcceptanceSourceCommit"
+            "artifactSetSha256=$($AcceptanceArtifactSetSha256.ToUpperInvariant())"
+            "title=$($manifestData.title)"
+            "validationSet=$ValidationSet"
+            "entryCount=$($plan.Count)"
+            "planSha256=$(Get-Sha256 $planPath)"
+        ) -join "`n"
+        [IO.File]::WriteAllText($planRawPath, $planRawText + "`n")
+        Write-Stage5HostRunnerReceipt -Role 'validation-plan' `
+            -OutputRoot $outputFull `
+            -ReceiptPath (Join-Path $outputFull 'validation-plan-receipt.json') `
+            -Title $manifestData.title `
+            -SourceCommit $AcceptanceSourceCommit `
+            -ArtifactSetSha256 $AcceptanceArtifactSetSha256 `
+            -ExecutableSha256 $manifestData.executableSha256 `
+            -RawLogPaths @($planPath, $planRawPath) `
+            -ChildRuns @() `
+            -Details ([ordered]@{
+                gateName = 'deterministic-runtime'
+                validationSet = 'All'
+                entryCount = $plan.Count
+            }) | Out-Null
+    }
     if (-not $deterministicRuntimeEligible) {
         Write-Output "Stage 5 focused/diagnostic deterministic-runtime plan completed: $($plan.Count) synchronous installed-runtime executions."
     }
@@ -1270,6 +1676,7 @@ $validationEnvironment = @{
 
 $registrySnapshots = New-Object 'Collections.Generic.List[object]'
 $results = New-Object 'Collections.Generic.List[object]'
+$childRuns = New-Object 'Collections.Generic.List[object]'
 $resultsPath = Join-Path $outputFull 'validation-results.json'
 $fatalPattern = '(?i)(CRC Mismatch|game thread ownership violation|assertion failed|fatal error|missing map|replay read error|SKIRMISH_AI_TEST_FAIL|SIMULATION_JOB_SYSTEM_FALLBACK|SIMULATION_SHADOW_(?:MISMATCH|FAIL)|SIMULATION_COLLISION_MISMATCH)'
 try {
@@ -1351,11 +1758,44 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
     $planDocument.launcherContract = $launcherEquivalence
     [IO.File]::WriteAllText($planPath, ($planDocument | ConvertTo-Json -Depth 8))
 
+    if ($deterministicRuntimeEligible -and $acceptanceBindingsRequested) {
+        $planRawPath = Join-Path $outputFull 'validation-plan.raw.log'
+        $planRawText = @(
+            'STAGE5_HOST_RUNNER_PLAN_V2'
+            "sourceCommit=$AcceptanceSourceCommit"
+            "artifactSetSha256=$($AcceptanceArtifactSetSha256.ToUpperInvariant())"
+            "title=$($manifestData.title)"
+            "validationSet=$ValidationSet"
+            "entryCount=$($plan.Count)"
+            "planSha256=$(Get-Sha256 $planPath)"
+        ) -join "`n"
+        [IO.File]::WriteAllText($planRawPath, $planRawText + "`n")
+        Write-Stage5HostRunnerReceipt -Role 'validation-plan' `
+            -OutputRoot $outputFull `
+            -ReceiptPath (Join-Path $outputFull 'validation-plan-receipt.json') `
+            -Title $manifestData.title `
+            -SourceCommit $AcceptanceSourceCommit `
+            -ArtifactSetSha256 $AcceptanceArtifactSetSha256 `
+            -ExecutableSha256 $manifestData.executableSha256 `
+            -RawLogPaths @($planPath, $planRawPath) `
+            -ChildRuns @() `
+            -Details ([ordered]@{
+                gateName = 'deterministic-runtime'
+                validationSet = 'All'
+                entryCount = $plan.Count
+            }) | Out-Null
+    }
+
     foreach ($entry in $plan) {
         Assert-FreeSpace $outputFull $MinimumFreeBytes 'Validation evidence volume'
         Assert-FileHash $executableFull $manifestData.executableSha256 'Installed runtime executable before run' | Out-Null
         $run = Invoke-ValidationProcess $executableFull $runtimeFull $entry `
-            (-not $DisableFrameTiming) $validationEnvironment
+            (-not $DisableFrameTiming) $validationEnvironment $outputFull
+        $childRuns.Add([pscustomobject]@{
+            entry = $entry
+            run = $run
+            childProcess = $run.childProcess
+        }) | Out-Null
         $combined = $run.stdout + "`n" + $run.stderr + "`n" + $run.runtimeLogText
         Assert-Condition (-not $run.timedOut) "Validation entry $($entry.sequence) timed out."
         Assert-Condition ($run.exitCode -eq 0) "Validation entry $($entry.sequence) exited with code $($run.exitCode)."
@@ -1398,8 +1838,13 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
             determinismKey = $entry.determinismKey
             configuration = $entry.configuration
             simulationMode = $entry.simulationMode
+            requestedWorkers = $entry.requestedWorkers
+            workerPolicy = $entry.workerPolicy
             repeat = $entry.repeat
             matrixRepeat = $entry.matrixRepeat
+            replayArgument = $entry.replayArgument
+            seed = $entry.seed
+            scenario = $entry.scenario
             fixtureSha256 = $entry.fixtureSha256
             stress = $entry.stress
             exitCode = $run.exitCode
@@ -1445,6 +1890,80 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
             "Stage 5 performance validation status is '$($performanceReport.status)': $($performanceReport.failures -join ' ')"
     }
     Assert-FileHash $executableFull $manifestData.executableSha256 'Installed runtime executable after matrix' | Out-Null
+
+    if ($deterministicRuntimeEligible -and $acceptanceBindingsRequested) {
+        $resultArray = @($results.ToArray())
+        $allChildStreamPaths = @($childRuns.ToArray() | ForEach-Object {
+            $_.entry.stdout
+            $_.entry.stderr
+        })
+        $replayRuns = @($childRuns.ToArray() | Where-Object {
+            $_.entry.kind -ceq 'replay'
+        })
+        $aiRuns = @($childRuns.ToArray() | Where-Object {
+            $_.entry.kind -ceq 'ai'
+        })
+        $replayResults = @($resultArray | Where-Object { $_.kind -ceq 'replay' })
+        $aiResults = @($resultArray | Where-Object { $_.kind -ceq 'ai' })
+        Write-Stage5HostRunnerReceipt -Role 'validation-results' `
+            -OutputRoot $outputFull `
+            -ReceiptPath (Join-Path $outputFull 'validation-results-receipt.json') `
+            -Title $manifestData.title `
+            -SourceCommit $AcceptanceSourceCommit `
+            -ArtifactSetSha256 $AcceptanceArtifactSetSha256 `
+            -ExecutableSha256 $manifestData.executableSha256 `
+            -RawLogPaths (@($resultsPath) + $allChildStreamPaths) `
+            -ChildRuns $childRuns.ToArray() `
+            -Details ([ordered]@{
+                resultCount = $resultArray.Count
+                allExecutionsPassed = $true
+                resultsSha256 = Get-Sha256 $resultsPath
+            }) | Out-Null
+        Write-Stage5HostRunnerReceipt -Role 'replay-results' `
+            -OutputRoot $outputFull `
+            -ReceiptPath (Join-Path $outputFull 'replay-results-receipt.json') `
+            -Title $manifestData.title `
+            -SourceCommit $AcceptanceSourceCommit `
+            -ArtifactSetSha256 $AcceptanceArtifactSetSha256 `
+            -ExecutableSha256 $manifestData.executableSha256 `
+            -RawLogPaths (@($resultsPath) + $allChildStreamPaths) `
+            -ChildRuns $replayRuns `
+            -Details ([ordered]@{
+                uniqueReplayCount = @($replayResults.determinismKey | Sort-Object -Unique).Count
+                executionCount = $replayResults.Count
+                crcTreeSha256 = Get-Stage5ResultTreeSha256 $resultArray 'replay'
+                allExecutionsPassed = $true
+            }) | Out-Null
+        Write-Stage5HostRunnerReceipt -Role 'ai-results' `
+            -OutputRoot $outputFull `
+            -ReceiptPath (Join-Path $outputFull 'ai-results-receipt.json') `
+            -Title $manifestData.title `
+            -SourceCommit $AcceptanceSourceCommit `
+            -ArtifactSetSha256 $AcceptanceArtifactSetSha256 `
+            -ExecutableSha256 $manifestData.executableSha256 `
+            -RawLogPaths (@($resultsPath) + $allChildStreamPaths) `
+            -ChildRuns $aiRuns `
+            -Details ([ordered]@{
+                scenarioCount = @($aiResults.scenario | Sort-Object -Unique).Count
+                distinctSeedCount = @($aiResults.seed | Sort-Object -Unique).Count
+                repeatCount = $manifestData.ai.repeats
+                allGamesCompleted = $true
+                digestTreeSha256 = Get-Stage5ResultTreeSha256 $resultArray 'ai'
+            }) | Out-Null
+        if ($EnforcePerformance) {
+            $performanceReportPath = Join-Path $outputFull 'performance-report.json'
+            Write-Stage5HostRunnerReceipt -Role 'performance-report' `
+                -OutputRoot $outputFull `
+                -ReceiptPath (Join-Path $outputFull 'performance-report-receipt.json') `
+                -Title $manifestData.title `
+                -SourceCommit $AcceptanceSourceCommit `
+                -ArtifactSetSha256 $AcceptanceArtifactSetSha256 `
+                -ExecutableSha256 $manifestData.executableSha256 `
+                -RawLogPaths (@($performanceReportPath, $resultsPath) + $allChildStreamPaths) `
+                -ChildRuns $replayRuns `
+                -Details ([ordered]@{}) | Out-Null
+        }
+    }
 }
 finally {
     $cleanupErrors = New-Object 'Collections.Generic.List[string]'

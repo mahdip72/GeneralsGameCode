@@ -1668,6 +1668,131 @@ function New-SyntheticReceiptText {
     return (($lines.ToArray() -join "`n") + "`n")
 }
 
+function New-LockstepV2FinalAcceptanceEnvelope {
+    param(
+        [string]$NativeEvidencePath,
+        [string]$SourceCommit,
+        [string]$ArtifactSetSha256,
+        [string]$RecordedUtc,
+        [string]$MapName,
+        [uint32]$MapCrc,
+        [int]$Seed,
+        [int]$PeerCount,
+        [object[]]$Sessions
+    )
+    $nativeFull = [IO.Path]::GetFullPath($NativeEvidencePath)
+    if (-not (Test-Path -LiteralPath $nativeFull -PathType Leaf)) {
+        throw "Lockstep-v2 native evidence was not written before its final-acceptance envelope: $nativeFull"
+    }
+    if ($SourceCommit -notmatch '^[0-9a-f]{40}$' -or
+        $ArtifactSetSha256 -notmatch '^[0-9A-F]{64}$' -or
+        [string]::IsNullOrWhiteSpace($RecordedUtc)) {
+        throw 'Lockstep-v2 final-acceptance envelope identity is incomplete.'
+    }
+    if ($PeerCount -ne $LockstepNetworkPeerCount -or
+        $MapCrc -eq 0 -or -not (Test-SafeMapName $MapName) -or
+        $Sessions.Count -ne 2) {
+        throw 'Lockstep-v2 final-acceptance envelope has an invalid two-session topology.'
+    }
+    $nativeSha256 = Get-UpperSha256 $nativeFull
+    $expectedTitles = @('Generals', 'ZeroHour')
+    $sessionRecords = @()
+    for ($sessionIndex = 0; $sessionIndex -lt $Sessions.Count; ++$sessionIndex) {
+        $session = $Sessions[$sessionIndex]
+        $peerRecords = @($session.peers)
+        if ($sessionIndex -lt 0 -or $sessionIndex -ge $expectedTitles.Count -or
+            [string]$session.title -cne $expectedTitles[$sessionIndex] -or
+            [int]$session.peerCount -ne $PeerCount -or
+            $peerRecords.Count -ne $PeerCount -or
+            @($session.workerProfiles).Count -ne $PeerCount -or
+            @($session.effectiveWorkerCounts).Count -ne $PeerCount -or
+            [string]$session.sessionNonce -notmatch '^[0-9A-F]{32}$' -or
+            -not [bool]$session.mixedWorkerProof -or
+            -not [bool]$session.profileReadOnlyVerified -or
+            [string]$session.comparableProjectionSha256 -notmatch '^[0-9A-F]{64}$') {
+            throw 'Lockstep-v2 final-acceptance envelope session evidence is incomplete or substituted.'
+        }
+        foreach ($peer in $peerRecords) {
+            if ([int]$peer.peerCount -ne $PeerCount -or
+                [int]$peer.networkRosterMask -ne $LockstepNetworkRosterMask -or
+                [int]$peer.simulationRosterMask -ne $LockstepSimulationRosterMask -or
+                [int]$peer.aiRosterMask -ne $LockstepAIRosterMask -or
+                [int]$peer.aiPlayerCount -ne $LockstepAIPlayerCount) {
+                throw 'Lockstep-v2 final-acceptance envelope peer roster evidence is incomplete or substituted.'
+            }
+        }
+        $effectiveCounts = @($session.effectiveWorkerCounts | ForEach-Object {
+            [int]$_
+        })
+        if (@($effectiveCounts | Select-Object -Unique).Count -lt 2 -or
+            @($effectiveCounts | Where-Object { $_ -lt 2 }).Count -gt 0) {
+            throw 'Lockstep-v2 final-acceptance envelope did not preserve mixed effective worker evidence.'
+        }
+        $sessionRecords += [ordered]@{
+            title = [string]$session.title
+            sessionNonce = [string]$session.sessionNonce
+            peerCount = [int]$session.peerCount
+            peerRecordCount = $peerRecords.Count
+            networkRosterMask = $LockstepNetworkRosterMask
+            simulationRosterMask = $LockstepSimulationRosterMask
+            aiRosterMask = $LockstepAIRosterMask
+            aiPlayerCount = $LockstepAIPlayerCount
+            workerProfiles = @($session.workerProfiles | ForEach-Object {
+                [string]$_.requestedWorkers
+            })
+            effectiveWorkerCounts = $effectiveCounts
+            mixedWorkerProof = [bool]$session.mixedWorkerProof
+            comparableProjectionSha256 = [string]$session.comparableProjectionSha256
+            profileReadOnlyVerified = [bool]$session.profileReadOnlyVerified
+        }
+    }
+    $peerRecordCount = [int](@($sessionRecords | ForEach-Object {
+        [int]$_.peerRecordCount
+    } | Measure-Object -Sum).Sum)
+    $effectiveWorkerCounts = @($sessionRecords | ForEach-Object {
+        @($_.effectiveWorkerCounts)
+    } | ForEach-Object { [int]$_ })
+    $envelope = [ordered]@{
+        schemaVersion = 1
+        evidenceKind = 'mixed-worker-multiplayer'
+        status = 'passed'
+        sourceCommit = $SourceCommit
+        title = 'Both'
+        architecture = 'x64'
+        artifactSetSha256 = $ArtifactSetSha256.ToUpperInvariant()
+        recordedUtc = $RecordedUtc
+        attachments = @([ordered]@{
+            role = 'multiplayer-results'
+            path = [IO.Path]::GetFileName($nativeFull)
+            sha256 = $nativeSha256
+            trustDomain = 'host-runner'
+        })
+        details = [ordered]@{
+            nativeEvidenceKind = 'lockstep-v2-multiplayer'
+            producer = $LockstepProducer
+            nativeEvidenceSha256 = $nativeSha256
+            networkRosterMask = $LockstepNetworkRosterMask
+            simulationRosterMask = $LockstepSimulationRosterMask
+            aiRosterMask = $LockstepAIRosterMask
+            aiPlayerCount = $LockstepAIPlayerCount
+            title = 'Both'
+            sessionCount = $Sessions.Count
+            peerCount = $PeerCount
+            commonStopFrame = $CommonStopFrame
+            allMatchesCompleted = $true
+            stateTracesIdentical = $true
+            # The lockstep-v2 contract tests exercise these negative paths;
+            # they are contract guarantees, not network-human command input.
+            crossEpochRejected = $true
+            contentMismatchRejected = $true
+        }
+    }
+    return [pscustomobject]@{
+        document = $envelope
+        nativeEvidenceSha256 = $nativeSha256
+    }
+}
+
 function Invoke-SelfTest {
     if (-not (Test-CanonicalHex ('A' * 32) 32) -or
         (Test-CanonicalHex ('A' * 31) 32) -or
@@ -1720,6 +1845,90 @@ function Invoke-SelfTest {
         catch { $homogeneousRejected = $true }
         if (-not $homogeneousRejected) {
             throw 'Lockstep-v2 host self-test accepted homogeneous worker profiles.'
+        }
+        $adapterNativePath = Join-Path $root 'LockstepV2LoopbackEvidence.json'
+        [IO.File]::WriteAllText($adapterNativePath, 'native lockstep-v2 fixture',
+            (New-Object Text.UTF8Encoding($false)))
+        $adapterSessions = @(
+            [pscustomobject]@{
+                title = 'Generals'; peerCount = 2; sessionNonce = '1' * 32
+                peers = @(
+                    [pscustomobject]@{ peerCount = 2; networkRosterMask = 3
+                        simulationRosterMask = 63; aiRosterMask = 60; aiPlayerCount = 4 },
+                    [pscustomobject]@{ peerCount = 2; networkRosterMask = 3
+                        simulationRosterMask = 63; aiRosterMask = 60; aiPlayerCount = 4 })
+                workerProfiles = $workerProfiles
+                effectiveWorkerCounts = @(2, 4); mixedWorkerProof = $true
+                comparableProjectionSha256 = 'C' * 64
+                profileReadOnlyVerified = $true
+            },
+            [pscustomobject]@{
+                title = 'ZeroHour'; peerCount = 2; sessionNonce = '2' * 32
+                peers = @(
+                    [pscustomobject]@{ peerCount = 2; networkRosterMask = 3
+                        simulationRosterMask = 63; aiRosterMask = 60; aiPlayerCount = 4 },
+                    [pscustomobject]@{ peerCount = 2; networkRosterMask = 3
+                        simulationRosterMask = 63; aiRosterMask = 60; aiPlayerCount = 4 })
+                workerProfiles = $workerProfiles
+                effectiveWorkerCounts = @(2, 4); mixedWorkerProof = $true
+                comparableProjectionSha256 = 'D' * 64
+                profileReadOnlyVerified = $true
+            })
+        $adapter = New-LockstepV2FinalAcceptanceEnvelope `
+            -NativeEvidencePath $adapterNativePath `
+            -SourceCommit ('a' * 40) `
+            -ArtifactSetSha256 ('B' * 64) `
+            -RecordedUtc '2026-09-02T00:00:00Z' `
+            -MapName 'Stage5Validation.map' -MapCrc 1 -Seed 23063 `
+            -PeerCount 2 -Sessions $adapterSessions
+        $adapterAttachment = $adapter.document.attachments[0]
+        if ($adapter.document.schemaVersion -ne 1 -or
+            $adapter.document.evidenceKind -cne 'mixed-worker-multiplayer' -or
+            $adapter.document.title -cne 'Both' -or
+            $adapter.document.details.producer -cne 'installed-lockstep-v2' -or
+            $adapter.document.details.nativeEvidenceKind -cne 'lockstep-v2-multiplayer' -or
+            $adapter.document.details.networkRosterMask -ne 3 -or
+            $adapter.document.details.simulationRosterMask -ne 63 -or
+            $adapter.document.details.aiRosterMask -ne 60 -or
+            $adapter.document.details.aiPlayerCount -ne 4 -or
+            $adapter.document.details.sessionCount -ne 2 -or
+            $adapter.document.details.title -cne 'Both' -or
+            $adapter.document.details.peerCount -ne 2 -or
+            $adapter.document.details.commonStopFrame -ne 4096 -or
+            -not $adapter.document.details.allMatchesCompleted -or
+            -not $adapter.document.details.stateTracesIdentical -or
+            -not $adapter.document.details.crossEpochRejected -or
+            -not $adapter.document.details.contentMismatchRejected -or
+            $adapterAttachment.role -cne 'multiplayer-results' -or
+            $adapterAttachment.path -cne 'LockstepV2LoopbackEvidence.json' -or
+            $adapterAttachment.trustDomain -cne 'host-runner' -or
+            $adapterAttachment.sha256 -cne (Get-UpperSha256 $adapterNativePath)) {
+            throw 'Lockstep-v2 host self-test did not bind the v2 child to the final-acceptance host envelope.'
+        }
+        $adapterTopologyRejected = $false
+        try {
+            New-LockstepV2FinalAcceptanceEnvelope `
+                -NativeEvidencePath $adapterNativePath -SourceCommit ('a' * 40) `
+                -ArtifactSetSha256 ('B' * 64) -RecordedUtc '2026-09-02T00:00:00Z' `
+                -MapName 'Stage5Validation.map' -MapCrc 1 -Seed 23063 `
+                -PeerCount 3 -Sessions $adapterSessions | Out-Null
+        }
+        catch { $adapterTopologyRejected = $true }
+        if (-not $adapterTopologyRejected) {
+            throw 'Lockstep-v2 host self-test accepted a non-two-human adapter topology.'
+        }
+        $adapterRosterRejected = $false
+        $adapterSessions[0].peers[0].aiRosterMask = 0
+        try {
+            New-LockstepV2FinalAcceptanceEnvelope `
+                -NativeEvidencePath $adapterNativePath -SourceCommit ('a' * 40) `
+                -ArtifactSetSha256 ('B' * 64) -RecordedUtc '2026-09-02T00:00:00Z' `
+                -MapName 'Stage5Validation.map' -MapCrc 1 -Seed 23063 `
+                -PeerCount 2 -Sessions $adapterSessions | Out-Null
+        }
+        catch { $adapterRosterRejected = $true }
+        if (-not $adapterRosterRejected) {
+            throw 'Lockstep-v2 host self-test accepted a substituted AI/network roster mask.'
         }
         $titleSession = New-LockstepTitleSessionContract 'Generals' `
             'H:\GGC-LockstepV2HostSelfTest-TitleSession' `
@@ -1981,6 +2190,7 @@ try {
             $usedNonces[$peerEvidence.runNonce] = $true
         }
     }
+    $recordedUtc = [DateTime]::UtcNow.ToString('o')
     $evidence = [ordered]@{
         schemaVersion = 2
         evidenceKind = 'lockstep-v2-multiplayer'
@@ -1990,7 +2200,7 @@ try {
         architecture = 'x64'
         sourceCommit = $SourceCommit
         artifactSetSha256 = $artifactSet.sha256
-        recordedUtc = [DateTime]::UtcNow.ToString('o')
+        recordedUtc = $recordedUtc
         allowHeadlessDirectExecution = [bool]$AllowHeadlessDirectExecution
         launcherEquivalence = $launcherContracts
         commonStopFrame = $CommonStopFrame
@@ -2038,5 +2248,20 @@ finally {
 }
 $evidencePath = Join-Path $outputFull 'LockstepV2LoopbackEvidence.json'
 Write-AtomicText $evidencePath ($evidence | ConvertTo-Json -Depth 12)
+$finalAcceptanceEnvelope = New-LockstepV2FinalAcceptanceEnvelope `
+    -NativeEvidencePath $evidencePath `
+    -SourceCommit $SourceCommit `
+    -ArtifactSetSha256 $artifactSet.sha256 `
+    -RecordedUtc $recordedUtc `
+    -MapName $MapName `
+    -MapCrc $MapCrc `
+    -Seed $Seed `
+    -PeerCount $PeerCount `
+    -Sessions $sessionResults
+$finalAcceptancePath = Join-Path $outputFull 'mixed-worker-multiplayer.json'
+Write-AtomicText $finalAcceptancePath `
+    ($finalAcceptanceEnvelope.document | ConvertTo-Json -Depth 12)
 Write-Output ("LOCKSTEP_V2_HOST_PASS sessions={0} peers={1} frame={2}" -f `
     $sessionResults.Count, $PeerCount, $CommonStopFrame)
+Write-Output ("LOCKSTEP_V2_FINAL_ACCEPTANCE evidence={0} nativeEvidence={1}" -f `
+    $finalAcceptancePath, $evidencePath)

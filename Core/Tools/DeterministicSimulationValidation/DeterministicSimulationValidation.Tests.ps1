@@ -131,9 +131,10 @@ function Write-ImmutableReceiptTestDocument {
     [IO.File]::WriteAllText($rawPath, 'unregistered executable receipt test log')
     Write-JsonDocument $Path ([ordered]@{
         schemaVersion = 1
-        evidenceKind = 'stage5-executable-originated-receipt'
+        evidenceKind = 'stage5-host-runner-receipt'
         status = 'passed'
         role = 'validation-plan'
+        trustDomain = 'host-runner'
         producer = 'installed-runtime-validation-plan-v2'
         producerVersion = '2'
         runNonce = $RunNonce
@@ -146,9 +147,308 @@ function Write-ImmutableReceiptTestDocument {
         rawLogs = @([ordered]@{
             name = 'stdout'; path = $rawLeaf; sha256 = Get-Sha256 $rawPath
         })
+        provenance = [ordered]@{
+            kind = 'host-runner-observation'
+            runner = 'Run-DeterministicSimulationValidation.ps1'
+            runnerVersion = '1'
+            childProvenance = 'not-applicable'
+            children = @()
+        }
         details = [ordered]@{
             gateName = 'deterministic-runtime'; validationSet = 'All'; entryCount = 1
         }
+    })
+}
+
+function Get-Stage5AcceptanceReceiptTestDetails {
+    param([string]$Role)
+    switch ($Role) {
+        'validation-plan' {
+            return [ordered]@{
+                gateName = 'deterministic-runtime'; validationSet = 'All'; entryCount = 1
+            }
+        }
+        'validation-results' {
+            return [ordered]@{
+                resultCount = 1; allExecutionsPassed = $true; resultsSha256 = 'A' * 64
+            }
+        }
+        'replay-results' {
+            return [ordered]@{
+                uniqueReplayCount = 10; executionCount = 10; crcTreeSha256 = 'B' * 64
+                allExecutionsPassed = $true
+            }
+        }
+        'ai-results' {
+            return [ordered]@{
+                scenarioCount = 2; distinctSeedCount = 3; repeatCount = 2
+                allGamesCompleted = $true; digestTreeSha256 = 'C' * 64
+            }
+        }
+        'combined-results' {
+            return [ordered]@{
+                pipelineMode = 'parallel'; simulationMode = 'parallel'
+                workerPolicy = 'auto'; renderer = 'd3d11'; renderThread = 'dedicated'
+                bothTitlesPassed = $true
+            }
+        }
+        'performance-report' { return [ordered]@{} }
+        default { throw "No host receipt test details exist for role '$Role'." }
+    }
+}
+
+function Write-Stage5HostReceiptTestDocument {
+    param(
+        [string]$Path, [string]$Role, [string]$Title, [string]$SourceCommit,
+        [string]$ArtifactSetSha256, [Collections.IDictionary]$ArtifactHashes
+    )
+    $directory = Split-Path -Parent ([IO.Path]::GetFullPath($Path))
+    $leaf = [IO.Path]::GetFileNameWithoutExtension($Path)
+    $stdoutLeaf = "$leaf.stdout.log"
+    $stderrLeaf = "$leaf.stderr.log"
+    $stdoutPath = Join-Path $directory $stdoutLeaf
+    $stderrPath = Join-Path $directory $stderrLeaf
+    [IO.File]::WriteAllText($stdoutPath, "host runner stdout for $Role")
+    [IO.File]::WriteAllText($stderrPath, "host runner stderr for $Role")
+    $runNonce = [Guid]::NewGuid().ToString()
+    $children = @()
+    if ($Role -ne 'validation-plan') {
+        $childTitles = if ($Title -ceq 'Both') { @('Generals', 'ZeroHour') } else { @($Title) }
+        $processId = 32000
+        foreach ($childTitle in $childTitles) {
+            $executableHash = if ($childTitle -ceq 'Generals') {
+                [string]$ArtifactHashes['generals-executable']
+            }
+            else { [string]$ArtifactHashes['zerohour-executable'] }
+            $children += [ordered]@{
+                role = $Role; title = $childTitle; runNonce = $runNonce
+                processId = $processId; processCreationUtc = '2026-09-01T00:00:00Z'
+                executablePath = "installed\\$childTitle.exe"
+                executableSha256 = $executableHash
+                commandLine = "$childTitle.exe -headless -stage5-validation"
+                exitCode = 0
+                stdout = [ordered]@{ path = $stdoutLeaf; sha256 = Get-Sha256 $stdoutPath }
+                stderr = [ordered]@{ path = $stderrLeaf; sha256 = Get-Sha256 $stderrPath }
+            }
+            ++$processId
+        }
+    }
+    Write-JsonDocument $Path ([ordered]@{
+        schemaVersion = 1; evidenceKind = 'stage5-host-runner-receipt'; status = 'passed'
+        role = $Role; trustDomain = 'host-runner'
+        producer = "installed-runtime-$($Role)-v2"; producerVersion = '2'
+        runNonce = $runNonce; sourceCommit = $SourceCommit; title = $Title
+        architecture = 'x64'; artifactSetSha256 = $ArtifactSetSha256
+        executableSha256 = if ($Title -ceq 'Both') {
+            [ordered]@{
+                Generals = [string]$ArtifactHashes['generals-executable']
+                ZeroHour = [string]$ArtifactHashes['zerohour-executable']
+            }
+        }
+        elseif ($Title -ceq 'Generals') { [string]$ArtifactHashes['generals-executable'] }
+        else { [string]$ArtifactHashes['zerohour-executable'] }
+        recordedUtc = '2026-09-01T00:00:00Z'
+        rawLogs = @(
+            [ordered]@{ name = 'stdout'; path = $stdoutLeaf; sha256 = Get-Sha256 $stdoutPath }
+            [ordered]@{ name = 'stderr'; path = $stderrLeaf; sha256 = Get-Sha256 $stderrPath }
+        )
+        provenance = [ordered]@{
+            kind = 'host-runner-observation'
+            runner = 'Run-DeterministicSimulationValidation.ps1'
+            runnerVersion = '1'
+            childProvenance = if ($Role -eq 'validation-plan') { 'not-applicable' } else { 'bound' }
+            children = $children
+        }
+        details = Get-Stage5AcceptanceReceiptTestDetails $Role
+    })
+}
+
+function Write-Stage5ExecutableReceiptTestDocument {
+    param(
+        [string]$Path, [string]$Role, [string]$Title, [string]$SourceCommit,
+        [string]$ArtifactSetSha256, [Collections.IDictionary]$ArtifactHashes
+    )
+    $directory = Split-Path -Parent ([IO.Path]::GetFullPath($Path))
+    $leaf = [IO.Path]::GetFileNameWithoutExtension($Path)
+    $stdoutLeaf = "$leaf.native.stdout.log"
+    $stderrLeaf = "$leaf.native.stderr.log"
+    $stdoutPath = Join-Path $directory $stdoutLeaf
+    $stderrPath = Join-Path $directory $stderrLeaf
+    [IO.File]::WriteAllText($stdoutPath, "native executable stdout for $Role")
+    [IO.File]::WriteAllText($stderrPath, "native executable stderr for $Role")
+    $runNonce = [Guid]::NewGuid().ToString()
+    $executableHash = if ($Title -ceq 'Generals') {
+        [string]$ArtifactHashes['generals-executable']
+    }
+    else { [string]$ArtifactHashes['zerohour-executable'] }
+    $nativeLeaf = "$leaf.native.json"
+    $nativePath = Join-Path $directory $nativeLeaf
+    Write-JsonDocument $nativePath ([ordered]@{
+        schemaVersion = 1
+        evidenceKind = 'stage5-executable-originated-receipt'
+        status = 'passed'
+        producer = "game-executable-stage5-$Role-v2"
+        producerVersion = '2'
+        runNonce = $runNonce
+        sourceCommit = $SourceCommit
+        artifactSetSha256 = $ArtifactSetSha256
+        executableSha256 = $executableHash
+    })
+    $nativeHash = Get-Sha256 $nativePath
+    Write-JsonDocument $Path ([ordered]@{
+        schemaVersion = 1
+        evidenceKind = 'stage5-executable-originated-receipt'
+        status = 'passed'
+        role = $Role
+        trustDomain = 'executable'
+        producer = "game-executable-stage5-$Role-v2"
+        producerVersion = '2'
+        runNonce = $runNonce
+        sourceCommit = $SourceCommit
+        title = $Title
+        architecture = 'x64'
+        artifactSetSha256 = $ArtifactSetSha256
+        executableSha256 = $executableHash
+        recordedUtc = '2026-09-01T00:00:00Z'
+        rawLogs = @(
+            [ordered]@{ name = 'stdout'; path = $stdoutLeaf; sha256 = Get-Sha256 $stdoutPath }
+            [ordered]@{ name = 'stderr'; path = $stderrLeaf; sha256 = Get-Sha256 $stderrPath }
+        )
+        provenance = [ordered]@{
+            kind = 'native-executable-observation'
+            receiptPath = $nativeLeaf; receiptSha256 = $nativeHash
+            processId = 33000; processCreationUtc = '2026-09-01T00:00:00Z'
+            executablePath = "installed\$Title.exe"
+            executableSha256 = $executableHash
+            commandLine = "$Title.exe -headless -stage5-validation"
+            exitCode = 0
+        }
+        details = Get-Stage5AcceptanceReceiptTestDetails $Role
+    })
+}
+
+function Write-Stage5ProtectedAttestationTestDocument {
+    param(
+        [string]$Path, [string]$Kind, [string]$Role, [string]$TrustDomain,
+        [string]$SourceCommit, [string]$ArtifactSetSha256, [string]$Title
+    )
+    $attestationLeaf = [IO.Path]::GetFileNameWithoutExtension($Path) + '.attestation.json'
+    $attestationPath = Join-Path (Split-Path -Parent ([IO.Path]::GetFullPath($Path))) $attestationLeaf
+    $protectionKind = switch ($TrustDomain) {
+        'reviewed-fixture' { 'external-reviewed-fixture-attestation' }
+        'premium-review' { 'external-premium-review-attestation' }
+        default { 'external-user-manual-approval-attestation' }
+    }
+    $subjectKey = '{0}|{1}|{2}|{3}|{4}' -f $SourceCommit,
+        $ArtifactSetSha256.ToUpperInvariant(), $Kind, $Role, $Title
+    Write-JsonDocument $attestationPath ([ordered]@{
+        schemaVersion = 1; evidenceKind = 'stage5-external-attestation'
+        trustDomain = $TrustDomain; role = $Role; sourceCommit = $SourceCommit
+        artifactSetSha256 = $ArtifactSetSha256; subjectKey = $subjectKey
+        authority = if ($TrustDomain -ceq 'manual-approval') {
+            'user-approval-authority'
+        }
+        elseif ($TrustDomain -ceq 'premium-review') {
+            'premium-review-authority'
+        }
+        else { 'fixture-review-authority' }
+        issuedUtc = '2026-09-01T00:00:00Z'
+    })
+    return [ordered]@{
+        kind = $protectionKind; path = $attestationLeaf
+        sha256 = Get-Sha256 $attestationPath
+    }
+}
+
+function Write-Stage5ReviewedFixtureReceiptTestDocument {
+    param(
+        [string]$Path, [string]$SourceCommit, [string]$ArtifactSetSha256,
+        [Collections.IDictionary]$ArtifactHashes
+    )
+    $directory = Split-Path -Parent ([IO.Path]::GetFullPath($Path))
+    $fixtureDirectory = Join-Path $directory 'reviewed-fixtures'
+    New-Item -ItemType Directory -Path $fixtureDirectory -Force | Out-Null
+    $fixtureEntries = @()
+    for ($index = 0; $index -lt 10; ++$index) {
+        $fixtureLeaf = "fixture-$index.rep"
+        $fixturePath = Join-Path $fixtureDirectory $fixtureLeaf
+        [IO.File]::WriteAllText($fixturePath, "reviewed fixture $index")
+        $fixtureEntries += [ordered]@{
+            id = "fixture-$index"; source = "reviewed-fixtures\\$fixtureLeaf"
+            sha256 = Get-Sha256 $fixturePath; stress = ($index -eq 0)
+        }
+    }
+    $manifestLeaf = 'reviewed-fixture-manifest.json'
+    $manifestPath = Join-Path $directory $manifestLeaf
+    Write-JsonDocument $manifestPath ([ordered]@{
+        schemaVersion = 1; title = 'ZeroHour'; executable = 'generalszh.exe'
+        executableSha256 = [string]$ArtifactHashes['zerohour-executable']
+        fixtures = $fixtureEntries
+        ai = [ordered]@{ seeds = @(1729, 1730, 1731); scenarios = @('4v3', '4v2'); repeats = 2 }
+    })
+    $manifestHash = Get-Sha256 $manifestPath
+    $protection = Write-Stage5ProtectedAttestationTestDocument $Path 'replay-determinism' `
+        'replay-fixture-manifest' 'reviewed-fixture' $SourceCommit $ArtifactSetSha256 'ZeroHour'
+    Write-JsonDocument $Path ([ordered]@{
+        schemaVersion = 1; evidenceKind = 'stage5-reviewed-fixture-receipt'; status = 'passed'
+        role = 'replay-fixture-manifest'; trustDomain = 'reviewed-fixture'
+        producer = 'reviewed-replay-fixture-manifest-v2'; producerVersion = '2'
+        sourceCommit = $SourceCommit; title = 'ZeroHour'; architecture = 'x64'
+        artifactSetSha256 = $ArtifactSetSha256; recordedUtc = '2026-09-01T00:00:00Z'
+        provenance = [ordered]@{
+            kind = 'reviewed-fixture'; reviewedBy = 'fixture-reviewer'
+            reviewedUtc = '2026-09-01T00:00:00Z'
+            fixtureManifest = [ordered]@{ path = $manifestLeaf; sha256 = $manifestHash }
+        }
+        protection = $protection
+        details = [ordered]@{
+            fixtureCount = 10; stressFixtureCount = 1; fixtureSetSha256 = $manifestHash
+        }
+    })
+}
+
+function Write-Stage5ExternalReceiptTestDocument {
+    param(
+        [string]$Path, [string]$Kind, [string]$Role, [string]$TrustDomain,
+        [string]$SourceCommit, [string]$ArtifactSetSha256
+    )
+    $title = 'Both'
+    $details = if ($Role -eq 'premium-review-results') {
+        [ordered]@{
+            reviewedCommit = $SourceCommit; reviewRounds = 2; independentReviewers = 9
+            openP0 = 0; openP1 = 0; openP2 = 0
+        }
+    }
+    else {
+        [ordered]@{
+            approvalScope = 'final-stage5-installed-runtime'
+            candidateHashVerified = $true; bothTitlesTested = $true; cleanExitPassed = $true
+        }
+    }
+    $protection = Write-Stage5ProtectedAttestationTestDocument $Path $Kind $Role `
+        $TrustDomain $SourceCommit $ArtifactSetSha256 $title
+    Write-JsonDocument $Path ([ordered]@{
+        schemaVersion = 1
+        evidenceKind = if ($TrustDomain -ceq 'premium-review') {
+            'stage5-premium-review-receipt'
+        }
+        else { 'stage5-manual-approval-receipt' }
+        status = 'passed'; role = $Role; trustDomain = $TrustDomain
+        producer = if ($TrustDomain -ceq 'premium-review') {
+            'stage5-premium-review-receipt-v2'
+        }
+        else { 'installed-runtime-manual-acceptance-v2' }
+        producerVersion = '2'; sourceCommit = $SourceCommit; title = $title
+        architecture = 'x64'; artifactSetSha256 = $ArtifactSetSha256
+        recordedUtc = '2026-09-01T00:00:00Z'
+        provenance = [ordered]@{
+            kind = $TrustDomain; reviewedBy = if ($TrustDomain -ceq 'manual-approval') {
+                'Mahdi'
+            }
+            else { 'premium-reviewer' }
+            reviewedUtc = '2026-09-01T00:00:00Z'
+        }
+        protection = $protection; details = $details
     })
 }
 
@@ -492,6 +792,8 @@ function New-LockstepFixtureEvidence {
                 schemaVersion = 2; producer = 'installed-lockstep-v2'
                 validationMode = 'installed-lockstep-v2-production'; title = $title
                 processId = $processId; peer = $peerIndex; peerCount = 2
+                networkRosterMask = 3; simulationRosterMask = 63
+                aiRosterMask = 60; aiPlayerCount = 4
                 port = $ports[$peerIndex]; runNonce = $runNonce; sessionNonce = $sessionNonce
                 executableSha256 = $ArtifactHashes[$executableRole].ToUpperInvariant()
                 sourceCommit = $SourceCommit; launcherEquivalence = $contract
@@ -522,7 +824,9 @@ function New-LockstepFixtureEvidence {
             $peers += ,$peer
         }
         $session = [ordered]@{
-            title = $title; peerCount = 2; ports = $ports; sessionNonce = $sessionNonce
+            title = $title; peerCount = 2; networkRosterMask = 3
+            simulationRosterMask = 63; aiRosterMask = 60; aiPlayerCount = 4
+            ports = $ports; sessionNonce = $sessionNonce
             launcherEquivalence = $contract; titleSessionProfile = $profile
             registryEquivalence = $registryEquivalence; workerProfiles = $workerProfiles
             effectiveWorkerCounts = $effectiveWorkerCounts; mixedWorkerProof = $true
@@ -537,7 +841,9 @@ function New-LockstepFixtureEvidence {
         architecture = 'x64'; sourceCommit = $SourceCommit
         artifactSetSha256 = $ArtifactSetSha256; recordedUtc = '2026-09-01T00:00:00Z'
         allowHeadlessDirectExecution = $true; launcherEquivalence = $launcherContracts
-        commonStopFrame = 4096; peerCount = 2; mapName = 'Stage5Validation.map'
+        commonStopFrame = 4096; peerCount = 2; networkRosterMask = 3
+        simulationRosterMask = 63; aiRosterMask = 60; aiPlayerCount = 4
+        mapName = 'Stage5Validation.map'
         mapCrc = 1; seed = 23063; v1Accepted = $false
         profileStrategy = 'known-folder-registry-redirect'
         registryViews = @('Registry32', 'Registry64')
@@ -3628,12 +3934,13 @@ try {
             eightToSixteenSpeedup = 1.1
         }
         'mixed-worker-multiplayer' = [ordered]@{
-            workerCounts = @('1', '2', '4', '8', 'auto')
-            matchRecords = 16; peerRecords = 40; fixedSeeds = @(23063, 49374)
-            topologies = @('two-peer-1-v-16', 'two-peer-2-v-auto',
-                'two-peer-4-v-8', 'four-peer-mixed-workers')
-            provenKernelMask = 63
-            allMatchesCompleted = $true; stateTracesIdentical = $true
+            nativeEvidenceKind = 'lockstep-v2-multiplayer'
+            producer = 'installed-lockstep-v2'
+            nativeEvidenceSha256 = 'A' * 64
+            networkRosterMask = 3; simulationRosterMask = 63; aiRosterMask = 60
+            aiPlayerCount = 4; title = 'Both'; sessionCount = 2; peerCount = 2
+            commonStopFrame = 4096; allMatchesCompleted = $true
+            stateTracesIdentical = $true
             crossEpochRejected = $true; contentMismatchRejected = $true
         }
         'combined-stage4-stage5-installed-runtime' = [ordered]@{
@@ -3667,11 +3974,38 @@ try {
                 Write-Net3LoopbackTestManifest $attachmentPath $sourceCommit $artifactSetHash `
                     $artifactTestHashes['generals-executable'] `
                     $artifactTestHashes['zerohour-executable']
+                # Keep the v2 details fixture structurally complete even though
+                # this attachment is intentionally diagnostic NET3 v1 and is
+                # rejected before final acceptance can consume the binding.
+                $detailsByKind[$kind].nativeEvidenceSha256 = Get-Sha256 $attachmentPath
             }
             elseif ($kind -ceq 'performance-scaling' -and $role -ceq 'performance-report') {
                 Write-PerformanceScalingTestManifest $attachmentPath $sourceCommit $artifactSetHash `
                     $artifactTestHashes['zerohour-executable'] `
                     (Get-Sha256 (Join-Path $attachmentRoot "$kind-stage3-baseline.json"))
+            }
+            elseif ($role -eq 'replay-fixture-manifest') {
+                Write-Stage5ReviewedFixtureReceiptTestDocument $attachmentPath $sourceCommit `
+                    $artifactSetHash $artifactTestHashes
+            }
+            elseif ($role -eq 'premium-review-results') {
+                Write-Stage5ExternalReceiptTestDocument $attachmentPath 'premium-review' `
+                    $role 'premium-review' $sourceCommit $artifactSetHash
+            }
+            elseif ($role -eq 'manual-checklist') {
+                Write-Stage5ExternalReceiptTestDocument $attachmentPath 'manual-acceptance' `
+                    $role 'manual-approval' $sourceCommit $artifactSetHash
+            }
+            elseif ($role -in @('validation-plan', 'validation-results',
+                'replay-results', 'ai-results', 'combined-results',
+                'performance-report')) {
+                $receiptTitle = if ($kind -eq 'combined-stage4-stage5-installed-runtime') {
+                    'Both'
+                }
+                else { 'ZeroHour' }
+                Write-Stage5HostReceiptTestDocument $attachmentPath $role `
+                    $receiptTitle `
+                    $sourceCommit $artifactSetHash $artifactTestHashes
             }
             else {
                 [IO.File]::WriteAllText($attachmentPath, "{`"evidence`":`"$kind/$role`"}")
@@ -3680,6 +4014,13 @@ try {
                 role = $role
                 path = "attachments\$leaf"
                 sha256 = Get-Sha256 $attachmentPath
+                trustDomain = switch ($role) {
+                    'replay-fixture-manifest' { 'reviewed-fixture' }
+                    'premium-review-results' { 'premium-review' }
+                    'manual-checklist' { 'manual-approval' }
+                    'stage3-baseline' { 'reviewed-fixture' }
+                    default { 'host-runner' }
+                }
             }
         }
         $title = if ($kind -in @('combined-stage4-stage5-installed-runtime',
@@ -3701,9 +4042,11 @@ try {
     foreach ($role in $requiredAttachmentRoles[$deterministicKind]) {
         $leaf = "$deterministicKind-$role.json"
         $attachmentPath = Join-Path $attachmentRoot $leaf
-        [IO.File]::WriteAllText($attachmentPath, "{`"evidence`":`"$deterministicKind/$role`"}")
+        Write-Stage5HostReceiptTestDocument $attachmentPath $role 'ZeroHour' `
+            $sourceCommit $artifactSetHash $artifactTestHashes
         $deterministicAttachments += [ordered]@{
             role = $role; path = "attachments\$leaf"; sha256 = Get-Sha256 $attachmentPath
+            trustDomain = 'host-runner'
         }
     }
     $deterministicDocument = [ordered]@{
@@ -3731,6 +4074,7 @@ try {
     $acceptanceKinds = @('deterministic-runtime', 'replay-determinism', 'fresh-ai',
         'performance-scaling', 'mixed-worker-multiplayer',
         'combined-stage4-stage5-installed-runtime', 'premium-review', 'manual-acceptance')
+    $acceptanceRelativePaths = @{}
     function Write-AcceptanceRequest {
         param([string]$Path, [string[]]$Kinds)
         Write-JsonDocument $Path ([ordered]@{
@@ -3741,7 +4085,12 @@ try {
             }
             evidence = @($Kinds | ForEach-Object {
                 [ordered]@{
-                    kind = $_; path = "$_.json"; sha256 = Get-Sha256 $evidencePaths[$_]
+                    kind = $_
+                    path = if ($acceptanceRelativePaths.ContainsKey($_)) {
+                        $acceptanceRelativePaths[$_]
+                    }
+                    else { "$_.json" }
+                    sha256 = Get-Sha256 $evidencePaths[$_]
                 }
             })
         })
@@ -3754,8 +4103,8 @@ try {
         'a fully valid diagnostic NET3 v1 envelope cannot satisfy final acceptance'
 
     # The installed v2 host is the only final-acceptance producer. Exercise its
-    # canonical boundary and fail-closed identity checks without fabricating a
-    # passing v2 session or performance result.
+    # canonical child boundary and fail-closed identity checks before adapting
+    # a complete fixture into the compatibility role below.
     $lockstepRunnerPath = Join-Path $PSScriptRoot 'Invoke-InstalledLockstepV2Validation.ps1'
     $lockstepRunnerSource = Get-Content -LiteralPath $lockstepRunnerPath -Raw
     Assert-True ($lockstepRunnerSource -match '\$LockstepProducer\s*=\s*''installed-lockstep-v2''' -and
@@ -3770,7 +4119,9 @@ try {
         artifactSetSha256 = $artifactSetHash; recordedUtc = '2026-09-01T00:00:00Z'
         allowHeadlessDirectExecution = $true
         launcherEquivalence = [ordered]@{ Generals = [ordered]@{}; ZeroHour = [ordered]@{} }
-        commonStopFrame = 4096; peerCount = 2; mapName = 'Stage5Validation.map'
+        commonStopFrame = 4096; peerCount = 2; networkRosterMask = 3
+        simulationRosterMask = 63; aiRosterMask = 60; aiPlayerCount = 4
+        mapName = 'Stage5Validation.map'
         mapCrc = 1; seed = 23063; v1Accepted = $false
         profileStrategy = 'known-folder-registry-redirect'
         registryViews = @('Registry32', 'Registry64')
@@ -3834,6 +4185,66 @@ try {
     catch {
         Assert-True $false "a complete lockstep-v2 fixture should be accepted: $($_.Exception.Message)"
     }
+
+    # Adapt the installed lockstep-v2 child into the compatibility role consumed
+    # by final acceptance.  The outer envelope is host-runner evidence; the
+    # native child remains the only multiplayer qualification authority.
+    $lockstepAdapterRoot = Join-Path $acceptanceRoot 'lockstep-v2-adapter'
+    $lockstepAdapterPath = Copy-LockstepFixtureCase $lockstepFixtureRoot $lockstepAdapterRoot
+    $lockstepAdapterHash = Get-Sha256 $lockstepAdapterPath
+    $lockstepAdapterDocument = [ordered]@{
+        schemaVersion = 1; evidenceKind = 'mixed-worker-multiplayer'; status = 'passed'
+        sourceCommit = $sourceCommit; title = 'Both'; architecture = 'x64'
+        artifactSetSha256 = $artifactSetHash; recordedUtc = '2026-09-02T00:00:00Z'
+        attachments = @([ordered]@{
+            role = 'multiplayer-results'; path = 'LockstepV2LoopbackEvidence.json'
+            sha256 = $lockstepAdapterHash; trustDomain = 'host-runner'
+        })
+        details = [ordered]@{
+            nativeEvidenceKind = 'lockstep-v2-multiplayer'
+            producer = 'installed-lockstep-v2'; nativeEvidenceSha256 = $lockstepAdapterHash
+            networkRosterMask = 3; simulationRosterMask = 63; aiRosterMask = 60
+            aiPlayerCount = 4; title = 'Both'; sessionCount = 2; peerCount = 2
+            commonStopFrame = 4096; allMatchesCompleted = $true
+            stateTracesIdentical = $true; crossEpochRejected = $true
+            contentMismatchRejected = $true
+        }
+    }
+    $lockstepAdapterEvidencePath = Join-Path $lockstepAdapterRoot `
+        'mixed-worker-multiplayer.json'
+    Write-JsonDocument $lockstepAdapterEvidencePath $lockstepAdapterDocument
+    $evidencePaths['mixed-worker-multiplayer'] = $lockstepAdapterEvidencePath
+    $acceptanceRelativePaths['mixed-worker-multiplayer'] = `
+        'lockstep-v2-adapter\mixed-worker-multiplayer.json'
+    Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
+    try {
+        $adapterAcceptance = Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest
+        Assert-True ($adapterAcceptance.status -ceq 'passed' -and
+            $adapterAcceptance.gateName -ceq 'final-stage5-acceptance') `
+            'the installed lockstep-v2 child passes through the mixed-worker final-acceptance adapter'
+    }
+    catch {
+        Assert-True $false "the installed lockstep-v2 adapter should satisfy final acceptance: $($_.Exception.Message)"
+    }
+    $adapterTrustDomain = $lockstepAdapterDocument.attachments[0].trustDomain
+    $lockstepAdapterDocument.attachments[0].trustDomain = 'executable'
+    Write-JsonDocument $lockstepAdapterEvidencePath $lockstepAdapterDocument
+    Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
+    Assert-Throws {
+        Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest | Out-Null
+    } 'wrong trust domain' `
+        'the lockstep-v2 adapter rejects a multiplayer child outside the host-runner trust domain'
+    $lockstepAdapterDocument.attachments[0].trustDomain = $adapterTrustDomain
+    $lockstepAdapterDocument.attachments[0].sha256 = '0' * 64
+    Write-JsonDocument $lockstepAdapterEvidencePath $lockstepAdapterDocument
+    Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
+    Assert-Throws {
+        Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest | Out-Null
+    } 'SHA-256 mismatch' `
+        'the lockstep-v2 adapter rejects a substituted native-child hash'
+    $lockstepAdapterDocument.attachments[0].sha256 = $lockstepAdapterHash
+    Write-JsonDocument $lockstepAdapterEvidencePath $lockstepAdapterDocument
+    Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
 
     $receiptBytesCaseRoot = Join-Path $acceptanceRoot 'lockstep-v2-negative-receipt-bytes'
     $receiptBytesPath = Copy-LockstepFixtureCase $lockstepFixtureRoot $receiptBytesCaseRoot
@@ -4000,8 +4411,10 @@ try {
         ArtifactHashes = $artifactTestHashes
     }
     $receiptRead = Read-Stage5FinalAcceptanceImmutableReceipt @receiptContractArgs
-    Assert-True ($receiptRead.acceptanceFailure -match 'missing-producer') `
-        'a structurally complete receipt still fails closed without a registered executable producer'
+    Assert-True ($null -eq $receiptRead.acceptanceFailure -and
+        $receiptRead.trustDomain -ceq 'host-runner' -and
+        $receiptRead.producer -ceq 'installed-runtime-validation-plan-v2') `
+        'a host-runner receipt passes only after its exact producer and trust domain are validated'
     $immutableReceipt.sourceCommit = 'b' * 40
     Write-JsonDocument $immutableReceiptPath $immutableReceipt
     Assert-Throws {
@@ -4041,14 +4454,133 @@ try {
     } 'replayed.*runNonce' `
         'a replayed receipt nonce is rejected even when its bytes are unchanged'
 
-    $acceptanceOutput = Join-Path $acceptanceRoot 'final-acceptance-report.json'
+    $immutableReceipt.trustDomain = 'executable'
+    Write-JsonDocument $immutableReceiptPath $immutableReceipt
     Assert-Throws {
-        & (Join-Path $PSScriptRoot 'Invoke-Stage5FinalAcceptance.ps1') `
-            -AcceptanceManifestPath $acceptanceRequest -OutputPath $acceptanceOutput | Out-Null
-    } 'diagnostic NET3 v1|lockstep-v2' `
-        'final acceptance command fails closed before a lockstep-v2 producer exists'
-    Assert-True (-not (Test-Path -LiteralPath $acceptanceOutput)) `
-        'final acceptance does not write a passed report without lockstep-v2 evidence'
+        Read-Stage5FinalAcceptanceImmutableReceipt @receiptContractArgs | Out-Null
+    } 'trustDomain is substituted' `
+        'a receipt cannot cross from the host-runner domain into the executable domain'
+    $immutableReceipt.trustDomain = 'host-runner'
+    $immutableReceipt.provenance.childProvenance = 'bound'
+    $immutableReceipt.provenance.children = @()
+    Write-JsonDocument $immutableReceiptPath $immutableReceipt
+    Assert-Throws {
+        Read-Stage5FinalAcceptanceImmutableReceipt @receiptContractArgs | Out-Null
+    } 'claims child provenance' `
+        'a host-runner plan cannot claim child provenance that it did not bind'
+    $immutableReceipt.provenance.childProvenance = 'not-applicable'
+    $immutableReceipt.provenance.children = @()
+    Write-JsonDocument $immutableReceiptPath $immutableReceipt
+
+    $executableReceiptPath = Join-Path $attachmentRoot `
+        'executable-validation-results.json'
+    Write-Stage5ExecutableReceiptTestDocument $executableReceiptPath `
+        'validation-results' 'ZeroHour' $sourceCommit $artifactSetHash $artifactTestHashes
+    $executableArgs = @{
+        Path = $executableReceiptPath; Kind = 'deterministic-runtime'
+        Role = 'validation-results'; EvidenceTitle = 'ZeroHour'
+        ExpectedSourceCommit = $sourceCommit
+        ExpectedArtifactSetSha256 = $artifactSetHash
+        ArtifactHashes = $artifactTestHashes
+    }
+    $executableRead = Read-Stage5FinalAcceptanceImmutableReceipt @executableArgs
+    Assert-True ($executableRead.trustDomain -ceq 'executable' -and
+        $executableRead.producer -ceq 'game-executable-stage5-validation-results-v2' -and
+        $executableRead.provenance.kind -ceq 'native-executable-observation') `
+        'an executable-originated receipt is accepted only with its role-bound native receipt'
+    $nativeReceiptPath = Join-Path $attachmentRoot 'executable-validation-results.native.json'
+    $nativeReceiptText = [IO.File]::ReadAllText($nativeReceiptPath)
+    [IO.File]::AppendAllText($nativeReceiptPath, "`n tampered")
+    Assert-Throws {
+        Read-Stage5FinalAcceptanceImmutableReceipt @executableArgs | Out-Null
+    } 'native provenance receipt.*SHA-256 mismatch' `
+        'an executable receipt rejects a tampered native receipt'
+    [IO.File]::WriteAllText($nativeReceiptPath, $nativeReceiptText)
+
+    $reviewedReceiptPath = Join-Path $attachmentRoot `
+        'replay-determinism-replay-fixture-manifest.json'
+    $reviewedArgs = @{
+        Path = $reviewedReceiptPath; Kind = 'replay-determinism'
+        Role = 'replay-fixture-manifest'; EvidenceTitle = 'ZeroHour'
+        ExpectedSourceCommit = $sourceCommit
+        ExpectedArtifactSetSha256 = $artifactSetHash
+        ArtifactHashes = $artifactTestHashes
+    }
+    $reviewedRead = Read-Stage5FinalAcceptanceImmutableReceipt @reviewedArgs
+    Assert-True ($reviewedRead.trustDomain -ceq 'reviewed-fixture' -and
+        $reviewedRead.protection.kind -ceq 'external-reviewed-fixture-attestation') `
+        'reviewed fixture receipts use the external reviewed-fixture trust domain'
+    $reviewedManifestPath = Join-Path $attachmentRoot 'reviewed-fixture-manifest.json'
+    $reviewedManifestText = [IO.File]::ReadAllText($reviewedManifestPath)
+    $reviewedReceiptText = [IO.File]::ReadAllText($reviewedReceiptPath)
+    [IO.File]::AppendAllText($reviewedManifestPath, "`n tampered")
+    Assert-Throws {
+        Read-Stage5FinalAcceptanceImmutableReceipt @reviewedArgs | Out-Null
+    } 'fixture manifest.*SHA-256 mismatch' `
+        'reviewed fixture receipts reject a changed nested fixture manifest'
+    [IO.File]::WriteAllText($reviewedManifestPath, $reviewedManifestText)
+    $reviewedDocument = Get-Content -LiteralPath $reviewedReceiptPath -Raw | ConvertFrom-Json
+    $reviewedDocument.trustDomain = 'host-runner'
+    Write-JsonDocument $reviewedReceiptPath $reviewedDocument
+    Assert-Throws {
+        Read-Stage5FinalAcceptanceImmutableReceipt @reviewedArgs | Out-Null
+    } 'trustDomain is substituted' `
+        'a reviewed fixture receipt cannot be reclassified as host-runner evidence'
+    [IO.File]::WriteAllText($reviewedReceiptPath, $reviewedReceiptText)
+
+    $premiumReceiptPath = Join-Path $attachmentRoot `
+        'premium-review-premium-review-results.json'
+    $premiumArgs = @{
+        Path = $premiumReceiptPath; Kind = 'premium-review'
+        Role = 'premium-review-results'; EvidenceTitle = 'Both'
+        ExpectedSourceCommit = $sourceCommit
+        ExpectedArtifactSetSha256 = $artifactSetHash
+        ArtifactHashes = $artifactTestHashes
+    }
+    $premiumRead = Read-Stage5FinalAcceptanceImmutableReceipt @premiumArgs
+    Assert-True ($premiumRead.trustDomain -ceq 'premium-review' -and
+        $premiumRead.protection.kind -ceq 'external-premium-review-attestation') `
+        'premium review receipts require the protected premium-review domain'
+    $premiumReceiptText = [IO.File]::ReadAllText($premiumReceiptPath)
+    $premiumDocument = Get-Content -LiteralPath $premiumReceiptPath -Raw | ConvertFrom-Json
+    $premiumDocument.protection.kind = 'external-user-manual-approval-attestation'
+    Write-JsonDocument $premiumReceiptPath $premiumDocument
+    Assert-Throws {
+        Read-Stage5FinalAcceptanceImmutableReceipt @premiumArgs | Out-Null
+    } 'protection kind is not external/protected' `
+        'premium review rejects a manual-approval protection marker'
+    [IO.File]::WriteAllText($premiumReceiptPath, $premiumReceiptText)
+
+    $manualReceiptPath = Join-Path $attachmentRoot `
+        'manual-acceptance-manual-checklist.json'
+    $manualArgs = @{
+        Path = $manualReceiptPath; Kind = 'manual-acceptance'
+        Role = 'manual-checklist'; EvidenceTitle = 'Both'
+        ExpectedSourceCommit = $sourceCommit
+        ExpectedArtifactSetSha256 = $artifactSetHash
+        ArtifactHashes = $artifactTestHashes
+    }
+    $manualRead = Read-Stage5FinalAcceptanceImmutableReceipt @manualArgs
+    Assert-True ($manualRead.trustDomain -ceq 'manual-approval' -and
+        $manualRead.protection.kind -ceq 'external-user-manual-approval-attestation') `
+        'manual acceptance receipts require the external manual-approval domain'
+    $manualReceiptText = [IO.File]::ReadAllText($manualReceiptPath)
+    $manualDocument = Get-Content -LiteralPath $manualReceiptPath -Raw | ConvertFrom-Json
+    $manualDocument.provenance.kind = 'host-runner'
+    Write-JsonDocument $manualReceiptPath $manualDocument
+    Assert-Throws {
+        Read-Stage5FinalAcceptanceImmutableReceipt @manualArgs | Out-Null
+    } 'authorized protected record' `
+        'manual acceptance rejects a caller-forged host-runner provenance marker'
+    [IO.File]::WriteAllText($manualReceiptPath, $manualReceiptText)
+
+    $acceptanceOutput = Join-Path $acceptanceRoot 'final-acceptance-report.json'
+    & (Join-Path $PSScriptRoot 'Invoke-Stage5FinalAcceptance.ps1') `
+        -AcceptanceManifestPath $acceptanceRequest -OutputPath $acceptanceOutput | Out-Null
+    $acceptanceReport = Get-Content -LiteralPath $acceptanceOutput -Raw | ConvertFrom-Json
+    Assert-True ($acceptanceReport.status -ceq 'passed' -and
+        $acceptanceReport.gateName -ceq 'final-stage5-acceptance') `
+        'final acceptance command writes a passed report after installed lockstep-v2 evidence is attached'
 
     $missingManualRequest = Join-Path $acceptanceRoot 'missing-manual.json'
     Write-AcceptanceRequest $missingManualRequest @($acceptanceKinds | Where-Object {
@@ -4363,6 +4895,80 @@ try {
             $artifactSetHash $artifactTestHashes['zerohour-executable'] ('F' * 64) | Out-Null
     } 'provenance is invalid' `
         'scaling evidence rejects a Stage 3 regression baseline with a different independent hash'
+
+    $evidenceModule = Get-Module -Name DeterministicSimulationEvidence
+    Assert-True ($null -ne $evidenceModule) `
+        'the final-acceptance snapshot tests can access the evidence module boundary'
+    $snapshotPath = Join-Path $attachmentRoot 'snapshot-mutation.json'
+    Write-JsonDocument $snapshotPath ([ordered]@{ marker = 'original'; value = 17 })
+    $snapshot = & $evidenceModule {
+        param($path)
+        Get-Stage5FinalAcceptanceFileSnapshot $path 'snapshot mutation test'
+    } $snapshotPath
+    [IO.File]::WriteAllText($snapshotPath, '{"marker":"mutated","value":99}')
+    $snapshotDocument = & $evidenceModule {
+        param($fileSnapshot)
+        ConvertFrom-Stage5FinalAcceptanceJsonSnapshot $fileSnapshot 'snapshot mutation test'
+    } $snapshot
+    Assert-True ((Get-Stage5JsonValue $snapshotDocument 'marker' 'snapshot mutation test') -ceq 'original' -and
+        (Get-Stage5JsonValue $snapshotDocument 'value' 'snapshot mutation test') -eq 17) `
+        'final-acceptance JSON parsing remains bound to the bytes captured before a later file mutation'
+
+    $reparseRoot = Join-Path $root 'reparse-negative'
+    $reparseBase = Join-Path $reparseRoot 'manifest'
+    $reparseTarget = Join-Path $reparseRoot 'outside'
+    New-Item -ItemType Directory -Path $reparseBase, $reparseTarget -Force | Out-Null
+    $reparseTargetFile = Join-Path $reparseTarget 'outside.json'
+    Write-JsonDocument $reparseTargetFile ([ordered]@{ marker = 'outside' })
+    $reparseLink = Join-Path $reparseBase 'linked'
+    $reparseRelative = 'linked\outside.json'
+    $reparseCreated = $false
+    try {
+        New-Item -ItemType Junction -Path $reparseLink -Target $reparseTarget `
+            -ErrorAction Stop | Out-Null
+        $reparseCreated = $true
+    }
+    catch {
+        $reparseLink = Join-Path $reparseBase 'linked.json'
+        $reparseRelative = 'linked.json'
+        try {
+            New-Item -ItemType SymbolicLink -Path $reparseLink -Target $reparseTargetFile `
+                -ErrorAction Stop | Out-Null
+            $reparseCreated = $true
+        }
+        catch {
+            Write-Warning 'Skipping reparse-path negative: this host does not permit junction or symbolic-link creation.'
+        }
+    }
+    if ($reparseCreated) {
+        $reparseError = $null
+        try {
+            & $evidenceModule {
+                param($baseDirectory, $relativePath)
+                Resolve-Stage5FinalAcceptanceFile $baseDirectory $relativePath `
+                    'reparse path negative'
+            } $reparseBase $reparseRelative | Out-Null
+        }
+        catch { $reparseError = $_.Exception.Message }
+        Assert-True ($reparseError -match 'reparse point') `
+            'final-acceptance evidence rejects a junction or symbolic-link path escape'
+        try {
+            $reparseLinkItem = Get-Item -LiteralPath $reparseLink -Force `
+                -ErrorAction SilentlyContinue
+            if ($null -ne $reparseLinkItem) {
+                if (($reparseLinkItem.Attributes -band [IO.FileAttributes]::Directory) -ne 0) {
+                    [IO.Directory]::Delete($reparseLink)
+                }
+                else {
+                    [IO.File]::Delete($reparseLink)
+                }
+            }
+        }
+        catch {
+            # Windows PowerShell 5.1 can throw while Remove-Item tears down a
+            # junction; the outer fixture cleanup remains the final fallback.
+        }
+    }
 
     $manualAttachment = Join-Path $attachmentRoot 'manual-acceptance-manual-checklist.json'
     [IO.File]::AppendAllText($manualAttachment, 'tampered')
