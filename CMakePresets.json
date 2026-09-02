@@ -301,7 +301,8 @@
                 "RTS_BUILD_GENERALS_PRODUCT": "OFF",
                 "RTS_BUILD_ZEROHOUR_PRODUCT": "OFF",
                 "RTS_BUILD_CORE_TOOLS": "OFF",
-                "RTS_BUILD_CORE_EXTRAS": "ON"
+                "RTS_BUILD_CORE_EXTRAS": "ON",
+                "RTS_BUILD_OPTION_FFMPEG": "OFF"
             }
         },
         {
@@ -316,7 +317,8 @@
                 "RTS_BUILD_GENERALS_PRODUCT": "OFF",
                 "RTS_BUILD_ZEROHOUR_PRODUCT": "OFF",
                 "RTS_BUILD_CORE_TOOLS": "OFF",
-                "RTS_BUILD_CORE_EXTRAS": "ON"
+                "RTS_BUILD_CORE_EXTRAS": "ON",
+                "RTS_BUILD_OPTION_FFMPEG": "OFF"
             }
         },
         {
@@ -331,7 +333,8 @@
                 "RTS_BUILD_GENERALS_PRODUCT": "OFF",
                 "RTS_BUILD_ZEROHOUR_PRODUCT": "OFF",
                 "RTS_BUILD_CORE_TOOLS": "OFF",
-                "RTS_BUILD_CORE_EXTRAS": "ON"
+                "RTS_BUILD_CORE_EXTRAS": "ON",
+                "RTS_BUILD_OPTION_FFMPEG": "OFF"
             }
         },
         {
