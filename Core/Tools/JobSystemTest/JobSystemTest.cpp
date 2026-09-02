@@ -3,6 +3,12 @@
 #include <limits.h>
 #include <new>
 #include <stdio.h>
+#if defined(_WIN32)
+#if !defined(NOMINMAX)
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #if defined(_MSC_VER) && defined(_DEBUG)
 #include <crtdbg.h>
 #endif
@@ -13,12 +19,6 @@
 #include <condition_variable>
 #include <mutex>
 #include <thread>
-#if defined(_WIN32)
-#if !defined(NOMINMAX)
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
 #endif
 
 #if defined(RTS_BUILD_CORE_EXTRAS)
