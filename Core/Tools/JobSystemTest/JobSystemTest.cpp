@@ -1100,7 +1100,14 @@ int testPrioritiesAndWorkStealing()
 			rts::JOB_PRIORITY_FRAME_CRITICAL),
 			"queued job can be promoted to a frame-critical lane");
 		gate.open();
-		result |= check(system.wait(group), "priority group completes");
+		/*
+		 * This ordering contract is for the single physical worker.  The
+		 * owner-thread fallback used by wait(group) is a second consumer: it
+		 * can claim the promoted record and be preempted before execute(),
+		 * allowing the physical worker to start the older critical record.
+		 */
+		result |= check(system.waitWithoutOwnerHelp(group, 5000),
+			"priority group completes");
 		result |= check(backgroundOrder == 1 && criticalOrder == 2,
 			"promoted job runs before existing frame-critical work");
 		system.shutdown();
