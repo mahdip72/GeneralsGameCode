@@ -4,6 +4,7 @@
 ** SPDX-License-Identifier: GPL-3.0-or-later
 */
 #include "Lib/PhysicsIntegrationKernel.h"
+#include "Lib/JobFloatingPointState.h"
 #include "Lib/JobSystem.h"
 
 #include <assert.h>
@@ -92,6 +93,48 @@ bool SameBytes(const void *left, const void *right, unsigned byteCount)
 {
 	return memcmp(left, right, byteCount) == 0;
 }
+
+#if defined(_WIN32) && !defined(_WIN64) && \
+	(!defined(_MSC_VER) || _MSC_VER >= 1300) && \
+	((defined(_MSC_VER) && defined(_M_IX86)) || \
+		(defined(__GNUC__) && defined(__i386__)))
+unsigned short ReadDirectX87ControlWord()
+{
+	unsigned short controlWord = 0;
+#if defined(_MSC_VER)
+	__asm { fnstcw [controlWord] }
+#else
+	__asm__ __volatile__("fnstcw %0" : "=m"(controlWord));
+#endif
+	return controlWord;
+}
+
+void WriteDirectX87ControlWord(unsigned short controlWord)
+{
+#if defined(_MSC_VER)
+	__asm { fldcw [controlWord] }
+#else
+	__asm__ __volatile__("fldcw %0" : : "m"(controlWord));
+#endif
+}
+
+unsigned short PerturbDirectX87ControlWord(unsigned short controlWord)
+{
+	const unsigned short modeMask = 0x1f3f;
+	const unsigned short precision =
+		(controlWord & 0x0300) == 0 ? 0x0200 : 0;
+	const unsigned short rounding =
+		(controlWord & 0x0c00) == 0x0400 ? 0x0800 : 0x0400;
+	// Toggle only invalid-operation masking so precision remains masked while
+	// the control-word API implementation executes any inexact arithmetic.
+	const unsigned short exceptions =
+		static_cast<unsigned short>((controlWord & 0x003f) ^ 0x0001);
+	const unsigned short infinity =
+		(controlWord & 0x1000) == 0 ? 0x1000 : 0;
+	return static_cast<unsigned short>((controlWord & ~modeMask) |
+		precision | rounding | exceptions | infinity);
+}
+#endif
 
 void OracleRotateX(float *matrix, float theta)
 {
@@ -294,6 +337,53 @@ void TestScalarByteAndFieldParity()
 	}
 }
 
+#if defined(_WIN32) && !defined(_WIN64) && \
+	(!defined(_MSC_VER) || _MSC_VER >= 1300) && \
+	((defined(_MSC_VER) && defined(_M_IX86)) || \
+		(defined(__GNUC__) && defined(__i386__)))
+void TestNestedFloatingPointScopeRestoration()
+{
+	const unsigned short baselineX87 = ReadDirectX87ControlWord();
+	const unsigned baselineMxcsr = _mm_getcsr();
+	const unsigned short firstX87 =
+		PerturbDirectX87ControlWord(baselineX87);
+	const unsigned short secondX87 =
+		PerturbDirectX87ControlWord(firstX87);
+	const unsigned firstMxcsr =
+		(baselineMxcsr & ~_MM_ROUND_MASK) | _MM_ROUND_DOWN;
+	const unsigned secondMxcsr =
+		(baselineMxcsr & ~_MM_ROUND_MASK) | _MM_ROUND_UP;
+	assert(firstX87 != baselineX87);
+	assert(secondX87 != firstX87);
+	assert((firstX87 & 0x0300) != (baselineX87 & 0x0300));
+	assert((firstX87 & 0x0c00) != (baselineX87 & 0x0c00));
+	assert((firstX87 & 0x003f) != (baselineX87 & 0x003f));
+	assert((firstX87 & 0x1000) != (baselineX87 & 0x1000));
+	WriteDirectX87ControlWord(firstX87);
+	_mm_setcsr(firstMxcsr);
+	const rts::JobFloatingPointState firstState;
+	WriteDirectX87ControlWord(secondX87);
+	_mm_setcsr(secondMxcsr);
+	const rts::JobFloatingPointState secondState;
+	WriteDirectX87ControlWord(baselineX87);
+	_mm_setcsr(baselineMxcsr);
+	{
+		rts::JobFloatingPointScope firstScope(firstState);
+		assert(ReadDirectX87ControlWord() == firstX87);
+		assert(_mm_getcsr() == firstMxcsr);
+		{
+			rts::JobFloatingPointScope secondScope(secondState);
+			assert(ReadDirectX87ControlWord() == secondX87);
+			assert(_mm_getcsr() == secondMxcsr);
+		}
+		assert(ReadDirectX87ControlWord() == firstX87);
+		assert(_mm_getcsr() == firstMxcsr);
+	}
+	assert(ReadDirectX87ControlWord() == baselineX87);
+	assert(_mm_getcsr() == baselineMxcsr);
+}
+#endif
+
 void TestLoadedTransportMassUsesLegacyOracle()
 {
 	rts::PhysicsIntegrationSnapshot loaded = MakeSnapshot(5);
@@ -445,6 +535,9 @@ void TestDampingFlagAndSleepyHeapParity()
 	config.pinWorkers = false;
 	assert(jobs.start(config));
 	assert(jobs.registerCurrentThread(rts::JOB_OWNER_GAME));
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
+	assert(jobs.workerCount() == config.workerCount);
+#endif
 	rts::PhysicsIntegrationOptions options;
 	options.minimumGrain = 1;
 	assert(rts::PreparePhysicsIntegrationPrefixes(&snapshots[0], count,
@@ -554,7 +647,13 @@ void RunWorkerCount(unsigned workerCount)
 	const rts::PhysicsIntegrationBatchResult result =
 		rts::PreparePhysicsIntegrationPrefixes(&snapshots[0], count,
 			&outputs[0], count, &scratch[0], count, options, &metrics);
+#if defined(_MSC_VER) && _MSC_VER < 1300
+	assert(actualWorkerCount == 1);
 	if (actualWorkerCount <= 1)
+#else
+	assert(actualWorkerCount == workerCount);
+	if (workerCount == 1)
+#endif
 	{
 		assert(result == rts::PHYSICS_INTEGRATION_POLICY_INELIGIBLE);
 		assert(SameBytes(&outputs[0], &sentinel[0],
@@ -618,6 +717,9 @@ void RunShadowWorkerCount(unsigned workerCount)
 	assert(jobs.start(config));
 	assert(jobs.registerCurrentThread(rts::JOB_OWNER_GAME));
 	const unsigned actualWorkerCount = jobs.workerCount();
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
+	assert(actualWorkerCount == workerCount);
+#endif
 
 	const unsigned count = 257;
 	std::vector<rts::PhysicsIntegrationSnapshot> snapshots(count);
@@ -635,6 +737,7 @@ void RunShadowWorkerCount(unsigned workerCount)
 	const rts::PhysicsIntegrationBatchResult result =
 		rts::PreparePhysicsIntegrationPrefixes(&snapshots[0], count,
 		&outputs[0], count, &scratch[0], count, options, &sliceMetrics);
+#if defined(_MSC_VER) && _MSC_VER < 1300
 	if (actualWorkerCount <= 1)
 	{
 		assert(result == rts::PHYSICS_INTEGRATION_POLICY_INELIGIBLE);
@@ -645,6 +748,7 @@ void RunShadowWorkerCount(unsigned workerCount)
 		assert(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME));
 		return;
 	}
+#endif
 	assert(result == rts::PHYSICS_INTEGRATION_PARALLEL);
 	bool matched = true;
 	for (unsigned outputIndex = 0; outputIndex != count; ++outputIndex)
@@ -698,9 +802,12 @@ void ExpectTransactionalFailure(rts::PhysicsIntegrationTestFault fault,
 	options.testFault = fault;
 	options.testOrdinal = ordinal;
 	rts::PhysicsIntegrationMetrics metrics;
+#if defined(_MSC_VER) && _MSC_VER < 1300
 	const rts::PhysicsIntegrationBatchResult runtimeExpectedResult =
-		rts::JobSystem::instance().workerCount() <= 1 ?
-		rts::PHYSICS_INTEGRATION_POLICY_INELIGIBLE : expectedResult;
+		rts::PHYSICS_INTEGRATION_POLICY_INELIGIBLE;
+#else
+	const rts::PhysicsIntegrationBatchResult runtimeExpectedResult = expectedResult;
+#endif
 	assert(rts::PreparePhysicsIntegrationPrefixes(&snapshots[0], count,
 		&outputs[0], count, &scratch[0], count, options, &metrics) ==
 		runtimeExpectedResult);
@@ -718,6 +825,9 @@ void TestTransactionalFailurePaths()
 	config.pinWorkers = false;
 	assert(jobs.start(config));
 	assert(jobs.registerCurrentThread(rts::JOB_OWNER_GAME));
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
+	assert(jobs.workerCount() == config.workerCount);
+#endif
 
 	ExpectTransactionalFailure(rts::PHYSICS_INTEGRATION_TEST_ALLOCATION_FAILURE,
 		0, rts::PHYSICS_INTEGRATION_SERIAL_FALLBACK);
@@ -759,6 +869,9 @@ void TestBelowGrainSlicesAreNotSchedulerFallbacks()
 	config.pinWorkers = false;
 	assert(jobs.start(config));
 	assert(jobs.registerCurrentThread(rts::JOB_OWNER_GAME));
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
+	assert(jobs.workerCount() == config.workerCount);
+#endif
 	jobs.resetMetrics();
 	for (unsigned count = 1; count != 64; ++count)
 	{
@@ -848,6 +961,11 @@ void TestPolicyIneligibleIsDistinctFromSafetyFallback()
 	assert(jobs.start(config));
 	assert(jobs.registerCurrentThread(rts::JOB_OWNER_RENDER));
 	const unsigned actualWorkerCount = jobs.workerCount();
+#if defined(_MSC_VER) && _MSC_VER < 1300
+	assert(actualWorkerCount == 1);
+#else
+	assert(actualWorkerCount == config.workerCount);
+#endif
 	jobs.resetMetrics();
 	assert(rts::PreflightPhysicsIntegrationPrefixes() ==
 		rts::PHYSICS_INTEGRATION_SERIAL_FALLBACK);
@@ -860,12 +978,17 @@ void TestPolicyIneligibleIsDistinctFromSafetyFallback()
 	assert(jobs.metrics().serialFallbackCount == 1);
 	assert(jobs.unregisterCurrentThread(rts::JOB_OWNER_RENDER));
 	assert(jobs.registerCurrentThread(rts::JOB_OWNER_GAME));
+#if defined(_MSC_VER) && _MSC_VER < 1300
 	if (actualWorkerCount <= 1)
 		assert(rts::PreflightPhysicsIntegrationPrefixes() ==
 			rts::PHYSICS_INTEGRATION_POLICY_INELIGIBLE);
 	else
 		assert(rts::PreflightPhysicsIntegrationPrefixes() ==
 			rts::PHYSICS_INTEGRATION_PARALLEL);
+#else
+	assert(rts::PreflightPhysicsIntegrationPrefixes() ==
+		rts::PHYSICS_INTEGRATION_PARALLEL);
+#endif
 
 	rts::PhysicsIntegrationBatchResult workerResult =
 		rts::PHYSICS_INTEGRATION_INVALID_INPUT;
@@ -882,6 +1005,7 @@ void TestPolicyIneligibleIsDistinctFromSafetyFallback()
 	assert(handle.isValid());
 	assert(jobs.wait(group));
 	assert(handle.succeeded());
+#if defined(_MSC_VER) && _MSC_VER < 1300
 	if (actualWorkerCount <= 1)
 	{
 		assert(workerResult == rts::PHYSICS_INTEGRATION_POLICY_INELIGIBLE);
@@ -894,6 +1018,11 @@ void TestPolicyIneligibleIsDistinctFromSafetyFallback()
 		assert(workerFallbacks == 1);
 		assert(jobs.metrics().serialFallbackCount == 1);
 	}
+#else
+	assert(workerResult == rts::PHYSICS_INTEGRATION_SERIAL_FALLBACK);
+	assert(workerFallbacks == 1);
+	assert(jobs.metrics().serialFallbackCount == 1);
+#endif
 
 	jobs.resetMetrics();
 	assert(rts::PreparePhysicsIntegrationPrefixes(&snapshots[0], 1,
@@ -907,6 +1036,9 @@ void TestPolicyIneligibleIsDistinctFromSafetyFallback()
 	config.workerCount = 1;
 	assert(jobs.start(config));
 	assert(jobs.registerCurrentThread(rts::JOB_OWNER_GAME));
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
+	assert(jobs.workerCount() == config.workerCount);
+#endif
 	jobs.resetMetrics();
 	assert(rts::PreflightPhysicsIntegrationPrefixes() ==
 		rts::PHYSICS_INTEGRATION_POLICY_INELIGIBLE);
@@ -1048,6 +1180,12 @@ int main()
 	_CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
 #endif
 	TestScalarByteAndFieldParity();
+#if defined(_WIN32) && !defined(_WIN64) && \
+	(!defined(_MSC_VER) || _MSC_VER >= 1300) && \
+	((defined(_MSC_VER) && defined(_M_IX86)) || \
+		(defined(__GNUC__) && defined(__i386__)))
+	TestNestedFloatingPointScopeRestoration();
+#endif
 	TestLoadedTransportMassUsesLegacyOracle();
 	TestBoundedOwnerIndexWithAdversarialSparseIDs();
 	TestDampingFlagAndSleepyHeapParity();
