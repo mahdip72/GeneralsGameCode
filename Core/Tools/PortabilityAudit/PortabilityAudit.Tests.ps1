@@ -154,6 +154,15 @@ D3DFVF_XYZ;
     Set-FixtureFile $fixtureRoot 'Core/GameEngine/Include/GameClient/GameWindow.h' @'
 int ExistingGameWindow();
 '@
+    Set-FixtureFile $fixtureRoot 'Core/Libraries/Include/Lib/JobFloatingPointState.h' @'
+int ExistingFloatingPointState();
+'@
+    Set-FixtureFile $fixtureRoot 'Core/Tools/PhysicsIntegrationKernelTest/PhysicsIntegrationKernelTest.cpp' @'
+int ExistingPhysicsIntegrationKernelTest();
+'@
+    Set-FixtureFile $fixtureRoot 'Core/Libraries/Source/TaskRuntime/JobFloatingPointState.cpp' @'
+int ExistingWrongFloatingPointState();
+'@
     Invoke-FixtureGit $fixtureRoot @('add', '--', '.') | Out-Null
     Invoke-FixtureGit $fixtureRoot @('commit', '--quiet', '-m', 'baseline') | Out-Null
     $baseline = (@(Invoke-FixtureGit $fixtureRoot @('rev-parse', 'HEAD'))[0]).Trim()
@@ -259,6 +268,59 @@ int ExistingStackDump();
     Invoke-FixtureGit $fixtureRoot @('add', 'Core/Libraries/Source/debug/debug_except.cpp', 'Core/Libraries/Source/debug/debug_debug.cpp', 'Generals/Code/GameEngine/Source/Common/System/StackDump.cpp') | Out-Null
     Invoke-FixtureGit $fixtureRoot @('commit', '--quiet', '-m', 'add debug exception fixture') | Out-Null
     $annotatedBaseline = (@(Invoke-FixtureGit $fixtureRoot @('rev-parse', 'HEAD'))[0]).Trim()
+    Set-FixtureFile $fixtureRoot 'Core/Libraries/Include/Lib/JobFloatingPointState.h' @'
+void CaptureOrRestore(unsigned short controlWord)
+{
+  __asm { fnstcw [controlWord] } // portability-audit: x87-control-word
+  __asm { fldcw [controlWord] } // portability-audit: x87-control-word
+  __asm__ __volatile__("fnstcw %0" : "=m"(controlWord)); // portability-audit: x87-control-word
+  __asm__ __volatile__("fldcw %0" : : "m"(controlWord)); // portability-audit: x87-control-word
+}
+'@
+    Set-FixtureFile $fixtureRoot 'Core/Tools/PhysicsIntegrationKernelTest/PhysicsIntegrationKernelTest.cpp' @'
+void CaptureOrRestore(unsigned short controlWord)
+{
+  __asm { fnstcw [controlWord] } // portability-audit: x87-control-word
+  __asm { fldcw [controlWord] } // portability-audit: x87-control-word
+  __asm__ __volatile__("fnstcw %0" : "=m"(controlWord)); // portability-audit: x87-control-word
+    __asm__ __volatile__("fldcw %0" : : "m"(controlWord)); // portability-audit: x87-control-word
+}
+'@
+    $annotatedX87 = Invoke-Audit $fixtureRoot $annotatedBaseline
+    Assert-Fixture ($annotatedX87.Output -notmatch 'Core/Libraries/Include/Lib/JobFloatingPointState\.h:.*x86-inline-assembly-or-context') 'the exact annotated x87 control-word lines must be allowed in the implementation header'
+    Assert-Fixture ($annotatedX87.Output -notmatch 'Core/Tools/PhysicsIntegrationKernelTest/PhysicsIntegrationKernelTest\.cpp:.*x86-inline-assembly-or-context') 'the exact annotated x87 control-word lines must be allowed in the focused test'
+    Set-FixtureFile $fixtureRoot 'Core/Libraries/Include/Lib/JobFloatingPointState.h' @'
+void CaptureOrRestore(unsigned short controlWord)
+{
+  __asm { fnstcw [controlWord] }
+}
+'@
+    Set-FixtureFile $fixtureRoot 'Core/Libraries/Source/TaskRuntime/JobFloatingPointState.cpp' @'
+void CaptureOrRestore(unsigned short controlWord)
+{
+  __asm { fldcw [controlWord] } // portability-audit: x87-control-word
+}
+'@
+    $rejectedX87 = Invoke-Audit $fixtureRoot $annotatedBaseline
+    Assert-Fixture ($rejectedX87.Output -match 'Core/Libraries/Include/Lib/JobFloatingPointState\.h:.*x86-inline-assembly-or-context') 'an unannotated x87 instruction must remain rejected even in the approved implementation file'
+    Assert-Fixture ($rejectedX87.Output -match 'Core/Libraries/Source/TaskRuntime/JobFloatingPointState\.cpp:.*x86-inline-assembly-or-context') 'an annotated x87 instruction in a wrong file must remain rejected'
+    Set-FixtureFile $fixtureRoot 'Core/Tools/PhysicsIntegrationKernelTest/PhysicsIntegrationKernelTest.cpp' @'
+void CaptureOrRestore(unsigned short controlWord)
+{
+  __asm { fldcw [controlWord] }
+}
+'@
+    $rejectedFocusedX87 = Invoke-Audit $fixtureRoot $annotatedBaseline
+    Assert-Fixture ($rejectedFocusedX87.Output -match 'Core/Tools/PhysicsIntegrationKernelTest/PhysicsIntegrationKernelTest\.cpp:.*x86-inline-assembly-or-context') 'an unannotated x87 instruction must remain rejected even in the approved focused test file'
+    Set-FixtureFile $fixtureRoot 'Core/Libraries/Include/Lib/JobFloatingPointState.h' @'
+void ExistingFloatingPointState();
+'@
+    Set-FixtureFile $fixtureRoot 'Core/Libraries/Source/TaskRuntime/JobFloatingPointState.cpp' @'
+int ExistingWrongFloatingPointState();
+'@
+    Set-FixtureFile $fixtureRoot 'Core/Tools/PhysicsIntegrationKernelTest/PhysicsIntegrationKernelTest.cpp' @'
+int ExistingPhysicsIntegrationKernelTest();
+'@
     Set-FixtureFile $fixtureRoot 'Core/Libraries/Source/debug/debug_except.cpp' @'
 uintptr_t Current(const CONTEXT &ctx)
 {

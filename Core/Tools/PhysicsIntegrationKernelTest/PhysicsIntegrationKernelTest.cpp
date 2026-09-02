@@ -102,9 +102,9 @@ unsigned short ReadDirectX87ControlWord()
 {
 	unsigned short controlWord = 0;
 #if defined(_MSC_VER)
-	__asm { fnstcw [controlWord] }
+	__asm { fnstcw [controlWord] } // portability-audit: x87-control-word
 #else
-	__asm__ __volatile__("fnstcw %0" : "=m"(controlWord));
+	__asm__ __volatile__("fnstcw %0" : "=m"(controlWord)); // portability-audit: x87-control-word
 #endif
 	return controlWord;
 }
@@ -112,9 +112,9 @@ unsigned short ReadDirectX87ControlWord()
 void WriteDirectX87ControlWord(unsigned short controlWord)
 {
 #if defined(_MSC_VER)
-	__asm { fldcw [controlWord] }
+	__asm { fldcw [controlWord] } // portability-audit: x87-control-word
 #else
-	__asm__ __volatile__("fldcw %0" : : "m"(controlWord));
+	__asm__ __volatile__("fldcw %0" : : "m"(controlWord)); // portability-audit: x87-control-word
 #endif
 }
 

@@ -573,6 +573,20 @@ foreach ($line in $diff) {
                 $currentFile -eq 'Core/Libraries/Source/debug/debug_debug.cpp' -and
                 ($content -match '^\s*_asm\s*// portability-audit: vc6-caller-address\s*$' -or
                  $content -match '^\s*mov eax,\[ebp\+4\]\s*// portability-audit: vc6-caller-address\s*$')
+            # The x87 state bridge is intentionally implemented with the
+            # smallest possible fnstcw/fldcw instructions on 32-bit Windows.
+            # Exempt only those exact, annotated lines in the implementation
+            # and its focused test; all other inline assembly remains rejected.
+            $isApprovedX87ControlWord =
+                $rule.Name -eq 'x86-inline-assembly-or-context' -and
+                $currentFile -in @(
+                    'Core/Libraries/Include/Lib/JobFloatingPointState.h',
+                    'Core/Tools/PhysicsIntegrationKernelTest/PhysicsIntegrationKernelTest.cpp'
+                ) -and
+                ($content -match '^\s*__asm \{ fnstcw \[controlWord\] \}\s*// portability-audit: x87-control-word\s*$' -or
+                 $content -match '^\s*__asm \{ fldcw \[controlWord\] \}\s*// portability-audit: x87-control-word\s*$' -or
+                 $content -match '^\s*__asm__ __volatile__\("fnstcw %0" : "=m"\(controlWord\)\);\s*// portability-audit: x87-control-word\s*$' -or
+                 $content -match '^\s*__asm__ __volatile__\("fldcw %0" : : "m"\(controlWord\)\);\s*// portability-audit: x87-control-word\s*$')
             $isApprovedWindowMessageBoundary =
                 $rule.Name -eq 'pointer-bearing-window-message' -and
                 $currentFile -eq 'Core/GameEngine/Include/GameClient/GameWindow.h' -and
@@ -580,6 +594,7 @@ foreach ($line in $diff) {
             if ($rule.RejectAddedLine -and -not $isAllowed -and
                 -not $isApprovedX86Context -and
                 -not $isApprovedVC6CallerAddress -and
+                -not $isApprovedX87ControlWord -and
                 -not $isApprovedWindowMessageBoundary -and
                 $content -match $rule.Pattern) {
                 $violations += "${currentFile}:${lineNumber}: $($rule.Name)"
