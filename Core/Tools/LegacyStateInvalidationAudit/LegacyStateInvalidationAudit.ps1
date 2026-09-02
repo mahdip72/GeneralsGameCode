@@ -53,6 +53,38 @@ function Get-BraceDepthAt {
     return $depth
 }
 
+function Test-TrackedResetSequence {
+    param(
+        [Parameter(Mandatory = $true)][string]$ResetBody,
+        [Parameter(Mandatory = $true)][int]$DeviceResetIndex,
+        [Parameter(Mandatory = $true)][int]$FailureReturnIndex
+    )
+
+    if ($DeviceResetIndex -lt 0 -or $FailureReturnIndex -lt 0 -or
+        $DeviceResetIndex -gt $FailureReturnIndex) {
+        return $false
+    }
+    $trackedReset = $ResetBody.IndexOf('ResetTrackedLegacyState();',
+        $FailureReturnIndex, [StringComparison]::Ordinal)
+    $trackedSeed = $ResetBody.IndexOf('SeedTrackedLegacyPipelineState();',
+        $trackedReset, [StringComparison]::Ordinal)
+    $cacheInvalidate = $ResetBody.IndexOf(
+        'Invalidate_Cached_Render_States();', $trackedSeed,
+        [StringComparison]::Ordinal)
+    if ($trackedReset -lt 0 -or $trackedSeed -lt 0 -or
+        $cacheInvalidate -lt 0 -or $FailureReturnIndex -gt $trackedReset -or
+        $trackedReset -gt $trackedSeed -or $trackedSeed -gt $cacheInvalidate -or
+        (Get-BraceDepthAt $ResetBody $DeviceResetIndex) -ne
+            (Get-BraceDepthAt $ResetBody $trackedReset) -or
+        (Get-BraceDepthAt $ResetBody $trackedReset) -ne
+            (Get-BraceDepthAt $ResetBody $trackedSeed) -or
+        (Get-BraceDepthAt $ResetBody $trackedSeed) -ne
+            (Get-BraceDepthAt $ResetBody $cacheInvalidate)) {
+        return $false
+    }
+    return $true
+}
+
 function Test-LegacyStateInvalidationContract {
     param([Parameter(Mandatory = $true)][string]$ImplementationText)
 
@@ -71,15 +103,17 @@ function Test-LegacyStateInvalidationContract {
     $createReset = $create.IndexOf('ResetTrackedLegacyState();', [StringComparison]::Ordinal)
     $createSeed = $create.IndexOf('SeedTrackedLegacyPipelineState();', [StringComparison]::Ordinal)
     $createInvalidate = $create.IndexOf('Invalidate_Cached_Render_States();', [StringComparison]::Ordinal)
-    $dependentInits = $create.IndexOf('Do_Onetime_Device_Dependent_Inits();', [StringComparison]::Ordinal)
+    $dependentInitsMatch = [regex]::Match($create,
+        '\bDo_Onetime_Device_Dependent_Inits\s*\(\s*\)')
     if ($nativeCreate -lt 0 -or $createReset -lt 0 -or $createSeed -lt 0 -or
-        $createInvalidate -lt 0 -or $dependentInits -lt 0 -or
+        $createInvalidate -lt 0 -or -not $dependentInitsMatch.Success -or
         $nativeCreate -gt $createReset -or $createReset -gt $createSeed -or
-        $createSeed -gt $createInvalidate -or $createInvalidate -gt $dependentInits -or
+        $createSeed -gt $createInvalidate -or
+        $createInvalidate -gt $dependentInitsMatch.Index -or
         (Get-BraceDepthAt $create $createReset) -ne 0 -or
         (Get-BraceDepthAt $create $createSeed) -ne 0 -or
         (Get-BraceDepthAt $create $createInvalidate) -ne 0 -or
-        (Get-BraceDepthAt $create $dependentInits) -ne 0) {
+        (Get-BraceDepthAt $create $dependentInitsMatch.Index) -ne 0) {
         return $false
     }
 
@@ -116,7 +150,56 @@ function Test-LegacyStateInvalidationContract {
         return $false
     }
 
+    # Native x64 resets are a separate lifecycle path: the native device
+    # reset must succeed before the tracked D3D11 shadow is reset, seeded, and
+    # invalidated.  Keep the selector explicit so a native build cannot drift
+    # into the legacy D3D8 reset path silently.
+    $nativeDeviceReset = $reset.IndexOf(
+        '_NativeProductDeviceLifecycle.reset(', [StringComparison]::Ordinal)
+    if ($nativeDeviceReset -ge 0) {
+        $nativeSelector = [regex]::Match($reset,
+            '(?is)if\s*\(\s*IsInitted\s*&&\s*_UseD3D11Backend\s*&&\s*_NativeProductDeviceLifecycle\.isActive\s*\(\s*\)\s*\)\s*\{')
+        $nativeFailureReturn = $reset.IndexOf('return false;',
+            $nativeDeviceReset, [StringComparison]::Ordinal)
+        $nativeSuccessReturn = $reset.IndexOf('return true;',
+            $nativeDeviceReset, [StringComparison]::Ordinal)
+        $nativeSequenceValid = Test-TrackedResetSequence `
+            -ResetBody $reset `
+            -DeviceResetIndex $nativeDeviceReset `
+            -FailureReturnIndex $nativeFailureReturn
+        if (-not $nativeSelector.Success -or
+            $nativeSelector.Index -gt $nativeDeviceReset -or
+            (Get-BraceDepthAt $reset $nativeDeviceReset) -ne
+                ((Get-BraceDepthAt $reset $nativeSelector.Index) + 1) -or
+            -not $nativeSequenceValid) {
+            return $false
+        }
+        $nativeTrackedInvalidate = $reset.IndexOf(
+            'Invalidate_Cached_Render_States();', $nativeFailureReturn,
+            [StringComparison]::Ordinal)
+        if ($nativeSuccessReturn -lt 0 -or
+            $nativeTrackedInvalidate -lt 0 -or
+            $nativeTrackedInvalidate -gt $nativeSuccessReturn) {
+            return $false
+        }
+    }
+
+    # The legacy branch remains authoritative for Win32/VC6 and for the
+    # explicit legacy-reset test fragment.  Its D3D11 bridge preparation and
+    # resource teardown must precede Reset(), while tracked state is reset only
+    # after Reset() succeeds.
     $deviceReset = $reset.IndexOf('Reset(&_PresentParameters)', [StringComparison]::Ordinal)
+    $legacyPathStart = if ($nativeDeviceReset -ge 0) {
+        $nativeSuccessReturn
+    } else { 0 }
+    $legacyTrackedBeforeReset = if ($legacyPathStart -ge 0) {
+        $reset.IndexOf('ResetTrackedLegacyState();', $legacyPathStart,
+            [StringComparison]::Ordinal)
+    } else { -1 }
+    if ($legacyTrackedBeforeReset -ge 0 -and
+        $legacyTrackedBeforeReset -lt $deviceReset) {
+        return $false
+    }
     $bridgePrepare = $reset.IndexOf(
         '_D3D11Bridge.Prepare_Legacy_Device_Reset()',
         [StringComparison]::Ordinal)
@@ -128,26 +211,38 @@ function Test-LegacyStateInvalidationContract {
         [StringComparison]::Ordinal)
     $resetFailureCheck = $reset.IndexOf('if (hr != D3D_OK)', $deviceReset, [StringComparison]::Ordinal)
     $resetFailureReturn = $reset.IndexOf('return false;', $resetFailureCheck, [StringComparison]::Ordinal)
-    $trackedReset = $reset.IndexOf('ResetTrackedLegacyState();', [StringComparison]::Ordinal)
-    $trackedSeed = $reset.IndexOf('SeedTrackedLegacyPipelineState();', [StringComparison]::Ordinal)
-    $cacheInvalidate = $reset.IndexOf('Invalidate_Cached_Render_States();', [StringComparison]::Ordinal)
+    $legacyTrackedReset = if ($resetFailureReturn -ge 0) {
+        $reset.IndexOf('ResetTrackedLegacyState();', $resetFailureReturn,
+            [StringComparison]::Ordinal)
+    } else { -1 }
+    $legacyTrackedSeed = if ($legacyTrackedReset -ge 0) {
+        $reset.IndexOf('SeedTrackedLegacyPipelineState();', $legacyTrackedReset,
+            [StringComparison]::Ordinal)
+    } else { -1 }
+    $legacyCacheInvalidate = if ($legacyTrackedSeed -ge 0) {
+        $reset.IndexOf('Invalidate_Cached_Render_States();', $legacyTrackedSeed,
+            [StringComparison]::Ordinal)
+    } else { -1 }
     return $bridgePrepare -ge 0 -and $bridgeFailureReturn -ge 0 -and
         $resourceTeardown -ge 0 -and $deviceReset -ge 0 -and
         $bridgePrepare -lt $bridgeFailureReturn -and
         $bridgeFailureReturn -lt $resourceTeardown -and
         $resourceTeardown -lt $deviceReset -and $resetFailureCheck -ge 0 -and
-        $resetFailureReturn -ge 0 -and $trackedReset -ge 0 -and
-        $trackedSeed -ge 0 -and $cacheInvalidate -ge 0 -and
+        $resetFailureReturn -ge 0 -and $legacyTrackedReset -ge 0 -and
+        $legacyTrackedSeed -ge 0 -and $legacyCacheInvalidate -ge 0 -and
         $deviceReset -lt $resetFailureCheck -and
         $resetFailureCheck -lt $resetFailureReturn -and
-        $resetFailureReturn -lt $trackedReset -and
-        $trackedReset -lt $trackedSeed -and $trackedSeed -lt $cacheInvalidate -and
+        $resetFailureReturn -lt $legacyTrackedReset -and
+        $legacyTrackedReset -lt $legacyTrackedSeed -and
+        $legacyTrackedSeed -lt $legacyCacheInvalidate -and
         (Get-BraceDepthAt $reset $bridgePrepare) -eq
             (Get-BraceDepthAt $reset $deviceReset) -and
         (Get-BraceDepthAt $reset $deviceReset) -eq
-            (Get-BraceDepthAt $reset $trackedReset) -and
-        (Get-BraceDepthAt $reset $trackedReset) -eq
-            (Get-BraceDepthAt $reset $trackedSeed)
+            (Get-BraceDepthAt $reset $legacyTrackedReset) -and
+        (Get-BraceDepthAt $reset $legacyTrackedReset) -eq
+            (Get-BraceDepthAt $reset $legacyTrackedSeed) -and
+        (Get-BraceDepthAt $reset $legacyTrackedSeed) -eq
+            (Get-BraceDepthAt $reset $legacyCacheInvalidate)
 }
 
 function Test-LegacyBridgeResetContract {
@@ -281,10 +376,31 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
     $valid = $valid -replace "`r`n", "`n"
     $validBridge = $validBridge -replace "`r`n", "`n"
     $validPointGroup = $validPointGroup -replace "`r`n", "`n"
+    $validNative = $valid.Replace(
+        "bool DX8Wrapper::Reset_Device(bool reload_assets, bool *reset_requires_reacquire)`n{`n",
+        "bool DX8Wrapper::Reset_Device(bool reload_assets, bool *reset_requires_reacquire)`n{`n    if (IsInitted && _UseD3D11Backend && _NativeProductDeviceLifecycle.isActive()) {`n        if (!_NativeProductDeviceLifecycle.reset(640, 480)) {`n            return false;`n        }`n        ResetTrackedLegacyState();`n        SeedTrackedLegacyPipelineState();`n        Invalidate_Cached_Render_States();`n        return true;`n    }`n")
     if (-not (Test-LegacyStateInvalidationContract $valid) -or
+        -not (Test-LegacyStateInvalidationContract $validNative) -or
         -not (Test-LegacyBridgeResetContract $validBridge) -or
         -not (Test-PointParticleVertexContract $validPointGroup)) {
         throw 'Valid cache-invalidation fixture rejected.'
+    }
+    if ($validNative -eq $valid) {
+        throw 'Native reset fixture mutation did not change the fixture.'
+    }
+    $missingNativeTracking = $validNative.Replace(
+        "        ResetTrackedLegacyState();`n        SeedTrackedLegacyPipelineState();`n        Invalidate_Cached_Render_States();`n        return true;",
+        "        Invalidate_Cached_Render_States();`n        return true;")
+    if ($missingNativeTracking -eq $validNative -or
+        (Test-LegacyStateInvalidationContract $missingNativeTracking)) {
+        throw 'Native reset without tracked-state publication was accepted.'
+    }
+    $missingNativeSelector = $validNative.Replace(
+        '    if (IsInitted && _UseD3D11Backend && _NativeProductDeviceLifecycle.isActive()) {',
+        '    if (IsInitted && _NativeProductDeviceLifecycle.isActive()) {')
+    if ($missingNativeSelector -eq $validNative -or
+        (Test-LegacyStateInvalidationContract $missingNativeSelector)) {
+        throw 'Native reset without the explicit backend selector was accepted.'
     }
     $ordinaryReset = $valid.Replace(
         '    ClearLegacyWrapperCaches();',
