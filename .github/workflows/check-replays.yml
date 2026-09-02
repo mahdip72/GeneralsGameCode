@@ -780,13 +780,13 @@ jobs:
           if (-not $?) {
             throw 'Stage 5 ValidationSet All runner failed.'
           }
-        # This title lane produces fresh, host-bound receipts. Cross-title
-        # pre-manual aggregation runs only after both title lanes and the
-        # combined host producer have been assembled; the reviewed
-        # repository manifest is never treated as fresh H: evidence here.
-        # Invoke-Stage5FinalAcceptance.ps1 is reserved for that assembled
-        # cross-title pre-manual step.
-        Write-Host 'Stage 5 fresh title receipts are ready for cross-title pre-manual aggregation.'
+          # This title lane produces fresh, host-bound receipts. Cross-title
+          # pre-manual aggregation runs only after both title lanes and the
+          # combined host producer have been assembled; the reviewed
+          # repository manifest is never treated as fresh H: evidence here.
+          # Invoke-Stage5FinalAcceptance.ps1 is reserved for that assembled
+          # cross-title pre-manual step.
+          Write-Host 'Stage 5 fresh title receipts are ready for cross-title pre-manual aggregation.'
 
       - name: Normalize Stage 5 Evidence Paths for Upload
         if: ${{ always() && inputs.stage5 }}

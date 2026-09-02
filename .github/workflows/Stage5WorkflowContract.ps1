@@ -72,6 +72,42 @@ function Get-Stage5IndentedBlock {
     return ($blockLines -join "`n")
 }
 
+function Assert-Stage5WorkflowRunBlockIndentation {
+    param([string]$Block, [int]$StepIndent, [int]$RunIndent, [string]$Context)
+
+    $lines = @($Block -split '\r?\n')
+    $runPrefix = ((' ' * $RunIndent) -join '') + 'run: |'
+    $runIndex = -1
+    for ($index = 0; $index -lt $lines.Count; ++$index) {
+        if ($lines[$index].TrimEnd() -ceq $runPrefix) {
+            $runIndex = $index
+            break
+        }
+    }
+    Assert-Stage5WorkflowCondition ($runIndex -ge 0) `
+        "$Context is missing its run block marker."
+
+    $bodyLineCount = 0
+    for ($index = $runIndex + 1; $index -lt $lines.Count; ++$index) {
+        $line = $lines[$index]
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            continue
+        }
+        $lineIndent = $line.Length - $line.TrimStart().Length
+        if ($lineIndent -le $StepIndent) {
+            break
+        }
+        if ($line.TrimStart().StartsWith('#')) {
+            continue
+        }
+        Assert-Stage5WorkflowCondition ($lineIndent -gt $RunIndent) `
+            "$Context contains a non-comment run-body line with indentation $lineIndent; expected greater than $RunIndent."
+        ++$bodyLineCount
+    }
+    Assert-Stage5WorkflowCondition ($bodyLineCount -gt 0) `
+        "$Context does not contain any non-comment run-body lines."
+}
+
 if ($SelfTest) {
     $fixture = @"
 stage5: true
@@ -239,6 +275,8 @@ Assert-Stage5WorkflowCondition ($allIndex -ge 0 -and $acceptanceIndex -gt $allIn
 $stage5Block = Get-Stage5IndentedBlock $check '- name: Run Stage 5 Installed-Runtime Replay Matrix' 6
 Assert-Stage5WorkflowCondition (-not [string]::IsNullOrWhiteSpace($stage5Block)) `
     'Stage 5 runner block could not be isolated.'
+Assert-Stage5WorkflowRunBlockIndentation $stage5Block 6 8 `
+    'Stage 5 installed-runtime replay step'
 Assert-Stage5WorkflowNotContains $stage5Block "-ValidationSet', 'Replay'" `
     'Stage 5 full qualification runner'
 Assert-Stage5WorkflowNotContains $stage5Block '-AllowNonStandardCorpus' `
