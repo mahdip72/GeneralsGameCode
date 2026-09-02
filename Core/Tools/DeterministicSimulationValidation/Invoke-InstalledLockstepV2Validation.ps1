@@ -35,6 +35,7 @@ $LockstepProducer = 'installed-lockstep-v2'
 $LockstepMagic = 'RTS_LOCKSTEP_V2_RECEIPT'
 $LockstepNegativeProbeMagic = 'RTS_LOCKSTEP_V2_NEGATIVE_PROBE'
 $PostKillWaitMilliseconds = 5000
+$script:LockstepHostSelfTestScratchRoot = $null
 
 function Get-UpperSha256 {
     param([string]$Path)
@@ -56,13 +57,128 @@ function Test-SafeHDirectory {
     param([string]$Path, [switch]$AllowWhitespace)
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
     $full = [IO.Path]::GetFullPath($Path)
-    return $full.Length -ge 4 -and $full.Length -lt 248 -and
+    $isHPath = $full.Length -ge 3 -and
         $full.Substring(0, 1) -match '^[Hh]$' -and $full[1] -eq ':' -and
         ($full[2] -eq '\' -or $full[2] -eq '/') -and
+        $full.Length -lt 248
+    $selfTestRoot = [string]$script:LockstepHostSelfTestScratchRoot
+    $isBoundedHostSelfTestPath = $false
+    if (-not [string]::IsNullOrWhiteSpace($selfTestRoot)) {
+        $selfTestRoot = [IO.Path]::GetFullPath($selfTestRoot).TrimEnd('\')
+        $isBoundedHostSelfTestPath =
+            $full -ceq $selfTestRoot -or
+            $full.StartsWith($selfTestRoot + '\', [StringComparison]::OrdinalIgnoreCase)
+    }
+    return $full.Length -ge 4 -and $full.Length -lt 248 -and
+        ($isHPath -or $isBoundedHostSelfTestPath) -and
         $full.IndexOf('..', [StringComparison]::Ordinal) -lt 0 -and
         $full.IndexOf(';', [StringComparison]::Ordinal) -lt 0 -and
         $full.IndexOf('"', [StringComparison]::Ordinal) -lt 0 -and
         ($AllowWhitespace -or $full -notmatch '\s')
+}
+
+function Get-LockstepItemIfPresent {
+    param([string]$Path)
+    try { return Get-Item -LiteralPath $Path -Force -ErrorAction Stop }
+    catch [System.Management.Automation.ItemNotFoundException] { return $null }
+}
+
+function Assert-LockstepNoReparse {
+    param([string]$Path, [string]$Context = 'lockstep path', [string]$Boundary)
+    $full = [IO.Path]::GetFullPath($Path)
+    $limit = [IO.Path]::GetPathRoot($full)
+    if (-not [string]::IsNullOrWhiteSpace($Boundary)) {
+        $limit = [IO.Path]::GetFullPath($Boundary).TrimEnd('\')
+        if ($full -cne $limit -and -not $full.StartsWith($limit + '\',
+                [StringComparison]::OrdinalIgnoreCase)) {
+            throw "$Context escapes its bounded root: $full"
+        }
+    }
+    $cursor = $full
+    while ($true) {
+        $item = Get-LockstepItemIfPresent $cursor
+        if ($null -ne $item -and
+            ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "$Context contains a reparse point: $cursor"
+        }
+        if ($cursor -ceq $limit) { break }
+        $parent = Split-Path -Parent $cursor
+        if ([string]::IsNullOrWhiteSpace($parent) -or $parent -ceq $cursor) { break }
+        $cursor = [IO.Path]::GetFullPath($parent)
+    }
+}
+
+function Ensure-LockstepHostSelfTestDirectory {
+    param(
+        [string]$Path,
+        [string]$Context = 'lockstep host self-test directory',
+        [switch]$Fresh
+    )
+    $full = [IO.Path]::GetFullPath($Path)
+    $root = [string]$script:LockstepHostSelfTestScratchRoot
+    Assert-LockstepNoReparse $full $Context $root
+    Assert-LockstepNoReparse (Split-Path -Parent $full) "$Context parent"
+    $item = Get-LockstepItemIfPresent $full
+    if ($null -ne $item) {
+        if ($Fresh) { throw "$Context was not fresh: $full" }
+        if (-not $item.PSIsContainer) { throw "$Context is not a directory: $full" }
+        Assert-LockstepNoReparse $full $Context $root
+        return
+    }
+    New-Item -Path $full -ItemType Directory -ErrorAction Stop | Out-Null
+    Assert-LockstepNoReparse $full $Context $root
+    Assert-LockstepNoReparse (Split-Path -Parent $full) "$Context parent"
+}
+
+function Remove-LockstepHostSelfTestTree {
+    param([string]$Path, [string]$Boundary)
+    $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $root = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+    if (-not $root.PSIsContainer) { throw "lockstep cleanup root is not a directory: $full" }
+    Assert-LockstepNoReparse $full 'lockstep cleanup root' $Boundary
+    foreach ($child in @(Get-ChildItem -LiteralPath $full -Force -ErrorAction Stop)) {
+        $childFull = [IO.Path]::GetFullPath($child.FullName)
+        Assert-LockstepNoReparse $childFull 'lockstep cleanup child' $Boundary
+        $current = Get-Item -LiteralPath $childFull -Force -ErrorAction Stop
+        if ($current.PSIsContainer) {
+            Remove-LockstepHostSelfTestTree $childFull $Boundary
+        }
+        else {
+            Assert-LockstepNoReparse $childFull 'lockstep cleanup file' $Boundary
+            Remove-Item -LiteralPath $childFull -Force -ErrorAction Stop
+        }
+    }
+    Assert-LockstepNoReparse $full 'lockstep cleanup root' $Boundary
+    if (@(Get-ChildItem -LiteralPath $full -Force -ErrorAction Stop).Count -ne 0) {
+        throw "lockstep cleanup root changed during cleanup: $full"
+    }
+    Remove-Item -LiteralPath $full -Force -ErrorAction Stop
+    if ($null -ne (Get-LockstepItemIfPresent $full)) {
+        throw "lockstep cleanup did not remove: $full"
+    }
+}
+
+function Try-NewLockstepDirectoryJunction {
+    param([string]$LinkPath, [string]$TargetPath)
+    try {
+        New-Item -Path $LinkPath -ItemType Junction -Target $TargetPath `
+            -ErrorAction Stop | Out-Null
+    }
+    catch { return $false }
+    $item = Get-LockstepItemIfPresent $LinkPath
+    return $null -ne $item -and
+        ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+}
+
+function Remove-LockstepDirectoryJunction {
+    param([string]$Path)
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -or
+        -not $item.PSIsContainer) { throw "not a directory junction: $Path" }
+    [IO.Directory]::Delete($Path)
+    if ($null -ne (Get-LockstepItemIfPresent $Path)) {
+        throw "directory junction remained after removal: $Path"
+    }
 }
 
 function Test-SafeReceiptLeaf {
@@ -713,6 +829,7 @@ function Restore-LockstepRegistrySnapshots {
 
 function Initialize-LockstepTitleSessionDirectories {
     param([pscustomobject]$Contract)
+    $selfTestRoot = [string]$script:LockstepHostSelfTestScratchRoot
     foreach ($directory in @(
         $Contract.sessionRoot, $Contract.documentsRoot, $Contract.profileRoot,
         $Contract.peerRoot, $Contract.environmentValues['TEMP'],
@@ -722,6 +839,10 @@ function Initialize-LockstepTitleSessionDirectories {
         $Contract.environmentValues['RTS_STAGE5_VALIDATION_CACHE_ROOT'],
         $Contract.environmentValues['RTS_STAGE5_VALIDATION_LOG_ROOT'],
         $Contract.environmentValues['RTS_STAGE5_VALIDATION_DUMP_ROOT'])) {
+        if (-not [string]::IsNullOrWhiteSpace($selfTestRoot)) {
+            Ensure-LockstepHostSelfTestDirectory $directory 'self-test session directory'
+            continue
+        }
         if (-not (Test-SafeHDirectory $directory -AllowWhitespace)) {
             throw "Lockstep-v2 title-session directory is not a safe H: path: $directory"
         }
@@ -762,8 +883,17 @@ function Remove-LockstepTitleSessionDirectories {
             [StringComparison]::OrdinalIgnoreCase)) {
         throw "Lockstep-v2 disposable title-session path escapes the output root: $sessionFull"
     }
-    if (-not (Test-Path -LiteralPath $sessionFull)) { return }
-    $rootItem = Get-Item -LiteralPath $sessionFull -Force
+    $rootItem = Get-Item -LiteralPath $sessionFull -Force `
+        -ErrorAction SilentlyContinue
+    if ($null -eq $rootItem) { return }
+    $selfTestRoot = [string]$script:LockstepHostSelfTestScratchRoot
+    if (-not [string]::IsNullOrWhiteSpace($selfTestRoot) -and
+        ($sessionFull -ceq $selfTestRoot -or
+         $sessionFull.StartsWith($selfTestRoot + '\',
+             [StringComparison]::OrdinalIgnoreCase))) {
+        Remove-LockstepHostSelfTestTree $sessionFull $outputFull
+        return
+    }
     if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
         throw "Lockstep-v2 disposable title-session root is a reparse point: $sessionFull"
     }
@@ -859,6 +989,15 @@ function Write-AtomicText {
         }
         throw
     }
+}
+
+function Write-LockstepHostSelfTestText {
+    param([string]$Path, [string]$Text)
+    $root = [string]$script:LockstepHostSelfTestScratchRoot
+    Assert-LockstepNoReparse $Path 'self-test output' $root
+    [IO.File]::WriteAllText($Path, $Text,
+        (New-Object Text.UTF8Encoding($false)))
+    Assert-LockstepNoReparse $Path 'self-test output' $root
 }
 
 function Wait-ForLeaf {
@@ -2263,8 +2402,12 @@ function New-SyntheticNegativeProbeEvidence {
         [uint32]$MapCrc,
         [int]$Seed
     )
-    $negativeRoot = Join-Path (Join-Path $Root $Title) 'NegativeProbes'
-    [IO.Directory]::CreateDirectory($negativeRoot) | Out-Null
+    $titleRoot = Join-Path $Root $Title
+    Ensure-LockstepHostSelfTestDirectory $titleRoot `
+        'lockstep host self-test title directory'
+    $negativeRoot = Join-Path $titleRoot 'NegativeProbes'
+    Ensure-LockstepHostSelfTestDirectory $negativeRoot `
+        'lockstep host self-test negative-probe directory'
     $isCrossEpoch = $Mode -ceq 'negative-cross-epoch'
     $expectedError = if ($isCrossEpoch) {
         'UnsupportedEngineEpoch'
@@ -2307,9 +2450,9 @@ function New-SyntheticNegativeProbeEvidence {
         "process_id=$ProcessId"
         'END'
     ) -join "`n"
-    Write-AtomicText $proofPath ($proofText + "`n")
-    Write-AtomicText $stdoutPath ("LOCKSTEP_V2_NEGATIVE_PROBE_PASS mode=$Mode pid=$ProcessId rejection=$expectedError`n")
-    Write-AtomicText $stderrPath ''
+    Write-LockstepHostSelfTestText $proofPath ($proofText + "`n")
+    Write-LockstepHostSelfTestText $stdoutPath ("LOCKSTEP_V2_NEGATIVE_PROBE_PASS mode=$Mode pid=$ProcessId rejection=$expectedError`n")
+    Write-LockstepHostSelfTestText $stderrPath ''
     $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\') + '\'
     $entry = [ordered]@{
         title = $Title
@@ -2348,18 +2491,27 @@ function Invoke-SelfTest {
         (Test-LowerHex40 ('A' * 40))) {
         throw 'Lockstep-v2 host nonce/source lexical self-test failed.'
     }
-    $root = 'H:\GGC-LockstepV2HostSelfTest-' + [guid]::NewGuid().ToString('N')
-    [IO.Directory]::CreateDirectory($root) | Out-Null
+    # The production contract deliberately keeps installed qualification on
+    # task-owned H:. The host self-test itself must also run on hosted Windows
+    # runners where H: is not mounted, so its disposable fixture uses the OS
+    # temp volume. Test-SafeHDirectory admits only this exact, bounded root
+    # while -SelfTest is active; all production paths remain H:-only.
+    $root = Join-Path ([IO.Path]::GetTempPath()) `
+        ('GGC-LockstepV2HostSelfTest-' + [guid]::NewGuid().ToString('N'))
+    $script:LockstepHostSelfTestScratchRoot = [IO.Path]::GetFullPath($root).TrimEnd('\')
     try {
+        Ensure-LockstepHostSelfTestDirectory $root `
+            'lockstep host self-test root' -Fresh
         $runtime = Join-Path $root 'runtime'
-        [IO.Directory]::CreateDirectory($runtime) | Out-Null
+        Ensure-LockstepHostSelfTestDirectory $runtime `
+            'lockstep host self-test runtime' -Fresh
         $fixtureExecutable = Join-Path $runtime 'generalsv.exe'
         $fixtureLauncher = Join-Path $runtime 'launcher.exe'
         $fixtureConfig = Join-Path $runtime 'launcher.lcf'
-        [IO.File]::WriteAllText($fixtureExecutable, 'fixture executable')
-        [IO.File]::WriteAllText($fixtureLauncher, 'fixture launcher')
-        [IO.File]::WriteAllText($fixtureConfig,
-            'RUN = . generalsv.exe -simulationMode parallel -workerPolicy auto')
+        Write-LockstepHostSelfTestText $fixtureExecutable 'fixture executable'
+        Write-LockstepHostSelfTestText $fixtureLauncher 'fixture launcher'
+        Write-LockstepHostSelfTestText $fixtureConfig `
+            'RUN = . generalsv.exe -simulationMode parallel -workerPolicy auto'
         $launcher = Get-LauncherRunContract $fixtureConfig $fixtureLauncher $runtime `
             $fixtureExecutable ('A' * 64) ('B' * 64)
         if ($launcher.directory -cne '.' -or
@@ -2450,7 +2602,7 @@ function Invoke-SelfTest {
                 contentMismatch = @($syntheticContentGenerals, $syntheticContentZeroHour)
             }
         }
-        Write-AtomicText $adapterNativePath `
+        Write-LockstepHostSelfTestText $adapterNativePath `
             ($adapterNativeDocument | ConvertTo-Json -Depth 12)
         $adapter = New-LockstepV2FinalAcceptanceEnvelope `
             -NativeEvidencePath $adapterNativePath `
@@ -2487,11 +2639,10 @@ function Invoke-SelfTest {
         $originalTamperedProof = [IO.File]::ReadAllText($tamperedProofPath)
         $tamperRejected = $false
         try {
-            [IO.File]::WriteAllText($tamperedProofPath,
+            Write-LockstepHostSelfTestText $tamperedProofPath `
                 ($originalTamperedProof.Replace(
                     'observed_error=UnsupportedEngineEpoch',
-                    'observed_error=ContentHashMismatch')),
-                (New-Object Text.UTF8Encoding($false)))
+                    'observed_error=ContentHashMismatch'))
             try {
                 New-LockstepV2FinalAcceptanceEnvelope `
                     -NativeEvidencePath $adapterNativePath `
@@ -2504,8 +2655,7 @@ function Invoke-SelfTest {
             catch { $tamperRejected = $true }
         }
         finally {
-            [IO.File]::WriteAllText($tamperedProofPath, $originalTamperedProof,
-                (New-Object Text.UTF8Encoding($false)))
+            Write-LockstepHostSelfTestText $tamperedProofPath $originalTamperedProof
         }
         if (-not $tamperRejected) {
             throw 'Lockstep-v2 host self-test accepted a tampered negative raw proof.'
@@ -2564,7 +2714,8 @@ function Invoke-SelfTest {
         $cleanupRoot = Join-Path $root 'TitleSession'
         $cleanupContract = New-LockstepTitleSessionContract 'Generals' $cleanupRoot $runtime
         Initialize-LockstepTitleSessionDirectories $cleanupContract
-        [IO.File]::WriteAllText((Join-Path $cleanupContract.profileRoot 'transient.bin'), 'transient')
+        Write-LockstepHostSelfTestText `
+            (Join-Path $cleanupContract.profileRoot 'transient.bin') 'transient'
         $cleanupRan = $false
         try {
             try { throw 'synthetic qualification failure' }
@@ -2581,6 +2732,66 @@ function Invoke-SelfTest {
         if (Test-Path -LiteralPath $cleanupRoot) {
             throw 'Lockstep-v2 host self-test left disposable title-session directories behind.'
         }
+        # Exercise cleanup's no-reparse guard when junction creation is available.
+        $redirectTarget = Join-Path ([IO.Path]::GetTempPath()) `
+            ('GGC-LockstepV2RedirectTarget-' + [guid]::NewGuid().ToString('N'))
+        $redirectSentinel = Join-Path $redirectTarget 'sentinel.txt'
+        $cleanupRedirectParent = Join-Path $root 'Adversarial'
+        $cleanupRedirectRoot = Join-Path $cleanupRedirectParent 'TitleSession'
+        $cleanupRedirect = Join-Path $cleanupRedirectRoot 'Redirected'
+        try {
+            Assert-LockstepNoReparse (Split-Path -Parent $redirectTarget) `
+                'lockstep junction target parent'
+            New-Item -Path $redirectTarget -ItemType Directory `
+                -ErrorAction Stop | Out-Null
+            Assert-LockstepNoReparse $redirectTarget 'lockstep junction target'
+            [IO.File]::WriteAllText($redirectSentinel, 'must-survive-cleanup',
+                (New-Object Text.UTF8Encoding($false)))
+            Assert-LockstepNoReparse $redirectSentinel 'lockstep junction target sentinel'
+            Ensure-LockstepHostSelfTestDirectory $cleanupRedirectParent 'adversarial cleanup parent'
+            Ensure-LockstepHostSelfTestDirectory $cleanupRedirectRoot 'adversarial cleanup root'
+            $junctionCreated = Try-NewLockstepDirectoryJunction `
+                $cleanupRedirect $redirectTarget
+            if ($junctionCreated) {
+                $cleanupRejected = $false
+                try {
+                    Remove-LockstepTitleSessionDirectories `
+                        ([pscustomobject]@{ sessionRoot = $cleanupRedirectRoot }) $root
+                }
+                catch { $cleanupRejected = $true }
+                if (-not $cleanupRejected) {
+                    throw 'Lockstep-v2 host cleanup followed a reparse child.'
+                }
+                if (-not (Test-Path -LiteralPath $redirectSentinel -PathType Leaf) -or
+                    [IO.File]::ReadAllText($redirectSentinel) -cne
+                        'must-survive-cleanup') {
+                    throw 'Lockstep-v2 host cleanup touched a redirected target.'
+                }
+                Remove-LockstepDirectoryJunction $cleanupRedirect
+            }
+            Remove-LockstepTitleSessionDirectories `
+                ([pscustomobject]@{ sessionRoot = $cleanupRedirectRoot }) $root
+            if ($null -ne (Get-LockstepItemIfPresent $cleanupRedirectRoot)) {
+                throw 'Lockstep-v2 host self-test left the adversarial cleanup root.'
+            }
+        }
+        finally {
+            $linkItem = Get-LockstepItemIfPresent $cleanupRedirect
+            if ($null -ne $linkItem -and
+                ($linkItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                Remove-LockstepDirectoryJunction $cleanupRedirect
+            }
+            foreach ($cleanupPath in @($cleanupRedirectParent, $redirectTarget)) {
+                if ($null -ne (Get-LockstepItemIfPresent $cleanupPath)) {
+                    if ($cleanupPath -eq $redirectTarget) {
+                        Remove-LockstepHostSelfTestTree $cleanupPath $null
+                    }
+                    else {
+                        Remove-LockstepHostSelfTestTree $cleanupPath $root
+                    }
+                }
+            }
+        }
         $stdoutProof = Get-LockstepStdoutProof `
             "LOCKSTEP_V2_VALIDATION_ACTIVE peer=0 frame_limit=4096`nLOCKSTEP_V2_VALIDATION_PASS peer=0 pid=1 frame=4096 crc=00000001`n" 0
         if (-not $stdoutProof.executableOrigin -or $stdoutProof.pid -ne 1 -or
@@ -2592,7 +2803,7 @@ function Invoke-SelfTest {
             'RUN = child generalsv.exe -simulationMode parallel -workerPolicy auto',
             'RUN = . generalsv.exe -unsupported value')
         foreach ($badLine in $negativeLauncherCases) {
-            [IO.File]::WriteAllText($fixtureConfig, $badLine)
+            Write-LockstepHostSelfTestText $fixtureConfig $badLine
             $rejected = $false
             try {
                 [void](Get-LauncherRunContract $fixtureConfig $fixtureLauncher $runtime `
@@ -2605,7 +2816,7 @@ function Invoke-SelfTest {
         }
         $receiptPath = Join-Path $root 'synthetic.receipt'
         $text = New-SyntheticReceiptText
-        [IO.File]::WriteAllText($receiptPath, $text, (New-Object Text.UTF8Encoding($false)))
+        Write-LockstepHostSelfTestText $receiptPath $text
         $parsed = Get-ReceiptPairs $receiptPath
         $pairs = $parsed.pairs
         if ($pairs['schema'] -cne '2' -or
@@ -2620,14 +2831,12 @@ function Invoke-SelfTest {
         $digest = Get-ReceiptCommandDigest $parsed
         $text = $text.Replace('checkpoint_128_command_digest=1',
             "checkpoint_128_command_digest=$digest")
-        [IO.File]::WriteAllText($receiptPath, $text,
-            (New-Object Text.UTF8Encoding($false)))
+        Write-LockstepHostSelfTestText $receiptPath $text
         $parsed = Get-ReceiptPairs $receiptPath
         $aiDigest = Get-ReceiptAIPlanningDigest $parsed
         $text = $text.Replace('ai_planning_digest=1',
             "ai_planning_digest=$aiDigest")
-        [IO.File]::WriteAllText($receiptPath, $text,
-            (New-Object Text.UTF8Encoding($false)))
+        Write-LockstepHostSelfTestText $receiptPath $text
         $parsed = Get-ReceiptPairs $receiptPath
         [void](Assert-LockstepV2Receipt $parsed 0 2 1 `
             '0123456789ABCDEF0123456789ABCDEF' `
@@ -2646,20 +2855,17 @@ function Invoke-SelfTest {
         $peerReceiptPath = Join-Path $root 'synthetic-peer.receipt'
         $peerText = New-SyntheticReceiptText -LocalSlot 1 -PhysicalWorkerCount 4 `
             -RunNonce 'FEDCBA9876543210FEDCBA9876543210'
-        [IO.File]::WriteAllText($peerReceiptPath, $peerText,
-            (New-Object Text.UTF8Encoding($false)))
+        Write-LockstepHostSelfTestText $peerReceiptPath $peerText
         $peerParsed = Get-ReceiptPairs $peerReceiptPath
         $peerDigest = Get-ReceiptCommandDigest $peerParsed
         $peerText = $peerText.Replace('checkpoint_128_command_digest=1',
             "checkpoint_128_command_digest=$peerDigest")
-        [IO.File]::WriteAllText($peerReceiptPath, $peerText,
-            (New-Object Text.UTF8Encoding($false)))
+        Write-LockstepHostSelfTestText $peerReceiptPath $peerText
         $peerParsed = Get-ReceiptPairs $peerReceiptPath
         $peerAIDigest = Get-ReceiptAIPlanningDigest $peerParsed
         $peerText = $peerText.Replace('ai_planning_digest=1',
             "ai_planning_digest=$peerAIDigest")
-        [IO.File]::WriteAllText($peerReceiptPath, $peerText,
-            (New-Object Text.UTF8Encoding($false)))
+        Write-LockstepHostSelfTestText $peerReceiptPath $peerText
         $peerParsed = Get-ReceiptPairs $peerReceiptPath
         [void](Assert-LockstepV2Receipt $peerParsed 1 2 1 `
             'FEDCBA9876543210FEDCBA9876543210' `
@@ -2677,7 +2883,7 @@ function Invoke-SelfTest {
             throw 'Lockstep-v2 host self-test accepted an explicit-two profile with four-worker telemetry.'
         }
         $mutated = $text.Replace($LockstepMagic, 'RTS_NET3_RECEIPT')
-        [IO.File]::WriteAllText($receiptPath, $mutated, (New-Object Text.UTF8Encoding($false)))
+        Write-LockstepHostSelfTestText $receiptPath $mutated
         $rejected = $false
         try { [void](Get-ReceiptPairs $receiptPath) } catch { $rejected = $true }
         if (-not $rejected) { throw 'Host parser accepted a v1 receipt magic.' }
@@ -2690,7 +2896,14 @@ function Invoke-SelfTest {
         Write-Output 'LOCKSTEP_V2_HOST_SELF_TEST_PASS'
     }
     finally {
-        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+        try {
+            if ($null -ne (Get-LockstepItemIfPresent $root)) {
+                Remove-LockstepHostSelfTestTree $root $root
+            }
+        }
+        finally {
+            $script:LockstepHostSelfTestScratchRoot = $null
+        }
     }
 }
 
