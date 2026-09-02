@@ -1,5 +1,6 @@
 #include "nativew3dbufferowner.h"
 
+#include <cstring>
 #include <limits.h>
 #include <new>
 
@@ -60,7 +61,8 @@ RenderResult UnbindNativeW3DBufferResources(NativeW3DResources *resources)
 
 NativeW3DBufferOwner::NativeW3DBufferOwner() :
 	m_resources(0), m_bindingGeneration(0), m_descriptor(), m_handle(),
-	m_staging(0),
+	m_deferredHandle(),
+	m_authoritative(0), m_authoritativeBytes(0), m_staging(0),
 	m_lockOffset(0), m_lockBytes(0),
 	m_lockMode(RENDER_BUFFER_UPDATE_PRESERVE), m_locked(false),
 	m_failedMutation(false)
@@ -89,11 +91,27 @@ RenderResult NativeW3DBufferOwner::Create(
 	m_resources = g_nativeW3DBufferResources;
 	m_bindingGeneration = g_nativeW3DBufferBindingGeneration;
 	m_descriptor = descriptor;
+	unsigned char *authoritative =
+		new(std::nothrow) unsigned char[descriptor.byteCount];
+	if (authoritative == 0)
+	{
+		m_resources = 0;
+		m_bindingGeneration = 0;
+		m_descriptor = BufferDescriptor();
+		m_failedMutation = true;
+		return RENDER_RESULT_OUT_OF_MEMORY;
+	}
+	memset(authoritative, 0, descriptor.byteCount);
 	GpuHandle created;
-	const RenderResult result = m_resources->CreateBuffer(m_descriptor, 0, 0,
-		&created);
+	// Establish a deterministic backend image before any partial PRESERVE lock.
+	// A dynamic D3D11 buffer created with null initial data has undefined bytes;
+	// the owner shadow alone cannot make untouched GPU bytes recoverable.  Seed
+	// the native allocation from the same zeroed authoritative image.
+	const RenderResult result = m_resources->CreateBuffer(m_descriptor,
+		authoritative, descriptor.byteCount, &created);
 	if (result != RENDER_RESULT_OK || !created.isValid())
 	{
+		delete[] authoritative;
 		m_resources = 0;
 		m_bindingGeneration = 0;
 		m_descriptor = BufferDescriptor();
@@ -101,6 +119,8 @@ RenderResult NativeW3DBufferOwner::Create(
 		return result == RENDER_RESULT_OK ? RENDER_RESULT_FAILED : result;
 	}
 	m_handle = created;
+	m_authoritative = authoritative;
+	m_authoritativeBytes = descriptor.byteCount;
 	m_failedMutation = false;
 	return RENDER_RESULT_OK;
 }
@@ -110,15 +130,46 @@ RenderResult NativeW3DBufferOwner::Reset()
 	ReleaseStaging();
 	RenderResult result = RENDER_RESULT_OK;
 	NativeW3DResources *resources = ActiveResources();
+	if (resources != 0 && m_deferredHandle.isValid() &&
+		resources->IsValid(m_deferredHandle) &&
+		!resources->Destroy(m_deferredHandle))
+	{
+		result = RENDER_RESULT_FAILED;
+	}
+	else if (resources != 0 && m_deferredHandle.isValid())
+	{
+		m_deferredHandle = GpuHandle();
+	}
 	if (resources != 0 && m_handle.isValid() &&
 		resources->IsValid(m_handle) && !resources->Destroy(m_handle))
 	{
 		result = RENDER_RESULT_FAILED;
 	}
+	else if (resources != 0 && m_handle.isValid())
+	{
+		m_handle = GpuHandle();
+	}
+	if (resources == 0)
+	{
+		// The registry has already been detached; it owns any remaining table
+		// cleanup, so the product owner can release its local references.
+		m_deferredHandle = GpuHandle();
+		m_handle = GpuHandle();
+	}
+	if (result != RENDER_RESULT_OK)
+	{
+		// Keep failed-destruction handles reachable for a later render-owner
+		// retry.  Clearing them here would strand live registry slots.
+		return result;
+	}
+	m_deferredHandle = GpuHandle();
 	m_handle = GpuHandle();
 	m_resources = 0;
 	m_bindingGeneration = 0;
 	m_descriptor = BufferDescriptor();
+	delete[] m_authoritative;
+	m_authoritative = 0;
+	m_authoritativeBytes = 0;
 	m_failedMutation = false;
 	return result;
 }
@@ -131,20 +182,47 @@ RenderResult NativeW3DBufferOwner::RecreateForDiscard()
 	{
 		return RENDER_RESULT_FAILED;
 	}
+	if (m_deferredHandle.isValid())
+	{
+		if (resources->IsValid(m_deferredHandle))
+		{
+			if (!resources->Destroy(m_deferredHandle))
+			{
+				return RENDER_RESULT_FAILED;
+			}
+		}
+		m_deferredHandle = GpuHandle();
+	}
 	const GpuHandle previous = m_handle;
+	unsigned char *zeroData = new(std::nothrow) unsigned char[
+		m_descriptor.byteCount];
+	if (zeroData == 0)
+	{
+		return RENDER_RESULT_OUT_OF_MEMORY;
+	}
+	memset(zeroData, 0, m_descriptor.byteCount);
 	GpuHandle replacement;
-	const RenderResult result = resources->CreateBuffer(m_descriptor, 0, 0,
-		&replacement);
+	const RenderResult result = resources->CreateBuffer(m_descriptor, zeroData,
+		m_descriptor.byteCount, &replacement);
+	delete[] zeroData;
 	if (result != RENDER_RESULT_OK || !replacement.isValid())
 	{
 		return result == RENDER_RESULT_OK ? RENDER_RESULT_FAILED : result;
 	}
 	if (!resources->Destroy(previous))
 	{
-		resources->Destroy(replacement);
+		// Destroying the old handle can fail after the replacement has already
+		// entered the resource table.  Keep that replacement reachable and retry
+		// its cleanup before allocating another one on the next DISCARD.
+		m_deferredHandle = replacement;
 		return RENDER_RESULT_FAILED;
 	}
 	m_handle = replacement;
+	if (m_authoritative != 0 && m_authoritativeBytes != 0)
+	{
+		memset(m_authoritative, 0, m_authoritativeBytes);
+	}
+	m_failedMutation = false;
 	return RENDER_RESULT_OK;
 }
 
@@ -157,6 +235,7 @@ RenderResult NativeW3DBufferOwner::Lock(size_t destinationOffset,
 	}
 	*data = 0;
 	NativeW3DResources *resources = ActiveResources();
+	ObserveAuthorityFailure(resources);
 	if (resources == 0 || !m_handle.isValid() || m_locked ||
 		!resources->IsValid(m_handle) || !IsSupportedUpdateMode(mode) ||
 		destinationOffset > m_descriptor.byteCount)
@@ -187,11 +266,25 @@ RenderResult NativeW3DBufferOwner::Lock(size_t destinationOffset,
 			return recreateResult;
 		}
 	}
-
 	unsigned char *staging = new(std::nothrow) unsigned char[byteCount];
 	if (staging == 0)
 	{
 		return RENDER_RESULT_OUT_OF_MEMORY;
+	}
+	if (mode == RENDER_BUFFER_UPDATE_DISCARD &&
+		m_authoritative != 0 && m_authoritativeBytes != 0)
+	{
+		// D3D discard invalidates the previous contents of the whole resource,
+		// not merely the caller's range. Seed the replacement image only after
+		// staging allocation succeeds; an allocation failure must not mutate the
+		// authoritative shadow before a write has been accepted.
+		memset(m_authoritative, 0, m_authoritativeBytes);
+	}
+	memset(staging, 0, byteCount);
+	if (mode != RENDER_BUFFER_UPDATE_DISCARD && m_authoritative != 0 &&
+		m_authoritativeBytes == m_descriptor.byteCount)
+	{
+		memcpy(staging, m_authoritative + destinationOffset, byteCount);
 	}
 	m_staging = staging;
 	m_lockOffset = destinationOffset;
@@ -209,6 +302,7 @@ RenderResult NativeW3DBufferOwner::Unlock()
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	NativeW3DResources *resources = ActiveResources();
+	ObserveAuthorityFailure(resources);
 	if (resources == 0 || m_staging == 0 ||
 		!m_handle.isValid() || !resources->IsValid(m_handle))
 	{
@@ -218,6 +312,11 @@ RenderResult NativeW3DBufferOwner::Unlock()
 	}
 	const RenderResult result = resources->UpdateBuffer(m_handle, m_staging,
 		m_lockBytes, m_lockOffset, m_lockMode);
+	if (result == RENDER_RESULT_OK && m_authoritative != 0 &&
+		m_authoritativeBytes == m_descriptor.byteCount)
+	{
+		memcpy(m_authoritative + m_lockOffset, m_staging, m_lockBytes);
+	}
 	ReleaseStaging();
 	m_failedMutation = result != RENDER_RESULT_OK;
 	return result;
@@ -233,6 +332,7 @@ RenderResult NativeW3DBufferOwner::AcquireVertexRange(unsigned int stride,
 	}
 	*validated = GpuHandle();
 	NativeW3DResources *resources = ActiveResources();
+	ObserveAuthorityFailure(resources);
 	if (resources == 0 || m_locked || m_failedMutation ||
 		!m_handle.isValid() || !resources->IsValid(m_handle))
 	{
@@ -257,6 +357,7 @@ RenderResult NativeW3DBufferOwner::AcquireIndexRange(RenderFormat format,
 	}
 	*validated = GpuHandle();
 	NativeW3DResources *resources = ActiveResources();
+	ObserveAuthorityFailure(resources);
 	if (resources == 0 || m_locked || m_failedMutation ||
 		!m_handle.isValid() || !resources->IsValid(m_handle))
 	{
@@ -280,7 +381,18 @@ bool NativeW3DBufferOwner::IsLocked() const
 
 bool NativeW3DBufferOwner::HasFailedMutation() const
 {
+	ObserveAuthorityFailure(ActiveResources());
 	return m_failedMutation;
+}
+
+void NativeW3DBufferOwner::ObserveAuthorityFailure(
+	NativeW3DResources *resources) const
+{
+	if (!m_failedMutation && resources != 0 && m_handle.isValid() &&
+		resources->HasBufferAuthorityFailure(m_handle))
+	{
+		m_failedMutation = true;
+	}
 }
 
 NativeW3DResources *NativeW3DBufferOwner::ActiveResources() const

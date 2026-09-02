@@ -23,6 +23,7 @@
 #include "LegacyTexturedFixed2PS.h"
 #include "LegacyTexturedPS.h"
 #include "LegacyTexturedVS.h"
+#include "LegacyTexturedUnweightedVS.h"
 
 #include <float.h>
 #include <limits.h>
@@ -41,6 +42,12 @@ const unsigned int STATE_CACHE_CAPACITY = 256;
 const unsigned int TRANSFORM_CONSTANT_BUFFER_COUNT = 64;
 const unsigned int TERRAIN_PIXEL_PROGRAM_COUNT = 8;
 const unsigned int LEGACY_VERTEX_LAYOUT_PRETRANSFORMED = 0x80000000U;
+// The low layout-flag bits retain the historical normal/diffuse/specular
+// contract. Weighted stream presence is carried in the high byte which is
+// published to the shader through VertexLayoutParameters.w.
+const unsigned int LEGACY_VERTEX_LAYOUT_BLEND_WEIGHT0 = 1U << 16;
+const unsigned int LEGACY_VERTEX_LAYOUT_BLEND_WEIGHT1 = 1U << 17;
+const unsigned int LEGACY_VERTEX_LAYOUT_BLEND_INDEX = 1U << 18;
 const unsigned int MAX_TEXTURE_REFRESH_SUBRESOURCES = 4096;
 const size_t MAX_TEXTURE_REFRESH_BYTES = 256U * 1024U * 1024U;
 
@@ -305,13 +312,18 @@ DXGI_FORMAT TranslateVertexDataFormat(LegacyVertexDataFormat format)
 	case RENDER_VERTEX_DATA_FLOAT3: return DXGI_FORMAT_R32G32B32_FLOAT;
 	case RENDER_VERTEX_DATA_FLOAT4: return DXGI_FORMAT_R32G32B32A32_FLOAT;
 	case RENDER_VERTEX_DATA_COLOR_BGRA8: return DXGI_FORMAT_B8G8R8A8_UNORM;
+	case RENDER_VERTEX_DATA_UBYTE4: return DXGI_FORMAT_R8G8B8A8_UINT;
+	// DXGI has no B8G8R8A8_UINT variant. LASTBETA_D3DCOLOR is a four-byte
+	// integer stream, so bind it as the byte-equivalent UINT declaration; the
+	// neutral decoder keeps the source spelling distinct from UBYTE4.
+	case RENDER_VERTEX_DATA_D3DCOLOR: return DXGI_FORMAT_R8G8B8A8_UINT;
 	default: return DXGI_FORMAT_UNKNOWN;
 	}
 }
 
 unsigned int VertexDataByteCount(LegacyVertexDataFormat format)
 {
-	static const unsigned int sizes[] = { 4, 8, 12, 16, 4 };
+	static const unsigned int sizes[] = { 4, 8, 12, 16, 4, 4, 4 };
 	return static_cast<unsigned int>(format) <
 		static_cast<unsigned int>(sizeof(sizes) / sizeof(sizes[0])) ?
 		sizes[format] : 0;
@@ -337,6 +349,25 @@ bool EqualVertexLayouts(const LegacyVertexLayout &left,
 		}
 	}
 	return true;
+}
+
+bool HasBlendVertexSemantics(const LegacyVertexLayout &layout)
+{
+	for (unsigned int index = 0; index < layout.elementCount; ++index)
+	{
+		if (layout.elements[index].semantic == RENDER_VERTEX_SEMANTIC_BLEND_WEIGHT ||
+			layout.elements[index].semantic == RENDER_VERTEX_SEMANTIC_BLEND_INDEX)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+bool FitsVertexStride(const LegacyVertexLayout &layout, unsigned int offset,
+	unsigned int byteCount)
+{
+	return offset <= layout.stride && byteCount <= layout.stride - offset;
 }
 
 struct ResourceSlot
@@ -515,6 +546,7 @@ public:
 		m_activeColorResource(0), m_activeDepthResource(0),
 		m_vertexShader(0), m_pixelShader(0), m_positionColorLayout(0),
 		m_texturedVertexShader(0), m_texturedPixelShader(0),
+		m_texturedUnweightedVertexShader(0),
 		m_texturedFixed1PixelShader(0), m_texturedFixed2PixelShader(0),
 		m_waterFlatPixelShader(0), m_waterRiverPixelShader(0),
 		m_seaWaveVertexShader(0), m_seaWavePixelShader(0),
@@ -2289,9 +2321,14 @@ public:
 			}
 		}
 
+		const bool weightedVertexInput = (vertexLayoutFlags &
+			(LEGACY_VERTEX_LAYOUT_BLEND_WEIGHT0 |
+			 LEGACY_VERTEX_LAYOUT_BLEND_WEIGHT1 |
+			 LEGACY_VERTEX_LAYOUT_BLEND_INDEX)) != 0U;
 		ID3D11VertexShader *vertexShader = useSeaWavePipeline ?
 			m_seaWaveVertexShader : (useFullPipeline ?
-			m_texturedVertexShader : m_vertexShader);
+			(weightedVertexInput ? m_texturedVertexShader :
+			 m_texturedUnweightedVertexShader) : m_vertexShader);
 		ID3D11PixelShader *pixelShader = useSeaWavePipeline ?
 			m_seaWavePixelShader : (useFullPipeline ?
 			m_texturedPixelShader : m_pixelShader);
@@ -2459,6 +2496,19 @@ public:
 			case RENDER_VERTEX_SEMANTIC_NORMAL: layoutFlags |= 1U; break;
 			case RENDER_VERTEX_SEMANTIC_DIFFUSE: layoutFlags |= 2U; break;
 			case RENDER_VERTEX_SEMANTIC_SPECULAR: layoutFlags |= 4U; break;
+			case RENDER_VERTEX_SEMANTIC_BLEND_WEIGHT:
+				if (vertexLayout.elements[index].semanticIndex == 0U)
+				{
+					layoutFlags |= LEGACY_VERTEX_LAYOUT_BLEND_WEIGHT0;
+				}
+				else if (vertexLayout.elements[index].semanticIndex == 1U)
+				{
+					layoutFlags |= LEGACY_VERTEX_LAYOUT_BLEND_WEIGHT1;
+				}
+				break;
+			case RENDER_VERTEX_SEMANTIC_BLEND_INDEX:
+				layoutFlags |= LEGACY_VERTEX_LAYOUT_BLEND_INDEX;
+				break;
 			case RENDER_VERTEX_SEMANTIC_TEXTURE_COORDINATE:
 				layoutFlags |= 1U << (8 +
 					vertexLayout.elements[index].semanticIndex);
@@ -3347,6 +3397,13 @@ private:
 		}
 		result = m_device->CreateVertexShader(g_LegacyTexturedVS,
 			sizeof(g_LegacyTexturedVS), 0, &m_texturedVertexShader);
+		if (FAILED(result))
+		{
+			return result;
+		}
+		result = m_device->CreateVertexShader(g_LegacyTexturedUnweightedVS,
+			sizeof(g_LegacyTexturedUnweightedVS), 0,
+			&m_texturedUnweightedVertexShader);
 		if (FAILED(result))
 		{
 			return result;
@@ -4401,12 +4458,15 @@ private:
 		{
 			return E_OUTOFMEMORY;
 		}
+		const bool weightedVertexInput = HasBlendVertexSemantics(descriptor);
 		D3D11_INPUT_ELEMENT_DESC nativeElements[
-			LegacyVertexLayout::MAX_ELEMENT_COUNT + LEGACY_TEXTURE_STAGE_COUNT + 3];
+			LegacyVertexLayout::MAX_ELEMENT_COUNT + LEGACY_TEXTURE_STAGE_COUNT + 6];
 		bool hasPosition = false;
 		bool hasNormal = false;
 		bool hasDiffuse = false;
 		bool hasSpecular = false;
+		bool hasBlendWeight[2] = { false, false };
+		bool hasBlendIndex = false;
 		bool hasTextureCoordinate[LEGACY_TEXTURE_STAGE_COUNT] = { false };
 		unsigned int positionOffset = 0;
 		for (unsigned int index = 0; index < descriptor.elementCount; ++index)
@@ -4462,6 +4522,28 @@ private:
 				semanticName = "COLOR";
 				semanticIndex = 1;
 				break;
+			case RENDER_VERTEX_SEMANTIC_BLEND_WEIGHT:
+				if (semanticIndex >= 2U || hasBlendWeight[semanticIndex] ||
+					(element.format != RENDER_VERTEX_DATA_FLOAT1 &&
+					 element.format != RENDER_VERTEX_DATA_FLOAT2 &&
+					 element.format != RENDER_VERTEX_DATA_FLOAT3 &&
+					 element.format != RENDER_VERTEX_DATA_FLOAT4))
+				{
+					return E_INVALIDARG;
+				}
+				hasBlendWeight[semanticIndex] = true;
+				semanticName = "BLENDWEIGHT";
+				break;
+			case RENDER_VERTEX_SEMANTIC_BLEND_INDEX:
+				if (hasBlendIndex || semanticIndex != 0U ||
+					(element.format != RENDER_VERTEX_DATA_UBYTE4 &&
+					 element.format != RENDER_VERTEX_DATA_D3DCOLOR))
+				{
+					return E_INVALIDARG;
+				}
+				hasBlendIndex = true;
+				semanticName = "BLENDINDICES";
+				break;
 			case RENDER_VERTEX_SEMANTIC_TEXTURE_COORDINATE:
 				if (semanticIndex >= LEGACY_TEXTURE_STAGE_COUNT ||
 					hasTextureCoordinate[semanticIndex] ||
@@ -4486,6 +4568,10 @@ private:
 			nativeElements[index].SemanticName = semanticName;
 			nativeElements[index].SemanticIndex = semanticIndex;
 			nativeElements[index].Format = TranslateVertexDataFormat(element.format);
+			if (nativeElements[index].Format == DXGI_FORMAT_UNKNOWN)
+			{
+				return E_INVALIDARG;
+			}
 			nativeElements[index].InputSlot = 0;
 			nativeElements[index].AlignedByteOffset = element.byteOffset;
 			nativeElements[index].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
@@ -4498,6 +4584,10 @@ private:
 		unsigned int nativeElementCount = descriptor.elementCount;
 		if (!hasNormal)
 		{
+			if (!FitsVertexStride(descriptor, positionOffset, 3U * sizeof(float)))
+			{
+				return E_INVALIDARG;
+			}
 			D3D11_INPUT_ELEMENT_DESC &element =
 				nativeElements[nativeElementCount++];
 			element.SemanticName = "NORMAL";
@@ -4510,6 +4600,10 @@ private:
 		}
 		if (!hasDiffuse)
 		{
+			if (!FitsVertexStride(descriptor, positionOffset, 3U * sizeof(float)))
+			{
+				return E_INVALIDARG;
+			}
 			D3D11_INPUT_ELEMENT_DESC &element =
 				nativeElements[nativeElementCount++];
 			element.SemanticName = "COLOR";
@@ -4522,6 +4616,10 @@ private:
 		}
 		if (!hasSpecular)
 		{
+			if (!FitsVertexStride(descriptor, positionOffset, 3U * sizeof(float)))
+			{
+				return E_INVALIDARG;
+			}
 			D3D11_INPUT_ELEMENT_DESC &element =
 				nativeElements[nativeElementCount++];
 			element.SemanticName = "COLOR";
@@ -4532,11 +4630,68 @@ private:
 			element.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
 			element.InstanceDataStepRate = 0;
 		}
+		if (weightedVertexInput)
+		{
+			if (!hasBlendWeight[0])
+			{
+				if (!FitsVertexStride(descriptor, positionOffset,
+					4U * sizeof(float)))
+				{
+					return E_INVALIDARG;
+				}
+				D3D11_INPUT_ELEMENT_DESC &element =
+					nativeElements[nativeElementCount++];
+				element.SemanticName = "BLENDWEIGHT";
+				element.SemanticIndex = 0;
+				element.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+				element.InputSlot = 0;
+				element.AlignedByteOffset = positionOffset;
+				element.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+				element.InstanceDataStepRate = 0;
+			}
+			if (!hasBlendWeight[1])
+			{
+				if (!FitsVertexStride(descriptor, positionOffset, sizeof(float)))
+				{
+					return E_INVALIDARG;
+				}
+				D3D11_INPUT_ELEMENT_DESC &element =
+					nativeElements[nativeElementCount++];
+				element.SemanticName = "BLENDWEIGHT";
+				element.SemanticIndex = 1;
+				element.Format = DXGI_FORMAT_R32_FLOAT;
+				element.InputSlot = 0;
+				element.AlignedByteOffset = positionOffset;
+				element.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+				element.InstanceDataStepRate = 0;
+			}
+			if (!hasBlendIndex)
+			{
+				if (!FitsVertexStride(descriptor, positionOffset, sizeof(unsigned int)))
+				{
+					return E_INVALIDARG;
+				}
+				D3D11_INPUT_ELEMENT_DESC &element =
+					nativeElements[nativeElementCount++];
+				element.SemanticName = "BLENDINDICES";
+				element.SemanticIndex = 0;
+				element.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+				element.InputSlot = 0;
+				element.AlignedByteOffset = positionOffset;
+				element.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+				element.InstanceDataStepRate = 0;
+			}
+		}
 		for (unsigned int coordinate = 0;
 			coordinate < LEGACY_TEXTURE_STAGE_COUNT; ++coordinate)
 		{
 			if (!hasTextureCoordinate[coordinate])
 			{
+				if (!FitsVertexStride(descriptor, positionOffset,
+					3U * sizeof(float)))
+				{
+					return E_INVALIDARG;
+				}
 				D3D11_INPUT_ELEMENT_DESC &element =
 					nativeElements[nativeElementCount++];
 				element.SemanticName = "TEXCOORD";
@@ -4552,9 +4707,14 @@ private:
 		entry.descriptor = descriptor;
 		entry.layout = 0;
 		entry.lastUsedSerial = nextStateUseSerial();
+		const void *vertexShaderBytecode = weightedVertexInput ?
+			static_cast<const void *>(g_LegacyTexturedVS) :
+			static_cast<const void *>(g_LegacyTexturedUnweightedVS);
+		const size_t vertexShaderBytecodeSize = weightedVertexInput ?
+			sizeof(g_LegacyTexturedVS) : sizeof(g_LegacyTexturedUnweightedVS);
 		HRESULT result = m_device->CreateInputLayout(nativeElements,
-			nativeElementCount, g_LegacyTexturedVS,
-			sizeof(g_LegacyTexturedVS), &entry.layout);
+			nativeElementCount, vertexShaderBytecode, vertexShaderBytecodeSize,
+			&entry.layout);
 		if (FAILED(result))
 		{
 			return result;
@@ -4881,6 +5041,11 @@ private:
 			m_texturedVertexShader->Release();
 			m_texturedVertexShader = 0;
 		}
+		if (m_texturedUnweightedVertexShader != 0)
+		{
+			m_texturedUnweightedVertexShader->Release();
+			m_texturedUnweightedVertexShader = 0;
+		}
 		if (m_waterRiverPixelShader != 0)
 		{
 			m_waterRiverPixelShader->Release();
@@ -4977,6 +5142,7 @@ private:
 	ID3D11PixelShader *m_pixelShader;
 	ID3D11InputLayout *m_positionColorLayout;
 	ID3D11VertexShader *m_texturedVertexShader;
+	ID3D11VertexShader *m_texturedUnweightedVertexShader;
 	ID3D11PixelShader *m_texturedPixelShader;
 	ID3D11PixelShader *m_texturedFixed1PixelShader;
 	ID3D11PixelShader *m_texturedFixed2PixelShader;

@@ -1,5 +1,6 @@
 #include "Renderer/NativeW3DResources.h"
 #include "Renderer/ThreadedRenderDevice.h"
+#include "nativew3dbufferowner.h"
 #include "nativew3d2.h"
 
 #include <cstdio>
@@ -845,6 +846,113 @@ int TestThreadedResourceCompletion()
 	delete device;
 	return result;
 }
+
+int TestThreadedNativeBufferOwnerFailureRecovery()
+{
+	int result = 0;
+	FakeRenderControl control;
+	ThreadedRenderOptions options;
+	options.serial = false;
+	options.maxFramesInFlight = 2;
+	options.maxPacketBytes = 1024 * 1024;
+	options.maxPacketCommands = 128;
+	options.resourceCapacity = 4;
+	IRenderDevice *device = CreateThreadedRenderDevice(
+		CreateThreadedFakeRenderDevice, &control, options);
+	result |= Check(device != 0,
+		"threaded native owner fixture allocates its device");
+	if (device == 0)
+	{
+		return result;
+	}
+	RenderDeviceParameters parameters;
+	parameters.backend = RENDER_BACKEND_D3D11;
+	parameters.window = reinterpret_cast<void *>(1);
+	parameters.width = 4;
+	parameters.height = 4;
+	result |= Check(device->initialize(parameters) == RENDER_RESULT_OK,
+		"threaded native owner fixture initializes its render owner");
+	if (!device->isOperational())
+	{
+		delete device;
+		return result;
+	}
+
+	NativeW3DResourceHost host(8);
+	NativeW3DResources resources(4);
+	result |= Check(host.Attach(device, device->immediateContext()) ==
+		RENDER_RESULT_OK && resources.BindHost(&host) == RENDER_RESULT_OK &&
+		BindNativeW3DBufferResources(&resources) == RENDER_RESULT_OK,
+		"threaded native owner fixture binds one resource host");
+
+	BufferDescriptor descriptor;
+	descriptor.byteCount = 16;
+	descriptor.stride = 4;
+	descriptor.binding = RENDER_BUFFER_VERTEX;
+	descriptor.usage = RENDER_USAGE_DYNAMIC;
+	NativeW3DBufferOwner owner;
+	void *bytes = 0;
+	result |= Check(owner.Create(descriptor) == RENDER_RESULT_OK,
+		"threaded native owner publishes its dynamic buffer");
+	IRenderContext *context = device->immediateContext();
+	InterlockedExchange(&control.failUpdate, 1);
+	unsigned char failedImage[16];
+	std::memset(failedImage, 0x51, sizeof(failedImage));
+	result |= Check(context->beginFrame() == RENDER_RESULT_OK &&
+		owner.Lock(0, sizeof(failedImage), RENDER_BUFFER_UPDATE_DISCARD,
+			&bytes) == RENDER_RESULT_OK && bytes != 0,
+		"threaded owner accepts an in-frame discard before completion");
+	if (bytes != 0)
+	{
+		std::memcpy(bytes, failedImage, sizeof(failedImage));
+	}
+	result |= Check(owner.Unlock() == RENDER_RESULT_OK &&
+		context->endFrame() == RENDER_RESULT_OK &&
+		SubmitThreadedRenderFrame(device, false) == RENDER_RESULT_OK &&
+		DrainThreadedRenderDevice(device) == RENDER_RESULT_FAILED,
+		"threaded owner exposes an asynchronous upload failure at completion");
+	ThreadedRenderFrameCompletion completion;
+	result |= Check(PollThreadedRenderCompletion(device, &completion) &&
+		completion.resourceFailure &&
+		resources.PublishThreadedCompletion(completion.sequence, true) ==
+			RENDER_RESULT_OK && owner.HasFailedMutation() &&
+		!owner.IsLocked(),
+		"failed threaded publication latches the direct owner authority");
+	bytes = reinterpret_cast<void *>(1);
+	result |= Check(owner.Lock(0, sizeof(failedImage),
+		RENDER_BUFFER_UPDATE_PRESERVE, &bytes) == RENDER_RESULT_FAILED &&
+		bytes == 0,
+		"failed threaded authority rejects stale preserve bytes");
+
+	InterlockedExchange(&control.failUpdate, 0);
+	result |= Check(device->recoverDevice() == RENDER_RESULT_OK &&
+		host.ReplaceContext(device->immediateContext()) == RENDER_RESULT_OK &&
+		resources.RestoreStaticBuffersAfterRecovery() == RENDER_RESULT_OK,
+		"threaded native owner fixture restores the backend before discard");
+	bytes = 0;
+	result |= Check(owner.Lock(0, sizeof(failedImage),
+		RENDER_BUFFER_UPDATE_DISCARD, &bytes) == RENDER_RESULT_OK &&
+		bytes != 0 && !owner.HasFailedMutation(),
+		"explicit discard recreates the failed threaded owner");
+	if (bytes != 0)
+	{
+		std::memset(bytes, 0x61, sizeof(failedImage));
+	}
+	GpuHandle validated;
+	result |= Check(owner.Unlock() == RENDER_RESULT_OK &&
+		owner.AcquireVertexRange(4, 0, 0, 4, &validated) ==
+			RENDER_RESULT_OK && validated.isValid() &&
+		!owner.HasFailedMutation(),
+		"discard recovery republishes a valid direct owner range");
+	result |= Check(owner.Reset() == RENDER_RESULT_OK &&
+		UnbindNativeW3DBufferResources(&resources) == RENDER_RESULT_OK &&
+		resources.Shutdown() == RENDER_RESULT_OK &&
+		host.Detach() == RENDER_RESULT_OK,
+		"threaded native owner fixture releases its recovered allocation");
+	device->shutdown();
+	delete device;
+	return result;
+}
 }
 
 int main()
@@ -1391,5 +1499,6 @@ int main()
 		device.LiveCount() == 0 && device.isOperational(),
 		"public borrowed shutdown succeeds after EndFrame and product cleanup preserves backend ownership");
 	result |= TestThreadedResourceCompletion();
+	result |= TestThreadedNativeBufferOwnerFailureRecovery();
 	return result;
 }

@@ -47,6 +47,7 @@
 #include "WWDebug/wwmemlog.h"
 #if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
 #include "nativew3dbufferowner.h"
+#include "dx8nativecompat.h"
 #endif
 
 static bool Use_Vertex_Range_Lock(unsigned int first_vertex,
@@ -84,28 +85,8 @@ static int _VertexBufferTotalSize;
 static bool Get_Native_Buffer_Update_Mode(int flags,
 	rts::render::RenderBufferUpdateMode *mode)
 {
-	const unsigned int supported_flags = D3DLOCK_DISCARD |
-		D3DLOCK_NOOVERWRITE | D3DLOCK_NOSYSLOCK;
-	if (mode == nullptr ||
-		(static_cast<unsigned int>(flags) & ~supported_flags) != 0 ||
-		((flags & D3DLOCK_DISCARD) != 0 &&
-		 (flags & D3DLOCK_NOOVERWRITE) != 0))
-	{
-		return false;
-	}
-	if ((flags & D3DLOCK_DISCARD) != 0)
-	{
-		*mode = rts::render::RENDER_BUFFER_UPDATE_DISCARD;
-	}
-	else if ((flags & D3DLOCK_NOOVERWRITE) != 0)
-	{
-		*mode = rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE;
-	}
-	else
-	{
-		*mode = rts::render::RENDER_BUFFER_UPDATE_PRESERVE;
-	}
-	return true;
+	return Decode_Native_Buffer_Update_Mode(
+		static_cast<unsigned int>(flags), mode);
 }
 #endif
 
@@ -480,7 +461,7 @@ DX8VertexBufferClass::DX8VertexBufferClass(
 	unsigned short VertexCount,
 	UsageType usage)
 	:
-	VertexBufferClass(BUFFER_TYPE_DX8, D3DFVF_XYZ|D3DFVF_TEX1|D3DFVF_NORMAL, VertexCount),
+	VertexBufferClass(BUFFER_TYPE_DX8, DX8_FVF_XYZNUV1, VertexCount),
 #if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
 	NativeBuffer(nullptr)
 #else
@@ -514,7 +495,7 @@ DX8VertexBufferClass::DX8VertexBufferClass(
 	unsigned short VertexCount,
 	UsageType usage)
 	:
-	VertexBufferClass(BUFFER_TYPE_DX8, D3DFVF_XYZ|D3DFVF_TEX1|D3DFVF_NORMAL|D3DFVF_DIFFUSE, VertexCount),
+	VertexBufferClass(BUFFER_TYPE_DX8, DX8_FVF_XYZNDUV1, VertexCount),
 #if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
 	NativeBuffer(nullptr)
 #else
@@ -548,7 +529,7 @@ DX8VertexBufferClass::DX8VertexBufferClass(
 	unsigned short VertexCount,
 	UsageType usage)
 	:
-	VertexBufferClass(BUFFER_TYPE_DX8, D3DFVF_XYZ|D3DFVF_TEX1|D3DFVF_DIFFUSE, VertexCount),
+	VertexBufferClass(BUFFER_TYPE_DX8, DX8_FVF_XYZDUV1, VertexCount),
 #if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
 	NativeBuffer(nullptr)
 #else
@@ -580,7 +561,7 @@ DX8VertexBufferClass::DX8VertexBufferClass(
 	unsigned short VertexCount,
 	UsageType usage)
 	:
-	VertexBufferClass(BUFFER_TYPE_DX8, D3DFVF_XYZ|D3DFVF_TEX1, VertexCount),
+	VertexBufferClass(BUFFER_TYPE_DX8, DX8_FVF_XYZUV1, VertexCount),
 #if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
 	NativeBuffer(nullptr)
 #else
@@ -678,16 +659,25 @@ bool DX8VertexBufferClass::Unlock_Buffer()
 	return changed;
 }
 
-HRESULT DX8VertexBufferClass::Lock(UINT byte_offset, UINT byte_count,
-	unsigned char **data, DWORD flags)
+long DX8VertexBufferClass::Lock(unsigned int byte_offset,
+	unsigned int byte_count, unsigned char **data, unsigned long flags)
 {
+	#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	return Lock_Buffer(byte_offset, byte_count, static_cast<int>(flags),
+		reinterpret_cast<void **>(data)) ? 0L : -1L;
+	#else
 	return Lock_Buffer(byte_offset, byte_count, flags,
 		reinterpret_cast<void **>(data)) ? D3D_OK : E_FAIL;
+	#endif
 }
 
-HRESULT DX8VertexBufferClass::Unlock()
+long DX8VertexBufferClass::Unlock()
 {
+	#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	return Unlock_Buffer() ? 0L : -1L;
+	#else
 	return Unlock_Buffer() ? D3D_OK : E_FAIL;
+	#endif
 }
 
 // ----------------------------------------------------------------------------
@@ -1259,10 +1249,24 @@ DynamicVBAccessClass::WriteLockClass::WriteLockClass(DynamicVBAccessClass* dynam
 	DynamicVBAccess(dynamic_vb_access_), Vertices(nullptr), Locked(false)
 {
 	DX8_THREAD_ASSERT();
-	if (DynamicVBAccess == nullptr || !DynamicVBAccess->Is_Valid())
+	if (DynamicVBAccess == nullptr)
 	{
 		return;
 	}
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	// A failed publication marks the owner invalid, but a zero-offset discard
+	// is the explicit recovery path. Keep the wrapper alive long enough for
+	// Lock_Native_Buffer to recreate that owner generation.
+	if (DynamicVBAccess->VertexBuffer == nullptr)
+	{
+		return;
+	}
+#else
+	if (!DynamicVBAccess->Is_Valid())
+	{
+		return;
+	}
+#endif
 	switch (DynamicVBAccess->Get_Type()) {
 	case BUFFER_TYPE_DYNAMIC_DX8:
 #ifdef VERTEX_BUFFER_LOG
@@ -1290,8 +1294,9 @@ DynamicVBAccessClass::WriteLockClass::WriteLockClass(DynamicVBAccessClass* dynam
 					_DynamicDX8VertexBuffer->FVF_Info().Get_FVF_Size(),
 				static_cast<size_t>(DynamicVBAccess->Get_Vertex_Count()) *
 					DynamicVBAccess->VertexBuffer->FVF_Info().Get_FVF_Size(),
-				D3DLOCK_NOSYSLOCK | (!DynamicVBAccess->VertexBufferOffset ?
-					D3DLOCK_DISCARD : D3DLOCK_NOOVERWRITE),
+				NATIVE_BUFFER_LOCK_NO_SYSTEM_LOCK |
+					(!DynamicVBAccess->VertexBufferOffset ?
+					NATIVE_BUFFER_LOCK_DISCARD : NATIVE_BUFFER_LOCK_NO_OVERWRITE),
 				reinterpret_cast<void **>(&Vertices));
 #else
 		{
@@ -1299,7 +1304,8 @@ DynamicVBAccessClass::WriteLockClass::WriteLockClass(DynamicVBAccessClass* dynam
 				DynamicVBAccess->VertexBufferOffset*_DynamicDX8VertexBuffer->FVF_Info().Get_FVF_Size(),
 				DynamicVBAccess->Get_Vertex_Count()*DynamicVBAccess->VertexBuffer->FVF_Info().Get_FVF_Size(),
 				(unsigned char**)&Vertices,
-				D3DLOCK_NOSYSLOCK | (!DynamicVBAccess->VertexBufferOffset ? D3DLOCK_DISCARD : D3DLOCK_NOOVERWRITE));
+				D3DLOCK_NOSYSLOCK | (!DynamicVBAccess->VertexBufferOffset ?
+					D3DLOCK_DISCARD : D3DLOCK_NOOVERWRITE));
 			DX8_ErrorCode(result);
 			Locked = SUCCEEDED(result);
 		}
@@ -1332,9 +1338,15 @@ bool DynamicVBAccessClass::WriteLockClass::Commit()
 	{
 		return false;
 	}
+	#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	const unsigned int change_flags =
+		!DynamicVBAccess->VertexBufferOffset ?
+			NATIVE_BUFFER_LOCK_DISCARD : NATIVE_BUFFER_LOCK_NO_OVERWRITE;
+	#else
 	const unsigned int change_flags =
 		!DynamicVBAccess->VertexBufferOffset ?
 			D3DLOCK_DISCARD : D3DLOCK_NOOVERWRITE;
+	#endif
 	bool changed = Locked;
 	switch (DynamicVBAccess->Get_Type()) {
 	case BUFFER_TYPE_DYNAMIC_DX8:

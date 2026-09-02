@@ -46,6 +46,7 @@
 #include "WWDebug/wwmemlog.h"
 #if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
 #include "nativew3dbufferowner.h"
+#include "dx8nativecompat.h"
 #endif
 
 #define DEFAULT_IB_SIZE 5000
@@ -78,28 +79,8 @@ static bool Use_Index_Range_Lock(unsigned int first_index,
 static bool Get_Native_Buffer_Update_Mode(int flags,
 	rts::render::RenderBufferUpdateMode *mode)
 {
-	const unsigned int supported_flags = D3DLOCK_DISCARD |
-		D3DLOCK_NOOVERWRITE | D3DLOCK_NOSYSLOCK;
-	if (mode == nullptr ||
-		(static_cast<unsigned int>(flags) & ~supported_flags) != 0 ||
-		((flags & D3DLOCK_DISCARD) != 0 &&
-		 (flags & D3DLOCK_NOOVERWRITE) != 0))
-	{
-		return false;
-	}
-	if ((flags & D3DLOCK_DISCARD) != 0)
-	{
-		*mode = rts::render::RENDER_BUFFER_UPDATE_DISCARD;
-	}
-	else if ((flags & D3DLOCK_NOOVERWRITE) != 0)
-	{
-		*mode = rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE;
-	}
-	else
-	{
-		*mode = rts::render::RENDER_BUFFER_UPDATE_PRESERVE;
-	}
-	return true;
+	return Decode_Native_Buffer_Update_Mode(
+		static_cast<unsigned int>(flags), mode);
 }
 #endif
 
@@ -627,16 +608,25 @@ bool DX8IndexBufferClass::Unlock_Buffer()
 	return changed;
 }
 
-HRESULT DX8IndexBufferClass::Lock(UINT byte_offset, UINT byte_count,
-	unsigned char **data, DWORD flags)
+long DX8IndexBufferClass::Lock(unsigned int byte_offset,
+	unsigned int byte_count, unsigned char **data, unsigned long flags)
 {
+	#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	return Lock_Buffer(byte_offset, byte_count, static_cast<int>(flags),
+		reinterpret_cast<void **>(data)) ? 0L : -1L;
+	#else
 	return Lock_Buffer(byte_offset, byte_count, flags,
 		reinterpret_cast<void **>(data)) ? D3D_OK : E_FAIL;
+	#endif
 }
 
-HRESULT DX8IndexBufferClass::Unlock()
+long DX8IndexBufferClass::Unlock()
 {
+	#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	return Unlock_Buffer() ? 0L : -1L;
+	#else
 	return Unlock_Buffer() ? D3D_OK : E_FAIL;
+	#endif
 }
 
 #if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
@@ -772,10 +762,24 @@ DynamicIBAccessClass::WriteLockClass::WriteLockClass(DynamicIBAccessClass* ib_ac
 	DynamicIBAccess(ib_access_), Indices(nullptr), Locked(false), Referenced(false)
 {
 	DX8_THREAD_ASSERT();
-	if (DynamicIBAccess == nullptr || !DynamicIBAccess->Is_Valid())
+	if (DynamicIBAccess == nullptr)
 	{
 		return;
 	}
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	// A failed publication is recoverable only through a zero-offset discard;
+	// defer the validity decision to Lock_Native_Buffer so it can recreate the
+	// native generation.
+	if (DynamicIBAccess->IndexBuffer == nullptr)
+	{
+		return;
+	}
+#else
+	if (!DynamicIBAccess->Is_Valid())
+	{
+		return;
+	}
+#endif
 	DynamicIBAccess->IndexBuffer->Add_Ref();
 	Referenced = true;
 	switch (DynamicIBAccess->Get_Type()) {
@@ -788,7 +792,7 @@ DynamicIBAccessClass::WriteLockClass::WriteLockClass(DynamicIBAccessClass* ib_ac
 				static_cast<size_t>(DynamicIBAccess->IndexBufferOffset) * sizeof(WORD),
 				static_cast<size_t>(DynamicIBAccess->Get_Index_Count()) * sizeof(WORD),
 				!DynamicIBAccess->IndexBufferOffset ?
-					D3DLOCK_DISCARD : D3DLOCK_NOOVERWRITE,
+					NATIVE_BUFFER_LOCK_DISCARD : NATIVE_BUFFER_LOCK_NO_OVERWRITE,
 				reinterpret_cast<void **>(&Indices));
 #else
 		{
@@ -797,7 +801,8 @@ DynamicIBAccessClass::WriteLockClass::WriteLockClass(DynamicIBAccessClass* ib_ac
 				DynamicIBAccess->IndexBufferOffset*sizeof(WORD),
 				DynamicIBAccess->Get_Index_Count()*sizeof(WORD),
 				(unsigned char**)&Indices,
-				!DynamicIBAccess->IndexBufferOffset ? D3DLOCK_DISCARD : D3DLOCK_NOOVERWRITE);
+				!DynamicIBAccess->IndexBufferOffset ? D3DLOCK_DISCARD :
+					D3DLOCK_NOOVERWRITE);
 			DX8_ErrorCode(result);
 			Locked = SUCCEEDED(result);
 		}
@@ -832,9 +837,15 @@ bool DynamicIBAccessClass::WriteLockClass::Commit()
 	{
 		return false;
 	}
+	#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	const unsigned int change_flags =
+		!DynamicIBAccess->IndexBufferOffset ?
+			NATIVE_BUFFER_LOCK_DISCARD : NATIVE_BUFFER_LOCK_NO_OVERWRITE;
+	#else
 	const unsigned int change_flags =
 		!DynamicIBAccess->IndexBufferOffset ?
 			D3DLOCK_DISCARD : D3DLOCK_NOOVERWRITE;
+	#endif
 	bool changed = Locked;
 	switch (DynamicIBAccess->Get_Type()) {
 	case BUFFER_TYPE_DYNAMIC_DX8:

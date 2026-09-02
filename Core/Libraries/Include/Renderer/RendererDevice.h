@@ -407,7 +407,19 @@ enum RenderVertexSemantic
 	RENDER_VERTEX_SEMANTIC_NORMAL,
 	RENDER_VERTEX_SEMANTIC_DIFFUSE,
 	RENDER_VERTEX_SEMANTIC_SPECULAR,
-	RENDER_VERTEX_SEMANTIC_TEXTURE_COORDINATE
+	RENDER_VERTEX_SEMANTIC_TEXTURE_COORDINATE,
+	// Weighted legacy FVFs carry one or more floating-point blend-weight
+	// fields followed, for LASTBETA forms, by a four-byte blend-index field.
+	// Keep these neutral semantics distinct from texture/material channels so
+	// the native backend can construct an exact input declaration.
+	RENDER_VERTEX_SEMANTIC_BLEND_WEIGHT,
+	RENDER_VERTEX_SEMANTIC_BLEND_INDEX,
+	// Plural spellings are useful to callers describing a stream and retain a
+	// single canonical enum value for the backend switch statements.
+	RENDER_VERTEX_SEMANTIC_BLEND_WEIGHTS =
+		RENDER_VERTEX_SEMANTIC_BLEND_WEIGHT,
+	RENDER_VERTEX_SEMANTIC_BLEND_INDICES =
+		RENDER_VERTEX_SEMANTIC_BLEND_INDEX
 };
 
 typedef RenderVertexSemantic LegacyVertexSemantic;
@@ -418,7 +430,13 @@ enum RenderVertexDataFormat
 	RENDER_VERTEX_DATA_FLOAT2,
 	RENDER_VERTEX_DATA_FLOAT3,
 	RENDER_VERTEX_DATA_FLOAT4,
-	RENDER_VERTEX_DATA_COLOR_BGRA8
+	RENDER_VERTEX_DATA_COLOR_BGRA8,
+	// Raw four-byte integer fields are used by LASTBETA_UBYTE4.  D3DCOLOR is
+	// kept as a separate neutral format because its byte ordering/normalization
+	// contract differs from an ordinary packed diffuse colour.
+	RENDER_VERTEX_DATA_UBYTE4,
+	RENDER_VERTEX_DATA_D3DCOLOR,
+	RENDER_VERTEX_DATA_COLOR_D3DCOLOR = RENDER_VERTEX_DATA_D3DCOLOR
 };
 
 // Compatibility spelling for the existing backend adapter.  The native API
@@ -437,7 +455,9 @@ struct LegacyVertexElement
 
 struct LegacyVertexLayout
 {
-	enum { MAX_ELEMENT_COUNT = 12 };
+	// XYZB5 plus normal/diffuse/specular and eight texture coordinates needs
+	// fourteen declarations. Leave room for future neutral stream fields.
+	enum { MAX_ELEMENT_COUNT = 16 };
 
 	LegacyVertexLayout();
 
@@ -465,7 +485,7 @@ struct RenderVertexElement
 
 struct RenderVertexLayout
 {
-	enum { MAX_ELEMENT_COUNT = 12 };
+	enum { MAX_ELEMENT_COUNT = 16 };
 
 	RenderVertexLayout() : stride(0), elementCount(0), preTransformed(false) {}
 

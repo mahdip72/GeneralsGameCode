@@ -43,7 +43,9 @@
 #include "WWDebug/wwdebug.h"
 #include "dx8fvf.h"
 
-const unsigned dynamic_fvf_type=D3DFVF_XYZ|D3DFVF_NORMAL|D3DFVF_TEX2|D3DFVF_DIFFUSE;
+// Dynamic sorting streams use the serialized neutral FVF contract. The
+// Win32/VC6 oracle still receives the equivalent D3D8 value through dx8fvf.h.
+const unsigned dynamic_fvf_type=DX8_FVF_XYZNDUV2;
 
 class DX8Wrapper;
 class SortingRendererClass;
@@ -213,7 +215,7 @@ inline VertexFormatXYZNDUV2 * DynamicVBAccessClass::WriteLockClass::Get_Formatte
 		return nullptr;
 	}
 	// assert that the format of the dynamic vertex buffer is still what we think it is.
-	WWASSERT(DynamicVBAccess->VertexBuffer->FVF_Info().Get_FVF() == (D3DFVF_XYZ|D3DFVF_NORMAL|D3DFVF_TEX2|D3DFVF_DIFFUSE));
+	WWASSERT(DynamicVBAccess->VertexBuffer->FVF_Info().Get_FVF() == dynamic_fvf_type);
 	return Vertices;
 }
 

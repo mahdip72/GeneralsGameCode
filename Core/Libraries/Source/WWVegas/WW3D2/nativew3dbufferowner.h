@@ -41,18 +41,27 @@ private:
 
 	RenderResult RecreateForDiscard();
 	NativeW3DResources *ActiveResources() const;
+	void ObserveAuthorityFailure(NativeW3DResources *resources) const;
 	void ReleaseStaging();
 
 	NativeW3DResources *m_resources;
 	unsigned int m_bindingGeneration;
 	BufferDescriptor m_descriptor;
 	GpuHandle m_handle;
+	// A replacement must remain owner-reachable when the old backend handle
+	// refuses destruction.  It is retried before the next discard recreation.
+	GpuHandle m_deferredHandle;
+	// A private byte image keeps PRESERVE/NO_OVERWRITE staging deterministic
+	// even when the backend only exposes a write mapping. It is deliberately
+	// owner-local: no renderer resource or API object crosses this boundary.
+	unsigned char *m_authoritative;
+	size_t m_authoritativeBytes;
 	unsigned char *m_staging;
 	size_t m_lockOffset;
 	size_t m_lockBytes;
 	RenderBufferUpdateMode m_lockMode;
 	bool m_locked;
-	bool m_failedMutation;
+	mutable bool m_failedMutation;
 };
 
 }

@@ -85,7 +85,8 @@ public:
 	};
 
 	FakeRenderDevice() : m_allocator(16), m_context(this), m_operational(true),
-		m_failCreate(false), m_failUpdate(false), m_failCreateAttempt(0),
+		m_failCreate(false), m_failUpdate(false), m_failDestroy(false),
+		m_failCreateAttempt(0),
 		m_failUpdateAttempt(0), m_createAttemptCount(0), m_updateAttemptCount(0),
 		m_createCount(0), m_destroyCount(0), m_updateCount(0), m_lastOffset(0),
 		m_lastBytes(0), m_lastMode(RENDER_BUFFER_UPDATE_PRESERVE), m_buffers(16)
@@ -127,7 +128,11 @@ public:
 		slot.live = true;
 		slot.handle = created;
 		slot.descriptor = descriptor;
-		slot.bytes.assign(descriptor.byteCount, 0);
+		// Do not let a fake's zero-fill hide an owner that fails to establish the
+		// initial image.  Real D3D11 dynamic buffers have undefined bytes when
+		// created without initial data, so partial PRESERVE must be safe even
+		// against a nonzero backend allocation.
+		slot.bytes.assign(descriptor.byteCount, initialData == nullptr ? 0xA5 : 0);
 		if (initialData != nullptr)
 		{
 			std::memcpy(slot.bytes.data(), initialData, initialDataBytes);
@@ -146,6 +151,10 @@ public:
 		{ return RENDER_RESULT_UNSUPPORTED; }
 	bool destroyResource(GpuHandle resource) override
 	{
+		if (m_failDestroy)
+		{
+			return false;
+		}
 		Buffer *slot = Find(resource);
 		if (slot == nullptr || !m_allocator.release(resource))
 		{
@@ -214,6 +223,7 @@ public:
 
 	void FailCreate(bool fail) { m_failCreate = fail; }
 	void FailUpdate(bool fail) { m_failUpdate = fail; }
+	void FailDestroy(bool fail) { m_failDestroy = fail; }
 	void FailCreateOnAttempt(unsigned int attempt)
 		{ m_failCreateAttempt = attempt; }
 	void FailUpdateOnAttempt(unsigned int attempt)
@@ -262,6 +272,7 @@ private:
 	bool m_operational;
 	bool m_failCreate;
 	bool m_failUpdate;
+	bool m_failDestroy;
 	unsigned int m_failCreateAttempt;
 	unsigned int m_failUpdateAttempt;
 	unsigned int m_createAttemptCount;
@@ -453,6 +464,26 @@ int main()
 		result |= Check(device.DrawCount() == 0,
 			"a failed-publication dynamic draw stops before backend submission");
 		device.FailUpdate(false);
+		DynamicIBAccessClass::WriteLockClass retryIndexLock(&failedUpdateIndex);
+		DynamicVBAccessClass::WriteLockClass retryVertexLock(&failedUpdateVertex);
+		unsigned short *retryIndices = retryIndexLock.Get_Index_Array();
+		VertexFormatXYZNDUV2 *retryVertices =
+			retryVertexLock.Get_Formatted_Vertex_Array();
+		result |= Check(retryIndexLock.Is_Locked() && retryIndices != nullptr &&
+			retryVertexLock.Is_Locked() && retryVertices != nullptr &&
+			failedUpdateIndex.Is_Valid() && failedUpdateVertex.Is_Valid(),
+			"failed dynamic publication can re-enter through a zero-offset discard");
+		if (retryIndices != nullptr && retryVertices != nullptr)
+		{
+			retryIndices[0] = 2;
+			retryIndices[1] = 1;
+			retryIndices[2] = 0;
+			std::memset(retryVertices, 0,
+				3 * failedUpdateVertex.FVF_Info().Get_FVF_Size());
+		}
+		result |= Check(retryIndexLock.Commit() && retryVertexLock.Commit() &&
+			failedUpdateIndex.Is_Valid() && failedUpdateVertex.Is_Valid(),
+			"discard recovery clears the failed-mutation state after publication");
 	}
 	DynamicIBAccessClass::_Deinit();
 	DynamicVBAccessClass::_Deinit();
@@ -584,9 +615,25 @@ int main()
 		resources.DescribeBuffer(staticHandle, &description) == RENDER_RESULT_OK &&
 		description.authority == NATIVE_W3D_CONTENT_CPU,
 		"a successful full update acquires its exact CPU-authoritative range");
-	const unsigned int staticAuthorityEpoch = description.authorityEpoch;
+	unsigned int staticAuthorityEpoch = description.authorityEpoch;
 	unsigned char staticBytes[16];
 	std::memset(staticBytes, 0x11, sizeof(staticBytes));
+	result |= Check(staticBuffer.Lock(4, 4, RENDER_BUFFER_UPDATE_PRESERVE,
+		&bytes) == RENDER_RESULT_OK && bytes != nullptr &&
+		std::memcmp(bytes, staticBytes + 4, 4) == 0,
+		"static partial preserve staging starts from the authoritative image");
+	Fill(bytes, 4, 0x22);
+	staticBytes[4] = 0x22;
+	staticBytes[5] = 0x22;
+	staticBytes[6] = 0x22;
+	staticBytes[7] = 0x22;
+	result |= Check(staticBuffer.Unlock() == RENDER_RESULT_OK &&
+		device.BufferEquals(staticHandle, staticBytes, sizeof(staticBytes)),
+		"static partial preserve publishes only the requested vertex bytes");
+	result |= Check(resources.DescribeBuffer(staticHandle, &description) ==
+		RENDER_RESULT_OK && description.authority == NATIVE_W3D_CONTENT_CPU,
+		"static partial preserve retains whole-buffer CPU authority");
+	staticAuthorityEpoch = description.authorityEpoch;
 	result |= Check(device.resize(800, 600) == RENDER_RESULT_OK &&
 		host.ReplaceContext(device.immediateContext()) == RENDER_RESULT_OK &&
 		resources.RepublishStaticBuffersAfterResize() == RENDER_RESULT_OK &&
@@ -629,6 +676,9 @@ int main()
 		device.LastMode() == RENDER_BUFFER_UPDATE_DISCARD,
 		"discard publishes its exact initialized prefix");
 	GpuHandle dynamicHandle;
+	unsigned char dynamicBytes[16];
+	std::memset(dynamicBytes, 0, sizeof(dynamicBytes));
+	std::memset(dynamicBytes, 0x22, 8);
 	result |= Check(dynamicBuffer.AcquireIndexRange(RENDER_FORMAT_R16_UINT,
 		0, 0, 4, &dynamicHandle) == RENDER_RESULT_OK &&
 		resources.DescribeBuffer(dynamicHandle, &description) == RENDER_RESULT_OK &&
@@ -645,12 +695,22 @@ int main()
 		RENDER_BUFFER_UPDATE_NO_OVERWRITE, &bytes) == RENDER_RESULT_OK,
 		"dynamic buffer accepts a disjoint no-overwrite tail");
 	Fill(bytes, 8, 0x33);
+	std::memset(dynamicBytes + 8, 0x33, 8);
 	result |= Check(dynamicBuffer.Unlock() == RENDER_RESULT_OK &&
 		device.LastOffset() == 8 && device.LastBytes() == 8 &&
 		device.LastMode() == RENDER_BUFFER_UPDATE_NO_OVERWRITE &&
 		resources.DescribeBuffer(dynamicHandle, &description) == RENDER_RESULT_OK &&
 		description.authority == NATIVE_W3D_CONTENT_INVALID,
 		"disjoint no-overwrite remains range-authoritative, not whole-buffer authoritative");
+	result |= Check(dynamicBuffer.Lock(4, 4,
+		RENDER_BUFFER_UPDATE_PRESERVE, &bytes) == RENDER_RESULT_OK &&
+		bytes != nullptr && std::memcmp(bytes, dynamicBytes + 4, 4) == 0,
+		"index partial preserve staging starts from the authoritative image");
+	Fill(bytes, 4, 0x44);
+	std::memset(dynamicBytes + 4, 0x44, 4);
+	result |= Check(dynamicBuffer.Unlock() == RENDER_RESULT_OK &&
+		device.BufferEquals(dynamicHandle, dynamicBytes, sizeof(dynamicBytes)),
+		"index partial preserve publishes only the requested index bytes");
 	result |= Check(dynamicBuffer.AcquireIndexRange(RENDER_FORMAT_R16_UINT,
 		0, 0, 8, &rejectedHandle) == RENDER_RESULT_OK &&
 		rejectedHandle == dynamicHandle,
@@ -702,6 +762,68 @@ int main()
 		!resources.IsValid(dynamicHandle),
 		"successful recovery publishes a replacement before retiring the stale generation");
 
+	// A replacement allocation is already live when destruction of the old
+	// handle refuses the transaction.  Keep it owner-reachable until a later
+	// DISCARD can retire it; otherwise the failed recovery strands a registry
+	// slot and every subsequent retry consumes another allocation.
+	NativeW3DBufferOwner deferredDestroyBuffer;
+	result |= Check(deferredDestroyBuffer.Create(dynamicDescriptor) ==
+		RENDER_RESULT_OK, "discard cleanup fixture creates its owner");
+	void *deferredBytes = nullptr;
+	result |= Check(deferredDestroyBuffer.Lock(4, 4,
+		RENDER_BUFFER_UPDATE_NO_OVERWRITE, &deferredBytes) ==
+		RENDER_RESULT_OK && deferredBytes != nullptr,
+		"discard cleanup fixture accepts an initial mutation");
+	if (deferredBytes != nullptr)
+	{
+		Fill(deferredBytes, 4, 0x19);
+	}
+	result |= Check(deferredDestroyBuffer.Unlock() == RENDER_RESULT_OK,
+		"discard cleanup fixture publishes its initial mutation");
+	device.FailUpdate(true);
+	result |= Check(deferredDestroyBuffer.Lock(4, 4,
+		RENDER_BUFFER_UPDATE_NO_OVERWRITE, &deferredBytes) ==
+		RENDER_RESULT_OK && deferredBytes != nullptr,
+		"discard cleanup fixture obtains a failure-injection range");
+	if (deferredBytes != nullptr)
+	{
+		Fill(deferredBytes, 4, 0x29);
+	}
+	result |= Check(deferredDestroyBuffer.Unlock() == RENDER_RESULT_FAILED &&
+		deferredDestroyBuffer.HasFailedMutation(),
+		"discard cleanup fixture enters failed-mutation state");
+	device.FailUpdate(false);
+	const unsigned int deferredCreatesBeforeRecovery = device.CreateCount();
+	const unsigned int deferredDestroysBeforeRecovery = device.DestroyCount();
+	const unsigned int deferredLiveBeforeRecovery = device.LiveCount();
+	device.FailDestroy(true);
+	deferredBytes = nullptr;
+	result |= Check(deferredDestroyBuffer.Lock(0, 16,
+		RENDER_BUFFER_UPDATE_DISCARD, &deferredBytes) ==
+		RENDER_RESULT_FAILED && deferredBytes == nullptr &&
+		device.LiveCount() == deferredLiveBeforeRecovery + 1 &&
+		device.CreateCount() == deferredCreatesBeforeRecovery + 1,
+		"old-handle destruction failure retains the replacement allocation");
+	device.FailDestroy(false);
+	deferredBytes = nullptr;
+	result |= Check(deferredDestroyBuffer.Lock(0, 16,
+		RENDER_BUFFER_UPDATE_DISCARD, &deferredBytes) ==
+		RENDER_RESULT_OK && deferredBytes != nullptr &&
+		device.LiveCount() == deferredLiveBeforeRecovery,
+		"discard retry retires the deferred replacement before recreating");
+	if (deferredBytes != nullptr)
+	{
+		Fill(deferredBytes, 16, 0x39);
+	}
+	result |= Check(deferredDestroyBuffer.Unlock() == RENDER_RESULT_OK &&
+		!deferredDestroyBuffer.HasFailedMutation() &&
+		device.CreateCount() == deferredCreatesBeforeRecovery + 2 &&
+		device.DestroyCount() == deferredDestroysBeforeRecovery + 2,
+		"successful discard retry leaves one current allocation and no orphan");
+	result |= Check(deferredDestroyBuffer.Reset() == RENDER_RESULT_OK &&
+		device.LiveCount() == deferredLiveBeforeRecovery - 1,
+		"discard cleanup fixture releases its sole current allocation");
+
 	rejectedHandle = GpuHandle(1, 1);
 	result |= Check(device.recoverDevice() == RENDER_RESULT_OK &&
 		!device.BufferEquals(staticHandle, staticBytes, sizeof(staticBytes)) &&
@@ -720,7 +842,7 @@ int main()
 		host.ReplaceContext(device.immediateContext()) == RENDER_RESULT_OK &&
 		resources.RestoreStaticBuffersAfterRecovery() == RENDER_RESULT_FAILED &&
 		staticBuffer.AcquireVertexRange(4, 0, 0, 4, &rejectedHandle) ==
-			RENDER_RESULT_INVALID_ARGUMENT && !rejectedHandle.isValid(),
+			RENDER_RESULT_FAILED && !rejectedHandle.isValid(),
 		"failed static recovery clears the draw handle instead of exposing stale geometry");
 	device.FailUpdate(false);
 

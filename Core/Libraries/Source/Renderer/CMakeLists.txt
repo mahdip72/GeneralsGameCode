@@ -84,6 +84,7 @@ if(WIN32 AND NOT IS_VS6_BUILD)
     set(renderer_sea_wave_vertex_shader_header "${renderer_generated_dir}/LegacySeaWaveVS.h")
     set(renderer_sea_wave_pixel_shader_header "${renderer_generated_dir}/LegacySeaWavePS.h")
     set(renderer_textured_vertex_shader_header "${renderer_generated_dir}/LegacyTexturedVS.h")
+    set(renderer_textured_unweighted_vertex_shader_header "${renderer_generated_dir}/LegacyTexturedUnweightedVS.h")
     set(renderer_textured_pixel_shader_header "${renderer_generated_dir}/LegacyTexturedPS.h")
     set(renderer_textured_fixed1_pixel_shader_header "${renderer_generated_dir}/LegacyTexturedFixed1PS.h")
     set(renderer_textured_fixed2_pixel_shader_header "${renderer_generated_dir}/LegacyTexturedFixed2PS.h")
@@ -184,6 +185,16 @@ if(WIN32 AND NOT IS_VS6_BUILD)
         VERBATIM
     )
     add_custom_command(
+        OUTPUT "${renderer_textured_unweighted_vertex_shader_header}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${renderer_generated_dir}"
+        COMMAND "${RTS_FXC_EXECUTABLE}" /nologo /T vs_5_0 /E VSTextured
+            /D LEGACY_UNWEIGHTED_VERTEX_INPUT=1
+            /Fh "${renderer_textured_unweighted_vertex_shader_header}"
+            /Vn g_LegacyTexturedUnweightedVS "${renderer_shader_source}"
+        DEPENDS "${renderer_shader_source}"
+        VERBATIM
+    )
+    add_custom_command(
         OUTPUT "${renderer_textured_pixel_shader_header}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${renderer_generated_dir}"
         COMMAND "${RTS_FXC_EXECUTABLE}" /nologo /T ps_5_0 /E PSTextured
@@ -225,6 +236,7 @@ if(WIN32 AND NOT IS_VS6_BUILD)
         "${renderer_sea_wave_vertex_shader_header}"
         "${renderer_sea_wave_pixel_shader_header}"
         "${renderer_textured_vertex_shader_header}"
+        "${renderer_textured_unweighted_vertex_shader_header}"
         "${renderer_textured_pixel_shader_header}"
         "${renderer_textured_fixed1_pixel_shader_header}"
         "${renderer_textured_fixed2_pixel_shader_header}"

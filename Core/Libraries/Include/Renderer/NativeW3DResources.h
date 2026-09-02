@@ -205,6 +205,10 @@ public:
 	bool RetireTexture(NativeW3DTextureHandle handle);
 	bool IsOwnerThread() const;
 	bool IsValid(GpuHandle handle) const;
+	// A resource handle can remain structurally live after an asynchronous
+	// upload failure.  This predicate distinguishes that failed authority from
+	// an intentionally range-authoritative dynamic buffer.
+	bool HasBufferAuthorityFailure(GpuHandle handle) const;
 	bool IsValid(NativeW3DTextureHandle handle) const;
 	bool IsValid(NativeW3DSurfaceHandle handle) const;
 

@@ -300,6 +300,7 @@ struct NativeW3DResources::Slot
 {
 	Slot() : kind(0), authority(NATIVE_W3D_CONTENT_INVALID),
 		authorityEpoch(0), backendEpoch(0), retired(false),
+		authorityFailure(false),
 		submissionAuthority(NATIVE_W3D_CONTENT_INVALID),
 		submissionBackendEpoch(0) {}
 	GpuHandle handle;
@@ -310,6 +311,10 @@ struct NativeW3DResources::Slot
 	unsigned int authorityEpoch;
 	unsigned int backendEpoch;
 	bool retired;
+	// Set only when the registry has rejected or invalidated accepted content.
+	// A successful range-authoritative DISCARD is not a failure and leaves this
+	// clear even though its whole-buffer authority is intentionally invalid.
+	bool authorityFailure;
 	std::vector<InitializedByteRange> initializedBytes;
 	// Confirmed bytes are published only after the matching threaded frame
 	// completion. Submission bytes include accepted FIFO uploads so a draw in
@@ -810,6 +815,7 @@ RenderResult NativeW3DResources::PublishThreadedCompletion(
 			slot.submissionAuthority = NATIVE_W3D_CONTENT_INVALID;
 			slot.backendEpoch = 0;
 			slot.submissionBackendEpoch = 0;
+			slot.authorityFailure = true;
 			slot.authorityEpoch = NextAuthorityEpoch();
 			continue;
 		}
@@ -834,6 +840,7 @@ RenderResult NativeW3DResources::PublishThreadedCompletion(
 			slot.submissionAuthority = NATIVE_W3D_CONTENT_INVALID;
 			slot.backendEpoch = 0;
 			slot.submissionBackendEpoch = 0;
+			slot.authorityFailure = true;
 			slot.authorityEpoch = NextAuthorityEpoch();
 			return RENDER_RESULT_OUT_OF_MEMORY;
 		}
@@ -841,6 +848,7 @@ RenderResult NativeW3DResources::PublishThreadedCompletion(
 		slot.authority = published.authority;
 		slot.backendEpoch = published.backendEpoch;
 		slot.authorityEpoch = NextAuthorityEpoch();
+		slot.authorityFailure = false;
 		slot.pendingBufferPublications.swap(remainingPublications);
 		if (slot.pendingBufferPublications.empty())
 		{
@@ -1321,6 +1329,7 @@ RenderResult NativeW3DResources::UpdateBuffer(GpuHandle handle,
 	slot->authority = nextAuthority;
 	slot->submissionAuthority = nextAuthority;
 	slot->authorityEpoch = NextAuthorityEpoch();
+	slot->authorityFailure = false;
 	slot->backendEpoch = bufferEpoch;
 	slot->submissionBackendEpoch = bufferEpoch;
 	if (slot->buffer.usage == RENDER_USAGE_DEFAULT)
@@ -1402,6 +1411,7 @@ RenderResult NativeW3DResources::RepublishStaticBuffers(
 			slot.submissionBackendEpoch = bufferEpoch;
 			slot.submissionInitializedBytes.swap(immutableSubmissionRanges);
 			slot.submissionAuthority = slot.authority;
+			slot.authorityFailure = false;
 			continue;
 		}
 		if (slot.buffer.usage != RENDER_USAGE_DEFAULT)
@@ -1464,6 +1474,7 @@ RenderResult NativeW3DResources::RepublishStaticBuffers(
 		slot.submissionAuthority = slot.authority;
 		slot.backendEpoch = bufferEpoch;
 		slot.submissionBackendEpoch = bufferEpoch;
+		slot.authorityFailure = false;
 	}
 	return RENDER_RESULT_OK;
 }
@@ -2030,6 +2041,19 @@ bool NativeW3DResources::IsValid(GpuHandle handle) const
 		slot != 0 && !slot->retired;
 }
 
+bool NativeW3DResources::HasBufferAuthorityFailure(GpuHandle handle) const
+{
+	IRenderDevice *device = m_impl == 0 || m_impl->state == 0 ? 0 :
+		m_impl->state->Device();
+	const Slot *slot = Find(handle);
+	return m_impl != 0 && m_impl->state != 0 &&
+		m_impl->state->IsOperational() && device != 0 &&
+		device->isOperational() &&
+		m_impl->stateGeneration == m_impl->state->Generation() &&
+		slot != 0 && slot->kind == 1 && !slot->retired &&
+		slot->authorityFailure;
+}
+
 bool NativeW3DResources::IsValid(NativeW3DTextureHandle handle) const
 {
 	const Slot *slot = Find(handle.resource);
@@ -2143,6 +2167,7 @@ void NativeW3DResources::InvalidateBufferAuthority(Slot &slot)
 		slot.recoveryInitializedBytes.clear();
 		slot.recoveryBytes.clear();
 	}
+	slot.authorityFailure = true;
 	slot.authorityEpoch = NextAuthorityEpoch();
 }
 
