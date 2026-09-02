@@ -393,7 +393,14 @@ $rules = @(
     },
     [pscustomobject]@{
         Name = 'pointer-sized-serialization'
-        Pattern = '(sizeof\s*\([^\)]*\*\)|xfer[^\r\n]*(void\s*\*|uintptr_t|intptr_t))'
+        # A pointer-sized sizeof is often only allocation/layout arithmetic
+        # (pointer arrays, scratch storage, or ABI field checks).  Likewise,
+        # xferImplementation/appendXferEvent declarations expose a void*
+        # buffer by design.  Flag the high-confidence case: an xfer call whose
+        # serialized byte count is explicitly pointer-sized.  Keep uintptr_t
+        # and intptr_t in this call-scoped rule because those values are also
+        # pointer-width wire data unless the caller converts them first.
+        Pattern = '(?i)(?<![A-Za-z0-9_])(?:xfer|xferUser|xferImplementation)\s*\([^\r\n]*(?:sizeof\s*\(\s*(?:(?:const|volatile|signed|unsigned|long|short|struct|class)\s+)*[A-Za-z_][A-Za-z0-9_:]*(?:\s*<[^>\r\n]*>)?\s*\*+\s*\)|\b(?:uintptr_t|intptr_t)\b)'
         RejectAddedLine = $true
     },
     [pscustomobject]@{

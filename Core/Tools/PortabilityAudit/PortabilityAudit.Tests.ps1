@@ -192,6 +192,20 @@ IDirect3DDevice8 *untrackedDevice;
     Set-FixtureFile $fixtureRoot 'untracked-pointer.cpp' @'
 int converted = reinterpret_cast<int>(address);
 '@
+    Set-FixtureFile $fixtureRoot 'untracked-pointer-buffer-sizing.cpp' @'
+void reserve(void **buffer, unsigned count)
+{
+  const unsigned bytes = count * sizeof(void *);
+  (void)buffer;
+  (void)bytes;
+}
+'@
+    Set-FixtureFile $fixtureRoot 'untracked-xfer-buffer.cpp' @'
+void appendXferEvent(const void *bytes, unsigned byteCount)
+{
+  xferUser((void *)bytes, byteCount);
+}
+'@
     Set-FixtureFile $fixtureRoot 'untracked-serialization.cpp' @'
 void save(void *value) { xfer(value, sizeof(void*)); }
 '@
@@ -224,6 +238,8 @@ __inline void GetFunctionDetails(void *pointer, char *name, char *filename, unsi
     Assert-Fixture ($failure.Output -match 'untracked\.cpp.*baseline=0.*current=1') 'untracked raw-D3D8 files must be included in the fail-closed ratchet'
     Assert-Fixture ($failure.Output -notmatch 'existing\.cpp.*raw-d3d8-surface-area') 'same-count edits must not be reported as raw-D3D8 growth'
     Assert-Fixture ($failure.Output -match 'untracked-pointer\.cpp: pointer-to-32-bit-cast') 'untracked pointer-cast sources must be rejected'
+    Assert-Fixture ($failure.Output -notmatch 'untracked-pointer-buffer-sizing\.cpp: pointer-sized-serialization') 'pointer-buffer sizing must not be classified as pointer serialization'
+    Assert-Fixture ($failure.Output -notmatch 'untracked-xfer-buffer\.cpp: pointer-sized-serialization') 'xfer buffer declarations/calls must not be classified as pointer serialization'
     Assert-Fixture ($failure.Output -match 'untracked-serialization\.cpp: pointer-sized-serialization') 'untracked serialization sources must be rejected'
     Assert-Fixture ($failure.Output -match 'untracked-asm\.cpp: x86-inline-assembly-or-context') 'untracked inline-assembly sources must be rejected'
     Assert-Fixture ($failure.Output -match 'untracked-window-message\.cpp: window-message-implicit-narrowing') 'untracked WindowMsgData scalar narrowing must be rejected'
