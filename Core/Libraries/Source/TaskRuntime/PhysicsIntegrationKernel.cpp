@@ -107,6 +107,7 @@ PhysicsMetricAtomic s_acceptedPhysicalWorkerJobs;
 PhysicsMetricAtomic s_acceptedOwnerHelpedJobs;
 PhysicsMetricAtomic s_acceptedPhysicalWorkerMask;
 PhysicsMetricAtomic s_maximumAcceptedDistinctPhysicalWorkers;
+PhysicsMetricAtomic s_acceptedPhysicalWorkerMaskIncomplete;
 PhysicsMetricAtomic s_maximumAcceptedPeakConcurrentPhysicalWorkers;
 PhysicsMetricAtomic s_acceptedAllocatedBytes;
 PhysicsMetricAtomic s_acceptedCaptureNanoseconds;
@@ -393,7 +394,8 @@ PhysicsIntegrationMetrics::PhysicsIntegrationMetrics()
 	: snapshotCount(0), rangeCount(0), effectiveMinimumGrain(0),
 	  submittedJobs(0), completedJobs(0), physicalWorkerJobs(0),
 	  ownerHelpedJobs(0), physicalWorkerMask(0), distinctPhysicalWorkers(0),
-	  peakConcurrentPhysicalWorkers(0), serialFallbacks(0), allocatedBytes(0),
+	  physicalWorkerMaskComplete(true), peakConcurrentPhysicalWorkers(0),
+	  serialFallbacks(0), allocatedBytes(0),
 	  captureNanoseconds(0), prepareNanoseconds(0), waitNanoseconds(0),
 	  commitNanoseconds(0), storageBytes(0), storageCapacityBytes(0),
 	  storageAllocations(0)
@@ -405,6 +407,7 @@ PhysicsIntegrationRuntimeMetrics::PhysicsIntegrationRuntimeMetrics()
 	  acceptedSubmittedJobs(0), acceptedCompletedJobs(0),
 	  acceptedPhysicalWorkerJobs(0), acceptedOwnerHelpedJobs(0),
 	  acceptedPhysicalWorkerMask(0), maximumAcceptedDistinctPhysicalWorkers(0),
+	  acceptedPhysicalWorkerMaskComplete(true),
 	  maximumAcceptedPeakConcurrentPhysicalWorkers(0),
 	  acceptedAllocatedBytes(0),
 	  acceptedCaptureNanoseconds(0), acceptedPrepareNanoseconds(0),
@@ -815,6 +818,8 @@ PhysicsIntegrationBatchResult PreparePhysicsIntegrationPrefixes(
 				if (workerIndex < sizeof(PhysicsIntegrationMetricCounter) * 8)
 					metrics->physicalWorkerMask |=
 						static_cast<PhysicsIntegrationMetricCounter>(1) << workerIndex;
+				else
+					metrics->physicalWorkerMaskComplete = false;
 				bool firstWorker = true;
 				for (unsigned previous = 0; previous != completionIndex; ++previous)
 				{
@@ -1026,6 +1031,7 @@ void ResetPhysicsIntegrationRuntimeMetrics()
 	resetMetric(s_acceptedOwnerHelpedJobs);
 	resetMetric(s_acceptedPhysicalWorkerMask);
 	resetMetric(s_maximumAcceptedDistinctPhysicalWorkers);
+	resetMetric(s_acceptedPhysicalWorkerMaskIncomplete);
 	resetMetric(s_maximumAcceptedPeakConcurrentPhysicalWorkers);
 	resetMetric(s_acceptedAllocatedBytes);
 	resetMetric(s_acceptedCaptureNanoseconds);
@@ -1063,6 +1069,8 @@ PhysicsIntegrationRuntimeMetrics GetPhysicsIntegrationRuntimeMetrics()
 	metrics.acceptedPhysicalWorkerMask = loadMetric(s_acceptedPhysicalWorkerMask);
 	metrics.maximumAcceptedDistinctPhysicalWorkers = static_cast<unsigned>(
 		loadMetric(s_maximumAcceptedDistinctPhysicalWorkers));
+	metrics.acceptedPhysicalWorkerMaskComplete =
+		loadMetric(s_acceptedPhysicalWorkerMaskIncomplete) == 0;
 	metrics.maximumAcceptedPeakConcurrentPhysicalWorkers = static_cast<unsigned>(
 		loadMetric(s_maximumAcceptedPeakConcurrentPhysicalWorkers));
 	metrics.acceptedAllocatedBytes = loadMetric(s_acceptedAllocatedBytes);
@@ -1114,6 +1122,8 @@ void RecordPhysicsIntegrationAuthoritativeSlice(unsigned prefixCount,
 	addMetric(s_acceptedPhysicalWorkerJobs, sliceMetrics.physicalWorkerJobs);
 	addMetric(s_acceptedOwnerHelpedJobs, sliceMetrics.ownerHelpedJobs);
 	orMetric(s_acceptedPhysicalWorkerMask, sliceMetrics.physicalWorkerMask);
+	if (!sliceMetrics.physicalWorkerMaskComplete)
+		addMetric(s_acceptedPhysicalWorkerMaskIncomplete, 1);
 	maximizeMetric(s_maximumAcceptedDistinctPhysicalWorkers,
 		sliceMetrics.distinctPhysicalWorkers);
 	maximizeMetric(s_maximumAcceptedPeakConcurrentPhysicalWorkers,

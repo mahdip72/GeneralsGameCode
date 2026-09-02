@@ -10,6 +10,16 @@ option(RTS_BUILD_OPTION_DEBUG "Build code with the \"Debug\" configuration." OFF
 option(RTS_BUILD_OPTION_ASAN "Build code with Address Sanitizer." OFF)
 option(RTS_BUILD_OPTION_VC6_FULL_DEBUG "Build VC6 with full debug info." OFF)
 option(RTS_BUILD_OPTION_FFMPEG "Enable FFmpeg support" OFF)
+option(RTS_BUILD_STAGE5_PROMOTED_MULTIPLAYER_AUTHORITY
+    "Embed Stage 5 multiplayer authority in a clean, post-gate x64 Release product build"
+    OFF)
+
+set(RTS_MULTIPLAYER_SIMULATION_TRUSTED_PROMOTED_KERNEL_MASK 0)
+set(RTS_MULTIPLAYER_SIMULATION_TRUSTED_SOURCE_REVISION "")
+if(RTS_BUILD_STAGE5_PROMOTED_MULTIPLAYER_AUTHORITY)
+    message(FATAL_ERROR
+        "RTS_BUILD_STAGE5_PROMOTED_MULTIPLAYER_AUTHORITY=ON is unavailable: InstalledNet3Validation v1 is diagnostic-only; a reviewed lockstep-v2 authority contract is required before live multiplayer kernels can be promoted")
+endif()
 
 # A VC6 product install must be rooted in a task-owned disposable subtree.
 # Presets provide the build-local default; an explicitly approved scratch root
@@ -33,6 +43,9 @@ add_feature_info(DebugBuild RTS_BUILD_OPTION_DEBUG "Building as a \"Debug\" buil
 add_feature_info(AddressSanitizer RTS_BUILD_OPTION_ASAN "Building with address sanitizer")
 add_feature_info(Vc6FullDebug RTS_BUILD_OPTION_VC6_FULL_DEBUG "Building VC6 with full debug info")
 add_feature_info(FFmpegSupport RTS_BUILD_OPTION_FFMPEG "Building with FFmpeg support")
+add_feature_info(Stage5PromotedMultiplayerAuthority
+    RTS_BUILD_STAGE5_PROMOTED_MULTIPLAYER_AUTHORITY
+    "Embedding post-gate Stage 5 multiplayer authority")
 
 set(RTS_BUILD_OUTPUT_SUFFIX "" CACHE STRING "Suffix appended to output names of installable targets")
 

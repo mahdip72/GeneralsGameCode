@@ -4,18 +4,19 @@
   "title": "Stage 5 physical-core scaling acceptance evidence",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "evidenceKind", "status", "sourceCommit", "artifactSetSha256", "title", "executableSha256", "stage3BaselineSha256", "measurementMode", "installedRuntime", "topology", "selectedLanes", "oneWorkerPhases", "amdahl", "kernelTimings", "fixtures"],
+  "required": ["schemaVersion", "evidenceKind", "status", "sourceCommit", "artifactSetSha256", "title", "executableSha256", "stage3BaselineSha256", "measurementMode", "installedRuntime", "rawSampleManifest", "topology", "selectedLanes", "oneWorkerPhases", "amdahl", "kernelTimings", "fixtures"],
   "properties": {
     "schemaVersion": { "const": 1 },
     "evidenceKind": { "const": "stage5-performance-scaling" },
     "status": { "const": "passed" },
     "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
     "artifactSetSha256": { "$ref": "#/$defs/sha256" },
-    "title": { "const": "ZeroHour" },
+    "title": { "enum": ["Generals", "ZeroHour"] },
     "executableSha256": { "$ref": "#/$defs/sha256" },
     "stage3BaselineSha256": { "$ref": "#/$defs/sha256" },
     "measurementMode": { "const": "headless-throughput" },
     "installedRuntime": { "const": true },
+    "rawSampleManifest": { "$ref": "#/$defs/evidenceFile" },
     "topology": {
       "type": "object", "additionalProperties": false,
       "required": ["source", "topologySha256", "physicalCoreCount", "logicalProcessorCount"],
@@ -44,6 +45,14 @@
   },
   "$defs": {
     "sha256": { "type": "string", "pattern": "^[0-9A-F]{64}$" },
+    "evidenceFile": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
     "lane": {
       "type": "object", "additionalProperties": false,
       "required": ["name", "requestedWorkers", "selectedLogicalProcessors", "selectedDistinctPhysicalCores", "selectedPhysicalCoreMask"],

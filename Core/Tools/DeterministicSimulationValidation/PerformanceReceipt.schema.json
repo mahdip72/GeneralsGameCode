@@ -1,0 +1,295 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Executable-originated Stage 5 performance receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "producer",
+    "evidenceKind",
+    "status",
+    "title",
+    "runId",
+    "sourceCommit",
+    "artifactSetSha256",
+    "executablePath",
+    "executableSha256",
+    "commandLine",
+    "process",
+    "fixture",
+    "frames",
+    "worker",
+    "topology",
+    "rawEvidence",
+    "schedulerMetrics",
+    "phases",
+    "kernels"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "producer": { "const": "game-executable-performance-receipt-v1" },
+    "evidenceKind": { "const": "stage5-performance-receipt" },
+    "status": { "const": "complete" },
+    "title": { "type": "string", "minLength": 1 },
+    "runId": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,256}$" },
+    "sourceCommit": { "type": "string", "minLength": 1 },
+    "artifactSetSha256": { "$ref": "#/$defs/sha256" },
+    "executablePath": { "type": "string", "minLength": 1 },
+    "executableSha256": { "$ref": "#/$defs/sha256" },
+    "commandLine": { "type": "string", "minLength": 1 },
+    "process": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "creationTimeUtc100ns",
+        "startTimeUtc100ns",
+        "endTimeUtc100ns",
+        "identityAvailable",
+        "exitCodeKnown",
+        "exitCode",
+        "exitBoundary"
+      ],
+      "properties": {
+        "id": { "type": "integer", "minimum": 1 },
+        "creationTimeUtc100ns": { "type": "integer", "minimum": 1 },
+        "startTimeUtc100ns": { "type": "integer", "minimum": 1 },
+        "endTimeUtc100ns": { "type": "integer", "minimum": 1 },
+        "identityAvailable": { "const": true },
+        "exitCodeKnown": { "const": true },
+        "exitCode": { "type": "integer" },
+        "exitBoundary": { "type": "string", "minLength": 1 }
+      }
+    },
+    "fixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "contentSha256",
+        "replayPath",
+        "seed",
+        "seedKnown",
+        "playerCount",
+        "playerCountKnown",
+        "unitCount",
+        "unitCountKnown"
+      ],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "contentSha256": { "$ref": "#/$defs/sha256" },
+        "replayPath": { "type": "string", "minLength": 1 },
+        "seed": { "type": "integer", "minimum": 0 },
+        "seedKnown": { "const": true },
+        "playerCount": { "type": "integer", "minimum": 0 },
+        "playerCountKnown": { "type": "boolean" },
+        "unitCount": { "type": "integer", "minimum": 0 },
+        "unitCountKnown": { "type": "boolean" }
+      }
+    },
+    "frames": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "end", "final", "finalCrcKnown", "finalCrc"],
+      "properties": {
+        "start": { "type": "integer", "minimum": 0 },
+        "end": { "type": "integer", "minimum": 0 },
+        "final": { "type": "integer", "minimum": 0 },
+        "finalCrcKnown": { "const": true },
+        "finalCrc": { "type": "integer", "minimum": 0, "maximum": 4294967295 }
+      }
+    },
+    "worker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requestedCount",
+        "effectiveCount",
+        "policy",
+        "pinned",
+        "availableLogicalCpuCount",
+        "reservedOwnerCpuCount",
+        "selectedWorkerCpuCount",
+        "selectedWorkerPhysicalCoreCount",
+        "selectedWorkerPhysicalCoreMask",
+        "selectedWorkerPhysicalCoreMaskComplete"
+      ],
+      "properties": {
+        "requestedCount": { "type": "integer", "minimum": 0 },
+        "effectiveCount": { "type": "integer", "minimum": 1 },
+        "policy": { "enum": ["auto", "all"] },
+        "pinned": { "const": true },
+        "availableLogicalCpuCount": { "type": "integer", "minimum": 1 },
+        "reservedOwnerCpuCount": { "type": "integer", "minimum": 0 },
+        "selectedWorkerCpuCount": { "type": "integer", "minimum": 1 },
+        "selectedWorkerPhysicalCoreCount": { "type": "integer", "minimum": 1 },
+        "selectedWorkerPhysicalCoreMask": { "type": "integer", "minimum": 1 },
+        "selectedWorkerPhysicalCoreMaskComplete": { "const": true }
+      }
+    },
+    "topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "cpuSets", "ownerCpuSetIds", "selectedWorkerCpuSetIds"],
+      "properties": {
+        "source": { "const": "GetSystemCpuSetInformation" },
+        "cpuSets": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "efficiencyClass",
+              "group",
+              "coreIndex",
+              "logicalProcessorIndex",
+              "parked",
+              "allocatedToOtherProcess",
+              "availableToProcess"
+            ],
+            "properties": {
+              "id": { "type": "integer", "minimum": 0 },
+              "efficiencyClass": { "type": "integer", "minimum": 0 },
+              "group": { "type": "integer", "minimum": 0 },
+              "coreIndex": { "type": "integer", "minimum": 0 },
+              "logicalProcessorIndex": { "type": "integer", "minimum": 0 },
+              "parked": { "type": "boolean" },
+              "allocatedToOtherProcess": { "type": "boolean" },
+              "availableToProcess": { "type": "boolean" }
+            }
+          }
+        },
+        "ownerCpuSetIds": { "type": "array", "items": { "type": "integer", "minimum": 0 } },
+        "selectedWorkerCpuSetIds": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "rawEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verifierBoundary", "rawLogPath", "rawLogSha256", "timingPath", "timingSha256"],
+      "properties": {
+        "verifierBoundary": { "type": "string", "minLength": 1 },
+        "rawLogPath": { "type": "string" },
+        "rawLogSha256": { "type": "string" },
+        "timingPath": { "type": "string" },
+        "timingSha256": { "type": "string" }
+      },
+      "allOf": [
+        {
+          "anyOf": [
+            { "properties": { "rawLogPath": { "minLength": 1 } } },
+            { "properties": { "rawLogSha256": { "$ref": "#/$defs/sha256" } } }
+          ]
+        },
+        {
+          "anyOf": [
+            { "properties": { "timingPath": { "minLength": 1 } } },
+            { "properties": { "timingSha256": { "$ref": "#/$defs/sha256" } } }
+          ]
+        }
+      ]
+    },
+    "schedulerMetrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "submittedJobCount", "executedJobCount", "stealCount",
+        "ownerHelpCount", "waitCount", "workerWaitRejectionCount",
+        "failedJobCount", "cancelledJobCount", "serialFallbackCount",
+        "totalQueueLatencyNanoseconds", "maximumQueueLatencyNanoseconds",
+        "workerBusyNanoseconds", "workerWaitNanoseconds",
+        "affinityFailureCount", "injectionHighWater",
+        "maximumActiveWorkers", "availableLogicalCpuCount",
+        "reservedOwnerCpuCount", "selectedWorkerCpuCount",
+        "selectedWorkerPhysicalCoreCount", "selectedWorkerPhysicalCoreMask",
+        "selectedWorkerPhysicalCoreMaskComplete"
+      ],
+      "properties": {
+        "submittedJobCount": { "type": "integer", "minimum": 0 },
+        "executedJobCount": { "type": "integer", "minimum": 0 },
+        "stealCount": { "type": "integer", "minimum": 0 },
+        "ownerHelpCount": { "type": "integer", "minimum": 0 },
+        "waitCount": { "type": "integer", "minimum": 0 },
+        "workerWaitRejectionCount": { "type": "integer", "minimum": 0 },
+        "failedJobCount": { "type": "integer", "minimum": 0 },
+        "cancelledJobCount": { "type": "integer", "minimum": 0 },
+        "serialFallbackCount": { "type": "integer", "minimum": 0 },
+        "totalQueueLatencyNanoseconds": { "type": "integer", "minimum": 0 },
+        "maximumQueueLatencyNanoseconds": { "type": "integer", "minimum": 0 },
+        "workerBusyNanoseconds": { "type": "integer", "minimum": 0 },
+        "workerWaitNanoseconds": { "type": "integer", "minimum": 0 },
+        "affinityFailureCount": { "type": "integer", "minimum": 0 },
+        "injectionHighWater": { "type": "integer", "minimum": 0 },
+        "maximumActiveWorkers": { "type": "integer", "minimum": 0 },
+        "availableLogicalCpuCount": { "type": "integer", "minimum": 0 },
+        "reservedOwnerCpuCount": { "type": "integer", "minimum": 0 },
+        "selectedWorkerCpuCount": { "type": "integer", "minimum": 0 },
+        "selectedWorkerPhysicalCoreCount": { "type": "integer", "minimum": 0 },
+        "selectedWorkerPhysicalCoreMask": { "type": "integer", "minimum": 0 },
+        "selectedWorkerPhysicalCoreMaskComplete": { "type": "boolean" }
+      }
+    },
+    "phases": {
+      "type": "array",
+      "minItems": 7,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "available", "totalNanoseconds", "maximumNanoseconds", "sampleCount"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "available": { "type": "boolean" },
+          "totalNanoseconds": { "type": "integer", "minimum": 0 },
+          "maximumNanoseconds": { "type": "integer", "minimum": 0 },
+          "sampleCount": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "kernels": {
+      "type": "array",
+      "minItems": 6,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "available",
+          "submittedJobs",
+          "completedJobs",
+          "physicalWorkerJobs",
+          "ownerHelpedJobs",
+          "physicalWorkerMask",
+          "distinctPhysicalWorkers",
+          "physicalWorkerMaskComplete",
+          "elapsedNanoseconds",
+          "elapsedNanosecondsKnown"
+        ],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "available": { "type": "boolean" },
+          "submittedJobs": { "type": "integer", "minimum": 0 },
+          "completedJobs": { "type": "integer", "minimum": 0 },
+          "physicalWorkerJobs": { "type": "integer", "minimum": 0 },
+          "ownerHelpedJobs": { "type": "integer", "minimum": 0 },
+          "physicalWorkerMask": { "type": "integer", "minimum": 0 },
+          "distinctPhysicalWorkers": { "type": "integer", "minimum": 0 },
+          "physicalWorkerMaskComplete": { "type": "boolean" },
+          "elapsedNanoseconds": { "type": "integer", "minimum": 0 },
+          "elapsedNanosecondsKnown": { "type": "boolean" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{64}$"
+    }
+  }
+}

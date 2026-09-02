@@ -26,6 +26,9 @@ else()
         CXX_STANDARD_REQUIRED YES
         CXX_EXTENSIONS NO
     )
+    if(MSVC)
+        target_compile_options(core_job_system_tests PRIVATE /EHsc)
+    endif()
 endif()
 
 if(MINGW)

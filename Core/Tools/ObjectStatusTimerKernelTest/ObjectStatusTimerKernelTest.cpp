@@ -8,6 +8,11 @@
 #include <limits.h>
 #include <stdio.h>
 
+#if defined(_MSC_VER)
+#include <crtdbg.h>
+#include <stdlib.h>
+#endif
+
 #if defined(RTS_BUILD_CORE_EXTRAS)
 extern "C" void rts_job_system_set_test_fault(unsigned fault,
 	unsigned occurrence);
@@ -305,15 +310,40 @@ void testRuntimeAuthorityRequiresPhysicalWorkers()
 		runtime.shadowMatches == 1 && runtime.shadowMismatches == 1,
 		"status shadow evidence remains separate from live authority");
 	rts::ResetObjectStatusTimerRuntimeMetrics();
+	rts::ObjectStatusTimerMetrics highCoreMetrics;
+	highCoreMetrics.submittedJobs = 65;
+	highCoreMetrics.completedJobs = 65;
+	highCoreMetrics.physicalWorkerJobs = 65;
+	highCoreMetrics.physicalWorkerMask = ~static_cast<
+		rts::ObjectStatusTimerMetricCounter>(0);
+	highCoreMetrics.distinctPhysicalWorkers = 65;
+	highCoreMetrics.physicalWorkerMaskComplete = false;
+	highCoreMetrics.peakConcurrentPhysicalWorkers = 65;
+	rts::RecordObjectStatusTimerAuthoritativeCommit(65, 65,
+		highCoreMetrics);
+	runtime = rts::GetObjectStatusTimerRuntimeMetrics();
+	expect(runtime.authoritativeBatches == 1 &&
+		runtime.maximumDistinctPhysicalWorkers == 65 &&
+		!runtime.physicalWorkerMaskComplete,
+		"status runtime retains exact identities beyond its diagnostic mask width");
+	rts::ResetObjectStatusTimerRuntimeMetrics();
 	runtime = rts::GetObjectStatusTimerRuntimeMetrics();
 	expect(runtime.authoritativeBatches == 0 && runtime.committedCommands == 0 &&
-		runtime.physicalWorkerMask == 0 && runtime.shadowExecutions == 0,
+		runtime.physicalWorkerMask == 0 && runtime.physicalWorkerMaskComplete &&
+		runtime.shadowExecutions == 0,
 		"status runtime reset clears prior-match authority");
 }
 }
 
 int main()
 {
+#if defined(_MSC_VER)
+#if _MSC_VER >= 1400
+	_set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
+	_CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+	_CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+#endif
 	testLiveAdapterPreflightSkipsForcedSerialPreparation();
 	testSerialTimerDecisionsAndLegacyOrder();
 	testNoSchedulerIsQuietSerialDecision();

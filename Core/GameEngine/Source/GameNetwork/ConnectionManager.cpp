@@ -48,8 +48,14 @@
 #include "GameNetwork/NetCommandValidation.h"
 #include "GameNetwork/NetCommandWrapperList.h"
 #if defined(_WIN64)
+#include "GameNetwork/InstalledLockstepV2Validation.h"
+#include "Lib/LockstepV2Contract.h"
+#include "Lib/NetworkCommandOriginPolicy.h"
 #include "Lib/NetworkEpochHandshake.h"
+#include "Lib/MultiplayerSimulationRuntimeProof.h"
 #include <bcrypt.h>
+#include <vector>
+
 #endif
 #include "GameNetwork/networkutil.h"
 #include "GameLogic/GameLogic.h"
@@ -104,6 +110,310 @@ enum TransferFileType
 };
 
 #if defined(_WIN64)
+static Bool getCurrentExecutablePath(WideChar *path, UnsignedInt pathCount)
+{
+	if (path == nullptr || pathCount < 2)
+		return FALSE;
+	const DWORD length = GetModuleFileNameW(nullptr, path, pathCount);
+	return length > 0 && length < pathCount;
+}
+
+static Bool calculateFileSha256(const WideChar *path, char output[65])
+{
+	if (path == nullptr || output == nullptr)
+		return FALSE;
+	output[0] = '\0';
+	HANDLE file = CreateFileW(path, GENERIC_READ,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+		OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+	if (file == INVALID_HANDLE_VALUE)
+		return FALSE;
+
+	BCRYPT_ALG_HANDLE algorithm = nullptr;
+	BCRYPT_HASH_HANDLE hash = nullptr;
+	DWORD objectLength = 0;
+	DWORD digestLength = 0;
+	DWORD propertyBytes = 0;
+	Bool success = FALSE;
+	if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM,
+		nullptr, 0) != 0 ||
+		BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
+			reinterpret_cast<PUCHAR>(&objectLength), sizeof(objectLength),
+			&propertyBytes, 0) != 0 || objectLength == 0 ||
+		BCryptGetProperty(algorithm, BCRYPT_HASH_LENGTH,
+			reinterpret_cast<PUCHAR>(&digestLength), sizeof(digestLength),
+			&propertyBytes, 0) != 0 || digestLength != 32)
+	{
+		if (algorithm != nullptr)
+			BCryptCloseAlgorithmProvider(algorithm, 0);
+		CloseHandle(file);
+		return FALSE;
+	}
+
+	std::vector<UnsignedByte> objectBuffer(objectLength);
+	std::vector<UnsignedByte> digest(digestLength);
+	std::vector<UnsignedByte> readBuffer(64U * 1024U);
+	if (BCryptCreateHash(algorithm, &hash, objectBuffer.data(), objectLength,
+		nullptr, 0, 0) == 0)
+	{
+		for (;;)
+		{
+			DWORD bytesRead = 0;
+			if (!ReadFile(file, readBuffer.data(),
+				static_cast<DWORD>(readBuffer.size()), &bytesRead, nullptr))
+			{
+				break;
+			}
+			if (bytesRead == 0)
+			{
+				success = BCryptFinishHash(hash, digest.data(), digestLength, 0) == 0;
+				break;
+			}
+			if (BCryptHashData(hash, readBuffer.data(), bytesRead, 0) != 0)
+				break;
+		}
+	}
+	if (success)
+	{
+		static const char HEX[] = "0123456789ABCDEF";
+		for (UnsignedInt index = 0; index < digestLength; ++index)
+		{
+			output[index * 2] = HEX[digest[index] >> 4];
+			output[index * 2 + 1] = HEX[digest[index] & 0x0f];
+		}
+		output[64] = '\0';
+	}
+	if (hash != nullptr)
+		BCryptDestroyHash(hash);
+	BCryptCloseAlgorithmProvider(algorithm, 0);
+	CloseHandle(file);
+	return success;
+}
+
+static Bool readRuntimeProofDocument(const WideChar *executablePath,
+	std::vector<char> &document)
+{
+	if (executablePath == nullptr)
+		return FALSE;
+	WideChar proofPath[MAX_PATH];
+	wcscpy_s(proofPath, executablePath);
+	WideChar *separator = wcsrchr(proofPath, L'\\');
+	if (separator == nullptr)
+		return FALSE;
+	separator[1] = L'\0';
+	static const WideChar PROOF_NAME[] =
+		L"MultiplayerSimulationRuntimeProof.txt";
+	if (wcslen(proofPath) + ARRAY_SIZE(PROOF_NAME) > ARRAY_SIZE(proofPath))
+		return FALSE;
+	wcscat_s(proofPath, PROOF_NAME);
+
+	HANDLE file = CreateFileW(proofPath, GENERIC_READ, FILE_SHARE_READ,
+		nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+		nullptr);
+	if (file == INVALID_HANDLE_VALUE)
+		return FALSE;
+	LARGE_INTEGER size;
+	if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 ||
+		size.QuadPart > 4096)
+	{
+		CloseHandle(file);
+		return FALSE;
+	}
+	document.resize(static_cast<size_t>(size.QuadPart));
+	DWORD bytesRead = 0;
+	const Bool success = ReadFile(file, document.data(),
+		static_cast<DWORD>(document.size()), &bytesRead, nullptr) &&
+		bytesRead == document.size();
+	CloseHandle(file);
+	return success;
+}
+
+static Bool buildRuntimeProofSiblingPath(const WideChar *executablePath,
+	const WideChar *relativePath, WideChar output[MAX_PATH])
+{
+	if (executablePath == nullptr || relativePath == nullptr || output == nullptr)
+		return FALSE;
+	wcscpy_s(output, MAX_PATH, executablePath);
+	WideChar *separator = wcsrchr(output, L'\\');
+	if (separator == nullptr)
+		return FALSE;
+	separator[1] = L'\0';
+	const size_t rootLength = wcslen(output);
+	const size_t relativeLength = wcslen(relativePath);
+	if (rootLength + relativeLength >= MAX_PATH)
+		return FALSE;
+	wcscat_s(output, MAX_PATH, relativePath);
+	return TRUE;
+}
+
+static Bool readBoundedRuntimeProofFile(const WideChar *path,
+	UnsignedInt maximumBytes, std::vector<char> &document)
+{
+	HANDLE file = CreateFileW(path, GENERIC_READ,
+		FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+		FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+	if (file == INVALID_HANDLE_VALUE)
+		return FALSE;
+	LARGE_INTEGER size;
+	if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 ||
+		size.QuadPart > maximumBytes)
+	{
+		CloseHandle(file);
+		return FALSE;
+	}
+	document.resize(static_cast<size_t>(size.QuadPart));
+	DWORD bytesRead = 0;
+	const Bool success = ReadFile(file, document.data(),
+		static_cast<DWORD>(document.size()), &bytesRead, nullptr) &&
+		bytesRead == document.size();
+	CloseHandle(file);
+	return success;
+}
+
+static Bool verifyRuntimeProofFileSha256(const WideChar *executablePath,
+	const WideChar *relativePath, const std::string &expectedSha256)
+{
+	WideChar path[MAX_PATH];
+	char actualSha256[65];
+	return buildRuntimeProofSiblingPath(executablePath, relativePath, path) &&
+		calculateFileSha256(path, actualSha256) &&
+		expectedSha256 == actualSha256;
+}
+
+static Bool isSafeRuntimeProofRelativePath(const std::string &path)
+{
+	return !path.empty() && path.size() < MAX_PATH && path[0] != '\\' &&
+		path[0] != '/' && path.find(':') == std::string::npos &&
+		path.find("..") == std::string::npos &&
+		path.compare(0, 8, "Net3Raw\\") == 0;
+}
+
+static Bool verifyRuntimeProofRawEvidenceIndex(const WideChar *executablePath,
+	const std::string &expectedIndexSha256)
+{
+	static const WideChar INDEX_NAME[] =
+		L"MultiplayerSimulationRawEvidence.index";
+	WideChar indexPath[MAX_PATH];
+	if (!buildRuntimeProofSiblingPath(executablePath, INDEX_NAME, indexPath))
+		return FALSE;
+	char actualIndexSha256[65];
+	if (!calculateFileSha256(indexPath, actualIndexSha256) ||
+		expectedIndexSha256 != actualIndexSha256)
+	{
+		return FALSE;
+	}
+	std::vector<char> bytes;
+	if (!readBoundedRuntimeProofFile(indexPath, 64U * 1024U, bytes))
+		return FALSE;
+	const std::string document(bytes.data(), bytes.size());
+	static const char MAGIC[] =
+		"RTS_MULTIPLAYER_SIMULATION_RAW_EVIDENCE_V1\n";
+	if (document.compare(0, sizeof(MAGIC) - 1, MAGIC) != 0)
+		return FALSE;
+	std::size_t cursor = sizeof(MAGIC) - 1;
+	std::vector<std::string> observedPaths;
+	observedPaths.reserve(40U);
+	for (UnsignedInt index = 0; index < 40U; ++index)
+	{
+		const std::size_t lineEnd = document.find('\n', cursor);
+		if (lineEnd == std::string::npos)
+			return FALSE;
+		const std::string line(document, cursor, lineEnd - cursor);
+		char expectedOrdinal[4];
+		sprintf_s(expectedOrdinal, "%02u|", index);
+		if (line.compare(0, 3, expectedOrdinal) != 0)
+			return FALSE;
+		const std::size_t separator = line.find('|', 3);
+		if (separator == std::string::npos || separator + 65 != line.size())
+			return FALSE;
+		const std::string relativePath(line, 3, separator - 3);
+		const std::string expectedSha256(line, separator + 1, 64);
+		if (!isSafeRuntimeProofRelativePath(relativePath) ||
+			!rts::IsCanonicalUpperHexDigest(expectedSha256, 64))
+		{
+			return FALSE;
+		}
+		for (std::size_t prior = 0; prior < observedPaths.size(); ++prior)
+		{
+			if (observedPaths[prior] == relativePath)
+				return FALSE;
+		}
+		observedPaths.push_back(relativePath);
+		WideChar relativeWide[MAX_PATH];
+		const Int wideLength = MultiByteToWideChar(CP_UTF8,
+			MB_ERR_INVALID_CHARS, relativePath.c_str(), -1, relativeWide,
+			ARRAY_SIZE(relativeWide));
+		if (wideLength <= 0 || !verifyRuntimeProofFileSha256(executablePath,
+			relativeWide, expectedSha256))
+		{
+			return FALSE;
+		}
+		cursor = lineEnd + 1;
+	}
+	return document.compare(cursor, 4, "END\n") == 0 &&
+		cursor + 4 == document.size();
+}
+
+static Bool verifyRuntimeProofEvidenceBundle(const WideChar *executablePath,
+	const rts::MultiplayerSimulationRuntimeProof &proof)
+{
+	return verifyRuntimeProofFileSha256(executablePath,
+		L"Net3LoopbackEvidence.json", proof.evidenceManifestSha256) &&
+		verifyRuntimeProofFileSha256(executablePath,
+		L"Stage5ArtifactSet.json", proof.artifactSetSha256) &&
+		verifyRuntimeProofRawEvidenceIndex(executablePath,
+			proof.rawEvidenceIndexSha256);
+}
+
+static unsigned getRuntimeMultiplayerSimulationReleaseProvenKernelMask(
+	UnsignedInt buildCompatibilityCrc, UnsignedInt contentCrc)
+{
+	static Bool inspected = FALSE;
+	static UnsignedInt inspectedBuildCrc = 0U;
+	static UnsignedInt inspectedContentCrc = 0U;
+	static unsigned resolvedMask =
+		rts::MULTIPLAYER_SIMULATION_KERNEL_RELEASE_PROVEN_DEFAULT_MASK;
+	if (inspected)
+	{
+		return buildCompatibilityCrc == inspectedBuildCrc &&
+			contentCrc == inspectedContentCrc ? resolvedMask :
+			rts::MULTIPLAYER_SIMULATION_KERNEL_RELEASE_PROVEN_DEFAULT_MASK;
+	}
+	inspected = TRUE;
+	inspectedBuildCrc = buildCompatibilityCrc;
+	inspectedContentCrc = contentCrc;
+
+	WideChar executablePath[MAX_PATH];
+	char executableSha256[65];
+	std::vector<char> document;
+	if (!getCurrentExecutablePath(executablePath, ARRAY_SIZE(executablePath)) ||
+		!calculateFileSha256(executablePath, executableSha256) ||
+		!readRuntimeProofDocument(executablePath, document))
+	{
+		return rts::MULTIPLAYER_SIMULATION_KERNEL_RELEASE_PROVEN_DEFAULT_MASK;
+	}
+	rts::MultiplayerSimulationRuntimeProof proof;
+	if (!rts::ParseMultiplayerSimulationRuntimeProof(document.data(),
+		document.size(), proof) ||
+		!verifyRuntimeProofEvidenceBundle(executablePath, proof))
+	{
+		return rts::MULTIPLAYER_SIMULATION_KERNEL_RELEASE_PROVEN_DEFAULT_MASK;
+	}
+	#if RTS_GENERALS
+	static const char EXPECTED_TITLE[] = "Generals";
+	#else
+	static const char EXPECTED_TITLE[] = "ZeroHour";
+	#endif
+	resolvedMask = rts::ResolveMultiplayerSimulationRuntimeProofMask(proof,
+		EXPECTED_TITLE, executableSha256, buildCompatibilityCrc, contentCrc,
+		static_cast<unsigned>(
+			rts::MULTIPLAYER_SIMULATION_KERNEL_LIVE_INTEGRATED_MASK),
+		static_cast<unsigned>(
+			rts::MULTIPLAYER_SIMULATION_KERNEL_RELEASE_PROVEN_DEFAULT_MASK),
+		"");
+	return resolvedMask;
+}
+
 static Bool generateNetworkHelloToken(std::uint64_t *token)
 {
 	if (token == nullptr)
@@ -302,6 +612,10 @@ ConnectionManager::ConnectionManager()
 	m_networkHelloDeferredCount = 0U;
 	m_networkHelloPendingCommands = nullptr;
 	m_networkHelloPendingCommandCount = 0U;
+	m_lockstepV2ReceiptRecorder.reset();
+	m_lockstepV2Session = rts::lockstep_v2::SessionContract();
+	m_lockstepV2TransportInitialized = FALSE;
+	clearNetworkSimulationPolicy();
 	clearNetworkFrameResendRequest();
 	for (Int i = 0; i < MAX_SLOTS; ++i) {
 		m_networkHelloValidated[i] = FALSE;
@@ -340,6 +654,10 @@ void ConnectionManager::init()
 	m_networkHelloAttempts = 0U;
 	m_networkHelloLocalToken = 0U;
 	m_networkHelloDeferredCount = 0U;
+	m_lockstepV2ReceiptRecorder.reset();
+	m_lockstepV2Session = rts::lockstep_v2::SessionContract();
+	m_lockstepV2TransportInitialized = FALSE;
+	clearNetworkSimulationPolicy();
 	for (i = 0; i < MAX_SLOTS; ++i) {
 		m_networkHelloValidated[i] = FALSE;
 		m_networkHelloAckReceived[i] = FALSE;
@@ -475,6 +793,10 @@ void ConnectionManager::reset()
 	m_networkHelloAttempts = 0U;
 	m_networkHelloLocalToken = 0U;
 	m_networkHelloDeferredCount = 0U;
+	m_lockstepV2ReceiptRecorder.reset();
+	m_lockstepV2Session = rts::lockstep_v2::SessionContract();
+	m_lockstepV2TransportInitialized = FALSE;
+	clearNetworkSimulationPolicy();
 	for (i = 0; i < MAX_SLOTS; ++i) {
 		m_networkHelloValidated[i] = FALSE;
 		m_networkHelloAckReceived[i] = FALSE;
@@ -527,6 +849,12 @@ Bool ConnectionManager::isPlayerConnected( Int playerID )
 void ConnectionManager::attachTransport(Transport *transport) {
 	delete m_transport;
 	m_transport = transport;
+#if defined(_WIN64)
+	// An attached transport may be owned by the normal LAN/GameSpy startup
+	// path.  Only initTransport() can positively report that this manager bound
+	// a UDP socket, so an externally attached object is not v2-proof-ready.
+	m_lockstepV2TransportInitialized = FALSE;
+#endif
 }
 
 Bool ConnectionManager::isNetworkHelloReady() const
@@ -548,7 +876,303 @@ Bool ConnectionManager::hasNetworkHelloFailure() const
 #endif
 }
 
+Bool ConnectionManager::isNetworkSimulationPolicyUsable() const
+{
 #if defined(_WIN64)
+	UnsignedInt presentRemoteMask = 0U;
+	UnsignedInt quittingRemoteMask = 0U;
+	for (Int slot = 0; slot < MAX_SLOTS; ++slot)
+	{
+		const UnsignedInt slotMask = 1U << slot;
+		if ((m_networkHelloExpectedSlots & slotMask) == 0U)
+			continue;
+		if (m_connections[slot] != nullptr &&
+			m_networkSimulationRemoteIdentityReceived[slot] &&
+			m_networkSimulationRemoteIdentity[slot].rosterMask ==
+				m_networkSimulationRosterMask)
+		{
+			presentRemoteMask |= slotMask;
+		}
+		if (m_connections[slot] != nullptr &&
+			m_connections[slot]->isQuitting())
+		{
+			quittingRemoteMask |= slotMask;
+		}
+	}
+	return m_networkSimulationLocalIdentity.rosterMask ==
+		m_networkSimulationRosterMask &&
+		rts::IsMultiplayerSimulationPolicyLifecycleUsable(
+			m_networkSimulationPolicyResolved,
+			m_networkSimulationSessionPolicy.status ==
+				rts::MULTIPLAYER_SIMULATION_POLICY_READY,
+			isNetworkHelloReady(), m_networkHelloFailed,
+			m_networkSimulationRosterMask, m_networkHelloExpectedSlots,
+			presentRemoteMask, quittingRemoteMask, m_localSlot, MAX_SLOTS);
+#else
+	return FALSE;
+#endif
+}
+
+Bool ConnectionManager::refreshNetworkSimulationPolicyForLockstepV2()
+{
+#if defined(_WIN64)
+	if (!rts::IsInstalledLockstepV2QualificationActive() ||
+		m_lockstepV2ReceiptRecorder.isActive() || !m_networkHelloStarted ||
+		m_localSlot < 0 || m_localSlot >= MAX_SLOTS)
+	{
+		return FALSE;
+	}
+	// Reusing the production Hello path is important: the refreshed identity
+	// and its session challenge still travel over the same UDP transport and
+	// are subject to the normal endpoint/roster checks.
+	beginNetworkHello();
+	return !m_networkHelloFailed;
+#else
+	return FALSE;
+#endif
+}
+
+Bool ConnectionManager::isMultiplayerSimulationKernelEnabled(
+	rts::MultiplayerSimulationKernel kernel) const
+{
+#if defined(_WIN64)
+	if (!isNetworkSimulationPolicyUsable())
+		return FALSE;
+	return rts::IsMultiplayerSimulationKernelEnabled(
+		m_networkSimulationSessionPolicy, kernel);
+#else
+	return FALSE;
+#endif
+}
+
+UnsignedInt ConnectionManager::getMultiplayerSimulationEnabledKernelMask() const
+{
+#if defined(_WIN64)
+	return isNetworkSimulationPolicyUsable() ?
+		m_networkSimulationSessionPolicy.enabledKernelMask : 0U;
+#else
+	return 0U;
+#endif
+}
+
+rts::MultiplayerSimulationPolicyStatus
+ConnectionManager::getMultiplayerSimulationPolicyStatus() const
+{
+#if defined(_WIN64)
+	return m_networkSimulationPolicyResolved ?
+		m_networkSimulationSessionPolicy.status :
+		rts::MULTIPLAYER_SIMULATION_POLICY_SERIAL_NETWORK_UNAVAILABLE;
+#else
+	return rts::MULTIPLAYER_SIMULATION_POLICY_SERIAL_NETWORK_UNAVAILABLE;
+#endif
+}
+
+#if defined(_WIN64)
+Bool ConnectionManager::beginLockstepV2Proof(
+	const rts::lockstep_v2::SessionContract &session)
+{
+	m_lockstepV2ReceiptRecorder.reset();
+	m_lockstepV2Session = rts::lockstep_v2::SessionContract();
+	if (m_transport == nullptr || !m_lockstepV2TransportInitialized ||
+		!m_networkHelloStarted || !isNetworkHelloReady() || m_networkHelloFailed ||
+		m_networkHelloLocalToken == 0U || m_localSlot < 0 ||
+		m_localSlot >= MAX_SLOTS ||
+		!rts::lockstep_v2::IsValidSessionContract(session) ||
+		!rts::IsInstalledLockstepV2QualificationActive() ||
+		!isNetworkSimulationPolicyUsable() ||
+		TheGlobalData == nullptr ||
+		session.localSlot != static_cast<UnsignedInt>(m_localSlot) ||
+		session.rosterMask != m_networkSimulationRosterMask ||
+		session.buildCompatibilityCrc != TheGlobalData->m_exeCRC ||
+		session.contentCrc != TheGlobalData->m_iniCRC ||
+		session.mapCrc != m_networkSimulationMapCrc)
+	{
+		return FALSE;
+	}
+	if (session.originMode == rts::lockstep_v2::CommandOriginMode::TrustedRouter &&
+		(m_packetRouterSlot < 0 || m_packetRouterSlot >= MAX_SLOTS ||
+			session.packetRouterSlot != static_cast<UnsignedInt>(m_packetRouterSlot) ||
+			(m_packetRouterSlot != m_localSlot &&
+				(m_connections[m_packetRouterSlot] == nullptr ||
+					m_connections[m_packetRouterSlot]->isQuitting()))))
+	{
+		return FALSE;
+	}
+
+	WideChar executablePath[MAX_PATH];
+	char executableSha256[65];
+	if (!getCurrentExecutablePath(executablePath, ARRAY_SIZE(executablePath)) ||
+		!calculateFileSha256(executablePath, executableSha256))
+	{
+		return FALSE;
+	}
+	if (!m_lockstepV2ReceiptRecorder.beginQualification(session,
+		m_networkHelloLocalToken, executableSha256))
+	{
+		return FALSE;
+	}
+	m_lockstepV2Session = session;
+	return TRUE;
+}
+
+Bool ConnectionManager::recordLockstepV2Command(UnsignedInt frame,
+	UnsignedInt originSlot, UnsignedShort commandId,
+	std::uint64_t commandDigest)
+{
+	return m_lockstepV2ReceiptRecorder.recordCommand(frame, originSlot,
+		commandId, commandDigest);
+}
+
+Bool ConnectionManager::recordLockstepV2Frame(UnsignedInt frame,
+	UnsignedInt crc, std::uint64_t commandDigest)
+{
+	return m_lockstepV2ReceiptRecorder.recordFrame(frame, crc,
+		commandDigest);
+}
+
+Bool ConnectionManager::finalizeLockstepV2Proof(Bool cleanShutdown,
+	rts::lockstep_v2::Receipt *receipt)
+{
+	if (receipt == nullptr || !m_lockstepV2ReceiptRecorder.isActive() ||
+		m_transport == nullptr || !m_lockstepV2TransportInitialized ||
+		!isNetworkHelloReady() || m_networkHelloFailed ||
+		!isNetworkSimulationPolicyUsable() || cleanShutdown == FALSE ||
+		!areAllQueuesEmpty())
+	{
+		return FALSE;
+	}
+	// A clean qualification boundary is observed from production transport
+	// state, not inferred from the caller reaching the common stop frame.  Every
+	// remote roster member must still be connected and non-quitting, and every
+	// reliable-send queue must already be drained before the receipt is sealed.
+	for (Int slot = 0; slot < MAX_SLOTS; ++slot)
+	{
+		if (slot == m_localSlot ||
+			(m_networkSimulationRosterMask & (1U << slot)) == 0U)
+		{
+			continue;
+		}
+		if (m_connections[slot] == nullptr || m_connections[slot]->isQuitting())
+			return FALSE;
+	}
+	rts::lockstep_v2::WorkerTelemetry workerTelemetry;
+	if (!rts::GetInstalledLockstepV2WorkerTelemetry(&workerTelemetry) ||
+		workerTelemetry.authorityMask != m_lockstepV2Session.provenKernelMask ||
+		!m_lockstepV2ReceiptRecorder.publishWorkerTelemetry(workerTelemetry) ||
+		!m_lockstepV2ReceiptRecorder.finish(cleanShutdown != FALSE,
+		TRUE, TRUE))
+	{
+		return FALSE;
+	}
+	*receipt = m_lockstepV2ReceiptRecorder.receipt();
+	return TRUE;
+}
+
+Bool ConnectionManager::isLockstepV2ProofActive() const
+{
+	return m_lockstepV2ReceiptRecorder.isActive();
+}
+
+void ConnectionManager::clearNetworkSimulationPolicy()
+{
+	m_networkSimulationMapCrc = 0U;
+	m_networkSimulationRosterMask = 0U;
+	m_networkSimulationPolicyResolved = FALSE;
+	m_networkSimulationLocalIdentity =
+		rts::network_epoch::NetworkSimulationPolicyIdentity();
+	m_networkSimulationSessionPolicy =
+		rts::MultiplayerSimulationSessionPolicy();
+	for (Int slot = 0; slot < MAX_SLOTS; ++slot)
+	{
+		m_networkSimulationRemoteIdentity[slot] =
+			rts::network_epoch::NetworkSimulationPolicyIdentity();
+		m_networkSimulationRemoteIdentityReceived[slot] = FALSE;
+	}
+}
+
+void ConnectionManager::revokeNetworkSimulationPolicy()
+{
+	m_networkSimulationPolicyResolved = FALSE;
+	m_networkSimulationSessionPolicy =
+		rts::MultiplayerSimulationSessionPolicy();
+	m_networkSimulationLocalIdentity.provenKernelMask = 0U;
+	for (Int slot = 0; slot < MAX_SLOTS; ++slot)
+		m_networkSimulationRemoteIdentityReceived[slot] = FALSE;
+}
+
+Bool ConnectionManager::acceptNetworkSimulationPolicy(Int slot,
+	const rts::network_epoch::NetworkSimulationPolicyIdentity &identity)
+{
+	if (slot < 0 || slot >= MAX_SLOTS ||
+		!rts::network_epoch::IsNetworkSimulationRosterIdentityValid(
+			identity.rosterMask, m_networkHelloExpectedSlots,
+			m_localSlot, MAX_SLOTS))
+	{
+		return FALSE;
+	}
+	if (m_networkSimulationRemoteIdentityReceived[slot] &&
+		!rts::network_epoch::IsMatchingNetworkSimulationPolicyIdentity(
+			m_networkSimulationRemoteIdentity[slot], identity))
+	{
+		return FALSE;
+	}
+	m_networkSimulationRemoteIdentity[slot] = identity;
+	m_networkSimulationRemoteIdentityReceived[slot] = TRUE;
+	return TRUE;
+}
+
+Bool ConnectionManager::resolveNetworkSimulationPolicy()
+{
+	rts::MultiplayerSimulationPeerPolicy localPeer;
+	localPeer.schema = m_networkSimulationLocalIdentity.schema;
+	localPeer.engineEpoch = m_networkSimulationLocalIdentity.engineEpoch;
+	localPeer.determinismEpoch =
+		m_networkSimulationLocalIdentity.determinismEpoch;
+	localPeer.buildCompatibilityCrc =
+		m_networkSimulationLocalIdentity.buildCompatibilityCrc;
+	localPeer.contentCrc = m_networkSimulationLocalIdentity.contentCrc;
+	localPeer.mapCrc = m_networkSimulationLocalIdentity.mapCrc;
+	localPeer.provenKernelMask =
+		m_networkSimulationLocalIdentity.provenKernelMask;
+
+	rts::MultiplayerSimulationPeerPolicy remotePeers[
+		rts::MULTIPLAYER_SIMULATION_MAXIMUM_REMOTE_PEERS];
+	unsigned remotePeerCount = 0U;
+	for (Int slot = 0; slot < MAX_SLOTS; ++slot)
+	{
+		if ((m_networkHelloExpectedSlots & (1U << slot)) == 0U)
+			continue;
+		if (!m_networkSimulationRemoteIdentityReceived[slot] ||
+			remotePeerCount >=
+				rts::MULTIPLAYER_SIMULATION_MAXIMUM_REMOTE_PEERS)
+		{
+			return FALSE;
+		}
+		const rts::network_epoch::NetworkSimulationPolicyIdentity &identity =
+			m_networkSimulationRemoteIdentity[slot];
+		rts::MultiplayerSimulationPeerPolicy &remotePeer =
+			remotePeers[remotePeerCount++];
+		remotePeer.schema = identity.schema;
+		remotePeer.engineEpoch = identity.engineEpoch;
+		remotePeer.determinismEpoch = identity.determinismEpoch;
+		remotePeer.buildCompatibilityCrc = identity.buildCompatibilityCrc;
+		remotePeer.contentCrc = identity.contentCrc;
+		remotePeer.mapCrc = identity.mapCrc;
+		remotePeer.provenKernelMask = identity.provenKernelMask;
+	}
+
+	if (remotePeerCount == 0U)
+		return FALSE;
+	// A rejected negotiation is still a resolved, persisted serial policy.
+	// Unsupported or unproven contracts must not turn a compatible NET3
+	// transport exchange into implicit worker permission.
+	rts::ResolveMultiplayerSimulationSessionPolicy(localPeer, remotePeers,
+		remotePeerCount, rts::MULTIPLAYER_SIMULATION_KERNEL_KNOWN_MASK,
+		m_networkSimulationSessionPolicy);
+	m_networkSimulationPolicyResolved = TRUE;
+	return TRUE;
+}
+
 void ConnectionManager::beginNetworkHello()
 {
 	clearNetworkHelloPendingCommands();
@@ -564,6 +1188,9 @@ void ConnectionManager::beginNetworkHello()
 	m_networkHelloAttempts = 0U;
 	m_networkHelloLocalToken = 0U;
 	m_networkHelloExpectedSlots = 0U;
+	m_networkSimulationPolicyResolved = FALSE;
+	m_networkSimulationSessionPolicy =
+		rts::MultiplayerSimulationSessionPolicy();
 
 	Bool hasRemotePeer = FALSE;
 	for (Int i = 0; i < MAX_SLOTS; ++i)
@@ -571,12 +1198,41 @@ void ConnectionManager::beginNetworkHello()
 		m_networkHelloValidated[i] = FALSE;
 		m_networkHelloAckReceived[i] = FALSE;
 		m_networkHelloRemoteToken[i] = 0U;
+		m_networkSimulationRemoteIdentity[i] =
+			rts::network_epoch::NetworkSimulationPolicyIdentity();
+		m_networkSimulationRemoteIdentityReceived[i] = FALSE;
 		if (m_connections[i] != nullptr)
 		{
 			hasRemotePeer = TRUE;
 			m_networkHelloExpectedSlots |= (1U << i);
 		}
 	}
+	if (m_localSlot < 0 || m_localSlot >= MAX_SLOTS)
+	{
+		rejectNetworkHello(-1, "NET3 local slot is not in the game roster");
+		return;
+	}
+	m_networkSimulationRosterMask = m_networkHelloExpectedSlots |
+		(1U << m_localSlot);
+	unsigned candidateKernelMask =
+		getRuntimeMultiplayerSimulationReleaseProvenKernelMask(
+			TheGlobalData->m_exeCRC, TheGlobalData->m_iniCRC);
+#if defined(_WIN64)
+	// The installed v2 qualifier refreshes this hello only after its local
+	// scheduler prerequisites are ready.  This mask is permission for the
+	// bounded qualification run; executable-origin kernel telemetry is gathered
+	// from the real gameplay execution and published only at finalization.
+	if (rts::IsInstalledLockstepV2QualificationActive())
+	{
+		candidateKernelMask = rts::GetInstalledLockstepV2ValidationAuthorityMask(
+			TheGlobalData->m_exeCRC, TheGlobalData->m_iniCRC);
+	}
+#endif
+	m_networkSimulationLocalIdentity =
+		rts::network_epoch::MakeNetworkSimulationPolicyIdentity(
+			TheGlobalData->m_exeCRC, TheGlobalData->m_iniCRC,
+			m_networkSimulationMapCrc, m_networkSimulationRosterMask,
+			candidateKernelMask);
 
 	if (!hasRemotePeer)
 		return;
@@ -633,6 +1289,12 @@ void ConnectionManager::serviceNetworkHello()
 	if (rts::network_epoch::IsNetworkHelloComplete(m_networkHelloExpectedSlots,
 		validatedSlots, acknowledgedSlots))
 	{
+		if (!resolveNetworkSimulationPolicy())
+		{
+			rejectNetworkHello(-1,
+				"NET3 simulation policy roster could not be resolved");
+			return;
+		}
 		m_networkHelloRequired = FALSE;
 		drainNetworkHelloPendingCommands();
 		return;
@@ -679,7 +1341,8 @@ Bool ConnectionManager::sendNetworkHello(Int slot)
 	const std::array<rts::runtime_epoch::Byte, rts::network_epoch::kNetworkHelloWireSize> encoded =
 		rts::network_epoch::EncodeNetworkHello(TheGlobalData->m_exeCRC, TheGlobalData->m_iniCRC,
 		static_cast<UnsignedInt>(m_localSlot), static_cast<UnsignedInt>(slot),
-		m_networkHelloLocalToken);
+		m_networkHelloLocalToken, rts::network_epoch::NetworkHelloKind::Hello,
+		m_networkSimulationLocalIdentity);
 	User *user = m_connections[slot]->getUser();
 	if (m_transport->queueSend(user->GetIPAddr(), user->GetPort(), encoded.data(),
 		static_cast<Int>(encoded.size())))
@@ -703,7 +1366,8 @@ Bool ConnectionManager::sendNetworkHelloAck(Int slot)
 		rts::network_epoch::EncodeNetworkHello(TheGlobalData->m_exeCRC, TheGlobalData->m_iniCRC,
 		static_cast<UnsignedInt>(m_localSlot), static_cast<UnsignedInt>(slot),
 		m_networkHelloRemoteToken[slot],
-		rts::network_epoch::NetworkHelloKind::Ack);
+		rts::network_epoch::NetworkHelloKind::Ack,
+		m_networkSimulationLocalIdentity);
 	User *user = m_connections[slot]->getUser();
 	if (m_transport->queueSend(user->GetIPAddr(), user->GetPort(), encoded.data(),
 		static_cast<Int>(encoded.size())))
@@ -771,10 +1435,59 @@ Bool ConnectionManager::isNetworkCommandSourceAuthorized(const NetCommandMsg *ms
 		packetRouterSlot = m_packetRouterSlot;
 	}
 
+	if (m_lockstepV2ReceiptRecorder.isActive())
+	{
+		if (m_lockstepV2Session.originMode ==
+			rts::lockstep_v2::CommandOriginMode::TrustedRouter &&
+			(m_packetRouterSlot < 0 || m_packetRouterSlot >= MAX_SLOTS ||
+				static_cast<UnsignedInt>(m_packetRouterSlot) !=
+					m_lockstepV2Session.packetRouterSlot ||
+				(m_packetRouterSlot != m_localSlot &&
+					(m_connections[m_packetRouterSlot] == nullptr ||
+						m_connections[m_packetRouterSlot]->isQuitting()))))
+		{
+			return FALSE;
+		}
+		return rts::IsLockstepV2CommandSourceAuthorized(
+			static_cast<unsigned>(sourceSlot),
+			static_cast<unsigned>(msg->getPlayerID()),
+			static_cast<unsigned>(packetRouterSlot),
+			m_lockstepV2Session.originMode,
+			static_cast<unsigned>(MAX_SLOTS));
+	}
+
 	return rts::network_epoch::IsNetworkCommandSourceAuthorized(
 		static_cast<std::uint32_t>(sourceSlot),
 		static_cast<std::uint32_t>(msg->getPlayerID()),
 		static_cast<std::uint32_t>(packetRouterSlot));
+}
+
+Bool ConnectionManager::getLockstepV2CommandDigest(const NetCommandRef *ref,
+	std::uint64_t *digest) const
+{
+	if (ref == nullptr || digest == nullptr || ref->getCommand() == nullptr)
+		return FALSE;
+	const NetCommandMsg *command = ref->getCommand();
+	const std::size_t byteCount = command->getSizeForNetPacket();
+	if (byteCount == 0U || byteCount > static_cast<std::size_t>(MAX_NETWORK_MESSAGE_LEN))
+		return FALSE;
+	std::vector<UnsignedByte> bytes(byteCount);
+	const std::size_t written = command->copyBytesForNetPacket(bytes.data(), *ref);
+	if (written != byteCount)
+		return FALSE;
+	if (command->getNetCommandType() == NETCOMMANDTYPE_GAMECOMMAND)
+	{
+		// Relay masks describe this hop, not the authored command.  Remove the
+		// mutable relay value before comparing a contribution across peers while
+		// retaining the field tag and every origin/frame/payload byte.
+		const std::size_t relayValueOffset =
+			sizeof(NetPacketCommandTypeField) + sizeof(NetPacketFrameField) + 1U;
+		if (relayValueOffset >= bytes.size())
+			return FALSE;
+		bytes[relayValueOffset] = 0U;
+	}
+	*digest = rts::lockstep_v2::ComputeCommandDigest(bytes.data(), written);
+	return *digest != 0U;
 }
 
 void ConnectionManager::clearNetworkFrameResendRequest()
@@ -921,6 +1634,7 @@ Bool ConnectionManager::processNetworkFrameRecoveryWrapper(NetCommandRef *ref, I
 void ConnectionManager::rejectNetworkHello(Int slot, const char *reason)
 {
 	m_networkHelloFailed = TRUE;
+	revokeNetworkSimulationPolicy();
 	clearNetworkHelloPendingCommands();
 	for (UnsignedInt index = 0; index < m_networkHelloDeferredCount; ++index)
 		m_networkHelloDeferred[index].length = 0;
@@ -1068,11 +1782,13 @@ Bool ConnectionManager::processNetworkHello(const TransportMessage &message, Boo
 	rts::network_epoch::NetworkHelloIdentity identity;
 	std::uint64_t receivedSessionToken = 0U;
 	rts::runtime_epoch::NetworkHello hello;
+	rts::network_epoch::NetworkSimulationPolicyIdentity simulationIdentity;
 	const rts::runtime_epoch::ValidationResult result =
 		rts::network_epoch::DecodeAndValidateNetworkHelloRecord(
 			message.data, static_cast<std::size_t>(message.length),
 			TheGlobalData->m_exeCRC, TheGlobalData->m_iniCRC,
-			&hello, &kind, &identity, &receivedSessionToken);
+			&hello, &kind, &identity, &receivedSessionToken,
+			&simulationIdentity);
 	if (!result.ok())
 	{
 		if (enforceFailure)
@@ -1109,6 +1825,13 @@ Bool ConnectionManager::processNetworkHello(const TransportMessage &message, Boo
 		// current peer. Keep the gate closed and let the current Hello retry or
 		// the bounded timeout resolve the exchange.
 		DEBUG_LOG_LEVEL(DEBUG_LEVEL_NET, ("ConnectionManager::processNetworkHello - ignoring stale NET3 token from slot %d", slot));
+		return FALSE;
+	}
+	if (!acceptNetworkSimulationPolicy(slot, simulationIdentity))
+	{
+		if (enforceFailure)
+			dropInvalidNetworkHelloPacket(slot,
+				"NET3 simulation policy roster or identity changed");
 		return FALSE;
 	}
 
@@ -1218,8 +1941,18 @@ void ConnectionManager::processTransportMessage(const TransportMessage &message)
 				static_cast<std::uint32_t>(command->getExecutionFrame()),
 				static_cast<std::uint32_t>(m_frameResendRequestFrame));
 		const Bool frameRecoveryAuthorized = isNetworkFrameRecoveryAuthorized(command, sourceSlot, FALSE);
-		const Bool frameRecoveryDelivery = rts::network_epoch::IsNetworkFrameRecoveryDelivery(
+		Bool frameRecoveryDelivery = rts::network_epoch::IsNetworkFrameRecoveryDelivery(
 			frameResendResponseAuthorized || frameRecoveryAuthorized, cmd->getRelay(), m_localSlot, MAX_SLOTS);
+		if (m_lockstepV2ReceiptRecorder.isActive() &&
+			m_lockstepV2Session.originMode ==
+				rts::lockstep_v2::CommandOriginMode::DirectAuthenticated)
+		{
+			// A direct-origin v2 session cannot let a responder republish cached
+			// commands authored by a third peer.  Recovery of that shape needs a
+			// separately authenticated per-origin envelope; until then the normal
+			// source check remains fail-closed.
+			frameRecoveryDelivery = FALSE;
+		}
 		const Bool directFrameAck = frameRecoveryDelivery || rts::network_epoch::ShouldAckNetworkDirectFrame(
 			sourceAuthorized, isFrameDataCommand, cmd->getRelay(), m_localSlot, MAX_SLOTS,
 			command->getExecutionFrame(), TheGameLogic->getFrame());
@@ -1248,6 +1981,35 @@ void ConnectionManager::processTransportMessage(const TransportMessage &message)
 		if (CommandRequiresAck(cmd->getCommand())) {
 			ackCommand(cmd, m_localSlot);
 		}
+	#if defined(_WIN64)
+		if (m_lockstepV2ReceiptRecorder.isActive() &&
+			command->getNetCommandType() == NETCOMMANDTYPE_GAMECOMMAND &&
+			command->getExecutionFrame() > 0U &&
+			command->getExecutionFrame() <= rts::lockstep_v2::kCommonStopFrame &&
+			command->getExecutionFrame() >= TheGameLogic->getFrame())
+		{
+			std::uint64_t commandDigest = 0U;
+			const Bool digestValid = getLockstepV2CommandDigest(cmd, &commandDigest);
+			FrameDataManager *originFrameData = command->getPlayerID() < MAX_SLOTS ?
+				m_frameData[command->getPlayerID()] : nullptr;
+			NetCommandList *originCommands = originFrameData != nullptr ?
+				originFrameData->getFrameCommandList(command->getExecutionFrame()) : nullptr;
+			NetCommandRef *existingCommand = originCommands != nullptr ?
+				originCommands->findMessage(command->getID(), command->getPlayerID()) : nullptr;
+			std::uint64_t existingDigest = 0U;
+			const Bool existingDigestValid = existingCommand == nullptr ||
+				getLockstepV2CommandDigest(existingCommand, &existingDigest);
+			const Bool contributionAccepted = digestValid && originFrameData != nullptr &&
+				(existingCommand == nullptr ?
+					recordLockstepV2Command(command->getExecutionFrame(),
+						command->getPlayerID(), command->getID(), commandDigest) :
+					(existingDigestValid && existingDigest == commandDigest));
+			if (!contributionAccepted)
+			{
+				m_lockstepV2ReceiptRecorder.reset();
+			}
+		}
+	#endif
 		if (!processNetCommand(cmd)) {
 			sendRemoteCommand(cmd);
 		}
@@ -2000,6 +2762,14 @@ PlayerLeaveCode ConnectionManager::processPlayerLeave(NetPlayerLeaveCommandMsg *
 	if (playerID >= MAX_SLOTS)
 		return PLAYERLEAVECODE_UNKNOWN;
 
+#if defined(_WIN64)
+	if (playerID == m_localSlot ||
+		(m_networkHelloExpectedSlots & (1U << playerID)) != 0U)
+	{
+		revokeNetworkSimulationPolicy();
+	}
+#endif
+
 	if ((playerID != m_localSlot) && (m_connections[playerID] != nullptr)) {
 		DEBUG_LOG(("ConnectionManager::processPlayerLeave() - setQuitting() on player %d on frame %d", playerID, TheGameLogic->getFrame()));
 		m_connections[playerID]->setQuitting();
@@ -2242,6 +3012,11 @@ void ConnectionManager::update(Bool isInGame) {
 	}
 
 #if defined(_WIN64)
+	if (m_networkSimulationPolicyResolved &&
+		!isNetworkSimulationPolicyUsable())
+	{
+		revokeNetworkSimulationPolicy();
+	}
 	serviceNetworkHello();
 #endif
 	if (m_transport == nullptr)
@@ -2521,7 +3296,12 @@ void ConnectionManager::initTransport() {
 	delete m_transport;
 	m_transport = new Transport;
 	m_transport->reset();
+#if defined(_WIN64)
+	const Bool transportInitialized = m_transport->init(m_localAddr, m_localPort);
+	m_lockstepV2TransportInitialized = transportInitialized;
+#else
 	m_transport->init(m_localAddr, m_localPort);
+#endif
 }
 
 /**
@@ -2541,6 +3321,25 @@ void ConnectionManager::sendLocalGameMessage(GameMessage *msg, UnsignedInt frame
 	netmsg->setID(currentID);
 
 	sendLocalCommand(netmsg);
+
+#if defined(_WIN64)
+	// Record the canonical bytes at the owner intake boundary.  The same
+	// command may be retransmitted; ReceiptRecorder deduplicates an identical
+	// command ID/digest and rejects altered bytes instead of counting either as
+	// a second contribution.
+	if (m_lockstepV2ReceiptRecorder.isActive())
+	{
+		NetCommandRef *receiptRef = NEW_NETCOMMANDREF(netmsg);
+		receiptRef->setRelay(0xff);
+		std::uint64_t commandDigest = 0U;
+		if (!getLockstepV2CommandDigest(receiptRef, &commandDigest) ||
+			!recordLockstepV2Command(frame, m_localSlot, currentID, commandDigest))
+		{
+			m_lockstepV2ReceiptRecorder.reset();
+		}
+		deleteInstance(receiptRef);
+	}
+#endif
 
 	netmsg->detach();
 }
@@ -2573,6 +3372,18 @@ void ConnectionManager::sendLocalCommand(NetCommandMsg *msg, UnsignedByte relay 
 }
 
 void ConnectionManager::sendLocalCommandImmediate(NetCommandMsg *msg, UnsignedByte relay) {
+	#if defined(_WIN64)
+	// DirectAuthenticated is the v2 default and deliberately bypasses the
+	// legacy packet-router relay.  A trusted-router session must be explicit in
+	// its receipt contract and retains the legacy routing behavior below.
+	if (m_lockstepV2ReceiptRecorder.isActive() &&
+		m_lockstepV2Session.originMode ==
+			rts::lockstep_v2::CommandOriginMode::DirectAuthenticated)
+	{
+		sendLocalCommandDirect(msg, relay);
+		return;
+	}
+	#endif
 
 	const Bool packetRouterHasConnection = m_packetRouterSlot < MAX_SLOTS &&
 		m_connections[m_packetRouterSlot] != nullptr;
@@ -2821,6 +3632,14 @@ PlayerLeaveCode ConnectionManager::disconnectPlayer(Int slot) {
 		return PLAYERLEAVECODE_UNKNOWN;
 	}
 
+#if defined(_WIN64)
+	if (static_cast<UnsignedInt>(slot) == m_localSlot ||
+		(m_networkHelloExpectedSlots & (1U << slot)) != 0U)
+	{
+		revokeNetworkSimulationPolicy();
+	}
+#endif
+
 	if (m_netCommandWrapperList != nullptr)
 		m_netCommandWrapperList->removeForPlayer(static_cast<UnsignedByte>(slot));
 #if defined(_WIN64)
@@ -3048,6 +3867,8 @@ void ConnectionManager::parseUserList(const GameInfo *game)
 	}
 
 #if defined(_WIN64)
+	clearNetworkSimulationPolicy();
+	m_networkSimulationMapCrc = game->getMapCRC();
 	beginNetworkHello();
 #endif
 #ifdef MEMORYPOOL_DEBUG

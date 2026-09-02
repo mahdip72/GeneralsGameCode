@@ -358,12 +358,13 @@ unsigned mergeSortedRanges(CollisionCandidate *scratch,
 	// heapRange is independent owner-only storage embedded in the state array;
 	// it avoids a second allocation while retaining every range's worker result.
 	unsigned heapSize = 0;
-	for (unsigned rangeIndex = 0; rangeIndex != rangeCount; ++rangeIndex)
+	for (unsigned heapRangeIndex = 0; heapRangeIndex != rangeCount;
+		++heapRangeIndex)
 	{
-		if (ranges[rangeIndex].uniqueCount == 0)
+		if (ranges[heapRangeIndex].uniqueCount == 0)
 			continue;
 		unsigned heapPosition = heapSize++;
-		ranges[heapPosition].heapRange = rangeIndex;
+		ranges[heapPosition].heapRange = heapRangeIndex;
 		while (heapPosition != 0)
 		{
 			const unsigned parentPosition = (heapPosition - 1) / 2;
@@ -469,16 +470,16 @@ void orderMergedCandidates(CollisionCandidate *output, unsigned outputCount,
 	for (unsigned index = 0; index != inputCount; ++index)
 		scratch[index].key.lowID = 0;
 	bool boundedUniqueOrders = true;
-	for (unsigned index = 0; index != outputCount; ++index)
+	for (unsigned outputIndex = 0; outputIndex != outputCount; ++outputIndex)
 	{
-		const unsigned discoveryOrder = output[index].discoveryOrder;
+		const unsigned discoveryOrder = output[outputIndex].discoveryOrder;
 		if (discoveryOrder >= inputCount ||
 			scratch[discoveryOrder].key.lowID != 0)
 		{
 			boundedUniqueOrders = false;
 			break;
 		}
-		scratch[discoveryOrder] = output[index];
+		scratch[discoveryOrder] = output[outputIndex];
 	}
 	if (!boundedUniqueOrders)
 	{

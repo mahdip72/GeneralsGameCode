@@ -16,53 +16,26 @@ target_sources(z_runtime_regression_tests PRIVATE
     RuntimeRegressionTests.cpp
     $<TARGET_OBJECTS:z_xcrc>
 )
+
 target_include_directories(z_runtime_regression_tests PRIVATE
     "${CMAKE_SOURCE_DIR}/Core/Tools/XferCrcSnapshotTest"
 )
 
-if(CMAKE_SIZEOF_VOID_P EQUAL 4)
-	target_link_libraries(z_runtime_regression_tests PRIVATE
-		comctl32
-		core_debug
-		core_profile_legacy
-		d3d8
-		d3dx8
-		dinput8
-		dxguid
-		imm32
-		milesstub
-		vfw32
-		winmm
-		z_gameengine
-		z_gameenginedevice
-		zi_always
-	)
-
-	if(NOT RTS_BUILD_OPTION_FFMPEG)
-		target_link_libraries(z_runtime_regression_tests PRIVATE binkstub)
-	endif()
-else()
-	# The native x64 utility exercises production runtime contracts. Keep it
-	# on the product's modern dependency boundary and do not pull the legacy
-	# D3D8, Miles, or Bink import libraries into the test executable.
-	#
-	# rts_d3d8_headers is intentionally allowed in this staging graph: it is a
-	# header-only compatibility boundary for the temporary parity sources, not
-	# a D3D8 import/library dependency.  The graph audit rejects d3d8, d3dx8,
-	# rts_d3d8lib, Miles, and Bink while explicitly permitting that interface.
-	target_link_libraries(z_runtime_regression_tests PRIVATE
-		comctl32
-		core_debug
-		core_profile_legacy
-		imm32
-		rts_legacy_product_runtime
-		vfw32
-		winmm
-		z_gameengine
-		z_gameenginedevice
-		zi_always
-	)
-endif()
+# Exercise the same architecture-selected product boundary as the title
+# executable. Win32/VC6 resolves this to the legacy D3D8/Miles/Bink lane;
+# native x64 resolves it to the D3D11/XAudio2 boundary.
+target_link_libraries(z_runtime_regression_tests PRIVATE
+	comctl32
+	core_debug
+	core_profile_legacy
+	imm32
+	rts_product_runtime
+	vfw32
+	winmm
+	z_gameengine
+	z_gameenginedevice
+	zi_always
+)
 
 add_test(NAME z_skirmish_ai_replay_epoch_tests COMMAND z_runtime_regression_tests --skirmish-ai-replay-epoch)
 set_tests_properties(z_skirmish_ai_replay_epoch_tests PROPERTIES TIMEOUT 30)
@@ -75,6 +48,28 @@ add_test(NAME z_xfer_crc_snapshot_tests
 set_tests_properties(z_xfer_crc_snapshot_tests PROPERTIES TIMEOUT 30)
 
 if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD)
+	add_executable(z_native_render_target_texture_tests
+		"${CMAKE_SOURCE_DIR}/Core/Tools/NativeW3DTextureOwnerTest/NativeRenderTargetTextureTest.cpp"
+	)
+	target_include_directories(z_native_render_target_texture_tests PRIVATE
+		"${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas/WW3D2"
+	)
+	target_link_libraries(z_native_render_target_texture_tests PRIVATE
+		core_wwstub
+		core_ww3d2_native
+		z_ww3d2
+		vfw32
+		winmm
+	)
+	set_target_properties(z_native_render_target_texture_tests PROPERTIES
+		CXX_STANDARD 20
+		CXX_STANDARD_REQUIRED YES
+		CXX_EXTENSIONS NO
+	)
+	add_test(NAME z_native_render_target_texture_tests
+		COMMAND z_native_render_target_texture_tests)
+	set_tests_properties(z_native_render_target_texture_tests PROPERTIES TIMEOUT 30)
+
 	# Exercise the real product AudioEventRTS/GameAudio implementations, not the
 	# isolated manager fixture's runtime substitutes. The hook only sets capacity.
 	target_link_libraries(z_runtime_regression_tests PRIVATE rts_native_audio_manager)

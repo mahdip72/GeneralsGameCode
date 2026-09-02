@@ -34,6 +34,10 @@
 #include "Common/GlobalData.h"
 #include "Common/ReplaySimulation.h"
 #include "Common/SkirmishAITestRunner.h"
+#include "GameNetwork/InstalledNet3Validation.h"
+#if defined(_WIN64)
+#include "GameNetwork/InstalledLockstepV2Validation.h"
+#endif
 
 
 /**
@@ -48,13 +52,79 @@ Int GameMain()
 	TheFramePacer->enableFramesPerSecondLimit(TRUE);
 	TheGameEngine = CreateGameEngine();
 	TheGameEngine->init();
-	if (TheGlobalData->m_commandLineData.hasSkirmishAITestRequest())
-		ArmSkirmishAITestRunner(TheGlobalData->m_commandLineData.getSkirmishAITestSeed(),
-			SKIRMISH_AI_TEST_SCENARIO_4V3);
-	else if (TheGlobalData->m_commandLineData.hasSkirmishAITest4v2Request())
-		ArmSkirmishAITestRunner(TheGlobalData->m_commandLineData.getSkirmishAITest4v2Seed(),
-			SKIRMISH_AI_TEST_SCENARIO_4V2);
-	const Bool canRun = StartSkirmishAITestRunner();
+	const Bool net3ValidationRequested = rts::IsInstalledNet3ValidationRequested();
+	Bool lockstepV2ValidationRequested = FALSE;
+#if defined(_WIN64)
+	lockstepV2ValidationRequested =
+		rts::IsInstalledLockstepV2QualificationRequested() ? TRUE : FALSE;
+#endif
+	const Bool skirmishValidationRequested =
+		TheGlobalData->m_commandLineData.hasSkirmishAITestRequest() ||
+		TheGlobalData->m_commandLineData.hasSkirmishAITest4v2Request() ||
+		TheGlobalData->m_commandLineData.hasSkirmishAITestPractical1v7Request();
+	const Bool validationOptionsConflict =
+		(net3ValidationRequested && lockstepV2ValidationRequested) ||
+		((net3ValidationRequested || lockstepV2ValidationRequested) &&
+			skirmishValidationRequested) ||
+		((net3ValidationRequested || lockstepV2ValidationRequested) &&
+			!TheGlobalData->m_simulateReplays.empty());
+	if (validationOptionsConflict)
+	{
+		printf("VALIDATION_FAIL reason=installed_validation_options_are_mutually_exclusive\n");
+		fflush(stdout);
+		exitcode = 2;
+		TheGameEngine->setQuitting(TRUE);
+	}
+	else if (net3ValidationRequested)
+	{
+		exitcode = rts::RunInstalledNet3Validation(
+			TheGlobalData->m_exeCRC, TheGlobalData->m_iniCRC);
+		TheGameEngine->setQuitting(TRUE);
+	}
+#if defined(_WIN64)
+	else if (lockstepV2ValidationRequested)
+	{
+		Bool serviceSucceeded =
+			TheGameEngine->prepareHeadlessSimulationJobsForInstalledQualification();
+		if (serviceSucceeded)
+			serviceSucceeded = rts::PrepareInstalledLockstepV2Qualification(
+			TheGlobalData->m_exeCRC, TheGlobalData->m_iniCRC) ? TRUE : FALSE;
+		while (serviceSucceeded &&
+			!rts::IsInstalledLockstepV2ProofStarted() &&
+			!rts::IsInstalledLockstepV2QualificationFailed())
+		{
+			serviceSucceeded = rts::ServiceInstalledLockstepV2Qualification(
+				TheGlobalData->m_exeCRC, TheGlobalData->m_iniCRC) ? TRUE : FALSE;
+		}
+		if (serviceSucceeded && rts::IsInstalledLockstepV2ProofStarted())
+			TheGameEngine->execute();
+		const Bool clean = serviceSucceeded &&
+			!rts::IsInstalledLockstepV2QualificationFailed() &&
+			rts::IsInstalledLockstepV2StopRequested();
+		if (!rts::FinalizeInstalledLockstepV2Qualification(clean != FALSE))
+			serviceSucceeded = FALSE;
+		exitcode = serviceSucceeded && clean ? 0 : 2;
+		TheGameEngine->setQuitting(TRUE);
+	}
+#endif
+	if (!net3ValidationRequested && !lockstepV2ValidationRequested)
+	{
+		if (TheGlobalData->m_commandLineData.hasSkirmishAITestRequest())
+			ArmSkirmishAITestRunner(
+				TheGlobalData->m_commandLineData.getSkirmishAITestSeed(),
+				SKIRMISH_AI_TEST_SCENARIO_4V3);
+		else if (TheGlobalData->m_commandLineData.hasSkirmishAITest4v2Request())
+			ArmSkirmishAITestRunner(
+				TheGlobalData->m_commandLineData.getSkirmishAITest4v2Seed(),
+				SKIRMISH_AI_TEST_SCENARIO_4V2);
+		else if (TheGlobalData->m_commandLineData.hasSkirmishAITestPractical1v7Request())
+			ArmSkirmishAITestRunner(
+				TheGlobalData->m_commandLineData.getSkirmishAITestPractical1v7Seed(),
+				SKIRMISH_AI_TEST_SCENARIO_PRACTICAL_1V7);
+	}
+	const Bool canRun = !net3ValidationRequested &&
+		!lockstepV2ValidationRequested &&
+		StartSkirmishAITestRunner();
 
 	if (!canRun)
 	{

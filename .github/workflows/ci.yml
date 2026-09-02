@@ -10,6 +10,42 @@ on:
       - main
   pull_request:
   workflow_dispatch:
+    inputs:
+      stage5_fixture_manifest:
+        description: "Zero Hour-only repository-relative Stage 5 replay fixture manifest"
+        required: false
+        type: string
+        default: ""
+      stage5_performance_baseline:
+        description: "Zero Hour-only repository-relative Stage 3 performance baseline JSON"
+        required: false
+        type: string
+        default: ""
+      stage5_expected_stage3_executable_sha256:
+        description: "Independently recorded Stage 3 x64 Zero Hour executable SHA-256"
+        required: false
+        type: string
+        default: ""
+      stage5_generals_fixture_manifest:
+        description: "Generals-only repository-relative Stage 5 replay fixture manifest"
+        required: false
+        type: string
+        default: ""
+      stage5_generals_performance_baseline:
+        description: "Generals-only repository-relative Stage 3 performance baseline JSON"
+        required: false
+        type: string
+        default: ""
+      stage5_generals_expected_stage3_executable_sha256:
+        description: "Independently recorded Stage 3 x64 Generals executable SHA-256"
+        required: false
+        type: string
+        default: ""
+      stage5_acceptance_manifest:
+        description: "Repository-relative reviewed final Stage 5 acceptance manifest"
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -24,6 +60,7 @@ jobs:
       generals: ${{ steps.filter.outputs.generals }}
       generalsmd: ${{ steps.filter.outputs.generalsmd }}
       shared: ${{ steps.filter.outputs.shared }}
+      stage5: ${{ steps.filter.outputs.stage5 }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -48,6 +85,18 @@ jobs:
               - 'cmake/**'
               - 'Core/**'
               - 'Dependencies/**'
+            stage5:
+              - '.github/workflows/**'
+              - 'CMakeLists.txt'
+              - 'CMakePresets.json'
+              - 'cmake/**'
+              - 'vcpkg.json'
+              - 'vcpkg-lock.json'
+              - 'triplets/**'
+              - 'Core/**'
+              - 'Dependencies/**'
+              - 'Generals/**'
+              - 'GeneralsMD/**'
 
       - name: Changes Summary
         run: |
@@ -55,6 +104,7 @@ jobs:
           echo "- Generals: ${{ steps.filter.outputs.generals == 'true' && '✅' || '❌' }}" >> $GITHUB_STEP_SUMMARY
           echo "- GeneralsMD: ${{ steps.filter.outputs.generalsmd == 'true' && '✅' || '❌' }}" >> $GITHUB_STEP_SUMMARY
           echo "- Shared: ${{ steps.filter.outputs.shared == 'true' && '✅' || '❌' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Stage 5: ${{ steps.filter.outputs.stage5 == 'true' && '✅' || '❌' }}" >> $GITHUB_STEP_SUMMARY
 
   build-generals:
     name: Build Generals${{ matrix.preset && '' }}
@@ -63,24 +113,38 @@ jobs:
     strategy:
       matrix:
         include:
+          - preset: "vc6-generals-oracle"
+            tools: false
+            extras: false
+            product: true
           - preset: "vc6"
             tools: true
             extras: true
+            product: true
           - preset: "vc6-profile"
             tools: true
             extras: true
+            product: true
           - preset: "vc6-debug"
             tools: true
             extras: true
+            product: true
           - preset: "win32"
             tools: true
             extras: true
+            product: true
           - preset: "win32-profile"
             tools: true
             extras: true
+            product: true
           - preset: "win32-debug"
             tools: true
             extras: true
+            product: true
+          - preset: "win32-generals-authoring"
+            tools: true
+            extras: false
+            product: false
           #- preset: "win32-vcpkg"
           #  tools: true
           #  extras: true
@@ -97,16 +161,17 @@ jobs:
       preset: ${{ matrix.preset }}
       tools: ${{ matrix.tools }}
       extras: ${{ matrix.extras }}
+      product: ${{ matrix.product }}
     secrets: inherit
 
   build-generals-x64:
     name: Build Generals x64
     needs: detect-changes
-    if: ${{ github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.generals == 'true' || needs.detect-changes.outputs.generalsmd == 'true' || needs.detect-changes.outputs.shared == 'true' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.generals == 'true' || needs.detect-changes.outputs.generalsmd == 'true' || needs.detect-changes.outputs.shared == 'true' || needs.detect-changes.outputs.stage5 == 'true' }}
     uses: ./.github/workflows/build-toolchain.yml
     with:
       game: "Generals"
-      preset: "x64-vcpkg"
+      preset: "x64-generals-vcpkg-product"
       tools: false
       extras: true
     secrets: inherit
@@ -120,6 +185,9 @@ jobs:
     strategy:
       matrix:
         include:
+          - preset: "vc6-zerohour-oracle"
+            tools: false
+            extras: false
           - preset: "vc6"
             tools: true
             extras: true
@@ -151,12 +219,19 @@ jobs:
           - preset: "win32"
             tools: true
             extras: true
+            product: true
           - preset: "win32-profile"
             tools: true
             extras: true
+            product: true
           - preset: "win32-debug"
             tools: true
             extras: true
+            product: true
+          - preset: "win32-zerohour-authoring"
+            tools: true
+            extras: false
+            product: false
           #- preset: "win32-vcpkg"
           #  tools: true
           #  extras: true
@@ -173,18 +248,42 @@ jobs:
       preset: ${{ matrix.preset }}
       tools: ${{ matrix.tools }}
       extras: ${{ matrix.extras }}
+      product: ${{ matrix.product }}
     secrets: inherit
 
   build-generalsmd-x64:
     name: Build GeneralsMD x64
     needs: [detect-changes, build-generals-x64]
-    if: ${{ github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.generalsmd == 'true' || needs.detect-changes.outputs.shared == 'true' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.generalsmd == 'true' || needs.detect-changes.outputs.shared == 'true' || needs.detect-changes.outputs.stage5 == 'true' }}
     uses: ./.github/workflows/build-toolchain.yml
     with:
       game: "GeneralsMD"
-      preset: "x64-vcpkg"
+      preset: "x64-zerohour-vcpkg-product"
       tools: false
       extras: true
+    secrets: inherit
+
+  build-native-x64-focused-runtime:
+    name: Native x64 ${{ matrix.preset }} Shared Runtime Focus
+    needs: detect-changes
+    if: ${{ github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.generals == 'true' || needs.detect-changes.outputs.generalsmd == 'true' || needs.detect-changes.outputs.shared == 'true' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - preset: "x64-debug-core"
+          - preset: "x64-profile-core"
+          - preset: "x64-asan-core"
+    uses: ./.github/workflows/build-toolchain.yml
+    with:
+      game: "Generals"
+      preset: ${{ matrix.preset }}
+      tools: false
+      extras: true
+      product: false
+      focused_targets: "core_deterministic_simulation_tests,core_job_system_tests,core_pipeline_execution_policy_tests"
+      focused_test_regex: '^core_(deterministic_simulation(_.*)?test|job_system_tests|pipeline_execution_policy_(parser|owner|compute|race)_test)$'
     secrets: inherit
 
   replaycheck-generalsmd:
@@ -194,7 +293,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - preset: "vc6+t+e"
+          - preset: "vc6-zerohour-oracle"
           - preset: "vc6-releaselog+t+e" # optimized build with logging and crashing enabled should be compatible, so we test that here.
       fail-fast: false
     uses: ./.github/workflows/check-replays.yml
@@ -202,4 +301,73 @@ jobs:
       game: "GeneralsMD"
       userdata: "GeneralsReplays/GeneralsZH/1.04"
       preset: ${{ matrix.preset }}
+    secrets: inherit
+
+  stage5-workflow-contract:
+    name: Stage 5 Workflow Contract
+    needs: detect-changes
+    if: ${{ github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.stage5 == 'true' }}
+    runs-on: windows-2022
+    timeout-minutes: 5
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Validate Stage 5 workflow contract
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5WorkflowContract.ps1" `
+            -SourceRoot "$env:GITHUB_WORKSPACE"
+
+      - name: Validate Stage 5 workflow contract self-test
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5WorkflowContract.ps1" -SelfTest
+
+  stage5-replaycheck-generalsmd-x64:
+    name: Stage 5 Installed Runtime Replay Matrix GeneralsMD x64
+    needs: [detect-changes, build-generalsmd-x64]
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' &&
+          inputs.stage5_fixture_manifest != '' &&
+          inputs.stage5_performance_baseline != '' &&
+          inputs.stage5_expected_stage3_executable_sha256 != '' &&
+          inputs.stage5_acceptance_manifest != '' }}
+    uses: ./.github/workflows/check-replays.yml
+    with:
+      game: "GeneralsMD"
+      userdata: "GeneralsReplays/GeneralsZH/1.04"
+      preset: "x64-zerohour-vcpkg-product+e"
+      stage5: true
+      stage5_require_x64: true
+      stage5_fixture_manifest: ${{ inputs.stage5_fixture_manifest }}
+      stage5_performance_baseline: ${{ inputs.stage5_performance_baseline }}
+      stage5_expected_stage3_executable_sha256: ${{ inputs.stage5_expected_stage3_executable_sha256 }}
+      stage5_acceptance_manifest: ${{ inputs.stage5_acceptance_manifest }}
+      stage5_replay_matrix_repeats: 2
+      stage5_stress_repeats: 3
+    secrets: inherit
+
+  stage5-replaycheck-generals-x64:
+    name: Stage 5 Installed Runtime Replay Matrix Generals x64
+    needs: [detect-changes, build-generals-x64]
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' &&
+          inputs.stage5_generals_fixture_manifest != '' &&
+          inputs.stage5_generals_performance_baseline != '' &&
+          inputs.stage5_generals_expected_stage3_executable_sha256 != '' &&
+          inputs.stage5_acceptance_manifest != '' }}
+    uses: ./.github/workflows/check-replays.yml
+    with:
+      game: "Generals"
+      userdata: "GeneralsReplays/Generals/1.08"
+      preset: "x64-generals-vcpkg-product+e"
+      stage5: true
+      stage5_require_x64: true
+      stage5_fixture_manifest: ${{ inputs.stage5_generals_fixture_manifest }}
+      stage5_performance_baseline: ${{ inputs.stage5_generals_performance_baseline }}
+      stage5_expected_stage3_executable_sha256: ${{ inputs.stage5_generals_expected_stage3_executable_sha256 }}
+      stage5_acceptance_manifest: ${{ inputs.stage5_acceptance_manifest }}
+      stage5_replay_matrix_repeats: 2
+      stage5_stress_repeats: 3
     secrets: inherit

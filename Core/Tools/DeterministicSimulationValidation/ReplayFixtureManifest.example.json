@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "title": "ZeroHour",
+  "executable": "generalszh.exe",
+  "executableSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "fixtures": [
+    {
+      "id": "reference-2v2",
+      "source": "fixtures/reference-2v2.rep",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "stress": false,
+      "maps": []
+    },
+    {
+      "id": "hard-ai-2v6",
+      "source": "fixtures/hard-ai-2v6.rep",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "stress": true,
+      "maps": [
+        {
+          "source": "fixtures/maps/hard-ai/map.map",
+          "profileRelativePath": "Maps\\Hard AI Stress\\Hard AI Stress.map",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ]
+    }
+  ],
+  "ai": {
+    "seeds": [1729, 1730, 1731],
+    "scenarios": ["4v3", "4v2"],
+    "repeats": 2
+  }
+}

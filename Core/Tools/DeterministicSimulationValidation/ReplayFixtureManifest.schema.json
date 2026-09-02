@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://generalsgamecode.invalid/schemas/stage5-replay-fixtures.json",
+  "title": "GeneralsGameCode Stage 5 replay and AI validation manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "title",
+    "executable",
+    "executableSha256",
+    "fixtures",
+    "ai"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "title": { "enum": ["Generals", "ZeroHour"] },
+    "executable": { "type": "string", "pattern": "^[A-Za-z0-9._-]+\\.exe$" },
+    "executableSha256": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" },
+    "fixtures": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "source", "sha256", "stress"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" },
+          "source": { "type": "string", "minLength": 1 },
+          "sha256": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" },
+          "stress": { "type": "boolean" },
+          "maps": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["source", "profileRelativePath", "sha256"],
+              "properties": {
+                "source": { "type": "string", "minLength": 1 },
+                "profileRelativePath": { "type": "string", "pattern": "^Maps[\\\\/]" },
+                "sha256": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "ai": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seeds", "scenarios", "repeats"],
+      "properties": {
+        "seeds": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "integer", "minimum": 1, "maximum": 2147483647 }
+        },
+        "scenarios": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "enum": ["4v3", "4v2"] }
+        },
+        "repeats": { "type": "integer", "minimum": 1 }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "title": { "const": "Generals" } } },
+      "then": {
+        "properties": {
+          "executable": { "pattern": "^generalsv(?:-[A-Za-z0-9._-]+)?\\.exe$" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "title": { "const": "ZeroHour" } } },
+      "then": {
+        "properties": {
+          "executable": { "pattern": "^generalszh(?:-[A-Za-z0-9._-]+)?\\.exe$" }
+        }
+      }
+    }
+  ]
+}

@@ -2301,7 +2301,9 @@ int main()
 		SEM_NOOPENFILEERRORBOX);
 #endif
 #if defined(_MSC_VER) && defined(_DEBUG)
+#if _MSC_VER >= 1400
 	_set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
 	_CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
 	_CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
 #endif

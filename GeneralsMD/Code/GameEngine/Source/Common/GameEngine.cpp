@@ -260,6 +260,23 @@ void printHeadlessSimulationJobMetrics(const rts::JobSystemMetrics &metrics,
 		metrics.availableLogicalCpuCount, metrics.reservedOwnerCpuCount,
 		metrics.selectedWorkerCpuCount);
 #endif
+	#if defined(_WIN64)
+	const rts::JobSystemConfig config = rts::JobSystem::startupConfig();
+	const char *workerPolicy = config.workerPolicy == rts::JOB_WORKER_POLICY_ALL ?
+		"all" : (config.workerPolicy == rts::JOB_WORKER_POLICY_AUTO ? "auto" : "unknown");
+	printf("SIMULATION_JOB_TOPOLOGY worker_policy=%s pin_workers=%u "
+		"selected_worker_physical_cores=%u selected_worker_physical_mask=%llu "
+		"selected_worker_physical_mask_complete=%u cpu_set_count=%u "
+		"selected_worker_cpu_set_count=%u owner_cpu_set_count=%u\n",
+		workerPolicy, config.pinWorkers ? 1u : 0u,
+		metrics.selectedWorkerPhysicalCoreCount,
+		static_cast<unsigned long long>(metrics.selectedWorkerPhysicalCoreMask),
+		metrics.selectedWorkerPhysicalCoreMaskComplete ? 1u : 0u,
+		rts::JobSystem::instance().cpuSetCount(),
+		rts::JobSystem::instance().selectedWorkerCpuSetCount(),
+		rts::JobSystem::instance().ownerCpuSetCount());
+	fflush(stdout);
+	#endif
 #if defined(_WIN64)
 	const rts::AIPlanningRuntimeMetrics ai = rts::GetAIPlanningRuntimeMetrics();
 	printf("AI_PLANNING_MANIFEST epoch=%u captured_snapshots=%llu captured_candidates=%llu requested_batches=%llu submitted_jobs=%llu completed_jobs=%llu serial_fallbacks=%llu shadow_matches=%llu shadow_mismatches=%llu validation_failures=%llu committed_batches=%llu parallel_authoritative_commits=%llu rejected_commits=%llu\n",
@@ -1270,6 +1287,15 @@ extern HWND ApplicationHWnd;
 /** -----------------------------------------------------------------------------------------------
  * The "main loop" of the game engine. It will not return until the game exits.
  */
+Bool GameEngine::prepareHeadlessSimulationJobsForInstalledQualification()
+{
+	startHeadlessSimulationJobsAfterUnsafeInitialization();
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	return TheGlobalData->m_headless && jobs.isRunning() &&
+		jobs.isCurrentThread(rts::JOB_OWNER_GAME) && jobs.workerCount() >= 2U &&
+		rts::GetSimulationExecutionMode() == rts::SIMULATION_EXECUTION_PARALLEL;
+}
+
 void GameEngine::execute()
 {
 	ASSERT_GAME_THREAD("GameEngine::execute");

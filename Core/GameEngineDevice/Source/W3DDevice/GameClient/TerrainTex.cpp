@@ -52,6 +52,9 @@
 #include "W3DDevice/GameClient/TileData.h"
 #include "Common/GlobalData.h"
 #include "WW3D2/dx8wrapper.h"
+#if !defined(_WIN64)
+#include "WW3D2/formconv.h"
+#endif
 #include "Renderer/LegacyD3DMath.h"
 #include "WW3D2/surfaceclass.h"
 #include "WW3D2/texturemipgenerator.h"

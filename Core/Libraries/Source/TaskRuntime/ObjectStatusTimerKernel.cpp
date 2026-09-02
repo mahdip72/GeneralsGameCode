@@ -95,6 +95,7 @@ StatusMetricAtomic s_physicalWorkerJobs;
 StatusMetricAtomic s_ownerHelpedJobs;
 StatusMetricAtomic s_physicalWorkerMask;
 StatusMetricAtomic s_maximumDistinctPhysicalWorkers;
+StatusMetricAtomic s_physicalWorkerMaskIncomplete;
 StatusMetricAtomic s_maximumPeakConcurrentPhysicalWorkers;
 StatusMetricAtomic s_shadowExecutions;
 StatusMetricAtomic s_shadowCommands;
@@ -248,7 +249,8 @@ ObjectStatusTimerMetrics::ObjectStatusTimerMetrics()
 	: evaluatedSnapshots(0), emittedCommands(0), submittedJobs(0),
 	  completedJobs(0), physicalWorkerJobs(0), ownerHelpedJobs(0),
 	  physicalWorkerMask(0), distinctPhysicalWorkers(0),
-	  peakConcurrentPhysicalWorkers(0), serialFallbacks(0)
+	  physicalWorkerMaskComplete(true), peakConcurrentPhysicalWorkers(0),
+	  serialFallbacks(0)
 {
 }
 
@@ -256,7 +258,8 @@ ObjectStatusTimerRuntimeMetrics::ObjectStatusTimerRuntimeMetrics()
 	: resetEpoch(0), authoritativeBatches(0), committedCommands(0),
 	  submittedJobs(0), completedJobs(0), physicalWorkerJobs(0),
 	  ownerHelpedJobs(0), physicalWorkerMask(0),
-	  maximumDistinctPhysicalWorkers(0), maximumPeakConcurrentPhysicalWorkers(0),
+	  maximumDistinctPhysicalWorkers(0), physicalWorkerMaskComplete(true),
+	  maximumPeakConcurrentPhysicalWorkers(0),
 	  shadowExecutions(0), shadowCommands(0), shadowMatches(0),
 	  shadowMismatches(0), ownerFallbacks(0), staleRejections(0)
 {
@@ -445,6 +448,8 @@ ObjectStatusTimerResult PrepareObjectStatusTimerCommands(
 						metrics->physicalWorkerMask |=
 							static_cast<ObjectStatusTimerMetricCounter>(1) <<
 							workerIndex;
+					else
+						metrics->physicalWorkerMaskComplete = false;
 					bool firstWorker = true;
 					for (unsigned previous = 0; previous != index; ++previous)
 					{
@@ -576,6 +581,7 @@ void ResetObjectStatusTimerRuntimeMetrics()
 	resetMetric(s_ownerHelpedJobs);
 	resetMetric(s_physicalWorkerMask);
 	resetMetric(s_maximumDistinctPhysicalWorkers);
+	resetMetric(s_physicalWorkerMaskIncomplete);
 	resetMetric(s_maximumPeakConcurrentPhysicalWorkers);
 	resetMetric(s_shadowExecutions);
 	resetMetric(s_shadowCommands);
@@ -598,6 +604,8 @@ ObjectStatusTimerRuntimeMetrics GetObjectStatusTimerRuntimeMetrics()
 	metrics.physicalWorkerMask = loadMetric(s_physicalWorkerMask);
 	metrics.maximumDistinctPhysicalWorkers = static_cast<unsigned>(
 		loadMetric(s_maximumDistinctPhysicalWorkers));
+	metrics.physicalWorkerMaskComplete =
+		loadMetric(s_physicalWorkerMaskIncomplete) == 0;
 	metrics.maximumPeakConcurrentPhysicalWorkers = static_cast<unsigned>(
 		loadMetric(s_maximumPeakConcurrentPhysicalWorkers));
 	metrics.shadowExecutions = loadMetric(s_shadowExecutions);
@@ -636,6 +644,8 @@ void RecordObjectStatusTimerAuthoritativeCommit(unsigned preparedCommandCount,
 	addMetric(s_physicalWorkerJobs, sliceMetrics.physicalWorkerJobs);
 	addMetric(s_ownerHelpedJobs, sliceMetrics.ownerHelpedJobs);
 	orMetric(s_physicalWorkerMask, sliceMetrics.physicalWorkerMask);
+	if (!sliceMetrics.physicalWorkerMaskComplete)
+		addMetric(s_physicalWorkerMaskIncomplete, 1);
 	maximizeMetric(s_maximumDistinctPhysicalWorkers,
 		sliceMetrics.distinctPhysicalWorkers);
 	maximizeMetric(s_maximumPeakConcurrentPhysicalWorkers,

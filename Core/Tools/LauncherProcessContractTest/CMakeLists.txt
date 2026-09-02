@@ -35,22 +35,34 @@ string(FIND "${_launcher_command_line_contents}"
     "Int parseSimulationMode(char *args[], int num)" _launcher_simulation_parser_start)
 string(FIND "${_launcher_command_line_contents}"
     "Int parseValidationExecutableSha256(char *args[], int num)"
-    _launcher_simulation_parser_end)
+    _launcher_simulation_parser_start_end)
 if(_launcher_simulation_parser_start LESS 0 OR
-        _launcher_simulation_parser_end LESS 0 OR
-        _launcher_simulation_parser_end LESS _launcher_simulation_parser_start)
+        _launcher_simulation_parser_start_end LESS 0 OR
+        _launcher_simulation_parser_start_end LESS _launcher_simulation_parser_start)
     message(FATAL_ERROR "The production simulation-mode parser markers are missing.")
 endif()
 math(EXPR _launcher_simulation_parser_length
-    "${_launcher_simulation_parser_end} - ${_launcher_simulation_parser_start}")
+    "${_launcher_simulation_parser_start_end} - ${_launcher_simulation_parser_start}")
 string(SUBSTRING "${_launcher_command_line_contents}"
     ${_launcher_simulation_parser_start} ${_launcher_simulation_parser_length}
     _launcher_simulation_parser)
 
+string(FIND "${_launcher_command_line_contents}"
+    "Int parseXRes(char *args[], int num)" _launcher_validation_parser_end)
+if(_launcher_validation_parser_end LESS 0 OR
+        _launcher_validation_parser_end LESS _launcher_simulation_parser_start_end)
+    message(FATAL_ERROR "The production validation-hash parser markers are missing.")
+endif()
+math(EXPR _launcher_validation_parser_length
+    "${_launcher_validation_parser_end} - ${_launcher_simulation_parser_start_end}")
+string(SUBSTRING "${_launcher_command_line_contents}"
+    ${_launcher_simulation_parser_start_end} ${_launcher_validation_parser_length}
+    _launcher_validation_parser)
+
 set(_launcher_parsers_header
     "${CMAKE_CURRENT_BINARY_DIR}/LauncherGameStartupParsers.h")
 file(WRITE "${_launcher_parsers_header}"
-    "${_launcher_worker_parser}\n${_launcher_simulation_parser}")
+    "${_launcher_worker_parser}\n${_launcher_simulation_parser}${_launcher_validation_parser}")
 
 # Generate the same LCF that the native product packaging helper emits.  The
 # resulting file is passed to the test so the 32-bit lane exercises the helper's

@@ -972,13 +972,31 @@ void TestRuntimeMetricsCountOnlyExplicitEvents()
 	assert(metrics.staleRejections == 1);
 	assert(metrics.circuitBreakerTrips == 1);
 	rts::ResetPhysicsIntegrationRuntimeMetrics();
+	rts::PhysicsIntegrationMetrics highCoreMetrics;
+	highCoreMetrics.rangeCount = 65;
+	highCoreMetrics.submittedJobs = 65;
+	highCoreMetrics.completedJobs = 65;
+	highCoreMetrics.physicalWorkerJobs = 65;
+	highCoreMetrics.physicalWorkerMask = ~static_cast<
+		rts::PhysicsIntegrationMetricCounter>(0);
+	highCoreMetrics.distinctPhysicalWorkers = 65;
+	highCoreMetrics.physicalWorkerMaskComplete = false;
+	highCoreMetrics.peakConcurrentPhysicalWorkers = 65;
+	rts::RecordPhysicsIntegrationAuthoritativeSlice(65, highCoreMetrics);
+	const rts::PhysicsIntegrationRuntimeMetrics highCoreRuntime =
+		rts::GetPhysicsIntegrationRuntimeMetrics();
+	assert(highCoreRuntime.acceptedBatches == 1);
+	assert(highCoreRuntime.maximumAcceptedDistinctPhysicalWorkers == 65);
+	assert(!highCoreRuntime.acceptedPhysicalWorkerMaskComplete);
+	rts::ResetPhysicsIntegrationRuntimeMetrics();
 	const rts::PhysicsIntegrationRuntimeMetrics afterSecondReset =
 		rts::GetPhysicsIntegrationRuntimeMetrics();
-	assert(afterSecondReset.resetEpoch == metrics.resetEpoch + 1);
+	assert(afterSecondReset.resetEpoch == metrics.resetEpoch + 2);
 	assert(afterSecondReset.acceptedBatches == 0);
 	assert(afterSecondReset.acceptedPrefixes == 0);
 	assert(afterSecondReset.acceptedPhysicalWorkerJobs == 0);
 	assert(afterSecondReset.acceptedPhysicalWorkerMask == 0);
+	assert(afterSecondReset.acceptedPhysicalWorkerMaskComplete);
 	assert(afterSecondReset.shadowBatches == 0);
 	assert(afterSecondReset.shadowPrefixes == 0);
 	assert(afterSecondReset.shadowRanges == 0);
@@ -992,6 +1010,9 @@ int main()
 {
 #if defined(_MSC_VER)
 	_set_error_mode(_OUT_TO_STDERR);
+#if _MSC_VER >= 1400
+	_set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
 	_CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
 	_CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
 #endif

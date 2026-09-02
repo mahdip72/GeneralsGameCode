@@ -3,6 +3,7 @@ param(
     [Parameter(Mandatory = $true)][string]$RuntimeRoot,
     [Parameter(Mandatory = $true)][string]$FixtureManifestPath,
     [Parameter(Mandatory = $true)][string]$OutputRoot,
+    [string]$TaskRoot = '',
     [ValidateSet('Replay', 'AI', 'All')][string]$ValidationSet = 'All',
     [int]$ReplayMatrixRepeats = 2,
     [int]$StressRepeats = 3,
@@ -16,8 +17,11 @@ param(
     [switch]$PlanOnly,
     [switch]$DisableFrameTiming,
     [switch]$DiagnosticNonAcceptance,
+    [Alias('HeadlessDirectExecutionException')]
+    [switch]$AllowHeadlessDirectExecution,
     [switch]$RequireX64,
     [switch]$EnforcePerformance,
+    [ValidateSet('Generals', 'ZeroHour')][string]$Title = 'ZeroHour',
     [string]$Stage3PerformanceBaselinePath = '',
     [string]$ExpectedStage3ExecutableSha256 = ''
 )
@@ -129,6 +133,182 @@ function Assert-FreeSpace {
         "$Context requires at least $RequiredBytes free bytes; $($drive.AvailableFreeSpace) are available on $root."
 }
 
+function Resolve-ExplicitTaskRoot {
+    param([string]$Path, [string]$Context)
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace($Path)) `
+        "$Context is required for installed execution."
+    $full = [IO.Path]::GetFullPath($Path)
+    $volumeRoot = [IO.Path]::GetPathRoot($full)
+    Assert-Condition ([String]::Equals($volumeRoot, 'H:\', [StringComparison]::OrdinalIgnoreCase)) `
+        "$Context must be an explicit task-owned H: path: $full"
+    Assert-Condition (-not [String]::Equals($full, $volumeRoot, [StringComparison]::OrdinalIgnoreCase)) `
+        "$Context must name a task directory below H:\, not the volume root."
+    return $full.TrimEnd('\')
+}
+
+function Assert-TaskOwnedPath {
+    param([string]$Path, [string]$TaskRoot, [string]$Context, [bool]$AllowRoot = $false)
+    $rootFull = [IO.Path]::GetFullPath($TaskRoot).TrimEnd('\')
+    $candidate = [IO.Path]::GetFullPath($Path)
+    $inside = $candidate.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar,
+        [StringComparison]::OrdinalIgnoreCase)
+    if ($AllowRoot) {
+        $inside = $inside -or [String]::Equals($candidate, $rootFull,
+            [StringComparison]::OrdinalIgnoreCase)
+    }
+    Assert-Condition $inside "$Context must remain below the task-owned root '$rootFull': $candidate"
+    if (-not $AllowRoot) {
+        Assert-Condition (-not [String]::Equals($candidate, $rootFull,
+            [StringComparison]::OrdinalIgnoreCase)) "$Context must not be the task root itself."
+    }
+    return $candidate
+}
+
+function Remove-TaskOwnedDirectory {
+    param([string]$Path, [string]$TaskRoot, [string]$Context)
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+    $full = Assert-TaskOwnedPath $Path $TaskRoot $Context
+    $item = Get-Item -LiteralPath $full -Force
+    Assert-Condition ($item.PSIsContainer) "$Context is not a directory: $full"
+    Assert-Condition (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) `
+        "$Context is a reparse point; refusing recursive cleanup: $full"
+    Remove-Item -LiteralPath $full -Recurse -Force
+    Assert-Condition (-not (Test-Path -LiteralPath $full)) "$Context was not removed: $full"
+}
+
+function Get-LauncherRunContract {
+    param([string]$LauncherConfigPath, [string]$RuntimeDirectory, [string]$Executable)
+    $runLines = @(Get-Content -LiteralPath $LauncherConfigPath |
+        Where-Object { $_ -match '^\s*RUN\s*=' })
+    Assert-Condition ($runLines.Count -eq 1) `
+        'launcher.lcf must contain exactly one RUN entry for validation.'
+    $match = [regex]::Match($runLines[0],
+        '^\s*RUN\s*=\s*(?<directory>\S+)\s+(?<executable>"[^"]+"|\S+)(?<arguments>.*)$')
+    Assert-Condition $match.Success 'launcher.lcf RUN entry has an unsupported shape.'
+    $directory = $match.Groups['directory'].Value
+    Assert-Condition ($directory -ceq '.') `
+        "launcher.lcf RUN working directory must be '.', got '$directory'."
+    $configuredExecutable = $match.Groups['executable'].Value.Trim('"')
+    Assert-Condition ($configuredExecutable -match '^[A-Za-z0-9._-]+\.exe$') `
+        'launcher.lcf RUN target must be a leaf executable name.'
+    $expectedExecutable = [IO.Path]::GetFileName($Executable)
+    Assert-Condition ($configuredExecutable -ceq $expectedExecutable) `
+        "launcher.lcf target '$configuredExecutable' does not match '$expectedExecutable'."
+
+    $argumentText = $match.Groups['arguments'].Value.Trim()
+    $arguments = New-Object 'Collections.Generic.List[string]'
+    if (-not [string]::IsNullOrWhiteSpace($argumentText)) {
+        $argumentMatches = [regex]::Matches($argumentText,
+            '"(?<quoted>(?:[^"]|"")*)"|(?<bare>\S+)')
+        $consumed = 0
+        foreach ($argumentMatch in $argumentMatches) {
+            if ($argumentMatch.Index -gt $consumed -and
+                $argumentText.Substring($consumed, $argumentMatch.Index - $consumed) -notmatch '^\s+$') {
+                throw 'launcher.lcf RUN arguments contain an unsupported token.'
+            }
+            $value = if ($argumentMatch.Groups['quoted'].Success) {
+                $argumentMatch.Groups['quoted'].Value.Replace('""', '"')
+            }
+            else { $argumentMatch.Groups['bare'].Value }
+            $arguments.Add($value) | Out-Null
+            $consumed = $argumentMatch.Index + $argumentMatch.Length
+        }
+        Assert-Condition ($consumed -eq $argumentText.Length) `
+            'launcher.lcf RUN arguments contain an unsupported trailing token.'
+    }
+    return [pscustomobject]@{
+        configPath = [IO.Path]::GetFullPath($LauncherConfigPath)
+        directory = $directory
+        executable = $configuredExecutable
+        arguments = $arguments.ToArray()
+        launcherPath = [IO.Path]::GetFullPath((Join-Path $RuntimeDirectory 'launcher.exe'))
+    }
+}
+
+function Assert-LauncherEquivalenceContract {
+    param(
+        [object]$LauncherContract,
+        [string]$Executable,
+        [string]$WorkingDirectory,
+        [object[]]$Plan,
+        [string]$ProfileLeafName = '',
+        [string]$DocumentsRoot = ''
+    )
+    $executableFull = [IO.Path]::GetFullPath($Executable)
+    $workingDirectoryFull = [IO.Path]::GetFullPath($WorkingDirectory)
+    $launcherTarget = [IO.Path]::GetFullPath((Join-Path $workingDirectoryFull $LauncherContract.executable))
+    Assert-Condition ([String]::Equals($launcherTarget, $executableFull,
+        [StringComparison]::OrdinalIgnoreCase)) `
+        'Direct validation target must be the executable named by launcher.lcf.'
+    $launcherArguments = @($LauncherContract.arguments)
+    if ($launcherArguments.Count -gt 0) {
+        Assert-Condition ($launcherArguments.Count -eq 4 -and
+            $launcherArguments[0] -ceq '-simulationMode' -and
+            $launcherArguments[1] -ceq 'parallel' -and
+            $launcherArguments[2] -ceq '-workerPolicy' -and
+            $launcherArguments[3] -ceq 'auto') `
+            'launcher.lcf may only contribute the reviewed native Stage 5 defaults.'
+    }
+    foreach ($entry in @($Plan)) {
+        $arguments = @($entry.arguments)
+        $headlessIndex = [Array]::IndexOf([object[]]$arguments, '-headless')
+        Assert-Condition ($headlessIndex -ge 0) `
+            "Validation entry $($entry.sequence) must remain headless for the direct exception."
+        $pipelineIndex = [Array]::IndexOf([object[]]$arguments, '-pipelineMode')
+        $simulationIndex = [Array]::IndexOf([object[]]$arguments, '-simulationMode')
+        $workerPolicyIndex = [Array]::IndexOf([object[]]$arguments, '-workerPolicy')
+        Assert-Condition ($pipelineIndex -ge 0 -and $arguments[$pipelineIndex + 1] -ceq 'serial' -and
+            $simulationIndex -ge 0 -and $arguments[$simulationIndex + 1] -ceq [string]$entry.simulationMode -and
+            $workerPolicyIndex -ge 0 -and $arguments[$workerPolicyIndex + 1] -ceq 'auto') `
+            "Validation entry $($entry.sequence) does not preserve the launcher-equivalent policy contract."
+        if ($launcherArguments.Count -gt 0) {
+            # A serial/shadow matrix entry deliberately overrides the launcher's
+            # parallel default. The worker policy remains the same final value;
+            # requiring a duplicate parallel token here would reject a valid
+            # explicit last-option-wins override.
+            $preservesLauncherSimulation = $entry.simulationMode -ceq 'parallel' `
+                -and $arguments -contains 'parallel'
+            Assert-Condition ($preservesLauncherSimulation -or $entry.simulationMode -cne 'parallel') `
+                "Validation entry $($entry.sequence) dropped the launcher's parallel default without an explicit simulation override."
+            Assert-Condition ($arguments -contains '-simulationMode' -and
+                $arguments -contains '-workerPolicy' -and $arguments -contains 'auto') `
+                "Validation entry $($entry.sequence) dropped a launcher.lcf default."
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($DocumentsRoot)) {
+        Assert-Condition ([String]::Equals(
+            [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($DocumentsRoot)),
+            'H:\', [StringComparison]::OrdinalIgnoreCase)) `
+            'Validation Documents redirection must remain on H:.'
+    }
+    return [pscustomobject]@{
+        schemaVersion = 1
+        mode = 'headless-direct-exception'
+        reason = 'launcher-main-does-not-propagate-child-exit-code'
+        launcherExecutable = $LauncherContract.launcherPath
+        launcherConfig = $LauncherContract.configPath
+        launcherTarget = $launcherTarget
+        launcherArguments = $launcherArguments
+        launcherWorkingDirectory = $workingDirectoryFull
+        directExecutable = $executableFull
+        directArguments = @('-headless', '-noFPSLimit', '-pipelineMode', 'serial',
+            '-simulationMode', '<matrix>', '-workerPolicy', 'auto',
+            '-validationExecutableSha256', '<manifest>')
+        directWorkingDirectory = $workingDirectoryFull
+        environmentVariables = @('TEMP', 'TMP', 'LOCALAPPDATA', 'APPDATA',
+            'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'RTS_FRAME_TIMING_DIR')
+        profileStrategy = 'known-folder-registry-redirect'
+        profileLeafName = $ProfileLeafName
+        documentsRoot = if ([string]::IsNullOrWhiteSpace($DocumentsRoot)) { $null } else { [IO.Path]::GetFullPath($DocumentsRoot) }
+        profileRegistryValues = @(
+            'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders\Personal',
+            'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders\Personal')
+        childExitCodeObserved = $true
+    }
+}
+
 function Get-PhysicalCoreCount {
     try {
         $processors = @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop)
@@ -145,16 +325,16 @@ function Assert-X64PeExecutable {
         $reader = New-Object IO.BinaryReader($stream)
         try {
             Assert-Condition ($reader.ReadUInt16() -eq 0x5A4D) `
-                'Performance validation requires a valid PE executable.'
+                'x64 validation requires a valid PE executable.'
             $stream.Position = 0x3C
             $peOffset = $reader.ReadInt32()
             Assert-Condition ($peOffset -gt 0 -and $peOffset -lt $stream.Length - 6) `
-                'Performance validation requires a valid PE header.'
+                'x64 validation requires a valid PE header.'
             $stream.Position = $peOffset
             Assert-Condition ($reader.ReadUInt32() -eq 0x00004550) `
-                'Performance validation requires a valid PE signature.'
+                'x64 validation requires a valid PE signature.'
             Assert-Condition ($reader.ReadUInt16() -eq 0x8664) `
-                'Performance validation requires the exact native x64 candidate.'
+                'x64 validation requires the exact native x64 candidate.'
         }
         finally { $reader.Dispose() }
     }
@@ -258,7 +438,7 @@ function Add-PlanEntry {
 
 function Get-ManifestData {
     param([string]$Path, [string]$Set, [bool]$AllowNonStandard,
-        [string]$ExecutableHashOverride)
+        [string]$ExecutableHashOverride, [string]$ExpectedTitle = 'ZeroHour')
     $manifestFile = [IO.Path]::GetFullPath($Path)
     Assert-Condition (Test-Path -LiteralPath $manifestFile -PathType Leaf) "Fixture manifest was not found: $manifestFile"
     $manifestDirectory = Split-Path -Parent $manifestFile
@@ -281,12 +461,16 @@ function Get-ManifestData {
         'Fixture manifest schemaVersion must be 1.'
     $title = Get-RequiredProperty $manifest 'title' 'Fixture manifest'
     Assert-JsonString $title 'Fixture manifest title'
-    Assert-Condition ($title -ceq 'ZeroHour') `
-        'The Stage 5 installed-runtime matrix currently supports title ZeroHour only.'
+    Assert-Condition ($title -ceq $ExpectedTitle) `
+        "Fixture manifest title '$title' does not match the requested installed-runtime title '$ExpectedTitle'."
     $executableName = Get-RequiredProperty $manifest 'executable' 'Fixture manifest'
     Assert-JsonString $executableName 'Fixture manifest executable'
     Assert-Condition ($executableName -match '^[A-Za-z0-9._-]+\.exe$') `
         'Fixture manifest executable must be a leaf .exe name.'
+    $expectedExecutablePrefix = if ($ExpectedTitle -ceq 'Generals') { 'generalsv' } else { 'generalszh' }
+    Assert-Condition ($executableName -match ('^' + $expectedExecutablePrefix +
+        '(?:-[A-Za-z0-9._-]+)?\.exe$')) `
+        "Fixture manifest executable '$executableName' does not belong to the requested title '$ExpectedTitle'."
     $executableHash = Get-RequiredProperty $manifest 'executableSha256' 'Fixture manifest'
     Assert-JsonString $executableHash 'Fixture manifest executableSha256'
     Assert-Condition (Test-Sha256Text $executableHash) 'Fixture manifest executableSha256 is invalid.'
@@ -414,6 +598,7 @@ function Get-ManifestData {
     return [pscustomobject]@{
         file = $manifestFile
         directory = $manifestDirectory
+        title = $title
         executable = $executableName
         executableSha256 = $executableHash.ToUpperInvariant()
         executableSha256Source = $executableHashSource
@@ -636,8 +821,94 @@ function Restore-RegistryValue {
     }
 }
 
+function Get-ValidationProcessIdentity {
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+    $processInfo = Get-CimInstance -ClassName Win32_Process `
+        -Filter ("ProcessId = {0}" -f $ProcessId) -ErrorAction SilentlyContinue
+    if ($null -eq $processInfo) { return $null }
+    if ([string]::IsNullOrWhiteSpace([string]$processInfo.ExecutablePath)) {
+        throw "Could not bind validation PID $ProcessId to an executable path."
+    }
+    $parentInfo = Get-CimInstance -ClassName Win32_Process `
+        -Filter ("ProcessId = {0}" -f [int]$processInfo.ParentProcessId) `
+        -ErrorAction SilentlyContinue
+    return [pscustomobject]@{
+        processId = [int]$processInfo.ProcessId
+        executablePath = [IO.Path]::GetFullPath([string]$processInfo.ExecutablePath)
+        creationToken = [string]$processInfo.CreationDate
+        parentProcessId = [int]$processInfo.ParentProcessId
+        parentCreationToken = if ($null -eq $parentInfo) { '' } else { [string]$parentInfo.CreationDate }
+    }
+}
+
+function Stop-ValidationProcessSafely {
+    param(
+        [Parameter(Mandatory = $true)][Diagnostics.Process]$Process,
+        [AllowNull()][object]$ExpectedIdentity = $null,
+        [int]$PostKillWaitMilliseconds = 30000
+    )
+    if ($Process.HasExited) {
+        # The process exited between the timeout check and cleanup.  Do not
+        # issue a second termination against a potentially reused PID.
+        return $false
+    }
+    if ($null -ne $ExpectedIdentity) {
+        $currentIdentity = $null
+        try {
+            $currentIdentity = Get-ValidationProcessIdentity $Process.Id
+        }
+        catch {
+            # CIM is supplementary evidence only.  The Process object returned
+            # by Start() remains bound to the original OS process handle, so a
+            # transient identity-query failure must not discard that handle or
+            # fall back to a fresh PID lookup.
+            Write-Warning "Could not refresh validation PID $($Process.Id) identity; terminating through the original Process handle."
+        }
+        if ($null -ne $currentIdentity) {
+            $sameExecutable = [String]::Equals(
+                $currentIdentity.executablePath, $ExpectedIdentity.executablePath,
+                [StringComparison]::OrdinalIgnoreCase)
+            $sameCreation = $currentIdentity.creationToken -ceq $ExpectedIdentity.creationToken
+            $sameParent = $currentIdentity.parentProcessId -eq $ExpectedIdentity.parentProcessId -and
+                $currentIdentity.parentCreationToken -ceq $ExpectedIdentity.parentCreationToken
+            if (-not ($sameExecutable -and $sameCreation -and $sameParent)) {
+                throw "Refusing to terminate validation PID $($Process.Id) because its path or process/parent creation identity changed."
+            }
+        }
+        elseif ($Process.HasExited) {
+            return $false
+        }
+        else {
+            Write-Warning "Validation PID $($Process.Id) identity is unavailable; terminating through the original Process handle."
+        }
+    }
+    try {
+        # Kill only through the Process instance retained immediately after
+        # Start().  Never reacquire by PID: doing so reopens a PID-reuse TOCTOU
+        # window between identity inspection and termination.
+        $Process.Kill()
+    }
+    catch {
+        try {
+            if ($Process.HasExited) { return $false }
+        }
+        catch { }
+        throw "Identity-bound validation process termination failed: $($_.Exception.Message)"
+    }
+    if (-not $Process.WaitForExit($PostKillWaitMilliseconds)) {
+        throw "Validation PID $($Process.Id) did not exit within the bounded post-kill wait."
+    }
+    return $true
+}
+
 function Invoke-ValidationProcess {
-    param([string]$Executable, [string]$WorkingDirectory, [object]$Entry, [bool]$CaptureTiming)
+    param(
+        [string]$Executable,
+        [string]$WorkingDirectory,
+        [object]$Entry,
+        [bool]$CaptureTiming,
+        [hashtable]$Environment
+    )
     $processName = [IO.Path]::GetFileNameWithoutExtension($Executable)
     Assert-Condition (@(Get-Process -Name $processName -ErrorAction SilentlyContinue).Count -eq 0) `
         "A $processName process is already running. Validation will not overlap game processes."
@@ -658,41 +929,111 @@ function Invoke-ValidationProcess {
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
+    foreach ($environmentName in $Environment.Keys) {
+        $startInfo.EnvironmentVariables[[string]$environmentName] =
+            [string]$Environment[$environmentName]
+    }
     if ($CaptureTiming) {
         $startInfo.EnvironmentVariables['RTS_FRAME_TIMING_DIR'] = $Entry.timingDirectory
+    }
+    elseif ($startInfo.EnvironmentVariables.ContainsKey('RTS_FRAME_TIMING_DIR')) {
+        $startInfo.EnvironmentVariables.Remove('RTS_FRAME_TIMING_DIR')
     }
     $process = New-Object Diagnostics.Process
     $process.StartInfo = $startInfo
     $startedAt = [DateTime]::UtcNow
-    Assert-Condition ($process.Start()) "Failed to start installed runtime process."
-    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-    $stderrTask = $process.StandardError.ReadToEndAsync()
-    $exited = $process.WaitForExit($Entry.timeoutSeconds * 1000)
-    if (-not $exited) {
-        try { $process.Kill() } catch { }
-        $process.WaitForExit()
-    }
-    $stdout = $stdoutTask.Result
-    $stderr = $stderrTask.Result
-    [IO.File]::WriteAllText($Entry.stdout, $stdout)
-    [IO.File]::WriteAllText($Entry.stderr, $stderr)
-    $runtimeLogText = New-Object 'Collections.Generic.List[string]'
-    foreach ($runtimeLog in @(Get-ChildItem -LiteralPath $WorkingDirectory -Filter '*DebugLogFile*.txt' -File |
-        Where-Object { $_.LastWriteTimeUtc -ge $startedAt.AddSeconds(-2) })) {
-        if (-not (Test-Path -LiteralPath $Entry.runtimeLogDirectory -PathType Container)) {
-            New-Item -ItemType Directory -Path $Entry.runtimeLogDirectory -Force | Out-Null
+    $started = $false
+    $terminationAttempted = $false
+    $processIdentity = $null
+    $stdoutTask = $null
+    $stderrTask = $null
+    $exited = $false
+    $timedOut = $false
+    $postKillWaitMilliseconds = 30000
+    try {
+        Assert-Condition ($process.Start()) "Failed to start installed runtime process."
+        $started = $true
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        try {
+            $processIdentity = Get-ValidationProcessIdentity $process.Id
         }
-        Copy-Item -LiteralPath $runtimeLog.FullName -Destination `
-            (Join-Path $Entry.runtimeLogDirectory $runtimeLog.Name)
-        $runtimeLogText.Add((Get-Content -LiteralPath $runtimeLog.FullName -Raw)) | Out-Null
+        catch {
+            Write-Warning "Could not capture validation PID $($process.Id) identity; retaining the original Process handle for bounded cleanup."
+            $processIdentity = $null
+        }
+        if ($null -eq $processIdentity -and -not $process.HasExited) {
+            Write-Warning "Validation PID $($process.Id) identity is unavailable; retaining the original Process handle for bounded cleanup."
+        }
+        if ($null -ne $processIdentity -and
+                -not [String]::Equals($processIdentity.executablePath,
+                    [IO.Path]::GetFullPath($Executable), [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Validation process path does not match the requested executable: $($processIdentity.executablePath)"
+        }
+
+        $exited = $process.WaitForExit($Entry.timeoutSeconds * 1000)
+        if (-not $exited) {
+            $timedOut = $true
+            $terminationAttempted = $true
+            Stop-ValidationProcessSafely $process $processIdentity $postKillWaitMilliseconds | Out-Null
+            # Keep the final state bounded even if the process disappeared in
+            # the race between identity inspection and Kill().
+            $exited = $process.WaitForExit($postKillWaitMilliseconds)
+            if (-not $exited) {
+                throw "Validation process remained alive after the bounded post-kill wait."
+            }
+        }
+        if ($null -eq $stdoutTask -or -not $stdoutTask.Wait($postKillWaitMilliseconds)) {
+            throw 'Validation stdout did not complete within the bounded post-process wait.'
+        }
+        if ($null -eq $stderrTask -or -not $stderrTask.Wait($postKillWaitMilliseconds)) {
+            throw 'Validation stderr did not complete within the bounded post-process wait.'
+        }
+        $stdout = $stdoutTask.Result
+        $stderr = $stderrTask.Result
+        [IO.File]::WriteAllText($Entry.stdout, $stdout)
+        [IO.File]::WriteAllText($Entry.stderr, $stderr)
+        $runtimeLogText = New-Object 'Collections.Generic.List[string]'
+        foreach ($runtimeLog in @(Get-ChildItem -LiteralPath $WorkingDirectory -Filter '*DebugLogFile*.txt' -File |
+            Where-Object { $_.LastWriteTimeUtc -ge $startedAt.AddSeconds(-2) })) {
+            if (-not (Test-Path -LiteralPath $Entry.runtimeLogDirectory -PathType Container)) {
+                New-Item -ItemType Directory -Path $Entry.runtimeLogDirectory -Force | Out-Null
+            }
+            Copy-Item -LiteralPath $runtimeLog.FullName -Destination `
+                (Join-Path $Entry.runtimeLogDirectory $runtimeLog.Name)
+            $runtimeLogText.Add((Get-Content -LiteralPath $runtimeLog.FullName -Raw)) | Out-Null
+        }
+        return [pscustomobject]@{
+            timedOut = $timedOut
+            exitCode = $(if ($exited) { $process.ExitCode } else { -1 })
+            wallMilliseconds = [int64]([DateTime]::UtcNow - $startedAt).TotalMilliseconds
+            stdout = $stdout
+            stderr = $stderr
+            runtimeLogText = $runtimeLogText.ToArray() -join "`n"
+        }
     }
-    return [pscustomobject]@{
-        timedOut = -not $exited
-        exitCode = $(if ($exited) { $process.ExitCode } else { -1 })
-        wallMilliseconds = [int64]([DateTime]::UtcNow - $startedAt).TotalMilliseconds
-        stdout = $stdout
-        stderr = $stderr
-        runtimeLogText = $runtimeLogText.ToArray() -join "`n"
+    finally {
+        $cleanupErrors = New-Object 'Collections.Generic.List[string]'
+        if ($started) {
+            try {
+                if (-not $process.HasExited) {
+                    if ($terminationAttempted) {
+                        if (-not $process.WaitForExit($postKillWaitMilliseconds)) {
+                            throw 'Validation process remained alive after its bounded termination attempt.'
+                        }
+                    }
+                    else {
+                        $terminationAttempted = $true
+                        Stop-ValidationProcessSafely $process $processIdentity $postKillWaitMilliseconds | Out-Null
+                    }
+                }
+            }
+            catch { $cleanupErrors.Add($_.Exception.Message) | Out-Null }
+        }
+        if ($null -ne $process) { $process.Dispose() }
+        if ($cleanupErrors.Count -gt 0) {
+            throw "Validation process cleanup failed: $($cleanupErrors -join ' | ')"
+        }
     }
 }
 
@@ -720,10 +1061,14 @@ Assert-Condition (-not $EnforcePerformance -or (-not $DisableFrameTiming -and -n
 Assert-Condition (-not $EnforcePerformance -or
     ($ReplayMatrixRepeats * $StressRepeats) -ge 4) `
     'Performance validation requires one warm-up and at least three measured stress runs per configuration.'
+if (-not $PlanOnly) {
+    Assert-Condition ([bool]$AllowHeadlessDirectExecution) `
+        'Installed validation requires the reviewed -AllowHeadlessDirectExecution exception.'
+}
 
 $runtimeFull = [IO.Path]::GetFullPath($RuntimeRoot)
 $manifestData = Get-ManifestData $FixtureManifestPath $ValidationSet `
-    ([bool]$AllowNonStandardCorpus) $ExpectedExecutableSha256
+    ([bool]$AllowNonStandardCorpus) $ExpectedExecutableSha256 $Title
 $executableFull = Join-Path $runtimeFull $manifestData.executable
 Assert-Condition (Test-Path -LiteralPath $runtimeFull -PathType Container) "Installed runtime root was not found: $runtimeFull"
 Assert-Condition (Test-Path -LiteralPath (Join-Path $runtimeFull 'launcher.exe') -PathType Leaf) `
@@ -733,6 +1078,8 @@ Assert-Condition (Test-Path -LiteralPath (Join-Path $runtimeFull 'launcher.lcf')
 Assert-Condition (Test-Path -LiteralPath $executableFull -PathType Leaf) `
     "Installed runtime executable was not found: $executableFull"
 Assert-FileHash $executableFull $manifestData.executableSha256 'Installed runtime executable' | Out-Null
+$launcherConfigFull = [IO.Path]::GetFullPath((Join-Path $runtimeFull 'launcher.lcf'))
+$launcherContract = Get-LauncherRunContract $launcherConfigFull $runtimeFull $executableFull
 
 $physicalCoreCount = 0
 $stage3PerformanceBaseline = $null
@@ -752,6 +1099,13 @@ if ($EnforcePerformance) {
 $outputFull = [IO.Path]::GetFullPath($OutputRoot)
 Assert-Condition (-not (Test-Path -LiteralPath $outputFull)) `
     'OutputRoot must not already exist; every validation run owns a fresh evidence directory.'
+if (-not $PlanOnly) {
+    $taskRootFull = Resolve-ExplicitTaskRoot $TaskRoot 'TaskRoot'
+    Assert-Condition (Test-Path -LiteralPath $taskRootFull -PathType Container) `
+        "TaskRoot must already exist as a task-owned directory: $taskRootFull"
+    Assert-TaskOwnedPath $outputFull $taskRootFull 'OutputRoot' | Out-Null
+    Assert-FreeSpace $taskRootFull $MinimumFreeBytes 'Validation task volume'
+}
 Assert-FreeSpace (Split-Path -Parent $outputFull) $MinimumFreeBytes 'Validation output volume'
 New-Item -ItemType Directory -Path $outputFull | Out-Null
 if ($null -ne $stage3PerformanceBaseline) {
@@ -766,6 +1120,8 @@ $plan = @(New-ValidationPlan $manifestData $ValidationSet $ReplayMatrixRepeats $
     $ReplayTimeoutSeconds $AiTimeoutSeconds $executableFull $outputFull)
 Assert-Condition ($plan.Count -gt 0) 'The fixture manifest produced an empty validation plan.'
 Assert-Condition ($plan.Count -le 10000) 'The fixture manifest produced more than 10000 validation entries.'
+$launcherEquivalence = Assert-LauncherEquivalenceContract $launcherContract `
+    $executableFull $runtimeFull $plan
 if ($deterministicRuntimeContractRequested) {
     foreach ($configuration in @(Get-WorkerConfigurations | ForEach-Object { $_.Id })) {
         $configurationReplayPlan = @($plan | Where-Object {
@@ -807,6 +1163,7 @@ $planDocument = [pscustomobject]@{
     generatedUtc = [DateTime]::UtcNow.ToString('o')
     runtimeRoot = $runtimeFull
     executable = $executableFull
+    title = $manifestData.title
     executableSha256 = $manifestData.executableSha256
     executableSha256Source = $manifestData.executableSha256Source
     fixtureManifest = $manifestData.file
@@ -819,10 +1176,13 @@ $planDocument = [pscustomobject]@{
     performanceMeasurementScope = 'aggregate-stage5-stress-replay-throughput'
     collisionSpecificReplayPerformanceClaim = $false
     diagnosticNonAcceptance = [bool]$DiagnosticNonAcceptance
+    directExecutionExceptionRequested = [bool]$AllowHeadlessDirectExecution
     frameTimingRequired = -not [bool]$DisableFrameTiming
     authoritativeWorkEvidenceRequired = $deterministicRuntimeEligible
     deterministicRuntimeEligible = $deterministicRuntimeEligible
     finalAcceptanceEligible = $false
+    taskRoot = $(if ($PlanOnly) { $null } else { $taskRootFull })
+    launcherContract = $launcherEquivalence
     physicalCoreCount = $physicalCoreCount
     stage3PerformanceBaseline = $(if ($null -ne $stage3PerformanceBaseline) {
         [pscustomobject]@{
@@ -866,19 +1226,58 @@ if ($PlanOnly) {
     return
 }
 
-if ([string]::IsNullOrWhiteSpace($ProfileLeafName)) {
+if ($Title -ceq 'Generals') {
+    $generalsProfileLeaf = 'Command and Conquer Generals Data'
+    if (-not [string]::IsNullOrWhiteSpace($ProfileLeafName)) {
+        Assert-Condition ($ProfileLeafName -ceq $generalsProfileLeaf) `
+            "Generals reads UserDataLeafName from INI; ProfileLeafName must be '$generalsProfileLeaf'."
+    }
+    $ProfileLeafName = $generalsProfileLeaf
+}
+elseif ([string]::IsNullOrWhiteSpace($ProfileLeafName)) {
     $ProfileLeafName = 'GGC-Stage5-Validation-{0}-{1}' -f ([DateTime]::UtcNow.ToString('yyyyMMddHHmmss')), $PID
 }
-Assert-Condition ($ProfileLeafName -match '^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$') `
-    'ProfileLeafName must be a simple unique Documents leaf name.'
-$documents = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
-Assert-Condition (-not [string]::IsNullOrWhiteSpace($documents)) 'The Documents directory could not be resolved.'
-$profileFull = [IO.Path]::GetFullPath((Join-Path $documents $ProfileLeafName))
-Assert-Condition ($profileFull.StartsWith([IO.Path]::GetFullPath($documents) + [IO.Path]::DirectorySeparatorChar,
-    [StringComparison]::OrdinalIgnoreCase)) 'Profile path escapes Documents.'
-Assert-Condition (-not (Test-Path -LiteralPath $profileFull)) 'ProfileLeafName already exists; use a unique profile.'
-Assert-FreeSpace $documents $MinimumFreeBytes 'Validation profile volume'
-New-Item -ItemType Directory -Path (Join-Path $profileFull 'Replays\Stage5Validation') -Force | Out-Null
+Assert-Condition ($ProfileLeafName -match '^[A-Za-z0-9][A-Za-z0-9 ._-]{0,79}$') `
+    'ProfileLeafName must be a simple Documents leaf name.'
+
+$taskRunRoot = [IO.Path]::GetFullPath((Join-Path $taskRootFull `
+    ('validation-run-{0}-{1}' -f $PID, [Guid]::NewGuid().ToString('N'))))
+Assert-TaskOwnedPath $taskRunRoot $taskRootFull 'Validation run root' | Out-Null
+Assert-Condition (-not (Test-Path -LiteralPath $taskRunRoot)) `
+    'The generated task validation run root already exists.'
+$documentsRoot = Join-Path $taskRunRoot 'Documents'
+$profileFull = [IO.Path]::GetFullPath((Join-Path $documentsRoot $ProfileLeafName))
+Assert-TaskOwnedPath $documentsRoot $taskRootFull 'Validation Documents root' | Out-Null
+Assert-TaskOwnedPath $profileFull $taskRootFull 'Validation profile' | Out-Null
+$tempRoot = Join-Path $taskRunRoot 'Temp'
+$tmpRoot = Join-Path $taskRunRoot 'Tmp'
+$cacheRoot = Join-Path $taskRunRoot 'Cache'
+$localAppDataRoot = Join-Path $taskRunRoot 'LocalAppData'
+$appDataRoot = Join-Path $taskRunRoot 'AppData'
+$taskRunPath = $taskRunRoot.Substring(2)
+if (-not $taskRunPath.StartsWith('\')) { $taskRunPath = '\' + $taskRunPath }
+$validationEnvironment = @{
+    TEMP = $tempRoot
+    TMP = $tmpRoot
+    LOCALAPPDATA = $localAppDataRoot
+    APPDATA = $appDataRoot
+    USERPROFILE = $taskRunRoot
+    HOMEDRIVE = 'H:'
+    HOMEPATH = $taskRunPath
+    RTS_STAGE5_VALIDATION_PROFILE_ROOT = $profileFull
+    RTS_STAGE5_VALIDATION_CACHE_ROOT = $cacheRoot
+}
+
+$registrySnapshots = New-Object 'Collections.Generic.List[object]'
+$results = New-Object 'Collections.Generic.List[object]'
+$resultsPath = Join-Path $outputFull 'validation-results.json'
+$fatalPattern = '(?i)(CRC Mismatch|game thread ownership violation|assertion failed|fatal error|missing map|replay read error|SKIRMISH_AI_TEST_FAIL|SIMULATION_JOB_SYSTEM_FALLBACK|SIMULATION_SHADOW_(?:MISMATCH|FAIL)|SIMULATION_COLLISION_MISMATCH)'
+try {
+    New-Item -ItemType Directory -Path $taskRunRoot -Force | Out-Null
+    foreach ($directory in @($documentsRoot, $tempRoot, $tmpRoot, $cacheRoot,
+            $localAppDataRoot, $appDataRoot, (Join-Path $profileFull 'Replays\Stage5Validation'))) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
 
 foreach ($fixture in $manifestData.fixtures) {
     $replayDestination = Join-Path $profileFull "Replays\$($fixture.replayArgument)"
@@ -921,27 +1320,42 @@ $generalsInstallFull = [IO.Path]::GetFullPath($GeneralsInstallRoot)
 Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Container) `
     "GeneralsInstallRoot was not found: $generalsInstallFull"
 
-$registrySnapshots = New-Object 'Collections.Generic.List[object]'
-$results = New-Object 'Collections.Generic.List[object]'
-$resultsPath = Join-Path $outputFull 'validation-results.json'
-$fatalPattern = '(?i)(CRC Mismatch|game thread ownership violation|assertion failed|fatal error|missing map|replay read error|SKIRMISH_AI_TEST_FAIL|SIMULATION_JOB_SYSTEM_FALLBACK|SIMULATION_SHADOW_(?:MISMATCH|FAIL)|SIMULATION_COLLISION_MISMATCH)'
-try {
     foreach ($view in @([Microsoft.Win32.RegistryView]::Registry32, [Microsoft.Win32.RegistryView]::Registry64)) {
+        # Both title variants call SHGetKnownFolderPath(FOLDERID_Documents),
+        # but Generals reads its leaf from INI while Zero Hour reads the leaf
+        # from the title registry key. Redirect the known folder itself so no
+        # validation profile is created below the user's live C: Documents.
         Set-PreservedRegistryValue $view `
-            'Software\Electronic Arts\EA Games\Generals' 'InstallPath' `
-            ($generalsInstallFull + '\') $registrySnapshots
+            'Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' `
+            'Personal' $documentsRoot $registrySnapshots
         Set-PreservedRegistryValue $view `
-            'Software\Electronic Arts\EA Games\Command and Conquer Generals Zero Hour' `
-            'InstallPath' ($runtimeFull + '\') $registrySnapshots
-        Set-PreservedRegistryValue $view `
-            'Software\Electronic Arts\EA Games\Command and Conquer Generals Zero Hour' `
-            'UserDataLeafName' $ProfileLeafName $registrySnapshots
+            'Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders' `
+            'Personal' $documentsRoot $registrySnapshots
+        if ($Title -ceq 'Generals') {
+            Set-PreservedRegistryValue $view `
+                'Software\Electronic Arts\EA Games\Generals' 'InstallPath' `
+                ($generalsInstallFull + '\') $registrySnapshots
+        }
+        else {
+            Set-PreservedRegistryValue $view `
+                'Software\Electronic Arts\EA Games\Command and Conquer Generals Zero Hour' `
+                'InstallPath' ($runtimeFull + '\') $registrySnapshots
+            Set-PreservedRegistryValue $view `
+                'Software\Electronic Arts\EA Games\Command and Conquer Generals Zero Hour' `
+                'UserDataLeafName' $ProfileLeafName $registrySnapshots
+        }
     }
+
+    $launcherEquivalence = Assert-LauncherEquivalenceContract $launcherContract `
+        $executableFull $runtimeFull $plan $ProfileLeafName $documentsRoot
+    $planDocument.launcherContract = $launcherEquivalence
+    [IO.File]::WriteAllText($planPath, ($planDocument | ConvertTo-Json -Depth 8))
 
     foreach ($entry in $plan) {
         Assert-FreeSpace $outputFull $MinimumFreeBytes 'Validation evidence volume'
         Assert-FileHash $executableFull $manifestData.executableSha256 'Installed runtime executable before run' | Out-Null
-        $run = Invoke-ValidationProcess $executableFull $runtimeFull $entry (-not $DisableFrameTiming)
+        $run = Invoke-ValidationProcess $executableFull $runtimeFull $entry `
+            (-not $DisableFrameTiming) $validationEnvironment
         $combined = $run.stdout + "`n" + $run.stderr + "`n" + $run.runtimeLogText
         Assert-Condition (-not $run.timedOut) "Validation entry $($entry.sequence) timed out."
         Assert-Condition ($run.exitCode -eq 0) "Validation entry $($entry.sequence) exited with code $($run.exitCode)."
@@ -978,6 +1392,7 @@ try {
         }
         $results.Add([pscustomobject]@{
             sequence = $entry.sequence
+            title = $manifestData.title
             kind = $entry.kind
             caseId = $entry.caseId
             determinismKey = $entry.determinismKey
@@ -1020,6 +1435,10 @@ try {
     if ($EnforcePerformance) {
         $performanceReport = Measure-Stage5Performance $results.ToArray() $physicalCoreCount `
             $stage3PerformanceBaseline 1 3
+        # Keep the performance evidence title-specific when the same reusable
+        # runner serves both Generals and Zero Hour lanes.
+        $performanceReport | Add-Member -NotePropertyName title `
+            -NotePropertyValue $manifestData.title -Force
         $performanceReportPath = Join-Path $outputFull 'performance-report.json'
         [IO.File]::WriteAllText($performanceReportPath, ($performanceReport | ConvertTo-Json -Depth 8))
         Assert-Condition ($performanceReport.status -ceq 'passed') `
@@ -1028,9 +1447,24 @@ try {
     Assert-FileHash $executableFull $manifestData.executableSha256 'Installed runtime executable after matrix' | Out-Null
 }
 finally {
-    Invoke-Stage5RegistryRestore -Snapshots @($registrySnapshots.ToArray()) -RestoreAction {
-        param($snapshot)
-        Restore-RegistryValue $snapshot
+    $cleanupErrors = New-Object 'Collections.Generic.List[string]'
+    try {
+        Invoke-Stage5RegistryRestore -Snapshots @($registrySnapshots.ToArray()) -RestoreAction {
+            param($snapshot)
+            Restore-RegistryValue $snapshot
+        }
+    }
+    catch {
+        $cleanupErrors.Add("registry restoration: $($_.Exception.Message)") | Out-Null
+    }
+    try {
+        Remove-TaskOwnedDirectory $taskRunRoot $taskRootFull 'Validation task scratch root'
+    }
+    catch {
+        $cleanupErrors.Add("task scratch cleanup: $($_.Exception.Message)") | Out-Null
+    }
+    if ($cleanupErrors.Count -gt 0) {
+        throw "Stage 5 validation cleanup failed after attempting every cleanup action: $($cleanupErrors -join ' | ')"
     }
 }
 

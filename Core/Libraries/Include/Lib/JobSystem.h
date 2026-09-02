@@ -255,6 +255,15 @@ public:
 	unsigned workerCount() const;
 	unsigned outstandingJobCount() const;
 	JobSystemMetrics metrics() const;
+	// Snapshot the immutable Windows CPU-set topology selected during start.
+	// These accessors remain valid after shutdown so an executable-owned receipt
+	// can be written at the exact completion boundary.
+	unsigned cpuSetCount() const;
+	bool cpuSetAt(unsigned index, JobCpuSetInfo &result) const;
+	unsigned selectedWorkerCpuSetCount() const;
+	bool selectedWorkerCpuSetIdAt(unsigned index, unsigned &result) const;
+	unsigned ownerCpuSetCount() const;
+	bool ownerCpuSetIdAt(unsigned index, unsigned &result) const;
 	void resetMetrics();
 	// Resets only wall-clock scheduler telemetry. Intervals crossing the reset
 	// boundary are discarded so a new match cannot inherit pre-match idle time.

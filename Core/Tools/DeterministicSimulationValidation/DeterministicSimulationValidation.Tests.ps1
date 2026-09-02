@@ -28,6 +28,55 @@ function Assert-True {
     }
 }
 
+function Assert-InstalledNet3ModuleBoundary {
+    param([Parameter(Mandatory = $true)][string]$FixturePath)
+    $runnerPath = Join-Path $PSScriptRoot 'Invoke-InstalledNet3LoopbackValidation.ps1'
+    $runnerSource = Get-Content -LiteralPath $runnerPath -Raw
+    Assert-True ($runnerSource -match '(?m)^Import-Module\s+\(Join-Path\s+\$PSScriptRoot') `
+        'the installed NET3 runner imports the evidence module through its module boundary'
+    Assert-True ($runnerSource -notmatch '(?m)^\.\s+\(Join-Path\s+\$PSScriptRoot') `
+        'the installed NET3 runner does not dot-source the evidence module'
+    Assert-True ($runnerSource -notmatch 'Get-Process\s+-Id|Stop-Process') `
+        'the installed NET3 runner does not reacquire or terminate peers by PID'
+    Assert-True ($runnerSource -match '\$Process\.Kill\(\)' -and
+        $runnerSource -match '\$Process\.WaitForExit\(\$PostKillWaitMilliseconds\)' -and
+        $runnerSource -notmatch '\$Process\.WaitForExit\(\s*\)') `
+        'the installed NET3 runner performs bounded retained-handle cleanup'
+    Assert-True ($runnerSource -match '\$cleanupFailures\s*=\s*New-Object' -and
+        $runnerSource -match 'foreach\s*\(\$entry\s+in\s+\$processes\)' -and
+        $runnerSource -match 'Installed NET3 peer cleanup failed') `
+        'the installed NET3 runner attempts every peer cleanup and reports aggregate failures'
+    Assert-True ($runnerSource -match '\$entry\.peerIndex' -and
+        $runnerSource -notmatch '\$entry\.index') `
+        'the installed NET3 runner reports cleanup failures with the retained peer index'
+    foreach ($helper in @('ConvertFrom-Stage5JsonDictionary', 'Assert-Stage5JsonShape',
+        'Get-Stage5JsonValue', 'Test-Stage5JsonInteger', 'Get-Stage5UInt64BitCount')) {
+        $escaped = [regex]::Escape($helper)
+        Assert-True ($runnerSource -match $escaped) `
+            "the installed NET3 runner invokes its shared helper '$helper'"
+        Assert-True ($null -ne (Get-Command $helper -ErrorAction SilentlyContinue)) `
+            "the evidence module exports the installed NET3 helper '$helper'"
+    }
+    try {
+        $fixture = [ordered]@{ schemaVersion = 1; marker = 'installed-net3-module-fixture' }
+        Write-JsonDocument $FixturePath $fixture
+        $document = ConvertFrom-Stage5JsonDictionary $FixturePath
+        Assert-Stage5JsonShape $document @('schemaVersion', 'marker') `
+            'installed NET3 module fixture'
+        Assert-True ((Get-Stage5JsonValue $document 'marker' `
+            'installed NET3 module fixture') -ceq 'installed-net3-module-fixture') `
+            'the installed NET3 runner module fixture can invoke the shared JSON helpers'
+        Assert-True (Test-Stage5JsonInteger (Get-Stage5JsonValue $document `
+            'schemaVersion' 'installed NET3 module fixture')) `
+            'the installed NET3 runner module fixture can invoke the shared scalar helpers'
+        Assert-True ((Get-Stage5UInt64BitCount ([UInt64]7)) -eq 3) `
+            'the installed NET3 runner module fixture can invoke the shared bit-count helper'
+    }
+    catch {
+        Assert-True $false "the installed NET3 runner module fixture failed: $($_.Exception.Message)"
+    }
+}
+
 function Assert-Throws {
     param([scriptblock]$Action, [string]$Pattern, [string]$Message)
     try {
@@ -39,19 +88,535 @@ function Assert-Throws {
     }
 }
 
+function Assert-ValidationProcessTerminationContract {
+    param([Parameter(Mandatory = $true)][string]$Content)
+    if ($Content -notmatch '(?ms)function\s+Stop-ValidationProcessSafely') {
+        throw 'Validation process termination helper is missing.'
+    }
+    if ($Content -match 'Get-Process\s+-Id') {
+        throw 'Validation timeout handling reacquires a process by PID instead of retaining the launched handle.'
+    }
+    if ($Content -notmatch '\$Process\.Kill\(\)') {
+        throw 'Validation timeout handling does not terminate through the retained Process handle.'
+    }
+    if ($Content -notmatch 'identity is unavailable; terminating through the original Process handle') {
+        throw 'Validation timeout handling does not retain the original handle when CIM identity capture is unavailable.'
+    }
+    if ($Content -match '\$process\.WaitForExit\(\s*\)') {
+        throw 'Validation timeout handling contains an unbounded WaitForExit call.'
+    }
+    if ($Content -match '\$process\.Kill\(\)\s*\}\s*catch\s*\{\s*\}') {
+        throw 'Validation timeout handling swallows a process termination failure.'
+    }
+    if ($Content -notmatch '\$Process\.WaitForExit\(\$PostKillWaitMilliseconds\)') {
+        throw 'Validation timeout handling has no bounded post-kill wait.'
+    }
+    if ($Content -notmatch '(?ms)finally\s*\{.*?\$process\.Dispose\(\).*?\}') {
+        throw 'Validation process is not disposed from a finally path.'
+    }
+}
+
 function Write-JsonDocument {
     param([string]$Path, [object]$Document)
     [IO.File]::WriteAllText($Path, ($Document | ConvertTo-Json -Depth 12))
+}
+
+function Write-ImmutableReceiptTestDocument {
+    param([string]$Path, [string]$SourceCommit, [string]$ArtifactSetSha256,
+        [string]$ExecutableSha256, [string]$RunNonce =
+        '11111111-1111-4111-8111-111111111111')
+    $directory = Split-Path -Parent ([IO.Path]::GetFullPath($Path))
+    $rawLeaf = [IO.Path]::GetFileNameWithoutExtension($Path) + '.raw.log'
+    $rawPath = Join-Path $directory $rawLeaf
+    [IO.File]::WriteAllText($rawPath, 'unregistered executable receipt test log')
+    Write-JsonDocument $Path ([ordered]@{
+        schemaVersion = 1
+        evidenceKind = 'stage5-executable-originated-receipt'
+        status = 'passed'
+        role = 'validation-plan'
+        producer = 'installed-runtime-validation-plan-v2'
+        producerVersion = '2'
+        runNonce = $RunNonce
+        sourceCommit = $SourceCommit
+        title = 'ZeroHour'
+        architecture = 'x64'
+        artifactSetSha256 = $ArtifactSetSha256
+        executableSha256 = $ExecutableSha256
+        recordedUtc = '2026-09-01T00:00:00Z'
+        rawLogs = @([ordered]@{
+            name = 'stdout'; path = $rawLeaf; sha256 = Get-Sha256 $rawPath
+        })
+        details = [ordered]@{
+            gateName = 'deterministic-runtime'; validationSet = 'All'; entryCount = 1
+        }
+    })
+}
+
+function Update-LockstepFixtureFnv {
+    param([Numerics.BigInteger]$Hash, [UInt64]$Value, [int]$Bytes,
+        [Numerics.BigInteger]$Prime, [Numerics.BigInteger]$Mask)
+    $updated = $Hash
+    for ($byteIndex = 0; $byteIndex -lt $Bytes; ++$byteIndex) {
+        $updated = (($updated -bxor
+            ([Numerics.BigInteger]($Value -band 255))) * $Prime) -band $Mask
+        $Value = $Value -shr 8
+    }
+    return $updated
+}
+
+function Get-LockstepFixtureCommandDigest {
+    param([Collections.IDictionary]$Pairs)
+    Add-Type -AssemblyName System.Numerics
+    [Numerics.BigInteger]$hash = [Numerics.BigInteger]::Parse('14695981039346656037')
+    [Numerics.BigInteger]$prime = [Numerics.BigInteger]::Parse('1099511628211')
+    [Numerics.BigInteger]$mask = [Numerics.BigInteger]::Parse('18446744073709551615')
+    for ($slot = 0; $slot -lt 8; ++$slot) {
+        $hash = Update-LockstepFixtureFnv $hash ([UInt64]$slot) 4 $prime $mask
+        foreach ($field in @('command_count', 'first_command_frame',
+            'last_command_frame')) {
+            [UInt64]$value = [UInt64]::Parse([string]$Pairs["peer_${slot}_${field}"])
+            $hash = Update-LockstepFixtureFnv $hash $value 4 $prime $mask
+        }
+        [UInt64]$lastId = [UInt64]::Parse([string]$Pairs["peer_${slot}_last_command_id"])
+        $hash = Update-LockstepFixtureFnv $hash $lastId 2 $prime $mask
+        [UInt64]$hasLast = if ($Pairs["peer_${slot}_has_last_command_id"] -ceq '1') { 1 } else { 0 }
+        $hash = Update-LockstepFixtureFnv $hash $hasLast 4 $prime $mask
+        foreach ($field in @('last_command_digest', 'command_digest')) {
+            [UInt64]$value = [UInt64]::Parse([string]$Pairs["peer_${slot}_${field}"])
+            $hash = Update-LockstepFixtureFnv $hash $value 8 $prime $mask
+        }
+    }
+    return $hash.ToString()
+}
+
+function Get-LockstepFixtureProjectionSha256 {
+    param([Collections.IDictionary]$Pairs)
+    $projection = [ordered]@{}
+    foreach ($key in @('mode', 'schema', 'protocol_epoch', 'peer_count', 'roster_mask',
+        'build_compatibility_crc', 'content_crc', 'map_crc', 'common_stop_frame',
+        'proven_kernel_mask', 'packet_router_slot', 'origin_mode', 'session_nonce',
+        'executable_sha256', 'source_revision', 'final_frame', 'frame_count',
+        'contributed_peer_mask', 'checkpoint_count', 'validation_authority_mask',
+        'executable_origin', 'worker_telemetry_executable_origin',
+        'transport_path_used', 'handshake_validated', 'clean_shutdown')) {
+        $projection[$key] = $Pairs[$key]
+    }
+    for ($slot = 0; $slot -lt 8; ++$slot) {
+        foreach ($suffix in @('command_count', 'first_command_frame',
+            'last_command_frame', 'last_command_id', 'has_last_command_id',
+            'last_command_digest', 'command_digest')) {
+            $projection["peer_${slot}_${suffix}"] = $Pairs["peer_${slot}_${suffix}"]
+        }
+    }
+    for ($checkpoint = 0; $checkpoint -lt 129; ++$checkpoint) {
+        foreach ($suffix in @('frame', 'crc', 'command_digest')) {
+            $projection["checkpoint_${checkpoint}_${suffix}"] =
+                $Pairs["checkpoint_${checkpoint}_${suffix}"]
+        }
+    }
+    $bytes = [Text.Encoding]::UTF8.GetBytes(($projection | ConvertTo-Json -Compress -Depth 5))
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return (($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join '').ToUpperInvariant()
+    }
+    finally { $sha.Dispose() }
+}
+
+function New-LockstepFixtureReceipt {
+    param(
+        [string]$Path,
+        [int]$LocalSlot,
+        [int]$WorkerCount,
+        [string]$RunNonce,
+        [string]$SessionNonce,
+        [string]$ExecutableSha256,
+        [string]$SourceCommit,
+        [int]$NetworkToken = 1
+    )
+    $pairs = [ordered]@{
+        producer = 'installed-lockstep-v2'
+        mode = 'installed-lockstep-v2-production'
+        schema = '2'; protocol_epoch = '2'; local_slot = [string]$LocalSlot
+        peer_count = '2'; roster_mask = '3'; build_compatibility_crc = '1'
+        content_crc = '1'; map_crc = '1'; common_stop_frame = '4096'
+        proven_kernel_mask = '63'; packet_router_slot = '0'; origin_mode = '2'
+        run_nonce = $RunNonce; session_nonce = $SessionNonce
+        executable_sha256 = $ExecutableSha256.ToUpperInvariant()
+        source_revision = $SourceCommit
+        network_session_token = [string]$NetworkToken
+        final_frame = '4096'; frame_count = '4096'; contributed_peer_mask = '3'
+        checkpoint_count = '129'; validation_authority_mask = '63'
+        executable_origin = '1'; worker_telemetry_executable_origin = '1'
+        transport_path_used = '1'; handshake_validated = '1'; clean_shutdown = '1'
+    }
+    for ($slot = 0; $slot -lt 8; ++$slot) {
+        $isRoster = $slot -lt 2
+        $pairs["peer_${slot}_command_count"] = if ($isRoster) { '1' } else { '0' }
+        $pairs["peer_${slot}_first_command_frame"] = if ($isRoster) { '8' } else { '0' }
+        $pairs["peer_${slot}_last_command_frame"] = if ($isRoster) { '4096' } else { '0' }
+        $pairs["peer_${slot}_last_command_id"] = if ($isRoster) { [string]($slot + 1) } else { '0' }
+        $pairs["peer_${slot}_has_last_command_id"] = if ($isRoster) { '1' } else { '0' }
+        $pairs["peer_${slot}_last_command_digest"] = if ($isRoster) { [string](1001 + $slot) } else { '0' }
+        $pairs["peer_${slot}_command_digest"] = if ($isRoster) { [string](2001 + $slot) } else { '0' }
+    }
+    for ($kernel = 0; $kernel -lt 6; ++$kernel) {
+        $pairs["kernel_${kernel}_physical_worker_mask"] = [string]$(if ($WorkerCount -eq 2) { 3 } else { 15 })
+        $pairs["kernel_${kernel}_physical_worker_jobs"] = '4096'
+        $pairs["kernel_${kernel}_distinct_physical_workers"] = [string]$WorkerCount
+        $pairs["kernel_${kernel}_peak_concurrent_physical_workers"] = [string]$WorkerCount
+        $pairs["kernel_${kernel}_physical_worker_mask_complete"] = '1'
+    }
+    for ($checkpoint = 0; $checkpoint -lt 129; ++$checkpoint) {
+        $frame = if ($checkpoint -eq 0) { 1 } else { $checkpoint * 32 }
+        $pairs["checkpoint_${checkpoint}_frame"] = [string]$frame
+        $pairs["checkpoint_${checkpoint}_crc"] = [string](100000 + $checkpoint)
+        $pairs["checkpoint_${checkpoint}_command_digest"] = [string](300000 + $checkpoint)
+    }
+    $digest = Get-LockstepFixtureCommandDigest $pairs
+    $pairs['checkpoint_128_command_digest'] = $digest
+    $lines = New-Object 'Collections.Generic.List[string]'
+    [void]$lines.Add('RTS_LOCKSTEP_V2_RECEIPT')
+    foreach ($key in $pairs.Keys) { [void]$lines.Add("$key=$($pairs[$key])") }
+    [void]$lines.Add('END')
+    $text = ($lines -join "`n") + "`n"
+    [IO.File]::WriteAllText($Path, $text, (New-Object Text.UTF8Encoding($false)))
+    return [pscustomobject]@{
+        path = $Path; pairs = $pairs; finalCRC = [UInt32]100128
+        projectionSha256 = Get-LockstepFixtureProjectionSha256 $pairs
+    }
+}
+
+function New-LockstepFixtureLauncherContract {
+    param(
+        [string]$Title,
+        [string]$RuntimeDirectory,
+        [string]$ExecutableSha256,
+        [string]$LauncherSha256,
+        [string]$ConfigSha256
+    )
+    $runtimeFull = [IO.Path]::GetFullPath($RuntimeDirectory)
+    $executable = if ($Title -ceq 'Generals') { 'generalsv.exe' } else { 'generalszh.exe' }
+    $executablePath = Join-Path $runtimeFull $executable
+    [ordered]@{
+        schemaVersion = 1; mode = 'headless-direct-exception'
+        configPath = Join-Path $runtimeFull 'launcher.lcf'
+        configSha256 = $ConfigSha256
+        launcherPath = Join-Path $runtimeFull 'launcher.exe'
+        launcherSha256 = $LauncherSha256
+        directory = '.'; executable = $executable
+        launcherTarget = $executablePath
+        launcherArguments = @('-simulationMode', 'parallel', '-workerPolicy', 'auto')
+        launcherWorkingDirectory = $runtimeFull
+        directExecutable = $executablePath
+        directWorkingDirectory = $runtimeFull
+        directArguments = @('-simulationMode', 'parallel', '-workerPolicy', 'auto')
+        childExitCodeObserved = $true
+    }
+}
+
+function New-LockstepFixtureTitleSessionProfile {
+    param([string]$Title, [string]$TitleRoot, [string]$RuntimeDirectory)
+    $sessionRoot = Join-Path ([IO.Path]::GetFullPath($TitleRoot)) 'TitleSession'
+    $runtimeFull = [IO.Path]::GetFullPath($RuntimeDirectory)
+    $documentsRoot = Join-Path $sessionRoot 'Documents'
+    $profileLeaf = if ($Title -ceq 'Generals') {
+        'Command and Conquer Generals Data'
+    } else { 'GGC-LockstepV2-ZeroHour' }
+    $profileRoot = Join-Path $documentsRoot $profileLeaf
+    $environmentValues = [ordered]@{
+        TEMP = Join-Path $sessionRoot 'Temp'
+        TMP = Join-Path $sessionRoot 'Tmp'
+        LOCALAPPDATA = Join-Path $sessionRoot 'LocalAppData'
+        APPDATA = Join-Path $sessionRoot 'AppData'
+        USERPROFILE = $sessionRoot; HOMEDRIVE = 'H:'
+        HOMEPATH = $sessionRoot.Substring(2)
+        RTS_STAGE5_VALIDATION_PROFILE_ROOT = $profileRoot
+        RTS_STAGE5_VALIDATION_CACHE_ROOT = Join-Path $sessionRoot 'Cache'
+        RTS_STAGE5_VALIDATION_LOG_ROOT = Join-Path $sessionRoot 'Logs'
+        RTS_STAGE5_VALIDATION_DUMP_ROOT = Join-Path $sessionRoot 'Dumps'
+        RTS_STAGE5_VALIDATION_TITLE_SESSION_ROOT = $sessionRoot
+    }
+    $registryValues = @(
+        [ordered]@{
+            subKey = 'Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders'
+            name = 'Personal'; value = $documentsRoot; purpose = 'known-folder-documents'
+        },
+        [ordered]@{
+            subKey = 'Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders'
+            name = 'Personal'; value = $documentsRoot; purpose = 'known-folder-documents'
+        }
+    )
+    if ($Title -ceq 'Generals') {
+        $registryValues += ,([ordered]@{
+            subKey = 'Software\Electronic Arts\EA Games\Generals'
+            name = 'InstallPath'; value = $runtimeFull + '\'; purpose = 'installed-runtime-binding'
+        })
+    }
+    else {
+        $registryValues += ,([ordered]@{
+            subKey = 'Software\Electronic Arts\EA Games\Command and Conquer Generals Zero Hour'
+            name = 'InstallPath'; value = $runtimeFull + '\'; purpose = 'installed-runtime-binding'
+        })
+        $registryValues += ,([ordered]@{
+            subKey = 'Software\Electronic Arts\EA Games\Command and Conquer Generals Zero Hour'
+            name = 'UserDataLeafName'; value = $profileLeaf; purpose = 'title-profile-leaf'
+        })
+    }
+    [ordered]@{
+        schemaVersion = 1; title = $Title; sessionRoot = $sessionRoot
+        runtimeDirectory = $runtimeFull; documentsRoot = $documentsRoot
+        profileLeaf = $profileLeaf; profileRoot = $profileRoot
+        peerRoot = Join-Path $sessionRoot 'Peers'
+        profileConcurrency = 'shared-title-profile-read-only'
+        environmentValues = $environmentValues
+        environmentVariableNames = @($environmentValues.Keys)
+        registryViews = @('Registry32', 'Registry64')
+        registryValues = @($registryValues)
+    }
+}
+
+function New-LockstepFixturePeerEnvironment {
+    param([Collections.IDictionary]$Profile, [int]$PeerIndex)
+    $peerRoot = Join-Path $Profile['peerRoot'] "peer-$PeerIndex"
+    $values = [ordered]@{}
+    foreach ($name in $Profile['environmentVariableNames']) {
+        $key = [string]$name
+        $base = [string]$Profile['environmentValues'][$key]
+        if ($key -ceq 'TEMP' -or $key -ceq 'TMP' -or
+            $key -ceq 'LOCALAPPDATA' -or $key -ceq 'APPDATA' -or
+            $key -ceq 'RTS_STAGE5_VALIDATION_CACHE_ROOT' -or
+            $key -ceq 'RTS_STAGE5_VALIDATION_LOG_ROOT' -or
+            $key -ceq 'RTS_STAGE5_VALIDATION_DUMP_ROOT') {
+            $values[$key] = Join-Path $peerRoot ([IO.Path]::GetFileName($base))
+        } else { $values[$key] = $base }
+    }
+    [ordered]@{
+        peer = $PeerIndex; root = $peerRoot; values = $values
+        variableNames = @($Profile['environmentVariableNames'])
+    }
+}
+
+function New-LockstepFixtureEvidence {
+    param(
+        [string]$Root,
+        [string]$SourceCommit,
+        [string]$ArtifactSetSha256,
+        [Collections.IDictionary]$ArtifactHashes
+    )
+    [IO.Directory]::CreateDirectory($Root) | Out-Null
+    $launcherContracts = [ordered]@{}
+    $sessions = @()
+    foreach ($titleIndex in 0..1) {
+        $title = if ($titleIndex -eq 0) { 'Generals' } else { 'ZeroHour' }
+        $titleRoot = Join-Path $Root $title
+        $runtimeRoot = Join-Path $Root ("{0}Runtime" -f $title)
+        [IO.Directory]::CreateDirectory($titleRoot) | Out-Null
+        [IO.Directory]::CreateDirectory($runtimeRoot) | Out-Null
+        $executableRole = if ($title -ceq 'Generals') {
+            'generals-executable'
+        } else { 'zerohour-executable' }
+        $launcherRole = if ($title -ceq 'Generals') {
+            'generals-launcher'
+        } else { 'zerohour-launcher' }
+        $configRole = if ($title -ceq 'Generals') {
+            'generals-launcher-config'
+        } else { 'zerohour-launcher-config' }
+        $contract = New-LockstepFixtureLauncherContract $title $runtimeRoot `
+            $ArtifactHashes[$executableRole] $ArtifactHashes[$launcherRole] `
+            $ArtifactHashes[$configRole]
+        $launcherContracts[$title] = $contract
+        $profile = New-LockstepFixtureTitleSessionProfile $title $titleRoot $runtimeRoot
+        $sessionNonce = if ($titleIndex -eq 0) {
+            ('A' * 31) + '1'
+        } else { ('B' * 31) + '2' }
+        $ports = @([int](42000 + ($titleIndex * 2)), [int](42001 + ($titleIndex * 2)))
+        $workerProfiles = @(
+            [ordered]@{
+                profile = 'explicit-two-workers'; requestedWorkers = '2'
+                workerPolicy = 'all'; overrideArguments = @('-workerCount', '2', '-workerPolicy', 'all')
+            },
+            [ordered]@{
+                profile = 'automatic-workers'; requestedWorkers = 'auto'
+                workerPolicy = 'auto'; overrideArguments = @('-workerPolicy', 'auto')
+            }
+        )
+        $effectiveWorkerCounts = @(2, 4)
+        $registryEquivalence = [ordered]@{
+            strategy = 'known-folder-registry-redirect'
+            views = @($profile['registryViews'])
+            values = @($profile['registryValues'])
+            profileRoot = $profile['profileRoot']
+        }
+        $peers = @()
+        $projection = $null
+        for ($peerIndex = 0; $peerIndex -lt 2; ++$peerIndex) {
+            $processId = 51000 + ($titleIndex * 10) + $peerIndex
+            $runNonce = if ($titleIndex -eq 0) {
+                if ($peerIndex -eq 0) { '1' * 32 } else { '2' * 32 }
+            } else {
+                if ($peerIndex -eq 0) { '3' * 32 } else { '4' * 32 }
+            }
+            $receiptLeaf = "lockstep-v2-$title-peer-$peerIndex.receipt"
+            $receiptPath = Join-Path $titleRoot $receiptLeaf
+            $receipt = New-LockstepFixtureReceipt $receiptPath $peerIndex `
+                $effectiveWorkerCounts[$peerIndex] $runNonce $sessionNonce `
+                $ArtifactHashes[$executableRole] $SourceCommit `
+                (1 + ($titleIndex * 10) + $peerIndex)
+            if ($null -eq $projection) { $projection = $receipt.projectionSha256 }
+            elseif ($projection -cne $receipt.projectionSha256) {
+                throw "Fixture receipt projection unexpectedly differed for $title peer $peerIndex."
+            }
+            $stdoutPath = Join-Path $titleRoot "peer-$peerIndex.stdout.log"
+            $stderrPath = Join-Path $titleRoot "peer-$peerIndex.stderr.log"
+            $stdoutActive = "LOCKSTEP_V2_VALIDATION_ACTIVE peer=$peerIndex frame_limit=4096"
+            $stdoutPass = "LOCKSTEP_V2_VALIDATION_PASS peer=$peerIndex pid=$processId frame=4096 crc=00018720"
+            [IO.File]::WriteAllText($stdoutPath, "$stdoutActive`n$stdoutPass`n",
+                (New-Object Text.UTF8Encoding($false)))
+            [IO.File]::WriteAllText($stderrPath, "lockstep-v2 peer $peerIndex clean exit`n",
+                (New-Object Text.UTF8Encoding($false)))
+            $override = $workerProfiles[$peerIndex]
+            $arguments = @($contract['launcherArguments'] + $override['overrideArguments'] + @(
+                '-installedLockstepV2Validation',
+                "peer=$peerIndex;peers=2;ports=$($ports -join ',');run=$runNonce;session=$sessionNonce;exe=$($ArtifactHashes[$executableRole].ToUpperInvariant());source=$SourceCommit;map=Stage5Validation.map;map_crc=1;seed=23063;dir=$titleRoot;receipt=$receiptLeaf;mode=trusted-router;router=0"))
+            $commandLine = '"{0}" {1}' -f $contract['directExecutable'], ($arguments -join ' ')
+            $telemetryMask = if ($effectiveWorkerCounts[$peerIndex] -eq 2) { 3 } else { 15 }
+            $telemetry = [ordered]@{
+                requestedWorkers = $override['requestedWorkers']
+                workerPolicy = $override['workerPolicy']
+                effectiveWorkers = $effectiveWorkerCounts[$peerIndex]
+                distinctPhysicalWorkers = @($effectiveWorkerCounts[$peerIndex]) * 6
+                physicalWorkerMasks = @($telemetryMask) * 6
+                executableOrigin = $true
+            }
+            $peer = [ordered]@{
+                schemaVersion = 2; producer = 'installed-lockstep-v2'
+                validationMode = 'installed-lockstep-v2-production'; title = $title
+                processId = $processId; peer = $peerIndex; peerCount = 2
+                port = $ports[$peerIndex]; runNonce = $runNonce; sessionNonce = $sessionNonce
+                executableSha256 = $ArtifactHashes[$executableRole].ToUpperInvariant()
+                sourceCommit = $SourceCommit; launcherEquivalence = $contract
+                launcherPath = $contract['launcherPath']; launcherSha256 = $contract['launcherSha256']
+                launcherConfigPath = $contract['configPath']; launcherConfigSha256 = $contract['configSha256']
+                directExecutionOptIn = $true; workingDirectory = $contract['directWorkingDirectory']
+                commandLine = $commandLine; arguments = $arguments
+                launcherDefaultArguments = @($contract['launcherArguments'])
+                directArguments = $arguments; workerOverride = $override
+                stdoutProof = [ordered]@{
+                    executableOrigin = $true; peer = $peerIndex; pid = $processId
+                    frameLimit = 4096; activeMarker = $stdoutActive
+                    passMarker = $stdoutPass; finalCrc = '00018720'
+                }
+                receiptWorkerTelemetry = $telemetry
+                requestedWorkers = $override['requestedWorkers']; workerPolicy = $override['workerPolicy']
+                effectiveWorkers = $effectiveWorkerCounts[$peerIndex]
+                titleSessionProfile = $profile; registryEquivalence = $registryEquivalence
+                environmentEquivalence = New-LockstepFixturePeerEnvironment $profile $peerIndex
+                receiptPath = $receiptLeaf; receiptSha256 = Get-Sha256 $receiptPath
+                stdoutSha256 = Get-Sha256 $stdoutPath; stderrSha256 = Get-Sha256 $stderrPath
+                exitCode = 0; finalFrame = 4096; finalCRC = 100128
+                comparableProjectionSha256 = $projection
+                lockstepV2Receipt = $true; v1ReceiptAccepted = $false
+            }
+            $rawPath = Join-Path $titleRoot "peer-$peerIndex.raw.json"
+            Write-JsonDocument $rawPath $peer
+            $peers += ,$peer
+        }
+        $session = [ordered]@{
+            title = $title; peerCount = 2; ports = $ports; sessionNonce = $sessionNonce
+            launcherEquivalence = $contract; titleSessionProfile = $profile
+            registryEquivalence = $registryEquivalence; workerProfiles = $workerProfiles
+            effectiveWorkerCounts = $effectiveWorkerCounts; mixedWorkerProof = $true
+            comparableProjectionSha256 = $projection; peers = $peers
+            profileReadOnlyVerified = $true; profileFilesAfterRun = @()
+        }
+        $sessions += ,$session
+    }
+    $document = [ordered]@{
+        schemaVersion = 2; evidenceKind = 'lockstep-v2-multiplayer'; status = 'passed'
+        producer = 'installed-lockstep-v2'; validationMode = 'installed-lockstep-v2-production'
+        architecture = 'x64'; sourceCommit = $SourceCommit
+        artifactSetSha256 = $ArtifactSetSha256; recordedUtc = '2026-09-01T00:00:00Z'
+        allowHeadlessDirectExecution = $true; launcherEquivalence = $launcherContracts
+        commonStopFrame = 4096; peerCount = 2; mapName = 'Stage5Validation.map'
+        mapCrc = 1; seed = 23063; v1Accepted = $false
+        profileStrategy = 'known-folder-registry-redirect'
+        registryViews = @('Registry32', 'Registry64')
+        environmentVariables = @('TEMP', 'TMP', 'LOCALAPPDATA', 'APPDATA', 'USERPROFILE',
+            'HOMEDRIVE', 'HOMEPATH', 'RTS_STAGE5_VALIDATION_PROFILE_ROOT',
+            'RTS_STAGE5_VALIDATION_CACHE_ROOT', 'RTS_STAGE5_VALIDATION_LOG_ROOT',
+            'RTS_STAGE5_VALIDATION_DUMP_ROOT')
+        profileConcurrency = 'shared-title-profile-read-only'; sessions = $sessions
+    }
+    $evidencePath = Join-Path $Root 'LockstepV2LoopbackEvidence.json'
+    Write-JsonDocument $evidencePath $document
+    return [pscustomobject]@{ path = $evidencePath; document = $document }
+}
+
+function Copy-LockstepFixtureCase {
+    param([string]$SourceRoot, [string]$CaseRoot)
+    Copy-Item -LiteralPath $SourceRoot -Destination $CaseRoot -Recurse -Force
+    $sourceFull = [IO.Path]::GetFullPath($SourceRoot)
+    $caseFull = [IO.Path]::GetFullPath($CaseRoot)
+    $sourceJson = $sourceFull.Replace('\', '\\')
+    $caseJson = $caseFull.Replace('\', '\\')
+    $sourceHomePathJson = $sourceFull.Substring(2).Replace('\', '\\')
+    $caseHomePathJson = $caseFull.Substring(2).Replace('\', '\\')
+    foreach ($jsonPath in Get-ChildItem -LiteralPath $caseFull -Filter '*.json' -File -Recurse) {
+        $json = [IO.File]::ReadAllText($jsonPath.FullName)
+        if ($json.IndexOf($sourceJson) -ge 0 -or
+            $json.IndexOf($sourceHomePathJson) -ge 0) {
+            [IO.File]::WriteAllText($jsonPath.FullName,
+                $json.Replace($sourceJson, $caseJson).Replace(
+                    $sourceHomePathJson, $caseHomePathJson),
+                (New-Object Text.UTF8Encoding($false)))
+        }
+    }
+    return [IO.Path]::GetFullPath((Join-Path $CaseRoot 'LockstepV2LoopbackEvidence.json'))
+}
+
+function Read-LockstepFixtureCaseDocument {
+    param([string]$EvidencePath)
+    return Get-Content -LiteralPath $EvidencePath -Raw | ConvertFrom-Json
+}
+
+function Write-LockstepFixturePeerMutation {
+    param(
+        [string]$EvidencePath,
+        [object]$Document,
+        [int]$SessionIndex,
+        [int]$PeerIndex,
+        [object]$Raw
+    )
+    $title = if ($SessionIndex -eq 0) { 'Generals' } else { 'ZeroHour' }
+    $rawPath = Join-Path (Split-Path -Parent $EvidencePath) "$title/peer-$PeerIndex.raw.json"
+    Write-JsonDocument $rawPath $Raw
+    Write-JsonDocument $EvidencePath $Document
+}
+
+function Set-LockstepFixtureReceiptCheckpointCrc {
+    param([string]$ReceiptPath, [string]$Replacement)
+    $text = [IO.File]::ReadAllText($ReceiptPath)
+    $text = $text.Replace('checkpoint_0_crc=100000', "checkpoint_0_crc=$Replacement")
+    [IO.File]::WriteAllText($ReceiptPath, $text, (New-Object Text.UTF8Encoding($false)))
+    $pairs = [ordered]@{}
+    foreach ($line in ($text -split "`n")) {
+        $trimmed = $line.TrimEnd("`r")
+        if ($trimmed -eq 'RTS_LOCKSTEP_V2_RECEIPT' -or $trimmed -eq 'END' -or
+            [string]::IsNullOrEmpty($trimmed)) { continue }
+        $equals = $trimmed.IndexOf('=')
+        $pairs[$trimmed.Substring(0, $equals)] = $trimmed.Substring($equals + 1)
+    }
+    return Get-LockstepFixtureProjectionSha256 $pairs
 }
 
 function Write-Net3LoopbackTestManifest {
     param([string]$Path, [string]$SourceCommit, [string]$ArtifactSetSha256,
         [string]$GeneralsExecutableSha256, [string]$ZeroHourExecutableSha256)
     $topologies = @(
-        [pscustomobject]@{ id = 'two-peer-1-v-16'; workers = @('1', '16') },
-        [pscustomobject]@{ id = 'two-peer-2-v-auto'; workers = @('2', 'auto') },
-        [pscustomobject]@{ id = 'two-peer-4-v-8'; workers = @('4', '8') },
-        [pscustomobject]@{ id = 'four-peer-mixed-workers'; workers = @('1', '2', '8', 'auto') }
+        [pscustomobject]@{ id = 'two-peer-1-v-16'; caseIndex = 0; workers = @('1', '16') },
+        [pscustomobject]@{ id = 'two-peer-2-v-auto'; caseIndex = 1; workers = @('2', 'auto') },
+        [pscustomobject]@{ id = 'two-peer-4-v-8'; caseIndex = 2; workers = @('4', '8') },
+        [pscustomobject]@{ id = 'four-peer-mixed-workers'; caseIndex = 3; workers = @('1', '2', '8', 'auto') }
     )
     $kernelNames = @('physics', 'status', 'collision', 'ai-planning', 'spatial', 'path')
     $kernelBits = @(1, 2, 4, 8, 16, 32)
@@ -59,6 +624,14 @@ function Write-Net3LoopbackTestManifest {
         Generals = $GeneralsExecutableSha256
         ZeroHour = $ZeroHourExecutableSha256
     }
+    $buildCrcs = @{ Generals = [UInt32]287454020; ZeroHour = [UInt32]1432778632 }
+    $contentCrcs = @{ Generals = [UInt32]2864434397; ZeroHour = [UInt32]2578103244 }
+    $receiptRoot = Split-Path -Parent ([IO.Path]::GetFullPath($Path))
+    $rawRoot = Join-Path $receiptRoot 'Net3Raw'
+    if (-not (Test-Path -LiteralPath $rawRoot -PathType Container)) {
+        New-Item -ItemType Directory -Path $rawRoot | Out-Null
+    }
+    $processOrdinal = 1000
     $matches = @()
     foreach ($title in @('Generals', 'ZeroHour')) {
         foreach ($topology in $topologies) {
@@ -77,11 +650,51 @@ function Write-Net3LoopbackTestManifest {
                             submitted = $physical
                             completed = $physical
                             physicalWorkerJobs = $physical
+                            ownerHelpedJobs = 0
+                            physicalWorkerMask = $(if ($effective -eq 1) { 0 } else { 3 })
                             distinctPhysicalWorkers = $(if ($effective -eq 1) { 0 } else { 2 })
+							physicalWorkerMaskComplete = $true
+                            peakConcurrentPhysicalWorkers = $(if ($effective -eq 1) { 0 } else { 2 })
                         }
                     }
+                    $rawLeaf = "net3-$title-$($topology.id)-$seed-peer-$peerIndex.log"
+                    $rawRelative = Join-Path 'Net3Raw' $rawLeaf
+                    $rawPath = Join-Path $receiptRoot $rawRelative
+                    $rawRecord = [ordered]@{
+                        schemaVersion = 1
+                        producer = 'installed-runtime-net3-peer-v1'
+                        validationMode = 'scoped-net3-loopback-release-proof'
+                        kernelFixture = 'actual-stage5-kernels-v1'
+                        processId = $processOrdinal
+                        title = $title
+                        caseIndex = $topology.caseIndex
+                        seed = $seed
+                        ordinal = $peerIndex
+                        peerCount = $topology.workers.Count
+                        sourceCommit = $SourceCommit
+                        executableSha256 = $executableHashes[$title]
+                        artifactSetSha256 = $ArtifactSetSha256
+                        buildCompatibilityCrc = $buildCrcs[$title]
+                        contentCrc = $contentCrcs[$title]
+                        requestedWorkers = $requested
+                        effectiveWorkers = $effective
+                        networkHelloReady = $true
+                        rosterExact = $true
+                        rosterSha256 = $rosterHash
+                        policyMask = 63
+                        finalFrame = 42000
+                        finalCRC = 'A1B2C3D4'
+                        cleanShutdown = $true
+                        kernels = $kernels
+                    }
+                    Write-JsonDocument $rawPath $rawRecord
                     $peers += [ordered]@{
                         ordinal = $peerIndex
+                        processId = $processOrdinal
+                        observedExecutableSha256 = $executableHashes[$title]
+                        observedArtifactSetSha256 = $ArtifactSetSha256
+                        rawOutputPath = $rawRelative
+                        rawOutputSha256 = Get-Sha256 $rawPath
                         requestedWorkers = $requested
                         effectiveWorkers = $effective
                         networkHelloReady = $true
@@ -94,6 +707,7 @@ function Write-Net3LoopbackTestManifest {
                         cleanShutdown = $true
                         kernels = $kernels
                     }
+                    ++$processOrdinal
                 }
                 $matches += [ordered]@{
                     recordId = "$title/$($topology.id)/$seed"
@@ -116,9 +730,24 @@ function Write-Net3LoopbackTestManifest {
         schemaVersion = 1
         evidenceKind = 'installed-net3-loopback'
         status = 'passed'
+        producer = 'installed-runtime-runner-v1'
+        validationMode = 'scoped-net3-loopback-release-proof'
+        installedRuntime = $true
+        independentProcessHashing = $true
         sourceCommit = $SourceCommit
         artifactSetSha256 = $ArtifactSetSha256
         supportedKernelMask = 63
+        policySchema = 1
+        engineEpoch = 1
+        determinismEpoch = 1
+        buildCompatibilityCrc = [ordered]@{
+            Generals = $buildCrcs.Generals
+            ZeroHour = $buildCrcs.ZeroHour
+        }
+        contentCrc = [ordered]@{
+            Generals = $contentCrcs.Generals
+            ZeroHour = $contentCrcs.ZeroHour
+        }
         executables = [ordered]@{
             Generals = $GeneralsExecutableSha256
             ZeroHour = $ZeroHourExecutableSha256
@@ -130,20 +759,108 @@ function Write-Net3LoopbackTestManifest {
 
 function Write-PerformanceScalingTestManifest {
     param([string]$Path, [string]$SourceCommit, [string]$ArtifactSetSha256,
-        [string]$ExecutableSha256, [string]$Stage3BaselineSha256)
+        [string]$ExecutableSha256, [string]$Stage3BaselineSha256,
+        [ValidateSet('Generals', 'ZeroHour')][string]$Title = 'ZeroHour')
+    $directory = Split-Path -Parent ([IO.Path]::GetFullPath($Path))
+    $stem = [IO.Path]::GetFileNameWithoutExtension($Path)
+    $rawLeaf = "$stem.raw-samples.json"
+    $topologyLeaf = "$stem.topology-receipt.json"
+    $rawPath = Join-Path $directory $rawLeaf
+    $topologyPath = Join-Path $directory $topologyLeaf
+    $executable = if ($Title -ceq 'Generals') { 'generalsv.exe' } else { 'generalszh.exe' }
+    $logicalProcessors = @()
+    foreach ($logicalIndex in 0..31) {
+        $logicalProcessors += [ordered]@{
+            logicalProcessorIndex = $logicalIndex
+            physicalCoreIndex = [int][Math]::Floor($logicalIndex / 2)
+        }
+    }
+    $topologyLanes = @(
+        [ordered]@{ name = 'forced-one'; requestedWorkers = 1
+            selectedLogicalProcessorIndices = @(0) },
+        [ordered]@{ name = 'physical-8'; requestedWorkers = 8
+            selectedLogicalProcessorIndices = @(0, 2, 4, 6, 8, 10, 12, 14) },
+        [ordered]@{ name = 'physical-16'; requestedWorkers = 16
+            selectedLogicalProcessorIndices = @(0, 2, 4, 6, 8, 10, 12, 14,
+                16, 18, 20, 22, 24, 26, 28, 30) }
+    )
+    $stage3ExecutableSha256 = 'C' * 64
+    $getRunCommand = {
+        param([string]$Fixture, [string]$Lane, [string]$ExecutableHash)
+        $workerCount = switch ($Lane) {
+            'stage3-forced-one' { 1 }
+            'forced-one' { 1 }
+            'physical-8' { 8 }
+            'physical-16' { 16 }
+        }
+        "$executable -headless -noFPSLimit -pipelineMode serial -simulationMode parallel -workerPolicy auto -validationExecutableSha256 $ExecutableHash -workerCount $workerCount -replay Stage5Scaling\$Fixture.rep"
+    }
+    Write-JsonDocument $topologyPath ([ordered]@{
+        schemaVersion = 1; producer = 'installed-runtime-scaling-runner-v1'
+        source = 'GetSystemCpuSetInformation'; sourceCommit = $SourceCommit
+        executableSha256 = $ExecutableSha256; processId = 10005
+        commandLine = & $getRunCommand 'one-thousand-units' 'forced-one' $ExecutableSha256
+        logicalProcessors = $logicalProcessors; selectedLanes = $topologyLanes
+    })
+
+    $fixtureNames = @('one-thousand-units', 'four-thousand-units',
+        'eight-thousand-units', 'dense-eight-player')
+    $unitCounts = @(1000, 4000, 8000, 12000)
+    $laneNames = @('stage3-forced-one', 'forced-one', 'physical-8', 'physical-16')
+    $laneSamples = @{
+        'stage3-forced-one' = @(990.0, 995.0, 1000.0, 1005.0, 1010.0)
+        'forced-one' = @(1010.0, 1015.0, 1020.0, 1025.0, 1030.0)
+        'physical-8' = @(490.0, 495.0, 500.0, 505.0, 510.0)
+        'physical-16' = @(440.0, 445.0, 450.0, 455.0, 460.0)
+    }
+    $fixtureSamples = @()
+    $runReceipts = @{}
+    $processId = 10000
+    for ($fixtureIndex = 0; $fixtureIndex -lt 4; ++$fixtureIndex) {
+        foreach ($lane in $laneNames) {
+            for ($repeat = 0; $repeat -lt 5; ++$repeat) {
+                $sampleExecutable = if ($lane -ceq 'stage3-forced-one') {
+                    $stage3ExecutableSha256
+                } else { $ExecutableSha256 }
+                $commandLine = & $getRunCommand $fixtureNames[$fixtureIndex] `
+                    $lane $sampleExecutable
+                $fixtureSamples += [ordered]@{
+                    fixture = $fixtureNames[$fixtureIndex]; playerCount = 8
+                    peakUnitCount = $unitCounts[$fixtureIndex]; lane = $lane
+                    repeat = $repeat; processId = $processId
+                    executableSha256 = $sampleExecutable; commandLine = $commandLine
+                    elapsedMilliseconds = $laneSamples[$lane][$repeat]
+                }
+                $runReceipts["$($fixtureNames[$fixtureIndex])|$lane|$repeat"] =
+                    [pscustomobject]@{ processId = $processId; commandLine = $commandLine }
+                ++$processId
+            }
+        }
+    }
     $phaseNames = @('owner-intake', 'world-queries', 'pathfinding', 'object-computation',
         'spatial-work', 'deterministic-commit', 'verification-publication')
     $phaseElapsed = @(10.0, 20.0, 20.0, 20.0, 15.0, 10.0, 5.0)
     $phaseSerial = @(8.0, 2.0, 2.0, 2.0, 1.0, 5.0, 2.0)
     $phases = @()
+    $phaseSamples = @()
     for ($index = 0; $index -lt $phaseNames.Count; ++$index) {
         $phases += [ordered]@{
             name = $phaseNames[$index]
             elapsedMilliseconds = $phaseElapsed[$index]
             serialMilliseconds = $phaseSerial[$index]
         }
+        for ($repeat = 0; $repeat -lt 5; ++$repeat) {
+            $receipt = $runReceipts["dense-eight-player|forced-one|$repeat"]
+            $phaseSamples += [ordered]@{
+                phase = $phaseNames[$index]; repeat = $repeat
+                processId = $receipt.processId; commandLine = $receipt.commandLine
+                elapsedMilliseconds = $phaseElapsed[$index]
+                serialMilliseconds = $phaseSerial[$index]
+            }
+        }
     }
     $kernels = @()
+    $kernelSamples = @()
     foreach ($name in @('physics', 'status', 'collision', 'ai-planning', 'spatial', 'path')) {
         $kernels += [ordered]@{
             name = $name; admittedSlices = 32
@@ -152,11 +869,18 @@ function Write-PerformanceScalingTestManifest {
             totalParallelMilliseconds = 6.0
             exactSerialOperationMilliseconds = 12.0; netSpeedup = 2.0
         }
+        for ($repeat = 0; $repeat -lt 5; ++$repeat) {
+            $receipt = $runReceipts["dense-eight-player|physical-8|$repeat"]
+            $kernelSamples += [ordered]@{
+                kernel = $name; repeat = $repeat; processId = $receipt.processId
+                commandLine = $receipt.commandLine; admittedSlices = 32
+                captureMilliseconds = 1.0; scheduleMilliseconds = 1.0
+                waitMilliseconds = 2.0; validateMilliseconds = 1.0
+                commitMilliseconds = 1.0; exactSerialOperationMilliseconds = 12.0
+            }
+        }
     }
     $fixtures = @()
-    $fixtureNames = @('one-thousand-units', 'four-thousand-units',
-        'eight-thousand-units', 'dense-eight-player')
-    $unitCounts = @(1000, 4000, 8000, 12000)
     foreach ($index in 0..3) {
         $fixtures += [ordered]@{
             name = $fixtureNames[$index]; playerCount = 8; peakUnitCount = $unitCounts[$index]
@@ -166,14 +890,27 @@ function Write-PerformanceScalingTestManifest {
             eightPhysicalCoreSpeedup = 2.04; eightToSixteenSpeedup = 1.1111111111
         }
     }
+    Write-JsonDocument $rawPath ([ordered]@{
+        schemaVersion = 1; evidenceKind = 'stage5-performance-scaling-raw-samples'
+        producer = 'installed-runtime-scaling-runner-v1'; sourceCommit = $SourceCommit
+        artifactSetSha256 = $ArtifactSetSha256; title = $Title
+        executableSha256 = $ExecutableSha256; stage3SourceCommit = ('b' * 40)
+        stage3ExecutableSha256 = $stage3ExecutableSha256
+        stage3BaselineSha256 = $Stage3BaselineSha256
+        measurementMode = 'headless-throughput'; installedRuntime = $true
+        topologyReceipt = [ordered]@{ path = $topologyLeaf; sha256 = Get-Sha256 $topologyPath }
+        fixtureSamples = $fixtureSamples; phaseSamples = $phaseSamples
+        kernelSamples = $kernelSamples
+    })
     Write-JsonDocument $Path ([ordered]@{
         schemaVersion = 1; evidenceKind = 'stage5-performance-scaling'; status = 'passed'
         sourceCommit = $SourceCommit; artifactSetSha256 = $ArtifactSetSha256
-        title = 'ZeroHour'; executableSha256 = $ExecutableSha256
+        title = $Title; executableSha256 = $ExecutableSha256
         stage3BaselineSha256 = $Stage3BaselineSha256
         measurementMode = 'headless-throughput'; installedRuntime = $true
+        rawSampleManifest = [ordered]@{ path = $rawLeaf; sha256 = Get-Sha256 $rawPath }
         topology = [ordered]@{
-            source = 'GetSystemCpuSetInformation'; topologySha256 = ('E' * 64)
+            source = 'GetSystemCpuSetInformation'; topologySha256 = Get-Sha256 $topologyPath
             physicalCoreCount = 16; logicalProcessorCount = 32
         }
         selectedLanes = @(
@@ -276,10 +1013,16 @@ function New-AiCompletionOutput {
         [int]$CollisionAuthoritativeCommits = -1,
         [int]$CollisionShadowExecutions = 0, [int]$CollisionShadowMismatches = 0,
         [int]$CollisionShadowComparedCandidates = -1,
-        [int]$CollisionOwnerFallbacks = 0, [int]$CollisionUnexpectedFallbacks = 0,
+		[int]$CollisionOwnerFallbacks = 0, [int]$CollisionUnexpectedFallbacks = 0,
+		[int]$CollisionStaleRejections = 0,
         [int]$CollisionCommittedCandidates = -1, [int]$CollisionPreparedPairs = -1,
         [int]$CollisionUniqueCandidates = -1, [int]$CollisionSubmitted = -1,
         [int]$CollisionCompleted = -1, [int]$CollisionIneligibleSlices = -1,
+		[int]$CollisionPhysicalWorkerJobs = -1,
+		[int]$CollisionOwnerHelpedJobs = -1,
+		[Int64]$CollisionPhysicalWorkerMask = -1,
+		[int]$CollisionDistinctPhysicalWorkers = -1,
+		[int]$CollisionPhysicalWorkerMaskComplete = 1,
 		[int]$PathWorkerExecuted = -1,
 		[int]$PathAuthoritativeCommits = -1, [int]$PathOwnerHelped = 0,
 		[int]$PathAuthoritativeMultiWorkerCommits = -1,
@@ -287,14 +1030,50 @@ function New-AiCompletionOutput {
 		[int]$PathStaleAcceptance = 0, [int]$PathMalformedAcceptance = 0,
 		[int]$PathShadowOnly = 0, [int]$PathTimeouts = 0, [int]$PathLateDrains = 0,
 		[int]$PathValidationFailures = 0, [int]$PathPeakWorkers = -1,
+		[int]$OrdinaryPathEligible = -1,
+		[int]$OrdinaryPathSubmittedRequests = -1,
+		[int]$OrdinaryPathSubmittedRanges = -1,
+		[int]$OrdinaryPathWorkerExecutedRequests = -1,
+		[int]$OrdinaryPathWorkerExecutedRangeJobs = -1,
+		[int]$OrdinaryPathOwnerHelpedRangeJobs = 0,
+		[int]$OrdinaryPathFailedRangeJobs = 0,
+		[Int64]$OrdinaryPathPhysicalWorkerMask = -1,
+		[int]$OrdinaryPathDistinctPhysicalWorkers = -1,
+		[int]$OrdinaryPathAuthoritativeCommits = -1,
+		[int]$OrdinaryPathAuthoritativeMultiWorkerCommits = -1,
+		[int]$OrdinaryPathStaleRejections = 0,
+		[int]$OrdinaryPathValidationFailures = 0,
+		[int]$OrdinaryPathSerialFallbacks = 0,
+		[int]$OrdinaryPathShadowComparisons = -1,
+		[int]$OrdinaryPathShadowMismatches = 0,
+		[int]$OrdinaryPathTimeouts = 0, [int]$OrdinaryPathLateDrains = 0,
+		[int]$OrdinaryPathPeakWorkers = -1,
+		[int]$OrdinaryPathMaximumBatchRequests = -1,
+		[int]$OrdinaryPathMaximumRangeCount = -1,
+		[int]$OrdinaryPathMaximumGrainSize = -1,
 		[int]$PhysicsAuthoritativeBatches = -1,
 		[int]$PhysicsCommittedPrefixes = -1, [int]$PhysicsRanges = -1,
 		[int]$PhysicsSubmitted = -1, [int]$PhysicsCompleted = -1,
+		[int]$PhysicsPhysicalWorkerJobs = -1, [int]$PhysicsOwnerHelpedJobs = -1,
+		[Int64]$PhysicsPhysicalWorkerMask = -1,
+		[int]$PhysicsDistinctPhysicalWorkers = -1,
+		[int]$PhysicsPhysicalWorkerMaskComplete = 1,
+		[int]$PhysicsPeakConcurrentPhysicalWorkers = -1,
 		[int]$PhysicsShadowExecutions = 0, [int]$PhysicsShadowMismatches = 0,
 		[int]$PhysicsShadowPrefixes = -1, [int]$PhysicsShadowRanges = -1,
 		[int]$PhysicsShadowSubmitted = -1, [int]$PhysicsShadowCompleted = -1,
 		[int]$PhysicsOwnerFallbacks = 0, [int]$PhysicsUnexpectedFallbacks = 0,
 		[int]$PhysicsStaleRejections = 0, [int]$PhysicsCircuitBreakerTrips = 0,
+		[int]$StatusAuthoritativeBatches = -1, [int]$StatusCommittedCommands = -1,
+		[int]$StatusSubmitted = -1, [int]$StatusCompleted = -1,
+		[int]$StatusPhysicalWorkerJobs = -1, [int]$StatusOwnerHelpedJobs = -1,
+		[Int64]$StatusPhysicalWorkerMask = -1,
+		[int]$StatusDistinctPhysicalWorkers = -1,
+		[int]$StatusPhysicalWorkerMaskComplete = 1,
+		[int]$StatusPeakConcurrentPhysicalWorkers = -1,
+		[int]$StatusShadowExecutions = -1, [int]$StatusShadowCommands = -1,
+		[int]$StatusShadowMismatches = 0, [int]$StatusOwnerFallbacks = 0,
+		[int]$StatusStaleRejections = 0,
 		[int]$SpatialCapturedArenas = -1, [int]$SpatialCaptureFailures = 0,
 		[int]$SpatialSuccessfulCollections = -1,
 		[int]$SpatialSuccessfulCollectionQueries = -1,
@@ -347,6 +1126,25 @@ function New-AiCompletionOutput {
     if ($CollisionUniqueCandidates -lt 0) { $CollisionUniqueCandidates = if ($collisionPreparedEligible) { 12 } else { 0 } }
     if ($CollisionSubmitted -lt 0) { $CollisionSubmitted = if ($collisionPreparedEligible) { 4 } else { 0 } }
     if ($CollisionCompleted -lt 0) { $CollisionCompleted = $CollisionSubmitted }
+	if ($CollisionPhysicalWorkerJobs -lt 0) {
+		$CollisionPhysicalWorkerJobs = if ($EffectiveWorkers -gt 1) {
+			$CollisionCompleted
+		} else { 0 }
+	}
+	if ($CollisionOwnerHelpedJobs -lt 0) {
+		$CollisionOwnerHelpedJobs = $CollisionCompleted -
+			$CollisionPhysicalWorkerJobs
+	}
+	if ($CollisionDistinctPhysicalWorkers -lt 0) {
+		$CollisionDistinctPhysicalWorkers = if ($CollisionPhysicalWorkerJobs -gt 0) {
+			[Math]::Min(2, $EffectiveWorkers)
+		} else { 0 }
+	}
+	if ($CollisionPhysicalWorkerMask -lt 0) {
+		$CollisionPhysicalWorkerMask = if ($CollisionDistinctPhysicalWorkers -gt 0) {
+			[Int64](([UInt64]1 -shl $CollisionDistinctPhysicalWorkers) - 1)
+		} else { 0 }
+	}
     if ($CollisionIneligibleSlices -lt 0) { $CollisionIneligibleSlices = if ($Mode -ceq 'serial') { 0 } else { 2 } }
     if ($CollisionShadowComparedCandidates -lt 0) {
         $CollisionShadowComparedCandidates = if ($CollisionShadowExecutions -gt 0) { 6 } else { 0 }
@@ -370,12 +1168,118 @@ function New-AiCompletionOutput {
 	}
 	$pathCallbackMin = if ($pathEligible -gt 0) { 2 } else { 0 }
 	$pathCallbackMax = if ($pathEligible -gt 0) { 18 } else { 0 }
+	$ordinaryParallelEligible = $Mode -ceq 'parallel' -and
+		$RequestedWorkers -cne '1' -and $EffectiveWorkers -gt 1
+	$ordinaryShadowEligible = $Mode -ceq 'shadow' -and
+		$RequestedWorkers -cne '1' -and $EffectiveWorkers -gt 0
+	$ordinaryBatchEligible = $ordinaryParallelEligible -or $ordinaryShadowEligible
+	if ($OrdinaryPathEligible -lt 0) {
+		$OrdinaryPathEligible = if ($ordinaryBatchEligible) { 7 } else { 0 }
+	}
+	if ($OrdinaryPathSubmittedRequests -lt 0) {
+		$OrdinaryPathSubmittedRequests = if ($ordinaryBatchEligible) { 6 } else { 0 }
+	}
+	if ($OrdinaryPathSubmittedRanges -lt 0) {
+		$OrdinaryPathSubmittedRanges = if ($ordinaryBatchEligible) {
+			[Math]::Min(4, [Math]::Min($EffectiveWorkers,
+				$OrdinaryPathSubmittedRequests))
+		} else { 0 }
+	}
+	if ($OrdinaryPathWorkerExecutedRequests -lt 0) {
+		$OrdinaryPathWorkerExecutedRequests = $OrdinaryPathSubmittedRequests
+	}
+	if ($OrdinaryPathWorkerExecutedRangeJobs -lt 0) {
+		$OrdinaryPathWorkerExecutedRangeJobs = $OrdinaryPathSubmittedRanges -
+			$OrdinaryPathOwnerHelpedRangeJobs - $OrdinaryPathFailedRangeJobs
+	}
+	if ($OrdinaryPathDistinctPhysicalWorkers -lt 0) {
+		$OrdinaryPathDistinctPhysicalWorkers = if (
+			$OrdinaryPathWorkerExecutedRangeJobs -gt 0) {
+			[Math]::Min(2, [Math]::Min($EffectiveWorkers,
+				$OrdinaryPathWorkerExecutedRangeJobs))
+		} else { 0 }
+	}
+	if ($OrdinaryPathPhysicalWorkerMask -lt 0) {
+		$OrdinaryPathPhysicalWorkerMask = if (
+			$OrdinaryPathDistinctPhysicalWorkers -gt 0) {
+			[Int64](([UInt64]1 -shl $OrdinaryPathDistinctPhysicalWorkers) - 1)
+		} else { 0 }
+	}
+	if ($OrdinaryPathAuthoritativeCommits -lt 0) {
+		$OrdinaryPathAuthoritativeCommits = if ($ordinaryParallelEligible) { 3 } else { 0 }
+	}
+	if ($OrdinaryPathAuthoritativeMultiWorkerCommits -lt 0) {
+		$OrdinaryPathAuthoritativeMultiWorkerCommits = if (
+			$ordinaryParallelEligible -and
+			$OrdinaryPathDistinctPhysicalWorkers -gt 1) {
+			$OrdinaryPathAuthoritativeCommits
+		} else { 0 }
+	}
+	if ($OrdinaryPathShadowComparisons -lt 0) {
+		$OrdinaryPathShadowComparisons = if ($ordinaryShadowEligible) { 4 } else { 0 }
+	}
+	if ($OrdinaryPathPeakWorkers -lt 0) {
+		$OrdinaryPathPeakWorkers = $OrdinaryPathDistinctPhysicalWorkers
+	}
+	if ($OrdinaryPathMaximumBatchRequests -lt 0) {
+		$OrdinaryPathMaximumBatchRequests = $OrdinaryPathSubmittedRequests
+	}
+	if ($OrdinaryPathMaximumRangeCount -lt 0) {
+		$OrdinaryPathMaximumRangeCount = $OrdinaryPathSubmittedRanges
+	}
+	if ($OrdinaryPathMaximumGrainSize -lt 0) {
+		$OrdinaryPathMaximumGrainSize = if ($OrdinaryPathSubmittedRanges -gt 0) {
+			[int][Math]::Ceiling($OrdinaryPathSubmittedRequests /
+				[double]$OrdinaryPathSubmittedRanges)
+		} else { 0 }
+	}
 	$physicsAuthoritativeEligible = $Mode -ceq 'parallel' -and $RequestedWorkers -cne '1'
 	if ($PhysicsAuthoritativeBatches -lt 0) { $PhysicsAuthoritativeBatches = if ($physicsAuthoritativeEligible) { 3 } else { 0 } }
 	if ($PhysicsCommittedPrefixes -lt 0) { $PhysicsCommittedPrefixes = if ($physicsAuthoritativeEligible) { 96 } else { 0 } }
 	if ($PhysicsRanges -lt 0) { $PhysicsRanges = if ($physicsAuthoritativeEligible) { 4 } else { 0 } }
 	if ($PhysicsSubmitted -lt 0) { $PhysicsSubmitted = if ($physicsAuthoritativeEligible) { 4 } else { 0 } }
 	if ($PhysicsCompleted -lt 0) { $PhysicsCompleted = $PhysicsSubmitted }
+	if ($PhysicsPhysicalWorkerJobs -lt 0) {
+		$PhysicsPhysicalWorkerJobs = if ($physicsAuthoritativeEligible) { $PhysicsCompleted } else { 0 }
+	}
+	if ($PhysicsOwnerHelpedJobs -lt 0) {
+		$PhysicsOwnerHelpedJobs = $PhysicsCompleted - $PhysicsPhysicalWorkerJobs
+	}
+	if ($PhysicsDistinctPhysicalWorkers -lt 0) {
+		$PhysicsDistinctPhysicalWorkers = if ($PhysicsPhysicalWorkerJobs -gt 0) {
+			[Math]::Min(2, $EffectiveWorkers)
+		} else { 0 }
+	}
+	if ($PhysicsPhysicalWorkerMask -lt 0) {
+		$PhysicsPhysicalWorkerMask = if ($PhysicsDistinctPhysicalWorkers -gt 0) {
+			[Int64](([UInt64]1 -shl $PhysicsDistinctPhysicalWorkers) - 1)
+		} else { 0 }
+	}
+	if ($PhysicsPeakConcurrentPhysicalWorkers -lt 0) {
+		$PhysicsPeakConcurrentPhysicalWorkers = $PhysicsDistinctPhysicalWorkers
+	}
+	$statusLiveEligible = $Mode -ceq 'parallel' -and $RequestedWorkers -cne '1' -and
+		$EffectiveWorkers -gt 1
+	if ($StatusAuthoritativeBatches -lt 0) { $StatusAuthoritativeBatches = if ($statusLiveEligible) { 3 } else { 0 } }
+	if ($StatusCommittedCommands -lt 0) { $StatusCommittedCommands = if ($StatusAuthoritativeBatches -gt 0) { 96 } else { 0 } }
+	if ($StatusSubmitted -lt 0) { $StatusSubmitted = if ($statusLiveEligible) { 4 } else { 0 } }
+	if ($StatusCompleted -lt 0) { $StatusCompleted = $StatusSubmitted }
+	if ($StatusPhysicalWorkerJobs -lt 0) { $StatusPhysicalWorkerJobs = if ($statusLiveEligible) { $StatusCompleted } else { 0 } }
+	if ($StatusOwnerHelpedJobs -lt 0) { $StatusOwnerHelpedJobs = $StatusCompleted - $StatusPhysicalWorkerJobs }
+	if ($StatusDistinctPhysicalWorkers -lt 0) {
+		$StatusDistinctPhysicalWorkers = if ($StatusPhysicalWorkerJobs -gt 0) { [Math]::Min(2, $EffectiveWorkers) } else { 0 }
+	}
+	if ($StatusPhysicalWorkerMask -lt 0) {
+		$StatusPhysicalWorkerMask = if ($StatusDistinctPhysicalWorkers -gt 0) {
+			[Int64](([UInt64]1 -shl $StatusDistinctPhysicalWorkers) - 1)
+		} else { 0 }
+	}
+	if ($StatusPeakConcurrentPhysicalWorkers -lt 0) { $StatusPeakConcurrentPhysicalWorkers = $StatusDistinctPhysicalWorkers }
+	if ($StatusShadowExecutions -lt 0) {
+		$StatusShadowExecutions = if ($Mode -ceq 'shadow' -and $RequestedWorkers -cne '1') { 3 } else { 0 }
+	}
+	if ($StatusShadowCommands -lt 0) { $StatusShadowCommands = if ($StatusShadowExecutions -gt 0) { 96 } else { 0 } }
+	$statusShadowMatches = $StatusShadowExecutions - $StatusShadowMismatches
 	if ($PhysicsShadowPrefixes -lt 0) { $PhysicsShadowPrefixes = if ($PhysicsShadowExecutions -gt 0) { 96 } else { 0 } }
 	if ($PhysicsShadowRanges -lt 0) { $PhysicsShadowRanges = if ($PhysicsShadowExecutions -gt 0) { 4 } else { 0 } }
 	if ($PhysicsShadowSubmitted -lt 0) { $PhysicsShadowSubmitted = if ($PhysicsShadowExecutions -gt 0) { 4 } else { 0 } }
@@ -463,20 +1367,51 @@ function New-AiCompletionOutput {
 		" direct_shadow_only=$PathShadowOnly direct_timeouts=$PathTimeouts" +
 		" direct_late_drains=$PathLateDrains direct_peak_active_workers=$PathPeakWorkers" +
 		" direct_callback_min=$pathCallbackMin direct_callback_max=$pathCallbackMax" +
+		" ordinary_path_eligible=$OrdinaryPathEligible" +
+		" ordinary_path_submitted_requests=$OrdinaryPathSubmittedRequests" +
+		" ordinary_path_submitted_ranges=$OrdinaryPathSubmittedRanges" +
+		" ordinary_path_worker_executed_requests=$OrdinaryPathWorkerExecutedRequests" +
+		" ordinary_path_worker_executed_range_jobs=$OrdinaryPathWorkerExecutedRangeJobs" +
+		" ordinary_path_owner_helped_range_jobs=$OrdinaryPathOwnerHelpedRangeJobs" +
+		" ordinary_path_failed_range_jobs=$OrdinaryPathFailedRangeJobs" +
+		" ordinary_path_physical_worker_mask=$OrdinaryPathPhysicalWorkerMask" +
+		" ordinary_path_distinct_physical_workers=$OrdinaryPathDistinctPhysicalWorkers" +
+		" ordinary_path_authoritative_commits=$OrdinaryPathAuthoritativeCommits" +
+		" ordinary_path_authoritative_multiworker_commits=$OrdinaryPathAuthoritativeMultiWorkerCommits" +
+		" ordinary_path_stale_rejections=$OrdinaryPathStaleRejections" +
+		" ordinary_path_validation_failures=$OrdinaryPathValidationFailures" +
+		" ordinary_path_serial_fallbacks=$OrdinaryPathSerialFallbacks" +
+		" ordinary_path_shadow_comparisons=$OrdinaryPathShadowComparisons" +
+		" ordinary_path_shadow_mismatches=$OrdinaryPathShadowMismatches" +
+		" ordinary_path_timeouts=$OrdinaryPathTimeouts" +
+		" ordinary_path_late_drains=$OrdinaryPathLateDrains" +
+		" ordinary_path_peak_active_workers=$OrdinaryPathPeakWorkers" +
+		" ordinary_path_max_batch_requests=$OrdinaryPathMaximumBatchRequests" +
+		" ordinary_path_max_range_count=$OrdinaryPathMaximumRangeCount" +
+		" ordinary_path_max_grain_size=$OrdinaryPathMaximumGrainSize" +
         " collision_authoritative_commits=$CollisionAuthoritativeCommits" +
         " collision_shadow_executions=$CollisionShadowExecutions" +
         " collision_shadow_compared_candidates=$CollisionShadowComparedCandidates" +
         " collision_shadow_mismatches=$CollisionShadowMismatches" +
         " collision_owner_fallbacks=$CollisionOwnerFallbacks" +
         " collision_unexpected_fallbacks=$CollisionUnexpectedFallbacks" +
-        " collision_ineligible_slices=$CollisionIneligibleSlices collision_stale_rejections=0" +
+		" collision_ineligible_slices=$CollisionIneligibleSlices collision_stale_rejections=$CollisionStaleRejections" +
         " collision_committed_candidates=$CollisionCommittedCandidates" +
         " collision_prepared_pairs=$CollisionPreparedPairs" +
         " collision_unique_candidates=$CollisionUniqueCandidates" +
         " collision_submitted_jobs=$CollisionSubmitted collision_completed_jobs=$CollisionCompleted" +
+		" collision_physical_worker_jobs=$CollisionPhysicalWorkerJobs" +
+		" collision_owner_helped_jobs=$CollisionOwnerHelpedJobs" +
+		" collision_physical_worker_mask=$CollisionPhysicalWorkerMask" +
+		" collision_distinct_physical_workers=$CollisionDistinctPhysicalWorkers" +
+		" collision_physical_worker_mask_complete=$CollisionPhysicalWorkerMaskComplete" +
 		" physics_authoritative_batches=$PhysicsAuthoritativeBatches" +
 		" physics_committed_prefixes=$PhysicsCommittedPrefixes physics_ranges=$PhysicsRanges" +
 		" physics_submitted_jobs=$PhysicsSubmitted physics_completed_jobs=$PhysicsCompleted" +
+		" physics_physical_worker_jobs=$PhysicsPhysicalWorkerJobs physics_owner_helped_jobs=$PhysicsOwnerHelpedJobs" +
+		" physics_physical_worker_mask=$PhysicsPhysicalWorkerMask physics_distinct_physical_workers=$PhysicsDistinctPhysicalWorkers" +
+		" physics_physical_worker_mask_complete=$PhysicsPhysicalWorkerMaskComplete" +
+		" physics_peak_concurrent_physical_workers=$PhysicsPeakConcurrentPhysicalWorkers" +
 		" physics_allocated_bytes=$physicsAllocatedBytes physics_capture_ns=$physicsCaptureNanoseconds physics_prepare_ns=$physicsPrepareNanoseconds" +
 		" physics_wait_ns=$physicsWaitNanoseconds physics_commit_ns=$physicsCommitNanoseconds physics_storage_bytes=$physicsStorageBytes" +
 		" physics_storage_capacity_bytes=$physicsStorageCapacityBytes physics_storage_allocations=$physicsStorageAllocations" +
@@ -490,6 +1425,15 @@ function New-AiCompletionOutput {
 		" physics_unexpected_fallbacks=$PhysicsUnexpectedFallbacks" +
 		" physics_stale_rejections=$PhysicsStaleRejections" +
 		" physics_circuit_breaker_trips=$PhysicsCircuitBreakerTrips" +
+		" status_authoritative_batches=$StatusAuthoritativeBatches status_committed_commands=$StatusCommittedCommands" +
+		" status_submitted_jobs=$StatusSubmitted status_completed_jobs=$StatusCompleted" +
+		" status_physical_worker_jobs=$StatusPhysicalWorkerJobs status_owner_helped_jobs=$StatusOwnerHelpedJobs" +
+		" status_physical_worker_mask=$StatusPhysicalWorkerMask status_distinct_physical_workers=$StatusDistinctPhysicalWorkers" +
+		" status_physical_worker_mask_complete=$StatusPhysicalWorkerMaskComplete" +
+		" status_peak_concurrent_physical_workers=$StatusPeakConcurrentPhysicalWorkers" +
+		" status_shadow_executions=$StatusShadowExecutions status_shadow_commands=$StatusShadowCommands" +
+		" status_shadow_matches=$statusShadowMatches status_shadow_mismatches=$StatusShadowMismatches" +
+		" status_owner_fallbacks=$StatusOwnerFallbacks status_stale_rejections=$StatusStaleRejections" +
 		" spatial_captured_arenas=$SpatialCapturedArenas spatial_capture_failures=$SpatialCaptureFailures" +
 		" spatial_successful_collections=$SpatialSuccessfulCollections" +
 		" spatial_successful_collection_queries=$SpatialSuccessfulCollectionQueries" +
@@ -560,9 +1504,15 @@ function New-ReplayMetricOutput {
 		[int]$CollisionShadowExecutions = 0,
 		[int]$CollisionShadowComparedCandidates = 0,
 		[int]$CollisionOwnerFallbacks = 0,
+		[int]$CollisionStaleRejections = 0,
 		[int]$PhysicsAuthoritativeBatches = -1, [int]$PhysicsCommittedPrefixes = -1,
 		[int]$PhysicsRanges = -1, [int]$PhysicsSubmitted = -1,
 		[int]$PhysicsCompleted = -1, [int]$PhysicsShadowExecutions = 0,
+		[int]$PhysicsPhysicalWorkerJobs = -1, [int]$PhysicsOwnerHelpedJobs = -1,
+		[Int64]$PhysicsPhysicalWorkerMask = -1,
+		[int]$PhysicsDistinctPhysicalWorkers = -1,
+		[int]$PhysicsPhysicalWorkerMaskComplete = 1,
+		[int]$PhysicsPeakConcurrentPhysicalWorkers = -1,
 		[int]$PhysicsShadowPrefixes = 0, [int]$PhysicsShadowRanges = 0,
 		[int]$PhysicsShadowSubmitted = 0, [int]$PhysicsShadowCompleted = 0,
 		[int]$PhysicsShadowMismatches = 0, [int]$PhysicsUnexpectedFallbacks = 0,
@@ -571,6 +1521,18 @@ function New-ReplayMetricOutput {
 		[int]$CollisionPreparedPairs = -1, [int]$CollisionUniqueCandidates = -1,
 		[int]$CollisionSubmitted = -1, [int]$CollisionCompleted = -1,
 		[int]$CollisionIneligibleSlices = -1,
+		[int]$CollisionPhysicalWorkerJobs = -1,
+		[int]$CollisionOwnerHelpedJobs = -1,
+		[Int64]$CollisionPhysicalWorkerMask = -1,
+		[int]$CollisionDistinctPhysicalWorkers = -1,
+		[int]$CollisionPhysicalWorkerMaskComplete = 1,
+		[int]$StatusAuthoritativeBatches = -1, [int]$StatusCommittedCommands = -1,
+		[int]$StatusSubmitted = -1, [int]$StatusCompleted = -1,
+		[int]$StatusPhysicalWorkerJobs = -1, [int]$StatusOwnerHelpedJobs = -1,
+		[Int64]$StatusPhysicalWorkerMask = -1,
+		[int]$StatusDistinctPhysicalWorkers = -1,
+		[int]$StatusPhysicalWorkerMaskComplete = 1,
+		[int]$StatusPeakConcurrentPhysicalWorkers = -1,
 		[int]$SpatialCapturedArenas = -1, [int]$SpatialCaptureFailures = 0,
 		[int]$SpatialSuccessfulCollections = -1,
 		[int]$SpatialSuccessfulCollectionQueries = -1,
@@ -604,6 +1566,25 @@ function New-ReplayMetricOutput {
     if ($CollisionUniqueCandidates -lt 0) { $CollisionUniqueCandidates = if ($collisionPreparedEligible) { 12 } else { 0 } }
     if ($CollisionSubmitted -lt 0) { $CollisionSubmitted = if ($collisionPreparedEligible) { 4 } else { 0 } }
     if ($CollisionCompleted -lt 0) { $CollisionCompleted = $CollisionSubmitted }
+	if ($CollisionPhysicalWorkerJobs -lt 0) {
+		$CollisionPhysicalWorkerJobs = if ($Workers -gt 1) {
+			$CollisionCompleted
+		} else { 0 }
+	}
+	if ($CollisionOwnerHelpedJobs -lt 0) {
+		$CollisionOwnerHelpedJobs = $CollisionCompleted -
+			$CollisionPhysicalWorkerJobs
+	}
+	if ($CollisionDistinctPhysicalWorkers -lt 0) {
+		$CollisionDistinctPhysicalWorkers = if ($CollisionPhysicalWorkerJobs -gt 0) {
+			[Math]::Min(2, $Workers)
+		} else { 0 }
+	}
+	if ($CollisionPhysicalWorkerMask -lt 0) {
+		$CollisionPhysicalWorkerMask = if ($CollisionDistinctPhysicalWorkers -gt 0) {
+			[Int64](([UInt64]1 -shl $CollisionDistinctPhysicalWorkers) - 1)
+		} else { 0 }
+	}
     if ($CollisionIneligibleSlices -lt 0) { $CollisionIneligibleSlices = if ($Mode -ceq 'serial') { 0 } else { 2 } }
     $physicsAuthoritativeEligible = $Mode -ceq 'parallel' -and $Workers -gt 1
     if ($PhysicsAuthoritativeBatches -lt 0) { $PhysicsAuthoritativeBatches = if ($physicsAuthoritativeEligible) { 3 } else { 0 } }
@@ -611,6 +1592,20 @@ function New-ReplayMetricOutput {
     if ($PhysicsRanges -lt 0) { $PhysicsRanges = if ($physicsAuthoritativeEligible) { 4 } else { 0 } }
 	if ($PhysicsSubmitted -lt 0) { $PhysicsSubmitted = if ($physicsAuthoritativeEligible) { 4 } else { 0 } }
 	if ($PhysicsCompleted -lt 0) { $PhysicsCompleted = $PhysicsSubmitted }
+	if ($PhysicsPhysicalWorkerJobs -lt 0) { $PhysicsPhysicalWorkerJobs = if ($physicsAuthoritativeEligible) { $PhysicsCompleted } else { 0 } }
+	if ($PhysicsOwnerHelpedJobs -lt 0) { $PhysicsOwnerHelpedJobs = $PhysicsCompleted - $PhysicsPhysicalWorkerJobs }
+	if ($PhysicsDistinctPhysicalWorkers -lt 0) { $PhysicsDistinctPhysicalWorkers = if ($PhysicsPhysicalWorkerJobs -gt 0) { [Math]::Min(2, $Workers) } else { 0 } }
+	if ($PhysicsPhysicalWorkerMask -lt 0) { $PhysicsPhysicalWorkerMask = if ($PhysicsDistinctPhysicalWorkers -gt 0) { [Int64](([UInt64]1 -shl $PhysicsDistinctPhysicalWorkers) - 1) } else { 0 } }
+	if ($PhysicsPeakConcurrentPhysicalWorkers -lt 0) { $PhysicsPeakConcurrentPhysicalWorkers = $PhysicsDistinctPhysicalWorkers }
+	if ($StatusAuthoritativeBatches -lt 0) { $StatusAuthoritativeBatches = if ($physicsAuthoritativeEligible) { 3 } else { 0 } }
+	if ($StatusCommittedCommands -lt 0) { $StatusCommittedCommands = if ($StatusAuthoritativeBatches -gt 0) { 96 } else { 0 } }
+	if ($StatusSubmitted -lt 0) { $StatusSubmitted = if ($physicsAuthoritativeEligible) { 4 } else { 0 } }
+	if ($StatusCompleted -lt 0) { $StatusCompleted = $StatusSubmitted }
+	if ($StatusPhysicalWorkerJobs -lt 0) { $StatusPhysicalWorkerJobs = if ($physicsAuthoritativeEligible) { $StatusCompleted } else { 0 } }
+	if ($StatusOwnerHelpedJobs -lt 0) { $StatusOwnerHelpedJobs = $StatusCompleted - $StatusPhysicalWorkerJobs }
+	if ($StatusDistinctPhysicalWorkers -lt 0) { $StatusDistinctPhysicalWorkers = if ($StatusPhysicalWorkerJobs -gt 0) { [Math]::Min(2, $Workers) } else { 0 } }
+	if ($StatusPhysicalWorkerMask -lt 0) { $StatusPhysicalWorkerMask = if ($StatusDistinctPhysicalWorkers -gt 0) { [Int64](([UInt64]1 -shl $StatusDistinctPhysicalWorkers) - 1) } else { 0 } }
+	if ($StatusPeakConcurrentPhysicalWorkers -lt 0) { $StatusPeakConcurrentPhysicalWorkers = $StatusDistinctPhysicalWorkers }
 	$physicsPreparedWork = $PhysicsSubmitted -gt 0 -or $PhysicsShadowSubmitted -gt 0
 	$physicsAllocatedBytes = if ($physicsPreparedWork) { 4096 } else { 0 }
 	$physicsCaptureNanoseconds = if ($physicsPreparedWork) { 100 } else { 0 }
@@ -676,10 +1671,15 @@ function New-ReplayMetricOutput {
         ("COLLISION_CANDIDATE_MANIFEST authoritative_commits=$CollisionAuthoritativeCommits shadow_executions=$CollisionShadowExecutions " +
         "shadow_compared_candidates=$CollisionShadowComparedCandidates " +
         "shadow_mismatches=$CollisionShadowMismatches owner_fallbacks=$CollisionOwnerFallbacks " +
-        "unexpected_fallbacks=$CollisionUnexpectedFallbacks ineligible_slices=$CollisionIneligibleSlices stale_rejections=0 " +
-		"committed_candidates=$CollisionCommittedCandidates prepared_pairs=$CollisionPreparedPairs unique_candidates=$CollisionUniqueCandidates submitted_jobs=$CollisionSubmitted completed_jobs=$CollisionCompleted") + "`n" +
+		"unexpected_fallbacks=$CollisionUnexpectedFallbacks ineligible_slices=$CollisionIneligibleSlices stale_rejections=$CollisionStaleRejections " +
+		"committed_candidates=$CollisionCommittedCandidates prepared_pairs=$CollisionPreparedPairs unique_candidates=$CollisionUniqueCandidates submitted_jobs=$CollisionSubmitted completed_jobs=$CollisionCompleted " +
+		"physical_worker_jobs=$CollisionPhysicalWorkerJobs owner_helped_jobs=$CollisionOwnerHelpedJobs " +
+		"physical_worker_mask=$CollisionPhysicalWorkerMask distinct_physical_workers=$CollisionDistinctPhysicalWorkers " +
+		"physical_worker_mask_complete=$CollisionPhysicalWorkerMaskComplete") + "`n" +
 		("PHYSICS_INTEGRATION_MANIFEST authoritative_batches=$PhysicsAuthoritativeBatches committed_prefixes=$PhysicsCommittedPrefixes ranges=$PhysicsRanges " +
-		"submitted_jobs=$PhysicsSubmitted completed_jobs=$PhysicsCompleted allocated_bytes=$physicsAllocatedBytes capture_ns=$physicsCaptureNanoseconds prepare_ns=$physicsPrepareNanoseconds " +
+		"submitted_jobs=$PhysicsSubmitted completed_jobs=$PhysicsCompleted physical_worker_jobs=$PhysicsPhysicalWorkerJobs owner_helped_jobs=$PhysicsOwnerHelpedJobs " +
+		"physical_worker_mask=$PhysicsPhysicalWorkerMask distinct_physical_workers=$PhysicsDistinctPhysicalWorkers physical_worker_mask_complete=$PhysicsPhysicalWorkerMaskComplete peak_concurrent_physical_workers=$PhysicsPeakConcurrentPhysicalWorkers " +
+		"allocated_bytes=$physicsAllocatedBytes capture_ns=$physicsCaptureNanoseconds prepare_ns=$physicsPrepareNanoseconds " +
 		"wait_ns=$physicsWaitNanoseconds commit_ns=$physicsCommitNanoseconds storage_bytes=$physicsStorageBytes storage_capacity_bytes=$physicsStorageCapacityBytes " +
 		"storage_allocations=$physicsStorageAllocations shadow_executions=$PhysicsShadowExecutions " +
 		"shadow_prefixes=$PhysicsShadowPrefixes shadow_ranges=$PhysicsShadowRanges " +
@@ -687,6 +1687,10 @@ function New-ReplayMetricOutput {
 		"shadow_matches=$($PhysicsShadowExecutions - $PhysicsShadowMismatches) " +
 		"shadow_mismatches=$PhysicsShadowMismatches owner_fallbacks=0 ineligible_slices=2 " +
 		"unexpected_fallbacks=$PhysicsUnexpectedFallbacks stale_rejections=0 circuit_breaker_trips=0") + "`n" +
+		("OBJECT_STATUS_TIMER_MANIFEST authoritative_batches=$StatusAuthoritativeBatches committed_commands=$StatusCommittedCommands " +
+		"submitted_jobs=$StatusSubmitted completed_jobs=$StatusCompleted physical_worker_jobs=$StatusPhysicalWorkerJobs owner_helped_jobs=$StatusOwnerHelpedJobs " +
+		"physical_worker_mask=$StatusPhysicalWorkerMask distinct_physical_workers=$StatusDistinctPhysicalWorkers physical_worker_mask_complete=$StatusPhysicalWorkerMaskComplete peak_concurrent_physical_workers=$StatusPeakConcurrentPhysicalWorkers " +
+		"shadow_executions=0 shadow_commands=0 shadow_matches=0 shadow_mismatches=0 owner_fallbacks=0 stale_rejections=0") + "`n" +
 		("IMMUTABLE_SPATIAL_MANIFEST captured_arenas=$SpatialCapturedArenas capture_failures=$SpatialCaptureFailures " +
 		"successful_collections=$SpatialSuccessfulCollections " +
 		"successful_collection_queries=$SpatialSuccessfulCollectionQueries " +
@@ -763,10 +1767,22 @@ function New-PerformanceResult {
 }
 
 $scriptPath = Join-Path $PSScriptRoot 'Run-DeterministicSimulationValidation.ps1'
-$temporaryBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+$configuredScratchRoot = [Environment]::GetEnvironmentVariable(
+    'RTS_STAGE5_VALIDATION_SCRATCH_ROOT')
+if ([string]::IsNullOrWhiteSpace($configuredScratchRoot)) {
+    if ($env:GITHUB_ACTIONS -eq 'true' -and
+        -not [string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) {
+        $configuredScratchRoot = $env:RUNNER_TEMP
+    }
+    else {
+        throw 'RTS_STAGE5_VALIDATION_SCRATCH_ROOT must identify an explicit task-owned test scratch root.'
+    }
+}
+$temporaryBase = [IO.Path]::GetFullPath($configuredScratchRoot)
 $root = Join-Path $temporaryBase ('GGC-Stage5Validation-Test-{0}-{1}' -f $PID, [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $root | Out-Null
 try {
+    Assert-InstalledNet3ModuleBoundary (Join-Path $root 'installed-net3-module-fixture.json')
     $runtime = Join-Path $root 'runtime'
     $fixtures = Join-Path $root 'fixtures'
     New-Item -ItemType Directory -Path $runtime | Out-Null
@@ -792,6 +1808,8 @@ try {
         'nonstandard corpus plans are ineligible for the deterministic-runtime and final gates'
     Assert-True ($plan.entries.Count -eq 141) `
         'two-pass replay, three-seed repeated AI matrix, and one shadow stress run have 141 planned runs'
+    Assert-True (-not $plan.x64Required -and -not $plan.performanceRequested) `
+        'a functional plan does not silently claim x64 or performance acceptance'
     Assert-True (@($plan.entries | Where-Object { $_.kind -ceq 'replay' }).Count -eq 56) `
         'replay matrix covers seven configurations, two passes, and three stress runs'
     Assert-True (@($plan.entries | Where-Object { $_.kind -ceq 'ai' }).Count -eq 85) `
@@ -874,6 +1892,26 @@ try {
         -not $replayOnlyPlan.deterministicRuntimeEligible -and
         -not $replayOnlyPlan.finalAcceptanceEligible) `
         'Replay-only plan remains a focused partial gate'
+
+    Assert-Throws {
+        & $scriptPath -RuntimeRoot $runtime -FixtureManifestPath $manifest `
+            -OutputRoot (Join-Path $root 'require-x64-output') -ValidationSet Replay `
+            -MinimumFreeBytes 1 -AllowNonStandardCorpus -PlanOnly -RequireX64 | Out-Null
+    } 'x64 validation requires a valid PE executable' `
+        'RequireX64 rejects a non-PE replay candidate before producing acceptance evidence'
+
+    $validationSource = Get-Content -LiteralPath $scriptPath -Raw
+    Assert-ValidationProcessTerminationContract $validationSource
+    Assert-True ($validationSource -match 'ValidateSet\(''Generals'', ''ZeroHour''\).*\$Title' -and
+        $validationSource -match 'manifestData\.title' -and
+        $validationSource -match 'expectedExecutablePrefix') `
+        'the installed-runtime runner binds title-specific manifest and executable evidence'
+    $unboundedTerminationFixture = $validationSource -replace `
+        '\$Process\.WaitForExit\(\$PostKillWaitMilliseconds\)', '$Process.WaitForExit()'
+    Assert-Throws {
+        Assert-ValidationProcessTerminationContract $unboundedTerminationFixture
+    } 'unbounded WaitForExit' `
+        'validation timeout contract rejects an unbounded post-kill wait'
 
     $oneSeedManifest = Join-Path $root 'one-seed-all.json'
     Write-TestManifest $oneSeedManifest $executableHash $referenceHash $stressHash `
@@ -1273,8 +2311,18 @@ try {
     Assert-True ($shadowCompletion.collisionShadowExecutions -eq 3 -and
         $shadowCompletion.collisionSubmittedJobs -eq 4 -and
         $shadowCompletion.aiCommittedBatches -eq 5 -and
-        $shadowCompletion.aiParallelAuthoritativeCommits -eq 0) `
+		$shadowCompletion.aiParallelAuthoritativeCommits -eq 0 -and
+		$shadowCompletion.ordinaryPathShadowComparisons -gt 0 -and
+		$shadowCompletion.ordinaryPathAuthoritativeCommits -eq 0) `
         'shadow evidence preserves generic AI commits and collision work without claiming parallel AI authority'
+	Assert-Throws {
+		$missingOrdinaryShadow = @{} + $shadowCompletionArguments
+		$missingOrdinaryShadow.OrdinaryPathShadowComparisons = 0
+		ConvertFrom-Stage5AiCompletion `
+			(New-AiCompletionOutput @missingOrdinaryShadow) `
+			$shadowEntry ('A' * 64) | Out-Null
+	} 'shadow stress has no physical-worker ordinary-path comparison' `
+		'installed shadow stress cannot omit ordinary-path comparison evidence'
     Assert-Throws {
         $shadowAuthority = @{} + $shadowCompletionArguments
         $shadowAuthority.AuthoritativeCommits = 1
@@ -1374,6 +2422,43 @@ try {
 			$twoWorkerEntry ('A' * 64) | Out-Null
 	} 'direct_validation_failures' `
 		'an eligible direct-path validation failure deterministically fails acceptance'
+	Assert-Throws {
+		ConvertFrom-Stage5AiCompletion `
+			(New-AiCompletionOutput -OrdinaryPathOwnerHelpedRangeJobs 1) `
+			$twoWorkerEntry ('A' * 64) | Out-Null
+	} 'owner-helped ordinary-path range jobs' `
+		'ordinary-path owner help cannot back installed worker authority'
+	Assert-Throws {
+		ConvertFrom-Stage5AiCompletion `
+			(New-AiCompletionOutput -OrdinaryPathPhysicalWorkerMask 1 `
+				-OrdinaryPathDistinctPhysicalWorkers 2) `
+			$twoWorkerEntry ('A' * 64) | Out-Null
+	} 'ordinary-path physical-worker mask and distinct count disagree' `
+		'ordinary-path evidence rejects an uncorrelated physical-worker count'
+	Assert-Throws {
+		ConvertFrom-Stage5AiCompletion `
+			(New-AiCompletionOutput -OrdinaryPathPeakWorkers 1) `
+			$twoWorkerEntry ('A' * 64) | Out-Null
+	} 'ordinary-path multi-worker authority without a concurrent' `
+		'ordinary-path multi-worker commits require observed concurrent workers'
+	Assert-Throws {
+		ConvertFrom-Stage5AiCompletion `
+			(New-AiCompletionOutput -OrdinaryPathValidationFailures 1) `
+			$twoWorkerEntry ('A' * 64) | Out-Null
+	} 'ordinary_path_validation_failures' `
+		'ordinary-path validation failure deterministically fails acceptance'
+	Assert-Throws {
+		ConvertFrom-Stage5AiCompletion `
+			(New-AiCompletionOutput -OrdinaryPathTimeouts 1) `
+			$twoWorkerEntry ('A' * 64) | Out-Null
+	} 'ordinary_path_timeouts' `
+		'ordinary-path owner timeout deterministically fails acceptance'
+	Assert-Throws {
+		ConvertFrom-Stage5AiCompletion `
+			(New-AiCompletionOutput -OrdinaryPathShadowComparisons 1) `
+			$twoWorkerEntry ('A' * 64) | Out-Null
+	} 'ordinary-path shadow comparisons outside shadow' `
+		'parallel evidence rejects ordinary shadow counters from another mode'
 	Assert-Throws {
 		ConvertFrom-Stage5AiCompletion `
 			(New-AiCompletionOutput -PhysicsShadowExecutions 1 -PhysicsShadowMismatches 1) `
@@ -1482,6 +2567,105 @@ try {
     $authoritativeStressEvidence = ConvertFrom-Stage5AiCompletion `
         (New-AiCompletionOutput -Scenario '4v2' -ActualAi 6 -ActualTeams '4v2') `
         $stressEntry ('A' * 64)
+	Assert-True ($authoritativeStressEvidence.ordinaryPathAuthoritativeCommits -gt 0 -and
+		$authoritativeStressEvidence.ordinaryPathWorkerExecutedRangeJobs -gt 1 -and
+		$authoritativeStressEvidence.ordinaryPathDistinctPhysicalWorkers -gt 1) `
+		'qualifying stress preserves independent ordinary-path physical-worker authority evidence'
+	Assert-Throws {
+		ConvertFrom-Stage5AiCompletion `
+			(New-AiCompletionOutput -Scenario '4v2' -ActualAi 6 -ActualTeams '4v2' `
+				-OrdinaryPathAuthoritativeCommits 0 `
+				-OrdinaryPathAuthoritativeMultiWorkerCommits 0) `
+			$stressEntry ('A' * 64) | Out-Null
+	} 'no authoritative ordinary A\* batch' `
+		'compact-direct worker authority cannot proxy missing ordinary A-star authority'
+    Assert-Throws {
+        ConvertFrom-Stage5AiCompletion `
+            (New-AiCompletionOutput -Scenario '4v2' -ActualAi 6 -ActualTeams '4v2' `
+                -CollisionPhysicalWorkerJobs 0 -CollisionOwnerHelpedJobs 4 `
+                -CollisionPhysicalWorkerMask 0 `
+                -CollisionDistinctPhysicalWorkers 0) `
+            $stressEntry ('A' * 64) | Out-Null
+    } 'at least two distinct physical collision workers' `
+        'qualifying AI stress rejects collision jobs completed entirely by owner help'
+    Assert-Throws {
+        ConvertFrom-Stage5AiCompletion `
+            (New-AiCompletionOutput -Scenario '4v2' -ActualAi 6 -ActualTeams '4v2' `
+                -CollisionPhysicalWorkerJobs 4 -CollisionOwnerHelpedJobs 0 `
+                -CollisionPhysicalWorkerMask 1 `
+                -CollisionDistinctPhysicalWorkers 1) `
+            $stressEntry ('A' * 64) | Out-Null
+    } 'at least two distinct physical collision workers' `
+        'qualifying AI stress rejects collision work confined to one physical worker'
+    Assert-Throws {
+        ConvertFrom-Stage5AiCompletion `
+            (New-AiCompletionOutput -Scenario '4v2' -ActualAi 6 -ActualTeams '4v2' `
+                -CollisionPhysicalWorkerJobs 4 -CollisionOwnerHelpedJobs 0 `
+                -CollisionPhysicalWorkerMask 4 `
+                -CollisionDistinctPhysicalWorkers 1) `
+            $stressEntry ('A' * 64) | Out-Null
+    } 'collision physical-worker mask exceeds the effective worker lane' `
+        'AI collision evidence rejects a physical identity outside its configured lane'
+	foreach ($lane in @(
+		@{ Name = 'parallel-2'; Requested = '2'; Workers = 2 },
+		@{ Name = 'parallel-4'; Requested = '4'; Workers = 4 },
+		@{ Name = 'parallel-8'; Requested = '8'; Workers = 8 },
+		@{ Name = 'parallel-16'; Requested = '16'; Workers = 16 },
+		@{ Name = 'parallel-auto'; Requested = 'auto'; Workers = 16 }
+	)) {
+		$laneEntry = [pscustomobject]@{
+			sequence = 500 + $lane.Workers
+			configuration = $lane.Name
+			simulationMode = 'parallel'
+			requestedWorkers = $lane.Requested
+			seed = 1729
+			scenario = '4v2'
+		}
+		$baseParameters = @{
+			Scenario = '4v2'; ActualAi = 6; ActualTeams = '4v2'
+			RequestedWorkers = $lane.Requested; EffectiveWorkers = $lane.Workers
+		}
+		ConvertFrom-Stage5AiCompletion (New-AiCompletionOutput @baseParameters) `
+			$laneEntry ('A' * 64) | Out-Null
+		foreach ($badCollision in @(
+			@{ CollisionAuthoritativeCommits = 0 },
+			@{ CollisionCommittedCandidates = 0 },
+			@{ CollisionOwnerFallbacks = 1 },
+			@{ CollisionStaleRejections = 1 },
+			@{ CollisionPhysicalWorkerMaskComplete = 0 }
+		)) {
+			$params = $baseParameters.Clone()
+			foreach ($key in $badCollision.Keys) { $params[$key] = $badCollision[$key] }
+			$expectedFailure = if ($badCollision.ContainsKey(
+				'CollisionPhysicalWorkerMaskComplete')) {
+				'incomplete collision physical-worker mask has no exact out-of-mask identity'
+			} else {
+				'qualifying parallel stress has no collision work'
+			}
+			Assert-Throws {
+				ConvertFrom-Stage5AiCompletion (New-AiCompletionOutput @params) `
+					$laneEntry ('A' * 64) | Out-Null
+			} $expectedFailure `
+				"$($lane.Name) rejects incomplete collision authority evidence"
+		}
+	}
+	Assert-Throws {
+		ConvertFrom-Stage5AiCompletion `
+			(New-AiCompletionOutput -Scenario '4v2' -ActualAi 6 -ActualTeams '4v2' `
+				-PhysicsPhysicalWorkerJobs 3 -PhysicsOwnerHelpedJobs 1) `
+			$stressEntry ('A' * 64) | Out-Null
+	} 'qualifying parallel stress has no positive authoritative physics' `
+		'qualifying AI stress rejects physics authority completed with owner help'
+	Assert-Throws {
+		ConvertFrom-Stage5AiCompletion `
+			(New-AiCompletionOutput -Scenario '4v2' -ActualAi 6 -ActualTeams '4v2' `
+				-StatusAuthoritativeBatches 3 -StatusCommittedCommands 96 `
+				-StatusSubmitted 4 -StatusCompleted 4 -StatusPhysicalWorkerJobs 0 `
+				-StatusOwnerHelpedJobs 4 -StatusPhysicalWorkerMask 0 `
+				-StatusDistinctPhysicalWorkers 0 -StatusPeakConcurrentPhysicalWorkers 0) `
+			$stressEntry ('A' * 64) | Out-Null
+	} 'qualifying parallel stress has no physical live status authority' `
+		'qualifying AI stress rejects advertised status authority without physical live execution'
     $spatialCollectionStressEntry = [pscustomobject]@{
         sequence = 24; configuration = 'parallel-2'; simulationMode = 'parallel'
         requestedWorkers = '2'; seed = 1729; scenario = '4v2'; stress = $true
@@ -1579,45 +2763,13 @@ try {
         sequence = 20; kind = 'ai'; stress = $true; configuration = 'parallel-2'
         aiEvidence = $authoritativeStressEvidence
     }, $shadowStressResult)
-    $splitAiAuthority = ConvertFrom-Stage5AiCompletion `
-        (New-AiCompletionOutput -Scenario '4v2' -ActualAi 6 -ActualTeams '4v2' `
-			-CollisionAuthoritativeCommits 0) $stressEntry ('A' * 64)
-    $splitCollisionAuthority = ConvertFrom-Stage5AiCompletion `
-        (New-AiCompletionOutput -Scenario '4v2' -ActualAi 6 -ActualTeams '4v2' `
-			-AuthoritativeCommits 0 -AiSubmitted 0 -AiCompleted 0) $stressEntry ('A' * 64)
-    $splitPathAuthority = ConvertFrom-Stage5AiCompletion `
-        (New-AiCompletionOutput -Scenario '4v2' -ActualAi 6 -ActualTeams '4v2' `
-            -AuthoritativeCommits 0 -AiSubmitted 0 -AiCompleted 0 `
-            -CollisionAuthoritativeCommits 0) $stressEntry ('A' * 64)
     Assert-Throws {
-        Assert-Stage5AuthoritativeWorkEvidence @(
-            [pscustomobject]@{
-                sequence = 201; kind = 'ai'; stress = $true; configuration = 'parallel-2'
-                aiEvidence = $splitAiAuthority
-            },
-            [pscustomobject]@{
-                sequence = 202; kind = 'ai'; stress = $true; configuration = 'parallel-2'
-                aiEvidence = $splitCollisionAuthority
-            },
-            [pscustomobject]@{
-                sequence = 203; kind = 'ai'; stress = $true; configuration = 'parallel-2'
-                aiEvidence = $splitPathAuthority
-            },
-            $shadowStressResult)
-    } 'same qualifying parallel 4v2 stress execution' `
-        'authority split across otherwise valid stress executions cannot satisfy overall acceptance'
-    $aiOnlyStressEvidence = ConvertFrom-Stage5AiCompletion `
-        (New-AiCompletionOutput -Scenario '4v2' -ActualAi 6 -ActualTeams '4v2' `
-            -CollisionAuthoritativeCommits 0 -CollisionCommittedCandidates 0 `
-            -CollisionPreparedPairs 0 -CollisionUniqueCandidates 0 `
-            -CollisionSubmitted 0 -CollisionCompleted 0) $stressEntry ('A' * 64)
-    Assert-Throws {
-        Assert-Stage5AuthoritativeWorkEvidence @([pscustomobject]@{
-            sequence = 23; kind = 'ai'; stress = $true; configuration = 'parallel-2'
-            aiEvidence = $aiOnlyStressEvidence
-        }, $shadowStressResult)
-    } 'AI counters cannot proxy collision work' `
-        'positive AI work cannot substitute for authoritative collision work'
+		ConvertFrom-Stage5AiCompletion `
+			(New-AiCompletionOutput -Scenario '4v2' -ActualAi 6 -ActualTeams '4v2' `
+				-CollisionAuthoritativeCommits 0 -CollisionCommittedCandidates 0) `
+			$stressEntry ('A' * 64) | Out-Null
+	} 'qualifying parallel stress has no collision work' `
+		'positive AI work cannot substitute for collision authority in any qualifying execution'
 	Assert-Throws {
 		ConvertFrom-Stage5AiCompletion `
 			(New-AiCompletionOutput -Scenario '4v2' -ActualAi 6 -ActualTeams '4v2' `
@@ -1758,6 +2910,84 @@ try {
             $replayEntry | Out-Null
     } 'collision submitted/completed job counts do not match' `
         'replay collision evidence rejects incomplete successful-job telemetry'
+    Assert-Throws {
+        ConvertFrom-Stage5ReplayMetrics `
+            (New-ReplayMetricOutput -CollisionPhysicalWorkerJobs 0 `
+                -CollisionOwnerHelpedJobs 4 -CollisionPhysicalWorkerMask 0 `
+                -CollisionDistinctPhysicalWorkers 0) `
+            $replayEntry | Out-Null
+    } 'at least two distinct physical collision workers' `
+        'qualifying replay stress rejects collision jobs completed entirely by owner help'
+    Assert-Throws {
+        ConvertFrom-Stage5ReplayMetrics `
+            (New-ReplayMetricOutput -CollisionPhysicalWorkerJobs 4 `
+                -CollisionOwnerHelpedJobs 0 -CollisionPhysicalWorkerMask 1 `
+                -CollisionDistinctPhysicalWorkers 1) `
+            $replayEntry | Out-Null
+    } 'at least two distinct physical collision workers' `
+        'qualifying replay stress rejects collision work confined to one physical worker'
+    Assert-Throws {
+        ConvertFrom-Stage5ReplayMetrics `
+            (New-ReplayMetricOutput -CollisionPhysicalWorkerJobs 4 `
+                -CollisionOwnerHelpedJobs 0 -CollisionPhysicalWorkerMask 4 `
+                -CollisionDistinctPhysicalWorkers 1) `
+            $replayEntry | Out-Null
+    } 'collision physical-worker mask exceeds the effective worker lane' `
+        'replay collision evidence rejects a physical identity outside its configured lane'
+	foreach ($lane in @(
+		@{ Name = 'parallel-2'; Workers = 2 },
+		@{ Name = 'parallel-4'; Workers = 4 },
+		@{ Name = 'parallel-8'; Workers = 8 },
+		@{ Name = 'parallel-16'; Workers = 16 },
+		@{ Name = 'parallel-auto'; Workers = 16 }
+	)) {
+		$laneEntry = [pscustomobject]@{
+			sequence = 600 + $lane.Workers
+			configuration = $lane.Name
+			simulationMode = 'parallel'
+			replayArgument = 'Stage5Validation\reference.rep'
+			stress = $true
+		}
+		$baseParameters = @{ Workers = $lane.Workers }
+		ConvertFrom-Stage5ReplayMetrics (New-ReplayMetricOutput @baseParameters) `
+			$laneEntry | Out-Null
+		foreach ($badCollision in @(
+			@{ CollisionAuthoritativeCommits = 0 },
+			@{ CollisionCommittedCandidates = 0 },
+			@{ CollisionOwnerFallbacks = 1 },
+			@{ CollisionStaleRejections = 1 },
+			@{ CollisionPhysicalWorkerMaskComplete = 0 }
+		)) {
+			$params = $baseParameters.Clone()
+			foreach ($key in $badCollision.Keys) { $params[$key] = $badCollision[$key] }
+			$expectedFailure = if ($badCollision.ContainsKey(
+				'CollisionPhysicalWorkerMaskComplete')) {
+				'incomplete collision physical-worker mask has no exact out-of-mask identity'
+			} else {
+				'qualifying stress replay has no collision work'
+			}
+			Assert-Throws {
+				ConvertFrom-Stage5ReplayMetrics (New-ReplayMetricOutput @params) `
+					$laneEntry | Out-Null
+			} $expectedFailure `
+				"$($lane.Name) replay rejects incomplete collision authority evidence"
+		}
+	}
+	Assert-Throws {
+		ConvertFrom-Stage5ReplayMetrics `
+			(New-ReplayMetricOutput -PhysicsPhysicalWorkerJobs 3 `
+				-PhysicsOwnerHelpedJobs 1) $replayEntry | Out-Null
+	} 'qualifying stress replay has no positive authoritative physics' `
+		'qualifying replay rejects physics authority completed with owner help'
+	Assert-Throws {
+		ConvertFrom-Stage5ReplayMetrics `
+			(New-ReplayMetricOutput -StatusAuthoritativeBatches 3 `
+				-StatusCommittedCommands 96 -StatusSubmitted 4 -StatusCompleted 4 `
+				-StatusPhysicalWorkerJobs 0 -StatusOwnerHelpedJobs 4 `
+				-StatusPhysicalWorkerMask 0 -StatusDistinctPhysicalWorkers 0 `
+				-StatusPeakConcurrentPhysicalWorkers 0) $replayEntry | Out-Null
+	} 'qualifying stress replay has no physical live status authority' `
+		'qualifying replay rejects advertised status authority without physical live execution'
     Assert-Throws {
         ConvertFrom-Stage5ReplayMetrics `
             (New-ReplayMetricOutput -CollisionShadowExecutions 1 `
@@ -2332,9 +3562,10 @@ try {
         'registry setup transaction aggregates setup and rollback errors'
 
     # Final acceptance is deliberately separate from the deterministic-runtime
-    # replay/AI matrix. Build one complete, independently hashed evidence set,
-    # then prove that missing, stale, tampered, and combined-policy-invalid
-    # inputs all fail closed.
+    # replay/AI matrix. Build one complete, independently hashed diagnostic v1
+    # evidence set, then prove that v1 is rejected until lockstep-v2 exists,
+    # while missing, stale, tampered, and combined-policy-invalid inputs fail
+    # closed for their own reasons.
     $acceptanceRoot = Join-Path $root 'final-acceptance'
     $artifactFiles = Join-Path $acceptanceRoot 'artifact-files'
     $attachmentRoot = Join-Path $acceptanceRoot 'attachments'
@@ -2517,23 +3748,307 @@ try {
     }
     $acceptanceRequest = Join-Path $acceptanceRoot 'final-acceptance.json'
     Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
-    $acceptanceReport = Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest
-    Assert-True ($acceptanceReport.status -ceq 'passed' -and
-        $acceptanceReport.gateName -ceq 'final-stage5-acceptance' -and
-        $acceptanceReport.evidence.Count -eq 8) `
-        'complete independently hashed final acceptance evidence passes aggregation'
+    Assert-Throws {
+        Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest | Out-Null
+    } 'diagnostic NET3 v1|lockstep-v2' `
+        'a fully valid diagnostic NET3 v1 envelope cannot satisfy final acceptance'
+
+    # The installed v2 host is the only final-acceptance producer. Exercise its
+    # canonical boundary and fail-closed identity checks without fabricating a
+    # passing v2 session or performance result.
+    $lockstepRunnerPath = Join-Path $PSScriptRoot 'Invoke-InstalledLockstepV2Validation.ps1'
+    $lockstepRunnerSource = Get-Content -LiteralPath $lockstepRunnerPath -Raw
+    Assert-True ($lockstepRunnerSource -match '\$LockstepProducer\s*=\s*''installed-lockstep-v2''' -and
+        $lockstepRunnerSource -match '\$LockstepMode\s*=\s*''installed-lockstep-v2-production''' -and
+        $lockstepRunnerSource -match 'evidenceKind\s*=\s*''lockstep-v2-multiplayer''' -and
+        $lockstepRunnerSource -match 'recordedUtc\s*=') `
+        'the installed lockstep-v2 producer publishes the canonical final-acceptance identity'
+    $lockstepProbe = [ordered]@{
+        schemaVersion = 2; evidenceKind = 'lockstep-v2-multiplayer'; status = 'passed'
+        producer = 'installed-lockstep-v2'; validationMode = 'installed-lockstep-v2-production'
+        architecture = 'x64'; sourceCommit = $sourceCommit
+        artifactSetSha256 = $artifactSetHash; recordedUtc = '2026-09-01T00:00:00Z'
+        allowHeadlessDirectExecution = $true
+        launcherEquivalence = [ordered]@{ Generals = [ordered]@{}; ZeroHour = [ordered]@{} }
+        commonStopFrame = 4096; peerCount = 2; mapName = 'Stage5Validation.map'
+        mapCrc = 1; seed = 23063; v1Accepted = $false
+        profileStrategy = 'known-folder-registry-redirect'
+        registryViews = @('Registry32', 'Registry64')
+        environmentVariables = @('TEMP', 'TMP', 'LOCALAPPDATA', 'APPDATA', 'USERPROFILE',
+            'HOMEDRIVE', 'HOMEPATH', 'RTS_STAGE5_VALIDATION_PROFILE_ROOT',
+            'RTS_STAGE5_VALIDATION_CACHE_ROOT', 'RTS_STAGE5_VALIDATION_LOG_ROOT',
+            'RTS_STAGE5_VALIDATION_DUMP_ROOT')
+        profileConcurrency = 'shared-title-profile-read-only'; sessions = @()
+    }
+    $lockstepProbePath = Join-Path $acceptanceRoot 'lockstep-v2-probe.json'
+    Write-JsonDocument $lockstepProbePath $lockstepProbe
+    $lockstepReadArgs = @{
+        Path = $lockstepProbePath; ExpectedSourceCommit = $sourceCommit
+        ExpectedArtifactSetSha256 = $artifactSetHash; ArtifactHashes = $artifactTestHashes
+    }
+    $lockstepProbe.Remove('evidenceKind')
+    Write-JsonDocument $lockstepProbePath $lockstepProbe
+    Assert-Throws {
+        Read-Stage5LockstepV2Evidence @lockstepReadArgs | Out-Null
+    } 'missing property ''evidenceKind''' `
+        'lockstep-v2 evidence rejects an envelope without its explicit evidence kind'
+    $lockstepProbe.evidenceKind = 'lockstep-v2-multiplayer'
+    $lockstepProbe.producer = 'installed-runtime-lockstep-v2'
+    $lockstepProbe.validationMode = 'production-lockstep-v2'
+    Write-JsonDocument $lockstepProbePath $lockstepProbe
+    Assert-Throws {
+        Read-Stage5LockstepV2Evidence @lockstepReadArgs | Out-Null
+    } 'invalid schema/producer/mode boundary' `
+        'lockstep-v2 evidence rejects a substituted producer and validation mode'
+    $lockstepProbe.producer = 'installed-lockstep-v2'
+    $lockstepProbe.validationMode = 'installed-lockstep-v2-production'
+    $lockstepProbe.sourceCommit = 'b' * 40
+    Write-JsonDocument $lockstepProbePath $lockstepProbe
+    Assert-Throws {
+        Read-Stage5LockstepV2Evidence @lockstepReadArgs | Out-Null
+    } 'stale or substituted' `
+        'lockstep-v2 evidence rejects a stale source revision before session acceptance'
+    $lockstepProbe.sourceCommit = $sourceCommit
+    $lockstepProbe.artifactSetSha256 = 'B' * 64
+    Write-JsonDocument $lockstepProbePath $lockstepProbe
+    Assert-Throws {
+        Read-Stage5LockstepV2Evidence @lockstepReadArgs | Out-Null
+    } 'does not match the independently hashed artifact set' `
+        'lockstep-v2 evidence rejects a substituted artifact-set hash'
+
+    $lockstepFixtureRoot = Join-Path $acceptanceRoot 'lockstep-v2-positive'
+    $lockstepFixture = New-LockstepFixtureEvidence $lockstepFixtureRoot `
+        $sourceCommit $artifactSetHash $artifactTestHashes
+    $lockstepPositiveArgs = @{
+        Path = $lockstepFixture.path; ExpectedSourceCommit = $sourceCommit
+        ExpectedArtifactSetSha256 = $artifactSetHash; ArtifactHashes = $artifactTestHashes
+    }
+    try {
+        $lockstepRead = Read-Stage5LockstepV2Evidence @lockstepPositiveArgs
+        Assert-True ($lockstepRead.schemaVersion -eq 2 -and
+            $lockstepRead.evidenceKind -ceq 'lockstep-v2-multiplayer' -and
+            $lockstepRead.sessions.Count -eq 2 -and
+            $lockstepRead.sessions[0].peers.Count -eq 2) `
+            'a complete executable-shaped two-title/two-peer lockstep-v2 fixture is accepted'
+    }
+    catch {
+        Assert-True $false "a complete lockstep-v2 fixture should be accepted: $($_.Exception.Message)"
+    }
+
+    $receiptBytesCaseRoot = Join-Path $acceptanceRoot 'lockstep-v2-negative-receipt-bytes'
+    $receiptBytesPath = Copy-LockstepFixtureCase $lockstepFixtureRoot $receiptBytesCaseRoot
+    $receiptBytesFile = Join-Path (Split-Path -Parent $receiptBytesPath) 'Generals/lockstep-v2-Generals-peer-0.receipt'
+    $receiptBytes = [IO.File]::ReadAllText($receiptBytesFile).Replace('clean_shutdown=1', 'clean_shutdown=0')
+    [IO.File]::WriteAllText($receiptBytesFile, $receiptBytes, (New-Object Text.UTF8Encoding($false)))
+    Assert-Throws {
+        Read-Stage5LockstepV2Evidence $receiptBytesPath $sourceCommit $artifactSetHash $artifactTestHashes | Out-Null
+    } 'receipt SHA-256 binding does not match' `
+        'lockstep-v2 rejects receipt bytes that no longer match the producer hash'
+
+    $receiptHashCaseRoot = Join-Path $acceptanceRoot 'lockstep-v2-negative-receipt-hash'
+    $receiptHashPath = Copy-LockstepFixtureCase $lockstepFixtureRoot $receiptHashCaseRoot
+    $receiptHashDocument = Read-LockstepFixtureCaseDocument $receiptHashPath
+    $receiptHashDocument.sessions[0].peers[0].receiptSha256 = '0' * 64
+    $receiptHashRaw = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $receiptHashPath) 'Generals/peer-0.raw.json') -Raw | ConvertFrom-Json
+    $receiptHashRaw.receiptSha256 = '0' * 64
+    Write-LockstepFixturePeerMutation $receiptHashPath $receiptHashDocument 0 0 $receiptHashRaw
+    Assert-Throws {
+        Read-Stage5LockstepV2Evidence $receiptHashPath $sourceCommit $artifactSetHash $artifactTestHashes | Out-Null
+    } 'receipt SHA-256 binding does not match|raw receipt index field' `
+        'lockstep-v2 rejects a substituted receipt hash'
+
+    $stdoutMarkerCaseRoot = Join-Path $acceptanceRoot 'lockstep-v2-negative-stdout-marker'
+    $stdoutMarkerPath = Copy-LockstepFixtureCase $lockstepFixtureRoot $stdoutMarkerCaseRoot
+    $stdoutMarkerDocument = Read-LockstepFixtureCaseDocument $stdoutMarkerPath
+    $stdoutMarkerRawPath = Join-Path (Split-Path -Parent $stdoutMarkerPath) 'Generals/peer-0.raw.json'
+    $stdoutMarkerRaw = Get-Content -LiteralPath $stdoutMarkerRawPath -Raw | ConvertFrom-Json
+    $stdoutMarkerFile = Join-Path (Split-Path -Parent $stdoutMarkerPath) 'Generals/peer-0.stdout.log'
+    $stdoutMarkerText = [IO.File]::ReadAllText($stdoutMarkerFile).Replace('frame=4096 crc=00018720', 'frame=4095 crc=00018720')
+    [IO.File]::WriteAllText($stdoutMarkerFile, $stdoutMarkerText, (New-Object Text.UTF8Encoding($false)))
+    $stdoutMarkerHash = Get-Sha256 $stdoutMarkerFile
+    $stdoutMarkerDocument.sessions[0].peers[0].stdoutSha256 = $stdoutMarkerHash
+    $stdoutMarkerRaw.stdoutSha256 = $stdoutMarkerHash
+    Write-LockstepFixturePeerMutation $stdoutMarkerPath $stdoutMarkerDocument 0 0 $stdoutMarkerRaw
+    Assert-Throws {
+        Read-Stage5LockstepV2Evidence $stdoutMarkerPath $sourceCommit $artifactSetHash $artifactTestHashes | Out-Null
+    } 'stdout proof is stale|stdout is not an exclusive' `
+        'lockstep-v2 rejects a stdout marker detached from the 4096-frame contract'
+
+    $stdoutHashCaseRoot = Join-Path $acceptanceRoot 'lockstep-v2-negative-stdout-hash'
+    $stdoutHashPath = Copy-LockstepFixtureCase $lockstepFixtureRoot $stdoutHashCaseRoot
+    $stdoutHashDocument = Read-LockstepFixtureCaseDocument $stdoutHashPath
+    $stdoutHashRawPath = Join-Path (Split-Path -Parent $stdoutHashPath) 'ZeroHour/peer-1.raw.json'
+    $stdoutHashRaw = Get-Content -LiteralPath $stdoutHashRawPath -Raw | ConvertFrom-Json
+    $stdoutHashDocument.sessions[1].peers[1].stdoutSha256 = 'F' * 64
+    $stdoutHashRaw.stdoutSha256 = 'F' * 64
+    Write-LockstepFixturePeerMutation $stdoutHashPath $stdoutHashDocument 1 1 $stdoutHashRaw
+    Assert-Throws {
+        Read-Stage5LockstepV2Evidence $stdoutHashPath $sourceCommit $artifactSetHash $artifactTestHashes | Out-Null
+    } 'stdout SHA-256 binding does not match' `
+        'lockstep-v2 rejects a substituted stdout hash'
+
+    $pidCaseRoot = Join-Path $acceptanceRoot 'lockstep-v2-negative-pid'
+    $pidPath = Copy-LockstepFixtureCase $lockstepFixtureRoot $pidCaseRoot
+    $pidDocument = Read-LockstepFixtureCaseDocument $pidPath
+    $pidDocument.sessions[0].peers[0].processId = 51999
+    $pidRawPath = Join-Path (Split-Path -Parent $pidPath) 'Generals/peer-0.raw.json'
+    $pidRaw = Get-Content -LiteralPath $pidRawPath -Raw | ConvertFrom-Json
+    $pidRaw.processId = 51999
+    Write-LockstepFixturePeerMutation $pidPath $pidDocument 0 0 $pidRaw
+    Assert-Throws {
+        Read-Stage5LockstepV2Evidence $pidPath $sourceCommit $artifactSetHash $artifactTestHashes | Out-Null
+    } 'stdout proof is stale|stdout proof' `
+        'lockstep-v2 rejects a pass marker with a substituted process identity'
+
+    $nonceCaseRoot = Join-Path $acceptanceRoot 'lockstep-v2-negative-run-nonce'
+    $noncePath = Copy-LockstepFixtureCase $lockstepFixtureRoot $nonceCaseRoot
+    $nonceDocument = Read-LockstepFixtureCaseDocument $noncePath
+    $nonceDocument.sessions[1].peers[0].runNonce = 'F' * 32
+    $nonceRawPath = Join-Path (Split-Path -Parent $noncePath) 'ZeroHour/peer-0.raw.json'
+    $nonceRaw = Get-Content -LiteralPath $nonceRawPath -Raw | ConvertFrom-Json
+    $nonceRaw.runNonce = 'F' * 32
+    Write-LockstepFixturePeerMutation $noncePath $nonceDocument 1 0 $nonceRaw
+    Assert-Throws {
+        Read-Stage5LockstepV2Evidence $noncePath $sourceCommit $artifactSetHash $artifactTestHashes | Out-Null
+    } 'configuration does not bind|run identity|receipt.*run' `
+        'lockstep-v2 rejects a replayed or substituted run nonce'
+
+    $workerOverrideCaseRoot = Join-Path $acceptanceRoot 'lockstep-v2-negative-worker-override'
+    $workerOverridePath = Copy-LockstepFixtureCase $lockstepFixtureRoot $workerOverrideCaseRoot
+    $workerOverrideDocument = Read-LockstepFixtureCaseDocument $workerOverridePath
+    $workerOverrideDocument.sessions[0].peers[0].workerOverride.profile = 'automatic-workers'
+    $workerOverrideRawPath = Join-Path (Split-Path -Parent $workerOverridePath) 'Generals/peer-0.raw.json'
+    $workerOverrideRaw = Get-Content -LiteralPath $workerOverrideRawPath -Raw | ConvertFrom-Json
+    $workerOverrideRaw.workerOverride.profile = 'automatic-workers'
+    Write-LockstepFixturePeerMutation $workerOverridePath $workerOverrideDocument 0 0 $workerOverrideRaw
+    Assert-Throws {
+        Read-Stage5LockstepV2Evidence $workerOverridePath $sourceCommit $artifactSetHash $artifactTestHashes | Out-Null
+    } 'worker override|process arguments' `
+        'lockstep-v2 rejects a substituted executable worker override'
+
+    $workerTelemetryCaseRoot = Join-Path $acceptanceRoot 'lockstep-v2-negative-worker-telemetry'
+    $workerTelemetryPath = Copy-LockstepFixtureCase $lockstepFixtureRoot $workerTelemetryCaseRoot
+    $workerTelemetryDocument = Read-LockstepFixtureCaseDocument $workerTelemetryPath
+    $workerTelemetryDocument.sessions[0].peers[0].receiptWorkerTelemetry.effectiveWorkers = 3
+    $workerTelemetryDocument.sessions[0].peers[0].effectiveWorkers = 3
+    $workerTelemetryRawPath = Join-Path (Split-Path -Parent $workerTelemetryPath) 'Generals/peer-0.raw.json'
+    $workerTelemetryRaw = Get-Content -LiteralPath $workerTelemetryRawPath -Raw | ConvertFrom-Json
+    $workerTelemetryRaw.receiptWorkerTelemetry.effectiveWorkers = 3
+    $workerTelemetryRaw.effectiveWorkers = 3
+    Write-LockstepFixturePeerMutation $workerTelemetryPath $workerTelemetryDocument 0 0 $workerTelemetryRaw
+    Assert-Throws {
+        Read-Stage5LockstepV2Evidence $workerTelemetryPath $sourceCommit $artifactSetHash $artifactTestHashes | Out-Null
+    } 'worker profile|worker telemetry|effective worker' `
+        'lockstep-v2 rejects telemetry that no longer matches the executable worker profile'
+
+    $projectionCaseRoot = Join-Path $acceptanceRoot 'lockstep-v2-negative-projection'
+    $projectionPath = Copy-LockstepFixtureCase $lockstepFixtureRoot $projectionCaseRoot
+    $projectionReceiptPath = Join-Path (Split-Path -Parent $projectionPath) 'ZeroHour/lockstep-v2-ZeroHour-peer-1.receipt'
+    $projection = Set-LockstepFixtureReceiptCheckpointCrc $projectionReceiptPath '100999'
+    $projectionDocument = Read-LockstepFixtureCaseDocument $projectionPath
+    $projectionDocument.sessions[1].peers[1].receiptSha256 = Get-Sha256 $projectionReceiptPath
+    $projectionDocument.sessions[1].peers[1].comparableProjectionSha256 = $projection
+    $projectionRawPath = Join-Path (Split-Path -Parent $projectionPath) 'ZeroHour/peer-1.raw.json'
+    $projectionRaw = Get-Content -LiteralPath $projectionRawPath -Raw | ConvertFrom-Json
+    $projectionRaw.receiptSha256 = $projectionDocument.sessions[1].peers[1].receiptSha256
+    $projectionRaw.comparableProjectionSha256 = $projection
+    Write-LockstepFixturePeerMutation $projectionPath $projectionDocument 1 1 $projectionRaw
+    Assert-Throws {
+        Read-Stage5LockstepV2Evidence $projectionPath $sourceCommit $artifactSetHash $artifactTestHashes | Out-Null
+    } 'peers disagree on CRC, checkpoint, or command digests' `
+        'lockstep-v2 rejects a substituted cross-peer checkpoint projection'
+
+    $timestampCaseRoot = Join-Path $acceptanceRoot 'lockstep-v2-negative-timestamp'
+    $timestampPath = Copy-LockstepFixtureCase $lockstepFixtureRoot $timestampCaseRoot
+    $timestampDocument = Read-LockstepFixtureCaseDocument $timestampPath
+    $timestampDocument.recordedUtc = 'not-a-timestamp'
+    Write-JsonDocument $timestampPath $timestampDocument
+    Assert-Throws {
+        Read-Stage5LockstepV2Evidence $timestampPath $sourceCommit $artifactSetHash $artifactTestHashes | Out-Null
+    } 'not a valid timestamp' 'lockstep-v2 rejects a stale or malformed aggregate timestamp'
+
+    $sourceCaseRoot = Join-Path $acceptanceRoot 'lockstep-v2-negative-source'
+    $sourcePath = Copy-LockstepFixtureCase $lockstepFixtureRoot $sourceCaseRoot
+    $sourceDocument = Read-LockstepFixtureCaseDocument $sourcePath
+    $sourceDocument.sourceCommit = 'B' * 40
+    Write-JsonDocument $sourcePath $sourceDocument
+    Assert-Throws {
+        Read-Stage5LockstepV2Evidence $sourcePath $sourceCommit $artifactSetHash $artifactTestHashes | Out-Null
+    } 'stale or substituted' 'lockstep-v2 rejects a stale aggregate source revision'
+
+    $artifactCaseRoot = Join-Path $acceptanceRoot 'lockstep-v2-negative-artifact'
+    $artifactPath = Copy-LockstepFixtureCase $lockstepFixtureRoot $artifactCaseRoot
+    $artifactDocument = Read-LockstepFixtureCaseDocument $artifactPath
+    $artifactDocument.artifactSetSha256 = 'C' * 64
+    Write-JsonDocument $artifactPath $artifactDocument
+    Assert-Throws {
+        Read-Stage5LockstepV2Evidence $artifactPath $sourceCommit $artifactSetHash $artifactTestHashes | Out-Null
+    } 'does not match the independently hashed artifact set' 'lockstep-v2 rejects a substituted artifact-set binding'
+
+    $immutableReceiptSchema = Join-Path $PSScriptRoot 'Stage5ImmutableEvidenceReceipt.schema.json'
+    Assert-True (Test-Path -LiteralPath $immutableReceiptSchema -PathType Leaf) `
+        'the generic immutable receipt schema is retained beside the host validator'
+    $immutableReceiptPath = Join-Path $attachmentRoot 'immutable-receipt-validation-plan.json'
+    Write-ImmutableReceiptTestDocument $immutableReceiptPath $sourceCommit `
+        $artifactSetHash $artifactTestHashes['zerohour-executable']
+    $immutableReceipt = Get-Content -LiteralPath $immutableReceiptPath -Raw | ConvertFrom-Json
+    $receiptContractArgs = @{
+        Path = $immutableReceiptPath; Kind = 'deterministic-runtime'
+        Role = 'validation-plan'; EvidenceTitle = 'ZeroHour'
+        ExpectedSourceCommit = $sourceCommit
+        ExpectedArtifactSetSha256 = $artifactSetHash
+        ArtifactHashes = $artifactTestHashes
+    }
+    $receiptRead = Read-Stage5FinalAcceptanceImmutableReceipt @receiptContractArgs
+    Assert-True ($receiptRead.acceptanceFailure -match 'missing-producer') `
+        'a structurally complete receipt still fails closed without a registered executable producer'
+    $immutableReceipt.sourceCommit = 'b' * 40
+    Write-JsonDocument $immutableReceiptPath $immutableReceipt
+    Assert-Throws {
+        Read-Stage5FinalAcceptanceImmutableReceipt @receiptContractArgs | Out-Null
+    } 'stale or does not match' `
+        'a stale receipt from another source commit is rejected'
+    $immutableReceipt.sourceCommit = $sourceCommit
+    $immutableReceipt.role = 'validation-results'
+    Write-JsonDocument $immutableReceiptPath $immutableReceipt
+    Assert-Throws {
+        Read-Stage5FinalAcceptanceImmutableReceipt @receiptContractArgs | Out-Null
+    } 'role is substituted' `
+        'a receipt substituted from another role is rejected'
+    $immutableReceipt.role = 'validation-plan'
+    $immutableReceipt.executableSha256 = '0' * 64
+    Write-JsonDocument $immutableReceiptPath $immutableReceipt
+    Assert-Throws {
+        Read-Stage5FinalAcceptanceImmutableReceipt @receiptContractArgs | Out-Null
+    } 'executable SHA-256 binding' `
+        'a receipt bound to the wrong executable hash is rejected'
+    $immutableReceipt.executableSha256 = $artifactTestHashes['zerohour-executable']
+    $immutableReceipt.rawLogs[0].sha256 = '0' * 64
+    Write-JsonDocument $immutableReceiptPath $immutableReceipt
+    Assert-Throws {
+        Read-Stage5FinalAcceptanceImmutableReceipt @receiptContractArgs | Out-Null
+    } 'raw log.*SHA-256 mismatch' `
+        'a receipt with a substituted raw log hash is rejected'
+    $immutableReceipt.rawLogs[0].sha256 = Get-Sha256 (Join-Path $attachmentRoot `
+        'immutable-receipt-validation-plan.raw.log')
+    Write-JsonDocument $immutableReceiptPath $immutableReceipt
+    $replayedNonces = @{}
+    $replayArgs = @{} + $receiptContractArgs
+    $replayArgs['SeenRunNonces'] = $replayedNonces
+    Read-Stage5FinalAcceptanceImmutableReceipt @replayArgs | Out-Null
+    Assert-Throws {
+        Read-Stage5FinalAcceptanceImmutableReceipt @replayArgs | Out-Null
+    } 'replayed.*runNonce' `
+        'a replayed receipt nonce is rejected even when its bytes are unchanged'
 
     $acceptanceOutput = Join-Path $acceptanceRoot 'final-acceptance-report.json'
-    & (Join-Path $PSScriptRoot 'Invoke-Stage5FinalAcceptance.ps1') `
-        -AcceptanceManifestPath $acceptanceRequest -OutputPath $acceptanceOutput | Out-Null
-    $writtenReport = Get-Content -LiteralPath $acceptanceOutput -Raw | ConvertFrom-Json
-    Assert-True ($writtenReport.status -ceq 'passed' -and
-        $writtenReport.sourceCommit -ceq $sourceCommit) `
-        'final acceptance command writes only a validated passed report'
     Assert-Throws {
         & (Join-Path $PSScriptRoot 'Invoke-Stage5FinalAcceptance.ps1') `
             -AcceptanceManifestPath $acceptanceRequest -OutputPath $acceptanceOutput | Out-Null
-    } 'refusing to overwrite evidence' 'final acceptance report refuses evidence overwrite'
+    } 'diagnostic NET3 v1|lockstep-v2' `
+        'final acceptance command fails closed before a lockstep-v2 producer exists'
+    Assert-True (-not (Test-Path -LiteralPath $acceptanceOutput)) `
+        'final acceptance does not write a passed report without lockstep-v2 evidence'
 
     $missingManualRequest = Join-Path $acceptanceRoot 'missing-manual.json'
     Write-AcceptanceRequest $missingManualRequest @($acceptanceKinds | Where-Object {
@@ -2572,21 +4087,87 @@ try {
     Assert-True ($net3Proof.provenKernelMask -eq 0x3F -and
         $net3Proof.matchCount -eq 16 -and $net3Proof.peerRecordCount -eq 40) `
         'canonical NET3 evidence proves six kernels across exactly 16 matches and 40 peer records'
-    $proofDirectory = Join-Path $acceptanceRoot 'generated-proof'
-    $proofHeader = Join-Path $proofDirectory 'MultiplayerSimulationReleaseProof.generated.h'
+    $proofDirectory = Join-Path $acceptanceRoot 'external-proof'
+    New-Item -ItemType Directory -Path $proofDirectory | Out-Null
+    $proofEvidence = Join-Path $proofDirectory 'Net3LoopbackEvidence.json'
+    $proofArtifactSet = Join-Path $proofDirectory 'Stage5ArtifactSet.json'
+    Copy-Item -LiteralPath $net3Manifest -Destination $proofEvidence
+    Copy-Item -LiteralPath $artifactSetPath -Destination $proofArtifactSet
+    $proofManifest = Get-Content -LiteralPath $proofEvidence -Raw | ConvertFrom-Json
+    $proofRawLines = @('RTS_MULTIPLAYER_SIMULATION_RAW_EVIDENCE_V1')
+    $proofRawOrdinal = 0
+    foreach ($proofMatch in $proofManifest.matches) {
+        foreach ($proofPeer in $proofMatch.peers) {
+            $sourceRaw = Join-Path (Split-Path -Parent $net3Manifest) $proofPeer.rawOutputPath
+            $destinationRaw = Join-Path $proofDirectory $proofPeer.rawOutputPath
+            $destinationParent = Split-Path -Parent $destinationRaw
+            if (-not (Test-Path -LiteralPath $destinationParent -PathType Container)) {
+                New-Item -ItemType Directory -Path $destinationParent -Force | Out-Null
+            }
+            Copy-Item -LiteralPath $sourceRaw -Destination $destinationRaw
+            $proofRawLines += ('{0:D2}|{1}|{2}' -f $proofRawOrdinal,
+                $proofPeer.rawOutputPath, (Get-Sha256 $destinationRaw))
+            ++$proofRawOrdinal
+        }
+    }
+    $proofRawLines += 'END'
+    $proofRawIndex = Join-Path $proofDirectory 'MultiplayerSimulationRawEvidence.index'
+    [IO.File]::WriteAllText($proofRawIndex, (($proofRawLines -join "`n") + "`n"))
+    $proofFile = Join-Path $proofDirectory 'MultiplayerSimulationRuntimeProof.txt'
     & (Join-Path $PSScriptRoot 'New-MultiplayerSimulationReleaseProof.ps1') `
-        -EvidenceManifestPath $net3Manifest -OutputPath $proofHeader `
+        -EvidenceManifestPath $proofEvidence -RawEvidenceIndexPath $proofRawIndex `
+        -ArtifactSetManifestPath $proofArtifactSet -OutputPath $proofFile `
         -ExpectedSourceCommit $sourceCommit -ExpectedArtifactSetSha256 $artifactSetHash `
         -ExpectedGeneralsExecutableSha256 $artifactTestHashes['generals-executable'] `
-        -ExpectedZeroHourExecutableSha256 $artifactTestHashes['zerohour-executable'] | Out-Null
-    $proofContent = Get-Content -LiteralPath $proofHeader -Raw
-    Assert-True ($proofContent -match 'RTS_MULTIPLAYER_SIMULATION_RELEASE_PROOF_SCHEMA 1' -and
-        $proofContent -match 'RTS_MULTIPLAYER_SIMULATION_RELEASE_PROOF_PROVEN_KERNEL_MASK 0x0000003Fu' -and
+        -ExpectedZeroHourExecutableSha256 $artifactTestHashes['zerohour-executable'] `
+        -Title Generals -ExpectedBuildCompatibilityCrc 287454020 `
+        -ExpectedContentCrc 2864434397 | Out-Null
+    $proofContent = Get-Content -LiteralPath $proofFile -Raw
+    Assert-True ($proofContent -match '^RTS_MULTIPLAYER_SIMULATION_RUNTIME_PROOF_V1' -and
+        $proofContent -match 'proven_kernel_mask=63' -and
+        $proofContent -match 'producer=installed-runtime-runner-v1' -and
+        $proofContent -match 'validation_mode=scoped-net3-loopback-release-proof' -and
+        $proofContent -match 'build_compatibility_crc=287454020' -and
+        $proofContent.Contains($artifactTestHashes['generals-executable']) -and
         $proofContent.Contains($sourceCommit) -and
         $proofContent.Contains((Get-Sha256 $net3Manifest))) `
-        'release-proof header binds schema, source, manifest digest, and the validated kernel mask'
+        'external proof binds unchanged executable, build, content, schema, runner, and raw evidence'
 
-    $missingNet3Path = Join-Path $acceptanceRoot 'net3-missing-match.json'
+    $misorderedProofDirectory = Join-Path $acceptanceRoot 'misordered-proof'
+    New-Item -ItemType Directory -Path $misorderedProofDirectory | Out-Null
+    Copy-Item -Path (Join-Path $proofDirectory '*') -Destination $misorderedProofDirectory `
+        -Recurse
+    Remove-Item -LiteralPath (Join-Path $misorderedProofDirectory `
+        'MultiplayerSimulationRuntimeProof.txt')
+    $misorderedRawIndex = Join-Path $misorderedProofDirectory `
+        'MultiplayerSimulationRawEvidence.index'
+    $misorderedLines = @(Get-Content -LiteralPath $misorderedRawIndex)
+    $firstEntry = $misorderedLines[1]
+    $secondEntry = $misorderedLines[2]
+    $misorderedLines[1] = '00' + $secondEntry.Substring(2)
+    $misorderedLines[2] = '01' + $firstEntry.Substring(2)
+    [IO.File]::WriteAllText($misorderedRawIndex,
+        (($misorderedLines -join "`n") + "`n"))
+    $misorderedProofFile = Join-Path $misorderedProofDirectory `
+        'MultiplayerSimulationRuntimeProof.txt'
+    Assert-Throws {
+        & (Join-Path $PSScriptRoot 'New-MultiplayerSimulationReleaseProof.ps1') `
+            -EvidenceManifestPath (Join-Path $misorderedProofDirectory `
+                'Net3LoopbackEvidence.json') -RawEvidenceIndexPath $misorderedRawIndex `
+            -ArtifactSetManifestPath (Join-Path $misorderedProofDirectory `
+                'Stage5ArtifactSet.json') -OutputPath $misorderedProofFile `
+            -ExpectedSourceCommit $sourceCommit -ExpectedArtifactSetSha256 $artifactSetHash `
+            -ExpectedGeneralsExecutableSha256 $artifactTestHashes['generals-executable'] `
+            -ExpectedZeroHourExecutableSha256 $artifactTestHashes['zerohour-executable'] `
+            -Title Generals -ExpectedBuildCompatibilityCrc 287454020 `
+            -ExpectedContentCrc 2864434397 | Out-Null
+    } 'does not match the canonical evidence peer order' `
+        'external proof rejects a valid raw record set reordered away from canonical peer provenance'
+    Assert-True (-not (Test-Path -LiteralPath $misorderedProofFile)) `
+        'misordered raw evidence leaves the external proof absent'
+
+    $net3FixtureRoot = Split-Path -Parent $net3Manifest
+    $missingNet3Path = Join-Path $net3FixtureRoot 'net3-missing-match.json'
     $missingNet3 = Get-Content -LiteralPath $net3Manifest -Raw | ConvertFrom-Json
     $missingNet3.matches = @($missingNet3.matches | Select-Object -First 15)
     Write-JsonDocument $missingNet3Path $missingNet3
@@ -2596,7 +4177,7 @@ try {
             $artifactTestHashes['zerohour-executable'] | Out-Null
     } 'exactly 16 match records' 'NET3 evidence rejects a missing match record'
 
-    $duplicateNet3Path = Join-Path $acceptanceRoot 'net3-duplicate-match.json'
+    $duplicateNet3Path = Join-Path $net3FixtureRoot 'net3-duplicate-match.json'
     $duplicateNet3 = Get-Content -LiteralPath $net3Manifest -Raw | ConvertFrom-Json
     $duplicateNet3.matches[15] = $duplicateNet3.matches[0]
     Write-JsonDocument $duplicateNet3Path $duplicateNet3
@@ -2606,7 +4187,7 @@ try {
             $artifactTestHashes['zerohour-executable'] | Out-Null
     } 'not canonical' 'NET3 evidence rejects a duplicate match disguised as the final record'
 
-    $missingPeerPath = Join-Path $acceptanceRoot 'net3-missing-peer.json'
+    $missingPeerPath = Join-Path $net3FixtureRoot 'net3-missing-peer.json'
     $missingPeer = Get-Content -LiteralPath $net3Manifest -Raw | ConvertFrom-Json
     $missingPeer.matches[0].peers = @($missingPeer.matches[0].peers | Select-Object -First 1)
     Write-JsonDocument $missingPeerPath $missingPeer
@@ -2616,7 +4197,7 @@ try {
             $artifactTestHashes['zerohour-executable'] | Out-Null
     } 'exact topology peer roster' 'NET3 evidence rejects a missing nested peer record'
 
-    $wrongProvenancePath = Join-Path $acceptanceRoot 'net3-wrong-provenance.json'
+    $wrongProvenancePath = Join-Path $net3FixtureRoot 'net3-wrong-provenance.json'
     $wrongProvenance = Get-Content -LiteralPath $net3Manifest -Raw | ConvertFrom-Json
     $wrongProvenance.sourceCommit = 'b' * 40
     Write-JsonDocument $wrongProvenancePath $wrongProvenance
@@ -2627,7 +4208,7 @@ try {
     } 'source commit does not match independent provenance' `
         'NET3 evidence rejects self-consistent but independently wrong provenance'
 
-    $tamperedKernelPath = Join-Path $acceptanceRoot 'net3-tampered-kernel.json'
+    $tamperedKernelPath = Join-Path $net3FixtureRoot 'net3-tampered-kernel.json'
     $tamperedKernel = Get-Content -LiteralPath $net3Manifest -Raw | ConvertFrom-Json
     $tamperedKernel.matches[0].peers[1].kernels[0].physicalWorkerJobs = 0
     Write-JsonDocument $tamperedKernelPath $tamperedKernel
@@ -2635,19 +4216,52 @@ try {
         Read-Stage5Net3LoopbackEvidence $tamperedKernelPath $sourceCommit $artifactSetHash `
             $artifactTestHashes['generals-executable'] `
             $artifactTestHashes['zerohour-executable'] | Out-Null
-    } 'does not prove positive work' 'NET3 evidence rejects tampered physical-worker proof'
-    $invalidProofHeader = Join-Path (Join-Path $acceptanceRoot 'invalid-proof') `
-        'MultiplayerSimulationReleaseProof.generated.h'
+    } 'raw counters do not match' 'NET3 evidence rejects tampered physical-worker proof'
+	$incompleteStatusPath = Join-Path $net3FixtureRoot 'net3-incomplete-status-mask.json'
+	$incompleteStatus = Get-Content -LiteralPath $net3Manifest -Raw | ConvertFrom-Json
+	$incompletePeer = $incompleteStatus.matches[0].peers[1]
+	$incompletePeer.kernels[1].physicalWorkerMaskComplete = $false
+	$sourceStatusRawPath = Join-Path $net3FixtureRoot $incompletePeer.rawOutputPath
+	$incompleteStatusRaw = Get-Content -LiteralPath $sourceStatusRawPath -Raw | ConvertFrom-Json
+	$incompleteStatusRaw.kernels[1].physicalWorkerMaskComplete = $false
+	$incompleteStatusRawRelative = 'Net3Raw\net3-incomplete-status-mask.log'
+	$incompleteStatusRawPath = Join-Path $net3FixtureRoot $incompleteStatusRawRelative
+	Write-JsonDocument $incompleteStatusRawPath $incompleteStatusRaw
+	$incompletePeer.rawOutputPath = $incompleteStatusRawRelative
+	$incompletePeer.rawOutputSha256 = Get-Sha256 $incompleteStatusRawPath
+	Write-JsonDocument $incompleteStatusPath $incompleteStatus
+	$incompleteMaskEvidence = Read-Stage5Net3LoopbackEvidence $incompleteStatusPath `
+		$sourceCommit $artifactSetHash $artifactTestHashes['generals-executable'] `
+		$artifactTestHashes['zerohour-executable']
+	Assert-True ($incompleteMaskEvidence.provenKernelMask -eq 0x3F) `
+		'NET3 evidence accepts exact high-core distinct counts when the 64-bit identity mask is explicitly incomplete'
+    $invalidProofDirectory = Join-Path $acceptanceRoot 'invalid-proof'
+    New-Item -ItemType Directory -Path $invalidProofDirectory | Out-Null
+    Copy-Item -Path (Join-Path $proofDirectory '*') -Destination $invalidProofDirectory `
+        -Recurse
+    Remove-Item -LiteralPath (Join-Path $invalidProofDirectory `
+        'MultiplayerSimulationRuntimeProof.txt')
+    Copy-Item -LiteralPath $tamperedKernelPath -Destination (Join-Path `
+        $invalidProofDirectory 'Net3LoopbackEvidence.json') -Force
+    $invalidProofFile = Join-Path $invalidProofDirectory `
+        'MultiplayerSimulationRuntimeProof.txt'
+    $invalidRawIndex = Join-Path $invalidProofDirectory `
+        'MultiplayerSimulationRawEvidence.index'
+    $invalidArtifactSet = Join-Path $invalidProofDirectory 'Stage5ArtifactSet.json'
     Assert-Throws {
         & (Join-Path $PSScriptRoot 'New-MultiplayerSimulationReleaseProof.ps1') `
-            -EvidenceManifestPath $tamperedKernelPath -OutputPath $invalidProofHeader `
+            -EvidenceManifestPath (Join-Path $invalidProofDirectory `
+                'Net3LoopbackEvidence.json') -RawEvidenceIndexPath $invalidRawIndex `
+            -ArtifactSetManifestPath $invalidArtifactSet -OutputPath $invalidProofFile `
             -ExpectedSourceCommit $sourceCommit -ExpectedArtifactSetSha256 $artifactSetHash `
             -ExpectedGeneralsExecutableSha256 $artifactTestHashes['generals-executable'] `
-            -ExpectedZeroHourExecutableSha256 $artifactTestHashes['zerohour-executable'] | Out-Null
-    } 'does not prove positive work' `
+            -ExpectedZeroHourExecutableSha256 $artifactTestHashes['zerohour-executable'] `
+            -Title Generals -ExpectedBuildCompatibilityCrc 287454020 `
+            -ExpectedContentCrc 2864434397 | Out-Null
+    } 'raw counters do not match' `
         'invalid evidence cannot generate a nonzero multiplayer release proof'
-    Assert-True (-not (Test-Path -LiteralPath $invalidProofHeader)) `
-        'invalid evidence leaves the release-proof header absent so the runtime mask remains zero'
+    Assert-True (-not (Test-Path -LiteralPath $invalidProofFile)) `
+        'invalid evidence leaves the external proof absent so the runtime mask remains zero'
 
     $scalingManifest = Join-Path $attachmentRoot 'performance-scaling-performance-report.json'
     $scalingBaselineHash = Get-Sha256 (Join-Path $attachmentRoot `
@@ -2658,7 +4272,18 @@ try {
         $scalingProof.fixtureCount -eq 4 -and $scalingProof.kernelCount -eq 6) `
         'canonical scaling evidence proves physical topology, realistic fixtures, and six kernels'
 
-    $missingScalingPath = Join-Path $acceptanceRoot 'scaling-missing-fixture.json'
+    $generalsScalingPath = Join-Path $attachmentRoot 'scaling-generals.json'
+    Write-PerformanceScalingTestManifest $generalsScalingPath $sourceCommit `
+        $artifactSetHash $artifactTestHashes['generals-executable'] `
+        $scalingBaselineHash -Title Generals
+    $generalsScalingProof = Read-Stage5PerformanceScalingEvidence $generalsScalingPath $sourceCommit `
+        $artifactSetHash $artifactTestHashes['generals-executable'] $scalingBaselineHash `
+        -ExpectedTitle Generals
+    Assert-True ($generalsScalingProof.physicalCoreCount -eq 16 -and
+        $generalsScalingProof.fixtureCount -eq 4 -and $generalsScalingProof.kernelCount -eq 6) `
+        'Generals scaling evidence binds its title-specific executable provenance'
+
+    $missingScalingPath = Join-Path $attachmentRoot 'scaling-missing-fixture.json'
     $missingScaling = Get-Content -LiteralPath $scalingManifest -Raw | ConvertFrom-Json
     $missingScaling.fixtures = @($missingScaling.fixtures | Select-Object -First 3)
     Write-JsonDocument $missingScalingPath $missingScaling
@@ -2669,7 +4294,7 @@ try {
     } 'exact 1k, 4k, 8k, and dense eight-player fixtures' `
         'scaling evidence rejects a missing realistic fixture'
 
-    $tamperedScalingPath = Join-Path $acceptanceRoot 'scaling-tampered-kernel.json'
+    $tamperedScalingPath = Join-Path $attachmentRoot 'scaling-tampered-kernel.json'
     $tamperedScaling = Get-Content -LiteralPath $scalingManifest -Raw | ConvertFrom-Json
     $tamperedScaling.kernelTimings[0].totalParallelMilliseconds = 5.0
     Write-JsonDocument $tamperedScalingPath $tamperedScaling
@@ -2677,10 +4302,41 @@ try {
         Read-Stage5PerformanceScalingEvidence $tamperedScalingPath $sourceCommit `
             $artifactSetHash $artifactTestHashes['zerohour-executable'] `
             $scalingBaselineHash | Out-Null
-    } 'does not prove positive net speedup' `
+    } 'does not match raw installed runs' `
         'scaling evidence rejects tampered aggregate kernel timing'
 
-    $logicalOnlyScalingPath = Join-Path $acceptanceRoot 'scaling-logical-only.json'
+    $forgedScalingPath = Join-Path $attachmentRoot 'scaling-forged-summary.json'
+    $forgedScaling = Get-Content -LiteralPath $scalingManifest -Raw | ConvertFrom-Json
+    $forgedScaling.fixtures[0].stage5OneWorkerMilliseconds = 1010.0
+    $forgedScaling.fixtures[0].oneWorkerRegressionRatio = 1.01
+    $forgedScaling.fixtures[0].eightPhysicalCoreSpeedup = 2.02
+    Write-JsonDocument $forgedScalingPath $forgedScaling
+    Assert-Throws {
+        Read-Stage5PerformanceScalingEvidence $forgedScalingPath $sourceCommit `
+            $artifactSetHash $artifactTestHashes['zerohour-executable'] `
+            $scalingBaselineHash | Out-Null
+    } 'does not match raw per-repeat medians' `
+        'internally consistent forged summary cannot replace installed raw samples'
+
+    $forgedCommandPath = Join-Path $attachmentRoot 'scaling-forged-command.json'
+    $forgedCommand = Get-Content -LiteralPath $scalingManifest -Raw | ConvertFrom-Json
+    $canonicalRawPath = Join-Path $attachmentRoot $forgedCommand.rawSampleManifest.path
+    $forgedRawLeaf = 'scaling-forged-command.raw-samples.json'
+    $forgedRawPath = Join-Path $attachmentRoot $forgedRawLeaf
+    $forgedRaw = Get-Content -LiteralPath $canonicalRawPath -Raw | ConvertFrom-Json
+    $forgedRaw.fixtureSamples[0].commandLine += ' -repeat 0'
+    Write-JsonDocument $forgedRawPath $forgedRaw
+    $forgedCommand.rawSampleManifest.path = $forgedRawLeaf
+    $forgedCommand.rawSampleManifest.sha256 = Get-Sha256 $forgedRawPath
+    Write-JsonDocument $forgedCommandPath $forgedCommand
+    Assert-Throws {
+        Read-Stage5PerformanceScalingEvidence $forgedCommandPath $sourceCommit `
+            $artifactSetHash $artifactTestHashes['zerohour-executable'] `
+            $scalingBaselineHash | Out-Null
+    } 'not an exact installed per-process timing receipt' `
+        'raw scaling samples reject a forged unsupported executable command'
+
+    $logicalOnlyScalingPath = Join-Path $attachmentRoot 'scaling-logical-only.json'
     $logicalOnlyScaling = Get-Content -LiteralPath $scalingManifest -Raw | ConvertFrom-Json
     $logicalOnlyScaling.selectedLanes[1].selectedDistinctPhysicalCores = 4
     Write-JsonDocument $logicalOnlyScalingPath $logicalOnlyScaling
@@ -2691,7 +4347,7 @@ try {
     } 'exact selected logical and distinct physical-core count' `
         'scaling evidence rejects eight logical workers backed by only four physical cores'
 
-    $tamperedAmdahlPath = Join-Path $acceptanceRoot 'scaling-tampered-amdahl.json'
+    $tamperedAmdahlPath = Join-Path $attachmentRoot 'scaling-tampered-amdahl.json'
     $tamperedAmdahl = Get-Content -LiteralPath $scalingManifest -Raw | ConvertFrom-Json
     $tamperedAmdahl.amdahl.serialFraction = 0.1
     Write-JsonDocument $tamperedAmdahlPath $tamperedAmdahl

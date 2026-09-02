@@ -10,7 +10,20 @@
 
 #pragma once
 
+struct DirectPathRuntimeMetrics;
+struct OrdinaryPathRuntimeMetrics;
+#if defined(_WIN64)
+namespace rts
+{
+struct CollisionCandidateRuntimeMetrics;
+struct ImmutableSpatialRuntimeMetrics;
+struct ObjectStatusTimerRuntimeMetrics;
+struct PhysicsIntegrationRuntimeMetrics;
+}
+#endif
+
 #include "GameNetwork/GameInfo.h"
+#include "Common/SkirmishAITestReceipt.h"
 
 enum
 {
@@ -24,7 +37,12 @@ enum
 enum SkirmishAITestScenario
 {
 	SKIRMISH_AI_TEST_SCENARIO_4V3,
-	SKIRMISH_AI_TEST_SCENARIO_4V2
+	SKIRMISH_AI_TEST_SCENARIO_4V2,
+	// This is a practical/manual lane.  It is intentionally distinct from
+	// the observer-backed automated lanes and is not a replay gate scenario.
+	SKIRMISH_AI_TEST_SCENARIO_PRACTICAL_1V7,
+	SKIRMISH_AI_TEST_SCENARIO_ONE_CONTROLLER_7_AI =
+		SKIRMISH_AI_TEST_SCENARIO_PRACTICAL_1V7
 };
 
 enum SkirmishAITestProgress
@@ -41,6 +59,7 @@ struct SkirmishAITestSlotPlan
 	Int color;
 	Int startPosition;
 	Int teamNumber;
+	Bool isController;
 };
 
 struct SkirmishAITestPlan
@@ -74,7 +93,54 @@ Bool IsValidSkirmishAITestReplayResult(UnsignedInt expectedFrameCount,
 SkirmishAITestProgress EvaluateSkirmishAITestProgress(UnsignedInt endFrame, UnsignedInt currentFrame);
 Bool IsSkirmishAITestStartupTimedOut(UnsignedInt elapsedMilliseconds);
 Bool IsSkirmishAITestProgressStalled(UnsignedInt elapsedMilliseconds);
+
+// Pure lifecycle accumulator used by the installed runner and focused tests.
+// It freezes nonzero path authority before a later game-data reset epoch.
+void AccumulateSkirmishAITestDirectPathMetrics(
+	DirectPathRuntimeMetrics *baseline,
+	const DirectPathRuntimeMetrics &current,
+	DirectPathRuntimeMetrics *frozen,
+	Bool *hasFrozenActivity,
+	Bool *awaitingInitialReset);
+void AccumulateSkirmishAITestOrdinaryPathMetrics(
+	OrdinaryPathRuntimeMetrics *baseline,
+	const OrdinaryPathRuntimeMetrics &current,
+	OrdinaryPathRuntimeMetrics *frozen,
+	Bool *awaitingInitialReset);
+#if defined(_WIN64)
+// Pure reset-epoch accumulators shared by installed lifecycle code and paired
+// title fixtures. The first observed reset rebases shell state; a later reset
+// is teardown and cannot erase the frozen match/replay evidence.
+void AccumulateSkirmishAITestCollisionMetrics(
+	rts::CollisionCandidateRuntimeMetrics *baseline,
+	const rts::CollisionCandidateRuntimeMetrics &current,
+	rts::CollisionCandidateRuntimeMetrics *frozen,
+	Bool *awaitingInitialReset);
+void AccumulateSkirmishAITestPhysicsMetrics(
+	rts::PhysicsIntegrationRuntimeMetrics *baseline,
+	const rts::PhysicsIntegrationRuntimeMetrics &current,
+	rts::PhysicsIntegrationRuntimeMetrics *frozen,
+	Bool *awaitingInitialReset);
+void AccumulateSkirmishAITestObjectStatusTimerMetrics(
+	rts::ObjectStatusTimerRuntimeMetrics *baseline,
+	const rts::ObjectStatusTimerRuntimeMetrics &current,
+	rts::ObjectStatusTimerRuntimeMetrics *frozen,
+	Bool *awaitingInitialReset);
+void AccumulateSkirmishAITestImmutableSpatialMetrics(
+	rts::ImmutableSpatialRuntimeMetrics *baseline,
+	const rts::ImmutableSpatialRuntimeMetrics &current,
+	rts::ImmutableSpatialRuntimeMetrics *frozen,
+	Bool *awaitingInitialReset);
+#endif
 Bool IsSkirmishAITestShutdownTimedOut(UnsignedInt elapsedMilliseconds);
+
+Bool IsSkirmishAITestPracticalControllerScenario(SkirmishAITestScenario scenario);
+Bool IsValidSkirmishAITestPracticalControllerPlan(
+	const SkirmishAITestPlan &plan);
+
+Bool SetSkirmishAITestExecutableHashInput(const char *sha256);
+Bool SetSkirmishAITestSimulationModeInput(const char *mode);
+void SetSkirmishAITestFinalDigest(UnsignedInt digest);
 
 void ArmSkirmishAITestRunner(Int seed,
 	SkirmishAITestScenario scenario = SKIRMISH_AI_TEST_SCENARIO_4V3);

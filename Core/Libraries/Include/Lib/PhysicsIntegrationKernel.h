@@ -135,6 +135,7 @@ struct PhysicsIntegrationMetrics
 	unsigned ownerHelpedJobs;
 	PhysicsIntegrationMetricCounter physicalWorkerMask;
 	unsigned distinctPhysicalWorkers;
+	bool physicalWorkerMaskComplete;
 	unsigned peakConcurrentPhysicalWorkers;
 	unsigned serialFallbacks;
 	unsigned allocatedBytes;
@@ -160,6 +161,7 @@ struct PhysicsIntegrationRuntimeMetrics
 	PhysicsIntegrationMetricCounter acceptedOwnerHelpedJobs;
 	PhysicsIntegrationMetricCounter acceptedPhysicalWorkerMask;
 	unsigned maximumAcceptedDistinctPhysicalWorkers;
+	bool acceptedPhysicalWorkerMaskComplete;
 	unsigned maximumAcceptedPeakConcurrentPhysicalWorkers;
 	PhysicsIntegrationMetricCounter acceptedAllocatedBytes;
 	PhysicsIntegrationMetricCounter acceptedCaptureNanoseconds;

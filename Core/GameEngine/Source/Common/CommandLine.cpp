@@ -31,6 +31,10 @@
 #include "Common/LocalFileSystem.h"
 #include "Common/Recorder.h"
 #include "Common/SkirmishAITestRunner.h"
+#include "GameNetwork/InstalledNet3Validation.h"
+#if defined(_WIN64)
+#include "GameNetwork/InstalledLockstepV2Validation.h"
+#endif
 #include "Common/version.h"
 #include "GameClient/ClientInstance.h"
 #include "GameClient/TerrainVisual.h" // for TERRAIN_LOD_MIN definition
@@ -38,6 +42,7 @@
 #include "GameNetwork/NetworkDefs.h"
 #include "Lib/JobSystem.h"
 #include "Lib/PipelineExecutionPolicy.h"
+#include "Lib/SimulationExecutionPolicy.h"
 #include "Renderer/RendererDevice.h"
 #include "WWLib/trim.h"
 
@@ -138,6 +143,12 @@ Int parseRenderer(char *args[], int argc)
 		rts::render::RenderBackend backend = rts::render::RENDER_BACKEND_DX8;
 		if (rts::render::ParseRenderBackend(args[1], &backend))
 		{
+			if (!rts::render::IsRenderBackendSupported(backend))
+			{
+				printf("Renderer '%s' is unavailable in this build; native x64 requires d3d11.\n",
+					args[1]);
+				exit(1);
+			}
 			rts::render::SetRequestedRenderBackend(backend);
 		}
 		else
@@ -458,6 +469,52 @@ Int parseHeadless(char *args[], int num)
 	return 1;
 }
 
+Int parseInstalledNet3Validation(char *args[], int num)
+{
+#if defined(_WIN64)
+	if (num < 2 || args == nullptr || args[1] == nullptr ||
+		!rts::ConfigureInstalledNet3Validation(args[1]))
+	{
+		printf("NET3_VALIDATION_PEER_FAIL reason=invalid_configuration\n");
+		fflush(stdout);
+		exit(2);
+	}
+	parseHeadless(args, num);
+	TheWritableGlobalData->m_shellMapOn = FALSE;
+	TheWritableGlobalData->m_useFpsLimit = FALSE;
+	rts::ClientInstance::setMultiInstance(TRUE);
+	rts::ClientInstance::skipPrimaryInstance();
+	return 2;
+#else
+	printf("NET3_VALIDATION_PEER_FAIL reason=native_x64_required\n");
+	fflush(stdout);
+	exit(2);
+#endif
+}
+
+Int parseInstalledLockstepV2Validation(char *args[], int num)
+{
+#if defined(_WIN64)
+	if (num < 2 || args == nullptr || args[1] == nullptr ||
+		!rts::ConfigureInstalledLockstepV2Qualification(args[1]))
+	{
+		printf("LOCKSTEP_V2_VALIDATION_FAIL reason=invalid_configuration\n");
+		fflush(stdout);
+		exit(2);
+	}
+	parseHeadless(args, num);
+	TheWritableGlobalData->m_shellMapOn = FALSE;
+	TheWritableGlobalData->m_useFpsLimit = FALSE;
+	rts::ClientInstance::setMultiInstance(TRUE);
+	rts::ClientInstance::skipPrimaryInstance();
+	return 2;
+#else
+	printf("LOCKSTEP_V2_VALIDATION_FAIL reason=native_x64_required\n");
+	fflush(stdout);
+	exit(2);
+#endif
+}
+
 Bool parseSkirmishAITestSeedArgument(char *args[], int num, Int *seed)
 {
 	if (num < 2 || !TryParseSkirmishAITestSeed(args[1], seed))
@@ -498,7 +555,8 @@ Int parseRunSkirmishAITest4v2ForStartup(char *args[], int num)
 Int parseRunSkirmishAITest(char *args[], int num)
 {
 	if (TheGlobalData->m_commandLineData.hasSkirmishAITestRequest() ||
-		TheGlobalData->m_commandLineData.hasSkirmishAITest4v2Request())
+		TheGlobalData->m_commandLineData.hasSkirmishAITest4v2Request() ||
+		TheGlobalData->m_commandLineData.hasSkirmishAITestPractical1v7Request())
 	{
 		printf("SKIRMISH_AI_TEST_FAIL seed=0 reason=duplicate_option\n");
 		fflush(stdout);
@@ -519,7 +577,8 @@ Int parseRunSkirmishAITest(char *args[], int num)
 Int parseRunSkirmishAITest4v2(char *args[], int num)
 {
 	if (TheGlobalData->m_commandLineData.hasSkirmishAITestRequest() ||
-		TheGlobalData->m_commandLineData.hasSkirmishAITest4v2Request())
+		TheGlobalData->m_commandLineData.hasSkirmishAITest4v2Request() ||
+		TheGlobalData->m_commandLineData.hasSkirmishAITestPractical1v7Request())
 	{
 		printf("SKIRMISH_AI_TEST_FAIL seed=0 reason=duplicate_option\n");
 		fflush(stdout);
@@ -621,6 +680,100 @@ Int parsePipelineMode(char *args[], int num)
 	if (!rts::SetPipelineExecutionMode(args[1]))
 	{
 		printf("Invalid or locked pipeline mode: %s (expected parallel or serial at startup)\n", args[1]);
+		exit(1);
+	}
+	return 2;
+}
+
+Int parseRunSkirmishAITestPractical1v7(char *args[], int num)
+{
+	if (TheGlobalData->m_commandLineData.hasSkirmishAITestRequest() ||
+		TheGlobalData->m_commandLineData.hasSkirmishAITest4v2Request() ||
+		TheGlobalData->m_commandLineData.hasSkirmishAITestPractical1v7Request())
+	{
+		printf("SKIRMISH_AI_TEST_FAIL seed=0 reason=duplicate_option\n");
+		fflush(stdout);
+		exit(2);
+	}
+
+	Int seed = 0;
+	parseSkirmishAITestSeedArgument(args, num, &seed);
+	if (!TheWritableGlobalData->m_commandLineData.
+		requestSkirmishAITestPractical1v7(seed))
+	{
+		printf("SKIRMISH_AI_TEST_FAIL seed=0 reason=duplicate_option\n");
+		fflush(stdout);
+		exit(2);
+	}
+	return 2;
+}
+
+Int parseRunSkirmishAITestPractical1v7ForStartup(char *args[], int num)
+{
+	Int seed = 0;
+	parseSkirmishAITestSeedArgument(args, num, &seed);
+
+	// This is the operator-controlled practical lane. Keep rendering and input
+	// active while bypassing the shell and intro sequence.
+	TheWritableGlobalData->m_shellMapOn = FALSE;
+	TheWritableGlobalData->m_playIntro = FALSE;
+	TheWritableGlobalData->m_playSizzle = FALSE;
+	return 2;
+}
+
+Int parseSimulationMode(char *args[], int num)
+{
+	if (num <= 1 || args == 0 || args[1] == 0)
+	{
+		printf("Missing simulation mode (expected serial, parallel, or shadow)\n");
+		exit(1);
+	}
+	if (!rts::SetSimulationExecutionMode(args[1]))
+	{
+		printf("Invalid simulation mode: %s (expected serial, parallel, or shadow)\n",
+			args[1]);
+		exit(1);
+	}
+	const char *canonicalMode = "serial";
+	if (rts::GetSimulationExecutionMode() == rts::SIMULATION_EXECUTION_PARALLEL)
+		canonicalMode = "parallel";
+	else if (rts::GetSimulationExecutionMode() == rts::SIMULATION_EXECUTION_SHADOW)
+		canonicalMode = "shadow";
+	if (!SetSkirmishAITestSimulationModeInput(canonicalMode))
+	{
+		printf("Unable to record simulation mode: %s\n", canonicalMode);
+		exit(1);
+	}
+	return 2;
+}
+
+Int parseValidationExecutableSha256(char *args[], int num)
+{
+	if (num <= 1 || args == 0 || args[1] == 0)
+	{
+		printf("Missing validation executable SHA-256 (expected 64 hex digits)\n");
+		exit(1);
+	}
+	const char *value = args[1];
+	// Check the complete token length before indexing the fixed-width digest.
+	// The command-line tokenizer guarantees a NUL-terminated argument, but a
+	// malformed short token must not make the validation loop read past it.
+	if (strlen(value) != 64)
+	{
+		printf("Invalid validation executable SHA-256: expected exactly 64 hex digits\n");
+		exit(1);
+	}
+	unsigned index = 0;
+	for (; index != 64; ++index)
+	{
+		const char c = value[index];
+		const bool hex = (c >= '0' && c <= '9') ||
+			(c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+		if (!hex) break;
+	}
+	if (index != 64 || !SetSkirmishAITestExecutableHashInput(value))
+	{
+		printf("Invalid validation executable SHA-256: expected exactly 64 hex digits\n");
 		exit(1);
 	}
 	return 2;
@@ -1309,6 +1462,8 @@ static CommandLineParam paramsForStartup[] =
 	{ "-runSkirmishAITest", parseRunSkirmishAITestForStartup },
 	// Explicit test-only 4v2 variant; the existing option remains 4v3.
 	{ "-runSkirmishAITest4v2", parseRunSkirmishAITest4v2ForStartup },
+	{ "-runSkirmishAITestPractical1v7",
+		parseRunSkirmishAITestPractical1v7ForStartup },
 
 	// TheSuperHackers @feature helmutbuhler 13/04/2025
 	// Play back a replay. Pass the filename including .rep afterwards.
@@ -1327,6 +1482,10 @@ static CommandLineParam paramsForStartup[] =
 	{ "-workerCount", parseWorkerCount },
 	{ "-workerPolicy", parseWorkerPolicy },
 	{ "-pipelineMode", parsePipelineMode },
+	{ "-simulationMode", parseSimulationMode },
+	{ "-validationExecutableSha256", parseValidationExecutableSha256 },
+	{ "-installedNet3Validation", parseInstalledNet3Validation },
+	{ "-installedLockstepV2Validation", parseInstalledLockstepV2Validation },
 };
 
 // These Params are parsed during Engine Init before INI data is loaded
@@ -1334,6 +1493,8 @@ static CommandLineParam paramsForEngineInit[] =
 {
 	{ "-runSkirmishAITest", parseRunSkirmishAITest },
 	{ "-runSkirmishAITest4v2", parseRunSkirmishAITest4v2 },
+	{ "-runSkirmishAITestPractical1v7",
+		parseRunSkirmishAITestPractical1v7 },
 	{ "-nologo", parseNoLogo }, // TheSuperHackers @tweak Is now available in Release builds.
 	{ "-noshellmap", parseNoShellMap },
 	{ "-noShellAnim", parseNoWindowAnimation }, // TheSuperHackers @tweak Is now available in Release builds.

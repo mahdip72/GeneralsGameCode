@@ -1323,6 +1323,7 @@ struct JobSystem::State
 	std::condition_variable capacityAvailable;
 	std::deque<std::shared_ptr<JobRecord> > injectionQueues[JOB_PRIORITY_COUNT];
 	std::vector<std::unique_ptr<Worker> > workers;
+	std::vector<JobCpuSetInfo> cpuSets;
 	std::vector<unsigned> selectedCpuSetIds;
 	unsigned ownerCpuSetIds[2];
 	OwnerThread ownerThreads[JOB_OWNER_COUNT];
@@ -2037,6 +2038,7 @@ bool JobSystem::startInternal(const JobSystemConfig &config, bool allowRestart)
 		m_state->configuredWorkerCount = effectiveWorkerCount;
 		m_state->completionCapacity = config.queueCapacity;
 		m_state->ownerThread = std::this_thread::get_id();
+		m_state->cpuSets.swap(cpuSets);
 		m_state->selectedCpuSetIds.swap(selectedCpuSetIds);
 		m_state->pinWorkers = config.pinWorkers &&
 			!m_state->selectedCpuSetIds.empty();
@@ -2119,6 +2121,7 @@ bool JobSystem::startInternal(const JobSystemConfig &config, bool allowRestart)
 			m_state->stopping = false;
 			m_state->configuredWorkerCount = 0;
 			m_state->completionCapacity = 0;
+			m_state->cpuSets.clear();
 			m_state->selectedCpuSetIds.clear();
 			m_state->pinWorkers = false;
 			m_state->reservedOwnerCpuCount = 0;
@@ -2319,6 +2322,63 @@ unsigned JobSystem::outstandingJobCount() const
 	}
 	std::lock_guard<std::mutex> lock(m_state->mutex);
 	return m_state->outstanding;
+}
+
+unsigned JobSystem::cpuSetCount() const
+{
+	if (m_state == 0)
+		return 0;
+	std::lock_guard<std::mutex> lock(m_state->mutex);
+	return static_cast<unsigned>(m_state->cpuSets.size());
+}
+
+bool JobSystem::cpuSetAt(unsigned index, JobCpuSetInfo &result) const
+{
+	if (m_state == 0)
+		return false;
+	std::lock_guard<std::mutex> lock(m_state->mutex);
+	if (index >= m_state->cpuSets.size())
+		return false;
+	result = m_state->cpuSets[index];
+	return true;
+}
+
+unsigned JobSystem::selectedWorkerCpuSetCount() const
+{
+	if (m_state == 0)
+		return 0;
+	std::lock_guard<std::mutex> lock(m_state->mutex);
+	return static_cast<unsigned>(m_state->selectedCpuSetIds.size());
+}
+
+bool JobSystem::selectedWorkerCpuSetIdAt(unsigned index, unsigned &result) const
+{
+	if (m_state == 0)
+		return false;
+	std::lock_guard<std::mutex> lock(m_state->mutex);
+	if (index >= m_state->selectedCpuSetIds.size())
+		return false;
+	result = m_state->selectedCpuSetIds[index];
+	return true;
+}
+
+unsigned JobSystem::ownerCpuSetCount() const
+{
+	if (m_state == 0)
+		return 0;
+	std::lock_guard<std::mutex> lock(m_state->mutex);
+	return m_state->reservedOwnerCpuCount;
+}
+
+bool JobSystem::ownerCpuSetIdAt(unsigned index, unsigned &result) const
+{
+	if (m_state == 0)
+		return false;
+	std::lock_guard<std::mutex> lock(m_state->mutex);
+	if (index >= m_state->reservedOwnerCpuCount || index >= 2)
+		return false;
+	result = m_state->ownerCpuSetIds[index];
+	return true;
 }
 
 JobSystemMetrics JobSystem::metrics() const

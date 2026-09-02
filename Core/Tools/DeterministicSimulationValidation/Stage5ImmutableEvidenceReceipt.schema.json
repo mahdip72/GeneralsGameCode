@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://generalsgamecode.invalid/schemas/stage5-immutable-evidence-receipt.json",
+  "title": "GeneralsGameCode Stage 5 executable-originated evidence receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion", "evidenceKind", "status", "role", "producer",
+    "producerVersion", "runNonce", "sourceCommit", "title", "architecture",
+    "artifactSetSha256", "executableSha256", "recordedUtc", "rawLogs", "details"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "evidenceKind": { "const": "stage5-executable-originated-receipt" },
+    "status": { "const": "passed" },
+    "role": {
+      "enum": [
+        "validation-plan", "validation-results", "replay-results",
+        "replay-fixture-manifest", "ai-results", "combined-results",
+        "premium-review-results", "manual-checklist"
+      ]
+    },
+    "producer": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*-v2$" },
+    "producerVersion": { "const": "2" },
+    "runNonce": { "type": "string", "format": "uuid" },
+    "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "title": { "enum": ["Generals", "ZeroHour", "Both"] },
+    "architecture": { "const": "x64" },
+    "artifactSetSha256": { "$ref": "#/$defs/sha256" },
+    "executableSha256": {
+      "oneOf": [
+        { "$ref": "#/$defs/sha256" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["Generals", "ZeroHour"],
+          "properties": {
+            "Generals": { "$ref": "#/$defs/sha256" },
+            "ZeroHour": { "$ref": "#/$defs/sha256" }
+          }
+        }
+      ]
+    },
+    "recordedUtc": { "type": "string", "format": "date-time" },
+    "rawLogs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "path", "sha256"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "path": { "$ref": "#/$defs/relativePath" },
+          "sha256": { "$ref": "#/$defs/sha256" }
+        }
+      }
+    },
+    "details": { "type": "object" }
+  },
+  "$defs": {
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "not": { "pattern": "^(?:[A-Za-z]:|[\\\\/])" },
+      "pattern": "^(?!.*(?:^|[\\\\/])\\.\\.(?:[\\\\/]|$)).+$"
+    },
+    "sha256": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" }
+  }
+}

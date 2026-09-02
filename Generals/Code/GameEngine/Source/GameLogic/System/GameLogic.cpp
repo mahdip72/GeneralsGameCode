@@ -57,6 +57,9 @@
 #include "Common/Team.h"
 #include "Common/ThingTemplate.h"
 #include "GameClient/Water.h"
+#if defined(_WIN64)
+#include "GameNetwork/InstalledLockstepV2Validation.h"
+#endif
 #include "Common/WellKnownKeys.h"
 #include "Common/Xfer.h"
 #include "Common/XferCRC.h"
@@ -4564,6 +4567,15 @@ void GameLogic::runVerificationAndPublicationPhase()
 	{
 		m_frame++;
 		m_hasUpdated = TRUE;
+#if defined(_WIN64)
+		if (rts::IsInstalledLockstepV2ProofStarted())
+		{
+			const Bool recorded = rts::RecordInstalledLockstepV2Frame(
+				m_frame, getCRC(CRC_RECALC)) ? TRUE : FALSE;
+			if (!recorded || rts::IsInstalledLockstepV2StopRequested())
+				TheGameEngine->setQuitting(TRUE);
+		}
+#endif
 	}
 }
 

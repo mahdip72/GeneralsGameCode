@@ -306,7 +306,13 @@ bool DeterministicCrcLiveVerifier::growSnapshotStorage(
 		return false;
 	}
 
+#if defined(_MSC_VER) && _MSC_VER < 1300
+	// VC6's STLPort does not provide the array form of nothrow new. Its
+	// compiler runtime retains the legacy null-returning allocation contract.
+	newStorage = new unsigned char[newCapacity];
+#else
 	newStorage = new (std::nothrow) unsigned char[newCapacity];
+#endif
 	if (newStorage == 0)
 	{
 		m_allocationFailed = true;
@@ -403,8 +409,13 @@ DeterministicCrcLiveStatus DeterministicCrcLiveVerifier::verify(
 			m_allocationFailed = true;
 			break;
 		}
+#if defined(_MSC_VER) && _MSC_VER < 1300
+		storage.legacyStorage =
+			new DeterministicLegacyXferOperation[storage.legacyCapacity];
+#else
 		storage.legacyStorage = new (std::nothrow)
 			DeterministicLegacyXferOperation[storage.legacyCapacity];
+#endif
 		if (storage.legacyStorage == 0)
 		{
 			m_allocationFailed = true;
@@ -438,10 +449,11 @@ DeterministicCrcLiveStatus DeterministicCrcLiveVerifier::verify(
 		m_generation, DETERMINISTIC_CRC_CAPTURE_LEGACY, &control,
 		DETERMINISTIC_CRC_LEGACY_XFER, serialOracleChecksum, options,
 		&result->jobSystem);
-	for (size_t index = 0U;
-		index < DETERMINISTIC_CRC_LIVE_PARTITION_COUNT; ++index)
+	for (size_t resultIndex = 0U;
+		resultIndex < DETERMINISTIC_CRC_LIVE_PARTITION_COUNT; ++resultIndex)
 	{
-		if (partitionResults[index].status == DETERMINISTIC_CRC_CAPTURE_COMPLETE)
+		if (partitionResults[resultIndex].status ==
+			DETERMINISTIC_CRC_CAPTURE_COMPLETE)
 			++completedPartitionCount;
 	}
 

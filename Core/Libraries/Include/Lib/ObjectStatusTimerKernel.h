@@ -67,6 +67,7 @@ struct ObjectStatusTimerMetrics
 	unsigned ownerHelpedJobs;
 	ObjectStatusTimerMetricCounter physicalWorkerMask;
 	unsigned distinctPhysicalWorkers;
+	bool physicalWorkerMaskComplete;
 	unsigned peakConcurrentPhysicalWorkers;
 	unsigned serialFallbacks;
 };
@@ -83,6 +84,7 @@ struct ObjectStatusTimerRuntimeMetrics
 	ObjectStatusTimerMetricCounter ownerHelpedJobs;
 	ObjectStatusTimerMetricCounter physicalWorkerMask;
 	unsigned maximumDistinctPhysicalWorkers;
+	bool physicalWorkerMaskComplete;
 	unsigned maximumPeakConcurrentPhysicalWorkers;
 	ObjectStatusTimerMetricCounter shadowExecutions;
 	ObjectStatusTimerMetricCounter shadowCommands;

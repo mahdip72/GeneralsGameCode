@@ -27,6 +27,22 @@ static bool SetSkirmishAITestSimulationModeInput(const char *)
     return true;
 }
 
+static bool SetSkirmishAITestExecutableHashInput(const char *sha256)
+{
+    if (sha256 == nullptr || std::strlen(sha256) != 64) {
+        return false;
+    }
+    for (int index = 0; index < 64; ++index) {
+        const char value = sha256[index];
+        if (!((value >= '0' && value <= '9') ||
+              (value >= 'a' && value <= 'f') ||
+              (value >= 'A' && value <= 'F'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 #define exit RejectParserExit
 #include "LauncherGameStartupParsers.h"
 #undef exit
@@ -144,6 +160,51 @@ bool TestLauncherConfigArgumentContract(const char *generatedLcfPath)
 
     return ok;
 }
+
+bool TestValidationExecutableHashParserContract()
+{
+    bool ok = true;
+    char option[] = "-validationExecutableSha256";
+    char shortHash[] = "0123456789abcdef";
+    char malformedHash[] =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg";
+    char validHash[] =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    char *shortArguments[] = {option, shortHash};
+    bool shortRejected = false;
+    try {
+        parseValidationExecutableSha256(shortArguments, 2);
+    }
+    catch (const ParserExit &) {
+        shortRejected = true;
+    }
+    ok &= Expect(shortRejected,
+        "short validation executable hashes must fail before fixed-width indexing");
+
+    char *malformedArguments[] = {option, malformedHash};
+    bool malformedRejected = false;
+    try {
+        parseValidationExecutableSha256(malformedArguments, 2);
+    }
+    catch (const ParserExit &) {
+        malformedRejected = true;
+    }
+    ok &= Expect(malformedRejected,
+        "non-hex validation executable hashes must be rejected");
+
+    char *validArguments[] = {option, validHash};
+    bool validAccepted = false;
+    try {
+        validAccepted = parseValidationExecutableSha256(validArguments, 2) == 2;
+    }
+    catch (const ParserExit &) {
+        validAccepted = false;
+    }
+    ok &= Expect(validAccepted,
+        "exactly 64 hexadecimal validation executable hashes must be accepted");
+    return ok;
+}
 } // namespace
 
 int main(int argc, char *argv[])
@@ -158,6 +219,7 @@ int main(int argc, char *argv[])
         return 1;
     }
     ok &= TestLauncherConfigArgumentContract(argv[1]);
+    ok &= TestValidationExecutableHashParserContract();
 
     Process missing;
     std::strcpy(missing.command, "stage3_launcher_process_that_does_not_exist.exe");

@@ -2,6 +2,161 @@
 
 The GeneralsReplays folder contains replays and the required maps that are tested in CI to ensure that the game is retail compatible.
 
+## Modernization Stage 5 deterministic simulation
+
+The deterministic-runtime gate is documented separately in
+`docs/modernization-stage5-deterministic-simulation.md`. It covers the exact
+installed native runtime across serial-1, parallel-1/2/4/8/16, and automatic
+workers; two full replay passes with repeated 2-vs-6 stress; the exact repeated
+4-vs-3 and 4-vs-2 live-AI cross-product across at least three distinct seeds;
+one additional installed 16-worker 4-vs-2 `simulationMode=shadow` comparison
+with positive collision jobs, `collision_shadow_compared_candidates > 0` for
+successful legacy insertions covered by the exact collision order/orientation
+oracle, and positive matching physics
+shadow prefix/range/jobs; reset-aware per-replay collision/physics manifests;
+zero mismatch/unexpected-fallback telemetry; scheduler and consumer faults; and
+aggregate Stage 5 large-match throughput. It deliberately does not claim final
+Stage 5 acceptance. Qualifying live stress separately requires physical-worker
+path authority and physics-specific authoritative batches/prefixes/jobs; AI,
+collision, and global scheduler traffic cannot proxy either family. Synchronous
+direct-path watchdog timeouts and validation failures fail the
+deterministic-runtime gate; late worker drains remain diagnostic because they
+may occur after the completion manifest. The 2x
+replay threshold is aggregate Stage 5 throughput,
+not a collision-lane speedup claim; collision phases and qualifying live
+collision authority are reported and gated separately.
+Serial evidence must report every collision-lane work counter as zero. The
+forced parallel-1 lane may report its expected owner fallback, but cannot report
+collision preparation, jobs, authority, shadow comparison, stale publication,
+or unexpected fallback.
+
+Final acceptance is a separate fail-closed aggregation. It requires independently
+hashed deterministic-runtime, replay, fresh-AI, performance, mixed-worker
+multiplayer, combined Stage 4 plus Stage 5 installed-runtime, premium-review,
+and user manual evidence for the same commit and artifact-set manifest. The
+combined lane must use `pipelineMode=parallel`, `simulationMode=parallel`,
+automatic workers, D3D11, and the dedicated render thread for both titles; it
+does not replace the serial-pipeline isolation matrix. Run the aggregator only
+after the user's real final manual approval:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File Core/Tools/DeterministicSimulationValidation/Invoke-Stage5FinalAcceptance.ps1 `
+  -AcceptanceManifestPath <final-acceptance-request.json> `
+  -OutputPath <fresh-final-acceptance-report.json>
+```
+
+`FinalAcceptanceManifest.schema.json`, `FinalAcceptanceArtifactSet.schema.json`,
+and `FinalAcceptanceEvidence.schema.json` define the envelopes. The PowerShell
+aggregator additionally enforces exact kind-specific metrics, attachment roles,
+cross-manifest hashes, and combined-policy semantics. Missing manual evidence
+is expected to fail until the user has actually approved the candidate.
+
+The multiplayer attachment is not a free-form soak summary. It must match
+`Net3LoopbackEvidence.schema.json`: exactly 16 canonically ordered installed
+NET3 matches (both titles, four supported topologies, seeds 23063 and 49374)
+and exactly 40 nested peers (20 per title). Every multicore peer must prove all
+six diagnostic kernel bits with balanced physical-plus-owner execution,
+consistent physical-worker masks, and peak concurrent execution above one;
+forced-one peers must report zero scheduler work. These v1 bits are diagnostic
+only and do not authorize live multiplayer workers. Collision evidence is emitted
+by the actual parallel collision-candidate kernel over a qualifying batch and
+binds that kernel's own submitted, physical, owner-help, mask, and peak fields.
+The strict parser independently binds source commit,
+artifact-set hash, both executable hashes, NET3 readiness, exact roster and
+policy mask, equal peer CRC/frame, exit zero, and clean shutdown. Each peer
+also names a runner-produced raw output file whose SHA-256 and independently
+observed process executable/artifact hashes are verified. That evidence creates
+an external `MultiplayerSimulationRuntimeProof.txt` for diagnostics, but a
+mutable sibling file cannot grant authority to an ordinary build. Product
+builds embed no v1 kernel authority. The trusted cap is always zero. The
+executable hashes itself and rechecks title, source revision, build/content
+CRCs, epochs, schema, and mask; runtime evidence can only remain diagnostic.
+`RTS_BUILD_STAGE5_PROMOTED_MULTIPLAYER_AUTHORITY=ON` fails configuration until
+a separately reviewed lockstep-v2 authority contract exists.
+
+Create that evidence only from a fresh installed-runtime directory and the
+already-generated six-artifact manifest. The runner starts the exact two x64
+product executables in the explicit, hidden, local-only
+`-installedNet3Validation` process mode; ordinary game and matchmaking startup
+cannot enter this mode. It independently binds every live process ID to its
+on-disk executable and re-hashes the complete artifact set for every peer before
+allowing the peer to exchange fixed-width NET3 records. It then enforces the
+canonical 16-match/40-peer matrix. Every peer completes both directions of the
+NET3 Hello/Ack challenge using its own session token before it may publish a
+ready record. The first runner pass creates title-specific external proof
+bundles for the default-zero candidate without rebuilding either executable:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File Core/Tools/DeterministicSimulationValidation/Invoke-InstalledNet3LoopbackValidation.ps1 `
+  -GeneralsExecutable <installed-generals.exe> `
+  -ZeroHourExecutable <installed-generalszh.exe> `
+  -ArtifactSetManifestPath <Stage5ArtifactSet.json> `
+  -SourceCommit <exact-lowercase-40-hex-commit> `
+  -OutputDirectory <fresh-task-owned-evidence-directory>
+```
+
+Do not configure a promoted Stage 5 product build yet.
+`RTS_BUILD_STAGE5_PROMOTED_MULTIPLAYER_AUTHORITY=ON` is a reserved switch and
+CMake rejects it with a clear lockstep-v2 prerequisite error. Generate proof
+bundles only as diagnostic artifacts from the default-zero candidate; copy
+`ProofBundles/Generals` beside the exact Generals executable and
+`ProofBundles/ZeroHour` beside the exact Zero Hour executable only when
+diagnostic inspection requires it. Keep the bundle files and `Net3Raw` tree
+together. Any changed executable, source revision, artifact manifest, evidence
+manifest, raw index, or raw peer output remains non-authorizing. The scoped
+runner mode is bounded and never joins a lobby or opens an ordinary gameplay
+network session.
+
+The performance attachment must match
+`PerformanceScalingEvidence.schema.json`. Final acceptance recomputes exact
+physical-core-mask populations for forced-one, 8-core, and 16-core lanes;
+one-worker phase totals and Amdahl limits; per-kernel capture/schedule/wait/
+validate/commit totals versus the exact serial operation; and the measured
+Stage 3 regression, 8-core throughput, and 8-to-16 scaling ratios for canonical
+1k, 4k, 8k, and dense eight-player fixtures. Logical worker counts without
+distinct physical-core evidence fail closed.
+
+The report must hash an adjacent `PerformanceScalingRawSamples.schema.json`
+manifest containing canonical per-process repeat rows bound to the source,
+artifact set, Stage 3 baseline, exact installed executable SHA-256, and exact
+supported `-headless -noFPSLimit -pipelineMode serial -simulationMode parallel
+-workerPolicy auto -validationExecutableSha256 ... -workerCount ... -replay ...`
+installed-runtime command line. That manifest must hash a parsed
+`PerformanceScalingTopologyReceipt.schema.json` CPU-set receipt. The validator
+derives the physical-core lanes and recomputes every reported median and ratio;
+the topology receipt must correlate to the first current one-worker run, and
+summary-only or internally consistent forged reports fail.
+
+Run the validation-tool self-tests and the real replay child-mode source audit
+without building or launching the game:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File Core/Tools/DeterministicSimulationValidation/DeterministicSimulationValidation.Tests.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File Core/Tools/DeterministicSimulationValidation/Audit-ReplayModePropagation.ps1 -SelfTest
+powershell -NoProfile -ExecutionPolicy Bypass -File Core/Tools/DeterministicSimulationValidation/Audit-ReplayModePropagation.ps1 -SourceRoot .
+```
+
+The matrix runner requires a fresh evidence directory, an installed Generals or
+Zero Hour runtime, and a reviewed explicit title-matching fixture manifest matching
+`ReplayFixtureManifest.schema.json`. Use `-PlanOnly` first. Automatic workers
+mean `-workerPolicy auto` with no `-workerCount`; replay `-jobs` is process-level
+parallelism and is not used by this matrix. A CI-built candidate may supply its
+controller-computed hash with `-ExpectedExecutableSha256`; fixture and map
+hashes still come only from the manifest. The existing VC6 replay check below
+remains a separate retail-compatibility oracle.
+
+Installed execution additionally requires an existing task-owned directory below
+`H:\` through `-TaskRoot`, an evidence `-OutputRoot` below that directory, and
+the reviewed `-AllowHeadlessDirectExecution` switch. The runner does not invoke
+`launcher.exe`, because its legacy process wrapper does not propagate the child
+exit code; it parses `launcher.lcf` and records an equivalence contract for the
+target executable, arguments, runtime working directory, child environment, and
+title-specific profile path before using the explicit headless exception. Both
+title variants redirect the Windows Documents known-folder values temporarily to
+a per-run H: tree and restore them in `finally`; TEMP, TMP, cache, logs, and
+profiles are task-owned and removed after the run. Keep the evidence directory
+for review and cleanup only the generated task scratch directory.
+
 You can also test with these replays locally:
 - Copy the replays into a subfolder in your `%USERPROFILE%/Documents/Command and Conquer Generals Zero Hour Data/Replays` folder.
 - Copy the maps into `%USERPROFILE%/Documents/Command and Conquer Generals Zero Hour Data/Maps`
