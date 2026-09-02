@@ -48,7 +48,7 @@
 #include "WWDebug/wwprofile.h"
 #include <limits.h>
 #include "WWMath/vp.h"
-#include "texture.h"
+#include "WW3D2/texture.h"
 #include "WWMath/vector3.h"
 
 // A random permutation of the numbers 0 to 15 - used for LOD particle decimation.

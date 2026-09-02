@@ -31,9 +31,7 @@ function(rts_add_legacy_renderer_targets)
         "${_legacy_ww3d2}/surfaceblit_legacy.cpp"
         "${_legacy_ww3d2}/texturemipgenerator_legacy.cpp"
         "${_legacy_gameengine_device}/Source/W3DDevice/Common/System/LegacyPixelShaderBytecode.cpp"
-        "${_legacy_gameengine_device}/Source/W3DDevice/GameClient/RenderTextureOperationsLegacy.cpp"
-        "${_legacy_gameengine_device}/Source/W3DDevice/GameClient/W3DProfilerFrameCaptureLegacy.cpp"
-        "${_legacy_gameengine_device}/Source/W3DDevice/GameClient/W3DSnowLegacy.cpp")
+        "${_legacy_gameengine_device}/Source/W3DDevice/GameClient/RenderTextureOperationsLegacy.cpp")
 
     set(_legacy_title_renderer_sources
         "${_legacy_ww3d2}/d3d11legacybridge.cpp"
@@ -50,7 +48,8 @@ function(rts_add_legacy_renderer_targets)
         "${_legacy_ww3d2}/sortingrenderer_legacy.cpp"
         "${_legacy_ww3d2}/surfaceclass_legacy.cpp"
         "${_legacy_ww3d2}/texture_legacy.cpp"
-        "${_legacy_ww3d2}/ww3dformat_legacy.cpp")
+        "${_legacy_ww3d2}/ww3dformat_legacy.cpp"
+        "${_legacy_gameengine_device}/Source/W3DDevice/GameClient/W3DProfilerFrameCaptureLegacy.cpp")
 
     add_library(rts_legacy_renderer STATIC ${_legacy_renderer_sources})
     target_include_directories(rts_legacy_renderer BEFORE PUBLIC
@@ -77,6 +76,7 @@ function(rts_add_legacy_renderer_targets)
         RTS_ENABLE_LEGACY_EMBEDDED_BROWSER=1)
     target_link_libraries(rts_legacy_renderer PUBLIC
         core_config
+        core_profile_tracy
         core_renderer
         core_task_runtime
         core_browserengine
@@ -96,6 +96,7 @@ function(rts_add_legacy_renderer_targets)
         "${_legacy_generals_root}/RenderGameClientLegacy.cpp"
         "${_legacy_ww3d2}/textureloader_legacy.cpp"
         "${_legacy_ww3d2}/line3d_legacy.cpp"
+        "${_legacy_gameengine_device}/Source/W3DDevice/GameClient/W3DSnowLegacy.cpp"
         ${_legacy_title_renderer_sources})
     target_include_directories(rts_generals_legacy_renderer BEFORE PUBLIC
         "${_legacy_generals_root}"
@@ -112,6 +113,12 @@ function(rts_add_legacy_renderer_targets)
         "${CMAKE_SOURCE_DIR}/Core/GameEngine/Include"
         "${CMAKE_SOURCE_DIR}/Core/GameEngineDevice/Include"
         "${CMAKE_SOURCE_DIR}/Dependencies/Utility")
+    # The title-specific compatibility sources are compiled as a separate
+    # target; the common target's PCH does not propagate through a static
+    # library link.  Keep the legacy macro surface available before the
+    # historical STL headers are parsed here as well.
+    target_precompile_headers(rts_generals_legacy_renderer PRIVATE
+        [["Utility/CppMacros.h"]])
     target_compile_definitions(rts_generals_legacy_renderer PUBLIC
         BUILD_WITH_D3D8=1
         RTS_ENABLE_LEGACY_EMBEDDED_BROWSER=1
@@ -125,6 +132,7 @@ function(rts_add_legacy_renderer_targets)
         "${_legacy_zerohour_root}/RenderGameClientLegacy.cpp"
         "${_legacy_ww3d2}/textureloader_legacy.cpp"
         "${_legacy_ww3d2}/line3d_legacy.cpp"
+        "${_legacy_gameengine_device}/Source/W3DDevice/GameClient/W3DSnowLegacy.cpp"
         ${_legacy_title_renderer_sources})
     target_include_directories(rts_zerohour_legacy_renderer BEFORE PUBLIC
         "${_legacy_zerohour_root}"
@@ -141,6 +149,8 @@ function(rts_add_legacy_renderer_targets)
         "${CMAKE_SOURCE_DIR}/Core/GameEngine/Include"
         "${CMAKE_SOURCE_DIR}/Core/GameEngineDevice/Include"
         "${CMAKE_SOURCE_DIR}/Dependencies/Utility")
+    target_precompile_headers(rts_zerohour_legacy_renderer PRIVATE
+        [["Utility/CppMacros.h"]])
     target_compile_definitions(rts_zerohour_legacy_renderer PUBLIC
         BUILD_WITH_D3D8=1
         RTS_ENABLE_LEGACY_EMBEDDED_BROWSER=1

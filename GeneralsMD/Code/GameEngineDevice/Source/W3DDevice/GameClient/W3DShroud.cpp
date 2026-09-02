@@ -27,6 +27,8 @@
 // Desc:      Code to support rendering of shrouded units/terrain.
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
+#include <mmsystem.h>
+
 #include "Lib/BaseType.h"
 #include "WW3D2/camera.h"
 #include "WWLib/simplevec.h"

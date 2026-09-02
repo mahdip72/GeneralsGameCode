@@ -44,7 +44,7 @@
 #include "part_ldr.h"
 #include "w3derr.h"
 #include "scene.h"
-#include "texture.h"
+#include "WW3D2/texture.h"
 #include "WWDebug/wwprofile.h"
 #include <limits.h>
 #include <WWLib/gcd_lcm.h>

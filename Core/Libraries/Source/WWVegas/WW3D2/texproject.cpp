@@ -78,7 +78,7 @@
 #include "texproject.h"
 #include "vertmaterial.h"
 #include "shader.h"
-#include "texture.h"
+#include "WW3D2/texture.h"
 #include "rendobj.h"
 #include "rinfo.h"
 #include "camera.h"

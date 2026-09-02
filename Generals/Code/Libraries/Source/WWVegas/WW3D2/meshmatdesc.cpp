@@ -37,7 +37,7 @@
  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 #include "meshmatdesc.h"
-#include "texture.h"
+#include "WW3D2/texture.h"
 #include "vertmaterial.h"
 #include "WWLib/realcrc.h"
 #include "Renderer/RenderGameClient.h"

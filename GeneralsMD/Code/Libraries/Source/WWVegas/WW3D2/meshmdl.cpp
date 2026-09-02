@@ -38,16 +38,16 @@
  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 #include "meshmdl.h"
-#include "dx8fvf.h"
+#include "WW3D2/dx8fvf.h"
 #include "matinfo.h"
 #include "aabtree.h"
 #include "htree.h"
 #include "WWMath/vp.h"
 #include "visrasterizer.h"
-#include "dx8polygonrenderer.h"
+#include "WW3D2/dx8polygonrenderer.h"
 #include "bwrender.h"
 #include "camera.h"
-#include "dx8renderer.h"
+#include "WW3D2/dx8renderer.h"
 #include "WWLib/hashtemplate.h"
 #include "Renderer/RenderGameClient.h"
 

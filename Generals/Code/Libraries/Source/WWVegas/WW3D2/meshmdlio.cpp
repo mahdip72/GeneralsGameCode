@@ -81,7 +81,7 @@
 #include "matinfo.h"
 #include "vertmaterial.h"
 #include "shader.h"
-#include "texture.h"
+#include "WW3D2/texture.h"
 #include "WWLib/chunkio.h"
 #include "w3derr.h"
 #include "w3d_file.h"

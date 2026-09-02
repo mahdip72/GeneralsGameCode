@@ -8,6 +8,7 @@
 */
 
 #include "Renderer/RenderGameClient.h"
+#include "Lib/BaseType.h"
 
 #if !defined(_WIN64)
 

@@ -28,6 +28,8 @@
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 
+#include <mmsystem.h>
+
 #include "Common/GameMemory.h"
 #include "Renderer/RenderGameClient.h"
 #include "WW3D2/rendobj.h"

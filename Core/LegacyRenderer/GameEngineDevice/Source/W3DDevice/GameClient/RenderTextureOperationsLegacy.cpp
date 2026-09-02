@@ -6,6 +6,7 @@
 #include "W3DDevice/GameClient/RenderTextureOperations.h"
 #include <WW3D2/texture.h>
 #include <WW3D2/texturemipgenerator.h>
+#include <d3d8.h>
 
 bool Generate_Render_Texture_Mip_Levels(TextureClass *texture)
 {

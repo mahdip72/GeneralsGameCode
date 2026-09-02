@@ -39,14 +39,14 @@
 
 #include "WWLib/sharebuf.h"
 #include "linegrp.h"
-#include "texture.h"
+#include "WW3D2/texture.h"
 #include "vertmaterial.h"
 #include "WWMath/wwmath.h"
 #include "rinfo.h"
 #include "camera.h"
 #if !defined(_WIN64)
-#include "dx8indexbuffer.h"
-#include "dx8vertexbuffer.h"
+#include "WW3D2/dx8indexbuffer.h"
+#include "WW3D2/dx8vertexbuffer.h"
 #endif
 #include "Renderer/LegacyColorPacking.h"
 #include "Renderer/RenderGameClient.h"

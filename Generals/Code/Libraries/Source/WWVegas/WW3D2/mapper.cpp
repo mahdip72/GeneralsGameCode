@@ -37,15 +37,15 @@
 
 #include "mapper.h"
 #include "WWLib/realcrc.h"
-#include "ww3d.h"
+#include "WW3D2/ww3d.h"
 #include "WWLib/INI.h"
 #include "WWLib/chunkio.h"
 #include "w3derr.h"
 #include "meshmatdesc.h"
 #include "Renderer/RenderGameClient.h"
 #include "WWDebug/wwdebug.h"
-#include "matinfo.h"
-#include "rendobj.h"
+#include "WW3D2/matinfo.h"
+#include "WW3D2/rendobj.h"
 #include "mesh.h"
 
 namespace

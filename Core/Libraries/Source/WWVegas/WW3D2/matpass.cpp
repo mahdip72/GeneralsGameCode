@@ -49,7 +49,7 @@
 #include "matpass.h"
 #include "vertmaterial.h"
 #include "shader.h"
-#include "texture.h"
+#include "WW3D2/texture.h"
 #include "Renderer/RenderGameClient.h"
 
 

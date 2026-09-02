@@ -38,6 +38,8 @@
 /*		7/18/2002 : Initial creation                                           */
 /*---------------------------------------------------------------------------*/
 
+#include <windows.h>
+#include <mmsystem.h>
 #include <dsound.h>
 
 // The VC6-era DirectSound header predates these speaker configurations.

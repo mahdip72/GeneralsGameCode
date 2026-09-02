@@ -49,8 +49,8 @@
 #include "WWMath/Vector3i.h"
 #include "WWLib/RANDOM.h"
 #include "WWMath/v3_rnd.h"
-#include "dx8indexbuffer.h"
-#include "dx8vertexbuffer.h"
+#include "WW3D2/dx8indexbuffer.h"
+#include "WW3D2/dx8vertexbuffer.h"
 #include "meshgeometry.h"
 #include "vertmaterial.h"
 

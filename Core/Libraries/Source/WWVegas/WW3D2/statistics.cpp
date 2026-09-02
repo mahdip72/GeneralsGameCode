@@ -22,8 +22,8 @@
 #include "Renderer/RenderGameClient.h"
 #include "WW3D2/shader.h"
 #include "ww3d.h"
-#include "textureloader.h"
-#include "texture.h"
+#include "WW3D2/textureloader.h"
+#include "WW3D2/texture.h"
 
 #include <memory.h>
 #ifdef _UNIX

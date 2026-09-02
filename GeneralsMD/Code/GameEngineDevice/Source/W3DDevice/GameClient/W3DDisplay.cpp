@@ -37,6 +37,7 @@ static void drawFramerateBar();
 #include <numeric>
 #include <stdlib.h>
 #include <windows.h>
+#include <mmsystem.h>
 #include <io.h>
 #include <time.h>
 

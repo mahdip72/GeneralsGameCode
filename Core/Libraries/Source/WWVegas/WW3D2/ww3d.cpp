@@ -96,7 +96,7 @@
 #include "WWDebug/wwprofile.h"
 #include "WWDebug/wwmemlog.h"
 #include "shattersystem.h"
-#include "textureloader.h"
+#include "WW3D2/textureloader.h"
 #include "statistics.h"
 #include "pointgr.h"
 #include "WWLib/ffactory.h"

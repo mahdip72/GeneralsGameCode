@@ -48,7 +48,7 @@
 
 #include "Utility/CppMacros.h"
 #include "metalmap.h"
-#include "texture.h"
+#include "WW3D2/texture.h"
 #include "Renderer/RenderTexturePublication.h"
 #include "ww3dformat.h"
 #include "ww3d.h"
