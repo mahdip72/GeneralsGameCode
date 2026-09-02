@@ -41,6 +41,7 @@ struct GroupRecord
 		  failed(false), cancelled(false)
 	{
 	}
+	void removePending(unsigned count);
 
 	void *owner;
 	unsigned generation;
@@ -169,6 +170,40 @@ void pauseJobSystemTest(unsigned pausePoint)
 	}
 }
 #endif
+
+std::unique_lock<std::mutex> lockCompletionMutex(std::mutex &mutex,
+	unsigned testPausePoint)
+{
+	std::unique_lock<std::mutex> lock(mutex, std::defer_lock);
+#if defined(RTS_BUILD_CORE_EXTRAS)
+	if ((s_jobSystemTestPauseMask.load(std::memory_order_acquire) & testPausePoint) != 0 &&
+		!lock.try_lock())
+	{
+		pauseJobSystemTest(testPausePoint);
+	}
+#else
+	(void)testPausePoint;
+#endif
+	if (!lock.owns_lock()) lock.lock();
+	return lock;
+}
+
+void GroupRecord::removePending(unsigned count)
+{
+	bool complete;
+	{
+		// Publish the predicate under the same mutex used by completion waiters.
+		std::unique_lock<std::mutex> lock = lockCompletionMutex(mutex, 512);
+		complete = pending.fetch_sub(count, std::memory_order_acq_rel) == count;
+	}
+	if (complete)
+	{
+		completed.notify_all();
+#if defined(RTS_BUILD_CORE_EXTRAS)
+		pauseJobSystemTest(256);
+#endif
+	}
+}
 
 #if defined(_WIN32) && !defined(_WIN64)
 class DeterministicFloatingPointScope
@@ -948,8 +983,14 @@ struct JobSystem::State
 		}
 		record->failed.store(failed, std::memory_order_release);
 		record->cancelled.store(cancelled, std::memory_order_release);
-		record->complete.store(true, std::memory_order_release);
+		{
+			std::unique_lock<std::mutex> lock = lockCompletionMutex(record->mutex, 4096);
+			record->complete.store(true, std::memory_order_release);
+		}
 		record->completed.notify_all();
+#if defined(RTS_BUILD_CORE_EXTRAS)
+		pauseJobSystemTest(2048);
+#endif
 		releaseDependents(record, failed || cancelled);
 
 		const std::shared_ptr<GroupRecord> group = record->group;
@@ -969,10 +1010,7 @@ struct JobSystem::State
 			}
 		}
 		capacityAvailable.notify_all();
-		if (group->pending.fetch_sub(1, std::memory_order_acq_rel) == 1)
-		{
-			group->completed.notify_all();
-		}
+		group->removePending(1);
 	}
 
 	void execute(const std::shared_ptr<JobRecord> &record, Worker &worker)
@@ -2610,10 +2648,7 @@ JobHandle JobSystem::trySubmitAfter(Job *job, JobPriority priority,
 	{
 		record->job.store(0, std::memory_order_release);
 		record->completion = 0;
-		if (groupRecord->pending.fetch_sub(1, std::memory_order_acq_rel) == 1)
-		{
-			groupRecord->completed.notify_all();
-		}
+		groupRecord->removePending(1);
 		try
 		{
 			std::lock_guard<std::mutex> lock(m_state->mutex);
@@ -2636,10 +2671,7 @@ JobHandle JobSystem::trySubmitAfter(Job *job, JobPriority priority,
 		record->accepted.store(false, std::memory_order_release);
 		record->job.store(0, std::memory_order_release);
 		record->completion = 0;
-		if (groupRecord->pending.fetch_sub(1, std::memory_order_acq_rel) == 1)
-		{
-			groupRecord->completed.notify_all();
-		}
+		groupRecord->removePending(1);
 		{
 			std::lock_guard<std::mutex> lock(m_state->mutex);
 			--m_state->outstanding;
@@ -2810,11 +2842,7 @@ bool JobSystem::trySubmitBatch(const JobSubmission *submissions,
 			records[index]->accepted.store(false, std::memory_order_release);
 			records[index]->queued.store(false, std::memory_order_release);
 		}
-		if (groupRecord->pending.fetch_sub(submissionCount,
-			std::memory_order_acq_rel) == submissionCount)
-		{
-			groupRecord->completed.notify_all();
-		}
+		groupRecord->removePending(submissionCount);
 		{
 			std::lock_guard<std::mutex> lock(m_state->mutex);
 			m_state->outstanding -= submissionCount;
@@ -3120,6 +3148,9 @@ bool JobSystem::wait(const JobHandle &handle)
 				continue;
 			}
 			std::unique_lock<std::mutex> lock(record->mutex);
+#if defined(RTS_BUILD_CORE_EXTRAS)
+			pauseJobSystemTest(1024);
+#endif
 			record->completed.wait_for(lock, std::chrono::milliseconds(1));
 		}
 		return true;
@@ -3184,7 +3215,11 @@ bool JobSystem::waitWithoutOwnerHelp(const JobGroup &group,
 	std::unique_lock<std::mutex> lock(record->mutex);
 	return record->completed.wait_for(lock,
 		std::chrono::milliseconds(timeoutMilliseconds), [record]() {
-			return record->pending.load(std::memory_order_acquire) == 0;
+			const bool complete = record->pending.load(std::memory_order_acquire) == 0;
+#if defined(RTS_BUILD_CORE_EXTRAS)
+			if (!complete) pauseJobSystemTest(128);
+#endif
+			return complete;
 		});
 }
 

@@ -45,7 +45,13 @@ enum JobSystemTestPause
 	JOB_SYSTEM_TEST_PAUSE_NON_OWNER_FINALIZER = 8,
 	JOB_SYSTEM_TEST_PAUSE_AFTER_DEPENDENT_ENQUEUE = 16,
 	JOB_SYSTEM_TEST_PAUSE_AFTER_EXECUTION_CLAIM = 32,
-	JOB_SYSTEM_TEST_PAUSE_AFTER_STALE_QUEUE_DISCARD = 64
+	JOB_SYSTEM_TEST_PAUSE_AFTER_STALE_QUEUE_DISCARD = 64,
+	JOB_SYSTEM_TEST_PAUSE_GROUP_WAIT_PREDICATE = 128,
+	JOB_SYSTEM_TEST_PAUSE_AFTER_GROUP_COMPLETION = 256,
+	JOB_SYSTEM_TEST_PAUSE_GROUP_COMPLETION_LOCK = 512,
+	JOB_SYSTEM_TEST_PAUSE_HANDLE_WAIT_PREDICATE = 1024,
+	JOB_SYSTEM_TEST_PAUSE_AFTER_HANDLE_COMPLETION = 2048,
+	JOB_SYSTEM_TEST_PAUSE_HANDLE_COMPLETION_LOCK = 4096
 };
 
 extern "C" void rts_job_system_set_test_fault(unsigned fault,
@@ -107,6 +113,16 @@ int check(bool condition, const char *message)
 		return 1;
 	}
 	return 0;
+}
+
+int runTest(const char *name, int (*test)())
+{
+	fprintf(stderr, "BEGIN: %s\n", name);
+	fflush(stderr);
+	const int result = test();
+	fprintf(stderr, "END: %s (%s)\n", name, result == 0 ? "PASS" : "FAIL");
+	fflush(stderr);
+	return result;
 }
 
 int testJobSystemTestLaneSelection()
@@ -1719,6 +1735,77 @@ int testTopologyPoliciesAndStartupOptions()
 }
 
 #if defined(RTS_BUILD_CORE_EXTRAS)
+int testCompletionPublicationCannotPassWaitingPredicate(bool waitOnHandle)
+{
+	int result = 0;
+	rts::JobSystem &system = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 1;
+	config.queueCapacity = 8;
+	config.scratchBytesPerWorker = 4096;
+	config.pinWorkers = false;
+	const bool started = system.start(config);
+	result |= check(started, "completion-publication fixture starts");
+	if (!started) return result;
+
+	rts::JobGroup group = system.createGroup();
+	Gate gate;
+	rts::Job *job = new GateJob(&gate);
+	rts::JobHandle handle = system.trySubmit(job, rts::JOB_PRIORITY_NORMAL, group);
+	if (!handle.isValid()) delete job;
+	const bool entered = handle.isValid() && gate.waitForEntry();
+	result |= check(entered, "completion-publication job enters before waiter starts");
+	if (entered)
+	{
+		const unsigned predicatePause = waitOnHandle ?
+			JOB_SYSTEM_TEST_PAUSE_HANDLE_WAIT_PREDICATE : JOB_SYSTEM_TEST_PAUSE_GROUP_WAIT_PREDICATE;
+		const unsigned publicationPause = waitOnHandle ?
+			JOB_SYSTEM_TEST_PAUSE_AFTER_HANDLE_COMPLETION : JOB_SYSTEM_TEST_PAUSE_AFTER_GROUP_COMPLETION;
+		const unsigned contentionPause = waitOnHandle ?
+			JOB_SYSTEM_TEST_PAUSE_HANDLE_COMPLETION_LOCK : JOB_SYSTEM_TEST_PAUSE_GROUP_COMPLETION_LOCK;
+		rts_job_system_set_test_pause_mask(predicatePause | publicationPause | contentionPause);
+		bool predicateHeld = false;
+		bool publisherReached = false;
+		bool publisherBlocked = false;
+		bool completedWhileHeld = true;
+		std::thread controller([&]() {
+			predicateHeld = rts_job_system_wait_for_test_pause(predicatePause, 5000);
+			gate.open();
+			publisherReached = rts_job_system_wait_for_test_pause(
+				publicationPause | contentionPause, 5000);
+			publisherBlocked = rts_job_system_wait_for_test_pause(contentionPause, 0);
+			completedWhileHeld = waitOnHandle ? handle.isComplete() : group.isComplete();
+			// Release every pause before joining, including on a failed assertion.
+			rts_job_system_set_test_pause_mask(0);
+		});
+		// The owner handle fence polls at one millisecond and the group fence is
+		// bounded, so the deliberately broken missed-notify path cannot strand a join.
+		const bool waited = waitOnHandle ? system.wait(handle) :
+			system.waitWithoutOwnerHelp(group, 5000);
+		controller.join();
+		result |= check(predicateHeld, "completion waiter holds its mutex after a false predicate");
+		result |= check(publisherReached, "completion publisher reaches the controlled interleaving");
+		result |= check(predicateHeld && publisherReached && publisherBlocked && !completedWhileHeld,
+			"completion publication cannot bypass the waiter's predicate mutex");
+		result |= check(waited && handle.succeeded(),
+			"completion waiter drains after the publisher/waiter handshake");
+	}
+	gate.open();
+	if (handle.isValid()) system.wait(group);
+	system.shutdown();
+	return result;
+}
+
+int testHandleCompletionPublication()
+{
+	return testCompletionPublicationCannotPassWaitingPredicate(true);
+}
+
+int testGroupCompletionPublication()
+{
+	return testCompletionPublicationCannotPassWaitingPredicate(false);
+}
+
 int testFaultInjectionAndRecovery()
 {
 	int result = 0;
@@ -2435,7 +2522,7 @@ int main(int argc, char **argv)
 			"worker counts 16 and 32).\n");
 	}
 	int result = 0;
-	result |= testJobSystemTestLaneSelection();
+	result |= runTest("testJobSystemTestLaneSelection", testJobSystemTestLaneSelection);
 	// Match headless startup before any subsystem or test has started workers.
 	// Lazy model/pose preparation must not resurrect a compute pool here.
 	rts::JobSystem &coldSystem = rts::JobSystem::instance();
@@ -2444,27 +2531,29 @@ int main(int argc, char **argv)
 	result |= check(!coldSystem.ensureStarted() && !coldSystem.isRunning() &&
 		coldSystem.workerCount() == 0 && coldSystem.outstandingJobCount() == 0,
 		"headless cold shutdown blocks lazy compute startup");
-	result |= testBasicStartSubmitWaitShutdown();
-	result |= testDeterministicWorkerCounts();
-	result |= testFlatRangePartitions();
-	result |= testFlatRangeKernelAndSaturationFallback();
-	result |= testAvailableCpuSetsAndOwnerReservations();
-	result |= testOwnerRoleAndLazyRestartBasics();
+	result |= runTest("testBasicStartSubmitWaitShutdown", testBasicStartSubmitWaitShutdown);
+	result |= runTest("testDeterministicWorkerCounts", testDeterministicWorkerCounts);
+	result |= runTest("testFlatRangePartitions", testFlatRangePartitions);
+	result |= runTest("testFlatRangeKernelAndSaturationFallback", testFlatRangeKernelAndSaturationFallback);
+	result |= runTest("testAvailableCpuSetsAndOwnerReservations", testAvailableCpuSetsAndOwnerReservations);
+	result |= runTest("testOwnerRoleAndLazyRestartBasics", testOwnerRoleAndLazyRestartBasics);
 #if !defined(_MSC_VER) || _MSC_VER >= 1300
-	result |= testExecutionScopedPhysicalWorkerIdentity();
-	result |= testPrioritiesAndWorkStealing();
-	result |= testWideWorkerPriorityThroughput();
-	result |= testCurrentWorkerWaitAccounting();
-	result |= testDependenciesContinuationsAndFailurePropagation();
-	result |= testCancellationOwnerHelpingAndCompletions();
-	result |= testTopologyPoliciesAndStartupOptions();
+	result |= runTest("testExecutionScopedPhysicalWorkerIdentity", testExecutionScopedPhysicalWorkerIdentity);
+	result |= runTest("testPrioritiesAndWorkStealing", testPrioritiesAndWorkStealing);
+	result |= runTest("testWideWorkerPriorityThroughput", testWideWorkerPriorityThroughput);
+	result |= runTest("testCurrentWorkerWaitAccounting", testCurrentWorkerWaitAccounting);
+	result |= runTest("testDependenciesContinuationsAndFailurePropagation", testDependenciesContinuationsAndFailurePropagation);
+	result |= runTest("testCancellationOwnerHelpingAndCompletions", testCancellationOwnerHelpingAndCompletions);
+	result |= runTest("testTopologyPoliciesAndStartupOptions", testTopologyPoliciesAndStartupOptions);
 #if defined(RTS_BUILD_CORE_EXTRAS)
-	result |= testFaultInjectionAndRecovery();
+	result |= runTest("testHandleCompletionPublication", testHandleCompletionPublication);
+	result |= runTest("testGroupCompletionPublication", testGroupCompletionPublication);
+	result |= runTest("testFaultInjectionAndRecovery", testFaultInjectionAndRecovery);
 #endif
-	result |= testBatchAdmissionAndWorkerWaitRejection();
-	result |= testServiceOwnerLifetimeAndWorkerRoleRejection();
-	result |= testProcessAffinityLimitsTopology();
-	result |= testLifecycleOwnershipAndResourceLimits();
+	result |= runTest("testBatchAdmissionAndWorkerWaitRejection", testBatchAdmissionAndWorkerWaitRejection);
+	result |= runTest("testServiceOwnerLifetimeAndWorkerRoleRejection", testServiceOwnerLifetimeAndWorkerRoleRejection);
+	result |= runTest("testProcessAffinityLimitsTopology", testProcessAffinityLimitsTopology);
+	result |= runTest("testLifecycleOwnershipAndResourceLimits", testLifecycleOwnershipAndResourceLimits);
 #endif
 	if (result == 0)
 	{
