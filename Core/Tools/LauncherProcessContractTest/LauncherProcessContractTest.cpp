@@ -135,7 +135,8 @@ bool TestLauncherConfigArgumentContract(const char *generatedLcfPath)
     ok &= Expect(std::strcmp(process.args, expectedDefaults) == 0,
         "generated launcher LCF must select defaults only for native x64");
 
-    Append_Process_Arguments(process, 4, userArguments);
+    ok &= Expect(Append_Process_Arguments(process, 4, userArguments) == TRUE,
+        "launcher argv must append when the fixed buffer has capacity");
 #if RTS_LAUNCHER_POINTER_BYTES == 8
     const char *expectedArguments =
         " -simulationMode parallel -workerPolicy auto -simulationMode serial -workerPolicy all";
@@ -157,6 +158,39 @@ bool TestLauncherConfigArgumentContract(const char *generatedLcfPath)
     ok &= Expect(rts::JobSystem::startupConfig().workerPolicy ==
         rts::JOB_WORKER_POLICY_ALL,
         "the user worker policy must take precedence using a game-supported value");
+
+    return ok;
+}
+
+bool TestLauncherArgumentCapacityContract()
+{
+    bool ok = true;
+    Process process;
+    std::strcpy(process.args, "seed");
+    const char before[] = "seed";
+
+    char oversizedArgument[sizeof(process.args)];
+    for (size_t index = 0; index < sizeof(oversizedArgument) - 1; ++index) {
+        oversizedArgument[index] = 'x';
+    }
+    oversizedArgument[sizeof(oversizedArgument) - 1] = 0;
+    char *oversizedArguments[] = {oversizedArgument};
+    ok &= Expect(Append_Process_Arguments(process, 1, oversizedArguments) == FALSE,
+        "launcher argv must reject an argument that exceeds the fixed buffer");
+    ok &= Expect(std::strcmp(process.args, before) == 0,
+        "a rejected launcher argv append must leave the existing command line unchanged");
+
+    Process boundary;
+    char maximumArgument[sizeof(boundary.args) - 1];
+    for (size_t index = 0; index < sizeof(maximumArgument) - 1; ++index) {
+        maximumArgument[index] = 'y';
+    }
+    maximumArgument[sizeof(maximumArgument) - 1] = 0;
+    char *maximumArguments[] = {maximumArgument};
+    ok &= Expect(Append_Process_Arguments(boundary, 1, maximumArguments) == TRUE,
+        "launcher argv must accept the largest argument that fits with its separator and terminator");
+    ok &= Expect(std::strlen(boundary.args) == sizeof(boundary.args) - 1,
+        "the accepted launcher argv must consume exactly the available command-line capacity");
 
     return ok;
 }
@@ -219,6 +253,7 @@ int main(int argc, char *argv[])
         return 1;
     }
     ok &= TestLauncherConfigArgumentContract(argv[1]);
+    ok &= TestLauncherArgumentCapacityContract();
     ok &= TestValidationExecutableHashParserContract();
 
     Process missing;

@@ -18,6 +18,8 @@
 
 #include "process.h"
 
+#include <string.h>
+
 Process::Process()
 {
   directory[0]=0;
@@ -29,12 +31,52 @@ Process::Process()
   dwThreadID=0;
 }
 
-void Append_Process_Arguments(Process &process, int argc, char *argv[])
+bit8 Append_Process_Arguments(Process &process, int argc, char *argv[])
 {
-    for (int i = 0; i < argc; ++i) {
-        strcat(process.args, " ");
-        strcat(process.args, argv[i]);
+    const size_t argsCapacity = sizeof(process.args);
+    size_t currentLength = 0;
+
+    if (argc < 0 || (argc > 0 && argv == nullptr)) {
+        return FALSE;
     }
+
+    while (currentLength < argsCapacity && process.args[currentLength] != 0) {
+        ++currentLength;
+    }
+    if (currentLength >= argsCapacity) {
+        return FALSE;
+    }
+
+    // Build into a bounded temporary so an overflow cannot leave a partially
+    // appended command line in the Process object.
+    char composedArgs[sizeof(process.args)];
+    memcpy(composedArgs, process.args, currentLength + 1);
+    size_t composedLength = currentLength;
+    for (int i = 0; i < argc; ++i) {
+        if (argv[i] == nullptr) {
+            return FALSE;
+        }
+
+        size_t argumentLength = 0;
+        while (argumentLength < argsCapacity && argv[i][argumentLength] != 0) {
+            ++argumentLength;
+        }
+        if (argumentLength >= argsCapacity) {
+            return FALSE;
+        }
+
+        const size_t availableLength = (argsCapacity - 1) - composedLength;
+        if (availableLength < 1 || argumentLength > availableLength - 1) {
+            return FALSE;
+        }
+
+        composedArgs[composedLength++] = ' ';
+        memcpy(composedArgs + composedLength, argv[i], argumentLength);
+        composedLength += argumentLength;
+    }
+    composedArgs[composedLength] = 0;
+    memcpy(process.args, composedArgs, composedLength + 1);
+    return TRUE;
 }
 
 bit8 Close_Process(Process &process)
