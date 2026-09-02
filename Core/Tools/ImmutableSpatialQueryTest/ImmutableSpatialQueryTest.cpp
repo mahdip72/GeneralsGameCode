@@ -1213,7 +1213,11 @@ void testJobSystemWrapperPhysicalTransactionalAndFaults()
 		successMetrics.physicalWorkerJobs == 4 &&
 		successMetrics.ownerHelpedJobs == 0 &&
 		successMetrics.physicalWorkerMask != 0 &&
-		successMetrics.distinctPhysicalWorkers >= 1,
+		successMetrics.physicalWorkerMaskComplete &&
+		successMetrics.distinctPhysicalWorkers >= 1 &&
+		successMetrics.peakConcurrentPhysicalWorkers != 0 &&
+		successMetrics.peakConcurrentPhysicalWorkers <=
+			successMetrics.distinctPhysicalWorkers,
 		"immutable spatial wrapper jobs are balanced and never owner-helped");
 
 	const ImmutableSpatialJobSystemTestFault faults[] = {
@@ -1227,6 +1231,8 @@ void testJobSystemWrapperPhysicalTransactionalAndFaults()
 	{
 		options = ImmutableSpatialJobSystemOptions();
 		options.testFault = fault;
+		if (fault == IMMUTABLE_SPATIAL_JOB_SYSTEM_TEST_CANCEL_AFTER_ADMISSION)
+			options.testSpinIterations = 200000;
 		options.testDispatchOrdinal = 1;
 		options.testRangeOrdinal = 0;
 		RunStorage failed(4, 2, 5, 16);
@@ -1265,7 +1271,9 @@ void testJobSystemWrapperPhysicalTransactionalAndFaults()
 		"one-worker fallback leaves publication untouched");
 	expect(ineligibleMetrics.submittedJobs == 0 &&
 		ineligibleMetrics.physicalWorkerMask == 0 &&
-		ineligibleMetrics.distinctPhysicalWorkers == 0,
+		ineligibleMetrics.distinctPhysicalWorkers == 0 &&
+		ineligibleMetrics.peakConcurrentPhysicalWorkers == 0 &&
+		ineligibleMetrics.physicalWorkerMaskComplete,
 		"one-worker fallback publishes no physical-worker identity");
 	expect(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME),
 		"immutable spatial one-worker fixture unregisters game owner");
@@ -1292,10 +1300,13 @@ void testJobSystemWrapperPhysicalTransactionalAndFaults()
 		metrics.collectionPhysicalWorkerJobs == 4 &&
 		metrics.collectionOwnerHelpedJobs == 0 &&
 		metrics.collectionPhysicalWorkerMask == successMetrics.physicalWorkerMask &&
+		metrics.collectionPhysicalWorkerMaskComplete &&
 		metrics.maximumCollectionQueries == 4 &&
 		metrics.maximumCollectionRanges == 2 &&
 		metrics.maximumCollectionDistinctPhysicalWorkers ==
 			successMetrics.distinctPhysicalWorkers &&
+		metrics.maximumCollectionPeakConcurrentPhysicalWorkers ==
+			successMetrics.peakConcurrentPhysicalWorkers &&
 		metrics.healing.eligibleQueries == 1 &&
 		metrics.healing.authoritativeQueries == 1 &&
 		metrics.healing.authoritativeCandidates == 3 &&
@@ -1304,6 +1315,19 @@ void testJobSystemWrapperPhysicalTransactionalAndFaults()
 		metrics.pointDefenseLaser.shadowMatches == 1 &&
 		metrics.pointDefenseLaser.shadowMismatches == 0,
 		"immutable spatial consumer metrics reset and remain independent");
+	ImmutableSpatialJobSystemMetrics highCoreMetrics = successMetrics;
+	highCoreMetrics.physicalWorkerMask = 0;
+	highCoreMetrics.physicalWorkerMaskComplete = false;
+	highCoreMetrics.distinctPhysicalWorkers = 65;
+	highCoreMetrics.peakConcurrentPhysicalWorkers = 3;
+	RecordImmutableSpatialSuccessfulCollection(4, 2, highCoreMetrics);
+	metrics = GetImmutableSpatialRuntimeMetrics();
+	expect(metrics.successfulCollections == 2 &&
+		metrics.collectionPhysicalWorkerMask == successMetrics.physicalWorkerMask &&
+		!metrics.collectionPhysicalWorkerMaskComplete &&
+		metrics.maximumCollectionDistinctPhysicalWorkers == 65 &&
+		metrics.maximumCollectionPeakConcurrentPhysicalWorkers == 3,
+		"immutable spatial collection keeps exact distinct and peak evidence when the mask is incomplete");
 	ResetImmutableSpatialRuntimeMetrics();
 	metrics = GetImmutableSpatialRuntimeMetrics();
 	expect(metrics.successfulCollections == 0 &&
@@ -1315,9 +1339,11 @@ void testJobSystemWrapperPhysicalTransactionalAndFaults()
 		metrics.collectionPhysicalWorkerJobs == 0 &&
 		metrics.collectionOwnerHelpedJobs == 0 &&
 		metrics.collectionPhysicalWorkerMask == 0 &&
+		metrics.collectionPhysicalWorkerMaskComplete &&
 		metrics.maximumCollectionQueries == 0 &&
 		metrics.maximumCollectionRanges == 0 &&
-		metrics.maximumCollectionDistinctPhysicalWorkers == 0,
+		metrics.maximumCollectionDistinctPhysicalWorkers == 0 &&
+		metrics.maximumCollectionPeakConcurrentPhysicalWorkers == 0,
 		"immutable spatial collection metrics reset at the lifecycle boundary");
 }
 
@@ -1419,7 +1445,11 @@ void testJobSystemWrapperOwnerFloatingPointParityAndFallback()
 				metrics.physicalWorkerJobs == metrics.submittedJobs &&
 				metrics.ownerHelpedJobs == 0 &&
 				metrics.physicalWorkerMask != 0 &&
+				metrics.physicalWorkerMaskComplete &&
 				metrics.distinctPhysicalWorkers >= 1 &&
+				metrics.peakConcurrentPhysicalWorkers != 0 &&
+				metrics.peakConcurrentPhysicalWorkers <=
+					metrics.distinctPhysicalWorkers &&
 				(workerCount < 4 || metrics.distinctPhysicalWorkers > 1),
 				"2/4/8/16 immutable spatial ranges use only physical workers");
 		}

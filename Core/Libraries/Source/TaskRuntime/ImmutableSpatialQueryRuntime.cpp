@@ -25,6 +25,56 @@ enum SpatialExecutionIdentity
 	SPATIAL_OWNER_HELP
 };
 
+typedef std::atomic<unsigned> SpatialJobAtomicUnsigned;
+
+inline unsigned incrementJobCounter(SpatialJobAtomicUnsigned &value)
+{
+	return value.fetch_add(1, std::memory_order_acq_rel) + 1;
+}
+
+inline void decrementJobCounter(SpatialJobAtomicUnsigned &value)
+{
+	value.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+inline unsigned loadJobCounter(const SpatialJobAtomicUnsigned &value)
+{
+	return value.load(std::memory_order_relaxed);
+}
+
+inline void maximizeJobCounter(SpatialJobAtomicUnsigned &value,
+	unsigned candidate)
+{
+	unsigned observed = value.load(std::memory_order_relaxed);
+	while (observed < candidate && !value.compare_exchange_weak(observed,
+		candidate, std::memory_order_relaxed, std::memory_order_relaxed)) {}
+}
+
+class SpatialPhysicalExecutionScope
+{
+public:
+	SpatialPhysicalExecutionScope(bool physicalWorker,
+		SpatialJobAtomicUnsigned *active,
+		SpatialJobAtomicUnsigned *peak)
+		: m_active(physicalWorker ? active : 0)
+	{
+		if (m_active != 0)
+		{
+			const unsigned current = incrementJobCounter(*m_active);
+			maximizeJobCounter(*peak, current);
+		}
+	}
+
+	~SpatialPhysicalExecutionScope()
+	{
+		if (m_active != 0)
+			decrementJobCounter(*m_active);
+	}
+
+private:
+	SpatialJobAtomicUnsigned *m_active;
+};
+
 struct SpatialRangeJob : public Job
 {
 	SpatialRangeJob(ImmutableSpatialRangeFunction rangeFunction,
@@ -32,23 +82,29 @@ struct SpatialRangeJob : public Job
 		SpatialExecutionIdentity *executionIdentity,
 		unsigned *executionPhysicalWorkerIndex, unsigned spinIterations,
 		bool fail,
-		const JobFloatingPointState &floatingPointState)
+		const JobFloatingPointState &floatingPointState,
+		SpatialJobAtomicUnsigned *activePhysicalWorkers,
+		SpatialJobAtomicUnsigned *peakPhysicalWorkers)
 		: function(rangeFunction), context(rangeContext), rangeIndex(ordinal),
 		  identity(executionIdentity),
 		  physicalWorkerIndex(executionPhysicalWorkerIndex),
 		  testSpinIterations(spinIterations), forceFailure(fail),
-		  floatingPointState(floatingPointState)
+		  floatingPointState(floatingPointState),
+		  activePhysicalWorkers(activePhysicalWorkers),
+		  peakPhysicalWorkers(peakPhysicalWorkers)
 	{
 	}
 
 	virtual void execute(JobContext &jobContext)
 	{
 		const JobFloatingPointScope floatingPointScope(floatingPointState);
+		const unsigned workerIndex = jobContext.physicalWorkerIndex();
+		const bool physicalWorker =
+			jobContext.isPhysicalWorkerExecution() &&
+			workerIndex != JOB_INVALID_PHYSICAL_WORKER_INDEX;
 		if (identity != 0)
 		{
-			const unsigned workerIndex = jobContext.physicalWorkerIndex();
-			if (jobContext.isPhysicalWorkerExecution() &&
-				workerIndex != JOB_INVALID_PHYSICAL_WORKER_INDEX)
+			if (physicalWorker)
 			{
 				*identity = SPATIAL_PHYSICAL_WORKER;
 				if (physicalWorkerIndex != 0)
@@ -59,6 +115,8 @@ struct SpatialRangeJob : public Job
 				*identity = SPATIAL_OWNER_HELP;
 			}
 		}
+		SpatialPhysicalExecutionScope physicalScope(physicalWorker,
+			activePhysicalWorkers, peakPhysicalWorkers);
 		volatile unsigned spinValue = rangeIndex;
 		for (unsigned spin = 0; spin != testSpinIterations; ++spin)
 			spinValue = spinValue * 1664525u + 1013904223u;
@@ -75,12 +133,17 @@ struct SpatialRangeJob : public Job
 	unsigned testSpinIterations;
 	bool forceFailure;
 	const JobFloatingPointState floatingPointState;
+	SpatialJobAtomicUnsigned *activePhysicalWorkers;
+	SpatialJobAtomicUnsigned *peakPhysicalWorkers;
 };
 
 struct SpatialDispatchContext
 {
 	SpatialDispatchContext()
 		: options(0), metrics(0), dispatchOrdinal(0), cancelled(false),
+		  activePhysicalWorkers(0), peakPhysicalWorkers(0),
+		  observedPhysicalWorkerIndices(0), observedPhysicalWorkerCount(0),
+		  observedPhysicalWorkerCapacity(0),
 		  floatingPointState()
 	{
 	}
@@ -89,8 +152,44 @@ struct SpatialDispatchContext
 	ImmutableSpatialJobSystemMetrics *metrics;
 	unsigned dispatchOrdinal;
 	std::atomic<bool> cancelled;
+	SpatialJobAtomicUnsigned activePhysicalWorkers;
+	SpatialJobAtomicUnsigned peakPhysicalWorkers;
+	unsigned *observedPhysicalWorkerIndices;
+	unsigned observedPhysicalWorkerCount;
+	unsigned observedPhysicalWorkerCapacity;
 	const JobFloatingPointState floatingPointState;
 };
+
+void observePhysicalWorker(SpatialDispatchContext *dispatch,
+	unsigned workerIndex)
+{
+	for (unsigned index = 0;
+		index != dispatch->observedPhysicalWorkerCount; ++index)
+	{
+		if (dispatch->observedPhysicalWorkerIndices[index] == workerIndex)
+			return;
+	}
+	if (dispatch->observedPhysicalWorkerCount <
+		dispatch->observedPhysicalWorkerCapacity)
+	{
+		dispatch->observedPhysicalWorkerIndices[
+			dispatch->observedPhysicalWorkerCount++] = workerIndex;
+	}
+	else
+	{
+		// The scheduler normally assigns IDs in [0, workerCount), which is the
+		// capacity allocated by the wrapper. Keep the evidence fail-closed if a
+		// future scheduler violates that contract.
+		dispatch->metrics->physicalWorkerMaskComplete = false;
+	}
+}
+
+void publishPhysicalWorkerPeak(SpatialDispatchContext *dispatch)
+{
+	const unsigned peak = loadJobCounter(dispatch->peakPhysicalWorkers);
+	if (peak > dispatch->metrics->peakConcurrentPhysicalWorkers)
+		dispatch->metrics->peakConcurrentPhysicalWorkers = peak;
+}
 
 bool spatialCancelled(void *context)
 {
@@ -149,7 +248,8 @@ bool spatialDispatch(void *context, ImmutableSpatialUInt32 rangeCount,
 		SpatialRangeJob *job = new (std::nothrow) SpatialRangeJob(
 			rangeFunction, rangeContext, allocated, identities + allocated,
 			physicalWorkerIndices + allocated, options.testSpinIterations,
-			forceFailure, dispatch->floatingPointState);
+			forceFailure, dispatch->floatingPointState,
+			&dispatch->activePhysicalWorkers, &dispatch->peakPhysicalWorkers);
 		if (job == 0)
 			break;
 		rangeJobs[allocated] = job;
@@ -213,6 +313,7 @@ bool spatialDispatch(void *context, ImmutableSpatialUInt32 rangeCount,
 		// owns only immutable input and private scratch, so drain before the
 		// dispatch-owned metadata leaves scope.
 		jobs.wait(group);
+		publishPhysicalWorkerPeak(dispatch);
 		delete[] rangeJobs;
 		delete[] identities;
 		delete[] physicalWorkerIndices;
@@ -222,6 +323,7 @@ bool spatialDispatch(void *context, ImmutableSpatialUInt32 rangeCount,
 	}
 	if (!jobs.wait(group))
 	{
+		publishPhysicalWorkerPeak(dispatch);
 		delete[] rangeJobs;
 		delete[] identities;
 		delete[] physicalWorkerIndices;
@@ -229,6 +331,7 @@ bool spatialDispatch(void *context, ImmutableSpatialUInt32 rangeCount,
 		delete[] handles;
 		return false;
 	}
+	publishPhysicalWorkerPeak(dispatch);
 
 	bool succeeded = !group.wasCancelled() && !group.failed();
 	for (unsigned completionIndex = 0; completionIndex != rangeCount;
@@ -245,6 +348,9 @@ bool spatialDispatch(void *context, ImmutableSpatialUInt32 rangeCount,
 			if (workerIndex < sizeof(JobMetricCounter) * 8)
 				dispatch->metrics->physicalWorkerMask |=
 					static_cast<JobMetricCounter>(1) << workerIndex;
+			else
+				dispatch->metrics->physicalWorkerMaskComplete = false;
+			observePhysicalWorker(dispatch, workerIndex);
 		}
 		else if (identities[completionIndex] == SPATIAL_OWNER_HELP)
 		{
@@ -252,38 +358,10 @@ bool spatialDispatch(void *context, ImmutableSpatialUInt32 rangeCount,
 			succeeded = false;
 		}
 	}
-	unsigned localDistinctWorkers = 0;
-	for (unsigned identityIndex = 0; identityIndex != rangeCount;
-		++identityIndex)
-	{
-		if (identities[identityIndex] != SPATIAL_PHYSICAL_WORKER)
-			continue;
-		bool firstIdentity = true;
-		for (unsigned previousIndex = 0; previousIndex != identityIndex;
-			++previousIndex)
-		{
-			if (identities[previousIndex] == SPATIAL_PHYSICAL_WORKER &&
-				physicalWorkerIndices[previousIndex] ==
-					physicalWorkerIndices[identityIndex])
-			{
-				firstIdentity = false;
-				break;
-			}
-		}
-		if (firstIdentity)
-			++localDistinctWorkers;
-	}
-	JobMetricCounter remainingMask = dispatch->metrics->physicalWorkerMask;
-	unsigned representableDistinctWorkers = 0;
-	while (remainingMask != 0)
-	{
-		remainingMask &= remainingMask - 1;
-		++representableDistinctWorkers;
-	}
-	if (localDistinctWorkers > dispatch->metrics->distinctPhysicalWorkers)
-		dispatch->metrics->distinctPhysicalWorkers = localDistinctWorkers;
-	if (representableDistinctWorkers > dispatch->metrics->distinctPhysicalWorkers)
-		dispatch->metrics->distinctPhysicalWorkers = representableDistinctWorkers;
+	if (dispatch->observedPhysicalWorkerCount >
+		dispatch->metrics->distinctPhysicalWorkers)
+		dispatch->metrics->distinctPhysicalWorkers =
+		dispatch->observedPhysicalWorkerCount;
 	delete[] rangeJobs;
 	delete[] identities;
 	delete[] physicalWorkerIndices;
@@ -335,9 +413,11 @@ SpatialMetricAtomic s_collectionCompletedJobs(0);
 SpatialMetricAtomic s_collectionPhysicalWorkerJobs(0);
 SpatialMetricAtomic s_collectionOwnerHelpedJobs(0);
 SpatialMetricAtomic s_collectionPhysicalWorkerMask(0);
+SpatialMetricAtomic s_collectionPhysicalWorkerMaskIncomplete(0);
 SpatialMetricAtomic s_maximumCollectionQueries(0);
 SpatialMetricAtomic s_maximumCollectionRanges(0);
 SpatialMetricAtomic s_maximumCollectionDistinctPhysicalWorkers(0);
+SpatialMetricAtomic s_maximumCollectionPeakConcurrentPhysicalWorkers(0);
 SpatialConsumerMetricAtomics s_consumers[IMMUTABLE_SPATIAL_CONSUMER_COUNT];
 
 void resetMetric(SpatialMetricAtomic &metric)
@@ -553,7 +633,8 @@ ImmutableSpatialJobSystemOptions::ImmutableSpatialJobSystemOptions()
 ImmutableSpatialJobSystemMetrics::ImmutableSpatialJobSystemMetrics()
 	: dispatches(0), ranges(0), submittedJobs(0), completedJobs(0),
 	  physicalWorkerJobs(0), ownerHelpedJobs(0), physicalWorkerMask(0),
-	  distinctPhysicalWorkers(0)
+	  distinctPhysicalWorkers(0), physicalWorkerMaskComplete(true),
+	  peakConcurrentPhysicalWorkers(0)
 {
 }
 
@@ -572,8 +653,10 @@ ImmutableSpatialRuntimeMetrics::ImmutableSpatialRuntimeMetrics()
 	  successfulCollectionRanges(0), multiRangeCollections(0),
 	  collectionSubmittedJobs(0), collectionCompletedJobs(0),
 	  collectionPhysicalWorkerJobs(0), collectionOwnerHelpedJobs(0),
-	  collectionPhysicalWorkerMask(0), maximumCollectionQueries(0),
-	  maximumCollectionRanges(0), maximumCollectionDistinctPhysicalWorkers(0)
+	  collectionPhysicalWorkerMask(0), collectionPhysicalWorkerMaskComplete(true),
+	  maximumCollectionQueries(0), maximumCollectionRanges(0),
+	  maximumCollectionDistinctPhysicalWorkers(0),
+	  maximumCollectionPeakConcurrentPhysicalWorkers(0)
 {
 }
 
@@ -606,6 +689,11 @@ ImmutableSpatialJobSystemResult ExecuteImmutableSpatialQueryBatchOnJobSystem(
 	SpatialDispatchContext dispatch;
 	dispatch.options = &options;
 	dispatch.metrics = jobMetrics;
+	dispatch.observedPhysicalWorkerCapacity = jobs.workerCount();
+	dispatch.observedPhysicalWorkerIndices = new (std::nothrow) unsigned[
+		dispatch.observedPhysicalWorkerCapacity];
+	if (dispatch.observedPhysicalWorkerIndices == 0)
+		return IMMUTABLE_SPATIAL_JOB_SYSTEM_FAILED;
 	ImmutableSpatialExecutionOptions executionOptions;
 	executionOptions.workerCount = jobs.workerCount();
 	executionOptions.dispatch = spatialDispatch;
@@ -622,15 +710,17 @@ ImmutableSpatialJobSystemResult ExecuteImmutableSpatialQueryBatchOnJobSystem(
 		executionMetrics);
 	if (kernelStatus != 0)
 		*kernelStatus = status;
+	ImmutableSpatialJobSystemResult result = IMMUTABLE_SPATIAL_JOB_SYSTEM_FAILED;
 	if (status == IMMUTABLE_SPATIAL_SUCCESS &&
 		jobMetrics->submittedJobs == jobMetrics->completedJobs &&
 		jobMetrics->completedJobs == jobMetrics->physicalWorkerJobs &&
 		jobMetrics->ownerHelpedJobs == 0)
-		return IMMUTABLE_SPATIAL_JOB_SYSTEM_SUCCESS;
-	if (status == IMMUTABLE_SPATIAL_CANCELLED || dispatch.cancelled.load(
+		result = IMMUTABLE_SPATIAL_JOB_SYSTEM_SUCCESS;
+	else if (status == IMMUTABLE_SPATIAL_CANCELLED || dispatch.cancelled.load(
 		std::memory_order_acquire))
-		return IMMUTABLE_SPATIAL_JOB_SYSTEM_CANCELLED;
-	return IMMUTABLE_SPATIAL_JOB_SYSTEM_FAILED;
+		result = IMMUTABLE_SPATIAL_JOB_SYSTEM_CANCELLED;
+	delete[] dispatch.observedPhysicalWorkerIndices;
+	return result;
 }
 
 void ResetImmutableSpatialRuntimeMetrics()
@@ -647,9 +737,11 @@ void ResetImmutableSpatialRuntimeMetrics()
 	resetMetric(s_collectionPhysicalWorkerJobs);
 	resetMetric(s_collectionOwnerHelpedJobs);
 	resetMetric(s_collectionPhysicalWorkerMask);
+	resetMetric(s_collectionPhysicalWorkerMaskIncomplete);
 	resetMetric(s_maximumCollectionQueries);
 	resetMetric(s_maximumCollectionRanges);
 	resetMetric(s_maximumCollectionDistinctPhysicalWorkers);
+	resetMetric(s_maximumCollectionPeakConcurrentPhysicalWorkers);
 	for (unsigned index = 0; index != IMMUTABLE_SPATIAL_CONSUMER_COUNT; ++index)
 		resetConsumer(s_consumers[index]);
 }
@@ -674,10 +766,14 @@ ImmutableSpatialRuntimeMetrics GetImmutableSpatialRuntimeMetrics()
 		s_collectionOwnerHelpedJobs);
 	result.collectionPhysicalWorkerMask = loadMetric(
 		s_collectionPhysicalWorkerMask);
+	result.collectionPhysicalWorkerMaskComplete =
+		loadMetric(s_collectionPhysicalWorkerMaskIncomplete) == 0;
 	result.maximumCollectionQueries = loadMetric(s_maximumCollectionQueries);
 	result.maximumCollectionRanges = loadMetric(s_maximumCollectionRanges);
 	result.maximumCollectionDistinctPhysicalWorkers = loadMetric(
 		s_maximumCollectionDistinctPhysicalWorkers);
+	result.maximumCollectionPeakConcurrentPhysicalWorkers = loadMetric(
+		s_maximumCollectionPeakConcurrentPhysicalWorkers);
 	result.healing = loadConsumer(s_consumers[
 		IMMUTABLE_SPATIAL_CONSUMER_HEALING]);
 	result.pointDefenseLaser = loadConsumer(s_consumers[
@@ -696,9 +792,14 @@ void RecordImmutableSpatialSuccessfulCollection(unsigned queryCount,
 	if (queryCount < 2 || rangeCount < 2 ||
 		metrics.submittedJobs != metrics.completedJobs ||
 		metrics.completedJobs != metrics.physicalWorkerJobs ||
-		metrics.ownerHelpedJobs != 0 || metrics.physicalWorkerMask == 0 ||
-		metrics.distinctPhysicalWorkers < countMetricBits(
-			metrics.physicalWorkerMask))
+		metrics.ownerHelpedJobs != 0 || metrics.distinctPhysicalWorkers == 0 ||
+		metrics.peakConcurrentPhysicalWorkers == 0 ||
+		metrics.peakConcurrentPhysicalWorkers >
+			metrics.distinctPhysicalWorkers ||
+		(metrics.physicalWorkerMaskComplete &&
+			(metrics.physicalWorkerMask == 0 ||
+				countMetricBits(metrics.physicalWorkerMask) !=
+					metrics.distinctPhysicalWorkers)))
 		return;
 	addMetric(s_successfulCollections, 1);
 	addMetric(s_successfulCollectionQueries, queryCount);
@@ -709,10 +810,14 @@ void RecordImmutableSpatialSuccessfulCollection(unsigned queryCount,
 	addMetric(s_collectionPhysicalWorkerJobs, metrics.physicalWorkerJobs);
 	addMetric(s_collectionOwnerHelpedJobs, metrics.ownerHelpedJobs);
 	orMetric(s_collectionPhysicalWorkerMask, metrics.physicalWorkerMask);
+	if (!metrics.physicalWorkerMaskComplete)
+		addMetric(s_collectionPhysicalWorkerMaskIncomplete, 1);
 	maximizeMetric(s_maximumCollectionQueries, queryCount);
 	maximizeMetric(s_maximumCollectionRanges, rangeCount);
 	maximizeMetric(s_maximumCollectionDistinctPhysicalWorkers,
 		metrics.distinctPhysicalWorkers);
+	maximizeMetric(s_maximumCollectionPeakConcurrentPhysicalWorkers,
+		metrics.peakConcurrentPhysicalWorkers);
 }
 
 void RecordImmutableSpatialEligibleQuery(ImmutableSpatialConsumer consumer)

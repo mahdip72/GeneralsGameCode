@@ -613,8 +613,8 @@ void testPartitionOrderingGenerationAndCallbackDestruction()
 		outputCount, &firstDifference) && firstDifference == outputCount,
 		"shadow comparison accepts every field of identical output");
 	rts::CollisionCandidate changed[6];
-	for (unsigned index = 0; index != outputCount; ++index)
-		changed[index] = output[index];
+	for (unsigned changedIndex = 0; changedIndex != outputCount; ++changedIndex)
+		changed[changedIndex] = output[changedIndex];
 	++changed[1].secondGeneration;
 	expect(!rts::CollisionCandidatesEqual(output, outputCount, changed,
 		outputCount, &firstDifference) && firstDifference == 1,
@@ -625,12 +625,12 @@ void testPartitionOrderingGenerationAndCallbackDestruction()
 		"shadow comparison rejects a differing candidate count");
 
 	unsigned callbacks = 0;
-	for (unsigned index = 0; index != outputCount; ++index)
+	for (unsigned callbackIndex = 0; callbackIndex != outputCount; ++callbackIndex)
 	{
-		if (!resolveGeneration(output[index].firstID,
-				output[index].firstGeneration, &state) ||
-			!resolveGeneration(output[index].secondID,
-				output[index].secondGeneration, &state))
+		if (!resolveGeneration(output[callbackIndex].firstID,
+				output[callbackIndex].firstGeneration, &state) ||
+			!resolveGeneration(output[callbackIndex].secondID,
+				output[callbackIndex].secondGeneration, &state))
 			continue;
 		++callbacks;
 		// Mirrors the live contact-list contract: detaching during onCollide
@@ -658,7 +658,8 @@ void testPartitionOrderingGenerationAndCallbackDestruction()
 	parallelWork.physicalWorkerMask = 5;
 	parallelWork.distinctPhysicalWorkers = 2;
 	parallelWork.physicalWorkerMaskComplete = true;
-	rts::RecordCollisionCandidateParallelWork(parallelWork);
+	parallelWork.peakConcurrentPhysicalWorkers = 2;
+	rts::RecordCollisionCandidateAcceptedParallelWork(parallelWork);
 	rts::RecordCollisionCandidateIneligibleSlice();
 	rts::RecordCollisionCandidateOwnerFallback(true, true);
 	const rts::CollisionCandidateRuntimeMetrics runtime =
@@ -677,14 +678,17 @@ void testPartitionOrderingGenerationAndCallbackDestruction()
 		runtime.physicalWorkerJobs == 3 && runtime.ownerHelpedJobs == 1 &&
 		runtime.physicalWorkerMask == 5 &&
 		runtime.distinctPhysicalWorkers == 2 &&
+		runtime.maximumPeakConcurrentPhysicalWorkers == 2 &&
 		runtime.physicalWorkerMaskComplete,
 		"runtime metrics separate commits, shadows, failures, useful work, and jobs");
 	parallelWork.distinctPhysicalWorkers = 65;
 	parallelWork.physicalWorkerMaskComplete = false;
+	parallelWork.peakConcurrentPhysicalWorkers = 3;
 	rts::RecordCollisionCandidateParallelWork(parallelWork);
 	const rts::CollisionCandidateRuntimeMetrics highCoreRuntime =
 		rts::GetCollisionCandidateRuntimeMetrics();
 	expect(highCoreRuntime.distinctPhysicalWorkers == 65 &&
+		highCoreRuntime.maximumPeakConcurrentPhysicalWorkers == 3 &&
 		!highCoreRuntime.physicalWorkerMaskComplete,
 		"runtime authority retains exact high-core identity count when its mask truncates");
 	rts::ResetCollisionCandidateRuntimeMetrics();
@@ -711,6 +715,7 @@ void testPartitionOrderingGenerationAndCallbackDestruction()
 		resetRuntime.ownerHelpedJobs == 0 &&
 		resetRuntime.physicalWorkerMask == 0 &&
 		resetRuntime.distinctPhysicalWorkers == 0 &&
+		resetRuntime.maximumPeakConcurrentPhysicalWorkers == 0 &&
 		resetRuntime.physicalWorkerMaskComplete,
 		"runtime metric lifecycle reset advances its epoch and clears every collision counter");
 }
@@ -811,17 +816,20 @@ void testActualWorkerMatrixParity()
 			expect(metrics.physicalWorkerJobs + metrics.ownerHelpedJobs ==
 				metrics.completedJobs && metrics.physicalWorkerJobs != 0 &&
 				metrics.distinctPhysicalWorkers != 0 &&
+				metrics.peakConcurrentPhysicalWorkers != 0 &&
+				metrics.peakConcurrentPhysicalWorkers <=
+					metrics.distinctPhysicalWorkers &&
+				metrics.distinctPhysicalWorkers <= workerCounts[worker] &&
 				metrics.physicalWorkerMaskComplete &&
 				(metrics.physicalWorkerMask >> workerCounts[worker]) == 0,
 				"range identities distinguish physical workers from owner help");
 			expect(parallelCount == serialCount && sameCandidates(
 				serialOutput, parallelOutput, serialCount),
 				"all worker counts preserve exact serial partition ordering");
-			const rts::JobSystemMetrics schedulerMetrics = jobs.metrics();
-			expect(schedulerMetrics.maximumActiveWorkers <=
-				workerCounts[worker] && schedulerMetrics.maximumActiveWorkers != 0 &&
+			expect(metrics.peakConcurrentPhysicalWorkers <=
+				workerCounts[worker] && metrics.peakConcurrentPhysicalWorkers != 0 &&
 				(workerCounts[worker] < 4 ||
-				 schedulerMetrics.maximumActiveWorkers >= 2),
+					metrics.peakConcurrentPhysicalWorkers >= 2),
 				"large collision wave records bounded physical-worker peak occupancy");
 		}
 
@@ -934,6 +942,7 @@ void testOwnerHelpIdentityAndParity()
 			metrics.physicalWorkerJobs == 0 &&
 			metrics.physicalWorkerMask == 0 &&
 			metrics.distinctPhysicalWorkers == 0 &&
+			metrics.peakConcurrentPhysicalWorkers == 0 &&
 			metrics.physicalWorkerMaskComplete,
 			"owner-help identity cannot masquerade as a physical worker");
 	}

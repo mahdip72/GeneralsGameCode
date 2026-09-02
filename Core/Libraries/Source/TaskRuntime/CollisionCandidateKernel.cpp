@@ -11,6 +11,10 @@
 #include <new>
 #include <string.h>
 
+#if !defined(_MSC_VER) || _MSC_VER >= 1300
+#include <atomic>
+#endif
+
 namespace rts
 {
 CollisionCandidateOptions::CollisionCandidateOptions()
@@ -27,7 +31,7 @@ CollisionCandidateMetrics::CollisionCandidateMetrics()
 	  locallyUniqueCandidates(0), ownerMergeComparisons(0),
 	  maximumRangeInputs(0), physicalWorkerJobs(0), ownerHelpedJobs(0),
 	  physicalWorkerMask(0), distinctPhysicalWorkers(0),
-	  physicalWorkerMaskComplete(true)
+	  physicalWorkerMaskComplete(true), peakConcurrentPhysicalWorkers(0)
 
 {
 }
@@ -42,12 +46,131 @@ CollisionCandidateRuntimeMetrics::CollisionCandidateRuntimeMetrics()
 	  completedJobs(0), localSortRuns(0), locallyUniqueCandidates(0),
 	  ownerMergeComparisons(0), maximumRangeInputs(0), physicalWorkerJobs(0),
 	  ownerHelpedJobs(0), physicalWorkerMask(0), distinctPhysicalWorkers(0),
-	  physicalWorkerMaskComplete(true)
+	  physicalWorkerMaskComplete(true), maximumPeakConcurrentPhysicalWorkers(0)
 {
 }
 
 namespace
 {
+#if defined(_MSC_VER) && _MSC_VER < 1300
+typedef unsigned CollisionJobAtomicUnsigned;
+inline unsigned incrementJobCounter(CollisionJobAtomicUnsigned &value)
+{
+	return ++value;
+}
+inline void decrementJobCounter(CollisionJobAtomicUnsigned &value)
+{
+	--value;
+}
+inline unsigned loadJobCounter(const CollisionJobAtomicUnsigned &value)
+{
+	return value;
+}
+inline void maximizeJobCounter(CollisionJobAtomicUnsigned &value,
+	unsigned candidate)
+{
+	if (candidate > value)
+		value = candidate;
+}
+#else
+typedef std::atomic<unsigned> CollisionJobAtomicUnsigned;
+inline unsigned incrementJobCounter(CollisionJobAtomicUnsigned &value)
+{
+	return value.fetch_add(1, std::memory_order_acq_rel) + 1;
+}
+inline void decrementJobCounter(CollisionJobAtomicUnsigned &value)
+{
+	value.fetch_sub(1, std::memory_order_acq_rel);
+}
+inline unsigned loadJobCounter(const CollisionJobAtomicUnsigned &value)
+{
+	return value.load(std::memory_order_relaxed);
+}
+inline void maximizeJobCounter(CollisionJobAtomicUnsigned &value,
+	unsigned candidate)
+{
+	unsigned observed = value.load(std::memory_order_relaxed);
+	while (observed < candidate && !value.compare_exchange_weak(observed,
+		candidate, std::memory_order_relaxed, std::memory_order_relaxed)) {}
+}
+#endif
+
+class CollisionPhysicalExecutionScope
+{
+public:
+	CollisionPhysicalExecutionScope(bool physicalWorker,
+		CollisionJobAtomicUnsigned *active,
+		CollisionJobAtomicUnsigned *peak)
+		: m_active(physicalWorker ? active : 0)
+	{
+		if (m_active != 0)
+		{
+			const unsigned current = incrementJobCounter(*m_active);
+			maximizeJobCounter(*peak, current);
+		}
+	}
+
+	~CollisionPhysicalExecutionScope()
+	{
+		if (m_active != 0)
+			decrementJobCounter(*m_active);
+	}
+
+private:
+	CollisionJobAtomicUnsigned *m_active;
+};
+
+#if defined(_MSC_VER) && _MSC_VER < 1300
+typedef JobMetricCounter CollisionMetricAtomic;
+inline JobMetricCounter loadMetric(const CollisionMetricAtomic &value)
+{
+	return value;
+}
+inline void resetMetric(CollisionMetricAtomic &value)
+{
+	value = 0;
+}
+inline void addMetric(CollisionMetricAtomic &value, JobMetricCounter amount)
+{
+	value += amount;
+}
+inline void orMetric(CollisionMetricAtomic &value, JobMetricCounter bits)
+{
+	value |= bits;
+}
+inline void maximizeMetric(CollisionMetricAtomic &value,
+	JobMetricCounter candidate)
+{
+	if (candidate > value)
+		value = candidate;
+}
+#else
+typedef std::atomic<JobMetricCounter> CollisionMetricAtomic;
+inline JobMetricCounter loadMetric(const CollisionMetricAtomic &value)
+{
+	return value.load(std::memory_order_relaxed);
+}
+inline void resetMetric(CollisionMetricAtomic &value)
+{
+	value.store(0, std::memory_order_relaxed);
+}
+inline void addMetric(CollisionMetricAtomic &value, JobMetricCounter amount)
+{
+	value.fetch_add(amount, std::memory_order_relaxed);
+}
+inline void orMetric(CollisionMetricAtomic &value, JobMetricCounter bits)
+{
+	value.fetch_or(bits, std::memory_order_relaxed);
+}
+inline void maximizeMetric(CollisionMetricAtomic &value,
+	JobMetricCounter candidate)
+{
+	JobMetricCounter observed = value.load(std::memory_order_relaxed);
+	while (observed < candidate && !value.compare_exchange_weak(observed,
+		candidate, std::memory_order_relaxed, std::memory_order_relaxed)) {}
+}
+#endif
+
 struct CollisionCandidateAddressSpan
 {
 	uintptr_t begin;
@@ -525,8 +648,12 @@ class CollisionCandidateJob : public Job
 {
 public:
 	CollisionCandidateJob(const CollisionCandidateInput *inputs,
-		CollisionCandidate *scratch, CollisionCandidateRangeState *range)
-		: m_inputs(inputs), m_scratch(scratch), m_range(range)
+		CollisionCandidate *scratch, CollisionCandidateRangeState *range,
+		CollisionJobAtomicUnsigned *activePhysicalWorkers,
+		CollisionJobAtomicUnsigned *peakPhysicalWorkers)
+		: m_inputs(inputs), m_scratch(scratch), m_range(range),
+		  m_activePhysicalWorkers(activePhysicalWorkers),
+		  m_peakPhysicalWorkers(peakPhysicalWorkers)
 	{
 	}
 
@@ -534,6 +661,9 @@ public:
 	{
 		if (context.isCancellationRequested())
 			return;
+		const bool physicalWorker = context.isPhysicalWorkerExecution();
+		CollisionPhysicalExecutionScope physicalScope(physicalWorker,
+			m_activePhysicalWorkers, m_peakPhysicalWorkers);
 		normalizeRange(m_inputs, m_scratch, m_range->begin, m_range->end,
 			&context);
 		if (context.isCancellationRequested())
@@ -542,7 +672,7 @@ public:
 			m_range->begin, m_range->end);
 		if (context.isCancellationRequested())
 			return;
-		m_range->physicalWorker = context.isPhysicalWorkerExecution();
+		m_range->physicalWorker = physicalWorker;
 		m_range->physicalWorkerIndex = context.physicalWorkerIndex();
 		m_range->completed = true;
 	}
@@ -551,6 +681,8 @@ private:
 	const CollisionCandidateInput *m_inputs;
 	CollisionCandidate *m_scratch;
 	CollisionCandidateRangeState *m_range;
+	CollisionJobAtomicUnsigned *m_activePhysicalWorkers;
+	CollisionJobAtomicUnsigned *m_peakPhysicalWorkers;
 };
 
 void normalizePartitionRange(
@@ -581,9 +713,12 @@ public:
 	PartitionCollisionCandidateJob(
 		const PartitionCollisionObjectSnapshot *owner,
 		const PartitionCollisionOccupantSnapshot *occupants,
-		CollisionCandidate *scratch, CollisionCandidateRangeState *range)
+		CollisionCandidate *scratch, CollisionCandidateRangeState *range,
+		CollisionJobAtomicUnsigned *activePhysicalWorkers,
+		CollisionJobAtomicUnsigned *peakPhysicalWorkers)
 		: m_owner(owner), m_occupants(occupants), m_scratch(scratch),
-		  m_range(range)
+		  m_range(range), m_activePhysicalWorkers(activePhysicalWorkers),
+		  m_peakPhysicalWorkers(peakPhysicalWorkers)
 	{
 	}
 
@@ -591,6 +726,9 @@ public:
 	{
 		if (context.isCancellationRequested())
 			return;
+		const bool physicalWorker = context.isPhysicalWorkerExecution();
+		CollisionPhysicalExecutionScope physicalScope(physicalWorker,
+			m_activePhysicalWorkers, m_peakPhysicalWorkers);
 		normalizePartitionRange(m_owner, m_occupants, m_scratch,
 			m_range->begin, m_range->end, &context);
 		if (context.isCancellationRequested())
@@ -599,7 +737,7 @@ public:
 			m_range->begin, m_range->end);
 		if (context.isCancellationRequested())
 			return;
-		m_range->physicalWorker = context.isPhysicalWorkerExecution();
+		m_range->physicalWorker = physicalWorker;
 		m_range->physicalWorkerIndex = context.physicalWorkerIndex();
 		m_range->completed = true;
 	}
@@ -609,9 +747,55 @@ private:
 	const PartitionCollisionOccupantSnapshot *m_occupants;
 	CollisionCandidate *m_scratch;
 	CollisionCandidateRangeState *m_range;
+	CollisionJobAtomicUnsigned *m_activePhysicalWorkers;
+	CollisionJobAtomicUnsigned *m_peakPhysicalWorkers;
 };
 
-CollisionCandidateRuntimeMetrics s_runtimeMetrics;
+CollisionMetricAtomic s_resetEpoch(0);
+CollisionMetricAtomic s_authoritativeCommits(0);
+CollisionMetricAtomic s_shadowExecutions(0);
+CollisionMetricAtomic s_shadowMismatches(0);
+CollisionMetricAtomic s_ownerFallbacks(0);
+CollisionMetricAtomic s_unexpectedFallbacks(0);
+CollisionMetricAtomic s_ineligibleSlices(0);
+CollisionMetricAtomic s_staleRejections(0);
+CollisionMetricAtomic s_committedCandidates(0);
+CollisionMetricAtomic s_shadowComparedCandidates(0);
+CollisionMetricAtomic s_preparedPairs(0);
+CollisionMetricAtomic s_uniqueCandidates(0);
+CollisionMetricAtomic s_submittedJobs(0);
+CollisionMetricAtomic s_completedJobs(0);
+CollisionMetricAtomic s_localSortRuns(0);
+CollisionMetricAtomic s_locallyUniqueCandidates(0);
+CollisionMetricAtomic s_ownerMergeComparisons(0);
+CollisionMetricAtomic s_maximumRangeInputs(0);
+CollisionMetricAtomic s_physicalWorkerJobs(0);
+CollisionMetricAtomic s_ownerHelpedJobs(0);
+CollisionMetricAtomic s_physicalWorkerMask(0);
+CollisionMetricAtomic s_distinctPhysicalWorkers(0);
+CollisionMetricAtomic s_physicalWorkerMaskIncomplete(0);
+CollisionMetricAtomic s_maximumPeakConcurrentPhysicalWorkers(0);
+
+void recordParallelWorkMetrics(const CollisionCandidateMetrics &metrics)
+{
+	addMetric(s_preparedPairs, metrics.preparedPairs);
+	addMetric(s_uniqueCandidates, metrics.uniqueCandidates);
+	addMetric(s_submittedJobs, metrics.submittedJobs);
+	addMetric(s_completedJobs, metrics.completedJobs);
+	addMetric(s_localSortRuns, metrics.localSortRuns);
+	addMetric(s_locallyUniqueCandidates, metrics.locallyUniqueCandidates);
+	addMetric(s_ownerMergeComparisons, metrics.ownerMergeComparisons);
+	maximizeMetric(s_maximumRangeInputs, metrics.maximumRangeInputs);
+	addMetric(s_physicalWorkerJobs, metrics.physicalWorkerJobs);
+	addMetric(s_ownerHelpedJobs, metrics.ownerHelpedJobs);
+	orMetric(s_physicalWorkerMask, metrics.physicalWorkerMask);
+	maximizeMetric(s_distinctPhysicalWorkers,
+		metrics.distinctPhysicalWorkers);
+	maximizeMetric(s_maximumPeakConcurrentPhysicalWorkers,
+		metrics.peakConcurrentPhysicalWorkers);
+	if (!metrics.physicalWorkerMaskComplete)
+		addMetric(s_physicalWorkerMaskIncomplete, 1);
+}
 
 #if defined(RTS_BUILD_CORE_EXTRAS) && \
 	(!defined(_MSC_VER) || _MSC_VER >= 1300)
@@ -746,6 +930,8 @@ CollisionCandidateResult PrepareCollisionCandidates(
 		return COLLISION_CANDIDATE_SERIAL_FALLBACK;
 	}
 	memset(ranges, 0, sizeof(CollisionCandidateRangeState) * jobCount);
+	CollisionJobAtomicUnsigned activePhysicalWorkers(0);
+	CollisionJobAtomicUnsigned peakPhysicalWorkers(0);
 	unsigned submitted = 0;
 	bool accepted = true;
 	for (; submitted != jobCount; ++submitted)
@@ -761,7 +947,8 @@ CollisionCandidateResult PrepareCollisionCandidates(
 		ranges[submitted].physicalWorkerIndex =
 			JOB_INVALID_PHYSICAL_WORKER_INDEX;
 		CollisionCandidateJob *job = new (std::nothrow)
-			CollisionCandidateJob(inputs, scratch, ranges + submitted);
+			CollisionCandidateJob(inputs, scratch, ranges + submitted,
+				&activePhysicalWorkers, &peakPhysicalWorkers);
 		JobHandle handle = job != 0 ? jobs.trySubmit(job,
 			JOB_PRIORITY_FRAME_CRITICAL, group) : JobHandle();
 		if (!handle.isValid())
@@ -784,6 +971,8 @@ CollisionCandidateResult PrepareCollisionCandidates(
 
 	jobs.wait(group);
 	collectRangeMetrics(ranges, jobCount, metrics);
+	metrics->peakConcurrentPhysicalWorkers =
+		loadJobCounter(peakPhysicalWorkers);
 	if (cancelled(options) || group.wasCancelled())
 	{
 		delete[] ranges;
@@ -927,6 +1116,8 @@ CollisionCandidateResult PreparePartitionCollisionCandidates(
 		return COLLISION_CANDIDATE_SERIAL_FALLBACK;
 	}
 	memset(ranges, 0, sizeof(CollisionCandidateRangeState) * jobCount);
+	CollisionJobAtomicUnsigned activePhysicalWorkers(0);
+	CollisionJobAtomicUnsigned peakPhysicalWorkers(0);
 	unsigned submitted = 0;
 	bool accepted = true;
 	for (; submitted != jobCount; ++submitted)
@@ -944,7 +1135,8 @@ CollisionCandidateResult PreparePartitionCollisionCandidates(
 			JOB_INVALID_PHYSICAL_WORKER_INDEX;
 		PartitionCollisionCandidateJob *job = new (std::nothrow)
 			PartitionCollisionCandidateJob(&owner, occupants, scratch,
-				ranges + submitted);
+				ranges + submitted, &activePhysicalWorkers,
+				&peakPhysicalWorkers);
 		JobHandle handle = job != 0 ? jobs.trySubmit(job,
 			JOB_PRIORITY_FRAME_CRITICAL, group) : JobHandle();
 		if (!handle.isValid())
@@ -971,6 +1163,8 @@ CollisionCandidateResult PreparePartitionCollisionCandidates(
 		jobs.wait(group);
 	}
 	collectRangeMetrics(ranges, jobCount, metrics);
+	metrics->peakConcurrentPhysicalWorkers =
+		loadJobCounter(peakPhysicalWorkers);
 	if (cancelled(options) || group.wasCancelled())
 	{
 		delete[] ranges;
@@ -1062,15 +1256,73 @@ bool ValidateCollisionCandidateGenerations(
 
 void ResetCollisionCandidateRuntimeMetrics()
 {
-	JobMetricCounter nextEpoch = s_runtimeMetrics.resetEpoch + 1;
+	JobMetricCounter nextEpoch = loadMetric(s_resetEpoch) + 1;
 	if (nextEpoch == 0) nextEpoch = 1;
-	s_runtimeMetrics = CollisionCandidateRuntimeMetrics();
-	s_runtimeMetrics.resetEpoch = nextEpoch;
+	resetMetric(s_authoritativeCommits);
+	resetMetric(s_shadowExecutions);
+	resetMetric(s_shadowMismatches);
+	resetMetric(s_ownerFallbacks);
+	resetMetric(s_unexpectedFallbacks);
+	resetMetric(s_ineligibleSlices);
+	resetMetric(s_staleRejections);
+	resetMetric(s_committedCandidates);
+	resetMetric(s_shadowComparedCandidates);
+	resetMetric(s_preparedPairs);
+	resetMetric(s_uniqueCandidates);
+	resetMetric(s_submittedJobs);
+	resetMetric(s_completedJobs);
+	resetMetric(s_localSortRuns);
+	resetMetric(s_locallyUniqueCandidates);
+	resetMetric(s_ownerMergeComparisons);
+	resetMetric(s_maximumRangeInputs);
+	resetMetric(s_physicalWorkerJobs);
+	resetMetric(s_ownerHelpedJobs);
+	resetMetric(s_physicalWorkerMask);
+	resetMetric(s_distinctPhysicalWorkers);
+	resetMetric(s_physicalWorkerMaskIncomplete);
+	resetMetric(s_maximumPeakConcurrentPhysicalWorkers);
+	// The owner resets only at a lifecycle boundary after all kernel groups
+	// have drained. Publish the new epoch last so diagnostic readers can use it
+	// as the boundary marker for the cleared counters.
+#if defined(_MSC_VER) && _MSC_VER < 1300
+	s_resetEpoch = nextEpoch;
+#else
+	s_resetEpoch.store(nextEpoch, std::memory_order_release);
+#endif
 }
 
 CollisionCandidateRuntimeMetrics GetCollisionCandidateRuntimeMetrics()
 {
-	return s_runtimeMetrics;
+	CollisionCandidateRuntimeMetrics result;
+	result.resetEpoch = loadMetric(s_resetEpoch);
+	result.authoritativeCommits = loadMetric(s_authoritativeCommits);
+	result.shadowExecutions = loadMetric(s_shadowExecutions);
+	result.shadowMismatches = loadMetric(s_shadowMismatches);
+	result.ownerFallbacks = loadMetric(s_ownerFallbacks);
+	result.unexpectedFallbacks = loadMetric(s_unexpectedFallbacks);
+	result.ineligibleSlices = loadMetric(s_ineligibleSlices);
+	result.staleRejections = loadMetric(s_staleRejections);
+	result.committedCandidates = loadMetric(s_committedCandidates);
+	result.shadowComparedCandidates = loadMetric(s_shadowComparedCandidates);
+	result.preparedPairs = loadMetric(s_preparedPairs);
+	result.uniqueCandidates = loadMetric(s_uniqueCandidates);
+	result.submittedJobs = loadMetric(s_submittedJobs);
+	result.completedJobs = loadMetric(s_completedJobs);
+	result.localSortRuns = loadMetric(s_localSortRuns);
+	result.locallyUniqueCandidates = loadMetric(s_locallyUniqueCandidates);
+	result.ownerMergeComparisons = loadMetric(s_ownerMergeComparisons);
+	result.maximumRangeInputs = static_cast<unsigned>(
+		loadMetric(s_maximumRangeInputs));
+	result.physicalWorkerJobs = loadMetric(s_physicalWorkerJobs);
+	result.ownerHelpedJobs = loadMetric(s_ownerHelpedJobs);
+	result.physicalWorkerMask = loadMetric(s_physicalWorkerMask);
+	result.distinctPhysicalWorkers = static_cast<unsigned>(
+		loadMetric(s_distinctPhysicalWorkers));
+	result.physicalWorkerMaskComplete =
+		loadMetric(s_physicalWorkerMaskIncomplete) == 0;
+	result.maximumPeakConcurrentPhysicalWorkers = static_cast<unsigned>(
+		loadMetric(s_maximumPeakConcurrentPhysicalWorkers));
+	return result;
 }
 
 void RecordCollisionCandidateOwnerCommit(bool authoritative, bool shadow,
@@ -1078,58 +1330,48 @@ void RecordCollisionCandidateOwnerCommit(bool authoritative, bool shadow,
 {
 	if (authoritative)
 	{
-		++s_runtimeMetrics.authoritativeCommits;
-		s_runtimeMetrics.committedCandidates += insertedCandidateCount;
+		addMetric(s_authoritativeCommits, 1);
+		addMetric(s_committedCandidates, insertedCandidateCount);
 	}
 	if (shadow)
 	{
-		++s_runtimeMetrics.shadowExecutions;
-		s_runtimeMetrics.shadowComparedCandidates += insertedCandidateCount;
+		addMetric(s_shadowExecutions, 1);
+		addMetric(s_shadowComparedCandidates, insertedCandidateCount);
 	}
 }
 
 void RecordCollisionCandidateShadowMismatch()
 {
-	++s_runtimeMetrics.shadowMismatches;
+	addMetric(s_shadowMismatches, 1);
 }
 
 void RecordCollisionCandidateParallelWork(
 	const CollisionCandidateMetrics &metrics)
 {
-	s_runtimeMetrics.preparedPairs += metrics.preparedPairs;
-	s_runtimeMetrics.uniqueCandidates += metrics.uniqueCandidates;
-	s_runtimeMetrics.submittedJobs += metrics.submittedJobs;
-	s_runtimeMetrics.completedJobs += metrics.completedJobs;
-	s_runtimeMetrics.localSortRuns += metrics.localSortRuns;
-	s_runtimeMetrics.locallyUniqueCandidates +=
-		metrics.locallyUniqueCandidates;
-	s_runtimeMetrics.ownerMergeComparisons += metrics.ownerMergeComparisons;
-	if (metrics.maximumRangeInputs > s_runtimeMetrics.maximumRangeInputs)
-		s_runtimeMetrics.maximumRangeInputs = metrics.maximumRangeInputs;
-	s_runtimeMetrics.physicalWorkerJobs += metrics.physicalWorkerJobs;
-	s_runtimeMetrics.ownerHelpedJobs += metrics.ownerHelpedJobs;
-	s_runtimeMetrics.physicalWorkerMask |= metrics.physicalWorkerMask;
-	if (metrics.distinctPhysicalWorkers >
-		s_runtimeMetrics.distinctPhysicalWorkers)
-	{
-		s_runtimeMetrics.distinctPhysicalWorkers =
-			metrics.distinctPhysicalWorkers;
-	}
-	if (!metrics.physicalWorkerMaskComplete)
-		s_runtimeMetrics.physicalWorkerMaskComplete = false;
+	recordParallelWorkMetrics(metrics);
+}
+
+void RecordCollisionCandidateAcceptedParallelWork(
+	const CollisionCandidateMetrics &metrics)
+{
+	// The owner calls this only after generation/contact validation and
+	// authoritative publication. Keep the recording primitive shared so
+	// accepted telemetry has exactly the same fields and atomic semantics as
+	// attempted-work diagnostics.
+	recordParallelWorkMetrics(metrics);
 }
 
 void RecordCollisionCandidateIneligibleSlice()
 {
-	++s_runtimeMetrics.ineligibleSlices;
+	addMetric(s_ineligibleSlices, 1);
 }
 
 void RecordCollisionCandidateOwnerFallback(bool stale, bool unexpected)
 {
-	++s_runtimeMetrics.ownerFallbacks;
+	addMetric(s_ownerFallbacks, 1);
 	if (unexpected)
-		++s_runtimeMetrics.unexpectedFallbacks;
+		addMetric(s_unexpectedFallbacks, 1);
 	if (stale)
-		++s_runtimeMetrics.staleRejections;
+		addMetric(s_staleRejections, 1);
 }
 }

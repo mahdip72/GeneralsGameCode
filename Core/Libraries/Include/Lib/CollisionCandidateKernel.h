@@ -138,6 +138,10 @@ struct CollisionCandidateMetrics
 	JobMetricCounter physicalWorkerMask;
 	unsigned distinctPhysicalWorkers;
 	bool physicalWorkerMaskComplete;
+	// Exact maximum number of physical workers executing this candidate
+	// preparation at the same time. This is kernel-local and non-authoritative;
+	// it must not be inferred from the scheduler-wide worker high-water mark.
+	unsigned peakConcurrentPhysicalWorkers;
 };
 
 struct CollisionCandidateRuntimeMetrics
@@ -172,6 +176,9 @@ struct CollisionCandidateRuntimeMetrics
 	// fixed-width mask is diagnostic only and may be incomplete on large hosts.
 	unsigned distinctPhysicalWorkers;
 	bool physicalWorkerMaskComplete;
+	// Maximum kernel-local physical-worker overlap observed by an accepted
+	// candidate preparation. This is independent from distinct worker count.
+	unsigned maximumPeakConcurrentPhysicalWorkers;
 };
 
 typedef bool (*CollisionCandidateGenerationResolver)(unsigned objectID,
@@ -245,6 +252,12 @@ void RecordCollisionCandidateOwnerCommit(bool authoritative, bool shadow,
 	unsigned insertedCandidateCount);
 void RecordCollisionCandidateShadowMismatch();
 void RecordCollisionCandidateParallelWork(
+	const CollisionCandidateMetrics &metrics);
+// Records a preparation only after the owner has validated and published its
+// authoritative candidate result. The non-accepted entry point above remains
+// available for attempted-work diagnostics and must not be used as authority
+// evidence by itself.
+void RecordCollisionCandidateAcceptedParallelWork(
 	const CollisionCandidateMetrics &metrics);
 void RecordCollisionCandidateIneligibleSlice();
 void RecordCollisionCandidateOwnerFallback(bool stale,

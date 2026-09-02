@@ -2437,8 +2437,6 @@ void PartitionData::addPossibleCollisions(PartitionContactList *ctList)
 								occupantCount, options, &preparedCount,
 								&preparationMetrics);
 						}
-						rts::RecordCollisionCandidateParallelWork(
-							preparationMetrics);
 						if (result == rts::COLLISION_CANDIDATE_PARALLEL)
 						{
 							LivePartitionCollisionSnapshotContext context;
@@ -2569,6 +2567,8 @@ void PartitionData::addPossibleCollisions(PartitionContactList *ctList)
 									}
 									else
 									{
+										rts::RecordCollisionCandidateAcceptedParallelWork(
+											preparationMetrics);
 										rts::RecordCollisionCandidateOwnerCommit(false,
 											true, actualCount);
 									}
@@ -2594,6 +2594,8 @@ void PartitionData::addPossibleCollisions(PartitionContactList *ctList)
 												++committedCount;
 										}
 									}
+									rts::RecordCollisionCandidateAcceptedParallelWork(
+										preparationMetrics);
 									rts::RecordCollisionCandidateOwnerCommit(true,
 										false, committedCount);
 									authoritativeCommit = TRUE;

@@ -90,6 +90,10 @@ struct ImmutableSpatialJobSystemMetrics
 	unsigned ownerHelpedJobs;
 	JobMetricCounter physicalWorkerMask;
 	unsigned distinctPhysicalWorkers;
+	bool physicalWorkerMaskComplete;
+	// Exact maximum number of physical workers executing either dispatch of
+	// this immutable collection at the same time. This is non-authoritative.
+	unsigned peakConcurrentPhysicalWorkers;
 };
 
 struct ImmutableSpatialConsumerRuntimeMetrics
@@ -129,9 +133,11 @@ struct ImmutableSpatialRuntimeMetrics
 	ImmutableSpatialMetricCounter collectionPhysicalWorkerJobs;
 	ImmutableSpatialMetricCounter collectionOwnerHelpedJobs;
 	ImmutableSpatialMetricCounter collectionPhysicalWorkerMask;
+	bool collectionPhysicalWorkerMaskComplete;
 	ImmutableSpatialMetricCounter maximumCollectionQueries;
 	ImmutableSpatialMetricCounter maximumCollectionRanges;
 	ImmutableSpatialMetricCounter maximumCollectionDistinctPhysicalWorkers;
+	ImmutableSpatialMetricCounter maximumCollectionPeakConcurrentPhysicalWorkers;
 	ImmutableSpatialConsumerRuntimeMetrics healing;
 	ImmutableSpatialConsumerRuntimeMetrics pointDefenseLaser;
 };
