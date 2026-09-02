@@ -531,17 +531,38 @@ function Assert-CollisionLifecycleManifestContract {
 function Assert-CollisionResetEpochContract {
     param([string]$HeaderContent, [string]$KernelContent,
         [string]$GameLogicContent, [string]$Context)
+    if ($HeaderContent.IndexOf('JobMetricCounter resetEpoch;',
+            [StringComparison]::Ordinal) -lt 0) {
+        throw "$Context is missing collision reset-epoch marker 'JobMetricCounter resetEpoch;'."
+    }
     foreach ($marker in @(
-        'JobMetricCounter resetEpoch;',
-        'JobMetricCounter nextEpoch = s_runtimeMetrics.resetEpoch + 1;',
-        's_runtimeMetrics.resetEpoch = nextEpoch;',
+        'CollisionMetricAtomic s_resetEpoch(0);',
+        'JobMetricCounter nextEpoch = loadMetric(s_resetEpoch) + 1;',
+        's_resetEpoch = nextEpoch;',
+        's_resetEpoch.store(nextEpoch, std::memory_order_release);'
+    )) {
+        if ($KernelContent.IndexOf($marker, [StringComparison]::Ordinal) -lt 0) {
+            throw "$Context is missing collision reset-epoch marker '$marker'."
+        }
+    }
+    $nextEpochIndex = $KernelContent.IndexOf(
+        'JobMetricCounter nextEpoch = loadMetric(s_resetEpoch) + 1;',
+        [StringComparison]::Ordinal)
+    foreach ($publicationMarker in @(
+        's_resetEpoch = nextEpoch;',
+        's_resetEpoch.store(nextEpoch, std::memory_order_release);'
+    )) {
+        $publicationIndex = $KernelContent.IndexOf($publicationMarker,
+            [StringComparison]::Ordinal)
+        if ($nextEpochIndex -gt $publicationIndex) {
+            throw "$Context publishes the collision reset epoch before deriving the next epoch."
+        }
+    }
+    foreach ($marker in @(
         'rts::ResetCollisionCandidateRuntimeMetrics();',
         'rts::ResetPhysicsIntegrationRuntimeMetrics();'
     )) {
-        $content = if ($marker -ceq 'JobMetricCounter resetEpoch;') { $HeaderContent }
-            elseif ($marker -match 's_runtimeMetrics') { $KernelContent }
-            else { $GameLogicContent }
-        if ($content.IndexOf($marker, [StringComparison]::Ordinal) -lt 0) {
+        if ($GameLogicContent.IndexOf($marker, [StringComparison]::Ordinal) -lt 0) {
             throw "$Context is missing collision reset-epoch marker '$marker'."
         }
     }
@@ -557,8 +578,11 @@ function Assert-CollisionAdapterContract {
         'rts::frame_timing::CollisionAdmission',
         'rts::frame_timing::SimulationSnapshot',
         'rts::frame_timing::SimulationParallel',
-        'rts::RecordCollisionCandidateParallelWork(',
+        'rts::RecordCollisionCandidateAcceptedParallelWork(',
         'rts::frame_timing::CollisionLiveValidation',
+        'rts::ValidateCollisionCandidateGenerations(',
+        'if (liveValid)',
+        'ctList->addToContactList(this,',
         'ctList->containsContact(this,',
         'rts::frame_timing::CollisionExistingFilter',
         'rts::frame_timing::SimulationCommit',
@@ -569,6 +593,31 @@ function Assert-CollisionAdapterContract {
         if ($AdapterContent.IndexOf($marker, [StringComparison]::Ordinal) -lt 0) {
             throw "$Context is missing collision adapter marker '$marker'."
         }
+    }
+    $validationMarker = 'rts::ValidateCollisionCandidateGenerations('
+    $validationIndex = $AdapterContent.IndexOf($validationMarker,
+        [StringComparison]::Ordinal)
+    $validGuardIndex = $AdapterContent.IndexOf('if (liveValid)',
+        $validationIndex, [StringComparison]::Ordinal)
+    if ($validGuardIndex -lt $validationIndex) {
+        throw "$Context does not gate accepted collision work on successful live validation."
+    }
+    $acceptedMarker = 'rts::RecordCollisionCandidateAcceptedParallelWork('
+    $publicationMarker = 'ctList->addToContactList(this,'
+    $acceptedIndex = $AdapterContent.IndexOf($acceptedMarker,
+        [StringComparison]::Ordinal)
+    while ($acceptedIndex -ge 0) {
+        if ($acceptedIndex -lt $validGuardIndex) {
+            throw "$Context records accepted collision work before successful live validation."
+        }
+        $publicationIndex = $AdapterContent.IndexOf($publicationMarker,
+            $validGuardIndex, [StringComparison]::Ordinal)
+        if ($publicationIndex -lt 0 -or $acceptedIndex -lt $publicationIndex) {
+            throw "$Context records accepted collision work before contact publication."
+        }
+        $acceptedIndex = $AdapterContent.IndexOf($acceptedMarker,
+            $acceptedIndex + $acceptedMarker.Length,
+            [StringComparison]::Ordinal)
     }
     foreach ($kernelMarker in @(
         'rts::frame_timing::SimulationWait',
@@ -1050,18 +1099,27 @@ CHECK(spatialFrozen.collectionPhysicalWorkerMask == 3 &&
     }
     Assert-CollisionResetEpochContract `
         'JobMetricCounter resetEpoch;' `
-        'JobMetricCounter nextEpoch = s_runtimeMetrics.resetEpoch + 1; s_runtimeMetrics.resetEpoch = nextEpoch;' `
+        'CollisionMetricAtomic s_resetEpoch(0); JobMetricCounter nextEpoch = loadMetric(s_resetEpoch) + 1; s_resetEpoch = nextEpoch; s_resetEpoch.store(nextEpoch, std::memory_order_release);' `
         'rts::ResetCollisionCandidateRuntimeMetrics(); rts::ResetPhysicsIntegrationRuntimeMetrics();' `
         'valid collision reset-epoch fixture'
-    try {
-        Assert-CollisionResetEpochContract 'JobMetricCounter resetEpoch;' `
-            's_runtimeMetrics.resetEpoch = nextEpoch;' `
-            'rts::ResetCollisionCandidateRuntimeMetrics(); rts::ResetPhysicsIntegrationRuntimeMetrics();' `
-            'malformed collision reset-epoch fixture'
-        throw 'Self-test failed to reject missing collision epoch increment evidence.'
-    }
-    catch {
-        if ($_.Exception.Message -like 'Self-test failed*') { throw }
+    $validCollisionResetEpoch = 'CollisionMetricAtomic s_resetEpoch(0); JobMetricCounter nextEpoch = loadMetric(s_resetEpoch) + 1; s_resetEpoch = nextEpoch; s_resetEpoch.store(nextEpoch, std::memory_order_release);'
+    foreach ($missingCollisionResetEpochMarker in @(
+        'CollisionMetricAtomic s_resetEpoch(0);',
+        'JobMetricCounter nextEpoch = loadMetric(s_resetEpoch) + 1;',
+        's_resetEpoch = nextEpoch;',
+        's_resetEpoch.store(nextEpoch, std::memory_order_release);'
+    )) {
+        try {
+            Assert-CollisionResetEpochContract 'JobMetricCounter resetEpoch;' `
+                ($validCollisionResetEpoch.Replace($missingCollisionResetEpochMarker,
+                    'removed_collision_reset_epoch_marker')) `
+                'rts::ResetCollisionCandidateRuntimeMetrics(); rts::ResetPhysicsIntegrationRuntimeMetrics();' `
+                'malformed collision reset-epoch fixture'
+            throw "Self-test failed to reject missing $missingCollisionResetEpochMarker collision reset-epoch evidence."
+        }
+        catch {
+            if ($_.Exception.Message -like 'Self-test failed*') { throw }
+        }
     }
     $validReplayDestructorSuppression = @'
 const Bool reportHeadlessMetrics = TheGlobalData->m_headless &&
@@ -1255,8 +1313,11 @@ rts::RecordCollisionCandidateIneligibleSlice();
 rts::frame_timing::CollisionAdmission
 rts::frame_timing::SimulationSnapshot
 rts::frame_timing::SimulationParallel
-rts::RecordCollisionCandidateParallelWork(
 rts::frame_timing::CollisionLiveValidation
+rts::ValidateCollisionCandidateGenerations(
+if (liveValid)
+ctList->addToContactList(this,
+rts::RecordCollisionCandidateAcceptedParallelWork(
 ctList->containsContact(this,
 rts::frame_timing::CollisionExistingFilter
 rts::frame_timing::SimulationCommit
@@ -1272,6 +1333,8 @@ rts::frame_timing::SimulationReduce
         'valid collision adapter fixture'
     foreach ($missingAdapterMarker in @('LivePartitionCollisionWorkspace',
         'CollisionAdmissionSampler', 'CollisionLiveValidation',
+        'ValidateCollisionCandidateGenerations', 'if (liveValid)',
+        'addToContactList', 'RecordCollisionCandidateAcceptedParallelWork',
         'CollisionExistingFilter', 'CollisionCommitPrepare', 'containsContact',
         'SimulationShadowCompare', 'SIMULATION_COLLISION_MISMATCH')) {
         try {
@@ -1284,6 +1347,28 @@ rts::frame_timing::SimulationReduce
         catch {
             if ($_.Exception.Message -like 'Self-test failed*') { throw }
         }
+    }
+    try {
+        Assert-CollisionAdapterContract `
+            ($validCollisionAdapter.Replace(
+                'rts::ValidateCollisionCandidateGenerations(',
+                'rts::RecordCollisionCandidateAcceptedParallelWork(pre_validation); rts::ValidateCollisionCandidateGenerations(')) `
+            $validCollisionKernel 'malformed pre-validation collision adapter fixture'
+        throw 'Self-test failed to reject accepted collision work before live validation.'
+    }
+    catch {
+        if ($_.Exception.Message -like 'Self-test failed*') { throw }
+    }
+    try {
+        Assert-CollisionAdapterContract `
+            ($validCollisionAdapter.Replace(
+                'ctList->addToContactList(this,',
+                'rts::RecordCollisionCandidateAcceptedParallelWork(pre_publication); ctList->addToContactList(this,')) `
+            $validCollisionKernel 'malformed pre-publication collision adapter fixture'
+        throw 'Self-test failed to reject accepted collision work before contact publication.'
+    }
+    catch {
+        if ($_.Exception.Message -like 'Self-test failed*') { throw }
     }
     Write-Output 'Replay mode propagation audit self-test passed.'
     return
