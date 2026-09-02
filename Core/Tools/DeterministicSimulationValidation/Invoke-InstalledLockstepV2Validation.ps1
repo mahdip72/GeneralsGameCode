@@ -33,6 +33,7 @@ $LockstepCheckpointCount = 129
 $LockstepMode = 'installed-lockstep-v2-production'
 $LockstepProducer = 'installed-lockstep-v2'
 $LockstepMagic = 'RTS_LOCKSTEP_V2_RECEIPT'
+$LockstepNegativeProbeMagic = 'RTS_LOCKSTEP_V2_NEGATIVE_PROBE'
 $PostKillWaitMilliseconds = 5000
 
 function Get-UpperSha256 {
@@ -1014,6 +1015,205 @@ function Get-ReceiptPairs {
     return [pscustomobject]@{ path = $Path; pairs = $pairs; text = $text }
 }
 
+function Get-NegativeProbePairs {
+    param([string]$Path)
+    $text = [IO.File]::ReadAllText($Path)
+    if ($text.IndexOf("`r", [StringComparison]::Ordinal) -ge 0) {
+        throw "Negative probe proof contains non-canonical CR line endings: $Path"
+    }
+    $lines = $text.Split(@("`n"), [StringSplitOptions]::None)
+    if ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq '') {
+        $lines = $lines[0..($lines.Count - 2)]
+    }
+    $expectedKeys = @(
+        'producer', 'mode', 'schema', 'protocol_epoch', 'run_nonce',
+        'session_nonce', 'executable_sha256', 'source_revision',
+        'probe_build_compatibility_crc', 'probe_content_crc', 'mutation',
+        'baseline_input_sha256', 'input_sha256', 'baseline_accepted',
+        'mutated_accepted', 'expected_error', 'observed_error', 'process_id')
+    if ($lines.Count -ne ($expectedKeys.Count + 2) -or
+        $lines[0] -cne $LockstepNegativeProbeMagic -or
+        $lines[$lines.Count - 1] -cne 'END') {
+        throw "Negative probe proof is not a canonical installed lockstep-v2 document: $Path"
+    }
+    $pairs = [ordered]@{}
+    for ($index = 0; $index -lt $expectedKeys.Count; ++$index) {
+        if ($lines[$index + 1].Length -eq 0) {
+            throw "Negative probe proof contains an empty line: $Path"
+        }
+        $pair = Get-CanonicalReceiptKeyValue $lines[$index + 1] $Path
+        if ($pairs.Contains($pair.key) -or $pair.key -cne $expectedKeys[$index]) {
+            throw "Negative probe proof field order/shape mismatch at ${index}: $Path"
+        }
+        $pairs[$pair.key] = $pair.value
+    }
+    return [pscustomobject]@{ path = $Path; pairs = $pairs; text = $text }
+}
+
+function Get-LockstepNegativeStdoutProof {
+    param([string]$Stdout)
+    if ([string]::IsNullOrEmpty($Stdout)) {
+        throw 'Installed lockstep-v2 negative probe did not provide stdout.'
+    }
+    $lines = @($Stdout -split "`n" | ForEach-Object { $_.TrimEnd("`r") })
+    $passLines = @($lines | Where-Object {
+        $_.StartsWith('LOCKSTEP_V2_NEGATIVE_PROBE_PASS ',
+            [StringComparison]::Ordinal)
+    })
+    if ($passLines.Count -ne 1) {
+        throw 'Installed lockstep-v2 negative probe must provide exactly one pass marker.'
+    }
+    $match = [regex]::Match($passLines[0],
+        '^LOCKSTEP_V2_NEGATIVE_PROBE_PASS mode=(?<mode>negative-(?:cross-epoch|content-mismatch)) pid=(?<pid>[0-9]+) rejection=(?<error>[A-Za-z]+)$')
+    if (-not $match.Success) {
+        throw 'Installed lockstep-v2 negative probe pass marker has an unsupported shape.'
+    }
+    return [pscustomobject]@{
+        marker = $passLines[0]
+        mode = $match.Groups['mode'].Value
+        pid = [int]$match.Groups['pid'].Value
+        rejection = $match.Groups['error'].Value
+    }
+}
+
+function Resolve-LockstepEvidenceFile {
+    param([string]$Root, [string]$RelativePath, [string]$Context)
+    if ([string]::IsNullOrWhiteSpace($RelativePath) -or
+        [IO.Path]::IsPathRooted($RelativePath) -or
+        $RelativePath -match '(^|[\\/])\.\.([\\/]|$)') {
+        throw "$Context path is not a bounded evidence-relative path: $RelativePath"
+    }
+    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\') + '\'
+    $candidate = [IO.Path]::GetFullPath((Join-Path $rootFull $RelativePath))
+    if (-not $candidate.StartsWith($rootFull,
+            [StringComparison]::OrdinalIgnoreCase) -or
+        -not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+        throw "$Context path is missing or escapes the native evidence root: $RelativePath"
+    }
+    return $candidate
+}
+
+function Assert-LockstepNegativeProbeEvidence {
+    param(
+        [pscustomobject]$Entry,
+        [string]$EvidenceRoot,
+        [string]$ExpectedTitle,
+        [string]$ExpectedMode,
+        [string]$ExpectedSourceCommit,
+        [string]$ExpectedExecutableSha256,
+        [uint32]$ExpectedMapCrc,
+        [int]$ExpectedSeed
+    )
+    if ($null -eq $Entry) { throw 'Native lockstep-v2 negative probe entry is missing.' }
+    $required = @(
+        'title', 'mode', 'producer', 'processId', 'runNonce', 'sessionNonce',
+        'executableSha256', 'sourceCommit', 'proofPath', 'proofSha256',
+        'stdoutPath', 'stdoutSha256', 'stderrPath', 'stderrSha256',
+        'inputSha256', 'baselineAccepted', 'mutatedAccepted', 'mutation',
+        'expectedError', 'observedError', 'exitCode', 'commandLine',
+        'arguments', 'probeBuildCrc', 'probeContentCrc')
+    $actual = @($Entry.PSObject.Properties | ForEach-Object { $_.Name })
+    if ($actual.Count -ne $required.Count) {
+        throw "Native lockstep-v2 negative probe entry has an unexpected field count for $ExpectedTitle/$ExpectedMode."
+    }
+    for ($index = 0; $index -lt $required.Count; ++$index) {
+        if ($actual[$index] -cne $required[$index]) {
+            throw "Native lockstep-v2 negative probe entry field order mismatch for $ExpectedTitle/$ExpectedMode."
+        }
+    }
+    if ([string]$Entry.title -cne $ExpectedTitle -or
+        [string]$Entry.mode -cne $ExpectedMode -or
+        [string]$Entry.producer -cne $LockstepProducer -or
+        [string]$Entry.sourceCommit -cne $ExpectedSourceCommit -or
+        [string]$Entry.executableSha256 -cne $ExpectedExecutableSha256 -or
+        [string]$Entry.runNonce -notmatch '^[0-9A-F]{32}$' -or
+        [string]$Entry.sessionNonce -notmatch '^[0-9A-F]{32}$' -or
+        [string]$Entry.executableSha256 -notmatch '^[0-9A-F]{64}$' -or
+        [string]$Entry.sourceCommit -notmatch '^[0-9a-f]{40}$' -or
+        [int]$Entry.processId -le 0 -or [int]$Entry.exitCode -ne 0) {
+        throw "Native lockstep-v2 negative probe identity is not bound to $ExpectedTitle/$ExpectedMode."
+    }
+    $proofPath = Resolve-LockstepEvidenceFile $EvidenceRoot `
+        ([string]$Entry.proofPath) "$ExpectedTitle/$ExpectedMode proof"
+    $stdoutPath = Resolve-LockstepEvidenceFile $EvidenceRoot `
+        ([string]$Entry.stdoutPath) "$ExpectedTitle/$ExpectedMode stdout"
+    $stderrPath = Resolve-LockstepEvidenceFile $EvidenceRoot `
+        ([string]$Entry.stderrPath) "$ExpectedTitle/$ExpectedMode stderr"
+    foreach ($hashCheck in @(
+        @($proofPath, [string]$Entry.proofSha256, 'proofSha256'),
+        @($stdoutPath, [string]$Entry.stdoutSha256, 'stdoutSha256'),
+        @($stderrPath, [string]$Entry.stderrSha256, 'stderrSha256'))) {
+        if ($hashCheck[1] -notmatch '^[0-9A-F]{64}$' -or
+            (Get-UpperSha256 $hashCheck[0]) -cne $hashCheck[1]) {
+            throw "Native lockstep-v2 negative probe $($hashCheck[2]) is not hash-bound for $ExpectedTitle/$ExpectedMode."
+        }
+    }
+    $parsed = Get-NegativeProbePairs $proofPath
+    $pairs = $parsed.pairs
+    $expectedError = if ($ExpectedMode -ceq 'negative-cross-epoch') {
+        'UnsupportedEngineEpoch'
+    }
+    else { 'ContentHashMismatch' }
+    $expectedMutation = if ($ExpectedMode -ceq 'negative-cross-epoch') {
+        'engine-epoch'
+    }
+    else { 'content-hash' }
+    if ($pairs['producer'] -cne $LockstepProducer -or
+        $pairs['mode'] -cne $ExpectedMode -or
+        $pairs['schema'] -cne '2' -or $pairs['protocol_epoch'] -cne '2' -or
+        $pairs['run_nonce'] -cne [string]$Entry.runNonce -or
+        $pairs['session_nonce'] -cne [string]$Entry.sessionNonce -or
+        $pairs['executable_sha256'] -cne $ExpectedExecutableSha256 -or
+        $pairs['source_revision'] -cne $ExpectedSourceCommit -or
+        $pairs['mutation'] -cne $expectedMutation -or
+        $pairs['expected_error'] -cne $expectedError -or
+        $pairs['observed_error'] -cne $expectedError -or
+        $pairs['baseline_input_sha256'] -notmatch '^[0-9A-F]{64}$' -or
+        $pairs['input_sha256'] -notmatch '^[0-9A-F]{64}$' -or
+        $pairs['baseline_input_sha256'] -ceq $pairs['input_sha256'] -or
+        -not (ConvertTo-ReceiptBool $pairs['baseline_accepted'] 'baseline_accepted') -or
+        (ConvertTo-ReceiptBool $pairs['mutated_accepted'] 'mutated_accepted') -or
+        [UInt64](ConvertTo-ReceiptUInt64 $pairs['probe_build_compatibility_crc'] 'probe_build_compatibility_crc') -ne [UInt64]$Entry.probeBuildCrc -or
+        [UInt64](ConvertTo-ReceiptUInt64 $pairs['probe_content_crc'] 'probe_content_crc') -ne [UInt64]$Entry.probeContentCrc -or
+        [UInt64](ConvertTo-ReceiptUInt64 $pairs['probe_build_compatibility_crc'] 'probe_build_compatibility_crc') -ne [UInt64]$ExpectedMapCrc -or
+        [UInt64](ConvertTo-ReceiptUInt64 $pairs['probe_content_crc'] 'probe_content_crc') -ne [UInt64]$ExpectedSeed -or
+        [int](ConvertTo-ReceiptUInt64 $pairs['process_id'] 'process_id') -ne [int]$Entry.processId) {
+        throw "Native lockstep-v2 negative probe raw proof did not prove the expected rejection for $ExpectedTitle/$ExpectedMode."
+    }
+    $stdoutText = [IO.File]::ReadAllText($stdoutPath)
+    $stdoutProof = Get-LockstepNegativeStdoutProof $stdoutText
+    if ($stdoutProof.mode -cne $ExpectedMode -or
+        $stdoutProof.pid -ne [int]$Entry.processId -or
+        $stdoutProof.rejection -cne $expectedError -or
+        $stdoutText -match 'NET3_VALIDATION_PEER_PASS') {
+        throw "Native lockstep-v2 negative probe stdout is not bound to the observed rejection for $ExpectedTitle/$ExpectedMode."
+    }
+    if ([string]$Entry.inputSha256 -cne $pairs['input_sha256'] -or
+        [string]$Entry.expectedError -cne $expectedError -or
+        [string]$Entry.observedError -cne $expectedError -or
+        [string]$Entry.mutation -cne $expectedMutation -or
+        [bool]$Entry.baselineAccepted -ne $true -or
+        [bool]$Entry.mutatedAccepted -ne $false -or
+        @($Entry.arguments).Count -lt 2 -or
+        @($Entry.arguments | Where-Object { [string]$_ -ceq '-installedLockstepV2Validation' }).Count -ne 1 -or
+        [string]$Entry.commandLine -notmatch [regex]::Escape($ExpectedMode)) {
+        throw "Native lockstep-v2 negative probe result metadata is not bound to its raw proof for $ExpectedTitle/$ExpectedMode."
+    }
+    return [pscustomobject]@{
+        title = $ExpectedTitle
+        mode = $ExpectedMode
+        processId = [int]$Entry.processId
+        runNonce = [string]$Entry.runNonce
+        sessionNonce = [string]$Entry.sessionNonce
+        proofPath = $proofPath
+        inputSha256 = $pairs['input_sha256']
+        baselineAccepted = $true
+        mutatedAccepted = $false
+        expectedError = $expectedError
+        observedError = $expectedError
+    }
+}
+
 function Get-ReceiptProjection {
     param([pscustomobject]$Parsed)
     $pairs = $Parsed.pairs
@@ -1309,6 +1509,42 @@ function Build-LockstepConfiguration {
         $LockstepSimulationRosterMask, $LockstepAIRosterMask)
 }
 
+function Build-LockstepNegativeProbeConfiguration {
+    param(
+        [string]$Mode,
+        [int]$LocalSlot,
+        [int]$PeerCount,
+        [UInt64[]]$Ports,
+        [string]$RunNonce,
+        [string]$SessionNonce,
+        [string]$ExecutableSha256,
+        [string]$SourceCommit,
+        [string]$MapName,
+        [uint32]$MapCrc,
+        [int]$Seed,
+        [uint32]$ProbeBuildCrc,
+        [uint32]$ProbeContentCrc,
+        [string]$Directory,
+        [string]$ReceiptName
+    )
+    if ($Mode -cne 'negative-cross-epoch' -and
+        $Mode -cne 'negative-content-mismatch') {
+        throw "Unsupported installed lockstep-v2 negative probe mode: $Mode"
+    }
+    if ($PeerCount -ne $LockstepNetworkPeerCount -or $LocalSlot -lt 0 -or
+        $LocalSlot -ge $PeerCount -or $ProbeBuildCrc -eq 0 -or
+        $ProbeContentCrc -eq 0) {
+        throw 'Negative probe configuration does not satisfy the two-human contract.'
+    }
+    $portText = ($Ports | ForEach-Object { [string]$_ }) -join ','
+    return ('peer={0};peers={1};ports={2};run={3};session={4};exe={5};source={6};map={7};map_crc={8};seed={9};dir={10};receipt={11};mode={12};router=0;build={13};content={14};network_roster={15};simulation_roster={16};ai_roster={17}' -f `
+        $LocalSlot, $PeerCount, $portText, $RunNonce, $SessionNonce,
+        $ExecutableSha256, $SourceCommit, $MapName, $MapCrc, $Seed,
+        $Directory, $ReceiptName, $Mode, $ProbeBuildCrc, $ProbeContentCrc,
+        $LockstepNetworkRosterMask, $LockstepSimulationRosterMask,
+        $LockstepAIRosterMask)
+}
+
 function Get-ComparableReceiptHash {
     param([pscustomobject]$Parsed)
     $projection = Get-ReceiptProjection $Parsed
@@ -1594,6 +1830,185 @@ function Invoke-LockstepSession {
     }
 }
 
+function Invoke-LockstepNegativeProbe {
+    param(
+        [string]$Title,
+        [string]$Executable,
+        [string]$ExecutableSha256,
+        [string]$SourceCommit,
+        [string]$EvidenceRoot,
+        [string]$SessionDirectory,
+        [int]$BasePort,
+        [string]$MapName,
+        [uint32]$MapCrc,
+        [int]$Seed,
+        [int]$PeerTimeoutSeconds,
+        [pscustomobject]$LauncherContract,
+        [bool]$AllowHeadlessDirectExecution,
+        [pscustomobject]$TitleSessionContract,
+        [string]$Mode
+    )
+    Assert-HeadlessDirectExecutionOptIn $AllowHeadlessDirectExecution
+    if ($Mode -cne 'negative-cross-epoch' -and
+        $Mode -cne 'negative-content-mismatch') {
+        throw "Unsupported installed lockstep-v2 negative probe mode: $Mode"
+    }
+    if ($null -eq $LauncherContract -or
+        @($LauncherContract.launcherArguments).Count -eq 0 -or
+        $null -eq $TitleSessionContract -or
+        $TitleSessionContract.title -cne $Title) {
+        throw "No validated launcher/title-session contract was provided for $Title negative probe."
+    }
+    $workingDirectory = [IO.Path]::GetFullPath((Split-Path -Parent $Executable))
+    if ($LauncherContract.directExecutable -cne $Executable -or
+        $LauncherContract.directWorkingDirectory -cne $workingDirectory -or
+        (Get-UpperSha256 $Executable) -cne $ExecutableSha256 -or
+        (Get-UpperSha256 $LauncherContract.configPath) -cne $LauncherContract.configSha256 -or
+        (Get-UpperSha256 $LauncherContract.launcherPath) -ne $LauncherContract.launcherSha256) {
+        throw "Installed $Title launcher/executable identity changed before negative probe."
+    }
+    if ($BasePort -lt 1024 -or $BasePort + 1 -gt 65535) {
+        throw 'Negative probe ports are outside the bounded UDP range.'
+    }
+    $ports = [UInt64[]]@($BasePort, $BasePort + 1)
+    if (-not (Test-UdpPortAvailable $BasePort) -or
+        -not (Test-UdpPortAvailable ($BasePort + 1))) {
+        throw "Negative probe UDP ports $BasePort/$($BasePort + 1) are unavailable."
+    }
+    $negativeRoot = Join-Path $SessionDirectory 'NegativeProbes'
+    [IO.Directory]::CreateDirectory($negativeRoot) | Out-Null
+    $runNonce = New-NonceHex
+    $sessionNonce = New-NonceHex
+    $receiptName = if ($Mode -ceq 'negative-cross-epoch') {
+        'cross-epoch.proof'
+    }
+    else { 'content-mismatch.proof' }
+    $proofPath = Join-Path $negativeRoot $receiptName
+    $stdoutPath = Join-Path $negativeRoot ($Mode + '.stdout.log')
+    $stderrPath = Join-Path $negativeRoot ($Mode + '.stderr.log')
+    foreach ($existing in @($proofPath, $stdoutPath, $stderrPath)) {
+        if (Test-Path -LiteralPath $existing) {
+            throw "Negative probe output was not fresh: $existing"
+        }
+    }
+    $configuration = Build-LockstepNegativeProbeConfiguration $Mode 0 `
+        $LockstepNetworkPeerCount $ports $runNonce $sessionNonce `
+        $ExecutableSha256 $SourceCommit $MapName $MapCrc $Seed $MapCrc `
+        ([uint32]$Seed) $negativeRoot $receiptName
+    $arguments = @($LauncherContract.launcherArguments + @(
+        '-installedLockstepV2Validation', $configuration))
+    $argumentString = ConvertTo-ProcessArgumentString $arguments
+    $commandLine = '"{0}" {1}' -f $Executable, $argumentString
+    $peerEnvironment = Get-LockstepPeerEnvironment $TitleSessionContract 0
+    foreach ($directory in @(
+        $peerEnvironment.root, $peerEnvironment.values['TEMP'],
+        $peerEnvironment.values['TMP'], $peerEnvironment.values['LOCALAPPDATA'],
+        $peerEnvironment.values['APPDATA'],
+        $peerEnvironment.values['RTS_STAGE5_VALIDATION_CACHE_ROOT'],
+        $peerEnvironment.values['RTS_STAGE5_VALIDATION_LOG_ROOT'],
+        $peerEnvironment.values['RTS_STAGE5_VALIDATION_DUMP_ROOT'])) {
+        [IO.Directory]::CreateDirectory($directory) | Out-Null
+    }
+    $process = $null
+    try {
+        $environmentSnapshot = $null
+        try {
+            $environmentSnapshot = Set-LockstepProcessEnvironment $peerEnvironment.values
+            $process = Start-Process -FilePath $Executable -ArgumentList $argumentString `
+                -WorkingDirectory $workingDirectory -PassThru -WindowStyle Hidden `
+                -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+        }
+        finally {
+            if ($null -ne $environmentSnapshot) {
+                Restore-LockstepProcessEnvironment $environmentSnapshot
+            }
+        }
+        $deadline = [datetime]::UtcNow.AddSeconds($PeerTimeoutSeconds)
+        Wait-ForLeaf $proofPath $process $deadline
+        $process.Refresh()
+        $processId = [int]$process.Id
+        $observedPath = [IO.Path]::GetFullPath($process.Path)
+        if ($observedPath -cne $Executable -or
+            (Get-UpperSha256 $observedPath) -cne $ExecutableSha256) {
+            throw "Negative probe PID $processId did not run the exact installed $Title executable."
+        }
+        $remaining = [Math]::Max(1, [int]($deadline - [datetime]::UtcNow).TotalMilliseconds)
+        if (-not $process.WaitForExit($remaining)) {
+            throw "Negative probe PID $processId exceeded the bounded timeout."
+        }
+        $process.Refresh()
+        if ($process.ExitCode -ne 0) {
+            $errorText = if (Test-Path -LiteralPath $stderrPath) {
+                [IO.File]::ReadAllText($stderrPath)
+            } else { '' }
+            throw "Negative probe PID $processId failed with exit $($process.ExitCode): $errorText"
+        }
+        $stdoutText = if (Test-Path -LiteralPath $stdoutPath) {
+            [IO.File]::ReadAllText($stdoutPath)
+        } else { '' }
+        $stdoutProof = Get-LockstepNegativeStdoutProof $stdoutText
+        if ($stdoutProof.mode -cne $Mode -or $stdoutProof.pid -ne $processId) {
+            throw "Negative probe stdout PID/mode does not match process $processId."
+        }
+        $parsed = Get-NegativeProbePairs $proofPath
+        $pairs = $parsed.pairs
+        $expectedError = if ($Mode -ceq 'negative-cross-epoch') {
+            'UnsupportedEngineEpoch'
+        }
+        else { 'ContentHashMismatch' }
+        $expectedMutation = if ($Mode -ceq 'negative-cross-epoch') {
+            'engine-epoch'
+        }
+        else { 'content-hash' }
+        $evidenceRootFull = [IO.Path]::GetFullPath($EvidenceRoot).TrimEnd('\')
+        $proofFull = [IO.Path]::GetFullPath($proofPath)
+        $stdoutFull = [IO.Path]::GetFullPath($stdoutPath)
+        $stderrFull = [IO.Path]::GetFullPath($stderrPath)
+        $evidencePrefix = $evidenceRootFull + '\'
+        foreach ($path in @($proofFull, $stdoutFull, $stderrFull)) {
+            if (-not $path.StartsWith($evidencePrefix,
+                    [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Negative probe output escaped the native evidence root: $path"
+            }
+        }
+        $entry = [ordered]@{
+            title = $Title
+            mode = $Mode
+            producer = $LockstepProducer
+            processId = $processId
+            runNonce = $runNonce
+            sessionNonce = $sessionNonce
+            executableSha256 = $ExecutableSha256
+            sourceCommit = $SourceCommit
+            proofPath = $proofFull.Substring($evidencePrefix.Length).Replace('\', '/')
+            proofSha256 = Get-UpperSha256 $proofFull
+            stdoutPath = $stdoutFull.Substring($evidencePrefix.Length).Replace('\', '/')
+            stdoutSha256 = Get-UpperSha256 $stdoutFull
+            stderrPath = $stderrFull.Substring($evidencePrefix.Length).Replace('\', '/')
+            stderrSha256 = Get-UpperSha256 $stderrFull
+            inputSha256 = $pairs['input_sha256']
+            baselineAccepted = ConvertTo-ReceiptBool $pairs['baseline_accepted'] 'baseline_accepted'
+            mutatedAccepted = ConvertTo-ReceiptBool $pairs['mutated_accepted'] 'mutated_accepted'
+            mutation = $pairs['mutation']
+            expectedError = $pairs['expected_error']
+            observedError = $pairs['observed_error']
+            exitCode = [int]$process.ExitCode
+            commandLine = $commandLine
+            arguments = @($arguments)
+            probeBuildCrc = [uint32](ConvertTo-ReceiptUInt32 $pairs['probe_build_compatibility_crc'] 'probe_build_compatibility_crc')
+            probeContentCrc = [uint32](ConvertTo-ReceiptUInt32 $pairs['probe_content_crc'] 'probe_content_crc')
+        }
+        [void](Assert-LockstepNegativeProbeEvidence ([pscustomobject]$entry) `
+            $EvidenceRoot $Title $Mode $SourceCommit $ExecutableSha256 $MapCrc $Seed)
+        return [pscustomobject]$entry
+    }
+    finally {
+        if ($null -ne $process) {
+            try { Stop-TaskPeer $process } catch { }
+        }
+    }
+}
+
 function New-SyntheticReceiptText {
     param([int]$LocalSlot = 0, [int]$PeerCount = 2,
         [string]$RunNonce = '0123456789ABCDEF0123456789ABCDEF',
@@ -1696,6 +2111,31 @@ function New-LockstepV2FinalAcceptanceEnvelope {
     }
     $nativeSha256 = Get-UpperSha256 $nativeFull
     $expectedTitles = @('Generals', 'ZeroHour')
+    $nativeDocument = $null
+    try {
+        $nativeDocument = [IO.File]::ReadAllText($nativeFull) | ConvertFrom-Json
+    }
+    catch {
+        throw "Lockstep-v2 native evidence is not parseable JSON: $nativeFull"
+    }
+    if ($null -eq $nativeDocument -or $null -eq $nativeDocument.negativeProbes) {
+        throw 'Lockstep-v2 native evidence has no observed negative-probe collection.'
+    }
+    $negativeProbeProperties = @($nativeDocument.negativeProbes.PSObject.Properties |
+        ForEach-Object { $_.Name })
+    if ($negativeProbeProperties.Count -ne 2 -or
+        $negativeProbeProperties[0] -cne 'crossEpoch' -or
+        $negativeProbeProperties[1] -cne 'contentMismatch') {
+        throw 'Lockstep-v2 native negative-probe collection has an unexpected shape.'
+    }
+    $crossEpochEntries = @($nativeDocument.negativeProbes.crossEpoch)
+    $contentMismatchEntries = @($nativeDocument.negativeProbes.contentMismatch)
+    if ($crossEpochEntries.Count -ne $Sessions.Count -or
+        $contentMismatchEntries.Count -ne $Sessions.Count) {
+        throw 'Lockstep-v2 native evidence does not contain one observed negative proof per title.'
+    }
+    $validatedCrossEpoch = @()
+    $validatedContentMismatch = @()
     $sessionRecords = @()
     for ($sessionIndex = 0; $sessionIndex -lt $Sessions.Count; ++$sessionIndex) {
         $session = $Sessions[$sessionIndex]
@@ -1721,6 +2161,27 @@ function New-LockstepV2FinalAcceptanceEnvelope {
                 throw 'Lockstep-v2 final-acceptance envelope peer roster evidence is incomplete or substituted.'
             }
         }
+        $expectedExecutableSha256 = [string]$peerRecords[0].executableSha256
+        if ($expectedExecutableSha256 -notmatch '^[0-9A-F]{64}$') {
+            throw "Lockstep-v2 $($session.title) peer evidence has no executable identity for negative proofs."
+        }
+        $crossEntry = @($crossEpochEntries | Where-Object {
+            [string]$_.title -ceq [string]$session.title
+        })
+        $contentEntry = @($contentMismatchEntries | Where-Object {
+            [string]$_.title -ceq [string]$session.title
+        })
+        if ($crossEntry.Count -ne 1 -or $contentEntry.Count -ne 1) {
+            throw "Lockstep-v2 $($session.title) is missing a unique observed negative proof pair."
+        }
+        $validatedCrossEpoch += Assert-LockstepNegativeProbeEvidence `
+            ([pscustomobject]$crossEntry[0]) `
+            (Split-Path -Parent $nativeFull) $session.title `
+            'negative-cross-epoch' $SourceCommit $expectedExecutableSha256 $MapCrc $Seed
+        $validatedContentMismatch += Assert-LockstepNegativeProbeEvidence `
+            ([pscustomobject]$contentEntry[0]) `
+            (Split-Path -Parent $nativeFull) $session.title `
+            'negative-content-mismatch' $SourceCommit $expectedExecutableSha256 $MapCrc $Seed
         $effectiveCounts = @($session.effectiveWorkerCounts | ForEach-Object {
             [int]$_
         })
@@ -1781,16 +2242,103 @@ function New-LockstepV2FinalAcceptanceEnvelope {
             commonStopFrame = $CommonStopFrame
             allMatchesCompleted = $true
             stateTracesIdentical = $true
-            # The lockstep-v2 contract tests exercise these negative paths;
-            # they are contract guarantees, not network-human command input.
-            crossEpochRejected = $true
-            contentMismatchRejected = $true
+            crossEpochRejected = ($validatedCrossEpoch.Count -eq $Sessions.Count)
+            contentMismatchRejected = ($validatedContentMismatch.Count -eq $Sessions.Count)
         }
     }
     return [pscustomobject]@{
         document = $envelope
         nativeEvidenceSha256 = $nativeSha256
     }
+}
+
+function New-SyntheticNegativeProbeEvidence {
+    param(
+        [string]$Root,
+        [string]$Title,
+        [string]$ExecutableSha256,
+        [string]$SourceCommit,
+        [string]$Mode,
+        [int]$ProcessId,
+        [uint32]$MapCrc,
+        [int]$Seed
+    )
+    $negativeRoot = Join-Path (Join-Path $Root $Title) 'NegativeProbes'
+    [IO.Directory]::CreateDirectory($negativeRoot) | Out-Null
+    $isCrossEpoch = $Mode -ceq 'negative-cross-epoch'
+    $expectedError = if ($isCrossEpoch) {
+        'UnsupportedEngineEpoch'
+    }
+    else { 'ContentHashMismatch' }
+    $mutation = if ($isCrossEpoch) { 'engine-epoch' } else { 'content-hash' }
+    $receiptName = if ($isCrossEpoch) { 'cross-epoch.proof' } else { 'content-mismatch.proof' }
+    $proofPath = Join-Path $negativeRoot $receiptName
+    $stdoutPath = Join-Path $negativeRoot ($Mode + '.stdout.log')
+    $stderrPath = Join-Path $negativeRoot ($Mode + '.stderr.log')
+    $runNonce = [string]::new('A', 24) + ('{0:X8}' -f $ProcessId)
+    $sessionNonce = [string]::new('B', 24) + ('{0:X8}' -f ($ProcessId + 10))
+    $baselineInputSha256 = if ($isCrossEpoch) {
+        [string]::new('1', 64)
+    }
+    else { [string]::new('3', 64) }
+    $inputSha256 = if ($isCrossEpoch) {
+        [string]::new('2', 64)
+    }
+    else { [string]::new('4', 64) }
+    $proofText = @(
+        $LockstepNegativeProbeMagic
+        "producer=$LockstepProducer"
+        "mode=$Mode"
+        'schema=2'
+        'protocol_epoch=2'
+        "run_nonce=$runNonce"
+        "session_nonce=$sessionNonce"
+        "executable_sha256=$ExecutableSha256"
+        "source_revision=$SourceCommit"
+        "probe_build_compatibility_crc=$MapCrc"
+        "probe_content_crc=$Seed"
+        "mutation=$mutation"
+        "baseline_input_sha256=$baselineInputSha256"
+        "input_sha256=$inputSha256"
+        'baseline_accepted=1'
+        'mutated_accepted=0'
+        "expected_error=$expectedError"
+        "observed_error=$expectedError"
+        "process_id=$ProcessId"
+        'END'
+    ) -join "`n"
+    Write-AtomicText $proofPath ($proofText + "`n")
+    Write-AtomicText $stdoutPath ("LOCKSTEP_V2_NEGATIVE_PROBE_PASS mode=$Mode pid=$ProcessId rejection=$expectedError`n")
+    Write-AtomicText $stderrPath ''
+    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\') + '\'
+    $entry = [ordered]@{
+        title = $Title
+        mode = $Mode
+        producer = $LockstepProducer
+        processId = $ProcessId
+        runNonce = $runNonce
+        sessionNonce = $sessionNonce
+        executableSha256 = $ExecutableSha256
+        sourceCommit = $SourceCommit
+        proofPath = ([IO.Path]::GetFullPath($proofPath).Substring($rootFull.Length).Replace('\', '/'))
+        proofSha256 = Get-UpperSha256 $proofPath
+        stdoutPath = ([IO.Path]::GetFullPath($stdoutPath).Substring($rootFull.Length).Replace('\', '/'))
+        stdoutSha256 = Get-UpperSha256 $stdoutPath
+        stderrPath = ([IO.Path]::GetFullPath($stderrPath).Substring($rootFull.Length).Replace('\', '/'))
+        stderrSha256 = Get-UpperSha256 $stderrPath
+        inputSha256 = $inputSha256
+        baselineAccepted = $true
+        mutatedAccepted = $false
+        mutation = $mutation
+        expectedError = $expectedError
+        observedError = $expectedError
+        exitCode = 0
+        commandLine = "generalsv.exe -installedLockstepV2Validation mode=$Mode"
+        arguments = @('-installedLockstepV2Validation', "mode=$Mode")
+        probeBuildCrc = [uint32]$MapCrc
+        probeContentCrc = [uint32]$Seed
+    }
+    return [pscustomobject]$entry
 }
 
 function Invoke-SelfTest {
@@ -1847,33 +2395,63 @@ function Invoke-SelfTest {
             throw 'Lockstep-v2 host self-test accepted homogeneous worker profiles.'
         }
         $adapterNativePath = Join-Path $root 'LockstepV2LoopbackEvidence.json'
-        [IO.File]::WriteAllText($adapterNativePath, 'native lockstep-v2 fixture',
-            (New-Object Text.UTF8Encoding($false)))
+        $syntheticSourceCommit = [string]::new('a', 40)
+        $syntheticCrossGenerals = New-SyntheticNegativeProbeEvidence $root `
+            'Generals' ([string]::new('A', 64)) $syntheticSourceCommit `
+            'negative-cross-epoch' 1001 1 23063
+        $syntheticContentGenerals = New-SyntheticNegativeProbeEvidence $root `
+            'Generals' ([string]::new('A', 64)) $syntheticSourceCommit `
+            'negative-content-mismatch' 1002 1 23063
+        $syntheticCrossZeroHour = New-SyntheticNegativeProbeEvidence $root `
+            'ZeroHour' ([string]::new('B', 64)) $syntheticSourceCommit `
+            'negative-cross-epoch' 1003 1 23063
+        $syntheticContentZeroHour = New-SyntheticNegativeProbeEvidence $root `
+            'ZeroHour' ([string]::new('B', 64)) $syntheticSourceCommit `
+            'negative-content-mismatch' 1004 1 23063
         $adapterSessions = @(
             [pscustomobject]@{
-                title = 'Generals'; peerCount = 2; sessionNonce = '1' * 32
+                title = 'Generals'; peerCount = 2; sessionNonce = [string]::new('1', 32)
                 peers = @(
                     [pscustomobject]@{ peerCount = 2; networkRosterMask = 3
-                        simulationRosterMask = 63; aiRosterMask = 60; aiPlayerCount = 4 },
+                        simulationRosterMask = 63; aiRosterMask = 60; aiPlayerCount = 4
+                        executableSha256 = [string]::new('A', 64)
+                        sourceCommit = $syntheticSourceCommit },
                     [pscustomobject]@{ peerCount = 2; networkRosterMask = 3
-                        simulationRosterMask = 63; aiRosterMask = 60; aiPlayerCount = 4 })
+                        simulationRosterMask = 63; aiRosterMask = 60; aiPlayerCount = 4
+                        executableSha256 = [string]::new('A', 64)
+                        sourceCommit = $syntheticSourceCommit })
                 workerProfiles = $workerProfiles
                 effectiveWorkerCounts = @(2, 4); mixedWorkerProof = $true
-                comparableProjectionSha256 = 'C' * 64
+                comparableProjectionSha256 = [string]::new('C', 64)
                 profileReadOnlyVerified = $true
             },
             [pscustomobject]@{
-                title = 'ZeroHour'; peerCount = 2; sessionNonce = '2' * 32
+                title = 'ZeroHour'; peerCount = 2; sessionNonce = [string]::new('2', 32)
                 peers = @(
                     [pscustomobject]@{ peerCount = 2; networkRosterMask = 3
-                        simulationRosterMask = 63; aiRosterMask = 60; aiPlayerCount = 4 },
+                        simulationRosterMask = 63; aiRosterMask = 60; aiPlayerCount = 4
+                        executableSha256 = [string]::new('B', 64)
+                        sourceCommit = $syntheticSourceCommit },
                     [pscustomobject]@{ peerCount = 2; networkRosterMask = 3
-                        simulationRosterMask = 63; aiRosterMask = 60; aiPlayerCount = 4 })
+                        simulationRosterMask = 63; aiRosterMask = 60; aiPlayerCount = 4
+                        executableSha256 = [string]::new('B', 64)
+                        sourceCommit = $syntheticSourceCommit })
                 workerProfiles = $workerProfiles
                 effectiveWorkerCounts = @(2, 4); mixedWorkerProof = $true
-                comparableProjectionSha256 = 'D' * 64
+                comparableProjectionSha256 = [string]::new('D', 64)
                 profileReadOnlyVerified = $true
             })
+        $adapterNativeDocument = [ordered]@{
+            schemaVersion = 2
+            evidenceKind = 'lockstep-v2-multiplayer'
+            producer = $LockstepProducer
+            negativeProbes = [ordered]@{
+                crossEpoch = @($syntheticCrossGenerals, $syntheticCrossZeroHour)
+                contentMismatch = @($syntheticContentGenerals, $syntheticContentZeroHour)
+            }
+        }
+        Write-AtomicText $adapterNativePath `
+            ($adapterNativeDocument | ConvertTo-Json -Depth 12)
         $adapter = New-LockstepV2FinalAcceptanceEnvelope `
             -NativeEvidencePath $adapterNativePath `
             -SourceCommit ('a' * 40) `
@@ -1904,6 +2482,33 @@ function Invoke-SelfTest {
             $adapterAttachment.trustDomain -cne 'host-runner' -or
             $adapterAttachment.sha256 -cne (Get-UpperSha256 $adapterNativePath)) {
             throw 'Lockstep-v2 host self-test did not bind the v2 child to the final-acceptance host envelope.'
+        }
+        $tamperedProofPath = Join-Path $root 'Generals\NegativeProbes\cross-epoch.proof'
+        $originalTamperedProof = [IO.File]::ReadAllText($tamperedProofPath)
+        $tamperRejected = $false
+        try {
+            [IO.File]::WriteAllText($tamperedProofPath,
+                ($originalTamperedProof.Replace(
+                    'observed_error=UnsupportedEngineEpoch',
+                    'observed_error=ContentHashMismatch')),
+                (New-Object Text.UTF8Encoding($false)))
+            try {
+                New-LockstepV2FinalAcceptanceEnvelope `
+                    -NativeEvidencePath $adapterNativePath `
+                    -SourceCommit $syntheticSourceCommit `
+                    -ArtifactSetSha256 ([string]::new('B', 64)) `
+                    -RecordedUtc '2026-09-02T00:00:00Z' `
+                    -MapName 'Stage5Validation.map' -MapCrc 1 -Seed 23063 `
+                    -PeerCount 2 -Sessions $adapterSessions | Out-Null
+            }
+            catch { $tamperRejected = $true }
+        }
+        finally {
+            [IO.File]::WriteAllText($tamperedProofPath, $originalTamperedProof,
+                (New-Object Text.UTF8Encoding($false)))
+        }
+        if (-not $tamperRejected) {
+            throw 'Lockstep-v2 host self-test accepted a tampered negative raw proof.'
         }
         $adapterTopologyRejected = $false
         try {
@@ -2134,11 +2739,12 @@ $launcherContracts = [ordered]@{
         $artifactSet.artifacts['zerohour-launcher-config'].sha256 `
         $artifactSet.artifacts['zerohour-launcher'].sha256
 }
-if ($BasePort + (2 * $PeerCount) - 1 -gt 65535) {
+if ($BasePort + (2 * $PeerCount) + 8 - 1 -gt 65535) {
     throw 'BasePort and PeerCount would exceed the 16-bit UDP port range.'
 }
 $allPorts = @()
 $sessionResults = @()
+$negativeProbeResults = @()
 $usedNonces = @{}
 $registrySnapshots = New-Object 'Collections.Generic.List[object]'
 $registrySnapshotKeys = @{}
@@ -2189,6 +2795,33 @@ try {
             }
             $usedNonces[$peerEvidence.runNonce] = $true
         }
+        foreach ($probeIndex in 0..1) {
+            $probeMode = if ($probeIndex -eq 0) {
+                'negative-cross-epoch'
+            }
+            else { 'negative-content-mismatch' }
+            $probePortBase = $BasePort + (2 * $PeerCount) +
+                ($titleIndex * 4) + ($probeIndex * 2)
+            $negativeProbe = Invoke-LockstepNegativeProbe $title `
+                ([string]$artifactSet.artifacts[$role].path) `
+                $executables[$title] $SourceCommit $outputFull $titleRoot `
+                $probePortBase $MapName $MapCrc $Seed $PeerTimeoutSeconds `
+                $launcherContracts[$title] ([bool]$AllowHeadlessDirectExecution) `
+                $titleSession $probeMode
+            $negativeProbeResults += $negativeProbe
+            foreach ($port in @($probePortBase, $probePortBase + 1)) {
+                if ($allPorts -contains $port) {
+                    throw "Lockstep-v2 host reused UDP port $port within one validation run."
+                }
+                $allPorts += $port
+            }
+            if ($usedNonces.ContainsKey($negativeProbe.sessionNonce) -or
+                $usedNonces.ContainsKey($negativeProbe.runNonce)) {
+                throw 'Lockstep-v2 host reused a negative-probe nonce.'
+            }
+            $usedNonces[$negativeProbe.sessionNonce] = $true
+            $usedNonces[$negativeProbe.runNonce] = $true
+        }
     }
     $recordedUtc = [DateTime]::UtcNow.ToString('o')
     $evidence = [ordered]@{
@@ -2212,6 +2845,14 @@ try {
         mapName = $MapName
         mapCrc = $MapCrc
         seed = $Seed
+        negativeProbes = [ordered]@{
+            crossEpoch = @($negativeProbeResults | Where-Object {
+                $_.mode -ceq 'negative-cross-epoch'
+            })
+            contentMismatch = @($negativeProbeResults | Where-Object {
+                $_.mode -ceq 'negative-content-mismatch'
+            })
+        }
         v1Accepted = $false
         profileStrategy = 'known-folder-registry-redirect'
         registryViews = @('Registry32', 'Registry64')

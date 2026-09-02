@@ -13,6 +13,8 @@ namespace rts
 // game can enter it, and no caller-provided mask is accepted as authority.
 bool ConfigureInstalledLockstepV2Qualification(const char *configuration);
 bool IsInstalledLockstepV2QualificationRequested();
+bool IsInstalledLockstepV2NegativeProbeRequested();
+bool RunInstalledLockstepV2NegativeProbe();
 bool PrepareInstalledLockstepV2Qualification(unsigned buildCompatibilityCrc,
 	unsigned contentCrc);
 bool ServiceInstalledLockstepV2Qualification(unsigned buildCompatibilityCrc,

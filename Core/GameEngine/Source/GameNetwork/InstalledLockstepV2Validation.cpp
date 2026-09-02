@@ -16,6 +16,7 @@
 #include "Lib/DeterministicAIPlanning.h"
 #include "Lib/ImmutableSpatialQueryRuntime.h"
 #include "Lib/JobSystem.h"
+#include "Lib/NetworkEpochHandshake.h"
 #include "Lib/ObjectStatusTimerKernel.h"
 #include "Lib/PhysicsIntegrationKernel.h"
 #include "Lib/SimulationExecutionPolicy.h"
@@ -39,6 +40,15 @@ const unsigned kLoopbackAddress = 0x7f000001U;
 const unsigned kMaximumConfigurationCharacters = 4095U;
 const unsigned kQualificationTimeoutMilliseconds = 120000U;
 const unsigned kKnownKernelMask = (1U << lockstep_v2::kKernelCount) - 1U;
+const char *const kNegativeCrossEpochMode = "negative-cross-epoch";
+const char *const kNegativeContentMismatchMode = "negative-content-mismatch";
+
+enum NegativeProbeKind
+{
+	NEGATIVE_PROBE_NONE,
+	NEGATIVE_PROBE_CROSS_EPOCH,
+	NEGATIVE_PROBE_CONTENT_MISMATCH
+};
 
 unsigned CountBits(std::uint64_t value)
 {
@@ -191,6 +201,7 @@ struct InstalledLockstepV2Config
 	std::string directory;
 	std::string receiptName;
 	std::string receiptPath;
+	NegativeProbeKind negativeProbe;
 	lockstep_v2::WorkerTelemetry telemetry;
 	GameInfo *gameInfo;
 
@@ -202,7 +213,8 @@ struct InstalledLockstepV2Config
 		localSlot(0U),
 		peerCount(0U), networkRosterMask(0U), simulationRosterMask(0U),
 		aiRosterMask(0U), mapCrc(0U), seed(0U), expectedBuild(0U),
-		expectedContent(0U), ports({{}}), telemetry(), gameInfo(nullptr) {}
+		expectedContent(0U), ports({{}}), negativeProbe(NEGATIVE_PROBE_NONE),
+		telemetry(), gameInfo(nullptr) {}
 };
 
 InstalledLockstepV2Config g_config;
@@ -411,12 +423,19 @@ bool ParseConfiguration(const char *configuration,
 		!IsSafeMapName(values[FIELD_MAP]) ||
 		!IsSafeReceiptDirectory(values[FIELD_DIRECTORY]) ||
 		!IsSafeReceiptName(values[FIELD_RECEIPT]) ||
-		values[FIELD_MODE] != "trusted-router" ||
 		!ParseUnsigned(values[FIELD_ROUTER], parsed->peerCount, &parsedValue) ||
 		parsedValue != 0U)
 	{
 		return false;
 	}
+	if (values[FIELD_MODE] == "trusted-router")
+		parsed->negativeProbe = NEGATIVE_PROBE_NONE;
+	else if (values[FIELD_MODE] == kNegativeCrossEpochMode)
+		parsed->negativeProbe = NEGATIVE_PROBE_CROSS_EPOCH;
+	else if (values[FIELD_MODE] == kNegativeContentMismatchMode)
+		parsed->negativeProbe = NEGATIVE_PROBE_CONTENT_MISMATCH;
+	else
+		return false;
 	parsed->mapName = values[FIELD_MAP];
 	parsed->mapCrc = 0U;
 	if (!ParseUnsigned(values[FIELD_MAP_CRC], 0xffffffffULL, &parsed->mapCrc) ||
@@ -447,6 +466,12 @@ bool ParseConfiguration(const char *configuration,
 		{
 			return false;
 		}
+	}
+	if (parsed->negativeProbe != NEGATIVE_PROBE_NONE &&
+		(!parsed->expectedBuildPresent || parsed->expectedBuild == 0U ||
+			!parsed->expectedContentPresent || parsed->expectedContent == 0U))
+	{
+		return false;
 	}
 	parsed->directory = values[FIELD_DIRECTORY];
 	parsed->receiptName = values[FIELD_RECEIPT];
@@ -539,6 +564,96 @@ bool CalculateCurrentExecutableSha256(std::string *digest)
 		(*digest)[index * 2U + 1U] = kHex[result[index] & 0x0fU];
 	}
 	return true;
+}
+
+bool CalculateBytesSha256(const runtime_epoch::Byte *bytes,
+	std::size_t byteCount, std::string *digest)
+{
+	if (bytes == nullptr || byteCount == 0U || byteCount > 0xffffffffULL ||
+		digest == nullptr)
+	{
+		return false;
+	}
+	BCRYPT_ALG_HANDLE algorithm = nullptr;
+	BCRYPT_HASH_HANDLE hash = nullptr;
+	DWORD objectLength = 0U;
+	DWORD hashLength = 0U;
+	DWORD propertyBytes = 0U;
+	std::vector<unsigned char> object;
+	std::array<unsigned char, 32U> result = {{}};
+	bool success = BCryptOpenAlgorithmProvider(&algorithm,
+		BCRYPT_SHA256_ALGORITHM, nullptr, 0U) == 0 &&
+		BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
+			reinterpret_cast<PUCHAR>(&objectLength), sizeof(objectLength),
+			&propertyBytes, 0U) == 0 &&
+		BCryptGetProperty(algorithm, BCRYPT_HASH_LENGTH,
+			reinterpret_cast<PUCHAR>(&hashLength), sizeof(hashLength),
+			&propertyBytes, 0U) == 0 && hashLength == result.size();
+	if (success)
+	{
+		object.resize(objectLength);
+		success = objectLength != 0U && BCryptCreateHash(algorithm, &hash,
+			object.data(), objectLength, nullptr, 0U, 0U) == 0;
+	}
+	if (success && BCryptHashData(hash, const_cast<PUCHAR>(bytes),
+		static_cast<ULONG>(byteCount), 0U) != 0)
+	{
+		success = false;
+	}
+	if (success && BCryptFinishHash(hash, result.data(),
+		static_cast<ULONG>(result.size()), 0U) != 0)
+	{
+		success = false;
+	}
+	if (hash != nullptr)
+		BCryptDestroyHash(hash);
+	if (algorithm != nullptr)
+		BCryptCloseAlgorithmProvider(algorithm, 0U);
+	if (!success)
+		return false;
+	static const char kHex[] = "0123456789ABCDEF";
+	digest->resize(result.size() * 2U);
+	for (std::size_t index = 0U; index < result.size(); ++index)
+	{
+		(*digest)[index * 2U] = kHex[result[index] >> 4U];
+		(*digest)[index * 2U + 1U] = kHex[result[index] & 0x0fU];
+	}
+	return true;
+}
+
+const char *NegativeProbeMode(NegativeProbeKind kind)
+{
+	return kind == NEGATIVE_PROBE_CROSS_EPOCH ? kNegativeCrossEpochMode :
+		kind == NEGATIVE_PROBE_CONTENT_MISMATCH ? kNegativeContentMismatchMode :
+		"";
+}
+
+const char *ValidationErrorName(runtime_epoch::ValidationError error)
+{
+	switch (error)
+	{
+	case runtime_epoch::ValidationError::None:
+		return "None";
+	case runtime_epoch::ValidationError::UnsupportedEngineEpoch:
+		return "UnsupportedEngineEpoch";
+	case runtime_epoch::ValidationError::ContentHashMismatch:
+		return "ContentHashMismatch";
+	default:
+		return "Other";
+	}
+}
+
+std::uint64_t MakeNegativeProbeSessionToken(const std::string &runNonce,
+	const std::string &sessionNonce)
+{
+	std::uint64_t token = 14695981039346656037ULL;
+	for (std::size_t index = 0U; index < runNonce.size(); ++index)
+		token = (token ^ static_cast<unsigned char>(runNonce[index])) *
+			1099511628211ULL;
+	for (std::size_t index = 0U; index < sessionNonce.size(); ++index)
+		token = (token ^ static_cast<unsigned char>(sessionNonce[index])) *
+			1099511628211ULL;
+	return token == 0U ? 1U : token;
 }
 
 class QualificationGameInfo : public SkirmishGameInfo
@@ -859,11 +974,148 @@ bool IsInstalledLockstepV2QualificationRequested()
 	return g_config.requested;
 }
 
+bool IsInstalledLockstepV2NegativeProbeRequested()
+{
+
+	return g_config.requested && g_config.negativeProbe != NEGATIVE_PROBE_NONE;
+}
+
+bool RunInstalledLockstepV2NegativeProbe()
+{
+
+	if (!IsInstalledLockstepV2NegativeProbeRequested() ||
+		!IsDirectoryReady(g_config.directory))
+	{
+		g_config.failed = true;
+		std::printf("LOCKSTEP_V2_NEGATIVE_PROBE_FAIL reason=invalid_configuration\n");
+		std::fflush(stdout);
+		return false;
+	}
+	std::string executableSha256;
+	if (!CalculateCurrentExecutableSha256(&executableSha256) ||
+		executableSha256 != g_config.executableSha256)
+	{
+		g_config.failed = true;
+		std::printf("LOCKSTEP_V2_NEGATIVE_PROBE_FAIL reason=executable_identity\n");
+		std::fflush(stdout);
+		return false;
+	}
+	const unsigned buildCompatibilityCrc = g_config.expectedBuild;
+	const unsigned contentCrc = g_config.expectedContent;
+	if (buildCompatibilityCrc == 0U || contentCrc == 0U ||
+		g_config.mapCrc == 0U || g_config.seed == 0U)
+	{
+		g_config.failed = true;
+		std::printf("LOCKSTEP_V2_NEGATIVE_PROBE_FAIL reason=invalid_probe_identity\n");
+		std::fflush(stdout);
+		return false;
+	}
+	const std::uint64_t sessionToken = MakeNegativeProbeSessionToken(
+		g_config.runNonce, g_config.sessionNonce);
+	const network_epoch::NetworkSimulationPolicyIdentity simulationPolicy =
+		network_epoch::MakeNetworkSimulationPolicyIdentity(buildCompatibilityCrc,
+			contentCrc, g_config.mapCrc, g_config.networkRosterMask,
+			kKnownKernelMask);
+	const std::array<runtime_epoch::Byte,
+		network_epoch::kNetworkHelloWireSize> baseline =
+		network_epoch::EncodeNetworkHello(buildCompatibilityCrc, contentCrc,
+			1U, 0U, sessionToken, network_epoch::NetworkHelloKind::Hello,
+			simulationPolicy);
+	std::array<runtime_epoch::Byte, network_epoch::kNetworkHelloWireSize> mutated =
+		baseline;
+	const bool crossEpoch = g_config.negativeProbe == NEGATIVE_PROBE_CROSS_EPOCH;
+	const std::size_t mutationOffset = crossEpoch ? 8U : 20U;
+	mutated[mutationOffset] ^= 1U;
+	const runtime_epoch::ValidationError expectedError = crossEpoch ?
+		runtime_epoch::ValidationError::UnsupportedEngineEpoch :
+		runtime_epoch::ValidationError::ContentHashMismatch;
+	std::string baselineInputSha256;
+	std::string inputSha256;
+	if (!CalculateBytesSha256(baseline.data(), baseline.size(),
+		&baselineInputSha256) ||
+		!CalculateBytesSha256(mutated.data(), mutated.size(), &inputSha256) ||
+		baselineInputSha256 == inputSha256)
+	{
+		g_config.failed = true;
+		std::printf("LOCKSTEP_V2_NEGATIVE_PROBE_FAIL reason=input_hash\n");
+		std::fflush(stdout);
+		return false;
+	}
+	runtime_epoch::NetworkHello baselineHello;
+	network_epoch::NetworkHelloKind baselineKind;
+	network_epoch::NetworkHelloIdentity baselineIdentity;
+	std::uint64_t baselineToken = 0U;
+	network_epoch::NetworkSimulationPolicyIdentity baselinePolicy;
+	const runtime_epoch::ValidationResult baselineResult =
+		network_epoch::DecodeAndValidateNetworkHelloRecord(baseline.data(),
+			baseline.size(), buildCompatibilityCrc, contentCrc, &baselineHello,
+			&baselineKind, &baselineIdentity, &baselineToken, &baselinePolicy);
+	runtime_epoch::NetworkHello mutatedHello;
+	network_epoch::NetworkHelloKind mutatedKind;
+	network_epoch::NetworkHelloIdentity mutatedIdentity;
+	std::uint64_t mutatedToken = 0U;
+	network_epoch::NetworkSimulationPolicyIdentity mutatedPolicy;
+	const runtime_epoch::ValidationResult mutatedResult =
+		network_epoch::DecodeAndValidateNetworkHelloRecord(mutated.data(),
+			mutated.size(), buildCompatibilityCrc, contentCrc, &mutatedHello,
+			&mutatedKind, &mutatedIdentity, &mutatedToken, &mutatedPolicy);
+	const bool baselineAccepted = baselineResult.ok();
+	const bool mutatedAccepted = mutatedResult.ok();
+	if (!baselineAccepted || mutatedAccepted ||
+		mutatedResult.error != expectedError || baselineToken != sessionToken ||
+		baselineIdentity.senderSlot != 1U || baselineIdentity.recipientSlot != 0U)
+	{
+		g_config.failed = true;
+		std::printf("LOCKSTEP_V2_NEGATIVE_PROBE_FAIL mode=%s expected=%s observed=%s\n",
+			NegativeProbeMode(g_config.negativeProbe),
+			ValidationErrorName(expectedError),
+			ValidationErrorName(mutatedResult.error));
+		std::fflush(stdout);
+		return false;
+	}
+	std::ostringstream proof;
+	proof << "RTS_LOCKSTEP_V2_NEGATIVE_PROBE\n";
+	proof << "producer=" << "installed-lockstep-v2\n";
+	proof << "mode=" << NegativeProbeMode(g_config.negativeProbe) << "\n";
+	proof << "schema=" << lockstep_v2::kSchemaVersion << "\n";
+	proof << "protocol_epoch=" << lockstep_v2::kProtocolEpoch << "\n";
+	proof << "run_nonce=" << g_config.runNonce << "\n";
+	proof << "session_nonce=" << g_config.sessionNonce << "\n";
+	proof << "executable_sha256=" << executableSha256 << "\n";
+	proof << "source_revision=" << g_config.sourceRevision << "\n";
+	proof << "probe_build_compatibility_crc=" << buildCompatibilityCrc << "\n";
+	proof << "probe_content_crc=" << contentCrc << "\n";
+	proof << "mutation=" << (crossEpoch ? "engine-epoch" : "content-hash") << "\n";
+	proof << "baseline_input_sha256=" << baselineInputSha256 << "\n";
+	proof << "input_sha256=" << inputSha256 << "\n";
+	proof << "baseline_accepted=" << (baselineAccepted ? 1 : 0) << "\n";
+	proof << "mutated_accepted=" << (mutatedAccepted ? 1 : 0) << "\n";
+	proof << "expected_error=" << ValidationErrorName(expectedError) << "\n";
+	proof << "observed_error=" << ValidationErrorName(mutatedResult.error) << "\n";
+	proof << "process_id=" << static_cast<unsigned long>(GetCurrentProcessId()) << "\n";
+	proof << "END\n";
+	const std::string encoded = proof.str();
+	if (!WriteFileAtomically(g_config.receiptPath, encoded.data(), encoded.size()))
+	{
+		g_config.failed = true;
+		std::printf("LOCKSTEP_V2_NEGATIVE_PROBE_FAIL reason=write_proof\n");
+		std::fflush(stdout);
+		return false;
+	}
+	std::printf("LOCKSTEP_V2_NEGATIVE_PROBE_PASS mode=%s pid=%lu rejection=%s\n",
+		NegativeProbeMode(g_config.negativeProbe),
+		static_cast<unsigned long>(GetCurrentProcessId()),
+		ValidationErrorName(mutatedResult.error));
+	std::fflush(stdout);
+	return true;
+}
+
 bool PrepareInstalledLockstepV2Qualification(unsigned buildCompatibilityCrc,
 	unsigned contentCrc)
 {
 
-	if (!g_config.requested || g_config.prepared || g_config.failed ||
+	if (!g_config.requested || g_config.negativeProbe != NEGATIVE_PROBE_NONE ||
+		g_config.prepared || g_config.failed ||
 		buildCompatibilityCrc == 0U || contentCrc == 0U ||
 		(g_config.expectedBuildPresent &&
 			g_config.expectedBuild != buildCompatibilityCrc) ||

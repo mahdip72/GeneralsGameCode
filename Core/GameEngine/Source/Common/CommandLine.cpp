@@ -502,6 +502,12 @@ Int parseInstalledLockstepV2Validation(char *args[], int num)
 		fflush(stdout);
 		exit(2);
 	}
+	if (rts::IsInstalledLockstepV2NegativeProbeRequested())
+	{
+		if (!rts::RunInstalledLockstepV2NegativeProbe())
+			exit(2);
+		exit(0);
+	}
 	parseHeadless(args, num);
 	TheWritableGlobalData->m_shellMapOn = FALSE;
 	TheWritableGlobalData->m_useFpsLimit = FALSE;
