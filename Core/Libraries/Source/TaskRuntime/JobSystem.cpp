@@ -762,9 +762,18 @@ struct JobSystem::State
 	ReadyEnqueueResult enqueueReady(const std::shared_ptr<JobRecord> &record)
 	{
 		std::unique_lock<std::mutex> publicationLock(record->publicationMutex);
+		// The mutex excludes a new execution claim. Observing finish's release
+		// of executing also acquires its earlier finalizing claim. Checking
+		// finalizing first can read both flags as false across that retirement.
 		if (record->readyPublicationFailed.load(std::memory_order_acquire) ||
-			record->finalizing.load(std::memory_order_acquire) ||
-			record->executing.load(std::memory_order_acquire) ||
+			record->executing.load(std::memory_order_acquire))
+		{
+			return READY_ALREADY_OWNED;
+		}
+#if defined(RTS_BUILD_CORE_EXTRAS)
+		pauseJobSystemTest(16384);
+#endif
+		if (record->finalizing.load(std::memory_order_acquire) ||
 			record->complete.load(std::memory_order_acquire))
 		{
 			return READY_ALREADY_OWNED;
@@ -935,6 +944,9 @@ struct JobSystem::State
 		if (executionOwner)
 		{
 			record->executing.store(false, std::memory_order_release);
+#if defined(RTS_BUILD_CORE_EXTRAS)
+			pauseJobSystemTest(32768);
+#endif
 		}
 		if (record->completion != 0)
 		{
@@ -3036,6 +3048,9 @@ bool JobSystem::trySubmitBatch(const JobSubmission *submissions,
 		m_state->workAvailable.notify_one();
 	}
 
+#if defined(RTS_BUILD_CORE_EXTRAS)
+	pauseJobSystemTest(8192);
+#endif
 	for (const std::shared_ptr<JobRecord> &record : records)
 	{
 		if (!record->complete.load(std::memory_order_acquire) &&

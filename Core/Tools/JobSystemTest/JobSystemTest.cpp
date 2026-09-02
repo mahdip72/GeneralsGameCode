@@ -51,7 +51,10 @@ enum JobSystemTestPause
 	JOB_SYSTEM_TEST_PAUSE_GROUP_COMPLETION_LOCK = 512,
 	JOB_SYSTEM_TEST_PAUSE_HANDLE_WAIT_PREDICATE = 1024,
 	JOB_SYSTEM_TEST_PAUSE_AFTER_HANDLE_COMPLETION = 2048,
-	JOB_SYSTEM_TEST_PAUSE_HANDLE_COMPLETION_LOCK = 4096
+	JOB_SYSTEM_TEST_PAUSE_HANDLE_COMPLETION_LOCK = 4096,
+	JOB_SYSTEM_TEST_PAUSE_BEFORE_BATCH_READY_RECHECK = 8192,
+	JOB_SYSTEM_TEST_PAUSE_READY_OWNERSHIP_RECHECK = 16384,
+	JOB_SYSTEM_TEST_PAUSE_AFTER_EXECUTION_RETIREMENT = 32768
 };
 
 extern "C" void rts_job_system_set_test_fault(unsigned fault,
@@ -1806,6 +1809,106 @@ int testGroupCompletionPublication()
 	return testCompletionPublicationCannotPassWaitingPredicate(false);
 }
 
+int testBatchRecheckCannotRepublishRetiringExecution()
+{
+	int result = 0;
+	rts::JobSystem &system = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 1;
+	config.queueCapacity = 8;
+	config.scratchBytesPerWorker = 4096;
+	config.pinWorkers = false;
+	const bool started = system.start(config);
+	result |= check(started, "batch-retirement fixture starts");
+	if (!started) return result;
+
+	rts::JobGroup group = system.createGroup();
+	Gate gate;
+	std::atomic<unsigned> executions(0);
+	std::atomic<unsigned> destructions(0);
+	rts::JobSubmission submission;
+	submission.job = new BlockingLifetimeJob(&gate, &executions, &destructions);
+	rts::JobHandle handle;
+	std::atomic<bool> batchReturned(false);
+	bool recheckPaused = false;
+	bool executionEntered = false;
+	bool ownershipChecked = false;
+	bool retirementPaused = false;
+	bool admissionFinished = false;
+	rts_job_system_set_test_pause_mask(
+		JOB_SYSTEM_TEST_PAUSE_BEFORE_BATCH_READY_RECHECK |
+		JOB_SYSTEM_TEST_PAUSE_READY_OWNERSHIP_RECHECK |
+		JOB_SYSTEM_TEST_PAUSE_AFTER_EXECUTION_RETIREMENT);
+	std::thread controller([&]() {
+		recheckPaused = rts_job_system_wait_for_test_pause(
+			JOB_SYSTEM_TEST_PAUSE_BEFORE_BATCH_READY_RECHECK, 5000);
+		executionEntered = recheckPaused && gate.waitForEntry();
+		if (executionEntered)
+		{
+			// A rejected duplicate must not attempt another queue publication.
+			// If the bug does attempt one, the fault prevents a phantom ready
+			// counter from stranding shutdown while preserving observable proof.
+			rts_job_system_set_test_fault(JOB_SYSTEM_TEST_FAIL_QUEUE_PUSH, 1);
+			rts_job_system_release_test_pause(
+				JOB_SYSTEM_TEST_PAUSE_BEFORE_BATCH_READY_RECHECK);
+			const std::chrono::steady_clock::time_point deadline =
+				std::chrono::steady_clock::now() + std::chrono::seconds(5);
+			while (!batchReturned.load(std::memory_order_acquire) &&
+				!rts_job_system_wait_for_test_pause(
+					JOB_SYSTEM_TEST_PAUSE_READY_OWNERSHIP_RECHECK, 0) &&
+				std::chrono::steady_clock::now() < deadline)
+			{
+				std::this_thread::yield();
+			}
+			ownershipChecked = batchReturned.load(std::memory_order_acquire) ||
+				rts_job_system_wait_for_test_pause(
+					JOB_SYSTEM_TEST_PAUSE_READY_OWNERSHIP_RECHECK, 0);
+			gate.open();
+			retirementPaused = rts_job_system_wait_for_test_pause(
+				JOB_SYSTEM_TEST_PAUSE_AFTER_EXECUTION_RETIREMENT, 5000);
+			rts_job_system_release_test_pause(
+				JOB_SYSTEM_TEST_PAUSE_READY_OWNERSHIP_RECHECK);
+			const std::chrono::steady_clock::time_point admissionDeadline =
+				std::chrono::steady_clock::now() + std::chrono::seconds(5);
+			while (!batchReturned.load(std::memory_order_acquire) &&
+				std::chrono::steady_clock::now() < admissionDeadline)
+			{
+				std::this_thread::yield();
+			}
+			admissionFinished = batchReturned.load(std::memory_order_acquire);
+		}
+		// Every error path releases both the worker and the admission thread.
+		gate.open();
+		rts_job_system_set_test_pause_mask(0);
+	});
+	const bool accepted = system.trySubmitBatch(&submission, 1, group, &handle);
+	batchReturned.store(true, std::memory_order_release);
+	controller.join();
+	if (!accepted) delete submission.job;
+	result |= check(accepted && recheckPaused && executionEntered &&
+		ownershipChecked && retirementPaused && admissionFinished,
+		"batch recheck overlaps a real execution's controlled retirement");
+	if (accepted)
+	{
+		result |= check(system.wait(group) && handle.succeeded() &&
+			executions.load() == 1 && destructions.load() == 1,
+			"retiring batch job completes and destroys exactly once");
+	}
+
+	rts::Job *probe = new LifetimeJob(&destructions);
+	rts::JobHandle probeHandle = system.trySubmit(probe,
+		rts::JOB_PRIORITY_NORMAL, group);
+	result |= check(!probeHandle.isValid(),
+		"retiring execution rejects duplicate publication before consuming the queue fault");
+	if (!probeHandle.isValid()) delete probe;
+	else system.wait(group);
+	rts_job_system_set_test_fault(0, 0);
+	result |= check(group.isComplete() && system.outstandingJobCount() == 0,
+		"batch-retirement regression drains without phantom ready work");
+	system.shutdown();
+	return result;
+}
+
 int testFaultInjectionAndRecovery()
 {
 	int result = 0;
@@ -2548,6 +2651,7 @@ int main(int argc, char **argv)
 #if defined(RTS_BUILD_CORE_EXTRAS)
 	result |= runTest("testHandleCompletionPublication", testHandleCompletionPublication);
 	result |= runTest("testGroupCompletionPublication", testGroupCompletionPublication);
+	result |= runTest("testBatchRecheckCannotRepublishRetiringExecution", testBatchRecheckCannotRepublishRetiringExecution);
 	result |= runTest("testFaultInjectionAndRecovery", testFaultInjectionAndRecovery);
 #endif
 	result |= runTest("testBatchAdmissionAndWorkerWaitRejection", testBatchAdmissionAndWorkerWaitRejection);
