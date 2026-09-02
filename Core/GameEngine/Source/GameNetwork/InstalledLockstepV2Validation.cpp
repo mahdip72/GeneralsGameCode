@@ -175,6 +175,9 @@ struct InstalledLockstepV2Config
 	ULONGLONG preparedAt;
 	unsigned localSlot;
 	unsigned peerCount;
+	unsigned networkRosterMask;
+	unsigned simulationRosterMask;
+	unsigned aiRosterMask;
 	unsigned mapCrc;
 	unsigned seed;
 	unsigned expectedBuild;
@@ -197,7 +200,8 @@ struct InstalledLockstepV2Config
 		finalized(false), expectedBuildPresent(false), expectedContentPresent(false),
 		preparedAt(0U),
 		localSlot(0U),
-		peerCount(0U), mapCrc(0U), seed(0U), expectedBuild(0U),
+		peerCount(0U), networkRosterMask(0U), simulationRosterMask(0U),
+		aiRosterMask(0U), mapCrc(0U), seed(0U), expectedBuild(0U),
 		expectedContent(0U), ports({{}}), telemetry(), gameInfo(nullptr) {}
 };
 
@@ -221,13 +225,17 @@ enum ConfigurationField
 	FIELD_ROUTER,
 	FIELD_BUILD,
 	FIELD_CONTENT,
+	FIELD_NETWORK_ROSTER,
+	FIELD_SIMULATION_ROSTER,
+	FIELD_AI_ROSTER,
 	FIELD_COUNT
 };
 
 const char *const kFieldNames[FIELD_COUNT] =
 {
 	"peer", "peers", "ports", "run", "session", "exe", "source", "map",
-	"map_crc", "seed", "dir", "receipt", "mode", "router", "build", "content"
+	"map_crc", "seed", "dir", "receipt", "mode", "router", "build", "content",
+	"network_roster", "simulation_roster", "ai_roster"
 };
 
 bool GetFieldIndex(const std::string &name, unsigned *index)
@@ -345,7 +353,8 @@ bool ParseConfiguration(const char *configuration,
 	{
 		FIELD_PEER, FIELD_PEERS, FIELD_PORTS, FIELD_RUN, FIELD_SESSION,
 		FIELD_EXE, FIELD_SOURCE, FIELD_MAP, FIELD_MAP_CRC, FIELD_SEED,
-		FIELD_DIRECTORY, FIELD_RECEIPT, FIELD_MODE, FIELD_ROUTER
+		FIELD_DIRECTORY, FIELD_RECEIPT, FIELD_MODE, FIELD_ROUTER,
+		FIELD_NETWORK_ROSTER, FIELD_SIMULATION_ROSTER, FIELD_AI_ROSTER
 	};
 	for (unsigned index = 0U; index < sizeof(required) / sizeof(required[0]);
 		++index)
@@ -368,6 +377,32 @@ bool ParseConfiguration(const char *configuration,
 		return false;
 	}
 	parsed->peerCount = parsedValue;
+	if (!ParseUnsigned(values[FIELD_NETWORK_ROSTER],
+		(1U << lockstep_v2::kMaxPeerCount) - 1U, &parsedValue))
+	{
+		return false;
+	}
+	parsed->networkRosterMask = parsedValue;
+	if (!ParseUnsigned(values[FIELD_SIMULATION_ROSTER],
+		(1U << lockstep_v2::kMaxPeerCount) - 1U, &parsedValue))
+	{
+		return false;
+	}
+	parsed->simulationRosterMask = parsedValue;
+	if (!ParseUnsigned(values[FIELD_AI_ROSTER],
+		(1U << lockstep_v2::kMaxPeerCount) - 1U, &parsedValue))
+	{
+		return false;
+	}
+	parsed->aiRosterMask = parsedValue;
+	if (parsed->peerCount != lockstep_v2::kQualificationNetworkPeerCount ||
+		parsed->networkRosterMask != lockstep_v2::kQualificationNetworkRosterMask ||
+		parsed->simulationRosterMask !=
+			lockstep_v2::kQualificationSimulationRosterMask ||
+		parsed->aiRosterMask != lockstep_v2::kQualificationAIRosterMask)
+	{
+		return false;
+	}
 	if (!ParsePorts(values[FIELD_PORTS], parsed->peerCount, &parsed->ports) ||
 		!IsCanonicalHex(values[FIELD_RUN], lockstep_v2::kNonceHexChars) ||
 		!IsCanonicalHex(values[FIELD_SESSION], lockstep_v2::kNonceHexChars) ||
@@ -550,6 +585,37 @@ bool AssignProductionKernelTelemetry(std::uint64_t physicalWorkerJobs,
 	return true;
 }
 
+lockstep_v2::AIPlanningTelemetry CaptureAIPlanningTelemetry(
+	const AIPlanningRuntimeMetrics &metrics)
+{
+	lockstep_v2::AIPlanningTelemetry telemetry;
+	telemetry.capturedSnapshots = metrics.capturedSnapshots;
+	telemetry.capturedCandidates = metrics.capturedCandidates;
+	telemetry.requestedBatches = metrics.requestedBatches;
+	telemetry.submittedJobs = metrics.submittedJobs;
+	telemetry.completedJobs = metrics.completedJobs;
+	telemetry.serialFallbacks = metrics.serialFallbacks;
+	telemetry.shadowMatches = metrics.shadowMatches;
+	telemetry.shadowMismatches = metrics.shadowMismatches;
+	telemetry.validationFailures = metrics.validationFailures;
+	telemetry.canonicalValidationInvocations =
+		metrics.canonicalValidationInvocations;
+	telemetry.committedBatches = metrics.committedBatches;
+	telemetry.parallelAuthoritativeCommits =
+		metrics.parallelAuthoritativeCommits;
+	telemetry.rejectedCommits = metrics.rejectedCommits;
+	telemetry.physicalWorkerExecutions = metrics.physicalWorkerExecutions;
+	telemetry.ownerHelpedExecutions = metrics.ownerHelpedExecutions;
+	telemetry.observedPhysicalWorkerMask = metrics.observedPhysicalWorkerMask;
+	telemetry.maximumDistinctPhysicalWorkers =
+		metrics.maximumDistinctPhysicalWorkers;
+	telemetry.maximumConcurrentPhysicalWorkers =
+		metrics.maximumConcurrentPhysicalWorkers;
+	telemetry.planningDigest = lockstep_v2::ComputeAIPlanningDigest(
+		g_config.simulationRosterMask, g_config.aiRosterMask, telemetry);
+	return telemetry;
+}
+
 void ResetProductionKernelTelemetry()
 {
 	ResetPhysicsIntegrationRuntimeMetrics();
@@ -576,10 +642,15 @@ bool CollectProductionKernelTelemetry(lockstep_v2::WorkerTelemetry *telemetry)
 		GetPhysicsIntegrationRuntimeMetrics();
 	const ObjectStatusTimerRuntimeMetrics status =
 		GetObjectStatusTimerRuntimeMetrics();
+	const CollisionCandidateRuntimeMetrics collision =
+		GetCollisionCandidateRuntimeMetrics();
 	const AIPlanningRuntimeMetrics ai = GetAIPlanningRuntimeMetrics();
+	const ImmutableSpatialRuntimeMetrics spatial =
+		GetImmutableSpatialRuntimeMetrics();
 	const OrdinaryPathRuntimeMetrics path = GetOrdinaryPathRuntimeMetrics();
 	lockstep_v2::WorkerTelemetry observed;
 	observed.executableOrigin = true;
+	observed.aiPlanning = CaptureAIPlanningTelemetry(ai);
 
 	const bool physicsValid = physics.acceptedBatches > 0U &&
 		physics.acceptedOwnerHelpedJobs == 0U &&
@@ -594,10 +665,26 @@ bool CollectProductionKernelTelemetry(lockstep_v2::WorkerTelemetry *telemetry)
 			status.physicalWorkerMask,
 			status.maximumPeakConcurrentPhysicalWorkers,
 			status.physicalWorkerMaskComplete, &observed.kernels[1]);
-	// Collision currently records workers per accepted batch but not their peak
-	// overlap.  A union/distinct count cannot be relabeled as concurrency, so the
-	// v2 authority bit remains fail-closed until that production metric exists.
-	const bool collisionValid = false;
+	// Collision authority requires accepted parallel work with a kernel-local
+	// overlap observation.  The aggregate mask is only accepted when complete;
+	// its cardinality must cover the largest exact per-batch distinct count.
+	const bool collisionValid = collision.authoritativeCommits > 0U &&
+		collision.shadowMismatches == 0U && collision.ownerHelpedJobs == 0U &&
+		collision.ownerFallbacks == 0U && collision.unexpectedFallbacks == 0U &&
+		collision.submittedJobs > 0U &&
+		collision.completedJobs == collision.submittedJobs &&
+		collision.physicalWorkerJobs == collision.completedJobs &&
+		collision.physicalWorkerMaskComplete &&
+		collision.distinctPhysicalWorkers > 1U &&
+		collision.maximumPeakConcurrentPhysicalWorkers > 1U &&
+		collision.maximumPeakConcurrentPhysicalWorkers <=
+			collision.distinctPhysicalWorkers &&
+		CountBits(collision.physicalWorkerMask) >=
+			collision.distinctPhysicalWorkers &&
+		AssignProductionKernelTelemetry(collision.physicalWorkerJobs,
+			collision.physicalWorkerMask,
+			collision.maximumPeakConcurrentPhysicalWorkers,
+			collision.physicalWorkerMaskComplete, &observed.kernels[2]);
 	const bool aiValid = ai.parallelAuthoritativeCommits > 0U &&
 		ai.ownerHelpedExecutions == 0U && ai.shadowMismatches == 0U &&
 		ai.validationFailures == 0U &&
@@ -605,9 +692,50 @@ bool CollectProductionKernelTelemetry(lockstep_v2::WorkerTelemetry *telemetry)
 			ai.observedPhysicalWorkerMask,
 			static_cast<unsigned>(ai.maximumConcurrentPhysicalWorkers), true,
 			&observed.kernels[3]);
-	// Spatial has the same boundary: its process-wide mask and per-collection
-	// distinct maximum do not prove concurrent overlap or mask completeness.
-	const bool spatialValid = false;
+	// Spatial collection metrics retain the exact kernel-local peak and the
+	// completeness bit for the process-wide worker mask.  Consumer telemetry is
+	// also required to remain free of owner help, fallbacks, and validation
+	// failures while the collection is used authoritatively.
+	const bool spatialConsumersValid =
+		spatial.healing.shadowMismatches == 0U &&
+		spatial.healing.ownerHelpedJobs == 0U &&
+		spatial.healing.expectedFallbacks == 0U &&
+		spatial.healing.unexpectedFallbacks == 0U &&
+		spatial.healing.staleRejections == 0U &&
+		spatial.healing.validationFailures == 0U &&
+		spatial.healing.circuitBreakerTrips == 0U &&
+		spatial.healing.completedJobs == spatial.healing.submittedJobs &&
+		spatial.healing.physicalWorkerJobs == spatial.healing.completedJobs &&
+		spatial.pointDefenseLaser.shadowMismatches == 0U &&
+		spatial.pointDefenseLaser.ownerHelpedJobs == 0U &&
+		spatial.pointDefenseLaser.expectedFallbacks == 0U &&
+		spatial.pointDefenseLaser.unexpectedFallbacks == 0U &&
+		spatial.pointDefenseLaser.staleRejections == 0U &&
+		spatial.pointDefenseLaser.validationFailures == 0U &&
+		spatial.pointDefenseLaser.circuitBreakerTrips == 0U &&
+		spatial.pointDefenseLaser.completedJobs ==
+			spatial.pointDefenseLaser.submittedJobs &&
+		spatial.pointDefenseLaser.physicalWorkerJobs ==
+			spatial.pointDefenseLaser.completedJobs;
+	const bool spatialValid = spatial.successfulCollections > 0U &&
+		spatial.collectionSubmittedJobs > 0U &&
+		spatial.collectionCompletedJobs == spatial.collectionSubmittedJobs &&
+		spatial.collectionPhysicalWorkerJobs ==
+			spatial.collectionCompletedJobs &&
+		spatial.collectionOwnerHelpedJobs == 0U &&
+		spatial.collectionPhysicalWorkerMaskComplete &&
+		spatial.maximumCollectionDistinctPhysicalWorkers > 1U &&
+		spatial.maximumCollectionPeakConcurrentPhysicalWorkers > 1U &&
+		spatial.maximumCollectionPeakConcurrentPhysicalWorkers <=
+			spatial.maximumCollectionDistinctPhysicalWorkers &&
+		CountBits(spatial.collectionPhysicalWorkerMask) >=
+			spatial.maximumCollectionDistinctPhysicalWorkers &&
+		spatialConsumersValid &&
+		AssignProductionKernelTelemetry(spatial.collectionPhysicalWorkerJobs,
+			spatial.collectionPhysicalWorkerMask,
+			static_cast<unsigned>(
+				spatial.maximumCollectionPeakConcurrentPhysicalWorkers),
+			spatial.collectionPhysicalWorkerMaskComplete, &observed.kernels[4]);
 	const bool pathValid = path.authoritativeMultiWorkerCommits > 0U &&
 		path.ownerHelpedRangeJobs == 0U && path.failedRangeJobs == 0U &&
 		path.validationFailures == 0U && path.shadowMismatches == 0U &&
@@ -647,7 +775,9 @@ bool BuildSession(unsigned buildCompatibilityCrc, unsigned contentCrc,
 	*session = lockstep_v2::SessionContract();
 	session->localSlot = g_config.localSlot;
 	session->peerCount = g_config.peerCount;
-	session->rosterMask = (1U << g_config.peerCount) - 1U;
+	session->rosterMask = g_config.networkRosterMask;
+	session->simulationRosterMask = g_config.simulationRosterMask;
+	session->aiRosterMask = g_config.aiRosterMask;
 	session->buildCompatibilityCrc = buildCompatibilityCrc;
 	session->contentCrc = contentCrc;
 	session->mapCrc = g_config.mapCrc;
@@ -773,10 +903,32 @@ bool PrepareInstalledLockstepV2Qualification(unsigned buildCompatibilityCrc,
 	for (unsigned slotIndex = 0U; slotIndex < MAX_SLOTS; ++slotIndex)
 	{
 		GameSlot *slot = game->getSlot(static_cast<Int>(slotIndex));
-		if (slotIndex >= g_config.peerCount)
+		const unsigned slotBit = 1U << slotIndex;
+		if ((g_config.simulationRosterMask & slotBit) == 0U)
 		{
 			slot->setState(SLOT_CLOSED);
 			continue;
+		}
+		if ((g_config.aiRosterMask & slotBit) != 0U)
+		{
+			// AI slots are local deterministic simulation owners.  They are
+			// intentionally outside the network roster and never receive a
+			// transport port or a peer command contribution.
+			slot->setState(SLOT_BRUTAL_AI);
+			slot->setPlayerTemplate(PLAYERTEMPLATE_RANDOM);
+			slot->setColor(static_cast<Int>(slotIndex));
+			slot->setStartPos(static_cast<Int>(slotIndex));
+			slot->setTeamNumber(1);
+			slot->setMapAvailability(TRUE);
+			slot->setAccept();
+			continue;
+		}
+		if ((g_config.networkRosterMask & slotBit) == 0U ||
+			slotIndex >= g_config.peerCount)
+		{
+			g_config.failed = true;
+			delete game;
+			return false;
 		}
 		AsciiString name;
 		name.format("lockstep-v2-peer-%u", slotIndex);
@@ -787,7 +939,9 @@ bool PrepareInstalledLockstepV2Qualification(unsigned buildCompatibilityCrc,
 		slot->setPlayerTemplate(0);
 		slot->setColor(static_cast<Int>(slotIndex));
 		slot->setStartPos(static_cast<Int>(slotIndex));
-		slot->setTeamNumber(static_cast<Int>(slotIndex & 1U));
+		// The two network humans are allied against the four local AIs.  This
+		// is the explicit 2v4 qualification topology, not six network peers.
+		slot->setTeamNumber(0);
 		slot->setMapAvailability(TRUE);
 		slot->setAccept();
 	}
@@ -832,8 +986,9 @@ bool PrepareInstalledLockstepV2Qualification(unsigned buildCompatibilityCrc,
 	message->appendIntegerArgument(0);
 	g_config.preparedAt = GetTickCount64();
 	g_config.prepared = true;
-	std::printf("LOCKSTEP_V2_VALIDATION_PREPARED peer=%u peers=%u port=%u\n",
-		g_config.localSlot, g_config.peerCount,
+	std::printf("LOCKSTEP_V2_VALIDATION_PREPARED peer=%u peers=%u network_roster=%u simulation_roster=%u ai_roster=%u port=%u\n",
+		g_config.localSlot, g_config.peerCount, g_config.networkRosterMask,
+		g_config.simulationRosterMask, g_config.aiRosterMask,
 		g_config.ports[g_config.localSlot]);
 	std::fflush(stdout);
 	return true;

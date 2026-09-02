@@ -18,6 +18,14 @@ constexpr std::uint32_t kProtocolEpoch = 2U;
 constexpr std::uint32_t kCommonStopFrame = 4096U;
 constexpr std::uint32_t kMinPeerCount = 2U;
 constexpr std::uint32_t kMaxPeerCount = 8U;
+// The installed qualification lane deliberately exercises two network humans
+// against four local skirmish AIs.  AI slots are simulation participants, not
+// transport peers and must never be added to the network peer count.
+constexpr std::uint32_t kQualificationNetworkPeerCount = 2U;
+constexpr std::uint32_t kQualificationNetworkRosterMask = 0x3U;
+constexpr std::uint32_t kQualificationSimulationRosterMask = 0x3fU;
+constexpr std::uint32_t kQualificationAIRosterMask = 0x3cU;
+constexpr std::uint32_t kQualificationAIPlayerCount = 4U;
 constexpr std::uint32_t kKernelCount = 6U;
 constexpr std::uint32_t kCheckpointStride = 32U;
 constexpr std::uint32_t kMaxCheckpoints =
@@ -46,7 +54,13 @@ struct SessionContract
 	std::uint32_t protocolEpoch = kProtocolEpoch;
 	std::uint32_t localSlot = 0U;
 	std::uint32_t peerCount = 0U;
+	// rosterMask is the authenticated network-human roster.  It intentionally
+	// excludes local AI simulation participants.
 	std::uint32_t rosterMask = 0U;
+	// simulationRosterMask covers every occupied deterministic simulation slot.
+	// aiRosterMask identifies the subset owned by local skirmish AI.
+	std::uint32_t simulationRosterMask = 0U;
+	std::uint32_t aiRosterMask = 0U;
 	std::uint32_t buildCompatibilityCrc = 0U;
 	std::uint32_t contentCrc = 0U;
 	std::uint32_t mapCrc = 0U;
@@ -58,6 +72,35 @@ struct SessionContract
 	std::array<char, kNonceHexChars + 1U> sessionNonce = {{}};
 	std::array<char, kSha256HexChars + 1U> executableSha256 = {{}};
 	std::array<char, kSourceRevisionHexChars + 1U> sourceRevision = {{}};
+};
+
+// Executable-origin AI planning evidence is kept separate from peer command
+// contributions.  These counters are copied from the AI-only runtime metrics
+// after the common stop frame; planningDigest binds the deterministic planning
+// counters to the explicit simulation/AI roster masks.  Host-local physical
+// worker observations remain separately validated and are intentionally not in
+// the cross-peer digest because qualification uses mixed worker profiles.
+struct AIPlanningTelemetry
+{
+	std::uint64_t capturedSnapshots = 0U;
+	std::uint64_t capturedCandidates = 0U;
+	std::uint64_t requestedBatches = 0U;
+	std::uint64_t submittedJobs = 0U;
+	std::uint64_t completedJobs = 0U;
+	std::uint64_t serialFallbacks = 0U;
+	std::uint64_t shadowMatches = 0U;
+	std::uint64_t shadowMismatches = 0U;
+	std::uint64_t validationFailures = 0U;
+	std::uint64_t canonicalValidationInvocations = 0U;
+	std::uint64_t committedBatches = 0U;
+	std::uint64_t parallelAuthoritativeCommits = 0U;
+	std::uint64_t rejectedCommits = 0U;
+	std::uint64_t physicalWorkerExecutions = 0U;
+	std::uint64_t ownerHelpedExecutions = 0U;
+	std::uint64_t observedPhysicalWorkerMask = 0U;
+	std::uint64_t maximumDistinctPhysicalWorkers = 0U;
+	std::uint64_t maximumConcurrentPhysicalWorkers = 0U;
+	std::uint64_t planningDigest = 0U;
 };
 
 struct PeerCommandContribution
@@ -96,6 +139,7 @@ struct WorkerTelemetry
 	std::uint32_t authorityMask = 0U;
 	bool executableOrigin = false;
 	std::array<KernelWorkerTelemetry, kKernelCount> kernels = {{}};
+	AIPlanningTelemetry aiPlanning;
 };
 
 struct Receipt
@@ -114,6 +158,7 @@ struct Receipt
 	bool cleanShutdown = false;
 	std::array<PeerCommandContribution, kMaxPeerCount> contributions = {{}};
 	std::array<KernelWorkerTelemetry, kKernelCount> workerTelemetry = {{}};
+	AIPlanningTelemetry aiPlanning;
 	std::array<FrameCheckpoint, kMaxCheckpoints> checkpoints = {{}};
 };
 
@@ -163,8 +208,14 @@ std::uint64_t MixCommandDigest(std::uint64_t priorDigest,
 	std::uint16_t commandId,
 	std::uint64_t commandDigest);
 
+std::uint64_t ComputeAIPlanningDigest(std::uint32_t simulationRosterMask,
+	std::uint32_t aiRosterMask,
+	const AIPlanningTelemetry &telemetry);
+
 bool IsCanonicalHex(const char *value, std::size_t hexChars);
 bool IsValidSessionContract(const SessionContract &session);
+bool IsValidAIPlanningTelemetry(const SessionContract &session,
+	const AIPlanningTelemetry &telemetry);
 
 ValidationResult ValidateReceipt(const Receipt &receipt,
 	const SessionContract &expectedSession,

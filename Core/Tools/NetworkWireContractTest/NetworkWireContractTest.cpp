@@ -888,6 +888,8 @@ int TestLockstepV2ReceiptContract()
 	session.localSlot = 0U;
 	session.peerCount = 2U;
 	session.rosterMask = 0x3U;
+	session.simulationRosterMask = 0x3U;
+	session.aiRosterMask = 0U;
 	session.buildCompatibilityCrc = 0x11223344U;
 	session.contentCrc = 0xaabbccddU;
 	session.mapCrc = 0x55667788U;
@@ -900,6 +902,20 @@ int TestLockstepV2ReceiptContract()
 	int result = 0;
 	result |= Check(IsValidSessionContract(session),
 		"lockstep-v2 session requires exact roster, hashes, nonces, and frame bound");
+	SessionContract mixedSession = session;
+	mixedSession.simulationRosterMask =
+		kQualificationSimulationRosterMask;
+	mixedSession.aiRosterMask = kQualificationAIRosterMask;
+	result |= Check(IsValidSessionContract(mixedSession),
+		"lockstep-v2 keeps two network humans distinct from four local AI slots");
+	SessionContract overlappingRoles = mixedSession;
+	overlappingRoles.aiRosterMask |= 0x1U;
+	result |= Check(!IsValidSessionContract(overlappingRoles),
+		"lockstep-v2 rejects an AI role that overlaps the network roster");
+	SessionContract missingSimulationSlot = mixedSession;
+	missingSimulationSlot.simulationRosterMask &= ~0x20U;
+	result |= Check(!IsValidSessionContract(missingSimulationSlot),
+		"lockstep-v2 rejects a simulation roster that omits an AI role");
 	SessionContract zeroIdentity = session;
 	FillCanonicalText(zeroIdentity.executableSha256, '0');
 	result |= Check(!IsValidSessionContract(zeroIdentity),
@@ -929,6 +945,27 @@ int TestLockstepV2ReceiptContract()
 		workerTelemetry.kernels[kernel].peakConcurrentPhysicalWorkers = 2U;
 		workerTelemetry.kernels[kernel].physicalWorkerMaskComplete = true;
 	}
+	AIPlanningTelemetry aiPlanning;
+	aiPlanning.capturedSnapshots = 4U;
+	aiPlanning.capturedCandidates = 16U;
+	aiPlanning.requestedBatches = 2U;
+	aiPlanning.submittedJobs = 8U;
+	aiPlanning.completedJobs = 8U;
+	aiPlanning.canonicalValidationInvocations = 2U;
+	aiPlanning.committedBatches = 2U;
+	aiPlanning.parallelAuthoritativeCommits = 2U;
+	aiPlanning.physicalWorkerExecutions = 8U;
+	aiPlanning.observedPhysicalWorkerMask = 0x3U;
+	aiPlanning.maximumDistinctPhysicalWorkers = 2U;
+	aiPlanning.maximumConcurrentPhysicalWorkers = 2U;
+	aiPlanning.planningDigest = ComputeAIPlanningDigest(
+		mixedSession.simulationRosterMask, mixedSession.aiRosterMask, aiPlanning);
+	result |= Check(IsValidAIPlanningTelemetry(mixedSession, aiPlanning),
+		"lockstep-v2 AI telemetry requires an executable-origin parallel commit digest");
+	AIPlanningTelemetry alteredAIPlanning = aiPlanning;
+	++alteredAIPlanning.planningDigest;
+	result |= Check(!IsValidAIPlanningTelemetry(mixedSession, alteredAIPlanning),
+		"lockstep-v2 rejects an altered AI planning digest");
 	result |= Check(recorder.begin(session, 0x0102030405060708ULL,
 		executableSha256, workerTelemetry),
 		"receipt recorder binds executable, session, and worker telemetry");
@@ -966,8 +1003,49 @@ int TestLockstepV2ReceiptContract()
 		0x0102030405060708ULL, 0x3U, false,
 		session.provenKernelMask).error == ValidationError::AuthorityNotProven,
 		"a claimed kernel without physical-worker evidence cannot grant authority");
-
+	WorkerTelemetry mixedWorkerTelemetry = workerTelemetry;
+	mixedWorkerTelemetry.aiPlanning = aiPlanning;
+	ReceiptRecorder mixedRecorder;
+	result |= Check(mixedRecorder.begin(mixedSession, 0x1112131415161718ULL,
+		executableSha256, mixedWorkerTelemetry),
+		"mixed lockstep-v2 recorder accepts local AI planning telemetry");
+	result |= Check(mixedRecorder.recordCommand(1U, 0U, 10U, localDigest) &&
+		mixedRecorder.recordCommand(1U, 1U, 20U, remoteDigest),
+		"mixed lockstep-v2 keeps commands limited to network-human origins");
+	for (std::uint32_t frame = 1U; frame <= kCommonStopFrame; ++frame)
+	{
+		if (!mixedRecorder.recordFrame(frame, frame ^ 0x5a5a5a5aU, 0U))
+		{
+			result |= Check(false,
+				"mixed lockstep-v2 recorder accepts sequential gameplay frames");
+			break;
+		}
+	}
+	result |= Check(mixedRecorder.finish(true, true, true),
+		"mixed lockstep-v2 receipt requires a clean AI planning boundary");
+	const Receipt &mixedReceipt = mixedRecorder.receipt();
 	std::array<char, kReceiptBufferBytes> encoded = {{}};
+	result |= Check(ValidateReceipt(mixedReceipt, mixedSession,
+		0x1112131415161718ULL, kQualificationNetworkRosterMask, false,
+		mixedSession.provenKernelMask).ok() &&
+		mixedReceipt.aiPlanning.planningDigest == aiPlanning.planningDigest,
+		"mixed lockstep-v2 receipt binds AI telemetry separately from peer commands");
+	std::size_t mixedEncodedBytes = 0U;
+	result |= Check(EncodeReceipt(mixedReceipt, encoded.data(), encoded.size(),
+		&mixedEncodedBytes) && mixedEncodedBytes > 0U,
+		"mixed lockstep-v2 receipt has a bounded canonical text encoding");
+	Receipt mixedDecoded;
+	result |= Check(DecodeReceipt(encoded.data(), mixedEncodedBytes,
+		&mixedDecoded).ok() &&
+		ValidateReceipt(mixedDecoded, mixedSession,
+			0x1112131415161718ULL, kQualificationNetworkRosterMask, false,
+			mixedSession.provenKernelMask).ok() &&
+		mixedDecoded.session.simulationRosterMask ==
+			kQualificationSimulationRosterMask &&
+		mixedDecoded.session.aiRosterMask == kQualificationAIRosterMask &&
+		mixedDecoded.aiPlanning.planningDigest == aiPlanning.planningDigest,
+		"mixed receipt round-trip retains role masks and AI planning digest");
+
 	std::size_t encodedBytes = 0U;
 	Receipt oversizedReceipt = receipt;
 	oversizedReceipt.checkpointCount = kMaxCheckpoints + 1U;

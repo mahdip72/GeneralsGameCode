@@ -115,6 +115,69 @@ bool IsWorkerTelemetryValid(const WorkerTelemetry &telemetry,
 	return true;
 }
 
+std::uint64_t AppendAIPlanningDigestValue(std::uint64_t hash,
+	std::uint64_t value, unsigned bytes)
+{
+	runtime_epoch::Byte encoded[sizeof(std::uint64_t)] = {};
+	for (unsigned index = 0U; index < bytes; ++index)
+	{
+		encoded[index] = static_cast<runtime_epoch::Byte>(value & 0xffU);
+		value >>= 8U;
+	}
+	return FnvUpdate(hash, encoded, bytes);
+}
+
+std::uint64_t ComputeAIPlanningDigestInternal(std::uint32_t simulationRosterMask,
+	std::uint32_t aiRosterMask, const AIPlanningTelemetry &telemetry)
+{
+	if (aiRosterMask == 0U)
+		return 0U;
+	std::uint64_t hash = kFnvOffset;
+	hash = AppendAIPlanningDigestValue(hash, simulationRosterMask, 4U);
+	hash = AppendAIPlanningDigestValue(hash, aiRosterMask, 4U);
+	hash = AppendAIPlanningDigestValue(hash, telemetry.capturedSnapshots, 8U);
+	hash = AppendAIPlanningDigestValue(hash, telemetry.capturedCandidates, 8U);
+	hash = AppendAIPlanningDigestValue(hash, telemetry.requestedBatches, 8U);
+	hash = AppendAIPlanningDigestValue(hash, telemetry.submittedJobs, 8U);
+	hash = AppendAIPlanningDigestValue(hash, telemetry.completedJobs, 8U);
+	hash = AppendAIPlanningDigestValue(hash, telemetry.serialFallbacks, 8U);
+	hash = AppendAIPlanningDigestValue(hash, telemetry.shadowMatches, 8U);
+	hash = AppendAIPlanningDigestValue(hash, telemetry.shadowMismatches, 8U);
+	hash = AppendAIPlanningDigestValue(hash, telemetry.validationFailures, 8U);
+	hash = AppendAIPlanningDigestValue(hash,
+		telemetry.canonicalValidationInvocations, 8U);
+	hash = AppendAIPlanningDigestValue(hash, telemetry.committedBatches, 8U);
+	hash = AppendAIPlanningDigestValue(hash,
+		telemetry.parallelAuthoritativeCommits, 8U);
+	hash = AppendAIPlanningDigestValue(hash, telemetry.rejectedCommits, 8U);
+	hash = AppendAIPlanningDigestValue(hash, telemetry.ownerHelpedExecutions, 8U);
+	// Physical worker observations are validated as executable-origin telemetry
+	// but deliberately do not enter the cross-peer planning digest: the
+	// qualification lane uses mixed worker profiles, so scheduler placement and
+	// worker counts may differ without changing the deterministic AI answer.
+	return hash;
+}
+
+bool IsZeroAIPlanningTelemetry(const AIPlanningTelemetry &telemetry)
+{
+	return telemetry.capturedSnapshots == 0U &&
+		telemetry.capturedCandidates == 0U &&
+		telemetry.requestedBatches == 0U && telemetry.submittedJobs == 0U &&
+		telemetry.completedJobs == 0U && telemetry.serialFallbacks == 0U &&
+		telemetry.shadowMatches == 0U && telemetry.shadowMismatches == 0U &&
+		telemetry.validationFailures == 0U &&
+		telemetry.canonicalValidationInvocations == 0U &&
+		telemetry.committedBatches == 0U &&
+		telemetry.parallelAuthoritativeCommits == 0U &&
+		telemetry.rejectedCommits == 0U &&
+		telemetry.physicalWorkerExecutions == 0U &&
+		telemetry.ownerHelpedExecutions == 0U &&
+		telemetry.observedPhysicalWorkerMask == 0U &&
+		telemetry.maximumDistinctPhysicalWorkers == 0U &&
+		telemetry.maximumConcurrentPhysicalWorkers == 0U &&
+		telemetry.planningDigest == 0U;
+}
+
 std::uint64_t ComputeReceiptCommandDigest(const Receipt &receipt)
 {
 	std::uint64_t hash = kFnvOffset;
@@ -281,7 +344,102 @@ bool ReadExactLine(const char *input, std::size_t inputSize,
 {
 	char line[256] = {};
 	return ReadLine(input, inputSize, cursor, line, sizeof(line)) &&
-	std::strcmp(line, expected) == 0;
+		std::strcmp(line, expected) == 0;
+}
+
+bool AppendAIPlanningTelemetry(char *output, std::size_t capacity,
+	std::size_t &offset, const AIPlanningTelemetry &telemetry)
+{
+	return AppendUnsignedLine(output, capacity, offset,
+		"ai_planning_captured_snapshots", telemetry.capturedSnapshots) &&
+		AppendUnsignedLine(output, capacity, offset,
+			"ai_planning_captured_candidates", telemetry.capturedCandidates) &&
+		AppendUnsignedLine(output, capacity, offset,
+			"ai_planning_requested_batches", telemetry.requestedBatches) &&
+		AppendUnsignedLine(output, capacity, offset,
+			"ai_planning_submitted_jobs", telemetry.submittedJobs) &&
+		AppendUnsignedLine(output, capacity, offset,
+			"ai_planning_completed_jobs", telemetry.completedJobs) &&
+		AppendUnsignedLine(output, capacity, offset,
+			"ai_planning_serial_fallbacks", telemetry.serialFallbacks) &&
+		AppendUnsignedLine(output, capacity, offset,
+			"ai_planning_shadow_matches", telemetry.shadowMatches) &&
+		AppendUnsignedLine(output, capacity, offset,
+			"ai_planning_shadow_mismatches", telemetry.shadowMismatches) &&
+		AppendUnsignedLine(output, capacity, offset,
+			"ai_planning_validation_failures", telemetry.validationFailures) &&
+		AppendUnsignedLine(output, capacity, offset,
+			"ai_planning_canonical_validation_invocations",
+			telemetry.canonicalValidationInvocations) &&
+		AppendUnsignedLine(output, capacity, offset,
+			"ai_planning_committed_batches", telemetry.committedBatches) &&
+		AppendUnsignedLine(output, capacity, offset,
+			"ai_planning_parallel_authoritative_commits",
+			telemetry.parallelAuthoritativeCommits) &&
+		AppendUnsignedLine(output, capacity, offset,
+			"ai_planning_rejected_commits", telemetry.rejectedCommits) &&
+		AppendUnsignedLine(output, capacity, offset,
+			"ai_planning_physical_worker_executions",
+			telemetry.physicalWorkerExecutions) &&
+		AppendUnsignedLine(output, capacity, offset,
+			"ai_planning_owner_helped_executions",
+			telemetry.ownerHelpedExecutions) &&
+		AppendUnsignedLine(output, capacity, offset,
+			"ai_planning_observed_physical_worker_mask",
+			telemetry.observedPhysicalWorkerMask) &&
+		AppendUnsignedLine(output, capacity, offset,
+			"ai_planning_maximum_distinct_physical_workers",
+			telemetry.maximumDistinctPhysicalWorkers) &&
+		AppendUnsignedLine(output, capacity, offset,
+			"ai_planning_maximum_concurrent_physical_workers",
+			telemetry.maximumConcurrentPhysicalWorkers) &&
+		AppendUnsignedLine(output, capacity, offset,
+			"ai_planning_digest", telemetry.planningDigest);
+}
+
+bool ReadAIPlanningTelemetry(const char *input, std::size_t inputSize,
+	std::size_t &cursor, AIPlanningTelemetry &telemetry)
+{
+	std::uint64_t *values[] =
+	{
+		&telemetry.capturedSnapshots, &telemetry.capturedCandidates,
+		&telemetry.requestedBatches, &telemetry.submittedJobs,
+		&telemetry.completedJobs, &telemetry.serialFallbacks,
+		&telemetry.shadowMatches, &telemetry.shadowMismatches,
+		&telemetry.validationFailures,
+		&telemetry.canonicalValidationInvocations,
+		&telemetry.committedBatches,
+		&telemetry.parallelAuthoritativeCommits, &telemetry.rejectedCommits,
+		&telemetry.physicalWorkerExecutions, &telemetry.ownerHelpedExecutions,
+		&telemetry.observedPhysicalWorkerMask,
+		&telemetry.maximumDistinctPhysicalWorkers,
+		&telemetry.maximumConcurrentPhysicalWorkers, &telemetry.planningDigest
+	};
+	const char *const keys[] =
+	{
+		"ai_planning_captured_snapshots", "ai_planning_captured_candidates",
+		"ai_planning_requested_batches", "ai_planning_submitted_jobs",
+		"ai_planning_completed_jobs", "ai_planning_serial_fallbacks",
+		"ai_planning_shadow_matches", "ai_planning_shadow_mismatches",
+		"ai_planning_validation_failures",
+		"ai_planning_canonical_validation_invocations",
+		"ai_planning_committed_batches",
+		"ai_planning_parallel_authoritative_commits",
+		"ai_planning_rejected_commits",
+		"ai_planning_physical_worker_executions",
+		"ai_planning_owner_helped_executions",
+		"ai_planning_observed_physical_worker_mask",
+		"ai_planning_maximum_distinct_physical_workers",
+		"ai_planning_maximum_concurrent_physical_workers",
+		"ai_planning_digest"
+	};
+	for (unsigned index = 0U; index < sizeof(values) / sizeof(values[0]); ++index)
+	{
+		if (!ReadUnsignedLine(input, inputSize, cursor, keys[index],
+			std::numeric_limits<std::uint64_t>::max(), values[index]))
+			return false;
+	}
+	return true;
 }
 
 bool AppendSession(char *output, std::size_t capacity, std::size_t &offset,
@@ -292,6 +450,10 @@ bool AppendSession(char *output, std::size_t capacity, std::size_t &offset,
 		AppendUnsignedLine(output, capacity, offset, "local_slot", session.localSlot) &&
 		AppendUnsignedLine(output, capacity, offset, "peer_count", session.peerCount) &&
 		AppendUnsignedLine(output, capacity, offset, "roster_mask", session.rosterMask) &&
+		AppendUnsignedLine(output, capacity, offset, "simulation_roster_mask",
+			session.simulationRosterMask) &&
+		AppendUnsignedLine(output, capacity, offset, "ai_roster_mask",
+			session.aiRosterMask) &&
 		AppendUnsignedLine(output, capacity, offset, "build_compatibility_crc", session.buildCompatibilityCrc) &&
 		AppendUnsignedLine(output, capacity, offset, "content_crc", session.contentCrc) &&
 		AppendUnsignedLine(output, capacity, offset, "map_crc", session.mapCrc) &&
@@ -325,6 +487,12 @@ bool ReadSession(const char *input, std::size_t inputSize, std::size_t &cursor,
 	if (!ReadUnsignedLine(input, inputSize, cursor, "roster_mask",
 		std::numeric_limits<std::uint32_t>::max(), &value)) return false;
 	session.rosterMask = static_cast<std::uint32_t>(value);
+	if (!ReadUnsignedLine(input, inputSize, cursor, "simulation_roster_mask",
+		std::numeric_limits<std::uint32_t>::max(), &value)) return false;
+	session.simulationRosterMask = static_cast<std::uint32_t>(value);
+	if (!ReadUnsignedLine(input, inputSize, cursor, "ai_roster_mask",
+		std::numeric_limits<std::uint32_t>::max(), &value)) return false;
+	session.aiRosterMask = static_cast<std::uint32_t>(value);
 	if (!ReadUnsignedLine(input, inputSize, cursor, "build_compatibility_crc",
 		std::numeric_limits<std::uint32_t>::max(), &value)) return false;
 	session.buildCompatibilityCrc = static_cast<std::uint32_t>(value);
@@ -375,7 +543,8 @@ bool AppendReceiptBody(char *output, std::size_t capacity, std::size_t &offset,
 			receipt.workerTelemetryExecutableOrigin) ||
 		!AppendBoolLine(output, capacity, offset, "transport_path_used", receipt.transportPathUsed) ||
 		!AppendBoolLine(output, capacity, offset, "handshake_validated", receipt.handshakeValidated) ||
-		!AppendBoolLine(output, capacity, offset, "clean_shutdown", receipt.cleanShutdown))
+		!AppendBoolLine(output, capacity, offset, "clean_shutdown", receipt.cleanShutdown) ||
+		!AppendAIPlanningTelemetry(output, capacity, offset, receipt.aiPlanning))
 		return false;
 
 	for (std::uint32_t slot = 0U; slot < kMaxPeerCount; ++slot)
@@ -507,6 +676,13 @@ std::uint64_t MixCommandDigest(std::uint64_t priorDigest,
 	return hash;
 }
 
+std::uint64_t ComputeAIPlanningDigest(std::uint32_t simulationRosterMask,
+	std::uint32_t aiRosterMask, const AIPlanningTelemetry &telemetry)
+{
+	return ComputeAIPlanningDigestInternal(simulationRosterMask, aiRosterMask,
+		telemetry);
+}
+
 bool IsCanonicalHex(const char *value, std::size_t hexChars)
 {
 	if (value == nullptr)
@@ -535,15 +711,24 @@ bool IsNonZeroCanonicalHex(const char *value, std::size_t hexChars)
 
 bool IsValidSessionContract(const SessionContract &session)
 {
+	const std::uint32_t validSlotMask = (1U << kMaxPeerCount) - 1U;
 	if (session.schemaVersion != kSchemaVersion ||
 		session.protocolEpoch != kProtocolEpoch ||
 		session.peerCount < kMinPeerCount ||
 		session.peerCount > kMaxPeerCount ||
-		(session.rosterMask & ~((1U << kMaxPeerCount) - 1U)) != 0U ||
+		(session.rosterMask & ~validSlotMask) != 0U ||
+		(session.simulationRosterMask & ~validSlotMask) != 0U ||
+		(session.aiRosterMask & ~validSlotMask) != 0U ||
 		session.localSlot >= session.peerCount ||
 		session.commonStopFrame != kCommonStopFrame ||
 		CountBits(session.rosterMask) != session.peerCount ||
 		!IsBitSet(session.rosterMask, session.localSlot) ||
+		session.simulationRosterMask == 0U ||
+		(session.rosterMask & ~session.simulationRosterMask) != 0U ||
+		(session.aiRosterMask & ~session.simulationRosterMask) != 0U ||
+		(session.rosterMask & session.aiRosterMask) != 0U ||
+		(session.rosterMask | session.aiRosterMask) !=
+			session.simulationRosterMask ||
 		!IsKnownOriginMode(session.originMode) ||
 		!IsNonZeroCanonicalHex(session.runNonce.data(), kNonceHexChars) ||
 		!IsNonZeroCanonicalHex(session.sessionNonce.data(), kNonceHexChars) ||
@@ -554,6 +739,36 @@ bool IsValidSessionContract(const SessionContract &session)
 		return session.packetRouterSlot == kNoRouterSlot;
 	return session.packetRouterSlot < kMaxPeerCount &&
 		IsBitSet(session.rosterMask, session.packetRouterSlot);
+}
+
+bool IsValidAIPlanningTelemetry(const SessionContract &session,
+	const AIPlanningTelemetry &telemetry)
+{
+	if (!IsValidSessionContract(session))
+		return false;
+	if (session.aiRosterMask == 0U)
+		return IsZeroAIPlanningTelemetry(telemetry);
+	if (telemetry.capturedSnapshots < CountBits(session.aiRosterMask) ||
+		telemetry.requestedBatches == 0U || telemetry.submittedJobs == 0U ||
+		telemetry.completedJobs != telemetry.submittedJobs ||
+		telemetry.serialFallbacks != 0U || telemetry.shadowMismatches != 0U ||
+		telemetry.validationFailures != 0U || telemetry.committedBatches == 0U ||
+		telemetry.parallelAuthoritativeCommits == 0U ||
+		telemetry.parallelAuthoritativeCommits > telemetry.committedBatches ||
+		telemetry.rejectedCommits != 0U ||
+		telemetry.physicalWorkerExecutions == 0U ||
+		telemetry.ownerHelpedExecutions != 0U ||
+		telemetry.observedPhysicalWorkerMask == 0U ||
+		CountBits64(telemetry.observedPhysicalWorkerMask) < 2U ||
+		telemetry.maximumDistinctPhysicalWorkers < 2U ||
+		telemetry.maximumConcurrentPhysicalWorkers < 2U ||
+		telemetry.maximumConcurrentPhysicalWorkers >
+			telemetry.maximumDistinctPhysicalWorkers ||
+		telemetry.planningDigest == 0U ||
+		telemetry.planningDigest != ComputeAIPlanningDigestInternal(
+			session.simulationRosterMask, session.aiRosterMask, telemetry))
+		return false;
+	return true;
 }
 
 ValidationResult ValidateReceipt(const Receipt &receipt,
@@ -571,6 +786,9 @@ ValidationResult ValidateReceipt(const Receipt &receipt,
 		receipt.session.localSlot != expectedSession.localSlot ||
 		receipt.session.peerCount != expectedSession.peerCount ||
 		receipt.session.rosterMask != expectedSession.rosterMask ||
+		receipt.session.simulationRosterMask !=
+			expectedSession.simulationRosterMask ||
+		receipt.session.aiRosterMask != expectedSession.aiRosterMask ||
 		receipt.session.buildCompatibilityCrc != expectedSession.buildCompatibilityCrc ||
 		receipt.session.contentCrc != expectedSession.contentCrc ||
 		receipt.session.mapCrc != expectedSession.mapCrc ||
@@ -604,6 +822,8 @@ ValidationResult ValidateReceipt(const Receipt &receipt,
 	workerTelemetry.kernels = receipt.workerTelemetry;
 	if (!IsWorkerTelemetryValid(workerTelemetry,
 		actualValidationAuthorityMask))
+		return {ValidationError::AuthorityNotProven};
+	if (!IsValidAIPlanningTelemetry(expectedSession, receipt.aiPlanning))
 		return {ValidationError::AuthorityNotProven};
 	if (!receipt.transportPathUsed)
 		return {ValidationError::MissingTransportPath};
@@ -731,7 +951,8 @@ ValidationResult DecodeReceipt(const char *input, std::size_t inputSize,
 			&receipt->workerTelemetryExecutableOrigin) ||
 		!ReadBoolLine(input, inputSize, cursor, "transport_path_used", &receipt->transportPathUsed) ||
 		!ReadBoolLine(input, inputSize, cursor, "handshake_validated", &receipt->handshakeValidated) ||
-		!ReadBoolLine(input, inputSize, cursor, "clean_shutdown", &receipt->cleanShutdown))
+		!ReadBoolLine(input, inputSize, cursor, "clean_shutdown", &receipt->cleanShutdown) ||
+		!ReadAIPlanningTelemetry(input, inputSize, cursor, receipt->aiPlanning))
 		return {ValidationError::InvalidReceiptText};
 
 	for (std::uint32_t slot = 0U; slot < kMaxPeerCount; ++slot)
@@ -824,7 +1045,9 @@ bool ReceiptRecorder::publishWorkerTelemetry(
 {
 	if (!m_active || m_failed || m_receipt.validationAuthorityMask != 0U ||
 		!IsWorkerTelemetryValid(workerTelemetry,
-			m_receipt.session.provenKernelMask))
+			m_receipt.session.provenKernelMask) ||
+		!IsValidAIPlanningTelemetry(m_receipt.session,
+			workerTelemetry.aiPlanning))
 	{
 		m_failed = true;
 		return false;
@@ -832,6 +1055,7 @@ bool ReceiptRecorder::publishWorkerTelemetry(
 	m_receipt.validationAuthorityMask = workerTelemetry.authorityMask;
 	m_receipt.workerTelemetryExecutableOrigin = workerTelemetry.executableOrigin;
 	m_receipt.workerTelemetry = workerTelemetry.kernels;
+	m_receipt.aiPlanning = workerTelemetry.aiPlanning;
 	return true;
 }
 

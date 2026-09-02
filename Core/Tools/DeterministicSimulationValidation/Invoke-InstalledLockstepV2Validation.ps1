@@ -24,6 +24,11 @@ $CommonStopFrame = 4096
 $LockstepSchema = 2
 $LockstepProtocolEpoch = 2
 $LockstepAuthorityMask = 63
+$LockstepNetworkPeerCount = 2
+$LockstepNetworkRosterMask = 0x3
+$LockstepSimulationRosterMask = 0x3f
+$LockstepAIRosterMask = 0x3c
+$LockstepAIPlayerCount = 4
 $LockstepCheckpointCount = 129
 $LockstepMode = 'installed-lockstep-v2-production'
 $LockstepProducer = 'installed-lockstep-v2'
@@ -953,13 +958,29 @@ function Get-ReceiptPairs {
     }
     $expectedKeys = @(
         'producer', 'mode', 'schema', 'protocol_epoch', 'local_slot', 'peer_count',
-        'roster_mask', 'build_compatibility_crc', 'content_crc', 'map_crc',
+        'roster_mask', 'simulation_roster_mask', 'ai_roster_mask',
+        'build_compatibility_crc', 'content_crc', 'map_crc',
         'common_stop_frame', 'proven_kernel_mask', 'packet_router_slot', 'origin_mode',
         'run_nonce', 'session_nonce', 'executable_sha256', 'source_revision',
         'network_session_token', 'final_frame', 'frame_count', 'contributed_peer_mask',
         'checkpoint_count', 'validation_authority_mask', 'executable_origin',
         'worker_telemetry_executable_origin', 'transport_path_used',
-        'handshake_validated', 'clean_shutdown')
+        'handshake_validated', 'clean_shutdown',
+        'ai_planning_captured_snapshots', 'ai_planning_captured_candidates',
+        'ai_planning_requested_batches', 'ai_planning_submitted_jobs',
+        'ai_planning_completed_jobs', 'ai_planning_serial_fallbacks',
+        'ai_planning_shadow_matches', 'ai_planning_shadow_mismatches',
+        'ai_planning_validation_failures',
+        'ai_planning_canonical_validation_invocations',
+        'ai_planning_committed_batches',
+        'ai_planning_parallel_authoritative_commits',
+        'ai_planning_rejected_commits',
+        'ai_planning_physical_worker_executions',
+        'ai_planning_owner_helped_executions',
+        'ai_planning_observed_physical_worker_mask',
+        'ai_planning_maximum_distinct_physical_workers',
+        'ai_planning_maximum_concurrent_physical_workers',
+        'ai_planning_digest')
     for ($slot = 0; $slot -lt 8; ++$slot) {
         $expectedKeys += "peer_${slot}_command_count"
         $expectedKeys += "peer_${slot}_first_command_frame"
@@ -998,12 +1019,24 @@ function Get-ReceiptProjection {
     $pairs = $Parsed.pairs
     $projection = [ordered]@{}
     foreach ($key in @('mode', 'schema', 'protocol_epoch', 'peer_count', 'roster_mask',
-        'build_compatibility_crc', 'content_crc', 'map_crc', 'common_stop_frame',
+        'simulation_roster_mask', 'ai_roster_mask', 'build_compatibility_crc',
+        'content_crc', 'map_crc', 'common_stop_frame',
         'proven_kernel_mask', 'packet_router_slot', 'origin_mode', 'session_nonce',
         'executable_sha256', 'source_revision', 'final_frame', 'frame_count',
         'contributed_peer_mask', 'checkpoint_count', 'validation_authority_mask',
         'executable_origin', 'worker_telemetry_executable_origin', 'transport_path_used',
-        'handshake_validated', 'clean_shutdown')) {
+        'handshake_validated', 'clean_shutdown',
+        'ai_planning_captured_snapshots', 'ai_planning_captured_candidates',
+        'ai_planning_requested_batches', 'ai_planning_submitted_jobs',
+        'ai_planning_completed_jobs', 'ai_planning_serial_fallbacks',
+        'ai_planning_shadow_matches', 'ai_planning_shadow_mismatches',
+         'ai_planning_validation_failures',
+         'ai_planning_canonical_validation_invocations',
+         'ai_planning_committed_batches',
+         'ai_planning_parallel_authoritative_commits',
+         'ai_planning_rejected_commits',
+         'ai_planning_owner_helped_executions',
+         'ai_planning_digest')) {
         $projection[$key] = $pairs[$key]
     }
     for ($slot = 0; $slot -lt 8; ++$slot) {
@@ -1054,6 +1087,45 @@ function Get-ReceiptCommandDigest {
     return $hash
 }
 
+function Update-ReceiptAIPlanningFnv {
+    param([Numerics.BigInteger]$Hash, [UInt64]$Value, [int]$Bytes,
+        [Numerics.BigInteger]$Prime, [Numerics.BigInteger]$Mask)
+    $updated = $Hash
+    for ($byteIndex = 0; $byteIndex -lt $Bytes; ++$byteIndex) {
+        $updated = (($updated -bxor
+            ([Numerics.BigInteger]($Value -band 255))) * $Prime) -band $Mask
+        $Value = $Value -shr 8
+    }
+    return $updated
+}
+
+function Get-ReceiptAIPlanningDigest {
+    param([pscustomobject]$Parsed)
+    Add-Type -AssemblyName System.Numerics
+    $pairs = $Parsed.pairs
+    [Numerics.BigInteger]$hash = [Numerics.BigInteger]::Parse('14695981039346656037')
+    [Numerics.BigInteger]$prime = [Numerics.BigInteger]::Parse('1099511628211')
+    [Numerics.BigInteger]$mask = [Numerics.BigInteger]::Parse('18446744073709551615')
+    $hash = Update-ReceiptAIPlanningFnv $hash `
+        (ConvertTo-ReceiptUInt32 $pairs['simulation_roster_mask'] 'simulation_roster_mask') `
+        4 $prime $mask
+    $hash = Update-ReceiptAIPlanningFnv $hash `
+        (ConvertTo-ReceiptUInt32 $pairs['ai_roster_mask'] 'ai_roster_mask') `
+        4 $prime $mask
+    foreach ($field in @(
+        'captured_snapshots', 'captured_candidates', 'requested_batches',
+        'submitted_jobs', 'completed_jobs', 'serial_fallbacks',
+         'shadow_matches', 'shadow_mismatches', 'validation_failures',
+         'canonical_validation_invocations', 'committed_batches',
+         'parallel_authoritative_commits', 'rejected_commits',
+         'owner_helped_executions')) {
+        $hash = Update-ReceiptAIPlanningFnv $hash `
+            (ConvertTo-ReceiptUInt64 $pairs["ai_planning_$field"] "ai_planning_$field") `
+            8 $prime $mask
+    }
+    return $hash
+}
+
 function Assert-LockstepV2Receipt {
     param(
         [pscustomobject]$Parsed,
@@ -1063,7 +1135,10 @@ function Assert-LockstepV2Receipt {
         [string]$ExpectedRunNonce,
         [string]$ExpectedSessionNonce,
         [string]$ExpectedExecutableSha256,
-        [string]$ExpectedSourceCommit
+        [string]$ExpectedSourceCommit,
+        [uint32]$ExpectedNetworkRosterMask = $LockstepNetworkRosterMask,
+        [uint32]$ExpectedSimulationRosterMask = $LockstepSimulationRosterMask,
+        [uint32]$ExpectedAIRosterMask = $LockstepAIRosterMask
     )
     $pairs = $Parsed.pairs
     if ($pairs['producer'] -cne $LockstepProducer -or $pairs['mode'] -cne $LockstepMode) {
@@ -1072,7 +1147,9 @@ function Assert-LockstepV2Receipt {
     foreach ($check in @(
         @('schema', $LockstepSchema), @('protocol_epoch', $LockstepProtocolEpoch),
         @('local_slot', $ExpectedLocalSlot), @('peer_count', $ExpectedPeerCount),
-        @('roster_mask', ((1 -shl $ExpectedPeerCount) - 1)),
+        @('roster_mask', $ExpectedNetworkRosterMask),
+        @('simulation_roster_mask', $ExpectedSimulationRosterMask),
+        @('ai_roster_mask', $ExpectedAIRosterMask),
         @('map_crc', $ExpectedMapCrc), @('common_stop_frame', $CommonStopFrame),
         @('proven_kernel_mask', $LockstepAuthorityMask), @('packet_router_slot', 0),
         @('origin_mode', 2), @('final_frame', $CommonStopFrame),
@@ -1083,6 +1160,15 @@ function Assert-LockstepV2Receipt {
         if ((ConvertTo-ReceiptUInt64 $pairs[$check[0]] $check[0]) -ne [UInt64]$check[1]) {
             throw "Receipt field $($check[0]) does not match the qualification contract: $($Parsed.path)"
         }
+    }
+    if ($ExpectedPeerCount -ne $LockstepNetworkPeerCount -or
+        $ExpectedNetworkRosterMask -ne $LockstepNetworkRosterMask -or
+        $ExpectedSimulationRosterMask -ne $LockstepSimulationRosterMask -or
+        $ExpectedAIRosterMask -ne $LockstepAIRosterMask -or
+        (Get-BitCount ([UInt64]$ExpectedAIRosterMask)) -ne $LockstepAIPlayerCount -or
+        ($ExpectedNetworkRosterMask -band $ExpectedAIRosterMask) -ne 0 -or
+        ($ExpectedNetworkRosterMask -bor $ExpectedAIRosterMask) -ne $ExpectedSimulationRosterMask) {
+        throw "Receipt topology is not the bounded two-human/four-local-AI qualification contract: $($Parsed.path)"
     }
     if (-not (Test-CanonicalHex $pairs['run_nonce'] 32) -or
         $pairs['run_nonce'] -cne $ExpectedRunNonce -or
@@ -1102,6 +1188,50 @@ function Assert-LockstepV2Receipt {
     }
     if ((ConvertTo-ReceiptUInt64 $pairs['network_session_token'] 'network_session_token') -eq 0) {
         throw "Receipt has no network session token: $($Parsed.path)"
+    }
+    $aiPlanningFields = @(
+        'captured_snapshots', 'captured_candidates', 'requested_batches',
+        'submitted_jobs', 'completed_jobs', 'serial_fallbacks',
+        'shadow_matches', 'shadow_mismatches', 'validation_failures',
+        'canonical_validation_invocations', 'committed_batches',
+        'parallel_authoritative_commits', 'rejected_commits',
+        'physical_worker_executions', 'owner_helped_executions',
+        'observed_physical_worker_mask', 'maximum_distinct_physical_workers',
+        'maximum_concurrent_physical_workers')
+    foreach ($field in $aiPlanningFields) {
+        [void](ConvertTo-ReceiptUInt64 $pairs["ai_planning_$field"] "ai_planning_$field")
+    }
+    $aiSnapshots = ConvertTo-ReceiptUInt64 $pairs['ai_planning_captured_snapshots'] `
+        'ai_planning_captured_snapshots'
+    $aiSubmitted = ConvertTo-ReceiptUInt64 $pairs['ai_planning_submitted_jobs'] `
+        'ai_planning_submitted_jobs'
+    $aiCompleted = ConvertTo-ReceiptUInt64 $pairs['ai_planning_completed_jobs'] `
+        'ai_planning_completed_jobs'
+    $aiCommitted = ConvertTo-ReceiptUInt64 $pairs['ai_planning_committed_batches'] `
+        'ai_planning_committed_batches'
+    $aiParallel = ConvertTo-ReceiptUInt64 $pairs['ai_planning_parallel_authoritative_commits'] `
+        'ai_planning_parallel_authoritative_commits'
+    $aiMask = ConvertTo-ReceiptUInt64 $pairs['ai_planning_observed_physical_worker_mask'] `
+        'ai_planning_observed_physical_worker_mask'
+    $aiDistinct = ConvertTo-ReceiptUInt64 $pairs['ai_planning_maximum_distinct_physical_workers'] `
+        'ai_planning_maximum_distinct_physical_workers'
+    $aiPeak = ConvertTo-ReceiptUInt64 $pairs['ai_planning_maximum_concurrent_physical_workers'] `
+        'ai_planning_maximum_concurrent_physical_workers'
+    if ($aiSnapshots -lt $LockstepAIPlayerCount -or $aiSubmitted -eq 0 -or
+        $aiCompleted -ne $aiSubmitted -or $aiCommitted -eq 0 -or $aiParallel -eq 0 -or
+        $aiParallel -gt $aiCommitted -or $aiMask -eq 0 -or
+        (Get-BitCount $aiMask) -lt 2 -or $aiDistinct -lt 2 -or $aiPeak -lt 2 -or
+        $aiPeak -gt $aiDistinct -or
+        (ConvertTo-ReceiptUInt64 $pairs['ai_planning_serial_fallbacks'] 'ai_planning_serial_fallbacks') -ne 0 -or
+        (ConvertTo-ReceiptUInt64 $pairs['ai_planning_shadow_mismatches'] 'ai_planning_shadow_mismatches') -ne 0 -or
+        (ConvertTo-ReceiptUInt64 $pairs['ai_planning_validation_failures'] 'ai_planning_validation_failures') -ne 0 -or
+        (ConvertTo-ReceiptUInt64 $pairs['ai_planning_rejected_commits'] 'ai_planning_rejected_commits') -ne 0 -or
+        (ConvertTo-ReceiptUInt64 $pairs['ai_planning_owner_helped_executions'] 'ai_planning_owner_helped_executions') -ne 0) {
+        throw "Receipt does not prove an authoritative parallel AI planning commit: $($Parsed.path)"
+    }
+    $aiDigest = ConvertTo-ReceiptUInt64 $pairs['ai_planning_digest'] 'ai_planning_digest'
+    if ($aiDigest -eq 0 -or $aiDigest -ne [UInt64](Get-ReceiptAIPlanningDigest $Parsed)) {
+        throw "Receipt AI planning digest is not canonical: $($Parsed.path)"
     }
     $expectedFrames = New-Object Collections.Generic.List[uint32]
     [void]$expectedFrames.Add(1)
@@ -1172,10 +1302,11 @@ function Build-LockstepConfiguration {
         [string]$ReceiptName
     )
     $portText = ($Ports | ForEach-Object { [string]$_ }) -join ','
-    return ('peer={0};peers={1};ports={2};run={3};session={4};exe={5};source={6};map={7};map_crc={8};seed={9};dir={10};receipt={11};mode=trusted-router;router=0' -f `
+    return ('peer={0};peers={1};ports={2};run={3};session={4};exe={5};source={6};map={7};map_crc={8};seed={9};dir={10};receipt={11};mode=trusted-router;router=0;network_roster={12};simulation_roster={13};ai_roster={14}' -f `
         $LocalSlot, $PeerCount, $portText, $RunNonce, $SessionNonce,
         $ExecutableSha256, $SourceCommit, $MapName, $MapCrc, $Seed,
-        $Directory, $ReceiptName)
+        $Directory, $ReceiptName, $LockstepNetworkRosterMask,
+        $LockstepSimulationRosterMask, $LockstepAIRosterMask)
 }
 
 function Get-ComparableReceiptHash {
@@ -1205,6 +1336,9 @@ function Invoke-LockstepSession {
         [pscustomobject]$TitleSessionContract
     )
     Assert-HeadlessDirectExecutionOptIn $AllowHeadlessDirectExecution
+    if ($PeerCount -ne $LockstepNetworkPeerCount) {
+        throw "Installed lockstep-v2 mixed qualification requires exactly $LockstepNetworkPeerCount network humans; local AI slots are not peers."
+    }
     if ($null -eq $LauncherContract -or
         @($LauncherContract.launcherArguments).Count -eq 0) {
         throw "No validated launcher-equivalence contract was provided for $Title."
@@ -1376,6 +1510,13 @@ function Invoke-LockstepSession {
                 processId = $record.process.Id
                 peer = $record.peer
                 peerCount = $PeerCount
+                # These masks make the network/simulation boundary explicit in
+                # every peer artifact: only slots 0/1 are transport humans;
+                # slots 2..5 are local skirmish-AI owners.
+                networkRosterMask = $LockstepNetworkRosterMask
+                simulationRosterMask = $LockstepSimulationRosterMask
+                aiRosterMask = $LockstepAIRosterMask
+                aiPlayerCount = $LockstepAIPlayerCount
                 port = $record.port
                 runNonce = $record.runNonce
                 sessionNonce = $record.sessionNonce
@@ -1423,6 +1564,10 @@ function Invoke-LockstepSession {
         return [pscustomobject]@{
             title = $Title
             peerCount = $PeerCount
+            networkRosterMask = $LockstepNetworkRosterMask
+            simulationRosterMask = $LockstepSimulationRosterMask
+            aiRosterMask = $LockstepAIRosterMask
+            aiPlayerCount = $LockstepAIPlayerCount
             ports = @($ports)
             sessionNonce = $sessionNonce
             launcherEquivalence = $LauncherContract
@@ -1462,7 +1607,9 @@ function New-SyntheticReceiptText {
     [void]$lines.Add("mode=$LockstepMode")
     foreach ($line in @(
         'schema=2', 'protocol_epoch=2', "local_slot=$LocalSlot", "peer_count=$PeerCount",
-        "roster_mask=$((1 -shl $PeerCount) - 1)", 'build_compatibility_crc=1',
+        "roster_mask=$LockstepNetworkRosterMask",
+        "simulation_roster_mask=$LockstepSimulationRosterMask",
+        "ai_roster_mask=$LockstepAIRosterMask", 'build_compatibility_crc=1',
         'content_crc=1', 'map_crc=1', "common_stop_frame=$CommonStopFrame",
         "proven_kernel_mask=$LockstepAuthorityMask", 'packet_router_slot=0',
         'origin_mode=2', "run_nonce=$RunNonce", "session_nonce=$SessionNonce",
@@ -1471,7 +1618,22 @@ function New-SyntheticReceiptText {
         "frame_count=$CommonStopFrame", "contributed_peer_mask=$((1 -shl $PeerCount) - 1)",
         "checkpoint_count=$LockstepCheckpointCount", "validation_authority_mask=$LockstepAuthorityMask",
         'executable_origin=1', 'worker_telemetry_executable_origin=1',
-        'transport_path_used=1', 'handshake_validated=1', 'clean_shutdown=1')) {
+        'transport_path_used=1', 'handshake_validated=1', 'clean_shutdown=1',
+        'ai_planning_captured_snapshots=4', 'ai_planning_captured_candidates=16',
+        'ai_planning_requested_batches=2', 'ai_planning_submitted_jobs=8',
+        'ai_planning_completed_jobs=8', 'ai_planning_serial_fallbacks=0',
+        'ai_planning_shadow_matches=8', 'ai_planning_shadow_mismatches=0',
+        'ai_planning_validation_failures=0',
+        'ai_planning_canonical_validation_invocations=2',
+        'ai_planning_committed_batches=2',
+        'ai_planning_parallel_authoritative_commits=2',
+        'ai_planning_rejected_commits=0',
+        'ai_planning_physical_worker_executions=8',
+        'ai_planning_owner_helped_executions=0',
+        "ai_planning_observed_physical_worker_mask=$((1 -shl $PhysicalWorkerCount) - 1)",
+        "ai_planning_maximum_distinct_physical_workers=$PhysicalWorkerCount",
+        "ai_planning_maximum_concurrent_physical_workers=$PhysicalWorkerCount",
+        'ai_planning_digest=1')) {
         [void]$lines.Add($line)
     }
     for ($slot = 0; $slot -lt 8; ++$slot) {
@@ -1647,6 +1809,12 @@ function Invoke-SelfTest {
         [IO.File]::WriteAllText($receiptPath, $text,
             (New-Object Text.UTF8Encoding($false)))
         $parsed = Get-ReceiptPairs $receiptPath
+        $aiDigest = Get-ReceiptAIPlanningDigest $parsed
+        $text = $text.Replace('ai_planning_digest=1',
+            "ai_planning_digest=$aiDigest")
+        [IO.File]::WriteAllText($receiptPath, $text,
+            (New-Object Text.UTF8Encoding($false)))
+        $parsed = Get-ReceiptPairs $receiptPath
         [void](Assert-LockstepV2Receipt $parsed 0 2 1 `
             '0123456789ABCDEF0123456789ABCDEF' `
             'ABCDEF0123456789ABCDEF0123456789' `
@@ -1670,6 +1838,12 @@ function Invoke-SelfTest {
         $peerDigest = Get-ReceiptCommandDigest $peerParsed
         $peerText = $peerText.Replace('checkpoint_128_command_digest=1',
             "checkpoint_128_command_digest=$peerDigest")
+        [IO.File]::WriteAllText($peerReceiptPath, $peerText,
+            (New-Object Text.UTF8Encoding($false)))
+        $peerParsed = Get-ReceiptPairs $peerReceiptPath
+        $peerAIDigest = Get-ReceiptAIPlanningDigest $peerParsed
+        $peerText = $peerText.Replace('ai_planning_digest=1',
+            "ai_planning_digest=$peerAIDigest")
         [IO.File]::WriteAllText($peerReceiptPath, $peerText,
             (New-Object Text.UTF8Encoding($false)))
         $peerParsed = Get-ReceiptPairs $peerReceiptPath
@@ -1716,8 +1890,8 @@ if (-not (Test-LowerHex40 $SourceCommit)) {
     throw 'SourceCommit must be the exact lowercase 40-hex revision.'
 }
 if ([string]::IsNullOrWhiteSpace($MapName) -or -not (Test-SafeMapName $MapName) -or
-    $MapCrc -eq 0 -or $PeerCount -lt 2 -or $PeerCount -gt 8) {
-    throw 'MapName/MapCrc/PeerCount do not form a bounded installed lockstep-v2 contract.'
+    $MapCrc -eq 0 -or $PeerCount -ne $LockstepNetworkPeerCount) {
+    throw 'MapName/MapCrc/PeerCount do not form the bounded two-human/four-local-AI installed lockstep-v2 contract.'
 }
 if (-not (Test-SafeHDirectory $OutputDirectory) -or (Test-Path -LiteralPath $OutputDirectory)) {
     throw 'OutputDirectory must be a fresh task-owned directory on H:.'
@@ -1821,6 +1995,10 @@ try {
         launcherEquivalence = $launcherContracts
         commonStopFrame = $CommonStopFrame
         peerCount = $PeerCount
+        networkRosterMask = $LockstepNetworkRosterMask
+        simulationRosterMask = $LockstepSimulationRosterMask
+        aiRosterMask = $LockstepAIRosterMask
+        aiPlayerCount = $LockstepAIPlayerCount
         mapName = $MapName
         mapCrc = $MapCrc
         seed = $Seed
