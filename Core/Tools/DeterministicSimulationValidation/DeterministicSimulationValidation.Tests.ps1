@@ -702,6 +702,50 @@ function Assert-CurrentNativeReceiptCatalog {
             $parsedReferences[0].path -ceq [IO.Path]::GetFileName($nativePath) -and
             $parsedReferences[0].sha256 -ceq (Get-Sha256 $nativePath)) `
             'runner child reader returns exactly one hash-bound V5 reference without guard-path output pollution'
+        $marker = "SIMULATION_PERFORMANCE_RECEIPT status=written path=$nativePath"
+        $lineEndingCases = [ordered]@{
+            'no trailing newline' = $marker
+            'LF' = $marker + "`n"
+            'CRLF' = $marker + "`r`n"
+            # Invoke-ValidationProcess concatenates the actual redirected
+            # Windows stdout, a LF separator, and redirected stderr verbatim.
+            'combined Windows process output' =
+                "SKIRMISH_AI_TEST_COMPLETE end_frame=3`r`nSIMULATION_JOB_METRICS failures=0`r`n" +
+                $marker + "`r`n" + "`n" + "diagnostic stderr line`r`n"
+        }
+        foreach ($case in $lineEndingCases.GetEnumerator()) {
+            $lineArguments = $parserArguments.Clone()
+            $lineArguments.OutputText = $case.Value
+            $references = @(& $parserCommand @lineArguments)
+            Assert-True ($references.Count -eq 1 -and $null -ne $references[0] -and
+                $references[0].path -ceq [IO.Path]::GetFileName($nativePath) -and
+                $references[0].sha256 -ceq (Get-Sha256 $nativePath) -and
+                $references[0].runNonce -ceq $native.runNonce -and
+                $references[0].cohortNonce -ceq $native.cohortNonce) `
+                "$domain runner child reader verifies full V5 provenance with $($case.Key)"
+        }
+        foreach ($mismatch in @('RunNonce','CohortNonce','SourceCommit','ArtifactSetSha256',
+            'ExecutableSha256','ProcessId','ProcessCreationUtc','ExpectedTitle','RuntimeClosure')) {
+            $invalidArguments = $parserArguments.Clone()
+            $invalidArguments.OutputText = $marker + "`r`n"
+            switch ($mismatch) {
+                'RunNonce' { $invalidArguments.RunNonce = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' }
+                'CohortNonce' { $invalidArguments.CohortNonce = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc' }
+                'SourceCommit' { $invalidArguments.SourceCommit = ('F' * 40) }
+                'ArtifactSetSha256' { $invalidArguments.ArtifactSetSha256 = ('0' * 64) }
+                'ExecutableSha256' { $invalidArguments.ExecutableSha256 = ('0' * 64) }
+                'ProcessId' { $invalidArguments.ProcessId = $native.provenance.processId + 1 }
+                'ProcessCreationUtc' { $invalidArguments.ProcessCreationUtc = '2026-09-01T00:00:01Z' }
+                'ExpectedTitle' { $invalidArguments.ExpectedTitle = 'Generals' }
+                'RuntimeClosure' {
+                    $invalidArguments.RuntimeClosure = @{
+                        dependencyManifestSha256 = ('0' * 64); closureSha256 = ('0' * 64)
+                    }
+                }
+            }
+            Assert-True ($null -eq (& $parserCommand @invalidArguments)) `
+                "$domain CRLF marker does not bypass mismatched $mismatch provenance"
+        }
         foreach ($mode in @('serial','parallel','shadow')) {
             Add-Stage5NativeReceiptTestObservations $native
             $native.fixture.workloadQualification='observed-only'
@@ -737,6 +781,9 @@ function Assert-CurrentNativeReceiptCatalog {
             Assert-Throws { Read-Stage5FinalAcceptanceImmutableReceipt @readArguments } 'fixture|seed|qualif|scheduler|worker|replay' `
                 "$domain rejects $mutation without inventing observed metadata"
             Assert-True ($null -eq (& $parserCommand @parserArguments)) "runner child reader rejects $mutation"
+            $crlfArguments = $parserArguments.Clone()
+            $crlfArguments.OutputText = $marker + "`r`n"
+            Assert-True ($null -eq (& $parserCommand @crlfArguments)) "CRLF runner child reader rejects $mutation"
         }
         foreach ($mutation in @('oracle','disabled','error','incomplete','unclosed')) {
             Add-Stage5NativeReceiptTestObservations $native
@@ -752,6 +799,10 @@ function Assert-CurrentNativeReceiptCatalog {
                 "$domain rejects $mutation native evidence without inventing coverage"
             Assert-True ($null -eq (& $parserCommand @parserArguments)) `
                 "runner child reader rejects $mutation native evidence"
+            $crlfArguments = $parserArguments.Clone()
+            $crlfArguments.OutputText = $marker + "`r`n"
+            Assert-True ($null -eq (& $parserCommand @crlfArguments)) `
+                "CRLF runner child reader rejects $mutation native evidence"
         }
     }
 }

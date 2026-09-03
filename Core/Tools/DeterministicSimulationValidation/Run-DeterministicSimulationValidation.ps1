@@ -210,7 +210,7 @@ function Get-NativePerformanceReceiptReference {
     if ([string]::IsNullOrWhiteSpace($OutputText) -or
         [string]::IsNullOrWhiteSpace($OutputRoot)) { return $null }
     $matches = [regex]::Matches($OutputText,
-        '(?m)^SIMULATION_PERFORMANCE_RECEIPT\s+status=written\s+path=(?<path>[^\r\n]+)$')
+        '(?m)^SIMULATION_PERFORMANCE_RECEIPT\s+status=written\s+path=(?<path>[^\r\n]+)\r?$')
     foreach ($match in $matches) {
         $candidateText = $match.Groups['path'].Value.Trim().Trim('"')
         if ([string]::IsNullOrWhiteSpace($candidateText)) { continue }
