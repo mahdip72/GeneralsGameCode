@@ -843,6 +843,155 @@ void checkpointLocalLifecycleCannotEraseFailure()
 		checkpointIs(firstProgress.firstTrueCheckpoint, 0, 0, 0) && checkpointIs(secondProgress.firstTrueCheckpoint, 31, 8, 2),
 		"independent range probes may reuse checkpoint keys without sharing cut or terminal state");
 }
+
+void sourceAttemptNoCaptureRejectionClosesWithoutCanonicalStream()
+{
+	// Break caught: preflight rejection disappears because only validated batches
+	// are observed, or finishing a rejected attempt fabricates a canonical stream.
+	ByteSink sink;
+	KernelPerformanceReferenceRunOptions options;
+	options.mode = KERNEL_REFERENCE_THROUGHPUT_BINDING;
+	options.clock = clock;
+	options.trace.mode = KERNEL_TRACE_RECORD;
+	options.trace.append = ByteSink::append;
+	options.trace.context = &sink;
+	options.trace.limits.maximumBytes = 1048576;
+	options.trace.limits.maximumRecords = 100000;
+	options.trace.limits.maximumLogicalEvents = 100000;
+	options.trace.limits.maximumAttempts = 10000;
+	options.trace.limits.maximumRanges = 500000;
+	// Literal W=4 integration-derived fixture bounds: 11+4=15 attempts;
+	// 256+16+4+4*16=340 reusable live ranges. Core must not derive game policy.
+	options.trace.residentAttemptCapacity = 15;
+	options.trace.residentRangeCapacity = 340;
+	// Opaque, independent binding fixtures. D owns native tuple derivation using
+	// the approved four-field 0x5003 identity schema, not this trace-ledger test.
+	const unsigned char identityBytes[32] = {
+		0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+		0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+		0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+		0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f
+	};
+	options.trace.binding.nativeRunIdentity.valid = true;
+	memcpy(options.trace.binding.nativeRunIdentity.bytes, identityBytes, sizeof(identityBytes));
+	options.trace.binding.executable = options.trace.binding.nativeRunIdentity;
+	options.trace.binding.executable.bytes[0] = 0x20;
+	options.trace.binding.fixture = options.trace.binding.nativeRunIdentity;
+	options.trace.binding.fixture.bytes[0] = 0x40;
+	options.trace.binding.sourcePolicy = options.trace.binding.nativeRunIdentity;
+	options.trace.binding.sourcePolicy.bytes[0] = 0x60;
+	KernelPerformanceAttemptIdentity identity = {};
+	identity.workKind = KERNEL_PERFORMANCE_PATH;
+	identity.subtype = 0;
+	identity.sampleOrdinal = 1;
+	identity.attemptOrdinal = 0;
+	identity.phase = KERNEL_PHASE_SPATIAL_WORK;
+	identity.ownerFrame = 7;
+	KernelPerformanceAttemptDecision decision = {};
+	decision.decisionOrdinal = 0;
+	decision.site = 11;
+	decision.reasonSchema = 1;
+	decision.reason = 1;
+	decision.deterministicEligible = false;
+	decision.deterministicFacts = options.trace.binding.fixture;
+	decision.admission = KERNEL_ADMISSION_NOT_REQUESTED;
+	decision.sourceConfiguredWorkers = 4;
+	KernelPerformanceAttemptFinish finish = {};
+	finish.disposition = KERNEL_PERFORMANCE_NOT_ADMITTED;
+	finish.reasonSchema = 1;
+	finish.reason = 1;
+	finish.fallbackEntered = true;
+	finish.fallbackCompleted = true;
+	KernelPerformanceAttemptReap reap = {};
+	reap.reasonSchema = 1;
+	reap.reason = 1;
+	const unsigned clocksBefore = clocks, writesBefore = writes, computesBefore = computes;
+	KernelPerformanceReferenceLedger source;
+	check(source.beginRun(options), "source attempt recording starts with explicit binding and resident limits");
+	const auto attempt = source.beginAttempt(identity);
+	check(attempt.valid(), "source trace observes a zero-ordinal attempt before any capture or validation");
+	check(source.observeDecision(attempt, decision), "source trace records the actual no-capture preflight rejection");
+	check(source.finishAttempt(attempt, finish), "source trace finishes the unchanged fallback without a validated batch");
+	check(source.reapAttempt(attempt, reap), "source trace reaps the synchronous rejected attempt exactly once");
+	check(source.sealObservationWindow(), "source trace seals new observation ingress after its rejected attempt");
+	check(source.sealExecutionClosure(), "source trace seals its empty retained-attempt set after ingress");
+	const auto receipt = source.freeze();
+	const auto &trace = receipt.trace;
+	check(trace.requested && trace.mode == KERNEL_TRACE_RECORD && trace.frozen && trace.complete &&
+		trace.errors == 0 && trace.observationSealed && trace.executionSealed,
+		"a fully closed no-capture source trace is complete independently from canonical stream completeness");
+	check(trace.attemptCount == 1 && trace.admittedAttemptCount == 0 && trace.notAdmittedAttemptCount == 1 &&
+		trace.abortedAfterAdmissionAttemptCount == 0 && trace.reapCount == 1 &&
+		trace.residentAttemptCount == 0 && trace.residentAttemptHighWater == 1 &&
+		trace.recordCount == 8 && trace.logicalEventCount == 8 &&
+		trace.coalescedSpanCount == 0 && trace.coalescedAttemptCount == 0,
+		"no-capture source counts one rejected and reaped attempt plus eight actual framing and lifecycle records");
+	check(receipt.frozen && !receipt.complete && receipt.errors == 0 && receipt.streamCount == 0 &&
+		receipt.mode == KERNEL_REFERENCE_THROUGHPUT_BINDING && source.runMode() == KERNEL_REFERENCE_THROUGHPUT_BINDING,
+		"a complete rejection trace never fabricates a validated or committed canonical stream");
+	check(trace.binding.nativeRunIdentity.equals(options.trace.binding.nativeRunIdentity) &&
+		trace.binding.executable.equals(options.trace.binding.executable) &&
+		trace.binding.fixture.equals(options.trace.binding.fixture) &&
+		trace.binding.sourcePolicy.equals(options.trace.binding.sourcePolicy) &&
+		trace.limits.maximumBytes == 1048576 && trace.limits.maximumRecords == 100000 &&
+		trace.limits.maximumLogicalEvents == 100000 && trace.limits.maximumAttempts == 10000 &&
+		trace.limits.maximumRanges == 500000 && trace.residentAttemptCapacity == 15 && trace.residentRangeCapacity == 340,
+		"source trace retains four independent bindings and keeps resident capacities distinct from five volume limits");
+	// Literal canonical prefix: field schema0x5001; kind1 at tag1; record ordinal1
+	// at tag2; trace version1 at tag3; resident capacities15/340 at tags4/5.
+	// Freeze the entire header independently: omitting/reordering a limit or
+	// binding on the wire must fail even when the snapshot copies remain right.
+	const unsigned char headerPrefix[] = {
+		'R', 'T', 'S', '-', 'K', 'E', 'R', 'N', 'E', 'L', '-', 'F', 'I', 'E', 'L', 'D', 'S', '-', 'v', '1',
+		0x01, 0x50, 0x00, 0x00,
+		1, 1, 0, 0, 0, 1, 0, 0, 0,
+		3, 2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+		1, 3, 0, 0, 0, 1, 0, 0, 0,
+		3, 4, 0, 0, 0, 15, 0, 0, 0, 0, 0, 0, 0,
+		3, 5, 0, 0, 0, 0x54, 0x01, 0, 0, 0, 0, 0, 0,
+		// Five historical limits: 1048576, 100000, 100000, 10000, 500000.
+		3, 6, 0, 0, 0, 0x00, 0x00, 0x10, 0, 0, 0, 0, 0,
+		3, 7, 0, 0, 0, 0xa0, 0x86, 0x01, 0, 0, 0, 0, 0,
+		3, 8, 0, 0, 0, 0xa0, 0x86, 0x01, 0, 0, 0, 0, 0,
+		3, 9, 0, 0, 0, 0x10, 0x27, 0x00, 0, 0, 0, 0, 0,
+		3, 10, 0, 0, 0, 0x20, 0xa1, 0x07, 0, 0, 0, 0, 0,
+		6, 11, 0, 0, 0, 4, 0, 0, 0,
+		// Native run binding, then executable, fixture, and source policy.
+		6, 13, 0, 0, 0, 4, 0, 0, 0,
+		3, 14, 0, 0, 0, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+		3, 15, 0, 0, 0, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+		3, 16, 0, 0, 0, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+		3, 17, 0, 0, 0, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+		6, 13, 0, 0, 0, 4, 0, 0, 0,
+		3, 14, 0, 0, 0, 0x20, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+		3, 15, 0, 0, 0, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+		3, 16, 0, 0, 0, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+		3, 17, 0, 0, 0, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+		6, 13, 0, 0, 0, 4, 0, 0, 0,
+		3, 14, 0, 0, 0, 0x40, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+		3, 15, 0, 0, 0, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+		3, 16, 0, 0, 0, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+		3, 17, 0, 0, 0, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+		6, 13, 0, 0, 0, 4, 0, 0, 0,
+		3, 14, 0, 0, 0, 0x60, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+		3, 15, 0, 0, 0, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+		3, 16, 0, 0, 0, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+		3, 17, 0, 0, 0, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f
+	};
+	check(sink.calls != 0 && sink.bytes.size() > sizeof(headerPrefix) &&
+		memcmp(sink.bytes.data(), headerPrefix, sizeof(headerPrefix)) == 0 &&
+		trace.byteCount == sink.bytes.size() && trace.digest.valid,
+		"source trace emits the literal full header with resident capacities, five limits, four bindings, and full byte count");
+	check(clocks == clocksBefore && writes == writesBefore && computes == computesBefore,
+		"no-capture rejection recording executes no input or output or detached compute callback and reads no clock");
+	const unsigned appendCalls = sink.calls;
+	const auto again = source.freeze();
+	check(again.trace.complete == trace.complete && again.trace.errors == trace.errors &&
+		again.trace.attemptCount == trace.attemptCount && again.trace.recordCount == trace.recordCount &&
+		again.trace.byteCount == trace.byteCount && again.trace.digest.valid == trace.digest.valid &&
+		memcmp(again.trace.digest.bytes, trace.digest.bytes, sizeof(trace.digest.bytes)) == 0 && sink.calls == appendCalls,
+		"freezing the rejected source twice cannot append a duplicate footer or change its frozen counters and hash");
+}
 }
 int main()
 {
@@ -862,5 +1011,6 @@ int main()
 	checkpointReplayRejectsChangedCutAndTerminal();
 	checkpointNeverEnteredAndMalformedSourceCannotExecute();
 	checkpointLocalLifecycleCannotEraseFailure();
+	sourceAttemptNoCaptureRejectionClosesWithoutCanonicalStream();
 	return failures == 0 ? 0 : 1;
 }

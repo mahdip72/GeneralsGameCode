@@ -21,6 +21,8 @@ enum
 	KERNEL_REFERENCE_ERROR_HASH = 256,
 	KERNEL_REFERENCE_ERROR_CALLBACK = 512,
 	KERNEL_REFERENCE_ERROR_MISMATCH = 1024,
+	KERNEL_REFERENCE_ERROR_TRACE_IO = 4096,
+	KERNEL_REFERENCE_ERROR_TRACE_BINDING = 8192,
 	KERNEL_REFERENCE_ERROR_CHECKPOINT = 16384
 };
 
@@ -126,6 +128,116 @@ struct KernelPerformanceReferenceBatch
 	unsigned slot;
 };
 
+enum KernelPerformanceTraceMode
+{
+	KERNEL_TRACE_DISABLED = 0,
+	KERNEL_TRACE_RECORD,
+	KERNEL_TRACE_CONSUME
+};
+
+struct KernelPerformanceTraceLimits
+{
+	JobMetricCounter maximumBytes, maximumRecords, maximumLogicalEvents;
+	JobMetricCounter maximumAttempts, maximumRanges;
+};
+
+struct KernelPerformanceTraceBinding
+{
+	KernelPerformanceDigest nativeRunIdentity, executable, fixture, sourcePolicy;
+};
+
+struct KernelPerformanceTraceOptions
+{
+	KernelPerformanceTraceOptions();
+	KernelPerformanceTraceMode mode;
+	KernelPerformanceTraceBinding binding;
+	KernelPerformanceTraceLimits limits;
+	// Derived by the native integration from its frozen worker/input policy,
+	// independently from historical event-volume limits; core enforces bounds.
+	JobMetricCounter residentAttemptCapacity, residentRangeCapacity;
+	KernelPerformanceTraceAppend append;
+	void *context;
+};
+
+struct KernelPerformanceReferenceRunOptions
+{
+	KernelPerformanceReferenceRunOptions();
+	KernelPerformanceReferenceMode mode;
+	KernelPerformanceClock clock;
+	void *clockContext;
+	KernelPerformanceTraceOptions trace;
+};
+
+class KernelPerformanceReferenceLedger;
+class KernelPerformanceAttempt
+{
+public:
+	KernelPerformanceAttempt();
+	bool valid() const;
+private:
+	friend class KernelPerformanceReferenceLedger;
+	const KernelPerformanceReferenceLedger *m_owner;
+	JobMetricCounter m_generation, m_serial;
+	unsigned m_slot;
+};
+
+struct KernelPerformanceAttemptIdentity
+{
+	unsigned workKind, subtype;
+	JobMetricCounter sampleOrdinal, attemptOrdinal;
+	KernelPerformancePhase phase;
+	unsigned ownerFrame;
+};
+
+enum KernelPerformanceAdmission
+{
+	KERNEL_ADMISSION_NOT_REQUESTED = 0,
+	KERNEL_ADMISSION_REFUSED,
+	KERNEL_ADMISSION_ACCEPTED
+};
+
+struct KernelPerformanceAttemptDecision
+{
+	JobMetricCounter decisionOrdinal;
+	unsigned site, reasonSchema, reason;
+	bool deterministicEligible;
+	KernelPerformanceDigest deterministicFacts;
+	KernelPerformanceAdmission admission;
+	unsigned sourceConfiguredWorkers, dynamicFactsKnownMask;
+	JobMetricCounter pendingJobs, outstandingJobs, activeSlots;
+};
+
+struct KernelPerformanceAttemptFinish
+{
+	KernelPerformanceDisposition disposition;
+	unsigned reasonSchema, reason;
+	bool fallbackEntered, fallbackCompleted;
+	KernelPerformanceReferenceBatch validatedBatch;
+};
+
+struct KernelPerformanceAttemptReap
+{
+	unsigned reasonSchema, reason, dynamicFactsKnownMask;
+	JobMetricCounter pendingJobs, outstandingJobs, activeSlots;
+};
+
+struct KernelPerformanceTraceSnapshot
+{
+	KernelPerformanceTraceSnapshot();
+	KernelPerformanceTraceMode mode;
+	bool requested, frozen, complete, observationSealed, executionSealed;
+	unsigned errors;
+	KernelPerformanceTraceBinding binding;
+	KernelPerformanceTraceLimits limits;
+	JobMetricCounter residentAttemptCapacity, residentRangeCapacity;
+	JobMetricCounter residentAttemptCount, residentAttemptHighWater;
+	JobMetricCounter attemptCount, admittedAttemptCount, notAdmittedAttemptCount;
+	JobMetricCounter abortedAfterAdmissionAttemptCount, reapCount;
+	JobMetricCounter recordCount, logicalEventCount, coalescedSpanCount, coalescedAttemptCount;
+	JobMetricCounter byteCount;
+	KernelPerformanceDigest digest;
+};
+
 struct KernelPerformanceReferenceStream
 {
 	KernelPerformanceReferenceStream();
@@ -144,6 +256,7 @@ struct KernelPerformanceReferenceSnapshot
 	bool frozen, complete;
 	unsigned errors, streamCount;
 	JobMetricCounter generation;
+	KernelPerformanceTraceSnapshot trace;
 	KernelPerformanceReferenceStream streams[KERNEL_PERFORMANCE_MAXIMUM_STREAMS];
 };
 
@@ -162,6 +275,19 @@ public:
 	KernelPerformanceReferenceMode runMode() const noexcept;
 	bool beginRun(KernelPerformanceReferenceMode mode,
 		KernelPerformanceClock clock = 0, void *clockContext = 0) noexcept;
+	bool beginRun(const KernelPerformanceReferenceRunOptions &options) noexcept;
+	KernelPerformanceAttempt beginAttempt(const KernelPerformanceAttemptIdentity &identity) noexcept;
+	bool observeDecision(KernelPerformanceAttempt attempt,
+		const KernelPerformanceAttemptDecision &decision) noexcept;
+	bool finishAttempt(KernelPerformanceAttempt attempt,
+		const KernelPerformanceAttemptFinish &finish) noexcept;
+	// Records actual owner cleanup. Slot release alone is not group-terminal
+	// closure; later admitted-work support must retain that separate proof.
+	bool reapAttempt(KernelPerformanceAttempt attempt,
+		const KernelPerformanceAttemptReap &reap) noexcept;
+	bool sealObservationWindow() noexcept;
+	// Reference retained-attempt closure only, never a scheduler-idle claim.
+	bool sealExecutionClosure() noexcept;
 	// One call represents one already-validated batch, possibly containing
 	// multiple operations. SerialOracle computes into DETACHED storage only;
 	// ThroughputBinding never invokes serialCompute or reads its clock.
@@ -184,6 +310,9 @@ private:
 	std::atomic<bool> m_foreignCall;
 	std::atomic<KernelPerformanceReferenceMode> m_runMode;
 	bool owner() noexcept;
+	bool failTrace(unsigned error) noexcept;
+	bool traceReady() noexcept;
+	unsigned traceAttemptSlot(KernelPerformanceAttempt attempt) noexcept;
 	KernelPerformanceReferenceSnapshot m_snapshot;
 	KernelPerformanceReferenceLedger(const KernelPerformanceReferenceLedger &);
 	KernelPerformanceReferenceLedger &operator=(const KernelPerformanceReferenceLedger &);
