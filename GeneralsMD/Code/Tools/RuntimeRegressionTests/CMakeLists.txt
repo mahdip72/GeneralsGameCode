@@ -54,6 +54,9 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD)
 	include("${CMAKE_SOURCE_DIR}/Core/Tools/Stage5PerformanceFixtureTest/PerformanceReceiptOwnerBridgeTitleTest.cmake")
 	rts_add_performance_receipt_owner_bridge_test(z_runtime_regression_tests
 		GeneralsMD z_performance_receipt_owner_bridge_tests)
+	include("${CMAKE_SOURCE_DIR}/Core/Tools/Stage5PerformanceFixtureTest/PerformanceReceiptProducerTitleTest.cmake")
+	rts_add_performance_receipt_producer_test(z_runtime_regression_tests
+		GeneralsMD z_performance_receipt_producer_tests)
 	add_executable(z_native_render_target_texture_tests
 		"${CMAKE_SOURCE_DIR}/Core/Tools/NativeW3DTextureOwnerTest/NativeRenderTargetTextureTest.cpp"
 	)

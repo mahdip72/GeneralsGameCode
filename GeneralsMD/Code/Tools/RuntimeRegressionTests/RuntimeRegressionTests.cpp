@@ -2595,6 +2595,7 @@ static void TestSkirmishAITestRunnerContract()
 #if defined(_WIN64)
 int RunHeadlessMetricStartupTitleTests();
 int RunPerformanceReceiptOwnerBridgeTitleTests();
+int RunPerformanceReceiptProducerTitleTests();
 #endif
 
 int main(int argc, char **argv)
@@ -2604,6 +2605,8 @@ int main(int argc, char **argv)
 		return RunHeadlessMetricStartupTitleTests();
 	if (argc == 2 && strcmp(argv[1], "--performance-receipt-owner-bridge") == 0)
 		return RunPerformanceReceiptOwnerBridgeTitleTests();
+	if (argc == 2 && strcmp(argv[1], "--performance-receipt-producer") == 0)
+		return RunPerformanceReceiptProducerTitleTests();
 	if (argc == 2 && strcmp(argv[1], "--performance-receipt-lifecycle") == 0)
 	{
 		TestPerformanceReceiptOwnerLifecycle();

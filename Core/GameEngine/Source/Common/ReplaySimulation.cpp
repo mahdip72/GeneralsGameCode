@@ -497,6 +497,41 @@ void printHeadlessJobMetrics(const char *replayName,
 
 class HeadlessSimulationJobSystemScope
 {
+#if defined(_WIN64)
+	class PerformanceReceiptOwnerBorrow
+	{
+	public:
+		PerformanceReceiptOwnerBorrow(GameLogic *owner, PerformanceReceiptRuntime *runtime)
+			: m_owner(0), m_runtime(runtime)
+		{
+			if (m_runtime == 0) return;
+			if (owner != 0 && owner->attachPerformanceReceiptRuntime(m_runtime))
+				m_owner = owner;
+			else
+				m_runtime->invalidate("replay owner could not borrow the receipt runtime");
+		}
+
+		~PerformanceReceiptOwnerBorrow()
+		{
+			if (m_owner == 0) return;
+			// The replay call cannot outlive its GameLogic owner. Do not
+			// dereference a replaced owner or leave a borrowed stack pointer.
+			if (TheGameLogic != m_owner ||
+				!m_owner->detachPerformanceReceiptRuntime(m_runtime))
+			{
+				RELEASE_CRASH("replay receipt runtime owner release failed");
+				abort();
+			}
+		}
+
+	private:
+		GameLogic *m_owner;
+		PerformanceReceiptRuntime *m_runtime;
+		PerformanceReceiptOwnerBorrow(const PerformanceReceiptOwnerBorrow &);
+		PerformanceReceiptOwnerBorrow &operator=(const PerformanceReceiptOwnerBorrow &);
+	};
+#endif
+
 public:
 	HeadlessSimulationJobSystemScope(const char *replayName,
 		rts::PipelineExecutionMode requestedPipelineMode,
@@ -509,6 +544,7 @@ public:
 		#if defined(_WIN64)
 		  , m_performanceReceipt(
 			static_cast<PerformanceReceiptRuntime *>(performanceReceipt))
+		  , m_performanceReceiptOwner(TheGameLogic, m_performanceReceipt)
 		#endif
 	{
 #if !defined(_WIN64)
@@ -688,6 +724,9 @@ private:
 	unsigned m_workerCount;
 #if defined(_WIN64)
 	PerformanceReceiptRuntime *m_performanceReceipt;
+	// Member release follows real job teardown, including the never-started
+	// destructor return, and precedes the outer stack runtime's destruction.
+	PerformanceReceiptOwnerBorrow m_performanceReceiptOwner;
 	rts::CollisionCandidateRuntimeMetrics m_collisionMetricsAtStart;
 	rts::CollisionCandidateRuntimeMetrics m_collisionMetricsFrozen;
 	Bool m_collisionMetricsAwaitingInitialReset;
@@ -896,7 +935,9 @@ void PerformanceReceiptRuntime::captureCompletedFrame(unsigned previousFrame,
 {
 	if (!active() || TheGameLogic == 0 || ThePlayerList == 0) return;
 	const unsigned frame = TheGameLogic->getFrame();
-	if (frame <= previousFrame || !m_lifecycle.observeCompletedFrame(frame)) return;
+	// NEW_GAME can replace an earlier world's frame (83 -> 1). Run-local
+	// lifecycle ordering rejects control frame 0 and duplicate completions.
+	if (frame == previousFrame || !m_lifecycle.observeCompletedFrame(frame)) return;
 	unsigned players = 0;
 	for (Int index = 0; index < ThePlayerList->getPlayerCount(); ++index)
 	{
