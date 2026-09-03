@@ -1197,6 +1197,18 @@ static bool livePartitionOwnerMatchesSnapshot(PartitionData *partition,
 		(geometry.getIsSmall() != FALSE) == snapshot.smallGeometry;
 }
 
+static rts::JobMetricCounter s_collisionPerformanceOrdinal = 0;
+
+static rts::JobMetricCounter nextCollisionPerformanceOrdinal()
+{
+	// A world frame may contain several partition updates during map loading.
+	// Their traversal ordinals restart; diagnostic attempt identities must not.
+	if (s_collisionPerformanceOrdinal !=
+		~static_cast<rts::JobMetricCounter>(0))
+		++s_collisionPerformanceOrdinal;
+	return s_collisionPerformanceOrdinal;
+}
+
 static void finishCollisionPerformanceBatch(
 	rts::performance::KernelPerformanceLedger *ledger,
 	const rts::performance::KernelPerformanceBatch &batch,
@@ -2318,7 +2330,7 @@ void PartitionData::addPossibleCollisions(PartitionContactList *ctList,
 				rts::performance::KERNEL_PERFORMANCE_COLLISION, 0,
 				TheGameLogic != nullptr ?
 					static_cast<UnsignedInt>(TheGameLogic->getFrame()) : 0,
-				static_cast<rts::JobMetricCounter>(ownerOrdinal));
+				nextCollisionPerformanceOrdinal());
 		rts::performance::KernelPerformanceReferenceLedger *referenceLedger =
 		&rts::performance::KernelPerformanceReferenceLedger::instance();
 	rts::performance::KernelPerformanceReferenceBatch referenceBatch;
