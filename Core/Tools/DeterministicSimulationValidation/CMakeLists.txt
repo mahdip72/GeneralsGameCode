@@ -4,6 +4,19 @@ if(WIN32)
     # retain its normal runner workspace without embedding a machine path.
     set(_stage5_validation_test_scratch_root
         "${CMAKE_CURRENT_BINARY_DIR}/stage5-validation-test-scratch")
+    if(MSVC AND NOT IS_VS6_BUILD)
+        add_executable(core_validation_process_lifecycle_fixture
+            ValidationProcessLifecycleFixture.cpp)
+        set_property(TARGET core_validation_process_lifecycle_fixture PROPERTY
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        add_test(NAME core_validation_process_lifecycle_tests
+            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/InvokeValidationProcessLifecycle.Tests.ps1"
+                -FixtureExecutable "$<TARGET_FILE:core_validation_process_lifecycle_fixture>"
+                -ScratchRoot "${_stage5_validation_test_scratch_root}")
+        set_tests_properties(core_validation_process_lifecycle_tests PROPERTIES
+            RUN_SERIAL TRUE PROCESSORS 1 TIMEOUT 120)
+    endif()
     add_test(NAME core_deterministic_simulation_validation_script_tests
         COMMAND powershell -NoProfile -ExecutionPolicy Bypass
             -File "${CMAKE_CURRENT_SOURCE_DIR}/DeterministicSimulationValidation.Tests.ps1"

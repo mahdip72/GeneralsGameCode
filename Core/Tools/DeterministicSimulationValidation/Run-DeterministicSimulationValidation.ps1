@@ -1580,6 +1580,67 @@ function Stop-ValidationProcessSafely {
     return $true
 }
 
+function Get-ValidationOriginalHandleIdentity {
+    param([Parameter(Mandatory = $true)][Diagnostics.Process]$Process)
+    if ($null -eq ('Stage5ValidationOriginalProcessNative' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class Stage5ValidationOriginalProcessNative
+{
+    [StructLayout(LayoutKind.Sequential)]
+    public struct FileTime
+    {
+        public UInt32 Low;
+        public UInt32 High;
+    }
+
+    [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
+    public static extern UInt32 GetProcessId(IntPtr process);
+
+    [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetProcessTimes(IntPtr process, out FileTime creation,
+        out FileTime exit, out FileTime kernel, out FileTime user);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool QueryFullProcessImageNameW(IntPtr process, UInt32 flags,
+        StringBuilder name, ref UInt32 size);
+}
+'@ -ErrorAction Stop
+    }
+    # Borrow only the handle retained by this original Process.Start(). Neither
+    # reacquire by PID nor close the borrowed handle from this read-only helper.
+    $handle = $Process.Handle
+    Assert-Condition ($handle -ne [IntPtr]::Zero) 'Original validation process handle is unavailable.'
+    [UInt32]$observedProcessId = [Stage5ValidationOriginalProcessNative]::GetProcessId($handle)
+    Assert-Condition ($observedProcessId -ne 0) 'Original validation process PID could not be read.'
+    $creation = New-Object 'Stage5ValidationOriginalProcessNative+FileTime'
+    $exitTime = New-Object 'Stage5ValidationOriginalProcessNative+FileTime'
+    $kernel = New-Object 'Stage5ValidationOriginalProcessNative+FileTime'
+    $user = New-Object 'Stage5ValidationOriginalProcessNative+FileTime'
+    Assert-Condition ([Stage5ValidationOriginalProcessNative]::GetProcessTimes(
+        $handle, [ref]$creation, [ref]$exitTime, [ref]$kernel, [ref]$user)) `
+        'Original validation process creation FILETIME could not be read.'
+    [UInt64]$creationTime100ns = ([UInt64]$creation.High -shl 32) -bor [UInt64]$creation.Low
+    Assert-Condition ($creationTime100ns -ne 0) 'Original validation process creation FILETIME is empty.'
+    $imagePath = New-Object Text.StringBuilder 32768
+    [UInt32]$imagePathLength = $imagePath.Capacity
+    Assert-Condition ([Stage5ValidationOriginalProcessNative]::QueryFullProcessImageNameW(
+        $handle, [UInt32]0, $imagePath, [ref]$imagePathLength)) `
+        'Original validation process image path could not be read.'
+    Assert-Condition ($imagePathLength -gt 0 -and $imagePathLength -lt $imagePath.Capacity) `
+        'Original validation process image path is empty or truncated.'
+    return [pscustomobject]@{
+        processId = $observedProcessId
+        processCreationTime100ns = $creationTime100ns
+        executablePath = [IO.Path]::GetFullPath($imagePath.ToString())
+    }
+}
+
 function Invoke-ValidationProcess {
     param(
         [string]$Executable,
@@ -1589,82 +1650,113 @@ function Invoke-ValidationProcess {
         [hashtable]$Environment,
         [string]$EvidenceRoot = '',
         [AllowNull()][object]$NativeObservationBinding = $null,
-        [AllowNull()][object]$LivePlanBinding = $null
+        [AllowNull()][object]$LivePlanBinding = $null,
+        [AllowNull()][ref]$LifecycleObservation
     )
-    $entryFields = if ($Entry -is [Collections.IDictionary]) { @($Entry.Keys) }
-        elseif ($null -ne $Entry) { @($Entry.PSObject.Properties | ForEach-Object { $_.Name }) }
-        else { @() }
-    $hasLiveMetadata = $false
-    foreach ($field in @('entryId', 'validationRole', 'proofProfileId')) {
-        if ($entryFields -contains $field) { $hasLiveMetadata = $true }
-    }
-    if ($hasLiveMetadata -or $null -ne $LivePlanBinding) {
-        Assert-Condition ($null -ne $LivePlanBinding) `
-            'A frozen live plan binding is required for a V2 validation entry.'
-        $Entry = Resolve-Stage5FrozenLivePlanEntry -LivePlanBinding $LivePlanBinding `
-            -Entry $Entry -Executable $Executable -WorkingDirectory $WorkingDirectory
-    }
-    $nativeBinding = Get-NativeObservationBinding $NativeObservationBinding
-    Assert-Condition ($null -eq $nativeBinding -or $CaptureTiming) `
-        'Native observation requires frame timing before starting the installed process.'
-    $processName = [IO.Path]::GetFileNameWithoutExtension($Executable)
-    Assert-Condition (@(Get-Process -Name $processName -ErrorAction SilentlyContinue).Count -eq 0) `
-        "A $processName process is already running. Validation will not overlap game processes."
-    $stdoutDirectory = Split-Path -Parent $Entry.stdout
-    if (-not (Test-Path -LiteralPath $stdoutDirectory -PathType Container)) {
-        New-Item -ItemType Directory -Path $stdoutDirectory | Out-Null
-    }
-    if ($CaptureTiming) {
-        New-Item -ItemType Directory -Path $Entry.timingDirectory -Force | Out-Null
-    }
-    $startInfo = New-Object Diagnostics.ProcessStartInfo
-    $startInfo.FileName = $Executable
-    $startInfo.WorkingDirectory = $WorkingDirectory
-    $startInfo.Arguments = (($Entry.arguments | ForEach-Object {
-        if ($_ -match '[\s"]') { '"' + $_.Replace('"', '\"') + '"' } else { $_ }
-    }) -join ' ')
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    foreach ($environmentName in $Environment.Keys) {
-        $startInfo.EnvironmentVariables[[string]$environmentName] =
-            [string]$Environment[$environmentName]
-    }
-    if ($CaptureTiming) {
-        $startInfo.EnvironmentVariables['RTS_FRAME_TIMING_DIR'] = $Entry.timingDirectory
-    }
-    elseif ($startInfo.EnvironmentVariables.ContainsKey('RTS_FRAME_TIMING_DIR')) {
-        $startInfo.EnvironmentVariables.Remove('RTS_FRAME_TIMING_DIR')
-    }
-    $processRunNonce = [Guid]::NewGuid().ToString()
-    $startInfo.EnvironmentVariables['RTS_STAGE5_RUN_NONCE'] = $processRunNonce
-    $startInfo.EnvironmentVariables['RTS_STAGE5_COHORT_NONCE'] = $executionCohortNonce
-    $startInfo.EnvironmentVariables['RTS_STAGE5_COHORT_CREATED_UTC'] = $executionCohortCreatedUtc
-    $nativeReceiptDirectory = Set-NativePerformanceObservationEnvironment `
-        -Environment $startInfo.EnvironmentVariables -Binding $nativeBinding -Entry $Entry `
-        -EvidenceRoot $EvidenceRoot -RunNonce $processRunNonce `
-        -CohortNonce $executionCohortNonce -CohortCreatedUtc $executionCohortCreatedUtc
-    if ($null -ne $nativeReceiptDirectory) {
-        if (-not (Test-Path -LiteralPath $nativeReceiptDirectory -PathType Container)) {
-            New-Item -ItemType Directory -Path $nativeReceiptDirectory -Force | Out-Null
-        }
-    }
-    $process = New-Object Diagnostics.Process
-    $process.StartInfo = $startInfo
-    $startedAt = [DateTime]::UtcNow
+    $captureLifecycle = $null -ne $LifecycleObservation
+    if ($captureLifecycle) { $LifecycleObservation.Value = $null }
+    $process = $null
+    $processRunNonce = $null
+    $launchAttempted = $false
     $started = $false
     $terminationAttempted = $false
-    $processIdentity = $null
-    $processCreationUtc = ''
-    $stdoutTask = $null
-    $stderrTask = $null
-    $exited = $false
     $timedOut = $false
+    $bodyCompleted = $false
+    $lifecycleIdentityStatus = 'not-started'
+    $lifecycleProcessId = $null
+    $lifecycleCreationTime100ns = $null
+    $lifecycleExecutablePath = $null
+    $lifecycleWaitSucceeded = $false
     $postKillWaitMilliseconds = 30000
     try {
+        $entryFields = if ($Entry -is [Collections.IDictionary]) { @($Entry.Keys) }
+            elseif ($null -ne $Entry) { @($Entry.PSObject.Properties | ForEach-Object { $_.Name }) }
+            else { @() }
+        $hasLiveMetadata = $false
+        foreach ($field in @('entryId', 'validationRole', 'proofProfileId')) {
+            if ($entryFields -contains $field) { $hasLiveMetadata = $true }
+        }
+        if ($hasLiveMetadata -or $null -ne $LivePlanBinding) {
+            Assert-Condition ($null -ne $LivePlanBinding) `
+                'A frozen live plan binding is required for a V2 validation entry.'
+            $Entry = Resolve-Stage5FrozenLivePlanEntry -LivePlanBinding $LivePlanBinding `
+                -Entry $Entry -Executable $Executable -WorkingDirectory $WorkingDirectory
+        }
+        $nativeBinding = Get-NativeObservationBinding $NativeObservationBinding
+        Assert-Condition ($null -eq $nativeBinding -or $CaptureTiming) `
+            'Native observation requires frame timing before starting the installed process.'
+        $processName = [IO.Path]::GetFileNameWithoutExtension($Executable)
+        Assert-Condition (@(Get-Process -Name $processName -ErrorAction SilentlyContinue).Count -eq 0) `
+            "A $processName process is already running. Validation will not overlap game processes."
+        $stdoutDirectory = Split-Path -Parent $Entry.stdout
+        if (-not (Test-Path -LiteralPath $stdoutDirectory -PathType Container)) {
+            New-Item -ItemType Directory -Path $stdoutDirectory | Out-Null
+        }
+        if ($CaptureTiming) {
+            New-Item -ItemType Directory -Path $Entry.timingDirectory -Force | Out-Null
+        }
+        $startInfo = New-Object Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $Executable
+        $startInfo.WorkingDirectory = $WorkingDirectory
+        $startInfo.Arguments = (($Entry.arguments | ForEach-Object {
+            if ($_ -match '[\s"]') { '"' + $_.Replace('"', '\"') + '"' } else { $_ }
+        }) -join ' ')
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        foreach ($environmentName in $Environment.Keys) {
+            $startInfo.EnvironmentVariables[[string]$environmentName] =
+                [string]$Environment[$environmentName]
+        }
+        if ($CaptureTiming) {
+            $startInfo.EnvironmentVariables['RTS_FRAME_TIMING_DIR'] = $Entry.timingDirectory
+        }
+        elseif ($startInfo.EnvironmentVariables.ContainsKey('RTS_FRAME_TIMING_DIR')) {
+            $startInfo.EnvironmentVariables.Remove('RTS_FRAME_TIMING_DIR')
+        }
+        $processRunNonce = [Guid]::NewGuid().ToString()
+        $startInfo.EnvironmentVariables['RTS_STAGE5_RUN_NONCE'] = $processRunNonce
+        $startInfo.EnvironmentVariables['RTS_STAGE5_COHORT_NONCE'] = $executionCohortNonce
+        $startInfo.EnvironmentVariables['RTS_STAGE5_COHORT_CREATED_UTC'] = $executionCohortCreatedUtc
+        $nativeReceiptDirectory = Set-NativePerformanceObservationEnvironment `
+            -Environment $startInfo.EnvironmentVariables -Binding $nativeBinding -Entry $Entry `
+            -EvidenceRoot $EvidenceRoot -RunNonce $processRunNonce `
+            -CohortNonce $executionCohortNonce -CohortCreatedUtc $executionCohortCreatedUtc
+        if ($null -ne $nativeReceiptDirectory) {
+            if (-not (Test-Path -LiteralPath $nativeReceiptDirectory -PathType Container)) {
+                New-Item -ItemType Directory -Path $nativeReceiptDirectory -Force | Out-Null
+            }
+        }
+        $process = New-Object Diagnostics.Process
+        $process.StartInfo = $startInfo
+        $startedAt = [DateTime]::UtcNow
+        $processIdentity = $null
+        $processCreationUtc = ''
+        $stdoutTask = $null
+        $stderrTask = $null
+        $exited = $false
+        $lifecycleIdentityStatus = 'unavailable'
+        $launchAttempted = $true
         Assert-Condition ($process.Start()) "Failed to start installed runtime process."
         $started = $true
+        if ($captureLifecycle) {
+            try {
+                $originalIdentity = Get-ValidationOriginalHandleIdentity $process
+                $lifecycleProcessId = [UInt32]$originalIdentity.processId
+                $lifecycleCreationTime100ns = [UInt64]$originalIdentity.processCreationTime100ns
+                $lifecycleExecutablePath = [string]$originalIdentity.executablePath
+                $lifecycleIdentityStatus = if ([String]::Equals($lifecycleExecutablePath,
+                    [IO.Path]::GetFullPath($Executable), [StringComparison]::OrdinalIgnoreCase)) {
+                    'verified'
+                } else { 'mismatch' }
+            }
+            catch {
+                # Optional observation failure withholds cleanup authority; it
+                # does not change the existing process or exception policy.
+                $lifecycleIdentityStatus = 'unavailable'
+            }
+        }
         try {
             $processCreationUtc = ConvertTo-UtcIsoTimestamp $process.StartTime
         }
@@ -1692,6 +1784,7 @@ function Invoke-ValidationProcess {
         }
 
         $exited = $process.WaitForExit($Entry.timeoutSeconds * 1000)
+        if ($exited) { $lifecycleWaitSucceeded = $true }
         if (-not $exited) {
             $timedOut = $true
             $terminationAttempted = $true
@@ -1699,6 +1792,7 @@ function Invoke-ValidationProcess {
             # Keep the final state bounded even if the process disappeared in
             # the race between identity inspection and Kill().
             $exited = $process.WaitForExit($postKillWaitMilliseconds)
+            if ($exited) { $lifecycleWaitSucceeded = $true }
             if (-not $exited) {
                 throw "Validation process remained alive after the bounded post-kill wait."
             }
@@ -1752,7 +1846,7 @@ function Invoke-ValidationProcess {
                 (Join-Path $Entry.runtimeLogDirectory $runtimeLog.Name)
             $runtimeLogText.Add((Get-Content -LiteralPath $runtimeLog.FullName -Raw)) | Out-Null
         }
-        return [pscustomobject]@{
+        $result = [pscustomobject]@{
             timedOut = $timedOut
             exitCode = $(if ($exited) { $process.ExitCode } else { -1 })
             wallMilliseconds = [int64]([DateTime]::UtcNow - $startedAt).TotalMilliseconds
@@ -1761,6 +1855,8 @@ function Invoke-ValidationProcess {
             runtimeLogText = $runtimeLogText.ToArray() -join "`n"
             childProcess = $childProcess
         }
+        $bodyCompleted = $true
+        return $result
     }
     finally {
         $cleanupErrors = New-Object 'Collections.Generic.List[string]'
@@ -1780,7 +1876,58 @@ function Invoke-ValidationProcess {
             }
             catch { $cleanupErrors.Add($_.Exception.Message) | Out-Null }
         }
-        if ($null -ne $process) { $process.Dispose() }
+        try {
+            if ($captureLifecycle) {
+                $exitCodeKnown = $false
+                $observedExitCode = $null
+                if ($started) {
+                    if (-not $lifecycleWaitSucceeded) {
+                        try { $lifecycleWaitSucceeded = $process.WaitForExit(0) }
+                        catch { }
+                    }
+                    if ($lifecycleWaitSucceeded) {
+                        try {
+                            $observedExitCode = [int]$process.ExitCode
+                            $exitCodeKnown = $true
+                        }
+                        catch { }
+                    }
+                }
+                $cleanupState = if ($cleanupErrors.Count -gt 0) { 'failed' }
+                    elseif (-not $launchAttempted) { 'not-needed' }
+                    elseif (-not $started -or -not $lifecycleWaitSucceeded) { 'unconfirmed' }
+                    elseif ($terminationAttempted) { 'completed' }
+                    else { 'not-needed' }
+                # Publish once, before Dispose, using only owned primitive
+                # copies. The mutable backing store and live Process stay here.
+                $values = New-Object 'Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
+                $values.Add('schemaVersion', [int]1)
+                $values.Add('authority', 'stage5-original-process-handle-v1')
+                $values.Add('runNonce', $processRunNonce)
+                $values.Add('launchAttempted', $launchAttempted)
+                $values.Add('started', $started)
+                $values.Add('identityStatus', $lifecycleIdentityStatus)
+                $values.Add('processId', $lifecycleProcessId)
+                $values.Add('processCreationTime100ns', $lifecycleCreationTime100ns)
+                $values.Add('executablePath', $lifecycleExecutablePath)
+                $values.Add('waitForExitSucceeded', $lifecycleWaitSucceeded)
+                $values.Add('exitCodeKnown', $exitCodeKnown)
+                $values.Add('exitCode', $observedExitCode)
+                $values.Add('timedOut', $timedOut)
+                $values.Add('terminationAttempted', $terminationAttempted)
+                $values.Add('cleanupState', $cleanupState)
+                $values.Add('bodyCompleted', $bodyCompleted)
+                $LifecycleObservation.Value = New-Object `
+                    'Collections.ObjectModel.ReadOnlyDictionary[string,object]' -ArgumentList (,$values)
+            }
+        }
+        catch {
+            # A publication failure cannot replace a primary/cleanup error or
+            # skip Dispose. The supplied holder was cleared before preflight.
+        }
+        finally {
+            if ($null -ne $process) { $process.Dispose() }
+        }
         if ($cleanupErrors.Count -gt 0) {
             throw "Validation process cleanup failed: $($cleanupErrors -join ' | ')"
         }
