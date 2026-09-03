@@ -534,8 +534,10 @@ function Assert-NativeObservationProcessBinding {
         Assert-Throws { Get-NativeObservationBinding $invalid | Out-Null } 'observation|Observation' `
             'incomplete, malformed, or qualification-bearing observation bindings are rejected'
     }
+    $observationEvidenceRoot = Join-Path $root 'observation-unit-test'
+    $observationTimingDirectory = Join-Path $observationEvidenceRoot 'timing-7'
     $entry = @{kind='replay';caseId='observed-replay';fixtureSha256=('E'*64);seed=0
-        sequence=7;timingDirectory='H:\observation-unit-test\timing-7'}
+        sequence=7;timingDirectory=$observationTimingDirectory}
     $environment = @{'RTS_PERFORMANCE_RUN_ID'='stale';'RTS_PERFORMANCE_SEED'='999'
         'RTS_PERFORMANCE_REFERENCE_MODE'='serial-oracle';'RTS_PERFORMANCE_UNIT_COUNT'='8000'
         'RTS_PERFORMANCE_UNKNOWN_INHERITED'='stale';'unrelated'='preserved'}
@@ -543,11 +545,13 @@ function Assert-NativeObservationProcessBinding {
     $firstNonce = '11111111-1111-4111-8111-111111111111'
     $secondNonce = '22222222-2222-4222-8222-222222222222'
     $arguments = @{Environment=$environment;Binding=$binding;Entry=$entry
-        EvidenceRoot='H:\observation-unit-test';RunNonce=$firstNonce
+        EvidenceRoot=$observationEvidenceRoot;RunNonce=$firstNonce
         CohortNonce=$cohort;CohortCreatedUtc='2026-09-01T00:00:00Z'}
     $directories = @(Set-NativePerformanceObservationEnvironment @arguments)
+    $observationReceiptRoot = Join-Path $observationEvidenceRoot 'native-performance-receipts'
+    $expectedReceiptDirectory = Join-Path $observationReceiptRoot $firstNonce
     Assert-True ($directories.Count -eq 1 -and $directories[0] -ceq
-        "H:\observation-unit-test\native-performance-receipts\$firstNonce" -and
+        $expectedReceiptDirectory -and
         $environment['RTS_PERFORMANCE_RECEIPT_DIR'] -ceq $directories[0] -and
         $environment['RTS_PERFORMANCE_RAW_LOG_PATH'] -ceq (Join-Path $directories[0] 'performance-raw.log') -and
         $environment['RTS_PERFORMANCE_TIMING_PATH'] -ceq $entry.timingDirectory -and

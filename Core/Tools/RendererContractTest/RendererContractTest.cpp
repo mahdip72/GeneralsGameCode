@@ -48,6 +48,26 @@ bool nearlyEqual(float left, float right, float epsilon = 0.00001f)
 	return fabs(left - right) <= epsilon;
 }
 
+std::string NormalizeSourceLineEndings(const std::string &contents)
+{
+	std::string normalized;
+	normalized.reserve(contents.size());
+	for (std::string::size_type i = 0; i != contents.size(); ++i)
+	{
+		if (contents[i] == '\r' && i + 1 < contents.size() &&
+			contents[i + 1] == '\n')
+		{
+			normalized += '\n';
+			++i;
+		}
+		else
+		{
+			normalized += contents[i];
+		}
+	}
+	return normalized;
+}
+
 bool ExpectedNativeVideoPublicationSelection(
 	rts::render::RenderBackend backend, bool backendSupported, bool ownerActive)
 {
@@ -95,7 +115,30 @@ bool ReadSourceText(const char *relativePath, std::string *contents)
 		return false;
 	}
 	contents->assign(&bytes[0], bytesRead);
+	*contents = NormalizeSourceLineEndings(*contents);
 	return true;
+}
+
+int testSourceReaderLineEndingNormalization()
+{
+	int result = 0;
+	const std::string lineFeedFixture = "legacy marker one\nlegacy marker two\n";
+	const std::string carriageReturnLineFeedFixture =
+		"legacy marker one\r\nlegacy marker two\r\n";
+	const std::string mixedLineEndingFixture =
+		"legacy marker one\r\nlegacy marker two\nlegacy marker three\r";
+	const std::string expectedMixedLineEnding =
+		"legacy marker one\nlegacy marker two\nlegacy marker three\r";
+	result |= check(NormalizeSourceLineEndings(lineFeedFixture) ==
+		lineFeedFixture,
+		"source reader preserves LF source text");
+	result |= check(NormalizeSourceLineEndings(carriageReturnLineFeedFixture) ==
+		lineFeedFixture,
+		"source reader normalizes CRLF source text to LF");
+	result |= check(NormalizeSourceLineEndings(mixedLineEndingFixture) ==
+		expectedMixedLineEnding,
+		"source reader normalizes only CRLF pairs and preserves lone CR bytes");
+	return result;
 }
 
 unsigned CountSourceOccurrences(const std::string &source, const char *needle)
@@ -6517,6 +6560,7 @@ int main()
 #endif
 #endif
 	result |= testBackendNames();
+	result |= testSourceReaderLineEndingNormalization();
 	result |= testRenderTexturePublicationOperationalStates();
 #if !defined(RTS_RENDERER_HAS_D3D11)
 	result |= testNativeRendererRejectsUnavailableBackend();
