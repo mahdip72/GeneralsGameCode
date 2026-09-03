@@ -31,6 +31,12 @@ struct KernelPerformanceDigest
 	bool equals(const KernelPerformanceDigest &other) const;
 };
 
+// The transport must append this exact byte range or fail. A failed/partial
+// append invalidates the stream; the writer never retries an accepted prefix.
+// The context and bytes are borrowed. Callbacks must not reenter the writer.
+typedef bool (*KernelPerformanceTraceAppend)(void *context,
+	const unsigned char *bytes, unsigned count);
+
 // No raw object-representation hashing. Each field encodes a type byte,
 // little-endian tag, and canonical value. sequence() records collection count;
 // callers then emit each element's scalar fields in deterministic order.
@@ -41,6 +47,13 @@ public:
 	KernelPerformanceCanonicalWriter();
 	~KernelPerformanceCanonicalWriter();
 	bool begin(unsigned fieldSchema);
+	// Optional trace transport uses fixed 64-KiB buffering by default. The
+	// legacy entry point and explicit unbuffered mode preserve canonical bytes.
+	bool begin(unsigned fieldSchema, KernelPerformanceTraceAppend append,
+		void *context, bool buffered = true) noexcept;
+	// Drain at a measured owner boundary without sealing the canonical stream.
+	// Empty/finalized flushes are inert; any transport/hash failure is sticky.
+	bool flush() noexcept;
 	bool u32(unsigned tag, unsigned value);
 	bool i32(unsigned tag, int value);
 	bool u64(unsigned tag, JobMetricCounter value);

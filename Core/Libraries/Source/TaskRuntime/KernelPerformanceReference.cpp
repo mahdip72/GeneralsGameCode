@@ -12,34 +12,100 @@ bool KernelPerformanceDigest::equals(const KernelPerformanceDigest &other) const
 
 struct KernelPerformanceCanonicalWriter::State
 {
-	State() : algorithm(0), hash(0), failed(false), finished(false) {}
+	enum { BufferCapacity = 65536 };
+	State() : algorithm(0), hash(0), buffer(0), pending(0), buffered(false),
+		failed(false), finished(false), busy(false), transport(0), context(0) {}
 	~State()
 	{
+		// An abandoned stream never implicitly publishes its unsealed suffix.
+		delete[] buffer;
 		if (hash != 0) BCryptDestroyHash(hash);
 		if (algorithm != 0) BCryptCloseAlgorithmProvider(algorithm, 0);
 	}
-	bool append(const unsigned char *bytes, unsigned count)
+	bool emit(const unsigned char *bytes, unsigned count) noexcept
 	{
+		if (busy) { failed = true; return false; }
 		if (failed || finished || hash == 0) return false;
+		if (count == 0) return true;
+		busy = true;
 		if (BCryptHashData(hash, const_cast<PUCHAR>(bytes), count, 0) != 0) failed = true;
+		if (!failed && transport != 0)
+		{
+			try { if (!transport(context, bytes, count)) failed = true; }
+			catch (...) { failed = true; }
+		}
+		// Reentry may have poisoned this state even if the callback returned
+		// success. Never turn that failure into an accepted hash or retry.
+		busy = false;
 		return !failed;
+	}
+	bool flush() noexcept
+	{
+		if (busy) { failed = true; return false; }
+		if (failed || hash == 0) return false;
+		if (finished || pending == 0) return true;
+		if (!emit(buffer, pending)) return false;
+		pending = 0;
+		return true;
+	}
+	bool append(const unsigned char *bytes, unsigned count) noexcept
+	{
+		if (busy) { failed = true; return false; }
+		if (failed || finished || hash == 0) return false;
+		if (!buffered) return emit(bytes, count);
+		while (count != 0)
+		{
+			const unsigned available = BufferCapacity - pending;
+			const unsigned copied = count < available ? count : available;
+			memcpy(buffer + pending, bytes, copied);
+			pending += copied;
+			bytes += copied;
+			count -= copied;
+			if (pending == BufferCapacity && !flush()) return false;
+		}
+		return true;
 	}
 	BCRYPT_ALG_HANDLE algorithm;
 	BCRYPT_HASH_HANDLE hash;
-	bool failed, finished;
+	unsigned char *buffer;
+	unsigned pending;
+	bool buffered, failed, finished, busy;
+	KernelPerformanceTraceAppend transport;
+	void *context;
 	KernelPerformanceDigest digest;
 };
 
 KernelPerformanceCanonicalWriter::KernelPerformanceCanonicalWriter() : m_state(0) {}
 KernelPerformanceCanonicalWriter::~KernelPerformanceCanonicalWriter() { delete m_state; }
-bool KernelPerformanceCanonicalWriter::begin(unsigned fieldSchema)
+bool KernelPerformanceCanonicalWriter::begin(unsigned fieldSchema, KernelPerformanceTraceAppend append,
+	void *context, bool buffered) noexcept
 {
-	if (m_state != 0 && !m_state->finished) { m_state->failed = true; return false; }
-	delete m_state;
-	m_state = new (std::nothrow) State;
+	if (m_state != 0 && (m_state->busy || m_state->failed || !m_state->finished))
+	{ m_state->failed = true; return false; }
+	if (m_state == 0) m_state = new (std::nothrow) State;
 	if (m_state == 0) return false;
-	if (fieldSchema == 0 || BCryptOpenAlgorithmProvider(&m_state->algorithm,
-		BCRYPT_SHA256_ALGORITHM, 0, 0) != 0 || BCryptCreateHash(m_state->algorithm,
+	// Reuse the writer's provider and optional buffer between completed spans.
+	// Only an explicitly buffered writer allocates 64 KiB; ordinary per-input
+	// canonical writers keep their existing small allocation footprint.
+	m_state->finished = false;
+	m_state->pending = 0;
+	m_state->buffered = buffered;
+	m_state->transport = append;
+	m_state->context = context;
+	m_state->digest = KernelPerformanceDigest();
+	if (fieldSchema == 0) { m_state->failed = true; return false; }
+	if (buffered && m_state->buffer == 0)
+	{
+		m_state->buffer = new (std::nothrow) unsigned char[State::BufferCapacity];
+		if (m_state->buffer == 0) { m_state->failed = true; return false; }
+	}
+	if (m_state->hash != 0)
+	{
+		BCryptDestroyHash(m_state->hash);
+		m_state->hash = 0;
+	}
+	if ((m_state->algorithm == 0 && BCryptOpenAlgorithmProvider(&m_state->algorithm,
+		BCRYPT_SHA256_ALGORITHM, 0, 0) != 0) || BCryptCreateHash(m_state->algorithm,
 		&m_state->hash, 0, 0, 0, 0, 0) != 0)
 	{
 		m_state->failed = true;
@@ -49,6 +115,14 @@ bool KernelPerformanceCanonicalWriter::begin(unsigned fieldSchema)
 	unsigned char schema[4];
 	for (unsigned index = 0; index != 4; ++index) schema[index] = static_cast<unsigned char>(fieldSchema >> (index * 8));
 	return m_state->append(domain, sizeof(domain) - 1) && m_state->append(schema, sizeof(schema));
+}
+bool KernelPerformanceCanonicalWriter::flush() noexcept
+{
+	return m_state != 0 && m_state->flush();
+}
+bool KernelPerformanceCanonicalWriter::begin(unsigned fieldSchema)
+{
+	return begin(fieldSchema, 0, 0, false);
 }
 bool KernelPerformanceCanonicalWriter::field(unsigned type, unsigned tag, JobMetricCounter value, unsigned width)
 {
@@ -73,9 +147,12 @@ bool KernelPerformanceCanonicalWriter::boolean(unsigned tag, bool value) { retur
 bool KernelPerformanceCanonicalWriter::sequence(unsigned tag, unsigned count) { return field(6, tag, count, 4); }
 KernelPerformanceDigest KernelPerformanceCanonicalWriter::finish()
 {
-	if (m_state == 0 || m_state->failed) return KernelPerformanceDigest();
+	if (m_state == 0) return KernelPerformanceDigest();
+	if (m_state->busy) { m_state->failed = true; return KernelPerformanceDigest(); }
+	if (m_state->failed) return KernelPerformanceDigest();
 	if (!m_state->finished)
 	{
+		if (!m_state->flush()) return KernelPerformanceDigest();
 		m_state->digest.valid = BCryptFinishHash(m_state->hash, m_state->digest.bytes, 32, 0) == 0;
 		m_state->failed = !m_state->digest.valid;
 		m_state->finished = true;
@@ -191,9 +268,15 @@ bool KernelPerformanceReferenceLedger::beginRun(KernelPerformanceReferenceMode m
 	if (m_snapshot.generation != 0 && !m_snapshot.frozen)
 	{ m_snapshot.errors |= KERNEL_PERFORMANCE_ERROR_STATE; return false; }
 	if (mode < KERNEL_REFERENCE_DISABLED || mode > KERNEL_REFERENCE_SERIAL_ORACLE)
-	{ m_snapshot.errors |= KERNEL_PERFORMANCE_ERROR_IDENTITY; return false; }
+	{
+		if (!m_snapshot.frozen) m_snapshot.errors |= KERNEL_PERFORMANCE_ERROR_IDENTITY;
+		return false;
+	}
 	if (m_snapshot.generation == ~static_cast<JobMetricCounter>(0))
-	{ m_snapshot.errors |= KERNEL_PERFORMANCE_ERROR_OVERFLOW; return false; }
+	{
+		if (!m_snapshot.frozen) m_snapshot.errors |= KERNEL_PERFORMANCE_ERROR_OVERFLOW;
+		return false;
+	}
 	const JobMetricCounter generation = m_snapshot.generation + 1;
 	delete m_state;
 	m_state = 0;
