@@ -87,6 +87,117 @@ static void Check(Bool result, const char *expression, Int line)
 }
 
 #if defined(_WIN64)
+class TerminalReceiptTestEnvironment
+{
+public:
+	bool set(const char *name, const char *value)
+	{
+		Saved saved;
+		saved.name = name;
+		const DWORD length = GetEnvironmentVariableA(name, 0, 0);
+		saved.present = length != 0;
+		if (saved.present)
+		{
+			std::vector<char> buffer(length);
+			GetEnvironmentVariableA(name, &buffer[0], length);
+			saved.value = &buffer[0];
+		}
+		m_saved.push_back(saved);
+		return SetEnvironmentVariableA(name, value) != 0;
+	}
+	~TerminalReceiptTestEnvironment()
+	{
+		for (std::size_t index = m_saved.size(); index != 0; --index)
+		{
+			const Saved &saved = m_saved[index - 1];
+			SetEnvironmentVariableA(saved.name.c_str(),
+				saved.present ? saved.value.c_str() : 0);
+		}
+	}
+private:
+	struct Saved { std::string name, value; bool present; };
+	std::vector<Saved> m_saved;
+};
+
+static void TestPerformanceReceiptTerminalAdmissions()
+{
+	using namespace rts::performance;
+	// Exercise the real runtime owner hook without game initialization or any
+	// publication. These process-local fixture values are always restored.
+	TerminalReceiptTestEnvironment environment;
+	const char *values[][2] = {
+		{ "RTS_PERFORMANCE_ROLE", "performance-report" },
+		{ "RTS_PERFORMANCE_RUN_ID", "terminal-owner-test-no-publication" },
+		{ "RTS_PERFORMANCE_RUN_NONCE", "11111111-1111-4111-8111-111111111111" },
+		{ "RTS_PERFORMANCE_COHORT_NONCE", "22222222-2222-4222-8222-222222222222" },
+		{ "RTS_PERFORMANCE_COHORT_CREATED_UTC", "2026-01-01T00:00:00Z" },
+		{ "RTS_PERFORMANCE_RECEIPT_DIR", "terminal-owner-test-no-publication" },
+		{ "RTS_PERFORMANCE_SOURCE_COMMIT", "0123456789abcdef0123456789abcdef01234567" },
+		{ "RTS_PERFORMANCE_ARTIFACT_SET_SHA256", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+		{ "RTS_PERFORMANCE_RUNTIME_MANIFEST_SHA256", "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" },
+		{ "RTS_PERFORMANCE_RUNTIME_CLOSURE_SHA256", "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC" },
+		{ "RTS_PERFORMANCE_FIXTURE_ID", "terminal-owner-fixture" },
+		{ "RTS_PERFORMANCE_RAW_LOG_PATH", "terminal-owner-test-no-publication/raw.log" },
+		{ "RTS_PERFORMANCE_TIMING_PATH", "terminal-owner-test-no-publication/timing.csv" },
+		{ "RTS_PERFORMANCE_VERIFIER_BOUNDARY", "test-only-no-publication" },
+		{ "RTS_PERFORMANCE_REFERENCE_MODE", "throughput-binding" },
+		{ "RTS_PERFORMANCE_WORKLOAD_QUALIFICATION", "observed-only" },
+		{ "RTS_PERFORMANCE_FIXTURE_KIND", "fresh-ai-map" },
+		{ "RTS_PERFORMANCE_FIXTURE_SHA256", 0 },
+		{ "RTS_PERFORMANCE_PLAYER_COUNT", 0 },
+		{ "RTS_PERFORMANCE_UNIT_COUNT", 0 },
+		{ "RTS_PERFORMANCE_SEED", 0 }
+	};
+	for (unsigned index = 0; index != sizeof(values) / sizeof(values[0]); ++index)
+		CHECK(environment.set(values[index][0], values[index][1]));
+
+	for (unsigned scenario = 0; scenario != 4; ++scenario)
+	{
+		PerformanceReceiptRuntime runtime;
+		const bool begun = runtime.begin("fresh-ai-map", "");
+		CHECK(begun);
+		if (!begun) return;
+		KernelPerformanceLedger &ledger = KernelPerformanceLedger::instance();
+		const KernelPerformanceBatch retained =
+			ledger.beginBatch(KERNEL_PERFORMANCE_STATUS, 0, 2, 1);
+		CHECK(retained.valid());
+		for (unsigned stage = 0; stage != KERNEL_PERFORMANCE_STAGE_COUNT; ++stage)
+		{
+			const KernelPerformanceInterval interval = ledger.beginInterval(retained,
+				static_cast<KernelPerformanceStage>(stage));
+			CHECK(interval.valid() && ledger.endInterval(interval));
+		}
+		// Missing CRC, unclean termination and rejected frame zero must not
+		// seal admission. Only the fourth scenario is an accepted terminal.
+		runtime.captureTerminalResult(scenario == 2 ? 0 : 2, 0x89ABCDEFU,
+			scenario != 0, scenario != 1);
+		const bool accepted = scenario == 3;
+		KernelPerformanceBatchIdentity identity;
+		CHECK(ledger.describeBatch(retained, identity) && identity.frame == 2);
+		const KernelPerformanceBatch next =
+			ledger.beginBatch(KERNEL_PERFORMANCE_STATUS, 0, 3, 2);
+		CHECK(next.valid() != accepted);
+		if (next.valid()) CHECK(ledger.endBatch(next, KERNEL_PERFORMANCE_NOT_ADMITTED));
+		if (accepted)
+		{
+			// A repeated terminal callback must not reopen or replace the run.
+			runtime.captureTerminalResult(3, 0x11111111U, true, true);
+			const KernelPerformanceBatch repeated =
+				ledger.beginBatch(KERNEL_PERFORMANCE_STATUS, 0, 4, 3);
+			CHECK(!repeated.valid());
+			if (repeated.valid()) CHECK(ledger.endBatch(repeated, KERNEL_PERFORMANCE_NOT_ADMITTED));
+		}
+		CHECK(ledger.endBatch(retained, KERNEL_PERFORMANCE_COMMITTED));
+		const KernelPerformanceSnapshot timing = ledger.freeze();
+		CHECK(timing.complete && timing.errors == 0 && timing.streamCount == 1);
+		CHECK(timing.streams[0].attemptedBatches == (accepted ? 1U : 2U));
+		CHECK(timing.streams[0].committedBatches == 1);
+		// No Runtime::finish call: no raw file or receipt is fabricated. The
+		// pure lifecycle cases below independently cover completed-frame/drain.
+		KernelPerformanceReferenceLedger::instance().freeze();
+	}
+}
+
 static void TestPerformanceReceiptOwnerLifecycle()
 {
 	PerformanceReceiptOwnerLifecycle idle;
@@ -165,6 +276,7 @@ static void TestPerformanceReceiptOwnerLifecycle()
 	CHECK(incompleteRange.captureTerminalResult(3, 7));
 	CHECK(!incompleteRange.finish(0, 0));
 	CHECK(incompleteRange.finalized());
+	TestPerformanceReceiptTerminalAdmissions();
 }
 #endif
 

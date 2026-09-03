@@ -1,4 +1,6 @@
 #include "Lib/KernelPerformanceDiagnostics.h"
+#include "Lib/KernelPerformanceReference.h"
+#include "Lib/DeterministicAIPlanning.h"
 
 #include <limits>
 #include <stdio.h>
@@ -41,6 +43,194 @@ void allStages(KernelPerformanceLedger &ledger, KernelPerformanceBatch batch,
 {
 	for (unsigned stage = 0; stage != KERNEL_PERFORMANCE_STAGE_COUNT; ++stage)
 		interval(ledger, batch, static_cast<KernelPerformanceStage>(stage), clock, 1);
+}
+
+void testTerminalSealExcludesResetFrame()
+{
+	Clock clock;
+	KernelPerformanceLedger ledger;
+	ledger.beginRun(true, Clock::read, &clock);
+	const auto status = ledger.beginBatch(KERNEL_PERFORMANCE_STATUS, 0, 64143, 1);
+	allStages(ledger, status, clock);
+	require(ledger.endBatch(status, KERNEL_PERFORMANCE_COMMITTED),
+		"terminal seal fixture retains a genuinely committed match status batch");
+	const unsigned callsBeforeSeal = clock.calls;
+	require(ledger.sealAdmissions() && ledger.sealAdmissions(),
+		"owner terminal seal is successful and idempotent");
+	// The real empty status sweep opens its capture scope before discovering
+	// zero objects in the reset world. It must not admit frame zero or poison
+	// the still-draining run through its canonical empty batch token.
+	const auto reset = ledger.beginBatch(KERNEL_PERFORMANCE_STATUS, 0, 0, 2);
+	require(reset.generation == 0 && reset.serial == 0 &&
+		reset.slot == KERNEL_PERFORMANCE_MAXIMUM_OPEN_BATCHES,
+		"post-terminal reset returns the canonical empty batch token");
+	{ KernelPerformanceScope scope(&ledger, reset, KERNEL_PERFORMANCE_CAPTURE); }
+	require(clock.calls == callsBeforeSeal, "terminal seal and reset scope read no clocks");
+	const auto result = ledger.freeze();
+	require(result.complete && result.errors == 0 && result.streamCount == 1 &&
+		result.streams[0].attemptedBatches == 1 && result.streams[0].committedBatches == 1 &&
+		result.streams[0].firstFrame == 64143 && result.streams[0].lastFrame == 64143,
+		"post-terminal reset cannot corrupt the closed match timing snapshot");
+}
+
+void testSealedAdmissionCannotBecomeEvidence()
+{
+	Clock clock;
+	KernelPerformanceLedger ledger;
+	ledger.beginRun(true, Clock::read, &clock);
+	const auto retained = ledger.beginBatch(KERNEL_PERFORMANCE_PATH, 0, 64143, 1);
+	const auto capture = ledger.beginInterval(retained, KERNEL_PERFORMANCE_CAPTURE);
+	ledger.sealAdmissions();
+	const unsigned callsBeforeAttempt = clock.calls;
+	const auto rejected = ledger.beginBatch(KERNEL_PERFORMANCE_AI, 0, 64144, 1);
+	require(!rejected.valid(), "terminal seal rejects new batches even with increasing frame identities");
+	{ KernelPerformanceScope scope(&ledger, rejected, KERNEL_PERFORMANCE_CAPTURE); }
+	require(clock.calls == callsBeforeAttempt,
+		"post-seal admission and canonical empty scope have no timing side effects");
+	// Keep the inert-API RED bounded: close any incorrectly admitted batch.
+	if (rejected.valid()) ledger.endBatch(rejected, KERNEL_PERFORMANCE_NOT_ADMITTED);
+	KernelPerformanceBatchIdentity identity;
+	require(ledger.describeBatch(retained, identity) && identity.frame == 64143,
+		"terminal seal preserves exact identity of retained work");
+	++clock.now;
+	require(ledger.endInterval(capture), "a pre-seal interval can genuinely close after terminal capture");
+	for (unsigned stage = KERNEL_PERFORMANCE_SCHEDULE; stage != KERNEL_PERFORMANCE_STAGE_COUNT; ++stage)
+		interval(ledger, retained, static_cast<KernelPerformanceStage>(stage), clock, 1);
+	require(ledger.endBatch(retained, KERNEL_PERFORMANCE_COMMITTED),
+		"retained work can observe remaining stages and commit after the seal");
+	const auto result = ledger.freeze();
+	require(result.complete && result.streamCount == 1 && result.streams[0].committedBatches == 1,
+		"only retained work contributes to the sealed run snapshot");
+	require(ledger.beginRun(true, Clock::read, &clock), "explicit new run may follow a sealed frozen run");
+	const auto fresh = ledger.beginBatch(KERNEL_PERFORMANCE_STATUS, 0, 0, 1);
+	require(fresh.valid(), "a new explicit generation reopens admission");
+	ledger.endBatch(fresh, KERNEL_PERFORMANCE_NOT_ADMITTED);
+	require(ledger.freeze().complete, "fresh generation does not inherit terminal admission state");
+}
+
+struct DeferredReference
+{
+	unsigned value;
+	mutable unsigned writes;
+	unsigned computes;
+};
+bool writeDeferredReference(KernelPerformanceCanonicalWriter &writer, const void *context)
+{
+	const DeferredReference &value = *static_cast<const DeferredReference *>(context);
+	++value.writes;
+	return writer.u32(1, value.value);
+}
+bool computeDeferredReference(const void *context, void *output)
+{
+	const DeferredReference &input = *static_cast<const DeferredReference *>(context);
+	DeferredReference &detached = *static_cast<DeferredReference *>(output);
+	++detached.computes;
+	detached.value = input.value;
+	return true;
+}
+
+void testSealedTimingRetainsLateReferenceBinding()
+{
+	Clock clock;
+	KernelPerformanceLedger &timing = KernelPerformanceLedger::instance();
+	KernelPerformanceReferenceLedger reference;
+	timing.beginRun(true, Clock::read, &clock);
+	reference.beginRun(KERNEL_REFERENCE_SERIAL_ORACLE, Clock::read, &clock);
+	auto retained = timing.beginBatch(KERNEL_PERFORMANCE_AI, 0, 64143, 1);
+	for (unsigned stage = KERNEL_PERFORMANCE_CAPTURE; stage != KERNEL_PERFORMANCE_VALIDATE; ++stage)
+		interval(timing, retained, static_cast<KernelPerformanceStage>(stage), clock, 1);
+	timing.sealAdmissions();
+	require(reference.mode() == KERNEL_REFERENCE_SERIAL_ORACLE,
+		"timing seal does not disable the reference mode needed by retained work");
+	DeferredReference input = { 7, 0, 0 }, actual = { 7, 0, 0 }, detached = { 99, 0, 0 };
+	KernelPerformanceReferenceBatch referenceBatch;
+	rts::AIPlanningReferenceBatchTransport transport;
+	transport.referenceLedger = &reference;
+	transport.referenceBatch = &referenceBatch;
+	transport.writeInput = writeDeferredReference;
+	transport.immutableInput = &input;
+	transport.writeOutput = writeDeferredReference;
+	transport.productionOutput = &actual;
+	transport.serialCompute = computeDeferredReference;
+	transport.detachedSerialOutput = &detached;
+	transport.operationCount = 1;
+	{
+		KernelPerformanceScope validate(&timing, retained, KERNEL_PERFORMANCE_VALIDATE);
+		require(rts::ObserveAIPlanningReferenceBatch(&retained, &transport),
+			"actual product reference helper can bind retained timing work after terminal seal");
+	}
+	require(referenceBatch.valid() && input.writes == 1 && actual.writes == 1 &&
+		detached.writes == 1 && detached.computes == 1 && actual.value == 7,
+		"late reference binding uses detached oracle output without replacing actual output");
+	interval(timing, retained, KERNEL_PERFORMANCE_COMMIT, clock, 1);
+	require(timing.endBatch(retained, KERNEL_PERFORMANCE_COMMITTED) &&
+		rts::FinishAIPlanningReferenceBatch(&transport, true),
+		"retained timing and reference tokens close only after their real commit");
+	auto rejected = timing.beginBatch(KERNEL_PERFORMANCE_AI, 0, 64144, 2);
+	require(!rts::ObserveAIPlanningReferenceBatch(&rejected, &transport) &&
+		input.writes == 1 && actual.writes == 1 && detached.computes == 1,
+		"actual product reference helper cannot hash or compute a post-seal batch");
+	// Close incorrectly admitted RED evidence without leaving singleton work.
+	if (rejected.valid()) timing.endBatch(rejected, KERNEL_PERFORMANCE_NOT_ADMITTED);
+	if (referenceBatch.valid()) rts::FinishAIPlanningReferenceBatch(&transport, false);
+	const auto timingResult = timing.freeze();
+	const auto referenceResult = reference.freeze();
+	require(timingResult.complete && referenceResult.complete &&
+		timingResult.streams[0].attemptedBatches == 1 && referenceResult.streams[0].validatedBatchCount == 1 &&
+		referenceResult.streams[0].committedBatchCount == 1,
+		"sealed run freezes exactly the retained committed timing/reference pair");
+}
+
+void testTerminalSealPreservesFailureBoundaries()
+{
+	Clock clock;
+	for (unsigned malformed = 0; malformed != 4; ++malformed)
+	{
+		KernelPerformanceLedger ledger;
+		ledger.beginRun(true, Clock::read, &clock);
+		auto stale = ledger.beginBatch(KERNEL_PERFORMANCE_STATUS, 0, 1, 1);
+		ledger.endBatch(stale, KERNEL_PERFORMANCE_NOT_ADMITTED);
+		ledger.sealAdmissions();
+		KernelPerformanceBatch token;
+		if (malformed == 0) token = stale;
+		if (malformed == 1) token.generation = stale.generation;
+		if (malformed == 2) token.serial = stale.serial;
+		if (malformed == 3) token.slot = 0;
+		require(!ledger.beginInterval(token, KERNEL_PERFORMANCE_CAPTURE).valid() &&
+			(ledger.freeze().errors & KERNEL_PERFORMANCE_ERROR_IDENTITY) != 0,
+			"seal does not excuse stale, partial or malformed nonempty scope tokens");
+	}
+	KernelPerformanceLedger open;
+	open.beginRun(true, Clock::read, &clock);
+	const auto retained = open.beginBatch(KERNEL_PERFORMANCE_PATH, 0, 1, 1);
+	open.beginInterval(retained, KERNEL_PERFORMANCE_WAIT);
+	open.sealAdmissions();
+	require((open.freeze().errors & KERNEL_PERFORMANCE_ERROR_INCOMPLETE) != 0,
+		"terminal sealing cannot disguise unclosed retained work as a drained run");
+	for (unsigned action = 0; action != 2; ++action)
+	{
+		KernelPerformanceLedger foreign;
+		foreign.beginRun(true, Clock::read, &clock);
+		const auto closed = foreign.beginBatch(KERNEL_PERFORMANCE_STATUS, 0, 1, 1);
+		foreign.endBatch(closed, KERNEL_PERFORMANCE_NOT_ADMITTED);
+		foreign.sealAdmissions();
+		std::thread worker([&]() {
+			if (action == 0) foreign.sealAdmissions();
+			else foreign.beginBatch(KERNEL_PERFORMANCE_STATUS, 0, 2, 2);
+		});
+		worker.join();
+		require((foreign.freeze().errors & KERNEL_PERFORMANCE_ERROR_OWNER) != 0,
+			"foreign post-seal actions remain ownership failures");
+	}
+	KernelPerformanceLedger disabled;
+	disabled.beginRun(false, Clock::read, &clock);
+	const unsigned calls = clock.calls;
+	disabled.sealAdmissions();
+	const auto empty = disabled.beginBatch(KERNEL_PERFORMANCE_STATUS, 0, 0, 1);
+	{ KernelPerformanceScope scope(&disabled, empty, KERNEL_PERFORMANCE_CAPTURE); }
+	const auto result = disabled.freeze();
+	require(!result.enabled && result.errors == 0 && clock.calls == calls,
+		"disabled seal remains clock-free and produces no fabricated evidence");
 }
 
 // Including nested intervals in both parent and child, or including the idle
@@ -264,6 +454,10 @@ void testScopeGuardAndSubtypeIdentity()
 
 int main()
 {
+	testTerminalSealExcludesResetFrame();
+	testSealedAdmissionCannotBecomeEvidence();
+	testSealedTimingRetainsLateReferenceBinding();
+	testTerminalSealPreservesFailureBoundaries();
 	testExclusiveIntervalsAndInclusiveLatency();
 	testActiveBatchIdentityQuery();
 	testCrossKernelNestingAndAbortedWork();

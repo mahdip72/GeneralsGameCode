@@ -118,6 +118,9 @@ public:
 	KernelPerformanceLedger();
 	static KernelPerformanceLedger &instance();
 	bool beginRun(bool enabled, KernelPerformanceClock clock = 0, void *context = 0);
+	// Stop admitting new diagnostic batches at the accepted terminal boundary.
+	// Existing tokens remain live until their real completion and final freeze.
+	bool sealAdmissions();
 	KernelPerformanceBatch beginBatch(KernelPerformanceKernel kernel,
 		unsigned subtype, unsigned frame, JobMetricCounter ordinal);
 	// Owner-only, non-mutating active-token query. Failure preserves identity;
@@ -160,7 +163,7 @@ private:
 	BatchState *resolve(KernelPerformanceBatch batch);
 	std::atomic<unsigned long> m_owner;
 	std::atomic<bool> m_foreignCall;
-	bool m_started, m_enabled, m_frozen;
+	bool m_started, m_enabled, m_frozen, m_admissionsSealed;
 	unsigned m_errors, m_openBatches, m_depth, m_streamCount;
 	JobMetricCounter m_generation, m_nextBatch, m_nextInterval, m_lastClock;
 	KernelPerformanceClock m_clock;

@@ -804,6 +804,10 @@ void PerformanceReceiptRuntime::captureTerminalResult(unsigned actualFrame,
 	if (!active()) return;
 	if (!crcKnown || !clean || !m_lifecycle.captureTerminalResult(actualFrame, crc))
 		invalidate("clean terminal owner frame and CRC were not captured exactly once");
+	else
+		// Teardown may reset the world frame while owner work is still draining.
+		// Stop new observations, but keep existing timing/reference tokens live.
+		rts::performance::KernelPerformanceLedger::instance().sealAdmissions();
 }
 
 void PerformanceReceiptRuntime::captureSchedulerBeforeTeardown()
@@ -822,6 +826,64 @@ void PerformanceReceiptRuntime::retainClosedReplay(const char *path, const char 
 	if (!active()) return;
 	m_receipt.retainedReplayPath = path;
 	m_receipt.retainedReplaySha256 = sha256;
+}
+
+static void printUnsupportedPerformanceSnapshot(
+	const rts::performance::PerformanceReceipt &receipt,
+	unsigned outstanding, unsigned ownerCompletions)
+{
+	using namespace rts::performance;
+	const KernelPerformanceSnapshot &timing = receipt.kernelTiming;
+	const KernelPerformanceReferenceSnapshot &reference = receipt.kernelReference;
+	// These are retained snapshots only, after the owner-dependent capture and
+	// drain boundary. Bounded failure-only output never changes qualification.
+	printf("SIMULATION_PERFORMANCE_SNAPSHOT timing_enabled=%u timing_frozen=%u timing_complete=%u timing_errors=%u timing_generation=%llu timing_streams=%u reference_mode=%u reference_frozen=%u reference_complete=%u reference_errors=%u reference_generation=%llu reference_streams=%u outstanding_jobs=%u pending_owner_completions=%u frame_start=%u frame_end=%u final_frame=%u\n",
+		static_cast<unsigned>(timing.enabled), static_cast<unsigned>(timing.frozen),
+		static_cast<unsigned>(timing.complete), timing.errors,
+		static_cast<unsigned long long>(timing.generation), timing.streamCount,
+		static_cast<unsigned>(reference.mode), static_cast<unsigned>(reference.frozen),
+		static_cast<unsigned>(reference.complete), reference.errors,
+		static_cast<unsigned long long>(reference.generation), reference.streamCount,
+		outstanding, ownerCompletions, receipt.frameStart, receipt.frameEnd, receipt.finalFrame);
+	for (unsigned index = 0; index < timing.streamCount &&
+		index < KERNEL_PERFORMANCE_MAXIMUM_STREAMS; ++index)
+	{
+		const KernelPerformanceStream &stream = timing.streams[index];
+		printf("SIMULATION_PERFORMANCE_TIMING_STREAM index=%u kernel=%u subtype=%u first_frame=%u last_frame=%u attempted=%llu admitted=%llu committed=%llu aborted=%llu active_ns=%llu inclusive_ns=%llu maximum_ns=%llu",
+			index, static_cast<unsigned>(stream.kernel), stream.subtype,
+			stream.firstFrame, stream.lastFrame,
+			static_cast<unsigned long long>(stream.attemptedBatches),
+			static_cast<unsigned long long>(stream.admittedBatches),
+			static_cast<unsigned long long>(stream.committedBatches),
+			static_cast<unsigned long long>(stream.abortedBatches),
+			static_cast<unsigned long long>(stream.activePipelineNanoseconds),
+			static_cast<unsigned long long>(stream.inclusiveBatchNanoseconds),
+			static_cast<unsigned long long>(stream.maximumBatchNanoseconds));
+		for (unsigned stage = 0; stage != KERNEL_PERFORMANCE_STAGE_COUNT; ++stage)
+			printf(" stage%u_ns=%llu stage%u_samples=%llu", stage,
+				static_cast<unsigned long long>(stream.stageNanoseconds[stage]), stage,
+				static_cast<unsigned long long>(stream.stageSamples[stage]));
+		printf("\n");
+	}
+	for (unsigned index = 0; index < reference.streamCount &&
+		index < KERNEL_PERFORMANCE_MAXIMUM_STREAMS; ++index)
+	{
+		const KernelPerformanceReferenceStream &stream = reference.streams[index];
+		printf("SIMULATION_PERFORMANCE_REFERENCE_STREAM index=%u kernel=%u subtype=%u field_schema=%u first_frame=%u last_frame=%u validated_batches=%llu committed_batches=%llu aborted_batches=%llu validated_operations=%llu committed_operations=%llu serial_samples=%llu serial_ns=%llu maximum_serial_ns=%llu input_digest_valid=%u output_digest_valid=%u commit_digest_valid=%u\n",
+			index, static_cast<unsigned>(stream.kernel), stream.subtype, stream.fieldSchema,
+			stream.firstFrame, stream.lastFrame,
+			static_cast<unsigned long long>(stream.validatedBatchCount),
+			static_cast<unsigned long long>(stream.committedBatchCount),
+			static_cast<unsigned long long>(stream.abortedBatchCount),
+			static_cast<unsigned long long>(stream.validatedOperationCount),
+			static_cast<unsigned long long>(stream.committedOperationCount),
+			static_cast<unsigned long long>(stream.serialSampleCount),
+			static_cast<unsigned long long>(stream.serialNanoseconds),
+			static_cast<unsigned long long>(stream.maximumSerialNanoseconds),
+			static_cast<unsigned>(stream.inputDigest.valid),
+			static_cast<unsigned>(stream.outputDigest.valid),
+			static_cast<unsigned>(stream.commitDigest.valid));
+	}
 }
 
 void PerformanceReceiptRuntime::finish(int exitCode, const char *boundary)
@@ -860,7 +922,10 @@ void PerformanceReceiptRuntime::finish(int exitCode, const char *boundary)
 	if (written)
 		printf("SIMULATION_PERFORMANCE_RECEIPT status=written path=%s\n", writtenPath.c_str());
 	else
+	{
 		printf("SIMULATION_PERFORMANCE_RECEIPT status=unsupported reason=%s\n", reason.c_str());
+		printUnsupportedPerformanceSnapshot(m_receipt, outstanding, ownerCompletions);
+	}
 	fflush(stdout);
 	m_active = false;
 }

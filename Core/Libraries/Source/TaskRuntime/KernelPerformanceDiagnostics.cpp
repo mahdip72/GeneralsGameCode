@@ -23,7 +23,8 @@ KernelPerformanceStream::KernelPerformanceStream() : kernel(KERNEL_PERFORMANCE_P
 KernelPerformanceSnapshot::KernelPerformanceSnapshot() : enabled(false), frozen(false),
 	complete(false), errors(0), streamCount(0), generation(0) {}
 KernelPerformanceLedger::KernelPerformanceLedger() : m_owner(GetCurrentThreadId()),
-	m_foreignCall(false), m_started(false), m_enabled(false), m_frozen(false), m_errors(0),
+	m_foreignCall(false), m_started(false), m_enabled(false), m_frozen(false),
+	m_admissionsSealed(false), m_errors(0),
 	m_openBatches(0), m_depth(0), m_streamCount(0), m_generation(0), m_nextBatch(0),
 	m_nextInterval(0), m_lastClock(0), m_clock(0), m_clockContext(0)
 {
@@ -91,6 +92,7 @@ bool KernelPerformanceLedger::beginRun(bool enabled,
 	m_started = true;
 	m_enabled = enabled;
 	m_frozen = false;
+	m_admissionsSealed = false;
 	m_errors = m_openBatches = m_depth = m_streamCount = 0;
 	m_nextBatch = m_nextInterval = m_lastClock = 0;
 	m_clock = clock != 0 ? clock : LiveSimulationPhaseClockNowNanoseconds;
@@ -105,11 +107,19 @@ bool KernelPerformanceLedger::beginRun(bool enabled,
 	return true;
 }
 
+bool KernelPerformanceLedger::sealAdmissions()
+{
+	if (!writable()) return false;
+	m_admissionsSealed = true;
+	return true;
+}
+
 KernelPerformanceBatch KernelPerformanceLedger::beginBatch(KernelPerformanceKernel kernel,
 	unsigned subtype, unsigned frame, JobMetricCounter ordinal)
 {
 	KernelPerformanceBatch token;
 	if (!writable()) return token;
+	if (m_admissionsSealed) return token;
 	if (static_cast<unsigned>(kernel) >= KERNEL_PERFORMANCE_KERNEL_COUNT)
 	{
 		fail(KERNEL_PERFORMANCE_ERROR_IDENTITY);
@@ -211,6 +221,13 @@ KernelPerformanceInterval KernelPerformanceLedger::beginInterval(KernelPerforman
 {
 	KernelPerformanceInterval result;
 	if (!writable()) return result;
+	// Post-terminal adapters may still construct an empty scope after a new
+	// batch was declined. Only that canonical empty token is harmless; retained
+	// tokens keep their normal validation and can finish before final freeze.
+	if (m_admissionsSealed && token.generation == 0 && token.serial == 0 &&
+		token.slot == KERNEL_PERFORMANCE_MAXIMUM_OPEN_BATCHES &&
+		static_cast<unsigned>(stage) < KERNEL_PERFORMANCE_STAGE_COUNT)
+		return result;
 	BatchState *batch = resolve(token);
 	if (batch == 0) return result;
 	if (static_cast<unsigned>(stage) >= KERNEL_PERFORMANCE_STAGE_COUNT)
