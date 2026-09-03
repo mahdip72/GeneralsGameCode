@@ -2956,6 +2956,449 @@ function New-AiCompletionOutput {
         "available_cpus=16 reserved_owner_cpus=1 selected_worker_cpus=$EffectiveWorkers"
 }
 
+function New-Stage5LiveRoleTestPlan {
+    # This is a role-resolution fixture, not a complete acceptance matrix.
+    return [pscustomobject]@{
+        schemaVersion = 2
+        liveQualification = [pscustomobject]@{
+            schemaVersion = 1
+            profileSetId = 'live-all-slices-v1'
+            authorityEntries = @([pscustomobject]@{
+                scenario = '4v2'; seed = 1729; configuration = 'parallel-2'; repeat = 2
+            })
+            shadowEntry = [pscustomobject]@{
+                scenario = '4v2'; seed = 1729; configuration = 'shadow-16'; repeat = 1
+            }
+        }
+        entries = @(
+            [pscustomobject]@{
+                sequence = 11; entryId = 'ai-0011'; kind = 'ai'; stress = $true
+                scenario = '4v2'; seed = 1729; configuration = 'parallel-2'; repeat = 1
+                simulationMode = 'parallel'; requestedWorkers = '2'; workerPolicy = 'auto'
+                determinismKey = '4v2-seed-1729'
+                validationRole = 'live-determinism'; proofProfileId = 'live-invariants-v1'
+            },
+            [pscustomobject]@{
+                sequence = 12; entryId = 'ai-0012'; kind = 'ai'; stress = $true
+                scenario = '4v2'; seed = 1729; configuration = 'parallel-2'; repeat = 2
+                simulationMode = 'parallel'; requestedWorkers = '2'; workerPolicy = 'auto'
+                determinismKey = '4v2-seed-1729'
+                validationRole = 'live-authority-stress'
+                proofProfileId = 'live-all-slices-authority-v1'
+            },
+            [pscustomobject]@{
+                sequence = 13; entryId = 'ai-0013'; kind = 'ai'; stress = $true
+                scenario = '4v2'; seed = 1729; configuration = 'shadow-16'; repeat = 1
+                simulationMode = 'shadow'; requestedWorkers = '16'; workerPolicy = 'auto'
+                determinismKey = '4v2-seed-1729'
+                validationRole = 'live-shadow-stress'; proofProfileId = 'live-all-slices-shadow-v1'
+            }
+        )
+    }
+}
+
+function New-Stage5LiveRoleTestOutput {
+    param([object]$Entry, [switch]$UnusedStatus)
+    $arguments = @{
+        Seed = $Entry.seed; Mode = $Entry.simulationMode
+        RequestedWorkers = $Entry.requestedWorkers
+        EffectiveWorkers = [int]$Entry.requestedWorkers
+        Scenario = '4v2'; ActualAi = 6; ActualTeams = '4v2'
+    }
+    if ($Entry.simulationMode -ceq 'shadow') {
+        $arguments.AuthoritativeCommits = 0
+        $arguments.AiCommittedBatches = 5
+        $arguments.ShadowExecutions = 5
+        $arguments.CollisionShadowExecutions = 3
+        $arguments.PhysicsShadowExecutions = 3
+    }
+    if ($UnusedStatus) {
+        $arguments.StatusAuthoritativeBatches = 0
+        $arguments.StatusCommittedCommands = 0
+        $arguments.StatusSubmitted = 0
+        $arguments.StatusCompleted = 0
+        $arguments.StatusPhysicalWorkerJobs = 0
+        $arguments.StatusOwnerHelpedJobs = 0
+        $arguments.StatusPhysicalWorkerMask = 0
+        $arguments.StatusDistinctPhysicalWorkers = 0
+        $arguments.StatusPeakConcurrentPhysicalWorkers = 0
+    }
+    return New-AiCompletionOutput @arguments
+}
+
+function Assert-Stage5LiveRoleContract {
+    $plan = New-Stage5LiveRoleTestPlan
+    $ordinary = $plan.entries[0]
+    $authority = $plan.entries[1]
+    $executableHash = 'A' * 64
+
+    # A result's observed positivity must not choose its own proof obligation.
+    $resolver = Get-Command Resolve-Stage5LiveValidationRequirements -ErrorAction SilentlyContinue
+    Assert-True ($null -ne $resolver) `
+        'live roles resolve from a versioned predeclared plan rather than scenario inference'
+    if ($null -ne $resolver) {
+        foreach ($expected in @(
+            @{ index = 0; role = 'live-determinism'; profile = 'live-invariants-v1' },
+            @{ index = 1; role = 'live-authority-stress'; profile = 'live-all-slices-authority-v1' },
+            @{ index = 2; role = 'live-shadow-stress'; profile = 'live-all-slices-shadow-v1' })) {
+            try {
+                $resolved = @(Resolve-Stage5LiveValidationRequirements -Plan $plan `
+                    -Entry $plan.entries[$expected.index])
+                Assert-True ($resolved.Count -eq 1 -and
+                    $resolved[0].validationRole -ceq $expected.role -and
+                    $resolved[0].proofProfileId -ceq $expected.profile -and
+                    $resolved[0].requireCompleteSliceSchema) `
+                    "the frozen selector resolves exactly one complete-schema $($expected.role) obligation"
+            }
+            catch { Assert-True $false "live role resolution failed: $($_.Exception.Message)" }
+        }
+    }
+
+    # These assertions exercise the real parser, independently of the resolver's existence.
+    foreach ($entry in $plan.entries) {
+        $output = New-Stage5LiveRoleTestOutput $entry
+        try {
+            $evidence = @(ConvertFrom-Stage5AiCompletion -Output $output -Entry $entry `
+                -ExecutableHash $executableHash -ValidationPlan $plan)
+            $expectedProof = if ($entry.validationRole -ceq 'live-determinism') {
+                'not-required'
+            } else { 'validated' }
+            Assert-True ($evidence.Count -eq 1 -and
+                $evidence[0].PSObject.Properties.Name -contains 'schemaStatus' -and
+                $evidence[0].PSObject.Properties.Name -contains 'invariantStatus' -and
+                $evidence[0].PSObject.Properties.Name -contains 'capabilityProofStatus' -and
+                $evidence[0].PSObject.Properties.Name -contains 'validationRole' -and
+                $evidence[0].PSObject.Properties.Name -contains 'proofProfileId' -and
+                $evidence[0].schemaStatus -ceq 'complete' -and
+                $evidence[0].invariantStatus -ceq 'validated' -and
+                $evidence[0].capabilityProofStatus -ceq $expectedProof -and
+                $evidence[0].validationRole -ceq $entry.validationRole -and
+                $evidence[0].proofProfileId -ceq $entry.proofProfileId) `
+                "complete $($entry.validationRole) evidence distinguishes validity from capability proof"
+        }
+        catch { Assert-True $false "complete $($entry.validationRole) evidence failed: $($_.Exception.Message)" }
+
+        $invariantMutations = @(
+            @{ field = 'job_failed'; value = '1'; pattern = 'failed' },
+            @{ field = 'job_cancelled'; value = '1'; pattern = 'cancel' },
+            @{ field = 'direct_stale_acceptance'; value = '1'; pattern = 'direct|stale' },
+            @{ field = 'collision_physical_worker_mask'; value = '1'; pattern = 'collision.*(mask|identity)' },
+            @{ field = 'collision_unexpected_fallbacks'; value = '1'; pattern = 'collision.*fallback' },
+            @{ field = 'status_stale_rejections'; value = '1'; pattern = 'status.*stale' })
+        if ($entry.simulationMode -ceq 'parallel') {
+            # These zero guards currently share a conditional with positive proof.
+            $invariantMutations += @(
+                @{ field = 'collision_owner_fallbacks'; value = '1'; pattern = 'collision' },
+                @{ field = 'collision_stale_rejections'; value = '1'; pattern = 'collision' },
+                @{ field = 'spatial_healing_expected_fallbacks'; value = '1'; pattern = 'healing|spatial' })
+        }
+        foreach ($mutation in $invariantMutations) {
+            $fieldPattern = '(?<=\s)' + [regex]::Escape($mutation.field) + '=\d+(?=\s|$)'
+            $mutated = [regex]::Replace($output, $fieldPattern,
+                ($mutation.field + '=' + $mutation.value))
+            Assert-True ($mutated -cne $output) `
+                "the $($mutation.field) negative mutates the complete producer fixture"
+            Assert-Throws {
+                ConvertFrom-Stage5AiCompletion -Output $mutated -Entry $entry `
+                    -ExecutableHash $executableHash -ValidationPlan $plan | Out-Null
+            } $mutation.pattern `
+                "$($entry.validationRole) retains the $($mutation.field) invariant"
+        }
+    }
+
+    $unusedStatusOutput = New-Stage5LiveRoleTestOutput $ordinary -UnusedStatus
+    try {
+        $unused = ConvertFrom-Stage5AiCompletion -Output $unusedStatusOutput -Entry $ordinary `
+            -ExecutableHash $executableHash -ValidationPlan $plan
+        Assert-True ($unused.schemaStatus -ceq 'complete' -and
+            $unused.invariantStatus -ceq 'validated' -and
+            $unused.capabilityProofStatus -ceq 'not-required' -and
+            [UInt64]$unused.fields.status_authoritative_batches -eq 0 -and
+            [UInt64]$unused.fields.status_submitted_jobs -eq 0 -and
+            $unused.line -ceq $unusedStatusOutput) `
+            'an ordinary complete 4v2 run retains a genuinely unused status slice without claiming capability'
+    }
+    catch { Assert-True $false "ordinary unused-status evidence failed: $($_.Exception.Message)" }
+    Assert-Throws {
+        ConvertFrom-Stage5AiCompletion -Output $unusedStatusOutput -Entry $authority `
+            -ExecutableHash $executableHash -ValidationPlan $plan | Out-Null
+    } 'status|capability' 'the identical unused status slice fails the designated full authority profile'
+
+    foreach ($entry in @($ordinary, $authority)) {
+        $missingWork = New-AiCompletionOutput -Scenario '4v2' -ActualAi 6 `
+            -ActualTeams '4v2' -OmitWorkEvidence
+        Assert-Throws {
+            ConvertFrom-Stage5AiCompletion -Output $missingWork -Entry $entry `
+                -ExecutableHash $executableHash -RequireAuthoritativeWorkEvidence $false `
+                -ValidationPlan $plan | Out-Null
+        } 'schema|work|evidence' "$($entry.validationRole) cannot waive the closed slice schema with the legacy presence flag"
+    }
+    Assert-Throws {
+        ConvertFrom-Stage5AiCompletion -Output (New-Stage5LiveRoleTestOutput $authority) `
+            -Entry $authority -ExecutableHash $executableHash | Out-Null
+    } 'plan|role' 'a V2 role-labelled entry cannot silently fall back to V1 without its plan'
+
+    # A malformed plan is rejected even when all of the observed counters are positive.
+    foreach ($mutation in @(
+        @{ name = 'a selector outside the matrix'; edit = { param($p) $p.liveQualification.authorityEntries[0].seed = 1730 } },
+        @{ name = 'a duplicate selector'; edit = { param($p) $p.liveQualification.authorityEntries += $p.liveQualification.authorityEntries[0] } },
+        @{ name = 'an empty authority selection'; edit = { param($p) $p.liveQualification.authorityEntries = @() } },
+        @{ name = 'an unknown role'; edit = { param($p) $p.entries[1].validationRole = 'live-selected-if-positive' } },
+        @{ name = 'an unknown profile'; edit = { param($p) $p.liveQualification.profileSetId = 'live-without-status' } },
+        @{ name = 'a downgraded selected entry'; edit = {
+            param($p)
+            $p.entries[1].validationRole = 'live-determinism'
+            $p.entries[1].proofProfileId = 'live-invariants-v1'
+        } })) {
+        $badPlan = New-Stage5LiveRoleTestPlan
+        & $mutation.edit $badPlan
+        if ($null -ne $resolver) {
+            Assert-Throws {
+                Resolve-Stage5LiveValidationRequirements -Plan $badPlan `
+                    -Entry $badPlan.entries[1] | Out-Null
+            } 'plan|selector|role|profile|authority' "the role resolver rejects $($mutation.name)"
+        }
+        Assert-Throws {
+            ConvertFrom-Stage5AiCompletion -Output (New-Stage5LiveRoleTestOutput $badPlan.entries[1]) `
+                -Entry $badPlan.entries[1] -ExecutableHash $executableHash `
+                -ValidationPlan $badPlan | Out-Null
+        } 'plan|selector|role|profile|authority' "positive counters cannot rescue $($mutation.name)"
+    }
+
+    # Preserve explicit V1 semantics: no new role is inferred for old callers.
+    $legacyEntry = [pscustomobject]@{
+        sequence = 14; configuration = 'parallel-2'; simulationMode = 'parallel'
+        requestedWorkers = '2'; seed = 1729; scenario = '4v2'; stress = $true
+    }
+    Assert-Throws {
+        ConvertFrom-Stage5AiCompletion $unusedStatusOutput $legacyEntry $executableHash | Out-Null
+    } 'status' 'an unversioned legacy entry retains the original strict positive-status semantics'
+
+    try {
+        $results = @()
+        foreach ($entry in $plan.entries) {
+            $evidence = ConvertFrom-Stage5AiCompletion -Output (New-Stage5LiveRoleTestOutput $entry) `
+                -Entry $entry -ExecutableHash $executableHash -ValidationPlan $plan
+            $result = $entry | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+            $result | Add-Member -MemberType NoteProperty -Name aiEvidence -Value $evidence
+            $results += $result
+        }
+        Assert-Stage5AuthoritativeWorkEvidence -Results $results -ValidationPlan $plan
+
+        # Removing outer labels must not route the parser's nested V2 evidence
+        # through the legacy favorable-result search without its original plan.
+        $nestedRoleResults = $results | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+        foreach ($nestedRoleResult in $nestedRoleResults) {
+            $nestedRoleResult.PSObject.Properties.Remove('validationRole')
+            $nestedRoleResult.PSObject.Properties.Remove('proofProfileId')
+        }
+        Assert-Throws {
+            Assert-Stage5AuthoritativeWorkEvidence -Results $nestedRoleResults
+        } 'V2|role|profile|plan' `
+            'nested V2 role evidence cannot enter the no-plan legacy aggregate after outer labels are removed'
+
+        # Real V1 parser output retains null metadata fields. Reject advertised
+        # nested labels, not the mere presence of those backwards-compatible keys.
+        $legacyResults = $nestedRoleResults | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+        foreach ($legacyResult in $legacyResults) {
+            $legacyResult.aiEvidence = ConvertFrom-Stage5AiCompletion `
+                -Output $legacyResult.aiEvidence.line -Entry $legacyResult `
+                -ExecutableHash $executableHash
+            foreach ($field in @('validationRole', 'proofProfileId')) {
+                Assert-True ($legacyResult.aiEvidence.PSObject.Properties.Name -contains $field -and
+                    $null -eq $legacyResult.aiEvidence.$field) `
+                    "the legacy parser retains a null nested $field without advertising a V2 obligation"
+            }
+        }
+        Assert-Stage5AuthoritativeWorkEvidence -Results $legacyResults
+        foreach ($metadata in @(
+            @{ field = 'validationRole'; value = 'live-determinism' },
+            @{ field = 'proofProfileId'; value = 'live-all-slices-authority-v1' })) {
+            $partialRoleResults = $legacyResults | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+            $field = $metadata.field
+            $partialRoleResults[0].aiEvidence.$field = $metadata.value
+            Assert-Throws {
+                Assert-Stage5AuthoritativeWorkEvidence -Results $partialRoleResults
+            } 'V2|role|profile|plan' `
+                "a non-null nested $field alone requires the original V2 plan"
+        }
+
+        # Each raw shadow outcome is independently valid and fully reparsable,
+        # but differs from its regular case. Leave cached outcomes unchanged so
+        # a comparison of cached aiEvidence properties cannot satisfy this test.
+        foreach ($outcome in @(
+            @{ field = 'final_digest'; value = 'DEADBEEF' },
+            @{ field = 'end_frame'; value = '42001' },
+            @{ field = 'winner_team'; value = '2' })) {
+            $divergentShadowResults = $results | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+            $field = $outcome.field
+            $originalLine = $divergentShadowResults[2].aiEvidence.line
+            $divergentShadowResults[2].aiEvidence.line = [regex]::Replace($originalLine,
+                ('(?<=\s)' + [regex]::Escape($field) + '=\S+(?=\s|$)'),
+                ($field + '=' + $outcome.value))
+            $divergentShadowResults[2].aiEvidence.fields.$field = $outcome.value
+            Assert-True ($divergentShadowResults[2].aiEvidence.line -cne $originalLine -and
+                $divergentShadowResults[2].aiEvidence.finalDigest -ceq 'A1B2C3D4' -and
+                $divergentShadowResults[2].aiEvidence.endFrame -eq 42000 -and
+                $divergentShadowResults[2].aiEvidence.winnerTeam -eq 1) `
+                "the shadow $field negative changes raw evidence while preserving the misleading cached outcome"
+            $reparsedShadow = ConvertFrom-Stage5AiCompletion `
+                -Output $divergentShadowResults[2].aiEvidence.line -Entry $plan.entries[2] `
+                -ExecutableHash $executableHash -ValidationPlan $plan
+            Assert-True ($reparsedShadow.fields[$field] -ceq $outcome.value -and
+                $reparsedShadow.capabilityProofStatus -ceq 'validated') `
+                "the changed shadow $field remains individually valid before the outcome comparison"
+            Assert-Throws {
+                Assert-Stage5AuthoritativeWorkEvidence -Results $divergentShadowResults `
+                    -ValidationPlan $plan
+            } 'shadow.*(outcome|reference)|regular.*outcome' `
+                "planned shadow $field must match the independently reparsed regular case outcome"
+        }
+
+        # An identical cached determinismKey is not a scenario/seed reference.
+        # In the second case only a different scenario has the shadow's seed.
+        foreach ($missingReference in @('seed', 'scenario')) {
+            $referencePlan = New-Stage5LiveRoleTestPlan
+            $referencePlan.entries[1].seed = 1730
+            $referencePlan.liveQualification.authorityEntries[0].seed = 1730
+            if ($missingReference -ceq 'seed') {
+                $referencePlan.entries[0].seed = 1730
+            }
+            else {
+                $referencePlan.entries[0].scenario = '4v3'
+                $referencePlan.entries[0].stress = $false
+            }
+            $referenceResults = @()
+            foreach ($referenceEntry in $referencePlan.entries) {
+                $referenceOutput = if ($referenceEntry.scenario -ceq '4v3') {
+                    New-AiCompletionOutput -Seed 1729 -Scenario '4v3' -ActualAi 7 -ActualTeams '4v3'
+                }
+                else { New-Stage5LiveRoleTestOutput $referenceEntry }
+                $referenceEvidence = ConvertFrom-Stage5AiCompletion -Output $referenceOutput `
+                    -Entry $referenceEntry -ExecutableHash $executableHash -ValidationPlan $referencePlan
+                $referenceResult = $referenceEntry | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+                $referenceResult | Add-Member -MemberType NoteProperty -Name aiEvidence -Value $referenceEvidence
+                $referenceResults += $referenceResult
+            }
+            Assert-True (@($referenceResults | Where-Object {
+                $_.determinismKey -ceq '4v2-seed-1729'
+            }).Count -eq 3) 'the missing-reference fixture retains a misleading shared cached determinism key'
+            Assert-Throws {
+                Assert-Stage5AuthoritativeWorkEvidence -Results $referenceResults -ValidationPlan $referencePlan
+            } 'shadow.*reference|regular.*reference' `
+                "planned shadow requires a regular reference for its exact $missingReference despite matching cached keys"
+        }
+
+        Assert-Throws {
+            Assert-Stage5AuthoritativeWorkEvidence -Results @($results[0], $results[2]) `
+                -ValidationPlan $plan
+        } 'selected|required|missing|authority|entry' `
+            'a positive unselected result cannot rescue an absent designated authority entry'
+
+        $zeroSelected = $results | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+        foreach ($field in @('status_authoritative_batches', 'status_committed_commands',
+            'status_submitted_jobs', 'status_completed_jobs', 'status_physical_worker_jobs',
+            'status_owner_helped_jobs', 'status_physical_worker_mask',
+            'status_distinct_physical_workers', 'status_peak_concurrent_physical_workers')) {
+            $zeroSelected[1].aiEvidence.fields.$field = '0'
+        }
+        $zeroSelected[1].aiEvidence.line = $unusedStatusOutput
+        Assert-Throws {
+            Assert-Stage5AuthoritativeWorkEvidence -Results $zeroSelected -ValidationPlan $plan
+        } 'status|capability|authority' `
+            'the selected same-result profile cannot borrow positive status from an unselected run'
+
+        $allSelectedPlan = New-Stage5LiveRoleTestPlan
+        $allSelectedPlan.liveQualification.authorityEntries += [pscustomobject]@{
+            scenario = '4v2'; seed = 1729; configuration = 'parallel-2'; repeat = 1
+        }
+        $allSelectedPlan.entries[0].validationRole = 'live-authority-stress'
+        $allSelectedPlan.entries[0].proofProfileId = 'live-all-slices-authority-v1'
+        $zeroSelected[0].validationRole = 'live-authority-stress'
+        $zeroSelected[0].proofProfileId = 'live-all-slices-authority-v1'
+        $zeroSelected[0].aiEvidence = ConvertFrom-Stage5AiCompletion `
+            -Output (New-Stage5LiveRoleTestOutput $allSelectedPlan.entries[0]) `
+            -Entry $allSelectedPlan.entries[0] -ExecutableHash $executableHash `
+            -ValidationPlan $allSelectedPlan
+        Assert-Throws {
+            Assert-Stage5AuthoritativeWorkEvidence -Results $zeroSelected `
+                -ValidationPlan $allSelectedPlan
+        } 'status|capability|authority' `
+            'every preselected authority entry must pass rather than choosing one positive selected run'
+    }
+    catch { Assert-True $false "live-role aggregate fixture failed: $($_.Exception.Message)" }
+
+    $localPlan = New-Stage5LiveRoleTestPlan
+    $localPlan.liveQualification.shadowEntry.configuration = 'shadow-8'
+    $localPlan.entries[2].configuration = 'shadow-8'
+    $localPlan.entries[2].requestedWorkers = '8'
+    $localShadow = $localPlan.entries[2]
+    $localOutput = New-Stage5LiveRoleTestOutput $localShadow
+    try {
+        $localEvidence = ConvertFrom-Stage5AiCompletion -Output $localOutput -Entry $localShadow `
+            -ExecutableHash $executableHash -ValidationPlan $localPlan
+        Assert-True ($localEvidence.schemaStatus -ceq 'complete' -and
+            $localEvidence.invariantStatus -ceq 'validated' -and
+            $localEvidence.validationRole -ceq 'live-shadow-stress' -and
+            $localEvidence.capabilityProofStatus -ceq 'validated' -and
+            $localEvidence.fields.requested_workers -ceq '8' -and
+            [UInt64]$localEvidence.fields.effective_workers -eq 8 -and
+            $localEvidence.ordinaryPathShadowComparisons -gt 0 -and
+            $localEvidence.spatialEvidence.successfulCollections -gt 0) `
+            'the designated V2 local shadow-8 profile proves strict shadow work without relabelling its workers'
+    }
+    catch { Assert-True $false "complete local shadow-8 evidence failed: $($_.Exception.Message)" }
+
+    $noLocalCollection = $localOutput
+    foreach ($field in @('spatial_successful_collections', 'spatial_successful_collection_queries',
+        'spatial_successful_collection_ranges', 'spatial_multi_range_collections',
+        'spatial_collection_submitted_jobs', 'spatial_collection_completed_jobs',
+        'spatial_collection_physical_worker_jobs', 'spatial_collection_owner_helped_jobs',
+        'spatial_collection_physical_worker_mask', 'spatial_maximum_collection_queries',
+        'spatial_maximum_collection_ranges', 'spatial_maximum_collection_distinct_physical_workers')) {
+        $noLocalCollection = [regex]::Replace($noLocalCollection,
+            ('(?<=\s)' + [regex]::Escape($field) + '=\d+(?=\s|$)'), ($field + '=0'))
+    }
+    Assert-Throws {
+        ConvertFrom-Stage5AiCompletion -Output $noLocalCollection -Entry $localShadow `
+            -ExecutableHash $executableHash -ValidationPlan $localPlan | Out-Null
+    } 'positive.*immutable-spatial collection' `
+        'local shadow-8 rejects zero multi-query collection proof even when consumer shadow counters are positive'
+
+    $noLocalOrdinaryComparison = [regex]::Replace($localOutput,
+        '(?<=\s)ordinary_path_shadow_comparisons=\d+(?=\s|$)', 'ordinary_path_shadow_comparisons=0')
+    Assert-Throws {
+        ConvertFrom-Stage5AiCompletion -Output $noLocalOrdinaryComparison -Entry $localShadow `
+            -ExecutableHash $executableHash -ValidationPlan $localPlan | Out-Null
+    } 'shadow.*ordinary-path comparison' `
+        'local shadow-8 requires its own positive physical-worker ordinary-path comparison'
+
+    foreach ($mutation in @(
+        @{ field = 'effective_workers'; value = '7'; pattern = '8 effective workers|effective worker count' },
+        @{ field = 'job_fallback'; value = '1'; pattern = 'shadow stress.*without fallback' },
+        @{ field = 'job_peak_active_workers'; value = '0'; pattern = 'shadow stress.*worker jobs' },
+        @{ field = 'job_failed'; value = '1'; pattern = 'failed jobs' },
+        @{ field = 'job_cancelled'; value = '1'; pattern = 'cancelled jobs' },
+        @{ field = 'requested_workers'; value = '16'; pattern = 'requested worker count does not match' })) {
+        $mutated = [regex]::Replace($localOutput,
+            ('(?<=\s)' + [regex]::Escape($mutation.field) + '=\d+(?=\s|$)'),
+            ($mutation.field + '=' + $mutation.value))
+        Assert-True ($mutated -cne $localOutput) `
+            "the local shadow-8 $($mutation.field) negative changes the producer fixture"
+        Assert-Throws {
+            ConvertFrom-Stage5AiCompletion -Output $mutated -Entry $localShadow `
+                -ExecutableHash $executableHash -ValidationPlan $localPlan | Out-Null
+        } $mutation.pattern "local shadow-8 retains the strict $($mutation.field) scheduler contract"
+    }
+    $legacyLocalShadow = [pscustomobject]@{
+        sequence = 15; scenario = '4v2'; seed = 1729; configuration = 'shadow-8'
+        simulationMode = 'shadow'; requestedWorkers = '8'; stress = $true
+    }
+    Assert-Throws {
+        ConvertFrom-Stage5AiCompletion $localOutput $legacyLocalShadow $executableHash | Out-Null
+    } 'unsupported worker configuration' 'V1 shadow-8 does not silently acquire the new V2 role contract'
+}
+
 function New-AiResult {
     param([string]$Configuration, [int]$Repeat, [string]$Digest = 'A1B2C3D4',
         [int]$EndFrame = 42000, [int]$Winner = 1,
@@ -3252,6 +3695,7 @@ $root = Join-Path $temporaryBase ('GGC-Stage5Validation-Test-{0}-{1}' -f $PID, [
 New-Item -ItemType Directory -Path $root | Out-Null
 try {
     Assert-InstalledNet3ModuleBoundary (Join-Path $root 'installed-net3-module-fixture.json')
+    Assert-Stage5LiveRoleContract
     $runtime = Join-Path $root 'runtime'
     $fixtures = Join-Path $root 'fixtures'
     New-Item -ItemType Directory -Path $runtime | Out-Null

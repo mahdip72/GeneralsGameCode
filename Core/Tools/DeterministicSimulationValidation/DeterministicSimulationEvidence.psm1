@@ -448,23 +448,157 @@ function Get-Stage5ImmutableSpatialFieldNames {
     return $names
 }
 
+function ConvertTo-Stage5LiveDictionary {
+    param([object]$Value, [string]$Context)
+    if ($Value -is [Collections.IDictionary]) { return $Value }
+    Assert-Stage5Condition ($Value -is [pscustomobject]) "$Context must be a live-plan object."
+    $dictionary = @{}
+    foreach ($property in $Value.PSObject.Properties) {
+        Assert-Stage5Condition (-not $dictionary.ContainsKey($property.Name)) `
+            "$Context contains a duplicate live-plan property."
+        $dictionary[$property.Name] = $property.Value
+    }
+    return $dictionary
+}
+
+function Get-Stage5LiveSelectorKey {
+    param([object]$Selector, [string]$Context)
+    $selectorObject = ConvertTo-Stage5LiveDictionary $Selector $Context
+    Assert-Stage5JsonProperties $selectorObject @('scenario', 'seed', 'configuration', 'repeat') $Context
+    Assert-Stage5Condition (@('4v2', '4v3') -ccontains $selectorObject.scenario -and
+        (Test-Stage5JsonInteger $selectorObject.seed) -and $selectorObject.seed -gt 0 -and
+        $selectorObject.seed -le [UInt32]::MaxValue -and
+        (Test-Stage5JsonInteger $selectorObject.repeat) -and $selectorObject.repeat -gt 0 -and
+        $selectorObject.configuration -is [string] -and
+        $selectorObject.configuration -cmatch '^(?:serial-1|parallel-(?:1|2|4|8|16|auto)|shadow-(?:8|16))$') `
+        "$Context has an invalid live plan selector."
+    return "$($selectorObject.scenario)|$($selectorObject.seed)|$($selectorObject.configuration)|$($selectorObject.repeat)"
+}
+
+function Resolve-Stage5LiveValidationRequirements {
+    param([object]$Plan, [object]$Entry)
+    $context = 'Stage 5 live validation plan'
+    $planObject = ConvertTo-Stage5LiveDictionary $Plan $context
+    Assert-Stage5JsonProperties $planObject @('schemaVersion', 'liveQualification', 'entries') $context
+    Assert-Stage5Condition ((Test-Stage5JsonInteger $planObject.schemaVersion) -and
+        $planObject.schemaVersion -eq 2 -and $planObject.entries -is [Array]) `
+        "$context requires the explicit V2 role contract."
+    $qualification = ConvertTo-Stage5LiveDictionary $planObject.liveQualification "$context qualification"
+    Assert-Stage5JsonShape $qualification @('schemaVersion', 'profileSetId', 'authorityEntries', 'shadowEntry') `
+        "$context qualification"
+    Assert-Stage5Condition ((Test-Stage5JsonInteger $qualification.schemaVersion) -and
+        $qualification.schemaVersion -eq 1 -and
+        $qualification.profileSetId -ceq 'live-all-slices-v1' -and
+        $qualification.authorityEntries -is [Array] -and $qualification.authorityEntries.Count -gt 0) `
+        "$context has an unknown profile or empty authority selection."
+
+    $entriesByKey = @{}
+    $entryIds = @{}
+    foreach ($planned in $planObject.entries) {
+        $candidate = ConvertTo-Stage5LiveDictionary $planned "$context entry"
+        Assert-Stage5JsonProperties $candidate @('kind') "$context entry"
+        if ($candidate.kind -cne 'ai') { continue }
+        Assert-Stage5JsonProperties $candidate @('entryId', 'sequence', 'scenario', 'seed',
+            'configuration', 'repeat', 'simulationMode', 'requestedWorkers', 'workerPolicy',
+            'stress', 'validationRole', 'proofProfileId') "$context AI entry"
+        $key = Get-Stage5LiveSelectorKey $candidate "$context AI entry"
+        Assert-Stage5Condition ($candidate.entryId -is [string] -and
+            -not [string]::IsNullOrWhiteSpace($candidate.entryId) -and
+            (Test-Stage5JsonInteger $candidate.sequence) -and $candidate.sequence -gt 0 -and
+            -not $entriesByKey.ContainsKey($key) -and -not $entryIds.ContainsKey($candidate.entryId)) `
+            "$context contains a missing or duplicate AI entry identity."
+        $lane = $candidate.configuration.Split('-')
+        Assert-Stage5Condition ($candidate.simulationMode -ceq $lane[0] -and
+            [string]$candidate.requestedWorkers -ceq $lane[1] -and
+            $candidate.workerPolicy -ceq 'auto' -and $candidate.stress -is [bool] -and
+            $candidate.stress -eq ($candidate.scenario -ceq '4v2')) `
+            "$context AI entry policy or stress applicability is inconsistent."
+        $entriesByKey[$key] = $candidate
+        $entryIds[$candidate.entryId] = $key
+    }
+
+    $authorityKeys = @{}
+    foreach ($selector in $qualification.authorityEntries) {
+        $selectorObject = ConvertTo-Stage5LiveDictionary $selector "$context authority selector"
+        Assert-Stage5JsonShape $selectorObject @('scenario', 'seed', 'configuration', 'repeat') `
+            "$context authority selector"
+        $key = Get-Stage5LiveSelectorKey $selectorObject "$context authority selector"
+        Assert-Stage5Condition ($selectorObject.scenario -ceq '4v2' -and
+            $selectorObject.configuration -cmatch '^parallel-(?:2|4|8|16|auto)$' -and
+            $entriesByKey.ContainsKey($key) -and -not $authorityKeys.ContainsKey($key)) `
+            "$context authority selector is duplicated, incapable, or absent from the planned matrix."
+        $authorityKeys[$key] = $true
+    }
+    $shadowSelector = ConvertTo-Stage5LiveDictionary $qualification.shadowEntry "$context shadow selector"
+    Assert-Stage5JsonShape $shadowSelector @('scenario', 'seed', 'configuration', 'repeat') `
+        "$context shadow selector"
+    $shadowKey = Get-Stage5LiveSelectorKey $shadowSelector "$context shadow selector"
+    Assert-Stage5Condition ($shadowSelector.scenario -ceq '4v2' -and
+        $shadowSelector.configuration -cmatch '^shadow-(?:8|16)$' -and
+        $entriesByKey.ContainsKey($shadowKey)) "$context shadow selector is absent or invalid."
+
+    $requested = ConvertTo-Stage5LiveDictionary $Entry "$context requested entry"
+    Assert-Stage5JsonProperties $requested @('entryId') "$context requested entry"
+    Assert-Stage5Condition ($requested.entryId -is [string] -and $entryIds.ContainsKey($requested.entryId)) `
+        "$context requested entry is not a member of the planned matrix."
+    $requirements = $null
+    foreach ($key in $entriesByKey.Keys) {
+        $candidate = $entriesByKey[$key]
+        $role = 'live-determinism'
+        $profile = 'live-invariants-v1'
+        if ($authorityKeys.ContainsKey($key)) {
+            $role = 'live-authority-stress'
+            $profile = 'live-all-slices-authority-v1'
+        }
+        elseif ($key -ceq $shadowKey) {
+            $role = 'live-shadow-stress'
+            $profile = 'live-all-slices-shadow-v1'
+        }
+        Assert-Stage5Condition ($candidate.validationRole -ceq $role -and
+            $candidate.proofProfileId -ceq $profile -and
+            ($candidate.simulationMode -cne 'shadow' -or $role -ceq 'live-shadow-stress')) `
+            "$context entry has an unknown or selector-inconsistent role/profile."
+        if ($candidate.entryId -ceq $requested.entryId) {
+            foreach ($field in @('entryId', 'kind', 'sequence', 'scenario', 'seed', 'configuration',
+                'repeat', 'simulationMode', 'requestedWorkers', 'workerPolicy', 'stress',
+                'validationRole', 'proofProfileId')) {
+                $value = Get-Stage5JsonValue $requested $field "$context requested entry"
+                Assert-Stage5Condition ($value -ceq $candidate[$field]) `
+                    "$context requested entry does not match its frozen role identity in '$field'."
+            }
+            $requirements = [pscustomobject]@{
+                schemaVersion = 1; entryId = $candidate.entryId
+                validationRole = $role; proofProfileId = $profile
+                requireCompleteSliceSchema = $true
+            }
+        }
+    }
+    Assert-Stage5Condition ($null -ne $requirements) "$context requested entry identity differs in case."
+    return $requirements
+}
+
 function ConvertFrom-Stage5ImmutableSpatialFields {
     param([hashtable]$Fields, [string]$Prefix, [object]$Entry,
-        [string]$Context)
+        [string]$Context, [object]$LiveRequirements = $null)
     $fieldNames = @(Get-Stage5ImmutableSpatialFieldNames $Prefix)
     $isStress = $false
-    if ($null -ne $Entry.PSObject.Properties['stress']) {
+    if ($null -ne $LiveRequirements -or $null -ne $Entry.PSObject.Properties['stress']) {
         $isStress = [bool]$Entry.stress
     }
     $qualifyingCollectionStress = $isStress -and
         ($Entry.simulationMode -ceq 'parallel' -or
             $Entry.simulationMode -ceq 'shadow') -and
-        $Entry.configuration -match '^(?:parallel-(?:2|4|8|16|auto)|shadow-16)$'
+        ($Entry.configuration -match '^(?:parallel-(?:2|4|8|16|auto)|shadow-16)$' -or
+         ($null -ne $LiveRequirements -and
+          $LiveRequirements.validationRole -ceq 'live-shadow-stress' -and
+          $Entry.configuration -ceq 'shadow-8'))
+    $requirePositiveCollection = $qualifyingCollectionStress -and
+        ($null -eq $LiveRequirements -or $LiveRequirements.validationRole -cne 'live-determinism')
     foreach ($numeric in $fieldNames) {
         Get-Stage5UInt64Field $Fields $numeric "$Context immutable-spatial evidence" | Out-Null
     }
     $capturedArenas = Get-Stage5UInt64Field $Fields ($Prefix + 'captured_arenas') $Context
-    if ($qualifyingCollectionStress) {
+    if ($requirePositiveCollection) {
         Assert-Stage5Condition ($capturedArenas -gt 0) `
             "$Context has no captured immutable-spatial arena."
     }
@@ -536,11 +670,11 @@ function ConvertFrom-Stage5ImmutableSpatialFields {
             "$Context reports immutable-spatial collection work without a successful collection."
     }
     if ($qualifyingCollectionStress) {
-        Assert-Stage5Condition ($successfulCollections -gt 0 -and
+        Assert-Stage5Condition (-not $requirePositiveCollection -or ($successfulCollections -gt 0 -and
             $successfulCollectionQueries -gt $successfulCollections -and
             $successfulCollectionRanges -gt $successfulCollections -and
             $collectionSubmitted -gt 0 -and $collectionPhysical -gt 0 -and
-            $maximumCollectionQueries -ge 2 -and $maximumCollectionRanges -ge 2) `
+            $maximumCollectionQueries -ge 2 -and $maximumCollectionRanges -ge 2)) `
             "$Context qualifying stress has no positive multi-query, multi-range immutable-spatial collection evidence."
         if ($Entry.configuration -match '^(?:parallel|shadow)-(2|4|8|16)$') {
             $explicitCollectionWorkers = [UInt64]$Matches[1]
@@ -631,8 +765,12 @@ function ConvertFrom-Stage5ImmutableSpatialFields {
             $Entry.simulationMode -ceq 'parallel' -and
             $Entry.configuration -match '^parallel-(?:2|4|8|16|auto)$'
         if ($qualifyingParallelStress) {
-            Assert-Stage5Condition ($authoritative -gt 0 -and $candidates -gt 0 -and
-                $submitted -gt 0 -and $physical -gt 0 -and $expectedFallbacks -eq 0) `
+            Assert-Stage5Condition ($expectedFallbacks -eq 0) `
+                "$Context qualifying stress has no positive $consumer immutable-spatial authority, candidates, and balanced worker evidence."
+            Assert-Stage5Condition (($null -ne $LiveRequirements -and
+                $LiveRequirements.validationRole -ceq 'live-determinism') -or
+                ($authoritative -gt 0 -and $candidates -gt 0 -and
+                 $submitted -gt 0 -and $physical -gt 0)) `
                 "$Context qualifying stress has no positive $consumer immutable-spatial authority, candidates, and balanced worker evidence."
         }
         if ($Entry.simulationMode -ceq 'shadow') {
@@ -674,8 +812,21 @@ function ConvertFrom-Stage5ImmutableSpatialFields {
 
 function ConvertFrom-Stage5AiCompletion {
     param([string]$Output, [object]$Entry, [string]$ExecutableHash,
-        [bool]$RequireAuthoritativeWorkEvidence = $true)
+        [bool]$RequireAuthoritativeWorkEvidence = $true, [object]$ValidationPlan = $null)
     $context = "AI validation entry $($Entry.sequence)"
+    $liveRequirements = $null
+    if ($null -ne $ValidationPlan) {
+        $liveRequirements = Resolve-Stage5LiveValidationRequirements -Plan $ValidationPlan -Entry $Entry
+    }
+    else {
+        $legacyEntry = ConvertTo-Stage5LiveDictionary $Entry $context
+        Assert-Stage5Condition (-not $legacyEntry.Contains('validationRole') -and
+            -not $legacyEntry.Contains('proofProfileId')) "$context has a V2 role without its validation plan."
+    }
+    $requireParallelCapability = $null -eq $liveRequirements -or
+        $liveRequirements.validationRole -ceq 'live-authority-stress'
+    $isVersionedShadowProof = $null -ne $liveRequirements -and
+        $liveRequirements.validationRole -ceq 'live-shadow-stress'
     $line = Get-Stage5SingleLine $Output 'SKIRMISH_AI_TEST_COMPLETE' $context
     $fields = ConvertFrom-Stage5MetricLine $line 'SKIRMISH_AI_TEST_COMPLETE' "$context completion manifest"
     foreach ($required in @('seed', 'loaded_seed', 'scenario', 'actual_ai', 'actual_teams', 'winner_team', 'end_frame', 'executable_sha256',
@@ -767,7 +918,8 @@ function ConvertFrom-Stage5AiCompletion {
         $presentWorkFieldCount -eq $workFieldNames.Count) `
         "$context completion manifest contains an incomplete authoritative-work schema."
     $hasAuthoritativeWorkEvidence = $presentWorkFieldCount -eq $workFieldNames.Count
-    Assert-Stage5Condition (-not $RequireAuthoritativeWorkEvidence -or $hasAuthoritativeWorkEvidence) `
+    Assert-Stage5Condition ((-not $RequireAuthoritativeWorkEvidence -and $null -eq $liveRequirements) -or
+        $hasAuthoritativeWorkEvidence) `
         "$context completion manifest is missing required authoritative Stage 5 work evidence."
     Assert-Stage5Condition ((Get-Stage5RequiredField $fields 'executable_sha256' $context) -ceq $ExecutableHash) `
         "$context executable hash does not match the validated candidate."
@@ -908,6 +1060,11 @@ function ConvertFrom-Stage5AiCompletion {
                 $ownerFallbacks -eq 0) `
                 "$context serial simulation reports AI lane jobs or owner fallbacks."
         }
+        if ($null -ne $liveRequirements -and $requireParallelCapability) {
+            Assert-Stage5Condition ($aiParallelAuthoritativeCommits -gt 0 -and
+                $aiSubmittedJobs -gt 0 -and $aiCompletedJobs -gt 0) `
+                "$context designated authority profile has no AI-specific submitted/completed owner authority."
+        }
 
 		$pathEligible = Get-Stage5UInt64Field $fields 'direct_eligible' $context
 		$pathSubmitted = Get-Stage5UInt64Field $fields 'direct_submitted' $context
@@ -969,10 +1126,13 @@ function ConvertFrom-Stage5AiCompletion {
 		$isQualifyingPathStress = $Entry.scenario -ceq '4v2' -and
 			$Entry.simulationMode -ceq 'parallel' -and
 			$Entry.configuration -match '^parallel-(?:2|4|8|16|auto)$'
-		if ($isQualifyingPathStress) {
+		if ($isQualifyingPathStress -and ($requireParallelCapability -or $pathWorkerExecuted -gt 0)) {
 			Assert-Stage5Condition ($pathEligible -ge 2 -and $pathSubmitted -ge 2 -and
-				$pathWorkerExecuted -gt 1 -and $pathPeakWorkers -gt 1 -and
-				$pathAuthoritativeCommits -gt 0 -and
+				$pathWorkerExecuted -gt 1 -and $pathPeakWorkers -gt 1) `
+				"$context qualifying parallel stress has no multi-request direct-path batch backed by more than one physical path worker and an authoritative commit."
+		}
+		if ($isQualifyingPathStress -and $requireParallelCapability) {
+			Assert-Stage5Condition ($pathAuthoritativeCommits -gt 0 -and
 				$pathAuthoritativeMultiWorkerCommits -gt 0) `
 				"$context qualifying parallel stress has no multi-request direct-path batch backed by more than one physical path worker and an authoritative commit."
 		}
@@ -1085,7 +1245,7 @@ function ConvertFrom-Stage5AiCompletion {
 			Assert-Stage5Condition ((Get-Stage5UInt64Field $fields $zeroInvariant $context) -eq 0) `
 				"$context reports forbidden ordinary-path acceptance evidence in '$zeroInvariant'."
 		}
-		if ($isQualifyingPathStress) {
+		if ($isQualifyingPathStress -and ($requireParallelCapability -or $ordinarySubmittedRanges -gt 0)) {
 			Assert-Stage5Condition ($ordinaryEligible -ge 2 -and
 				$ordinarySubmittedRequests -ge 2 -and
 				$ordinarySubmittedRanges -ge 2 -and
@@ -1094,8 +1254,11 @@ function ConvertFrom-Stage5AiCompletion {
 				$ordinaryPathDistinctPhysicalWorkers -gt 1 -and
 				$ordinaryPathPeakWorkers -gt 1 -and
 				$ordinaryMaximumBatchRequests -ge 2 -and
-				$ordinaryMaximumRangeCount -ge 2 -and
-				$ordinaryPathAuthoritativeCommits -gt 0 -and
+				$ordinaryMaximumRangeCount -ge 2) `
+				"$context qualifying parallel stress has no authoritative ordinary A* batch backed by concurrent physical path workers."
+		}
+		if ($isQualifyingPathStress -and $requireParallelCapability) {
+			Assert-Stage5Condition ($ordinaryPathAuthoritativeCommits -gt 0 -and
 				$ordinaryPathAuthoritativeMultiWorkerCommits -gt 0) `
 				"$context qualifying parallel stress has no authoritative ordinary A* batch backed by concurrent physical path workers."
 		}
@@ -1122,7 +1285,8 @@ function ConvertFrom-Stage5AiCompletion {
 		}
 		$isQualifyingOrdinaryShadow = $Entry.scenario -ceq '4v2' -and
 			$Entry.simulationMode -ceq 'shadow' -and
-			$Entry.configuration -ceq 'shadow-16'
+			($Entry.configuration -ceq 'shadow-16' -or
+             ($isVersionedShadowProof -and $Entry.configuration -ceq 'shadow-8'))
 		if ($isQualifyingOrdinaryShadow) {
 			Assert-Stage5Condition ($ordinaryShadowComparisons -gt 0 -and
 				$ordinaryPathWorkerExecutedRequests -gt 0 -and
@@ -1224,11 +1388,14 @@ function ConvertFrom-Stage5AiCompletion {
         if ($isQualifyingCollisionStress) {
 			$collisionStaleRejections = Get-Stage5UInt64Field $fields `
 				'collision_stale_rejections' $context
-			Assert-Stage5Condition ($collisionAuthoritativeCommits -gt 0 -and
-				$collisionCommittedCandidates -gt 0 -and
-				$collisionOwnerFallbacks -eq 0 -and $collisionStaleRejections -eq 0 -and
-				$collisionPhysicalWorkerJobs -gt 0 -and
-				$collisionDistinctPhysicalWorkers -ge 2) `
+			Assert-Stage5Condition ($collisionOwnerFallbacks -eq 0 -and $collisionStaleRejections -eq 0) `
+                "$context qualifying parallel stress has no collision work executed by at least two distinct physical collision workers."
+			Assert-Stage5Condition ($collisionCompletedJobs -eq 0 -or
+                ($collisionPhysicalWorkerJobs -gt 0 -and $collisionDistinctPhysicalWorkers -ge 2)) `
+                "$context qualifying parallel stress has no collision work executed by at least two distinct physical collision workers."
+			Assert-Stage5Condition (-not $requireParallelCapability -or
+                ($collisionAuthoritativeCommits -gt 0 -and $collisionCommittedCandidates -gt 0 -and
+				 $collisionPhysicalWorkerJobs -gt 0 -and $collisionDistinctPhysicalWorkers -ge 2)) `
                 "$context qualifying parallel stress has no collision work executed by at least two distinct physical collision workers."
 			Assert-Stage5Condition ($collisionWorkerBound -gt 64 -or
 				$collisionPhysicalWorkerMaskComplete -eq 1) `
@@ -1362,13 +1529,14 @@ function ConvertFrom-Stage5AiCompletion {
             $Entry.simulationMode -ceq 'parallel' -and
             $Entry.configuration -match '^parallel-(?:2|4|8|16|auto)$'
 		if ($isQualifyingPhysicsStress) {
-			Assert-Stage5Condition ($physicsAuthoritativeBatches -gt 0 -and
-                $physicsCommittedPrefixes -gt 0 -and $physicsRanges -gt 0 -and
-				$physicsSubmittedJobs -gt 0 -and $physicsCompletedJobs -gt 0 -and
-				$physicsPhysicalWorkerJobs -eq $physicsCompletedJobs -and
+			Assert-Stage5Condition ($physicsPhysicalWorkerJobs -eq $physicsCompletedJobs -and
 				$physicsOwnerHelpedJobs -eq 0 -and
-				$physicsDistinctPhysicalWorkers -ge 2 -and
-				$physicsPeakConcurrentPhysicalWorkers -ge 2) `
+                (($physicsCompletedJobs -eq 0 -and $physicsPeakConcurrentPhysicalWorkers -eq 0) -or
+                 ($physicsDistinctPhysicalWorkers -ge 2 -and $physicsPeakConcurrentPhysicalWorkers -ge 2))) `
+				"$context qualifying parallel stress has no positive authoritative physics batch, prefix, range, and job evidence."
+			Assert-Stage5Condition (-not $requireParallelCapability -or
+                ($physicsAuthoritativeBatches -gt 0 -and $physicsCommittedPrefixes -gt 0 -and
+                 $physicsRanges -gt 0 -and $physicsSubmittedJobs -gt 0 -and $physicsCompletedJobs -gt 0)) `
 				"$context qualifying parallel stress has no positive authoritative physics batch, prefix, range, and job evidence."
 			Assert-Stage5Condition ($physicsWorkerBound -gt 64 -or
 				$physicsPhysicalWorkerMaskComplete -eq 1) `
@@ -1484,12 +1652,15 @@ function ConvertFrom-Stage5AiCompletion {
 			$Entry.simulationMode -ceq 'parallel' -and
 			$Entry.configuration -match '^parallel-(?:2|4|8|16|auto)$'
 		if ($isQualifyingStatusStress) {
-			Assert-Stage5Condition ($statusAuthoritativeBatches -gt 0 -and
-				$statusCommittedCommands -gt 0 -and $statusSubmittedJobs -gt 0 -and
-				$statusPhysicalWorkerJobs -eq $statusCompletedJobs -and
+			Assert-Stage5Condition ($statusPhysicalWorkerJobs -eq $statusCompletedJobs -and
 				$statusOwnerHelpedJobs -eq 0 -and
-				$statusDistinctPhysicalWorkers -ge 2 -and
-				$statusPeakConcurrentPhysicalWorkers -ge 2) `
+                (($statusCompletedJobs -eq 0 -and $statusPeakConcurrentPhysicalWorkers -eq 0) -or
+                 ($statusDistinctPhysicalWorkers -ge 2 -and $statusPeakConcurrentPhysicalWorkers -ge 2))) `
+				"$context qualifying parallel stress has no physical live status authority."
+			Assert-Stage5Condition ((-not $requireParallelCapability -and
+                $statusAuthoritativeBatches -eq 0 -and $statusCommittedCommands -eq 0) -or
+                ($statusAuthoritativeBatches -gt 0 -and $statusCommittedCommands -gt 0 -and
+                 $statusSubmittedJobs -gt 0)) `
 				"$context qualifying parallel stress has no physical live status authority."
 			Assert-Stage5Condition ($physicsWorkerBound -gt 64 -or
 				$statusPhysicalWorkerMaskComplete -eq 1) `
@@ -1518,7 +1689,7 @@ function ConvertFrom-Stage5AiCompletion {
 				"$context nonparallel status lane reports live authority."
 		}
         $spatialEvidence = ConvertFrom-Stage5ImmutableSpatialFields $fields `
-            'spatial_' $Entry $context
+            'spatial_' $Entry $context $liveRequirements
     }
 
     $effectiveWorkers = Get-Stage5UInt64Field $fields 'effective_workers' $context
@@ -1551,9 +1722,11 @@ function ConvertFrom-Stage5AiCompletion {
             $executedJobs -gt 0 -and $peakWorkers -gt 0) `
             "$context automatic configuration did not execute parallel jobs without fallback."
     }
-    elseif ($Entry.configuration -ceq 'shadow-16') {
-        Assert-Stage5Condition ($effectiveWorkers -eq 16) `
-            "$context shadow stress did not run with 16 effective workers."
+    elseif ($Entry.configuration -ceq 'shadow-16' -or
+        ($isVersionedShadowProof -and $Entry.configuration -ceq 'shadow-8')) {
+        $expectedShadowWorkers = if ($Entry.configuration -ceq 'shadow-8') { 8 } else { 16 }
+        Assert-Stage5Condition ($effectiveWorkers -eq $expectedShadowWorkers) `
+            "$context shadow stress did not run with $expectedShadowWorkers effective workers."
         Assert-Stage5Condition ($fallbackJobs -eq 0 -and $submittedJobs -gt 0 -and
             $executedJobs -gt 0 -and $peakWorkers -gt 0) `
             "$context shadow stress did not execute worker jobs without fallback."
@@ -1564,6 +1737,13 @@ function ConvertFrom-Stage5AiCompletion {
 
     return [pscustomobject]@{
         line = $line
+        schemaStatus = $(if ($hasAuthoritativeWorkEvidence) { 'complete' } else { 'unavailable-non-acceptance' })
+        invariantStatus = $(if ($hasAuthoritativeWorkEvidence) { 'validated' } else { 'unavailable-non-acceptance' })
+        capabilityProofStatus = $(if ($null -eq $liveRequirements) { 'unavailable-v1' }
+            elseif ($liveRequirements.validationRole -ceq 'live-determinism') { 'not-required' }
+            else { 'validated' })
+        validationRole = $(if ($null -ne $liveRequirements) { $liveRequirements.validationRole } else { $null })
+        proofProfileId = $(if ($null -ne $liveRequirements) { $liveRequirements.proofProfileId } else { $null })
         finalDigest = (Get-Stage5RequiredField $fields 'final_digest' $context).ToUpperInvariant()
         endFrame = Get-Stage5UInt64Field $fields 'end_frame' $context
         winnerTeam = Get-Stage5UInt64Field $fields 'winner_team' $context
@@ -2293,8 +2473,92 @@ function Assert-Stage5AiDeterminism {
     }
 }
 
+function Assert-Stage5PlannedLiveWorkEvidence {
+    param([object[]]$Results, [object]$ValidationPlan)
+    $context = 'Stage 5 selected live capability evidence'
+    $planObject = ConvertTo-Stage5LiveDictionary $ValidationPlan "$context plan"
+    Assert-Stage5JsonProperties $planObject @('entries') "$context plan"
+    $plannedAi = @($planObject.entries | Where-Object { $_.kind -ceq 'ai' })
+    Assert-Stage5Condition ($plannedAi.Count -gt 0) "$context has no planned AI entries."
+    # Validate the entire closed selector set even when no process result arrived.
+    Resolve-Stage5LiveValidationRequirements -Plan $ValidationPlan -Entry $plannedAi[0] | Out-Null
+    $seen = @{}
+    $verifiedOutcomes = @{}
+    foreach ($result in $Results) {
+        if ($result.kind -cne 'ai') { continue }
+        $requirements = Resolve-Stage5LiveValidationRequirements -Plan $ValidationPlan -Entry $result
+        Assert-Stage5Condition (-not $seen.ContainsKey($requirements.entryId)) `
+            "$context contains a duplicate required entry '$($requirements.entryId)'."
+        $seen[$requirements.entryId] = $true
+        $evidence = ConvertTo-Stage5LiveDictionary $result.aiEvidence "$context entry $($requirements.entryId)"
+        Assert-Stage5JsonProperties $evidence @('line', 'fields', 'schemaStatus', 'invariantStatus',
+            'capabilityProofStatus', 'validationRole', 'proofProfileId') "$context entry $($requirements.entryId)"
+        Assert-Stage5Condition ($evidence.schemaStatus -ceq 'complete' -and
+            $evidence.invariantStatus -ceq 'validated' -and
+            $evidence.validationRole -ceq $requirements.validationRole -and
+            $evidence.proofProfileId -ceq $requirements.proofProfileId) `
+            "$context entry '$($requirements.entryId)' has missing or inconsistent role evidence."
+        $retainedFields = ConvertTo-Stage5LiveDictionary $evidence.fields "$context raw fields"
+        $executableHash = Get-Stage5JsonValue $retainedFields 'executable_sha256' "$context raw fields"
+        # Reparse this exact result. Never union cached positive properties across runs.
+        $verified = ConvertFrom-Stage5AiCompletion -Output $evidence.line -Entry $result `
+            -ExecutableHash $executableHash -ValidationPlan $ValidationPlan
+        Assert-Stage5Condition ($retainedFields.Count -eq $verified.fields.Count) `
+            "$context entry '$($requirements.entryId)' has an incomplete retained raw field set."
+        foreach ($field in $verified.fields.Keys) {
+            $retainedValue = Get-Stage5JsonValue $retainedFields $field "$context raw fields"
+            Assert-Stage5Condition ($retainedValue -ceq $verified.fields[$field]) `
+                "$context entry '$($requirements.entryId)' raw field '$field' differs from its completion line."
+        }
+        Assert-Stage5Condition ($evidence.capabilityProofStatus -ceq $verified.capabilityProofStatus) `
+            "$context entry '$($requirements.entryId)' has an inconsistent capability claim."
+        $verifiedOutcomes[$requirements.entryId] = $verified
+    }
+    foreach ($planned in $plannedAi) {
+        Assert-Stage5Condition ($seen.ContainsKey($planned.entryId)) `
+            "$context is missing required plan entry '$($planned.entryId)'; an unselected positive result cannot rescue it."
+    }
+    # Full matrix coverage remains a separate determinism gate. Bind this
+    # selected shadow to its exact case using only the re-parsed raw outcomes.
+    $shadowOutcome = @($verifiedOutcomes.Values | Where-Object {
+        $_.validationRole -ceq 'live-shadow-stress'
+    })[0]
+    $referenceOutcomes = @($verifiedOutcomes.Values | Where-Object {
+        $_.validationRole -cne 'live-shadow-stress' -and
+        $_.fields.scenario -ceq $shadowOutcome.fields.scenario -and
+        [UInt64]$_.fields.seed -eq [UInt64]$shadowOutcome.fields.seed
+    })
+    Assert-Stage5Condition ($referenceOutcomes.Count -gt 0) `
+        "$context shadow has no regular reference for its exact scenario and seed."
+    foreach ($referenceOutcome in $referenceOutcomes) {
+        Assert-Stage5Condition ($shadowOutcome.finalDigest -ceq $referenceOutcome.finalDigest -and
+            $shadowOutcome.endFrame -eq $referenceOutcome.endFrame -and
+            $shadowOutcome.winnerTeam -eq $referenceOutcome.winnerTeam) `
+            "$context shadow differs from the regular matrix outcome."
+    }
+}
+
 function Assert-Stage5AuthoritativeWorkEvidence {
-    param([object[]]$Results)
+    param([object[]]$Results, [object]$ValidationPlan = $null)
+    if ($null -ne $ValidationPlan) {
+        Assert-Stage5PlannedLiveWorkEvidence -Results $Results -ValidationPlan $ValidationPlan
+        return
+    }
+    foreach ($result in $Results) {
+        $legacyResult = ConvertTo-Stage5LiveDictionary $result 'Stage 5 legacy live result'
+        Assert-Stage5Condition (-not $legacyResult.Contains('validationRole') -and
+            -not $legacyResult.Contains('proofProfileId')) `
+            'Stage 5 V2 role evidence requires its original validation plan.'
+        if ($legacyResult.Contains('aiEvidence') -and $null -ne $legacyResult['aiEvidence']) {
+            $legacyEvidence = ConvertTo-Stage5LiveDictionary $legacyResult['aiEvidence'] `
+                'Stage 5 legacy live result evidence'
+            foreach ($field in @('validationRole', 'proofProfileId')) {
+                Assert-Stage5Condition (-not $legacyEvidence.Contains($field) -or
+                    $null -eq $legacyEvidence[$field]) `
+                    'Stage 5 nested V2 role evidence requires its original validation plan.'
+            }
+        }
+    }
     $stressParallel = @($Results | Where-Object {
         $_.kind -ceq 'ai' -and $_.stress -and $_.configuration -match '^parallel-(?:2|4|8|16|auto)$'
     })
@@ -8489,7 +8753,7 @@ function Invoke-Stage5FinalAcceptanceAggregation {
 Export-ModuleMember -Function ConvertFrom-Stage5JsonDictionary, Get-Stage5JsonValue, `
     Assert-Stage5NativePerformanceReceiptProvenance, `
     Assert-Stage5JsonShape, Test-Stage5JsonInteger, Get-Stage5UInt64BitCount, Get-Stage5FileSha256, `
-    ConvertFrom-Stage5AiCompletion, ConvertFrom-Stage5ReplayMetrics, `
+    ConvertFrom-Stage5AiCompletion, ConvertFrom-Stage5ReplayMetrics, Resolve-Stage5LiveValidationRequirements, `
     ConvertFrom-Stage5ReplayResult, Get-Stage5TimingEvidence, Assert-Stage5AiDeterminism, Assert-Stage5ReplayDeterminism, `
     Assert-Stage5AuthoritativeWorkEvidence, Assert-Stage5CollisionTimingEvidence, `
     Read-Stage5PerformanceBaseline, Measure-Stage5Performance, Invoke-Stage5RegistryRestore, `
