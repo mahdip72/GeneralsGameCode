@@ -6,6 +6,8 @@
 
 #include <cstdio>
 #include <climits>
+#include <cstring>
+#include <limits>
 #include <new>
 #include <windows.h>
 
@@ -1064,6 +1066,97 @@ int TestNativeCommandsPreservePipelineState(NativeW3D2 *owner)
 	return result;
 }
 
+int TestPlainTransformRejectsNonfiniteValues(NativeW3D2 *owner)
+{
+	int result = 0;
+	if (owner == 0 || !owner->IsOperational())
+		return Check(false, "nonfinite transform fixture has an operational owner");
+	const float invalidValues[] = {
+		std::numeric_limits<float>::quiet_NaN(),
+		std::numeric_limits<float>::infinity(),
+		-std::numeric_limits<float>::infinity()
+	};
+	rts::render::RenderMatrix4 priorTransform;
+	for (unsigned int element = 0; element != 16; ++element)
+		priorTransform.values[element] = static_cast<float>(element + 1);
+
+	for (unsigned int published = 0; published != 2; ++published)
+	{
+		const rts::render::LegacyTransformSlot slot = published == 0 ?
+			rts::render::LEGACY_TRANSFORM_PROJECTION :
+			rts::render::LEGACY_TRANSFORM_VIEW;
+		for (unsigned int invalid = 0; invalid != 3; ++invalid)
+		{
+			for (unsigned int element = 0; element != 16; ++element)
+			{
+				rts::render::ResetTrackedLegacyState();
+				result |= Check(rts::render::TrackLegacyTransform(slot,
+					priorTransform.values), "nonfinite fixture seeds a prior transform");
+				if (published != 0)
+				{
+					rts::render::SeedTrackedLegacyPipelineState();
+					result |= Check(owner->SetGameRenderState(
+						rts::render::GAME_RENDER_STATE_Z_BIAS, 8U) ==
+						rts::render::RENDER_RESULT_OK &&
+						owner->SetGameRenderState(
+						rts::render::GAME_RENDER_STATE_STENCIL_REFERENCE, 0x3fU) ==
+						rts::render::RENDER_RESULT_OK &&
+						owner->SetGameRenderState(
+						rts::render::GAME_RENDER_STATE_ALPHA_BLEND_ENABLE, 1U) ==
+						rts::render::RENDER_RESULT_OK,
+						"nonfinite fixture publishes nondefault pipeline state");
+				}
+				if (owner->BeginGameDisplayIteration() != rts::render::RENDER_RESULT_OK ||
+					owner->Renderer().BeginFrame() != rts::render::RENDER_RESULT_OK)
+					return result | Check(false, "nonfinite fixture starts a real frame");
+
+				rts::render::RenderMatrix4 malformed = priorTransform;
+				malformed.values[element] = invalidValues[invalid];
+				rts::render::GameRenderCommand command = {};
+				command.type = rts::render::GAME_RENDER_COMMAND_SET_TRANSFORM;
+				command.value0 = slot;
+				command.input = &malformed;
+				command.inputBytes = sizeof(malformed);
+				const rts::render::RenderResult commandResult =
+					owner->ExecuteGameRenderCommand(command);
+				rts::render::LegacyPipelineState pipeline;
+				const bool pipelinePublished =
+					rts::render::GetTrackedLegacyPipelineState(&pipeline);
+				// Publish only after observing the rejection so the ordinary getter
+				// can inspect the retained transform of the unpublished fixture.
+				if (!pipelinePublished)
+					rts::render::SeedTrackedLegacyPipelineState();
+				rts::render::LegacyLogicalState after;
+				const bool hasState = rts::render::GetTrackedLegacyLogicalState(&after);
+				const rts::render::RenderMatrix4 &actualTransform = published == 0 ?
+					after.constants.projection : after.constants.view;
+				const bool pipelinePreserved = published == 0 ? !pipelinePublished :
+					pipelinePublished && pipeline.rasterizer.depthBias == -8 &&
+					pipeline.depthStencil.stencilReference == 0x3fU &&
+					pipeline.blend.blendEnable;
+				const rts::render::RenderResult endResult = owner->Renderer().EndFrame(false);
+				if (endResult == rts::render::RENDER_RESULT_OK)
+					result |= Check(owner->Renderer().FinalizeEndedFrame(false) ==
+						rts::render::RENDER_RESULT_OK,
+						"nonfinite RED fixture finalizes an incorrectly accepted command");
+				const rts::render::RenderResult drainResult = owner->Renderer().DrainThreaded();
+				const bool rejectedAtomically = commandResult ==
+					rts::render::RENDER_RESULT_INVALID_ARGUMENT && hasState &&
+					pipelinePreserved && std::memcmp(actualTransform.values,
+					priorTransform.values, sizeof(priorTransform.values)) == 0 &&
+					endResult == rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+					drainResult == rts::render::RENDER_RESULT_OK;
+				if (!rejectedAtomically)
+					std::fprintf(stderr, "Transform case: published=%u invalid=%u element=%u command=%d end=%d\n",
+						published, invalid, element, commandResult, endResult);
+				result |= Check(rejectedAtomically,
+					"plain transform rejects nonfinite values before state publication and reports frame failure");
+			}
+		}
+	}
+	return result;
+}
+
 int TestStencilStateEncoding(NativeW3D2 *owner)
 {
 	int result = 0;
@@ -1174,6 +1267,7 @@ int main()
 		result |= TestNativeHardwareZBias(&w3d);
 		result |= TestNativeCameraBiasSequences(&w3d);
 		result |= TestNativeCommandsPreservePipelineState(&w3d);
+		result |= TestPlainTransformRejectsNonfiniteValues(&w3d);
 		result |= TestStencilStateEncoding(&w3d);
 		const bool usesDedicatedThreadedOwner =
 			rts::render::NativeW3DRecoveryTestAccess::IsThreaded(

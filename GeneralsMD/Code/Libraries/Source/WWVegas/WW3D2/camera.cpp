@@ -76,6 +76,10 @@
 #include "WWMath/matrix4.h"
 #include "Renderer/RenderGameClient.h"
 
+#if defined(_WIN64)
+#include <cmath>
+#endif
+
 
 /***********************************************************************************************
  * CameraClass::CameraClass -- constructor                                                     *
@@ -732,6 +736,54 @@ void CameraClass::Device_To_World_Space(const Vector2 & device_coord,Vector3 * w
  *=============================================================================================*/
 void CameraClass::Apply()
 {
+#if defined(_WIN64)
+	int width,height,bits;
+	bool windowed;
+	WW3D::Get_Render_Target_Resolution(width,height,bits,windowed);
+
+	// Reject malformed raw camera data before frustum math, pixel conversion,
+	// or the first native viewport/transform publication.
+	if (width <= 0 || height <= 0 ||
+		!std::isfinite(Viewport.Min.X) || !std::isfinite(Viewport.Min.Y) ||
+		!std::isfinite(Viewport.Max.X) || !std::isfinite(Viewport.Max.Y) ||
+		!std::isfinite(ZBufferMin) || !std::isfinite(ZBufferMax) ||
+		!std::isfinite(ZNear) || !std::isfinite(ZFar) ||
+		Viewport.Min.X < 0.0f || Viewport.Min.Y < 0.0f ||
+		Viewport.Max.X > 1.0f || Viewport.Max.Y > 1.0f ||
+		Viewport.Min.X > Viewport.Max.X || Viewport.Min.Y > Viewport.Max.Y ||
+		ZBufferMin < 0.0f || ZBufferMin > 1.0f ||
+		ZBufferMax < 0.0f || ZBufferMax > 1.0f ||
+		ZBufferMin > ZBufferMax || ZNear < 0.0f || ZFar <= ZNear ||
+		(Projection == PERSPECTIVE && ZNear == 0.0f))
+	{
+		rts::render::NativeGameRenderOwnerScope scope;
+		rts::render::IGameRenderClientNativeOwner *owner = scope.Get();
+		if (owner != 0)
+			owner->RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
+		return;
+	}
+
+	const unsigned int viewportX =
+		static_cast<unsigned int>(Viewport.Min.X * (float)width);
+	const unsigned int viewportY =
+		static_cast<unsigned int>(Viewport.Min.Y * (float)height);
+	const unsigned int viewportWidth =
+		static_cast<unsigned int>((Viewport.Max.X - Viewport.Min.X) * (float)width);
+	const unsigned int viewportHeight =
+		static_cast<unsigned int>((Viewport.Max.Y - Viewport.Min.Y) * (float)height);
+	if (viewportWidth == 0 || viewportHeight == 0)
+	{
+		rts::render::NativeGameRenderOwnerScope scope;
+		rts::render::IGameRenderClientNativeOwner *owner = scope.Get();
+		if (owner != 0)
+			owner->RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
+		return;
+	}
+
+	Update_Frustum();
+	rts::render::SetGameViewport(viewportX,viewportY,viewportWidth,viewportHeight,
+		ZBufferMin,ZBufferMax);
+#else
 	Update_Frustum();
 
 	int width,height,bits;
@@ -744,6 +796,7 @@ void CameraClass::Apply()
 		static_cast<unsigned int>((Viewport.Max.X - Viewport.Min.X) * (float)width),
 		static_cast<unsigned int>((Viewport.Max.Y - Viewport.Min.Y) * (float)height),
 		ZBufferMin,ZBufferMax);
+#endif
 
 	Matrix4x4 d3dprojection;
 	Get_D3D_Projection_Matrix(&d3dprojection);

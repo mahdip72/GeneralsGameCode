@@ -23,6 +23,7 @@
 #include "WWMath/matrix3d.h"
 #include "WWMath/matrix4.h"
 
+#include <cmath>
 #include <math.h>
 #include <string.h>
 
@@ -279,15 +280,34 @@ void SetGameRenderCamera(void *cameraOpaque)
 		return;
 	}
 
-	Matrix4x4 projection;
-	Matrix3D view;
-	camera->Get_D3D_Projection_Matrix(&projection);
-	camera->Get_View_Matrix(&view);
-
-	GameCameraSnapshot snapshot;
-	CopyMatrix(view, &snapshot.view);
-	CopyMatrix(projection, &snapshot.projection);
 	const ViewportClass &viewport = camera->Get_Viewport();
+	float zNear = 0.0f;
+	float zFar = 1.0f;
+	float minimumDepth = 0.0f;
+	float maximumDepth = 1.0f;
+	camera->Get_Clip_Planes(zNear, zFar);
+	camera->Get_Depth_Range(&minimumDepth, &maximumDepth);
+	// Validate raw camera metadata before projection arithmetic or conversion
+	// of normalized viewport coordinates to unsigned pixel values.
+	if (!std::isfinite(viewport.Min.X) || !std::isfinite(viewport.Min.Y) ||
+		!std::isfinite(viewport.Max.X) || !std::isfinite(viewport.Max.Y) ||
+		!std::isfinite(minimumDepth) || !std::isfinite(maximumDepth) ||
+		!std::isfinite(zNear) || !std::isfinite(zFar) ||
+		viewport.Min.X < 0.0f || viewport.Min.Y < 0.0f ||
+		viewport.Max.X > 1.0f || viewport.Max.Y > 1.0f ||
+		viewport.Min.X > viewport.Max.X || viewport.Min.Y > viewport.Max.Y ||
+		minimumDepth < 0.0f || minimumDepth > 1.0f ||
+		maximumDepth < 0.0f || maximumDepth > 1.0f ||
+		minimumDepth > maximumDepth || zNear < 0.0f || zFar <= zNear ||
+		(camera->Get_Projection_Type() == CameraClass::PERSPECTIVE && zNear == 0.0f))
+	{
+		NativeGameRenderOwnerScope scope;
+		IGameRenderClientNativeOwner *owner = scope.Get();
+		if (owner != 0)
+			owner->RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+		return;
+	}
+
 	const unsigned int viewportX = static_cast<unsigned int>(
 		viewport.Min.X * static_cast<float>(width));
 	const unsigned int viewportY = static_cast<unsigned int>(
@@ -296,12 +316,23 @@ void SetGameRenderCamera(void *cameraOpaque)
 		(viewport.Max.X - viewport.Min.X) * static_cast<float>(width));
 	const unsigned int viewportHeight = static_cast<unsigned int>(
 		(viewport.Max.Y - viewport.Min.Y) * static_cast<float>(height));
-	float zNear = 0.0f;
-	float zFar = 1.0f;
-	float minimumDepth = 0.0f;
-	float maximumDepth = 1.0f;
-	camera->Get_Clip_Planes(zNear, zFar);
-	camera->Get_Depth_Range(&minimumDepth, &maximumDepth);
+	if (viewportWidth == 0 || viewportHeight == 0)
+	{
+		NativeGameRenderOwnerScope scope;
+		IGameRenderClientNativeOwner *owner = scope.Get();
+		if (owner != 0)
+			owner->RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+		return;
+	}
+
+	Matrix4x4 projection;
+	Matrix3D view;
+	camera->Get_D3D_Projection_Matrix(&projection);
+	camera->Get_View_Matrix(&view);
+
+	GameCameraSnapshot snapshot;
+	CopyMatrix(view, &snapshot.view);
+	CopyMatrix(projection, &snapshot.projection);
 	snapshot.viewport = RenderViewport(static_cast<float>(viewportX),
 		static_cast<float>(viewportY), static_cast<float>(viewportWidth),
 		static_cast<float>(viewportHeight), minimumDepth, maximumDepth);

@@ -1105,6 +1105,16 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		{
+			const RenderMatrix4 &transform =
+				*static_cast<const RenderMatrix4 *>(command.input);
+			for (unsigned int index = 0; index < 16; ++index)
+			{
+				if (!IsFiniteGameFloat(transform.values[index]))
+				{
+					RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+					return RENDER_RESULT_INVALID_ARGUMENT;
+				}
+			}
 			LegacyPipelineState pipeline;
 			if (!GetTrackedLegacyPipelineState(&pipeline))
 				SeedTrackedLegacyPipelineState();
