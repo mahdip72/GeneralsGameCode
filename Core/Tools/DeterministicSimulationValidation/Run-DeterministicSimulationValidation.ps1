@@ -2030,6 +2030,9 @@ function Export-LocalCapacityAiCorpus {
             containerEngineEpoch = $artifact.containerEngineEpoch
             payloadMagic = $artifact.payloadMagic
             skirmishAiReplayEpoch = $artifact.skirmishAiReplayEpoch
+            pathfindingReplayEpoch = $artifact.pathfindingReplayEpoch
+            replayQualificationVersion = $artifact.replayQualificationVersion
+            replayQualification = $artifact.replayQualification
             exportedUtc = $artifact.exportedUtc
         }) | Out-Null
     }

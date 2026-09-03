@@ -22,6 +22,11 @@ function Get-Stage5ReplayTitleContract {
             epoch = 1
             marker = '[GeneralsAIPlanningEpoch=1]'
             markerSuffix = ' [GeneralsAIPlanningEpoch=1]'
+            pathfindingEpoch = 1
+            pathfindingMarker = '[GeneralsPathfindingEpoch=1]'
+            pathfindingMarkerSuffix = ' [GeneralsPathfindingEpoch=1]'
+            qualificationVersion = 2
+            qualification = 'current-path-qualified'
         }
     }
     return [pscustomobject]@{
@@ -29,6 +34,11 @@ function Get-Stage5ReplayTitleContract {
         epoch = 3
         marker = '[SkirmishAIEpoch=3]'
         markerSuffix = ' [SkirmishAIEpoch=3]'
+        pathfindingEpoch = $null
+        pathfindingMarker = $null
+        pathfindingMarkerSuffix = $null
+        qualificationVersion = 2
+        qualification = 'current-ai-qualified'
     }
 }
 
@@ -208,6 +218,95 @@ function Get-Stage5ExporterUtf16String {
     throw "$Context wide string is unterminated."
 }
 
+function Get-Stage5ReplayQualification {
+    param(
+        [Parameter(Mandatory = $true)][string]$VersionTime,
+        [Parameter(Mandatory = $true)][object]$ReplayContract,
+        [Parameter(Mandatory = $true)][string]$Context
+    )
+    $markerMatches = @([regex]::Matches($VersionTime,
+        '\[(?:GeneralsPathfinding|GeneralsAI|SkirmishAI)[^\]]*(?:\]|$)'))
+    $markerValues = @($markerMatches | ForEach-Object { $_.Value })
+
+    if ($ReplayContract.title -ceq 'Generals') {
+        $aiMarkers = @($markerValues | Where-Object {
+            $_ -match '^\[GeneralsAI'
+        })
+        $pathMarkers = @($markerValues | Where-Object {
+            $_ -match '^\[GeneralsPathfinding'
+        })
+        $zeroHourMarkers = @($markerValues | Where-Object {
+            $_ -match '^\[SkirmishAI'
+        })
+        Assert-Stage5ExporterCondition ($aiMarkers.Count -eq 1 -and
+            $aiMarkers[0] -ceq $ReplayContract.marker) `
+            "$Context does not carry exactly one current Generals AI marker."
+        Assert-Stage5ExporterCondition ($zeroHourMarkers.Count -eq 0) `
+            "$Context mixes Generals and Zero Hour replay markers."
+
+        if ($pathMarkers.Count -eq 0) {
+            Assert-Stage5ExporterCondition ($markerValues.Count -eq 1 -and
+                $VersionTime.EndsWith($ReplayContract.markerSuffix,
+                    [StringComparison]::Ordinal)) `
+                "$Context has an invalid legacy Generals AI-only marker suffix."
+            return [pscustomobject]@{
+                pathfindingReplayEpoch = $null
+                pathfindingReplayMarker = $null
+                replayQualificationVersion = 1
+                replayQualification = 'legacy-ai-only'
+            }
+        }
+
+        $pairSuffix = $ReplayContract.pathfindingMarkerSuffix +
+            $ReplayContract.markerSuffix
+        Assert-Stage5ExporterCondition ($pathMarkers.Count -eq 1 -and
+            $pathMarkers[0] -ceq $ReplayContract.pathfindingMarker -and
+            $markerValues.Count -eq 2 -and
+            $markerValues[0] -ceq $ReplayContract.pathfindingMarker -and
+            $markerValues[1] -ceq $ReplayContract.marker -and
+            $VersionTime.EndsWith($pairSuffix, [StringComparison]::Ordinal)) `
+            "$Context does not carry the exact current Generals pathfinding/AI marker pair."
+        return [pscustomobject]@{
+            pathfindingReplayEpoch = $ReplayContract.pathfindingEpoch
+            pathfindingReplayMarker = $ReplayContract.pathfindingMarker
+            replayQualificationVersion = $ReplayContract.qualificationVersion
+            replayQualification = $ReplayContract.qualification
+        }
+    }
+
+    Assert-Stage5ExporterCondition ($markerValues.Count -eq 1 -and
+        $markerValues[0] -ceq $ReplayContract.marker -and
+        $VersionTime.EndsWith($ReplayContract.markerSuffix,
+            [StringComparison]::Ordinal)) `
+        "$Context does not carry exactly one current $($ReplayContract.title) epoch-$($ReplayContract.epoch) marker."
+    return [pscustomobject]@{
+        pathfindingReplayEpoch = $null
+        pathfindingReplayMarker = $null
+        replayQualificationVersion = $ReplayContract.qualificationVersion
+        replayQualification = $ReplayContract.qualification
+    }
+}
+
+function Assert-Stage5ReplayFreshQualification {
+    param(
+        [Parameter(Mandatory = $true)][object]$Header,
+        [Parameter(Mandatory = $true)][string]$ExpectedTitle,
+        [Parameter(Mandatory = $true)][string]$Context
+    )
+    $replayContract = Get-Stage5ReplayTitleContract $ExpectedTitle $Context
+    if ($ExpectedTitle -ceq 'Generals') {
+        Assert-Stage5ExporterCondition (
+            [int]$Header.replayQualificationVersion -eq
+                [int]$replayContract.qualificationVersion -and
+            [string]$Header.replayQualification -ceq
+                [string]$replayContract.qualification -and
+            [int]$Header.pathfindingReplayEpoch -eq
+                [int]$replayContract.pathfindingEpoch) `
+            "$Context requires the current Generals pathfinding/AI marker pair."
+    }
+    return $Header
+}
+
 function Read-Stage5ReplayContainer {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -260,13 +359,8 @@ function Read-Stage5ReplayContainer {
             }
             [void](Get-Stage5ExporterUtf16String $reader 'Replay version')
             $versionTime = Get-Stage5ExporterUtf16String $reader 'Replay version-time'
-            $markerMatches = [regex]::Matches($versionTime,
-                '\[(?:GeneralsAI|SkirmishAI)[^\]]*\]')
-            Assert-Stage5ExporterCondition ($markerMatches.Count -eq 1 -and
-                $markerMatches[0].Value -ceq $replayContract.marker -and
-                $versionTime.EndsWith($replayContract.markerSuffix,
-                    [StringComparison]::Ordinal)) `
-                "Replay file does not carry exactly one current $($replayContract.title) epoch-$($replayContract.epoch) marker: $full"
+            $qualification = Get-Stage5ReplayQualification $versionTime `
+                $replayContract "Replay file '$full'"
             return [pscustomobject]@{
                 magic = $magic
                 schemaVersion = [int]$schemaVersion
@@ -275,6 +369,10 @@ function Read-Stage5ReplayContainer {
                 genrep = $genrep
                 skirmishAiReplayEpoch = $replayContract.epoch
                 versionTime = $versionTime
+                pathfindingReplayEpoch = $qualification.pathfindingReplayEpoch
+                pathfindingReplayMarker = $qualification.pathfindingReplayMarker
+                replayQualificationVersion = $qualification.replayQualificationVersion
+                replayQualification = $qualification.replayQualification
             }
         }
         finally { $reader.Dispose() }
@@ -498,6 +596,8 @@ function Export-Stage5FreshReplayArtifact {
         Assert-Stage5ExporterCondition ($copy.sha256 -ceq $ExpectedSha256.ToUpperInvariant()) `
             "Retained replay source SHA-256 mismatch. Expected $ExpectedSha256, got $($copy.sha256)."
         $header = Read-Stage5ReplayContainer -Path $temporaryFull -ExpectedTitle $title
+        Assert-Stage5ReplayFreshQualification $header $title `
+            'Fresh replay export' | Out-Null
         Assert-Stage5ExporterCondition ((Get-Stage5ExporterSha256 $temporaryFull) -ceq $copy.sha256) `
             'Temporary replay copy SHA-256 differs from the stable source snapshot.'
         [IO.File]::Move($temporaryFull, $destinationFull)
@@ -511,10 +611,17 @@ function Export-Stage5FreshReplayArtifact {
         Assert-Stage5ExporterCondition ($destinationSha256 -ceq $copy.sha256) `
             'Replay export destination SHA-256 differs from the source snapshot.'
         $destinationHeader = Read-Stage5ReplayContainer -Path $destinationFull -ExpectedTitle $title
+        Assert-Stage5ReplayFreshQualification $destinationHeader $title `
+            'Fresh replay export destination' | Out-Null
         Assert-Stage5ExporterCondition ($destinationHeader.magic -ceq $header.magic -and
             $destinationHeader.schemaVersion -eq $header.schemaVersion -and
             $destinationHeader.engineEpoch -eq $header.engineEpoch -and
-            $destinationHeader.skirmishAiReplayEpoch -eq $header.skirmishAiReplayEpoch) `
+            $destinationHeader.skirmishAiReplayEpoch -eq $header.skirmishAiReplayEpoch -and
+            $destinationHeader.pathfindingReplayEpoch -eq $header.pathfindingReplayEpoch -and
+            $destinationHeader.replayQualificationVersion -eq
+                $header.replayQualificationVersion -and
+            $destinationHeader.replayQualification -ceq
+                $header.replayQualification) `
             'Replay export destination header differs from the validated source snapshot.'
         return [pscustomobject]@{
             origin = Get-Stage5ExporterMetadataValue $Metadata 'origin'
@@ -535,6 +642,10 @@ function Export-Stage5FreshReplayArtifact {
             containerEngineEpoch = $destinationHeader.engineEpoch
             payloadMagic = $destinationHeader.genrep
             skirmishAiReplayEpoch = $destinationHeader.skirmishAiReplayEpoch
+            pathfindingReplayEpoch = $destinationHeader.pathfindingReplayEpoch
+            pathfindingReplayMarker = $destinationHeader.pathfindingReplayMarker
+            replayQualificationVersion = $destinationHeader.replayQualificationVersion
+            replayQualification = $destinationHeader.replayQualification
             exportedUtc = ([DateTime]::UtcNow).ToString('o')
         }
     }
@@ -554,11 +665,16 @@ function Assert-Stage5ExporterRecord {
         [Parameter(Mandatory = $true)][string]$ExecutableSha256,
         [switch]$AllowMissingSource
     )
-    foreach ($name in @('origin', 'title', 'category', 'scenario', 'seed',
+    $requiredNames = @('origin', 'title', 'category', 'scenario', 'seed',
         'runNonce', 'executableSha256', 'sourceProfileRoot', 'sourcePath',
         'destinationPath', 'sourceSha256', 'destinationSha256',
         'containerMagic', 'containerSchemaVersion', 'containerEngineEpoch',
-        'payloadMagic', 'skirmishAiReplayEpoch')) {
+        'payloadMagic', 'skirmishAiReplayEpoch')
+    if ($Title -ceq 'Generals') {
+        $requiredNames += @('pathfindingReplayEpoch',
+            'replayQualificationVersion', 'replayQualification')
+    }
+    foreach ($name in $requiredNames) {
         Assert-Stage5ExporterCondition ($null -ne $Record.PSObject.Properties[$name]) `
             "Corpus manifest record is missing '$name'."
     }
@@ -626,16 +742,35 @@ function Assert-Stage5ExporterRecord {
         [string]$Record.payloadMagic -ceq 'GENREP' -and
         [int]$Record.skirmishAiReplayEpoch -eq $replayContract.epoch) `
         'Corpus manifest record has an invalid native replay container contract.'
+    if ($Title -ceq 'Generals') {
+        Assert-Stage5ExporterCondition ([int]$Record.pathfindingReplayEpoch -eq
+            [int]$replayContract.pathfindingEpoch -and
+            [int]$Record.replayQualificationVersion -eq
+                [int]$replayContract.qualificationVersion -and
+            [string]$Record.replayQualification -ceq
+                [string]$replayContract.qualification) `
+            'Corpus manifest record has invalid current Generals path qualification metadata.'
+    }
     $replayEpochProperty = $Record.PSObject.Properties['replayEpoch']
     if ($null -ne $replayEpochProperty) {
         Assert-Stage5ExporterCondition ([int]$replayEpochProperty.Value -eq $replayContract.epoch) `
             'Corpus manifest record completion epoch does not match its title.'
     }
     $header = Read-Stage5ReplayContainer -Path $destinationFull -ExpectedTitle $Title
-    Assert-Stage5ExporterCondition ($header.magic -ceq 'RPL3' -and
+    Assert-Stage5ReplayFreshQualification $header $Title `
+        'Corpus manifest record destination' | Out-Null
+    $headerMatchesRecord = ($header.magic -ceq 'RPL3' -and
         $header.schemaVersion -eq 2 -and $header.engineEpoch -eq 1 -and
         $header.genrep -ceq 'GENREP' -and
-        $header.skirmishAiReplayEpoch -eq $replayContract.epoch) `
+        $header.skirmishAiReplayEpoch -eq $replayContract.epoch)
+    if ($Title -ceq 'Generals') {
+        $headerMatchesRecord = ($headerMatchesRecord -and
+            $header.pathfindingReplayEpoch -eq $Record.pathfindingReplayEpoch -and
+            $header.replayQualificationVersion -eq
+                $Record.replayQualificationVersion -and
+            $header.replayQualification -ceq $Record.replayQualification)
+    }
+    Assert-Stage5ExporterCondition $headerMatchesRecord `
         'Corpus manifest record destination failed native replay revalidation.'
 }
 
@@ -697,7 +832,9 @@ function Get-Stage5ExporterRecordIdentity {
         'executableSha256', 'sourceProfileRoot', 'sourcePath', 'sourceSha256',
         'destinationPath', 'destinationSha256', 'length', 'containerMagic',
         'containerSchemaVersion', 'containerEngineEpoch', 'payloadMagic',
-        'skirmishAiReplayEpoch', 'sequence', 'configuration', 'repeat',
+        'skirmishAiReplayEpoch', 'pathfindingReplayEpoch',
+        'replayQualificationVersion', 'replayQualification', 'sequence',
+        'configuration', 'repeat',
         'replayEpoch', 'replaySha256', 'exportedUtc')
     $values = New-Object 'Collections.Generic.List[string]'
     foreach ($name in $names) {
@@ -1227,6 +1364,15 @@ function Convert-Stage5FreshReplayCorpusManifestToFixtures {
             containerEngineEpoch = [int]$record.containerEngineEpoch
             payloadMagic = [string]$record.payloadMagic
             skirmishAiReplayEpoch = [int]$record.skirmishAiReplayEpoch
+            pathfindingReplayEpoch = if ($null -ne $record.PSObject.Properties['pathfindingReplayEpoch']) {
+                [int]$record.pathfindingReplayEpoch
+            } else { $null }
+            replayQualificationVersion = if ($null -ne $record.PSObject.Properties['replayQualificationVersion']) {
+                [int]$record.replayQualificationVersion
+            } else { $null }
+            replayQualification = if ($null -ne $record.PSObject.Properties['replayQualification']) {
+                [string]$record.replayQualification
+            } else { $null }
             sequence = if ($null -ne $record.PSObject.Properties['sequence']) {
                 [int]$record.sequence
             } else { $null }

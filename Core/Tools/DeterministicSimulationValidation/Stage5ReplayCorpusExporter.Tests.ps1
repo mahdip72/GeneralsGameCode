@@ -33,6 +33,138 @@ function Assert-Throws {
     }
 }
 
+function Assert-CurrentGeneralsReplayQualification {
+    param([object]$Record, [string]$Context)
+    $versionProperty = $Record.PSObject.Properties['replayQualificationVersion']
+    $qualificationProperty = $Record.PSObject.Properties['replayQualification']
+    $pathEpochProperty = $Record.PSObject.Properties['pathfindingReplayEpoch']
+    $valid = $false
+    if ($null -ne $versionProperty -and $null -ne $qualificationProperty -and
+        $null -ne $pathEpochProperty) {
+        $valid = ([int]$versionProperty.Value -eq 2 -and
+            [string]$qualificationProperty.Value -ceq 'current-path-qualified' -and
+            [int]$pathEpochProperty.Value -eq 1)
+    }
+    Assert-True $valid `
+        "$Context does not carry the versioned current Generals path qualification."
+}
+
+function Set-TestRecordProperty {
+    param([object]$Record, [string]$Name, [object]$Value)
+    $property = $Record.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        $Record | Add-Member -MemberType NoteProperty -Name $Name -Value $Value |
+            Out-Null
+    }
+    else {
+        [void]($property.Value = $Value)
+    }
+}
+
+function Assert-LocalCapacityRunnerPreservesReplayQualification {
+    $runnerPath = Join-Path $PSScriptRoot 'Run-DeterministicSimulationValidation.ps1'
+    $tokens = $null
+    $parseErrors = $null
+    $runnerAst = [System.Management.Automation.Language.Parser]::ParseFile(
+        $runnerPath, [ref]$tokens, [ref]$parseErrors)
+    Assert-True ($parseErrors.Count -eq 0) `
+        'LocalCapacity runner parses for replay qualification integration testing.'
+    $functionAst = $runnerAst.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Export-LocalCapacityAiCorpus'
+    }, $true)
+    Assert-True ($null -ne $functionAst) `
+        'LocalCapacity runner exposes the replay corpus export function.'
+    if ($null -eq $functionAst) { return }
+
+    $recordAst = $functionAst.Find({
+        param($node)
+        if ($node -isnot [System.Management.Automation.Language.HashtableAst]) {
+            return $false
+        }
+        $keys = @($node.KeyValuePairs | ForEach-Object {
+            $keyAst = $_.Item1
+            if ($keyAst -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                [string]$keyAst.Value
+            }
+            else {
+                [string]$keyAst.Extent.Text
+            }
+        })
+        return ($keys -contains 'sequence' -and
+            $keys -contains 'skirmishAiReplayEpoch')
+    }, $true)
+    Assert-True ($null -ne $recordAst) `
+        'LocalCapacity runner reconstructs a native replay record.'
+    if ($null -eq $recordAst) { return }
+
+    foreach ($field in @('pathfindingReplayEpoch',
+            'replayQualificationVersion', 'replayQualification')) {
+        $fieldPairs = @($recordAst.KeyValuePairs | Where-Object {
+            $keyAst = $_.Item1
+            $keyName = if ($keyAst -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                [string]$keyAst.Value
+            }
+            else {
+                [string]$keyAst.Extent.Text
+            }
+            $keyName -ceq $field
+        })
+        Assert-True ($fieldPairs.Count -eq 1) `
+            "LocalCapacity runner record must preserve exactly one '$field' field."
+    }
+
+    $entry = [pscustomobject]@{
+        sequence = 73
+        configuration = 'parallel-3'
+        repeat = 2
+        scenario = '4v3'
+        seed = 4242
+    }
+    $completion = [pscustomobject]@{
+        runNonce = 'ABCD-000073-00000002'
+        replayEpoch = 17
+        replaySha256 = ('C' * 64)
+    }
+    $artifact = [pscustomobject]@{
+        origin = 'artifact-origin-sentinel'
+        title = 'artifact-title-sentinel'
+        category = 'artifact-category-sentinel'
+        executableSha256 = ('D' * 64)
+        sourceProfileRoot = 'artifact-profile-sentinel'
+        sourcePath = 'artifact-source-sentinel'
+        sourceSha256 = ('E' * 64)
+        destinationPath = 'artifact-destination-sentinel'
+        destinationSha256 = ('F' * 64)
+        length = [Int64]987654
+        containerMagic = 'artifact-container-magic'
+        containerSchemaVersion = 19
+        containerEngineEpoch = 23
+        payloadMagic = 'artifact-payload-magic'
+        skirmishAiReplayEpoch = 29
+        pathfindingReplayEpoch = 31
+        replayQualificationVersion = 37
+        replayQualification = 'artifact-qualification-sentinel'
+        exportedUtc = 'artifact-exported-utc-sentinel'
+    }
+    $evaluatedRecord = Invoke-Expression $recordAst.Extent.Text
+    Assert-True ($null -ne $evaluatedRecord) `
+        'LocalCapacity runner record AST evaluates with explicit entry, completion, and artifact inputs.'
+    Assert-True ($evaluatedRecord.sequence -eq $entry.sequence -and
+        $evaluatedRecord.configuration -ceq $entry.configuration -and
+        $evaluatedRecord.repeat -eq $entry.repeat -and
+        $evaluatedRecord.scenario -ceq $entry.scenario -and
+        $evaluatedRecord.seed -eq $entry.seed -and
+        $evaluatedRecord.runNonce -ceq $completion.runNonce -and
+        $evaluatedRecord.replayEpoch -eq $completion.replayEpoch -and
+        $evaluatedRecord.replaySha256 -ceq $completion.replaySha256 -and
+        $evaluatedRecord.pathfindingReplayEpoch -eq $artifact.pathfindingReplayEpoch -and
+        $evaluatedRecord.replayQualificationVersion -eq $artifact.replayQualificationVersion -and
+        $evaluatedRecord.replayQualification -ceq $artifact.replayQualification) `
+        'LocalCapacity runner record AST does not preserve entry, completion, and qualification values.'
+}
+
 function Get-TestSha256 {
     param([string]$Path)
     $sha = [Security.Cryptography.SHA256]::Create()
@@ -119,6 +251,8 @@ function New-TestMetadata {
     }
 }
 
+Assert-LocalCapacityRunnerPreservesReplayQualification
+
 $scratchFull = [IO.Path]::GetFullPath($ScratchRoot).TrimEnd('\')
 $scratchRootName = [IO.Path]::GetPathRoot($scratchFull)
 Assert-True (-not [string]::IsNullOrWhiteSpace($scratchRootName) -and
@@ -187,7 +321,7 @@ try {
     New-Item -ItemType Directory -Path $generalsSourceDirectory, $generalsCorpusRoot -Force | Out-Null
     $generalsSourcePath = Join-Path $generalsSourceDirectory 'SkirmishAI-4v2-1729-AE-000001.rep'
     [IO.File]::WriteAllBytes($generalsSourcePath,
-        (New-TestReplayBytes -AiMarker ' [GeneralsAIPlanningEpoch=1]'))
+        (New-TestReplayBytes -AiMarker ' [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1]'))
     $generalsSourceSha256 = Get-TestSha256 $generalsSourcePath
     $generalsRunNonce = '00AE-000001-00000001'
     $generalsCompletion = 'SKIRMISH_AI_TEST_COMPLETE seed=1729 scenario=4v2 ' +
@@ -208,6 +342,8 @@ try {
     Assert-True ($generalsRecord.title -ceq 'Generals' -and
         $generalsRecord.skirmishAiReplayEpoch -eq 1) `
         'Generals export did not retain the title-specific epoch-1 replay marker.'
+    Assert-CurrentGeneralsReplayQualification $generalsRecord `
+        'Generals export'
     $generalsResultsPath = Join-Path $generalsTaskRoot 'validation-results.json'
     [IO.File]::WriteAllText($generalsResultsPath, '{"status":"passed"}')
     $generalsIndex = Write-Stage5FreshReplayArtifactIndex `
@@ -222,6 +358,202 @@ try {
         -Records @($generalsRecord) -ValidationResultsPath $generalsResultsPath
     Assert-True (Test-Path -LiteralPath $generalsManifest.path -PathType Leaf) `
         'Generals corpus manifest did not accept a title-matched epoch-1 record.'
+    $generalsManifestDocument = Get-Content -LiteralPath $generalsManifest.path -Raw |
+        ConvertFrom-Json
+    Assert-CurrentGeneralsReplayQualification $generalsManifestDocument.records[0] `
+        'Generals corpus manifest record'
+
+    # A legacy Generals replay carrying only the AI epoch remains readable for
+    # diagnostics, but it is not current-path-qualified fresh-corpus input.
+    $legacyGeneralsSourcePath = Join-Path $generalsSourceDirectory 'legacy-ai-only.rep'
+    [IO.File]::WriteAllBytes($legacyGeneralsSourcePath,
+        (New-TestReplayBytes -AiMarker ' [GeneralsAIPlanningEpoch=1]'))
+    $legacyGeneralsSourceSha256 = Get-TestSha256 $legacyGeneralsSourcePath
+    $legacyGeneralsCompletion = 'SKIRMISH_AI_TEST_COMPLETE seed=1729 scenario=4v2 ' +
+        'run_nonce=00AE-000001-00000008 replay_epoch=1 replay_sha256=' +
+        $legacyGeneralsSourceSha256 + ' replay_retained="' +
+        $legacyGeneralsSourcePath + '"'
+    $legacyGeneralsRetention = Get-Stage5ReplayCompletionFields `
+        -Output $legacyGeneralsCompletion -ExpectedSeed 1729 `
+        -ExpectedScenario '4v2' -ExpectedTitle 'Generals' `
+        -Context 'legacy Generals diagnostic completion'
+    Assert-True ($legacyGeneralsRetention.replayEpoch -eq 1 -and
+        $legacyGeneralsRetention.replayRetained -ceq $legacyGeneralsSourcePath) `
+        'legacy Generals AI-only completion was not preserved for diagnostics.'
+    $exporterModule = Get-Module -Name Stage5ReplayCorpusExporter |
+        Select-Object -First 1
+    $legacyGeneralsHeader = & $exporterModule {
+        param([string]$ReplayPath)
+        Read-Stage5ReplayContainer -Path $ReplayPath -ExpectedTitle 'Generals'
+    } $legacyGeneralsSourcePath
+    Assert-True ($legacyGeneralsHeader.skirmishAiReplayEpoch -eq 1 -and
+        $legacyGeneralsHeader.versionTime.EndsWith(
+            '[GeneralsAIPlanningEpoch=1]', [StringComparison]::Ordinal)) `
+        'generic replay reading did not preserve the legacy Generals AI-only classification.'
+    Assert-Throws {
+        Export-Stage5FreshReplayArtifact `
+            -SourcePath $legacyGeneralsSourcePath `
+            -ExpectedSha256 $legacyGeneralsSourceSha256 `
+            -TaskRoot $generalsTaskRoot -TaskRunRoot $generalsTaskRunRoot `
+            -ProfileRoot $generalsProfileRoot `
+            -CorpusExportRoot (Join-Path $generalsTaskRoot 'legacy-ai-only-corpus') `
+            -Metadata (New-TestMetadata '00AE-000001-00000008' '4v2' 1729 `
+                'native-fresh-ai' 'Generals')
+    } 'pathfinding|current.*path|marker|replay' `
+        'fresh Generals export rejects a legacy AI-only replay'
+
+    $invalidGeneralsMarkers = @(
+        [pscustomobject]@{
+            name = 'path-only'
+            marker = ' [GeneralsPathfindingEpoch=1]'
+            nonce = '00AE-000001-00000009'
+        }
+        [pscustomobject]@{
+            name = 'future-path-epoch'
+            marker = ' [GeneralsPathfindingEpoch=2] [GeneralsAIPlanningEpoch=1]'
+            nonce = '00AE-000001-0000000A'
+        }
+        [pscustomobject]@{
+            name = 'future-ai-epoch'
+            marker = ' [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=2]'
+            nonce = '00AE-000001-0000000B'
+        }
+        [pscustomobject]@{
+            name = 'reversed-pair'
+            marker = ' [GeneralsAIPlanningEpoch=1] [GeneralsPathfindingEpoch=1]'
+            nonce = '00AE-000001-0000000C'
+        }
+        [pscustomobject]@{
+            name = 'duplicate-path'
+            marker = ' [GeneralsPathfindingEpoch=1] [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1]'
+            nonce = '00AE-000001-0000000D'
+        }
+        [pscustomobject]@{
+            name = 'duplicate-ai'
+            marker = ' [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1] [GeneralsAIPlanningEpoch=1]'
+            nonce = '00AE-000001-0000000E'
+        }
+        [pscustomobject]@{
+            name = 'malformed-path-prefix'
+            marker = ' [GeneralsPathfindingEpoch] [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1]'
+            nonce = '00AE-000001-0000000F'
+        }
+        [pscustomobject]@{
+            name = 'malformed-ai-prefix'
+            marker = ' [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch] [GeneralsAIPlanningEpoch=1]'
+            nonce = '00AE-000001-00000010'
+        }
+        [pscustomobject]@{
+            name = 'extra-suffix'
+            marker = ' [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1] trailing'
+            nonce = '00AE-000001-00000011'
+        }
+        [pscustomobject]@{
+            name = 'mixed-title-marker'
+            marker = ' [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1] [SkirmishAIEpoch=3]'
+            nonce = '00AE-000001-00000012'
+        }
+    )
+    foreach ($invalidMarker in $invalidGeneralsMarkers) {
+        $invalidPath = Join-Path $generalsSourceDirectory `
+            ('invalid-generals-{0}.rep' -f $invalidMarker.name)
+        [IO.File]::WriteAllBytes($invalidPath,
+            (New-TestReplayBytes -AiMarker $invalidMarker.marker))
+        Assert-Throws {
+            Export-Stage5FreshReplayArtifact `
+                -SourcePath $invalidPath -ExpectedSha256 (Get-TestSha256 $invalidPath) `
+                -TaskRoot $generalsTaskRoot -TaskRunRoot $generalsTaskRunRoot `
+                -ProfileRoot $generalsProfileRoot `
+                -CorpusExportRoot (Join-Path $generalsTaskRoot `
+                    ('invalid-generals-{0}-corpus' -f $invalidMarker.name)) `
+                -Metadata (New-TestMetadata $invalidMarker.nonce '4v2' 1729 `
+                    'native-fresh-ai' 'Generals')
+        } 'pathfinding|current.*path|marker|epoch|title|replay' `
+            ('fresh Generals export rejects {0} marker' -f $invalidMarker.name)
+    }
+
+    $zeroHourGeneralsPairPath = Join-Path $generalsSourceDirectory `
+        'zerohour-with-generals-path-pair.rep'
+    [IO.File]::WriteAllBytes($zeroHourGeneralsPairPath,
+        (New-TestReplayBytes -AiMarker ' [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1]'))
+    Assert-Throws {
+        Export-Stage5FreshReplayArtifact `
+            -SourcePath $zeroHourGeneralsPairPath `
+            -ExpectedSha256 (Get-TestSha256 $zeroHourGeneralsPairPath) `
+            -TaskRoot $generalsTaskRoot -TaskRunRoot $generalsTaskRunRoot `
+            -ProfileRoot $generalsProfileRoot `
+            -CorpusExportRoot (Join-Path $generalsTaskRoot 'zerohour-generals-pair-corpus') `
+            -Metadata (New-TestMetadata '00AE-000001-00000013' '4v2' 1729 `
+                'native-fresh-ai' 'ZeroHour')
+    } 'pathfinding|current.*path|marker|epoch|title|replay' `
+        'Zero Hour export rejects a Generals pathfinding marker pair'
+
+    # Qualification metadata must not promote old bytes: even a forged record
+    # claiming version 2/current path qualification is re-read from disk.
+    $forgedMetadataCorpusRoot = Join-Path $generalsTaskRoot 'forged-legacy-corpus'
+    $forgedMetadataDirectory = Join-Path $forgedMetadataCorpusRoot 'Generals\native-fresh-ai'
+    New-Item -ItemType Directory -Path $forgedMetadataDirectory -Force | Out-Null
+    $forgedDestinationPath = Join-Path $forgedMetadataDirectory 'legacy-ai-only.rep'
+    [IO.File]::WriteAllBytes($forgedDestinationPath,
+        [IO.File]::ReadAllBytes($legacyGeneralsSourcePath))
+    $forgedGeneralsRecord = [pscustomobject]@{}
+    foreach ($property in $generalsRecord.PSObject.Properties) {
+        $forgedGeneralsRecord | Add-Member -MemberType NoteProperty `
+            -Name $property.Name -Value $property.Value
+    }
+    Set-TestRecordProperty $forgedGeneralsRecord 'title' 'Generals'
+    Set-TestRecordProperty $forgedGeneralsRecord 'sourcePath' $legacyGeneralsSourcePath
+    Set-TestRecordProperty $forgedGeneralsRecord 'sourceSha256' $legacyGeneralsSourceSha256
+    Set-TestRecordProperty $forgedGeneralsRecord 'destinationPath' $forgedDestinationPath
+    Set-TestRecordProperty $forgedGeneralsRecord 'destinationSha256' $legacyGeneralsSourceSha256
+    Set-TestRecordProperty $forgedGeneralsRecord 'length' ([Int64](Get-Item -LiteralPath $legacyGeneralsSourcePath).Length)
+    Set-TestRecordProperty $forgedGeneralsRecord 'replayQualificationVersion' 2
+    Set-TestRecordProperty $forgedGeneralsRecord 'replayQualification' 'current-path-qualified'
+    Set-TestRecordProperty $forgedGeneralsRecord 'pathfindingReplayEpoch' 1
+    Assert-Throws {
+        Write-Stage5FreshReplayArtifactIndex `
+            -TaskRoot $generalsTaskRoot -CorpusExportRoot $forgedMetadataCorpusRoot `
+            -Title 'Generals' -ExecutableSha256 ('A' * 64) `
+            -Records @($forgedGeneralsRecord) -ValidationResultsPath $generalsResultsPath
+    } 'pathfinding|current.*path|marker|replay' `
+        'artifact index rejects forged current-path metadata over legacy bytes'
+    Assert-Throws {
+        Write-Stage5FreshReplayCorpusManifest `
+            -TaskRoot $generalsTaskRoot -CorpusExportRoot $forgedMetadataCorpusRoot `
+            -Title 'Generals' -ExecutableSha256 ('A' * 64) `
+            -Records @($forgedGeneralsRecord) -ValidationResultsPath $generalsResultsPath
+    } 'pathfinding|current.*path|marker|replay' `
+        'corpus manifest rejects forged current-path metadata over legacy bytes'
+
+    # A record without the versioned qualification fields is historical V1
+    # proof and cannot be silently promoted into a fresh corpus.
+    $v1GeneralsDestinationPath = Join-Path $forgedMetadataDirectory 'unversioned-pair.rep'
+    [IO.File]::WriteAllBytes($v1GeneralsDestinationPath,
+        [IO.File]::ReadAllBytes($generalsSourcePath))
+    $v1GeneralsRecord = [pscustomobject]@{}
+    foreach ($property in $generalsRecord.PSObject.Properties) {
+        $v1GeneralsRecord | Add-Member -MemberType NoteProperty `
+            -Name $property.Name -Value $property.Value
+    }
+    Set-TestRecordProperty $v1GeneralsRecord 'sourcePath' $generalsSourcePath
+    Set-TestRecordProperty $v1GeneralsRecord 'sourceSha256' $generalsSourceSha256
+    Set-TestRecordProperty $v1GeneralsRecord 'destinationPath' $v1GeneralsDestinationPath
+    Set-TestRecordProperty $v1GeneralsRecord 'destinationSha256' $generalsSourceSha256
+    Set-TestRecordProperty $v1GeneralsRecord 'length' ([Int64](Get-Item -LiteralPath $generalsSourcePath).Length)
+    foreach ($propertyName in @('replayQualificationVersion',
+            'replayQualification', 'pathfindingReplayEpoch')) {
+        $property = $v1GeneralsRecord.PSObject.Properties[$propertyName]
+        if ($null -ne $property) {
+            $v1GeneralsRecord.PSObject.Properties.Remove($propertyName)
+        }
+    }
+    Assert-Throws {
+        Write-Stage5FreshReplayArtifactIndex `
+            -TaskRoot $generalsTaskRoot -CorpusExportRoot $forgedMetadataCorpusRoot `
+            -Title 'Generals' -ExecutableSha256 ('A' * 64) `
+            -Records @($v1GeneralsRecord) -ValidationResultsPath $generalsResultsPath
+    } 'qualification|version|current|path|record' `
+        'artifact index rejects unversioned Generals qualification proof'
 
     # Cross-title and mixed-marker negatives must remain rejected even when a
     # marker from another title would satisfy the current hard-coded parser.
