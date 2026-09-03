@@ -2997,6 +2997,161 @@ function New-Stage5LiveRoleTestPlan {
     }
 }
 
+function Assert-Stage5LivePlanPrelaunchBinding {
+    # Execute real function bodies without the runner's top-level workflow.
+    # No test executable is written: even an omitted guard cannot start a child.
+    $parseTokens = $null; $parseErrors = $null
+    $tree = [System.Management.Automation.Language.Parser]::ParseFile(
+        (Join-Path $PSScriptRoot 'Run-DeterministicSimulationValidation.ps1'),
+        [ref]$parseTokens, [ref]$parseErrors)
+    Assert-True ($parseErrors.Count -eq 0) 'live plan prelaunch runner parses without errors'
+    foreach ($definition in $tree.EndBlock.Statements) {
+        if ($definition -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
+            Invoke-Expression $definition.Extent.Text
+        }
+    }
+
+    $directory = Join-Path $root 'live-plan-prelaunch'
+    New-Item -ItemType Directory -Path $directory | Out-Null
+    $executable = Join-Path $directory ('never-created-' + [Guid]::NewGuid().ToString('N') + '.exe')
+    Assert-True (-not (Test-Path -LiteralPath $executable)) 'prelaunch fixture executable cannot run'
+    $plan = New-Stage5LiveRoleTestPlan
+    foreach ($entry in $plan.entries) {
+        $entryDirectory = Join-Path $directory $entry.entryId
+        $entry | Add-Member -NotePropertyMembers @{
+            arguments = @('-headless', '-noFPSLimit', '-pipelineMode', 'serial',
+                '-simulationMode', $entry.simulationMode, '-workerPolicy', 'auto',
+                '-workerCount', $entry.requestedWorkers, '-validationExecutableSha256', ('A' * 64))
+            command = ''; timeoutSeconds = 1
+            stdout = Join-Path $entryDirectory 'stdout.log'
+            stderr = Join-Path $entryDirectory 'stderr.log'
+            timingDirectory = Join-Path $entryDirectory 'timing'
+            runtimeLogDirectory = Join-Path $entryDirectory 'runtime-logs'
+        }
+        $entry.command = ConvertTo-DisplayCommand $executable $entry.arguments
+    }
+    $documentsRoot = Join-Path $directory 'Documents'
+    $launcher = [pscustomobject]@{
+        executable = [IO.Path]::GetFileName($executable); arguments = @()
+        launcherPath = Join-Path $directory 'launcher.exe'
+        configPath = Join-Path $directory 'launcher.lcf'
+    }
+    $plan | Add-Member -NotePropertyMembers @{
+        runtimeRoot = $directory; executable = $executable; executableSha256 = ('A' * 64)
+        title = 'ZeroHour'; cohortNonce = $script:TestCohortNonce
+        cohortCreatedUtc = $script:TestCohortCreatedUtc
+        launcherContract = Assert-LauncherEquivalenceContract $launcher $executable `
+            $directory $plan.entries 'FinalizedProfile' $documentsRoot
+    }
+
+    $freezePath = Join-Path $directory 'final-validation-plan.json'
+    $frozen = $null
+    $freezeError = ''
+    try { $frozen = Write-Stage5FrozenValidationPlan -Plan $plan -Path $freezePath }
+    catch { $freezeError = $_.Exception.Message }
+    Assert-True ($null -ne $frozen) "finalized live plan freezes before child preparation (got '$freezeError')"
+    if ($null -ne $frozen) {
+        $writtenJson = [IO.File]::ReadAllText($freezePath)
+        $writtenPlan = $writtenJson | ConvertFrom-Json
+        Assert-True ($frozen.planPath -ceq $freezePath -and $frozen.planJson -ceq $writtenJson -and
+            $frozen.planSha256 -ceq (Get-Sha256Text $writtenJson) -and
+            $writtenPlan.launcherContract.profileLeafName -ceq 'FinalizedProfile' -and
+            $writtenPlan.launcherContract.documentsRoot -ceq $documentsRoot) `
+            'frozen plan owns the exact final launcher/profile bytes and their original hash'
+        $originalHash = $frozen.planSha256
+        Assert-Throws { $frozen.planJson = '{}' } 'read.only|set|property|key' `
+            'a caller cannot replace immutable frozen plan text'
+        Assert-Throws { $frozen.planSha256 = ('F' * 64) } 'read.only|set|property|key' `
+            'a caller cannot replace the original frozen plan hash'
+        Assert-True ($frozen.planJson -ceq $writtenJson -and $frozen.planSha256 -ceq $originalHash) `
+            'failed frozen binding mutations preserve the original plan authority'
+        Assert-Throws { Write-Stage5FrozenValidationPlan -Plan $plan -Path $freezePath | Out-Null } `
+            'exist|create.new|overwrite' 'a frozen plan cannot be rewritten for a later child'
+        Assert-True ([IO.File]::ReadAllText($freezePath) -ceq $writtenJson) `
+            'a refused second freeze preserves the first plan bytes'
+    }
+
+    $existingPath = Join-Path $directory 'existing-plan.json'
+    [IO.File]::WriteAllText($existingPath, 'previous cohort evidence')
+    Assert-Throws { Write-Stage5FrozenValidationPlan -Plan $plan -Path $existingPath | Out-Null } `
+        'exist|create.new|overwrite' 'freezing refuses an already occupied plan path'
+    Assert-True ([IO.File]::ReadAllText($existingPath) -ceq 'previous cohort evidence') `
+        'failed freezing never overwrites existing evidence'
+
+    # Independent on-disk fixture lets resolution and the real invocation
+    # boundary fail behaviorally even while the create-new seam is fail-closed.
+    $bindingPath = Join-Path $directory 'bound-validation-plan.json'
+    $bindingJson = $plan | ConvertTo-Json -Depth 12
+    [IO.File]::WriteAllText($bindingPath, $bindingJson, (New-Object Text.UTF8Encoding($false)))
+    $bindingValues = New-Object 'Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
+    $bindingValues.Add('planPath', $bindingPath)
+    $bindingValues.Add('planJson', $bindingJson)
+    $bindingValues.Add('planSha256', (Get-Sha256Text $bindingJson))
+    $binding = New-Object 'Collections.ObjectModel.ReadOnlyDictionary[string,string]' -ArgumentList (,$bindingValues)
+    $launchEntry = ($bindingJson | ConvertFrom-Json).entries[1]
+    $plan.entries[1].validationRole = 'live-determinism'
+    $plan.entries[1].proofProfileId = 'live-invariants-v1'
+    $plan.entries[1].arguments[0] = '-mutated-after-freeze'
+    $plan.liveQualification.authorityEntries[0].repeat = 1
+    $plan.launcherContract.profileLeafName = 'MutatedProfile'
+    $planDocument = $plan
+    $executionCohortNonce = $script:TestCohortNonce
+    $executionCohortCreatedUtc = $script:TestCohortCreatedUtc
+    $resolved = $null
+    $resolveError = ''
+    try {
+        $resolved = Resolve-Stage5FrozenLivePlanEntry -LivePlanBinding $binding -Entry $launchEntry `
+            -Executable $executable -WorkingDirectory $directory
+    }
+    catch { $resolveError = $_.Exception.Message }
+    Assert-True ($null -ne $resolved) `
+        "frozen live entry resolves without ambient mutable-plan authority (got '$resolveError')"
+    if ($null -ne $resolved) {
+        Assert-True ($resolved.entryId -ceq 'ai-0012' -and
+            $resolved.validationRole -ceq 'live-authority-stress' -and
+            $resolved.proofProfileId -ceq 'live-all-slices-authority-v1' -and
+            $resolved.arguments[0] -ceq '-headless') `
+            'entry resolution retains the role and arguments selected before caller mutation'
+    }
+    if ($null -ne $frozen) {
+        $stillFrozen = $frozen.planJson | ConvertFrom-Json
+        Assert-True ($stillFrozen.liveQualification.authorityEntries[0].repeat -eq 2 -and
+            $stillFrozen.launcherContract.profileLeafName -ceq 'FinalizedProfile' -and
+            $stillFrozen.entries[1].arguments[0] -ceq '-headless') `
+            'freezing owns nested selectors, launcher metadata, and arguments instead of caller aliases'
+    }
+
+    $invokeArguments = @{Executable=$executable;WorkingDirectory=$directory;Entry=$launchEntry
+        CaptureTiming=$false;Environment=@{};EvidenceRoot=$directory;NativeObservationBinding=$null}
+    Assert-Throws { Invoke-ValidationProcess @invokeArguments | Out-Null } `
+        'frozen.*plan.*required|live.*plan.*binding.*required' `
+        'V2 role-bearing entries require an explicit frozen binding before Process.Start'
+    Assert-True (-not (Test-Path -LiteralPath (Split-Path -Parent $launchEntry.stdout))) `
+        'missing V2 binding is rejected before creating child output directories'
+
+    $strippedEntry = ($bindingJson | ConvertFrom-Json).entries[0]
+    foreach ($name in @('entryId', 'validationRole', 'proofProfileId')) {
+        $strippedEntry.PSObject.Properties.Remove($name)
+    }
+    $invokeArguments.Entry = $strippedEntry
+    $invokeArguments.LivePlanBinding = $binding
+    Assert-Throws { Invoke-ValidationProcess @invokeArguments | Out-Null } `
+        'frozen (validation|live) plan|live plan binding|entryId|validationRole|proofProfileId' `
+        'removing V2 entry metadata cannot downgrade an explicitly bound process to legacy'
+    Assert-True (-not (Test-Path -LiteralPath (Split-Path -Parent $strippedEntry.stdout))) `
+        'stripped V2 entry is rejected before creating child output directories'
+
+    $tamperedPlan = $bindingJson | ConvertFrom-Json
+    $tamperedPlan.entries[2].arguments[0] = '-changed-on-disk'
+    [IO.File]::WriteAllText($bindingPath, ($tamperedPlan | ConvertTo-Json -Depth 12))
+    $invokeArguments.Entry = ($bindingJson | ConvertFrom-Json).entries[2]
+    Assert-Throws { Invoke-ValidationProcess @invokeArguments | Out-Null } `
+        'frozen.*(hash|changed|bytes)|plan.*(hash|changed|bytes)' `
+        'changed plan bytes reject the original binding rather than blessing a new hash'
+    Assert-True (-not (Test-Path -LiteralPath (Split-Path -Parent $invokeArguments.Entry.stdout))) `
+        'changed frozen plan is rejected before creating child output directories'
+}
+
 function New-Stage5LiveRoleTestOutput {
     param([object]$Entry, [switch]$UnusedStatus)
     $arguments = @{
@@ -3696,6 +3851,7 @@ New-Item -ItemType Directory -Path $root | Out-Null
 try {
     Assert-InstalledNet3ModuleBoundary (Join-Path $root 'installed-net3-module-fixture.json')
     Assert-Stage5LiveRoleContract
+    Assert-Stage5LivePlanPrelaunchBinding
     $runtime = Join-Path $root 'runtime'
     $fixtures = Join-Path $root 'fixtures'
     New-Item -ItemType Directory -Path $runtime | Out-Null

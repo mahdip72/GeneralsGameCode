@@ -122,6 +122,93 @@ function Get-Stage5FileSnapshot {
     }
 }
 
+function Write-Stage5FrozenValidationPlan {
+    param([object]$Plan, [string]$Path)
+    $context = 'Frozen validation plan'
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace($Path)) "$context path is required."
+    $full = [IO.Path]::GetFullPath($Path)
+    Assert-ContainedPathNoReparse (Split-Path -Parent $full) $full $context | Out-Null
+    $json = $Plan | ConvertTo-Json -Depth 12
+    $ownedPlan = $json | ConvertFrom-Json
+    Assert-Condition ($ownedPlan.schemaVersion -eq 2 -and
+        -not [string]::IsNullOrWhiteSpace($ownedPlan.launcherContract.profileLeafName) -and
+        -not [string]::IsNullOrWhiteSpace($ownedPlan.launcherContract.documentsRoot)) `
+        "$context requires the finalized V2 launcher/profile binding."
+    $aiEntries = @($ownedPlan.entries | Where-Object { $_.kind -ceq 'ai' })
+    Assert-Condition ($aiEntries.Count -gt 0) "$context requires its declared live entries."
+    Resolve-Stage5LiveValidationRequirements $ownedPlan $aiEntries[0] | Out-Null
+    $encoding = New-Object Text.UTF8Encoding($false, $true)
+    $bytes = $encoding.GetBytes($json)
+    $expectedHash = Get-Sha256Bytes $bytes
+    # CreateNew preserves both prior-cohort evidence and any failed partial write.
+    $stream = [IO.File]::Open($full, [IO.FileMode]::CreateNew,
+        [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    }
+    finally { $stream.Dispose() }
+    $snapshot = Get-Stage5FileSnapshot $full $context
+    Assert-Condition ($snapshot.sha256 -ceq $expectedHash) "$context bytes changed while freezing."
+    # Only immutable strings escape; the mutable backing dictionary stays owned here.
+    $values = New-Object 'Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
+    $values.Add('planPath', $full)
+    $values.Add('planJson', $json)
+    $values.Add('planSha256', $expectedHash)
+    return New-Object 'Collections.ObjectModel.ReadOnlyDictionary[string,string]' -ArgumentList (,$values)
+}
+
+function Resolve-Stage5FrozenLivePlanEntry {
+    param(
+        [object]$LivePlanBinding, [object]$Entry,
+        [string]$Executable, [string]$WorkingDirectory
+    )
+    $context = 'Frozen live plan binding'
+    Assert-Condition ($LivePlanBinding -is [Collections.ObjectModel.ReadOnlyDictionary[string,string]]) `
+        "$context requires immutable original plan values."
+    $fields = @('planPath', 'planJson', 'planSha256')
+    Assert-JsonObjectShape $LivePlanBinding $fields $fields $context
+    $planPath = $LivePlanBinding['planPath']
+    $planJson = $LivePlanBinding['planJson']
+    $expectedHash = $LivePlanBinding['planSha256']
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace($planPath) -and
+        -not [string]::IsNullOrWhiteSpace($planJson) -and (Test-Sha256Text $expectedHash)) `
+        "$context has missing or invalid original plan values."
+    Assert-Condition ((Get-Sha256Text $planJson) -ceq $expectedHash) `
+        'Frozen validation plan text does not match its original hash.'
+    $snapshot = Get-Stage5FileSnapshot $planPath 'Frozen validation plan'
+    $encoding = New-Object Text.UTF8Encoding($false, $true)
+    Assert-Condition ($snapshot.sha256 -ceq $expectedHash -and
+        $encoding.GetString($snapshot.bytes) -ceq $planJson) `
+        'Frozen validation plan bytes changed after the original freeze.'
+    $frozenPlan = $planJson | ConvertFrom-Json
+    $requirements = Resolve-Stage5LiveValidationRequirements $frozenPlan $Entry
+    $frozenEntry = @($frozenPlan.entries | Where-Object {
+        $_.kind -ceq 'ai' -and $_.entryId -ceq $requirements.entryId
+    })[0]
+    Assert-Condition ([String]::Equals([IO.Path]::GetFullPath($Executable),
+        [IO.Path]::GetFullPath($frozenPlan.executable), [StringComparison]::OrdinalIgnoreCase) -and
+        [String]::Equals([IO.Path]::GetFullPath($WorkingDirectory),
+        [IO.Path]::GetFullPath($frozenPlan.runtimeRoot), [StringComparison]::OrdinalIgnoreCase)) `
+        "$context executable or working directory differs from the frozen plan."
+    foreach ($field in @('command', 'stdout', 'stderr', 'timingDirectory',
+        'runtimeLogDirectory', 'timeoutSeconds')) {
+        Assert-Condition ($Entry.$field -ceq $frozenEntry.$field) `
+            "$context entry launch field '$field' differs from the frozen plan."
+    }
+    Assert-Condition ($Entry.arguments -is [Array] -and $frozenEntry.arguments -is [Array] -and
+        $Entry.arguments.Count -eq $frozenEntry.arguments.Count) `
+        "$context entry arguments differ from the frozen plan."
+    for ($index = 0; $index -lt $frozenEntry.arguments.Count; ++$index) {
+        Assert-Condition ($Entry.arguments[$index] -is [string] -and
+            $frozenEntry.arguments[$index] -is [string] -and
+            $Entry.arguments[$index] -ceq $frozenEntry.arguments[$index]) `
+            "$context entry argument $index differs from the frozen plan."
+    }
+    # The returned entry is a fresh parse of the frozen text, never a caller alias.
+    return $frozenEntry
+}
+
 function ConvertTo-UtcIsoTimestamp {
     param([AllowNull()][object]$Value)
     if ($null -eq $Value) { return '' }
@@ -1441,8 +1528,22 @@ function Invoke-ValidationProcess {
         [bool]$CaptureTiming,
         [hashtable]$Environment,
         [string]$EvidenceRoot = '',
-        [AllowNull()][object]$NativeObservationBinding = $null
+        [AllowNull()][object]$NativeObservationBinding = $null,
+        [AllowNull()][object]$LivePlanBinding = $null
     )
+    $entryFields = if ($Entry -is [Collections.IDictionary]) { @($Entry.Keys) }
+        elseif ($null -ne $Entry) { @($Entry.PSObject.Properties | ForEach-Object { $_.Name }) }
+        else { @() }
+    $hasLiveMetadata = $false
+    foreach ($field in @('entryId', 'validationRole', 'proofProfileId')) {
+        if ($entryFields -contains $field) { $hasLiveMetadata = $true }
+    }
+    if ($hasLiveMetadata -or $null -ne $LivePlanBinding) {
+        Assert-Condition ($null -ne $LivePlanBinding) `
+            'A frozen live plan binding is required for a V2 validation entry.'
+        $Entry = Resolve-Stage5FrozenLivePlanEntry -LivePlanBinding $LivePlanBinding `
+            -Entry $Entry -Executable $Executable -WorkingDirectory $WorkingDirectory
+    }
     $nativeBinding = Get-NativeObservationBinding $NativeObservationBinding
     Assert-Condition ($null -eq $nativeBinding -or $CaptureTiming) `
         'Native observation requires frame timing before starting the installed process.'
