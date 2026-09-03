@@ -43,6 +43,60 @@ enum LiveSimulationPhaseRunResult
 	LIVE_SIMULATION_PHASE_FAILED_AFTER_MUTATION
 };
 
+enum LiveSimulationPhaseFailureBoundary
+{
+	LIVE_SIMULATION_PHASE_FAILURE_NONE = 0,
+	LIVE_SIMULATION_PHASE_FAILURE_CONFIGURATION,
+	LIVE_SIMULATION_PHASE_FAILURE_RESET,
+	LIVE_SIMULATION_PHASE_FAILURE_NESTED_ENTRY,
+	LIVE_SIMULATION_PHASE_FAILURE_CLAIM,
+	LIVE_SIMULATION_PHASE_FAILURE_EXECUTE,
+	LIVE_SIMULATION_PHASE_FAILURE_AUTHORITY_VALIDATION,
+	LIVE_SIMULATION_PHASE_FAILURE_OWNER_VALIDATION,
+	LIVE_SIMULATION_PHASE_FAILURE_VALIDATE_EXCEPTION,
+	LIVE_SIMULATION_PHASE_FAILURE_COMMIT_EXCEPTION,
+	LIVE_SIMULATION_PHASE_FAILURE_ADVANCE,
+	LIVE_SIMULATION_PHASE_FAILURE_UNEXPECTED_STOP,
+	LIVE_SIMULATION_PHASE_FAILURE_FINAL_STATE
+};
+
+enum LiveSimulationPhaseExceptionCategory
+{
+	LIVE_SIMULATION_PHASE_EXCEPTION_NONE = 0,
+	LIVE_SIMULATION_PHASE_EXCEPTION_STANDARD,
+	LIVE_SIMULATION_PHASE_EXCEPTION_UNKNOWN,
+	LIVE_SIMULATION_PHASE_EXCEPTION_TITLE_INI
+};
+
+// First-failure owner-thread diagnostics only. This constant-space record is
+// never consulted by simulation, serialized, transferred, or hashed. The
+// pre-containment identity and exception copy survive graph cancellation;
+// returnGraphState/returnTerminalCause describe the unchanged terminal path.
+struct LiveSimulationPhaseFailureDiagnostic
+{
+	LiveSimulationPhaseFailureDiagnostic();
+	LiveSimulationPhaseFailureBoundary boundary;
+	SimulationPhaseId phaseId;
+	SimulationPhaseJobKey jobKey;
+	unsigned frame;
+	unsigned generation;
+	unsigned internalEpoch;
+	unsigned committedPhaseCount;
+	unsigned sequenceSignature;
+	bool ownerCommitEntered;
+	SimulationPhaseGraphState graphState;
+	SimulationPhaseWorkStatus terminalCause;
+	SimulationPhaseGraphState returnGraphState;
+	SimulationPhaseWorkStatus returnTerminalCause;
+	bool ownerContextKnown;
+	unsigned ownerFrame;
+	unsigned ownerPhaseFrame;
+	unsigned ownerCursor;
+	LiveSimulationPhaseExceptionCategory exceptionCategory;
+	char exceptionMessage[192];
+	bool exceptionMessageTruncated;
+};
+
 struct LiveSimulationPhaseAuthorityEvidence
 {
 	LiveSimulationPhaseAuthorityEvidence();
@@ -151,6 +205,14 @@ public:
 	unsigned committedPhaseCount() const;
 	const LiveSimulationPhaseRuntimeMetrics &runtimeMetrics() const;
 	void resetRuntimeMetrics();
+	// Identity fields are valid only when boundary is not FAILURE_NONE.
+	const LiveSimulationPhaseFailureDiagnostic &failureDiagnostic() const;
+	// Called only on a failing title validation/commit boundary. Copies the
+	// first owner context and optional exception text before bare rethrow;
+	// it must never consume the exception or select simulation behavior.
+	void annotateOwnerFailure(unsigned ownerFrame, unsigned ownerPhaseFrame,
+		unsigned ownerCursor, LiveSimulationPhaseExceptionCategory category =
+			LIVE_SIMULATION_PHASE_EXCEPTION_NONE, const char *message = 0);
 	// Deterministic unit fixtures may replace the monotonic clock only while no
 	// frame is active. Product callers retain the default clock.
 	bool setPerformanceClockForTesting(
@@ -192,6 +254,10 @@ private:
 	};
 
 	bool ensureConfigured();
+	void recordFailure(LiveSimulationPhaseFailureBoundary boundary,
+		SimulationPhaseId phaseId, unsigned frame);
+	void recordException(LiveSimulationPhaseExceptionCategory category,
+		const char *message);
 	LiveSimulationPhaseRunResult failureResult() const;
 	LiveSimulationPhaseRunResult finishRun(
 		LiveSimulationPhaseRunResult result, unsigned frame);
@@ -235,6 +301,7 @@ private:
 	void *m_performanceClockContext;
 	JobMetricCounter m_currentFrameStartNanoseconds;
 	LiveSimulationPhaseRuntimeMetrics m_runtimeMetrics;
+	LiveSimulationPhaseFailureDiagnostic m_failureDiagnostic;
 	bool m_configured;
 	bool m_frameActive;
 	bool m_ownerCommitEntered;

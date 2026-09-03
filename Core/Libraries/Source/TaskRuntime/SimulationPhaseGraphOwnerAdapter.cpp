@@ -10,6 +10,8 @@
 
 #include "Lib/SimulationPhaseGraphOwnerAdapter.h"
 
+#include <exception>
+
 #if defined(_WIN32)
 #include <windows.h>
 #else
@@ -134,6 +136,86 @@ LiveSimulationPhaseAuthorityEvidence::LiveSimulationPhaseAuthorityEvidence()
 	  physicalWorkerIndex(SIMULATION_PHASE_INVALID_WORKER_INDEX),
 	  validated(false), committed(false)
 {
+}
+
+LiveSimulationPhaseFailureDiagnostic::LiveSimulationPhaseFailureDiagnostic()
+	: boundary(LIVE_SIMULATION_PHASE_FAILURE_NONE),
+	  phaseId(SIMULATION_PHASE_INVALID_ID), jobKey(SIMULATION_PHASE_INVALID_JOB_KEY),
+	  frame(0), generation(0), internalEpoch(0), committedPhaseCount(0),
+	  sequenceSignature(0), ownerCommitEntered(false),
+	  graphState(SIMULATION_PHASE_GRAPH_UNCONFIGURED),
+	  terminalCause(SIMULATION_PHASE_WORK_SUCCEEDED),
+	  returnGraphState(SIMULATION_PHASE_GRAPH_UNCONFIGURED),
+	  returnTerminalCause(SIMULATION_PHASE_WORK_SUCCEEDED),
+	  ownerContextKnown(false), ownerFrame(0), ownerPhaseFrame(0), ownerCursor(0),
+	  exceptionCategory(LIVE_SIMULATION_PHASE_EXCEPTION_NONE),
+	  exceptionMessageTruncated(false)
+{
+	exceptionMessage[0] = '\0';
+}
+
+const LiveSimulationPhaseFailureDiagnostic &
+LiveSimulationPhaseGraphOwnerAdapter::failureDiagnostic() const
+{
+	return m_failureDiagnostic;
+}
+
+void LiveSimulationPhaseGraphOwnerAdapter::annotateOwnerFailure(
+	unsigned ownerFrame, unsigned ownerPhaseFrame, unsigned ownerCursor,
+	LiveSimulationPhaseExceptionCategory category, const char *message)
+{
+	if (m_failureDiagnostic.boundary != LIVE_SIMULATION_PHASE_FAILURE_NONE ||
+		m_failureDiagnostic.ownerContextKnown)
+		return;
+	m_failureDiagnostic.ownerContextKnown = true;
+	m_failureDiagnostic.ownerFrame = ownerFrame;
+	m_failureDiagnostic.ownerPhaseFrame = ownerPhaseFrame;
+	m_failureDiagnostic.ownerCursor = ownerCursor;
+	recordException(category, message);
+}
+
+void LiveSimulationPhaseGraphOwnerAdapter::recordException(
+	LiveSimulationPhaseExceptionCategory category, const char *message)
+{
+	if (m_failureDiagnostic.boundary != LIVE_SIMULATION_PHASE_FAILURE_NONE ||
+		m_failureDiagnostic.exceptionCategory != LIVE_SIMULATION_PHASE_EXCEPTION_NONE)
+		return;
+	m_failureDiagnostic.exceptionCategory = category;
+	unsigned length = 0;
+	const unsigned capacity = sizeof(m_failureDiagnostic.exceptionMessage);
+	if (message != 0)
+	{
+		while (length + 1 < capacity && message[length] != '\0')
+		{
+			m_failureDiagnostic.exceptionMessage[length] = message[length];
+			++length;
+		}
+	}
+	m_failureDiagnostic.exceptionMessage[length] = '\0';
+	m_failureDiagnostic.exceptionMessageTruncated =
+		message != 0 && message[length] != '\0';
+}
+
+void LiveSimulationPhaseGraphOwnerAdapter::recordFailure(
+	LiveSimulationPhaseFailureBoundary boundary, SimulationPhaseId phaseId,
+	unsigned frame)
+{
+	if (m_failureDiagnostic.boundary != LIVE_SIMULATION_PHASE_FAILURE_NONE)
+		return;
+	m_failureDiagnostic.boundary = boundary;
+	m_failureDiagnostic.phaseId = phaseId;
+	m_failureDiagnostic.jobKey = phaseOrdinal(phaseId) < LIVE_PHASE_STORAGE_COUNT ?
+		0 : SIMULATION_PHASE_INVALID_JOB_KEY;
+	m_failureDiagnostic.frame = frame;
+	m_failureDiagnostic.generation = m_graph.generation();
+	m_failureDiagnostic.internalEpoch = m_graph.internalEpoch();
+	m_failureDiagnostic.committedPhaseCount = m_committedPhaseCount;
+	m_failureDiagnostic.sequenceSignature = m_currentSequenceSignature;
+	m_failureDiagnostic.ownerCommitEntered = m_ownerCommitEntered;
+	m_failureDiagnostic.graphState = m_graph.state();
+	m_failureDiagnostic.terminalCause = m_graph.terminalCause();
+	m_failureDiagnostic.returnGraphState = m_failureDiagnostic.graphState;
+	m_failureDiagnostic.returnTerminalCause = m_failureDiagnostic.terminalCause;
 }
 
 LiveSimulationPhaseRuntimeMetrics::LiveSimulationPhaseRuntimeMetrics()
@@ -297,6 +379,14 @@ LiveSimulationPhaseGraphOwnerAdapter::failureResult() const
 LiveSimulationPhaseRunResult LiveSimulationPhaseGraphOwnerAdapter::finishRun(
 	LiveSimulationPhaseRunResult result, unsigned frame)
 {
+	if (m_failureDiagnostic.boundary != LIVE_SIMULATION_PHASE_FAILURE_NONE &&
+		m_failureDiagnostic.boundary != LIVE_SIMULATION_PHASE_FAILURE_NESTED_ENTRY &&
+		(result == LIVE_SIMULATION_PHASE_FALLBACK_BEFORE_MUTATION ||
+		 result == LIVE_SIMULATION_PHASE_FAILED_AFTER_MUTATION))
+	{
+		m_failureDiagnostic.returnGraphState = m_graph.state();
+		m_failureDiagnostic.returnTerminalCause = m_graph.terminalCause();
+	}
 	if (result != LIVE_SIMULATION_PHASE_FALLBACK_BEFORE_MUTATION)
 	{
 		recordFramePerformance(elapsedNanoseconds(
@@ -354,6 +444,8 @@ LiveSimulationPhaseGraphOwnerAdapter::runFrame(unsigned frame)
 	// before rewriting any outer-attempt identity or fallback cutoff.
 	if (m_frameActive)
 	{
+		recordFailure(LIVE_SIMULATION_PHASE_FAILURE_NESTED_ENTRY,
+			m_expectedPhaseOrdinal + 1, frame);
 		// This rejected call did not own or commit the outer frame's work. Keep
 		// its evidence independent so aggregate commit totals remain truthful.
 		++m_runtimeMetrics.attemptedFrames;
@@ -364,6 +456,13 @@ LiveSimulationPhaseGraphOwnerAdapter::runFrame(unsigned frame)
 		m_runtimeMetrics.lastSequenceSignature = 0;
 		return LIVE_SIMULATION_PHASE_FAILED_AFTER_MUTATION;
 	}
+	// Reset validity without copying or formatting a message on successful
+	// frames. All identity fields are replaced together at the first failure.
+	m_failureDiagnostic.boundary = LIVE_SIMULATION_PHASE_FAILURE_NONE;
+	m_failureDiagnostic.ownerContextKnown = false;
+	m_failureDiagnostic.exceptionCategory = LIVE_SIMULATION_PHASE_EXCEPTION_NONE;
+	m_failureDiagnostic.exceptionMessage[0] = '\0';
+	m_failureDiagnostic.exceptionMessageTruncated = false;
 	m_currentFrameStartNanoseconds = performanceClockNowNanoseconds();
 	m_committedPhaseCount = 0;
 	m_expectedPhaseOrdinal = 0;
@@ -372,7 +471,11 @@ LiveSimulationPhaseGraphOwnerAdapter::runFrame(unsigned frame)
 	m_stopAfterCommit = false;
 	m_sequenceViolation = false;
 	if (!ensureConfigured() || m_nextGeneration == ~0u)
+	{
+		recordFailure(LIVE_SIMULATION_PHASE_FAILURE_CONFIGURATION,
+			SIMULATION_PHASE_INVALID_ID, frame);
 		return finishRun(LIVE_SIMULATION_PHASE_FALLBACK_BEFORE_MUTATION, frame);
+	}
 
 	const unsigned generationValue = m_nextGeneration + 1;
 	unsigned phaseOrdinalValue;
@@ -384,7 +487,11 @@ LiveSimulationPhaseGraphOwnerAdapter::runFrame(unsigned frame)
 		m_evidence[phaseOrdinalValue] = LiveSimulationPhaseAuthorityEvidence();
 	}
 	if (!m_graph.reset(generationValue))
+	{
+		recordFailure(LIVE_SIMULATION_PHASE_FAILURE_RESET,
+			SIMULATION_PHASE_INVALID_ID, frame);
 		return finishRun(LIVE_SIMULATION_PHASE_FALLBACK_BEFORE_MUTATION, frame);
+	}
 	m_nextGeneration = generationValue;
 	m_frameActive = true;
 
@@ -396,6 +503,8 @@ LiveSimulationPhaseGraphOwnerAdapter::runFrame(unsigned frame)
 			ticket.phaseId() != phaseOrdinalValue + 1 ||
 			ticket.jobKey() != 0)
 		{
+			recordFailure(LIVE_SIMULATION_PHASE_FAILURE_CLAIM,
+				phaseOrdinalValue + 1, m_inputs[phaseOrdinalValue].frame);
 			m_sequenceViolation = true;
 			m_graph.requestCancellation();
 			m_graph.advanceOwner();
@@ -408,6 +517,8 @@ LiveSimulationPhaseGraphOwnerAdapter::runFrame(unsigned frame)
 				SimulationPhaseExecutionIdentity::ownerHelp());
 		if (executeStatus != SIMULATION_PHASE_WORK_SUCCEEDED)
 		{
+			recordFailure(LIVE_SIMULATION_PHASE_FAILURE_EXECUTE,
+				phaseOrdinalValue + 1, m_inputs[phaseOrdinalValue].frame);
 			m_graph.advanceOwner();
 			m_frameActive = false;
 			return finishRun(failureResult(), frame);
@@ -428,6 +539,8 @@ LiveSimulationPhaseGraphOwnerAdapter::runFrame(unsigned frame)
 		if (!advanced || committedJobs != 1 ||
 			m_committedPhaseCount != phaseOrdinalValue + 1)
 		{
+			recordFailure(LIVE_SIMULATION_PHASE_FAILURE_ADVANCE,
+				phaseOrdinalValue + 1, m_inputs[phaseOrdinalValue].frame);
 			m_sequenceViolation = true;
 			m_graph.requestCancellation();
 			m_graph.advanceOwner();
@@ -437,6 +550,9 @@ LiveSimulationPhaseGraphOwnerAdapter::runFrame(unsigned frame)
 
 		if (m_stopAfterCommit)
 		{
+			if (phaseOrdinalValue != 0)
+				recordFailure(LIVE_SIMULATION_PHASE_FAILURE_UNEXPECTED_STOP,
+					phaseOrdinalValue + 1, m_inputs[phaseOrdinalValue].frame);
 			m_graph.requestCancellation();
 			m_graph.advanceOwner();
 			m_frameActive = false;
@@ -447,6 +563,13 @@ LiveSimulationPhaseGraphOwnerAdapter::runFrame(unsigned frame)
 	}
 
 	m_frameActive = false;
+	if (m_graph.state() != SIMULATION_PHASE_GRAPH_COMPLETED ||
+		m_committedPhaseCount != LIVE_PHASE_STORAGE_COUNT)
+	{
+		recordFailure(LIVE_SIMULATION_PHASE_FAILURE_FINAL_STATE,
+			LIVE_SIMULATION_PHASE_VERIFICATION_PUBLICATION,
+			m_inputs[LIVE_PHASE_STORAGE_COUNT - 1].frame);
+	}
 	return finishRun(m_graph.state() == SIMULATION_PHASE_GRAPH_COMPLETED &&
 		m_committedPhaseCount == LIVE_PHASE_STORAGE_COUNT ?
 		LIVE_SIMULATION_PHASE_COMPLETED : failureResult(), frame);
@@ -643,7 +766,12 @@ LiveSimulationPhaseGraphOwnerAdapter::validateAuthorityToken(
 	if (adapter == 0 || immutablePhaseInput == 0 ||
 		immutablePhaseInputBytes != sizeof(PhaseInput) ||
 		privateJobOutput == 0 || privateJobOutputBytes != sizeof(AuthorityToken))
+	{
+		if (adapter != 0)
+			adapter->recordFailure(LIVE_SIMULATION_PHASE_FAILURE_AUTHORITY_VALIDATION,
+				context.phaseId(), 0);
 		return SIMULATION_PHASE_WORK_FAILED;
+	}
 
 	const PhaseInput &input = *static_cast<const PhaseInput *>(
 		immutablePhaseInput);
@@ -660,11 +788,35 @@ LiveSimulationPhaseGraphOwnerAdapter::validateAuthorityToken(
 		output.internalEpoch != context.internalEpoch() ||
 		output.executionKind != SIMULATION_PHASE_EXECUTION_OWNER_HELP ||
 		output.physicalWorkerIndex != SIMULATION_PHASE_INVALID_WORKER_INDEX ||
-		adapter->m_callbacks.validate == 0 ||
-		!adapter->m_callbacks.validate(context.phaseId(),
-			context.generation(), input.frame, adapter->m_ownerContext))
+		adapter->m_callbacks.validate == 0)
 	{
+		adapter->recordFailure(LIVE_SIMULATION_PHASE_FAILURE_AUTHORITY_VALIDATION,
+			context.phaseId(), input.frame);
 		return SIMULATION_PHASE_WORK_FAILED;
+	}
+	try
+	{
+		if (!adapter->m_callbacks.validate(context.phaseId(),
+			context.generation(), input.frame, adapter->m_ownerContext))
+		{
+			adapter->recordFailure(LIVE_SIMULATION_PHASE_FAILURE_OWNER_VALIDATION,
+				context.phaseId(), input.frame);
+			return SIMULATION_PHASE_WORK_FAILED;
+		}
+	}
+	catch (const std::exception &exception)
+	{
+		adapter->recordException(LIVE_SIMULATION_PHASE_EXCEPTION_STANDARD, exception.what());
+		adapter->recordFailure(LIVE_SIMULATION_PHASE_FAILURE_VALIDATE_EXCEPTION,
+			context.phaseId(), input.frame);
+		throw;
+	}
+	catch (...)
+	{
+		adapter->recordException(LIVE_SIMULATION_PHASE_EXCEPTION_UNKNOWN, 0);
+		adapter->recordFailure(LIVE_SIMULATION_PHASE_FAILURE_VALIDATE_EXCEPTION,
+			context.phaseId(), input.frame);
+		throw;
 	}
 
 	LiveSimulationPhaseAuthorityEvidence &evidence =
@@ -702,9 +854,26 @@ void LiveSimulationPhaseGraphOwnerAdapter::commitOwnerPhase(
 	// non-throwing legacy phase can still throw after partial mutation; graph
 	// containment must never reinterpret that state as safe to replay.
 	adapter->m_ownerCommitEntered = true;
-	adapter->m_stopAfterCommit = !adapter->m_callbacks.commit(
-		context.phaseId(), context.generation(), input.frame,
-		adapter->m_ownerContext);
+	try
+	{
+		adapter->m_stopAfterCommit = !adapter->m_callbacks.commit(
+			context.phaseId(), context.generation(), input.frame,
+			adapter->m_ownerContext);
+	}
+	catch (const std::exception &exception)
+	{
+		adapter->recordException(LIVE_SIMULATION_PHASE_EXCEPTION_STANDARD, exception.what());
+		adapter->recordFailure(LIVE_SIMULATION_PHASE_FAILURE_COMMIT_EXCEPTION,
+			context.phaseId(), input.frame);
+		throw;
+	}
+	catch (...)
+	{
+		adapter->recordException(LIVE_SIMULATION_PHASE_EXCEPTION_UNKNOWN, 0);
+		adapter->recordFailure(LIVE_SIMULATION_PHASE_FAILURE_COMMIT_EXCEPTION,
+			context.phaseId(), input.frame);
+		throw;
+	}
 	LiveSimulationPhaseAuthorityEvidence &evidence =
 		adapter->m_evidence[phaseOrdinalValue];
 	evidence.committed = true;

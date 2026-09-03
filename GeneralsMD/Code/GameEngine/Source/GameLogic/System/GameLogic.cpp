@@ -42,6 +42,7 @@
 #include "Common/GameState.h"
 #include "Common/GameUtility.h"
 #include "Common/INI.h"
+#include "Common/INIException.h"
 #include "Common/LatchRestore.h"
 #include "Common/MapObject.h"
 #include "Common/MultiplayerSettings.h"
@@ -4532,7 +4533,34 @@ void GameLogic::update()
 	}
 	if (graphResult == rts::LIVE_SIMULATION_PHASE_FAILED_AFTER_MUTATION)
 	{
-		RELEASE_CRASH(("Stage5 phase graph failed after owner mutation; legacy fallback is unsafe."));
+		const rts::LiveSimulationPhaseFailureDiagnostic &failure =
+			m_stage5PhaseGraph.failureDiagnostic();
+		char failureText[1024];
+		snprintf(failureText, sizeof(failureText),
+			"Stage5 phase graph failed after owner mutation; legacy fallback is unsafe. "
+			"boundary=%u phase=%u job=%u frame=%u generation=%u epoch=%u "
+			"committed=%u signature=%u owner_entered=%u graph=%u cause=%u "
+			"return_graph=%u return_cause=%u owner_known=%u owner_frame=%u "
+			"owner_phase_frame=%u owner_cursor=%u observed_owner_frame=%u "
+			"observed_owner_phase_frame=%u observed_owner_cursor=%u "
+			"exception=%u message_truncated=%u message=\"%s\"",
+			static_cast<unsigned>(failure.boundary), failure.phaseId, failure.jobKey,
+			failure.frame, failure.generation, failure.internalEpoch,
+			failure.committedPhaseCount, failure.sequenceSignature,
+			failure.ownerCommitEntered ? 1u : 0u,
+			static_cast<unsigned>(failure.graphState),
+			static_cast<unsigned>(failure.terminalCause),
+			static_cast<unsigned>(failure.returnGraphState),
+			static_cast<unsigned>(failure.returnTerminalCause),
+			failure.ownerContextKnown ? 1u : 0u, failure.ownerFrame,
+			failure.ownerPhaseFrame, failure.ownerCursor, getFrame(),
+			m_stage5PhaseNow, m_stage5PhaseCursor,
+			static_cast<unsigned>(failure.exceptionCategory),
+			failure.exceptionMessageTruncated ? 1u : 0u, failure.exceptionMessage);
+		failureText[sizeof(failureText) - 1] = '\0';
+		fprintf(stderr, "%s\n", failureText);
+		fflush(stderr);
+		RELEASE_CRASH((failureText));
 		return;
 	}
 
@@ -4626,14 +4654,19 @@ bool GameLogic::validateStage5PhaseGraphCommit( unsigned phaseId,
 	unsigned generation, unsigned frame, void *ownerContext )
 {
 	GameLogic *logic = static_cast<GameLogic *>(ownerContext);
-	if (!isStage5PhaseGraphOwner(logic) || generation == 0 ||
-		phaseId != logic->m_stage5PhaseCursor + 1)
+	const bool owner = isStage5PhaseGraphOwner(logic);
+	bool valid = owner && generation != 0 &&
+		phaseId == logic->m_stage5PhaseCursor + 1;
+	if (valid)
 	{
-		return false;
+		valid = phaseId == rts::LIVE_SIMULATION_PHASE_OWNER_INTAKE ?
+			logic->getFrame() == frame :
+			logic->m_stage5PhaseNow == frame && logic->getFrame() == frame;
 	}
-	if (phaseId == rts::LIVE_SIMULATION_PHASE_OWNER_INTAKE)
-		return logic->getFrame() == frame;
-	return logic->m_stage5PhaseNow == frame && logic->getFrame() == frame;
+	if (!valid && owner)
+		logic->m_stage5PhaseGraph.annotateOwnerFailure(logic->getFrame(),
+			logic->m_stage5PhaseNow, logic->m_stage5PhaseCursor);
+	return valid;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -4643,6 +4676,8 @@ bool GameLogic::commitStage5PhaseGraphPhase( unsigned phaseId,
 	GameLogic *logic = static_cast<GameLogic *>(ownerContext);
 	Bool continueFrame = TRUE;
 	(void)generation;
+	try
+	{
 	switch (phaseId)
 	{
 		case rts::LIVE_SIMULATION_PHASE_OWNER_INTAKE:
@@ -4671,6 +4706,21 @@ bool GameLogic::commitStage5PhaseGraphPhase( unsigned phaseId,
 		default:
 			RELEASE_CRASH(("Stage5 phase graph attempted an unknown owner commit."));
 			return false;
+	}
+	}
+	catch (const INIException &exception)
+	{
+		// INIException owns its message buffer. Never copy or consume it here.
+		logic->m_stage5PhaseGraph.annotateOwnerFailure(logic->getFrame(),
+			logic->m_stage5PhaseNow, logic->m_stage5PhaseCursor,
+			rts::LIVE_SIMULATION_PHASE_EXCEPTION_TITLE_INI, exception.mFailureMessage);
+		throw;
+	}
+	catch (...)
+	{
+		logic->m_stage5PhaseGraph.annotateOwnerFailure(logic->getFrame(),
+			logic->m_stage5PhaseNow, logic->m_stage5PhaseCursor);
+		throw;
 	}
 	++logic->m_stage5PhaseCursor;
 	return continueFrame != FALSE;

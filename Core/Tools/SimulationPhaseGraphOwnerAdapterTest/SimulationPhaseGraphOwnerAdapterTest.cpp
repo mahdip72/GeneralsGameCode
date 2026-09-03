@@ -2,6 +2,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <stdexcept>
 
 namespace
 {
@@ -15,6 +17,17 @@ void require(bool condition, const char *message)
 	}
 }
 
+unsigned diagnosticFailures = 0;
+
+void requireDiagnostic(bool condition, const char *message)
+{
+	if (!condition)
+	{
+		std::fprintf(stderr, "FAIL: %s\n", message);
+		++diagnosticFailures;
+	}
+}
+
 struct Harness
 {
 	Harness()
@@ -23,7 +36,10 @@ struct Harness
 		  throwDuringCommitPhase(0), retargetAfterIntake(false),
 		  retargetFrame(0), reenterDuringCommitPhase(0),
 		  nestedResult(rts::LIVE_SIMULATION_PHASE_COMPLETED),
-		  validationCount(0), commitCount(0)
+		  validationCount(0), commitCount(0), throwDuringValidationPhase(0),
+		  standardException(false), annotateFailure(false),
+		  ownerFrame(0), ownerPhaseFrame(0), ownerCursor(0),
+		  titleExceptionMessage(0)
 	{
 		unsigned index;
 		for (index = 0; index != 32; ++index)
@@ -49,6 +65,14 @@ struct Harness
 	unsigned validatedFrame[32];
 	unsigned validationCount;
 	unsigned commitCount;
+	unsigned throwDuringValidationPhase;
+	bool standardException;
+	bool annotateFailure;
+	unsigned ownerFrame;
+	unsigned ownerPhaseFrame;
+	unsigned ownerCursor;
+	const char *titleExceptionMessage;
+	rts::LiveSimulationPhaseFailureDiagnostic nestedFailure;
 };
 
 struct FakeClock
@@ -87,6 +111,13 @@ bool validate(rts::SimulationPhaseId phaseId, unsigned generation,
 		harness->cancelDuringValidation = false;
 		harness->adapter->requestCancellation();
 	}
+	if (harness->throwDuringValidationPhase == phaseId)
+		throw std::runtime_error("validation sentinel");
+	if (harness->validationFailurePhase == phaseId && harness->annotateFailure)
+	{
+		harness->adapter->annotateOwnerFailure(harness->ownerFrame,
+			harness->ownerPhaseFrame, harness->ownerCursor);
+	}
 	return harness->validationFailurePhase != phaseId;
 }
 
@@ -98,11 +129,26 @@ bool commit(rts::SimulationPhaseId phaseId, unsigned generation,
 	require(harness->commitCount < 32, "commit trace overflow");
 	harness->committed[harness->commitCount++] = phaseId;
 	if (harness->throwDuringCommitPhase == phaseId)
+	{
+		if (harness->annotateFailure)
+		{
+			harness->adapter->annotateOwnerFailure(harness->ownerFrame,
+				harness->ownerPhaseFrame, harness->ownerCursor,
+				rts::LIVE_SIMULATION_PHASE_EXCEPTION_TITLE_INI,
+				harness->titleExceptionMessage);
+			// Later generic fallout must not replace the first owner details.
+			harness->adapter->annotateOwnerFailure(999, 999, 999,
+				rts::LIVE_SIMULATION_PHASE_EXCEPTION_UNKNOWN, "later fallout");
+		}
+		if (harness->standardException)
+			throw std::runtime_error("owner commit sentinel");
 		throw phaseId;
+	}
 	if (harness->reenterDuringCommitPhase == phaseId)
 	{
 		harness->reenterDuringCommitPhase = 0;
 		harness->nestedResult = harness->adapter->runFrame(frame + 1000);
+		harness->nestedFailure = harness->adapter->failureDiagnostic();
 	}
 	if (phaseId == rts::LIVE_SIMULATION_PHASE_OWNER_INTAKE &&
 		harness->retargetAfterIntake)
@@ -436,6 +482,206 @@ void testPerformanceEvidenceUsesInjectedClockAndSaturates()
 		"phase performance schema marker must remain explicit");
 }
 
+void testRejectedValidationRetainsOwnerFrameMismatch()
+{
+	Harness harness;
+	harness.validationFailurePhase = rts::LIVE_SIMULATION_PHASE_SPATIAL;
+	harness.annotateFailure = true;
+	harness.ownerFrame = 41;
+	harness.ownerPhaseFrame = 40;
+	harness.ownerCursor = 2;
+	rts::LiveSimulationPhaseGraphOwnerAdapter adapter(callbacks(), &harness);
+	harness.adapter = &adapter;
+	require(adapter.runFrame(40) == rts::LIVE_SIMULATION_PHASE_FAILED_AFTER_MUTATION &&
+		adapter.committedPhaseCount() == 2 && harness.commitCount == 2,
+		"diagnosing a later validation rejection must preserve the mutation cutoff");
+	rts::LiveSimulationPhaseAuthorityEvidence committedEvidence;
+	require(adapter.authorityEvidence(1, committedEvidence) && committedEvidence.committed,
+		"validation failure must retain the already committed intake authority");
+	const rts::LiveSimulationPhaseFailureDiagnostic &failure = adapter.failureDiagnostic();
+	requireDiagnostic(failure.boundary == rts::LIVE_SIMULATION_PHASE_FAILURE_OWNER_VALIDATION &&
+		failure.phaseId == 3 && failure.jobKey == 0 && failure.frame == 40 &&
+		failure.generation == 1 && failure.internalEpoch != 0 &&
+		failure.internalEpoch == committedEvidence.internalEpoch,
+		"validation diagnostic must retain the first failing phase and immutable identity");
+	requireDiagnostic(failure.committedPhaseCount == 2 && failure.sequenceSignature == 12 &&
+		failure.ownerCommitEntered && failure.ownerContextKnown &&
+		failure.ownerFrame == 41 && failure.ownerPhaseFrame == 40 && failure.ownerCursor == 2,
+		"validation diagnostic must retain owner-frame mismatch and prior real commits");
+	requireDiagnostic(failure.graphState == rts::SIMULATION_PHASE_GRAPH_RUNNING &&
+		failure.terminalCause == rts::SIMULATION_PHASE_WORK_SUCCEEDED &&
+		failure.returnGraphState == rts::SIMULATION_PHASE_GRAPH_FAILED &&
+		failure.returnTerminalCause == rts::SIMULATION_PHASE_WORK_FAILED &&
+		failure.exceptionCategory == rts::LIVE_SIMULATION_PHASE_EXCEPTION_NONE,
+		"validation diagnostic must distinguish rejection from exception and containment fallout");
+}
+
+void testValidationExceptionIsNotRelabeledAsRejection()
+{
+	Harness harness;
+	harness.throwDuringValidationPhase = rts::LIVE_SIMULATION_PHASE_SPATIAL;
+	rts::LiveSimulationPhaseGraphOwnerAdapter adapter(callbacks(), &harness);
+	harness.adapter = &adapter;
+	require(adapter.runFrame(42) == rts::LIVE_SIMULATION_PHASE_FAILED_AFTER_MUTATION &&
+		harness.commitCount == 2 && adapter.committedPhaseCount() == 2,
+		"validation exception containment must not repeat any owner callback");
+	const rts::LiveSimulationPhaseFailureDiagnostic &failure = adapter.failureDiagnostic();
+	requireDiagnostic(failure.boundary == rts::LIVE_SIMULATION_PHASE_FAILURE_VALIDATE_EXCEPTION &&
+		failure.phaseId == 3 && failure.frame == 42 && failure.committedPhaseCount == 2 &&
+		failure.exceptionCategory == rts::LIVE_SIMULATION_PHASE_EXCEPTION_STANDARD &&
+		std::strcmp(failure.exceptionMessage, "validation sentinel") == 0,
+		"validation exception category and original message must survive graph containment");
+}
+
+void testPartialCommitExceptionRetainsFirstFailure()
+{
+	Harness harness;
+	harness.throwDuringCommitPhase = rts::LIVE_SIMULATION_PHASE_OWNER_TAIL;
+	harness.standardException = true;
+	rts::LiveSimulationPhaseGraphOwnerAdapter adapter(callbacks(), &harness);
+	harness.adapter = &adapter;
+	require(adapter.runFrame(43) == rts::LIVE_SIMULATION_PHASE_FAILED_AFTER_MUTATION &&
+		harness.commitCount == 4 && adapter.committedPhaseCount() == 3,
+		"a throwing fourth commit must remain unaccepted after partial owner mutation");
+	const rts::LiveSimulationPhaseFailureDiagnostic &failure = adapter.failureDiagnostic();
+	requireDiagnostic(failure.boundary == rts::LIVE_SIMULATION_PHASE_FAILURE_COMMIT_EXCEPTION &&
+		failure.phaseId == 4 && failure.frame == 43 && failure.committedPhaseCount == 3 &&
+		failure.sequenceSignature == 123 && failure.ownerCommitEntered &&
+		failure.exceptionCategory == rts::LIVE_SIMULATION_PHASE_EXCEPTION_STANDARD &&
+		std::strcmp(failure.exceptionMessage, "owner commit sentinel") == 0 &&
+		!failure.exceptionMessageTruncated,
+		"partial commit diagnostic must preserve phase, accepted prefix, and original exception text");
+	requireDiagnostic(failure.graphState == rts::SIMULATION_PHASE_GRAPH_RUNNING &&
+		failure.returnGraphState == rts::SIMULATION_PHASE_GRAPH_FAILED &&
+		failure.returnTerminalCause == rts::SIMULATION_PHASE_WORK_FAILED,
+		"cleanup must not overwrite the first commit failure with an advance-count failure");
+	rts::LiveSimulationPhaseAuthorityEvidence evidence;
+	require(adapter.authorityEvidence(4, evidence) && evidence.validated && !evidence.committed,
+		"failure diagnostics must never manufacture authority publication");
+}
+
+void testUnknownFirstCommitExceptionKeepsUnsafeCutoff()
+{
+	Harness harness;
+	harness.throwDuringCommitPhase = rts::LIVE_SIMULATION_PHASE_OWNER_INTAKE;
+	rts::LiveSimulationPhaseGraphOwnerAdapter adapter(callbacks(), &harness);
+	harness.adapter = &adapter;
+	require(adapter.runFrame(44) == rts::LIVE_SIMULATION_PHASE_FAILED_AFTER_MUTATION &&
+		harness.commitCount == 1 && adapter.committedPhaseCount() == 0,
+		"unknown first-commit exception must never authorize a legacy retry");
+	const rts::LiveSimulationPhaseFailureDiagnostic &failure = adapter.failureDiagnostic();
+	requireDiagnostic(failure.boundary == rts::LIVE_SIMULATION_PHASE_FAILURE_COMMIT_EXCEPTION &&
+		failure.phaseId == 1 && failure.frame == 44 && failure.ownerCommitEntered &&
+		failure.committedPhaseCount == 0 && failure.sequenceSignature == 0 &&
+		failure.exceptionCategory == rts::LIVE_SIMULATION_PHASE_EXCEPTION_UNKNOWN &&
+		failure.exceptionMessage[0] == '\0',
+		"unrecognized exception must be explicitly unknown without invented message or commit");
+}
+
+void testOwnerExceptionAnnotationIsCopiedBoundedAndFirstWins()
+{
+	char message[512];
+	std::memset(message, 'x', sizeof(message) - 1);
+	message[sizeof(message) - 1] = '\0';
+	Harness harness;
+	harness.throwDuringCommitPhase = rts::LIVE_SIMULATION_PHASE_OWNER_TAIL;
+	harness.annotateFailure = true;
+	harness.ownerFrame = 46;
+	harness.ownerPhaseFrame = 45;
+	harness.ownerCursor = 3;
+	harness.titleExceptionMessage = message;
+	rts::LiveSimulationPhaseGraphOwnerAdapter adapter(callbacks(), &harness);
+	harness.adapter = &adapter;
+	require(adapter.runFrame(45) == rts::LIVE_SIMULATION_PHASE_FAILED_AFTER_MUTATION,
+		"owner exception annotation must not consume or recover the thrown callback");
+	message[0] = 'z';
+	const rts::LiveSimulationPhaseFailureDiagnostic &failure = adapter.failureDiagnostic();
+	requireDiagnostic(failure.boundary == rts::LIVE_SIMULATION_PHASE_FAILURE_COMMIT_EXCEPTION &&
+		failure.exceptionCategory == rts::LIVE_SIMULATION_PHASE_EXCEPTION_TITLE_INI &&
+		failure.ownerContextKnown && failure.ownerFrame == 46 &&
+		failure.ownerPhaseFrame == 45 && failure.ownerCursor == 3,
+		"first title exception annotation must survive later generic annotations and containment");
+	requireDiagnostic(failure.exceptionMessageTruncated &&
+		std::strlen(failure.exceptionMessage) == sizeof(failure.exceptionMessage) - 1 &&
+		failure.exceptionMessage[0] == 'x' &&
+		failure.exceptionMessage[sizeof(failure.exceptionMessage) - 2] == 'x' &&
+		failure.exceptionMessage[sizeof(failure.exceptionMessage) - 1] == '\0',
+		"exception text must be an owned bounded terminated copy with truthful truncation");
+	harness.throwDuringCommitPhase = 0;
+	harness.annotateFailure = false;
+	require(adapter.runFrame(46) == rts::LIVE_SIMULATION_PHASE_COMPLETED,
+		"fresh top-level frame must preserve existing recovery behavior");
+	requireDiagnostic(adapter.failureDiagnostic().boundary == rts::LIVE_SIMULATION_PHASE_FAILURE_NONE &&
+		!adapter.failureDiagnostic().ownerContextKnown &&
+		adapter.failureDiagnostic().exceptionCategory == rts::LIVE_SIMULATION_PHASE_EXCEPTION_NONE &&
+		adapter.failureDiagnostic().exceptionMessage[0] == '\0',
+		"fresh top-level frame must not expose a stale exception or owner mismatch");
+}
+
+void testNestedFailureDoesNotReplaceOuterAuthority()
+{
+	Harness harness;
+	harness.reenterDuringCommitPhase = rts::LIVE_SIMULATION_PHASE_OWNER_INTAKE;
+	rts::LiveSimulationPhaseGraphOwnerAdapter adapter(callbacks(), &harness);
+	harness.adapter = &adapter;
+	require(adapter.runFrame(47) == rts::LIVE_SIMULATION_PHASE_COMPLETED &&
+		harness.nestedResult == rts::LIVE_SIMULATION_PHASE_FAILED_AFTER_MUTATION &&
+		adapter.committedPhaseCount() == 5 && harness.commitCount == 5,
+		"nested failure diagnostics must leave the outer five owner commits intact");
+	requireDiagnostic(harness.nestedFailure.boundary == rts::LIVE_SIMULATION_PHASE_FAILURE_NESTED_ENTRY &&
+		harness.nestedFailure.phaseId == 1 && harness.nestedFailure.frame == 1047 &&
+		harness.nestedFailure.generation == 1 && harness.nestedFailure.committedPhaseCount == 0 &&
+		harness.nestedFailure.ownerCommitEntered,
+		"rejected nested call must expose its requested identity before outer completion");
+	requireCanonicalEvidence(adapter, 47, 1);
+	requireDiagnostic(adapter.failureDiagnostic().boundary == rts::LIVE_SIMULATION_PHASE_FAILURE_NESTED_ENTRY &&
+		adapter.failureDiagnostic().frame == 1047,
+		"outer completion must not erase a nested rejection before its owner can report it");
+	require(adapter.runFrame(48) == rts::LIVE_SIMULATION_PHASE_COMPLETED,
+		"next nonnested top-level frame must still complete");
+	requireDiagnostic(adapter.failureDiagnostic().boundary == rts::LIVE_SIMULATION_PHASE_FAILURE_NONE,
+		"next top-level frame must clear the preceding nested diagnostic");
+}
+
+void testLaterOuterExceptionCannotRewriteNestedFirstFailure()
+{
+	Harness harness;
+	harness.reenterDuringCommitPhase = rts::LIVE_SIMULATION_PHASE_OWNER_INTAKE;
+	harness.throwDuringCommitPhase = rts::LIVE_SIMULATION_PHASE_OWNER_TAIL;
+	harness.annotateFailure = true;
+	harness.ownerFrame = 52;
+	harness.ownerPhaseFrame = 51;
+	harness.ownerCursor = 3;
+	harness.titleExceptionMessage = "later outer exception";
+	rts::LiveSimulationPhaseGraphOwnerAdapter adapter(callbacks(), &harness);
+	harness.adapter = &adapter;
+	require(adapter.runFrame(51) == rts::LIVE_SIMULATION_PHASE_FAILED_AFTER_MUTATION &&
+		harness.nestedResult == rts::LIVE_SIMULATION_PHASE_FAILED_AFTER_MUTATION &&
+		adapter.committedPhaseCount() == 3 && harness.commitCount == 4,
+		"nested rejection followed by an outer throw must retain the original unsafe cutoff and commits");
+	const rts::LiveSimulationPhaseFailureDiagnostic &failure = adapter.failureDiagnostic();
+	const rts::LiveSimulationPhaseFailureDiagnostic &first = harness.nestedFailure;
+	requireDiagnostic(failure.boundary == rts::LIVE_SIMULATION_PHASE_FAILURE_NESTED_ENTRY &&
+		failure.phaseId == 1 && failure.frame == 1051 && failure.generation == 1 &&
+		failure.internalEpoch == first.internalEpoch && failure.committedPhaseCount == 0 &&
+		failure.sequenceSignature == 0 && failure.ownerCommitEntered,
+		"later outer failure must preserve the nested rejection identity and accepted prefix");
+	requireDiagnostic(!failure.ownerContextKnown &&
+		failure.ownerFrame == first.ownerFrame && failure.ownerPhaseFrame == first.ownerPhaseFrame &&
+		failure.ownerCursor == first.ownerCursor &&
+		failure.exceptionCategory == rts::LIVE_SIMULATION_PHASE_EXCEPTION_NONE &&
+		failure.exceptionMessage[0] == '\0' && !failure.exceptionMessageTruncated,
+		"later outer exception must not annotate the already claimed nested first failure");
+	requireDiagnostic(failure.graphState == first.graphState &&
+		failure.terminalCause == first.terminalCause &&
+		failure.returnGraphState == first.returnGraphState &&
+		failure.returnTerminalCause == first.returnTerminalCause,
+		"outer containment must not replace the nested rejection return-state snapshot");
+	rts::LiveSimulationPhaseAuthorityEvidence evidence;
+	require(adapter.authorityEvidence(4, evidence) && evidence.validated && !evidence.committed,
+		"first-failure immutability must not manufacture the later throwing commit");
+}
+
 } // namespace
 
 int main()
@@ -449,6 +695,15 @@ int main()
 	testThrowAfterOwnerMutationNeverFallsBack();
 	testCallbackFrameReentryCannotRewriteOuterAttempt();
 	testPerformanceEvidenceUsesInjectedClockAndSaturates();
+	testRejectedValidationRetainsOwnerFrameMismatch();
+	testValidationExceptionIsNotRelabeledAsRejection();
+	testPartialCommitExceptionRetainsFirstFailure();
+	testUnknownFirstCommitExceptionKeepsUnsafeCutoff();
+	testOwnerExceptionAnnotationIsCopiedBoundedAndFirstWins();
+	testNestedFailureDoesNotReplaceOuterAuthority();
+	testLaterOuterExceptionCannotRewriteNestedFirstFailure();
+	if (diagnosticFailures != 0)
+		return 1;
 	std::printf("SimulationPhaseGraph owner-adapter tests passed.\n");
 	return 0;
 }
