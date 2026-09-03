@@ -491,7 +491,7 @@ void CaptureSkirmishAITestRuntimeState()
 	const unsigned workerCount = rts::JobSystem::instance().workerCount();
 	if (workerCount > s_runner.effectiveWorkerCount)
 		s_runner.effectiveWorkerCount = workerCount;
-	if (TheGameLogic != nullptr)
+	if (TheGameLogic != nullptr && !s_runner.ending)
 		s_phaseMetricsLast = TheGameLogic->getStage5PhaseRuntimeMetrics();
 	CaptureSkirmishAITestSliceMetrics();
 }
