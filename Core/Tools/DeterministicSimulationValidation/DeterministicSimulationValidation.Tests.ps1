@@ -1,8 +1,14 @@
 [CmdletBinding()]
-param()
+param(
+    [ValidateSet('All', 'Plan', 'Runtime', 'Acceptance')]
+    [string]$ValidationPartition = 'All'
+)
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+$runPlan = $ValidationPartition -eq 'All' -or $ValidationPartition -eq 'Plan'
+$runRuntime = $ValidationPartition -eq 'All' -or $ValidationPartition -eq 'Runtime'
+$runAcceptance = $ValidationPartition -eq 'All' -or $ValidationPartition -eq 'Acceptance'
 $script:Failures = 0
 $script:TestCohortNonce = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 $script:TestCohortCreatedUtc = '2026-09-01T00:00:00Z'
@@ -4063,10 +4069,12 @@ $temporaryBase = [IO.Path]::GetFullPath($configuredScratchRoot)
 $root = Join-Path $temporaryBase ('GGC-Stage5Validation-Test-{0}-{1}' -f $PID, [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $root | Out-Null
 try {
-    Assert-InstalledNet3ModuleBoundary (Join-Path $root 'installed-net3-module-fixture.json')
-    Assert-Stage5LiveRoleContract
-    Assert-Stage5LivePlanPrelaunchBinding
-    Assert-Stage5LivePlanCallerRouting
+    if ($runPlan) {
+        Assert-InstalledNet3ModuleBoundary (Join-Path $root 'installed-net3-module-fixture.json')
+        Assert-Stage5LiveRoleContract
+        Assert-Stage5LivePlanPrelaunchBinding
+        Assert-Stage5LivePlanCallerRouting
+    }
     $runtime = Join-Path $root 'runtime'
     $fixtures = Join-Path $root 'fixtures'
     New-Item -ItemType Directory -Path $runtime | Out-Null
@@ -4081,9 +4089,13 @@ try {
     $stressHash = Get-Sha256 (Join-Path $fixtures 'hard-ai-2v6.rep')
     $manifest = Join-Path $root 'manifest.json'
     Write-TestManifest $manifest $executableHash $referenceHash $stressHash
-
     $planOutput = Join-Path $root 'plan-output'
-    & $scriptPath -RuntimeRoot $runtime -FixtureManifestPath $manifest -OutputRoot $planOutput `
+    if (-not $runPlan) {
+        New-Item -ItemType Directory -Path $planOutput | Out-Null
+    }
+
+    if ($runPlan) {
+        & $scriptPath -RuntimeRoot $runtime -FixtureManifestPath $manifest -OutputRoot $planOutput `
         -ValidationSet All -ReplayMatrixRepeats 2 -StressRepeats 3 -MinimumFreeBytes 1 `
         -AllowNonStandardCorpus -PlanOnly | Out-Null
     $plan = Get-Content -LiteralPath (Join-Path $planOutput 'validation-plan.json') -Raw | ConvertFrom-Json
@@ -4612,6 +4624,8 @@ try {
     } 'seeds must be distinct' `
         'duplicate seed entries cannot disguise a three-seed acceptance matrix'
 
+    }
+    if ($runRuntime) {
     $badHashManifest = Join-Path $root 'bad-hash.json'
     Write-TestManifest $badHashManifest ('0' * 64) $referenceHash $stressHash
     Assert-Throws {
@@ -6230,6 +6244,8 @@ try {
     } 'setup: injected setup failure.*rollback: created-key cleanup: injected rollback cleanup failure' `
         'registry setup transaction aggregates setup and rollback errors'
 
+    }
+    if ($runAcceptance) {
     # Final acceptance is deliberately separate from the deterministic-runtime
     # replay/AI matrix. Build one complete, independently hashed diagnostic v1
     # evidence set, then prove that v1 is rejected until lockstep-v2 exists,
@@ -7684,6 +7700,7 @@ try {
         Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest | Out-Null
     } 'attachment.*SHA-256 mismatch' `
         'final acceptance independently rehashes and rejects a tampered attachment'
+    }
 }
 finally {
     $rootFull = [IO.Path]::GetFullPath($root)

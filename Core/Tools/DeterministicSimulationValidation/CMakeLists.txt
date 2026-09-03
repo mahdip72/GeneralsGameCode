@@ -17,10 +17,17 @@ if(WIN32)
         set_tests_properties(core_validation_process_lifecycle_tests PROPERTIES
             RUN_SERIAL TRUE PROCESSORS 1 TIMEOUT 120)
     endif()
-    add_test(NAME core_deterministic_simulation_validation_script_tests
-        COMMAND powershell -NoProfile -ExecutionPolicy Bypass
-            -File "${CMAKE_CURRENT_SOURCE_DIR}/DeterministicSimulationValidation.Tests.ps1"
-    )
+    foreach(_stage5_partition IN ITEMS Plan Runtime Acceptance)
+        string(TOLOWER "${_stage5_partition}" _stage5_partition_name)
+        add_test(NAME core_deterministic_simulation_validation_${_stage5_partition_name}_tests
+            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/DeterministicSimulationValidation.Tests.ps1"
+                -ValidationPartition "${_stage5_partition}")
+        set_tests_properties(core_deterministic_simulation_validation_${_stage5_partition_name}_tests
+            PROPERTIES RUN_SERIAL TRUE PROCESSORS 1
+                ENVIRONMENT
+                    "RTS_STAGE5_VALIDATION_SCRATCH_ROOT=${_stage5_validation_test_scratch_root}")
+    endforeach()
     add_test(NAME core_stage5_validation_runner_safety_tests
         COMMAND powershell -NoProfile -ExecutionPolicy Bypass
             -File "${CMAKE_CURRENT_SOURCE_DIR}/Stage5ValidationRunnerSafety.Tests.ps1"
@@ -48,15 +55,15 @@ if(WIN32)
         set_tests_properties(core_installed_lockstep_v2_host_self_test
             PROPERTIES TIMEOUT 30)
     endif()
-    # Complete Windows PowerShell 5.1 runs take about 161 seconds for the
-    # evidence suite and 147 seconds for the expanded paired-host suite.
-    # Retain all independent provenance rereads and negative fixtures, with
-    # bounded headroom for hosted-runner contention (the old 180-second
-    # evidence budget timed out in CI).
-    set_tests_properties(core_deterministic_simulation_validation_script_tests
-        PROPERTIES TIMEOUT 300
-            ENVIRONMENT
-                "RTS_STAGE5_VALIDATION_SCRATCH_ROOT=${_stage5_validation_test_scratch_root}")
+    # Keep all assertions and independent evidence rereads. Separate measured
+    # Windows PowerShell 5.1 groups (about 42 / 18 / 172 seconds) instead of
+    # extending the aggregate test's repeatedly exhausted 300-second budget.
+    set_tests_properties(core_deterministic_simulation_validation_plan_tests
+        PROPERTIES TIMEOUT 120)
+    set_tests_properties(core_deterministic_simulation_validation_runtime_tests
+        PROPERTIES TIMEOUT 90)
+    set_tests_properties(core_deterministic_simulation_validation_acceptance_tests
+        PROPERTIES TIMEOUT 300)
     set_tests_properties(core_stage5_validation_runner_safety_tests
         PROPERTIES TIMEOUT 60
             ENVIRONMENT
