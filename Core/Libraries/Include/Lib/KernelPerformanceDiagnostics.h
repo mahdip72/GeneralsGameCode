@@ -41,6 +41,22 @@ enum KernelPerformanceDisposition
 	KERNEL_PERFORMANCE_COMMITTED
 };
 
+enum KernelPerformanceRunRole
+{
+	KERNEL_PERFORMANCE_PIPELINE = 0,
+	KERNEL_PERFORMANCE_PHASE_SERIAL_BASELINE
+};
+
+enum KernelPerformancePhase
+{
+	KERNEL_PHASE_OWNER_INTAKE = 0,
+	KERNEL_PHASE_LEGACY_MUTABLE_ISLAND,
+	KERNEL_PHASE_SPATIAL_WORK,
+	KERNEL_PHASE_OWNER_TAIL,
+	KERNEL_PHASE_VERIFICATION_PUBLICATION,
+	KERNEL_PHASE_COUNT
+};
+
 enum
 {
 	KERNEL_PERFORMANCE_MAXIMUM_STREAMS = 16,
@@ -57,6 +73,52 @@ enum
 };
 
 typedef JobMetricCounter (*KernelPerformanceClock)(void *context);
+
+struct KernelPerformanceTimingRunOptions
+{
+	KernelPerformanceTimingRunOptions();
+	bool enabled;
+	KernelPerformanceRunRole role;
+	KernelPerformanceClock clock;
+	void *clockContext;
+};
+
+struct KernelPerformanceFrame
+{
+	KernelPerformanceFrame();
+	bool valid() const;
+	JobMetricCounter generation, serial, sampleOrdinal;
+	unsigned ownerFrameAtEntry;
+};
+
+struct KernelPerformanceSchedulerBoundary
+{
+	KernelPerformanceSchedulerBoundary();
+	JobMetricCounter submittedJobs, executedJobs, ownerHelpJobs;
+	JobMetricCounter outstandingJobs, pendingJobs;
+};
+
+struct KernelPerformancePhaseAccountingRow
+{
+	KernelPerformancePhaseAccountingRow();
+	JobMetricCounter totalNanoseconds, serialNanoseconds, pureNanoseconds;
+	JobMetricCounter samples, maximumNanoseconds;
+};
+
+struct KernelPerformancePhaseAccountingSnapshot
+{
+	KernelPerformancePhaseAccountingSnapshot();
+	bool requested, frozen, complete;
+	unsigned errors;
+	JobMetricCounter completedFrameCount;
+	unsigned firstCompletedFrame, lastCompletedFrame;
+	JobMetricCounter frameNanoseconds, maximumFrameNanoseconds;
+	JobMetricCounter unscopedSerialNanoseconds;
+	JobMetricCounter completionSerialNanoseconds, completionSampleCount;
+	KernelPerformancePhaseAccountingRow phases[KERNEL_PHASE_COUNT];
+	KernelPerformanceSchedulerBoundary schedulerBegin, schedulerEnd;
+	bool schedulerClosureKnown;
+};
 
 struct KernelPerformanceBatch
 {
@@ -105,6 +167,8 @@ struct KernelPerformanceSnapshot
 	bool enabled, frozen, complete;
 	unsigned errors, streamCount;
 	JobMetricCounter generation;
+	KernelPerformanceRunRole runRole;
+	KernelPerformancePhaseAccountingSnapshot phaseAccounting;
 	KernelPerformanceStream streams[KERNEL_PERFORMANCE_MAXIMUM_STREAMS];
 };
 
@@ -118,6 +182,21 @@ public:
 	KernelPerformanceLedger();
 	static KernelPerformanceLedger &instance();
 	bool beginRun(bool enabled, KernelPerformanceClock clock = 0, void *context = 0);
+	bool beginRun(const KernelPerformanceTimingRunOptions &options);
+	// Latched run identity, not permission to collect or resume failed work.
+	KernelPerformanceRunRole runRole() const noexcept;
+	// Explicit baseline extents share the ledger clock. All owner work defaults
+	// to serial, including gaps between the five ordered phases. Ordinary and
+	// disabled runs ignore these hooks without reading a clock.
+	KernelPerformanceFrame beginFrame(JobMetricCounter sampleOrdinal,
+		unsigned ownerFrameAtEntry, const KernelPerformanceSchedulerBoundary &actual);
+	bool beginPhase(KernelPerformanceFrame frame, KernelPerformancePhase phase);
+	bool endPhase(KernelPerformanceFrame frame, KernelPerformancePhase phase);
+	bool endFrame(KernelPerformanceFrame frame, unsigned completedFrame,
+		const KernelPerformanceSchedulerBoundary &actual);
+	KernelPerformanceInterval beginCompletionSerial();
+	bool endCompletionSerial(KernelPerformanceInterval interval);
+	bool sealExecutionClosure(const KernelPerformanceSchedulerBoundary &actual);
 	// Stop admitting new diagnostic batches at the accepted terminal boundary.
 	// Existing tokens remain live until their real completion and final freeze.
 	bool sealAdmissions();
@@ -154,8 +233,25 @@ private:
 		unsigned frame;
 		JobMetricCounter ordinal;
 	};
+	struct PhaseState
+	{
+		PhaseState();
+		KernelPerformanceFrame frame;
+		KernelPerformanceInterval completion;
+		bool phaseOpen, closureSealed, boundaryKnown;
+		unsigned nextPhase;
+		JobMetricCounter nextFrame, lastSampleOrdinal, frameStart, phaseStart;
+		JobMetricCounter lastClock, unscoped, completionStart, completionElapsed;
+		KernelPerformancePhaseAccountingRow phases[KERNEL_PHASE_COUNT];
+		KernelPerformancePhaseAccountingSnapshot snapshot;
+	};
 	bool owner();
 	bool writable();
+	bool phaseWritable();
+	bool frameMatches(KernelPerformanceFrame frame);
+	bool checkSchedulerBoundary(const KernelPerformanceSchedulerBoundary &actual);
+	bool settlePhaseAccounting(JobMetricCounter value);
+	bool checkPhaseTotals();
 	bool fail(unsigned error);
 	bool now(JobMetricCounter &value);
 	bool add(JobMetricCounter &total, JobMetricCounter amount);
@@ -163,6 +259,7 @@ private:
 	BatchState *resolve(KernelPerformanceBatch batch);
 	std::atomic<unsigned long> m_owner;
 	std::atomic<bool> m_foreignCall;
+	std::atomic<KernelPerformanceRunRole> m_runRole;
 	bool m_started, m_enabled, m_frozen, m_admissionsSealed;
 	unsigned m_errors, m_openBatches, m_depth, m_streamCount;
 	JobMetricCounter m_generation, m_nextBatch, m_nextInterval, m_lastClock;
@@ -172,6 +269,7 @@ private:
 	IntervalState m_intervals[KERNEL_PERFORMANCE_MAXIMUM_INTERVAL_DEPTH];
 	StreamIdentity m_identities[KERNEL_PERFORMANCE_MAXIMUM_STREAMS];
 	KernelPerformanceStream m_streams[KERNEL_PERFORMANCE_MAXIMUM_STREAMS];
+	PhaseState m_phase;
 	KernelPerformanceSnapshot m_snapshot;
 	KernelPerformanceLedger(const KernelPerformanceLedger &);
 	KernelPerformanceLedger &operator=(const KernelPerformanceLedger &);

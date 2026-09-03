@@ -5,6 +5,21 @@
 
 namespace rts { namespace performance {
 
+KernelPerformanceTimingRunOptions::KernelPerformanceTimingRunOptions() : enabled(false),
+	role(KERNEL_PERFORMANCE_PIPELINE), clock(0), clockContext(0) {}
+KernelPerformanceFrame::KernelPerformanceFrame() : generation(0), serial(0),
+	sampleOrdinal(0), ownerFrameAtEntry(0) {}
+bool KernelPerformanceFrame::valid() const { return generation != 0 && serial != 0; }
+KernelPerformanceSchedulerBoundary::KernelPerformanceSchedulerBoundary() : submittedJobs(0),
+	executedJobs(0), ownerHelpJobs(0), outstandingJobs(0), pendingJobs(0) {}
+KernelPerformancePhaseAccountingRow::KernelPerformancePhaseAccountingRow() : totalNanoseconds(0),
+	serialNanoseconds(0), pureNanoseconds(0), samples(0), maximumNanoseconds(0) {}
+KernelPerformancePhaseAccountingSnapshot::KernelPerformancePhaseAccountingSnapshot() : requested(false),
+	frozen(false), complete(false), errors(0), completedFrameCount(0), firstCompletedFrame(0),
+	lastCompletedFrame(0), frameNanoseconds(0), maximumFrameNanoseconds(0),
+	unscopedSerialNanoseconds(0), completionSerialNanoseconds(0), completionSampleCount(0),
+	schedulerClosureKnown(false) {}
+
 KernelPerformanceBatch::KernelPerformanceBatch() : generation(0), serial(0),
 	slot(KERNEL_PERFORMANCE_MAXIMUM_OPEN_BATCHES) {}
 bool KernelPerformanceBatch::valid() const { return generation != 0 && serial != 0; }
@@ -21,9 +36,13 @@ KernelPerformanceStream::KernelPerformanceStream() : kernel(KERNEL_PERFORMANCE_P
 	memset(stageSamples, 0, sizeof(stageSamples));
 }
 KernelPerformanceSnapshot::KernelPerformanceSnapshot() : enabled(false), frozen(false),
-	complete(false), errors(0), streamCount(0), generation(0) {}
+	complete(false), errors(0), streamCount(0), generation(0), runRole(KERNEL_PERFORMANCE_PIPELINE) {}
+KernelPerformanceLedger::PhaseState::PhaseState() : phaseOpen(false), closureSealed(false),
+	boundaryKnown(false), nextPhase(0), nextFrame(0), lastSampleOrdinal(0), frameStart(0),
+	phaseStart(0), lastClock(0), unscoped(0), completionStart(0), completionElapsed(0) {}
 KernelPerformanceLedger::KernelPerformanceLedger() : m_owner(GetCurrentThreadId()),
-	m_foreignCall(false), m_started(false), m_enabled(false), m_frozen(false),
+	m_foreignCall(false), m_runRole(KERNEL_PERFORMANCE_PIPELINE),
+	m_started(false), m_enabled(false), m_frozen(false),
 	m_admissionsSealed(false), m_errors(0),
 	m_openBatches(0), m_depth(0), m_streamCount(0), m_generation(0), m_nextBatch(0),
 	m_nextInterval(0), m_lastClock(0), m_clock(0), m_clockContext(0)
@@ -36,6 +55,244 @@ KernelPerformanceLedger &KernelPerformanceLedger::instance()
 {
 	static KernelPerformanceLedger ledger;
 	return ledger;
+}
+
+bool KernelPerformanceLedger::beginRun(const KernelPerformanceTimingRunOptions &options)
+{
+	if (!owner()) return false;
+	if (m_started && !m_frozen) return fail(KERNEL_PERFORMANCE_ERROR_STATE);
+	if (static_cast<unsigned>(options.role) > KERNEL_PERFORMANCE_PHASE_SERIAL_BASELINE)
+		return fail(KERNEL_PERFORMANCE_ERROR_IDENTITY);
+	if (m_generation == ~static_cast<JobMetricCounter>(0))
+		return fail(KERNEL_PERFORMANCE_ERROR_OVERFLOW);
+	++m_generation;
+	m_started = true;
+	m_enabled = options.enabled;
+	m_frozen = false;
+	m_admissionsSealed = false;
+	m_errors = m_openBatches = m_depth = m_streamCount = 0;
+	m_nextBatch = m_nextInterval = m_lastClock = 0;
+	m_clock = options.clock != 0 ? options.clock : LiveSimulationPhaseClockNowNanoseconds;
+	m_clockContext = options.clockContext;
+	m_foreignCall.store(false, std::memory_order_release);
+	memset(m_batches, 0, sizeof(m_batches));
+	memset(m_intervals, 0, sizeof(m_intervals));
+	memset(m_identities, 0, sizeof(m_identities));
+	for (unsigned index = 0; index != KERNEL_PERFORMANCE_MAXIMUM_STREAMS; ++index)
+		m_streams[index] = KernelPerformanceStream();
+	m_phase = PhaseState();
+	m_phase.snapshot.requested = options.enabled && options.role == KERNEL_PERFORMANCE_PHASE_SERIAL_BASELINE;
+	m_snapshot = KernelPerformanceSnapshot();
+	m_runRole.store(options.role, std::memory_order_release);
+	return true;
+}
+KernelPerformanceRunRole KernelPerformanceLedger::runRole() const noexcept
+{
+	return m_runRole.load(std::memory_order_acquire);
+}
+bool KernelPerformanceLedger::phaseWritable()
+{
+	return writable() && m_phase.snapshot.requested;
+}
+bool KernelPerformanceLedger::frameMatches(KernelPerformanceFrame frame)
+{
+	if (!m_phase.frame.valid() || frame.generation != m_phase.frame.generation ||
+		frame.serial != m_phase.frame.serial || frame.sampleOrdinal != m_phase.frame.sampleOrdinal ||
+		frame.ownerFrameAtEntry != m_phase.frame.ownerFrameAtEntry)
+		return fail(KERNEL_PERFORMANCE_ERROR_IDENTITY);
+	return true;
+}
+bool KernelPerformanceLedger::checkSchedulerBoundary(const KernelPerformanceSchedulerBoundary &actual)
+{
+	// Preserve actual observations, even on failure. Historical nonzero counts
+	// are valid; new work, resets, and unfinished work inside this extent are not.
+	m_phase.snapshot.schedulerEnd = actual;
+	if (!m_phase.boundaryKnown)
+	{
+		m_phase.snapshot.schedulerBegin = actual;
+		m_phase.boundaryKnown = true;
+	}
+	const KernelPerformanceSchedulerBoundary &first = m_phase.snapshot.schedulerBegin;
+	if (actual.outstandingJobs != 0 || actual.pendingJobs != 0 ||
+		actual.submittedJobs != first.submittedJobs || actual.executedJobs != first.executedJobs ||
+		actual.ownerHelpJobs != first.ownerHelpJobs)
+		return fail(KERNEL_PERFORMANCE_ERROR_STATE);
+	return true;
+}
+KernelPerformanceFrame KernelPerformanceLedger::beginFrame(JobMetricCounter sampleOrdinal,
+	unsigned ownerFrameAtEntry, const KernelPerformanceSchedulerBoundary &actual)
+{
+	KernelPerformanceFrame token;
+	if (!phaseWritable() || m_admissionsSealed) return token;
+	if (m_phase.frame.valid() || m_phase.completion.valid() || m_phase.closureSealed || m_depth != 0)
+	{
+		fail(KERNEL_PERFORMANCE_ERROR_ORDER);
+		return token;
+	}
+	if (m_phase.snapshot.completedFrameCount != 0 && sampleOrdinal <= m_phase.lastSampleOrdinal)
+	{
+		fail(KERNEL_PERFORMANCE_ERROR_IDENTITY);
+		return token;
+	}
+	JobMetricCounter timestamp = 0;
+	if (!checkSchedulerBoundary(actual) || !now(timestamp) || !add(m_phase.nextFrame, 1)) return token;
+	token.generation = m_generation;
+	token.serial = m_phase.nextFrame;
+	token.sampleOrdinal = sampleOrdinal;
+	token.ownerFrameAtEntry = ownerFrameAtEntry;
+	m_phase.frame = token;
+	m_phase.frameStart = m_phase.lastClock = timestamp;
+	m_phase.unscoped = 0;
+	m_phase.nextPhase = 0;
+	m_phase.phaseOpen = false;
+	for (unsigned index = 0; index != KERNEL_PHASE_COUNT; ++index)
+		m_phase.phases[index] = KernelPerformancePhaseAccountingRow();
+	return token;
+}
+bool KernelPerformanceLedger::beginPhase(KernelPerformanceFrame frame, KernelPerformancePhase phase)
+{
+	if (!phaseWritable() || !frameMatches(frame)) return false;
+	if (static_cast<unsigned>(phase) >= KERNEL_PHASE_COUNT)
+		return fail(KERNEL_PERFORMANCE_ERROR_IDENTITY);
+	if (m_phase.phaseOpen || static_cast<unsigned>(phase) != m_phase.nextPhase || m_depth != 0)
+		return fail(KERNEL_PERFORMANCE_ERROR_ORDER);
+	JobMetricCounter timestamp = 0;
+	if (!now(timestamp)) return false;
+	m_phase.phaseStart = timestamp;
+	m_phase.phaseOpen = true;
+	return true;
+}
+bool KernelPerformanceLedger::endPhase(KernelPerformanceFrame frame, KernelPerformancePhase phase)
+{
+	if (!phaseWritable() || !frameMatches(frame)) return false;
+	if (static_cast<unsigned>(phase) >= KERNEL_PHASE_COUNT)
+		return fail(KERNEL_PERFORMANCE_ERROR_IDENTITY);
+	if (!m_phase.phaseOpen || static_cast<unsigned>(phase) != m_phase.nextPhase || m_depth != 0)
+		return fail(KERNEL_PERFORMANCE_ERROR_ORDER);
+	JobMetricCounter timestamp = 0;
+	if (!now(timestamp)) return false;
+	KernelPerformancePhaseAccountingRow &row = m_phase.phases[phase];
+	const JobMetricCounter measured = timestamp - m_phase.phaseStart;
+	JobMetricCounter partition = row.serialNanoseconds;
+	if (!add(partition, row.pureNanoseconds)) return false;
+	if (partition != measured) return fail(KERNEL_PERFORMANCE_ERROR_INCOMPLETE);
+	row.totalNanoseconds = row.maximumNanoseconds = measured;
+	row.samples = 1;
+	m_phase.phaseOpen = false;
+	++m_phase.nextPhase;
+	return true;
+}
+bool KernelPerformanceLedger::endFrame(KernelPerformanceFrame frame, unsigned completedFrame,
+	const KernelPerformanceSchedulerBoundary &actual)
+{
+	if (!phaseWritable() || !frameMatches(frame)) return false;
+	if (m_phase.phaseOpen || m_phase.nextPhase != KERNEL_PHASE_COUNT || m_depth != 0)
+		return fail(KERNEL_PERFORMANCE_ERROR_INCOMPLETE);
+	if (m_phase.snapshot.completedFrameCount != 0 && completedFrame <= m_phase.snapshot.lastCompletedFrame)
+		return fail(KERNEL_PERFORMANCE_ERROR_IDENTITY);
+	JobMetricCounter timestamp = 0;
+	if (!checkSchedulerBoundary(actual) || !now(timestamp)) return false;
+	const JobMetricCounter measured = timestamp - m_phase.frameStart;
+	JobMetricCounter partition = m_phase.unscoped;
+	KernelPerformancePhaseAccountingSnapshot updated = m_phase.snapshot;
+	for (unsigned index = 0; index != KERNEL_PHASE_COUNT; ++index)
+	{
+		const KernelPerformancePhaseAccountingRow &sample = m_phase.phases[index];
+		KernelPerformancePhaseAccountingRow &total = updated.phases[index];
+		if (!add(partition, sample.totalNanoseconds) ||
+			!add(total.totalNanoseconds, sample.totalNanoseconds) ||
+			!add(total.serialNanoseconds, sample.serialNanoseconds) ||
+			!add(total.pureNanoseconds, sample.pureNanoseconds) || !add(total.samples, sample.samples)) return false;
+		if (sample.maximumNanoseconds > total.maximumNanoseconds) total.maximumNanoseconds = sample.maximumNanoseconds;
+	}
+	if (partition != measured) return fail(KERNEL_PERFORMANCE_ERROR_INCOMPLETE);
+	if (!add(updated.frameNanoseconds, measured) || !add(updated.unscopedSerialNanoseconds, m_phase.unscoped)) return false;
+	if (updated.completedFrameCount == 0) updated.firstCompletedFrame = completedFrame;
+	updated.lastCompletedFrame = completedFrame;
+	if (measured > updated.maximumFrameNanoseconds) updated.maximumFrameNanoseconds = measured;
+	if (!add(updated.completedFrameCount, 1)) return false;
+	m_phase.snapshot = updated;
+	m_phase.lastSampleOrdinal = frame.sampleOrdinal;
+	m_phase.frame = KernelPerformanceFrame();
+	return true;
+}
+KernelPerformanceInterval KernelPerformanceLedger::beginCompletionSerial()
+{
+	KernelPerformanceInterval token;
+	if (!phaseWritable()) return token;
+	if (!m_admissionsSealed || m_phase.snapshot.completedFrameCount == 0 || m_phase.frame.valid() ||
+		m_phase.completion.valid() || m_phase.closureSealed || m_depth != 0)
+	{
+		fail(KERNEL_PERFORMANCE_ERROR_ORDER);
+		return token;
+	}
+	JobMetricCounter timestamp = 0;
+	if (!now(timestamp) || !add(m_nextInterval, 1)) return token;
+	token.generation = m_generation;
+	token.serial = m_nextInterval;
+	m_phase.completion = token;
+	m_phase.completionStart = m_phase.lastClock = timestamp;
+	m_phase.completionElapsed = 0;
+	return token;
+}
+bool KernelPerformanceLedger::endCompletionSerial(KernelPerformanceInterval token)
+{
+	if (!phaseWritable()) return false;
+	if (!m_phase.completion.valid() || token.generation != m_phase.completion.generation ||
+		token.serial != m_phase.completion.serial || m_depth != 0)
+		return fail(KERNEL_PERFORMANCE_ERROR_ORDER);
+	JobMetricCounter timestamp = 0;
+	if (!now(timestamp)) return false;
+	const JobMetricCounter measured = timestamp - m_phase.completionStart;
+	if (measured != m_phase.completionElapsed) return fail(KERNEL_PERFORMANCE_ERROR_INCOMPLETE);
+	if (!add(m_phase.snapshot.completionSerialNanoseconds, measured) ||
+		!add(m_phase.snapshot.completionSampleCount, 1)) return false;
+	m_phase.completion = KernelPerformanceInterval();
+	return true;
+}
+bool KernelPerformanceLedger::sealExecutionClosure(const KernelPerformanceSchedulerBoundary &actual)
+{
+	if (!phaseWritable()) return false;
+	if (!m_admissionsSealed || m_phase.snapshot.completedFrameCount == 0 || m_phase.frame.valid() ||
+		m_phase.completion.valid() || m_depth != 0 || m_openBatches != 0)
+		return fail(KERNEL_PERFORMANCE_ERROR_INCOMPLETE);
+	if (!checkSchedulerBoundary(actual) || !checkPhaseTotals()) return false;
+	m_phase.closureSealed = true;
+	m_phase.snapshot.schedulerClosureKnown = true;
+	return true;
+}
+
+bool KernelPerformanceLedger::settlePhaseAccounting(JobMetricCounter timestamp)
+{
+	if (!m_phase.snapshot.requested || (!m_phase.frame.valid() && !m_phase.completion.valid())) return true;
+	if (timestamp < m_phase.lastClock) return fail(KERNEL_PERFORMANCE_ERROR_CLOCK);
+	const JobMetricCounter elapsed = timestamp - m_phase.lastClock;
+	m_phase.lastClock = timestamp;
+	if (m_phase.completion.valid()) return add(m_phase.completionElapsed, elapsed);
+	if (m_phase.phaseOpen) return add(m_phase.phases[m_phase.nextPhase].serialNanoseconds, elapsed);
+	return add(m_phase.unscoped, elapsed);
+}
+
+bool KernelPerformanceLedger::checkPhaseTotals()
+{
+	const KernelPerformancePhaseAccountingSnapshot &a = m_phase.snapshot;
+	JobMetricCounter framePartition = a.unscopedSerialNanoseconds;
+	JobMetricCounter serial = a.unscopedSerialNanoseconds, pure = 0;
+	for (unsigned index = 0; index != KERNEL_PHASE_COUNT; ++index)
+	{
+		const KernelPerformancePhaseAccountingRow &row = a.phases[index];
+		JobMetricCounter phasePartition = row.serialNanoseconds;
+		if (!add(phasePartition, row.pureNanoseconds) || !add(framePartition, row.totalNanoseconds) ||
+			!add(serial, row.serialNanoseconds) || !add(pure, row.pureNanoseconds)) return false;
+		if (phasePartition != row.totalNanoseconds || row.samples != a.completedFrameCount)
+			return fail(KERNEL_PERFORMANCE_ERROR_INCOMPLETE);
+	}
+	if (framePartition != a.frameNanoseconds) return fail(KERNEL_PERFORMANCE_ERROR_INCOMPLETE);
+	JobMetricCounter accounted = a.frameNanoseconds;
+	if (!add(accounted, a.completionSerialNanoseconds) || !add(serial, a.completionSerialNanoseconds) ||
+		!add(serial, pure)) return false;
+	if (accounted != serial) return fail(KERNEL_PERFORMANCE_ERROR_INCOMPLETE);
+	return true;
 }
 
 bool KernelPerformanceLedger::owner()
@@ -78,33 +335,20 @@ bool KernelPerformanceLedger::now(JobMetricCounter &value)
 	if (value == 0 || value == ~static_cast<JobMetricCounter>(0) || value < m_lastClock)
 		return fail(KERNEL_PERFORMANCE_ERROR_CLOCK);
 	m_lastClock = value;
-	return true;
+	// The independently measured phase/frame boundaries and every pipeline
+	// timestamp settle one owner-time partition. Pipeline nesting cannot add or
+	// subtract time from it; unscoped owner work is serial by default.
+	return settlePhaseAccounting(value);
 }
 
 bool KernelPerformanceLedger::beginRun(bool enabled,
 	KernelPerformanceClock clock, void *context)
 {
-	if (!owner()) return false;
-	if (m_started && !m_frozen) return fail(KERNEL_PERFORMANCE_ERROR_STATE);
-	if (m_generation == ~static_cast<JobMetricCounter>(0))
-		return fail(KERNEL_PERFORMANCE_ERROR_OVERFLOW);
-	++m_generation;
-	m_started = true;
-	m_enabled = enabled;
-	m_frozen = false;
-	m_admissionsSealed = false;
-	m_errors = m_openBatches = m_depth = m_streamCount = 0;
-	m_nextBatch = m_nextInterval = m_lastClock = 0;
-	m_clock = clock != 0 ? clock : LiveSimulationPhaseClockNowNanoseconds;
-	m_clockContext = context;
-	m_foreignCall.store(false, std::memory_order_release);
-	memset(m_batches, 0, sizeof(m_batches));
-	memset(m_intervals, 0, sizeof(m_intervals));
-	memset(m_identities, 0, sizeof(m_identities));
-	for (unsigned index = 0; index != KERNEL_PERFORMANCE_MAXIMUM_STREAMS; ++index)
-		m_streams[index] = KernelPerformanceStream();
-	m_snapshot = KernelPerformanceSnapshot();
-	return true;
+	KernelPerformanceTimingRunOptions options;
+	options.enabled = enabled;
+	options.clock = clock;
+	options.clockContext = context;
+	return beginRun(options);
 }
 
 bool KernelPerformanceLedger::sealAdmissions()
@@ -316,6 +560,17 @@ KernelPerformanceSnapshot KernelPerformanceLedger::freeze()
 	if (!m_started) fail(KERNEL_PERFORMANCE_ERROR_STATE);
 	if (m_foreignCall.load(std::memory_order_acquire)) fail(KERNEL_PERFORMANCE_ERROR_OWNER);
 	if (m_openBatches != 0 || m_depth != 0) fail(KERNEL_PERFORMANCE_ERROR_INCOMPLETE);
+	if (m_phase.snapshot.requested)
+	{
+		if (!m_admissionsSealed || !m_phase.closureSealed || !m_phase.boundaryKnown ||
+			m_phase.snapshot.completedFrameCount == 0 || m_phase.frame.valid() ||
+			m_phase.phaseOpen || m_phase.completion.valid()) fail(KERNEL_PERFORMANCE_ERROR_INCOMPLETE);
+		if (m_errors == 0) checkPhaseTotals();
+		m_phase.snapshot.errors = m_errors;
+		m_phase.snapshot.complete = m_errors == 0;
+		m_phase.snapshot.schedulerClosureKnown = m_phase.closureSealed && m_errors == 0;
+	}
+	m_phase.snapshot.frozen = true;
 	m_frozen = true;
 	m_snapshot.enabled = m_enabled;
 	m_snapshot.frozen = true;
@@ -323,6 +578,8 @@ KernelPerformanceSnapshot KernelPerformanceLedger::freeze()
 	m_snapshot.errors = m_errors;
 	m_snapshot.generation = m_generation;
 	m_snapshot.streamCount = m_streamCount;
+	m_snapshot.runRole = runRole();
+	m_snapshot.phaseAccounting = m_phase.snapshot;
 	for (unsigned index = 0; index != m_streamCount; ++index)
 		m_snapshot.streams[index] = m_streams[index];
 	return m_snapshot;

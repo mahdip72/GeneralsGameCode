@@ -162,7 +162,8 @@ struct KernelPerformanceReferenceLedger::State
 	Pending pending[KERNEL_PERFORMANCE_MAXIMUM_OPEN_BATCHES];
 };
 
-KernelPerformanceReferenceLedger::KernelPerformanceReferenceLedger() : m_state(0), m_owner(GetCurrentThreadId()), m_foreignCall(false) {}
+KernelPerformanceReferenceLedger::KernelPerformanceReferenceLedger() : m_state(0), m_owner(GetCurrentThreadId()),
+	m_foreignCall(false), m_runMode(KERNEL_REFERENCE_DISABLED) {}
 KernelPerformanceReferenceLedger::~KernelPerformanceReferenceLedger() { delete m_state; }
 KernelPerformanceReferenceLedger &KernelPerformanceReferenceLedger::instance() { static KernelPerformanceReferenceLedger ledger; return ledger; }
 KernelPerformanceReferenceMode KernelPerformanceReferenceLedger::mode() const noexcept
@@ -172,6 +173,10 @@ KernelPerformanceReferenceMode KernelPerformanceReferenceLedger::mode() const no
 		m_snapshot.frozen || m_snapshot.errors != 0 || m_state == 0)
 		return KERNEL_REFERENCE_DISABLED;
 	return m_snapshot.mode;
+}
+KernelPerformanceReferenceMode KernelPerformanceReferenceLedger::runMode() const noexcept
+{
+	return m_runMode.load(std::memory_order_acquire);
 }
 bool KernelPerformanceReferenceLedger::owner() noexcept
 {
@@ -196,6 +201,10 @@ bool KernelPerformanceReferenceLedger::beginRun(KernelPerformanceReferenceMode m
 	m_snapshot.mode = mode;
 	m_snapshot.generation = generation;
 	m_foreignCall.store(false, std::memory_order_release);
+	// Latch before allocation: a failed diagnostic setup must not silently
+	// change this run's execution identity. Rejected reconfiguration above
+	// leaves the previous identity untouched.
+	m_runMode.store(mode, std::memory_order_release);
 	if (mode == KERNEL_REFERENCE_DISABLED) return true;
 	m_state = new (std::nothrow) State;
 	if (m_state == 0) { m_snapshot.errors |= KERNEL_PERFORMANCE_ERROR_CAPACITY; return false; }

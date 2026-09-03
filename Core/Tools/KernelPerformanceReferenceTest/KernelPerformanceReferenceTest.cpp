@@ -182,9 +182,59 @@ void orderingAndOwnership()
 	check(!observe(capacity, input, actual, detached, KERNEL_PERFORMANCE_MAXIMUM_OPEN_BATCHES + 1).valid() &&
 		(capacity.freeze().errors & KERNEL_PERFORMANCE_ERROR_CAPACITY), "open batch capacity cannot overwrite commit identities");
 }
+
+// The active mode must still disable diagnostics on failure; execution routing
+// needs a separate immutable query so a failure cannot change the run's role.
+void latchedRunModeSurvivesFailureAndFreeze()
+{
+	KernelPerformanceReferenceLedger ledger;
+	check(ledger.runMode() == KERNEL_REFERENCE_DISABLED, "unstarted run identity is disabled");
+	check(ledger.beginRun(KERNEL_REFERENCE_SERIAL_ORACLE, clock), "latched-mode fixture starts an oracle run");
+	check(ledger.runMode() == KERNEL_REFERENCE_SERIAL_ORACLE, "run identity records the requested oracle role");
+	check(!ledger.finishBatch(KernelPerformanceReferenceBatch(), true), "invalid commit poisons active diagnostics");
+	check(ledger.mode() == KERNEL_REFERENCE_DISABLED && ledger.runMode() == KERNEL_REFERENCE_SERIAL_ORACLE,
+		"diagnostic failure disables active mode without changing the latched role");
+	std::thread foreign([&]() {
+		check(ledger.mode() == KERNEL_REFERENCE_DISABLED && ledger.runMode() == KERNEL_REFERENCE_SERIAL_ORACLE,
+			"foreign role query is safe and cannot reactivate failed diagnostics");
+	});
+	foreign.join();
+	const auto failed = ledger.freeze();
+	check(!failed.complete && failed.mode == KERNEL_REFERENCE_SERIAL_ORACLE &&
+		ledger.runMode() == KERNEL_REFERENCE_SERIAL_ORACLE,
+		"freeze retains failed run identity independently from active collection");
+	check(ledger.beginRun(KERNEL_REFERENCE_DISABLED) && ledger.runMode() == KERNEL_REFERENCE_DISABLED,
+		"an explicit new run can replace the frozen role without inheriting stale identity");
+}
+
+void rejectedConfigurationCannotReplaceRunMode()
+{
+	KernelPerformanceReferenceLedger ledger;
+	check(ledger.beginRun(KERNEL_REFERENCE_SERIAL_ORACLE, clock), "reconfiguration fixture starts an oracle run");
+	check(!ledger.beginRun(KERNEL_REFERENCE_THROUGHPUT_BINDING) &&
+		ledger.runMode() == KERNEL_REFERENCE_SERIAL_ORACLE && ledger.mode() == KERNEL_REFERENCE_DISABLED,
+		"rejected active-run configuration poisons collection without changing execution identity");
+	ledger.freeze();
+	check(!ledger.beginRun(static_cast<KernelPerformanceReferenceMode>(255)) &&
+		ledger.runMode() == KERNEL_REFERENCE_SERIAL_ORACLE,
+		"unsupported requested mode cannot replace the frozen role");
+	check(ledger.beginRun(KERNEL_REFERENCE_THROUGHPUT_BINDING) &&
+		ledger.runMode() == KERNEL_REFERENCE_THROUGHPUT_BINDING,
+		"accepted explicit run replaces the historical mode");
+	std::thread query([&]() {
+		check(ledger.mode() == KERNEL_REFERENCE_DISABLED && ledger.runMode() == KERNEL_REFERENCE_THROUGHPUT_BINDING,
+			"foreign active-mode query stays disabled while its role query remains truthful");
+	});
+	query.join();
+	check(ledger.mode() == KERNEL_REFERENCE_THROUGHPUT_BINDING,
+		"foreign read-only queries never poison active reference collection");
+	ledger.freeze();
+}
 }
 int main()
 {
 	modeQuery(); canonicalFields(); disabledAndMatchingReference(); failureAndCommitBoundaries(); orderingAndOwnership();
+	latchedRunModeSurvivesFailureAndFreeze();
+	rejectedConfigurationCannotReplaceRunMode();
 	return failures == 0 ? 0 : 1;
 }

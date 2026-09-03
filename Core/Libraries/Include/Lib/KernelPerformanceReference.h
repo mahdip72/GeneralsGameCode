@@ -98,6 +98,9 @@ public:
 	// disabled/unstarted/frozen/failed runs observe Disabled without mutating
 	// the ledger or reading owner-owned state. Gate diagnostics allocations only.
 	KernelPerformanceReferenceMode mode() const noexcept;
+	// Latched identity across diagnostic failure/freeze; does not reactivate
+	// collection or grant permission to dispatch work after an error.
+	KernelPerformanceReferenceMode runMode() const noexcept;
 	bool beginRun(KernelPerformanceReferenceMode mode,
 		KernelPerformanceClock clock = 0, void *clockContext = 0) noexcept;
 	// One call represents one already-validated batch, possibly containing
@@ -120,6 +123,7 @@ private:
 	State *m_state;
 	std::atomic<unsigned long> m_owner;
 	std::atomic<bool> m_foreignCall;
+	std::atomic<KernelPerformanceReferenceMode> m_runMode;
 	bool owner() noexcept;
 	KernelPerformanceReferenceSnapshot m_snapshot;
 	KernelPerformanceReferenceLedger(const KernelPerformanceReferenceLedger &);
