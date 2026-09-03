@@ -1,9 +1,9 @@
 if(WIN32)
-    # Keep script-test fixtures beside the configured build tree. The workflow
-    # places local build trees on the task-owned H: volume, while hosted CI can
-    # retain its normal runner workspace without embedding a machine path.
+    # Keep GUID-named process fixtures below a short build-root directory.
+    # Nesting them under this tools directory exceeds Process.Start's legacy
+    # Windows path limit in longer CI presets, before any child can launch.
     set(_stage5_validation_test_scratch_root
-        "${CMAKE_CURRENT_BINARY_DIR}/stage5-validation-test-scratch")
+        "${CMAKE_BINARY_DIR}/s5-validation")
     if(MSVC AND NOT IS_VS6_BUILD)
         add_executable(core_validation_process_lifecycle_fixture
             ValidationProcessLifecycleFixture.cpp)
