@@ -513,6 +513,73 @@ void TestMismatchFallbacksArePreMutation()
 	assertRejectedWithoutMutation(valid, valid.requiredCellInfoCount - 1);
 }
 
+void TestGeneralsRecordedPathAuthorityPolicy()
+{
+	// The fixed semantic epoch does not depend on scheduler topology. Recording
+	// needs the paired path/AI epoch; ordinary playback remains owner-thread only.
+	for (unsigned mode = 0; mode < 3; ++mode)
+	{
+		for (unsigned session = 0; session < 3; ++session)
+		{
+			for (unsigned marked = 0; marked < 2; ++marked)
+			{
+				rts::FixedPathfindingSemanticsPolicy fixed = {};
+				fixed.nativeRuntime = true;
+				fixed.runtimeUsesCurrentGeneralsEpoch = true;
+				fixed.recordingGame = session == 1;
+				fixed.replayGame = session == 2;
+				fixed.replayUsesCurrentPathEpoch = marked != 0;
+				rts::DirectPathAuthorityPolicy direct = {};
+				direct.parallelExecutionMode = mode == 2;
+				direct.shadowExecutionMode = mode == 1;
+				direct.runtimeUsesCurrentGeneralsEpoch = true;
+				direct.recordingGame = fixed.recordingGame;
+				direct.replayGame = fixed.replayGame;
+				direct.replayUsesCurrentPathEpoch = fixed.replayUsesCurrentPathEpoch;
+				// Unrecorded native sessions also cover same-build save restoration.
+				const bool expectedFixed = session == 0 || marked != 0;
+				const bool expectedDirect = expectedFixed && mode == 2;
+				assert(rts::IsFixedPathfindingSemanticsAllowed(fixed) == expectedFixed);
+				assert(rts::IsDirectPathAuthorityAllowed(direct) == expectedDirect);
+				assert(rts::IsOrdinaryPathAuthorityAllowed(direct, expectedFixed) ==
+					(expectedDirect && session != 2));
+				assert(!rts::IsOrdinaryPathAuthorityAllowed(direct, false));
+				fixed.nativeRuntime = false;
+				assert(!rts::IsFixedPathfindingSemanticsAllowed(fixed));
+				fixed.nativeRuntime = true;
+				fixed.runtimeUsesCurrentGeneralsEpoch = false;
+				direct.runtimeUsesCurrentGeneralsEpoch = false;
+				assert(!rts::IsFixedPathfindingSemanticsAllowed(fixed));
+				assert(!rts::IsDirectPathAuthorityAllowed(direct));
+			}
+		}
+	}
+
+	// Keep the pre-existing negotiated direct-network lane separate from the
+	// new local recording epoch; it never authorizes ordinary worker paths.
+	rts::DirectPathAuthorityPolicy network = {};
+	network.parallelExecutionMode = true;
+	network.runtimeUsesCurrentGeneralsEpoch = true;
+	network.networkGame = true;
+	network.multiplayerGame = true;
+	assert(!rts::IsDirectPathAuthorityAllowed(network));
+	network.multiplayerPolicyEnabled = true;
+	assert(rts::IsDirectPathAuthorityAllowed(network));
+	assert(!rts::IsOrdinaryPathAuthorityAllowed(network, true));
+	network.networkGame = false;
+	assert(!rts::IsDirectPathAuthorityAllowed(network));
+	network.networkGame = true;
+	for (unsigned session = 1; session < 3; ++session)
+	{
+		network.recordingGame = session == 1;
+		network.replayGame = session == 2;
+		network.replayUsesCurrentPathEpoch = false;
+		assert(!rts::IsDirectPathAuthorityAllowed(network));
+		network.replayUsesCurrentPathEpoch = true;
+		assert(!rts::IsDirectPathAuthorityAllowed(network));
+	}
+}
+
 void TestAuthorityPolicyAndRawStartAdmission()
 {
 	rts::DirectPathAuthorityPolicy policy = {};
@@ -2022,6 +2089,7 @@ int main()
 	TestMalformedAndGenerationStaleResults();
 	TestMismatchFallbacksArePreMutation();
 	TestAuthorityPolicyAndRawStartAdmission();
+	TestGeneralsRecordedPathAuthorityPolicy();
 	TestPhysicalWorkerCountsAndOneWorkerParity();
 #if defined(_WIN64)
 	TestDirectPathBatchPerformanceLedgerStages();

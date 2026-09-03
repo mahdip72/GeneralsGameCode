@@ -7757,6 +7757,8 @@ Bool ShouldUseCurrentNativeFixedPathfinding()
 	policy.replayUsesCurrentPathEpoch =
 		TheRecorder->replayUsesPathfindQueueCapacity();
 #else
+	policy.replayUsesCurrentPathEpoch =
+		TheRecorder->replayUsesCurrentGeneralsPathfindingEpoch();
 	policy.runtimeUsesCurrentGeneralsEpoch =
 		IsGeneralsAICanonicalRuntimeEpoch();
 #endif
@@ -7784,6 +7786,8 @@ rts::DirectPathAuthorityPolicy BuildDirectPathAuthorityPolicy()
 	policy.replayUsesCurrentPathEpoch = TheRecorder &&
 		TheRecorder->replayUsesPathfindQueueCapacity();
 #else
+	policy.replayUsesCurrentPathEpoch = TheRecorder &&
+		TheRecorder->replayUsesCurrentGeneralsPathfindingEpoch();
 	policy.runtimeUsesCurrentGeneralsEpoch =
 		IsGeneralsAICanonicalRuntimeEpoch();
 #endif

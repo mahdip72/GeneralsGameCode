@@ -14,6 +14,7 @@
 
 #include "Utility/CppMacros.h"
 #include "Common/SkirmishAIReplayEpoch.h"
+#include "Common/GeneralsPathfindingReplayEpoch.h"
 #include "GameLogic/GeneralsAIPlanningRuntime.h"
 #include "GameLogic/GeneralsAIReplayPolicy.h"
 
@@ -21,6 +22,11 @@
 #include <iostream>
 #include <limits>
 #include <type_traits>
+
+#if defined(_MSC_VER)
+#include <crtdbg.h>
+#include <stdlib.h>
+#endif
 
 static_assert(std::is_standard_layout_v<GeneralsAIEnemyCandidateFact>);
 static_assert(std::is_trivially_copyable_v<GeneralsAIEnemyCandidateFact>);
@@ -32,6 +38,77 @@ static_assert(std::is_trivially_copyable_v<GeneralsAIEnemyPlanningResult>);
 namespace
 {
 const float kRetailEnemyThreshold = 1.0e12f;
+
+void TestGeneralsPathfindingReplayEpochContract()
+{
+	const WideChar *current =
+		L"build [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1]";
+	assert(GetGeneralsPathfindingReplayEpoch(current) ==
+		GENERALS_PATHFINDING_REPLAY_EPOCH_CURRENT);
+	assert(GetSkirmishAIReplayEpoch(current) == SKIRMISH_AI_REPLAY_EPOCH_CURRENT);
+	const WideChar *legacy[] =
+	{
+		NULL, L"", L"build",
+		L"build [GeneralsAIPlanningEpoch=1]",
+		L"build [GeneralsPathfindingEpoch=1]",
+		L"build [GeneralsAIPlanningEpoch=1] [GeneralsPathfindingEpoch=1]",
+		L"build [GeneralsPathfindingEpoch=1][GeneralsAIPlanningEpoch=1]",
+		L"build [GeneralsPathfindingEpoch=1] middle [GeneralsAIPlanningEpoch=1]",
+		L"build [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1] ",
+		L"build [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1] trailing",
+		L"build [GeneralsPathfindingEpoch=0] [GeneralsAIPlanningEpoch=1]",
+		L"build [GeneralsPathfindingEpoch=2] [GeneralsAIPlanningEpoch=1]",
+		L"build [GeneralsPathfindingEpoch=01] [GeneralsAIPlanningEpoch=1]",
+		L"build [GeneralsPathfindingEpoch=-1] [GeneralsAIPlanningEpoch=1]",
+		L"build [GeneralsPathfindingEpoch=bogus] [GeneralsAIPlanningEpoch=1]",
+		L"build [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=0]",
+		L"build [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=2]",
+		L"build [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=01]",
+		L"build [GeneralsPathfindingEpoch=1] [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1]",
+		L"build [GeneralsPathfindingEpoch=2] [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1]",
+		L"build [GeneralsPathfindingEpoch] [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1]",
+		L"build [GeneralsPathfindingEpoch:1] [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1]",
+		L"build [GeneralsPathfindingEpoch=bogus] [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1]",
+		L"build [GeneralsAIPlanningEpoch=1] [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1]",
+		L"build [GeneralsAIPlanningEpoch=2] [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1]",
+		L"build [GeneralsAIPlanningEpoch] [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1]",
+		L"build [GeneralsAIPlanningEpoch=bogus] [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1]",
+		L"build [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1] [GeneralsPathfindingEpoch]",
+		L"build [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1] [GeneralsAIPlanningEpoch]",
+		L"build [PathfindQueueEpoch=1] [GeneralsAIPlanningEpoch=1]"
+	};
+	for (unsigned i = 0; i < sizeof(legacy) / sizeof(legacy[0]); ++i)
+		assert(GetGeneralsPathfindingReplayEpoch(legacy[i]) ==
+			GENERALS_PATHFINDING_REPLAY_EPOCH_LEGACY);
+	// Adding the path contract must not reinterpret existing AI-only recordings.
+	assert(GetSkirmishAIReplayEpoch(L"build [GeneralsAIPlanningEpoch=1]") ==
+		SKIRMISH_AI_REPLAY_EPOCH_CURRENT);
+
+	const Int localModes[] = { GAME_SINGLE_PLAYER, GAME_SKIRMISH };
+	for (unsigned i = 0; i < sizeof(localModes) / sizeof(localModes[0]); ++i)
+	{
+		assert(GetGeneralsPathfindingRecordingEpoch(localModes[i], true, false, 1) == 1);
+		assert(GetGeneralsPathfindingRecordingEpoch(localModes[i], false, false, 1) == 0);
+		assert(GetGeneralsPathfindingRecordingEpoch(localModes[i], true, true, 1) == 0);
+		assert(GetGeneralsPathfindingRecordingEpoch(localModes[i], true, false, 0) == 0);
+		assert(GetGeneralsPathfindingRecordingEpoch(localModes[i], true, false, 2) == 0);
+		assert(GetGeneralsPathfindingPlaybackEpoch(current, localModes[i], true) == 1);
+		assert(GetGeneralsPathfindingPlaybackEpoch(current, localModes[i], false) == 0);
+		for (unsigned j = 0; j < sizeof(legacy) / sizeof(legacy[0]); ++j)
+			assert(GetGeneralsPathfindingPlaybackEpoch(legacy[j], localModes[i], true) == 0);
+	}
+	const Int otherModes[] =
+		{ GAME_LAN, GAME_INTERNET, GAME_REPLAY, GAME_SHELL, GAME_NONE, -1, 999 };
+	for (unsigned i = 0; i < sizeof(otherModes) / sizeof(otherModes[0]); ++i)
+	{
+		assert(GetGeneralsPathfindingRecordingEpoch(otherModes[i], true, false, 1) == 0);
+		assert(GetGeneralsPathfindingPlaybackEpoch(current, otherModes[i], true) == 0);
+	}
+	for (Int pathEpoch = -1; pathEpoch <= 2; ++pathEpoch)
+		for (Int aiEpoch = -1; aiEpoch <= 2; ++aiEpoch)
+			assert(HasCurrentGeneralsPathfindingReplayEpoch(pathEpoch, aiEpoch) ==
+				(pathEpoch == 1 && aiEpoch == 1));
+}
 
 void TestTopologyAndReplayGates()
 {
@@ -373,6 +450,15 @@ void TestCanonicalBatchAcrossTopologiesAndFailure()
 
 int main()
 {
+#if defined(_MSC_VER)
+	_set_error_mode(_OUT_TO_STDERR);
+#if _MSC_VER >= 1400
+	_set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
+	_CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+	_CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+#endif
+	TestGeneralsPathfindingReplayEpochContract();
 	TestTopologyAndReplayGates();
 	TestGeneralsScoringAndUntrustedResults();
 	TestCanonicalBatchAcrossTopologiesAndFailure();

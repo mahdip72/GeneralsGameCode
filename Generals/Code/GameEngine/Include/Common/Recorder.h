@@ -152,6 +152,8 @@ public:
 	Bool replayUsesSkirmishAIDeterministicPlanning() const {
 		return m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_CURRENT;
 	}
+	Int getGeneralsPathfindingReplayEpoch() const { return m_generalsPathfindingReplayEpoch; }
+	Bool replayUsesCurrentGeneralsPathfindingEpoch() const;
 	void initControls();															///< Show or Hide the Replay controls
 
 	static AsciiString getReplayDir();								///< Returns the directory that holds the replay files.
@@ -211,6 +213,7 @@ protected:
 
 	Bool m_doingAnalysis;
 	Int m_skirmishAIReplayEpoch;
+	Int m_generalsPathfindingReplayEpoch;
 	Bool m_archiveReplays;														///< if true, each replay is archived to the replay archive folder after recording
 
 	Int m_originalGameMode; // valid in replays

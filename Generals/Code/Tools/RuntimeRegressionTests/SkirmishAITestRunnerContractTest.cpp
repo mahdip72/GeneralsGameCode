@@ -14,9 +14,11 @@
 #include "Common/SkirmishAITestRunner.h"
 #include "Common/PerformanceReceiptRuntime.h"
 #include "Common/SkirmishAIReplayEpoch.h"
+#include "Common/GeneralsPathfindingReplayEpoch.h"
 #include "GameLogic/AIPathfind.h"
 #include "Lib/SimulationPhaseGraphOwnerAdapter.h"
 #if defined(_WIN64)
+#include <cstdint>
 #include "AudioDevice/AudioAssetSource.h"
 #include "AudioDevice/NullAudioManager.h"
 #include "Common/ArchiveFileSystem.h"
@@ -295,6 +297,247 @@ static void TestSkirmishAIReplayEpoch()
 	CHECK(CountSkirmishAIReplayMarkers(marked.str(),
 		GetSkirmishAIReplayMarkerPrefix()) == 1);
 }
+
+static void TestGeneralsPathfindingReplayEpochWriter()
+{
+	UnicodeString version = L"native build";
+	MarkReplayVersionForGeneralsPathfindingCurrentEpoch(version);
+	CHECK(version == L"native build [GeneralsPathfindingEpoch=1]");
+	MarkReplayVersionForGeneralsPathfindingCurrentEpoch(version);
+	CHECK(version == L"native build [GeneralsPathfindingEpoch=1]");
+	// The path marker precedes the existing terminal AI marker on the wire.
+	MarkReplayVersionForSkirmishAICurrentEpoch(version);
+	CHECK(version == L"native build [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1]");
+	CHECK(GetGeneralsPathfindingReplayEpoch(version) == 1);
+	CHECK(GetSkirmishAIReplayEpoch(version) == 1);
+	MarkReplayVersionForGeneralsPathfindingCurrentEpoch(version);
+	MarkReplayVersionForSkirmishAICurrentEpoch(version);
+	CHECK(version == L"native build [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1]");
+
+	// Never retrofit an AI-only header in the wrong order or repair a future,
+	// duplicate, or malformed family into an apparently current recording.
+	const WideChar *unchanged[] =
+	{
+		L"native build [GeneralsAIPlanningEpoch=1]",
+		L"native build [GeneralsAIPlanningEpoch=2]",
+		L"native build [GeneralsAIPlanningEpoch]",
+		L"native build [GeneralsAIPlanningEpoch=bogus]",
+		L"native build [GeneralsPathfindingEpoch=0]",
+		L"native build [GeneralsPathfindingEpoch=2]",
+		L"native build [GeneralsPathfindingEpoch]",
+		L"native build [GeneralsPathfindingEpoch=bogus]",
+		L"native build [GeneralsPathfindingEpoch=1] trailing",
+		L"native build [GeneralsPathfindingEpoch=1] [GeneralsPathfindingEpoch=1]",
+		L"native build [GeneralsPathfindingEpoch] [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1]",
+		L"native build [GeneralsAIPlanningEpoch] [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1]"
+	};
+	for (unsigned i = 0; i < sizeof(unchanged) / sizeof(unchanged[0]); ++i)
+	{
+		UnicodeString rejected = unchanged[i];
+		MarkReplayVersionForGeneralsPathfindingCurrentEpoch(rejected);
+		CHECK(rejected == unchanged[i]);
+		CHECK(GetGeneralsPathfindingReplayEpoch(rejected) == 0);
+	}
+	CHECK(GetSkirmishAIReplayEpoch(unchanged[0]) == 1);
+}
+
+#if defined(_WIN64)
+namespace GeneralsPathfindingRecorderEpochTest
+{
+// Only external I/O and surrounding object state are supplied here. Each
+// included fragment is extracted from the actual Recorder.cpp by CMake.
+struct VersionSource
+{
+	UnicodeString getUnicodeVersion() const { return L"native version"; }
+	UnicodeString getUnicodeBuildTime() const { return L"native build"; }
+};
+static VersionSource s_version;
+static VersionSource *TheVersion = &s_version;
+static void *TheNetwork = NULL;
+
+struct LaunchStream
+{
+	std::uint32_t words[4];
+	unsigned available;
+	unsigned consumed;
+};
+
+static Bool readNativeReplayU32Field(LaunchStream *stream, std::uint32_t *value)
+{
+	if (!stream || stream->consumed >= stream->available)
+		return FALSE;
+	*value = stream->words[stream->consumed++];
+	return TRUE;
+}
+
+struct GameInfoState
+{
+	unsigned endCount;
+	unsigned resetCount;
+	GameInfoState() : endCount(0), resetCount(0) {}
+	void endGame() { ++endCount; }
+	void reset() { ++resetCount; }
+};
+
+struct Header
+{
+	UnicodeString versionTimeString;
+};
+
+struct RecorderEpochState
+{
+	Int m_skirmishAIReplayEpoch;
+	Int m_generalsPathfindingReplayEpoch;
+	Int m_originalGameMode;
+	Bool m_replayReadError;
+	Bool m_nativeReplayContainer;
+	std::uint32_t m_nativeReplayRecordBytes;
+	LaunchStream stream;
+	LaunchStream *m_file;
+	GameInfoState m_gameInfo;
+
+	RecorderEpochState() : m_skirmishAIReplayEpoch(0),
+		m_generalsPathfindingReplayEpoch(0), m_originalGameMode(GAME_NONE),
+		m_replayReadError(FALSE), m_nativeReplayContainer(FALSE),
+		m_nativeReplayRecordBytes(0), m_file(&stream) {}
+
+	Int getGameMode() const { return m_originalGameMode; }
+
+	void resetEpochs()
+	{
+#include "GeneralsRecorderInitEpochUnderTest.inc"
+	}
+
+	UnicodeString recordEpoch(Int originalGameMode)
+	{
+		resetEpochs();
+		// startRecording resets the member mode before writing the header; only
+		// its originalGameMode argument still describes this new recording.
+		m_originalGameMode = GAME_NONE;
+#include "GeneralsRecorderRecordingEpochUnderTest.inc"
+		return versionTimeString;
+	}
+
+	Bool failReplayHeaderRead()
+	{
+		m_file = NULL;
+		return FALSE;
+	}
+
+	Bool playbackEpoch(const WideChar *version, Int originalMode,
+		unsigned availableWords, Bool headerValid)
+	{
+		stream.words[0] = 2U;
+		stream.words[1] = static_cast<std::uint32_t>(originalMode);
+		stream.words[2] = 0U;
+		stream.words[3] = 30U;
+		stream.available = availableWords;
+		stream.consumed = 0;
+		m_file = &stream;
+#include "GeneralsRecorderPlaybackResetUnderTest.inc"
+		if (!headerValid)
+			return FALSE;
+		Header header;
+		header.versionTimeString = version;
+#include "GeneralsRecorderPlaybackHeaderEpochUnderTest.inc"
+		// The decoded original mode is not available yet. Merely parsing a
+		// current-looking string must not enable local path semantics here.
+		CHECK(m_generalsPathfindingReplayEpoch == 0);
+#include "GeneralsRecorderPlaybackLaunchEpochUnderTest.inc"
+		return TRUE;
+	}
+};
+
+static void TestLifecycle()
+{
+	const Bool savedRuntimeEpoch = IsGeneralsAICanonicalRuntimeEpoch();
+	SetGeneralsAICanonicalRuntimeEpoch(TRUE);
+	RecorderEpochState recorder;
+	recorder.m_skirmishAIReplayEpoch = 1;
+	recorder.m_generalsPathfindingReplayEpoch = 1;
+	recorder.resetEpochs();
+	CHECK(recorder.m_skirmishAIReplayEpoch == 0);
+	CHECK(recorder.m_generalsPathfindingReplayEpoch == 0);
+	const WideChar *current =
+		L"native build [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1]";
+	const Int localModes[] = { GAME_SINGLE_PLAYER, GAME_SKIRMISH };
+	for (unsigned i = 0; i < sizeof(localModes) / sizeof(localModes[0]); ++i)
+	{
+		TheNetwork = NULL;
+		const UnicodeString recording = recorder.recordEpoch(localModes[i]);
+		CHECK(recording == current);
+		CHECK(recorder.m_originalGameMode == GAME_NONE);
+		CHECK(recorder.m_skirmishAIReplayEpoch == 1);
+		CHECK(recorder.m_generalsPathfindingReplayEpoch == 1);
+		CHECK(HasCurrentGeneralsPathfindingReplayEpoch(
+			recorder.m_generalsPathfindingReplayEpoch, recorder.m_skirmishAIReplayEpoch));
+		TheNetwork = &recorder;
+		CHECK(recorder.recordEpoch(localModes[i]) ==
+			L"native build [GeneralsAIPlanningEpoch=1]");
+		CHECK(recorder.m_generalsPathfindingReplayEpoch == 0);
+		TheNetwork = NULL;
+		SetGeneralsAICanonicalRuntimeEpoch(FALSE);
+		CHECK(recorder.recordEpoch(localModes[i]) == L"native build");
+		CHECK(recorder.m_generalsPathfindingReplayEpoch == 0);
+		CHECK(recorder.m_skirmishAIReplayEpoch == 0);
+		SetGeneralsAICanonicalRuntimeEpoch(TRUE);
+		CHECK(recorder.playbackEpoch(current, localModes[i], 4, TRUE));
+		CHECK(recorder.m_originalGameMode == localModes[i]);
+		CHECK(recorder.m_generalsPathfindingReplayEpoch == 1);
+		CHECK(recorder.m_skirmishAIReplayEpoch == 1);
+		CHECK(recorder.stream.consumed == 4);
+		CHECK(recorder.playbackEpoch(L"native build [GeneralsAIPlanningEpoch=1]",
+			localModes[i], 4, TRUE));
+		CHECK(recorder.m_skirmishAIReplayEpoch == 1);
+		CHECK(recorder.m_generalsPathfindingReplayEpoch == 0);
+	}
+	const Int otherModes[] =
+		{ GAME_LAN, GAME_INTERNET, GAME_REPLAY, GAME_SHELL, GAME_NONE, -1, 999 };
+	for (unsigned i = 0; i < sizeof(otherModes) / sizeof(otherModes[0]); ++i)
+	{
+		CHECK(recorder.recordEpoch(otherModes[i]) == L"native build");
+		CHECK(recorder.m_generalsPathfindingReplayEpoch == 0);
+		CHECK(recorder.playbackEpoch(current, otherModes[i], 4, TRUE));
+		CHECK(recorder.m_generalsPathfindingReplayEpoch == 0);
+	}
+	const WideChar *legacy[] =
+	{
+		L"native build",
+		L"native build [GeneralsPathfindingEpoch=2] [GeneralsAIPlanningEpoch=1]",
+		L"native build [GeneralsPathfindingEpoch] [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1]",
+		L"native build [GeneralsAIPlanningEpoch] [GeneralsPathfindingEpoch=1] [GeneralsAIPlanningEpoch=1]"
+	};
+	for (unsigned i = 0; i < sizeof(legacy) / sizeof(legacy[0]); ++i)
+	{
+		recorder.m_generalsPathfindingReplayEpoch = 1;
+		CHECK(recorder.playbackEpoch(legacy[i], GAME_SKIRMISH, 4, TRUE));
+		CHECK(recorder.m_generalsPathfindingReplayEpoch == 0);
+	}
+	for (unsigned available = 0; available < 4; ++available)
+	{
+		recorder.m_generalsPathfindingReplayEpoch = 1;
+		const unsigned ends = recorder.m_gameInfo.endCount;
+		const unsigned resets = recorder.m_gameInfo.resetCount;
+		CHECK(!recorder.playbackEpoch(current, GAME_SKIRMISH, available, TRUE));
+		CHECK(recorder.m_generalsPathfindingReplayEpoch == 0);
+		CHECK(recorder.stream.consumed == available);
+		CHECK(recorder.m_gameInfo.endCount == ends + 1);
+		CHECK(recorder.m_gameInfo.resetCount == resets + 1);
+		CHECK(recorder.m_file == NULL);
+	}
+	recorder.m_generalsPathfindingReplayEpoch = 1;
+	recorder.m_skirmishAIReplayEpoch = 1;
+	CHECK(!recorder.playbackEpoch(current, GAME_SKIRMISH, 4, FALSE));
+	CHECK(recorder.m_generalsPathfindingReplayEpoch == 0);
+	CHECK(recorder.m_skirmishAIReplayEpoch == 0);
+	CHECK(recorder.playbackEpoch(current, GAME_SKIRMISH, 4, TRUE));
+	CHECK(recorder.m_generalsPathfindingReplayEpoch == 1);
+	recorder.resetEpochs();
+	CHECK(recorder.m_generalsPathfindingReplayEpoch == 0);
+	SetGeneralsAICanonicalRuntimeEpoch(savedRuntimeEpoch);
+}
+} // namespace GeneralsPathfindingRecorderEpochTest
+#endif
 
 static void TestTextureLoadQueuePublication()
 {
@@ -868,6 +1111,12 @@ int RunHeadlessMetricStartupTitleTests();
 int main(int argc, char **argv)
 {
 #if defined(_WIN64)
+	if (argc == 2 && strcmp(argv[1], "--generals-pathfinding-recorder-epoch") == 0)
+	{
+		GeneralsPathfindingRecorderEpochTest::TestLifecycle();
+		printf("Generals recorder path epoch: %d failure(s).\n", s_failures);
+		return s_failures != 0 ? 1 : 0;
+	}
 	if (argc == 2 && strcmp(argv[1], "--headless-metric-startup") == 0)
 		return RunHeadlessMetricStartupTitleTests();
 	if (argc == 2 && strcmp(argv[1], "--performance-receipt-lifecycle") == 0)
@@ -888,6 +1137,12 @@ int main(int argc, char **argv)
 		}
 		printf("All Generals skirmish AI replay epoch tests passed.\n");
 		return 0;
+	}
+	if (argc == 2 && strcmp(argv[1], "--generals-pathfinding-replay-epoch") == 0)
+	{
+		TestGeneralsPathfindingReplayEpochWriter();
+		printf("Generals path epoch writer: %d failure(s).\n", s_failures);
+		return s_failures != 0 ? 1 : 0;
 	}
 #if defined(_WIN64)
 	if (argc == 2 && strcmp(argv[1], "--native-logical-audio") == 0)

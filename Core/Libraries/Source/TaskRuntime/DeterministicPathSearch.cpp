@@ -1646,10 +1646,12 @@ bool IsDirectPathAuthorityAllowed(
 	{
 		return !policy.replayGame || policy.replayUsesCurrentPathEpoch;
 	}
-	// Generals has no direct-path replay epoch.  Keep both recording and
-	// playback on the legacy lane until such an epoch is published.
-	return !policy.recordingGame && !policy.replayGame &&
-		policy.runtimeUsesCurrentGeneralsEpoch;
+	// The Generals path/AI epoch pair admits local recording and playback.
+	// The existing negotiated unrecorded network lane remains separate.
+	return policy.runtimeUsesCurrentGeneralsEpoch &&
+		((!policy.recordingGame && !policy.replayGame) ||
+			(!policy.networkGame && !policy.multiplayerGame &&
+				policy.replayUsesCurrentPathEpoch));
 }
 
 bool IsFixedPathfindingSemanticsAllowed(
@@ -1664,10 +1666,11 @@ bool IsFixedPathfindingSemanticsAllowed(
 		// separately excluded from ordinary worker authority by the owner.
 		return !policy.replayGame || policy.replayUsesCurrentPathEpoch;
 	}
-	// Generals has no pathfinding replay marker.  Its current native epoch is
-	// therefore live-only; both recording and replay stay on retail semantics.
-	return policy.runtimeUsesCurrentGeneralsEpoch && !policy.recordingGame &&
-		!policy.replayGame;
+	// Same-build unrecorded sessions (including save restoration) retain the
+	// native semantics. Recording/playback additionally require the path epoch.
+	return policy.runtimeUsesCurrentGeneralsEpoch &&
+		((!policy.recordingGame && !policy.replayGame) ||
+			policy.replayUsesCurrentPathEpoch);
 }
 
 bool IsOrdinaryPathAuthorityAllowed(
@@ -1675,7 +1678,7 @@ bool IsOrdinaryPathAuthorityAllowed(
 	bool fixedPathfindingSemantics) noexcept
 {
 	// Ordinary A* has no multiplayer or replay proven bit yet.  Even a marked
-	// Zero Hour replay that uses fixed serial semantics cannot accept worker
+	// replay that uses fixed serial semantics cannot accept ordinary worker
 	// authority; the marker preserves playback compatibility only.
 	return fixedPathfindingSemantics && !policy.networkGame &&
 		!policy.multiplayerGame && !policy.replayGame &&

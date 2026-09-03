@@ -46,11 +46,17 @@ add_test(NAME g_skirmish_ai_replay_epoch_tests
     COMMAND g_skirmish_ai_runner_contract_tests --skirmish-ai-replay-epoch)
 set_tests_properties(g_skirmish_ai_replay_epoch_tests PROPERTIES TIMEOUT 30)
 
+add_test(NAME g_generals_pathfinding_replay_epoch_tests
+    COMMAND g_skirmish_ai_runner_contract_tests --generals-pathfinding-replay-epoch)
+set_tests_properties(g_generals_pathfinding_replay_epoch_tests PROPERTIES TIMEOUT 30)
+
 add_test(NAME g_texture_load_queue_contract_tests
     COMMAND g_skirmish_ai_runner_contract_tests --texture-load-queue-contract)
 set_tests_properties(g_texture_load_queue_contract_tests PROPERTIES TIMEOUT 30)
 
 if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/GeneralsPathfindingReplayEpochTest.cmake")
+    rts_add_generals_pathfinding_recorder_epoch_test(g_skirmish_ai_runner_contract_tests)
     include("${CMAKE_SOURCE_DIR}/Core/Tools/Stage5PerformanceFixtureTest/HeadlessMetricStartupTitleTest.cmake")
     rts_add_headless_metric_startup_test(g_skirmish_ai_runner_contract_tests
         Generals g_headless_metric_startup_tests)
@@ -150,6 +156,8 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD
     # audio path, matching the title's installed runtime closure.
     set_tests_properties(
         g_skirmish_ai_replay_epoch_tests
+        g_generals_pathfinding_replay_epoch_tests
+        g_generals_pathfinding_recorder_epoch_tests
         g_skirmish_ai_runner_contract_tests
         g_native_logical_audio_tests
         g_texture_load_queue_contract_tests
