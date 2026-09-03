@@ -3030,12 +3030,19 @@ function Assert-Stage5LivePlanPrelaunchBinding {
         }
         $entry.command = ConvertTo-DisplayCommand $executable $entry.arguments
     }
-    $documentsRoot = Join-Path $directory 'Documents'
+    # Metadata only: this fixture never redirects Documents or creates this
+    # path. Hosted unit-test scratch may be on a different volume.
+    $documentsRoot = 'H:\Stage5SyntheticDocuments'
     $launcher = [pscustomobject]@{
         executable = [IO.Path]::GetFileName($executable); arguments = @()
         launcherPath = Join-Path $directory 'launcher.exe'
         configPath = Join-Path $directory 'launcher.lcf'
     }
+    Assert-Throws {
+        Assert-LauncherEquivalenceContract $launcher $executable $directory `
+            $plan.entries 'FinalizedProfile' 'D:\Stage5SyntheticDocuments' | Out-Null
+    } 'Validation Documents redirection must remain on H' `
+        'installed Documents safety remains enforced for metadata outside H'
     $plan | Add-Member -NotePropertyMembers @{
         runtimeRoot = $directory; executable = $executable; executableSha256 = ('A' * 64)
         title = 'ZeroHour'; cohortNonce = $script:TestCohortNonce
@@ -3150,6 +3157,213 @@ function Assert-Stage5LivePlanPrelaunchBinding {
         'changed plan bytes reject the original binding rather than blessing a new hash'
     Assert-True (-not (Test-Path -LiteralPath (Split-Path -Parent $invokeArguments.Entry.stdout))) `
         'changed frozen plan is rejected before creating child output directories'
+}
+
+function Assert-Stage5LiveManifestPlanRouting {
+    param([string]$Runtime, [string]$Manifest, [object]$LegacyPlan)
+    Assert-True ($LegacyPlan.schemaVersion -eq 1 -and
+        $null -eq $LegacyPlan.PSObject.Properties['liveQualification'] -and
+        @($LegacyPlan.entries | Where-Object {
+            $null -ne $_.PSObject.Properties['entryId'] -or
+            $null -ne $_.PSObject.Properties['validationRole'] -or
+            $null -ne $_.PSObject.Properties['proofProfileId']
+        }).Count -eq 0) 'V1 public plans remain explicitly legacy without nullable V2 role properties'
+    $v2 = [IO.File]::ReadAllText($Manifest) | ConvertFrom-Json
+    $v2.schemaVersion = 2
+    $v2.ai | Add-Member -NotePropertyName liveQualification -NotePropertyValue ([pscustomobject]@{
+        schemaVersion = 1; profileSetId = 'live-all-slices-v1'
+        authorityEntries = @(
+            [pscustomobject]@{scenario='4v2';seed=1729;configuration='parallel-2';repeat=2},
+            [pscustomobject]@{scenario='4v2';seed=1730;configuration='parallel-4';repeat=1})
+        shadowEntry = [pscustomobject]@{scenario='4v2';seed=1729;configuration='shadow-16';repeat=1}
+    })
+    $manifestDirectory = Split-Path -Parent $Manifest
+    $v2Path = Join-Path $manifestDirectory 'live-manifest-v2.json'
+    [IO.File]::WriteAllText($v2Path, ($v2 | ConvertTo-Json -Depth 12))
+    $output = Join-Path $root 'live-manifest-v2-plan'
+    $errorText = ''
+    try {
+        & $scriptPath -RuntimeRoot $Runtime -FixtureManifestPath $v2Path -OutputRoot $output `
+            -ValidationSet AI -MinimumFreeBytes 1 -PlanOnly | Out-Null
+    }
+    catch { $errorText = $_.Exception.Message }
+    $planPath = Join-Path $output 'validation-plan.json'
+    $generated = $errorText -ceq '' -and (Test-Path -LiteralPath $planPath)
+    Assert-True $generated "public PlanOnly routes the explicit V2 live manifest (got '$errorText')"
+    if ($generated) {
+        $planned = [IO.File]::ReadAllText($planPath) | ConvertFrom-Json
+        $authority = @($planned.entries | Where-Object { $_.validationRole -ceq 'live-authority-stress' })
+        $shadow = @($planned.entries | Where-Object { $_.validationRole -ceq 'live-shadow-stress' })
+        $ordinary = @($planned.entries | Where-Object { $_.validationRole -ceq 'live-determinism' })
+        Assert-True ($planned.schemaVersion -eq 2 -and $planned.entries.Count -eq 85 -and
+            $planned.liveQualification.profileSetId -ceq 'live-all-slices-v1' -and
+            $planned.liveQualification.authorityEntries.Count -eq 2) `
+            'V2 planning preserves the full 84-run regular matrix and one predeclared shadow'
+        Assert-True (($authority.entryId -join '|') -ceq 'ai-0032|ai-0045' -and
+            @($authority | Where-Object { $_.proofProfileId -ceq 'live-all-slices-authority-v1' }).Count -eq 2 -and
+            $shadow.Count -eq 1 -and $shadow[0].entryId -ceq 'ai-0085' -and
+            $shadow[0].proofProfileId -ceq 'live-all-slices-shadow-v1' -and
+            $ordinary.Count -eq 82 -and
+            @($ordinary | Where-Object { $_.proofProfileId -ceq 'live-invariants-v1' }).Count -eq 82) `
+            'exact manifest tuples assign stable sequence IDs and closed profiles before any observed result'
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $output 'runs')) -and
+            -not (Test-Path -LiteralPath (Join-Path $output 'validation-results.json')) -and
+            -not (Test-Path -LiteralPath (Join-Path $output 'validation-plan-receipt.json')) -and
+            -not $planned.finalAcceptanceEligible) `
+            'a V2 PlanOnly preview has no child attempt, result, or execution receipt'
+    }
+    foreach ($case in @(
+        @{name='missing-qualification';pattern='liveQualification';edit={param($m) $m.ai.PSObject.Properties.Remove('liveQualification')}},
+        @{name='incapable-authority';pattern='authority selector|incapable';edit={param($m) $m.ai.liveQualification.authorityEntries[0].configuration='parallel-1'}},
+        @{name='wrong-shadow';pattern='shadow selector|shadow.*absent';edit={param($m) $m.ai.liveQualification.shadowEntry.configuration='shadow-8'}}
+    )) {
+        $invalid = [IO.File]::ReadAllText($v2Path) | ConvertFrom-Json
+        & $case.edit $invalid
+        $invalidPath = Join-Path $manifestDirectory ($case.name + '-live-manifest.json')
+        [IO.File]::WriteAllText($invalidPath, ($invalid | ConvertTo-Json -Depth 12))
+        $invalidOutput = Join-Path $root ($case.name + '-live-plan')
+        Assert-Throws {
+            & $scriptPath -RuntimeRoot $Runtime -FixtureManifestPath $invalidPath `
+                -OutputRoot $invalidOutput -ValidationSet AI -MinimumFreeBytes 1 -PlanOnly | Out-Null
+        } $case.pattern "public V2 planning rejects $($case.name) at its live contract boundary"
+    }
+    $v2.schemaVersion = 1
+    $legacyTaggedPath = Join-Path $manifestDirectory 'legacy-tagged-live-manifest.json'
+    [IO.File]::WriteAllText($legacyTaggedPath, ($v2 | ConvertTo-Json -Depth 12))
+    Assert-Throws {
+        & $scriptPath -RuntimeRoot $Runtime -FixtureManifestPath $legacyTaggedPath `
+            -OutputRoot (Join-Path $root 'legacy-tagged-live-plan') -ValidationSet AI `
+            -MinimumFreeBytes 1 -PlanOnly | Out-Null
+    } 'unsupported property.*liveQualification|V1.*liveQualification' `
+        'V1 cannot acquire V2 qualification by adding a nested live selector object'
+}
+
+function Assert-Stage5LivePlanCallerRouting {
+    # Execute the actual top-level emission/finalization statements and child
+    # call only. The profile/registry setup and the child loop are never run.
+    $parseTokens = $null; $parseErrors = $null
+    $tree = [System.Management.Automation.Language.Parser]::ParseFile(
+        (Join-Path $PSScriptRoot 'Run-DeterministicSimulationValidation.ps1'),
+        [ref]$parseTokens, [ref]$parseErrors)
+    Assert-True ($parseErrors.Count -eq 0) 'live plan caller runner parses without errors'
+    foreach ($definition in $tree.EndBlock.Statements) {
+        if ($definition -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
+            Invoke-Expression $definition.Extent.Text
+        }
+    }
+    $topLevel = @($tree.EndBlock.Statements)
+    $initial = New-Object 'Collections.Generic.List[string]'
+    $collecting = $false
+    foreach ($statement in $topLevel) {
+        if ($statement -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $statement.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+            $statement.Left.VariablePath.UserPath -ceq 'planPath') { $collecting = $true }
+        if (-not $collecting) { continue }
+        if ($statement -is [System.Management.Automation.Language.IfStatementAst] -and
+            $null -ne $statement.Clauses[0].Item1.Find({param($node)
+                $node -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                $node.VariablePath.UserPath -ceq 'EnforcePerformance'
+            }, $true)) { break }
+        $initial.Add($statement.Extent.Text) | Out-Null
+    }
+    $processLoop = $tree.Find({param($node)
+        $node -is [System.Management.Automation.Language.ForEachStatementAst] -and
+        $node.Variable.VariablePath.UserPath -ceq 'entry' -and
+        $null -ne $node.Body.Find({param($child)
+            $child -is [System.Management.Automation.Language.CommandAst] -and
+            $child.GetCommandName() -ceq 'Invoke-ValidationProcess'
+        }, $true)
+    }, $true)
+    Assert-True ($initial.Count -gt 0 -and $null -ne $processLoop) `
+        'existing plan emission and process iteration remain executable caller boundaries'
+    if ($initial.Count -eq 0 -or $null -eq $processLoop) { return }
+    $final = New-Object 'Collections.Generic.List[string]'
+    $collecting = $false
+    foreach ($statement in $processLoop.Parent.Statements) {
+        if ($statement.Extent.StartOffset -eq $processLoop.Extent.StartOffset) { break }
+        if ($statement -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $statement.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+            $statement.Left.VariablePath.UserPath -ceq 'launcherEquivalence') { $collecting = $true }
+        if ($collecting) { $final.Add($statement.Extent.Text) | Out-Null }
+    }
+    $processAssignment = @($processLoop.Body.Statements | Where-Object {
+        $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+        $null -ne $_.Right.Find({param($node)
+            $node -is [System.Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -ceq 'Invoke-ValidationProcess'
+        }, $true)
+    })
+    Assert-True ($final.Count -gt 0 -and $processAssignment.Count -eq 1) `
+        'existing final launcher binding and actual child invocation can be isolated without setup'
+    if ($final.Count -eq 0 -or $processAssignment.Count -ne 1) { return }
+    $initialBlock = [scriptblock]::Create(($initial.ToArray() -join "`n"))
+    $finalBlock = [scriptblock]::Create(($final.ToArray() -join "`n"))
+    $processBlock = [scriptblock]::Create($processAssignment[0].Extent.Text)
+
+    $outputFull = Join-Path $root 'live-plan-caller-routing'
+    New-Item -ItemType Directory -Path $outputFull | Out-Null
+    $runtimeFull = $outputFull
+    $executableFull = Join-Path $runtimeFull ('never-created-' + [Guid]::NewGuid().ToString('N') + '.exe')
+    $planDocument = New-Stage5LiveRoleTestPlan
+    foreach ($entry in $planDocument.entries) {
+        $configuration = [pscustomobject]@{Mode=$entry.simulationMode;HasWorkerCount=$true;WorkerCount=[int]$entry.requestedWorkers}
+        $arguments = @(New-CommonArguments $configuration ('A' * 64)) + @('-runSkirmishAITest4v2', '1729')
+        $entryDirectory = Join-Path $outputFull $entry.entryId
+        $entry | Add-Member -NotePropertyMembers @{
+            arguments=$arguments;command=(ConvertTo-DisplayCommand $executableFull $arguments);timeoutSeconds=1
+            stdout=(Join-Path $entryDirectory 'stdout.log');stderr=(Join-Path $entryDirectory 'stderr.log')
+            timingDirectory=(Join-Path $entryDirectory 'timing');runtimeLogDirectory=(Join-Path $entryDirectory 'runtime-logs')
+        }
+    }
+    $plan = @($planDocument.entries)
+    $launcherContract = [pscustomobject]@{
+        executable=[IO.Path]::GetFileName($executableFull);arguments=@()
+        launcherPath=(Join-Path $runtimeFull 'launcher.exe');configPath=(Join-Path $runtimeFull 'launcher.lcf')
+    }
+    $planDocument | Add-Member -NotePropertyMembers @{
+        runtimeRoot=$runtimeFull;executable=$executableFull;executableSha256=('A' * 64);title='ZeroHour'
+        cohortNonce=$script:TestCohortNonce;cohortCreatedUtc=$script:TestCohortCreatedUtc
+        launcherContract=(Assert-LauncherEquivalenceContract $launcherContract $executableFull $runtimeFull $plan)
+    }
+    $manifestData = [pscustomobject]@{schemaVersion=2;ai=[pscustomobject]@{liveQualification=$planDocument.liveQualification}}
+    $PlanOnly = $false; $localCapacityRequested = $false
+    $deterministicRuntimeEligible = $false; $acceptanceBindingsRequested = $false
+    $livePlanBinding = $null
+    . $initialBlock
+    Assert-True (-not (Test-Path -LiteralPath $planPath)) `
+        'actual V2 execution defers plan publication until launcher/profile finalization'
+    $ProfileLeafName = 'FinalizedCallerProfile'
+    # The extracted caller consumes metadata, not a physical profile fixture.
+    $documentsRoot = 'H:\Stage5SyntheticCallerDocuments'
+    . $finalBlock
+    Assert-True ($null -ne $livePlanBinding) `
+        'top-level finalized V2 execution retains the original frozen binding for every child'
+    $originalJson = [IO.File]::ReadAllText($planPath)
+    $originalPlan = $originalJson | ConvertFrom-Json
+    Assert-True ($originalPlan.launcherContract.profileLeafName -ceq 'FinalizedCallerProfile' -and
+        $originalPlan.launcherContract.documentsRoot -ceq $documentsRoot) `
+        'the top-level plan records the actual final profile rather than a draft launcher binding'
+    Assert-Throws { . $finalBlock } 'exist|create.new|overwrite' `
+        'a second top-level finalization cannot overwrite the frozen cohort plan'
+    Assert-True ([IO.File]::ReadAllText($planPath) -ceq $originalJson) `
+        'refused top-level finalization preserves original frozen bytes'
+
+    # Independent immutable expected values expose an omitted caller argument
+    # even before the finalization route starts returning its own binding.
+    $values = New-Object 'Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
+    $values.Add('planPath', $planPath); $values.Add('planJson', $originalJson)
+    $values.Add('planSha256', (Get-Sha256Text $originalJson))
+    $livePlanBinding = New-Object 'Collections.ObjectModel.ReadOnlyDictionary[string,string]' -ArgumentList (,$values)
+    $entry = ($originalJson | ConvertFrom-Json).entries[1]
+    $changed = $originalJson | ConvertFrom-Json
+    $changed.entries[1].arguments[0] = '-changed-after-finalization'
+    [IO.File]::WriteAllText($planPath, ($changed | ConvertTo-Json -Depth 12))
+    $DisableFrameTiming = $true; $validationEnvironment = @{}; $nativeObservationBinding = $null
+    Assert-Throws { . $processBlock } 'frozen.*(hash|changed|bytes)|plan.*(hash|changed|bytes)' `
+        'the actual top-level child caller passes its original frozen binding instead of omitting it'
+    Assert-True (-not (Test-Path -LiteralPath (Split-Path -Parent $entry.stdout)) -and
+        -not (Test-Path -LiteralPath $executableFull)) `
+        'changed final plan cannot prepare a child or launch the nonexistent fixture executable'
 }
 
 function New-Stage5LiveRoleTestOutput {
@@ -3852,6 +4066,7 @@ try {
     Assert-InstalledNet3ModuleBoundary (Join-Path $root 'installed-net3-module-fixture.json')
     Assert-Stage5LiveRoleContract
     Assert-Stage5LivePlanPrelaunchBinding
+    Assert-Stage5LivePlanCallerRouting
     $runtime = Join-Path $root 'runtime'
     $fixtures = Join-Path $root 'fixtures'
     New-Item -ItemType Directory -Path $runtime | Out-Null
@@ -3910,6 +4125,7 @@ try {
     Assert-True ($shadowModeIndex -ge 0 -and
         $shadowEntries[0].arguments[$shadowModeIndex + 1] -ceq 'shadow') `
         'shadow stress execution passes simulationMode=shadow to the installed runtime'
+    Assert-Stage5LiveManifestPlanRouting $runtime $manifest $plan
 
     $localCapacityOutput = Join-Path $root 'local-capacity-plan-output'
     $localCapacityProcessors = @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop)

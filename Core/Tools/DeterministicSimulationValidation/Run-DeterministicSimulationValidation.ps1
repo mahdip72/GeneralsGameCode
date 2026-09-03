@@ -1002,8 +1002,8 @@ function Get-ManifestData {
         'executableSha256', 'fixtures', 'ai') 'Fixture manifest'
     $schemaVersion = Get-RequiredProperty $manifest 'schemaVersion' 'Fixture manifest'
     Assert-JsonInteger $schemaVersion 'Fixture manifest schemaVersion'
-    Assert-Condition ($schemaVersion -eq 1) `
-        'Fixture manifest schemaVersion must be 1.'
+    Assert-Condition ($schemaVersion -eq 1 -or $schemaVersion -eq 2) `
+        'Fixture manifest schemaVersion must be 1 or 2.'
     $title = Get-RequiredProperty $manifest 'title' 'Fixture manifest'
     Assert-JsonString $title 'Fixture manifest title'
     Assert-Condition ($title -ceq $ExpectedTitle) `
@@ -1106,8 +1106,31 @@ function Get-ManifestData {
         'Replay validation requires a unique source SHA-256 for every fixture.'
 
     $aiObject = Get-RequiredProperty $manifest 'ai' 'Fixture manifest'
-    Assert-JsonObjectShape $aiObject @('seeds', 'scenarios', 'repeats') `
-        @('seeds', 'scenarios', 'repeats') 'AI manifest'
+    $aiFields = @('seeds', 'scenarios', 'repeats')
+    if ($schemaVersion -eq 2) { $aiFields += 'liveQualification' }
+    Assert-JsonObjectShape $aiObject $aiFields $aiFields 'AI manifest'
+    $liveQualification = $null
+    if ($schemaVersion -eq 2) {
+        $liveQualification = Get-RequiredProperty $aiObject 'liveQualification' 'AI manifest'
+        $qualificationFields = @('schemaVersion', 'profileSetId', 'authorityEntries', 'shadowEntry')
+        Assert-JsonObjectShape $liveQualification $qualificationFields $qualificationFields 'AI liveQualification'
+        Assert-JsonInteger $liveQualification.schemaVersion 'AI liveQualification schemaVersion'
+        Assert-JsonString $liveQualification.profileSetId 'AI liveQualification profileSetId'
+        Assert-Condition ($liveQualification.schemaVersion -eq 1 -and
+            $liveQualification.profileSetId -ceq 'live-all-slices-v1') `
+            'AI liveQualification requires schema 1 and the closed live-all-slices-v1 profile.'
+        Assert-JsonArray $liveQualification.authorityEntries 'AI liveQualification authorityEntries'
+        Assert-Condition ($liveQualification.authorityEntries.Count -gt 0) `
+            'AI liveQualification requires at least one authority selector.'
+        $selectorFields = @('scenario', 'seed', 'configuration', 'repeat')
+        foreach ($selector in @($liveQualification.authorityEntries) + @($liveQualification.shadowEntry)) {
+            Assert-JsonObjectShape $selector $selectorFields $selectorFields 'AI liveQualification selector'
+            Assert-JsonString $selector.scenario 'AI liveQualification selector scenario'
+            Assert-JsonString $selector.configuration 'AI liveQualification selector configuration'
+            Assert-JsonInteger $selector.seed 'AI liveQualification selector seed'
+            Assert-JsonInteger $selector.repeat 'AI liveQualification selector repeat'
+        }
+    }
     $seedValues = Get-RequiredProperty $aiObject 'seeds' 'AI manifest'
     Assert-JsonArray $seedValues 'AI manifest seeds'
     $seeds = @($seedValues)
@@ -1141,8 +1164,12 @@ function Get-ManifestData {
             'The deterministic-runtime gate requires at least three distinct live-AI seeds.'
     }
     $ai = [pscustomobject]@{ seeds = $seeds; scenarios = $scenarios; repeats = [int]$aiRepeats }
+    if ($schemaVersion -eq 2) {
+        $ai | Add-Member -NotePropertyName liveQualification -NotePropertyValue $liveQualification
+    }
 
     return [pscustomobject]@{
+        schemaVersion = $schemaVersion
         file = $manifestFile
         directory = $manifestDirectory
         title = $title
@@ -1268,6 +1295,39 @@ function New-ValidationPlan {
         Add-PlanEntry $plan 'ai' "4v2-shadow-seed-$shadowSeed" $shadowConfiguration 1 `
             $AiTimeout $shadowArguments $Executable $OutputDirectory "4v2-seed-$shadowSeed" `
             '' '' $true 0 $shadowSeed '4v2'
+    }
+    if ($Data.schemaVersion -eq 2) {
+        $aiEntries = @($plan | Where-Object { $_.kind -ceq 'ai' })
+        Assert-Condition ($aiEntries.Count -gt 0) 'V2 live qualification requires an AI validation plan.'
+        $qualification = $Data.ai.liveQualification
+        $authorityKeys = @{}
+        foreach ($selector in $qualification.authorityEntries) {
+            $key = '{0}|{1}|{2}|{3}' -f $selector.scenario, $selector.seed,
+                $selector.configuration, $selector.repeat
+            $authorityKeys[$key] = $true
+        }
+        $shadow = $qualification.shadowEntry
+        $shadowKey = '{0}|{1}|{2}|{3}' -f $shadow.scenario, $shadow.seed, $shadow.configuration, $shadow.repeat
+        foreach ($entry in $aiEntries) {
+            $key = '{0}|{1}|{2}|{3}' -f $entry.scenario, $entry.seed, $entry.configuration, $entry.repeat
+            $role = 'live-determinism'; $profile = 'live-invariants-v1'
+            if ($authorityKeys.ContainsKey($key)) {
+                $role = 'live-authority-stress'; $profile = 'live-all-slices-authority-v1'
+            }
+            elseif ($key -ceq $shadowKey) {
+                $role = 'live-shadow-stress'; $profile = 'live-all-slices-shadow-v1'
+            }
+            $entry | Add-Member -NotePropertyMembers @{
+                entryId = ('ai-{0:D4}' -f $entry.sequence)
+                validationRole = $role; proofProfileId = $profile
+            }
+        }
+        # Keep the original selectors: the shared resolver rejects duplicates,
+        # absent/incapable tuples, and role/profile inconsistencies for the whole plan.
+        $livePlan = [pscustomobject]@{
+            schemaVersion=2;liveQualification=$qualification;entries=$plan.ToArray()
+        }
+        Resolve-Stage5LiveValidationRequirements $livePlan $aiEntries[0] | Out-Null
     }
     return $plan.ToArray()
 }
@@ -2360,7 +2420,7 @@ if ($ValidationSet -ne 'Replay') {
 }
 $deterministicRuntimeEligible = $deterministicRuntimeContractRequested -and [bool]$EnforcePerformance
 $planDocument = [pscustomobject]@{
-    schemaVersion = 1
+    schemaVersion = $manifestData.schemaVersion
     gateName = 'deterministic-runtime'
     generatedUtc = [DateTime]::UtcNow.ToString('o')
     cohortNonce = $executionCohortNonce
@@ -2392,7 +2452,7 @@ $planDocument = [pscustomobject]@{
     finalAcceptanceEligible = $false
     acceptanceReceiptRequested = $acceptanceBindingsRequested
     acceptanceReceiptEligible = $deterministicRuntimeEligible -and
-        $acceptanceBindingsRequested
+        $acceptanceBindingsRequested -and ($manifestData.schemaVersion -eq 1 -or -not $PlanOnly)
     acceptanceSourceCommit = if ($acceptanceBindingsRequested) {
         $AcceptanceSourceCommit
     } else { $null }
@@ -2435,20 +2495,27 @@ $planDocument = [pscustomobject]@{
     } else { $null })
     entries = $plan
 }
+if ($manifestData.schemaVersion -eq 2) {
+    $planDocument | Add-Member -NotePropertyName liveQualification `
+        -NotePropertyValue $manifestData.ai.liveQualification
+}
 $planPath = Join-Path $outputFull 'validation-plan.json'
-[IO.File]::WriteAllText($planPath, ($planDocument | ConvertTo-Json -Depth 8))
-if ($localCapacityRequested) {
-    Write-LocalCapacityReceipt `
-        -Path (Join-Path $outputFull 'local-capacity-plan-receipt.json') `
-        -Status 'planned-non-acceptance' `
-        -ValidationSet $ValidationSet `
-        -Entries $plan `
-        -Results @() `
-        -Configurations $workerConfigurations `
-        -ShadowConfiguration $collisionShadowConfiguration `
-        -Topology $localCapacityTopology `
-        -PlanPath $planPath `
-        -ResultsPath (Join-Path $outputFull 'validation-results.json') | Out-Null
+$livePlanBinding = $null
+if ($PlanOnly -or $planDocument.schemaVersion -eq 1) {
+    [IO.File]::WriteAllText($planPath, ($planDocument | ConvertTo-Json -Depth 8))
+    if ($localCapacityRequested) {
+        Write-LocalCapacityReceipt `
+            -Path (Join-Path $outputFull 'local-capacity-plan-receipt.json') `
+            -Status 'planned-non-acceptance' `
+            -ValidationSet $ValidationSet `
+            -Entries $plan `
+            -Results @() `
+            -Configurations $workerConfigurations `
+            -ShadowConfiguration $collisionShadowConfiguration `
+            -Topology $localCapacityTopology `
+            -PlanPath $planPath `
+            -ResultsPath (Join-Path $outputFull 'validation-results.json') | Out-Null
+    }
 }
 if ($EnforcePerformance -and $physicalCoreCount -lt 8) {
     $unsupportedPerformance = [pscustomobject]@{
@@ -2464,7 +2531,8 @@ if ($EnforcePerformance -and $physicalCoreCount -lt 8) {
     throw 'Stage 5 performance validation is unsupported: fewer than eight physical cores were detected.'
 }
 if ($PlanOnly) {
-    if ($deterministicRuntimeEligible -and $acceptanceBindingsRequested) {
+    if ($planDocument.schemaVersion -eq 1 -and
+        $deterministicRuntimeEligible -and $acceptanceBindingsRequested) {
         $planRawPath = Join-Path $outputFull 'validation-plan.raw.log'
         $planRawText = @(
             'STAGE5_HOST_RUNNER_PLAN_V2'
@@ -2497,7 +2565,10 @@ if ($PlanOnly) {
             -CohortCreatedUtc $executionCohortCreatedUtc `
             -RuntimeClosure $hostRunnerRuntimeClosure | Out-Null
     }
-    if (-not $deterministicRuntimeEligible) {
+    if ($planDocument.schemaVersion -eq 2) {
+        Write-Output "Stage 5 V2 live plan preview completed: $($plan.Count) planned executions; no installed execution evidence."
+    }
+    elseif (-not $deterministicRuntimeEligible) {
         Write-Output "Stage 5 focused/diagnostic deterministic-runtime plan completed: $($plan.Count) synchronous installed-runtime executions."
     }
     else {
@@ -2637,7 +2708,25 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
     $launcherEquivalence = Assert-LauncherEquivalenceContract $launcherContract `
         $executableFull $runtimeFull $plan $ProfileLeafName $documentsRoot
     $planDocument.launcherContract = $launcherEquivalence
-    [IO.File]::WriteAllText($planPath, ($planDocument | ConvertTo-Json -Depth 8))
+    if ($planDocument.schemaVersion -eq 2) {
+        $livePlanBinding = Write-Stage5FrozenValidationPlan -Plan $planDocument -Path $planPath
+        if ($localCapacityRequested) {
+            Write-LocalCapacityReceipt `
+                -Path (Join-Path $outputFull 'local-capacity-plan-receipt.json') `
+                -Status 'planned-non-acceptance' `
+                -ValidationSet $ValidationSet `
+                -Entries $plan `
+                -Results @() `
+                -Configurations $workerConfigurations `
+                -ShadowConfiguration $collisionShadowConfiguration `
+                -Topology $localCapacityTopology `
+                -PlanPath $planPath `
+                -ResultsPath (Join-Path $outputFull 'validation-results.json') | Out-Null
+        }
+    }
+    else {
+        [IO.File]::WriteAllText($planPath, ($planDocument | ConvertTo-Json -Depth 8))
+    }
 
     if ($deterministicRuntimeEligible -and $acceptanceBindingsRequested) {
         $planRawPath = Join-Path $outputFull 'validation-plan.raw.log'
@@ -2676,9 +2765,14 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
     foreach ($entry in $plan) {
         Assert-FreeSpace $outputFull $MinimumFreeBytes 'Validation evidence volume'
         Assert-FileHash $executableFull $manifestData.executableSha256 'Installed runtime executable before run' | Out-Null
+        if ($null -ne $livePlanBinding) {
+            Assert-FileHash $livePlanBinding.planPath $livePlanBinding.planSha256 `
+                'Frozen validation plan before run' | Out-Null
+        }
         $run = Invoke-ValidationProcess $executableFull $runtimeFull $entry `
             (-not $DisableFrameTiming) $validationEnvironment $outputFull `
-            -NativeObservationBinding $nativeObservationBinding
+            -NativeObservationBinding $nativeObservationBinding `
+            -LivePlanBinding $(if ($entry.kind -ceq 'ai') { $livePlanBinding } else { $null })
         $childRuns.Add([pscustomobject]@{
             entry = $entry
             run = $run
