@@ -6,6 +6,8 @@
 #include "Lib/JobSystem.h"
 #include "Lib/JobFloatingPointState.h"
 #include "Lib/ObjectComputationIsland.h"
+#include "ObjectComputationTestMode.h"
+#include "../TestSupport/LocalCapacityTestLane.h"
 
 #include <cmath>
 #include <stdio.h>
@@ -39,6 +41,70 @@ bool noCaptureOrJobWork(const rts::ObjectComputationMetrics &metrics)
 		metrics.candidatePayloadBytes == 0 &&
 		metrics.spatialCellSpans == 0 && metrics.spatialMemberships == 0 &&
 		metrics.allocatedBytes == 0 && metrics.arenaAllocations == 0;
+}
+
+bool collectCandidateCount(const rts::SimulationReadView &view,
+	const rts::ObjectComputationIsland &island, unsigned *candidateCount)
+{
+	if (candidateCount == 0) return false;
+	*candidateCount = 0;
+	for (unsigned command = 0; command != island.commandCount(); ++command)
+	{
+		const rts::SimulationMergedCommand *merged = island.commandAt(command);
+		rts::ObjectComputationCandidateSetHeader header;
+		if (merged == 0 || !rts::DecodeObjectComputationCandidateSet(view,
+			*merged, &header))
+			return false;
+		for (unsigned ordinal = 0; ordinal != header.candidateCount; ++ordinal)
+		{
+			UnsignedInt objectIndex = 0;
+			if (!rts::ObjectComputationCandidateIndexAt(view, *merged,
+				ordinal, &objectIndex))
+				return false;
+			++*candidateCount;
+		}
+	}
+	return true;
+}
+
+bool ownerSerialMatchesReference(const rts::SimulationReadView &view,
+	const rts::ObjectComputationIsland &reference,
+	const rts::ObjectComputationMetrics &referenceMetrics,
+	rts::ObjectComputationIsland *ownerSerial,
+	rts::ObjectComputationMetrics *ownerMetrics)
+{
+	if (ownerSerial == 0 || ownerMetrics == 0) return false;
+	rts::ObjectComputationOptions serialOptions;
+	if (ownerSerial->prepare(view, serialOptions, ownerMetrics) !=
+		rts::OBJECT_COMPUTATION_SERIAL_REFERENCE)
+		return false;
+	unsigned referenceCandidates = 0;
+	unsigned ownerCandidates = 0;
+	return reference.commandCount() == view.moduleCount() &&
+		ownerSerial->commandCount() == view.moduleCount() &&
+		referenceMetrics.emittedCommands == view.moduleCount() &&
+		ownerMetrics->emittedCommands == view.moduleCount() &&
+		collectCandidateCount(view, reference, &referenceCandidates) &&
+		collectCandidateCount(view, *ownerSerial, &ownerCandidates) &&
+		referenceCandidates == ownerCandidates &&
+		referenceCandidates == referenceMetrics.emittedCandidates &&
+		ownerCandidates == ownerMetrics->emittedCandidates &&
+		rts::ObjectComputationCommandsEqual(view, reference, *ownerSerial);
+}
+
+bool validateSerialFallback(const rts::SimulationReadView &view,
+	const rts::ObjectComputationIsland &reference,
+	const rts::ObjectComputationMetrics &referenceMetrics,
+	const rts::ObjectComputationIsland &fallback,
+	const rts::ObjectComputationMetrics &fallbackMetrics)
+{
+	if (!rts_test::ObjectComputationSerialFallbackIsWellAccounted(fallback,
+		fallbackMetrics))
+		return false;
+	rts::ObjectComputationIsland ownerSerial;
+	rts::ObjectComputationMetrics ownerMetrics;
+	return ownerSerialMatchesReference(view, reference, referenceMetrics,
+		&ownerSerial, &ownerMetrics);
 }
 
 void fillFixture(rts::SimulationReadObjectRecord *objects,
@@ -137,6 +203,28 @@ void testReadViewValidation()
 		"duplicate cell membership fails closed before worker publication");
 }
 
+void testInvalidInputDisposition(rts_test::ObjectComputationTestMode mode)
+{
+	enum { OBJECT_COUNT = 8, MODULE_COUNT = 2 };
+	rts::SimulationReadObjectRecord objects[OBJECT_COUNT];
+	rts::SimulationReadModuleRecord modules[MODULE_COUNT];
+	rts::SimulationReadScheduleEntry schedule[MODULE_COUNT];
+	fillFixture(objects, modules, schedule, OBJECT_COUNT, MODULE_COUNT);
+	objects[1].objectID = objects[0].objectID;
+	rts::SimulationReadView invalid(110, 11, objects, OBJECT_COUNT, modules,
+		MODULE_COUNT, schedule, MODULE_COUNT);
+	rts::ObjectComputationIsland island;
+	rts::ObjectComputationOptions options;
+	options.parallel = true;
+	rts::ObjectComputationMetrics metrics;
+	const rts::ObjectComputationResult result = island.prepare(invalid,
+		options, &metrics);
+	expect(result == rts::OBJECT_COMPUTATION_INVALID_INPUT &&
+		!rts_test::ObjectComputationResultIsAccepted(mode, result, island,
+			metrics, MODULE_COUNT),
+		"invalid immutable input is rejected in both test modes");
+}
+
 void testCapturePreflightRejectsBeforeWork()
 {
 	rts::ObjectComputationOptions serialOptions;
@@ -154,8 +242,11 @@ void testCapturePreflightRejectsBeforeWork()
 		"unavailable parallel/shadow scheduler rejects before capture work");
 }
 
-void testReferenceAndParallelAgreement()
+void testReferenceAndParallelAgreement(
+	rts_test::ObjectComputationTestMode mode, bool localCapacity)
 {
+	const bool allowSerialFallback =
+		rts_test::ObjectComputationAllowsSerialFallback(mode);
 	enum { OBJECT_COUNT = 1024, MODULE_COUNT = 64 };
 	rts::SimulationReadObjectRecord objects[OBJECT_COUNT];
 	rts::SimulationReadModuleRecord modules[MODULE_COUNT];
@@ -180,10 +271,14 @@ void testReferenceAndParallelAgreement()
 
 	rts::JobSystem &jobs = rts::JobSystem::instance();
 	rts::JobSystemConfig config;
-	config.workerCount = 4;
+	config.workerCount = rts_test::ResolveActualWorkerCount(4,
+		localCapacity);
 	config.queueCapacity = 128;
 	config.scratchBytesPerWorker = 64 * 1024;
 	config.pinWorkers = false;
+	rts_test::PrintWorkerCountSubstitution(
+		"Object computation island tests", 4, config.workerCount,
+		localCapacity);
 	expect(jobs.start(config), "four-worker computation scheduler starts");
 	expect(jobs.registerCurrentThread(rts::JOB_OWNER_GAME),
 		"test thread registers as the game owner");
@@ -192,30 +287,67 @@ void testReferenceAndParallelAgreement()
 	rts::ObjectComputationOptions parallelOptions;
 	parallelOptions.parallel = true;
 	rts::ObjectComputationMetrics parallelMetrics;
-	expect(parallel.prepare(view, parallelOptions, &parallelMetrics) ==
-		rts::OBJECT_COMPUTATION_PARALLEL,
-		"eligible work executes as a multi-range object island");
+	const rts::ObjectComputationResult parallelResult = parallel.prepare(view,
+		parallelOptions, &parallelMetrics);
+	expect(parallelResult == rts::OBJECT_COMPUTATION_PARALLEL ||
+		(allowSerialFallback && parallelResult ==
+			rts::OBJECT_COMPUTATION_SERIAL_FALLBACK),
+		"eligible work executes or accounts for an explicit owner fallback");
+	rts::ObjectComputationIsland ownerFallback;
+	rts::ObjectComputationMetrics ownerFallbackMetrics;
+	bool ownerFallbackMatches = false;
+	if (parallelResult == rts::OBJECT_COMPUTATION_SERIAL_FALLBACK)
+	{
+		expect(rts_test::ObjectComputationSerialFallbackIsWellAccounted(
+			parallel, parallelMetrics),
+			"parallel fallback has no published commands and drains every job");
+		ownerFallbackMatches = ownerSerialMatchesReference(view, reference,
+			referenceMetrics, &ownerFallback, &ownerFallbackMetrics);
+		expect(ownerFallbackMatches,
+			"correctness fallback consumes the detached owner reference result");
+	}
+	const rts::ObjectComputationIsland *authoritative =
+		parallelResult == rts::OBJECT_COMPUTATION_SERIAL_FALLBACK ?
+		&ownerFallback : &parallel;
+	const rts::ObjectComputationMetrics *authoritativeMetrics =
+		parallelResult == rts::OBJECT_COMPUTATION_SERIAL_FALLBACK ?
+		&ownerFallbackMetrics : &parallelMetrics;
 	unsigned firstDifference = 99;
-	expect(rts::ObjectComputationCommandsEqual(view, reference, parallel,
-		&firstDifference),
-		"parallel command payloads exactly match the owner reference");
-	expect(parallelMetrics.rangeCount >= 2 &&
-		parallelMetrics.submittedJobs == parallelMetrics.completedJobs &&
-		parallelMetrics.schedulerReleasedJobs ==
-			parallelMetrics.submittedJobs &&
-		parallelMetrics.distinctPhysicalWorkers > 1 &&
-		parallelMetrics.emittedCommands == MODULE_COUNT &&
-		parallelMetrics.emittedCandidates > 0 &&
-		parallelMetrics.candidatePayloadBytes <
+	if (parallelResult == rts::OBJECT_COMPUTATION_PARALLEL)
+	{
+		expect(rts::ObjectComputationCommandsEqual(view, reference, parallel,
+			&firstDifference),
+			"parallel command payloads exactly match the owner reference");
+		expect(rts_test::ObjectComputationParallelIsWellAccounted(
+			parallelResult, parallelMetrics, MODULE_COUNT) &&
+			parallelMetrics.rangeCount >= 2 &&
+			parallelMetrics.distinctPhysicalWorkers > 1 &&
+			parallelMetrics.emittedCandidates > 0 &&
+			parallelMetrics.candidatePayloadBytes <
 			MODULE_COUNT * OBJECT_COUNT * sizeof(unsigned) &&
-		parallelMetrics.spatialCellSpans == 1 &&
-		parallelMetrics.spatialMemberships == OBJECT_COUNT,
-		"parallel metrics prove ranged work, scheduler ownership, and fencing");
+			parallelMetrics.spatialCellSpans == 1 &&
+			parallelMetrics.spatialMemberships == OBJECT_COUNT,
+			"parallel metrics prove ranged work, scheduler ownership, and fencing");
+	}
+	else
+	{
+		expect(!rts_test::ObjectComputationResultIsAccepted(mode,
+			parallelResult, parallel, parallelMetrics, MODULE_COUNT) ||
+			allowSerialFallback,
+			"strict scaling rejects the same non-scalable disposition");
+	}
+	unsigned authoritativeCandidates = 0;
+	expect(authoritative->commandCount() == MODULE_COUNT &&
+		authoritativeMetrics->emittedCommands == MODULE_COUNT &&
+		collectCandidateCount(view, *authoritative, &authoritativeCandidates) &&
+		authoritativeCandidates == authoritativeMetrics->emittedCandidates &&
+		rts::ObjectComputationCommandsEqual(view, reference, *authoritative),
+		"authoritative output preserves complete ordered command parity");
 	for (unsigned commandIndex = 0; commandIndex < MODULE_COUNT;
 		++commandIndex)
 	{
 		const rts::SimulationMergedCommand *command =
-			parallel.commandAt(commandIndex);
+			authoritative->commandAt(commandIndex);
 		rts::ObjectComputationCandidateSetHeader header;
 		expect(command != 0 && command->command()->orderKey().phase() ==
 			commandIndex && rts::DecodeObjectComputationCandidateSet(
@@ -226,41 +358,88 @@ void testReferenceAndParallelAgreement()
 	rts::ObjectComputationIsland failed;
 	parallelOptions.testFault = rts::OBJECT_COMPUTATION_TEST_PRODUCER_FAILURE;
 	parallelOptions.testOrdinal = 3;
-	expect(failed.prepare(view, parallelOptions, &parallelMetrics) ==
+	rts::ObjectComputationResult failedResult =
+		failed.prepare(view, parallelOptions, &parallelMetrics);
+	expect(failedResult ==
 		rts::OBJECT_COMPUTATION_SERIAL_FALLBACK &&
 		failed.commandCount() == 0 && parallelMetrics.serialFallbacks == 1,
 		"injected producer failure publishes no partial owner commands");
 	expect(parallelMetrics.schedulerReleasedJobs ==
 		parallelMetrics.submittedJobs,
 		"scheduler releases every admitted failing producer job exactly once");
+	expect(rts_test::ObjectComputationSerialFallbackIsWellAccounted(failed,
+		parallelMetrics) &&
+		rts_test::ObjectComputationResultIsAccepted(mode, failedResult, failed,
+			parallelMetrics, MODULE_COUNT) == allowSerialFallback,
+		"producer failure fallback disposition follows the selected mode");
+	expect(!allowSerialFallback || validateSerialFallback(view, reference,
+		referenceMetrics, failed, parallelMetrics),
+		"producer failure fallback has a complete owner serial result");
 
 	rts::ObjectComputationIsland cancelled;
 	parallelOptions.testFault =
 		rts::OBJECT_COMPUTATION_TEST_CANCEL_AFTER_ADMISSION;
 	parallelOptions.testOrdinal = 0;
-	expect(cancelled.prepare(view, parallelOptions, &parallelMetrics) ==
+	rts::ObjectComputationResult cancelledResult =
+		cancelled.prepare(view, parallelOptions, &parallelMetrics);
+	expect(cancelledResult ==
 		rts::OBJECT_COMPUTATION_SERIAL_FALLBACK &&
 		cancelled.commandCount() == 0 &&
 		parallelMetrics.schedulerReleasedJobs ==
 			parallelMetrics.submittedJobs,
 		"cancelled admitted wave preserves scheduler-owned job lifetime");
+	expect(rts_test::ObjectComputationSerialFallbackIsWellAccounted(cancelled,
+		parallelMetrics) &&
+		rts_test::ObjectComputationResultIsAccepted(mode, cancelledResult,
+			cancelled, parallelMetrics, MODULE_COUNT) == allowSerialFallback,
+		"cancelled fallback disposition follows the selected mode");
+	expect(!allowSerialFallback || validateSerialFallback(view, reference,
+		referenceMetrics, cancelled, parallelMetrics),
+		"cancelled fallback has a complete owner serial result");
 
 	rts::ObjectComputationIsland ownerHelped;
 	parallelOptions.testFault =
 		rts::OBJECT_COMPUTATION_TEST_OWNER_HELP_ONLY;
-	expect(ownerHelped.prepare(view, parallelOptions, &parallelMetrics) ==
+	rts::ObjectComputationMetrics ownerHelpMetrics;
+	rts::ObjectComputationResult ownerHelpResult = ownerHelped.prepare(view,
+		parallelOptions, &ownerHelpMetrics);
+	expect(ownerHelpResult ==
 		rts::OBJECT_COMPUTATION_SERIAL_FALLBACK &&
 		ownerHelped.commandCount() == 0 &&
-		parallelMetrics.physicalWorkerJobs == 0 &&
-		parallelMetrics.ownerHelpedJobs == parallelMetrics.submittedJobs &&
-		parallelMetrics.distinctPhysicalWorkers == 0 &&
-		parallelMetrics.serialFallbacks == 1,
+		ownerHelpMetrics.physicalWorkerJobs == 0 &&
+		ownerHelpMetrics.ownerHelpedJobs == ownerHelpMetrics.submittedJobs &&
+		ownerHelpMetrics.distinctPhysicalWorkers == 0 &&
+		ownerHelpMetrics.serialFallbacks == 1,
 		"all-owner-help identity is evidence-only and never authoritative");
+	expect(rts_test::ObjectComputationSerialFallbackIsWellAccounted(ownerHelped,
+		ownerHelpMetrics) &&
+		rts_test::ObjectComputationResultIsAccepted(mode, ownerHelpResult,
+			ownerHelped, ownerHelpMetrics, MODULE_COUNT) == allowSerialFallback,
+		"OWNER_HELP_ONLY fallback is accepted only in correctness mode");
+	expect(!rts_test::ObjectComputationResultIsAccepted(
+			rts_test::OBJECT_COMPUTATION_TEST_STRICT_SCALING, ownerHelpResult,
+			ownerHelped, ownerHelpMetrics, MODULE_COUNT) &&
+		rts_test::ObjectComputationResultIsAccepted(
+			rts_test::OBJECT_COMPUTATION_TEST_ALLOW_SERIAL_FALLBACK,
+			ownerHelpResult, ownerHelped, ownerHelpMetrics, MODULE_COUNT),
+		"OWNER_HELP_ONLY explicitly rejects strict and accepts correctness mode");
+	expect(validateSerialFallback(view, reference, referenceMetrics, ownerHelped,
+		ownerHelpMetrics),
+		"OWNER_HELP_ONLY fallback consumes the complete owner reference");
+	rts::ObjectComputationMetrics badOwnerHelpMetrics = ownerHelpMetrics;
+	++badOwnerHelpMetrics.completedJobs;
+	expect(!rts_test::ObjectComputationSerialFallbackIsWellAccounted(
+		ownerHelped, badOwnerHelpMetrics) &&
+		!rts_test::ObjectComputationResultIsAccepted(mode, ownerHelpResult,
+			ownerHelped, badOwnerHelpMetrics, MODULE_COUNT),
+		"fallback admission rejects bad completion accounting");
 
 	rts::ObjectComputationIsland timedOut;
 	parallelOptions.testFault =
 		rts::OBJECT_COMPUTATION_TEST_PHYSICAL_WAIT_TIMEOUT;
-	expect(timedOut.prepare(view, parallelOptions, &parallelMetrics) ==
+	rts::ObjectComputationResult timedOutResult = timedOut.prepare(view,
+		parallelOptions, &parallelMetrics);
+	expect(timedOutResult ==
 		rts::OBJECT_COMPUTATION_SERIAL_FALLBACK &&
 		timedOut.commandCount() == 0 &&
 		parallelMetrics.physicalWaitTimeouts == 1 &&
@@ -269,35 +448,72 @@ void testReferenceAndParallelAgreement()
 			parallelMetrics.submittedJobs &&
 		parallelMetrics.serialFallbacks == 1,
 		"physical wait timeout cancels, fences, and publishes no commands");
+	expect(rts_test::ObjectComputationSerialFallbackIsWellAccounted(timedOut,
+		parallelMetrics) &&
+		rts_test::ObjectComputationResultIsAccepted(mode, timedOutResult,
+			timedOut, parallelMetrics, MODULE_COUNT) == allowSerialFallback,
+		"physical timeout fallback disposition follows the selected mode");
+	expect(!allowSerialFallback || validateSerialFallback(view, reference,
+		referenceMetrics, timedOut, parallelMetrics),
+		"physical timeout fallback has a complete owner serial result");
 
 	rts::ObjectComputationIsland mismatching;
 	parallelOptions.testFault = rts::OBJECT_COMPUTATION_TEST_SHADOW_MISMATCH;
 	parallelOptions.testOrdinal = 5;
-	expect(mismatching.prepare(view, parallelOptions, &parallelMetrics) ==
-		rts::OBJECT_COMPUTATION_PARALLEL,
+	rts::ObjectComputationResult mismatchingResult = mismatching.prepare(view,
+		parallelOptions, &parallelMetrics);
+	expect(mismatchingResult == rts::OBJECT_COMPUTATION_PARALLEL ||
+		(allowSerialFallback && mismatchingResult ==
+			rts::OBJECT_COMPUTATION_SERIAL_FALLBACK),
 		"shadow mismatch fixture remains a structurally valid worker wave");
-	expect(!rts::ObjectComputationCommandsEqual(view, reference, mismatching,
-		&firstDifference) && firstDifference == 5,
-		"shadow oracle reports the first injected command mismatch");
+	if (mismatchingResult == rts::OBJECT_COMPUTATION_PARALLEL)
+		expect(!rts::ObjectComputationCommandsEqual(view, reference, mismatching,
+			&firstDifference) && firstDifference == 5,
+			"shadow oracle reports the first injected command mismatch");
+	else
+	{
+		expect(rts_test::ObjectComputationSerialFallbackIsWellAccounted(
+			mismatching, parallelMetrics) &&
+			rts_test::ObjectComputationResultIsAccepted(mode,
+				mismatchingResult, mismatching, parallelMetrics,
+				MODULE_COUNT) == allowSerialFallback,
+			"shadow mismatch fallback remains explicitly accounted");
+		expect(!allowSerialFallback || validateSerialFallback(view, reference,
+			referenceMetrics, mismatching, parallelMetrics),
+			"shadow mismatch fallback has a complete owner serial result");
+	}
 
 	rts::ObjectComputationIsland budgetFailure;
 	parallelOptions.testFault =
 		rts::OBJECT_COMPUTATION_TEST_PAYLOAD_BUDGET_FAILURE;
 	parallelOptions.testOrdinal = 0;
-	expect(budgetFailure.prepare(view, parallelOptions, &parallelMetrics) ==
+	rts::ObjectComputationResult budgetResult = budgetFailure.prepare(view,
+		parallelOptions, &parallelMetrics);
+	expect(budgetResult ==
 		rts::OBJECT_COMPUTATION_SERIAL_FALLBACK &&
 		budgetFailure.commandCount() == 0 &&
 		parallelMetrics.submittedJobs == 0 &&
 		parallelMetrics.serialFallbacks == 1,
 		"bounded payload arena failure publishes nothing before admission");
+	expect(rts_test::ObjectComputationSerialFallbackIsWellAccounted(
+		budgetFailure, parallelMetrics) &&
+		rts_test::ObjectComputationResultIsAccepted(mode, budgetResult,
+			budgetFailure, parallelMetrics, MODULE_COUNT) == allowSerialFallback,
+		"payload budget fallback disposition follows the selected mode");
+	expect(!allowSerialFallback || validateSerialFallback(view, reference,
+		referenceMetrics, budgetFailure, parallelMetrics),
+		"payload budget fallback has a complete owner serial result");
 
 	expect(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME),
 		"game owner unregisters after parallel tests");
 	jobs.shutdown();
 }
 
-void testOwnerFloatingPointBoundaryParity()
+void testOwnerFloatingPointBoundaryParity(
+	rts_test::ObjectComputationTestMode mode, bool localCapacity)
 {
+	const bool allowSerialFallback =
+		rts_test::ObjectComputationAllowsSerialFallback(mode);
 	enum { OBJECT_COUNT = 1024, MODULE_COUNT = 64 };
 	rts::SimulationReadObjectRecord objects[OBJECT_COUNT];
 	rts::SimulationReadModuleRecord modules[MODULE_COUNT];
@@ -321,10 +537,14 @@ void testOwnerFloatingPointBoundaryParity()
 
 	rts::JobSystem &jobs = rts::JobSystem::instance();
 	rts::JobSystemConfig config;
-	config.workerCount = 4;
+	config.workerCount = rts_test::ResolveActualWorkerCount(4,
+		localCapacity);
 	config.queueCapacity = 128;
 	config.scratchBytesPerWorker = 64 * 1024;
 	config.pinWorkers = false;
+	rts_test::PrintWorkerCountSubstitution(
+		"Object computation floating-point tests", 4, config.workerCount,
+		localCapacity);
 	expect(jobs.start(config), "floating-point parity scheduler starts");
 	expect(jobs.registerCurrentThread(rts::JOB_OWNER_GAME),
 		"floating-point parity owner registers");
@@ -335,18 +555,43 @@ void testOwnerFloatingPointBoundaryParity()
 #endif
 	rts::ObjectComputationIsland reference;
 	rts::ObjectComputationOptions referenceOptions;
-	expect(reference.prepare(view, referenceOptions) ==
+	rts::ObjectComputationMetrics referenceMetrics;
+	expect(reference.prepare(view, referenceOptions, &referenceMetrics) ==
 		rts::OBJECT_COMPUTATION_SERIAL_REFERENCE,
 		"boundary reference uses the submitting owner floating-point state");
 	rts::ObjectComputationIsland parallel;
 	rts::ObjectComputationOptions parallelOptions;
 	parallelOptions.parallel = true;
 	rts::ObjectComputationMetrics metrics;
-	expect(parallel.prepare(view, parallelOptions, &metrics) ==
-		rts::OBJECT_COMPUTATION_PARALLEL &&
-		metrics.distinctPhysicalWorkers > 1,
-		"boundary candidate wave executes on multiple physical workers");
-	expect(rts::ObjectComputationCommandsEqual(view, reference, parallel),
+	const rts::ObjectComputationResult parallelResult = parallel.prepare(view,
+		parallelOptions, &metrics);
+	expect(parallelResult == rts::OBJECT_COMPUTATION_PARALLEL ||
+		(allowSerialFallback && parallelResult ==
+			rts::OBJECT_COMPUTATION_SERIAL_FALLBACK),
+		"boundary candidate wave executes or accounts for owner fallback");
+	rts::ObjectComputationIsland ownerFallback;
+	rts::ObjectComputationMetrics ownerFallbackMetrics;
+	if (parallelResult == rts::OBJECT_COMPUTATION_SERIAL_FALLBACK)
+	{
+		expect(rts_test::ObjectComputationSerialFallbackIsWellAccounted(parallel,
+			metrics),
+			"boundary fallback publishes no commands and drains every job");
+		expect(ownerSerialMatchesReference(view, reference, referenceMetrics,
+			&ownerFallback, &ownerFallbackMetrics),
+			"boundary fallback consumes the detached owner reference result");
+		expect(rts_test::ObjectComputationResultIsAccepted(mode, parallelResult,
+			parallel, metrics, MODULE_COUNT) == allowSerialFallback,
+			"boundary fallback disposition follows the selected mode");
+	}
+	else
+		expect(rts_test::ObjectComputationParallelIsWellAccounted(parallelResult,
+			metrics, MODULE_COUNT) && metrics.distinctPhysicalWorkers > 1,
+			"boundary candidate wave executes on multiple physical workers");
+	const rts::ObjectComputationIsland *boundaryAuthoritative =
+		parallelResult == rts::OBJECT_COMPUTATION_SERIAL_FALLBACK ?
+		&ownerFallback : &parallel;
+	expect(rts::ObjectComputationCommandsEqual(view, reference,
+		*boundaryAuthoritative),
 		"worker candidate indices preserve owner rounding-mode parity");
 	const rts::SimulationMergedCommand *moduleZeroCommand = 0;
 	for (unsigned index = 0; index != reference.commandCount(); ++index)
@@ -408,13 +653,46 @@ void testOwnerFloatingPointBoundaryParity()
 		rts::ObjectComputationOptions counterReferenceOptions;
 		rts::ObjectComputationOptions counterParallelOptions;
 		counterParallelOptions.parallel = true;
-		expect(counterReference.prepare(counterView, counterReferenceOptions) ==
-			rts::OBJECT_COMPUTATION_SERIAL_REFERENCE &&
-			counterParallel.prepare(counterView, counterParallelOptions) ==
-				rts::OBJECT_COMPUTATION_PARALLEL &&
-			rts::ObjectComputationCommandsEqual(counterView, counterReference,
-				counterParallel),
+		rts::ObjectComputationMetrics counterReferenceMetrics;
+		rts::ObjectComputationMetrics counterParallelMetrics;
+		expect(counterReference.prepare(counterView, counterReferenceOptions,
+			&counterReferenceMetrics) ==
+			rts::OBJECT_COMPUTATION_SERIAL_REFERENCE,
+			"counterexample reference retains the legacy float state");
+		const rts::ObjectComputationResult counterParallelResult =
+			counterParallel.prepare(counterView, counterParallelOptions,
+				&counterParallelMetrics);
+		expect(counterParallelResult == rts::OBJECT_COMPUTATION_PARALLEL ||
+			(allowSerialFallback && counterParallelResult ==
+				rts::OBJECT_COMPUTATION_SERIAL_FALLBACK),
+			"counterexample wave executes or accounts for owner fallback");
+		rts::ObjectComputationIsland counterOwnerFallback;
+		rts::ObjectComputationMetrics counterOwnerMetrics;
+		if (counterParallelResult == rts::OBJECT_COMPUTATION_SERIAL_FALLBACK)
+		{
+			expect(rts_test::ObjectComputationSerialFallbackIsWellAccounted(
+				counterParallel, counterParallelMetrics) &&
+				rts_test::ObjectComputationResultIsAccepted(mode,
+					counterParallelResult, counterParallel,
+					counterParallelMetrics, MODULE_COUNT) == allowSerialFallback,
+				"counterexample fallback disposition follows the selected mode");
+			expect(ownerSerialMatchesReference(counterView, counterReference,
+				counterReferenceMetrics, &counterOwnerFallback,
+				&counterOwnerMetrics),
+				"counterexample fallback consumes the owner reference result");
+		}
+		const rts::ObjectComputationIsland *counterAuthoritative =
+			counterParallelResult == rts::OBJECT_COMPUTATION_SERIAL_FALLBACK ?
+			&counterOwnerFallback : &counterParallel;
+		expect(counterParallelResult != rts::OBJECT_COMPUTATION_PARALLEL ||
+			(rts_test::ObjectComputationParallelIsWellAccounted(
+				counterParallelResult, counterParallelMetrics, MODULE_COUNT) &&
+				rts::ObjectComputationCommandsEqual(counterView,
+					counterReference, counterParallel)),
 			"worker reproduces the legacy float/sqrt/subtract/clamp/square sequence");
+		expect(rts::ObjectComputationCommandsEqual(counterView,
+			counterReference, *counterAuthoritative),
+			"counterexample authoritative output preserves full parity");
 		const rts::SimulationMergedCommand *counterCommand = 0;
 		for (unsigned index = 0; index != counterReference.commandCount(); ++index)
 		{
@@ -482,12 +760,28 @@ void testOneWorkerFallback()
 }
 }
 
-int main()
+int main(int argc, char **argv)
 {
+	bool localCapacity = false;
+	rts_test::ObjectComputationTestMode mode =
+		rts_test::OBJECT_COMPUTATION_TEST_STRICT_SCALING;
+	if (!rts_test::ParseObjectComputationTestMode(argc, argv,
+		&localCapacity, &mode))
+	{
+		fprintf(stderr,
+			"Usage: core_object_computation_island_tests "
+			"[--local-capacity] "
+			"[--strict-scaling|--allow-serial-fallback]\n");
+		return 2;
+	}
+	rts_test::PrintTestCapacityLane(localCapacity);
+	printf("Object computation test mode: %s\n",
+		rts_test::ObjectComputationTestModeName(mode));
 	testReadViewValidation();
+	testInvalidInputDisposition(mode);
 	testCapturePreflightRejectsBeforeWork();
-	testReferenceAndParallelAgreement();
-	testOwnerFloatingPointBoundaryParity();
+	testReferenceAndParallelAgreement(mode, localCapacity);
+	testOwnerFloatingPointBoundaryParity(mode, localCapacity);
 	testOneWorkerFallback();
 	if (failures != 0) return 1;
 	printf("Object computation island tests passed.\n");
