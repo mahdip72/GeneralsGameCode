@@ -1104,8 +1104,11 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
-		if (!GetTrackedLegacyPipelineState(0))
-			SeedTrackedLegacyPipelineState();
+		{
+			LegacyPipelineState pipeline;
+			if (!GetTrackedLegacyPipelineState(&pipeline))
+				SeedTrackedLegacyPipelineState();
+		}
 		if (!TrackLegacyTransform(
 				static_cast<LegacyTransformSlot>(command.value0),
 				static_cast<const RenderMatrix4 *>(command.input)->values))
@@ -1541,8 +1544,11 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 		return RENDER_RESULT_OK;
 
 	case GAME_RENDER_COMMAND_APPLY_RENDER_STATE_CHANGES:
-		if (!GetTrackedLegacyPipelineState(0))
-			SeedTrackedLegacyPipelineState();
+		{
+			LegacyPipelineState pipeline;
+			if (!GetTrackedLegacyPipelineState(&pipeline))
+				SeedTrackedLegacyPipelineState();
+		}
 		return RENDER_RESULT_OK;
 
 	case GAME_RENDER_COMMAND_INVALIDATE_RENDER_STATE_CACHE:
@@ -1565,7 +1571,8 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 					sizeof(RenderFloat4), &expectedBytes) ||
 				command.inputBytes != expectedBytes)
 				goto invalid_command;
-			if (!GetTrackedLegacyPipelineState(0))
+			LegacyPipelineState pipeline;
+			if (!GetTrackedLegacyPipelineState(&pipeline))
 				SeedTrackedLegacyPipelineState();
 			const float *values = static_cast<const float *>(command.input);
 			const bool tracked = command.type ==
@@ -2303,7 +2310,9 @@ rts::render::RenderResult NativeW3D2::SetGameRenderState(
 	case rts::render::GAME_RENDER_STATE_Z_BIAS:
 		if (value > static_cast<unsigned int>(INT_MAX))
 			goto invalid_state;
-		logical.pipeline.rasterizer.depthBias = static_cast<int>(value);
+		// Positive game Z-bias brings coplanar geometry forward. The native
+		// rasterizer adds signed bias to depth, so translate at this seam only.
+		logical.pipeline.rasterizer.depthBias = -static_cast<int>(value);
 		break;
 	case rts::render::GAME_RENDER_STATE_BLEND_OPERATION:
 		if (!IsValidGameBlendOperation(value))
@@ -2901,7 +2910,9 @@ bool NativeW3D2::SupportsDot3() const
 
 bool NativeW3D2::SupportsZBias() const
 {
-	return false;
+	// D3D11 applies rasterizer bias; do not also bias camera projections or
+	// request the title's physical decal-offset fallback.
+	return IsOperational();
 }
 
 bool NativeW3D2::SupportsStencil() const

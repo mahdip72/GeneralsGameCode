@@ -5,6 +5,7 @@
 #include "Renderer/ThreadedRenderDevice.h"
 
 #include <cstdio>
+#include <climits>
 #include <new>
 #include <windows.h>
 
@@ -822,6 +823,247 @@ int TestReacquireFailureFailClosed(HWND window)
 	return result;
 }
 
+int TestNativeHardwareZBias(NativeW3D2 *owner)
+{
+	int result = 0;
+	if (owner == 0 || !owner->IsOperational())
+		return Check(false, "Z-bias fixture has an operational native owner");
+
+	// D3D8 positive ZBIAS brings coplanar geometry forward. D3D11 adds its
+	// signed rasterizer bias to depth, so the native game seam must negate the
+	// logical value for the game's LESS/LESSEQUAL depth convention. This tests
+	// the existing unit scale, not equality with a particular D3D8 GPU's pixels.
+	rts::render::ResetTrackedLegacyState();
+	rts::render::SeedTrackedLegacyPipelineState();
+	struct BiasCase
+	{
+		unsigned int logicalBias;
+		int rasterizerBias;
+	};
+	const BiasCase cases[] = {
+		{ 0U, 0 }, { 1U, -1 }, { 8U, -8 }, { 16U, -16 },
+		{ static_cast<unsigned int>(INT_MAX), -INT_MAX }
+	};
+	rts::render::LegacyLogicalState state;
+	for (unsigned int index = 0; index != sizeof(cases) / sizeof(cases[0]); ++index)
+	{
+		result |= Check(owner->SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_Z_BIAS, cases[index].logicalBias) ==
+			rts::render::RENDER_RESULT_OK &&
+			rts::render::GetTrackedLegacyLogicalState(&state) &&
+			state.pipeline.rasterizer.depthBias == cases[index].rasterizerBias,
+			"native positive logical Z-bias maps toward the viewer without signed overflow");
+	}
+	result |= Check(owner->SupportsZBias(),
+		"native hardware bias suppresses the title's extra physical decal offset");
+
+	result |= Check(owner->SetGameRenderState(
+		rts::render::GAME_RENDER_STATE_Z_BIAS, 16U) ==
+		rts::render::RENDER_RESULT_OK,
+		"Z-bias boundary fixture restores a normal prior value");
+	const unsigned int invalidValues[] = {
+		static_cast<unsigned int>(INT_MAX) + 1U, UINT_MAX
+	};
+	for (unsigned int index = 0; index != sizeof(invalidValues) / sizeof(invalidValues[0]); ++index)
+	{
+		result |= Check(owner->SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_Z_BIAS, invalidValues[index]) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+			rts::render::GetTrackedLegacyLogicalState(&state) &&
+			state.pipeline.rasterizer.depthBias == -16,
+			"out-of-range logical Z-bias preserves the prior signed rasterizer bias");
+	}
+	result |= Check(owner->SetGameRenderState(
+		rts::render::GAME_RENDER_STATE_Z_BIAS, 0U) ==
+		rts::render::RENDER_RESULT_OK &&
+		rts::render::GetTrackedLegacyLogicalState(&state) &&
+		state.pipeline.rasterizer.depthBias == 0,
+		"clearing native logical Z-bias restores unbiased rasterization");
+	return result;
+}
+
+bool HasUnmodifiedCameraProjection(const rts::render::LegacyLogicalState &state)
+{
+	// Hand-written perspective fixture: near=1, far=3, unit X/Y scale.
+	const float expected[16] = {
+		1.0f, 0.0f, 0.0f, 0.0f,
+		0.0f, 1.0f, 0.0f, 0.0f,
+		0.0f, 0.0f, -1.5f, -1.0f,
+		0.0f, 0.0f, -1.5f, 0.0f
+	};
+	for (unsigned int index = 0; index != 16; ++index)
+		if (state.constants.projection.values[index] != expected[index])
+			return false;
+	return true;
+}
+
+int TestNativeCameraBiasSequences(NativeW3D2 *owner)
+{
+	int result = 0;
+	if (owner == 0 || !owner->IsOperational())
+		return Check(false, "camera bias fixture has an operational native owner");
+	// Snapshots publish a viewport to the real threaded context. That command
+	// belongs to an open frame, just as it does in the title's render loop.
+	result |= Check(owner->BeginGameDisplayIteration() ==
+		rts::render::RENDER_RESULT_OK && owner->Renderer().BeginFrame() ==
+		rts::render::RENDER_RESULT_OK,
+		"camera bias fixture begins a real native frame");
+	if (result != 0)
+		return result;
+	rts::render::ResetTrackedLegacyState();
+	rts::render::SeedTrackedLegacyPipelineState();
+	rts::render::GameCameraSnapshot snapshot;
+	snapshot.projection.values[10] = -1.5f;
+	snapshot.projection.values[11] = -1.0f;
+	snapshot.projection.values[14] = -1.5f;
+	snapshot.projection.values[15] = 0.0f;
+	snapshot.viewport = rts::render::RenderViewport(
+		0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f);
+	snapshot.zNear = 1.0f;
+	snapshot.zFar = 3.0f;
+
+	for (unsigned int title = 0; title != 2; ++title)
+	{
+		// Exercise each title's real native command sequence: Generals applies
+		// a plain projection; Zero Hour uses the bias-aware projection command.
+		// Both subsequently publish the same raw camera snapshot for meshes.
+		rts::render::GameRenderCommand command = {};
+		command.type = title == 0 ?
+			rts::render::GAME_RENDER_COMMAND_SET_TRANSFORM :
+			rts::render::GAME_RENDER_COMMAND_SET_PROJECTION_WITH_Z_BIAS;
+		command.value0 = rts::render::LEGACY_TRANSFORM_PROJECTION;
+		command.input = &snapshot.projection;
+		command.inputBytes = sizeof(snapshot.projection);
+		command.float0 = snapshot.zNear;
+		command.float1 = snapshot.zFar;
+		result |= Check(owner->SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_Z_BIAS, 8U) ==
+			rts::render::RENDER_RESULT_OK,
+			"camera fixture enables the game's decal bias");
+		rts::render::LegacyLogicalState state;
+		result |= Check(owner->ExecuteGameRenderCommand(command) ==
+			rts::render::RENDER_RESULT_OK &&
+			rts::render::GetTrackedLegacyLogicalState(&state) &&
+			HasUnmodifiedCameraProjection(state),
+			title == 0 ? "Generals camera leaves bias exclusively in the rasterizer" :
+			"Zero Hour camera does not also fold hardware bias into its projection");
+		for (unsigned int repeat = 0; repeat != 3; ++repeat)
+		{
+			result |= Check(owner->SetGameRenderCameraSnapshot(snapshot) ==
+				rts::render::RENDER_RESULT_OK &&
+				rts::render::GetTrackedLegacyLogicalState(&state) &&
+				HasUnmodifiedCameraProjection(state) &&
+				state.pipeline.rasterizer.depthBias == -8,
+				"repeated title camera snapshots preserve hardware bias without accumulating projection bias");
+		}
+		result |= Check(owner->SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_Z_BIAS, 16U) ==
+			rts::render::RENDER_RESULT_OK &&
+			owner->ExecuteGameRenderCommand(command) ==
+			rts::render::RENDER_RESULT_OK &&
+			rts::render::GetTrackedLegacyLogicalState(&state) &&
+			HasUnmodifiedCameraProjection(state) &&
+			state.pipeline.rasterizer.depthBias == -16,
+			"changing bias and reapplying either title camera does not alter projection");
+		command.float0 = command.float1 = 2.0f;
+		result |= Check(owner->ExecuteGameRenderCommand(command) ==
+			rts::render::RENDER_RESULT_OK &&
+			rts::render::GetTrackedLegacyLogicalState(&state) &&
+			HasUnmodifiedCameraProjection(state),
+			"equal clip planes do not introduce a projection fallback or division");
+		result |= Check(owner->SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_Z_BIAS, 0U) ==
+			rts::render::RENDER_RESULT_OK &&
+			owner->SetGameRenderCameraSnapshot(snapshot) ==
+			rts::render::RENDER_RESULT_OK &&
+			rts::render::GetTrackedLegacyLogicalState(&state) &&
+			HasUnmodifiedCameraProjection(state) &&
+			state.pipeline.rasterizer.depthBias == 0,
+			"ending either title's biased pass restores the unmodified camera and zero bias");
+	}
+	const rts::render::RenderResult endResult = owner->Renderer().EndFrame(false);
+	const rts::render::RenderResult finalizeResult = endResult ==
+		rts::render::RENDER_RESULT_OK ? owner->Renderer().FinalizeEndedFrame(false) :
+		endResult;
+	const rts::render::RenderResult drainResult = owner->Renderer().DrainThreaded();
+	result |= Check(endResult == rts::render::RENDER_RESULT_OK &&
+		finalizeResult == rts::render::RENDER_RESULT_OK &&
+		drainResult == rts::render::RENDER_RESULT_OK,
+		"camera bias fixture completes its native frame without presentation");
+	return result;
+}
+
+int TestNativeCommandsPreservePipelineState(NativeW3D2 *owner)
+{
+	int result = 0;
+	if (owner == 0 || !owner->IsOperational())
+		return Check(false, "pipeline preservation fixture has an operational owner");
+	rts::render::RenderMatrix4 view;
+	view.values[12] = 5.0f;
+	const rts::render::RenderFloat4 constants(1.0f, 2.0f, 3.0f, 4.0f);
+	const rts::render::GameRenderCommandType types[] = {
+		rts::render::GAME_RENDER_COMMAND_SET_TRANSFORM,
+		rts::render::GAME_RENDER_COMMAND_APPLY_RENDER_STATE_CHANGES,
+		rts::render::GAME_RENDER_COMMAND_SET_VERTEX_SHADER_CONSTANTS,
+		rts::render::GAME_RENDER_COMMAND_SET_PIXEL_SHADER_CONSTANTS
+	};
+	const char *messages[] = {
+		"plain transforms preserve live bias, stencil reference, and alpha blending",
+		"applying render-state changes preserves live bias, stencil reference, and alpha blending",
+		"vertex constants preserve live bias, stencil reference, and alpha blending",
+		"pixel constants preserve live bias, stencil reference, and alpha blending"
+	};
+	for (unsigned int index = 0; index != sizeof(types) / sizeof(types[0]); ++index)
+	{
+		rts::render::ResetTrackedLegacyState();
+		rts::render::SeedTrackedLegacyPipelineState();
+		result |= Check(owner->SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_Z_BIAS, 8U) ==
+			rts::render::RENDER_RESULT_OK &&
+			owner->SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_REFERENCE, 0x3fU) ==
+			rts::render::RENDER_RESULT_OK &&
+			owner->SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_ALPHA_BLEND_ENABLE, 1U) ==
+			rts::render::RENDER_RESULT_OK,
+			"pipeline preservation fixture publishes nondefault render state");
+		rts::render::GameRenderCommand command = {};
+		command.type = types[index];
+		if (index == 0)
+		{
+			command.value0 = rts::render::LEGACY_TRANSFORM_VIEW;
+			command.input = &view;
+			command.inputBytes = sizeof(view);
+		}
+		else if (index >= 2)
+		{
+			command.value1 = 1U;
+			command.input = &constants;
+			command.inputBytes = sizeof(constants);
+		}
+		rts::render::LegacyLogicalState state;
+		result |= Check(owner->ExecuteGameRenderCommand(command) ==
+			rts::render::RENDER_RESULT_OK &&
+			rts::render::GetTrackedLegacyLogicalState(&state) &&
+			state.pipeline.rasterizer.depthBias == -8 &&
+			state.pipeline.depthStencil.stencilReference == 0x3fU &&
+			state.pipeline.blend.blendEnable, messages[index]);
+		if (index == 0)
+			result |= Check(state.constants.view.values[12] == 5.0f,
+				"preserving pipeline state still publishes the requested view transform");
+		else if (index >= 2)
+		{
+			const rts::render::RenderFloat4 &published = index == 2 ?
+				state.constants.vertexShaderConstants[0] :
+				state.constants.pixelShaderConstants[0];
+			result |= Check(published.x == 1.0f && published.y == 2.0f &&
+				published.z == 3.0f && published.w == 4.0f,
+				"preserving pipeline state still publishes the requested shader constants");
+		}
+	}
+	return result;
+}
+
 int TestStencilStateEncoding(NativeW3D2 *owner)
 {
 	int result = 0;
@@ -929,6 +1171,9 @@ int main()
 		"native WW3D2 initializes a hidden D3D11 swap chain");
 	if (initializeResult == rts::render::RENDER_RESULT_OK)
 	{
+		result |= TestNativeHardwareZBias(&w3d);
+		result |= TestNativeCameraBiasSequences(&w3d);
+		result |= TestNativeCommandsPreservePipelineState(&w3d);
 		result |= TestStencilStateEncoding(&w3d);
 		const bool usesDedicatedThreadedOwner =
 			rts::render::NativeW3DRecoveryTestAccess::IsThreaded(
