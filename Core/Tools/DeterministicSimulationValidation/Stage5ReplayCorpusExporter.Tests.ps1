@@ -107,9 +107,9 @@ function New-TestReplayBytes {
 
 function New-TestMetadata {
     param([string]$RunNonce, [string]$Scenario = '4v2', [int]$Seed = 1729,
-        [string]$Category = 'native-fresh-ai')
+        [string]$Category = 'native-fresh-ai', [string]$Title = 'ZeroHour')
     return [ordered]@{
-        title = 'ZeroHour'
+        title = $Title
         category = $Category
         scenario = $Scenario
         seed = $Seed
@@ -145,7 +145,9 @@ try {
     $completion = 'SKIRMISH_AI_TEST_COMPLETE seed=1729 scenario=4v2 ' +
         'run_nonce=' + $runNonce + ' replay_epoch=3 replay_sha256=' +
         $sourceSha256 + ' replay_retained="' + $sourcePath + '"'
-    $retention = Get-Stage5ReplayCompletionFields $completion 1729 '4v2'
+    $retention = Get-Stage5ReplayCompletionFields `
+        -Output $completion -ExpectedSeed 1729 -ExpectedScenario '4v2' `
+        -ExpectedTitle 'ZeroHour'
     Assert-True ($retention.replayRetained -ceq $sourcePath) `
         'completion parser did not retain a quoted source path.'
     Assert-True ($retention.replaySha256 -ceq $sourceSha256) `
@@ -174,6 +176,163 @@ try {
         Where-Object { $_.Name -like '*.tmp-*' })
     Assert-True ($temporaryFiles.Count -eq 0) `
         'successful export left an exporter temporary file behind.'
+
+    # Replay markers and completion epochs are title-specific and must remain
+    # consistent through the reader, completion parser, and record validation.
+    $generalsTaskRoot = Join-Path $testRoot 'generals-task'
+    $generalsTaskRunRoot = Join-Path $generalsTaskRoot 'validation-run'
+    $generalsProfileRoot = Join-Path $generalsTaskRunRoot 'Documents\Profile Name'
+    $generalsSourceDirectory = Join-Path $generalsProfileRoot 'Replays'
+    $generalsCorpusRoot = Join-Path $generalsTaskRoot 'fresh-native-corpus'
+    New-Item -ItemType Directory -Path $generalsSourceDirectory, $generalsCorpusRoot -Force | Out-Null
+    $generalsSourcePath = Join-Path $generalsSourceDirectory 'SkirmishAI-4v2-1729-AE-000001.rep'
+    [IO.File]::WriteAllBytes($generalsSourcePath,
+        (New-TestReplayBytes -AiMarker ' [GeneralsAIPlanningEpoch=1]'))
+    $generalsSourceSha256 = Get-TestSha256 $generalsSourcePath
+    $generalsRunNonce = '00AE-000001-00000001'
+    $generalsCompletion = 'SKIRMISH_AI_TEST_COMPLETE seed=1729 scenario=4v2 ' +
+        'run_nonce=' + $generalsRunNonce + ' replay_epoch=1 replay_sha256=' +
+        $generalsSourceSha256 + ' replay_retained="' + $generalsSourcePath + '"'
+    $generalsRetention = Get-Stage5ReplayCompletionFields `
+        -Output $generalsCompletion -ExpectedSeed 1729 -ExpectedScenario '4v2' `
+        -ExpectedTitle 'Generals'
+    Assert-True ($generalsRetention.replayEpoch -eq 1 -and
+        $generalsRetention.replayRetained -ceq $generalsSourcePath) `
+        'Generals completion parsing did not preserve the title-specific epoch-1 contract.'
+    $generalsRecord = Export-Stage5FreshReplayArtifact `
+        -SourcePath $generalsSourcePath -ExpectedSha256 $generalsSourceSha256 `
+        -TaskRoot $generalsTaskRoot -TaskRunRoot $generalsTaskRunRoot `
+        -ProfileRoot $generalsProfileRoot -CorpusExportRoot $generalsCorpusRoot `
+        -Metadata (New-TestMetadata $generalsRunNonce '4v2' 1729 `
+            'native-fresh-ai' 'Generals')
+    Assert-True ($generalsRecord.title -ceq 'Generals' -and
+        $generalsRecord.skirmishAiReplayEpoch -eq 1) `
+        'Generals export did not retain the title-specific epoch-1 replay marker.'
+    $generalsResultsPath = Join-Path $generalsTaskRoot 'validation-results.json'
+    [IO.File]::WriteAllText($generalsResultsPath, '{"status":"passed"}')
+    $generalsIndex = Write-Stage5FreshReplayArtifactIndex `
+        -TaskRoot $generalsTaskRoot -CorpusExportRoot $generalsCorpusRoot `
+        -Title 'Generals' -ExecutableSha256 ('A' * 64) `
+        -Records @($generalsRecord) -ValidationResultsPath $generalsResultsPath
+    Assert-True (Test-Path -LiteralPath $generalsIndex.path -PathType Leaf) `
+        'Generals artifact index did not accept a title-matched epoch-1 record.'
+    $generalsManifest = Write-Stage5FreshReplayCorpusManifest `
+        -TaskRoot $generalsTaskRoot -CorpusExportRoot $generalsCorpusRoot `
+        -Title 'Generals' -ExecutableSha256 ('A' * 64) `
+        -Records @($generalsRecord) -ValidationResultsPath $generalsResultsPath
+    Assert-True (Test-Path -LiteralPath $generalsManifest.path -PathType Leaf) `
+        'Generals corpus manifest did not accept a title-matched epoch-1 record.'
+
+    # Cross-title and mixed-marker negatives must remain rejected even when a
+    # marker from another title would satisfy the current hard-coded parser.
+    $generalsEpoch3Completion = $generalsCompletion.Replace(
+        'replay_epoch=1', 'replay_epoch=3')
+    Assert-Throws {
+        Get-Stage5ReplayCompletionFields `
+            -Output $generalsEpoch3Completion -ExpectedSeed 1729 `
+            -ExpectedScenario '4v2' -ExpectedTitle 'Generals'
+    } 'epoch|title' `
+        'Generals completion rejects a Zero Hour epoch'
+    $zeroHourEpoch1Completion = $completion.Replace('replay_epoch=3', 'replay_epoch=1')
+    Assert-Throws {
+        Get-Stage5ReplayCompletionFields `
+            -Output $zeroHourEpoch1Completion -ExpectedSeed 1729 `
+            -ExpectedScenario '4v2' -ExpectedTitle 'ZeroHour'
+    } 'epoch|title' `
+        'Zero Hour completion rejects a Generals epoch'
+
+    $generalsWrongMarkerPath = Join-Path $sourceDirectory 'generals-with-zerohour-marker.rep'
+    [IO.File]::WriteAllBytes($generalsWrongMarkerPath, (New-TestReplayBytes))
+    Assert-Throws {
+        Export-Stage5FreshReplayArtifact `
+            -SourcePath $generalsWrongMarkerPath `
+            -ExpectedSha256 (Get-TestSha256 $generalsWrongMarkerPath) `
+            -TaskRoot $taskRoot -TaskRunRoot $taskRunRoot `
+            -ProfileRoot $profileRoot `
+            -CorpusExportRoot (Join-Path $taskRoot 'wrong-generals-corpus') `
+            -Metadata (New-TestMetadata '00AE-000001-00000002' '4v2' 1729 `
+                'native-fresh-ai' 'Generals')
+    } 'epoch|title|marker|replay' `
+        'Generals export rejects a Zero Hour marker'
+
+    $mixedMarkerPath = Join-Path $sourceDirectory 'mixed-title-markers.rep'
+    [IO.File]::WriteAllBytes($mixedMarkerPath,
+        (New-TestReplayBytes -AiMarker ' [GeneralsAIPlanningEpoch=1] [SkirmishAIEpoch=3]'))
+    Assert-Throws {
+        Export-Stage5FreshReplayArtifact `
+            -SourcePath $mixedMarkerPath `
+            -ExpectedSha256 (Get-TestSha256 $mixedMarkerPath) `
+            -TaskRoot $taskRoot -TaskRunRoot $taskRunRoot `
+            -ProfileRoot $profileRoot `
+            -CorpusExportRoot (Join-Path $taskRoot 'mixed-marker-corpus') `
+            -Metadata (New-TestMetadata '00AE-000001-00000003' '4v2' 1729 `
+                'native-fresh-ai' 'ZeroHour')
+    } 'epoch|title|marker|mixed|replay' `
+        'export rejects mixed title replay markers'
+
+    $reverseMixedMarkerPath = Join-Path $sourceDirectory 'reverse-mixed-title-markers.rep'
+    [IO.File]::WriteAllBytes($reverseMixedMarkerPath,
+        (New-TestReplayBytes -AiMarker ' [SkirmishAIEpoch=3] [GeneralsAIPlanningEpoch=1]'))
+    Assert-Throws {
+        Export-Stage5FreshReplayArtifact `
+            -SourcePath $reverseMixedMarkerPath `
+            -ExpectedSha256 (Get-TestSha256 $reverseMixedMarkerPath) `
+            -TaskRoot $taskRoot -TaskRunRoot $taskRunRoot `
+            -ProfileRoot $profileRoot `
+            -CorpusExportRoot (Join-Path $taskRoot 'reverse-mixed-marker-corpus') `
+            -Metadata (New-TestMetadata '00AE-000001-00000005' '4v2' 1729 `
+                'native-fresh-ai' 'Generals')
+    } 'epoch|title|marker|mixed|replay' `
+        'export rejects reverse-order mixed title replay markers'
+
+    $malformedDuplicateMarkerPath = Join-Path $sourceDirectory 'malformed-duplicate-marker.rep'
+    [IO.File]::WriteAllBytes($malformedDuplicateMarkerPath,
+        (New-TestReplayBytes -AiMarker ' [SkirmishAI] [SkirmishAIEpoch=3]'))
+    Assert-Throws {
+        Export-Stage5FreshReplayArtifact `
+            -SourcePath $malformedDuplicateMarkerPath `
+            -ExpectedSha256 (Get-TestSha256 $malformedDuplicateMarkerPath) `
+            -TaskRoot $taskRoot -TaskRunRoot $taskRunRoot `
+            -ProfileRoot $profileRoot `
+            -CorpusExportRoot (Join-Path $taskRoot 'malformed-duplicate-marker-corpus') `
+            -Metadata (New-TestMetadata '00AE-000001-00000006')
+    } 'epoch|title|marker|mixed|replay' `
+        'export rejects malformed duplicate title marker prefixes'
+
+    Assert-Throws {
+        Export-Stage5FreshReplayArtifact `
+            -SourcePath $sourcePath -ExpectedSha256 $sourceSha256 `
+            -TaskRoot $taskRoot -TaskRunRoot $taskRunRoot `
+            -ProfileRoot $profileRoot `
+            -CorpusExportRoot (Join-Path $taskRoot 'invalid-title-corpus') `
+            -Metadata (New-TestMetadata '00AE-000001-00000007' '4v2' 1729 `
+                'native-fresh-ai' 'UnsupportedTitle')
+    } 'Generals|ZeroHour|title' `
+        'export rejects an unsupported replay title'
+
+    $crossTitleRecordCorpusRoot = Join-Path $taskRoot 'cross-title-record-corpus'
+    New-Item -ItemType Directory -Path $crossTitleRecordCorpusRoot -Force | Out-Null
+    $zeroHourRecordForCrossTitle = Export-Stage5FreshReplayArtifact `
+        -SourcePath $sourcePath -ExpectedSha256 $sourceSha256 `
+        -TaskRoot $taskRoot -TaskRunRoot $taskRunRoot `
+        -ProfileRoot $profileRoot -CorpusExportRoot $crossTitleRecordCorpusRoot `
+        -Metadata (New-TestMetadata '00AE-000001-00000004')
+    $forgedGeneralsRecord = [pscustomobject]@{}
+    foreach ($property in $zeroHourRecordForCrossTitle.PSObject.Properties) {
+        $forgedGeneralsRecord | Add-Member -MemberType NoteProperty `
+            -Name $property.Name -Value $property.Value
+    }
+    $forgedGeneralsRecord.title = 'Generals'
+    $crossTitleResultsPath = Join-Path $taskRoot 'cross-title-results.json'
+    [IO.File]::WriteAllText($crossTitleResultsPath, '{"status":"passed"}')
+    Assert-Throws {
+        Write-Stage5FreshReplayArtifactIndex `
+            -TaskRoot $taskRoot -CorpusExportRoot $crossTitleRecordCorpusRoot `
+            -Title 'Generals' -ExecutableSha256 ('A' * 64) `
+            -Records @($forgedGeneralsRecord) `
+            -ValidationResultsPath $crossTitleResultsPath
+    } 'epoch|title|marker|replay' `
+        'record validation rejects a Zero Hour artifact relabeled as Generals'
 
     $validationResults = Join-Path $taskRoot 'validation-results.json'
     $validationReceipt = Join-Path $taskRoot 'validation-results-receipt.json'

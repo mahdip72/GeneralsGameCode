@@ -8,6 +8,30 @@ function Assert-Stage5ExporterCondition {
     }
 }
 
+function Get-Stage5ReplayTitleContract {
+    param(
+        [Parameter(Mandatory = $true)][string]$ExpectedTitle,
+        [string]$Context = 'Replay title'
+    )
+    Assert-Stage5ExporterCondition ($ExpectedTitle -ceq 'Generals' -or
+        $ExpectedTitle -ceq 'ZeroHour') `
+        "$Context must be Generals or ZeroHour."
+    if ($ExpectedTitle -ceq 'Generals') {
+        return [pscustomobject]@{
+            title = 'Generals'
+            epoch = 1
+            marker = '[GeneralsAIPlanningEpoch=1]'
+            markerSuffix = ' [GeneralsAIPlanningEpoch=1]'
+        }
+    }
+    return [pscustomobject]@{
+        title = 'ZeroHour'
+        epoch = 3
+        marker = '[SkirmishAIEpoch=3]'
+        markerSuffix = ' [SkirmishAIEpoch=3]'
+    }
+}
+
 function Get-Stage5ExporterFullPath {
     param([Parameter(Mandatory = $true)][string]$Path, [string]$Context)
     Assert-Stage5ExporterCondition (-not [string]::IsNullOrWhiteSpace($Path)) `
@@ -185,7 +209,11 @@ function Get-Stage5ExporterUtf16String {
 }
 
 function Read-Stage5ReplayContainer {
-    param([Parameter(Mandatory = $true)][string]$Path)
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$ExpectedTitle
+    )
+    $replayContract = Get-Stage5ReplayTitleContract $ExpectedTitle
     $full = Get-Stage5ExporterFullPath $Path 'Replay file'
     $stream = [IO.File]::Open($full, [IO.FileMode]::Open,
         [IO.FileAccess]::Read, [IO.FileShare]::Read)
@@ -232,18 +260,20 @@ function Read-Stage5ReplayContainer {
             }
             [void](Get-Stage5ExporterUtf16String $reader 'Replay version')
             $versionTime = Get-Stage5ExporterUtf16String $reader 'Replay version-time'
-            $aiMarker = ' [SkirmishAIEpoch=3]'
-            $markerMatches = [regex]::Matches($versionTime, '\[SkirmishAI[^\]]*\]')
+            $markerMatches = [regex]::Matches($versionTime,
+                '\[(?:GeneralsAI|SkirmishAI)[^\]]*\]')
             Assert-Stage5ExporterCondition ($markerMatches.Count -eq 1 -and
-                $versionTime.EndsWith($aiMarker, [StringComparison]::Ordinal)) `
-                "Replay file does not carry exactly one current Skirmish-AI epoch-3 marker: $full"
+                $markerMatches[0].Value -ceq $replayContract.marker -and
+                $versionTime.EndsWith($replayContract.markerSuffix,
+                    [StringComparison]::Ordinal)) `
+                "Replay file does not carry exactly one current $($replayContract.title) epoch-$($replayContract.epoch) marker: $full"
             return [pscustomobject]@{
                 magic = $magic
                 schemaVersion = [int]$schemaVersion
                 engineEpoch = [int]$engineEpoch
                 payloadByteCount = [UInt64]$payloadByteCount
                 genrep = $genrep
-                skirmishAiReplayEpoch = 3
+                skirmishAiReplayEpoch = $replayContract.epoch
                 versionTime = $versionTime
             }
         }
@@ -257,8 +287,10 @@ function Get-Stage5ReplayCompletionFields {
         [Parameter(Mandatory = $true)][string]$Output,
         [Parameter(Mandatory = $true)][int]$ExpectedSeed,
         [Parameter(Mandatory = $true)][string]$ExpectedScenario,
+        [Parameter(Mandatory = $true)][string]$ExpectedTitle,
         [string]$Context = 'Fresh replay completion'
     )
+    $replayContract = Get-Stage5ReplayTitleContract $ExpectedTitle
     $lines = @($Output -split "`r?`n" | Where-Object {
         $_.StartsWith('SKIRMISH_AI_TEST_COMPLETE ', [StringComparison]::Ordinal)
     })
@@ -291,7 +323,8 @@ function Get-Stage5ReplayCompletionFields {
         "$Context scenario does not match the plan."
     [int]$replayEpoch = 0
     Assert-Stage5ExporterCondition ([int]::TryParse([string]$fields['replay_epoch'], [ref]$replayEpoch) -and
-        $replayEpoch -eq 3) "$Context replay epoch is not 3."
+        $replayEpoch -eq $replayContract.epoch) `
+        "$Context replay epoch is not $($replayContract.epoch) for title '$($replayContract.title)'."
     $replaySha256 = [string]$fields['replay_sha256']
     Assert-Stage5ExporterCondition ($replaySha256 -match '^[0-9A-Fa-f]{64}$') `
         "$Context replay SHA-256 is invalid."
@@ -329,6 +362,7 @@ function Assert-Stage5ExporterMetadata {
     $title = Get-Stage5ExporterMetadataValue $Metadata 'title'
     Assert-Stage5ExporterCondition ($title -match '^[A-Za-z0-9][A-Za-z0-9 ._-]{0,79}$') `
         'Fresh replay metadata title contains unsupported path characters.'
+    Get-Stage5ReplayTitleContract $title 'Fresh replay metadata title' | Out-Null
     $category = Get-Stage5ExporterMetadataValue $Metadata 'category'
     Assert-Stage5ExporterCondition ($category -match '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') `
         'Fresh replay metadata category contains unsupported path characters.'
@@ -412,6 +446,7 @@ function Export-Stage5FreshReplayArtifact {
         [Parameter(Mandatory = $true)][Collections.IDictionary]$Metadata
     )
     Assert-Stage5ExporterMetadata $Metadata
+    $title = Get-Stage5ExporterMetadataValue $Metadata 'title'
     Assert-Stage5ExporterCondition ($ExpectedSha256 -match '^[0-9A-Fa-f]{64}$') `
         'Expected replay SHA-256 is invalid.'
     $taskRootFull = Assert-Stage5ExporterExplicitTaskRoot $TaskRoot 'TaskRoot'
@@ -462,7 +497,7 @@ function Export-Stage5FreshReplayArtifact {
         $copy = Copy-Stage5ReplayWithStableSource $sourceFull $temporaryFull
         Assert-Stage5ExporterCondition ($copy.sha256 -ceq $ExpectedSha256.ToUpperInvariant()) `
             "Retained replay source SHA-256 mismatch. Expected $ExpectedSha256, got $($copy.sha256)."
-        $header = Read-Stage5ReplayContainer $temporaryFull
+        $header = Read-Stage5ReplayContainer -Path $temporaryFull -ExpectedTitle $title
         Assert-Stage5ExporterCondition ((Get-Stage5ExporterSha256 $temporaryFull) -ceq $copy.sha256) `
             'Temporary replay copy SHA-256 differs from the stable source snapshot.'
         [IO.File]::Move($temporaryFull, $destinationFull)
@@ -475,7 +510,7 @@ function Export-Stage5FreshReplayArtifact {
         $destinationSha256 = Get-Stage5ExporterSha256 $destinationFull
         Assert-Stage5ExporterCondition ($destinationSha256 -ceq $copy.sha256) `
             'Replay export destination SHA-256 differs from the source snapshot.'
-        $destinationHeader = Read-Stage5ReplayContainer $destinationFull
+        $destinationHeader = Read-Stage5ReplayContainer -Path $destinationFull -ExpectedTitle $title
         Assert-Stage5ExporterCondition ($destinationHeader.magic -ceq $header.magic -and
             $destinationHeader.schemaVersion -eq $header.schemaVersion -and
             $destinationHeader.engineEpoch -eq $header.engineEpoch -and
@@ -527,6 +562,7 @@ function Assert-Stage5ExporterRecord {
         Assert-Stage5ExporterCondition ($null -ne $Record.PSObject.Properties[$name]) `
             "Corpus manifest record is missing '$name'."
     }
+    $replayContract = Get-Stage5ReplayTitleContract $Title 'Corpus manifest title'
     Assert-Stage5ExporterCondition ([string]$Record.origin -ceq 'native-fresh-runtime') `
         'Corpus manifest record origin is not native-fresh-runtime.'
     Assert-Stage5ExporterCondition ([string]$Record.title -ceq $Title) `
@@ -588,12 +624,18 @@ function Assert-Stage5ExporterRecord {
         [int]$Record.containerSchemaVersion -eq 2 -and
         [int]$Record.containerEngineEpoch -eq 1 -and
         [string]$Record.payloadMagic -ceq 'GENREP' -and
-        [int]$Record.skirmishAiReplayEpoch -eq 3) `
+        [int]$Record.skirmishAiReplayEpoch -eq $replayContract.epoch) `
         'Corpus manifest record has an invalid native replay container contract.'
-    $header = Read-Stage5ReplayContainer $destinationFull
+    $replayEpochProperty = $Record.PSObject.Properties['replayEpoch']
+    if ($null -ne $replayEpochProperty) {
+        Assert-Stage5ExporterCondition ([int]$replayEpochProperty.Value -eq $replayContract.epoch) `
+            'Corpus manifest record completion epoch does not match its title.'
+    }
+    $header = Read-Stage5ReplayContainer -Path $destinationFull -ExpectedTitle $Title
     Assert-Stage5ExporterCondition ($header.magic -ceq 'RPL3' -and
         $header.schemaVersion -eq 2 -and $header.engineEpoch -eq 1 -and
-        $header.genrep -ceq 'GENREP' -and $header.skirmishAiReplayEpoch -eq 3) `
+        $header.genrep -ceq 'GENREP' -and
+        $header.skirmishAiReplayEpoch -eq $replayContract.epoch) `
         'Corpus manifest record destination failed native replay revalidation.'
 }
 
@@ -737,6 +779,7 @@ function Read-Stage5FreshReplayCorpusBundle {
         'origin' 'Corpus manifest') -ceq 'native-fresh-runtime') `
         'Corpus manifest origin is not native-fresh-runtime.'
     $title = [string](Get-Stage5ExporterJsonProperty $manifest 'title' 'Corpus manifest')
+    Get-Stage5ReplayTitleContract $title 'Corpus manifest title' | Out-Null
     $executableSha256 = [string](Get-Stage5ExporterJsonProperty $manifest `
         'executableSha256' 'Corpus manifest')
     Assert-Stage5ExporterCondition ($executableSha256 -match '^[0-9A-Fa-f]{64}$') `
@@ -891,6 +934,7 @@ function Write-Stage5FreshReplayArtifactIndex {
     )
     Assert-Stage5ExporterCondition ($Title -match '^[A-Za-z0-9][A-Za-z0-9 ._-]{0,79}$') `
         'Artifact index title is invalid.'
+    Get-Stage5ReplayTitleContract $Title 'Artifact index title' | Out-Null
     Assert-Stage5ExporterCondition ($ExecutableSha256 -match '^[0-9A-Fa-f]{64}$') `
         'Artifact index executable SHA-256 is invalid.'
     Assert-Stage5ExporterCondition ($null -ne $Records -and $Records.Count -gt 0) `
@@ -947,6 +991,7 @@ function Write-Stage5FreshReplayCorpusManifest {
     )
     Assert-Stage5ExporterCondition ($Title -match '^[A-Za-z0-9][A-Za-z0-9 ._-]{0,79}$') `
         'Corpus manifest title is invalid.'
+    Get-Stage5ReplayTitleContract $Title 'Corpus manifest title' | Out-Null
     Assert-Stage5ExporterCondition ($ExecutableSha256 -match '^[0-9A-Fa-f]{64}$') `
         'Corpus manifest executable SHA-256 is invalid.'
     Assert-Stage5ExporterCondition ($null -ne $Records -and $Records.Count -gt 0) `

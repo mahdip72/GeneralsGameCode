@@ -1990,7 +1990,7 @@ function Export-LocalCapacityAiCorpus {
             "LocalCapacity corpus export has no parsed AI result for sequence $($entry.sequence)."
         $completion = Get-Stage5ReplayCompletionFields `
             -Output ([string]$run.stdout) -ExpectedSeed ([int]$entry.seed) `
-            -ExpectedScenario ([string]$entry.scenario) `
+            -ExpectedScenario ([string]$entry.scenario) -ExpectedTitle $Title `
             -Context "LocalCapacity AI sequence $($entry.sequence) completion"
         $artifact = Export-Stage5FreshReplayArtifact `
             -SourcePath $completion.replayRetained `
