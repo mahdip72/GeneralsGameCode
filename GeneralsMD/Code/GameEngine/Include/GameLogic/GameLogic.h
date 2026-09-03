@@ -64,6 +64,9 @@ class WindowLayout;
 class TerrainLogic;
 class GhostObjectManager;
 class CommandButton;
+#if defined(_WIN64)
+class PerformanceReceiptRuntime;
+#endif
 enum BuildableStatus CPP_11(: Int);
 
 
@@ -149,6 +152,10 @@ public:
 	UnsignedInt getObjectStatusTimerStorageCapacity() const { return m_objectStatusTimerStorageCapacity; }
 	Bool getStage5PhaseAuthorityEvidence( UnsignedInt phaseId,
 		rts::LiveSimulationPhaseAuthorityEvidence &evidence ) const;
+#if defined(_WIN64)
+	bool attachPerformanceReceiptRuntime(PerformanceReceiptRuntime *runtime);
+	bool detachPerformanceReceiptRuntime(PerformanceReceiptRuntime *expectedRuntime);
+#endif
 	const rts::LiveSimulationPhaseRuntimeMetrics &getStage5PhaseRuntimeMetrics() const
 	{
 		return m_stage5PhaseGraph.runtimeMetrics();
@@ -410,6 +417,9 @@ private:
 	rts::LiveSimulationPhaseGraphOwnerAdapter m_stage5PhaseGraph;
 	UnsignedInt m_stage5PhaseCursor;
 	UnsignedInt m_stage5PhaseNow;
+#if defined(_WIN64)
+	PerformanceReceiptRuntime *m_performanceReceiptRuntime;
+#endif
 
 	// CRC cache system -----------------------------------------------------------------------------
 	UnsignedInt	m_CRC;																			///< Cache of previous CRC value
@@ -467,6 +477,12 @@ private:
 	void runLegacyStage5Phases();
 	static rts::LiveSimulationPhaseOwnerCallbacks makeStage5PhaseGraphCallbacks();
 	static bool isStage5PhaseGraphOwner( void *ownerContext );
+#if defined(_WIN64)
+	static void observeStage5PhaseGraphBoundary(
+		rts::LiveSimulationPhaseObservationBoundary boundary,
+		rts::SimulationPhaseId phaseId, unsigned generation,
+		unsigned frame, void *ownerContext) noexcept;
+#endif
 	static bool validateStage5PhaseGraphCommit( unsigned phaseId,
 		unsigned generation, unsigned frame, void *ownerContext );
 	static bool commitStage5PhaseGraphPhase( unsigned phaseId,

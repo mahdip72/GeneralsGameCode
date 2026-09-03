@@ -59,6 +59,7 @@
 #include "Common/ThingTemplate.h"
 #include "GameClient/Water.h"
 #if defined(_WIN64)
+#include "Common/PerformanceReceiptRuntime.h"
 #include "GameNetwork/InstalledLockstepV2Validation.h"
 #endif
 #include "Common/WellKnownKeys.h"
@@ -955,6 +956,9 @@ GameLogic::GameLogic()
 	m_objectStatusTimerStorageCapacity = 0;
 	m_stage5PhaseCursor = 0;
 	m_stage5PhaseNow = 0;
+#if defined(_WIN64)
+	m_performanceReceiptRuntime = 0;
+#endif
 	m_hasUpdated = FALSE;
 	m_frameObjectsChangedTriggerAreas = 0;
 	m_width = 0;
@@ -4105,6 +4109,9 @@ rts::LiveSimulationPhaseOwnerCallbacks GameLogic::makeStage5PhaseGraphCallbacks(
 	callbacks.isOwner = &GameLogic::isStage5PhaseGraphOwner;
 	callbacks.validate = &GameLogic::validateStage5PhaseGraphCommit;
 	callbacks.commit = &GameLogic::commitStage5PhaseGraphPhase;
+#if defined(_WIN64)
+	callbacks.observe = &GameLogic::observeStage5PhaseGraphBoundary;
+#endif
 	return callbacks;
 }
 
@@ -4127,6 +4134,43 @@ bool GameLogic::isStage5PhaseGraphOwner( void *ownerContext )
 	return true;
 #endif
 }
+
+// ------------------------------------------------------------------------------------------------
+#if defined(_WIN64)
+bool GameLogic::attachPerformanceReceiptRuntime(PerformanceReceiptRuntime *runtime)
+{
+	if (!isStage5PhaseGraphOwner(this) || isInGameLogicUpdate() ||
+		runtime == 0 || !runtime->active() ||
+		(m_performanceReceiptRuntime != 0 && m_performanceReceiptRuntime != runtime))
+		return false;
+	m_performanceReceiptRuntime = runtime;
+	return true;
+}
+
+bool GameLogic::detachPerformanceReceiptRuntime(PerformanceReceiptRuntime *expectedRuntime)
+{
+	if (!isStage5PhaseGraphOwner(this) || isInGameLogicUpdate() ||
+		expectedRuntime == 0 || m_performanceReceiptRuntime != expectedRuntime)
+		return false;
+	m_performanceReceiptRuntime = 0;
+	return true;
+}
+
+void GameLogic::observeStage5PhaseGraphBoundary(
+	rts::LiveSimulationPhaseObservationBoundary boundary,
+	rts::SimulationPhaseId phaseId, unsigned generation,
+	unsigned frame, void *ownerContext) noexcept
+{
+	GameLogic *logic = static_cast<GameLogic *>(ownerContext);
+	if (logic == 0 || logic->m_performanceReceiptRuntime == 0)
+		return;
+	// A rejected foreign callback must not read mutable world state. The
+	// runtime latches its qualification failure without affecting dispatch.
+	const unsigned actualFrame = isStage5PhaseGraphOwner(logic) ? logic->getFrame() : 0;
+	logic->m_performanceReceiptRuntime->observePhaseBoundary(
+		boundary, phaseId, generation, frame, actualFrame);
+}
+#endif
 
 // ------------------------------------------------------------------------------------------------
 bool GameLogic::validateStage5PhaseGraphCommit( unsigned phaseId,

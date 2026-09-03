@@ -33,6 +33,7 @@
 #include "Lib/PipelineExecutionPolicy.h"
 #include "Lib/SimulationExecutionPolicy.h"
 #if defined(_WIN64)
+#include "Common/GameThreadOwnership.h"
 #include "Common/Player.h"
 #include "Common/PlayerList.h"
 #include "GameLogic/AIPathfind.h"
@@ -719,7 +720,11 @@ int countProcessesRunning(const std::vector<WorkerProcess>& processes)
 } // namespace
 
 #if defined(_WIN64)
-PerformanceReceiptRuntime::PerformanceReceiptRuntime() : m_active(false) {}
+PerformanceReceiptRuntime::PerformanceReceiptRuntime()
+	: m_active(false), m_phaseSampleOrdinal(0), m_phaseGeneration(0),
+	  m_phaseAuthorityFrame(0), m_phaseObservationFailed(false)
+{
+}
 
 bool PerformanceReceiptRuntime::begin(const char *fixtureKind, const char *replayPath)
 {
@@ -751,6 +756,126 @@ bool PerformanceReceiptRuntime::begin(const char *fixtureKind, const char *repla
 void PerformanceReceiptRuntime::invalidate(const char *reason)
 {
 	if (active() && m_failure.empty()) m_failure = reason;
+}
+
+static rts::performance::KernelPerformanceSchedulerBoundary
+capturePerformancePhaseSchedulerBoundary()
+{
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	const rts::JobSystemMetrics metrics = jobs.metrics();
+	rts::performance::KernelPerformanceSchedulerBoundary actual;
+	actual.submittedJobs = metrics.submittedJobCount;
+	actual.executedJobs = metrics.executedJobCount;
+	actual.ownerHelpJobs = metrics.ownerHelpCount;
+	actual.outstandingJobs = jobs.outstandingJobCount();
+	actual.pendingJobs = jobs.pendingOwnerCompletionCount();
+	return actual;
+}
+
+void PerformanceReceiptRuntime::observePhaseBoundary(
+	rts::LiveSimulationPhaseObservationBoundary boundary,
+	rts::SimulationPhaseId phaseId, unsigned generation,
+	unsigned authorityFrame, unsigned actualOwnerFrame) noexcept
+{
+	using namespace rts::performance;
+	// A foreign observation changes only this atomic failure latch, never the
+	// owner's token, ledger state, world data, or gameplay execution policy.
+	if (!GameThreadOwnership::IsCurrentThread())
+	{
+		m_phaseObservationFailed.store(true, std::memory_order_release);
+		return;
+	}
+	if (!active() || m_lifecycle.terminalResultKnown()) return;
+	KernelPerformanceLedger &ledger = KernelPerformanceLedger::instance();
+	// This selects an observational extent only. Ordinary runtime begin and
+	// every gameplay/worker dispatch decision retain their existing policy.
+	if (ledger.runRole() != KERNEL_PERFORMANCE_PHASE_SERIAL_BASELINE) return;
+	try
+	{
+		if (boundary == rts::LIVE_SIMULATION_PHASE_OBSERVE_FRAME_ABORT)
+		{
+			// In particular, nested rejection cannot replace or discard the
+			// outer token. That real outer frame may still finish accounting.
+			m_phaseObservationFailed.store(true, std::memory_order_release);
+			return;
+		}
+		if (boundary == rts::LIVE_SIMULATION_PHASE_OBSERVE_FRAME_BEGIN)
+		{
+			if (m_phaseFrame.valid() || generation == 0 ||
+				m_phaseSampleOrdinal == ~static_cast<rts::JobMetricCounter>(0))
+			{
+				m_phaseObservationFailed.store(true, std::memory_order_release);
+				return;
+			}
+			const KernelPerformanceFrame frame = ledger.beginFrame(
+				m_phaseSampleOrdinal + 1, authorityFrame,
+				capturePerformancePhaseSchedulerBoundary());
+			if (!frame.valid())
+			{
+				m_phaseObservationFailed.store(true, std::memory_order_release);
+				return;
+			}
+			m_phaseFrame = frame;
+			++m_phaseSampleOrdinal;
+			m_phaseGeneration = generation;
+			return;
+		}
+		if (!m_phaseFrame.valid() || generation != m_phaseGeneration)
+		{
+			m_phaseObservationFailed.store(true, std::memory_order_release);
+			return;
+		}
+		if (boundary == rts::LIVE_SIMULATION_PHASE_OBSERVE_FRAME_END)
+		{
+			// FRAME_END retains entry authority, while the last real phase
+			// can have adopted a new world frame during owner intake.
+			if (authorityFrame != m_phaseFrame.ownerFrameAtEntry ||
+				m_phaseAuthorityFrame == ~0u || actualOwnerFrame == 0 ||
+				actualOwnerFrame != m_phaseAuthorityFrame + 1 ||
+				!ledger.endFrame(m_phaseFrame, actualOwnerFrame,
+					capturePerformancePhaseSchedulerBoundary()))
+			{
+				m_phaseObservationFailed.store(true, std::memory_order_release);
+				return;
+			}
+			m_phaseFrame = KernelPerformanceFrame();
+			m_phaseGeneration = 0;
+			return;
+		}
+		KernelPerformancePhase phase;
+		switch (phaseId)
+		{
+		case rts::LIVE_SIMULATION_PHASE_OWNER_INTAKE:
+			phase = KERNEL_PHASE_OWNER_INTAKE; break;
+		case rts::LIVE_SIMULATION_PHASE_LEGACY_MUTABLE_ISLAND:
+			phase = KERNEL_PHASE_LEGACY_MUTABLE_ISLAND; break;
+		case rts::LIVE_SIMULATION_PHASE_SPATIAL:
+			phase = KERNEL_PHASE_SPATIAL_WORK; break;
+		case rts::LIVE_SIMULATION_PHASE_OWNER_TAIL:
+			phase = KERNEL_PHASE_OWNER_TAIL; break;
+		case rts::LIVE_SIMULATION_PHASE_VERIFICATION_PUBLICATION:
+			phase = KERNEL_PHASE_VERIFICATION_PUBLICATION; break;
+		default:
+			m_phaseObservationFailed.store(true, std::memory_order_release);
+			return;
+		}
+		if (boundary == rts::LIVE_SIMULATION_PHASE_OBSERVE_PHASE_BEGIN)
+		{
+			if (ledger.beginPhase(m_phaseFrame, phase))
+				m_phaseAuthorityFrame = authorityFrame;
+			else
+				m_phaseObservationFailed.store(true, std::memory_order_release);
+		}
+		else if (boundary != rts::LIVE_SIMULATION_PHASE_OBSERVE_PHASE_END ||
+			authorityFrame != m_phaseAuthorityFrame || !ledger.endPhase(m_phaseFrame, phase))
+			m_phaseObservationFailed.store(true, std::memory_order_release);
+	}
+	catch (...)
+	{
+		// Failure reporting here cannot allocate or throw through a gameplay
+		// callback. Final publication consumes the latch after teardown.
+		m_phaseObservationFailed.store(true, std::memory_order_release);
+	}
 }
 
 void PerformanceReceiptRuntime::bindFixture(const char *kind, const char *contentPath,
@@ -906,6 +1031,8 @@ void PerformanceReceiptRuntime::finish(int exitCode, const char *boundary)
 	m_receipt.finalCrcKnown = m_lifecycle.terminalResultKnown();
 	const bool timingClosed = resolvePerformanceReceiptTimingPath(m_receipt);
 	std::string reason = m_failure;
+	if (reason.empty() && m_phaseObservationFailed.load(std::memory_order_acquire))
+		reason = "phase observation did not retain a complete owner frame identity";
 	if (reason.empty() && !complete)
 		reason = "owner lifecycle is incomplete or authoritative work is not drained";
 	if (reason.empty() && exitCode != 0) reason = "owner run did not exit cleanly";

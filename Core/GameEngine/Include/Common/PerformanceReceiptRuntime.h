@@ -8,6 +8,8 @@
 
 #if defined(_WIN64)
 #include "Lib/PerformanceReceipt.h"
+#include "Lib/SimulationPhaseGraphOwnerAdapter.h"
+#include <atomic>
 
 struct OrdinaryPathRuntimeMetrics;
 namespace rts
@@ -58,6 +60,10 @@ public:
 	bool begin(const char *fixtureKind, const char *replayPath);
 	bool active() const { return m_active && !m_lifecycle.finalized(); }
 	void invalidate(const char *reason);
+	void observePhaseBoundary(
+		rts::LiveSimulationPhaseObservationBoundary boundary,
+		rts::SimulationPhaseId phaseId, unsigned generation,
+		unsigned authorityFrame, unsigned actualOwnerFrame) noexcept;
 	void bindFixture(const char *kind, const char *contentPath,
 		const char *sha256, unsigned seed);
 	void captureCompletedFrame(unsigned previousFrame,
@@ -76,6 +82,11 @@ private:
 	rts::performance::PerformanceReceipt m_receipt;
 	PerformanceReceiptOwnerLifecycle m_lifecycle;
 	bool m_active;
+	rts::performance::KernelPerformanceFrame m_phaseFrame;
+	rts::JobMetricCounter m_phaseSampleOrdinal;
+	unsigned m_phaseGeneration;
+	unsigned m_phaseAuthorityFrame;
+	std::atomic<bool> m_phaseObservationFailed;
 	std::string m_failure;
 	PerformanceReceiptRuntime(const PerformanceReceiptRuntime &);
 	PerformanceReceiptRuntime &operator=(const PerformanceReceiptRuntime &);

@@ -60,6 +60,9 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD)
     include("${CMAKE_SOURCE_DIR}/Core/Tools/Stage5PerformanceFixtureTest/HeadlessMetricStartupTitleTest.cmake")
     rts_add_headless_metric_startup_test(g_skirmish_ai_runner_contract_tests
         Generals g_headless_metric_startup_tests)
+    include("${CMAKE_SOURCE_DIR}/Core/Tools/Stage5PerformanceFixtureTest/PerformanceReceiptOwnerBridgeTitleTest.cmake")
+    rts_add_performance_receipt_owner_bridge_test(g_skirmish_ai_runner_contract_tests
+        Generals g_performance_receipt_owner_bridge_tests)
     # Exercise the real AudioEventRTS/GameAudio implementations, not the
     # isolated manager fixture's runtime substitutes. The hook only sets
     # deterministic test capacity.
