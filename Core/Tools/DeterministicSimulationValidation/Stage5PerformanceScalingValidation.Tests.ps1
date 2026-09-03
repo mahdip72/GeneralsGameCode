@@ -549,6 +549,62 @@ function Assert-PairedRejected {
     Assert-True $rejected "Negative paired self-test '$Name' was not rejected."
 }
 
+function Test-Stage5RegistryJournalExistingFileUpdate {
+    param([string]$Root)
+    $journalPath = Join-Path $Root 'synthetic-recovery-journal-update.json'
+    $snapshots = @(
+        [pscustomobject]@{
+            view = [Microsoft.Win32.RegistryView]::Registry32
+            subKey = 'Software\Stage5\Validation'; name = 'Personal'
+            hadKey = $true; hadValue = $true
+            oldValue = '%STAGE5_TEST_DOCUMENTS%\Documents'
+            oldKind = [Microsoft.Win32.RegistryValueKind]::ExpandString
+            createdSubKeys = @()
+        },
+        [pscustomobject]@{
+            view = [Microsoft.Win32.RegistryView]::Registry64
+            subKey = 'Software\Stage5\Validation'; name = 'InstallPath'
+            hadKey = $true; hadValue = $false
+            oldValue = $null; oldKind = $null; createdSubKeys = @()
+        }
+    )
+    Write-Stage5RegistryRecoveryJournal $journalPath 'ZeroHour' $Root $snapshots `
+        ([pscustomobject]@{ processId = 4242; exitProof = $false; blocked = $true }) 'pending'
+    $pendingJournal = Read-TestJson $journalPath
+    Assert-True ($pendingJournal.state -ceq 'pending' -and
+        @($pendingJournal.snapshots).Count -eq 2 -and
+        $pendingJournal.snapshots[0].oldValue -ceq '%STAGE5_TEST_DOCUMENTS%\Documents' -and
+        [int]$pendingJournal.snapshots[0].oldKind -eq 2 -and
+        -not [bool]$pendingJournal.snapshots[1].hadValue) `
+        'Initial recovery journal must preserve raw expansion, type, and absence.'
+    $pendingHash = Get-Sha256 $journalPath
+    try {
+        # This second write must exercise replacement of an existing file;
+        # a fresh-file-only test misses the PowerShell null-string binding bug.
+        Write-Stage5RegistryRecoveryJournal $journalPath 'ZeroHour' $Root $snapshots `
+            ([pscustomobject]@{ processId = 4242; exitProof = $true; blocked = $false }) 'restored'
+    }
+    catch {
+        Assert-True ((Get-Sha256 $journalPath) -ceq $pendingHash) `
+            'Failed journal replacement must leave the pending recovery data intact.'
+        throw
+    }
+    $restoredJournal = Read-TestJson $journalPath
+    Assert-True ($restoredJournal.state -ceq 'restored' -and
+        [bool]$restoredJournal.childExitProof -and -not [bool]$restoredJournal.cleanupBlocked -and
+        [int]$restoredJournal.processId -eq 4242 -and
+        @($restoredJournal.snapshots).Count -eq 2 -and
+        $restoredJournal.snapshots[0].oldValue -ceq '%STAGE5_TEST_DOCUMENTS%\Documents' -and
+        [int]$restoredJournal.snapshots[0].oldKind -eq 2 -and
+        -not [bool]$restoredJournal.snapshots[1].hadValue -and
+        $null -eq $restoredJournal.snapshots[1].oldValue -and
+        $null -eq $restoredJournal.snapshots[1].oldKind) `
+        'Existing recovery journal must atomically publish restored state without changing originals.'
+    Assert-True (@(Get-ChildItem -LiteralPath $Root -File `
+            -Filter 'synthetic-recovery-journal-update.json.tmp-*').Count -eq 0) `
+        'Successful journal replacement must not leave a temporary recovery file.'
+}
+
 $runner = Join-Path $PSScriptRoot 'Invoke-Stage5PerformanceScalingValidation.ps1'
 $runnerSource = Get-Content -LiteralPath $runner -Raw
 $scratchParent = if (-not [string]::IsNullOrWhiteSpace($ScratchRoot)) {
@@ -651,6 +707,7 @@ try {
         $recoveryJournal.snapshots[0].subKey -ceq 'Software\Stage5\Validation' -and
         @($recoveryJournal.snapshots[0].createdSubKeys)[0] -ceq 'Software') `
         'Blocked cleanup must retain an exact recoverable registry snapshot journal.'
+    Test-Stage5RegistryJournalExistingFileUpdate $testRoot
     $validDocument = Read-TestJson $validManifest
     $literalReceipt = Read-TestJson $validDocument.runs[0].receiptPath
     Assert-True ($literalReceipt.cohortCreatedUtc -is [string] -and

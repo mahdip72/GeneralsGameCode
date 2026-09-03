@@ -2751,7 +2751,7 @@ function Write-Stage5JsonAtomically {
     [IO.File]::WriteAllText($temporary, ($Value | ConvertTo-Json -Depth 20))
     try {
         if ([IO.File]::Exists($Path)) {
-            [IO.File]::Replace($temporary, $Path, $null)
+            [IO.File]::Replace($temporary, $Path, [NullString]::Value)
         }
         else {
             [IO.File]::Move($temporary, $Path)
