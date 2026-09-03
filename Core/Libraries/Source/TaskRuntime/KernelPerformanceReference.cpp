@@ -117,7 +117,9 @@ KernelPerformanceTraceSnapshot::KernelPerformanceTraceSnapshot() : mode(KERNEL_T
 	frozen(false), complete(false), observationSealed(false), executionSealed(false), errors(0), binding(), limits(),
 	residentAttemptCapacity(0), residentRangeCapacity(0), residentAttemptCount(0), residentAttemptHighWater(0),
 	attemptCount(0), admittedAttemptCount(0), notAdmittedAttemptCount(0), abortedAfterAdmissionAttemptCount(0),
-	reapCount(0), recordCount(0), logicalEventCount(0), coalescedSpanCount(0), coalescedAttemptCount(0), byteCount(0) {}
+	reapCount(0), capturedAttemptCount(0), capturedOperationCount(0), dispatchCount(0), rangeCount(0), releasedRangeCount(0),
+	residentRangeCount(0), residentRangeHighWater(0), recordCount(0), logicalEventCount(0),
+	coalescedSpanCount(0), coalescedAttemptCount(0), byteCount(0) {}
 
 struct KernelPerformanceCanonicalWriter::State
 {
@@ -313,6 +315,33 @@ bool traceDynamicFactsValid(unsigned known, JobMetricCounter pending, JobMetricC
 	return (known & ~7U) == 0 && ((known & 1U) != 0 || pending == 0) &&
 		((known & 2U) != 0 || outstanding == 0) && ((known & 4U) != 0 || activeSlots == 0);
 }
+bool sameRangePlan(const KernelPerformanceRangePlan &first, const KernelPerformanceRangePlan &second)
+{
+	return first.dispatchOrdinal == second.dispatchOrdinal && first.rangeOrdinal == second.rangeOrdinal &&
+		first.bodyKind == second.bodyKind && first.begin == second.begin && first.end == second.end &&
+		first.operationCount == second.operationCount;
+}
+bool releasedRangeProgressValid(const KernelPerformanceRangeProgress &progress)
+{
+	const KernelPerformanceCheckpointProgress &checkpoint = progress.checkpoint;
+	if (!checkpoint.entered)
+		return checkpoint.errors == 0 && checkpoint.pollCount == 0 && checkpoint.firstTruePoll == 0 &&
+			checkpoint.completedWorkUnits == 0 && checkpoint.firstTrueCheckpoint.site == 0 &&
+			checkpoint.firstTrueCheckpoint.first == 0 && checkpoint.firstTrueCheckpoint.second == 0 &&
+			checkpoint.finalCheckpoint.site == 0 && checkpoint.finalCheckpoint.first == 0 &&
+			checkpoint.finalCheckpoint.second == 0 && checkpoint.terminal == KERNEL_RANGE_NEVER_ENTERED &&
+			progress.publication == KERNEL_PUBLICATION_NOT_APPLICABLE;
+	return releasedCheckpointProgressValid(checkpoint) && progress.publication >= KERNEL_PUBLICATION_NOT_APPLICABLE &&
+		progress.publication <= KERNEL_PUBLICATION_REJECTED &&
+		(progress.publication != KERNEL_PUBLICATION_PUBLISHED || checkpoint.terminal == KERNEL_RANGE_COMPLETED);
+}
+bool appendRangePlan(KernelPerformanceCanonicalWriter &writer, JobMetricCounter serial,
+	const KernelPerformanceRangePlan &range)
+{
+	return writer.u64(3, serial) && writer.u64(4, range.dispatchOrdinal) && writer.u32(5, range.rangeOrdinal) &&
+		writer.u32(6, range.bodyKind) && writer.u64(7, range.begin) && writer.u64(8, range.end) &&
+		writer.u64(9, range.operationCount);
+}
 struct CallbackGuard
 {
 	explicit CallbackGuard(bool &active) : flag(active) { flag = true; }
@@ -339,10 +368,22 @@ struct KernelPerformanceReferenceLedger::State
 	};
 	struct Attempt
 	{
-		Attempt() : active(false), decisionSeen(false), finished(false), serial(0), decisionOrdinal(0), identity() {}
-		bool active, decisionSeen, finished;
-		JobMetricCounter serial, decisionOrdinal;
+		Attempt() : active(false), decisionSeen(false), finished(false), captured(false), admitted(false),
+			dispatchSeen(false), serial(0), decisionOrdinal(0), capturedOperations(0), inputSchema(0),
+			plannedRanges(0), releasedRanges(0), identity(), dispatch() {}
+		bool active, decisionSeen, finished, captured, admitted, dispatchSeen;
+		JobMetricCounter serial, decisionOrdinal, capturedOperations;
+		unsigned inputSchema, plannedRanges, releasedRanges;
 		KernelPerformanceAttemptIdentity identity;
+		KernelPerformanceDigest inputDigest;
+		KernelPerformanceDispatchPlan dispatch;
+	};
+	struct Range
+	{
+		Range() : active(false), attemptSerial(0), plan() {}
+		bool active;
+		JobMetricCounter attemptSerial;
+		KernelPerformanceRangePlan plan;
 	};
 	struct AttemptOrder
 	{
@@ -351,8 +392,8 @@ struct KernelPerformanceReferenceLedger::State
 		JobMetricCounter sample, ordinal;
 	};
 	State() : streamCount(0), openCount(0), nextSerial(0), lastClock(0), busy(false), clock(0), context(0),
-		traceOwner(0), traceAppend(0), traceContext(0), attempts(0), attemptCapacity(0), nextAttemptSerial(0) {}
-	~State() { delete[] attempts; }
+		traceOwner(0), traceAppend(0), traceContext(0), attempts(0), ranges(0), attemptCapacity(0), rangeCapacity(0), nextAttemptSerial(0) {}
+	~State() { delete[] ranges; delete[] attempts; }
 	bool now(JobMetricCounter &value)
 	{
 		value = clock != 0 ? clock(context) : 0;
@@ -396,7 +437,8 @@ struct KernelPerformanceReferenceLedger::State
 	void *traceContext;
 	KernelPerformanceCanonicalWriter traceWriter;
 	Attempt *attempts;
-	unsigned attemptCapacity;
+	Range *ranges;
+	unsigned attemptCapacity, rangeCapacity;
 	JobMetricCounter nextAttemptSerial;
 	AttemptOrder attemptOrder[KERNEL_PERFORMANCE_KERNEL_COUNT][2];
 };
@@ -492,7 +534,7 @@ bool KernelPerformanceReferenceLedger::beginRun(const KernelPerformanceReference
 	if (m_snapshot.generation != 0 && !m_snapshot.frozen) return failTrace(KERNEL_PERFORMANCE_ERROR_STATE);
 	if (options.trace.mode == KERNEL_TRACE_DISABLED)
 		return beginRun(options.mode, options.clock, options.clockContext);
-	// Consumption and admitted-work execution are separate later slices. A
+	// Consumption and successful linkage are separate later slices. A
 	// rejected configuration must not replace a previously frozen receipt.
 	if (options.trace.mode != KERNEL_TRACE_RECORD || options.mode != KERNEL_REFERENCE_THROUGHPUT_BINDING)
 		return failTrace(KERNEL_PERFORMANCE_ERROR_IDENTITY);
@@ -506,7 +548,8 @@ bool KernelPerformanceReferenceLedger::beginRun(const KernelPerformanceReference
 		requested.residentRangeCapacity == 0)
 		return failTrace(KERNEL_PERFORMANCE_ERROR_CAPACITY);
 	if (requested.residentAttemptCapacity > ~0U || requested.residentRangeCapacity > ~0U ||
-		requested.residentAttemptCapacity > static_cast<size_t>(-1) / sizeof(State::Attempt))
+		requested.residentAttemptCapacity > static_cast<size_t>(-1) / sizeof(State::Attempt) ||
+		requested.residentRangeCapacity > static_cast<size_t>(-1) / sizeof(State::Range))
 		return failTrace(KERNEL_PERFORMANCE_ERROR_OVERFLOW);
 	const JobMetricCounter previousGeneration = m_snapshot.generation;
 	const bool started = beginRun(options.mode, options.clock, options.clockContext);
@@ -525,8 +568,10 @@ bool KernelPerformanceReferenceLedger::beginRun(const KernelPerformanceReference
 	m_state->attemptCapacity = static_cast<unsigned>(requested.residentAttemptCapacity);
 	m_state->attempts = new (std::nothrow) State::Attempt[m_state->attemptCapacity];
 	if (m_state->attempts == 0) return failTrace(KERNEL_PERFORMANCE_ERROR_CAPACITY);
-	// Only resident attempts are allocated here. The paired range bound is
-	// already frozen in the header; this slice accepts no range observations.
+	m_state->rangeCapacity = static_cast<unsigned>(requested.residentRangeCapacity);
+	m_state->ranges = new (std::nothrow) State::Range[m_state->rangeCapacity];
+	if (m_state->ranges == 0) return failTrace(KERNEL_PERFORMANCE_ERROR_CAPACITY);
+	// These reusable tables follow live bounds, never total event history.
 	CallbackGuard guard(m_state->busy);
 	KernelPerformanceCanonicalWriter &writer = m_state->traceWriter;
 	if (!writer.begin(0x5001, State::appendTrace, m_state) || !m_state->traceRecord(1) ||
@@ -589,13 +634,19 @@ bool KernelPerformanceReferenceLedger::observeDecision(KernelPerformanceAttempt 
 	const unsigned slot = traceAttemptSlot(token);
 	if (slot == ~0U) return false;
 	State::Attempt &attempt = m_state->attempts[slot];
-	if (attempt.finished || decision.admission != KERNEL_ADMISSION_NOT_REQUESTED || decision.deterministicEligible)
+	if (attempt.finished || (decision.admission == KERNEL_ADMISSION_ACCEPTED &&
+		(!attempt.captured || m_snapshot.trace.observationSealed)))
 		return failTrace(KERNEL_PERFORMANCE_ERROR_STATE);
 	if (decision.site == 0 || decision.reasonSchema == 0 || !decision.deterministicFacts.valid ||
+		decision.admission < KERNEL_ADMISSION_NOT_REQUESTED || decision.admission > KERNEL_ADMISSION_ACCEPTED ||
+		(decision.admission != KERNEL_ADMISSION_NOT_REQUESTED && !decision.deterministicEligible) ||
 		!traceDynamicFactsValid(decision.dynamicFactsKnownMask, decision.pendingJobs, decision.outstandingJobs, decision.activeSlots))
 		return failTrace(KERNEL_PERFORMANCE_ERROR_IDENTITY);
 	if (attempt.decisionSeen && decision.decisionOrdinal <= attempt.decisionOrdinal)
 		return failTrace(KERNEL_PERFORMANCE_ERROR_ORDER);
+	JobMetricCounter admittedCount = m_snapshot.trace.admittedAttemptCount;
+	if (!attempt.admitted && decision.admission == KERNEL_ADMISSION_ACCEPTED && !checkedAdd(admittedCount, 1))
+		return failTrace(KERNEL_PERFORMANCE_ERROR_OVERFLOW);
 	CallbackGuard guard(m_state->busy);
 	KernelPerformanceCanonicalWriter &writer = m_state->traceWriter;
 	if (!m_state->traceRecord(4) || !writer.u64(3, attempt.serial) || !writer.u64(4, decision.decisionOrdinal) ||
@@ -607,6 +658,152 @@ bool KernelPerformanceReferenceLedger::observeDecision(KernelPerformanceAttempt 
 		return failTrace(KERNEL_REFERENCE_ERROR_HASH);
 	attempt.decisionSeen = true;
 	attempt.decisionOrdinal = decision.decisionOrdinal;
+	// Later source refusal/failure cannot erase an earlier actual acceptance.
+	if (decision.admission == KERNEL_ADMISSION_ACCEPTED) attempt.admitted = true;
+	m_snapshot.trace.admittedAttemptCount = admittedCount;
+	return true;
+}
+bool KernelPerformanceReferenceLedger::bindCapturedInput(KernelPerformanceAttempt token, unsigned fieldSchema,
+	JobMetricCounter operationCount, KernelPerformanceCanonicalCallback writeInput, const void *immutableInput) noexcept
+{
+	if (!traceReady()) return false;
+	const unsigned slot = traceAttemptSlot(token);
+	if (slot == ~0U) return false;
+	State::Attempt &attempt = m_state->attempts[slot];
+	if (attempt.finished || attempt.captured) return failTrace(KERNEL_PERFORMANCE_ERROR_STATE);
+	if (fieldSchema == 0 || operationCount == 0 || writeInput == 0 || immutableInput == 0)
+		return failTrace(KERNEL_PERFORMANCE_ERROR_IDENTITY);
+	JobMetricCounter capturedCount = m_snapshot.trace.capturedAttemptCount;
+	JobMetricCounter capturedOperations = m_snapshot.trace.capturedOperationCount;
+	if (!checkedAdd(capturedCount, 1) || !checkedAdd(capturedOperations, operationCount))
+		return failTrace(KERNEL_PERFORMANCE_ERROR_OVERFLOW);
+	try
+	{
+		CallbackGuard guard(m_state->busy);
+		KernelPerformanceCanonicalWriter inputWriter;
+		if (!inputWriter.begin(fieldSchema)) return failTrace(KERNEL_REFERENCE_ERROR_HASH);
+		if (!writeInput(inputWriter, immutableInput)) return failTrace(KERNEL_REFERENCE_ERROR_CALLBACK);
+		const KernelPerformanceDigest input = inputWriter.finish();
+		if (!input.valid) return failTrace(KERNEL_REFERENCE_ERROR_HASH);
+		if (m_foreignCall.load(std::memory_order_acquire)) return failTrace(KERNEL_PERFORMANCE_ERROR_OWNER);
+		if (m_snapshot.errors != 0) return failTrace(m_snapshot.errors);
+		KernelPerformanceCanonicalWriter &writer = m_state->traceWriter;
+		if (!m_state->traceRecord(5) || !writer.u64(3, attempt.serial) || !writer.u32(4, fieldSchema) ||
+			!writer.u64(5, operationCount) || !appendDigest(writer, input, 6))
+			return failTrace(KERNEL_REFERENCE_ERROR_HASH);
+		attempt.inputDigest = input;
+	}
+	catch (...) { return failTrace(KERNEL_REFERENCE_ERROR_CALLBACK); }
+	// Retain the canonical digest and identity only, never the native pointer.
+	attempt.captured = true;
+	attempt.inputSchema = fieldSchema;
+	attempt.capturedOperations = operationCount;
+	m_snapshot.trace.capturedAttemptCount = capturedCount;
+	m_snapshot.trace.capturedOperationCount = capturedOperations;
+	return true;
+}
+bool KernelPerformanceReferenceLedger::observeDispatch(KernelPerformanceAttempt token,
+	const KernelPerformanceDispatchPlan &dispatch) noexcept
+{
+	if (!traceReady()) return false;
+	const unsigned slot = traceAttemptSlot(token);
+	if (slot == ~0U) return false;
+	State::Attempt &attempt = m_state->attempts[slot];
+	KernelPerformanceTraceSnapshot &trace = m_snapshot.trace;
+	if (trace.observationSealed || attempt.finished || !attempt.captured ||
+		(attempt.dispatchSeen && (attempt.plannedRanges != attempt.dispatch.rangeCount ||
+			attempt.releasedRanges != attempt.dispatch.rangeCount)))
+		return failTrace(KERNEL_PERFORMANCE_ERROR_STATE);
+	if (dispatch.bodySchema == 0 || dispatch.checkpointSchema == 0 || dispatch.rangeCount == 0 || dispatch.operationCount == 0)
+		return failTrace(KERNEL_PERFORMANCE_ERROR_IDENTITY);
+	if (attempt.dispatchSeen && dispatch.dispatchOrdinal <= attempt.dispatch.dispatchOrdinal)
+		return failTrace(KERNEL_PERFORMANCE_ERROR_ORDER);
+	if (trace.residentRangeCount > trace.residentRangeCapacity ||
+		dispatch.rangeCount > trace.residentRangeCapacity - trace.residentRangeCount ||
+		trace.rangeCount > trace.limits.maximumRanges || dispatch.rangeCount > trace.limits.maximumRanges - trace.rangeCount)
+		return failTrace(KERNEL_PERFORMANCE_ERROR_CAPACITY);
+	JobMetricCounter dispatchCount = trace.dispatchCount;
+	if (!checkedAdd(dispatchCount, 1)) return failTrace(KERNEL_PERFORMANCE_ERROR_OVERFLOW);
+	CallbackGuard guard(m_state->busy);
+	KernelPerformanceCanonicalWriter &writer = m_state->traceWriter;
+	if (!m_state->traceRecord(6) || !writer.u64(3, attempt.serial) || !writer.u64(4, dispatch.dispatchOrdinal) ||
+		!writer.u32(5, dispatch.bodySchema) || !writer.u32(6, dispatch.checkpointSchema) || !writer.u32(7, dispatch.rangeCount) ||
+		!writer.u64(8, dispatch.operationCount) || !writer.u64(9, dispatch.sourceGrain) || !writer.u64(10, dispatch.sourceLimit))
+		return failTrace(KERNEL_REFERENCE_ERROR_HASH);
+	attempt.dispatchSeen = true;
+	attempt.dispatch = dispatch;
+	attempt.plannedRanges = attempt.releasedRanges = 0;
+	trace.dispatchCount = dispatchCount;
+	return true;
+}
+bool KernelPerformanceReferenceLedger::observeRangePlan(KernelPerformanceAttempt token,
+	const KernelPerformanceRangePlan &range) noexcept
+{
+	if (!traceReady()) return false;
+	const unsigned slot = traceAttemptSlot(token);
+	if (slot == ~0U) return false;
+	State::Attempt &attempt = m_state->attempts[slot];
+	if (attempt.finished || !attempt.dispatchSeen || attempt.plannedRanges == attempt.dispatch.rangeCount)
+		return failTrace(KERNEL_PERFORMANCE_ERROR_STATE);
+	if (range.dispatchOrdinal != attempt.dispatch.dispatchOrdinal || range.end < range.begin)
+		return failTrace(KERNEL_PERFORMANCE_ERROR_IDENTITY);
+	// Plans enumerate declared range ordinals once. Released progress may be
+	// imported in any owner-observed order, without retaining past dispatches.
+	if (range.rangeOrdinal != attempt.plannedRanges) return failTrace(KERNEL_PERFORMANCE_ERROR_ORDER);
+	KernelPerformanceTraceSnapshot &trace = m_snapshot.trace;
+	if (trace.rangeCount >= trace.limits.maximumRanges) return failTrace(KERNEL_PERFORMANCE_ERROR_CAPACITY);
+	unsigned rangeSlot = 0;
+	while (rangeSlot != m_state->rangeCapacity && m_state->ranges[rangeSlot].active) ++rangeSlot;
+	if (rangeSlot == m_state->rangeCapacity) return failTrace(KERNEL_PERFORMANCE_ERROR_CAPACITY);
+	CallbackGuard guard(m_state->busy);
+	if (!m_state->traceRecord(7) || !appendRangePlan(m_state->traceWriter, attempt.serial, range))
+		return failTrace(KERNEL_REFERENCE_ERROR_HASH);
+	State::Range &retained = m_state->ranges[rangeSlot];
+	retained.active = true;
+	retained.attemptSerial = attempt.serial;
+	retained.plan = range;
+	++attempt.plannedRanges;
+	++trace.rangeCount;
+	++trace.residentRangeCount;
+	if (trace.residentRangeCount > trace.residentRangeHighWater) trace.residentRangeHighWater = trace.residentRangeCount;
+	return true;
+}
+bool KernelPerformanceReferenceLedger::observeReleasedRange(KernelPerformanceAttempt token,
+	const KernelPerformanceRangePlan &range, const KernelPerformanceRangeProgress &progress) noexcept
+{
+	if (!traceReady()) return false;
+	const unsigned slot = traceAttemptSlot(token);
+	if (slot == ~0U) return false;
+	State::Attempt &attempt = m_state->attempts[slot];
+	if (!attempt.dispatchSeen || attempt.plannedRanges != attempt.dispatch.rangeCount ||
+		(progress.checkpoint.entered && !attempt.admitted))
+		return failTrace(KERNEL_PERFORMANCE_ERROR_STATE);
+	if (range.dispatchOrdinal != attempt.dispatch.dispatchOrdinal)
+		return failTrace(KERNEL_PERFORMANCE_ERROR_IDENTITY);
+	unsigned rangeSlot = 0;
+	while (rangeSlot != m_state->rangeCapacity && (!m_state->ranges[rangeSlot].active ||
+		m_state->ranges[rangeSlot].attemptSerial != attempt.serial || !sameRangePlan(m_state->ranges[rangeSlot].plan, range))) ++rangeSlot;
+	if (rangeSlot == m_state->rangeCapacity) return failTrace(KERNEL_PERFORMANCE_ERROR_IDENTITY);
+	if (!releasedRangeProgressValid(progress)) return failTrace(KERNEL_REFERENCE_ERROR_CHECKPOINT);
+	JobMetricCounter releasedCount = m_snapshot.trace.releasedRangeCount;
+	if (!checkedAdd(releasedCount, 1)) return failTrace(KERNEL_PERFORMANCE_ERROR_OVERFLOW);
+	CallbackGuard guard(m_state->busy);
+	KernelPerformanceCanonicalWriter &writer = m_state->traceWriter;
+	const KernelPerformanceCheckpointProgress &checkpoint = progress.checkpoint;
+	if (!m_state->traceRecord(8) || !appendRangePlan(writer, attempt.serial, range) ||
+		!writer.boolean(10, checkpoint.entered) || !writer.u32(11, checkpoint.errors) ||
+		!writer.u64(12, checkpoint.pollCount) || !writer.u64(13, checkpoint.firstTruePoll) || !writer.u64(14, checkpoint.completedWorkUnits) ||
+		!writer.u32(15, checkpoint.firstTrueCheckpoint.site) || !writer.u64(16, checkpoint.firstTrueCheckpoint.first) ||
+		!writer.u64(17, checkpoint.firstTrueCheckpoint.second) || !writer.u32(18, checkpoint.finalCheckpoint.site) ||
+		!writer.u64(19, checkpoint.finalCheckpoint.first) || !writer.u64(20, checkpoint.finalCheckpoint.second) ||
+		!writer.u32(21, static_cast<unsigned>(checkpoint.terminal)) || !writer.u32(22, static_cast<unsigned>(progress.publication)))
+		return failTrace(KERNEL_REFERENCE_ERROR_HASH);
+	// The import acknowledges immutable released POD; it never releases native
+	// work. Only this reusable metadata is freed, not the containing attempt.
+	m_state->ranges[rangeSlot].active = false;
+	++attempt.releasedRanges;
+	m_snapshot.trace.releasedRangeCount = releasedCount;
+	--m_snapshot.trace.residentRangeCount;
 	return true;
 }
 bool KernelPerformanceReferenceLedger::finishAttempt(KernelPerformanceAttempt token,
@@ -616,13 +813,17 @@ bool KernelPerformanceReferenceLedger::finishAttempt(KernelPerformanceAttempt to
 	const unsigned slot = traceAttemptSlot(token);
 	if (slot == ~0U) return false;
 	State::Attempt &attempt = m_state->attempts[slot];
-	if (!attempt.decisionSeen || attempt.finished || finish.disposition != KERNEL_PERFORMANCE_NOT_ADMITTED)
+	if (!attempt.decisionSeen || attempt.finished ||
+		(finish.disposition != KERNEL_PERFORMANCE_NOT_ADMITTED && finish.disposition != KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION) ||
+		(attempt.admitted != (finish.disposition == KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION)))
 		return failTrace(KERNEL_PERFORMANCE_ERROR_STATE);
 	if (finish.reasonSchema == 0 || finish.fallbackEntered != finish.fallbackCompleted ||
 		finish.validatedBatch.generation != 0 || finish.validatedBatch.serial != 0 ||
 		finish.validatedBatch.slot != KERNEL_PERFORMANCE_MAXIMUM_OPEN_BATCHES)
 		return failTrace(KERNEL_PERFORMANCE_ERROR_IDENTITY);
-	JobMetricCounter count = m_snapshot.trace.notAdmittedAttemptCount;
+	JobMetricCounter &dispositionCount = attempt.admitted ? m_snapshot.trace.abortedAfterAdmissionAttemptCount :
+		m_snapshot.trace.notAdmittedAttemptCount;
+	JobMetricCounter count = dispositionCount;
 	if (!checkedAdd(count, 1)) return failTrace(KERNEL_PERFORMANCE_ERROR_OVERFLOW);
 	CallbackGuard guard(m_state->busy);
 	KernelPerformanceCanonicalWriter &writer = m_state->traceWriter;
@@ -631,7 +832,7 @@ bool KernelPerformanceReferenceLedger::finishAttempt(KernelPerformanceAttempt to
 		!writer.boolean(7, finish.fallbackEntered) || !writer.boolean(8, finish.fallbackCompleted) || !writer.boolean(9, false))
 		return failTrace(KERNEL_REFERENCE_ERROR_HASH);
 	attempt.finished = true;
-	m_snapshot.trace.notAdmittedAttemptCount = count;
+	dispositionCount = count;
 	return true;
 }
 bool KernelPerformanceReferenceLedger::reapAttempt(KernelPerformanceAttempt token,
@@ -642,6 +843,9 @@ bool KernelPerformanceReferenceLedger::reapAttempt(KernelPerformanceAttempt toke
 	if (slot == ~0U) return false;
 	State::Attempt &attempt = m_state->attempts[slot];
 	if (!attempt.finished) return failTrace(KERNEL_PERFORMANCE_ERROR_STATE);
+	if (attempt.dispatchSeen && (attempt.plannedRanges != attempt.dispatch.rangeCount ||
+		attempt.releasedRanges != attempt.dispatch.rangeCount))
+		return failTrace(KERNEL_PERFORMANCE_ERROR_INCOMPLETE);
 	if (reap.reasonSchema == 0 ||
 		!traceDynamicFactsValid(reap.dynamicFactsKnownMask, reap.pendingJobs, reap.outstandingJobs, reap.activeSlots))
 		return failTrace(KERNEL_PERFORMANCE_ERROR_IDENTITY);
@@ -653,8 +857,8 @@ bool KernelPerformanceReferenceLedger::reapAttempt(KernelPerformanceAttempt toke
 		!writer.u32(5, reap.reason) || !writer.u32(6, reap.dynamicFactsKnownMask) || !writer.u64(7, reap.pendingJobs) ||
 		!writer.u64(8, reap.outstandingJobs) || !writer.u64(9, reap.activeSlots))
 		return failTrace(KERNEL_REFERENCE_ERROR_HASH);
-	// No submitted group exists in this slice. Later admitted attempts must
-	// establish their real group-terminal boundary before this slot is reused.
+	// The native owner separately proves group-terminal cleanup. A released
+	// range or active-slot observation cannot substitute for that boundary.
 	attempt.active = false;
 	m_snapshot.trace.reapCount = count;
 	--m_snapshot.trace.residentAttemptCount;
@@ -674,7 +878,8 @@ bool KernelPerformanceReferenceLedger::sealObservationWindow() noexcept
 bool KernelPerformanceReferenceLedger::sealExecutionClosure() noexcept
 {
 	if (!traceReady()) return false;
-	if (!m_snapshot.trace.observationSealed || m_snapshot.trace.executionSealed || m_snapshot.trace.residentAttemptCount != 0)
+	if (!m_snapshot.trace.observationSealed || m_snapshot.trace.executionSealed ||
+		m_snapshot.trace.residentAttemptCount != 0 || m_snapshot.trace.residentRangeCount != 0)
 		return failTrace(KERNEL_PERFORMANCE_ERROR_STATE);
 	CallbackGuard guard(m_state->busy);
 	if (!m_state->traceRecord(2) || !m_state->traceWriter.u32(3, 2) ||
@@ -696,7 +901,7 @@ KernelPerformanceReferenceBatch KernelPerformanceReferenceLedger::observeValidat
 	if (m_state == 0 || m_snapshot.errors != 0) return token;
 	if (m_state->busy) { m_snapshot.errors |= KERNEL_PERFORMANCE_ERROR_STATE; return token; }
 	// Successful traced batches require authenticated attempt linkage, which
-	// this no-capture slice cannot yet establish. Keep the old untraced path.
+	// this source-abort slice cannot yet establish. Keep the old untraced path.
 	if (m_snapshot.trace.requested) { failTrace(KERNEL_PERFORMANCE_ERROR_STATE); return token; }
 	const unsigned maximumSubtype = kernel == KERNEL_PERFORMANCE_AI || kernel == KERNEL_PERFORMANCE_PATH ? 1 : 0;
 	if (kernel < KERNEL_PERFORMANCE_PHYSICS || kernel >= KERNEL_PERFORMANCE_KERNEL_COUNT ||
@@ -839,7 +1044,8 @@ KernelPerformanceReferenceSnapshot KernelPerformanceReferenceLedger::freeze() no
 	{
 		KernelPerformanceTraceSnapshot &trace = m_snapshot.trace;
 		trace.errors |= m_snapshot.errors;
-		if (m_state == 0 || !trace.observationSealed || !trace.executionSealed || trace.residentAttemptCount != 0)
+		if (m_state == 0 || !trace.observationSealed || !trace.executionSealed ||
+			trace.residentAttemptCount != 0 || trace.residentRangeCount != 0)
 			failTrace(KERNEL_PERFORMANCE_ERROR_INCOMPLETE);
 		if (trace.errors == 0)
 		{
@@ -851,7 +1057,10 @@ KernelPerformanceReferenceSnapshot KernelPerformanceReferenceLedger::freeze() no
 				!writer.u64(9, trace.reapCount) || !writer.u64(10, trace.residentAttemptCount) ||
 				!writer.u64(11, trace.residentAttemptHighWater) || !writer.u64(12, trace.coalescedSpanCount) ||
 				!writer.u64(13, trace.coalescedAttemptCount) || !writer.boolean(14, trace.observationSealed) ||
-				!writer.boolean(15, trace.executionSealed))
+				!writer.boolean(15, trace.executionSealed) || !writer.u64(16, trace.capturedAttemptCount) ||
+				!writer.u64(17, trace.capturedOperationCount) || !writer.u64(18, trace.dispatchCount) ||
+				!writer.u64(19, trace.rangeCount) || !writer.u64(20, trace.releasedRangeCount) ||
+				!writer.u64(21, trace.residentRangeCount) || !writer.u64(22, trace.residentRangeHighWater))
 				failTrace(KERNEL_REFERENCE_ERROR_HASH);
 			else
 			{
@@ -861,7 +1070,7 @@ KernelPerformanceReferenceSnapshot KernelPerformanceReferenceLedger::freeze() no
 		}
 		trace.frozen = true;
 		trace.complete = trace.errors == 0 && trace.digest.valid && trace.observationSealed &&
-			trace.executionSealed && trace.residentAttemptCount == 0;
+			trace.executionSealed && trace.residentAttemptCount == 0 && trace.residentRangeCount == 0;
 	}
 	m_snapshot.frozen = true;
 	m_snapshot.complete = m_snapshot.generation != 0 && m_snapshot.mode != KERNEL_REFERENCE_DISABLED &&

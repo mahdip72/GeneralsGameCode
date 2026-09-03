@@ -992,6 +992,273 @@ void sourceAttemptNoCaptureRejectionClosesWithoutCanonicalStream()
 		memcmp(again.trace.digest.bytes, trace.digest.bytes, sizeof(trace.digest.bytes)) == 0 && sink.calls == appendCalls,
 		"freezing the rejected source twice cannot append a duplicate footer or change its frozen counters and hash");
 }
+
+struct SourceAbortFixture
+{
+	SourceAbortFixture() : input(), rejected(), accepted(), refused(), notAdmitted(), aborted(), reap(),
+		dispatch(), firstRange(), secondRange(), cancelled(), neverEntered()
+	{
+		options.mode = KERNEL_REFERENCE_THROUGHPUT_BINDING;
+		options.clock = clock;
+		options.trace.mode = KERNEL_TRACE_RECORD;
+		options.trace.append = ByteSink::append;
+		options.trace.context = &sink;
+		options.trace.limits.maximumBytes = 1048576;
+		options.trace.limits.maximumRecords = 100000;
+		options.trace.limits.maximumLogicalEvents = 100000;
+		options.trace.limits.maximumAttempts = 10000;
+		options.trace.limits.maximumRanges = 500000;
+		options.trace.residentAttemptCapacity = 15;
+		options.trace.residentRangeCapacity = 340;
+		const unsigned char identityBytes[32] = {
+			0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+			0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+			0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+			0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f
+		};
+		options.trace.binding.nativeRunIdentity.valid = true;
+		memcpy(options.trace.binding.nativeRunIdentity.bytes, identityBytes, sizeof(identityBytes));
+		options.trace.binding.executable = options.trace.binding.nativeRunIdentity;
+		options.trace.binding.executable.bytes[0] = 0x20;
+		options.trace.binding.fixture = options.trace.binding.nativeRunIdentity;
+		options.trace.binding.fixture.bytes[0] = 0x40;
+		options.trace.binding.sourcePolicy = options.trace.binding.nativeRunIdentity;
+		options.trace.binding.sourcePolicy.bytes[0] = 0x60;
+		input.a = 3; input.b = 4;
+		rejected.site = 11; rejected.reasonSchema = 1; rejected.reason = 1;
+		rejected.deterministicFacts = options.trace.binding.fixture;
+		rejected.sourceConfiguredWorkers = 4;
+		accepted = rejected;
+		accepted.site = 21; accepted.reason = 2;
+		accepted.deterministicEligible = true;
+		accepted.admission = KERNEL_ADMISSION_ACCEPTED;
+		refused = accepted;
+		refused.site = 22; refused.reason = 4;
+		refused.admission = KERNEL_ADMISSION_REFUSED;
+		refused.dynamicFactsKnownMask = 4; refused.activeSlots = 1;
+		notAdmitted.disposition = KERNEL_PERFORMANCE_NOT_ADMITTED;
+		notAdmitted.reasonSchema = 1; notAdmitted.reason = 1;
+		notAdmitted.fallbackEntered = notAdmitted.fallbackCompleted = true;
+		aborted = notAdmitted;
+		aborted.disposition = KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION;
+		aborted.reason = 3;
+		reap.reasonSchema = 1; reap.reason = 1;
+		reap.dynamicFactsKnownMask = 4;
+		dispatch.bodySchema = dispatch.checkpointSchema = 1;
+		dispatch.rangeCount = 2; dispatch.operationCount = 2;
+		dispatch.sourceGrain = 1; dispatch.sourceLimit = 2;
+		firstRange.bodyKind = 1; firstRange.end = 1; firstRange.operationCount = 1;
+		secondRange = firstRange;
+		secondRange.rangeOrdinal = 1; secondRange.begin = 1; secondRange.end = 2;
+		const KernelPerformanceCheckpointProgress literalCancelled = {
+			true, 0, 3, 3, 128, { 12, 128, 0 }, { 12, 128, 0 }, KERNEL_RANGE_CANCELLED
+		};
+		cancelled.checkpoint = literalCancelled;
+		cancelled.publication = KERNEL_PUBLICATION_DISCARDED_AFTER_CANCEL;
+		// neverEntered remains all-zero POD: no probe/body was ever invoked.
+	}
+	KernelPerformanceAttemptIdentity identity(JobMetricCounter ordinal) const
+	{
+		KernelPerformanceAttemptIdentity value = {};
+		value.workKind = KERNEL_PERFORMANCE_PATH;
+		value.sampleOrdinal = 1; value.attemptOrdinal = ordinal;
+		value.phase = KERNEL_PHASE_SPATIAL_WORK; value.ownerFrame = 7;
+		return value;
+	}
+	ByteSink sink;
+	KernelPerformanceReferenceRunOptions options;
+	Input input;
+	KernelPerformanceAttemptDecision rejected, accepted, refused;
+	KernelPerformanceAttemptFinish notAdmitted, aborted;
+	KernelPerformanceAttemptReap reap;
+	KernelPerformanceDispatchPlan dispatch;
+	KernelPerformanceRangePlan firstRange, secondRange;
+	KernelPerformanceRangeProgress cancelled, neverEntered;
+};
+
+void sourceAbortedAttemptRetainsIdentityUntilReleasedReap()
+{
+	// Break caught: finished-but-unreleased B disappears, or C's slot-busy
+	// rejection is confused with B's admission and late released range records.
+	SourceAbortFixture fixture;
+	KernelPerformanceReferenceLedger source;
+	const unsigned clocksBefore = clocks, writesBefore = writes, computesBefore = computes;
+	check(source.beginRun(fixture.options), "aborted source fixture begins with frozen source bounds");
+	const auto a = source.beginAttempt(fixture.identity(0));
+	check(a.valid(), "A begins before its actual no-capture preflight");
+	check(source.observeDecision(a, fixture.rejected), "A records its deterministic no-capture rejection");
+	check(source.finishAttempt(a, fixture.notAdmitted), "A records completed unchanged fallback");
+	check(source.reapAttempt(a, fixture.reap), "A reaps before the independently admitted B attempt");
+	const auto b = source.beginAttempt(fixture.identity(1));
+	check(b.valid(), "B receives a new identity after A was reaped");
+	check(source.bindCapturedInput(b, 1, 2, writeInput, &fixture.input), "B canonicalizes its real two-operation input once");
+	check(source.observeDecision(b, fixture.accepted), "B records actual source acceptance independently from validation");
+	check(source.observeDispatch(b, fixture.dispatch), "B records its actual two-range dispatch plan");
+	check(source.observeRangePlan(b, fixture.firstRange), "B binds cancelled request range zero to its dispatch");
+	check(source.observeRangePlan(b, fixture.secondRange), "B binds never-entered request range one to its dispatch");
+	check(source.finishAttempt(b, fixture.aborted), "B finishes aborted fallback before either range is owner-imported");
+	const auto c = source.beginAttempt(fixture.identity(2));
+	check(c.valid(), "C remains a separate observation while finished B is still retained");
+	check(source.observeDecision(c, fixture.refused), "C retains actual source active-slot refusal without changing B admission");
+	check(source.finishAttempt(c, fixture.notAdmitted), "C finishes its own unchanged fallback without capture");
+	check(source.reapAttempt(c, fixture.reap), "C reaps without reaping the older pending B identity");
+	// Supplied POD is imported only after the fixture's declared release point.
+	// Real scheduler/group proof belongs to the native producer integration test.
+	check(source.observeReleasedRange(b, fixture.firstRange, fixture.cancelled), "B imports its released cancelled 128-unit prefix");
+	check(source.observeReleasedRange(b, fixture.secondRange, fixture.neverEntered), "B acknowledges the released never-entered range without a body");
+	check(source.reapAttempt(b, fixture.reap), "B reaps only after both distinct planned ranges were acknowledged");
+	check(source.sealObservationWindow(), "aborted source seals new observation ingress after all three attempts");
+	check(source.sealExecutionClosure(), "aborted source seals reference closure after its actual retained set is empty");
+	const auto receipt = source.freeze();
+	const auto &trace = receipt.trace;
+	check(trace.requested && trace.frozen && trace.complete && trace.errors == 0 &&
+		trace.observationSealed && trace.executionSealed, "closed aborted source trace qualifies independently of canonical success");
+	check(trace.attemptCount == 3 && trace.admittedAttemptCount == 1 && trace.notAdmittedAttemptCount == 2 &&
+		trace.abortedAfterAdmissionAttemptCount == 1 && trace.reapCount == 3 &&
+		trace.residentAttemptCount == 0 && trace.residentAttemptHighWater == 2,
+		"A B C remain three attempts with one admission and two simultaneously retained identities");
+	check(trace.capturedAttemptCount == 1 && trace.capturedOperationCount == 2 && trace.dispatchCount == 1 &&
+		trace.rangeCount == 2 && trace.releasedRangeCount == 2 && trace.residentRangeCount == 0 && trace.residentRangeHighWater == 2,
+		"two request ranges and 128 search work units never become extra captured operations or admitted batches");
+	check(trace.recordCount == 22 && trace.logicalEventCount == 22 &&
+		trace.coalescedSpanCount == 0 && trace.coalescedAttemptCount == 0,
+		"eighteen actual lifecycle records plus header two seals and footer produce exactly twenty-two records");
+	check(receipt.frozen && !receipt.complete && receipt.streamCount == 0 &&
+		receipt.mode == KERNEL_REFERENCE_THROUGHPUT_BINDING && source.runMode() == KERNEL_REFERENCE_THROUGHPUT_BINDING,
+		"aborted source work fabricates no validated or committed canonical stream");
+	check(writes == writesBefore + 1 && clocks == clocksBefore && computes == computesBefore &&
+		fixture.input.a == 3 && fixture.input.b == 4,
+		"aborted source records input once with no output callback detached body clock or authoritative input mutation");
+	// Independent final footer extension: tags16..22 bind all seven derived
+	// capture/range counters; no snapshot-only or production-generated oracle.
+	const unsigned char footerSuffix[] = {
+		3, 16, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+		3, 17, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0,
+		3, 18, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+		3, 19, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0,
+		3, 20, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0,
+		3, 21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+		3, 22, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0
+	};
+	check(fixture.sink.bytes.size() >= sizeof(footerSuffix) &&
+		memcmp(fixture.sink.bytes.data() + fixture.sink.bytes.size() - sizeof(footerSuffix), footerSuffix, sizeof(footerSuffix)) == 0 &&
+		trace.byteCount == fixture.sink.bytes.size() && trace.digest.valid,
+		"aborted source footer binds the literal seven derived counts at tags sixteen through twenty-two");
+}
+
+KernelPerformanceAttempt startFinishedAbortedSource(KernelPerformanceReferenceLedger &source,
+	SourceAbortFixture &fixture, bool plansBeforeAdmission = false)
+{
+	const bool started = source.beginRun(fixture.options);
+	const auto b = source.beginAttempt(fixture.identity(1));
+	const bool captured = source.bindCapturedInput(b, 1, 2, writeInput, &fixture.input);
+	bool admitted = false;
+	if (!plansBeforeAdmission) admitted = source.observeDecision(b, fixture.accepted);
+	const bool dispatched = source.observeDispatch(b, fixture.dispatch);
+	const bool firstPlanned = source.observeRangePlan(b, fixture.firstRange);
+	const bool secondPlanned = source.observeRangePlan(b, fixture.secondRange);
+	if (plansBeforeAdmission) admitted = source.observeDecision(b, fixture.accepted);
+	const bool finished = source.finishAttempt(b, fixture.aborted);
+	check(started && b.valid() && captured && admitted && dispatched && firstPlanned && secondPlanned && finished,
+		"retention fixture records actual capture plans admission and aborted finish before owner release");
+	return b;
+}
+void observeAndReapRefusedSource(KernelPerformanceReferenceLedger &source, SourceAbortFixture &fixture)
+{
+	const auto c = source.beginAttempt(fixture.identity(2));
+	const bool refused = source.observeDecision(c, fixture.refused);
+	const bool finished = source.finishAttempt(c, fixture.notAdmitted);
+	const bool reaped = source.reapAttempt(c, fixture.reap);
+	check(c.valid() && refused && finished && reaped,
+		"independent slot-busy C is recorded and reaped while finished B still owns its identity");
+}
+KernelPerformanceReferenceSnapshot releaseAndCloseAbortedSource(KernelPerformanceReferenceLedger &source,
+	SourceAbortFixture &fixture, KernelPerformanceAttempt b)
+{
+	check(source.observeReleasedRange(b, fixture.firstRange, fixture.cancelled), "retained B accepts its first real released range");
+	check(source.observeReleasedRange(b, fixture.secondRange, fixture.neverEntered), "retained B accepts its second real released range");
+	check(source.reapAttempt(b, fixture.reap), "retained B reaps after both released ranges not after fallback alone");
+	check(source.sealObservationWindow(), "released abort closes observation ingress");
+	check(source.sealExecutionClosure(), "released abort closes reference execution without a scheduler claim");
+	return source.freeze();
+}
+
+void sourceAbortedRetentionRejectsEarlyReapAndClosure()
+{
+	// Break caught: one early/partial release or another attempt's cleanup can
+	// recycle B's live metadata and turn incomplete source work into a receipt.
+	{
+		SourceAbortFixture fixture; KernelPerformanceReferenceLedger source;
+		const auto b = startFinishedAbortedSource(source, fixture);
+		check(!source.reapAttempt(b, fixture.reap), "aborted fallback cannot reap before either released range");
+		const auto trace = source.freeze().trace;
+		check(!trace.complete && trace.errors != 0 && trace.residentAttemptCount == 1 &&
+			trace.abortedAfterAdmissionAttemptCount == 1 && trace.residentRangeCount == 2 && trace.releasedRangeCount == 0,
+			"early reap failure retains the admitted attempt and both unreleased ranges");
+	}
+	{
+		SourceAbortFixture fixture; KernelPerformanceReferenceLedger source;
+		const auto b = startFinishedAbortedSource(source, fixture);
+		check(source.observeReleasedRange(b, fixture.firstRange, fixture.cancelled), "partial release imports only B range zero");
+		check(!source.reapAttempt(b, fixture.reap), "one released range cannot silently acknowledge the never-entered second range");
+		const auto trace = source.freeze().trace;
+		check(!trace.complete && trace.errors != 0 && trace.residentAttemptCount == 1 &&
+			trace.residentRangeCount == 1 && trace.rangeCount == 2 && trace.releasedRangeCount == 1,
+			"partial release leaves one range resident and cannot close the enclosing attempt");
+	}
+	{
+		SourceAbortFixture fixture; KernelPerformanceReferenceLedger source;
+		startFinishedAbortedSource(source, fixture);
+		observeAndReapRefusedSource(source, fixture);
+		check(source.sealObservationWindow(), "pending B may survive a normal observation ingress seal");
+		check(!source.sealExecutionClosure(), "C reap cannot permit execution closure while B is pending");
+		const auto trace = source.freeze().trace;
+		check(!trace.complete && trace.errors != 0 && trace.observationSealed && !trace.executionSealed &&
+			trace.attemptCount == 2 && trace.reapCount == 1 && trace.residentAttemptCount == 1 && trace.residentRangeCount == 2,
+			"failed premature closure preserves sealed ingress and B identity after C was reaped");
+	}
+}
+
+void sourceAbortedCapacityAndPreAdmissionPlanOrder()
+{
+	// Break caught: finish frees a slot, or diagnostics require moving the real
+	// source admission ahead of its already-prepared dispatch/range plan.
+	{
+		SourceAbortFixture fixture; KernelPerformanceReferenceLedger source;
+		fixture.options.trace.residentAttemptCapacity = 1;
+		startFinishedAbortedSource(source, fixture);
+		check(!source.beginAttempt(fixture.identity(2)).valid(), "one-slot fixture cannot reuse B identity before release and reap");
+		const auto trace = source.freeze().trace;
+		check(!trace.complete && (trace.errors & KERNEL_PERFORMANCE_ERROR_CAPACITY) != 0 &&
+			trace.attemptCount == 1 && trace.residentAttemptCount == 1 && trace.residentRangeCount == 2,
+			"exhausted live capacity is explicit without changing or clearing the retained source attempt");
+	}
+	{
+		SourceAbortFixture fixture; KernelPerformanceReferenceLedger source;
+		fixture.options.trace.residentAttemptCapacity = 2;
+		const auto b = startFinishedAbortedSource(source, fixture);
+		observeAndReapRefusedSource(source, fixture);
+		const auto receipt = releaseAndCloseAbortedSource(source, fixture, b);
+		const auto &trace = receipt.trace;
+		check(trace.complete && trace.errors == 0 && trace.attemptCount == 2 && trace.admittedAttemptCount == 1 &&
+			trace.notAdmittedAttemptCount == 1 && trace.abortedAfterAdmissionAttemptCount == 1 && trace.reapCount == 2 &&
+			trace.residentAttemptCount == 0 && trace.residentAttemptHighWater == 2 &&
+			trace.residentRangeCount == 0 && trace.releasedRangeCount == 2 && trace.recordCount == 18,
+			"two-slot fixture keeps B across C cleanup then releases exactly the two distinct source identities");
+	}
+	{
+		SourceAbortFixture fixture; KernelPerformanceReferenceLedger source;
+		const auto b = startFinishedAbortedSource(source, fixture, true);
+		const auto receipt = releaseAndCloseAbortedSource(source, fixture, b);
+		const auto &trace = receipt.trace;
+		check(trace.complete && trace.errors == 0 && trace.attemptCount == 1 && trace.admittedAttemptCount == 1 &&
+			trace.abortedAfterAdmissionAttemptCount == 1 && trace.capturedAttemptCount == 1 &&
+			trace.capturedOperationCount == 2 && trace.dispatchCount == 1 && trace.rangeCount == 2 &&
+			trace.releasedRangeCount == 2 && trace.reapCount == 1 && trace.recordCount == 14 &&
+			trace.residentAttemptCount == 0 && trace.residentRangeCount == 0,
+			"pre-admission plans retain actual source ordering and still require recorded acceptance before released work");
+	}
+}
 }
 int main()
 {
@@ -1012,5 +1279,8 @@ int main()
 	checkpointNeverEnteredAndMalformedSourceCannotExecute();
 	checkpointLocalLifecycleCannotEraseFailure();
 	sourceAttemptNoCaptureRejectionClosesWithoutCanonicalStream();
+	sourceAbortedAttemptRetainsIdentityUntilReleasedReap();
+	sourceAbortedRetentionRejectsEarlyReapAndClosure();
+	sourceAbortedCapacityAndPreAdmissionPlanOrder();
 	return failures == 0 ? 0 : 1;
 }

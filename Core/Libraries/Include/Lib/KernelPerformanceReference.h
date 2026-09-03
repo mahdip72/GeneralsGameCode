@@ -207,6 +207,34 @@ struct KernelPerformanceAttemptDecision
 	JobMetricCounter pendingJobs, outstandingJobs, activeSlots;
 };
 
+struct KernelPerformanceDispatchPlan
+{
+	JobMetricCounter dispatchOrdinal;
+	unsigned bodySchema, checkpointSchema, rangeCount;
+	JobMetricCounter operationCount, sourceGrain, sourceLimit;
+};
+
+struct KernelPerformanceRangePlan
+{
+	JobMetricCounter dispatchOrdinal;
+	unsigned rangeOrdinal, bodyKind;
+	JobMetricCounter begin, end, operationCount;
+};
+
+enum KernelPerformancePublication
+{
+	KERNEL_PUBLICATION_NOT_APPLICABLE = 0,
+	KERNEL_PUBLICATION_PUBLISHED,
+	KERNEL_PUBLICATION_DISCARDED_AFTER_CANCEL,
+	KERNEL_PUBLICATION_REJECTED
+};
+
+struct KernelPerformanceRangeProgress
+{
+	KernelPerformanceCheckpointProgress checkpoint;
+	KernelPerformancePublication publication;
+};
+
 struct KernelPerformanceAttemptFinish
 {
 	KernelPerformanceDisposition disposition;
@@ -233,6 +261,8 @@ struct KernelPerformanceTraceSnapshot
 	JobMetricCounter residentAttemptCount, residentAttemptHighWater;
 	JobMetricCounter attemptCount, admittedAttemptCount, notAdmittedAttemptCount;
 	JobMetricCounter abortedAfterAdmissionAttemptCount, reapCount;
+	JobMetricCounter capturedAttemptCount, capturedOperationCount, dispatchCount, rangeCount, releasedRangeCount;
+	JobMetricCounter residentRangeCount, residentRangeHighWater;
 	JobMetricCounter recordCount, logicalEventCount, coalescedSpanCount, coalescedAttemptCount;
 	JobMetricCounter byteCount;
 	KernelPerformanceDigest digest;
@@ -279,10 +309,22 @@ public:
 	KernelPerformanceAttempt beginAttempt(const KernelPerformanceAttemptIdentity &identity) noexcept;
 	bool observeDecision(KernelPerformanceAttempt attempt,
 		const KernelPerformanceAttemptDecision &decision) noexcept;
+	bool bindCapturedInput(KernelPerformanceAttempt attempt, unsigned fieldSchema,
+		JobMetricCounter operationCount, KernelPerformanceCanonicalCallback writeInput,
+		const void *immutableInput) noexcept;
+	bool observeDispatch(KernelPerformanceAttempt attempt,
+		const KernelPerformanceDispatchPlan &dispatch) noexcept;
+	bool observeRangePlan(KernelPerformanceAttempt attempt,
+		const KernelPerformanceRangePlan &range) noexcept;
+	// Owner import after the native release/acquire, never a worker ledger call
+	// or a request to release storage. Group-terminal reap remains separate.
+	bool observeReleasedRange(KernelPerformanceAttempt attempt,
+		const KernelPerformanceRangePlan &range, const KernelPerformanceRangeProgress &progress) noexcept;
 	bool finishAttempt(KernelPerformanceAttempt attempt,
 		const KernelPerformanceAttemptFinish &finish) noexcept;
-	// Records actual owner cleanup. Slot release alone is not group-terminal
-	// closure; later admitted-work support must retain that separate proof.
+	// Records actual owner cleanup after all planned ranges were acknowledged.
+	// Native integration separately establishes the real group-terminal boundary;
+	// active-slot release alone does not establish that boundary.
 	bool reapAttempt(KernelPerformanceAttempt attempt,
 		const KernelPerformanceAttemptReap &reap) noexcept;
 	bool sealObservationWindow() noexcept;
