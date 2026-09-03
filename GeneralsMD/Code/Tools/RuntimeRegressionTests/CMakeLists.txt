@@ -48,6 +48,9 @@ add_test(NAME z_xfer_crc_snapshot_tests
 set_tests_properties(z_xfer_crc_snapshot_tests PROPERTIES TIMEOUT 30)
 
 if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD)
+	include("${CMAKE_SOURCE_DIR}/Core/Tools/Stage5PerformanceFixtureTest/HeadlessMetricStartupTitleTest.cmake")
+	rts_add_headless_metric_startup_test(z_runtime_regression_tests
+		GeneralsMD z_headless_metric_startup_tests)
 	add_executable(z_native_render_target_texture_tests
 		"${CMAKE_SOURCE_DIR}/Core/Tools/NativeW3DTextureOwnerTest/NativeRenderTargetTextureTest.cpp"
 	)

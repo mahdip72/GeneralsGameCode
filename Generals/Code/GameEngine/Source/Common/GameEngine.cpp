@@ -61,9 +61,11 @@
 #include "Common/FunctionLexicon.h"
 #include "Common/CommandLine.h"
 #if defined(_WIN64)
+#include "GameLogic/AIPathfind.h"
 #include "GameLogic/GeneralsAIPlanningPolicy.h"
 #include "Lib/CollisionCandidateKernel.h"
 #include "Lib/DeterministicAIPlanning.h"
+#include "Lib/ImmutableSpatialQueryRuntime.h"
 #endif
 #include "Lib/ObjectStatusTimerKernel.h"
 #include "Lib/PhysicsIntegrationKernel.h"
@@ -170,9 +172,15 @@ void startHeadlessSimulationJobsAfterUnsafeInitialization()
 	rts::JobSystem &jobs = rts::JobSystem::instance();
 	jobs.resetMetrics();
 #if defined(_WIN64)
+	// Fresh headless matches arm their collectors after initial world reset.
+	// Give every family the same one-shot, pre-worker diagnostics boundary.
 	rts::ResetAIPlanningRuntimeMetrics();
+	ResetDirectPathRuntimeMetrics();
+	ResetOrdinaryPathRuntimeMetrics();
+	rts::ResetCollisionCandidateRuntimeMetrics();
 	rts::ResetPhysicsIntegrationRuntimeMetrics();
 	rts::ResetObjectStatusTimerRuntimeMetrics();
+	rts::ResetImmutableSpatialRuntimeMetrics();
 #endif
 
 	if (rts::GetPipelineExecutionMode() != rts::PIPELINE_EXECUTION_SERIAL &&
