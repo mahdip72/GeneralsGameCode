@@ -44,12 +44,38 @@ function(_rts_path_is_equal left right output_variable)
     endif()
 endfunction()
 
+function(_rts_reject_windows_symlink_ancestors path context)
+    if(NOT CMAKE_HOST_WIN32)
+        return()
+    endif()
+
+    # CMake versions used by the compatibility lane can report a lexical
+    # REAL_PATH for a junction.  Inspect every existing component first so a
+    # missing leaf cannot hide a reparse point in its parent chain.
+    get_filename_component(_rts_probe_path "${path}" ABSOLUTE)
+    file(TO_CMAKE_PATH "${_rts_probe_path}" _rts_probe_path)
+    while(TRUE)
+        if(IS_SYMLINK "${_rts_probe_path}")
+            message(FATAL_ERROR
+                "${context} must resolve below RTS_TASK_OWNED_INSTALL_ROOT; "
+                "junctions, traversal, and absolute canonical destinations are rejected. "
+                "Existing path component '${_rts_probe_path}' is a junction or symlink.")
+        endif()
+        get_filename_component(_rts_probe_parent "${_rts_probe_path}" DIRECTORY)
+        if("${_rts_probe_parent}" STREQUAL "${_rts_probe_path}")
+            break()
+        endif()
+        set(_rts_probe_path "${_rts_probe_parent}")
+    endwhile()
+endfunction()
+
 function(_rts_resolve_path_with_existing_parent path output_variable context)
     # REAL_PATH intentionally requires an existing path.  A normal configure
     # has not created the install leaf yet, so walk to the nearest existing
     # directory, resolve that directory, and append the lexical remainder.
     # This still resolves every existing junction/symlink in the path.
     get_filename_component(_rts_absolute_path "${path}" ABSOLUTE)
+    _rts_reject_windows_symlink_ancestors("${_rts_absolute_path}" "${context}")
     file(TO_CMAKE_PATH "${_rts_absolute_path}" _rts_candidate)
     set(_rts_suffix "")
     while(NOT EXISTS "${_rts_candidate}")

@@ -1019,6 +1019,19 @@ rts_validate_task_owned_vc6_install_prefix([==[$prefixCmake]==] "RTS_INSTALL_PRE
         New-Item -ItemType Junction -Path $junctionPath -Target $junctionTarget | Out-Null
         Invoke-Vc6PrefixConfigureNegativeFixture 'junction-escape' `
             (Join-Path $junctionPath 'ZeroHour') 'must resolve below RTS_TASK_OWNED_INSTALL_ROOT'
+
+        # Keep a real descendant below the junction so the resolver must walk
+        # past an ordinary existing directory and inspect the link above it.
+        $existingAncestorBuild = Join-Path $prefixFixtureRoot 'junction-existing-ancestor-build'
+        $existingAncestorInstall = Join-Path $existingAncestorBuild 'install'
+        $existingAncestorTarget = Join-Path $prefixFixtureRoot 'junction-target-existing-ancestor'
+        $existingAncestorTargetPrefix = Join-Path $existingAncestorTarget 'Existing/ZeroHour'
+        New-Item -ItemType Directory -Path $existingAncestorTargetPrefix -Force | Out-Null
+        New-Item -ItemType Directory -Path $existingAncestorInstall -Force | Out-Null
+        $existingAncestorPath = Join-Path $existingAncestorInstall 'escape'
+        New-Item -ItemType Junction -Path $existingAncestorPath -Target $existingAncestorTarget | Out-Null
+        Invoke-Vc6PrefixConfigureNegativeFixture 'junction-existing-ancestor' `
+            (Join-Path $existingAncestorPath 'Existing/ZeroHour') 'must resolve below RTS_TASK_OWNED_INSTALL_ROOT'
     }
     finally {
         Remove-Item -LiteralPath $prefixFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue

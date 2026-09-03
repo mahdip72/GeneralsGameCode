@@ -4,6 +4,11 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4)
         ${CMAKE_SOURCE_DIR}/Core/LegacyRenderer/WWVegas/WW3D2/surfaceblit_legacy.cpp
     )
 
+    target_include_directories(core_surface_blit_tests BEFORE PRIVATE
+        ${CMAKE_SOURCE_DIR}/Core/LegacyRenderer
+        ${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas/WW3D2
+    )
+
     target_include_directories(core_surface_blit_tests PRIVATE
         ${CMAKE_SOURCE_DIR}/Core/LegacyRenderer/WWVegas
         ${CMAKE_SOURCE_DIR}/Core/Libraries/Source

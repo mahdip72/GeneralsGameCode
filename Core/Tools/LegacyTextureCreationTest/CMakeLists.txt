@@ -9,6 +9,11 @@ add_executable(core_legacy_texture_creation_tests
     ${CMAKE_SOURCE_DIR}/Core/LegacyRenderer/WWVegas/WW3D2/surfaceblit_legacy.cpp
 )
 
+target_include_directories(core_legacy_texture_creation_tests BEFORE PRIVATE
+    ${CMAKE_SOURCE_DIR}/Core/LegacyRenderer
+    ${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas/WW3D2
+)
+
 target_include_directories(core_legacy_texture_creation_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/Core/LegacyRenderer/WWVegas
     ${CMAKE_SOURCE_DIR}/Core/Libraries/Source
