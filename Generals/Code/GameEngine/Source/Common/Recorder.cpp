@@ -44,6 +44,7 @@
 #include "GameNetwork/GameSpy/PeerDefs.h"
 #include "GameNetwork/networkutil.h"
 #include "GameLogic/GameLogic.h"
+#include "Common/GeneralsPathfindingReplayEpoch.h"
 #include "Common/RandomValue.h"
 #include "Common/CRCDebug.h"
 #include "Common/OptionPreferences.h"
@@ -51,6 +52,8 @@
 #include "Lib/ReplayFieldReader.h"
 
 #if defined(_WIN64)
+#include "GameLogic/GeneralsAIReplayPolicy.h"
+#include "Lib/ReplayPathContract.h"
 #include "Lib/RuntimeEpochContract.h"
 #include "Lib/ReplayCommandContract.h"
 #include <array>
@@ -905,6 +908,12 @@ RecorderClass::RecorderClass()
 RecorderClass::~RecorderClass() {
 }
 
+Bool RecorderClass::replayUsesCurrentGeneralsPathfindingEpoch() const
+{
+	return HasCurrentGeneralsPathfindingReplayEpoch(
+		m_generalsPathfindingReplayEpoch, m_skirmishAIReplayEpoch);
+}
+
 /**
  * Initialization
  * The recorder will record by default since every game will be recorded.
@@ -935,6 +944,8 @@ void RecorderClass::init() {
 	m_nativeReplayPayloadEnd = 0;
 	m_nativeReplayRecordBytes = 0U;
 #endif
+	m_skirmishAIReplayEpoch = SKIRMISH_AI_REPLAY_EPOCH_LEGACY;
+	m_generalsPathfindingReplayEpoch = GENERALS_PATHFINDING_REPLAY_EPOCH_LEGACY;
 
 	OptionPreferences optionPref;
 	m_archiveReplays = optionPref.getArchiveReplaysEnabled();
@@ -1194,6 +1205,31 @@ void RecorderClass::startRecording(GameDifficulty diff, Int originalGameMode, In
 	// write out version info
 	UnicodeString versionString = TheVersion->getUnicodeVersion();
 	UnicodeString versionTimeString = TheVersion->getUnicodeBuildTime();
+	#if defined(_WIN64)
+	// A current-epoch local recording must replay through the same canonical
+	// planning policy regardless of scheduler mode. Network recordings stay
+	// unmarked until the mixed-worker multiplayer epoch gate is available.
+	m_skirmishAIReplayEpoch = GetGeneralsAIRecordingEpoch(originalGameMode,
+		IsGeneralsAICanonicalRuntimeEpoch());
+	m_generalsPathfindingReplayEpoch = GetGeneralsPathfindingRecordingEpoch(
+		originalGameMode, true, TheNetwork != nullptr, m_skirmishAIReplayEpoch);
+	if (m_generalsPathfindingReplayEpoch == GENERALS_PATHFINDING_REPLAY_EPOCH_CURRENT)
+	{
+		MarkReplayVersionForGeneralsPathfindingCurrentEpoch(versionTimeString);
+	}
+	if (m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_CURRENT)
+	{
+		MarkReplayVersionForSkirmishAICurrentEpoch(versionTimeString);
+	}
+	if (m_generalsPathfindingReplayEpoch == GENERALS_PATHFINDING_REPLAY_EPOCH_CURRENT)
+	{
+		// Only retain the path epoch if the exact paired marker was emitted.
+		m_generalsPathfindingReplayEpoch = GetGeneralsPathfindingReplayEpoch(versionTimeString);
+	}
+	#else
+	m_skirmishAIReplayEpoch = SKIRMISH_AI_REPLAY_EPOCH_LEGACY;
+	m_generalsPathfindingReplayEpoch = GENERALS_PATHFINDING_REPLAY_EPOCH_LEGACY;
+	#endif
 	UnsignedInt versionNumber = TheVersion->getVersionNumber();
 	#if defined(_WIN64)
 	nativeHeaderWriteOk = writeNativeReplayWideString(m_file, versionString.str()) && nativeHeaderWriteOk;
@@ -1250,7 +1286,7 @@ void RecorderClass::startRecording(GameDifficulty diff, Int originalGameMode, In
 			TheSkirmishGameInfo->setCRCInterval(REPLAY_CRC_INTERVAL);
       theSlotList = GameInfoToAsciiString(TheSkirmishGameInfo);
       DEBUG_LOG(("GameInfo String: %s",theSlotList.str()));
-			localIndex = 0;
+			localIndex = TheSkirmishGameInfo->getLocalSlotNum();
     }
     else
     {
@@ -1533,7 +1569,23 @@ void RecorderClass::writeArgument(GameMessageArgumentDataType type, const GameMe
 Bool RecorderClass::readReplayHeader(ReplayHeader& header)
 {
 	AsciiString filepath = getReplayDir();
-	filepath.concat(header.filename.str());
+#if defined(_WIN64)
+	if (header.forPlayback && TheGlobalData != 0 && TheGlobalData->m_headless)
+	{
+		char resolvedPath[MAX_PATH];
+		if (!rts::replay::ResolveReplayPlaybackPath(filepath.str(),
+			header.filename.str(), true, resolvedPath, sizeof(resolvedPath)))
+		{
+			DEBUG_LOG(("Invalid native headless replay path: %s", header.filename.str()));
+			return FALSE;
+		}
+		filepath = resolvedPath;
+	}
+	else
+#endif
+	{
+		filepath.concat(header.filename.str());
+	}
 
 	// TheSuperHackers @performance More buffered data reduces disk overhead and will improve fast forward playback
 	const UnsignedInt buffersize = header.forPlayback ? replayBufferBytes : File::BUFFERSIZE;
@@ -1832,6 +1884,8 @@ Bool RecorderClass::replayMatchesGameVersion(const ReplayHeader& header)
 Bool RecorderClass::playbackFile(AsciiString filename)
 {
 	m_replayReadError = FALSE;
+	m_skirmishAIReplayEpoch = SKIRMISH_AI_REPLAY_EPOCH_LEGACY;
+	m_generalsPathfindingReplayEpoch = GENERALS_PATHFINDING_REPLAY_EPOCH_LEGACY;
 #if defined(_WIN64)
 	m_nativeReplayContainer = FALSE;
 	m_nativeReplayRecordBytes = 0U;
@@ -1852,10 +1906,22 @@ Bool RecorderClass::playbackFile(AsciiString filename)
 	{
 		return FALSE;
 	}
+	m_skirmishAIReplayEpoch = GetSkirmishAIReplayEpoch(
+		header.versionTimeString);
 
 #ifdef DEBUG_CRASHING
 	Bool versionStringDiff = header.versionString != TheVersion->getUnicodeVersion();
-	Bool versionTimeStringDiff = header.versionTimeString != TheVersion->getUnicodeBuildTime();
+	UnicodeString planningMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
+	MarkReplayVersionForSkirmishAICurrentEpoch(planningMarkedVersionTimeString);
+	Bool versionTimeStringDiff = header.versionTimeString != TheVersion->getUnicodeBuildTime() &&
+		header.versionTimeString != planningMarkedVersionTimeString;
+#if defined(_WIN64)
+	UnicodeString pathMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
+	MarkReplayVersionForGeneralsPathfindingCurrentEpoch(pathMarkedVersionTimeString);
+	MarkReplayVersionForSkirmishAICurrentEpoch(pathMarkedVersionTimeString);
+	versionTimeStringDiff = versionTimeStringDiff &&
+		header.versionTimeString != pathMarkedVersionTimeString;
+#endif
 	Bool versionNumberDiff = header.versionNumber != TheVersion->getVersionNumber();
 	Bool exeCRCDiff = header.exeCRC != TheGlobalData->m_exeCRC;
 	Bool exeDifferent = versionStringDiff || versionTimeStringDiff || versionNumberDiff || exeCRCDiff;
@@ -1930,6 +1996,12 @@ Bool RecorderClass::playbackFile(AsciiString filename)
 		m_gameInfo.reset();
 		return failReplayHeaderRead();
 	}
+#if defined(_WIN64)
+	// The live game mode is GAME_REPLAY; only the fully decoded original mode
+	// can distinguish an eligible local recording from a network recording.
+	m_generalsPathfindingReplayEpoch = GetGeneralsPathfindingPlaybackEpoch(
+		header.versionTimeString.str(), m_originalGameMode, true);
+#endif
 
 #ifdef DEBUG_LOGGING
 	if (header.localPlayerIndex >= 0)

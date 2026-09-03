@@ -60,13 +60,24 @@
 #include "Common/Science.h"
 #include "Common/FunctionLexicon.h"
 #include "Common/CommandLine.h"
+#if defined(_WIN64)
+#include "GameLogic/AIPathfind.h"
+#include "Lib/CollisionCandidateKernel.h"
+#include "Lib/DeterministicAIPlanning.h"
+#include "Lib/ImmutableSpatialQueryRuntime.h"
+#endif
+#include "Lib/ObjectStatusTimerKernel.h"
+#include "Lib/PhysicsIntegrationKernel.h"
 #include "Lib/JobSystem.h"
+#include "Lib/PipelineExecutionPolicy.h"
+#include "Lib/SimulationExecutionPolicy.h"
 
 #include "rts/profile.h"
 #include "Common/DamageFX.h"
 #include "Common/MultiplayerSettings.h"
 #include "Common/Recorder.h"
 #include "Common/SkirmishAITestRunner.h"
+#include "Common/Stage5PerformanceFixtureRunner.h"
 #include "Common/SpecialPower.h"
 #include "Common/TerrainTypes.h"
 #include "Common/Upgrade.h"
@@ -115,6 +126,256 @@
 
 #include "Common/version.h"
 
+
+//-------------------------------------------------------------------------------------------------
+
+namespace
+{
+rts::SimulationExecutionMode s_requestedHeadlessSimulationMode =
+	rts::SIMULATION_EXECUTION_SERIAL;
+rts::PipelineExecutionMode s_requestedHeadlessPipelineMode =
+	rts::PIPELINE_EXECUTION_PARALLEL;
+Bool s_headlessSimulationJobSystemStartAttempted = FALSE;
+Bool s_headlessSimulationJobSystemStarted = FALSE;
+unsigned s_headlessSimulationWorkerCount = 0;
+
+bool ensureSimulationJobsStarted(void *context)
+{
+	return static_cast<rts::JobSystem *>(context)->ensureStarted();
+}
+
+const char *headlessSimulationModeName(rts::SimulationExecutionMode mode)
+{
+	switch (mode)
+	{
+		case rts::SIMULATION_EXECUTION_PARALLEL: return "parallel";
+		case rts::SIMULATION_EXECUTION_SHADOW: return "shadow";
+		default: return "serial";
+	}
+}
+
+const char *headlessPipelineModeName(rts::PipelineExecutionMode mode)
+{
+	return mode == rts::PIPELINE_EXECUTION_SERIAL ? "serial" : "parallel";
+}
+
+void startHeadlessSimulationJobsAfterUnsafeInitialization()
+{
+	if (!TheGlobalData->m_headless ||
+		s_headlessSimulationJobSystemStartAttempted) return;
+	s_headlessSimulationJobSystemStartAttempted = TRUE;
+	s_requestedHeadlessSimulationMode = rts::GetSimulationExecutionMode();
+	s_requestedHeadlessPipelineMode = rts::GetPipelineExecutionMode();
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	jobs.resetMetrics();
+#if defined(_WIN64)
+	// Fresh headless matches arm their collectors after initial world reset.
+	// Give every family the same one-shot, pre-worker diagnostics boundary.
+	rts::ResetAIPlanningRuntimeMetrics();
+	ResetDirectPathRuntimeMetrics();
+	ResetOrdinaryPathRuntimeMetrics();
+	rts::ResetCollisionCandidateRuntimeMetrics();
+	rts::ResetPhysicsIntegrationRuntimeMetrics();
+	rts::ResetObjectStatusTimerRuntimeMetrics();
+	rts::ResetImmutableSpatialRuntimeMetrics();
+#endif
+
+	if (rts::GetPipelineExecutionMode() != rts::PIPELINE_EXECUTION_SERIAL &&
+		!rts::SetPipelineExecutionMode(rts::PIPELINE_EXECUTION_SERIAL))
+	{
+		rts::SetSimulationExecutionMode(rts::SIMULATION_EXECUTION_SERIAL);
+		rts::LockSimulationExecutionMode();
+		printf("SIMULATION_JOB_SYSTEM_FALLBACK requested_mode=%s reason=pipeline_mode_locked\n",
+			headlessSimulationModeName(s_requestedHeadlessSimulationMode));
+		fflush(stdout);
+		return;
+	}
+	rts::LockPipelineExecutionMode();
+
+#if defined(_MSC_VER) && _MSC_VER < 1300
+	if (s_requestedHeadlessSimulationMode != rts::SIMULATION_EXECUTION_SERIAL)
+		rts::SetSimulationExecutionMode(rts::SIMULATION_EXECUTION_SERIAL);
+	rts::LockSimulationExecutionMode();
+	return;
+#else
+	if (rts::GetSimulationExecutionMode() == rts::SIMULATION_EXECUTION_SERIAL)
+	{
+		rts::LockSimulationExecutionMode();
+		return;
+	}
+
+	if (!jobs.start(rts::JobSystem::startupConfig()))
+	{
+		rts::SetSimulationExecutionMode(rts::SIMULATION_EXECUTION_SERIAL);
+		rts::LockSimulationExecutionMode();
+		printf("SIMULATION_JOB_SYSTEM_FALLBACK requested_mode=%s reason=start_failed\n",
+			headlessSimulationModeName(s_requestedHeadlessSimulationMode));
+		fflush(stdout);
+		return;
+	}
+	if (!jobs.registerCurrentThread(rts::JOB_OWNER_GAME))
+	{
+		jobs.shutdown();
+		rts::SetSimulationExecutionMode(rts::SIMULATION_EXECUTION_SERIAL);
+		rts::LockSimulationExecutionMode();
+		printf("SIMULATION_JOB_SYSTEM_FALLBACK requested_mode=%s reason=owner_registration_failed\n",
+			headlessSimulationModeName(s_requestedHeadlessSimulationMode));
+		fflush(stdout);
+		return;
+	}
+	rts::LockSimulationExecutionMode();
+	s_headlessSimulationJobSystemStarted = TRUE;
+	s_headlessSimulationWorkerCount = jobs.workerCount();
+	printf("SIMULATION_JOB_SYSTEM_START requested_mode=%s effective_mode=%s requested_pipeline=%s effective_pipeline=serial workers=%u\n",
+		headlessSimulationModeName(s_requestedHeadlessSimulationMode),
+		headlessSimulationModeName(rts::GetSimulationExecutionMode()),
+		headlessPipelineModeName(s_requestedHeadlessPipelineMode),
+		s_headlessSimulationWorkerCount);
+	fflush(stdout);
+#endif
+}
+
+void printHeadlessSimulationJobMetrics(const rts::JobSystemMetrics &metrics,
+	const rts::PhysicsIntegrationRuntimeMetrics &physics,
+	const rts::ObjectStatusTimerRuntimeMetrics &status)
+{
+#if defined(_MSC_VER) && _MSC_VER < 1300
+	printf("SIMULATION_JOB_METRICS requested_mode=%s effective_mode=serial requested_pipeline=%s effective_pipeline=serial scheduler_started=0 workers=0\n",
+		headlessSimulationModeName(s_requestedHeadlessSimulationMode),
+		headlessPipelineModeName(s_requestedHeadlessPipelineMode));
+#else
+	printf("SIMULATION_JOB_METRICS requested_mode=%s effective_mode=%s requested_pipeline=%s effective_pipeline=serial scheduler_started=%u workers=%u submitted=%llu executed=%llu steals=%llu owner_help=%llu waits=%llu worker_wait_rejections=%llu failures=%llu cancelled=%llu fallback=%llu queue_latency_ns=%llu max_queue_latency_ns=%llu sleeps=%llu wakes=%llu affinity_failures=%llu queue_high_water=%u peak_active_workers=%u available_cpus=%u reserved_owner_cpus=%u selected_worker_cpus=%u\n",
+		headlessSimulationModeName(s_requestedHeadlessSimulationMode),
+		s_headlessSimulationJobSystemStarted ?
+			headlessSimulationModeName(rts::GetSimulationExecutionMode()) : "serial",
+		headlessPipelineModeName(s_requestedHeadlessPipelineMode),
+		s_headlessSimulationJobSystemStarted ? 1u : 0u,
+		s_headlessSimulationWorkerCount,
+		static_cast<unsigned long long>(metrics.submittedJobCount),
+		static_cast<unsigned long long>(metrics.executedJobCount),
+		static_cast<unsigned long long>(metrics.stealCount),
+		static_cast<unsigned long long>(metrics.ownerHelpCount),
+		static_cast<unsigned long long>(metrics.waitCount),
+		static_cast<unsigned long long>(metrics.workerWaitRejectionCount),
+		static_cast<unsigned long long>(metrics.failedJobCount),
+		static_cast<unsigned long long>(metrics.cancelledJobCount),
+		static_cast<unsigned long long>(metrics.serialFallbackCount),
+		static_cast<unsigned long long>(metrics.totalQueueLatencyNanoseconds),
+		static_cast<unsigned long long>(metrics.maximumQueueLatencyNanoseconds),
+		static_cast<unsigned long long>(metrics.workerSleepCount),
+		static_cast<unsigned long long>(metrics.workerWakeCount),
+		static_cast<unsigned long long>(metrics.affinityFailureCount),
+		metrics.injectionHighWater, metrics.maximumActiveWorkers,
+		metrics.availableLogicalCpuCount, metrics.reservedOwnerCpuCount,
+		metrics.selectedWorkerCpuCount);
+#endif
+	#if defined(_WIN64)
+	const rts::JobSystemConfig config = rts::JobSystem::startupConfig();
+	const char *workerPolicy = config.workerPolicy == rts::JOB_WORKER_POLICY_ALL ?
+		"all" : (config.workerPolicy == rts::JOB_WORKER_POLICY_AUTO ? "auto" : "unknown");
+	printf("SIMULATION_JOB_TOPOLOGY worker_policy=%s pin_workers=%u "
+		"selected_worker_physical_cores=%u selected_worker_physical_mask=%llu "
+		"selected_worker_physical_mask_complete=%u cpu_set_count=%u "
+		"selected_worker_cpu_set_count=%u owner_cpu_set_count=%u\n",
+		workerPolicy, config.pinWorkers ? 1u : 0u,
+		metrics.selectedWorkerPhysicalCoreCount,
+		static_cast<unsigned long long>(metrics.selectedWorkerPhysicalCoreMask),
+		metrics.selectedWorkerPhysicalCoreMaskComplete ? 1u : 0u,
+		rts::JobSystem::instance().cpuSetCount(),
+		rts::JobSystem::instance().selectedWorkerCpuSetCount(),
+		rts::JobSystem::instance().ownerCpuSetCount());
+	fflush(stdout);
+	#endif
+#if defined(_WIN64)
+	const rts::AIPlanningRuntimeMetrics ai = rts::GetAIPlanningRuntimeMetrics();
+	printf("AI_PLANNING_MANIFEST epoch=%u captured_snapshots=%llu captured_candidates=%llu requested_batches=%llu submitted_jobs=%llu completed_jobs=%llu serial_fallbacks=%llu shadow_matches=%llu shadow_mismatches=%llu validation_failures=%llu committed_batches=%llu parallel_authoritative_commits=%llu rejected_commits=%llu\n",
+		(unsigned)SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG,
+		static_cast<unsigned long long>(ai.capturedSnapshots),
+		static_cast<unsigned long long>(ai.capturedCandidates),
+		static_cast<unsigned long long>(ai.requestedBatches),
+		static_cast<unsigned long long>(ai.submittedJobs),
+		static_cast<unsigned long long>(ai.completedJobs),
+		static_cast<unsigned long long>(ai.serialFallbacks),
+		static_cast<unsigned long long>(ai.shadowMatches),
+		static_cast<unsigned long long>(ai.shadowMismatches),
+		static_cast<unsigned long long>(ai.validationFailures),
+		static_cast<unsigned long long>(ai.committedBatches),
+		static_cast<unsigned long long>(ai.parallelAuthoritativeCommits),
+		static_cast<unsigned long long>(ai.rejectedCommits));
+	const rts::CollisionCandidateRuntimeMetrics collision =
+		rts::GetCollisionCandidateRuntimeMetrics();
+	printf("COLLISION_CANDIDATE_MANIFEST authoritative_commits=%llu shadow_executions=%llu shadow_compared_candidates=%llu shadow_mismatches=%llu owner_fallbacks=%llu unexpected_fallbacks=%llu ineligible_slices=%llu stale_rejections=%llu committed_candidates=%llu prepared_pairs=%llu unique_candidates=%llu submitted_jobs=%llu completed_jobs=%llu physical_worker_jobs=%llu owner_helped_jobs=%llu physical_worker_mask=%llu distinct_physical_workers=%u physical_worker_mask_complete=%u\n",
+		static_cast<unsigned long long>(collision.authoritativeCommits),
+		static_cast<unsigned long long>(collision.shadowExecutions),
+		static_cast<unsigned long long>(collision.shadowComparedCandidates),
+		static_cast<unsigned long long>(collision.shadowMismatches),
+		static_cast<unsigned long long>(collision.ownerFallbacks),
+		static_cast<unsigned long long>(collision.unexpectedFallbacks),
+		static_cast<unsigned long long>(collision.ineligibleSlices),
+		static_cast<unsigned long long>(collision.staleRejections),
+		static_cast<unsigned long long>(collision.committedCandidates),
+		static_cast<unsigned long long>(collision.preparedPairs),
+		static_cast<unsigned long long>(collision.uniqueCandidates),
+		static_cast<unsigned long long>(collision.submittedJobs),
+		static_cast<unsigned long long>(collision.completedJobs),
+		static_cast<unsigned long long>(collision.physicalWorkerJobs),
+		static_cast<unsigned long long>(collision.ownerHelpedJobs),
+		static_cast<unsigned long long>(collision.physicalWorkerMask),
+		collision.distinctPhysicalWorkers,
+		collision.physicalWorkerMaskComplete ? 1U : 0U);
+	printf("PHYSICS_INTEGRATION_MANIFEST authoritative_batches=%llu committed_prefixes=%llu ranges=%llu submitted_jobs=%llu completed_jobs=%llu physical_worker_jobs=%llu owner_helped_jobs=%llu physical_worker_mask=%llu distinct_physical_workers=%u physical_worker_mask_complete=%u peak_concurrent_physical_workers=%u allocated_bytes=%llu capture_ns=%llu prepare_ns=%llu wait_ns=%llu commit_ns=%llu storage_bytes=%llu storage_capacity_bytes=%llu storage_allocations=%llu shadow_executions=%llu shadow_prefixes=%llu shadow_ranges=%llu shadow_submitted_jobs=%llu shadow_completed_jobs=%llu shadow_matches=%llu shadow_mismatches=%llu owner_fallbacks=%llu ineligible_slices=%llu unexpected_fallbacks=%llu stale_rejections=%llu circuit_breaker_trips=%llu\n",
+		static_cast<unsigned long long>(physics.acceptedBatches),
+		static_cast<unsigned long long>(physics.acceptedPrefixes),
+		static_cast<unsigned long long>(physics.acceptedRanges),
+		static_cast<unsigned long long>(physics.acceptedSubmittedJobs),
+		static_cast<unsigned long long>(physics.acceptedCompletedJobs),
+		static_cast<unsigned long long>(physics.acceptedPhysicalWorkerJobs),
+		static_cast<unsigned long long>(physics.acceptedOwnerHelpedJobs),
+		static_cast<unsigned long long>(physics.acceptedPhysicalWorkerMask),
+		physics.maximumAcceptedDistinctPhysicalWorkers,
+		physics.acceptedPhysicalWorkerMaskComplete ? 1U : 0U,
+		physics.maximumAcceptedPeakConcurrentPhysicalWorkers,
+		static_cast<unsigned long long>(physics.acceptedAllocatedBytes),
+		static_cast<unsigned long long>(physics.acceptedCaptureNanoseconds),
+		static_cast<unsigned long long>(physics.acceptedPrepareNanoseconds),
+		static_cast<unsigned long long>(physics.acceptedWaitNanoseconds),
+		static_cast<unsigned long long>(physics.acceptedCommitNanoseconds),
+		static_cast<unsigned long long>(physics.acceptedStorageBytes),
+		static_cast<unsigned long long>(physics.acceptedStorageCapacityBytes),
+		static_cast<unsigned long long>(physics.acceptedStorageAllocations),
+		static_cast<unsigned long long>(physics.shadowBatches),
+		static_cast<unsigned long long>(physics.shadowPrefixes),
+		static_cast<unsigned long long>(physics.shadowRanges),
+		static_cast<unsigned long long>(physics.shadowSubmittedJobs),
+		static_cast<unsigned long long>(physics.shadowCompletedJobs),
+		static_cast<unsigned long long>(physics.shadowMatches),
+		static_cast<unsigned long long>(physics.shadowMismatches),
+		static_cast<unsigned long long>(physics.ownerFallbacks),
+		static_cast<unsigned long long>(physics.ineligibleSlices),
+		static_cast<unsigned long long>(physics.unexpectedFallbacks),
+		static_cast<unsigned long long>(physics.staleRejections),
+		static_cast<unsigned long long>(physics.circuitBreakerTrips));
+	printf("OBJECT_STATUS_TIMER_MANIFEST authoritative_batches=%llu committed_commands=%llu submitted_jobs=%llu completed_jobs=%llu physical_worker_jobs=%llu owner_helped_jobs=%llu physical_worker_mask=%llu distinct_physical_workers=%u physical_worker_mask_complete=%u peak_concurrent_physical_workers=%u shadow_executions=%llu shadow_commands=%llu shadow_matches=%llu shadow_mismatches=%llu owner_fallbacks=%llu stale_rejections=%llu\n",
+		static_cast<unsigned long long>(status.authoritativeBatches),
+		static_cast<unsigned long long>(status.committedCommands),
+		static_cast<unsigned long long>(status.submittedJobs),
+		static_cast<unsigned long long>(status.completedJobs),
+		static_cast<unsigned long long>(status.physicalWorkerJobs),
+		static_cast<unsigned long long>(status.ownerHelpedJobs),
+		static_cast<unsigned long long>(status.physicalWorkerMask),
+		status.maximumDistinctPhysicalWorkers,
+		status.physicalWorkerMaskComplete ? 1U : 0U,
+		status.maximumPeakConcurrentPhysicalWorkers,
+		static_cast<unsigned long long>(status.shadowExecutions),
+		static_cast<unsigned long long>(status.shadowCommands),
+		static_cast<unsigned long long>(status.shadowMatches),
+		static_cast<unsigned long long>(status.shadowMismatches),
+		static_cast<unsigned long long>(status.ownerFallbacks),
+		static_cast<unsigned long long>(status.staleRejections));
+#endif
+	fflush(stdout);
+}
+}
 
 //-------------------------------------------------------------------------------------------------
 
@@ -265,8 +526,24 @@ GameEngine::GameEngine()
 //-------------------------------------------------------------------------------------------------
 GameEngine::~GameEngine()
 {
-	const Bool releaseJobOwner = !TheGlobalData->m_headless &&
-		rts::JobSystem::instance().isCurrentThread(rts::JOB_OWNER_GAME);
+	rts::JobSystem &jobSystem = rts::JobSystem::instance();
+	const Bool releaseJobOwner =
+		jobSystem.isCurrentThread(rts::JOB_OWNER_GAME);
+	const Bool reportHeadlessMetrics = TheGlobalData->m_headless &&
+		s_headlessSimulationJobSystemStartAttempted &&
+		TheGlobalData->m_simulateReplays.empty();
+	if (TheGlobalData->m_headless && s_headlessSimulationJobSystemStarted)
+		jobSystem.shutdown();
+	const rts::JobSystemMetrics headlessMetrics = jobSystem.metrics();
+#if defined(_WIN64)
+	const rts::PhysicsIntegrationRuntimeMetrics headlessPhysicsMetrics =
+		rts::GetPhysicsIntegrationRuntimeMetrics();
+	const rts::ObjectStatusTimerRuntimeMetrics headlessStatusMetrics =
+		rts::GetObjectStatusTimerRuntimeMetrics();
+#else
+	const rts::PhysicsIntegrationRuntimeMetrics headlessPhysicsMetrics;
+	const rts::ObjectStatusTimerRuntimeMetrics headlessStatusMetrics;
+#endif
 	//extern std::vector<std::string>	preloadTextureNamesGlobalHack;
 	//preloadTextureNamesGlobalHack.clear();
 
@@ -288,10 +565,8 @@ GameEngine::~GameEngine()
 	// TheSuperHackers @fix helmutbuhler 03/06/2025
 	// Reset all subsystems before deletion to prevent crashing due to cross dependencies.
 	reset();
-	// Headless replay never starts the shared compute scheduler.  Avoid creating
-	// it solely for shutdown while subsystem owners are being destroyed.
 	if (!TheGlobalData->m_headless)
-		rts::JobSystem::instance().shutdown();
+		jobSystem.shutdown();
 
 	TheSubsystemList->shutdownAll();
 	delete TheSubsystemList;
@@ -323,9 +598,12 @@ GameEngine::~GameEngine()
 	_Module.Term();
 	if (releaseJobOwner)
 	{
-		if (!rts::JobSystem::instance().unregisterCurrentThread(rts::JOB_OWNER_GAME))
+		if (!jobSystem.unregisterCurrentThread(rts::JOB_OWNER_GAME))
 			DEBUG_LOG(("JobSystem game-owner registration could not be released."));
 	}
+	if (reportHeadlessMetrics)
+		printHeadlessSimulationJobMetrics(headlessMetrics, headlessPhysicsMetrics,
+			headlessStatusMetrics);
 
 #ifdef PERF_TIMERS
 	PerfGather::termPerfDump();
@@ -386,10 +664,22 @@ void GameEngine::init()
 		if (!TheGlobalData->m_headless)
 		{
 			rts::JobSystem &jobSystem = rts::JobSystem::instance();
-			if (!jobSystem.ensureStarted())
+			const rts::SimulationExecutionStartupResult startupResult =
+				rts::PrepareSimulationExecutionStartup(
+					ensureSimulationJobsStarted, &jobSystem);
+			if (startupResult == rts::SIMULATION_EXECUTION_STARTUP_POLICY_FAILURE)
+			{
+				RELEASE_CRASH(("JobSystem startup failed and simulation policy could not fall back to serial."));
+			}
+			else if (startupResult ==
+				rts::SIMULATION_EXECUTION_STARTUP_SERIAL_FALLBACK)
+			{
 				DEBUG_LOG(("JobSystem startup failed; parallel consumers will use their serial fallback."));
+			}
 			else if (!jobSystem.registerCurrentThread(rts::JOB_OWNER_GAME))
+			{
 				RELEASE_CRASH(("JobSystem was initialized by a different game owner."));
+			}
 		}
 
 		//create an INI object to use for loading stuff
@@ -994,21 +1284,30 @@ void GameEngine::update()
 				rts::frame_timing::Scope frameTiming(rts::frame_timing::ClientStep);
 				TheGameClient->step();
 			}
+			startHeadlessSimulationJobsAfterUnsafeInitialization();
 		}
 	}
 }
 
-// Horrible reference, but we really, really need to know if we are windowed.
-extern bool DX8Wrapper_IsWindowed;
 extern HWND ApplicationHWnd;
 
 /** -----------------------------------------------------------------------------------------------
  * The "main loop" of the game engine. It will not return until the game exits.
  */
+Bool GameEngine::prepareHeadlessSimulationJobsForInstalledQualification()
+{
+	startHeadlessSimulationJobsAfterUnsafeInitialization();
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	return TheGlobalData->m_headless && jobs.isRunning() &&
+		jobs.isCurrentThread(rts::JOB_OWNER_GAME) && jobs.workerCount() >= 2U &&
+		rts::GetSimulationExecutionMode() == rts::SIMULATION_EXECUTION_PARALLEL;
+}
+
 void GameEngine::execute()
 {
 	ASSERT_GAME_THREAD("GameEngine::execute");
-	rts::frame_timing::Session frameTimingSession("interactive");
+	rts::frame_timing::Session frameTimingSession(
+		TheGlobalData != 0 && TheGlobalData->m_headless ? "headless" : "interactive");
 #if defined(RTS_DEBUG)
 	DWORD startTime = timeGetTime() / 1000;
 #endif
@@ -1016,7 +1315,8 @@ void GameEngine::execute()
 	// pretty basic for now
 	while( !m_quitting )
 	{
-		rts::frame_timing::BeginFrame(TheGameLogic->getFrame());
+		const unsigned previousFrame = TheGameLogic->getFrame();
+		rts::frame_timing::BeginFrame(previousFrame);
 
 		//if (TheGlobalData->m_vTune)
 		{
@@ -1055,6 +1355,9 @@ void GameEngine::execute()
 					// compute a frame
 					update();
 					UpdateSkirmishAITestRunner();
+#if defined(_WIN64)
+					UpdateStage5PerformanceFixtureRunner();
+#endif
 				}
 				catch (INIException e)
 				{
@@ -1086,6 +1389,9 @@ void GameEngine::execute()
 			}
 		}
 		rts::frame_timing::EndFrame(TheGameLogic->getFrame());
+#if defined(_WIN64)
+		ObserveSkirmishAITestCompletedFrame(previousFrame);
+#endif
 
 #ifdef PERF_TIMERS
 		if (!m_quitting && TheGameLogic->isInGame() && !TheGameLogic->isInShellGame() && !TheGameLogic->isGamePaused())

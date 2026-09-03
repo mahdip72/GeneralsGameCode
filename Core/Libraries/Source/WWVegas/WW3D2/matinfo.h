@@ -40,7 +40,7 @@
 #include "WWDebug/wwdebug.h"
 #include "WWLib/Vector.h"
 #include "WW3D2/vertmaterial.h"
-#include "texture.h"
+#include "WW3D2/texture.h"
 #include "WW3D2/shader.h"
 #ifdef _UNIX
 #include "osdep.h"

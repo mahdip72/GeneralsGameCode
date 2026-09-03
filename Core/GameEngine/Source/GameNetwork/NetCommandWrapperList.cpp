@@ -30,6 +30,7 @@
 #include "GameNetwork/NetCommandWrapperList.h"
 #include "GameNetwork/NetCommandValidation.h"
 #include "GameNetwork/NetPacket.h"
+#include "Lib/NetworkCommandOriginPolicy.h"
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 ////// NetCommandWrapperListNode ///////////////////////////////////////////////////////////////////
@@ -306,9 +307,14 @@ NetCommandList * NetCommandWrapperList::getReadyCommands()
 			else {
 				DEBUG_LOG(("NetCommandWrapperList::getReadyCommands - discarded non-contiguous wrapped command"));
 			}
-			if (msg != nullptr && msg->getCommand() != nullptr) {
+			if (msg != nullptr && msg->getCommand() != nullptr &&
+				rts::IsWrappedNetworkCommandOriginAuthorized(temp->getPlayerID(),
+					msg->getCommand()->getPlayerID(), MAX_SLOTS)) {
 				NetCommandRef *ret = retlist->addMessage(msg->getCommand());
 				ret->setRelay(msg->getRelay());
+			}
+			else if (msg != nullptr && msg->getCommand() != nullptr) {
+				DEBUG_LOG(("NetCommandWrapperList::getReadyCommands - rejected wrapped command origin mismatch"));
 			}
 			else {
 				DEBUG_LOG(("NetCommandWrapperList::getReadyCommands - discarded malformed wrapped command"));

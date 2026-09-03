@@ -8,6 +8,7 @@
 #include "Lib/JobSystem.h"
 #include "Lib/PipelineExecutionPolicy.h"
 #include "Lib/WaterPolygonKernel.h"
+#include "../TestSupport/LocalCapacityTestLane.h"
 
 #include <new>
 #include <math.h>
@@ -467,8 +468,17 @@ int main(int argc, char **argv)
 #if defined(_WIN32) && !defined(_WIN64)
 	GameFloatingPointScope gameFloatingPointScope;
 #endif
+	bool localCapacity = false;
+	bool serialPipelines = false;
+	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity,
+		&serialPipelines, "--serial-policy"))
+	{
+		fprintf(stderr, "Usage: core_water_polygon_kernel_tests [--local-capacity] [--serial-policy]\n");
+		return 2;
+	}
+	rts_test::PrintTestCapacityLane(localCapacity);
 	initializeSinTable();
-	if (argc > 1 && strcmp(argv[1], "--serial-policy") == 0)
+	if (serialPipelines)
 		return serialPolicy();
 	const unsigned workers[] = {1, 2, 4, 8, 16, 0};
 	rts::JobSystem &system = rts::JobSystem::instance();
@@ -481,8 +491,13 @@ int main(int argc, char **argv)
 		workerIndex < sizeof(workers)/sizeof(workers[0]); ++workerIndex)
 	{
 		system.shutdown();
+		const unsigned effectiveWorkerCount =
+			rts_test::ResolveActualWorkerCount(workers[workerIndex],
+			localCapacity);
+		rts_test::PrintWorkerCountSubstitution("water polygon",
+			workers[workerIndex], effectiveWorkerCount, localCapacity);
 		rts::JobSystemConfig config = rts::JobSystem::startupConfig();
-		config.workerCount = workers[workerIndex];
+		config.workerCount = effectiveWorkerCount;
 		config.queueCapacity = 1024;
 		config.scratchBytesPerWorker = 4096;
 		config.pinWorkers = false;

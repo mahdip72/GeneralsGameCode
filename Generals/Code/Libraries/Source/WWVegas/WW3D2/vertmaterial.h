@@ -58,8 +58,6 @@ class VertexMaterialClass : public RefCountClass
 {
 	W3DMPO_CODE(VertexMaterialClass)
 
-	friend DX8Wrapper;
-
 public:
 	/*
 	** Similar to the TextureClass, these enumerations are set up to be exactly the same as
@@ -172,7 +170,7 @@ public:
 	ColorSourceType	Get_Diffuse_Color_Source();
 
 	/*
-	** UV source control.  The DX8 FVF can support up to 8 uv-arrays.  The vertex
+	** UV source control.  The legacy FVF can support up to 8 uv-arrays.  The vertex
 	** material can/must be configured to index to the uv-arrays that you want to
 	** use for the two texture stages.
 	*/
@@ -243,15 +241,17 @@ private:
 	mutable bool					CRCDirty;
 	bool									UseLighting;
 
-private:
+public:
 	/*
-	** Apply the render states to D3D
+	** Apply the render states to the renderer
 	*/
 	void					Apply() const;
 	/*
-	** Apply the render states corresponding to a null vertex material to D3D
+	** Apply the render states corresponding to a null vertex material to the renderer
 	*/
 	static void			Apply_Null();
+
+private:
 	unsigned long		Compute_CRC() const;
 
 	static VertexMaterialClass *Presets[PRESET_COUNT];

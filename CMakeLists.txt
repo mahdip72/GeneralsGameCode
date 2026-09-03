@@ -68,12 +68,9 @@ if(WIN32 OR "${CMAKE_SYSTEM}" MATCHES "Windows")
     if(${CMAKE_SIZEOF_VOID_P} EQUAL 4 AND NOT RTS_BUILD_OPTION_FFMPEG)
         include(cmake/bink.cmake)
     endif()
-    if(_RTS_BUILD_REQUIRES_DX8 AND NOT RTS_VIDEO_BACKEND_GRAPH_AUDIT)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 4 AND _RTS_BUILD_REQUIRES_DX8 AND
+            NOT RTS_VIDEO_BACKEND_GRAPH_AUDIT)
         include(cmake/dx8.cmake)
-        if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND
-            (RTS_BUILD_PRODUCT OR RTS_BUILD_CORE_EXTRAS))
-            include(cmake/native-d3d8-compat.cmake)
-        endif()
     endif()
 endif()
 
@@ -85,7 +82,7 @@ else()
 endif()
 
 include(cmake/xaudio2.cmake)
-include(cmake/legacy-product-runtime.cmake)
+include(cmake/product-runtime.cmake)
 include(cmake/gamespy.cmake)
 include(cmake/lzhl.cmake)
 include(cmake/stb.cmake)
@@ -132,12 +129,21 @@ add_subdirectory(resources)
 
 add_subdirectory(Core)
 
+include(cmake/legacy-renderer.cmake)
+
+# The x86 renderer lane is created only after Core has defined the shared
+# CPU-side libraries; native x64 targets never link it.
+if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4 AND
+        NOT RTS_VIDEO_BACKEND_GRAPH_AUDIT)
+    rts_add_legacy_renderer_targets()
+endif()
+
 # Add main build targets
-if(RTS_BUILD_PRODUCT AND RTS_BUILD_ZEROHOUR)
+if(RTS_BUILD_ZEROHOUR)
     add_subdirectory(GeneralsMD)
 endif()
 
-if(RTS_BUILD_PRODUCT AND RTS_BUILD_GENERALS)
+if(RTS_BUILD_GENERALS)
     add_subdirectory(Generals)
 endif()
 

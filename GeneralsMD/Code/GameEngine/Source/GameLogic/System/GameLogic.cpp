@@ -33,6 +33,7 @@
 #include "Common/AudioHandleSpecialValues.h"
 #include "Common/BuildAssistant.h"
 #include "Common/CRCDebug.h"
+#include "Common/DeterministicCrcLiveVerifier.h"
 #include "Common/FramePacer.h"
 #include "Common/GameAudio.h"
 #include "Common/GameEngine.h"
@@ -41,6 +42,7 @@
 #include "Common/GameState.h"
 #include "Common/GameUtility.h"
 #include "Common/INI.h"
+#include "Common/INIException.h"
 #include "Common/LatchRestore.h"
 #include "Common/MapObject.h"
 #include "Common/MultiplayerSettings.h"
@@ -57,12 +59,22 @@
 #include "Common/Team.h"
 #include "Common/ThingTemplate.h"
 #include "GameClient/Water.h"
+#if defined(_WIN64)
+#include "Common/PerformanceReceiptRuntime.h"
+#include "GameNetwork/InstalledLockstepV2Validation.h"
+#endif
 #include "GameClient/Snow.h"
 #include "Common/WellKnownKeys.h"
 #include "Common/Xfer.h"
 #include "Common/XferCRC.h"
 #include "Common/XferDeepCRC.h"
 #include "Common/GameSpyMiscPreferences.h"
+
+#include "Lib/ObjectStatusTimerKernel.h"
+#include "Lib/CollisionCandidateKernel.h"
+#include "Lib/PhysicsIntegrationKernel.h"
+#include "Lib/SimulationExecutionPolicy.h"
+#include "Lib/SimulationPhaseGraphOwnerAdapter.h"
 
 #include "GameClient/ControlBar.h"
 #include "GameClient/Drawable.h"
@@ -85,13 +97,18 @@
 #include "GameLogic/CrateSystem.h"
 #include "GameLogic/FPUControl.h"
 #include "GameLogic/GameLogic.h"
+#include "GameLogic/HordeObjectComputationIsland.h"
+#include "GameLogic/ImmutableSpatialQueryRuntime.h"
 #include "GameLogic/Locomotor.h"
 #include "GameLogic/Object.h"
 #include "GameLogic/Module/AIUpdate.h"
+#include "GameLogic/Module/AutoHealBehavior.h"
 #include "GameLogic/Module/BodyModule.h"
 #include "GameLogic/Module/CreateModule.h"
 #include "GameLogic/Module/DestroyModule.h"
 #include "GameLogic/Module/OpenContain.h"
+#include "GameLogic/Module/PhysicsUpdate.h"
+#include "GameLogic/Module/PointDefenseLaserUpdate.h"
 #include "GameLogic/PartitionManager.h"
 #include "GameLogic/PolygonTrigger.h"
 #include "GameLogic/ScriptActions.h"
@@ -110,13 +127,693 @@
 #include "GameNetwork/GameSpy/ThreadUtils.h"
 #include "GameNetwork/LANAPICallbacks.h"
 #include "GameNetwork/NetworkInterface.h"
+#include "GameNetwork/MultiplayerSimulationRuntimePolicy.h"
 #include "GameNetwork/GameSpy/PersistentStorageThread.h"
+
+#include <stdlib.h>
+#include <new>
 
 #include <rts/profile.h>
 
 struct QuitGameException {};
 
 DECLARE_PERF_TIMER(SleepyMaintenance)
+
+namespace
+{
+Bool s_physicsIntegrationCircuitBreaker = FALSE;
+
+#if defined(_WIN64)
+rts::JobMetricCounter s_kernelPerformanceOrdinal = 0;
+
+rts::JobMetricCounter nextKernelPerformanceOrdinal()
+{
+	if (s_kernelPerformanceOrdinal !=
+		~static_cast<rts::JobMetricCounter>(0))
+		++s_kernelPerformanceOrdinal;
+	return s_kernelPerformanceOrdinal;
+}
+
+struct KernelPerformanceBatchGuard
+{
+	KernelPerformanceBatchGuard(rts::performance::KernelPerformanceKernel kernel,
+		unsigned subtype, unsigned frame, rts::JobMetricCounter ordinal)
+		: ledger(&rts::performance::KernelPerformanceLedger::instance()),
+		  token(ledger->beginBatch(kernel, subtype, frame, ordinal)),
+		  active(token.valid()), admitted(FALSE),
+		  performanceReferenceLedger(0), performanceReferenceBatch()
+	{
+	}
+
+	void markAdmitted()
+	{
+		admitted = TRUE;
+	}
+
+	void finish(Bool committed)
+	{
+		if (performanceReferenceLedger != 0 &&
+			performanceReferenceBatch.valid())
+		{
+			const rts::performance::KernelPerformanceReferenceBatch referenceBatch =
+				performanceReferenceBatch;
+			performanceReferenceBatch =
+				rts::performance::KernelPerformanceReferenceBatch();
+			performanceReferenceLedger->finishBatch(referenceBatch,
+				committed != FALSE);
+		}
+		if (!active)
+			return;
+		active = FALSE;
+		const rts::performance::KernelPerformanceDisposition disposition =
+			committed ? rts::performance::KERNEL_PERFORMANCE_COMMITTED :
+			(admitted ? rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION :
+				rts::performance::KERNEL_PERFORMANCE_NOT_ADMITTED);
+		ledger->endBatch(token, disposition);
+	}
+
+	~KernelPerformanceBatchGuard()
+	{
+		finish(FALSE);
+	}
+
+	rts::performance::KernelPerformanceLedger *ledger;
+	rts::performance::KernelPerformanceBatch token;
+	Bool active;
+	Bool admitted;
+	rts::performance::KernelPerformanceReferenceLedger *performanceReferenceLedger;
+	rts::performance::KernelPerformanceReferenceBatch performanceReferenceBatch;
+};
+
+struct KernelPerformanceIntervalGuard
+{
+	KernelPerformanceIntervalGuard(
+		rts::performance::KernelPerformanceLedger *owner,
+		rts::performance::KernelPerformanceBatch batch,
+		rts::performance::KernelPerformanceStage stage)
+		: ledger(owner), interval()
+	{
+		if (ledger != nullptr && batch.valid())
+			interval = ledger->beginInterval(batch, stage);
+	}
+
+	void close()
+	{
+		if (ledger == nullptr || !interval.valid())
+			return;
+		const rts::performance::KernelPerformanceInterval closing = interval;
+		interval = rts::performance::KernelPerformanceInterval();
+		ledger->endInterval(closing);
+	}
+
+	~KernelPerformanceIntervalGuard()
+	{
+		close();
+	}
+
+	rts::performance::KernelPerformanceLedger *ledger;
+	rts::performance::KernelPerformanceInterval interval;
+};
+
+Bool isImmutableSpatialUpdateEnabled(UpdateModulePtr update)
+{
+	if (update == nullptr || update->friend_getObject() == nullptr)
+		return FALSE;
+	const DisabledMaskType disabled =
+		update->friend_getObject()->getDisabledFlags();
+#if RETAIL_COMPATIBLE_CRC
+	return !disabled.any() ||
+		disabled.anyIntersectionWith(update->getDisabledTypesToProcess());
+#else
+	return update->getDisabledTypesToProcess().testForAll(disabled);
+#endif
+}
+
+Bool isImmutableSpatialQueryQueueable(UpdateModulePtr update, UnsignedInt now)
+{
+	static NameKeyType autoHealNameKey = NAMEKEY("AutoHealBehavior");
+	static NameKeyType pointDefenseNameKey = NAMEKEY("PointDefenseLaserUpdate");
+	if (update == nullptr || update->friend_getNextCallFrame() > now ||
+		update->friend_getNextCallPhase() != PHASE_NORMAL ||
+		!isImmutableSpatialUpdateEnabled(update))
+		return FALSE;
+	const NameKeyType nameKey = update->getModuleNameKey();
+	if (nameKey == autoHealNameKey)
+		return static_cast<AutoHealBehavior *>(update)->
+			canQueueImmutableSpatialQuery();
+	if (nameKey == pointDefenseNameKey)
+		return static_cast<PointDefenseLaserUpdate *>(update)->
+			canQueueImmutableSpatialQuery();
+	return FALSE;
+}
+
+struct ImmutableSpatialHeapEntry
+{
+	UpdateModulePtr update;
+	UnsignedInt priority;
+};
+
+std::vector<ImmutableSpatialHeapEntry> s_immutableSpatialHeap;
+std::vector<UpdateModulePtr> s_immutableSpatialQueries;
+
+void recordImmutableSpatialOwnerComparison(UnsignedInt *comparisonCount)
+{
+	if (*comparisonCount != ~static_cast<UnsignedInt>(0))
+		++*comparisonCount;
+}
+
+void rebalanceImmutableSpatialHeapRoot(UnsignedInt *comparisonCount)
+{
+	UnsignedInt index = 0;
+	UnsignedInt child = 1;
+	while (child < s_immutableSpatialHeap.size())
+	{
+		if (child + 1 < s_immutableSpatialHeap.size())
+		{
+			recordImmutableSpatialOwnerComparison(comparisonCount);
+			if (s_immutableSpatialHeap[child].priority >
+				s_immutableSpatialHeap[child + 1].priority)
+				++child;
+		}
+		recordImmutableSpatialOwnerComparison(comparisonCount);
+		if (s_immutableSpatialHeap[index].priority <=
+			s_immutableSpatialHeap[child].priority)
+			break;
+		const ImmutableSpatialHeapEntry swap = s_immutableSpatialHeap[index];
+		s_immutableSpatialHeap[index] = s_immutableSpatialHeap[child];
+		s_immutableSpatialHeap[child] = swap;
+		index = child;
+		child = index * 2 + 1;
+	}
+}
+
+UnsignedInt countImmutableSpatialQueryCollection(
+	const std::vector<UpdateModulePtr> &sleepyUpdates,
+	std::vector<UpdateModulePtr> &queryUpdates, UnsignedInt now,
+	UnsignedInt *queryCellVisits, UnsignedInt *queryMemberVisits,
+	UnsignedInt *maximumRangeCost, UnsignedInt *ownerScanCount,
+	UnsignedInt *ownerSortComparisons, UnsignedInt *ownerLookupComparisons,
+	Bool *costValid)
+{
+	enum { MAXIMUM_QUERY_COSTS = 256 };
+	const UnsignedInt maximum = ~static_cast<UnsignedInt>(0);
+	static NameKeyType autoHealNameKey = NAMEKEY("AutoHealBehavior");
+	static NameKeyType pointDefenseNameKey = NAMEKEY("PointDefenseLaserUpdate");
+	if (queryCellVisits == nullptr || queryMemberVisits == nullptr ||
+		maximumRangeCost == nullptr || ownerScanCount == nullptr ||
+		ownerSortComparisons == nullptr || ownerLookupComparisons == nullptr ||
+		costValid == nullptr)
+		return 0;
+	*queryCellVisits = 0;
+	*queryMemberVisits = 0;
+	*maximumRangeCost = 0;
+	*ownerScanCount = static_cast<UnsignedInt>(sleepyUpdates.size());
+	*ownerSortComparisons = 0;
+	*ownerLookupComparisons = 0;
+	*costValid = TRUE;
+	queryUpdates.clear();
+	s_immutableSpatialHeap.clear();
+	if (sleepyUpdates.size() > ~static_cast<UnsignedInt>(0))
+	{
+		*costValid = FALSE;
+		return 0;
+	}
+	try
+	{
+		// Simulate the title heap's exact root rebalance without mutating live
+		// modules. The resulting prefix stops at the first non-spatial mover, so
+		// dispatch occurs at the exact live consumer-group boundary.
+		s_immutableSpatialHeap.reserve(sleepyUpdates.size());
+		for (UnsignedInt index = 0; index != sleepyUpdates.size(); ++index)
+		{
+			ImmutableSpatialHeapEntry entry;
+			entry.update = sleepyUpdates[index];
+			entry.priority = entry.update != nullptr ?
+				entry.update->friend_getPriority() : ~static_cast<UnsignedInt>(0);
+			s_immutableSpatialHeap.push_back(entry);
+		}
+		while (!s_immutableSpatialHeap.empty() &&
+			s_immutableSpatialHeap[0].update != nullptr &&
+			s_immutableSpatialHeap[0].priority ==
+				s_immutableSpatialHeap[0].update->friend_getPriority() &&
+			isImmutableSpatialQueryQueueable(
+				s_immutableSpatialHeap[0].update, now))
+		{
+			queryUpdates.push_back(s_immutableSpatialHeap[0].update);
+			if (queryUpdates.size() > MAXIMUM_QUERY_COSTS)
+				break;
+			s_immutableSpatialHeap[0].priority =
+				~static_cast<UnsignedInt>(0);
+			rebalanceImmutableSpatialHeapRoot(ownerScanCount);
+		}
+	}
+	catch (...)
+	{
+		queryUpdates.clear();
+		s_immutableSpatialHeap.clear();
+		*costValid = FALSE;
+		return 2;
+	}
+	const UnsignedInt queueableQueryCount = static_cast<UnsignedInt>(
+		queryUpdates.size());
+	// Policy rejection is intentionally complete before any per-query radius
+	// measurement. Singleton and forced-serial frames do no partition walk.
+	if (queueableQueryCount < 2)
+		return queueableQueryCount;
+	if (queueableQueryCount > MAXIMUM_QUERY_COSTS)
+	{
+		*costValid = FALSE;
+		return queueableQueryCount;
+	}
+	UnsignedInt queryCosts[MAXIMUM_QUERY_COSTS];
+	UnsignedInt measuredQueryCount = 0;
+	for (UnsignedInt measureIndex = 0; measureIndex != queryUpdates.size();
+		++measureIndex)
+	{
+		UpdateModulePtr update = queryUpdates[measureIndex];
+		UnsignedInt cellVisits = 0;
+		UnsignedInt memberVisits = 0;
+		const NameKeyType nameKey = update->getModuleNameKey();
+		Bool measured = FALSE;
+		if (nameKey == autoHealNameKey)
+			measured = static_cast<AutoHealBehavior *>(update)->
+				measureImmutableSpatialQueryCost(&cellVisits, &memberVisits);
+		else if (nameKey == pointDefenseNameKey)
+			measured = static_cast<PointDefenseLaserUpdate *>(update)->
+				measureImmutableSpatialQueryCost(&cellVisits, &memberVisits);
+		if (!measured || cellVisits > maximum - *queryCellVisits ||
+			memberVisits > maximum - *queryMemberVisits ||
+			cellVisits > maximum / 8 || memberVisits > maximum / 24 ||
+			cellVisits * 8 > maximum - memberVisits * 24)
+			*costValid = FALSE;
+		else
+		{
+			*queryCellVisits += cellVisits;
+			*queryMemberVisits += memberVisits;
+			queryCosts[measuredQueryCount] =
+				cellVisits * 8 + memberVisits * 24;
+		}
+		++measuredQueryCount;
+	}
+	if (!*costValid || measuredQueryCount != queueableQueryCount)
+		return queueableQueryCount;
+	UnsignedInt comparisonDepth = 0;
+	for (UnsignedInt sortedCapacity = 1;
+		sortedCapacity < queueableQueryCount; sortedCapacity <<= 1)
+		++comparisonDepth;
+	if (comparisonDepth != 0 && queueableQueryCount >
+		~static_cast<UnsignedInt>(0) / comparisonDepth)
+	{
+		*costValid = FALSE;
+		return queueableQueryCount;
+	}
+	*ownerSortComparisons = queueableQueryCount * comparisonDepth;
+	*ownerLookupComparisons = queueableQueryCount * comparisonDepth;
+	UnsignedInt rangeCount = rts::JobSystem::instance().workerCount();
+	if (rangeCount > queueableQueryCount)
+		rangeCount = queueableQueryCount;
+	const UnsignedInt quotient = queueableQueryCount / rangeCount;
+	const UnsignedInt remainder = queueableQueryCount % rangeCount;
+	for (UnsignedInt rangeIndex = 0; rangeIndex != rangeCount; ++rangeIndex)
+	{
+		const UnsignedInt begin = rangeIndex * quotient +
+			(rangeIndex < remainder ? rangeIndex : remainder);
+		const UnsignedInt count = quotient +
+			(rangeIndex < remainder ? 1u : 0u);
+		UnsignedInt rangeCost = 0;
+		for (UnsignedInt queryIndex = begin; queryIndex != begin + count;
+			++queryIndex)
+		{
+			if (queryCosts[queryIndex] > maximum - rangeCost)
+			{
+				*costValid = FALSE;
+				return queueableQueryCount;
+			}
+			rangeCost += queryCosts[queryIndex];
+		}
+		if (rangeCost > *maximumRangeCost)
+			*maximumRangeCost = rangeCost;
+	}
+	return queueableQueryCount;
+}
+
+void prepareImmutableSpatialQueryCollection(
+	const std::vector<UpdateModulePtr> &queryUpdates, UnsignedInt now,
+	UnsignedInt queueableQueryCount)
+{
+	static NameKeyType autoHealNameKey = NAMEKEY("AutoHealBehavior");
+	static NameKeyType pointDefenseNameKey = NAMEKEY("PointDefenseLaserUpdate");
+	if (!BeginLiveImmutableSpatialQueryCollection(queueableQueryCount))
+		return;
+	for (UnsignedInt index = 0; index != queryUpdates.size(); ++index)
+	{
+		UpdateModulePtr update = queryUpdates[index];
+		if (!isImmutableSpatialQueryQueueable(update, now))
+			continue;
+		const NameKeyType nameKey = update->getModuleNameKey();
+		if (nameKey == autoHealNameKey)
+		{
+			if (!static_cast<AutoHealBehavior *>(update)->
+				queueImmutableSpatialQuery())
+				return;
+		}
+		else if (nameKey == pointDefenseNameKey)
+		{
+			if (!static_cast<PointDefenseLaserUpdate *>(update)->
+				queueImmutableSpatialQuery())
+				return;
+		}
+	}
+	ExecuteLiveImmutableSpatialQueryCollection();
+}
+#endif
+
+struct PreparedPhysicsIntegrationBatch
+{
+	PreparedPhysicsIntegrationBatch()
+		: owners(nullptr), ownerIndex(nullptr), snapshots(nullptr), outputs(nullptr),
+		  scratch(nullptr), count(0), committed(0), storageBytes(0), storageCapacityBytes(0),
+		  storageAllocations(0), ready(FALSE)
+#if defined(_WIN64)
+		  , performanceBatch(), performanceBatchActive(FALSE),
+		  performanceBatchAdmitted(FALSE), performanceReferenceLedger(0),
+		  performanceReferenceBatch(), performanceReferenceOutput(0),
+		  performanceReferenceOutputCapacity(0)
+#endif
+	{
+	}
+
+	~PreparedPhysicsIntegrationBatch()
+	{
+#if defined(_WIN64)
+		finishPerformanceBatch(FALSE);
+#endif
+	}
+
+#if defined(_WIN64)
+	void finishPerformanceBatch(Bool committedBatch)
+	{
+		if (performanceReferenceLedger != 0 &&
+			performanceReferenceBatch.valid())
+		{
+			const rts::performance::KernelPerformanceReferenceBatch referenceBatch =
+				performanceReferenceBatch;
+			performanceReferenceBatch =
+				rts::performance::KernelPerformanceReferenceBatch();
+			performanceReferenceLedger->finishBatch(referenceBatch,
+				committedBatch != FALSE);
+		}
+		if (!performanceBatchActive)
+			return;
+		performanceBatchActive = FALSE;
+		const rts::performance::KernelPerformanceDisposition disposition =
+			committedBatch ? rts::performance::KERNEL_PERFORMANCE_COMMITTED :
+			(performanceBatchAdmitted ?
+				rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION :
+				rts::performance::KERNEL_PERFORMANCE_NOT_ADMITTED);
+		rts::performance::KernelPerformanceLedger::instance().endBatch(
+			performanceBatch, disposition);
+	}
+#endif
+
+	PhysicsBehavior **owners;
+	rts::PhysicsIntegrationOwnerIndexEntry *ownerIndex;
+	rts::PhysicsIntegrationSnapshot *snapshots;
+	rts::PhysicsIntegrationOutput *outputs;
+	rts::PhysicsIntegrationOutput *scratch;
+	rts::PhysicsIntegrationMetrics metrics;
+	UnsignedInt count;
+	UnsignedInt committed;
+	UnsignedInt storageBytes;
+	UnsignedInt storageCapacityBytes;
+	UnsignedInt storageAllocations;
+	Bool ready;
+#if defined(_WIN64)
+	rts::performance::KernelPerformanceBatch performanceBatch;
+	Bool performanceBatchActive;
+	Bool performanceBatchAdmitted;
+	rts::performance::KernelPerformanceReferenceLedger *performanceReferenceLedger;
+	rts::performance::KernelPerformanceReferenceBatch performanceReferenceBatch;
+	rts::PhysicsIntegrationOutput *performanceReferenceOutput;
+	UnsignedInt performanceReferenceOutputCapacity;
+#endif
+};
+
+Bool preparePhysicsIntegrationBatch(GameLogic *logic,
+	const std::vector<UpdateModulePtr> &sleepyUpdates, UnsignedInt now,
+	PreparedPhysicsIntegrationBatch &batch)
+{
+	const rts::PhysicsIntegrationMetricCounter captureStart =
+		rts::PhysicsIntegrationClockNowNanoseconds();
+	static NameKeyType physicsNameKey = NAMEKEY("PhysicsBehavior");
+	if (s_physicsIntegrationCircuitBreaker)
+		return FALSE;
+
+#if defined(_WIN64)
+	batch.performanceBatch =
+		rts::performance::KernelPerformanceLedger::instance().beginBatch(
+			rts::performance::KERNEL_PERFORMANCE_PHYSICS, 0,
+		logic->getFrame(), nextKernelPerformanceOrdinal());
+	batch.performanceBatchActive = batch.performanceBatch.valid();
+	batch.performanceBatchAdmitted = FALSE;
+	batch.performanceReferenceLedger = 0;
+	batch.performanceReferenceBatch =
+		rts::performance::KernelPerformanceReferenceBatch();
+	batch.performanceReferenceOutput = 0;
+	batch.performanceReferenceOutputCapacity = 0;
+	rts::performance::KernelPerformanceReferenceMode referenceMode =
+		rts::performance::KERNEL_REFERENCE_DISABLED;
+	if (batch.performanceBatchActive)
+	{
+		rts::performance::KernelPerformanceReferenceLedger *referenceLedger =
+			&rts::performance::KernelPerformanceReferenceLedger::instance();
+		referenceMode = referenceLedger->mode();
+		if (referenceMode != rts::performance::KERNEL_REFERENCE_DISABLED)
+			batch.performanceReferenceLedger = referenceLedger;
+	}
+	const Bool serialReference = referenceMode ==
+		rts::performance::KERNEL_REFERENCE_SERIAL_ORACLE;
+	rts::performance::KernelPerformanceLedger *performanceLedger =
+		batch.performanceBatchActive ?
+		&rts::performance::KernelPerformanceLedger::instance() : 0;
+	KernelPerformanceIntervalGuard captureScope(performanceLedger,
+		batch.performanceBatch, rts::performance::KERNEL_PERFORMANCE_CAPTURE);
+#endif
+
+	UnsignedInt candidateCount = 0;
+	for (UnsignedInt countIndex = 0; countIndex != sleepyUpdates.size(); ++countIndex)
+	{
+		UpdateModulePtr update = sleepyUpdates[countIndex];
+		if (update == nullptr || update->friend_getNextCallFrame() > now ||
+			update->friend_getNextCallPhase() != PHASE_PHYSICS)
+			continue;
+		Object *owner = const_cast<Object *>(update->friend_getObject());
+		PhysicsBehavior *physics = owner != nullptr ? owner->getPhysics() : nullptr;
+		if (physics == nullptr || physics != update ||
+			physics->getModuleNameKey() != physicsNameKey)
+			continue;
+		++candidateCount;
+	}
+	if (candidateCount == 0 ||
+		candidateCount > rts::PHYSICS_INTEGRATION_MAXIMUM_SNAPSHOTS)
+		return FALSE;
+
+	UnsignedInt outputCopies = 2;
+#if defined(_WIN64)
+	if (serialReference)
+		++outputCopies;
+#endif
+	const UnsignedInt perCandidateBytes = static_cast<UnsignedInt>(
+		sizeof(PhysicsBehavior *) + sizeof(rts::PhysicsIntegrationOwnerIndexEntry) +
+		sizeof(rts::PhysicsIntegrationSnapshot) +
+		outputCopies * sizeof(rts::PhysicsIntegrationOutput));
+	if (candidateCount > ~static_cast<UnsignedInt>(0) / perCandidateBytes)
+	{
+		rts::RecordPhysicsIntegrationUnexpectedFallback();
+		return FALSE;
+	}
+	batch.storageBytes = candidateCount * perCandidateBytes;
+	const Bool growsStorage = batch.storageBytes >
+		logic->getPhysicsIntegrationStorageCapacity();
+	if (!logic->ensurePhysicsIntegrationStorage(batch.storageBytes))
+	{
+		rts::RecordPhysicsIntegrationUnexpectedFallback();
+		return FALSE;
+	}
+	batch.storageCapacityBytes = logic->getPhysicsIntegrationStorageCapacity();
+	batch.storageAllocations = growsStorage ? 1 : 0;
+	unsigned char *storage = static_cast<unsigned char *>(
+		logic->getPhysicsIntegrationStorage());
+	batch.owners = reinterpret_cast<PhysicsBehavior **>(storage);
+	storage += candidateCount * sizeof(PhysicsBehavior *);
+	batch.ownerIndex = reinterpret_cast<rts::PhysicsIntegrationOwnerIndexEntry *>(storage);
+	storage += candidateCount * sizeof(rts::PhysicsIntegrationOwnerIndexEntry);
+	batch.snapshots = reinterpret_cast<rts::PhysicsIntegrationSnapshot *>(storage);
+	storage += candidateCount * sizeof(rts::PhysicsIntegrationSnapshot);
+	batch.outputs = reinterpret_cast<rts::PhysicsIntegrationOutput *>(storage);
+	storage += candidateCount * sizeof(rts::PhysicsIntegrationOutput);
+	batch.scratch = reinterpret_cast<rts::PhysicsIntegrationOutput *>(storage);
+#if defined(_WIN64)
+	if (serialReference)
+	{
+		storage += candidateCount * sizeof(rts::PhysicsIntegrationOutput);
+		batch.performanceReferenceOutput =
+			reinterpret_cast<rts::PhysicsIntegrationOutput *>(storage);
+		batch.performanceReferenceOutputCapacity = candidateCount;
+	}
+#endif
+
+	UnsignedInt captured = 0;
+	for (UnsignedInt captureIndex = 0; captureIndex != sleepyUpdates.size(); ++captureIndex)
+	{
+		UpdateModulePtr update = sleepyUpdates[captureIndex];
+		if (update == nullptr || update->friend_getNextCallFrame() > now ||
+			update->friend_getNextCallPhase() != PHASE_PHYSICS)
+			continue;
+		Object *owner = const_cast<Object *>(update->friend_getObject());
+		PhysicsBehavior *physics = owner != nullptr ? owner->getPhysics() : nullptr;
+		if (physics == nullptr || physics != update ||
+			physics->getModuleNameKey() != physicsNameKey)
+			continue;
+		if (!physics->captureIntegrationPrefixSnapshot(batch.snapshots[captured],
+			now, logic->getPhysicsWorldEpoch(), update->friend_getPriority(), captureIndex))
+			continue;
+		batch.owners[captured] = physics;
+		++captured;
+	}
+	if (captured == 0)
+		return FALSE;
+	if (!rts::BuildPhysicsIntegrationOwnerIndex(batch.snapshots, captured,
+		batch.ownerIndex, candidateCount))
+	{
+		rts::RecordPhysicsIntegrationUnexpectedFallback();
+		return FALSE;
+	}
+	batch.count = captured;
+	const rts::PhysicsIntegrationMetricCounter captureNanoseconds =
+		rts::PhysicsIntegrationClockNowNanoseconds() - captureStart;
+#if defined(_WIN64)
+	captureScope.close();
+#endif
+
+	rts::PhysicsIntegrationOptions options;
+#if defined(_WIN64)
+	options.performanceBatch = batch.performanceBatch;
+	options.performanceReferenceLedger = batch.performanceReferenceLedger;
+	options.performanceReferenceBatch = &batch.performanceReferenceBatch;
+	options.performanceReferenceOutput = batch.performanceReferenceOutput;
+	options.performanceReferenceOutputCapacity =
+		batch.performanceReferenceOutputCapacity;
+#endif
+	const rts::PhysicsIntegrationBatchResult result =
+		rts::PreparePhysicsIntegrationPrefixes(batch.snapshots, batch.count,
+			batch.outputs, batch.count, batch.scratch, batch.count, options, &batch.metrics);
+	batch.metrics.captureNanoseconds = captureNanoseconds;
+	batch.metrics.storageBytes = batch.storageBytes;
+	batch.metrics.storageCapacityBytes = batch.storageCapacityBytes;
+	batch.metrics.storageAllocations = batch.storageAllocations;
+	if (batch.storageAllocations != 0)
+		batch.metrics.allocatedBytes += batch.storageCapacityBytes;
+	#if defined(_WIN64)
+	batch.performanceBatchAdmitted = batch.metrics.submittedJobs != 0;
+	#endif
+	if (result != rts::PHYSICS_INTEGRATION_PARALLEL)
+	{
+		if (result == rts::PHYSICS_INTEGRATION_POLICY_INELIGIBLE)
+			rts::RecordPhysicsIntegrationIneligibleSlice();
+		else
+			rts::RecordPhysicsIntegrationUnexpectedFallback();
+		return FALSE;
+	}
+
+	if (rts::UseSimulationShadowOracle())
+	{
+		Bool matched = TRUE;
+		for (UnsignedInt index = 0; index != batch.count; ++index)
+		{
+			rts::PhysicsIntegrationOutput serial;
+			if (!PhysicsBehavior::computeIntegrationPrefixSerialOracle(
+				batch.snapshots[index], serial) ||
+				!rts::PhysicsIntegrationOutputsEqual(serial, batch.outputs[index]))
+			{
+				matched = FALSE;
+				break;
+			}
+		}
+		rts::RecordPhysicsIntegrationShadow(matched != FALSE, batch.count,
+			batch.metrics);
+		if (!matched)
+		{
+			s_physicsIntegrationCircuitBreaker = TRUE;
+			rts::RecordPhysicsIntegrationCircuitBreakerTrip();
+		}
+		return FALSE;
+	}
+
+	batch.ready = rts::UseParallelSimulation() ? TRUE : FALSE;
+	return batch.ready;
+}
+
+Bool consumePhysicsIntegrationPrefix(GameLogic *logic,
+	PreparedPhysicsIntegrationBatch &batch, UpdateModulePtr update,
+	UnsignedInt now, UpdateSleepTime &sleepLen)
+{
+	if (!batch.ready || update == nullptr ||
+		update->friend_getIndexInLogic() != 0 ||
+		update->friend_getNextCallPhase() != PHASE_PHYSICS)
+		return FALSE;
+	Object *rootOwner = const_cast<Object *>(update->friend_getObject());
+	if (rootOwner == nullptr)
+		return FALSE;
+	const rts::PhysicsIntegrationMetricCounter commitStart =
+		rts::PhysicsIntegrationClockNowNanoseconds();
+
+	const UnsignedInt objectID = static_cast<UnsignedInt>(rootOwner->getID());
+	UnsignedInt entry = 0;
+	if (!rts::FindPhysicsIntegrationOwnerIndex(batch.ownerIndex, batch.count,
+		objectID, &entry))
+		return FALSE;
+	PhysicsBehavior *physics = rootOwner->getPhysics();
+	if (physics == nullptr || physics != update || batch.owners[entry] != physics)
+	{
+		rts::RecordPhysicsIntegrationOwnerFallback(true);
+		return FALSE;
+	}
+
+	const rts::PhysicsIntegrationSnapshot &captured = batch.snapshots[entry];
+	Object *resolved = logic->findObjectByID(static_cast<ObjectID>(captured.objectID));
+	Bool valid = resolved == rootOwner && resolved != nullptr &&
+		resolved->getPhysics() == physics &&
+		logic->getFrame() == captured.frame &&
+		logic->getPhysicsWorldEpoch() == captured.worldEpoch &&
+		update->friend_getPriority() == captured.wakePriority &&
+		resolved->getMotionGeneration() == captured.motionGeneration &&
+		physics->getPhysicsGeneration() == captured.physicsGeneration;
+	rts::PhysicsIntegrationSnapshot current;
+	if (valid)
+	{
+		valid = physics->captureIntegrationPrefixSnapshot(current, now,
+			logic->getPhysicsWorldEpoch(), update->friend_getPriority(),
+			captured.heapOrdinal) &&
+			rts::ValidatePhysicsIntegrationCommit(captured, current,
+				batch.outputs[entry], true, true, true);
+	}
+	if (!valid)
+	{
+		rts::RecordPhysicsIntegrationOwnerFallback(true);
+		return FALSE;
+	}
+
+	sleepLen = physics->updateFromPreparedIntegrationPrefix(captured,
+		batch.outputs[entry], commitStart, batch.metrics.commitNanoseconds
+#if defined(_WIN64)
+		, &batch.performanceBatch
+#endif
+		);
+	++batch.committed;
+	return TRUE;
+}
+}
 
 #include "Common/UnitTimings.h" //Contains the DO_UNIT_TIMINGS define jba.
 // If defined, the game times various units.
@@ -244,6 +941,7 @@ const char* toString(GameMode mode)
 /** GameLogic class constructor */
 // ------------------------------------------------------------------------------------------------
 GameLogic::GameLogic()
+	: m_stage5PhaseGraph(makeStage5PhaseGraphCallbacks(), this)
 {
 	m_background = nullptr;
 	m_CRC = 0;
@@ -262,6 +960,16 @@ GameLogic::GameLogic()
 	m_startNewGame = FALSE;
 
 	m_frame = 0;
+	m_physicsWorldEpoch = 1;
+	m_physicsIntegrationStorage = nullptr;
+	m_physicsIntegrationStorageCapacity = 0;
+	m_objectStatusTimerStorage = nullptr;
+	m_objectStatusTimerStorageCapacity = 0;
+	m_stage5PhaseCursor = 0;
+	m_stage5PhaseNow = 0;
+#if defined(_WIN64)
+	m_performanceReceiptRuntime = 0;
+#endif
 	m_hasUpdated = FALSE;
 	m_frameObjectsChangedTriggerAreas = 0;
 	m_width = 0;
@@ -290,6 +998,54 @@ GameLogic::GameLogic()
 	m_loadingSave = FALSE;
 	m_clearingGameData = FALSE;
 	m_quitToDesktopAfterMatch = FALSE;
+}
+
+//-------------------------------------------------------------------------------------------------
+Bool GameLogic::ensurePhysicsIntegrationStorage( UnsignedInt bytes )
+{
+	if (bytes <= m_physicsIntegrationStorageCapacity)
+		return TRUE;
+#if defined(_MSC_VER) && _MSC_VER <= 1200
+	unsigned char *storage = new unsigned char[bytes];
+#else
+	unsigned char *storage = new (std::nothrow) unsigned char[bytes];
+#endif
+	if (storage == nullptr)
+		return FALSE;
+	delete[] m_physicsIntegrationStorage;
+	m_physicsIntegrationStorage = storage;
+	m_physicsIntegrationStorageCapacity = bytes;
+	return TRUE;
+}
+
+//-------------------------------------------------------------------------------------------------
+Bool GameLogic::ensureObjectStatusTimerStorage( UnsignedInt bytes )
+{
+	if (bytes <= m_objectStatusTimerStorageCapacity)
+		return TRUE;
+	const UnsignedInt maximum = ~static_cast<UnsignedInt>(0);
+	UnsignedInt capacity = m_objectStatusTimerStorageCapacity != 0 ?
+		m_objectStatusTimerStorageCapacity : 4096;
+	while (capacity < bytes)
+	{
+		if (capacity > maximum / 2)
+		{
+			capacity = bytes;
+			break;
+		}
+		capacity *= 2;
+	}
+#if defined(_MSC_VER) && _MSC_VER <= 1200
+	unsigned char *storage = new unsigned char[capacity];
+#else
+	unsigned char *storage = new (std::nothrow) unsigned char[capacity];
+#endif
+	if (storage == nullptr)
+		return FALSE;
+	delete[] m_objectStatusTimerStorage;
+	m_objectStatusTimerStorage = storage;
+	m_objectStatusTimerStorageCapacity = capacity;
+	return TRUE;
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -336,6 +1092,12 @@ void GameLogic::destroyAllObjectsImmediate()
 // ------------------------------------------------------------------------------------------------
 GameLogic::~GameLogic()
 {
+	delete[] m_physicsIntegrationStorage;
+	m_physicsIntegrationStorage = nullptr;
+	m_physicsIntegrationStorageCapacity = 0;
+	delete[] m_objectStatusTimerStorage;
+	m_objectStatusTimerStorage = nullptr;
+	m_objectStatusTimerStorageCapacity = 0;
 
 	// clear any object TOC we might have
 	m_objectTOC.clear();
@@ -418,6 +1180,16 @@ void GameLogic::init()
 //-------------------------------------------------------------------------------------------------
 void GameLogic::reset()
 {
+	if (++m_physicsWorldEpoch == 0)
+		m_physicsWorldEpoch = 1;
+	s_physicsIntegrationCircuitBreaker = FALSE;
+	ResetHordeObjectComputationIslandForMatch();
+	rts::ResetCollisionCandidateRuntimeMetrics();
+	rts::ResetPhysicsIntegrationRuntimeMetrics();
+	rts::ResetObjectStatusTimerRuntimeMetrics();
+#if defined(_WIN64)
+	ResetLiveImmutableSpatialRuntime();
+#endif
 	m_thingTemplateBuildableOverrides.clear();
 	m_controlBarOverrides.clear();
 
@@ -2637,7 +3409,8 @@ void GameLogic::processCommandList( CommandList *list )
 	for( msg = list->getFirstMessage(); msg; msg = msg->next() )
 	{
 #ifdef RTS_DEBUG
-		DEBUG_ASSERTCRASH(msg != nullptr && msg != (GameMessage*)0xdeadbeef, ("bad msg"));
+		DEBUG_ASSERTCRASH(msg != nullptr && msg != reinterpret_cast<GameMessage *>(
+			static_cast<uintptr_t>(0xdeadbeef)), ("bad msg"));
 #endif
 		logicMessageDispatcher( msg, nullptr );
 	}
@@ -3674,6 +4447,20 @@ static void unitTimings()
 DECLARE_PERF_TIMER(GameLogic_update)
 DECLARE_PERF_TIMER(GameLogic_update_normal)
 DECLARE_PERF_TIMER(GameLogic_update_sleepy)
+DECLARE_PERF_TIMER(GameLogic_update_owner_intake)
+DECLARE_PERF_TIMER(GameLogic_update_legacy_mutable_island)
+DECLARE_PERF_TIMER(GameLogic_update_spatial)
+DECLARE_PERF_TIMER(GameLogic_update_owner_tail)
+DECLARE_PERF_TIMER(GameLogic_update_verification_publication)
+
+enum Stage5GameLogicPhaseTrace
+{
+	STAGE5_PHASE_OWNER_INTAKE = 1,
+	STAGE5_PHASE_LEGACY_MUTABLE_ISLAND,
+	STAGE5_PHASE_SPATIAL,
+	STAGE5_PHASE_OWNER_TAIL,
+	STAGE5_PHASE_VERIFICATION_PUBLICATION
+};
 
 #ifdef DUMP_PERF_STATS
 extern __int64 Total_Get_Texture_Time;
@@ -3683,11 +4470,32 @@ extern __int64 Total_Load_3D_Assets;
 #endif
 
 // ------------------------------------------------------------------------------------------------
+void GameLogic::validateStage5Owner( const char *boundary ) const
+{
+#if !defined(_UNIX)
+	if (!GameThreadOwnership::IsAttached() || !GameThreadOwnership::IsCurrentThread())
+	{
+		RELEASE_CRASH((boundary));
+	}
+#else
+	(void)boundary;
+#endif
+}
+
+// ------------------------------------------------------------------------------------------------
+void GameLogic::traceStage5Phase( Int phase ) const
+{
+	// Profiler-only diagnostic trace; it is not part of simulation state, saves, or CRCs.
+	PROFILER_PLOT("SimulationPhase", static_cast<int64_t>(phase));
+}
+
+// ------------------------------------------------------------------------------------------------
 /** Update all objects in the world by invoking their update() methods. */
 // ------------------------------------------------------------------------------------------------
 void GameLogic::update()
 {
 	ASSERT_GAME_THREAD("GameLogic::update");
+	validateStage5Owner("Stage5 simulation update requires the attached game thread.");
 	USE_PERF_TIMER(GameLogic_update)
 	PROFILER_SECTION_COLOR(0x4CAF50);
 
@@ -3695,6 +4503,280 @@ void GameLogic::update()
 #ifdef DO_UNIT_TIMINGS
 	unitTimings();
 #endif
+	if (m_startNewGame && !TheDisplay->isMoviePlaying())
+	{
+		// Wall-clock evidence is match-scoped and never participates in state.
+		m_stage5PhaseGraph.resetRuntimeMetrics();
+		rts::JobSystem::instance().resetPerformanceMetrics();
+	}
+	const Bool stage5CurrentRuntime =
+#if defined(_WIN64)
+		BuildSupportsSkirmishAICounterRngPlanning();
+#else
+		FALSE;
+#endif
+	const UnsignedInt replayEpoch = TheRecorder != nullptr ?
+		static_cast<UnsignedInt>(TheRecorder->getSkirmishAIReplayEpoch()) :
+		static_cast<UnsignedInt>(SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+	if (!rts::ShouldUseLiveSimulationPhaseGraph(stage5CurrentRuntime != FALSE,
+		isInReplayGame() != FALSE, replayEpoch,
+		static_cast<UnsignedInt>(SKIRMISH_AI_REPLAY_EPOCH_CURRENT)))
+	{
+		// VC6 and legacy/unknown replay epochs retain the original direct tick.
+		runLegacyStage5Phases();
+		return;
+	}
+
+	m_stage5PhaseCursor = 0;
+	const rts::LiveSimulationPhaseRunResult graphResult =
+		m_stage5PhaseGraph.runFrame(getFrame());
+	if (graphResult == rts::LIVE_SIMULATION_PHASE_COMPLETED ||
+		graphResult == rts::LIVE_SIMULATION_PHASE_STOPPED_BY_OWNER)
+	{
+		return;
+	}
+	if (graphResult == rts::LIVE_SIMULATION_PHASE_FAILED_AFTER_MUTATION)
+	{
+		const rts::LiveSimulationPhaseFailureDiagnostic &failure =
+			m_stage5PhaseGraph.failureDiagnostic();
+		char failureText[1024];
+		snprintf(failureText, sizeof(failureText),
+			"Stage5 phase graph failed after owner mutation; legacy fallback is unsafe. "
+			"boundary=%u phase=%u job=%u frame=%u generation=%u epoch=%u "
+			"committed=%u signature=%u owner_entered=%u graph=%u cause=%u "
+			"return_graph=%u return_cause=%u owner_known=%u owner_frame=%u "
+			"owner_phase_frame=%u owner_cursor=%u observed_owner_frame=%u "
+			"observed_owner_phase_frame=%u observed_owner_cursor=%u "
+			"exception=%u message_truncated=%u message=\"%s\"",
+			static_cast<unsigned>(failure.boundary), failure.phaseId, failure.jobKey,
+			failure.frame, failure.generation, failure.internalEpoch,
+			failure.committedPhaseCount, failure.sequenceSignature,
+			failure.ownerCommitEntered ? 1u : 0u,
+			static_cast<unsigned>(failure.graphState),
+			static_cast<unsigned>(failure.terminalCause),
+			static_cast<unsigned>(failure.returnGraphState),
+			static_cast<unsigned>(failure.returnTerminalCause),
+			failure.ownerContextKnown ? 1u : 0u, failure.ownerFrame,
+			failure.ownerPhaseFrame, failure.ownerCursor, getFrame(),
+			m_stage5PhaseNow, m_stage5PhaseCursor,
+			static_cast<unsigned>(failure.exceptionCategory),
+			failure.exceptionMessageTruncated ? 1u : 0u, failure.exceptionMessage);
+		failureText[sizeof(failureText) - 1] = '\0';
+		fprintf(stderr, "%s\n", failureText);
+		fflush(stderr);
+		RELEASE_CRASH((failureText));
+		return;
+	}
+
+	// The adapter only requests fallback before its first owner commit.
+	// Therefore this exact legacy sequence cannot duplicate mutation.
+	runLegacyStage5Phases();
+}
+
+// ------------------------------------------------------------------------------------------------
+void GameLogic::runLegacyStage5Phases()
+{
+	rts::JobMetricCounter phaseNanoseconds[
+		rts::LIVE_SIMULATION_PHASE_COUNT - 1] = { 0 };
+	const rts::JobMetricCounter frameStart =
+		m_stage5PhaseGraph.performanceClockNowNanoseconds();
+	rts::JobMetricCounter phaseStart =
+		m_stage5PhaseGraph.performanceClockNowNanoseconds();
+	UnsignedInt now = 0;
+	if (!runOwnerIntakePhase(now))
+	{
+		const rts::JobMetricCounter phaseEnd =
+			m_stage5PhaseGraph.performanceClockNowNanoseconds();
+		phaseNanoseconds[0] = phaseEnd >= phaseStart ?
+			phaseEnd - phaseStart : 0;
+		const rts::JobMetricCounter frameEnd =
+			m_stage5PhaseGraph.performanceClockNowNanoseconds();
+		(void)m_stage5PhaseGraph.recordDirectFramePerformance(
+			phaseNanoseconds, 1, frameEnd >= frameStart ?
+			frameEnd - frameStart : 0);
+		return;
+	}
+	rts::JobMetricCounter phaseEnd =
+		m_stage5PhaseGraph.performanceClockNowNanoseconds();
+	phaseNanoseconds[0] = phaseEnd >= phaseStart ?
+		phaseEnd - phaseStart : 0;
+	phaseStart = m_stage5PhaseGraph.performanceClockNowNanoseconds();
+	runLegacyMutableIslandPhase(now);
+	phaseEnd = m_stage5PhaseGraph.performanceClockNowNanoseconds();
+	phaseNanoseconds[1] = phaseEnd >= phaseStart ? phaseEnd - phaseStart : 0;
+	phaseStart = m_stage5PhaseGraph.performanceClockNowNanoseconds();
+	runSpatialPhase();
+	phaseEnd = m_stage5PhaseGraph.performanceClockNowNanoseconds();
+	phaseNanoseconds[2] = phaseEnd >= phaseStart ? phaseEnd - phaseStart : 0;
+	phaseStart = m_stage5PhaseGraph.performanceClockNowNanoseconds();
+	runOwnerTailPhase();
+	phaseEnd = m_stage5PhaseGraph.performanceClockNowNanoseconds();
+	phaseNanoseconds[3] = phaseEnd >= phaseStart ? phaseEnd - phaseStart : 0;
+	phaseStart = m_stage5PhaseGraph.performanceClockNowNanoseconds();
+	runVerificationAndPublicationPhase();
+	phaseEnd = m_stage5PhaseGraph.performanceClockNowNanoseconds();
+	phaseNanoseconds[4] = phaseEnd >= phaseStart ? phaseEnd - phaseStart : 0;
+	const rts::JobMetricCounter frameEnd =
+		m_stage5PhaseGraph.performanceClockNowNanoseconds();
+	(void)m_stage5PhaseGraph.recordDirectFramePerformance(phaseNanoseconds,
+		rts::LIVE_SIMULATION_PHASE_COUNT - 1,
+		frameEnd >= frameStart ? frameEnd - frameStart : 0);
+}
+
+// ------------------------------------------------------------------------------------------------
+rts::LiveSimulationPhaseOwnerCallbacks GameLogic::makeStage5PhaseGraphCallbacks()
+{
+	rts::LiveSimulationPhaseOwnerCallbacks callbacks;
+	callbacks.isOwner = &GameLogic::isStage5PhaseGraphOwner;
+	callbacks.validate = &GameLogic::validateStage5PhaseGraphCommit;
+	callbacks.commit = &GameLogic::commitStage5PhaseGraphPhase;
+#if defined(_WIN64)
+	callbacks.observe = &GameLogic::observeStage5PhaseGraphBoundary;
+#endif
+	return callbacks;
+}
+
+// ------------------------------------------------------------------------------------------------
+Bool GameLogic::getStage5PhaseAuthorityEvidence( UnsignedInt phaseId,
+	rts::LiveSimulationPhaseAuthorityEvidence &evidence ) const
+{
+	return m_stage5PhaseGraph.authorityEvidence(phaseId, evidence) ? TRUE : FALSE;
+}
+
+// ------------------------------------------------------------------------------------------------
+bool GameLogic::isStage5PhaseGraphOwner( void *ownerContext )
+{
+	if (ownerContext == nullptr)
+		return false;
+#if !defined(_UNIX)
+	return GameThreadOwnership::IsAttached() &&
+		GameThreadOwnership::IsCurrentThread();
+#else
+	return true;
+#endif
+}
+
+// ------------------------------------------------------------------------------------------------
+#if defined(_WIN64)
+bool GameLogic::attachPerformanceReceiptRuntime(PerformanceReceiptRuntime *runtime)
+{
+	if (!isStage5PhaseGraphOwner(this) || isInGameLogicUpdate() ||
+		runtime == 0 || !runtime->active() ||
+		(m_performanceReceiptRuntime != 0 && m_performanceReceiptRuntime != runtime))
+		return false;
+	m_performanceReceiptRuntime = runtime;
+	return true;
+}
+
+bool GameLogic::detachPerformanceReceiptRuntime(PerformanceReceiptRuntime *expectedRuntime)
+{
+	if (!isStage5PhaseGraphOwner(this) || isInGameLogicUpdate() ||
+		expectedRuntime == 0 || m_performanceReceiptRuntime != expectedRuntime)
+		return false;
+	m_performanceReceiptRuntime = 0;
+	return true;
+}
+
+void GameLogic::observeStage5PhaseGraphBoundary(
+	rts::LiveSimulationPhaseObservationBoundary boundary,
+	rts::SimulationPhaseId phaseId, unsigned generation,
+	unsigned frame, void *ownerContext) noexcept
+{
+	GameLogic *logic = static_cast<GameLogic *>(ownerContext);
+	if (logic == 0 || logic->m_performanceReceiptRuntime == 0)
+		return;
+	// A rejected foreign callback must not read mutable world state. The
+	// runtime latches its qualification failure without affecting dispatch.
+	const unsigned actualFrame = isStage5PhaseGraphOwner(logic) ? logic->getFrame() : 0;
+	logic->m_performanceReceiptRuntime->observePhaseBoundary(
+		boundary, phaseId, generation, frame, actualFrame);
+}
+#endif
+
+// ------------------------------------------------------------------------------------------------
+bool GameLogic::validateStage5PhaseGraphCommit( unsigned phaseId,
+	unsigned generation, unsigned frame, void *ownerContext )
+{
+	GameLogic *logic = static_cast<GameLogic *>(ownerContext);
+	const bool owner = isStage5PhaseGraphOwner(logic);
+	bool valid = owner && generation != 0 &&
+		phaseId == logic->m_stage5PhaseCursor + 1;
+	if (valid)
+	{
+		valid = logic->getFrame() == frame;
+	}
+	if (!valid && owner)
+		logic->m_stage5PhaseGraph.annotateOwnerFailure(logic->getFrame(),
+			logic->m_stage5PhaseNow, logic->m_stage5PhaseCursor);
+	return valid;
+}
+
+// ------------------------------------------------------------------------------------------------
+bool GameLogic::commitStage5PhaseGraphPhase( unsigned phaseId,
+	unsigned generation, unsigned frame, void *ownerContext )
+{
+	GameLogic *logic = static_cast<GameLogic *>(ownerContext);
+	Bool continueFrame = TRUE;
+	(void)generation;
+	try
+	{
+	switch (phaseId)
+	{
+		case rts::LIVE_SIMULATION_PHASE_OWNER_INTAKE:
+			logic->m_stage5PhaseNow = frame;
+			continueFrame = logic->runOwnerIntakePhase(logic->m_stage5PhaseNow);
+			// Commands can reset the world after legacy scheduling time was
+			// captured. Only authority adopts the post-intake world identity.
+			if (continueFrame &&
+				!logic->m_stage5PhaseGraph.retargetPendingFrameAfterIntake(
+					logic->getFrame()))
+			{
+				RELEASE_CRASH(("Stage5 phase graph could not publish the post-intake frame identity."));
+				return false;
+			}
+			break;
+		case rts::LIVE_SIMULATION_PHASE_LEGACY_MUTABLE_ISLAND:
+			logic->runLegacyMutableIslandPhase(logic->m_stage5PhaseNow);
+			break;
+		case rts::LIVE_SIMULATION_PHASE_SPATIAL:
+			logic->runSpatialPhase();
+			break;
+		case rts::LIVE_SIMULATION_PHASE_OWNER_TAIL:
+			logic->runOwnerTailPhase();
+			break;
+		case rts::LIVE_SIMULATION_PHASE_VERIFICATION_PUBLICATION:
+			logic->runVerificationAndPublicationPhase();
+			break;
+		default:
+			RELEASE_CRASH(("Stage5 phase graph attempted an unknown owner commit."));
+			return false;
+	}
+	}
+	catch (const INIException &exception)
+	{
+		// INIException owns its message buffer. Never copy or consume it here.
+		logic->m_stage5PhaseGraph.annotateOwnerFailure(logic->getFrame(),
+			logic->m_stage5PhaseNow, logic->m_stage5PhaseCursor,
+			rts::LIVE_SIMULATION_PHASE_EXCEPTION_TITLE_INI, exception.mFailureMessage);
+		throw;
+	}
+	catch (...)
+	{
+		logic->m_stage5PhaseGraph.annotateOwnerFailure(logic->getFrame(),
+			logic->m_stage5PhaseNow, logic->m_stage5PhaseCursor);
+		throw;
+	}
+	++logic->m_stage5PhaseCursor;
+	return continueFrame != FALSE;
+}
+
+// ------------------------------------------------------------------------------------------------
+Bool GameLogic::runOwnerIntakePhase( UnsignedInt &now )
+{
+	validateStage5Owner("Stage5 owner-intake phase requires the attached game thread.");
+	USE_PERF_TIMER(GameLogic_update_owner_intake)
+	PROFILER_SECTION_NAME("Simulation.OwnerIntake");
+	traceStage5Phase(STAGE5_PHASE_OWNER_INTAKE);
 
 	setFPMode();
 
@@ -3733,7 +4815,7 @@ void GameLogic::update()
 	}
 
 	// send the current time to the GameClient
-	UnsignedInt now = getFrame();
+	now = getFrame();
 	TheGameClient->setFrame(now);
 
 	PROFILER_PLOT("LogicFrame", static_cast<int64_t>(now));
@@ -3747,7 +4829,7 @@ void GameLogic::update()
 	TheFramePacer->setTimeFrozen(TheGameEngine->isTimeFrozen());
 
 	if (TheFramePacer->isTimeFrozen())
-		return;
+		return FALSE;
 
 	// Note - TerrainLogic update needs to happen after ScriptEngine update, but before object updates.  jba.
 	// This way changes in bridges are noted in the script engine before being cleared in TerrainLogic->update
@@ -3803,6 +4885,17 @@ void GameLogic::update()
 		processCommandList( TheCommandList );
 	}
 
+	return TRUE;
+}
+
+// ------------------------------------------------------------------------------------------------
+void GameLogic::runLegacyMutableIslandPhase( UnsignedInt now )
+{
+	validateStage5Owner("Stage5 legacy mutable-island phase requires the attached game thread.");
+	USE_PERF_TIMER(GameLogic_update_legacy_mutable_island)
+	PROFILER_SECTION_NAME("Simulation.LegacyMutableIsland");
+	traceStage5Phase(STAGE5_PHASE_LEGACY_MUTABLE_ISLAND);
+
 #ifdef ALLOW_NONSLEEPY_UPDATES
 	{
 		for (std::list<UpdateModulePtr>::const_iterator it = m_normalUpdates.begin(); it != m_normalUpdates.end(); ++it)
@@ -3836,6 +4929,14 @@ void GameLogic::update()
 	}
 #endif
 
+	PreparedPhysicsIntegrationBatch physicsBatch;
+	Bool physicsBatchAttempted = FALSE;
+	PreparedHordeObjectComputationIsland hordeObjectBatch;
+	Bool hordeObjectBatchAttempted = FALSE;
+#if defined(_WIN64)
+	Bool immutableSpatialArenaCaptured = FALSE;
+	UnsignedInt immutableSpatialPreparedOrdinal = 0;
+#endif
 	{
 		while (!m_sleepyUpdates.empty())
 		{
@@ -3853,6 +4954,117 @@ void GameLogic::update()
 			{
 				break;
 			}
+			#if defined(_WIN64)
+			if (immutableSpatialArenaCaptured &&
+				(s_immutableSpatialQueries.empty() ||
+				immutableSpatialPreparedOrdinal >=
+					s_immutableSpatialQueries.size() ||
+				s_immutableSpatialQueries[immutableSpatialPreparedOrdinal] != u))
+			{
+				EndLiveImmutableSpatialQueryCollection();
+			}
+			#endif
+			if (!physicsBatchAttempted &&
+				u->friend_getNextCallPhase() == PHASE_PHYSICS)
+			{
+				physicsBatchAttempted = TRUE;
+				if (rts::ShouldPrepareLiveSimulationKernelOffThread(
+					rts::MULTIPLAYER_SIMULATION_KERNEL_PHYSICS))
+				{
+					const rts::PhysicsIntegrationBatchResult physicsPreflight =
+						rts::PreflightPhysicsIntegrationPrefixes();
+					if (physicsPreflight == rts::PHYSICS_INTEGRATION_PARALLEL)
+						preparePhysicsIntegrationBatch(this, m_sleepyUpdates,
+							now, physicsBatch);
+					else if (physicsPreflight ==
+						rts::PHYSICS_INTEGRATION_POLICY_INELIGIBLE)
+						rts::RecordPhysicsIntegrationIneligibleSlice();
+					else
+						rts::RecordPhysicsIntegrationUnexpectedFallback();
+				}
+			}
+			if (!hordeObjectBatchAttempted &&
+				u->friend_getNextCallPhase() == PHASE_NORMAL)
+			{
+				hordeObjectBatchAttempted = TRUE;
+				if (TheNetwork == nullptr &&
+					rts::PrepareSimulationCommandsOffThread())
+					PrepareHordeObjectComputationIsland(this, m_sleepyUpdates,
+						now, hordeObjectBatch);
+			}
+
+#if defined(_WIN64)
+			if (immutableSpatialArenaCaptured &&
+				(s_immutableSpatialQueries.empty() ||
+				immutableSpatialPreparedOrdinal >=
+					s_immutableSpatialQueries.size() ||
+				s_immutableSpatialQueries[immutableSpatialPreparedOrdinal] != u))
+			{
+				s_immutableSpatialQueries.clear();
+				immutableSpatialArenaCaptured = FALSE;
+			}
+			if (ShouldCaptureLiveImmutableSpatialArena(
+				immutableSpatialArenaCaptured,
+				isImmutableSpatialQueryQueueable(u, now)))
+			{
+				immutableSpatialArenaCaptured = TRUE;
+				immutableSpatialPreparedOrdinal = 0;
+				s_immutableSpatialHeap.clear();
+				s_immutableSpatialQueries.clear();
+				if (rts::ShouldPrepareLiveSimulationKernelOffThread(
+					rts::MULTIPLAYER_SIMULATION_KERNEL_SPATIAL))
+				{
+					LiveImmutableSpatialCollectionPreflightResult preflight =
+						PreflightLiveImmutableSpatialQueryScheduler();
+					UnsignedInt queueableQueryCount = 0;
+					UnsignedInt queryCellVisits = 0;
+					UnsignedInt queryMemberVisits = 0;
+					UnsignedInt maximumRangeCost = 0;
+					UnsignedInt ownerScanCount = 0;
+					UnsignedInt ownerSortComparisons = 0;
+					UnsignedInt ownerLookupComparisons = 0;
+					Bool queryCostValid = TRUE;
+					if (preflight == LIVE_IMMUTABLE_SPATIAL_COLLECTION_ELIGIBLE)
+					{
+						queueableQueryCount = countImmutableSpatialQueryCollection(
+							m_sleepyUpdates, s_immutableSpatialQueries, now,
+							&queryCellVisits,
+							&queryMemberVisits, &maximumRangeCost,
+							&ownerScanCount, &ownerSortComparisons,
+							&ownerLookupComparisons, &queryCostValid);
+						preflight = PreflightLiveImmutableSpatialQueryCollection(
+							queueableQueryCount);
+						if (preflight == LIVE_IMMUTABLE_SPATIAL_COLLECTION_ELIGIBLE)
+							preflight = queryCostValid ?
+								PreflightLiveImmutableSpatialQueryCollectionCost(
+									ThePartitionManager, queueableQueryCount,
+									queryCellVisits, queryMemberVisits,
+									maximumRangeCost, ownerScanCount,
+									ownerSortComparisons,
+									ownerLookupComparisons) :
+								LIVE_IMMUTABLE_SPATIAL_COLLECTION_FAILED;
+					}
+					if (preflight == LIVE_IMMUTABLE_SPATIAL_COLLECTION_ELIGIBLE)
+					{
+						if (CaptureLiveImmutableSpatialArena(ThePartitionManager, now))
+						{
+							prepareImmutableSpatialQueryCollection(s_immutableSpatialQueries, now,
+								queueableQueryCount);
+						}
+						else
+						{
+							PublishLiveImmutableSpatialNoCaptureState(
+								LIVE_IMMUTABLE_SPATIAL_COLLECTION_FAILED,
+								ThePartitionManager, now);
+						}
+					}
+					else
+						PublishLiveImmutableSpatialNoCaptureState(preflight,
+							ThePartitionManager, now);
+				}
+				s_immutableSpatialHeap.clear();
+			}
+#endif
 
 			UpdateSleepTime sleepLen = UPDATE_SLEEP_NONE;	// default, if it is disabled.
 
@@ -3872,7 +5084,11 @@ void GameLogic::update()
 				//DEBUG_LOG(("calling update %08lx (%d %d)...",update,update->friend_getNextCallFrame(),update->friend_getNextCallPhase()));
 				m_curUpdateModule = u;
 
-				sleepLen = u->update();
+				if (!consumePhysicsIntegrationPrefix(this, physicsBatch, u,
+					now, sleepLen) &&
+					!ConsumeHordeObjectComputationIsland(this, hordeObjectBatch,
+						u, now, sleepLen))
+					sleepLen = u->update();
 				DEBUG_ASSERTCRASH(sleepLen > 0, ("you may not return 0 from update"));
 				if (sleepLen < 1)
 					sleepLen = UPDATE_SLEEP_NONE;
@@ -3882,10 +5098,36 @@ void GameLogic::update()
 			}
 
 			// else defer it till next frame and re-push it
-			u->friend_setNextCallFrame(now + sleepLen);
-			rebalanceSleepyUpdate(0);
+				u->friend_setNextCallFrame(now + sleepLen);
+			#if defined(_WIN64)
+				if (immutableSpatialArenaCaptured)
+				{
+					if (immutableSpatialPreparedOrdinal <
+						s_immutableSpatialQueries.size() &&
+						s_immutableSpatialQueries[immutableSpatialPreparedOrdinal] == u)
+						++immutableSpatialPreparedOrdinal;
+					if (s_immutableSpatialQueries.empty() ||
+						immutableSpatialPreparedOrdinal >=
+							s_immutableSpatialQueries.size())
+					{
+						EndLiveImmutableSpatialQueryCollection();
+						s_immutableSpatialQueries.clear();
+						immutableSpatialArenaCaptured = FALSE;
+					}
+				}
+			#endif
+				rebalanceSleepyUpdate(0);
 		}
 	}
+#if defined(_WIN64)
+	EndLiveImmutableSpatialQueryCollection();
+	physicsBatch.finishPerformanceBatch(
+		physicsBatch.ready && physicsBatch.count != 0 &&
+		physicsBatch.committed == physicsBatch.count);
+#endif
+	if (physicsBatch.committed != 0)
+		rts::RecordPhysicsIntegrationAuthoritativeSlice(physicsBatch.committed,
+			physicsBatch.metrics);
 
 	validateSleepyUpdate();
 
@@ -3899,10 +5141,309 @@ void GameLogic::update()
 		TheBuildAssistant->UPDATE();
 	}
 
+}
+
+// ------------------------------------------------------------------------------------------------
+void GameLogic::runSpatialPhase()
+{
+	validateStage5Owner("Stage5 spatial phase requires the attached game thread.");
+	USE_PERF_TIMER(GameLogic_update_spatial)
+	PROFILER_SECTION_NAME("Simulation.Spatial");
+	traceStage5Phase(STAGE5_PHASE_SPATIAL);
+
 	// update partition info
 	{
 		ThePartitionManager->UPDATE();
 	}
+
+}
+
+// ------------------------------------------------------------------------------------------------
+static void runLegacyDisabledStatusSweep( GameLogic *logic )
+{
+	for( Object *obj = logic->getFirstObject(); obj; obj = obj->getNextObject() )
+	{
+		if( obj->isDisabled() )
+			obj->checkDisabledStatus();
+	}
+}
+
+// ------------------------------------------------------------------------------------------------
+static Bool runPreparedDisabledStatusSweep( GameLogic *logic )
+{
+	if( DISABLED_COUNT > rts::OBJECT_STATUS_TIMER_MAX_TYPES )
+		return FALSE;
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	if( !rts::ShouldPrepareLiveObjectStatusTimerSnapshot(
+			rts::ShouldPrepareLiveSimulationKernelOffThread(
+				rts::MULTIPLAYER_SIMULATION_KERNEL_STATUS),
+			jobs.isRunning(), jobs.workerCount(), jobs.isWorkerThread(),
+			jobs.isCurrentThread(rts::JOB_OWNER_GAME)) )
+		return FALSE;
+
+#if defined(_WIN64)
+	KernelPerformanceBatchGuard performanceBatch(
+		rts::performance::KERNEL_PERFORMANCE_STATUS, 0,
+		logic->getFrame(), nextKernelPerformanceOrdinal());
+	rts::performance::KernelPerformanceReferenceMode referenceMode =
+		rts::performance::KERNEL_REFERENCE_DISABLED;
+	if( performanceBatch.active )
+	{
+	rts::performance::KernelPerformanceReferenceLedger *referenceLedger =
+			&rts::performance::KernelPerformanceReferenceLedger::instance();
+		referenceMode = referenceLedger->mode();
+		if( referenceMode != rts::performance::KERNEL_REFERENCE_DISABLED )
+			performanceBatch.performanceReferenceLedger = referenceLedger;
+	}
+	const Bool serialReference = referenceMode ==
+		rts::performance::KERNEL_REFERENCE_SERIAL_ORACLE;
+	KernelPerformanceIntervalGuard captureScope(performanceBatch.ledger,
+		performanceBatch.token, rts::performance::KERNEL_PERFORMANCE_CAPTURE);
+#endif
+
+	UnsignedInt snapshotCount = 0;
+	for( Object *countObject = logic->getFirstObject(); countObject;
+		countObject = countObject->getNextObject() )
+	{
+		if( countObject->isDisabled() &&
+			++snapshotCount > rts::OBJECT_STATUS_TIMER_MAXIMUM_SNAPSHOTS )
+			return FALSE;
+	}
+	if( snapshotCount == 0 )
+		return TRUE;
+	if( snapshotCount < rts::OBJECT_STATUS_TIMER_MINIMUM_PARALLEL_SNAPSHOTS )
+		return FALSE;
+
+	const Bool shadow = rts::UseSimulationShadowOracle();
+	const size_t maximumStorageBytes = static_cast<size_t>(
+		~static_cast<UnsignedInt>(0));
+	size_t commandCopies = shadow ? 2 : 1;
+#if defined(_WIN64)
+	if (serialReference)
+		++commandCopies;
+#endif
+	if( static_cast<size_t>(snapshotCount) > maximumStorageBytes /
+			sizeof(rts::ObjectStatusTimerSnapshot) ||
+		static_cast<size_t>(snapshotCount) > maximumStorageBytes /
+			sizeof(rts::ObjectStatusTimerCommand) )
+	{
+		rts::RecordObjectStatusTimerOwnerFallback(false);
+		return FALSE;
+	}
+	const size_t snapshotBytes = sizeof(rts::ObjectStatusTimerSnapshot) *
+		static_cast<size_t>(snapshotCount);
+	const size_t commandBytes = sizeof(rts::ObjectStatusTimerCommand) *
+		static_cast<size_t>(snapshotCount);
+	if( commandBytes > maximumStorageBytes / commandCopies ||
+		snapshotBytes > maximumStorageBytes - commandBytes * commandCopies )
+	{
+		rts::RecordObjectStatusTimerOwnerFallback(false);
+		return FALSE;
+	}
+	const UnsignedInt storageBytes = static_cast<UnsignedInt>(snapshotBytes +
+		commandBytes * commandCopies);
+	if( !logic->ensureObjectStatusTimerStorage(storageBytes) )
+	{
+		rts::RecordObjectStatusTimerOwnerFallback(false);
+		return FALSE;
+	}
+	unsigned char *storage = static_cast<unsigned char *>(
+		logic->getObjectStatusTimerStorage());
+
+	rts::ObjectStatusTimerSnapshot *snapshots =
+		reinterpret_cast<rts::ObjectStatusTimerSnapshot *>(storage);
+	rts::ObjectStatusTimerCommand *serialCommands =
+		reinterpret_cast<rts::ObjectStatusTimerCommand *>(storage + snapshotBytes);
+	rts::ObjectStatusTimerCommand *preparedCommands = serialCommands;
+	if( shadow )
+		preparedCommands = reinterpret_cast<rts::ObjectStatusTimerCommand *>(
+			storage + snapshotBytes + commandBytes);
+#if defined(_WIN64)
+	rts::ObjectStatusTimerCommand *referenceOutput = 0;
+	if( serialReference )
+	{
+		if( shadow )
+			referenceOutput = reinterpret_cast<rts::ObjectStatusTimerCommand *>(
+				storage + snapshotBytes + 2 * commandBytes);
+		else
+		{
+			referenceOutput = serialCommands;
+			preparedCommands = reinterpret_cast<rts::ObjectStatusTimerCommand *>(
+				storage + snapshotBytes + commandBytes);
+		}
+	}
+#endif
+
+	UnsignedInt snapshotIndex = 0;
+	UnsignedInt ownerOrder = 0;
+	for( Object *snapshotObject = logic->getFirstObject(); snapshotObject;
+		snapshotObject = snapshotObject->getNextObject(), ++ownerOrder )
+	{
+		if( !snapshotObject->isDisabled() )
+			continue;
+		rts::ObjectStatusTimerSnapshot &snapshot = snapshots[snapshotIndex++];
+		snapshot.objectID = static_cast<UnsignedInt>(snapshotObject->getID());
+		snapshot.ownerOrder = ownerOrder;
+		snapshot.activeMask = 0;
+		for( UnsignedInt resetTypeIndex = 0;
+			resetTypeIndex != rts::OBJECT_STATUS_TIMER_MAX_TYPES; ++resetTypeIndex )
+			snapshot.expirationFrame[resetTypeIndex] = FOREVER;
+		for( Int disabledTypeIndex = 0;
+			disabledTypeIndex != DISABLED_COUNT; ++disabledTypeIndex )
+		{
+			const DisabledType disabledType = static_cast<DisabledType>(disabledTypeIndex);
+			if( snapshotObject->isDisabledByType(disabledType) )
+			{
+				snapshot.activeMask |= 1u << disabledTypeIndex;
+				snapshot.expirationFrame[disabledTypeIndex] =
+					snapshotObject->getDisabledUntil(disabledType);
+			}
+		}
+	}
+
+#if defined(_WIN64)
+	captureScope.close();
+#endif
+	rts::ObjectStatusTimerOptions parallelOptions;
+	parallelOptions.parallel = true;
+#if defined(_WIN64)
+	parallelOptions.performanceBatch = performanceBatch.token;
+	parallelOptions.performanceReferenceLedger =
+		performanceBatch.performanceReferenceLedger;
+	parallelOptions.performanceReferenceBatch =
+		&performanceBatch.performanceReferenceBatch;
+	parallelOptions.performanceReferenceOutput = referenceOutput;
+	parallelOptions.performanceReferenceOutputCapacity =
+		serialReference ? snapshotCount : 0;
+#endif
+	rts::ObjectStatusTimerMetrics parallelMetrics;
+	UnsignedInt preparedCount = 0;
+	const rts::ObjectStatusTimerResult preparedResult =
+		rts::PrepareObjectStatusTimerCommands(snapshots, snapshotCount,
+			logic->getFrame(), DISABLED_COUNT, preparedCommands, snapshotCount,
+			parallelOptions, &preparedCount, &parallelMetrics);
+#if defined(_WIN64)
+	if( parallelMetrics.submittedJobs != 0 )
+		performanceBatch.markAdmitted();
+#endif
+
+	PROFILER_PLOT("ObjectStatusTimerSnapshots",
+		static_cast<int64_t>(parallelMetrics.evaluatedSnapshots));
+	PROFILER_PLOT("ObjectStatusTimerCommands",
+		static_cast<int64_t>(parallelMetrics.emittedCommands));
+	PROFILER_PLOT("ObjectStatusTimerJobs",
+		static_cast<int64_t>(parallelMetrics.submittedJobs));
+	PROFILER_PLOT("ObjectStatusTimerFallbacks",
+		static_cast<int64_t>(parallelMetrics.serialFallbacks));
+
+	Bool preparedSuccessfully =
+		preparedResult == rts::OBJECT_STATUS_TIMER_SERIAL ||
+		preparedResult == rts::OBJECT_STATUS_TIMER_PARALLEL;
+	if( shadow )
+	{
+		rts::ObjectStatusTimerOptions serialOptions;
+		rts::ObjectStatusTimerMetrics serialMetrics;
+		UnsignedInt serialCount = 0;
+		const rts::ObjectStatusTimerResult serialResult =
+			rts::PrepareObjectStatusTimerCommands(snapshots, snapshotCount,
+				logic->getFrame(), DISABLED_COUNT, serialCommands, snapshotCount,
+				serialOptions, &serialCount, &serialMetrics);
+		if( preparedResult != rts::OBJECT_STATUS_TIMER_PARALLEL )
+		{
+			rts::RecordObjectStatusTimerOwnerFallback(false);
+			return FALSE;
+		}
+		UnsignedInt firstDifference = 0;
+		const Bool matchesSerial =
+			serialResult == rts::OBJECT_STATUS_TIMER_SERIAL &&
+			rts::ObjectStatusTimerCommandsEqual(serialCommands, serialCount,
+				preparedCommands, preparedCount, &firstDifference);
+		rts::RecordObjectStatusTimerShadow(matchesSerial != FALSE, preparedCount,
+			parallelMetrics);
+		if( !matchesSerial )
+		{
+			UnsignedInt serialID = firstDifference < serialCount ?
+				serialCommands[firstDifference].objectID : 0;
+			UnsignedInt preparedID = firstDifference < preparedCount ?
+				preparedCommands[firstDifference].objectID : 0;
+			(void) serialID;
+			(void) preparedID;
+			DEBUG_LOG(("object status timer shadow mismatch frame=%u index=%u serial_id=%u parallel_id=%u serial_count=%u parallel_count=%u serial_result=%d parallel_result=%d\n",
+				logic->getFrame(), firstDifference, serialID, preparedID,
+				serialCount, preparedCount, serialResult, preparedResult));
+			return FALSE;
+		}
+		preparedCommands = serialCommands;
+		preparedCount = serialCount;
+		preparedSuccessfully = TRUE;
+	}
+
+	if( !preparedSuccessfully )
+	{
+		rts::RecordObjectStatusTimerOwnerFallback(false);
+		return FALSE;
+	}
+
+	UnsignedInt committedCount = 0;
+#if defined(_WIN64)
+	Bool allCommandsResolved = TRUE;
+	const Bool authoritativePerformanceBatch = !shadow &&
+		preparedResult == rts::OBJECT_STATUS_TIMER_PARALLEL &&
+		preparedCount != 0;
+	KernelPerformanceIntervalGuard commitScope(
+		authoritativePerformanceBatch ? performanceBatch.ledger : 0,
+		performanceBatch.token, rts::performance::KERNEL_PERFORMANCE_COMMIT);
+#endif
+	for( UnsignedInt index = 0; index != preparedCount; ++index )
+	{
+		const rts::ObjectStatusTimerCommand &command = preparedCommands[index];
+		Object *resolvedObject = logic->findObjectByID(static_cast<ObjectID>(command.objectID));
+		if( resolvedObject == nullptr )
+		{
+#if defined(_WIN64)
+			allCommandsResolved = FALSE;
+#endif
+			continue;
+		}
+		Bool stillExpired = FALSE;
+		for( Int checkTypeIndex = 0; checkTypeIndex != DISABLED_COUNT;
+			++checkTypeIndex )
+		{
+			const UnsignedInt bit = 1u << checkTypeIndex;
+			const DisabledType disabledType = static_cast<DisabledType>(checkTypeIndex);
+			if( (command.expiredMask & bit) != 0 &&
+				resolvedObject->isDisabledByType(disabledType) &&
+				logic->getFrame() >= resolvedObject->getDisabledUntil(disabledType) )
+			{
+				stillExpired = TRUE;
+				break;
+			}
+		}
+		if( stillExpired )
+		{
+			resolvedObject->checkDisabledStatus();
+			++committedCount;
+		}
+	}
+#if defined(_WIN64)
+	commitScope.close();
+	performanceBatch.finish(authoritativePerformanceBatch && allCommandsResolved &&
+		committedCount == preparedCount);
+#endif
+	if( !shadow && preparedResult == rts::OBJECT_STATUS_TIMER_PARALLEL )
+		rts::RecordObjectStatusTimerAuthoritativeCommit(preparedCount,
+			committedCount, parallelMetrics);
+
+	return TRUE;
+}
+
+// ------------------------------------------------------------------------------------------------
+void GameLogic::runOwnerTailPhase()
+{
+	validateStage5Owner("Stage5 owner-tail phase requires the attached game thread.");
+	USE_PERF_TIMER(GameLogic_update_owner_tail)
+	PROFILER_SECTION_NAME("Simulation.OwnerTail");
+	traceStage5Phase(STAGE5_PHASE_OWNER_TAIL);
 
 	//
 	// End of frame clean-up
@@ -3918,16 +5459,23 @@ void GameLogic::update()
 	TheLocomotorStore->UPDATE();
 	TheVictoryConditions->UPDATE();
 
-	{
-		//Handle disabled statii (and re-enable objects once frame matches)
-		for( Object *obj = m_objList; obj; obj = obj->getNextObject() )
-		{
-			if( obj->isDisabled() )
-			{
-				obj->checkDisabledStatus();
-			}
-		}
-	}
+	// Handle disabled statii after the stores/victory boundary exactly as the
+	// legacy sweep did. Serial mode retains that loop byte-for-byte in behavior;
+	// parallel/shadow prepare only pointer-free expiry decisions and commit them
+	// in the same owner-captured object order. Network sessions require the
+	// exact-roster mixed-worker policy before this prepared lane is eligible.
+	if( !runPreparedDisabledStatusSweep(this) )
+		runLegacyDisabledStatusSweep(this);
+
+}
+
+// ------------------------------------------------------------------------------------------------
+void GameLogic::runVerificationAndPublicationPhase()
+{
+	validateStage5Owner("Stage5 verification/publication phase requires the attached game thread.");
+	USE_PERF_TIMER(GameLogic_update_verification_publication)
+	PROFILER_SECTION_NAME("Simulation.VerificationPublication");
+	traceStage5Phase(STAGE5_PHASE_VERIFICATION_PUBLICATION);
 
 
 
@@ -3938,6 +5486,15 @@ void GameLogic::update()
 	{
 		m_frame++;
 		m_hasUpdated = TRUE;
+#if defined(_WIN64)
+		if (rts::IsInstalledLockstepV2ProofStarted())
+		{
+			const Bool recorded = rts::RecordInstalledLockstepV2Frame(
+				m_frame, getCRC(CRC_RECALC)) ? TRUE : FALSE;
+			if (!recorded || rts::IsInstalledLockstepV2StopRequested())
+				TheGameEngine->setQuitting(TRUE);
+		}
+#endif
 	}
 }
 
@@ -4151,6 +5708,14 @@ UnsignedInt GameLogic::getCRC( Int mode, AsciiString deepCRCFileName )
 	LatchRestore<Bool> latch(inCRCGen, !isInGameLogicUpdate());
 
 	XferCRC *xferCRC;
+	rts::DeterministicCrcLiveVerifier liveCrcVerifier;
+	Bool liveCrcActive = FALSE;
+	Bool liveCrcEligible = TRUE;
+#ifdef DEBUG_CRC
+	liveCrcEligible = !((g_crcModuleDataFromClient &&
+		!isInGameLogicUpdate()) ||
+		(g_crcModuleDataFromLogic && isInGameLogicUpdate()));
+#endif
 	AsciiString marker;
 	if (deepCRCFileName.isNotEmpty())
 	{
@@ -4175,7 +5740,16 @@ UnsignedInt GameLogic::getCRC( Int mode, AsciiString deepCRCFileName )
 		else
 #endif // DEBUG_CRC
 		{
-			xferCRC = NEW XferCRC;
+			if (liveCrcEligible && liveCrcVerifier.begin(
+				rts::GetSimulationExecutionMode()))
+			{
+				xferCRC = liveCrcVerifier.xfer();
+				liveCrcActive = TRUE;
+			}
+			else
+			{
+				xferCRC = NEW XferCRC;
+			}
 			crcName = "lightCRC";
 		}
 		xferCRC->open(crcName);
@@ -4189,12 +5763,16 @@ UnsignedInt GameLogic::getCRC( Int mode, AsciiString deepCRCFileName )
 		CRCGEN_LOG(("CRC at start of frame %d is 0x%8.8X", m_frame, xferCRC->getCRC()));
 	}
 
+	if (liveCrcActive)
+		liveCrcVerifier.beginPartition(rts::DETERMINISTIC_CRC_LIVE_OBJECTS);
 	marker = "MARKER:Objects";
 	xferCRC->xferAsciiString(&marker);
 	for( obj = m_objList; obj; obj=obj->getNextObject() )
 	{
 		xferCRC->xferSnapshot( obj );
 	}
+	if (liveCrcActive)
+		liveCrcVerifier.endPartition(rts::DETERMINISTIC_CRC_LIVE_OBJECTS);
 	UnsignedInt seed = GetGameLogicRandomSeedCRC();
 	if (isInGameLogicUpdate())
 	{
@@ -4205,10 +5783,17 @@ UnsignedInt GameLogic::getCRC( Int mode, AsciiString deepCRCFileName )
 	{
 		CRCGEN_LOG(("RandomSeed: %d", seed));
 	}
+	if (liveCrcActive)
+		liveCrcVerifier.beginPartition(rts::DETERMINISTIC_CRC_LIVE_RANDOM_SEED);
 	if (xferCRC->getXferMode() == XFER_CRC)
 	{
 		xferCRC->xferUnsignedInt( &seed );
 	}
+	if (liveCrcActive)
+		liveCrcVerifier.endPartition(rts::DETERMINISTIC_CRC_LIVE_RANDOM_SEED);
+	if (liveCrcActive)
+		liveCrcVerifier.beginPartition(
+			rts::DETERMINISTIC_CRC_LIVE_PARTITION_MANAGER);
 	marker = "MARKER:ThePartitionManager";
 	xferCRC->xferAsciiString(&marker);
 	xferCRC->xferSnapshot( ThePartitionManager );
@@ -4216,6 +5801,9 @@ UnsignedInt GameLogic::getCRC( Int mode, AsciiString deepCRCFileName )
 	{
 		CRCGEN_LOG(("CRC after partition manager for frame %d is 0x%8.8X", m_frame, xferCRC->getCRC()));
 	}
+	if (liveCrcActive)
+		liveCrcVerifier.endPartition(
+			rts::DETERMINISTIC_CRC_LIVE_PARTITION_MANAGER);
 
 #ifdef DEBUG_CRC
 	if ((g_crcModuleDataFromClient && !isInGameLogicUpdate()) ||
@@ -4232,13 +5820,19 @@ UnsignedInt GameLogic::getCRC( Int mode, AsciiString deepCRCFileName )
 #endif // DEBUG_CRC
 
 	marker = "MARKER:ThePlayerList";
+	if (liveCrcActive)
+		liveCrcVerifier.beginPartition(rts::DETERMINISTIC_CRC_LIVE_PLAYER_LIST);
 	xferCRC->xferAsciiString(&marker);
 	xferCRC->xferSnapshot( ThePlayerList );
 	if (isInGameLogicUpdate())
 	{
 		CRCGEN_LOG(("CRC after PlayerList for frame %d is 0x%8.8X", m_frame, xferCRC->getCRC()));
 	}
+	if (liveCrcActive)
+		liveCrcVerifier.endPartition(rts::DETERMINISTIC_CRC_LIVE_PLAYER_LIST);
 
+	if (liveCrcActive)
+		liveCrcVerifier.beginPartition(rts::DETERMINISTIC_CRC_LIVE_AI);
 	marker = "MARKER:TheAI";
 	xferCRC->xferAsciiString(&marker);
 	xferCRC->xferSnapshot( TheAI );
@@ -4246,6 +5840,8 @@ UnsignedInt GameLogic::getCRC( Int mode, AsciiString deepCRCFileName )
 	{
 		CRCGEN_LOG(("CRC after AI for frame %d is 0x%8.8X", m_frame, xferCRC->getCRC()));
 	}
+	if (liveCrcActive)
+		liveCrcVerifier.endPartition(rts::DETERMINISTIC_CRC_LIVE_AI);
 
 	if (xferCRC->getXferMode() == XFER_SAVE)
 	{
@@ -4258,7 +5854,23 @@ UnsignedInt GameLogic::getCRC( Int mode, AsciiString deepCRCFileName )
 
 	UnsignedInt theCRC = xferCRC->getCRC();
 
-	delete xferCRC;
+	if (liveCrcActive)
+	{
+		rts::DeterministicCrcLiveResult liveResult;
+		const rts::DeterministicCrcLiveStatus liveStatus =
+			liveCrcVerifier.verify(theCRC, &liveResult);
+		if (rts::UseSimulationShadowOracle() && liveStatus ==
+			rts::DETERMINISTIC_CRC_LIVE_ORACLE_MISMATCH)
+		{
+			DEBUG_LOG(("deterministic CRC shadow mismatch frame=%d generation=%u serial=%8.8X parallel=%8.8X\n",
+				m_frame, liveResult.generation, theCRC,
+				liveResult.parallelChecksum));
+		}
+	}
+	else
+	{
+		delete xferCRC;
+	}
 	xferCRC = nullptr;
 
 	if (isInGameLogicUpdate())

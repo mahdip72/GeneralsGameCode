@@ -18,10 +18,22 @@
 #include "Common/GameMemory.h"
 #include "Common/GlobalData.h"
 #include "Common/SkirmishAITestRunner.h"
+#include "Common/PerformanceReceiptRuntime.h"
 #include "Common/SkirmishAIReplayEpoch.h"
 #include "Common/PathfindQueueReplayEpoch.h"
+#include "GameClient/GameText.h"
+#include "GameLogic/AIPathfind.h"
+#include "Lib/SimulationPhaseGraphOwnerAdapter.h"
+#include "XferCrcSnapshotTest.h"
 #include "GameLogic/SkirmishAIDecision.h"
 #include "GameLogic/SkirmishAILiveness.h"
+#if defined(_WIN64)
+#include "GameLogic/ImmutableSpatialQueryRuntime.h"
+#include "Lib/CollisionCandidateKernel.h"
+#include "Lib/ImmutableSpatialQueryRuntime.h"
+#include "Lib/PhysicsIntegrationKernel.h"
+#endif
+
 #include "WW3D2/textureloader.h"
 
 #include <stdio.h>
@@ -74,6 +86,280 @@ static void Check(Bool result, const char *expression, Int line)
 		++s_failures;
 	}
 }
+
+class SkirmishAITestGameText : public GameTextInterface
+{
+public:
+	virtual void init() {}
+	virtual void reset() {}
+	virtual void update() {}
+
+	virtual UnicodeString fetch(const Char *, Bool *exists = nullptr)
+	{
+		if (exists)
+			*exists = FALSE;
+		return UnicodeString();
+	}
+	virtual UnicodeString fetch(AsciiString, Bool *exists = nullptr)
+	{
+		if (exists)
+			*exists = FALSE;
+		return UnicodeString();
+	}
+	virtual UnicodeString fetchFormat(const Char *, ...)
+	{
+		return UnicodeString();
+	}
+	virtual UnicodeString fetchOrSubstitute(const Char *, const WideChar *)
+	{
+		return UnicodeString();
+	}
+	virtual UnicodeString fetchOrSubstituteFormat(const Char *, const WideChar *, ...)
+	{
+		return UnicodeString();
+	}
+	virtual UnicodeString fetchOrSubstituteFormatVA(const Char *, const WideChar *, va_list)
+	{
+		return UnicodeString();
+	}
+	virtual AsciiStringVec& getStringsWithLabelPrefix(AsciiString)
+	{
+		return m_strings;
+	}
+	virtual void initMapStringFile(const AsciiString&) {}
+
+private:
+	AsciiStringVec m_strings;
+};
+
+#if defined(_WIN64)
+class TerminalReceiptTestEnvironment
+{
+public:
+	bool set(const char *name, const char *value)
+	{
+		Saved saved;
+		saved.name = name;
+		const DWORD length = GetEnvironmentVariableA(name, 0, 0);
+		saved.present = length != 0;
+		if (saved.present)
+		{
+			std::vector<char> buffer(length);
+			GetEnvironmentVariableA(name, &buffer[0], length);
+			saved.value = &buffer[0];
+		}
+		m_saved.push_back(saved);
+		return SetEnvironmentVariableA(name, value) != 0;
+	}
+	~TerminalReceiptTestEnvironment()
+	{
+		for (std::size_t index = m_saved.size(); index != 0; --index)
+		{
+			const Saved &saved = m_saved[index - 1];
+			SetEnvironmentVariableA(saved.name.c_str(),
+				saved.present ? saved.value.c_str() : 0);
+		}
+	}
+private:
+	struct Saved { std::string name, value; bool present; };
+	std::vector<Saved> m_saved;
+};
+
+static void TestPerformanceReceiptTerminalAdmissions()
+{
+	using namespace rts::performance;
+	// Exercise the real runtime owner hook without game initialization or any
+	// publication. These process-local fixture values are always restored.
+	TerminalReceiptTestEnvironment environment;
+	const char *values[][2] = {
+		{ "RTS_PERFORMANCE_ROLE", "performance-report" },
+		{ "RTS_PERFORMANCE_RUN_ID", "terminal-owner-test-no-publication" },
+		{ "RTS_PERFORMANCE_RUN_NONCE", "11111111-1111-4111-8111-111111111111" },
+		{ "RTS_PERFORMANCE_COHORT_NONCE", "22222222-2222-4222-8222-222222222222" },
+		{ "RTS_PERFORMANCE_COHORT_CREATED_UTC", "2026-01-01T00:00:00Z" },
+		{ "RTS_PERFORMANCE_RECEIPT_DIR", "terminal-owner-test-no-publication" },
+		{ "RTS_PERFORMANCE_SOURCE_COMMIT", "0123456789abcdef0123456789abcdef01234567" },
+		{ "RTS_PERFORMANCE_ARTIFACT_SET_SHA256", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+		{ "RTS_PERFORMANCE_RUNTIME_MANIFEST_SHA256", "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" },
+		{ "RTS_PERFORMANCE_RUNTIME_CLOSURE_SHA256", "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC" },
+		{ "RTS_PERFORMANCE_FIXTURE_ID", "terminal-owner-fixture" },
+		{ "RTS_PERFORMANCE_RAW_LOG_PATH", "terminal-owner-test-no-publication/raw.log" },
+		{ "RTS_PERFORMANCE_TIMING_PATH", "terminal-owner-test-no-publication/timing.csv" },
+		{ "RTS_PERFORMANCE_VERIFIER_BOUNDARY", "test-only-no-publication" },
+		{ "RTS_PERFORMANCE_REFERENCE_MODE", "throughput-binding" },
+		{ "RTS_PERFORMANCE_WORKLOAD_QUALIFICATION", "observed-only" },
+		{ "RTS_PERFORMANCE_FIXTURE_KIND", "fresh-ai-map" },
+		{ "RTS_PERFORMANCE_FIXTURE_SHA256", 0 },
+		{ "RTS_PERFORMANCE_PLAYER_COUNT", 0 },
+		{ "RTS_PERFORMANCE_UNIT_COUNT", 0 },
+		{ "RTS_PERFORMANCE_SEED", 0 }
+	};
+	for (unsigned index = 0; index != sizeof(values) / sizeof(values[0]); ++index)
+		CHECK(environment.set(values[index][0], values[index][1]));
+
+	for (unsigned scenario = 0; scenario != 4; ++scenario)
+	{
+		PerformanceReceiptRuntime runtime;
+		const bool begun = runtime.begin("fresh-ai-map", "");
+		CHECK(begun);
+		if (!begun) return;
+		KernelPerformanceLedger &ledger = KernelPerformanceLedger::instance();
+		const KernelPerformanceBatch retained =
+			ledger.beginBatch(KERNEL_PERFORMANCE_STATUS, 0, 2, 1);
+		CHECK(retained.valid());
+		for (unsigned stage = 0; stage != KERNEL_PERFORMANCE_STAGE_COUNT; ++stage)
+		{
+			const KernelPerformanceInterval interval = ledger.beginInterval(retained,
+				static_cast<KernelPerformanceStage>(stage));
+			CHECK(interval.valid() && ledger.endInterval(interval));
+		}
+		// Missing CRC, unclean termination and rejected frame zero must not
+		// seal admission. Only the fourth scenario is an accepted terminal.
+		runtime.captureTerminalResult(scenario == 2 ? 0 : 2, 0x89ABCDEFU,
+			scenario != 0, scenario != 1);
+		const bool accepted = scenario == 3;
+		KernelPerformanceBatchIdentity identity;
+		CHECK(ledger.describeBatch(retained, identity) && identity.frame == 2);
+		const KernelPerformanceBatch next =
+			ledger.beginBatch(KERNEL_PERFORMANCE_STATUS, 0, 3, 2);
+		CHECK(next.valid() != accepted);
+		if (next.valid()) CHECK(ledger.endBatch(next, KERNEL_PERFORMANCE_NOT_ADMITTED));
+		if (accepted)
+		{
+			// A repeated terminal callback must not reopen or replace the run.
+			runtime.captureTerminalResult(3, 0x11111111U, true, true);
+			const KernelPerformanceBatch repeated =
+				ledger.beginBatch(KERNEL_PERFORMANCE_STATUS, 0, 4, 3);
+			CHECK(!repeated.valid());
+			if (repeated.valid()) CHECK(ledger.endBatch(repeated, KERNEL_PERFORMANCE_NOT_ADMITTED));
+		}
+		CHECK(ledger.endBatch(retained, KERNEL_PERFORMANCE_COMMITTED));
+		const KernelPerformanceSnapshot timing = ledger.freeze();
+		CHECK(timing.complete && timing.errors == 0 && timing.streamCount == 1);
+		CHECK(timing.streams[0].attemptedBatches == (accepted ? 1U : 2U));
+		CHECK(timing.streams[0].committedBatches == 1);
+		// No Runtime::finish call: no raw file or receipt is fabricated. The
+		// pure lifecycle cases below independently cover completed-frame/drain.
+		KernelPerformanceReferenceLedger::instance().freeze();
+	}
+}
+
+static void TestPerformanceReceiptOwnerLifecycle()
+{
+	PerformanceReceiptOwnerLifecycle idle;
+	CHECK(!idle.begun() && !idle.finalized() && !idle.terminalResultKnown());
+	CHECK(!idle.observeCompletedFrame(1));
+	CHECK(!idle.captureTerminalResult(1, 0x12345678U));
+	CHECK(!idle.finish(0, 0));
+
+	PerformanceReceiptOwnerLifecycle complete;
+	CHECK(complete.begin());
+	CHECK(complete.begun() && !complete.begin());
+	CHECK(!complete.observeCompletedFrame(0));
+	CHECK(complete.observeCompletedFrame(1));
+	CHECK(!complete.observeCompletedFrame(1));
+	CHECK(complete.observeCompletedFrame(2));
+	// The fresh-match victory event is frame 2; its real owner CRC was
+	// computed at frame 3 before that completed-frame callback runs.
+	const unsigned victoryFrame = 2;
+	const unsigned actualCrcFrame = victoryFrame + 1;
+	CHECK(complete.captureTerminalResult(actualCrcFrame, 0x89ABCDEFU));
+	CHECK(complete.terminalResultKnown());
+	CHECK(complete.terminalFrame() == actualCrcFrame);
+	CHECK(complete.terminalFrame() != victoryFrame);
+	CHECK(complete.terminalCrc() == 0x89ABCDEFU);
+	CHECK(!complete.captureTerminalResult(4, 0x11111111U));
+	CHECK(complete.observeCompletedFrame(actualCrcFrame));
+	CHECK(!complete.observeCompletedFrame(0));
+	CHECK(!complete.observeCompletedFrame(1));
+	CHECK(!complete.observeCompletedFrame(4));
+	CHECK(complete.lastCompletedFrame() == actualCrcFrame);
+	CHECK(complete.finish(0, 0));
+	CHECK(complete.finalized());
+	CHECK(!complete.finish(0, 0));
+	CHECK(!complete.begin());
+	CHECK(!complete.observeCompletedFrame(4));
+	CHECK(complete.terminalFrame() == actualCrcFrame &&
+		complete.terminalCrc() == 0x89ABCDEFU);
+
+	PerformanceReceiptOwnerLifecycle missingCompletedTerminal;
+	CHECK(missingCompletedTerminal.begin());
+	CHECK(missingCompletedTerminal.observeCompletedFrame(1));
+	CHECK(missingCompletedTerminal.captureTerminalResult(2, 7));
+	CHECK(!missingCompletedTerminal.finish(0, 0));
+	CHECK(missingCompletedTerminal.finalized());
+	CHECK(!missingCompletedTerminal.observeCompletedFrame(2));
+	CHECK(!missingCompletedTerminal.finish(0, 0));
+
+	PerformanceReceiptOwnerLifecycle missingTerminal;
+	CHECK(missingTerminal.begin());
+	CHECK(missingTerminal.observeCompletedFrame(1));
+	CHECK(!missingTerminal.finish(0, 0));
+	CHECK(missingTerminal.finalized());
+
+	PerformanceReceiptOwnerLifecycle workerStillActive;
+	CHECK(workerStillActive.begin());
+	CHECK(workerStillActive.observeCompletedFrame(1));
+	CHECK(workerStillActive.captureTerminalResult(1, 7));
+	CHECK(!workerStillActive.finish(1, 0));
+	CHECK(workerStillActive.finalized());
+	CHECK(!workerStillActive.finish(0, 0));
+
+	PerformanceReceiptOwnerLifecycle ownerCallbackPending;
+	CHECK(ownerCallbackPending.begin());
+	CHECK(ownerCallbackPending.observeCompletedFrame(1));
+	CHECK(ownerCallbackPending.captureTerminalResult(1, 7));
+	CHECK(!ownerCallbackPending.finish(0, 1));
+	CHECK(ownerCallbackPending.finalized());
+	CHECK(!ownerCallbackPending.finish(0, 0));
+
+	PerformanceReceiptOwnerLifecycle incompleteRange;
+	CHECK(incompleteRange.begin());
+	CHECK(incompleteRange.observeCompletedFrame(1));
+	CHECK(incompleteRange.observeCompletedFrame(3));
+	CHECK(!incompleteRange.captureTerminalResult(0, 7));
+	CHECK(!incompleteRange.captureTerminalResult(2, 7));
+	CHECK(incompleteRange.captureTerminalResult(3, 7));
+	CHECK(!incompleteRange.finish(0, 0));
+	CHECK(incompleteRange.finalized());
+	TestPerformanceReceiptTerminalAdmissions();
+}
+#endif
+
+#if defined(_WIN64)
+struct StableHealCommitProbe
+{
+	StableHealCommitProbe()
+		: count(0), lifecycleInvalidated(FALSE),
+		  secondObservedAfterInvalidation(FALSE)
+	{
+		objects[0] = nullptr;
+		objects[1] = nullptr;
+	}
+
+	Object *objects[2];
+	UnsignedInt count;
+	Bool lifecycleInvalidated;
+	Bool secondObservedAfterInvalidation;
+};
+
+static void RecordStableHealCommit(Object *object, void *context)
+{
+	StableHealCommitProbe *probe = static_cast<StableHealCommitProbe *>(context);
+	if (probe->count >= 2)
+		return;
+	probe->objects[probe->count++] = object;
+	if (probe->count == 1)
+	{
+		InvalidateLiveImmutableSpatialLifecycle();
+		probe->lifecycleInvalidated = TRUE;
+	}
+	else
+	{
+		probe->secondObservedAfterInvalidation = probe->lifecycleInvalidated;
+	}
+}
+#endif
 
 #if defined(_WIN64)
 // Only the external environment is substituted here. AudioEventRTS, GameAudio,
@@ -945,19 +1231,51 @@ static void TestSkirmishAIReplayEpoch()
 	CHECK(ReplayVersionUsesSkirmishAILivenessRecovery(livenessOnly));
 	CHECK(!ShouldUseSkirmishAICurrentBehavior(true, SKIRMISH_AI_REPLAY_EPOCH_PR6_LIVENESS));
 
+	UnicodeString adaptiveGlobalRngEpoch = unmarked;
+	MarkReplayVersionForSkirmishAIAdaptiveGlobalRngEpoch(adaptiveGlobalRngEpoch);
+	CHECK(adaptiveGlobalRngEpoch.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=2]") == 0);
+	CHECK(GetSkirmishAIReplayEpoch(adaptiveGlobalRngEpoch) == SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG);
+	CHECK(ReplayVersionUsesSkirmishAILivenessRecovery(adaptiveGlobalRngEpoch));
+	CHECK(ShouldUseSkirmishAICurrentBehavior(true, SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG));
+	CHECK(!ShouldUseSkirmishAICounterRng(true, SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG));
+
 	UnicodeString currentEpoch = unmarked;
 	MarkReplayVersionForSkirmishAICurrentEpoch(currentEpoch);
-	CHECK(currentEpoch.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=2]") == 0);
+	CHECK(currentEpoch.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3]") == 0);
 	CHECK(GetSkirmishAIReplayEpoch(currentEpoch) == SKIRMISH_AI_REPLAY_EPOCH_CURRENT);
 	CHECK(ReplayVersionUsesSkirmishAILivenessRecovery(currentEpoch));
 	CHECK(ShouldUseSkirmishAICurrentBehavior(true, SKIRMISH_AI_REPLAY_EPOCH_CURRENT));
+	CHECK(ShouldUseSkirmishAICounterRng(true, SKIRMISH_AI_REPLAY_EPOCH_CURRENT));
 	MarkReplayVersionForSkirmishAICurrentEpoch(currentEpoch);
-	CHECK(currentEpoch.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=2]") == 0);
+	CHECK(currentEpoch.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3]") == 0);
+
+	UnicodeString recordingWithoutCounterPlanning = unmarked;
+	MarkReplayVersionForSkirmishAIRecordingCapability(
+		recordingWithoutCounterPlanning, FALSE);
+	CHECK(GetSkirmishAIReplayEpoch(recordingWithoutCounterPlanning) ==
+		SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG);
+	UnicodeString recordingWithCounterPlanning = unmarked;
+	MarkReplayVersionForSkirmishAIRecordingCapability(
+		recordingWithCounterPlanning, TRUE);
+	CHECK(GetSkirmishAIReplayEpoch(recordingWithCounterPlanning) ==
+		SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG);
+
+	UnicodeString architectureRecordingEpoch = unmarked;
+	MarkReplayVersionForSkirmishAIRecordingEpoch(architectureRecordingEpoch);
+#if defined(_WIN64)
+	CHECK(BuildSupportsSkirmishAICounterRngPlanning());
+	CHECK(GetSkirmishAIReplayEpoch(architectureRecordingEpoch) ==
+		SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG);
+#else
+	CHECK(!BuildSupportsSkirmishAICounterRngPlanning());
+	CHECK(GetSkirmishAIReplayEpoch(architectureRecordingEpoch) ==
+		SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG);
+#endif
 
 	UnicodeString unrelatedSuffix = L"Aug 14 2026 21:00:00 [SkirmishAILiveness=2]";
 	CHECK(GetSkirmishAIReplayEpoch(unrelatedSuffix) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	CHECK(!ReplayVersionUsesSkirmishAILivenessRecovery(unrelatedSuffix));
-	UnicodeString futureEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3]";
+	UnicodeString futureEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=4]";
 	CHECK(GetSkirmishAIReplayEpoch(futureEpoch) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	UnicodeString malformedEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=x]";
 	CHECK(GetSkirmishAIReplayEpoch(malformedEpoch) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
@@ -965,14 +1283,15 @@ static void TestSkirmishAIReplayEpoch()
 	CHECK(GetSkirmishAIReplayEpoch(mixedMarkers) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	UnicodeString duplicateMarkers = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=2] [SkirmishAIEpoch=2]";
 	CHECK(GetSkirmishAIReplayEpoch(duplicateMarkers) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
-	UnicodeString unknownThenCurrent = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3] [SkirmishAIEpoch=2]";
+	UnicodeString unknownThenCurrent = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=4] [SkirmishAIEpoch=3]";
 	CHECK(GetSkirmishAIReplayEpoch(unknownThenCurrent) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	UnicodeString malformedThenLiveness = L"Aug 14 2026 21:00:00 [SkirmishAILiveness=x] [SkirmishAILiveness=1]";
 	CHECK(GetSkirmishAIReplayEpoch(malformedThenLiveness) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	UnicodeString unknownWriterInput = futureEpoch;
 	MarkReplayVersionForSkirmishAICurrentEpoch(unknownWriterInput);
 	CHECK(unknownWriterInput.compare(futureEpoch) == 0);
-	CHECK(!ShouldUseSkirmishAICurrentBehavior(true, 3));
+	CHECK(!ShouldUseSkirmishAICurrentBehavior(true, 4));
+	CHECK(ShouldUseSkirmishAICounterRng(false, SKIRMISH_AI_REPLAY_EPOCH_LEGACY));
 }
 
 static void TestPathfindQueueReplayEpoch()
@@ -999,6 +1318,15 @@ static void TestPathfindQueueReplayEpoch()
 	MarkReplayVersionForSkirmishAICurrentEpoch(combined);
 	CHECK(GetPathfindQueueReplayEpoch(combined) == PATHFIND_QUEUE_REPLAY_EPOCH_CURRENT);
 	CHECK(GetSkirmishAIReplayEpoch(combined) == SKIRMISH_AI_REPLAY_EPOCH_CURRENT);
+
+	UnicodeString pathAdaptiveGlobalRng = unmarked;
+	MarkReplayVersionForPathfindQueueCurrentEpoch(pathAdaptiveGlobalRng);
+	MarkReplayVersionForSkirmishAIAdaptiveGlobalRngEpoch(pathAdaptiveGlobalRng);
+	CHECK(GetPathfindQueueReplayEpoch(pathAdaptiveGlobalRng) == PATHFIND_QUEUE_REPLAY_EPOCH_CURRENT);
+	CHECK(GetSkirmishAIReplayEpoch(pathAdaptiveGlobalRng) ==
+		SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG);
+	CHECK(!ShouldUseSkirmishAICounterRng(true,
+		GetSkirmishAIReplayEpoch(pathAdaptiveGlobalRng)));
 
 	UnicodeString pathLiveness = unmarked;
 	MarkReplayVersionForPathfindQueueCurrentEpoch(pathLiveness);
@@ -1376,8 +1704,733 @@ static void TestSkirmishAIFeedbackPolicies()
 	CHECK(newState.hasPathFailureFrame);
 }
 
+#if defined(_WIN32)
+struct SkirmishAITestReplayCommitProbe
+{
+	Int callCount;
+	Int sharingFailures;
+	Bool persistentSharing;
+	DWORD terminalError;
+	Bool temporaryMissingDuringFailure;
+};
+
+static Bool SkirmishAITestReplayFileExists(const char *path)
+{
+	FILE *file = fopen(path, "rb");
+	if (file == nullptr)
+		return FALSE;
+	return fclose(file) == 0;
+}
+
+static Bool WriteSkirmishAITestReplayFile(const char *path,
+	const char *contents)
+{
+	if (path == nullptr || contents == nullptr)
+		return FALSE;
+	FILE *file = fopen(path, "wb");
+	if (file == nullptr)
+		return FALSE;
+	const size_t length = strlen(contents);
+	const Bool written = fwrite(contents, 1, length, file) == length;
+	const int closeResult = fclose(file);
+	return written && closeResult == 0;
+}
+
+static Bool SkirmishAITestReplayFileHasContents(const char *path,
+	const char *expectedContents)
+{
+	if (path == nullptr || expectedContents == nullptr)
+		return FALSE;
+	const size_t expectedLength = strlen(expectedContents);
+	char contents[128];
+	if (expectedLength >= sizeof(contents))
+		return FALSE;
+	FILE *file = fopen(path, "rb");
+	if (file == nullptr)
+		return FALSE;
+	const size_t readCount = fread(contents, 1, expectedLength, file);
+	const Bool matches = readCount == expectedLength &&
+		memcmp(contents, expectedContents, expectedLength) == 0 &&
+		fgetc(file) == EOF;
+	const int closeResult = fclose(file);
+	return matches && closeResult == 0;
+}
+
+static Bool CommitSkirmishAITestReplayUsingProbe(const char *temporaryPath,
+	const char *destinationPath, void *context)
+{
+	SkirmishAITestReplayCommitProbe *probe =
+		static_cast<SkirmishAITestReplayCommitProbe *>(context);
+	if (probe == nullptr)
+	{
+		SetLastError(ERROR_INVALID_PARAMETER);
+		return FALSE;
+	}
+	++probe->callCount;
+	if (probe->persistentSharing ||
+		probe->callCount <= probe->sharingFailures)
+	{
+		if (!SkirmishAITestReplayFileExists(temporaryPath))
+			probe->temporaryMissingDuringFailure = TRUE;
+		SetLastError(ERROR_SHARING_VIOLATION);
+		return FALSE;
+	}
+	if (probe->terminalError != ERROR_SUCCESS)
+	{
+		SetLastError(probe->terminalError);
+		return FALSE;
+	}
+	return MoveFileExA(temporaryPath, destinationPath,
+		MOVEFILE_WRITE_THROUGH) ? TRUE : FALSE;
+}
+
+static void TestSkirmishAITestReplayRetentionCommitPolicy()
+{
+	char currentDirectory[SKIRMISH_AI_TEST_RECEIPT_PATH_LENGTH];
+	const DWORD directoryLength = GetCurrentDirectoryA(
+		static_cast<DWORD>(sizeof(currentDirectory)), currentDirectory);
+	CHECK(directoryLength != 0 && directoryLength < sizeof(currentDirectory));
+	if (directoryLength == 0 || directoryLength >= sizeof(currentDirectory))
+		return;
+	const unsigned long processId =
+		static_cast<unsigned long>(GetCurrentProcessId());
+	char sourcePath[SKIRMISH_AI_TEST_RECEIPT_PATH_LENGTH];
+	char destinationPath[SKIRMISH_AI_TEST_RECEIPT_PATH_LENGTH];
+	char temporaryPath[SKIRMISH_AI_TEST_RECEIPT_PATH_LENGTH];
+	_snprintf(sourcePath, sizeof(sourcePath),
+		"%s\\SkirmishAITestRetentionPolicy-%lu-source.rep",
+		currentDirectory, processId);
+	_snprintf(destinationPath, sizeof(destinationPath),
+		"%s\\SkirmishAITestRetentionPolicy-%lu-retained.rep",
+		currentDirectory, processId);
+	_snprintf(temporaryPath, sizeof(temporaryPath),
+		"%s\\SkirmishAITestRetentionPolicy-%lu-retained.rep.tmp",
+		currentDirectory, processId);
+	sourcePath[sizeof(sourcePath) - 1] = '\0';
+	destinationPath[sizeof(destinationPath) - 1] = '\0';
+	temporaryPath[sizeof(temporaryPath) - 1] = '\0';
+
+	remove(sourcePath);
+	remove(destinationPath);
+	remove(temporaryPath);
+	char digest[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1];
+	strcpy(digest, "unchanged");
+	SkirmishAITestReplayCommitProbe sourceFailure =
+		{ 0, 0, TRUE, ERROR_SUCCESS, FALSE };
+	CHECK(!SkirmishAITestDetail::RetainSkirmishAITestReplayAtomically(sourcePath,
+		destinationPath, digest, CommitSkirmishAITestReplayUsingProbe,
+		&sourceFailure));
+	CHECK(sourceFailure.callCount == 0);
+	CHECK(strcmp(digest, "unchanged") == 0);
+
+	CHECK(WriteSkirmishAITestReplayFile(sourcePath, "replay-fixture"));
+	SkirmishAITestReplayCommitProbe sharingThenSuccess =
+		{ 0, 1, FALSE, ERROR_SUCCESS, FALSE };
+	strcpy(digest, "unchanged");
+	CHECK(SkirmishAITestDetail::RetainSkirmishAITestReplayAtomically(sourcePath,
+		destinationPath, digest, CommitSkirmishAITestReplayUsingProbe,
+		&sharingThenSuccess));
+	CHECK(sharingThenSuccess.callCount == 2);
+	CHECK(strcmp(digest,
+		"8742EBC99881266FF5BADEDD521E1CD24066EAD2E88A9D544C3C1F466AE534DA") == 0);
+	CHECK(SkirmishAITestReplayFileHasContents(destinationPath,
+		"replay-fixture"));
+	CHECK(SkirmishAITestReplayFileExists(sourcePath));
+
+	remove(sourcePath);
+	remove(destinationPath);
+	remove(temporaryPath);
+	CHECK(WriteSkirmishAITestReplayFile(sourcePath, "replay-fixture"));
+	SkirmishAITestReplayCommitProbe persistentSharing =
+		{ 0, 0, TRUE, ERROR_SUCCESS, FALSE };
+	strcpy(digest, "unchanged");
+	CHECK(!SkirmishAITestDetail::RetainSkirmishAITestReplayAtomically(sourcePath,
+		destinationPath, digest, CommitSkirmishAITestReplayUsingProbe,
+		&persistentSharing));
+	CHECK(persistentSharing.callCount ==
+		8);
+	CHECK(!persistentSharing.temporaryMissingDuringFailure);
+	CHECK(strcmp(digest, "unchanged") == 0);
+	CHECK(SkirmishAITestReplayFileExists(sourcePath));
+	CHECK(!SkirmishAITestReplayFileExists(destinationPath));
+	CHECK(!SkirmishAITestReplayFileExists(temporaryPath));
+
+	remove(sourcePath);
+	remove(destinationPath);
+	remove(temporaryPath);
+	CHECK(WriteSkirmishAITestReplayFile(sourcePath, "replay-fixture"));
+	SkirmishAITestReplayCommitProbe nonSharingFailure =
+		{ 0, 0, FALSE, ERROR_ACCESS_DENIED, FALSE };
+	strcpy(digest, "unchanged");
+	CHECK(!SkirmishAITestDetail::RetainSkirmishAITestReplayAtomically(sourcePath,
+		destinationPath, digest, CommitSkirmishAITestReplayUsingProbe,
+		&nonSharingFailure));
+	CHECK(nonSharingFailure.callCount == 1);
+	CHECK(strcmp(digest, "unchanged") == 0);
+	CHECK(SkirmishAITestReplayFileExists(sourcePath));
+	CHECK(!SkirmishAITestReplayFileExists(destinationPath));
+	CHECK(!SkirmishAITestReplayFileExists(temporaryPath));
+
+	remove(sourcePath);
+	remove(destinationPath);
+	remove(temporaryPath);
+	CHECK(WriteSkirmishAITestReplayFile(sourcePath, "replay-fixture"));
+	CHECK(WriteSkirmishAITestReplayFile(destinationPath,
+		"destination-sentinel"));
+	SkirmishAITestReplayCommitProbe existingDestination =
+		{ 0, 0, FALSE, ERROR_SUCCESS, FALSE };
+	strcpy(digest, "unchanged");
+	CHECK(!SkirmishAITestDetail::RetainSkirmishAITestReplayAtomically(sourcePath,
+		destinationPath, digest, CommitSkirmishAITestReplayUsingProbe,
+		&existingDestination));
+	CHECK(existingDestination.callCount == 1);
+	CHECK(strcmp(digest, "unchanged") == 0);
+	CHECK(SkirmishAITestReplayFileHasContents(destinationPath,
+		"destination-sentinel"));
+	CHECK(SkirmishAITestReplayFileExists(sourcePath));
+	CHECK(!SkirmishAITestReplayFileExists(temporaryPath));
+
+	remove(sourcePath);
+	remove(destinationPath);
+	remove(temporaryPath);
+}
+#endif
+
+static void TestSkirmishAITestReceiptContract()
+{
+	SkirmishAITestPlan practicalPlan;
+	BuildSkirmishAITestPlan(1731,
+		SKIRMISH_AI_TEST_SCENARIO_PRACTICAL_1V7, &practicalPlan);
+	CHECK(IsSkirmishAITestPracticalControllerScenario(
+		SKIRMISH_AI_TEST_SCENARIO_PRACTICAL_1V7));
+	CHECK(IsValidSkirmishAITestPracticalControllerPlan(practicalPlan));
+	CHECK(practicalPlan.slots[0].state == SLOT_PLAYER &&
+		practicalPlan.slots[0].playerTemplate != PLAYERTEMPLATE_OBSERVER &&
+		practicalPlan.slots[0].isController);
+	CHECK(practicalPlan.slots[1].color == 1 &&
+		practicalPlan.slots[7].color == 7 &&
+		practicalPlan.slots[1].teamNumber == 0 &&
+		practicalPlan.slots[7].teamNumber == 1);
+	SkirmishAITestPlan invalidPracticalPlan = practicalPlan;
+	invalidPracticalPlan.slots[0].playerTemplate = PLAYERTEMPLATE_OBSERVER;
+	CHECK(!IsValidSkirmishAITestPracticalControllerPlan(invalidPracticalPlan));
+
+	SkirmishAITestReplayReceipt receipt = { 0 };
+	receipt.seed = 1731;
+	receipt.winnerTeam = 0;
+	receipt.endFrame = 42000;
+	receipt.replayEpoch = SKIRMISH_AI_REPLAY_EPOCH_CURRENT;
+	strcpy(receipt.scenario, "4v3");
+	strcpy(receipt.executableSha256,
+		"0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF");
+	strcpy(receipt.replaySha256,
+		"8742EBC99881266FF5BADEDD521E1CD24066EAD2E88A9D544C3C1F466AE534DA");
+	strcpy(receipt.runNonce, "00000001-00000002-00000003");
+	strcpy(receipt.replayPath, "retained-replay.rep");
+	CHECK(IsValidSkirmishAITestReplayReceipt(receipt,
+		SKIRMISH_AI_REPLAY_EPOCH_CURRENT));
+	receipt.replayEpoch = SKIRMISH_AI_REPLAY_EPOCH_LEGACY;
+	CHECK(!IsValidSkirmishAITestReplayReceipt(receipt,
+		SKIRMISH_AI_REPLAY_EPOCH_CURRENT));
+	receipt.replayEpoch = SKIRMISH_AI_REPLAY_EPOCH_CURRENT;
+	receipt.runNonce[0] = '!';
+	CHECK(!IsValidSkirmishAITestReplayReceipt(receipt,
+		SKIRMISH_AI_REPLAY_EPOCH_CURRENT));
+	receipt.runNonce[0] = '0';
+	strcpy(receipt.scenario, "practical-1v7");
+	CHECK(IsValidSkirmishAITestReplayReceipt(receipt,
+		SKIRMISH_AI_REPLAY_EPOCH_CURRENT));
+
+	char currentDirectory[SKIRMISH_AI_TEST_RECEIPT_PATH_LENGTH];
+	const DWORD directoryLength = GetCurrentDirectoryA(
+		static_cast<DWORD>(sizeof(currentDirectory)), currentDirectory);
+	CHECK(directoryLength != 0 && directoryLength < sizeof(currentDirectory));
+	if (directoryLength == 0 || directoryLength >= sizeof(currentDirectory))
+		return;
+	char sourcePath[SKIRMISH_AI_TEST_RECEIPT_PATH_LENGTH];
+	char destinationPath[SKIRMISH_AI_TEST_RECEIPT_PATH_LENGTH];
+	_snprintf(sourcePath, sizeof(sourcePath), "%s\\SkirmishAITestReceipt-%lu.rep",
+		currentDirectory, static_cast<unsigned long>(GetCurrentProcessId()));
+	_snprintf(destinationPath, sizeof(destinationPath), "%s\\SkirmishAITestReceipt-%lu-retained.rep",
+		currentDirectory, static_cast<unsigned long>(GetCurrentProcessId()));
+	sourcePath[sizeof(sourcePath) - 1] = '\0';
+	destinationPath[sizeof(destinationPath) - 1] = '\0';
+	remove(sourcePath);
+	remove(destinationPath);
+	FILE *source = fopen(sourcePath, "wb");
+	CHECK(source != nullptr);
+	if (source == nullptr)
+		return;
+	const char *fixture = "replay-fixture";
+	CHECK(fwrite(fixture, 1, strlen(fixture), source) == strlen(fixture));
+	CHECK(fclose(source) == 0);
+	char digest[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1];
+	CHECK(RetainSkirmishAITestReplayAtomically(sourcePath, destinationPath, digest));
+	CHECK(strcmp(digest,
+		"8742EBC99881266FF5BADEDD521E1CD24066EAD2E88A9D544C3C1F466AE534DA") == 0);
+	CHECK(!RetainSkirmishAITestReplayAtomically(sourcePath, destinationPath, digest));
+	remove(sourcePath);
+	remove(destinationPath);
+}
+
+static void TestSkirmishAITestHardAI2v6Contract()
+{
+	SkirmishAITestPlan plan;
+	BuildSkirmishAITestPlan(1733,
+		SKIRMISH_AI_TEST_SCENARIO_HARD_AI_2V6, &plan);
+	CHECK(plan.seed == 1733);
+	CHECK(!plan.slots[0].isController);
+
+	Int plannedAiCount = 0;
+	Int plannedTeamCounts[2] = { 0, 0 };
+	Int slotIndex;
+	for (slotIndex = 0; slotIndex < SKIRMISH_AI_TEST_SLOT_COUNT; ++slotIndex)
+	{
+		const SkirmishAITestSlotPlan &slot = plan.slots[slotIndex];
+		CHECK(slot.state == SLOT_BRUTAL_AI);
+		CHECK(slot.playerTemplate == PLAYERTEMPLATE_RANDOM);
+		CHECK(slot.color == slotIndex);
+		CHECK(slot.startPosition == slotIndex);
+		CHECK(slot.teamNumber == (slotIndex < 2 ? 0 : 1));
+		CHECK(!slot.isController);
+		if (slot.state == SLOT_BRUTAL_AI)
+		{
+			++plannedAiCount;
+			if (slot.teamNumber >= 0 && slot.teamNumber < 2)
+				++plannedTeamCounts[slot.teamNumber];
+		}
+	}
+	CHECK(plannedAiCount == 8);
+	CHECK(plannedTeamCounts[0] == 2 && plannedTeamCounts[1] == 6);
+
+	// Exercise the actual GameInfo slot semantics: all eight slots are hard AI,
+	// there is no human controller, and the local slot remains -1.
+	GlobalData *previousGlobalData = TheWritableGlobalData;
+	GameTextInterface *previousGameText = TheGameText;
+	SkirmishAITestGameText testGameText;
+	TheGameText = &testGameText;
+	GlobalData *testGlobalData = new GlobalData;
+	TheWritableGlobalData = testGlobalData;
+	GameInfo *actualGameInfo = new GameInfo;
+	GameSlot actualSlots[SKIRMISH_AI_TEST_SLOT_COUNT];
+	for (slotIndex = 0; slotIndex < SKIRMISH_AI_TEST_SLOT_COUNT; ++slotIndex)
+		actualGameInfo->setSlotPointer(slotIndex, &actualSlots[slotIndex]);
+	actualGameInfo->enterGame();
+	actualGameInfo->setLocalIP(0);
+	for (slotIndex = 0; slotIndex < SKIRMISH_AI_TEST_SLOT_COUNT; ++slotIndex)
+	{
+		const SkirmishAITestSlotPlan &expected = plan.slots[slotIndex];
+		GameSlot *actual = actualGameInfo->getSlot(slotIndex);
+		actual->setState(expected.state);
+		actual->setPlayerTemplate(expected.playerTemplate);
+		actual->setColor(expected.color);
+		actual->setStartPos(expected.startPosition);
+		actual->setTeamNumber(expected.teamNumber);
+	}
+	CHECK(actualGameInfo->getNumPlayers() == 8);
+	CHECK(actualGameInfo->getNumNonObserverPlayers() == 8);
+	CHECK(actualGameInfo->getLocalSlotNum() == -1);
+
+	Int actualAiCount = 0;
+	Int actualTeamCounts[2] = { 0, 0 };
+	for (slotIndex = 0; slotIndex < SKIRMISH_AI_TEST_SLOT_COUNT; ++slotIndex)
+	{
+		const GameSlot *actual = actualGameInfo->getConstSlot(slotIndex);
+		CHECK(actual->isAI() && !actual->isHuman());
+		if (actual->isAI())
+		{
+			++actualAiCount;
+			if (actual->getTeamNumber() >= 0 && actual->getTeamNumber() < 2)
+				++actualTeamCounts[actual->getTeamNumber()];
+		}
+	}
+	CHECK(actualAiCount == 8);
+	CHECK(actualTeamCounts[0] == 2 && actualTeamCounts[1] == 6);
+	delete actualGameInfo;
+	TheWritableGlobalData = testGlobalData;
+	delete testGlobalData;
+	TheWritableGlobalData = previousGlobalData;
+	TheGameText = previousGameText;
+}
+
+
 static void TestSkirmishAITestRunnerContract()
 {
+#if defined(_WIN64)
+	TestPerformanceReceiptOwnerLifecycle();
+#endif
+	TestSkirmishAITestReceiptContract();
+#if defined(_WIN32)
+	TestSkirmishAITestReplayRetentionCommitPolicy();
+#endif
+	TestSkirmishAITestHardAI2v6Contract();
+	CHECK(!rts::ShouldUseLiveSimulationPhaseGraph(false, false, 0, 3));
+	CHECK(rts::ShouldUseLiveSimulationPhaseGraph(true, false, 0, 3));
+	CHECK(!rts::ShouldUseLiveSimulationPhaseGraph(true, true, 2, 3));
+	CHECK(rts::ShouldUseLiveSimulationPhaseGraph(true, true, 3, 3));
+	CHECK(rts::IsLiveSimulationPhaseReleaseWorkerCount(1));
+	CHECK(rts::IsLiveSimulationPhaseReleaseWorkerCount(2));
+	CHECK(rts::IsLiveSimulationPhaseReleaseWorkerCount(4));
+	CHECK(rts::IsLiveSimulationPhaseReleaseWorkerCount(8));
+	CHECK(rts::IsLiveSimulationPhaseReleaseWorkerCount(16));
+	CHECK(!rts::IsLiveSimulationPhaseReleaseWorkerCount(3));
+	rts::LiveSimulationPhaseRuntimeMetrics phaseMetrics;
+	phaseMetrics.attemptedFrames = 2;
+	phaseMetrics.completedFrames = 2;
+	phaseMetrics.stableSequenceFrames = 2;
+	phaseMetrics.committedPhases = 10;
+	phaseMetrics.lastFrame = 2;
+	phaseMetrics.lastGeneration = 2;
+	phaseMetrics.lastCommittedPhaseCount = 5;
+	phaseMetrics.lastSequenceSignature = 12345;
+	UnsignedInt performancePhaseOrdinal;
+	for (performancePhaseOrdinal = 0;
+		performancePhaseOrdinal < rts::LIVE_SIMULATION_PHASE_COUNT - 1;
+		++performancePhaseOrdinal)
+	{
+		phaseMetrics.ownerPhaseTotalNanoseconds[performancePhaseOrdinal] = 20;
+		phaseMetrics.ownerPhaseMaximumNanoseconds[performancePhaseOrdinal] = 10;
+		phaseMetrics.ownerPhaseSampleCount[performancePhaseOrdinal] = 2;
+	}
+	phaseMetrics.frameSimulationTotalNanoseconds = 100;
+	phaseMetrics.frameSimulationSampleCount = 2;
+	phaseMetrics.serialIslandTotalNanoseconds = 40;
+	phaseMetrics.serialIslandSampleCount = 2;
+	CHECK(rts::HasStableLiveSimulationPhaseEvidence(phaseMetrics));
+	CHECK(rts::LIVE_SIMULATION_PHASE_PERFORMANCE_SCHEMA_VERSION == 1);
+	CHECK(phaseMetrics.serialIslandTotalNanoseconds <=
+		phaseMetrics.frameSimulationTotalNanoseconds &&
+		phaseMetrics.frameSimulationSampleCount ==
+			phaseMetrics.serialIslandSampleCount &&
+		phaseMetrics.ownerPhaseSampleCount[0] ==
+			phaseMetrics.frameSimulationSampleCount &&
+		phaseMetrics.ownerPhaseSampleCount[4] ==
+			phaseMetrics.frameSimulationSampleCount);
+	phaseMetrics.sequenceViolationFrames = 1;
+	CHECK(!rts::HasStableLiveSimulationPhaseEvidence(phaseMetrics));
+
+	DirectPathRuntimeMetrics baseline;
+	DirectPathRuntimeMetrics current;
+	DirectPathRuntimeMetrics frozen;
+	memset(&baseline, 0, sizeof(baseline));
+	memset(&current, 0, sizeof(current));
+	memset(&frozen, 0, sizeof(frozen));
+	baseline.resetEpoch = 20;
+	current.resetEpoch = 20;
+	current.eligibleRequests = 88;
+	current.workerExecutedJobs = 88;
+	current.authoritativeCommits = 88;
+	current.authoritativeMultiWorkerCommits = 88;
+	Bool hasFrozenActivity = FALSE;
+	Bool awaitingInitialReset = TRUE;
+	AccumulateSkirmishAITestDirectPathMetrics(&baseline, current, &frozen,
+		&hasFrozenActivity, &awaitingInitialReset);
+	CHECK(awaitingInitialReset && !hasFrozenActivity &&
+		frozen.workerExecutedJobs == 0 && frozen.authoritativeCommits == 0 &&
+		frozen.authoritativeMultiWorkerCommits == 0);
+	memset(&current, 0, sizeof(current));
+	current.resetEpoch = 21;
+	current.eligibleRequests = 7;
+	current.submittedJobs = 6;
+	current.executedJobs = 6;
+	current.workerExecutedJobs = 4;
+	current.authoritativeCommits = 3;
+	current.authoritativeMultiWorkerCommits = 2;
+	current.timeoutCancellations = 1;
+	current.peakActiveWorkers = 1;
+	current.minimumCallbackCount = 9;
+	current.maximumCallbackCount = 27;
+	AccumulateSkirmishAITestDirectPathMetrics(&baseline, current, &frozen,
+		&hasFrozenActivity, &awaitingInitialReset);
+	CHECK(!awaitingInitialReset && hasFrozenActivity &&
+		frozen.workerExecutedJobs == 4 &&
+		frozen.authoritativeCommits == 3 &&
+		frozen.authoritativeMultiWorkerCommits == 2 &&
+		frozen.timeoutCancellations == 1);
+	memset(&current, 0, sizeof(current));
+	current.resetEpoch = 22;
+	AccumulateSkirmishAITestDirectPathMetrics(&baseline, current, &frozen,
+		&hasFrozenActivity, &awaitingInitialReset);
+	CHECK(frozen.workerExecutedJobs == 4 && frozen.authoritativeCommits == 3 &&
+		frozen.authoritativeMultiWorkerCommits == 2 &&
+		frozen.timeoutCancellations == 1 &&
+		frozen.minimumCallbackCount == 9 && frozen.maximumCallbackCount == 27);
+	baseline = current;
+	memset(&frozen, 0, sizeof(frozen));
+	hasFrozenActivity = FALSE;
+	awaitingInitialReset = TRUE;
+	current.resetEpoch = 23;
+	AccumulateSkirmishAITestDirectPathMetrics(&baseline, current, &frozen,
+		&hasFrozenActivity, &awaitingInitialReset);
+	CHECK(!awaitingInitialReset && !hasFrozenActivity &&
+		baseline.resetEpoch == 23 &&
+		frozen.authoritativeCommits == 0 &&
+		frozen.authoritativeMultiWorkerCommits == 0 &&
+		frozen.timeoutCancellations == 0);
+
+	OrdinaryPathRuntimeMetrics ordinaryBaseline;
+	OrdinaryPathRuntimeMetrics ordinaryCurrent;
+	OrdinaryPathRuntimeMetrics ordinaryFrozen;
+	memset(&ordinaryBaseline, 0, sizeof(ordinaryBaseline));
+	memset(&ordinaryCurrent, 0, sizeof(ordinaryCurrent));
+	memset(&ordinaryFrozen, 0, sizeof(ordinaryFrozen));
+	ordinaryBaseline.resetEpoch = 30;
+	ordinaryCurrent.resetEpoch = 30;
+	ordinaryCurrent.workerExecutedRangeJobs = 91;
+	ordinaryCurrent.authoritativeCommits = 90;
+	Bool ordinaryAwaitingInitialReset = TRUE;
+	AccumulateSkirmishAITestOrdinaryPathMetrics(&ordinaryBaseline,
+		ordinaryCurrent, &ordinaryFrozen, &ordinaryAwaitingInitialReset);
+	CHECK(ordinaryAwaitingInitialReset &&
+		ordinaryFrozen.workerExecutedRangeJobs == 0 &&
+		ordinaryFrozen.authoritativeCommits == 0);
+	memset(&ordinaryCurrent, 0, sizeof(ordinaryCurrent));
+	ordinaryCurrent.resetEpoch = 31;
+	ordinaryCurrent.eligibleRequests = 8;
+	ordinaryCurrent.submittedRequests = 6;
+	ordinaryCurrent.submittedRangeJobs = 4;
+	ordinaryCurrent.workerExecutedRequests = 6;
+	ordinaryCurrent.workerExecutedRangeJobs = 4;
+	ordinaryCurrent.physicalWorkerMask = 5;
+	ordinaryCurrent.distinctPhysicalWorkers = 65;
+	ordinaryCurrent.physicalWorkerMaskComplete = FALSE;
+	ordinaryCurrent.authoritativeCommits = 3;
+	ordinaryCurrent.authoritativeMultiWorkerCommits = 2;
+	ordinaryCurrent.peakActiveWorkers = 2;
+	ordinaryCurrent.maximumBatchRequests = 6;
+	ordinaryCurrent.maximumRangeCount = 4;
+	ordinaryCurrent.maximumGrainSize = 2;
+	AccumulateSkirmishAITestOrdinaryPathMetrics(&ordinaryBaseline,
+		ordinaryCurrent, &ordinaryFrozen, &ordinaryAwaitingInitialReset);
+	CHECK(!ordinaryAwaitingInitialReset &&
+		ordinaryFrozen.workerExecutedRangeJobs == 4 &&
+		ordinaryFrozen.physicalWorkerMask == 5 &&
+		ordinaryFrozen.distinctPhysicalWorkers == 65 &&
+		!ordinaryFrozen.physicalWorkerMaskComplete &&
+		ordinaryFrozen.authoritativeCommits == 3 &&
+		ordinaryFrozen.authoritativeMultiWorkerCommits == 2);
+	memset(&ordinaryCurrent, 0, sizeof(ordinaryCurrent));
+	ordinaryCurrent.resetEpoch = 32;
+	AccumulateSkirmishAITestOrdinaryPathMetrics(&ordinaryBaseline,
+		ordinaryCurrent, &ordinaryFrozen, &ordinaryAwaitingInitialReset);
+	CHECK(ordinaryFrozen.workerExecutedRangeJobs == 4 &&
+		ordinaryFrozen.physicalWorkerMask == 5 &&
+		ordinaryFrozen.authoritativeCommits == 3 &&
+		ordinaryFrozen.maximumBatchRequests == 6);
+	ordinaryBaseline = ordinaryCurrent;
+	memset(&ordinaryFrozen, 0, sizeof(ordinaryFrozen));
+	ordinaryAwaitingInitialReset = TRUE;
+	ordinaryCurrent.resetEpoch = 33;
+	AccumulateSkirmishAITestOrdinaryPathMetrics(&ordinaryBaseline,
+		ordinaryCurrent, &ordinaryFrozen, &ordinaryAwaitingInitialReset);
+	CHECK(!ordinaryAwaitingInitialReset &&
+		ordinaryFrozen.workerExecutedRangeJobs == 0 &&
+		ordinaryFrozen.physicalWorkerMask == 0 &&
+		ordinaryFrozen.authoritativeCommits == 0);
+
+#if defined(_WIN64)
+	rts::CollisionCandidateRuntimeMetrics collisionBaseline;
+	rts::CollisionCandidateRuntimeMetrics collisionCurrent;
+	rts::CollisionCandidateRuntimeMetrics collisionFrozen;
+	collisionBaseline.resetEpoch = 50;
+	collisionBaseline.authoritativeCommits = 90;
+	collisionCurrent = collisionBaseline;
+	Bool collisionAwaitingInitialReset = TRUE;
+	AccumulateSkirmishAITestCollisionMetrics(&collisionBaseline,
+		collisionCurrent, &collisionFrozen, &collisionAwaitingInitialReset);
+	CHECK(collisionAwaitingInitialReset && collisionFrozen.authoritativeCommits == 0);
+	collisionCurrent = rts::CollisionCandidateRuntimeMetrics();
+	collisionCurrent.resetEpoch = 51;
+	collisionCurrent.authoritativeCommits = 3;
+	collisionCurrent.committedCandidates = 12;
+	collisionCurrent.submittedJobs = 4;
+	collisionCurrent.completedJobs = 4;
+	collisionCurrent.physicalWorkerJobs = 3;
+	collisionCurrent.ownerHelpedJobs = 1;
+	collisionCurrent.physicalWorkerMask = 5;
+	collisionCurrent.distinctPhysicalWorkers = 65;
+	collisionCurrent.physicalWorkerMaskComplete = false;
+	AccumulateSkirmishAITestCollisionMetrics(&collisionBaseline,
+		collisionCurrent, &collisionFrozen, &collisionAwaitingInitialReset);
+	CHECK(!collisionAwaitingInitialReset && collisionFrozen.authoritativeCommits == 3 &&
+		collisionFrozen.committedCandidates == 12 &&
+		collisionFrozen.physicalWorkerJobs == 3 &&
+		collisionFrozen.ownerHelpedJobs == 1 &&
+		collisionFrozen.physicalWorkerMask == 5 &&
+		collisionFrozen.distinctPhysicalWorkers == 65 &&
+		!collisionFrozen.physicalWorkerMaskComplete);
+	collisionCurrent = rts::CollisionCandidateRuntimeMetrics();
+	collisionCurrent.resetEpoch = 52;
+	AccumulateSkirmishAITestCollisionMetrics(&collisionBaseline,
+		collisionCurrent, &collisionFrozen, &collisionAwaitingInitialReset);
+	CHECK(collisionFrozen.authoritativeCommits == 3 &&
+		collisionFrozen.committedCandidates == 12 &&
+		collisionFrozen.physicalWorkerJobs == 3 &&
+		collisionFrozen.ownerHelpedJobs == 1 &&
+		collisionFrozen.physicalWorkerMask == 5);
+	collisionBaseline = collisionCurrent;
+	collisionFrozen = rts::CollisionCandidateRuntimeMetrics();
+	collisionAwaitingInitialReset = TRUE;
+	collisionCurrent.resetEpoch = 53;
+	AccumulateSkirmishAITestCollisionMetrics(&collisionBaseline,
+		collisionCurrent, &collisionFrozen, &collisionAwaitingInitialReset);
+	CHECK(!collisionAwaitingInitialReset && collisionFrozen.authoritativeCommits == 0);
+	collisionCurrent.authoritativeCommits = 2;
+	collisionCurrent.committedCandidates = 7;
+	AccumulateSkirmishAITestCollisionMetrics(&collisionBaseline,
+		collisionCurrent, &collisionFrozen, &collisionAwaitingInitialReset);
+	CHECK(collisionFrozen.authoritativeCommits == 2 &&
+		collisionFrozen.committedCandidates == 7);
+
+	rts::PhysicsIntegrationRuntimeMetrics physicsBaseline;
+	rts::PhysicsIntegrationRuntimeMetrics physicsCurrent;
+	rts::PhysicsIntegrationRuntimeMetrics physicsFrozen;
+	physicsBaseline.resetEpoch = 60;
+	physicsBaseline.acceptedBatches = 80;
+	physicsCurrent = physicsBaseline;
+	Bool physicsAwaitingInitialReset = TRUE;
+	AccumulateSkirmishAITestPhysicsMetrics(&physicsBaseline,
+		physicsCurrent, &physicsFrozen, &physicsAwaitingInitialReset);
+	CHECK(physicsAwaitingInitialReset && physicsFrozen.acceptedBatches == 0);
+	physicsCurrent = rts::PhysicsIntegrationRuntimeMetrics();
+	physicsCurrent.resetEpoch = 62; // New-game and scheduler resets may coalesce.
+	physicsCurrent.acceptedBatches = 5;
+	physicsCurrent.acceptedPrefixes = 96;
+	physicsCurrent.acceptedSubmittedJobs = 4;
+	physicsCurrent.acceptedCompletedJobs = 4;
+	AccumulateSkirmishAITestPhysicsMetrics(&physicsBaseline,
+		physicsCurrent, &physicsFrozen, &physicsAwaitingInitialReset);
+	CHECK(!physicsAwaitingInitialReset && physicsFrozen.acceptedBatches == 5 &&
+		physicsFrozen.acceptedPrefixes == 96);
+	physicsCurrent = rts::PhysicsIntegrationRuntimeMetrics();
+	physicsCurrent.resetEpoch = 63;
+	AccumulateSkirmishAITestPhysicsMetrics(&physicsBaseline,
+		physicsCurrent, &physicsFrozen, &physicsAwaitingInitialReset);
+	CHECK(physicsFrozen.acceptedBatches == 5 && physicsFrozen.acceptedPrefixes == 96);
+	physicsBaseline = physicsCurrent;
+	physicsFrozen = rts::PhysicsIntegrationRuntimeMetrics();
+	physicsAwaitingInitialReset = TRUE;
+	physicsCurrent.resetEpoch = 64;
+	AccumulateSkirmishAITestPhysicsMetrics(&physicsBaseline,
+		physicsCurrent, &physicsFrozen, &physicsAwaitingInitialReset);
+	CHECK(!physicsAwaitingInitialReset && physicsFrozen.acceptedBatches == 0);
+	physicsCurrent.shadowBatches = 2;
+	physicsCurrent.shadowPrefixes = 48;
+	physicsCurrent.shadowRanges = 4;
+	physicsCurrent.shadowSubmittedJobs = 4;
+	physicsCurrent.shadowCompletedJobs = 4;
+	physicsCurrent.shadowMatches = 2;
+	AccumulateSkirmishAITestPhysicsMetrics(&physicsBaseline,
+		physicsCurrent, &physicsFrozen, &physicsAwaitingInitialReset);
+	CHECK(physicsFrozen.acceptedBatches == 0 && physicsFrozen.shadowBatches == 2 &&
+		physicsFrozen.shadowPrefixes == 48 && physicsFrozen.shadowMatches == 2);
+
+	rts::ImmutableSpatialRuntimeMetrics spatialBaseline;
+	rts::ImmutableSpatialRuntimeMetrics spatialCurrent;
+	rts::ImmutableSpatialRuntimeMetrics spatialFrozen;
+#if defined(_WIN64)
+	const Bool physicsBatchAttempted = FALSE;
+	const Bool earlierNormalMoverIsSpatialConsumer = FALSE;
+	const Bool followingAutoHealIsSpatialConsumer = TRUE;
+	CHECK(!ShouldCaptureLiveImmutableSpatialArena(FALSE,
+		earlierNormalMoverIsSpatialConsumer));
+	CHECK(!physicsBatchAttempted && ShouldCaptureLiveImmutableSpatialArena(FALSE,
+		followingAutoHealIsSpatialConsumer));
+	CHECK(!ShouldCaptureLiveImmutableSpatialArena(TRUE, TRUE));
+	CHECK(!ShouldCaptureLiveImmutableSpatialArena(FALSE, FALSE));
+	unsigned char firstHealToken = 0;
+	unsigned char secondHealToken = 0;
+	Object *stableHealObjects[2] = {
+		reinterpret_cast<Object *>(&firstHealToken),
+		reinterpret_cast<Object *>(&secondHealToken)
+	};
+	StableHealCommitProbe stableHealProbe;
+	CommitLiveImmutableSpatialObjectSequence(stableHealObjects, 2,
+		&RecordStableHealCommit, &stableHealProbe);
+	CHECK(stableHealProbe.count == 2 &&
+		stableHealProbe.secondObservedAfterInvalidation &&
+		stableHealProbe.objects[0] == stableHealObjects[0] &&
+		stableHealProbe.objects[1] == stableHealObjects[1]);
+#endif
+	spatialBaseline.resetEpoch = 70;
+	spatialBaseline.capturedArenas = 90;
+	spatialCurrent = spatialBaseline;
+	Bool spatialAwaitingInitialReset = TRUE;
+	AccumulateSkirmishAITestImmutableSpatialMetrics(&spatialBaseline,
+		spatialCurrent, &spatialFrozen, &spatialAwaitingInitialReset);
+	CHECK(spatialAwaitingInitialReset && spatialFrozen.capturedArenas == 0 &&
+		spatialFrozen.healing.authoritativeQueries == 0);
+	spatialCurrent = rts::ImmutableSpatialRuntimeMetrics();
+	spatialCurrent.resetEpoch = 71;
+	spatialCurrent.capturedArenas = 4;
+	spatialCurrent.successfulCollections = 4;
+	spatialCurrent.successfulCollectionQueries = 20;
+	spatialCurrent.successfulCollectionRanges = 8;
+	spatialCurrent.multiRangeCollections = 4;
+	spatialCurrent.collectionSubmittedJobs = 16;
+	spatialCurrent.collectionCompletedJobs = 16;
+	spatialCurrent.collectionPhysicalWorkerJobs = 16;
+	spatialCurrent.collectionPhysicalWorkerMask = 3;
+	spatialCurrent.maximumCollectionQueries = 5;
+	spatialCurrent.maximumCollectionRanges = 2;
+	spatialCurrent.maximumCollectionDistinctPhysicalWorkers = 2;
+	spatialCurrent.healing.authoritativeQueries = 3;
+	spatialCurrent.healing.authoritativeCandidates = 8;
+	spatialCurrent.healing.submittedJobs = 6;
+	spatialCurrent.healing.completedJobs = 6;
+	spatialCurrent.healing.physicalWorkerJobs = 6;
+	spatialCurrent.pointDefenseLaser.authoritativeQueries = 2;
+	spatialCurrent.pointDefenseLaser.authoritativeCandidates = 5;
+	AccumulateSkirmishAITestImmutableSpatialMetrics(&spatialBaseline,
+		spatialCurrent, &spatialFrozen, &spatialAwaitingInitialReset);
+	CHECK(!spatialAwaitingInitialReset && spatialFrozen.capturedArenas == 4 &&
+		spatialFrozen.successfulCollections == 4 &&
+		spatialFrozen.successfulCollectionQueries == 20 &&
+		spatialFrozen.successfulCollectionRanges == 8 &&
+		spatialFrozen.multiRangeCollections == 4 &&
+		spatialFrozen.collectionSubmittedJobs == 16 &&
+		spatialFrozen.collectionCompletedJobs == 16 &&
+		spatialFrozen.collectionPhysicalWorkerJobs == 16 &&
+		spatialFrozen.collectionOwnerHelpedJobs == 0 &&
+		spatialFrozen.collectionPhysicalWorkerMask == 3 &&
+		spatialFrozen.maximumCollectionQueries == 5 &&
+		spatialFrozen.maximumCollectionRanges == 2 &&
+		spatialFrozen.maximumCollectionDistinctPhysicalWorkers == 2 &&
+		spatialFrozen.healing.authoritativeQueries == 3 &&
+		spatialFrozen.healing.authoritativeCandidates == 8 &&
+		spatialFrozen.healing.physicalWorkerJobs == 6 &&
+		spatialFrozen.pointDefenseLaser.authoritativeQueries == 2 &&
+		spatialFrozen.pointDefenseLaser.authoritativeCandidates == 5);
+	spatialCurrent = rts::ImmutableSpatialRuntimeMetrics();
+	spatialCurrent.resetEpoch = 72;
+	AccumulateSkirmishAITestImmutableSpatialMetrics(&spatialBaseline,
+		spatialCurrent, &spatialFrozen, &spatialAwaitingInitialReset);
+	CHECK(spatialFrozen.capturedArenas == 4 &&
+		spatialFrozen.successfulCollections == 4 &&
+		spatialFrozen.maximumCollectionRanges == 2 &&
+		spatialFrozen.collectionPhysicalWorkerMask == 3 &&
+		spatialFrozen.maximumCollectionDistinctPhysicalWorkers == 2 &&
+		spatialFrozen.healing.authoritativeQueries == 3 &&
+		spatialFrozen.pointDefenseLaser.authoritativeQueries == 2);
+	spatialBaseline = spatialCurrent;
+	spatialFrozen = rts::ImmutableSpatialRuntimeMetrics();
+	spatialAwaitingInitialReset = TRUE;
+	spatialCurrent.resetEpoch = 73;
+	AccumulateSkirmishAITestImmutableSpatialMetrics(&spatialBaseline,
+		spatialCurrent, &spatialFrozen, &spatialAwaitingInitialReset);
+	CHECK(!spatialAwaitingInitialReset && spatialFrozen.healing.shadowQueries == 0);
+	spatialCurrent.healing.shadowQueries = 2;
+	spatialCurrent.healing.shadowMatches = 2;
+	spatialCurrent.pointDefenseLaser.shadowQueries = 3;
+	spatialCurrent.pointDefenseLaser.shadowMatches = 3;
+	AccumulateSkirmishAITestImmutableSpatialMetrics(&spatialBaseline,
+		spatialCurrent, &spatialFrozen, &spatialAwaitingInitialReset);
+	CHECK(spatialFrozen.healing.shadowQueries == 2 &&
+		spatialFrozen.healing.shadowMatches == 2 &&
+		spatialFrozen.pointDefenseLaser.shadowQueries == 3 &&
+		spatialFrozen.pointDefenseLaser.shadowMatches == 3);
+#endif
+
 	CommandLineData commandLineData;
 	CHECK(!commandLineData.hasSkirmishAITestRequest());
 	CHECK(commandLineData.getSkirmishAITestSeed() == 0);
@@ -1388,6 +2441,7 @@ static void TestSkirmishAITestRunnerContract()
 	CHECK(commandLineData.getSkirmishAITestSeed() == 1729);
 	CHECK(!commandLineData.requestSkirmishAITest(1730));
 	CHECK(!commandLineData.requestSkirmishAITest4v2(1730));
+	CHECK(!commandLineData.requestSkirmishAITestPractical1v7(1730));
 
 	CommandLineData commandLineData4v2;
 	CHECK(commandLineData4v2.requestSkirmishAITest4v2(1730));
@@ -1395,6 +2449,17 @@ static void TestSkirmishAITestRunnerContract()
 	CHECK(commandLineData4v2.getSkirmishAITest4v2Seed() == 1730);
 	CHECK(!commandLineData4v2.requestSkirmishAITest4v2(1731));
 	CHECK(!commandLineData4v2.requestSkirmishAITest(1731));
+	CHECK(!commandLineData4v2.requestSkirmishAITestPractical1v7(1731));
+
+	CommandLineData practicalCommandLineData;
+	CHECK(!practicalCommandLineData.hasSkirmishAITestPractical1v7Request());
+	CHECK(practicalCommandLineData.getSkirmishAITestPractical1v7Seed() == 0);
+	CHECK(practicalCommandLineData.requestSkirmishAITestPractical1v7(1732));
+	CHECK(practicalCommandLineData.hasSkirmishAITestPractical1v7Request());
+	CHECK(practicalCommandLineData.getSkirmishAITestPractical1v7Seed() == 1732);
+	CHECK(!practicalCommandLineData.requestSkirmishAITest(1733));
+	CHECK(!practicalCommandLineData.requestSkirmishAITest4v2(1733));
+	CHECK(!practicalCommandLineData.requestSkirmishAITestPractical1v7(1733));
 
 	CHECK(!IsSkirmishAITestRunnerArmed());
 	CHECK(!ShouldBypassFramePacingForSkirmishAITest(FALSE));
@@ -1409,6 +2474,19 @@ static void TestSkirmishAITestRunnerContract()
 	CHECK(!TryParseSkirmishAITestSeed("12x", &seed));
 	CHECK(!TryParseSkirmishAITestSeed("2147483648", &seed));
 	CHECK(!TryParseSkirmishAITestSeed("1", nullptr));
+	const char *executableHash =
+		"0123456789abcdef0123456789ABCDEF0123456789abcdef0123456789ABCDEF";
+	CHECK(SetSkirmishAITestExecutableHashInput(executableHash));
+	CHECK(!SetSkirmishAITestExecutableHashInput(nullptr));
+	CHECK(!SetSkirmishAITestExecutableHashInput("0123456789abcdef"));
+	CHECK(!SetSkirmishAITestExecutableHashInput(
+		"G123456789abcdef0123456789ABCDEF0123456789abcdef0123456789ABCDEF"));
+	CHECK(SetSkirmishAITestSimulationModeInput("serial"));
+	CHECK(SetSkirmishAITestSimulationModeInput("parallel"));
+	CHECK(SetSkirmishAITestSimulationModeInput("shadow"));
+	CHECK(!SetSkirmishAITestSimulationModeInput(nullptr));
+	CHECK(!SetSkirmishAITestSimulationModeInput("automatic"));
+	SetSkirmishAITestFinalDigest(0x12345678U);
 
 	SkirmishAITestPlan plan;
 	BuildSkirmishAITestPlan(1729, &plan);
@@ -1514,9 +2592,34 @@ static void TestSkirmishAITestRunnerContract()
 	CHECK(!IsValidSkirmishAITestReplayResult(42000, 42001, FALSE, FALSE, 200, 199));
 }
 
+#if defined(_WIN64)
+int RunHeadlessMetricStartupTitleTests();
+int RunPerformanceReceiptOwnerBridgeTitleTests();
+int RunPerformanceReceiptProducerTitleTests();
+#endif
+
 int main(int argc, char **argv)
 {
+#if defined(_WIN64)
+	if (argc == 2 && strcmp(argv[1], "--headless-metric-startup") == 0)
+		return RunHeadlessMetricStartupTitleTests();
+	if (argc == 2 && strcmp(argv[1], "--performance-receipt-owner-bridge") == 0)
+		return RunPerformanceReceiptOwnerBridgeTitleTests();
+	if (argc == 2 && strcmp(argv[1], "--performance-receipt-producer") == 0)
+		return RunPerformanceReceiptProducerTitleTests();
+	if (argc == 2 && strcmp(argv[1], "--performance-receipt-lifecycle") == 0)
+	{
+		TestPerformanceReceiptOwnerLifecycle();
+		return s_failures != 0 ? 1 : 0;
+	}
+#endif
 	initMemoryManager();
+	if (argc == 2 && strcmp(argv[1], "--xfer-crc-snapshot") == 0)
+	{
+		const int result = RunXferCrcSnapshotTests();
+		shutdownMemoryManager();
+		return result;
+	}
 #if defined(_WIN64)
 	if (argc == 2 && strcmp(argv[1], "--native-logical-audio") == 0)
 	{

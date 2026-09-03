@@ -1,5 +1,6 @@
 #include "W3DDevice/GameClient/W3DScreenshotCodec.h"
 #include "Lib/JobSystem.h"
+#include "../TestSupport/LocalCapacityTestLane.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -249,7 +250,8 @@ private:
 	WorkerGate *m_gate;
 };
 
-static int checkParallelConversion(const ScreenshotPixelSource &source, const char *testName)
+static int checkParallelConversion(const ScreenshotPixelSource &source,
+	const char *testName, bool localCapacity)
 {
 	ScreenshotRowRange ranges[16];
 	rts::Job *tasks[16];
@@ -272,16 +274,21 @@ static int checkParallelConversion(const ScreenshotPixelSource &source, const ch
 		workerIndex < sizeof(workerCounts) / sizeof(workerCounts[0]);
 		++workerIndex)
 	{
+		const unsigned effectiveWorkerCount =
+			rts_test::ResolveActualWorkerCount(workerCounts[workerIndex],
+			localCapacity);
+		rts_test::PrintWorkerCountSubstitution(testName,
+			workerCounts[workerIndex], effectiveWorkerCount, localCapacity);
 		memset(striped, 0xCD, byteCount);
 		rts::JobSystemConfig config;
-		config.workerCount = workerCounts[workerIndex];
+		config.workerCount = effectiveWorkerCount;
 		config.queueCapacity = 16;
 		config.scratchBytesPerWorker = 4096;
 		config.pinWorkers = false;
 		if (!system.start(config))
 		{
 			fprintf(stderr, "%s: failed to start %u-worker runtime\n",
-				testName, workerCounts[workerIndex]);
+				testName, effectiveWorkerCount);
 			result = 1;
 			continue;
 		}
@@ -290,7 +297,7 @@ static int checkParallelConversion(const ScreenshotPixelSource &source, const ch
 			3 : actualWorkerCount;
 		WorkerGate gate(observedTarget);
 		result |= check(actualWorkerCount != 0 &&
-			actualWorkerCount <= workerCounts[workerIndex], testName,
+			actualWorkerCount <= effectiveWorkerCount, testName,
 			"screenshot worker count respects the requested upper bound");
 		if (actualWorkerCount == 1)
 		{
@@ -347,7 +354,7 @@ static int checkParallelConversion(const ScreenshotPixelSource &source, const ch
 	return result;
 }
 
-static int testArgb32ParallelConversionMatchesSerial()
+static int testArgb32ParallelConversionMatchesSerial(bool localCapacity)
 {
 	const char *testName = "testArgb32ParallelConversionMatchesSerial";
 	const unsigned width = 3;
@@ -370,10 +377,10 @@ static int testArgb32ParallelConversionMatchesSerial()
 	source.height = height;
 	source.pitch = pitch;
 	source.format = SCREENSHOT_SOURCE_ARGB32;
-	return checkParallelConversion(source, testName);
+	return checkParallelConversion(source, testName, localCapacity);
 }
 
-static int testRgb565ParallelConversionMatchesSerial()
+static int testRgb565ParallelConversionMatchesSerial(bool localCapacity)
 {
 	const char *testName = "testRgb565ParallelConversionMatchesSerial";
 	const unsigned width = 5;
@@ -398,7 +405,7 @@ static int testRgb565ParallelConversionMatchesSerial()
 	source.height = height;
 	source.pitch = pitch;
 	source.format = SCREENSHOT_SOURCE_RGB565;
-	return checkParallelConversion(source, testName);
+	return checkParallelConversion(source, testName, localCapacity);
 }
 
 static int testArgb32SerialConversionUsesPitch()
@@ -486,14 +493,21 @@ static int testRowRangeLeavesOtherRowsUntouched()
 	return 0;
 }
 
-int main()
+int main(int argc, char **argv)
 {
+	bool localCapacity = false;
+	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity))
+	{
+		fprintf(stderr, "Usage: core_screenshot_codec_tests [--local-capacity]\n");
+		return 2;
+	}
+	rts_test::PrintTestCapacityLane(localCapacity);
 	int result = 0;
 	result |= testRowRangePlanning();
 	result |= testArgb32SerialConversionUsesPitch();
 	result |= testRgb565SerialConversionUsesPitch();
 	result |= testRowRangeLeavesOtherRowsUntouched();
-	result |= testArgb32ParallelConversionMatchesSerial();
-	result |= testRgb565ParallelConversionMatchesSerial();
+	result |= testArgb32ParallelConversionMatchesSerial(localCapacity);
+	result |= testRgb565ParallelConversionMatchesSerial(localCapacity);
 	return result;
 }

@@ -30,13 +30,36 @@
 #include "Lib/BaseType.h"
 #include "WWLib/always.h"
 #include "W3DDevice/GameClient/W3DSmudge.h"
-#include "W3DDevice/GameClient/W3DShaderManager.h"
 #include "Common/GameMemory.h"
 #include "GameClient/View.h"
 #include "GameClient/Display.h"
 #include "WW3D2/texture.h"
+#include "WW3D2/dx8vertexbuffer.h"
 #include "WW3D2/dx8indexbuffer.h"
-#include "WW3D2/dx8wrapper.h"
+#include "WW3D2/vertmaterial.h"
+#include "Renderer/RenderGameClient.h"
+
+// Keep the source-level contract explicit without importing the renderer namespace.
+using rts::render::GAME_BUFFER_TYPE_DYNAMIC_IMMEDIATE;
+using rts::render::GAME_TEXTURE_STAGE_ADDRESS_U;
+using rts::render::GAME_TEXTURE_STAGE_ADDRESS_V;
+using rts::render::GAME_TEXTURE_STAGE_ADDRESS_W;
+using rts::render::GAME_TEXTURE_STAGE_ALPHA_OPERATION;
+using rts::render::GAME_TEXTURE_STAGE_COLOR_OPERATION;
+using rts::render::GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER;
+using rts::render::GAME_TEXTURE_STAGE_MINIFICATION_FILTER;
+using rts::render::GAME_TEXTURE_STAGE_MIP_FILTER;
+using rts::render::GAME_TRANSFORM_VIEW;
+using rts::render::GAME_TRANSFORM_WORLD;
+using rts::render::RENDER_FORMAT_B8G8R8A8_UNORM;
+using rts::render::RENDER_RESULT_OK;
+using rts::render::RENDER_TEXTURE_ADDRESS_CLAMP;
+using rts::render::RENDER_TEXTURE_FILTER_LINEAR;
+using rts::render::RENDER_TEXTURE_FILTER_NONE;
+using rts::render::RENDER_TEXTURE_OP_MODULATE;
+using rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_1;
+using rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_2;
+
 #include "WW3D2/rinfo.h"
 #include "WW3D2/camera.h"
 #include "WW3D2/sortingrenderer.h"
@@ -80,34 +103,19 @@ void W3DSmudgeManager::ReAcquireResources()
 {
 	ReleaseResources();
 
-	SurfaceClass::SurfaceDescription surface_desc;
-	if (DX8Wrapper::Is_D3D11_Backend_Active())
+	rts::render::RenderBackBufferInfo back_buffer_info;
+	if (rts::render::GetGameBackBufferInfo(&back_buffer_info) !=
+		rts::render::RENDER_RESULT_OK || back_buffer_info.width == 0 ||
+		back_buffer_info.height == 0 ||
+		back_buffer_info.format != rts::render::RENDER_FORMAT_B8G8R8A8_UNORM)
 	{
-		rts::render::RenderBackBufferInfo back_buffer_info;
-		if (DX8Wrapper::Get_Render_Back_Buffer_Info(&back_buffer_info) !=
-			rts::render::RENDER_RESULT_OK || back_buffer_info.width == 0 ||
-			back_buffer_info.height == 0 || back_buffer_info.format !=
-			rts::render::RENDER_FORMAT_B8G8R8A8_UNORM)
-		{
-			return;
-		}
-		surface_desc.Width = back_buffer_info.width;
-		surface_desc.Height = back_buffer_info.height;
-		// The legacy texture remains the sampling object, while its renderer
-		// mirror is created with the swap-chain's B8G8R8A8-compatible format.
-		surface_desc.Format = WW3D_FORMAT_A8R8G8B8;
-	}
-	else
-	{
-		SurfaceClass *surface=DX8Wrapper::_Get_DX8_Back_Buffer();
-		if (!surface)
-		{
-			return;
-		}
-		surface->Get_Description(surface_desc);
-		REF_PTR_RELEASE(surface);
+		return;
 	}
 
+	SurfaceClass::SurfaceDescription surface_desc;
+	surface_desc.Width = back_buffer_info.width;
+	surface_desc.Height = back_buffer_info.height;
+	surface_desc.Format = WW3D_FORMAT_A8R8G8B8;
 	m_backgroundTexture = MSGNEW("TextureClass") TextureClass(surface_desc.Width,surface_desc.Height,surface_desc.Format,MIP_LEVELS_1,TextureClass::POOL_DEFAULT, true);
 
 	m_backBufferWidth = surface_desc.Width;
@@ -152,197 +160,18 @@ void W3DSmudgeManager::ReAcquireResources()
 }
 
 /*Copies a portion of the current render target into a specified buffer*/
-Int copyRect(unsigned char *buf, Int bufSize, int oX, int oY, int width, int height)
-{
-	if (DX8Wrapper::Is_D3D11_Backend_Active())
-	{
-		// This helper reads a legacy surface. D3D11 smudge capture uses the
-		// renderer-owned copy path instead, so never probe the hidden DX8 target.
-		return 0;
-	}
-
- 	IDirect3DSurface8 *surface=nullptr;	///<previous render target
- 	IDirect3DSurface8 *tempSurface=nullptr;
-	Int result = 0;
-	HRESULT hr = S_OK;
-
- 	LPDIRECT3DDEVICE8 m_pDev=DX8Wrapper::_Get_D3D_Device8();
-
-	if (!m_pDev)
-		goto error;
-
- 	m_pDev->GetRenderTarget(&surface);
-
-	if (!surface)
-		goto error;
-
- 	D3DSURFACE_DESC desc;
-
- 	surface->GetDesc(&desc);
-
-	RECT srcRect;
-	srcRect.left=oX;
-	srcRect.top=oY;
-	srcRect.right=oX+width;
-	srcRect.bottom=oY+height;
-
-	POINT dstPoint;
-	dstPoint.x=0;
-	dstPoint.y=0;
-
- 	hr=m_pDev->CreateImageSurface(  width, height, desc.Format, &tempSurface);
-
-	if (hr != S_OK)
-		goto error;
-
- 	hr=m_pDev->CopyRects(surface,&srcRect,1,tempSurface,&dstPoint);
-
-	if (hr != S_OK)
-		goto error;
-
- 	D3DLOCKED_RECT lrect;
-
- 	hr=tempSurface->LockRect(&lrect,nullptr,D3DLOCK_READONLY);
-
-	if (hr != S_OK)
-		goto error;
-
- 	tempSurface->GetDesc(&desc);
-
-	if (desc.Size < bufSize)
-		bufSize = desc.Size;
-
-	memcpy(buf,lrect.pBits,bufSize);
-	result = bufSize;
-
-	tempSurface->UnlockRect();
-
-error:
-	if (surface)
-		surface->Release();
-	if (tempSurface)
-		tempSurface->Release();
-
-	return result;
-}
-
 #define UNIQUE_COLOR	(0x12345678)
 #define BLOCK_SIZE	(8)
 
 Bool W3DSmudgeManager::testHardwareSupport()
 {
 	if (m_hardwareSupportStatus == SMUDGE_SUPPORT_UNKNOWN)
-	{	//we have not done the test yet.
-		if (DX8Wrapper::Is_D3D11_Backend_Active())
-		{
-			// The D3D11 path validates the actual copy during render.  Its
-			// capability probe must not draw/read a hidden legacy back buffer, since
-			// that target is no longer authoritative for the visible frame.
-			m_hardwareSupportStatus = m_backgroundTexture != nullptr &&
-				m_backgroundTexture->Peek_D3D_Base_Texture() != nullptr ?
-				SMUDGE_SUPPORT_YES : SMUDGE_SUPPORT_NO;
-			return m_hardwareSupportStatus == SMUDGE_SUPPORT_YES;
-		}
-
-		IDirect3DTexture8 *backTexture=W3DShaderManager::getRenderTexture();
-		if (!backTexture || !W3DShaderManager::isRenderingToTexture())
-		{
-			// TheSuperHackers @bugfix When Render-To-Texture is disabled globally, we fallback
-			// to copying the backbuffer to a texture.
-			if (m_backgroundTexture)
-			{
-				m_hardwareSupportStatus = SMUDGE_SUPPORT_YES;
-				return TRUE;
-			}
-
-			m_hardwareSupportStatus = SMUDGE_SUPPORT_NO;
-			return FALSE;
-		}
-
-		VertexMaterialClass *vmat=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
-		DX8Wrapper::Set_Material(vmat);
-		REF_PTR_RELEASE(vmat);	//no need to keep a reference since it's a preset.
-
-		ShaderClass shader=ShaderClass::_PresetOpaqueShader;
-		shader.Set_Depth_Compare(ShaderClass::PASS_ALWAYS);
-		shader.Set_Depth_Mask(ShaderClass::DEPTH_WRITE_DISABLE);
-		DX8Wrapper::Set_Shader(shader);
-		DX8Wrapper::Set_Texture(0,nullptr);
-		DX8Wrapper::Apply_Render_State_Changes();	//force update of view and projection matrices
-
-		struct _TRANS_LIT_TEX_VERTEX {
-			Vector4 p;
-			DWORD color;   // diffuse color
-			float	u;
-			float	v;
-		} v[4];
-
-		//bottom right
-		v[0].p = Vector4( BLOCK_SIZE-0.5f, BLOCK_SIZE-0.5f, 0.0f, 1.0f );
-		v[0].u = BLOCK_SIZE/(Real)TheDisplay->getWidth();
-		v[0].v = BLOCK_SIZE/(Real)TheDisplay->getHeight();
-		//top right
-		v[1].p = Vector4( BLOCK_SIZE-0.5f, 0-0.5f, 0.0f, 1.0f );
-		v[1].u = BLOCK_SIZE/(Real)TheDisplay->getWidth();
-		v[1].v = 0;
-		//bottom left
-		v[2].p = Vector4(  0-0.5f, BLOCK_SIZE-0.5f, 0.0f, 1.0f );
-		v[2].u = 0;
-		v[2].v = BLOCK_SIZE/(Real)TheDisplay->getHeight();
-		//top left
-		v[3].p = Vector4(  0-0.5f,  0-0.5f, 0.0f, 1.0f );
-		v[3].u = 0;
-		v[3].v = 0;
-
-		v[0].color = UNIQUE_COLOR;
-		v[1].color = UNIQUE_COLOR;
-		v[2].color = UNIQUE_COLOR;
-		v[3].color = UNIQUE_COLOR;
-
-		//draw polygons like this is very inefficient but for only 2 triangles, it's
-		//not worth bothering with index/vertex buffers.
-		DX8Wrapper::Set_Vertex_Shader(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
-
-		DX8Wrapper::Draw_Primitive_UP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
-
-		DWORD refData[BLOCK_SIZE*BLOCK_SIZE];
-		memset(refData,0,sizeof(refData));
-		Int bufSize=copyRect((unsigned char *)refData,sizeof(refData),0,0,BLOCK_SIZE,BLOCK_SIZE);	//copy area we just rendered using solid color
-		if (!bufSize)
-		{
-			m_hardwareSupportStatus = SMUDGE_SUPPORT_NO;
-			return FALSE;
-		}
-
-		DX8Wrapper::Set_DX8_Texture(0,backTexture);
-
-		DWORD testData[BLOCK_SIZE*BLOCK_SIZE];
-		memset(testData,0xff,sizeof(testData));
-
-		v[0].color = 0xffffffff;
-		v[1].color = 0xffffffff;
-		v[2].color = 0xffffffff;
-		v[3].color = 0xffffffff;
-
-		DX8Wrapper::Draw_Primitive_UP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
-		bufSize=copyRect((unsigned char *)testData,sizeof(testData),0,0,BLOCK_SIZE,BLOCK_SIZE);
-
-		if (!bufSize)
-		{
-			m_hardwareSupportStatus = SMUDGE_SUPPORT_NO;
-			return FALSE;
-		}
-
-		//compare the 2 buffers to see if they match.
-		if (memcmp(testData,refData,bufSize) == 0)
-		{
-			m_hardwareSupportStatus = SMUDGE_SUPPORT_YES;
-			return TRUE;
-		}
-		m_hardwareSupportStatus = SMUDGE_SUPPORT_NO;
+	{
+		m_hardwareSupportStatus = m_backgroundTexture != nullptr &&
+			m_backgroundTexture->Is_Initialized() ?
+			SMUDGE_SUPPORT_YES : SMUDGE_SUPPORT_NO;
 	}
-
-	return (SMUDGE_SUPPORT_YES == m_hardwareSupportStatus);
+	return SMUDGE_SUPPORT_YES == m_hardwareSupportStatus;
 }
 
 void W3DSmudgeManager::render(RenderInfoClass &rinfo)
@@ -360,38 +189,18 @@ void W3DSmudgeManager::render(RenderInfoClass &rinfo)
 		return;
 	}
 
-	const bool d3d11_active = DX8Wrapper::Is_D3D11_Backend_Active();
-	SurfaceClass *backBuffer = nullptr;
-	SurfaceClass *background = nullptr;
+	rts::render::RenderBackBufferInfo back_buffer_info;
+	if (rts::render::GetGameBackBufferInfo(&back_buffer_info) !=
+		rts::render::RENDER_RESULT_OK || back_buffer_info.width == 0 ||
+		back_buffer_info.height == 0 ||
+		back_buffer_info.format != rts::render::RENDER_FORMAT_B8G8R8A8_UNORM)
+	{
+		return;
+	}
 	SurfaceClass::SurfaceDescription surface_desc;
-	if (d3d11_active)
-	{
-		rts::render::RenderBackBufferInfo back_buffer_info;
-		if (DX8Wrapper::Get_Render_Back_Buffer_Info(&back_buffer_info) !=
-			rts::render::RENDER_RESULT_OK || back_buffer_info.width == 0 ||
-			back_buffer_info.height == 0)
-		{
-			return;
-		}
-		surface_desc.Width = back_buffer_info.width;
-		surface_desc.Height = back_buffer_info.height;
-		surface_desc.Format = WW3D_FORMAT_A8R8G8B8;
-	}
-	else
-	{
-		backBuffer = DX8Wrapper::_Get_DX8_Back_Buffer();
-		if (!backBuffer)
-			return;
-		background = m_backgroundTexture ?
-			m_backgroundTexture->Get_Surface_Level() : nullptr;
-		if (!background)
-		{
-			REF_PTR_RELEASE(backBuffer);
-			return;
-		}
-		backBuffer->Get_Description(surface_desc);
-	}
-
+	surface_desc.Width = back_buffer_info.width;
+	surface_desc.Height = back_buffer_info.height;
+	surface_desc.Format = WW3D_FORMAT_A8R8G8B8;
 	CameraClass &camera=rinfo.Camera;
 	Vector3 vsVert;
 	Vector4 ssVert;
@@ -487,64 +296,45 @@ void W3DSmudgeManager::render(RenderInfoClass &rinfo)
 
 	if (!count)
 	{
-		REF_PTR_RELEASE(background);
-		REF_PTR_RELEASE(backBuffer);
 		return;	//nothing to render.
 	}
 
-	// Copy the visible color target into an alternate buffer. D3D11 must use a
-	// GPU copy from its active target; the legacy path retains its legacy copy and
-	// invalidation behavior for the differential renderer.
-	if (d3d11_active)
+	// Copy the visible color target into an alternate buffer through the
+	// renderer contract. The backend owns synchronization and resource
+	// transition; this call fails closed when the active target is unavailable.
+	if (m_backgroundTexture == nullptr || !m_backgroundTexture->Is_Initialized() ||
+		rts::render::CopyGameActiveTargetToTexture(m_backgroundTexture) !=
+		rts::render::RENDER_RESULT_OK)
 	{
-		if (m_backgroundTexture == nullptr ||
-			m_backgroundTexture->Peek_D3D_Base_Texture() == nullptr)
-		{
-			return;
-		}
-		const rts::render::RenderResult copy_result =
-			DX8Wrapper::Copy_Active_Render_Target_To_Texture(
-				m_backgroundTexture->Peek_D3D_Base_Texture());
-		if (copy_result != rts::render::RENDER_RESULT_OK)
-		{
-			return;
-		}
-	}
-	else
-	{
-		background->Copy(0,0,0,0,surface_desc.Width,surface_desc.Height,backBuffer);
-		Notify_Render_Texture_Changed(
-			m_backgroundTexture->Peek_D3D_Base_Texture());
+		return;
 	}
 
-	REF_PTR_RELEASE(background);
-	REF_PTR_RELEASE(backBuffer);
 
 	Matrix4x4 identity(true);
-	DX8Wrapper::Set_Transform(D3DTS_WORLD,identity);
-	DX8Wrapper::Set_Transform(D3DTS_VIEW,identity);
+	rts::render::SetGameTransform(GAME_TRANSFORM_WORLD,identity);
+	rts::render::SetGameTransform(GAME_TRANSFORM_VIEW,identity);
 
-	DX8Wrapper::Set_Index_Buffer(m_indexBuffer,0);
-	//DX8Wrapper::Set_Shader(ShaderClass::_PresetOpaqueSpriteShader);
+	rts::render::SetGameIndexBuffer(m_indexBuffer,0);
+	//rts::render::SetGameShader(ShaderClass::_PresetOpaqueSpriteShader);
 
-	DX8Wrapper::Set_Shader(ShaderClass::_PresetAlphaShader);
+	rts::render::SetGameShader(ShaderClass::_PresetAlphaShader);
 
-	DX8Wrapper::Set_Texture(0,m_backgroundTexture);
+	rts::render::SetGameTexture(0,m_backgroundTexture);
 	//Need these states in case texture is non-power-of-2
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ADDRESSW, D3DTADDRESS_CLAMP);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_MIPFILTER, D3DTEXF_NONE);
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_CLAMP);
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_CLAMP);
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ADDRESS_W, RENDER_TEXTURE_ADDRESS_CLAMP);
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_NONE);
 	VertexMaterialClass *vmat=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
-	DX8Wrapper::Set_Material(vmat);
+	rts::render::SetGameMaterial(vmat);
 	REF_PTR_RELEASE(vmat);
-	DX8Wrapper::Apply_Render_State_Changes();
+	rts::render::ApplyGameRenderStateChanges();
 
 	//Disable reading texture alpha since it's undefined.
-	//DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_COLOROP,D3DTOP_SELECTARG1);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_ALPHAOP,D3DTOP_SELECTARG2);
+	//rts::render::SetGameTextureStageState(0,GAME_TEXTURE_STAGE_COLOR_OPERATION,RENDER_TEXTURE_OP_SELECT_ARGUMENT_1);
+	rts::render::SetGameTextureStageState(0,GAME_TEXTURE_STAGE_ALPHA_OPERATION,RENDER_TEXTURE_OP_SELECT_ARGUMENT_2);
 
 	Int smudgesRemaining=count;
 	setIt=m_usedSmudgeSetList.begin();	//first smudge set that needs rendering.
@@ -560,7 +350,7 @@ void W3DSmudgeManager::render(RenderInfoClass &rinfo)
 
 		Int smudgesInRenderBatch=0;
 
-		DynamicVBAccessClass vb_access(BUFFER_TYPE_DYNAMIC_DX8,dynamic_fvf_type,count*5);	//allocate 5 verts per smudge.
+		DynamicVBAccessClass vb_access(GAME_BUFFER_TYPE_DYNAMIC_IMMEDIATE,dynamic_fvf_type,count*5);	//allocate 5 verts per smudge.
 		{
 			DynamicVBAccessClass::WriteLockClass lock(&vb_access);
 			VertexFormatXYZNDUV2* verts=lock.Get_Formatted_Vertex_Array();
@@ -616,23 +406,14 @@ void W3DSmudgeManager::render(RenderInfoClass &rinfo)
 		}
 
 flushSmudges:
-		DX8Wrapper::Set_Vertex_Buffer(vb_access);
+		rts::render::SetGameVertexBuffer(vb_access);
 
-		DX8Wrapper::Draw_Triangles(0,smudgesInRenderBatch*4, 0, smudgesInRenderBatch*5);
+		rts::render::DrawGameTriangles(0,smudgesInRenderBatch*4, 0, smudgesInRenderBatch*5);
 
-//Debug Code which draws outline around smudge
-/*		DX8Wrapper::_Get_D3D_Device8()->SetRenderState(D3DRS_FILLMODE,D3DFILL_WIREFRAME);
-		DX8Wrapper::_Get_D3D_Device8()->SetRenderState(D3DRS_ALPHABLENDENABLE,FALSE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_COLOROP,D3DTOP_SELECTARG2);
-		DX8Wrapper::Draw_Triangles(	0,smudgesInRenderBatch*4, 0, smudgesInRenderBatch*5);
-		DX8Wrapper::_Get_D3D_Device8()->SetRenderState(D3DRS_FILLMODE,D3DFILL_SOLID);
-		DX8Wrapper::_Get_D3D_Device8()->SetRenderState(D3DRS_ALPHABLENDENABLE,TRUE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_COLOROP,D3DTOP_SELECTARG1);
-*/
 		smudgesRemaining -= smudgesInRenderBatch;
 	}
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_COLOROP,D3DTOP_MODULATE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_ALPHAOP,D3DTOP_MODULATE);
+	rts::render::SetGameTextureStageState(0,GAME_TEXTURE_STAGE_COLOR_OPERATION,RENDER_TEXTURE_OP_MODULATE);
+	rts::render::SetGameTextureStageState(0,GAME_TEXTURE_STAGE_ALPHA_OPERATION,RENDER_TEXTURE_OP_MODULATE);
 
 }

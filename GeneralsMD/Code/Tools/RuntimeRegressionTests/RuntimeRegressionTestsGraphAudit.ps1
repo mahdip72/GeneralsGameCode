@@ -129,7 +129,7 @@ function Assert-RequiredDependencies {
     foreach ($required in @(
             'core_debug',
             'core_profile_legacy',
-            'rts_legacy_product_runtime',
+            'rts_product_runtime',
             'z_gameengine',
             'z_gameenginedevice',
             'zi_always')) {
@@ -491,7 +491,8 @@ function Assert-InstallPrefixContract {
         [switch]$RequireRuntimeRegressionInstall
     )
 
-    $prefixPattern = '^if\(\s*' + [regex]::Escape($EffectivePrefix) + '\s*\)$'
+    $prefixPattern = '^if\(\s*' + [regex]::Escape($EffectivePrefix) +
+        '\s+AND\s+TARGET\s+' + [regex]::Escape($MainTarget) + '\s*\)$'
     $mainInstallPattern = '(?im)^\s*install\s*\(\s*TARGETS\s+' + [regex]::Escape($MainTarget) + '\b'
     $prefixBlock = Get-CMakeIfBlock $Content $prefixPattern "$Context install prefix" $mainInstallPattern
 
@@ -523,41 +524,77 @@ function Assert-RuntimeRegressionSourceContract {
 
     $cmakePath = Join-Path $SourceRoot 'GeneralsMD/Code/Tools/RuntimeRegressionTests/CMakeLists.txt'
     $runtimeCmake = Get-Content -LiteralPath $cmakePath -Raw
-    $win32Condition = '^if\(\s*CMAKE_SIZEOF_VOID_P\s+EQUAL\s+4\s*\)$'
-    $win32Block = Get-CMakeIfBlock $runtimeCmake $win32Condition 'runtime regression Win32 lane'
-
-    $win32LinkCommands = @(Get-CMakeTargetLinkCommandTexts $win32Block.BodyLines)
-    $win32Dependencies = @($win32LinkCommands | ForEach-Object {
+    $linkCommands = @(Get-CMakeTargetLinkCommandTexts ($runtimeCmake -split "`r?`n"))
+    $dependencies = @($linkCommands | ForEach-Object {
             Get-CommandDependencyTokens $_
         })
-    foreach ($required in @('d3d8', 'd3dx8', 'milesstub')) {
-        if ($win32Dependencies -notcontains $required) {
-            throw "The legacy Win32 runtime regression lane is missing '$required'."
+    foreach ($required in @('rts_product_runtime', 'z_gameengine', 'z_gameenginedevice')) {
+        if ($dependencies -notcontains $required) {
+            throw "The runtime regression target is missing architecture-selected dependency '$required'."
         }
     }
-
-    $binkCondition = '^if\(\s*NOT\s+RTS_BUILD_OPTION_FFMPEG\s*\)$'
-    $binkBlock = Get-CMakeIfBlock $win32Block.BodyText $binkCondition 'runtime regression Win32 Bink lane'
-    $binkDependencies = @((Get-CMakeTargetLinkCommandTexts $binkBlock.BodyLines) | ForEach-Object {
-            Get-CommandDependencyTokens $_
-        })
-    if ($binkDependencies -notcontains 'binkstub') {
-        throw 'The legacy Win32 Bink compatibility condition does not link binkstub.'
+    Assert-NoForbiddenDependencies $dependencies 'Runtime regression source link lane'
+    if ($runtimeCmake -match '\brts_(?:legacy|native)_product_runtime\b') {
+        throw 'The runtime regression target bypasses the architecture-selected product boundary.'
     }
+}
 
-    Assert-ExactElseBranch $win32Block 'The runtime regression target'
-    $x64LinkCommands = @(Get-CMakeTargetLinkCommandTexts $win32Block.ElseBodyLines)
-    $x64Dependencies = @($x64LinkCommands | ForEach-Object {
-            Get-CommandDependencyTokens $_
-        })
-    foreach ($required in @('rts_legacy_product_runtime', 'z_gameengine', 'z_gameenginedevice')) {
-        if ($x64Dependencies -notcontains $required) {
-            throw "The native x64 runtime regression lane is missing '$required'."
+function Assert-NoRegistryInstallFallback {
+    param(
+        [Parameter(Mandatory = $true)][string]$Content,
+        [Parameter(Mandatory = $true)][string]$Context,
+        [Parameter(Mandatory = $true)][string]$EffectivePrefix,
+        [Parameter(Mandatory = $true)][string]$RegistryPrefix
+    )
+
+    $fallbackPattern = '(?is)set\s*\(\s*' + [regex]::Escape($EffectivePrefix) +
+        '\s+"\$\{' + [regex]::Escape($RegistryPrefix) + '\}"\s*\)'
+    if ($Content -match $fallbackPattern) {
+        throw "'$Context' still promotes the HKLM registry value into an install destination."
+    }
+}
+
+function Assert-Vc6InstallPrefixContract {
+    param(
+        [Parameter(Mandatory = $true)][string]$Content,
+        [Parameter(Mandatory = $true)][string]$Context,
+        [Parameter(Mandatory = $true)][string]$TitleOption,
+        [Parameter(Mandatory = $true)][string]$Prefix
+    )
+
+    $guardPattern = '(?ms)^if\(IS_VS6_BUILD\s+AND\s+RTS_BUILD_' +
+        [regex]::Escape($TitleOption) + '_PRODUCT\)\s*' +
+        'rts_validate_task_owned_vc6_install_prefix\s*\(\s*"\$\{' +
+        [regex]::Escape($Prefix) + '\}"\s+"' + [regex]::Escape($Prefix) +
+        '"\s*\)\s*endif\(\)'
+    if ($Content -notmatch $guardPattern) {
+        throw "'$Context' does not validate an explicit task-owned $Prefix before a VC6 product install."
+    }
+}
+
+function Assert-Vc6InstallPrefixValidatorContract {
+    param(
+        [Parameter(Mandatory = $true)][string]$Content,
+        [Parameter(Mandatory = $true)][string]$Context
+    )
+
+    if ($Content -notmatch '(?ms)function\(rts_validate_task_owned_vc6_install_prefix\s+prefix\s+variable_name\).*?endfunction\(\)') {
+        throw "'$Context' does not define the VC6 task-owned install-prefix validator."
+    }
+    foreach ($requiredPattern in @(
+            'if\("\$\{prefix\}"\s+STREQUAL\s+""\)',
+            'if\(NOT\s+IS_ABSOLUTE\s+"\$\{prefix\}"\)',
+            'RTS_TASK_OWNED_INSTALL_ROOT',
+            'RTS_APPROVED_SCRATCH_ROOT',
+            'file\(REAL_PATH',
+            '_rts_path_is_under',
+            'program files',
+            'steamapps',
+            'generalsgamecode-',
+            'junctions')) {
+        if ($Content -notmatch $requiredPattern) {
+            throw "'$Context' does not reject unsafe VC6 install-prefix form '$requiredPattern'."
         }
-    }
-    Assert-NoForbiddenDependencies $x64Dependencies 'Native x64 runtime regression source link lane'
-    if ($win32Block.ElseBodyText -notmatch '(?is)rts_d3d8_headers.*?header-only compatibility boundary') {
-        throw 'The temporary x64 D3D8 header-only compatibility boundary is undocumented.'
     }
 }
 
@@ -605,6 +642,13 @@ function Assert-SourceContracts {
 
     Assert-RuntimeRegressionSourceContract $SourceRoot
     Assert-RegistryMacroContract $SourceRoot
+    $configBuild = Get-Content -LiteralPath (Join-Path $SourceRoot 'cmake/config-build.cmake') -Raw
+    if ($configBuild -notmatch '(?im)^include\(\$\{CMAKE_CURRENT_LIST_DIR\}/task-owned-install-prefix\.cmake\)\s*$') {
+        throw 'cmake/config-build.cmake does not include the task-owned VC6 install-prefix validator.'
+    }
+    Assert-Vc6InstallPrefixValidatorContract `
+        (Get-Content -LiteralPath (Join-Path $SourceRoot 'cmake/task-owned-install-prefix.cmake') -Raw) `
+        'cmake/task-owned-install-prefix.cmake'
 
     $toolsCmake = Get-Content -LiteralPath (Join-Path $SourceRoot 'GeneralsMD/Code/Tools/CMakeLists.txt') -Raw
     if ($toolsCmake -notmatch '(?ms)^if\(RTS_BUILD_ZEROHOUR_EXTRAS\s+OR\s+\(CMAKE_SIZEOF_VOID_P\s+EQUAL\s+8\s+AND\s+RTS_BUILD_PRODUCT\)\)\s*add_subdirectory\(RuntimeRegressionTests\)\s*endif\(\)') {
@@ -614,10 +658,14 @@ function Assert-SourceContracts {
     Assert-NativeLauncherBuildContract $SourceRoot 'GeneralsMD' 'ZEROHOUR' 'z_launcher'
 
     foreach ($installContract in @(
-            @{ Path = 'Generals/CMakeLists.txt'; Prefix = 'RTS_INSTALL_PREFIX_GENERALS'; EffectivePrefix = '_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS'; RegistryPrefix = 'RTS_REGISTRY_INSTALL_PREFIX_GENERALS'; MainTarget = 'g_generals'; LauncherTarget = 'g_launcher' },
-            @{ Path = 'GeneralsMD/CMakeLists.txt'; Prefix = 'RTS_INSTALL_PREFIX_ZEROHOUR'; EffectivePrefix = '_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR'; RegistryPrefix = 'RTS_REGISTRY_INSTALL_PREFIX_ZEROHOUR'; MainTarget = 'z_generals'; LauncherTarget = 'z_launcher'; RequireRuntimeRegressionInstall = $true })) {
+            @{ Path = 'Generals/CMakeLists.txt'; Prefix = 'RTS_INSTALL_PREFIX_GENERALS'; EffectivePrefix = '_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS'; RegistryPrefix = 'RTS_REGISTRY_INSTALL_PREFIX_GENERALS'; TitleOption = 'GENERALS'; MainTarget = 'g_generals'; LauncherTarget = 'g_launcher' },
+            @{ Path = 'GeneralsMD/CMakeLists.txt'; Prefix = 'RTS_INSTALL_PREFIX_ZEROHOUR'; EffectivePrefix = '_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR'; RegistryPrefix = 'RTS_REGISTRY_INSTALL_PREFIX_ZEROHOUR'; TitleOption = 'ZEROHOUR'; MainTarget = 'z_generals'; LauncherTarget = 'z_launcher'; RequireRuntimeRegressionInstall = $true })) {
         $installCmake = Get-Content -LiteralPath (Join-Path $SourceRoot $installContract.Path) -Raw
         Assert-RegistryDiscoveryContract $installCmake $installContract.Path $installContract.RegistryPrefix
+        Assert-NoRegistryInstallFallback $installCmake $installContract.Path `
+            $installContract.EffectivePrefix $installContract.RegistryPrefix
+        Assert-Vc6InstallPrefixContract $installCmake $installContract.Path `
+            $installContract.TitleOption $installContract.Prefix
         $requireRuntime = [bool]$installContract.RequireRuntimeRegressionInstall
         if ($requireRuntime) {
             Assert-InstallPrefixContract $installCmake $installContract.EffectivePrefix $installContract.Path $installContract.MainTarget $installContract.LauncherTarget -RequireRuntimeRegressionInstall
@@ -824,6 +872,169 @@ fetch_registry_value("unrelated" "InstallPath" RTS_REGISTRY_INSTALL_PREFIX_ZEROH
     }
     if (-not $extraRegistryCaught) {
         throw 'Self-test accepted an extra unguarded registry fetch.'
+    }
+
+    $registryInstallFallback = @'
+set(_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR
+    "${RTS_REGISTRY_INSTALL_PREFIX_ZEROHOUR}")
+'@
+    $registryInstallFallbackCaught = $false
+    try {
+        Assert-NoRegistryInstallFallback $registryInstallFallback `
+            'Self-test registry install fallback' '_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR' `
+            'RTS_REGISTRY_INSTALL_PREFIX_ZEROHOUR'
+    }
+    catch {
+        $registryInstallFallbackCaught = $true
+    }
+    if (-not $registryInstallFallbackCaught) {
+        throw 'Self-test accepted a registry-derived install destination.'
+    }
+
+    $validVc6InstallPrefixGuard = @'
+if(IS_VS6_BUILD AND RTS_BUILD_ZEROHOUR_PRODUCT)
+    rts_validate_task_owned_vc6_install_prefix(
+        "${RTS_INSTALL_PREFIX_ZEROHOUR}" "RTS_INSTALL_PREFIX_ZEROHOUR")
+endif()
+'@
+    Assert-Vc6InstallPrefixContract $validVc6InstallPrefixGuard `
+        'Self-test valid VC6 install prefix guard' 'ZEROHOUR' 'RTS_INSTALL_PREFIX_ZEROHOUR'
+    $missingVc6InstallPrefixGuard = $validVc6InstallPrefixGuard.Replace(
+        'rts_validate_task_owned_vc6_install_prefix', 'message')
+    $missingVc6InstallPrefixCaught = $false
+    try {
+        Assert-Vc6InstallPrefixContract $missingVc6InstallPrefixGuard `
+            'Self-test missing VC6 install prefix guard' 'ZEROHOUR' 'RTS_INSTALL_PREFIX_ZEROHOUR'
+    }
+    catch {
+        $missingVc6InstallPrefixCaught = $true
+    }
+    if (-not $missingVc6InstallPrefixCaught) {
+        throw 'Self-test accepted a VC6 product install without explicit prefix validation.'
+    }
+
+    $validVc6PrefixValidator = @'
+function(rts_validate_task_owned_vc6_install_prefix prefix variable_name)
+    if("${prefix}" STREQUAL "")
+    endif()
+    if(NOT IS_ABSOLUTE "${prefix}")
+    endif()
+    if(NOT DEFINED RTS_TASK_OWNED_INSTALL_ROOT)
+    endif()
+    if(DEFINED RTS_APPROVED_SCRATCH_ROOT)
+    endif()
+    file(REAL_PATH "${prefix}" _prefix_real)
+    _rts_path_is_under("${_prefix_real}" "${RTS_TASK_OWNED_INSTALL_ROOT}" _under_root)
+    if(_prefix_real MATCHES "program files|steamapps|generalsgamecode-")
+    endif()
+    # junctions must resolve below the disposable root
+    if(NOT _under_root)
+    endif()
+endfunction()
+'@
+    Assert-Vc6InstallPrefixValidatorContract $validVc6PrefixValidator `
+        'Self-test valid VC6 prefix validator'
+    $missingAbsoluteValidator = $validVc6PrefixValidator.Replace(
+        'if(NOT IS_ABSOLUTE "${prefix}")', 'if(IS_ABSOLUTE "${prefix}")')
+    $missingAbsoluteValidatorCaught = $false
+    try {
+        Assert-Vc6InstallPrefixValidatorContract $missingAbsoluteValidator `
+            'Self-test missing absolute VC6 prefix validator guard'
+    }
+    catch {
+        $missingAbsoluteValidatorCaught = $true
+    }
+    if (-not $missingAbsoluteValidatorCaught) {
+        throw 'Self-test accepted a VC6 prefix validator without an absolute-path guard.'
+    }
+
+    # Exercise the production validator through real CMake configure failures,
+    # including an existing junction that resolves outside the disposable root.
+    # Regex-only source fixtures cannot prove that canonical path resolution is
+    # enforced by CMake itself.
+    # Keep this fixture below the checkout rather than %TEMP%; on Windows the
+    # latter is commonly under C:\Users and would trip the intentional
+    # user-path denylist before the outside-root/junction cases are reached.
+    $prefixFixtureRoot = Join-Path $PSScriptRoot ('.rts-vc6-prefix-' + [Guid]::NewGuid().ToString('N'))
+    try {
+        $validatorModulePath = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '../../../../cmake/task-owned-install-prefix.cmake')).Path.Replace('\', '/')
+        function Invoke-Vc6PrefixConfigureNegativeFixture {
+            param(
+                [string]$Name,
+                [string]$Prefix,
+                [string]$ExpectedPattern
+            )
+            $fixtureSource = Join-Path $prefixFixtureRoot "$Name-source"
+            $fixtureBuild = Join-Path $prefixFixtureRoot "$Name-build"
+            $installRoot = Join-Path $fixtureBuild 'install'
+            New-Item -ItemType Directory -Path $fixtureSource -Force | Out-Null
+            $installRootCmake = $installRoot.Replace('\', '/')
+            $prefixCmake = $Prefix.Replace('\', '/')
+            $fixtureCmake = @"
+cmake_minimum_required(VERSION 3.25)
+project(vc6_prefix_negative_$Name NONE)
+set(RTS_TASK_OWNED_INSTALL_ROOT [==[$installRootCmake]==])
+set(RTS_APPROVED_SCRATCH_ROOT "")
+include("$validatorModulePath")
+rts_validate_task_owned_vc6_install_prefix([==[$prefixCmake]==] "RTS_INSTALL_PREFIX_FIXTURE")
+"@
+            Set-Content -LiteralPath (Join-Path $fixtureSource 'CMakeLists.txt') `
+                -Value $fixtureCmake -Encoding UTF8
+            # These are intentionally failing configure probes. PowerShell can
+            # promote native stderr to a terminating ErrorRecord while the
+            # script-wide preference is Stop, before the expected exit code and
+            # diagnostic can be inspected.
+            $savedErrorActionPreference = $ErrorActionPreference
+            try {
+                $ErrorActionPreference = 'Continue'
+                $configureOutput = @(& cmake -S $fixtureSource -B $fixtureBuild -G Ninja 2>&1)
+                $configureExitCode = $LASTEXITCODE
+            }
+            finally {
+                $ErrorActionPreference = $savedErrorActionPreference
+            }
+            # Native stderr records are formatted to the host width and can
+            # wrap one CMake diagnostic across lines. Compare normalized text.
+            $configureText = (($configureOutput -join "`n") -replace '\s+', ' ')
+            if ($configureExitCode -eq 0 -or $configureText -notmatch $ExpectedPattern) {
+                throw "Real CMake VC6 prefix negative fixture '$Name' did not fail as expected: $configureText"
+            }
+        }
+
+        $outsidePrefix = Join-Path $prefixFixtureRoot 'outside-runtime/Generals'
+        Invoke-Vc6PrefixConfigureNegativeFixture 'outside-root' `
+            $outsidePrefix 'must resolve below RTS_TASK_OWNED_INSTALL_ROOT'
+
+        $userFixtureBuild = Join-Path $prefixFixtureRoot 'user-path-build'
+        $userPrefix = Join-Path (Join-Path $userFixtureBuild 'install') 'Users/Shared/Generals'
+        Invoke-Vc6PrefixConfigureNegativeFixture 'user-path' `
+            $userPrefix 'user, canonical, shared, or retail path'
+
+        $junctionBuild = Join-Path $prefixFixtureRoot 'junction-escape-build'
+        $junctionInstall = Join-Path $junctionBuild 'install'
+        $junctionTarget = Join-Path $prefixFixtureRoot 'junction-target'
+        New-Item -ItemType Directory -Path $junctionTarget -Force | Out-Null
+        New-Item -ItemType Directory -Path $junctionInstall -Force | Out-Null
+        $junctionPath = Join-Path $junctionInstall 'escape'
+        New-Item -ItemType Junction -Path $junctionPath -Target $junctionTarget | Out-Null
+        Invoke-Vc6PrefixConfigureNegativeFixture 'junction-escape' `
+            (Join-Path $junctionPath 'ZeroHour') 'must resolve below RTS_TASK_OWNED_INSTALL_ROOT'
+
+        # Keep a real descendant below the junction so the resolver must walk
+        # past an ordinary existing directory and inspect the link above it.
+        $existingAncestorBuild = Join-Path $prefixFixtureRoot 'junction-existing-ancestor-build'
+        $existingAncestorInstall = Join-Path $existingAncestorBuild 'install'
+        $existingAncestorTarget = Join-Path $prefixFixtureRoot 'junction-target-existing-ancestor'
+        $existingAncestorTargetPrefix = Join-Path $existingAncestorTarget 'Existing/ZeroHour'
+        New-Item -ItemType Directory -Path $existingAncestorTargetPrefix -Force | Out-Null
+        New-Item -ItemType Directory -Path $existingAncestorInstall -Force | Out-Null
+        $existingAncestorPath = Join-Path $existingAncestorInstall 'escape'
+        New-Item -ItemType Junction -Path $existingAncestorPath -Target $existingAncestorTarget | Out-Null
+        Invoke-Vc6PrefixConfigureNegativeFixture 'junction-existing-ancestor' `
+            (Join-Path $existingAncestorPath 'Existing/ZeroHour') 'must resolve below RTS_TASK_OWNED_INSTALL_ROOT'
+    }
+    finally {
+        Remove-Item -LiteralPath $prefixFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 
     $malformedRuntime = @'

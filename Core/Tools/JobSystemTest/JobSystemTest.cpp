@@ -3,6 +3,16 @@
 #include <limits.h>
 #include <new>
 #include <stdio.h>
+#include <string.h>
+#if defined(_WIN32)
+#if !defined(NOMINMAX)
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+#if defined(_MSC_VER) && defined(_DEBUG)
+#include <crtdbg.h>
+#endif
 
 #if !defined(_MSC_VER) || _MSC_VER >= 1300
 #include <atomic>
@@ -10,12 +20,6 @@
 #include <condition_variable>
 #include <mutex>
 #include <thread>
-#if defined(_WIN32)
-#if !defined(NOMINMAX)
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
 #endif
 
 #if defined(RTS_BUILD_CORE_EXTRAS)
@@ -41,7 +45,16 @@ enum JobSystemTestPause
 	JOB_SYSTEM_TEST_PAUSE_NON_OWNER_FINALIZER = 8,
 	JOB_SYSTEM_TEST_PAUSE_AFTER_DEPENDENT_ENQUEUE = 16,
 	JOB_SYSTEM_TEST_PAUSE_AFTER_EXECUTION_CLAIM = 32,
-	JOB_SYSTEM_TEST_PAUSE_AFTER_STALE_QUEUE_DISCARD = 64
+	JOB_SYSTEM_TEST_PAUSE_AFTER_STALE_QUEUE_DISCARD = 64,
+	JOB_SYSTEM_TEST_PAUSE_GROUP_WAIT_PREDICATE = 128,
+	JOB_SYSTEM_TEST_PAUSE_AFTER_GROUP_COMPLETION = 256,
+	JOB_SYSTEM_TEST_PAUSE_GROUP_COMPLETION_LOCK = 512,
+	JOB_SYSTEM_TEST_PAUSE_HANDLE_WAIT_PREDICATE = 1024,
+	JOB_SYSTEM_TEST_PAUSE_AFTER_HANDLE_COMPLETION = 2048,
+	JOB_SYSTEM_TEST_PAUSE_HANDLE_COMPLETION_LOCK = 4096,
+	JOB_SYSTEM_TEST_PAUSE_BEFORE_BATCH_READY_RECHECK = 8192,
+	JOB_SYSTEM_TEST_PAUSE_READY_OWNERSHIP_RECHECK = 16384,
+	JOB_SYSTEM_TEST_PAUSE_AFTER_EXECUTION_RETIREMENT = 32768
 };
 
 extern "C" void rts_job_system_set_test_fault(unsigned fault,
@@ -56,6 +69,45 @@ extern "C" void rts_job_system_release_test_pause(unsigned pausePoint);
 
 namespace
 {
+enum JobSystemTestLane
+{
+	JOB_SYSTEM_TEST_LANE_FULL = 0,
+	JOB_SYSTEM_TEST_LANE_LOCAL_CAPACITY
+};
+
+const unsigned kLocalCapacityWorkerLimit = 12;
+JobSystemTestLane g_testLane = JOB_SYSTEM_TEST_LANE_FULL;
+
+bool parseJobSystemTestLane(int argc, const char *selector,
+	JobSystemTestLane *lane)
+{
+	if (lane == 0 || argc < 1)
+		return false;
+	*lane = JOB_SYSTEM_TEST_LANE_FULL;
+	if (argc == 1)
+		return true;
+	if (argc == 2 && selector != 0 &&
+		strcmp(selector, "--local-capacity") == 0)
+	{
+		*lane = JOB_SYSTEM_TEST_LANE_LOCAL_CAPACITY;
+		return true;
+	}
+	return false;
+}
+
+bool isLocalCapacityLane()
+{
+	return g_testLane == JOB_SYSTEM_TEST_LANE_LOCAL_CAPACITY;
+}
+
+unsigned workerCountForTest(unsigned requested, bool localCapacity)
+{
+	if (!localCapacity ||
+		(requested != 0 && requested <= kLocalCapacityWorkerLimit))
+		return requested;
+	return kLocalCapacityWorkerLimit;
+}
+
 int check(bool condition, const char *message)
 {
 	if (!condition)
@@ -64,6 +116,39 @@ int check(bool condition, const char *message)
 		return 1;
 	}
 	return 0;
+}
+
+int runTest(const char *name, int (*test)())
+{
+	fprintf(stderr, "BEGIN: %s\n", name);
+	fflush(stderr);
+	const int result = test();
+	fprintf(stderr, "END: %s (%s)\n", name, result == 0 ? "PASS" : "FAIL");
+	fflush(stderr);
+	return result;
+}
+
+int testJobSystemTestLaneSelection()
+{
+	int result = 0;
+	JobSystemTestLane lane = JOB_SYSTEM_TEST_LANE_LOCAL_CAPACITY;
+	result |= check(parseJobSystemTestLane(1, 0, &lane) &&
+		lane == JOB_SYSTEM_TEST_LANE_FULL,
+		"test lane defaults to the full high-core qualification lane");
+	result |= check(parseJobSystemTestLane(2, "--local-capacity", &lane) &&
+		lane == JOB_SYSTEM_TEST_LANE_LOCAL_CAPACITY,
+		"local capacity selector chooses the bounded test lane explicitly");
+	result |= check(!parseJobSystemTestLane(3, "--local-capacity", &lane),
+		"unknown test lane arguments are rejected");
+	result |= check(workerCountForTest(16, false) == 16 &&
+		workerCountForTest(32, false) == 32,
+		"full test lane retains its high-core worker requests");
+	result |= check(workerCountForTest(0, true) == kLocalCapacityWorkerLimit &&
+		workerCountForTest(16, true) == kLocalCapacityWorkerLimit &&
+		workerCountForTest(kLocalCapacityWorkerLimit, true) ==
+			kLocalCapacityWorkerLimit,
+		"local capacity lane bounds automatic and oversized worker requests");
+	return result;
 }
 
 class CountJob : public rts::Job
@@ -78,6 +163,30 @@ public:
 
 private:
 	unsigned *m_count;
+};
+
+class ContextFailJob : public rts::Job
+{
+public:
+	virtual void execute(rts::JobContext &context) { context.fail(); }
+};
+
+class ExecutionIdentityJob : public rts::Job
+{
+public:
+	ExecutionIdentityJob(bool *physicalWorker, unsigned *physicalWorkerIndex)
+		: m_physicalWorker(physicalWorker),
+		  m_physicalWorkerIndex(physicalWorkerIndex) {}
+
+	virtual void execute(rts::JobContext &context)
+	{
+		*m_physicalWorker = context.isPhysicalWorkerExecution();
+		*m_physicalWorkerIndex = context.physicalWorkerIndex();
+	}
+
+private:
+	bool *m_physicalWorker;
+	unsigned *m_physicalWorkerIndex;
 };
 
 class DeterministicJob : public rts::Job
@@ -103,6 +212,8 @@ private:
 int testBasicStartSubmitWaitShutdown()
 {
 	int result = 0;
+	result |= check(rts::JOB_SYSTEM_PERFORMANCE_SCHEMA_VERSION == 1,
+		"scheduler performance schema marker remains explicit");
 	unsigned executions = 0;
 	rts::JobSystemConfig config;
 	config.workerCount = 1;
@@ -126,6 +237,44 @@ int testBasicStartSubmitWaitShutdown()
 	result |= check(handle.isComplete(), "submitted handle completes");
 	result |= check(handle.succeeded(), "submitted handle succeeds");
 	result |= check(executions == 1, "submitted job executes exactly once");
+
+#if defined(_MSC_VER) && _MSC_VER < 1300
+	bool physicalWorker = true;
+	unsigned physicalWorkerIndex = 0;
+	rts::JobGroup identityGroup = system.createGroup();
+	rts::Job *identityJob = new ExecutionIdentityJob(&physicalWorker,
+		&physicalWorkerIndex);
+	rts::JobHandle identityHandle = system.trySubmit(identityJob,
+		rts::JOB_PRIORITY_NORMAL, identityGroup);
+	if (!identityHandle.isValid()) delete identityJob;
+	result |= check(identityHandle.isValid() && system.wait(identityGroup) &&
+		!physicalWorker &&
+		physicalWorkerIndex == rts::JOB_INVALID_PHYSICAL_WORKER_INDEX,
+		"legacy inline execution has no physical-worker identity");
+	system.resetMetrics();
+	rts::JobGroup skippedGroup = system.createGroup();
+	rts::JobHandle failedPrerequisite = system.trySubmit(new ContextFailJob,
+		rts::JOB_PRIORITY_NORMAL, skippedGroup);
+	unsigned skippedExecutions = 0;
+	rts::Job *skippedJob = new CountJob(&skippedExecutions);
+	rts::JobHandle skippedHandle = system.trySubmitAfter(skippedJob,
+		rts::JOB_PRIORITY_NORMAL, skippedGroup, &failedPrerequisite, 1);
+	if (!skippedHandle.isValid()) delete skippedJob;
+	const rts::JobSystemMetrics skippedMetrics = system.metrics();
+	result |= check(failedPrerequisite.isValid() && skippedHandle.isValid() &&
+		failedPrerequisite.failed() && skippedHandle.failed() &&
+		skippedExecutions == 0 && skippedMetrics.executedJobCount == 1 &&
+		skippedMetrics.failedJobCount == 2 &&
+		skippedMetrics.maximumActiveWorkers == 1,
+		"legacy dependency skip is finalized without false callback execution");
+	result |= check(system.waitWithoutOwnerHelp(skippedGroup, 0) &&
+		system.metrics().waitCount == skippedMetrics.waitCount + 1,
+		"legacy no-owner-help fence observes immediate inline completion");
+	system.resetPerformanceMetrics();
+	result |= check(system.metrics().workerBusyNanoseconds == 0 &&
+		system.metrics().workerWaitNanoseconds == 0,
+		"legacy direct lane exposes zero physical-worker timing");
+#endif
 
 	system.shutdown();
 	result |= check(!system.isRunning(), "shutdown stops the job system");
@@ -176,6 +325,8 @@ int testBasicStartSubmitWaitShutdown()
 
 int testDeterministicWorkerCounts()
 {
+	// The local lane keeps the worker-count matrix visible while replacing
+	// direct starts above the local capacity with an explicit bounded request.
 	const unsigned workerCounts[] = { 1, 2, 4, 8, 16, 0 };
 	const unsigned jobCount = 256;
 	unsigned reference[jobCount];
@@ -195,7 +346,8 @@ int testDeterministicWorkerCounts()
 		unsigned outputs[jobCount] = { 0 };
 		rts::JobHandle handles[jobCount];
 		rts::JobSystemConfig config;
-		config.workerCount = workerCounts[workerIndex];
+		config.workerCount = workerCountForTest(workerCounts[workerIndex],
+			isLocalCapacityLane());
 		config.queueCapacity = jobCount;
 		config.scratchBytesPerWorker = 4096;
 		config.pinWorkers = false;
@@ -206,9 +358,16 @@ int testDeterministicWorkerCounts()
 		result |= check(system.workerCount() == 1,
 			"VC6 reference adapter reports its single execution lane");
 #else
-		result |= check(workerCounts[workerIndex] == 0 ? system.workerCount() > 0 :
-			system.workerCount() == workerCounts[workerIndex],
-			"configured worker count has no product cap");
+		const unsigned expectedWorkerCount = workerCountForTest(
+			workerCounts[workerIndex], isLocalCapacityLane());
+		const bool workerCountMatches = isLocalCapacityLane() ?
+			system.workerCount() == expectedWorkerCount :
+			(workerCounts[workerIndex] == 0 ? system.workerCount() > 0 :
+				system.workerCount() == expectedWorkerCount);
+		result |= check(workerCountMatches,
+			isLocalCapacityLane() ?
+				"local lane uses its bounded worker request" :
+				"configured worker count has no product cap");
 #endif
 		rts::JobGroup group = system.createGroup();
 		for (index = 0; index < jobCount; ++index)
@@ -241,6 +400,7 @@ int testFlatRangePartitions()
 	int result = 0;
 	const unsigned sizes[] = { 0, 1, 7, 64, 257, 4097, 131071, UINT_MAX };
 	const unsigned grains[] = { 0, 1, 32, 512, UINT_MAX };
+	// These values exercise pure range arithmetic and do not start workers.
 	const unsigned workers[] = { 0, 1, 2, 4, 8, 16, UINT_MAX };
 	unsigned sizeIndex;
 	unsigned grainIndex;
@@ -311,17 +471,23 @@ int testFlatRangeKernelAndSaturationFallback()
 	int result = 0;
 	const unsigned itemCount = 4097;
 	const unsigned maximumRanges = itemCount / 32;
+	// The 16-worker case remains in the full matrix; local direct starts are
+	// reduced to the explicit 12-worker capacity by workerCountForTest.
 	const unsigned workers[] = { 1, 2, 4, 8, 16, 0 };
 	for (unsigned workerIndex = 0; workerIndex < sizeof(workers) / sizeof(workers[0]); ++workerIndex)
 	for (unsigned saturated = 0; saturated < 2; ++saturated)
 	{
 		rts::JobSystem &system = rts::JobSystem::instance();
 		rts::JobSystemConfig config;
-		config.workerCount = workers[workerIndex];
+		config.workerCount = workerCountForTest(workers[workerIndex],
+			isLocalCapacityLane());
 		config.queueCapacity = saturated ? 1 : maximumRanges;
 		config.scratchBytesPerWorker = 4096;
 		config.pinWorkers = false;
 		result |= check(system.start(config), "flat-range fixture starts");
+		if (isLocalCapacityLane())
+			result |= check(system.workerCount() <= kLocalCapacityWorkerLimit,
+				"local flat-range fixture stays within worker capacity");
 		unsigned executions[itemCount] = { 0 };
 		unsigned outputs[itemCount] = { 0 };
 		const unsigned rangeCount = rts::JobSystem::chooseRangeCount(itemCount, 32,
@@ -410,6 +576,55 @@ int testAvailableCpuSetsAndOwnerReservations()
 		rts::JOB_WORKER_POLICY_AUTO, 16, workers, 12) == 9 &&
 		rts::JobSystem::chooseWorkerCount(9, rts::JOB_WORKER_POLICY_AUTO, 16) == 16,
 		"explicit oversubscription preserves count but pins only to available CPUs");
+	rts::JobCpuSetInfo pairedSmtCpuSets[16];
+	unsigned pairedWorkers[8] = { 0 };
+	for (index = 0; index < 16; ++index)
+	{
+		pairedSmtCpuSets[index].id = 200 + index;
+		pairedSmtCpuSets[index].efficiencyClass = 1;
+		pairedSmtCpuSets[index].group = 0;
+		pairedSmtCpuSets[index].coreIndex = index / 2;
+		pairedSmtCpuSets[index].logicalProcessorIndex = index;
+	}
+	const unsigned pairedWorkerCount = rts::JobSystem::selectWorkerCpuSets(
+		pairedSmtCpuSets, 16, rts::JOB_WORKER_POLICY_AUTO, 8,
+		pairedWorkers, 8);
+	rts::JobMetricCounter pairedPhysicalMask = 0;
+	bool pairedPhysicalMaskComplete = false;
+	const unsigned pairedPhysicalCount =
+		rts::JobSystem::summarizeSelectedPhysicalCores(pairedSmtCpuSets, 16,
+			pairedWorkers, pairedWorkerCount, &pairedPhysicalMask,
+			&pairedPhysicalMaskComplete);
+	result |= check(pairedWorkerCount == 8 && pairedPhysicalCount == 8 &&
+		pairedPhysicalMask == static_cast<rts::JobMetricCounter>(0xff) &&
+		pairedPhysicalMaskComplete,
+		"eight workers spread across eight paired-SMT physical cores");
+	rts::JobCpuSetInfo wideCpuSets[128];
+	unsigned wideWorkers[128] = { 0 };
+	for (index = 0; index < 128; ++index)
+	{
+		wideCpuSets[index].id = 1000 + index;
+		wideCpuSets[index].efficiencyClass = 1;
+		wideCpuSets[index].group = index / 64;
+		wideCpuSets[index].coreIndex = index % 64;
+		wideCpuSets[index].logicalProcessorIndex = index % 64;
+	}
+	result |= check(rts::JobSystem::selectWorkerCpuSets(wideCpuSets, 96,
+		rts::JOB_WORKER_POLICY_AUTO, 0, wideWorkers, 128) == 94 &&
+		rts::JobSystem::chooseWorkerCount(96, rts::JOB_WORKER_POLICY_AUTO, 0) == 94,
+		"96-LP auto topology reserves owners without a processor-group ceiling");
+	const unsigned wideWorkerCount = rts::JobSystem::selectWorkerCpuSets(
+		wideCpuSets, 128, rts::JOB_WORKER_POLICY_ALL, 0, wideWorkers, 128);
+	rts::JobMetricCounter widePhysicalMask = 0;
+	bool widePhysicalMaskComplete = true;
+	const unsigned widePhysicalCount =
+		rts::JobSystem::summarizeSelectedPhysicalCores(wideCpuSets, 128,
+			wideWorkers, wideWorkerCount, &widePhysicalMask,
+			&widePhysicalMaskComplete);
+	result |= check(wideWorkerCount == 128 && widePhysicalCount == 128 &&
+		widePhysicalMask == ~static_cast<rts::JobMetricCounter>(0) &&
+		!widePhysicalMaskComplete,
+		"128-LP topology reports an explicitly incomplete 64-bit core mask");
 	for (index = 0; index < 12; ++index) cpuSets[index].availableToProcess = index < 2;
 	result |= check(rts::JobSystem::selectOwnerCpuSets(cpuSets, 12,
 		rts::JOB_WORKER_POLICY_AUTO, 0, owners, 2) == 1 &&
@@ -507,6 +722,220 @@ private:
 	Gate *m_gate;
 };
 
+class SignalledExecutionIdentityJob : public rts::Job
+{
+public:
+	SignalledExecutionIdentityJob(std::atomic<bool> *executed,
+		bool *physicalWorker, unsigned *physicalWorkerIndex)
+		: m_executed(executed), m_physicalWorker(physicalWorker),
+		  m_physicalWorkerIndex(physicalWorkerIndex) {}
+
+	virtual void execute(rts::JobContext &context)
+	{
+		*m_physicalWorker = context.isPhysicalWorkerExecution();
+		*m_physicalWorkerIndex = context.physicalWorkerIndex();
+		m_executed->store(true, std::memory_order_release);
+	}
+
+private:
+	std::atomic<bool> *m_executed;
+	bool *m_physicalWorker;
+	unsigned *m_physicalWorkerIndex;
+};
+
+class BlockingExecutionIdentityJob : public rts::Job
+{
+public:
+	BlockingExecutionIdentityJob(Gate *gate, bool *physicalWorker,
+		unsigned *physicalWorkerIndex, std::thread::id *threadId)
+		: m_gate(gate), m_physicalWorker(physicalWorker),
+		  m_physicalWorkerIndex(physicalWorkerIndex), m_threadId(threadId) {}
+
+	virtual void execute(rts::JobContext &context)
+	{
+		*m_physicalWorker = context.isPhysicalWorkerExecution();
+		*m_physicalWorkerIndex = context.physicalWorkerIndex();
+		*m_threadId = std::this_thread::get_id();
+		m_gate->waitUntilOpen();
+	}
+
+private:
+	Gate *m_gate;
+	bool *m_physicalWorker;
+	unsigned *m_physicalWorkerIndex;
+	std::thread::id *m_threadId;
+};
+
+bool runPhysicalWorkerIdentityWave(rts::JobSystem &system,
+	bool physicalWorkers[4], unsigned physicalWorkerIndices[4],
+	std::thread::id threadIds[4])
+{
+	Gate gates[4];
+	rts::JobHandle handles[4];
+	rts::JobGroup group = system.createGroup();
+	bool submitted = true;
+	bool anySubmitted = false;
+	bool entered = true;
+	unsigned index;
+
+	for (index = 0; index != 4; ++index)
+	{
+		physicalWorkers[index] = false;
+		physicalWorkerIndices[index] = rts::JOB_INVALID_PHYSICAL_WORKER_INDEX;
+		threadIds[index] = std::thread::id();
+		rts::Job *job = new BlockingExecutionIdentityJob(&gates[index],
+			&physicalWorkers[index], &physicalWorkerIndices[index],
+			&threadIds[index]);
+		handles[index] = system.trySubmit(job, rts::JOB_PRIORITY_NORMAL, group);
+		if (!handles[index].isValid())
+		{
+			delete job;
+			submitted = false;
+		}
+		else
+		{
+			anySubmitted = true;
+		}
+	}
+
+	if (submitted)
+	{
+		for (index = 0; index != 4; ++index)
+			entered = gates[index].waitForEntry() && entered;
+	}
+	for (index = 0; index != 4; ++index) gates[index].open();
+	if (anySubmitted) entered = system.wait(group) && entered;
+	return submitted && entered;
+}
+
+int testExecutionScopedPhysicalWorkerIdentity()
+{
+	int result = 0;
+	rts::JobSystemConfig config;
+	config.workerCount = 1;
+	config.queueCapacity = 8;
+	config.scratchBytesPerWorker = 4096;
+	config.pinWorkers = false;
+
+	rts::JobSystem &system = rts::JobSystem::instance();
+	const bool started = system.start(config);
+	result |= check(started, "physical-worker identity job system starts");
+	if (!started) return result;
+
+	bool physicalWorker = false;
+	unsigned physicalWorkerIndex = rts::JOB_INVALID_PHYSICAL_WORKER_INDEX;
+	std::atomic<bool> executed(false);
+	rts::JobGroup physicalGroup = system.createGroup();
+	rts::Job *physicalJob = new SignalledExecutionIdentityJob(&executed,
+		&physicalWorker, &physicalWorkerIndex);
+	rts::JobHandle physicalHandle = system.trySubmit(physicalJob,
+		rts::JOB_PRIORITY_NORMAL, physicalGroup);
+	if (!physicalHandle.isValid()) delete physicalJob;
+	const std::chrono::steady_clock::time_point physicalDeadline =
+		std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	while (!executed.load(std::memory_order_acquire) &&
+		std::chrono::steady_clock::now() < physicalDeadline)
+		std::this_thread::yield();
+	const bool workerExecuted = executed.load(std::memory_order_acquire);
+	result |= check(physicalHandle.isValid() && workerExecuted,
+		"physical worker executes identity probe without owner help");
+	result |= check(workerExecuted && physicalWorker && physicalWorkerIndex == 0,
+		"physical worker exposes its stable zero-based scheduler index");
+	if (physicalHandle.isValid())
+		result |= check(system.wait(physicalGroup),
+			"physical-worker identity probe drains");
+
+	Gate blocker;
+	rts::JobGroup blockerGroup = system.createGroup();
+	rts::Job *blockerJob = new GateJob(&blocker);
+	rts::JobHandle blockerHandle = system.trySubmit(blockerJob,
+		rts::JOB_PRIORITY_FRAME_CRITICAL, blockerGroup);
+	if (!blockerHandle.isValid()) delete blockerJob;
+	const bool workerBlocked = blockerHandle.isValid() && blocker.waitForEntry();
+	result |= check(workerBlocked,
+		"physical worker is held before the owner-help identity probe");
+
+	bool ownerPhysicalWorker = true;
+	unsigned ownerPhysicalWorkerIndex = 0;
+	rts::JobGroup ownerGroup = system.createGroup();
+	rts::Job *ownerJob = new ExecutionIdentityJob(&ownerPhysicalWorker,
+		&ownerPhysicalWorkerIndex);
+	rts::JobHandle ownerHandle = system.trySubmit(ownerJob,
+		rts::JOB_PRIORITY_NORMAL, ownerGroup);
+	if (!ownerHandle.isValid()) delete ownerJob;
+	const bool ownerWaited = ownerHandle.isValid() && system.wait(ownerGroup);
+	result |= check(ownerWaited,
+		"registered scheduler owner executes queued identity probe while worker is held");
+	result |= check(ownerWaited && !ownerPhysicalWorker &&
+		ownerPhysicalWorkerIndex == rts::JOB_INVALID_PHYSICAL_WORKER_INDEX,
+		"owner help cannot impersonate a physical scheduler worker");
+
+	if (blockerHandle.isValid())
+	{
+		blocker.open();
+		result |= check(system.wait(blockerGroup),
+			"held physical worker drains after identity probe");
+	}
+	system.shutdown();
+
+	config.workerCount = 4;
+	config.queueCapacity = 32;
+	const bool multiWorkerStarted = system.start(config);
+	result |= check(multiWorkerStarted && system.workerCount() == 4,
+		"multi-worker identity fixture starts four physical workers");
+	if (multiWorkerStarted && system.workerCount() == 4)
+	{
+		bool firstPhysical[4];
+		bool secondPhysical[4];
+		unsigned firstIndices[4];
+		unsigned secondIndices[4];
+		std::thread::id firstThreads[4];
+		std::thread::id secondThreads[4];
+		const bool firstWave = runPhysicalWorkerIdentityWave(system,
+			firstPhysical, firstIndices, firstThreads);
+		const bool secondWave = runPhysicalWorkerIdentityWave(system,
+			secondPhysical, secondIndices, secondThreads);
+		result |= check(firstWave && secondWave,
+			"all physical workers execute both identity waves without owner help");
+
+		bool validRange = firstWave && secondWave;
+		bool distinct = firstWave && secondWave;
+		bool stableByThread = firstWave && secondWave;
+		for (unsigned first = 0; first != 4; ++first)
+		{
+			validRange = validRange && firstPhysical[first] &&
+				secondPhysical[first] && firstIndices[first] < 4 &&
+				secondIndices[first] < 4;
+			for (unsigned other = first + 1; other != 4; ++other)
+			{
+				distinct = distinct && firstIndices[first] != firstIndices[other] &&
+					secondIndices[first] != secondIndices[other];
+			}
+
+			bool foundThread = false;
+			for (unsigned second = 0; second != 4; ++second)
+			{
+				if (firstThreads[first] == secondThreads[second])
+				{
+					foundThread = true;
+					stableByThread = stableByThread &&
+						firstIndices[first] == secondIndices[second];
+					break;
+				}
+			}
+			stableByThread = stableByThread && foundThread;
+		}
+		result |= check(validRange,
+			"physical worker indices remain within the configured worker range");
+		result |= check(distinct,
+			"simultaneously occupied physical workers expose distinct indices");
+		result |= check(stableByThread,
+			"each physical scheduler thread retains its index across jobs");
+	}
+	system.shutdown();
+	return result;
+}
+
 class OrderedJob : public rts::Job
 {
 public:
@@ -519,6 +948,40 @@ public:
 private:
 	std::atomic<unsigned> *m_sequence;
 	unsigned *m_order;
+};
+
+class LocalPriorityPublisherJob : public rts::Job
+{
+public:
+	LocalPriorityPublisherJob(rts::JobSystem *system,
+		const rts::JobGroup &group, Gate *gate,
+		std::atomic<unsigned> *sequence, unsigned *backgroundOrder,
+		bool *accepted)
+		: m_system(system), m_group(group), m_gate(gate),
+		  m_sequence(sequence), m_backgroundOrder(backgroundOrder),
+		  m_accepted(accepted) {}
+
+	virtual void execute(rts::JobContext &context)
+	{
+		rts::Job *job = new OrderedJob(m_sequence, m_backgroundOrder);
+		const rts::JobHandle handle = m_system->trySubmit(job,
+			rts::JOB_PRIORITY_BACKGROUND, m_group);
+		*m_accepted = handle.isValid();
+		if (!handle.isValid())
+		{
+			delete job;
+			context.fail();
+		}
+		m_gate->waitUntilOpen();
+	}
+
+private:
+	rts::JobSystem *m_system;
+	rts::JobGroup m_group;
+	Gate *m_gate;
+	std::atomic<unsigned> *m_sequence;
+	unsigned *m_backgroundOrder;
+	bool *m_accepted;
 };
 
 class BusyJob : public rts::Job
@@ -538,6 +1001,20 @@ public:
 	}
 private:
 	std::atomic<unsigned> *m_executions;
+};
+
+class PriorityCountJob : public rts::Job
+{
+public:
+	PriorityCountJob(std::atomic<unsigned> *counts, unsigned priority)
+		: m_counts(counts), m_priority(priority) {}
+	virtual void execute(rts::JobContext &)
+	{
+		m_counts[m_priority].fetch_add(1, std::memory_order_relaxed);
+	}
+private:
+	std::atomic<unsigned> *m_counts;
+	unsigned m_priority;
 };
 
 class FanOutJob : public rts::Job
@@ -722,9 +1199,60 @@ int testPrioritiesAndWorkStealing()
 			rts::JOB_PRIORITY_FRAME_CRITICAL),
 			"queued job can be promoted to a frame-critical lane");
 		gate.open();
-		result |= check(system.wait(group), "priority group completes");
+		/*
+		 * This ordering contract is for the single physical worker.  The
+		 * owner-thread fallback used by wait(group) is a second consumer: it
+		 * can claim the promoted record and be preempted before execute(),
+		 * allowing the physical worker to start the older critical record.
+		 */
+		result |= check(system.waitWithoutOwnerHelp(group, 5000),
+			"priority group completes");
 		result |= check(backgroundOrder == 1 && criticalOrder == 2,
 			"promoted job runs before existing frame-critical work");
+		system.shutdown();
+	}
+
+	{
+		rts::JobSystemConfig config;
+		config.workerCount = 1;
+		config.queueCapacity = 8;
+		config.scratchBytesPerWorker = 4096;
+		config.pinWorkers = false;
+		result |= check(system.start(config),
+			"cross-source priority test starts");
+		rts::JobGroup group = system.createGroup();
+		Gate publisherGate;
+		std::atomic<unsigned> sequence(0);
+		unsigned backgroundOrder = 0;
+		unsigned criticalOrder = 0;
+		bool localBackgroundAccepted = false;
+		rts::JobHandle publisher = system.trySubmit(
+			new LocalPriorityPublisherJob(&system, group, &publisherGate,
+				&sequence, &backgroundOrder, &localBackgroundAccepted),
+			rts::JOB_PRIORITY_NORMAL, group);
+		result |= check(publisher.isValid() && publisherGate.waitForEntry() &&
+			localBackgroundAccepted,
+			"worker publishes local background work before release");
+		rts::JobHandle critical = system.trySubmit(
+			new OrderedJob(&sequence, &criticalOrder),
+			rts::JOB_PRIORITY_FRAME_CRITICAL, group);
+		result |= check(critical.isValid(),
+			"owner publishes injected frame-critical work before release");
+		publisherGate.open();
+		const std::chrono::steady_clock::time_point completionDeadline =
+			std::chrono::steady_clock::now() + std::chrono::seconds(5);
+		while (!group.isComplete() &&
+			std::chrono::steady_clock::now() < completionDeadline)
+		{
+			std::this_thread::yield();
+		}
+		const bool completedWithoutOwnerHelp = group.isComplete();
+		result |= check(completedWithoutOwnerHelp,
+			"physical worker completes cross-source priority group");
+		if (!completedWithoutOwnerHelp)
+			system.wait(group);
+		result |= check(criticalOrder == 1 && backgroundOrder == 2,
+			"injected frame-critical work outranks worker-local background work");
 		system.shutdown();
 	}
 
@@ -892,6 +1420,113 @@ int testDependenciesContinuationsAndFailurePropagation()
 	return result;
 }
 
+int testWideWorkerPriorityThroughput()
+{
+	int result = 0;
+	rts::JobSystem &system = rts::JobSystem::instance();
+	const unsigned fullWorkerCounts[2] = { 16, 32 };
+	const unsigned localWorkerCounts[3] = { 4, 8, 12 };
+	const unsigned *workerCounts = isLocalCapacityLane() ?
+		localWorkerCounts : fullWorkerCounts;
+	const unsigned configurationCount = isLocalCapacityLane() ? 3 : 2;
+	const unsigned jobsPerPriority = 256;
+	for (unsigned configuration = 0; configuration < configurationCount;
+		++configuration)
+	{
+		rts::JobSystemConfig config;
+		config.workerCount = workerCounts[configuration];
+		config.queueCapacity = jobsPerPriority * rts::JOB_PRIORITY_COUNT + 16;
+		config.scratchBytesPerWorker = 4096;
+		config.pinWorkers = false;
+		result |= check(system.start(config),
+			"wide priority-throughput scheduler starts");
+		if (isLocalCapacityLane())
+			result |= check(system.workerCount() <= kLocalCapacityWorkerLimit,
+				"local priority-throughput fixture stays within worker capacity");
+		rts::JobGroup group = system.createGroup();
+		std::atomic<unsigned> counts[rts::JOB_PRIORITY_COUNT];
+		for (unsigned priority = 0; priority < rts::JOB_PRIORITY_COUNT; ++priority)
+			counts[priority].store(0, std::memory_order_relaxed);
+		bool accepted = true;
+		for (unsigned index = 0; index < jobsPerPriority && accepted; ++index)
+		{
+			for (unsigned priority = 0; priority < rts::JOB_PRIORITY_COUNT; ++priority)
+			{
+				rts::Job *job = new PriorityCountJob(counts, priority);
+				const rts::JobHandle handle = system.trySubmit(job,
+					static_cast<rts::JobPriority>(priority), group);
+				if (!handle.isValid())
+				{
+					delete job;
+					accepted = false;
+					break;
+				}
+			}
+		}
+		result |= check(accepted,
+			"wide priority-throughput workload admits every priority lane");
+		const bool completed = accepted && system.waitWithoutOwnerHelp(group, 5000);
+		result |= check(completed,
+			"wide priority-throughput workload completes on physical workers");
+		for (unsigned priority = 0; priority < rts::JOB_PRIORITY_COUNT; ++priority)
+		{
+			result |= check(counts[priority].load(std::memory_order_relaxed) ==
+				jobsPerPriority,
+				"wide priority-throughput lane executes every job exactly once");
+		}
+		const rts::JobSystemMetrics metrics = system.metrics();
+		result |= check(metrics.ownerHelpCount == 0 &&
+			metrics.executedJobCount == jobsPerPriority * rts::JOB_PRIORITY_COUNT,
+			"wide priority-throughput telemetry excludes owner execution");
+		if (!completed) system.cancel(group);
+		system.wait(group);
+		system.shutdown();
+	}
+	return result;
+}
+
+int testCurrentWorkerWaitAccounting()
+{
+	int result = 0;
+	rts::JobSystem &system = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 1;
+	config.queueCapacity = 8;
+	config.scratchBytesPerWorker = 4096;
+	config.pinWorkers = false;
+	result |= check(system.start(config),
+		"current-wait telemetry scheduler starts");
+	const std::chrono::steady_clock::time_point deadline =
+		std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	rts::JobSystemMetrics beforeReset;
+	do
+	{
+		beforeReset = system.metrics();
+		if (beforeReset.workerWaitSampleCount != 0 &&
+			beforeReset.workerWaitNanoseconds != 0) break;
+		std::this_thread::yield();
+	} while (std::chrono::steady_clock::now() < deadline);
+	result |= check(beforeReset.workerWaitSampleCount == 1 &&
+		beforeReset.workerWaitNanoseconds >=
+			beforeReset.maximumWorkerWaitNanoseconds,
+		"snapshot includes a currently sleeping physical worker");
+	system.resetPerformanceMetrics();
+	rts::JobSystemMetrics afterReset = system.metrics();
+	result |= check(afterReset.workerBusySampleCount == 0 &&
+		afterReset.workerBusyNanoseconds == 0 &&
+		afterReset.workerWaitSampleCount == 1 &&
+		afterReset.workerWaitNanoseconds >=
+			afterReset.maximumWorkerWaitNanoseconds,
+		"linearizable reset rebases rather than erases an open worker wait");
+	system.shutdown();
+	const rts::JobSystemMetrics afterShutdown = system.metrics();
+	result |= check(afterShutdown.workerWaitSampleCount >= 1 &&
+		afterShutdown.workerWaitNanoseconds >=
+			afterShutdown.maximumWorkerWaitNanoseconds,
+		"per-worker telemetry remains observable after worker shutdown");
+	return result;
+}
+
 int testCancellationOwnerHelpingAndCompletions()
 {
 	int result = 0;
@@ -903,6 +1538,46 @@ int testCancellationOwnerHelpingAndCompletions()
 	config.pinWorkers = false;
 	result |= check(system.start(config), "owner-help test starts");
 	const std::thread::id ownerThread = std::this_thread::get_id();
+
+	{
+		system.resetMetrics();
+		rts::JobGroup group = system.createGroup();
+		Gate gate;
+		bool queuedJobExecuted = false;
+		rts::JobHandle blocker = system.trySubmit(new GateJob(&gate),
+			rts::JOB_PRIORITY_NORMAL, group);
+		result |= check(blocker.isValid() && gate.waitForEntry(),
+			"no-owner-help blocker enters before timeout");
+		rts::JobHandle queued = system.trySubmit(
+			new MarkJob(&queuedJobExecuted),
+			rts::JOB_PRIORITY_FRAME_CRITICAL, group);
+		const rts::JobMetricCounter ownerHelpBefore =
+			system.metrics().ownerHelpCount;
+		result |= check(queued.isValid() &&
+			!system.waitWithoutOwnerHelp(group, 20),
+			"bounded no-owner-help fence times out while worker is blocked");
+		result |= check(!queuedJobExecuted &&
+			system.metrics().ownerHelpCount == ownerHelpBefore,
+			"bounded fence never executes queued work on the owner");
+		gate.open();
+		result |= check(system.waitWithoutOwnerHelp(group, 5000) &&
+			queuedJobExecuted,
+			"bounded no-owner-help fence observes physical completion");
+		const rts::JobSystemMetrics performanceMetrics = system.metrics();
+		result |= check(performanceMetrics.workerBusySampleCount == 2 &&
+			performanceMetrics.workerBusyNanoseconds >=
+				performanceMetrics.maximumWorkerBusyNanoseconds,
+			"physical callback timing records two overflow-safe busy samples");
+		system.resetPerformanceMetrics();
+		const rts::JobSystemMetrics resetPerformanceMetrics = system.metrics();
+		result |= check(resetPerformanceMetrics.workerBusySampleCount == 0 &&
+			resetPerformanceMetrics.workerBusyNanoseconds == 0 &&
+			resetPerformanceMetrics.maximumWorkerBusyNanoseconds == 0 &&
+			resetPerformanceMetrics.workerWaitSampleCount <= 1 &&
+			resetPerformanceMetrics.workerWaitNanoseconds >=
+				resetPerformanceMetrics.maximumWorkerWaitNanoseconds,
+			"match performance reset clears completed timing and may expose only the current wait");
+	}
 
 	{
 		rts::JobGroup blockedGroup = system.createGroup();
@@ -935,6 +1610,7 @@ int testCancellationOwnerHelpingAndCompletions()
 	}
 
 	{
+		system.resetMetrics();
 		rts::JobGroup group = system.createGroup();
 		Gate gate;
 		bool queuedJobExecuted = false;
@@ -952,6 +1628,11 @@ int testCancellationOwnerHelpingAndCompletions()
 			"active and queued jobs publish cancellation");
 		result |= check(!queuedJobExecuted,
 			"queued cancelled work does not execute");
+		const rts::JobSystemMetrics cancellationMetrics = system.metrics();
+		result |= check(cancellationMetrics.executedJobCount == 1 &&
+			cancellationMetrics.cancelledJobCount == 2 &&
+			cancellationMetrics.maximumActiveWorkers == 1,
+			"cancelled claims count finalization but not callback or physical execution");
 	}
 
 	{
@@ -1004,6 +1685,8 @@ int testTopologyPoliciesAndStartupOptions()
 	result |= check(rts::JobSystem::chooseWorkerCount(8,
 		rts::JOB_WORKER_POLICY_AUTO, 16) == 16,
 		"explicit worker count has no product hard cap");
+	// The wide topology values below exercise selection/mask arithmetic only;
+	// this test does not start a scheduler for those synthetic topologies.
 
 	rts::JobCpuSetInfo cpuSets[34];
 	for (unsigned index = 0; index < 32; ++index)
@@ -1037,6 +1720,7 @@ int testTopologyPoliciesAndStartupOptions()
 	result |= check(!containsReserved,
 		"auto reserves the two stable highest-performance CPU sets");
 
+	// This verifies command-line state storage only; it does not start workers.
 	result |= check(rts::JobSystem::setStartupWorkerCount(16),
 		"startup worker override accepts 16");
 	result |= check(rts::JobSystem::setStartupWorkerPolicy("all"),
@@ -1054,6 +1738,177 @@ int testTopologyPoliciesAndStartupOptions()
 }
 
 #if defined(RTS_BUILD_CORE_EXTRAS)
+int testCompletionPublicationCannotPassWaitingPredicate(bool waitOnHandle)
+{
+	int result = 0;
+	rts::JobSystem &system = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 1;
+	config.queueCapacity = 8;
+	config.scratchBytesPerWorker = 4096;
+	config.pinWorkers = false;
+	const bool started = system.start(config);
+	result |= check(started, "completion-publication fixture starts");
+	if (!started) return result;
+
+	rts::JobGroup group = system.createGroup();
+	Gate gate;
+	rts::Job *job = new GateJob(&gate);
+	rts::JobHandle handle = system.trySubmit(job, rts::JOB_PRIORITY_NORMAL, group);
+	if (!handle.isValid()) delete job;
+	const bool entered = handle.isValid() && gate.waitForEntry();
+	result |= check(entered, "completion-publication job enters before waiter starts");
+	if (entered)
+	{
+		const unsigned predicatePause = waitOnHandle ?
+			JOB_SYSTEM_TEST_PAUSE_HANDLE_WAIT_PREDICATE : JOB_SYSTEM_TEST_PAUSE_GROUP_WAIT_PREDICATE;
+		const unsigned publicationPause = waitOnHandle ?
+			JOB_SYSTEM_TEST_PAUSE_AFTER_HANDLE_COMPLETION : JOB_SYSTEM_TEST_PAUSE_AFTER_GROUP_COMPLETION;
+		const unsigned contentionPause = waitOnHandle ?
+			JOB_SYSTEM_TEST_PAUSE_HANDLE_COMPLETION_LOCK : JOB_SYSTEM_TEST_PAUSE_GROUP_COMPLETION_LOCK;
+		rts_job_system_set_test_pause_mask(predicatePause | publicationPause | contentionPause);
+		bool predicateHeld = false;
+		bool publisherReached = false;
+		bool publisherBlocked = false;
+		bool completedWhileHeld = true;
+		std::thread controller([&]() {
+			predicateHeld = rts_job_system_wait_for_test_pause(predicatePause, 5000);
+			gate.open();
+			publisherReached = rts_job_system_wait_for_test_pause(
+				publicationPause | contentionPause, 5000);
+			publisherBlocked = rts_job_system_wait_for_test_pause(contentionPause, 0);
+			completedWhileHeld = waitOnHandle ? handle.isComplete() : group.isComplete();
+			// Release every pause before joining, including on a failed assertion.
+			rts_job_system_set_test_pause_mask(0);
+		});
+		// The owner handle fence polls at one millisecond and the group fence is
+		// bounded, so the deliberately broken missed-notify path cannot strand a join.
+		const bool waited = waitOnHandle ? system.wait(handle) :
+			system.waitWithoutOwnerHelp(group, 5000);
+		controller.join();
+		result |= check(predicateHeld, "completion waiter holds its mutex after a false predicate");
+		result |= check(publisherReached, "completion publisher reaches the controlled interleaving");
+		result |= check(predicateHeld && publisherReached && publisherBlocked && !completedWhileHeld,
+			"completion publication cannot bypass the waiter's predicate mutex");
+		result |= check(waited && handle.succeeded(),
+			"completion waiter drains after the publisher/waiter handshake");
+	}
+	gate.open();
+	if (handle.isValid()) system.wait(group);
+	system.shutdown();
+	return result;
+}
+
+int testHandleCompletionPublication()
+{
+	return testCompletionPublicationCannotPassWaitingPredicate(true);
+}
+
+int testGroupCompletionPublication()
+{
+	return testCompletionPublicationCannotPassWaitingPredicate(false);
+}
+
+int testBatchRecheckCannotRepublishRetiringExecution()
+{
+	int result = 0;
+	rts::JobSystem &system = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 1;
+	config.queueCapacity = 8;
+	config.scratchBytesPerWorker = 4096;
+	config.pinWorkers = false;
+	const bool started = system.start(config);
+	result |= check(started, "batch-retirement fixture starts");
+	if (!started) return result;
+
+	rts::JobGroup group = system.createGroup();
+	Gate gate;
+	std::atomic<unsigned> executions(0);
+	std::atomic<unsigned> destructions(0);
+	rts::JobSubmission submission;
+	submission.job = new BlockingLifetimeJob(&gate, &executions, &destructions);
+	rts::JobHandle handle;
+	std::atomic<bool> batchReturned(false);
+	bool recheckPaused = false;
+	bool executionEntered = false;
+	bool ownershipChecked = false;
+	bool retirementPaused = false;
+	bool admissionFinished = false;
+	rts_job_system_set_test_pause_mask(
+		JOB_SYSTEM_TEST_PAUSE_BEFORE_BATCH_READY_RECHECK |
+		JOB_SYSTEM_TEST_PAUSE_READY_OWNERSHIP_RECHECK |
+		JOB_SYSTEM_TEST_PAUSE_AFTER_EXECUTION_RETIREMENT);
+	std::thread controller([&]() {
+		recheckPaused = rts_job_system_wait_for_test_pause(
+			JOB_SYSTEM_TEST_PAUSE_BEFORE_BATCH_READY_RECHECK, 5000);
+		executionEntered = recheckPaused && gate.waitForEntry();
+		if (executionEntered)
+		{
+			// A rejected duplicate must not attempt another queue publication.
+			// If the bug does attempt one, the fault prevents a phantom ready
+			// counter from stranding shutdown while preserving observable proof.
+			rts_job_system_set_test_fault(JOB_SYSTEM_TEST_FAIL_QUEUE_PUSH, 1);
+			rts_job_system_release_test_pause(
+				JOB_SYSTEM_TEST_PAUSE_BEFORE_BATCH_READY_RECHECK);
+			const std::chrono::steady_clock::time_point deadline =
+				std::chrono::steady_clock::now() + std::chrono::seconds(5);
+			while (!batchReturned.load(std::memory_order_acquire) &&
+				!rts_job_system_wait_for_test_pause(
+					JOB_SYSTEM_TEST_PAUSE_READY_OWNERSHIP_RECHECK, 0) &&
+				std::chrono::steady_clock::now() < deadline)
+			{
+				std::this_thread::yield();
+			}
+			ownershipChecked = batchReturned.load(std::memory_order_acquire) ||
+				rts_job_system_wait_for_test_pause(
+					JOB_SYSTEM_TEST_PAUSE_READY_OWNERSHIP_RECHECK, 0);
+			gate.open();
+			retirementPaused = rts_job_system_wait_for_test_pause(
+				JOB_SYSTEM_TEST_PAUSE_AFTER_EXECUTION_RETIREMENT, 5000);
+			rts_job_system_release_test_pause(
+				JOB_SYSTEM_TEST_PAUSE_READY_OWNERSHIP_RECHECK);
+			const std::chrono::steady_clock::time_point admissionDeadline =
+				std::chrono::steady_clock::now() + std::chrono::seconds(5);
+			while (!batchReturned.load(std::memory_order_acquire) &&
+				std::chrono::steady_clock::now() < admissionDeadline)
+			{
+				std::this_thread::yield();
+			}
+			admissionFinished = batchReturned.load(std::memory_order_acquire);
+		}
+		// Every error path releases both the worker and the admission thread.
+		gate.open();
+		rts_job_system_set_test_pause_mask(0);
+	});
+	const bool accepted = system.trySubmitBatch(&submission, 1, group, &handle);
+	batchReturned.store(true, std::memory_order_release);
+	controller.join();
+	if (!accepted) delete submission.job;
+	result |= check(accepted && recheckPaused && executionEntered &&
+		ownershipChecked && retirementPaused && admissionFinished,
+		"batch recheck overlaps a real execution's controlled retirement");
+	if (accepted)
+	{
+		result |= check(system.wait(group) && handle.succeeded() &&
+			executions.load() == 1 && destructions.load() == 1,
+			"retiring batch job completes and destroys exactly once");
+	}
+
+	rts::Job *probe = new LifetimeJob(&destructions);
+	rts::JobHandle probeHandle = system.trySubmit(probe,
+		rts::JOB_PRIORITY_NORMAL, group);
+	result |= check(!probeHandle.isValid(),
+		"retiring execution rejects duplicate publication before consuming the queue fault");
+	if (!probeHandle.isValid()) delete probe;
+	else system.wait(group);
+	rts_job_system_set_test_fault(0, 0);
+	result |= check(group.isComplete() && system.outstandingJobCount() == 0,
+		"batch-retirement regression drains without phantom ready work");
+	system.shutdown();
+	return result;
+}
+
 int testFaultInjectionAndRecovery()
 {
 	int result = 0;
@@ -1719,6 +2574,8 @@ int testLifecycleOwnershipAndResourceLimits()
 		"scheduler remains usable after rejected non-owner shutdown");
 	system.shutdown();
 
+	// The pathological request is rejected by JobSystem before allocation and
+	// intentionally remains outside the local worker-start matrix.
 	config.workerCount = UINT_MAX;
 	result |= check(!system.start(config) && !system.isRunning(),
 		"topology-derived resource limit rejects pathological worker counts");
@@ -1727,9 +2584,48 @@ int testLifecycleOwnershipAndResourceLimits()
 #endif
 }
 
-int main()
+int main(int argc, char **argv)
 {
+#if defined(_WIN32)
+	SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX |
+		SEM_NOOPENFILEERRORBOX);
+#endif
+#if defined(_MSC_VER) && defined(_DEBUG)
+#if _MSC_VER >= 1400
+	_set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
+	_CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+	_CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+#endif
+	JobSystemTestLane selectedLane = JOB_SYSTEM_TEST_LANE_FULL;
+	const char *selector = argv != 0 && argc > 1 ? argv[1] : 0;
+	if (!parseJobSystemTestLane(argc, selector, &selectedLane))
+	{
+		fprintf(stderr, "Usage: %s [--local-capacity]\n",
+			argv != 0 && argc > 0 && argv[0] != 0 ? argv[0] :
+				"core_job_system_tests");
+		return 2;
+	}
+	g_testLane = selectedLane;
+	if (isLocalCapacityLane())
+	{
+		printf("JobSystem test lane: local-capacity (maximum test-created "
+			"workers=%u).\n", kLocalCapacityWorkerLimit);
+		printf("External high-core throughput lane explicitly excluded: "
+			"worker counts 16 and 32; the no-argument lane retains it.\n");
+		printf("Local priority-throughput worker counts: 4, 8 and 12.\n");
+		printf("Local deterministic and flat-range starts above 12, including "
+			"automatic requests, use explicit 12-worker requests.\n");
+		printf("Synthetic topology counts above 12 and the UINT_MAX rejection "
+			"probe do not create worker threads.\n");
+	}
+	else
+	{
+		printf("JobSystem test lane: full (includes high-core throughput "
+			"worker counts 16 and 32).\n");
+	}
 	int result = 0;
+	result |= runTest("testJobSystemTestLaneSelection", testJobSystemTestLaneSelection);
 	// Match headless startup before any subsystem or test has started workers.
 	// Lazy model/pose preparation must not resurrect a compute pool here.
 	rts::JobSystem &coldSystem = rts::JobSystem::instance();
@@ -1738,24 +2634,30 @@ int main()
 	result |= check(!coldSystem.ensureStarted() && !coldSystem.isRunning() &&
 		coldSystem.workerCount() == 0 && coldSystem.outstandingJobCount() == 0,
 		"headless cold shutdown blocks lazy compute startup");
-	result |= testBasicStartSubmitWaitShutdown();
-	result |= testDeterministicWorkerCounts();
-	result |= testFlatRangePartitions();
-	result |= testFlatRangeKernelAndSaturationFallback();
-	result |= testAvailableCpuSetsAndOwnerReservations();
-	result |= testOwnerRoleAndLazyRestartBasics();
+	result |= runTest("testBasicStartSubmitWaitShutdown", testBasicStartSubmitWaitShutdown);
+	result |= runTest("testDeterministicWorkerCounts", testDeterministicWorkerCounts);
+	result |= runTest("testFlatRangePartitions", testFlatRangePartitions);
+	result |= runTest("testFlatRangeKernelAndSaturationFallback", testFlatRangeKernelAndSaturationFallback);
+	result |= runTest("testAvailableCpuSetsAndOwnerReservations", testAvailableCpuSetsAndOwnerReservations);
+	result |= runTest("testOwnerRoleAndLazyRestartBasics", testOwnerRoleAndLazyRestartBasics);
 #if !defined(_MSC_VER) || _MSC_VER >= 1300
-	result |= testPrioritiesAndWorkStealing();
-	result |= testDependenciesContinuationsAndFailurePropagation();
-	result |= testCancellationOwnerHelpingAndCompletions();
-	result |= testTopologyPoliciesAndStartupOptions();
+	result |= runTest("testExecutionScopedPhysicalWorkerIdentity", testExecutionScopedPhysicalWorkerIdentity);
+	result |= runTest("testPrioritiesAndWorkStealing", testPrioritiesAndWorkStealing);
+	result |= runTest("testWideWorkerPriorityThroughput", testWideWorkerPriorityThroughput);
+	result |= runTest("testCurrentWorkerWaitAccounting", testCurrentWorkerWaitAccounting);
+	result |= runTest("testDependenciesContinuationsAndFailurePropagation", testDependenciesContinuationsAndFailurePropagation);
+	result |= runTest("testCancellationOwnerHelpingAndCompletions", testCancellationOwnerHelpingAndCompletions);
+	result |= runTest("testTopologyPoliciesAndStartupOptions", testTopologyPoliciesAndStartupOptions);
 #if defined(RTS_BUILD_CORE_EXTRAS)
-	result |= testFaultInjectionAndRecovery();
+	result |= runTest("testHandleCompletionPublication", testHandleCompletionPublication);
+	result |= runTest("testGroupCompletionPublication", testGroupCompletionPublication);
+	result |= runTest("testBatchRecheckCannotRepublishRetiringExecution", testBatchRecheckCannotRepublishRetiringExecution);
+	result |= runTest("testFaultInjectionAndRecovery", testFaultInjectionAndRecovery);
 #endif
-	result |= testBatchAdmissionAndWorkerWaitRejection();
-	result |= testServiceOwnerLifetimeAndWorkerRoleRejection();
-	result |= testProcessAffinityLimitsTopology();
-	result |= testLifecycleOwnershipAndResourceLimits();
+	result |= runTest("testBatchAdmissionAndWorkerWaitRejection", testBatchAdmissionAndWorkerWaitRejection);
+	result |= runTest("testServiceOwnerLifetimeAndWorkerRoleRejection", testServiceOwnerLifetimeAndWorkerRoleRejection);
+	result |= runTest("testProcessAffinityLimitsTopology", testProcessAffinityLimitsTopology);
+	result |= runTest("testLifecycleOwnershipAndResourceLimits", testLifecycleOwnershipAndResourceLimits);
 #endif
 	if (result == 0)
 	{

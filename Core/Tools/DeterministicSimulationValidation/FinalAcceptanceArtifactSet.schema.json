@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://generalsgamecode.invalid/schemas/stage5-final-artifact-set.json",
+  "title": "GeneralsGameCode Stage 5 final artifact set",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "sourceCommit", "productSet", "architecture",
+    "artifacts", "runtimeClosure"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "productSet": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "uniqueItems": true,
+      "items": { "enum": ["Generals", "ZeroHour"] }
+    },
+    "architecture": { "const": "x64" },
+    "runtimeClosure": { "$ref": "#/$defs/runtimeClosure" },
+    "artifacts": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["role", "path", "sha256"],
+        "properties": {
+          "role": {
+            "enum": [
+              "generals-executable", "generals-launcher", "generals-launcher-config",
+              "zerohour-executable", "zerohour-launcher", "zerohour-launcher-config"
+            ]
+          },
+          "path": { "$ref": "#/$defs/relativePath" },
+          "sha256": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "not": { "pattern": "^(?:[A-Za-z]:|[\\/])" },
+      "pattern": "^(?!.*(?:^|[\\/])\\.\\.(?:[\\/]|$)).+$"
+    },
+    "runtimeClosure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dependencyManifest", "closureSha256"],
+      "properties": {
+        "dependencyManifest": { "$ref": "#/$defs/fileReference" },
+        "closureSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "fileReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "$ref": "#/$defs/relativePath" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}

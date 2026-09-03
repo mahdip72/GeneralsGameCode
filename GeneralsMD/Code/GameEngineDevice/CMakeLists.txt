@@ -214,7 +214,10 @@ target_link_libraries(z_gameenginedevice PRIVATE
     stb
 )
 
+rts_attach_title_game_engine_device(z_gameenginedevice ZEROHOUR)
+
 target_link_libraries(z_gameenginedevice PUBLIC
     corei_gameenginedevice_public
+	core_renderer
     z_gameengine
 )

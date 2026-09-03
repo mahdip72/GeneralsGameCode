@@ -7,7 +7,6 @@ set(GAMEENGINEDEVICE_SRC
     Include/W3DDevice/Common/HeightMapTerrainPrepare.h
     Include/W3DDevice/Common/HeightMapDynamicLightPrepare.h
     Include/W3DDevice/Common/EffectPrepare.h
-    Include/W3DDevice/Common/LegacyPixelShaderBytecode.h
     Include/W3DDevice/Common/W3DRadar.h
     Include/W3DDevice/Common/W3DShroudRenderPolicy.h
     Include/W3DDevice/Common/W3DThingFactory.h
@@ -35,6 +34,7 @@ set(GAMEENGINEDEVICE_SRC
     Include/W3DDevice/GameClient/Module/W3DTreeDraw.h
     Include/W3DDevice/GameClient/Module/W3DTruckDraw.h
     Include/W3DDevice/GameClient/TerrainTex.h
+    Include/W3DDevice/GameClient/RenderTextureOperations.h
     Include/W3DDevice/GameClient/TileData.h
 #    Include/W3DDevice/GameClient/W3DAssetManager.h
 #    Include/W3DDevice/GameClient/W3DAssetManagerExposed.h
@@ -104,7 +104,6 @@ set(GAMEENGINEDEVICE_SRC
     Source/W3DDevice/Common/System/HeightMapTerrainPrepare.cpp
     Source/W3DDevice/Common/System/HeightMapDynamicLightPrepare.cpp
     Source/W3DDevice/Common/System/EffectPrepare.cpp
-    Source/W3DDevice/Common/System/LegacyPixelShaderBytecode.cpp
     Source/W3DDevice/Common/System/W3DRadar.cpp
     Source/W3DDevice/Common/Thing/W3DModuleFactory.cpp
     Source/W3DDevice/Common/Thing/W3DThingFactory.cpp
@@ -172,7 +171,6 @@ set(GAMEENGINEDEVICE_SRC
     Source/W3DDevice/GameClient/W3DMouse.cpp
     Source/W3DDevice/GameClient/W3DParticleSys.cpp
 #    Source/W3DDevice/GameClient/W3DPoly.cpp
-    Source/W3DDevice/GameClient/W3DProfilerFrameCapture.cpp
     Source/W3DDevice/GameClient/W3DPropBuffer.cpp
     Source/W3DDevice/GameClient/W3DScorch.cpp
 #    Source/W3DDevice/GameClient/W3DRoadBuffer.cpp
@@ -180,7 +178,6 @@ set(GAMEENGINEDEVICE_SRC
     Source/W3DDevice/GameClient/W3DShaderManager.cpp
 #    Source/W3DDevice/GameClient/W3DShroud.cpp
     Source/W3DDevice/GameClient/W3DSmudge.cpp
-    Source/W3DDevice/GameClient/W3DSnow.cpp
 #    Source/W3DDevice/GameClient/W3DStatusCircle.cpp
     Source/W3DDevice/GameClient/W3DTerrainBackground.cpp
     Source/W3DDevice/GameClient/W3DTerrainTracks.cpp
@@ -210,6 +207,14 @@ set(GAMEENGINEDEVICE_SRC
     #Source/Win32Device/GameClient/Win32DIMouse.cpp
     Source/Win32Device/GameClient/Win32Mouse.cpp
 )
+
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    list(APPEND GAMEENGINEDEVICE_SRC
+        Source/W3DDevice/GameClient/RenderTextureOperationsNative.cpp
+        Source/W3DDevice/GameClient/W3DProfilerFrameCapture.cpp
+        Source/W3DDevice/GameClient/W3DSnow.cpp
+    )
+endif()
 
 if(CMAKE_SIZEOF_VOID_P EQUAL 4)
     list(APPEND GAMEENGINEDEVICE_SRC
@@ -268,7 +273,7 @@ endif()
 
 target_link_libraries(corei_gameenginedevice_public INTERFACE
     corei_gameengine_public
-    rts_legacy_product_runtime
+    rts_product_runtime
 )
 
 # Emit the configured native-device source/link closure for the architecture

@@ -13,6 +13,29 @@ namespace render
 typedef void (*NativeW3DOwnerCommand)(void *context);
 typedef void (*NativeW3DOwnerContextRelease)(void *context);
 
+// A caller-owned, allocation-free queue entry for terminal cleanup that must
+// not be lost when the bounded packet queue is full.  One entry may be queued
+// at a time; it stays queued if its callback throws so the owner can retry it.
+class NativeW3DOwnerFallbackEntry
+{
+public:
+	NativeW3DOwnerFallbackEntry();
+	~NativeW3DOwnerFallbackEntry();
+	bool IsQueued() const;
+
+private:
+	friend class NativeW3DOwnerQueue;
+	NativeW3DOwnerFallbackEntry(const NativeW3DOwnerFallbackEntry &);
+	NativeW3DOwnerFallbackEntry &operator=(
+		const NativeW3DOwnerFallbackEntry &);
+
+	NativeW3DOwnerCommand m_command;
+	NativeW3DOwnerContextRelease m_release;
+	void *m_context;
+	NativeW3DOwnerFallbackEntry *m_next;
+	bool m_queued;
+};
+
 // The queue never stores a caller-owned/game-owned pointer directly.  Wrap
 // callback state in an opaque token and keep one reference for every accepted
 // queue entry.  The token's context is visible only to the command while the
@@ -61,6 +84,12 @@ public:
 	// therefore never contain a caller-owned/game-owned pointer.
 	RenderResult Enqueue(NativeW3DOwnerCommand command,
 		NativeW3DOwnerToken *token);
+	// Terminal resource-table teardown uses an entry embedded in the table.
+	// This path performs no allocation and is not limited by packet capacity;
+	// its total size is bounded by the registered resource-table count.
+	RenderResult EnqueueFallback(NativeW3DOwnerCommand command, void *context,
+		NativeW3DOwnerContextRelease release,
+		NativeW3DOwnerFallbackEntry *entry);
 
 	// Closing is owner-only and atomic with respect to producers.  Accepted
 	// entries stay drainable, while later producers are rejected before they
@@ -68,9 +97,9 @@ public:
 	RenderResult Close();
 
 	// Only the bound owner may drain.  drained must be non-null and receives the
-	// number of callbacks removed from the queue, including callbacks that fail
-	// through a C++ exception.  Callback exceptions are contained and reported
-	// as RENDER_RESULT_FAILED after the remaining selected commands run.
+	// number of callbacks removed from the queue. Ordinary callback exceptions
+	// are contained and removed; a failing terminal fallback remains queued and
+	// is not counted so owner cleanup can retry without orphaning live handles.
 	RenderResult Drain(unsigned int maxCommands, unsigned int *drained);
 
 	bool IsOwnerThread() const;

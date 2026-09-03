@@ -373,10 +373,10 @@ foreach ($title in @(
 }
 
 $runtimeCMake = Get-Content -LiteralPath (Join-Path $SourceRoot 'cmake/legacy-product-runtime.cmake') -Raw
-if ($runtimeCMake -notmatch '(?ms)^    if\(NOT RTS_BUILD_OPTION_FFMPEG\)\s*^        target_link_libraries\(rts_legacy_product_runtime INTERFACE binkstub\)\s*^    endif\(\)') {
+if ($runtimeCMake -notmatch '(?ms)^if\(NOT RTS_BUILD_OPTION_FFMPEG\)\s*^    target_link_libraries\(rts_legacy_product_runtime INTERFACE binkstub\)\s*^endif\(\)') {
     throw 'Bink link ownership is not conditional on the FFmpeg backend option.'
 }
-Assert-ExactConditionalBlock $runtimeCMake '    if(NOT RTS_BUILD_OPTION_FFMPEG)' '        target_link_libraries(rts_legacy_product_runtime INTERFACE binkstub)' '    endif()' 'Bink link conditional block is not exact.'
+Assert-ExactConditionalBlock $runtimeCMake 'if(NOT RTS_BUILD_OPTION_FFMPEG)' '    target_link_libraries(rts_legacy_product_runtime INTERFACE binkstub)' 'endif()' 'Bink link conditional block is not exact.'
 Assert-TokenCount $runtimeCMake 'binkstub' 1 'Bink runtime link ownership is ambiguous.'
 
 $rootCMake = Get-Content -LiteralPath (Join-Path $SourceRoot 'CMakeLists.txt') -Raw
@@ -392,10 +392,11 @@ Assert-ExactConditionalBlock $rootCMake '    if(${CMAKE_SIZEOF_VOID_P} EQUAL 4 A
 Assert-TokenCount $rootCMake 'include\(cmake/bink\.cmake\)' 1 'Bink dependency fetch ownership is ambiguous.'
 
 $runtimeTestsCMake = Get-Content -LiteralPath (Join-Path $SourceRoot 'GeneralsMD/Code/Tools/RuntimeRegressionTests/CMakeLists.txt') -Raw
-if ($runtimeTestsCMake -notmatch '(?ms)^if\(CMAKE_SIZEOF_VOID_P EQUAL 4\).*?^\s*if\(NOT RTS_BUILD_OPTION_FFMPEG\)\s*^\s*target_link_libraries\(z_runtime_regression_tests PRIVATE binkstub\)\s*^\s*endif\(\)') {
-    throw 'Zero Hour runtime regression tests link Bink outside the fallback backend.'
+if ($runtimeTestsCMake -notmatch '\brts_product_runtime\b' -or
+    $runtimeTestsCMake -match '\bbinkstub\b') {
+    throw 'Zero Hour runtime regression tests bypass architecture-selected Bink ownership.'
 }
-Assert-TokenCount $runtimeTestsCMake 'binkstub' 1 'Zero Hour runtime regression test link ownership is ambiguous.'
+Assert-TokenCount $runtimeTestsCMake 'rts_product_runtime' 1 'Zero Hour runtime regression product-boundary ownership is ambiguous.'
 
 $audioContractFiles = @(
     'Core/GameEngine/Include/Common/GameAudio.h',

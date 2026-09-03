@@ -161,38 +161,38 @@ int testCheckedIndexedSubmissionBounds()
 {
 	unsigned int index_count = 0;
 	CHECK("checked triangle-list arithmetic",
-		rts::render::Checked_D3D8_Primitive_Index_Count(
+		rts::render::Checked_Legacy_Primitive_Index_Count(
 			rts::render::LEGACY_D3DPT_TRIANGLELIST, 2, &index_count) &&
 			index_count == 6);
 	CHECK("triangle-list multiplication overflow is rejected",
-		!rts::render::Checked_D3D8_Primitive_Index_Count(
+		!rts::render::Checked_Legacy_Primitive_Index_Count(
 			rts::render::LEGACY_D3DPT_TRIANGLELIST,
 			static_cast<unsigned int>(-1) / 3 + 1,
 			&index_count));
 	CHECK("triangle-strip addition overflow is rejected",
-		!rts::render::Checked_D3D8_Primitive_Index_Count(
+		!rts::render::Checked_Legacy_Primitive_Index_Count(
 			rts::render::LEGACY_D3DPT_TRIANGLESTRIP,
 			static_cast<unsigned int>(-1), &index_count));
 	CHECK("indexed range at buffer end is valid",
-		rts::render::Is_D3D8_Indexed_Range_Valid(8, 7, 1));
+		rts::render::Is_Legacy_Indexed_Range_Valid(8, 7, 1));
 	CHECK("indexed range crossing buffer end is rejected",
-		!rts::render::Is_D3D8_Indexed_Range_Valid(8, 7, 2));
+		!rts::render::Is_Legacy_Indexed_Range_Valid(8, 7, 2));
 	CHECK("indexed range with start past buffer is rejected",
-		!rts::render::Is_D3D8_Indexed_Range_Valid(8, 9, 0));
+		!rts::render::Is_Legacy_Indexed_Range_Valid(8, 9, 0));
 	CHECK("exact vertex window is valid",
-		rts::render::Is_D3D8_Vertex_Range_Valid(12, 2, 4, 6));
+		rts::render::Is_Legacy_Vertex_Range_Valid(12, 2, 4, 6));
 	CHECK("sorting vertex window accepts rebased indices at a dynamic offset",
-		rts::render::Is_D3D8_Vertex_Range_Valid(12, 4, 0, 8));
+		rts::render::Is_Legacy_Vertex_Range_Valid(12, 4, 0, 8));
 	CHECK("empty vertex window at the end is valid",
-		rts::render::Is_D3D8_Vertex_Range_Valid(12, 12, 0, 0));
+		rts::render::Is_Legacy_Vertex_Range_Valid(12, 12, 0, 0));
 	CHECK("vertex base beyond capacity is rejected",
-		!rts::render::Is_D3D8_Vertex_Range_Valid(12, 13, 0, 0));
+		!rts::render::Is_Legacy_Vertex_Range_Valid(12, 13, 0, 0));
 	CHECK("minimum vertex overflow is rejected",
-		!rts::render::Is_D3D8_Vertex_Range_Valid(12, 2, 11, 0));
+		!rts::render::Is_Legacy_Vertex_Range_Valid(12, 2, 11, 0));
 	CHECK("vertex count overflow is rejected",
-		!rts::render::Is_D3D8_Vertex_Range_Valid(12, 2, 4, 7));
+		!rts::render::Is_Legacy_Vertex_Range_Valid(12, 2, 4, 7));
 	CHECK("unsigned vertex addition cannot wrap into the buffer",
-		!rts::render::Is_D3D8_Vertex_Range_Valid(12, 2,
+		!rts::render::Is_Legacy_Vertex_Range_Valid(12, 2,
 			static_cast<unsigned int>(-1), 1));
 	CHECK("largest signed D3D11 base vertex is valid",
 		rts::render::Is_D3D11_Base_Vertex_Valid(0x7fffffffU));

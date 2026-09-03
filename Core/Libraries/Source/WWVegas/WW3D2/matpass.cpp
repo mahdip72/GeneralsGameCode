@@ -49,9 +49,8 @@
 #include "matpass.h"
 #include "vertmaterial.h"
 #include "shader.h"
-#include "texture.h"
-#include "statistics.h"
-#include "dx8wrapper.h"
+#include "WW3D2/texture.h"
+#include "Renderer/RenderGameClient.h"
 
 
 bool MaterialPassClass::EnablePerPolygonCulling = true;
@@ -117,11 +116,11 @@ MaterialPassClass::~MaterialPassClass()
  *=============================================================================================*/
 void MaterialPassClass::Install_Materials() const
 {
-	DX8Wrapper::Set_Material(Peek_Material());
-	DX8Wrapper::Set_Shader(Peek_Shader());
-	for (int i=0;i<DX8Wrapper::Get_Current_Caps()->Get_Max_Textures_Per_Pass();++i)
+	rts::render::SetGameMaterial(Peek_Material());
+	rts::render::SetGameShader(Peek_Shader());
+	for (unsigned int i = 0; i < rts::render::GetGameMaxTexturesPerPass(); ++i)
 	{
-		DX8Wrapper::Set_Texture(i,Peek_Texture(i));
+		rts::render::SetGameTexture(i,Peek_Texture(i));
 	}
 }
 

@@ -40,6 +40,7 @@
 #include "GameNetwork/NetCommandValidation.h"
 #if defined(_WIN64)
 #include "Lib/NetworkEpochHandshake.h"
+#include "Lib/LockstepV2Contract.h"
 #endif
 #include "GameNetwork/udp.h"
 #include "GameNetwork/Transport.h"
@@ -173,6 +174,25 @@ public:
 	virtual Bool isPlayerConnected( Int playerID ) override;
 	virtual Bool isNetworkHelloReady() override;
 	virtual Bool hasNetworkHelloFailure() override;
+	virtual Bool isNetworkSimulationPolicyUsable() override;
+	virtual Bool refreshNetworkSimulationPolicyForLockstepV2() override;
+	virtual Bool isMultiplayerSimulationKernelEnabled(
+		rts::MultiplayerSimulationKernel kernel) override;
+	virtual UnsignedInt getMultiplayerSimulationEnabledKernelMask() override;
+	virtual rts::MultiplayerSimulationPolicyStatus
+		getMultiplayerSimulationPolicyStatus() override;
+#if defined(_WIN64)
+	virtual Bool beginLockstepV2Proof(
+		const rts::lockstep_v2::SessionContract &session) override;
+	virtual Bool recordLockstepV2Command(UnsignedInt frame,
+		UnsignedInt originSlot, UnsignedShort commandId,
+		std::uint64_t commandDigest) override;
+	virtual Bool recordLockstepV2Frame(UnsignedInt frame, UnsignedInt crc,
+		std::uint64_t commandDigest) override;
+	virtual Bool finalizeLockstepV2Proof(Bool cleanShutdown,
+		rts::lockstep_v2::Receipt *receipt) override;
+	virtual Bool isLockstepV2ProofActive() const override;
+#endif
 
 	virtual void notifyOthersOfCurrentFrame() override;														///< Tells all the other players what frame we are on.
 	virtual void notifyOthersOfNewFrame(UnsignedInt frame) override;								///< Tells all the other players that we are on a new frame.
@@ -260,6 +280,74 @@ Bool Network::hasNetworkHelloFailure()
 {
 	return m_conMgr != nullptr && m_conMgr->hasNetworkHelloFailure();
 }
+
+Bool Network::isNetworkSimulationPolicyUsable()
+{
+	return m_conMgr != nullptr &&
+		m_conMgr->isNetworkSimulationPolicyUsable();
+}
+
+Bool Network::refreshNetworkSimulationPolicyForLockstepV2()
+{
+	return m_conMgr != nullptr &&
+		m_conMgr->refreshNetworkSimulationPolicyForLockstepV2();
+}
+
+Bool Network::isMultiplayerSimulationKernelEnabled(
+	rts::MultiplayerSimulationKernel kernel)
+{
+	return m_conMgr != nullptr &&
+		m_conMgr->isMultiplayerSimulationKernelEnabled(kernel);
+}
+
+UnsignedInt Network::getMultiplayerSimulationEnabledKernelMask()
+{
+	return m_conMgr != nullptr ?
+		m_conMgr->getMultiplayerSimulationEnabledKernelMask() : 0U;
+}
+
+rts::MultiplayerSimulationPolicyStatus
+Network::getMultiplayerSimulationPolicyStatus()
+{
+	return m_conMgr != nullptr ?
+		m_conMgr->getMultiplayerSimulationPolicyStatus() :
+		rts::MULTIPLAYER_SIMULATION_POLICY_SERIAL_NETWORK_UNAVAILABLE;
+}
+
+#if defined(_WIN64)
+Bool Network::beginLockstepV2Proof(
+	const rts::lockstep_v2::SessionContract &session)
+{
+	return m_conMgr != nullptr && m_conMgr->beginLockstepV2Proof(session);
+}
+
+Bool Network::recordLockstepV2Command(UnsignedInt frame,
+	UnsignedInt originSlot, UnsignedShort commandId,
+	std::uint64_t commandDigest)
+{
+	return m_conMgr != nullptr && m_conMgr->recordLockstepV2Command(
+		frame, originSlot, commandId, commandDigest);
+}
+
+Bool Network::recordLockstepV2Frame(UnsignedInt frame, UnsignedInt crc,
+	std::uint64_t commandDigest)
+{
+	return m_conMgr != nullptr && m_conMgr->recordLockstepV2Frame(
+		frame, crc, commandDigest);
+}
+
+Bool Network::finalizeLockstepV2Proof(Bool cleanShutdown,
+	rts::lockstep_v2::Receipt *receipt)
+{
+	return m_conMgr != nullptr && m_conMgr->finalizeLockstepV2Proof(
+		cleanShutdown, receipt);
+}
+
+Bool Network::isLockstepV2ProofActive() const
+{
+	return m_conMgr != nullptr && m_conMgr->isLockstepV2ProofActive();
+}
+#endif
 
 
 // PRIVATE FUNCTIONS //////////////////////////////////////////////////////////

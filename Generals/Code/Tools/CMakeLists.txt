@@ -28,4 +28,5 @@ endif()
 if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND
         (RTS_BUILD_GENERALS_EXTRAS OR RTS_BUILD_PRODUCT))
     add_subdirectory(RuntimeRegressionTests)
+    add_subdirectory(DeterministicAIPlanningTest)
 endif()

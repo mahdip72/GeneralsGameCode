@@ -34,6 +34,7 @@
 #include "Common/Player.h"
 #include "Common/PlayerList.h"
 #include "Common/Recorder.h"
+#include "Common/RandomValue.h"
 #include "Common/Team.h"
 #include "Common/ThingFactory.h"
 #include "Common/BuildAssistant.h"
@@ -77,6 +78,7 @@ struct SkirmishProductionCandidate
 	TeamPrototype *prototype;
 	SkirmishAICostRange costRange;
 	Int factoryWaitFrames;
+	UnsignedInt sourceOrdinal;
 };
 
 struct SkirmishFactoryProjection
@@ -84,6 +86,7 @@ struct SkirmishFactoryProjection
 	Object *factory;
 	Int projectedFrames;
 	Bool usedByCandidate;
+	Bool idle;
 };
 
 struct SkirmishEnemyCandidate
@@ -647,6 +650,7 @@ Bool AISkirmishPlayer::estimateTeamProduction(
 		projection.factory = factory;
 		projection.projectedFrames = 0;
 		projection.usedByCandidate = false;
+		projection.idle = production->getProductionCount() <= 0;
 		Bool firstEntry = true;
 		for (const ProductionEntry *entry = production->firstProduction(); entry;
 			entry = production->nextProduction(entry)) {
@@ -687,12 +691,19 @@ void AISkirmishPlayer::getVisibleEnemyComposition(
 	Int *aircraftValue, Int *vehicleValue, Int *infantryValue,
 	Coord3D *routeTarget, Bool *hasRouteTarget)
 {
+	getVisibleEnemyCompositionFor(getAiEnemy(), aircraftValue, vehicleValue,
+		infantryValue, routeTarget, hasRouteTarget);
+}
+
+void AISkirmishPlayer::getVisibleEnemyCompositionFor(
+	Player *enemy, Int *aircraftValue, Int *vehicleValue, Int *infantryValue,
+	Coord3D *routeTarget, Bool *hasRouteTarget) const
+{
 	*aircraftValue = 0;
 	*vehicleValue = 0;
 	*infantryValue = 0;
 	*hasRouteTarget = false;
 	routeTarget->zero();
-	Player *enemy = getAiEnemy();
 	if (!enemy)
 		return;
 
@@ -989,6 +1000,772 @@ SkirmishAIDecisionDifficulty AISkirmishPlayer::getDecisionDifficulty() const
 	return SKIRMISH_AI_DIFFICULTY_HARD;
 }
 
+#if defined(_WIN64)
+static Bool ShouldUseCounterBasedSkirmishAIPlanning()
+{
+	return ShouldUseSkirmishAICounterRng(
+		TheGameLogic->isInReplayGame(),
+		TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() : SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+}
+
+#endif
+
+#if defined(_WIN64)
+Bool AISkirmishPlayer::isEnemyPlanningDue() const
+{
+	Bool currentEnemyInvalid = m_currentEnemy &&
+		(m_player->getRelationship(m_currentEnemy->getDefaultTeam()) != ENEMIES ||
+		 !m_currentEnemy->hasAnyObjects());
+	return ShouldEvaluateSkirmishAITarget(currentEnemyInvalid,
+		TheGameLogic->getFrame(), m_frameToCheckEnemy, true);
+}
+
+//-------------------------------------------------------------------------------------------------
+/** Capture target facts in PlayerList order. Path, shroud, and object reads remain owner-only. */
+//-------------------------------------------------------------------------------------------------
+Bool AISkirmishPlayer::captureEnemyPlanningSnapshot(
+	rts::AIEnemyPlanningSnapshot *snapshot ) const
+{
+	if (!snapshot)
+		return false;
+	rts::ClearAIEnemyPlanningSnapshot(snapshot);
+	snapshot->frame = TheGameLogic->getFrame();
+	snapshot->ownerPlayerIndex = (UnsignedInt)m_player->getPlayerIndex();
+	snapshot->currentEnemyPlayerIndex = m_currentEnemy ? m_currentEnemy->getPlayerIndex() : -1;
+	snapshot->switchScoreThreshold = 200;
+
+	Object *representative = findEnemyRouteRepresentative();
+	for (Int i = 0; i < ThePlayerList->getPlayerCount(); ++i)
+	{
+		Player *candidatePlayer = ThePlayerList->getNthPlayer(i);
+		if (!candidatePlayer ||
+			m_player->getRelationship(candidatePlayer->getDefaultTeam()) != ENEMIES ||
+			!candidatePlayer->hasAnyObjects())
+		{
+			continue;
+		}
+		if (snapshot->candidateCount >= rts::AI_PLANNING_MAX_PLAYERS)
+			return false;
+
+		rts::AIEnemyCandidateFact &fact = snapshot->candidates[snapshot->candidateCount++];
+		fact.sourceOrdinal = (UnsignedInt)i;
+		fact.playerIndex = candidatePlayer->getPlayerIndex();
+		Bool hasKnownObject = false;
+		Bool hasKnownUnit = false;
+		Bool hasKnownBuildFacility = false;
+		fact.knownAssetValue = getKnownEnemyAssetValue(candidatePlayer,
+			&hasKnownObject, &hasKnownUnit, &hasKnownBuildFacility);
+		fact.hasKnownObject = hasKnownObject ? 1 : 0;
+		fact.hasKnownUnit = hasKnownUnit ? 1 : 0;
+		fact.hasKnownBuildFacility = hasKnownBuildFacility ? 1 : 0;
+
+		Coord3D knownPosition = m_baseCenter;
+		Bool hasKnownPosition = getKnownEnemyPosition(candidatePlayer, &knownPosition);
+		fact.hasKnownPosition = hasKnownPosition ? 1 : 0;
+		fact.distance = 0;
+		if (hasKnownPosition)
+		{
+			double dx = (double)knownPosition.x - (double)m_baseCenter.x;
+			double dy = (double)knownPosition.y - (double)m_baseCenter.y;
+			double distance = sqrt(dx * dx + dy * dy);
+			fact.distance = distance >= 2147483647.0 ? 2147483647 : (Int)(distance + 0.5);
+		}
+		fact.routeClass = (Int)classifyEnemyRoute(
+			representative, &knownPosition, hasKnownPosition);
+		fact.targetingThisAI = candidatePlayer->getCachedCurrentEnemy() == m_player ? 1 : 0;
+		fact.alliedAIsTargeting = countAlliedSkirmishAIsTargeting(candidatePlayer);
+	}
+	return true;
+}
+
+//-------------------------------------------------------------------------------------------------
+/** Publish a target ID after all player results have been sorted by their order keys. */
+//-------------------------------------------------------------------------------------------------
+Bool AISkirmishPlayer::commitEnemyPlanningResult(
+	const rts::AIEnemyPlanningSnapshot &snapshot,
+	const rts::AIEnemyPlanningResult &result )
+{
+	if (!validateEnemyPlanningCommit(snapshot, result))
+		return false;
+
+	Player *newEnemy = nullptr;
+	if (result.selectedPlayerIndex >= 0)
+	{
+		for (Int i = 0; i < ThePlayerList->getPlayerCount(); ++i)
+		{
+			Player *candidate = ThePlayerList->getNthPlayer(i);
+			if (candidate && candidate->getPlayerIndex() == result.selectedPlayerIndex)
+			{
+				newEnemy = candidate;
+				break;
+			}
+		}
+	}
+	m_frameToCheckEnemy = TheGameLogic->getFrame() + 5*LOGICFRAMES_PER_SECOND;
+
+	if (newEnemy != m_currentEnemy)
+	{
+		m_currentEnemy = newEnemy;
+		m_currentEnemyPlayerIndex = m_currentEnemy ? m_currentEnemy->getPlayerIndex() : -1;
+		if (m_currentEnemy)
+		{
+			AsciiString message = TheNameKeyGenerator->keyToName(m_player->getPlayerNameKey());
+			message.concat(" acquiring target enemy player: ");
+			message.concat(TheNameKeyGenerator->keyToName(m_currentEnemy->getPlayerNameKey()));
+			TheScriptEngine->AppendDebugMessage(message, false);
+		}
+	}
+	return true;
+}
+
+Bool AISkirmishPlayer::validateEnemyPlanningCommit(
+	const rts::AIEnemyPlanningSnapshot &snapshot,
+	const rts::AIEnemyPlanningResult &result ) const
+{
+	// ExecuteAIPlanningBatch performs the single canonical numeric validation
+	// before this owner commit. Keep this boundary structural and live-state
+	// aware so normal mode does not recompute the same enemy oracle twice.
+	if (!result.valid || snapshot.frame != TheGameLogic->getFrame() ||
+		snapshot.ownerPlayerIndex != (UnsignedInt)m_player->getPlayerIndex() ||
+		result.orderKey.frame != snapshot.frame ||
+		result.orderKey.playerIndex != snapshot.ownerPlayerIndex ||
+		result.orderKey.subphase != rts::AI_PLANNING_SUBPHASE_ENEMY_TARGET ||
+		result.orderKey.emissionOrdinal != 0U ||
+		snapshot.candidateCount > rts::AI_PLANNING_MAX_PLAYERS)
+		return false;
+	if (result.selectedPlayerIndex < 0)
+		return result.selectedPlayerIndex == -1 &&
+			result.orderKey.sourceOrdinal == rts::AI_PLANNING_INVALID_ORDINAL;
+
+	Bool snapshotMember = false;
+	for (UnsignedInt i = 0; i < snapshot.candidateCount; ++i)
+	{
+		if (snapshot.candidates[i].playerIndex == result.selectedPlayerIndex &&
+			snapshot.candidates[i].sourceOrdinal == result.orderKey.sourceOrdinal)
+		{
+			snapshotMember = true;
+			break;
+		}
+	}
+	if (!snapshotMember)
+		return false;
+	Player *candidate = ThePlayerList->getNthPlayer((Int)result.orderKey.sourceOrdinal);
+	return candidate && candidate->getPlayerIndex() == result.selectedPlayerIndex &&
+		m_player->getRelationship(candidate->getDefaultTeam()) == ENEMIES &&
+		candidate->hasAnyObjects();
+}
+
+//-------------------------------------------------------------------------------------------------
+/**
+ * Capture the complete immutable production source view on the owner thread.
+ * The old implementation called the factory, queue, template, weapon, and
+ * path helpers once per candidate. This adapter performs each live traversal
+ * once, stores only bounded POD facts, and lets the shared planner shard the
+ * expensive candidate analysis without exposing live objects to workers.
+ */
+//-------------------------------------------------------------------------------------------------
+Bool AISkirmishPlayer::captureAdaptiveProductionCandidateFacts(
+	rts::AIProductionPlanningSnapshot *snapshot,
+	const rts::AICounterRngKey &baseRandomKey,
+	Int *highestPriority,
+	Bool *overflowed )
+{
+	if (!snapshot || !highestPriority || !overflowed)
+		return false;
+	*overflowed = false;
+	rts::ClearAIProductionPlanningSnapshot(snapshot);
+	snapshot->frame = TheGameLogic->getFrame();
+	snapshot->ownerPlayerIndex = (UnsignedInt)m_player->getPlayerIndex();
+	snapshot->tieBreakKey = baseRandomKey;
+	snapshot->tieBreakKey.frame = snapshot->frame;
+	snapshot->tieBreakKey.domain = rts::AI_COUNTER_RNG_DOMAIN_PLAYER_PLANNING;
+	snapshot->tieBreakKey.playerIndex = snapshot->ownerPlayerIndex;
+	snapshot->tieBreakKey.ownerStableId = snapshot->ownerPlayerIndex;
+	snapshot->tieBreakKey.sourceStableId = 0;
+	snapshot->tieBreakKey.eventKind = rts::AI_COUNTER_RNG_EVENT_PRODUCTION_TIE;
+	snapshot->tieBreakKey.eventOrdinal = 0;
+	snapshot->tieBreakKey.drawOrdinal = 0;
+
+	std::vector<SkirmishFactoryProjection> factories;
+	for (BuildListInfo *build = m_player->getBuildList(); build;
+		build = build->getNext())
+	{
+		Object *factory = TheGameLogic->findObjectByID(build->getObjectID());
+		if (!factory || factory->getControllingPlayer() != m_player ||
+			factory->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) ||
+			factory->testStatus(OBJECT_STATUS_SOLD))
+			continue;
+		ProductionUpdateInterface *production =
+			factory->getProductionUpdateInterface();
+		if (!production)
+			continue;
+		Bool duplicate = false;
+		for (std::vector<SkirmishFactoryProjection>::const_iterator existing =
+			factories.begin(); existing != factories.end(); ++existing)
+		{
+			if (existing->factory == factory)
+			{
+				duplicate = true;
+				break;
+			}
+		}
+		if (duplicate)
+			continue;
+		if (factories.size() >= rts::AI_PLANNING_MAX_PRODUCTION_FACTORIES)
+		{
+			*overflowed = true;
+			return false;
+		}
+		SkirmishFactoryProjection projection;
+		projection.factory = factory;
+		projection.projectedFrames = 0;
+		projection.usedByCandidate = false;
+		projection.idle = production->getProductionCount() <= 0;
+		Bool firstEntry = true;
+		for (const ProductionEntry *entry = production->firstProduction(); entry;
+			entry = production->nextProduction(entry))
+		{
+			projection.projectedFrames = AddSkirmishAIFrameValue(
+				projection.projectedFrames,
+				getSkirmishProductionEntryFrames(entry, m_player, firstEntry));
+			firstEntry = false;
+		}
+		factories.push_back(projection);
+	}
+	snapshot->sourceFacts.factoryCount = (UnsignedInt)factories.size();
+	for (UnsignedInt factory = 0U; factory < snapshot->sourceFacts.factoryCount;
+		++factory)
+	{
+		snapshot->sourceFacts.factories[factory].projectedFrames =
+			factories[factory].projectedFrames;
+		snapshot->sourceFacts.factories[factory].valid = 1U;
+		snapshot->sourceFacts.factories[factory].idle =
+			factories[factory].idle ? 1U : 0U;
+	}
+
+	// Enemy composition and the route target are one owner-side object scan for
+	// the whole batch. A second single representative query supplies the shared
+	// ground-route fact; neither is repeated per candidate.
+	Coord3D routeTarget;
+	Bool hasRouteTarget = false;
+	getVisibleEnemyCompositionFor(m_currentEnemy,
+		&snapshot->sourceFacts.enemyAircraftValue,
+		&snapshot->sourceFacts.enemyVehicleValue,
+		&snapshot->sourceFacts.enemyInfantryValue,
+		&routeTarget, &hasRouteTarget);
+	snapshot->sourceFacts.hasRouteTarget = hasRouteTarget ? 1U : 0U;
+	Object *representative = nullptr;
+	for (Object *object = TheGameLogic->getFirstObject(); object;
+		object = object->getNextObject())
+	{
+		if (object->getControllingPlayer() == m_player &&
+			!object->isEffectivelyDead() &&
+			!object->isKindOf(KINDOF_STRUCTURE) &&
+			!object->isKindOf(KINDOF_AIRCRAFT) &&
+			object->getAIUpdateInterface())
+		{
+			representative = object;
+			break;
+		}
+	}
+	if (representative && hasRouteTarget && representative->getAIUpdateInterface())
+	{
+		snapshot->sourceFacts.groundRouteKnown = 1U;
+		snapshot->sourceFacts.groundRouteReachable =
+			TheAI->pathfinder()->clientSafeQuickDoesPathExist(
+				representative->getAIUpdateInterface()->getLocomotorSet(),
+				representative->getPosition(), &routeTarget) ? 1U : 0U;
+	}
+
+	const TeamPrototype *queuedPrototypes[
+		rts::AI_PLANNING_MAX_PRODUCTION_CANDIDATES];
+	UnsignedInt queuedCount = 0U;
+	for (DLINK_ITERATOR<TeamInQueue> iter = iterate_TeamBuildQueue();
+		!iter.done(); iter.advance())
+	{
+		TeamInQueue *team = iter.cur();
+		if (!team || !team->m_team || !team->m_team->getPrototype())
+			continue;
+		if (queuedCount >= rts::AI_PLANNING_MAX_PRODUCTION_CANDIDATES)
+		{
+			*overflowed = true;
+			return false;
+		}
+		queuedPrototypes[queuedCount++] = team->m_team->getPrototype();
+	}
+
+	Bool hasCandidate = false;
+	*highestPriority = (-2147483647 - 1);
+	UnsignedInt sourceOrdinal = 0;
+	Player::PlayerTeamList::const_iterator teamIt;
+	for (teamIt = m_player->getPlayerTeams()->begin();
+		teamIt != m_player->getPlayerTeams()->end(); ++teamIt, ++sourceOrdinal)
+	{
+		TeamPrototype *prototype = *teamIt;
+		if (!prototype || !prototype->evaluateProductionCondition() ||
+			prototype->countTeamInstances() >=
+				prototype->getTemplateInfo()->m_maxInstances)
+			continue;
+		Bool queued = false;
+		for (UnsignedInt queuedIndex = 0U; queuedIndex < queuedCount;
+			++queuedIndex)
+		{
+			if (queuedPrototypes[queuedIndex] == prototype)
+			{
+				queued = true;
+				break;
+			}
+		}
+		if (queued)
+			continue;
+		if (rts::RequiresAIProductionOwnerSerialFallback(
+			snapshot->candidateCount + 1U))
+		{
+			*overflowed = true;
+			return false;
+		}
+
+		const TeamTemplateInfo *info = prototype->getTemplateInfo();
+		rts::AIProductionCandidateSourceFact &source =
+			snapshot->sourceFacts.candidates[snapshot->candidateCount];
+		memset(&source, 0, sizeof(source));
+		Bool hasUnit = false;
+		Bool candidateFactoriesAvailable = true;
+		Bool anyIdleFactory = false;
+		for (Int unitIndex = 0; unitIndex < info->m_numUnitsInfo; ++unitIndex)
+		{
+			const TCreateUnitsInfo *unitInfo = &info->m_unitsInfo[unitIndex];
+			const ThingTemplate *thing =
+				TheThingFactory->findTemplate(unitInfo->unitThingName);
+			if (!thing)
+				continue;
+			if (source.unitCount >= rts::AI_PLANNING_MAX_PRODUCTION_UNITS)
+			{
+				*overflowed = true;
+				return false;
+			}
+			rts::AIProductionUnitSourceFact &unit =
+				source.units[source.unitCount++];
+			hasUnit = true;
+			unit.cost = thing->calcCostToBuild(m_player);
+			unit.buildFrames = thing->calcTimeToBuild(m_player);
+			unit.minUnits = unitInfo->minUnits;
+			unit.maxUnits = unitInfo->maxUnits;
+			if (thing->isKindOf(KINDOF_AIRCRAFT))
+				unit.flags |= rts::AI_PRODUCTION_SOURCE_AIRCRAFT;
+			if (thing->isKindOf(KINDOF_VEHICLE))
+				unit.flags |= rts::AI_PRODUCTION_SOURCE_VEHICLE;
+			if (thing->isKindOf(KINDOF_INFANTRY))
+				unit.flags |= rts::AI_PRODUCTION_SOURCE_INFANTRY;
+			WeaponSetFlags weaponFlags;
+			weaponFlags.clear();
+			const WeaponTemplateSet *weaponSet =
+				thing->findWeaponTemplateSet(weaponFlags);
+			if (weaponSet)
+			{
+				for (Int slot = 0; slot < WEAPONSLOT_COUNT; ++slot)
+				{
+					const WeaponTemplate *weapon =
+						weaponSet->getNth((WeaponSlotType)slot);
+					if (weapon && (weapon->getAntiMask() &
+						(WEAPON_ANTI_AIRBORNE_VEHICLE |
+						 WEAPON_ANTI_AIRBORNE_INFANTRY)))
+						unit.flags |= rts::AI_PRODUCTION_SOURCE_ATTACKS_AIRCRAFT;
+					if (weapon && (weapon->getAntiMask() & WEAPON_ANTI_GROUND))
+						unit.flags |= rts::AI_PRODUCTION_SOURCE_ATTACKS_GROUND;
+					if (!weapon)
+						continue;
+					const KindOfMaskType &preferred =
+						weaponSet->getNthPreferredAgainstMask((WeaponSlotType)slot);
+					if (preferred.test(KINDOF_AIRCRAFT))
+						unit.flags |= rts::AI_PRODUCTION_SOURCE_ATTACKS_AIRCRAFT;
+					if (preferred.test(KINDOF_VEHICLE))
+						unit.flags |= rts::AI_PRODUCTION_SOURCE_PREFERS_VEHICLE;
+					if (preferred.test(KINDOF_INFANTRY))
+						unit.flags |= rts::AI_PRODUCTION_SOURCE_PREFERS_INFANTRY;
+				}
+			}
+			for (UnsignedInt factory = 0U;
+				factory < snapshot->sourceFacts.factoryCount; ++factory)
+			{
+				if (!TheBuildAssistant->isPossibleToMakeUnit(
+					factories[factory].factory, thing))
+					continue;
+				unit.compatibleFactoryMask |= 1U << factory;
+				Int quantity = ProductionUpdate::getProductionQuantityForUnitFromObject(
+					factories[factory].factory, thing);
+				if (quantity < 1)
+					quantity = 1;
+				if (quantity > 255)
+				{
+					*overflowed = true;
+					return false;
+				}
+				unit.productionQuantity[factory] = (unsigned char)quantity;
+				if (factories[factory].idle)
+					anyIdleFactory = true;
+			}
+			if (unit.compatibleFactoryMask == 0U)
+				candidateFactoriesAvailable = false;
+		}
+		if (!hasUnit || !candidateFactoriesAvailable || !anyIdleFactory)
+			continue;
+
+		source.valid = 1U;
+		rts::AIProductionCandidateFact &fact =
+			snapshot->candidates[snapshot->candidateCount++];
+		fact.sourceOrdinal = sourceOrdinal;
+		fact.candidateStableId = (UnsignedInt)prototype->getID();
+		fact.configuredPriority = prototype->getTemplateInfo()->m_productionPriority;
+		fact.eligible = 1;
+		if (ShouldReplaceSkirmishAIHighestPriority(
+			hasCandidate, fact.configuredPriority, *highestPriority))
+		{
+			*highestPriority = fact.configuredPriority;
+		}
+		hasCandidate = true;
+	}
+	snapshot->sourceFacts.valid = 1U;
+	return true;
+}
+
+//-------------------------------------------------------------------------------------------------
+/** Finish small owner state capture after the immutable source view is ready. */
+//-------------------------------------------------------------------------------------------------
+Bool AISkirmishPlayer::finishAdaptiveProductionPlanningSnapshot(
+	rts::AIProductionPlanningSnapshot *snapshot )
+{
+	if (!snapshot || snapshot->candidateCount > rts::AI_PLANNING_MAX_PRODUCTION_CANDIDATES)
+		return false;
+
+	Bool criticalRebuildCanStart = false;
+	Int rebuildReserve = getCriticalRebuildReserve(&criticalRebuildCanStart);
+	Int poorReserve = TheAI->getAiData()->m_resourcesPoor;
+	snapshot->initialReserve = GetSkirmishAIReserve(poorReserve, rebuildReserve);
+	snapshot->retryReserve = GetSkirmishAIReserve(poorReserve, 0);
+	Bool rebuildReserveApplied = snapshot->initialReserve > snapshot->retryReserve;
+	snapshot->retryWithoutInitialReserve =
+		rebuildReserveApplied && !criticalRebuildCanStart ? 1 : 0;
+	snapshot->resources = m_player->getMoney()->countMoney();
+	snapshot->logicFramesPerSecond = LOGICFRAMES_PER_SECOND;
+	SkirmishAIDecisionDifficulty difficulty = getDecisionDifficulty();
+	snapshot->difficulty = (Int)difficulty;
+	snapshot->contextInfluencePercent = GetSkirmishAIContextInfluencePercent(difficulty);
+
+	// Source facts already contain the one-time enemy/object/nav observations and
+	// each candidate's immutable unit/weapon/factory facts. Feedback counters are
+	// owner state, so copy them once here without reopening any per-candidate
+	// live traversal.
+	UnsignedInt sourceOrdinal = 0U;
+	UnsignedInt candidateIndex = 0U;
+	Player::PlayerTeamList::const_iterator teamIt;
+	for (teamIt = m_player->getPlayerTeams()->begin();
+		teamIt != m_player->getPlayerTeams()->end() &&
+			candidateIndex < snapshot->candidateCount;
+		++teamIt, ++sourceOrdinal)
+	{
+		rts::AIProductionCandidateFact &fact =
+			snapshot->candidates[candidateIndex];
+		if (fact.sourceOrdinal != sourceOrdinal)
+			continue;
+		TeamPrototype *prototype = *teamIt;
+		if (!prototype || (UnsignedInt)prototype->getID() !=
+			fact.candidateStableId ||
+			!snapshot->sourceFacts.candidates[candidateIndex].valid)
+			return false;
+		fact.recentLossCount = prototype->getRecentSkirmishAILossCount();
+		fact.recentPathFailureCount = prototype->getRecentSkirmishAIPathFailureCount();
+		++candidateIndex;
+	}
+	return candidateIndex == snapshot->candidateCount;
+}
+
+Bool AISkirmishPlayer::prepareAdaptiveProductionPlanningSnapshot(
+	rts::AIProductionPlanningSnapshot *snapshot,
+	const rts::AICounterRngKey &baseRandomKey,
+	Bool *handled,
+	Bool *overflowed)
+{
+	if (!snapshot || !handled || !overflowed)
+		return false;
+	*handled = false;
+	*overflowed = false;
+
+	// Feedback decay is an owner mutation and must happen once, before the
+	// immutable candidate view is handed to the shared planner.
+	Player::PlayerTeamList::const_iterator teamIt;
+	for (teamIt = m_player->getPlayerTeams()->begin();
+		teamIt != m_player->getPlayerTeams()->end(); ++teamIt)
+	{
+		(*teamIt)->decaySkirmishAIFeedback(TheGameLogic->getFrame());
+	}
+
+	Int highestPriority = (-2147483647 - 1);
+	if (!captureAdaptiveProductionCandidateFacts(
+		snapshot, baseRandomKey, &highestPriority, overflowed))
+		return false;
+
+	// Preserve the legacy reinforcement decision boundary before admitting the
+	// expensive production context to the worker batch.
+	if (selectTeamToReinforce(highestPriority))
+	{
+		// The retail process path queues existing work again after a successful
+		// reinforcement selection.  Keep that owner-side pass before marking the
+		// batched production boundary handled.
+		queueUnits();
+		markProductionPlanningHandled();
+		*handled = true;
+		return true;
+	}
+	if (snapshot->candidateCount == 0U)
+	{
+		markProductionPlanningHandled();
+		*handled = true;
+		return true;
+	}
+	return finishAdaptiveProductionPlanningSnapshot(snapshot);
+}
+
+//-------------------------------------------------------------------------------------------------
+/** Rare overflow lane: preserve epoch-3 scoring and counter-RNG semantics without a fixed array. */
+//-------------------------------------------------------------------------------------------------
+Bool AISkirmishPlayer::selectTeamToBuildCounterSerialFallback(
+	const rts::AICounterRngKey &randomKey )
+{
+	Bool hasCandidate = false;
+	Int highestPriority = (-2147483647 - 1);
+	std::vector<SkirmishProductionCandidate> candidates;
+	UnsignedInt sourceOrdinal = 0U;
+	Player::PlayerTeamList::const_iterator teamIt;
+	for (teamIt = m_player->getPlayerTeams()->begin();
+		teamIt != m_player->getPlayerTeams()->end(); ++teamIt, ++sourceOrdinal)
+	{
+		SkirmishProductionCandidate candidate;
+		candidate.prototype = *teamIt;
+		candidate.sourceOrdinal = sourceOrdinal;
+		if (!isAdaptiveProductionCandidate(candidate.prototype,
+			&candidate.costRange, &candidate.factoryWaitFrames))
+		{
+			continue;
+		}
+		candidates.push_back(candidate);
+		const Int priority = candidate.prototype->getTemplateInfo()->m_productionPriority;
+		if (ShouldReplaceSkirmishAIHighestPriority(
+			hasCandidate, priority, highestPriority))
+		{
+			highestPriority = priority;
+		}
+		hasCandidate = true;
+	}
+
+	// Match the fixed-snapshot path's legacy reinforcement boundary exactly.
+	if (selectTeamToReinforce(highestPriority))
+		return true;
+	if (!hasCandidate)
+		return false;
+
+	rts::AIProductionPlanningSnapshot context;
+	rts::ClearAIProductionPlanningSnapshot(&context);
+	context.frame = TheGameLogic->getFrame();
+	context.ownerPlayerIndex = (UnsignedInt)m_player->getPlayerIndex();
+	context.tieBreakKey = randomKey;
+	Bool criticalRebuildCanStart = false;
+	const Int rebuildReserve = getCriticalRebuildReserve(&criticalRebuildCanStart);
+	const Int poorReserve = TheAI->getAiData()->m_resourcesPoor;
+	context.initialReserve = GetSkirmishAIReserve(poorReserve, rebuildReserve);
+	context.retryReserve = GetSkirmishAIReserve(poorReserve, 0);
+	const Bool rebuildReserveApplied = context.initialReserve > context.retryReserve;
+	context.retryWithoutInitialReserve =
+		rebuildReserveApplied && !criticalRebuildCanStart ? 1U : 0U;
+	context.resources = m_player->getMoney()->countMoney();
+	context.logicFramesPerSecond = LOGICFRAMES_PER_SECOND;
+	const SkirmishAIDecisionDifficulty difficulty = getDecisionDifficulty();
+	context.difficulty = (Int)difficulty;
+	context.contextInfluencePercent = GetSkirmishAIContextInfluencePercent(difficulty);
+
+	Int enemyAircraftValue = 0;
+	Int enemyVehicleValue = 0;
+	Int enemyInfantryValue = 0;
+	Coord3D routeTarget;
+	Bool hasRouteTarget = false;
+	getVisibleEnemyCompositionFor(m_currentEnemy, &enemyAircraftValue,
+		&enemyVehicleValue, &enemyInfantryValue, &routeTarget, &hasRouteTarget);
+
+	std::vector<rts::AIProductionCandidateFact> candidateFacts;
+	candidateFacts.reserve(candidates.size());
+	for (std::vector<SkirmishProductionCandidate>::const_iterator candidateIt = candidates.begin();
+		candidateIt != candidates.end(); ++candidateIt)
+	{
+		rts::AIProductionCandidateFact fact;
+		memset(&fact, 0, sizeof(fact));
+		fact.sourceOrdinal = candidateIt->sourceOrdinal;
+		fact.candidateStableId = (UnsignedInt)candidateIt->prototype->getID();
+		fact.configuredPriority =
+			candidateIt->prototype->getTemplateInfo()->m_productionPriority;
+		fact.minimumCost = candidateIt->costRange.minimumCost;
+		fact.plannedCost = candidateIt->costRange.plannedCost;
+		fact.factoryWaitFrames = candidateIt->factoryWaitFrames;
+		fact.counterFitScore = getCandidateCounterFit(candidateIt->prototype,
+			enemyAircraftValue, enemyVehicleValue, enemyInfantryValue);
+		fact.routeClass = (Int)classifyTeamRoute(
+			candidateIt->prototype, &routeTarget, hasRouteTarget);
+		fact.recentLossCount = candidateIt->prototype->getRecentSkirmishAILossCount();
+		fact.recentPathFailureCount =
+			candidateIt->prototype->getRecentSkirmishAIPathFailureCount();
+		fact.eligible = 1U;
+		candidateFacts.push_back(fact);
+	}
+
+	rts::RecordAIPlanningOwnerCapture((UnsignedInt)candidateFacts.size());
+	rts::AIProductionSelectionResult result;
+	if (!rts::PlanAIProductionSelectionOwnerSerial(context,
+		&candidateFacts[0], (UnsignedInt)candidateFacts.size(), &result) ||
+		!result.valid || !result.hasSelection)
+	{
+		rts::RecordAIPlanningOwnerCommit(false);
+		return false;
+	}
+
+	TeamPrototype *selectedPrototype = NULL;
+	for (std::vector<SkirmishProductionCandidate>::const_iterator candidateIt = candidates.begin();
+		candidateIt != candidates.end(); ++candidateIt)
+	{
+		if (candidateIt->sourceOrdinal == result.selectedSourceOrdinal &&
+			(UnsignedInt)candidateIt->prototype->getID() == result.selectedStableId)
+		{
+			selectedPrototype = candidateIt->prototype;
+			break;
+		}
+	}
+	if (!selectedPrototype)
+	{
+		rts::RecordAIPlanningOwnerCommit(false);
+		return false;
+	}
+
+	// Revalidate the stable ID at the original live-list ordinal immediately
+	// before the single commit mutation.
+	sourceOrdinal = 0U;
+	for (teamIt = m_player->getPlayerTeams()->begin();
+		teamIt != m_player->getPlayerTeams()->end(); ++teamIt, ++sourceOrdinal)
+	{
+		if (sourceOrdinal != result.selectedSourceOrdinal)
+			continue;
+		const Bool accepted = *teamIt == selectedPrototype &&
+			(UnsignedInt)(*teamIt)->getID() == result.selectedStableId &&
+			queueSelectedTeam(*teamIt);
+		rts::RecordAIPlanningOwnerCommit(accepted != FALSE);
+		return accepted;
+	}
+	rts::RecordAIPlanningOwnerCommit(false);
+	return false;
+}
+
+Bool AISkirmishPlayer::validateProductionPlanningCommit(
+	const rts::AIProductionPlanningSnapshot &snapshot,
+	const rts::AIProductionPlanningResult &result ) const
+{
+	// The shared batch executor has already performed the canonical numeric
+	// validation.  Keep this owner boundary structural and membership-only so
+	// the normal production path does not recompute the oracle.
+	if (!result.valid ||
+		snapshot.frame != (UnsignedInt)TheGameLogic->getFrame() ||
+		snapshot.ownerPlayerIndex != (UnsignedInt)m_player->getPlayerIndex() ||
+		result.orderKey.frame != snapshot.frame ||
+		result.orderKey.playerIndex != snapshot.ownerPlayerIndex ||
+		result.orderKey.subphase != rts::AI_PLANNING_SUBPHASE_TEAM_PRODUCTION ||
+		result.orderKey.emissionOrdinal != 0U ||
+		result.selectedSourceOrdinal != result.orderKey.sourceOrdinal ||
+		snapshot.candidateCount > rts::AI_PLANNING_MAX_PRODUCTION_CANDIDATES)
+		return false;
+	if (!result.hasSelection)
+		return result.selectedSourceOrdinal == rts::AI_PLANNING_INVALID_ORDINAL &&
+			result.orderKey.sourceOrdinal == rts::AI_PLANNING_INVALID_ORDINAL &&
+			result.selectedStableId == 0U && result.tieCount == 0U;
+
+	Bool snapshotMember = false;
+	for (UnsignedInt i = 0; i < snapshot.candidateCount; ++i)
+	{
+		const rts::AIProductionCandidateFact &candidate = snapshot.candidates[i];
+		if (candidate.eligible &&
+			candidate.sourceOrdinal == result.selectedSourceOrdinal &&
+			candidate.candidateStableId == result.selectedStableId)
+		{
+			snapshotMember = true;
+			break;
+		}
+	}
+	if (!snapshotMember)
+		return false;
+
+	UnsignedInt sourceOrdinal = 0;
+	Player::PlayerTeamList::const_iterator teamIt;
+	for (teamIt = m_player->getPlayerTeams()->begin();
+		teamIt != m_player->getPlayerTeams()->end(); ++teamIt, ++sourceOrdinal)
+	{
+		if (sourceOrdinal == result.selectedSourceOrdinal)
+			return (UnsignedInt)(*teamIt)->getID() == result.selectedStableId;
+	}
+	return false;
+}
+
+Bool AISkirmishPlayer::validateProductionPlanningBatchCommit(
+	const rts::AIProductionPlanningSnapshot &snapshot,
+	const rts::AIProductionPlanningResult &result) const
+{
+	return validateProductionPlanningCommit(snapshot, result);
+}
+
+Bool AISkirmishPlayer::commitProductionPlanningResult(
+	const rts::AIProductionPlanningSnapshot &snapshot,
+	const rts::AIProductionPlanningResult &result )
+{
+	if (!validateProductionPlanningCommit(snapshot, result))
+		return false;
+
+	UnsignedInt sourceOrdinal = 0;
+	Player::PlayerTeamList::const_iterator teamIt;
+	for (teamIt = m_player->getPlayerTeams()->begin();
+		teamIt != m_player->getPlayerTeams()->end(); ++teamIt, ++sourceOrdinal)
+	{
+		if (sourceOrdinal == result.selectedSourceOrdinal)
+			return queueSelectedTeam(*teamIt);
+	}
+	return false;
+}
+
+Bool AISkirmishPlayer::selectTeamToBuildWithPlanning()
+{
+	// Feedback decay is an explicit owner mutation and therefore happens before
+	// immutable capture rather than being hidden inside a capture adapter.
+	Player::PlayerTeamList::const_iterator teamIt;
+	for (teamIt = m_player->getPlayerTeams()->begin();
+		teamIt != m_player->getPlayerTeams()->end(); ++teamIt)
+	{
+		(*teamIt)->decaySkirmishAIFeedback(TheGameLogic->getFrame());
+	}
+
+	rts::AICounterRngKey randomKey;
+	rts::ClearAICounterRngKey(&randomKey);
+	randomKey.simulationEpoch = SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG;
+	randomKey.matchSeed = GetGameLogicRandomSeed();
+	randomKey.frame = TheGameLogic->getFrame();
+	randomKey.domain = rts::AI_COUNTER_RNG_DOMAIN_PLAYER_PLANNING;
+	randomKey.playerIndex = (UnsignedInt)m_player->getPlayerIndex();
+	randomKey.ownerStableId = randomKey.playerIndex;
+	randomKey.sourceStableId = 0U;
+	randomKey.eventKind = rts::AI_COUNTER_RNG_EVENT_PRODUCTION_TIE;
+	randomKey.eventOrdinal = 0U;
+	randomKey.drawOrdinal = 0U;
+
+	// The normal current-epoch path is admitted only by AI::update's one-batch
+	// lane. If that lane cannot publish (capture, admission, or validation
+	// failure), keep the deterministic counter-RNG result on the owner without
+	// manufacturing a one-snapshot JobSystem batch.
+	return selectTeamToBuildCounterSerialFallback(randomKey);
+}
+#endif
+
 /**
  * Determine the next team to build.  Return true if one was selected.
  */
@@ -996,6 +1773,20 @@ Bool AISkirmishPlayer::selectTeamToBuild()
 {
 	if (!ShouldUseCurrentSkirmishAIBehavior())
 		return AIPlayer::selectTeamToBuild();
+#if defined(_WIN64)
+	if (hasStagedProductionPlanningResult())
+	{
+		rts::AIProductionPlanningSnapshot snapshot;
+		rts::AIProductionPlanningResult result;
+		if (!takeStagedProductionPlanningResult(&snapshot, &result))
+			return false;
+		if (!result.valid || !result.hasSelection)
+			return false;
+		return commitProductionPlanningResult(snapshot, result);
+	}
+	if (ShouldUseCounterBasedSkirmishAIPlanning())
+		return selectTeamToBuildWithPlanning();
+#endif
 
 	Bool hasCandidate = false;
 	Int highestPriority = (-2147483647 - 1);
@@ -1004,6 +1795,7 @@ Bool AISkirmishPlayer::selectTeamToBuild()
 	for (teamIt = m_player->getPlayerTeams()->begin(); teamIt != m_player->getPlayerTeams()->end(); ++teamIt) {
 		SkirmishProductionCandidate candidate;
 		candidate.prototype = *teamIt;
+		candidate.sourceOrdinal = 0U;
 		candidate.prototype->decaySkirmishAIFeedback(TheGameLogic->getFrame());
 		if (!isAdaptiveProductionCandidate(
 			candidate.prototype, &candidate.costRange, &candidate.factoryWaitFrames))
@@ -1762,9 +2554,19 @@ void AISkirmishPlayer::doTeamBuilding()
 		// happens, like a building is added or a unit finished, the timers are shortcut.
 		m_teamDelay--;
 		if (m_teamDelay<1) {
+			#if defined(_WIN64)
+			if (!consumeProductionPlanningQueue())
+				queueUnits(); // update the queues.
+			#else
 			queueUnits(); // update the queues.
+			#endif
 			if (m_readyToBuildTeam) {
+				#if defined(_WIN64)
+				if (!consumeProductionPlanningHandled())
+					processTeamBuilding();
+				#else
 				processTeamBuilding();
+				#endif
 			}
 			m_teamDelay = 2*LOGICFRAMES_PER_SECOND; // check again in 5 seconds.
 			// Note that this timer gets shortcut when a unit or building is completed.

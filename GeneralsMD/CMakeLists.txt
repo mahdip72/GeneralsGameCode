@@ -18,7 +18,7 @@ endif()
 # Add main build targets
 add_subdirectory(Code)
 
-if(TARGET z_launcher)
+if(TARGET z_launcher AND TARGET z_generals)
     set(_RTS_GENERATED_LAUNCHER_LCF_ZEROHOUR
         "${CMAKE_CURRENT_BINARY_DIR}/launcher.lcf")
     rts_generate_launcher_lcf(z_generals
@@ -26,7 +26,7 @@ if(TARGET z_launcher)
 endif()
 
 # Keep registry discovery isolated from the user-controlled install prefix.
-# Only the legacy Win32 path may use the registry value as a fallback.
+# Registry values are diagnostic only and never become install destinations.
 set(_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR "${RTS_INSTALL_PREFIX_ZEROHOUR}")
 if("${CMAKE_HOST_SYSTEM}" MATCHES "Windows" AND "${CMAKE_SYSTEM}" MATCHES "Windows"
         AND CMAKE_SIZEOF_VOID_P EQUAL 4)
@@ -53,10 +53,11 @@ if("${CMAKE_HOST_SYSTEM}" MATCHES "Windows" AND "${CMAKE_SYSTEM}" MATCHES "Windo
         RTS_REGISTRY_INSTALL_PREFIX_ZEROHOUR
         "Zero Hour install path from registry")
 
-    if(NOT RTS_INSTALL_PREFIX_ZEROHOUR)
-        set(_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR
-            "${RTS_REGISTRY_INSTALL_PREFIX_ZEROHOUR}")
-    endif()
+endif()
+
+if(IS_VS6_BUILD AND RTS_BUILD_ZEROHOUR_PRODUCT)
+    rts_validate_task_owned_vc6_install_prefix(
+        "${RTS_INSTALL_PREFIX_ZEROHOUR}" "RTS_INSTALL_PREFIX_ZEROHOUR")
 endif()
 
 # Native products have no compatible retail registry location.  Keep an
@@ -66,7 +67,7 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT _RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR)
     set(_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR "ZeroHour")
 endif()
 
-if(_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR)
+if(_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR AND TARGET z_generals)
     install(TARGETS z_generals RUNTIME DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}")
     install(FILES $<TARGET_PDB_FILE:z_generals> DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}" OPTIONAL)
 
@@ -102,18 +103,6 @@ if(_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR)
 
     rts_install_asan_runtime("${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}")
 
-    if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND TARGET d3d8to9)
-        install(TARGETS d3d8to9
-            RUNTIME DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}")
-        install(FILES ${RTS_NATIVE_D3DX_RUNTIME_DLLS}
-            DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}")
-        install(FILES "${RTS_NATIVE_D3D8_COMPAT_LICENSE}"
-            DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}/licenses/native-d3d8-compat"
-            RENAME "d3d8to9-LICENSE.md")
-        install(FILES ${RTS_NATIVE_D3DX_LICENSE_FILES}
-            DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}/licenses/native-d3d8-compat")
-    endif()
-
     if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND TARGET z_launcher)
         install(TARGETS z_launcher RUNTIME DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}")
         install(FILES $<TARGET_PDB_FILE:z_launcher> DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}" OPTIONAL)
@@ -128,7 +117,9 @@ if(_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR)
         install(TARGETS z_runtime_regression_tests RUNTIME DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}")
         install(FILES $<TARGET_PDB_FILE:z_runtime_regression_tests> DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}" OPTIONAL)
     endif()
+endif()
 
+if(_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR)
     if(TARGET z_worldbuilder)
         install(TARGETS z_worldbuilder RUNTIME DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}")
         install(FILES $<TARGET_PDB_FILE:z_worldbuilder> DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}" OPTIONAL)
@@ -169,7 +160,7 @@ if(_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR)
         install(FILES $<TARGET_PDB_FILE:z_wdump> DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}" OPTIONAL)
     endif()
 else()
-    message(STATUS "Zero Hour install path not found. Registry keys for 'Command and Conquer Generals Zero Hour' not found. "
+    message(STATUS "No explicit Zero Hour install prefix was supplied. "
                    "Zero Hour targets will be built, but not installed. "
-                   "You can specify the path manually by setting RTS_INSTALL_PREFIX_ZEROHOUR.")
+                   "Set RTS_INSTALL_PREFIX_ZEROHOUR to a task-owned disposable path to install.")
 endif()

@@ -6,6 +6,7 @@
 
 #include "Lib/ParallelVisibility.h"
 #include "Lib/PipelineExecutionPolicy.h"
+#include "../TestSupport/LocalCapacityTestLane.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -454,7 +455,16 @@ int testSerialPipelinePolicy()
 
 int main(int argc, char **argv)
 {
-	if (argc == 2 && strcmp(argv[1], "--serial-policy") == 0) return testSerialPipelinePolicy();
+	bool localCapacity = false;
+	bool serialPipelines = false;
+	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity,
+		&serialPipelines, "--serial-policy"))
+	{
+		fprintf(stderr, "Usage: core_parallel_visibility_tests [--local-capacity] [--serial-policy]\n");
+		return 2;
+	}
+	rts_test::PrintTestCapacityLane(localCapacity);
+	if (serialPipelines) return testSerialPipelinePolicy();
 	testClipEdges();
 	const unsigned workers[] = { 1, 2, 4, 8, 16, 0 };
 	const unsigned sizes[] = { 0, 1, 511, 1023, 1024, 1031, 8192 };
@@ -463,7 +473,11 @@ int main(int argc, char **argv)
 		rts::JobSystem &system = rts::JobSystem::instance();
 		system.shutdown();
 		rts::JobSystemConfig config;
-		config.workerCount = workers[worker];
+		const unsigned effectiveWorkerCount =
+			rts_test::ResolveActualWorkerCount(workers[worker], localCapacity);
+		rts_test::PrintWorkerCountSubstitution("parallel visibility",
+			workers[worker], effectiveWorkerCount, localCapacity);
+		config.workerCount = effectiveWorkerCount;
 		config.queueCapacity = 512;
 		config.scratchBytesPerWorker = 4096;
 		CHECK(system.start(config));

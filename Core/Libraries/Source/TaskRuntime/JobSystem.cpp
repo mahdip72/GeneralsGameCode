@@ -41,6 +41,7 @@ struct GroupRecord
 		  failed(false), cancelled(false)
 	{
 	}
+	void removePending(unsigned count);
 
 	void *owner;
 	unsigned generation;
@@ -97,6 +98,31 @@ thread_local void *s_currentJobSystemWorkerQueue = 0;
 std::atomic<unsigned> s_startupWorkerCount(0);
 std::atomic<unsigned> s_startupWorkerPolicy(JOB_WORKER_POLICY_AUTO);
 
+unsigned long long performanceClockNanoseconds()
+{
+	return static_cast<unsigned long long>(
+		std::chrono::duration_cast<std::chrono::nanoseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+void saturatingCounterAdd(unsigned long long &value,
+	unsigned long long increment)
+{
+	const unsigned long long maximum = ~0ull;
+	value = increment > maximum - value ? maximum : value + increment;
+}
+
+void saturatingCounterIncrement(unsigned long long &value)
+{
+	saturatingCounterAdd(value, 1);
+}
+
+void updateCounterMaximum(unsigned long long &value,
+	unsigned long long sample)
+{
+	if (sample > value) value = sample;
+}
+
 #if defined(RTS_BUILD_CORE_EXTRAS)
 std::atomic<unsigned> s_jobSystemTestFault(0);
 std::atomic<unsigned> s_jobSystemTestFaultOccurrence(0);
@@ -144,6 +170,40 @@ void pauseJobSystemTest(unsigned pausePoint)
 	}
 }
 #endif
+
+std::unique_lock<std::mutex> lockCompletionMutex(std::mutex &mutex,
+	unsigned testPausePoint)
+{
+	std::unique_lock<std::mutex> lock(mutex, std::defer_lock);
+#if defined(RTS_BUILD_CORE_EXTRAS)
+	if ((s_jobSystemTestPauseMask.load(std::memory_order_acquire) & testPausePoint) != 0 &&
+		!lock.try_lock())
+	{
+		pauseJobSystemTest(testPausePoint);
+	}
+#else
+	(void)testPausePoint;
+#endif
+	if (!lock.owns_lock()) lock.lock();
+	return lock;
+}
+
+void GroupRecord::removePending(unsigned count)
+{
+	bool complete;
+	{
+		// Publish the predicate under the same mutex used by completion waiters.
+		std::unique_lock<std::mutex> lock = lockCompletionMutex(mutex, 512);
+		complete = pending.fetch_sub(count, std::memory_order_acq_rel) == count;
+	}
+	if (complete)
+	{
+		completed.notify_all();
+#if defined(RTS_BUILD_CORE_EXTRAS)
+		pauseJobSystemTest(256);
+#endif
+	}
+}
 
 #if defined(_WIN32) && !defined(_WIN64)
 class DeterministicFloatingPointScope
@@ -276,6 +336,10 @@ std::vector<JobCpuSetInfo> enumerateSystemCpuSets()
 		reinterpret_cast<GetProcessGroupAffinityFunction>(
 			GetProcAddress(kernel, "GetProcessGroupAffinity"));
 	USHORT groupCount = 0;
+	if (getGroups == 0)
+	{
+		return result;
+	}
 	if (getGroups != 0)
 	{
 		getGroups(GetCurrentProcess(), &groupCount, 0);
@@ -289,12 +353,23 @@ std::vector<JobCpuSetInfo> enumerateSystemCpuSets()
 		}
 	}
 	if (processGroups.empty()) return result;
+	const USHORT activeGroupCount = GetActiveProcessorGroupCount();
+	/* On Windows 10 a process starts associated with one processor group even
+	 * when it has not been restricted to that group.  Treating that initial
+	 * association as an eligibility ceiling silently caps auto/all at 64 LPs.
+	 * Explicit CPU-set selections remain authoritative.  A multi-group proper
+	 * subset is also an explicit association and remains authoritative. */
+	const bool hasExplicitCpuSetRestriction = !processCpuSets.empty();
+	const bool hasExplicitGroupRestriction = processGroups.size() > 1 &&
+		activeGroupCount != 0 && processGroups.size() < activeGroupCount;
 	DWORD_PTR processMask = 0;
 	DWORD_PTR systemMask = 0;
 	const bool hasProcessMask = processGroups.size() == 1 &&
 		GetProcessAffinityMask(GetCurrentProcess(), &processMask, &systemMask) &&
 		processMask != 0;
 	if (processGroups.size() == 1 && !hasProcessMask) return result;
+	const bool hasExplicitProcessMask = hasProcessMask &&
+		processMask != systemMask;
 	ULONG offset = 0;
 	while (offset + sizeof(SYSTEM_CPU_SET_INFORMATION) <= byteCount)
 	{
@@ -316,14 +391,15 @@ std::vector<JobCpuSetInfo> enumerateSystemCpuSets()
 			item.parked = information->CpuSet.Parked != 0;
 			item.allocatedToOtherProcess = information->CpuSet.Allocated != 0 &&
 				information->CpuSet.AllocatedToTargetProcess == 0;
-			item.availableToProcess = (processCpuSets.empty() ||
+			item.availableToProcess = (!hasExplicitCpuSetRestriction ||
 				std::find(processCpuSets.begin(), processCpuSets.end(), item.id) !=
-					processCpuSets.end()) && (processGroups.empty() ||
+					processCpuSets.end()) && (!hasExplicitGroupRestriction ||
 				std::find(processGroups.begin(), processGroups.end(),
 					static_cast<USHORT>(item.group)) != processGroups.end());
-			if (hasProcessMask && (item.logicalProcessorIndex >=
-				sizeof(DWORD_PTR) * CHAR_BIT ||
-				(processMask & (static_cast<DWORD_PTR>(1) <<
+			if (hasExplicitProcessMask &&
+				(item.group != processGroups[0] ||
+				 item.logicalProcessorIndex >= sizeof(DWORD_PTR) * CHAR_BIT ||
+				 (processMask & (static_cast<DWORD_PTR>(1) <<
 					item.logicalProcessorIndex)) == 0))
 				item.availableToProcess = false;
 			result.push_back(item);
@@ -342,6 +418,11 @@ unsigned processAvailableCpuCount()
 	if (GetProcessAffinityMask(GetCurrentProcess(), &processMask, &systemMask) &&
 		processMask != 0)
 	{
+		if (processMask == systemMask)
+		{
+			const DWORD allGroups = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+			if (allGroups != 0) return static_cast<unsigned>(allGroups);
+		}
 		unsigned count = 0;
 		while (processMask != 0)
 		{
@@ -397,9 +478,10 @@ extern "C" void rts_job_system_release_test_pause(unsigned pausePoint)
 struct JobContext::State
 {
 	State(GroupRecord *groupValue, unsigned char *scratchValue,
-		unsigned scratchCapacityValue)
+		unsigned scratchCapacityValue, unsigned physicalWorkerIndexValue)
 		: group(groupValue), scratch(scratchValue),
-		  scratchCapacity(scratchCapacityValue), scratchUsed(0), failed(false)
+		  scratchCapacity(scratchCapacityValue), scratchUsed(0), failed(false),
+		  physicalWorkerIndex(physicalWorkerIndexValue)
 	{
 	}
 
@@ -408,6 +490,7 @@ struct JobContext::State
 	unsigned scratchCapacity;
 	unsigned scratchUsed;
 	bool failed;
+	unsigned physicalWorkerIndex;
 };
 
 struct JobHandle::State
@@ -447,15 +530,41 @@ struct JobSystem::State
 		bool cancelled;
 	};
 
+	struct PerformanceRecord
+	{
+		PerformanceRecord()
+			: busyNanoseconds(0), maximumBusyNanoseconds(0), busySampleCount(0),
+			  waitNanoseconds(0), maximumWaitNanoseconds(0), waitSampleCount(0),
+			  waitStartNanoseconds(0), waitGeneration(0)
+		{
+		}
+
+		mutable std::mutex mutex;
+		unsigned long long busyNanoseconds;
+		unsigned long long maximumBusyNanoseconds;
+		unsigned long long busySampleCount;
+		unsigned long long waitNanoseconds;
+		unsigned long long maximumWaitNanoseconds;
+		unsigned long long waitSampleCount;
+		unsigned long long waitStartNanoseconds;
+		unsigned long long waitGeneration;
+	};
+
 	struct Worker
 	{
-		Worker() : index(0) {}
+		Worker() : performance(0), index(0)
+		{
+			for (unsigned priority = 0; priority < JOB_PRIORITY_COUNT; ++priority)
+				stealCursor[priority] = priority;
+		}
 
 		std::mutex mutex;
 		std::deque<std::shared_ptr<JobRecord> > queues[JOB_PRIORITY_COUNT];
 		std::thread thread;
 		std::vector<unsigned char> scratch;
+		PerformanceRecord *performance;
 		unsigned index;
+		unsigned stealCursor[JOB_PRIORITY_COUNT];
 	};
 
 	struct OwnerThread
@@ -469,16 +578,22 @@ struct JobSystem::State
 	State()
 		: pinWorkers(false), queueCapacity(0), outstanding(0), configuredWorkerCount(0),
 		  generation(0), running(false), stopping(false), lazyStartupDisabled(false),
-		  availableLogicalCpuCount(0), reservedOwnerCpuCount(0), readyCount(0),
+		  availableLogicalCpuCount(0), reservedOwnerCpuCount(0),
+		  selectedWorkerPhysicalCoreCount(0), selectedWorkerPhysicalCoreMask(0),
+		  selectedWorkerPhysicalCoreMaskComplete(true),
+		  readyCount(0),
 		  activeWorkers(0), submittedJobCount(0), executedJobCount(0),
 		  stealCount(0), ownerHelpCount(0), waitCount(0),
 		  workerWaitRejectionCount(0), failedJobCount(0),
 		  cancelledJobCount(0), serialFallbackCount(0),
 		  totalQueueLatencyNanoseconds(0), maximumQueueLatencyNanoseconds(0),
-		  workerSleepCount(0), workerWakeCount(0), affinityFailureCount(0),
+		  workerSleepCount(0), workerWakeCount(0),
+		  performanceMetricGeneration(2), affinityFailureCount(0),
 		  injectionHighWater(0), maximumActiveWorkers(0),
 		  completionCapacity(0)
 	{
+		for (unsigned priority = 0; priority < JOB_PRIORITY_COUNT; ++priority)
+			readyCounts[priority].store(0, std::memory_order_relaxed);
 	}
 
 	bool hasInjectedWorkUnlocked() const
@@ -493,58 +608,62 @@ struct JobSystem::State
 		return false;
 	}
 
-	std::shared_ptr<JobRecord> popInjectedWorkUnlocked()
+	std::shared_ptr<JobRecord> popInjectedWorkUnlocked(unsigned priority)
 	{
-		for (unsigned priority = 0; priority < JOB_PRIORITY_COUNT; ++priority)
+		if (!injectionQueues[priority].empty())
 		{
-			if (!injectionQueues[priority].empty())
-			{
-				std::shared_ptr<JobRecord> record = injectionQueues[priority].front();
-				injectionQueues[priority].pop_front();
-				return record;
-			}
+			std::shared_ptr<JobRecord> record = injectionQueues[priority].front();
+			injectionQueues[priority].pop_front();
+			return record;
 		}
 		return std::shared_ptr<JobRecord>();
 	}
 
-	std::shared_ptr<JobRecord> popLocalWork(Worker &worker)
+	std::shared_ptr<JobRecord> popLocalWork(Worker &worker, unsigned priority)
 	{
 		std::lock_guard<std::mutex> lock(worker.mutex);
-		for (unsigned priority = 0; priority < JOB_PRIORITY_COUNT; ++priority)
+		if (!worker.queues[priority].empty())
 		{
-			if (!worker.queues[priority].empty())
-			{
-				std::shared_ptr<JobRecord> record = worker.queues[priority].front();
-				worker.queues[priority].pop_front();
-				return record;
-			}
+			std::shared_ptr<JobRecord> record = worker.queues[priority].front();
+			worker.queues[priority].pop_front();
+			return record;
 		}
 		return std::shared_ptr<JobRecord>();
 	}
 
-	std::shared_ptr<JobRecord> stealWork(Worker &worker)
+	std::shared_ptr<JobRecord> stealWork(Worker &worker, unsigned priority)
 	{
 		const unsigned count = static_cast<unsigned>(workers.size());
+		if (count == 0) return std::shared_ptr<JobRecord>();
 		const bool helper = worker.index >= count;
-		const unsigned firstOffset = helper ? 0 : 1;
-		const unsigned endOffset = helper ? count : count;
-		for (unsigned offset = firstOffset; offset < endOffset; ++offset)
+		const unsigned candidateCount = helper ? count : count - 1;
+		const unsigned maximumProbeCount = 4;
+		const unsigned probeLimit = std::min(candidateCount, maximumProbeCount);
+		unsigned victimIndex = worker.stealCursor[priority] % count;
+		unsigned probes = 0;
+		while (probes < probeLimit)
 		{
-			const unsigned victimIndex = helper ? offset :
-				(worker.index + offset) % count;
-			Worker &victim = *workers[victimIndex];
-			std::lock_guard<std::mutex> lock(victim.mutex);
-			for (unsigned priority = 0; priority < JOB_PRIORITY_COUNT; ++priority)
+			if (!helper && victimIndex == worker.index)
 			{
+				victimIndex = (victimIndex + 1) % count;
+				continue;
+			}
+			Worker &victim = *workers[victimIndex];
+			{
+				std::lock_guard<std::mutex> lock(victim.mutex);
 				if (!victim.queues[priority].empty())
 				{
 					std::shared_ptr<JobRecord> record = victim.queues[priority].back();
 					victim.queues[priority].pop_back();
+					worker.stealCursor[priority] = (victimIndex + 1) % count;
 					stealCount.fetch_add(1, std::memory_order_relaxed);
 					return record;
 				}
 			}
+			++probes;
+			victimIndex = (victimIndex + 1) % count;
 		}
+		worker.stealCursor[priority] = victimIndex;
 		return std::shared_ptr<JobRecord>();
 	}
 
@@ -552,28 +671,37 @@ struct JobSystem::State
 	{
 		for (;;)
 		{
-			std::shared_ptr<JobRecord> record = popLocalWork(worker);
-			if (!record)
+			std::shared_ptr<JobRecord> record;
+			/* Priority is the outer selection dimension.  A worker must not run
+			 * local background work while frame-critical work is already visible
+			 * in the shared injection queue or on a peer worker. */
+			for (unsigned priority = 0;
+				priority < JOB_PRIORITY_COUNT && !record; ++priority)
 			{
-				std::lock_guard<std::mutex> lock(mutex);
-				record = popInjectedWorkUnlocked();
-			}
-			if (!record)
-			{
-				record = stealWork(worker);
+				record = popLocalWork(worker, priority);
+				if (!record)
+				{
+					std::lock_guard<std::mutex> lock(mutex);
+					record = popInjectedWorkUnlocked(priority);
+				}
+				if (!record && readyCounts[priority].load(
+					std::memory_order_acquire) != 0)
+				{
+					record = stealWork(worker, priority);
+				}
+				/* A published higher-priority lane remains authoritative even
+				 * when this bounded steal pass did not find its current owner. */
+				if (!record && readyCounts[priority].load(
+					std::memory_order_acquire) != 0)
+				{
+					return std::shared_ptr<JobRecord>();
+				}
 			}
 			if (!record)
 			{
 				return std::shared_ptr<JobRecord>();
 			}
 
-			unsigned observedReadyCount = readyCount.load(std::memory_order_acquire);
-			while (observedReadyCount != 0 &&
-				!readyCount.compare_exchange_weak(observedReadyCount,
-					observedReadyCount - 1, std::memory_order_acq_rel,
-					std::memory_order_acquire))
-			{
-			}
 			bool claimed = false;
 			{
 				std::lock_guard<std::mutex> publicationLock(
@@ -587,6 +715,9 @@ struct JobSystem::State
 					!record->complete.load(std::memory_order_acquire) &&
 					record->job.load(std::memory_order_acquire) != 0)
 				{
+					readyCounts[record->priority].fetch_sub(1,
+						std::memory_order_acq_rel);
+					readyCount.fetch_sub(1, std::memory_order_acq_rel);
 					record->executing.store(true, std::memory_order_release);
 					record->queued.store(false, std::memory_order_release);
 					claimed = true;
@@ -631,9 +762,18 @@ struct JobSystem::State
 	ReadyEnqueueResult enqueueReady(const std::shared_ptr<JobRecord> &record)
 	{
 		std::unique_lock<std::mutex> publicationLock(record->publicationMutex);
+		// The mutex excludes a new execution claim. Observing finish's release
+		// of executing also acquires its earlier finalizing claim. Checking
+		// finalizing first can read both flags as false across that retirement.
 		if (record->readyPublicationFailed.load(std::memory_order_acquire) ||
-			record->finalizing.load(std::memory_order_acquire) ||
-			record->executing.load(std::memory_order_acquire) ||
+			record->executing.load(std::memory_order_acquire))
+		{
+			return READY_ALREADY_OWNED;
+		}
+#if defined(RTS_BUILD_CORE_EXTRAS)
+		pauseJobSystemTest(16384);
+#endif
+		if (record->finalizing.load(std::memory_order_acquire) ||
 			record->complete.load(std::memory_order_acquire))
 		{
 			return READY_ALREADY_OWNED;
@@ -646,6 +786,7 @@ struct JobSystem::State
 		}
 		try
 		{
+			bool failedAfterQueuePush = false;
 #if defined(RTS_BUILD_CORE_EXTRAS)
 			if (consumeJobSystemTestFault(6))
 			{
@@ -663,10 +804,15 @@ struct JobSystem::State
 #if defined(RTS_BUILD_CORE_EXTRAS)
 				if (consumeJobSystemTestFault(10))
 				{
-					throw std::bad_alloc();
+					failedAfterQueuePush = true;
 				}
 #endif
-				readyCount.fetch_add(1, std::memory_order_release);
+				if (!failedAfterQueuePush)
+				{
+					readyCounts[record->priority].fetch_add(1,
+						std::memory_order_release);
+					readyCount.fetch_add(1, std::memory_order_release);
+				}
 			}
 			else
 			{
@@ -675,24 +821,40 @@ struct JobSystem::State
 #if defined(RTS_BUILD_CORE_EXTRAS)
 				if (consumeJobSystemTestFault(10))
 				{
-					throw std::bad_alloc();
+					failedAfterQueuePush = true;
 				}
 #endif
-				unsigned injectedCount = 0;
-				for (unsigned lane = 0; lane < JOB_PRIORITY_COUNT; ++lane)
+				if (!failedAfterQueuePush)
 				{
-					injectedCount += static_cast<unsigned>(
-						injectionQueues[lane].size());
+					unsigned injectedCount = 0;
+					for (unsigned lane = 0; lane < JOB_PRIORITY_COUNT; ++lane)
+					{
+						injectedCount += static_cast<unsigned>(
+							injectionQueues[lane].size());
+					}
+					unsigned observedHighWater = injectionHighWater.load(
+						std::memory_order_relaxed);
+					while (injectedCount > observedHighWater &&
+						!injectionHighWater.compare_exchange_weak(observedHighWater,
+							injectedCount, std::memory_order_relaxed,
+							std::memory_order_relaxed))
+					{
+					}
+					readyCounts[record->priority].fetch_add(1,
+						std::memory_order_release);
+					readyCount.fetch_add(1, std::memory_order_release);
 				}
-				unsigned observedHighWater = injectionHighWater.load(
-					std::memory_order_relaxed);
-				while (injectedCount > observedHighWater &&
-					!injectionHighWater.compare_exchange_weak(observedHighWater,
-						injectedCount, std::memory_order_relaxed,
-						std::memory_order_relaxed))
-				{
-				}
-				readyCount.fetch_add(1, std::memory_order_release);
+			}
+			if (failedAfterQueuePush)
+			{
+				record->readyPublicationFailed.store(true,
+					std::memory_order_release);
+				record->queued.store(false, std::memory_order_release);
+				publicationLock.unlock();
+#if defined(RTS_BUILD_CORE_EXTRAS)
+				pauseJobSystemTest(4);
+#endif
+				return READY_FAILED;
 			}
 		}
 		catch (...)
@@ -782,6 +944,9 @@ struct JobSystem::State
 		if (executionOwner)
 		{
 			record->executing.store(false, std::memory_order_release);
+#if defined(RTS_BUILD_CORE_EXTRAS)
+			pauseJobSystemTest(32768);
+#endif
 		}
 		if (record->completion != 0)
 		{
@@ -820,7 +985,6 @@ struct JobSystem::State
 				failed = true;
 			}
 		}
-		executedJobCount.fetch_add(1, std::memory_order_relaxed);
 		if (failed)
 		{
 			failedJobCount.fetch_add(1, std::memory_order_relaxed);
@@ -831,8 +995,14 @@ struct JobSystem::State
 		}
 		record->failed.store(failed, std::memory_order_release);
 		record->cancelled.store(cancelled, std::memory_order_release);
-		record->complete.store(true, std::memory_order_release);
+		{
+			std::unique_lock<std::mutex> lock = lockCompletionMutex(record->mutex, 4096);
+			record->complete.store(true, std::memory_order_release);
+		}
 		record->completed.notify_all();
+#if defined(RTS_BUILD_CORE_EXTRAS)
+		pauseJobSystemTest(2048);
+#endif
 		releaseDependents(record, failed || cancelled);
 
 		const std::shared_ptr<GroupRecord> group = record->group;
@@ -852,10 +1022,7 @@ struct JobSystem::State
 			}
 		}
 		capacityAvailable.notify_all();
-		if (group->pending.fetch_sub(1, std::memory_order_acq_rel) == 1)
-		{
-			group->completed.notify_all();
-		}
+		group->removePending(1);
 	}
 
 	void execute(const std::shared_ptr<JobRecord> &record, Worker &worker)
@@ -874,18 +1041,9 @@ struct JobSystem::State
 		{
 		}
 		const bool poolWorker = worker.index < configuredWorkerCount;
-		unsigned active = 0;
-		if (poolWorker)
-		{
-			active = activeWorkers.fetch_add(1, std::memory_order_acq_rel) + 1;
-			unsigned observedMaximum = maximumActiveWorkers.load(
-				std::memory_order_relaxed);
-			while (active > observedMaximum &&
-				!maximumActiveWorkers.compare_exchange_weak(observedMaximum, active,
-					std::memory_order_relaxed, std::memory_order_relaxed))
-			{
-			}
-		}
+		bool callbackExecuted = false;
+		unsigned long long busyStartNanoseconds = 0;
+		unsigned long long busyGeneration = 0;
 		bool cancelled = record->group->cancelled.load(
 			std::memory_order_acquire);
 		bool failed = record->dependencyFailed.load(std::memory_order_acquire);
@@ -896,12 +1054,30 @@ struct JobSystem::State
 		}
 		if (!cancelled && !failed)
 		{
+			callbackExecuted = true;
+			if (poolWorker)
+			{
+				busyGeneration = performanceMetricGeneration.load(
+					std::memory_order_acquire);
+				busyStartNanoseconds = performanceClockNanoseconds();
+				const unsigned active = activeWorkers.fetch_add(1,
+					std::memory_order_acq_rel) + 1;
+				unsigned observedMaximum = maximumActiveWorkers.load(
+					std::memory_order_relaxed);
+				while (active > observedMaximum &&
+					!maximumActiveWorkers.compare_exchange_weak(observedMaximum,
+						active, std::memory_order_relaxed,
+						std::memory_order_relaxed))
+				{
+				}
+			}
 #if defined(_WIN32) && !defined(_WIN64)
 			DeterministicFloatingPointScope floatingPointScope;
 #endif
 			JobContext::State contextState(record->group.get(),
 				worker.scratch.empty() ? 0 : &worker.scratch[0],
-				static_cast<unsigned>(worker.scratch.size()));
+				static_cast<unsigned>(worker.scratch.size()),
+				poolWorker ? worker.index : JOB_INVALID_PHYSICAL_WORKER_INDEX);
 			JobContext context(&contextState);
 			try
 			{
@@ -917,8 +1093,16 @@ struct JobSystem::State
 			std::memory_order_acquire);
 
 		delete record->job.exchange(0, std::memory_order_acq_rel);
-		if (poolWorker)
+		if (callbackExecuted)
 		{
+			executedJobCount.fetch_add(1, std::memory_order_relaxed);
+		}
+		if (poolWorker && callbackExecuted)
+		{
+			const unsigned long long busyEndNanoseconds =
+				performanceClockNanoseconds();
+			recordWorkerBusy(worker, busyGeneration, busyStartNanoseconds,
+				busyEndNanoseconds);
 			activeWorkers.fetch_sub(1, std::memory_order_acq_rel);
 		}
 #if defined(RTS_BUILD_CORE_EXTRAS)
@@ -958,6 +1142,181 @@ struct JobSystem::State
 #endif
 	}
 
+	void recordWorkerBusy(Worker &worker, unsigned long long generation,
+		unsigned long long startNanoseconds, unsigned long long endNanoseconds)
+	{
+		PerformanceRecord *performance = worker.performance;
+		if (performance == 0 || (generation & 1) != 0) return;
+		std::lock_guard<std::mutex> lock(performance->mutex);
+		if (generation != performanceMetricGeneration.load(
+			std::memory_order_acquire)) return;
+		const unsigned long long elapsed = endNanoseconds >= startNanoseconds ?
+			endNanoseconds - startNanoseconds : 0;
+		saturatingCounterAdd(performance->busyNanoseconds, elapsed);
+		updateCounterMaximum(performance->maximumBusyNanoseconds, elapsed);
+		saturatingCounterIncrement(performance->busySampleCount);
+	}
+
+	void beginWorkerWait(Worker &worker)
+	{
+		PerformanceRecord *performance = worker.performance;
+		if (performance == 0) return;
+		for (;;)
+		{
+			const unsigned long long generation = performanceMetricGeneration.load(
+				std::memory_order_acquire);
+			if ((generation & 1) != 0)
+			{
+				std::this_thread::yield();
+				continue;
+			}
+			const unsigned long long startNanoseconds =
+				performanceClockNanoseconds();
+			std::lock_guard<std::mutex> lock(performance->mutex);
+			if (generation != performanceMetricGeneration.load(
+				std::memory_order_acquire))
+			{
+				continue;
+			}
+			performance->waitGeneration = generation;
+			performance->waitStartNanoseconds = startNanoseconds;
+			return;
+		}
+	}
+
+	void endWorkerWait(Worker &worker)
+	{
+		PerformanceRecord *performance = worker.performance;
+		if (performance == 0) return;
+		const unsigned long long endNanoseconds = performanceClockNanoseconds();
+		std::lock_guard<std::mutex> lock(performance->mutex);
+		const unsigned long long generation = performanceMetricGeneration.load(
+			std::memory_order_acquire);
+		if ((generation & 1) == 0 &&
+			performance->waitStartNanoseconds != 0 &&
+			performance->waitGeneration == generation)
+		{
+			const unsigned long long elapsed = endNanoseconds >=
+				performance->waitStartNanoseconds ? endNanoseconds -
+				performance->waitStartNanoseconds : 0;
+			saturatingCounterAdd(performance->waitNanoseconds, elapsed);
+			updateCounterMaximum(performance->maximumWaitNanoseconds, elapsed);
+			saturatingCounterIncrement(performance->waitSampleCount);
+		}
+		performance->waitStartNanoseconds = 0;
+		performance->waitGeneration = 0;
+	}
+
+	void resetPerformanceRecords()
+	{
+		unsigned long long stableGeneration = performanceMetricGeneration.load(
+			std::memory_order_acquire);
+		for (;;)
+		{
+			if ((stableGeneration & 1) != 0)
+			{
+				std::this_thread::yield();
+				stableGeneration = performanceMetricGeneration.load(
+					std::memory_order_acquire);
+				continue;
+			}
+			const unsigned long long resettingGeneration = stableGeneration + 1;
+			if (performanceMetricGeneration.compare_exchange_weak(stableGeneration,
+				resettingGeneration, std::memory_order_acq_rel,
+				std::memory_order_acquire)) break;
+		}
+		const unsigned long long nextGeneration = stableGeneration >= ~0ull - 1 ?
+			2 : stableGeneration + 2;
+		const unsigned long long resetNanoseconds = performanceClockNanoseconds();
+		for (std::unique_ptr<PerformanceRecord> &record : performanceRecords)
+		{
+			std::lock_guard<std::mutex> lock(record->mutex);
+			const bool remainsWaiting = record->waitStartNanoseconds != 0 &&
+				record->waitGeneration == stableGeneration;
+			record->busyNanoseconds = 0;
+			record->maximumBusyNanoseconds = 0;
+			record->busySampleCount = 0;
+			record->waitNanoseconds = 0;
+			record->maximumWaitNanoseconds = 0;
+			record->waitSampleCount = 0;
+			record->waitStartNanoseconds = remainsWaiting ? resetNanoseconds : 0;
+			record->waitGeneration = remainsWaiting ? nextGeneration : 0;
+		}
+		performanceMetricGeneration.store(nextGeneration,
+			std::memory_order_release);
+	}
+
+	void resetAllMetrics()
+	{
+		submittedJobCount.store(0, std::memory_order_relaxed);
+		executedJobCount.store(0, std::memory_order_relaxed);
+		stealCount.store(0, std::memory_order_relaxed);
+		ownerHelpCount.store(0, std::memory_order_relaxed);
+		waitCount.store(0, std::memory_order_relaxed);
+		workerWaitRejectionCount.store(0, std::memory_order_relaxed);
+		failedJobCount.store(0, std::memory_order_relaxed);
+		cancelledJobCount.store(0, std::memory_order_relaxed);
+		serialFallbackCount.store(0, std::memory_order_relaxed);
+		totalQueueLatencyNanoseconds.store(0, std::memory_order_relaxed);
+		maximumQueueLatencyNanoseconds.store(0, std::memory_order_relaxed);
+		workerSleepCount.store(0, std::memory_order_relaxed);
+		workerWakeCount.store(0, std::memory_order_relaxed);
+		affinityFailureCount.store(0, std::memory_order_relaxed);
+		injectionHighWater.store(0, std::memory_order_relaxed);
+		maximumActiveWorkers.store(0, std::memory_order_relaxed);
+		resetPerformanceRecords();
+	}
+
+	void collectPerformanceMetrics(JobSystemMetrics &result)
+	{
+		for (;;)
+		{
+			const unsigned long long generation = performanceMetricGeneration.load(
+				std::memory_order_acquire);
+			if ((generation & 1) != 0)
+			{
+				std::this_thread::yield();
+				continue;
+			}
+			result.workerBusyNanoseconds = 0;
+			result.maximumWorkerBusyNanoseconds = 0;
+			result.workerBusySampleCount = 0;
+			result.workerWaitNanoseconds = 0;
+			result.maximumWorkerWaitNanoseconds = 0;
+			result.workerWaitSampleCount = 0;
+			const unsigned long long nowNanoseconds = performanceClockNanoseconds();
+			for (std::unique_ptr<PerformanceRecord> &record : performanceRecords)
+			{
+				std::lock_guard<std::mutex> lock(record->mutex);
+				saturatingCounterAdd(result.workerBusyNanoseconds,
+					record->busyNanoseconds);
+				updateCounterMaximum(result.maximumWorkerBusyNanoseconds,
+					record->maximumBusyNanoseconds);
+				saturatingCounterAdd(result.workerBusySampleCount,
+					record->busySampleCount);
+				saturatingCounterAdd(result.workerWaitNanoseconds,
+					record->waitNanoseconds);
+				updateCounterMaximum(result.maximumWorkerWaitNanoseconds,
+					record->maximumWaitNanoseconds);
+				saturatingCounterAdd(result.workerWaitSampleCount,
+					record->waitSampleCount);
+				if (record->waitStartNanoseconds != 0 &&
+					record->waitGeneration == generation)
+				{
+					const unsigned long long elapsed = nowNanoseconds >=
+						record->waitStartNanoseconds ? nowNanoseconds -
+						record->waitStartNanoseconds : 0;
+					saturatingCounterAdd(result.workerWaitNanoseconds, elapsed);
+					updateCounterMaximum(result.maximumWorkerWaitNanoseconds,
+						elapsed);
+					saturatingCounterIncrement(result.workerWaitSampleCount);
+				}
+			}
+			if (generation == performanceMetricGeneration.load(
+				std::memory_order_acquire)) return;
+		}
+	}
+
 	void workerLoop(Worker *worker)
 	{
 #if defined(_WIN32)
@@ -985,10 +1344,18 @@ struct JobSystem::State
 			}
 			{
 				std::unique_lock<std::mutex> lock(mutex);
+				if (readyCount.load(std::memory_order_acquire) != 0)
+				{
+					lock.unlock();
+					std::this_thread::yield();
+					continue;
+				}
 				workerSleepCount.fetch_add(1, std::memory_order_relaxed);
+				beginWorkerWait(*worker);
 				workAvailable.wait(lock, [this]() {
 					return stopping || readyCount.load(std::memory_order_acquire) != 0;
 				});
+				endWorkerWait(*worker);
 				workerWakeCount.fetch_add(1, std::memory_order_relaxed);
 				if (stopping && readyCount.load(std::memory_order_acquire) == 0)
 				{
@@ -1006,6 +1373,7 @@ struct JobSystem::State
 	std::condition_variable capacityAvailable;
 	std::deque<std::shared_ptr<JobRecord> > injectionQueues[JOB_PRIORITY_COUNT];
 	std::vector<std::unique_ptr<Worker> > workers;
+	std::vector<JobCpuSetInfo> cpuSets;
 	std::vector<unsigned> selectedCpuSetIds;
 	unsigned ownerCpuSetIds[2];
 	OwnerThread ownerThreads[JOB_OWNER_COUNT];
@@ -1023,7 +1391,11 @@ struct JobSystem::State
 	bool lazyStartupDisabled;
 	unsigned availableLogicalCpuCount;
 	unsigned reservedOwnerCpuCount;
+	unsigned selectedWorkerPhysicalCoreCount;
+	JobMetricCounter selectedWorkerPhysicalCoreMask;
+	bool selectedWorkerPhysicalCoreMaskComplete;
 	std::atomic<unsigned> readyCount;
+	std::atomic<unsigned> readyCounts[JOB_PRIORITY_COUNT];
 	std::atomic<unsigned> activeWorkers;
 	std::atomic<unsigned long long> submittedJobCount;
 	std::atomic<unsigned long long> executedJobCount;
@@ -1038,10 +1410,12 @@ struct JobSystem::State
 	std::atomic<unsigned long long> maximumQueueLatencyNanoseconds;
 	std::atomic<unsigned long long> workerSleepCount;
 	std::atomic<unsigned long long> workerWakeCount;
+	std::atomic<unsigned long long> performanceMetricGeneration;
 	std::atomic<unsigned long long> affinityFailureCount;
 	std::atomic<unsigned> injectionHighWater;
 	std::atomic<unsigned> maximumActiveWorkers;
 	unsigned completionCapacity;
+	std::vector<std::unique_ptr<PerformanceRecord> > performanceRecords;
 };
 
 JobCpuSetInfo::JobCpuSetInfo()
@@ -1062,9 +1436,15 @@ JobSystemMetrics::JobSystemMetrics()
 	  ownerHelpCount(0), waitCount(0), workerWaitRejectionCount(0),
 	  failedJobCount(0), cancelledJobCount(0), serialFallbackCount(0),
 	  totalQueueLatencyNanoseconds(0), maximumQueueLatencyNanoseconds(0),
-	  workerSleepCount(0), workerWakeCount(0), affinityFailureCount(0),
+	  workerSleepCount(0), workerWakeCount(0),
+	  workerBusyNanoseconds(0), maximumWorkerBusyNanoseconds(0),
+	  workerBusySampleCount(0), workerWaitNanoseconds(0),
+	  maximumWorkerWaitNanoseconds(0), workerWaitSampleCount(0),
+	  affinityFailureCount(0),
 	  injectionHighWater(0), maximumActiveWorkers(0), availableLogicalCpuCount(0),
-	  reservedOwnerCpuCount(0), selectedWorkerCpuCount(0)
+	  reservedOwnerCpuCount(0), selectedWorkerCpuCount(0),
+	  selectedWorkerPhysicalCoreCount(0), selectedWorkerPhysicalCoreMask(0),
+	  selectedWorkerPhysicalCoreMaskComplete(true)
 {
 }
 
@@ -1076,6 +1456,17 @@ bool JobContext::isCancellationRequested() const
 {
 	return m_state != 0 && m_state->group != 0 &&
 		m_state->group->cancelled.load(std::memory_order_acquire);
+}
+
+bool JobContext::isPhysicalWorkerExecution() const
+{
+	return physicalWorkerIndex() != JOB_INVALID_PHYSICAL_WORKER_INDEX;
+}
+
+unsigned JobContext::physicalWorkerIndex() const
+{
+	return m_state != 0 ? m_state->physicalWorkerIndex :
+		JOB_INVALID_PHYSICAL_WORKER_INDEX;
 }
 
 void JobContext::fail()
@@ -1392,13 +1783,148 @@ unsigned JobSystem::selectWorkerCpuSets(const JobCpuSetInfo *cpuSets,
 	const unsigned writable = selectedCount < selectedIdCapacity ?
 		selectedCount : selectedIdCapacity;
 	unsigned written = 0;
+	// Prefer one logical processor from each physical core before consuming SMT
+	// siblings.  Efficiency-class ordering remains authoritative within each
+	// pass, so heterogeneous systems still prefer their faster cores.
 	for (unsigned index = 0; index < eligibleCount && written < writable; ++index)
 	{
 		if ((ownerCount > 0 && eligible[index].id == ownerIds[0]) ||
 			(ownerCount > 1 && eligible[index].id == ownerIds[1])) continue;
+		bool sharesSelectedCore = false;
+		for (unsigned selectedIndex = 0; selectedIndex < written; ++selectedIndex)
+		{
+			for (unsigned eligibleIndex = 0; eligibleIndex < eligibleCount;
+				++eligibleIndex)
+			{
+				if (eligible[eligibleIndex].id != selectedIds[selectedIndex]) continue;
+				sharesSelectedCore = eligible[index].coreIndex != UINT_MAX &&
+					eligible[eligibleIndex].coreIndex != UINT_MAX &&
+					eligible[index].group == eligible[eligibleIndex].group &&
+					eligible[index].coreIndex == eligible[eligibleIndex].coreIndex;
+				break;
+			}
+			if (sharesSelectedCore) break;
+		}
+		if (sharesSelectedCore) continue;
 		selectedIds[written++] = eligible[index].id;
 	}
+	for (unsigned index = 0; index < eligibleCount && written < writable; ++index)
+	{
+		if ((ownerCount > 0 && eligible[index].id == ownerIds[0]) ||
+			(ownerCount > 1 && eligible[index].id == ownerIds[1])) continue;
+		bool alreadySelected = false;
+		for (unsigned selectedIndex = 0; selectedIndex < written; ++selectedIndex)
+		{
+			if (selectedIds[selectedIndex] == eligible[index].id)
+			{
+				alreadySelected = true;
+				break;
+			}
+		}
+		if (!alreadySelected) selectedIds[written++] = eligible[index].id;
+	}
 	return written;
+}
+
+unsigned JobSystem::summarizeSelectedPhysicalCores(
+	const JobCpuSetInfo *cpuSets, unsigned cpuSetCount,
+	const unsigned *selectedIds, unsigned selectedIdCount,
+	JobMetricCounter *selectedCoreMask, bool *selectedCoreMaskComplete)
+{
+	if (selectedCoreMask != 0) *selectedCoreMask = 0;
+	if (selectedCoreMaskComplete != 0) *selectedCoreMaskComplete = true;
+	if (cpuSets == 0 || selectedIds == 0)
+	{
+		if (selectedCoreMaskComplete != 0 && selectedIdCount != 0)
+			*selectedCoreMaskComplete = false;
+		return 0;
+	}
+	unsigned distinctCount = 0;
+	const unsigned maskBits = static_cast<unsigned>(sizeof(JobMetricCounter) * 8);
+	for (unsigned selectedIndex = 0; selectedIndex < selectedIdCount; ++selectedIndex)
+	{
+		unsigned cpuIndex = cpuSetCount;
+		for (unsigned index = 0; index < cpuSetCount; ++index)
+		{
+			if (cpuSets[index].id == selectedIds[selectedIndex])
+			{
+				cpuIndex = index;
+				break;
+			}
+		}
+		if (cpuIndex == cpuSetCount)
+		{
+			if (selectedCoreMaskComplete != 0)
+				*selectedCoreMaskComplete = false;
+			continue;
+		}
+		bool alreadyCounted = false;
+		for (unsigned previous = 0; previous < selectedIndex; ++previous)
+		{
+			unsigned previousCpuIndex = cpuSetCount;
+			for (unsigned index = 0; index < cpuSetCount; ++index)
+			{
+				if (cpuSets[index].id == selectedIds[previous])
+				{
+					previousCpuIndex = index;
+					break;
+				}
+			}
+			if (previousCpuIndex == cpuSetCount) continue;
+			const bool sameKnownCore = cpuSets[cpuIndex].coreIndex != UINT_MAX &&
+				cpuSets[previousCpuIndex].coreIndex != UINT_MAX &&
+				cpuSets[cpuIndex].group == cpuSets[previousCpuIndex].group &&
+				cpuSets[cpuIndex].coreIndex == cpuSets[previousCpuIndex].coreIndex;
+			if (sameKnownCore || cpuSets[cpuIndex].id == cpuSets[previousCpuIndex].id)
+			{
+				alreadyCounted = true;
+				break;
+			}
+		}
+		if (alreadyCounted) continue;
+		unsigned representativeIndex = cpuIndex;
+		for (unsigned index = 0; index < cpuIndex; ++index)
+		{
+			const bool sameKnownCore = cpuSets[cpuIndex].coreIndex != UINT_MAX &&
+				cpuSets[index].coreIndex != UINT_MAX &&
+				cpuSets[cpuIndex].group == cpuSets[index].group &&
+				cpuSets[cpuIndex].coreIndex == cpuSets[index].coreIndex;
+			if (sameKnownCore || cpuSets[cpuIndex].id == cpuSets[index].id)
+			{
+				representativeIndex = index;
+				break;
+			}
+		}
+		unsigned topologyOrdinal = 0;
+		for (unsigned index = 0; index < representativeIndex; ++index)
+		{
+			bool earlierSameCore = false;
+			for (unsigned earlier = 0; earlier < index; ++earlier)
+			{
+				const bool sameKnownCore = cpuSets[index].coreIndex != UINT_MAX &&
+					cpuSets[earlier].coreIndex != UINT_MAX &&
+					cpuSets[index].group == cpuSets[earlier].group &&
+					cpuSets[index].coreIndex == cpuSets[earlier].coreIndex;
+				if (sameKnownCore || cpuSets[index].id == cpuSets[earlier].id)
+				{
+					earlierSameCore = true;
+					break;
+				}
+			}
+			if (!earlierSameCore) ++topologyOrdinal;
+		}
+		if (topologyOrdinal < maskBits)
+		{
+			if (selectedCoreMask != 0)
+				*selectedCoreMask |= static_cast<JobMetricCounter>(1) << topologyOrdinal;
+		}
+		else if (selectedCoreMaskComplete != 0)
+		{
+			*selectedCoreMaskComplete = false;
+		}
+		++distinctCount;
+	}
+	return distinctCount;
 }
 
 bool JobSystem::setStartupWorkerCount(unsigned workerCount)
@@ -1544,6 +2070,13 @@ bool JobSystem::startInternal(const JobSystemConfig &config, bool allowRestart)
 			ownerCpuSetCount = 0;
 		}
 	}
+	JobMetricCounter selectedPhysicalCoreMask = 0;
+	bool selectedPhysicalCoreMaskComplete = true;
+	const unsigned selectedPhysicalCoreCount = selectedCpuSetIds.empty() ? 0 :
+		summarizeSelectedPhysicalCores(&cpuSets[0],
+			static_cast<unsigned>(cpuSets.size()), &selectedCpuSetIds[0],
+			static_cast<unsigned>(selectedCpuSetIds.size()),
+			&selectedPhysicalCoreMask, &selectedPhysicalCoreMaskComplete);
 	{
 		std::lock_guard<std::mutex> lock(m_state->mutex);
 		if (m_state->running || m_state->stopping || !m_state->workers.empty())
@@ -1555,22 +2088,31 @@ bool JobSystem::startInternal(const JobSystemConfig &config, bool allowRestart)
 		m_state->configuredWorkerCount = effectiveWorkerCount;
 		m_state->completionCapacity = config.queueCapacity;
 		m_state->ownerThread = std::this_thread::get_id();
+		m_state->cpuSets.swap(cpuSets);
 		m_state->selectedCpuSetIds.swap(selectedCpuSetIds);
 		m_state->pinWorkers = config.pinWorkers &&
 			!m_state->selectedCpuSetIds.empty();
 		m_state->availableLogicalCpuCount = eligibleCpuCount;
 		m_state->reservedOwnerCpuCount = ownerCpuSetCount;
+		m_state->selectedWorkerPhysicalCoreCount = selectedPhysicalCoreCount;
+		m_state->selectedWorkerPhysicalCoreMask = selectedPhysicalCoreMask;
+		m_state->selectedWorkerPhysicalCoreMaskComplete =
+			selectedPhysicalCoreMaskComplete;
 		m_state->ownerCpuSetIds[0] = ownerCpuSetIds[0];
 		m_state->ownerCpuSetIds[1] = ownerCpuSetIds[1];
 		++m_state->generation;
 		m_state->stopping = false;
 		m_state->readyCount.store(0, std::memory_order_release);
+		for (unsigned priority = 0; priority < JOB_PRIORITY_COUNT; ++priority)
+			m_state->readyCounts[priority].store(0, std::memory_order_release);
 		m_state->activeWorkers.store(0, std::memory_order_release);
 	}
-	resetMetrics();
+	m_state->resetAllMetrics();
 
 	try
 	{
+		m_state->performanceRecords.clear();
+		m_state->performanceRecords.reserve(effectiveWorkerCount);
 		m_state->ownerHelper.reset(new State::Worker);
 		m_state->ownerHelper->index = effectiveWorkerCount;
 		m_state->ownerHelper->scratch.resize(config.scratchBytesPerWorker);
@@ -1578,7 +2120,10 @@ bool JobSystem::startInternal(const JobSystemConfig &config, bool allowRestart)
 		for (unsigned index = 0; index < effectiveWorkerCount; ++index)
 		{
 			std::unique_ptr<State::Worker> worker(new State::Worker);
+			std::unique_ptr<State::PerformanceRecord> performance(
+				new State::PerformanceRecord);
 			worker->index = index;
+			worker->performance = performance.get();
 #if defined(RTS_BUILD_CORE_EXTRAS)
 			if (consumeJobSystemTestFault(2))
 			{
@@ -1586,6 +2131,7 @@ bool JobSystem::startInternal(const JobSystemConfig &config, bool allowRestart)
 			}
 #endif
 			worker->scratch.resize(config.scratchBytesPerWorker);
+			m_state->performanceRecords.push_back(std::move(performance));
 			m_state->workers.push_back(std::move(worker));
 		}
 		LockPipelineExecutionMode();
@@ -1618,15 +2164,20 @@ bool JobSystem::startInternal(const JobSystemConfig &config, bool allowRestart)
 			}
 		}
 		m_state->workers.clear();
+		m_state->performanceRecords.clear();
 		m_state->ownerHelper.reset();
 		{
 			std::lock_guard<std::mutex> lock(m_state->mutex);
 			m_state->stopping = false;
 			m_state->configuredWorkerCount = 0;
 			m_state->completionCapacity = 0;
+			m_state->cpuSets.clear();
 			m_state->selectedCpuSetIds.clear();
 			m_state->pinWorkers = false;
 			m_state->reservedOwnerCpuCount = 0;
+			m_state->selectedWorkerPhysicalCoreCount = 0;
+			m_state->selectedWorkerPhysicalCoreMask = 0;
+			m_state->selectedWorkerPhysicalCoreMaskComplete = true;
 		}
 		return false;
 	}
@@ -1715,6 +2266,8 @@ void JobSystem::shutdown()
 		}
 		m_state->outstanding = 0;
 		m_state->readyCount.store(0, std::memory_order_release);
+		for (unsigned priority = 0; priority < JOB_PRIORITY_COUNT; ++priority)
+			m_state->readyCounts[priority].store(0, std::memory_order_release);
 		m_state->configuredWorkerCount = 0;
 		m_state->queueCapacity = 0;
 		m_state->completionCapacity = 0;
@@ -1821,6 +2374,63 @@ unsigned JobSystem::outstandingJobCount() const
 	return m_state->outstanding;
 }
 
+unsigned JobSystem::cpuSetCount() const
+{
+	if (m_state == 0)
+		return 0;
+	std::lock_guard<std::mutex> lock(m_state->mutex);
+	return static_cast<unsigned>(m_state->cpuSets.size());
+}
+
+bool JobSystem::cpuSetAt(unsigned index, JobCpuSetInfo &result) const
+{
+	if (m_state == 0)
+		return false;
+	std::lock_guard<std::mutex> lock(m_state->mutex);
+	if (index >= m_state->cpuSets.size())
+		return false;
+	result = m_state->cpuSets[index];
+	return true;
+}
+
+unsigned JobSystem::selectedWorkerCpuSetCount() const
+{
+	if (m_state == 0)
+		return 0;
+	std::lock_guard<std::mutex> lock(m_state->mutex);
+	return static_cast<unsigned>(m_state->selectedCpuSetIds.size());
+}
+
+bool JobSystem::selectedWorkerCpuSetIdAt(unsigned index, unsigned &result) const
+{
+	if (m_state == 0)
+		return false;
+	std::lock_guard<std::mutex> lock(m_state->mutex);
+	if (index >= m_state->selectedCpuSetIds.size())
+		return false;
+	result = m_state->selectedCpuSetIds[index];
+	return true;
+}
+
+unsigned JobSystem::ownerCpuSetCount() const
+{
+	if (m_state == 0)
+		return 0;
+	std::lock_guard<std::mutex> lock(m_state->mutex);
+	return m_state->reservedOwnerCpuCount;
+}
+
+bool JobSystem::ownerCpuSetIdAt(unsigned index, unsigned &result) const
+{
+	if (m_state == 0)
+		return false;
+	std::lock_guard<std::mutex> lock(m_state->mutex);
+	if (index >= m_state->reservedOwnerCpuCount || index >= 2)
+		return false;
+	result = m_state->ownerCpuSetIds[index];
+	return true;
+}
+
 JobSystemMetrics JobSystem::metrics() const
 {
 	JobSystemMetrics result;
@@ -1828,6 +2438,7 @@ JobSystemMetrics JobSystem::metrics() const
 	{
 		return result;
 	}
+	std::shared_lock<std::shared_mutex> lifecycleLock(m_state->lifecycleMutex);
 	result.submittedJobCount = m_state->submittedJobCount.load(std::memory_order_relaxed);
 	result.executedJobCount = m_state->executedJobCount.load(std::memory_order_relaxed);
 	result.stealCount = m_state->stealCount.load(std::memory_order_relaxed);
@@ -1841,6 +2452,7 @@ JobSystemMetrics JobSystem::metrics() const
 	result.maximumQueueLatencyNanoseconds = m_state->maximumQueueLatencyNanoseconds.load(std::memory_order_relaxed);
 	result.workerSleepCount = m_state->workerSleepCount.load(std::memory_order_relaxed);
 	result.workerWakeCount = m_state->workerWakeCount.load(std::memory_order_relaxed);
+	m_state->collectPerformanceMetrics(result);
 	result.affinityFailureCount = m_state->affinityFailureCount.load(std::memory_order_relaxed);
 	result.injectionHighWater = m_state->injectionHighWater.load(std::memory_order_relaxed);
 	result.maximumActiveWorkers = m_state->maximumActiveWorkers.load(std::memory_order_relaxed);
@@ -1849,6 +2461,12 @@ JobSystemMetrics JobSystem::metrics() const
 		result.availableLogicalCpuCount = m_state->availableLogicalCpuCount;
 		result.reservedOwnerCpuCount = m_state->reservedOwnerCpuCount;
 		result.selectedWorkerCpuCount = static_cast<unsigned>(m_state->selectedCpuSetIds.size());
+		result.selectedWorkerPhysicalCoreCount =
+			m_state->selectedWorkerPhysicalCoreCount;
+		result.selectedWorkerPhysicalCoreMask =
+			m_state->selectedWorkerPhysicalCoreMask;
+		result.selectedWorkerPhysicalCoreMaskComplete =
+			m_state->selectedWorkerPhysicalCoreMaskComplete;
 	}
 	return result;
 }
@@ -1859,22 +2477,16 @@ void JobSystem::resetMetrics()
 	{
 		return;
 	}
-	m_state->submittedJobCount.store(0, std::memory_order_relaxed);
-	m_state->executedJobCount.store(0, std::memory_order_relaxed);
-	m_state->stealCount.store(0, std::memory_order_relaxed);
-	m_state->ownerHelpCount.store(0, std::memory_order_relaxed);
-	m_state->waitCount.store(0, std::memory_order_relaxed);
-	m_state->workerWaitRejectionCount.store(0, std::memory_order_relaxed);
-	m_state->failedJobCount.store(0, std::memory_order_relaxed);
-	m_state->cancelledJobCount.store(0, std::memory_order_relaxed);
-	m_state->serialFallbackCount.store(0, std::memory_order_relaxed);
-	m_state->totalQueueLatencyNanoseconds.store(0, std::memory_order_relaxed);
-	m_state->maximumQueueLatencyNanoseconds.store(0, std::memory_order_relaxed);
-	m_state->workerSleepCount.store(0, std::memory_order_relaxed);
-	m_state->workerWakeCount.store(0, std::memory_order_relaxed);
-	m_state->affinityFailureCount.store(0, std::memory_order_relaxed);
-	m_state->injectionHighWater.store(0, std::memory_order_relaxed);
-	m_state->maximumActiveWorkers.store(0, std::memory_order_relaxed);
+	std::shared_lock<std::shared_mutex> lifecycleLock(m_state->lifecycleMutex);
+	m_state->resetAllMetrics();
+}
+
+void JobSystem::resetPerformanceMetrics()
+{
+	if (m_state == 0)
+		return;
+	std::shared_lock<std::shared_mutex> lifecycleLock(m_state->lifecycleMutex);
+	m_state->resetPerformanceRecords();
 }
 
 void JobSystem::recordSerialFallback()
@@ -2048,10 +2660,7 @@ JobHandle JobSystem::trySubmitAfter(Job *job, JobPriority priority,
 	{
 		record->job.store(0, std::memory_order_release);
 		record->completion = 0;
-		if (groupRecord->pending.fetch_sub(1, std::memory_order_acq_rel) == 1)
-		{
-			groupRecord->completed.notify_all();
-		}
+		groupRecord->removePending(1);
 		try
 		{
 			std::lock_guard<std::mutex> lock(m_state->mutex);
@@ -2074,10 +2683,7 @@ JobHandle JobSystem::trySubmitAfter(Job *job, JobPriority priority,
 		record->accepted.store(false, std::memory_order_release);
 		record->job.store(0, std::memory_order_release);
 		record->completion = 0;
-		if (groupRecord->pending.fetch_sub(1, std::memory_order_acq_rel) == 1)
-		{
-			groupRecord->completed.notify_all();
-		}
+		groupRecord->removePending(1);
 		{
 			std::lock_guard<std::mutex> lock(m_state->mutex);
 			--m_state->outstanding;
@@ -2248,11 +2854,7 @@ bool JobSystem::trySubmitBatch(const JobSubmission *submissions,
 			records[index]->accepted.store(false, std::memory_order_release);
 			records[index]->queued.store(false, std::memory_order_release);
 		}
-		if (groupRecord->pending.fetch_sub(submissionCount,
-			std::memory_order_acq_rel) == submissionCount)
-		{
-			groupRecord->completed.notify_all();
-		}
+		groupRecord->removePending(submissionCount);
 		{
 			std::lock_guard<std::mutex> lock(m_state->mutex);
 			m_state->outstanding -= submissionCount;
@@ -2360,6 +2962,11 @@ bool JobSystem::trySubmitBatch(const JobSubmission *submissions,
 			{
 				record->accepted.store(true, std::memory_order_release);
 			}
+			for (const std::shared_ptr<JobRecord> &record : readyRecords)
+			{
+				m_state->readyCounts[record->priority].fetch_add(1,
+					std::memory_order_release);
+			}
 			m_state->readyCount.fetch_add(
 				static_cast<unsigned>(readyRecords.size()),
 				std::memory_order_release);
@@ -2405,6 +3012,11 @@ bool JobSystem::trySubmitBatch(const JobSubmission *submissions,
 					std::memory_order_relaxed))
 			{
 			}
+			for (const std::shared_ptr<JobRecord> &record : readyRecords)
+			{
+				m_state->readyCounts[record->priority].fetch_add(1,
+					std::memory_order_release);
+			}
 			m_state->readyCount.fetch_add(
 				static_cast<unsigned>(readyRecords.size()),
 				std::memory_order_release);
@@ -2436,6 +3048,9 @@ bool JobSystem::trySubmitBatch(const JobSubmission *submissions,
 		m_state->workAvailable.notify_one();
 	}
 
+#if defined(RTS_BUILD_CORE_EXTRAS)
+	pauseJobSystemTest(8192);
+#endif
 	for (const std::shared_ptr<JobRecord> &record : records)
 	{
 		if (!record->complete.load(std::memory_order_acquire) &&
@@ -2467,7 +3082,7 @@ bool JobSystem::tryPromote(Job *job, JobPriority priority)
 			return false;
 		}
 	}
-	auto promoteInQueues = [job, priority](
+	auto promoteInQueues = [this, job, priority](
 		std::deque<std::shared_ptr<JobRecord> > *queues) {
 		for (unsigned lane = 0; lane < JOB_PRIORITY_COUNT; ++lane)
 		{
@@ -2496,6 +3111,10 @@ bool JobSystem::tryPromote(Job *job, JobPriority priority)
 					}
 					record->priority = priority;
 					queues[lane].erase(it);
+					m_state->readyCounts[priority].fetch_add(1,
+						std::memory_order_release);
+					m_state->readyCounts[lane].fetch_sub(1,
+						std::memory_order_acq_rel);
 					return true;
 				}
 			}
@@ -2544,6 +3163,9 @@ bool JobSystem::wait(const JobHandle &handle)
 				continue;
 			}
 			std::unique_lock<std::mutex> lock(record->mutex);
+#if defined(RTS_BUILD_CORE_EXTRAS)
+			pauseJobSystemTest(1024);
+#endif
 			record->completed.wait_for(lock, std::chrono::milliseconds(1));
 		}
 		return true;
@@ -2587,6 +3209,33 @@ bool JobSystem::wait(const JobGroup &group)
 		return record->pending.load(std::memory_order_acquire) == 0;
 	});
 	return true;
+}
+
+bool JobSystem::waitWithoutOwnerHelp(const JobGroup &group,
+	unsigned timeoutMilliseconds)
+{
+	if (!group.isValid() || m_state == 0 ||
+		group.m_state->record->owner != m_state)
+	{
+		return false;
+	}
+	if (s_currentJobSystemWorker == m_state)
+	{
+		m_state->workerWaitRejectionCount.fetch_add(1,
+			std::memory_order_relaxed);
+		return false;
+	}
+	m_state->waitCount.fetch_add(1, std::memory_order_relaxed);
+	const std::shared_ptr<GroupRecord> record = group.m_state->record;
+	std::unique_lock<std::mutex> lock(record->mutex);
+	return record->completed.wait_for(lock,
+		std::chrono::milliseconds(timeoutMilliseconds), [record]() {
+			const bool complete = record->pending.load(std::memory_order_acquire) == 0;
+#if defined(RTS_BUILD_CORE_EXTRAS)
+			if (!complete) pauseJobSystemTest(128);
+#endif
+			return complete;
+		});
 }
 
 bool JobSystem::cancel(const JobGroup &group)

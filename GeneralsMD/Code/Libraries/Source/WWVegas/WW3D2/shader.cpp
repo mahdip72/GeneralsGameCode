@@ -43,14 +43,12 @@
 #include "shader.h"
 #include "w3d_file.h"
 #include "WWDebug/wwdebug.h"
-#include "dx8wrapper.h"
-#include "dx8caps.h"
+#include "Renderer/RenderGameClient.h"
 
 
 bool ShaderClass::ShaderDirty=true;
 unsigned long ShaderClass::CurrentShader=0;
-unsigned long _PolygonCullMode = D3DCULL_CW;
-
+static bool _PolygonCullModeInverted = false;
 
 /*
 ** Definitions of the preset shaders:
@@ -361,685 +359,50 @@ void ShaderClass::Report_Unable_To_Fog (const char *source)
 	#endif
 }
 
-class Blend
-{
-public:
-
-	Blend(D3DBLEND f, bool ab)
-	{
-		func = f;
-		useAlpha = ab;
-	}
-
-	D3DBLEND	func;
-	bool		useAlpha;
-};
-
-const Blend srcBlendLUT[ShaderClass::SRCBLEND_MAX] =
-{
-	Blend(D3DBLEND_ZERO, false),
-	Blend(D3DBLEND_ONE, false),
-	Blend(D3DBLEND_SRCALPHA, true),
-	Blend(D3DBLEND_INVSRCALPHA, true)
-};
-
-const Blend dstBlendLUT[ShaderClass::DSTBLEND_MAX] =
-{
-	Blend(D3DBLEND_ZERO, false),
-	Blend(D3DBLEND_ONE, false),
- 	Blend(D3DBLEND_SRCCOLOR, false),
- 	Blend(D3DBLEND_INVSRCCOLOR, false),
- 	Blend(D3DBLEND_SRCALPHA, true),
- 	Blend(D3DBLEND_INVSRCALPHA, true)
-};
-
-
 /***********************************************************************************************
- * ShaderClass::Apply -- Apply the renderstates for this shader                                *
+ * ShaderClass::Apply -- Publish the renderer-neutral pipeline state                         *
  *                                                                                             *
- * INPUT:                                                                                      *
- *                                                                                             *
- * OUTPUT:                                                                                     *
- *                                                                                             *
- * WARNINGS:                                                                                   *
- *                                                                                             *
- * HISTORY:                                                                                    *
- *   4/24/2001  gth : Created.                                                                 *
- *=============================================================================================*/
+ * Shader bits remain the serialized product contract.  The renderer facade decodes those      *
+ * bits into the native pipeline and keeps the legacy adapter isolated behind the facade.      *
+ ***********************************************************************************************/
 void ShaderClass::Apply()
 {
 	unsigned long diff;
 
-	unsigned int TextureOpCaps=DX8Wrapper::Get_Current_Caps()->Get_DX8_Caps().TextureOpCaps;
-
 	if (ShaderDirty)
 	{
-		diff=0xffffffff;
+		diff = 0xffffffffUL;
 	}
 	else
 	{
-		diff=CurrentShader^ShaderBits;
+		diff = CurrentShader ^ ShaderBits;
 	}
 
-	if(!diff) return;
-
-
-	CurrentShader=ShaderBits;
-	ShaderDirty=false;
-	// COLOR MASK
-
-	if(diff & (ShaderClass::MASK_COLORMASK | ShaderClass::MASK_SRCBLEND | ShaderClass::MASK_DSTBLEND | ShaderClass::MASK_ALPHATEST))
+	if (!diff)
 	{
-		ULONG planeMask = 0xffffff;
-
-		if(Get_Color_Mask() != ShaderClass::COLOR_WRITE_ENABLE)
-			planeMask = 0;
-
-		D3DBLEND	sf;
-		D3DBLEND	df;
-		bool	blendAlpha = false;
-
-		if(!planeMask)
-		{
-			sf = D3DBLEND_ZERO;
-			df = D3DBLEND_ONE;
-		}
-		else
-		{
-			sf = srcBlendLUT[ int(Get_Src_Blend_Func()) ].func;
-			df = dstBlendLUT[ int(Get_Dst_Blend_Func()) ].func;
-			blendAlpha |= srcBlendLUT[ int(Get_Src_Blend_Func()) ].useAlpha;
-			blendAlpha |= dstBlendLUT[ int(Get_Dst_Blend_Func()) ].useAlpha;
-		}
-
-		BOOL blendOn = FALSE;
-
-		if(sf != D3DBLEND_ONE || df != D3DBLEND_ZERO)
-		{
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_SRCBLEND,sf);
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_DESTBLEND,df);
-			blendOn = TRUE;
-		}
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE,blendOn);
-
-		BOOL alphaTest = FALSE;
-
-		if(Get_Alpha_Test() == ShaderClass::ALPHATEST_ENABLE)
-		{
-			unsigned char alphareference = 0x60;	// Alpha reference value that produces best results with mip-mapped textures.
-
-			if(sf == D3DBLEND_INVSRCALPHA)
-			{
-				DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHAREF,0xff - alphareference);
-				DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHAFUNC,D3DCMP_LESSEQUAL);
-			}
-			else
-			{
-				DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHAREF,alphareference);
-				DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHAFUNC,D3DCMP_GREATEREQUAL);
-			}
-			blendAlpha = true;
-			alphaTest = TRUE;
-		}
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHATESTENABLE,alphaTest);
-
-		diff &= ~(ShaderClass::MASK_COLORMASK | ShaderClass::MASK_SRCBLEND | ShaderClass::MASK_DSTBLEND | ShaderClass::MASK_ALPHATEST);
-		if(!diff)
-			return;
-	}
-
-	if(diff & (ShaderClass::MASK_FOG))
-	{
-		// Whenever fog is enabled or disabled, the entire shader is invalidated. This is why we
-		// can defer the "fog enabled" check inside the "fog settings changed" check.
-		if (DX8Wrapper::Get_Current_Caps()->Is_Fog_Allowed() && DX8Wrapper::Get_Fog_Enable()) {
-
-			BOOL fm = FALSE;
-			D3DCOLOR fogColor = DX8Wrapper::Get_Fog_Color();
-
-			switch(Get_Fog_Func())
-			{
-			case ShaderClass::FOG_ENABLE:
-				fm = TRUE;
-				break;
-			case ShaderClass::FOG_SCALE_FRAGMENT:
-				fogColor = 0;
-				fm = TRUE;
-				break;
-			case ShaderClass::FOG_WHITE:
-				fogColor = 0xffffff;
-				fm = TRUE;
-				break;
-			case ShaderClass::FOG_DISABLE:
-				fm = FALSE;
-				break;
-			}
-
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_FOGENABLE,fm);
-
-			if(fm)
-			{
-				DX8Wrapper::Set_DX8_Render_State(D3DRS_FOGCOLOR,fogColor);
-			}
-
-		} else {
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_FOGENABLE,FALSE);
-		}
-
-		diff &= ~(ShaderClass::MASK_FOG);
-		if(!diff)
-			return;
-	}
-
-	// Defaults
-
-	D3DTEXTUREOP	PricOp	= D3DTOP_SELECTARG1;
-	DWORD				PricArg1 = D3DTA_DIFFUSE;
-	DWORD				PricArg2 = D3DTA_DIFFUSE;
-
-	D3DTEXTUREOP	PriaOp	 = D3DTOP_SELECTARG1;
-	DWORD			PriaArg1 = D3DTA_DIFFUSE;
-	DWORD			PriaArg2 = D3DTA_DIFFUSE;
-
-	D3DTEXTUREOP	SeccOp	 = D3DTOP_DISABLE;
-	DWORD			SeccArg1 = D3DTA_TEXTURE;
-	DWORD			SeccArg2 = D3DTA_CURRENT;
-
-	D3DTEXTUREOP	SecaOp	 = D3DTOP_DISABLE;
-	DWORD			SecaArg1 = D3DTA_TEXTURE;
-	DWORD			SecaArg2 = D3DTA_CURRENT;
-
-	bool voodoo3=(DX8Wrapper::Get_Current_Caps()->Get_Vendor()==DX8Caps::VENDOR_3DFX) &&
-					 (DX8Wrapper::Get_Current_Caps()->Get_Device()==DX8Caps::DEVICE_3DFX_VOODOO_3);
-	int pri_mask=ShaderClass::MASK_PRIGRADIENT|ShaderClass::MASK_TEXTURING;
-	int sec_mask=ShaderClass::MASK_POSTDETAILALPHAFUNC|ShaderClass::MASK_POSTDETAILCOLORFUNC|ShaderClass::MASK_TEXTURING;
-
-	// Voodoo3s need to keep track of any changes in any of the above
-	// because it shuffles the stages around
-	if (voodoo3) {
-		pri_mask|=sec_mask;
-		sec_mask=pri_mask;
-	}
-
-	if(diff & pri_mask)
-	{
-		if(Get_Texturing() == ShaderClass::TEXTURING_ENABLE)
-		{
-			switch(Get_Primary_Gradient())
-			{
-			case ShaderClass::GRADIENT_DISABLE:
-				//Decal
-				PricOp = D3DTOP_SELECTARG1;
-				PricArg1 = D3DTA_TEXTURE;
-				PricArg2 = D3DTA_CURRENT;
-				PriaOp = D3DTOP_SELECTARG1;
-				PriaArg1 = D3DTA_TEXTURE;
-				PriaArg2 = D3DTA_CURRENT;
-				break;
-			default:
-			case ShaderClass::GRADIENT_MODULATE:
-				PricOp = D3DTOP_MODULATE;
-				PricArg1 = D3DTA_TEXTURE;
-				PricArg2 = D3DTA_DIFFUSE;
-				PriaOp = D3DTOP_MODULATE;
-				PriaArg1 = D3DTA_TEXTURE;
-				PriaArg2 = D3DTA_DIFFUSE;
-				break;
-			case ShaderClass::GRADIENT_ADD:
-				//Modulate Alpha
-				if(!(TextureOpCaps & D3DTEXOPCAPS_ADD))
-					PricOp = D3DTOP_MODULATE;
-				else
-					PricOp = D3DTOP_ADD;
-				PricArg1 = D3DTA_TEXTURE;
-				PricArg2 = D3DTA_DIFFUSE;
-				PriaOp = D3DTOP_MODULATE;
-				PriaArg1 = D3DTA_TEXTURE;
-				PriaArg2 = D3DTA_DIFFUSE;
-				break;
-
-			// Bump map is a hack currently as we only have two stages in use!
-			case ShaderClass::GRADIENT_BUMPENVMAP:
-				if(TextureOpCaps & D3DTEXOPCAPS_BUMPENVMAP)
-				{
-					PricOp=D3DTOP_BUMPENVMAP;
-					PricArg1=D3DTA_TEXTURE;
-					PricArg2=D3DTA_DIFFUSE;
-					PriaOp = D3DTOP_DISABLE;
-					PriaArg1 = D3DTA_TEXTURE;
-					PriaArg2 = D3DTA_CURRENT;
-				} else {
-					PricOp = D3DTOP_SELECTARG1;
-					PricArg1 = D3DTA_DIFFUSE;
-					PricArg2 = D3DTA_DIFFUSE;
-					PriaOp = D3DTOP_SELECTARG1;
-					PriaArg1 = D3DTA_DIFFUSE;
-					PriaArg2 = D3DTA_DIFFUSE;
-				}
-				break;
-
-			// Bump map is a hack currently as we only have two stages in use!
-			case ShaderClass::GRADIENT_BUMPENVMAPLUMINANCE:
-				if(TextureOpCaps & D3DTEXOPCAPS_BUMPENVMAPLUMINANCE)
-				{
-					PricOp=D3DTOP_BUMPENVMAPLUMINANCE;
-					PricArg1=D3DTA_TEXTURE;
-					PricArg2=D3DTA_DIFFUSE;
-					PriaOp = D3DTOP_DISABLE;
-					PriaArg1 = D3DTA_TEXTURE;
-					PriaArg2 = D3DTA_CURRENT;
-				} else {
-					PricOp = D3DTOP_SELECTARG1;
-					PricArg1 = D3DTA_DIFFUSE;
-					PricArg2 = D3DTA_DIFFUSE;
-					PriaOp = D3DTOP_SELECTARG1;
-					PriaArg1 = D3DTA_DIFFUSE;
-					PriaArg2 = D3DTA_DIFFUSE;
-				}
-				break;
-
-			case ShaderClass::GRADIENT_MODULATE2X:
-				//Modulate Alpha
-				if(!(TextureOpCaps & D3DTOP_MODULATE2X))
-					PricOp = D3DTOP_MODULATE;
-				else
-					PricOp = D3DTOP_MODULATE2X;
-				PricArg1 = D3DTA_TEXTURE;
-				PricArg2 = D3DTA_DIFFUSE;
-				PriaOp = D3DTOP_MODULATE;
-				PriaArg1 = D3DTA_TEXTURE;
-				PriaArg2 = D3DTA_DIFFUSE;
-				break;
-			}
-
-		}
-		else
-		{
-			switch(Get_Primary_Gradient())
-			{
-			case ShaderClass::GRADIENT_DISABLE:
-				PricOp = D3DTOP_DISABLE;
-				PricArg1 = D3DTA_TEXTURE;
-				PricArg2 = D3DTA_CURRENT;
-				PriaOp = D3DTOP_DISABLE;
-				PriaArg1 = D3DTA_TEXTURE;
-				PriaArg2 = D3DTA_CURRENT;
-				break;
-			default:
-			case ShaderClass::GRADIENT_MODULATE:
-				PricOp = D3DTOP_SELECTARG2;
-				PricArg1 = D3DTA_TEXTURE;
-				PricArg2 = D3DTA_DIFFUSE;
-				PriaOp = D3DTOP_SELECTARG2;
-				PriaArg1 = D3DTA_TEXTURE;
-				PriaArg2 = D3DTA_DIFFUSE;
-				break;
-			case ShaderClass::GRADIENT_ADD:
-				PricOp = D3DTOP_SELECTARG2;
-				PricArg1 = D3DTA_TEXTURE;
-				PricArg2 = D3DTA_DIFFUSE;
-				PriaOp = D3DTOP_SELECTARG2;
-				PriaArg1 = D3DTA_TEXTURE;
-				PriaArg2 = D3DTA_DIFFUSE;
-				break;
-			}
-		}
-	}
-
-	if(diff & sec_mask)
-	{
-		if(Get_Texturing()== ShaderClass::TEXTURING_ENABLE)
-		{
-			switch(Get_Post_Detail_Color_Func())
-			{
-			default:
-			case ShaderClass::DETAILCOLOR_DISABLE:
-				break;
-
-			case ShaderClass::DETAILCOLOR_DETAIL:
-				if(TextureOpCaps & D3DTEXOPCAPS_SELECTARG1)
-				{
-					SeccOp = D3DTOP_SELECTARG1;
-					SeccArg1 = D3DTA_TEXTURE;
-					SeccArg2 = D3DTA_CURRENT;
-				}
-				else {
-					SNAPSHOT_SAY(("Warning: Using unsupported texture op: SELECTARG1"));
-				}
-				break;
-
-			case ShaderClass::DETAILCOLOR_SCALE:
-				if(TextureOpCaps & D3DTEXOPCAPS_MODULATE)
-				{
-					SeccOp = D3DTOP_MODULATE;
-					SeccArg1 = D3DTA_TEXTURE;
-					SeccArg2 = D3DTA_CURRENT;
-				}
-				else {
-					SNAPSHOT_SAY(("Warning: Using unsupported texture op: MODULATE"));
-				}
-				break;
-
-			case ShaderClass::DETAILCOLOR_INVSCALE:
-				if(TextureOpCaps & D3DTEXOPCAPS_ADDSMOOTH)
-				{
-					SeccOp = D3DTOP_ADDSMOOTH;
-					SeccArg1 = D3DTA_TEXTURE;
-					SeccArg2 = D3DTA_CURRENT;
-				} else if(TextureOpCaps & D3DTEXOPCAPS_ADD) {
-					SeccOp = D3DTOP_ADD;
-					SeccArg1 = D3DTA_TEXTURE;
-					SeccArg2 = D3DTA_CURRENT;
-				}
-				else {
-					SNAPSHOT_SAY(("Warning: Using unsupported texture op: ADDSMOOTH"));
-				}
-				break;
-
-			case ShaderClass::DETAILCOLOR_ADD:
-				if(TextureOpCaps & D3DTEXOPCAPS_ADD)
-				{
-					SeccOp = D3DTOP_ADD;
-					SeccArg1 = D3DTA_TEXTURE;
-					SeccArg2 = D3DTA_CURRENT;
-				}
-				else {
-					SNAPSHOT_SAY(("Warning: Using unsupported texture op: ADD"));
-				}
-				break;
-
-			case ShaderClass::DETAILCOLOR_SUB:
-				if(TextureOpCaps & D3DTEXOPCAPS_SUBTRACT)
-				{
-					SeccOp = D3DTOP_SUBTRACT;
-					SeccArg1 = D3DTA_TEXTURE;
-					SeccArg2 = D3DTA_CURRENT;
-				}
-				else {
-					SNAPSHOT_SAY(("Warning: Using unsupported texture op: SUBTRACT"));
-				}
-				break;
-
-			case ShaderClass::DETAILCOLOR_SUBR:
-				if(TextureOpCaps & D3DTEXOPCAPS_SUBTRACT)
-				{
-					SeccOp = D3DTOP_SUBTRACT;
-					SeccArg1 = D3DTA_CURRENT;
-					SeccArg2 = D3DTA_TEXTURE;
-				}
-				else {
-					SNAPSHOT_SAY(("Warning: Using unsupported texture op: SUBTRACT"));
-				}
-				break;
-
-			case ShaderClass::DETAILCOLOR_BLEND:
-				if(TextureOpCaps & D3DTEXOPCAPS_BLENDTEXTUREALPHA)
-				{
-					SeccOp = D3DTOP_BLENDTEXTUREALPHA;
-					SeccArg1 = D3DTA_TEXTURE;
-					SeccArg2 = D3DTA_CURRENT;
-				}
-				else {
-					SNAPSHOT_SAY(("Warning: Using unsupported texture op: BLENDTEXTUREALPHA"));
-				}
-				break;
-
-			case ShaderClass::DETAILCOLOR_DETAILBLEND:
-				if(TextureOpCaps & D3DTEXOPCAPS_BLENDCURRENTALPHA)
-				{
-					SeccOp = D3DTOP_BLENDCURRENTALPHA;
-					SeccArg1 = D3DTA_TEXTURE;
-					SeccArg2 = D3DTA_CURRENT;
-				}
-				else {
-					SNAPSHOT_SAY(("Warning: Using unsupported texture op: BLENDCURRENTALPHA"));
-				}
-				break;
-
-			case ShaderClass::DETAILCOLOR_ADDSIGNED:
-				if (TextureOpCaps & D3DTEXOPCAPS_ADDSIGNED) {
-					SeccOp = D3DTOP_ADDSIGNED;
-					SeccArg1 = D3DTA_TEXTURE;
-					SeccArg2 = D3DTA_CURRENT;
-				}  else if (TextureOpCaps & D3DTEXOPCAPS_ADD) {
-					SeccOp = D3DTOP_ADD;
-					SeccArg1 = D3DTA_TEXTURE;
-					SeccArg2 = D3DTA_CURRENT;
-				} else {
-					SNAPSHOT_SAY(("Warning: Using unsupported texture op: ADDSIGNED"));
-				}
-				break;
-
-			case ShaderClass::DETAILCOLOR_ADDSIGNED2X:
-				if (TextureOpCaps & D3DTEXOPCAPS_ADDSIGNED2X) {
-					SeccOp = D3DTOP_ADDSIGNED2X;
-					SeccArg1 = D3DTA_TEXTURE;
-					SeccArg2 = D3DTA_CURRENT;
-				} else if (TextureOpCaps & D3DTEXOPCAPS_ADDSIGNED) {
-					SeccOp = D3DTOP_ADDSIGNED;
-					SeccArg1 = D3DTA_TEXTURE;
-					SeccArg2 = D3DTA_CURRENT;
-				}  else if (TextureOpCaps & D3DTEXOPCAPS_ADD) {
-					SeccOp = D3DTOP_ADD;
-					SeccArg1 = D3DTA_TEXTURE;
-					SeccArg2 = D3DTA_CURRENT;
-				} else {
-					SNAPSHOT_SAY(("Warning: Using unsupported texture op: ADDSIGNED2X"));
-				}
-				break;
-
-			case ShaderClass::DETAILCOLOR_SCALE2X:
-				if(TextureOpCaps & D3DTEXOPCAPS_MODULATE2X) {
-					SeccOp = D3DTOP_MODULATE2X;
-					SeccArg1 = D3DTA_TEXTURE;
-					SeccArg2 = D3DTA_CURRENT;
-				} else if(TextureOpCaps & D3DTEXOPCAPS_MODULATE) {
-					SeccOp = D3DTOP_MODULATE;
-					SeccArg1 = D3DTA_TEXTURE;
-					SeccArg2 = D3DTA_CURRENT;
-				}
-				else {
-					SNAPSHOT_SAY(("Warning: Using unsupported texture op: MODULATE2X"));
-				}
-				break;
-
-			case ShaderClass::DETAILCOLOR_MODALPHAADDCOLOR:
-				if (DX8Wrapper::Get_Current_Caps()->Support_ModAlphaAddClr()) {
-					SeccOp = D3DTOP_MODULATEALPHA_ADDCOLOR;
-					SeccArg1 = D3DTA_CURRENT;
-					SeccArg2 = D3DTA_TEXTURE;
-				} else if (TextureOpCaps & D3DTEXOPCAPS_ADD) {
-					SeccOp = D3DTOP_ADD;
-					SeccArg1 = D3DTA_TEXTURE;
-					SeccArg2 = D3DTA_CURRENT;
-				} else {
-					SNAPSHOT_SAY(("Warning: Using unsupported texture op: MODULATEALPHA_ADDCOLOR"));
-				}
-				break;
-			}
-
-			switch(Get_Post_Detail_Alpha_Func())
-			{
-			default:
-			case ShaderClass::DETAILALPHA_DISABLE:
-				break;
-
-			case ShaderClass::DETAILALPHA_DETAIL:
-				if(TextureOpCaps & D3DTEXOPCAPS_SELECTARG1)
-				{
-					SecaOp = D3DTOP_SELECTARG1;
-					SecaArg1 = D3DTA_TEXTURE;
-					SecaArg2 = D3DTA_CURRENT;
-				}
-				else {
-					SNAPSHOT_SAY(("Warning: Using unsupported texture op: SELECTARG1"));
-				}
-				break;
-
-			case ShaderClass::DETAILALPHA_SCALE:
-				if(TextureOpCaps & D3DTEXOPCAPS_MODULATE)
-				{
-					SecaOp = D3DTOP_MODULATE;
-					SecaArg1 = D3DTA_TEXTURE;
-					SecaArg2 = D3DTA_CURRENT;
-				}
-				else {
-					SNAPSHOT_SAY(("Warning: Using unsupported texture op: MODULATE"));
-				}
-				break;
-
-			case ShaderClass::DETAILALPHA_INVSCALE:
-				if(TextureOpCaps & D3DTEXOPCAPS_ADDSMOOTH)
-				{
-					SecaOp = D3DTOP_ADDSMOOTH;
-					SecaArg1 = D3DTA_TEXTURE;
-					SecaArg2 = D3DTA_CURRENT;
-				}
-				else {
-					SNAPSHOT_SAY(("Warning: Using unsupported texture op: ADDSMOOTH"));
-				}
-				break;
-			}
-
-			// if color is enabled and alpha is disabled set to pass alpha through
-			if ((SeccOp!=D3DTOP_DISABLE) && (SecaOp==D3DTOP_DISABLE)) {
-				SecaOp = D3DTOP_SELECTARG2;
-				SecaArg2 = D3DTA_CURRENT;
-			} else if ((SeccOp==D3DTOP_DISABLE) && (SecaOp!=D3DTOP_DISABLE)) {
-				SeccOp = D3DTOP_SELECTARG2;
-				SeccArg2 = D3DTA_CURRENT;
-			}
-		}
-	}
-
-	bool kill_stage_2=false;
-
-	// Apply the stage settings
-	if (diff & pri_mask) {
-		// for voodoo3 supported blend modes, the stage 0 color and alpha are both diffuse
-		// or both not, so we can check for color diffuse only
-		if ( voodoo3 && (PricArg2==D3DTA_DIFFUSE) &&
-			  ( (SecaOp!=D3DTOP_DISABLE) || (SeccOp!=D3DTOP_DISABLE) )
-			) {
-			// Special Voodoo3 code
-			// If stage 0 has a diffuse input
-			// and stage 1 has an input put the diffuse in stage 2
-
-			DWORD tex_arg=D3DTA_CURRENT;
-			if(Get_Texturing() == ShaderClass::TEXTURING_ENABLE) {
-				tex_arg=D3DTA_TEXTURE;
-			}
-
-			// this is for the bad case of using
-			// stage 0 for diffuse only
-			if ((PricOp==D3DTOP_SELECTARG1)&&(PricArg1==D3DTA_DIFFUSE)) {
-				WWDEBUG_SAY(("Wasted Stage 0 in shader-vertex diffuse only"));
-				// set stage 0 to disable
-				DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_COLOROP,D3DTOP_DISABLE);
-				DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_ALPHAOP,D3DTOP_DISABLE);
-				// set stage 1 to accept diffuse
-				if (SeccArg2==D3DTA_CURRENT) SeccArg2=D3DTA_DIFFUSE;
-				if (SecaArg2==D3DTA_CURRENT) SecaArg2=D3DTA_DIFFUSE;
-				// and nuke stage 2
-				kill_stage_2=true;
-			} else {
-				// set stage 0 to pass through what it needs
-				DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_COLOROP,D3DTOP_SELECTARG1);
-				DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_COLORARG1,tex_arg);
-				DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_ALPHAOP,D3DTOP_SELECTARG1);
-				DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_ALPHAARG1,tex_arg);
-
-				// Stage 2 is part of the renderer-neutral state contract as well.
-				DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_COLOROP,PricOp);
-				DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_COLORARG1,D3DTA_CURRENT);
-				DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_COLORARG2,D3DTA_DIFFUSE);
-				DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_ALPHAOP,PriaOp);
-				DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_ALPHAARG1,D3DTA_CURRENT);
-				DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_ALPHAARG2,D3DTA_DIFFUSE);
-				DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_TEXCOORDINDEX,D3DTSS_TCI_PASSTHRU);
-				DX8Wrapper::Set_DX8_Texture(2,nullptr);
-				kill_stage_2=false;
-				ShaderDirty=true;
-			}
-		} else {
-
-#pragma message("(gth) Generals added a feature here WW3D::Is_Coloring_Enabled() which needs to be merged properly")
-#if 0
-			if (WW3D::Is_Coloring_Enabled())
-			{
-				cArg2=aArg2=D3DTA_TFACTOR;
-				cOp=aOp=D3DTOP_SELECTARG2;
-			}
-#endif
-			DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_COLOROP,PricOp);
-			DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_COLORARG1,PricArg1);
-			DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_COLORARG2,PricArg2);
-			DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_ALPHAOP,PriaOp);
-			DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_ALPHAARG1,PriaArg1);
-			DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_ALPHAARG2,PriaArg2);
-			kill_stage_2=true;
-		}
-		diff &= ~(ShaderClass::MASK_PRIGRADIENT);
-	}
-
-	if (diff & sec_mask) {
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1,D3DTSS_COLOROP,SeccOp);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1,D3DTSS_COLORARG1,SeccArg1);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1,D3DTSS_COLORARG2,SeccArg2);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1,D3DTSS_ALPHAOP,SecaOp);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1,D3DTSS_ALPHAARG1,SecaArg1);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1,D3DTSS_ALPHAARG2,SecaArg2);
-		diff &= ~(ShaderClass::MASK_POSTDETAILCOLORFUNC);
-		diff &= ~(ShaderClass::MASK_POSTDETAILALPHAFUNC);
-		diff &= ~(ShaderClass::MASK_TEXTURING);
-	}
-
-	// Make sure to disable stage 2 for voodoos when the third stage is not used.
-	if (voodoo3 && kill_stage_2) {
-		if ((SeccOp!=D3DTOP_DISABLE)&&(SecaOp!=D3DTOP_DISABLE)) {
-			DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_COLOROP,D3DTOP_SELECTARG1);
-			DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_COLORARG1,D3DTA_CURRENT);
-			DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_ALPHAOP,D3DTOP_SELECTARG1);
-			DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_ALPHAARG1,D3DTA_CURRENT);
-		} else {
-			DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_COLOROP,D3DTOP_DISABLE);
-			DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_ALPHAOP,D3DTOP_DISABLE);
-		}
-		DX8Wrapper::Set_DX8_Texture_Stage_State(2,D3DTSS_TEXCOORDINDEX,D3DTSS_TCI_PASSTHRU);
-		DX8Wrapper::Set_DX8_Texture(2,nullptr);
-	}
-
-	if(!diff)
 		return;
-
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_SPECULARENABLE,BOOL(Get_Secondary_Gradient()));
-
-	// DEPTH COMPARE FUNCTION
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZFUNC,D3DCMPFUNC(int(Get_Depth_Compare())+1));
-
-	// DEPTH MASK
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZWRITEENABLE,BOOL(Get_Depth_Mask()));
-
-	// DITHERING
-//	DX8Wrapper::Set_DX8_Render_State(D3DRS_DITHERENABLE,BOOL(Get_Dither_Mask()));
-
-	// CULLMODE
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_CULLMODE,Get_Cull_Mode() ? _PolygonCullMode : D3DCULL_NONE);
-
-	// NPATCHES
-	if (diff&ShaderClass::MASK_NPATCHENABLE) {
-		float level=1.0f;
-		if (Get_NPatch_Enable()) level=float(WW3D::Get_NPatches_Level());
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_PATCHSEGMENTS,*((DWORD*)&level));
 	}
 
-	// Enable/disable alpha test
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHATESTENABLE,BOOL(Get_Alpha_Test()));
+	const rts::render::RenderResult cullResult =
+		rts::render::SetGameShaderCullInverted(
+			Is_Backface_Culling_Inverted());
+	if (cullResult != rts::render::RENDER_RESULT_OK)
+	{
+		rts::render::MarkLegacyStatePublicationFailure();
+		return;
+	}
 
-	// Enable/disable stencil test
-	// Not supported yet
+	const rts::render::RenderResult result =
+		rts::render::ApplyGameShaderBits(ShaderBits);
+	if (result != rts::render::RENDER_RESULT_OK)
+	{
+		rts::render::MarkLegacyStatePublicationFailure();
+		return;
+	}
+
+	CurrentShader = ShaderBits;
+	ShaderDirty = false;
 }
-
 
 /***********************************************************************************************
  * ShaderClass::Invert_Backface_Culling -- Globally invert the sense of all backface culling   *
@@ -1055,14 +418,9 @@ void ShaderClass::Apply()
  *=============================================================================================*/
 void ShaderClass::Invert_Backface_Culling(bool onoff)
 {
-	if (onoff == true) {
-		_PolygonCullMode = D3DCULL_CCW;
-	} else {
-		_PolygonCullMode = D3DCULL_CW;
-	}
+	_PolygonCullModeInverted = onoff;
 	Invalidate();
 }
-
 
 /***********************************************************************************************
  * ShaderClass::Get_SS_Category -- Helper function for static sort system                      *
@@ -1155,8 +513,10 @@ int ShaderClass::Guess_Sort_Level() const
  *=============================================================================================*/
 bool ShaderClass::Is_Backface_Culling_Inverted()
 {
-	return (_PolygonCullMode == D3DCULL_CCW);
+	return _PolygonCullModeInverted;
 }
+
+
 
 const StringClass& ShaderClass::Get_Description(StringClass& str) const
 {

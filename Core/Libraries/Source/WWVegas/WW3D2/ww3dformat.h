@@ -48,13 +48,11 @@ class Vector4;
 class Targa;
 
 /*
-** Enum for possible surface formats. This is a small subset of the D3DFORMAT
-** enum which lists the formats supported by DX8; we will add new members to
-** this list as needed (keeping it in the same order as D3DFORMAT).
-** NOTE: Whenever this is changed, formconv.h/.cpp must be modified as well
-** (that contains the code for converting between this and D3DFORMAT)..
+** Enum for possible surface formats.  The values are a stable logical
+** contract shared by loaders, CPU conversion, and native render resources.
+** NOTE: Whenever this is changed, formconv.h/.cpp must be modified as well.
 **
-** The format names use the D3DFORMAT conventions:
+** The format names use the historical channel conventions:
 **      A = Alpha
 **      R = Red
 **      G = Green

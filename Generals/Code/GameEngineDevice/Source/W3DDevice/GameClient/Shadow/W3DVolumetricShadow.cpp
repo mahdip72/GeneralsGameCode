@@ -42,7 +42,7 @@
 #include "GameClient/View.h"
 #include "WW3D2/camera.h"
 #include "WW3D2/light.h"
-#include "WW3D2/dx8wrapper.h"
+#include "WW3D2/nativew3dbuffercompat.h"
 #include "WW3D2/dx8vertexbuffer.h"
 #include "WW3D2/dx8indexbuffer.h"
 #include "WW3D2/hlod.h"
@@ -56,8 +56,8 @@
 #include "W3DDevice/GameClient/W3DShadow.h"
 #include "WW3D2/statistics.h"
 #include "GameLogic/TerrainLogic.h"
-#include "WW3D2/dx8caps.h"
 #include "GameClient/Drawable.h"
+#include "Renderer/RenderGameClient.h"
 
 
 // Global Variables and Functions /////////////////////////////////////////////
@@ -86,26 +86,24 @@ const Real cosAngleToCare = cos ((0.2 * PI) / 180.0);	//1.5 degree difference
 //#define SV_DEBUG
 //#define SV_DEBUG_BOUNDS
 
-struct SHADOW_STATIC_VOLUME_VERTEX	//vertex structure passed to D3D
+struct SHADOW_STATIC_VOLUME_VERTEX	//vertex structure submitted to the renderer
 {
 		float x,y,z;
 };
-#define SHADOW_STATIC_VOLUME_FVF	D3DFVF_XYZ
+#define SHADOW_STATIC_VOLUME_FVF	rts::render::GAME_VERTEX_XYZ
 
 #ifdef SV_DEBUG	//in debug mode, dynamic shadows are rendered with random diffuse color
-	struct SHADOW_DYNAMIC_VOLUME_VERTEX	//vertex structure passed to D3D
+	struct SHADOW_DYNAMIC_VOLUME_VERTEX	//vertex structure submitted to the renderer
 	{
 			float x,y,z;
 			DWORD diffuse;
 	};
-	#define SHADOW_DYNAMIC_VOLUME_FVF	D3DFVF_XYZ|D3DFVF_DIFFUSE
+	#define SHADOW_DYNAMIC_VOLUME_FVF	(rts::render::GAME_VERTEX_XYZ | rts::render::GAME_VERTEX_DIFFUSE)
 #else
 	typedef struct SHADOW_STATIC_VOLUME_VERTEX	SHADOW_DYNAMIC_VOLUME_VERTEX;
-	#define SHADOW_DYNAMIC_VOLUME_FVF	D3DFVF_XYZ
+	#define SHADOW_DYNAMIC_VOLUME_FVF	rts::render::GAME_VERTEX_XYZ
 #endif
 
-LPDIRECT3DVERTEXBUFFER8 shadowVertexBufferD3D=nullptr;		///<bridge-facing D3D vertex-buffer handle
-LPDIRECT3DINDEXBUFFER8	shadowIndexBufferD3D=nullptr;	///<bridge-facing D3D index-buffer handle
 DX8VertexBufferClass *shadowVertexBufferOwner=nullptr;
 DX8IndexBufferClass *shadowIndexBufferOwner=nullptr;
 int nShadowVertsInBuf=0;	//model vetices in vertex buffer
@@ -124,7 +122,7 @@ static Real beX;
 static Real beY;
 static Real beZ;
 
-static LPDIRECT3DVERTEXBUFFER8 lastActiveVertexBuffer=nullptr;
+static DX8VertexBufferClass *lastActiveVertexBuffer=nullptr;
 
 /** A simple structure to hold random geometry (vertices, polygons, etc.).  We'll use this
 * to store shadow volumes. */
@@ -1225,7 +1223,11 @@ void W3DVolumetricShadow::RenderMeshVolume(Int meshIndex, Int lightIndex, const 
 	Geometry *geometry;
 	Int numVerts, numPolys, numIndex;
 
-	if (!DX8Wrapper::Is_Initted())
+	if (!rts::render::IsGameRendererInitialized() ||
+		!rts::render::IsGameRenderTargetOperational() ||
+		shadowVertexBufferOwner == nullptr || shadowIndexBufferOwner == nullptr ||
+		!shadowVertexBufferOwner->Is_Valid() ||
+		!shadowIndexBufferOwner->Is_Valid())
 		return;
 
 	geometry = m_shadowVolume[lightIndex][ meshIndex ];
@@ -1245,42 +1247,34 @@ void W3DVolumetricShadow::RenderMeshVolume(Int meshIndex, Int lightIndex, const 
 	if( numVerts == 0 || numPolys == 0 )
 		return;
 
-	D3DMATRIX dxmWorld = To_D3DMATRIX(*meshXform);
-	DX8Wrapper::_Set_DX8_Transform(D3DTS_WORLD, dxmWorld);
+	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_WORLD, *meshXform);
 
 	W3DBufferManager::W3DVertexBufferSlot *vbSlot=m_shadowVolumeVB[lightIndex][ meshIndex ];
-	if (!vbSlot)
+	if (!vbSlot || vbSlot->m_VB == nullptr ||
+		vbSlot->m_VB->m_DX8VertexBuffer == nullptr ||
+		!vbSlot->m_VB->m_DX8VertexBuffer->Is_Valid())
 		return;
-	if (vbSlot->m_VB->m_DX8VertexBuffer->Get_DX8_Vertex_Buffer() != lastActiveVertexBuffer)
-	{	lastActiveVertexBuffer=vbSlot->m_VB->m_DX8VertexBuffer->Get_DX8_Vertex_Buffer();
-		DX8Wrapper::Set_DX8_Vertex_Buffer(lastActiveVertexBuffer,
-			vbSlot->m_VB->m_DX8VertexBuffer->FVF_Info().Get_FVF_Size(),
-			D3DFVF_XYZ);	//12 bytes per vertex.
-	}
-	else
-	{
-		DX8Wrapper::Track_DX8_Vertex_Buffer(lastActiveVertexBuffer,
-			vbSlot->m_VB->m_DX8VertexBuffer->FVF_Info().Get_FVF_Size(),
-			D3DFVF_XYZ);
-	}
+	lastActiveVertexBuffer = vbSlot->m_VB->m_DX8VertexBuffer;
+	rts::render::SetGameVertexBuffer(vbSlot->m_VB->m_DX8VertexBuffer);
+	rts::render::SetGameVertexShader(SHADOW_STATIC_VOLUME_FVF);
 
 	DEBUG_ASSERTCRASH(vbSlot->m_size >= numVerts,("Overflowing Shadow Vertex Buffer Slot"));
 
 	W3DBufferManager::W3DIndexBufferSlot *ibSlot=m_shadowVolumeIB[lightIndex][ meshIndex ];
-	if (!ibSlot)
+	if (!ibSlot || ibSlot->m_IB == nullptr ||
+		ibSlot->m_IB->m_DX8IndexBuffer == nullptr ||
+		!ibSlot->m_IB->m_DX8IndexBuffer->Is_Valid())
 		return;
 
 	DEBUG_ASSERTCRASH(ibSlot->m_size >= numIndex,("Overflowing Shadow Index Buffer Slot"));
 
-	DX8Wrapper::Set_DX8_Index_Buffer(
-		ibSlot->m_IB->m_DX8IndexBuffer->Get_DX8_Index_Buffer(), vbSlot->m_start);
-
-	if (DX8Wrapper::_Is_Triangle_Draw_Enabled())
-	{
-		Debug_Statistics::Record_DX8_Polys_And_Vertices(numPolys,numVerts,ShaderClass::_PresetOpaqueShader);
-		DX8Wrapper::Draw_DX8_Indexed_Primitive(
-			D3DPT_TRIANGLELIST, 0, numVerts, ibSlot->m_start, numPolys);
-	}
+	rts::render::SetGameIndexBuffer(ibSlot->m_IB->m_DX8IndexBuffer,
+		static_cast<unsigned short>(vbSlot->m_start));
+	Debug_Statistics::Record_DX8_Polys_And_Vertices(numPolys, numVerts,
+		ShaderClass::_PresetOpaqueShader);
+	rts::render::DrawGameTriangles(static_cast<unsigned short>(ibSlot->m_start),
+		static_cast<unsigned short>(numPolys), 0,
+		static_cast<unsigned short>(numVerts));
 
 }
 
@@ -1291,7 +1285,11 @@ void W3DVolumetricShadow::RenderDynamicMeshVolume(Int meshIndex, Int lightIndex,
 	SHADOW_DYNAMIC_VOLUME_VERTEX* pvVertices;
 	UnsignedShort *pvIndices;
 
-	if (!DX8Wrapper::Is_Initted())
+	if (!rts::render::IsGameRendererInitialized() ||
+		!rts::render::IsGameRenderTargetOperational() ||
+		shadowVertexBufferOwner == nullptr || shadowIndexBufferOwner == nullptr ||
+		!shadowVertexBufferOwner->Is_Valid() ||
+		!shadowIndexBufferOwner->Is_Valid())
 		return;
 
 
@@ -1315,16 +1313,20 @@ void W3DVolumetricShadow::RenderDynamicMeshVolume(Int meshIndex, Int lightIndex,
 
 	if (nShadowVertsInBuf > (SHADOW_VERTEX_SIZE-numVerts))	//check if room for model verts
 	{	//flush the buffer by drawing the contents and re-locking again
-		if (shadowVertexBufferD3D->Lock(0,numVerts*sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),(unsigned char**)&pvVertices,D3DLOCK_DISCARD) != D3D_OK)
+		if (!shadowVertexBufferOwner->Lock_Buffer(0,
+			numVerts*sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),
+			NATIVE_BUFFER_LOCK_DISCARD, reinterpret_cast<void **>(&pvVertices)))
 			return;
 		nShadowVertsInBuf=0;
 		nShadowStartBatchVertex=0;
 	}
 	else
-	{	if (shadowVertexBufferD3D->Lock(nShadowVertsInBuf*sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),numVerts*sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX), (unsigned char**)&pvVertices,D3DLOCK_NOOVERWRITE) != D3D_OK)
+	{	if (!shadowVertexBufferOwner->Lock_Buffer(
+			static_cast<size_t>(nShadowVertsInBuf) * sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),
+			static_cast<size_t>(numVerts) * sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),
+			NATIVE_BUFFER_LOCK_NO_OVERWRITE, reinterpret_cast<void **>(&pvVertices)))
 			return;
 	}
-	SHADOW_DYNAMIC_VOLUME_VERTEX *publishedVertices = pvVertices;
 #ifdef SV_DEBUG
 	srand(0x1345465);
 #endif
@@ -1342,66 +1344,42 @@ void W3DVolumetricShadow::RenderDynamicMeshVolume(Int meshIndex, Int lightIndex,
 #endif
 	}
 
-	Publish_Render_Buffer_Change(shadowVertexBufferD3D,
-		rts::render::RENDER_BUFFER_VERTEX,
-		publishedVertices,
-		static_cast<size_t>(numVerts) * sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),
-		static_cast<size_t>(nShadowVertsInBuf) * sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),
-		nShadowVertsInBuf == 0 ? rts::render::RENDER_BUFFER_UPDATE_DISCARD :
-			rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE);
-	shadowVertexBufferD3D->Unlock();
+	shadowVertexBufferOwner->Unlock_Buffer();
 
 	if (nShadowIndicesInBuf > (SHADOW_INDEX_SIZE-numIndex))	//check if room for model verts
 	{	//flush the buffer by drawing the contents and re-locking again
-		if (shadowIndexBufferD3D->Lock(0,numIndex*sizeof(short),(unsigned char**)&pvIndices,D3DLOCK_DISCARD) != D3D_OK)
+		if (!shadowIndexBufferOwner->Lock_Buffer(0,
+			static_cast<size_t>(numIndex) * sizeof(short),
+			NATIVE_BUFFER_LOCK_DISCARD, reinterpret_cast<void **>(&pvIndices)))
 			return;
 		nShadowIndicesInBuf=0;
 		nShadowStartBatchIndex=0;
 	}
 	else
-	{	if (shadowIndexBufferD3D->Lock(nShadowIndicesInBuf*sizeof(short),numIndex*sizeof(short), (unsigned char**)&pvIndices,D3DLOCK_NOOVERWRITE) != D3D_OK)
+	{	if (!shadowIndexBufferOwner->Lock_Buffer(
+			static_cast<size_t>(nShadowIndicesInBuf) * sizeof(short),
+			static_cast<size_t>(numIndex) * sizeof(short),
+			NATIVE_BUFFER_LOCK_NO_OVERWRITE, reinterpret_cast<void **>(&pvIndices)))
 			return;
 	}
-	unsigned short *publishedIndices = pvIndices;
-
-
 	if(pvIndices)
 	{
 		memcpy(pvIndices,geometry->GetPolygonIndex(0,(short *)pvIndices,3),numPolys*3*sizeof(short));
 	}
 
-	Publish_Render_Buffer_Change(shadowIndexBufferD3D,
-		rts::render::RENDER_BUFFER_INDEX,
-		publishedIndices,
-		static_cast<size_t>(numIndex) * sizeof(short),
-		static_cast<size_t>(nShadowIndicesInBuf) * sizeof(short),
-		nShadowIndicesInBuf == 0 ? rts::render::RENDER_BUFFER_UPDATE_DISCARD :
-			rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE);
-	shadowIndexBufferD3D->Unlock();
+	shadowIndexBufferOwner->Unlock_Buffer();
 
-	DX8Wrapper::Set_DX8_Index_Buffer(shadowIndexBufferD3D,
-		nShadowStartBatchVertex);
-
-	D3DMATRIX dxmWorld = To_D3DMATRIX(*meshXform);
-	DX8Wrapper::_Set_DX8_Transform(D3DTS_WORLD, dxmWorld);
-
-	if (shadowVertexBufferD3D != lastActiveVertexBuffer)
-	{	DX8Wrapper::Set_DX8_Vertex_Buffer(shadowVertexBufferD3D,
-		sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX), SHADOW_DYNAMIC_VOLUME_FVF);
-		lastActiveVertexBuffer = shadowVertexBufferD3D;
-	}
-	else
-	{
-		DX8Wrapper::Track_DX8_Vertex_Buffer(shadowVertexBufferD3D,
-			sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX), SHADOW_DYNAMIC_VOLUME_FVF);
-	}
-
-	if (DX8Wrapper::_Is_Triangle_Draw_Enabled())
-	{
-		Debug_Statistics::Record_DX8_Polys_And_Vertices(numPolys,numVerts,ShaderClass::_PresetOpaqueShader);
-		DX8Wrapper::Draw_DX8_Indexed_Primitive(D3DPT_TRIANGLELIST, 0,
-			numVerts, nShadowStartBatchIndex, numPolys);
-	}
+	rts::render::SetGameIndexBuffer(shadowIndexBufferOwner,
+		static_cast<unsigned short>(nShadowStartBatchVertex));
+	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_WORLD, *meshXform);
+	lastActiveVertexBuffer = shadowVertexBufferOwner;
+	rts::render::SetGameVertexBuffer(shadowVertexBufferOwner);
+	rts::render::SetGameVertexShader(SHADOW_DYNAMIC_VOLUME_FVF);
+	Debug_Statistics::Record_DX8_Polys_And_Vertices(numPolys, numVerts,
+		ShaderClass::_PresetOpaqueShader);
+	rts::render::DrawGameTriangles(static_cast<unsigned short>(nShadowStartBatchIndex),
+		static_cast<unsigned short>(numPolys), 0,
+		static_cast<unsigned short>(numVerts));
 
 	nShadowVertsInBuf += numVerts;
 	nShadowStartBatchVertex=nShadowVertsInBuf;
@@ -1449,13 +1427,19 @@ void W3DVolumetricShadow::RenderMeshVolumeBounds(Int meshIndex, Int lightIndex, 
 
 	static Vector3 verts[8];
 
-	if (!DX8Wrapper::Is_Initted())
+	if (!rts::render::IsGameRendererInitialized() ||
+		!rts::render::IsGameRenderTargetOperational() ||
+		shadowVertexBufferOwner == nullptr || shadowIndexBufferOwner == nullptr ||
+		!shadowVertexBufferOwner->Is_Valid() ||
+		!shadowIndexBufferOwner->Is_Valid())
 		return;
 
 	Vector3 meshPosition;
 	meshXform->Get_Translation(&meshPosition);	//current mesh position
 
 	geometry = m_shadowVolume[lightIndex][ meshIndex ];
+	if (geometry == nullptr)
+		return;
 	AABoxClass &aab=geometry->getBoundingBox();
 
 	// compute the vertex positions
@@ -1486,13 +1470,18 @@ void W3DVolumetricShadow::RenderMeshVolumeBounds(Int meshIndex, Int lightIndex, 
 
 	if (nShadowVertsInBuf > (SHADOW_VERTEX_SIZE-numVerts))	//check if room for model verts
 	{	//flush the buffer by drawing the contents and re-locking again
-		if (shadowVertexBufferD3D->Lock(0,numVerts*sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),(unsigned char**)&pvVertices,D3DLOCK_DISCARD) != D3D_OK)
+		if (!shadowVertexBufferOwner->Lock_Buffer(0,
+			static_cast<size_t>(numVerts) * sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),
+			NATIVE_BUFFER_LOCK_DISCARD, reinterpret_cast<void **>(&pvVertices)))
 			return;
 		nShadowVertsInBuf=0;
 		nShadowStartBatchVertex=0;
 	}
 	else
-	{	if (shadowVertexBufferD3D->Lock(nShadowVertsInBuf*sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),numVerts*sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX), (unsigned char**)&pvVertices,D3DLOCK_NOOVERWRITE) != D3D_OK)
+	{	if (!shadowVertexBufferOwner->Lock_Buffer(
+			static_cast<size_t>(nShadowVertsInBuf) * sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),
+			static_cast<size_t>(numVerts) * sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),
+			NATIVE_BUFFER_LOCK_NO_OVERWRITE, reinterpret_cast<void **>(&pvVertices)))
 			return;
 	}
 	srand(0x1345465);
@@ -1509,24 +1498,22 @@ void W3DVolumetricShadow::RenderMeshVolumeBounds(Int meshIndex, Int lightIndex, 
 		}
 	}
 
-	Publish_Render_Buffer_Change(shadowVertexBufferD3D,
-		rts::render::RENDER_BUFFER_VERTEX,
-		pvVertices - numVerts,
-		static_cast<size_t>(numVerts) * sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),
-		static_cast<size_t>(nShadowVertsInBuf) * sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),
-		nShadowVertsInBuf == 0 ? rts::render::RENDER_BUFFER_UPDATE_DISCARD :
-			rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE);
-	shadowVertexBufferD3D->Unlock();
+	shadowVertexBufferOwner->Unlock_Buffer();
 
 	if (nShadowIndicesInBuf > (SHADOW_INDEX_SIZE-numIndex))	//check if room for model verts
 	{	//flush the buffer by drawing the contents and re-locking again
-		if (shadowIndexBufferD3D->Lock(0,numIndex*sizeof(short),(unsigned char**)&pvIndices,D3DLOCK_DISCARD) != D3D_OK)
+		if (!shadowIndexBufferOwner->Lock_Buffer(0,
+			static_cast<size_t>(numIndex) * sizeof(short),
+			NATIVE_BUFFER_LOCK_DISCARD, reinterpret_cast<void **>(&pvIndices)))
 			return;
 		nShadowIndicesInBuf=0;
 		nShadowStartBatchIndex=0;
 	}
 	else
-	{	if (shadowIndexBufferD3D->Lock(nShadowIndicesInBuf*sizeof(short),numIndex*sizeof(short), (unsigned char**)&pvIndices,D3DLOCK_NOOVERWRITE) != D3D_OK)
+	{	if (!shadowIndexBufferOwner->Lock_Buffer(
+			static_cast<size_t>(nShadowIndicesInBuf) * sizeof(short),
+			static_cast<size_t>(numIndex) * sizeof(short),
+			NATIVE_BUFFER_LOCK_NO_OVERWRITE, reinterpret_cast<void **>(&pvIndices)))
 			return;
 	}
 
@@ -1541,30 +1528,20 @@ void W3DVolumetricShadow::RenderMeshVolumeBounds(Int meshIndex, Int lightIndex, 
 		}
 	}
 
-	Publish_Render_Buffer_Change(shadowIndexBufferD3D,
-		rts::render::RENDER_BUFFER_INDEX,
-		pvIndices - numIndex,
-		static_cast<size_t>(numIndex) * sizeof(short),
-		static_cast<size_t>(nShadowIndicesInBuf) * sizeof(short),
-		nShadowIndicesInBuf == 0 ? rts::render::RENDER_BUFFER_UPDATE_DISCARD :
-			rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE);
-	shadowIndexBufferD3D->Unlock();
+	shadowIndexBufferOwner->Unlock_Buffer();
 
-	DX8Wrapper::Set_DX8_Index_Buffer(shadowIndexBufferD3D,
-		nShadowStartBatchVertex);
+	rts::render::SetGameIndexBuffer(shadowIndexBufferOwner,
+		static_cast<unsigned short>(nShadowStartBatchVertex));
 
-
-	//todo: replace this with mesh transform
-	Matrix4x4 mWorld(1);	//identity since boxes are pre-transformed to world space.
-	D3DMATRIX dxmWorld = To_D3DMATRIX(mWorld);
-	DX8Wrapper::_Set_DX8_Transform(D3DTS_WORLD, dxmWorld);
-
-		DX8Wrapper::Set_DX8_Vertex_Buffer(shadowVertexBufferD3D,
-			sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX), SHADOW_DYNAMIC_VOLUME_FVF);
-	DX8Wrapper::Set_Vertex_Shader(SHADOW_DYNAMIC_VOLUME_FVF);
-
-	DX8Wrapper::Draw_DX8_Indexed_Primitive(D3DPT_TRIANGLELIST, 0,
-		numVerts, nShadowStartBatchIndex, numPolys);
+	// The box vertices are already in world space, so use the identity transform.
+	Matrix4x4 mWorld(1);
+	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_WORLD, mWorld);
+	lastActiveVertexBuffer = shadowVertexBufferOwner;
+	rts::render::SetGameVertexBuffer(shadowVertexBufferOwner);
+	rts::render::SetGameVertexShader(SHADOW_DYNAMIC_VOLUME_FVF);
+	rts::render::DrawGameTriangles(static_cast<unsigned short>(nShadowStartBatchIndex),
+		static_cast<unsigned short>(numPolys), 0,
+		static_cast<unsigned short>(numVerts));
 
 	nShadowVertsInBuf += numVerts;
 	nShadowStartBatchVertex=nShadowVertsInBuf;
@@ -2865,13 +2842,13 @@ void W3DVolumetricShadow::constructVolumeVB( Vector3 *lightPosObject,Real shadow
 
 	geomMesh = m_geometry->getMesh(meshIndex);
 
-	DX8VertexBufferClass::AppendLockClass lockVtxBuffer(vbSlot->m_VB->m_DX8VertexBuffer,vbSlot->m_start,vertexCount);
+	VertexBufferClass::AppendLockClass lockVtxBuffer(vbSlot->m_VB->m_DX8VertexBuffer,vbSlot->m_start,vertexCount);
 	VertexFormatXYZ *vb = (VertexFormatXYZ*)lockVtxBuffer.Get_Vertex_Array();
 
 	if (vb == nullptr)
 		return;
 
-	DX8IndexBufferClass::AppendLockClass lockIdxBuffer(ibSlot->m_IB->m_DX8IndexBuffer,ibSlot->m_start,polygonCount*3);
+	IndexBufferClass::AppendLockClass lockIdxBuffer(ibSlot->m_IB->m_DX8IndexBuffer,ibSlot->m_start,polygonCount*3);
 	UnsignedShort *ib = (UnsignedShort*)lockIdxBuffer.Get_Index_Array();
 
 	if (ib == nullptr)
@@ -3232,8 +3209,10 @@ void W3DVolumetricShadow::resetSilhouette( Int meshIndex )
 // ============================================================================
 void W3DVolumetricShadowManager::renderStencilShadows()
 {
-	if (!DX8Wrapper::Is_Initted())
-		return;	//need device to render anything.
+	if (!rts::render::IsGameRendererInitialized() ||
+		!rts::render::IsGameRenderTargetOperational() ||
+		!rts::render::GameRendererSupportsStencil())
+		return;	//need a live renderer with a stencil attachment.
 
 	struct _TRANSLITVERTEX {
 	    Vector4 p;
@@ -3257,42 +3236,64 @@ void W3DVolumetricShadowManager::renderStencilShadows()
 
 	//draw polygons like this is very inefficient but for only 2 triangles, it's
 	//not worth bothering with index/vertex buffers.
-	DX8Wrapper::Set_Vertex_Shader(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+	rts::render::SetGameVertexShader(
+		rts::render::GAME_VERTEX_XYZRHW | rts::render::GAME_VERTEX_DIFFUSE);
 
-	// Use alpha blending to draw the transparent shadow
-    DX8Wrapper::Set_DX8_Render_State( D3DRS_ALPHABLENDENABLE, TRUE );
-//  m_pDev->SetRenderState( D3DRS_SRCBLEND,  D3DBLEND_SRCALPHA );
-//  m_pDev->SetRenderState( D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA );
-		DX8Wrapper::Set_DX8_Render_State( D3DRS_SRCBLEND,  D3DBLEND_DESTCOLOR);
-		DX8Wrapper::Set_DX8_Render_State( D3DRS_DESTBLEND, D3DBLEND_ZERO );
+	// Use alpha blending to draw the transparent shadow.
+	rts::render::SetGameRenderState(
+		rts::render::GAME_RENDER_STATE_ALPHA_BLEND_ENABLE, 1);
+	rts::render::SetGameRenderState(
+		rts::render::GAME_RENDER_STATE_SOURCE_BLEND,
+		rts::render::RENDER_BLEND_DESTINATION_COLOR);
+	rts::render::SetGameRenderState(
+		rts::render::GAME_RENDER_STATE_DESTINATION_BLEND,
+		rts::render::RENDER_BLEND_ZERO);
 
 
-	// Set stencil states
-    DX8Wrapper::Set_DX8_Render_State( D3DRS_ZENABLE,          TRUE );
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_ZFUNC, D3DCMP_ALWAYS);
+	// Set depth/stencil states.
+	rts::render::SetGameRenderState(
+		rts::render::GAME_RENDER_STATE_DEPTH_ENABLE, 1);
+	rts::render::SetGameRenderState(
+		rts::render::GAME_RENDER_STATE_DEPTH_FUNCTION,
+		rts::render::RENDER_COMPARE_ALWAYS);
 
 	// Only write where stencil val >= 1 (count indicates # of shadows that
-	// overlap that pixel)
-    DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILENABLE, TRUE );
-    DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILFUNC, D3DCMP_LESSEQUAL );	//reference value is less or equal to stencil
-    DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILPASS, D3DSTENCILOP_KEEP );
-	//Upper bits of stencil could be used for storing occluded models which are player colored.  So we mask out those
-	//pixels and only use the lower bits for shadow calculations.
-	DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILMASK,     ~TheW3DShadowManager->getStencilShadowMask());
-    DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILREF,      0x1 );
+	// overlap that pixel).
+	rts::render::SetGameRenderState(
+		rts::render::GAME_RENDER_STATE_STENCIL_ENABLE, 1);
+	rts::render::SetGameRenderState(
+		rts::render::GAME_RENDER_STATE_STENCIL_FUNCTION,
+		rts::render::RENDER_COMPARE_LESS_EQUAL);
+	rts::render::SetGameRenderState(
+		rts::render::GAME_RENDER_STATE_STENCIL_PASS_OPERATION,
+		rts::render::RENDER_STENCIL_KEEP);
+	// Upper stencil bits belong to player-color occlusion; only the lower
+	// bits participate in this final shadow pass.
+	rts::render::SetGameRenderState(
+		rts::render::GAME_RENDER_STATE_STENCIL_READ_MASK,
+		~TheW3DShadowManager->getStencilShadowMask());
+	rts::render::SetGameRenderState(
+		rts::render::GAME_RENDER_STATE_STENCIL_REFERENCE, 0x1);
+	rts::render::SetGameRenderState(
+		rts::render::GAME_RENDER_STATE_SHADE_MODE,
+		rts::render::IsNativeGameRendererActive() ?
+			rts::render::GAME_RENDER_SHADE_GOURAUD :
+			rts::render::GAME_RENDER_SHADE_FLAT);
 
+	(void)rts::render::DrawGamePrimitiveUP(
+		rts::render::GAME_PRIMITIVE_TRIANGLE_STRIP, 2, v,
+		sizeof(_TRANSLITVERTEX),
+		rts::render::GAME_VERTEX_XYZRHW | rts::render::GAME_VERTEX_DIFFUSE);
 
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_SHADEMODE,
-		rts::render::Select_D3D11_Volumetric_Shadow_Shade_Mode(
-			DX8Wrapper::Is_D3D11_Backend_Active(), true));
-
-	if (DX8Wrapper::_Is_Triangle_Draw_Enabled())
-		DX8Wrapper::Draw_Primitive_UP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANSLITVERTEX));
-
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_SHADEMODE, D3DSHADE_GOURAUD);
-	DX8Wrapper::Set_DX8_Render_State( D3DRS_ALPHABLENDENABLE, FALSE );
+	rts::render::SetGameRenderState(
+		rts::render::GAME_RENDER_STATE_SHADE_MODE,
+		rts::render::GAME_RENDER_SHADE_GOURAUD);
+	rts::render::SetGameRenderState(
+		rts::render::GAME_RENDER_STATE_ALPHA_BLEND_ENABLE, 0);
 	// turn off the stencil buffer
-	DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILENABLE, FALSE );
+	rts::render::SetGameRenderState(
+		rts::render::GAME_RENDER_STATE_STENCIL_ENABLE, 0);
+	rts::render::ApplyGameRenderStateChanges();
 
 }
 
@@ -3319,92 +3320,129 @@ void W3DVolumetricShadowManager::renderShadows( Bool forceStencilFill )
 	if (m_shadowList && TheGlobalData->m_useShadowVolumes)
 	{
 
-		if (!DX8Wrapper::Is_Initted())
-			return;	//need device to render anything.
+		if (!rts::render::IsGameRendererInitialized() ||
+			!rts::render::IsGameRenderTargetOperational() ||
+			!rts::render::GameRendererSupportsStencil() ||
+			shadowVertexBufferOwner == nullptr || shadowIndexBufferOwner == nullptr ||
+			!shadowVertexBufferOwner->Is_Valid() ||
+			!shadowIndexBufferOwner->Is_Valid())
+			return;	//need a live renderer with a stencil attachment.
 
-		//According to Nvidia there's a D3D bug that happens if you don't start with a
+		//Some drivers require a fresh dynamic VB each frame, so force a
 		//new dynamic VB each frame - so we force a DISCARD by overflowing the counter.
 		nShadowIndicesInBuf = 0xffff;
 		nShadowVertsInBuf = 0xffff;
 
-		//Set W3D to some known state
+
+		//Set the neutral renderer to the shadow-volume baseline.
 		VertexMaterialClass *vmat=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
-		DX8Wrapper::Set_Material(vmat);
+		rts::render::SetGameMaterial(vmat);
 		REF_PTR_RELEASE(vmat);
+		rts::render::SetGameShader(ShaderClass::_PresetOpaqueShader);
+		rts::render::SetGameTexture(0, nullptr);
+		rts::render::SetGameTexture(1, nullptr);
+		rts::render::ApplyGameRenderStateChanges();
 
-		DX8Wrapper::Set_Shader(ShaderClass::_PresetOpaqueShader);
-		DX8Wrapper::Set_Texture(0,nullptr);	//turn off textures
-		DX8Wrapper::Set_Texture(1,nullptr);	//turn off textures
-		DX8Wrapper::Apply_Render_State_Changes();	//force update of view and projection matrices
+		// Turn off depth writes and fixed-function alpha/fog tests.
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_DEPTH_FUNCTION,
+			rts::render::RENDER_COMPARE_LESS_EQUAL);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_DEPTH_ENABLE, 1);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_DEPTH_WRITE, 0);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_ALPHA_TEST_ENABLE, 0);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_FOG_ENABLE, 0);
 
-		// turn off z writing
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
-	  DX8Wrapper::Set_DX8_Render_State( D3DRS_ZENABLE,          TRUE );
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_ZWRITEENABLE , FALSE);
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHATESTENABLE, FALSE);
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_FOGENABLE, FALSE);
+		// Set the texture stages to the untextured, vertex-color path.
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_SHADE_MODE,
+			rts::render::IsNativeGameRendererActive() ?
+				rts::render::GAME_RENDER_SHADE_GOURAUD :
+				rts::render::GAME_RENDER_SHADE_FLAT);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_LIGHTING, 0);
+		rts::render::SetGameTextureStageState(0,
+			rts::render::GAME_TEXTURE_STAGE_COLOR_ARGUMENT1,
+			rts::render::GAME_TEXTURE_ARGUMENT_TEXTURE);
+		rts::render::SetGameTextureStageState(0,
+			rts::render::GAME_TEXTURE_STAGE_COLOR_ARGUMENT2,
+			rts::render::GAME_TEXTURE_ARGUMENT_DIFFUSE);
+		rts::render::SetGameTextureStageState(0,
+			rts::render::GAME_TEXTURE_STAGE_COLOR_OPERATION,
+			rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_2);
+		rts::render::SetGameTextureStageState(0,
+			rts::render::GAME_TEXTURE_STAGE_ALPHA_OPERATION,
+			rts::render::RENDER_TEXTURE_OP_DISABLE);
+		rts::render::SetGameTextureStageState(0,
+			rts::render::GAME_TEXTURE_STAGE_COORDINATE_INDEX, 0);
+		rts::render::SetGameTextureStageState(1,
+			rts::render::GAME_TEXTURE_STAGE_COLOR_OPERATION,
+			rts::render::RENDER_TEXTURE_OP_DISABLE);
+		rts::render::SetGameTextureStageState(1,
+			rts::render::GAME_TEXTURE_STAGE_ALPHA_OPERATION,
+			rts::render::RENDER_TEXTURE_OP_DISABLE);
+		rts::render::SetGameTextureStageState(1,
+			rts::render::GAME_TEXTURE_STAGE_COORDINATE_INDEX, 1);
+		rts::render::SetGameTexture(0, nullptr);
+		rts::render::SetGameTexture(1, nullptr);
 
-
-		// setup the TMU to default
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_SHADEMODE,
-			rts::render::Select_D3D11_Volumetric_Shadow_Shade_Mode(
-				DX8Wrapper::Is_D3D11_Backend_Active(), true));
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_LIGHTING, FALSE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG1, D3DTA_TEXTURE );
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG2, D3DTA_DIFFUSE );
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLOROP,   D3DTOP_SELECTARG2);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ALPHAOP,   D3DTOP_DISABLE );
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXCOORDINDEX, 0 );
-
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLOROP,   D3DTOP_DISABLE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ALPHAOP,   D3DTOP_DISABLE );
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_TEXCOORDINDEX, 1 );
-		DX8Wrapper::Set_DX8_Texture(0,nullptr);
-		DX8Wrapper::Set_DX8_Texture(1,nullptr);
-
-		DWORD oldColorWriteEnable=0x12345678;
+		// The native state contract handles color-write suppression explicitly.
 
 	#ifdef SV_DEBUG
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE , TRUE);
-		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILENABLE, FALSE );
-		DX8Wrapper::Set_DX8_Render_State( D3DRS_SRCBLEND, /*D3DBLEND_DESTCOLOR*/D3DBLEND_ONE );
-		DX8Wrapper::Set_DX8_Render_State( D3DRS_DESTBLEND, D3DBLEND_ZERO );
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_ALPHA_BLEND_ENABLE, 1);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_ENABLE, 0);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_SOURCE_BLEND,
+			rts::render::RENDER_BLEND_ONE);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_DESTINATION_BLEND,
+			rts::render::RENDER_BLEND_ZERO);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_DEPTH_FUNCTION,
+			rts::render::RENDER_COMPARE_LESS_EQUAL);
 	#else
-		//disable writes to color buffer
-		if (DX8Wrapper::Get_Current_Caps()->Get_DX8_Caps().PrimitiveMiscCaps & D3DPMISCCAPS_COLORWRITEENABLE)
-		{	DX8Wrapper::_Get_D3D_Device8()->GetRenderState(D3DRS_COLORWRITEENABLE, &oldColorWriteEnable);
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_COLORWRITEENABLE,0);
-		}
-		else
-		{	//device does not support disabling writes to color buffer so fake it through alpha blending
-			DX8Wrapper::Set_DX8_Render_State( D3DRS_SRCBLEND, D3DBLEND_ZERO );
-			DX8Wrapper::Set_DX8_Render_State( D3DRS_DESTBLEND, D3DBLEND_ONE );
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE , TRUE);
-		}
-		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILENABLE, TRUE );
+		// Suppress color writes during the stencil-volume passes.
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_COLOR_WRITE_MASK, 0);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_ENABLE, 1);
 	#endif
-		//Any pixels with stencil already set to 128 contains a potential occluder.  If this pixels also has any of the player
-		//color stencil bits also set, it means that it's an occluded player color and we need to NOT render shadows here.  We
-		//do this determination by comparing the value in the combined bits against a value containing only a potential occluder.
-		//If the value of just the potential occluder bit is >= than the combined bits, then we know none of the player color
-		//bits were set and it's okay to render shadow.
+		// Any pixels with stencil already set to 128 contain a potential occluder.
 		if (TheW3DShadowManager->getStencilShadowMask() == 0x80808080)
-			DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILFUNC,     D3DCMP_NOTEQUAL );	//in this mode, MSB indicates occluded player pixels.
+			rts::render::SetGameRenderState(
+				rts::render::GAME_RENDER_STATE_STENCIL_FUNCTION,
+				rts::render::RENDER_COMPARE_NOT_EQUAL);
 		else
-			DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILFUNC,     D3DCMP_GREATEREQUAL );	//in this mode, multiple bits indicate occluded player pixels.
-		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILREF,      0x80808080 );			//isolate MSB, it's used to indicate pixels containing potential occluders.
-		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILMASK,     TheW3DShadowManager->getStencilShadowMask());	//isolate upper bits containing PotentialOccluderBit|PlayerColorBits
-		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILWRITEMASK,0xffffffff );
-		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILZFAIL, D3DSTENCILOP_KEEP );
-		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILFAIL,  D3DSTENCILOP_KEEP );
-		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILPASS,  D3DSTENCILOP_INCR );
+			rts::render::SetGameRenderState(
+				rts::render::GAME_RENDER_STATE_STENCIL_FUNCTION,
+				rts::render::RENDER_COMPARE_GREATER_EQUAL);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_REFERENCE, 0x80808080);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_READ_MASK,
+			TheW3DShadowManager->getStencilShadowMask());
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_WRITE_MASK, 0xffffffff);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_DEPTH_FAIL_OPERATION,
+			rts::render::RENDER_STENCIL_KEEP);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_FAIL_OPERATION,
+			rts::render::RENDER_STENCIL_KEEP);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_PASS_OPERATION,
+			rts::render::RENDER_STENCIL_INCREMENT);
 
-		DX8Wrapper::Set_Vertex_Shader(SHADOW_DYNAMIC_VOLUME_FVF);
+		rts::render::SetGameVertexShader(SHADOW_DYNAMIC_VOLUME_FVF);
 
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_CULLMODE,D3DCULL_CW);
-//		m_pDev->SetRenderState(D3DRS_ZBIAS,1);	///@todo: See if this helps or makes things worse.
-		//m_pDev->SetRenderState(D3DRS_FILLMODE,D3DFILL_WIREFRAME);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_CULL_MODE,
+			rts::render::GAME_RENDER_CULL_CLOCKWISE);
 
 
 		lastActiveVertexBuffer=nullptr;	//reset
@@ -3434,7 +3472,7 @@ void W3DVolumetricShadowManager::renderShadows( Bool forceStencilFill )
 		}
 
 		// Set vertex format to that used by static shadow volumes
-		DX8Wrapper::Set_Vertex_Shader(W3DBufferManager::getDX8Format(W3DBufferManager::VBM_FVF_XYZ));
+		rts::render::SetGameVertexShader(SHADOW_STATIC_VOLUME_FVF);
 
 		//Empty queue of static shadow volumes to render.
 		W3DBufferManager::W3DVertexBuffer *nextVb;
@@ -3451,14 +3489,18 @@ void W3DVolumetricShadowManager::renderShadows( Bool forceStencilFill )
 		}
 
 		// change the stencil op to decrement
-		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILPASS,  D3DSTENCILOP_DECRSAT);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_PASS_OPERATION,
+			rts::render::RENDER_STENCIL_DECREMENT_SATURATE);
 
 		//
 		// invert normals of shadow volumes so we can decrement in the
 		// stencil buffer and render
 		//
 
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_CULLMODE,D3DCULL_CCW);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_CULL_MODE,
+			rts::render::GAME_RENDER_CULL_COUNTER_CLOCKWISE);
 
 		for (nextVb=TheW3DBufferManager->getNextVertexBuffer(nullptr,W3DBufferManager::VBM_FVF_XYZ);nextVb != nullptr; nextVb=TheW3DBufferManager->getNextVertexBuffer(nextVb,W3DBufferManager::VBM_FVF_XYZ))
 		{
@@ -3470,7 +3512,7 @@ void W3DVolumetricShadowManager::renderShadows( Bool forceStencilFill )
 			}
 		}
 
-		DX8Wrapper::Set_Vertex_Shader(SHADOW_DYNAMIC_VOLUME_FVF);
+		rts::render::SetGameVertexShader(SHADOW_DYNAMIC_VOLUME_FVF);
 		//flush any dynamic shadow volumes
 		shadowDynamicTask=m_dynamicShadowVolumesToRender;
 		while (shadowDynamicTask)
@@ -3486,13 +3528,18 @@ void W3DVolumetricShadowManager::renderShadows( Bool forceStencilFill )
 			nextVb->m_renderTaskList=nullptr;
 		}
 
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_CULLMODE,D3DCULL_CW);
-//		m_pDev->SetRenderState(D3DRS_ZBIAS,0);	///@todo: See if this helps or makes things worse.
-		//m_pDev->SetRenderState(D3DRS_FILLMODE,D3DFILL_SOLID);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_CULL_MODE,
+			rts::render::GAME_RENDER_CULL_CLOCKWISE);
 
 
-		if (oldColorWriteEnable != 0x12345678)
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_COLORWRITEENABLE,oldColorWriteEnable);
+		// Re-enable the color target before drawing the final shadow quad.
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_COLOR_WRITE_MASK,
+			rts::render::GAME_COLOR_WRITE_RED |
+			rts::render::GAME_COLOR_WRITE_GREEN |
+			rts::render::GAME_COLOR_WRITE_BLUE |
+			rts::render::GAME_COLOR_WRITE_ALPHA);
 
 		//
 		// render the big transparent square of shadows in the stencil buffer
@@ -3502,28 +3549,33 @@ void W3DVolumetricShadowManager::renderShadows( Bool forceStencilFill )
 //		if (numRenderedShadows)
 			renderStencilShadows();
 
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_SHADEMODE, D3DSHADE_GOURAUD);
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE , FALSE);
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_LIGHTING, FALSE);
+		// Return to the neutral fixed-function baseline after the final pass.
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_SHADE_MODE,
+			rts::render::GAME_RENDER_SHADE_GOURAUD);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_ALPHA_BLEND_ENABLE, 0);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_LIGHTING, 0);
 
-		DX8Wrapper::Invalidate_Cached_Render_States();
+		rts::render::InvalidateGameRenderStateCache();
 	}
 	else
 	if (forceStencilFill)
 	{	//no shadows to render, but still need to fill stencil buffer
 		//for other effects.
 
-		//Set W3D to some known state
+		//Set the neutral renderer to the stencil-fill baseline.
 		VertexMaterialClass *vmat=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
-		DX8Wrapper::Set_Material(vmat);
+		rts::render::SetGameMaterial(vmat);
 		REF_PTR_RELEASE(vmat);
-		DX8Wrapper::Set_Shader(ShaderClass::_PresetOpaqueShader);
-		DX8Wrapper::Set_Texture(0,nullptr);
-		DX8Wrapper::Apply_Render_State_Changes();	//force update of view and projection matrices
+		rts::render::SetGameShader(ShaderClass::_PresetOpaqueShader);
+		rts::render::SetGameTexture(0, nullptr);
+		rts::render::ApplyGameRenderStateChanges();
 
 		renderStencilShadows();
 
-		DX8Wrapper::Invalidate_Cached_Render_States();
+		rts::render::InvalidateGameRenderStateCache();
 	}
 
 }
@@ -3617,13 +3669,11 @@ W3DVolumetricShadowManager::~W3DVolumetricShadowManager()
 
 }
 
-/** Releases all W3D/D3D assets before a reset.. */
+/** Releases all render assets before a reset. */
 void W3DVolumetricShadowManager::ReleaseResources()
 {
 	REF_PTR_RELEASE(shadowIndexBufferOwner);
 	REF_PTR_RELEASE(shadowVertexBufferOwner);
-	shadowIndexBufferD3D=nullptr;
-	shadowVertexBufferD3D=nullptr;
 	lastActiveVertexBuffer=nullptr;
 	if (TheW3DBufferManager)
 	{	TheW3DBufferManager->ReleaseResources();
@@ -3631,22 +3681,22 @@ void W3DVolumetricShadowManager::ReleaseResources()
 	}
 }
 
-/** (Re)allocates all W3D/D3D assets after a reset.. */
+/** (Re)allocates all render assets after a reset. */
 Bool W3DVolumetricShadowManager::ReAcquireResources()
 {
 	ReleaseResources();
 
-	if (!DX8Wrapper::Is_Initted())
+	if (!rts::render::IsGameRendererInitialized() ||
+		!rts::render::IsGameRenderTargetOperational())
 		return FALSE;
 
 	shadowIndexBufferOwner=NEW_REF(DX8IndexBufferClass,
 		(static_cast<unsigned short>(SHADOW_INDEX_SIZE),
 		DX8IndexBufferClass::USAGE_DYNAMIC));
 	if (shadowIndexBufferOwner == nullptr ||
-		(shadowIndexBufferD3D=shadowIndexBufferOwner->Get_DX8_Index_Buffer()) == nullptr)
+		!shadowIndexBufferOwner->Is_Valid())
 	{
 		REF_PTR_RELEASE(shadowIndexBufferOwner);
-		shadowIndexBufferD3D=nullptr;
 		return FALSE;
 	}
 
@@ -3655,18 +3705,19 @@ Bool W3DVolumetricShadowManager::ReAcquireResources()
 		static_cast<unsigned short>(SHADOW_VERTEX_SIZE),
 		DX8VertexBufferClass::USAGE_DYNAMIC));
 	if (shadowVertexBufferOwner == nullptr ||
-		(shadowVertexBufferD3D=shadowVertexBufferOwner->Get_DX8_Vertex_Buffer()) == nullptr)
+		!shadowVertexBufferOwner->Is_Valid())
 	{
 		REF_PTR_RELEASE(shadowVertexBufferOwner);
 		REF_PTR_RELEASE(shadowIndexBufferOwner);
-		shadowVertexBufferD3D=nullptr;
-		shadowIndexBufferD3D=nullptr;
 		return FALSE;
 	}
 
 	if (TheW3DBufferManager)
 		if (!TheW3DBufferManager->ReAcquireResources())
+		{
+			ReleaseResources();
 			return FALSE;
+		}
 
 	return TRUE;
 }
@@ -3697,7 +3748,8 @@ void W3DVolumetricShadowManager::reset()
 // ============================================================================
 W3DVolumetricShadow* W3DVolumetricShadowManager::addShadow(RenderObjClass *robj, Shadow::ShadowTypeInfo *shadowInfo, Drawable *draw)
 {
-	if (!DX8Wrapper::Has_Stencil() || !robj || !TheGlobalData->m_useShadowVolumes)
+	if (!rts::render::GameRendererSupportsStencil() || !robj ||
+		!TheGlobalData->m_useShadowVolumes)
 		return nullptr;	//right now we require a stencil buffer
 
 	W3DShadowGeometry *sg=nullptr;

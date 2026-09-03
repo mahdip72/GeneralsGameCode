@@ -208,16 +208,13 @@ int main(int argc, char *argv[])
 
 	DBGMSG("Read process info");
 
-	for (int i = 1; i < argc; i++)
+	if (Append_Process_Arguments(proc, argc - 1, argv + 1) == FALSE ||
+		(hasSecondEXE && Append_Process_Arguments(proc2, argc - 1, argv + 1) == FALSE))
 	{
-		strcat(proc.args, " ");
-		strcat(proc.args, argv[i]);
-
-		if (hasSecondEXE)
-		{
-			strcat(proc2.args, " ");
-			strcat(proc2.args, argv[i]);
-		}
+		MessageBox(nullptr,"Launcher arguments exceed the supported command-line length.",
+			"Launcher error",MB_OK);
+		myChdir(cwd);
+		return -1;
 	}
 
 	DBGMSG("ARGS: "<<proc.args);

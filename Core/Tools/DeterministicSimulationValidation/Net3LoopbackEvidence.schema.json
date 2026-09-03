@@ -1,0 +1,130 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://generalsgamecode.invalid/schemas/stage5-installed-net3-loopback.json",
+  "title": "GeneralsGameCode Stage 5 installed NET3 loopback evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion", "evidenceKind", "status", "producer", "validationMode",
+    "installedRuntime", "independentProcessHashing", "sourceCommit",
+    "artifactSetSha256", "supportedKernelMask", "policySchema", "engineEpoch",
+    "determinismEpoch", "buildCompatibilityCrc", "contentCrc", "executables",
+    "fixedSeeds", "matches"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "evidenceKind": { "const": "installed-net3-loopback" },
+    "status": { "const": "passed" },
+    "producer": { "const": "installed-runtime-runner-v1" },
+    "validationMode": { "const": "scoped-net3-loopback-release-proof" },
+    "installedRuntime": { "const": true },
+    "independentProcessHashing": { "const": true },
+    "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "artifactSetSha256": { "$ref": "#/$defs/sha256" },
+    "supportedKernelMask": { "const": 63 },
+    "policySchema": { "const": 1 },
+    "engineEpoch": { "const": 1 },
+    "determinismEpoch": { "const": 1 },
+    "buildCompatibilityCrc": { "$ref": "#/$defs/titleCrcs" },
+    "contentCrc": { "$ref": "#/$defs/titleCrcs" },
+    "executables": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["Generals", "ZeroHour"],
+      "properties": {
+        "Generals": { "$ref": "#/$defs/sha256" },
+        "ZeroHour": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "fixedSeeds": {
+      "type": "array", "minItems": 2, "maxItems": 2,
+      "prefixItems": [{ "const": 23063 }, { "const": 49374 }]
+    },
+    "matches": {
+      "type": "array", "minItems": 16, "maxItems": 16,
+      "items": { "$ref": "#/$defs/match" }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9A-F]{64}$" },
+    "titleCrcs": {
+      "type": "object", "additionalProperties": false,
+      "required": ["Generals", "ZeroHour"],
+      "properties": {
+        "Generals": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "ZeroHour": { "type": "integer", "minimum": 1, "maximum": 4294967295 }
+      }
+    },
+    "match": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "recordId", "sourceCommit", "title", "executableSha256", "artifactSetSha256",
+        "topologyId", "seed", "networkHelloReady", "rosterExact", "rosterSha256",
+        "policyMask", "peers"
+      ],
+      "properties": {
+        "recordId": { "type": "string", "minLength": 1 },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "title": { "enum": ["Generals", "ZeroHour"] },
+        "executableSha256": { "$ref": "#/$defs/sha256" },
+        "artifactSetSha256": { "$ref": "#/$defs/sha256" },
+        "topologyId": {
+          "enum": ["two-peer-1-v-16", "two-peer-2-v-auto", "two-peer-4-v-8", "four-peer-mixed-workers"]
+        },
+        "seed": { "enum": [23063, 49374] },
+        "networkHelloReady": { "const": true },
+        "rosterExact": { "const": true },
+        "rosterSha256": { "$ref": "#/$defs/sha256" },
+        "policyMask": { "const": 63 },
+        "peers": { "type": "array", "minItems": 2, "maxItems": 4, "items": { "$ref": "#/$defs/peer" } }
+      }
+    },
+    "peer": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "ordinal", "processId", "observedExecutableSha256", "observedArtifactSetSha256",
+        "rawOutputPath", "rawOutputSha256", "requestedWorkers", "effectiveWorkers", "networkHelloReady", "rosterExact",
+        "rosterSha256", "policyMask", "finalFrame", "finalCRC", "exitCode", "cleanShutdown", "kernels"
+      ],
+      "properties": {
+        "ordinal": { "type": "integer", "minimum": 0, "maximum": 3 },
+        "processId": { "type": "integer", "minimum": 1 },
+        "observedExecutableSha256": { "$ref": "#/$defs/sha256" },
+        "observedArtifactSetSha256": { "$ref": "#/$defs/sha256" },
+        "rawOutputPath": { "type": "string", "pattern": "^Net3Raw\\\\[^:|]+$" },
+        "rawOutputSha256": { "$ref": "#/$defs/sha256" },
+        "requestedWorkers": { "enum": ["1", "2", "4", "8", "16", "auto"] },
+        "effectiveWorkers": { "type": "integer", "minimum": 1 },
+        "networkHelloReady": { "const": true },
+        "rosterExact": { "const": true },
+        "rosterSha256": { "$ref": "#/$defs/sha256" },
+        "policyMask": { "const": 63 },
+        "finalFrame": { "type": "integer", "minimum": 1 },
+        "finalCRC": { "type": "string", "pattern": "^[0-9A-F]{8}$" },
+        "exitCode": { "const": 0 },
+        "cleanShutdown": { "const": true },
+        "kernels": { "type": "array", "minItems": 6, "maxItems": 6, "items": { "$ref": "#/$defs/kernel" } }
+      }
+    },
+    "kernel": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "name", "bit", "submitted", "completed", "physicalWorkerJobs",
+        "ownerHelpedJobs", "physicalWorkerMask", "distinctPhysicalWorkers",
+        "physicalWorkerMaskComplete", "peakConcurrentPhysicalWorkers"
+      ],
+      "properties": {
+        "name": { "enum": ["physics", "status", "collision", "ai-planning", "spatial", "path"] },
+        "bit": { "enum": [1, 2, 4, 8, 16, 32] },
+        "submitted": { "type": "integer", "minimum": 0 },
+        "completed": { "type": "integer", "minimum": 0 },
+        "physicalWorkerJobs": { "type": "integer", "minimum": 0 },
+        "ownerHelpedJobs": { "type": "integer", "minimum": 0 },
+        "physicalWorkerMask": { "type": "integer", "minimum": 0 },
+        "distinctPhysicalWorkers": { "type": "integer", "minimum": 0 },
+        "physicalWorkerMaskComplete": { "type": "boolean" },
+        "peakConcurrentPhysicalWorkers": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

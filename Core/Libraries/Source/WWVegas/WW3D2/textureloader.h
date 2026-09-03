@@ -20,7 +20,7 @@
  ***              C O N F I D E N T I A L  ---  W E S T W O O D  S T U D I O S               ***
  ***********************************************************************************************
  *                                                                                             *
- *                 Project Name : DX8 Texture Manager                                          *
+ *                 Project Name : Native texture loader                                          *
  *                                                                                             *
  *                     $Archive:: /Commando/Code/ww3d2/textureloader.h                            $*
  *                                                                                             *
@@ -39,13 +39,14 @@
 
 #pragma once
 
+// Legacy renderer declarations; native code includes the neutral header.
+
 #include "texturemipbuffer.h"
 
 #include "WWLib/always.h"
 #include "texture.h"
 
 class StringClass;
-struct IDirect3DTexture8;
 class TextureLoadTaskClass;
 class DDSFileClass;
 class Targa;
@@ -67,11 +68,11 @@ public:
 	// Modify given texture size to nearest valid size on current hardware.
 	static void Validate_Texture_Size(unsigned& width, unsigned& height, unsigned& depth);
 
-	static IDirect3DTexture8 * Load_Thumbnail(
+	static void * Load_Thumbnail(
 		const StringClass& filename,const Vector3& hsv_shift);
 //		WW3DFormat texture_format);	// Pass WW3D_FORMAT_UNKNOWN if you don't care
 
-	static IDirect3DSurface8 *		Load_Surface_Immediate(
+	static void *		Load_Surface_Immediate(
 		const StringClass& filename,
 		WW3DFormat surface_format,		// Pass WW3D_FORMAT_UNKNOWN if you don't care
 		bool allow_compression);
@@ -103,7 +104,8 @@ public:
 #endif
 	static void Update(void(*network_callback)() = nullptr);
 
-	// returns true if current thread of execution is allowed to make DX8 calls.
+	// Returns true when the caller is the render-owner thread.  The historical
+	// entry point name is retained for x86 source/ABI compatibility.
 	static bool Is_DX8_Thread();
 
 	static void Suspend_Texture_Load();
@@ -261,7 +263,7 @@ class TextureLoadTaskClass : public TextureLoadTaskListNodeClass
 		unsigned int			Get_Locked_Surface_Pitch(unsigned int level) const;
 
 		TextureBaseClass *	Peek_Texture				()				{ return Texture;			}
-		IDirect3DTexture8	*	Peek_D3D_Texture			()				{ return (IDirect3DTexture8*)D3DTexture;		}
+		void *	Peek_Texture_Handle			()				{ return LoadedTextureHandle;		}
 
 		void						Set_Type						(TaskType t)		{ Type		= t;			}
 		void						Set_Priority				(PriorityType p)	{ Priority	= p;			}
@@ -292,8 +294,11 @@ class TextureLoadTaskClass : public TextureLoadTaskListNodeClass
 		virtual bool			Load_Compressed_Mipmap	();
 		virtual bool			Load_Uncompressed_Mipmap();
 		virtual bool			Allocate_Prepared_Surfaces();
-		virtual bool			Create_D3D_Texture		();
+		virtual bool			Create_Texture_Handle		();
 		virtual bool			Upload_Prepared_Surfaces();
+#if defined(_WIN64)
+		virtual bool			Publish_Native_Prepared_Texture();
+#endif
 		virtual void			Release_Prepared_Surfaces();
 		virtual size_t			Get_Prepare_Memory_Byte_Count() const;
 
@@ -303,7 +308,7 @@ class TextureLoadTaskClass : public TextureLoadTaskListNodeClass
 		void						Apply							(bool initialize);
 
 		TextureBaseClass*		Texture;
-		IDirect3DBaseTexture8*	D3DTexture;
+		void *	LoadedTextureHandle;
 		WW3DFormat				Format;
 
 		unsigned int			Width;
@@ -350,8 +355,11 @@ protected:
 
 	virtual bool			Load_Compressed_Mipmap	() override;
 	virtual bool			Allocate_Prepared_Surfaces() override;
-	virtual bool			Create_D3D_Texture		() override;
+	virtual bool			Create_Texture_Handle		() override;
 	virtual bool			Upload_Prepared_Surfaces() override;
+#if defined(_WIN64)
+	virtual bool			Publish_Native_Prepared_Texture() override;
+#endif
 	virtual void			Release_Prepared_Surfaces() override;
 	virtual size_t			Get_Prepare_Memory_Byte_Count() const override;
 //	virtual bool			Load_Uncompressed_Mipmap() override;
@@ -363,7 +371,7 @@ private:
 	unsigned char*			Get_Locked_CubeMap_Surface_Pointer(unsigned int face, unsigned int level);
 	unsigned int			Get_Locked_CubeMap_Surface_Pitch(unsigned int face, unsigned int level) const;
 
-	IDirect3DCubeTexture8*	Peek_D3D_Cube_Texture()				{ return (IDirect3DCubeTexture8*)D3DTexture;		}
+	void *	Peek_Cube_Texture_Handle()				{ return LoadedTextureHandle;		}
 
 	unsigned char*			LockedCubeSurfacePtr[6][MIP_LEVELS_MAX];
 	unsigned int			LockedCubeSurfacePitch[6][MIP_LEVELS_MAX];
@@ -378,4 +386,7 @@ public:
 protected:
 	virtual bool			Begin_Compressed_Load	() override;
 	virtual bool			Begin_Uncompressed_Load	() override;
+#if defined(_WIN64)
+	virtual bool			Publish_Native_Prepared_Texture() override;
+#endif
 };

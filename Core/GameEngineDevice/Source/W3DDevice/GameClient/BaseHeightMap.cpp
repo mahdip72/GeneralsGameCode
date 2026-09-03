@@ -81,7 +81,19 @@
 #include "W3DDevice/GameClient/W3DShadow.h"
 #include "W3DDevice/GameClient/W3DWater.h"
 #include "W3DDevice/GameClient/W3DShroud.h"
-#include "WW3D2/dx8wrapper.h"
+#include "Renderer/RenderGameClient.h"
+#include "Renderer/RenderTexturePublication.h"
+
+// Keep the source-level contract explicit without importing the renderer namespace.
+using rts::render::GAME_BUFFER_TYPE_DYNAMIC_IMMEDIATE;
+using rts::render::GAME_COLOR_WRITE_ALPHA;
+using rts::render::GAME_COLOR_WRITE_BLUE;
+using rts::render::GAME_COLOR_WRITE_GREEN;
+using rts::render::GAME_COLOR_WRITE_RED;
+using rts::render::GAME_RENDER_STATE_COLOR_WRITE_MASK;
+using rts::render::GAME_TEXTURE_STAGE_COORDINATE_INDEX;
+using rts::render::GAME_TRANSFORM_WORLD;
+
 #include "WW3D2/light.h"
 #include "WW3D2/scene.h"
 #include "W3DDevice/GameClient/W3DPoly.h"
@@ -305,7 +317,11 @@ BaseHeightMapRenderObjClass::BaseHeightMapRenderObjClass()
 #else
 	m_shroud = NEW W3DShroud;
 #endif
-	DX8Wrapper::SetCleanupHook(this);
+	// Pass the actual neutral hook subobject through the opaque seam.  Passing
+	// the complete multiply-inherited object would lose the base adjustment
+	// required by the compatibility adapter.
+	rts::render::SetGameCleanupHook(
+		static_cast<rts::render::GameRenderCleanupHook *>(this));
 }
 
 void BaseHeightMapRenderObjClass::scheduleFullUpdate()
@@ -1444,7 +1460,7 @@ RenderObjClass *	 BaseHeightMapRenderObjClass::Clone() const
 //=============================================================================
 void BaseHeightMapRenderObjClass::loadRoadsAndBridges(W3DTerrainLogic *pTerrainLogic, Bool saveGame)
 {
-	if (DX8Wrapper::_Get_D3D_Device8() && (DX8Wrapper::_Get_D3D_Device8()->TestCooperativeLevel()) != D3D_OK)
+	if (!rts::render::IsGameRenderTargetOperational())
 		return;	//device not ready to render anything
 
 #ifdef DO_ROADS
@@ -1759,8 +1775,7 @@ void BaseHeightMapRenderObjClass::initDestAlphaLUT()
 				pData++;
 			}
 			surf->Unlock();
-			Notify_Render_Texture_Changed(
-				m_destAlphaTexture->Peek_D3D_Base_Texture());
+			rts::render::NotifyTextureChanged(m_destAlphaTexture);
 		}
 
 		m_destAlphaTexture->Get_Filter().Set_U_Addr_Mode(TextureFilterClass::TEXTURE_ADDRESS_CLAMP);
@@ -2284,7 +2299,7 @@ void BaseHeightMapRenderObjClass::renderShoreLines(CameraClass *pCamera)
 		return;
 
 	//Check if video card is capable of using this effect
-	if (DX8Wrapper::getBackBufferFormat() != WW3D_FORMAT_A8R8G8B8)
+	if (rts::render::GetGameBackBufferFormat() != WW3D_FORMAT_A8R8G8B8)
 		return;	//can't apply effect on cards without destination alpha
 
 	Int vertexCount = 0;
@@ -2301,21 +2316,21 @@ void BaseHeightMapRenderObjClass::renderShoreLines(CameraClass *pCamera)
 
 	ShaderClass unlitShader=ShaderClass::_PresetOpaque2DShader;
 	unlitShader.Set_Depth_Compare(ShaderClass::PASS_LEQUAL);
-	DX8Wrapper::Set_Shader(unlitShader);
+	rts::render::SetGameShader(unlitShader);
 	VertexMaterialClass *vmat=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
-	DX8Wrapper::Set_Material(vmat);
+	rts::render::SetGameMaterial(vmat);
 	REF_PTR_RELEASE(vmat);
-	DX8Wrapper::Set_Texture(0,m_destAlphaTexture);
-	DX8Wrapper::Set_Transform(D3DTS_WORLD,Matrix3D(true));
+	rts::render::SetGameTexture(0,m_destAlphaTexture);
+	rts::render::SetGameTransform(GAME_TRANSFORM_WORLD,Matrix3D(true));
 	//Enabled writes to destination alpha only
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_COLORWRITEENABLE,D3DCOLORWRITEENABLE_ALPHA);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(0,  D3DTSS_TEXCOORDINDEX, 0);
+	rts::render::SetGameRenderState(GAME_RENDER_STATE_COLOR_WRITE_MASK,GAME_COLOR_WRITE_ALPHA);
+	rts::render::SetGameTextureStageState(0,  GAME_TEXTURE_STAGE_COORDINATE_INDEX, 0);
 
 
 	while (j != m_numShoreLineTiles)
 	{
-		DynamicVBAccessClass vb_access(BUFFER_TYPE_DYNAMIC_DX8,dynamic_fvf_type,DEFAULT_MAX_BATCH_SHORELINE_TILES*4);
-		DynamicIBAccessClass ib_access(BUFFER_TYPE_DYNAMIC_DX8,DEFAULT_MAX_BATCH_SHORELINE_TILES*6);
+		DynamicVBAccessClass vb_access(GAME_BUFFER_TYPE_DYNAMIC_IMMEDIATE,dynamic_fvf_type,DEFAULT_MAX_BATCH_SHORELINE_TILES*4);
+		DynamicIBAccessClass ib_access(GAME_BUFFER_TYPE_DYNAMIC_IMMEDIATE,DEFAULT_MAX_BATCH_SHORELINE_TILES*6);
 
 		{	//Need to put this in another code block so vb/ib gets automatically locked/unlocked by destructors
 			DynamicVBAccessClass::WriteLockClass lock(&vb_access);
@@ -2323,7 +2338,7 @@ void BaseHeightMapRenderObjClass::renderShoreLines(CameraClass *pCamera)
 			DynamicIBAccessClass::WriteLockClass lockib(&ib_access);
 			UnsignedShort *ib=lockib.Get_Index_Array();
 			if (!ib || !vb)
-			{	DX8Wrapper::Set_DX8_Render_State(D3DRS_COLORWRITEENABLE,D3DCOLORWRITEENABLE_BLUE|D3DCOLORWRITEENABLE_GREEN|D3DCOLORWRITEENABLE_RED);
+			{	rts::render::SetGameRenderState(GAME_RENDER_STATE_COLOR_WRITE_MASK,GAME_COLOR_WRITE_BLUE|GAME_COLOR_WRITE_GREEN|GAME_COLOR_WRITE_RED);
 				return;
 			}
 
@@ -2420,9 +2435,9 @@ void BaseHeightMapRenderObjClass::renderShoreLines(CameraClass *pCamera)
 
 		if (indexCount > 0 && vertexCount > 0)
 		{
-			DX8Wrapper::Set_Index_Buffer(ib_access,0);
-			DX8Wrapper::Set_Vertex_Buffer(vb_access);
-			DX8Wrapper::Draw_Triangles(	0,indexCount/3, 0,	vertexCount);	//draw a quad, 2 triangles, 4 verts
+			rts::render::SetGameIndexBuffer(ib_access,0);
+			rts::render::SetGameVertexBuffer(vb_access);
+			rts::render::DrawGameTriangles(	0,indexCount/3, 0,	vertexCount);	//draw a quad, 2 triangles, 4 verts
 			m_numVisibleShoreLineTiles += indexCount/6;
 		}
 
@@ -2431,7 +2446,7 @@ void BaseHeightMapRenderObjClass::renderShoreLines(CameraClass *pCamera)
 	}
 
 	//Disable writes to destination alpha
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_COLORWRITEENABLE,D3DCOLORWRITEENABLE_BLUE|D3DCOLORWRITEENABLE_GREEN|D3DCOLORWRITEENABLE_RED);
+	rts::render::SetGameRenderState(GAME_RENDER_STATE_COLOR_WRITE_MASK,GAME_COLOR_WRITE_BLUE|GAME_COLOR_WRITE_GREEN|GAME_COLOR_WRITE_RED);
 	ShaderClass::Invalidate();
 }
 
@@ -2447,7 +2462,7 @@ void BaseHeightMapRenderObjClass::renderShoreLinesSorted(CameraClass *pCamera)
 		return;
 
 	//Check if video card is capable of using this effect
-	if (DX8Wrapper::getBackBufferFormat() != WW3D_FORMAT_A8R8G8B8)
+	if (rts::render::GetGameBackBufferFormat() != WW3D_FORMAT_A8R8G8B8)
 		return;	//can't apply effect on cards without destination alpha
 
 	Int vertexCount = 0;
@@ -2485,23 +2500,23 @@ void BaseHeightMapRenderObjClass::renderShoreLinesSorted(CameraClass *pCamera)
 
 	ShaderClass unlitShader=ShaderClass::_PresetOpaque2DShader;
 	unlitShader.Set_Depth_Compare(ShaderClass::PASS_LEQUAL);
-	DX8Wrapper::Set_Shader(unlitShader);
+	rts::render::SetGameShader(unlitShader);
 	VertexMaterialClass *vmat=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
-	DX8Wrapper::Set_Material(vmat);
+	rts::render::SetGameMaterial(vmat);
 	REF_PTR_RELEASE(vmat);
-	DX8Wrapper::Set_Texture(0,m_destAlphaTexture);
-	DX8Wrapper::Set_Transform(D3DTS_WORLD,Matrix3D(true));
+	rts::render::SetGameTexture(0,m_destAlphaTexture);
+	rts::render::SetGameTransform(GAME_TRANSFORM_WORLD,Matrix3D(true));
 	//Enabled writes to destination alpha only
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_COLORWRITEENABLE,D3DCOLORWRITEENABLE_ALPHA);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(0,  D3DTSS_TEXCOORDINDEX, 0);
+	rts::render::SetGameRenderState(GAME_RENDER_STATE_COLOR_WRITE_MASK,GAME_COLOR_WRITE_ALPHA);
+	rts::render::SetGameTextureStageState(0,  GAME_TEXTURE_STAGE_COORDINATE_INDEX, 0);
 
 	Bool isDone=FALSE;
 	Int lastRenderedTile=0;
 
 	while (!isDone)
 	{
-		DynamicVBAccessClass vb_access(BUFFER_TYPE_DYNAMIC_DX8,dynamic_fvf_type,DEFAULT_MAX_BATCH_SHORELINE_TILES*4);
-		DynamicIBAccessClass ib_access(BUFFER_TYPE_DYNAMIC_DX8,DEFAULT_MAX_BATCH_SHORELINE_TILES*6);
+		DynamicVBAccessClass vb_access(GAME_BUFFER_TYPE_DYNAMIC_IMMEDIATE,dynamic_fvf_type,DEFAULT_MAX_BATCH_SHORELINE_TILES*4);
+		DynamicIBAccessClass ib_access(GAME_BUFFER_TYPE_DYNAMIC_IMMEDIATE,DEFAULT_MAX_BATCH_SHORELINE_TILES*6);
 
 		{	//Need to put this in another code block so vb/ib gets automatically locked/unlocked by destructors
 			DynamicVBAccessClass::WriteLockClass lock(&vb_access);
@@ -2509,7 +2524,7 @@ void BaseHeightMapRenderObjClass::renderShoreLinesSorted(CameraClass *pCamera)
 			DynamicIBAccessClass::WriteLockClass lockib(&ib_access);
 			UnsignedShort *ib=lockib.Get_Index_Array();
 			if (!ib || !vb)
-			{	DX8Wrapper::Set_DX8_Render_State(D3DRS_COLORWRITEENABLE,D3DCOLORWRITEENABLE_BLUE|D3DCOLORWRITEENABLE_GREEN|D3DCOLORWRITEENABLE_RED);
+			{	rts::render::SetGameRenderState(GAME_RENDER_STATE_COLOR_WRITE_MASK,GAME_COLOR_WRITE_BLUE|GAME_COLOR_WRITE_GREEN|GAME_COLOR_WRITE_RED);
 				return;
 			}
 
@@ -2760,9 +2775,9 @@ flushVertexBuffer1:
 
 		if (indexCount > 0 && vertexCount > 0)
 		{
-			DX8Wrapper::Set_Index_Buffer(ib_access,0);
-			DX8Wrapper::Set_Vertex_Buffer(vb_access);
-			DX8Wrapper::Draw_Triangles(	0,indexCount/3, 0,	vertexCount);	//draw a quad, 2 triangles, 4 verts
+			rts::render::SetGameIndexBuffer(ib_access,0);
+			rts::render::SetGameVertexBuffer(vb_access);
+			rts::render::DrawGameTriangles(	0,indexCount/3, 0,	vertexCount);	//draw a quad, 2 triangles, 4 verts
 			m_numVisibleShoreLineTiles += indexCount/6;
 		}
 
@@ -2771,7 +2786,7 @@ flushVertexBuffer1:
 	}
 
 	//Disable writes to destination alpha
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_COLORWRITEENABLE,D3DCOLORWRITEENABLE_BLUE|D3DCOLORWRITEENABLE_GREEN|D3DCOLORWRITEENABLE_RED);
+	rts::render::SetGameRenderState(GAME_RENDER_STATE_COLOR_WRITE_MASK,GAME_COLOR_WRITE_BLUE|GAME_COLOR_WRITE_GREEN|GAME_COLOR_WRITE_RED);
 	ShaderClass::Invalidate();
 }
 
@@ -2784,15 +2799,15 @@ called after flush. */
 void BaseHeightMapRenderObjClass::renderTrees(CameraClass * camera)
 {
 #ifdef EXTENDED_STATS
-	if (DX8Wrapper::stats.m_disableObjects) {
+	if (rts::render::IsGameObjectRenderingDisabled()) {
 		return;
 	}
 #endif
 	if (m_map==nullptr) return;
 	if (Scene==nullptr) return;
 	if (m_treeBuffer) {
-		DX8Wrapper::Set_Transform(D3DTS_WORLD,Transform);
-		DX8Wrapper::Set_Material(m_vertexMaterialClass);
+		rts::render::SetGameTransform(GAME_TRANSFORM_WORLD,Transform);
+		rts::render::SetGameMaterial(m_vertexMaterialClass);
 		RTS3DScene *pMyScene = (RTS3DScene *)Scene;
 		RefRenderObjListIterator pDynamicLightsIterator(pMyScene->getDynamicLights());
 		m_treeBuffer->drawTrees(camera, &pDynamicLightsIterator);

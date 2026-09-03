@@ -1,19 +1,24 @@
 #include "Utility/CppMacros.h"
 #include "Renderer/RendererDevice.h"
-#if defined(RTS_RENDERER_HAS_D3D11)
-#include "../../Libraries/Source/WWVegas/WW3D2/d3d11legacybridge.h"
+#include "Renderer/RenderTexturePublication.h"
 #include "W3DDevice/GameClient/W3DVideoBuffer.h"
-#include "Renderer/LegacyBridgeValidation.h"
+#if defined(RTS_RENDERER_HAS_D3D11) && !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
+#include "d3d11legacybridge.h"
 #endif
+#include "Renderer/LegacyBridgeValidation.h"
 #include "Renderer/LegacyRenderState.h"
+#if !defined(RTS_RENDERER_HAS_D3D11)
+#include "Renderer/NativeW3DRenderer.h"
+#endif
 
 #include <stdio.h>
 #include <algorithm>
 #include <math.h>
+#include <string>
 #include <string.h>
 #include <vector>
 
-#if defined(RTS_RENDERER_HAS_D3D11)
+#if defined(RTS_RENDERER_HAS_D3D11) && !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
 #include <type_traits>
 #endif
 #if defined(_WIN32)
@@ -43,9 +48,136 @@ bool nearlyEqual(float left, float right, float epsilon = 0.00001f)
 	return fabs(left - right) <= epsilon;
 }
 
+std::string NormalizeSourceLineEndings(const std::string &contents)
+{
+	std::string normalized;
+	normalized.reserve(contents.size());
+	for (std::string::size_type i = 0; i != contents.size(); ++i)
+	{
+		if (contents[i] == '\r' && i + 1 < contents.size() &&
+			contents[i + 1] == '\n')
+		{
+			normalized += '\n';
+			++i;
+		}
+		else
+		{
+			normalized += contents[i];
+		}
+	}
+	return normalized;
+}
+
+bool ExpectedNativeVideoPublicationSelection(
+	rts::render::RenderBackend backend, bool backendSupported, bool ownerActive)
+{
+#if defined(_WIN64)
+	return backend == rts::render::RENDER_BACKEND_D3D11 &&
+		backendSupported && ownerActive;
+#else
+	(void)backend;
+	(void)backendSupported;
+	(void)ownerActive;
+	return false;
+#endif
+}
+
+bool ReadSourceText(const char *relativePath, std::string *contents)
+{
+	if (relativePath == 0 || contents == 0)
+	{
+		return false;
+	}
+	std::string path = RTS_SOURCE_ROOT;
+	path += "/";
+	path += relativePath;
+	FILE *input = fopen(path.c_str(), "rb");
+	if (input == 0 || fseek(input, 0, SEEK_END) != 0)
+	{
+		if (input != 0)
+		{
+			fclose(input);
+		}
+		return false;
+	}
+	const long byteCount = ftell(input);
+	if (byteCount <= 0 || fseek(input, 0, SEEK_SET) != 0)
+	{
+		fclose(input);
+		return false;
+	}
+	std::vector<char> bytes(static_cast<size_t>(byteCount));
+	const size_t bytesRead = fread(&bytes[0], 1,
+		static_cast<size_t>(byteCount), input);
+	fclose(input);
+	if (bytesRead != static_cast<size_t>(byteCount))
+	{
+		return false;
+	}
+	contents->assign(&bytes[0], bytesRead);
+	*contents = NormalizeSourceLineEndings(*contents);
+	return true;
+}
+
+int testSourceReaderLineEndingNormalization()
+{
+	int result = 0;
+	const std::string lineFeedFixture = "legacy marker one\nlegacy marker two\n";
+	const std::string carriageReturnLineFeedFixture =
+		"legacy marker one\r\nlegacy marker two\r\n";
+	const std::string mixedLineEndingFixture =
+		"legacy marker one\r\nlegacy marker two\nlegacy marker three\r";
+	const std::string expectedMixedLineEnding =
+		"legacy marker one\nlegacy marker two\nlegacy marker three\r";
+	result |= check(NormalizeSourceLineEndings(lineFeedFixture) ==
+		lineFeedFixture,
+		"source reader preserves LF source text");
+	result |= check(NormalizeSourceLineEndings(carriageReturnLineFeedFixture) ==
+		lineFeedFixture,
+		"source reader normalizes CRLF source text to LF");
+	result |= check(NormalizeSourceLineEndings(mixedLineEndingFixture) ==
+		expectedMixedLineEnding,
+		"source reader normalizes only CRLF pairs and preserves lone CR bytes");
+	return result;
+}
+
+unsigned CountSourceOccurrences(const std::string &source, const char *needle)
+{
+	if (needle == 0 || *needle == '\0')
+	{
+		return 0;
+	}
+	unsigned count = 0;
+	for (std::string::size_type position = source.find(needle);
+		position != std::string::npos;
+		position = source.find(needle, position + 1))
+	{
+		++count;
+	}
+	return count;
+}
+
 int testBackendNames()
 {
 	int result = 0;
+	result |= check(rts::render::RequestedRenderBackend() ==
+		rts::render::DefaultRenderBackend(),
+		"the requested renderer starts at the platform default");
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	result |= check(rts::render::DefaultRenderBackend() ==
+		rts::render::RENDER_BACKEND_D3D11 &&
+		rts::render::IsRenderBackendSupported(
+			rts::render::RENDER_BACKEND_D3D11) &&
+		!rts::render::IsRenderBackendSupported(
+			rts::render::RENDER_BACKEND_DX8),
+		"native x64 defaults to D3D11 and rejects the DX8 command-line backend");
+#else
+	result |= check(rts::render::DefaultRenderBackend() ==
+		rts::render::RENDER_BACKEND_DX8 &&
+		rts::render::IsRenderBackendSupported(
+			rts::render::RENDER_BACKEND_DX8),
+		"legacy Win32 retains the DX8 renderer default");
+#endif
 	rts::render::RenderBackend backend = rts::render::RENDER_BACKEND_D3D11;
 	result |= check(rts::render::ParseRenderBackend("dx8", &backend) &&
 		backend == rts::render::RENDER_BACKEND_DX8,
@@ -68,6 +200,528 @@ int testBackendNames()
 		rts::render::RENDER_BACKEND_D3D11,
 		"startup command-line selection reaches the renderer boundary");
 	rts::render::SetRequestedRenderBackend(rts::render::RENDER_BACKEND_DX8);
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	result |= check(rts::render::RequestedRenderBackend() ==
+		rts::render::RENDER_BACKEND_DX8 &&
+		!rts::render::IsRenderBackendSupported(
+			rts::render::RequestedRenderBackend()),
+		"unsupported native command-line selection remains observable for fail-closed startup");
+#endif
+	rts::render::SetRequestedRenderBackend(rts::render::DefaultRenderBackend());
+	return result;
+}
+
+int testRenderTexturePublicationOperationalStates()
+{
+	int result = 0;
+	result |= check(
+		rts::render::IsRenderTexturePublicationOperationalState(
+			true, false, false, false),
+		"legacy texture publication is operational before a scene bracket");
+	result |= check(
+		!rts::render::IsRenderTexturePublicationOperationalState(
+			true, true, false, false),
+		"legacy texture publication is suppressed while lost or resetting");
+	result |= check(
+		!rts::render::IsRenderTexturePublicationOperationalState(
+			false, false, false, false),
+		"texture publication is suppressed after renderer shutdown");
+	result |= check(
+		rts::render::IsRenderTexturePublicationOperationalState(
+			true, false, true, true),
+		"native texture publication is operational after bridge recovery");
+	result |= check(
+		!rts::render::IsRenderTexturePublicationOperationalState(
+			true, false, true, false),
+		"native texture publication is suppressed while the bridge is lost");
+	return result;
+}
+
+#if !defined(RTS_RENDERER_HAS_D3D11)
+int testNativeRendererRejectsUnavailableBackend()
+{
+	rts::render::NativeW3DRenderer renderer;
+	rts::render::NativeW3DRendererDescriptor descriptor;
+	descriptor.width = 64;
+	descriptor.height = 64;
+	return check(renderer.Initialize(&renderer, descriptor) ==
+		rts::render::RENDER_RESULT_UNSUPPORTED,
+		"native renderer reports unsupported when its backend is unavailable");
+}
+#endif
+
+int testRendererTextureLifecycleContracts()
+{
+	int result = 0;
+	std::string surfaceHeader;
+	std::string surfaceSource;
+	std::string legacySurfaceSource;
+	std::string textureSource;
+	std::string legacyTextureSource;
+	std::string waterSource;
+	std::string videoHeader;
+	std::string videoSource;
+	std::string videoPlayerHeader;
+	std::string ffmpegSource;
+	std::string generalsShroudSource;
+	std::string generalsMDShroudSource;
+	result |= check(ReadSourceText(
+		"Core/Libraries/Source/WWVegas/WW3D2/surfaceclass.h",
+		&surfaceHeader), "surface lock contract source is available");
+	result |= check(ReadSourceText(
+		"Core/Libraries/Source/WWVegas/WW3D2/surfaceclass.cpp",
+		&surfaceSource), "surface lock implementation source is available");
+#if !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
+	result |= check(ReadSourceText(
+		"Core/LegacyRenderer/WWVegas/WW3D2/surfaceclass_legacy.cpp",
+		&legacySurfaceSource), "legacy surface lock implementation source is available");
+#endif
+	result |= check(ReadSourceText(
+		"Core/Libraries/Source/WWVegas/WW3D2/texture.cpp",
+		&textureSource), "texture construction source is available");
+#if !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
+	result |= check(ReadSourceText(
+		"Core/LegacyRenderer/WWVegas/WW3D2/texture_legacy.cpp",
+		&legacyTextureSource), "legacy texture construction source is available");
+#endif
+	result |= check(ReadSourceText(
+		"Core/GameEngineDevice/Source/W3DDevice/GameClient/Water/W3DWater.cpp",
+		&waterSource), "water upload source is available");
+	result |= check(ReadSourceText(
+		"Core/GameEngineDevice/Include/W3DDevice/GameClient/W3DVideoBuffer.h",
+		&videoHeader), "video buffer state header is available");
+	result |= check(ReadSourceText(
+		"Core/GameEngineDevice/Source/W3DDevice/GameClient/W3DVideoBuffer.cpp",
+		&videoSource), "video buffer publication source is available");
+	result |= check(ReadSourceText(
+		"Core/GameEngine/Include/GameClient/VideoPlayer.h",
+		&videoPlayerHeader), "video player interface source is available");
+	result |= check(ReadSourceText(
+		"Core/GameEngineDevice/Source/VideoDevice/FFmpeg/FFmpegVideoPlayer.cpp",
+		&ffmpegSource), "FFmpeg video source is available");
+	result |= check(ReadSourceText(
+		"Generals/Code/GameEngineDevice/Source/W3DDevice/GameClient/W3DShroud.cpp",
+		&generalsShroudSource), "Generals shroud source is available");
+	result |= check(ReadSourceText(
+		"GeneralsMD/Code/GameEngineDevice/Source/W3DDevice/GameClient/W3DShroud.cpp",
+		&generalsMDShroudSource), "Zero Hour shroud source is available");
+
+	const std::string::size_type bumpMapMethod = waterSource.find(
+		"HRESULT WaterRenderObjClass::initBumpMap");
+	const std::string::size_type bumpMapNativeGuard = waterSource.rfind(
+		"#if defined(_WIN64)", bumpMapMethod);
+	const std::string::size_type bumpMapLegacyBranch = waterSource.find(
+		"#else", bumpMapNativeGuard);
+	const std::string::size_type bumpMapEnd = waterSource.find(
+		"HRESULT WaterRenderObjClass::generateVertexBuffer",
+		bumpMapLegacyBranch);
+	result |= check(bumpMapMethod != std::string::npos &&
+		bumpMapNativeGuard != std::string::npos &&
+		bumpMapLegacyBranch != std::string::npos &&
+		bumpMapLegacyBranch > bumpMapNativeGuard &&
+		bumpMapEnd != std::string::npos && bumpMapEnd > bumpMapLegacyBranch,
+		"water bump upload keeps native and compatibility branches bounded");
+	std::string nativeBumpMapSource;
+	std::string legacyBumpMapSource;
+	if (bumpMapNativeGuard != std::string::npos &&
+		bumpMapLegacyBranch != std::string::npos &&
+		bumpMapLegacyBranch > bumpMapNativeGuard)
+	{
+		nativeBumpMapSource = waterSource.substr(bumpMapNativeGuard,
+			bumpMapLegacyBranch - bumpMapNativeGuard);
+	}
+	if (bumpMapLegacyBranch != std::string::npos &&
+		bumpMapEnd != std::string::npos && bumpMapEnd > bumpMapLegacyBranch)
+	{
+		legacyBumpMapSource = waterSource.substr(bumpMapLegacyBranch,
+			bumpMapEnd - bumpMapLegacyBranch);
+	}
+
+#if defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
+	const std::string::size_type readOnlyDeclaration =
+		surfaceHeader.find("void Unlock_Read_Only();");
+	const std::string::size_type readOnlyMethod = surfaceSource.find(
+		"void SurfaceClass::Unlock_Read_Only()");
+	const std::string::size_type readOnlyMethodEnd = surfaceSource.find(
+		"bool SurfaceClass::Acquire_Native_Surface", readOnlyMethod);
+	result |= check(readOnlyDeclaration != std::string::npos &&
+		readOnlyMethod != std::string::npos &&
+		readOnlyMethodEnd != std::string::npos &&
+		readOnlyMethodEnd > readOnlyMethod,
+		"surface exposes an explicit read-only lock completion boundary");
+	if (readOnlyMethod != std::string::npos &&
+		readOnlyMethodEnd != std::string::npos &&
+		readOnlyMethodEnd > readOnlyMethod)
+	{
+		const std::string readOnlyBody = surfaceSource.substr(readOnlyMethod,
+			readOnlyMethodEnd - readOnlyMethod);
+		result |= check(readOnlyBody.find("NativeSurface->locked = false") !=
+			std::string::npos && readOnlyBody.find("Publish_Native_Surface") ==
+			std::string::npos,
+			"native read-only completion releases the lock without republishing");
+	}
+
+	result |= check(textureSource.find(
+		"TextureClass *TextureClass::Create_Native_From_Prepared") !=
+			std::string::npos &&
+		nativeBumpMapSource.find("TextureClass::Create_Native_From_Prepared") !=
+			std::string::npos,
+		"water publishes prepared mips through the direct native texture factory");
+	result |= check(nativeBumpMapSource.find("Unlock_Read_Only()") !=
+		std::string::npos && nativeBumpMapSource.find("NEW_REF(TextureClass") ==
+			std::string::npos,
+		"water source reads do not republish or allocate an empty native texture");
+#else
+	const std::string::size_type legacyReadOnlyMethod =
+		legacySurfaceSource.find("void SurfaceClass::Unlock_Read_Only()");
+	const std::string::size_type legacyReadOnlyMethodEnd =
+		legacySurfaceSource.find("bool SurfaceClass::Acquire_Native_Surface",
+			legacyReadOnlyMethod);
+	result |= check(legacyReadOnlyMethod != std::string::npos &&
+		legacyReadOnlyMethodEnd != std::string::npos &&
+		legacyReadOnlyMethodEnd > legacyReadOnlyMethod,
+		"legacy surface exposes a bounded read-only lock completion boundary");
+	if (legacyReadOnlyMethod != std::string::npos &&
+		legacyReadOnlyMethodEnd != std::string::npos &&
+		legacyReadOnlyMethodEnd > legacyReadOnlyMethod)
+	{
+		const std::string legacyReadOnlyBody = legacySurfaceSource.substr(
+			legacyReadOnlyMethod, legacyReadOnlyMethodEnd - legacyReadOnlyMethod);
+		result |= check(legacyReadOnlyBody.find("Unlock();") !=
+			std::string::npos,
+			"legacy read-only completion closes the compatibility surface lock");
+	}
+
+	result |= check(legacyBumpMapSource.find(
+		"TextureClass::Create_Native_From_Prepared") == std::string::npos &&
+		legacyBumpMapSource.find("destinationSurface->Unlock();") !=
+			std::string::npos,
+		"legacy water publishes destination mips through the compatibility surface path");
+	result |= check(legacyBumpMapSource.find("Unlock_Read_Only()") !=
+		std::string::npos && legacyBumpMapSource.find("NEW_REF(TextureClass") !=
+			std::string::npos,
+		"legacy water reads source mips while owning a compatibility destination texture");
+#endif
+	const std::string::size_type whiteUpdate = waterSource.find(
+		"Bool WaterRenderObjClass::updateWhiteTexture()");
+	const std::string::size_type whiteUpdateEnd = waterSource.find(
+		"void WaterRenderObjClass::ReAcquireResources()", whiteUpdate);
+	result |= check(whiteUpdate != std::string::npos &&
+		whiteUpdateEnd > whiteUpdate,
+		"water white-texture writes use one bounded completion helper");
+	if (whiteUpdate != std::string::npos && whiteUpdateEnd > whiteUpdate)
+	{
+		const std::string whiteUpdateBody = waterSource.substr(whiteUpdate,
+			whiteUpdateEnd - whiteUpdate);
+		result |= check(whiteUpdateBody.find(
+			"surface->Unlock_Native_Surface()") != std::string::npos &&
+			whiteUpdateBody.find("m_whiteTexturePublishPending=TRUE") !=
+			std::string::npos && whiteUpdateBody.find(
+			"m_whiteTexturePublishPending=publicationSucceeded ? FALSE : TRUE") !=
+			std::string::npos,
+			"native white-texture publication retains a retryable failure state");
+#if defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
+		// The native branch is checked above; the source also retains the
+		// compatibility branch for the shared game-client implementation.
+#else
+		result |= check(whiteUpdateBody.find("surface->Unlock();") !=
+			std::string::npos && whiteUpdateBody.find(
+			"rts::render::NotifyTextureChanged(m_whiteTexture)") !=
+			std::string::npos,
+			"legacy white-texture publication keeps Unlock and notification behavior");
+#endif
+	}
+	unsigned whiteUpdateCallCount = 0;
+	for (std::string::size_type call = waterSource.find(
+		"updateWhiteTexture();"); call != std::string::npos; call =
+		waterSource.find("updateWhiteTexture();", call + 1))
+	{
+		++whiteUpdateCallCount;
+	}
+	result |= check(whiteUpdateCallCount == 3,
+		"water reset, initialization, and shader paths retry white publication");
+
+	// The Win32/VC6 procedural constructors must report the result of the
+	// actual compatibility allocation.  Keep this as a source contract because
+	// the device-free renderer test cannot create a real legacy device, while
+	// the VC6 oracle compile proves the guarded implementation remains valid.
+#if !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
+	const char *legacyCreationMarkers[] = {
+		"Poke_Texture(DX8Wrapper::_Create_DX8_Texture\n",
+		"Poke_Texture(DX8Wrapper::_Create_DX8_Texture(\n\t\tsurface->",
+		"Poke_Texture(DX8Wrapper::_Create_DX8_ZTexture\n",
+		"Poke_Texture(DX8Wrapper::_Create_DX8_Cube_Texture\n",
+		"Poke_Texture(DX8Wrapper::_Create_DX8_Volume_Texture\n"
+	};
+	const unsigned legacyCreationMarkerCount =
+		static_cast<unsigned>(sizeof(legacyCreationMarkers) /
+			sizeof(legacyCreationMarkers[0]));
+	for (unsigned i = 0; i != legacyCreationMarkerCount; ++i)
+	{
+		const std::string::size_type creation = legacyTextureSource.find(
+			legacyCreationMarkers[i]);
+		const std::string::size_type branchEnd = legacyTextureSource.find(
+			"#endif", creation);
+		bool derivesInitialization = false;
+		if (creation != std::string::npos && branchEnd > creation)
+		{
+			const std::string legacyBranch = legacyTextureSource.substr(
+				creation, branchEnd - creation);
+			derivesInitialization = legacyBranch.find(
+				"Initialized = Peek_D3D_Base_Texture() != nullptr;") !=
+				std::string::npos;
+		}
+		result |= check(derivesInitialization,
+			"legacy procedural allocation failure leaves initialization false");
+	}
+#endif
+
+#if !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
+	std::string wrapperSource;
+	result |= check(ReadSourceText(
+		"Core/LegacyRenderer/WWVegas/WW3D2/dx8wrapper.cpp",
+		&wrapperSource), "renderer wrapper source is available");
+	const std::string::size_type init = wrapperSource.find(
+		"bool DX8Wrapper::Init(void * hwnd, bool lite)");
+	const std::string::size_type shutdown = wrapperSource.find(
+		"void DX8Wrapper::Shutdown()", init);
+	const std::string::size_type reset = wrapperSource.find(
+		"bool DX8Wrapper::Reset_Device(", shutdown);
+	const std::string::size_type resetEnd = wrapperSource.find(
+		"void DX8Wrapper::Release_DX8_Buffer_Bindings()", reset);
+	result |= check(init != std::string::npos && shutdown > init &&
+		reset > shutdown && resetEnd > reset,
+		"renderer lifecycle methods remain source-addressable");
+	if (init != std::string::npos && shutdown > init &&
+		reset > shutdown && resetEnd > reset)
+	{
+		result |= check(wrapperSource.find("IsDeviceLost = false;", init) < shutdown,
+			"renderer initialization clears stale lost state");
+		result |= check(wrapperSource.find("IsDeviceLost = false;", shutdown) < reset,
+			"renderer shutdown clears stale lost state");
+		result |= check(wrapperSource.find("IsDeviceLost = false;", reset) < resetEnd,
+			"successful legacy reset clears stale lost state");
+	}
+
+	const std::string::size_type setRenderDevice = wrapperSource.find(
+		"bool DX8Wrapper::Set_Render_Device(int dev", resetEnd);
+	const std::string::size_type setRenderDeviceEnd = wrapperSource.find(
+		"bool DX8Wrapper::Set_Device_Resolution(", setRenderDevice);
+	const std::string::size_type setDeviceResolution = setRenderDeviceEnd;
+	const std::string::size_type setDeviceResolutionEnd = wrapperSource.find(
+		"void DX8Wrapper::Get_Device_Resolution(", setDeviceResolution);
+	const std::string::size_type toggleWindowed = wrapperSource.find(
+		"bool DX8Wrapper::Toggle_Windowed()", setRenderDevice);
+	const std::string::size_type toggleWindowedEnd = wrapperSource.find(
+		"void DX8Wrapper::Set_Swap_Interval(", toggleWindowed);
+	const std::string::size_type shutdownEnd = wrapperSource.find(
+		"bool DX8Wrapper::Do_Onetime_Device_Dependent_Inits()", shutdown);
+	result |= check(init != std::string::npos && shutdown > init &&
+		wrapperSource.find("rts::render::GameRenderer_IsWindowed = false;", init) <
+			shutdown && wrapperSource.find(
+			"IsWindowed = rts::render::GameRenderer_IsWindowed;", init) <
+			shutdown,
+		"legacy initialization synchronizes neutral window state and ABI mirror");
+	if (setRenderDevice != std::string::npos &&
+		setRenderDeviceEnd > setRenderDevice)
+	{
+		const std::string setRenderBody = wrapperSource.substr(setRenderDevice,
+			setRenderDeviceEnd - setRenderDevice);
+		result |= check(setRenderBody.find(
+			"rts::render::GameRenderer_IsWindowed = (windowed != 0);") !=
+			std::string::npos && setRenderBody.find(
+			"IsWindowed = rts::render::GameRenderer_IsWindowed;") !=
+			std::string::npos && setRenderBody.find(
+			"rts::render::GameRenderer_IsWindowed = previous_windowed;") !=
+			std::string::npos,
+			"legacy device selection updates and rolls back one canonical window state");
+	}
+	else
+	{
+		result |= check(false,
+			"legacy device-selection synchronization boundary is source-addressable");
+	}
+	if (setDeviceResolution != std::string::npos &&
+		setDeviceResolutionEnd > setDeviceResolution)
+	{
+		const std::string setResolutionBody = wrapperSource.substr(
+			setDeviceResolution, setDeviceResolutionEnd - setDeviceResolution);
+		result |= check(setResolutionBody.find(
+			"const bool previous_windowed = rts::render::GameRenderer_IsWindowed;") !=
+			std::string::npos && setResolutionBody.find(
+			"const bool requested_windowed = windowed == -1 ?") !=
+			std::string::npos && setResolutionBody.find(
+			"rts::render::GameRenderer_IsWindowed = windowed != 0;") !=
+			std::string::npos && setResolutionBody.find(
+			"IsWindowed = rts::render::GameRenderer_IsWindowed;") !=
+			std::string::npos && setResolutionBody.find(
+			"rts::render::GameRenderer_IsWindowed = previous_windowed;") !=
+			std::string::npos,
+			"legacy resolution changes and rollback use the canonical window state");
+	}
+	else
+	{
+		result |= check(false,
+			"legacy resolution synchronization boundary is source-addressable");
+	}
+	if (toggleWindowed != std::string::npos &&
+		toggleWindowedEnd > toggleWindowed)
+	{
+		const std::string toggleBody = wrapperSource.substr(toggleWindowed,
+			toggleWindowedEnd - toggleWindowed);
+		result |= check(toggleBody.find(
+			"!rts::render::GameRenderer_IsWindowed") != std::string::npos,
+			"legacy window toggle reads the canonical neutral state");
+	}
+	else
+	{
+		result |= check(false,
+			"legacy window-toggle synchronization boundary is source-addressable");
+	}
+	result |= check(shutdownEnd > shutdown && wrapperSource.find(
+		"IsWindowed = rts::render::GameRenderer_IsWindowed;", shutdown) <
+			shutdownEnd,
+		"legacy shutdown reconciles the retained ABI window-state mirror");
+#endif
+
+	const std::string::size_type updateBegin = textureSource.find(
+		"bool TextureBaseClass::Update_Native_Subresource_Data");
+	const std::string::size_type updateEnd = textureSource.find(
+		"size_t TextureBaseClass::Get_Native_Texture_Byte_Count", updateBegin);
+	result |= check(updateBegin != std::string::npos && updateEnd > updateBegin,
+		"native texture update source is bounded for the in-place contract");
+	if (updateBegin != std::string::npos && updateEnd > updateBegin)
+	{
+		const std::string updateBody = textureSource.substr(updateBegin,
+			updateEnd - updateBegin);
+		result |= check(updateBody.find("RefreshCpuContent") !=
+			std::string::npos && updateBody.find("Apply_Native_Texture") ==
+			std::string::npos,
+			"steady-state texture updates refresh the existing native resource");
+	}
+	result |= check(surfaceHeader.find("bool Unlock_Native_Surface();") !=
+		std::string::npos && surfaceSource.find(
+		"bool SurfaceClass::Unlock_Native_Surface()") != std::string::npos,
+		"native surface publication exposes a status-returning unlock beside legacy ABI");
+	result |= check(surfaceHeader.find("bool Copy_Native_No_Publish(") !=
+		std::string::npos && surfaceHeader.find(
+		"bool Publish_Native_Changes();") != std::string::npos &&
+		surfaceSource.find("bool SurfaceClass::Copy_Native_No_Publish(") !=
+		std::string::npos && surfaceSource.find(
+		"bool SurfaceClass::Publish_Native_Changes()") != std::string::npos,
+		"native surfaces expose a separate batch-copy and publication boundary");
+	const std::string::size_type noPublishBegin = surfaceSource.find(
+		"bool SurfaceClass::Copy_Native_No_Publish(");
+	const std::string::size_type publishChangesBegin = surfaceSource.find(
+		"bool SurfaceClass::Publish_Native_Changes()", noPublishBegin);
+	if (noPublishBegin != std::string::npos &&
+		publishChangesBegin > noPublishBegin)
+	{
+		const std::string noPublishBody = surfaceSource.substr(noPublishBegin,
+			publishChangesBegin - noPublishBegin);
+		result |= check(noPublishBody.find("Publish_Native_Surface") ==
+			std::string::npos,
+			"native batch copies mutate the CPU shadow without publishing");
+	}
+	if (publishChangesBegin != std::string::npos)
+	{
+		const std::string publishBody = surfaceSource.substr(publishChangesBegin);
+		result |= check(publishBody.find("Publish_Native_Surface") !=
+			std::string::npos,
+			"native batch completion retains a retryable publication boundary");
+	}
+	result |= check(videoHeader.find("m_nativePublicationPending") !=
+		std::string::npos && videoSource.find("Unlock_Native_Surface()") !=
+		std::string::npos && videoSource.find(
+		"m_nativePublicationPending = publicationSucceeded ? FALSE : TRUE") !=
+		std::string::npos && videoSource.find(
+		"!m_nativePublicationPending") != std::string::npos,
+		"video retains and visibly reports failed native publication for retry");
+	result |= check(videoPlayerHeader.find("publishLockedFrame") ==
+		std::string::npos && ffmpegSource.find("publishLockedFrame") ==
+		std::string::npos,
+		"FFmpeg uses the single VideoBuffer unlock publication boundary");
+	const char *shroudSources[] = {
+		generalsShroudSource.c_str(), generalsMDShroudSource.c_str()
+	};
+	for (unsigned int shroudIndex = 0; shroudIndex < 2; ++shroudIndex)
+	{
+		const std::string shroud(shroudSources[shroudIndex]);
+		const std::string::size_type borderBegin = shroud.find(
+			"Bool W3DShroud::fillBorderShroudData(");
+		const std::string::size_type borderEnd = shroud.find(
+			"/**Set the shroud color within the border area", borderBegin);
+		const std::string::size_type syncUnlock = shroud.find(
+			"m_pSrcTexture->Unlock_Native_Surface()");
+		const std::string::size_type syncDirty = shroud.find(
+			"m_srcTextureDirty=FALSE;", syncUnlock);
+		const std::string::size_type borderCall = shroud.find(
+			"fillBorderShroudData(m_boderShroudLevel, pDestSurface)");
+		const std::string::size_type borderClear = shroud.find(
+			"m_clearDstTexture=FALSE;", borderCall);
+		result |= check(syncUnlock != std::string::npos &&
+			syncDirty > syncUnlock && shroud.find("Copy_Native") !=
+			std::string::npos && borderCall != std::string::npos &&
+			borderClear > borderCall && shroud.find(
+			"m_clearDstTexture = TRUE;") != std::string::npos,
+			"both shroud copies retain dirty state until native publication succeeds");
+		if (borderBegin != std::string::npos && borderEnd > borderBegin)
+		{
+			const std::string borderBody = shroud.substr(borderBegin,
+				borderEnd - borderBegin);
+			const std::string::size_type rowLoop = borderBody.find(
+				"for (y=0; y<m_dstTextureHeight; y++)");
+			const std::string::size_type lastBatchCopy = borderBody.rfind(
+				"Copy_Native_No_Publish(");
+			const std::string::size_type batchPublish = borderBody.find(
+				"Publish_Native_Changes()");
+			result |= check(rowLoop != std::string::npos &&
+				lastBatchCopy != std::string::npos && batchPublish > lastBatchCopy &&
+				CountSourceOccurrences(borderBody, "Publish_Native_Changes()") == 1,
+				"both shroud border fills publish once after all native row mutations");
+		}
+		const std::string::size_type borderFailure = shroud.rfind(
+			"if (!fillBorderShroudData", borderCall);
+		const std::string::size_type borderFailureReturn = shroud.find(
+			"return;", borderFailure);
+		result |= check(borderFailure != std::string::npos &&
+			borderFailureReturn > borderFailure && borderFailureReturn < borderClear,
+			"both shroud border publication failures retain the retry latch");
+	}
+	return result;
+}
+
+int testNativeMeshPrelitStageResetContract()
+{
+	int result = 0;
+	result |= check(rts::render::LEGACY_TEXTURE_STAGE_COUNT == 8,
+		"the neutral renderer preserves all eight legacy texture stages");
+
+#if defined(RTS_SOURCE_ROOT)
+	std::string meshSource;
+	result |= check(ReadSourceText(
+		"Core/Libraries/Source/WWVegas/WW3D2/nativew3dmeshrenderer.cpp",
+		&meshSource), "native mesh source is available for prelit reset checks");
+	if (!meshSource.empty())
+	{
+		const std::string::size_type multiPass = meshSource.find(
+			"case MeshGeometryClass::PRELIT_LIGHTMAP_MULTI_PASS");
+		const std::string::size_type allStageReset = meshSource.find(
+			"for (i = 0; i < rts::render::LEGACY_TEXTURE_STAGE_COUNT; i++)",
+			multiPass);
+		const std::string::size_type resetCall = meshSource.find(
+			"rts::render::SetGameTexture(i, nullptr);", allStageReset);
+		const std::string::size_type nextPrelitCase = meshSource.find(
+			"case MeshGeometryClass::PRELIT_LIGHTMAP_MULTI_TEXTURE", multiPass);
+		result |= check(multiPass != std::string::npos &&
+			allStageReset != std::string::npos &&
+			resetCall != std::string::npos &&
+			(nextPrelitCase == std::string::npos ||
+				allStageReset < nextPrelitCase) &&
+			(resetCall < nextPrelitCase),
+			"no-texture PRELIT multi-pass reset clears every legacy stage");
+	}
+#endif
 	return result;
 }
 
@@ -779,7 +1433,7 @@ int testLegacyResetSeedAndAmbientUpdate()
 		pipeline.rasterizer.fillMode == rts::render::RENDER_FILL_SOLID,
 		"explicit neutral pipeline seed restores valid deterministic defaults");
 	const rts::render::RenderFloat4 rawAmbient =
-		rts::render::DecodeLegacyD3D8Ambient(0x80402010U);
+		rts::render::DecodeLegacyAmbientColor(0x80402010U);
 	result |= check(rawAmbient.x == (64.0f / 255.0f) &&
 		rawAmbient.y == (32.0f / 255.0f) &&
 		rawAmbient.z == (16.0f / 255.0f) && rawAmbient.w == 1.0f,
@@ -1435,6 +2089,7 @@ int testLegacyStatePublicationFailureLatch()
 }
 
 #if defined(RTS_RENDERER_HAS_D3D11)
+#if !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
 int testD3D11PrimitiveTopologyTranslation()
 {
 	int result = 0;
@@ -1492,6 +2147,7 @@ int testD3D11PrimitiveTopologyTranslation()
 	rts::render::ResetLegacyStatePublicationFailure();
 	return result;
 }
+#endif
 
 int testD3D11LegacyStateBoundary()
 {
@@ -1507,35 +2163,37 @@ int testD3D11LegacyStateBoundary()
 		!rts::render::Is_D3D11_Clip_Plane_Mask_Supported(0x40U),
 		"D3D11 clip-plane publication preserves the six-plane boundary");
 	result |= check(rts::render::Is_D3D11_Shade_Mode_Value_Supported(
-		D3DSHADE_GOURAUD) &&
-		!rts::render::Is_D3D11_Shade_Mode_Value_Supported(D3DSHADE_FLAT),
+		rts::render::LEGACY_VOLUMETRIC_SHADOW_SHADE_GOURAUD) &&
+		!rts::render::Is_D3D11_Shade_Mode_Value_Supported(
+			rts::render::LEGACY_VOLUMETRIC_SHADOW_SHADE_FLAT),
 		"D3D11 keeps Gouraud shading and rejects unrepresented flat shading");
 	result |= check(
 		rts::render::Is_D3D11_Default_Render_State_Value_Supported(
-			D3DRS_COLORVERTEX, TRUE) &&
+			rts::render::LEGACY_D3DRS_COLORVERTEX, TRUE) &&
 		!rts::render::Is_D3D11_Default_Render_State_Value_Supported(
-			D3DRS_COLORVERTEX, FALSE) &&
+			rts::render::LEGACY_D3DRS_COLORVERTEX, FALSE) &&
 		rts::render::Is_D3D11_Default_Render_State_Value_Supported(
-			D3DRS_DITHERENABLE, FALSE) &&
+			rts::render::LEGACY_D3DRS_DITHERENABLE, FALSE) &&
 		!rts::render::Is_D3D11_Default_Render_State_Value_Supported(
-			D3DRS_DITHERENABLE, TRUE) &&
+			rts::render::LEGACY_D3DRS_DITHERENABLE, TRUE) &&
 		rts::render::Is_D3D11_Default_Render_State_Value_Supported(
-			D3DRS_CLIPPING, TRUE) &&
+			rts::render::LEGACY_D3DRS_CLIPPING, TRUE) &&
 		!rts::render::Is_D3D11_Default_Render_State_Value_Supported(
-			D3DRS_CLIPPING, FALSE) &&
+			rts::render::LEGACY_D3DRS_CLIPPING, FALSE) &&
 		rts::render::Is_D3D11_Default_Render_State_Value_Supported(
-			D3DRS_SOFTWAREVERTEXPROCESSING, FALSE) &&
+			rts::render::LEGACY_D3DRS_SOFTWAREVERTEXPROCESSING, FALSE) &&
 		!rts::render::Is_D3D11_Default_Render_State_Value_Supported(
-			D3DRS_SOFTWAREVERTEXPROCESSING, TRUE),
+			rts::render::LEGACY_D3DRS_SOFTWAREVERTEXPROCESSING, TRUE),
 		"D3D11 accepts only the exact harmless legacy default-state values");
 	result |= check(
 		rts::render::Is_D3D11_Irrelevant_Render_State(
-			D3DRS_FOGTABLEMODE) &&
-		!rts::render::Is_D3D11_Irrelevant_Render_State(D3DRS_COLORVERTEX) &&
+			rts::render::LEGACY_D3DRS_FOGTABLEMODE) &&
+		!rts::render::Is_D3D11_Irrelevant_Render_State(
+			rts::render::LEGACY_D3DRS_COLORVERTEX) &&
 		!rts::render::Should_Poison_D3D11_Render_State(
-			D3DRS_FOGTABLEMODE, false) &&
+			rts::render::LEGACY_D3DRS_FOGTABLEMODE, false) &&
 		rts::render::Should_Poison_D3D11_Render_State(
-			D3DRS_COLORVERTEX, false),
+			rts::render::LEGACY_D3DRS_COLORVERTEX, false),
 		"D3D8 fog and color-vertex numeric states cannot alias in the allowlist");
 	result |= check(
 		rts::render::Select_D3D11_Volumetric_Shadow_Shade_Mode(false, true) ==
@@ -2325,6 +2983,68 @@ int testD3D11HiddenSwapChain()
 		result |= check(device->createTexture(textureDescriptor, &textureData, 1,
 			&texture) == rts::render::RENDER_RESULT_OK,
 			"D3D11 parity probe creates an immutable shader texture");
+		// Texture type masks are packed into the legacy constant buffer.  Keep
+		// deliberately contrasting resources here so a first draw can expose a
+		// state-before-texture publication, rather than only proving that the SRV
+		// binding itself succeeded.
+		const unsigned int typeProbeCubePixels[6] = {
+			0xff0000ffU, 0xff0000ffU, 0xff0000ffU,
+			0xff0000ffU, 0xff0000ffU, 0xff0000ffU
+		};
+		rts::render::TextureSubresourceData typeProbeCubeData[6];
+		for (unsigned int face = 0; face < 6; ++face)
+		{
+			typeProbeCubeData[face].data = &typeProbeCubePixels[face];
+			typeProbeCubeData[face].rowPitch = sizeof(unsigned int);
+			typeProbeCubeData[face].slicePitch = sizeof(unsigned int);
+		}
+		rts::render::TextureDescriptor typeProbeCubeDescriptor = textureDescriptor;
+		typeProbeCubeDescriptor.width = 1;
+		typeProbeCubeDescriptor.height = 1;
+		typeProbeCubeDescriptor.arrayCount = 6;
+		typeProbeCubeDescriptor.dimension = rts::render::RENDER_TEXTURE_CUBE;
+		rts::render::GpuHandle typeProbeCubeTexture;
+		const unsigned int typeProbeGradientPixels[2] = {
+			0xff0000ffU, 0xffff0000U
+		};
+		rts::render::TextureDescriptor typeProbeGradientDescriptor = textureDescriptor;
+		typeProbeGradientDescriptor.width = 2;
+		typeProbeGradientDescriptor.height = 1;
+		rts::render::TextureSubresourceData typeProbeGradientData;
+		typeProbeGradientData.data = typeProbeGradientPixels;
+		typeProbeGradientData.rowPitch = 2 * sizeof(unsigned int);
+		typeProbeGradientData.slicePitch = sizeof(typeProbeGradientPixels);
+		rts::render::GpuHandle typeProbeGradientTexture;
+		const unsigned char typeProbeSignedPixels[2] = { 0xc0, 0x00 };
+		rts::render::TextureDescriptor typeProbeSignedDescriptor = textureDescriptor;
+		typeProbeSignedDescriptor.width = 1;
+		typeProbeSignedDescriptor.height = 1;
+		typeProbeSignedDescriptor.format = rts::render::RENDER_FORMAT_R8G8_SNORM;
+		rts::render::TextureSubresourceData typeProbeSignedData;
+		typeProbeSignedData.data = typeProbeSignedPixels;
+		typeProbeSignedData.rowPitch = 2;
+		typeProbeSignedData.slicePitch = sizeof(typeProbeSignedPixels);
+		rts::render::GpuHandle typeProbeSignedTexture;
+		const unsigned int typeProbeUnsignedPixels[1] = { 0xff000040U };
+		rts::render::TextureDescriptor typeProbeUnsignedDescriptor = textureDescriptor;
+		typeProbeUnsignedDescriptor.width = 1;
+		typeProbeUnsignedDescriptor.height = 1;
+		rts::render::TextureSubresourceData typeProbeUnsignedData;
+		typeProbeUnsignedData.data = typeProbeUnsignedPixels;
+		typeProbeUnsignedData.rowPitch = sizeof(unsigned int);
+		typeProbeUnsignedData.slicePitch = sizeof(typeProbeUnsignedPixels);
+		rts::render::GpuHandle typeProbeUnsignedTexture;
+		const bool typeProbeResourcesCreated =
+			device->createTexture(typeProbeCubeDescriptor, typeProbeCubeData, 6,
+				&typeProbeCubeTexture) == rts::render::RENDER_RESULT_OK &&
+			device->createTexture(typeProbeGradientDescriptor, &typeProbeGradientData,
+				1, &typeProbeGradientTexture) == rts::render::RENDER_RESULT_OK &&
+			device->createTexture(typeProbeSignedDescriptor, &typeProbeSignedData, 1,
+				&typeProbeSignedTexture) == rts::render::RENDER_RESULT_OK &&
+			device->createTexture(typeProbeUnsignedDescriptor, &typeProbeUnsignedData,
+				1, &typeProbeUnsignedTexture) == rts::render::RENDER_RESULT_OK;
+		result |= check(typeProbeResourcesCreated,
+			"D3D11 creates contrasting cube, signed, and unsigned texture probes");
 		const unsigned int treeShroudPixels[4] = {
 			0xff000000U, 0xffffffffU, 0xffffffffU, 0xffffffffU
 		};
@@ -3484,6 +4204,48 @@ int testD3D11HiddenSwapChain()
 		result |= check(center[1] > 240 && center[0] < 16 && center[2] < 16 &&
 			outside[0] > 240 && outside[1] < 16 && outside[2] < 16,
 			"XYZRHW conversion preserves viewport offset, extent, and diffuse color");
+		// POSITIONT constants include the viewport transform.  Change the native
+		// viewport after publishing the same logical state so draw-boundary refresh
+		// must update the cached constants without rebinding the pipeline.
+		bool viewportRefreshFrameStarted = context->beginFrame() ==
+			rts::render::RENDER_RESULT_OK;
+		bool viewportRefreshFrameSucceeded = false;
+		if (viewportRefreshFrameStarted)
+		{
+			viewportRefreshFrameSucceeded =
+				context->clear(clearColor, 1.0f, 0) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->setLegacyStateForLayout(logicalState,
+					preTransformedLayout, 0) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->setViewport(16.0f, 16.0f, 32.0f, 32.0f, 0.0f, 1.0f) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->setVertexBuffer(preTransformedBuffer,
+					sizeof(PreTransformedVertex), 0) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->setPrimitiveTopology(
+					rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->draw(6, 0) == rts::render::RENDER_RESULT_OK &&
+				context->setLegacyStateForLayout(logicalState,
+					preTransformedLayout, 0) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->draw(6, 0) == rts::render::RENDER_RESULT_OK;
+			const rts::render::RenderResult viewportRefreshEndResult =
+				context->endFrame();
+			viewportRefreshFrameSucceeded = viewportRefreshFrameSucceeded &&
+				viewportRefreshEndResult == rts::render::RENDER_RESULT_OK;
+		}
+		const bool viewportRefreshCaptured = viewportRefreshFrameSucceeded &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK;
+		const unsigned char *viewportRefreshEdge =
+			&pixels[4 * (32 * 64 + 20)];
+		result |= check(viewportRefreshCaptured && viewportRefreshEdge[1] > 240 &&
+			viewportRefreshEdge[0] < 16 && viewportRefreshEdge[2] < 16,
+			"draw refreshes POSITIONT constants after a cached viewport change");
 		rts::render::LegacyLogicalState preTransformedClipState = logicalState;
 		preTransformedClipState.pipeline.clipPlaneEnableMask = 1U;
 		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
@@ -4258,6 +5020,392 @@ int testD3D11HiddenSwapChain()
 			rts::render::LegacyTextureStageState();
 		result |= check(device->destroyResource(mipTexture),
 			"D3D11 parity probe drains the contrasting mip chain");
+		if (typeProbeResourcesCreated)
+		{
+			rts::render::LegacyLogicalState typeProbeState;
+			typeProbeState.pipeline.rasterizer.cullMode =
+				rts::render::RENDER_CULL_NONE;
+			typeProbeState.pipeline.textureStages[0].colorOperation =
+				rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_1;
+			typeProbeState.pipeline.textureStages[0].colorArgument1 =
+				rts::render::RENDER_TEXTURE_ARG_TEXTURE;
+			typeProbeState.pipeline.textureStages[0].alphaOperation =
+				rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_1;
+			typeProbeState.pipeline.textureStages[0].alphaArgument1 =
+				rts::render::RENDER_TEXTURE_ARG_TEXTURE;
+			std::vector<unsigned char> typeProbeCapture(64 * 64 * 4);
+			rts::render::RenderFormat typeProbeCaptureFormat =
+				rts::render::RENDER_FORMAT_UNKNOWN;
+
+			// The first draw deliberately publishes state before the cube SRV.  A
+			// stale cube mask makes the shader read the empty 2D slot instead of the
+			// red cube slot.
+			bool typeProbeFrameStarted = context->beginFrame() ==
+				rts::render::RENDER_RESULT_OK;
+			bool typeProbeFrameSucceeded = false;
+			if (typeProbeFrameStarted)
+			{
+				typeProbeFrameSucceeded =
+					context->clear(clearColor, 1.0f, 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, rts::render::GpuHandle()) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setLegacyStateForLayout(typeProbeState, texturedLayout,
+						1) == rts::render::RENDER_RESULT_OK &&
+					context->setVertexBuffer(texturedVertexBuffer,
+						sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, typeProbeCubeTexture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setPrimitiveTopology(
+						rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->draw(3, 0) == rts::render::RENDER_RESULT_OK;
+				const rts::render::RenderResult typeProbeEndResult =
+					context->endFrame();
+				typeProbeFrameSucceeded = typeProbeFrameSucceeded &&
+					typeProbeEndResult == rts::render::RENDER_RESULT_OK;
+			}
+			const bool typeProbeCubeCaptured = typeProbeFrameSucceeded &&
+				device->captureBackBuffer(&typeProbeCapture[0],
+					typeProbeCapture.size(), 64 * 4, &typeProbeCaptureFormat) ==
+					rts::render::RENDER_RESULT_OK;
+			const unsigned char *typeProbeCenter =
+				&typeProbeCapture[4 * (32 * 64 + 32)];
+			result |= check(typeProbeCubeCaptured && typeProbeCenter[2] > 240 &&
+				typeProbeCenter[0] < 16 && typeProbeCenter[1] < 16,
+				"D3D11 first draw refreshes cube type constants after state publication");
+
+			// Texture-before-state is the control ordering: setLegacyState sees the
+			// current 2D mask and must produce the green 2D sample.
+			typeProbeFrameStarted = context->beginFrame() ==
+				rts::render::RENDER_RESULT_OK;
+			typeProbeFrameSucceeded = false;
+			if (typeProbeFrameStarted)
+			{
+				typeProbeFrameSucceeded =
+					context->clear(clearColor, 1.0f, 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, texture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setLegacyStateForLayout(typeProbeState, texturedLayout,
+						1) == rts::render::RENDER_RESULT_OK &&
+					context->setVertexBuffer(texturedVertexBuffer,
+						sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+					context->setPrimitiveTopology(
+						rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->draw(3, 0) == rts::render::RENDER_RESULT_OK;
+				const rts::render::RenderResult typeProbeEndResult =
+					context->endFrame();
+				typeProbeFrameSucceeded = typeProbeFrameSucceeded &&
+					typeProbeEndResult == rts::render::RENDER_RESULT_OK;
+			}
+			const bool typeProbe2DCaptured = typeProbeFrameSucceeded &&
+				device->captureBackBuffer(&typeProbeCapture[0],
+					typeProbeCapture.size(), 64 * 4, &typeProbeCaptureFormat) ==
+					rts::render::RENDER_RESULT_OK;
+			typeProbeCenter = &typeProbeCapture[4 * (32 * 64 + 32)];
+			result |= check(typeProbe2DCaptured && typeProbeCenter[1] > 240 &&
+				typeProbeCenter[0] < 16 && typeProbeCenter[2] < 16,
+				"D3D11 texture-before-state ordering publishes the 2D type mask");
+
+			// Once a cube state has been bound, replacing its SRV with a 2D SRV
+			// without rebinding the logical state must refresh constants at draw time.
+			typeProbeFrameStarted = context->beginFrame() ==
+				rts::render::RENDER_RESULT_OK;
+			typeProbeFrameSucceeded = false;
+			if (typeProbeFrameStarted)
+			{
+				typeProbeFrameSucceeded =
+					context->clear(clearColor, 1.0f, 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, typeProbeCubeTexture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setLegacyStateForLayout(typeProbeState, texturedLayout,
+						1) == rts::render::RENDER_RESULT_OK &&
+					context->setVertexBuffer(texturedVertexBuffer,
+						sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+					context->setPrimitiveTopology(
+						rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, texture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->draw(3, 0) == rts::render::RENDER_RESULT_OK;
+				const rts::render::RenderResult typeProbeEndResult =
+					context->endFrame();
+				typeProbeFrameSucceeded = typeProbeFrameSucceeded &&
+					typeProbeEndResult == rts::render::RENDER_RESULT_OK;
+			}
+			const bool typeProbeCubeTo2DCaptured = typeProbeFrameSucceeded &&
+				device->captureBackBuffer(&typeProbeCapture[0],
+					typeProbeCapture.size(), 64 * 4, &typeProbeCaptureFormat) ==
+					rts::render::RENDER_RESULT_OK;
+			typeProbeCenter = &typeProbeCapture[4 * (32 * 64 + 32)];
+			result |= check(typeProbeCubeTo2DCaptured && typeProbeCenter[1] > 240 &&
+				typeProbeCenter[0] < 16 && typeProbeCenter[2] < 16,
+				"D3D11 draw-boundary refresh handles cube-to-2D transitions");
+
+			// Repeating the same state and 2D binding must remain a cached fast path;
+			// use indexed draws here so both draw entry points share the refresh path.
+			typeProbeFrameStarted = context->beginFrame() ==
+				rts::render::RENDER_RESULT_OK;
+			typeProbeFrameSucceeded = false;
+			if (typeProbeFrameStarted)
+			{
+				typeProbeFrameSucceeded =
+					context->clear(clearColor, 1.0f, 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, texture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setLegacyStateForLayout(typeProbeState, texturedLayout,
+						1) == rts::render::RENDER_RESULT_OK &&
+					context->setVertexBuffer(texturedVertexBuffer,
+						sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+					context->setIndexBuffer(indexBuffer,
+						rts::render::RENDER_FORMAT_R16_UINT, 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setPrimitiveTopology(
+						rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->drawIndexed(3, 0, 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, texture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setLegacyStateForLayout(typeProbeState, texturedLayout,
+						1) == rts::render::RENDER_RESULT_OK &&
+					context->drawIndexed(3, 0, 0) ==
+						rts::render::RENDER_RESULT_OK;
+				const rts::render::RenderResult typeProbeEndResult =
+					context->endFrame();
+				typeProbeFrameSucceeded = typeProbeFrameSucceeded &&
+					typeProbeEndResult == rts::render::RENDER_RESULT_OK;
+			}
+			const bool typeProbeCachedCaptured = typeProbeFrameSucceeded &&
+				device->captureBackBuffer(&typeProbeCapture[0],
+					typeProbeCapture.size(), 64 * 4, &typeProbeCaptureFormat) ==
+					rts::render::RENDER_RESULT_OK;
+			typeProbeCenter = &typeProbeCapture[4 * (32 * 64 + 32)];
+			result |= check(typeProbeCachedCaptured && typeProbeCenter[1] > 240 &&
+				typeProbeCenter[0] < 16 && typeProbeCenter[2] < 16,
+				"D3D11 unchanged texture state stays on the cached indexed path");
+
+			// The indexed draw also covers the opposite transition.  The first 2D
+			// draw establishes constants with no cube bit; the final cube draw must
+			// not reuse that stale mask.
+			typeProbeFrameStarted = context->beginFrame() ==
+				rts::render::RENDER_RESULT_OK;
+			typeProbeFrameSucceeded = false;
+			if (typeProbeFrameStarted)
+			{
+				typeProbeFrameSucceeded =
+					context->clear(clearColor, 1.0f, 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, texture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setLegacyStateForLayout(typeProbeState, texturedLayout,
+						1) == rts::render::RENDER_RESULT_OK &&
+					context->setVertexBuffer(texturedVertexBuffer,
+						sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+					context->setIndexBuffer(indexBuffer,
+						rts::render::RENDER_FORMAT_R16_UINT, 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setPrimitiveTopology(
+						rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->drawIndexed(3, 0, 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, typeProbeCubeTexture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->drawIndexed(3, 0, 0) ==
+						rts::render::RENDER_RESULT_OK;
+				const rts::render::RenderResult typeProbeEndResult =
+					context->endFrame();
+				typeProbeFrameSucceeded = typeProbeFrameSucceeded &&
+					typeProbeEndResult == rts::render::RENDER_RESULT_OK;
+			}
+			const bool typeProbe2DToCubeCaptured = typeProbeFrameSucceeded &&
+				device->captureBackBuffer(&typeProbeCapture[0],
+					typeProbeCapture.size(), 64 * 4, &typeProbeCaptureFormat) ==
+					rts::render::RENDER_RESULT_OK;
+			typeProbeCenter = &typeProbeCapture[4 * (32 * 64 + 32)];
+			result |= check(typeProbe2DToCubeCaptured && typeProbeCenter[2] > 240 &&
+				typeProbeCenter[0] < 16 && typeProbeCenter[1] < 16,
+				"D3D11 indexed draw-boundary refresh handles 2D-to-cube transitions");
+
+			rts::render::LegacyLogicalState signedBumpState;
+			signedBumpState.pipeline.rasterizer.cullMode =
+				rts::render::RENDER_CULL_NONE;
+			signedBumpState.pipeline.textureStages[0].colorOperation =
+				rts::render::RENDER_TEXTURE_OP_BUMP_ENVIRONMENT;
+			signedBumpState.pipeline.textureStages[0].bumpEnvironmentMatrix00 =
+			1.0f;
+			signedBumpState.pipeline.textureStages[1].colorOperation =
+				rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_1;
+			signedBumpState.pipeline.textureStages[1].colorArgument1 =
+				rts::render::RENDER_TEXTURE_ARG_TEXTURE;
+			signedBumpState.pipeline.textureStages[1].alphaOperation =
+				rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_1;
+			signedBumpState.pipeline.textureStages[1].alphaArgument1 =
+				rts::render::RENDER_TEXTURE_ARG_TEXTURE;
+			signedBumpState.pipeline.textureStages[0].sampler.addressU =
+				rts::render::RENDER_TEXTURE_ADDRESS_CLAMP;
+			signedBumpState.pipeline.textureStages[0].sampler.addressV =
+				rts::render::RENDER_TEXTURE_ADDRESS_CLAMP;
+			signedBumpState.pipeline.textureStages[1].sampler.addressU =
+				rts::render::RENDER_TEXTURE_ADDRESS_CLAMP;
+			signedBumpState.pipeline.textureStages[1].sampler.addressV =
+				rts::render::RENDER_TEXTURE_ADDRESS_CLAMP;
+			signedBumpState.pipeline.textureStages[0].sampler.minification =
+				rts::render::RENDER_TEXTURE_FILTER_POINT;
+			signedBumpState.pipeline.textureStages[0].sampler.magnification =
+				rts::render::RENDER_TEXTURE_FILTER_POINT;
+			signedBumpState.pipeline.textureStages[0].sampler.mipmapping =
+				rts::render::RENDER_TEXTURE_FILTER_NONE;
+			signedBumpState.pipeline.textureStages[1].sampler.minification =
+				rts::render::RENDER_TEXTURE_FILTER_POINT;
+			signedBumpState.pipeline.textureStages[1].sampler.magnification =
+				rts::render::RENDER_TEXTURE_FILTER_POINT;
+			signedBumpState.pipeline.textureStages[1].sampler.mipmapping =
+				rts::render::RENDER_TEXTURE_FILTER_NONE;
+
+			// With the signed R8G8_SNORM probe, the correct bump offset selects the
+			// red left texel.  Retain this passing signed-format control alongside
+			// the cube regression so the refresh cannot change bump interpretation.
+			typeProbeFrameStarted = context->beginFrame() ==
+				rts::render::RENDER_RESULT_OK;
+			typeProbeFrameSucceeded = false;
+			if (typeProbeFrameStarted)
+			{
+				typeProbeFrameSucceeded =
+					context->clear(clearColor, 1.0f, 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, rts::render::GpuHandle()) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(1, rts::render::GpuHandle()) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setLegacyStateForLayout(signedBumpState, texturedLayout,
+						3) == rts::render::RENDER_RESULT_OK &&
+					context->setVertexBuffer(texturedVertexBuffer,
+						sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, typeProbeSignedTexture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(1, typeProbeGradientTexture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setPrimitiveTopology(
+						rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->draw(3, 0) == rts::render::RENDER_RESULT_OK;
+				const rts::render::RenderResult typeProbeEndResult =
+					context->endFrame();
+				typeProbeFrameSucceeded = typeProbeFrameSucceeded &&
+					typeProbeEndResult == rts::render::RENDER_RESULT_OK;
+			}
+			const bool signedBumpCaptured = typeProbeFrameSucceeded &&
+				device->captureBackBuffer(&typeProbeCapture[0],
+					typeProbeCapture.size(), 64 * 4, &typeProbeCaptureFormat) ==
+					rts::render::RENDER_RESULT_OK;
+			typeProbeCenter = &typeProbeCapture[4 * (32 * 64 + 32)];
+			result |= check(signedBumpCaptured && typeProbeCenter[2] > 240 &&
+				typeProbeCenter[0] < 16 && typeProbeCenter[1] < 16,
+				"D3D11 first draw preserves signed bump interpretation after state publication");
+
+			// The reverse order remains a valid control and must select the same
+			// signed result when setLegacyState sees the already-bound SNORM SRV.
+			typeProbeFrameStarted = context->beginFrame() ==
+				rts::render::RENDER_RESULT_OK;
+			typeProbeFrameSucceeded = false;
+			if (typeProbeFrameStarted)
+			{
+				typeProbeFrameSucceeded =
+					context->clear(clearColor, 1.0f, 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, typeProbeSignedTexture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(1, typeProbeGradientTexture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setLegacyStateForLayout(signedBumpState, texturedLayout,
+						3) == rts::render::RENDER_RESULT_OK &&
+					context->setVertexBuffer(texturedVertexBuffer,
+						sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+					context->setPrimitiveTopology(
+						rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->draw(3, 0) == rts::render::RENDER_RESULT_OK;
+				const rts::render::RenderResult typeProbeEndResult =
+					context->endFrame();
+				typeProbeFrameSucceeded = typeProbeFrameSucceeded &&
+					typeProbeEndResult == rts::render::RENDER_RESULT_OK;
+			}
+			const bool signedBumpReverseCaptured = typeProbeFrameSucceeded &&
+				device->captureBackBuffer(&typeProbeCapture[0],
+					typeProbeCapture.size(), 64 * 4, &typeProbeCaptureFormat) ==
+					rts::render::RENDER_RESULT_OK;
+			typeProbeCenter = &typeProbeCapture[4 * (32 * 64 + 32)];
+			result |= check(signedBumpReverseCaptured && typeProbeCenter[2] > 240 &&
+				typeProbeCenter[0] < 16 && typeProbeCenter[1] < 16,
+				"D3D11 signed bump reverse ordering matches the state-first path");
+
+			// Change only the stage-0 resource from signed to unsigned after the
+			// state has been published.  The unsigned 0.25 sample must be remapped
+			// to -0.5 and therefore still select the red left texel.
+			typeProbeFrameStarted = context->beginFrame() ==
+				rts::render::RENDER_RESULT_OK;
+			typeProbeFrameSucceeded = false;
+			if (typeProbeFrameStarted)
+			{
+				typeProbeFrameSucceeded =
+					context->clear(clearColor, 1.0f, 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, typeProbeSignedTexture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(1, typeProbeGradientTexture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setLegacyStateForLayout(signedBumpState, texturedLayout,
+						3) == rts::render::RENDER_RESULT_OK &&
+					context->setVertexBuffer(texturedVertexBuffer,
+						sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+					context->setIndexBuffer(indexBuffer,
+						rts::render::RENDER_FORMAT_R16_UINT, 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setPrimitiveTopology(
+						rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, typeProbeUnsignedTexture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->drawIndexed(3, 0, 0) ==
+						rts::render::RENDER_RESULT_OK;
+				const rts::render::RenderResult typeProbeEndResult =
+					context->endFrame();
+				typeProbeFrameSucceeded = typeProbeFrameSucceeded &&
+					typeProbeEndResult == rts::render::RENDER_RESULT_OK;
+			}
+			const bool signedBumpTransitionCaptured = typeProbeFrameSucceeded &&
+				device->captureBackBuffer(&typeProbeCapture[0],
+					typeProbeCapture.size(), 64 * 4, &typeProbeCaptureFormat) ==
+					rts::render::RENDER_RESULT_OK;
+			typeProbeCenter = &typeProbeCapture[4 * (32 * 64 + 32)];
+			result |= check(signedBumpTransitionCaptured &&
+				typeProbeCenter[2] > 240 && typeProbeCenter[0] < 16 &&
+				typeProbeCenter[1] < 16,
+				"D3D11 indexed draw refreshes signed-mask transitions");
+		}
 		rts::render::TextureDescriptor movieDescriptor;
 		movieDescriptor.width = 16;
 		movieDescriptor.height = 9;
@@ -4386,6 +5534,26 @@ int testD3D11HiddenSwapChain()
 			rts::render::RENDER_RESULT_OK && debugErrorCount == 0) ||
 			debugValidationResult == rts::render::RENDER_RESULT_UNSUPPORTED,
 			"D3D11 debug layer reports no validation errors or is unavailable");
+		if (typeProbeCubeTexture.isValid())
+		{
+			result |= check(device->destroyResource(typeProbeCubeTexture),
+				"D3D11 releases the cube type-mask probe");
+		}
+		if (typeProbeGradientTexture.isValid())
+		{
+			result |= check(device->destroyResource(typeProbeGradientTexture),
+				"D3D11 releases the gradient type-mask probe");
+		}
+		if (typeProbeSignedTexture.isValid())
+		{
+			result |= check(device->destroyResource(typeProbeSignedTexture),
+				"D3D11 releases the signed type-mask probe");
+		}
+		if (typeProbeUnsignedTexture.isValid())
+		{
+			result |= check(device->destroyResource(typeProbeUnsignedTexture),
+				"D3D11 releases the unsigned type-mask probe");
+		}
 		result |= check(device->destroyResource(vertexBuffer) &&
 			device->destroyResource(greenVertexBuffer) &&
 			device->destroyResource(halfAlphaVertexBuffer) &&
@@ -4537,9 +5705,73 @@ int testD3D11HeadlessDevice()
 	result |= check(device->createBuffer(descriptor, 0, 0, &buffer) ==
 		rts::render::RENDER_RESULT_OK && buffer.isValid(),
 		"D3D11 dynamic buffer receives a logical handle");
+	rts::render::RenderResourceStatistics bufferStatistics;
+	result |= check(device->getDebugResourceStatistics(&bufferStatistics) ==
+		rts::render::RENDER_RESULT_OK && bufferStatistics.bufferCount == 1 &&
+		bufferStatistics.recoveryShadowBytes == 0,
+		"D3D11 buffer ownership retains descriptors without a persistent CPU shadow");
+	rts::render::BufferDescriptor immutableRecoveryDescriptor;
+	immutableRecoveryDescriptor.byteCount = 16;
+	immutableRecoveryDescriptor.stride = 4;
+	unsigned int immutableRecoveryBytes[4] = { 7, 8, 9, 10 };
+	rts::render::GpuHandle immutableRecoveryBuffer;
+	result |= check(device->createBuffer(immutableRecoveryDescriptor,
+		immutableRecoveryBytes, sizeof(immutableRecoveryBytes),
+		&immutableRecoveryBuffer) == rts::render::RENDER_RESULT_OK &&
+		device->getDebugResourceStatistics(&bufferStatistics) ==
+			rts::render::RENDER_RESULT_OK && bufferStatistics.bufferCount == 2 &&
+		bufferStatistics.recoveryShadowBytes == sizeof(immutableRecoveryBytes),
+		"only immutable buffer creation sources contribute recovery bytes");
 	result |= check(device->recoverDevice() ==
 		rts::render::RENDER_RESULT_OK && device->isOperational(),
 		"D3D11 recovery recreates live logical resources without changing handles");
+	result |= check(device->immediateContext()->beginFrame() ==
+		rts::render::RENDER_RESULT_OK &&
+		device->immediateContext()->setVertexBuffer(immutableRecoveryBuffer,
+			immutableRecoveryDescriptor.stride, 0) ==
+			rts::render::RENDER_RESULT_OK &&
+		device->immediateContext()->setVertexBuffer(buffer, descriptor.stride, 0) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+		device->immediateContext()->endFrame() ==
+			rts::render::RENDER_RESULT_OK &&
+		device->destroyResource(immutableRecoveryBuffer),
+		"a recovered descriptor-only buffer fails closed until owner republish");
+	rts::render::BufferDescriptor largerMutableDescriptor;
+	largerMutableDescriptor.byteCount = 64;
+	largerMutableDescriptor.stride = 16;
+	largerMutableDescriptor.usage = rts::render::RENDER_USAGE_DYNAMIC;
+	rts::render::GpuHandle largerMutableBuffer;
+	result |= check(device->createBuffer(largerMutableDescriptor, 0, 0,
+		&largerMutableBuffer) == rts::render::RENDER_RESULT_OK &&
+		largerMutableBuffer.index() == immutableRecoveryBuffer.index() &&
+		largerMutableBuffer.generation() != immutableRecoveryBuffer.generation() &&
+		device->getDebugResourceStatistics(&bufferStatistics) ==
+			rts::render::RENDER_RESULT_OK && bufferStatistics.bufferCount == 2 &&
+		bufferStatistics.recoveryShadowBytes == 0,
+		"destroyed immutable recovery bytes do not survive slot reuse");
+	result |= check(device->recoverDevice() ==
+		rts::render::RENDER_RESULT_OK && device->isOperational() &&
+		device->immediateContext()->beginFrame() ==
+			rts::render::RENDER_RESULT_OK &&
+		device->immediateContext()->setVertexBuffer(largerMutableBuffer,
+			largerMutableDescriptor.stride, 0) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+		device->immediateContext()->endFrame() ==
+			rts::render::RENDER_RESULT_OK,
+		"reused mutable buffer recovers only its descriptor shell");
+	unsigned int largerMutableBytes[16] = { 0 };
+	result |= check(device->updateBufferResource(largerMutableBuffer,
+		largerMutableBytes, sizeof(largerMutableBytes), 0,
+		rts::render::RENDER_BUFFER_UPDATE_DISCARD) ==
+			rts::render::RENDER_RESULT_OK &&
+		device->immediateContext()->beginFrame() ==
+			rts::render::RENDER_RESULT_OK &&
+		device->immediateContext()->setVertexBuffer(largerMutableBuffer,
+			largerMutableDescriptor.stride, 0) == rts::render::RENDER_RESULT_OK &&
+		device->immediateContext()->endFrame() ==
+			rts::render::RENDER_RESULT_OK &&
+		device->destroyResource(largerMutableBuffer),
+		"reused mutable buffer becomes bindable only after full republish");
 	unsigned int values[4] = { 1, 2, 3, 4 };
 	result |= check(device->immediateContext()->beginFrame() ==
 		rts::render::RENDER_RESULT_OK &&
@@ -4558,12 +5790,21 @@ int testD3D11HeadlessDevice()
 		device->immediateContext()->endFrame() ==
 			rts::render::RENDER_RESULT_OK,
 		"recreated dynamic buffers retain their logical handle and update path");
+	result |= check(device->getDebugResourceStatistics(&bufferStatistics) ==
+		rts::render::RENDER_RESULT_OK && bufferStatistics.bufferCount == 1 &&
+		bufferStatistics.recoveryShadowBytes == 0,
+		"buffer recovery recreates descriptor shells without allocating CPU bytes");
 	unsigned int rangeValues[4] = { 10, 20, 30, 40 };
 	rts::render::IRenderContext *rangeContext = device->immediateContext();
 	result |= check(rangeContext->updateBuffer(buffer, rangeValues,
 		sizeof(rangeValues), 0, rts::render::RENDER_BUFFER_UPDATE_DISCARD) ==
 			rts::render::RENDER_RESULT_INVALID_ARGUMENT,
 		"dynamic range updates require an open owner frame");
+	result |= check(device->updateBufferResource(buffer, rangeValues,
+		sizeof(unsigned int) * 2, 0,
+		rts::render::RENDER_BUFFER_UPDATE_DISCARD) ==
+			rts::render::RENDER_RESULT_OK,
+		"device-owner buffer publication is legal before an owner frame");
 	result |= check(rangeContext->beginFrame() ==
 		rts::render::RENDER_RESULT_OK &&
 		rangeContext->updateBuffer(buffer, rangeValues, sizeof(unsigned int) * 2,
@@ -4734,9 +5975,66 @@ int testD3D11HeadlessDevice()
 	return result;
 }
 
+#endif
+
 int testW3DVideoBufferDirectPublicationLayout()
 {
 	int result = 0;
+	result |= check(ExpectedNativeVideoPublicationSelection(
+		rts::render::RENDER_BACKEND_DX8, true, true) == false,
+		"W3D video keeps the legacy publication policy for DX8");
+#if defined(_WIN64)
+	result |= check(ExpectedNativeVideoPublicationSelection(
+		rts::render::RENDER_BACKEND_D3D11, true, true),
+		"W3D video selection requires a supported active native owner");
+#else
+	result |= check(!ExpectedNativeVideoPublicationSelection(
+		rts::render::RENDER_BACKEND_D3D11, true, true),
+		"W3D video keeps the compatibility publication policy on x86");
+#endif
+	result |= check(!ExpectedNativeVideoPublicationSelection(
+		rts::render::RENDER_BACKEND_D3D11, true, false),
+		"W3D video selection rejects a requested but inactive native owner");
+	result |= check(!ExpectedNativeVideoPublicationSelection(
+		rts::render::RENDER_BACKEND_D3D11, false, true),
+		"W3D video selection rejects an unsupported native backend");
+
+	std::string source;
+	result |= check(ReadSourceText(
+		"Core/GameEngineDevice/Source/W3DDevice/GameClient/W3DVideoBuffer.cpp",
+		&source), "W3D video source is available for policy-contract checks");
+	if (!source.empty())
+	{
+		const std::string::size_type method = source.find(
+			"Bool W3DVideoBuffer::UsesNativeD3D11PublicationPath()");
+		const std::string::size_type methodEnd = source.find(
+			"// W3DVideoBuffer::SetBuffer", method);
+		const std::string::size_type nativeGuard = source.find(
+			"#if defined(_WIN64)", method);
+		const std::string::size_type fallbackBranch = source.find(
+			"#else", nativeGuard);
+		const std::string::size_type fallbackReturn = source.find(
+			"return FALSE;", fallbackBranch);
+		const std::string::size_type activeOwnerQuery = source.find(
+			"IsNativeD3D11PublicationActive()", method);
+		result |= check(method != std::string::npos &&
+			methodEnd != std::string::npos && nativeGuard > method &&
+			nativeGuard < methodEnd && fallbackBranch > nativeGuard &&
+			fallbackBranch < methodEnd && fallbackReturn > fallbackBranch &&
+			fallbackReturn < methodEnd,
+			"W3D video native selection is compile-time disabled outside x64");
+		result |= check(activeOwnerQuery > method &&
+			activeOwnerQuery < methodEnd,
+			"W3D video selection consults the actual active native owner");
+		result |= check(source.find("publishLockedFrame") ==
+			std::string::npos && source.find(
+			"Publish_Render_Texture_BGRA8_Change") == std::string::npos,
+			"W3D video has no second pre-unlock native frame publisher");
+		result |= check(source.find("m_surface->Unlock()") !=
+			std::string::npos,
+			"W3D video retains the SurfaceClass unlock publication boundary");
+	}
+
 	const unsigned int width = 16;
 	const unsigned int height = 9;
 	const unsigned int paddedPitch = width * 4 + 16;
@@ -4757,6 +6055,7 @@ int testW3DVideoBufferDirectPublicationLayout()
 	return result;
 }
 
+#if defined(RTS_RENDERER_HAS_D3D11)
 int testD3D11TextureRefreshContract()
 {
 	int result = 0;
@@ -5087,6 +6386,7 @@ int testD3D11StateCacheEvictionContract()
 	return result;
 }
 
+#if !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
 int testD3D11LegacyBridgeLifecycleContract()
 {
 	int result = 0;
@@ -5103,6 +6403,8 @@ int testD3D11LegacyBridgeLifecycleContract()
 	typedef void (D3D11LegacyBridge::*ExpectedCaptureRequest)();
 	typedef bool (D3D11LegacyBridge::*ExpectedBeginFrame)();
 	typedef bool (D3D11LegacyBridge::*ExpectedPrepareReset)();
+	typedef void (D3D11LegacyBridge::*ExpectedShutdown)();
+	typedef rts::render::RenderResult (D3D11LegacyBridge::*ExpectedShutdownResult)();
 	typedef void (D3D11LegacyBridge::*ExpectedInvalidateBufferRange)(IUnknown *,
 		unsigned int, size_t, size_t, rts::render::RenderBufferUpdateMode);
 	typedef bool (D3D11LegacyBridge::*ExpectedPublishBufferChange)(IUnknown *,
@@ -5128,6 +6430,10 @@ int testD3D11LegacyBridgeLifecycleContract()
 		ExpectedBeginFrame>::value &&
 		std::is_same<decltype(&D3D11LegacyBridge::Prepare_Legacy_Device_Reset),
 		ExpectedPrepareReset>::value &&
+		std::is_same<decltype(&D3D11LegacyBridge::Shutdown),
+		ExpectedShutdown>::value &&
+		std::is_same<decltype(&D3D11LegacyBridge::Shutdown_Result),
+		ExpectedShutdownResult>::value &&
 		std::is_same<decltype(&D3D11LegacyBridge::Invalidate_Buffer_Range),
 		ExpectedInvalidateBufferRange>::value &&
 		std::is_same<decltype(&D3D11LegacyBridge::Publish_Buffer_Change),
@@ -5137,6 +6443,7 @@ int testD3D11LegacyBridgeLifecycleContract()
 		"D3D11 bridge exposes result-bearing lifecycle and pre-present capture methods");
 	return result;
 }
+#endif
 
 int testD3D11LegacyBlendFactors()
 {
@@ -5226,17 +6533,40 @@ int testD3D11LegacyBlendFactors()
 #endif
 }
 
+#if !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
 int TestLegacyResetResources();
 int TestLegacyAsyncFramePolicy();
 int TestLegacyAsyncBridgeCompletion();
+#if defined(RTS_RENDERER_WAVE_SHADER_CONTRACT_TEST)
+int RunLegacyWaveShaderContractTests();
+#endif
+#if defined(RTS_RENDERER_SHADER_ASSET_CONTRACT_TEST)
+int RunLegacyShaderAssetContractTests();
+#endif
+#endif
 
 int main()
 {
 	int result = 0;
+#if !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
 	result |= TestLegacyResetResources();
 	result |= TestLegacyAsyncFramePolicy();
 	result |= TestLegacyAsyncBridgeCompletion();
+#if defined(RTS_RENDERER_WAVE_SHADER_CONTRACT_TEST)
+	result |= RunLegacyWaveShaderContractTests();
+#endif
+#if defined(RTS_RENDERER_SHADER_ASSET_CONTRACT_TEST)
+	result |= RunLegacyShaderAssetContractTests();
+#endif
+#endif
 	result |= testBackendNames();
+	result |= testSourceReaderLineEndingNormalization();
+	result |= testRenderTexturePublicationOperationalStates();
+#if !defined(RTS_RENDERER_HAS_D3D11)
+	result |= testNativeRendererRejectsUnavailableBackend();
+#endif
+	result |= testRendererTextureLifecycleContracts();
+	result |= testNativeMeshPrelitStageResetContract();
 	result |= testGenerationSafeHandles();
 	result |= testNeutralDescriptorDefaults();
 	result |= testLegacyLogicalState();
@@ -5248,14 +6578,18 @@ int main()
 	result |= testLegacyShaderBitDecoder();
 	result |= testRendererFrameLifecycleState();
 	result |= testRenderCaptureQueue();
+	result |= testW3DVideoBufferDirectPublicationLayout();
 #if defined(RTS_RENDERER_HAS_D3D11)
+#if !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
 	result |= testD3D11PrimitiveTopologyTranslation();
+#endif
 	result |= testD3D11LegacyStateBoundary();
 	result |= testD3D11HeadlessDevice();
-	result |= testW3DVideoBufferDirectPublicationLayout();
 	result |= testD3D11TextureRefreshContract();
 	result |= testD3D11StateCacheEvictionContract();
+#if !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
 	result |= testD3D11LegacyBridgeLifecycleContract();
+#endif
 	result |= testD3D11LegacyBlendFactors();
 	result |= testD3D11HiddenSwapChain();
 #endif

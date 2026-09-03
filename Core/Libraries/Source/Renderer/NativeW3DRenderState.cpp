@@ -38,11 +38,35 @@ long DecrementReference(volatile long *references)
 	return __sync_sub_and_fetch(references, 1);
 #endif
 }
+
+long ReadAtomic(volatile const long *value)
+{
+#ifdef _WIN32
+	return InterlockedCompareExchange(const_cast<long *>(value), 0, 0);
+#else
+	return __sync_add_and_fetch(const_cast<long *>(value), 0);
+#endif
 }
 
-NativeW3DRenderState::NativeW3DRenderState(unsigned int cleanupCapacity) :
+void WriteAtomic(volatile long *value, long replacement)
+{
+#ifdef _WIN32
+#if defined(_MSC_VER) && _MSC_VER < 1300
+	InterlockedExchange(const_cast<long *>(value), replacement);
+#else
+	InterlockedExchange(value, replacement);
+#endif
+#else
+	__sync_lock_test_and_set(value, replacement);
+#endif
+}
+}
+
+NativeW3DRenderState::NativeW3DRenderState(unsigned int cleanupCapacity,
+	unsigned int initialGeneration) :
 	m_references(1), m_cleanup(cleanupCapacity), m_device(0), m_context(0),
-	m_generation(1)
+	m_generation(initialGeneration), m_backendEpoch(1), m_bufferEpoch(1),
+	m_backendTerminal(1), m_boundResourceTables(0)
 {
 }
 
@@ -50,13 +74,15 @@ NativeW3DRenderState::~NativeW3DRenderState()
 {
 }
 
-NativeW3DRenderState *NativeW3DRenderState::Create(unsigned int cleanupCapacity)
+NativeW3DRenderState *NativeW3DRenderState::Create(unsigned int cleanupCapacity,
+	unsigned int initialGeneration)
 {
-	if (cleanupCapacity == 0)
+	if (cleanupCapacity == 0 || initialGeneration == 0)
 	{
 		return 0;
 	}
-	return new (std::nothrow) NativeW3DRenderState(cleanupCapacity);
+	return new (std::nothrow) NativeW3DRenderState(cleanupCapacity,
+		initialGeneration);
 }
 
 void NativeW3DRenderState::AddRef()
@@ -87,6 +113,17 @@ RenderResult NativeW3DRenderState::AttachBackend(IRenderDevice *device,
 	}
 	m_device = device;
 	m_context = context;
+	WriteAtomic(&m_backendTerminal, 0);
+	++m_backendEpoch;
+	if (m_backendEpoch == 0)
+	{
+		m_backendEpoch = 1;
+	}
+	++m_bufferEpoch;
+	if (m_bufferEpoch == 0)
+	{
+		m_bufferEpoch = 1;
+	}
 	return RENDER_RESULT_OK;
 }
 
@@ -98,12 +135,32 @@ RenderResult NativeW3DRenderState::ReplaceContext(IRenderContext *context)
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	m_context = context;
+	++m_backendEpoch;
+	if (m_backendEpoch == 0)
+	{
+		m_backendEpoch = 1;
+	}
 	return RENDER_RESULT_OK;
 }
 
-RenderResult NativeW3DRenderState::DetachBackend()
+RenderResult NativeW3DRenderState::AdvanceBufferEpoch()
 {
-	if (!IsOwnerThread() || IsAcceptingCleanup())
+	if (!IsOwnerThread() || m_device == 0 || !IsAcceptingCleanup())
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	++m_bufferEpoch;
+	if (m_bufferEpoch == 0)
+	{
+		m_bufferEpoch = 1;
+	}
+	return RENDER_RESULT_OK;
+}
+
+RenderResult NativeW3DRenderState::DetachBackend(bool allowBoundResourceTables)
+{
+	if (!IsOwnerThread() || IsAcceptingCleanup() ||
+		(!allowBoundResourceTables && BoundResourceTables() != 0))
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
@@ -114,7 +171,38 @@ RenderResult NativeW3DRenderState::DetachBackend()
 	{
 		m_generation = 1;
 	}
+	++m_backendEpoch;
+	if (m_backendEpoch == 0)
+	{
+		m_backendEpoch = 1;
+	}
+	++m_bufferEpoch;
+	if (m_bufferEpoch == 0)
+	{
+		m_bufferEpoch = 1;
+	}
+	// Publish terminal detachment only after every owner-thread backend field and
+	// epoch has reached its final value.
+	WriteAtomic(&m_backendTerminal, 1);
 	return RENDER_RESULT_OK;
+}
+
+RenderResult NativeW3DRenderState::RegisterResourceTable()
+{
+	if (!IsOperational())
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	IncrementReference(&m_boundResourceTables);
+	return RENDER_RESULT_OK;
+}
+
+void NativeW3DRenderState::UnregisterResourceTable()
+{
+	if (ReadAtomic(&m_boundResourceTables) > 0)
+	{
+		DecrementReference(&m_boundResourceTables);
+	}
 }
 
 RenderResult NativeW3DRenderState::BeginShutdown()
@@ -126,6 +214,14 @@ RenderResult NativeW3DRenderState::EnqueueCleanup(NativeW3DOwnerCommand command,
 	NativeW3DOwnerToken *token)
 {
 	return m_cleanup.Enqueue(command, token);
+}
+
+RenderResult NativeW3DRenderState::EnqueueFallbackCleanup(
+	NativeW3DOwnerCommand command, void *context,
+	NativeW3DOwnerContextRelease release,
+	NativeW3DOwnerFallbackEntry *entry)
+{
+	return m_cleanup.EnqueueFallback(command, context, release, entry);
 }
 
 RenderResult NativeW3DRenderState::DrainCleanup(unsigned int maxCommands,
@@ -149,6 +245,22 @@ unsigned int NativeW3DRenderState::PendingCleanup() const
 	return m_cleanup.Size();
 }
 
+unsigned int NativeW3DRenderState::BoundResourceTables() const
+{
+	const long count = ReadAtomic(&m_boundResourceTables);
+	return count > 0 ? static_cast<unsigned int>(count) : 0;
+}
+
+void NativeW3DRenderState::MarkBackendTerminal()
+{
+	WriteAtomic(&m_backendTerminal, 1);
+}
+
+bool NativeW3DRenderState::IsBackendTerminal() const
+{
+	return ReadAtomic(&m_backendTerminal) != 0;
+}
+
 bool NativeW3DRenderState::IsOperational() const
 {
 	return IsOwnerThread() && IsAcceptingCleanup() && m_device != 0 &&
@@ -158,6 +270,16 @@ bool NativeW3DRenderState::IsOperational() const
 unsigned int NativeW3DRenderState::Generation() const
 {
 	return IsOwnerThread() ? m_generation : 0;
+}
+
+unsigned int NativeW3DRenderState::BackendEpoch() const
+{
+	return IsOwnerThread() ? m_backendEpoch : 0;
+}
+
+unsigned int NativeW3DRenderState::BufferEpoch() const
+{
+	return IsOwnerThread() ? m_bufferEpoch : 0;
 }
 
 IRenderDevice *NativeW3DRenderState::Device() const

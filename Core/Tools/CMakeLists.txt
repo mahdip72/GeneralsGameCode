@@ -6,25 +6,34 @@ if(RTS_BUILD_CORE_TOOLS)
     add_subdirectory(ParticleEditor)
 endif()
 
-# Build the installed-runtime compatibility probe for native products as well
-# as the broader core-extras test lane.
-if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD AND
-    TARGET d3d8to9 AND (RTS_BUILD_PRODUCT OR RTS_BUILD_CORE_EXTRAS))
-    add_subdirectory(NativeD3D8CompatibilityTest)
-endif()
-
 # Build less useful tool/test binaries.
 if(RTS_BUILD_CORE_EXTRAS)
+    add_subdirectory(TestSupport)
+    if(WIN32 AND NOT IS_VS6_BUILD)
+        add_subdirectory(LauncherProcessContractTest)
+    endif()
     if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD)
         add_subdirectory(NativeRendererGraphTest)
         add_subdirectory(NativeW3DOwnerQueueTest)
         add_subdirectory(NativeW3DRenderStateTest)
         add_subdirectory(NativeW3DRendererTest)
         add_subdirectory(NativeW3DResourcesTest)
+		add_subdirectory(NativeW3DBufferOwnerTest)
+		add_subdirectory(NativeW3DSampledTextureTest)
+        add_subdirectory(NativeW3DTextureOwnerTest)
         add_subdirectory(NativeW3D2Test)
+        add_subdirectory(NativeGameRenderClientLifecycleTest)
+        add_subdirectory(NativeTitleCameraAdapterTest)
+        add_subdirectory(NativeSortingRendererTest)
+        add_subdirectory(NativeW3DLineTest)
+        add_subdirectory(NativeProductDeviceLifecycleTest)
         add_subdirectory(X64PortabilityTest)
         add_subdirectory(FrameTimingDiagnosticsTest)
+        add_subdirectory(KernelPerformanceDiagnosticsTest)
+        add_subdirectory(KernelPerformanceReferenceTest)
         add_subdirectory(ReplayFieldReaderTest)
+        add_subdirectory(Stage5PerformanceFixtureTest)
+        add_subdirectory(HardAI2v6CommandLineRecorderTest)
         add_subdirectory(ThreadHandleContractTest)
         add_subdirectory(RegistryHandleContractTest)
         add_subdirectory(RegistryViewContractTest)
@@ -37,8 +46,8 @@ if(RTS_BUILD_CORE_EXTRAS)
         add_subdirectory(NativeAudioManagerContractTest)
         add_subdirectory(NativeAudioAssetCatalogTest)
         add_subdirectory(NativeXAudioManagerContractTest)
-        add_subdirectory(LauncherProcessContractTest)
-        if(MSVC)
+        if(MSVC AND RTS_BUILD_PRODUCT AND
+                (RTS_BUILD_GENERALS OR RTS_BUILD_ZEROHOUR))
             add_test(NAME core_native_product_runtime_packaging_tests
                 COMMAND powershell -NoProfile -ExecutionPolicy Bypass
                     -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeProductRuntimeAudit/NativeProductRuntimePackaging.Tests.ps1"
@@ -181,10 +190,39 @@ if(RTS_BUILD_CORE_EXTRAS)
                     -SourceRoot "${CMAKE_SOURCE_DIR}"
             )
             set_tests_properties(core_ffmpeg_movie_playback_audit PROPERTIES TIMEOUT 30)
+            add_test(NAME core_ffmpeg_movie_playback_audit_self_test
+                COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                    -File "${CMAKE_CURRENT_SOURCE_DIR}/FFmpegMoviePlaybackAudit/FFmpegMoviePlaybackAudit.ps1"
+                    -SelfTest
+            )
+            set_tests_properties(core_ffmpeg_movie_playback_audit_self_test PROPERTIES TIMEOUT 30)
         endif()
     endif()
     add_subdirectory(JobSystemTest)
+    if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT IS_VS6_BUILD)
+        add_subdirectory(PerformanceReceiptTest)
+    endif()
     add_subdirectory(PipelineExecutionPolicyTest)
+    add_subdirectory(DeterministicSimulationTest)
+	add_subdirectory(MixedWorkerMultiplayerTest)
+	add_subdirectory(ObjectComputationIslandTest)
+	add_subdirectory(SimulationPhaseGraphTest)
+	add_subdirectory(SimulationPhaseGraphOwnerAdapterTest)
+    add_subdirectory(DeterministicCrcStreamTest)
+    add_subdirectory(DeterministicCrcRuntimeAdapterTest)
+    add_subdirectory(DeterministicCrcSnapshotTest)
+    add_subdirectory(DeterministicCrcJobSystemAdapterTest)
+    add_subdirectory(ObjectStatusTimerKernelTest)
+    add_subdirectory(CollisionCandidateKernelTest)
+    add_subdirectory(PhysicsIntegrationKernelTest)
+    if(NOT IS_VS6_BUILD)
+        add_subdirectory(ImmutableSpatialQueryTest)
+    endif()
+    add_subdirectory(DeterministicSimulationValidation)
+    if(NOT IS_VS6_BUILD)
+        add_subdirectory(DeterministicAIPlanningTest)
+        add_subdirectory(DeterministicPathSearchTest)
+    endif()
     add_subdirectory(ParallelVisibilityTest)
     add_subdirectory(ParallelSkinningTest)
     add_subdirectory(EffectPrepareTest)
@@ -203,7 +241,9 @@ if(RTS_BUILD_CORE_EXTRAS)
         add_subdirectory(ResourceIoPipelineTest)
         add_subdirectory(ModelAssetBytesTest)
         add_subdirectory(RuntimeEpochContractTest)
-        add_subdirectory(NetworkWireContractTest)
+        if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+            add_subdirectory(NetworkWireContractTest)
+        endif()
         add_subdirectory(FileTransferTimeoutTest)
         add_subdirectory(PersistPointerTokenTest)
         add_subdirectory(ChunkIOValueReadTest)
@@ -343,19 +383,25 @@ if(RTS_BUILD_CORE_EXTRAS)
         add_subdirectory(MilesAudioCompletionTest)
     endif()
     add_subdirectory(ScreenshotCodecTest)
-    add_subdirectory(TextureMipBufferTest)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+        add_subdirectory(TextureMipBufferTest)
+    endif()
     add_subdirectory(TextureMipGeneratorTest)
     add_subdirectory(SurfaceBlitTest)
     add_subdirectory(CameraAudioPolicyTest)
     add_subdirectory(MovieFinalFrameTest)
     add_subdirectory(RendererContractTest)
+    add_subdirectory(RenderGameClientCommandSinkTest)
+    add_subdirectory(LegacyColorPackingTest)
     add_subdirectory(MouseCursorModeTest)
     add_subdirectory(RenderSubmissionPolicyTest)
     add_subdirectory(ShroudDestinationUpdateTest)
     add_subdirectory(VisualParityAnalyzer)
     add_subdirectory(FVFStrideTest)
     add_subdirectory(LegacyPixelShaderBytecodeTest)
-    add_subdirectory(LegacyD3DMathTest)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+        add_subdirectory(LegacyD3DMathTest)
+    endif()
     add_subdirectory(LegacyTextureOperationTest)
     add_subdirectory(LegacyTextureCreationTest)
     if(CMAKE_SIZEOF_VOID_P EQUAL 4)
@@ -377,6 +423,54 @@ if(RTS_BUILD_CORE_EXTRAS)
 endif()
 
 if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    add_test(NAME core_native_game_render_client_lifecycle_audit
+        COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeGameRenderClientLifecycleAudit/NativeGameRenderClientLifecycleAudit.ps1"
+            -SourceRoot "${CMAKE_SOURCE_DIR}"
+    )
+    set_tests_properties(core_native_game_render_client_lifecycle_audit PROPERTIES TIMEOUT 30)
+    add_test(NAME core_native_renderer_graph_audit_self_test
+        COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeRendererGraphAudit/NativeRendererGraphAudit.ps1"
+            -SelfTest
+    )
+    set_tests_properties(core_native_renderer_graph_audit_self_test PROPERTIES TIMEOUT 30)
+    if(NOT IS_VS6_BUILD AND RTS_BUILD_PRODUCT AND
+            (RTS_BUILD_GENERALS OR RTS_BUILD_ZEROHOUR))
+        set(_native_renderer_graph_audit_product_targets)
+        set(_native_renderer_graph_audit_migration_targets)
+        if(RTS_BUILD_GENERALS)
+            list(APPEND _native_renderer_graph_audit_product_targets g_generals)
+            list(APPEND _native_renderer_graph_audit_migration_targets
+                g_ww3d2 g_gameenginedevice)
+        endif()
+        if(RTS_BUILD_ZEROHOUR)
+            list(APPEND _native_renderer_graph_audit_product_targets z_generals)
+            list(APPEND _native_renderer_graph_audit_migration_targets
+                z_ww3d2 z_gameenginedevice)
+        endif()
+        set(_native_renderer_graph_audit_configuration "Release")
+        if(CMAKE_CONFIGURATION_TYPES)
+            set(_native_renderer_graph_audit_configuration "$<CONFIG>")
+        elseif(CMAKE_BUILD_TYPE)
+            set(_native_renderer_graph_audit_configuration "${CMAKE_BUILD_TYPE}")
+        endif()
+        add_test(NAME core_native_renderer_graph_audit
+            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/NativeRendererGraphAudit/NativeRendererGraphAudit.ps1"
+                -SourceRoot "${CMAKE_SOURCE_DIR}"
+                -BuildRoot "${CMAKE_BINARY_DIR}"
+                -Configuration "${_native_renderer_graph_audit_configuration}"
+                -Targets core_renderer,core_ww3d2_native
+                -MigrationTargets "${_native_renderer_graph_audit_migration_targets}"
+                -ProductTargets "${_native_renderer_graph_audit_product_targets}"
+                -AuthorityOnly
+        )
+        set_tests_properties(core_native_renderer_graph_audit PROPERTIES TIMEOUT 120)
+        unset(_native_renderer_graph_audit_configuration)
+        unset(_native_renderer_graph_audit_migration_targets)
+        unset(_native_renderer_graph_audit_product_targets)
+    endif()
     add_test(NAME core_network_session_token_audit
         COMMAND powershell -NoProfile -ExecutionPolicy Bypass
             -File "${CMAKE_CURRENT_SOURCE_DIR}/NetworkSessionTokenAudit/NetworkSessionTokenAudit.ps1"

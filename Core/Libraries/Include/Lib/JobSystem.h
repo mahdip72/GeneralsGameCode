@@ -18,6 +18,8 @@ typedef unsigned __int64 JobMetricCounter;
 typedef unsigned long long JobMetricCounter;
 #endif
 
+const unsigned JOB_SYSTEM_PERFORMANCE_SCHEMA_VERSION = 1;
+
 enum JobPriority
 {
 	JOB_PRIORITY_FRAME_CRITICAL = 0,
@@ -91,18 +93,33 @@ struct JobSystemMetrics
 	JobMetricCounter maximumQueueLatencyNanoseconds;
 	JobMetricCounter workerSleepCount;
 	JobMetricCounter workerWakeCount;
+	JobMetricCounter workerBusyNanoseconds;
+	JobMetricCounter maximumWorkerBusyNanoseconds;
+	JobMetricCounter workerBusySampleCount;
+	JobMetricCounter workerWaitNanoseconds;
+	JobMetricCounter maximumWorkerWaitNanoseconds;
+	JobMetricCounter workerWaitSampleCount;
 	JobMetricCounter affinityFailureCount;
 	unsigned injectionHighWater;
 	unsigned maximumActiveWorkers;
 	unsigned availableLogicalCpuCount;
 	unsigned reservedOwnerCpuCount;
 	unsigned selectedWorkerCpuCount;
+	unsigned selectedWorkerPhysicalCoreCount;
+	JobMetricCounter selectedWorkerPhysicalCoreMask;
+	bool selectedWorkerPhysicalCoreMaskComplete;
 };
+
+const unsigned JOB_INVALID_PHYSICAL_WORKER_INDEX = ~0u;
 
 class JobContext
 {
 public:
 	bool isCancellationRequested() const;
+	// Execution-scoped scheduler identity. Owner help and the synchronous
+	// legacy runtime deliberately have no physical-worker index.
+	bool isPhysicalWorkerExecution() const;
+	unsigned physicalWorkerIndex() const;
 	void fail();
 	void *allocateScratch(unsigned byteCount, unsigned alignment);
 
@@ -213,6 +230,12 @@ public:
 		unsigned cpuSetCount, JobWorkerPolicy policy,
 		unsigned explicitWorkerCount, unsigned *selectedIds,
 		unsigned selectedIdCapacity);
+	// Returns distinct physical cores represented by selected logical CPUs. The
+	// mask uses stable topology-order ordinals and is intentionally diagnostic.
+	static unsigned summarizeSelectedPhysicalCores(const JobCpuSetInfo *cpuSets,
+		unsigned cpuSetCount, const unsigned *selectedIds,
+		unsigned selectedIdCount, JobMetricCounter *selectedCoreMask,
+		bool *selectedCoreMaskComplete);
 	static bool setStartupWorkerCount(unsigned workerCount);
 	static bool setStartupWorkerPolicy(const char *policy);
 	static JobSystemConfig startupConfig();
@@ -232,7 +255,19 @@ public:
 	unsigned workerCount() const;
 	unsigned outstandingJobCount() const;
 	JobSystemMetrics metrics() const;
+	// Snapshot the immutable Windows CPU-set topology selected during start.
+	// These accessors remain valid after shutdown so an executable-owned receipt
+	// can be written at the exact completion boundary.
+	unsigned cpuSetCount() const;
+	bool cpuSetAt(unsigned index, JobCpuSetInfo &result) const;
+	unsigned selectedWorkerCpuSetCount() const;
+	bool selectedWorkerCpuSetIdAt(unsigned index, unsigned &result) const;
+	unsigned ownerCpuSetCount() const;
+	bool ownerCpuSetIdAt(unsigned index, unsigned &result) const;
 	void resetMetrics();
+	// Resets only wall-clock scheduler telemetry. Intervals crossing the reset
+	// boundary are discarded so a new match cannot inherit pre-match idle time.
+	void resetPerformanceMetrics();
 	void recordSerialFallback();
 
 	JobGroup createGroup();
@@ -254,6 +289,10 @@ public:
 	bool tryPromote(Job *job, JobPriority priority);
 	bool wait(const JobHandle &handle);
 	bool wait(const JobGroup &group);
+	// Bounded completion fence for owner-controlled fallback. This never helps
+	// execute queued work; callers must cancel and use normal wait after timeout.
+	bool waitWithoutOwnerHelp(const JobGroup &group,
+		unsigned timeoutMilliseconds);
 	bool cancel(const JobGroup &group);
 	unsigned pumpOwnerCompletions(unsigned maximumCount);
 	unsigned pendingOwnerCompletionCount() const;

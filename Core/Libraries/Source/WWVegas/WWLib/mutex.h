@@ -180,7 +180,11 @@ public:
         ;
 #else
         while (cs.Flag.test_and_set(std::memory_order_acq_rel)) {
+#if defined(__cpp_lib_atomic_wait) && __cpp_lib_atomic_wait >= 201907L
             cs.Flag.wait(true, std::memory_order_relaxed);
+#else
+            ThreadClass::Switch_Thread();
+#endif
         }
 #endif
     }
@@ -190,7 +194,9 @@ public:
       cs.Flag=0;
 #else
       cs.Flag.clear(std::memory_order_release);
+#if defined(__cpp_lib_atomic_wait) && __cpp_lib_atomic_wait >= 201907L
       cs.Flag.notify_one();
+#endif
 #endif
     }
 

@@ -36,7 +36,7 @@
 #include "GameClient/View.h"
 #include "WW3D2/camera.h"
 #include "WW3D2/light.h"
-#include "WW3D2/dx8wrapper.h"
+#include "WW3D2/nativew3dbuffercompat.h"
 #include "WW3D2/dx8vertexbuffer.h"
 #include "WW3D2/dx8indexbuffer.h"
 #include "WW3D2/hlod.h"
@@ -44,7 +44,6 @@
 #include "WW3D2/meshmdl.h"
 #include "WW3D2/assetmgr.h"
 #include "WW3D2/texproject.h"
-#include "WW3D2/dx8renderer.h"
 #include "Lib/BaseType.h"
 #include "W3DDevice/GameClient/HeightMap.h"
 #include "Common/GlobalData.h"
@@ -60,6 +59,8 @@
 #include "W3DDevice/Common/RadarTerrainPrepare.h"
 #include "Lib/ProjectedTerrainGridKernel.h"
 #include "Lib/PipelineExecutionPolicy.h"
+#include "Renderer/RenderGameClient.h"
+#include "Renderer/RenderTexturePublication.h"
 
 #include <string.h>
 #include "W3DDevice/Common/RadarTerrainPrepare.h"
@@ -89,10 +90,11 @@ W3DProjectedShadowManager *TheW3DProjectedShadowManager=nullptr;	//global single
 ProjectedShadowManager	*TheProjectedShadowManager;				//global singleton with simpler interface.
 extern const FrustumClass *shadowCameraFrustum;	//defined in W3DShadow.
 ///@todo: Externs from volumetric shadow renderer - these need to be moved into W3DBufferManager
-// These are bridge-facing aliases. The owning DX8 wrapper objects live in
-// W3DVolumetricShadow.cpp so a reset can release each resource exactly once.
-extern LPDIRECT3DVERTEXBUFFER8 shadowVertexBufferD3D;		///<D3D vertex buffer
-extern LPDIRECT3DINDEXBUFFER8	shadowIndexBufferD3D;	///<D3D index buffer
+// The volumetric-shadow owner publishes the shared streaming buffers.  Keep
+// the product-facing declaration at the resource-owner level so neither
+// projected shadow code nor the native renderer needs a raw API handle.
+extern DX8VertexBufferClass *shadowVertexBufferOwner;
+extern DX8IndexBufferClass *shadowIndexBufferOwner;
 extern int nShadowVertsInBuf;	//model vetices in vertex buffer
 extern int nShadowStartBatchVertex;
 extern int nShadowIndicesInBuf;	//model vetices in vertex buffer
@@ -101,17 +103,15 @@ extern int SHADOW_VERTEX_SIZE;
 extern int SHADOW_INDEX_SIZE;
 
 //Global streaming vertex buffer with x,y,z,u,v type.
-struct SHADOW_DECAL_VERTEX	//vertex structure passed to D3D
+struct SHADOW_DECAL_VERTEX	//vertex structure submitted to the renderer
 {
 		float x,y,z;
 		DWORD diffuse;
 		float u,v;
 };
 
-#define SHADOW_DECAL_FVF	D3DFVF_XYZ|D3DFVF_TEX1|D3DFVF_DIFFUSE
+#define SHADOW_DECAL_FVF	rts::render::GAME_VERTEX_XYZDUV1
 
-LPDIRECT3DVERTEXBUFFER8 shadowDecalVertexBufferD3D=nullptr;		///<bridge-facing D3D vertex-buffer handle
-LPDIRECT3DINDEXBUFFER8	shadowDecalIndexBufferD3D=nullptr;	///<bridge-facing D3D index-buffer handle
 DX8VertexBufferClass *shadowDecalVertexBufferOwner=nullptr;
 DX8IndexBufferClass *shadowDecalIndexBufferOwner=nullptr;
 int nShadowDecalVertsInBuf=0;	//model vetices in vertex buffer
@@ -122,9 +122,6 @@ int	nShadowDecalPolysInBatch=0;
 int	nShadowDecalVertsInBatch=0;
 int SHADOW_DECAL_VERTEX_SIZE=32768;
 int SHADOW_DECAL_INDEX_SIZE=65536;
-static SHADOW_DECAL_VERTEX shadowDecalVertexUpload[32768];
-static unsigned short shadowDecalIndexUpload[65536];
-
 
 class W3DShadowTexture;	//forward reference
 class W3DShadowTextureManager;	//forward reference
@@ -397,37 +394,41 @@ Bool W3DProjectedShadowManager::ReAcquireResources()
 	DEBUG_ASSERTCRASH(m_dynamicRenderTarget == nullptr, ("Acquire of existing shadow render target"));
 
 	m_renderTargetHasAlpha=TRUE;
-	if ((m_dynamicRenderTarget=DX8Wrapper::Create_Render_Target (DEFAULT_RENDER_TARGET_WIDTH, DEFAULT_RENDER_TARGET_HEIGHT, WW3D_FORMAT_A8R8G8B8)) == nullptr)
+	if ((m_dynamicRenderTarget=rts::render::CreateGameRenderTarget(
+		DEFAULT_RENDER_TARGET_WIDTH, DEFAULT_RENDER_TARGET_HEIGHT,
+		WW3D_FORMAT_A8R8G8B8)) == nullptr)
 	{
 			m_renderTargetHasAlpha=FALSE;
 
 			//failed to get a render target with alpha.
 			//try again without.
-			m_dynamicRenderTarget=DX8Wrapper::Create_Render_Target (DEFAULT_RENDER_TARGET_WIDTH, DEFAULT_RENDER_TARGET_HEIGHT);
+			m_dynamicRenderTarget=rts::render::CreateGameRenderTarget(
+				DEFAULT_RENDER_TARGET_WIDTH, DEFAULT_RENDER_TARGET_HEIGHT,
+				WW3D_FORMAT_UNKNOWN);
 	}
 
-	if (m_dynamicRenderTarget == nullptr || !DX8Wrapper::Is_Initted())
+	if (m_dynamicRenderTarget == nullptr ||
+		!m_dynamicRenderTarget->Is_Initialized() ||
+		!rts::render::IsGameRendererInitialized())
 	{
 		REF_PTR_RELEASE(m_dynamicRenderTarget);
 		return FALSE;
 	}
 
-	DEBUG_ASSERTCRASH(shadowDecalIndexBufferD3D == nullptr && shadowDecalIndexBufferOwner == nullptr &&
-		shadowDecalVertexBufferD3D == nullptr && shadowDecalVertexBufferOwner == nullptr,
+	DEBUG_ASSERTCRASH(shadowDecalIndexBufferOwner == nullptr &&
+		shadowDecalVertexBufferOwner == nullptr,
 		("ReAcquireResources not released in W3DProjectedShadowManager"));
 
-	// Keep the legacy-facing handles only as aliases to wrapper-owned
-	// resources. The decal index count is one below the historical 65536
+	// The decal index count is one below the historical 65536
 	// allocation because DX8IndexBufferClass stores its count as an unsigned
 	// short; the largest generated decal (103*103*6 indices) remains below it.
 	shadowDecalIndexBufferOwner=NEW_REF(DX8IndexBufferClass,
 		(static_cast<unsigned short>(SHADOW_DECAL_INDEX_SIZE-1),
 		DX8IndexBufferClass::USAGE_DYNAMIC));
 	if (shadowDecalIndexBufferOwner == nullptr ||
-		(shadowDecalIndexBufferD3D=shadowDecalIndexBufferOwner->Get_DX8_Index_Buffer()) == nullptr)
+		!shadowDecalIndexBufferOwner->Is_Valid())
 	{
-		REF_PTR_RELEASE(shadowDecalIndexBufferOwner);
-		shadowDecalIndexBufferD3D=nullptr;
+		ReleaseResources();
 		return FALSE;
 	}
 
@@ -435,12 +436,9 @@ Bool W3DProjectedShadowManager::ReAcquireResources()
 		(SHADOW_DECAL_FVF, static_cast<unsigned short>(SHADOW_DECAL_VERTEX_SIZE),
 		DX8VertexBufferClass::USAGE_DYNAMIC));
 	if (shadowDecalVertexBufferOwner == nullptr ||
-		(shadowDecalVertexBufferD3D=shadowDecalVertexBufferOwner->Get_DX8_Vertex_Buffer()) == nullptr)
+		!shadowDecalVertexBufferOwner->Is_Valid())
 	{
-		REF_PTR_RELEASE(shadowDecalVertexBufferOwner);
-		REF_PTR_RELEASE(shadowDecalIndexBufferOwner);
-		shadowDecalVertexBufferD3D=nullptr;
-		shadowDecalIndexBufferD3D=nullptr;
+		ReleaseResources();
 		return FALSE;
 	}
 
@@ -453,8 +451,6 @@ void W3DProjectedShadowManager::ReleaseResources()
 	REF_PTR_RELEASE(m_dynamicRenderTarget);	//need to create a new render target
 	REF_PTR_RELEASE(shadowDecalIndexBufferOwner);
 	REF_PTR_RELEASE(shadowDecalVertexBufferOwner);
-	shadowDecalIndexBufferD3D=nullptr;
-	shadowDecalVertexBufferD3D=nullptr;
 }
 
 void W3DProjectedShadowManager::invalidateCachedLightPositions()
@@ -505,8 +501,11 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadowParallel(
 		!GetRadarTerrainPrepareService().isInitialized())
 		return result;
 	if (shadow == 0 || TheTerrainRenderObject == 0 ||
-		!DX8Wrapper::Is_Initted() || shadowVertexBufferD3D == 0 ||
-		shadowIndexBufferD3D == 0 || SHADOW_VERTEX_SIZE <= 0 ||
+		!rts::render::IsGameRendererInitialized() ||
+		!rts::render::IsGameRenderTargetOperational() ||
+		shadowVertexBufferOwner == 0 || shadowIndexBufferOwner == 0 ||
+		!shadowVertexBufferOwner->Is_Valid() ||
+		!shadowIndexBufferOwner->Is_Valid() || SHADOW_VERTEX_SIZE <= 0 ||
 		SHADOW_INDEX_SIZE <= 0)
 		return result;
 
@@ -570,32 +569,32 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadowParallel(
 		};
 		SHADOW_VOLUME_VERTEX *pvVertices = 0;
 		UnsignedShort *pvIndices = 0;
-		SHADOW_VOLUME_VERTEX *vertexStart;
 		UnsignedShort *indexStart;
 		static Matrix4x4 mWorld(true);
 		if (nShadowVertsInBuf > (SHADOW_VERTEX_SIZE - numVerts))
 		{
-			if (shadowVertexBufferD3D->Lock(0,
+			if (!shadowVertexBufferOwner->Lock_Buffer(0,
 				numVerts * sizeof(SHADOW_VOLUME_VERTEX),
-				(unsigned char **)&pvVertices, D3DLOCK_DISCARD) != D3D_OK)
+				NATIVE_BUFFER_LOCK_DISCARD,
+				reinterpret_cast<void **>(&pvVertices)))
 				return 0;
 			nShadowVertsInBuf = 0;
 			nShadowStartBatchVertex = 0;
 		}
 		else
 		{
-			if (shadowVertexBufferD3D->Lock(
+			if (!shadowVertexBufferOwner->Lock_Buffer(
 				nShadowVertsInBuf * sizeof(SHADOW_VOLUME_VERTEX),
 				numVerts * sizeof(SHADOW_VOLUME_VERTEX),
-				(unsigned char **)&pvVertices, D3DLOCK_NOOVERWRITE) != D3D_OK)
+				NATIVE_BUFFER_LOCK_NO_OVERWRITE,
+				reinterpret_cast<void **>(&pvVertices)))
 				return 0;
 		}
 		if (pvVertices == 0)
 		{
-			shadowVertexBufferD3D->Unlock();
+			shadowVertexBufferOwner->Unlock_Buffer();
 			return 0;
 		}
-		vertexStart = pvVertices;
 		for (row = 0; row < static_cast<unsigned>(vertsPerColumn); ++row)
 		{
 			for (column = 0; column < static_cast<unsigned>(vertsPerRow);
@@ -610,82 +609,92 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadowParallel(
 				++pvVertices;
 			}
 		}
-		Publish_Render_Buffer_Change(shadowVertexBufferD3D,
-			rts::render::RENDER_BUFFER_VERTEX, vertexStart,
-			static_cast<size_t>(numVerts) * sizeof(SHADOW_VOLUME_VERTEX),
-			static_cast<size_t>(nShadowVertsInBuf) *
-				sizeof(SHADOW_VOLUME_VERTEX),
-			nShadowVertsInBuf == 0 ?
-				rts::render::RENDER_BUFFER_UPDATE_DISCARD :
-				rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE);
-		shadowVertexBufferD3D->Unlock();
+		shadowVertexBufferOwner->Unlock_Buffer();
 
 		if (nShadowIndicesInBuf > (SHADOW_INDEX_SIZE - numIndex))
 		{
-			if (shadowIndexBufferD3D->Lock(0,
+			if (!shadowIndexBufferOwner->Lock_Buffer(0,
 				numIndex * sizeof(UnsignedShort),
-				(unsigned char **)&pvIndices, D3DLOCK_DISCARD) != D3D_OK)
+				NATIVE_BUFFER_LOCK_DISCARD,
+				reinterpret_cast<void **>(&pvIndices)))
 				return 0;
 			nShadowIndicesInBuf = 0;
 			nShadowStartBatchIndex = 0;
 		}
 		else
 		{
-			if (shadowIndexBufferD3D->Lock(
+			if (!shadowIndexBufferOwner->Lock_Buffer(
 				nShadowIndicesInBuf * sizeof(UnsignedShort),
 				numIndex * sizeof(UnsignedShort),
-				(unsigned char **)&pvIndices, D3DLOCK_NOOVERWRITE) != D3D_OK)
+				NATIVE_BUFFER_LOCK_NO_OVERWRITE,
+				reinterpret_cast<void **>(&pvIndices)))
 				return 0;
 		}
 		if (pvIndices == 0)
 		{
-			shadowIndexBufferD3D->Unlock();
+			shadowIndexBufferOwner->Unlock_Buffer();
 			return 0;
 		}
 		indexStart = pvIndices;
 		memcpy(indexStart, s_projectedTerrainGridScratch.indices(),
 			static_cast<size_t>(numIndex) * sizeof(UnsignedShort));
-		Publish_Render_Buffer_Change(shadowIndexBufferD3D,
-			rts::render::RENDER_BUFFER_INDEX, indexStart,
-			static_cast<size_t>(numIndex) * sizeof(UnsignedShort),
-			static_cast<size_t>(nShadowIndicesInBuf) *
-				sizeof(UnsignedShort),
-			nShadowIndicesInBuf == 0 ?
-				rts::render::RENDER_BUFFER_UPDATE_DISCARD :
-				rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE);
-		shadowIndexBufferD3D->Unlock();
+		shadowIndexBufferOwner->Unlock_Buffer();
 
-		DX8Wrapper::Set_DX8_Index_Buffer(shadowIndexBufferD3D,
-			nShadowStartBatchVertex);
-		DX8Wrapper::_Set_DX8_Transform(D3DTS_WORLD,
-			*(_D3DMATRIX *)&mWorld);
-		DX8Wrapper::Set_DX8_Vertex_Buffer(shadowVertexBufferD3D,
-			sizeof(SHADOW_VOLUME_VERTEX), D3DFVF_XYZ);
-		DX8Wrapper::Set_Vertex_Shader(D3DFVF_XYZ);
+		rts::render::SetGameIndexBuffer(shadowIndexBufferOwner,
+			static_cast<unsigned short>(nShadowStartBatchVertex));
+		rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_WORLD,
+			mWorld);
+		rts::render::SetGameVertexBuffer(shadowVertexBufferOwner);
+		rts::render::SetGameVertexShader(rts::render::GAME_VERTEX_XYZ);
 
 		const Int numPolys = (endX - startX) * (endY - startY) * 2;
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHATESTENABLE, TRUE);
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_STENCILENABLE, TRUE);
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_STENCILFUNC, D3DCMP_ALWAYS);
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_STENCILREF, 0x1);
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_STENCILMASK, 0xffffffff);
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_STENCILWRITEMASK, 0xffffffff);
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_STENCILZFAIL, D3DSTENCILOP_KEEP);
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_STENCILFAIL, D3DSTENCILOP_KEEP);
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_STENCILPASS, D3DSTENCILOP_INCR);
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_LIGHTING, FALSE);
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_SRCBLEND, D3DBLEND_DESTCOLOR);
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_DESTBLEND, D3DBLEND_ZERO);
-		if (DX8Wrapper::_Is_Triangle_Draw_Enabled())
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_ALPHA_TEST_ENABLE, 1);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_ENABLE, 1);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_FUNCTION,
+			rts::render::RENDER_COMPARE_ALWAYS);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_REFERENCE, 0x1);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_READ_MASK, 0xffffffffU);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_WRITE_MASK, 0xffffffffU);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_DEPTH_FAIL_OPERATION,
+			rts::render::RENDER_STENCIL_KEEP);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_FAIL_OPERATION,
+			rts::render::RENDER_STENCIL_KEEP);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_PASS_OPERATION,
+			rts::render::RENDER_STENCIL_INCREMENT);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_LIGHTING, 0);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_SOURCE_BLEND,
+			rts::render::RENDER_BLEND_DESTINATION_COLOR);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_DESTINATION_BLEND,
+			rts::render::RENDER_BLEND_ZERO);
+		rts::render::ApplyGameRenderStateChanges();
+		if (rts::render::IsGameRenderTargetOperational())
 		{
 			Debug_Statistics::Record_DX8_Polys_And_Vertices(numPolys, numVerts,
 				ShaderClass::_PresetOpaqueShader);
-			DX8Wrapper::Draw_DX8_Indexed_Primitive(D3DPT_TRIANGLELIST, 0,
-				numVerts, nShadowStartBatchIndex, numPolys);
+			rts::render::DrawGameTriangles(
+				static_cast<unsigned short>(nShadowStartBatchIndex),
+				static_cast<unsigned short>(numPolys), 0,
+				static_cast<unsigned short>(numVerts));
 		}
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHATESTENABLE, FALSE);
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_STENCILENABLE, FALSE);
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_LIGHTING, TRUE);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_ALPHA_TEST_ENABLE, 0);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_ENABLE, 0);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_LIGHTING, 1);
+		rts::render::ApplyGameRenderStateChanges();
 		nShadowVertsInBuf += numVerts;
 		nShadowStartBatchVertex = nShadowVertsInBuf;
 		nShadowIndicesInBuf += numIndex;
@@ -702,7 +711,7 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 		return parallelResult;
 
 	static	Matrix4x4 mWorld(true);	//initialize to identity matrix
-	struct SHADOW_VOLUME_VERTEX	//vertex structure passed to D3D
+	struct SHADOW_VOLUME_VERTEX	//vertex structure submitted to the renderer
 	{
 		float x,y,z;
 	};
@@ -713,7 +722,7 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 	Bool flipForBlend;
 
 
-	#define SHADOW_VOLUME_FVF	D3DFVF_XYZ
+	#define SHADOW_VOLUME_FVF	rts::render::GAME_VERTEX_XYZ
 
 	if (TheTerrainRenderObject)
 	{
@@ -727,7 +736,11 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 		Real mapScaleInv=1.0f/MAP_XY_FACTOR;
 		SHADOW_VOLUME_VERTEX* pvVertices;
 		UnsignedShort *pvIndices;
-		if (!DX8Wrapper::Is_Initted())
+		if (!rts::render::IsGameRendererInitialized() ||
+			!rts::render::IsGameRenderTargetOperational() ||
+			shadowVertexBufferOwner == nullptr || shadowIndexBufferOwner == nullptr ||
+			!shadowVertexBufferOwner->Is_Valid() ||
+			!shadowIndexBufferOwner->Is_Valid())
 			return 0;
 
 		//Get terrain cell index for area with shadow
@@ -752,13 +765,20 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 
 		if (nShadowVertsInBuf > (SHADOW_VERTEX_SIZE-numVerts))	//check if room for model verts
 		{	//flush the buffer by drawing the contents and re-locking again
-			if (shadowVertexBufferD3D->Lock(0,numVerts*sizeof(SHADOW_VOLUME_VERTEX),(unsigned char**)&pvVertices,D3DLOCK_DISCARD) != D3D_OK)
+			if (!shadowVertexBufferOwner->Lock_Buffer(0,
+				numVerts * sizeof(SHADOW_VOLUME_VERTEX),
+				NATIVE_BUFFER_LOCK_DISCARD,
+				reinterpret_cast<void **>(&pvVertices)))
 				return 0;
 			nShadowVertsInBuf=0;
 			nShadowStartBatchVertex=0;
 		}
 		else
-		{	if (shadowVertexBufferD3D->Lock(nShadowVertsInBuf*sizeof(SHADOW_VOLUME_VERTEX),numVerts*sizeof(SHADOW_VOLUME_VERTEX), (unsigned char**)&pvVertices,D3DLOCK_NOOVERWRITE) != D3D_OK)
+		{	if (!shadowVertexBufferOwner->Lock_Buffer(
+				nShadowVertsInBuf * sizeof(SHADOW_VOLUME_VERTEX),
+				numVerts * sizeof(SHADOW_VOLUME_VERTEX),
+				NATIVE_BUFFER_LOCK_NO_OVERWRITE,
+				reinterpret_cast<void **>(&pvVertices)))
 				return 0;
 		}
 
@@ -779,26 +799,24 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 			}
 		}
 
-		Publish_Render_Buffer_Change(shadowVertexBufferD3D,
-			rts::render::RENDER_BUFFER_VERTEX,
-			pvVertices - numVerts,
-			static_cast<size_t>(numVerts) * sizeof(SHADOW_VOLUME_VERTEX),
-			static_cast<size_t>(nShadowVertsInBuf) * sizeof(SHADOW_VOLUME_VERTEX),
-			nShadowVertsInBuf == 0 ? rts::render::RENDER_BUFFER_UPDATE_DISCARD :
-				rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE);
-		shadowVertexBufferD3D->Unlock();
+		shadowVertexBufferOwner->Unlock_Buffer();
 
 		Int numIndex=(endX - startX) * (endY-startY)*6;	//6 indices per terrain cell (2 triangles).
 
 		if (nShadowIndicesInBuf > (SHADOW_INDEX_SIZE-numIndex))	//check if room for model verts
 		{	//flush the buffer by drawing the contents and re-locking again
-			if (shadowIndexBufferD3D->Lock(0,numIndex*sizeof(short),(unsigned char**)&pvIndices,D3DLOCK_DISCARD) != D3D_OK)
+			if (!shadowIndexBufferOwner->Lock_Buffer(0, numIndex*sizeof(short),
+				NATIVE_BUFFER_LOCK_DISCARD,
+				reinterpret_cast<void **>(&pvIndices)))
 				return 0;
 			nShadowIndicesInBuf=0;
 			nShadowStartBatchIndex=0;
 		}
 		else
-		{	if (shadowIndexBufferD3D->Lock(nShadowIndicesInBuf*sizeof(short),numIndex*sizeof(short), (unsigned char**)&pvIndices,D3DLOCK_NOOVERWRITE) != D3D_OK)
+		{	if (!shadowIndexBufferOwner->Lock_Buffer(
+				nShadowIndicesInBuf*sizeof(short), numIndex*sizeof(short),
+				NATIVE_BUFFER_LOCK_NO_OVERWRITE,
+				reinterpret_cast<void **>(&pvIndices)))
 				return 0;
 		}
 
@@ -846,53 +864,68 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 				}
 		}
 
-		Publish_Render_Buffer_Change(shadowIndexBufferD3D,
-			rts::render::RENDER_BUFFER_INDEX,
-			pvIndices - numIndex,
-			static_cast<size_t>(numIndex) * sizeof(short),
-			static_cast<size_t>(nShadowIndicesInBuf) * sizeof(short),
-			nShadowIndicesInBuf == 0 ? rts::render::RENDER_BUFFER_UPDATE_DISCARD :
-				rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE);
-		shadowIndexBufferD3D->Unlock();
+		shadowIndexBufferOwner->Unlock_Buffer();
 
-		DX8Wrapper::Set_DX8_Index_Buffer(shadowIndexBufferD3D,
-			nShadowStartBatchVertex);
+		rts::render::SetGameIndexBuffer(shadowIndexBufferOwner,
+			static_cast<unsigned short>(nShadowStartBatchVertex));
 
-		DX8Wrapper::_Set_DX8_Transform(D3DTS_WORLD, *(_D3DMATRIX *)&mWorld);
+		rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_WORLD,
+			mWorld);
 
-		DX8Wrapper::Set_DX8_Vertex_Buffer(shadowVertexBufferD3D,
-			sizeof(SHADOW_VOLUME_VERTEX), SHADOW_VOLUME_FVF);
-		DX8Wrapper::Set_Vertex_Shader(SHADOW_VOLUME_FVF);
+		rts::render::SetGameVertexBuffer(shadowVertexBufferOwner);
+		rts::render::SetGameVertexShader(SHADOW_VOLUME_FVF);
 
 		Int numPolys = (endX - startX)*(endY - startY)*2;	//2 triangles per cell
 
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHATESTENABLE, TRUE);	//should reject background pixels
-		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILENABLE, TRUE );
-		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILFUNC,     D3DCMP_ALWAYS );
-		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILREF,      0x1 );
-		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILMASK,     0xffffffff );
-		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILWRITEMASK,0xffffffff );
-		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILZFAIL, D3DSTENCILOP_KEEP );
-		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILFAIL,  D3DSTENCILOP_KEEP );
-		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILPASS,  D3DSTENCILOP_INCR );
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_ALPHA_TEST_ENABLE, 1);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_ENABLE, 1);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_FUNCTION,
+			rts::render::RENDER_COMPARE_ALWAYS);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_REFERENCE, 0x1);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_READ_MASK, 0xffffffffU);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_WRITE_MASK, 0xffffffffU);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_DEPTH_FAIL_OPERATION,
+			rts::render::RENDER_STENCIL_KEEP);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_FAIL_OPERATION,
+			rts::render::RENDER_STENCIL_KEEP);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_PASS_OPERATION,
+			rts::render::RENDER_STENCIL_INCREMENT);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_LIGHTING, 0);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_SOURCE_BLEND,
+			rts::render::RENDER_BLEND_DESTINATION_COLOR);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_DESTINATION_BLEND,
+			rts::render::RENDER_BLEND_ZERO);
+		rts::render::ApplyGameRenderStateChanges();
 
-//    m_pDev->SetRenderState( D3DRS_ALPHABLENDENABLE, FALSE );	//useful to see bounds
-		DX8Wrapper::Set_DX8_Render_State( D3DRS_LIGHTING, FALSE);
-		DX8Wrapper::Set_DX8_Render_State( D3DRS_SRCBLEND,  D3DBLEND_DESTCOLOR);
-		DX8Wrapper::Set_DX8_Render_State( D3DRS_DESTBLEND, D3DBLEND_ZERO );
 
-
-		if (DX8Wrapper::_Is_Triangle_Draw_Enabled())
+		if (rts::render::IsGameRenderTargetOperational())
 		{
 			Debug_Statistics::Record_DX8_Polys_And_Vertices(numPolys,numVerts,ShaderClass::_PresetOpaqueShader);
-			DX8Wrapper::Draw_DX8_Indexed_Primitive(D3DPT_TRIANGLELIST, 0,
-				numVerts, nShadowStartBatchIndex, numPolys);
+			rts::render::DrawGameTriangles(
+				static_cast<unsigned short>(nShadowStartBatchIndex),
+				static_cast<unsigned short>(numPolys), 0,
+				static_cast<unsigned short>(numVerts));
 		}
 
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHATESTENABLE, FALSE);	//should reject background pixels
-		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILENABLE, FALSE );
-//    m_pDev->SetRenderState( D3DRS_ALPHABLENDENABLE, TRUE );
-		DX8Wrapper::Set_DX8_Render_State( D3DRS_LIGHTING, TRUE);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_ALPHA_TEST_ENABLE, 0);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_STENCIL_ENABLE, 0);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_LIGHTING, 1);
+		rts::render::ApplyGameRenderStateChanges();
 
 		nShadowVertsInBuf += numVerts;
 		nShadowStartBatchVertex=nShadowVertsInBuf;
@@ -904,149 +937,6 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 	return 0;
 }
 
-#if 0
-
-TextureClass *snow=nullptr;
-TextureClass *grass=nullptr;
-TextureClass *ground=nullptr;
-
-#define V_COUNT  (4*4)	//4 vertices per cell
-#define I_COUNT  (4*6)	//6 indices per cell
-#define TILE_HEIGHT	10.1f
-#define TILE_DIFFUSE 0x00b4b0a5
-
-enum BlendDirection CPP_11(: Int)
-{	B_A,	//visible on all sides
-	B_R,	//visible on right
-	B_L,	//visible on left
-	B_T,	//visible on top
-	B_B,	//visble on bottom
-	B_TL,	//visible on top/left
-	B_BR,	//visible on bottom/right
-	B_TR,	//visible on top/right
-	B_BL	//visilbe on bottom/left
-};
-
-//Vertex alpha values for each blend direction assuming tile vertices
-//start at top left corner and continue counter-clockwise
-DWORD BDToVA[9][4]=
-{
-	{0xff000000,0xff000000,0xff000000,0xff000000},
-	{0,0,0xff000000,0xff000000},
-	{0xff000000,0xff000000,0,0},
-	{0xff000000,0,0,0xff000000},
-	{0,0xff000000,0xff000000,0},
-	{0xff000000,0,0,0},
-	{0,0,0xff000000,0},
-	{0,0,0,0xff000000},
-	{0,0xff000000,0,0}
-};
-
-static void RenderVBTile(TextureClass *text, Real ox, Real oy, Real ou, Real ov, BlendDirection bd=B_A)
-{
-	DynamicVBAccessClass vb_access(BUFFER_TYPE_DYNAMIC_DX8,DX8_FVF_XYZNDUV2,4);
-	DynamicIBAccessClass ib_access(BUFFER_TYPE_DYNAMIC_DX8,6);
-
-	DynamicVBAccessClass::WriteLockClass lock(&vb_access);
-	VertexFormatXYZNDUV2* vb= lock.Get_Formatted_Vertex_Array();
-	DynamicIBAccessClass::WriteLockClass lockib(&ib_access);
-	if (!vb) return;
-
-	UnsignedShort *ib=lockib.Get_Index_Array();
-
-	vb->x=ox;
-	vb->y=oy;
-	vb->z=TILE_HEIGHT;
-	vb->diffuse=TILE_DIFFUSE|BDToVA[bd][0];
-	vb->u1=ou;
-	vb->v1=ov;
-	vb++;
-
-	vb->x=ox;
-	vb->y=oy-10.0f;
-	vb->z=TILE_HEIGHT;
-	vb->diffuse=TILE_DIFFUSE|BDToVA[bd][1];
-	vb->u1=ou;
-	vb->v1=ov+0.25f;
-	vb++;
-
-	vb->x=ox+10.0f;
-	vb->y=oy-10.0f;
-	vb->z=TILE_HEIGHT;
-	vb->diffuse=TILE_DIFFUSE|BDToVA[bd][2];
-	vb->u1=ou+0.25f;
-	vb->v1=ov+0.25f;
-	vb++;
-
-	vb->x=ox+10.0f;
-	vb->y=oy;
-	vb->z=TILE_HEIGHT;
-	vb->diffuse=TILE_DIFFUSE|BDToVA[bd][3];
-	vb->u1=ou+0.25f;
-	vb->v1=ov;
-	vb++;
-
-	ib[0]=0;
-	ib[1]=1;
-	ib[2]=3;
-	ib[3]=3;
-	ib[4]=1;
-	ib[5]=2;
-
-	if (bd == B_TR || bd == B_BL)
-	{	//need to flip triangles so alpha gradient doesn't follow diagonal edge
-		ib[2]=2;
-		ib[4]=0;
-	}
-
-	DX8Wrapper::Set_Index_Buffer(ib_access,0);
-	DX8Wrapper::Set_Vertex_Buffer(vb_access);
-	DX8Wrapper::Set_Texture(0, text);
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_SRCBLEND,  D3DBLEND_SRCALPHA );
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA  );
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE, TRUE );
-	ShaderClass::Invalidate();	//invalidate to force shader to reset since we directly changed states
-	DX8Wrapper::Draw_Triangles(	0,2, 0,	4);	//draw a quad, 2 triangles, 4 verts
-}
-
-//Debug code used to draw some dummy polygons.
-void TestBlendRender(RenderInfoClass & rinfo)
-{
-	static Int doInit=1;
-
-	if (doInit)
-	{	doInit = 0;
-		snow = WW3DAssetManager::Get_Instance()->Get_Texture("TXSnow04a.tga");
-		grass = WW3DAssetManager::Get_Instance()->Get_Texture("TMGras23a.tga");
-		ground = WW3DAssetManager::Get_Instance()->Get_Texture("TXAsph01a.tga");
-	}
-
-	VertexMaterialClass *vmat=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
-	DX8Wrapper::Set_Material(vmat);
-	REF_PTR_RELEASE(vmat);
-	DX8Wrapper::Set_Shader(ShaderClass::_PresetOpaqueShader);
-
-	Matrix3D tm(1);	//identity
-	DX8Wrapper::Set_Transform(D3DTS_WORLD,tm);
-
-	//grass
-	RenderVBTile(grass,580.0f,480.0f,0.0f,0.0f);	RenderVBTile(grass,590.0f,480.0f,0.25f,0.0f);
-	RenderVBTile(grass,580.0f,470.0f,0.0f,0.25f);	RenderVBTile(grass,590.0f,470.0f,0.25f,0.25f);
-	RenderVBTile(grass,580.0f,460.0f,0.0f,0.5f);	RenderVBTile(grass,590.0f,460.0f,0.25f,0.5f,B_L);
-	RenderVBTile(grass,580.0f,450.0f,0.0f,0.75f);	RenderVBTile(grass,590.0f,450.0f,0.25f,0.75f,B_L);
-	RenderVBTile(grass,580.0f,440.0f,0.0f,0.0f);	RenderVBTile(grass,590.0f,440.0f,0.25f,0.0f,B_L);
-
-	RenderVBTile(grass,610.0f,460.0f,0.0f,0.5f, B_B);
-	RenderVBTile(grass,610.0f,450.0f,0.0f,0.75f);
-	RenderVBTile(grass,610.0f,440.0f,0.0f,0.0f);
-
-
-	//snow
-	RenderVBTile(snow,590.0f,480.0f,0.0f,0.0f, B_R);	RenderVBTile(snow,600.0f,480.0f,0.25f,0.0f);	RenderVBTile(snow,610.0f,480.0f,0.5f,0.0f);
-	RenderVBTile(snow,590.0f,470.0f,0.0f,0.25f, B_R);	RenderVBTile(snow,600.0f,470.0f,0.25f,0.25f);	RenderVBTile(snow,610.0f,470.0f,0.5f,0.25f);
-	RenderVBTile(snow,590.0f,460.0f,0.0f,0.5f, B_TR);	RenderVBTile(snow,600.0f,460.0f,0.25f,0.5f,B_T); RenderVBTile(snow,610.0f,460.0f,0.5f,0.5f,B_T);
-}
-#endif
 
 void W3DProjectedShadowManager::flushDecals(W3DShadowTexture *texture, ShadowType type)
 {
@@ -1057,115 +947,48 @@ void W3DProjectedShadowManager::flushDecals(W3DShadowTexture *texture, ShadowTyp
 		return;
 	}
 
-	if (!DX8Wrapper::Is_Initted())
+	if (!rts::render::IsGameRendererInitialized() ||
+		shadowDecalVertexBufferOwner == nullptr ||
+		shadowDecalIndexBufferOwner == nullptr ||
+		!shadowDecalVertexBufferOwner->Is_Valid() ||
+		!shadowDecalIndexBufferOwner->Is_Valid())
 		return;	//no render device to render
 
-	if (DX8Wrapper::Is_D3D11_Backend_Active())
-	{
-		Publish_Render_Buffer_Change(shadowDecalVertexBufferD3D,
-			rts::render::RENDER_BUFFER_VERTEX,
-			shadowDecalVertexUpload + nShadowDecalStartBatchVertex,
-			static_cast<size_t>(nShadowDecalVertsInBatch) * sizeof(SHADOW_DECAL_VERTEX),
-			static_cast<size_t>(nShadowDecalStartBatchVertex) * sizeof(SHADOW_DECAL_VERTEX),
-			nShadowDecalStartBatchVertex == 0 ? rts::render::RENDER_BUFFER_UPDATE_DISCARD :
-				rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE);
-		Publish_Render_Buffer_Change(shadowDecalIndexBufferD3D,
-			rts::render::RENDER_BUFFER_INDEX,
-			shadowDecalIndexUpload + nShadowDecalStartBatchIndex,
-			static_cast<size_t>(nShadowDecalPolysInBatch) * 3 * sizeof(unsigned short),
-			static_cast<size_t>(nShadowDecalStartBatchIndex) * sizeof(unsigned short),
-			nShadowDecalStartBatchIndex == 0 ? rts::render::RENDER_BUFFER_UPDATE_DISCARD :
-				rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE);
-	}
-
 	VertexMaterialClass *vmat=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
-	DX8Wrapper::Set_Material(vmat);
+	rts::render::SetGameMaterial(vmat);
 	REF_PTR_RELEASE(vmat);
-	DX8Wrapper::Set_Texture(0,texture->getTexture());
+	rts::render::SetGameTexture(0,texture->getTexture());
 
-//	DX8Wrapper::Set_Shader(ShaderClass::_PresetOpaqueShader);	//good for debugging, draws without alpha
 	switch (type)
 	{
 		case SHADOW_DECAL:
-			DX8Wrapper::Set_Shader(ShaderClass::_PresetMultiplicativeShader);
+			rts::render::SetGameShader(ShaderClass::_PresetMultiplicativeShader);
 			break;
 		case SHADOW_ALPHA_DECAL:
-			DX8Wrapper::Set_Shader(ShaderClass::_PresetAlphaShader);
+			rts::render::SetGameShader(ShaderClass::_PresetAlphaShader);
 			break;
 		case SHADOW_ADDITIVE_DECAL:
-			DX8Wrapper::Set_Shader(ShaderClass::_PresetAdditiveShader);
+			rts::render::SetGameShader(ShaderClass::_PresetAdditiveShader);
 			break;
 	}
 
-//	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHAREF,0x60);
-//	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHAFUNC,D3DCMP_GREATEREQUAL);
-	//_PresetAlphaSpriteShader
+	rts::render::ApplyGameRenderStateChanges();	//force update of view and projection matrices
 
-	DX8Wrapper::Apply_Render_State_Changes();	//force update of view and projection matrices
+	rts::render::SetGameIndexBuffer(shadowDecalIndexBufferOwner,
+		static_cast<unsigned short>(nShadowDecalStartBatchVertex));
+	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_WORLD, mWorld);
+	rts::render::SetGameVertexBuffer(shadowDecalVertexBufferOwner);
+	rts::render::SetGameVertexShader(SHADOW_DECAL_FVF);
 
-//Alpha Blended Shadows
-//	m_pDev->SetRenderState( D3DRS_SRCBLEND,  D3DBLEND_SRCALPHA );
-//	m_pDev->SetRenderState( D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA  );
-/*	UnsignedInt color=TheW3DShadowManager->getShadowColor();
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_TEXTUREFACTOR, 0xff000000 | color);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_COLORARG2, D3DTA_TFACTOR);
-
-	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_ALPHAARG2, D3DTA_TFACTOR);
-*/
-
-
-	DX8Wrapper::Set_DX8_Index_Buffer(shadowDecalIndexBufferD3D,
-		nShadowDecalStartBatchVertex);
-	DX8Wrapper::_Set_DX8_Transform(D3DTS_WORLD, *(_D3DMATRIX *)&mWorld);
-
-	DX8Wrapper::Set_DX8_Vertex_Buffer(shadowDecalVertexBufferD3D,
-		sizeof(SHADOW_DECAL_VERTEX), SHADOW_DECAL_FVF);
-	DX8Wrapper::Set_Vertex_Shader(SHADOW_DECAL_FVF);
-
-//Hard Shadows using stencil
-/*	m_pDev->SetRenderState( D3DRS_SRCBLEND,  D3DBLEND_ZERO);
-	m_pDev->SetRenderState( D3DRS_DESTBLEND, D3DBLEND_ONE );
-	m_pDev->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);	//should reject background pixels
-	m_pDev->SetRenderState( D3DRS_STENCILENABLE, TRUE );
-*/
-/*	m_pDev->SetRenderState( D3DRS_STENCILFUNC,     D3DCMP_ALWAYS );
-	m_pDev->SetRenderState( D3DRS_STENCILREF,      0x1 );
-	m_pDev->SetRenderState( D3DRS_STENCILMASK,     0xffffffff );
-	m_pDev->SetRenderState( D3DRS_STENCILWRITEMASK,0xffffffff );
-	m_pDev->SetRenderState( D3DRS_STENCILZFAIL, D3DSTENCILOP_KEEP );
-	m_pDev->SetRenderState( D3DRS_STENCILFAIL,  D3DSTENCILOP_KEEP );
-	m_pDev->SetRenderState( D3DRS_STENCILPASS,  D3DSTENCILOP_INCR );
-*/
-//m_pDev->SetRenderState( D3DRS_ALPHABLENDENABLE, FALSE );	//useful to see bounds
-
-	if (DX8Wrapper::_Is_Triangle_Draw_Enabled())
+	if (rts::render::IsGameRenderTargetOperational())
 	{
 		Debug_Statistics::Record_DX8_Polys_And_Vertices(nShadowDecalPolysInBatch,nShadowDecalVertsInBatch,ShaderClass::_PresetOpaqueShader);
-		DX8Wrapper::Draw_DX8_Indexed_Primitive(D3DPT_TRIANGLELIST, 0,
-			nShadowDecalVertsInBatch, nShadowDecalStartBatchIndex,
-			nShadowDecalPolysInBatch);
+		rts::render::DrawGameTriangles(
+			static_cast<unsigned short>(nShadowDecalStartBatchIndex),
+			static_cast<unsigned short>(nShadowDecalPolysInBatch), 0,
+			static_cast<unsigned short>(nShadowDecalVertsInBatch));
 	}
 
-//	m_pDev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);	//should reject background pixels
-//	m_pDev->SetRenderState( D3DRS_STENCILENABLE, FALSE );
-//m_pDev->SetRenderState( D3DRS_ALPHABLENDENABLE, TRUE );
-
-
-	//Restore multiplicative sprite shader
-//	m_pDev->SetRenderState(D3DRS_DESTBLEND,D3DBLEND_SRCCOLOR);	//restore W3D state
-//	m_pDev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ZERO);
-
-/*	m_pDev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
-	m_pDev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-	m_pDev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_CURRENT);
-	m_pDev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
-	m_pDev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
-	m_pDev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_CURRENT);
-*/
 	nShadowDecalStartBatchVertex=nShadowDecalVertsInBuf;
 	nShadowDecalStartBatchIndex=nShadowDecalIndicesInBuf;
 	nShadowDecalPolysInBatch=0;	//reset number of polys in texture batch
@@ -1222,8 +1045,13 @@ Int W3DProjectedShadowManager::queueDecalParallel(W3DProjectedShadow *shadow)
 		!GetRadarTerrainPrepareService().isInitialized())
 		return -1;
 	if (shadow == 0 || TheTerrainRenderObject == 0 ||
-		!DX8Wrapper::Is_Initted() || shadowDecalVertexBufferD3D == 0 ||
-		shadowDecalIndexBufferD3D == 0 || SHADOW_DECAL_VERTEX_SIZE <= 0 ||
+		!rts::render::IsGameRendererInitialized() ||
+		!rts::render::IsGameRenderTargetOperational() ||
+		shadowDecalVertexBufferOwner == nullptr ||
+		shadowDecalIndexBufferOwner == nullptr ||
+		!shadowDecalVertexBufferOwner->Is_Valid() ||
+		!shadowDecalIndexBufferOwner->Is_Valid() ||
+		SHADOW_DECAL_VERTEX_SIZE <= 0 ||
 		SHADOW_DECAL_INDEX_SIZE <= 0)
 		return -1;
 	hmap = TheTerrainRenderObject->getMap();
@@ -1384,43 +1212,37 @@ Int W3DProjectedShadowManager::queueDecalParallel(W3DProjectedShadow *shadow)
 	{
 		SHADOW_DECAL_VERTEX *pvVertices = 0;
 		UnsignedShort *pvIndices = 0;
-		if (shadowDecalVertexBufferD3D->Lock(
+		if (!shadowDecalVertexBufferOwner->Lock_Buffer(
 			nShadowDecalVertsInBuf * sizeof(SHADOW_DECAL_VERTEX),
 			numVerts * sizeof(SHADOW_DECAL_VERTEX),
-			(unsigned char **)&pvVertices, D3DLOCK_NOOVERWRITE) != D3D_OK)
+			NATIVE_BUFFER_LOCK_NO_OVERWRITE,
+			reinterpret_cast<void **>(&pvVertices)))
 			return 0;
 		if (pvVertices == 0)
 		{
-			shadowDecalVertexBufferD3D->Unlock();
+			shadowDecalVertexBufferOwner->Unlock_Buffer();
 			return 0;
 		}
 		memcpy(pvVertices, s_projectedTerrainGridScratch.vertices(),
 			static_cast<size_t>(numVerts) * sizeof(SHADOW_DECAL_VERTEX));
-		if (DX8Wrapper::Is_D3D11_Backend_Active())
-			memcpy(shadowDecalVertexUpload + nShadowDecalVertsInBuf,
-				s_projectedTerrainGridScratch.vertices(),
-				static_cast<size_t>(numVerts) * sizeof(SHADOW_DECAL_VERTEX));
-		shadowDecalVertexBufferD3D->Unlock();
+		shadowDecalVertexBufferOwner->Unlock_Buffer();
 
-		if (shadowDecalIndexBufferD3D->Lock(
+		if (!shadowDecalIndexBufferOwner->Lock_Buffer(
 			nShadowDecalIndicesInBuf * sizeof(UnsignedShort),
 			numIndex * sizeof(UnsignedShort),
-			(unsigned char **)&pvIndices, D3DLOCK_NOOVERWRITE) != D3D_OK)
+			NATIVE_BUFFER_LOCK_NO_OVERWRITE,
+			reinterpret_cast<void **>(&pvIndices)))
 			return 0;
 		if (pvIndices == 0)
 		{
-			shadowDecalIndexBufferD3D->Unlock();
+			shadowDecalIndexBufferOwner->Unlock_Buffer();
 			return 0;
 		}
 		for (index = 0; index < static_cast<unsigned>(numIndex); ++index)
 			pvIndices[index] = static_cast<UnsignedShort>(
 				s_projectedTerrainGridScratch.indices()[index] +
 				nShadowDecalVertsInBatch);
-		if (DX8Wrapper::Is_D3D11_Backend_Active())
-			memcpy(shadowDecalIndexUpload + nShadowDecalIndicesInBuf,
-				pvIndices, static_cast<size_t>(numIndex) *
-					sizeof(UnsignedShort));
-		shadowDecalIndexBufferD3D->Unlock();
+		shadowDecalIndexBufferOwner->Unlock_Buffer();
 
 		nShadowDecalPolysInBatch += static_cast<Int>(cellCount * 2);
 		nShadowDecalVertsInBuf += numVerts;
@@ -1453,7 +1275,12 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 
 	if (TheTerrainRenderObject)
 	{
-		if (!DX8Wrapper::Is_Initted())
+		if (!rts::render::IsGameRendererInitialized() ||
+			!rts::render::IsGameRenderTargetOperational() ||
+			shadowDecalVertexBufferOwner == nullptr ||
+			shadowDecalIndexBufferOwner == nullptr ||
+			!shadowDecalVertexBufferOwner->Is_Valid() ||
+			!shadowDecalIndexBufferOwner->Is_Valid())
 			return;	//no render device to render
 
 		WorldHeightMap *hmap=TheTerrainRenderObject->getMap();
@@ -1638,7 +1465,9 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 		if (nShadowDecalVertsInBuf > (SHADOW_DECAL_VERTEX_SIZE-numVerts))	//check if room for model verts
 		{	//flush the buffer by drawing the contents and re-locking again
 			flushDecals(shadow->m_shadowTexture[0], shadow->m_type);
-			if (shadowDecalVertexBufferD3D->Lock(0,numVerts*sizeof(SHADOW_DECAL_VERTEX),(unsigned char**)&pvVertices,D3DLOCK_DISCARD) != D3D_OK)
+			if (!shadowDecalVertexBufferOwner->Lock_Buffer(0,
+				numVerts*sizeof(SHADOW_DECAL_VERTEX), NATIVE_BUFFER_LOCK_DISCARD,
+				reinterpret_cast<void **>(&pvVertices)))
 				return;
 
 			nShadowDecalStartBatchVertex=0;
@@ -1647,7 +1476,10 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 			nShadowDecalVertsInBuf=0;
 		}
 		else
-		{	if (shadowDecalVertexBufferD3D->Lock(nShadowDecalVertsInBuf*sizeof(SHADOW_DECAL_VERTEX),numVerts*sizeof(SHADOW_DECAL_VERTEX), (unsigned char**)&pvVertices,D3DLOCK_NOOVERWRITE) != D3D_OK)
+		{	if (!shadowDecalVertexBufferOwner->Lock_Buffer(
+				nShadowDecalVertsInBuf*sizeof(SHADOW_DECAL_VERTEX),
+				numVerts*sizeof(SHADOW_DECAL_VERTEX), NATIVE_BUFFER_LOCK_NO_OVERWRITE,
+				reinterpret_cast<void **>(&pvVertices)))
 				return;
 		}
 
@@ -1705,16 +1537,15 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 			}
 		}
 
-		if (DX8Wrapper::Is_D3D11_Backend_Active())
-			memcpy(shadowDecalVertexUpload + nShadowDecalVertsInBuf,
-				pvVertices - numVerts, static_cast<size_t>(numVerts) * sizeof(SHADOW_DECAL_VERTEX));
-		shadowDecalVertexBufferD3D->Unlock();
+		shadowDecalVertexBufferOwner->Unlock_Buffer();
 
 		if (nShadowDecalIndicesInBuf > (SHADOW_DECAL_INDEX_SIZE-numIndex))	//check if room for model verts
 		{	//flush the buffer by drawing the contents and re-locking again
 			flushDecals(shadow->m_shadowTexture[0], shadow->m_type);
 
-			if (shadowDecalIndexBufferD3D->Lock(0,numIndex*sizeof(short),(unsigned char**)&pvIndices,D3DLOCK_DISCARD) != D3D_OK)
+			if (!shadowDecalIndexBufferOwner->Lock_Buffer(0,
+				numIndex*sizeof(short), NATIVE_BUFFER_LOCK_DISCARD,
+				reinterpret_cast<void **>(&pvIndices)))
 				return;
 
 			nShadowDecalStartBatchIndex=0;
@@ -1723,7 +1554,10 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 			nShadowDecalIndicesInBuf=0;
 		}
 		else
-		{	if (shadowDecalIndexBufferD3D->Lock(nShadowDecalIndicesInBuf*sizeof(short),numIndex*sizeof(short), (unsigned char**)&pvIndices,D3DLOCK_NOOVERWRITE) != D3D_OK)
+		{	if (!shadowDecalIndexBufferOwner->Lock_Buffer(
+				nShadowDecalIndicesInBuf*sizeof(short), numIndex*sizeof(short),
+				NATIVE_BUFFER_LOCK_NO_OVERWRITE,
+				reinterpret_cast<void **>(&pvIndices)))
 				return;
 		}
 
@@ -1756,10 +1590,7 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 			}
 		}
 
-		if (DX8Wrapper::Is_D3D11_Backend_Active())
-			memcpy(shadowDecalIndexUpload + nShadowDecalIndicesInBuf,
-				pvIndices - numIndex, static_cast<size_t>(numIndex) * sizeof(unsigned short));
-		shadowDecalIndexBufferD3D->Unlock();
+		shadowDecalIndexBufferOwner->Unlock_Buffer();
 
 		Int numPolys = (endX - startX)*(endY - startY)*2;	//2 triangles per cell
 		nShadowDecalPolysInBatch += numPolys;
@@ -1789,7 +1620,12 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 
 	if (TheTerrainRenderObject)
 	{
-		if (!DX8Wrapper::Is_Initted())
+		if (!rts::render::IsGameRendererInitialized() ||
+			!rts::render::IsGameRenderTargetOperational() ||
+			shadowDecalVertexBufferOwner == nullptr ||
+			shadowDecalIndexBufferOwner == nullptr ||
+			!shadowDecalVertexBufferOwner->Is_Valid() ||
+			!shadowDecalIndexBufferOwner->Is_Valid())
 			return;	//no render device to render
 
 		objPos=shadow->m_robj->Get_Position();
@@ -1815,7 +1651,9 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 		if (nShadowDecalVertsInBuf > (SHADOW_DECAL_VERTEX_SIZE-numVerts))	//check if room for model verts
 		{	//flush the buffer by drawing the contents and re-locking again
 			flushDecals(shadow->m_shadowTexture[0], shadow->m_type);
-			if (shadowDecalVertexBufferD3D->Lock(0,numVerts*sizeof(SHADOW_DECAL_VERTEX),(unsigned char**)&pvVertices,D3DLOCK_DISCARD) != D3D_OK)
+			if (!shadowDecalVertexBufferOwner->Lock_Buffer(0,
+				numVerts*sizeof(SHADOW_DECAL_VERTEX), NATIVE_BUFFER_LOCK_DISCARD,
+				reinterpret_cast<void **>(&pvVertices)))
 				return;
 
 			nShadowDecalStartBatchVertex=0;
@@ -1824,7 +1662,10 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 			nShadowDecalVertsInBuf=0;
 		}
 		else
-		{	if (shadowDecalVertexBufferD3D->Lock(nShadowDecalVertsInBuf*sizeof(SHADOW_DECAL_VERTEX),numVerts*sizeof(SHADOW_DECAL_VERTEX), (unsigned char**)&pvVertices,D3DLOCK_NOOVERWRITE) != D3D_OK)
+		{	if (!shadowDecalVertexBufferOwner->Lock_Buffer(
+				nShadowDecalVertsInBuf*sizeof(SHADOW_DECAL_VERTEX),
+				numVerts*sizeof(SHADOW_DECAL_VERTEX), NATIVE_BUFFER_LOCK_NO_OVERWRITE,
+				reinterpret_cast<void **>(&pvVertices)))
 				return;
 		}
 
@@ -1871,16 +1712,15 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 			pvVertices++;
 		}
 
-		if (DX8Wrapper::Is_D3D11_Backend_Active())
-			memcpy(shadowDecalVertexUpload + nShadowDecalVertsInBuf,
-				pvVertices - numVerts, static_cast<size_t>(numVerts) * sizeof(SHADOW_DECAL_VERTEX));
-		shadowDecalVertexBufferD3D->Unlock();
+		shadowDecalVertexBufferOwner->Unlock_Buffer();
 
 		if (nShadowDecalIndicesInBuf > (SHADOW_DECAL_INDEX_SIZE-numIndex))	//check if room for model verts
 		{	//flush the buffer by drawing the contents and re-locking again
 			flushDecals(shadow->m_shadowTexture[0],shadow->m_type);
 
-			if (shadowDecalIndexBufferD3D->Lock(0,numIndex*sizeof(short),(unsigned char**)&pvIndices,D3DLOCK_DISCARD) != D3D_OK)
+			if (!shadowDecalIndexBufferOwner->Lock_Buffer(0,
+				numIndex*sizeof(short), NATIVE_BUFFER_LOCK_DISCARD,
+				reinterpret_cast<void **>(&pvIndices)))
 				return;
 
 			nShadowDecalStartBatchIndex=0;
@@ -1889,7 +1729,10 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 			nShadowDecalIndicesInBuf=0;
 		}
 		else
-		{	if (shadowDecalIndexBufferD3D->Lock(nShadowDecalIndicesInBuf*sizeof(short),numIndex*sizeof(short), (unsigned char**)&pvIndices,D3DLOCK_NOOVERWRITE) != D3D_OK)
+		{	if (!shadowDecalIndexBufferOwner->Lock_Buffer(
+				nShadowDecalIndicesInBuf*sizeof(short), numIndex*sizeof(short),
+				NATIVE_BUFFER_LOCK_NO_OVERWRITE,
+				reinterpret_cast<void **>(&pvIndices)))
 				return;
 		}
 
@@ -1903,10 +1746,7 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 			pvIndices += 6;
 		}
 
-		if (DX8Wrapper::Is_D3D11_Backend_Active())
-			memcpy(shadowDecalIndexUpload + nShadowDecalIndicesInBuf,
-				pvIndices - numIndex, static_cast<size_t>(numIndex) * sizeof(unsigned short));
-		shadowDecalIndexBufferD3D->Unlock();
+		shadowDecalIndexBufferOwner->Unlock_Buffer();
 
 		Int numPolys = 2;	//2 triangles per decal
 		nShadowDecalPolysInBatch += numPolys;
@@ -1955,15 +1795,15 @@ Int W3DProjectedShadowManager::renderShadows(RenderInfoClass & rinfo)
 	static AABoxClass aaBox;
 	static SphereClass sphere;
 
-	//According to Nvidia there's a D3D bug that happens if you don't start with a
-	//new dynamic VB each frame - so we force a DISCARD by overflowing the counter.
+	//Dynamic streams require a discard at each frame boundary, so overflow the
+	//counter before the first decal upload.
 	nShadowDecalVertsInBuf = 0xffff;
 	nShadowDecalIndicesInBuf = 0xffff;
 
 	if (TheGlobalData->m_useShadowDecals)
 	{
 		// Render the object
-		TheDX8MeshRenderer.Set_Camera(&rinfo.Camera);
+		rts::render::SetGameRenderCamera(static_cast<void *>(&rinfo.Camera));
 
 		//keep track of active decal texture so we can render all decals at once.
 		W3DShadowTexture *lastShadowDecalTexture=nullptr;
@@ -2027,7 +1867,7 @@ Int W3DProjectedShadowManager::renderShadows(RenderInfoClass & rinfo)
 
 					//terrain is always visible and affected by all shadows so must render
 					projector->Peek_Material_Pass()->Install_Materials();
-					DX8Wrapper::Apply_Render_State_Changes();	//force update of view and projection matrices
+					rts::render::ApplyGameRenderStateChanges();	//force update of view and projection matrices
 					if (renderProjectedTerrainShadow(shadow, aaBox))
 						projectionCount++;
 					projector->Peek_Material_Pass()->UnInstall_Materials();
@@ -2075,7 +1915,7 @@ Int W3DProjectedShadowManager::renderShadows(RenderInfoClass & rinfo)
 		}
 
 		flushDecals(lastShadowDecalTexture,lastShadowType);	//make sure there are not any unrendered decals left over.
-		TheDX8MeshRenderer.Flush();	//draw all the shadow receiving objects
+		rts::render::FlushGameRenderMeshes();	//draw all the shadow receiving objects
 	}
 	if (m_decalList)
 	{
@@ -2786,22 +2626,26 @@ void W3DProjectedShadow::updateTexture(Vector3 &lightPos)
 		context->light_environment->Reset(m_robj->Get_Position(), Vector3(0,0,0));
 
 		TextureClass *shadow_texture=m_shadowTexture[0]->getTexture();
-		const bool d3d11_active=DX8Wrapper::Is_D3D11_Backend_Active();
+		const bool native_renderer_active =
+			rts::render::IsNativeGameRendererActive();
+		// Compute_Texture owns the native copy and publication boundary.  A
+		// failed copy returns false and leaves the light history unchanged, so
+		// the next update retries without a second acquire of the same lease.
 		if (!m_shadowProjector->Compute_Texture(m_robj,context,
-				d3d11_active ? shadow_texture : nullptr))
+				native_renderer_active ? shadow_texture : nullptr))
 		{
 			return;
 		}
 
-		if (!d3d11_active)
+		if (!native_renderer_active)
 		{
 			// Copy shadow from the temporary video-memory surface into the
-			// permanent texture. D3D11 performs its GPU copy while the temporary
+			// permanent texture. The native renderer performs its GPU copy while the temporary
 			// target is still active inside Compute_Texture.
 			SurfaceClass *oldSurface=shadow_texture->Get_Surface_Level();
 			SurfaceClass *newSurface=TheW3DProjectedShadowManager->getRenderTarget()->Get_Surface_Level();
 			oldSurface->Copy(0,0,0,0,DEFAULT_RENDER_TARGET_WIDTH,DEFAULT_RENDER_TARGET_HEIGHT,newSurface);
-			Notify_Render_Texture_Changed(shadow_texture->Peek_D3D_Base_Texture());
+			rts::render::NotifyTextureChanged(shadow_texture);
 			REF_PTR_RELEASE(newSurface);
 			REF_PTR_RELEASE(oldSurface);
 		}
@@ -2853,12 +2697,8 @@ void W3DProjectedShadow::updateProjectionParameters(const Matrix3D &cameraXform)
 
 void W3DProjectedShadow::update()
 {
-	const bool missing_d3d11_projection =
-		m_type == SHADOW_PROJECTION && DX8Wrapper::Is_D3D11_Backend_Active() &&
-		!DX8Wrapper::Acquire_D3D11_Copied_Texture_Content(
-			m_shadowTexture[0]->getTexture()->Peek_D3D_Base_Texture());
-	if (missing_d3d11_projection ||
-		m_shadowTexture[0]->getLightPosHistory() != TheW3DShadowManager->getLightPosWorld(0))
+	if (m_shadowTexture[0]->getLightPosHistory() !=
+		TheW3DShadowManager->getLightPosWorld(0))
 	{	//light has moved since last time this shadow was calculated. Need update
 		updateTexture(TheW3DShadowManager->getLightPosWorld(0));
 	}

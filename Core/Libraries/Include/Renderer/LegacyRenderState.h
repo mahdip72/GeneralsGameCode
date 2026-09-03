@@ -90,9 +90,9 @@ enum RenderFillMode
 	RENDER_FILL_SOLID
 };
 
-// D3DMCS_MATERIAL/COLOR1/COLOR2 are deliberately represented by the same
-// ordinal values.  The neutral renderer does not include the D3D8 headers,
-// but the DX8 bridge can therefore publish the values without lossy remapping.
+// The historical material, first-color, and second-color sources are
+// deliberately represented by the same ordinal values. The neutral renderer
+// can therefore accept compatibility-lane values without lossy remapping.
 enum RenderMaterialSource
 {
 	RENDER_MATERIAL_SOURCE_MATERIAL,
@@ -118,7 +118,7 @@ enum RenderLegacyPixelProgram
 	// this appended so the existing program values embedded in shader code do
 	// not change while the migration is in progress.
 	RENDER_LEGACY_PIXEL_WATER_SEA,
-	// The profiler's D3D8 ps_1_4 shader swaps the sampled B/R channels. Keep
+	// The profiler's legacy ps_1_4 shader swaps the sampled B/R channels. Keep
 	// this appended as well so all existing program values remain stable.
 	RENDER_LEGACY_PIXEL_PROFILER_SWIZZLE
 };
@@ -295,7 +295,7 @@ struct LegacyTextureStageState
 	bool projectedCoordinates;
 	// D3DTTFF_COUNT1..COUNT4 are values, not independent flags.  Keep the
 	// selected component count in the neutral state so the D3D11 sampler can
-	// reproduce D3D8's projected-coordinate denominator (Y, Z, or W).
+	// reproduce the legacy projected-coordinate denominator (Y, Z, or W).
 	unsigned int textureTransformCount;
 	float bumpEnvironmentMatrix00;
 	float bumpEnvironmentMatrix01;
@@ -484,7 +484,7 @@ bool GetTrackedLegacyTextureStage(unsigned int index,
 bool TrackLegacyTexturePresence(unsigned int index, bool present);
 void TrackLegacyFog(const LegacyFogConstants &fog);
 bool TrackLegacyClipPlane(unsigned int index, const float *plane);
-RenderFloat4 DecodeLegacyD3D8Ambient(unsigned int color);
+RenderFloat4 DecodeLegacyAmbientColor(unsigned int color);
 void TrackLegacyGlobalAmbient(const RenderFloat4 &ambient);
 bool GetTrackedLegacyLogicalState(LegacyLogicalState *state);
 

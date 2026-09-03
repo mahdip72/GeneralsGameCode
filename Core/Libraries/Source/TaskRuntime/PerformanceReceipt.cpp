@@ -1,0 +1,1848 @@
+#include "Lib/PerformanceReceipt.h"
+
+#include <algorithm>
+#include <ctype.h>
+#include <fstream>
+#include <iomanip>
+#include <limits.h>
+#include <sstream>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#if defined(_WIN32)
+#if !defined(NOMINMAX)
+#define NOMINMAX
+#endif
+#if !defined(_WIN32_WINNT)
+#define _WIN32_WINNT 0x0A00
+#endif
+#include <windows.h>
+#include <bcrypt.h>
+#endif
+
+namespace rts { namespace performance {
+
+namespace
+{
+const char *const REQUIRED_PHASE_NAMES[] =
+{
+	"owner-intake",
+	"legacy-mutable-island",
+	"spatial-work",
+	"owner-tail",
+	"verification-publication"
+};
+
+const char *const REQUIRED_KERNEL_NAMES[] =
+{
+	"physics",
+	"status",
+	"collision",
+	"ai-planning",
+	"spatial",
+	"path"
+};
+
+void setReason(std::string *reason, const char *value)
+{
+	if (reason != 0)
+		*reason = value != 0 ? value : "unspecified failure";
+}
+
+void setReason(std::string *reason, const std::string &value)
+{
+	if (reason != 0)
+		*reason = value;
+}
+
+bool isHexString(const std::string &value, unsigned length)
+{
+	if (value.size() != length)
+		return false;
+	for (std::size_t index = 0; index < value.size(); ++index)
+	{
+		const unsigned char character =
+			static_cast<unsigned char>(value[index]);
+		if (!((character >= '0' && character <= '9') ||
+			(character >= 'a' && character <= 'f') ||
+			(character >= 'A' && character <= 'F')))
+			return false;
+	}
+	return true;
+}
+
+bool isLowerHexString(const std::string &value, unsigned length)
+{
+	if (!isHexString(value, length))
+		return false;
+	for (std::size_t index = 0; index < value.size(); ++index)
+		if (value[index] >= 'A' && value[index] <= 'F')
+			return false;
+	return true;
+}
+
+bool isCanonicalUuid(const std::string &value)
+{
+	if (value.size() != 36 || value[8] != '-' || value[13] != '-' ||
+		value[18] != '-' || value[23] != '-')
+		return false;
+	for (std::size_t index = 0; index < value.size(); ++index)
+	{
+		if (index == 8 || index == 13 || index == 18 || index == 23)
+			continue;
+		const unsigned char character =
+			static_cast<unsigned char>(value[index]);
+		if (!((character >= '0' && character <= '9') ||
+			(character >= 'a' && character <= 'f') ||
+			(character >= 'A' && character <= 'F')))
+			return false;
+	}
+	const char version = value[14];
+	const char variant = value[19];
+	return version >= '1' && version <= '5' &&
+		((variant >= '8' && variant <= '9') ||
+		 (variant >= 'a' && variant <= 'b') ||
+		 (variant >= 'A' && variant <= 'B'));
+}
+
+bool isIsoUtcTimestamp(const std::string &value)
+{
+	if (value.size() < 20 || value[4] != '-' || value[7] != '-' ||
+		value[10] != 'T' || value[13] != ':' || value[16] != ':')
+		return false;
+	for (std::size_t index = 0; index < 19; ++index)
+	{
+		if (index == 4 || index == 7 || index == 10 || index == 13 ||
+			index == 16)
+			continue;
+		if (value[index] < '0' || value[index] > '9')
+			return false;
+	}
+	if (value[19] == 'Z')
+		return true;
+	if (value[19] != '.')
+		return false;
+	std::size_t index = 20;
+	while (index < value.size() && value[index] >= '0' && value[index] <= '9')
+		++index;
+	return index > 20 && index < value.size() && index + 1 == value.size() &&
+		value[index] == 'Z';
+}
+
+bool isSafeToken(const std::string &value)
+{
+	if (value.empty() || value.size() > 256)
+		return false;
+	for (std::size_t index = 0; index < value.size(); ++index)
+	{
+		const unsigned char character =
+			static_cast<unsigned char>(value[index]);
+		if (!isalnum(character) && character != '-' && character != '_' &&
+			character != '.')
+			return false;
+	}
+	return value.find("..") == std::string::npos;
+}
+
+bool readEnvironment(const char *name, std::string &value)
+{
+#if defined(_WIN32)
+	char buffer[4096];
+	const DWORD length = GetEnvironmentVariableA(name, buffer,
+		static_cast<DWORD>(sizeof(buffer)));
+	if (length == 0 || length >= sizeof(buffer))
+		return false;
+	value.assign(buffer, length);
+	return !value.empty();
+#else
+	const char *environmentValue = getenv(name);
+	if (environmentValue == 0 || environmentValue[0] == '\0')
+		return false;
+	value.assign(environmentValue);
+	return true;
+#endif
+}
+
+bool parseUnsigned(const std::string &text, unsigned &value)
+{
+	if (text.empty())
+		return false;
+	unsigned parsed = 0;
+	for (std::size_t index = 0; index != text.size(); ++index)
+	{
+		if (text[index] < '0' || text[index] > '9')
+			return false;
+		const unsigned digit = static_cast<unsigned>(text[index] - '0');
+		if (parsed > (UINT_MAX - digit) / 10)
+			return false;
+		parsed = parsed * 10 + digit;
+	}
+	value = parsed;
+	return true;
+}
+
+void appendJsonString(std::ostringstream &json, const std::string &value)
+{
+	static const char HEX[] = "0123456789ABCDEF";
+	json << '"';
+	for (std::size_t index = 0; index < value.size(); ++index)
+	{
+		const unsigned char character =
+			static_cast<unsigned char>(value[index]);
+		switch (character)
+		{
+		case '\\': json << "\\\\"; break;
+		case '"': json << "\\\""; break;
+		case '\b': json << "\\b"; break;
+		case '\f': json << "\\f"; break;
+		case '\n': json << "\\n"; break;
+		case '\r': json << "\\r"; break;
+		case '\t': json << "\\t"; break;
+		default:
+			if (character < 0x20)
+				json << "\\u00" << HEX[character >> 4]
+					<< HEX[character & 0x0f];
+			else
+				json << static_cast<char>(character);
+			break;
+		}
+	}
+	json << '"';
+}
+
+void appendKey(std::ostringstream &json, const char *key)
+{
+	appendJsonString(json, key);
+	json << ':';
+}
+
+void appendStringField(std::ostringstream &json, const char *key,
+	const std::string &value, bool comma = true)
+{
+	appendKey(json, key);
+	appendJsonString(json, value);
+	if (comma) json << ',';
+}
+
+void appendUnsignedField(std::ostringstream &json, const char *key,
+	unsigned value, bool comma = true)
+{
+	appendKey(json, key);
+	json << value;
+	if (comma) json << ',';
+}
+
+void appendCounterField(std::ostringstream &json, const char *key,
+	JobMetricCounter value, bool comma = true)
+{
+	appendKey(json, key);
+	json << static_cast<unsigned long long>(value);
+	if (comma) json << ',';
+}
+
+void appendBoolField(std::ostringstream &json, const char *key,
+	bool value, bool comma = true)
+{
+	appendKey(json, key);
+	json << (value ? "true" : "false");
+	if (comma) json << ',';
+}
+
+bool hasUniqueNamesAndExactOrder(
+	const std::vector<PerformanceReceiptPhase> &phases,
+	const char *const *requiredNames, unsigned requiredCount)
+{
+	if (phases.size() != requiredCount)
+		return false;
+	for (unsigned index = 0; index < requiredCount; ++index)
+	{
+		if (phases[index].name != requiredNames[index])
+			return false;
+		for (unsigned prior = 0; prior < index; ++prior)
+			if (phases[index].name == phases[prior].name)
+				return false;
+	}
+	return true;
+}
+
+bool hasUniqueNamesAndExactOrder(
+	const std::vector<PerformanceReceiptKernel> &kernels,
+	const char *const *requiredNames, unsigned requiredCount)
+{
+	if (kernels.size() != requiredCount)
+		return false;
+	for (unsigned index = 0; index < requiredCount; ++index)
+	{
+		if (kernels[index].name != requiredNames[index])
+			return false;
+		for (unsigned prior = 0; prior < index; ++prior)
+			if (kernels[index].name == kernels[prior].name)
+				return false;
+	}
+	return true;
+}
+
+bool findCpuSet(const PerformanceReceipt &receipt, unsigned id,
+	PerformanceReceiptCpuSet *result = 0)
+{
+	for (std::size_t index = 0; index < receipt.cpuSets.size(); ++index)
+	{
+		if (receipt.cpuSets[index].id == id)
+		{
+			if (result != 0)
+				*result = receipt.cpuSets[index];
+			return true;
+		}
+	}
+	return false;
+}
+
+bool containsUnsigned(const std::vector<unsigned> &values, unsigned value)
+{
+	return std::find(values.begin(), values.end(), value) != values.end();
+}
+
+#if defined(_WIN32)
+bool currentFileTime(JobMetricCounter &value)
+{
+	FILETIME fileTime;
+	GetSystemTimeAsFileTime(&fileTime);
+	ULARGE_INTEGER integer;
+	integer.LowPart = fileTime.dwLowDateTime;
+	integer.HighPart = fileTime.dwHighDateTime;
+	value = static_cast<JobMetricCounter>(integer.QuadPart);
+	return value != 0;
+}
+
+bool currentUtcTimestamp(std::string &value)
+{
+	SYSTEMTIME now;
+	GetSystemTime(&now);
+	std::ostringstream text;
+	text << std::setfill('0') << std::setw(4) << now.wYear << '-'
+		<< std::setw(2) << now.wMonth << '-' << std::setw(2) << now.wDay
+		<< 'T' << std::setw(2) << now.wHour << ':' << std::setw(2)
+		<< now.wMinute << ':' << std::setw(2) << now.wSecond << '.'
+		<< std::setw(3) << now.wMilliseconds << 'Z';
+	value = text.str();
+	return isIsoUtcTimestamp(value);
+}
+
+bool calculateSha256(const void *bytes, std::size_t byteCount,
+	std::string &digest)
+{
+	BCRYPT_ALG_HANDLE algorithm = 0;
+	BCRYPT_HASH_HANDLE hash = 0;
+	DWORD objectLength = 0;
+	DWORD digestLength = 0;
+	DWORD propertyBytes = 0;
+	if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, 0,
+		0) != 0 || BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
+		reinterpret_cast<PUCHAR>(&objectLength), sizeof(objectLength),
+		&propertyBytes, 0) != 0 || objectLength == 0 ||
+		BCryptGetProperty(algorithm, BCRYPT_HASH_LENGTH,
+		reinterpret_cast<PUCHAR>(&digestLength), sizeof(digestLength),
+		&propertyBytes, 0) != 0 || digestLength != 32)
+	{
+		if (algorithm != 0)
+			BCryptCloseAlgorithmProvider(algorithm, 0);
+		return false;
+	}
+	std::vector<unsigned char> object(objectLength);
+	unsigned char result[32] = { 0 };
+	const bool created = BCryptCreateHash(algorithm, &hash, object.data(),
+		objectLength, 0, 0, 0) == 0;
+	const bool hashed = created && byteCount <= 0xffffffffU &&
+		BCryptHashData(hash, reinterpret_cast<PUCHAR>(
+			const_cast<void *>(bytes)), static_cast<ULONG>(byteCount), 0) == 0;
+	const bool finished = hashed && BCryptFinishHash(hash, result,
+		digestLength, 0) == 0;
+	if (finished)
+	{
+		static const char HEX[] = "0123456789ABCDEF";
+		digest.resize(64);
+		for (unsigned index = 0; index < 32; ++index)
+		{
+			digest[index * 2] = HEX[result[index] >> 4];
+			digest[index * 2 + 1] = HEX[result[index] & 0x0f];
+		}
+	}
+	if (hash != 0)
+		BCryptDestroyHash(hash);
+	BCryptCloseAlgorithmProvider(algorithm, 0);
+	return finished;
+}
+
+bool calculateFileSha256(const std::string &path, std::string &digest)
+{
+	HANDLE file = CreateFileA(path.c_str(), GENERIC_READ,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0,
+		OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, 0);
+	if (file == INVALID_HANDLE_VALUE)
+		return false;
+	BCRYPT_ALG_HANDLE algorithm = 0;
+	BCRYPT_HASH_HANDLE hash = 0;
+	DWORD objectLength = 0;
+	DWORD digestLength = 0;
+	DWORD propertyBytes = 0;
+	bool success = BCryptOpenAlgorithmProvider(&algorithm,
+		BCRYPT_SHA256_ALGORITHM, 0, 0) == 0 &&
+		BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
+		reinterpret_cast<PUCHAR>(&objectLength), sizeof(objectLength),
+		&propertyBytes, 0) == 0 && objectLength != 0 &&
+		BCryptGetProperty(algorithm, BCRYPT_HASH_LENGTH,
+		reinterpret_cast<PUCHAR>(&digestLength), sizeof(digestLength),
+		&propertyBytes, 0) == 0 && digestLength == 32;
+	std::vector<unsigned char> object;
+	if (success)
+	{
+		object.resize(objectLength);
+		success = BCryptCreateHash(algorithm, &hash, object.data(), objectLength,
+			0, 0, 0) == 0;
+	}
+	unsigned char buffer[64 * 1024];
+	while (success)
+	{
+		DWORD read = 0;
+		if (!ReadFile(file, buffer, sizeof(buffer), &read, 0))
+		{
+			success = false;
+			break;
+		}
+		if (read == 0)
+			break;
+		success = BCryptHashData(hash, buffer, read, 0) == 0;
+	}
+	unsigned char result[32] = { 0 };
+	if (success)
+		success = BCryptFinishHash(hash, result, digestLength, 0) == 0;
+	if (success)
+	{
+		static const char HEX[] = "0123456789ABCDEF";
+		digest.resize(64);
+		for (unsigned index = 0; index < 32; ++index)
+		{
+			digest[index * 2] = HEX[result[index] >> 4];
+			digest[index * 2 + 1] = HEX[result[index] & 0x0f];
+		}
+	}
+	if (hash != 0)
+		BCryptDestroyHash(hash);
+	if (algorithm != 0)
+		BCryptCloseAlgorithmProvider(algorithm, 0);
+	CloseHandle(file);
+	return success;
+}
+
+bool captureProcessIdentity(PerformanceReceipt &receipt, std::string *reason)
+{
+	receipt.processId = GetCurrentProcessId();
+	char path[MAX_PATH];
+	const DWORD length = GetModuleFileNameA(0, path, sizeof(path));
+	if (length == 0 || length >= sizeof(path))
+	{
+		setReason(reason, "GetModuleFileNameA failed");
+		return false;
+	}
+	receipt.executablePath.assign(path, length);
+	if (!calculateFileSha256(receipt.executablePath,
+		receipt.executableSha256))
+	{
+		setReason(reason, "executable SHA-256 capture failed");
+		return false;
+	}
+	FILETIME creation;
+	FILETIME processExit;
+	FILETIME kernel;
+	FILETIME user;
+	if (!GetProcessTimes(GetCurrentProcess(), &creation, &processExit,
+		&kernel, &user))
+	{
+		setReason(reason, "GetProcessTimes failed");
+		return false;
+	}
+	ULARGE_INTEGER creationInteger;
+	creationInteger.LowPart = creation.dwLowDateTime;
+	creationInteger.HighPart = creation.dwHighDateTime;
+	receipt.processCreationTimeUtc100ns =
+		static_cast<JobMetricCounter>(creationInteger.QuadPart);
+	if (receipt.processCreationTimeUtc100ns == 0 ||
+		!currentFileTime(receipt.processStartTimeUtc100ns))
+	{
+		setReason(reason, "process time capture was unavailable");
+		return false;
+	}
+	const char *commandLine = GetCommandLineA();
+	if (commandLine == 0 || commandLine[0] == '\0')
+	{
+		setReason(reason, "GetCommandLineA returned no command line");
+		return false;
+	}
+	receipt.commandLine.assign(commandLine);
+	receipt.processIdentityAvailable = true;
+	return true;
+}
+#else
+bool captureProcessIdentity(PerformanceReceipt &, std::string *reason)
+{
+	setReason(reason, "executable process provenance is unavailable on this host");
+	return false;
+}
+#endif
+
+bool loadOptionalUnsigned(const char *name, unsigned &value, bool &known,
+	std::string *reason)
+{
+	std::string text;
+	if (!readEnvironment(name, text))
+	{
+		known = false;
+		return true;
+	}
+	if (!parseUnsigned(text, value))
+	{
+		setReason(reason, std::string("invalid ") + name);
+		return false;
+	}
+	known = true;
+	return true;
+}
+
+void appendCpuSet(std::ostringstream &json,
+	const PerformanceReceiptCpuSet &cpuSet, bool comma)
+{
+	json << "{\n";
+	appendUnsignedField(json, "id", cpuSet.id);
+	appendUnsignedField(json, "efficiencyClass", cpuSet.efficiencyClass);
+	appendUnsignedField(json, "group", cpuSet.group);
+	appendUnsignedField(json, "coreIndex", cpuSet.coreIndex);
+	appendUnsignedField(json, "logicalProcessorIndex",
+		cpuSet.logicalProcessorIndex);
+	appendBoolField(json, "parked", cpuSet.parked);
+	appendBoolField(json, "allocatedToOtherProcess",
+		cpuSet.allocatedToOtherProcess);
+	appendBoolField(json, "availableToProcess", cpuSet.availableToProcess,
+		false);
+	json << "\n}";
+	if (comma) json << ',';
+}
+
+void appendPhase(std::ostringstream &json,
+	const PerformanceReceiptPhase &phase, bool comma)
+{
+	json << "{\n";
+	appendStringField(json, "name", phase.name);
+	appendBoolField(json, "available", phase.available);
+	appendCounterField(json, "totalNanoseconds", phase.totalNanoseconds);
+	appendCounterField(json, "maximumNanoseconds",
+		phase.maximumNanoseconds);
+	appendCounterField(json, "sampleCount", phase.sampleCount);
+	appendCounterField(json, "serialNanoseconds", phase.serialNanoseconds);
+	appendBoolField(json, "serialNanosecondsKnown", phase.serialNanosecondsKnown, false);
+	json << "\n}";
+	if (comma) json << ',';
+}
+
+void appendKernel(std::ostringstream &json,
+	const PerformanceReceiptKernel &kernel, bool comma)
+{
+	json << "{\n";
+	appendStringField(json, "name", kernel.name);
+	appendBoolField(json, "available", kernel.available);
+	appendCounterField(json, "submittedJobs", kernel.submittedJobs);
+	appendCounterField(json, "completedJobs", kernel.completedJobs);
+	appendCounterField(json, "physicalWorkerJobs",
+		kernel.physicalWorkerJobs);
+	appendCounterField(json, "ownerHelpedJobs", kernel.ownerHelpedJobs);
+	appendCounterField(json, "physicalWorkerMask",
+		kernel.physicalWorkerMask);
+	appendUnsignedField(json, "distinctPhysicalWorkers",
+		kernel.distinctPhysicalWorkers);
+	appendBoolField(json, "physicalWorkerMaskComplete",
+		kernel.physicalWorkerMaskComplete);
+	appendCounterField(json, "elapsedNanoseconds",
+		kernel.elapsedNanoseconds);
+	appendBoolField(json, "elapsedNanosecondsKnown",
+		kernel.elapsedNanosecondsKnown, false);
+	json << "\n}";
+	if (comma) json << ',';
+}
+
+void appendRawLog(std::ostringstream &json, const char *name,
+	const std::string &path, const std::string &sha256, bool comma)
+{
+	json << "{\n";
+	appendStringField(json, "name", name);
+	appendStringField(json, "path", path);
+	appendStringField(json, "sha256", sha256, false);
+	json << "\n}";
+	if (comma) json << ',';
+}
+
+void appendKernelTiming(std::ostringstream &json,
+	const KernelPerformanceSnapshot &snapshot)
+{
+	static const char *const stages[] = { "capture", "schedule", "wait", "validate", "commit" };
+	json << "\"kernelTiming\":{\n";
+	appendUnsignedField(json, "schemaVersion", 1);
+	appendStringField(json, "mode", "owner-pipeline-observation");
+	appendStringField(json, "attribution", "owner-stack-exclusive-v1");
+	appendBoolField(json, "enabled", snapshot.enabled);
+	appendBoolField(json, "frozen", snapshot.frozen);
+	appendBoolField(json, "complete", snapshot.complete);
+	appendUnsignedField(json, "errors", snapshot.errors);
+	appendCounterField(json, "generation", snapshot.generation);
+	// This ledger never executes a serial reference. Unknown is not zero cost.
+	appendBoolField(json, "serialReferenceKnown", false);
+	json << "\"streams\":[";
+	for (unsigned index = 0; index != snapshot.streamCount; ++index)
+	{
+		if (index != 0) json << ',';
+		const KernelPerformanceStream &stream = snapshot.streams[index];
+		json << '{';
+		appendStringField(json, "name", REQUIRED_KERNEL_NAMES[stream.kernel]);
+		appendUnsignedField(json, "subtype", stream.subtype);
+		appendCounterField(json, "attemptedBatches", stream.attemptedBatches);
+		appendCounterField(json, "admittedBatches", stream.admittedBatches);
+		appendCounterField(json, "committedBatches", stream.committedBatches);
+		appendCounterField(json, "abortedBatches", stream.abortedBatches);
+		appendUnsignedField(json, "firstFrame", stream.firstFrame);
+		appendUnsignedField(json, "lastFrame", stream.lastFrame);
+		appendCounterField(json, "activePipelineNanoseconds", stream.activePipelineNanoseconds);
+		appendCounterField(json, "inclusiveBatchNanoseconds", stream.inclusiveBatchNanoseconds);
+		appendCounterField(json, "maximumBatchNanoseconds", stream.maximumBatchNanoseconds);
+		json << "\"stages\":[";
+		for (unsigned stage = 0; stage != KERNEL_PERFORMANCE_STAGE_COUNT; ++stage)
+		{
+			if (stage != 0) json << ',';
+			json << '{';
+			appendStringField(json, "name", stages[stage]);
+			appendCounterField(json, "totalNanoseconds", stream.stageNanoseconds[stage]);
+			appendCounterField(json, "sampleCount", stream.stageSamples[stage], false);
+			json << '}';
+		}
+		json << "]}";
+	}
+	json << "]}";
+}
+
+bool validKernelTimingStorage(const KernelPerformanceSnapshot &snapshot)
+{
+	if (snapshot.streamCount > KERNEL_PERFORMANCE_MAXIMUM_STREAMS) return false;
+	for (unsigned index = 0; index != snapshot.streamCount; ++index)
+		if (snapshot.streams[index].kernel < KERNEL_PERFORMANCE_PHYSICS ||
+			snapshot.streams[index].kernel >= KERNEL_PERFORMANCE_KERNEL_COUNT)
+			return false;
+	return true;
+}
+
+bool validKernelTiming(const PerformanceReceipt &receipt)
+{
+	const KernelPerformanceSnapshot &snapshot = receipt.kernelTiming;
+	if (!validKernelTimingStorage(snapshot) || !snapshot.enabled || !snapshot.frozen ||
+		snapshot.errors != 0 || snapshot.generation == 0 ||
+		snapshot.complete != (snapshot.streamCount != 0)) return false;
+	for (unsigned index = 0; index != snapshot.streamCount; ++index)
+	{
+		const KernelPerformanceStream &stream = snapshot.streams[index];
+		const unsigned maximumSubtype = stream.kernel == KERNEL_PERFORMANCE_AI ||
+			stream.kernel == KERNEL_PERFORMANCE_PATH ? 1 : 0;
+		if (stream.subtype > maximumSubtype || stream.attemptedBatches == 0 ||
+			stream.admittedBatches > stream.attemptedBatches ||
+			stream.committedBatches > stream.admittedBatches ||
+			stream.abortedBatches != stream.admittedBatches - stream.committedBatches ||
+			stream.firstFrame > stream.lastFrame || stream.firstFrame < receipt.frameStart ||
+			stream.lastFrame > receipt.frameEnd ||
+			stream.activePipelineNanoseconds > stream.inclusiveBatchNanoseconds ||
+			stream.maximumBatchNanoseconds > stream.inclusiveBatchNanoseconds) return false;
+		for (unsigned prior = 0; prior != index; ++prior)
+			if (snapshot.streams[prior].kernel == stream.kernel &&
+				snapshot.streams[prior].subtype == stream.subtype) return false;
+		JobMetricCounter total = 0;
+		for (unsigned stage = 0; stage != KERNEL_PERFORMANCE_STAGE_COUNT; ++stage)
+		{
+			if (stream.stageNanoseconds[stage] > ~static_cast<JobMetricCounter>(0) - total ||
+				(stream.stageNanoseconds[stage] != 0 && stream.stageSamples[stage] == 0) ||
+				stream.stageSamples[stage] < stream.committedBatches) return false;
+			total += stream.stageNanoseconds[stage];
+		}
+		if (total != stream.activePipelineNanoseconds) return false;
+	}
+	return true;
+}
+
+const char *referenceModeName(KernelPerformanceReferenceMode mode)
+{
+	return mode == KERNEL_REFERENCE_THROUGHPUT_BINDING ? "throughput-binding" :
+		(mode == KERNEL_REFERENCE_SERIAL_ORACLE ? "serial-oracle" : "disabled");
+}
+
+std::string referenceDigestText(const KernelPerformanceDigest &digest)
+{
+	if (!digest.valid) return std::string();
+	static const char hex[] = "0123456789ABCDEF";
+	std::string text(64, '0');
+	for (unsigned index = 0; index != 32; ++index)
+	{
+		text[index * 2] = hex[digest.bytes[index] >> 4];
+		text[index * 2 + 1] = hex[digest.bytes[index] & 15];
+	}
+	return text;
+}
+
+void appendKernelReference(std::ostringstream &json,
+	const KernelPerformanceReferenceSnapshot &snapshot)
+{
+	json << "\"kernelReference\":{\n";
+	appendUnsignedField(json, "schemaVersion", 1);
+	appendStringField(json, "mode", referenceModeName(snapshot.mode));
+	appendBoolField(json, "frozen", snapshot.frozen);
+	appendBoolField(json, "complete", snapshot.complete);
+	appendUnsignedField(json, "errors", snapshot.errors);
+	appendCounterField(json, "generation", snapshot.generation);
+	json << "\"streams\":[";
+	for (unsigned index = 0; index != snapshot.streamCount; ++index)
+	{
+		if (index != 0) json << ',';
+		const KernelPerformanceReferenceStream &stream = snapshot.streams[index];
+		json << '{';
+		appendStringField(json, "name", REQUIRED_KERNEL_NAMES[stream.kernel]);
+		appendUnsignedField(json, "subtype", stream.subtype);
+		appendUnsignedField(json, "fieldSchema", stream.fieldSchema);
+		appendUnsignedField(json, "firstFrame", stream.firstFrame);
+		appendUnsignedField(json, "lastFrame", stream.lastFrame);
+		appendCounterField(json, "validatedBatchCount", stream.validatedBatchCount);
+		appendCounterField(json, "committedBatchCount", stream.committedBatchCount);
+		appendCounterField(json, "abortedBatchCount", stream.abortedBatchCount);
+		appendCounterField(json, "validatedOperationCount", stream.validatedOperationCount);
+		appendCounterField(json, "committedOperationCount", stream.committedOperationCount);
+		appendCounterField(json, "serialSampleCount", stream.serialSampleCount);
+		appendCounterField(json, "serialNanoseconds", stream.serialNanoseconds);
+		appendCounterField(json, "maximumSerialNanoseconds", stream.maximumSerialNanoseconds);
+		appendStringField(json, "inputSha256", referenceDigestText(stream.inputDigest));
+		appendStringField(json, "outputSha256", referenceDigestText(stream.outputDigest));
+		appendStringField(json, "commitSha256", referenceDigestText(stream.commitDigest), false);
+		json << '}';
+	}
+	json << "]}";
+}
+
+bool validKernelReferenceStorage(const KernelPerformanceReferenceSnapshot &snapshot)
+{
+	if (snapshot.streamCount > KERNEL_PERFORMANCE_MAXIMUM_STREAMS) return false;
+	for (unsigned index = 0; index != snapshot.streamCount; ++index)
+		if (snapshot.streams[index].kernel < KERNEL_PERFORMANCE_PHYSICS ||
+			snapshot.streams[index].kernel >= KERNEL_PERFORMANCE_KERNEL_COUNT)
+			return false;
+	return true;
+}
+
+bool validKernelReference(const PerformanceReceipt &receipt)
+{
+	const KernelPerformanceReferenceSnapshot &snapshot = receipt.kernelReference;
+	if (!validKernelReferenceStorage(snapshot) || !snapshot.frozen ||
+		snapshot.errors != 0 || snapshot.generation == 0 ||
+		snapshot.complete != (snapshot.streamCount != 0) ||
+		(snapshot.mode != KERNEL_REFERENCE_THROUGHPUT_BINDING &&
+		 snapshot.mode != KERNEL_REFERENCE_SERIAL_ORACLE)) return false;
+	// Complete means observed accounting closed, not six-kernel qualification.
+	// Missing streams remain useful local unknowns; present ones must reconcile.
+	for (unsigned index = 0; index != snapshot.streamCount; ++index)
+	{
+		const KernelPerformanceReferenceStream &stream = snapshot.streams[index];
+		const unsigned maximumSubtype = stream.kernel == KERNEL_PERFORMANCE_AI ||
+			stream.kernel == KERNEL_PERFORMANCE_PATH ? 1 : 0;
+		if (stream.subtype > maximumSubtype || stream.fieldSchema == 0 ||
+			stream.validatedBatchCount == 0 ||
+			stream.committedBatchCount > stream.validatedBatchCount ||
+			stream.abortedBatchCount != stream.validatedBatchCount - stream.committedBatchCount ||
+			stream.validatedOperationCount < stream.validatedBatchCount ||
+			stream.committedOperationCount < stream.committedBatchCount ||
+			stream.committedOperationCount > stream.validatedOperationCount ||
+			stream.validatedOperationCount - stream.committedOperationCount < stream.abortedBatchCount ||
+			(stream.committedBatchCount == 0 && stream.committedOperationCount != 0) ||
+			(stream.abortedBatchCount == 0 && stream.validatedOperationCount != stream.committedOperationCount) ||
+			stream.firstFrame > stream.lastFrame || stream.firstFrame < receipt.frameStart ||
+			stream.lastFrame > receipt.frameEnd ||
+			!stream.inputDigest.valid || !stream.outputDigest.valid || !stream.commitDigest.valid ||
+			stream.maximumSerialNanoseconds > stream.serialNanoseconds) return false;
+		for (unsigned prior = 0; prior != index; ++prior)
+			if (snapshot.streams[prior].kernel == stream.kernel &&
+				snapshot.streams[prior].subtype == stream.subtype) return false;
+		const KernelPerformanceStream *timing = 0;
+		for (unsigned timingIndex = 0; timingIndex != receipt.kernelTiming.streamCount; ++timingIndex)
+			if (receipt.kernelTiming.streams[timingIndex].kernel == stream.kernel &&
+				receipt.kernelTiming.streams[timingIndex].subtype == stream.subtype)
+				timing = &receipt.kernelTiming.streams[timingIndex];
+		if (timing == 0 || stream.committedBatchCount != timing->committedBatches ||
+			stream.validatedBatchCount > timing->admittedBatches ||
+			stream.firstFrame < timing->firstFrame || stream.lastFrame > timing->lastFrame) return false;
+		if (snapshot.mode == KERNEL_REFERENCE_THROUGHPUT_BINDING)
+		{
+			if (stream.serialSampleCount != 0 || stream.serialNanoseconds != 0 ||
+				stream.maximumSerialNanoseconds != 0) return false;
+		}
+		else if (stream.serialSampleCount != stream.committedBatchCount ||
+			(stream.serialNanoseconds != 0 && stream.serialSampleCount == 0)) return false;
+	}
+	return true;
+}
+
+void appendRuntimeClosure(std::ostringstream &json,
+	const PerformanceReceipt &receipt)
+{
+	json << "\"runtimeClosure\":{\n";
+	appendStringField(json, "dependencyManifestSha256",
+		receipt.runtimeClosureDependencyManifestSha256);
+	appendStringField(json, "closureSha256", receipt.runtimeClosureSha256,
+		false);
+	json << "\n},\n";
+}
+
+#if defined(_WIN32)
+bool fileTimeToUtcTimestamp(JobMetricCounter fileTimeValue,
+	std::string &value)
+{
+	ULARGE_INTEGER integer;
+	integer.QuadPart = static_cast<ULONGLONG>(fileTimeValue);
+	FILETIME fileTime;
+	fileTime.dwLowDateTime = integer.LowPart;
+	fileTime.dwHighDateTime = integer.HighPart;
+	SYSTEMTIME systemTime;
+	if (!FileTimeToSystemTime(&fileTime, &systemTime))
+		return false;
+	std::ostringstream text;
+	text << std::setfill('0') << std::setw(4) << systemTime.wYear << '-'
+		<< std::setw(2) << systemTime.wMonth << '-' << std::setw(2)
+		<< systemTime.wDay << 'T' << std::setw(2) << systemTime.wHour << ':'
+		<< std::setw(2) << systemTime.wMinute << ':' << std::setw(2)
+		<< systemTime.wSecond << '.' << std::setw(7)
+		<< static_cast<unsigned long long>(integer.QuadPart % 10000000ULL)
+		<< 'Z';
+	value = text.str();
+	return isIsoUtcTimestamp(value);
+}
+#endif
+
+} // namespace
+
+PerformanceReceiptCpuSet::PerformanceReceiptCpuSet()
+	: id(0), efficiencyClass(0), group(0), coreIndex(UINT_MAX),
+	  logicalProcessorIndex(0), parked(false),
+	  allocatedToOtherProcess(false), availableToProcess(false)
+{
+}
+
+PerformanceReceiptPhase::PerformanceReceiptPhase()
+	: available(false), totalNanoseconds(0), maximumNanoseconds(0),
+	  sampleCount(0), serialNanoseconds(0), serialNanosecondsKnown(false)
+{
+}
+
+PerformanceReceiptWorkload::PerformanceReceiptWorkload()
+	: sampleCount(0), firstFrame(0), lastFrame(0), playerCount(0),
+	  initialUnitCount(0), minimumUnitCount(0), peakUnitCount(0),
+	  rosterStable(true), contiguous(true)
+{
+}
+
+bool IsPerformanceReceiptRosterPlayer(bool playableSide, bool observer)
+{
+	return playableSide && !observer;
+}
+
+bool IsPerformanceReceiptLiveUnit(bool infantry, bool vehicle,
+	bool effectivelyDead, bool destroyed)
+{
+	return (infantry || vehicle) && !effectivelyDead && !destroyed;
+}
+
+bool ObservePerformanceReceiptWorkload(PerformanceReceiptWorkload &workload,
+	unsigned frame, unsigned playerCount, unsigned liveUnitCount)
+{
+	if (workload.sampleCount != 0 && frame <= workload.lastFrame)
+		return false;
+	if (workload.sampleCount == 0)
+	{
+		workload.firstFrame = frame;
+		workload.playerCount = playerCount;
+		workload.initialUnitCount = liveUnitCount;
+		workload.minimumUnitCount = liveUnitCount;
+	}
+	else
+	{
+		workload.contiguous = workload.contiguous &&
+			static_cast<JobMetricCounter>(frame) ==
+				static_cast<JobMetricCounter>(workload.lastFrame) + 1;
+		workload.rosterStable = workload.rosterStable &&
+			workload.playerCount == playerCount;
+	}
+	workload.lastFrame = frame;
+	++workload.sampleCount;
+	if (liveUnitCount < workload.minimumUnitCount)
+		workload.minimumUnitCount = liveUnitCount;
+	if (liveUnitCount > workload.peakUnitCount)
+		workload.peakUnitCount = liveUnitCount;
+	return true;
+}
+
+PerformanceReceiptKernel::PerformanceReceiptKernel()
+	: available(false), submittedJobs(0), completedJobs(0),
+	  physicalWorkerJobs(0), ownerHelpedJobs(0), physicalWorkerMask(0),
+	  distinctPhysicalWorkers(0), physicalWorkerMaskComplete(false),
+	  elapsedNanoseconds(0), elapsedNanosecondsKnown(false)
+{
+}
+
+PerformanceReceiptRawEvidence::PerformanceReceiptRawEvidence()
+	: timingClosed(false), timingWriteSucceeded(false), timingTruncated(false),
+	  timingComplete(false), timingSessionCount(0), timingFrameSamples(0),
+	  timingFirstFrame(0), timingLastFrame(0)
+{
+}
+
+PerformanceReceipt::PerformanceReceipt()
+	: schemaVersion(PERFORMANCE_RECEIPT_SCHEMA_VERSION),
+	  producer(PERFORMANCE_RECEIPT_PRODUCER),
+	  evidenceKind(PERFORMANCE_RECEIPT_EVIDENCE_KIND), status("pending"),
+	  role("performance-report"), producerVersion("5"), architecture("x64"),
+	  processId(0), processCreationTimeUtc100ns(0),
+	  processStartTimeUtc100ns(0), processEndTimeUtc100ns(0),
+	  processIdentityAvailable(false), processExitCode(0),
+	  processExitCodeKnown(false), fixtureKind("replay"),
+	  workloadQualification("minimum-qualified"), fixtureIdentityObserved(false), fixtureObservationFailed(false),
+	  expectedSeed(0), expectedSeedKnown(false), seed(0), seedKnown(false),
+	  requestedPlayerCount(0), requestedMinimumUnitCount(0),
+	  frameSimulationTotalNanoseconds(0), frameSimulationMaximumNanoseconds(0),
+	  frameSimulationSampleCount(0), frameStart(0), frameEnd(0), finalFrame(0),
+	  finalCrcKnown(false), finalCrc(0), requestedWorkerCount(0),
+	  simulationMode("unknown"), schedulerStarted(false),
+	  effectiveWorkerCount(0), workersPinned(false),
+	  availableLogicalCpuCount(0), reservedOwnerCpuCount(0),
+	  selectedWorkerCpuCount(0), selectedWorkerPhysicalCoreCount(0),
+	  selectedWorkerPhysicalCoreMask(0),
+	  selectedWorkerPhysicalCoreMaskComplete(false)
+{
+	kernelReference.mode = KERNEL_REFERENCE_THROUGHPUT_BINDING;
+}
+
+bool BeginPerformanceReceipt(PerformanceReceipt &receipt, const char *title,
+	const char *replayPath, unsigned ordinal, std::string *reason)
+{
+	receipt = PerformanceReceipt();
+	std::string qualification, fixtureKind;
+	if (readEnvironment("RTS_PERFORMANCE_WORKLOAD_QUALIFICATION", qualification))
+		receipt.workloadQualification = qualification;
+	if (readEnvironment("RTS_PERFORMANCE_FIXTURE_KIND", fixtureKind))
+		receipt.fixtureKind = fixtureKind;
+	const bool observedOnly = receipt.workloadQualification == "observed-only";
+	if ((!observedOnly && receipt.workloadQualification != "minimum-qualified") ||
+		(receipt.fixtureKind != "replay" && receipt.fixtureKind != "fresh-ai-map") ||
+		(receipt.fixtureKind == "fresh-ai-map" && !observedOnly))
+	{
+		setReason(reason, "fixture kind or workload qualification is invalid");
+		return false;
+	}
+	if (title == 0 || title[0] == '\0' ||
+		(receipt.fixtureKind == "replay" && (replayPath == 0 || replayPath[0] == '\0')) ||
+		(receipt.fixtureKind == "fresh-ai-map" && replayPath != 0 && replayPath[0] != '\0'))
+	{
+		setReason(reason, "title and replay path are required");
+		return false;
+	}
+	receipt.title = title;
+	receipt.replayPath = replayPath != 0 ? replayPath : "";
+
+	if (!readEnvironment("RTS_PERFORMANCE_ROLE", receipt.role) ||
+		!readEnvironment("RTS_PERFORMANCE_RUN_ID", receipt.runId) ||
+		!readEnvironment("RTS_PERFORMANCE_RUN_NONCE", receipt.runNonce) ||
+		!readEnvironment("RTS_PERFORMANCE_COHORT_NONCE", receipt.cohortNonce) ||
+		!readEnvironment("RTS_PERFORMANCE_COHORT_CREATED_UTC",
+			receipt.cohortCreatedUtc) ||
+		!readEnvironment("RTS_PERFORMANCE_RECEIPT_DIR",
+			receipt.outputDirectory) ||
+		!readEnvironment("RTS_PERFORMANCE_SOURCE_COMMIT", receipt.sourceCommit) ||
+		!readEnvironment("RTS_PERFORMANCE_ARTIFACT_SET_SHA256",
+			receipt.artifactSetSha256) ||
+		!readEnvironment("RTS_PERFORMANCE_RUNTIME_MANIFEST_SHA256",
+			receipt.runtimeClosureDependencyManifestSha256) ||
+		!readEnvironment("RTS_PERFORMANCE_RUNTIME_CLOSURE_SHA256",
+			receipt.runtimeClosureSha256) ||
+		!readEnvironment("RTS_PERFORMANCE_FIXTURE_ID", receipt.fixtureId) ||
+		!readEnvironment("RTS_PERFORMANCE_RAW_LOG_PATH",
+			receipt.rawEvidence.rawLogPath) ||
+		!readEnvironment("RTS_PERFORMANCE_TIMING_PATH",
+			receipt.rawEvidence.timingPath) ||
+		!readEnvironment("RTS_PERFORMANCE_VERIFIER_BOUNDARY",
+			receipt.rawEvidence.verifierBoundary))
+	{
+		setReason(reason, "required performance receipt environment is missing");
+		return false;
+	}
+	if (receipt.role != "performance-report" ||
+		!isCanonicalUuid(receipt.runNonce) ||
+		!isCanonicalUuid(receipt.cohortNonce) ||
+		!isIsoUtcTimestamp(receipt.cohortCreatedUtc) ||
+		!currentUtcTimestamp(receipt.recordedUtc))
+	{
+		setReason(reason, "performance receipt role, nonce, or cohort timestamp is invalid");
+		return false;
+	}
+	std::string referenceMode;
+	if (readEnvironment("RTS_PERFORMANCE_REFERENCE_MODE", referenceMode))
+	{
+		if (referenceMode == "serial-oracle")
+			receipt.kernelReference.mode = KERNEL_REFERENCE_SERIAL_ORACLE;
+		else if (referenceMode != "throughput-binding")
+		{
+			setReason(reason, "RTS_PERFORMANCE_REFERENCE_MODE is invalid");
+			return false;
+		}
+	}
+	const bool expectedHashKnown = readEnvironment("RTS_PERFORMANCE_FIXTURE_SHA256",
+		receipt.expectedFixtureContentSha256);
+	if ((!observedOnly && !expectedHashKnown) ||
+		(expectedHashKnown && !isHexString(receipt.expectedFixtureContentSha256, 64)) ||
+		!loadOptionalUnsigned("RTS_PERFORMANCE_SEED", receipt.expectedSeed, receipt.expectedSeedKnown, reason) ||
+		(!observedOnly && !receipt.expectedSeedKnown))
+	{
+		setReason(reason, "expected fixture hash or seed is missing or invalid");
+		return false;
+	}
+	// Hashes are computed from the closed producer-owned files at publication.
+	// Host-supplied hashes cannot stand in for an executable observation.
+	bool playerCountKnown = false;
+	bool unitCountKnown = false;
+	if (!loadOptionalUnsigned("RTS_PERFORMANCE_PLAYER_COUNT",
+		receipt.requestedPlayerCount, playerCountKnown, reason) ||
+		!loadOptionalUnsigned("RTS_PERFORMANCE_UNIT_COUNT",
+			receipt.requestedMinimumUnitCount, unitCountKnown, reason))
+		return false;
+	if ((observedOnly && (playerCountKnown || unitCountKnown)) ||
+		(!observedOnly && (!playerCountKnown || !unitCountKnown ||
+			receipt.requestedPlayerCount == 0 || receipt.requestedMinimumUnitCount == 0)))
+	{
+		setReason(reason, "requested performance workload environment is missing or zero");
+		return false;
+	}
+	if (!captureProcessIdentity(receipt, reason))
+		return false;
+	// The ordinal is deliberately retained in the run ID only when the host
+	// provided a nonzero ordinal. It cannot replace the host's unique nonce.
+	if (ordinal != 0)
+	{
+		std::ostringstream suffix;
+		suffix << '-' << ordinal;
+		receipt.runId += suffix.str();
+	}
+	return true;
+}
+
+bool BindPerformanceReceiptFixtureObservation(PerformanceReceipt &receipt,
+	const char *kind, const char *contentPath, const char *observedContentSha256,
+	unsigned observedSeed, std::string *reason)
+{
+	// Copy first: callers may pass strings already retained in this receipt.
+	const std::string actualKind = kind != 0 ? kind : "";
+	const std::string actualPath = contentPath != 0 ? contentPath : "";
+	std::string actualHash = observedContentSha256 != 0 ? observedContentSha256 : "";
+	std::string expectedHash = receipt.expectedFixtureContentSha256;
+	for (std::size_t index = 0; index != actualHash.size(); ++index)
+		actualHash[index] = static_cast<char>(toupper(static_cast<unsigned char>(actualHash[index])));
+	for (std::size_t index = 0; index != expectedHash.size(); ++index)
+		expectedHash[index] = static_cast<char>(toupper(static_cast<unsigned char>(expectedHash[index])));
+	if (receipt.fixtureIdentityObserved || receipt.fixtureObservationFailed || actualKind != receipt.fixtureKind ||
+		(actualKind != "replay" && actualKind != "fresh-ai-map") || actualPath.empty() || !isHexString(actualHash, 64) ||
+		(!expectedHash.empty() && expectedHash != actualHash) ||
+		(receipt.expectedSeedKnown && receipt.expectedSeed != observedSeed))
+	{
+		receipt.fixtureIdentityObserved = false;
+		receipt.fixtureObservationFailed = true;
+		setReason(reason, "actual fixture observation differs from its expected identity or was rebound");
+		return false;
+	}
+	receipt.fixtureContentPath = actualPath;
+	receipt.fixtureContentSha256 = actualHash;
+	receipt.replayPath = actualKind == "replay" ? actualPath : "";
+	receipt.seed = observedSeed;
+	receipt.seedKnown = true;
+	receipt.fixtureIdentityObserved = true;
+	return true;
+}
+
+bool CapturePerformanceReceiptJobSystem(PerformanceReceipt &receipt,
+	const JobSystem &jobs, const JobSystemMetrics &metrics,
+	std::string *reason)
+{
+	const JobSystemConfig config = JobSystem::startupConfig();
+	if (jobs.workerCount() != 0 || metrics.selectedWorkerCpuCount != 0)
+		receipt.schedulerStarted = true;
+	receipt.schedulerMetrics = metrics;
+	receipt.requestedWorkerCount = config.workerCount;
+	receipt.workerPolicy = config.workerPolicy == JOB_WORKER_POLICY_ALL ?
+		"all" : (config.workerPolicy == JOB_WORKER_POLICY_AUTO ? "auto" : "unknown");
+	if (receipt.workerPolicy == "unknown")
+	{
+		setReason(reason, "unknown JobSystem worker policy");
+		return false;
+	}
+	if (jobs.workerCount() != 0)
+		receipt.effectiveWorkerCount = jobs.workerCount();
+	receipt.workersPinned = receipt.schedulerStarted && config.pinWorkers;
+	receipt.availableLogicalCpuCount = metrics.availableLogicalCpuCount;
+	receipt.reservedOwnerCpuCount = metrics.reservedOwnerCpuCount;
+	receipt.selectedWorkerCpuCount = metrics.selectedWorkerCpuCount;
+	receipt.selectedWorkerPhysicalCoreCount =
+		metrics.selectedWorkerPhysicalCoreCount;
+	receipt.selectedWorkerPhysicalCoreMask =
+		metrics.selectedWorkerPhysicalCoreMask;
+	receipt.selectedWorkerPhysicalCoreMaskComplete =
+		metrics.selectedWorkerPhysicalCoreMaskComplete;
+
+	receipt.cpuSets.clear();
+	const unsigned cpuSetCount = jobs.cpuSetCount();
+	for (unsigned index = 0; index < cpuSetCount; ++index)
+	{
+		JobCpuSetInfo source;
+		if (!jobs.cpuSetAt(index, source))
+		{
+			setReason(reason, "JobSystem CPU-set snapshot changed during capture");
+			return false;
+		}
+		PerformanceReceiptCpuSet target;
+		target.id = source.id;
+		target.efficiencyClass = source.efficiencyClass;
+		target.group = source.group;
+		target.coreIndex = source.coreIndex;
+		target.logicalProcessorIndex = source.logicalProcessorIndex;
+		target.parked = source.parked;
+		target.allocatedToOtherProcess = source.allocatedToOtherProcess;
+		target.availableToProcess = source.availableToProcess;
+		receipt.cpuSets.push_back(target);
+	}
+	receipt.selectedWorkerCpuSetIds.clear();
+	for (unsigned index = 0; index < jobs.selectedWorkerCpuSetCount(); ++index)
+	{
+		unsigned id = 0;
+		if (!jobs.selectedWorkerCpuSetIdAt(index, id))
+		{
+			setReason(reason, "JobSystem selected CPU-set snapshot changed");
+			return false;
+		}
+		receipt.selectedWorkerCpuSetIds.push_back(id);
+	}
+	receipt.ownerCpuSetIds.clear();
+	for (unsigned index = 0; index < jobs.ownerCpuSetCount(); ++index)
+	{
+		unsigned id = 0;
+		if (!jobs.ownerCpuSetIdAt(index, id))
+		{
+			setReason(reason, "JobSystem owner CPU-set snapshot changed");
+			return false;
+		}
+		receipt.ownerCpuSetIds.push_back(id);
+	}
+	return true;
+}
+
+bool SetPerformanceReceiptReplayResult(PerformanceReceipt &receipt,
+	unsigned frameStart, unsigned finalFrame, unsigned finalCrc,
+	bool finalCrcKnown, int processExitCode, bool processExitCodeKnown,
+	const char *exitBoundary, bool clean, std::string *reason)
+{
+	if (exitBoundary == 0 || exitBoundary[0] == '\0')
+	{
+		setReason(reason, "process exit boundary is required");
+		return false;
+	}
+	if (!processExitCodeKnown)
+	{
+		setReason(reason, "process exit code is unavailable");
+		return false;
+	}
+	receipt.frameStart = frameStart;
+	receipt.frameEnd = finalFrame;
+	receipt.finalFrame = finalFrame;
+	receipt.finalCrc = finalCrc;
+	receipt.finalCrcKnown = finalCrcKnown;
+	receipt.processExitCode = processExitCode;
+	receipt.processExitCodeKnown = processExitCodeKnown;
+	receipt.processExitBoundary = exitBoundary;
+#if defined(_WIN32)
+	if (!currentFileTime(receipt.processEndTimeUtc100ns))
+	{
+		setReason(reason, "process end time capture was unavailable");
+		return false;
+	}
+#endif
+	receipt.status = clean ? "passed" : "failed";
+	return true;
+}
+
+bool SerializePerformanceReceipt(const PerformanceReceipt &receipt,
+	std::string &document, std::string *reason)
+{
+	if (!validKernelTimingStorage(receipt.kernelTiming) ||
+		!validKernelReferenceStorage(receipt.kernelReference))
+	{
+		setReason(reason, "kernel evidence storage is outside its fixed bounds");
+		return false;
+	}
+	std::ostringstream json;
+	json << "{\n";
+	appendUnsignedField(json, "schemaVersion", receipt.schemaVersion);
+	appendStringField(json, "producer", receipt.producer);
+	appendStringField(json, "evidenceKind", receipt.evidenceKind);
+	appendStringField(json, "status", receipt.status);
+	appendStringField(json, "role", receipt.role);
+	appendStringField(json, "measurementRole",
+		receipt.kernelReference.mode == KERNEL_REFERENCE_THROUGHPUT_BINDING ? "throughput" :
+		(receipt.kernelReference.mode == KERNEL_REFERENCE_SERIAL_ORACLE ? "serial-oracle" : "disabled"));
+	appendStringField(json, "simulationMode", receipt.simulationMode);
+	appendBoolField(json, "schedulerStarted", receipt.schedulerStarted);
+	appendStringField(json, "producerVersion", receipt.producerVersion);
+	appendStringField(json, "title", receipt.title);
+	appendStringField(json, "runId", receipt.runId);
+	appendStringField(json, "runNonce", receipt.runNonce);
+	appendStringField(json, "cohortNonce", receipt.cohortNonce);
+	appendStringField(json, "cohortCreatedUtc", receipt.cohortCreatedUtc);
+	appendStringField(json, "recordedUtc", receipt.recordedUtc);
+	appendStringField(json, "architecture", receipt.architecture);
+	appendStringField(json, "sourceCommit", receipt.sourceCommit);
+	appendStringField(json, "artifactSetSha256", receipt.artifactSetSha256);
+	appendRuntimeClosure(json, receipt);
+	appendStringField(json, "executablePath", receipt.executablePath);
+	appendStringField(json, "executableSha256", receipt.executableSha256);
+	appendStringField(json, "commandLine", receipt.commandLine);
+	json << "\"process\":{\n";
+	appendUnsignedField(json, "id", receipt.processId);
+	appendCounterField(json, "creationTimeUtc100ns",
+		receipt.processCreationTimeUtc100ns);
+	appendCounterField(json, "startTimeUtc100ns",
+		receipt.processStartTimeUtc100ns);
+	appendCounterField(json, "endTimeUtc100ns",
+		receipt.processEndTimeUtc100ns);
+	appendBoolField(json, "identityAvailable",
+		receipt.processIdentityAvailable);
+	appendBoolField(json, "exitCodeKnown", receipt.processExitCodeKnown);
+	appendKey(json, "exitCode");
+	json << receipt.processExitCode << ',';
+	appendStringField(json, "exitBoundary", receipt.processExitBoundary, false);
+	json << "\n},\n";
+	json << "\"fixture\":{\n";
+	appendStringField(json, "id", receipt.fixtureId);
+	appendStringField(json, "kind", receipt.fixtureKind);
+	appendStringField(json, "workloadQualification", receipt.workloadQualification);
+	appendStringField(json, "contentPath", receipt.fixtureContentPath);
+	appendBoolField(json, "identityObserved", receipt.fixtureIdentityObserved);
+	appendStringField(json, "contentSha256", receipt.fixtureContentSha256);
+	appendStringField(json, "replayPath", receipt.replayPath);
+	appendStringField(json, "retainedReplayPath", receipt.retainedReplayPath);
+	appendStringField(json, "retainedReplaySha256", receipt.retainedReplaySha256);
+	appendUnsignedField(json, "seed", receipt.seed);
+	appendBoolField(json, "seedKnown", receipt.seedKnown);
+	if (receipt.workloadQualification == "observed-only")
+		json << "\"requestedPlayerCount\":null,\"requestedMinimumUnitCount\":null";
+	else
+	{
+		appendUnsignedField(json, "requestedPlayerCount", receipt.requestedPlayerCount);
+		appendUnsignedField(json, "requestedMinimumUnitCount", receipt.requestedMinimumUnitCount, false);
+	}
+	json << "\n},\n";
+	json << "\"workload\":{\n";
+	appendStringField(json, "sampling", "completed-simulation-frame-boundary-v1");
+	appendCounterField(json, "sampleCount", receipt.workload.sampleCount);
+	appendUnsignedField(json, "firstFrame", receipt.workload.firstFrame);
+	appendUnsignedField(json, "lastFrame", receipt.workload.lastFrame);
+	appendUnsignedField(json, "playerCount", receipt.workload.playerCount);
+	appendBoolField(json, "rosterStable", receipt.workload.rosterStable);
+	appendBoolField(json, "contiguous", receipt.workload.contiguous);
+	appendUnsignedField(json, "initialUnitCount", receipt.workload.initialUnitCount);
+	appendUnsignedField(json, "minimumUnitCount", receipt.workload.minimumUnitCount);
+	appendUnsignedField(json, "peakUnitCount", receipt.workload.peakUnitCount, false);
+	json << "\n},\n";
+	json << "\"frameSimulation\":{\n";
+	appendCounterField(json, "totalNanoseconds", receipt.frameSimulationTotalNanoseconds);
+	appendCounterField(json, "maximumNanoseconds", receipt.frameSimulationMaximumNanoseconds);
+	appendCounterField(json, "sampleCount", receipt.frameSimulationSampleCount, false);
+	json << "\n},\n";
+	json << "\"frames\":{\n";
+	appendUnsignedField(json, "start", receipt.frameStart);
+	appendUnsignedField(json, "end", receipt.frameEnd);
+	appendUnsignedField(json, "final", receipt.finalFrame);
+	appendBoolField(json, "finalCrcKnown", receipt.finalCrcKnown);
+	appendUnsignedField(json, "finalCrc", receipt.finalCrc, false);
+	json << "\n},\n";
+	json << "\"worker\":{\n";
+	appendUnsignedField(json, "requestedCount", receipt.requestedWorkerCount);
+	appendUnsignedField(json, "effectiveCount", receipt.effectiveWorkerCount);
+	appendStringField(json, "policy", receipt.workerPolicy);
+	appendBoolField(json, "pinned", receipt.workersPinned);
+	appendUnsignedField(json, "availableLogicalCpuCount",
+		receipt.availableLogicalCpuCount);
+	appendUnsignedField(json, "reservedOwnerCpuCount",
+		receipt.reservedOwnerCpuCount);
+	appendUnsignedField(json, "selectedWorkerCpuCount",
+		receipt.selectedWorkerCpuCount);
+	appendUnsignedField(json, "selectedWorkerPhysicalCoreCount",
+		receipt.selectedWorkerPhysicalCoreCount);
+	appendCounterField(json, "selectedWorkerPhysicalCoreMask",
+		receipt.selectedWorkerPhysicalCoreMask);
+	appendBoolField(json, "selectedWorkerPhysicalCoreMaskComplete",
+		receipt.selectedWorkerPhysicalCoreMaskComplete, false);
+	json << "\n},\n";
+	json << "\"topology\":{\n";
+	appendStringField(json, "source", receipt.schedulerStarted ? "GetSystemCpuSetInformation" : "scheduler-not-started");
+	appendKey(json, "cpuSets");
+	json << "[\n";
+	for (std::size_t index = 0; index < receipt.cpuSets.size(); ++index)
+		appendCpuSet(json, receipt.cpuSets[index],
+			index + 1 != receipt.cpuSets.size());
+	json << "\n],\n";
+	appendKey(json, "ownerCpuSetIds");
+	json << '[';
+	for (std::size_t index = 0; index < receipt.ownerCpuSetIds.size(); ++index)
+	{
+		if (index != 0) json << ',';
+		json << receipt.ownerCpuSetIds[index];
+	}
+	json << "],\n";
+	appendKey(json, "selectedWorkerCpuSetIds");
+	json << '[';
+	for (std::size_t index = 0;
+		index < receipt.selectedWorkerCpuSetIds.size(); ++index)
+	{
+		if (index != 0) json << ',';
+		json << receipt.selectedWorkerCpuSetIds[index];
+	}
+	json << "]\n},\n";
+	json << "\"rawEvidence\":{\n";
+	appendStringField(json, "verifierBoundary",
+		receipt.rawEvidence.verifierBoundary);
+	appendStringField(json, "rawLogPath", receipt.rawEvidence.rawLogPath);
+	appendStringField(json, "rawLogSha256",
+		receipt.rawEvidence.rawLogSha256);
+	appendStringField(json, "timingPath", receipt.rawEvidence.timingPath);
+	appendStringField(json, "timingSha256",
+		receipt.rawEvidence.timingSha256);
+	appendBoolField(json, "timingClosed", receipt.rawEvidence.timingClosed);
+	appendBoolField(json, "timingWriteSucceeded", receipt.rawEvidence.timingWriteSucceeded);
+	appendBoolField(json, "timingTruncated", receipt.rawEvidence.timingTruncated);
+	appendBoolField(json, "timingComplete", receipt.rawEvidence.timingComplete);
+	appendUnsignedField(json, "timingSessionCount", receipt.rawEvidence.timingSessionCount);
+	appendCounterField(json, "timingFrameSamples", receipt.rawEvidence.timingFrameSamples);
+	appendUnsignedField(json, "timingFirstFrame", receipt.rawEvidence.timingFirstFrame);
+	appendUnsignedField(json, "timingLastFrame", receipt.rawEvidence.timingLastFrame, false);
+	json << "\n},\n";
+	json << "\"rawLogs\":[\n";
+	appendRawLog(json, "raw-log", receipt.rawEvidence.rawLogPath,
+		receipt.rawEvidence.rawLogSha256, true);
+	appendRawLog(json, "timing", receipt.rawEvidence.timingPath,
+		receipt.rawEvidence.timingSha256, false);
+	json << "\n],\n";
+	std::string processCreationUtc;
+#if defined(_WIN32)
+	if (!fileTimeToUtcTimestamp(receipt.processCreationTimeUtc100ns,
+		processCreationUtc))
+	{
+		setReason(reason, "process creation timestamp serialization failed");
+		return false;
+	}
+#endif
+	json << "\"provenance\":{\n";
+	appendStringField(json, "kind", "native-executable-observation");
+	appendStringField(json, "receiptPath", receipt.receiptPath);
+	appendUnsignedField(json, "processId", receipt.processId);
+	appendStringField(json, "processCreationUtc", processCreationUtc);
+	appendStringField(json, "executablePath", receipt.executablePath);
+	appendStringField(json, "executableSha256", receipt.executableSha256);
+	appendStringField(json, "commandLine", receipt.commandLine);
+	appendUnsignedField(json, "exitCode",
+		static_cast<unsigned>(receipt.processExitCode), false);
+	json << "\n},\n";
+	json << "\"schedulerMetrics\":{\n";
+	appendCounterField(json, "submittedJobCount",
+		receipt.schedulerMetrics.submittedJobCount);
+	appendCounterField(json, "executedJobCount",
+		receipt.schedulerMetrics.executedJobCount);
+	appendCounterField(json, "stealCount",
+		receipt.schedulerMetrics.stealCount);
+	appendCounterField(json, "ownerHelpCount",
+		receipt.schedulerMetrics.ownerHelpCount);
+	appendCounterField(json, "waitCount", receipt.schedulerMetrics.waitCount);
+	appendCounterField(json, "workerWaitRejectionCount",
+		receipt.schedulerMetrics.workerWaitRejectionCount);
+	appendCounterField(json, "failedJobCount",
+		receipt.schedulerMetrics.failedJobCount);
+	appendCounterField(json, "cancelledJobCount",
+		receipt.schedulerMetrics.cancelledJobCount);
+	appendCounterField(json, "serialFallbackCount",
+		receipt.schedulerMetrics.serialFallbackCount);
+	appendCounterField(json, "totalQueueLatencyNanoseconds",
+		receipt.schedulerMetrics.totalQueueLatencyNanoseconds);
+	appendCounterField(json, "maximumQueueLatencyNanoseconds",
+		receipt.schedulerMetrics.maximumQueueLatencyNanoseconds);
+	appendCounterField(json, "workerBusyNanoseconds",
+		receipt.schedulerMetrics.workerBusyNanoseconds);
+	appendCounterField(json, "workerWaitNanoseconds",
+		receipt.schedulerMetrics.workerWaitNanoseconds);
+	appendCounterField(json, "affinityFailureCount",
+		receipt.schedulerMetrics.affinityFailureCount);
+	appendUnsignedField(json, "injectionHighWater",
+		receipt.schedulerMetrics.injectionHighWater);
+	appendUnsignedField(json, "maximumActiveWorkers",
+		receipt.schedulerMetrics.maximumActiveWorkers);
+	appendUnsignedField(json, "availableLogicalCpuCount",
+		receipt.schedulerMetrics.availableLogicalCpuCount);
+	appendUnsignedField(json, "reservedOwnerCpuCount",
+		receipt.schedulerMetrics.reservedOwnerCpuCount);
+	appendUnsignedField(json, "selectedWorkerCpuCount",
+		receipt.schedulerMetrics.selectedWorkerCpuCount);
+	appendUnsignedField(json, "selectedWorkerPhysicalCoreCount",
+		receipt.schedulerMetrics.selectedWorkerPhysicalCoreCount);
+	appendCounterField(json, "selectedWorkerPhysicalCoreMask",
+		receipt.schedulerMetrics.selectedWorkerPhysicalCoreMask);
+	appendBoolField(json, "selectedWorkerPhysicalCoreMaskComplete",
+		receipt.schedulerMetrics.selectedWorkerPhysicalCoreMaskComplete,
+		false);
+	json << "\n},\n";
+	appendKey(json, "phases");
+	json << "[\n";
+	for (std::size_t index = 0; index < receipt.phases.size(); ++index)
+		appendPhase(json, receipt.phases[index],
+			index + 1 != receipt.phases.size());
+	json << "\n],\n";
+	appendKey(json, "kernels");
+	json << "[\n";
+	for (std::size_t index = 0; index < receipt.kernels.size(); ++index)
+		appendKernel(json, receipt.kernels[index],
+			index + 1 != receipt.kernels.size());
+	json << "\n],\n";
+	appendKernelTiming(json, receipt.kernelTiming);
+	json << ",\n";
+	appendKernelReference(json, receipt.kernelReference);
+	json << "\n}\n";
+	document = json.str();
+	return !document.empty();
+}
+
+bool ValidatePerformanceReceipt(const PerformanceReceipt &receipt,
+	std::string *reason)
+{
+	if (receipt.schemaVersion != PERFORMANCE_RECEIPT_SCHEMA_VERSION ||
+		receipt.producer != PERFORMANCE_RECEIPT_PRODUCER ||
+		receipt.evidenceKind != PERFORMANCE_RECEIPT_EVIDENCE_KIND ||
+		receipt.producerVersion != "5" || receipt.role != "performance-report" ||
+		receipt.architecture != "x64")
+	{
+		setReason(reason, "receipt schema or producer is not recognized");
+		return false;
+	}
+	if (receipt.status != "passed")
+	{
+		setReason(reason, "receipt is not complete");
+		return false;
+	}
+	if (!validKernelTiming(receipt))
+	{
+		setReason(reason, "kernel timing is not a finalized, internally consistent run snapshot");
+		return false;
+	}
+	if (!validKernelReference(receipt))
+	{
+		setReason(reason, "kernel reference is not a finalized, role-consistent canonical binding");
+		return false;
+	}
+	if (receipt.title.empty() || receipt.runId.empty() ||
+		receipt.runNonce.empty() || receipt.cohortNonce.empty() ||
+		receipt.cohortCreatedUtc.empty() || receipt.recordedUtc.empty() ||
+		receipt.sourceCommit.empty() || receipt.commandLine.empty() ||
+		receipt.fixtureId.empty() || !isSafeToken(receipt.runId) ||
+		!isCanonicalUuid(receipt.runNonce) || !isCanonicalUuid(receipt.cohortNonce) ||
+		!isIsoUtcTimestamp(receipt.cohortCreatedUtc) ||
+		!isIsoUtcTimestamp(receipt.recordedUtc) ||
+		receipt.recordedUtc < receipt.cohortCreatedUtc ||
+		!isLowerHexString(receipt.sourceCommit, 40) ||
+		!isSafeToken(receipt.fixtureId) || receipt.receiptPath.empty())
+	{
+		setReason(reason, "receipt identity fields are incomplete");
+		return false;
+	}
+	if (!isHexString(receipt.artifactSetSha256, 64) ||
+		!isHexString(receipt.runtimeClosureDependencyManifestSha256, 64) ||
+		!isHexString(receipt.runtimeClosureSha256, 64) ||
+		!isHexString(receipt.fixtureContentSha256, 64) ||
+		!isHexString(receipt.executableSha256, 64) ||
+		receipt.executablePath.empty())
+	{
+		setReason(reason, "binary or fixture hash identity is incomplete");
+		return false;
+	}
+	if (!receipt.processIdentityAvailable || receipt.processId == 0 ||
+		receipt.processCreationTimeUtc100ns == 0 ||
+		receipt.processStartTimeUtc100ns == 0 ||
+		receipt.processEndTimeUtc100ns < receipt.processStartTimeUtc100ns ||
+		!receipt.processExitCodeKnown || receipt.processExitCode != 0 ||
+		receipt.processExitBoundary.empty())
+	{
+		setReason(reason, "process provenance or exit boundary is unavailable");
+		return false;
+	}
+	if (!receipt.seedKnown || receipt.frameEnd < receipt.frameStart ||
+		receipt.finalFrame != receipt.frameEnd || !receipt.finalCrcKnown)
+	{
+		setReason(reason, "fixture result frame or CRC is incomplete");
+		return false;
+	}
+	const bool observedOnly = receipt.workloadQualification == "observed-only";
+	if ((!observedOnly && receipt.workloadQualification != "minimum-qualified") ||
+		!receipt.fixtureIdentityObserved || receipt.fixtureObservationFailed || receipt.fixtureContentPath.empty() ||
+		(receipt.fixtureKind != "replay" && receipt.fixtureKind != "fresh-ai-map") ||
+		(receipt.fixtureKind == "replay" && (receipt.replayPath != receipt.fixtureContentPath ||
+			!receipt.retainedReplayPath.empty() || !receipt.retainedReplaySha256.empty())) ||
+		(receipt.fixtureKind == "fresh-ai-map" && (!observedOnly || !receipt.replayPath.empty() ||
+			receipt.retainedReplayPath.empty() || !isHexString(receipt.retainedReplaySha256, 64))))
+	{
+		setReason(reason, "fixture observation, kind, or retained replay identity is incomplete");
+		return false;
+	}
+	const PerformanceReceiptWorkload &workload = receipt.workload;
+	if ((observedOnly && (receipt.requestedPlayerCount != 0 || receipt.requestedMinimumUnitCount != 0)) ||
+		(!observedOnly && (receipt.requestedPlayerCount == 0 || receipt.requestedMinimumUnitCount == 0 ||
+			workload.playerCount != receipt.requestedPlayerCount || workload.initialUnitCount < receipt.requestedMinimumUnitCount)) ||
+		workload.sampleCount == 0 || !workload.rosterStable || !workload.contiguous ||
+		workload.playerCount == 0 ||
+		static_cast<JobMetricCounter>(workload.firstFrame) !=
+			static_cast<JobMetricCounter>(receipt.frameStart) + 1 ||
+		workload.lastFrame != receipt.frameEnd ||
+		workload.lastFrame < workload.firstFrame ||
+		workload.sampleCount != static_cast<JobMetricCounter>(workload.lastFrame) -
+			workload.firstFrame + 1 ||
+		workload.minimumUnitCount > workload.initialUnitCount ||
+		workload.peakUnitCount < workload.initialUnitCount)
+	{
+		setReason(reason, "completed-frame workload observation is incomplete or below the requested minimum");
+		return false;
+	}
+	if (receipt.frameSimulationTotalNanoseconds == 0 ||
+		receipt.frameSimulationMaximumNanoseconds == 0 ||
+		receipt.frameSimulationMaximumNanoseconds > receipt.frameSimulationTotalNanoseconds ||
+		receipt.frameSimulationSampleCount < workload.sampleCount)
+	{
+		setReason(reason, "measured frame simulation timing is incomplete");
+		return false;
+	}
+	if ((receipt.simulationMode != "serial" && receipt.simulationMode != "parallel" && receipt.simulationMode != "shadow") ||
+		(receipt.workerPolicy != "auto" && receipt.workerPolicy != "all"))
+	{
+		setReason(reason, "actual simulation mode or worker policy is unknown");
+		return false;
+	}
+	if (!receipt.schedulerStarted && (!observedOnly || receipt.simulationMode != "serial" ||
+		receipt.effectiveWorkerCount != 0 || receipt.workersPinned || receipt.availableLogicalCpuCount != 0 ||
+		receipt.reservedOwnerCpuCount != 0 || receipt.selectedWorkerCpuCount != 0 ||
+		receipt.selectedWorkerPhysicalCoreCount != 0 || receipt.selectedWorkerPhysicalCoreMask != 0 ||
+		receipt.selectedWorkerPhysicalCoreMaskComplete || !receipt.cpuSets.empty() ||
+		!receipt.ownerCpuSetIds.empty() || !receipt.selectedWorkerCpuSetIds.empty()))
+	{
+		setReason(reason, "absent scheduler cannot claim workers or physical topology");
+		return false;
+	}
+	if (receipt.schedulerStarted && (!receipt.workersPinned ||
+		receipt.effectiveWorkerCount == 0 ||
+		receipt.availableLogicalCpuCount == 0 ||
+		receipt.selectedWorkerCpuCount == 0 ||
+		receipt.selectedWorkerPhysicalCoreCount == 0 ||
+		receipt.selectedWorkerPhysicalCoreMask == 0 ||
+		receipt.effectiveWorkerCount != receipt.selectedWorkerCpuCount ||
+		!receipt.selectedWorkerPhysicalCoreMaskComplete))
+	{
+		setReason(reason, "effective worker or physical topology proof is incomplete");
+		return false;
+	}
+	if ((receipt.schedulerStarted && receipt.cpuSets.empty()) ||
+		receipt.selectedWorkerCpuSetIds.size() !=
+			receipt.selectedWorkerCpuCount ||
+		receipt.ownerCpuSetIds.size() != receipt.reservedOwnerCpuCount ||
+		receipt.availableLogicalCpuCount < receipt.selectedWorkerCpuCount)
+	{
+		setReason(reason, "CPU-set topology arrays are incomplete");
+		return false;
+	}
+	std::vector<unsigned> seenCpuSetIds;
+	for (std::size_t index = 0; index < receipt.cpuSets.size(); ++index)
+	{
+		const PerformanceReceiptCpuSet &cpuSet = receipt.cpuSets[index];
+		if (containsUnsigned(seenCpuSetIds, cpuSet.id))
+		{
+			setReason(reason, "CPU-set topology contains duplicate IDs");
+			return false;
+		}
+		seenCpuSetIds.push_back(cpuSet.id);
+	}
+	std::vector<unsigned> selectedIds;
+	for (std::size_t index = 0;
+		index < receipt.selectedWorkerCpuSetIds.size(); ++index)
+	{
+		const unsigned id = receipt.selectedWorkerCpuSetIds[index];
+		PerformanceReceiptCpuSet cpuSet;
+		if (containsUnsigned(selectedIds, id) || !findCpuSet(receipt, id,
+			&cpuSet) || !cpuSet.availableToProcess || cpuSet.parked ||
+			cpuSet.allocatedToOtherProcess)
+		{
+			setReason(reason, "selected CPU-set is unavailable or duplicated");
+			return false;
+		}
+		selectedIds.push_back(id);
+	}
+	for (std::size_t first = 0; first < selectedIds.size(); ++first)
+	{
+		PerformanceReceiptCpuSet firstSet;
+		findCpuSet(receipt, selectedIds[first], &firstSet);
+		for (std::size_t second = first + 1; second < selectedIds.size();
+			++second)
+		{
+			PerformanceReceiptCpuSet secondSet;
+			findCpuSet(receipt, selectedIds[second], &secondSet);
+			if (firstSet.group == secondSet.group &&
+				firstSet.coreIndex == secondSet.coreIndex)
+			{
+				setReason(reason, "selected CPU-sets share one physical core");
+				return false;
+			}
+		}
+	}
+	if (selectedIds.size() != receipt.selectedWorkerPhysicalCoreCount)
+	{
+		setReason(reason, "selected physical-core count does not match CPU sets");
+		return false;
+	}
+	std::vector<unsigned> ownerIds;
+	for (std::size_t index = 0; index < receipt.ownerCpuSetIds.size(); ++index)
+	{
+		PerformanceReceiptCpuSet ownerSet;
+		if (containsUnsigned(ownerIds, receipt.ownerCpuSetIds[index]) ||
+			!findCpuSet(receipt, receipt.ownerCpuSetIds[index], &ownerSet) ||
+			!ownerSet.availableToProcess || ownerSet.parked ||
+			ownerSet.allocatedToOtherProcess)
+		{
+			setReason(reason, "owner CPU-set is absent or duplicated");
+			return false;
+		}
+		else
+			ownerIds.push_back(receipt.ownerCpuSetIds[index]);
+	}
+	if (receipt.rawEvidence.verifierBoundary.empty() ||
+		receipt.rawEvidence.rawLogPath.empty() ||
+		receipt.rawEvidence.timingPath.empty() ||
+		!isHexString(receipt.rawEvidence.rawLogSha256, 64) ||
+		!isHexString(receipt.rawEvidence.timingSha256, 64))
+	{
+		setReason(reason, "raw log or timing evidence boundary is incomplete");
+		return false;
+	}
+	if (!receipt.rawEvidence.timingClosed || !receipt.rawEvidence.timingWriteSucceeded ||
+		receipt.rawEvidence.timingTruncated || !receipt.rawEvidence.timingComplete ||
+		receipt.rawEvidence.timingSessionCount != 1 ||
+		receipt.rawEvidence.timingFrameSamples < workload.sampleCount ||
+		receipt.rawEvidence.timingFirstFrame > receipt.frameStart ||
+		receipt.rawEvidence.timingLastFrame < receipt.frameEnd)
+	{
+		setReason(reason, "timing capture is not closed, complete, and frame-correlated");
+		return false;
+	}
+	const unsigned requiredPhaseCount =
+		static_cast<unsigned>(sizeof(REQUIRED_PHASE_NAMES) /
+			sizeof(REQUIRED_PHASE_NAMES[0]));
+	if (!hasUniqueNamesAndExactOrder(receipt.phases, REQUIRED_PHASE_NAMES,
+		requiredPhaseCount))
+	{
+		setReason(reason, "executable phase metrics are not the exact canonical set");
+		return false;
+	}
+	JobMetricCounter phaseTotal = 0;
+	for (std::size_t index = 0; index < receipt.phases.size(); ++index)
+	{
+		const PerformanceReceiptPhase &phase = receipt.phases[index];
+		if (phase.available && (phase.sampleCount == 0 ||
+			phase.totalNanoseconds == 0 || phase.maximumNanoseconds == 0))
+		{
+			setReason(reason, "available phase metric has no positive timing");
+			return false;
+		}
+		if (!phase.available && (phase.totalNanoseconds != 0 ||
+			phase.maximumNanoseconds != 0 || phase.sampleCount != 0))
+		{
+			setReason(reason, "unavailable phase metric contains timing data");
+			return false;
+		}
+		if (phase.maximumNanoseconds > phase.totalNanoseconds ||
+			phase.sampleCount > receipt.frameSimulationSampleCount ||
+			phase.totalNanoseconds > receipt.frameSimulationTotalNanoseconds - phaseTotal ||
+			(!phase.serialNanosecondsKnown && phase.serialNanoseconds != 0) ||
+			(phase.serialNanosecondsKnown && (!phase.available ||
+				phase.serialNanoseconds > phase.totalNanoseconds)))
+		{
+			setReason(reason, "owner phase timing or serial coverage is inconsistent");
+			return false;
+		}
+		phaseTotal += phase.totalNanoseconds;
+	}
+	const unsigned requiredKernelCount =
+		static_cast<unsigned>(sizeof(REQUIRED_KERNEL_NAMES) /
+			sizeof(REQUIRED_KERNEL_NAMES[0]));
+	if (!hasUniqueNamesAndExactOrder(receipt.kernels, REQUIRED_KERNEL_NAMES,
+		requiredKernelCount))
+	{
+		setReason(reason, "executable kernel metrics are not the exact canonical set");
+		return false;
+	}
+	for (std::size_t index = 0; index < receipt.kernels.size(); ++index)
+	{
+		const PerformanceReceiptKernel &kernel = receipt.kernels[index];
+		if (!receipt.schedulerStarted && (kernel.physicalWorkerJobs != 0 ||
+			kernel.physicalWorkerMask != 0 || kernel.distinctPhysicalWorkers != 0))
+		{
+			setReason(reason, "absent scheduler cannot report physical kernel execution");
+			return false;
+		}
+		if (!kernel.available && (kernel.submittedJobs != 0 ||
+			kernel.completedJobs != 0 || kernel.physicalWorkerJobs != 0 ||
+			kernel.ownerHelpedJobs != 0 || kernel.physicalWorkerMask != 0 ||
+			kernel.distinctPhysicalWorkers != 0 ||
+			kernel.physicalWorkerMaskComplete ||
+			kernel.elapsedNanoseconds != 0 || kernel.elapsedNanosecondsKnown))
+		{
+			setReason(reason, "unavailable kernel metric contains evidence");
+			return false;
+		}
+		if (kernel.elapsedNanosecondsKnown &&
+			kernel.elapsedNanoseconds == 0)
+		{
+			setReason(reason, "known kernel timing is not positive");
+			return false;
+		}
+	}
+	return true;
+}
+
+bool WritePerformanceReceiptAtomically(PerformanceReceipt &receipt,
+	const char *directory, std::string *writtenPath, std::string *reason)
+{
+	if (writtenPath != 0)
+		writtenPath->clear();
+	if (directory == 0 || directory[0] == '\0')
+	{
+		setReason(reason, "receipt destination directory is missing");
+		return false;
+	}
+	std::ostringstream finalName;
+	finalName << directory;
+	const std::string directoryText(directory);
+	if (!directoryText.empty() && directoryText[directoryText.size() - 1] != '\\' &&
+		directoryText[directoryText.size() - 1] != '/')
+		finalName << '\\';
+	finalName << "performance-receipt-" << receipt.runId << '-'
+		<< receipt.processId << ".json";
+	const std::string finalPath = finalName.str();
+	receipt.receiptPath = finalPath;
+#if defined(_WIN32)
+	if (!receipt.rawEvidence.timingClosed || !receipt.rawEvidence.timingWriteSucceeded ||
+		receipt.rawEvidence.timingTruncated || !receipt.rawEvidence.timingComplete)
+	{
+		setReason(reason, "timing capture must be completely finalized before hashing");
+		return false;
+	}
+	if (!calculateFileSha256(receipt.rawEvidence.rawLogPath,
+			receipt.rawEvidence.rawLogSha256) ||
+		!calculateFileSha256(receipt.rawEvidence.timingPath,
+			receipt.rawEvidence.timingSha256))
+	{
+		setReason(reason, "closed raw evidence could not be hashed");
+		return false;
+	}
+#endif
+	if (!ValidatePerformanceReceipt(receipt, reason))
+		return false;
+	std::string document;
+	if (!SerializePerformanceReceipt(receipt, document, reason))
+	{
+		setReason(reason, "receipt serialization failed");
+		return false;
+	}
+#if defined(_WIN32)
+	const DWORD attributes = GetFileAttributesA(directory);
+	if (attributes == INVALID_FILE_ATTRIBUTES ||
+		(attributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+	{
+		setReason(reason, "receipt destination is not an existing directory");
+		return false;
+	}
+	std::ostringstream temporaryName;
+	temporaryName << finalPath << ".tmp-" << GetCurrentProcessId() << '-'
+		<< GetTickCount();
+	const std::string temporaryPath = temporaryName.str();
+	HANDLE file = CreateFileA(temporaryPath.c_str(), GENERIC_WRITE, 0, 0,
+		CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, 0);
+	if (file == INVALID_HANDLE_VALUE)
+	{
+		setReason(reason, "temporary receipt creation failed");
+		return false;
+	}
+	std::size_t offset = 0;
+	bool success = true;
+	while (offset < document.size())
+	{
+		const DWORD requested = static_cast<DWORD>(std::min<std::size_t>(
+			document.size() - offset, 0xffffffffU));
+		DWORD written = 0;
+		if (!WriteFile(file, document.data() + offset, requested, &written, 0) ||
+			written != requested)
+		{
+			success = false;
+			break;
+		}
+		offset += written;
+	}
+	if (success && !FlushFileBuffers(file))
+		success = false;
+	CloseHandle(file);
+	if (!success || !MoveFileExA(temporaryPath.c_str(), finalPath.c_str(),
+		MOVEFILE_WRITE_THROUGH))
+	{
+		DeleteFileA(temporaryPath.c_str());
+		setReason(reason, "atomic receipt publication failed");
+		return false;
+	}
+#else
+	const std::string temporaryPath = finalPath + ".tmp";
+	{
+		std::ofstream output(temporaryPath.c_str(),
+			std::ios::out | std::ios::binary | std::ios::trunc);
+		if (!output.is_open())
+		{
+			setReason(reason, "temporary receipt creation failed");
+			return false;
+		}
+		output.write(document.data(), static_cast<std::streamsize>(document.size()));
+		output.flush();
+		if (!output.good())
+		{
+			setReason(reason, "temporary receipt write failed");
+			return false;
+		}
+	}
+	if (rename(temporaryPath.c_str(), finalPath.c_str()) != 0)
+	{
+		remove(temporaryPath.c_str());
+		setReason(reason, "atomic receipt publication failed");
+		return false;
+	}
+#endif
+	if (writtenPath != 0)
+		*writtenPath = finalPath;
+	return true;
+}
+
+} }

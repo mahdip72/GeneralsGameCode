@@ -224,15 +224,31 @@ JobSystemMetrics::JobSystemMetrics()
 	  ownerHelpCount(0), waitCount(0), workerWaitRejectionCount(0),
 	  failedJobCount(0), cancelledJobCount(0), serialFallbackCount(0),
 	  totalQueueLatencyNanoseconds(0), maximumQueueLatencyNanoseconds(0),
-	  workerSleepCount(0), workerWakeCount(0), affinityFailureCount(0), injectionHighWater(0),
+	  workerSleepCount(0), workerWakeCount(0),
+	  workerBusyNanoseconds(0), maximumWorkerBusyNanoseconds(0),
+	  workerBusySampleCount(0), workerWaitNanoseconds(0),
+	  maximumWorkerWaitNanoseconds(0), workerWaitSampleCount(0),
+	  affinityFailureCount(0), injectionHighWater(0),
 	  maximumActiveWorkers(0), availableLogicalCpuCount(0), reservedOwnerCpuCount(0),
-	  selectedWorkerCpuCount(0) {}
+	  selectedWorkerCpuCount(0), selectedWorkerPhysicalCoreCount(0),
+	  selectedWorkerPhysicalCoreMask(0),
+	  selectedWorkerPhysicalCoreMaskComplete(true) {}
 
 JobContext::JobContext(State *state) : m_state(state) {}
 
 bool JobContext::isCancellationRequested() const
 {
 	return m_state != 0 && m_state->group != 0 && m_state->group->cancelled;
+}
+
+bool JobContext::isPhysicalWorkerExecution() const
+{
+	return false;
+}
+
+unsigned JobContext::physicalWorkerIndex() const
+{
+	return JOB_INVALID_PHYSICAL_WORKER_INDEX;
 }
 
 void JobContext::fail()
@@ -445,13 +461,152 @@ unsigned JobSystem::selectWorkerCpuSets(const JobCpuSetInfo *cpuSets,
 		selectedCount : selectedIdCapacity;
 	unsigned index;
 	unsigned written = 0;
+	/* Prefer distinct physical cores before selecting SMT siblings. */
 	for (index = 0; index < eligibleCount && written < writable; ++index)
 	{
 		if ((ownerCount > 0 && eligible[index].id == ownerIds[0]) ||
 			(ownerCount > 1 && eligible[index].id == ownerIds[1])) continue;
+		bool sharesSelectedCore = false;
+		unsigned selectedIndex;
+		for (selectedIndex = 0; selectedIndex < written; ++selectedIndex)
+		{
+			unsigned eligibleIndex;
+			for (eligibleIndex = 0; eligibleIndex < eligibleCount; ++eligibleIndex)
+			{
+				if (eligible[eligibleIndex].id != selectedIds[selectedIndex]) continue;
+				sharesSelectedCore = eligible[index].coreIndex != UINT_MAX &&
+					eligible[eligibleIndex].coreIndex != UINT_MAX &&
+					eligible[index].group == eligible[eligibleIndex].group &&
+					eligible[index].coreIndex == eligible[eligibleIndex].coreIndex;
+				break;
+			}
+			if (sharesSelectedCore) break;
+		}
+		if (sharesSelectedCore) continue;
 		selectedIds[written++] = eligible[index].id;
 	}
+	for (index = 0; index < eligibleCount && written < writable; ++index)
+	{
+		if ((ownerCount > 0 && eligible[index].id == ownerIds[0]) ||
+			(ownerCount > 1 && eligible[index].id == ownerIds[1])) continue;
+		bool alreadySelected = false;
+		unsigned selectedIndex;
+		for (selectedIndex = 0; selectedIndex < written; ++selectedIndex)
+		{
+			if (selectedIds[selectedIndex] == eligible[index].id)
+			{
+				alreadySelected = true;
+				break;
+			}
+		}
+		if (!alreadySelected) selectedIds[written++] = eligible[index].id;
+	}
 	return written;
+}
+
+unsigned JobSystem::summarizeSelectedPhysicalCores(
+	const JobCpuSetInfo *cpuSets, unsigned cpuSetCount,
+	const unsigned *selectedIds, unsigned selectedIdCount,
+	JobMetricCounter *selectedCoreMask, bool *selectedCoreMaskComplete)
+{
+	if (selectedCoreMask != 0) *selectedCoreMask = 0;
+	if (selectedCoreMaskComplete != 0) *selectedCoreMaskComplete = true;
+	if (cpuSets == 0 || selectedIds == 0)
+	{
+		if (selectedCoreMaskComplete != 0 && selectedIdCount != 0)
+			*selectedCoreMaskComplete = false;
+		return 0;
+	}
+	unsigned distinctCount = 0;
+	const unsigned maskBits = (unsigned)(sizeof(JobMetricCounter) * 8);
+	unsigned selectedIndex;
+	for (selectedIndex = 0; selectedIndex < selectedIdCount; ++selectedIndex)
+	{
+		unsigned cpuIndex = cpuSetCount;
+		unsigned index;
+		for (index = 0; index < cpuSetCount; ++index)
+		{
+			if (cpuSets[index].id == selectedIds[selectedIndex])
+			{
+				cpuIndex = index;
+				break;
+			}
+		}
+		if (cpuIndex == cpuSetCount)
+		{
+			if (selectedCoreMaskComplete != 0)
+				*selectedCoreMaskComplete = false;
+			continue;
+		}
+		bool alreadyCounted = false;
+		unsigned previous;
+		for (previous = 0; previous < selectedIndex; ++previous)
+		{
+			unsigned previousCpuIndex = cpuSetCount;
+			for (index = 0; index < cpuSetCount; ++index)
+			{
+				if (cpuSets[index].id == selectedIds[previous])
+				{
+					previousCpuIndex = index;
+					break;
+				}
+			}
+			if (previousCpuIndex == cpuSetCount) continue;
+			const bool sameKnownCore = cpuSets[cpuIndex].coreIndex != UINT_MAX &&
+				cpuSets[previousCpuIndex].coreIndex != UINT_MAX &&
+				cpuSets[cpuIndex].group == cpuSets[previousCpuIndex].group &&
+				cpuSets[cpuIndex].coreIndex == cpuSets[previousCpuIndex].coreIndex;
+			if (sameKnownCore || cpuSets[cpuIndex].id == cpuSets[previousCpuIndex].id)
+			{
+				alreadyCounted = true;
+				break;
+			}
+		}
+		if (alreadyCounted) continue;
+		unsigned representativeIndex = cpuIndex;
+		for (index = 0; index < cpuIndex; ++index)
+		{
+			const bool sameKnownCore = cpuSets[cpuIndex].coreIndex != UINT_MAX &&
+				cpuSets[index].coreIndex != UINT_MAX &&
+				cpuSets[cpuIndex].group == cpuSets[index].group &&
+				cpuSets[cpuIndex].coreIndex == cpuSets[index].coreIndex;
+			if (sameKnownCore || cpuSets[cpuIndex].id == cpuSets[index].id)
+			{
+				representativeIndex = index;
+				break;
+			}
+		}
+		unsigned topologyOrdinal = 0;
+		for (index = 0; index < representativeIndex; ++index)
+		{
+			bool earlierSameCore = false;
+			unsigned earlier;
+			for (earlier = 0; earlier < index; ++earlier)
+			{
+				const bool sameKnownCore = cpuSets[index].coreIndex != UINT_MAX &&
+					cpuSets[earlier].coreIndex != UINT_MAX &&
+					cpuSets[index].group == cpuSets[earlier].group &&
+					cpuSets[index].coreIndex == cpuSets[earlier].coreIndex;
+				if (sameKnownCore || cpuSets[index].id == cpuSets[earlier].id)
+				{
+					earlierSameCore = true;
+					break;
+				}
+			}
+			if (!earlierSameCore) ++topologyOrdinal;
+		}
+		if (topologyOrdinal < maskBits)
+		{
+			if (selectedCoreMask != 0)
+				*selectedCoreMask |= ((JobMetricCounter)1) << topologyOrdinal;
+		}
+		else if (selectedCoreMaskComplete != 0)
+		{
+			*selectedCoreMaskComplete = false;
+		}
+		++distinctCount;
+	}
+	return distinctCount;
 }
 
 bool JobSystem::setStartupWorkerCount(unsigned workerCount)
@@ -586,6 +741,16 @@ bool JobSystem::isWorkerThread() const { return false; }
 unsigned JobSystem::outstandingJobCount() const { return 0; }
 JobSystemMetrics JobSystem::metrics() const { return m_state != 0 ? m_state->metrics : JobSystemMetrics(); }
 void JobSystem::resetMetrics() { if (m_state != 0) m_state->metrics = JobSystemMetrics(); }
+void JobSystem::resetPerformanceMetrics()
+{
+	if (m_state == 0) return;
+	m_state->metrics.workerBusyNanoseconds = 0;
+	m_state->metrics.maximumWorkerBusyNanoseconds = 0;
+	m_state->metrics.workerBusySampleCount = 0;
+	m_state->metrics.workerWaitNanoseconds = 0;
+	m_state->metrics.maximumWorkerWaitNanoseconds = 0;
+	m_state->metrics.workerWaitSampleCount = 0;
+}
 void JobSystem::recordSerialFallback() { if (m_state != 0) ++m_state->metrics.serialFallbackCount; }
 
 JobGroup JobSystem::createGroup()
@@ -673,8 +838,10 @@ JobHandle JobSystem::trySubmitAfter(Job *job, JobPriority priority,
 	++m_state->metrics.submittedJobCount;
 	bool cancelled = groupRecord->cancelled;
 	bool failed = dependencyFailed;
+	bool callbackExecuted = false;
 	if (!cancelled && !failed)
 	{
+		callbackExecuted = true;
 		JobContext::State contextState(groupRecord,
 			m_state->scratch.empty() ? 0 : &m_state->scratch[0],
 			(unsigned)m_state->scratch.size());
@@ -701,10 +868,10 @@ JobHandle JobSystem::trySubmitAfter(Job *job, JobPriority priority,
 	groupRecord->failed = groupRecord->failed || failed;
 	groupRecord->cancelled = groupRecord->cancelled || cancelled;
 	--groupRecord->pending;
-	++m_state->metrics.executedJobCount;
+	if (callbackExecuted) ++m_state->metrics.executedJobCount;
 	if (failed) ++m_state->metrics.failedJobCount;
 	if (cancelled) ++m_state->metrics.cancelledJobCount;
-	m_state->metrics.maximumActiveWorkers = 1;
+	if (callbackExecuted) m_state->metrics.maximumActiveWorkers = 1;
 	return JobHandle(handleState);
 }
 
@@ -811,8 +978,10 @@ bool JobSystem::trySubmitBatch(const JobSubmission *submissions,
 		}
 		bool cancelled = groupRecord->cancelled;
 		bool failed = dependencyFailed;
+		bool callbackExecuted = false;
 		if (!cancelled && !failed)
 		{
+			callbackExecuted = true;
 			JobContext::State contextState(groupRecord,
 				m_state->scratch.empty() ? 0 : &m_state->scratch[0],
 				(unsigned)m_state->scratch.size());
@@ -848,10 +1017,10 @@ bool JobSystem::trySubmitBatch(const JobSubmission *submissions,
 		groupRecord->cancelled = groupRecord->cancelled || cancelled;
 		--groupRecord->pending;
 		++m_state->metrics.submittedJobCount;
-		++m_state->metrics.executedJobCount;
+		if (callbackExecuted) ++m_state->metrics.executedJobCount;
 		if (failed) ++m_state->metrics.failedJobCount;
 		if (cancelled) ++m_state->metrics.cancelledJobCount;
-		m_state->metrics.maximumActiveWorkers = 1;
+		if (callbackExecuted) m_state->metrics.maximumActiveWorkers = 1;
 		delete handles[index].m_state;
 		handles[index].m_state = handleStates[index];
 		handleStates[index] = 0;
@@ -875,6 +1044,16 @@ bool JobSystem::wait(const JobHandle &handle)
 bool JobSystem::wait(const JobGroup &group)
 {
 	if (!group.isValid()) return false;
+	++m_state->metrics.waitCount;
+	return group.isComplete();
+}
+bool JobSystem::waitWithoutOwnerHelp(const JobGroup &group,
+	unsigned timeoutMilliseconds)
+{
+	(void)timeoutMilliseconds;
+	if (!group.isValid() || m_state == 0 ||
+		group.m_state->record->owner != m_state)
+		return false;
 	++m_state->metrics.waitCount;
 	return group.isComplete();
 }

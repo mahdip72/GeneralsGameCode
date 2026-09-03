@@ -49,25 +49,27 @@
 #include "WWMath/vector3.h"
 #include "texturefilter.h"
 
-struct IDirect3DBaseTexture8;
-struct IDirect3DTexture8;
-struct IDirect3DCubeTexture8;
-struct IDirect3DVolumeTexture8;
-
-class DX8Wrapper;
 class TextureLoader;
 class LoaderThreadClass;
 class TextureLoadTaskClass;
 class TextureClass;
 class CubeTextureClass;
 class VolumeTextureClass;
+#if defined(_WIN64)
+struct NativeTextureStorage;
+namespace rts { namespace render {
+	struct NativeW3DTextureHandle;
+	struct NativeW3DSurfaceHandle;
+	struct NativeW3DGpuContentLease;
+	struct TextureDescriptor;
+	struct TextureSubresourceData;
+} }
+#endif
 
 class TextureBaseClass : public RefCountClass
 {
 	friend class TextureLoader;
 	friend class LoaderThreadClass;
-	friend class DX8TextureTrackerClass;  //(gth) so it can call Poke_Texture,
-	friend class DX8ZTextureTrackerClass;
 
 public:
 
@@ -155,9 +157,12 @@ public:
 	// This utility function processes the texture reduction (used during rendering)
 	void Invalidate();
 
-	// texture accessors (dx8)
-	IDirect3DBaseTexture8 *Peek_D3D_Base_Texture() const;
-	void Set_D3D_Base_Texture(IDirect3DBaseTexture8* tex);
+	// Opaque texture-handle accessors. Native rendering uses the typed
+	// acquisition/publication methods below; this slot is retained so
+	// migrated callers can preserve access-time bookkeeping without exposing
+	// a graphics API object through the product header.
+	void *Peek_Texture_Handle() const;
+	void Set_Texture_Handle(void *texture_handle);
 
 	PoolType Get_Pool() const { return Pool; }
 
@@ -176,7 +181,8 @@ public:
 	unsigned Get_Reduction() const;
 
 	// Background texture loader will call this when texture has been loaded
-	virtual void Apply_New_Surface(IDirect3DBaseTexture8* tex, bool initialized, bool disable_auto_invalidation = false)=0;	// If the parameter is true, the texture will be flagged as initialised
+	virtual void Apply_New_Surface(void *texture_handle, bool initialized,
+		bool disable_auto_invalidation = false)=0;	// If the parameter is true, the texture will be flagged as initialised
 
 	MipCountType MipLevelCount;
 
@@ -186,27 +192,58 @@ public:
 	// but the currently used textures.
 	static void Invalidate_Old_Unused_Textures(unsigned inactive_time_override);
 
-	// Apply this texture's settings into D3D
+	// Apply this texture's settings into the active renderer
 	virtual void Apply(unsigned int stage)=0;
 
-	// Apply a Null texture's settings into D3D
+	// Apply a null texture's settings into the active renderer
 	static void Apply_Null(unsigned int stage);
 
 	virtual TextureClass* As_TextureClass() { return nullptr; }
 	virtual CubeTextureClass* As_CubeTextureClass() { return nullptr; }
 	virtual VolumeTextureClass* As_VolumeTextureClass() { return nullptr; }
 
-	IDirect3DTexture8* Peek_D3D_Texture() const { return (IDirect3DTexture8*)Peek_D3D_Base_Texture(); }
-	IDirect3DVolumeTexture8* Peek_D3D_VolumeTexture() const { return (IDirect3DVolumeTexture8*)Peek_D3D_Base_Texture(); }
-	IDirect3DCubeTexture8* Peek_D3D_CubeTexture() const { return (IDirect3DCubeTexture8*)Peek_D3D_Base_Texture(); }
+#if defined(_WIN64)
+	// Product-facing x64 texture publication. These methods expose only typed
+	// generation-safe handles; the retained CPU view supports SurfaceClass
+	// read/modify paths without retaining a native COM resource.
+	bool Apply_Native_Texture(const rts::render::TextureDescriptor &descriptor,
+		const rts::render::TextureSubresourceData *subresources,
+		unsigned int subresource_count, WW3DFormat source_format,
+		bool initialized, bool disable_auto_invalidation = false,
+		bool missing_texture = false);
+	bool Apply_Native_Missing_Texture();
+	bool Acquire_Native_Texture(rts::render::NativeW3DTextureHandle *handle,
+		rts::render::NativeW3DGpuContentLease *gpu_lease = 0) const;
+	bool Acquire_Native_Surface(unsigned int mip_level,
+		unsigned int array_slice, bool for_output,
+		rts::render::NativeW3DSurfaceHandle *surface,
+		rts::render::NativeW3DGpuContentLease *gpu_lease = 0) const;
+	bool Publish_Native_Output(rts::render::NativeW3DSurfaceHandle surface,
+		rts::render::NativeW3DGpuContentLease *gpu_lease) const;
+	bool Copy_Native_Active_Color_Target();
+	bool Publish_Native_BGRA8(const void *data, size_t row_pitch,
+		size_t slice_pitch);
+	bool Generate_Native_Mip_Levels();
+	bool Refresh_Native_CPU_Content() const;
+	bool Get_Native_Subresource_Data(unsigned int mip_level,
+		unsigned int array_slice, const unsigned char **data,
+		size_t *row_pitch, size_t *slice_pitch) const;
+	bool Update_Native_Subresource_Data(unsigned int mip_level,
+		unsigned int array_slice, const unsigned char *data,
+		size_t row_pitch, size_t slice_pitch);
+	size_t Get_Native_Texture_Byte_Count() const;
+#endif
 
 protected:
 
 	void Load_Locked_Surface();
-	// Release the owned legacy resource in one place so all lifecycle paths keep
-	// the pointer/ref-count transition identical.
-	void Release_D3D_Texture();
-	void Poke_Texture(IDirect3DBaseTexture8* tex) { D3DTexture = tex; }
+	// Release the opaque compatibility handle in one place. Native resource
+	// ownership is handled by Release_Native_Texture().
+	void Release_Texture_Handle();
+#if defined(_WIN64)
+	void Release_Native_Texture();
+#endif
+	void Poke_Texture_Handle(void *texture_handle) { TextureHandle = texture_handle; }
 
 	bool Initialized;
 
@@ -232,8 +269,11 @@ protected:
 
 private:
 
-	// Direct3D texture object
-	IDirect3DBaseTexture8 *D3DTexture;
+	// Opaque compatibility texture handle. Native paths use NativeTexture.
+	void *TextureHandle;
+#if defined(_WIN64)
+	NativeTextureStorage *NativeTexture;
+#endif
 
 	// Name
 	StringClass Name;
@@ -260,14 +300,13 @@ private:
 **                             TextureClass
 **
 ** This is our regular texture class. For legacy reasons it contains some
-** information beyond the D3D texture itself, such as texture addressing
+** information beyond the native texture itself, such as texture addressing
 ** modes.
 **
 *************************************************************************/
 class TextureClass : public TextureBaseClass
 {
 	W3DMPO_CODE(TextureClass)
-//	friend DX8Wrapper;
 
 public:
 
@@ -281,7 +320,20 @@ public:
 		PoolType pool=POOL_MANAGED,
 		bool rendertarget=false,
 		bool allow_reduction=true
+#if defined(_WIN64)
+		, bool initialize_native_resource=true
+#endif
 	);
+
+#if defined(_WIN64)
+	// Build a texture directly from a validated native upload. This avoids
+	// allocating an empty resource that is immediately retired by the first
+	// prepared publication.
+	static TextureClass *Create_Native_From_Prepared(
+		const rts::render::TextureDescriptor &descriptor,
+		const rts::render::TextureSubresourceData *subresources,
+		unsigned int subresource_count, WW3DFormat source_format);
+#endif
 
 	// Create texture from a file. If format is specified the texture is converted to that format.
 	// Note that the format must be supported by the current device and that a texture can't exist
@@ -303,7 +355,7 @@ public:
 		MipCountType mip_level_count=MIP_LEVELS_ALL
 	);
 
-	TextureClass(IDirect3DBaseTexture8* d3d_texture);
+	TextureClass(void *texture_handle);
 
 	// default constructors for derived classes (cube & vol)
 	TextureClass
@@ -323,11 +375,12 @@ public:
 	virtual void Init() override;
 
 	// Background texture loader will call this when texture has been loaded
-	virtual void Apply_New_Surface(IDirect3DBaseTexture8* tex, bool initialized, bool disable_auto_invalidation = false) override;	// If the parameter is true, the texture will be flagged as initialised
+	virtual void Apply_New_Surface(void *texture_handle, bool initialized,
+		bool disable_auto_invalidation = false) override;	// If the parameter is true, the texture will be flagged as initialised
 
 	// Get the surface of one of the mipmap levels (defaults to highest-resolution one)
 	SurfaceClass *Get_Surface_Level(unsigned int level = 0);
-	IDirect3DSurface8 *Get_D3D_Surface_Level(unsigned int level = 0);
+	void *Get_Surface_Handle_Level(unsigned int level = 0);
 	void Get_Level_Description( SurfaceClass::SurfaceDescription & desc, unsigned int level = 0 );
 
 	TextureFilterClass& Get_Filter() { return Filter; }
@@ -368,11 +421,12 @@ public:
 	virtual void Init() override {}
 
 	// Background texture loader will call this when texture has been loaded
-	virtual void Apply_New_Surface(IDirect3DBaseTexture8* tex, bool initialized, bool disable_auto_invalidation = false) override;	// If the parameter is true, the texture will be flagged as initialised
+	virtual void Apply_New_Surface(void *texture_handle, bool initialized,
+		bool disable_auto_invalidation = false) override;	// If the parameter is true, the texture will be flagged as initialised
 
 	virtual void Apply(unsigned int stage) override;
 
-	IDirect3DSurface8 *Get_D3D_Surface_Level(unsigned int level = 0);
+	void *Get_Surface_Handle_Level(unsigned int level = 0);
 	virtual unsigned Get_Texture_Memory_Usage() const override;
 
 private:
@@ -415,9 +469,10 @@ public:
 		MipCountType mip_level_count=MIP_LEVELS_ALL
 	);
 
-	CubeTextureClass(IDirect3DBaseTexture8* d3d_texture);
+	CubeTextureClass(void *texture_handle);
 
-	virtual void Apply_New_Surface(IDirect3DBaseTexture8* tex, bool initialized, bool disable_auto_invalidation = false) override;	// If the parameter is true, the texture will be flagged as initialised
+	virtual void Apply_New_Surface(void *texture_handle, bool initialized,
+		bool disable_auto_invalidation = false) override;	// If the parameter is true, the texture will be flagged as initialised
 
 	virtual TexAssetType Get_Asset_Type() const override { return TEX_CUBEMAP; }
 
@@ -461,9 +516,10 @@ public:
 		MipCountType mip_level_count=MIP_LEVELS_ALL
 	);
 
-	VolumeTextureClass(IDirect3DBaseTexture8* d3d_texture);
+	VolumeTextureClass(void *texture_handle);
 
-	virtual void Apply_New_Surface(IDirect3DBaseTexture8* tex, bool initialized, bool disable_auto_invalidation = false) override;	// If the parameter is true, the texture will be flagged as initialised
+	virtual void Apply_New_Surface(void *texture_handle, bool initialized,
+		bool disable_auto_invalidation = false) override;	// If the parameter is true, the texture will be flagged as initialised
 
 	virtual TexAssetType Get_Asset_Type() const override { return TEX_VOLUME; }
 

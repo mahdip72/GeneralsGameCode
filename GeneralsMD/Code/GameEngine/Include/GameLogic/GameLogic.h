@@ -37,6 +37,7 @@
 #include "GameNetwork/NetworkDefs.h"
 #include "GameLogic/AI.h"
 #include "GameLogic/Module/UpdateModule.h"	// needed for DIRECT_UPDATEMODULE_ACCESS
+#include "Lib/SimulationPhaseGraphOwnerAdapter.h"
 
 /*
 	At one time, we distinguished between sleepy and nonsleepy
@@ -63,6 +64,9 @@ class WindowLayout;
 class TerrainLogic;
 class GhostObjectManager;
 class CommandButton;
+#if defined(_WIN64)
+class PerformanceReceiptRuntime;
+#endif
 enum BuildableStatus CPP_11(: Int);
 
 
@@ -139,6 +143,23 @@ public:
 	Bool isInGameLogicUpdate() const { return m_isInUpdate; }
 	Bool hasUpdated() const { return m_hasUpdated; } ///< Returns true if the logic frame has advanced in the current client/render update
 	UnsignedInt getFrame();										///< Returns the current simulation frame number
+	UnsignedInt getPhysicsWorldEpoch() const { return m_physicsWorldEpoch; }
+	Bool ensurePhysicsIntegrationStorage( UnsignedInt bytes );
+	void *getPhysicsIntegrationStorage() const { return m_physicsIntegrationStorage; }
+	UnsignedInt getPhysicsIntegrationStorageCapacity() const { return m_physicsIntegrationStorageCapacity; }
+	Bool ensureObjectStatusTimerStorage( UnsignedInt bytes );
+	void *getObjectStatusTimerStorage() const { return m_objectStatusTimerStorage; }
+	UnsignedInt getObjectStatusTimerStorageCapacity() const { return m_objectStatusTimerStorageCapacity; }
+	Bool getStage5PhaseAuthorityEvidence( UnsignedInt phaseId,
+		rts::LiveSimulationPhaseAuthorityEvidence &evidence ) const;
+#if defined(_WIN64)
+	bool attachPerformanceReceiptRuntime(PerformanceReceiptRuntime *runtime);
+	bool detachPerformanceReceiptRuntime(PerformanceReceiptRuntime *expectedRuntime);
+#endif
+	const rts::LiveSimulationPhaseRuntimeMetrics &getStage5PhaseRuntimeMetrics() const
+	{
+		return m_stage5PhaseGraph.runtimeMetrics();
+	}
 	UnsignedInt getCRC( Int mode = CRC_CACHED, AsciiString deepCRCFileName = AsciiString::TheEmptyString );		///< Returns the CRC
 
 	void setObjectIDCounter( ObjectID nextObjID ) { m_nextObjID = nextObjID; }
@@ -388,6 +409,18 @@ private:
 	Real m_width, m_height;																	///< Dimensions of the world
 	UnsignedInt m_frame;																		///< Simulation frame number
 
+	UnsignedInt m_physicsWorldEpoch;
+	unsigned char *m_physicsIntegrationStorage;
+	UnsignedInt m_physicsIntegrationStorageCapacity;
+	unsigned char *m_objectStatusTimerStorage;
+	UnsignedInt m_objectStatusTimerStorageCapacity;
+	rts::LiveSimulationPhaseGraphOwnerAdapter m_stage5PhaseGraph;
+	UnsignedInt m_stage5PhaseCursor;
+	UnsignedInt m_stage5PhaseNow;
+#if defined(_WIN64)
+	PerformanceReceiptRuntime *m_performanceReceiptRuntime;
+#endif
+
 	// CRC cache system -----------------------------------------------------------------------------
 	UnsignedInt	m_CRC;																			///< Cache of previous CRC value
 	typedef std::map<Int, UnsignedInt> CachedCRCMap;
@@ -435,6 +468,27 @@ private:
 	ObjectPointerList m_objectsToDestroy;										///< List of things that need to be destroyed at end of frame
 
 	ObjectID m_nextObjID;																		///< For allocating object id's
+
+	Bool runOwnerIntakePhase( UnsignedInt &now );
+	void runLegacyMutableIslandPhase( UnsignedInt now );
+	void runSpatialPhase();
+	void runOwnerTailPhase();
+	void runVerificationAndPublicationPhase();
+	void runLegacyStage5Phases();
+	static rts::LiveSimulationPhaseOwnerCallbacks makeStage5PhaseGraphCallbacks();
+	static bool isStage5PhaseGraphOwner( void *ownerContext );
+#if defined(_WIN64)
+	static void observeStage5PhaseGraphBoundary(
+		rts::LiveSimulationPhaseObservationBoundary boundary,
+		rts::SimulationPhaseId phaseId, unsigned generation,
+		unsigned frame, void *ownerContext) noexcept;
+#endif
+	static bool validateStage5PhaseGraphCommit( unsigned phaseId,
+		unsigned generation, unsigned frame, void *ownerContext );
+	static bool commitStage5PhaseGraphPhase( unsigned phaseId,
+		unsigned generation, unsigned frame, void *ownerContext );
+	void validateStage5Owner( const char *boundary ) const;
+	void traceStage5Phase( Int phase ) const;
 
 	void processDestroyList();												///< Destroy all pending objects on the destroy list
 

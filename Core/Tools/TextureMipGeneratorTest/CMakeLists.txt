@@ -12,7 +12,6 @@ target_include_directories(core_texture_mip_generator_tests PRIVATE
 
 target_link_libraries(core_texture_mip_generator_tests PRIVATE
     core_utility_no_pch
-    d3d8lib
 )
 
 set_target_properties(core_texture_mip_generator_tests PROPERTIES

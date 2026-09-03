@@ -33,7 +33,7 @@
 #include "Common/GameType.h"
 #include "Common/GlobalData.h"
 #include "Common/ModelState.h"
-#include "WW3D2/dx8wrapper.h"
+#include "Renderer/RenderGameClient.h"
 
 //#include "GameLogic/Module/BodyModule.h" -- Yikes... not necessary to include this! (KM)
 enum BodyDamageType CPP_11(: Int); //Ahhhh much better!
@@ -56,7 +56,7 @@ struct ID3DXFont;
 /////////////////////////////////////////////////////////////////////////////
 // WbView3d view
 
-class WbView3d : public WbView, public DX8_CleanupHook
+class WbView3d : public WbView, public rts::render::GameRenderCleanupHook
 {
 protected:
 	WbView3d();           // protected constructor used by dynamic creation
@@ -65,8 +65,8 @@ protected:
 // Attributes
 public:
 
-	// DX8_CleanupHook methods
-	virtual void ReleaseResources() override;	///< Release all dx8 resources so the device can be reset.
+	// Device-reset cleanup methods
+	virtual void ReleaseResources() override;	///< Release renderer resources so the device can be reset.
 	virtual void ReAcquireResources() override;  ///< Reacquire all resources after device reset.
 
 // Operations

@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "PerformanceScalingDiagnostics.schema.json",
+  "title": "Hash-bound Stage 5 throughput and matched serial-oracle diagnostics, not acceptance",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "evidenceKind", "status", "finalAcceptanceClaim", "qualificationMode", "sourceCommit", "artifactSetSha256", "executableSha256", "title", "measurementMode", "installedRuntime", "hostAggregate", "referencePolicy", "blockedBy", "lanes", "runs", "pairedOracleBindings", "kernelComparisons"],
+  "properties": {
+    "schemaVersion": { "const": 3 },
+    "evidenceKind": { "const": "stage5-performance-scaling-diagnostics" },
+    "status": { "const": "diagnostic" },
+    "finalAcceptanceClaim": { "const": false },
+    "qualificationMode": { "enum": ["LocalCapacitySmoke", "External16Core"] },
+    "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "artifactSetSha256": { "$ref": "#/$defs/sha256" },
+    "executableSha256": { "$ref": "#/$defs/sha256" },
+    "title": { "enum": ["Generals", "ZeroHour"] },
+    "measurementMode": { "const": "headless-throughput" },
+    "installedRuntime": { "const": true },
+    "hostAggregate": { "$ref": "#/$defs/file" },
+    "referencePolicy": { "enum": ["throughput-only", "paired-serial-oracle-v1"] },
+    "blockedBy": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "contains": { "const": "phase-serial-coverage-unknown" },
+      "items": { "enum": ["phase-serial-coverage-unknown", "same-input-serial-reference-unavailable", "kernel-reference-coverage-incomplete"] }
+    },
+    "pairedOracleBindings": {
+      "type": "array", "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["throughputRunId", "oracleRun"],
+        "properties": {
+          "throughputRunId": { "type": "string", "minLength": 1 },
+          "oracleRun": { "allOf": [
+            { "$ref": "#/$defs/run" },
+            { "properties": { "measurementRole": { "const": "serial-oracle" },
+              "kernelReference": { "properties": { "mode": { "const": "serial-oracle" } } } } }
+          ] }
+        }
+      }
+    },
+    "kernelComparisons": {
+      "type": "array", "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["fixtureId", "lane", "name", "measuredPairs", "medianPipelineNanoseconds", "medianSerialNanoseconds", "netSpeedupKnown", "netSpeedup"],
+        "properties": {
+          "fixtureId": { "type": "string", "minLength": 1 }, "lane": { "type": "string", "minLength": 1 },
+          "name": { "enum": ["physics", "status", "collision", "ai-planning", "spatial", "path"] },
+          "measuredPairs": { "type": "integer", "minimum": 1 },
+          "medianPipelineNanoseconds": { "type": "number", "minimum": 0 },
+          "medianSerialNanoseconds": { "type": "number", "minimum": 0 },
+          "netSpeedupKnown": { "type": "boolean" }, "netSpeedup": { "type": ["number", "null"], "exclusiveMinimum": 0 }
+        },
+        "allOf": [{ "if": { "properties": { "netSpeedupKnown": { "const": false } } },
+          "then": { "properties": { "netSpeedup": { "const": null } } },
+          "else": { "properties": { "netSpeedup": { "type": "number", "exclusiveMinimum": 0 } } } }]
+      }
+    },
+    "lanes": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["fixtureId", "lane", "measuredRuns", "warmupRuns", "medianElapsedMilliseconds"],
+        "properties": {
+          "fixtureId": { "type": "string", "minLength": 1 },
+          "lane": { "type": "string", "minLength": 1 },
+          "measuredRuns": { "type": "integer", "minimum": 1 },
+          "warmupRuns": { "type": "integer", "minimum": 0 },
+          "medianElapsedMilliseconds": { "type": "number", "exclusiveMinimum": 0 }
+        }
+      }
+    },
+    "runs": {
+      "type": "array", "minItems": 1,
+      "items": { "allOf": [
+        { "$ref": "#/$defs/run" },
+        { "properties": { "measurementRole": { "const": "throughput" },
+          "kernelReference": { "properties": { "mode": { "const": "throughput-binding" },
+            "streams": { "items": { "properties": { "serialSampleCount": { "const": 0 },
+              "serialNanoseconds": { "const": 0 }, "maximumSerialNanoseconds": { "const": 0 } } } } } } } }
+      ] }
+    }
+  },
+  "$defs": {
+    "run": {
+        "type": "object", "additionalProperties": false,
+        "required": ["fixtureId", "lane", "ordinal", "warmup", "elapsedMilliseconds", "receipt", "runId", "processId", "processCreationTimeUtc100ns", "requestedMinimumUnitCount", "workload", "frameSimulation", "phases", "kernelTiming", "measurementRole", "kernelReference"],
+        "properties": {
+          "fixtureId": { "type": "string", "minLength": 1 },
+          "lane": { "type": "string", "minLength": 1 },
+          "ordinal": { "type": "integer", "minimum": 0 },
+          "warmup": { "type": "boolean" },
+          "elapsedMilliseconds": { "type": "number", "exclusiveMinimum": 0 },
+          "receipt": { "$ref": "#/$defs/file" },
+          "runId": { "type": "string", "minLength": 1 },
+          "processId": { "type": "integer", "minimum": 1 },
+          "processCreationTimeUtc100ns": { "type": "integer", "minimum": 1 },
+          "requestedMinimumUnitCount": { "type": "integer", "minimum": 1 },
+          "measurementRole": { "enum": ["throughput", "serial-oracle"] },
+          "workload": { "$ref": "PerformanceReceipt.schema.json#/properties/workload" },
+          "frameSimulation": { "$ref": "PerformanceReceipt.schema.json#/properties/frameSimulation" },
+          "phases": { "$ref": "PerformanceReceipt.schema.json#/properties/phases" },
+          "kernelTiming": { "$ref": "PerformanceReceipt.schema.json#/properties/kernelTiming" },
+          "kernelReference": { "$ref": "PerformanceReceipt.schema.json#/properties/kernelReference" }
+        }
+    },
+    "sha256": { "type": "string", "pattern": "^[0-9A-F]{64}$" },
+    "file": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}

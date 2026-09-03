@@ -33,6 +33,10 @@
 #include "GameNetwork/User.h"
 #include "GameNetwork/NetworkDefs.h"
 
+#if defined(_WIN64)
+#include "Lib/LockstepV2Contract.h"
+#endif
+
 // forward declarations
 
 class GameMessage;
@@ -110,6 +114,28 @@ public:
 	// behavior through the same interface.
 	virtual Bool isNetworkHelloReady() = 0;
 	virtual Bool hasNetworkHelloFailure() = 0;
+	virtual Bool isNetworkSimulationPolicyUsable() = 0;
+	virtual Bool refreshNetworkSimulationPolicyForLockstepV2() = 0;
+	virtual Bool isMultiplayerSimulationKernelEnabled(
+		rts::MultiplayerSimulationKernel kernel) = 0;
+	virtual UnsignedInt getMultiplayerSimulationEnabledKernelMask() = 0;
+	virtual rts::MultiplayerSimulationPolicyStatus
+		getMultiplayerSimulationPolicyStatus() = 0;
+#if defined(_WIN64)
+	// These hooks are intentionally observation-only.  The validation bootstrap
+	// owns session creation, while Network/ConnectionManager publish the real
+	// UDP command/frame/CRC observations into the executable-origin receipt.
+	virtual Bool beginLockstepV2Proof(
+		const rts::lockstep_v2::SessionContract &session) = 0;
+	virtual Bool recordLockstepV2Command(UnsignedInt frame,
+		UnsignedInt originSlot, UnsignedShort commandId,
+		std::uint64_t commandDigest) = 0;
+	virtual Bool recordLockstepV2Frame(UnsignedInt frame, UnsignedInt crc,
+		std::uint64_t commandDigest) = 0;
+	virtual Bool finalizeLockstepV2Proof(Bool cleanShutdown,
+		rts::lockstep_v2::Receipt *receipt) = 0;
+	virtual Bool isLockstepV2ProofActive() const = 0;
+#endif
 
 	virtual void notifyOthersOfCurrentFrame() = 0;					///< Tells all the other players what frame we are on.
 	virtual void notifyOthersOfNewFrame(UnsignedInt frame) = 0;							///< Tells all the other players that we are on a new frame.

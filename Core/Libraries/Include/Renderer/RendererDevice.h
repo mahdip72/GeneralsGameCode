@@ -16,6 +16,8 @@ enum RenderBackend
 
 const char *RenderBackendName(RenderBackend backend);
 bool ParseRenderBackend(const char *name, RenderBackend *backend);
+RenderBackend DefaultRenderBackend();
+bool IsRenderBackendSupported(RenderBackend backend);
 void SetRequestedRenderBackend(RenderBackend backend);
 RenderBackend RequestedRenderBackend();
 
@@ -187,13 +189,77 @@ enum RenderResult
 	RENDER_RESULT_FAILED
 };
 
+// The legacy display contract exposes immediate presentation (0) and up to
+// three queued vertical blanks.  Keep this bound independent of the backend's
+// wider DXGI Present range so every owner/producer adapter validates the same
+// game-facing values.
+enum { RENDER_SWAP_INTERVAL_MAX = 3 };
+
+// Validates the complete neutral texture contract before caller-owned bytes are
+// copied or a backend allocation is attempted.  A zero maximumUploadBytes
+// disables the byte budget; uploadBytes is cleared on every failure.
+RenderResult ValidateTextureUpload(const TextureDescriptor &descriptor,
+	const TextureSubresourceData *data, unsigned int dataCount,
+	bool dataRequired, size_t maximumUploadBytes, size_t *uploadBytes);
+
+// Explicit deterministic failure points for focused backend ownership tests.
+// Production callers never need to configure these; unsupported backends retain
+// the default fail-closed implementation on IRenderDevice.
+enum RenderResourceFaultPoint
+{
+	RENDER_RESOURCE_FAULT_NONE,
+	RENDER_RESOURCE_FAULT_TEXTURE_ALLOCATION,
+	RENDER_RESOURCE_FAULT_TEXTURE_VIEW,
+	RENDER_RESOURCE_FAULT_TEXTURE_SHADOW,
+	RENDER_RESOURCE_FAULT_TEXTURE_RECOVERY,
+	RENDER_RESOURCE_FAULT_TEXTURE_DESTRUCTION,
+	// Appended so existing fault-point values remain stable.  This is used by
+	// sorted-batch tests to force a temporary vertex/index cleanup refusal.
+	RENDER_RESOURCE_FAULT_BUFFER_DESTRUCTION,
+	// A presentation-pass failure is injected after the optional postprocess
+	// draw but before DXGI Present, allowing native tests to read the transformed
+	// back buffer without depending on the flip queue.
+	RENDER_RESOURCE_FAULT_PRESENTATION_PASS
+};
+
+struct RenderResourceStatistics
+{
+	RenderResourceStatistics();
+
+	unsigned int liveHandles;
+	unsigned int bufferCount;
+	unsigned int textureCount;
+	unsigned int nativeResourceCount;
+	unsigned int shaderResourceViewCount;
+	unsigned int renderTargetViewCount;
+	unsigned int depthStencilViewCount;
+	size_t recoveryShadowBytes;
+};
+
 struct RenderBackBufferInfo
 {
-	RenderBackBufferInfo();
+	RenderBackBufferInfo() : width(0), height(0),
+		format(RENDER_FORMAT_UNKNOWN) {}
 
 	unsigned int width;
 	unsigned int height;
 	RenderFormat format;
+};
+
+// Texture filtering is queried from the live backend rather than inferred
+// from a logical texture format or a legacy capability bitfield.  The base
+// contract is deliberately non-pure so test devices and older adapters remain
+// source-compatible; its conservative answer prevents callers from enabling
+// filtering that the backend has not positively advertised.
+struct RenderTextureFilterCapabilities
+{
+	RenderTextureFilterCapabilities() : supportsPoint(false),
+		supportsLinear(false), supportsAnisotropic(false), maxAnisotropy(1) {}
+
+	bool supportsPoint;
+	bool supportsLinear;
+	bool supportsAnisotropic;
+	unsigned int maxAnisotropy;
 };
 
 enum RenderCaptureKind
@@ -207,7 +273,8 @@ enum RenderCaptureKind
 
 struct RenderCaptureHandle
 {
-	RenderCaptureHandle();
+	RenderCaptureHandle() : kind(RENDER_CAPTURE_COMPRESSED_SCREENSHOT),
+		requestId(0), generation(0) {}
 
 	RenderCaptureKind kind;
 	unsigned int requestId;
@@ -355,29 +422,57 @@ private:
 	unsigned int m_failureCount;
 };
 
-enum LegacyVertexFormat
+enum RenderVertexFormat
 {
 	RENDER_VERTEX_POSITION3_COLOR = 1,
 	RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1 = 2
 };
 
-enum LegacyVertexSemantic
+// Temporary source-compatible spellings for the legacy backend.  Remove them
+// after that adapter consumes the neutral descriptor types directly.
+typedef RenderVertexFormat LegacyVertexFormat;
+
+enum RenderVertexSemantic
 {
 	RENDER_VERTEX_SEMANTIC_POSITION,
 	RENDER_VERTEX_SEMANTIC_NORMAL,
 	RENDER_VERTEX_SEMANTIC_DIFFUSE,
 	RENDER_VERTEX_SEMANTIC_SPECULAR,
-	RENDER_VERTEX_SEMANTIC_TEXTURE_COORDINATE
+	RENDER_VERTEX_SEMANTIC_TEXTURE_COORDINATE,
+	// Weighted legacy FVFs carry one or more floating-point blend-weight
+	// fields followed, for LASTBETA forms, by a four-byte blend-index field.
+	// Keep these neutral semantics distinct from texture/material channels so
+	// the native backend can construct an exact input declaration.
+	RENDER_VERTEX_SEMANTIC_BLEND_WEIGHT,
+	RENDER_VERTEX_SEMANTIC_BLEND_INDEX,
+	// Plural spellings are useful to callers describing a stream and retain a
+	// single canonical enum value for the backend switch statements.
+	RENDER_VERTEX_SEMANTIC_BLEND_WEIGHTS =
+		RENDER_VERTEX_SEMANTIC_BLEND_WEIGHT,
+	RENDER_VERTEX_SEMANTIC_BLEND_INDICES =
+		RENDER_VERTEX_SEMANTIC_BLEND_INDEX
 };
 
-enum LegacyVertexDataFormat
+typedef RenderVertexSemantic LegacyVertexSemantic;
+
+enum RenderVertexDataFormat
 {
 	RENDER_VERTEX_DATA_FLOAT1,
 	RENDER_VERTEX_DATA_FLOAT2,
 	RENDER_VERTEX_DATA_FLOAT3,
 	RENDER_VERTEX_DATA_FLOAT4,
-	RENDER_VERTEX_DATA_COLOR_BGRA8
+	RENDER_VERTEX_DATA_COLOR_BGRA8,
+	// Raw four-byte integer fields are used by LASTBETA_UBYTE4.  Packed color is
+	// kept as a separate neutral format because its byte ordering/normalization
+	// contract differs from an ordinary packed diffuse colour.
+	RENDER_VERTEX_DATA_UBYTE4,
+	RENDER_VERTEX_DATA_PACKED_COLOR,
+	RENDER_VERTEX_DATA_COLOR_PACKED = RENDER_VERTEX_DATA_PACKED_COLOR
 };
+
+// Compatibility spelling for the existing backend adapter.  The native API
+// above remains the source of truth and carries no API-specific FVF value.
+typedef RenderVertexDataFormat LegacyVertexDataFormat;
 
 struct LegacyVertexElement
 {
@@ -391,7 +486,9 @@ struct LegacyVertexElement
 
 struct LegacyVertexLayout
 {
-	enum { MAX_ELEMENT_COUNT = 12 };
+	// XYZB5 plus normal/diffuse/specular and eight texture coordinates needs
+	// fourteen declarations. Leave room for future neutral stream fields.
+	enum { MAX_ELEMENT_COUNT = 16 };
 
 	LegacyVertexLayout();
 
@@ -403,12 +500,59 @@ struct LegacyVertexLayout
 	LegacyVertexElement elements[MAX_ELEMENT_COUNT];
 };
 
+// Backend-neutral description of one vertex stream.  Keep this independent of
+// LegacyVertexLayout so native consumers can be compiled without the legacy
+// FVF adapter.
+struct RenderVertexElement
+{
+	RenderVertexElement() : semantic(RENDER_VERTEX_SEMANTIC_POSITION),
+		semanticIndex(0), format(RENDER_VERTEX_DATA_FLOAT3), byteOffset(0) {}
+
+	RenderVertexSemantic semantic;
+	unsigned int semanticIndex;
+	RenderVertexDataFormat format;
+	unsigned int byteOffset;
+};
+
+struct RenderVertexLayout
+{
+	enum { MAX_ELEMENT_COUNT = 16 };
+
+	RenderVertexLayout() : stride(0), elementCount(0), preTransformed(false) {}
+
+	unsigned int stride;
+	unsigned int elementCount;
+	// Pre-transformed positions are already in viewport space.
+	bool preTransformed;
+	RenderVertexElement elements[MAX_ELEMENT_COUNT];
+};
+
 enum RenderPrimitiveTopology
 {
 	RENDER_PRIMITIVE_TRIANGLE_LIST,
 	RENDER_PRIMITIVE_TRIANGLE_STRIP,
 	RENDER_PRIMITIVE_LINE_LIST,
 	RENDER_PRIMITIVE_LINE_STRIP
+};
+
+// Coordinates and dimensions are pixels; depth remains in the neutral [0, 1]
+// renderer range.  The descriptor deliberately uses floats so conversion from
+// integer legacy viewports preserves the existing backend call exactly.
+struct RenderViewport
+{
+	RenderViewport() : x(0.0f), y(0.0f), width(0.0f), height(0.0f),
+		minimumDepth(0.0f), maximumDepth(1.0f) {}
+	RenderViewport(float xValue, float yValue, float widthValue,
+		float heightValue, float minimumDepthValue, float maximumDepthValue) :
+		x(xValue), y(yValue), width(widthValue), height(heightValue),
+		minimumDepth(minimumDepthValue), maximumDepth(maximumDepthValue) {}
+
+	float x;
+	float y;
+	float width;
+	float height;
+	float minimumDepth;
+	float maximumDepth;
 };
 
 enum RenderClearFlags
@@ -468,6 +612,19 @@ public:
 	virtual RenderResult createTexture(const TextureDescriptor &descriptor,
 		const TextureSubresourceData *initialData,
 		unsigned int initialDataCount, GpuHandle *texture) = 0;
+	// Owner-thread resource publication is legal independently of frame state.
+	// Backends that do not specialize this seam retain their existing immediate-
+	// context behavior; native and threaded backends override it so transient
+	// asset-loader bytes can be published before BeginFrame and freed on return.
+	virtual RenderResult updateBufferResource(GpuHandle buffer,
+		const void *data, size_t byteCount, size_t destinationOffset,
+		RenderBufferUpdateMode mode = RENDER_BUFFER_UPDATE_PRESERVE)
+	{
+		IRenderContext *context = immediateContext();
+		return context == 0 ? RENDER_RESULT_INVALID_ARGUMENT :
+			context->updateBuffer(buffer, data, byteCount, destinationOffset,
+				mode);
+	}
 	// Refreshes every texture subresource in place when the existing resource
 	// has compatible shape, format, binding, and update capability.  A
 	// RENDER_RESULT_UNSUPPORTED result means callers may recreate the resource;
@@ -487,11 +644,58 @@ public:
 	// callers can submit the next non-zero size when the window is restored.
 	virtual RenderResult resize(unsigned int width, unsigned int height) = 0;
 	virtual RenderResult present() = 0;
+	// Optional presentation controls are deliberately non-pure so legacy and
+	// test-only devices remain source-compatible.  Native D3D11 overrides these
+	// with owner-thread implementations; unsupported devices fail closed.
+	virtual RenderResult setSwapInterval(unsigned int interval)
+	{
+		return interval > RENDER_SWAP_INTERVAL_MAX ?
+			RENDER_RESULT_INVALID_ARGUMENT : RENDER_RESULT_UNSUPPORTED;
+	}
+	virtual RenderResult getSwapInterval(unsigned int *interval) const
+	{
+		if (interval == 0)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		*interval = 0;
+		return RENDER_RESULT_UNSUPPORTED;
+	}
+	// Gamma remains a renderer-local presentation transform.  The second bool
+	// preserves the legacy curve's use-limit switch; calibrate is retained as
+	// metadata for parity with the old ramp API and never changes desktop state.
+	virtual RenderResult setGamma(float gamma, float brightness, float contrast,
+		bool calibrate, bool useLimit = true)
+	{
+		(void)gamma; (void)brightness; (void)contrast;
+		(void)calibrate; (void)useLimit;
+		return RENDER_RESULT_UNSUPPORTED;
+	}
+	virtual RenderResult getGamma(float *gamma, float *brightness,
+		float *contrast, bool *calibrate, bool *useLimit) const
+	{
+		if (gamma == 0 || brightness == 0 || contrast == 0 ||
+			calibrate == 0 || useLimit == 0)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		*gamma = 1.0f; *brightness = 0.0f; *contrast = 1.0f;
+		*calibrate = false; *useLimit = true;
+		return RENDER_RESULT_UNSUPPORTED;
+	}
 	virtual RenderResult getBackBufferInfo(RenderBackBufferInfo *info) const = 0;
+	virtual RenderResult getTextureFilterCapabilities(
+		RenderTextureFilterCapabilities *capabilities) const
+	{
+		if (capabilities != 0)
+			*capabilities = RenderTextureFilterCapabilities();
+		return RENDER_RESULT_UNSUPPORTED;
+	}
 	virtual RenderResult captureBackBuffer(void *destination,
 		size_t destinationBytes, size_t destinationRowPitch,
 		RenderFormat *format) = 0;
 	virtual RenderResult getDebugValidationErrorCount(unsigned int *count) const = 0;
+	virtual RenderResult configureResourceFaultInjection(
+		RenderResourceFaultPoint point, unsigned int failOnInvocation,
+		RenderResult result);
+	virtual RenderResult getDebugResourceStatistics(
+		RenderResourceStatistics *statistics) const;
 	// Requests the D3D11 debug-layer live-object report while the device is
 	// still alive. The report is emitted through the normal graphics-debug
 	// output channel; retail devices without the optional SDK layer return

@@ -1,11 +1,19 @@
 #include "Lib/NetworkWireContract.h"
+#include "Lib/NetworkCommandOriginPolicy.h"
 #include "Lib/NetworkEpochHandshake.h"
+#include "Lib/MultiplayerSimulationRuntimeProof.h"
 #include "Lib/NetworkNatPolicy.h"
 
 #include <array>
 #include <cstdio>
 #include <initializer_list>
 #include <limits>
+#include <string>
+
+#if defined(_MSC_VER)
+#include <crtdbg.h>
+#include <stdlib.h>
+#endif
 
 namespace
 {
@@ -88,6 +96,111 @@ int TestWrapperCapacity()
 	return result;
 }
 
+int TestWrappedCommandOriginPolicy()
+{
+	int result = 0;
+	result |= Check(rts::IsWrappedNetworkCommandOriginAuthorized(2U, 2U, 8U),
+		"a direct wrapper preserves its endpoint-bound claimed origin");
+	result |= Check(rts::IsWrappedNetworkCommandOriginAuthorized(5U, 5U, 8U),
+		"a trusted-router wrapper preserves its claimed command origin");
+	result |= Check(rts::IsWrappedNetworkCommandOriginAuthorized(3U, 3U, 8U),
+		"a frame-recovery wrapper preserves its claimed command origin");
+	result |= Check(!rts::IsWrappedNetworkCommandOriginAuthorized(2U, 3U, 8U),
+		"a decoded wrapper cannot impersonate another player slot");
+	result |= Check(!rts::IsWrappedNetworkCommandOriginAuthorized(8U, 8U, 8U) &&
+		!rts::IsWrappedNetworkCommandOriginAuthorized(2U, 8U, 8U),
+		"wrapper and decoded origins must both name active slot indices");
+	return result;
+}
+
+int TestExternalRuntimeReleaseProof()
+{
+	const std::string executableSha(64, 'A');
+	const std::string artifactSha(64, 'B');
+	const std::string evidenceSha(64, 'C');
+	const std::string rawIndexSha(64, 'D');
+	const std::string sourceRevision(40, 'a');
+	const unsigned trustedPromotedMask = static_cast<unsigned>(
+		rts::MULTIPLAYER_SIMULATION_KERNEL_LIVE_INTEGRATED_MASK);
+	const std::string document =
+		"RTS_MULTIPLAYER_SIMULATION_RUNTIME_PROOF_V1\n"
+		"schema=1\n"
+		"title=Generals\n"
+		"source_revision=" + sourceRevision + "\n" +
+		"executable_sha256=" + executableSha + "\n" +
+		"artifact_set_sha256=" + artifactSha + "\n" +
+		"evidence_manifest_sha256=" + evidenceSha + "\n"
+		"raw_evidence_index_sha256=" + rawIndexSha + "\n"
+		"policy_schema=1\n"
+		"engine_epoch=1\n"
+		"determinism_epoch=1\n"
+		"build_compatibility_crc=287454020\n"
+		"content_crc=2864434397\n"
+		"proven_kernel_mask=63\n"
+		"match_count=16\n"
+		"peer_process_count=40\n"
+		"producer=installed-runtime-runner-v1\n"
+		"validation_mode=scoped-net3-loopback-release-proof\n"
+		"END\n";
+	rts::MultiplayerSimulationRuntimeProof proof;
+	int result = 0;
+	result |= Check(rts::ParseMultiplayerSimulationRuntimeProof(
+		document.data(), document.size(), proof),
+		"canonical external runtime proof parses without source generation");
+	result |= Check(rts::ResolveMultiplayerSimulationRuntimeProofMask(proof,
+		"Generals", executableSha.c_str(), 0x11223344U, 0xaabbccddU,
+		trustedPromotedMask, trustedPromotedMask, sourceRevision.c_str()) == 0U,
+		"InstalledNet3Validation v1 remains diagnostic even with a nonzero caller mask");
+	result |= Check(rts::ResolveMultiplayerSimulationRuntimeProofMask(proof,
+		"Generals", executableSha.c_str(), 0x11223344U, 0xaabbccddU,
+		trustedPromotedMask, 0U, "") == 0U,
+		"a forged sibling proof cannot elevate default-zero build authority");
+	result |= Check(rts::ResolveMultiplayerSimulationRuntimeProofMask(proof,
+		"ZeroHour", executableSha.c_str(), 0x11223344U, 0xaabbccddU,
+		trustedPromotedMask, trustedPromotedMask, sourceRevision.c_str()) == 0U,
+		"another title cannot reuse an external runtime proof");
+	result |= Check(rts::ResolveMultiplayerSimulationRuntimeProofMask(proof,
+		"Generals", std::string(64, 'D').c_str(), 0x11223344U, 0xaabbccddU,
+		trustedPromotedMask, trustedPromotedMask, sourceRevision.c_str()) == 0U,
+		"a rebuilt or substituted executable cannot reuse an external runtime proof");
+	result |= Check(rts::ResolveMultiplayerSimulationRuntimeProofMask(proof,
+		"Generals", executableSha.c_str(), 0x11223345U, 0xaabbccddU,
+		trustedPromotedMask, trustedPromotedMask, sourceRevision.c_str()) == 0U,
+		"a different build identity cannot reuse an external runtime proof");
+	result |= Check(rts::ResolveMultiplayerSimulationRuntimeProofMask(proof,
+		"Generals", executableSha.c_str(), 0x11223344U, 0xaabbccdeU,
+		trustedPromotedMask, trustedPromotedMask, sourceRevision.c_str()) == 0U,
+		"different installed content cannot reuse an external runtime proof");
+	result |= Check(rts::ResolveMultiplayerSimulationRuntimeProofMask(proof,
+		"Generals", executableSha.c_str(), 0x11223344U, 0xaabbccddU,
+		trustedPromotedMask, trustedPromotedMask,
+		std::string(40, 'b').c_str()) == 0U,
+		"runtime evidence from another source revision cannot confirm build authority");
+	rts::MultiplayerSimulationRuntimeProof partialProof = proof;
+	partialProof.provenKernelMask &= ~static_cast<unsigned>(
+		rts::MULTIPLAYER_SIMULATION_KERNEL_COLLISION);
+	result |= Check(rts::ResolveMultiplayerSimulationRuntimeProofMask(
+		partialProof, "Generals", executableSha.c_str(), 0x11223344U,
+		0xaabbccddU, trustedPromotedMask, trustedPromotedMask,
+		sourceRevision.c_str()) == 0U,
+		"a partial proof cannot enable a partially validated product policy");
+	rts::MultiplayerSimulationRuntimeProof manuallyAuthored = proof;
+	manuallyAuthored.producer = "manual";
+	result |= Check(rts::ResolveMultiplayerSimulationRuntimeProofMask(
+		manuallyAuthored, "Generals", executableSha.c_str(), 0x11223344U,
+		0xaabbccddU, trustedPromotedMask, trustedPromotedMask,
+		sourceRevision.c_str()) == 0U,
+		"a manually labeled proof has no release authority");
+	manuallyAuthored = proof;
+	manuallyAuthored.validationMode = "ordinary-gameplay";
+	result |= Check(rts::ResolveMultiplayerSimulationRuntimeProofMask(
+		manuallyAuthored, "Generals", executableSha.c_str(), 0x11223344U,
+		0xaabbccddU, trustedPromotedMask, trustedPromotedMask,
+		sourceRevision.c_str()) == 0U,
+		"ordinary gameplay cannot self-certify a multiplayer release proof");
+	return result;
+}
+
 int TestNetworkHelloContract()
 {
 	using namespace rts::network_epoch;
@@ -96,11 +209,28 @@ int TestNetworkHelloContract()
 	constexpr std::uint32_t executableCrc = 0x11223344U;
 	constexpr std::uint32_t iniCrc = 0xaabbccddU;
 	constexpr std::uint64_t sessionToken = 0x0123456789abcdefULL;
+	const unsigned liveIntegratedMask = static_cast<unsigned>(
+		rts::MULTIPLAYER_SIMULATION_KERNEL_LIVE_INTEGRATED_MASK);
+	const unsigned nonProductTestMask =
+		rts::SelectMultiplayerSimulationNonProductTestOverrideMask(
+			liveIntegratedMask, liveIntegratedMask);
+	const NetworkSimulationPolicyIdentity simulationPolicy =
+		MakeNetworkSimulationPolicyIdentity(executableCrc, iniCrc,
+			0x10203040U, 0xa5U, nonProductTestMask);
 	const std::array<rts::runtime_epoch::Byte, kNetworkHelloWireSize> encoded =
-		EncodeNetworkHello(executableCrc, iniCrc, 2U, 5U, sessionToken);
+		EncodeNetworkHello(executableCrc, iniCrc, 2U, 5U, sessionToken,
+			NetworkHelloKind::Hello, simulationPolicy);
 
 	int result = 0;
-	result |= Check(kNetworkHelloWireSize == 60U, "NET3 hello uses the fixed 60-byte wire size");
+	const rts::MultiplayerSimulationGeneratedReleaseProof absentProof =
+		{ 0, "", "", "", "", "", liveIntegratedMask };
+	result |= Check(
+		rts::ResolveMultiplayerSimulationGeneratedReleaseProofMask(
+			absentProof, liveIntegratedMask) == 0,
+		"default product transport advertises no merely implemented kernel");
+	result |= Check(nonProductTestMask == liveIntegratedMask,
+		"wire fixture uses an explicit non-product release-proof override");
+	result |= Check(kNetworkHelloWireSize == 80U, "NET3 policy hello uses the fixed 80-byte wire size");
 	result |= Check(HasNetworkHelloMagic(encoded.data(), encoded.size()),
 		"NET3 hello carries its independent wire magic");
 	result |= Check(!HasNetworkHelloMagic(encoded.data(), encoded.size() - 1U),
@@ -115,6 +245,13 @@ int TestNetworkHelloContract()
 	result |= Check(HasNetworkHelloPrefix(obsoleteRecord.data(), obsoleteRecord.size()) &&
 		!HasNetworkHelloMagic(obsoleteRecord.data(), obsoleteRecord.size()),
 		"obsolete 52-byte NET3 records cannot enter gameplay packet parsing");
+	std::array<rts::runtime_epoch::Byte, 60U> prePolicyRecord = {{}};
+	for (std::size_t index = 0; index < prePolicyRecord.size(); ++index)
+		prePolicyRecord[index] = encoded[index];
+	result |= Check(HasNetworkHelloPrefix(prePolicyRecord.data(),
+		prePolicyRecord.size()) &&
+		!HasNetworkHelloMagic(prePolicyRecord.data(), prePolicyRecord.size()),
+		"pre-policy 60-byte NET3 records cannot enter gameplay packet parsing");
 	result |= Check(encoded[4] == 0x01U && encoded[5] == 0x00U &&
 		encoded[6] == 0x00U && encoded[7] == 0x00U,
 		"NET3 schema version is little endian");
@@ -132,6 +269,20 @@ int TestNetworkHelloContract()
 		"NET3 Hello record kind decodes explicitly");
 	result |= Check(ReadNetworkHelloSessionToken(encoded.data()) == sessionToken,
 		"NET3 session token is fixed-width little endian");
+	result |= Check(ReadLittleEndian32(encoded.data() +
+		kNetworkHelloPolicySchemaOffset) ==
+		static_cast<std::uint32_t>(
+			rts::MULTIPLAYER_SIMULATION_POLICY_SCHEMA) &&
+		ReadLittleEndian32(encoded.data() + kNetworkHelloMapCrcOffset) ==
+			0x10203040U &&
+		ReadLittleEndian32(encoded.data() + kNetworkHelloRosterMaskOffset) ==
+			0xa5U,
+		"NET3 carries the fixed-width policy schema, map, and exact roster");
+	result |= Check(IsNetworkSimulationRosterIdentityValid(0xa5U, 0x85U,
+		5U, 8U) &&
+		!IsNetworkSimulationRosterIdentityValid(0xa4U, 0x85U, 5U, 8U) &&
+		!IsNetworkSimulationRosterIdentityValid(0xa5U, 0xa5U, 5U, 8U),
+		"NET3 policy identity is bound to the exact local-plus-remote roster");
 
 	const std::array<rts::runtime_epoch::Byte, kNetworkHelloWireSize> ackEncoded =
 		EncodeNetworkHello(executableCrc, iniCrc, 5U, 2U, sessionToken, NetworkHelloKind::Ack);
@@ -152,10 +303,46 @@ int TestNetworkHelloContract()
 		"NET3 unknown record kinds fail validation");
 	NetworkHelloKind decodedKind = NetworkHelloKind::Hello;
 	NetworkHelloIdentity decodedRecordIdentity;
+	NetworkSimulationPolicyIdentity decodedSimulationPolicy;
 	result |= Check(DecodeNetworkHelloRecord(ackEncoded.data(), ackEncoded.size(),
 		&decodedKind, &decodedRecordIdentity) && decodedKind == NetworkHelloKind::Ack &&
 		decodedRecordIdentity.senderSlot == 5U && decodedRecordIdentity.recipientSlot == 2U,
 		"NET3 Ack carries the stable sender and recipient identity");
+	std::uint64_t decodedSessionToken = 0U;
+	result |= Check(DecodeAndValidateNetworkHelloRecord(encoded.data(),
+		encoded.size(), executableCrc, iniCrc, &decoded, &decodedKind,
+		&decodedRecordIdentity, &decodedSessionToken,
+		&decodedSimulationPolicy).ok() &&
+		decodedSimulationPolicy.schema ==
+			rts::MULTIPLAYER_SIMULATION_POLICY_SCHEMA &&
+		decodedSimulationPolicy.engineEpoch ==
+			rts::runtime_epoch::kCurrentEngineEpoch &&
+		decodedSimulationPolicy.determinismEpoch ==
+			rts::MULTIPLAYER_SIMULATION_DETERMINISM_EPOCH &&
+		decodedSimulationPolicy.buildCompatibilityCrc == executableCrc &&
+		decodedSimulationPolicy.contentCrc == iniCrc &&
+		decodedSimulationPolicy.mapCrc == 0x10203040U &&
+		decodedSimulationPolicy.rosterMask == 0xa5U &&
+		decodedSimulationPolicy.provenKernelMask ==
+			nonProductTestMask,
+		"NET3 decoder reconstructs the authoritative simulation policy identity");
+	const NetworkSimulationPolicyIdentity defaultProductPolicy =
+		MakeNetworkSimulationPolicyIdentity(executableCrc, iniCrc,
+			0x10203040U, 0xa5U,
+			rts::ResolveMultiplayerSimulationGeneratedReleaseProofMask(
+				absentProof, liveIntegratedMask));
+	const std::array<rts::runtime_epoch::Byte, kNetworkHelloWireSize>
+		defaultProductEncoded = EncodeNetworkHello(executableCrc, iniCrc,
+			2U, 5U, sessionToken, NetworkHelloKind::Hello,
+			defaultProductPolicy);
+	NetworkSimulationPolicyIdentity decodedDefaultProductPolicy;
+	result |= Check(DecodeAndValidateNetworkHelloRecord(
+		defaultProductEncoded.data(), defaultProductEncoded.size(),
+		executableCrc, iniCrc, &decoded, &decodedKind,
+		&decodedRecordIdentity, &decodedSessionToken,
+		&decodedDefaultProductPolicy).ok() &&
+		decodedDefaultProductPolicy.provenKernelMask == 0,
+		"compatible default peers negotiate serial without release evidence");
 
 	rts::network_epoch::NetworkHelloIdentity identity;
 	result |= Check(DecodeAndValidateNetworkHello(encoded.data(), encoded.size(),
@@ -183,7 +370,7 @@ int TestNetworkHelloContract()
 	result |= Check(decoded.payloadByteCount == kNetworkHelloPayloadSize &&
 		decoded.payloadChecksum == CalculatePayloadChecksum(
 			encoded.data() + kNetworkHelloKindOffset, kNetworkHelloPayloadSize),
-		"NET3 checksum covers kind, identity, and session token payload");
+		"NET3 checksum covers kind, identity, session token, and policy payload");
 
 	std::array<rts::runtime_epoch::Byte, kNetworkHelloWireSize> malformed = encoded;
 	malformed[0] = 'X';
@@ -236,7 +423,8 @@ int TestNetworkHelloContract()
 		!IsNetworkHelloSessionTokenAccepted(NetworkHelloKind::Ack,
 			sessionToken, sessionToken + 1U),
 		"Ack acceptance requires the current local session token");
-	result |= Check(EncodeNetworkHello(executableCrc, iniCrc, 2U, 5U, sessionToken) == encoded,
+	result |= Check(EncodeNetworkHello(executableCrc, iniCrc, 2U, 5U,
+		sessionToken, NetworkHelloKind::Hello, simulationPolicy) == encoded,
 		"Hello retries preserve the same session challenge");
 
 	const std::array<rts::runtime_epoch::Byte, kNetworkHelloWireSize> zeroToken =
@@ -685,11 +873,215 @@ int TestNetworkNatPolicy()
 	return result;
 }
 
+template <std::size_t N>
+void FillCanonicalText(std::array<char, N> &value, char fill)
+{
+	for (std::size_t index = 0U; index + 1U < N; ++index)
+		value[index] = fill;
+	value[N - 1U] = '\0';
+}
+
+int TestLockstepV2ReceiptContract()
+{
+	using namespace rts::lockstep_v2;
+	SessionContract session;
+	session.localSlot = 0U;
+	session.peerCount = 2U;
+	session.rosterMask = 0x3U;
+	session.simulationRosterMask = 0x3U;
+	session.aiRosterMask = 0U;
+	session.buildCompatibilityCrc = 0x11223344U;
+	session.contentCrc = 0xaabbccddU;
+	session.mapCrc = 0x55667788U;
+	session.provenKernelMask = 0x3fU;
+	FillCanonicalText(session.runNonce, 'A');
+	FillCanonicalText(session.sessionNonce, 'B');
+	FillCanonicalText(session.executableSha256, 'C');
+	FillCanonicalText(session.sourceRevision, 'D');
+
+	int result = 0;
+	result |= Check(IsValidSessionContract(session),
+		"lockstep-v2 session requires exact roster, hashes, nonces, and frame bound");
+	SessionContract mixedSession = session;
+	mixedSession.simulationRosterMask =
+		kQualificationSimulationRosterMask;
+	mixedSession.aiRosterMask = kQualificationAIRosterMask;
+	result |= Check(IsValidSessionContract(mixedSession),
+		"lockstep-v2 keeps two network humans distinct from four local AI slots");
+	SessionContract overlappingRoles = mixedSession;
+	overlappingRoles.aiRosterMask |= 0x1U;
+	result |= Check(!IsValidSessionContract(overlappingRoles),
+		"lockstep-v2 rejects an AI role that overlaps the network roster");
+	SessionContract missingSimulationSlot = mixedSession;
+	missingSimulationSlot.simulationRosterMask &= ~0x20U;
+	result |= Check(!IsValidSessionContract(missingSimulationSlot),
+		"lockstep-v2 rejects a simulation roster that omits an AI role");
+	SessionContract zeroIdentity = session;
+	FillCanonicalText(zeroIdentity.executableSha256, '0');
+	result |= Check(!IsValidSessionContract(zeroIdentity),
+		"lockstep-v2 rejects an all-zero executable identity");
+	SessionContract invalidRouter = session;
+	invalidRouter.originMode = CommandOriginMode::TrustedRouter;
+	invalidRouter.packetRouterSlot = 7U;
+	result |= Check(!IsValidSessionContract(invalidRouter),
+		"trusted-router sessions must bind the router to the active roster");
+	result |= Check(!rts::IsLockstepV2CommandSourceAuthorized(
+		0U, 1U, 0U, CommandOriginMode::DirectAuthenticated, 8U),
+		"direct lockstep-v2 rejects a router claiming another origin");
+	result |= Check(rts::IsLockstepV2CommandSourceAuthorized(
+		0U, 1U, 0U, CommandOriginMode::TrustedRouter, 8U),
+		"trusted-router mode is an explicit opt-in boundary");
+
+	ReceiptRecorder recorder;
+	const char *executableSha256 = session.executableSha256.data();
+	WorkerTelemetry workerTelemetry;
+	workerTelemetry.authorityMask = session.provenKernelMask;
+	workerTelemetry.executableOrigin = true;
+	for (std::uint32_t kernel = 0U; kernel < kKernelCount; ++kernel)
+	{
+		workerTelemetry.kernels[kernel].physicalWorkerMask = 0x3U;
+		workerTelemetry.kernels[kernel].physicalWorkerJobs = 64U;
+		workerTelemetry.kernels[kernel].distinctPhysicalWorkers = 2U;
+		workerTelemetry.kernels[kernel].peakConcurrentPhysicalWorkers = 2U;
+		workerTelemetry.kernels[kernel].physicalWorkerMaskComplete = true;
+	}
+	AIPlanningTelemetry aiPlanning;
+	aiPlanning.capturedSnapshots = 4U;
+	aiPlanning.capturedCandidates = 16U;
+	aiPlanning.requestedBatches = 2U;
+	aiPlanning.submittedJobs = 8U;
+	aiPlanning.completedJobs = 8U;
+	aiPlanning.canonicalValidationInvocations = 2U;
+	aiPlanning.committedBatches = 2U;
+	aiPlanning.parallelAuthoritativeCommits = 2U;
+	aiPlanning.physicalWorkerExecutions = 8U;
+	aiPlanning.observedPhysicalWorkerMask = 0x3U;
+	aiPlanning.maximumDistinctPhysicalWorkers = 2U;
+	aiPlanning.maximumConcurrentPhysicalWorkers = 2U;
+	aiPlanning.planningDigest = ComputeAIPlanningDigest(
+		mixedSession.simulationRosterMask, mixedSession.aiRosterMask, aiPlanning);
+	result |= Check(IsValidAIPlanningTelemetry(mixedSession, aiPlanning),
+		"lockstep-v2 AI telemetry requires an executable-origin parallel commit digest");
+	AIPlanningTelemetry alteredAIPlanning = aiPlanning;
+	++alteredAIPlanning.planningDigest;
+	result |= Check(!IsValidAIPlanningTelemetry(mixedSession, alteredAIPlanning),
+		"lockstep-v2 rejects an altered AI planning digest");
+	result |= Check(recorder.begin(session, 0x0102030405060708ULL,
+		executableSha256, workerTelemetry),
+		"receipt recorder binds executable, session, and worker telemetry");
+	const rts::runtime_epoch::Byte localBytes[] = {0x11U, 0x22U, 0x33U};
+	const rts::runtime_epoch::Byte remoteBytes[] = {0x44U, 0x55U, 0x66U};
+	const std::uint64_t localDigest = ComputeCommandDigest(localBytes, sizeof(localBytes));
+	const std::uint64_t remoteDigest = ComputeCommandDigest(remoteBytes, sizeof(remoteBytes));
+	result |= Check(recorder.recordCommand(1U, 0U, 10U, localDigest),
+		"local production command contributes to the v2 receipt");
+	result |= Check(recorder.recordCommand(1U, 1U, 20U, remoteDigest),
+		"remote production command contributes to the v2 receipt");
+	result |= Check(recorder.recordCommand(1U, 1U, 20U, remoteDigest),
+		"an identical retransmit is deduplicated by command ID and digest");
+	for (std::uint32_t frame = 1U; frame <= kCommonStopFrame; ++frame)
+	{
+		if (!recorder.recordFrame(frame, frame ^ 0xa5a5a5a5U, 0U))
+		{
+			result |= Check(false, "receipt recorder accepts only sequential gameplay frames");
+			break;
+		}
+	}
+	result |= Check(recorder.finish(true, true, true),
+		"complete v2 receipt requires transport, handshake, and clean shutdown");
+	const Receipt &receipt = recorder.receipt();
+	result |= Check(ValidateReceipt(receipt, session, 0x0102030405060708ULL,
+		0x3U, false, session.provenKernelMask).ok(),
+		"complete v2 receipt validates against its executable authority");
+	result |= Check(ResolveValidatedKernelMask(receipt, session,
+		0x0102030405060708ULL, 0x3U, false, 0x3fU,
+		session.provenKernelMask) == 0x3fU,
+		"only a validated executable-origin telemetry receipt resolves authority");
+	Receipt missingWorkerEvidence = receipt;
+	missingWorkerEvidence.workerTelemetry[0].physicalWorkerMask = 0U;
+	result |= Check(ValidateReceipt(missingWorkerEvidence, session,
+		0x0102030405060708ULL, 0x3U, false,
+		session.provenKernelMask).error == ValidationError::AuthorityNotProven,
+		"a claimed kernel without physical-worker evidence cannot grant authority");
+	WorkerTelemetry mixedWorkerTelemetry = workerTelemetry;
+	mixedWorkerTelemetry.aiPlanning = aiPlanning;
+	ReceiptRecorder mixedRecorder;
+	result |= Check(mixedRecorder.begin(mixedSession, 0x1112131415161718ULL,
+		executableSha256, mixedWorkerTelemetry),
+		"mixed lockstep-v2 recorder accepts local AI planning telemetry");
+	result |= Check(mixedRecorder.recordCommand(1U, 0U, 10U, localDigest) &&
+		mixedRecorder.recordCommand(1U, 1U, 20U, remoteDigest),
+		"mixed lockstep-v2 keeps commands limited to network-human origins");
+	for (std::uint32_t frame = 1U; frame <= kCommonStopFrame; ++frame)
+	{
+		if (!mixedRecorder.recordFrame(frame, frame ^ 0x5a5a5a5aU, 0U))
+		{
+			result |= Check(false,
+				"mixed lockstep-v2 recorder accepts sequential gameplay frames");
+			break;
+		}
+	}
+	result |= Check(mixedRecorder.finish(true, true, true),
+		"mixed lockstep-v2 receipt requires a clean AI planning boundary");
+	const Receipt &mixedReceipt = mixedRecorder.receipt();
+	std::array<char, kReceiptBufferBytes> encoded = {{}};
+	result |= Check(ValidateReceipt(mixedReceipt, mixedSession,
+		0x1112131415161718ULL, kQualificationNetworkRosterMask, false,
+		mixedSession.provenKernelMask).ok() &&
+		mixedReceipt.aiPlanning.planningDigest == aiPlanning.planningDigest,
+		"mixed lockstep-v2 receipt binds AI telemetry separately from peer commands");
+	std::size_t mixedEncodedBytes = 0U;
+	result |= Check(EncodeReceipt(mixedReceipt, encoded.data(), encoded.size(),
+		&mixedEncodedBytes) && mixedEncodedBytes > 0U,
+		"mixed lockstep-v2 receipt has a bounded canonical text encoding");
+	Receipt mixedDecoded;
+	result |= Check(DecodeReceipt(encoded.data(), mixedEncodedBytes,
+		&mixedDecoded).ok() &&
+		ValidateReceipt(mixedDecoded, mixedSession,
+			0x1112131415161718ULL, kQualificationNetworkRosterMask, false,
+			mixedSession.provenKernelMask).ok() &&
+		mixedDecoded.session.simulationRosterMask ==
+			kQualificationSimulationRosterMask &&
+		mixedDecoded.session.aiRosterMask == kQualificationAIRosterMask &&
+		mixedDecoded.aiPlanning.planningDigest == aiPlanning.planningDigest,
+		"mixed receipt round-trip retains role masks and AI planning digest");
+
+	std::size_t encodedBytes = 0U;
+	Receipt oversizedReceipt = receipt;
+	oversizedReceipt.checkpointCount = kMaxCheckpoints + 1U;
+	result |= Check(!EncodeReceipt(oversizedReceipt, encoded.data(), encoded.size(),
+		&encodedBytes), "receipt encoding rejects an out-of-bounds checkpoint count");
+	result |= Check(EncodeReceipt(receipt, encoded.data(), encoded.size(),
+		&encodedBytes) && encodedBytes > 0U,
+		"lockstep-v2 receipt has a bounded canonical text encoding");
+	Receipt decoded;
+	result |= Check(DecodeReceipt(encoded.data(), encodedBytes, &decoded).ok(),
+		"canonical lockstep-v2 receipt decodes");
+	result |= Check(ValidateReceipt(decoded, session, 0x0102030405060708ULL,
+		0x3U, false, session.provenKernelMask).ok(),
+		"decoded receipt retains frame, peer, and telemetry evidence");
+	decoded.cleanShutdown = false;
+	result |= Check(ResolveValidatedKernelMask(decoded, session,
+		0x0102030405060708ULL, 0x3U, false, 0x3fU,
+		session.provenKernelMask) == 0U,
+		"unclean or altered receipts cannot grant authority");
+	return result;
+}
+
 } // namespace
 
 int main()
 {
+#if defined(_MSC_VER)
+#if _MSC_VER >= 1400
+	_set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
+	_CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+	_CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+#endif
 	return TestFixedSizes() | TestSizeConversion() | TestWrapperCapacity() |
+		TestWrappedCommandOriginPolicy() | TestExternalRuntimeReleaseProof() |
+		TestLockstepV2ReceiptContract() |
 		TestNetworkHelloContract() | TestNetworkFramePublicationGate() |
 		TestNetworkHelloFailureHandlingPolicy() | TestNetworkIngressPolicy() |
 		TestNetworkHelloDropPolicy() | TestNetworkFrameResendPolicy() |

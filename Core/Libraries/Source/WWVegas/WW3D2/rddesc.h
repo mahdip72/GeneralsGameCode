@@ -38,14 +38,28 @@
 
 #include "WWLib/Vector.h"
 #include "WWLib/wwstring.h"
-#include <d3d8types.h>
-#include <d3d8caps.h>
+#include <string.h>
+
+// The public descriptor is shared by the native WW3D facade and the paired
+// compatibility owner. Keep the legacy adapter payload opaque here so the
+// facade does not pull a backend SDK into every descriptor consumer. The
+// legacy owner interprets this storage in its own boundary translation unit.
+enum
+{
+	LEGACY_RENDER_DEVICE_STORAGE_BYTES = 2048
+};
+
+union LegacyRenderDeviceStorage
+{
+	double Alignment;
+	unsigned char Bytes[LEGACY_RENDER_DEVICE_STORAGE_BYTES];
+};
 
 class ResolutionDescClass
 {
 public:
-	ResolutionDescClass() : Width(0), Height(0), BitDepth(0) { }
-	ResolutionDescClass(int w,int h,int bits) : Width(w), Height(h), BitDepth(bits) { }
+	ResolutionDescClass() : Width(0), Height(0), BitDepth(0), RefreshRate(0) { }
+	ResolutionDescClass(int w,int h,int bits) : Width(w), Height(h), BitDepth(bits), RefreshRate(0) { }
 	bool operator == (const ResolutionDescClass & src) { return ((Width==src.Width) && (Height==src.Height) && (BitDepth==src.BitDepth)); }
 	bool operator != (const ResolutionDescClass & src) { return ((Width!=src.Width) || (Height!=src.Height) || (BitDepth!=src.BitDepth)); }
 
@@ -62,9 +76,10 @@ class RenderDeviceDescClass
 public:
 
 	RenderDeviceDescClass() : DeviceName(), DeviceVendor(), DevicePlatform(),
-											DriverName(), DriverVendor(), DriverVersion(),
-											HardwareName(), HardwareVendor(), HardwareChipset()
+										DriverName(), DriverVendor(), DriverVersion(),
+										HardwareName(), HardwareVendor(), HardwareChipset()
 	{
+		memset(LegacyData.Bytes, 0, sizeof(LegacyData.Bytes));
 	}
 
 	~RenderDeviceDescClass()
@@ -82,8 +97,8 @@ public:
 		set_hardware_name(src.Get_Hardware_Name());
 		set_hardware_vendor(src.Get_Hardware_Vendor());
 		set_hardware_chipset(src.Get_Hardware_Chipset());
-		Caps=src.Caps;
-		AdapterIdentifier=src.AdapterIdentifier;
+		memcpy(LegacyData.Bytes, src.LegacyData.Bytes,
+			sizeof(LegacyData.Bytes));
 		ResArray = src.ResArray;
 		return *this;
 	}
@@ -104,10 +119,8 @@ public:
 	const char *		Get_Hardware_Chipset() const	{ return HardwareChipset; }
 
 	const DynamicVectorClass<ResolutionDescClass> & Enumerate_Resolutions() const	{ return ResArray; }
-	const D3DCAPS8& 	Get_Caps() const { return Caps; }
-	const D3DADAPTER_IDENTIFIER8& Get_Adapter_Identifier() const { return AdapterIdentifier; }
-
-private:
+	void *Get_Legacy_Data() { return LegacyData.Bytes; }
+	const void *Get_Legacy_Data() const { return LegacyData.Bytes; }
 
 	void set_device_name(const char * name)		{ DeviceName=name; }
 	void set_device_vendor(const char * name)		{ DeviceVendor=name; }
@@ -121,6 +134,15 @@ private:
 
 	void reset_resolution_list()					{ ResArray.Delete_All(); }
 	void add_resolution(int w,int h,int bits);
+	void set_resolution_refresh_rate(int index, int refresh_rate)
+	{
+		if (index >= 0 && index < ResArray.Count())
+		{
+			ResArray[index].RefreshRate = refresh_rate;
+		}
+	}
+
+	private:
 
 	StringClass			DeviceName;
 	StringClass			DeviceVendor;
@@ -134,13 +156,11 @@ private:
 	StringClass			HardwareVendor;
 	StringClass			HardwareChipset;
 
-	D3DCAPS8				Caps;
-	D3DADAPTER_IDENTIFIER8 AdapterIdentifier;
+	LegacyRenderDeviceStorage		LegacyData;
 
 	DynamicVectorClass<ResolutionDescClass>	ResArray;
 
 	friend class WW3D;
-	friend class DX8Wrapper;
 };
 
 

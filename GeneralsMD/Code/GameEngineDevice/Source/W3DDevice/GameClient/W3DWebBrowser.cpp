@@ -32,8 +32,7 @@
 #include "GameClient/Image.h"
 #include "GameClient/GameWindow.h"
 #include "WWMath/vector2i.h"
-#include "WW3D2/dx8wrapper.h"
-#include "WW3D2/dx8webbrowser.h"
+#include "Renderer/GameWebBrowser.h"
 
 W3DWebBrowser::W3DWebBrowser() : WebBrowser() {
 }
@@ -66,12 +65,15 @@ Bool W3DWebBrowser::createBrowserWindow(const char *tag, GameWindow *win)
 		return FALSE;
 	}
 
-	DX8WebBrowser::CreateBrowser(windowName.str(), url->m_url.str(), x, y, w, h, 0, BROWSEROPTION_SCROLLBARS | BROWSEROPTION_3DBORDER, (LPDISPATCH)this);
+	rts::render::GameWebBrowser::CreateBrowser(windowName.str(), url->m_url.str(), x, y, w, h, 0,
+		rts::render::GAME_WEB_BROWSER_OPTION_SCROLLBARS |
+			rts::render::GAME_WEB_BROWSER_OPTION_3D_BORDER,
+		reinterpret_cast<void *>(this));
 
 	return TRUE;
 }
 
 void W3DWebBrowser::closeBrowserWindow(GameWindow *win)
 {
-	DX8WebBrowser::DestroyBrowser(win->winGetInstanceData()->m_decoratedNameString.str());
+	rts::render::GameWebBrowser::DestroyBrowser(win->winGetInstanceData()->m_decoratedNameString.str());
 }

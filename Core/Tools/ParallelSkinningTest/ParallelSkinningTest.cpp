@@ -5,6 +5,7 @@
 */
 #include "Lib/ParallelSkinning.h"
 #include "WWMath/matrix3d.h"
+#include "../TestSupport/LocalCapacityTestLane.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -567,16 +568,29 @@ int floatingPointParity()
 }
 }
 
-int main()
+int main(int argc, char **argv)
 {
 #if defined(_WIN32) && defined(_MSC_VER) && _MSC_VER < 1300 && defined(_M_IX86)
 	GameFloatingPointModeGuard gameFloatingPointMode;
 #endif
+	bool localCapacity = false;
+	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity))
+	{
+		fprintf(stderr, "Usage: core_parallel_skinning_tests [--local-capacity]\n");
+		return 2;
+	}
+	rts_test::PrintTestCapacityLane(localCapacity);
 	int result = 0;
 	result |= scratchReuse();
 	const unsigned workers[] = { 1, 2, 4, 8, 16, 0 };
 	for (unsigned index = 0; index != sizeof(workers) / sizeof(workers[0]); ++index)
-		result |= parity(workers[index]);
+	{
+		const unsigned effectiveWorkerCount =
+			rts_test::ResolveActualWorkerCount(workers[index], localCapacity);
+		rts_test::PrintWorkerCountSubstitution("parallel skinning",
+			workers[index], effectiveWorkerCount, localCapacity);
+		result |= parity(effectiveWorkerCount);
+	}
 	result |= failurePaths();
 	result |= scalingEvidence();
 	result |= floatingPointParity();

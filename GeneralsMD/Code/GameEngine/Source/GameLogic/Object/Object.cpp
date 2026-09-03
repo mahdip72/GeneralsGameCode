@@ -62,6 +62,7 @@
 #include "GameLogic/ExperienceTracker.h"
 #include "GameLogic/FiringTracker.h"
 #include "GameLogic/GameLogic.h"
+#include "GameLogic/ImmutableSpatialQueryRuntime.h"
 #include "GameLogic/Locomotor.h"
 
 #include "GameLogic/Module/AIUpdate.h"
@@ -180,6 +181,7 @@ Object::Object( const ThingTemplate *tt, const ObjectStatusMaskType &objectStatu
 	m_indicatorColor(0),
 	m_ai(nullptr),
 	m_physics(nullptr),
+	m_motionGeneration(1),
 	m_geometryInfo(tt->getTemplateGeometryInfo()),
 	m_containedBy(nullptr),
 	m_containedByID(INVALID_ID),
@@ -592,6 +594,46 @@ void Object::initObject()
 
 //-------------------------------------------------------------------------------------------------
 //-------------------------------------------------------------------------------------------------
+void Object::setPosition( const Coord3D *pos )
+{
+	Thing::setPosition(pos);
+	if (++m_motionGeneration == 0) m_motionGeneration = 1;
+#if defined(_WIN64)
+	if (m_partitionData != nullptr)
+		InvalidateLiveImmutableSpatialFacts();
+#endif
+}
+
+void Object::setPositionZ( Real z )
+{
+	Thing::setPositionZ(z);
+	if (++m_motionGeneration == 0) m_motionGeneration = 1;
+#if defined(_WIN64)
+	if (m_partitionData != nullptr)
+		InvalidateLiveImmutableSpatialFacts();
+#endif
+}
+
+void Object::setOrientation( Real angle )
+{
+	Thing::setOrientation(angle);
+	if (++m_motionGeneration == 0) m_motionGeneration = 1;
+#if defined(_WIN64)
+	if (m_partitionData != nullptr)
+		InvalidateLiveImmutableSpatialFacts();
+#endif
+}
+
+void Object::setTransformMatrix( const Matrix3D *mx )
+{
+	Thing::setTransformMatrix(mx);
+	if (++m_motionGeneration == 0) m_motionGeneration = 1;
+#if defined(_WIN64)
+	if (m_partitionData != nullptr)
+		InvalidateLiveImmutableSpatialFacts();
+#endif
+}
+
 Object::~Object()
 {
 
@@ -851,6 +893,10 @@ void Object::setGeometryInfoZ( Real newZ )
 {
 	// A Z change only does not need to un/register with the PartitionManager
 	m_geometryInfo.setMaxHeightAbovePosition( newZ );
+#if defined(_WIN64)
+	if (m_partitionData != nullptr)
+		InvalidateLiveImmutableSpatialFacts();
+#endif
 
 	if (m_drawable)
 		m_drawable->reactToGeometryChange();

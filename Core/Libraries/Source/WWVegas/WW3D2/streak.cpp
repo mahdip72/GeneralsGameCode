@@ -34,16 +34,16 @@
  * Functions:                                                                                  *
  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
+#include "Utility/CppMacros.h"
 #include "streak.h"
 #include "ww3d.h"
 #include "rinfo.h"
 #include "predlod.h"
 #include "WWMath/v3_rnd.h"
-#include "texture.h"
+#include "WW3D2/texture.h"
 #include "coltest.h"
 #include "w3d_file.h"
-#include "texture.h"
-#include "dx8wrapper.h"
+#include "WW3D2/texture.h"
 #include "WWMath/vp.h"
 #include "WWMath/Vector3i.h"
 #include "sortingrenderer.h"

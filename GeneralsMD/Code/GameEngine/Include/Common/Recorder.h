@@ -151,7 +151,10 @@ public:
 	Bool isPlaybackMode() const { return m_mode == RECORDERMODETYPE_PLAYBACK || m_mode == RECORDERMODETYPE_SIMULATION_PLAYBACK; }
 	Int getSkirmishAIReplayEpoch() const { return m_skirmishAIReplayEpoch; }
 	Bool replayUsesSkirmishAILivenessRecovery() const { return m_skirmishAIReplayEpoch >= SKIRMISH_AI_REPLAY_EPOCH_PR6_LIVENESS; }
-	Bool replayUsesSkirmishAICurrentBehavior() const { return m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_CURRENT; }
+	Bool replayUsesSkirmishAICurrentBehavior() const { return
+		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG ||
+		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG; }
+	Bool replayUsesSkirmishAICounterRng() const { return m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG; }
 	Int getPathfindQueueReplayEpoch() const { return m_pathfindQueueReplayEpoch; }
 	Bool replayUsesPathfindQueueCapacity() const { return m_pathfindQueueReplayEpoch == PATHFIND_QUEUE_REPLAY_EPOCH_CURRENT; }
 	void initControls();															///< Show or Hide the Replay controls

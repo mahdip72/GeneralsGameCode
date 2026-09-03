@@ -1,0 +1,76 @@
+#ifndef RTS_WW3D2_NATIVEW3DBUFFEROWNER_H
+#define RTS_WW3D2_NATIVEW3DBUFFEROWNER_H
+
+#include "Renderer/NativeW3DResources.h"
+
+namespace rts
+{
+namespace render
+{
+
+// The native x64 compatibility classes borrow the product's one resource
+// registry. The bridge owns that registry and must unbind it before backend
+// shutdown. No backend object or COM interface crosses this boundary.
+RenderResult BindNativeW3DBufferResources(NativeW3DResources *resources);
+RenderResult UnbindNativeW3DBufferResources(NativeW3DResources *resources);
+// All buffer facade calls are render-owner operations.  This query is used by
+// the compatibility-shaped lock wrappers before they touch either a native
+// resource or a sorting allocation.
+bool IsNativeW3DBufferOwnerThread();
+
+class NativeW3DBufferOwner
+{
+public:
+	NativeW3DBufferOwner();
+	~NativeW3DBufferOwner();
+
+	RenderResult Create(const BufferDescriptor &descriptor);
+	RenderResult Reset();
+	RenderResult Lock(size_t destinationOffset, size_t byteCount,
+		RenderBufferUpdateMode mode, void **data);
+	RenderResult Unlock();
+	RenderResult AcquireVertexRange(unsigned int stride, unsigned int offset,
+		unsigned int startVertex, unsigned int vertexCount,
+		GpuHandle *validated) const;
+	RenderResult AcquireIndexRange(RenderFormat format, unsigned int offset,
+		unsigned int startIndex, unsigned int indexCount,
+		GpuHandle *validated) const;
+
+	bool IsLocked() const;
+	bool HasFailedMutation() const;
+
+private:
+	NativeW3DBufferOwner(const NativeW3DBufferOwner &);
+	NativeW3DBufferOwner &operator=(const NativeW3DBufferOwner &);
+
+	RenderResult RecreateForDiscard();
+	NativeW3DResources *ActiveResources() const;
+	void ObserveAuthorityFailure(NativeW3DResources *resources) const;
+	void ReleaseStaging();
+
+	NativeW3DResources *m_resources;
+	unsigned int m_bindingGeneration;
+	BufferDescriptor m_descriptor;
+	GpuHandle m_handle;
+	NativeW3DBufferCleanupTicket *m_cleanupTicket;
+	// A replacement must remain owner-reachable when the old backend handle
+	// refuses destruction.  It is retried before the next discard recreation.
+	GpuHandle m_deferredHandle;
+	NativeW3DBufferCleanupTicket *m_deferredCleanupTicket;
+	// A private byte image keeps PRESERVE/NO_OVERWRITE staging deterministic
+	// even when the backend only exposes a write mapping. It is deliberately
+	// owner-local: no renderer resource or API object crosses this boundary.
+	unsigned char *m_authoritative;
+	size_t m_authoritativeBytes;
+	unsigned char *m_staging;
+	size_t m_lockOffset;
+	size_t m_lockBytes;
+	RenderBufferUpdateMode m_lockMode;
+	bool m_locked;
+	mutable bool m_failedMutation;
+};
+
+}
+}
+
+#endif

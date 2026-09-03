@@ -28,6 +28,24 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+$forbiddenNativeInstallPayloadPattern = '(?i)(?:^|[/"\\])d3d8(?:to9)?\.dll(?:["\s]|$)|d3dx8(?:d|_\d+)?\.dll|D3DX9_43\.dll|D3DCompiler_43\.dll|mss32\.dll|binkw32\.dll|native-d3d8-compat'
+$forbiddenNativeImportPattern = '(?im)^\s*(?:d3d8(?:to9)?|d3d9|d3dx8(?:d|_\d+)?|d3dx9_43|mss32|binkw32)\.dll\s*$'
+
+foreach ($negativeInstallFixture in @(
+    'file(INSTALL FILES "C:/fixture/d3d8to9.dll")',
+    'file(INSTALL FILES "C:/fixture/d3dx8d.dll")',
+    'file(INSTALL FILES "C:/fixture/licenses/native-d3d8-compat/LICENSE")')) {
+    if ($negativeInstallFixture -notmatch $forbiddenNativeInstallPayloadPattern) {
+        throw "Native product install-payload audit definition accepted negative fixture '$negativeInstallFixture'."
+    }
+}
+foreach ($negativeImportFixture in @('d3d8.dll', 'd3d8to9.dll', 'd3dx8d.dll',
+    'd3dx8_43.dll', 'mss32.dll', 'binkw32.dll')) {
+    if ($negativeImportFixture -notmatch $forbiddenNativeImportPattern) {
+        throw "Native product import audit definition accepted negative fixture '$negativeImportFixture'."
+    }
+}
+
 $selectedConfiguration = $Configuration
 if ($OutputSuffix -match '[\\/:;]') {
     throw 'OutputSuffix must not contain path or list separators.'
@@ -276,8 +294,8 @@ function Assert-SameFile([string] $ExpectedPath, [string] $InstalledPath,
 }
 
 foreach ($product in @(
-    @{ Name = 'Generals'; Generals = 'ON'; ZeroHour = 'OFF'; TitleDirectory = 'Generals'; InstallDirectory = 'Generals'; Targets = @('g_generals', 'g_launcher', 'g_skirmish_ai_runner_contract_tests', 'core_native_d3d8_compatibility_test'); Executables = @("generalsv$OutputSuffix.exe", 'launcher.exe', 'g_skirmish_ai_runner_contract_tests.exe'); ContractExecutable = 'g_skirmish_ai_runner_contract_tests.exe'; ContractArguments = @(); LauncherCommand = "generalsv$OutputSuffix.exe" },
-    @{ Name = 'ZeroHour'; Generals = 'OFF'; ZeroHour = 'ON'; TitleDirectory = 'GeneralsMD'; InstallDirectory = 'ZeroHour'; Targets = @('z_generals', 'z_launcher', 'z_runtime_regression_tests', 'core_native_d3d8_compatibility_test'); Executables = @("generalszh$OutputSuffix.exe", 'launcher.exe', 'z_runtime_regression_tests.exe'); ContractExecutable = 'z_runtime_regression_tests.exe'; ContractArguments = @('--skirmish-ai-replay-epoch'); LauncherCommand = "generalszh$OutputSuffix.exe" }
+    @{ Name = 'Generals'; Generals = 'ON'; ZeroHour = 'OFF'; TitleDirectory = 'Generals'; InstallDirectory = 'Generals'; Targets = @('g_generals', 'g_launcher', 'g_skirmish_ai_runner_contract_tests'); Executables = @("generalsv$OutputSuffix.exe", 'launcher.exe', 'g_skirmish_ai_runner_contract_tests.exe'); ContractExecutable = 'g_skirmish_ai_runner_contract_tests.exe'; ContractArguments = @(); LauncherCommand = "generalsv$OutputSuffix.exe" },
+    @{ Name = 'ZeroHour'; Generals = 'OFF'; ZeroHour = 'ON'; TitleDirectory = 'GeneralsMD'; InstallDirectory = 'ZeroHour'; Targets = @('z_generals', 'z_launcher', 'z_runtime_regression_tests'); Executables = @("generalszh$OutputSuffix.exe", 'launcher.exe', 'z_runtime_regression_tests.exe'); ContractExecutable = 'z_runtime_regression_tests.exe'; ContractArguments = @('--skirmish-ai-replay-epoch'); LauncherCommand = "generalszh$OutputSuffix.exe" }
 )) {
     $productBuildRoot = Join-Path $BuildRoot $product.Name
     $installRoot = Join-Path $productBuildRoot 'InstallRoot'
@@ -306,6 +324,8 @@ foreach ($product in @(
         '-DRTS_BUILD_PRODUCT=ON',
         "-DRTS_BUILD_ZEROHOUR=$($product.ZeroHour)",
         "-DRTS_BUILD_GENERALS=$($product.Generals)",
+        "-DRTS_BUILD_ZEROHOUR_PRODUCT=$($product.ZeroHour)",
+        "-DRTS_BUILD_GENERALS_PRODUCT=$($product.Generals)",
         '-DRTS_BUILD_GENERALS_TOOLS=OFF',
         '-DRTS_BUILD_GENERALS_EXTRAS=OFF',
         '-DRTS_BUILD_GENERALS_DOCS=OFF',
@@ -362,6 +382,18 @@ foreach ($product in @(
 
     $cachePath = Join-Path $productBuildRoot 'CMakeCache.txt'
     $cache = Get-Content -LiteralPath $cachePath -Raw
+    $legacyD3D8Requirement = [regex]::Match($cache,
+        '(?m)^RTS_NATIVE_PRODUCT_REQUIRES_LEGACY_D3D8:INTERNAL=(ON|OFF)\r?$')
+    if (-not $legacyD3D8Requirement.Success -or
+        $legacyD3D8Requirement.Groups[1].Value -cne 'OFF') {
+        throw "Native x64 $($product.Name) product does not declare the completed D3D8 device cutover."
+    }
+    $resourceClosure = [regex]::Match($cache,
+        '(?m)^RTS_NATIVE_PRODUCT_RESOURCE_CLOSURE_COMPLETE:INTERNAL=(ON|OFF)\r?$')
+    if (-not $resourceClosure.Success -or
+        $resourceClosure.Groups[1].Value -cne 'ON') {
+        throw "Native x64 $($product.Name) product audit is blocked: sampled-texture and surface ownership has not crossed the D3D11 resource boundary."
+    }
     $runtimeDllMatch = [regex]::Match($cache, '(?m)^RTS_FFMPEG_RUNTIME_DLLS:INTERNAL=(.+)$')
     if (-not $runtimeDllMatch.Success) {
         throw "Native x64 $($product.Name) product did not resolve FFmpeg runtime DLLs."
@@ -398,15 +430,10 @@ foreach ($product in @(
         $zlibRuntimeDlls.Count -eq 0) {
         throw "Native x64 $($product.Name) product did not resolve the dynamic vcpkg zlib runtime."
     }
-    $d3dxRuntimeDllMatch = [regex]::Match($cache, '(?m)^RTS_NATIVE_D3DX_RUNTIME_DLLS:INTERNAL=(.+)$')
-    if (-not $d3dxRuntimeDllMatch.Success) {
-        throw "Native x64 $($product.Name) product did not resolve app-local D3DX compatibility DLLs."
-    }
-    $d3dxRuntimeDlls = @($d3dxRuntimeDllMatch.Groups[1].Value.Trim() -split ';')
     $runtimeInstallBlockPattern = '(?ms)^[ \t]*file\(INSTALL DESTINATION "' +
         [regex]::Escape($expectedDestination) + '" TYPE FILE FILES(?<Files>.*?)\)[ \t]*\r?$'
     $runtimeInstallBlocks = [regex]::Matches($installScript, $runtimeInstallBlockPattern)
-    foreach ($runtimeDll in @($runtimeDlls + $msvcRuntimeDlls + $zlibRuntimeDlls + $d3dxRuntimeDlls)) {
+    foreach ($runtimeDll in @($runtimeDlls + $msvcRuntimeDlls + $zlibRuntimeDlls)) {
         $runtimeDllName = [IO.Path]::GetFileName($runtimeDll)
         $runtimeDllPattern = '"[^"]*/' + [regex]::Escape($runtimeDllName) + '"'
         $matchingBlock = $runtimeInstallBlocks | Where-Object {
@@ -416,26 +443,19 @@ foreach ($product in @(
             throw "Native x64 $($product.Name) install script is missing runtime $runtimeDllName below CMAKE_INSTALL_PREFIX/$($product.InstallDirectory)."
         }
     }
-    $d3d8InstallPattern = 'file\(INSTALL DESTINATION "' +
-        [regex]::Escape($expectedDestination) +
-        '" TYPE SHARED_LIBRARY FILES "(?<Source>[^"]*/d3d8\.dll)"\)'
-    $d3d8InstallMatches = @([regex]::Matches($installScript, $d3d8InstallPattern))
-    if ($d3d8InstallMatches.Count -eq 0) {
-        throw "Native x64 $($product.Name) install script is missing the app-local d3d8.dll compatibility module."
+    if ($installScript -match $forbiddenNativeInstallPayloadPattern) {
+        throw "Native x64 $($product.Name) install script retains a forbidden D3D8/D3DX/Miles/Bink compatibility payload."
     }
-    $expectedD3D8Sources = @(Get-ConfigurationArtifactCandidates $productBuildRoot '_deps/native_d3d8_compat-build/d3d8.dll' $selectedConfiguration |
-        ForEach-Object { $_.Replace('\', '/') })
-    $configuredD3D8Sources = @($d3d8InstallMatches | ForEach-Object {
-        [IO.Path]::GetFullPath($_.Groups['Source'].Value).Replace('\', '/')
-    })
-    $hasExpectedD3D8Source = @($configuredD3D8Sources | Where-Object {
-        $configuredSource = $_
-        @($expectedD3D8Sources | Where-Object {
-            $_.Equals($configuredSource, [StringComparison]::OrdinalIgnoreCase)
-        }).Count -gt 0
-    }).Count -gt 0
-    if (-not $hasExpectedD3D8Source) {
-        throw "Native x64 $($product.Name) install script selects an unexpected d3d8.dll source."
+
+    $selectionPath = Join-Path $productBuildRoot 'product_runtime_selection.txt'
+    if (-not (Test-Path -LiteralPath $selectionPath)) {
+        throw "Native x64 $($product.Name) architecture selection closure was not generated."
+    }
+    $selection = Get-Content -LiteralPath $selectionPath -Raw
+    if ($selection -notmatch '(?m)^target=rts_product_runtime\r?$' -or
+        $selection -notmatch '(?m)^links=rts_native_product_runtime\r?$' -or
+        $selection -match '\brts_legacy_product_runtime\b') {
+        throw "Native x64 $($product.Name) does not select rts_native_product_runtime exclusively."
     }
 
     $closurePath = Join-Path $productBuildRoot 'native_product_runtime_link_closure.txt'
@@ -444,12 +464,20 @@ foreach ($product in @(
     }
 
     $closure = Get-Content -LiteralPath $closurePath -Raw
-    foreach ($required in @('rts_xaudio2', 'rts_d3d8_headers', 'rts_native_d3d8_compat_boundary', 'bcrypt', 'd3d11', 'dxgi', 'dinput8', 'dxguid')) {
+    if ($closure -notmatch '(?m)^target=rts_native_product_runtime\r?$' -or
+        $closure -notmatch '(?m)^requires_legacy_d3d8=OFF\r?$') {
+        throw "Native x64 $($product.Name) runtime closure does not report the completed D3D8 cutover."
+    }
+    if ($closure -notmatch '(?m)^resource_closure_complete=ON\r?$') {
+        throw "Native x64 $($product.Name) runtime closure reports an incomplete D3D11 sampled-texture/surface cutover."
+    }
+    foreach ($required in @('rts_xaudio2', 'bcrypt', 'd3d11', 'dxgi', 'dinput8', 'dxguid')) {
         if ($closure -notmatch ("\b" + [regex]::Escape($required) + "\b")) {
             throw "Native x64 $($product.Name) product is missing required dependency '$required'."
         }
     }
-    foreach ($forbidden in @('milesstub', 'binkstub', 'rts_d3d8lib', 'd3d8')) {
+    foreach ($forbidden in @('milesstub', 'binkstub', 'rts_d3d8lib', 'd3d8', 'd3dx8',
+        'rts_native_d3d8_compat_boundary', 'd3d8to9')) {
         if ($closure -match ("\b" + [regex]::Escape($forbidden) + "\b")) {
             throw "Native x64 $($product.Name) product retains forbidden dependency '$forbidden'."
         }
@@ -507,17 +535,39 @@ foreach ($product in @(
         if ($LASTEXITCODE -ne 0) {
             throw "Native x64 $($product.Name) could not inspect imports for $executable."
         }
-        if ($imports -match '(?im)^\s*d3d[89]\.dll\s*$') {
-            throw "Native x64 $($product.Name) installed executable $executable directly imports a legacy D3D runtime."
+        if ($imports -match $forbiddenNativeImportPattern) {
+            throw "Native x64 $($product.Name) installed executable $executable directly imports a forbidden legacy D3D8/D3DX/Miles/Bink runtime."
+        }
+    }
+
+    # An executable-only check misses forbidden legacy dependencies imported
+    # by an app-local helper or codec DLL. Audit every installed PE image so
+    # the complete redistributable closure is architecture-correct and clean.
+    $installedPeImages = @(Get-ChildItem -LiteralPath $installedTitleRoot -Recurse -File | Where-Object {
+            $_.Extension -ieq '.exe' -or $_.Extension -ieq '.dll'
+        })
+    if ($installedPeImages.Count -eq 0) {
+        throw "Native x64 $($product.Name) install contains no auditable PE images."
+    }
+    foreach ($installedPeImage in $installedPeImages) {
+        if ((Get-PeMachine $installedPeImage.FullName) -ne 0x8664) {
+            throw "Native x64 $($product.Name) app-local PE image $($installedPeImage.Name) is not AMD64."
+        }
+        $peImports = (& dumpbin.exe /nologo /imports $installedPeImage.FullName 2>&1) -join "`n"
+        if ($LASTEXITCODE -ne 0) {
+            throw "Native x64 $($product.Name) could not inspect app-local imports for $($installedPeImage.Name)."
+        }
+        if ($peImports -match $forbiddenNativeImportPattern) {
+            throw "Native x64 $($product.Name) app-local PE image $($installedPeImage.Name) imports a forbidden legacy D3D8/D3DX/Miles/Bink runtime."
         }
     }
     $installedLauncherConfig = Join-Path $installedTitleRoot 'launcher.lcf'
     if (-not (Test-Path -LiteralPath $installedLauncherConfig -PathType Leaf)) {
         throw "Native x64 $($product.Name) audit did not produce launcher.lcf."
     }
-    $expectedLauncherConfig = "RUN = . $($product.LauncherCommand)"
+    $expectedLauncherConfig = "RUN = . $($product.LauncherCommand) -simulationMode parallel -workerPolicy auto"
     if ((Get-Content -LiteralPath $installedLauncherConfig -Raw).Trim() -cne $expectedLauncherConfig) {
-        throw "Native x64 $($product.Name) launcher.lcf does not select $($product.LauncherCommand)."
+        throw "Native x64 $($product.Name) launcher.lcf does not select $($product.LauncherCommand) with the Stage 5 parallel/automatic policy."
     }
     foreach ($runtimeDll in $runtimeDlls) {
         $runtimeDllName = [IO.Path]::GetFileName($runtimeDll)
@@ -573,29 +623,13 @@ foreach ($product in @(
         }
     }
 
-    foreach ($runtimeDll in $d3dxRuntimeDlls) {
-        $runtimeName = [IO.Path]::GetFileName($runtimeDll)
-        $installedRuntimeDll = Join-Path $installedTitleRoot $runtimeName
-        Assert-SameFile $runtimeDll $installedRuntimeDll "Native x64 $($product.Name) installed compatibility runtime $runtimeName"
-        if ((Get-PeMachine $installedRuntimeDll) -ne 0x8664) {
-            throw "Native x64 $($product.Name) compatibility runtime $runtimeName is not an AMD64 PE image."
+    foreach ($forbiddenRuntime in @('d3d8.dll', 'd3d8to9.dll', 'd3dx8.dll',
+        'd3dx8d.dll', 'D3DCompiler_43.dll', 'D3DX9_43.dll', 'mss32.dll',
+        'binkw32.dll')) {
+        $installedForbiddenRuntime = Join-Path $installedTitleRoot $forbiddenRuntime
+        if (Test-Path -LiteralPath $installedForbiddenRuntime) {
+            throw "Native x64 $($product.Name) install contains forbidden legacy compatibility runtime $forbiddenRuntime."
         }
-    }
-    $builtD3D8 = Resolve-ConfigurationArtifact $productBuildRoot '_deps/native_d3d8_compat-build/d3d8.dll' $selectedConfiguration "Native x64 $($product.Name) built d3d8 compatibility module"
-    $installedD3D8 = Join-Path $installedTitleRoot 'd3d8.dll'
-    Assert-SameFile $builtD3D8 $installedD3D8 "Native x64 $($product.Name) installed d3d8 compatibility module"
-    if ((Get-PeMachine $installedD3D8) -ne 0x8664) {
-        throw "Native x64 $($product.Name) d3d8 compatibility module is not an AMD64 PE image."
-    }
-    $d3d8Imports = (& dumpbin.exe /nologo /imports $installedD3D8 2>&1) -join "`n"
-    if ($LASTEXITCODE -ne 0 -or $d3d8Imports -notmatch '(?im)^\s*d3d9\.dll\s*$') {
-        throw "Native x64 $($product.Name) d3d8 compatibility module does not import the expected system D3D9 runtime."
-    }
-
-    $compatibilityProbe = Resolve-ConfigurationArtifact $productBuildRoot 'Core/core_native_d3d8_compatibility_test.exe' $selectedConfiguration "Native x64 $($product.Name) built compatibility behavior probe"
-    & $compatibilityProbe $installedD3D8 (Join-Path $installedTitleRoot 'D3DCompiler_43.dll') (Join-Path $installedTitleRoot 'D3DX9_43.dll')
-    if ($LASTEXITCODE -ne 0) {
-        throw "Native x64 $($product.Name) installed compatibility runtime behavior probe failed."
     }
 
     $installedContract = Join-Path $installedTitleRoot $product.ContractExecutable
@@ -617,10 +651,8 @@ foreach ($product in @(
     }
 
     $compatibilityLicenseRoot = Join-Path $installedTitleRoot 'licenses/native-d3d8-compat'
-    foreach ($licenseName in @('d3d8to9-LICENSE.md', 'LICENSE.txt', 'NOTICE.md')) {
-        if (-not (Test-Path -LiteralPath (Join-Path $compatibilityLicenseRoot $licenseName) -PathType Leaf)) {
-            throw "Native x64 $($product.Name) install is missing compatibility notice $licenseName."
-        }
+    if (Test-Path -LiteralPath $compatibilityLicenseRoot) {
+        throw "Native x64 $($product.Name) install contains the retired D3D8 compatibility license package."
     }
 }
 

@@ -14,6 +14,17 @@ function Assert-File([string] $Path, [string] $Description) {
     Assert-True (Test-Path -LiteralPath $Path -PathType Leaf) "$Description is missing: $Path"
 }
 
+function Assert-NativeRuntimeIsLegacyFree([string] $ProductRoot, [string] $Description) {
+    foreach ($forbiddenRuntime in @('d3d8.dll', 'd3d8to9.dll', 'd3dx8.dll',
+        'd3dx8d.dll', 'D3DCompiler_43.dll', 'D3DX9_43.dll', 'mss32.dll',
+        'binkw32.dll')) {
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $ProductRoot $forbiddenRuntime))) `
+            "$Description incorrectly contains legacy compatibility runtime $forbiddenRuntime."
+    }
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $ProductRoot 'licenses/native-d3d8-compat'))) `
+        "$Description incorrectly contains the retired D3D8 compatibility license package."
+}
+
 function Get-Sha256([string] $Path) {
     $sha256 = [Security.Cryptography.SHA256]::Create()
     try {
@@ -81,13 +92,15 @@ try {
     $releaseLauncher = Join-Path $releaseProductRoot 'launcher.lcf'
     Assert-File $releaseExecutable 'The suffixed release executable'
     Assert-File $releaseLauncher 'The generated release launcher configuration'
-    Assert-True ((Get-Content -LiteralPath $releaseLauncher -Raw).Trim() -ceq 'RUN = . generalsv-stage3.exe') `
-        'The release launcher does not name the target output file.'
+    Assert-True ((Get-Content -LiteralPath $releaseLauncher -Raw).Trim() -ceq 'RUN = . generalsv-stage3.exe -simulationMode parallel -workerPolicy auto') `
+        'The release launcher does not select the native target and Stage 5 execution policy.'
     Assert-File (Join-Path $releaseZeroHourRoot 'generalszh-stage3.exe') 'The suffixed Zero Hour release executable'
-    Assert-True ((Get-Content -LiteralPath (Join-Path $releaseZeroHourRoot 'launcher.lcf') -Raw).Trim() -ceq 'RUN = . generalszh-stage3.exe') `
-        'The Zero Hour launcher does not name the target output file.'
+    Assert-True ((Get-Content -LiteralPath (Join-Path $releaseZeroHourRoot 'launcher.lcf') -Raw).Trim() -ceq 'RUN = . generalszh-stage3.exe -simulationMode parallel -workerPolicy auto') `
+        'The Zero Hour launcher does not select the native target and Stage 5 execution policy.'
     Assert-File (Join-Path $releaseProductRoot 'msvcp140.dll') 'The release MSVC C++ runtime'
     Assert-File (Join-Path $releaseProductRoot 'vcruntime140.dll') 'The release MSVC runtime'
+    Assert-NativeRuntimeIsLegacyFree $releaseProductRoot 'The release Generals install'
+    Assert-NativeRuntimeIsLegacyFree $releaseZeroHourRoot 'The release Zero Hour install'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $releaseProductRoot 'msvcp140d.dll'))) `
         'The release install incorrectly contains the debug MSVC C++ runtime.'
 
@@ -99,14 +112,16 @@ try {
     $debugProductRoot = Join-Path $debugInstallRoot 'Generals'
     $debugZeroHourRoot = Join-Path $debugInstallRoot 'ZeroHour'
     Assert-File (Join-Path $debugProductRoot 'generalsv-stage3.exe') 'The suffixed debug executable'
-    Assert-True ((Get-Content -LiteralPath (Join-Path $debugProductRoot 'launcher.lcf') -Raw).Trim() -ceq 'RUN = . generalsv-stage3.exe') `
-        'The debug launcher does not name the target output file.'
+    Assert-True ((Get-Content -LiteralPath (Join-Path $debugProductRoot 'launcher.lcf') -Raw).Trim() -ceq 'RUN = . generalsv-stage3.exe -simulationMode parallel -workerPolicy auto') `
+        'The debug launcher does not select the native target and Stage 5 execution policy.'
     Assert-File (Join-Path $debugZeroHourRoot 'generalszh-stage3.exe') 'The suffixed Zero Hour debug executable'
-    Assert-True ((Get-Content -LiteralPath (Join-Path $debugZeroHourRoot 'launcher.lcf') -Raw).Trim() -ceq 'RUN = . generalszh-stage3.exe') `
-        'The Zero Hour debug launcher does not name the target output file.'
+    Assert-True ((Get-Content -LiteralPath (Join-Path $debugZeroHourRoot 'launcher.lcf') -Raw).Trim() -ceq 'RUN = . generalszh-stage3.exe -simulationMode parallel -workerPolicy auto') `
+        'The Zero Hour debug launcher does not select the native target and Stage 5 execution policy.'
     Assert-File (Join-Path $debugProductRoot 'msvcp140d.dll') 'The debug MSVC C++ runtime'
     Assert-File (Join-Path $debugProductRoot 'vcruntime140d.dll') 'The debug MSVC runtime'
     Assert-File (Join-Path $debugProductRoot 'ucrtbased.dll') 'The debug Universal CRT runtime'
+    Assert-NativeRuntimeIsLegacyFree $debugProductRoot 'The debug Generals install'
+    Assert-NativeRuntimeIsLegacyFree $debugZeroHourRoot 'The debug Zero Hour install'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $debugProductRoot 'msvcp140.dll'))) `
         'The debug install incorrectly contains the release MSVC C++ runtime.'
 
@@ -116,6 +131,33 @@ try {
         'The same-prefix Debug install MSVC C++ runtime'
     Assert-True ((Get-Sha256 (Join-Path $releaseProductRoot 'msvcp140.dll')) -ceq $releaseHash) `
         'The same-prefix Debug installation changed the previously installed release runtime.'
+    Assert-NativeRuntimeIsLegacyFree $releaseProductRoot 'The mixed-configuration Generals install'
+    Assert-NativeRuntimeIsLegacyFree $releaseZeroHourRoot 'The mixed-configuration Zero Hour install'
+
+    foreach ($negativeRuntimeName in @('d3d8to9.dll', 'd3dx8d.dll')) {
+        $negativeRuntimeFixture = Join-Path $testRoot ('negative-' + $negativeRuntimeName)
+        New-Item -ItemType Directory -Path $negativeRuntimeFixture -Force | Out-Null
+        [IO.File]::WriteAllText((Join-Path $negativeRuntimeFixture $negativeRuntimeName), 'fixture')
+        $negativeRuntimeRejected = $false
+        try {
+            Assert-NativeRuntimeIsLegacyFree $negativeRuntimeFixture "The $negativeRuntimeName negative fixture"
+        }
+        catch {
+            $negativeRuntimeRejected = $true
+        }
+        Assert-True $negativeRuntimeRejected "The packaging audit accepted forbidden runtime $negativeRuntimeName."
+    }
+
+    $negativeLicenseFixture = Join-Path $testRoot 'negative-native-d3d8-license'
+    New-Item -ItemType Directory -Path (Join-Path $negativeLicenseFixture 'licenses/native-d3d8-compat') -Force | Out-Null
+    $negativeLicenseRejected = $false
+    try {
+        Assert-NativeRuntimeIsLegacyFree $negativeLicenseFixture 'The native D3D8 license negative fixture'
+    }
+    catch {
+        $negativeLicenseRejected = $true
+    }
+    Assert-True $negativeLicenseRejected 'The packaging audit accepted the retired D3D8 compatibility license package.'
 
     Write-Output 'Native product runtime packaging configure/install fixture passed.'
 }

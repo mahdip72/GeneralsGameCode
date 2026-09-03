@@ -345,11 +345,28 @@ void testOwnedNativeRange()
 }
 }
 
-int main()
+int main(int argc, char **argv)
 {
+	const bool localCapacity = argc == 2 &&
+		std::strcmp(argv[1], "--local-capacity") == 0;
+	if (argc != 1 && !localCapacity)
+	{
+		std::fprintf(stderr, "Usage: core_resource_io_pipeline_tests [--local-capacity]\n");
+		return 2;
+	}
 	owner = std::this_thread::get_id();
 	const unsigned workers[] = {1, 2, 4, 8, 16, 0};
-	for (unsigned count : workers) testParity(count);
+	const unsigned localWorkers[] = {1, 2, 4, 8, 12};
+	if (localCapacity)
+	{
+		std::printf("resource IO lane: local-capacity (explicit workers 1, 2, 4, 8, 12; "
+			"external high-core/automatic lane excluded)\n");
+		for (unsigned count : localWorkers) testParity(count);
+	}
+	else
+	{
+		for (unsigned count : workers) testParity(count);
+	}
 	testFaultsAndPressure();
 	testOverlapCancellationAndShutdown();
 	testSerialFallback();

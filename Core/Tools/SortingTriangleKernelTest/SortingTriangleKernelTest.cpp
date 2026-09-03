@@ -4,6 +4,7 @@
 ** SPDX-License-Identifier: GPL-3.0-or-later
 */
 #include "Lib/SortingTriangleKernel.h"
+#include "../TestSupport/LocalCapacityTestLane.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -521,13 +522,26 @@ void testFloatingPointParity()
 #endif
 }
 
-int main()
+int main(int argc, char **argv)
 {
+	bool localCapacity = false;
+	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity))
+	{
+		fprintf(stderr, "Usage: core_sorting_triangle_kernel_tests [--local-capacity]\n");
+		return 2;
+	}
+	rts_test::PrintTestCapacityLane(localCapacity);
 	int result = 0;
 	const unsigned workers[] = { 1, 2, 4, 8, 16, 0 };
 	for (unsigned index = 0; index != sizeof(workers) / sizeof(workers[0]);
 		++index)
-		result |= runWorkerConfiguration(workers[index]);
+	{
+		const unsigned effectiveWorkerCount =
+			rts_test::ResolveActualWorkerCount(workers[index], localCapacity);
+		rts_test::PrintWorkerCountSubstitution("sorting triangle",
+			workers[index], effectiveWorkerCount, localCapacity);
+		result |= runWorkerConfiguration(effectiveWorkerCount);
+	}
 	testTinyAndInvalid();
 #if defined(RTS_BUILD_CORE_EXTRAS) && (!defined(_MSC_VER) || _MSC_VER >= 1300)
 	testScratchAllocationFailure();

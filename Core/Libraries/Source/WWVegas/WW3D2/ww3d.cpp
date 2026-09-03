@@ -96,25 +96,21 @@
 #include "WWDebug/wwprofile.h"
 #include "WWDebug/wwmemlog.h"
 #include "shattersystem.h"
-#include "textureloader.h"
+#include "WW3D2/textureloader.h"
 #include "statistics.h"
 #include "pointgr.h"
 #include "WWLib/ffactory.h"
 #include "WWLib/INI.h"
 #include "dazzle.h"
 #include "meshmdl.h"
-#include "dx8renderer.h"
 #include "render2d.h"
 #include "WWLib/bound.h"
 #include "rddesc.h"
 #include "WWMath/Vector3i.h"
-#include "dx8wrapper.h"
+#include "Renderer/RenderGameClient.h"
 #include "WWLib/TARGA.h"
-#include "sortingrenderer.h"
 #include "WWLib/thread.h"
 #include "WWLib/cpudetect.h"
-#include "dx8texman.h"
-#include "formconv.h"
 #include "animatedsoundmgr.h"
 #include "static_sort_list.h"
 #include "shdlib.h"
@@ -137,7 +133,7 @@ bool Checked_Multiply(size_t left, size_t right, size_t *result)
 	return true;
 }
 
-struct D3D11LegacyScreenshotCapture
+struct GameScreenshotCapture
 {
 	char filename[80];
 	float gamma;
@@ -151,40 +147,40 @@ struct D3D11LegacyScreenshotCapture
 // the raw movie pointer through the asynchronous bridge. This makes a
 // resize, device recovery, or stop deterministic instead of allowing a later
 // frame to write past the old buffer.
-struct D3D11MovieCaptureRequest
+struct GameMovieCaptureRequest
 {
 	FrameGrabClass *movie;
 	unsigned int width;
 	unsigned int height;
 };
 
-std::vector<D3D11MovieCaptureRequest *> s_d3d11MovieRequests;
-FrameGrabClass *s_d3d11MovieOwner = 0;
-unsigned int s_d3d11MovieWidth = 0;
-unsigned int s_d3d11MovieHeight = 0;
-bool s_d3d11MovieStopPending = false;
+std::vector<GameMovieCaptureRequest *> s_gameMovieRequests;
+FrameGrabClass *s_gameMovieOwner = 0;
+unsigned int s_gameMovieWidth = 0;
+unsigned int s_gameMovieHeight = 0;
+bool s_gameMovieStopPending = false;
 
-bool Remove_D3D11_Movie_Request(D3D11MovieCaptureRequest *request)
+bool Remove_GameMovie_Request(GameMovieCaptureRequest *request)
 {
-	for (std::vector<D3D11MovieCaptureRequest *>::iterator it =
-		s_d3d11MovieRequests.begin(); it != s_d3d11MovieRequests.end(); ++it)
+	for (std::vector<GameMovieCaptureRequest *>::iterator it =
+		s_gameMovieRequests.begin(); it != s_gameMovieRequests.end(); ++it)
 	{
 		if (*it == request)
 		{
-			s_d3d11MovieRequests.erase(it);
+			s_gameMovieRequests.erase(it);
 			return true;
 		}
 	}
 	return false;
 }
 
-void Complete_D3D11_Legacy_Screenshot(void *consumer,
+void Complete_GameScreenshot(void *consumer,
 	const rts::render::RenderCaptureHandle *, unsigned int width,
 	unsigned int height, size_t rowPitch, rts::render::RenderFormat format,
 	const void *pixels, size_t pixelBytes)
 {
-	D3D11LegacyScreenshotCapture *capture =
-		static_cast<D3D11LegacyScreenshotCapture *>(consumer);
+	GameScreenshotCapture *capture =
+		static_cast<GameScreenshotCapture *>(consumer);
 	if (capture == 0)
 	{
 		return;
@@ -201,7 +197,7 @@ void Complete_D3D11_Legacy_Screenshot(void *consumer,
 		!Checked_Multiply(static_cast<size_t>(width), height, &pixelCount) ||
 		!Checked_Multiply(pixelCount, 3, &imageBytes))
 	{
-		WWDEBUG_SAY(("D3D11 legacy screenshot completion had invalid pixels"));
+		WWDEBUG_SAY(("Native screenshot completion had invalid pixels"));
 		delete capture;
 		return;
 	}
@@ -212,7 +208,7 @@ void Complete_D3D11_Legacy_Screenshot(void *consumer,
 	}
 	catch (...)
 	{
-		WWDEBUG_SAY(("D3D11 legacy screenshot allocation failed"));
+		WWDEBUG_SAY(("Native screenshot allocation failed"));
 		delete capture;
 		return;
 	}
@@ -275,7 +271,7 @@ void Complete_D3D11_Legacy_Screenshot(void *consumer,
 				&unpaddedRowBytes) || unpaddedRowBytes >
 				std::numeric_limits<size_t>::max() - 3)
 		{
-			WWDEBUG_SAY(("D3D11 BMP screenshot dimensions are invalid"));
+			WWDEBUG_SAY(("Native BMP screenshot dimensions are invalid"));
 			delete[] image;
 			delete capture;
 			return;
@@ -287,7 +283,7 @@ void Complete_D3D11_Legacy_Screenshot(void *consumer,
 			headerBytes + imageFileBytes >
 			static_cast<size_t>(std::numeric_limits<unsigned long>::max()))
 		{
-			WWDEBUG_SAY(("D3D11 BMP screenshot file is too large"));
+			WWDEBUG_SAY(("Native BMP screenshot file is too large"));
 			delete[] image;
 			delete capture;
 			return;
@@ -320,7 +316,7 @@ void Complete_D3D11_Legacy_Screenshot(void *consumer,
 			}
 			catch (...)
 			{
-				WWDEBUG_SAY(("D3D11 BMP screenshot row allocation failed"));
+				WWDEBUG_SAY(("Native BMP screenshot row allocation failed"));
 				file->Close();
 				_TheWritingFileFactory->Return_File(file);
 				delete[] image;
@@ -349,21 +345,21 @@ void Complete_D3D11_Legacy_Screenshot(void *consumer,
 	delete capture;
 }
 
-void Cancel_D3D11_Legacy_Screenshot(void *consumer,
+void Cancel_GameScreenshot(void *consumer,
 	const rts::render::RenderCaptureHandle *, rts::render::RenderResult reason)
 {
-	delete static_cast<D3D11LegacyScreenshotCapture *>(consumer);
-	WWDEBUG_SAY(("D3D11 legacy screenshot capture cancelled: %d",
+	delete static_cast<GameScreenshotCapture *>(consumer);
+	WWDEBUG_SAY(("Game screenshot capture cancelled: %d",
 		static_cast<int>(reason)));
 }
 
-void Complete_D3D11_Movie(void *consumer,
+void Complete_GameMovie(void *consumer,
 	const rts::render::RenderCaptureHandle *, unsigned int width,
 	unsigned int height, size_t rowPitch, rts::render::RenderFormat format,
 	const void *pixels, size_t pixelBytes)
 {
-	D3D11MovieCaptureRequest *request =
-		static_cast<D3D11MovieCaptureRequest *>(consumer);
+	GameMovieCaptureRequest *request =
+		static_cast<GameMovieCaptureRequest *>(consumer);
 	if (request == 0)
 	{
 		return;
@@ -371,21 +367,21 @@ void Complete_D3D11_Movie(void *consumer,
 	// Detach the request before doing any error handling. Stopping the movie
 	// from this owner-thread callback may synchronously cancel the remaining
 	// FIFO entries and mutate the request list.
-	Remove_D3D11_Movie_Request(request);
+	Remove_GameMovie_Request(request);
 	FrameGrabClass *movie = request->movie;
 	const bool dimensionsMatch = width == request->width &&
 		height == request->height;
-	if (movie == 0 || movie != s_d3d11MovieOwner || pixels == 0 ||
+	if (movie == 0 || movie != s_gameMovieOwner || pixels == 0 ||
 		!dimensionsMatch ||
 		format != rts::render::RENDER_FORMAT_B8G8R8A8_UNORM || width == 0 ||
 		height == 0)
 	{
-		WWDEBUG_SAY(("D3D11 movie capture stopped because the visible frame "
+		WWDEBUG_SAY(("Native movie capture stopped because the visible frame "
 			"does not match its AVI dimensions"));
 		delete request;
-		if (movie == s_d3d11MovieOwner)
+		if (movie == s_gameMovieOwner)
 		{
-			s_d3d11MovieStopPending = true;
+			s_gameMovieStopPending = true;
 		}
 		return;
 	}
@@ -401,11 +397,11 @@ void Complete_D3D11_Movie(void *consumer,
 			static_cast<size_t>(width), 3, &outputRowBytes) ||
 		outputRowBytes > std::numeric_limits<size_t>::max() - 3)
 	{
-		WWDEBUG_SAY(("D3D11 movie capture completion had invalid pixels"));
+		WWDEBUG_SAY(("Native movie capture completion had invalid pixels"));
 		delete request;
-		if (movie == s_d3d11MovieOwner)
+		if (movie == s_gameMovieOwner)
 		{
-			s_d3d11MovieStopPending = true;
+			s_gameMovieStopPending = true;
 		}
 		return;
 	}
@@ -413,11 +409,11 @@ void Complete_D3D11_Movie(void *consumer,
 	if (!Checked_Multiply(aviRowBytes, static_cast<size_t>(height),
 		&aviBytes) || aviBytes == 0 || movie->GetBuffer() == 0)
 	{
-		WWDEBUG_SAY(("D3D11 movie capture buffer dimensions are invalid"));
+		WWDEBUG_SAY(("Native movie capture buffer dimensions are invalid"));
 		delete request;
-		if (movie == s_d3d11MovieOwner)
+		if (movie == s_gameMovieOwner)
 		{
-			s_d3d11MovieStopPending = true;
+			s_gameMovieStopPending = true;
 		}
 		return;
 	}
@@ -448,22 +444,134 @@ void Complete_D3D11_Movie(void *consumer,
 	delete request;
 }
 
-void Cancel_D3D11_Movie(void *consumer,
+void Cancel_GameMovie(void *consumer,
 	const rts::render::RenderCaptureHandle *, rts::render::RenderResult reason)
 {
-	D3D11MovieCaptureRequest *request =
-		static_cast<D3D11MovieCaptureRequest *>(consumer);
+	GameMovieCaptureRequest *request =
+		static_cast<GameMovieCaptureRequest *>(consumer);
 	if (request != 0)
 	{
-		WWDEBUG_SAY(("D3D11 movie capture frame cancelled: %d",
+		WWDEBUG_SAY(("Native movie capture frame cancelled: %d",
 			static_cast<int>(reason)));
-		Remove_D3D11_Movie_Request(request);
-		if (request->movie == s_d3d11MovieOwner)
+		Remove_GameMovie_Request(request);
+		if (request->movie == s_gameMovieOwner)
 		{
-			s_d3d11MovieStopPending = true;
+			s_gameMovieStopPending = true;
 		}
 		delete request;
 	}
+}
+}
+
+namespace
+{
+WW3DErrorType ToWW3DError(rts::render::RenderResult result)
+{
+	return result == rts::render::RENDER_RESULT_OK ?
+		WW3D_ERROR_OK : WW3D_ERROR_GENERIC;
+}
+
+rts::render::GameRenderColor ToGameRenderColor(const Vector3 &color,
+	float alpha)
+{
+	rts::render::GameRenderColor result;
+	result.red = color.X;
+	result.green = color.Y;
+	result.blue = color.Z;
+	result.alpha = alpha;
+	return result;
+}
+
+std::vector<RenderDeviceDescClass> s_gameDeviceDescriptions;
+RenderDeviceDescClass s_emptyGameDeviceDescription;
+
+bool PopulateGameDeviceDescription(int deviceidx)
+{
+	const int deviceCount = rts::render::GetGameRenderDeviceCount();
+	if (deviceidx < 0 || deviceidx >= deviceCount)
+	{
+		return false;
+	}
+	try
+	{
+		if (static_cast<size_t>(deviceidx) >= s_gameDeviceDescriptions.size())
+		{
+			s_gameDeviceDescriptions.resize(static_cast<size_t>(deviceidx) + 1);
+		}
+	}
+	catch (...)
+	{
+		return false;
+	}
+
+	rts::render::GameRenderDeviceDesc gameDescription;
+	memset(&gameDescription, 0, sizeof(gameDescription));
+	unsigned int resolutionCount = 0;
+	rts::render::RenderResult result =
+		rts::render::GetGameRenderDeviceDesc(deviceidx, &gameDescription,
+			0, 0, &resolutionCount);
+	if (result != rts::render::RENDER_RESULT_OK)
+	{
+		return false;
+	}
+	// A malformed owner must not make this ABI adapter allocate an unbounded
+	// amount of memory. Real owners enumerate at most the display modes they
+	// expose; this upper bound only protects the caller-owned bridge buffer.
+	if (resolutionCount > 4096)
+	{
+		return false;
+	}
+	std::vector<rts::render::GameRenderResolutionDesc> resolutions;
+	try
+	{
+		resolutions.resize(resolutionCount);
+	}
+	catch (...)
+	{
+		return false;
+	}
+	if (resolutionCount != 0)
+	{
+		result = rts::render::GetGameRenderDeviceDesc(deviceidx,
+			&gameDescription, &resolutions[0], resolutionCount,
+			&resolutionCount);
+		if (result != rts::render::RENDER_RESULT_OK)
+		{
+			return false;
+		}
+	}
+
+	RenderDeviceDescClass &description = s_gameDeviceDescriptions[deviceidx];
+	description.set_device_name(gameDescription.deviceName);
+	description.set_device_vendor(gameDescription.deviceVendor);
+	description.set_device_platform(gameDescription.devicePlatform);
+	description.set_driver_name(gameDescription.driverName);
+	description.set_driver_vendor(gameDescription.driverVendor);
+	description.set_driver_version(gameDescription.driverVersion);
+	description.set_hardware_name(gameDescription.hardwareName);
+	description.set_hardware_vendor(gameDescription.hardwareVendor);
+	description.set_hardware_chipset(gameDescription.hardwareChipset);
+	description.reset_resolution_list();
+	for (unsigned int i = 0; i < resolutionCount; ++i)
+	{
+		description.add_resolution(resolutions[i].width, resolutions[i].height,
+			resolutions[i].bitDepth);
+		const DynamicVectorClass<ResolutionDescClass> &stored_resolutions =
+			description.Enumerate_Resolutions();
+		for (int j = 0; j < stored_resolutions.Count(); ++j)
+		{
+			const ResolutionDescClass &stored = stored_resolutions[j];
+			if (stored.Width == resolutions[i].width &&
+				stored.Height == resolutions[i].height &&
+				stored.BitDepth == resolutions[i].bitDepth)
+			{
+				description.set_resolution_refresh_rate(j,
+					resolutions[i].refreshRate);
+				break;
+			}
+		}
+	}
+	return true;
 }
 }
 
@@ -562,7 +670,7 @@ unsigned													WW3D::NPatchesLevel=1;
 bool														WW3D::IsTexturingEnabled=true;
 bool										WW3D::IsColoringEnabled=false;
 
-static HWND												_Hwnd = nullptr;		// Not a member to hide windows from WW3D users
+static void *												_Hwnd = nullptr;		// Not a member to hide windows from WW3D users
 static int												_TextureReduction = 0;
 static int												_TextureMinDim = 1;
 static bool												_LargeTextureExtraReductionEnabled = false;
@@ -584,7 +692,7 @@ void WW3D::Set_NPatches_Gap_Filling_Mode(NPatchesGapFillingModeEnum mode)
 {
 	if (NPatchesGapFillingMode!=mode) {
 		NPatchesGapFillingMode=mode;
-		TheDX8MeshRenderer.Invalidate();
+		rts::render::InvalidateGameMeshCache();
 	}
 }
 
@@ -592,8 +700,8 @@ void WW3D::Set_NPatches_Level(unsigned level)
 {
 	if (level>8) level=8;
 	if (level<1) level=1;
-	if (NPatchesLevel==1 && level>1) TheDX8MeshRenderer.Invalidate();
-	if (NPatchesLevel>1 && level==1) TheDX8MeshRenderer.Invalidate();
+	if (NPatchesLevel==1 && level>1) rts::render::InvalidateGameMeshCache();
+	if (NPatchesLevel>1 && level==1) rts::render::InvalidateGameMeshCache();
 	NPatchesLevel = level;
 }
 
@@ -613,17 +721,20 @@ WW3DErrorType WW3D::Init(void *hwnd, char *defaultpal, bool lite)
 {
 	assert(IsInitted == false);
 	WWDEBUG_SAY(("WW3D::Init hwnd = %p",hwnd));
-	_Hwnd = (HWND)hwnd;
+	_Hwnd = hwnd;
 	Lite = lite;
 
 	/*
-	** Initialize d3d, this also enumerates the available devices and resolutions.
+	** Initialize the single renderer owner. It also enumerates the available
+	** devices and resolutions behind the neutral WW3D contract.
 	*/
-	Init_D3D_To_WW3_Conversion();
-	WWDEBUG_SAY(("Init DX8Wrapper"));
-	if (!DX8Wrapper::Init(_Hwnd, lite)) {
-		return(WW3D_ERROR_INITIALIZATION_FAILED);
+	const rts::render::RenderResult initResult =
+		rts::render::InitializeGameRenderer(_Hwnd, DEFAULT_RESOLUTION_WIDTH,
+		DEFAULT_RESOLUTION_HEIGHT, lite, false);
+	if (initResult != rts::render::RENDER_RESULT_OK) {
+		return ToWW3DError(initResult);
 	}
+	s_gameDeviceDescriptions.clear();
 	WWDEBUG_SAY(("Allocate Debug Resources"));
 	Allocate_Debug_Resources();
 
@@ -679,11 +790,11 @@ WW3DErrorType WW3D::Shutdown()
 	assert(Lite || IsInitted == true);
 //	WWDEBUG_SAY(("WW3D::Shutdown"));
 
-#ifdef WW3D_DX8
-	if (IsCapturing || Movie != nullptr || !s_d3d11MovieRequests.empty()) {
+#ifdef _WIN32
+	if (IsCapturing || Movie != nullptr || !s_gameMovieRequests.empty()) {
 		Stop_Movie_Capture();
 	}
-#endif //WW3D_DX8
+#endif
 
 	//restore the previous timer resolution
 	MAYBE_UNUSED MMRESULT r=timeEndPeriod(1);
@@ -709,10 +820,8 @@ WW3DErrorType WW3D::Shutdown()
 		WW3DAssetManager::Get_Instance()->Free_Assets();
 	}
 
-	DX8TextureManagerClass::Shutdown();
-	if (!Lite) {
-		DX8Wrapper::Shutdown();
-	}
+	const rts::render::RenderResult rendererResult =
+		rts::render::ShutdownGameRenderer();
 
 	/*
 	** Clear the default static sort lists
@@ -725,7 +834,7 @@ WW3DErrorType WW3D::Shutdown()
 	AnimatedSoundMgrClass::Shutdown ();
 
 	IsInitted = false;
-	return WW3D_ERROR_OK;
+	return ToWW3DError(rendererResult);
 }
 
 
@@ -743,12 +852,8 @@ WW3DErrorType WW3D::Shutdown()
  *=============================================================================================*/
 WW3DErrorType WW3D::Set_Render_Device( const char * dev_name, int width, int height, int bits, int windowed, bool resize_window )
 {
-	bool success = DX8Wrapper::Set_Render_Device(dev_name,width,height,bits,windowed,resize_window);
-	if (success) {
-		return WW3D_ERROR_OK;
-	} else {
-		return WW3D_ERROR_INITIALIZATION_FAILED;
-	}
+	return ToWW3DError(rts::render::SetGameRenderDeviceByName(dev_name,
+		width, height, bits, windowed, resize_window));
 }
 
 
@@ -766,12 +871,7 @@ WW3DErrorType WW3D::Set_Render_Device( const char * dev_name, int width, int hei
  *=============================================================================================*/
 WW3DErrorType WW3D::Set_Any_Render_Device()
 {
-	bool success = DX8Wrapper::Set_Any_Render_Device();
-	if (success) {
-		return WW3D_ERROR_OK;
-	} else {
-		return WW3D_ERROR_INITIALIZATION_FAILED;
-	}
+	return ToWW3DError(rts::render::SetAnyGameRenderDevice());
 }
 
 
@@ -789,12 +889,8 @@ WW3DErrorType WW3D::Set_Any_Render_Device()
  *=============================================================================================*/
 WW3DErrorType WW3D::Set_Render_Device(int dev, int width, int height, int bits, int windowed, bool resize_window, bool reset_device, bool restore_assets )
 {
-	bool success = DX8Wrapper::Set_Render_Device(dev,width,height,bits,windowed,resize_window,reset_device, restore_assets );
-	if (success) {
-		return WW3D_ERROR_OK;
-	} else {
-		return WW3D_ERROR_INITIALIZATION_FAILED;
-	}
+	return ToWW3DError(rts::render::SetGameRenderDeviceByIndex(dev, width,
+		height, bits, windowed, resize_window, reset_device, restore_assets));
 }
 
 
@@ -812,12 +908,7 @@ WW3DErrorType WW3D::Set_Render_Device(int dev, int width, int height, int bits, 
  *=============================================================================================*/
 WW3DErrorType WW3D::Set_Next_Render_Device()
 {
-	bool success = DX8Wrapper::Set_Next_Render_Device();
-	if (success) {
-		return WW3D_ERROR_OK;
-	} else {
-		return WW3D_ERROR_INITIALIZATION_FAILED;
-	}
+	return ToWW3DError(rts::render::SetNextGameRenderDevice());
 }
 
 /***********************************************************************************************
@@ -851,7 +942,12 @@ void *WW3D::Get_Window()
  *=============================================================================================*/
 bool WW3D::Is_Windowed()
 {
-	return DX8Wrapper::Is_Windowed();
+	int width = 0;
+	int height = 0;
+	int bits = 0;
+	bool windowed = false;
+	return rts::render::GetGameRendererResolution(&width, &height, &bits,
+		&windowed) == rts::render::RENDER_RESULT_OK && windowed;
 }
 
 /***********************************************************************************************
@@ -871,12 +967,7 @@ bool WW3D::Is_Windowed()
  *=============================================================================================*/
 WW3DErrorType WW3D::Toggle_Windowed ()
 {
-	bool success = DX8Wrapper::Toggle_Windowed();
-	if (success) {
-		return WW3D_ERROR_OK;
-	} else {
-		return WW3D_ERROR_INITIALIZATION_FAILED;
-	}
+	return ToWW3DError(rts::render::ToggleGameRendererWindowed());
 }
 
 
@@ -891,11 +982,11 @@ WW3DErrorType WW3D::Toggle_Windowed ()
  *                                                                                             *
  * HISTORY:                                                                                    *
  *   3/24/98    GTH : Created.                                                                 *
- *   1/25/2001  gth : converted to dx8                                                         *
+ *   1/25/2001  gth : converted to the renderer facade                                        *
  *=============================================================================================*/
 int WW3D::Get_Render_Device()
 {
-	return DX8Wrapper::Get_Render_Device();
+	return rts::render::GetGameRenderDeviceIndex();
 }
 
 
@@ -910,11 +1001,17 @@ int WW3D::Get_Render_Device()
  *                                                                                             *
  * HISTORY:                                                                                    *
  *   3/26/98    GTH : Created.                                                                 *
- *   1/25/2001  gth : converted to dx8                                                         *
+ *   1/25/2001  gth : converted to the renderer facade                                        *
  *=============================================================================================*/
 const RenderDeviceDescClass & WW3D::Get_Render_Device_Desc(int deviceidx)
 {
-	return DX8Wrapper::Get_Render_Device_Desc(deviceidx);
+	if (deviceidx < 0) {
+		deviceidx = Get_Render_Device();
+	}
+	if (!PopulateGameDeviceDescription(deviceidx)) {
+		return s_emptyGameDeviceDescription;
+	}
+	return s_gameDeviceDescriptions[deviceidx];
 }
 
 
@@ -930,11 +1027,11 @@ const RenderDeviceDescClass & WW3D::Get_Render_Device_Desc(int deviceidx)
  *                                                                                             *
  * HISTORY:                                                                                    *
  *   5/19/99    GTH : Created.                                                                 *
- *   1/25/2001  gth : converted to DX8                                                         *
+ *   1/25/2001  gth : converted to the renderer facade                                        *
  *=============================================================================================*/
 int WW3D::Get_Render_Device_Count()
 {
-	return DX8Wrapper::Get_Render_Device_Count();
+	return rts::render::GetGameRenderDeviceCount();
 }
 
 
@@ -949,11 +1046,11 @@ int WW3D::Get_Render_Device_Count()
  *                                                                                             *
  * HISTORY:                                                                                    *
  *   5/19/99    GTH : Created.                                                                 *
- *   1/25/2001  gth : converted to dx8                                                         *
+ *   1/25/2001  gth : converted to the renderer facade                                        *
  *=============================================================================================*/
 const char * WW3D::Get_Render_Device_Name(int device_index)
 {
-	return DX8Wrapper::Get_Render_Device_Name(device_index);
+	return Get_Render_Device_Desc(device_index).Get_Device_Name();
 }
 
 
@@ -971,13 +1068,8 @@ const char * WW3D::Get_Render_Device_Name(int device_index)
  *=============================================================================================*/
 WW3DErrorType WW3D::Set_Device_Resolution(int width,int height,int bits,int windowed, bool resize_window)
 {
-	bool success = DX8Wrapper::Set_Device_Resolution(width,height,bits,windowed,resize_window);
-
-	if (success) {
-		return WW3D_ERROR_OK;
-	} else {
-		return WW3D_ERROR_INITIALIZATION_FAILED;
-	}
+	return ToWW3DError(rts::render::SetGameRendererResolution(width, height,
+		bits, windowed, resize_window));
 }
 
 
@@ -992,11 +1084,14 @@ WW3DErrorType WW3D::Set_Device_Resolution(int width,int height,int bits,int wind
  *                                                                                             *
  * HISTORY:                                                                                    *
  *   3/24/98    GTH : Created.                                                                 *
- *   1/25/2001  gth : converted to dx8                                                         *
+ *   1/25/2001  gth : converted to the renderer facade                                        *
  *=============================================================================================*/
 void WW3D::Get_Render_Target_Resolution(int & set_w,int & set_h,int & set_bits,bool & set_windowed)
 {
-	DX8Wrapper::Get_Render_Target_Resolution(set_w,set_h,set_bits,set_windowed);
+	set_w = set_h = set_bits = 0;
+	set_windowed = false;
+	rts::render::GetGameRendererTargetResolution(&set_w, &set_h, &set_bits,
+		&set_windowed);
 }
 
 
@@ -1011,11 +1106,14 @@ void WW3D::Get_Render_Target_Resolution(int & set_w,int & set_h,int & set_bits,b
  *                                                                                             *
  * HISTORY:                                                                                    *
  *   3/24/98    GTH : Created.                                                                 *
- *   1/25/2001  gth : converted to dx8                                                         *
+ *   1/25/2001  gth : converted to the renderer facade                                        *
  *=============================================================================================*/
 void WW3D::Get_Device_Resolution(int & set_w,int & set_h,int & set_bits,bool & set_windowed)
 {
-	DX8Wrapper::Get_Device_Resolution(set_w,set_h,set_bits,set_windowed);
+	set_w = set_h = set_bits = 0;
+	set_windowed = false;
+	rts::render::GetGameRendererResolution(&set_w, &set_h, &set_bits,
+		&set_windowed);
 }
 
 
@@ -1030,16 +1128,17 @@ void WW3D::Get_Device_Resolution(int & set_w,int & set_h,int & set_bits,bool & s
  *                                                                                             *
  * HISTORY:                                                                                    *
  *   12/3/98    BMG : Created.                                                                 *
- *   1/25/2001  gth : converted to dx8                                                         *
+ *   1/25/2001  gth : converted to the renderer facade                                        *
  *=============================================================================================*/
 WW3DErrorType WW3D::Registry_Save_Render_Device( const char * sub_key )
 {
-	bool success = DX8Wrapper::Registry_Save_Render_Device(sub_key);
-	if (success) {
-		return WW3D_ERROR_OK;
-	} else {
-		return WW3D_ERROR_INITIALIZATION_FAILED;
-	}
+	int width = 0;
+	int height = 0;
+	int depth = 0;
+	bool windowed = false;
+	Get_Device_Resolution(width, height, depth, windowed);
+	return Registry_Save_Render_Device(sub_key, Get_Render_Device(), width,
+		height, depth, windowed, Get_Texture_Bitdepth());
 }
 
 /***********************************************************************************************
@@ -1056,12 +1155,35 @@ WW3DErrorType WW3D::Registry_Save_Render_Device( const char * sub_key )
  *=============================================================================================*/
 WW3DErrorType WW3D::Registry_Save_Render_Device( const char *sub_key, int device, int width, int height, int depth, bool windowed, int texture_depth )
 {
-	bool success = DX8Wrapper::Registry_Save_Render_Device(sub_key,device,width,height,depth,windowed,texture_depth);
-	if (success) {
-		return WW3D_ERROR_OK;
-	} else {
-		return WW3D_ERROR_INITIALIZATION_FAILED;
+	static const char *valueDeviceName = "RenderDeviceName";
+	static const char *valueWidth = "RenderDeviceWidth";
+	static const char *valueHeight = "RenderDeviceHeight";
+	static const char *valueDepth = "RenderDeviceDepth";
+	static const char *valueWindowed = "RenderDeviceWindowed";
+	static const char *valueTextureDepth = "RenderDeviceTextureDepth";
+	if (sub_key == 0 || device < 0 || device >= Get_Render_Device_Count() ||
+		width <= 0 || height <= 0 || depth <= 0 || texture_depth <= 0)
+	{
+		return WW3D_ERROR_GENERIC;
 	}
+	const char *deviceName = Get_Render_Device_Name(device);
+	if (deviceName == 0 || *deviceName == 0)
+	{
+		return WW3D_ERROR_GENERIC;
+	}
+	RegistryClass registry(sub_key);
+	if (!registry.Is_Valid())
+	{
+		WWDEBUG_SAY(("Error getting Registry"));
+		return WW3D_ERROR_GENERIC;
+	}
+	registry.Set_String(valueDeviceName, deviceName);
+	registry.Set_Int(valueWidth, width);
+	registry.Set_Int(valueHeight, height);
+	registry.Set_Int(valueDepth, depth);
+	registry.Set_Int(valueWindowed, windowed ? 1 : 0);
+	registry.Set_Int(valueTextureDepth, texture_depth);
+	return WW3D_ERROR_OK;
 }
 
 
@@ -1079,22 +1201,105 @@ WW3DErrorType WW3D::Registry_Save_Render_Device( const char *sub_key, int device
  *=============================================================================================*/
 WW3DErrorType WW3D::Registry_Load_Render_Device( const char * sub_key, bool resize_window )
 {
-	bool success = DX8Wrapper::Registry_Load_Render_Device(sub_key,resize_window);
-	if (success) {
-		return WW3D_ERROR_OK;
-	} else {
-		return WW3D_ERROR_INITIALIZATION_FAILED;
+	char name[200];
+	int width = -1;
+	int height = -1;
+	int depth = -1;
+	int windowed = -1;
+	int textureDepth = -1;
+	if (Registry_Load_Render_Device(sub_key, name, sizeof(name), width, height,
+		depth, windowed, textureDepth) && *name != 0)
+	{
+		WWDEBUG_SAY(("Device %s (%d X %d) %d bit windowed:%d", name, width,
+			height, depth, windowed));
+		if (textureDepth == 16 || textureDepth == 32)
+		{
+			Set_Texture_Bitdepth(textureDepth);
+		}
+		else
+		{
+			WWDEBUG_SAY(("Invalid texture depth %d, switching to 16 bits",
+				textureDepth));
+			Set_Texture_Bitdepth(16);
+		}
+
+		if (Set_Render_Device(name, width, height, depth, windowed,
+			resize_window) == WW3D_ERROR_OK)
+		{
+			return WW3D_ERROR_OK;
+		}
+		depth = depth == 16 ? 32 : 16;
+		if (Set_Render_Device(name, width, height, depth, windowed,
+			resize_window) == WW3D_ERROR_OK)
+		{
+			return WW3D_ERROR_OK;
+		}
+		depth = depth == 16 ? 32 : 16;
+		if (width == 640)
+		{
+			width = 1024;
+			height = 768;
+		}
+		for (;;)
+		{
+			if (width > 2048) { width = 2048; height = 1536; }
+			else if (width > 1920) { width = 1920; height = 1440; }
+			else if (width > 1600) { width = 1600; height = 1200; }
+			else if (width > 1280) { width = 1280; height = 1024; }
+			else if (width > 1024) { width = 1024; height = 768; }
+			else if (width > 800) { width = 800; height = 600; }
+			else if (width != 640) { width = 640; height = 480; }
+			else { return Set_Any_Render_Device(); }
+			for (int i = 0; i < 2; ++i)
+			{
+				if (Set_Render_Device(name, width, height, depth, windowed,
+					resize_window) == WW3D_ERROR_OK)
+				{
+					return WW3D_ERROR_OK;
+				}
+				depth = depth == 16 ? 32 : 16;
+			}
+		}
 	}
+	WWDEBUG_SAY(("Error getting Registry"));
+	return Set_Any_Render_Device();
 }
 
 bool WW3D::Registry_Load_Render_Device( const char * sub_key, char *device, int device_len, int &width, int &height, int &depth, int &windowed, int &texture_depth)
 {
-	return DX8Wrapper::Registry_Load_Render_Device(sub_key,device,device_len,width,height,depth,windowed,texture_depth);
+	static const char *valueDeviceName = "RenderDeviceName";
+	static const char *valueWidth = "RenderDeviceWidth";
+	static const char *valueHeight = "RenderDeviceHeight";
+	static const char *valueDepth = "RenderDeviceDepth";
+	static const char *valueWindowed = "RenderDeviceWindowed";
+	static const char *valueTextureDepth = "RenderDeviceTextureDepth";
+	if (device == 0 || device_len <= 0)
+	{
+		return false;
+	}
+	*device = 0;
+	width = -1;
+	height = -1;
+	depth = -1;
+	windowed = -1;
+	texture_depth = -1;
+	RegistryClass registry(sub_key);
+	if (!registry.Is_Valid())
+	{
+		return false;
+	}
+	registry.Get_String(valueDeviceName, device, device_len);
+	width = registry.Get_Int(valueWidth, -1);
+	height = registry.Get_Int(valueHeight, -1);
+	depth = registry.Get_Int(valueDepth, -1);
+	windowed = registry.Get_Int(valueWindowed, -1);
+	texture_depth = registry.Get_Int(valueTextureDepth, -1);
+	return true;
 }
 
 void WW3D::_Invalidate_Mesh_Cache()
 {
-	TheDX8MeshRenderer.Invalidate();
+	rts::render::InvalidateGameMeshCache();
 }
 
 void WW3D::_Invalidate_Textures()
@@ -1151,33 +1356,10 @@ WW3DErrorType WW3D::Begin_Render(bool clear,bool clearz,const Vector3 & color, f
 
 	WWPROFILE("WW3D::Begin_Render");
 	WWASSERT(IsInitted);
-	HRESULT hr;
 
 	SNAPSHOT_SAY(("=========================================="));
 	SNAPSHOT_SAY(("========== WW3D::Begin_Render ============"));
 	SNAPSHOT_SAY(("==========================================\n"));
-
-	// The compatibility D3D8 device is a differential oracle while the D3D11
-	// bridge owns visible presentation. Its cooperative state must not suppress
-	// a D3D11 frame (which otherwise leaves audio running against a black or
-	// stale window).
-	if (!DX8Wrapper::Is_D3D11_Backend_Active() &&
-		DX8Wrapper::_Get_D3D_Device8() &&
-		(hr=DX8Wrapper::_Get_D3D_Device8()->TestCooperativeLevel()) != D3D_OK)
-	{
-        // If the device was lost, do not render until we get it back
-        if( D3DERR_DEVICELOST == hr )
-            return WW3D_ERROR_GENERIC;	//other app has the device
-
-        // Check if the device needs to be reset
-        if( D3DERR_DEVICENOTRESET == hr )
-        {
-            WWDEBUG_SAY(("WW3D::Begin_Render is resetting the device."));
-            DX8Wrapper::Reset_Device();
-        }
-
-		return WW3D_ERROR_GENERIC;
-	}
 
 	// Memory allocation statistics
 	LastFrameMemoryAllocations=WWMemoryLogClass::Get_Allocate_Count();
@@ -1186,8 +1368,12 @@ WW3DErrorType WW3D::Begin_Render(bool clear,bool clearz,const Vector3 & color, f
 
 	TextureLoader::Update(network_callback);
 //	TextureClass::_Reset_Time_Stamp();
-	DynamicVBAccessClass::_Reset(true);
-	DynamicIBAccessClass::_Reset(true);
+	const rts::render::RenderResult resetResult =
+		rts::render::ResetGameRenderFrameResources(true);
+	if (resetResult != rts::render::RENDER_RESULT_OK)
+	{
+		return ToWW3DError(resetResult);
+	}
 
 	Debug_Statistics::Begin_Statistics();
 
@@ -1199,27 +1385,15 @@ WW3DErrorType WW3D::Begin_Render(bool clear,bool clearz,const Vector3 & color, f
 	WWASSERT(!IsRendering);
 	IsRendering = true;
 
-	// If we want to clear the screen, we need to set the viewport to include the entire screen:
-	if (clear || clearz) {
-		D3DVIEWPORT8 vp;
-		int width, height, bits;
-		bool windowed;
-		WW3D::Get_Render_Target_Resolution(width, height, bits, windowed);
-		vp.X = 0;
-		vp.Y = 0;
-		vp.Width = width;
-		vp.Height = height;
-		vp.MinZ = 0.0f;
-		vp.MaxZ = 1.0f;
-		DX8Wrapper::Set_Viewport(&vp);
-		DX8Wrapper::Clear(clear, clearz, color, dest_alpha);
-	}
-
-	// Notify D3D that we are beginning to render the frame
-	if (!DX8Wrapper::Begin_Scene())
+	rts::render::BeginGameDisplayIteration();
+	const rts::render::GameRenderColor gameColor =
+		ToGameRenderColor(color, dest_alpha);
+	const rts::render::RenderResult beginResult =
+		rts::render::BeginGameRender(clear, clearz, gameColor, dest_alpha);
+	if (beginResult != rts::render::RENDER_RESULT_OK)
 	{
 		IsRendering = false;
-		return WW3D_ERROR_GENERIC;
+		return ToWW3DError(beginResult);
 	}
 
 	return WW3D_ERROR_OK;
@@ -1317,29 +1491,43 @@ WW3DErrorType WW3D::Render(SceneClass * scene,CameraClass * cam,bool clear,bool 
 
 	// Clear the viewport
 	if (clear || clearz) {
-		DX8Wrapper::Clear(clear, clearz, color);
+		const rts::render::GameRenderColor gameColor =
+			ToGameRenderColor(color, 0.0f);
+		const rts::render::RenderResult clearResult =
+			rts::render::ClearGameRenderTargets(clear, clearz, gameColor, 0.0f);
+		if (clearResult != rts::render::RENDER_RESULT_OK)
+		{
+			return ToWW3DError(clearResult);
+		}
 	}
 
 	// set the rendering mode
 	switch(scene->Get_Polygon_Mode()) {
 		case SceneClass::POINT:
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_FILLMODE,D3DFILL_POINT);
+			rts::render::SetGameRenderState(
+				rts::render::GAME_RENDER_STATE_FILL_MODE,
+				rts::render::GAME_RENDER_FILL_POINT);
 			break;
 		case SceneClass::LINE:
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_FILLMODE,D3DFILL_WIREFRAME);
+			rts::render::SetGameRenderState(
+				rts::render::GAME_RENDER_STATE_FILL_MODE,
+				rts::render::GAME_RENDER_FILL_WIREFRAME);
 			break;
 		case SceneClass::FILL:
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_FILLMODE,D3DFILL_SOLID);
+			rts::render::SetGameRenderState(
+				rts::render::GAME_RENDER_STATE_FILL_MODE,
+				rts::render::GAME_RENDER_FILL_SOLID);
 			break;
 	}
 
 	// Set the global ambient light value here.  If the scene is using the LightEnvironment system
 	// this setting will get overridden.
-	DX8Wrapper::Set_Ambient(scene->Get_Ambient_Light());
+	rts::render::SetGameAmbientColor(ToGameRenderColor(
+		scene->Get_Ambient_Light(), 1.0f));
 
 	// render the scene
 
-	TheDX8MeshRenderer.Set_Camera(&rinfo.Camera);
+	rts::render::SetGameRenderCamera(static_cast<void *>(&rinfo.Camera));
 
 	scene->Render(rinfo);
 
@@ -1383,15 +1571,17 @@ WW3DErrorType WW3D::Render(
 	rinfo.Camera.Apply();
 
 	// set the rendering mode
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_FILLMODE,D3DFILL_SOLID);
+	rts::render::SetGameRenderState(
+		rts::render::GAME_RENDER_STATE_FILL_MODE,
+		rts::render::GAME_RENDER_FILL_SOLID);
 
 	// Install the lighting environment if one is supplied
 	if (rinfo.light_environment != nullptr) {
-		DX8Wrapper::Set_Light_Environment(rinfo.light_environment);
+		rts::render::SetGameLightEnvironment(rinfo.light_environment);
 	}
 
 	// Render the object
-	TheDX8MeshRenderer.Set_Camera(&rinfo.Camera);
+	rts::render::SetGameRenderCamera(static_cast<void *>(&rinfo.Camera));
 
 	obj.Render(rinfo);
 
@@ -1406,7 +1596,7 @@ WW3DErrorType WW3D::Render(
  *                                                                                             *
  *    NOTE: This normally happens AUTOMATICALLY. The user should almost *NEVER* have to call   *
  *    this function.  Anyway, this function causes all of the deferred rendering systems to    *
- *    actually perform all of their rendering tasks.  This includes the DX8MeshRenderer and    *
+ *    actually perform all of their rendering tasks.  This includes mesh and sort queues.       *
  *    the sorting system.                                                                      *
  *                                                                                             *
  * INPUT:                                                                                      *
@@ -1422,12 +1612,12 @@ WW3DErrorType WW3D::Render(
  *=============================================================================================*/
 void WW3D::Flush(RenderInfoClass & rinfo)
 {
-	TheDX8MeshRenderer.Flush();
+	rts::render::FlushGameRenderMeshes();
 	SHD_FLUSH;
 	WW3D::Render_And_Clear_Static_Sort_Lists(rinfo);	//draws things like water
 
-	SortingRendererClass::Flush();
-	TheDX8MeshRenderer.Clear_Pending_Delete_Lists();
+	rts::render::FlushGameSortedTriangles();
+	rts::render::ClearGameRenderMeshPendingDeletes();
 }
 
 
@@ -1457,21 +1647,19 @@ WW3DErrorType WW3D::End_Render(bool flip_frame)
 	// If sorting renderer flush isn't called from within any of the render functions
 	// the sorting arrays will overflow!
 
-	SortingRendererClass::Flush();
+	rts::render::FlushGameSortedTriangles();
 
 	IsRendering = false;
 
-	{
-		WWPROFILE("DX8Wrapper::End_Scene");
-		DX8Wrapper::End_Scene(flip_frame);
-	}
-	// D3D11 capture callbacks run from End_Scene after the capture queue has
+	const rts::render::RenderResult endResult =
+		rts::render::EndGameRender(flip_frame);
+	// Capture callbacks run from the owner after the capture queue has
 	// detached its completed entries. Defer an error-triggered movie stop until
 	// the queue has finished invoking every callback, otherwise the remaining
 	// callbacks would observe a deleted FrameGrabClass.
-	if (s_d3d11MovieStopPending)
+	if (s_gameMovieStopPending)
 	{
-		s_d3d11MovieStopPending = false;
+		s_gameMovieStopPending = false;
 		Stop_Movie_Capture();
 	}
 
@@ -1491,9 +1679,9 @@ WW3DErrorType WW3D::End_Render(bool flip_frame)
 	// (gth) I've found some cases where its not safe to rely on our "shadow" copy (of
 	// matrices for example) across multiple frames.  So even though this is slightly
 	// less "optimal", lets just reset the caches each frame.
-	DX8Wrapper::Invalidate_Cached_Render_States();
+	rts::render::InvalidateGameRenderStateCache();
 
-	return WW3D_ERROR_OK;
+	return ToWW3DError(endResult);
 }
 
 
@@ -1511,7 +1699,7 @@ WW3DErrorType WW3D::End_Render(bool flip_frame)
  *=============================================================================================*/
 void WW3D::Flip_To_Primary()
 {
-	DX8Wrapper::Flip_To_Primary();
+	rts::render::FlipGameRenderer();
 }
 
 
@@ -1529,12 +1717,12 @@ void WW3D::Flip_To_Primary()
  *=============================================================================================*/
 unsigned int WW3D::Get_Last_Frame_Poly_Count()
 {
-	return Debug_Statistics::Get_DX8_Polygons();
+	return rts::render::GetGameLastFramePolygonCount();
 }
 
 unsigned int WW3D::Get_Last_Frame_Vertex_Count()
 {
-	return Debug_Statistics::Get_DX8_Vertices();
+	return rts::render::GetGameLastFrameVertexCount();
 }
 
 void WW3D::Update_Logic_Frame_Time(float milliseconds)
@@ -1566,6 +1754,7 @@ void WW3D::Sync(bool step)
 		FractionalSyncMs -= integralSyncMs;
 		SyncTime += integralSyncMs;
 	}
+	rts::render::SyncGameRenderer(step);
 }
 
 /***********************************************************************************************
@@ -1582,7 +1771,7 @@ void WW3D::Sync(bool step)
  *=============================================================================================*/
 void WW3D::Set_Ext_Swap_Interval(long swap)
 {
-	DX8Wrapper::Set_Swap_Interval(swap);
+	rts::render::SetGameRendererSwapInterval(swap);
 }
 
 
@@ -1600,7 +1789,7 @@ void WW3D::Set_Ext_Swap_Interval(long swap)
  *=============================================================================================*/
 long WW3D::Get_Ext_Swap_Interval()
 {
-	return DX8Wrapper::Get_Swap_Interval();
+	return rts::render::GetGameRendererSwapInterval();
 }
 
 
@@ -1656,13 +1845,25 @@ int WW3D::Get_Collision_Box_Display_Mask()
  *=============================================================================================*/
 void WW3D::Normalize_Coordinates(int x, int y, float &fx, float &fy)
 {
+	int width = 0;
+	int height = 0;
+	int bits = 0;
+	bool windowed = false;
+	if (rts::render::GetGameRendererResolution(&width, &height, &bits,
+		&windowed) != rts::render::RENDER_RESULT_OK || width <= 0 ||
+		height <= 0)
+	{
+		fx = 0.0f;
+		fy = 0.0f;
+		return;
+	}
 	// clip the coordinates back into the resolution of the screen
-	x = Bound(x, 0, DX8Wrapper::Get_Device_Resolution_Width());
-	y = Bound(y, 0, DX8Wrapper::Get_Device_Resolution_Height());
+	x = Bound(x, 0, width);
+	y = Bound(y, 0, height);
 
 	// now that the coordinates are clipped convert them to their normalized values.
-	fx = (float)x / DX8Wrapper::Get_Device_Resolution_Width();
-	fy = (float)y / DX8Wrapper::Get_Device_Resolution_Height();
+	fx = (float)x / width;
+	fy = (float)y / height;
 }
 
 
@@ -1677,233 +1878,93 @@ void WW3D::Normalize_Coordinates(int x, int y, float &fx, float &fy)
  *                                                                                             *
  * HISTORY:                                                                                    *
  *   5/19/99    GTH : Created.                                                                 *
- *   2/26/2001  hy : Updated to DX8                                                            *
+ *   2/26/2001  hy : Updated to the renderer facade                                            *
  *=============================================================================================*/
 void WW3D::Make_Screen_Shot( const char * filename_base , const float gamma, const ScreenShotFormatEnum format)
 {
-
 	WWASSERT(!IsRendering);
 
+	if (filename_base == 0)
+	{
+		filename_base = "ScreenShot";
+	}
 	char filename[80];
-
 	char ext[4];
 	switch (format) {
 		case TGA:
-			sprintf(ext,"tga");
+			sprintf(ext, "tga");
 			break;
 		case BMP:
-			sprintf(ext,"bmp");
+			sprintf(ext, "bmp");
 			break;
 		default:
 			WWASSERT(0);
 			return;
-			break;
 	}
 
 	static int frame_number = 1;
-
 	bool done = false;
 	while (!done) {
-		snprintf( filename, ARRAY_SIZE(filename), "%s%.2d.%s", filename_base, frame_number++, ext);
-		FileClass*file=_TheFileFactory->Get_File( filename );
-		if ( file ) {
+		snprintf(filename, ARRAY_SIZE(filename), "%s%.2d.%s", filename_base,
+			frame_number++, ext);
+		FileClass *file = _TheFileFactory->Get_File(filename);
+		if (file != 0) {
 			file->Open();
 			done = !file->Is_Available();
-			_TheFileFactory->Return_File( file );
+			_TheFileFactory->Return_File(file);
 		} else {
 			done = true;
 		}
 	}
 
-	WWDEBUG_SAY(( "Creating Screen Shot %s", filename ));
-
-	// make the gamma look up table
-	int i;
-	unsigned char gamma_lut[256];
-	float recip = 1.0f;
-	if (gamma > WWMATH_EPSILON) {
-		recip = 1.0f / gamma;
-	}
-	for (i = 0; i < 256; i++) {
-		gamma_lut[i] = (unsigned char) (256.0f * powf(i / 256.0f, recip));
-	}
-
-	unsigned int x, y, width, height;
-	size_t index = 0;
-	size_t index2 = 0;
-	unsigned char *image = nullptr;
-	if (DX8Wrapper::Is_D3D11_Backend_Active())
+	WWDEBUG_SAY(("Creating Screen Shot %s", filename));
+	rts::render::RenderBackBufferInfo backBufferInfo;
+	const rts::render::RenderResult infoResult =
+		rts::render::GetGameBackBufferInfo(&backBufferInfo);
+	if (infoResult != rts::render::RENDER_RESULT_OK ||
+		backBufferInfo.format != rts::render::RENDER_FORMAT_B8G8R8A8_UNORM ||
+		backBufferInfo.width == 0 || backBufferInfo.height == 0 ||
+		(format == TGA && (backBufferInfo.width > 65535 ||
+			backBufferInfo.height > 65535)))
 	{
-		rts::render::RenderBackBufferInfo backBufferInfo;
-		const rts::render::RenderResult infoResult =
-			DX8Wrapper::Get_D3D11_Back_Buffer_Info(&backBufferInfo);
-		if (infoResult != rts::render::RENDER_RESULT_OK ||
-			backBufferInfo.format != rts::render::RENDER_FORMAT_B8G8R8A8_UNORM ||
-			backBufferInfo.width == 0 || backBufferInfo.height == 0 ||
-			(format == TGA && (backBufferInfo.width > 65535 ||
-				backBufferInfo.height > 65535)))
-		{
-			WWDEBUG_SAY(("D3D11 screenshot back-buffer dimensions are invalid"));
-			return;
-		}
-		D3D11LegacyScreenshotCapture *capture = 0;
-		try
-		{
-			capture = new D3D11LegacyScreenshotCapture;
-		}
-		catch (...)
-		{
-			capture = 0;
-		}
-		if (capture == 0)
-		{
-			WWDEBUG_SAY(("D3D11 screenshot request allocation failed"));
-			return;
-		}
-		strlcpy(capture->filename, filename, ARRAY_SIZE(capture->filename));
-		capture->gamma = gamma;
-		capture->format = format;
-		capture->width = backBufferInfo.width;
-		capture->height = backBufferInfo.height;
-		rts::render::RenderCaptureRequestDescriptor descriptor;
-		descriptor.kind = rts::render::RENDER_CAPTURE_WW3D_SCREENSHOT;
-		descriptor.consumer = capture;
-		descriptor.completed = Complete_D3D11_Legacy_Screenshot;
-		descriptor.cancelled = Cancel_D3D11_Legacy_Screenshot;
-		rts::render::RenderCaptureHandle handle;
-		const rts::render::RenderResult queueResult =
-			DX8Wrapper::Queue_D3D11_Back_Buffer_Capture(descriptor, &handle);
-		if (queueResult != rts::render::RENDER_RESULT_OK)
-		{
-			WWDEBUG_SAY(("D3D11 screenshot queue rejected: %d",
-				static_cast<int>(queueResult)));
-			Cancel_D3D11_Legacy_Screenshot(capture, &handle, queueResult);
-		}
+		WWDEBUG_SAY(("Screenshot back-buffer dimensions are invalid"));
 		return;
 	}
-	else
+
+	GameScreenshotCapture *capture = 0;
+	try
 	{
-		// TheSuperHackers @bugfix xezon 21/05/2025 Get the back buffer and create a copy of the surface.
-		// Originally this code took the front buffer and tried to lock it. This does not work when the
-		// render view clips outside the desktop boundaries. It crashed the game.
-		SurfaceClass* surface = DX8Wrapper::_Get_DX8_Back_Buffer();
-
-		SurfaceClass::SurfaceDescription surfaceDesc;
-		surface->Get_Description(surfaceDesc);
-
-		SurfaceClass* surfaceCopy = NEW_REF(SurfaceClass, (DX8Wrapper::_Create_DX8_Surface(surfaceDesc.Width, surfaceDesc.Height, surfaceDesc.Format)));
-		DX8Wrapper::_Copy_DX8_Rects(surface->Peek_D3D_Surface(), nullptr, 0, surfaceCopy->Peek_D3D_Surface(), nullptr);
-
-		surface->Release_Ref();
-		surface = nullptr;
-
-		struct Rect
-		{
-			int Pitch;
-			void* pBits;
-		} lrect;
-
-		lrect.pBits = surfaceCopy->Lock(&lrect.Pitch);
-		if (lrect.pBits == nullptr)
-		{
-			surfaceCopy->Release_Ref();
-			return;
-		}
-
-		width = surfaceDesc.Width;
-		height = surfaceDesc.Height;
-		image = W3DNEWARRAY unsigned char[3*width*height];
-
-		for (y=0; y<height; y++)
-		{
-			for (x=0; x<width; x++)
-			{
-				index=3*(x+y*width);
-				index2=y*lrect.Pitch+4*x;
-				image[index] = gamma_lut[*((unsigned char *) lrect.pBits + index2+2)];
-				image[index+1] = gamma_lut[*((unsigned char *) lrect.pBits + index2+1)];
-				image[index+2] = gamma_lut[*((unsigned char *) lrect.pBits + index2+0)];
-			}
-		}
-
-		surfaceCopy->Unlock();
-		surfaceCopy->Release_Ref();
-		surfaceCopy = nullptr;
+		capture = new GameScreenshotCapture;
 	}
-
-	switch (format) {
-		case TGA:
-			{
-				Targa targ;
-				memset(&targ.Header,0,sizeof(targ.Header));
-				targ.Header.Width=width;
-				targ.Header.Height=height;
-				targ.Header.PixelDepth=24;
-				targ.Header.ImageType=TGA_TRUECOLOR;
-				targ.SetImage((char *) image);
-				targ.YFlip();
-
-				FileClass*file=_TheWritingFileFactory->Get_File( filename );
-				if ( file ) {
-					file->Create();
-					file->Close();
-					_TheWritingFileFactory->Return_File( file );
-				}
-
-				targ.Save(filename,TGAF_IMAGE,false);
-			}
-		break;
-		case BMP:
-			{
-				BITMAPFILEHEADER fileheader;
-				BITMAPINFOHEADER header;
-				memset(&header, 0, sizeof(BITMAPINFOHEADER));
-				header.biSize = sizeof(BITMAPINFOHEADER);
-				header.biWidth = width;
-				header.biHeight = height;
-				header.biPlanes = 1;
-				header.biBitCount = 24;
-				header.biCompression = BI_RGB;
-				header.biXPelsPerMeter = 0xB12;
-				header.biYPelsPerMeter = 0xB12;
-				int len = ((width * 24 +31) & ~31) /8;
-
-				memset(&fileheader, 0, sizeof(BITMAPFILEHEADER));
-				fileheader.bfType = 19778; // BM
-				fileheader.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
-				fileheader.bfSize = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER) + len * height * sizeof(char);
-
-				FileClass *file = _TheWritingFileFactory->Get_File( filename );
-				if ( file ) {
-					file->Create();
-					file->Open(FileClass::WRITE);
-					int num;
-					num = file->Write(&fileheader, sizeof(BITMAPFILEHEADER));
-					WWASSERT(num == sizeof(BITMAPFILEHEADER));
-					num = file->Write(&header, sizeof(BITMAPINFOHEADER));
-					WWASSERT(num == sizeof(BITMAPINFOHEADER));
-					char *temp = new char [len];
-					memset(temp, 0, len * sizeof(char));
-					// invert image, pad and swap R and B
-					for (y = 0; y < (int) height; y++) {
-						memcpy(&temp[0], &image[ 3 * width * (height - y - 1)], 3 * width * sizeof(char));
-						for (x = 0; x < width; x++) {
-							char t2 = temp[3 * x];
-							temp[3 * x] = temp[3 * x + 2];
-							temp[3 * x + 2] = t2;
-						}
-						num = file->Write(&temp[0], len * sizeof(char));
-						WWASSERT(num == len * (int)sizeof(char));
-					}
-					delete [] temp;
-					file->Close();
-					_TheWritingFileFactory->Return_File( file );
-				}
-			}
-			break;
+	catch (...)
+	{
+		capture = 0;
 	}
+	if (capture == 0)
+	{
+		WWDEBUG_SAY(("Screenshot request allocation failed"));
+		return;
+	}
+	strlcpy(capture->filename, filename, ARRAY_SIZE(capture->filename));
+	capture->gamma = gamma;
+	capture->format = format;
+	capture->width = backBufferInfo.width;
+	capture->height = backBufferInfo.height;
 
-	delete [] image;
+	rts::render::RenderCaptureRequestDescriptor descriptor;
+	descriptor.kind = rts::render::RENDER_CAPTURE_WW3D_SCREENSHOT;
+	descriptor.consumer = capture;
+	descriptor.completed = Complete_GameScreenshot;
+	descriptor.cancelled = Cancel_GameScreenshot;
+	rts::render::RenderCaptureHandle handle;
+	const rts::render::RenderResult queueResult =
+		rts::render::QueueGameBackBufferCapture(descriptor, &handle);
+	if (queueResult != rts::render::RENDER_RESULT_OK)
+	{
+		WWDEBUG_SAY(("Screenshot queue rejected: %d",
+			static_cast<int>(queueResult)));
+		Cancel_GameScreenshot(capture, &handle, queueResult);
+	}
 }
 
 
@@ -1918,50 +1979,41 @@ void WW3D::Make_Screen_Shot( const char * filename_base , const float gamma, con
  *                                                                                             *
  * HISTORY:                                                                                    *
  *   5/19/99    GTH : Created.                                                                 *
- *   2/26/2001  hy : updated to dx8                                                            *
+ *   2/26/2001  hy : updated to the renderer facade                                            *
  *=============================================================================================*/
 void WW3D::Start_Movie_Capture( const char * filename_base, float frame_rate )
 {
 #ifdef _WIN32
-	if (IsCapturing || Movie != nullptr || !s_d3d11MovieRequests.empty()) {
+	if (IsCapturing || Movie != nullptr || !s_gameMovieRequests.empty()) {
 		Stop_Movie_Capture();
 	}
-	WWASSERT( !IsCapturing);
+	WWASSERT(!IsCapturing);
+	if (filename_base == 0)
+	{
+		filename_base = "Movie";
+	}
+
+	rts::render::RenderBackBufferInfo backBufferInfo;
+	const rts::render::RenderResult infoResult =
+		rts::render::GetGameBackBufferInfo(&backBufferInfo);
+	if (infoResult != rts::render::RENDER_RESULT_OK ||
+		backBufferInfo.width == 0 || backBufferInfo.height == 0 ||
+		backBufferInfo.format != rts::render::RENDER_FORMAT_B8G8R8A8_UNORM ||
+		backBufferInfo.width > static_cast<unsigned int>(
+			std::numeric_limits<int>::max()) ||
+		backBufferInfo.height > static_cast<unsigned int>(
+			std::numeric_limits<int>::max()))
+	{
+		WWDEBUG_SAY(("Movie capture could not query the back buffer"));
+		return;
+	}
+	const int width = static_cast<int>(backBufferInfo.width);
+	const int height = static_cast<int>(backBufferInfo.height);
+	const int depth = 24;
+
 	IsCapturing = true;
 	RecordNextFrame = false;
-
-	int height = 0;
-	int width = 0;
-	if (DX8Wrapper::Is_D3D11_Backend_Active())
-	{
-		rts::render::RenderBackBufferInfo backBufferInfo;
-		if (DX8Wrapper::Get_D3D11_Back_Buffer_Info(&backBufferInfo) !=
-			rts::render::RENDER_RESULT_OK || backBufferInfo.width == 0 ||
-			backBufferInfo.height == 0 || backBufferInfo.format !=
-			rts::render::RENDER_FORMAT_B8G8R8A8_UNORM ||
-			backBufferInfo.width > static_cast<unsigned int>(
-				std::numeric_limits<int>::max()) ||
-			backBufferInfo.height > static_cast<unsigned int>(
-				std::numeric_limits<int>::max()))
-		{
-			WWDEBUG_SAY(("D3D11 movie capture could not query the back buffer"));
-			IsCapturing = false;
-			return;
-		}
-		width = static_cast<int>(backBufferInfo.width);
-		height = static_cast<int>(backBufferInfo.height);
-	}
-	else
-	{
-		RECT bounds;
-		GetWindowRect(_Hwnd, &bounds);
-		height = bounds.bottom - bounds.top;
-		width = bounds.right - bounds.left;
-	}
-	int depth=24;
-
-	WWASSERT( Movie == nullptr);
-
+	WWASSERT(Movie == nullptr);
 	if (frame_rate == 0.0f) {
 		frame_rate = 1.0f;
 		PauseRecord = true;
@@ -1969,24 +2021,21 @@ void WW3D::Start_Movie_Capture( const char * filename_base, float frame_rate )
 		PauseRecord = false;
 	}
 
-	Movie = W3DNEW FrameGrabClass( filename_base, FrameGrabClass::AVI, width, height, depth, frame_rate);
+	Movie = W3DNEW FrameGrabClass(filename_base, FrameGrabClass::AVI, width,
+		height, depth, frame_rate);
 	if (Movie == 0 || Movie->GetBuffer() == 0)
 	{
 		WWDEBUG_SAY(("Movie capture could not allocate its AVI buffer"));
 		delete Movie;
-		Movie = nullptr;
+		Movie = 0;
 		IsCapturing = false;
 		RecordNextFrame = false;
 		return;
 	}
-	if (DX8Wrapper::Is_D3D11_Backend_Active())
-	{
-		s_d3d11MovieOwner = Movie;
-		s_d3d11MovieWidth = static_cast<unsigned int>(width);
-		s_d3d11MovieHeight = static_cast<unsigned int>(height);
-	}
-
-	WWDEBUG_SAY(( "Starting Movie %s", filename_base ));
+	s_gameMovieOwner = Movie;
+	s_gameMovieWidth = backBufferInfo.width;
+	s_gameMovieHeight = backBufferInfo.height;
+	WWDEBUG_SAY(("Starting Movie %s", filename_base));
 #endif
 }
 
@@ -2006,39 +2055,27 @@ void WW3D::Start_Movie_Capture( const char * filename_base, float frame_rate )
 void WW3D::Stop_Movie_Capture()
 {
 #ifdef _WIN32
-	if (IsCapturing || Movie != nullptr || !s_d3d11MovieRequests.empty()) {
+	if (IsCapturing || Movie != nullptr || !s_gameMovieRequests.empty()) {
 		IsCapturing = false;
 		RecordNextFrame = false;
-		s_d3d11MovieStopPending = false;
-		WWDEBUG_SAY(( "Stopping Movie" ));
-
-		if (DX8Wrapper::Is_D3D11_Backend_Active())
+		s_gameMovieStopPending = false;
+		WWDEBUG_SAY(("Stopping Movie"));
+		while (!s_gameMovieRequests.empty())
 		{
-			while (!s_d3d11MovieRequests.empty())
+			GameMovieCaptureRequest *request = s_gameMovieRequests.front();
+			const unsigned int cancelled = rts::render::CancelGameBackBufferCaptures(
+				request, rts::render::RENDER_RESULT_FAILED);
+			if (cancelled == 0 && Remove_GameMovie_Request(request))
 			{
-				D3D11MovieCaptureRequest *request =
-					s_d3d11MovieRequests.front();
-				DX8Wrapper::Cancel_D3D11_Back_Buffer_Captures(request,
-					rts::render::RENDER_RESULT_FAILED);
-				if (Remove_D3D11_Movie_Request(request))
-				{
-					delete request;
-				}
+				delete request;
 			}
 		}
-		while (!s_d3d11MovieRequests.empty())
-		{
-			D3D11MovieCaptureRequest *request =
-				s_d3d11MovieRequests.back();
-			s_d3d11MovieRequests.pop_back();
-			delete request;
-		}
-		s_d3d11MovieOwner = 0;
-		s_d3d11MovieWidth = 0;
-		s_d3d11MovieHeight = 0;
-		s_d3d11MovieStopPending = false;
+		s_gameMovieOwner = 0;
+		s_gameMovieWidth = 0;
+		s_gameMovieHeight = 0;
+		s_gameMovieStopPending = false;
 		delete Movie;
-		Movie = nullptr;
+		Movie = 0;
 	}
 #endif
 }
@@ -2185,139 +2222,82 @@ bool WW3D::Is_Movie_Ready()
  *                                                                                             *
  * HISTORY:                                                                                    *
  *   5/19/99    GTH : Created.                                                                 *
- *   2/26/2001  hy : Updated to dx8                                                            *
+ *   2/26/2001  hy : Updated to the renderer facade                                            *
  *=============================================================================================*/
 void WW3D::Update_Movie_Capture()
 {
 #ifdef _WIN32
-	WWASSERT( IsCapturing);
+	WWASSERT(IsCapturing);
 	WWPROFILE("WW3D::Update_Movie_Capture");
-	WWDEBUG_SAY(( "Updating"));
+	WWDEBUG_SAY(("Updating"));
 
-	if (DX8Wrapper::Is_D3D11_Backend_Active())
+	if (rts::render::IsGameRenderingToTexture())
 	{
-		if (DX8Wrapper::Is_Render_To_Texture())
-		{
-			// Offscreen passes do not present. Queueing here would accumulate
-			// duplicate requests that all consume the next visible back buffer.
-			return;
-		}
-		if (Movie == nullptr)
-		{
-			WWDEBUG_SAY(("D3D11 movie capture has no movie consumer"));
-			return;
-		}
-		if (s_d3d11MovieOwner != Movie || s_d3d11MovieWidth == 0 ||
-			s_d3d11MovieHeight == 0)
-		{
-			WWDEBUG_SAY(("D3D11 movie capture has no stable frame dimensions"));
-			Stop_Movie_Capture();
-			return;
-		}
-		D3D11MovieCaptureRequest *request = 0;
-		try
-		{
-			request = new D3D11MovieCaptureRequest;
-		}
-		catch (...)
-		{
-			request = 0;
-		}
-		if (request == 0)
-		{
-			WWDEBUG_SAY(("D3D11 movie capture request allocation failed"));
-			Stop_Movie_Capture();
-			return;
-		}
-		request->movie = Movie;
-		request->width = s_d3d11MovieWidth;
-		request->height = s_d3d11MovieHeight;
-		try
-		{
-			s_d3d11MovieRequests.push_back(request);
-		}
-		catch (...)
+		// Offscreen passes do not present. Queueing here would accumulate
+		// duplicate requests that all consume the next visible back buffer.
+		return;
+	}
+	if (Movie == 0)
+	{
+		WWDEBUG_SAY(("Movie capture has no movie consumer"));
+		return;
+	}
+	if (s_gameMovieOwner != Movie || s_gameMovieWidth == 0 ||
+		s_gameMovieHeight == 0)
+	{
+		WWDEBUG_SAY(("Movie capture has no stable frame dimensions"));
+		Stop_Movie_Capture();
+		return;
+	}
+
+	GameMovieCaptureRequest *request = 0;
+	try
+	{
+		request = new GameMovieCaptureRequest;
+	}
+	catch (...)
+	{
+		request = 0;
+	}
+	if (request == 0)
+	{
+		WWDEBUG_SAY(("Movie capture request allocation failed"));
+		Stop_Movie_Capture();
+		return;
+	}
+	request->movie = Movie;
+	request->width = s_gameMovieWidth;
+	request->height = s_gameMovieHeight;
+	try
+	{
+		s_gameMovieRequests.push_back(request);
+	}
+	catch (...)
+	{
+		delete request;
+		WWDEBUG_SAY(("Movie capture request list allocation failed"));
+		Stop_Movie_Capture();
+		return;
+	}
+
+	rts::render::RenderCaptureRequestDescriptor descriptor;
+	descriptor.kind = rts::render::RENDER_CAPTURE_MOVIE;
+	descriptor.consumer = request;
+	descriptor.completed = Complete_GameMovie;
+	descriptor.cancelled = Cancel_GameMovie;
+	rts::render::RenderCaptureHandle handle;
+	const rts::render::RenderResult queueResult =
+		rts::render::QueueGameBackBufferCapture(descriptor, &handle);
+	if (queueResult != rts::render::RENDER_RESULT_OK)
+	{
+		WWDEBUG_SAY(("Movie capture queue rejected: %d",
+			static_cast<int>(queueResult)));
+		if (Remove_GameMovie_Request(request))
 		{
 			delete request;
-			WWDEBUG_SAY(("D3D11 movie capture request list allocation failed"));
-			Stop_Movie_Capture();
-			return;
 		}
-		rts::render::RenderCaptureRequestDescriptor descriptor;
-		descriptor.kind = rts::render::RENDER_CAPTURE_MOVIE;
-		descriptor.consumer = request;
-		descriptor.completed = Complete_D3D11_Movie;
-		descriptor.cancelled = Cancel_D3D11_Movie;
-		rts::render::RenderCaptureHandle handle;
-		const rts::render::RenderResult queueResult =
-			DX8Wrapper::Queue_D3D11_Back_Buffer_Capture(descriptor, &handle);
-		if (queueResult != rts::render::RENDER_RESULT_OK)
-		{
-			WWDEBUG_SAY(("D3D11 movie capture queue rejected: %d",
-				static_cast<int>(queueResult)));
-			if (Remove_D3D11_Movie_Request(request))
-			{
-				delete request;
-			}
-			Stop_Movie_Capture();
-		}
-		return;
+		Stop_Movie_Capture();
 	}
-
-	// TheSuperHackers @bugfix xezon 21/05/2025 Get the back buffer and create a copy of the surface.
-	// Originally this code took the front buffer and tried to lock it. This does not work when the
-	// render view clips outside the desktop boundaries. It crashed the game.
-	SurfaceClass* surface = DX8Wrapper::_Get_DX8_Back_Buffer();
-
-	SurfaceClass::SurfaceDescription surfaceDesc;
-	surface->Get_Description(surfaceDesc);
-
-	SurfaceClass* surfaceCopy = NEW_REF(SurfaceClass, (DX8Wrapper::_Create_DX8_Surface(surfaceDesc.Width, surfaceDesc.Height, surfaceDesc.Format)));
-	DX8Wrapper::_Copy_DX8_Rects(surface->Peek_D3D_Surface(), nullptr, 0, surfaceCopy->Peek_D3D_Surface(), nullptr);
-
-	surface->Release_Ref();
-	surface = nullptr;
-
-	struct Rect
-	{
-		int Pitch;
-		void* pBits;
-	} lrect;
-
-	lrect.pBits = surfaceCopy->Lock(&lrect.Pitch);
-	if (lrect.pBits == nullptr)
-	{
-		surfaceCopy->Release_Ref();
-		return;
-	}
-
-	unsigned int x,y,index,index2,width,height;
-
-	width = surfaceDesc.Width;
-	height = surfaceDesc.Height;
-
-	char *image=(char *)Movie->GetBuffer();
-
-	for (y=0; y<height; y++)
-	{
-		for (x=0; x<width; x++)
-		{
-			// index for image
-			index=3*(x+(height-y-1)*width);
-			// index for fb
-			index2=y*lrect.Pitch+4*x;
-
-			image[index]=*((char *) lrect.pBits + index2+0);
-			image[index+1]=*((char *) lrect.pBits + index2+1);
-			image[index+2]=*((char *) lrect.pBits + index2+2);
-		}
-	}
-
-	surfaceCopy->Unlock();
-	surfaceCopy->Release_Ref();
-	surfaceCopy = nullptr;
-
-	Movie->Grab(image);
 #endif
 }
 
@@ -2552,33 +2532,37 @@ void WW3D::Get_Pixel_Center(float &x, float &y)
 
 void WW3D::Update_Pixel_Center()
 {
-#ifdef WW3D_DX8
-	const char *name = _RenderDeviceShortNameTable.getString(CurRenderDevice);
-	if ( strstr(name, "OpenGL") ) {
-		PixelCenterX = 0.0f; PixelCenterY = 0.0f;
-	} else if ( strstr(name, "Glide") ) {
-		PixelCenterX = 0.0f; PixelCenterY = 0.0f;
-	} else if ( strstr(name, "DirectX") ) {
-		PixelCenterX = 0.5f; PixelCenterY = 0.5f;
-	} else if ( strstr(name, "Software") ) {
-		PixelCenterX = 0.0f; PixelCenterY = 0.0f;
-	} else if ( strstr(name, "Null") ) {
-		PixelCenterX = 0.0f; PixelCenterY = 0.0f;
-	} else {
-		// unknown device
-		PixelCenterX = 0.0f; PixelCenterY = 0.0f;
+	char name[rts::render::GAME_RENDER_DEVICE_STRING_CAPACITY];
+	memset(name, 0, sizeof(name));
+	const rts::render::RenderResult result =
+		rts::render::GetGameRenderDeviceName(
+			rts::render::GetGameRenderDeviceIndex(), name, sizeof(name));
+	if (result == rts::render::RENDER_RESULT_OK &&
+		(strstr(name, "Direct") != 0 || strstr(name, "D3D") != 0 ||
+		 strstr(name, "Native") != 0))
+	{
+		PixelCenterX = 0.5f;
+		PixelCenterY = 0.5f;
 	}
-#endif //WW3D_DX8
+	else
+	{
+		PixelCenterX = 0.0f;
+		PixelCenterY = 0.0f;
+	}
 }
 
 void WW3D::Set_Texture_Bitdepth(int bitdepth)
 {
-	DX8Wrapper::Set_Texture_Bitdepth(bitdepth);
+	if (bitdepth != 16 && bitdepth != 32)
+	{
+		return;
+	}
+	rts::render::SetGameTextureBitdepth(bitdepth);
 }
 
 int WW3D::Get_Texture_Bitdepth()
 {
-	return DX8Wrapper::Get_Texture_Bitdepth();
+	return rts::render::GetGameTextureBitdepth();
 }
 
 void WW3D::Set_MSAA_Mode(MultiSampleModeEnum mode)
@@ -2587,19 +2571,23 @@ void WW3D::Set_MSAA_Mode(MultiSampleModeEnum mode)
 
 	default:
 	case MULTISAMPLE_MODE_NONE:
-		DX8Wrapper::Set_MSAA_Mode(D3DMULTISAMPLE_NONE);
+		rts::render::SetGameMSAAMode(
+			rts::render::GAME_RENDER_MULTISAMPLE_NONE);
 		break;
 
 	case MULTISAMPLE_MODE_2X:
-		DX8Wrapper::Set_MSAA_Mode(D3DMULTISAMPLE_2_SAMPLES);
+		rts::render::SetGameMSAAMode(
+			rts::render::GAME_RENDER_MULTISAMPLE_2X);
 		break;
 
 	case MULTISAMPLE_MODE_4X:
-		DX8Wrapper::Set_MSAA_Mode(D3DMULTISAMPLE_4_SAMPLES);
+		rts::render::SetGameMSAAMode(
+			rts::render::GAME_RENDER_MULTISAMPLE_4X);
 		break;
 
 	case MULTISAMPLE_MODE_8X:
-		DX8Wrapper::Set_MSAA_Mode(D3DMULTISAMPLE_8_SAMPLES);
+		rts::render::SetGameMSAAMode(
+			rts::render::GAME_RENDER_MULTISAMPLE_8X);
 		break;
 
 	}
@@ -2607,21 +2595,21 @@ void WW3D::Set_MSAA_Mode(MultiSampleModeEnum mode)
 
 WW3D::MultiSampleModeEnum WW3D::Get_MSAA_Mode()
 {
-	D3DMULTISAMPLE_TYPE type = DX8Wrapper::Get_MSAA_Mode();
+	const unsigned int type = rts::render::GetGameMSAAMode();
 
 	switch (type) {
 
 	default:
-	case D3DMULTISAMPLE_NONE:
+	case rts::render::GAME_RENDER_MULTISAMPLE_NONE:
 		return MULTISAMPLE_MODE_NONE;
 
-	case D3DMULTISAMPLE_2_SAMPLES:
+	case rts::render::GAME_RENDER_MULTISAMPLE_2X:
 		return MULTISAMPLE_MODE_2X;
 
-	case D3DMULTISAMPLE_4_SAMPLES:
+	case rts::render::GAME_RENDER_MULTISAMPLE_4X:
 		return MULTISAMPLE_MODE_4X;
 
-	case D3DMULTISAMPLE_8_SAMPLES:
+	case rts::render::GAME_RENDER_MULTISAMPLE_8X:
 		return MULTISAMPLE_MODE_8X;
 
 	}
@@ -2647,7 +2635,7 @@ void WW3D::Enable_Sorting(bool onoff)
 	IsSortingEnabled = onoff;
 	// Have to invalidate mesh rendering system because
 	// meshes are put into different fvfs depending on their sort state
-	TheDX8MeshRenderer.Invalidate();
+	rts::render::InvalidateGameMeshCache();
 }
 
 void WW3D::Override_Current_Static_Sort_Lists(StaticSortListClass * sort_list)
@@ -2667,5 +2655,5 @@ void WW3D::Reset_Current_Static_Sort_Lists_To_Default()
 
 void WW3D::Set_Gamma(float gamma,float bright,float contrast,bool calibrate)
 {
-	DX8Wrapper::Set_Gamma(gamma,bright,contrast,calibrate);
+	rts::render::SetGameGamma(gamma, bright, contrast, calibrate);
 }
