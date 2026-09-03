@@ -160,6 +160,21 @@ int TestProjectionSeamDeclaration()
 	return 0;
 }
 
+int TestNeutralValueDefaults()
+{
+	rts::render::RenderBackBufferInfo backBufferInfo;
+	rts::render::RenderCaptureHandle captureHandle;
+	int result = 0;
+	result |= Check(backBufferInfo.width == 0 && backBufferInfo.height == 0 &&
+		backBufferInfo.format == rts::render::RENDER_FORMAT_UNKNOWN,
+		"back-buffer info has neutral defaults without renderer linkage");
+	result |= Check(captureHandle.kind ==
+		rts::render::RENDER_CAPTURE_COMPRESSED_SCREENSHOT &&
+		captureHandle.requestId == 0 && captureHandle.generation == 0,
+		"capture handle has neutral defaults without renderer linkage");
+	return result;
+}
+
 int TestTextureFormatCapability()
 {
 	FakeNativeOwner owner;
@@ -305,6 +320,7 @@ int main()
 	int result = 0;
 	result |= TestNativeRenderTargetCapability();
 	result |= TestProjectionSeamDeclaration();
+	result |= TestNeutralValueDefaults();
 	result |= TestTextureFormatCapability();
 	result |= TestNativeOwnerCallbackReentry();
 	result |= TestNativeOwnerLifecycleExclusion();

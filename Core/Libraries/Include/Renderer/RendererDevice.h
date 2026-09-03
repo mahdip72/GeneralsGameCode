@@ -238,7 +238,8 @@ struct RenderResourceStatistics
 
 struct RenderBackBufferInfo
 {
-	RenderBackBufferInfo();
+	RenderBackBufferInfo() : width(0), height(0),
+		format(RENDER_FORMAT_UNKNOWN) {}
 
 	unsigned int width;
 	unsigned int height;
@@ -272,7 +273,8 @@ enum RenderCaptureKind
 
 struct RenderCaptureHandle
 {
-	RenderCaptureHandle();
+	RenderCaptureHandle() : kind(RENDER_CAPTURE_COMPRESSED_SCREENSHOT),
+		requestId(0), generation(0) {}
 
 	RenderCaptureKind kind;
 	unsigned int requestId;
