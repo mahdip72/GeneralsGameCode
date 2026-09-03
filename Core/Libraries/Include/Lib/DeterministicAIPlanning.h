@@ -11,6 +11,10 @@
 #pragma once
 
 #include "Lib/CounterBasedRng.h"
+#if defined(_WIN64)
+#include "Lib/KernelPerformanceDiagnostics.h"
+#include "Lib/KernelPerformanceReference.h"
+#endif
 
 namespace rts
 {
@@ -307,6 +311,115 @@ struct AIPlanningBatchStatus
 	uint32_t ownerHelpedJobs;
 };
 
+#if defined(_WIN64)
+// Owner-thread-only transport for the optional performance ledger. The
+// helpers deliberately keep ledger failures observational: a malformed or
+// stale identity can make a receipt incomplete, but it never changes the AI
+// admission, fallback, or commit decision.
+class AIPlanningPerformanceInterval
+{
+public:
+	AIPlanningPerformanceInterval(performance::KernelPerformanceBatch *batch,
+		performance::KernelPerformanceStage stage);
+	~AIPlanningPerformanceInterval();
+	bool end();
+	bool valid() const;
+
+private:
+	performance::KernelPerformanceLedger *m_ledger;
+	performance::KernelPerformanceInterval m_interval;
+	AIPlanningPerformanceInterval(const AIPlanningPerformanceInterval &);
+	AIPlanningPerformanceInterval &operator=(
+		const AIPlanningPerformanceInterval &);
+};
+
+// A title adapter owns one AI operation batch. Capture begins before title
+// snapshot materialization; callers explicitly classify empty admission,
+// post-admission failure, or successful parallel authority. Serial and
+// serial-fallback paths pass enabled=false or abort this batch and therefore
+// never receive fabricated scheduler/wait/validation samples.
+class AIPlanningPerformanceBatchScope
+{
+public:
+	AIPlanningPerformanceBatchScope(bool enabled,
+		performance::KernelPerformanceKernel kernel, unsigned subtype,
+		unsigned frame, JobMetricCounter ordinal);
+	~AIPlanningPerformanceBatchScope();
+	performance::KernelPerformanceBatch *token();
+	void begin(performance::KernelPerformanceStage stage);
+	bool end();
+	void notAdmitted();
+	void abort();
+	void commit();
+
+private:
+	void finish(performance::KernelPerformanceDisposition disposition);
+	performance::KernelPerformanceLedger *m_ledger;
+	performance::KernelPerformanceBatch m_batch;
+	performance::KernelPerformanceInterval m_interval;
+	bool m_closed;
+	AIPlanningPerformanceBatchScope(const AIPlanningPerformanceBatchScope &);
+	AIPlanningPerformanceBatchScope &operator=(
+		const AIPlanningPerformanceBatchScope &);
+};
+
+// Optional native reference transport for one already-admitted AI timing
+// batch. The title supplies immutable views and preallocated detached output;
+// this seam never allocates or changes the authoritative planner path. A
+// null ledger, token, callback, or zero operation count leaves the transport
+// inert. The timing batch identity remains the source of frame/ordinal truth.
+struct AIPlanningReferenceBatchTransport
+{
+	AIPlanningReferenceBatchTransport();
+	performance::KernelPerformanceReferenceLedger *referenceLedger;
+	performance::KernelPerformanceReferenceBatch *referenceBatch;
+	performance::KernelPerformanceCanonicalCallback writeInput;
+	const void *immutableInput;
+	performance::KernelPerformanceCanonicalCallback writeOutput;
+	const void *productionOutput;
+	performance::KernelPerformanceSerialCallback serialCompute;
+	void *detachedSerialOutput;
+	JobMetricCounter operationCount;
+	unsigned fieldSchema;
+};
+
+// Canonical shared AI views used by the native title adapters. The production
+// callback receives immutable owner-captured snapshots and the validated
+// parallel result buffer; it never reaches through to live game objects. The
+// same output-view type is supplied as detachedSerialOutput in SerialOracle,
+// allowing the serial callback and output callback to share typed storage.
+struct AIPlanningReferencePlayerInputView
+{
+	const AIPlayerPlanningSnapshot *snapshots;
+	uint32_t count;
+	uint32_t subtype;
+};
+
+struct AIPlanningReferencePlayerOutputView
+{
+	// Mutable storage is intentional: SerialOracle supplies this same typed
+	// view to the detached planner, then the canonical output callback reads it.
+	AIPlayerPlanningResult *results;
+	uint32_t count;
+	uint32_t subtype;
+};
+
+bool WriteAIPlanningReferenceInput(
+	performance::KernelPerformanceCanonicalWriter &writer,
+	const void *context);
+bool WriteAIPlanningReferenceOutput(
+	performance::KernelPerformanceCanonicalWriter &writer,
+	const void *context);
+bool ComputeAIPlanningReferenceSerial(const void *immutableInput,
+	void *detachedOutput);
+
+bool ObserveAIPlanningReferenceBatch(
+	performance::KernelPerformanceBatch *timingBatch,
+	AIPlanningReferenceBatchTransport *transport) noexcept;
+bool FinishAIPlanningReferenceBatch(
+	AIPlanningReferenceBatchTransport *transport, bool committed) noexcept;
+#endif
+
 // AI-only scheduler/accounting data. These counters deliberately exclude
 // renderer, collision, pathfinding, and other JobSystem consumers so an
 // installed-runtime manifest can prove that real AI planning work ran.
@@ -410,7 +523,16 @@ bool ExecuteAIPlanningBatchOnJobSystem(AIPlanningExecutionMode mode,
 	AIPlayerPlanningResult *committedResults,
 	AIPlayerPlanningResult *serialScratch,
 	AIPlayerPlanningResult *parallelScratch,
-	AIPlanningBatchStatus *status);
+	AIPlanningBatchStatus *status
+#if defined(_WIN64)
+	// Owner-created diagnostic identity. The shared executor only consumes this
+	// optional transport for observational timing; an invalid token is inert.
+	, performance::KernelPerformanceBatch *performanceBatch = 0
+	// Optional reference identity/canonical views. This remains inert until a
+	// title explicitly supplies a ledger, output token, and callbacks.
+	, AIPlanningReferenceBatchTransport *referenceBatch = 0
+#endif
+	);
 
 void ResetAIPlanningRuntimeMetrics();
 AIPlanningRuntimeMetrics GetAIPlanningRuntimeMetrics();

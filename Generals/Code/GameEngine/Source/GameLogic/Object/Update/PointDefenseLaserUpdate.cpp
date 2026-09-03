@@ -249,8 +249,40 @@ Object* PointDefenseLaserUpdate::scanClosestTarget()
 }
 
 //-------------------------------------------------------------------------------------------------
+#if defined(_WIN64)
+namespace
+{
+class ImmutableSpatialPointDefenseCommitInterval
+{
+public:
+	ImmutableSpatialPointDefenseCommitInterval(UpdateModule *owner, Bool enabled)
+		: m_enabled(enabled)
+	{
+		if (m_enabled)
+		{
+			m_token = CaptureLiveImmutableSpatialCompletion(owner,
+				LIVE_IMMUTABLE_SPATIAL_POINT_DEFENSE_LASER);
+			BeginLiveImmutableSpatialCommit(
+				LIVE_IMMUTABLE_SPATIAL_POINT_DEFENSE_LASER, m_token);
+		}
+	}
+
+	~ImmutableSpatialPointDefenseCommitInterval() noexcept
+	{
+		if (m_enabled)
+			EndLiveImmutableSpatialCommit(
+				LIVE_IMMUTABLE_SPATIAL_POINT_DEFENSE_LASER, m_token);
+	}
+
+private:
+	rts::ImmutableSpatialConsumerCompletionToken m_token;
+	Bool m_enabled;
+};
+}
+#endif
 Object* PointDefenseLaserUpdate::scanClosestTargetOwner( ObjectID *orderedIDs,
-	UnsignedInt orderedCapacity, UnsignedInt *orderedCount )
+	UnsignedInt orderedCapacity, UnsignedInt *orderedCount,
+	Bool measureSpatialCommit )
 {
 	const PointDefenseLaserUpdateModuleData *data = getPointDefenseLaserUpdateModuleData();
 	Object *me = getObject();
@@ -344,6 +376,11 @@ Object* PointDefenseLaserUpdate::scanClosestTargetOwner( ObjectID *orderedIDs,
 		}
 	}
 
+	#if defined(_WIN64)
+	ImmutableSpatialPointDefenseCommitInterval performanceCommit(this, measureSpatialCommit);
+	#else
+	(void)measureSpatialCommit;
+	#endif
 	if( bestTargetInRange[ 0 ] )
 	{
 		//This is the best primary target in range.
@@ -383,9 +420,49 @@ Object* PointDefenseLaserUpdate::scanClosestTargetOwner( ObjectID *orderedIDs,
 }
 
 //-------------------------------------------------------------------------------------------------
+#if defined(_WIN64)
+namespace
+{
+class ImmutableSpatialConsumerCompletionGuard
+{
+public:
+	explicit ImmutableSpatialConsumerCompletionGuard(UpdateModule *owner)
+		: m_token(CaptureLiveImmutableSpatialCompletion(owner, LIVE_IMMUTABLE_SPATIAL_POINT_DEFENSE_LASER)),
+		  m_committed(FALSE)
+	{
+	}
+
+	~ImmutableSpatialConsumerCompletionGuard() noexcept
+	{
+		CompleteLiveImmutableSpatialConsumer(
+			LIVE_IMMUTABLE_SPATIAL_POINT_DEFENSE_LASER, m_token, m_committed);
+	}
+
+	void beginCommit()
+	{
+		BeginLiveImmutableSpatialCommit(LIVE_IMMUTABLE_SPATIAL_POINT_DEFENSE_LASER, m_token);
+	}
+
+	void endCommit()
+	{
+		EndLiveImmutableSpatialCommit(LIVE_IMMUTABLE_SPATIAL_POINT_DEFENSE_LASER, m_token);
+	}
+
+	void markCommitted(Bool matched = TRUE)
+	{
+		m_committed = matched;
+	}
+
+private:
+	rts::ImmutableSpatialConsumerCompletionToken m_token;
+	Bool m_committed;
+};
+}
+#endif
 Object* PointDefenseLaserUpdate::scanClosestTargetScheduled()
 {
 #if defined(_WIN64)
+	ImmutableSpatialConsumerCompletionGuard performanceGuard(this);
 	const PointDefenseLaserUpdateModuleData *data =
 		getPointDefenseLaserUpdateModuleData();
 	Object *me = getObject();
@@ -511,7 +588,7 @@ Object* PointDefenseLaserUpdate::scanClosestTargetScheduled()
 		{
 			UnsignedInt oracleCount = 0;
 			Object *oracleTarget = scanClosestTargetOwner( oracleIDs, capacity,
-				&oracleCount );
+				&oracleCount, TRUE );
 			Bool matched = oracleCount <= capacity &&
 				workerCount == oracleCount;
 			for( UnsignedInt index = 0; matched && index != oracleCount;
@@ -526,6 +603,7 @@ Object* PointDefenseLaserUpdate::scanClosestTargetScheduled()
 			if( !matched )
 				DisableLiveImmutableSpatialConsumer(
 					LIVE_IMMUTABLE_SPATIAL_POINT_DEFENSE_LASER );
+			performanceGuard.markCommitted(matched);
 			return oracleTarget;
 		}
 
@@ -540,10 +618,13 @@ Object* PointDefenseLaserUpdate::scanClosestTargetScheduled()
 				return scanClosestTarget();
 			}
 		}
+		performanceGuard.beginCommit();
 		m_bestTargetID = workerTarget ? workerTarget->getID() : INVALID_ID;
 		m_inRange = workerInRange;
+		performanceGuard.endCommit();
 		RecordLiveImmutableSpatialAuthoritativeQuery(
 			LIVE_IMMUTABLE_SPATIAL_POINT_DEFENSE_LASER, workerCount );
+		performanceGuard.markCommitted();
 		return workerTarget;
 	}
 #endif

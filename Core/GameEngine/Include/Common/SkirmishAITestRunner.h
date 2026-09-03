@@ -139,6 +139,13 @@ Bool IsValidSkirmishAITestPracticalControllerPlan(
 	const SkirmishAITestPlan &plan);
 
 Bool SetSkirmishAITestExecutableHashInput(const char *sha256);
+// Shared validation hashing; these do not arm or alter any AI-test scenario.
+Bool HashSkirmishAITestBytes(const void *bytes, size_t byteCount,
+	char sha256[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1]);
+Bool HashSkirmishAITestContentFile(const char *path,
+	char sha256[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1]);
+Bool CaptureSkirmishAITestValidatedExecutableHash(
+	char sha256[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1]);
 Bool SetSkirmishAITestSimulationModeInput(const char *mode);
 void SetSkirmishAITestFinalDigest(UnsignedInt digest);
 
@@ -148,3 +155,9 @@ Bool IsSkirmishAITestRunnerArmed();
 Bool StartSkirmishAITestRunner();
 void UpdateSkirmishAITestRunner();
 Int FinalizeSkirmishAITestRunner(Int engineExitCode);
+#if defined(_WIN64)
+void ObserveSkirmishAITestCompletedFrame(unsigned previousFrame);
+// Call only after the real engine has drained and been destroyed. This uses
+// retained diagnostic snapshots, never reset/destroyed game globals.
+void FinalizeSkirmishAITestPerformanceReceipt(Int engineExitCode);
+#endif

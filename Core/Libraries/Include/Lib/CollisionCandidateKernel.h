@@ -6,6 +6,10 @@
 #pragma once
 
 #include "Lib/JobSystem.h"
+#if defined(_WIN64)
+#include "Lib/KernelPerformanceDiagnostics.h"
+#include "Lib/KernelPerformanceReference.h"
+#endif
 
 namespace rts
 {
@@ -76,6 +80,65 @@ enum CollisionCandidateOrder
 	COLLISION_CANDIDATE_CANONICAL_KEY = 1
 };
 
+#if defined(_WIN64)
+enum
+{
+	// Bump when the typed collision reference field layout changes. The
+	// production/reference callbacks bind this schema to both digests.
+	COLLISION_CANDIDATE_REFERENCE_FIELD_SCHEMA = 1
+};
+
+// Canonical reference input is an immutable owner snapshot plus the exact
+// cell/occupant request order. Pointer values are transport only; callbacks
+// emit every pointed-to scalar field in order.
+struct PartitionCollisionReferenceInput
+{
+	PartitionCollisionObjectSnapshot owner;
+	const PartitionCollisionCellSnapshot *cells;
+	unsigned cellCount;
+	const PartitionCollisionOccupantSnapshot *occupants;
+	unsigned occupantCount;
+	CollisionCandidateOrder order;
+};
+
+// Production output and detached serial-oracle output share this descriptor.
+// The serial callback writes candidates/scratch only in its detached instance;
+// the production descriptor has scratch == 0 and is read-only by callbacks.
+struct PartitionCollisionReferenceOutput
+{
+	CollisionCandidate *candidates;
+	CollisionCandidate *scratch;
+	unsigned count;
+	unsigned capacity;
+};
+
+// Owner-only transport for one already-live-validated collision batch. The
+// shared kernel never calls reference callbacks on worker threads; the title
+// supplies immutable input/production views and, for SerialOracle mode, the
+// detached output descriptor.
+struct CollisionCandidateReferenceBatchTransport
+{
+	CollisionCandidateReferenceBatchTransport();
+	performance::KernelPerformanceReferenceLedger *referenceLedger;
+	performance::KernelPerformanceReferenceBatch *referenceBatch;
+	performance::KernelPerformanceCanonicalCallback writeInput;
+	const void *immutableInput;
+	performance::KernelPerformanceCanonicalCallback writeOutput;
+	const void *productionOutput;
+	performance::KernelPerformanceSerialCallback serialCompute;
+	void *detachedSerialOutput;
+	JobMetricCounter operationCount;
+	unsigned fieldSchema;
+};
+
+bool WritePartitionCollisionReferenceInput(
+	performance::KernelPerformanceCanonicalWriter &writer,
+	const void *context);
+bool WritePartitionCollisionReferenceOutput(
+	performance::KernelPerformanceCanonicalWriter &writer,
+	const void *context);
+#endif
+
 enum CollisionCandidateResult
 {
 	COLLISION_CANDIDATE_SERIAL,
@@ -119,6 +182,24 @@ struct CollisionCandidateOptions
 	unsigned minimumGrain;
 	CollisionCandidateOrder order;
 	const JobGroup *cancellationGroup;
+#if defined(_WIN64)
+	// Optional owner-created diagnostic token.  The shared kernel only consumes
+	// this transport on native x64; an invalid token is inert and never changes
+	// candidate preparation or its fallback behavior.
+	performance::KernelPerformanceLedger *performanceLedger;
+	performance::KernelPerformanceBatch performanceBatch;
+	// Optional owner-created canonical-reference transport. The shared kernel
+	// never invokes callbacks on worker threads; the owner fills this output
+	// token only after live validation and closes it after authoritative
+	// publication (or fallback). Null pointers are inert.
+	performance::KernelPerformanceReferenceLedger *performanceReferenceLedger;
+	performance::KernelPerformanceReferenceBatch *performanceReferenceBatch;
+	// Dedicated detached serial-oracle output. It is never an alias for the
+	// authoritative output or worker scratch; capacity zero keeps the optional
+	// transport inert in disabled/throughput modes.
+	CollisionCandidate *performanceReferenceOutput;
+	unsigned performanceReferenceOutputCapacity;
+#endif
 };
 
 struct CollisionCandidateMetrics
@@ -227,6 +308,22 @@ CollisionCandidateResult PreparePartitionCollisionCandidates(
 	const CollisionCandidateOptions &options,
 	unsigned *outputCount,
 	CollisionCandidateMetrics *metrics = 0);
+
+#if defined(_WIN64)
+// Replays the exact owner-side serial normalization/sort/dedup path into
+// detached storage for KernelPerformanceReferenceLedger's serial oracle.
+// It performs no contact publication and never touches authoritative output.
+bool ComputePartitionCollisionCandidatesSerialReference(
+	const void *immutableInput, void *detachedOutput);
+
+bool ObserveCollisionCandidateReferenceBatch(
+	performance::KernelPerformanceLedger *timingLedger,
+	const performance::KernelPerformanceBatch *timingBatch,
+	CollisionCandidateReferenceBatchTransport *transport) noexcept;
+bool FinishCollisionCandidateReferenceBatch(
+	CollisionCandidateReferenceBatchTransport *transport,
+	bool committed) noexcept;
+#endif
 
 // Compares the complete prepared representation, including callback
 // orientation, snapshot generations, and discovery order.  On success,

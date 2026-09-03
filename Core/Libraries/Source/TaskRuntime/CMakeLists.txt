@@ -103,6 +103,8 @@ endif()
 if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT IS_VS6_BUILD)
     target_sources(core_task_runtime PRIVATE
         PerformanceReceipt.cpp
+        KernelPerformanceDiagnostics.cpp
+        KernelPerformanceReference.cpp
     )
 endif()
 

@@ -535,7 +535,8 @@ public:
 		is intersecting the ground, add it to the list as a possible
 		collide-with-ground.
 	*/
-	void addPossibleCollisions(PartitionContactList *ctList);
+	void addPossibleCollisions(PartitionContactList *ctList,
+		UnsignedInt ownerOrdinal);
 
 	Object *getObject() { return m_object; }				///< return the Object that owns this module
 	const Object *getObject() const { return m_object; }				///< return the Object that owns this module

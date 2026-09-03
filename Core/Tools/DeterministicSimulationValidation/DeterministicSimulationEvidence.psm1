@@ -53,7 +53,107 @@ function Assert-Stage5JsonProperties {
     foreach ($name in $Names) { Get-Stage5JsonValue $Object $name $Context | Out-Null }
 }
 
-function Assert-Stage5NativeV2ReceiptProvenance {
+function Assert-Stage5NativeFixtureObservation {
+    param([object]$Document, [string]$Context, [switch]$RequireScaling)
+    $fixture = $Document.fixture
+    Assert-Stage5JsonProperties $fixture @('kind','workloadQualification','contentPath','contentSha256',
+        'identityObserved','replayPath','retainedReplayPath','retainedReplaySha256','seed','seedKnown',
+        'requestedPlayerCount','requestedMinimumUnitCount') "$Context fixture"
+    Assert-Stage5Condition (@('replay','fresh-ai-map') -ccontains $fixture.kind -and
+        @('minimum-qualified','observed-only') -ccontains $fixture.workloadQualification -and
+        $fixture.contentPath -is [string] -and -not [string]::IsNullOrWhiteSpace($fixture.contentPath) -and
+        $fixture.contentSha256 -is [string] -and $fixture.contentSha256 -cmatch '^[0-9A-Fa-f]{64}$' -and
+        $fixture.identityObserved -is [bool] -and $fixture.identityObserved -and
+        $fixture.seedKnown -is [bool] -and $fixture.seedKnown -and
+        (Test-Stage5JsonInteger $fixture.seed) -and $fixture.seed -ge 0 -and $fixture.seed -le [UInt32]::MaxValue) `
+        "$Context fixture kind, qualification, observed content identity or seed is invalid."
+    if ($fixture.kind -ceq 'replay') {
+        Assert-Stage5Condition ($fixture.replayPath -is [string] -and $fixture.replayPath -ceq $fixture.contentPath -and
+            $fixture.retainedReplayPath -ceq '' -and $fixture.retainedReplaySha256 -ceq '') "$Context replay content path is inconsistent."
+    } else {
+        Assert-Stage5Condition ($fixture.workloadQualification -ceq 'observed-only' -and $fixture.replayPath -ceq '' -and
+            $fixture.retainedReplayPath -is [string] -and -not [string]::IsNullOrWhiteSpace($fixture.retainedReplayPath) -and
+            $fixture.retainedReplaySha256 -is [string] -and $fixture.retainedReplaySha256 -cmatch '^[0-9A-Fa-f]{64}$') `
+            "$Context fresh-AI map and closed retained replay identities are not separate and complete."
+    }
+    if ($fixture.workloadQualification -ceq 'minimum-qualified') {
+        Assert-Stage5DiagnosticCounter $fixture.requestedPlayerCount "$Context requested players"
+        Assert-Stage5DiagnosticCounter $fixture.requestedMinimumUnitCount "$Context requested units"
+        Assert-Stage5Condition ($fixture.requestedPlayerCount -gt 0 -and $fixture.requestedMinimumUnitCount -gt 0 -and
+            $Document.workload.playerCount -eq $fixture.requestedPlayerCount -and
+            $Document.workload.initialUnitCount -ge $fixture.requestedMinimumUnitCount) "$Context qualified workload is below its requested minimum."
+    } else {
+        Assert-Stage5Condition ($null -eq $fixture.requestedPlayerCount -and $null -eq $fixture.requestedMinimumUnitCount) `
+            "$Context observed-only workload must not invent requested minima."
+    }
+    if ($RequireScaling) {
+        Assert-Stage5Condition ($fixture.kind -ceq 'replay' -and $fixture.workloadQualification -ceq 'minimum-qualified' -and
+            $Document.simulationMode -ceq 'parallel' -and $Document.schedulerStarted -is [bool] -and $Document.schedulerStarted) `
+            "$Context scaling requires minimum-qualified parallel replay evidence with a started scheduler."
+    }
+}
+
+function Assert-Stage5NativeSchedulerObservation {
+    param([object]$Document, [string]$Context)
+    Assert-Stage5Condition (@('serial','parallel','shadow') -ccontains $Document.simulationMode -and
+        $Document.schedulerStarted -is [bool]) "$Context actual simulation mode or scheduler observation is missing."
+    $worker = $Document.worker; $topology = $Document.topology
+    Assert-Stage5JsonShape $worker @('requestedCount','effectiveCount','policy','pinned','availableLogicalCpuCount',
+        'reservedOwnerCpuCount','selectedWorkerCpuCount','selectedWorkerPhysicalCoreCount','selectedWorkerPhysicalCoreMask',
+        'selectedWorkerPhysicalCoreMaskComplete') "$Context worker"
+    foreach ($field in @('requestedCount','effectiveCount','availableLogicalCpuCount','reservedOwnerCpuCount',
+        'selectedWorkerCpuCount','selectedWorkerPhysicalCoreCount','selectedWorkerPhysicalCoreMask')) {
+        Assert-Stage5DiagnosticCounter $worker[$field] "$Context worker $field"
+    }
+    Assert-Stage5JsonShape $topology @('source','cpuSets','ownerCpuSetIds','selectedWorkerCpuSetIds') "$Context topology"
+    Assert-Stage5Condition (@('auto','all') -ccontains $worker.policy -and $worker.pinned -is [bool] -and
+        $worker.selectedWorkerPhysicalCoreMaskComplete -is [bool] -and $topology.cpuSets -is [Array] -and
+        $topology.ownerCpuSetIds -is [Array] -and $topology.selectedWorkerCpuSetIds -is [Array]) "$Context scheduler topology types are invalid."
+    if (-not $Document.schedulerStarted) {
+        Assert-Stage5Condition ($Document.simulationMode -ceq 'serial' -and $Document.fixture.workloadQualification -ceq 'observed-only' -and
+            -not $worker.pinned -and -not $worker.selectedWorkerPhysicalCoreMaskComplete -and $worker.effectiveCount -eq 0 -and
+            $worker.availableLogicalCpuCount -eq 0 -and $worker.reservedOwnerCpuCount -eq 0 -and $worker.selectedWorkerCpuCount -eq 0 -and
+            $worker.selectedWorkerPhysicalCoreCount -eq 0 -and $worker.selectedWorkerPhysicalCoreMask -eq 0 -and
+            $topology.source -ceq 'scheduler-not-started' -and $topology.cpuSets.Count -eq 0 -and
+            $topology.ownerCpuSetIds.Count -eq 0 -and $topology.selectedWorkerCpuSetIds.Count -eq 0) `
+            "$Context absent scheduler cannot claim selected workers or physical topology."
+        return
+    }
+    Assert-Stage5Condition ($worker.pinned -and $worker.selectedWorkerPhysicalCoreMaskComplete -and $worker.effectiveCount -gt 0 -and
+        $worker.effectiveCount -eq $worker.selectedWorkerCpuCount -and $worker.selectedWorkerCpuCount -eq $worker.selectedWorkerPhysicalCoreCount -and
+        $worker.availableLogicalCpuCount -ge $worker.selectedWorkerCpuCount -and $worker.selectedWorkerPhysicalCoreMask -gt 0 -and
+        $topology.source -ceq 'GetSystemCpuSetInformation' -and $topology.cpuSets.Count -gt 0 -and
+        $topology.selectedWorkerCpuSetIds.Count -eq $worker.selectedWorkerCpuCount -and
+        $topology.ownerCpuSetIds.Count -eq $worker.reservedOwnerCpuCount) "$Context started scheduler lacks complete selected topology."
+    $cpuSets = @{}; $selected = @{}; $cores = @{}; $owners = @{}
+    foreach ($cpu in $topology.cpuSets) {
+        Assert-Stage5JsonShape $cpu @('id','efficiencyClass','group','coreIndex','logicalProcessorIndex','parked',
+            'allocatedToOtherProcess','availableToProcess') "$Context CPU set"
+        foreach ($field in @('id','efficiencyClass','group','coreIndex','logicalProcessorIndex')) {
+            Assert-Stage5DiagnosticCounter $cpu[$field] "$Context CPU set $field"
+        }
+        Assert-Stage5Condition ($cpu.parked -is [bool] -and $cpu.allocatedToOtherProcess -is [bool] -and
+            $cpu.availableToProcess -is [bool] -and -not $cpuSets.ContainsKey([string]$cpu.id)) "$Context CPU set is duplicated or malformed."
+        $cpuSets[[string]$cpu.id] = $cpu
+    }
+    foreach ($id in $topology.selectedWorkerCpuSetIds) {
+        Assert-Stage5DiagnosticCounter $id "$Context selected CPU set id"
+        Assert-Stage5Condition ($cpuSets.ContainsKey([string]$id) -and -not $selected.ContainsKey([string]$id)) "$Context selected CPU set is absent or duplicated."
+        $cpu=$cpuSets[[string]$id]; $core="$($cpu.group)|$($cpu.coreIndex)"
+        Assert-Stage5Condition ($cpu.availableToProcess -and -not $cpu.parked -and -not $cpu.allocatedToOtherProcess -and
+            -not $cores.ContainsKey($core)) "$Context selected physical core is unavailable or shared."
+        $selected[[string]$id]=$true; $cores[$core]=$true
+    }
+    foreach ($id in $topology.ownerCpuSetIds) {
+        Assert-Stage5DiagnosticCounter $id "$Context owner CPU set id"
+        Assert-Stage5Condition ($cpuSets.ContainsKey([string]$id) -and -not $owners.ContainsKey([string]$id)) "$Context owner CPU set is absent or duplicated."
+        $cpu=$cpuSets[[string]$id]
+        Assert-Stage5Condition ($cpu.availableToProcess -and -not $cpu.parked -and -not $cpu.allocatedToOtherProcess) "$Context owner CPU set is unavailable."
+        $owners[[string]$id]=$true
+    }
+}
+
+function Assert-Stage5NativePerformanceReceiptProvenance {
     param(
         [object]$Document,
         [string]$Context,
@@ -66,11 +166,86 @@ function Assert-Stage5NativeV2ReceiptProvenance {
         [string]$ExpectedReceiptPath,
         [string]$ExpectedEvidenceDirectory = ''
     )
+    Assert-Stage5JsonProperties $Document @('schemaVersion','producer','producerVersion',
+        'evidenceKind','status','measurementRole','frames','fixture','workload',
+        'frameSimulation','phases','kernelTiming','kernelReference','rawEvidence','simulationMode',
+        'schedulerStarted','worker','topology') $Context
+    Assert-Stage5Condition ((Test-Stage5JsonInteger $Document.schemaVersion) -and
+        $Document.schemaVersion -eq 5 -and
+        $Document.producer -ceq 'game-executable-stage5-performance-report-v5' -and
+        $Document.producerVersion -ceq '5' -and $Document.status -ceq 'passed' -and
+        $Document.evidenceKind -ceq 'stage5-executable-originated-receipt') `
+        "$Context requires the current V5 native producer/version, not obsolete metadata."
+    Assert-Stage5Condition ($Document.measurementRole -ceq 'throughput') `
+        "$Context oracle or unknown measurement role is not normal validation throughput evidence."
     Assert-Stage5Condition ((Get-Stage5JsonValue $Document 'role' $Context) -ceq
         'performance-report' -and
         (Get-Stage5JsonValue $Document 'title' $Context) -ceq $ExpectedTitle -and
         (Get-Stage5JsonValue $Document 'architecture' $Context) -ceq 'x64') `
         "$Context role/title/architecture is not bound to the installed run."
+    $frames = $Document.frames; $workload = $Document.workload
+    foreach ($field in @('start','end','final','finalCrc')) {
+        Assert-Stage5DiagnosticCounter $frames[$field] "$Context frame $field"
+        Assert-Stage5Condition ($frames[$field] -le [UInt32]::MaxValue) "$Context frame exceeds native storage."
+    }
+    foreach ($field in @('sampleCount','firstFrame','lastFrame','playerCount',
+        'initialUnitCount','minimumUnitCount','peakUnitCount')) {
+        Assert-Stage5DiagnosticCounter $workload[$field] "$Context workload $field"
+    }
+    Assert-Stage5NativeFixtureObservation $Document $Context
+    Assert-Stage5NativeSchedulerObservation $Document $Context
+    Assert-Stage5Condition ($frames.end -gt $frames.start -and $frames.final -eq $frames.end -and
+        $frames.finalCrcKnown -is [bool] -and $frames.finalCrcKnown -and
+        $workload.sampling -ceq 'completed-simulation-frame-boundary-v1' -and
+        $workload.rosterStable -is [bool] -and $workload.rosterStable -and
+        $workload.contiguous -is [bool] -and $workload.contiguous -and
+        $workload.playerCount -gt 0 -and
+        $workload.firstFrame -eq ([decimal]$frames.start + 1) -and $workload.lastFrame -eq $frames.end -and
+        [decimal]$workload.sampleCount -eq ([decimal]$frames.end - [decimal]$frames.start) -and
+        $workload.minimumUnitCount -le $workload.initialUnitCount -and
+        $workload.peakUnitCount -ge $workload.initialUnitCount) "$Context completed-frame workload is inconsistent."
+    $frameTiming = $Document.frameSimulation
+    foreach ($field in @('totalNanoseconds','maximumNanoseconds','sampleCount')) {
+        Assert-Stage5DiagnosticCounter $frameTiming[$field] "$Context frame timing $field"
+    }
+    Assert-Stage5Condition ($frameTiming.totalNanoseconds -gt 0 -and $frameTiming.maximumNanoseconds -gt 0 -and
+        $frameTiming.maximumNanoseconds -le $frameTiming.totalNanoseconds -and
+        $frameTiming.sampleCount -ge $workload.sampleCount -and
+        $Document.phases -is [Array] -and $Document.phases.Count -eq 5) "$Context frame/phase timing is incomplete."
+    $phaseNames = @('owner-intake','legacy-mutable-island','spatial-work','owner-tail','verification-publication')
+    [decimal]$phaseTotal = 0
+    for ($index = 0; $index -lt 5; ++$index) {
+        $phase = $Document.phases[$index]
+        foreach ($field in @('totalNanoseconds','maximumNanoseconds','sampleCount','serialNanoseconds')) {
+            Assert-Stage5DiagnosticCounter $phase[$field] "$Context phase $field"
+        }
+        Assert-Stage5Condition ($phase.name -ceq $phaseNames[$index] -and $phase.available -is [bool] -and
+            $phase.serialNanosecondsKnown -is [bool] -and $phase.maximumNanoseconds -le $phase.totalNanoseconds -and
+            $phase.sampleCount -le $frameTiming.sampleCount -and
+            (($phase.serialNanosecondsKnown -and $phase.available -and $phase.serialNanoseconds -le $phase.totalNanoseconds) -or
+                (-not $phase.serialNanosecondsKnown -and $phase.serialNanoseconds -eq 0)) -and
+            (($phase.available -and $phase.totalNanoseconds -gt 0 -and $phase.sampleCount -gt 0) -or
+                (-not $phase.available -and $phase.totalNanoseconds -eq 0 -and $phase.sampleCount -eq 0))) `
+            "$Context phase timing fabricates or loses measured/unknown data."
+        $phaseTotal += [decimal]$phase.totalNanoseconds
+    }
+    Assert-Stage5Condition ($phaseTotal -le [decimal]$frameTiming.totalNanoseconds) "$Context phase timing overlaps frame time."
+    Assert-Stage5DiagnosticKernelTiming $Document.kernelTiming $frames "$Context kernel timing"
+    Assert-Stage5DiagnosticKernelReference $Document.kernelReference $Document.kernelTiming `
+        $frames $Document.measurementRole "$Context kernel reference"
+    $rawEvidence = $Document.rawEvidence
+    foreach ($field in @('timingSessionCount','timingFrameSamples','timingFirstFrame','timingLastFrame')) {
+        Assert-Stage5DiagnosticCounter $rawEvidence[$field] "$Context raw timing $field"
+    }
+    Assert-Stage5Condition ($rawEvidence.timingClosed -is [bool] -and $rawEvidence.timingClosed -and
+        $rawEvidence.timingWriteSucceeded -is [bool] -and $rawEvidence.timingWriteSucceeded -and
+        $rawEvidence.timingTruncated -is [bool] -and -not $rawEvidence.timingTruncated -and
+        $rawEvidence.timingComplete -is [bool] -and $rawEvidence.timingComplete -and
+        $rawEvidence.timingSessionCount -eq 1 -and $rawEvidence.timingFrameSamples -ge $workload.sampleCount -and
+        $rawEvidence.timingFirstFrame -le $frames.start -and $rawEvidence.timingLastFrame -ge $frames.end) `
+        "$Context raw timing is not finalized with complete replay coverage."
+    # Accounting completeness is not six-kernel coverage or scaling acceptance.
+    # Empty frozen ledgers and unknown phase serial portions remain explicit.
     [DateTimeOffset]$cohortCreated = [DateTimeOffset]::MinValue
     [DateTimeOffset]$recorded = [DateTimeOffset]::MinValue
     Assert-Stage5Condition ([DateTimeOffset]::TryParse(
@@ -100,6 +275,10 @@ function Assert-Stage5NativeV2ReceiptProvenance {
         $rawName = [string](Get-Stage5JsonValue $rawLog 'name' "$Context raw log")
         $rawPathText = [string](Get-Stage5JsonValue $rawLog 'path' "$Context raw log")
         $rawExpectedHash = [string](Get-Stage5JsonValue $rawLog 'sha256' "$Context raw log")
+        $prefix = if ($rawName -ceq 'raw-log') { 'rawLog' } else { 'timing' }
+        Assert-Stage5Condition ($rawEvidence[$prefix + 'Path'] -ceq $rawPathText -and
+            ([string]$rawEvidence[$prefix + 'Sha256']).ToUpperInvariant() -ceq $rawExpectedHash.ToUpperInvariant()) `
+            "$Context raw timing/log identity is detached from executable close evidence."
         Assert-Stage5Condition (($rawName -ceq 'raw-log' -or $rawName -ceq 'timing') -and
             -not $seenRawNames.ContainsKey($rawName) -and
             -not [string]::IsNullOrWhiteSpace($rawPathText) -and
@@ -3054,8 +3233,9 @@ function Get-Stage5FinalAcceptanceReceiptContract {
             currentProducer = 'Run-DeterministicSimulationValidation.ps1'
             trustDomain = 'host-runner'
             allowedTrustDomains = @('host-runner', 'executable')
-            executableProducer = 'game-executable-stage5-performance-report-v2'
-            hostChildNativeProducers = @('game-executable-stage5-performance-report-v2')
+            executableProducer = 'game-executable-stage5-performance-report-v5'
+            executableProducerVersion = '5'
+            hostChildNativeProducers = @('game-executable-stage5-performance-report-v5')
             evidenceKind = 'stage5-host-runner-receipt'
             requiresChildProvenance = $true
             detailNames = @('resultCount', 'allExecutionsPassed', 'resultsSha256')
@@ -3066,8 +3246,9 @@ function Get-Stage5FinalAcceptanceReceiptContract {
             currentProducer = 'Run-DeterministicSimulationValidation.ps1'
             trustDomain = 'host-runner'
             allowedTrustDomains = @('host-runner', 'executable')
-            executableProducer = 'game-executable-stage5-performance-report-v2'
-            hostChildNativeProducers = @('game-executable-stage5-performance-report-v2')
+            executableProducer = 'game-executable-stage5-performance-report-v5'
+            executableProducerVersion = '5'
+            hostChildNativeProducers = @('game-executable-stage5-performance-report-v5')
             evidenceKind = 'stage5-host-runner-receipt'
             requiresChildProvenance = $true
             detailNames = @('uniqueReplayCount', 'executionCount',
@@ -3090,8 +3271,9 @@ function Get-Stage5FinalAcceptanceReceiptContract {
             currentProducer = 'Run-DeterministicSimulationValidation.ps1'
             trustDomain = 'host-runner'
             allowedTrustDomains = @('host-runner', 'executable')
-            executableProducer = 'game-executable-stage5-performance-report-v2'
-            hostChildNativeProducers = @('game-executable-stage5-performance-report-v2')
+            executableProducer = 'game-executable-stage5-performance-report-v5'
+            executableProducerVersion = '5'
+            hostChildNativeProducers = @('game-executable-stage5-performance-report-v5')
             evidenceKind = 'stage5-host-runner-receipt'
             requiresChildProvenance = $true
             detailNames = @('scenarioCount', 'distinctSeedCount', 'repeatCount',
@@ -3103,7 +3285,7 @@ function Get-Stage5FinalAcceptanceReceiptContract {
             currentProducer = 'New-Stage5CombinedHostRunnerReceipt.ps1'
             trustDomain = 'host-runner'
             allowedTrustDomains = @('host-runner')
-            hostChildNativeProducers = @('game-executable-stage5-performance-report-v2')
+            hostChildNativeProducers = @('game-executable-stage5-performance-report-v5')
             evidenceKind = 'stage5-host-runner-receipt'
             requiresChildProvenance = $true
             detailNames = @('pipelineMode', 'simulationMode', 'workerPolicy',
@@ -3115,8 +3297,9 @@ function Get-Stage5FinalAcceptanceReceiptContract {
             currentProducer = 'Run-DeterministicSimulationValidation.ps1'
             trustDomain = 'host-runner'
             allowedTrustDomains = @('host-runner', 'executable')
-            executableProducer = 'game-executable-stage5-performance-report-v2'
-            hostChildNativeProducers = @('game-executable-stage5-performance-report-v2')
+            executableProducer = 'game-executable-stage5-performance-report-v5'
+            executableProducerVersion = '5'
+            hostChildNativeProducers = @('game-executable-stage5-performance-report-v5')
             evidenceKind = 'stage5-host-runner-receipt'
             requiresChildProvenance = $true
             detailNames = @()
@@ -3447,6 +3630,9 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
         [string]$contract.executableProducer
     }
     else { [string]$contract.producer }
+    $expectedProducerVersion = if ($documentTrustDomain -ceq 'executable') {
+        [string]$contract.executableProducerVersion
+    } else { [string]$contract.producerVersion }
     $expectedEvidenceKind = if ($documentTrustDomain -ceq 'executable') {
         'stage5-executable-originated-receipt'
     }
@@ -3465,8 +3651,8 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
     Assert-Stage5Condition ($producer -is [string] -and
         $producer -ceq $expectedProducer -and
         $producerVersion -is [string] -and
-        $producerVersion -ceq [string]$contract.producerVersion) `
-        "$context has an unregistered producer/version for trust domain '$documentTrustDomain'. Expected '$expectedProducer' version $($contract.producerVersion)."
+        $producerVersion -ceq $expectedProducerVersion) `
+        "$context has an unregistered producer/version for trust domain '$documentTrustDomain'. Expected '$expectedProducer' version $expectedProducerVersion."
     Assert-Stage5Condition ($sourceCommit -is [string] -and
         $sourceCommit -ceq $ExpectedSourceCommit) `
         "$context sourceCommit is stale or does not match the final acceptance commit."
@@ -3733,7 +3919,7 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
                     $nativeReceiptExecutableHash = Get-Stage5JsonValue $nativeDocument `
                         'executableSha256' "$context host child nativeReceipt"
                     Assert-Stage5Condition ((Get-Stage5JsonValue $nativeDocument `
-                        'schemaVersion' "$context host child nativeReceipt") -eq 1 -and
+                        'schemaVersion' "$context host child nativeReceipt") -eq 5 -and
                         (Get-Stage5JsonValue $nativeDocument 'evidenceKind' `
                             "$context host child nativeReceipt") -ceq
                             'stage5-executable-originated-receipt' -and
@@ -3742,7 +3928,7 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
                         (Get-Stage5JsonValue $nativeDocument 'producer' `
                             "$context host child nativeReceipt") -match "^(?:$expectedNativeProducer)$" -and
                         (Get-Stage5JsonValue $nativeDocument 'producerVersion' `
-                            "$context host child nativeReceipt") -ceq '2' -and
+                            "$context host child nativeReceipt") -ceq '5' -and
                         ((Get-Stage5JsonValue $nativeDocument 'runNonce' `
                             "$context host child nativeReceipt") -match
                             '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-5][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$') -and
@@ -3762,7 +3948,7 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
                         (Get-Stage5JsonValue $nativeDocument 'runtimeClosure' `
                             "$context host child nativeReceipt") $runtimeClosure `
                         "$context host child nativeReceipt")
-                    [void](Assert-Stage5NativeV2ReceiptProvenance `
+                    [void](Assert-Stage5NativePerformanceReceiptProvenance `
                         $nativeDocument "$context host child nativeReceipt" `
                         $childTitle $childExecutablePath $childExpectedHash `
                         ([int]$childPid) $childCreation $ExpectedCohortCreatedUtc `
@@ -3820,7 +4006,7 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
                 $expectedGenerals
             }
             else { $expectedZeroHour }
-            [void](Assert-Stage5NativeV2ReceiptProvenance `
+            [void](Assert-Stage5NativePerformanceReceiptProvenance `
                 $nativeDocument "$context native receipt" $EvidenceTitle `
                 ([string](Get-Stage5JsonValue $provenance 'executablePath' `
                     "$context native provenance")) `
@@ -3834,8 +4020,8 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
                 'stage5-executable-originated-receipt' -and
                 (Get-Stage5JsonValue $nativeDocument 'status' "$context native receipt") -ceq 'passed' -and
                 (Get-Stage5JsonValue $nativeDocument 'producer' "$context native receipt") -ceq
-                    'game-executable-stage5-performance-report-v2' -and
-                (Get-Stage5JsonValue $nativeDocument 'producerVersion' "$context native receipt") -ceq '2' -and
+                    'game-executable-stage5-performance-report-v5' -and
+                (Get-Stage5JsonValue $nativeDocument 'producerVersion' "$context native receipt") -ceq '5' -and
                 (Get-Stage5JsonValue $nativeDocument 'runNonce' "$context native receipt") -ceq $runNonce -and
                 (Get-Stage5JsonValue $nativeDocument 'sourceCommit' "$context native receipt") -ceq $ExpectedSourceCommit -and
                 (Get-Stage5JsonValue $nativeDocument 'artifactSetSha256' "$context native receipt").ToUpperInvariant() -ceq
@@ -4960,11 +5146,11 @@ function Read-Stage5PerformanceScalingRawSamples {
         'Stage 5 scaling raw-sample manifest'
     $stage3ExecutableSha256 = Get-Stage5JsonValue $document 'stage3ExecutableSha256' `
         'Stage 5 scaling raw-sample manifest'
-    Assert-Stage5Condition ((Get-Stage5JsonValue $document 'schemaVersion' 'Stage 5 scaling raw-sample manifest') -eq 1 -and
+    Assert-Stage5Condition ((Get-Stage5JsonValue $document 'schemaVersion' 'Stage 5 scaling raw-sample manifest') -eq 2 -and
         (Get-Stage5JsonValue $document 'evidenceKind' 'Stage 5 scaling raw-sample manifest') -ceq
             'stage5-performance-scaling-raw-samples' -and
         (Get-Stage5JsonValue $document 'producer' 'Stage 5 scaling raw-sample manifest') -ceq
-            'installed-runtime-scaling-runner-v1' -and
+            'installed-runtime-scaling-runner-v2' -and
         (Get-Stage5JsonValue $document 'sourceCommit' 'Stage 5 scaling raw-sample manifest') -ceq
             $ExpectedSourceCommit -and
         (Get-Stage5JsonValue $document 'artifactSetSha256' 'Stage 5 scaling raw-sample manifest') -ceq
@@ -5017,15 +5203,19 @@ function Read-Stage5PerformanceScalingRawSamples {
     for ($fixtureIndex = 0; $fixtureIndex -lt 4; ++$fixtureIndex) {
         $laneValues = @{}
         foreach ($laneName in $laneNames) { $laneValues[$laneName] = @() }
-        $peakUnitCount = $null
+        $peakUnitCount = 0
+        $minimumInitialUnitCount = [int]::MaxValue
         for ($laneIndex = 0; $laneIndex -lt 4; ++$laneIndex) {
             for ($repeat = 0; $repeat -lt $repeatCount; ++$repeat) {
                 $sample = $fixtureSamples[$rowIndex++]
                 $context = "Stage 5 scaling fixture raw sample $($rowIndex - 1)"
                 Assert-Stage5JsonShape $sample @('fixture', 'playerCount', 'peakUnitCount',
+                    'requestedMinimumUnitCount', 'initialUnitCount',
                     'lane', 'repeat', 'processId', 'executableSha256', 'commandLine',
                     'elapsedMilliseconds') $context
                 $units = Get-Stage5JsonValue $sample 'peakUnitCount' $context
+                $initialUnits = Get-Stage5JsonValue $sample 'initialUnitCount' $context
+                $requestedUnits = Get-Stage5JsonValue $sample 'requestedMinimumUnitCount' $context
                 $processId = Get-Stage5JsonValue $sample 'processId' $context
                 $elapsed = Get-Stage5JsonValue $sample 'elapsedMilliseconds' $context
                 $expectedHash = if ($laneIndex -eq 0) {
@@ -5037,6 +5227,10 @@ function Read-Stage5PerformanceScalingRawSamples {
                     $fixtureNames[$fixtureIndex] -and
                     (Get-Stage5JsonValue $sample 'playerCount' $context) -eq 8 -and
                     (Test-Stage5JsonInteger $units) -and [int]$units -ge $minimumUnits[$fixtureIndex] -and
+                    (Test-Stage5JsonInteger $requestedUnits) -and
+                    [int]$requestedUnits -eq $minimumUnits[$fixtureIndex] -and
+                    (Test-Stage5JsonInteger $initialUnits) -and
+                    [int]$initialUnits -ge [int]$requestedUnits -and [int]$initialUnits -le [int]$units -and
                     (Get-Stage5JsonValue $sample 'lane' $context) -ceq $laneNames[$laneIndex] -and
                     (Get-Stage5JsonValue $sample 'repeat' $context) -eq $repeat -and
                     (Test-Stage5JsonInteger $processId) -and [Int64]$processId -gt 0 -and
@@ -5045,9 +5239,8 @@ function Read-Stage5PerformanceScalingRawSamples {
                     (Get-Stage5JsonValue $sample 'commandLine' $context) -ceq $expectedCommand -and
                     (Test-Stage5JsonNumber $elapsed) -and [double]$elapsed -gt 0.0) `
                     "$context is not an exact installed per-process timing receipt."
-                if ($null -eq $peakUnitCount) { $peakUnitCount = [int]$units }
-                Assert-Stage5Condition ([int]$units -eq $peakUnitCount) `
-                    "$context changes peak unit count within one fixture."
+                $peakUnitCount = [Math]::Max($peakUnitCount, [int]$units)
+                $minimumInitialUnitCount = [Math]::Min($minimumInitialUnitCount, [int]$initialUnits)
                 $seenProcesses[[string]$processId] = $true
                 $runReceipts["$($fixtureNames[$fixtureIndex])|$($laneNames[$laneIndex])|$repeat"] =
                     [pscustomobject]@{ processId = [Int64]$processId; commandLine = $expectedCommand }
@@ -5062,6 +5255,8 @@ function Read-Stage5PerformanceScalingRawSamples {
             name = $fixtureNames[$fixtureIndex]
             playerCount = 8
             peakUnitCount = $peakUnitCount
+            requestedMinimumUnitCount = $minimumUnits[$fixtureIndex]
+            minimumInitialUnitCount = $minimumInitialUnitCount
             repeats = $repeatCount
             stage3OneWorkerMilliseconds = $stage3
             stage5OneWorkerMilliseconds = $stage5
@@ -5078,14 +5273,16 @@ function Read-Stage5PerformanceScalingRawSamples {
         $topology.commandLine -ceq $topologyRunReceipt.commandLine) `
         'Stage 5 scaling topology receipt is not correlated with its exact installed one-worker run.'
 
-    $phaseNames = @('owner-intake', 'world-queries', 'pathfinding', 'object-computation',
-        'spatial-work', 'deterministic-commit', 'verification-publication')
+    $phaseNames = @('owner-intake', 'legacy-mutable-island', 'spatial-work',
+        'owner-tail', 'verification-publication')
     $phaseSamples = Get-Stage5JsonValue $document 'phaseSamples' `
         'Stage 5 scaling raw-sample manifest'
     Assert-Stage5Condition ($phaseSamples -is [Array] -and
         $phaseSamples.Count -eq $phaseNames.Count * $repeatCount) `
         'Stage 5 scaling raw samples require every one-worker phase for every repeat.'
     $phaseAggregates = @()
+    $phaseRunTotals = New-Object 'double[]' $repeatCount
+    $phaseRunSerialTotals = New-Object 'double[]' $repeatCount
     $rowIndex = 0
     foreach ($phaseName in $phaseNames) {
         $elapsedValues = @()
@@ -5094,7 +5291,7 @@ function Read-Stage5PerformanceScalingRawSamples {
             $sample = $phaseSamples[$rowIndex++]
             $context = "Stage 5 scaling phase raw sample $($rowIndex - 1)"
             Assert-Stage5JsonShape $sample @('phase', 'repeat', 'processId', 'commandLine',
-                'elapsedMilliseconds', 'serialMilliseconds') $context
+                'elapsedMilliseconds', 'serialMilliseconds', 'serialMillisecondsKnown') $context
             $receipt = $runReceipts["dense-eight-player|forced-one|$repeat"]
             $elapsed = Get-Stage5JsonValue $sample 'elapsedMilliseconds' $context
             $serial = Get-Stage5JsonValue $sample 'serialMilliseconds' $context
@@ -5104,15 +5301,20 @@ function Read-Stage5PerformanceScalingRawSamples {
                 (Get-Stage5JsonValue $sample 'commandLine' $context) -ceq $receipt.commandLine -and
                 (Test-Stage5JsonNumber $elapsed) -and [double]$elapsed -gt 0.0 -and
                 (Test-Stage5JsonNumber $serial) -and [double]$serial -ge 0.0 -and
+                (Get-Stage5JsonValue $sample 'serialMillisecondsKnown' $context) -is [bool] -and
+                (Get-Stage5JsonValue $sample 'serialMillisecondsKnown' $context) -and
                 [double]$serial -le [double]$elapsed) `
                 "$context is not correlated with its exact installed one-worker run."
             $elapsedValues += [double]$elapsed
             $serialValues += [double]$serial
+            $phaseRunTotals[$repeat] += [double]$elapsed
+            $phaseRunSerialTotals[$repeat] += [double]$serial
         }
         $phaseAggregates += [pscustomobject]@{
             name = $phaseName
             elapsedMilliseconds = Get-Stage5Median $elapsedValues
             serialMilliseconds = Get-Stage5Median $serialValues
+            serialMillisecondsKnown = $true
         }
     }
 
@@ -5128,6 +5330,7 @@ function Read-Stage5PerformanceScalingRawSamples {
     $rowIndex = 0
     foreach ($kernelName in $kernelNames) {
         $admittedValues = @()
+        $parallelValues = @()
         $partValues = @{}
         foreach ($part in $parts) { $partValues[$part] = @() }
         $serialValues = @()
@@ -5137,7 +5340,8 @@ function Read-Stage5PerformanceScalingRawSamples {
             Assert-Stage5JsonShape $sample @('kernel', 'repeat', 'processId', 'commandLine',
                 'admittedSlices', 'captureMilliseconds', 'scheduleMilliseconds',
                 'waitMilliseconds', 'validateMilliseconds', 'commitMilliseconds',
-                'exactSerialOperationMilliseconds') $context
+                'exactSerialOperationMilliseconds', 'exactSerialOperationMillisecondsKnown',
+                'timingAttribution') $context
             $receipt = $runReceipts["dense-eight-player|physical-8|$repeat"]
             $admitted = Get-Stage5JsonValue $sample 'admittedSlices' $context
             $serial = Get-Stage5JsonValue $sample 'exactSerialOperationMilliseconds' $context
@@ -5146,15 +5350,23 @@ function Read-Stage5PerformanceScalingRawSamples {
                 (Get-Stage5JsonValue $sample 'processId' $context) -eq $receipt.processId -and
                 (Get-Stage5JsonValue $sample 'commandLine' $context) -ceq $receipt.commandLine -and
                 (Test-Stage5JsonInteger $admitted) -and [int]$admitted -gt 0 -and
+                (Get-Stage5JsonValue $sample 'exactSerialOperationMillisecondsKnown' $context) -is [bool] -and
+                (Get-Stage5JsonValue $sample 'exactSerialOperationMillisecondsKnown' $context) -and
+                (Get-Stage5JsonValue $sample 'timingAttribution' $context) -ceq 'owner-stack-exclusive-v1' -and
                 (Test-Stage5JsonNumber $serial) -and [double]$serial -gt 0.0) `
                 "$context is not correlated with its exact installed physical-8 run."
             $admittedValues += [double]$admitted
+            [double]$runParallel = 0.0
             foreach ($part in $parts) {
                 $value = Get-Stage5JsonValue $sample $part $context
                 Assert-Stage5Condition ((Test-Stage5JsonNumber $value) -and [double]$value -ge 0.0) `
                     "$context $part is invalid."
                 $partValues[$part] += [double]$value
+                $runParallel += [double]$value
             }
+            Assert-Stage5Condition ($runParallel -gt 0.0 -and
+                -not [double]::IsInfinity($runParallel)) "$context has no finite positive active pipeline cost."
+            $parallelValues += $runParallel
             $serialValues += [double]$serial
         }
         $capture = Get-Stage5Median $partValues.captureMilliseconds
@@ -5162,7 +5374,9 @@ function Read-Stage5PerformanceScalingRawSamples {
         $wait = Get-Stage5Median $partValues.waitMilliseconds
         $validate = Get-Stage5Median $partValues.validateMilliseconds
         $commit = Get-Stage5Median $partValues.commitMilliseconds
-        $parallelTotal = $capture + $schedule + $wait + $validate + $commit
+        # Components can be anticorrelated between runs. Their separate
+        # medians are descriptive, never an observed total pipeline cost.
+        $parallelTotal = Get-Stage5Median $parallelValues
         $serialOperation = Get-Stage5Median $serialValues
         $kernelAggregates += [pscustomobject]@{
             name = $kernelName
@@ -5174,6 +5388,8 @@ function Read-Stage5PerformanceScalingRawSamples {
             commitMilliseconds = $commit
             totalParallelMilliseconds = $parallelTotal
             exactSerialOperationMilliseconds = $serialOperation
+            exactSerialOperationMillisecondsKnown = $true
+            timingAttribution = 'owner-stack-exclusive-v1'
             netSpeedup = $serialOperation / $parallelTotal
         }
     }
@@ -5182,9 +5398,580 @@ function Read-Stage5PerformanceScalingRawSamples {
         topologySha256 = $topologySha256
         topology = $topology
         repeatCount = $repeatCount
+        totalOneWorkerMilliseconds = Get-Stage5Median $phaseRunTotals
+        totalSerialMilliseconds = Get-Stage5Median $phaseRunSerialTotals
         phases = $phaseAggregates
         kernels = $kernelAggregates
         fixtures = $fixtureAggregates
+    }
+}
+
+function Assert-Stage5DiagnosticCounter {
+    param([object]$Value, [string]$Context)
+    Assert-Stage5Condition ((Test-Stage5JsonInteger $Value) -and
+        [decimal]$Value -ge 0 -and [decimal]$Value -le [decimal][UInt64]::MaxValue) `
+        "$Context must be an exact unsigned 64-bit counter."
+}
+
+function Assert-Stage5DiagnosticKernelTiming {
+    param([object]$Timing, [object]$Frames, [string]$Context)
+    Assert-Stage5JsonShape $Timing @('schemaVersion', 'mode', 'attribution', 'enabled',
+        'frozen', 'complete', 'errors', 'generation', 'serialReferenceKnown', 'streams') $Context
+    Assert-Stage5DiagnosticCounter $Timing.generation "$Context generation"
+    Assert-Stage5Condition ($Timing.schemaVersion -eq 1 -and
+        $Timing.mode -ceq 'owner-pipeline-observation' -and
+        $Timing.attribution -ceq 'owner-stack-exclusive-v1' -and
+        $Timing.enabled -is [bool] -and $Timing.enabled -and
+        $Timing.frozen -is [bool] -and $Timing.frozen -and
+        $Timing.complete -is [bool] -and
+        (Test-Stage5JsonInteger $Timing.errors) -and $Timing.errors -eq 0 -and
+        [decimal]$Timing.generation -gt 0 -and
+        $Timing.serialReferenceKnown -is [bool] -and -not $Timing.serialReferenceKnown -and
+        $Timing.streams -is [Array] -and $Timing.streams.Count -le 16 -and
+        $Timing.complete -eq ($Timing.streams.Count -gt 0)) `
+        "$Context is not a finalized V5 owner-pipeline ledger."
+    $names = @('physics', 'status', 'collision', 'ai-planning', 'spatial', 'path')
+    $stages = @('capture', 'schedule', 'wait', 'validate', 'commit')
+    $seen = @{}
+    foreach ($stream in $Timing.streams) {
+        Assert-Stage5JsonShape $stream @('name', 'subtype', 'attemptedBatches', 'admittedBatches',
+            'committedBatches', 'abortedBatches', 'firstFrame', 'lastFrame',
+            'activePipelineNanoseconds', 'inclusiveBatchNanoseconds', 'maximumBatchNanoseconds', 'stages') $Context
+        foreach ($field in @('subtype', 'attemptedBatches', 'admittedBatches', 'committedBatches',
+            'abortedBatches', 'firstFrame', 'lastFrame', 'activePipelineNanoseconds',
+            'inclusiveBatchNanoseconds', 'maximumBatchNanoseconds')) {
+            Assert-Stage5DiagnosticCounter $stream[$field] "$Context $field"
+        }
+        $identity = "$($stream.name)|$($stream.subtype)"
+        $maximumSubtype = if (@('ai-planning', 'path') -ccontains $stream.name) { 1 } else { 0 }
+        Assert-Stage5Condition ($names -ccontains $stream.name -and
+            -not $seen.ContainsKey($identity) -and $stream.subtype -le $maximumSubtype -and
+            $stream.attemptedBatches -gt 0 -and $stream.admittedBatches -le $stream.attemptedBatches -and
+            $stream.committedBatches -le $stream.admittedBatches -and
+            [decimal]$stream.abortedBatches -eq ([decimal]$stream.admittedBatches - [decimal]$stream.committedBatches) -and
+            $stream.firstFrame -ge $Frames.start -and $stream.lastFrame -le $Frames.end -and
+            $stream.firstFrame -le $stream.lastFrame -and
+            $stream.activePipelineNanoseconds -le $stream.inclusiveBatchNanoseconds -and
+            $stream.maximumBatchNanoseconds -le $stream.inclusiveBatchNanoseconds -and
+            $stream.stages -is [Array] -and $stream.stages.Count -eq 5) `
+            "$Context stream identity, disposition, frame, or latency accounting is inconsistent."
+        $seen[$identity] = $true
+        [decimal]$active = 0
+        for ($index = 0; $index -lt 5; ++$index) {
+            $stage = $stream.stages[$index]
+            Assert-Stage5JsonShape $stage @('name', 'totalNanoseconds', 'sampleCount') $Context
+            Assert-Stage5DiagnosticCounter $stage.totalNanoseconds "$Context stage time"
+            Assert-Stage5DiagnosticCounter $stage.sampleCount "$Context stage samples"
+            Assert-Stage5Condition ($stage.name -ceq $stages[$index] -and
+                $stage.sampleCount -ge $stream.committedBatches -and
+                ($stage.totalNanoseconds -eq 0 -or $stage.sampleCount -gt 0)) `
+                "$Context committed stage coverage is incomplete."
+            $active += [decimal]$stage.totalNanoseconds
+        }
+        Assert-Stage5Condition ($active -eq [decimal]$stream.activePipelineNanoseconds) `
+            "$Context exclusive stage sum does not match active pipeline time."
+    }
+}
+
+function Assert-Stage5DiagnosticKernelReference {
+    param([object]$Reference, [object]$Timing, [object]$Frames,
+        [string]$MeasurementRole, [string]$Context)
+    Assert-Stage5JsonShape $Reference @('schemaVersion', 'mode', 'frozen', 'complete',
+        'errors', 'generation', 'streams') $Context
+    Assert-Stage5DiagnosticCounter $Reference.generation "$Context generation"
+    $expectedMode = if ($MeasurementRole -ceq 'throughput') { 'throughput-binding' } else { 'serial-oracle' }
+    Assert-Stage5Condition (@('throughput', 'serial-oracle') -ccontains $MeasurementRole -and
+        (Test-Stage5JsonInteger $Reference.schemaVersion) -and $Reference.schemaVersion -eq 1 -and
+        $Reference.mode -ceq $expectedMode -and
+        $Reference.frozen -is [bool] -and $Reference.frozen -and
+        $Reference.complete -is [bool] -and
+        (Test-Stage5JsonInteger $Reference.errors) -and $Reference.errors -eq 0 -and
+        [decimal]$Reference.generation -gt 0 -and $Reference.streams -is [Array] -and
+        $Reference.streams.Count -le 16 -and
+        $Reference.complete -eq ($Reference.streams.Count -gt 0)) `
+        "$Context is not a finalized role-consistent canonical reference ledger."
+    $names = @('physics', 'status', 'collision', 'ai-planning', 'spatial', 'path')
+    $seen = @{}
+    foreach ($stream in $Reference.streams) {
+        Assert-Stage5JsonShape $stream @('name', 'subtype', 'fieldSchema', 'firstFrame', 'lastFrame',
+            'validatedBatchCount', 'committedBatchCount', 'abortedBatchCount',
+            'validatedOperationCount', 'committedOperationCount', 'serialSampleCount',
+            'serialNanoseconds', 'maximumSerialNanoseconds', 'inputSha256', 'outputSha256', 'commitSha256') $Context
+        foreach ($field in @('subtype', 'fieldSchema', 'firstFrame', 'lastFrame', 'validatedBatchCount',
+            'committedBatchCount', 'abortedBatchCount', 'validatedOperationCount',
+            'committedOperationCount', 'serialSampleCount', 'serialNanoseconds', 'maximumSerialNanoseconds')) {
+            Assert-Stage5DiagnosticCounter $stream[$field] "$Context $field"
+        }
+        $identity = "$($stream.name)|$($stream.subtype)"
+        $maximumSubtype = if (@('ai-planning', 'path') -ccontains $stream.name) { 1 } else { 0 }
+        Assert-Stage5Condition ($names -ccontains $stream.name -and
+            -not $seen.ContainsKey($identity) -and $stream.subtype -le $maximumSubtype -and
+            $stream.fieldSchema -gt 0 -and $stream.fieldSchema -le [UInt32]::MaxValue -and
+            $stream.firstFrame -le [UInt32]::MaxValue -and $stream.lastFrame -le [UInt32]::MaxValue -and
+            $stream.firstFrame -ge $Frames.start -and $stream.lastFrame -le $Frames.end -and
+            $stream.firstFrame -le $stream.lastFrame -and $stream.validatedBatchCount -gt 0 -and
+            $stream.committedBatchCount -le $stream.validatedBatchCount -and
+            [decimal]$stream.abortedBatchCount -eq ([decimal]$stream.validatedBatchCount - [decimal]$stream.committedBatchCount) -and
+            $stream.validatedOperationCount -ge $stream.validatedBatchCount -and
+            $stream.committedOperationCount -ge $stream.committedBatchCount -and
+            $stream.committedOperationCount -le $stream.validatedOperationCount -and
+            [decimal]$stream.validatedOperationCount - [decimal]$stream.committedOperationCount -ge [decimal]$stream.abortedBatchCount -and
+            ($stream.committedBatchCount -gt 0 -or $stream.committedOperationCount -eq 0) -and
+            ($stream.abortedBatchCount -gt 0 -or $stream.validatedOperationCount -eq $stream.committedOperationCount) -and
+            $stream.maximumSerialNanoseconds -le $stream.serialNanoseconds) `
+            "$Context reference identity, frame, batch, or operation accounting is inconsistent."
+        foreach ($field in @('inputSha256', 'outputSha256', 'commitSha256')) {
+            Assert-Stage5Condition ($stream[$field] -is [string] -and $stream[$field] -cmatch '^[0-9A-F]{64}$') `
+                "$Context canonical reference $field digest is unavailable."
+        }
+        $seen[$identity] = $true
+        $matchingTiming = @($Timing.streams | Where-Object {
+            $_.name -ceq $stream.name -and $_.subtype -eq $stream.subtype
+        })
+        Assert-Stage5Condition ($matchingTiming.Count -eq 1) "$Context reference stream has no unique timing stream."
+        $matched = $matchingTiming[0]
+        Assert-Stage5Condition ($stream.committedBatchCount -eq $matched.committedBatches -and
+            $stream.validatedBatchCount -le $matched.admittedBatches -and
+            $stream.firstFrame -ge $matched.firstFrame -and $stream.lastFrame -le $matched.lastFrame) `
+            "$Context reference and timing batch commit/frame coverage do not match."
+        if ($MeasurementRole -ceq 'throughput') {
+            Assert-Stage5Condition ($stream.serialSampleCount -eq 0 -and $stream.serialNanoseconds -eq 0 -and
+                $stream.maximumSerialNanoseconds -eq 0) "$Context throughput reference contains serial-oracle work."
+        } else {
+            Assert-Stage5Condition ($stream.serialSampleCount -eq $stream.committedBatchCount -and
+                ($stream.serialNanoseconds -eq 0 -or $stream.serialSampleCount -gt 0)) `
+                "$Context serial reference samples do not match committed batches."
+        }
+    }
+}
+
+function Get-Stage5DiagnosticInputBindings {
+    param([object]$Aggregate, [string]$SourceCommit, [string]$ArtifactHash,
+        [string]$ExecutableHash, [string]$Title)
+    # Bind the already-reviewed closure manifest once. This diagnostic
+    # conversion does not claim to requalify every installed asset or replace
+    # the host's locked runtime-closure check.
+    Assert-Stage5JsonShape $Aggregate.artifactSetManifest @('path', 'sha256') 'Diagnostic artifact manifest'
+    $artifactPath = [IO.Path]::GetFullPath([string]$Aggregate.artifactSetManifest.path)
+    $artifactSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $artifactPath 'Diagnostic artifact manifest'
+    Assert-Stage5Condition ($Aggregate.artifactSetManifest.sha256 -ceq $ArtifactHash) 'Diagnostic artifact manifest binding differs.'
+    Assert-Stage5FinalAcceptanceSnapshotSha256 $artifactSnapshot $ArtifactHash 'Diagnostic artifact manifest' | Out-Null
+    $artifact = ConvertFrom-Stage5FinalAcceptanceJsonSnapshot $artifactSnapshot 'Diagnostic artifact manifest'
+    Assert-Stage5JsonShape $artifact @('schemaVersion', 'sourceCommit', 'productSet', 'architecture',
+        'artifacts', 'runtimeClosure') 'Diagnostic artifact manifest'
+    Assert-Stage5Condition ($artifact.schemaVersion -eq 1 -and $artifact.sourceCommit -ceq $SourceCommit -and
+        $artifact.architecture -ceq 'x64') 'Diagnostic artifact identity differs.'
+    Assert-Stage5FinalAcceptanceStringSet $artifact.productSet @('Generals', 'ZeroHour') 'Diagnostic artifact products'
+    $artifactDirectory = Split-Path -Parent $artifactPath
+    $reference = $artifact.runtimeClosure.dependencyManifest
+    Assert-Stage5JsonShape $reference @('path', 'sha256') 'Diagnostic dependency manifest'
+    $dependencyPath = Resolve-Stage5FinalAcceptanceFile $artifactDirectory $reference.path 'Diagnostic dependency manifest'
+    $dependencySnapshot = Get-Stage5FinalAcceptanceFileSnapshot $dependencyPath 'Diagnostic dependency manifest'
+    $dependencyHash = Assert-Stage5FinalAcceptanceSnapshotSha256 $dependencySnapshot $reference.sha256 'Diagnostic dependency manifest'
+    $dependency = ConvertFrom-Stage5FinalAcceptanceJsonSnapshot $dependencySnapshot 'Diagnostic dependency manifest'
+    Assert-Stage5JsonShape $dependency @('schemaVersion', 'sourceCommit', 'productSet', 'architecture', 'files') 'Diagnostic dependency manifest'
+    Assert-Stage5Condition ($dependency.schemaVersion -eq 1 -and $dependency.sourceCommit -ceq $SourceCommit -and
+        $dependency.architecture -ceq 'x64' -and $dependency.files -is [Array] -and $dependency.files.Count -ge 10) `
+        'Diagnostic dependency closure identity is invalid.'
+    Assert-Stage5FinalAcceptanceStringSet $dependency.productSet @('Generals', 'ZeroHour') 'Diagnostic dependency products'
+    $lines = @(); $seenPaths = @{}; $kinds = @{}; $executableMatches = 0
+    foreach ($file in $dependency.files) {
+        Assert-Stage5JsonShape $file @('title', 'kind', 'path', 'sha256') 'Diagnostic dependency entry'
+        Assert-Stage5Condition (@('Generals', 'ZeroHour') -ccontains $file.title -and
+            @('executable', 'launcher', 'launcher-config', 'dll', 'asset') -ccontains $file.kind -and
+            $file.sha256 -is [string] -and $file.sha256 -cmatch '^[0-9A-F]{64}$') 'Diagnostic dependency entry is invalid.'
+        $filePath = Resolve-Stage5FinalAcceptanceFile $artifactDirectory $file.path 'Diagnostic dependency path'
+        Assert-Stage5Condition (-not $seenPaths.ContainsKey($filePath)) 'Diagnostic dependency path is duplicated.'
+        $seenPaths[$filePath] = $file.sha256; $kinds["$($file.title)|$($file.kind)"] = $true
+        $lines += "$($file.title)|$($file.kind)|$(([string]$file.path).Replace('\', '/'))|$($file.sha256)"
+        if ($file.title -ceq $Title -and $file.kind -ceq 'executable' -and $file.sha256 -ceq $ExecutableHash -and
+            [String]::Equals($filePath, [IO.Path]::GetFullPath([string]$Aggregate.executable.path), [StringComparison]::OrdinalIgnoreCase)) {
+            ++$executableMatches
+        }
+    }
+    foreach ($product in @('Generals', 'ZeroHour')) {
+        foreach ($kind in @('executable', 'launcher', 'launcher-config', 'dll', 'asset')) {
+            Assert-Stage5Condition ($kinds.ContainsKey("$product|$kind")) 'Diagnostic dependency closure is incomplete.'
+        }
+    }
+    Assert-Stage5Condition ($executableMatches -eq 1) 'Diagnostic executable is detached from the artifact closure.'
+    foreach ($entry in $artifact.artifacts) {
+        Assert-Stage5JsonShape $entry @('role', 'path', 'sha256') 'Diagnostic core artifact'
+        $entryPath = Resolve-Stage5FinalAcceptanceFile $artifactDirectory $entry.path 'Diagnostic core artifact'
+        Assert-Stage5Condition ($seenPaths.ContainsKey($entryPath) -and $seenPaths[$entryPath] -ceq $entry.sha256) `
+            'Diagnostic core artifact is detached from the closure.'
+    }
+    [Array]::Sort($lines, [StringComparer]::Ordinal)
+    $closureHash = Get-Stage5FinalAcceptanceSha256FromBytes ([Text.Encoding]::UTF8.GetBytes(($lines -join "`n") + "`n"))
+    $closure = $Aggregate.runtimeClosure
+    Assert-Stage5JsonShape $closure @('dependencyManifestPath', 'dependencyManifestSha256', 'closureSha256', 'fileCount') 'Diagnostic runtime closure'
+    Assert-Stage5Condition ($artifact.runtimeClosure.closureSha256 -ceq $closureHash -and
+        $closure.dependencyManifestPath -ceq $reference.path -and $closure.dependencyManifestSha256 -ceq $dependencyHash -and
+        $closure.closureSha256 -ceq $closureHash -and $closure.fileCount -eq $dependency.files.Count) `
+        'Diagnostic runtime closure binding does not match its manifest bytes.'
+    Assert-Stage5JsonShape $Aggregate.fixtureManifest @('path', 'sha256') 'Diagnostic fixture manifest'
+    $fixturePath = [IO.Path]::GetFullPath([string]$Aggregate.fixtureManifest.path)
+    $fixtureSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $fixturePath 'Diagnostic fixture manifest'
+    Assert-Stage5FinalAcceptanceSnapshotSha256 $fixtureSnapshot $Aggregate.fixtureManifest.sha256 'Diagnostic fixture manifest' | Out-Null
+    $fixtureDocument = ConvertFrom-Stage5FinalAcceptanceJsonSnapshot $fixtureSnapshot 'Diagnostic fixture manifest'
+    Assert-Stage5JsonShape $fixtureDocument @('schemaVersion', 'evidenceKind', 'title', 'executableSha256', 'fixtures') 'Diagnostic fixture manifest'
+    Assert-Stage5Condition ($fixtureDocument.schemaVersion -eq 1 -and
+        $fixtureDocument.evidenceKind -ceq 'stage5-performance-scaling-fixtures' -and
+        $fixtureDocument.title -ceq $Title -and $fixtureDocument.executableSha256 -ceq $ExecutableHash -and
+        $fixtureDocument.fixtures -is [Array] -and $fixtureDocument.fixtures.Count -eq 4) 'Diagnostic fixture manifest identity is invalid.'
+    $fixtureMinimums = @{ 'one-thousand-units' = 1000; 'four-thousand-units' = 4000; 'eight-thousand-units' = 8000; 'dense-eight-player' = 8000 }
+    $fixtures = @{}
+    foreach ($fixture in $fixtureDocument.fixtures) {
+        Assert-Stage5JsonShape $fixture @('id', 'source', 'sha256', 'seed', 'playerCount', 'peakUnitCount') 'Diagnostic reviewed fixture'
+        Assert-Stage5Condition ($fixtureMinimums.ContainsKey([string]$fixture.id) -and -not $fixtures.ContainsKey([string]$fixture.id) -and
+            $fixture.playerCount -eq 8 -and (Test-Stage5JsonInteger $fixture.seed) -and
+            $fixture.seed -ge 0 -and $fixture.seed -le [UInt32]::MaxValue -and
+            (Test-Stage5JsonInteger $fixture.peakUnitCount) -and
+            (($fixture.id -ceq 'dense-eight-player' -and $fixture.peakUnitCount -ge 8000) -or
+                ($fixture.id -cne 'dense-eight-player' -and $fixture.peakUnitCount -eq $fixtureMinimums[$fixture.id]))) `
+            'Diagnostic reviewed fixture workload or seed is invalid.'
+        $replayPath = Resolve-Stage5FinalAcceptanceFile (Split-Path -Parent $fixturePath) $fixture.source 'Diagnostic reviewed replay'
+        $replaySnapshot = Get-Stage5FinalAcceptanceFileSnapshot $replayPath 'Diagnostic reviewed replay'
+        $replayHash = Assert-Stage5FinalAcceptanceSnapshotSha256 $replaySnapshot $fixture.sha256 'Diagnostic reviewed replay'
+        $fixtures[$fixture.id] = [pscustomobject]@{ path = $replayPath; sha256 = $replayHash
+            seed = $fixture.seed; playerCount = $fixture.playerCount; minimumUnitCount = $fixture.peakUnitCount }
+    }
+    return [pscustomobject]@{ fixtures = $fixtures; dependencyManifestSha256 = $dependencyHash; closureSha256 = $closureHash }
+}
+
+function ConvertTo-Stage5PerformanceDiagnostics {
+    param([string]$HostAggregatePath, [string]$ExpectedHostAggregateSha256,
+        [string]$ExpectedSourceCommit, [string]$ExpectedArtifactSetSha256,
+        [string]$ExpectedExecutableSha256,
+        [ValidateSet('Generals', 'ZeroHour')][string]$ExpectedTitle = 'ZeroHour',
+        [switch]$RequireAcceptance)
+    # Independent oracle processes can establish exact kernel references, not
+    # whole-frame serial coverage. This converter has no acceptance branch.
+    $full = [IO.Path]::GetFullPath($HostAggregatePath)
+    $base = Split-Path -Parent $full
+    $snapshot = Get-Stage5FinalAcceptanceFileSnapshot $full 'Performance host aggregate'
+    $hostHash = Assert-Stage5FinalAcceptanceSnapshotSha256 $snapshot `
+        $ExpectedHostAggregateSha256 'Performance host aggregate'
+    $aggregate = ConvertFrom-Stage5FinalAcceptanceJsonSnapshot $snapshot 'Performance host aggregate'
+    Assert-Stage5JsonProperties $aggregate @('schemaVersion', 'evidenceKind', 'producer', 'status',
+        'qualificationMode', 'measurementMode', 'installedRuntime', 'sourceCommit',
+        'artifactSetSha256', 'title', 'executable', 'nativeReceiptBindings', 'runs', 'referencePolicy',
+        'pairedOracleBindings', 'artifactSetManifest', 'runtimeClosure', 'fixtureManifest') 'Performance host aggregate'
+    $expectedKind = if ($aggregate.qualificationMode -ceq 'LocalCapacitySmoke') {
+        'stage5-performance-scaling-local-capacity-smoke'
+    } else { 'stage5-performance-scaling-host-qualification' }
+    Assert-Stage5Condition ($ExpectedSourceCommit -cmatch '^[0-9a-f]{40}$' -and
+        $ExpectedArtifactSetSha256 -cmatch '^[0-9A-F]{64}$' -and
+        $ExpectedExecutableSha256 -cmatch '^[0-9A-F]{64}$' -and
+        $aggregate.schemaVersion -eq 2 -and $aggregate.evidenceKind -ceq $expectedKind -and
+        $aggregate.producer -ceq 'Invoke-Stage5PerformanceScalingValidation.ps1' -and
+        $aggregate.status -ceq 'passed' -and
+        @('LocalCapacitySmoke', 'External16Core') -ccontains $aggregate.qualificationMode -and
+        $aggregate.measurementMode -ceq 'headless-throughput' -and
+        $aggregate.installedRuntime -is [bool] -and $aggregate.installedRuntime -and
+        $aggregate.sourceCommit -ceq $ExpectedSourceCommit -and
+        $aggregate.artifactSetSha256 -ceq $ExpectedArtifactSetSha256 -and
+        $aggregate.title -ceq $ExpectedTitle -and
+        $aggregate.executable.sha256 -ceq $ExpectedExecutableSha256 -and
+        $aggregate.runs -is [Array] -and $aggregate.runs.Count -gt 0 -and
+        $aggregate.nativeReceiptBindings -is [Array] -and
+        $aggregate.nativeReceiptBindings.Count -eq $aggregate.runs.Count) `
+        'Performance host aggregate is not bound to the requested native installed artifact.'
+    Assert-Stage5Condition (@('throughput-only', 'paired-serial-oracle-v1') -ccontains $aggregate.referencePolicy -and
+        $aggregate.pairedOracleBindings -is [Array] -and
+        (($aggregate.referencePolicy -ceq 'throughput-only' -and $aggregate.pairedOracleBindings.Count -eq 0) -or
+            ($aggregate.referencePolicy -ceq 'paired-serial-oracle-v1' -and $aggregate.pairedOracleBindings.Count -eq $aggregate.runs.Count))) `
+        'Performance paired oracle policy or pair count is invalid.'
+    $inputBindings = Get-Stage5DiagnosticInputBindings $aggregate $ExpectedSourceCommit $ExpectedArtifactSetSha256 $ExpectedExecutableSha256 $ExpectedTitle
+    $entries = @(); $scheduled = @{}; $pairsByThroughput = @{}
+    for ($index = 0; $index -lt $aggregate.runs.Count; ++$index) {
+        $run = $aggregate.runs[$index]
+        Assert-Stage5Condition ($run.runId -is [string] -and -not $scheduled.ContainsKey($run.runId)) 'Performance throughput run is duplicated.'
+        $scheduled[$run.runId] = $run
+        $entries += [pscustomobject]@{ run = $run; binding = $aggregate.nativeReceiptBindings[$index]; role = 'throughput' }
+    }
+    foreach ($pair in $aggregate.pairedOracleBindings) {
+        Assert-Stage5JsonShape $pair @('throughputRunId', 'oracleRun') 'Performance paired oracle binding'
+        Assert-Stage5Condition ($pair.throughputRunId -is [string] -and $scheduled.ContainsKey($pair.throughputRunId) -and
+            -not $pairsByThroughput.ContainsKey($pair.throughputRunId)) 'Performance oracle pair is duplicated or refers to an unknown run.'
+        $pairsByThroughput[$pair.throughputRunId] = $pair.oracleRun
+        $entries += [pscustomobject]@{ run = $pair.oracleRun; binding = $pair.oracleRun.receiptBinding; role = 'serial-oracle' }
+    }
+    $runs = @()
+    $nativeByRunId = @{}; $diagnosticsByRunId = @{}
+    $seenProcesses = @{}; $seenRunIds = @{}; $seenNonces = @{}; $seenReceipts = @{}
+    $cohort = $null
+    $phaseNames = @('owner-intake', 'legacy-mutable-island', 'spatial-work',
+        'owner-tail', 'verification-publication')
+    for ($index = 0; $index -lt $entries.Count; ++$index) {
+        $run = $entries[$index].run
+        $context = "Performance diagnostic run $index"
+        Assert-Stage5JsonProperties $run @('fixtureId', 'lane', 'ordinal', 'warmup', 'runId',
+            'processId', 'processCreationTimeUtc100ns', 'elapsedMilliseconds', 'receiptPath',
+            'receiptSha256', 'receiptBinding', 'rawLogPath', 'rawLogSha256', 'timingPath', 'timingSha256',
+            'selectedWorkerCpuSetIds', 'selectedPhysicalCoreMask') $context
+        $binding = $run.receiptBinding
+        $outerBinding = $entries[$index].binding
+        $bindingFields = @('path', 'sha256', 'runId', 'runNonce', 'cohortNonce', 'processId',
+            'processCreationTimeUtc100ns', 'executablePath', 'executableSha256', 'commandLine',
+            'rawLogPath', 'rawLogSha256', 'timingPath', 'timingSha256')
+        Assert-Stage5JsonShape $binding $bindingFields $context
+        Assert-Stage5JsonShape $outerBinding $bindingFields $context
+        foreach ($field in $bindingFields) {
+            Assert-Stage5Condition ($binding[$field] -ceq $outerBinding[$field]) "$context has conflicting receipt bindings."
+        }
+        $receiptPath = [IO.Path]::GetFullPath([string]$run.receiptPath)
+        Assert-Stage5FinalAcceptancePathContained $base $receiptPath $context
+        Assert-Stage5Condition ($receiptPath -ceq [IO.Path]::GetFullPath([string]$binding.path) -and
+            $run.receiptSha256 -ceq $binding.sha256 -and -not $seenReceipts.ContainsKey($receiptPath)) `
+            "$context repeats or detaches a receipt."
+        $nativeSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $receiptPath $context
+        $nativeHash = Assert-Stage5FinalAcceptanceSnapshotSha256 $nativeSnapshot $binding.sha256 $context
+        $native = ConvertFrom-Stage5FinalAcceptanceJsonSnapshot $nativeSnapshot $context
+        Assert-Stage5JsonProperties $native @('schemaVersion', 'producer', 'producerVersion', 'evidenceKind',
+            'status', 'title', 'sourceCommit', 'artifactSetSha256', 'executablePath', 'executableSha256',
+            'runId', 'runNonce', 'cohortNonce', 'commandLine', 'process', 'fixture', 'frames', 'workload',
+            'frameSimulation', 'phases', 'kernelTiming', 'measurementRole', 'kernelReference', 'rawEvidence',
+            'runtimeClosure', 'worker', 'topology', 'cohortCreatedUtc', 'architecture', 'simulationMode', 'schedulerStarted') $context
+        Assert-Stage5Condition ($native.schemaVersion -eq 5 -and
+            $native.producer -ceq 'game-executable-stage5-performance-report-v5' -and
+            $native.producerVersion -ceq '5' -and $native.status -ceq 'passed' -and
+            $native.evidenceKind -ceq 'stage5-executable-originated-receipt' -and
+            $native.title -ceq $ExpectedTitle -and $native.sourceCommit -ceq $ExpectedSourceCommit -and
+            $native.artifactSetSha256 -ceq $ExpectedArtifactSetSha256 -and
+            $native.executableSha256 -ceq $ExpectedExecutableSha256 -and
+            $native.executablePath -ceq $aggregate.executable.path) "$context native provenance does not match the host artifact."
+        Assert-Stage5Condition ($native.measurementRole -ceq $entries[$index].role) `
+            "$context measurement role cannot cross the throughput/oracle boundary."
+        Assert-Stage5Condition ($native.architecture -ceq 'x64') "$context native architecture differs."
+        Assert-Stage5RuntimeClosureBinding $native.runtimeClosure $inputBindings "$context pair provenance" | Out-Null
+        Assert-Stage5NativeFixtureObservation $native $context -RequireScaling
+        Assert-Stage5NativeSchedulerObservation $native $context
+        foreach ($field in @('runId', 'runNonce', 'cohortNonce', 'executablePath', 'executableSha256', 'commandLine')) {
+            Assert-Stage5Condition ($native[$field] -is [string] -and
+                -not [string]::IsNullOrWhiteSpace($native[$field]) -and $native[$field] -ceq $binding[$field]) `
+                "$context native identity differs from its retained host observation."
+        }
+        $process = $native.process
+        Assert-Stage5DiagnosticCounter $run.ordinal "$context ordinal"
+        Assert-Stage5DiagnosticCounter $process.id "$context process id"
+        Assert-Stage5DiagnosticCounter $process.creationTimeUtc100ns "$context process creation time"
+        Assert-Stage5Condition ($process.id -gt 0 -and $process.creationTimeUtc100ns -gt 0 -and
+            $process.identityAvailable -is [bool] -and $process.identityAvailable -and
+            $process.exitCodeKnown -is [bool] -and $process.exitCodeKnown -and $process.exitCode -eq 0 -and
+            $process.id -eq $binding.processId -and $process.id -eq $run.processId -and
+            $process.creationTimeUtc100ns -eq $binding.processCreationTimeUtc100ns -and
+            $process.creationTimeUtc100ns -eq $run.processCreationTimeUtc100ns -and
+            $native.runId -ceq $run.runId -and
+            $run.fixtureId -is [string] -and -not [string]::IsNullOrWhiteSpace($run.fixtureId) -and
+            $run.lane -is [string] -and -not [string]::IsNullOrWhiteSpace($run.lane) -and
+            -not $seenProcesses.ContainsKey([string]$process.id) -and
+            -not $seenRunIds.ContainsKey($native.runId) -and -not $seenNonces.ContainsKey($native.runNonce) -and
+            $run.warmup -is [bool] -and (Test-Stage5JsonNumber $run.elapsedMilliseconds) -and
+            $run.elapsedMilliseconds -gt 0) "$context process identity, completion, or elapsed observation is invalid."
+        if ($null -eq $cohort) { $cohort = $native.cohortNonce }
+        Assert-Stage5Condition ($cohort -ceq $native.cohortNonce) "$context mixes execution cohorts."
+        $seenProcesses[[string]$process.id] = $true; $seenRunIds[$native.runId] = $true
+        $seenNonces[$native.runNonce] = $true; $seenReceipts[$receiptPath] = $true
+        $workload = $native.workload; $frames = $native.frames
+        Assert-Stage5Condition ($inputBindings.fixtures.ContainsKey([string]$native.fixture.id)) "$context fixture is not reviewed."
+        $reviewedFixture = $inputBindings.fixtures[$native.fixture.id]
+        Assert-Stage5Condition ($native.fixture.contentSha256 -ceq $reviewedFixture.sha256 -and
+            $native.fixture.seedKnown -is [bool] -and $native.fixture.seedKnown -and
+            (Test-Stage5JsonInteger $native.fixture.seed) -and $native.fixture.seed -eq $reviewedFixture.seed -and
+            [String]::Equals([IO.Path]::GetFullPath([string]$native.fixture.replayPath), $reviewedFixture.path, [StringComparison]::OrdinalIgnoreCase) -and
+            $native.fixture.requestedPlayerCount -eq $reviewedFixture.playerCount -and
+            $native.fixture.requestedMinimumUnitCount -eq $reviewedFixture.minimumUnitCount) `
+            "$context fixture identity does not match the independently reopened reviewed replay."
+        Assert-Stage5Condition ($native.worker.policy -is [string] -and @('auto', 'all') -ccontains $native.worker.policy -and
+            $native.worker.pinned -is [bool] -and $native.worker.pinned -and
+            $native.worker.effectiveCount -gt 0 -and $native.worker.effectiveCount -eq $native.worker.selectedWorkerCpuCount -and
+            $native.worker.selectedWorkerCpuCount -eq $native.worker.selectedWorkerPhysicalCoreCount -and
+            $native.worker.selectedWorkerPhysicalCoreMaskComplete -is [bool] -and $native.worker.selectedWorkerPhysicalCoreMaskComplete -and
+            $native.topology.source -ceq 'GetSystemCpuSetInformation' -and
+            $native.topology.selectedWorkerCpuSetIds -is [Array] -and
+            $native.topology.selectedWorkerCpuSetIds.Count -eq $native.worker.selectedWorkerCpuCount -and
+            $run.selectedWorkerCpuSetIds -is [Array] -and
+            (($run.selectedWorkerCpuSetIds | ConvertTo-Json -Compress) -ceq ($native.topology.selectedWorkerCpuSetIds | ConvertTo-Json -Compress)) -and
+            $run.selectedPhysicalCoreMask -ceq ([UInt64]$native.worker.selectedWorkerPhysicalCoreMask).ToString('X16')) `
+            "$context worker/topology observation is not bound to the selected production policy."
+        Assert-Stage5DiagnosticCounter $native.fixture.requestedPlayerCount "$context requested player count"
+        Assert-Stage5DiagnosticCounter $native.fixture.requestedMinimumUnitCount "$context requested minimum units"
+        foreach ($field in @('start', 'end', 'final', 'finalCrc')) {
+            Assert-Stage5DiagnosticCounter $frames[$field] "$context frame $field"
+        }
+        foreach ($field in @('sampleCount', 'firstFrame', 'lastFrame', 'playerCount',
+            'initialUnitCount', 'minimumUnitCount', 'peakUnitCount')) {
+            Assert-Stage5DiagnosticCounter $workload[$field] "$context workload $field"
+        }
+        Assert-Stage5Condition ($native.fixture.id -ceq $run.fixtureId -and
+            $native.fixture.requestedPlayerCount -eq 8 -and $workload.playerCount -eq 8 -and
+            $workload.sampling -ceq 'completed-simulation-frame-boundary-v1' -and
+            $workload.rosterStable -is [bool] -and $workload.rosterStable -and
+            $workload.contiguous -is [bool] -and $workload.contiguous -and
+            $frames.end -gt $frames.start -and $frames.final -eq $frames.end -and
+            $frames.finalCrcKnown -is [bool] -and $frames.finalCrcKnown -and
+            [decimal]$workload.sampleCount -eq ([decimal]$frames.end - [decimal]$frames.start) -and
+            $workload.firstFrame -eq ([decimal]$frames.start + 1) -and $workload.lastFrame -eq $frames.end -and
+            $native.fixture.requestedMinimumUnitCount -gt 0 -and
+            $workload.initialUnitCount -ge $native.fixture.requestedMinimumUnitCount -and
+            $workload.minimumUnitCount -le $workload.initialUnitCount -and
+            $workload.peakUnitCount -ge $workload.initialUnitCount) "$context completed-frame workload is inconsistent."
+        $raw = $native.rawEvidence
+        Assert-Stage5Condition ($raw.timingClosed -is [bool] -and $raw.timingClosed -and
+            $raw.timingWriteSucceeded -is [bool] -and $raw.timingWriteSucceeded -and
+            $raw.timingTruncated -is [bool] -and -not $raw.timingTruncated -and
+            $raw.timingComplete -is [bool] -and $raw.timingComplete -and
+            $raw.timingSessionCount -eq 1 -and $raw.timingFrameSamples -ge $workload.sampleCount -and
+            $raw.timingFirstFrame -le $frames.start -and $raw.timingLastFrame -ge $frames.end) `
+            "$context raw timing was not finalized with complete replay coverage."
+        foreach ($prefix in @('rawLog', 'timing')) {
+            $pathField = $prefix + 'Path'; $hashField = $prefix + 'Sha256'
+            Assert-Stage5Condition ($raw[$pathField] -ceq $binding[$pathField] -and
+                $raw[$hashField] -ceq $binding[$hashField] -and
+                $run[$pathField] -ceq $binding[$pathField] -and $run[$hashField] -ceq $binding[$hashField]) `
+                "$context raw file binding is inconsistent."
+            $rawPath = [IO.Path]::GetFullPath([string]$raw[$pathField])
+            Assert-Stage5FinalAcceptancePathContained $base $rawPath $context
+            $rawSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $rawPath "$context $prefix"
+            Assert-Stage5FinalAcceptanceSnapshotSha256 $rawSnapshot $raw[$hashField] "$context $prefix" | Out-Null
+        }
+        $frameTiming = $native.frameSimulation
+        foreach ($field in @('totalNanoseconds', 'maximumNanoseconds', 'sampleCount')) {
+            Assert-Stage5DiagnosticCounter $frameTiming[$field] "$context frame timing $field"
+        }
+        Assert-Stage5Condition ($frameTiming.totalNanoseconds -gt 0 -and
+            $frameTiming.maximumNanoseconds -gt 0 -and
+            $frameTiming.maximumNanoseconds -le $frameTiming.totalNanoseconds -and
+            $frameTiming.sampleCount -ge $workload.sampleCount -and
+            $native.phases -is [Array] -and $native.phases.Count -eq 5) "$context frame/phase timing is incomplete."
+        [decimal]$phaseTotal = 0
+        for ($phaseIndex = 0; $phaseIndex -lt 5; ++$phaseIndex) {
+            $phase = $native.phases[$phaseIndex]
+            foreach ($field in @('totalNanoseconds', 'maximumNanoseconds', 'sampleCount', 'serialNanoseconds')) {
+                Assert-Stage5DiagnosticCounter $phase[$field] "$context phase $field"
+            }
+            Assert-Stage5Condition ($phase.name -ceq $phaseNames[$phaseIndex] -and
+                $phase.available -is [bool] -and $phase.serialNanosecondsKnown -is [bool] -and
+                $phase.maximumNanoseconds -le $phase.totalNanoseconds -and
+                $phase.sampleCount -le $frameTiming.sampleCount -and
+                (($phase.serialNanosecondsKnown -and $phase.available -and $phase.serialNanoseconds -le $phase.totalNanoseconds) -or
+                    (-not $phase.serialNanosecondsKnown -and $phase.serialNanoseconds -eq 0)) -and
+                (($phase.available -and $phase.totalNanoseconds -gt 0 -and $phase.sampleCount -gt 0) -or
+                    (-not $phase.available -and $phase.totalNanoseconds -eq 0 -and $phase.sampleCount -eq 0))) `
+                "$context owner phase timing is inconsistent or fabricates unknown serial data."
+            $phaseTotal += [decimal]$phase.totalNanoseconds
+        }
+        Assert-Stage5Condition ($phaseTotal -le [decimal]$frameTiming.totalNanoseconds) "$context owner phases overlap frame time."
+        Assert-Stage5DiagnosticKernelTiming $native.kernelTiming $frames "$context kernel timing"
+        Assert-Stage5DiagnosticKernelReference $native.kernelReference $native.kernelTiming `
+            $frames $native.measurementRole "$context kernel reference"
+        $diagnostic = [pscustomobject]@{ fixtureId = $run.fixtureId; lane = $run.lane; ordinal = $run.ordinal
+            warmup = $run.warmup; elapsedMilliseconds = $run.elapsedMilliseconds
+            receipt = [pscustomobject]@{ path = $receiptPath; sha256 = $nativeHash }
+            runId = $native.runId; processId = $process.id; processCreationTimeUtc100ns = $process.creationTimeUtc100ns
+            requestedMinimumUnitCount = $native.fixture.requestedMinimumUnitCount
+            workload = $workload; frameSimulation = $frameTiming; phases = $native.phases; kernelTiming = $native.kernelTiming
+            measurementRole = $native.measurementRole; kernelReference = $native.kernelReference }
+        $nativeByRunId[$native.runId] = $native; $diagnosticsByRunId[$native.runId] = $diagnostic
+        if ($entries[$index].role -ceq 'throughput') { $runs += $diagnostic }
+    }
+    $pairedDiagnostics = @(); $kernelSamples = @(); $allKernelCoverage = $true
+    foreach ($throughput in $runs) {
+        if (-not $pairsByThroughput.ContainsKey($throughput.runId)) { continue }
+        $oracleRun = $pairsByThroughput[$throughput.runId]
+        $oracle = $diagnosticsByRunId[$oracleRun.runId]
+        $left = $nativeByRunId[$throughput.runId]; $right = $nativeByRunId[$oracleRun.runId]
+        $context = "Performance pair '$($throughput.runId)'"
+        Assert-Stage5Condition ($throughput.fixtureId -ceq $oracle.fixtureId -and $throughput.lane -ceq $oracle.lane -and
+            $throughput.ordinal -eq $oracle.ordinal -and $throughput.warmup -eq $oracle.warmup -and
+            $throughput.processCreationTimeUtc100ns -ne $oracle.processCreationTimeUtc100ns) "$context scheduled identity differs."
+        foreach ($field in @('commandLine', 'cohortCreatedUtc', 'cohortNonce', 'architecture')) {
+            Assert-Stage5Condition ($left[$field] -ceq $right[$field]) "$context production $field does not match."
+        }
+        foreach ($field in @('fixture', 'workload', 'frames', 'worker', 'topology')) {
+            Assert-Stage5Condition (($left[$field] | ConvertTo-Json -Depth 30 -Compress) -ceq
+                ($right[$field] | ConvertTo-Json -Depth 30 -Compress)) "$context production $field does not match."
+        }
+        $leftStreams = $left.kernelReference.streams; $rightStreams = $right.kernelReference.streams
+        Assert-Stage5Condition ($leftStreams.Count -gt 0 -and $leftStreams.Count -eq $rightStreams.Count) "$context canonical reference stream coverage is missing."
+        $oracleStreams = @{}; $timingStreams = @{}; $oracleTimingStreams = @{}
+        foreach ($stream in $rightStreams) { $oracleStreams["$($stream.name)|$($stream.subtype)"] = $stream }
+        foreach ($stream in $left.kernelTiming.streams) { $timingStreams["$($stream.name)|$($stream.subtype)"] = $stream }
+        foreach ($stream in $right.kernelTiming.streams) { $oracleTimingStreams["$($stream.name)|$($stream.subtype)"] = $stream }
+        Assert-Stage5Condition ($timingStreams.Count -eq $oracleTimingStreams.Count) "$context timing stream coverage differs."
+        foreach ($key in $timingStreams.Keys) {
+            Assert-Stage5Condition ($oracleTimingStreams.ContainsKey($key)) "$context timing stream is unmatched."
+            foreach ($field in @('attemptedBatches', 'admittedBatches', 'committedBatches', 'abortedBatches', 'firstFrame', 'lastFrame')) {
+                Assert-Stage5Condition ($timingStreams[$key][$field] -eq $oracleTimingStreams[$key][$field]) "$context timing disposition does not match."
+            }
+        }
+        $sampleByKernel = @{}; $committedReferences = @{}
+        foreach ($stream in $leftStreams) {
+            $key = "$($stream.name)|$($stream.subtype)"
+            Assert-Stage5Condition ($oracleStreams.ContainsKey($key)) "$context canonical reference stream is unmatched."
+            $matched = $oracleStreams[$key]
+            foreach ($field in @('name', 'subtype', 'fieldSchema', 'firstFrame', 'lastFrame', 'validatedBatchCount',
+                'committedBatchCount', 'abortedBatchCount', 'validatedOperationCount', 'committedOperationCount',
+                'inputSha256', 'outputSha256', 'commitSha256')) {
+                Assert-Stage5Condition ($stream[$field] -ceq $matched[$field]) "$context canonical reference $field does not match."
+            }
+            if ($stream.committedBatchCount -gt 0) { $committedReferences[$key] = $true }
+            if (-not $sampleByKernel.ContainsKey($stream.name)) {
+                $sampleByKernel[$stream.name] = [pscustomobject]@{ fixtureId = $throughput.fixtureId; lane = $throughput.lane
+                    name = $stream.name; pipelineNanoseconds = [decimal]0; serialNanoseconds = [decimal]0; committedBatches = [decimal]0 }
+            }
+            $sample = $sampleByKernel[$stream.name]
+            # Sum actual per-run exclusive components/subtypes before taking a
+            # median. Inclusive oracle latency never enters this denominator.
+            foreach ($stage in $timingStreams[$key].stages) { $sample.pipelineNanoseconds += [decimal]$stage.totalNanoseconds }
+            $sample.serialNanoseconds += [decimal]$matched.serialNanoseconds
+            $sample.committedBatches += [decimal]$stream.committedBatchCount
+        }
+        if (-not $throughput.warmup) {
+            foreach ($name in @('physics', 'status', 'collision', 'ai-planning', 'spatial', 'path')) {
+                if (-not $sampleByKernel.ContainsKey($name) -or $sampleByKernel[$name].committedBatches -eq 0) { $allKernelCoverage = $false }
+            }
+            foreach ($key in $timingStreams.Keys) {
+                if ($timingStreams[$key].committedBatches -gt 0 -and -not $committedReferences.ContainsKey($key)) { $allKernelCoverage = $false }
+            }
+            foreach ($sample in $sampleByKernel.Values) { $kernelSamples += $sample }
+        }
+        $pairedDiagnostics += [pscustomobject]@{ throughputRunId = $throughput.runId; oracleRun = $oracle }
+    }
+    $kernelComparisons = @()
+    foreach ($group in @($kernelSamples | Group-Object fixtureId, lane, name | Sort-Object Name)) {
+        $pipeline = Get-Stage5Median @($group.Group | ForEach-Object { [double]$_.pipelineNanoseconds })
+        $serial = Get-Stage5Median @($group.Group | ForEach-Object { [double]$_.serialNanoseconds })
+        $ratioKnown = $pipeline -gt 0 -and $serial -gt 0
+        $kernelComparisons += [pscustomobject]@{ fixtureId = $group.Group[0].fixtureId; lane = $group.Group[0].lane
+            name = $group.Group[0].name; measuredPairs = $group.Count; medianPipelineNanoseconds = $pipeline
+            medianSerialNanoseconds = $serial; netSpeedupKnown = $ratioKnown
+            netSpeedup = $(if ($ratioKnown) { $serial / $pipeline } else { $null }) }
+    }
+    $lanes = @()
+    foreach ($group in @($runs | Group-Object fixtureId, lane)) {
+        $measured = @($group.Group | Where-Object { -not $_.warmup })
+        Assert-Stage5Condition ($measured.Count -gt 0) 'Performance diagnostics contain a lane without a measured run.'
+        $lanes += [pscustomobject]@{ fixtureId = $measured[0].fixtureId; lane = $measured[0].lane
+            measuredRuns = $measured.Count; warmupRuns = $group.Count - $measured.Count
+            medianElapsedMilliseconds = Get-Stage5Median @($measured | ForEach-Object { [double]$_.elapsedMilliseconds }) }
+    }
+    if ($RequireAcceptance) {
+        throw 'V5 diagnostics cannot establish scaling acceptance: independent whole-frame phase serial coverage remains unavailable.'
+    }
+    return [pscustomobject]@{
+        schemaVersion = 3; evidenceKind = 'stage5-performance-scaling-diagnostics'; status = 'diagnostic'
+        finalAcceptanceClaim = $false; qualificationMode = $aggregate.qualificationMode
+        sourceCommit = $ExpectedSourceCommit; artifactSetSha256 = $ExpectedArtifactSetSha256
+        executableSha256 = $ExpectedExecutableSha256; title = $ExpectedTitle
+        measurementMode = 'headless-throughput'; installedRuntime = $true
+        hostAggregate = [pscustomobject]@{ path = $full; sha256 = $hostHash }
+        referencePolicy = $aggregate.referencePolicy
+        blockedBy = @('phase-serial-coverage-unknown') + $(if ($pairedDiagnostics.Count -eq 0) {
+            @('same-input-serial-reference-unavailable')
+        } elseif (-not $allKernelCoverage) { @('kernel-reference-coverage-incomplete') } else { @() })
+        lanes = $lanes; runs = $runs; pairedOracleBindings = $pairedDiagnostics; kernelComparisons = $kernelComparisons
     }
 }
 
@@ -5233,7 +6020,7 @@ function Read-Stage5PerformanceScalingEvidence {
         'measurementMode', 'installedRuntime', 'selectedLanes', 'oneWorkerPhases',
         'amdahl', 'kernelTimings', 'fixtures') `
         'Stage 5 scaling evidence'
-    Assert-Stage5Condition ((Get-Stage5JsonValue $document 'schemaVersion' 'Stage 5 scaling evidence') -eq 1 -and
+    Assert-Stage5Condition ((Get-Stage5JsonValue $document 'schemaVersion' 'Stage 5 scaling evidence') -eq 2 -and
         (Get-Stage5JsonValue $document 'evidenceKind' 'Stage 5 scaling evidence') -ceq
             'stage5-performance-scaling' -and
         (Get-Stage5JsonValue $document 'status' 'Stage 5 scaling evidence') -ceq 'passed' -and
@@ -5319,29 +6106,30 @@ function Read-Stage5PerformanceScalingEvidence {
     }
 
     $phases = Get-Stage5JsonValue $document 'oneWorkerPhases' 'Stage 5 scaling evidence'
-    $phaseNames = @('owner-intake', 'world-queries', 'pathfinding', 'object-computation',
-        'spatial-work', 'deterministic-commit', 'verification-publication')
+    $phaseNames = @('owner-intake', 'legacy-mutable-island', 'spatial-work',
+        'owner-tail', 'verification-publication')
     Assert-Stage5Condition ($phases -is [Array] -and $phases.Count -eq $phaseNames.Count) `
         'Stage 5 scaling evidence requires exact one-worker timing for all simulation phases.'
-    [double]$totalOne = 0.0
-    [double]$totalSerial = 0.0
+    [double]$totalOne = $raw.totalOneWorkerMilliseconds
+    [double]$totalSerial = $raw.totalSerialMilliseconds
     for ($phaseIndex = 0; $phaseIndex -lt $phaseNames.Count; ++$phaseIndex) {
         $phase = $phases[$phaseIndex]
         $context = "Stage 5 one-worker phase $phaseIndex"
-        Assert-Stage5JsonShape $phase @('name', 'elapsedMilliseconds', 'serialMilliseconds') $context
+        Assert-Stage5JsonShape $phase @('name', 'elapsedMilliseconds', 'serialMilliseconds',
+            'serialMillisecondsKnown') $context
         $elapsed = Get-Stage5JsonValue $phase 'elapsedMilliseconds' $context
         $serial = Get-Stage5JsonValue $phase 'serialMilliseconds' $context
         Assert-Stage5Condition ((Get-Stage5JsonValue $phase 'name' $context) -ceq
             $phaseNames[$phaseIndex] -and (Test-Stage5JsonNumber $elapsed) -and
             [double]$elapsed -gt 0.0 -and (Test-Stage5JsonNumber $serial) -and
             [double]$serial -ge 0.0 -and [double]$serial -le [double]$elapsed -and
+            (Get-Stage5JsonValue $phase 'serialMillisecondsKnown' $context) -is [bool] -and
+            (Get-Stage5JsonValue $phase 'serialMillisecondsKnown' $context) -and
             [Math]::Abs([double]$elapsed -
                 [double]$raw.phases[$phaseIndex].elapsedMilliseconds) -le 0.0001 -and
             [Math]::Abs([double]$serial -
                 [double]$raw.phases[$phaseIndex].serialMilliseconds) -le 0.0001) `
             "$context timing does not match the raw per-repeat median."
-        $totalOne += [double]$elapsed
-        $totalSerial += [double]$serial
     }
     $amdahl = Get-Stage5JsonValue $document 'amdahl' 'Stage 5 scaling evidence'
     Assert-Stage5JsonShape $amdahl @('totalOneWorkerMilliseconds', 'totalSerialMilliseconds',
@@ -5375,23 +6163,25 @@ function Read-Stage5PerformanceScalingEvidence {
         Assert-Stage5JsonShape $kernel @('name', 'admittedSlices', 'captureMilliseconds',
             'scheduleMilliseconds', 'waitMilliseconds', 'validateMilliseconds',
             'commitMilliseconds', 'totalParallelMilliseconds', 'exactSerialOperationMilliseconds',
-            'netSpeedup') $context
+            'exactSerialOperationMillisecondsKnown', 'timingAttribution', 'netSpeedup') $context
         $admitted = Get-Stage5JsonValue $kernel 'admittedSlices' $context
         $parts = @('captureMilliseconds', 'scheduleMilliseconds', 'waitMilliseconds',
             'validateMilliseconds', 'commitMilliseconds')
-        [double]$parallelTotal = 0.0
         foreach ($part in $parts) {
             $value = Get-Stage5JsonValue $kernel $part $context
             Assert-Stage5Condition ((Test-Stage5JsonNumber $value) -and [double]$value -ge 0.0) `
                 "$context $part is invalid."
-            $parallelTotal += [double]$value
         }
         $reportedParallel = Get-Stage5JsonValue $kernel 'totalParallelMilliseconds' $context
         $serialOperation = Get-Stage5JsonValue $kernel 'exactSerialOperationMilliseconds' $context
         $netSpeedup = Get-Stage5JsonValue $kernel 'netSpeedup' $context
         $rawKernel = $raw.kernels[$kernelIndex]
+        [double]$parallelTotal = $rawKernel.totalParallelMilliseconds
         Assert-Stage5Condition ((Get-Stage5JsonValue $kernel 'name' $context) -ceq
             $kernelNames[$kernelIndex] -and (Test-Stage5JsonInteger $admitted) -and
+            (Get-Stage5JsonValue $kernel 'exactSerialOperationMillisecondsKnown' $context) -is [bool] -and
+            (Get-Stage5JsonValue $kernel 'exactSerialOperationMillisecondsKnown' $context) -and
+            (Get-Stage5JsonValue $kernel 'timingAttribution' $context) -ceq 'owner-stack-exclusive-v1' -and
             [int]$admitted -eq $rawKernel.admittedSlices -and
             [Math]::Abs([double](Get-Stage5JsonValue $kernel 'captureMilliseconds' $context) -
                 [double]$rawKernel.captureMilliseconds) -le 0.0001 -and
@@ -5427,6 +6217,7 @@ function Read-Stage5PerformanceScalingEvidence {
         $fixture = $fixtures[$fixtureIndex]
         $context = "Stage 5 scaling fixture $fixtureIndex"
         Assert-Stage5JsonShape $fixture @('name', 'playerCount', 'peakUnitCount', 'repeats',
+            'requestedMinimumUnitCount', 'minimumInitialUnitCount',
             'stage3OneWorkerMilliseconds', 'stage5OneWorkerMilliseconds',
             'eightPhysicalCoreMilliseconds', 'sixteenPhysicalCoreMilliseconds',
             'oneWorkerRegressionRatio', 'eightPhysicalCoreSpeedup', 'eightToSixteenSpeedup') $context
@@ -5453,6 +6244,10 @@ function Read-Stage5PerformanceScalingEvidence {
             [int]$players -eq 8 -and (Test-Stage5JsonInteger $units) -and
             [int]$units -eq $rawFixture.peakUnitCount -and
             [int]$units -ge $minimumUnits[$fixtureIndex] -and
+            (Get-Stage5JsonValue $fixture 'requestedMinimumUnitCount' $context) -eq
+                $rawFixture.requestedMinimumUnitCount -and
+            (Get-Stage5JsonValue $fixture 'minimumInitialUnitCount' $context) -eq
+                $rawFixture.minimumInitialUnitCount -and
             (Test-Stage5JsonInteger $repeats) -and [int]$repeats -eq $raw.repeatCount -and
             [Math]::Abs([double]$stage3 - [double]$rawFixture.stage3OneWorkerMilliseconds) -le 0.0001 -and
             [Math]::Abs([double]$stage5 - [double]$rawFixture.stage5OneWorkerMilliseconds) -le 0.0001 -and
@@ -7692,6 +8487,7 @@ function Invoke-Stage5FinalAcceptanceAggregation {
 # .psm1 file into a caller scope, where Export-ModuleMember is invalid and the
 # private commands are unavailable.
 Export-ModuleMember -Function ConvertFrom-Stage5JsonDictionary, Get-Stage5JsonValue, `
+    Assert-Stage5NativePerformanceReceiptProvenance, `
     Assert-Stage5JsonShape, Test-Stage5JsonInteger, Get-Stage5UInt64BitCount, Get-Stage5FileSha256, `
     ConvertFrom-Stage5AiCompletion, ConvertFrom-Stage5ReplayMetrics, `
     ConvertFrom-Stage5ReplayResult, Get-Stage5TimingEvidence, Assert-Stage5AiDeterminism, Assert-Stage5ReplayDeterminism, `
@@ -7700,5 +8496,5 @@ Export-ModuleMember -Function ConvertFrom-Stage5JsonDictionary, Get-Stage5JsonVa
     Invoke-Stage5RegistrySetupTransaction, `
     Test-Stage5RegistryLeafRemoval, Invoke-Stage5CreatedRegistryKeyCleanup, `
     Invoke-Stage5FinalAcceptanceAggregation, Read-Stage5Net3LoopbackEvidence, `
-    Read-Stage5PerformanceScalingEvidence, Read-Stage5FinalAcceptanceImmutableReceipt, `
+    Read-Stage5PerformanceScalingEvidence, ConvertTo-Stage5PerformanceDiagnostics, Read-Stage5FinalAcceptanceImmutableReceipt, `
     Read-Stage5LockstepV2Evidence, Get-Stage5RuntimeClosureBinding

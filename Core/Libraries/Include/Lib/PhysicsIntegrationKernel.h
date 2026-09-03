@@ -5,6 +5,10 @@
 */
 #pragma once
 
+#if defined(_WIN64)
+#include "Lib/KernelPerformanceReference.h"
+#endif
+
 namespace rts
 {
 #if defined(_MSC_VER) && _MSC_VER < 1300
@@ -121,6 +125,17 @@ struct PhysicsIntegrationOptions
 	unsigned minimumGrain;
 	PhysicsIntegrationTestFault testFault;
 	unsigned testOrdinal;
+#if defined(_WIN64)
+	// Optional owner token for observational kernel timing. VC6 keeps the
+	// historical options layout and behavior unchanged.
+	performance::KernelPerformanceBatch performanceBatch;
+	// Optional reference evidence is injected by the owner. The kernel leaves
+	// these inert until a native reference mode is active.
+	performance::KernelPerformanceReferenceLedger *performanceReferenceLedger;
+	performance::KernelPerformanceReferenceBatch *performanceReferenceBatch;
+	PhysicsIntegrationOutput *performanceReferenceOutput;
+	unsigned performanceReferenceOutputCapacity;
+#endif
 };
 
 struct PhysicsIntegrationMetrics

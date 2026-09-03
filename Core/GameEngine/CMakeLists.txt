@@ -23,6 +23,8 @@ set(GAMEENGINE_SRC
     Include/Common/CommandLine.h
     Include/Common/DeterministicCrcLiveVerifier.h
     Include/Common/SkirmishAITestRunner.h
+    Include/Common/Stage5PerformanceFixtureContract.h
+    Include/Common/Stage5PerformanceFixtureRunner.h
     Include/GameLogic/ImmutableSpatialQueryRuntime.h
     Include/Common/crc.h
     Include/Common/CRCDebug.h
@@ -580,6 +582,7 @@ set(GAMEENGINE_SRC
 #    Source/Common/BitFlags.cpp
     Source/Common/CommandLine.cpp
     Source/Common/SkirmishAITestRunner.cpp
+    Source/Common/Stage5PerformanceFixtureRunner.cpp
     Source/Common/crc.cpp
     Source/Common/CRCDebug.cpp
     Source/Common/DamageFX.cpp

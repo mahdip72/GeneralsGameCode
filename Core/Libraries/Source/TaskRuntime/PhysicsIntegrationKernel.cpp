@@ -274,6 +274,193 @@ bool validOutputValues(const PhysicsIntegrationOutput &output)
 			static_cast<unsigned>(sizeof(scalarValues) / sizeof(scalarValues[0])));
 }
 
+#if defined(_WIN64)
+/* Reference schema 1: batch sequence=1; snapshot scalars=2..9,
+** matrix/position/acceleration/velocity sequences=10/12/14/16 with value
+** tags=11/13/15/17, then rates/gravity/material/direction=18..29. Output
+** uses batch sequence=1, the same identity scalars=2..9, matrix/acceleration/
+** velocity sequences=10/12/14 with value tags=11/13/15, then rates=16..18.
+*/
+enum { PHYSICS_REFERENCE_FIELD_SCHEMA = 1 };
+
+struct PhysicsReferenceInput
+{
+	const PhysicsIntegrationSnapshot *snapshots;
+	unsigned count;
+};
+
+struct PhysicsReferenceOutput
+{
+	PhysicsIntegrationOutput *outputs;
+	unsigned count;
+	unsigned capacity;
+};
+
+bool writePhysicsReferenceSnapshot(
+	performance::KernelPerformanceCanonicalWriter &writer,
+	const PhysicsIntegrationSnapshot &snapshot)
+{
+	if (!writer.u32(2, snapshot.frame) ||
+		!writer.u32(3, snapshot.worldEpoch) ||
+		!writer.u32(4, snapshot.objectID) ||
+		!writer.u32(5, snapshot.motionGeneration) ||
+		!writer.u32(6, snapshot.physicsGeneration) ||
+		!writer.u32(7, snapshot.wakePriority) ||
+		!writer.u32(8, snapshot.heapOrdinal) ||
+		!writer.u32(9, snapshot.flags) ||
+		!writer.sequence(10, PHYSICS_INTEGRATION_MATRIX_FLOATS))
+		return false;
+	for (unsigned index = 0; index != PHYSICS_INTEGRATION_MATRIX_FLOATS;
+		++index)
+		if (!writer.f32(11, snapshot.matrix[index])) return false;
+	if (!writer.sequence(12, PHYSICS_INTEGRATION_VECTOR_FLOATS)) return false;
+	for (unsigned index = 0; index != PHYSICS_INTEGRATION_VECTOR_FLOATS;
+		++index)
+		if (!writer.f32(13, snapshot.position[index])) return false;
+	if (!writer.sequence(14, PHYSICS_INTEGRATION_VECTOR_FLOATS)) return false;
+	for (unsigned index = 0; index != PHYSICS_INTEGRATION_VECTOR_FLOATS;
+		++index)
+		if (!writer.f32(15, snapshot.acceleration[index])) return false;
+	if (!writer.sequence(16, PHYSICS_INTEGRATION_VECTOR_FLOATS)) return false;
+	for (unsigned index = 0; index != PHYSICS_INTEGRATION_VECTOR_FLOATS;
+		++index)
+		if (!writer.f32(17, snapshot.velocity[index])) return false;
+	return writer.f32(18, snapshot.yawRate) &&
+		writer.f32(19, snapshot.rollRate) &&
+		writer.f32(20, snapshot.pitchRate) &&
+		writer.f32(21, snapshot.gravity) &&
+		writer.f32(22, snapshot.mass) &&
+		writer.f32(23, snapshot.forwardFriction) &&
+		writer.f32(24, snapshot.lateralFriction) &&
+		writer.f32(25, snapshot.aerodynamicFriction) &&
+		writer.f32(26, snapshot.pitchRollYawFactor) &&
+		writer.f32(27, snapshot.centerOfMassOffset) &&
+		writer.f32(28, snapshot.directionX) &&
+		writer.f32(29, snapshot.directionY);
+}
+
+bool writePhysicsReferenceInput(
+	performance::KernelPerformanceCanonicalWriter &writer, const void *context)
+{
+	const PhysicsReferenceInput &input =
+		*static_cast<const PhysicsReferenceInput *>(context);
+	if (input.snapshots == 0 || input.count == 0 ||
+		!writer.sequence(1, input.count))
+		return false;
+	for (unsigned index = 0; index != input.count; ++index)
+		if (!writePhysicsReferenceSnapshot(writer, input.snapshots[index]))
+			return false;
+	return true;
+}
+
+bool writePhysicsReferenceOutput(
+	performance::KernelPerformanceCanonicalWriter &writer, const void *context)
+{
+	const PhysicsReferenceOutput &output =
+		*static_cast<const PhysicsReferenceOutput *>(context);
+	if (output.outputs == 0 || output.count == 0 ||
+		!writer.sequence(1, output.count))
+		return false;
+	for (unsigned index = 0; index != output.count; ++index)
+	{
+		const PhysicsIntegrationOutput &value = output.outputs[index];
+		if (!writer.u32(2, value.frame) ||
+			!writer.u32(3, value.worldEpoch) ||
+			!writer.u32(4, value.objectID) ||
+			!writer.u32(5, value.motionGeneration) ||
+			!writer.u32(6, value.physicsGeneration) ||
+			!writer.u32(7, value.wakePriority) ||
+			!writer.u32(8, value.heapOrdinal) ||
+			!writer.u32(9, value.flags) ||
+			!writer.sequence(10, PHYSICS_INTEGRATION_MATRIX_FLOATS))
+			return false;
+		for (unsigned element = 0;
+			element != PHYSICS_INTEGRATION_MATRIX_FLOATS; ++element)
+			if (!writer.f32(11, value.matrix[element])) return false;
+		if (!writer.sequence(12, PHYSICS_INTEGRATION_VECTOR_FLOATS))
+			return false;
+		for (unsigned element = 0;
+			element != PHYSICS_INTEGRATION_VECTOR_FLOATS; ++element)
+			if (!writer.f32(13, value.acceleration[element])) return false;
+		if (!writer.sequence(14, PHYSICS_INTEGRATION_VECTOR_FLOATS))
+			return false;
+		for (unsigned element = 0;
+			element != PHYSICS_INTEGRATION_VECTOR_FLOATS; ++element)
+			if (!writer.f32(15, value.velocity[element])) return false;
+		if (!writer.f32(16, value.yawRate) ||
+			!writer.f32(17, value.rollRate) ||
+			!writer.f32(18, value.pitchRate))
+			return false;
+	}
+	return true;
+}
+
+bool computePhysicsReferenceSerial(const void *immutableInput,
+	void *detachedOutput)
+{
+	const PhysicsReferenceInput &input =
+		*static_cast<const PhysicsReferenceInput *>(immutableInput);
+	PhysicsReferenceOutput &output =
+		*static_cast<PhysicsReferenceOutput *>(detachedOutput);
+	if (input.snapshots == 0 || input.count == 0 || output.outputs == 0 ||
+		output.capacity < input.count)
+		return false;
+	for (unsigned index = 0; index != input.count; ++index)
+		if (!ComputePhysicsIntegrationPrefix(input.snapshots[index],
+			output.outputs[index]))
+			return false;
+	output.count = input.count;
+	return true;
+}
+
+void observePhysicsReferenceBatch(const PhysicsIntegrationOptions &options,
+	const PhysicsIntegrationSnapshot *snapshots, unsigned count,
+	PhysicsIntegrationOutput *outputs)
+{
+	if (options.performanceReferenceBatch == 0)
+		return;
+	*options.performanceReferenceBatch =
+		performance::KernelPerformanceReferenceBatch();
+	if (options.performanceReferenceLedger == 0 ||
+		options.performanceBatch.valid() == false)
+		return;
+	const performance::KernelPerformanceReferenceMode mode =
+		options.performanceReferenceLedger->mode();
+	if (mode == performance::KERNEL_REFERENCE_DISABLED)
+		return;
+	performance::KernelPerformanceBatchIdentity identity;
+	if (!performance::KernelPerformanceLedger::instance().describeBatch(
+		options.performanceBatch, identity) ||
+		identity.kernel != performance::KERNEL_PERFORMANCE_PHYSICS ||
+		identity.subtype != 0)
+		return;
+	PhysicsReferenceInput input;
+	input.snapshots = snapshots;
+	input.count = count;
+	PhysicsReferenceOutput production;
+	production.outputs = outputs;
+	production.count = count;
+	production.capacity = count;
+	PhysicsReferenceOutput detached;
+	detached.outputs = mode == performance::KERNEL_REFERENCE_SERIAL_ORACLE ?
+		options.performanceReferenceOutput : 0;
+	detached.count = 0;
+	detached.capacity = options.performanceReferenceOutputCapacity;
+	const performance::KernelPerformanceSerialCallback serialCompute =
+		mode == performance::KERNEL_REFERENCE_SERIAL_ORACLE ?
+		computePhysicsReferenceSerial : 0;
+	void *detachedContext =
+		mode == performance::KERNEL_REFERENCE_SERIAL_ORACLE ?
+		&detached : 0;
+	*options.performanceReferenceBatch =
+		options.performanceReferenceLedger->observeValidatedBatch(
+		identity.kernel, identity.subtype, identity.frame, identity.ordinal,
+		PHYSICS_REFERENCE_FIELD_SCHEMA, count, writePhysicsReferenceInput,
+		&input, writePhysicsReferenceOutput, &production, serialCompute,
+		detachedContext);
+}
+#endif
+
 struct PhysicsIntegrationExecutionRecord
 {
 	PhysicsIntegrationExecutionRecord()
@@ -387,6 +574,11 @@ PhysicsIntegrationBatchResult fallback(JobSystem *jobs,
 PhysicsIntegrationOptions::PhysicsIntegrationOptions()
 	: minimumGrain(PHYSICS_INTEGRATION_DEFAULT_MINIMUM_GRAIN),
 	  testFault(PHYSICS_INTEGRATION_TEST_NO_FAULT), testOrdinal(0)
+#if defined(_WIN64)
+	, performanceBatch(), performanceReferenceLedger(0),
+	performanceReferenceBatch(0), performanceReferenceOutput(0),
+	performanceReferenceOutputCapacity(0)
+#endif
 {
 }
 
@@ -694,93 +886,108 @@ PhysicsIntegrationBatchResult PreparePhysicsIntegrationPrefixes(
 	if (rangeCount <= 1)
 		return PHYSICS_INTEGRATION_POLICY_INELIGIBLE;
 
-	if (rangeCount > static_cast<unsigned>(~static_cast<unsigned>(0)) /
-		(sizeof(JobSubmission) + sizeof(JobHandle) +
-		 sizeof(PhysicsIntegrationJob *) + sizeof(PhysicsIntegrationJob) +
-		 sizeof(PhysicsIntegrationExecutionRecord)))
-		return fallback(&jobs, *metrics);
-	metrics->allocatedBytes = rangeCount * static_cast<unsigned>(
-		sizeof(JobSubmission) + sizeof(JobHandle) +
-		sizeof(PhysicsIntegrationJob *) + sizeof(PhysicsIntegrationJob) +
-		sizeof(PhysicsIntegrationExecutionRecord));
-	if (options.testFault == PHYSICS_INTEGRATION_TEST_ALLOCATION_FAILURE)
-		return fallback(&jobs, *metrics);
-	JobSubmission *submissions = new (std::nothrow) JobSubmission[rangeCount];
-	JobHandle *handles = new (std::nothrow) JobHandle[rangeCount];
-	PhysicsIntegrationJob **jobPointers = new (std::nothrow)
-		PhysicsIntegrationJob *[rangeCount];
-	PhysicsIntegrationExecutionRecord *executions = new (std::nothrow)
-		PhysicsIntegrationExecutionRecord[rangeCount];
-	if (submissions == 0 || handles == 0 || jobPointers == 0 || executions == 0)
-	{
-		delete[] submissions;
-		delete[] handles;
-		delete[] jobPointers;
-		delete[] executions;
-		return fallback(&jobs, *metrics);
-	}
-	for (unsigned pointerIndex = 0; pointerIndex != rangeCount; ++pointerIndex)
-		jobPointers[pointerIndex] = 0;
-
+	JobSubmission *submissions = 0;
+	JobHandle *handles = 0;
+	PhysicsIntegrationJob **jobPointers = 0;
+	PhysicsIntegrationExecutionRecord *executions = 0;
 	JobGroup group;
-	if (options.testFault != PHYSICS_INTEGRATION_TEST_GROUP_FAILURE)
-		group = jobs.createGroup();
-	if (!group.isValid())
-	{
-		delete[] submissions;
-		delete[] handles;
-		delete[] jobPointers;
-		delete[] executions;
-		return fallback(&jobs, *metrics);
-	}
-
 	const JobFloatingPointState floatingPointState;
 	PhysicsJobAtomicUnsigned activePhysicalWorkers(0);
 	PhysicsJobAtomicUnsigned peakPhysicalWorkers(0);
 	bool jobsReady = true;
-	for (unsigned rangeIndex = 0; rangeIndex != rangeCount; ++rangeIndex)
-	{
-		JobRange range;
-		if (!JobSystem::rangeForIndex(snapshotCount, rangeCount, rangeIndex, range))
-		{
-			jobsReady = false;
-			break;
-		}
-		if (options.testFault == PHYSICS_INTEGRATION_TEST_JOB_ALLOCATION_FAILURE &&
-			rangeIndex == options.testOrdinal)
-		{
-			jobsReady = false;
-			break;
-		}
-		jobPointers[rangeIndex] = new (std::nothrow) PhysicsIntegrationJob(
-			snapshots, scratch, rangeIndex, range.begin, range.end,
-			floatingPointState, options.testFault, options.testOrdinal,
-			executions + rangeIndex, &activePhysicalWorkers,
-			&peakPhysicalWorkers);
-		if (jobPointers[rangeIndex] == 0)
-		{
-			jobsReady = false;
-			break;
-		}
-		submissions[rangeIndex].job = jobPointers[rangeIndex];
-		submissions[rangeIndex].priority = JOB_PRIORITY_FRAME_CRITICAL;
-	}
-
 	bool admitted = false;
-	if (jobsReady && !(options.testFault == PHYSICS_INTEGRATION_TEST_ADMISSION_FAILURE &&
-		options.testOrdinal < rangeCount))
-		admitted = jobs.trySubmitBatch(submissions, rangeCount, group, handles);
-	if (!admitted)
+#if defined(_WIN64)
+	performance::KernelPerformanceLedger *performanceLedger =
+		options.performanceBatch.valid() ?
+		&performance::KernelPerformanceLedger::instance() : 0;
+#endif
 	{
-		for (unsigned cleanupIndex = 0; cleanupIndex != rangeCount; ++cleanupIndex)
-			delete jobPointers[cleanupIndex];
-		delete[] submissions;
-		delete[] handles;
-		delete[] jobPointers;
-		delete[] executions;
-		return fallback(&jobs, *metrics);
+#if defined(_WIN64)
+		performance::KernelPerformanceScope scheduleScope(performanceLedger,
+			options.performanceBatch, performance::KERNEL_PERFORMANCE_SCHEDULE);
+#endif
+		if (rangeCount > static_cast<unsigned>(~static_cast<unsigned>(0)) /
+			(sizeof(JobSubmission) + sizeof(JobHandle) +
+			 sizeof(PhysicsIntegrationJob *) + sizeof(PhysicsIntegrationJob) +
+			 sizeof(PhysicsIntegrationExecutionRecord)))
+			return fallback(&jobs, *metrics);
+		metrics->allocatedBytes = rangeCount * static_cast<unsigned>(
+			sizeof(JobSubmission) + sizeof(JobHandle) +
+			sizeof(PhysicsIntegrationJob *) + sizeof(PhysicsIntegrationJob) +
+			sizeof(PhysicsIntegrationExecutionRecord));
+		if (options.testFault == PHYSICS_INTEGRATION_TEST_ALLOCATION_FAILURE)
+			return fallback(&jobs, *metrics);
+		submissions = new (std::nothrow) JobSubmission[rangeCount];
+		handles = new (std::nothrow) JobHandle[rangeCount];
+		jobPointers = new (std::nothrow)
+			PhysicsIntegrationJob *[rangeCount];
+		executions = new (std::nothrow)
+			PhysicsIntegrationExecutionRecord[rangeCount];
+		if (submissions == 0 || handles == 0 || jobPointers == 0 || executions == 0)
+		{
+			delete[] submissions;
+			delete[] handles;
+			delete[] jobPointers;
+			delete[] executions;
+			return fallback(&jobs, *metrics);
+		}
+		for (unsigned pointerIndex = 0; pointerIndex != rangeCount; ++pointerIndex)
+			jobPointers[pointerIndex] = 0;
+
+		if (options.testFault != PHYSICS_INTEGRATION_TEST_GROUP_FAILURE)
+			group = jobs.createGroup();
+		if (!group.isValid())
+		{
+			delete[] submissions;
+			delete[] handles;
+			delete[] jobPointers;
+			delete[] executions;
+			return fallback(&jobs, *metrics);
+		}
+
+		for (unsigned rangeIndex = 0; rangeIndex != rangeCount; ++rangeIndex)
+		{
+			JobRange range;
+			if (!JobSystem::rangeForIndex(snapshotCount, rangeCount, rangeIndex, range))
+			{
+				jobsReady = false;
+				break;
+			}
+			if (options.testFault == PHYSICS_INTEGRATION_TEST_JOB_ALLOCATION_FAILURE &&
+				rangeIndex == options.testOrdinal)
+			{
+				jobsReady = false;
+				break;
+			}
+			jobPointers[rangeIndex] = new (std::nothrow) PhysicsIntegrationJob(
+				snapshots, scratch, rangeIndex, range.begin, range.end,
+				floatingPointState, options.testFault, options.testOrdinal,
+				executions + rangeIndex, &activePhysicalWorkers,
+				&peakPhysicalWorkers);
+			if (jobPointers[rangeIndex] == 0)
+			{
+				jobsReady = false;
+				break;
+			}
+			submissions[rangeIndex].job = jobPointers[rangeIndex];
+			submissions[rangeIndex].priority = JOB_PRIORITY_FRAME_CRITICAL;
+		}
+
+		if (jobsReady && !(options.testFault == PHYSICS_INTEGRATION_TEST_ADMISSION_FAILURE &&
+			options.testOrdinal < rangeCount))
+			admitted = jobs.trySubmitBatch(submissions, rangeCount, group, handles);
+		if (!admitted)
+		{
+			for (unsigned cleanupIndex = 0; cleanupIndex != rangeCount; ++cleanupIndex)
+				delete jobPointers[cleanupIndex];
+			delete[] submissions;
+			delete[] handles;
+			delete[] jobPointers;
+			delete[] executions;
+			return fallback(&jobs, *metrics);
+		}
+		metrics->submittedJobs = rangeCount;
 	}
-	metrics->submittedJobs = rangeCount;
 	if (options.testFault == PHYSICS_INTEGRATION_TEST_CANCEL_AFTER_ADMISSION)
 		jobs.cancel(group);
 	metrics->prepareNanoseconds = PhysicsIntegrationClockNowNanoseconds() -
@@ -790,77 +997,97 @@ PhysicsIntegrationBatchResult PreparePhysicsIntegrationPrefixes(
 	const unsigned physicalCompletionTimeoutMilliseconds = 8;
 	const bool forcePhysicalTimeout = options.testFault ==
 		PHYSICS_INTEGRATION_TEST_PHYSICAL_WAIT_TIMEOUT;
-	const bool physicalFenceCompleted = !forcePhysicalTimeout &&
-		jobs.waitWithoutOwnerHelp(group, physicalCompletionTimeoutMilliseconds);
-	if (!physicalFenceCompleted)
+	bool physicalFenceCompleted = false;
 	{
-		jobs.cancel(group);
-		jobs.wait(group);
-	}
-	else
-	{
-		// The passive fence proved that every job completed without owner help.
-		jobs.wait(group);
+#if defined(_WIN64)
+		performance::KernelPerformanceScope waitScope(performanceLedger,
+			options.performanceBatch, performance::KERNEL_PERFORMANCE_WAIT);
+#endif
+		physicalFenceCompleted = !forcePhysicalTimeout &&
+			jobs.waitWithoutOwnerHelp(group, physicalCompletionTimeoutMilliseconds);
+		if (!physicalFenceCompleted)
+		{
+			jobs.cancel(group);
+			jobs.wait(group);
+		}
+		else
+		{
+			// The passive fence proved that every job completed without owner help.
+			jobs.wait(group);
+		}
 	}
 	metrics->waitNanoseconds = PhysicsIntegrationClockNowNanoseconds() - waitStart;
 	const PhysicsIntegrationMetricCounter finalizeStart =
 		PhysicsIntegrationClockNowNanoseconds();
-	for (unsigned completionIndex = 0; completionIndex != rangeCount; ++completionIndex)
-	{
-		if (handles[completionIndex].succeeded() && executions[completionIndex].completed)
-		{
-			++metrics->completedJobs;
-			if (executions[completionIndex].physicalWorker)
-			{
-				++metrics->physicalWorkerJobs;
-				const unsigned workerIndex =
-					executions[completionIndex].physicalWorkerIndex;
-				if (workerIndex < sizeof(PhysicsIntegrationMetricCounter) * 8)
-					metrics->physicalWorkerMask |=
-						static_cast<PhysicsIntegrationMetricCounter>(1) << workerIndex;
-				else
-					metrics->physicalWorkerMaskComplete = false;
-				bool firstWorker = true;
-				for (unsigned previous = 0; previous != completionIndex; ++previous)
-				{
-					if (handles[previous].succeeded() && executions[previous].completed &&
-						executions[previous].physicalWorker &&
-						executions[previous].physicalWorkerIndex == workerIndex)
-					{
-						firstWorker = false;
-						break;
-					}
-				}
-				if (firstWorker)
-					++metrics->distinctPhysicalWorkers;
-			}
-			else if (executions[completionIndex].ownerHelped)
-				++metrics->ownerHelpedJobs;
-		}
-	}
-	metrics->peakConcurrentPhysicalWorkers = loadJobCounter(peakPhysicalWorkers);
-
 	PhysicsIntegrationBatchResult result = PHYSICS_INTEGRATION_PARALLEL;
-	if (!physicalFenceCompleted || group.wasCancelled())
-		result = fallback(&jobs, *metrics, PHYSICS_INTEGRATION_CANCELLED);
-	else if (group.failed() || metrics->completedJobs != metrics->submittedJobs)
-		result = fallback(&jobs, *metrics);
-	else if (metrics->physicalWorkerJobs != metrics->completedJobs ||
-		metrics->ownerHelpedJobs != 0)
-		result = fallback(&jobs, *metrics);
-	if (result == PHYSICS_INTEGRATION_PARALLEL)
 	{
-		for (unsigned validationIndex = 0; validationIndex != snapshotCount; ++validationIndex)
+#if defined(_WIN64)
+		performance::KernelPerformanceScope validateScope(performanceLedger,
+			options.performanceBatch, performance::KERNEL_PERFORMANCE_VALIDATE);
+#endif
+		for (unsigned completionIndex = 0; completionIndex != rangeCount; ++completionIndex)
 		{
-			if (!ValidatePhysicsIntegrationOutput(snapshots[validationIndex], scratch[validationIndex]))
+			if (handles[completionIndex].succeeded() && executions[completionIndex].completed)
 			{
-				result = fallback(&jobs, *metrics);
-				break;
+				++metrics->completedJobs;
+				if (executions[completionIndex].physicalWorker)
+				{
+					++metrics->physicalWorkerJobs;
+					const unsigned workerIndex =
+						executions[completionIndex].physicalWorkerIndex;
+					if (workerIndex < sizeof(PhysicsIntegrationMetricCounter) * 8)
+						metrics->physicalWorkerMask |=
+							static_cast<PhysicsIntegrationMetricCounter>(1) << workerIndex;
+					else
+						metrics->physicalWorkerMaskComplete = false;
+					bool firstWorker = true;
+					for (unsigned previous = 0; previous != completionIndex; ++previous)
+					{
+						if (handles[previous].succeeded() && executions[previous].completed &&
+							executions[previous].physicalWorker &&
+							executions[previous].physicalWorkerIndex == workerIndex)
+						{
+							firstWorker = false;
+							break;
+						}
+					}
+					if (firstWorker)
+						++metrics->distinctPhysicalWorkers;
+				}
+				else if (executions[completionIndex].ownerHelped)
+					++metrics->ownerHelpedJobs;
 			}
 		}
+		metrics->peakConcurrentPhysicalWorkers = loadJobCounter(peakPhysicalWorkers);
+
+		if (!physicalFenceCompleted || group.wasCancelled())
+			result = fallback(&jobs, *metrics, PHYSICS_INTEGRATION_CANCELLED);
+		else if (group.failed() || metrics->completedJobs != metrics->submittedJobs)
+			result = fallback(&jobs, *metrics);
+		else if (metrics->physicalWorkerJobs != metrics->completedJobs ||
+			metrics->ownerHelpedJobs != 0)
+			result = fallback(&jobs, *metrics);
+		if (result == PHYSICS_INTEGRATION_PARALLEL)
+		{
+			for (unsigned validationIndex = 0; validationIndex != snapshotCount; ++validationIndex)
+			{
+				if (!ValidatePhysicsIntegrationOutput(snapshots[validationIndex], scratch[validationIndex]))
+				{
+					result = fallback(&jobs, *metrics);
+					break;
+				}
+			}
+		}
+		if (result == PHYSICS_INTEGRATION_PARALLEL)
+		{
+			memcpy(output, scratch, snapshotCount * sizeof(PhysicsIntegrationOutput));
+		#if defined(_WIN64)
+			// Reference hashing and any detached oracle work belong to the owner
+			// validation interval, after the real output is complete.
+			observePhysicsReferenceBatch(options, snapshots, snapshotCount, output);
+		#endif
+		}
 	}
-	if (result == PHYSICS_INTEGRATION_PARALLEL)
-		memcpy(output, scratch, snapshotCount * sizeof(PhysicsIntegrationOutput));
 
 	delete[] submissions;
 	delete[] handles;

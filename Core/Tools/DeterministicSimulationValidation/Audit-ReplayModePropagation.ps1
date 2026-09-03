@@ -316,7 +316,7 @@ function Assert-ImmutableSpatialBatchRuntimeContract {
         }
     }
     foreach ($marker in @(
-        'LIVE_IMMUTABLE_SPATIAL_MAXIMUM_QUERIES = 256',
+        'rts::ImmutableSpatialCollectionCompletion::MAXIMUM_QUERIES',
 		'PreflightLiveImmutableSpatialQueryScheduler()',
 		'PreflightLiveImmutableSpatialQueryCollection(',
 		'queueableQueryCount > LIVE_IMMUTABLE_SPATIAL_MAXIMUM_QUERIES',
@@ -411,6 +411,79 @@ function Assert-ImmutableSpatialBatchRuntimeContract {
                 throw "$Context $($consumerContract.label) is missing spatial owner/oracle marker '$marker'."
             }
         }
+    }
+}
+
+function Assert-ImmutableSpatialDiagnosticsRuntimeContract {
+    param([string]$Content, [string]$Context)
+    # This boundary retires observations only: it must neither invent a commit
+    # nor reset the arena, query epoch, or authoritative collection state.
+    $closePattern = 'void endCollection\(\)\s*\{\s*if\s*\(m_performanceBatchActive\s*\|\|\s*m_referenceBatch\.valid\(\)\)\s*finishPerformanceBatch\(\s*rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION\s*\);\s*\}'
+    if ($Content -notmatch $closePattern -or
+        $Content.IndexOf('liveSpatialRuntime().endCollection();',
+            [StringComparison]::Ordinal) -lt 0) {
+        throw "$Context does not expose an idempotent diagnostics-only spatial collection close."
+    }
+}
+
+function Assert-ImmutableSpatialDiagnosticsOwnerContract {
+    param([string]$Content, [string]$Context)
+    $start = $Content.IndexOf('Bool immutableSpatialArenaCaptured = FALSE;',
+        [StringComparison]::Ordinal)
+    $end = if ($start -ge 0) {
+        $Content.IndexOf('validateSleepyUpdate();', $start,
+            [StringComparison]::Ordinal)
+    } else { -1 }
+    if ($start -lt 0 -or $end -lt 0) {
+        throw "$Context is missing the spatial sleepy-owner collection scope."
+    }
+    $scope = $Content.Substring($start, $end - $start)
+    $mismatchPattern = 'if\s*\(immutableSpatialArenaCaptured\s*&&\s*\(s_immutableSpatialQueries\.empty\(\)\s*\|\|\s*immutableSpatialPreparedOrdinal\s*>=\s*s_immutableSpatialQueries\.size\(\)\s*\|\|\s*s_immutableSpatialQueries\[immutableSpatialPreparedOrdinal\]\s*!=\s*u\)\)\s*\{\s*EndLiveImmutableSpatialQueryCollection\(\);\s*\}'
+    $mismatch = [regex]::Match($scope, $mismatchPattern)
+    $physics = $scope.IndexOf('if (!physicsBatchAttempted', [StringComparison]::Ordinal)
+    if (-not $mismatch.Success -or $physics -lt 0 -or
+        $mismatch.Index + $mismatch.Length -gt $physics) {
+        throw "$Context does not close a discarded spatial prefix before unrelated owner preparation."
+    }
+    $exhaustedPattern = 'if\s*\(s_immutableSpatialQueries\.empty\(\)\s*\|\|\s*immutableSpatialPreparedOrdinal\s*>=\s*s_immutableSpatialQueries\.size\(\)\)\s*\{\s*EndLiveImmutableSpatialQueryCollection\(\);\s*s_immutableSpatialQueries\.clear\(\);'
+    if ($scope -notmatch $exhaustedPattern) {
+        throw "$Context does not close unconsumed spatial queries when the owner prefix is exhausted."
+    }
+    $tailPattern = '\}\s*\}\s*#if defined\(_WIN64\)\s*EndLiveImmutableSpatialQueryCollection\(\);\s*physicsBatch\.finishPerformanceBatch\('
+    if ($scope -notmatch $tailPattern) {
+        throw "$Context does not close remaining spatial observations when the sleepy loop exits."
+    }
+}
+
+function Assert-PointDefenseSpatialCommitIntervalContract {
+    param([string]$Content, [string]$Context)
+    $scanStart = $Content.IndexOf('Object* PointDefenseLaserUpdate::scanClosestTargetOwner(',
+        [StringComparison]::Ordinal)
+    $scanEnd = if ($scanStart -ge 0) {
+        $Content.IndexOf('Object* PointDefenseLaserUpdate::scanClosestTargetScheduled()',
+            $scanStart, [StringComparison]::Ordinal)
+    } else { -1 }
+    if ($scanStart -lt 0 -or $scanEnd -lt 0) {
+        throw "$Context is missing the point-defense owner and scheduled scanners."
+    }
+    $scan = $Content.Substring($scanStart, $scanEnd - $scanStart)
+    $publicationPattern = '\}\s*#if defined\(_WIN64\)\s*ImmutableSpatialPointDefenseCommitInterval performanceCommit\(this, measureSpatialCommit\);\s*#else\s*\(void\)measureSpatialCommit;\s*#endif\s*if\( bestTargetInRange\[ 0 \] \)'
+    if ($scan -notmatch $publicationPattern -or
+        $scan.IndexOf('Bool measureSpatialCommit', [StringComparison]::Ordinal) -lt 0) {
+        throw "$Context does not start shadow commit timing at the original publication-only boundary."
+    }
+    $shadowStart = $Content.IndexOf('if( rts::UseSimulationShadowOracle() )',
+        $scanEnd, [StringComparison]::Ordinal)
+    $shadowEnd = if ($shadowStart -ge 0) {
+        $Content.IndexOf('Bool matched =', $shadowStart, [StringComparison]::Ordinal)
+    } else { -1 }
+    if ($shadowStart -lt 0 -or $shadowEnd -lt 0) {
+        throw "$Context is missing the point-defense shadow comparison boundary."
+    }
+    $shadow = $Content.Substring($shadowStart, $shadowEnd - $shadowStart)
+    if ($shadow -notmatch 'scanClosestTargetOwner\( oracleIDs, capacity,\s*&oracleCount, TRUE \)' -or
+        $shadow -match 'performanceGuard\.(beginCommit|endCommit)\(') {
+        throw "$Context charges the legacy oracle scan to commit instead of its exact publication."
     }
 }
 
@@ -626,6 +699,32 @@ function Assert-CollisionAdapterContract {
         if ($KernelContent.IndexOf($kernelMarker, [StringComparison]::Ordinal) -lt 0) {
             throw "$Context is missing collision kernel marker '$kernelMarker'."
         }
+    }
+}
+
+function Assert-ObjectStatusAuthoritativeCommitContract {
+    param([string]$Content, [string]$Context)
+    $committedCountMarker = 'UnsignedInt committedCount = 0;'
+    $committedCountIndex = $Content.IndexOf($committedCountMarker,
+        [StringComparison]::Ordinal)
+    if ($committedCountIndex -lt 0) {
+        throw "$Context is missing the object-status committed-command counter."
+    }
+    $statusBody = $Content.Substring($committedCountIndex)
+    $finishMatch = [regex]::Match($statusBody,
+        '(?s)performanceBatch\s*\.\s*finish\s*\((?<expression>.*?)\);')
+    if (-not $finishMatch.Success) {
+        throw "$Context is missing the object-status performance-batch completion call."
+    }
+    $normalizedTerms = @($finishMatch.Groups['expression'].Value -replace '\s+', '' -split '&&' |
+        ForEach-Object { $_.Trim('(', ')') })
+    if ($normalizedTerms -notcontains 'authoritativePerformanceBatch' -or
+        $normalizedTerms -notcontains 'allCommandsResolved') {
+        throw "$Context must require authoritative mode and resolved commands when completing the object-status batch."
+    }
+    if ($normalizedTerms -notcontains 'committedCount==preparedCount' -and
+        $normalizedTerms -notcontains 'preparedCount==committedCount') {
+        throw "$Context must require prepared and committed object-status command counts to match."
     }
 }
 
@@ -1165,7 +1264,8 @@ addMetric(s_successfulCollectionQueries, queryCount);
 addMetric(s_successfulCollectionRanges, rangeCount);
 '@
     $validLiveSpatial = @'
-LIVE_IMMUTABLE_SPATIAL_MAXIMUM_QUERIES = 256
+LIVE_IMMUTABLE_SPATIAL_MAXIMUM_QUERIES =
+rts::ImmutableSpatialCollectionCompletion::MAXIMUM_QUERIES
 PreflightLiveImmutableSpatialQueryScheduler()
 PreflightLiveImmutableSpatialQueryCollection(
 queueableQueryCount > LIVE_IMMUTABLE_SPATIAL_MAXIMUM_QUERIES
@@ -1305,7 +1405,37 @@ preparePhysicsIntegrationBatch(this, m_sleepyUpdates,
 	catch {
 		if ($_.Exception.Message -like 'Self-test failed*') { throw }
 	}
-    $validCollisionAdapter = @'
+	$validObjectStatusCompletion = @'
+UnsignedInt committedCount = 0;
+Bool allCommandsResolved = TRUE;
+performanceBatch.finish(
+    authoritativePerformanceBatch &&
+    allCommandsResolved &&
+    committedCount == preparedCount);
+'@
+	Assert-ObjectStatusAuthoritativeCommitContract `
+		$validObjectStatusCompletion 'valid object-status completion fixture'
+	foreach ($malformedObjectStatusCompletion in @(
+		$validObjectStatusCompletion.Replace(
+			'committedCount == preparedCount', 'removed_commit_cardinality'),
+		$validObjectStatusCompletion.Replace(
+			'allCommandsResolved', 'removed_command_resolution'),
+		$validObjectStatusCompletion.Replace(
+			'performanceBatch.finish(',
+			'const Bool complete = committedCount == preparedCount; performanceBatch.finish(').Replace(
+				'    committedCount == preparedCount);',
+				'    removed_commit_cardinality);')
+	)) {
+		try {
+			Assert-ObjectStatusAuthoritativeCommitContract `
+				$malformedObjectStatusCompletion 'malformed object-status completion fixture'
+			throw 'Self-test failed to reject an incomplete object-status authoritative completion predicate.'
+		}
+		catch {
+			if ($_.Exception.Message -like 'Self-test failed*') { throw }
+		}
+	}
+	$validCollisionAdapter = @'
 class LivePartitionCollisionWorkspace
 rts::CollisionAdmissionSampler admissionSampler;
 admissionSampler.hasUsefulSpread()
@@ -1369,6 +1499,102 @@ rts::frame_timing::SimulationReduce
     }
     catch {
         if ($_.Exception.Message -like 'Self-test failed*') { throw }
+    }
+    $validSpatialClose = @'
+void endCollection()
+{
+    if (m_performanceBatchActive || m_referenceBatch.valid())
+        finishPerformanceBatch(rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION);
+}
+liveSpatialRuntime().endCollection();
+'@
+    Assert-ImmutableSpatialDiagnosticsRuntimeContract $validSpatialClose 'valid spatial diagnostics close'
+    foreach ($invalidClose in @(
+        $validSpatialClose.Replace('m_performanceBatchActive || m_referenceBatch.valid()', 'true'),
+        $validSpatialClose.Replace('KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION', 'KERNEL_PERFORMANCE_COMMITTED'),
+        $validSpatialClose.Replace('liveSpatialRuntime().endCollection();', ''),
+        $validSpatialClose.Replace('void endCollection()', 'void noBoundaryClose()'),
+        $validSpatialClose.Replace('    if (m_performanceBatchActive', '    clearCollection(); if (m_performanceBatchActive')
+    )) {
+        try {
+            Assert-ImmutableSpatialDiagnosticsRuntimeContract $invalidClose 'invalid spatial diagnostics close'
+            throw 'Self-test failed to reject an unsafe spatial diagnostics close.'
+        }
+        catch { if ($_.Exception.Message -like 'Self-test failed*') { throw } }
+    }
+    $validSpatialOwnerClose = @'
+Bool immutableSpatialArenaCaptured = FALSE;
+{
+    while (!m_sleepyUpdates.empty())
+    {
+        if (immutableSpatialArenaCaptured &&
+            (s_immutableSpatialQueries.empty() ||
+            immutableSpatialPreparedOrdinal >= s_immutableSpatialQueries.size() ||
+            s_immutableSpatialQueries[immutableSpatialPreparedOrdinal] != u))
+        {
+            EndLiveImmutableSpatialQueryCollection();
+        }
+        if (!physicsBatchAttempted) { preparePhysics(); }
+        if (s_immutableSpatialQueries.empty() ||
+            immutableSpatialPreparedOrdinal >= s_immutableSpatialQueries.size())
+        {
+            EndLiveImmutableSpatialQueryCollection();
+            s_immutableSpatialQueries.clear();
+        }
+    }
+}
+#if defined(_WIN64)
+EndLiveImmutableSpatialQueryCollection();
+physicsBatch.finishPerformanceBatch(false);
+#endif
+validateSleepyUpdate();
+'@
+    Assert-ImmutableSpatialDiagnosticsOwnerContract $validSpatialOwnerClose 'valid spatial owner close'
+    foreach ($invalidOwnerClose in @(
+        $validSpatialOwnerClose.Replace('!= u', '== u'),
+        $validSpatialOwnerClose.Replace('if (!physicsBatchAttempted)', 'if (unrelatedPreparation)'),
+        $validSpatialOwnerClose.Replace('            EndLiveImmutableSpatialQueryCollection();', ''),
+        ($validSpatialOwnerClose -replace 'EndLiveImmutableSpatialQueryCollection\(\);\r?\nphysicsBatch', 'physicsBatch')
+    )) {
+        try {
+            Assert-ImmutableSpatialDiagnosticsOwnerContract $invalidOwnerClose 'invalid spatial owner close'
+            throw 'Self-test failed to reject an unclosed spatial owner collection.'
+        }
+        catch { if ($_.Exception.Message -like 'Self-test failed*') { throw } }
+    }
+    $validPointDefenseCommit = @'
+Object* PointDefenseLaserUpdate::scanClosestTargetOwner(
+    Bool measureSpatialCommit )
+{
+    for (Object *other = iter->first(); other; other = iter->next()) { scan(other); }
+#if defined(_WIN64)
+    ImmutableSpatialPointDefenseCommitInterval performanceCommit(this, measureSpatialCommit);
+#else
+    (void)measureSpatialCommit;
+#endif
+    if( bestTargetInRange[ 0 ] ) { m_bestTargetID = bestTargetInRange[ 0 ]->getID(); }
+}
+Object* PointDefenseLaserUpdate::scanClosestTargetScheduled()
+{
+    if( rts::UseSimulationShadowOracle() )
+    {
+        Object *oracleTarget = scanClosestTargetOwner( oracleIDs, capacity,
+            &oracleCount, TRUE );
+        Bool matched = true;
+    }
+}
+'@
+    Assert-PointDefenseSpatialCommitIntervalContract $validPointDefenseCommit 'valid point-defense commit interval'
+    foreach ($invalidPointDefenseCommit in @(
+        $validPointDefenseCommit.Replace('performanceCommit(this, measureSpatialCommit)', 'performanceCommit(this, FALSE)'),
+        $validPointDefenseCommit.Replace('&oracleCount, TRUE', '&oracleCount, FALSE'),
+        $validPointDefenseCommit.Replace('Object *oracleTarget =', 'performanceGuard.beginCommit(); Object *oracleTarget =')
+    )) {
+        try {
+            Assert-PointDefenseSpatialCommitIntervalContract $invalidPointDefenseCommit 'invalid point-defense commit interval'
+            throw 'Self-test failed to reject scan-wide or missing point-defense commit timing.'
+        }
+        catch { if ($_.Exception.Message -like 'Self-test failed*') { throw } }
     }
     Write-Output 'Replay mode propagation audit self-test passed.'
     return
@@ -1499,6 +1725,12 @@ foreach ($spatialRuntimeSource in @($spatialKernelSource, $liveSpatialSource,
 }
 $spatialKernelContent = Get-Content -LiteralPath $spatialKernelSource -Raw
 $liveSpatialContent = Get-Content -LiteralPath $liveSpatialSource -Raw
+$spatialRuntimeHeaderContent = Get-Content -LiteralPath (Join-Path $sourceFull `
+    'Core\Libraries\Include\Lib\ImmutableSpatialQueryRuntime.h') -Raw
+if ($spatialRuntimeHeaderContent -notmatch 'enum\s*\{\s*MAXIMUM_QUERIES\s*=\s*256\s*\}') {
+    throw 'The shared spatial completion capacity is not the audited 256-query bound.'
+}
+Assert-ImmutableSpatialDiagnosticsRuntimeContract $liveSpatialContent 'live spatial diagnostics'
 $physicsKernelContent = Get-Content -LiteralPath $physicsKernelSource -Raw
 foreach ($titleRoot in @('Generals', 'GeneralsMD')) {
     $gameLogicRelative = "$titleRoot\Code\GameEngine\Source\GameLogic\System\GameLogic.cpp"
@@ -1513,6 +1745,10 @@ foreach ($titleRoot in @('Generals', 'GeneralsMD')) {
     }
 	$gameLogicContent = Get-Content -LiteralPath `
 		(Join-Path $sourceFull $gameLogicRelative) -Raw
+    Assert-ImmutableSpatialDiagnosticsOwnerContract $gameLogicContent "$titleRoot spatial diagnostics"
+    Assert-PointDefenseSpatialCommitIntervalContract `
+        (Get-Content -LiteralPath (Join-Path $sourceFull $pointDefenseRelative) -Raw) `
+        "$titleRoot point-defense diagnostics"
 	Assert-EarlyPhysicsIntegrationPreflightContract $physicsKernelContent `
 		$gameLogicContent "$titleRoot early physics preflight"
     Assert-ImmutableSpatialBatchRuntimeContract $spatialKernelContent `

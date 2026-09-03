@@ -19,6 +19,7 @@
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
 
 #include "Common/ReplaySimulation.h"
+#include "Common/PerformanceReceiptRuntime.h"
 #include "Lib/FrameTimingDiagnostics.h"
 
 #include "Common/GameEngine.h"
@@ -32,7 +33,12 @@
 #include "Lib/PipelineExecutionPolicy.h"
 #include "Lib/SimulationExecutionPolicy.h"
 #if defined(_WIN64)
+#include "Common/Player.h"
+#include "Common/PlayerList.h"
+#include "GameLogic/AIPathfind.h"
+#include "GameLogic/Object.h"
 #include "Lib/PerformanceReceipt.h"
+#include "Lib/ReplayPathContract.h"
 #include "Lib/CollisionCandidateKernel.h"
 #include "Lib/DeterministicAIPlanning.h"
 #include "Lib/ImmutableSpatialQueryRuntime.h"
@@ -45,6 +51,50 @@
 Bool ReplaySimulation::s_isRunning = false;
 UnsignedInt ReplaySimulation::s_replayIndex = 0;
 UnsignedInt ReplaySimulation::s_replayCount = 0;
+
+#if defined(_WIN64)
+PerformanceReceiptOwnerLifecycle::PerformanceReceiptOwnerLifecycle()
+	: m_begun(false), m_finalized(false), m_terminalResultKnown(false),
+	  m_contiguous(true), m_lastCompletedFrame(0), m_terminalFrame(0), m_terminalCrc(0)
+{
+}
+
+bool PerformanceReceiptOwnerLifecycle::begin()
+{
+	if (m_begun) return false;
+	m_begun = true;
+	return true;
+}
+
+bool PerformanceReceiptOwnerLifecycle::observeCompletedFrame(unsigned frame)
+{
+	if (!m_begun || m_finalized || frame == 0 || frame <= m_lastCompletedFrame ||
+		(m_terminalResultKnown && frame > m_terminalFrame)) return false;
+	if (frame != m_lastCompletedFrame + 1) m_contiguous = false;
+	m_lastCompletedFrame = frame;
+	return true;
+}
+
+bool PerformanceReceiptOwnerLifecycle::captureTerminalResult(unsigned actualFrame, unsigned crc)
+{
+	if (!m_begun || m_finalized || m_terminalResultKnown || actualFrame == 0 ||
+		actualFrame < m_lastCompletedFrame) return false;
+	m_terminalResultKnown = true;
+	m_terminalFrame = actualFrame;
+	m_terminalCrc = crc;
+	return true;
+}
+
+bool PerformanceReceiptOwnerLifecycle::finish(unsigned outstandingJobs,
+	unsigned pendingOwnerCompletions)
+{
+	if (!m_begun || m_finalized) return false;
+	m_finalized = true;
+	return m_terminalResultKnown && m_contiguous && m_lastCompletedFrame != 0 &&
+		m_lastCompletedFrame == m_terminalFrame && outstandingJobs == 0 &&
+		pendingOwnerCompletions == 0;
+}
+#endif
 
 namespace
 {
@@ -74,6 +124,31 @@ const char *pipelineModeName(rts::PipelineExecutionMode mode)
 }
 
 #if defined(_WIN64)
+// Prevent replacement or mutation of the exact loose replay while both the
+// diagnostic hasher and Recorder read it. Failure disables evidence only.
+class ImmutableReplayReceiptSource
+{
+public:
+	ImmutableReplayReceiptSource() : m_file(INVALID_HANDLE_VALUE) { m_sha256[0] = '\0'; }
+	~ImmutableReplayReceiptSource()
+	{
+		if (m_file != INVALID_HANDLE_VALUE) CloseHandle(m_file);
+	}
+	bool open(const char *path)
+	{
+		m_file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, 0,
+			OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+		return m_file != INVALID_HANDLE_VALUE &&
+			HashSkirmishAITestContentFile(path, m_sha256) != FALSE;
+	}
+	const char *sha256() const { return m_sha256; }
+private:
+	HANDLE m_file;
+	char m_sha256[65];
+	ImmutableReplayReceiptSource(const ImmutableReplayReceiptSource &);
+	ImmutableReplayReceiptSource &operator=(const ImmutableReplayReceiptSource &);
+};
+
 void printHeadlessReplaySliceMetrics(
 	const rts::CollisionCandidateRuntimeMetrics &collision,
 	const rts::PhysicsIntegrationRuntimeMetrics &physics,
@@ -246,36 +321,27 @@ void capturePerformanceReceiptMetrics(
 	const rts::CollisionCandidateRuntimeMetrics &collision,
 	const rts::PhysicsIntegrationRuntimeMetrics &physics,
 	const rts::ObjectStatusTimerRuntimeMetrics &status,
-	const rts::ImmutableSpatialRuntimeMetrics &spatial)
+	const rts::ImmutableSpatialRuntimeMetrics &spatial,
+	const rts::LiveSimulationPhaseRuntimeMetrics &phaseMetrics,
+	const rts::AIPlanningRuntimeMetrics &ai,
+	const OrdinaryPathRuntimeMetrics &path)
 {
 	receipt.phases.clear();
-	const rts::LiveSimulationPhaseRuntimeMetrics phaseMetrics =
-		TheGameLogic != 0 ? TheGameLogic->getStage5PhaseRuntimeMetrics() :
-		rts::LiveSimulationPhaseRuntimeMetrics();
-	// Only the three phase clocks currently exposed by the executable are
-	// marked available.  The remaining contract rows remain explicit but
-	// unavailable until their owning phase publishes an exact clock.
-	appendPerformanceReceiptPhase(receipt, "owner-intake",
-		phaseMetrics.ownerPhaseSampleCount[0] != 0,
-		phaseMetrics.ownerPhaseTotalNanoseconds[0],
-		phaseMetrics.ownerPhaseMaximumNanoseconds[0],
-		phaseMetrics.ownerPhaseSampleCount[0]);
-	appendPerformanceReceiptPhase(receipt, "world-queries", false, 0, 0, 0);
-	appendPerformanceReceiptPhase(receipt, "pathfinding", false, 0, 0, 0);
-	appendPerformanceReceiptPhase(receipt, "object-computation", false, 0, 0,
-		0);
-	appendPerformanceReceiptPhase(receipt, "spatial-work",
-		phaseMetrics.ownerPhaseSampleCount[2] != 0,
-		phaseMetrics.ownerPhaseTotalNanoseconds[2],
-		phaseMetrics.ownerPhaseMaximumNanoseconds[2],
-		phaseMetrics.ownerPhaseSampleCount[2]);
-	appendPerformanceReceiptPhase(receipt, "deterministic-commit", false, 0,
-		0, 0);
-	appendPerformanceReceiptPhase(receipt, "verification-publication",
-		phaseMetrics.ownerPhaseSampleCount[4] != 0,
-		phaseMetrics.ownerPhaseTotalNanoseconds[4],
-		phaseMetrics.ownerPhaseMaximumNanoseconds[4],
-		phaseMetrics.ownerPhaseSampleCount[4]);
+	const char *names[] = { "owner-intake", "legacy-mutable-island",
+		"spatial-work", "owner-tail", "verification-publication" };
+	for (unsigned index = 0; index != 5; ++index)
+		appendPerformanceReceiptPhase(receipt, names[index],
+			phaseMetrics.ownerPhaseSampleCount[index] != 0,
+			phaseMetrics.ownerPhaseTotalNanoseconds[index],
+			phaseMetrics.ownerPhaseMaximumNanoseconds[index],
+			phaseMetrics.ownerPhaseSampleCount[index]);
+	// Inclusive owner phases are not serial portions: worker kernels execute
+	// inside them. The receipt retains the default unknown serial coverage.
+	receipt.frameSimulationTotalNanoseconds =
+		phaseMetrics.frameSimulationTotalNanoseconds;
+	receipt.frameSimulationMaximumNanoseconds =
+		phaseMetrics.frameSimulationMaximumNanoseconds;
+	receipt.frameSimulationSampleCount = phaseMetrics.frameSimulationSampleCount;
 
 	receipt.kernels.clear();
 	appendPerformanceReceiptKernel(receipt, "physics", true,
@@ -294,8 +360,6 @@ void capturePerformanceReceiptMetrics(
 		collision.physicalWorkerJobs, collision.ownerHelpedJobs,
 		collision.physicalWorkerMask, collision.distinctPhysicalWorkers,
 		collision.physicalWorkerMaskComplete);
-	const rts::AIPlanningRuntimeMetrics ai =
-		rts::GetAIPlanningRuntimeMetrics();
 	appendPerformanceReceiptKernel(receipt, "ai-planning", true,
 		static_cast<rts::JobMetricCounter>(ai.submittedJobs),
 		static_cast<rts::JobMetricCounter>(ai.completedJobs),
@@ -311,49 +375,58 @@ void capturePerformanceReceiptMetrics(
 		spatial.collectionPhysicalWorkerMask,
 		static_cast<unsigned>(spatial.maximumCollectionDistinctPhysicalWorkers),
 		spatial.maximumCollectionDistinctPhysicalWorkers <= 64U);
-	appendPerformanceReceiptKernel(receipt, "path", false, 0, 0, 0,
-		0, 0, 0, false);
+	appendPerformanceReceiptKernel(receipt, "path", true,
+		path.submittedRangeJobs,
+		static_cast<rts::JobMetricCounter>(path.workerExecutedRangeJobs) +
+			path.ownerHelpedRangeJobs,
+		path.workerExecutedRangeJobs, path.ownerHelpedRangeJobs,
+		path.physicalWorkerMask, path.distinctPhysicalWorkers,
+		path.physicalWorkerMaskComplete != FALSE);
 }
 
 bool resolvePerformanceReceiptTimingPath(
 	rts::performance::PerformanceReceipt &receipt)
 {
-	std::string configuredPath = receipt.rawEvidence.timingPath;
-	if (configuredPath.empty()) return false;
-	const DWORD attributes = GetFileAttributesA(configuredPath.c_str());
-	if (attributes != INVALID_FILE_ATTRIBUTES &&
-		(attributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
-		return true;
-	if (attributes == INVALID_FILE_ATTRIBUTES ||
-		(attributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+	const rts::frame_timing::FinalizedCapture capture =
+		rts::frame_timing::Capture::instance().finalize();
+	receipt.rawEvidence.timingClosed = capture.closed;
+	receipt.rawEvidence.timingWriteSucceeded = capture.writeSucceeded;
+	receipt.rawEvidence.timingTruncated = capture.truncated;
+	receipt.rawEvidence.timingComplete = capture.complete;
+	receipt.rawEvidence.timingSessionCount = capture.sessionCount;
+	receipt.rawEvidence.timingFrameSamples = capture.frameSamples;
+	receipt.rawEvidence.timingFirstFrame = capture.firstFrame;
+	receipt.rawEvidence.timingLastFrame = capture.lastFrame;
+	if (!capture.complete || capture.sessionCount != 1)
 		return false;
-	std::string pattern = configuredPath;
-	if (!pattern.empty() && pattern[pattern.size() - 1] != '\\' &&
-		pattern[pattern.size() - 1] != '/')
-		pattern += '\\';
-	pattern += "frame-timing-*.csv";
-	WIN32_FIND_DATAA data;
-	HANDLE search = FindFirstFileA(pattern.c_str(), &data);
-	if (search == INVALID_HANDLE_VALUE) return false;
-	std::string resolvedPath;
-	bool multiple = false;
-	do
+	// The host may request the exact file or its directory; it cannot nominate
+	// a different CSV. Resolve both paths without searching directory contents.
+	char expected[MAX_PATH], actual[MAX_PATH];
+	const DWORD expectedLength = GetFullPathNameA(receipt.rawEvidence.timingPath.c_str(),
+		sizeof(expected), expected, 0);
+	const DWORD actualLength = GetFullPathNameA(capture.path.c_str(),
+		sizeof(actual), actual, 0);
+	if (expectedLength == 0 || expectedLength >= sizeof(expected) ||
+		actualLength == 0 || actualLength >= sizeof(actual))
+		return false;
+	const DWORD attributes = GetFileAttributesA(expected);
+	if (attributes == INVALID_FILE_ATTRIBUTES)
+		return false;
+	std::string expectedPath(expected), actualPath(actual);
+	if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
 	{
-		if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
-		{
-			if (!resolvedPath.empty()) multiple = true;
-			resolvedPath = configuredPath;
-			if (!resolvedPath.empty() &&
-				resolvedPath[resolvedPath.size() - 1] != '\\' &&
-				resolvedPath[resolvedPath.size() - 1] != '/')
-				resolvedPath += '\\';
-			resolvedPath += data.cFileName;
-		}
+		while (!expectedPath.empty() &&
+			(expectedPath[expectedPath.size() - 1] == '\\' ||
+				expectedPath[expectedPath.size() - 1] == '/'))
+			expectedPath.erase(expectedPath.size() - 1);
+		const std::size_t separator = actualPath.find_last_of("\\/");
+		if (separator == std::string::npos ||
+			_stricmp(expectedPath.c_str(), actualPath.substr(0, separator).c_str()) != 0)
+			return false;
 	}
-	while (FindNextFileA(search, &data) != 0);
-	FindClose(search);
-	if (multiple || resolvedPath.empty()) return false;
-	receipt.rawEvidence.timingPath = resolvedPath;
+	else if (_stricmp(expectedPath.c_str(), actualPath.c_str()) != 0)
+		return false;
+	receipt.rawEvidence.timingPath = actualPath;
 	return true;
 }
 
@@ -363,7 +436,7 @@ bool writePerformanceReceiptRawDiagnostic(
 	if (receipt.rawEvidence.rawLogPath.empty()) return false;
 	FILE *file = fopen(receipt.rawEvidence.rawLogPath.c_str(), "wx");
 	if (file == 0) return false;
-	fprintf(file, "producer=game-executable-performance-receipt-v1\n");
+	fprintf(file, "producer=game-executable-performance-receipt-v5\n");
 	fprintf(file, "game_owned=1\n");
 	fprintf(file, "run_id=%s\n", receipt.runId.c_str());
 	fprintf(file, "process_id=%u\n", receipt.processId);
@@ -434,7 +507,7 @@ public:
 		  m_startAttempted(false), m_started(false), m_workerCount(0)
 		#if defined(_WIN64)
 		  , m_performanceReceipt(
-			static_cast<rts::performance::PerformanceReceipt *>(performanceReceipt))
+			static_cast<PerformanceReceiptRuntime *>(performanceReceipt))
 		#endif
 	{
 #if !defined(_WIN64)
@@ -453,6 +526,9 @@ public:
 		m_spatialMetricsAtStart = rts::GetImmutableSpatialRuntimeMetrics();
 		m_spatialMetricsFrozen = rts::ImmutableSpatialRuntimeMetrics();
 		m_spatialMetricsAwaitingInitialReset = TRUE;
+		m_ordinaryPathMetricsAtStart = GetOrdinaryPathRuntimeMetrics();
+		memset(&m_ordinaryPathMetricsFrozen, 0, sizeof(m_ordinaryPathMetricsFrozen));
+		m_ordinaryPathMetricsAwaitingInitialReset = TRUE;
 #endif
 	}
 
@@ -461,26 +537,13 @@ public:
 		if (!m_startAttempted) return;
 		rts::JobSystem &jobs = rts::JobSystem::instance();
 		#if defined(_WIN64)
-		if (m_performanceReceipt != 0 && m_started)
-		{
-			std::string reason;
-			rts::performance::CapturePerformanceReceiptJobSystem(
-				*m_performanceReceipt, jobs, jobs.metrics(), &reason);
-		}
+		if (m_performanceReceipt != 0)
+			m_performanceReceipt->captureSchedulerBeforeTeardown();
 		#endif
 		if (m_started) jobs.shutdown();
 		const rts::JobSystemMetrics metrics = jobs.metrics();
 #if defined(_WIN64)
 		captureSliceMetrics();
-		if (m_performanceReceipt != 0)
-		{
-			std::string reason;
-			rts::performance::CapturePerformanceReceiptJobSystem(
-				*m_performanceReceipt, jobs, metrics, &reason);
-			capturePerformanceReceiptMetrics(*m_performanceReceipt,
-				m_collisionMetricsFrozen, m_physicsMetricsFrozen,
-				m_statusMetricsFrozen, m_spatialMetricsFrozen);
-		}
 #endif
 		if (m_started && jobs.isCurrentThread(rts::JOB_OWNER_GAME) &&
 			!jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME))
@@ -581,6 +644,22 @@ public:
 		AccumulateSkirmishAITestImmutableSpatialMetrics(&m_spatialMetricsAtStart,
 			spatialMetrics, &m_spatialMetricsFrozen,
 			&m_spatialMetricsAwaitingInitialReset);
+		const OrdinaryPathRuntimeMetrics pathMetrics = GetOrdinaryPathRuntimeMetrics();
+		AccumulateSkirmishAITestOrdinaryPathMetrics(&m_ordinaryPathMetricsAtStart,
+			pathMetrics, &m_ordinaryPathMetricsFrozen,
+			&m_ordinaryPathMetricsAwaitingInitialReset);
+#endif
+	}
+
+	void captureCompletedFrameMetrics(unsigned previousFrame)
+	{
+#if defined(_WIN64)
+		if (m_performanceReceipt != 0)
+			m_performanceReceipt->captureCompletedFrame(previousFrame,
+				m_collisionMetricsFrozen, m_physicsMetricsFrozen,
+				m_statusMetricsFrozen, m_spatialMetricsFrozen, m_ordinaryPathMetricsFrozen);
+#else
+		(void)previousFrame;
 #endif
 	}
 
@@ -589,14 +668,7 @@ public:
 	{
 #if defined(_WIN64)
 		if (m_performanceReceipt != 0)
-		{
-			m_performanceReceipt->frameStart = 0;
-			m_performanceReceipt->frameEnd = finalFrame;
-			m_performanceReceipt->finalFrame = finalFrame;
-			m_performanceReceipt->finalCrc = finalCrc;
-			m_performanceReceipt->finalCrcKnown = finalCrcKnown;
-			m_performanceReceipt->status = clean ? "complete" : "failed";
-		}
+			m_performanceReceipt->captureTerminalResult(finalFrame, finalCrc, finalCrcKnown, clean);
 #else
 		(void)finalFrame;
 		(void)finalCrc;
@@ -614,7 +686,7 @@ private:
 	bool m_started;
 	unsigned m_workerCount;
 #if defined(_WIN64)
-	rts::performance::PerformanceReceipt *m_performanceReceipt;
+	PerformanceReceiptRuntime *m_performanceReceipt;
 	rts::CollisionCandidateRuntimeMetrics m_collisionMetricsAtStart;
 	rts::CollisionCandidateRuntimeMetrics m_collisionMetricsFrozen;
 	Bool m_collisionMetricsAwaitingInitialReset;
@@ -627,6 +699,9 @@ private:
 	rts::ImmutableSpatialRuntimeMetrics m_spatialMetricsAtStart;
 	rts::ImmutableSpatialRuntimeMetrics m_spatialMetricsFrozen;
 	Bool m_spatialMetricsAwaitingInitialReset;
+	OrdinaryPathRuntimeMetrics m_ordinaryPathMetricsAtStart;
+	OrdinaryPathRuntimeMetrics m_ordinaryPathMetricsFrozen;
+	Bool m_ordinaryPathMetricsAwaitingInitialReset;
 #endif
 };
 
@@ -642,6 +717,154 @@ int countProcessesRunning(const std::vector<WorkerProcess>& processes)
 	return numProcessesRunning;
 }
 } // namespace
+
+#if defined(_WIN64)
+PerformanceReceiptRuntime::PerformanceReceiptRuntime() : m_active(false) {}
+
+bool PerformanceReceiptRuntime::begin(const char *fixtureKind, const char *replayPath)
+{
+	if (!m_lifecycle.begin()) return false;
+#if defined(RTS_GENERALS)
+	const char *title = "Generals";
+#elif defined(RTS_ZEROHOUR)
+	const char *title = "ZeroHour";
+#else
+	const char *title = "Unknown";
+#endif
+	std::string reason;
+	if (!rts::performance::BeginPerformanceReceipt(m_receipt, title, replayPath, 0, &reason) ||
+		m_receipt.fixtureKind != fixtureKind)
+	{
+		if (reason.empty()) reason = "receipt fixture kind does not match its real owner";
+		printf("SIMULATION_PERFORMANCE_RECEIPT status=unsupported reason=%s\n", reason.c_str());
+		fflush(stdout);
+		return false;
+	}
+	m_receipt.simulationMode = simulationModeName(rts::GetSimulationExecutionMode());
+	rts::performance::KernelPerformanceLedger::instance().beginRun(true);
+	rts::performance::KernelPerformanceReferenceLedger::instance().beginRun(
+		m_receipt.kernelReference.mode);
+	m_active = true;
+	return true;
+}
+
+void PerformanceReceiptRuntime::invalidate(const char *reason)
+{
+	if (active() && m_failure.empty()) m_failure = reason;
+}
+
+void PerformanceReceiptRuntime::bindFixture(const char *kind, const char *contentPath,
+	const char *sha256, unsigned seed)
+{
+	if (!active()) return;
+	std::string reason;
+	if (!rts::performance::BindPerformanceReceiptFixtureObservation(m_receipt,
+		kind, contentPath, sha256, seed, &reason)) invalidate(reason.c_str());
+}
+
+void PerformanceReceiptRuntime::captureCompletedFrame(unsigned previousFrame,
+	const rts::CollisionCandidateRuntimeMetrics &collision,
+	const rts::PhysicsIntegrationRuntimeMetrics &physics,
+	const rts::ObjectStatusTimerRuntimeMetrics &status,
+	const rts::ImmutableSpatialRuntimeMetrics &spatial,
+	const OrdinaryPathRuntimeMetrics &path)
+{
+	if (!active() || TheGameLogic == 0 || ThePlayerList == 0) return;
+	const unsigned frame = TheGameLogic->getFrame();
+	if (frame <= previousFrame || !m_lifecycle.observeCompletedFrame(frame)) return;
+	unsigned players = 0;
+	for (Int index = 0; index < ThePlayerList->getPlayerCount(); ++index)
+	{
+		Player *player = ThePlayerList->getNthPlayer(index);
+		if (player != 0 && rts::performance::IsPerformanceReceiptRosterPlayer(
+			player->isPlayableSide() != FALSE, player->isPlayerObserver() != FALSE)) ++players;
+	}
+	unsigned units = 0;
+	for (Object *object = TheGameLogic->getFirstObject(); object != 0;
+		object = object->getNextObject())
+	{
+		if (rts::performance::IsPerformanceReceiptLiveUnit(
+			object->isKindOf(KINDOF_INFANTRY) != FALSE,
+			object->isKindOf(KINDOF_VEHICLE) != FALSE,
+			object->isEffectivelyDead() != FALSE, object->isDestroyed() != FALSE)) ++units;
+	}
+	if (!rts::performance::ObservePerformanceReceiptWorkload(m_receipt.workload,
+		frame, players, units))
+	{
+		invalidate("completed-frame workload could not be retained");
+		return;
+	}
+	capturePerformanceReceiptMetrics(m_receipt, collision, physics, status, spatial,
+		TheGameLogic->getStage5PhaseRuntimeMetrics(), rts::GetAIPlanningRuntimeMetrics(), path);
+}
+
+void PerformanceReceiptRuntime::captureTerminalResult(unsigned actualFrame,
+	unsigned crc, bool crcKnown, bool clean)
+{
+	if (!active()) return;
+	if (!crcKnown || !clean || !m_lifecycle.captureTerminalResult(actualFrame, crc))
+		invalidate("clean terminal owner frame and CRC were not captured exactly once");
+}
+
+void PerformanceReceiptRuntime::captureSchedulerBeforeTeardown()
+{
+	if (!active()) return;
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	m_receipt.simulationMode = simulationModeName(rts::GetSimulationExecutionMode());
+	m_receipt.schedulerStarted = m_receipt.schedulerStarted || jobs.isRunning();
+	std::string reason;
+	if (!rts::performance::CapturePerformanceReceiptJobSystem(m_receipt,
+		jobs, jobs.metrics(), &reason)) invalidate(reason.c_str());
+}
+
+void PerformanceReceiptRuntime::retainClosedReplay(const char *path, const char *sha256)
+{
+	if (!active()) return;
+	m_receipt.retainedReplayPath = path;
+	m_receipt.retainedReplaySha256 = sha256;
+}
+
+void PerformanceReceiptRuntime::finish(int exitCode, const char *boundary)
+{
+	if (!active()) return;
+	// No game globals or owner registration are needed below this boundary.
+	const rts::JobSystem &jobs = rts::JobSystem::instance();
+	const unsigned outstanding = jobs.outstandingJobCount();
+	const unsigned ownerCompletions = jobs.pendingOwnerCompletionCount();
+	const bool complete = m_lifecycle.finish(outstanding, ownerCompletions);
+	if (outstanding == 0 && ownerCompletions == 0)
+	{
+		m_receipt.kernelTiming = rts::performance::KernelPerformanceLedger::instance().freeze();
+		m_receipt.kernelReference = rts::performance::KernelPerformanceReferenceLedger::instance().freeze();
+	}
+	m_receipt.frameStart = 0;
+	m_receipt.frameEnd = m_lifecycle.terminalFrame();
+	m_receipt.finalFrame = m_lifecycle.terminalFrame();
+	m_receipt.finalCrc = m_lifecycle.terminalCrc();
+	m_receipt.finalCrcKnown = m_lifecycle.terminalResultKnown();
+	const bool timingClosed = resolvePerformanceReceiptTimingPath(m_receipt);
+	std::string reason = m_failure;
+	if (reason.empty() && !complete)
+		reason = "owner lifecycle is incomplete or authoritative work is not drained";
+	if (reason.empty() && exitCode != 0) reason = "owner run did not exit cleanly";
+	if (reason.empty() && !timingClosed) reason = "closed frame-timing CSV could not be resolved";
+	const bool clean = reason.empty();
+	const bool rawClosed = clean && writePerformanceReceiptRawDiagnostic(m_receipt);
+	if (clean && !rawClosed) reason = "game-owned raw diagnostic could not be closed";
+	const bool resultCaptured = rawClosed && rts::performance::SetPerformanceReceiptReplayResult(
+		m_receipt, m_receipt.frameStart, m_receipt.finalFrame, m_receipt.finalCrc,
+		m_receipt.finalCrcKnown, exitCode, true, boundary, true, &reason);
+	std::string writtenPath;
+	const bool written = resultCaptured && rts::performance::WritePerformanceReceiptAtomically(
+		m_receipt, m_receipt.outputDirectory.c_str(), &writtenPath, &reason);
+	if (written)
+		printf("SIMULATION_PERFORMANCE_RECEIPT status=written path=%s\n", writtenPath.c_str());
+	else
+		printf("SIMULATION_PERFORMANCE_RECEIPT status=unsupported reason=%s\n", reason.c_str());
+	fflush(stdout);
+	m_active = false;
+}
+#endif
 
 int ReplaySimulation::simulateReplaysInThisProcess(const std::vector<AsciiString> &filenames)
 {
@@ -681,32 +904,46 @@ int ReplaySimulation::simulateReplaysInThisProcess(const std::vector<AsciiString
 	// A receipt is intentionally one executable-owned artifact per process.
 	// Multi-replay and worker-process orchestration remain caller-owned and do
 	// not get a synthetic aggregate receipt here.
-	rts::performance::PerformanceReceipt performanceReceipt;
-	bool performanceReceiptRequested = filenames.size() == 1;
+	PerformanceReceiptRuntime performanceReceipt;
+	char performanceSourcePath[MAX_PATH] = {0};
+	const bool performanceSourcePathValid = filenames.size() == 1 &&
+		rts::replay::ResolveReplayPlaybackPath(RecorderClass::getReplayDir().str(),
+			filenames[0].str(), true, performanceSourcePath, sizeof(performanceSourcePath));
+	if (filenames.size() == 1 && !performanceSourcePathValid)
+	{
+		printf("Invalid native headless replay path: %s\n", filenames[0].str());
+		return 1;
+	}
+	const bool performanceReceiptRequested = performanceSourcePathValid &&
+		performanceReceipt.begin("replay", performanceSourcePath);
+	ImmutableReplayReceiptSource performanceSource;
 	if (performanceReceiptRequested)
 	{
-#if defined(RTS_GENERALS)
-		const char *performanceReceiptTitle = "Generals";
-#elif defined(RTS_ZEROHOUR)
-		const char *performanceReceiptTitle = "ZeroHour";
-#else
-		const char *performanceReceiptTitle = "Unknown";
-#endif
-		std::string reason;
-		if (!rts::performance::BeginPerformanceReceipt(performanceReceipt,
-			performanceReceiptTitle, filenames[0].str(), 0, &reason))
-		{
-			performanceReceiptRequested = false;
-			printf("SIMULATION_PERFORMANCE_RECEIPT status=unsupported reason=%s\n",
-				reason.c_str());
-			fflush(stdout);
-		}
+		if (!performanceSource.open(performanceSourcePath))
+			performanceReceipt.invalidate("immutable replay content could not be hashed");
 	}
 #endif
 	for (size_t i = 0; i < filenames.size(); i++)
 	{
 		rts::frame_timing::Session frameTimingSession("headless");
 		AsciiString filename = filenames[i];
+		AsciiString playbackFilename = filename;
+#if defined(_WIN64)
+		if (performanceSourcePathValid)
+			playbackFilename = performanceSourcePath;
+		else
+		{
+			char resolvedPath[MAX_PATH];
+			if (!rts::replay::ResolveReplayPlaybackPath(RecorderClass::getReplayDir().str(),
+				filename.str(), true, resolvedPath, sizeof(resolvedPath)))
+			{
+				printf("Invalid native headless replay path: %s\n", filename.str());
+				++numErrors;
+				continue;
+			}
+			playbackFilename = resolvedPath;
+		}
+#endif
 		HeadlessSimulationJobSystemScope simulationJobs(filename.str(),
 			requestedPipelineMode,
 #if defined(_WIN64)
@@ -719,9 +956,20 @@ int ReplaySimulation::simulateReplaysInThisProcess(const std::vector<AsciiString
 		printf("Simulating Replay \"%s\"\n", filename.str());
 		fflush(stdout);
 		DWORD startTimeMillis = GetTickCount();
-		if (TheRecorder->simulateReplay(filename))
+		if (TheRecorder->simulateReplay(playbackFilename))
 		{
 			Bool replayFailed = FALSE;
+#if defined(_WIN64)
+			if (performanceReceiptRequested)
+			{
+				const GameInfo *recordedGame = TheRecorder->getGameInfo();
+				if (recordedGame != 0 && performanceSource.sha256()[0] != '\0')
+					performanceReceipt.bindFixture("replay", performanceSourcePath,
+						performanceSource.sha256(), static_cast<unsigned>(recordedGame->getSeed()));
+				else
+					performanceReceipt.invalidate("loaded replay identity was unavailable");
+			}
+#endif
 			if (TheRecorder->hasReplayReadError())
 			{
 				printf("REPLAY_FAIL reason=malformed_command\n");
@@ -735,7 +983,8 @@ int ReplaySimulation::simulateReplaysInThisProcess(const std::vector<AsciiString
 			UnsignedInt totalTimeSec = TheRecorder->getPlaybackFrameCount() / LOGICFRAMES_PER_SECOND;
 			while (TheRecorder->isPlaybackInProgress())
 			{
-				rts::frame_timing::BeginFrame(TheGameLogic->getFrame());
+				const unsigned previousFrame = TheGameLogic->getFrame();
+				rts::frame_timing::BeginFrame(previousFrame);
 				// Freeze the last completed frame before a terminal
 				// MSG_CLEAR_GAME_DATA can advance the slice reset epochs.
 				simulationJobs.captureSliceMetrics();
@@ -755,6 +1004,9 @@ int ReplaySimulation::simulateReplaysInThisProcess(const std::vector<AsciiString
 				}
 				simulationJobs.captureSliceMetrics();
 				rts::frame_timing::EndFrame(TheGameLogic->getFrame());
+				// The diagnostic object scan remains inside the measured process
+				// runtime; no estimated observer cost is subtracted.
+				simulationJobs.captureCompletedFrameMetrics(previousFrame);
 				if (TheRecorder->hasReplayReadError())
 				{
 					printf("REPLAY_FAIL reason=malformed_command\n");
@@ -815,41 +1067,8 @@ int ReplaySimulation::simulateReplaysInThisProcess(const std::vector<AsciiString
 
 #if defined(_WIN64)
 	if (performanceReceiptRequested)
-	{
-		std::string reason;
-		std::string writtenPath;
-		const bool clean = numErrors == 0;
-		// The frame-timing session is destroyed at the end of the replay loop,
-		// so resolve its single closed CSV before the executable hashes it.
-		const bool timingEvidenceClosed =
-			resolvePerformanceReceiptTimingPath(performanceReceipt);
-		const bool rawEvidenceClosed =
-			timingEvidenceClosed &&
-			writePerformanceReceiptRawDiagnostic(performanceReceipt);
-		const bool resultCaptured = rawEvidenceClosed &&
-			rts::performance::SetPerformanceReceiptReplayResult(
-				performanceReceipt, performanceReceipt.frameStart,
-				performanceReceipt.finalFrame, performanceReceipt.finalCrc,
-				performanceReceipt.finalCrcKnown,
-				clean ? 0 : 1, true,
-				"ReplaySimulation::simulateReplaysInThisProcess:return", clean,
-				&reason);
-		if (!rawEvidenceClosed)
-			reason = timingEvidenceClosed ?
-				"game-owned raw diagnostic could not be closed" :
-				"closed frame-timing CSV could not be resolved";
-		const bool written = resultCaptured &&
-			rts::performance::WritePerformanceReceiptAtomically(
-				performanceReceipt, performanceReceipt.outputDirectory.c_str(),
-				&writtenPath, &reason);
-		if (written)
-			printf("SIMULATION_PERFORMANCE_RECEIPT status=written path=%s\n",
-				writtenPath.c_str());
-		else
-			printf("SIMULATION_PERFORMANCE_RECEIPT status=unsupported reason=%s\n",
-				reason.c_str());
-		fflush(stdout);
-	}
+		performanceReceipt.finish(numErrors != 0 ? 1 : 0,
+			"ReplaySimulation::simulateReplaysInThisProcess:return");
 #endif
 
 	return numErrors != 0 ? 1 : 0;
@@ -993,6 +1212,21 @@ std::vector<AsciiString> ReplaySimulation::resolveFilenameWildcards(const std::v
 
 int ReplaySimulation::simulateReplays(const std::vector<AsciiString> &filenames, int maxProcesses)
 {
+#if defined(_WIN64)
+	if (TheGlobalData->m_headless)
+	{
+		for (size_t i = 0; i < filenames.size(); ++i)
+		{
+			char resolvedPath[MAX_PATH];
+			if (!rts::replay::ResolveReplayPlaybackPath(RecorderClass::getReplayDir().str(),
+				filenames[i].str(), true, resolvedPath, sizeof(resolvedPath)))
+			{
+				printf("Invalid native headless replay path: %s\n", filenames[i].str());
+				return 1;
+			}
+		}
+	}
+#endif
 	std::vector<AsciiString> filenamesResolved = resolveFilenameWildcards(filenames);
 	if (maxProcesses == SIMULATE_REPLAYS_SEQUENTIAL)
 		return simulateReplaysInThisProcess(filenamesResolved);

@@ -5,6 +5,9 @@
 */
 #include "Lib/ImmutableSpatialQuery.h"
 #include "Lib/ImmutableSpatialQueryRuntime.h"
+#if defined(_WIN64)
+#include "Lib/KernelPerformanceDiagnostics.h"
+#endif
 #include "../TestSupport/LocalCapacityTestLane.h"
 
 #include <algorithm>
@@ -326,6 +329,7 @@ struct GenerationContext
 {
 	ImmutableSpatialGeneration arenaGeneration = {};
 	ImmutableSpatialUInt32 arenaCalls = 0;
+	ImmutableSpatialUInt32 objectCalls = 0;
 	ImmutableSpatialUInt32 failArenaCall = 0;
 	ImmutableSpatialUInt32 staleObjectID = 0;
 };
@@ -344,7 +348,9 @@ bool resolveArena(const ImmutableSpatialGeneration *expected, void *opaque)
 bool resolveObject(ImmutableSpatialUInt32 objectID,
 	const ImmutableSpatialGeneration *, void *opaque)
 {
-	return objectID != static_cast<GenerationContext *>(opaque)->staleObjectID;
+	auto &context = *static_cast<GenerationContext *>(opaque);
+	++context.objectCalls;
+	return objectID != context.staleObjectID;
 }
 
 struct RunStorage
@@ -1046,6 +1052,22 @@ bool outputStillSentinel(const RunStorage &storage)
 	return storage.outputCount == 0xccccccccu;
 }
 
+#if defined(_WIN64)
+struct SpatialPerformanceClock
+{
+	SpatialPerformanceClock() : value(100) {}
+	rts::JobMetricCounter value;
+
+	static rts::JobMetricCounter read(void *context)
+	{
+		SpatialPerformanceClock &clock =
+			*static_cast<SpatialPerformanceClock *>(context);
+		return ++clock.value;
+	}
+};
+
+#endif
+
 void testFailureCancellationCapacityAndNoPublication()
 {
 	Fixture fixture;
@@ -1353,6 +1375,475 @@ void testJobSystemWrapperPhysicalTransactionalAndFaults()
 		metrics.maximumCollectionDistinctPhysicalWorkers == 0 &&
 		metrics.maximumCollectionPeakConcurrentPhysicalWorkers == 0,
 		"immutable spatial collection metrics reset at the lifecycle boundary");
+}
+
+void testJobSystemWrapperPerformanceLedgerHooks()
+{
+#if defined(_WIN64)
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 2;
+	config.queueCapacity = 64;
+	config.scratchBytesPerWorker = 4096;
+	config.pinWorkers = false;
+	expect(jobs.start(config), "spatial performance hook workers start");
+	expect(jobs.registerCurrentThread(rts::JOB_OWNER_GAME),
+		"spatial performance hook registers game owner");
+
+	SpatialPerformanceClock clock;
+	rts::performance::KernelPerformanceLedger ledger;
+	expect(ledger.beginRun(true, SpatialPerformanceClock::read, &clock),
+		"spatial performance hook ledger starts");
+	const rts::performance::KernelPerformanceBatch batch = ledger.beginBatch(
+		rts::performance::KERNEL_PERFORMANCE_SPATIAL, 0, 42, 1);
+	expect(batch.valid(), "spatial performance hook uses subtype-zero batch");
+
+	const rts::performance::KernelPerformanceInterval capture =
+		ledger.beginInterval(batch, rts::performance::KERNEL_PERFORMANCE_CAPTURE);
+	Fixture fixture;
+	std::vector<ImmutableSpatialQuery> queries(4, baseQuery(fixture));
+	GenerationContext generationContext;
+	generationContext.arenaGeneration = fixture.arenaGeneration;
+	expect(ledger.endInterval(capture),
+		"spatial performance hook captures and closes the arena interval");
+
+	ImmutableSpatialJobSystemOptions inertOptions;
+	expect(inertOptions.performanceLedger == 0 &&
+		!inertOptions.performanceBatch.valid(),
+		"spatial performance transport defaults to an inert token");
+	ImmutableSpatialJobSystemOptions options;
+	options.performanceLedger = &ledger;
+	options.performanceBatch = batch;
+	RunStorage storage(4, 2, 5, 16);
+	ImmutableSpatialBatchScratch scratch = storage.scratch();
+	ImmutableSpatialJobSystemMetrics jobMetrics;
+	ImmutableSpatialStatus kernelStatus = IMMUTABLE_SPATIAL_INVALID_ARGUMENT;
+	expect(ExecuteImmutableSpatialQueryBatchOnJobSystem(
+		fixture.arena.data(), fixture.arenaBytes, queries.data(),
+		static_cast<ImmutableSpatialUInt32>(queries.size()), resolveArena,
+		resolveObject, &generationContext, scratch, storage.output.data(),
+		static_cast<ImmutableSpatialUInt32>(storage.output.size()),
+		storage.spans.data(),
+		static_cast<ImmutableSpatialUInt32>(storage.spans.size()),
+		&storage.outputCount, options, &jobMetrics, nullptr, &kernelStatus) ==
+		IMMUTABLE_SPATIAL_JOB_SYSTEM_SUCCESS &&
+		kernelStatus == IMMUTABLE_SPATIAL_SUCCESS,
+		"spatial performance hook wraps a successful shared collection");
+
+	const rts::performance::KernelPerformanceInterval validate =
+		ledger.beginInterval(batch,
+			rts::performance::KERNEL_PERFORMANCE_VALIDATE);
+	expect(validate.valid() && ValidateImmutableSpatialResultSpans(
+		storage.spans.data(), static_cast<ImmutableSpatialUInt32>(queries.size()),
+		storage.outputCount),
+		"spatial performance hook validates the published spans");
+	expect(ledger.endInterval(validate),
+		"spatial performance hook validation interval closes");
+
+	const rts::performance::KernelPerformanceInterval commit =
+		ledger.beginInterval(batch, rts::performance::KERNEL_PERFORMANCE_COMMIT);
+	std::vector<ImmutableSpatialResult> ownerPublished = storage.output;
+	expect(commit.valid() && ownerPublished.size() == storage.output.size(),
+		"spatial performance hook records an owner publication");
+	expect(ledger.endInterval(commit),
+		"spatial performance hook commit interval closes");
+	expect(ledger.endBatch(batch,
+		rts::performance::KERNEL_PERFORMANCE_COMMITTED),
+		"spatial performance hook commits after all five stages");
+	const rts::performance::KernelPerformanceSnapshot snapshot = ledger.freeze();
+	expect(snapshot.complete && snapshot.streamCount == 1,
+		"spatial performance hook freezes a complete ledger stream");
+	if (snapshot.streamCount == 1)
+	{
+		const rts::performance::KernelPerformanceStream &stream =
+			snapshot.streams[0];
+		expect(stream.kernel == rts::performance::KERNEL_PERFORMANCE_SPATIAL &&
+			stream.subtype == 0 && stream.attemptedBatches == 1 &&
+			stream.admittedBatches == 1 && stream.committedBatches == 1 &&
+			stream.abortedBatches == 0,
+			"spatial performance hook keeps one shared subtype-zero commit");
+		expect(stream.stageSamples[rts::performance::KERNEL_PERFORMANCE_CAPTURE] == 1 &&
+			stream.stageSamples[rts::performance::KERNEL_PERFORMANCE_VALIDATE] == 1 &&
+			stream.stageSamples[rts::performance::KERNEL_PERFORMANCE_COMMIT] == 1 &&
+			stream.stageSamples[rts::performance::KERNEL_PERFORMANCE_SCHEDULE] ==
+				jobMetrics.dispatches &&
+			stream.stageSamples[rts::performance::KERNEL_PERFORMANCE_WAIT] ==
+				jobMetrics.dispatches,
+			"spatial performance hook accounts each shared scheduler phase once per dispatch");
+		expect(stream.stageSamples[rts::performance::KERNEL_PERFORMANCE_SCHEDULE] <=
+			jobMetrics.dispatches &&
+			stream.stageSamples[rts::performance::KERNEL_PERFORMANCE_WAIT] <=
+			jobMetrics.dispatches &&
+			jobMetrics.dispatches < static_cast<unsigned>(queries.size()),
+			"spatial performance hook never charges scheduler work once per consumer");
+	}
+
+	expect(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME),
+		"spatial performance hook unregisters game owner");
+	jobs.shutdown();
+#endif
+}
+
+void testSpatialCollectionCompletionIdentity()
+{
+#if defined(_WIN64)
+	ImmutableSpatialCollectionCompletion completion;
+	ImmutableSpatialConsumerCompletionToken first;
+	first.batchEpoch = 11;
+	first.queryOrdinal = 0;
+	ImmutableSpatialConsumerCompletionToken second = first;
+	second.queryOrdinal = 1;
+	completion.reset(11);
+	completion.expectedConsumers = 2;
+	expect(completion.complete(IMMUTABLE_SPATIAL_CONSUMER_HEALING, first, true) &&
+		!completion.finished(), "spatial first consumer leaves collection pending");
+	expect(!completion.complete(IMMUTABLE_SPATIAL_CONSUMER_HEALING, first, true) &&
+		completion.completedConsumers == 1 && !completion.finished(),
+		"spatial duplicate query completion cannot finish another consumer");
+	expect(completion.complete(IMMUTABLE_SPATIAL_CONSUMER_POINT_DEFENSE_LASER,
+		second, true) && completion.finished() && completion.allConsumersCommitted,
+		"spatial distinct query completions commit exactly one collection");
+
+	completion.reset(12);
+	completion.expectedConsumers = 2;
+	expect(!completion.complete(IMMUTABLE_SPATIAL_CONSUMER_HEALING, first, true) &&
+		completion.completedConsumers == 0,
+		"spatial old epoch cannot complete a recaptured collection");
+	first.batchEpoch = second.batchEpoch = 12;
+	ImmutableSpatialConsumerCompletionToken unrelated = first;
+	unrelated.queryOrdinal = 2;
+	expect(!completion.complete(IMMUTABLE_SPATIAL_CONSUMER_HEALING,
+		unrelated, true) && completion.completedConsumers == 0,
+		"spatial unrelated query ordinal cannot advance collection completion");
+
+	completion.reset(12);
+	completion.expectedConsumers = 2;
+	expect(completion.complete(IMMUTABLE_SPATIAL_CONSUMER_HEALING, first, false) &&
+		!completion.finished(), "spatial failed consumer keeps partial batch pending");
+	expect(completion.complete(IMMUTABLE_SPATIAL_CONSUMER_POINT_DEFENSE_LASER,
+		second, true) && completion.finished() && !completion.allConsumersCommitted,
+		"spatial partial or empty consumer conservatively aborts full batch");
+	expect(!completion.complete(IMMUTABLE_SPATIAL_CONSUMER_POINT_DEFENSE_LASER,
+		second, true), "spatial completed collection cannot finish twice");
+#endif
+}
+
+void testJobSystemWrapperReferenceHooks()
+{
+#if defined(_WIN64)
+	using namespace rts::performance;
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 2;
+	config.queueCapacity = 64;
+	config.scratchBytesPerWorker = 4096;
+	config.pinWorkers = false;
+	expect(jobs.start(config), "spatial reference workers start");
+	expect(jobs.registerCurrentThread(rts::JOB_OWNER_GAME),
+		"spatial reference registers game owner");
+	ImmutableSpatialJobSystemOptions defaults;
+	expect(defaults.referenceLedger == nullptr && defaults.referenceBatch == nullptr &&
+		defaults.queryOwners == nullptr && defaults.queryOwnerCount == 0,
+		"spatial reference transport defaults to no diagnostic work");
+
+	Fixture fixture;
+	std::vector<ImmutableSpatialQuery> queries(4, baseQuery(fixture));
+	for (unsigned index = 0; index < queries.size(); ++index)
+		queries[index].iteratorOrder = index;
+	ImmutableSpatialQueryOwnerIdentity owners[4];
+	for (unsigned index = 0; index < 4; ++index)
+	{
+		owners[index].objectID = 100 + index;
+		owners[index].consumer = (index & 1) ?
+			IMMUTABLE_SPATIAL_CONSUMER_POINT_DEFENSE_LASER :
+			IMMUTABLE_SPATIAL_CONSUMER_HEALING;
+		owners[index].wakePriority = 10 + index;
+	}
+	std::vector<ImmutableSpatialResult> baseline;
+	std::vector<ImmutableSpatialResultSpan> baselineSpans;
+	unsigned baselineArenaCalls = 0;
+	unsigned baselineObjectCalls = 0;
+	for (int modeIndex = KERNEL_REFERENCE_DISABLED;
+		modeIndex <= KERNEL_REFERENCE_SERIAL_ORACLE; ++modeIndex)
+	{
+		const KernelPerformanceReferenceMode mode =
+			static_cast<KernelPerformanceReferenceMode>(modeIndex);
+		SpatialPerformanceClock timingClock;
+		SpatialPerformanceClock serialClock;
+		KernelPerformanceLedger timing;
+		KernelPerformanceReferenceLedger reference;
+		expect(timing.beginRun(true, SpatialPerformanceClock::read, &timingClock) &&
+			reference.beginRun(mode, SpatialPerformanceClock::read, &serialClock),
+			"spatial reference ledgers begin independently");
+		const KernelPerformanceBatch batch = timing.beginBatch(
+			KERNEL_PERFORMANCE_SPATIAL, 0, 42, 7);
+		const KernelPerformanceInterval capture = timing.beginInterval(batch,
+			KERNEL_PERFORMANCE_CAPTURE);
+		expect(timing.endInterval(capture), "spatial reference capture completes");
+		KernelPerformanceReferenceBatch referenceBatch;
+		ImmutableSpatialJobSystemOptions options;
+		options.performanceLedger = &timing;
+		options.performanceBatch = batch;
+		options.referenceLedger = &reference;
+		options.referenceBatch = &referenceBatch;
+		options.queryOwners = owners;
+		options.queryOwnerCount = 4;
+		GenerationContext generationContext;
+		generationContext.arenaGeneration = fixture.arenaGeneration;
+		RunStorage storage(4, 2, 5, 32);
+		ImmutableSpatialJobSystemMetrics metrics;
+		const JobMetricCounter beforeSerial = serialClock.value;
+		expect(ExecuteImmutableSpatialQueryBatchOnJobSystem(fixture.arena.data(),
+			fixture.arenaBytes, queries.data(), 4, resolveArena, resolveObject,
+			&generationContext, storage.scratch(), storage.output.data(),
+			static_cast<ImmutableSpatialUInt32>(storage.output.size()),
+			storage.spans.data(), 4, &storage.outputCount, options, &metrics) ==
+			IMMUTABLE_SPATIAL_JOB_SYSTEM_SUCCESS,
+			"spatial reference never changes real worker publication success");
+		const KernelPerformanceInterval validate = timing.beginInterval(batch,
+			KERNEL_PERFORMANCE_VALIDATE);
+		expect(ValidateImmutableSpatialResultSpans(storage.spans.data(), 4,
+			storage.outputCount) && timing.endInterval(validate),
+			"spatial reference owner validates complete published spans");
+		if (mode == KERNEL_REFERENCE_DISABLED)
+		{
+			baseline.assign(storage.output.begin(),
+				storage.output.begin() + storage.outputCount);
+			baselineSpans = storage.spans;
+			baselineArenaCalls = generationContext.arenaCalls;
+			baselineObjectCalls = generationContext.objectCalls;
+		}
+		else
+		{
+			expect(storage.outputCount == baseline.size() &&
+				memcmp(storage.output.data(), baseline.data(),
+					baseline.size() * sizeof(ImmutableSpatialResult)) == 0 &&
+				memcmp(storage.spans.data(), baselineSpans.data(),
+					baselineSpans.size() * sizeof(ImmutableSpatialResultSpan)) == 0,
+				"spatial reference and detached oracle never clobber actual outputs");
+			expect(generationContext.arenaCalls == baselineArenaCalls &&
+				generationContext.objectCalls == baselineObjectCalls,
+				"spatial detached oracle never calls the live generation resolver");
+		}
+		expect(referenceBatch.valid() == (mode != KERNEL_REFERENCE_DISABLED),
+			"spatial validated collection returns one owner-retained reference token");
+		if (mode != KERNEL_REFERENCE_SERIAL_ORACLE)
+			expect(serialClock.value == beforeSerial,
+				"spatial disabled and throughput modes never run the serial clock");
+		const KernelPerformanceInterval commit = timing.beginInterval(batch,
+			KERNEL_PERFORMANCE_COMMIT);
+		expect(timing.endInterval(commit) && timing.endBatch(batch,
+			KERNEL_PERFORMANCE_COMMITTED), "spatial owner completes original timing batch");
+		if (referenceBatch.valid())
+			expect(reference.finishBatch(referenceBatch, true),
+				"spatial owner closes reference only after collection commit");
+		const KernelPerformanceReferenceSnapshot snapshot = reference.freeze();
+		expect(snapshot.complete == (mode != KERNEL_REFERENCE_DISABLED) &&
+			snapshot.errors == 0 && snapshot.streamCount ==
+			(mode == KERNEL_REFERENCE_DISABLED ? 0u : 1u),
+			"spatial reference freezes one complete collection stream when enabled");
+		if (snapshot.streamCount == 1)
+		{
+			const KernelPerformanceReferenceStream &stream = snapshot.streams[0];
+			expect(stream.kernel == KERNEL_PERFORMANCE_SPATIAL && stream.subtype == 0 &&
+				stream.fieldSchema == 1 && stream.firstFrame == 42 && stream.lastFrame == 42 &&
+				stream.validatedBatchCount == 1 && stream.committedBatchCount == 1 &&
+				stream.validatedOperationCount == 4 && stream.committedOperationCount == 4 &&
+				stream.inputDigest.valid && stream.outputDigest.valid && stream.commitDigest.valid,
+				"spatial reference binds all operations to the shared timing identity");
+			expect(stream.serialSampleCount ==
+				(mode == KERNEL_REFERENCE_SERIAL_ORACLE ? 1u : 0u),
+				"spatial oracle performs exactly one detached serial collection");
+		}
+	}
+	expect(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME),
+		"spatial reference unregisters game owner");
+	jobs.shutdown();
+#endif
+}
+
+#if defined(_WIN64)
+rts::performance::KernelPerformanceReferenceSnapshot captureSpatialReference(
+	const Fixture &source, const std::vector<ImmutableSpatialQuery> &sourceQueries,
+	const std::vector<ImmutableSpatialQueryOwnerIdentity> &sourceOwners,
+	rts::performance::KernelPerformanceReferenceMode mode,
+	bool committed = true, unsigned extraCapacity = 0,
+	ImmutableSpatialJobSystemTestFault fault = IMMUTABLE_SPATIAL_JOB_SYSTEM_TEST_NONE,
+	bool omitOwners = false)
+{
+	using namespace rts::performance;
+	SpatialPerformanceClock clock;
+	KernelPerformanceLedger timing;
+	KernelPerformanceReferenceLedger reference;
+	expect(timing.beginRun(true, SpatialPerformanceClock::read, &clock) &&
+		reference.beginRun(mode, SpatialPerformanceClock::read, &clock),
+		"spatial canonical fixture starts both diagnostic ledgers");
+	const KernelPerformanceBatch batch = timing.beginBatch(KERNEL_PERFORMANCE_SPATIAL, 0, 42, 7);
+	const KernelPerformanceInterval capture = timing.beginInterval(batch, KERNEL_PERFORMANCE_CAPTURE);
+	KernelPerformanceReferenceBatch token;
+	{
+		// Every address passed to the synchronous callbacks is destroyed before
+		// finishBatch below, proving the retained token has no input lifetime.
+		std::vector<ImmutableSpatialUInt32> arena = source.arena;
+		std::vector<ImmutableSpatialQuery> queries = sourceQueries;
+		std::vector<ImmutableSpatialQueryOwnerIdentity> owners = sourceOwners;
+		const unsigned count = static_cast<unsigned>(queries.size());
+		const unsigned capacity = count * static_cast<unsigned>(source.objects.size()) + extraCapacity;
+		RunStorage output(count, 2, static_cast<unsigned>(source.objects.size()), capacity);
+		ImmutableSpatialJobSystemOptions options;
+		options.performanceLedger = &timing;
+		options.performanceBatch = batch;
+		options.referenceLedger = &reference;
+		options.referenceBatch = &token;
+		options.queryOwners = omitOwners ? nullptr : owners.data();
+		options.queryOwnerCount = omitOwners ? 0 : count;
+		options.testFault = fault;
+		GenerationContext generationContext;
+		generationContext.arenaGeneration = source.arenaGeneration;
+		expect(timing.endInterval(capture), "spatial canonical fixture finishes capture");
+		ImmutableSpatialJobSystemMetrics metrics;
+		const ImmutableSpatialJobSystemResult result = ExecuteImmutableSpatialQueryBatchOnJobSystem(
+			arena.data(), source.arenaBytes, queries.data(), count, resolveArena,
+			resolveObject, &generationContext, output.scratch(), output.output.data(), capacity,
+			output.spans.data(), count, &output.outputCount, options, &metrics);
+		expect((result == IMMUTABLE_SPATIAL_JOB_SYSTEM_SUCCESS) ==
+			(fault == IMMUTABLE_SPATIAL_JOB_SYSTEM_TEST_NONE),
+			"spatial reference metadata never selects gameplay success or fallback");
+		if (fault != IMMUTABLE_SPATIAL_JOB_SYSTEM_TEST_NONE)
+			expect(outputStillSentinel(output), "spatial failed reference batch preserves publication buffers");
+	}
+	if (committed)
+	{
+		const KernelPerformanceInterval commit = timing.beginInterval(batch, KERNEL_PERFORMANCE_COMMIT);
+		expect(timing.endInterval(commit), "spatial canonical fixture finishes owner commit");
+	}
+	expect(timing.endBatch(batch, committed ? KERNEL_PERFORMANCE_COMMITTED :
+		KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION), "spatial canonical fixture closes original timing batch");
+	if (token.valid())
+		expect(reference.finishBatch(token, committed), "spatial reference closes safely after arena expiry");
+	return reference.freeze();
+}
+#endif
+
+void testSpatialReferenceSemanticBindings()
+{
+#if defined(_WIN64)
+	using namespace rts::performance;
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 2;
+	config.queueCapacity = 64;
+	config.scratchBytesPerWorker = 4096;
+	config.pinWorkers = false;
+	expect(jobs.start(config) && jobs.registerCurrentThread(rts::JOB_OWNER_GAME),
+		"spatial canonical fixtures start physical workers and owner");
+	Fixture fixture;
+	std::vector<ImmutableSpatialQuery> queries(5, baseQuery(fixture));
+	std::vector<ImmutableSpatialQueryOwnerIdentity> owners(5);
+	for (unsigned index = 0; index != 5; ++index)
+	{
+		queries[index].iteratorOrder = index;
+		owners[index].objectID = 100 + index;
+		owners[index].consumer = (index & 1) ? IMMUTABLE_SPATIAL_CONSUMER_POINT_DEFENSE_LASER :
+			IMMUTABLE_SPATIAL_CONSUMER_HEALING;
+		owners[index].wakePriority = index + 20;
+	}
+	const KernelPerformanceReferenceSnapshot baseline = captureSpatialReference(
+		fixture, queries, owners, KERNEL_REFERENCE_THROUGHPUT_BINDING);
+	expect(baseline.complete && baseline.streamCount == 1, "spatial canonical baseline is complete");
+	const KernelPerformanceReferenceSnapshot relocated = captureSpatialReference(
+		fixture, queries, owners, KERNEL_REFERENCE_THROUGHPUT_BINDING, true, 31);
+	expect(relocated.complete && baseline.streams[0].inputDigest.equals(relocated.streams[0].inputDigest) &&
+		baseline.streams[0].outputDigest.equals(relocated.streams[0].outputDigest) &&
+		baseline.streams[0].commitDigest.equals(relocated.streams[0].commitDigest),
+		"spatial binding excludes arena addresses and unused scratch/output capacity");
+	const KernelPerformanceReferenceSnapshot oracle = captureSpatialReference(
+		fixture, queries, owners, KERNEL_REFERENCE_SERIAL_ORACLE);
+	expect(oracle.complete && oracle.streams[0].serialSampleCount == 1 &&
+		baseline.streams[0].inputDigest.equals(oracle.streams[0].inputDigest) &&
+		baseline.streams[0].outputDigest.equals(oracle.streams[0].outputDigest),
+		"spatial detached serial matches all five iterator orders on identical immutable input");
+	Fixture floatingPointFixture = fixture;
+	for (ImmutableSpatialObjectRecord &object : floatingPointFixture.objects) object.admissionMask = 0;
+	floatingPointFixture.objects[1].admissionMask = 1;
+	floatingPointFixture.objects[1].positionX = 1.0e-20f;
+	floatingPointFixture.build();
+	std::vector<ImmutableSpatialQuery> floatingPointQueries = queries;
+	for (ImmutableSpatialQuery &query : floatingPointQueries) query.maximumDistance = 1.0001e-20f;
+	const unsigned savedMxcsr = _mm_getcsr();
+	_mm_setcsr(savedMxcsr | _MM_FLUSH_ZERO_ON);
+	const KernelPerformanceReferenceSnapshot floatingPoint = captureSpatialReference(
+		floatingPointFixture, floatingPointQueries, owners, KERNEL_REFERENCE_SERIAL_ORACLE);
+	_mm_setcsr(savedMxcsr);
+	expect(floatingPoint.complete && floatingPoint.streams[0].serialSampleCount == 1,
+		"spatial detached serial preserves captured owner floating-point semantics");
+
+	for (unsigned mutation = 0; mutation != 11; ++mutation)
+	{
+		Fixture changed = fixture;
+		std::vector<ImmutableSpatialQuery> changedQueries = queries;
+		std::vector<ImmutableSpatialQueryOwnerIdentity> changedOwners = owners;
+		switch (mutation)
+		{
+		case 0: ++changedOwners[0].objectID; break;
+		case 1: changedOwners[0].consumer = IMMUTABLE_SPATIAL_CONSUMER_POINT_DEFENSE_LASER; break;
+		case 2: ++changedOwners[0].wakePriority; break;
+		case 3: changedQueries[0].positionZ = -0.0f; break;
+		case 4: changed.objects[4].boundingSphereRadius += 1.0f; break;
+		case 5: changed.cellSize = 20.0f; break;
+		case 6: std::swap(changed.members[0], changed.members[1]); break;
+		case 7: ++changed.objects[1].buildCost; break;
+		case 8: ++changed.objects[1].generation.facts; break;
+		case 9: changed.objects[1].positionX = 1.5f; break;
+		case 10: std::reverse(changedQueries.begin(), changedQueries.end()); break;
+		}
+		changed.build();
+		const KernelPerformanceReferenceSnapshot observed = captureSpatialReference(
+			changed, changedQueries, changedOwners, KERNEL_REFERENCE_THROUGHPUT_BINDING);
+		expect(observed.complete && !baseline.streams[0].inputDigest.equals(observed.streams[0].inputDigest),
+			"spatial binding changes for semantic owner geometry topology generation or query order");
+		if (mutation <= 5)
+			expect(baseline.streams[0].outputDigest.equals(observed.streams[0].outputDigest),
+				"spatial full input binding includes facts unused by this result set");
+		if (mutation >= 6)
+			expect(!baseline.streams[0].outputDigest.equals(observed.streams[0].outputDigest),
+				"spatial binding includes full ordered result facts and spans");
+	}
+	std::vector<ImmutableSpatialQuery> emptyQueries = queries;
+	for (ImmutableSpatialQuery &query : emptyQueries) query.requiredAdmissionMask = 0x80000000u;
+	const KernelPerformanceReferenceSnapshot empty = captureSpatialReference(
+		fixture, emptyQueries, owners, KERNEL_REFERENCE_SERIAL_ORACLE, false);
+	expect(empty.complete && empty.streams[0].validatedBatchCount == 1 &&
+		empty.streams[0].abortedBatchCount == 1 && empty.streams[0].committedBatchCount == 0 &&
+		empty.streams[0].serialSampleCount == 0,
+		"spatial empty detached result is validated but conservatively aborted without commit samples");
+	const KernelPerformanceReferenceSnapshot missingOwners = captureSpatialReference(
+		fixture, queries, owners, KERNEL_REFERENCE_SERIAL_ORACLE, true, 0,
+		IMMUTABLE_SPATIAL_JOB_SYSTEM_TEST_NONE, true);
+	expect(!missingOwners.complete && (missingOwners.errors & KERNEL_REFERENCE_ERROR_CALLBACK) != 0,
+		"spatial incomplete owner binding poisons diagnostics without changing gameplay publication");
+	const KernelPerformanceReferenceSnapshot failed = captureSpatialReference(
+		fixture, queries, owners, KERNEL_REFERENCE_SERIAL_ORACLE, false, 0,
+		IMMUTABLE_SPATIAL_JOB_SYSTEM_TEST_RANGE_FAILURE);
+	expect(!failed.complete && failed.errors == 0 && failed.streamCount == 0,
+		"spatial rejected worker batch never invokes reference observation");
+
+	SpatialPerformanceClock identityClock;
+	KernelPerformanceReferenceLedger identityLedger;
+	expect(identityLedger.beginRun(KERNEL_REFERENCE_THROUGHPUT_BINDING,
+		SpatialPerformanceClock::read, &identityClock), "spatial expected identity ledger starts");
+	const int marker = 0;
+	const auto writeMarker = [](KernelPerformanceCanonicalWriter &writer, const void *)
+		{ return writer.u32(1, 0); };
+	const KernelPerformanceReferenceBatch identityBatch = identityLedger.observeValidatedBatch(
+		KERNEL_PERFORMANCE_SPATIAL, 0, 42, 7, 1, 5, writeMarker, &marker, writeMarker, &marker);
+	expect(identityLedger.finishBatch(identityBatch, true), "spatial expected batch identity commits");
+	const KernelPerformanceReferenceSnapshot identity = identityLedger.freeze();
+	expect(identity.complete && baseline.streams[0].commitDigest.equals(identity.streams[0].commitDigest),
+		"spatial uses exact original timing frame ordinal and operation count");
+	expect(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME), "spatial canonical fixtures unregister owner");
+	jobs.shutdown();
+#endif
 }
 
 void testJobSystemWrapperOwnerFloatingPointParityAndFallback(bool localCapacity)
@@ -1736,6 +2227,10 @@ int main(int argc, char **argv)
 	testFailureCancellationCapacityAndNoPublication();
 	testGenerationAndMalformedArenaFailClosed();
 	testJobSystemWrapperPhysicalTransactionalAndFaults();
+	testJobSystemWrapperPerformanceLedgerHooks();
+	testSpatialCollectionCompletionIdentity();
+	testJobSystemWrapperReferenceHooks();
+	testSpatialReferenceSemanticBindings();
 	testJobSystemWrapperOwnerFloatingPointParityAndFallback(localCapacity);
 	testPersistentArenaRefreshBenchmarks();
 	testDeterministicAdmissionCostInversion();

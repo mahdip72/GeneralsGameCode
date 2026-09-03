@@ -616,7 +616,11 @@ struct AIPlanningJobSystemEvidence
 	AIPlanningJobSystemEvidence() : physicalWorkerMask(0U),
 		distinctPhysicalWorkers(0U), peakConcurrentPhysicalWorkers(0U),
 		physicalWorkerExecutions(0U), ownerHelpedJobs(0U),
-		resultsValidated(false) {}
+		resultsValidated(false)
+#if defined(_WIN64)
+		, performanceBatch(0), referenceBatch(0)
+#endif
+	{}
 
 	void collect(const AIPlayerPlanningJob::ExecutionRecord *execution,
 		uint32_t executionCount, uint32_t peak)
@@ -657,6 +661,10 @@ struct AIPlanningJobSystemEvidence
 	// every result is either owner-produced from those facts or canonically
 	// validated against its original immutable snapshot.
 	bool resultsValidated;
+#if defined(_WIN64)
+	performance::KernelPerformanceBatch *performanceBatch;
+	AIPlanningReferenceBatchTransport *referenceBatch;
+#endif
 };
 
 uint32_t CountAIPlanningJobs(const AIPlayerPlanningSnapshot *snapshots,
@@ -686,7 +694,17 @@ bool RunAIPlanningJobs(const AIPlayerPlanningSnapshot *snapshots,
 {
 	AIPlanningJobSystemEvidence *evidence =
 		static_cast<AIPlanningJobSystemEvidence *>(userData);
+	#if defined(_WIN64)
+	performance::KernelPerformanceBatch *performanceBatch =
+		evidence != 0 ? evidence->performanceBatch : 0;
+	AIPlanningReferenceBatchTransport *referenceBatch =
+		evidence != 0 ? evidence->referenceBatch : 0;
+	#endif
 	if (evidence != 0) *evidence = AIPlanningJobSystemEvidence();
+	#if defined(_WIN64)
+	if (evidence != 0) evidence->performanceBatch = performanceBatch;
+	if (evidence != 0) evidence->referenceBatch = referenceBatch;
+	#endif
 	// Admit only a shape with at least two meaningful jobs. A single due player
 	// can still qualify when its immutable production source view spans multiple
 	// candidate shards; one small player remains on the serial oracle.
@@ -697,6 +715,11 @@ bool RunAIPlanningJobs(const AIPlayerPlanningSnapshot *snapshots,
 		!jobs.isCurrentThread(JOB_OWNER_GAME) || jobs.workerCount() == 0U)
 		return false;
 
+#if defined(_WIN64)
+	AIPlanningPerformanceInterval schedule(
+		evidence != 0 ? evidence->performanceBatch : 0,
+		performance::KERNEL_PERFORMANCE_SCHEDULE);
+#endif
 	JobGroup group = jobs.createGroup();
 	if (!group.isValid())
 		return false;
@@ -787,6 +810,9 @@ bool RunAIPlanningJobs(const AIPlayerPlanningSnapshot *snapshots,
 		}
 	}
 
+#if defined(_WIN64)
+	schedule.end();
+#endif
 	if (submissionFailed)
 	{
 		jobs.cancel(group);
@@ -799,8 +825,17 @@ bool RunAIPlanningJobs(const AIPlayerPlanningSnapshot *snapshots,
 	// job. A short passive fence either proves physical-worker progress or
 	// cancels and falls back to the serial oracle.
 	const unsigned physicalCompletionTimeoutMilliseconds = 8U;
-	if (!jobs.waitWithoutOwnerHelp(group,
-			physicalCompletionTimeoutMilliseconds))
+#if defined(_WIN64)
+	AIPlanningPerformanceInterval wait(
+		evidence != 0 ? evidence->performanceBatch : 0,
+		performance::KERNEL_PERFORMANCE_WAIT);
+#endif
+	const bool passiveWaitCompleted = jobs.waitWithoutOwnerHelp(group,
+		physicalCompletionTimeoutMilliseconds);
+#if defined(_WIN64)
+	wait.end();
+#endif
+	if (!passiveWaitCompleted)
 	{
 		jobs.cancel(group);
 		jobs.wait(group);
@@ -826,6 +861,11 @@ bool RunAIPlanningJobs(const AIPlayerPlanningSnapshot *snapshots,
 	// Candidate shards have completed on physical workers. Compare the two
 	// independently derived POD outputs before either can become authoritative,
 	// then run the small deterministic winner reduction exactly once.
+#if defined(_WIN64)
+	AIPlanningPerformanceInterval validate(
+		evidence != 0 ? evidence->performanceBatch : 0,
+		performance::KERNEL_PERFORMANCE_VALIDATE);
+#endif
 	for (uint32_t player = 0U; player < snapshotCount; ++player)
 	{
 		if (sourceSharded[player])
@@ -846,6 +886,10 @@ bool RunAIPlanningJobs(const AIPlayerPlanningSnapshot *snapshots,
 			results[player]))
 			return false;
 	}
+#if defined(_WIN64)
+	ObserveAIPlanningReferenceBatch(performanceBatch, referenceBatch);
+	validate.end();
+#endif
 	if (evidence != 0) evidence->collect(execution, submitted,
 		peakPhysicalWorkers.load(std::memory_order_relaxed));
 	if (evidence != 0) evidence->resultsValidated = true;
@@ -854,6 +898,475 @@ bool RunAIPlanningJobs(const AIPlayerPlanningSnapshot *snapshots,
 		evidence->peakConcurrentPhysicalWorkers > 1U;
 }
 }
+
+#if defined(_WIN64)
+AIPlanningPerformanceInterval::AIPlanningPerformanceInterval(
+	performance::KernelPerformanceBatch *batch,
+	performance::KernelPerformanceStage stage) : m_ledger(0), m_interval()
+{
+	if (batch != 0 && batch->valid())
+	{
+		m_ledger = &performance::KernelPerformanceLedger::instance();
+		m_interval = m_ledger->beginInterval(*batch, stage);
+	}
+}
+
+AIPlanningPerformanceInterval::~AIPlanningPerformanceInterval()
+{
+	end();
+}
+
+bool AIPlanningPerformanceInterval::end()
+{
+	if (m_ledger == 0 || !m_interval.valid())
+		return false;
+	const bool ended = m_ledger->endInterval(m_interval);
+	m_interval = performance::KernelPerformanceInterval();
+	return ended;
+}
+
+bool AIPlanningPerformanceInterval::valid() const
+{
+	return m_ledger != 0 && m_interval.valid();
+}
+
+AIPlanningPerformanceBatchScope::AIPlanningPerformanceBatchScope(bool enabled,
+	performance::KernelPerformanceKernel kernel, unsigned subtype,
+	unsigned frame, JobMetricCounter ordinal) : m_ledger(0), m_batch(),
+	m_interval(), m_closed(false)
+{
+	// Do not touch the ledger while disabled. In particular, this keeps a
+	// disabled title path from reading its clock or changing diagnostic state.
+	if (!enabled)
+		return;
+	m_ledger = &performance::KernelPerformanceLedger::instance();
+	m_batch = m_ledger->beginBatch(kernel, subtype, frame, ordinal);
+}
+
+AIPlanningPerformanceBatchScope::~AIPlanningPerformanceBatchScope()
+{
+	abort();
+}
+
+performance::KernelPerformanceBatch *AIPlanningPerformanceBatchScope::token()
+{
+	return m_ledger != 0 && m_batch.valid() && !m_closed ? &m_batch : 0;
+}
+
+void AIPlanningPerformanceBatchScope::begin(
+	performance::KernelPerformanceStage stage)
+{
+	if (m_closed || m_ledger == 0 || !m_batch.valid())
+		return;
+	end();
+	m_interval = m_ledger->beginInterval(m_batch, stage);
+}
+
+bool AIPlanningPerformanceBatchScope::end()
+{
+	if (m_ledger == 0 || !m_interval.valid())
+		return false;
+	const bool ended = m_ledger->endInterval(m_interval);
+	m_interval = performance::KernelPerformanceInterval();
+	return ended;
+}
+
+void AIPlanningPerformanceBatchScope::finish(
+	performance::KernelPerformanceDisposition disposition)
+{
+	if (m_closed)
+		return;
+	end();
+	if (m_ledger != 0 && m_batch.valid())
+		m_ledger->endBatch(m_batch, disposition);
+	m_closed = true;
+}
+
+void AIPlanningPerformanceBatchScope::notAdmitted()
+{
+	finish(performance::KERNEL_PERFORMANCE_NOT_ADMITTED);
+}
+
+void AIPlanningPerformanceBatchScope::abort()
+{
+	finish(performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION);
+}
+
+void AIPlanningPerformanceBatchScope::commit()
+{
+	finish(performance::KERNEL_PERFORMANCE_COMMITTED);
+}
+
+AIPlanningReferenceBatchTransport::AIPlanningReferenceBatchTransport() :
+	referenceLedger(0), referenceBatch(0), writeInput(0), immutableInput(0),
+	writeOutput(0), productionOutput(0), serialCompute(0),
+	detachedSerialOutput(0), operationCount(0), fieldSchema(1U)
+{
+}
+
+namespace
+{
+bool WriteAIPlanningReferenceOrderKey(
+	performance::KernelPerformanceCanonicalWriter &writer,
+	const AIPlanningOrderKey &key, unsigned tag)
+{
+	return writer.u32(tag + 0U, key.frame) &&
+		writer.u32(tag + 1U, key.playerIndex) &&
+		writer.u32(tag + 2U, key.subphase) &&
+		writer.u32(tag + 3U, key.sourceOrdinal) &&
+		writer.u32(tag + 4U, key.emissionOrdinal);
+}
+
+bool WriteAIPlanningReferenceCounterKey(
+	performance::KernelPerformanceCanonicalWriter &writer,
+	const AICounterRngKey &key, unsigned tag)
+{
+	return writer.u32(tag + 0U, key.simulationEpoch) &&
+		writer.u32(tag + 1U, key.matchSeed) &&
+		writer.u32(tag + 2U, key.frame) &&
+		writer.u32(tag + 3U, key.domain) &&
+		writer.u32(tag + 4U, key.playerIndex) &&
+		writer.u32(tag + 5U, key.ownerStableId) &&
+		writer.u32(tag + 6U, key.sourceStableId) &&
+		writer.u32(tag + 7U, key.eventKind) &&
+		writer.u32(tag + 8U, key.eventOrdinal) &&
+		writer.u32(tag + 9U, key.drawOrdinal);
+}
+
+bool WriteAIPlanningReferenceCounterLedger(
+	performance::KernelPerformanceCanonicalWriter &writer,
+	const AICounterRngLedgerRecord &record, unsigned tag)
+{
+	return WriteAIPlanningReferenceCounterKey(writer, record.key, tag) &&
+		writer.u32(tag + 10U, record.algorithm) &&
+		writer.u32(tag + 11U, record.rawValue) &&
+		writer.u32(tag + 12U, record.exclusiveUpperBound) &&
+		writer.u32(tag + 13U, record.selectedIndex) &&
+		writer.u32(tag + 14U, record.valid);
+}
+
+bool WriteAIPlanningReferenceEnemySnapshot(
+	performance::KernelPerformanceCanonicalWriter &writer,
+	const AIEnemyPlanningSnapshot &snapshot, unsigned tag)
+{
+	if (snapshot.candidateCount > AI_PLANNING_MAX_PLAYERS ||
+		!writer.u32(tag + 0U, snapshot.frame) ||
+		!writer.u32(tag + 1U, snapshot.ownerPlayerIndex) ||
+		!writer.i32(tag + 2U, snapshot.currentEnemyPlayerIndex) ||
+		!writer.i32(tag + 3U, snapshot.switchScoreThreshold) ||
+		!writer.sequence(tag + 4U, snapshot.candidateCount))
+		return false;
+	for (uint32_t i = 0U; i < snapshot.candidateCount; ++i)
+	{
+		const AIEnemyCandidateFact &candidate = snapshot.candidates[i];
+		if (!writer.u32(tag + 5U, candidate.sourceOrdinal) ||
+			!writer.i32(tag + 6U, candidate.playerIndex) ||
+			!writer.i32(tag + 7U, candidate.knownAssetValue) ||
+			!writer.i32(tag + 8U, candidate.distance) ||
+			!writer.i32(tag + 9U, candidate.alliedAIsTargeting) ||
+			!writer.i32(tag + 10U, candidate.routeClass) ||
+			!writer.u32(tag + 11U, candidate.hasKnownPosition) ||
+			!writer.u32(tag + 12U, candidate.targetingThisAI) ||
+			!writer.u32(tag + 13U, candidate.hasKnownObject) ||
+			!writer.u32(tag + 14U, candidate.hasKnownUnit) ||
+			!writer.u32(tag + 15U, candidate.hasKnownBuildFacility))
+			return false;
+	}
+	return true;
+}
+
+bool WriteAIPlanningReferenceProductionSnapshot(
+	performance::KernelPerformanceCanonicalWriter &writer,
+	const AIProductionPlanningSnapshot &snapshot, unsigned tag)
+{
+	const AIProductionPlanningSourceFacts &facts = snapshot.sourceFacts;
+	if (snapshot.candidateCount > AI_PLANNING_MAX_PRODUCTION_CANDIDATES ||
+		facts.factoryCount > AI_PLANNING_MAX_PRODUCTION_FACTORIES ||
+		!writer.u32(tag + 0U, snapshot.frame) ||
+		!writer.u32(tag + 1U, snapshot.ownerPlayerIndex) ||
+		!writer.i32(tag + 2U, snapshot.resources) ||
+		!writer.i32(tag + 3U, snapshot.logicFramesPerSecond) ||
+		!writer.i32(tag + 4U, snapshot.initialReserve) ||
+		!writer.i32(tag + 5U, snapshot.retryReserve) ||
+		!writer.i32(tag + 6U, snapshot.difficulty) ||
+		!writer.i32(tag + 7U, snapshot.contextInfluencePercent) ||
+		!writer.u32(tag + 8U, snapshot.retryWithoutInitialReserve) ||
+		!writer.sequence(tag + 9U, snapshot.candidateCount) ||
+		!WriteAIPlanningReferenceCounterKey(writer, snapshot.tieBreakKey,
+			tag + 10U))
+		return false;
+	for (uint32_t i = 0U; i < snapshot.candidateCount; ++i)
+	{
+		const AIProductionCandidateFact &candidate = snapshot.candidates[i];
+		if (!writer.u32(tag + 20U, candidate.sourceOrdinal) ||
+			!writer.u32(tag + 21U, candidate.candidateStableId) ||
+			!writer.i32(tag + 22U, candidate.configuredPriority) ||
+			!writer.i32(tag + 23U, candidate.counterFitScore) ||
+			!writer.i32(tag + 24U, candidate.minimumCost) ||
+			!writer.i32(tag + 25U, candidate.plannedCost) ||
+			!writer.i32(tag + 26U, candidate.factoryWaitFrames) ||
+			!writer.i32(tag + 27U, candidate.routeClass) ||
+			!writer.i32(tag + 28U, candidate.recentLossCount) ||
+			!writer.i32(tag + 29U, candidate.recentPathFailureCount) ||
+			!writer.u32(tag + 30U, candidate.eligible))
+			return false;
+	}
+
+	if (!writer.u32(tag + 40U, facts.valid) ||
+		!writer.u32(tag + 41U, facts.factoryCount) ||
+		!writer.i32(tag + 42U, facts.enemyAircraftValue) ||
+		!writer.i32(tag + 43U, facts.enemyVehicleValue) ||
+		!writer.i32(tag + 44U, facts.enemyInfantryValue) ||
+		!writer.u32(tag + 45U, facts.hasRouteTarget) ||
+		!writer.u32(tag + 46U, facts.groundRouteKnown) ||
+		!writer.u32(tag + 47U, facts.groundRouteReachable) ||
+		!writer.sequence(tag + 48U, facts.factoryCount) ||
+		!writer.sequence(tag + 49U, snapshot.candidateCount))
+		return false;
+	for (uint32_t i = 0U; i < facts.factoryCount; ++i)
+	{
+		const AIProductionFactorySourceFact &factory = facts.factories[i];
+		if (!writer.i32(tag + 50U, factory.projectedFrames) ||
+			!writer.u32(tag + 51U, factory.valid) ||
+			!writer.u32(tag + 52U, factory.idle))
+			return false;
+	}
+	for (uint32_t i = 0U; i < snapshot.candidateCount; ++i)
+	{
+		const AIProductionCandidateSourceFact &candidate = facts.candidates[i];
+		if (candidate.unitCount > AI_PLANNING_MAX_PRODUCTION_UNITS ||
+			!writer.u32(tag + 60U, candidate.valid) ||
+			!writer.u32(tag + 61U, candidate.unitCount) ||
+			!writer.sequence(tag + 62U, candidate.unitCount))
+			return false;
+		for (uint32_t unitIndex = 0U; unitIndex < candidate.unitCount;
+			++unitIndex)
+		{
+			const AIProductionUnitSourceFact &unit = candidate.units[unitIndex];
+			if (!writer.i32(tag + 63U, unit.cost) ||
+				!writer.i32(tag + 64U, unit.buildFrames) ||
+				!writer.i32(tag + 65U, unit.minUnits) ||
+				!writer.i32(tag + 66U, unit.maxUnits) ||
+				!writer.u32(tag + 67U, unit.flags) ||
+				!writer.u32(tag + 68U, unit.compatibleFactoryMask) ||
+				!writer.sequence(tag + 69U, facts.factoryCount))
+				return false;
+			for (uint32_t factory = 0U; factory < facts.factoryCount; ++factory)
+				if (!writer.u32(tag + 70U,
+					unit.productionQuantity[factory]))
+					return false;
+		}
+	}
+	return true;
+}
+
+bool WriteAIPlanningReferenceEnemyResult(
+	performance::KernelPerformanceCanonicalWriter &writer,
+	const AIEnemyPlanningResult &result, unsigned tag)
+{
+	if (result.candidateScoreCount > AI_PLANNING_MAX_PLAYERS ||
+		!writer.u32(tag + 0U, result.valid) ||
+		!writer.i32(tag + 1U, result.selectedPlayerIndex) ||
+		!writer.i32(tag + 2U, result.selectedScore) ||
+		!writer.i32(tag + 3U, result.bestPlayerIndex) ||
+		!writer.i32(tag + 4U, result.bestScore) ||
+		!writer.u32(tag + 5U, result.candidateScoreCount) ||
+		!WriteAIPlanningReferenceOrderKey(writer, result.orderKey, tag + 6U) ||
+		!writer.sequence(tag + 11U, result.candidateScoreCount))
+		return false;
+	for (uint32_t i = 0U; i < result.candidateScoreCount; ++i)
+	{
+		const AIEnemyCandidateScore &score = result.candidateScores[i];
+		if (!writer.u32(tag + 12U, score.sourceOrdinal) ||
+			!writer.i32(tag + 13U, score.playerIndex) ||
+			!writer.i32(tag + 14U, score.knownAssetScore) ||
+			!writer.i32(tag + 15U, score.retaliationScore) ||
+			!writer.i32(tag + 16U, score.routeScore) ||
+			!writer.i32(tag + 17U, score.allyTargetScore) ||
+			!writer.i32(tag + 18U, score.distanceScore) ||
+			!writer.i32(tag + 19U, score.crippledScore) ||
+			!writer.i32(tag + 20U, score.totalScore))
+			return false;
+	}
+	return true;
+}
+
+bool WriteAIPlanningReferenceProductionResult(
+	performance::KernelPerformanceCanonicalWriter &writer,
+	const AIProductionPlanningResult &result, unsigned tag)
+{
+	if (result.candidateScoreCount > AI_PLANNING_MAX_PRODUCTION_CANDIDATES ||
+		!writer.u32(tag + 0U, result.valid) ||
+		!writer.u32(tag + 1U, result.hasSelection) ||
+		!writer.u32(tag + 2U, result.selectedSourceOrdinal) ||
+		!writer.u32(tag + 3U, result.selectedStableId) ||
+		!writer.u64(tag + 4U,
+			static_cast<JobMetricCounter>(result.selectedScore)) ||
+		!writer.i32(tag + 5U, result.highestPriority) ||
+		!writer.i32(tag + 6U, result.committedReserve) ||
+		!writer.u32(tag + 7U, result.tieCount) ||
+		!writer.u32(tag + 8U, result.usedRetryReserve) ||
+		!writer.u32(tag + 9U, result.candidateScoreCount) ||
+		!WriteAIPlanningReferenceOrderKey(writer, result.orderKey, tag + 10U) ||
+		!WriteAIPlanningReferenceCounterLedger(writer, result.randomLedger,
+			tag + 15U) ||
+		!writer.sequence(tag + 30U, result.candidateScoreCount))
+		return false;
+	for (uint32_t i = 0U; i < result.candidateScoreCount; ++i)
+	{
+		const AIProductionCandidateScore &score = result.candidateScores[i];
+		if (!writer.u32(tag + 31U, score.sourceOrdinal) ||
+			!writer.u32(tag + 32U, score.candidateStableId) ||
+			!writer.i32(tag + 33U, score.counterFitScore) ||
+			!writer.i32(tag + 34U, score.economyScore) ||
+			!writer.i32(tag + 35U, score.factoryWaitScore) ||
+			!writer.i32(tag + 36U, score.routeScore) ||
+			!writer.i32(tag + 37U, score.lossScore) ||
+			!writer.i32(tag + 38U, score.pathFailureScore) ||
+			!writer.i32(tag + 39U, score.rawContextScore) ||
+			!writer.u64(tag + 40U,
+				static_cast<JobMetricCounter>(score.finalScore)) ||
+			!writer.u32(tag + 41U, score.considered))
+			return false;
+	}
+	return true;
+}
+
+bool WriteAIPlanningReferenceInputFields(
+	performance::KernelPerformanceCanonicalWriter &writer,
+	const AIPlanningReferencePlayerInputView &view)
+{
+	if (!view.snapshots || view.count == 0U ||
+		view.count > AI_PLANNING_MAX_PLAYERS || view.subtype > 1U ||
+		!writer.u32(1U, view.subtype) || !writer.sequence(2U, view.count))
+		return false;
+	for (uint32_t i = 0U; i < view.count; ++i)
+	{
+		const AIPlayerPlanningSnapshot &snapshot = view.snapshots[i];
+		if (!writer.u32(3U, snapshot.frame) ||
+			!writer.u32(4U, snapshot.playerIndex) ||
+			!writer.u32(5U, snapshot.planEnemyTarget) ||
+			!writer.u32(6U, snapshot.planProduction))
+			return false;
+		if (view.subtype == AI_PLANNING_SUBPHASE_ENEMY_TARGET)
+		{
+			if (snapshot.planEnemyTarget == 0U ||
+				!WriteAIPlanningReferenceEnemySnapshot(writer,
+					snapshot.enemyTarget, 10U))
+				return false;
+		}
+		else if (snapshot.planProduction == 0U ||
+			!WriteAIPlanningReferenceProductionSnapshot(writer,
+				snapshot.production, 100U))
+			return false;
+	}
+	return true;
+}
+
+bool WriteAIPlanningReferenceOutputFields(
+	performance::KernelPerformanceCanonicalWriter &writer,
+	const AIPlanningReferencePlayerOutputView &view)
+{
+	if (!view.results || view.count == 0U ||
+		view.count > AI_PLANNING_MAX_PLAYERS || view.subtype > 1U ||
+		!writer.u32(1U, view.subtype) || !writer.sequence(2U, view.count))
+		return false;
+	for (uint32_t i = 0U; i < view.count; ++i)
+	{
+		const AIPlayerPlanningResult &result = view.results[i];
+		if (!writer.u32(3U, result.valid) ||
+			!writer.u32(4U, result.playerIndex))
+			return false;
+		if (view.subtype == AI_PLANNING_SUBPHASE_ENEMY_TARGET)
+		{
+			if (!WriteAIPlanningReferenceEnemyResult(writer,
+				result.enemyTarget, 10U))
+				return false;
+		}
+		else if (!WriteAIPlanningReferenceProductionResult(writer,
+			result.production, 100U))
+			return false;
+	}
+	return true;
+}
+}
+
+bool WriteAIPlanningReferenceInput(
+	performance::KernelPerformanceCanonicalWriter &writer,
+	const void *context)
+{
+	const AIPlanningReferencePlayerInputView *view =
+		static_cast<const AIPlanningReferencePlayerInputView *>(context);
+	return view != 0 && WriteAIPlanningReferenceInputFields(writer, *view);
+}
+
+bool WriteAIPlanningReferenceOutput(
+	performance::KernelPerformanceCanonicalWriter &writer,
+	const void *context)
+{
+	const AIPlanningReferencePlayerOutputView *view =
+		static_cast<const AIPlanningReferencePlayerOutputView *>(context);
+	return view != 0 && WriteAIPlanningReferenceOutputFields(writer, *view);
+}
+
+bool ComputeAIPlanningReferenceSerial(const void *immutableInput,
+	void *detachedOutput)
+{
+	const AIPlanningReferencePlayerInputView *inputView =
+		static_cast<const AIPlanningReferencePlayerInputView *>(immutableInput);
+	AIPlanningReferencePlayerOutputView *outputView =
+		static_cast<AIPlanningReferencePlayerOutputView *>(detachedOutput);
+	return inputView != 0 && outputView != 0 && inputView->snapshots != 0 &&
+		outputView->results != 0 && inputView->count != 0U &&
+		inputView->count <= AI_PLANNING_MAX_PLAYERS &&
+		outputView->count == inputView->count &&
+		outputView->subtype == inputView->subtype &&
+		PlanAIPlayerBatchSerial(inputView->snapshots, inputView->count,
+			outputView->results);
+}
+
+bool ObserveAIPlanningReferenceBatch(
+	performance::KernelPerformanceBatch *timingBatch,
+	AIPlanningReferenceBatchTransport *transport) noexcept
+{
+	if (transport == 0 || transport->referenceLedger == 0 ||
+		transport->referenceBatch == 0 || timingBatch == 0)
+		return false;
+	*transport->referenceBatch = performance::KernelPerformanceReferenceBatch();
+	if (transport->referenceLedger->mode() ==
+		performance::KERNEL_REFERENCE_DISABLED)
+		return false;
+	performance::KernelPerformanceBatchIdentity identity;
+	if (!performance::KernelPerformanceLedger::instance().describeBatch(
+		*timingBatch, identity))
+		return false;
+	const performance::KernelPerformanceReferenceBatch observed =
+		transport->referenceLedger->observeValidatedBatch(identity.kernel,
+			identity.subtype, identity.frame, identity.ordinal,
+			transport->fieldSchema, transport->operationCount,
+			transport->writeInput, transport->immutableInput,
+			transport->writeOutput, transport->productionOutput,
+			transport->serialCompute, transport->detachedSerialOutput);
+	if (!observed.valid())
+		return false;
+	*transport->referenceBatch = observed;
+	return true;
+}
+
+bool FinishAIPlanningReferenceBatch(
+	AIPlanningReferenceBatchTransport *transport, bool committed) noexcept
+{
+	if (transport == 0 || transport->referenceLedger == 0 ||
+		transport->referenceBatch == 0 ||
+		!transport->referenceBatch->valid())
+		return false;
+	const bool finished = transport->referenceLedger->finishBatch(
+		*transport->referenceBatch, committed);
+	if (finished)
+		*transport->referenceBatch = performance::KernelPerformanceReferenceBatch();
+	return finished;
+}
+#endif
 
 void ClearAIEnemyPlanningSnapshot(AIEnemyPlanningSnapshot *snapshot)
 {
@@ -1569,10 +2082,19 @@ bool ExecuteAIPlanningBatchOnJobSystem(AIPlanningExecutionMode mode,
 	AIPlayerPlanningResult *committedResults,
 	AIPlayerPlanningResult *serialScratch,
 	AIPlayerPlanningResult *parallelScratch,
-	AIPlanningBatchStatus *status)
+	AIPlanningBatchStatus *status
+#if defined(_WIN64)
+	, performance::KernelPerformanceBatch *performanceBatch,
+	AIPlanningReferenceBatchTransport *referenceBatch
+#endif
+	)
 {
 	s_requestedBatches.fetch_add(1U, std::memory_order_relaxed);
 	AIPlanningJobSystemEvidence evidence;
+#if defined(_WIN64)
+	evidence.performanceBatch = performanceBatch;
+	evidence.referenceBatch = referenceBatch;
+#endif
 	const bool admitJobSystem = snapshots != 0 &&
 		CountAIPlanningJobs(snapshots, snapshotCount) >= 2U;
 	const bool executed = ExecuteAIPlanningBatch(mode, snapshots, snapshotCount,

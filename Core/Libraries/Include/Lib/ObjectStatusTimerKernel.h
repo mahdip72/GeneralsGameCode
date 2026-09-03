@@ -6,6 +6,9 @@
 #pragma once
 
 #include "Lib/JobSystem.h"
+#if defined(_WIN64)
+#include "Lib/KernelPerformanceReference.h"
+#endif
 
 namespace rts
 {
@@ -54,6 +57,17 @@ struct ObjectStatusTimerOptions
 	ObjectStatusTimerOptions();
 	bool parallel;
 	unsigned minimumGrain;
+#if defined(_WIN64)
+	// Optional owner token for observational kernel timing. VC6 keeps the
+	// historical options layout and behavior unchanged.
+	performance::KernelPerformanceBatch performanceBatch;
+	// Optional reference evidence is injected by the owner. The kernel leaves
+	// these inert until a native reference mode is active.
+	performance::KernelPerformanceReferenceLedger *performanceReferenceLedger;
+	performance::KernelPerformanceReferenceBatch *performanceReferenceBatch;
+	ObjectStatusTimerCommand *performanceReferenceOutput;
+	unsigned performanceReferenceOutputCapacity;
+#endif
 };
 
 struct ObjectStatusTimerMetrics

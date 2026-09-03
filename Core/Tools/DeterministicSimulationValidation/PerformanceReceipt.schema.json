@@ -9,6 +9,9 @@
     "evidenceKind",
     "status",
     "role",
+    "measurementRole",
+    "simulationMode",
+    "schedulerStarted",
     "producerVersion",
     "title",
     "runId",
@@ -25,6 +28,8 @@
     "commandLine",
     "process",
     "fixture",
+    "workload",
+    "frameSimulation",
     "frames",
     "worker",
     "topology",
@@ -33,15 +38,20 @@
     "provenance",
     "schedulerMetrics",
     "phases",
-    "kernels"
+    "kernels",
+    "kernelTiming",
+    "kernelReference"
   ],
   "properties": {
-    "schemaVersion": { "const": 1 },
-    "producer": { "const": "game-executable-stage5-performance-report-v2" },
+    "schemaVersion": { "const": 5 },
+    "producer": { "const": "game-executable-stage5-performance-report-v5" },
     "evidenceKind": { "const": "stage5-executable-originated-receipt" },
     "status": { "const": "passed" },
     "role": { "const": "performance-report" },
-    "producerVersion": { "const": "2" },
+    "measurementRole": { "enum": ["throughput", "serial-oracle"] },
+    "simulationMode": { "enum": ["serial", "parallel", "shadow"] },
+    "schedulerStarted": { "type": "boolean" },
+    "producerVersion": { "const": "5" },
     "title": { "type": "string", "minLength": 1 },
     "runId": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,256}$" },
     "runNonce": { "type": "string", "format": "uuid" },
@@ -92,25 +102,67 @@
       "additionalProperties": false,
       "required": [
         "id",
+        "kind",
+        "workloadQualification",
+        "contentPath",
+        "identityObserved",
         "contentSha256",
         "replayPath",
+        "retainedReplayPath",
+        "retainedReplaySha256",
         "seed",
         "seedKnown",
-        "playerCount",
-        "playerCountKnown",
-        "unitCount",
-        "unitCountKnown"
+        "requestedPlayerCount",
+        "requestedMinimumUnitCount"
       ],
       "properties": {
         "id": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["replay", "fresh-ai-map"] },
+        "workloadQualification": { "enum": ["minimum-qualified", "observed-only"] },
+        "contentPath": { "type": "string", "minLength": 1 },
+        "identityObserved": { "const": true },
         "contentSha256": { "$ref": "#/$defs/sha256" },
-        "replayPath": { "type": "string", "minLength": 1 },
+        "replayPath": { "type": "string" },
+        "retainedReplayPath": { "type": "string" },
+        "retainedReplaySha256": { "anyOf": [{ "const": "" }, { "$ref": "#/$defs/sha256" }] },
         "seed": { "type": "integer", "minimum": 0 },
         "seedKnown": { "const": true },
-        "playerCount": { "type": "integer", "minimum": 0 },
-        "playerCountKnown": { "type": "boolean" },
-        "unitCount": { "type": "integer", "minimum": 0 },
-        "unitCountKnown": { "type": "boolean" }
+        "requestedPlayerCount": { "type": ["integer", "null"], "minimum": 1 },
+        "requestedMinimumUnitCount": { "type": ["integer", "null"], "minimum": 1 }
+      },
+      "allOf": [
+        { "if": { "properties": { "workloadQualification": { "const": "observed-only" } } },
+          "then": { "properties": { "requestedPlayerCount": { "const": null }, "requestedMinimumUnitCount": { "const": null } } },
+          "else": { "properties": { "requestedPlayerCount": { "type": "integer", "minimum": 1 }, "requestedMinimumUnitCount": { "type": "integer", "minimum": 1 } } } },
+        { "if": { "properties": { "kind": { "const": "replay" } } },
+          "then": { "properties": { "replayPath": { "minLength": 1 }, "retainedReplayPath": { "const": "" }, "retainedReplaySha256": { "const": "" } } },
+          "else": { "properties": { "workloadQualification": { "const": "observed-only" }, "replayPath": { "const": "" },
+            "retainedReplayPath": { "minLength": 1 }, "retainedReplaySha256": { "$ref": "#/$defs/sha256" } } } }
+      ]
+    },
+    "workload": {
+      "type": "object", "additionalProperties": false,
+      "required": ["sampling", "sampleCount", "firstFrame", "lastFrame", "playerCount", "rosterStable", "contiguous", "initialUnitCount", "minimumUnitCount", "peakUnitCount"],
+      "properties": {
+        "sampling": { "const": "completed-simulation-frame-boundary-v1" },
+        "sampleCount": { "type": "integer", "minimum": 1 },
+        "firstFrame": { "type": "integer", "minimum": 1 },
+        "lastFrame": { "type": "integer", "minimum": 1 },
+        "playerCount": { "type": "integer", "minimum": 1 },
+        "rosterStable": { "const": true },
+        "contiguous": { "const": true },
+        "initialUnitCount": { "type": "integer", "minimum": 0 },
+        "minimumUnitCount": { "type": "integer", "minimum": 0 },
+        "peakUnitCount": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "frameSimulation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["totalNanoseconds", "maximumNanoseconds", "sampleCount"],
+      "properties": {
+        "totalNanoseconds": { "type": "integer", "minimum": 1 },
+        "maximumNanoseconds": { "type": "integer", "minimum": 1 },
+        "sampleCount": { "type": "integer", "minimum": 1 }
       }
     },
     "frames": {
@@ -142,15 +194,15 @@
       ],
       "properties": {
         "requestedCount": { "type": "integer", "minimum": 0 },
-        "effectiveCount": { "type": "integer", "minimum": 1 },
+        "effectiveCount": { "type": "integer", "minimum": 0 },
         "policy": { "enum": ["auto", "all"] },
-        "pinned": { "const": true },
-        "availableLogicalCpuCount": { "type": "integer", "minimum": 1 },
+        "pinned": { "type": "boolean" },
+        "availableLogicalCpuCount": { "type": "integer", "minimum": 0 },
         "reservedOwnerCpuCount": { "type": "integer", "minimum": 0 },
-        "selectedWorkerCpuCount": { "type": "integer", "minimum": 1 },
-        "selectedWorkerPhysicalCoreCount": { "type": "integer", "minimum": 1 },
-        "selectedWorkerPhysicalCoreMask": { "type": "integer", "minimum": 1 },
-        "selectedWorkerPhysicalCoreMaskComplete": { "const": true }
+        "selectedWorkerCpuCount": { "type": "integer", "minimum": 0 },
+        "selectedWorkerPhysicalCoreCount": { "type": "integer", "minimum": 0 },
+        "selectedWorkerPhysicalCoreMask": { "type": "integer", "minimum": 0 },
+        "selectedWorkerPhysicalCoreMaskComplete": { "type": "boolean" }
       }
     },
     "topology": {
@@ -158,10 +210,10 @@
       "additionalProperties": false,
       "required": ["source", "cpuSets", "ownerCpuSetIds", "selectedWorkerCpuSetIds"],
       "properties": {
-        "source": { "const": "GetSystemCpuSetInformation" },
+        "source": { "enum": ["GetSystemCpuSetInformation", "scheduler-not-started"] },
         "cpuSets": {
           "type": "array",
-          "minItems": 1,
+          "minItems": 0,
           "items": {
             "type": "object",
             "additionalProperties": false,
@@ -190,7 +242,7 @@
         "ownerCpuSetIds": { "type": "array", "items": { "type": "integer", "minimum": 0 } },
         "selectedWorkerCpuSetIds": {
           "type": "array",
-          "minItems": 1,
+          "minItems": 0,
           "items": { "type": "integer", "minimum": 0 }
         }
       }
@@ -198,13 +250,21 @@
     "rawEvidence": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["verifierBoundary", "rawLogPath", "rawLogSha256", "timingPath", "timingSha256"],
+      "required": ["verifierBoundary", "rawLogPath", "rawLogSha256", "timingPath", "timingSha256", "timingClosed", "timingWriteSucceeded", "timingTruncated", "timingComplete", "timingSessionCount", "timingFrameSamples", "timingFirstFrame", "timingLastFrame"],
       "properties": {
         "verifierBoundary": { "type": "string", "minLength": 1 },
         "rawLogPath": { "type": "string", "minLength": 1 },
         "rawLogSha256": { "$ref": "#/$defs/sha256" },
         "timingPath": { "type": "string", "minLength": 1 },
-        "timingSha256": { "$ref": "#/$defs/sha256" }
+        "timingSha256": { "$ref": "#/$defs/sha256" },
+        "timingClosed": { "const": true },
+        "timingWriteSucceeded": { "const": true },
+        "timingTruncated": { "const": false },
+        "timingComplete": { "const": true },
+        "timingSessionCount": { "const": 1 },
+        "timingFrameSamples": { "type": "integer", "minimum": 1 },
+        "timingFirstFrame": { "type": "integer", "minimum": 0 },
+        "timingLastFrame": { "type": "integer", "minimum": 0 }
       }
     },
     "rawLogs": {
@@ -282,19 +342,50 @@
     },
     "phases": {
       "type": "array",
-      "minItems": 7,
-      "maxItems": 7,
+      "minItems": 5,
+      "maxItems": 5,
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["name", "available", "totalNanoseconds", "maximumNanoseconds", "sampleCount"],
+        "required": ["name", "available", "totalNanoseconds", "maximumNanoseconds", "sampleCount", "serialNanoseconds", "serialNanosecondsKnown"],
         "properties": {
-          "name": { "enum": ["owner-intake", "world-queries", "pathfinding", "object-computation", "spatial-work", "deterministic-commit", "verification-publication"] },
+          "name": { "enum": ["owner-intake", "legacy-mutable-island", "spatial-work", "owner-tail", "verification-publication"] },
           "available": { "type": "boolean" },
           "totalNanoseconds": { "type": "integer", "minimum": 0 },
           "maximumNanoseconds": { "type": "integer", "minimum": 0 },
-          "sampleCount": { "type": "integer", "minimum": 0 }
+          "sampleCount": { "type": "integer", "minimum": 0 },
+          "serialNanoseconds": { "type": "integer", "minimum": 0 },
+          "serialNanosecondsKnown": { "type": "boolean" }
         }
+      }
+    },
+    "kernelTiming": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "mode", "attribution", "enabled", "frozen", "complete", "errors", "generation", "serialReferenceKnown", "streams"],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "mode": { "const": "owner-pipeline-observation" },
+        "attribution": { "const": "owner-stack-exclusive-v1" },
+        "enabled": { "const": true },
+        "frozen": { "const": true },
+        "complete": { "type": "boolean" },
+        "errors": { "const": 0 },
+        "generation": { "type": "integer", "minimum": 1 },
+        "serialReferenceKnown": { "const": false },
+        "streams": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/kernelStream" } }
+      }
+    },
+    "kernelReference": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "mode", "frozen", "complete", "errors", "generation", "streams"],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "mode": { "enum": ["throughput-binding", "serial-oracle"] },
+        "frozen": { "const": true },
+        "complete": { "type": "boolean" },
+        "errors": { "const": 0 },
+        "generation": { "type": "integer", "minimum": 1, "maximum": 18446744073709551615 },
+        "streams": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/referenceStream" } }
       }
     },
     "kernels": {
@@ -333,7 +424,96 @@
       }
     }
   },
+  "allOf": [
+    {
+      "if": { "properties": { "schedulerStarted": { "const": false } } },
+      "then": { "properties": {
+        "simulationMode": { "const": "serial" },
+        "fixture": { "properties": { "workloadQualification": { "const": "observed-only" } } },
+        "worker": { "properties": { "effectiveCount": { "const": 0 }, "pinned": { "const": false },
+          "availableLogicalCpuCount": { "const": 0 }, "reservedOwnerCpuCount": { "const": 0 },
+          "selectedWorkerCpuCount": { "const": 0 }, "selectedWorkerPhysicalCoreCount": { "const": 0 },
+          "selectedWorkerPhysicalCoreMask": { "const": 0 }, "selectedWorkerPhysicalCoreMaskComplete": { "const": false } } },
+        "topology": { "properties": { "source": { "const": "scheduler-not-started" },
+          "cpuSets": { "maxItems": 0 }, "ownerCpuSetIds": { "maxItems": 0 }, "selectedWorkerCpuSetIds": { "maxItems": 0 } } }
+      } },
+      "else": { "properties": {
+        "worker": { "properties": { "effectiveCount": { "minimum": 1 }, "pinned": { "const": true },
+          "availableLogicalCpuCount": { "minimum": 1 }, "selectedWorkerCpuCount": { "minimum": 1 },
+          "selectedWorkerPhysicalCoreCount": { "minimum": 1 }, "selectedWorkerPhysicalCoreMask": { "minimum": 1 },
+          "selectedWorkerPhysicalCoreMaskComplete": { "const": true } } },
+        "topology": { "properties": { "source": { "const": "GetSystemCpuSetInformation" },
+          "cpuSets": { "minItems": 1 }, "selectedWorkerCpuSetIds": { "minItems": 1 } } }
+      } }
+    },
+    {
+      "if": { "properties": { "measurementRole": { "const": "throughput" } } },
+      "then": {
+        "properties": { "kernelReference": { "properties": {
+          "mode": { "const": "throughput-binding" },
+          "streams": { "items": { "properties": {
+            "serialSampleCount": { "const": 0 },
+            "serialNanoseconds": { "const": 0 },
+            "maximumSerialNanoseconds": { "const": 0 }
+          } } }
+        } } }
+      },
+      "else": { "properties": { "kernelReference": { "properties": { "mode": { "const": "serial-oracle" } } } } }
+    }
+  ],
   "$defs": {
+    "referenceCounter": { "type": "integer", "minimum": 0, "maximum": 18446744073709551615 },
+    "referenceStream": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "subtype", "fieldSchema", "firstFrame", "lastFrame", "validatedBatchCount", "committedBatchCount", "abortedBatchCount", "validatedOperationCount", "committedOperationCount", "serialSampleCount", "serialNanoseconds", "maximumSerialNanoseconds", "inputSha256", "outputSha256", "commitSha256"],
+      "properties": {
+        "name": { "enum": ["physics", "status", "collision", "ai-planning", "spatial", "path"] },
+        "subtype": { "type": "integer", "minimum": 0, "maximum": 1 },
+        "fieldSchema": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "firstFrame": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "lastFrame": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "validatedBatchCount": { "type": "integer", "minimum": 1, "maximum": 18446744073709551615 },
+        "committedBatchCount": { "$ref": "#/$defs/referenceCounter" },
+        "abortedBatchCount": { "$ref": "#/$defs/referenceCounter" },
+        "validatedOperationCount": { "type": "integer", "minimum": 1, "maximum": 18446744073709551615 },
+        "committedOperationCount": { "$ref": "#/$defs/referenceCounter" },
+        "serialSampleCount": { "$ref": "#/$defs/referenceCounter" },
+        "serialNanoseconds": { "$ref": "#/$defs/referenceCounter" },
+        "maximumSerialNanoseconds": { "$ref": "#/$defs/referenceCounter" },
+        "inputSha256": { "type": "string", "pattern": "^[0-9A-F]{64}$" },
+        "outputSha256": { "type": "string", "pattern": "^[0-9A-F]{64}$" },
+        "commitSha256": { "type": "string", "pattern": "^[0-9A-F]{64}$" }
+      }
+    },
+    "kernelStream": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "subtype", "attemptedBatches", "admittedBatches", "committedBatches", "abortedBatches", "firstFrame", "lastFrame", "activePipelineNanoseconds", "inclusiveBatchNanoseconds", "maximumBatchNanoseconds", "stages"],
+      "properties": {
+        "name": { "enum": ["physics", "status", "collision", "ai-planning", "spatial", "path"] },
+        "subtype": { "type": "integer", "minimum": 0, "maximum": 1 },
+        "attemptedBatches": { "type": "integer", "minimum": 1 },
+        "admittedBatches": { "type": "integer", "minimum": 0 },
+        "committedBatches": { "type": "integer", "minimum": 0 },
+        "abortedBatches": { "type": "integer", "minimum": 0 },
+        "firstFrame": { "type": "integer", "minimum": 0 },
+        "lastFrame": { "type": "integer", "minimum": 0 },
+        "activePipelineNanoseconds": { "type": "integer", "minimum": 0 },
+        "inclusiveBatchNanoseconds": { "type": "integer", "minimum": 0 },
+        "maximumBatchNanoseconds": { "type": "integer", "minimum": 0 },
+        "stages": {
+          "type": "array", "minItems": 5, "maxItems": 5,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["name", "totalNanoseconds", "sampleCount"],
+            "properties": {
+              "name": { "enum": ["capture", "schedule", "wait", "validate", "commit"] },
+              "totalNanoseconds": { "type": "integer", "minimum": 0 },
+              "sampleCount": { "type": "integer", "minimum": 0 }
+            }
+          }
+        }
+      }
+    },
     "sha256": {
       "type": "string",
       "pattern": "^[A-Fa-f0-9]{64}$"

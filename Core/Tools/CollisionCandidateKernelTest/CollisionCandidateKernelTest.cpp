@@ -4,6 +4,10 @@
 ** SPDX-License-Identifier: GPL-3.0-or-later
 */
 #include "Lib/CollisionCandidateKernel.h"
+#if defined(_WIN64)
+#include "Lib/KernelPerformanceDiagnostics.h"
+#include "Lib/KernelPerformanceReference.h"
+#endif
 #include "../TestSupport/LocalCapacityTestLane.h"
 
 #include <limits.h>
@@ -721,6 +725,409 @@ void testPartitionOrderingGenerationAndCallbackDestruction()
 		"runtime metric lifecycle reset advances its epoch and clears every collision counter");
 }
 
+#if defined(_WIN64)
+struct CollisionPerformanceClock
+{
+	CollisionPerformanceClock() : now(100), calls(0) {}
+	rts::JobMetricCounter now;
+	unsigned calls;
+	static rts::JobMetricCounter read(void *context)
+	{
+		CollisionPerformanceClock &clock =
+			*static_cast<CollisionPerformanceClock *>(context);
+		++clock.calls;
+		return ++clock.now;
+	}
+};
+
+void openAndClosePerformanceInterval(
+	rts::performance::KernelPerformanceLedger &ledger,
+	rts::performance::KernelPerformanceBatch batch,
+	rts::performance::KernelPerformanceStage stage,
+	CollisionPerformanceClock &clock)
+{
+	const rts::performance::KernelPerformanceInterval interval =
+		ledger.beginInterval(batch, stage);
+	expect(interval.valid(), "collision performance interval opens");
+	++clock.now;
+	expect(ledger.endInterval(interval), "collision performance interval closes");
+}
+
+void makePerformancePartition(
+	rts::PartitionCollisionObjectSnapshot &owner,
+	rts::PartitionCollisionCellSnapshot *cells,
+	rts::PartitionCollisionOccupantSnapshot *occupants,
+	unsigned occupantCount)
+{
+	makePartitionOwner(owner);
+	const unsigned cellCount = 2;
+	const unsigned perCell = occupantCount / cellCount;
+	for (unsigned cell = 0; cell != cellCount; ++cell)
+	{
+		cells[cell].occupantBegin = cell * perCell;
+		cells[cell].occupantCount = perCell;
+		cells[cell].discoveryBase = cell * perCell;
+	}
+	for (unsigned index = 0; index != occupantCount; ++index)
+	{
+		occupants[index].objectID = index + 20;
+		occupants[index].generation = index + 2;
+	}
+}
+
+void testPerformanceTokenHandoffAndCommittedStages()
+{
+	enum { OCCUPANT_COUNT = 512 };
+	if (!startJobSystem(4))
+		return;
+	rts::PartitionCollisionObjectSnapshot owner;
+	rts::PartitionCollisionCellSnapshot cells[2];
+	rts::PartitionCollisionOccupantSnapshot occupants[OCCUPANT_COUNT];
+	rts::CollisionCandidate output[OCCUPANT_COUNT];
+	rts::CollisionCandidate scratch[OCCUPANT_COUNT];
+	makePerformancePartition(owner, cells, occupants, OCCUPANT_COUNT);
+	CollisionPerformanceClock clock;
+	rts::performance::KernelPerformanceLedger ledger;
+	expect(ledger.beginRun(true, CollisionPerformanceClock::read, &clock),
+		"collision performance run starts");
+	const rts::performance::KernelPerformanceBatch batch = ledger.beginBatch(
+		rts::performance::KERNEL_PERFORMANCE_COLLISION, 0, 42, 7);
+	expect(batch.valid(), "collision performance batch carries frame and owner ordinal");
+	{
+		openAndClosePerformanceInterval(ledger, batch,
+			rts::performance::KERNEL_PERFORMANCE_CAPTURE, clock);
+		rts::CollisionCandidateOptions options;
+		options.parallel = true;
+		options.minimumGrain = 32;
+		options.performanceLedger = &ledger;
+		options.performanceBatch = batch;
+		unsigned outputCount = 0;
+		rts::CollisionCandidateMetrics metrics;
+		const rts::CollisionCandidateResult result =
+			rts::PreparePartitionCollisionCandidates(owner, cells, 2, occupants,
+			OCCUPANT_COUNT, output, OCCUPANT_COUNT, scratch, OCCUPANT_COUNT,
+			options, &outputCount, &metrics);
+		expect(result == rts::COLLISION_CANDIDATE_PARALLEL && outputCount != 0,
+			"collision performance token survives shared parallel preparation");
+		openAndClosePerformanceInterval(ledger, batch,
+			rts::performance::KERNEL_PERFORMANCE_VALIDATE, clock);
+		openAndClosePerformanceInterval(ledger, batch,
+			rts::performance::KERNEL_PERFORMANCE_COMMIT, clock);
+	}
+	expect(ledger.endBatch(batch,
+		rts::performance::KERNEL_PERFORMANCE_COMMITTED),
+		"collision performance committed batch closes after owner publication");
+	const rts::performance::KernelPerformanceSnapshot snapshot = ledger.freeze();
+	expect(snapshot.complete && snapshot.streamCount == 1,
+		"collision performance committed run freezes completely");
+	if (snapshot.streamCount == 1)
+	{
+		const rts::performance::KernelPerformanceStream &stream = snapshot.streams[0];
+		expect(stream.kernel == rts::performance::KERNEL_PERFORMANCE_COLLISION &&
+			stream.subtype == 0 && stream.firstFrame == 42 && stream.lastFrame == 42,
+			"collision performance identity retains fixed kernel subtype and captured frame");
+		expect(stream.attemptedBatches == 1 && stream.admittedBatches == 1 &&
+			stream.committedBatches == 1 && stream.abortedBatches == 0,
+			"collision performance committed disposition is authoritative only");
+		for (unsigned stage = 0;
+			stage != rts::performance::KERNEL_PERFORMANCE_STAGE_COUNT; ++stage)
+			expect(stream.stageSamples[stage] != 0,
+			"committed collision performance stage has a real sample");
+		expect(stream.stageSamples[rts::performance::KERNEL_PERFORMANCE_SCHEDULE] == 1 &&
+			stream.stageSamples[rts::performance::KERNEL_PERFORMANCE_WAIT] == 1,
+			"shared collision kernel records one schedule and one wait interval");
+	}
+	stopJobSystem();
+}
+
+void testPerformanceAbortedAndDisabledPaths()
+{
+	enum { OCCUPANT_COUNT = 512 };
+	if (!startJobSystem(4))
+		return;
+	rts::PartitionCollisionObjectSnapshot owner;
+	rts::PartitionCollisionCellSnapshot cells[2];
+	rts::PartitionCollisionOccupantSnapshot occupants[OCCUPANT_COUNT];
+	rts::CollisionCandidate output[OCCUPANT_COUNT];
+	rts::CollisionCandidate scratch[OCCUPANT_COUNT];
+	makePerformancePartition(owner, cells, occupants, OCCUPANT_COUNT);
+	CollisionPerformanceClock clock;
+	rts::performance::KernelPerformanceLedger ledger;
+	expect(ledger.beginRun(true, CollisionPerformanceClock::read, &clock),
+		"aborted collision performance run starts");
+	const rts::performance::KernelPerformanceBatch batch = ledger.beginBatch(
+		rts::performance::KERNEL_PERFORMANCE_COLLISION, 0, 43, 8);
+	{
+		openAndClosePerformanceInterval(ledger, batch,
+			rts::performance::KERNEL_PERFORMANCE_CAPTURE, clock);
+		rts::CollisionCandidateOptions options;
+		options.parallel = true;
+		options.minimumGrain = 32;
+		options.performanceLedger = &ledger;
+		options.performanceBatch = batch;
+		unsigned outputCount = 0;
+		const rts::CollisionCandidateResult result =
+			rts::PreparePartitionCollisionCandidates(owner, cells, 2, occupants,
+			OCCUPANT_COUNT, output, OCCUPANT_COUNT, scratch, OCCUPANT_COUNT,
+			options, &outputCount);
+		expect(result == rts::COLLISION_CANDIDATE_PARALLEL,
+			"aborted collision performance path admits shared work");
+		openAndClosePerformanceInterval(ledger, batch,
+			rts::performance::KERNEL_PERFORMANCE_VALIDATE, clock);
+	}
+	expect(ledger.endBatch(batch,
+		rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION),
+		"aborted collision performance batch preserves reached overhead");
+	const rts::performance::KernelPerformanceSnapshot aborted = ledger.freeze();
+	expect(aborted.complete && aborted.streamCount == 1,
+		"aborted collision performance run still freezes accounting");
+	if (aborted.streamCount == 1)
+	{
+		const rts::performance::KernelPerformanceStream &stream = aborted.streams[0];
+		expect(stream.abortedBatches == 1 && stream.committedBatches == 0 &&
+			stream.stageSamples[rts::performance::KERNEL_PERFORMANCE_COMMIT] == 0,
+			"aborted collision performance cannot invent an authoritative commit stage");
+	}
+	stopJobSystem();
+
+	CollisionPerformanceClock disabledClock;
+	rts::performance::KernelPerformanceLedger disabled;
+	expect(disabled.beginRun(false, CollisionPerformanceClock::read,
+		&disabledClock), "disabled collision performance run configures");
+	const rts::performance::KernelPerformanceBatch disabledBatch =
+		disabled.beginBatch(rts::performance::KERNEL_PERFORMANCE_COLLISION, 0, 44, 9);
+	expect(!disabledBatch.valid(), "disabled collision performance has no timing token");
+	unsigned outputCount = 0;
+	rts::CollisionCandidateOptions options;
+	options.parallel = false;
+	options.performanceLedger = &disabled;
+	options.performanceBatch = disabledBatch;
+	const rts::CollisionCandidateResult result =
+		rts::PreparePartitionCollisionCandidates(owner, cells, 2, occupants,
+		OCCUPANT_COUNT, output, OCCUPANT_COUNT, scratch, OCCUPANT_COUNT,
+		options, &outputCount);
+	expect(result == rts::COLLISION_CANDIDATE_SERIAL && outputCount != 0 &&
+		disabledClock.calls == 0,
+		"disabled collision telemetry leaves gameplay result intact without reading its clock");
+	const rts::performance::KernelPerformanceSnapshot disabledSnapshot =
+		disabled.freeze();
+	expect(!disabledSnapshot.enabled && !disabledSnapshot.complete &&
+		disabledSnapshot.streamCount == 0,
+		"disabled collision telemetry publishes no timing evidence");
+}
+
+void testReferenceTokenHandoffFromAdmittedPartition()
+{
+	enum { OCCUPANT_COUNT = 512 };
+	if (!startJobSystem(4))
+		return;
+	rts::PartitionCollisionObjectSnapshot owner;
+	rts::PartitionCollisionCellSnapshot cells[2];
+	rts::PartitionCollisionOccupantSnapshot occupants[OCCUPANT_COUNT];
+	rts::CollisionCandidate output[OCCUPANT_COUNT];
+	rts::CollisionCandidate scratch[OCCUPANT_COUNT];
+	rts::CollisionCandidate referenceOutput[OCCUPANT_COUNT];
+	makePerformancePartition(owner, cells, occupants, OCCUPANT_COUNT);
+	CollisionPerformanceClock timingClock;
+	CollisionPerformanceClock referenceClock;
+	rts::performance::KernelPerformanceLedger timing;
+	rts::performance::KernelPerformanceReferenceLedger reference;
+	expect(timing.beginRun(true, CollisionPerformanceClock::read, &timingClock),
+		"reference collision timing run starts");
+	expect(reference.beginRun(
+		rts::performance::KERNEL_REFERENCE_THROUGHPUT_BINDING,
+		CollisionPerformanceClock::read, &referenceClock),
+		"reference collision throughput run starts");
+	const rts::performance::KernelPerformanceBatch timingBatch =
+		timing.beginBatch(rts::performance::KERNEL_PERFORMANCE_COLLISION, 0, 45, 0);
+	expect(timingBatch.valid(),
+		"reference collision timing batch accepts zero-based owner ordinal");
+	rts::performance::KernelPerformanceReferenceBatch referenceBatch;
+	rts::PartitionCollisionReferenceInput referenceInput;
+	rts::PartitionCollisionReferenceOutput referenceProductionOutput;
+	rts::CollisionCandidateReferenceBatchTransport referenceTransport;
+	unsigned outputCount = 0;
+	rts::CollisionCandidateMetrics metrics;
+	{
+		rts::CollisionCandidateOptions options;
+		options.parallel = true;
+		options.minimumGrain = 32;
+		options.performanceLedger = &timing;
+		options.performanceBatch = timingBatch;
+		options.performanceReferenceLedger = &reference;
+		options.performanceReferenceBatch = &referenceBatch;
+		options.performanceReferenceOutput = referenceOutput;
+		options.performanceReferenceOutputCapacity = OCCUPANT_COUNT;
+		const rts::CollisionCandidateResult result =
+			rts::PreparePartitionCollisionCandidates(owner, cells, 2, occupants,
+			OCCUPANT_COUNT, output, OCCUPANT_COUNT, scratch, OCCUPANT_COUNT,
+			options, &outputCount, &metrics);
+		expect(result == rts::COLLISION_CANDIDATE_PARALLEL && outputCount != 0,
+			"reference collision transport reaches a real admitted partition kernel");
+	}
+	// Treat the completed owner snapshot as the fixture's live-validation
+	// boundary; no reference failure may alter authoritative output.
+	referenceInput.owner = owner;
+	referenceInput.cells = cells;
+	referenceInput.cellCount = 2;
+	referenceInput.occupants = occupants;
+	referenceInput.occupantCount = OCCUPANT_COUNT;
+	referenceInput.order = rts::COLLISION_CANDIDATE_REVERSE_DISCOVERY;
+	referenceProductionOutput.candidates = output;
+	referenceProductionOutput.scratch = 0;
+	referenceProductionOutput.count = outputCount;
+	referenceProductionOutput.capacity = OCCUPANT_COUNT;
+	referenceTransport.referenceLedger = &reference;
+	referenceTransport.referenceBatch = &referenceBatch;
+	referenceTransport.writeInput =
+		rts::WritePartitionCollisionReferenceInput;
+	referenceTransport.immutableInput = &referenceInput;
+	referenceTransport.writeOutput =
+		rts::WritePartitionCollisionReferenceOutput;
+	referenceTransport.productionOutput = &referenceProductionOutput;
+	referenceTransport.operationCount = metrics.preparedPairs;
+	referenceTransport.fieldSchema =
+		rts::COLLISION_CANDIDATE_REFERENCE_FIELD_SCHEMA;
+	expect(rts::ObserveCollisionCandidateReferenceBatch(
+		&timing, &timingBatch, &referenceTransport),
+		"reference observer accepts the validated shared collision output");
+	expect(referenceBatch.valid(),
+		"admitted partition kernel emits one canonical reference token");
+	if (referenceBatch.valid())
+	{
+		expect(reference.finishBatch(referenceBatch, true),
+			"canonical collision reference token closes after owner publication");
+		const rts::performance::KernelPerformanceReferenceSnapshot snapshot =
+			reference.freeze();
+		expect(snapshot.complete && snapshot.streamCount == 1,
+			"canonical collision reference run freezes completely");
+		if (snapshot.streamCount == 1)
+		{
+			const rts::performance::KernelPerformanceReferenceStream &stream =
+				snapshot.streams[0];
+			expect(stream.kernel == rts::performance::KERNEL_PERFORMANCE_COLLISION &&
+				stream.subtype == 0 && stream.firstFrame == 45 &&
+				stream.lastFrame == 45,
+				"canonical collision reference preserves timing identity");
+			expect(stream.validatedBatchCount == 1 &&
+				stream.committedBatchCount == 1 &&
+				stream.validatedOperationCount == OCCUPANT_COUNT &&
+				stream.committedOperationCount == OCCUPANT_COUNT &&
+				stream.serialSampleCount == 0,
+				"throughput reference records occupant operations without serial work");
+		}
+	}
+	stopJobSystem();
+}
+
+void testReferenceSerialOracleUsesDetachedPartitionStorage()
+{
+	enum { OCCUPANT_COUNT = 512 };
+	if (!startJobSystem(4))
+		return;
+	rts::PartitionCollisionObjectSnapshot owner;
+	rts::PartitionCollisionCellSnapshot cells[2];
+	rts::PartitionCollisionOccupantSnapshot occupants[OCCUPANT_COUNT];
+	rts::CollisionCandidate output[OCCUPANT_COUNT];
+	rts::CollisionCandidate scratch[OCCUPANT_COUNT];
+	rts::CollisionCandidate referenceOutput[OCCUPANT_COUNT];
+	rts::CollisionCandidate referenceScratch[OCCUPANT_COUNT];
+	makePerformancePartition(owner, cells, occupants, OCCUPANT_COUNT);
+	CollisionPerformanceClock timingClock;
+	CollisionPerformanceClock referenceClock;
+	rts::performance::KernelPerformanceLedger timing;
+	rts::performance::KernelPerformanceReferenceLedger reference;
+	expect(timing.beginRun(true, CollisionPerformanceClock::read, &timingClock),
+		"serial collision reference timing run starts");
+	expect(reference.beginRun(
+		rts::performance::KERNEL_REFERENCE_SERIAL_ORACLE,
+		CollisionPerformanceClock::read, &referenceClock),
+		"serial collision reference oracle starts");
+	rts::performance::KernelPerformanceBatch timingBatch = timing.beginBatch(
+		rts::performance::KERNEL_PERFORMANCE_COLLISION, 0, 46, 1);
+	expect(timingBatch.valid(), "serial collision reference timing batch starts");
+	unsigned outputCount = 0;
+	rts::CollisionCandidateMetrics metrics;
+	rts::CollisionCandidateOptions options;
+	options.parallel = true;
+	options.minimumGrain = 32;
+	options.performanceLedger = &timing;
+	options.performanceBatch = timingBatch;
+	openAndClosePerformanceInterval(timing, timingBatch,
+		rts::performance::KERNEL_PERFORMANCE_CAPTURE, timingClock);
+	const rts::CollisionCandidateResult result =
+		rts::PreparePartitionCollisionCandidates(owner, cells, 2, occupants,
+		OCCUPANT_COUNT, output, OCCUPANT_COUNT, scratch, OCCUPANT_COUNT,
+		options, &outputCount, &metrics);
+	expect(result == rts::COLLISION_CANDIDATE_PARALLEL && outputCount != 0,
+		"serial collision oracle uses a real admitted partition output");
+	rts::PartitionCollisionReferenceInput input;
+	input.owner = owner;
+	input.cells = cells;
+	input.cellCount = 2;
+	input.occupants = occupants;
+	input.occupantCount = OCCUPANT_COUNT;
+	input.order = rts::COLLISION_CANDIDATE_REVERSE_DISCOVERY;
+	rts::PartitionCollisionReferenceOutput production;
+	production.candidates = output;
+	production.scratch = 0;
+	production.count = outputCount;
+	production.capacity = OCCUPANT_COUNT;
+	rts::PartitionCollisionReferenceOutput detached;
+	detached.candidates = referenceOutput;
+	detached.scratch = referenceScratch;
+	detached.count = 0;
+	detached.capacity = OCCUPANT_COUNT;
+	rts::performance::KernelPerformanceReferenceBatch referenceBatch;
+	rts::CollisionCandidateReferenceBatchTransport transport;
+	transport.referenceLedger = &reference;
+	transport.referenceBatch = &referenceBatch;
+	transport.writeInput = rts::WritePartitionCollisionReferenceInput;
+	transport.immutableInput = &input;
+	transport.writeOutput = rts::WritePartitionCollisionReferenceOutput;
+	transport.productionOutput = &production;
+	transport.serialCompute =
+		rts::ComputePartitionCollisionCandidatesSerialReference;
+	transport.detachedSerialOutput = &detached;
+	transport.operationCount = metrics.preparedPairs;
+	transport.fieldSchema = rts::COLLISION_CANDIDATE_REFERENCE_FIELD_SCHEMA;
+	{
+		rts::performance::KernelPerformanceScope validateTiming(
+			&timing, timingBatch,
+			rts::performance::KERNEL_PERFORMANCE_VALIDATE);
+		expect(rts::ObserveCollisionCandidateReferenceBatch(
+			&timing, &timingBatch, &transport),
+			"serial collision oracle observes the validated candidate output");
+		expect(referenceBatch.valid() && detached.count == outputCount &&
+			rts::CollisionCandidatesEqual(output, outputCount,
+				referenceOutput, detached.count),
+			"serial collision oracle matches production output in detached storage");
+	}
+	expect(referenceClock.calls != 0,
+		"serial collision oracle measures its detached computation");
+	if (referenceBatch.valid())
+	{
+		rts::performance::KernelPerformanceScope commitTiming(
+			&timing, timingBatch,
+			rts::performance::KERNEL_PERFORMANCE_COMMIT);
+		expect(rts::FinishCollisionCandidateReferenceBatch(&transport, true),
+			"serial collision oracle token closes after publication");
+	}
+	expect(timing.endBatch(timingBatch,
+		rts::performance::KERNEL_PERFORMANCE_COMMITTED),
+		"serial collision timing batch closes after oracle publication");
+	const rts::performance::KernelPerformanceReferenceSnapshot snapshot =
+		reference.freeze();
+	expect(snapshot.complete && snapshot.streamCount == 1,
+		"serial collision reference run freezes completely");
+	if (snapshot.streamCount == 1)
+		expect(snapshot.streams[0].serialSampleCount == 1 &&
+			snapshot.streams[0].committedOperationCount == OCCUPANT_COUNT,
+			"serial collision reference records one detached sample and pair count");
+	stopJobSystem();
+}
+#endif
+
 #if !defined(_MSC_VER) || _MSC_VER >= 1300
 void testActualWorkerMatrixParity(bool localCapacity)
 {
@@ -1126,6 +1533,12 @@ int main(int argc, char **argv)
 	testColdParallelRequestDoesNotStartWorkers();
 	testOneWorkerFallbackAndCancellation();
 	testPartitionOrderingGenerationAndCallbackDestruction();
+#if defined(_WIN64)
+	testPerformanceTokenHandoffAndCommittedStages();
+	testPerformanceAbortedAndDisabledPaths();
+	testReferenceTokenHandoffFromAdmittedPartition();
+	testReferenceSerialOracleUsesDetachedPartitionStorage();
+#endif
 #if !defined(_MSC_VER) || _MSC_VER >= 1300
 	testActualWorkerMatrixParity(localCapacity);
 	testOwnerHelpIdentityAndParity();

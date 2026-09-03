@@ -11,6 +11,16 @@
 #include <iostream>
 #include <vector>
 
+#if defined(_MSC_VER)
+#include <crtdbg.h>
+#include <stdlib.h>
+#endif
+
+#if defined(_WIN64)
+#include "Lib/KernelPerformanceDiagnostics.h"
+#include "Lib/KernelPerformanceReference.h"
+#endif
+
 namespace
 {
 rts::AICounterRngKey MakeTestRandomKey()
@@ -514,6 +524,338 @@ void InitializeSinglePlayerSourceShardBatch(
 	}
 }
 
+#if defined(_WIN64)
+struct AIPlanningPerformanceTestClock
+{
+	AIPlanningPerformanceTestClock() : now(100U) {}
+
+	rts::JobMetricCounter now;
+
+	static rts::JobMetricCounter read(void *context)
+	{
+		return static_cast<AIPlanningPerformanceTestClock *>(context)->now;
+	}
+};
+
+void ObserveAIPlanningTestStage(
+	rts::performance::KernelPerformanceLedger &ledger,
+	rts::performance::KernelPerformanceBatch batch,
+	rts::performance::KernelPerformanceStage stage,
+	AIPlanningPerformanceTestClock &clock)
+{
+	const rts::performance::KernelPerformanceInterval interval =
+		ledger.beginInterval(batch, stage);
+	assert(interval.valid());
+	++clock.now;
+	assert(ledger.endInterval(interval));
+}
+
+typedef rts::AIPlanningReferencePlayerInputView
+	AIPlanningReferencePlayerInputView;
+typedef rts::AIPlanningReferencePlayerOutputView
+	AIPlanningReferencePlayerOutputView;
+
+bool WriteTestAIPlanningReferenceInput(
+	rts::performance::KernelPerformanceCanonicalWriter &writer,
+	const void *context)
+{
+	return rts::WriteAIPlanningReferenceInput(writer, context);
+}
+
+bool WriteTestAIPlanningReferenceOutput(
+	rts::performance::KernelPerformanceCanonicalWriter &writer,
+	const void *context)
+{
+	return rts::WriteAIPlanningReferenceOutput(writer, context);
+}
+
+unsigned g_aiReferenceSerialComputes = 0U;
+
+bool ComputeTestAIPlanningReferenceSerial(const void *immutableInput,
+	void *detachedOutput)
+{
+	++g_aiReferenceSerialComputes;
+	return rts::ComputeAIPlanningReferenceSerial(immutableInput, detachedOutput);
+}
+
+void InitializeAIReferenceSourceFacts(
+	rts::AIPlayerPlanningSnapshot *snapshots, uint32_t count)
+{
+	for (uint32_t i = 0U; i < count; ++i)
+	{
+		rts::AIProductionPlanningSnapshot &production =
+			snapshots[i].production;
+		production.sourceFacts.valid = 1U;
+		production.sourceFacts.factoryCount = 1U;
+		production.sourceFacts.factories[0].valid = 1U;
+		production.sourceFacts.factories[0].idle = 1U;
+		production.sourceFacts.factories[0].projectedFrames = 2;
+		for (uint32_t candidate = 0U;
+			candidate < production.candidateCount; ++candidate)
+		{
+			rts::AIProductionCandidateSourceFact &source =
+				production.sourceFacts.candidates[candidate];
+			source.valid = 1U;
+			source.unitCount = 1U;
+			rts::AIProductionUnitSourceFact &unit = source.units[0];
+			unit.cost = 10 + static_cast<int32_t>(candidate);
+			unit.buildFrames = 5;
+			unit.minUnits = 1;
+			unit.maxUnits = 2;
+			unit.flags = rts::AI_PRODUCTION_SOURCE_VEHICLE |
+				rts::AI_PRODUCTION_SOURCE_ATTACKS_GROUND;
+			unit.compatibleFactoryMask = 1U;
+			unit.productionQuantity[0] = 1U;
+		}
+	}
+}
+
+void TestAIPlanningReferenceTransport()
+{
+	using namespace rts::performance;
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 2U;
+	config.queueCapacity = 64U;
+	config.scratchBytesPerWorker = 64U * 1024U;
+	config.pinWorkers = false;
+	assert(jobs.start(config));
+	assert(jobs.registerCurrentThread(rts::JOB_OWNER_GAME));
+
+	AIPlanningPerformanceTestClock clock;
+	KernelPerformanceLedger &timing = KernelPerformanceLedger::instance();
+	assert(timing.beginRun(true, AIPlanningPerformanceTestClock::read, &clock));
+	KernelPerformanceReferenceLedger reference;
+	assert(reference.beginRun(KERNEL_REFERENCE_SERIAL_ORACLE,
+		AIPlanningPerformanceTestClock::read, &clock));
+	const uint32_t snapshotCount = 2U;
+
+	for (uint32_t subtype = 0U; subtype <= 1U; ++subtype)
+	{
+		// Production results contain fixed-capacity score/source arrays. Keep the
+		// reference fixture off the 1 MB Windows test stack even when its admitted
+		// batch is intentionally small.
+		std::vector<rts::AIPlayerPlanningSnapshot> snapshots(snapshotCount);
+		std::vector<rts::AIPlayerPlanningResult> committed(snapshotCount);
+		std::vector<rts::AIPlayerPlanningResult> serialScratch(snapshotCount);
+		std::vector<rts::AIPlayerPlanningResult> parallelScratch(snapshotCount);
+		for (uint32_t i = 0U; i < snapshotCount; ++i)
+		{
+			rts::ClearAIPlayerPlanningSnapshot(&snapshots[i]);
+			snapshots[i].frame = 910U + subtype;
+			snapshots[i].playerIndex = i + 1U;
+			if (subtype == 0U)
+			{
+				snapshots[i].planEnemyTarget = 1U;
+				snapshots[i].enemyTarget.frame = snapshots[i].frame;
+				snapshots[i].enemyTarget.ownerPlayerIndex =
+					snapshots[i].playerIndex;
+				snapshots[i].enemyTarget.candidateCount = 1U;
+				snapshots[i].enemyTarget.candidates[0].sourceOrdinal = 7U;
+				snapshots[i].enemyTarget.candidates[0].playerIndex = 7;
+				snapshots[i].enemyTarget.candidates[0].knownAssetValue =
+					100 + static_cast<int32_t>(i);
+				snapshots[i].enemyTarget.candidates[0].hasKnownObject = 1U;
+				snapshots[i].enemyTarget.candidates[0].hasKnownUnit = 1U;
+			}
+			else
+			{
+				snapshots[i].planProduction = 1U;
+				snapshots[i].production.frame = snapshots[i].frame;
+				snapshots[i].production.ownerPlayerIndex =
+					snapshots[i].playerIndex;
+				snapshots[i].production.resources = 2000;
+				snapshots[i].production.logicFramesPerSecond = 30;
+				snapshots[i].production.difficulty =
+					rts::AI_PLANNING_DIFFICULTY_HARD;
+				snapshots[i].production.contextInfluencePercent = 100;
+				snapshots[i].production.tieBreakKey = MakeTestRandomKey();
+				snapshots[i].production.tieBreakKey.frame = snapshots[i].frame;
+				snapshots[i].production.tieBreakKey.playerIndex =
+					snapshots[i].playerIndex;
+				snapshots[i].production.candidateCount = 2U;
+				for (uint32_t candidate = 0U; candidate < 2U; ++candidate)
+				{
+					rts::AIProductionCandidateFact &fact =
+						snapshots[i].production.candidates[candidate];
+					fact.sourceOrdinal = candidate + 1U;
+					fact.candidateStableId = 100U + candidate;
+					fact.configuredPriority = candidate == 1U ? -100 : -200;
+					fact.minimumCost = 10;
+					fact.plannedCost = 20;
+					fact.eligible = 1U;
+				}
+				InitializeAIReferenceSourceFacts(&snapshots[i], 1U);
+			}
+		}
+
+		const KernelPerformanceBatch timingBatch = timing.beginBatch(
+			KERNEL_PERFORMANCE_AI, subtype, snapshots[0].frame, subtype + 1U);
+		assert(timingBatch.valid());
+		KernelPerformanceBatch mutableTimingBatch = timingBatch;
+		const KernelPerformanceInterval capture = timing.beginInterval(
+			mutableTimingBatch, KERNEL_PERFORMANCE_CAPTURE);
+		assert(capture.valid());
+		++clock.now;
+		assert(timing.endInterval(capture));
+
+		AIPlanningReferencePlayerInputView inputView = {
+			snapshots.data(), snapshotCount, subtype};
+		// The reference observer runs inside the shared VALIDATE scope, before
+		// ExecuteAIPlanningBatch copies the accepted worker results into the
+		// caller's committed buffer. Hash the validated parallel scratch itself.
+		AIPlanningReferencePlayerOutputView outputView = {
+			parallelScratch.data(), snapshotCount, subtype};
+		std::vector<rts::AIPlayerPlanningResult> detached(snapshotCount);
+		AIPlanningReferencePlayerOutputView detachedOutputView = {
+			detached.data(), snapshotCount, subtype};
+		KernelPerformanceReferenceBatch referenceBatch;
+		rts::AIPlanningReferenceBatchTransport transport;
+		transport.referenceLedger = &reference;
+		transport.referenceBatch = &referenceBatch;
+		transport.writeInput = WriteTestAIPlanningReferenceInput;
+		transport.immutableInput = &inputView;
+		transport.writeOutput = WriteTestAIPlanningReferenceOutput;
+		transport.productionOutput = &outputView;
+		transport.serialCompute = ComputeTestAIPlanningReferenceSerial;
+		transport.detachedSerialOutput = &detachedOutputView;
+		transport.operationCount = snapshotCount;
+		transport.fieldSchema = 1U;
+
+		rts::AIPlanningBatchStatus status;
+		assert(rts::ExecuteAIPlanningBatchOnJobSystem(
+			rts::AI_PLANNING_EXECUTION_PARALLEL, snapshots.data(), snapshotCount,
+			committed.data(), serialScratch.data(), parallelScratch.data(), &status,
+			&mutableTimingBatch,
+			&transport));
+		// The observer runs after worker validation but before the runner's
+		// physical-authority decision. A short fixture may therefore validate a
+		// real worker result and then take the documented serial fallback when
+		// two workers did not overlap; that must not invalidate the receipt path.
+		assert(status.ownerHelpedJobs == 0U);
+		assert(status.distinctPhysicalWorkers > 0U);
+		assert(status.peakConcurrentPhysicalWorkers > 0U);
+		if (status.parallelSucceeded != 0U)
+		{
+			assert(status.usedSerialFallback == 0U);
+			assert(status.committedMode == rts::AI_PLANNING_EXECUTION_PARALLEL);
+			assert(status.distinctPhysicalWorkers > 1U);
+			assert(status.peakConcurrentPhysicalWorkers > 1U);
+		}
+		else
+			assert(status.usedSerialFallback == 1U);
+		assert(referenceBatch.valid());
+		assert(g_aiReferenceSerialComputes == subtype + 1U);
+		const bool parallelAuthoritative = status.parallelSucceeded != 0U &&
+			status.committedMode == rts::AI_PLANNING_EXECUTION_PARALLEL &&
+			status.usedSerialFallback == 0U;
+		assert(FinishAIPlanningReferenceBatch(&transport, parallelAuthoritative));
+		if (parallelAuthoritative)
+		{
+			++clock.now;
+			const KernelPerformanceInterval commit = timing.beginInterval(
+				mutableTimingBatch, KERNEL_PERFORMANCE_COMMIT);
+			assert(commit.valid());
+			++clock.now;
+			assert(timing.endInterval(commit));
+			assert(timing.endBatch(mutableTimingBatch,
+				KERNEL_PERFORMANCE_COMMITTED));
+		}
+		else
+		{
+			assert(timing.endBatch(mutableTimingBatch,
+				KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION));
+		}
+	}
+
+	const KernelPerformanceReferenceSnapshot referenceSnapshot = reference.freeze();
+	assert(referenceSnapshot.complete && referenceSnapshot.streamCount == 2U);
+	for (unsigned streamIndex = 0U; streamIndex < referenceSnapshot.streamCount;
+		++streamIndex)
+	{
+		const KernelPerformanceReferenceStream &stream =
+			referenceSnapshot.streams[streamIndex];
+		assert(stream.fieldSchema == 1U);
+		assert(stream.validatedBatchCount == 1U);
+		assert(stream.committedBatchCount <= 1U);
+		assert(stream.abortedBatchCount + stream.committedBatchCount == 1U);
+		assert(stream.validatedOperationCount == snapshotCount);
+		if (stream.committedBatchCount != 0U)
+		{
+			assert(stream.committedOperationCount == snapshotCount);
+			assert(stream.serialSampleCount == 1U);
+		}
+		else
+		{
+			assert(stream.committedOperationCount == 0U);
+			assert(stream.serialSampleCount == 0U);
+		}
+	}
+
+	const KernelPerformanceSnapshot timingSnapshot = timing.freeze();
+	assert(timingSnapshot.complete && timingSnapshot.streamCount == 2U);
+	jobs.shutdown();
+	assert(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME));
+}
+
+void TestAIPlanningPerformanceTransport()
+{
+	using namespace rts::performance;
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 2U;
+	config.queueCapacity = 64U;
+	config.scratchBytesPerWorker = 64U * 1024U;
+	config.pinWorkers = false;
+	assert(jobs.start(config));
+	assert(jobs.registerCurrentThread(rts::JOB_OWNER_GAME));
+
+	AIPlanningPerformanceTestClock clock;
+	KernelPerformanceLedger &ledger = KernelPerformanceLedger::instance();
+	assert(ledger.beginRun(true, AIPlanningPerformanceTestClock::read, &clock));
+
+	rts::AIPlayerPlanningSnapshot snapshots[2];
+	rts::AIPlayerPlanningResult committed[2];
+	rts::AIPlayerPlanningResult serialScratch[2];
+	rts::AIPlayerPlanningResult parallelScratch[2];
+	rts::AIPlanningBatchStatus status;
+	KernelPerformanceBatch batch = ledger.beginBatch(
+		KERNEL_PERFORMANCE_AI, 1U, 904U, 1U);
+	assert(batch.valid());
+
+	// The title owner begins capture before materializing its first snapshot.
+	const KernelPerformanceInterval capture = ledger.beginInterval(
+		batch, KERNEL_PERFORMANCE_CAPTURE);
+	assert(capture.valid());
+	InitializeSinglePlayerSourceShardBatch(&snapshots[0]);
+	snapshots[1] = snapshots[0];
+	snapshots[1].playerIndex = 2U;
+	snapshots[1].production.ownerPlayerIndex = 2U;
+	snapshots[1].production.tieBreakKey.playerIndex = 2U;
+	++clock.now;
+	assert(ledger.endInterval(capture));
+
+	assert(rts::ExecuteAIPlanningBatchOnJobSystem(
+		rts::AI_PLANNING_EXECUTION_PARALLEL, snapshots, 2U, committed,
+		serialScratch, parallelScratch, &status, &batch));
+	assert(status.parallelSucceeded == 1U);
+	assert(status.usedSerialFallback == 0U);
+	ObserveAIPlanningTestStage(ledger, batch, KERNEL_PERFORMANCE_COMMIT, clock);
+
+	// Shared scheduling, passive wait, and result validation must be explicit
+	// samples alongside the owner capture and commit intervals.
+	assert(ledger.endBatch(batch, KERNEL_PERFORMANCE_COMMITTED));
+	const KernelPerformanceSnapshot result = ledger.freeze();
+	assert(result.complete && result.streamCount == 1U);
+	const KernelPerformanceStream &stream = result.streams[0];
+	for (unsigned stage = 0U; stage != KERNEL_PERFORMANCE_STAGE_COUNT; ++stage)
+		assert(stream.stageSamples[stage] >= 1U);
+
+	jobs.shutdown();
+	assert(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME));
+}
+#endif
+
 void TestBatchSerialParityAndFaults()
 {
 	std::vector<rts::AIPlayerPlanningSnapshot> snapshots(16U);
@@ -878,6 +1220,11 @@ void TestRealJobSystemRunner()
 
 int main(int argc, char **argv)
 {
+#if defined(_MSC_VER)
+	_set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+	_CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+	_CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+#endif
 	bool localCapacity = false;
 	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity))
 	{
@@ -899,6 +1246,10 @@ int main(int argc, char **argv)
 	TestModeSpecificOwnerCommitAuthorityMetrics();
 	TestRealJobSystemRunner();
 	TestPhysicalIdentityAndPeakByBatchShape(localCapacity);
+#if defined(_WIN64)
+	TestAIPlanningReferenceTransport();
+	TestAIPlanningPerformanceTransport();
+#endif
 	std::cout << "Deterministic AI planning tests passed.\n";
 	return 0;
 }

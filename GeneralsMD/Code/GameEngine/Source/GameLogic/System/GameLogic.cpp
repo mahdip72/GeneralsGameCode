@@ -142,6 +142,97 @@ namespace
 Bool s_physicsIntegrationCircuitBreaker = FALSE;
 
 #if defined(_WIN64)
+rts::JobMetricCounter s_kernelPerformanceOrdinal = 0;
+
+rts::JobMetricCounter nextKernelPerformanceOrdinal()
+{
+	if (s_kernelPerformanceOrdinal !=
+		~static_cast<rts::JobMetricCounter>(0))
+		++s_kernelPerformanceOrdinal;
+	return s_kernelPerformanceOrdinal;
+}
+
+struct KernelPerformanceBatchGuard
+{
+	KernelPerformanceBatchGuard(rts::performance::KernelPerformanceKernel kernel,
+		unsigned subtype, unsigned frame, rts::JobMetricCounter ordinal)
+		: ledger(&rts::performance::KernelPerformanceLedger::instance()),
+		  token(ledger->beginBatch(kernel, subtype, frame, ordinal)),
+		  active(token.valid()), admitted(FALSE),
+		  performanceReferenceLedger(0), performanceReferenceBatch()
+	{
+	}
+
+	void markAdmitted()
+	{
+		admitted = TRUE;
+	}
+
+	void finish(Bool committed)
+	{
+		if (performanceReferenceLedger != 0 &&
+			performanceReferenceBatch.valid())
+		{
+			const rts::performance::KernelPerformanceReferenceBatch referenceBatch =
+				performanceReferenceBatch;
+			performanceReferenceBatch =
+				rts::performance::KernelPerformanceReferenceBatch();
+			performanceReferenceLedger->finishBatch(referenceBatch,
+				committed != FALSE);
+		}
+		if (!active)
+			return;
+		active = FALSE;
+		const rts::performance::KernelPerformanceDisposition disposition =
+			committed ? rts::performance::KERNEL_PERFORMANCE_COMMITTED :
+			(admitted ? rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION :
+				rts::performance::KERNEL_PERFORMANCE_NOT_ADMITTED);
+		ledger->endBatch(token, disposition);
+	}
+
+	~KernelPerformanceBatchGuard()
+	{
+		finish(FALSE);
+	}
+
+	rts::performance::KernelPerformanceLedger *ledger;
+	rts::performance::KernelPerformanceBatch token;
+	Bool active;
+	Bool admitted;
+	rts::performance::KernelPerformanceReferenceLedger *performanceReferenceLedger;
+	rts::performance::KernelPerformanceReferenceBatch performanceReferenceBatch;
+};
+
+struct KernelPerformanceIntervalGuard
+{
+	KernelPerformanceIntervalGuard(
+		rts::performance::KernelPerformanceLedger *owner,
+		rts::performance::KernelPerformanceBatch batch,
+		rts::performance::KernelPerformanceStage stage)
+		: ledger(owner), interval()
+	{
+		if (ledger != nullptr && batch.valid())
+			interval = ledger->beginInterval(batch, stage);
+	}
+
+	void close()
+	{
+		if (ledger == nullptr || !interval.valid())
+			return;
+		const rts::performance::KernelPerformanceInterval closing = interval;
+		interval = rts::performance::KernelPerformanceInterval();
+		ledger->endInterval(closing);
+	}
+
+	~KernelPerformanceIntervalGuard()
+	{
+		close();
+	}
+
+	rts::performance::KernelPerformanceLedger *ledger;
+	rts::performance::KernelPerformanceInterval interval;
+};
+
 Bool isImmutableSpatialUpdateEnabled(UpdateModulePtr update)
 {
 	if (update == nullptr || update->friend_getObject() == nullptr)
@@ -401,8 +492,47 @@ struct PreparedPhysicsIntegrationBatch
 		: owners(nullptr), ownerIndex(nullptr), snapshots(nullptr), outputs(nullptr),
 		  scratch(nullptr), count(0), committed(0), storageBytes(0), storageCapacityBytes(0),
 		  storageAllocations(0), ready(FALSE)
+#if defined(_WIN64)
+		  , performanceBatch(), performanceBatchActive(FALSE),
+		  performanceBatchAdmitted(FALSE), performanceReferenceLedger(0),
+		  performanceReferenceBatch(), performanceReferenceOutput(0),
+		  performanceReferenceOutputCapacity(0)
+#endif
 	{
 	}
+
+	~PreparedPhysicsIntegrationBatch()
+	{
+#if defined(_WIN64)
+		finishPerformanceBatch(FALSE);
+#endif
+	}
+
+#if defined(_WIN64)
+	void finishPerformanceBatch(Bool committedBatch)
+	{
+		if (performanceReferenceLedger != 0 &&
+			performanceReferenceBatch.valid())
+		{
+			const rts::performance::KernelPerformanceReferenceBatch referenceBatch =
+				performanceReferenceBatch;
+			performanceReferenceBatch =
+				rts::performance::KernelPerformanceReferenceBatch();
+			performanceReferenceLedger->finishBatch(referenceBatch,
+				committedBatch != FALSE);
+		}
+		if (!performanceBatchActive)
+			return;
+		performanceBatchActive = FALSE;
+		const rts::performance::KernelPerformanceDisposition disposition =
+			committedBatch ? rts::performance::KERNEL_PERFORMANCE_COMMITTED :
+			(performanceBatchAdmitted ?
+				rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION :
+				rts::performance::KERNEL_PERFORMANCE_NOT_ADMITTED);
+		rts::performance::KernelPerformanceLedger::instance().endBatch(
+			performanceBatch, disposition);
+	}
+#endif
 
 	PhysicsBehavior **owners;
 	rts::PhysicsIntegrationOwnerIndexEntry *ownerIndex;
@@ -416,6 +546,15 @@ struct PreparedPhysicsIntegrationBatch
 	UnsignedInt storageCapacityBytes;
 	UnsignedInt storageAllocations;
 	Bool ready;
+#if defined(_WIN64)
+	rts::performance::KernelPerformanceBatch performanceBatch;
+	Bool performanceBatchActive;
+	Bool performanceBatchAdmitted;
+	rts::performance::KernelPerformanceReferenceLedger *performanceReferenceLedger;
+	rts::performance::KernelPerformanceReferenceBatch performanceReferenceBatch;
+	rts::PhysicsIntegrationOutput *performanceReferenceOutput;
+	UnsignedInt performanceReferenceOutputCapacity;
+#endif
 };
 
 Bool preparePhysicsIntegrationBatch(GameLogic *logic,
@@ -427,6 +566,37 @@ Bool preparePhysicsIntegrationBatch(GameLogic *logic,
 	static NameKeyType physicsNameKey = NAMEKEY("PhysicsBehavior");
 	if (s_physicsIntegrationCircuitBreaker)
 		return FALSE;
+
+#if defined(_WIN64)
+	batch.performanceBatch =
+		rts::performance::KernelPerformanceLedger::instance().beginBatch(
+			rts::performance::KERNEL_PERFORMANCE_PHYSICS, 0,
+		logic->getFrame(), nextKernelPerformanceOrdinal());
+	batch.performanceBatchActive = batch.performanceBatch.valid();
+	batch.performanceBatchAdmitted = FALSE;
+	batch.performanceReferenceLedger = 0;
+	batch.performanceReferenceBatch =
+		rts::performance::KernelPerformanceReferenceBatch();
+	batch.performanceReferenceOutput = 0;
+	batch.performanceReferenceOutputCapacity = 0;
+	rts::performance::KernelPerformanceReferenceMode referenceMode =
+		rts::performance::KERNEL_REFERENCE_DISABLED;
+	if (batch.performanceBatchActive)
+	{
+		rts::performance::KernelPerformanceReferenceLedger *referenceLedger =
+			&rts::performance::KernelPerformanceReferenceLedger::instance();
+		referenceMode = referenceLedger->mode();
+		if (referenceMode != rts::performance::KERNEL_REFERENCE_DISABLED)
+			batch.performanceReferenceLedger = referenceLedger;
+	}
+	const Bool serialReference = referenceMode ==
+		rts::performance::KERNEL_REFERENCE_SERIAL_ORACLE;
+	rts::performance::KernelPerformanceLedger *performanceLedger =
+		batch.performanceBatchActive ?
+		&rts::performance::KernelPerformanceLedger::instance() : 0;
+	KernelPerformanceIntervalGuard captureScope(performanceLedger,
+		batch.performanceBatch, rts::performance::KERNEL_PERFORMANCE_CAPTURE);
+#endif
 
 	UnsignedInt candidateCount = 0;
 	for (UnsignedInt countIndex = 0; countIndex != sleepyUpdates.size(); ++countIndex)
@@ -446,10 +616,15 @@ Bool preparePhysicsIntegrationBatch(GameLogic *logic,
 		candidateCount > rts::PHYSICS_INTEGRATION_MAXIMUM_SNAPSHOTS)
 		return FALSE;
 
+	UnsignedInt outputCopies = 2;
+#if defined(_WIN64)
+	if (serialReference)
+		++outputCopies;
+#endif
 	const UnsignedInt perCandidateBytes = static_cast<UnsignedInt>(
 		sizeof(PhysicsBehavior *) + sizeof(rts::PhysicsIntegrationOwnerIndexEntry) +
 		sizeof(rts::PhysicsIntegrationSnapshot) +
-		2 * sizeof(rts::PhysicsIntegrationOutput));
+		outputCopies * sizeof(rts::PhysicsIntegrationOutput));
 	if (candidateCount > ~static_cast<UnsignedInt>(0) / perCandidateBytes)
 	{
 		rts::RecordPhysicsIntegrationUnexpectedFallback();
@@ -476,6 +651,15 @@ Bool preparePhysicsIntegrationBatch(GameLogic *logic,
 	batch.outputs = reinterpret_cast<rts::PhysicsIntegrationOutput *>(storage);
 	storage += candidateCount * sizeof(rts::PhysicsIntegrationOutput);
 	batch.scratch = reinterpret_cast<rts::PhysicsIntegrationOutput *>(storage);
+#if defined(_WIN64)
+	if (serialReference)
+	{
+		storage += candidateCount * sizeof(rts::PhysicsIntegrationOutput);
+		batch.performanceReferenceOutput =
+			reinterpret_cast<rts::PhysicsIntegrationOutput *>(storage);
+		batch.performanceReferenceOutputCapacity = candidateCount;
+	}
+#endif
 
 	UnsignedInt captured = 0;
 	for (UnsignedInt captureIndex = 0; captureIndex != sleepyUpdates.size(); ++captureIndex)
@@ -506,8 +690,19 @@ Bool preparePhysicsIntegrationBatch(GameLogic *logic,
 	batch.count = captured;
 	const rts::PhysicsIntegrationMetricCounter captureNanoseconds =
 		rts::PhysicsIntegrationClockNowNanoseconds() - captureStart;
+#if defined(_WIN64)
+	captureScope.close();
+#endif
 
 	rts::PhysicsIntegrationOptions options;
+#if defined(_WIN64)
+	options.performanceBatch = batch.performanceBatch;
+	options.performanceReferenceLedger = batch.performanceReferenceLedger;
+	options.performanceReferenceBatch = &batch.performanceReferenceBatch;
+	options.performanceReferenceOutput = batch.performanceReferenceOutput;
+	options.performanceReferenceOutputCapacity =
+		batch.performanceReferenceOutputCapacity;
+#endif
 	const rts::PhysicsIntegrationBatchResult result =
 		rts::PreparePhysicsIntegrationPrefixes(batch.snapshots, batch.count,
 			batch.outputs, batch.count, batch.scratch, batch.count, options, &batch.metrics);
@@ -517,6 +712,9 @@ Bool preparePhysicsIntegrationBatch(GameLogic *logic,
 	batch.metrics.storageAllocations = batch.storageAllocations;
 	if (batch.storageAllocations != 0)
 		batch.metrics.allocatedBytes += batch.storageCapacityBytes;
+	#if defined(_WIN64)
+	batch.performanceBatchAdmitted = batch.metrics.submittedJobs != 0;
+	#endif
 	if (result != rts::PHYSICS_INTEGRATION_PARALLEL)
 	{
 		if (result == rts::PHYSICS_INTEGRATION_POLICY_INELIGIBLE)
@@ -605,7 +803,11 @@ Bool consumePhysicsIntegrationPrefix(GameLogic *logic,
 	}
 
 	sleepLen = physics->updateFromPreparedIntegrationPrefix(captured,
-		batch.outputs[entry], commitStart, batch.metrics.commitNanoseconds);
+		batch.outputs[entry], commitStart, batch.metrics.commitNanoseconds
+#if defined(_WIN64)
+		, &batch.performanceBatch
+#endif
+		);
 	++batch.committed;
 	return TRUE;
 }
@@ -4658,6 +4860,16 @@ void GameLogic::runLegacyMutableIslandPhase( UnsignedInt now )
 			{
 				break;
 			}
+			#if defined(_WIN64)
+			if (immutableSpatialArenaCaptured &&
+				(s_immutableSpatialQueries.empty() ||
+				immutableSpatialPreparedOrdinal >=
+					s_immutableSpatialQueries.size() ||
+				s_immutableSpatialQueries[immutableSpatialPreparedOrdinal] != u))
+			{
+				EndLiveImmutableSpatialQueryCollection();
+			}
+			#endif
 			if (!physicsBatchAttempted &&
 				u->friend_getNextCallPhase() == PHASE_PHYSICS)
 			{
@@ -4804,6 +5016,7 @@ void GameLogic::runLegacyMutableIslandPhase( UnsignedInt now )
 						immutableSpatialPreparedOrdinal >=
 							s_immutableSpatialQueries.size())
 					{
+						EndLiveImmutableSpatialQueryCollection();
 						s_immutableSpatialQueries.clear();
 						immutableSpatialArenaCaptured = FALSE;
 					}
@@ -4812,6 +5025,12 @@ void GameLogic::runLegacyMutableIslandPhase( UnsignedInt now )
 				rebalanceSleepyUpdate(0);
 		}
 	}
+#if defined(_WIN64)
+	EndLiveImmutableSpatialQueryCollection();
+	physicsBatch.finishPerformanceBatch(
+		physicsBatch.ready && physicsBatch.count != 0 &&
+		physicsBatch.committed == physicsBatch.count);
+#endif
 	if (physicsBatch.committed != 0)
 		rts::RecordPhysicsIntegrationAuthoritativeSlice(physicsBatch.committed,
 			physicsBatch.metrics);
@@ -4868,6 +5087,26 @@ static Bool runPreparedDisabledStatusSweep( GameLogic *logic )
 			jobs.isCurrentThread(rts::JOB_OWNER_GAME)) )
 		return FALSE;
 
+#if defined(_WIN64)
+	KernelPerformanceBatchGuard performanceBatch(
+		rts::performance::KERNEL_PERFORMANCE_STATUS, 0,
+		logic->getFrame(), nextKernelPerformanceOrdinal());
+	rts::performance::KernelPerformanceReferenceMode referenceMode =
+		rts::performance::KERNEL_REFERENCE_DISABLED;
+	if( performanceBatch.active )
+	{
+	rts::performance::KernelPerformanceReferenceLedger *referenceLedger =
+			&rts::performance::KernelPerformanceReferenceLedger::instance();
+		referenceMode = referenceLedger->mode();
+		if( referenceMode != rts::performance::KERNEL_REFERENCE_DISABLED )
+			performanceBatch.performanceReferenceLedger = referenceLedger;
+	}
+	const Bool serialReference = referenceMode ==
+		rts::performance::KERNEL_REFERENCE_SERIAL_ORACLE;
+	KernelPerformanceIntervalGuard captureScope(performanceBatch.ledger,
+		performanceBatch.token, rts::performance::KERNEL_PERFORMANCE_CAPTURE);
+#endif
+
 	UnsignedInt snapshotCount = 0;
 	for( Object *countObject = logic->getFirstObject(); countObject;
 		countObject = countObject->getNextObject() )
@@ -4884,7 +5123,11 @@ static Bool runPreparedDisabledStatusSweep( GameLogic *logic )
 	const Bool shadow = rts::UseSimulationShadowOracle();
 	const size_t maximumStorageBytes = static_cast<size_t>(
 		~static_cast<UnsignedInt>(0));
-	const size_t commandCopies = shadow ? 2 : 1;
+	size_t commandCopies = shadow ? 2 : 1;
+#if defined(_WIN64)
+	if (serialReference)
+		++commandCopies;
+#endif
 	if( static_cast<size_t>(snapshotCount) > maximumStorageBytes /
 			sizeof(rts::ObjectStatusTimerSnapshot) ||
 		static_cast<size_t>(snapshotCount) > maximumStorageBytes /
@@ -4921,6 +5164,21 @@ static Bool runPreparedDisabledStatusSweep( GameLogic *logic )
 	if( shadow )
 		preparedCommands = reinterpret_cast<rts::ObjectStatusTimerCommand *>(
 			storage + snapshotBytes + commandBytes);
+#if defined(_WIN64)
+	rts::ObjectStatusTimerCommand *referenceOutput = 0;
+	if( serialReference )
+	{
+		if( shadow )
+			referenceOutput = reinterpret_cast<rts::ObjectStatusTimerCommand *>(
+				storage + snapshotBytes + 2 * commandBytes);
+		else
+		{
+			referenceOutput = serialCommands;
+			preparedCommands = reinterpret_cast<rts::ObjectStatusTimerCommand *>(
+				storage + snapshotBytes + commandBytes);
+		}
+	}
+#endif
 
 	UnsignedInt snapshotIndex = 0;
 	UnsignedInt ownerOrder = 0;
@@ -4949,14 +5207,31 @@ static Bool runPreparedDisabledStatusSweep( GameLogic *logic )
 		}
 	}
 
+#if defined(_WIN64)
+	captureScope.close();
+#endif
 	rts::ObjectStatusTimerOptions parallelOptions;
 	parallelOptions.parallel = true;
+#if defined(_WIN64)
+	parallelOptions.performanceBatch = performanceBatch.token;
+	parallelOptions.performanceReferenceLedger =
+		performanceBatch.performanceReferenceLedger;
+	parallelOptions.performanceReferenceBatch =
+		&performanceBatch.performanceReferenceBatch;
+	parallelOptions.performanceReferenceOutput = referenceOutput;
+	parallelOptions.performanceReferenceOutputCapacity =
+		serialReference ? snapshotCount : 0;
+#endif
 	rts::ObjectStatusTimerMetrics parallelMetrics;
 	UnsignedInt preparedCount = 0;
 	const rts::ObjectStatusTimerResult preparedResult =
 		rts::PrepareObjectStatusTimerCommands(snapshots, snapshotCount,
 			logic->getFrame(), DISABLED_COUNT, preparedCommands, snapshotCount,
 			parallelOptions, &preparedCount, &parallelMetrics);
+#if defined(_WIN64)
+	if( parallelMetrics.submittedJobs != 0 )
+		performanceBatch.markAdmitted();
+#endif
 
 	PROFILER_PLOT("ObjectStatusTimerSnapshots",
 		static_cast<int64_t>(parallelMetrics.evaluatedSnapshots));
@@ -5016,12 +5291,26 @@ static Bool runPreparedDisabledStatusSweep( GameLogic *logic )
 	}
 
 	UnsignedInt committedCount = 0;
+#if defined(_WIN64)
+	Bool allCommandsResolved = TRUE;
+	const Bool authoritativePerformanceBatch = !shadow &&
+		preparedResult == rts::OBJECT_STATUS_TIMER_PARALLEL &&
+		preparedCount != 0;
+	KernelPerformanceIntervalGuard commitScope(
+		authoritativePerformanceBatch ? performanceBatch.ledger : 0,
+		performanceBatch.token, rts::performance::KERNEL_PERFORMANCE_COMMIT);
+#endif
 	for( UnsignedInt index = 0; index != preparedCount; ++index )
 	{
 		const rts::ObjectStatusTimerCommand &command = preparedCommands[index];
 		Object *resolvedObject = logic->findObjectByID(static_cast<ObjectID>(command.objectID));
 		if( resolvedObject == nullptr )
+		{
+#if defined(_WIN64)
+			allCommandsResolved = FALSE;
+#endif
 			continue;
+		}
 		Bool stillExpired = FALSE;
 		for( Int checkTypeIndex = 0; checkTypeIndex != DISABLED_COUNT;
 			++checkTypeIndex )
@@ -5042,6 +5331,11 @@ static Bool runPreparedDisabledStatusSweep( GameLogic *logic )
 			++committedCount;
 		}
 	}
+#if defined(_WIN64)
+	commitScope.close();
+	performanceBatch.finish(authoritativePerformanceBatch && allCommandsResolved &&
+		committedCount == preparedCount);
+#endif
 	if( !shadow && preparedResult == rts::OBJECT_STATUS_TIMER_PARALLEL )
 		rts::RecordObjectStatusTimerAuthoritativeCommit(preparedCount,
 			committedCount, parallelMetrics);

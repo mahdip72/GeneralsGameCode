@@ -29,11 +29,17 @@
 #include "Lib/SimulationExecutionPolicy.h"
 #include "Lib/SimulationPhaseGraphOwnerAdapter.h"
 #if defined(_WIN64)
+#include "Common/FileSystem.h"
+#include "Common/PerformanceReceiptRuntime.h"
+#include "Common/crc.h"
 #include "Lib/CollisionCandidateKernel.h"
 #include "Lib/DeterministicAIPlanning.h"
 #include "Lib/ImmutableSpatialQueryRuntime.h"
 #include "Lib/ObjectStatusTimerKernel.h"
 #include "Lib/PhysicsIntegrationKernel.h"
+#include <memory>
+#include <new>
+#include <vector>
 #endif
 
 #include <errno.h>
@@ -98,6 +104,8 @@ OrdinaryPathRuntimeMetrics s_ordinaryPathMetricsAtStart;
 OrdinaryPathRuntimeMetrics s_ordinaryPathMetricsFrozen;
 Bool s_ordinaryPathMetricsAwaitingInitialReset = FALSE;
 #if defined(_WIN64)
+std::unique_ptr<PerformanceReceiptRuntime> s_performanceReceipt;
+bool s_performanceReceiptAttempted = false;
 rts::AIPlanningRuntimeMetrics s_aiPlanningMetricsAtStart;
 rts::CollisionCandidateRuntimeMetrics s_collisionMetricsAtStart;
 rts::CollisionCandidateRuntimeMetrics s_collisionMetricsFrozen;
@@ -488,6 +496,64 @@ void CaptureSkirmishAITestRuntimeState()
 	CaptureSkirmishAITestSliceMetrics();
 }
 
+#if defined(_WIN64)
+struct ClosePerformanceMapFile
+{
+	void operator()(File *file) const { if (file != 0) file->close(); }
+};
+
+void BindSkirmishAITestPerformanceMap()
+{
+	if (!s_performanceReceipt || !s_performanceReceipt->active()) return;
+	if (TheFileSystem == 0)
+	{
+		s_performanceReceipt->invalidate("loaded map filesystem was unavailable");
+		return;
+	}
+	std::unique_ptr<File, ClosePerformanceMapFile> file(TheFileSystem->openFile(
+		s_runner.loadedMapName, File::READ | File::BINARY | File::STREAMING));
+	const Int length = file ? file->size() : 0;
+	if (length <= 0 || length > 64 * 1024 * 1024 ||
+		static_cast<unsigned>(length) != s_runner.loadedMapSize)
+	{
+		s_performanceReceipt->invalidate("loaded map content size could not be verified");
+		return;
+	}
+	try
+	{
+		std::vector<unsigned char> bytes(static_cast<size_t>(length));
+		Int offset = 0;
+		while (offset < length)
+		{
+			const Int count = file->read(&bytes[static_cast<size_t>(offset)], length - offset);
+			if (count <= 0 || count > length - offset) break;
+			offset += count;
+		}
+		unsigned char extra = 0;
+		if (offset != length || file->read(&extra, 1) != 0)
+		{
+			s_performanceReceipt->invalidate("loaded map content was not read exactly");
+			return;
+		}
+		CRC crc;
+		crc.computeCRC(&bytes[0], length);
+		char sha256[65];
+		if (crc.get() != s_runner.loadedMapCRC ||
+			!HashSkirmishAITestBytes(&bytes[0], bytes.size(), sha256))
+		{
+			s_performanceReceipt->invalidate("loaded map content disagrees with the live map");
+			return;
+		}
+		s_performanceReceipt->bindFixture("fresh-ai-map", s_runner.loadedMapName,
+			sha256, static_cast<unsigned>(s_runner.loadedSeed));
+	}
+	catch (const std::bad_alloc &)
+	{
+		s_performanceReceipt->invalidate("loaded map hashing storage was unavailable");
+	}
+}
+#endif
+
 rts::JobMetricCounter JobMetricDelta(rts::JobMetricCounter finalValue,
 	rts::JobMetricCounter initialValue)
 {
@@ -502,6 +568,31 @@ Bool RetainSkirmishAITestReplayAtomically(const char *sourcePath,
 {
 	return RetainSkirmishAITestReplayAtomicallyInternal(sourcePath,
 		destinationPath, sha256);
+}
+
+Bool HashSkirmishAITestBytes(const void *bytes, size_t byteCount,
+	char sha256[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1])
+{
+	if ((!bytes && byteCount != 0) || !sha256) return FALSE;
+	SkirmishAITestSha256 hash;
+	if (byteCount != 0)
+		hash.update(static_cast<const unsigned char *>(bytes), byteCount);
+	hash.finish(sha256);
+	return TRUE;
+}
+
+Bool CaptureSkirmishAITestValidatedExecutableHash(
+	char sha256[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1])
+{
+	return CaptureSkirmishAITestExecutableHash(sha256) &&
+		(strcmp(s_executableHashInput, "unavailable") == 0 ||
+			_stricmp(s_executableHashInput, sha256) == 0);
+}
+
+Bool HashSkirmishAITestContentFile(const char *path,
+	char sha256[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1])
+{
+	return HashSkirmishAITestFile(path, sha256);
 }
 
 void AccumulateSkirmishAITestDirectPathMetrics(
@@ -1944,6 +2035,15 @@ Bool StartSkirmishAITestRunner()
 	TheRecorder->setArchiveEnabled(FALSE);
 	InitRandom(static_cast<UnsignedInt>(plan.seed));
 
+#if defined(_WIN64)
+	if (!IsSkirmishAITestPracticalControllerScenario(s_runner.scenario) &&
+		!s_performanceReceiptAttempted)
+	{
+		s_performanceReceiptAttempted = true;
+		s_performanceReceipt.reset(new PerformanceReceiptRuntime);
+		if (!s_performanceReceipt->begin("fresh-ai-map", "")) s_performanceReceipt.reset();
+	}
+#endif
 	GameMessage *message = TheMessageStream->appendMessage(GameMessage::MSG_NEW_GAME);
 	message->appendIntegerArgument(GAME_SKIRMISH);
 	message->appendIntegerArgument(DIFFICULTY_NORMAL);
@@ -2055,6 +2155,9 @@ void UpdateSkirmishAITestRunner()
 		s_runner.loadedMapCRC = loadedState.mapCRC;
 		s_runner.loadedMapSize = loadedState.mapSize;
 		s_runner.loadedSeed = loadedState.seed;
+#if defined(_WIN64)
+		BindSkirmishAITestPerformanceMap();
+#endif
 	}
 
 	if (!IsSkirmishAITestPracticalControllerScenario(s_runner.scenario))
@@ -2239,9 +2342,39 @@ void UpdateSkirmishAITestRunner()
 	// Capture the authoritative owner-thread state digest before exitGame tears
 	// down the live simulation. Validation compares this value across worker
 	// counts and execution modes; it must never be derived from worker order.
-	SetSkirmishAITestFinalDigest(TheGameLogic->getCRC(CRC_RECALC));
+	const UnsignedInt finalCRC = TheGameLogic->getCRC(CRC_RECALC);
+	SetSkirmishAITestFinalDigest(finalCRC);
+#if defined(_WIN64)
+	// The victory event frame remains unchanged in the replay contract. Its
+	// authoritative digest belongs to the actual current owner frame instead.
+	if (s_performanceReceipt)
+		s_performanceReceipt->captureTerminalResult(currentFrame, finalCRC, true, true);
+#endif
 	RequestSkirmishAITestStop();
 }
+
+#if defined(_WIN64)
+void ObserveSkirmishAITestCompletedFrame(unsigned previousFrame)
+{
+	if (!s_performanceReceipt || !s_performanceReceipt->active() ||
+		!s_runner.loadedStateValidated || s_runner.failed)
+		return;
+	// ending may already be true: exitGame queued teardown, but this frame
+	// still contains the terminal owner state and must be observed after EndFrame.
+	s_performanceReceipt->captureCompletedFrame(previousFrame,
+		s_collisionMetricsFrozen, s_physicsMetricsFrozen, s_statusMetricsFrozen,
+		s_spatialMetricsFrozen, s_ordinaryPathMetricsFrozen);
+}
+
+void FinalizeSkirmishAITestPerformanceReceipt(Int engineExitCode)
+{
+	if (s_performanceReceipt)
+	{
+		s_performanceReceipt->finish(engineExitCode, "GameMain:engine-destroyed-before-owner-detach");
+		s_performanceReceipt.reset();
+	}
+}
+#endif
 
 Int FinalizeSkirmishAITestRunner(Int engineExitCode)
 {
@@ -2339,6 +2472,18 @@ Int FinalizeSkirmishAITestRunner(Int engineExitCode)
 			FailSkirmishAITest("replay_receipt_invalid");
 	}
 
+#if defined(_WIN64)
+	// Copy all owner-dependent state before GameEngine destroys the recorder,
+	// player list, game data and JobSystem owner registration.
+	if (s_performanceReceipt)
+	{
+		s_performanceReceipt->captureSchedulerBeforeTeardown();
+		if (s_runner.failed)
+			s_performanceReceipt->invalidate("fresh AI owner run or closed replay validation failed");
+		else
+			s_performanceReceipt->retainClosedReplay(s_runner.retainedReplayPath, s_runner.replaySha256);
+	}
+#endif
 	if (s_runner.failed)
 	{
 		printf("SKIRMISH_AI_TEST_FAIL seed=%d scenario=%s run_nonce=%s reason=%s\n",

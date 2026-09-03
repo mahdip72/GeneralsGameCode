@@ -6,9 +6,9 @@
   "additionalProperties": false,
   "required": ["schemaVersion", "evidenceKind", "producer", "sourceCommit", "artifactSetSha256", "title", "executableSha256", "stage3SourceCommit", "stage3ExecutableSha256", "stage3BaselineSha256", "measurementMode", "installedRuntime", "topologyReceipt", "fixtureSamples", "phaseSamples", "kernelSamples"],
   "properties": {
-    "schemaVersion": { "const": 1 },
+    "schemaVersion": { "const": 2 },
     "evidenceKind": { "const": "stage5-performance-scaling-raw-samples" },
-    "producer": { "const": "installed-runtime-scaling-runner-v1" },
+    "producer": { "const": "installed-runtime-scaling-runner-v2" },
     "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
     "artifactSetSha256": { "$ref": "#/$defs/sha256" },
     "title": { "enum": ["Generals", "ZeroHour"] },
@@ -20,7 +20,7 @@
     "installedRuntime": { "const": true },
     "topologyReceipt": { "$ref": "#/$defs/evidenceFile" },
     "fixtureSamples": { "type": "array", "minItems": 48, "items": { "$ref": "#/$defs/fixtureSample" } },
-    "phaseSamples": { "type": "array", "minItems": 21, "items": { "$ref": "#/$defs/phaseSample" } },
+    "phaseSamples": { "type": "array", "minItems": 15, "items": { "$ref": "#/$defs/phaseSample" } },
     "kernelSamples": { "type": "array", "minItems": 18, "items": { "$ref": "#/$defs/kernelSample" } }
   },
   "$defs": {
@@ -35,11 +35,13 @@
     },
     "fixtureSample": {
       "type": "object", "additionalProperties": false,
-      "required": ["fixture", "playerCount", "peakUnitCount", "lane", "repeat", "processId", "executableSha256", "commandLine", "elapsedMilliseconds"],
+      "required": ["fixture", "playerCount", "peakUnitCount", "requestedMinimumUnitCount", "initialUnitCount", "lane", "repeat", "processId", "executableSha256", "commandLine", "elapsedMilliseconds"],
       "properties": {
         "fixture": { "enum": ["one-thousand-units", "four-thousand-units", "eight-thousand-units", "dense-eight-player"] },
         "playerCount": { "const": 8 },
         "peakUnitCount": { "type": "integer", "minimum": 1000 },
+        "requestedMinimumUnitCount": { "type": "integer", "minimum": 1000 },
+        "initialUnitCount": { "type": "integer", "minimum": 1000 },
         "lane": { "enum": ["stage3-forced-one", "forced-one", "physical-8", "physical-16"] },
         "repeat": { "type": "integer", "minimum": 0 },
         "processId": { "type": "integer", "minimum": 1 },
@@ -50,19 +52,20 @@
     },
     "phaseSample": {
       "type": "object", "additionalProperties": false,
-      "required": ["phase", "repeat", "processId", "commandLine", "elapsedMilliseconds", "serialMilliseconds"],
+      "required": ["phase", "repeat", "processId", "commandLine", "elapsedMilliseconds", "serialMilliseconds", "serialMillisecondsKnown"],
       "properties": {
-        "phase": { "enum": ["owner-intake", "world-queries", "pathfinding", "object-computation", "spatial-work", "deterministic-commit", "verification-publication"] },
+        "phase": { "enum": ["owner-intake", "legacy-mutable-island", "spatial-work", "owner-tail", "verification-publication"] },
         "repeat": { "type": "integer", "minimum": 0 },
         "processId": { "type": "integer", "minimum": 1 },
         "commandLine": { "type": "string", "minLength": 1 },
         "elapsedMilliseconds": { "type": "number", "exclusiveMinimum": 0 },
-        "serialMilliseconds": { "type": "number", "minimum": 0 }
+        "serialMilliseconds": { "type": "number", "minimum": 0 },
+        "serialMillisecondsKnown": { "const": true }
       }
     },
     "kernelSample": {
       "type": "object", "additionalProperties": false,
-      "required": ["kernel", "repeat", "processId", "commandLine", "admittedSlices", "captureMilliseconds", "scheduleMilliseconds", "waitMilliseconds", "validateMilliseconds", "commitMilliseconds", "exactSerialOperationMilliseconds"],
+      "required": ["kernel", "repeat", "processId", "commandLine", "admittedSlices", "captureMilliseconds", "scheduleMilliseconds", "waitMilliseconds", "validateMilliseconds", "commitMilliseconds", "exactSerialOperationMilliseconds", "exactSerialOperationMillisecondsKnown", "timingAttribution"],
       "properties": {
         "kernel": { "enum": ["physics", "status", "collision", "ai-planning", "spatial", "path"] },
         "repeat": { "type": "integer", "minimum": 0 },
@@ -74,7 +77,9 @@
         "waitMilliseconds": { "type": "number", "minimum": 0 },
         "validateMilliseconds": { "type": "number", "minimum": 0 },
         "commitMilliseconds": { "type": "number", "minimum": 0 },
-        "exactSerialOperationMilliseconds": { "type": "number", "exclusiveMinimum": 0 }
+        "exactSerialOperationMilliseconds": { "type": "number", "exclusiveMinimum": 0 },
+        "exactSerialOperationMillisecondsKnown": { "const": true },
+        "timingAttribution": { "const": "owner-stack-exclusive-v1" }
       }
     }
   }

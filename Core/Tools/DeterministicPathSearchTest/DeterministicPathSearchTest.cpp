@@ -1,6 +1,10 @@
 #include "Lib/DeterministicPathBatch.h"
 #include "Lib/BoundedFreeCounter.h"
 #include "Lib/JobSystem.h"
+#if defined(_WIN64)
+#include "Lib/KernelPerformanceDiagnostics.h"
+#include "Lib/KernelPerformanceReference.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -16,6 +20,11 @@
 
 #if defined(NDEBUG)
 #error DeterministicPathSearchTest must run with assertions enabled
+#endif
+
+#if defined(_MSC_VER)
+#include <crtdbg.h>
+#include <stdlib.h>
 #endif
 
 extern "C" void rts_direct_path_set_test_pause_mask(unsigned pauseMask);
@@ -700,6 +709,204 @@ void TestPhysicalWorkerCountsAndOneWorkerParity()
 	}
 }
 
+#if defined(_WIN64)
+struct PathPerformanceTestClock
+{
+	PathPerformanceTestClock() : value(0), reads(0) {}
+
+	static rts::JobMetricCounter read(void *context)
+	{
+		PathPerformanceTestClock &clock =
+			*static_cast<PathPerformanceTestClock *>(context);
+		++clock.reads;
+		return ++clock.value;
+	}
+
+	rts::JobMetricCounter value;
+	unsigned reads;
+};
+
+void TestDirectPathBatchPerformanceLedgerStages()
+{
+	using namespace rts::performance;
+	PathPerformanceTestClock clock;
+	KernelPerformanceLedger &ledger = KernelPerformanceLedger::instance();
+	assert(ledger.beginRun(true, PathPerformanceTestClock::read, &clock));
+	KernelPerformanceBatch ledgerBatch = ledger.beginBatch(
+		KERNEL_PERFORMANCE_PATH, 1, 42, 1);
+	assert(ledgerBatch.valid());
+	const KernelPerformanceInterval capture = ledger.beginInterval(ledgerBatch,
+		KERNEL_PERFORMANCE_CAPTURE);
+	assert(capture.valid());
+	assert(ledger.endInterval(capture));
+
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	jobs.shutdown();
+	rts::JobSystemConfig config;
+	config.workerCount = 2;
+	config.queueCapacity = 16;
+	config.scratchBytesPerWorker = 4096;
+	config.pinWorkers = false;
+	assert(jobs.start(config));
+	assert(jobs.registerCurrentThread(rts::JOB_OWNER_GAME));
+	DirectFixture first(3, 4, 11, 7);
+	DirectFixture second(17, 9, 10, 14);
+	second.snapshot.requestToken = 74;
+	second.snapshot.objectId = 100;
+	const std::array<rts::DirectPathSnapshot, 2> snapshots =
+		{first.snapshot, second.snapshot};
+	rts::DeterministicDirectPathBatch batch;
+	assert(batch.executeSynchronously(jobs, snapshots.data(), snapshots.size(),
+		1000, &ledgerBatch));
+	const KernelPerformanceInterval validate = ledger.beginInterval(ledgerBatch,
+		KERNEL_PERFORMANCE_VALIDATE);
+	assert(validate.valid());
+	assert(ledger.endInterval(validate));
+	const KernelPerformanceInterval commit = ledger.beginInterval(ledgerBatch,
+		KERNEL_PERFORMANCE_COMMIT);
+	assert(commit.valid());
+	assert(ledger.endInterval(commit));
+	assert(ledger.endBatch(ledgerBatch, KERNEL_PERFORMANCE_COMMITTED));
+	const KernelPerformanceSnapshot snapshot = ledger.freeze();
+	assert(snapshot.complete);
+	assert(snapshot.streamCount == 1);
+	const KernelPerformanceStream &stream = snapshot.streams[0];
+	assert(stream.kernel == KERNEL_PERFORMANCE_PATH);
+	assert(stream.subtype == 1);
+	assert(stream.firstFrame == 42 && stream.lastFrame == 42);
+	for (unsigned stage = 0; stage < KERNEL_PERFORMANCE_STAGE_COUNT; ++stage)
+		assert(stream.stageSamples[stage] >= 1);
+	assert(stream.attemptedBatches == 1);
+	assert(stream.admittedBatches == 1);
+	assert(stream.committedBatches == 1);
+	assert(stream.abortedBatches == 0);
+	assert(stream.activePipelineNanoseconds != 0);
+	assert(clock.reads != 0);
+	assert(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME));
+	jobs.shutdown();
+}
+
+struct PathReferenceTestRun
+{
+	rts::performance::KernelPerformanceSnapshot timing;
+	rts::performance::KernelPerformanceReferenceSnapshot reference;
+	unsigned referenceClockReads;
+};
+
+PathReferenceTestRun RunDirectPathReferenceBatch(
+	rts::performance::KernelPerformanceReferenceMode mode, bool committed)
+{
+	using namespace rts::performance;
+	PathPerformanceTestClock timingClock;
+	PathPerformanceTestClock referenceClock;
+	KernelPerformanceLedger &timing = KernelPerformanceLedger::instance();
+	KernelPerformanceReferenceLedger reference;
+	assert(timing.beginRun(true, PathPerformanceTestClock::read, &timingClock));
+	assert(reference.beginRun(mode, PathPerformanceTestClock::read,
+		&referenceClock));
+	assert(reference.mode() == mode);
+	KernelPerformanceBatch timingBatch = timing.beginBatch(
+		KERNEL_PERFORMANCE_PATH, 1, 142, 9);
+	assert(timingBatch.valid());
+
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	jobs.shutdown();
+	rts::JobSystemConfig config;
+	config.workerCount = 2;
+	config.queueCapacity = 16;
+	config.scratchBytesPerWorker = 4096;
+	config.pinWorkers = false;
+	assert(jobs.start(config));
+	assert(jobs.registerCurrentThread(rts::JOB_OWNER_GAME));
+	DirectFixture first(3, 4, 11, 7);
+	DirectFixture second(17, 9, 10, 14);
+	second.snapshot.requestToken = 74;
+	second.snapshot.objectId = 100;
+	const std::array<rts::DirectPathSnapshot, 2> snapshots =
+		{first.snapshot, second.snapshot};
+	rts::DeterministicDirectPathBatch batch;
+	rts::performance::KernelPerformanceReferenceBatch referenceBatch;
+	assert(batch.executeSynchronously(jobs, snapshots.data(), snapshots.size(),
+		1000, &timingBatch, &reference, &referenceBatch));
+	const rts::DeterministicDirectPathBatchExecutionSnapshot execution =
+		batch.executionSnapshot();
+	assert(execution.completed && execution.workerExecutedJobCount == 2);
+	// RED until the native path batch emits one reference token from its real
+	// post-validation output while the timing VALIDATE scope is still open.
+	assert(referenceBatch.valid());
+
+	const KernelPerformanceInterval commit = timing.beginInterval(timingBatch,
+		KERNEL_PERFORMANCE_COMMIT);
+	assert(commit.valid());
+	assert(timing.endInterval(commit));
+	assert(reference.finishBatch(referenceBatch, committed));
+	assert(timing.endBatch(timingBatch, committed ?
+		KERNEL_PERFORMANCE_COMMITTED :
+		KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION));
+	const KernelPerformanceSnapshot timingSnapshot = timing.freeze();
+	const KernelPerformanceReferenceSnapshot referenceSnapshot =
+		reference.freeze();
+	assert(timingSnapshot.complete);
+	assert(referenceSnapshot.complete);
+	assert(referenceSnapshot.streamCount == 1);
+	const KernelPerformanceReferenceStream &stream =
+		referenceSnapshot.streams[0];
+	assert(stream.kernel == KERNEL_PERFORMANCE_PATH && stream.subtype == 1);
+	assert(stream.firstFrame == 142 && stream.lastFrame == 142);
+	assert(stream.validatedBatchCount == 1);
+	assert(stream.validatedOperationCount == snapshots.size());
+	if (committed)
+	{
+		assert(stream.committedBatchCount == 1);
+		assert(stream.committedOperationCount == snapshots.size());
+	}
+	else
+	{
+		assert(stream.abortedBatchCount == 1);
+		assert(stream.committedBatchCount == 0);
+		assert(stream.committedOperationCount == 0);
+	}
+	if (mode == KERNEL_REFERENCE_SERIAL_ORACLE)
+	{
+		assert(committed ? stream.serialSampleCount == 1 :
+			stream.serialSampleCount == 0);
+		if (committed)
+			assert(stream.serialNanoseconds != 0);
+	}
+	else
+	{
+		assert(stream.serialSampleCount == 0);
+		assert(stream.serialNanoseconds == 0);
+		assert(referenceClock.reads == 0);
+	}
+	assert(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME));
+	jobs.shutdown();
+	PathReferenceTestRun result = {};
+	result.timing = timingSnapshot;
+	result.reference = referenceSnapshot;
+	result.referenceClockReads = referenceClock.reads;
+	return result;
+}
+
+void TestDirectPathReferenceModesAndCommitBoundary()
+{
+	const PathReferenceTestRun throughput = RunDirectPathReferenceBatch(
+		rts::performance::KERNEL_REFERENCE_THROUGHPUT_BINDING, true);
+	const PathReferenceTestRun serial = RunDirectPathReferenceBatch(
+		rts::performance::KERNEL_REFERENCE_SERIAL_ORACLE, true);
+	assert(throughput.reference.streams[0].inputDigest.equals(
+		serial.reference.streams[0].inputDigest));
+	assert(throughput.reference.streams[0].outputDigest.equals(
+		serial.reference.streams[0].outputDigest));
+	assert(throughput.reference.streams[0].commitDigest.equals(
+		serial.reference.streams[0].commitDigest));
+	const PathReferenceTestRun aborted = RunDirectPathReferenceBatch(
+		rts::performance::KERNEL_REFERENCE_SERIAL_ORACLE, false);
+	assert(aborted.reference.streams[0].abortedBatchCount == 1);
+	assert(aborted.reference.streams[0].serialSampleCount == 0);
+}
+#endif
+
 void TestBoundedBatchUsesMultiplePhysicalWorkers()
 {
 	rts::JobSystem &jobs = rts::JobSystem::instance();
@@ -1356,6 +1563,176 @@ void AssertOrdinaryBatchMatchesSerial(
 	assert(workerCrc == serialCrc);
 }
 
+#if defined(_WIN64)
+struct OrdinaryPathReferenceTestRun
+{
+	rts::performance::KernelPerformanceSnapshot timing;
+	rts::performance::KernelPerformanceReferenceSnapshot reference;
+	unsigned referenceClockReads;
+};
+
+OrdinaryPathReferenceTestRun RunOrdinaryPathReferenceBatch(
+	rts::performance::KernelPerformanceReferenceMode mode, bool committed)
+{
+	using namespace rts::performance;
+	OrdinaryFixture fixture(32, 32, 601);
+	std::array<rts::DeterministicOrdinaryPathBatchRequest, 2> requests =
+		{fixture.makeRequest(0), fixture.makeRequest(1)};
+	std::vector<OrdinarySerialResult> serial;
+	serial.reserve(requests.size());
+	for (std::size_t index = 0; index < requests.size(); ++index)
+	{
+		requests[index].search.hierarchyMode =
+			rts::DETERMINISTIC_PATH_HIERARCHY_ZERO_HOUR;
+		serial.push_back(RunOrdinarySerialOracle(fixture, requests[index]));
+		assert(serial.back().status == rts::DETERMINISTIC_PATH_FOUND);
+	}
+
+	PathPerformanceTestClock timingClock;
+	PathPerformanceTestClock referenceClock;
+	KernelPerformanceLedger &timing = KernelPerformanceLedger::instance();
+	KernelPerformanceReferenceLedger reference;
+	assert(timing.beginRun(true, PathPerformanceTestClock::read,
+		&timingClock));
+	assert(reference.beginRun(mode, PathPerformanceTestClock::read,
+		&referenceClock));
+	assert(reference.mode() == mode);
+	KernelPerformanceBatch timingBatch = timing.beginBatch(
+		KERNEL_PERFORMANCE_PATH, 0, 242, 11);
+	assert(timingBatch.valid());
+
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	jobs.shutdown();
+	rts::JobSystemConfig config;
+	config.workerCount = 4;
+	config.queueCapacity = 16;
+	config.scratchBytesPerWorker = 4096;
+	config.pinWorkers = false;
+	assert(jobs.start(config));
+	assert(jobs.registerCurrentThread(rts::JOB_OWNER_GAME));
+	rts::DeterministicOrdinaryPathBatch batch;
+	rts::performance::KernelPerformanceReferenceBatch referenceBatch;
+	assert(batch.executeSynchronously(jobs, fixture.grid, requests.data(),
+		requests.size(), 2000, &timingBatch, &reference,
+		&referenceBatch));
+	const rts::DeterministicOrdinaryPathBatchExecutionSnapshot execution =
+		batch.executionSnapshot();
+	assert(execution.completed);
+	assert(execution.requestCount == requests.size());
+	assert(execution.rangeCount == requests.size());
+	AssertOrdinaryBatchMatchesSerial(batch, serial, requests.size());
+	if (mode == KERNEL_REFERENCE_DISABLED)
+		assert(!referenceBatch.valid());
+	else
+		assert(referenceBatch.valid());
+
+	const KernelPerformanceInterval commit = timing.beginInterval(timingBatch,
+		KERNEL_PERFORMANCE_COMMIT);
+	assert(commit.valid());
+	assert(timing.endInterval(commit));
+	if (mode != KERNEL_REFERENCE_DISABLED)
+		assert(reference.finishBatch(referenceBatch, committed));
+	assert(timing.endBatch(timingBatch, committed ?
+		KERNEL_PERFORMANCE_COMMITTED :
+		KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION));
+	const KernelPerformanceSnapshot timingSnapshot = timing.freeze();
+	const KernelPerformanceReferenceSnapshot referenceSnapshot =
+		reference.freeze();
+	assert(timingSnapshot.complete);
+	assert(timingSnapshot.streamCount == 1);
+	const KernelPerformanceStream &timingStream = timingSnapshot.streams[0];
+	assert(timingStream.kernel == KERNEL_PERFORMANCE_PATH);
+	assert(timingStream.subtype == 0);
+	assert(timingStream.firstFrame == 242 && timingStream.lastFrame == 242);
+	for (unsigned stage = 0; stage < KERNEL_PERFORMANCE_STAGE_COUNT; ++stage)
+		assert(timingStream.stageSamples[stage] >= 1);
+	assert(timingStream.attemptedBatches == 1);
+	assert(timingStream.admittedBatches == 1);
+	assert(timingStream.committedBatches == (committed ? 1 : 0));
+	assert(timingStream.abortedBatches == (committed ? 0 : 1));
+	assert(timingStream.activePipelineNanoseconds != 0);
+	assert(timingClock.reads != 0);
+
+	assert(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME));
+	jobs.shutdown();
+	OrdinaryPathReferenceTestRun result = {};
+	result.timing = timingSnapshot;
+	result.reference = referenceSnapshot;
+	result.referenceClockReads = referenceClock.reads;
+	return result;
+}
+
+void TestOrdinaryPathReferenceModesAndCommitBoundary()
+{
+	const OrdinaryPathReferenceTestRun disabled =
+		RunOrdinaryPathReferenceBatch(
+			rts::performance::KERNEL_REFERENCE_DISABLED, true);
+	assert(disabled.reference.frozen);
+	assert(disabled.reference.mode ==
+		rts::performance::KERNEL_REFERENCE_DISABLED);
+	assert(disabled.reference.errors == 0);
+	assert(disabled.reference.streamCount == 0);
+	assert(disabled.referenceClockReads == 0);
+
+	const OrdinaryPathReferenceTestRun throughput =
+		RunOrdinaryPathReferenceBatch(
+			rts::performance::KERNEL_REFERENCE_THROUGHPUT_BINDING, true);
+	const OrdinaryPathReferenceTestRun serial =
+		RunOrdinaryPathReferenceBatch(
+			rts::performance::KERNEL_REFERENCE_SERIAL_ORACLE, true);
+	assert(throughput.reference.complete);
+	assert(serial.reference.complete);
+	assert(throughput.reference.streamCount == 1);
+	assert(serial.reference.streamCount == 1);
+	const rts::performance::KernelPerformanceReferenceStream &throughputStream =
+		throughput.reference.streams[0];
+	const rts::performance::KernelPerformanceReferenceStream &serialStream =
+		serial.reference.streams[0];
+	assert(throughputStream.kernel == rts::performance::KERNEL_PERFORMANCE_PATH);
+	assert(throughputStream.subtype == 0);
+	assert(serialStream.kernel == rts::performance::KERNEL_PERFORMANCE_PATH);
+	assert(serialStream.subtype == 0);
+	assert(throughputStream.fieldSchema == 1);
+	assert(serialStream.fieldSchema == 1);
+	assert(throughputStream.firstFrame == 242 &&
+		throughputStream.lastFrame == 242);
+	assert(serialStream.firstFrame == 242 && serialStream.lastFrame == 242);
+	assert(throughputStream.validatedBatchCount == 1);
+	assert(serialStream.validatedBatchCount == 1);
+	assert(throughputStream.validatedOperationCount == 2);
+	assert(serialStream.validatedOperationCount == 2);
+	assert(throughputStream.committedBatchCount == 1);
+	assert(serialStream.committedBatchCount == 1);
+	assert(throughputStream.committedOperationCount == 2);
+	assert(serialStream.committedOperationCount == 2);
+	assert(throughputStream.serialSampleCount == 0);
+	assert(throughputStream.serialNanoseconds == 0);
+	assert(throughputStream.inputDigest.equals(serialStream.inputDigest));
+	assert(throughputStream.outputDigest.equals(serialStream.outputDigest));
+	assert(throughputStream.commitDigest.equals(serialStream.commitDigest));
+	assert(throughput.referenceClockReads == 0);
+	assert(serialStream.serialSampleCount == 1);
+	assert(serialStream.serialNanoseconds != 0);
+	assert(serial.referenceClockReads != 0);
+
+	const OrdinaryPathReferenceTestRun aborted =
+		RunOrdinaryPathReferenceBatch(
+			rts::performance::KERNEL_REFERENCE_SERIAL_ORACLE, false);
+	assert(aborted.reference.complete);
+	assert(aborted.reference.streamCount == 1);
+	const rts::performance::KernelPerformanceReferenceStream &abortedStream =
+		aborted.reference.streams[0];
+	assert(abortedStream.validatedBatchCount == 1);
+	assert(abortedStream.validatedOperationCount == 2);
+	assert(abortedStream.abortedBatchCount == 1);
+	assert(abortedStream.committedBatchCount == 0);
+	assert(abortedStream.committedOperationCount == 0);
+	assert(abortedStream.serialSampleCount == 0);
+	assert(abortedStream.serialNanoseconds == 0);
+	assert(aborted.referenceClockReads != 0);
+}
+#endif
+
 void TestOrdinaryLegacyWidthWrapAndBridgeFallback()
 {
 	OrdinaryFixture fixture(70, 10, 880);
@@ -1624,6 +2001,14 @@ void TestOrdinaryAdaptiveLargeObstructedBatchAndFaults()
 
 int main()
 {
+#if defined(_MSC_VER)
+	_set_error_mode(_OUT_TO_STDERR);
+#if _MSC_VER >= 1400
+	_set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
+	_CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+	_CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+#endif
 	TestBoundedFreeCounterInvariants();
 	TestConcurrentMultiWorkerAuthorityCorrelation();
 	TestExactSupercoverDirectionsAndPostGoal();
@@ -1638,10 +2023,17 @@ int main()
 	TestMismatchFallbacksArePreMutation();
 	TestAuthorityPolicyAndRawStartAdmission();
 	TestPhysicalWorkerCountsAndOneWorkerParity();
+#if defined(_WIN64)
+	TestDirectPathBatchPerformanceLedgerStages();
+	TestDirectPathReferenceModesAndCommitBoundary();
+#endif
 	TestBoundedBatchUsesMultiplePhysicalWorkers();
 	TestBatchFailureTimeoutLateDrainAndStoppedFallback();
 	TestOrdinaryLegacyWidthWrapAndBridgeFallback();
 	TestOrdinaryOneWorkerSerialParity();
+#if defined(_WIN64)
+	TestOrdinaryPathReferenceModesAndCommitBoundary();
+#endif
 	TestOrdinaryAdaptiveLargeObstructedBatchAndFaults();
 	std::puts("DeterministicPathSearchTest passed");
 	return 0;

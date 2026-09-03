@@ -36,6 +36,7 @@
 #include "Common/SkirmishAITestRunner.h"
 #include "GameNetwork/InstalledNet3Validation.h"
 #if defined(_WIN64)
+#include "Common/Stage5PerformanceFixtureRunner.h"
 #include "GameNetwork/InstalledLockstepV2Validation.h"
 #endif
 
@@ -54,7 +55,9 @@ Int GameMain()
 	TheGameEngine->init();
 	const Bool net3ValidationRequested = rts::IsInstalledNet3ValidationRequested();
 	Bool lockstepV2ValidationRequested = FALSE;
+	Bool performanceFixtureRequested = FALSE;
 #if defined(_WIN64)
+	performanceFixtureRequested = IsStage5PerformanceFixtureRequested();
 	lockstepV2ValidationRequested =
 		rts::IsInstalledLockstepV2QualificationRequested() ? TRUE : FALSE;
 #endif
@@ -63,6 +66,8 @@ Int GameMain()
 		TheGlobalData->m_commandLineData.hasSkirmishAITest4v2Request() ||
 		TheGlobalData->m_commandLineData.hasSkirmishAITestPractical1v7Request();
 	const Bool validationOptionsConflict =
+		(performanceFixtureRequested && (net3ValidationRequested || lockstepV2ValidationRequested ||
+			skirmishValidationRequested || !TheGlobalData->m_simulateReplays.empty())) ||
 		(net3ValidationRequested && lockstepV2ValidationRequested) ||
 		((net3ValidationRequested || lockstepV2ValidationRequested) &&
 			skirmishValidationRequested) ||
@@ -122,9 +127,13 @@ Int GameMain()
 				TheGlobalData->m_commandLineData.getSkirmishAITestPractical1v7Seed(),
 				SKIRMISH_AI_TEST_SCENARIO_PRACTICAL_1V7);
 	}
-	const Bool canRun = !net3ValidationRequested &&
+	const Bool canRun = !validationOptionsConflict && !net3ValidationRequested &&
 		!lockstepV2ValidationRequested &&
-		StartSkirmishAITestRunner();
+		StartSkirmishAITestRunner()
+#if defined(_WIN64)
+		&& StartStage5PerformanceFixtureRunner()
+#endif
+		;
 
 	if (!canRun)
 	{
@@ -141,12 +150,19 @@ Int GameMain()
 	}
 	if (IsSkirmishAITestRunnerArmed())
 		exitcode = FinalizeSkirmishAITestRunner(exitcode);
+#if defined(_WIN64)
+	if (performanceFixtureRequested)
+		exitcode = FinalizeStage5PerformanceFixtureRunner(exitcode);
+#endif
 
 	// since execute() returned, we are exiting the game
 	delete TheFramePacer;
 	TheFramePacer = nullptr;
 	delete TheGameEngine;
 	TheGameEngine = nullptr;
+#if defined(_WIN64)
+	FinalizeSkirmishAITestPerformanceReceipt(exitcode);
+#endif
 	GameThreadOwnership::DetachCurrentThread();
 
 	return exitcode;

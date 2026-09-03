@@ -7,6 +7,10 @@
 
 #include "Lib/ImmutableSpatialQuery.h"
 #include "Lib/JobSystem.h"
+#if defined(_WIN64)
+#include "Lib/KernelPerformanceDiagnostics.h"
+#include "Lib/KernelPerformanceReference.h"
+#endif
 
 namespace rts
 {
@@ -68,6 +72,42 @@ enum ImmutableSpatialJobSystemTestFault
 	IMMUTABLE_SPATIAL_JOB_SYSTEM_TEST_TIMEOUT
 };
 
+#if defined(_WIN64)
+struct ImmutableSpatialQueryOwnerIdentity
+{
+	ImmutableSpatialUInt32 objectID;
+	ImmutableSpatialConsumer consumer;
+	ImmutableSpatialUInt32 wakePriority;
+};
+
+struct ImmutableSpatialConsumerCompletionToken
+{
+	ImmutableSpatialConsumerCompletionToken();
+	ImmutableSpatialUInt32 batchEpoch;
+	ImmutableSpatialUInt32 queryOrdinal;
+};
+
+// Owner-only observational state, shared with the focused runtime tests.
+// It never decides whether a consumer may publish authoritative gameplay.
+struct ImmutableSpatialCollectionCompletion
+{
+	enum { MAXIMUM_QUERIES = 256 };
+	ImmutableSpatialCollectionCompletion();
+	void reset(ImmutableSpatialUInt32 epoch);
+	bool pending(const ImmutableSpatialConsumerCompletionToken &token) const;
+	bool complete(ImmutableSpatialConsumer consumer,
+		const ImmutableSpatialConsumerCompletionToken &token, bool committed);
+	bool finished() const;
+
+	ImmutableSpatialUInt32 batchEpoch;
+	unsigned expectedConsumers;
+	unsigned completedConsumers;
+	bool allConsumersCommitted;
+private:
+	bool m_completed[MAXIMUM_QUERIES];
+};
+#endif
+
 struct ImmutableSpatialJobSystemOptions
 {
 	ImmutableSpatialJobSystemOptions();
@@ -76,6 +116,17 @@ struct ImmutableSpatialJobSystemOptions
 	unsigned testDispatchOrdinal;
 	unsigned testRangeOrdinal;
 	unsigned testSpinIterations;
+#if defined(_WIN64)
+	// Optional owner-created diagnostic identity. The shared executor only
+	// consumes this transport for observational timing; invalid tokens are
+	// inert and never change admission, fallback, or publication behavior.
+	performance::KernelPerformanceLedger *performanceLedger;
+	performance::KernelPerformanceBatch performanceBatch;
+	performance::KernelPerformanceReferenceLedger *referenceLedger;
+	performance::KernelPerformanceReferenceBatch *referenceBatch;
+	const ImmutableSpatialQueryOwnerIdentity *queryOwners;
+	ImmutableSpatialUInt32 queryOwnerCount;
+#endif
 };
 
 struct ImmutableSpatialJobSystemMetrics

@@ -8,6 +8,9 @@
 
 #include <atomic>
 #include <new>
+#if defined(_WIN64)
+#include <memory>
+#endif
 
 namespace rts
 {
@@ -74,6 +77,275 @@ public:
 private:
 	SpatialJobAtomicUnsigned *m_active;
 };
+
+#if defined(_WIN64)
+// The owner supplies one shared collection token.  The dispatch wrapper only
+// measures real scheduler work; an invalid token keeps the diagnostic path
+// completely inert, including clock access.
+class SpatialPerformanceInterval
+{
+public:
+	SpatialPerformanceInterval(
+		performance::KernelPerformanceLedger *ledger,
+		const performance::KernelPerformanceBatch &batch,
+		performance::KernelPerformanceStage stage)
+		: m_ledger(ledger), m_interval()
+	{
+		if (m_ledger != 0 && batch.valid())
+			m_interval = m_ledger->beginInterval(batch, stage);
+	}
+
+	~SpatialPerformanceInterval() noexcept
+	{
+		end();
+	}
+
+	void end()
+	{
+		if (m_ledger != 0 && m_interval.valid())
+		{
+			m_ledger->endInterval(m_interval);
+			m_interval = performance::KernelPerformanceInterval();
+		}
+	}
+
+private:
+	performance::KernelPerformanceLedger *m_ledger;
+	performance::KernelPerformanceInterval m_interval;
+};
+
+struct SpatialReferenceInput
+{
+	const void *arena;
+	ImmutableSpatialUInt32 arenaCapacity;
+	const ImmutableSpatialQuery *queries;
+	ImmutableSpatialUInt32 queryCount;
+	const ImmutableSpatialQueryOwnerIdentity *owners;
+	ImmutableSpatialUInt32 ownerCount;
+	const JobFloatingPointState *floatingPointState;
+};
+
+struct SpatialReferenceOutput
+{
+	SpatialReferenceOutput()
+		: results(0), spans(0), queryCount(0), resultCount(0), valid(false),
+		  scratch(), detachedResults(0), detachedSpans(0), resultCapacity(0) {}
+	const ImmutableSpatialResult *results;
+	const ImmutableSpatialResultSpan *spans;
+	ImmutableSpatialUInt32 queryCount, resultCount;
+	bool valid;
+	ImmutableSpatialBatchScratch scratch;
+	ImmutableSpatialResult *detachedResults;
+	ImmutableSpatialResultSpan *detachedSpans;
+	ImmutableSpatialUInt32 resultCapacity;
+};
+
+bool writeSpatialGeneration(performance::KernelPerformanceCanonicalWriter &writer,
+	unsigned tag, const ImmutableSpatialGeneration &generation)
+{
+	return writer.u32(tag, generation.lifecycle) &&
+		writer.u32(tag + 1, generation.topology) &&
+		writer.u32(tag + 2, generation.facts);
+}
+
+template <typename T>
+const T *spatialArenaRecords(const void *arena, ImmutableSpatialUInt32 offset)
+{
+	return reinterpret_cast<const T *>(static_cast<const unsigned char *>(arena) + offset);
+}
+
+bool writeSpatialReferenceInput(performance::KernelPerformanceCanonicalWriter &writer,
+	const void *context)
+{
+	const SpatialReferenceInput &input = *static_cast<const SpatialReferenceInput *>(context);
+	if (input.owners == 0 || input.ownerCount != input.queryCount)
+		return false;
+	// Execution has already validated this captured arena. Bind semantic
+	// fields only, never storage addresses, capacities, offsets, or padding.
+	const ImmutableSpatialArenaHeader &header =
+		*static_cast<const ImmutableSpatialArenaHeader *>(input.arena);
+	if (!writer.u32(1, header.version) || !writer.f32(2, header.cellSize) ||
+		!writeSpatialGeneration(writer, 3, header.generation) ||
+		!writer.u32(6, header.gridWidth) || !writer.u32(7, header.gridHeight) ||
+		!writer.sequence(10, header.objectCount))
+		return false;
+	const ImmutableSpatialObjectRecord *objects =
+		spatialArenaRecords<ImmutableSpatialObjectRecord>(input.arena, header.objectOffset);
+	for (ImmutableSpatialUInt32 index = 0; index != header.objectCount; ++index)
+	{
+		const ImmutableSpatialObjectRecord &object = objects[index];
+		if (!writer.u32(11, object.objectID) ||
+			!writeSpatialGeneration(writer, 12, object.generation) ||
+			!writer.u32(15, object.admissionMask) || !writer.i32(16, object.buildCost) ||
+			!writer.f32(17, object.positionX) || !writer.f32(18, object.positionY) ||
+			!writer.f32(19, object.positionZ) || !writer.f32(20, object.boundingCircleRadius) ||
+			!writer.f32(21, object.boundingSphereRadius) || !writer.f32(22, object.zCenterOffset))
+			return false;
+	}
+	const ImmutableSpatialCellRecord *cells =
+		spatialArenaRecords<ImmutableSpatialCellRecord>(input.arena, header.cellOffset);
+	if (!writer.sequence(30, header.cellCount)) return false;
+	for (ImmutableSpatialUInt32 index = 0; index != header.cellCount; ++index)
+		if (!writer.u32(31, cells[index].memberBegin) ||
+			!writer.u32(32, cells[index].memberCount)) return false;
+	const ImmutableSpatialMemberRecord *members =
+		spatialArenaRecords<ImmutableSpatialMemberRecord>(input.arena, header.memberOffset);
+	if (!writer.sequence(40, header.memberCount)) return false;
+	for (ImmutableSpatialUInt32 index = 0; index != header.memberCount; ++index)
+		if (!writer.u32(41, members[index].objectIndex)) return false;
+	const ImmutableSpatialRadiusRecord *radii =
+		spatialArenaRecords<ImmutableSpatialRadiusRecord>(input.arena, header.radiusOffset);
+	if (!writer.sequence(50, header.radiusCount)) return false;
+	for (ImmutableSpatialUInt32 index = 0; index != header.radiusCount; ++index)
+		if (!writer.u32(51, radii[index].offsetBegin) ||
+			!writer.u32(52, radii[index].offsetCount)) return false;
+	const ImmutableSpatialOffsetRecord *offsets =
+		spatialArenaRecords<ImmutableSpatialOffsetRecord>(input.arena, header.offsetOffset);
+	if (!writer.sequence(60, header.offsetCount)) return false;
+	for (ImmutableSpatialUInt32 index = 0; index != header.offsetCount; ++index)
+		if (!writer.i32(61, offsets[index].x) || !writer.i32(62, offsets[index].y)) return false;
+	if (!writer.sequence(70, input.queryCount)) return false;
+	for (ImmutableSpatialUInt32 index = 0; index != input.queryCount; ++index)
+	{
+		const ImmutableSpatialQuery &query = input.queries[index];
+		const ImmutableSpatialQueryOwnerIdentity &owner = input.owners[index];
+		if (!writeSpatialGeneration(writer, 71, query.expectedArenaGeneration) ||
+			!writer.u32(74, query.selfObjectIndex) || !writer.i32(75, query.centerCellX) ||
+			!writer.i32(76, query.centerCellY) || !writer.u32(77, query.maximumRadius) ||
+			!writer.f32(78, query.positionX) || !writer.f32(79, query.positionY) ||
+			!writer.f32(80, query.positionZ) || !writer.f32(81, query.boundingCircleRadius) ||
+			!writer.f32(82, query.boundingSphereRadius) || !writer.f32(83, query.zCenterOffset) ||
+			!writer.f32(84, query.maximumDistance) || !writer.u32(85, query.requiredAdmissionMask) ||
+			!writer.u32(86, query.rejectedAdmissionMask) || !writer.u32(87, query.distanceType) ||
+			!writer.u32(88, query.iteratorOrder) || !writer.u32(89, owner.objectID) ||
+			!writer.u32(90, static_cast<unsigned>(owner.consumer)) ||
+			!writer.u32(91, owner.wakePriority))
+			return false;
+	}
+	return true;
+}
+
+bool writeSpatialReferenceOutput(performance::KernelPerformanceCanonicalWriter &writer,
+	const void *context)
+{
+	const SpatialReferenceOutput &output = *static_cast<const SpatialReferenceOutput *>(context);
+	if (!output.valid || !writer.sequence(1, output.queryCount)) return false;
+	for (ImmutableSpatialUInt32 index = 0; index != output.queryCount; ++index)
+		if (!writer.u32(2, output.spans[index].begin) ||
+			!writer.u32(3, output.spans[index].count)) return false;
+	if (!writer.sequence(4, output.resultCount)) return false;
+	for (ImmutableSpatialUInt32 index = 0; index != output.resultCount; ++index)
+	{
+		const ImmutableSpatialResult &result = output.results[index];
+		if (!writer.u32(5, result.objectIndex) || !writer.u32(6, result.objectID) ||
+			!writeSpatialGeneration(writer, 7, result.generation) ||
+			!writer.u32(10, result.discoveryOrdinal) || !writer.i32(11, result.buildCost) ||
+			!writer.f32(12, result.distanceSquared)) return false;
+	}
+	return true;
+}
+
+class SpatialReferenceStorage
+{
+public:
+	bool prepare(ImmutableSpatialUInt32 queryCount, ImmutableSpatialUInt32 objectCount,
+		ImmutableSpatialUInt32 resultCount, SpatialReferenceOutput &output)
+	{
+		m_counts.reset(new (std::nothrow) ImmutableSpatialUInt32[queryCount]);
+		m_states.reset(new (std::nothrow) ImmutableSpatialUInt32[queryCount]);
+		m_spanScratch.reset(new (std::nothrow) ImmutableSpatialResultSpan[queryCount]);
+		m_spans.reset(new (std::nothrow) ImmutableSpatialResultSpan[queryCount]);
+		if (objectCount != 0)
+			m_visits.reset(new (std::nothrow) ImmutableSpatialUInt32[objectCount]);
+		if (resultCount != 0)
+		{
+			m_resultScratch.reset(new (std::nothrow) ImmutableSpatialResult[resultCount]);
+			m_sortScratch.reset(new (std::nothrow) ImmutableSpatialResult[resultCount]);
+			m_results.reset(new (std::nothrow) ImmutableSpatialResult[resultCount]);
+		}
+		if (!m_counts || !m_states || !m_spanScratch || !m_spans ||
+			(objectCount != 0 && !m_visits) || (resultCount != 0 &&
+			(!m_resultScratch || !m_sortScratch || !m_results))) return false;
+		output.queryCount = queryCount;
+		output.resultCapacity = resultCount;
+		output.detachedResults = m_results.get();
+		output.detachedSpans = m_spans.get();
+		output.results = m_results.get();
+		output.spans = m_spans.get();
+		output.scratch.counts = m_counts.get();
+		output.scratch.countCapacity = queryCount;
+		output.scratch.states = m_states.get();
+		output.scratch.stateCapacity = queryCount;
+		output.scratch.visitStamps = m_visits.get();
+		output.scratch.visitStampCapacity = objectCount;
+		output.scratch.spanScratch = m_spanScratch.get();
+		output.scratch.spanScratchCapacity = queryCount;
+		output.scratch.resultScratch = m_resultScratch.get();
+		output.scratch.resultScratchCapacity = resultCount;
+		output.scratch.sortScratch = m_sortScratch.get();
+		output.scratch.sortScratchCapacity = resultCount;
+		return true;
+	}
+private:
+	std::unique_ptr<ImmutableSpatialUInt32[]> m_counts, m_states, m_visits;
+	std::unique_ptr<ImmutableSpatialResultSpan[]> m_spanScratch, m_spans;
+	std::unique_ptr<ImmutableSpatialResult[]> m_resultScratch, m_sortScratch, m_results;
+};
+
+bool computeSpatialReference(const void *immutableInput, void *detachedOutput)
+{
+	const SpatialReferenceInput &input = *static_cast<const SpatialReferenceInput *>(immutableInput);
+	SpatialReferenceOutput &output = *static_cast<SpatialReferenceOutput *>(detachedOutput);
+	if (output.queryCount != input.queryCount || output.detachedSpans == 0) return false;
+	JobFloatingPointScope floatingPointScope(*input.floatingPointState);
+	// Defaults are one serial range and no dispatch, cancellation, or live
+	// generation callbacks. This never reaches healing or target publication.
+	ImmutableSpatialExecutionOptions serialOptions;
+	output.valid = ExecuteImmutableSpatialQueryBatch(input.arena, input.arenaCapacity,
+		input.queries, input.queryCount, serialOptions, output.scratch,
+		output.detachedResults, output.resultCapacity, output.detachedSpans,
+		output.queryCount, &output.resultCount, 0) == IMMUTABLE_SPATIAL_SUCCESS;
+	return output.valid;
+}
+
+void observeSpatialReference(const void *arena, ImmutableSpatialUInt32 arenaCapacity,
+	const ImmutableSpatialQuery *queries, ImmutableSpatialUInt32 queryCount,
+	const ImmutableSpatialResult *results, const ImmutableSpatialResultSpan *spans,
+	ImmutableSpatialUInt32 resultCount, const JobFloatingPointState &floatingPointState,
+	const ImmutableSpatialJobSystemOptions &options)
+{
+	if (options.referenceLedger == 0 || options.referenceBatch == 0 ||
+		options.referenceBatch->valid() || options.performanceLedger == 0) return;
+	const performance::KernelPerformanceReferenceMode mode = options.referenceLedger->mode();
+	if (mode == performance::KERNEL_REFERENCE_DISABLED) return;
+	performance::KernelPerformanceBatchIdentity identity;
+	if (!options.performanceLedger->describeBatch(options.performanceBatch, identity)) return;
+	SpatialPerformanceInterval validation(options.performanceLedger, options.performanceBatch,
+		performance::KERNEL_PERFORMANCE_VALIDATE);
+	SpatialReferenceInput input = { arena, arenaCapacity, queries, queryCount,
+		options.queryOwners, options.queryOwnerCount, &floatingPointState };
+	SpatialReferenceOutput actual;
+	actual.results = results;
+	actual.spans = spans;
+	actual.queryCount = queryCount;
+	actual.resultCount = resultCount;
+	actual.valid = ValidateImmutableSpatialResultSpans(spans, queryCount, resultCount);
+	SpatialReferenceOutput detached;
+	SpatialReferenceStorage storage;
+	if (mode == performance::KERNEL_REFERENCE_SERIAL_ORACLE)
+	{
+		const ImmutableSpatialArenaHeader &header =
+			*static_cast<const ImmutableSpatialArenaHeader *>(arena);
+		// Failure is reported by the serial callback, never by the gameplay
+		// return value. Allocation is outside the pure serial callback clock.
+		storage.prepare(queryCount, header.objectCount, resultCount, detached);
+	}
+	*options.referenceBatch = options.referenceLedger->observeValidatedBatch(
+		identity.kernel, identity.subtype, identity.frame, identity.ordinal, 1,
+		queryCount, writeSpatialReferenceInput, &input, writeSpatialReferenceOutput,
+		&actual, computeSpatialReference, &detached);
+}
+#endif
 
 struct SpatialRangeJob : public Job
 {
@@ -219,6 +491,11 @@ bool spatialDispatch(void *context, ImmutableSpatialUInt32 rangeCount,
 	if (!group.isValid())
 		return false;
 
+#if defined(_WIN64)
+	SpatialPerformanceInterval scheduleInterval(options.performanceLedger,
+		options.performanceBatch, performance::KERNEL_PERFORMANCE_SCHEDULE);
+#endif
+
 	SpatialRangeJob **rangeJobs = new (std::nothrow) SpatialRangeJob *[rangeCount];
 	SpatialExecutionIdentity *identities = new (std::nothrow)
 		SpatialExecutionIdentity[rangeCount];
@@ -293,6 +570,10 @@ bool spatialDispatch(void *context, ImmutableSpatialUInt32 rangeCount,
 	dispatch->metrics->submittedJobs += rangeCount;
 	dispatch->metrics->ranges += rangeCount;
 
+#if defined(_WIN64)
+	scheduleInterval.end();
+#endif
+
 	if (options.testFault ==
 		IMMUTABLE_SPATIAL_JOB_SYSTEM_TEST_CANCEL_AFTER_ADMISSION &&
 		dispatch->dispatchOrdinal == options.testDispatchOrdinal)
@@ -304,6 +585,10 @@ bool spatialDispatch(void *context, ImmutableSpatialUInt32 rangeCount,
 	const bool forceTimeout = options.testFault ==
 		IMMUTABLE_SPATIAL_JOB_SYSTEM_TEST_TIMEOUT &&
 		dispatch->dispatchOrdinal == options.testDispatchOrdinal;
+#if defined(_WIN64)
+	SpatialPerformanceInterval waitInterval(options.performanceLedger,
+		options.performanceBatch, performance::KERNEL_PERFORMANCE_WAIT);
+#endif
 	if (forceTimeout || !jobs.waitWithoutOwnerHelp(group,
 		IMMUTABLE_SPATIAL_PHYSICAL_WAIT_MILLISECONDS))
 	{
@@ -313,6 +598,9 @@ bool spatialDispatch(void *context, ImmutableSpatialUInt32 rangeCount,
 		// owns only immutable input and private scratch, so drain before the
 		// dispatch-owned metadata leaves scope.
 		jobs.wait(group);
+#if defined(_WIN64)
+		waitInterval.end();
+#endif
 		publishPhysicalWorkerPeak(dispatch);
 		delete[] rangeJobs;
 		delete[] identities;
@@ -323,6 +611,9 @@ bool spatialDispatch(void *context, ImmutableSpatialUInt32 rangeCount,
 	}
 	if (!jobs.wait(group))
 	{
+#if defined(_WIN64)
+		waitInterval.end();
+#endif
 		publishPhysicalWorkerPeak(dispatch);
 		delete[] rangeJobs;
 		delete[] identities;
@@ -331,6 +622,9 @@ bool spatialDispatch(void *context, ImmutableSpatialUInt32 rangeCount,
 		delete[] handles;
 		return false;
 	}
+#if defined(_WIN64)
+	waitInterval.end();
+#endif
 	publishPhysicalWorkerPeak(dispatch);
 
 	bool succeeded = !group.wasCancelled() && !group.failed();
@@ -624,9 +918,63 @@ ImmutableSpatialAdmissionResult EvaluateImmutableSpatialQueryAdmission(
 		IMMUTABLE_SPATIAL_ADMISSION_POLICY_INELIGIBLE;
 }
 
+#if defined(_WIN64)
+ImmutableSpatialConsumerCompletionToken::ImmutableSpatialConsumerCompletionToken()
+	: batchEpoch(0), queryOrdinal(IMMUTABLE_SPATIAL_INVALID_OBJECT_INDEX)
+{
+}
+
+ImmutableSpatialCollectionCompletion::ImmutableSpatialCollectionCompletion()
+{
+	reset(0);
+}
+
+void ImmutableSpatialCollectionCompletion::reset(ImmutableSpatialUInt32 epoch)
+{
+	batchEpoch = epoch;
+	expectedConsumers = 0;
+	completedConsumers = 0;
+	allConsumersCommitted = true;
+	for (unsigned index = 0; index != MAXIMUM_QUERIES; ++index)
+		m_completed[index] = false;
+}
+
+bool ImmutableSpatialCollectionCompletion::pending(
+	const ImmutableSpatialConsumerCompletionToken &token) const
+{
+	return batchEpoch != 0 && token.batchEpoch == batchEpoch &&
+		expectedConsumers <= MAXIMUM_QUERIES &&
+		token.queryOrdinal < expectedConsumers && !m_completed[token.queryOrdinal];
+}
+
+bool ImmutableSpatialCollectionCompletion::complete(
+	ImmutableSpatialConsumer consumer,
+	const ImmutableSpatialConsumerCompletionToken &token, bool committed)
+{
+	if (consumer < IMMUTABLE_SPATIAL_CONSUMER_HEALING ||
+		consumer >= IMMUTABLE_SPATIAL_CONSUMER_COUNT ||
+		!pending(token))
+		return false;
+	m_completed[token.queryOrdinal] = true;
+	++completedConsumers;
+	if (!committed)
+		allConsumersCommitted = false;
+	return true;
+}
+
+bool ImmutableSpatialCollectionCompletion::finished() const
+{
+	return expectedConsumers != 0 && completedConsumers == expectedConsumers;
+}
+#endif
+
 ImmutableSpatialJobSystemOptions::ImmutableSpatialJobSystemOptions()
 	: testFault(IMMUTABLE_SPATIAL_JOB_SYSTEM_TEST_NONE),
 	  testDispatchOrdinal(1), testRangeOrdinal(0), testSpinIterations(0)
+#if defined(_WIN64)
+	, performanceLedger(0), performanceBatch(), referenceLedger(0),
+	  referenceBatch(0), queryOwners(0), queryOwnerCount(0)
+#endif
 {
 }
 
@@ -719,6 +1067,11 @@ ImmutableSpatialJobSystemResult ExecuteImmutableSpatialQueryBatchOnJobSystem(
 	else if (status == IMMUTABLE_SPATIAL_CANCELLED || dispatch.cancelled.load(
 		std::memory_order_acquire))
 		result = IMMUTABLE_SPATIAL_JOB_SYSTEM_CANCELLED;
+#if defined(_WIN64)
+	if (result == IMMUTABLE_SPATIAL_JOB_SYSTEM_SUCCESS)
+		observeSpatialReference(arena, arenaCapacity, queries, queryCount, output,
+			outputSpans, *outputCount, dispatch.floatingPointState, options);
+#endif
 	delete[] dispatch.observedPhysicalWorkerIndices;
 	return result;
 }

@@ -22,6 +22,11 @@ CollisionCandidateOptions::CollisionCandidateOptions()
 	  minimumGrain(COLLISION_CANDIDATE_DEFAULT_MINIMUM_GRAIN),
 	  order(COLLISION_CANDIDATE_REVERSE_DISCOVERY),
 	  cancellationGroup(0)
+	#if defined(_WIN64)
+	  , performanceLedger(0), performanceBatch(),
+	  performanceReferenceLedger(0), performanceReferenceBatch(0),
+	  performanceReferenceOutput(0), performanceReferenceOutputCapacity(0)
+#endif
 {
 }
 
@@ -72,7 +77,7 @@ inline void maximizeJobCounter(CollisionJobAtomicUnsigned &value,
 	if (candidate > value)
 		value = candidate;
 }
-#else
+	#else
 typedef std::atomic<unsigned> CollisionJobAtomicUnsigned;
 inline unsigned incrementJobCounter(CollisionJobAtomicUnsigned &value)
 {
@@ -93,7 +98,7 @@ inline void maximizeJobCounter(CollisionJobAtomicUnsigned &value,
 	while (observed < candidate && !value.compare_exchange_weak(observed,
 		candidate, std::memory_order_relaxed, std::memory_order_relaxed)) {}
 }
-#endif
+	#endif
 
 class CollisionPhysicalExecutionScope
 {
@@ -934,6 +939,12 @@ CollisionCandidateResult PrepareCollisionCandidates(
 	CollisionJobAtomicUnsigned peakPhysicalWorkers(0);
 	unsigned submitted = 0;
 	bool accepted = true;
+	#if defined(_WIN64)
+	{
+		performance::KernelPerformanceScope scheduleTiming(
+			options.performanceLedger, options.performanceBatch,
+			performance::KERNEL_PERFORMANCE_SCHEDULE);
+	#endif
 	for (; submitted != jobCount; ++submitted)
 	{
 		JobRange range;
@@ -959,17 +970,38 @@ CollisionCandidateResult PrepareCollisionCandidates(
 		}
 		++metrics->submittedJobs;
 	}
+#if defined(_WIN64)
+	}
+#endif
 	if (!accepted)
 	{
 		jobs.cancel(group);
+	#if defined(_WIN64)
+		{
+			performance::KernelPerformanceScope waitTiming(
+				options.performanceLedger, options.performanceBatch,
+				performance::KERNEL_PERFORMANCE_WAIT);
+			jobs.wait(group);
+		}
+	#else
 		jobs.wait(group);
+	#endif
 		delete[] ranges;
 		++metrics->serialFallbacks;
 		jobs.recordSerialFallback();
 		return COLLISION_CANDIDATE_SERIAL_FALLBACK;
 	}
 
+#if defined(_WIN64)
+	{
+		performance::KernelPerformanceScope waitTiming(
+			options.performanceLedger, options.performanceBatch,
+			performance::KERNEL_PERFORMANCE_WAIT);
+		jobs.wait(group);
+	}
+#else
 	jobs.wait(group);
+#endif
 	collectRangeMetrics(ranges, jobCount, metrics);
 	metrics->peakConcurrentPhysicalWorkers =
 		loadJobCounter(peakPhysicalWorkers);
@@ -1120,6 +1152,12 @@ CollisionCandidateResult PreparePartitionCollisionCandidates(
 	CollisionJobAtomicUnsigned peakPhysicalWorkers(0);
 	unsigned submitted = 0;
 	bool accepted = true;
+#if defined(_WIN64)
+	{
+		performance::KernelPerformanceScope scheduleTiming(
+			options.performanceLedger, options.performanceBatch,
+			performance::KERNEL_PERFORMANCE_SCHEDULE);
+#endif
 	for (; submitted != jobCount; ++submitted)
 	{
 		JobRange range;
@@ -1147,10 +1185,22 @@ CollisionCandidateResult PreparePartitionCollisionCandidates(
 		}
 		++metrics->submittedJobs;
 	}
+#if defined(_WIN64)
+	}
+#endif
 	if (!accepted)
 	{
 		jobs.cancel(group);
+	#if defined(_WIN64)
+		{
+			performance::KernelPerformanceScope waitTiming(
+				options.performanceLedger, options.performanceBatch,
+				performance::KERNEL_PERFORMANCE_WAIT);
+			jobs.wait(group);
+		}
+	#else
 		jobs.wait(group);
+	#endif
 		delete[] ranges;
 		++metrics->serialFallbacks;
 		jobs.recordSerialFallback();
@@ -1160,6 +1210,11 @@ CollisionCandidateResult PreparePartitionCollisionCandidates(
 	{
 		rts::frame_timing::Scope partitionWaitTiming(
 			rts::frame_timing::SimulationWait);
+	#if defined(_WIN64)
+		performance::KernelPerformanceScope waitTiming(
+			options.performanceLedger, options.performanceBatch,
+			performance::KERNEL_PERFORMANCE_WAIT);
+	#endif
 		jobs.wait(group);
 	}
 	collectRangeMetrics(ranges, jobCount, metrics);
@@ -1193,6 +1248,194 @@ CollisionCandidateResult PreparePartitionCollisionCandidates(
 	delete[] ranges;
 	return COLLISION_CANDIDATE_PARALLEL;
 }
+
+#if defined(_WIN64)
+CollisionCandidateReferenceBatchTransport::CollisionCandidateReferenceBatchTransport()
+	: referenceLedger(0), referenceBatch(0), writeInput(0), immutableInput(0),
+	  writeOutput(0), productionOutput(0), serialCompute(0),
+	  detachedSerialOutput(0), operationCount(0),
+	  fieldSchema(COLLISION_CANDIDATE_REFERENCE_FIELD_SCHEMA)
+{
+}
+
+bool ObserveCollisionCandidateReferenceBatch(
+	performance::KernelPerformanceLedger *timingLedger,
+	const performance::KernelPerformanceBatch *timingBatch,
+	CollisionCandidateReferenceBatchTransport *transport) noexcept
+{
+	if (timingLedger == 0 || timingBatch == 0 || transport == 0 ||
+		transport->referenceLedger == 0 || transport->referenceBatch == 0 ||
+		transport->referenceBatch->valid() || transport->writeInput == 0 ||
+		transport->immutableInput == 0 || transport->writeOutput == 0 ||
+		transport->productionOutput == 0 || transport->operationCount == 0 ||
+		transport->fieldSchema == 0 ||
+		transport->referenceLedger->mode() ==
+			performance::KERNEL_REFERENCE_DISABLED)
+		return false;
+	performance::KernelPerformanceBatchIdentity identity;
+	if (!timingLedger->describeBatch(*timingBatch, identity) ||
+		identity.kernel != performance::KERNEL_PERFORMANCE_COLLISION ||
+		identity.subtype != 0)
+		return false;
+	const performance::KernelPerformanceReferenceBatch observed =
+		transport->referenceLedger->observeValidatedBatch(identity.kernel,
+		identity.subtype, identity.frame, identity.ordinal,
+		transport->fieldSchema, transport->operationCount,
+		transport->writeInput, transport->immutableInput,
+		transport->writeOutput, transport->productionOutput,
+		transport->serialCompute, transport->detachedSerialOutput);
+	if (!observed.valid())
+		return false;
+	*transport->referenceBatch = observed;
+	return true;
+}
+
+bool FinishCollisionCandidateReferenceBatch(
+	CollisionCandidateReferenceBatchTransport *transport,
+	bool committed) noexcept
+{
+	if (transport == 0 || transport->referenceLedger == 0 ||
+		transport->referenceBatch == 0 ||
+		!transport->referenceBatch->valid())
+		return false;
+	if (!transport->referenceLedger->finishBatch(
+			*transport->referenceBatch, committed))
+		return false;
+	*transport->referenceBatch = performance::KernelPerformanceReferenceBatch();
+	return true;
+}
+
+bool WritePartitionCollisionReferenceInput(
+	performance::KernelPerformanceCanonicalWriter &writer,
+	const void *context)
+{
+	const PartitionCollisionReferenceInput *input =
+		static_cast<const PartitionCollisionReferenceInput *>(context);
+	if (input == 0 ||
+		(input->cellCount != 0 && input->cells == 0) ||
+		(input->occupantCount != 0 && input->occupants == 0))
+		return false;
+	const PartitionCollisionObjectSnapshot &owner = input->owner;
+	if (!writer.u32(1, owner.objectID) || !writer.u32(2, owner.generation) ||
+		!writer.u32(3, owner.dirtyOrder) ||
+		!writer.f32(4, owner.positionX) || !writer.f32(5, owner.positionY) ||
+		!writer.f32(6, owner.positionZ) ||
+		!writer.f32(7, owner.orientation) ||
+		!writer.f32(8, owner.majorRadius) ||
+		!writer.f32(9, owner.minorRadius) ||
+		!writer.u32(10, owner.geometryType) ||
+		!writer.boolean(11, owner.smallGeometry) ||
+		!writer.sequence(20, input->cellCount))
+		return false;
+	for (unsigned cellIndex = 0; cellIndex != input->cellCount;
+		++cellIndex)
+	{
+		const PartitionCollisionCellSnapshot &cell =
+			input->cells[cellIndex];
+		if (!writer.u32(21, cell.occupantBegin) ||
+			!writer.u32(22, cell.occupantCount) ||
+			!writer.u32(23, cell.discoveryBase))
+			return false;
+	}
+	if (!writer.sequence(30, input->occupantCount))
+		return false;
+	for (unsigned occupantIndex = 0;
+		occupantIndex != input->occupantCount; ++occupantIndex)
+	{
+		const PartitionCollisionOccupantSnapshot &occupant =
+			input->occupants[occupantIndex];
+		if (!writer.u32(31, occupant.objectID) ||
+			!writer.u32(32, occupant.generation))
+			return false;
+	}
+	return writer.u32(40, static_cast<unsigned>(input->order));
+}
+
+bool WritePartitionCollisionReferenceOutput(
+	performance::KernelPerformanceCanonicalWriter &writer,
+	const void *context)
+{
+	const PartitionCollisionReferenceOutput *output =
+		static_cast<const PartitionCollisionReferenceOutput *>(context);
+	if (output == 0 || output->count > output->capacity ||
+		(output->count != 0 && output->candidates == 0))
+		return false;
+	if (!writer.sequence(1, output->count))
+		return false;
+	for (unsigned index = 0; index != output->count; ++index)
+	{
+		const CollisionCandidate &candidate = output->candidates[index];
+		if (!writer.u32(2, candidate.key.lowID) ||
+			!writer.u32(3, candidate.key.highID) ||
+			!writer.u32(4, candidate.firstID) ||
+			!writer.u32(5, candidate.secondID) ||
+			!writer.u32(6, candidate.firstGeneration) ||
+			!writer.u32(7, candidate.secondGeneration) ||
+			!writer.u32(8, candidate.discoveryOrder))
+			return false;
+	}
+	return true;
+}
+
+bool ComputePartitionCollisionCandidatesSerialReference(
+	const void *immutableInput, void *detachedOutput)
+{
+	const PartitionCollisionReferenceInput *input =
+		static_cast<const PartitionCollisionReferenceInput *>(immutableInput);
+	PartitionCollisionReferenceOutput *output =
+		static_cast<PartitionCollisionReferenceOutput *>(detachedOutput);
+	if (input == 0 || output == 0 || input->owner.objectID == 0 ||
+		input->owner.generation == 0 ||
+		(input->cellCount != 0 && input->cells == 0) ||
+		(input->occupantCount != 0 && input->occupants == 0) ||
+		(input->occupantCount != 0 &&
+			(output->candidates == 0 || output->scratch == 0)) ||
+		output->capacity < input->occupantCount ||
+		(input->order != COLLISION_CANDIDATE_REVERSE_DISCOVERY &&
+			input->order != COLLISION_CANDIDATE_CANONICAL_KEY))
+		return false;
+	CollisionCandidateAddressSpan detachedSpans[2];
+	if (!makeCollisionCandidateAddressSpan(output->candidates,
+			output->capacity, sizeof(CollisionCandidate), detachedSpans[0]) ||
+		!makeCollisionCandidateAddressSpan(output->scratch, output->capacity,
+			sizeof(CollisionCandidate), detachedSpans[1]) ||
+		!collisionCandidateAddressSpansAreDisjoint(detachedSpans, 2))
+		return false;
+	unsigned expectedBegin = 0;
+	for (unsigned cell = 0; cell != input->cellCount; ++cell)
+	{
+		const PartitionCollisionCellSnapshot &snapshot = input->cells[cell];
+		if (snapshot.occupantBegin != expectedBegin ||
+			snapshot.discoveryBase != expectedBegin ||
+			snapshot.occupantCount > input->occupantCount - expectedBegin)
+			return false;
+		expectedBegin += snapshot.occupantCount;
+	}
+	if (expectedBegin != input->occupantCount)
+		return false;
+	for (unsigned index = 0; index != input->occupantCount; ++index)
+	{
+		if (input->occupants[index].objectID != 0 &&
+			input->occupants[index].generation == 0)
+			return false;
+	}
+	if (input->occupantCount == 0)
+	{
+		output->count = 0;
+		return true;
+	}
+	normalizePartitionRange(&input->owner, input->occupants, output->scratch,
+		0, input->occupantCount, 0);
+	const unsigned count = finalizeCandidates(output->scratch,
+		input->occupantCount, input->order);
+	if (count > output->capacity)
+		return false;
+	memcpy(output->candidates, output->scratch,
+		sizeof(CollisionCandidate) * count);
+	output->count = count;
+	return true;
+}
+#endif
 
 bool CollisionCandidatesEqual(
 	const CollisionCandidate *left,

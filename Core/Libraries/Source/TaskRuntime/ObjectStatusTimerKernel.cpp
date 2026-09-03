@@ -120,6 +120,20 @@ struct ObjectStatusTimerExecutionRecord
 	unsigned physicalWorkerIndex;
 };
 
+unsigned expiredMaskForSnapshot(const ObjectStatusTimerSnapshot &snapshot,
+	unsigned currentFrame, unsigned disabledTypeCount)
+{
+	unsigned expiredMask = 0;
+	for (unsigned type = 0; type != disabledTypeCount; ++type)
+	{
+		const unsigned bit = 1u << type;
+		if ((snapshot.activeMask & bit) != 0 &&
+			currentFrame >= snapshot.expirationFrame[type])
+			expiredMask |= bit;
+	}
+	return expiredMask;
+}
+
 class ObjectStatusPhysicalExecutionScope
 {
 public:
@@ -154,14 +168,8 @@ bool evaluateRange(const ObjectStatusTimerSnapshot *snapshots,
 			return false;
 
 		const ObjectStatusTimerSnapshot &snapshot = snapshots[index];
-		unsigned expiredMask = 0;
-		for (unsigned type = 0; type != disabledTypeCount; ++type)
-		{
-			const unsigned bit = 1u << type;
-			if ((snapshot.activeMask & bit) != 0 &&
-				currentFrame >= snapshot.expirationFrame[type])
-				expiredMask |= bit;
-		}
+		const unsigned expiredMask = expiredMaskForSnapshot(snapshot,
+			currentFrame, disabledTypeCount);
 		if (expiredMask == 0)
 			continue;
 
@@ -174,6 +182,206 @@ bool evaluateRange(const ObjectStatusTimerSnapshot *snapshots,
 	}
 	return true;
 }
+
+#if defined(_WIN64)
+/* Reference schema 1: batch currentFrame=2, disabledTypeCount=3,
+** snapshot sequence=1 with objectID/ownerOrder/activeMask=4..6 and all 16
+** expiration values as sequence=7/value tag=8. Output command sequence=1
+** with objectID/ownerOrder/expiredMask=2..4. */
+enum { STATUS_REFERENCE_FIELD_SCHEMA = 1 };
+
+struct StatusReferenceInput
+{
+	const ObjectStatusTimerSnapshot *snapshots;
+	unsigned count;
+	unsigned currentFrame;
+	unsigned disabledTypeCount;
+};
+
+struct StatusReferenceOutput
+{
+	ObjectStatusTimerCommand *commands;
+	unsigned count;
+	unsigned capacity;
+};
+
+bool statusReferenceCommandLess(const ObjectStatusTimerCommand &left,
+	const ObjectStatusTimerCommand &right)
+{
+	return left.ownerOrder < right.ownerOrder ||
+		(left.ownerOrder == right.ownerOrder && left.objectID < right.objectID);
+}
+
+void siftStatusReferenceCommands(ObjectStatusTimerCommand *commands,
+	unsigned root, unsigned end)
+{
+	for (;;)
+	{
+		const unsigned child = root * 2 + 1;
+		if (child >= end)
+			return;
+		unsigned selected = child;
+		if (child + 1 < end &&
+			statusReferenceCommandLess(commands[selected], commands[child + 1]))
+			selected = child + 1;
+		if (!statusReferenceCommandLess(commands[root], commands[selected]))
+			return;
+		const ObjectStatusTimerCommand temporary = commands[root];
+		commands[root] = commands[selected];
+		commands[selected] = temporary;
+		root = selected;
+	}
+}
+
+bool computeStatusReferenceSerial(const void *immutableInput,
+	void *detachedOutput)
+{
+	const StatusReferenceInput &input =
+		*static_cast<const StatusReferenceInput *>(immutableInput);
+	StatusReferenceOutput &output =
+		*static_cast<StatusReferenceOutput *>(detachedOutput);
+	if (input.snapshots == 0 || input.count == 0 ||
+		input.disabledTypeCount == 0 ||
+		input.disabledTypeCount > OBJECT_STATUS_TIMER_MAX_TYPES ||
+		output.commands == 0 || output.capacity < input.count)
+		return false;
+	unsigned commandCount = 0;
+	for (unsigned index = 0; index != input.count; ++index)
+	{
+		const unsigned expiredMask = expiredMaskForSnapshot(
+			input.snapshots[index], input.currentFrame,
+			input.disabledTypeCount);
+		if (expiredMask == 0)
+			continue;
+		ObjectStatusTimerCommand &command = output.commands[commandCount++];
+		command.objectID = input.snapshots[index].objectID;
+		command.ownerOrder = input.snapshots[index].ownerOrder;
+		command.expiredMask = expiredMask;
+	}
+	if (commandCount > 1)
+	{
+		unsigned heapStart = commandCount / 2;
+		while (heapStart != 0)
+		{
+			--heapStart;
+			siftStatusReferenceCommands(output.commands, heapStart,
+				commandCount);
+		}
+		unsigned heapEnd = commandCount;
+		while (heapEnd > 1)
+		{
+			--heapEnd;
+			const ObjectStatusTimerCommand temporary = output.commands[0];
+			output.commands[0] = output.commands[heapEnd];
+			output.commands[heapEnd] = temporary;
+			siftStatusReferenceCommands(output.commands, 0, heapEnd);
+		}
+	}
+	for (unsigned index = 1; index != commandCount; ++index)
+		if (output.commands[index - 1].ownerOrder ==
+			output.commands[index].ownerOrder &&
+			output.commands[index - 1].objectID ==
+			output.commands[index].objectID)
+			return false;
+	output.count = commandCount;
+	return true;
+}
+
+bool writeStatusReferenceInput(
+	performance::KernelPerformanceCanonicalWriter &writer,
+	const void *context)
+{
+	const StatusReferenceInput &input =
+		*static_cast<const StatusReferenceInput *>(context);
+	if (input.snapshots == 0 || input.count == 0 ||
+		!writer.u32(2, input.currentFrame) ||
+		!writer.u32(3, input.disabledTypeCount) ||
+		!writer.sequence(1, input.count))
+		return false;
+	for (unsigned index = 0; index != input.count; ++index)
+	{
+		const ObjectStatusTimerSnapshot &snapshot = input.snapshots[index];
+		if (!writer.u32(4, snapshot.objectID) ||
+			!writer.u32(5, snapshot.ownerOrder) ||
+			!writer.u32(6, snapshot.activeMask) ||
+			!writer.sequence(7, OBJECT_STATUS_TIMER_MAX_TYPES))
+			return false;
+		for (unsigned type = 0; type != OBJECT_STATUS_TIMER_MAX_TYPES; ++type)
+			if (!writer.u32(8, snapshot.expirationFrame[type])) return false;
+	}
+	return true;
+}
+
+bool writeStatusReferenceOutput(
+	performance::KernelPerformanceCanonicalWriter &writer,
+	const void *context)
+{
+	const StatusReferenceOutput &output =
+		*static_cast<const StatusReferenceOutput *>(context);
+	if ((output.count != 0 && output.commands == 0) ||
+		!writer.sequence(1, output.count))
+		return false;
+	for (unsigned index = 0; index != output.count; ++index)
+	{
+		const ObjectStatusTimerCommand &command = output.commands[index];
+		if (!writer.u32(2, command.objectID) ||
+			!writer.u32(3, command.ownerOrder) ||
+			!writer.u32(4, command.expiredMask))
+			return false;
+	}
+	return true;
+}
+
+void observeStatusReferenceBatch(const ObjectStatusTimerOptions &options,
+	const ObjectStatusTimerSnapshot *snapshots, unsigned snapshotCount,
+	unsigned currentFrame, unsigned disabledTypeCount,
+	const ObjectStatusTimerCommand *output, unsigned outputCount)
+{
+	if (options.performanceReferenceBatch == 0)
+		return;
+	*options.performanceReferenceBatch =
+		performance::KernelPerformanceReferenceBatch();
+	if (options.performanceReferenceLedger == 0 ||
+		!options.performanceBatch.valid())
+		return;
+	const performance::KernelPerformanceReferenceMode mode =
+		options.performanceReferenceLedger->mode();
+	if (mode == performance::KERNEL_REFERENCE_DISABLED)
+		return;
+	performance::KernelPerformanceBatchIdentity identity;
+	if (!performance::KernelPerformanceLedger::instance().describeBatch(
+		options.performanceBatch, identity) ||
+		identity.kernel != performance::KERNEL_PERFORMANCE_STATUS ||
+		identity.subtype != 0)
+		return;
+	StatusReferenceInput input;
+	input.snapshots = snapshots;
+	input.count = snapshotCount;
+	input.currentFrame = currentFrame;
+	input.disabledTypeCount = disabledTypeCount;
+	StatusReferenceOutput production;
+	production.commands = const_cast<ObjectStatusTimerCommand *>(output);
+	production.count = outputCount;
+	production.capacity = outputCount;
+	StatusReferenceOutput detached;
+	detached.commands = mode == performance::KERNEL_REFERENCE_SERIAL_ORACLE ?
+		options.performanceReferenceOutput : 0;
+	detached.count = 0;
+	detached.capacity = options.performanceReferenceOutputCapacity;
+	const performance::KernelPerformanceSerialCallback serialCompute =
+		mode == performance::KERNEL_REFERENCE_SERIAL_ORACLE ?
+		computeStatusReferenceSerial : 0;
+	void *detachedContext =
+		mode == performance::KERNEL_REFERENCE_SERIAL_ORACLE ?
+		&detached : 0;
+	*options.performanceReferenceBatch =
+		options.performanceReferenceLedger->observeValidatedBatch(
+		identity.kernel, identity.subtype, identity.frame, identity.ordinal,
+		STATUS_REFERENCE_FIELD_SCHEMA, snapshotCount,
+		writeStatusReferenceInput, &input, writeStatusReferenceOutput,
+		&production, serialCompute, detachedContext);
+}
+#endif
 
 class ObjectStatusTimerJob : public Job
 {
@@ -242,6 +450,11 @@ ObjectStatusTimerResult recordFallback(JobSystem *jobs,
 
 ObjectStatusTimerOptions::ObjectStatusTimerOptions()
 	: parallel(false), minimumGrain(OBJECT_STATUS_TIMER_DEFAULT_MINIMUM_GRAIN)
+#if defined(_WIN64)
+	, performanceBatch(), performanceReferenceLedger(0),
+	performanceReferenceBatch(0), performanceReferenceOutput(0),
+	performanceReferenceOutputCapacity(0)
+#endif
 {
 }
 
@@ -345,6 +558,19 @@ ObjectStatusTimerResult PrepareObjectStatusTimerCommands(
 	unsigned submitted = 0;
 	ObjectStatusTimerResult result = useParallel ?
 		OBJECT_STATUS_TIMER_PARALLEL : OBJECT_STATUS_TIMER_SERIAL;
+#if defined(_WIN64)
+	performance::KernelPerformanceLedger *performanceLedger =
+		options.performanceBatch.valid() ?
+		&performance::KernelPerformanceLedger::instance() : 0;
+#endif
+	{
+#if defined(_WIN64)
+		// Completion accounting, merge, and publication are the owner-side
+		// validation boundary. Nested schedule/wait scopes settle this interval
+		// so their time is not double-counted as validation work.
+		performance::KernelPerformanceScope validateScope(performanceLedger,
+			options.performanceBatch, performance::KERNEL_PERFORMANCE_VALIDATE);
+#endif
 
 	if (!useParallel)
 	{
@@ -374,53 +600,65 @@ ObjectStatusTimerResult PrepareObjectStatusTimerCommands(
 	}
 	else
 	{
-		JobGroup group = jobs.createGroup();
-		if (!group.isValid())
-			result = recordFallback(&jobs, *metrics);
-		for (unsigned producer = 0;
-			result == OBJECT_STATUS_TIMER_PARALLEL && producer != jobCount;
-			++producer)
+		JobGroup group;
 		{
-			JobRange range;
-			if (!JobSystem::rangeForIndex(snapshotCount, jobCount, producer,
-				range))
-			{
+		#if defined(_WIN64)
+			performance::KernelPerformanceScope scheduleScope(performanceLedger,
+				options.performanceBatch, performance::KERNEL_PERFORMANCE_SCHEDULE);
+		#endif
+			group = jobs.createGroup();
+			if (!group.isValid())
 				result = recordFallback(&jobs, *metrics);
-				break;
-			}
-			buffers[producer] = new (std::nothrow) SimulationCommandBuffer(
-				commandStorage + range.begin, range.end - range.begin,
-				payloadStorage + range.begin * sizeof(ObjectStatusTimerPayload),
-				(range.end - range.begin) * sizeof(ObjectStatusTimerPayload),
-				producer, OBJECT_STATUS_TIMER_MODULE_TYPE);
-			if (buffers[producer] == 0)
+			for (unsigned producer = 0;
+				result == OBJECT_STATUS_TIMER_PARALLEL && producer != jobCount;
+				++producer)
 			{
-				result = recordFallback(&jobs, *metrics);
-				break;
+				JobRange range;
+				if (!JobSystem::rangeForIndex(snapshotCount, jobCount, producer,
+					range))
+				{
+					result = recordFallback(&jobs, *metrics);
+					break;
+				}
+				buffers[producer] = new (std::nothrow) SimulationCommandBuffer(
+					commandStorage + range.begin, range.end - range.begin,
+					payloadStorage + range.begin * sizeof(ObjectStatusTimerPayload),
+					(range.end - range.begin) * sizeof(ObjectStatusTimerPayload),
+					producer, OBJECT_STATUS_TIMER_MODULE_TYPE);
+				if (buffers[producer] == 0)
+				{
+					result = recordFallback(&jobs, *metrics);
+					break;
+				}
+				producerSlots[producer] = buffers[producer];
+				++createdBuffers;
+				ObjectStatusTimerJob *job = new (std::nothrow)
+					ObjectStatusTimerJob(snapshots, range.begin, range.end,
+						currentFrame, disabledTypeCount, buffers[producer],
+						executions + producer, &activePhysicalWorkers,
+						&peakPhysicalWorkers);
+				JobHandle handle = job != 0 ? jobs.trySubmit(job,
+					JOB_PRIORITY_FRAME_CRITICAL, group) : JobHandle();
+				if (!handle.isValid())
+				{
+					delete job;
+					result = recordFallback(&jobs, *metrics);
+					break;
+				}
+				++submitted;
+				++metrics->submittedJobs;
 			}
-			producerSlots[producer] = buffers[producer];
-			++createdBuffers;
-			ObjectStatusTimerJob *job = new (std::nothrow)
-				ObjectStatusTimerJob(snapshots, range.begin, range.end,
-					currentFrame, disabledTypeCount, buffers[producer],
-					executions + producer, &activePhysicalWorkers,
-					&peakPhysicalWorkers);
-			JobHandle handle = job != 0 ? jobs.trySubmit(job,
-				JOB_PRIORITY_FRAME_CRITICAL, group) : JobHandle();
-			if (!handle.isValid())
-			{
-				delete job;
-				result = recordFallback(&jobs, *metrics);
-				break;
-			}
-			++submitted;
-			++metrics->submittedJobs;
 		}
 		if (result != OBJECT_STATUS_TIMER_PARALLEL && group.isValid())
 			jobs.cancel(group);
 		bool physicalFenceCompleted = true;
-		if (submitted != 0)
 		{
+#if defined(_WIN64)
+			performance::KernelPerformanceScope waitScope(performanceLedger,
+				options.performanceBatch, performance::KERNEL_PERFORMANCE_WAIT);
+#endif
+			if (submitted != 0)
+			{
 			const unsigned physicalCompletionTimeoutMilliseconds = 8;
 			physicalFenceCompleted = jobs.waitWithoutOwnerHelp(group,
 				physicalCompletionTimeoutMilliseconds);
@@ -433,6 +671,7 @@ ObjectStatusTimerResult PrepareObjectStatusTimerCommands(
 			{
 				jobs.wait(group);
 			}
+		}
 		}
 		for (unsigned index = 0; index != submitted; ++index)
 		{
@@ -476,7 +715,7 @@ ObjectStatusTimerResult PrepareObjectStatusTimerCommands(
 			 metrics->completedJobs != metrics->submittedJobs ||
 			 metrics->physicalWorkerJobs != metrics->completedJobs ||
 			 metrics->ownerHelpedJobs != 0))
-			result = recordFallback(&jobs, *metrics);
+				result = recordFallback(&jobs, *metrics);
 	}
 
 	if (result == OBJECT_STATUS_TIMER_SERIAL ||
@@ -531,6 +770,12 @@ ObjectStatusTimerResult PrepareObjectStatusTimerCommands(
 				*outputCount = mergeResult.commandCount;
 			}
 		}
+	}
+#if defined(_WIN64)
+	if (result == OBJECT_STATUS_TIMER_PARALLEL)
+		observeStatusReferenceBatch(options, snapshots, snapshotCount,
+			currentFrame, disabledTypeCount, output, *outputCount);
+#endif
 	}
 
 	deleteBuffers(buffers, createdBuffers);

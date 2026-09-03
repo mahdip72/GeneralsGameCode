@@ -7,6 +7,9 @@
 
 #include "Common/GameCommon.h"
 #include "Lib/ImmutableSpatialQuery.h"
+#if defined(_WIN64)
+#include "Lib/ImmutableSpatialQueryRuntime.h"
+#endif
 
 class Object;
 class PartitionManager;
@@ -90,6 +93,9 @@ Bool QueueLiveImmutableSpatialQuery(UpdateModule *owner,
 	PartitionManager *manager, const Coord3D *position, Real maximumDistance,
 	UnsignedInt frame, LiveImmutableSpatialConsumer consumer);
 void ExecuteLiveImmutableSpatialQueryCollection();
+// End the owner's collection lifetime by aborting any unconsumed diagnostic
+// batch. This is idempotent and leaves arena/query state and gameplay intact.
+void EndLiveImmutableSpatialQueryCollection();
 void ResetLiveImmutableSpatialRuntime();
 void InvalidateLiveImmutableSpatialLifecycle();
 void InvalidateLiveImmutableSpatialTopology();
@@ -123,6 +129,21 @@ Bool GetLiveImmutableSpatialCommitBuffer(Object ***objects,
 void CommitLiveImmutableSpatialObjectSequence(Object *const *objects,
 	UnsignedInt count, LiveImmutableSpatialObjectCommitCallback callback,
 	void *context);
+
+// Performance instrumentation is owner-thread only and intentionally has no
+// gameplay meaning.  Commit intervals bracket the exact state publication in
+// each consumer; completion closes the shared collection token only after all
+// queued consumers have returned (including fallback/abort paths).
+#if defined(_WIN64)
+rts::ImmutableSpatialConsumerCompletionToken CaptureLiveImmutableSpatialCompletion(
+	UpdateModule *owner, LiveImmutableSpatialConsumer consumer);
+void BeginLiveImmutableSpatialCommit(LiveImmutableSpatialConsumer consumer,
+	const rts::ImmutableSpatialConsumerCompletionToken &token);
+void EndLiveImmutableSpatialCommit(LiveImmutableSpatialConsumer consumer,
+	const rts::ImmutableSpatialConsumerCompletionToken &token);
+void CompleteLiveImmutableSpatialConsumer(LiveImmutableSpatialConsumer consumer,
+	const rts::ImmutableSpatialConsumerCompletionToken &token, Bool committed);
+#endif
 
 void RecordLiveImmutableSpatialAuthoritativeQuery(
 	LiveImmutableSpatialConsumer consumer, UnsignedInt candidateCount);

@@ -254,6 +254,44 @@ UpdateSleepTime AutoHealBehavior::update()
 }
 
 #if defined(_WIN64)
+namespace
+{
+class ImmutableSpatialConsumerCompletionGuard
+{
+public:
+	explicit ImmutableSpatialConsumerCompletionGuard(UpdateModule *owner)
+		: m_token(CaptureLiveImmutableSpatialCompletion(owner, LIVE_IMMUTABLE_SPATIAL_HEALING)),
+		  m_committed(FALSE)
+	{
+	}
+
+	~ImmutableSpatialConsumerCompletionGuard() noexcept
+	{
+		CompleteLiveImmutableSpatialConsumer(
+			LIVE_IMMUTABLE_SPATIAL_HEALING, m_token, m_committed);
+	}
+
+	void beginCommit()
+	{
+		BeginLiveImmutableSpatialCommit(LIVE_IMMUTABLE_SPATIAL_HEALING, m_token);
+	}
+
+	void endCommit()
+	{
+		EndLiveImmutableSpatialCommit(LIVE_IMMUTABLE_SPATIAL_HEALING, m_token);
+	}
+
+	void markCommitted(Bool matched = TRUE)
+	{
+		m_committed = matched;
+	}
+
+private:
+	rts::ImmutableSpatialConsumerCompletionToken m_token;
+	Bool m_committed;
+};
+}
+
 //-------------------------------------------------------------------------------------------------
 Bool AutoHealBehavior::canQueueImmutableSpatialQuery()
 {
@@ -298,6 +336,7 @@ Bool AutoHealBehavior::measureImmutableSpatialQueryCost(
 //-------------------------------------------------------------------------------------------------
 Bool AutoHealBehavior::tryImmutableRadiusHeal()
 {
+	ImmutableSpatialConsumerCompletionGuard performanceGuard(this);
 	const AutoHealBehaviorModuleData *d = getAutoHealBehaviorModuleData();
 	Object *healer = getObject();
 	LiveImmutableSpatialResultView view;
@@ -363,6 +402,7 @@ Bool AutoHealBehavior::tryImmutableRadiusHeal()
 
 	ObjectID *commitIDs = workerIDs;
 	UnsignedInt commitCount = workerCount;
+	Bool referenceMatched = TRUE;
 	if( rts::UseSimulationShadowOracle() )
 	{
 		UnsignedInt oracleCount = 0;
@@ -398,6 +438,7 @@ Bool AutoHealBehavior::tryImmutableRadiusHeal()
 			matched = workerIDs[index] == oracleIDs[index];
 		RecordLiveImmutableSpatialShadowQuery(
 			LIVE_IMMUTABLE_SPATIAL_HEALING, matched );
+		referenceMatched = matched;
 		if( !matched )
 			DisableLiveImmutableSpatialConsumer(
 				LIVE_IMMUTABLE_SPATIAL_HEALING );
@@ -425,8 +466,14 @@ Bool AutoHealBehavior::tryImmutableRadiusHeal()
 			return FALSE;
 		}
 	}
-	CommitLiveImmutableSpatialObjectSequence( commitObjects, commitCount,
-		&AutoHealBehavior::commitImmutableRadiusHealObject, this );
+	if( commitCount != 0 )
+	{
+		performanceGuard.beginCommit();
+		CommitLiveImmutableSpatialObjectSequence( commitObjects, commitCount,
+			&AutoHealBehavior::commitImmutableRadiusHealObject, this );
+		performanceGuard.endCommit();
+		performanceGuard.markCommitted(referenceMatched);
+	}
 	if( !rts::UseSimulationShadowOracle() )
 	{
 		RecordLiveImmutableSpatialAuthoritativeQuery(

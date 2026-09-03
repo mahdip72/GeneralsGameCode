@@ -4,6 +4,10 @@
 ** SPDX-License-Identifier: GPL-3.0-or-later
 */
 #include "Lib/ObjectStatusTimerKernel.h"
+#if defined(_WIN64)
+#include "Lib/KernelPerformanceDiagnostics.h"
+#include "Lib/KernelPerformanceReference.h"
+#endif
 
 #include <limits.h>
 #include <stdio.h>
@@ -335,6 +339,284 @@ void testRuntimeAuthorityRequiresPhysicalWorkers()
 		runtime.shadowExecutions == 0,
 		"status runtime reset clears prior-match authority");
 }
+
+#if defined(_WIN64)
+struct KernelPerformanceClock
+{
+	KernelPerformanceClock() : now(1000) {}
+	rts::JobMetricCounter now;
+	static rts::JobMetricCounter read(void *context)
+	{
+		KernelPerformanceClock &clock = *static_cast<KernelPerformanceClock *>(context);
+		clock.now += 10;
+		return clock.now;
+	}
+};
+
+void testKernelPerformanceTokenReachesStatusStages()
+{
+	enum { SNAPSHOT_COUNT = 300 };
+	rts::ObjectStatusTimerSnapshot snapshots[SNAPSHOT_COUNT];
+	rts::ObjectStatusTimerCommand output[SNAPSHOT_COUNT];
+	fillParallelSnapshots(snapshots, SNAPSHOT_COUNT);
+
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 2;
+	config.queueCapacity = 64;
+	config.scratchBytesPerWorker = 64 * 1024;
+	config.pinWorkers = false;
+	expect(jobs.start(config), "job system starts for kernel diagnostics");
+	expect(jobs.registerCurrentThread(rts::JOB_OWNER_GAME),
+		"diagnostic test thread registers as simulation owner");
+
+	KernelPerformanceClock clock;
+	rts::performance::KernelPerformanceLedger &ledger =
+		rts::performance::KernelPerformanceLedger::instance();
+	expect(ledger.beginRun(true, KernelPerformanceClock::read, &clock),
+		"status diagnostics run starts");
+	const rts::performance::KernelPerformanceBatch token = ledger.beginBatch(
+		rts::performance::KERNEL_PERFORMANCE_STATUS, 0, 100, 1);
+	expect(token.valid(), "status diagnostics batch starts");
+	{
+		rts::performance::KernelPerformanceScope capture(&ledger, token,
+			rts::performance::KERNEL_PERFORMANCE_CAPTURE);
+		clock.now += 10;
+	}
+
+	rts::ObjectStatusTimerOptions options;
+	options.parallel = true;
+	options.minimumGrain = 1;
+	options.performanceBatch = token;
+	rts::ObjectStatusTimerMetrics metrics;
+	unsigned outputCount = 0;
+	expect(rts::PrepareObjectStatusTimerCommands(snapshots, SNAPSHOT_COUNT,
+		100, 13, output, SNAPSHOT_COUNT, options, &outputCount, &metrics) ==
+		rts::OBJECT_STATUS_TIMER_PARALLEL,
+		"status diagnostics token follows the real parallel path");
+	{
+		rts::performance::KernelPerformanceScope commit(&ledger, token,
+			rts::performance::KERNEL_PERFORMANCE_COMMIT);
+		clock.now += 10;
+	}
+	expect(ledger.endBatch(token,
+		rts::performance::KERNEL_PERFORMANCE_COMMITTED),
+		"status diagnostics batch commits after all stages");
+	const rts::performance::KernelPerformanceSnapshot snapshot = ledger.freeze();
+	expect(snapshot.complete && snapshot.streamCount == 1,
+		"status diagnostics freezes one complete stream");
+	if (snapshot.streamCount == 1)
+	{
+		const rts::performance::KernelPerformanceStream &stream = snapshot.streams[0];
+		expect(stream.kernel == rts::performance::KERNEL_PERFORMANCE_STATUS &&
+			stream.subtype == 0 && stream.attemptedBatches == 1 &&
+			stream.admittedBatches == 1 && stream.committedBatches == 1,
+			"status diagnostics preserves batch identity and disposition");
+		for (unsigned stage = 0;
+			stage != rts::performance::KERNEL_PERFORMANCE_STAGE_COUNT; ++stage)
+			expect(stream.stageSamples[stage] >= 1 &&
+				stream.stageNanoseconds[stage] > 0,
+				"status diagnostics records every measured stage");
+	}
+
+	jobs.shutdown();
+	expect(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME),
+		"diagnostic test thread unregisters cleanly");
+}
+
+void testKernelPerformanceReferenceTransportReachesStatusParallelPath()
+{
+	enum { SNAPSHOT_COUNT = 300 };
+	rts::ObjectStatusTimerSnapshot snapshots[SNAPSHOT_COUNT];
+	rts::ObjectStatusTimerCommand output[SNAPSHOT_COUNT];
+	fillParallelSnapshots(snapshots, SNAPSHOT_COUNT);
+
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 2;
+	config.queueCapacity = 64;
+	config.scratchBytesPerWorker = 64 * 1024;
+	config.pinWorkers = false;
+	expect(jobs.start(config), "reference status job system starts");
+	expect(jobs.registerCurrentThread(rts::JOB_OWNER_GAME),
+		"reference status test registers simulation owner");
+
+	KernelPerformanceClock timingClock;
+	rts::performance::KernelPerformanceLedger &timingLedger =
+		rts::performance::KernelPerformanceLedger::instance();
+	expect(timingLedger.beginRun(true, KernelPerformanceClock::read,
+		&timingClock), "reference status timing run starts");
+	const rts::performance::KernelPerformanceBatch timingBatch =
+		timingLedger.beginBatch(rts::performance::KERNEL_PERFORMANCE_STATUS,
+		0, 100, 1);
+	expect(timingBatch.valid(), "reference status timing batch starts");
+	{
+		rts::performance::KernelPerformanceScope capture(&timingLedger,
+			timingBatch, rts::performance::KERNEL_PERFORMANCE_CAPTURE);
+		timingClock.now += 10;
+	}
+
+	KernelPerformanceClock referenceClock;
+	rts::performance::KernelPerformanceReferenceLedger referenceLedger;
+	expect(referenceLedger.beginRun(
+		rts::performance::KERNEL_REFERENCE_THROUGHPUT_BINDING,
+		KernelPerformanceClock::read, &referenceClock),
+		"reference status throughput run starts");
+	rts::performance::KernelPerformanceReferenceBatch referenceBatch;
+	rts::ObjectStatusTimerOptions options;
+	options.parallel = true;
+	options.minimumGrain = 1;
+	options.performanceBatch = timingBatch;
+	options.performanceReferenceLedger = &referenceLedger;
+	options.performanceReferenceBatch = &referenceBatch;
+	rts::ObjectStatusTimerMetrics metrics;
+	unsigned outputCount = 0;
+	expect(rts::PrepareObjectStatusTimerCommands(snapshots, SNAPSHOT_COUNT,
+		100, 13, output, SNAPSHOT_COUNT, options, &outputCount, &metrics) ==
+		rts::OBJECT_STATUS_TIMER_PARALLEL,
+		"reference status throughput follows the real parallel path");
+	{
+		rts::performance::KernelPerformanceScope commit(&timingLedger,
+			timingBatch, rts::performance::KERNEL_PERFORMANCE_COMMIT);
+		timingClock.now += 10;
+	}
+	expect(timingLedger.endBatch(timingBatch,
+		rts::performance::KERNEL_PERFORMANCE_COMMITTED),
+		"reference status timing batch commits");
+	expect(referenceBatch.valid(),
+		"reference status throughput observes one validated batch");
+	if (referenceBatch.valid())
+		expect(referenceLedger.finishBatch(referenceBatch, true),
+			"reference status throughput commit closes reference batch");
+	const rts::performance::KernelPerformanceReferenceSnapshot reference =
+		referenceLedger.freeze();
+	expect(reference.complete && reference.streamCount == 1,
+		"reference status throughput freezes complete evidence");
+	if (reference.streamCount == 1)
+	{
+		const rts::performance::KernelPerformanceReferenceStream &stream =
+			reference.streams[0];
+		expect(stream.kernel == rts::performance::KERNEL_PERFORMANCE_STATUS &&
+			stream.subtype == 0 && stream.validatedBatchCount == 1 &&
+			stream.committedBatchCount == 1 &&
+			stream.validatedOperationCount == SNAPSHOT_COUNT &&
+			stream.committedOperationCount == SNAPSHOT_COUNT &&
+			stream.serialSampleCount == 0 && stream.serialNanoseconds == 0,
+			"reference status throughput keeps batch and operation cardinality separate");
+	}
+	expect(referenceClock.now == 1000,
+		"reference status throughput invokes no serial clock");
+	expect(timingLedger.freeze().complete,
+		"reference status timing evidence remains complete");
+	jobs.shutdown();
+	expect(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME),
+		"reference status throughput unregisters simulation owner");
+}
+
+void testKernelPerformanceReferenceSerialStatusUsesDetachedOutput()
+{
+	enum { SNAPSHOT_COUNT = 300 };
+	rts::ObjectStatusTimerSnapshot snapshots[SNAPSHOT_COUNT];
+	rts::ObjectStatusTimerCommand output[SNAPSHOT_COUNT];
+	rts::ObjectStatusTimerCommand referenceOutput[SNAPSHOT_COUNT];
+	fillParallelSnapshots(snapshots, SNAPSHOT_COUNT);
+	for (unsigned index = 0; index != SNAPSHOT_COUNT; ++index)
+	{
+		referenceOutput[index].objectID = 0xdead0000u + index;
+		referenceOutput[index].ownerOrder = 0xbeef0000u + index;
+		referenceOutput[index].expiredMask = 0xa5a50000u + index;
+	}
+
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 2;
+	config.queueCapacity = 64;
+	config.scratchBytesPerWorker = 64 * 1024;
+	config.pinWorkers = false;
+	expect(jobs.start(config), "serial reference status job system starts");
+	expect(jobs.registerCurrentThread(rts::JOB_OWNER_GAME),
+		"serial reference status registers simulation owner");
+
+	KernelPerformanceClock timingClock;
+	rts::performance::KernelPerformanceLedger &timingLedger =
+		rts::performance::KernelPerformanceLedger::instance();
+	expect(timingLedger.beginRun(true, KernelPerformanceClock::read,
+		&timingClock), "serial reference status timing run starts");
+	const rts::performance::KernelPerformanceBatch timingBatch =
+		timingLedger.beginBatch(rts::performance::KERNEL_PERFORMANCE_STATUS,
+		0, 100, 1);
+	expect(timingBatch.valid(), "serial reference status timing batch starts");
+	{
+		rts::performance::KernelPerformanceScope capture(&timingLedger,
+			timingBatch, rts::performance::KERNEL_PERFORMANCE_CAPTURE);
+		timingClock.now += 10;
+	}
+
+	KernelPerformanceClock referenceClock;
+	rts::performance::KernelPerformanceReferenceLedger referenceLedger;
+	expect(referenceLedger.beginRun(
+		rts::performance::KERNEL_REFERENCE_SERIAL_ORACLE,
+		KernelPerformanceClock::read, &referenceClock),
+		"serial reference status oracle starts");
+	rts::performance::KernelPerformanceReferenceBatch referenceBatch;
+	rts::ObjectStatusTimerOptions options;
+	options.parallel = true;
+	options.minimumGrain = 1;
+	options.performanceBatch = timingBatch;
+	options.performanceReferenceLedger = &referenceLedger;
+	options.performanceReferenceBatch = &referenceBatch;
+	options.performanceReferenceOutput = referenceOutput;
+	options.performanceReferenceOutputCapacity = SNAPSHOT_COUNT;
+	rts::ObjectStatusTimerMetrics metrics;
+	unsigned outputCount = 0;
+	expect(rts::PrepareObjectStatusTimerCommands(snapshots, SNAPSHOT_COUNT,
+		100, 13, output, SNAPSHOT_COUNT, options, &outputCount, &metrics) ==
+		rts::OBJECT_STATUS_TIMER_PARALLEL,
+		"serial reference status oracle follows the real parallel path");
+	expect(outputCount == SNAPSHOT_COUNT,
+		"serial reference status fixture emits every command");
+	unsigned firstDifference = 0;
+	expect(rts::ObjectStatusTimerCommandsEqual(referenceOutput, outputCount,
+		output, outputCount, &firstDifference),
+		"serial reference status output is detached and ordered like production");
+	{
+		rts::performance::KernelPerformanceScope commit(&timingLedger,
+			timingBatch, rts::performance::KERNEL_PERFORMANCE_COMMIT);
+		timingClock.now += 10;
+	}
+	expect(timingLedger.endBatch(timingBatch,
+		rts::performance::KERNEL_PERFORMANCE_COMMITTED),
+		"serial reference status timing batch commits");
+	expect(referenceBatch.valid(),
+		"serial reference status observes one validated batch");
+	if (referenceBatch.valid())
+		expect(referenceLedger.finishBatch(referenceBatch, true),
+			"serial reference status commit closes reference batch");
+	const rts::performance::KernelPerformanceReferenceSnapshot reference =
+		referenceLedger.freeze();
+	expect(reference.complete && reference.streamCount == 1,
+		"serial reference status freezes complete evidence");
+	if (reference.streamCount == 1)
+	{
+		const rts::performance::KernelPerformanceReferenceStream &stream =
+			reference.streams[0];
+		expect(stream.kernel == rts::performance::KERNEL_PERFORMANCE_STATUS &&
+			stream.subtype == 0 && stream.validatedBatchCount == 1 &&
+			stream.committedBatchCount == 1 &&
+			stream.validatedOperationCount == SNAPSHOT_COUNT &&
+			stream.committedOperationCount == SNAPSHOT_COUNT &&
+			stream.serialSampleCount == 1 && stream.serialNanoseconds != 0,
+			"serial reference status keeps measured detached work separate");
+	}
+	expect(referenceClock.now == 1020,
+		"serial reference status measures only detached serial work");
+	expect(timingLedger.freeze().complete,
+		"serial reference status timing evidence remains complete");
+	jobs.shutdown();
+	expect(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME),
+		"serial reference status unregisters simulation owner");
+}
+#endif
 }
 
 int main()
@@ -354,6 +636,11 @@ int main()
 	testRealJobSystemPathAndFailure();
 #endif
 	testRuntimeAuthorityRequiresPhysicalWorkers();
+#if defined(_WIN64)
+	testKernelPerformanceTokenReachesStatusStages();
+	testKernelPerformanceReferenceTransportReachesStatusParallelPath();
+	testKernelPerformanceReferenceSerialStatusUsesDetachedOutput();
+#endif
 	if (failures != 0)
 		return 1;
 	printf("Object status timer kernel tests passed.\n");

@@ -82,7 +82,7 @@ function Get-Stage5FileSnapshot {
     $full = [IO.Path]::GetFullPath($Path)
     Assert-Condition (Test-Path -LiteralPath $full -PathType Leaf) `
         "$Context file was not found: $full"
-    Assert-ContainedPathNoReparse (Split-Path -Parent $full) $full $Context
+    Assert-ContainedPathNoReparse (Split-Path -Parent $full) $full $Context | Out-Null
     $before = Get-Item -LiteralPath $full -Force -ErrorAction Stop
     Assert-Condition (($before -is [IO.FileInfo]) -and
         (($before.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)) `
@@ -188,7 +188,7 @@ function ConvertTo-OutputRelativePath {
     return ($candidateParts[$rootParts.Count..($candidateParts.Count - 1)] -join '\')
 }
 
-function Get-NativeV2ReceiptReference {
+function Get-NativePerformanceReceiptReference {
     param(
         [string]$OutputText,
         [string]$OutputRoot,
@@ -204,7 +204,8 @@ function Get-NativeV2ReceiptReference {
         [int]$ProcessId,
         [string]$ProcessCreationUtc,
         [string]$ExpectedExecutablePath,
-        [string[]]$ExpectedProducers = @('game-executable-stage5-performance-report-v2')
+        [string[]]$ExpectedProducers = @('game-executable-stage5-performance-report-v5'),
+        [string]$ExpectedCohortCreatedUtc = ''
     )
     if ([string]::IsNullOrWhiteSpace($OutputText) -or
         [string]::IsNullOrWhiteSpace($OutputRoot)) { return $null }
@@ -228,7 +229,9 @@ function Get-NativeV2ReceiptReference {
                 'Native receipt reference'
             $nativeText = [Text.Encoding]::UTF8.GetString([byte[]]$nativeSnapshot.bytes)
             $native = if ($PSVersionTable.PSVersion.Major -ge 6) {
-                $nativeText | ConvertFrom-Json -AsHashtable
+                if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) {
+                    $nativeText | ConvertFrom-Json -AsHashtable -DateKind String
+                } else { $nativeText | ConvertFrom-Json -AsHashtable }
             }
             else {
                 Add-Type -AssemblyName System.Web.Extensions
@@ -241,7 +244,7 @@ function Get-NativeV2ReceiptReference {
             $nativeRuntimeClosure = $native['runtimeClosure']
             $nativeProvenance = $native['provenance']
             $nativeRawLogs = $native['rawLogs']
-            if ($native['schemaVersion'] -ne 1 -or
+            if ($native['schemaVersion'] -ne 5 -or
                 [string]$native['role'] -cne 'performance-report' -or
                 [string]$native['title'] -cne $ExpectedTitle -or
                 [string]$native['architecture'] -cne 'x64' -or
@@ -250,7 +253,7 @@ function Get-NativeV2ReceiptReference {
                 [string]$native['recordedUtc'] -notmatch
                     '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$' -or
                 [string]$native['recordedUtc'] -lt [string]$native['cohortCreatedUtc'] -or
-                [string]$native['producerVersion'] -cne '2' -or
+                [string]$native['producerVersion'] -cne '5' -or
                 $null -eq $nativeRuntimeClosure -or
                 [string]$nativeRuntimeClosure['dependencyManifestSha256'].ToUpperInvariant() -cne
                     [string]$RuntimeClosure['dependencyManifestSha256'].ToUpperInvariant() -or
@@ -258,6 +261,9 @@ function Get-NativeV2ReceiptReference {
                     [string]$RuntimeClosure['closureSha256'].ToUpperInvariant() -or
                 $nativeRawLogs -isnot [Array] -or $nativeRawLogs.Count -ne 2 -or
                 $nativeProvenance -isnot [Collections.IDictionary]) { continue }
+            Assert-Stage5NativePerformanceReceiptProvenance $native 'Native receipt reference' `
+                $ExpectedTitle $ExpectedExecutablePath $ExecutableSha256 $ProcessId `
+                $ProcessCreationUtc $ExpectedCohortCreatedUtc $candidate $OutputRoot
             $rawLogsValid = $true
             foreach ($rawLog in $nativeRawLogs) {
                 if ($rawLog -isnot [Collections.IDictionary] -or
@@ -291,7 +297,7 @@ function Get-NativeV2ReceiptReference {
                     $ExecutableSha256.ToUpperInvariant() -or
                 [int]$nativeProvenance['exitCode'] -ne 0 -or
                 [string]::IsNullOrWhiteSpace([string]$nativeProvenance['commandLine'])) { continue }
-            if ($native['schemaVersion'] -ne 1 -or
+            if ($native['schemaVersion'] -ne 5 -or
                 [string]$native['evidenceKind'] -cne 'stage5-executable-originated-receipt' -or
                 [string]$native['status'] -cne 'passed' -or
                 [string]$native['producer'] -notin $ExpectedProducers -or
@@ -312,7 +318,7 @@ function Get-NativeV2ReceiptReference {
         }
         catch {
             # A legacy or malformed marker is diagnostic only.  It must never
-            # be promoted to a v2 native provenance reference.
+            # be promoted to a current native provenance reference.
         }
     }
     return $null
@@ -393,6 +399,38 @@ function Get-HostRunnerRuntimeClosure {
     return [ordered]@{
         dependencyManifestSha256 = $AcceptanceRuntimeDependencyManifestSha256.ToUpperInvariant()
         closureSha256 = $AcceptanceRuntimeClosureSha256.ToUpperInvariant()
+    }
+}
+
+function Get-NativeObservationBinding {
+    param([AllowNull()][object]$Binding)
+    if ($null -eq $Binding) { return $null }
+    # This is a transport boundary, not artifact verification or acceptance.
+    # Callers must independently verify the installed source/artifact closure.
+    $context = 'Native observation binding'
+    $fields = @('sourceCommit','artifactSetSha256','runtimeClosure')
+    Assert-JsonObjectShape $Binding $fields $fields $context
+    Assert-JsonString $Binding.sourceCommit "$context sourceCommit"
+    Assert-Condition ($Binding.sourceCommit -cmatch '^[0-9a-f]{40}$') `
+        "$context sourceCommit must be an independently supplied lowercase 40-hex commit."
+    Assert-JsonString $Binding.artifactSetSha256 "$context artifactSetSha256"
+    Assert-Condition (Test-Sha256Text $Binding.artifactSetSha256) `
+        "$context artifactSetSha256 must contain exactly 64 hexadecimal characters."
+    $closure = $Binding.runtimeClosure
+    $closureFields = @('dependencyManifestSha256','closureSha256')
+    Assert-JsonObjectShape $closure $closureFields $closureFields "$context runtimeClosure"
+    foreach ($field in $closureFields) {
+        Assert-JsonString $closure[$field] "$context runtimeClosure.$field"
+        Assert-Condition (Test-Sha256Text $closure[$field]) `
+            "$context runtimeClosure.$field must contain exactly 64 hexadecimal characters."
+    }
+    return [ordered]@{
+        sourceCommit = $Binding.sourceCommit
+        artifactSetSha256 = $Binding.artifactSetSha256.ToUpperInvariant()
+        runtimeClosure = [ordered]@{
+            dependencyManifestSha256 = $closure.dependencyManifestSha256.ToUpperInvariant()
+            closureSha256 = $closure.closureSha256.ToUpperInvariant()
+        }
     }
 }
 
@@ -1029,6 +1067,76 @@ function Get-ManifestData {
     }
 }
 
+function Set-NativePerformanceFixtureEnvironment {
+    param([object]$Environment, [object]$Entry)
+    $Environment['RTS_PERFORMANCE_WORKLOAD_QUALIFICATION'] = 'observed-only'
+    $Environment['RTS_PERFORMANCE_FIXTURE_KIND'] = if ($Entry.kind -ceq 'replay') { 'replay' } else { 'fresh-ai-map' }
+    $Environment['RTS_PERFORMANCE_FIXTURE_ID'] = [string]$Entry.caseId
+    foreach ($name in @('RTS_PERFORMANCE_PLAYER_COUNT','RTS_PERFORMANCE_UNIT_COUNT',
+        'RTS_PERFORMANCE_SEED','RTS_PERFORMANCE_FIXTURE_SHA256')) {
+        $Environment.Remove($name) | Out-Null
+    }
+    if ($Entry.kind -ceq 'replay') {
+        # A plan's seed zero is a placeholder, not a parsed replay seed. The
+        # executable observes the actual loaded game seed before publication.
+        $Environment['RTS_PERFORMANCE_FIXTURE_SHA256'] = [string]$Entry.fixtureSha256
+    } else {
+        $Environment['RTS_PERFORMANCE_SEED'] = [string]$Entry.seed
+    }
+}
+
+function Set-NativePerformanceObservationEnvironment {
+    param(
+        [object]$Environment,
+        [AllowNull()][object]$Binding,
+        [object]$Entry,
+        [string]$EvidenceRoot,
+        [string]$RunNonce,
+        [string]$CohortNonce,
+        [string]$CohortCreatedUtc
+    )
+    $nativeBinding = Get-NativeObservationBinding $Binding
+    $nativeReceiptDirectory = $null
+    if ($null -ne $nativeBinding) {
+        Assert-CanonicalUuid $RunNonce 'Native observation run nonce' | Out-Null
+        Assert-CanonicalUuid $CohortNonce 'Native observation cohort nonce' | Out-Null
+        Assert-Condition (-not [string]::IsNullOrWhiteSpace($EvidenceRoot) -and
+            -not [string]::IsNullOrWhiteSpace($CohortCreatedUtc) -and
+            -not [string]::IsNullOrWhiteSpace([string]$Entry.timingDirectory)) `
+            'Native observation requires output, timing, and cohort creation bindings.'
+        $nativeReceiptDirectory = Join-Path ([IO.Path]::GetFullPath($EvidenceRoot)) `
+            ('native-performance-receipts\' + $RunNonce)
+    }
+    # An absent binding is disabled, not permission to reuse inherited metadata.
+    # Clear the whole diagnostic namespace before installing this child's values.
+    foreach ($name in @($Environment.Keys)) {
+        if ([string]$name -like 'RTS_PERFORMANCE_*' -or
+            [string]$name -ieq 'RTS_STAGE5_RUNTIME_CLOSURE_SHA256' -or
+            [string]$name -ieq 'RTS_STAGE5_RUNTIME_MANIFEST_SHA256') {
+            $Environment.Remove([string]$name) | Out-Null
+        }
+    }
+    if ($null -eq $nativeBinding) { return $null }
+    $Environment['RTS_STAGE5_RUNTIME_CLOSURE_SHA256'] = $nativeBinding.runtimeClosure.closureSha256
+    $Environment['RTS_STAGE5_RUNTIME_MANIFEST_SHA256'] = $nativeBinding.runtimeClosure.dependencyManifestSha256
+    $Environment['RTS_PERFORMANCE_ROLE'] = 'performance-report'
+    $Environment['RTS_PERFORMANCE_REFERENCE_MODE'] = 'throughput-binding'
+    $Environment['RTS_PERFORMANCE_RUN_ID'] = 'stage5-' + [string]$Entry.sequence + '-' + $RunNonce
+    $Environment['RTS_PERFORMANCE_RUN_NONCE'] = $RunNonce
+    $Environment['RTS_PERFORMANCE_COHORT_NONCE'] = $CohortNonce
+    $Environment['RTS_PERFORMANCE_COHORT_CREATED_UTC'] = $CohortCreatedUtc
+    $Environment['RTS_PERFORMANCE_RECEIPT_DIR'] = $nativeReceiptDirectory
+    $Environment['RTS_PERFORMANCE_SOURCE_COMMIT'] = $nativeBinding.sourceCommit
+    $Environment['RTS_PERFORMANCE_ARTIFACT_SET_SHA256'] = $nativeBinding.artifactSetSha256
+    $Environment['RTS_PERFORMANCE_RUNTIME_MANIFEST_SHA256'] = $nativeBinding.runtimeClosure.dependencyManifestSha256
+    $Environment['RTS_PERFORMANCE_RUNTIME_CLOSURE_SHA256'] = $nativeBinding.runtimeClosure.closureSha256
+    Set-NativePerformanceFixtureEnvironment $Environment $Entry
+    $Environment['RTS_PERFORMANCE_RAW_LOG_PATH'] = Join-Path $nativeReceiptDirectory 'performance-raw.log'
+    $Environment['RTS_PERFORMANCE_TIMING_PATH'] = $Entry.timingDirectory
+    $Environment['RTS_PERFORMANCE_VERIFIER_BOUNDARY'] = 'stage5-host-runner-closed-native-evidence'
+    return $nativeReceiptDirectory
+}
+
 function New-ValidationPlan {
     param([object]$Data, [string]$Set, [int]$ReplayPasses, [int]$StressRunCount,
         [int]$ReplayTimeout, [int]$AiTimeout, [string]$Executable, [string]$OutputDirectory,
@@ -1332,8 +1440,12 @@ function Invoke-ValidationProcess {
         [object]$Entry,
         [bool]$CaptureTiming,
         [hashtable]$Environment,
-        [string]$EvidenceRoot = ''
+        [string]$EvidenceRoot = '',
+        [AllowNull()][object]$NativeObservationBinding = $null
     )
+    $nativeBinding = Get-NativeObservationBinding $NativeObservationBinding
+    Assert-Condition ($null -eq $nativeBinding -or $CaptureTiming) `
+        'Native observation requires frame timing before starting the installed process.'
     $processName = [IO.Path]::GetFileNameWithoutExtension($Executable)
     Assert-Condition (@(Get-Process -Name $processName -ErrorAction SilentlyContinue).Count -eq 0) `
         "A $processName process is already running. Validation will not overlap game processes."
@@ -1368,47 +1480,14 @@ function Invoke-ValidationProcess {
     $startInfo.EnvironmentVariables['RTS_STAGE5_RUN_NONCE'] = $processRunNonce
     $startInfo.EnvironmentVariables['RTS_STAGE5_COHORT_NONCE'] = $executionCohortNonce
     $startInfo.EnvironmentVariables['RTS_STAGE5_COHORT_CREATED_UTC'] = $executionCohortCreatedUtc
-    if ($null -ne $hostRunnerRuntimeClosure) {
-        $startInfo.EnvironmentVariables['RTS_STAGE5_RUNTIME_CLOSURE_SHA256'] =
-            [string]$hostRunnerRuntimeClosure.closureSha256
-        $startInfo.EnvironmentVariables['RTS_STAGE5_RUNTIME_MANIFEST_SHA256'] =
-            [string]$hostRunnerRuntimeClosure.dependencyManifestSha256
-
-        $nativeReceiptDirectory = Join-Path $EvidenceRoot `
-            ('native-performance-receipts\' + $processRunNonce)
+    $nativeReceiptDirectory = Set-NativePerformanceObservationEnvironment `
+        -Environment $startInfo.EnvironmentVariables -Binding $nativeBinding -Entry $Entry `
+        -EvidenceRoot $EvidenceRoot -RunNonce $processRunNonce `
+        -CohortNonce $executionCohortNonce -CohortCreatedUtc $executionCohortCreatedUtc
+    if ($null -ne $nativeReceiptDirectory) {
         if (-not (Test-Path -LiteralPath $nativeReceiptDirectory -PathType Container)) {
             New-Item -ItemType Directory -Path $nativeReceiptDirectory -Force | Out-Null
         }
-        $nativeRawLogPath = Join-Path $nativeReceiptDirectory 'performance-raw.log'
-        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_ROLE'] = 'performance-report'
-        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_RUN_ID'] =
-            ('stage5-' + [string]$Entry.sequence + '-' + $processRunNonce)
-        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_RUN_NONCE'] = $processRunNonce
-        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_COHORT_NONCE'] =
-            $executionCohortNonce
-        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_COHORT_CREATED_UTC'] =
-            $executionCohortCreatedUtc
-        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_RECEIPT_DIR'] =
-            $nativeReceiptDirectory
-        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_SOURCE_COMMIT'] =
-            $AcceptanceSourceCommit
-        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_ARTIFACT_SET_SHA256'] =
-            $AcceptanceArtifactSetSha256
-        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_RUNTIME_MANIFEST_SHA256'] =
-            [string]$hostRunnerRuntimeClosure.dependencyManifestSha256
-        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_RUNTIME_CLOSURE_SHA256'] =
-            [string]$hostRunnerRuntimeClosure.closureSha256
-        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_FIXTURE_ID'] =
-            [string]$Entry.caseId
-        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_FIXTURE_SHA256'] =
-            [string]$Entry.fixtureSha256
-        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_RAW_LOG_PATH'] =
-            $nativeRawLogPath
-        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_TIMING_PATH'] =
-            $Entry.timingDirectory
-        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_VERIFIER_BOUNDARY'] =
-            'stage5-host-runner-closed-native-evidence'
-        $startInfo.EnvironmentVariables['RTS_PERFORMANCE_SEED'] = [string]$Entry.seed
     }
     $process = New-Object Diagnostics.Process
     $process.StartInfo = $startInfo
@@ -1484,20 +1563,21 @@ function Invoke-ValidationProcess {
                 nativeReceipt = $null
             }
             if (-not [string]::IsNullOrWhiteSpace($EvidenceRoot) -and
-                $acceptanceBindingsRequested) {
+                $null -ne $nativeBinding) {
                 $nativeRole = if ($Entry.kind -ceq 'ai') { 'ai-results' } else { 'replay-results' }
-                $childProcess.nativeReceipt = Get-NativeV2ReceiptReference `
+                $childProcess.nativeReceipt = Get-NativePerformanceReceiptReference `
                     -OutputText ($stdout + "`n" + $stderr) `
                     -OutputRoot $EvidenceRoot -WorkingDirectory $WorkingDirectory `
-                    -Role $nativeRole -SourceCommit $AcceptanceSourceCommit `
-                    -ArtifactSetSha256 $AcceptanceArtifactSetSha256 `
+                    -Role $nativeRole -SourceCommit $nativeBinding.sourceCommit `
+                    -ArtifactSetSha256 $nativeBinding.artifactSetSha256 `
                     -ExecutableSha256 $manifestData.executableSha256 `
                     -RunNonce $processRunNonce `
                     -CohortNonce $executionCohortNonce `
-                    -RuntimeClosure $hostRunnerRuntimeClosure `
+                    -RuntimeClosure $nativeBinding.runtimeClosure `
                     -ExpectedTitle $manifestData.title `
                     -ProcessId ([int]$process.Id) `
                     -ProcessCreationUtc $processCreationUtc `
+                    -ExpectedCohortCreatedUtc $executionCohortCreatedUtc `
                     -ExpectedExecutablePath ([IO.Path]::GetFullPath($Executable))
             }
         }
@@ -1689,7 +1769,7 @@ function Write-Stage5HostRunnerReceipt {
         # the role's hashed result log; selecting a real child here avoids
         # inventing a process identity or a synthetic native receipt.
         $expectedNativeProducers = switch ($Role) {
-            default { @('game-executable-stage5-performance-report-v2') }
+            default { @('game-executable-stage5-performance-report-v5') }
         }
         $candidate = @($ChildRuns | Where-Object {
             $null -ne $_.childProcess -and
@@ -2053,6 +2133,13 @@ if (-not [string]::IsNullOrWhiteSpace($ExecutionCohortCreatedUtc)) {
 $executionCohortCreatedUtc = $executionCohortCreated.ToString('o')
 $hostRunnerRuntimeClosure = if ($acceptanceBindingsRequested) {
     Get-HostRunnerRuntimeClosure 'Acceptance-bound host-runner execution'
+} else { $null }
+$nativeObservationBinding = if ($acceptanceBindingsRequested) {
+    Get-NativeObservationBinding ([ordered]@{
+        sourceCommit = $AcceptanceSourceCommit
+        artifactSetSha256 = $AcceptanceArtifactSetSha256
+        runtimeClosure = $hostRunnerRuntimeClosure
+    })
 } else { $null }
 if (-not $PlanOnly) {
     Assert-Condition ([bool]$AllowHeadlessDirectExecution) `
@@ -2486,7 +2573,8 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
         Assert-FreeSpace $outputFull $MinimumFreeBytes 'Validation evidence volume'
         Assert-FileHash $executableFull $manifestData.executableSha256 'Installed runtime executable before run' | Out-Null
         $run = Invoke-ValidationProcess $executableFull $runtimeFull $entry `
-            (-not $DisableFrameTiming) $validationEnvironment $outputFull
+            (-not $DisableFrameTiming) $validationEnvironment $outputFull `
+            -NativeObservationBinding $nativeObservationBinding
         $childRuns.Add([pscustomobject]@{
             entry = $entry
             run = $run

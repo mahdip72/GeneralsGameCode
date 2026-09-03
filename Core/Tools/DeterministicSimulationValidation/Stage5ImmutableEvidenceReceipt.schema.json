@@ -46,10 +46,10 @@
         "reviewed-replay-fixture-manifest-v2",
         "stage5-premium-review-receipt-v2",
         "installed-runtime-manual-acceptance-v2",
-        "game-executable-stage5-performance-report-v2"
+        "game-executable-stage5-performance-report-v5"
       ]
     },
-    "producerVersion": { "const": "2" },
+    "producerVersion": { "enum": ["2", "5"] },
     "runNonce": {
       "type": "string",
       "format": "uuid"
@@ -93,6 +93,13 @@
     { "$ref": "#/$defs/reviewedFixtureReceipt" },
     { "$ref": "#/$defs/premiumReviewReceipt" },
     { "$ref": "#/$defs/manualApprovalReceipt" }
+  ],
+  "allOf": [
+    {
+      "if": { "properties": { "trustDomain": { "const": "executable" } } },
+      "then": { "properties": { "producerVersion": { "const": "5" } } },
+      "else": { "properties": { "producerVersion": { "const": "2" } } }
+    }
   ],
   "$defs": {
     "sha256": {
@@ -142,7 +149,7 @@
         "sha256": { "$ref": "#/$defs/sha256" },
         "producer": {
           "type": "string",
-          "const": "game-executable-stage5-performance-report-v2"
+          "const": "game-executable-stage5-performance-report-v5"
         },
         "runNonce": { "type": "string", "format": "uuid" },
         "cohortNonce": { "type": "string", "format": "uuid" }
@@ -365,7 +372,7 @@
           ]
         },
         "producer": {
-          "const": "game-executable-stage5-performance-report-v2"
+          "const": "game-executable-stage5-performance-report-v5"
         },
         "provenance": { "$ref": "#/$defs/nativeProvenance" }
       },
@@ -375,25 +382,25 @@
             {
               "properties": {
                 "role": { "const": "validation-results" },
-                "producer": { "const": "game-executable-stage5-performance-report-v2" }
+                "producer": { "const": "game-executable-stage5-performance-report-v5" }
               }
             },
             {
               "properties": {
                 "role": { "const": "replay-results" },
-                "producer": { "const": "game-executable-stage5-performance-report-v2" }
+                "producer": { "const": "game-executable-stage5-performance-report-v5" }
               }
             },
             {
               "properties": {
                 "role": { "const": "ai-results" },
-                "producer": { "const": "game-executable-stage5-performance-report-v2" }
+                "producer": { "const": "game-executable-stage5-performance-report-v5" }
               }
             },
             {
               "properties": {
                 "role": { "const": "performance-report" },
-                "producer": { "const": "game-executable-stage5-performance-report-v2" }
+                "producer": { "const": "game-executable-stage5-performance-report-v5" }
               }
             }
           ]

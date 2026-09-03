@@ -83,6 +83,8 @@ void disabled(const std::string& directory)
 		capture.endFrame(900);
 		capture.endSession();
 		check(!capture.isActive(), "disabled capture remains inactive");
+		check(!capture.finalize().complete,
+			"disabled capture cannot provide complete receipt evidence");
 	}
 	check(files(directory).empty(), "disabled capture creates no output");
 }
@@ -167,8 +169,59 @@ void bounded(const std::string& directory)
 			capture.endFrame((i + 1) * 900);
 		}
 		check(!capture.isActive(), "row limit leaves capture inactive");
+		const rts::frame_timing::FinalizedCapture final = capture.finalize();
+		check(final.closed && final.truncated && !final.complete,
+			"row-limited capture is closed but cannot qualify as complete evidence");
 	}
 	check(rows(directory).size() == 16384, "capture stops at the fixed row bound");
+}
+
+void finalized(const std::string& directory)
+{
+	SetEnvironmentVariableA("RTS_FRAME_TIMING_DIR", directory.c_str());
+	rts::frame_timing::Capture capture;
+	capture.beginSession("headless");
+	capture.beginFrame(0);
+	capture.endFrame(1);
+	capture.beginFrame(1);
+	capture.endFrame(2);
+	capture.beginFrame(2);
+	capture.endFrame(0);
+	capture.endSession();
+	const rts::frame_timing::FinalizedCapture final = capture.finalize();
+	const std::vector<std::string> paths = files(directory);
+	check(paths.size() == 1 && final.path == paths[0],
+		"finalization identifies the exact producer-owned file");
+	check(final.closed && final.writeSucceeded && !final.truncated && final.complete,
+		"complete finalization proves successful file close");
+	check(final.sessionCount == 1 && final.frameSamples == 3 &&
+		final.firstFrame == 0 && final.lastFrame == 2,
+		"finalization retains pre-reset frame coverage");
+	HANDLE exclusive = CreateFileA(final.path.c_str(), GENERIC_READ | GENERIC_WRITE,
+		0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	check(exclusive != INVALID_HANDLE_VALUE,
+		"receipt file is physically closed, not merely flushed");
+	if (exclusive != INVALID_HANDLE_VALUE) CloseHandle(exclusive);
+	capture.beginSession("headless");
+	capture.beginFrame(100);
+	capture.endFrame(101);
+	const rts::frame_timing::FinalizedCapture again = capture.finalize();
+	check(again.path == final.path && again.frameSamples == 3 && again.complete,
+		"finalization is idempotent and prevents later session writes");
+}
+
+void incomplete(const std::string& directory)
+{
+	SetEnvironmentVariableA("RTS_FRAME_TIMING_DIR", directory.c_str());
+	rts::frame_timing::Capture capture;
+	capture.beginSession("headless");
+	capture.beginFrame(0);
+	capture.endFrame(1);
+	capture.beginFrame(1);
+	capture.endSession();
+	const rts::frame_timing::FinalizedCapture final = capture.finalize();
+	check(final.closed && final.writeSucceeded && !final.complete,
+		"unfinished frame fails coverage despite a successful close");
 }
 }
 
@@ -184,19 +237,26 @@ int main()
 	if (!CreateDirectoryA(root.c_str(), NULL))
 		return 1; // Never reuse or remove a directory owned by another run.
 	const std::string disabledDir = root + "\\disabled", enabledDir = root + "\\enabled", boundedDir = root + "\\bounded";
+	const std::string finalizedDir = root + "\\finalized", incompleteDir = root + "\\incomplete";
 	check(CreateDirectoryA(disabledDir.c_str(), NULL) != FALSE, "create disabled case");
 	check(CreateDirectoryA(enabledDir.c_str(), NULL) != FALSE, "create enabled case");
 	check(CreateDirectoryA(boundedDir.c_str(), NULL) != FALSE, "create bounded case");
+	check(CreateDirectoryA(finalizedDir.c_str(), NULL) != FALSE, "create finalized case");
+	check(CreateDirectoryA(incompleteDir.c_str(), NULL) != FALSE, "create incomplete case");
 	LARGE_INTEGER frequency;
 	if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0)
 		return 1;
 	disabled(disabledDir);
 	enabled(enabledDir, frequency.QuadPart);
 	bounded(boundedDir);
+	finalized(finalizedDir);
+	incomplete(incompleteDir);
 	SetEnvironmentVariableA("RTS_FRAME_TIMING_DIR", NULL);
 	removeCase(disabledDir);
 	removeCase(enabledDir);
 	removeCase(boundedDir);
+	removeCase(finalizedDir);
+	removeCase(incompleteDir);
 	check(RemoveDirectoryA(root.c_str()) != FALSE, "remove empty test root");
 	return failures ? 1 : 0;
 }

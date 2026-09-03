@@ -1,0 +1,9 @@
+add_executable(core_stage5_performance_fixture_tests Stage5PerformanceFixtureTest.cpp)
+target_include_directories(core_stage5_performance_fixture_tests PRIVATE
+    "${CMAKE_SOURCE_DIR}/Core/GameEngine/Include"
+)
+set_target_properties(core_stage5_performance_fixture_tests PROPERTIES
+    CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO
+)
+add_test(NAME core_stage5_performance_fixture_tests COMMAND core_stage5_performance_fixture_tests)
+set_tests_properties(core_stage5_performance_fixture_tests PROPERTIES TIMEOUT 30)

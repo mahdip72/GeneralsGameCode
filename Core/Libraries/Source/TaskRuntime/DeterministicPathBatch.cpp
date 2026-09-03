@@ -11,6 +11,10 @@
 #include "Lib/DeterministicPathBatch.h"
 
 #include "Lib/JobSystem.h"
+#if defined(_WIN64)
+#include "Lib/KernelPerformanceDiagnostics.h"
+#include "Lib/KernelPerformanceReference.h"
+#endif
 
 #include <array>
 #include <atomic>
@@ -26,6 +30,42 @@ namespace rts
 {
 namespace
 {
+
+#if defined(_WIN64)
+class PathPerformanceInterval
+{
+public:
+	PathPerformanceInterval(performance::KernelPerformanceBatch *batch,
+		performance::KernelPerformanceStage stage) : m_ledger(nullptr)
+	{
+		if (batch != nullptr && batch->valid())
+		{
+			m_ledger = &performance::KernelPerformanceLedger::instance();
+			m_interval = m_ledger->beginInterval(*batch, stage);
+		}
+	}
+
+	~PathPerformanceInterval()
+	{
+		end();
+	}
+
+	void end()
+	{
+		if (m_ledger != nullptr && m_interval.valid())
+		{
+			m_ledger->endInterval(m_interval);
+			m_interval = performance::KernelPerformanceInterval();
+		}
+	}
+
+private:
+	performance::KernelPerformanceLedger *m_ledger;
+	performance::KernelPerformanceInterval m_interval;
+	PathPerformanceInterval(const PathPerformanceInterval &);
+	PathPerformanceInterval &operator=(const PathPerformanceInterval &);
+};
+#endif
 
 std::atomic<unsigned> s_activeDirectPathBatches(0);
 std::atomic<unsigned> s_directPathLateDrainExecutions(0);
@@ -126,6 +166,215 @@ struct DirectPathBatchWork
 	std::atomic<unsigned> liveJobs;
 	std::atomic<bool> ownsActiveSlot;
 };
+
+#if defined(_WIN64)
+/*
+** PATH reference schema 1 is pointer-free and order-sensitive.  Input tags
+** carry the complete immutable direct snapshot (ordered callback and start
+** neighbour facts); output tags carry every scalar result field and the
+** ordered raw chain.  Capacities and pointers are storage identities, not
+** path semantics, so they are deliberately excluded.
+*/
+struct DirectPathReferenceInput
+{
+	const DirectPathBatchWork *batch;
+	std::size_t requestCount;
+};
+
+struct DirectPathReferenceOutputView
+{
+	const DirectPathSearchResult *results;
+	std::size_t count;
+	const void *detachedStorage;
+};
+
+struct DirectPathReferenceDetachedOutput
+{
+	DirectPathReferenceDetachedOutput() : view(), count(0)
+	{
+		view.results = results.data();
+		view.count = 0;
+		view.detachedStorage = this;
+	}
+
+	DirectPathReferenceOutputView view;
+	std::size_t count;
+	std::array<DirectPathSearchResult,
+		DETERMINISTIC_DIRECT_PATH_MAX_BATCH_REQUESTS> results;
+	std::array<std::array<DeterministicPathPoint,
+		DETERMINISTIC_DIRECT_PATH_MAX_CALLBACKS>,
+		DETERMINISTIC_DIRECT_PATH_MAX_BATCH_REQUESTS> rawPoints;
+};
+
+bool WriteDirectPathFact(performance::KernelPerformanceCanonicalWriter &writer,
+	const DirectPathCellFact &fact)
+{
+	return writer.i32(3, fact.x) && writer.i32(4, fact.y) &&
+		writer.u32(5, fact.zone) && writer.u32(6, fact.flags) &&
+		writer.u32(7, fact.hasPathfindInfo);
+}
+
+bool WriteDirectPathReferenceInput(
+	performance::KernelPerformanceCanonicalWriter &writer, const void *context)
+{
+	const DirectPathReferenceInput &input =
+		*static_cast<const DirectPathReferenceInput *>(context);
+	if (input.batch == nullptr || input.requestCount == 0 ||
+		input.requestCount > DETERMINISTIC_DIRECT_PATH_MAX_BATCH_REQUESTS ||
+		!writer.sequence(1, static_cast<unsigned>(input.requestCount)))
+		return false;
+	for (std::size_t index = 0; index < input.requestCount; ++index)
+	{
+		const DirectPathSnapshot &snapshot =
+			input.batch->requests[index].snapshot;
+		if (!writer.sequence(2, static_cast<unsigned>(snapshot.callbackCount)))
+			return false;
+		for (std::size_t callback = 0; callback < snapshot.callbackCount;
+			++callback)
+		{
+			if (!WriteDirectPathFact(writer, snapshot.callbacks[callback]))
+				return false;
+		}
+		if (!writer.sequence(8,
+			static_cast<unsigned>(snapshot.startNeighborCount)))
+			return false;
+		for (std::size_t neighbor = 0;
+			neighbor < snapshot.startNeighborCount; ++neighbor)
+		{
+			if (!WriteDirectPathFact(writer,
+				snapshot.startNeighbors[neighbor]))
+				return false;
+		}
+		if (!writer.u32(10, snapshot.topologyOccupancyGeneration) ||
+			!writer.u32(11, snapshot.requestToken) ||
+			!writer.u32(12, snapshot.objectId) ||
+			!writer.u32(13, snapshot.availableCellInfoCount) ||
+			!writer.i32(14, snapshot.startX) ||
+			!writer.i32(15, snapshot.startY) ||
+			!writer.i32(16, snapshot.goalX) ||
+			!writer.i32(17, snapshot.goalY) ||
+			!writer.u32(18, snapshot.requiredZone) ||
+			!writer.u32(19, snapshot.expectedLayer))
+			return false;
+	}
+	return true;
+}
+
+bool WriteDirectPathReferenceOutput(
+	performance::KernelPerformanceCanonicalWriter &writer, const void *context)
+{
+	const DirectPathReferenceOutputView &output =
+		*static_cast<const DirectPathReferenceOutputView *>(context);
+	if (output.results == nullptr || output.count == 0 ||
+		!writer.sequence(20, static_cast<unsigned>(output.count)))
+		return false;
+	for (std::size_t index = 0; index < output.count; ++index)
+	{
+		const DirectPathSearchResult &result = output.results[index];
+		if (!writer.u32(21, static_cast<unsigned>(result.status)) ||
+			!writer.u32(22, static_cast<unsigned>(result.rawPointCount)) ||
+			!writer.u32(23, static_cast<unsigned>(result.callbackCount)) ||
+			!writer.u32(24, static_cast<unsigned>(result.requiredCellInfoCount)) ||
+			!writer.u32(25, static_cast<unsigned>(
+				result.startNeighborAllocationCount)) ||
+			!writer.u32(26, static_cast<unsigned>(result.openCellCountAfterGoal)) ||
+			!writer.u32(27, static_cast<unsigned>(result.cumulativeCellCount)) ||
+			!writer.u32(28, result.topologyOccupancyGeneration) ||
+			!writer.u32(29, result.requestToken) ||
+			!writer.u32(30, result.objectId) ||
+			!writer.sequence(31, static_cast<unsigned>(result.rawPointCount)))
+			return false;
+		for (std::size_t point = 0; point < result.rawPointCount; ++point)
+		{
+			const DeterministicPathPoint &value = result.rawPoints[point];
+			if (!writer.i32(32, value.x) || !writer.i32(33, value.y) ||
+				!writer.u32(34, value.layer))
+				return false;
+		}
+	}
+	return true;
+}
+
+bool SerialComputeDirectPathReference(const void *immutableInput,
+	void *detachedSerialOutput)
+{
+	const DirectPathReferenceInput &input =
+		*static_cast<const DirectPathReferenceInput *>(immutableInput);
+	DirectPathReferenceOutputView &view =
+		*static_cast<DirectPathReferenceOutputView *>(detachedSerialOutput);
+	if (view.detachedStorage == nullptr)
+		return false;
+	DirectPathReferenceDetachedOutput &detached =
+		*static_cast<DirectPathReferenceDetachedOutput *>(
+			const_cast<void *>(view.detachedStorage));
+	if (input.batch == nullptr || input.requestCount == 0 ||
+		input.requestCount > DETERMINISTIC_DIRECT_PATH_MAX_BATCH_REQUESTS)
+		return false;
+	detached.count = input.requestCount;
+	detached.view.count = input.requestCount;
+	for (std::size_t index = 0; index < input.requestCount; ++index)
+	{
+		DirectPathSearchResult &result = detached.results[index];
+		result = {};
+		result.rawPoints = detached.rawPoints[index].data();
+		result.rawPointCapacity = detached.rawPoints[index].size();
+		FindDeterministicDirectPath(input.batch->requests[index].snapshot,
+			result);
+	}
+	return true;
+}
+
+void ObserveDirectPathReference(const DirectPathBatchWork &batch,
+	std::size_t requestCount, performance::KernelPerformanceBatch *timingBatch,
+	performance::KernelPerformanceReferenceLedger *referenceLedger,
+	performance::KernelPerformanceReferenceBatch *referenceBatch)
+{
+	if (referenceBatch == nullptr)
+		return;
+	*referenceBatch = performance::KernelPerformanceReferenceBatch();
+	if (timingBatch == nullptr || referenceLedger == nullptr ||
+		!timingBatch->valid())
+		return;
+	const performance::KernelPerformanceReferenceMode mode =
+		referenceLedger->mode();
+	if (mode == performance::KERNEL_REFERENCE_DISABLED)
+		return;
+	performance::KernelPerformanceBatchIdentity identity;
+	if (!performance::KernelPerformanceLedger::instance().describeBatch(
+		*timingBatch, identity) || identity.kernel !=
+		performance::KERNEL_PERFORMANCE_PATH || identity.subtype != 1)
+		return;
+
+	std::array<DirectPathSearchResult,
+		DETERMINISTIC_DIRECT_PATH_MAX_BATCH_REQUESTS> productionResults;
+	for (std::size_t index = 0; index < requestCount; ++index)
+		productionResults[index] = batch.requests[index].result;
+	DirectPathReferenceInput input = {&batch, requestCount};
+	DirectPathReferenceOutputView production = {
+		productionResults.data(), requestCount, nullptr};
+	std::unique_ptr<DirectPathReferenceDetachedOutput> detached;
+	if (mode == performance::KERNEL_REFERENCE_SERIAL_ORACLE)
+	{
+		try
+		{
+			detached.reset(new DirectPathReferenceDetachedOutput());
+		}
+		catch (...)
+		{
+			return;
+		}
+	}
+	*referenceBatch = referenceLedger->observeValidatedBatch(
+		performance::KERNEL_PERFORMANCE_PATH, identity.subtype, identity.frame,
+		identity.ordinal, 1, static_cast<rts::JobMetricCounter>(requestCount),
+		WriteDirectPathReferenceInput, &input,
+		WriteDirectPathReferenceOutput, &production,
+		mode == performance::KERNEL_REFERENCE_SERIAL_ORACLE ?
+			SerialComputeDirectPathReference : nullptr,
+		mode == performance::KERNEL_REFERENCE_SERIAL_ORACLE ?
+			static_cast<void *>(&detached->view) : nullptr);
+}
+#endif
 
 void releaseDirectPathActiveSlot(DirectPathBatchWork &batch)
 {
@@ -312,8 +561,18 @@ DeterministicDirectPathBatch::~DeterministicDirectPathBatch()
 
 bool DeterministicDirectPathBatch::executeSynchronously(JobSystem &jobs,
 	const DirectPathSnapshot *snapshots, std::size_t requestCount,
-	unsigned workerWaitTimeoutMilliseconds)
+	unsigned workerWaitTimeoutMilliseconds
+#if defined(_WIN64)
+	, performance::KernelPerformanceBatch *performanceBatch
+	, performance::KernelPerformanceReferenceLedger *performanceReferenceLedger
+	, performance::KernelPerformanceReferenceBatch *performanceReferenceBatch
+#endif
+	)
 {
+	#if defined(_WIN64)
+	if (performanceReferenceBatch != nullptr)
+		*performanceReferenceBatch = performance::KernelPerformanceReferenceBatch();
+	#endif
 	if (m_state == nullptr)
 		return false;
 	m_state->work.reset();
@@ -328,13 +587,16 @@ bool DeterministicDirectPathBatch::executeSynchronously(JobSystem &jobs,
 	{
 		return false;
 	}
-
 	unsigned expectedActiveBatches = 0;
 	if (!s_activeDirectPathBatches.compare_exchange_strong(expectedActiveBatches,
 		1, std::memory_order_acq_rel, std::memory_order_acquire))
 	{
 		return false;
 	}
+	#if defined(_WIN64)
+	PathPerformanceInterval capture(performanceBatch,
+		performance::KERNEL_PERFORMANCE_CAPTURE);
+	#endif
 	try
 	{
 		m_state->work = std::make_shared<DirectPathBatchWork>();
@@ -377,7 +639,11 @@ bool DeterministicDirectPathBatch::executeSynchronously(JobSystem &jobs,
 		work.physicalWorkerIndex.store(JOB_INVALID_PHYSICAL_WORKER_INDEX,
 			std::memory_order_relaxed);
 	}
-
+	#if defined(_WIN64)
+	capture.end();
+	PathPerformanceInterval schedule(performanceBatch,
+		performance::KERNEL_PERFORMANCE_SCHEDULE);
+	#endif
 	const JobGroup group = jobs.createGroup();
 	if (!group.isValid())
 	{
@@ -415,6 +681,11 @@ bool DeterministicDirectPathBatch::executeSynchronously(JobSystem &jobs,
 		return false;
 	}
 	m_state->submittedJobCount = requestCount;
+	#if defined(_WIN64)
+	schedule.end();
+	PathPerformanceInterval wait(performanceBatch,
+		performance::KERNEL_PERFORMANCE_WAIT);
+	#endif
 
 	#if defined(RTS_BUILD_CORE_EXTRAS)
 	if ((s_directPathTestPauseMask.load(std::memory_order_acquire) & 1) != 0 &&
@@ -467,10 +738,17 @@ bool DeterministicDirectPathBatch::executeSynchronously(JobSystem &jobs,
 	// A completed group has no runnable job for the owner to help.  This is
 	// the batch's one join and cannot create an owner execution identity.
 	const bool joined = jobs.wait(group);
+	#if defined(_WIN64)
+	wait.end();
+	#endif
 	releaseDirectPathActiveSlot(batch);
 	m_state->completed = joined && !group.failed() && !group.wasCancelled();
 	if (!m_state->completed)
 		return false;
+	#if defined(_WIN64)
+	PathPerformanceInterval validate(performanceBatch,
+		performance::KERNEL_PERFORMANCE_VALIDATE);
+	#endif
 	for (std::size_t i = 0; i < requestCount; ++i)
 	{
 		if (!handles[i].succeeded() ||
@@ -481,6 +759,10 @@ bool DeterministicDirectPathBatch::executeSynchronously(JobSystem &jobs,
 			return false;
 		}
 	}
+	#if defined(_WIN64)
+	ObserveDirectPathReference(batch, requestCount, performanceBatch,
+		performanceReferenceLedger, performanceReferenceBatch);
+	#endif
 	return true;
 }
 
@@ -756,6 +1038,562 @@ bool hasInitialCellInfo(const OrdinaryPathBatchWork &batch,
 	return (batch.cells[cellIndex].navigationFlags &
 		DETERMINISTIC_PATH_HAS_CELL_INFO) != 0;
 }
+
+#if defined(_WIN64)
+struct OrdinaryPathReferenceInput
+{
+	const OrdinaryPathBatchWork *batch;
+	std::size_t requestCount;
+	std::size_t cellCount;
+	std::size_t hierarchyBlockCount;
+};
+
+struct OrdinaryPathReferenceResultView
+{
+	const DeterministicPathPoint *points;
+	std::size_t pointCount;
+	const std::uint32_t *allocationOrder;
+	std::size_t allocationCount;
+	const std::uint32_t *cleanupOrder;
+	std::size_t cleanupCount;
+	const std::uint32_t *passableBlockIndices;
+	std::size_t passableBlockCount;
+	std::uint32_t snapshotGeneration;
+	std::uint32_t objectId;
+	std::uint32_t expandedNodeCount;
+	std::uint32_t discoveredNodeCount;
+	std::uint32_t requiredCellInfoCount;
+	std::uint32_t cumulativeCellCount;
+	std::uint64_t ownerToken;
+	std::uint64_t materializationPlanHash;
+	bool hierarchyAllPassable;
+	DeterministicPathSearchStatus status;
+};
+
+struct OrdinaryPathReferenceOutputView
+{
+	const OrdinaryPathReferenceResultView *results;
+	std::size_t count;
+	const void *detachedStorage;
+};
+
+struct OrdinaryPathReferenceDetachedOperation
+{
+	OrdinaryPathReferenceDetachedOperation() : result(), view(),
+		materializationPlanHash(0)
+	{
+		result = {};
+		view = {};
+	}
+
+	DeterministicPathSearchResult result;
+	std::vector<DeterministicPathPoint> points;
+	std::vector<std::uint32_t> passableBlocks;
+	std::vector<std::uint32_t> allocationOrder;
+	std::vector<std::uint32_t> cleanupOrder;
+	OrdinaryPathReferenceResultView view;
+	std::uint64_t materializationPlanHash;
+};
+
+struct OrdinaryPathReferenceDetachedOutput
+{
+	OrdinaryPathReferenceDetachedOutput() : view(), count(0)
+	{
+		view.results = nullptr;
+		view.count = 0;
+		view.detachedStorage = this;
+	}
+
+	OrdinaryPathReferenceOutputView view;
+	std::size_t count;
+	std::vector<OrdinaryPathReferenceResultView> results;
+	std::vector<OrdinaryPathReferenceDetachedOperation> operations;
+	std::vector<DeterministicPathSearchNode> nodes;
+	std::vector<std::uint32_t> heap;
+	std::vector<std::uint8_t> hierarchyPassable;
+	std::vector<std::uint32_t> discovered;
+	std::vector<std::uint32_t> open;
+	std::vector<std::uint32_t> closed;
+};
+
+struct OrdinaryPathReferenceBundle
+{
+	OrdinaryPathReferenceBundle() : input(), production(), productionResults(),
+		detached()
+	{
+		input = {};
+		production = {};
+	}
+
+	OrdinaryPathReferenceInput input;
+	OrdinaryPathReferenceOutputView production;
+	std::vector<OrdinaryPathReferenceResultView> productionResults;
+	std::unique_ptr<OrdinaryPathReferenceDetachedOutput> detached;
+};
+
+bool WriteOrdinaryPathReferenceInput(
+	performance::KernelPerformanceCanonicalWriter &writer, const void *context)
+{
+	const OrdinaryPathReferenceInput &input =
+		*static_cast<const OrdinaryPathReferenceInput *>(context);
+	if (input.batch == nullptr || input.requestCount == 0 ||
+		input.batch->requestCount != input.requestCount ||
+		input.batch->grid.cells == nullptr ||
+		input.cellCount != input.batch->cells.size() ||
+		!writer.u32(1, input.batch->grid.width) ||
+		!writer.u32(2, input.batch->grid.height) ||
+		!writer.i32(3, input.batch->grid.originX) ||
+		!writer.i32(4, input.batch->grid.originY) ||
+		!writer.u32(5, input.batch->grid.snapshotGeneration) ||
+		!writer.u32(6, static_cast<unsigned>(input.hierarchyBlockCount)) ||
+		!writer.sequence(10, static_cast<unsigned>(input.cellCount)))
+		return false;
+	for (std::size_t index = 0; index < input.cellCount; ++index)
+	{
+		const DeterministicPathCell &cell = input.batch->cells[index];
+		if (!writer.u32(11, cell.traversalMask) ||
+			!writer.u32(12, cell.obstacleObjectId) ||
+			!writer.u32(13, cell.positionObjectId) ||
+			!writer.u32(14, cell.goalObjectId) ||
+			!writer.u32(15, cell.blockZone) ||
+			!writer.u32(16, cell.globalZone) ||
+			!writer.u32(17, cell.zone) ||
+			!writer.u32(18, cell.type) || !writer.u32(19, cell.flags) ||
+			!writer.u32(20, cell.layer) ||
+			!writer.u32(21, cell.connectsToLayer) ||
+			!writer.u32(22, cell.pinched) ||
+			!writer.u32(23, cell.blockPassable) ||
+			!writer.u32(24, cell.navigationFlags))
+			return false;
+	}
+	if (!writer.sequence(30, static_cast<unsigned>(input.requestCount)))
+		return false;
+	for (std::size_t index = 0; index < input.requestCount; ++index)
+	{
+		const OrdinaryPathRequestWork &work = input.batch->requests[index];
+		const DeterministicPathRequest &request = work.request;
+		if (!writer.u32(31, request.expectedSnapshotGeneration) ||
+			!writer.u32(32, request.objectId) ||
+			!writer.i32(33, request.startX) ||
+			!writer.i32(34, request.startY) ||
+			!writer.i32(35, request.goalX) ||
+			!writer.i32(36, request.goalY) ||
+			!writer.u32(37, request.traversalMask) ||
+			!writer.u32(38, request.maximumExpandedNodes) ||
+			!writer.u32(39, request.availableCellInfoCount) ||
+			!writer.u32(40, request.requiredZone) ||
+			!writer.u32(41, request.footprintRadius) ||
+			!writer.u32(42, request.centerInCell) ||
+			!writer.u32(43, request.allowDiagonal) ||
+			!writer.u32(44, request.allowBlockedStart) ||
+			!writer.u32(45, request.expectedLayer) ||
+			!writer.u32(46, request.requireLegacyDirectLine) ||
+			!writer.u32(47, request.requireObstructedSearch) ||
+			!writer.u32(48, request.isHuman) ||
+			!writer.u32(49, request.hierarchyMode) ||
+			!writer.u32(50, request.hierarchyBlockSize) ||
+			!writer.u64(51, work.ownerToken))
+			return false;
+	}
+	return true;
+}
+
+bool WriteOrdinaryPathReferenceOutput(
+	performance::KernelPerformanceCanonicalWriter &writer, const void *context)
+{
+	const OrdinaryPathReferenceOutputView &output =
+		*static_cast<const OrdinaryPathReferenceOutputView *>(context);
+	if (output.results == nullptr || output.count == 0 ||
+		!writer.sequence(60, static_cast<unsigned>(output.count)))
+		return false;
+	for (std::size_t index = 0; index < output.count; ++index)
+	{
+		const OrdinaryPathReferenceResultView &result = output.results[index];
+		if (!writer.u32(61, static_cast<unsigned>(result.status)) ||
+			!writer.u32(62, result.snapshotGeneration) ||
+			!writer.u32(63, result.objectId) ||
+			!writer.u32(64, result.expandedNodeCount) ||
+			!writer.u32(65, result.discoveredNodeCount) ||
+			!writer.u32(66, result.requiredCellInfoCount) ||
+			!writer.u32(67, result.cumulativeCellCount) ||
+			!writer.u64(68, result.ownerToken) ||
+			!writer.boolean(69, result.hierarchyAllPassable) ||
+			!writer.u64(70, result.materializationPlanHash) ||
+			!writer.sequence(71, static_cast<unsigned>(result.pointCount)))
+			return false;
+		for (std::size_t point = 0; point < result.pointCount; ++point)
+		{
+			const DeterministicPathPoint &value = result.points[point];
+			if (!writer.i32(72, value.x) || !writer.i32(73, value.y) ||
+				!writer.u32(74, value.layer))
+				return false;
+		}
+		if (!writer.sequence(75, static_cast<unsigned>(result.allocationCount)))
+			return false;
+		for (std::size_t item = 0; item < result.allocationCount; ++item)
+			if (!writer.u32(76, result.allocationOrder[item])) return false;
+		if (!writer.sequence(77, static_cast<unsigned>(result.cleanupCount)))
+			return false;
+		for (std::size_t item = 0; item < result.cleanupCount; ++item)
+			if (!writer.u32(78, result.cleanupOrder[item])) return false;
+		if (!writer.sequence(79,
+			static_cast<unsigned>(result.passableBlockCount)))
+			return false;
+		for (std::size_t item = 0; item < result.passableBlockCount; ++item)
+			if (!writer.u32(80, result.passableBlockIndices[item])) return false;
+	}
+	return true;
+}
+
+void SetOrdinaryPathReferenceResultView(
+	OrdinaryPathReferenceResultView &view,
+	const DeterministicPathSearchResult &result,
+	const OrdinaryPathRequestWork &work,
+	const std::vector<DeterministicPathPoint> &points,
+	const std::vector<std::uint32_t> &allocationOrder,
+	const std::vector<std::uint32_t> &cleanupOrder,
+	const std::vector<std::uint32_t> &passableBlocks,
+	std::uint64_t materializationPlanHash)
+{
+	view.points = points.empty() ? nullptr : points.data();
+	view.pointCount = result.pointCount;
+	view.allocationOrder = allocationOrder.empty() ? nullptr :
+		allocationOrder.data();
+	view.allocationCount = allocationOrder.size();
+	view.cleanupOrder = cleanupOrder.empty() ? nullptr : cleanupOrder.data();
+	view.cleanupCount = cleanupOrder.size();
+	view.passableBlockIndices = passableBlocks.empty() ? nullptr :
+		passableBlocks.data();
+	view.passableBlockCount = passableBlocks.size();
+	view.snapshotGeneration = result.snapshotGeneration;
+	view.objectId = work.request.objectId;
+	view.expandedNodeCount = result.expandedNodeCount;
+	view.discoveredNodeCount = result.discoveredNodeCount;
+	view.requiredCellInfoCount = result.requiredCellInfoCount;
+	view.cumulativeCellCount = result.cumulativeCellCount;
+	view.ownerToken = work.ownerToken;
+	view.materializationPlanHash = materializationPlanHash;
+	view.hierarchyAllPassable = result.hierarchyAllPassable != 0;
+	view.status = result.status;
+}
+
+bool BuildOrdinaryPathReferencePlan(const OrdinaryPathBatchWork &batch,
+	const OrdinaryPathRequestWork &work, OrdinaryPathReferenceDetachedOutput &storage,
+	OrdinaryPathReferenceDetachedOperation &operation)
+{
+	const DeterministicPathSearchResult &result = operation.result;
+	if (result.status != DETERMINISTIC_PATH_FOUND)
+	{
+		// The detached vectors are sized from the production result before the
+		// serial clock starts.  Refuse a divergent count rather than allowing a
+		// malformed non-found result to make the canonical writer read beyond
+		// detached storage.
+		if (result.pointCount > operation.points.size() ||
+			result.passableBlockCount > operation.passableBlocks.size())
+			return false;
+		operation.points.resize(result.pointCount);
+		operation.passableBlocks.resize(result.passableBlockCount);
+		operation.allocationOrder.clear();
+		operation.cleanupOrder.clear();
+		SetOrdinaryPathReferenceResultView(operation.view, result, work,
+			operation.points, operation.allocationOrder, operation.cleanupOrder,
+			operation.passableBlocks, 0);
+		return true;
+	}
+	if (batch.grid.width == 0 || batch.grid.height == 0 ||
+		batch.grid.width > std::numeric_limits<std::size_t>::max() /
+			batch.grid.height)
+		return false;
+	const std::size_t cellCount = static_cast<std::size_t>(batch.grid.width) *
+		batch.grid.height;
+	if (cellCount != storage.nodes.size() || cellCount != batch.cells.size())
+		return false;
+	const std::int64_t startX = work.request.startX;
+	const std::int64_t startY = work.request.startY;
+	const std::int64_t goalX = work.request.goalX;
+	const std::int64_t goalY = work.request.goalY;
+	const std::int64_t originX = batch.grid.originX;
+	const std::int64_t originY = batch.grid.originY;
+	if (startX < originX || startY < originY || goalX < originX ||
+		goalY < originY || static_cast<std::uint64_t>(startX - originX) >=
+			batch.grid.width || static_cast<std::uint64_t>(startY - originY) >=
+			batch.grid.height || static_cast<std::uint64_t>(goalX - originX) >=
+			batch.grid.width || static_cast<std::uint64_t>(goalY - originY) >=
+			batch.grid.height)
+		return false;
+	const std::uint32_t startIndex = static_cast<std::uint32_t>(
+		(static_cast<std::uint64_t>(startY - originY) * batch.grid.width) +
+		static_cast<std::uint64_t>(startX - originX));
+	const std::uint32_t goalIndex = static_cast<std::uint32_t>(
+		(static_cast<std::uint64_t>(goalY - originY) * batch.grid.width) +
+		static_cast<std::uint64_t>(goalX - originX));
+	if (storage.discovered.size() < cellCount || storage.open.size() < cellCount ||
+		storage.closed.size() < cellCount ||
+		operation.allocationOrder.size() > cellCount ||
+		operation.cleanupOrder.size() > cellCount)
+		return false;
+	std::size_t discoveredCount = 0;
+	std::size_t openCount = 0;
+	std::size_t closedCount = 0;
+	for (std::size_t index = 0; index < cellCount; ++index)
+	{
+		const DeterministicPathSearchNode &node = storage.nodes[index];
+		if (node.pathCost == std::numeric_limits<std::uint32_t>::max())
+			continue;
+		storage.discovered[discoveredCount++] = static_cast<std::uint32_t>(index);
+		if (node.state == DETERMINISTIC_PATH_NODE_OPEN)
+			storage.open[openCount++] = static_cast<std::uint32_t>(index);
+		else if (node.state == DETERMINISTIC_PATH_NODE_CLOSED)
+			storage.closed[closedCount++] = static_cast<std::uint32_t>(index);
+	}
+	if (discoveredCount != result.discoveredNodeCount ||
+		openCount + closedCount != result.cumulativeCellCount)
+		return false;
+	std::sort(storage.discovered.begin(),
+		storage.discovered.begin() + discoveredCount,
+		[&](std::uint32_t left, std::uint32_t right)
+		{
+			return storage.nodes[left].discoveryOrdinal <
+				storage.nodes[right].discoveryOrdinal;
+		});
+	std::sort(storage.open.begin(), storage.open.begin() + openCount,
+		[&](std::uint32_t left, std::uint32_t right)
+		{
+			const DeterministicPathSearchNode &leftNode = storage.nodes[left];
+			const DeterministicPathSearchNode &rightNode = storage.nodes[right];
+			if (leftNode.estimatedTotalCost != rightNode.estimatedTotalCost)
+				return leftNode.estimatedTotalCost < rightNode.estimatedTotalCost;
+			return leftNode.insertionOrdinal < rightNode.insertionOrdinal;
+		});
+	std::sort(storage.closed.begin(), storage.closed.begin() + closedCount,
+		[&](std::uint32_t left, std::uint32_t right)
+		{
+			return storage.nodes[left].closeOrdinal >
+				storage.nodes[right].closeOrdinal;
+		});
+
+	std::size_t expectedAllocationCount = 0;
+	if (!hasInitialCellInfo(batch, goalIndex)) ++expectedAllocationCount;
+	if (startIndex != goalIndex && !hasInitialCellInfo(batch, startIndex))
+		++expectedAllocationCount;
+	for (std::size_t index = 0; index < discoveredCount; ++index)
+	{
+		const std::uint32_t cellIndex = storage.discovered[index];
+		if (cellIndex != startIndex && cellIndex != goalIndex &&
+			!hasInitialCellInfo(batch, cellIndex))
+			++expectedAllocationCount;
+	}
+	if (expectedAllocationCount != result.requiredCellInfoCount ||
+		expectedAllocationCount != operation.allocationOrder.size() ||
+		openCount + closedCount != operation.cleanupOrder.size() ||
+		result.passableBlockCount > operation.passableBlocks.size() ||
+		result.pointCount > operation.points.size())
+		return false;
+	std::size_t allocationIndex = 0;
+	if (!hasInitialCellInfo(batch, goalIndex))
+		operation.allocationOrder[allocationIndex++] = goalIndex;
+	if (startIndex != goalIndex && !hasInitialCellInfo(batch, startIndex))
+		operation.allocationOrder[allocationIndex++] = startIndex;
+	for (std::size_t index = 0; index < discoveredCount; ++index)
+	{
+		const std::uint32_t cellIndex = storage.discovered[index];
+		if (cellIndex != startIndex && cellIndex != goalIndex &&
+			!hasInitialCellInfo(batch, cellIndex))
+			operation.allocationOrder[allocationIndex++] = cellIndex;
+	}
+	for (std::size_t index = 0; index < openCount; ++index)
+		operation.cleanupOrder[index] = storage.open[index];
+	for (std::size_t index = 0; index < closedCount; ++index)
+		operation.cleanupOrder[openCount + index] = storage.closed[index];
+	for (std::size_t index = 0; index < result.passableBlockCount; ++index)
+		operation.passableBlocks[index] = result.passableBlockIndices[index];
+	operation.passableBlocks.resize(result.passableBlockCount);
+	operation.materializationPlanHash = ComputeDeterministicOrdinaryPathPlanHash(
+		operation.points.data(), result.pointCount,
+		operation.allocationOrder.data(), operation.allocationOrder.size(),
+		operation.cleanupOrder.data(), operation.cleanupOrder.size(),
+		operation.passableBlocks.data(), operation.passableBlocks.size(),
+		result.hierarchyAllPassable != 0, result.snapshotGeneration,
+		work.request.objectId, work.ownerToken);
+	if (operation.materializationPlanHash == 0)
+		return false;
+	SetOrdinaryPathReferenceResultView(operation.view, result, work,
+			operation.points, operation.allocationOrder, operation.cleanupOrder,
+			operation.passableBlocks, operation.materializationPlanHash);
+	return true;
+}
+
+bool SerialComputeOrdinaryPathReference(const void *immutableInput,
+	void *detachedSerialOutput)
+{
+	const OrdinaryPathReferenceInput &input =
+		*static_cast<const OrdinaryPathReferenceInput *>(immutableInput);
+	OrdinaryPathReferenceOutputView &view =
+		*static_cast<OrdinaryPathReferenceOutputView *>(detachedSerialOutput);
+	if (view.detachedStorage == nullptr)
+		return false;
+	OrdinaryPathReferenceDetachedOutput &detached =
+		*static_cast<OrdinaryPathReferenceDetachedOutput *>(
+			const_cast<void *>(view.detachedStorage));
+	if (input.batch == nullptr || input.requestCount == 0 ||
+		input.requestCount != detached.operations.size() ||
+		input.requestCount != detached.results.size())
+		return false;
+	detached.count = input.requestCount;
+	detached.view.count = input.requestCount;
+	for (std::size_t index = 0; index < input.requestCount; ++index)
+	{
+		OrdinaryPathReferenceDetachedOperation &operation =
+			detached.operations[index];
+		operation.result = {};
+		operation.result.points = operation.points.empty() ? nullptr :
+			operation.points.data();
+		operation.result.pointCapacity = operation.points.size();
+		operation.result.passableBlockIndices =
+			operation.passableBlocks.empty() ? nullptr :
+			operation.passableBlocks.data();
+		operation.result.passableBlockCapacity = operation.passableBlocks.size();
+		DeterministicPathSearchScratch scratch = {
+			detached.nodes.data(), detached.nodes.size(), detached.heap.data(),
+			detached.heap.size(), detached.hierarchyPassable.data(),
+			detached.hierarchyPassable.size()
+		};
+		FindDeterministicPath(input.batch->grid,
+			input.batch->requests[index].request, scratch, operation.result);
+		if (!BuildOrdinaryPathReferencePlan(*input.batch,
+			input.batch->requests[index], detached, operation))
+			return false;
+		detached.results[index] = operation.view;
+	}
+	return true;
+}
+
+bool PrepareOrdinaryPathReferenceBundle(const OrdinaryPathBatchWork &batch,
+	std::size_t requestCount, performance::KernelPerformanceReferenceMode mode,
+	OrdinaryPathReferenceBundle &bundle)
+{
+	if (requestCount == 0 || requestCount != batch.requestCount ||
+		batch.grid.cells == nullptr || batch.grid.width == 0 ||
+		batch.grid.height == 0 || batch.grid.width >
+		std::numeric_limits<std::size_t>::max() / batch.grid.height)
+		return false;
+	const std::size_t cellCount = static_cast<std::size_t>(batch.grid.width) *
+		batch.grid.height;
+	const std::size_t hierarchyBlockWidth =
+		(static_cast<std::size_t>(batch.grid.width) + 9U) / 10U;
+	const std::size_t hierarchyBlockHeight =
+		(static_cast<std::size_t>(batch.grid.height) + 9U) / 10U;
+	if (hierarchyBlockWidth == 0 || hierarchyBlockHeight == 0 ||
+		hierarchyBlockWidth > std::numeric_limits<std::size_t>::max() /
+			hierarchyBlockHeight)
+		return false;
+	const std::size_t hierarchyBlockCount = hierarchyBlockWidth *
+		hierarchyBlockHeight;
+	bundle.input.batch = &batch;
+	bundle.input.requestCount = requestCount;
+	bundle.input.cellCount = cellCount;
+	bundle.input.hierarchyBlockCount = hierarchyBlockCount;
+	bundle.productionResults.resize(requestCount);
+	for (std::size_t index = 0; index < requestCount; ++index)
+	{
+		const OrdinaryPathRequestWork &work = batch.requests[index];
+		const DeterministicPathSearchResult &result = work.result;
+		const std::uint64_t planHash = result.status ==
+			DETERMINISTIC_PATH_FOUND ? ComputeDeterministicOrdinaryPathPlanHash(
+			work.points.empty() ? nullptr : work.points.data(), work.points.size(),
+			work.allocationOrder.empty() ? nullptr : work.allocationOrder.data(),
+			work.allocationOrder.size(),
+			work.cleanupOrder.empty() ? nullptr : work.cleanupOrder.data(),
+			work.cleanupOrder.size(),
+			work.passableBlocks.empty() ? nullptr : work.passableBlocks.data(),
+			work.passableBlocks.size(), result.hierarchyAllPassable != 0,
+			result.snapshotGeneration, work.request.objectId, work.ownerToken) : 0;
+		if (result.status == DETERMINISTIC_PATH_FOUND && planHash == 0)
+			return false;
+		SetOrdinaryPathReferenceResultView(bundle.productionResults[index],
+			result, work, work.points, work.allocationOrder, work.cleanupOrder,
+			work.passableBlocks, planHash);
+	}
+	bundle.production.results = bundle.productionResults.data();
+	bundle.production.count = requestCount;
+	bundle.production.detachedStorage = nullptr;
+	if (mode != performance::KERNEL_REFERENCE_SERIAL_ORACLE)
+		return true;
+	try
+	{
+		bundle.detached.reset(new OrdinaryPathReferenceDetachedOutput());
+		OrdinaryPathReferenceDetachedOutput &detached = *bundle.detached;
+		detached.results.resize(requestCount);
+		detached.operations.resize(requestCount);
+		detached.nodes.resize(cellCount);
+		detached.heap.resize(cellCount);
+		detached.hierarchyPassable.resize(hierarchyBlockCount);
+		detached.discovered.resize(cellCount);
+		detached.open.resize(cellCount);
+		detached.closed.resize(cellCount);
+		for (std::size_t index = 0; index < requestCount; ++index)
+		{
+			OrdinaryPathReferenceDetachedOperation &operation =
+				detached.operations[index];
+			const OrdinaryPathReferenceResultView &production =
+				bundle.productionResults[index];
+			operation.points.resize(production.pointCount);
+			operation.passableBlocks.resize(production.passableBlockCount);
+			operation.allocationOrder.resize(production.allocationCount);
+			operation.cleanupOrder.resize(production.cleanupCount);
+		}
+	}
+	catch (...)
+	{
+		return false;
+	}
+	bundle.detached->view.results = bundle.detached->results.data();
+	bundle.detached->view.count = requestCount;
+	return true;
+}
+
+void ObserveOrdinaryPathReference(const OrdinaryPathBatchWork &batch,
+	std::size_t requestCount, performance::KernelPerformanceBatch *timingBatch,
+	performance::KernelPerformanceReferenceLedger *referenceLedger,
+	performance::KernelPerformanceReferenceBatch *referenceBatch)
+{
+	if (referenceBatch == nullptr)
+		return;
+	*referenceBatch = performance::KernelPerformanceReferenceBatch();
+	if (timingBatch == nullptr || referenceLedger == nullptr ||
+		!timingBatch->valid())
+		return;
+	const performance::KernelPerformanceReferenceMode mode =
+		referenceLedger->mode();
+	if (mode == performance::KERNEL_REFERENCE_DISABLED)
+		return;
+	performance::KernelPerformanceBatchIdentity identity;
+	if (!performance::KernelPerformanceLedger::instance().describeBatch(
+		*timingBatch, identity) || identity.kernel !=
+		performance::KERNEL_PERFORMANCE_PATH || identity.subtype != 0)
+		return;
+	OrdinaryPathReferenceBundle bundle;
+	try
+	{
+		if (!PrepareOrdinaryPathReferenceBundle(batch, requestCount, mode,
+			bundle))
+			return;
+	}
+	catch (...)
+	{
+		return;
+	}
+	*referenceBatch = referenceLedger->observeValidatedBatch(
+		performance::KERNEL_PERFORMANCE_PATH, identity.subtype, identity.frame,
+		identity.ordinal, 1, static_cast<rts::JobMetricCounter>(requestCount),
+		WriteOrdinaryPathReferenceInput, &bundle.input,
+		WriteOrdinaryPathReferenceOutput, &bundle.production,
+		mode == performance::KERNEL_REFERENCE_SERIAL_ORACLE ?
+			SerialComputeOrdinaryPathReference : nullptr,
+		mode == performance::KERNEL_REFERENCE_SERIAL_ORACLE ?
+			static_cast<void *>(&bundle.detached->view) : nullptr);
+}
+#endif
 
 bool buildOrdinaryPathMaterializationPlan(OrdinaryPathBatchWork &batch,
 	OrdinaryPathRangeWork &range, OrdinaryPathRequestWork &work)
@@ -1095,8 +1933,18 @@ DeterministicOrdinaryPathBatch::~DeterministicOrdinaryPathBatch()
 bool DeterministicOrdinaryPathBatch::executeSynchronously(JobSystem &jobs,
 	const ImmutableNavigationGrid &grid,
 	const DeterministicOrdinaryPathBatchRequest *requests,
-	std::size_t requestCount, unsigned workerWaitTimeoutMilliseconds)
+	std::size_t requestCount, unsigned workerWaitTimeoutMilliseconds
+#if defined(_WIN64)
+	, performance::KernelPerformanceBatch *performanceBatch
+	, performance::KernelPerformanceReferenceLedger *performanceReferenceLedger
+	, performance::KernelPerformanceReferenceBatch *performanceReferenceBatch
+#endif
+	)
 {
+	#if defined(_WIN64)
+	if (performanceReferenceBatch != nullptr)
+		*performanceReferenceBatch = performance::KernelPerformanceReferenceBatch();
+	#endif
 	if (m_state == nullptr)
 		return false;
 	m_state->work.reset();
@@ -1177,6 +2025,10 @@ bool DeterministicOrdinaryPathBatch::executeSynchronously(JobSystem &jobs,
 	{
 		return false;
 	}
+	#if defined(_WIN64)
+	PathPerformanceInterval capture(performanceBatch,
+		performance::KERNEL_PERFORMANCE_CAPTURE);
+	#endif
 	try
 	{
 		m_state->work = std::make_shared<OrdinaryPathBatchWork>();
@@ -1221,6 +2073,11 @@ bool DeterministicOrdinaryPathBatch::executeSynchronously(JobSystem &jobs,
 		m_state->work.reset();
 		return false;
 	}
+	#if defined(_WIN64)
+	capture.end();
+	PathPerformanceInterval schedule(performanceBatch,
+		performance::KERNEL_PERFORMANCE_SCHEDULE);
+	#endif
 
 	const JobGroup group = jobs.createGroup();
 	if (!group.isValid())
@@ -1258,6 +2115,11 @@ bool DeterministicOrdinaryPathBatch::executeSynchronously(JobSystem &jobs,
 		return false;
 	}
 	m_state->submittedRangeJobCount = rangeCount;
+	#if defined(_WIN64)
+	schedule.end();
+	PathPerformanceInterval wait(performanceBatch,
+		performance::KERNEL_PERFORMANCE_WAIT);
+	#endif
 
 	#if defined(RTS_BUILD_CORE_EXTRAS)
 	if ((s_directPathTestPauseMask.load(std::memory_order_acquire) &
@@ -1307,10 +2169,17 @@ bool DeterministicOrdinaryPathBatch::executeSynchronously(JobSystem &jobs,
 	}
 
 	const bool joined = jobs.wait(group);
+	#if defined(_WIN64)
+	wait.end();
+	#endif
 	releaseOrdinaryPathActiveSlot(batch);
 	m_state->completed = joined && !group.failed() && !group.wasCancelled();
 	if (!m_state->completed)
 		return false;
+	#if defined(_WIN64)
+	PathPerformanceInterval validate(performanceBatch,
+		performance::KERNEL_PERFORMANCE_VALIDATE);
+	#endif
 	for (unsigned i = 0; i < rangeCount; ++i)
 	{
 		if (!handles[i].succeeded() ||
@@ -1321,6 +2190,10 @@ bool DeterministicOrdinaryPathBatch::executeSynchronously(JobSystem &jobs,
 			return false;
 		}
 	}
+	#if defined(_WIN64)
+	ObserveOrdinaryPathReference(batch, requestCount, performanceBatch,
+		performanceReferenceLedger, performanceReferenceBatch);
+	#endif
 	return true;
 }
 

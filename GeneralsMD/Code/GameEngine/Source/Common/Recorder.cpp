@@ -53,6 +53,7 @@
 
 #if defined(_WIN64)
 #include "Lib/RuntimeEpochContract.h"
+#include "Lib/ReplayPathContract.h"
 #include "Lib/ReplayCommandContract.h"
 #include <array>
 #include <cstdint>
@@ -1543,7 +1544,23 @@ void RecorderClass::writeArgument(GameMessageArgumentDataType type, const GameMe
 Bool RecorderClass::readReplayHeader(ReplayHeader& header)
 {
 	AsciiString filepath = getReplayDir();
-	filepath.concat(header.filename.str());
+#if defined(_WIN64)
+	if (header.forPlayback && TheGlobalData != 0 && TheGlobalData->m_headless)
+	{
+		char resolvedPath[MAX_PATH];
+		if (!rts::replay::ResolveReplayPlaybackPath(filepath.str(),
+			header.filename.str(), true, resolvedPath, sizeof(resolvedPath)))
+		{
+			DEBUG_LOG(("Invalid native headless replay path: %s", header.filename.str()));
+			return FALSE;
+		}
+		filepath = resolvedPath;
+	}
+	else
+#endif
+	{
+		filepath.concat(header.filename.str());
+	}
 
 	// TheSuperHackers @performance More buffered data reduces disk overhead and will improve fast forward playback
 	const UnsignedInt buffersize = header.forPlayback ? replayBufferBytes : File::BUFFERSIZE;

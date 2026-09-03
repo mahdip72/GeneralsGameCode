@@ -11,6 +11,10 @@
 #pragma once
 
 #include "Lib/DeterministicPathSearch.h"
+#if defined(_WIN64)
+#include "Lib/KernelPerformanceDiagnostics.h"
+#include "Lib/KernelPerformanceReference.h"
+#endif
 
 #include <cstddef>
 
@@ -73,7 +77,13 @@ public:
 	bool executeSynchronously(JobSystem &jobs,
 		const DirectPathSnapshot *snapshots,
 		std::size_t requestCount,
-		unsigned workerWaitTimeoutMilliseconds = 50);
+		unsigned workerWaitTimeoutMilliseconds = 50
+#if defined(_WIN64)
+		, performance::KernelPerformanceBatch *performanceBatch = nullptr
+		, performance::KernelPerformanceReferenceLedger *performanceReferenceLedger = nullptr
+		, performance::KernelPerformanceReferenceBatch *performanceReferenceBatch = nullptr
+#endif
+		);
 	DeterministicDirectPathBatchExecutionSnapshot executionSnapshot() const;
 	DeterministicDirectPathExecutionSnapshot requestExecutionSnapshot(
 		std::size_t requestIndex) const;
@@ -169,7 +179,13 @@ public:
 		const ImmutableNavigationGrid &grid,
 		const DeterministicOrdinaryPathBatchRequest *requests,
 		std::size_t requestCount,
-		unsigned workerWaitTimeoutMilliseconds = 50);
+		unsigned workerWaitTimeoutMilliseconds = 50
+#if defined(_WIN64)
+		, performance::KernelPerformanceBatch *performanceBatch = nullptr
+		, performance::KernelPerformanceReferenceLedger *performanceReferenceLedger = nullptr
+		, performance::KernelPerformanceReferenceBatch *performanceReferenceBatch = nullptr
+#endif
+		);
 	DeterministicOrdinaryPathBatchExecutionSnapshot executionSnapshot() const;
 	DeterministicDirectPathExecutionSnapshot requestExecutionSnapshot(
 		std::size_t requestIndex) const;

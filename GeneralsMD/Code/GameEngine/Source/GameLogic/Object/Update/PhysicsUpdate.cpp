@@ -847,23 +847,39 @@ Bool PhysicsBehavior::computeIntegrationPrefixSerialOracle(
 DECLARE_PERF_TIMER(PhysicsBehavior)
 UpdateSleepTime PhysicsBehavior::update()
 {
-	return updateImpl(nullptr, nullptr, 0, nullptr);
+	return updateImpl(nullptr, nullptr, 0, nullptr
+#if defined(_WIN64)
+		, nullptr
+#endif
+		);
 }
 
 UpdateSleepTime PhysicsBehavior::updateFromPreparedIntegrationPrefix(
 	const rts::PhysicsIntegrationSnapshot &snapshot,
 	const rts::PhysicsIntegrationOutput &output,
 	rts::PhysicsIntegrationMetricCounter commitStart,
-	rts::PhysicsIntegrationMetricCounter &commitNanoseconds)
+	rts::PhysicsIntegrationMetricCounter &commitNanoseconds
+#if defined(_WIN64)
+	, const rts::performance::KernelPerformanceBatch *performanceBatch
+#endif
+	)
 {
-	return updateImpl(&snapshot, &output, commitStart, &commitNanoseconds);
+	return updateImpl(&snapshot, &output, commitStart, &commitNanoseconds
+#if defined(_WIN64)
+		, performanceBatch
+#endif
+		);
 }
 
 UpdateSleepTime PhysicsBehavior::updateImpl(
 	const rts::PhysicsIntegrationSnapshot *snapshot,
 	const rts::PhysicsIntegrationOutput *output,
 	rts::PhysicsIntegrationMetricCounter commitStart,
-	rts::PhysicsIntegrationMetricCounter *commitNanoseconds)
+	rts::PhysicsIntegrationMetricCounter *commitNanoseconds
+#if defined(_WIN64)
+	, const rts::performance::KernelPerformanceBatch *performanceBatch
+#endif
+	)
 {
 	USE_PERF_TIMER(PhysicsBehavior)
 
@@ -899,6 +915,17 @@ UpdateSleepTime PhysicsBehavior::updateImpl(
 		Real oldPosZ = mtx.Get_Z_Translation();
 		if (usePrepared)
 		{
+#if defined(_WIN64)
+			const rts::performance::KernelPerformanceBatch preparedBatch =
+				performanceBatch != nullptr ? *performanceBatch :
+				rts::performance::KernelPerformanceBatch();
+			rts::performance::KernelPerformanceLedger *performanceLedger =
+				preparedBatch.valid() ?
+				&rts::performance::KernelPerformanceLedger::instance() : 0;
+			rts::performance::KernelPerformanceScope commitScope(
+				performanceLedger, preparedBatch,
+				rts::performance::KERNEL_PERFORMANCE_COMMIT);
+#endif
 			for (unsigned row = 0; row != 3; ++row)
 				for (unsigned column = 0; column != 4; ++column)
 					mtx[row][column] = output->matrix[row * 4 + column];

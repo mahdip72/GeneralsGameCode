@@ -6,7 +6,7 @@
   "additionalProperties": false,
   "required": ["schemaVersion", "evidenceKind", "status", "sourceCommit", "artifactSetSha256", "title", "executableSha256", "stage3BaselineSha256", "measurementMode", "installedRuntime", "rawSampleManifest", "topology", "selectedLanes", "oneWorkerPhases", "amdahl", "kernelTimings", "fixtures"],
   "properties": {
-    "schemaVersion": { "const": 1 },
+    "schemaVersion": { "const": 2 },
     "evidenceKind": { "const": "stage5-performance-scaling" },
     "status": { "const": "passed" },
     "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
@@ -28,7 +28,7 @@
       }
     },
     "selectedLanes": { "type": "array", "minItems": 3, "maxItems": 3, "items": { "$ref": "#/$defs/lane" } },
-    "oneWorkerPhases": { "type": "array", "minItems": 7, "maxItems": 7, "items": { "$ref": "#/$defs/phase" } },
+    "oneWorkerPhases": { "type": "array", "minItems": 5, "maxItems": 5, "items": { "$ref": "#/$defs/phase" } },
     "amdahl": {
       "type": "object", "additionalProperties": false,
       "required": ["totalOneWorkerMilliseconds", "totalSerialMilliseconds", "serialFraction", "maximumSpeedup", "reachesTwoX"],
@@ -66,16 +66,17 @@
     },
     "phase": {
       "type": "object", "additionalProperties": false,
-      "required": ["name", "elapsedMilliseconds", "serialMilliseconds"],
+      "required": ["name", "elapsedMilliseconds", "serialMilliseconds", "serialMillisecondsKnown"],
       "properties": {
-        "name": { "enum": ["owner-intake", "world-queries", "pathfinding", "object-computation", "spatial-work", "deterministic-commit", "verification-publication"] },
+        "name": { "enum": ["owner-intake", "legacy-mutable-island", "spatial-work", "owner-tail", "verification-publication"] },
         "elapsedMilliseconds": { "type": "number", "exclusiveMinimum": 0 },
-        "serialMilliseconds": { "type": "number", "minimum": 0 }
+        "serialMilliseconds": { "type": "number", "minimum": 0 },
+        "serialMillisecondsKnown": { "const": true }
       }
     },
     "kernel": {
       "type": "object", "additionalProperties": false,
-      "required": ["name", "admittedSlices", "captureMilliseconds", "scheduleMilliseconds", "waitMilliseconds", "validateMilliseconds", "commitMilliseconds", "totalParallelMilliseconds", "exactSerialOperationMilliseconds", "netSpeedup"],
+      "required": ["name", "admittedSlices", "captureMilliseconds", "scheduleMilliseconds", "waitMilliseconds", "validateMilliseconds", "commitMilliseconds", "totalParallelMilliseconds", "exactSerialOperationMilliseconds", "exactSerialOperationMillisecondsKnown", "timingAttribution", "netSpeedup"],
       "properties": {
         "name": { "enum": ["physics", "status", "collision", "ai-planning", "spatial", "path"] },
         "admittedSlices": { "type": "integer", "minimum": 1 },
@@ -86,16 +87,20 @@
         "commitMilliseconds": { "type": "number", "minimum": 0 },
         "totalParallelMilliseconds": { "type": "number", "exclusiveMinimum": 0 },
         "exactSerialOperationMilliseconds": { "type": "number", "exclusiveMinimum": 0 },
+        "exactSerialOperationMillisecondsKnown": { "const": true },
+        "timingAttribution": { "const": "owner-stack-exclusive-v1" },
         "netSpeedup": { "type": "number", "exclusiveMinimum": 1 }
       }
     },
     "fixture": {
       "type": "object", "additionalProperties": false,
-      "required": ["name", "playerCount", "peakUnitCount", "repeats", "stage3OneWorkerMilliseconds", "stage5OneWorkerMilliseconds", "eightPhysicalCoreMilliseconds", "sixteenPhysicalCoreMilliseconds", "oneWorkerRegressionRatio", "eightPhysicalCoreSpeedup", "eightToSixteenSpeedup"],
+      "required": ["name", "playerCount", "peakUnitCount", "requestedMinimumUnitCount", "minimumInitialUnitCount", "repeats", "stage3OneWorkerMilliseconds", "stage5OneWorkerMilliseconds", "eightPhysicalCoreMilliseconds", "sixteenPhysicalCoreMilliseconds", "oneWorkerRegressionRatio", "eightPhysicalCoreSpeedup", "eightToSixteenSpeedup"],
       "properties": {
         "name": { "enum": ["one-thousand-units", "four-thousand-units", "eight-thousand-units", "dense-eight-player"] },
         "playerCount": { "const": 8 },
         "peakUnitCount": { "type": "integer", "minimum": 1000 },
+        "requestedMinimumUnitCount": { "type": "integer", "minimum": 1000 },
+        "minimumInitialUnitCount": { "type": "integer", "minimum": 1000 },
         "repeats": { "type": "integer", "minimum": 3 },
         "stage3OneWorkerMilliseconds": { "type": "number", "exclusiveMinimum": 0 },
         "stage5OneWorkerMilliseconds": { "type": "number", "exclusiveMinimum": 0 },

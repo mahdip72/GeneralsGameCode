@@ -6,6 +6,11 @@
 #include "Lib/PhysicsIntegrationKernel.h"
 #include "Lib/JobFloatingPointState.h"
 #include "Lib/JobSystem.h"
+#if defined(_WIN64)
+#include "Lib/KernelPerformanceDiagnostics.h"
+#include "Lib/KernelPerformanceReference.h"
+#endif
+#include "../TestSupport/LocalCapacityTestLane.h"
 
 #include <assert.h>
 #include <float.h>
@@ -692,16 +697,24 @@ void RunWorkerCount(unsigned workerCount)
 	assert(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME));
 }
 
-void TestWorkerCountsAndOwnerFloatingPointState()
+void TestWorkerCountsAndOwnerFloatingPointState(bool localCapacity)
 {
 	const unsigned counts[] = { 1, 2, 4, 8, 16 };
 	for (unsigned index = 0; index != sizeof(counts) / sizeof(counts[0]); ++index)
-		RunWorkerCount(counts[index]);
+	{
+		const unsigned requestedWorkerCount = counts[index];
+		const unsigned workerCount = rts_test::ResolveActualWorkerCount(
+			requestedWorkerCount, localCapacity);
+		rts_test::PrintWorkerCountSubstitution(
+			"Physics integration", requestedWorkerCount, workerCount,
+			localCapacity);
+		RunWorkerCount(workerCount);
+	}
 
 #if defined(_WIN32) && (!defined(_MSC_VER) || _MSC_VER >= 1300)
 	const unsigned savedMxcsr = _mm_getcsr();
 	_mm_setcsr((savedMxcsr & ~_MM_ROUND_MASK) | _MM_ROUND_DOWN);
-	RunWorkerCount(4);
+	RunWorkerCount(rts_test::ResolveActualWorkerCount(4, localCapacity));
 	_mm_setcsr(savedMxcsr);
 #endif
 }
@@ -780,10 +793,20 @@ void RunShadowWorkerCount(unsigned workerCount)
 	assert(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME));
 }
 
-void TestShadowWorkAtTwoAndSixteenWorkers()
+void TestShadowWorkAtTwoAndSixteenWorkers(bool localCapacity)
 {
-	RunShadowWorkerCount(2);
-	RunShadowWorkerCount(16);
+	const unsigned requestedWorkerCounts[] = { 2, 16 };
+	for (unsigned index = 0;
+		index != sizeof(requestedWorkerCounts) / sizeof(requestedWorkerCounts[0]); ++index)
+	{
+		const unsigned requestedWorkerCount = requestedWorkerCounts[index];
+		const unsigned workerCount = rts_test::ResolveActualWorkerCount(
+			requestedWorkerCount, localCapacity);
+		rts_test::PrintWorkerCountSubstitution(
+			"Physics integration shadow", requestedWorkerCount, workerCount,
+			localCapacity);
+		RunShadowWorkerCount(workerCount);
+	}
 }
 
 void ExpectTransactionalFailure(rts::PhysicsIntegrationTestFault fault,
@@ -1167,10 +1190,264 @@ void TestRuntimeMetricsCountOnlyExplicitEvents()
 	assert(afterSecondReset.shadowCompletedJobs == 0);
 	assert(afterSecondReset.unexpectedFallbacks == 0);
 }
+
+#if defined(_WIN64)
+struct KernelPerformanceClock
+{
+	KernelPerformanceClock() : now(1000) {}
+	rts::JobMetricCounter now;
+	static rts::JobMetricCounter read(void *context)
+	{
+		KernelPerformanceClock &clock = *static_cast<KernelPerformanceClock *>(context);
+		clock.now += 10;
+		return clock.now;
+	}
+};
+
+void TestKernelPerformanceTokenReachesPhysicsStages()
+{
+	const unsigned count = 64;
+	std::vector<rts::PhysicsIntegrationSnapshot> snapshots(count);
+	std::vector<rts::PhysicsIntegrationOutput> outputs(count);
+	std::vector<rts::PhysicsIntegrationOutput> scratch(count);
+	for (unsigned index = 0; index != count; ++index)
+		snapshots[index] = MakeSnapshot(index);
+
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 2;
+	config.queueCapacity = 16;
+	config.scratchBytesPerWorker = 64 * 1024;
+	config.pinWorkers = false;
+	assert(jobs.start(config));
+	assert(jobs.registerCurrentThread(rts::JOB_OWNER_GAME));
+
+	KernelPerformanceClock clock;
+	rts::performance::KernelPerformanceLedger &ledger =
+		rts::performance::KernelPerformanceLedger::instance();
+	assert(ledger.beginRun(true, KernelPerformanceClock::read, &clock));
+	const rts::performance::KernelPerformanceBatch token = ledger.beginBatch(
+		rts::performance::KERNEL_PERFORMANCE_PHYSICS, 0, 900, 1);
+	assert(token.valid());
+	{
+		rts::performance::KernelPerformanceScope capture(&ledger, token,
+			rts::performance::KERNEL_PERFORMANCE_CAPTURE);
+		clock.now += 10;
+	}
+
+	rts::PhysicsIntegrationOptions options;
+	options.minimumGrain = 1;
+	options.performanceBatch = token;
+	rts::PhysicsIntegrationMetrics metrics;
+	assert(rts::PreparePhysicsIntegrationPrefixes(&snapshots[0], count,
+		&outputs[0], count, &scratch[0], count, options, &metrics) ==
+		rts::PHYSICS_INTEGRATION_PARALLEL);
+	{
+		rts::performance::KernelPerformanceScope commit(&ledger, token,
+			rts::performance::KERNEL_PERFORMANCE_COMMIT);
+		clock.now += 10;
+	}
+	assert(ledger.endBatch(token,
+		rts::performance::KERNEL_PERFORMANCE_COMMITTED));
+	const rts::performance::KernelPerformanceSnapshot snapshot = ledger.freeze();
+	assert(snapshot.complete && snapshot.streamCount == 1);
+	const rts::performance::KernelPerformanceStream &stream = snapshot.streams[0];
+	assert(stream.kernel == rts::performance::KERNEL_PERFORMANCE_PHYSICS &&
+		stream.subtype == 0 && stream.attemptedBatches == 1 &&
+		stream.admittedBatches == 1 && stream.committedBatches == 1);
+	for (unsigned stage = 0;
+		stage != rts::performance::KERNEL_PERFORMANCE_STAGE_COUNT; ++stage)
+		assert(stream.stageSamples[stage] >= 1 && stream.stageNanoseconds[stage] > 0);
+
+	jobs.shutdown();
+	assert(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME));
 }
 
-int main()
+void TestKernelPerformanceReferenceTransportReachesPhysicsParallelPath()
 {
+	const unsigned count = 64;
+	std::vector<rts::PhysicsIntegrationSnapshot> snapshots(count);
+	std::vector<rts::PhysicsIntegrationOutput> outputs(count);
+	std::vector<rts::PhysicsIntegrationOutput> scratch(count);
+	for (unsigned index = 0; index != count; ++index)
+		snapshots[index] = MakeSnapshot(index);
+
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 2;
+	config.queueCapacity = 16;
+	config.scratchBytesPerWorker = 64 * 1024;
+	config.pinWorkers = false;
+	assert(jobs.start(config));
+	assert(jobs.registerCurrentThread(rts::JOB_OWNER_GAME));
+
+	KernelPerformanceClock timingClock;
+	rts::performance::KernelPerformanceLedger &timingLedger =
+		rts::performance::KernelPerformanceLedger::instance();
+	assert(timingLedger.beginRun(true, KernelPerformanceClock::read,
+		&timingClock));
+	const rts::performance::KernelPerformanceBatch timingBatch =
+		timingLedger.beginBatch(rts::performance::KERNEL_PERFORMANCE_PHYSICS,
+		0, 900, 1);
+	assert(timingBatch.valid());
+	{
+		rts::performance::KernelPerformanceScope capture(&timingLedger,
+			timingBatch, rts::performance::KERNEL_PERFORMANCE_CAPTURE);
+		timingClock.now += 10;
+	}
+
+	KernelPerformanceClock referenceClock;
+	rts::performance::KernelPerformanceReferenceLedger referenceLedger;
+	assert(referenceLedger.beginRun(
+		rts::performance::KERNEL_REFERENCE_THROUGHPUT_BINDING,
+		KernelPerformanceClock::read, &referenceClock));
+	rts::performance::KernelPerformanceReferenceBatch referenceBatch;
+	rts::PhysicsIntegrationOptions options;
+	options.minimumGrain = 1;
+	options.performanceBatch = timingBatch;
+	options.performanceReferenceLedger = &referenceLedger;
+	options.performanceReferenceBatch = &referenceBatch;
+	rts::PhysicsIntegrationMetrics metrics;
+	assert(rts::PreparePhysicsIntegrationPrefixes(&snapshots[0], count,
+		&outputs[0], count, &scratch[0], count, options, &metrics) ==
+		rts::PHYSICS_INTEGRATION_PARALLEL);
+	{
+		rts::performance::KernelPerformanceScope commit(&timingLedger,
+			timingBatch, rts::performance::KERNEL_PERFORMANCE_COMMIT);
+		timingClock.now += 10;
+	}
+	assert(timingLedger.endBatch(timingBatch,
+		rts::performance::KERNEL_PERFORMANCE_COMMITTED));
+	assert(referenceBatch.valid());
+	assert(referenceLedger.finishBatch(referenceBatch, true));
+	const rts::performance::KernelPerformanceReferenceSnapshot reference =
+		referenceLedger.freeze();
+	assert(reference.complete && reference.streamCount == 1);
+	if (reference.streamCount == 1)
+	{
+		const rts::performance::KernelPerformanceReferenceStream &stream =
+			reference.streams[0];
+		assert(stream.kernel == rts::performance::KERNEL_PERFORMANCE_PHYSICS &&
+			stream.subtype == 0 && stream.validatedBatchCount == 1 &&
+			stream.committedBatchCount == 1 &&
+			stream.validatedOperationCount == count &&
+			stream.committedOperationCount == count &&
+			stream.serialSampleCount == 0 &&
+			stream.serialNanoseconds == 0);
+	}
+	assert(referenceClock.now == 1000);
+
+	assert(timingLedger.freeze().complete);
+	jobs.shutdown();
+	assert(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME));
+}
+
+void TestKernelPerformanceReferenceSerialPhysicsUsesDedicatedOutput()
+{
+	const unsigned count = 64;
+	std::vector<rts::PhysicsIntegrationSnapshot> snapshots(count);
+	std::vector<rts::PhysicsIntegrationOutput> outputs(count);
+	std::vector<rts::PhysicsIntegrationOutput> scratch(count);
+	std::vector<rts::PhysicsIntegrationOutput> referenceOutputs(count);
+	std::vector<rts::PhysicsIntegrationOutput> expected(count);
+	for (unsigned index = 0; index != count; ++index)
+	{
+		snapshots[index] = MakeSnapshot(index);
+		assert(rts::ComputePhysicsIntegrationPrefix(snapshots[index],
+			expected[index]));
+	}
+	FillSentinel(referenceOutputs);
+
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 2;
+	config.queueCapacity = 16;
+	config.scratchBytesPerWorker = 64 * 1024;
+	config.pinWorkers = false;
+	assert(jobs.start(config));
+	assert(jobs.registerCurrentThread(rts::JOB_OWNER_GAME));
+
+	KernelPerformanceClock timingClock;
+	rts::performance::KernelPerformanceLedger &timingLedger =
+		rts::performance::KernelPerformanceLedger::instance();
+	assert(timingLedger.beginRun(true, KernelPerformanceClock::read,
+		&timingClock));
+	const rts::performance::KernelPerformanceBatch timingBatch =
+		timingLedger.beginBatch(rts::performance::KERNEL_PERFORMANCE_PHYSICS,
+		0, 900, 1);
+	assert(timingBatch.valid());
+	{
+		rts::performance::KernelPerformanceScope capture(&timingLedger,
+			timingBatch, rts::performance::KERNEL_PERFORMANCE_CAPTURE);
+		timingClock.now += 10;
+	}
+
+	KernelPerformanceClock referenceClock;
+	rts::performance::KernelPerformanceReferenceLedger referenceLedger;
+	assert(referenceLedger.beginRun(
+		rts::performance::KERNEL_REFERENCE_SERIAL_ORACLE,
+		KernelPerformanceClock::read, &referenceClock));
+	rts::performance::KernelPerformanceReferenceBatch referenceBatch;
+	rts::PhysicsIntegrationOptions options;
+	options.minimumGrain = 1;
+	options.performanceBatch = timingBatch;
+	options.performanceReferenceLedger = &referenceLedger;
+	options.performanceReferenceBatch = &referenceBatch;
+	options.performanceReferenceOutput = &referenceOutputs[0];
+	options.performanceReferenceOutputCapacity = count;
+	rts::PhysicsIntegrationMetrics metrics;
+	assert(rts::PreparePhysicsIntegrationPrefixes(&snapshots[0], count,
+		&outputs[0], count, &scratch[0], count, options, &metrics) ==
+		rts::PHYSICS_INTEGRATION_PARALLEL);
+	assert(SameBytes(&outputs[0], &expected[0],
+		count * sizeof(rts::PhysicsIntegrationOutput)));
+	assert(SameBytes(&referenceOutputs[0], &expected[0],
+		count * sizeof(rts::PhysicsIntegrationOutput)));
+	assert(SameBytes(&scratch[0], &expected[0],
+		count * sizeof(rts::PhysicsIntegrationOutput)));
+	{
+		rts::performance::KernelPerformanceScope commit(&timingLedger,
+			timingBatch, rts::performance::KERNEL_PERFORMANCE_COMMIT);
+		timingClock.now += 10;
+	}
+	assert(timingLedger.endBatch(timingBatch,
+		rts::performance::KERNEL_PERFORMANCE_COMMITTED));
+	assert(referenceBatch.valid());
+	assert(referenceLedger.finishBatch(referenceBatch, true));
+	const rts::performance::KernelPerformanceReferenceSnapshot reference =
+		referenceLedger.freeze();
+	assert(reference.complete && reference.streamCount == 1);
+	if (reference.streamCount == 1)
+	{
+		const rts::performance::KernelPerformanceReferenceStream &stream =
+			reference.streams[0];
+		assert(stream.kernel == rts::performance::KERNEL_PERFORMANCE_PHYSICS &&
+			stream.subtype == 0 && stream.validatedBatchCount == 1 &&
+			stream.committedBatchCount == 1 &&
+			stream.validatedOperationCount == count &&
+			stream.committedOperationCount == count &&
+			stream.serialSampleCount == 1 &&
+			stream.serialNanoseconds != 0);
+	}
+	assert(referenceClock.now == 1020);
+
+	assert(timingLedger.freeze().complete);
+	jobs.shutdown();
+	assert(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME));
+}
+#endif
+}
+
+int main(int argc, char **argv)
+{
+	bool localCapacity = false;
+	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity))
+	{
+		fprintf(stderr,
+			"Usage: core_physics_integration_kernel_tests [--local-capacity]\n");
+		return 2;
+	}
+	rts_test::PrintTestCapacityLane(localCapacity);
 #if defined(_MSC_VER)
 	_set_error_mode(_OUT_TO_STDERR);
 #if _MSC_VER >= 1400
@@ -1191,13 +1468,18 @@ int main()
 	TestDampingFlagAndSleepyHeapParity();
 	TestOwnerGenerationAndHeapValidationFields();
 	TestOwnerCommitGateMutationDestructionAndReset();
-	TestWorkerCountsAndOwnerFloatingPointState();
-	TestShadowWorkAtTwoAndSixteenWorkers();
+	TestWorkerCountsAndOwnerFloatingPointState(localCapacity);
+	TestShadowWorkAtTwoAndSixteenWorkers(localCapacity);
 	TestTransactionalFailurePaths();
 	TestBelowGrainSlicesAreNotSchedulerFallbacks();
 	TestPolicyIneligibleIsDistinctFromSafetyFallback();
 	TestInvalidAndNonfiniteInputDoesNotPublish();
 	TestRuntimeMetricsCountOnlyExplicitEvents();
+#if defined(_WIN64)
+	TestKernelPerformanceTokenReachesPhysicsStages();
+	TestKernelPerformanceReferenceTransportReachesPhysicsParallelPath();
+	TestKernelPerformanceReferenceSerialPhysicsUsesDedicatedOutput();
+#endif
 	printf("Physics integration kernel tests passed.\n");
 	return 0;
 }

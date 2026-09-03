@@ -17,15 +17,17 @@
 #endif
 
 #include "Lib/JobSystem.h"
+#include "Lib/KernelPerformanceDiagnostics.h"
+#include "Lib/KernelPerformanceReference.h"
 
 #include <string>
 #include <vector>
 
 namespace rts { namespace performance {
 
-const unsigned PERFORMANCE_RECEIPT_SCHEMA_VERSION = 1;
+const unsigned PERFORMANCE_RECEIPT_SCHEMA_VERSION = 5;
 const char *const PERFORMANCE_RECEIPT_PRODUCER =
-	"game-executable-stage5-performance-report-v2";
+	"game-executable-stage5-performance-report-v5";
 const char *const PERFORMANCE_RECEIPT_EVIDENCE_KIND =
 	"stage5-executable-originated-receipt";
 
@@ -52,7 +54,28 @@ struct PerformanceReceiptPhase
 	JobMetricCounter totalNanoseconds;
 	JobMetricCounter maximumNanoseconds;
 	JobMetricCounter sampleCount;
+	JobMetricCounter serialNanoseconds;
+	bool serialNanosecondsKnown;
 };
+
+// Diagnostics sampled after completed simulation frames, never instantaneous
+// lifecycle counts. Requested workload remains a separate host input.
+struct PerformanceReceiptWorkload
+{
+	PerformanceReceiptWorkload();
+	JobMetricCounter sampleCount;
+	unsigned firstFrame, lastFrame, playerCount;
+	unsigned initialUnitCount, minimumUnitCount, peakUnitCount;
+	bool rosterStable, contiguous;
+};
+
+bool IsPerformanceReceiptRosterPlayer(bool playableSide, bool observer);
+bool IsPerformanceReceiptLiveUnit(bool infantry, bool vehicle,
+	bool effectivelyDead, bool destroyed);
+// Repeated/regressed frames are not new completed-frame observations. This
+// also preserves the last match sample across terminal game-data reset.
+bool ObservePerformanceReceiptWorkload(PerformanceReceiptWorkload &workload,
+	unsigned frame, unsigned playerCount, unsigned liveUnitCount);
 
 struct PerformanceReceiptKernel
 {
@@ -83,6 +106,13 @@ struct PerformanceReceiptRawEvidence
 	std::string rawLogSha256;
 	std::string timingPath;
 	std::string timingSha256;
+	bool timingClosed;
+	bool timingWriteSucceeded;
+	bool timingTruncated;
+	bool timingComplete;
+	unsigned timingSessionCount;
+	JobMetricCounter timingFrameSamples;
+	unsigned timingFirstFrame, timingLastFrame;
 };
 
 struct PerformanceReceipt
@@ -125,14 +155,27 @@ struct PerformanceReceipt
 	std::string processExitBoundary;
 
 	std::string fixtureId;
+	std::string fixtureKind;
+	std::string workloadQualification;
+	std::string fixtureContentPath;
+	bool fixtureIdentityObserved;
+	bool fixtureObservationFailed;
+	// Host expectations are not executable observations and are not serialized.
+	std::string expectedFixtureContentSha256;
+	unsigned expectedSeed;
+	bool expectedSeedKnown;
 	std::string fixtureContentSha256;
 	std::string replayPath;
+	std::string retainedReplayPath;
+	std::string retainedReplaySha256;
 	unsigned seed;
 	bool seedKnown;
-	unsigned playerCount;
-	bool playerCountKnown;
-	unsigned unitCount;
-	bool unitCountKnown;
+	unsigned requestedPlayerCount;
+	unsigned requestedMinimumUnitCount;
+	PerformanceReceiptWorkload workload;
+	JobMetricCounter frameSimulationTotalNanoseconds;
+	JobMetricCounter frameSimulationMaximumNanoseconds;
+	JobMetricCounter frameSimulationSampleCount;
 
 	unsigned frameStart;
 	unsigned frameEnd;
@@ -141,6 +184,8 @@ struct PerformanceReceipt
 	unsigned finalCrc;
 
 	unsigned requestedWorkerCount;
+	std::string simulationMode;
+	bool schedulerStarted;
 	unsigned effectiveWorkerCount;
 	std::string workerPolicy;
 	bool workersPinned;
@@ -157,6 +202,10 @@ struct PerformanceReceipt
 	std::vector<unsigned> selectedWorkerCpuSetIds;
 	std::vector<PerformanceReceiptPhase> phases;
 	std::vector<PerformanceReceiptKernel> kernels;
+	KernelPerformanceSnapshot kernelTiming;
+	// Mode is requested at Begin, then replaced by the actual frozen ledger.
+	// It derives measurementRole; a host label cannot disguise oracle elapsed.
+	KernelPerformanceReferenceSnapshot kernelReference;
 	PerformanceReceiptRawEvidence rawEvidence;
 };
 
@@ -165,6 +214,13 @@ struct PerformanceReceipt
 // run ID, fixture identity, or host evidence.
 bool BeginPerformanceReceipt(PerformanceReceipt &receipt, const char *title,
 	const char *replayPath, unsigned ordinal, std::string *reason = 0);
+
+// The owner supplies a hash read from the actual replay/map content and the
+// seed from the loaded game, not from the host environment. A failed or second
+// binding invalidates publication. Fresh-AI retained replay proof is separate.
+bool BindPerformanceReceiptFixtureObservation(PerformanceReceipt &receipt,
+	const char *kind, const char *contentPath, const char *observedContentSha256,
+	unsigned observedSeed, std::string *reason = 0);
 
 // Copies the immutable CPU-set topology retained by JobSystem after startup
 // and the scheduler counters observed at the completion boundary.

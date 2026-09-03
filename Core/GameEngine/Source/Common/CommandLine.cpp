@@ -31,6 +31,7 @@
 #include "Common/LocalFileSystem.h"
 #include "Common/Recorder.h"
 #include "Common/SkirmishAITestRunner.h"
+#include "Common/Stage5PerformanceFixtureRunner.h"
 #include "GameNetwork/InstalledNet3Validation.h"
 #if defined(_WIN64)
 #include "GameNetwork/InstalledLockstepV2Validation.h"
@@ -688,6 +689,18 @@ Int parsePipelineMode(char *args[], int num)
 		exit(1);
 	}
 	return 2;
+}
+
+Int parseRunStage5PerformanceFixtureForStartup(char *args[], int num)
+{
+	// The whole-command-line preflight has already validated map, seed, budget,
+	// explicit headless opt-in, and all incompatible execution lanes.
+	parseHeadless(args, num);
+	TheWritableGlobalData->m_shellMapOn = FALSE;
+	TheWritableGlobalData->m_useFpsLimit = FALSE;
+	rts::ClientInstance::setMultiInstance(TRUE);
+	rts::ClientInstance::skipPrimaryInstance();
+	return 4;
 }
 
 Int parseRunSkirmishAITestPractical1v7(char *args[], int num)
@@ -1465,6 +1478,7 @@ static CommandLineParam paramsForStartup[] =
 	// This runs the game without a window, graphics, input and audio. You can combine this with -replay
 	{ "-headless", parseHeadless },
 	{ "-runSkirmishAITest", parseRunSkirmishAITestForStartup },
+	{ "-runStage5PerformanceFixture", parseRunStage5PerformanceFixtureForStartup },
 	// Explicit test-only 4v2 variant; the existing option remains 4v3.
 	{ "-runSkirmishAITest4v2", parseRunSkirmishAITest4v2ForStartup },
 	{ "-runSkirmishAITestPractical1v7",
@@ -1731,6 +1745,30 @@ static void parseCommandLine(const CommandLineParam* params, int numParams)
 		token = nextParam(nullptr, "\" ");
 	}
 	int argc = argv.size();
+	// Reject mixed modes before an installed-validation handler can execute or
+	// exit. This is intentionally independent of argument order and parser pass.
+	rts::fixture::Request fixtureRequest;
+	const char *fixtureError = nullptr;
+	Bool nativeFixtureSupported = FALSE;
+#if defined(_WIN64)
+	nativeFixtureSupported = TRUE;
+#endif
+	if (!rts::fixture::ParseCommandLine(argc, argv.empty() ? nullptr : &argv[0],
+		nativeFixtureSupported != FALSE, &fixtureRequest, &fixtureError))
+	{
+		printf("STAGE5_PERFORMANCE_FIXTURE_FAIL reason=%s\n", fixtureError ? fixtureError : "invalid_arguments");
+		fflush(stdout);
+		exit(2);
+	}
+#if defined(_WIN64)
+	if (params == paramsForStartup && fixtureRequest.requested &&
+		!ConfigureStage5PerformanceFixture(fixtureRequest))
+	{
+		printf("STAGE5_PERFORMANCE_FIXTURE_FAIL reason=duplicate_configuration\n");
+		fflush(stdout);
+		exit(2);
+	}
+#endif
 
 	int arg = 1;
 

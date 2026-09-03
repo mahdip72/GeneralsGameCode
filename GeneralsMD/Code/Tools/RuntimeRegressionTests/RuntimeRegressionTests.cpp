@@ -18,6 +18,7 @@
 #include "Common/GameMemory.h"
 #include "Common/GlobalData.h"
 #include "Common/SkirmishAITestRunner.h"
+#include "Common/PerformanceReceiptRuntime.h"
 #include "Common/SkirmishAIReplayEpoch.h"
 #include "Common/PathfindQueueReplayEpoch.h"
 #include "GameLogic/AIPathfind.h"
@@ -84,6 +85,88 @@ static void Check(Bool result, const char *expression, Int line)
 		++s_failures;
 	}
 }
+
+#if defined(_WIN64)
+static void TestPerformanceReceiptOwnerLifecycle()
+{
+	PerformanceReceiptOwnerLifecycle idle;
+	CHECK(!idle.begun() && !idle.finalized() && !idle.terminalResultKnown());
+	CHECK(!idle.observeCompletedFrame(1));
+	CHECK(!idle.captureTerminalResult(1, 0x12345678U));
+	CHECK(!idle.finish(0, 0));
+
+	PerformanceReceiptOwnerLifecycle complete;
+	CHECK(complete.begin());
+	CHECK(complete.begun() && !complete.begin());
+	CHECK(!complete.observeCompletedFrame(0));
+	CHECK(complete.observeCompletedFrame(1));
+	CHECK(!complete.observeCompletedFrame(1));
+	CHECK(complete.observeCompletedFrame(2));
+	// The fresh-match victory event is frame 2; its real owner CRC was
+	// computed at frame 3 before that completed-frame callback runs.
+	const unsigned victoryFrame = 2;
+	const unsigned actualCrcFrame = victoryFrame + 1;
+	CHECK(complete.captureTerminalResult(actualCrcFrame, 0x89ABCDEFU));
+	CHECK(complete.terminalResultKnown());
+	CHECK(complete.terminalFrame() == actualCrcFrame);
+	CHECK(complete.terminalFrame() != victoryFrame);
+	CHECK(complete.terminalCrc() == 0x89ABCDEFU);
+	CHECK(!complete.captureTerminalResult(4, 0x11111111U));
+	CHECK(complete.observeCompletedFrame(actualCrcFrame));
+	CHECK(!complete.observeCompletedFrame(0));
+	CHECK(!complete.observeCompletedFrame(1));
+	CHECK(!complete.observeCompletedFrame(4));
+	CHECK(complete.lastCompletedFrame() == actualCrcFrame);
+	CHECK(complete.finish(0, 0));
+	CHECK(complete.finalized());
+	CHECK(!complete.finish(0, 0));
+	CHECK(!complete.begin());
+	CHECK(!complete.observeCompletedFrame(4));
+	CHECK(complete.terminalFrame() == actualCrcFrame &&
+		complete.terminalCrc() == 0x89ABCDEFU);
+
+	PerformanceReceiptOwnerLifecycle missingCompletedTerminal;
+	CHECK(missingCompletedTerminal.begin());
+	CHECK(missingCompletedTerminal.observeCompletedFrame(1));
+	CHECK(missingCompletedTerminal.captureTerminalResult(2, 7));
+	CHECK(!missingCompletedTerminal.finish(0, 0));
+	CHECK(missingCompletedTerminal.finalized());
+	CHECK(!missingCompletedTerminal.observeCompletedFrame(2));
+	CHECK(!missingCompletedTerminal.finish(0, 0));
+
+	PerformanceReceiptOwnerLifecycle missingTerminal;
+	CHECK(missingTerminal.begin());
+	CHECK(missingTerminal.observeCompletedFrame(1));
+	CHECK(!missingTerminal.finish(0, 0));
+	CHECK(missingTerminal.finalized());
+
+	PerformanceReceiptOwnerLifecycle workerStillActive;
+	CHECK(workerStillActive.begin());
+	CHECK(workerStillActive.observeCompletedFrame(1));
+	CHECK(workerStillActive.captureTerminalResult(1, 7));
+	CHECK(!workerStillActive.finish(1, 0));
+	CHECK(workerStillActive.finalized());
+	CHECK(!workerStillActive.finish(0, 0));
+
+	PerformanceReceiptOwnerLifecycle ownerCallbackPending;
+	CHECK(ownerCallbackPending.begin());
+	CHECK(ownerCallbackPending.observeCompletedFrame(1));
+	CHECK(ownerCallbackPending.captureTerminalResult(1, 7));
+	CHECK(!ownerCallbackPending.finish(0, 1));
+	CHECK(ownerCallbackPending.finalized());
+	CHECK(!ownerCallbackPending.finish(0, 0));
+
+	PerformanceReceiptOwnerLifecycle incompleteRange;
+	CHECK(incompleteRange.begin());
+	CHECK(incompleteRange.observeCompletedFrame(1));
+	CHECK(incompleteRange.observeCompletedFrame(3));
+	CHECK(!incompleteRange.captureTerminalResult(0, 7));
+	CHECK(!incompleteRange.captureTerminalResult(2, 7));
+	CHECK(incompleteRange.captureTerminalResult(3, 7));
+	CHECK(!incompleteRange.finish(0, 0));
+	CHECK(incompleteRange.finalized());
+}
+#endif
 
 #if defined(_WIN64)
 struct StableHealCommitProbe
@@ -1542,6 +1625,9 @@ static void TestSkirmishAITestReceiptContract()
 
 static void TestSkirmishAITestRunnerContract()
 {
+#if defined(_WIN64)
+	TestPerformanceReceiptOwnerLifecycle();
+#endif
 	TestSkirmishAITestReceiptContract();
 	CHECK(!rts::ShouldUseLiveSimulationPhaseGraph(false, false, 0, 3));
 	CHECK(rts::ShouldUseLiveSimulationPhaseGraph(true, false, 0, 3));
@@ -2073,6 +2159,13 @@ static void TestSkirmishAITestRunnerContract()
 
 int main(int argc, char **argv)
 {
+#if defined(_WIN64)
+	if (argc == 2 && strcmp(argv[1], "--performance-receipt-lifecycle") == 0)
+	{
+		TestPerformanceReceiptOwnerLifecycle();
+		return s_failures != 0 ? 1 : 0;
+	}
+#endif
 	initMemoryManager();
 	if (argc == 2 && strcmp(argv[1], "--xfer-crc-snapshot") == 0)
 	{

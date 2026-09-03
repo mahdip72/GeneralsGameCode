@@ -237,7 +237,12 @@ inline Bool ExecuteGeneralsAIEnemyPlanningBatch(
 	GeneralsAIEnemyPlanningResult *results,
 	UnsignedInt injectedFailureOrdinal = rts::AI_PLANNING_INVALID_ORDINAL,
 	rts::AIPlanningBatchStatus *status = 0,
-	std::atomic<UnsignedInt> *testRendezvous = 0)
+	std::atomic<UnsignedInt> *testRendezvous = 0
+#if defined(_WIN64)
+	, rts::performance::KernelPerformanceBatch *performanceBatch = 0
+	, rts::AIPlanningReferenceBatchTransport *referenceBatch = 0
+#endif
+	)
 {
 	InitializeGeneralsAIPlanningBatchStatus(status, executionMode);
 	// A negotiated network serial lane is still the current canonical owner
@@ -267,6 +272,10 @@ inline Bool ExecuteGeneralsAIEnemyPlanningBatch(
 		!jobs.isCurrentThread(rts::JOB_OWNER_GAME))
 		return false;
 
+#if defined(_WIN64)
+	rts::AIPlanningPerformanceInterval schedule(performanceBatch,
+		rts::performance::KERNEL_PERFORMANCE_SCHEDULE);
+#endif
 	GeneralsAIEnemyPlanningJob::ExecutionRecord execution[
 		GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS];
 	std::atomic<UnsignedInt> activePhysicalWorkers(0U);
@@ -298,6 +307,9 @@ inline Bool ExecuteGeneralsAIEnemyPlanningBatch(
 			break;
 		}
 	}
+#if defined(_WIN64)
+	schedule.end();
+#endif
 	if (submitted != snapshotCount)
 	{
 		jobs.cancel(group);
@@ -317,8 +329,16 @@ inline Bool ExecuteGeneralsAIEnemyPlanningBatch(
 	// the requested topology or the group is cancelled and recomputed serially.
 	const UnsignedInt physicalCompletionTimeoutMilliseconds =
 		testRendezvous ? 1000U : 8U;
-	if (!jobs.waitWithoutOwnerHelp(group,
-		physicalCompletionTimeoutMilliseconds))
+#if defined(_WIN64)
+	rts::AIPlanningPerformanceInterval wait(performanceBatch,
+		rts::performance::KERNEL_PERFORMANCE_WAIT);
+#endif
+	const Bool passiveWaitCompleted = jobs.waitWithoutOwnerHelp(group,
+		physicalCompletionTimeoutMilliseconds);
+#if defined(_WIN64)
+	wait.end();
+#endif
+	if (!passiveWaitCompleted)
 	{
 		jobs.cancel(group);
 		jobs.wait(group);
@@ -348,6 +368,10 @@ inline Bool ExecuteGeneralsAIEnemyPlanningBatch(
 		return PlanGeneralsAIEnemyPlanningBatchSerial(
 			snapshots, snapshotCount, results);
 	}
+#if defined(_WIN64)
+	rts::AIPlanningPerformanceInterval validate(performanceBatch,
+		rts::performance::KERNEL_PERFORMANCE_VALIDATE);
+#endif
 	for (UnsignedInt i = 0U; i < snapshotCount; ++i)
 	{
 		if (!execution[i].completed ||
@@ -361,6 +385,10 @@ inline Bool ExecuteGeneralsAIEnemyPlanningBatch(
 				snapshots, snapshotCount, results);
 		}
 	}
+#if defined(_WIN64)
+	rts::ObserveAIPlanningReferenceBatch(performanceBatch, referenceBatch);
+	validate.end();
+#endif
 	if (status)
 		status->parallelSucceeded = 1U;
 

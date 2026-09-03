@@ -75,6 +75,7 @@
 #include "Common/MultiplayerSettings.h"
 #include "Common/Recorder.h"
 #include "Common/SkirmishAITestRunner.h"
+#include "Common/Stage5PerformanceFixtureRunner.h"
 #include "Common/SpecialPower.h"
 #include "Common/TerrainTypes.h"
 #include "Common/Upgrade.h"
@@ -1306,7 +1307,8 @@ void GameEngine::execute()
 	// pretty basic for now
 	while( !m_quitting )
 	{
-		rts::frame_timing::BeginFrame(TheGameLogic->getFrame());
+		const unsigned previousFrame = TheGameLogic->getFrame();
+		rts::frame_timing::BeginFrame(previousFrame);
 
 		//if (TheGlobalData->m_vTune)
 		{
@@ -1345,6 +1347,9 @@ void GameEngine::execute()
 					// compute a frame
 					update();
 					UpdateSkirmishAITestRunner();
+#if defined(_WIN64)
+					UpdateStage5PerformanceFixtureRunner();
+#endif
 				}
 				catch (INIException e)
 				{
@@ -1376,6 +1381,9 @@ void GameEngine::execute()
 			}
 		}
 		rts::frame_timing::EndFrame(TheGameLogic->getFrame());
+#if defined(_WIN64)
+		ObserveSkirmishAITestCompletedFrame(previousFrame);
+#endif
 
 #ifdef PERF_TIMERS
 		if (!m_quitting && TheGameLogic->isInGame() && !TheGameLogic->isInShellGame() && !TheGameLogic->isGamePaused())

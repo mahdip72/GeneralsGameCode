@@ -258,7 +258,7 @@ function Write-Stage5HostReceiptTestDocument {
             $nativeTimingPath = Join-Path $directory $nativeTimingLeaf
             [IO.File]::WriteAllText($nativeRawPath, "native raw evidence for $Role/$childTitle")
             [IO.File]::WriteAllText($nativeTimingPath, "native timing evidence for $Role/$childTitle")
-            Write-JsonDocument $nativePath ([ordered]@{
+            $nativeDocument = [ordered]@{
                 schemaVersion = 1
                 evidenceKind = 'stage5-executable-originated-receipt'
                 status = 'passed'
@@ -289,7 +289,9 @@ function Write-Stage5HostReceiptTestDocument {
                     commandLine = "$childTitle.exe -headless -stage5-validation"
                     exitCode = 0
                 }
-            })
+            }
+            Add-Stage5NativeReceiptTestObservations $nativeDocument
+            Write-JsonDocument $nativePath $nativeDocument
             $children += [ordered]@{
                 role = $Role; title = $childTitle; runNonce = $runNonce
                 processId = $processId; processCreationUtc = '2026-09-01T00:00:00Z'
@@ -301,7 +303,7 @@ function Write-Stage5HostReceiptTestDocument {
                 stderr = [ordered]@{ path = $stderrLeaf; sha256 = Get-Sha256 $stderrPath }
                 nativeReceipt = [ordered]@{
                     path = $nativeLeaf; sha256 = Get-Sha256 $nativePath
-                    producer = 'game-executable-stage5-performance-report-v2'
+                    producer = 'game-executable-stage5-performance-report-v5'
                     runNonce = $runNonce; cohortNonce = $script:TestCohortNonce
                 }
             }
@@ -366,7 +368,7 @@ function Write-Stage5ExecutableReceiptTestDocument {
     $nativeTimingPath = Join-Path $directory $nativeTimingLeaf
     [IO.File]::WriteAllText($nativeRawPath, "native raw evidence for $Role/$Title")
     [IO.File]::WriteAllText($nativeTimingPath, "native timing evidence for $Role/$Title")
-    Write-JsonDocument $nativePath ([ordered]@{
+    $nativeDocument = [ordered]@{
         schemaVersion = 1
         evidenceKind = 'stage5-executable-originated-receipt'
         status = 'passed'
@@ -397,7 +399,9 @@ function Write-Stage5ExecutableReceiptTestDocument {
             commandLine = "$Title.exe -headless -stage5-validation"
             exitCode = 0
         }
-    })
+    }
+    Add-Stage5NativeReceiptTestObservations $nativeDocument
+    Write-JsonDocument $nativePath $nativeDocument
     $nativeHash = Get-Sha256 $nativePath
     Write-JsonDocument $Path ([ordered]@{
         schemaVersion = 1
@@ -405,8 +409,8 @@ function Write-Stage5ExecutableReceiptTestDocument {
         status = 'passed'
         role = $Role
         trustDomain = 'executable'
-        producer = 'game-executable-stage5-performance-report-v2'
-        producerVersion = '2'
+        producer = 'game-executable-stage5-performance-report-v5'
+        producerVersion = '5'
         runNonce = $runNonce
         sourceCommit = $SourceCommit
         title = $Title
@@ -431,6 +435,321 @@ function Write-Stage5ExecutableReceiptTestDocument {
         }
         details = Get-Stage5AcceptanceReceiptTestDetails $Role
     })
+}
+
+function Add-Stage5NativeReceiptTestObservations {
+    param([Collections.IDictionary]$Document)
+    $Document.schemaVersion = 5
+    $Document.producer = 'game-executable-stage5-performance-report-v5'
+    $Document.producerVersion = '5'
+    $Document.measurementRole = 'throughput'
+    $Document.frames = @{start=0;end=1;final=1;finalCrcKnown=$true;finalCrc=123}
+    $Document.fixture = @{id='native-provenance-fixture';requestedPlayerCount=8;requestedMinimumUnitCount=1000
+        kind='replay';workloadQualification='minimum-qualified';identityObserved=$true
+        contentPath='fixture.rep';contentSha256=('A'*64);replayPath='fixture.rep'
+        retainedReplayPath='';retainedReplaySha256='';seed=1729;seedKnown=$true}
+    $Document.simulationMode = 'parallel'; $Document.schedulerStarted = $true
+    $Document.worker = @{requestedCount=1;effectiveCount=1;policy='auto';pinned=$true
+        availableLogicalCpuCount=2;reservedOwnerCpuCount=1;selectedWorkerCpuCount=1
+        selectedWorkerPhysicalCoreCount=1;selectedWorkerPhysicalCoreMask=2;selectedWorkerPhysicalCoreMaskComplete=$true}
+    $Document.topology = @{source='GetSystemCpuSetInformation';ownerCpuSetIds=@(0);selectedWorkerCpuSetIds=@(1)
+        cpuSets=@(@{id=0;efficiencyClass=0;group=0;coreIndex=0;logicalProcessorIndex=0
+            parked=$false;allocatedToOtherProcess=$false;availableToProcess=$true},
+            @{id=1;efficiencyClass=0;group=0;coreIndex=1;logicalProcessorIndex=1
+            parked=$false;allocatedToOtherProcess=$false;availableToProcess=$true})}
+    $Document.workload = @{sampling='completed-simulation-frame-boundary-v1';sampleCount=1
+        firstFrame=1;lastFrame=1;playerCount=8;initialUnitCount=1000;minimumUnitCount=1000
+        peakUnitCount=1000;rosterStable=$true;contiguous=$true}
+    $Document.frameSimulation = @{totalNanoseconds=100;maximumNanoseconds=100;sampleCount=1}
+    $Document.phases = @(@('owner-intake','legacy-mutable-island','spatial-work','owner-tail',
+        'verification-publication') | ForEach-Object {
+        @{name=$_;available=$true;totalNanoseconds=10;maximumNanoseconds=10;sampleCount=1
+            serialNanoseconds=0;serialNanosecondsKnown=$false}
+    })
+    $Document.kernelTiming = @{schemaVersion=1;mode='owner-pipeline-observation'
+        attribution='owner-stack-exclusive-v1';enabled=$true;frozen=$true;complete=$false
+        errors=0;generation=1;serialReferenceKnown=$false;streams=@()}
+    $Document.kernelReference = @{schemaVersion=1;mode='throughput-binding';frozen=$true
+        complete=$false;errors=0;generation=1;streams=@()}
+    $Document.rawEvidence = @{verifierBoundary='closed-native-files'
+        rawLogPath=$Document.rawLogs[0].path;rawLogSha256=$Document.rawLogs[0].sha256
+        timingPath=$Document.rawLogs[1].path;timingSha256=$Document.rawLogs[1].sha256
+        timingClosed=$true;timingWriteSucceeded=$true;timingTruncated=$false;timingComplete=$true
+        timingSessionCount=1;timingFrameSamples=2;timingFirstFrame=0;timingLastFrame=1}
+}
+
+function Assert-NativeObservationProcessBinding {
+    # Load only pure transport helpers. Never execute the runner's process,
+    # profile, registry, or installed-runtime workflow in this regression.
+    $parseTokens = $null; $parseErrors = $null
+    $tree = [System.Management.Automation.Language.Parser]::ParseFile(
+        (Join-Path $PSScriptRoot 'Run-DeterministicSimulationValidation.ps1'),
+        [ref]$parseTokens, [ref]$parseErrors)
+    Assert-True ($parseErrors.Count -eq 0) 'native observation runner parses without errors'
+    $helpersPresent = $true
+    foreach ($name in @('Get-NativeObservationBinding','Set-NativePerformanceObservationEnvironment')) {
+        $definition = $tree.Find({param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
+        }, $true)
+        Assert-True ($null -ne $definition) "native observation has a pure $name boundary"
+        if ($null -eq $definition) { $helpersPresent = $false }
+    }
+    $processDefinition = $tree.Find({param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-ValidationProcess'
+    }, $true)
+    Assert-True (@($processDefinition.Body.ParamBlock.Parameters | Where-Object {
+        $_.Name.VariablePath.UserPath -ceq 'NativeObservationBinding'
+    }).Count -eq 1) 'installed process accepts an explicit observation binding without canonical acceptance flags'
+    if (-not $helpersPresent) { return }
+    foreach ($name in @('Get-RequiredProperty','Assert-JsonObjectShape','Assert-JsonString',
+        'Test-Sha256Text','Assert-CanonicalUuid','Get-NativeObservationBinding',
+        'Set-NativePerformanceFixtureEnvironment','Set-NativePerformanceObservationEnvironment')) {
+        $definition = $tree.Find({param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
+        }, $true)
+        Invoke-Expression $definition.Extent.Text
+    }
+    $binding = [ordered]@{sourceCommit=('a'*40);artifactSetSha256=('b'*64)
+        runtimeClosure=[ordered]@{dependencyManifestSha256=('c'*64);closureSha256=('d'*64)}}
+    $copies = @(Get-NativeObservationBinding $binding)
+    Assert-True ($copies.Count -eq 1 -and $copies[0].artifactSetSha256 -ceq ('B'*64) -and
+        $copies[0].runtimeClosure.closureSha256 -ceq ('D'*64) -and
+        $binding.artifactSetSha256 -ceq ('b'*64)) `
+        'observation validation returns exactly one normalized binding without changing caller evidence'
+    $copies[0].runtimeClosure.closureSha256 = 'modified-copy'
+    Assert-True ($binding.runtimeClosure.closureSha256 -ceq ('d'*64)) `
+        'observation binding owns its nested closure copy'
+    Assert-True ($null -eq (Get-NativeObservationBinding $null)) 'omitted observation binding remains disabled'
+    foreach ($mutate in @(
+        {param($value) $value.sourceCommit='A'*40},
+        {param($value) $value.artifactSetSha256=' ' + ('B'*64)},
+        {param($value) $value.runtimeClosure.Remove('closureSha256')},
+        {param($value) $value.runtimeClosure.dependencyManifestSha256=123},
+        {param($value) $value.finalAcceptanceEligible=$true},
+        {param($value) $value.runtimeClosure.acceptanceReceiptRequested=$true}
+    )) {
+        $invalid = @{sourceCommit=('a'*40);artifactSetSha256=('b'*64)
+            runtimeClosure=@{dependencyManifestSha256=('c'*64);closureSha256=('d'*64)}}
+        & $mutate $invalid
+        Assert-Throws { Get-NativeObservationBinding $invalid | Out-Null } 'observation|Observation' `
+            'incomplete, malformed, or qualification-bearing observation bindings are rejected'
+    }
+    $entry = @{kind='replay';caseId='observed-replay';fixtureSha256=('E'*64);seed=0
+        sequence=7;timingDirectory='H:\observation-unit-test\timing-7'}
+    $environment = @{'RTS_PERFORMANCE_RUN_ID'='stale';'RTS_PERFORMANCE_SEED'='999'
+        'RTS_PERFORMANCE_REFERENCE_MODE'='serial-oracle';'RTS_PERFORMANCE_UNIT_COUNT'='8000'
+        'RTS_PERFORMANCE_UNKNOWN_INHERITED'='stale';'unrelated'='preserved'}
+    $cohort = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    $firstNonce = '11111111-1111-4111-8111-111111111111'
+    $secondNonce = '22222222-2222-4222-8222-222222222222'
+    $arguments = @{Environment=$environment;Binding=$binding;Entry=$entry
+        EvidenceRoot='H:\observation-unit-test';RunNonce=$firstNonce
+        CohortNonce=$cohort;CohortCreatedUtc='2026-09-01T00:00:00Z'}
+    $directories = @(Set-NativePerformanceObservationEnvironment @arguments)
+    Assert-True ($directories.Count -eq 1 -and $directories[0] -ceq
+        "H:\observation-unit-test\native-performance-receipts\$firstNonce" -and
+        $environment['RTS_PERFORMANCE_RECEIPT_DIR'] -ceq $directories[0] -and
+        $environment['RTS_PERFORMANCE_RAW_LOG_PATH'] -ceq (Join-Path $directories[0] 'performance-raw.log') -and
+        $environment['RTS_PERFORMANCE_TIMING_PATH'] -ceq $entry.timingDirectory -and
+        $environment['RTS_PERFORMANCE_RUN_NONCE'] -ceq $firstNonce -and
+        $environment['RTS_PERFORMANCE_RUN_ID'] -ceq "stage5-7-$firstNonce" -and
+        $environment['RTS_PERFORMANCE_COHORT_NONCE'] -ceq $cohort -and
+        $environment['RTS_PERFORMANCE_SOURCE_COMMIT'] -ceq ('a'*40) -and
+        $environment['RTS_PERFORMANCE_ARTIFACT_SET_SHA256'] -ceq ('B'*64) -and
+        $environment['RTS_PERFORMANCE_RUNTIME_CLOSURE_SHA256'] -ceq ('D'*64) -and
+        $environment['RTS_PERFORMANCE_REFERENCE_MODE'] -ceq 'throughput-binding' -and
+        $environment['RTS_PERFORMANCE_WORKLOAD_QUALIFICATION'] -ceq 'observed-only' -and
+        -not $environment.ContainsKey('RTS_PERFORMANCE_SEED') -and
+        -not $environment.ContainsKey('RTS_PERFORMANCE_UNIT_COUNT') -and
+        -not $environment.ContainsKey('RTS_PERFORMANCE_UNKNOWN_INHERITED') -and
+        $environment['unrelated'] -ceq 'preserved') `
+        'local observation gets exact fresh child paths and verified binding without inherited oracle or workload claims'
+    $arguments.RunNonce = $secondNonce
+    $secondDirectory = Set-NativePerformanceObservationEnvironment @arguments
+    Assert-True ($secondDirectory -cne $directories[0] -and
+        $environment['RTS_PERFORMANCE_RUN_ID'] -ceq "stage5-7-$secondNonce" -and
+        $environment['RTS_PERFORMANCE_RAW_LOG_PATH'] -notmatch $firstNonce) `
+        'a second child cannot reuse the prior receipt or raw path'
+    $beforeInvalid = $environment | ConvertTo-Json -Compress
+    $arguments.Binding = @{sourceCommit='malformed'}
+    Assert-Throws { Set-NativePerformanceObservationEnvironment @arguments | Out-Null } 'observation|Observation' `
+        'malformed observation binding fails before changing child environment'
+    Assert-True (($environment | ConvertTo-Json -Compress) -ceq $beforeInvalid) `
+        'failed binding validation leaves the child environment untouched'
+    $arguments.Binding = $null
+    $disabled = Set-NativePerformanceObservationEnvironment @arguments
+    Assert-True ($null -eq $disabled -and
+        @($environment.Keys | Where-Object { $_ -like 'RTS_PERFORMANCE_*' }).Count -eq 0 -and
+        -not $environment.ContainsKey('RTS_STAGE5_RUNTIME_CLOSURE_SHA256') -and
+        -not $environment.ContainsKey('RTS_STAGE5_RUNTIME_MANIFEST_SHA256') -and
+        $environment['unrelated'] -ceq 'preserved') `
+        'disabled observation cannot accidentally inherit native receipt authorization'
+    $processSource = $processDefinition.Extent.Text
+    Assert-True ($processSource -notmatch '\$(?:acceptanceBindingsRequested|AcceptanceSourceCommit|AcceptanceArtifactSetSha256|hostRunnerRuntimeClosure)\b' -and
+        $processSource -match 'Set-NativePerformanceObservationEnvironment' -and
+        $processSource -match '-SourceCommit\s+\$nativeBinding.sourceCommit' -and
+        $processSource -match '-ArtifactSetSha256\s+\$nativeBinding.artifactSetSha256' -and
+        $processSource -match '-RuntimeClosure\s+\$nativeBinding.runtimeClosure') `
+        'environment and receipt parser consume the same explicit observation binding, not acceptance globals'
+    Assert-True ($tree.Extent.Text -match '-NativeObservationBinding\s+\$nativeObservationBinding' -and
+        $tree.Extent.Text -match 'LocalCapacity cannot request canonical acceptance bindings or receipts\.') `
+        'canonical caller passes its binding explicitly while LocalCapacity acceptance remains forbidden'
+}
+
+function Assert-CurrentNativeReceiptCatalog {
+    param([string]$Directory, [string]$SourceCommit, [string]$ArtifactSetSha256,
+        [Collections.IDictionary]$ArtifactHashes)
+    Assert-NativeObservationProcessBinding
+    # Execute only the real receipt parser and its pure file helpers. Never
+    # invoke the runner's top-level registry/process workflow from a unit test.
+    $parseTokens = $null; $parseErrors = $null
+    $runnerTree = [System.Management.Automation.Language.Parser]::ParseFile(
+        (Join-Path $PSScriptRoot 'Run-DeterministicSimulationValidation.ps1'),
+        [ref]$parseTokens, [ref]$parseErrors)
+    $environmentHelper = $runnerTree.Find({param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ceq 'Set-NativePerformanceFixtureEnvironment'
+    }, $true)
+    if ($null -eq $environmentHelper) {
+        Assert-True $false 'generic runner has a tested observed-only fixture environment boundary'
+    } else {
+        Invoke-Expression $environmentHelper.Extent.Text
+        $environment = @{'RTS_PERFORMANCE_PLAYER_COUNT'='8';'RTS_PERFORMANCE_UNIT_COUNT'='8000'
+            'RTS_PERFORMANCE_SEED'='0';'unrelated'='preserved'}
+        Set-NativePerformanceFixtureEnvironment $environment @{kind='replay';caseId='reviewed-replay';fixtureSha256=('A'*64);seed=0}
+        Assert-True ($environment['RTS_PERFORMANCE_WORKLOAD_QUALIFICATION'] -ceq 'observed-only' -and
+            $environment['RTS_PERFORMANCE_FIXTURE_KIND'] -ceq 'replay' -and
+            $environment['RTS_PERFORMANCE_FIXTURE_SHA256'] -ceq ('A'*64) -and
+            -not $environment.ContainsKey('RTS_PERFORMANCE_SEED') -and
+            -not $environment.ContainsKey('RTS_PERFORMANCE_PLAYER_COUNT') -and
+            -not $environment.ContainsKey('RTS_PERFORMANCE_UNIT_COUNT') -and $environment['unrelated'] -ceq 'preserved') `
+            'generic replay cannot inherit workload minima or claim plan placeholder seed zero as observed'
+        Set-NativePerformanceFixtureEnvironment $environment @{kind='ai';caseId='4v3-seed-1729';fixtureSha256='';seed=1729}
+        Assert-True ($environment['RTS_PERFORMANCE_FIXTURE_KIND'] -ceq 'fresh-ai-map' -and
+            $environment['RTS_PERFORMANCE_SEED'] -ceq '1729' -and
+            -not $environment.ContainsKey('RTS_PERFORMANCE_FIXTURE_SHA256')) `
+            'fresh AI carries its expected seed without fabricating the yet-unobserved map hash'
+    }
+    $parserCommand = ''
+    foreach ($name in @('Get-Sha256Bytes','Get-Stage5FileSnapshot','ConvertTo-OutputRelativePath',
+        'Assert-ContainedPathNoReparse')) {
+        $definition = $runnerTree.Find({param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
+        }, $true)
+        Invoke-Expression $definition.Extent.Text
+    }
+    $definition = $runnerTree.Find({param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        @('Get-NativeV2ReceiptReference','Get-NativePerformanceReceiptReference') -ccontains $node.Name
+    }, $true)
+    Invoke-Expression $definition.Extent.Text
+    $parserCommand = $definition.Name
+    foreach ($domain in @('host-runner','executable')) {
+        $path = Join-Path $Directory "current-native-$domain.json"
+        if ($domain -ceq 'host-runner') {
+            Write-Stage5HostReceiptTestDocument $path 'validation-results' 'ZeroHour' `
+                $SourceCommit $ArtifactSetSha256 $ArtifactHashes
+        } else {
+            Write-Stage5ExecutableReceiptTestDocument $path 'validation-results' 'ZeroHour' `
+                $SourceCommit $ArtifactSetSha256 $ArtifactHashes
+        }
+        $wrapper = ConvertFrom-Stage5JsonDictionary $path
+        $nativeBinding = if ($domain -ceq 'host-runner') { $wrapper.provenance.children[0].nativeReceipt } else { $wrapper.provenance }
+        $nativePath = if ($domain -ceq 'host-runner') {
+            Join-Path $Directory $nativeBinding.path
+        } else { Join-Path $Directory $nativeBinding.receiptPath }
+        $native = ConvertFrom-Stage5JsonDictionary $nativePath
+        $native.schemaVersion=1; $native.producer='game-executable-stage5-performance-report-v2'; $native.producerVersion='2'
+        $publish = {
+            Write-JsonDocument $nativePath $native
+            if ($domain -ceq 'host-runner') {
+                $nativeBinding.sha256=Get-Sha256 $nativePath; $nativeBinding.producer=$native.producer
+            } else {
+                $nativeBinding.receiptSha256=Get-Sha256 $nativePath
+                $wrapper.producer=$native.producer; $wrapper.producerVersion=$native.producerVersion
+            }
+            Write-JsonDocument $path $wrapper
+        }
+        & $publish
+        $readArguments = @{Path=$path;Kind='deterministic-runtime';Role='validation-results'
+            EvidenceTitle='ZeroHour';ExpectedSourceCommit=$SourceCommit
+            ExpectedArtifactSetSha256=$ArtifactSetSha256;ArtifactHashes=$ArtifactHashes}
+        Assert-Throws { Read-Stage5FinalAcceptanceImmutableReceipt @readArguments } 'producer|version|V5|obsolete' `
+            "$domain cannot promote an obsolete hash-bound native receipt"
+        $parserArguments = @{OutputText="SIMULATION_PERFORMANCE_RECEIPT status=written path=$nativePath"
+            OutputRoot=$Directory;WorkingDirectory=$Directory;Role='validation-results'
+            SourceCommit=$SourceCommit;ArtifactSetSha256=$ArtifactSetSha256
+            ExecutableSha256=$ArtifactHashes['zerohour-executable'];RunNonce=$native.runNonce
+            CohortNonce=$native.cohortNonce;RuntimeClosure=$script:TestRuntimeClosure;ExpectedTitle='ZeroHour'
+            ProcessId=$native.provenance.processId;ProcessCreationUtc=$native.provenance.processCreationUtc
+            ExpectedExecutablePath=$native.provenance.executablePath}
+        Assert-True ($null -eq (& $parserCommand @parserArguments)) `
+            'runner child reader rejects obsolete native protocol despite correct raw hashes'
+        Add-Stage5NativeReceiptTestObservations $native
+        & $publish
+        try {
+            $proof = Read-Stage5FinalAcceptanceImmutableReceipt @readArguments
+            Assert-True ($proof.trustDomain -ceq $domain) `
+                'current V5 throughput provenance with no admitted streams remains valid non-scaling evidence'
+        } catch { Assert-True $false "current V5 throughput provenance was rejected: $($_.Exception.Message)" }
+        $parsedReferences = @(& $parserCommand @parserArguments)
+        Assert-True ($parsedReferences.Count -eq 1 -and $null -ne $parsedReferences[0] -and
+            $parsedReferences[0].producer -ceq 'game-executable-stage5-performance-report-v5' -and
+            $parsedReferences[0].path -ceq [IO.Path]::GetFileName($nativePath) -and
+            $parsedReferences[0].sha256 -ceq (Get-Sha256 $nativePath)) `
+            'runner child reader returns exactly one hash-bound V5 reference without guard-path output pollution'
+        foreach ($mode in @('serial','parallel','shadow')) {
+            Add-Stage5NativeReceiptTestObservations $native
+            $native.fixture.workloadQualification='observed-only'
+            $native.fixture.requestedPlayerCount=$null; $native.fixture.requestedMinimumUnitCount=$null
+            $native.workload.playerCount=7; $native.workload.initialUnitCount=0; $native.workload.minimumUnitCount=0
+            $native.simulationMode=$mode
+            if ($mode -ceq 'serial') {
+                $native.schedulerStarted=$false
+                foreach ($field in @('effectiveCount','availableLogicalCpuCount','reservedOwnerCpuCount',
+                    'selectedWorkerCpuCount','selectedWorkerPhysicalCoreCount','selectedWorkerPhysicalCoreMask')) { $native.worker[$field]=0 }
+                $native.worker.pinned=$false; $native.worker.selectedWorkerPhysicalCoreMaskComplete=$false
+                $native.topology=@{source='scheduler-not-started';cpuSets=@();ownerCpuSetIds=@();selectedWorkerCpuSetIds=@()}
+            }
+            & $publish
+            try {
+                $proof = Read-Stage5FinalAcceptanceImmutableReceipt @readArguments
+                Assert-True ($proof.trustDomain -ceq $domain) "$domain accepts explicit observed-only $mode without fabricated workload or workers"
+            } catch { Assert-True $false "$domain observed-only $mode rejected: $($_.Exception.Message)" }
+            $parsedReferences=@(& $parserCommand @parserArguments)
+            Assert-True ($parsedReferences.Count -eq 1 -and $null -ne $parsedReferences[0]) `
+                "runner child reader retains observed-only $mode provenance"
+        }
+        foreach ($mutation in @('unobserved-fixture','unknown-qualification','missing-seed','map-as-replay','serial-workers')) {
+            Add-Stage5NativeReceiptTestObservations $native
+            switch ($mutation) {
+                'unobserved-fixture' { $native.fixture.identityObserved=$false }
+                'unknown-qualification' { $native.fixture.workloadQualification='assumed-eight' }
+                'missing-seed' { $native.fixture.seedKnown=$false }
+                'map-as-replay' { $native.fixture.kind='fresh-ai-map';$native.fixture.contentPath='Maps/Test/Test.map' }
+                'serial-workers' { $native.simulationMode='serial';$native.schedulerStarted=$false }
+            }
+            & $publish
+            Assert-Throws { Read-Stage5FinalAcceptanceImmutableReceipt @readArguments } 'fixture|seed|qualif|scheduler|worker|replay' `
+                "$domain rejects $mutation without inventing observed metadata"
+            Assert-True ($null -eq (& $parserCommand @parserArguments)) "runner child reader rejects $mutation"
+        }
+        foreach ($mutation in @('oracle','disabled','error','incomplete','unclosed')) {
+            Add-Stage5NativeReceiptTestObservations $native
+            switch ($mutation) {
+                'oracle' { $native.measurementRole='serial-oracle';$native.kernelReference.mode='serial-oracle' }
+                'disabled' { $native.kernelReference.mode='disabled' }
+                'error' { $native.kernelReference.errors=64 }
+                'incomplete' { $native.kernelReference.frozen=$false }
+                'unclosed' { $native.rawEvidence.timingClosed=$false }
+            }
+            & $publish
+            Assert-Throws { Read-Stage5FinalAcceptanceImmutableReceipt @readArguments } 'role|oracle|reference|timing|finalized|producer|version' `
+                "$domain rejects $mutation native evidence without inventing coverage"
+            Assert-True ($null -eq (& $parserCommand @parserArguments)) `
+                "runner child reader rejects $mutation native evidence"
+        }
+    }
 }
 
 function Write-Stage5ProtectedAttestationTestDocument {
@@ -1381,6 +1700,7 @@ function Write-PerformanceScalingTestManifest {
     $fixtureNames = @('one-thousand-units', 'four-thousand-units',
         'eight-thousand-units', 'dense-eight-player')
     $unitCounts = @(1000, 4000, 8000, 12000)
+    $minimumCounts = @(1000, 4000, 8000, 8000)
     $laneNames = @('stage3-forced-one', 'forced-one', 'physical-8', 'physical-16')
     $laneSamples = @{
         'stage3-forced-one' = @(990.0, 995.0, 1000.0, 1005.0, 1010.0)
@@ -1402,6 +1722,8 @@ function Write-PerformanceScalingTestManifest {
                 $fixtureSamples += [ordered]@{
                     fixture = $fixtureNames[$fixtureIndex]; playerCount = 8
                     peakUnitCount = $unitCounts[$fixtureIndex]; lane = $lane
+                    requestedMinimumUnitCount = $minimumCounts[$fixtureIndex]
+                    initialUnitCount = $unitCounts[$fixtureIndex]
                     repeat = $repeat; processId = $processId
                     executableSha256 = $sampleExecutable; commandLine = $commandLine
                     elapsedMilliseconds = $laneSamples[$lane][$repeat]
@@ -1412,10 +1734,10 @@ function Write-PerformanceScalingTestManifest {
             }
         }
     }
-    $phaseNames = @('owner-intake', 'world-queries', 'pathfinding', 'object-computation',
-        'spatial-work', 'deterministic-commit', 'verification-publication')
-    $phaseElapsed = @(10.0, 20.0, 20.0, 20.0, 15.0, 10.0, 5.0)
-    $phaseSerial = @(8.0, 2.0, 2.0, 2.0, 1.0, 5.0, 2.0)
+    $phaseNames = @('owner-intake', 'legacy-mutable-island', 'spatial-work',
+        'owner-tail', 'verification-publication')
+    $phaseElapsed = @(10.0, 60.0, 15.0, 10.0, 5.0)
+    $phaseSerial = @(8.0, 6.0, 1.0, 5.0, 2.0)
     $phases = @()
     $phaseSamples = @()
     for ($index = 0; $index -lt $phaseNames.Count; ++$index) {
@@ -1423,6 +1745,7 @@ function Write-PerformanceScalingTestManifest {
             name = $phaseNames[$index]
             elapsedMilliseconds = $phaseElapsed[$index]
             serialMilliseconds = $phaseSerial[$index]
+            serialMillisecondsKnown = $true
         }
         for ($repeat = 0; $repeat -lt 5; ++$repeat) {
             $receipt = $runReceipts["dense-eight-player|forced-one|$repeat"]
@@ -1431,6 +1754,7 @@ function Write-PerformanceScalingTestManifest {
                 processId = $receipt.processId; commandLine = $receipt.commandLine
                 elapsedMilliseconds = $phaseElapsed[$index]
                 serialMilliseconds = $phaseSerial[$index]
+                serialMillisecondsKnown = $true
             }
         }
     }
@@ -1443,6 +1767,8 @@ function Write-PerformanceScalingTestManifest {
             waitMilliseconds = 2.0; validateMilliseconds = 1.0; commitMilliseconds = 1.0
             totalParallelMilliseconds = 6.0
             exactSerialOperationMilliseconds = 12.0; netSpeedup = 2.0
+            exactSerialOperationMillisecondsKnown = $true
+            timingAttribution = 'owner-stack-exclusive-v1'
         }
         for ($repeat = 0; $repeat -lt 5; ++$repeat) {
             $receipt = $runReceipts["dense-eight-player|physical-8|$repeat"]
@@ -1452,6 +1778,8 @@ function Write-PerformanceScalingTestManifest {
                 captureMilliseconds = 1.0; scheduleMilliseconds = 1.0
                 waitMilliseconds = 2.0; validateMilliseconds = 1.0
                 commitMilliseconds = 1.0; exactSerialOperationMilliseconds = 12.0
+                exactSerialOperationMillisecondsKnown = $true
+                timingAttribution = 'owner-stack-exclusive-v1'
             }
         }
     }
@@ -1459,6 +1787,8 @@ function Write-PerformanceScalingTestManifest {
     foreach ($index in 0..3) {
         $fixtures += [ordered]@{
             name = $fixtureNames[$index]; playerCount = 8; peakUnitCount = $unitCounts[$index]
+            requestedMinimumUnitCount = $minimumCounts[$index]
+            minimumInitialUnitCount = $unitCounts[$index]
             repeats = 5; stage3OneWorkerMilliseconds = 1000.0
             stage5OneWorkerMilliseconds = 1020.0; eightPhysicalCoreMilliseconds = 500.0
             sixteenPhysicalCoreMilliseconds = 450.0; oneWorkerRegressionRatio = 1.02
@@ -1466,8 +1796,8 @@ function Write-PerformanceScalingTestManifest {
         }
     }
     Write-JsonDocument $rawPath ([ordered]@{
-        schemaVersion = 1; evidenceKind = 'stage5-performance-scaling-raw-samples'
-        producer = 'installed-runtime-scaling-runner-v1'; sourceCommit = $SourceCommit
+        schemaVersion = 2; evidenceKind = 'stage5-performance-scaling-raw-samples'
+        producer = 'installed-runtime-scaling-runner-v2'; sourceCommit = $SourceCommit
         artifactSetSha256 = $ArtifactSetSha256; title = $Title
         executableSha256 = $ExecutableSha256; stage3SourceCommit = ('b' * 40)
         stage3ExecutableSha256 = $stage3ExecutableSha256
@@ -1478,7 +1808,7 @@ function Write-PerformanceScalingTestManifest {
         kernelSamples = $kernelSamples
     })
     Write-JsonDocument $Path ([ordered]@{
-        schemaVersion = 1; evidenceKind = 'stage5-performance-scaling'; status = 'passed'
+        schemaVersion = 2; evidenceKind = 'stage5-performance-scaling'; status = 'passed'
         sourceCommit = $SourceCommit; artifactSetSha256 = $ArtifactSetSha256
         title = $Title; executableSha256 = $ExecutableSha256
         stage3BaselineSha256 = $Stage3BaselineSha256
@@ -1504,6 +1834,447 @@ function Write-PerformanceScalingTestManifest {
         kernelTimings = $kernels
         fixtures = $fixtures
     })
+}
+
+function Assert-PerformanceScalingPerRunArithmetic {
+    param([string]$Path, [string]$SourceCommit, [string]$ArtifactSetSha256,
+        [string]$ExecutableSha256, [string]$Stage3BaselineSha256)
+    Write-PerformanceScalingTestManifest $Path $SourceCommit $ArtifactSetSha256 `
+        $ExecutableSha256 $Stage3BaselineSha256
+    $summary = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    $rawPath = Join-Path (Split-Path -Parent $Path) $summary.rawSampleManifest.path
+    $raw = Get-Content -LiteralPath $rawPath -Raw | ConvertFrom-Json
+    # Five real totals are 105,105,5,105,105. The independent component
+    # medians add to 5, which is not the median measured pipeline cost (105).
+    $capture = @(101.0, 1.0, 1.0, 101.0, 1.0)
+    $wait = @(1.0, 101.0, 1.0, 1.0, 101.0)
+    foreach ($repeat in 0..4) {
+        $raw.kernelSamples[$repeat].captureMilliseconds = $capture[$repeat]
+        $raw.kernelSamples[$repeat].waitMilliseconds = $wait[$repeat]
+        $raw.kernelSamples[$repeat].exactSerialOperationMilliseconds = 210.0
+    }
+    $summary.kernelTimings[0].captureMilliseconds = 1.0
+    $summary.kernelTimings[0].waitMilliseconds = 1.0
+    $summary.kernelTimings[0].totalParallelMilliseconds = 105.0
+    $summary.kernelTimings[0].exactSerialOperationMilliseconds = 210.0
+    $summary.kernelTimings[0].netSpeedup = 2.0
+    Write-JsonDocument $rawPath $raw
+    $summary.rawSampleManifest.sha256 = Get-Sha256 $rawPath
+    Write-JsonDocument $Path $summary
+    try {
+        $proof = Read-Stage5PerformanceScalingEvidence $Path $SourceCommit `
+            $ArtifactSetSha256 $ExecutableSha256 $Stage3BaselineSha256
+        Assert-True ($proof.kernelCount -eq 6) `
+            'scaling accepts the median of matched per-run component sums'
+    }
+    catch {
+        Assert-True $false "scaling must use matched per-run sums, not a sum of component medians: $($_.Exception.Message)"
+    }
+}
+
+function Assert-PerformanceScalingVersionedContract {
+    param([string]$Path, [string]$SourceCommit, [string]$ArtifactSetSha256,
+        [string]$ExecutableSha256, [string]$Stage3BaselineSha256)
+    Write-PerformanceScalingTestManifest $Path $SourceCommit $ArtifactSetSha256 `
+        $ExecutableSha256 $Stage3BaselineSha256
+    $summary = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    $summary.schemaVersion = 1
+    Write-JsonDocument $Path $summary
+    Assert-Throws { Read-Stage5PerformanceScalingEvidence $Path $SourceCommit `
+        $ArtifactSetSha256 $ExecutableSha256 $Stage3BaselineSha256 } 'provenance|schema' `
+        'obsolete phase contracts cannot silently satisfy versioned scaling acceptance'
+    Write-PerformanceScalingTestManifest $Path $SourceCommit $ArtifactSetSha256 `
+        $ExecutableSha256 $Stage3BaselineSha256
+    $summary = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    $rawPath = Join-Path (Split-Path -Parent $Path) $summary.rawSampleManifest.path
+    $raw = Get-Content -LiteralPath $rawPath -Raw | ConvertFrom-Json
+    $raw.fixtureSamples[0].peakUnitCount = 1007
+    $summary.fixtures[0].peakUnitCount = 1007
+    Write-JsonDocument $rawPath $raw
+    $summary.rawSampleManifest.sha256 = Get-Sha256 $rawPath
+    Write-JsonDocument $Path $summary
+    try {
+        $proof = Read-Stage5PerformanceScalingEvidence $Path $SourceCommit `
+            $ArtifactSetSha256 $ExecutableSha256 $Stage3BaselineSha256
+        Assert-True ($proof.fixtureCount -eq 4) `
+            'completed-frame peaks may vary while requested minimum workload remains fixed'
+    }
+    catch { Assert-True $false "variable measured peaks must be accepted: $($_.Exception.Message)" }
+    Write-PerformanceScalingTestManifest $Path $SourceCommit $ArtifactSetSha256 `
+        $ExecutableSha256 $Stage3BaselineSha256
+    $summary = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    $raw = Get-Content -LiteralPath $rawPath -Raw | ConvertFrom-Json
+    $raw.phaseSamples[0] | Add-Member NoteProperty serialMillisecondsKnown $false -Force
+    Write-JsonDocument $rawPath $raw
+    $summary.rawSampleManifest.sha256 = Get-Sha256 $rawPath
+    Write-JsonDocument $Path $summary
+    Assert-Throws { Read-Stage5PerformanceScalingEvidence $Path $SourceCommit `
+        $ArtifactSetSha256 $ExecutableSha256 $Stage3BaselineSha256 } 'serial|correlated|unsupported' `
+        'unknown serial coverage cannot qualify as a zero or measured serial fraction'
+}
+
+function Assert-PerformanceDiagnosticsConversion {
+    param([string]$Path, [string]$SourceCommit, [string]$ArtifactSetSha256,
+        [string]$ExecutableSha256)
+    # This test catches a converter that relabels local evidence as acceptance,
+    # includes warmups/oracle time in medians, or trusts changed receipt bytes.
+    if ($null -eq (Get-Command ConvertTo-Stage5PerformanceDiagnostics -ErrorAction SilentlyContinue)) {
+        Assert-True $false 'hash-bound local performance diagnostics converter is available'
+        return
+    }
+    $directory = Split-Path -Parent $Path
+    # A small, real byte-bound artifact/fixture bundle keeps this converter test
+    # independent of the installed-runtime test corpus and large game assets.
+    $dependencyFiles = @(); $artifactEntries = @(); $closureLines = @()
+    foreach ($title in @('Generals', 'ZeroHour')) {
+        foreach ($kind in @('executable', 'launcher', 'launcher-config', 'dll', 'asset')) {
+            $leaf = "diagnostics-$title-$kind.bin"
+            $filePath = Join-Path $directory $leaf
+            Write-JsonDocument $filePath @{ title = $title; kind = $kind }
+            $hash = Get-Sha256 $filePath
+            $dependencyFiles += @{ title = $title; kind = $kind; path = $leaf; sha256 = $hash }
+            $closureLines += "$title|$kind|$leaf|$hash"
+            if ($kind -ceq 'executable') {
+                $artifactEntries += @{ role = "$($title.ToLowerInvariant())-executable"; path = $leaf; sha256 = $hash }
+                if ($title -ceq 'ZeroHour') { $ExecutableSha256 = $hash; $executablePath = $filePath }
+            }
+        }
+    }
+    [Array]::Sort($closureLines, [StringComparer]::Ordinal)
+    $closureHash = Get-Sha256Text (($closureLines -join "`n") + "`n")
+    $dependencyPath = Join-Path $directory 'diagnostics-dependencies.json'
+    Write-JsonDocument $dependencyPath @{ schemaVersion = 1; sourceCommit = $SourceCommit
+        productSet = @('Generals', 'ZeroHour'); architecture = 'x64'; files = $dependencyFiles }
+    $dependencyHash = Get-Sha256 $dependencyPath
+    $artifactPath = Join-Path $directory 'diagnostics-artifacts.json'
+    Write-JsonDocument $artifactPath @{ schemaVersion = 1; sourceCommit = $SourceCommit
+        productSet = @('Generals', 'ZeroHour'); architecture = 'x64'; artifacts = $artifactEntries
+        runtimeClosure = @{ dependencyManifest = @{ path = 'diagnostics-dependencies.json'; sha256 = $dependencyHash }
+            closureSha256 = $closureHash } }
+    $ArtifactSetSha256 = Get-Sha256 $artifactPath
+    $fixtureEntries = @()
+    foreach ($fixture in @(@('one-thousand-units', 1000), @('four-thousand-units', 4000),
+        @('eight-thousand-units', 8000), @('dense-eight-player', 8000))) {
+        $fixturePath = Join-Path $directory "diagnostics-$($fixture[0]).rep"
+        Write-JsonDocument $fixturePath @{ fixture = $fixture[0] }
+        $fixtureEntries += @{ id = $fixture[0]; source = [IO.Path]::GetFileName($fixturePath)
+            sha256 = Get-Sha256 $fixturePath; seed = 1729; playerCount = 8; peakUnitCount = $fixture[1] }
+    }
+    $fixtureManifestPath = Join-Path $directory 'diagnostics-fixtures.json'
+    Write-JsonDocument $fixtureManifestPath @{ schemaVersion = 1
+        evidenceKind = 'stage5-performance-scaling-fixtures'; title = 'ZeroHour'
+        executableSha256 = $ExecutableSha256; fixtures = $fixtureEntries }
+    $replayPath = Join-Path $directory $fixtureEntries[0].source
+    $runs = @()
+    $bindings = @()
+    $times = @(999.0, 10.0, 30.0, 20.0)
+    foreach ($index in 0..3) {
+        $rawPath = Join-Path $directory "diagnostics-$index.log"
+        $timingPath = Join-Path $directory "diagnostics-$index.csv"
+        Write-JsonDocument $rawPath @{ run = $index }
+        Write-JsonDocument $timingPath @{ frame = $index }
+        $receiptPath = Join-Path $directory "diagnostics-$index.receipt.json"
+        $phases = @()
+        foreach ($name in @('owner-intake', 'legacy-mutable-island', 'spatial-work',
+            'owner-tail', 'verification-publication')) {
+            $phases += @{ name = $name; available = $true; totalNanoseconds = 10
+                maximumNanoseconds = 10; sampleCount = 1; serialNanoseconds = 0
+                serialNanosecondsKnown = $false }
+        }
+        $receipt = [ordered]@{
+            schemaVersion = 5; producer = 'game-executable-stage5-performance-report-v5'
+            producerVersion = '5'; evidenceKind = 'stage5-executable-originated-receipt'
+            measurementRole = 'throughput'
+            simulationMode = 'parallel'; schedulerStarted = $true
+            status = 'passed'; title = 'ZeroHour'; sourceCommit = $SourceCommit
+            artifactSetSha256 = $ArtifactSetSha256; executableSha256 = $ExecutableSha256
+            executablePath = $executablePath; runId = "diagnostic-$index"
+            architecture = 'x64'; cohortCreatedUtc = '2026-01-01T00:00:00Z'
+            runtimeClosure = @{ dependencyManifestSha256 = $dependencyHash; closureSha256 = $closureHash }
+            runNonce = "11111111-1111-4111-8111-11111111111$index"
+            cohortNonce = '22222222-2222-4222-8222-222222222222'; commandLine = "test-run-$index"
+            process = @{ id = 20000 + $index; creationTimeUtc100ns = 100 + $index
+                identityAvailable = $true; exitCodeKnown = $true; exitCode = 0 }
+            fixture = @{ id = 'one-thousand-units'; requestedPlayerCount = 8
+                requestedMinimumUnitCount = 1000; contentSha256 = $fixtureEntries[0].sha256
+                replayPath = $replayPath; seed = 1729; seedKnown = $true
+                kind = 'replay'; workloadQualification = 'minimum-qualified'; contentPath = $replayPath
+                identityObserved = $true; retainedReplayPath = ''; retainedReplaySha256 = '' }
+            worker = @{ requestedCount = 1; effectiveCount = 1; policy = 'auto'; pinned = $true
+                availableLogicalCpuCount = 2; reservedOwnerCpuCount = 1; selectedWorkerCpuCount = 1
+                selectedWorkerPhysicalCoreCount = 1; selectedWorkerPhysicalCoreMask = 2
+                selectedWorkerPhysicalCoreMaskComplete = $true }
+            topology = @{ source = 'GetSystemCpuSetInformation'; ownerCpuSetIds = @(0); selectedWorkerCpuSetIds = @(1)
+                cpuSets = @(@{ id = 0; efficiencyClass = 0; group = 0; coreIndex = 0; logicalProcessorIndex = 0
+                    parked = $false; allocatedToOtherProcess = $false; availableToProcess = $true },
+                    @{ id = 1; efficiencyClass = 0; group = 0; coreIndex = 1; logicalProcessorIndex = 1
+                    parked = $false; allocatedToOtherProcess = $false; availableToProcess = $true }) }
+            frames = @{ start = 0; end = 1; final = 1; finalCrcKnown = $true; finalCrc = 123 }
+            workload = @{ sampling = 'completed-simulation-frame-boundary-v1'; sampleCount = 1
+                firstFrame = 1; lastFrame = 1; playerCount = 8; initialUnitCount = 1000
+                minimumUnitCount = 1000; peakUnitCount = 1000 + $index
+                rosterStable = $true; contiguous = $true }
+            frameSimulation = @{ totalNanoseconds = 100; maximumNanoseconds = 100; sampleCount = 1 }
+            phases = $phases
+            kernelTiming = @{ schemaVersion = 1; mode = 'owner-pipeline-observation'
+                attribution = 'owner-stack-exclusive-v1'; enabled = $true; frozen = $true
+                complete = $true; errors = 0; generation = 1; serialReferenceKnown = $false
+                streams = @(@{ name = 'physics'; subtype = 0; attemptedBatches = 1
+                    admittedBatches = 1; committedBatches = 1; abortedBatches = 0
+                    firstFrame = 1; lastFrame = 1; activePipelineNanoseconds = 5
+                    inclusiveBatchNanoseconds = 10; maximumBatchNanoseconds = 10
+                    stages = @(@{name='capture';totalNanoseconds=1;sampleCount=1},
+                        @{name='schedule';totalNanoseconds=1;sampleCount=1},
+                        @{name='wait';totalNanoseconds=1;sampleCount=1},
+                        @{name='validate';totalNanoseconds=1;sampleCount=1},
+                        @{name='commit';totalNanoseconds=1;sampleCount=1}) }) }
+            kernelReference = @{ schemaVersion = 1; mode = 'throughput-binding'
+                frozen = $true; complete = $true; errors = 0; generation = 1
+                streams = @(@{ name = 'physics'; subtype = 0; fieldSchema = 1
+                    firstFrame = 1; lastFrame = 1; validatedBatchCount = 1
+                    committedBatchCount = 1; abortedBatchCount = 0
+                    validatedOperationCount = 2; committedOperationCount = 2
+                    serialSampleCount = 0; serialNanoseconds = 0; maximumSerialNanoseconds = 0
+                    inputSha256 = ('A' * 64); outputSha256 = ('B' * 64); commitSha256 = ('C' * 64) }) }
+            rawEvidence = @{ rawLogPath = $rawPath; rawLogSha256 = Get-Sha256 $rawPath
+                timingPath = $timingPath; timingSha256 = Get-Sha256 $timingPath
+                timingClosed = $true; timingWriteSucceeded = $true; timingTruncated = $false
+                timingComplete = $true; timingSessionCount = 1; timingFrameSamples = 2
+                timingFirstFrame = 0; timingLastFrame = 1 }
+        }
+        Write-JsonDocument $receiptPath $receipt
+        $binding = [ordered]@{
+            path = $receiptPath; sha256 = Get-Sha256 $receiptPath
+            runId = $receipt.runId; runNonce = $receipt.runNonce; cohortNonce = $receipt.cohortNonce
+            processId = $receipt.process.id; processCreationTimeUtc100ns = $receipt.process.creationTimeUtc100ns
+            executablePath = $receipt.executablePath; executableSha256 = $ExecutableSha256
+            commandLine = $receipt.commandLine; rawLogPath = $rawPath; rawLogSha256 = Get-Sha256 $rawPath
+            timingPath = $timingPath; timingSha256 = Get-Sha256 $timingPath
+        }
+        $bindings += $binding
+        $runs += [ordered]@{
+            fixtureId = 'one-thousand-units'; lane = 'forced-one'; ordinal = $index
+            warmup = $index -eq 0; elapsedMilliseconds = $times[$index]
+            runId = $receipt.runId; processId = $receipt.process.id
+            processCreationTimeUtc100ns = $receipt.process.creationTimeUtc100ns
+            receiptPath = $receiptPath; receiptSha256 = $binding.sha256; receiptBinding = $binding
+            rawLogPath = $rawPath; rawLogSha256 = $binding.rawLogSha256
+            timingPath = $timingPath; timingSha256 = $binding.timingSha256
+            selectedWorkerCpuSetIds = @(1); selectedPhysicalCoreMask = '0000000000000002'
+        }
+    }
+    $hostAggregate = [ordered]@{
+        schemaVersion = 2; evidenceKind = 'stage5-performance-scaling-local-capacity-smoke'
+        producer = 'Invoke-Stage5PerformanceScalingValidation.ps1'; status = 'passed'
+        qualificationMode = 'LocalCapacitySmoke'; measurementMode = 'headless-throughput'; installedRuntime = $true
+        sourceCommit = $SourceCommit; artifactSetSha256 = $ArtifactSetSha256; title = 'ZeroHour'
+        executable = @{ path = $executablePath; sha256 = $ExecutableSha256 }
+        artifactSetManifest = @{ path = $artifactPath; sha256 = $ArtifactSetSha256 }
+        runtimeClosure = @{ dependencyManifestPath = 'diagnostics-dependencies.json'
+            dependencyManifestSha256 = $dependencyHash; closureSha256 = $closureHash; fileCount = 10 }
+        fixtureManifest = @{ path = $fixtureManifestPath; sha256 = Get-Sha256 $fixtureManifestPath }
+        referencePolicy = 'throughput-only'; pairedOracleBindings = @()
+        nativeReceiptBindings = $bindings; runs = $runs
+    }
+    Write-JsonDocument $Path $hostAggregate
+    $proof = ConvertTo-Stage5PerformanceDiagnostics $Path (Get-Sha256 $Path) `
+        $SourceCommit $ArtifactSetSha256 $ExecutableSha256 'ZeroHour'
+    Assert-True (@($proof).Count -eq 1 -and -not $proof.finalAcceptanceClaim -and $proof.status -ceq 'diagnostic' -and
+        $proof.schemaVersion -eq 3 -and $proof.runs[1].measurementRole -ceq 'throughput' -and
+        $proof.runs[1].kernelReference.streams[0].committedOperationCount -eq 2 -and
+        $proof.lanes[0].medianElapsedMilliseconds -eq 20.0 -and $proof.lanes[0].measuredRuns -eq 3) `
+        'local converter retains canonical batch/operation identity and excludes warmups from throughput medians'
+    Assert-True ($proof.blockedBy -contains 'phase-serial-coverage-unknown' -and
+        $proof.blockedBy -contains 'same-input-serial-reference-unavailable') `
+        'local converter preserves both independent serial evidence prerequisites'
+    Assert-Throws { ConvertTo-Stage5PerformanceDiagnostics $Path (Get-Sha256 $Path) `
+        $SourceCommit $ArtifactSetSha256 $ExecutableSha256 'ZeroHour' -RequireAcceptance } 'serial|acceptance' `
+        'local converter cannot manufacture an external acceptance result'
+    $originalReceipt = Get-Content -LiteralPath $runs[1].receiptPath -Raw
+    $publishMutation = {
+        param([object]$Value)
+        Write-JsonDocument $runs[1].receiptPath $Value
+        $bindings[1].sha256 = Get-Sha256 $runs[1].receiptPath
+        $runs[1].receiptSha256 = $bindings[1].sha256
+        Write-JsonDocument $Path $hostAggregate
+    }
+    $changed = $originalReceipt | ConvertFrom-Json
+    $changed.schemaVersion = 4; $changed.producer = 'game-executable-stage5-performance-report-v4'
+    $changed.producerVersion = '4'
+    & $publishMutation $changed
+    Assert-Throws { ConvertTo-Stage5PerformanceDiagnostics $Path (Get-Sha256 $Path) `
+        $SourceCommit $ArtifactSetSha256 $ExecutableSha256 'ZeroHour' } 'provenance|V5' `
+        'obsolete unbound receipt protocol is rejected even when its bytes are hash-bound'
+    $changed = $originalReceipt | ConvertFrom-Json
+    $changed.measurementRole = 'serial-oracle'; $changed.kernelReference.mode = 'serial-oracle'
+    $changed.kernelReference.streams[0].serialSampleCount = 1
+    $changed.kernelReference.streams[0].serialNanoseconds = 7
+    $changed.kernelReference.streams[0].maximumSerialNanoseconds = 7
+    & $publishMutation $changed
+    Assert-Throws { ConvertTo-Stage5PerformanceDiagnostics $Path (Get-Sha256 $Path) `
+        $SourceCommit $ArtifactSetSha256 $ExecutableSha256 'ZeroHour' } 'throughput|role|oracle' `
+        'serial-oracle process elapsed cannot enter throughput medians'
+    $changed = $originalReceipt | ConvertFrom-Json
+    $changed.kernelReference.streams[0].serialNanoseconds = 7
+    & $publishMutation $changed
+    Assert-Throws { ConvertTo-Stage5PerformanceDiagnostics $Path (Get-Sha256 $Path) `
+        $SourceCommit $ArtifactSetSha256 $ExecutableSha256 'ZeroHour' } 'serial|reference' `
+        'a throughput label cannot hide executed serial cost'
+    $changed = $originalReceipt | ConvertFrom-Json
+    $changed.kernelReference.streams[0].committedBatchCount = 0
+    $changed.kernelReference.streams[0].abortedBatchCount = 1
+    $changed.kernelReference.streams[0].committedOperationCount = 0
+    & $publishMutation $changed
+    Assert-Throws { ConvertTo-Stage5PerformanceDiagnostics $Path (Get-Sha256 $Path) `
+        $SourceCommit $ArtifactSetSha256 $ExecutableSha256 'ZeroHour' } 'reference|commit|timing' `
+        'reference commit disposition must match timing batches, not operation count'
+    $changed = $originalReceipt | ConvertFrom-Json
+    $changed.kernelReference.streams[0].validatedOperationCount = 3
+    & $publishMutation $changed
+    Assert-Throws { ConvertTo-Stage5PerformanceDiagnostics $Path (Get-Sha256 $Path) `
+        $SourceCommit $ArtifactSetSha256 $ExecutableSha256 'ZeroHour' } 'reference|operation' `
+        'no aborted batch means no validated operation may disappear'
+    $changed = $originalReceipt | ConvertFrom-Json
+    $changed.kernelTiming.streams[0].committedBatches = 0
+    $changed.kernelTiming.streams[0].abortedBatches = 1
+    $changed.kernelReference.streams[0].committedBatchCount = 0
+    $changed.kernelReference.streams[0].abortedBatchCount = 1
+    $changed.kernelReference.streams[0].committedOperationCount = 1
+    & $publishMutation $changed
+    Assert-Throws { ConvertTo-Stage5PerformanceDiagnostics $Path (Get-Sha256 $Path) `
+        $SourceCommit $ArtifactSetSha256 $ExecutableSha256 'ZeroHour' } 'reference|operation' `
+        'zero committed batches cannot own committed operations'
+    $changed = $originalReceipt | ConvertFrom-Json
+    $changed.kernelReference.streams[0].inputSha256 = ''
+    & $publishMutation $changed
+    Assert-Throws { ConvertTo-Stage5PerformanceDiagnostics $Path (Get-Sha256 $Path) `
+        $SourceCommit $ArtifactSetSha256 $ExecutableSha256 'ZeroHour' } 'digest|hash|reference' `
+        'missing canonical input binding cannot be reported as valid diagnostics'
+    & $publishMutation ($originalReceipt | ConvertFrom-Json)
+    Write-JsonDocument $runs[1].receiptPath @{ changed = $true }
+    Assert-Throws { ConvertTo-Stage5PerformanceDiagnostics $Path (Get-Sha256 $Path) `
+        $SourceCommit $ArtifactSetSha256 $ExecutableSha256 'ZeroHour' } 'SHA-256|hash' `
+        'local converter rechecks receipt hashes instead of trusting aggregate status'
+    & $publishMutation ($originalReceipt | ConvertFrom-Json)
+    $hostAggregate.schemaVersion = 1
+    Write-JsonDocument $Path $hostAggregate
+    Assert-Throws { ConvertTo-Stage5PerformanceDiagnostics $Path (Get-Sha256 $Path) `
+        $SourceCommit $ArtifactSetSha256 $ExecutableSha256 'ZeroHour' } 'aggregate|version|protocol' `
+        'an obsolete host aggregate cannot be silently reinterpreted as the paired protocol'
+    $hostAggregate.schemaVersion = 2
+    $hostAggregate.referencePolicy = 'paired-serial-oracle-v1'
+    $serialTimes = @(7777, 10, 30, 20)
+    $pairs = @()
+    foreach ($index in 0..3) {
+        $oracle = Get-Content -LiteralPath $runs[$index].receiptPath -Raw | ConvertFrom-Json
+        $oracle.runId = "oracle-$index"
+        $oracle.runNonce = "33333333-3333-4333-8333-33333333333$index"
+        $oracle.process.id = 30000 + $index; $oracle.process.creationTimeUtc100ns = 200 + $index
+        $oracle.measurementRole = 'serial-oracle'; $oracle.kernelReference.mode = 'serial-oracle'
+        $oracle.kernelReference.streams[0].serialSampleCount = 1
+        $oracle.kernelReference.streams[0].serialNanoseconds = $serialTimes[$index]
+        $oracle.kernelReference.streams[0].maximumSerialNanoseconds = $serialTimes[$index]
+        # Oracle pipeline/elapsed time is intentionally enormous and must not
+        # contaminate the throughput denominator or its 20ms median.
+        $oracle.kernelTiming.streams[0].activePipelineNanoseconds = 500000
+        $oracle.kernelTiming.streams[0].inclusiveBatchNanoseconds = 500000
+        $oracle.kernelTiming.streams[0].maximumBatchNanoseconds = 500000
+        foreach ($stage in $oracle.kernelTiming.streams[0].stages) { $stage.totalNanoseconds = 100000 }
+        $oracleRaw = Join-Path $directory "oracle-$index.log"
+        $oracleTiming = Join-Path $directory "oracle-$index.csv"
+        Write-JsonDocument $oracleRaw @{ oracle = $index }
+        Write-JsonDocument $oracleTiming @{ oracleFrame = $index }
+        $oracle.rawEvidence.rawLogPath = $oracleRaw; $oracle.rawEvidence.rawLogSha256 = Get-Sha256 $oracleRaw
+        $oracle.rawEvidence.timingPath = $oracleTiming; $oracle.rawEvidence.timingSha256 = Get-Sha256 $oracleTiming
+        $oraclePath = Join-Path $directory "oracle-$index.receipt.json"
+        Write-JsonDocument $oraclePath $oracle
+        $oracleRun = $runs[$index] | ConvertTo-Json -Depth 30 | ConvertFrom-Json
+        $oracleRun.runId = $oracle.runId; $oracleRun.processId = $oracle.process.id
+        $oracleRun.processCreationTimeUtc100ns = $oracle.process.creationTimeUtc100ns
+        $oracleRun.elapsedMilliseconds = 999999
+        $oracleRun.receiptPath = $oraclePath; $oracleRun.receiptSha256 = Get-Sha256 $oraclePath
+        $oracleRun.rawLogPath = $oracleRaw; $oracleRun.rawLogSha256 = $oracle.rawEvidence.rawLogSha256
+        $oracleRun.timingPath = $oracleTiming; $oracleRun.timingSha256 = $oracle.rawEvidence.timingSha256
+        $oracleRun.receiptBinding.path = $oraclePath; $oracleRun.receiptBinding.sha256 = $oracleRun.receiptSha256
+        $oracleRun.receiptBinding.runId = $oracle.runId; $oracleRun.receiptBinding.runNonce = $oracle.runNonce
+        $oracleRun.receiptBinding.processId = $oracle.process.id
+        $oracleRun.receiptBinding.processCreationTimeUtc100ns = $oracle.process.creationTimeUtc100ns
+        $oracleRun.receiptBinding.rawLogPath = $oracleRaw; $oracleRun.receiptBinding.rawLogSha256 = $oracle.rawEvidence.rawLogSha256
+        $oracleRun.receiptBinding.timingPath = $oracleTiming; $oracleRun.receiptBinding.timingSha256 = $oracle.rawEvidence.timingSha256
+        $pairs += @{ throughputRunId = $runs[$index].runId; oracleRun = $oracleRun }
+    }
+    $hostAggregate.pairedOracleBindings = $pairs
+    Write-JsonDocument $Path $hostAggregate
+    $pairedProof = ConvertTo-Stage5PerformanceDiagnostics $Path (Get-Sha256 $Path) `
+        $SourceCommit $ArtifactSetSha256 $ExecutableSha256 'ZeroHour'
+    Assert-True (@($pairedProof).Count -eq 1 -and $pairedProof.runs.Count -eq 4 -and $pairedProof.pairedOracleBindings.Count -eq 4 -and
+        $pairedProof.lanes[0].medianElapsedMilliseconds -eq 20.0 -and
+        $pairedProof.kernelComparisons[0].measuredPairs -eq 3 -and
+        $pairedProof.kernelComparisons[0].medianPipelineNanoseconds -eq 5 -and
+        $pairedProof.kernelComparisons[0].medianSerialNanoseconds -eq 20 -and
+        $pairedProof.kernelComparisons[0].netSpeedup -eq 4) `
+        'matched independent oracle costs exclude warmups and all oracle pipeline/process elapsed'
+    Assert-True (-not $pairedProof.finalAcceptanceClaim -and
+        $pairedProof.blockedBy -contains 'phase-serial-coverage-unknown' -and
+        $pairedProof.blockedBy -contains 'kernel-reference-coverage-incomplete' -and
+        $pairedProof.blockedBy -notcontains 'same-input-serial-reference-unavailable') `
+        'a matched partial kernel proof does not manufacture whole-frame or six-kernel acceptance'
+    Assert-Throws { ConvertTo-Stage5PerformanceDiagnostics $Path (Get-Sha256 $Path) `
+        $SourceCommit $ArtifactSetSha256 $ExecutableSha256 'ZeroHour' -RequireAcceptance } 'serial|acceptance' `
+        'paired serial kernels still cannot satisfy missing phase-serial coverage'
+    $originalOracle = Get-Content -LiteralPath $pairs[1].oracleRun.receiptPath -Raw
+    $publishOracle = {
+        param([object]$Value)
+        $run = $pairs[1].oracleRun
+        Write-JsonDocument $run.receiptPath $Value
+        $run.receiptSha256 = Get-Sha256 $run.receiptPath; $run.receiptBinding.sha256 = $run.receiptSha256
+        Write-JsonDocument $Path $hostAggregate
+    }
+    foreach ($field in @('inputSha256', 'outputSha256', 'commitSha256')) {
+        $changed = $originalOracle | ConvertFrom-Json
+        $changed.kernelReference.streams[0].$field = 'D' * 64
+        & $publishOracle $changed
+        Assert-Throws { ConvertTo-Stage5PerformanceDiagnostics $Path (Get-Sha256 $Path) `
+            $SourceCommit $ArtifactSetSha256 $ExecutableSha256 'ZeroHour' } 'pair|reference|match' `
+            "paired oracle rejects independently rehashed unequal $field"
+    }
+    foreach ($mutation in @('seed', 'worker', 'topology', 'command', 'count')) {
+        $changed = $originalOracle | ConvertFrom-Json
+        switch ($mutation) {
+            'seed' { $changed.fixture.seed = 1730 }
+            'worker' { $changed.worker.policy = 'all' }
+            'topology' { $changed.topology.cpuSets[0].efficiencyClass = 1 }
+            'command' { $changed.commandLine += ' -different'; $pairs[1].oracleRun.receiptBinding.commandLine = $changed.commandLine }
+            'count' { $changed.kernelReference.streams[0].validatedOperationCount = 3; $changed.kernelReference.streams[0].committedOperationCount = 3 }
+        }
+        & $publishOracle $changed
+        Assert-Throws { ConvertTo-Stage5PerformanceDiagnostics $Path (Get-Sha256 $Path) `
+            $SourceCommit $ArtifactSetSha256 $ExecutableSha256 'ZeroHour' } 'pair|fixture|reference|match' `
+            "paired oracle rejects independently rehashed unequal $mutation"
+        $pairs[1].oracleRun.receiptBinding.commandLine = ($originalOracle | ConvertFrom-Json).commandLine
+    }
+    & $publishOracle ($originalOracle | ConvertFrom-Json)
+    $hostAggregate.pairedOracleBindings = @($pairs[0], $pairs[0], $pairs[2], $pairs[3])
+    Write-JsonDocument $Path $hostAggregate
+    Assert-Throws { ConvertTo-Stage5PerformanceDiagnostics $Path (Get-Sha256 $Path) `
+        $SourceCommit $ArtifactSetSha256 $ExecutableSha256 'ZeroHour' } 'pair|duplicate|repeat' `
+        'one oracle pair cannot be reused for another throughput run'
+    $hostAggregate.pairedOracleBindings = @($pairs[0], $pairs[1], $pairs[2])
+    Write-JsonDocument $Path $hostAggregate
+    Assert-Throws { ConvertTo-Stage5PerformanceDiagnostics $Path (Get-Sha256 $Path) `
+        $SourceCommit $ArtifactSetSha256 $ExecutableSha256 'ZeroHour' } 'pair|count|missing' `
+        'every scheduled throughput run including warmup requires its own oracle'
+    $hostAggregate.pairedOracleBindings = $pairs
+    Write-JsonDocument $Path $hostAggregate
+    Write-JsonDocument $replayPath @{ changedReplay = $true }
+    Assert-Throws { ConvertTo-Stage5PerformanceDiagnostics $Path (Get-Sha256 $Path) `
+        $SourceCommit $ArtifactSetSha256 $ExecutableSha256 'ZeroHour' } 'fixture|replay|SHA-256|hash' `
+        'matching receipt strings cannot hide changed actual reviewed replay bytes'
+    Write-JsonDocument $replayPath @{ fixture = 'one-thousand-units' }
+    Write-JsonDocument $dependencyPath @{ changedDependencyManifest = $true }
+    Assert-Throws { ConvertTo-Stage5PerformanceDiagnostics $Path (Get-Sha256 $Path) `
+        $SourceCommit $ArtifactSetSha256 $ExecutableSha256 'ZeroHour' } 'dependency|closure|SHA-256|hash' `
+        'matching receipt closure strings cannot hide changed dependency manifest bytes'
 }
 
 function Write-TestManifest {
@@ -5522,6 +6293,8 @@ try {
     $immutableReceipt.provenance.children = @()
     Write-JsonDocument $immutableReceiptPath $immutableReceipt
 
+    Assert-CurrentNativeReceiptCatalog $attachmentRoot $sourceCommit $artifactSetHash $artifactTestHashes
+
     $executableReceiptPath = Join-Path $attachmentRoot `
         'executable-validation-results.json'
     Write-Stage5ExecutableReceiptTestDocument $executableReceiptPath `
@@ -5535,7 +6308,7 @@ try {
     }
     $executableRead = Read-Stage5FinalAcceptanceImmutableReceipt @executableArgs
     Assert-True ($executableRead.trustDomain -ceq 'executable' -and
-        $executableRead.producer -ceq 'game-executable-stage5-performance-report-v2' -and
+        $executableRead.producer -ceq 'game-executable-stage5-performance-report-v5' -and
         $executableRead.provenance.kind -ceq 'native-executable-observation') `
         'an executable-originated receipt is accepted only with its role-bound native receipt'
     $nativeReceiptPath = Join-Path $attachmentRoot 'executable-validation-results.native.json'
@@ -5858,6 +6631,14 @@ try {
     Assert-True ($scalingProof.physicalCoreCount -eq 16 -and
         $scalingProof.fixtureCount -eq 4 -and $scalingProof.kernelCount -eq 6) `
         'canonical scaling evidence proves physical topology, realistic fixtures, and six kernels'
+
+    Assert-PerformanceScalingPerRunArithmetic `
+        (Join-Path $attachmentRoot 'scaling-per-run-arithmetic.json') $sourceCommit `
+        $artifactSetHash $artifactTestHashes['zerohour-executable'] $scalingBaselineHash
+    Assert-PerformanceDiagnosticsConversion (Join-Path $attachmentRoot 'scaling-diagnostics-input.json') `
+        $sourceCommit $artifactSetHash $artifactTestHashes['zerohour-executable']
+    Assert-PerformanceScalingVersionedContract (Join-Path $attachmentRoot 'scaling-versioned.json') `
+        $sourceCommit $artifactSetHash $artifactTestHashes['zerohour-executable'] $scalingBaselineHash
 
     $generalsScalingPath = Join-Path $attachmentRoot 'scaling-generals.json'
     Write-PerformanceScalingTestManifest $generalsScalingPath $sourceCommit `

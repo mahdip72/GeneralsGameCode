@@ -41,8 +41,11 @@ typedef unsigned __int64 PhysicsIntegrationMetricCounter;
 #else
 typedef unsigned long long PhysicsIntegrationMetricCounter;
 #endif
-struct PhysicsIntegrationSnapshot;
-struct PhysicsIntegrationOutput;
+	struct PhysicsIntegrationSnapshot;
+	struct PhysicsIntegrationOutput;
+#if defined(_WIN64)
+	namespace performance { struct KernelPerformanceBatch; }
+#endif
 }
 
 enum ObjectID CPP_11(: Int);
@@ -113,7 +116,11 @@ public:
 		const rts::PhysicsIntegrationSnapshot &snapshot,
 		const rts::PhysicsIntegrationOutput &output,
 		rts::PhysicsIntegrationMetricCounter commitStart,
-		rts::PhysicsIntegrationMetricCounter &commitNanoseconds);
+		rts::PhysicsIntegrationMetricCounter &commitNanoseconds
+#if defined(_WIN64)
+		, const rts::performance::KernelPerformanceBatch *performanceBatch
+#endif
+		);
 	Bool captureIntegrationPrefixSnapshot(
 		rts::PhysicsIntegrationSnapshot &snapshot, UnsignedInt frame,
 		UnsignedInt worldEpoch, UnsignedInt wakePriority,
@@ -301,7 +308,11 @@ private:
 	UpdateSleepTime updateImpl(const rts::PhysicsIntegrationSnapshot *snapshot,
 		const rts::PhysicsIntegrationOutput *output,
 		rts::PhysicsIntegrationMetricCounter commitStart,
-		rts::PhysicsIntegrationMetricCounter *commitNanoseconds);
+		rts::PhysicsIntegrationMetricCounter *commitNanoseconds
+#if defined(_WIN64)
+		, const rts::performance::KernelPerformanceBatch *performanceBatch
+#endif
+		);
 
 
 };

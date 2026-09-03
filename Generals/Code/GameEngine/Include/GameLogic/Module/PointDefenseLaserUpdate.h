@@ -86,7 +86,8 @@ public:
 protected:
 	Object* scanClosestTargetScheduled();
 	Object* scanClosestTargetOwner( ObjectID *orderedIDs,
-		UnsignedInt orderedCapacity, UnsignedInt *orderedCount );
+		UnsignedInt orderedCapacity, UnsignedInt *orderedCount,
+		Bool measureSpatialCommit = FALSE );
 
 	ObjectID m_bestTargetID;
 	Bool m_inRange;
