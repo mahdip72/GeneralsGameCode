@@ -558,6 +558,21 @@ Int parseRunSkirmishAITest4v2ForStartup(char *args[], int num)
 	return 2;
 }
 
+#if defined(_WIN64)
+Int parseRunSkirmishAITestHardAI2v6ForStartup(char *args[], int num)
+{
+	Int seed = 0;
+	parseSkirmishAITestSeedArgument(args, num, &seed);
+
+	parseHeadless(args, num);
+	TheWritableGlobalData->m_shellMapOn = FALSE;
+	TheWritableGlobalData->m_useFpsLimit = FALSE;
+	rts::ClientInstance::setMultiInstance(TRUE);
+	rts::ClientInstance::skipPrimaryInstance();
+	return 2;
+}
+#endif
+
 Int parseRunSkirmishAITest(char *args[], int num)
 {
 	if (TheGlobalData->m_commandLineData.hasSkirmishAITestRequest() ||
@@ -725,6 +740,31 @@ Int parseRunSkirmishAITestPractical1v7(char *args[], int num)
 	}
 	return 2;
 }
+
+#if defined(_WIN64)
+Int parseRunSkirmishAITestHardAI2v6(char *args[], int num)
+{
+	if (TheGlobalData->m_commandLineData.hasSkirmishAITestRequest() ||
+		TheGlobalData->m_commandLineData.hasSkirmishAITest4v2Request() ||
+		TheGlobalData->m_commandLineData.hasSkirmishAITestPractical1v7Request() ||
+		TheGlobalData->m_commandLineData.hasSkirmishAITestHardAI2v6Request())
+	{
+		printf("SKIRMISH_AI_TEST_FAIL seed=0 reason=duplicate_option\n");
+		fflush(stdout);
+		exit(2);
+	}
+
+	Int seed = 0;
+	parseSkirmishAITestSeedArgument(args, num, &seed);
+	if (!TheWritableGlobalData->m_commandLineData.requestSkirmishAITestHardAI2v6(seed))
+	{
+		printf("SKIRMISH_AI_TEST_FAIL seed=0 reason=duplicate_option\n");
+		fflush(stdout);
+		exit(2);
+	}
+	return 2;
+}
+#endif
 
 Int parseRunSkirmishAITestPractical1v7ForStartup(char *args[], int num)
 {
@@ -1483,6 +1523,10 @@ static CommandLineParam paramsForStartup[] =
 	{ "-runSkirmishAITest4v2", parseRunSkirmishAITest4v2ForStartup },
 	{ "-runSkirmishAITestPractical1v7",
 		parseRunSkirmishAITestPractical1v7ForStartup },
+#if defined(_WIN64)
+	{ "-runSkirmishAITestHardAI2v6",
+		parseRunSkirmishAITestHardAI2v6ForStartup },
+#endif
 
 	// TheSuperHackers @feature helmutbuhler 13/04/2025
 	// Play back a replay. Pass the filename including .rep afterwards.
@@ -1514,6 +1558,9 @@ static CommandLineParam paramsForEngineInit[] =
 	{ "-runSkirmishAITest4v2", parseRunSkirmishAITest4v2 },
 	{ "-runSkirmishAITestPractical1v7",
 		parseRunSkirmishAITestPractical1v7 },
+#if defined(_WIN64)
+	{ "-runSkirmishAITestHardAI2v6", parseRunSkirmishAITestHardAI2v6 },
+#endif
 	{ "-nologo", parseNoLogo }, // TheSuperHackers @tweak Is now available in Release builds.
 	{ "-noshellmap", parseNoShellMap },
 	{ "-noShellAnim", parseNoWindowAnimation }, // TheSuperHackers @tweak Is now available in Release builds.

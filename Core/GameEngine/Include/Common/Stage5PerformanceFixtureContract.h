@@ -147,7 +147,8 @@ inline bool IsConflictingOption(const char *option)
 {
 	const char *conflicts[] = { "-replay", "-jobs", "-installedNet3Validation",
 		"-installedLockstepV2Validation", "-runSkirmishAITest", "-runSkirmishAITest4v2",
-		"-runSkirmishAITestPractical1v7", "-loadsave", "-benchmark", "-map", "-file" };
+		"-runSkirmishAITestPractical1v7", "-runSkirmishAITestHardAI2v6",
+		"-loadsave", "-benchmark", "-map", "-file" };
 	for (unsigned i = 0; i < sizeof(conflicts) / sizeof(conflicts[0]); ++i)
 		if (SameToken(option, conflicts[i])) return true;
 	return false;

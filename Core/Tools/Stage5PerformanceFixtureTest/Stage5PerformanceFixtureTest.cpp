@@ -103,6 +103,16 @@ void TestNumericAndConflictingOptions()
 		Check(!Parse(after, 8, request), "conflicting option after fixture is rejected");
 	}
 	rts::fixture::Request request;
+	const char *hardBefore[] = { "game", "-runSkirmishAITestHardAI2v6", "1733",
+		"-headless", "-runStage5PerformanceFixture", "Maps\\Fixture\\Fixture.map",
+		"101", "900" };
+	const char *hardAfter[] = { "game", "-headless", "-runStage5PerformanceFixture",
+		"Maps\\Fixture\\Fixture.map", "101", "900",
+		"-runSkirmishAITestHardAI2v6", "1733" };
+	Check(!Parse(hardBefore, 8, request),
+		"Hard-AI-2v6 option before fixture is rejected as conflicting");
+	Check(!Parse(hardAfter, 8, request),
+		"Hard-AI-2v6 option after fixture is rejected as conflicting");
 	const char *missing[] = { "game", "-headless", "-runStage5PerformanceFixture", "Maps\\Fixture\\Fixture.map", "1" };
 	Check(!Parse(missing, 5, request), "missing budget is rejected");
 }

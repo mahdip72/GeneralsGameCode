@@ -64,7 +64,11 @@ Int GameMain()
 	const Bool skirmishValidationRequested =
 		TheGlobalData->m_commandLineData.hasSkirmishAITestRequest() ||
 		TheGlobalData->m_commandLineData.hasSkirmishAITest4v2Request() ||
-		TheGlobalData->m_commandLineData.hasSkirmishAITestPractical1v7Request();
+		TheGlobalData->m_commandLineData.hasSkirmishAITestPractical1v7Request()
+#if defined(_WIN64)
+		|| TheGlobalData->m_commandLineData.hasSkirmishAITestHardAI2v6Request()
+#endif
+		;
 	const Bool validationOptionsConflict =
 		(performanceFixtureRequested && (net3ValidationRequested || lockstepV2ValidationRequested ||
 			skirmishValidationRequested || !TheGlobalData->m_simulateReplays.empty())) ||
@@ -126,6 +130,12 @@ Int GameMain()
 			ArmSkirmishAITestRunner(
 				TheGlobalData->m_commandLineData.getSkirmishAITestPractical1v7Seed(),
 				SKIRMISH_AI_TEST_SCENARIO_PRACTICAL_1V7);
+#if defined(_WIN64)
+		else if (TheGlobalData->m_commandLineData.hasSkirmishAITestHardAI2v6Request())
+			ArmSkirmishAITestRunner(
+				TheGlobalData->m_commandLineData.getSkirmishAITestHardAI2v6Seed(),
+				SKIRMISH_AI_TEST_SCENARIO_HARD_AI_2V6);
+#endif
 	}
 	const Bool canRun = !validationOptionsConflict && !net3ValidationRequested &&
 		!lockstepV2ValidationRequested &&
