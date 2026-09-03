@@ -1983,7 +1983,8 @@ static void TestSkirmishAITestHardAI2v6Contract()
 
 	Int plannedAiCount = 0;
 	Int plannedTeamCounts[2] = { 0, 0 };
-	for (Int slotIndex = 0; slotIndex < SKIRMISH_AI_TEST_SLOT_COUNT; ++slotIndex)
+	Int slotIndex;
+	for (slotIndex = 0; slotIndex < SKIRMISH_AI_TEST_SLOT_COUNT; ++slotIndex)
 	{
 		const SkirmishAITestSlotPlan &slot = plan.slots[slotIndex];
 		CHECK(slot.state == SLOT_BRUTAL_AI);
@@ -2012,11 +2013,11 @@ static void TestSkirmishAITestHardAI2v6Contract()
 	TheWritableGlobalData = testGlobalData;
 	GameInfo *actualGameInfo = new GameInfo;
 	GameSlot actualSlots[SKIRMISH_AI_TEST_SLOT_COUNT];
-	for (Int slotIndex = 0; slotIndex < SKIRMISH_AI_TEST_SLOT_COUNT; ++slotIndex)
+	for (slotIndex = 0; slotIndex < SKIRMISH_AI_TEST_SLOT_COUNT; ++slotIndex)
 		actualGameInfo->setSlotPointer(slotIndex, &actualSlots[slotIndex]);
 	actualGameInfo->enterGame();
 	actualGameInfo->setLocalIP(0);
-	for (Int slotIndex = 0; slotIndex < SKIRMISH_AI_TEST_SLOT_COUNT; ++slotIndex)
+	for (slotIndex = 0; slotIndex < SKIRMISH_AI_TEST_SLOT_COUNT; ++slotIndex)
 	{
 		const SkirmishAITestSlotPlan &expected = plan.slots[slotIndex];
 		GameSlot *actual = actualGameInfo->getSlot(slotIndex);
@@ -2032,7 +2033,7 @@ static void TestSkirmishAITestHardAI2v6Contract()
 
 	Int actualAiCount = 0;
 	Int actualTeamCounts[2] = { 0, 0 };
-	for (Int slotIndex = 0; slotIndex < SKIRMISH_AI_TEST_SLOT_COUNT; ++slotIndex)
+	for (slotIndex = 0; slotIndex < SKIRMISH_AI_TEST_SLOT_COUNT; ++slotIndex)
 	{
 		const GameSlot *actual = actualGameInfo->getConstSlot(slotIndex);
 		CHECK(actual->isAI() && !actual->isHuman());
