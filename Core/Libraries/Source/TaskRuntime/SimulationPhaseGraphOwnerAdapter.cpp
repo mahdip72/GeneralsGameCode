@@ -271,7 +271,7 @@ bool HasStableLiveSimulationPhaseEvidence(
 }
 
 LiveSimulationPhaseOwnerCallbacks::LiveSimulationPhaseOwnerCallbacks()
-	: isOwner(0), validate(0), commit(0)
+	: isOwner(0), validate(0), commit(0), observe(0)
 {
 }
 
@@ -376,6 +376,14 @@ LiveSimulationPhaseGraphOwnerAdapter::failureResult() const
 		LIVE_SIMULATION_PHASE_FAILED_AFTER_MUTATION;
 }
 
+void LiveSimulationPhaseGraphOwnerAdapter::observeOwnerBoundary(
+	LiveSimulationPhaseObservationBoundary boundary, SimulationPhaseId phaseId,
+	unsigned generation, unsigned frame) const
+{
+	if (m_callbacks.observe != 0)
+		m_callbacks.observe(boundary, phaseId, generation, frame, m_ownerContext);
+}
+
 LiveSimulationPhaseRunResult LiveSimulationPhaseGraphOwnerAdapter::finishRun(
 	LiveSimulationPhaseRunResult result, unsigned frame)
 {
@@ -425,6 +433,12 @@ LiveSimulationPhaseRunResult LiveSimulationPhaseGraphOwnerAdapter::finishRun(
 	}
 	if (m_sequenceViolation)
 		++m_runtimeMetrics.sequenceViolationFrames;
+	// Include graph cleanup and telemetry bookkeeping in the run-owned frame
+	// extent. Only an actual complete frame may close that measured extent.
+	observeOwnerBoundary(result == LIVE_SIMULATION_PHASE_COMPLETED ?
+		LIVE_SIMULATION_PHASE_OBSERVE_FRAME_END :
+		LIVE_SIMULATION_PHASE_OBSERVE_FRAME_ABORT,
+		SIMULATION_PHASE_INVALID_ID, m_graph.generation(), frame);
 	return result;
 }
 
@@ -454,8 +468,15 @@ LiveSimulationPhaseGraphOwnerAdapter::runFrame(unsigned frame)
 		m_runtimeMetrics.lastGeneration = m_graph.generation();
 		m_runtimeMetrics.lastCommittedPhaseCount = 0;
 		m_runtimeMetrics.lastSequenceSignature = 0;
+		// This is not a second measured frame. Latch the run's failure without
+		// replacing or closing the active outer measurement.
+		observeOwnerBoundary(LIVE_SIMULATION_PHASE_OBSERVE_FRAME_ABORT,
+			m_expectedPhaseOrdinal + 1, m_graph.generation(), frame);
 		return LIVE_SIMULATION_PHASE_FAILED_AFTER_MUTATION;
 	}
+	observeOwnerBoundary(LIVE_SIMULATION_PHASE_OBSERVE_FRAME_BEGIN,
+		SIMULATION_PHASE_INVALID_ID,
+		m_nextGeneration == ~0u ? 0 : m_nextGeneration + 1, frame);
 	// Reset validity without copying or formatting a message on successful
 	// frames. All identity fields are replaced together at the first failure.
 	m_failureDiagnostic.boundary = LIVE_SIMULATION_PHASE_FAILURE_NONE;
@@ -528,7 +549,11 @@ LiveSimulationPhaseGraphOwnerAdapter::runFrame(unsigned frame)
 			performanceClockNowNanoseconds();
 		const unsigned committedBeforeAdvance = m_committedPhaseCount;
 		unsigned committedJobs = 0;
+		observeOwnerBoundary(LIVE_SIMULATION_PHASE_OBSERVE_PHASE_BEGIN,
+			phaseOrdinalValue + 1, generationValue, m_inputs[phaseOrdinalValue].frame);
 		const bool advanced = m_graph.advanceOwner(&committedJobs);
+		observeOwnerBoundary(LIVE_SIMULATION_PHASE_OBSERVE_PHASE_END,
+			phaseOrdinalValue + 1, generationValue, m_inputs[phaseOrdinalValue].frame);
 		const JobMetricCounter phaseEndNanoseconds =
 			performanceClockNowNanoseconds();
 		if (m_committedPhaseCount != committedBeforeAdvance)

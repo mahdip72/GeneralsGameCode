@@ -1,5 +1,9 @@
 #include "Lib/SimulationPhaseGraphOwnerAdapter.h"
 
+#if defined(_WIN64)
+#include "Lib/KernelPerformanceDiagnostics.h"
+#endif
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -18,6 +22,10 @@ void require(bool condition, const char *message)
 }
 
 unsigned diagnosticFailures = 0;
+
+#if defined(_WIN64)
+struct AccountingObservation;
+#endif
 
 void requireDiagnostic(bool condition, const char *message)
 {
@@ -40,6 +48,9 @@ struct Harness
 		  standardException(false), annotateFailure(false),
 		  ownerFrame(0), ownerPhaseFrame(0), ownerCursor(0),
 		  titleExceptionMessage(0)
+		  #if defined(_WIN64)
+		  , accounting(0)
+		  #endif
 	{
 		unsigned index;
 		for (index = 0; index != 32; ++index)
@@ -73,6 +84,9 @@ struct Harness
 	unsigned ownerCursor;
 	const char *titleExceptionMessage;
 	rts::LiveSimulationPhaseFailureDiagnostic nestedFailure;
+	#if defined(_WIN64)
+	AccountingObservation *accounting;
+	#endif
 };
 
 struct FakeClock
@@ -93,6 +107,115 @@ rts::JobMetricCounter readFakeClock(void *context)
 	return clock->values[clock->index++];
 }
 
+#if defined(_WIN64)
+struct AccountingClock
+{
+	AccountingClock() : now(100), reads(0) {}
+	rts::JobMetricCounter now;
+	unsigned reads;
+	static rts::JobMetricCounter read(void *context)
+	{
+		AccountingClock &clock = *static_cast<AccountingClock *>(context);
+		++clock.reads;
+		return clock.now++;
+	}
+};
+
+// The real run owner retains this ledger/token and latches invalidate() on an
+// observation failure. A nullable adapter callback transports boundaries only:
+// no replacement timer, inferred completed frame, or dispatch-policy result.
+struct AccountingObservation
+{
+	AccountingObservation() : sampleOrdinal(0), actualOwnerFrame(40),
+		entryFrame(0), entryGeneration(0), abortedFrames(0),
+		failed(false), advanceOwnerWork(false), advanceSchedulerAtVerification(false)
+	{
+		std::memset(phaseFrames, 0, sizeof(phaseFrames));
+		actual.submittedJobs = 17;
+		actual.executedJobs = 17;
+		actual.ownerHelpJobs = 3;
+	}
+
+	rts::performance::KernelPerformanceLedger ledger;
+	rts::performance::KernelPerformanceFrame frame;
+	rts::performance::KernelPerformanceSchedulerBoundary actual;
+	AccountingClock clock;
+	rts::JobMetricCounter sampleOrdinal;
+	unsigned actualOwnerFrame, entryFrame, entryGeneration, abortedFrames;
+	unsigned phaseFrames[5];
+	bool failed, advanceOwnerWork, advanceSchedulerAtVerification;
+};
+
+void observeAccounting(rts::LiveSimulationPhaseObservationBoundary boundary,
+	rts::SimulationPhaseId phaseId, unsigned generation, unsigned ownerFrame,
+	void *context)
+{
+	using namespace rts::performance;
+	AccountingObservation &observation =
+		*static_cast<Harness *>(context)->accounting;
+	bool accepted = true;
+	switch (boundary)
+	{
+	case rts::LIVE_SIMULATION_PHASE_OBSERVE_FRAME_BEGIN:
+		observation.entryFrame = ownerFrame;
+		observation.entryGeneration = generation;
+		observation.frame = observation.ledger.beginFrame(
+			++observation.sampleOrdinal, ownerFrame, observation.actual);
+		accepted = observation.frame.valid();
+		break;
+	case rts::LIVE_SIMULATION_PHASE_OBSERVE_PHASE_BEGIN:
+		if (phaseId < 1 || phaseId > 5) { accepted = false; break; }
+		observation.phaseFrames[phaseId - 1] = ownerFrame;
+		accepted = observation.ledger.beginPhase(observation.frame,
+			static_cast<KernelPerformancePhase>(phaseId - 1));
+		break;
+	case rts::LIVE_SIMULATION_PHASE_OBSERVE_PHASE_END:
+		accepted = observation.ledger.endPhase(observation.frame,
+			static_cast<KernelPerformancePhase>(phaseId - 1));
+		break;
+	case rts::LIVE_SIMULATION_PHASE_OBSERVE_FRAME_END:
+		// Verification increments the real owner's frame after authority was
+		// validated. Read that owner state, never ownerFrame + 1.
+		accepted = observation.ledger.endFrame(observation.frame,
+			observation.actualOwnerFrame, observation.actual);
+		if (accepted) observation.frame = KernelPerformanceFrame();
+		break;
+	case rts::LIVE_SIMULATION_PHASE_OBSERVE_FRAME_ABORT:
+		++observation.abortedFrames;
+		accepted = false;
+		// Preserve any open outer/partial frame and the run's latched failure.
+		// In product this is PerformanceReceiptRuntime::invalidate, not a
+		// request to reset evidence or change the baseline execution route.
+		break;
+	default:
+		accepted = false;
+		break;
+	}
+	if (!accepted) observation.failed = true;
+}
+
+void beginAccountingRun(AccountingObservation &observation,
+	rts::performance::KernelPerformanceClock clock, void *clockContext)
+{
+	rts::performance::KernelPerformanceTimingRunOptions options;
+	options.enabled = true;
+	options.role = rts::performance::KERNEL_PERFORMANCE_PHASE_SERIAL_BASELINE;
+	options.clock = clock;
+	options.clockContext = clockContext;
+	require(observation.ledger.beginRun(options), "owner accounting fixture starts");
+}
+
+rts::performance::KernelPerformanceSnapshot freezeAccounting(
+	AccountingObservation &observation)
+{
+	// Closure errors remain observable in the real snapshot. Do not stop at a
+	// setup assertion when the deliberately unimplemented transport is RED.
+	observation.ledger.sealAdmissions();
+	observation.ledger.sealExecutionClosure(observation.actual);
+	return observation.ledger.freeze();
+}
+#endif
+
 bool isOwner(void *context)
 {
 	return static_cast<Harness *>(context)->owner;
@@ -106,6 +229,13 @@ bool validate(rts::SimulationPhaseId phaseId, unsigned generation,
 	harness->validated[harness->validationCount] = phaseId;
 	harness->validatedFrame[harness->validationCount] = frame;
 	++harness->validationCount;
+	#if defined(_WIN64)
+	if (harness->accounting != 0 && harness->accounting->advanceOwnerWork)
+	{
+		const unsigned work[] = { 2, 3, 5, 7, 11 };
+		harness->accounting->clock.now += work[phaseId - 1];
+	}
+	#endif
 	if (harness->cancelDuringValidation)
 	{
 		harness->cancelDuringValidation = false;
@@ -128,6 +258,13 @@ bool commit(rts::SimulationPhaseId phaseId, unsigned generation,
 	require(generation != 0, "commit must receive a nonzero generation");
 	require(harness->commitCount < 32, "commit trace overflow");
 	harness->committed[harness->commitCount++] = phaseId;
+	#if defined(_WIN64)
+	if (harness->accounting != 0 && harness->accounting->advanceOwnerWork)
+	{
+		const unsigned work[] = { 3, 5, 7, 11, 13 };
+		harness->accounting->clock.now += work[phaseId - 1];
+	}
+	#endif
 	if (harness->throwDuringCommitPhase == phaseId)
 	{
 		if (harness->annotateFailure)
@@ -156,7 +293,20 @@ bool commit(rts::SimulationPhaseId phaseId, unsigned generation,
 		require(harness->adapter->retargetPendingFrameAfterIntake(
 			harness->retargetFrame),
 			"intake must be able to retarget never-claimed phase inputs");
+		#if defined(_WIN64)
+		if (harness->accounting != 0)
+			harness->accounting->actualOwnerFrame = harness->retargetFrame;
+		#endif
 	}
+	#if defined(_WIN64)
+	if (harness->accounting != 0 &&
+		phaseId == rts::LIVE_SIMULATION_PHASE_VERIFICATION_PUBLICATION)
+	{
+		++harness->accounting->actualOwnerFrame;
+		if (harness->accounting->advanceSchedulerAtVerification)
+			++harness->accounting->actual.executedJobs;
+	}
+	#endif
 	(void)frame;
 	return !(phaseId == rts::LIVE_SIMULATION_PHASE_OWNER_INTAKE &&
 		harness->stopAfterIntake);
@@ -682,6 +832,221 @@ void testLaterOuterExceptionCannotRewriteNestedFirstFailure()
 		"first-failure immutability must not manufacture the later throwing commit");
 }
 
+#if defined(_WIN64)
+rts::LiveSimulationPhaseOwnerCallbacks accountingCallbacks()
+{
+	rts::LiveSimulationPhaseOwnerCallbacks result = callbacks();
+	result.observe = &observeAccounting;
+	return result;
+}
+
+// Moving phase observations after the real callbacks, omitting a boundary, or
+// substituting legacy telemetry loses these independently specified work costs.
+void testOwnerAccountingEnclosesValidationAndCommit()
+{
+	AccountingObservation observation;
+	observation.advanceOwnerWork = true;
+	beginAccountingRun(observation, &AccountingClock::read, &observation.clock);
+	Harness harness;
+	harness.accounting = &observation;
+	rts::LiveSimulationPhaseGraphOwnerAdapter adapter(accountingCallbacks(), &harness);
+	harness.adapter = &adapter;
+	require(adapter.runFrame(40) == rts::LIVE_SIMULATION_PHASE_COMPLETED &&
+		harness.commitCount == 5, "accounting must preserve the real owner commits");
+	const auto result = freezeAccounting(observation);
+	const auto &a = result.phaseAccounting;
+	requireDiagnostic(!observation.failed && a.complete && a.errors == 0,
+		"adapter boundaries must close complete real-ledger phase accounting");
+	requireDiagnostic(a.completedFrameCount == 1 && a.firstCompletedFrame == 41 &&
+		a.lastCompletedFrame == 41 && a.frameNanoseconds == 78 &&
+		a.unscopedSerialNanoseconds == 6 && observation.clock.reads == 12,
+		"owner work and six graph gaps must partition the independently measured frame");
+	const rts::JobMetricCounter totals[] = { 6, 9, 13, 19, 25 };
+	for (unsigned index = 0; index != 5; ++index)
+	{
+		requireDiagnostic(a.phases[index].totalNanoseconds == totals[index] &&
+			a.phases[index].serialNanoseconds == totals[index] &&
+			a.phases[index].pureNanoseconds == 0 && a.phases[index].samples == 1,
+			"both real validation and commit costs remain inside their serial phase");
+	}
+	requireDiagnostic(a.schedulerClosureKnown && a.schedulerBegin.submittedJobs == 17 &&
+		a.schedulerEnd.executedJobs == 17 && a.schedulerEnd.ownerHelpJobs == 3 &&
+		result.runRole == rts::performance::KERNEL_PERFORMANCE_PHASE_SERIAL_BASELINE,
+		"owner observations preserve actual historical scheduler counters and latched role");
+}
+
+void testOwnerAccountingKeepsUnscopedTimeDistinctFromLegacyTelemetry()
+{
+	AccountingObservation observation;
+	FakeClock accountingClock;
+	const rts::JobMetricCounter accountingSamples[] = {
+		100, 110, 130, 135, 165, 170, 185, 190, 200, 205, 215, 220
+	};
+	FakeClock legacyClock;
+	const rts::JobMetricCounter legacySamples[] = {
+		1000, 1010, 1020, 1025, 1045, 1050, 1080, 1090, 1130, 1150, 1200, 1300
+	};
+	for (unsigned index = 0; index != 12; ++index)
+	{
+		accountingClock.values[index] = accountingSamples[index];
+		legacyClock.values[index] = legacySamples[index];
+	}
+	accountingClock.count = legacyClock.count = 12;
+	beginAccountingRun(observation, &readFakeClock, &accountingClock);
+	Harness harness;
+	harness.accounting = &observation;
+	rts::LiveSimulationPhaseGraphOwnerAdapter adapter(accountingCallbacks(), &harness);
+	harness.adapter = &adapter;
+	require(adapter.setPerformanceClockForTesting(&readFakeClock, &legacyClock) &&
+		adapter.runFrame(40) == rts::LIVE_SIMULATION_PHASE_COMPLETED,
+		"distinct legacy telemetry and run-owned accounting clocks are accepted");
+	const auto result = freezeAccounting(observation);
+	const auto &a = result.phaseAccounting;
+	requireDiagnostic(!observation.failed && a.complete && a.frameNanoseconds == 120 &&
+		a.maximumFrameNanoseconds == 120 && a.unscopedSerialNanoseconds == 35,
+		"real ledger accounts graph setup, inter-phase gaps, and the frame tail exactly");
+	const rts::JobMetricCounter totals[] = { 20, 30, 15, 10, 10 };
+	for (unsigned index = 0; index != 5; ++index)
+		requireDiagnostic(a.phases[index].totalNanoseconds == totals[index] &&
+			a.phases[index].serialNanoseconds == totals[index] &&
+			a.phases[index].pureNanoseconds == 0 &&
+			a.phases[index].maximumNanoseconds == totals[index],
+			"baseline phase totals come only from the run-owned ledger clock");
+	requireDiagnostic(adapter.runtimeMetrics().frameSimulationTotalNanoseconds == 300 &&
+		accountingClock.index == 12 && legacyClock.index == 12,
+		"legacy telemetry remains independent rather than being copied into accounting");
+}
+
+void testOwnerAccountingRetargetUsesActualCompletedFrameAndSurvivesMetricsReset()
+{
+	AccountingObservation observation;
+	observation.actualOwnerFrame = 83;
+	beginAccountingRun(observation, &AccountingClock::read, &observation.clock);
+	Harness harness;
+	harness.accounting = &observation;
+	harness.retargetAfterIntake = true;
+	harness.retargetFrame = 0;
+	rts::LiveSimulationPhaseGraphOwnerAdapter adapter(accountingCallbacks(), &harness);
+	harness.adapter = &adapter;
+	require(adapter.runFrame(83) == rts::LIVE_SIMULATION_PHASE_COMPLETED,
+		"accounted intake retarget preserves the real owner path");
+	requireDiagnostic(observation.entryFrame == 83 && observation.entryGeneration == 1 &&
+		observation.phaseFrames[0] == 83 && observation.phaseFrames[1] == 0 &&
+		observation.phaseFrames[4] == 0,
+		"measurement transports pre-intake identity and actual retargeted phase identities");
+	adapter.resetRuntimeMetrics();
+	harness.retargetAfterIntake = false;
+	require(adapter.runFrame(1) == rts::LIVE_SIMULATION_PHASE_COMPLETED,
+		"a later frame completes after resetting only legacy telemetry");
+	const auto result = freezeAccounting(observation);
+	requireDiagnostic(!observation.failed && result.phaseAccounting.complete &&
+		result.phaseAccounting.completedFrameCount == 2 &&
+		result.phaseAccounting.firstCompletedFrame == 1 &&
+		result.phaseAccounting.lastCompletedFrame == 2 &&
+		observation.sampleOrdinal == 2 && adapter.runtimeMetrics().completedFrames == 1,
+		"run-owned samples survive metrics reset and bind actual post-verification frames");
+}
+
+void testOwnerAccountingEarlyStopCannotHideBehindPriorCompleteFrame()
+{
+	AccountingObservation observation;
+	beginAccountingRun(observation, &AccountingClock::read, &observation.clock);
+	Harness harness;
+	harness.accounting = &observation;
+	rts::LiveSimulationPhaseGraphOwnerAdapter adapter(accountingCallbacks(), &harness);
+	harness.adapter = &adapter;
+	require(adapter.runFrame(40) == rts::LIVE_SIMULATION_PHASE_COMPLETED,
+		"early-stop fixture first completes a real frame");
+	harness.stopAfterIntake = true;
+	require(adapter.runFrame(41) == rts::LIVE_SIMULATION_PHASE_STOPPED_BY_OWNER &&
+		harness.commitCount == 6, "stopped intake does not execute the other four phases");
+	const auto result = freezeAccounting(observation);
+	const auto &a = result.phaseAccounting;
+	requireDiagnostic(observation.failed && observation.abortedFrames == 1 &&
+		!a.complete && a.errors != 0 && a.completedFrameCount == 1 &&
+		a.firstCompletedFrame == 41 && a.lastCompletedFrame == 41 &&
+		a.frameNanoseconds == 11 && a.phases[0].samples == 1 && a.phases[4].samples == 1,
+		"stopped owner frame stays incomplete without fabricated phases or erased prior evidence");
+	requireDiagnostic(observation.ledger.runRole() ==
+		rts::performance::KERNEL_PERFORMANCE_PHASE_SERIAL_BASELINE,
+		"observation failure cannot switch the latched baseline role to physical execution");
+}
+
+void testOwnerAccountingRejectedOwnerCannotPublishAFrame()
+{
+	AccountingObservation observation;
+	beginAccountingRun(observation, &AccountingClock::read, &observation.clock);
+	Harness harness;
+	harness.accounting = &observation;
+	harness.owner = false;
+	rts::LiveSimulationPhaseGraphOwnerAdapter adapter(accountingCallbacks(), &harness);
+	harness.adapter = &adapter;
+	require(adapter.runFrame(40) == rts::LIVE_SIMULATION_PHASE_FALLBACK_BEFORE_MUTATION &&
+		harness.validationCount == 0 && harness.commitCount == 0,
+		"measurement does not promote missing owner authority into a commit");
+	const auto result = freezeAccounting(observation);
+	requireDiagnostic(observation.failed && observation.abortedFrames == 1 &&
+		!result.phaseAccounting.complete && result.phaseAccounting.completedFrameCount == 0,
+		"owner preflight refusal invalidates qualification without inventing a completed frame");
+}
+
+void testOwnerAccountingNestedFailureCannotResetOuterFrameOrQualification()
+{
+	AccountingObservation observation;
+	beginAccountingRun(observation, &AccountingClock::read, &observation.clock);
+	Harness harness;
+	harness.accounting = &observation;
+	harness.reenterDuringCommitPhase = rts::LIVE_SIMULATION_PHASE_OWNER_INTAKE;
+	rts::LiveSimulationPhaseGraphOwnerAdapter adapter(accountingCallbacks(), &harness);
+	harness.adapter = &adapter;
+	require(adapter.runFrame(40) == rts::LIVE_SIMULATION_PHASE_COMPLETED &&
+		harness.nestedResult == rts::LIVE_SIMULATION_PHASE_FAILED_AFTER_MUTATION &&
+		harness.commitCount == 5, "rejected nested entry preserves the real outer commits");
+	const auto result = freezeAccounting(observation);
+	requireDiagnostic(observation.failed && observation.abortedFrames == 1 &&
+		observation.sampleOrdinal == 1 && result.phaseAccounting.complete &&
+		result.phaseAccounting.completedFrameCount == 1 &&
+		result.phaseAccounting.lastCompletedFrame == 41,
+		"nested rejection latches run failure while preserving exactly one outer measurement");
+}
+
+void testOwnerAccountingObservesActualSchedulerEndWithoutChangingGameplay()
+{
+	AccountingObservation observation;
+	observation.advanceSchedulerAtVerification = true;
+	beginAccountingRun(observation, &AccountingClock::read, &observation.clock);
+	Harness harness;
+	harness.accounting = &observation;
+	rts::LiveSimulationPhaseGraphOwnerAdapter adapter(accountingCallbacks(), &harness);
+	harness.adapter = &adapter;
+	require(adapter.runFrame(40) == rts::LIVE_SIMULATION_PHASE_COMPLETED &&
+		harness.commitCount == 5, "scheduler evidence failure does not select owner dispatch");
+	const auto result = freezeAccounting(observation);
+	requireDiagnostic(observation.failed && !result.phaseAccounting.complete &&
+		result.phaseAccounting.schedulerBegin.executedJobs == 17 &&
+		result.phaseAccounting.schedulerEnd.executedJobs == 18 &&
+		result.runRole == rts::performance::KERNEL_PERFORMANCE_PHASE_SERIAL_BASELINE,
+		"unexpected real scheduler work fails accounting instead of copying the entry boundary");
+}
+
+void testAbsentOwnerObserverDoesNotReadDiagnosticsClock()
+{
+	AccountingObservation observation;
+	beginAccountingRun(observation, &AccountingClock::read, &observation.clock);
+	Harness harness;
+	harness.accounting = &observation;
+	rts::LiveSimulationPhaseGraphOwnerAdapter adapter(callbacks(), &harness);
+	harness.adapter = &adapter;
+	require(adapter.runFrame(40) == rts::LIVE_SIMULATION_PHASE_COMPLETED &&
+		harness.commitCount == 5 && rts::HasStableLiveSimulationPhaseEvidence(adapter.runtimeMetrics()),
+		"default nullable observation transport preserves ordinary owner execution");
+	const auto result = observation.ledger.freeze();
+	requireDiagnostic(observation.clock.reads == 0 && observation.sampleOrdinal == 0 &&
+		result.phaseAccounting.completedFrameCount == 0 && !result.phaseAccounting.complete,
+		"absent observer never reads the diagnostic clock or fabricates frame coverage");
+}
+#endif
+
 } // namespace
 
 int main()
@@ -702,6 +1067,16 @@ int main()
 	testOwnerExceptionAnnotationIsCopiedBoundedAndFirstWins();
 	testNestedFailureDoesNotReplaceOuterAuthority();
 	testLaterOuterExceptionCannotRewriteNestedFirstFailure();
+	#if defined(_WIN64)
+	testOwnerAccountingEnclosesValidationAndCommit();
+	testOwnerAccountingKeepsUnscopedTimeDistinctFromLegacyTelemetry();
+	testOwnerAccountingRetargetUsesActualCompletedFrameAndSurvivesMetricsReset();
+	testOwnerAccountingEarlyStopCannotHideBehindPriorCompleteFrame();
+	testOwnerAccountingRejectedOwnerCannotPublishAFrame();
+	testOwnerAccountingNestedFailureCannotResetOuterFrameOrQualification();
+	testOwnerAccountingObservesActualSchedulerEndWithoutChangingGameplay();
+	testAbsentOwnerObserverDoesNotReadDiagnosticsClock();
+	#endif
 	if (diagnosticFailures != 0)
 		return 1;
 	std::printf("SimulationPhaseGraph owner-adapter tests passed.\n");

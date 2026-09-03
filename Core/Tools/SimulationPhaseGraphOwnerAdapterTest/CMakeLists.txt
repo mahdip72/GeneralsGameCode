@@ -38,6 +38,11 @@ if(NOT SIMULATION_PHASE_GRAPH_OWNER_ADAPTER_LEGACY_ONLY AND NOT IS_VS6_BUILD)
     target_link_libraries(simulation_phase_graph_owner_adapter_tests PRIVATE
         simulation_phase_graph_owner_adapter_core
     )
+    if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+        target_sources(simulation_phase_graph_owner_adapter_tests PRIVATE
+            ../../Libraries/Source/TaskRuntime/KernelPerformanceDiagnostics.cpp
+        )
+    endif()
     set_target_properties(simulation_phase_graph_owner_adapter_tests PROPERTIES
         CXX_STANDARD 20
         CXX_STANDARD_REQUIRED YES

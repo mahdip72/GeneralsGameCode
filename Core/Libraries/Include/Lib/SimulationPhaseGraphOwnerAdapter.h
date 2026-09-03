@@ -168,6 +168,27 @@ typedef bool (*LiveSimulationPhaseCommitFunction)(
 	SimulationPhaseId phaseId, unsigned generation, unsigned frame,
 	void *ownerContext);
 
+enum LiveSimulationPhaseObservationBoundary
+{
+	LIVE_SIMULATION_PHASE_OBSERVE_FRAME_BEGIN = 0,
+	LIVE_SIMULATION_PHASE_OBSERVE_PHASE_BEGIN,
+	LIVE_SIMULATION_PHASE_OBSERVE_PHASE_END,
+	LIVE_SIMULATION_PHASE_OBSERVE_FRAME_END,
+	LIVE_SIMULATION_PHASE_OBSERVE_FRAME_ABORT
+};
+
+// Optional non-throwing owner-run observation only. The existing ownerContext
+// resolves the run-owned ledger, clock, and actual completed-frame/scheduler
+// state. Failure must latch run qualification failure there; it must never
+// reset evidence, choose gameplay dispatch, or unlatch an execution role.
+// Frame/phase identity here is authority identity, not an inferred completed
+// frame. An abort does not close or discard an active outer/partial extent.
+// FRAME_BEGIN reports the prospective generation before graph configuration
+// and reset; it does not itself establish successful phase authority.
+typedef void (*LiveSimulationPhaseObservationFunction)(
+	LiveSimulationPhaseObservationBoundary boundary, SimulationPhaseId phaseId,
+	unsigned generation, unsigned frame, void *ownerContext);
+
 struct LiveSimulationPhaseOwnerCallbacks
 {
 	LiveSimulationPhaseOwnerCallbacks();
@@ -175,6 +196,7 @@ struct LiveSimulationPhaseOwnerCallbacks
 	LiveSimulationPhaseOwnerFunction isOwner;
 	LiveSimulationPhaseValidateFunction validate;
 	LiveSimulationPhaseCommitFunction commit;
+	LiveSimulationPhaseObservationFunction observe;
 };
 
 // One fixed owner-authority job is configured for each live GameLogic phase:
@@ -261,6 +283,8 @@ private:
 	LiveSimulationPhaseRunResult failureResult() const;
 	LiveSimulationPhaseRunResult finishRun(
 		LiveSimulationPhaseRunResult result, unsigned frame);
+	void observeOwnerBoundary(LiveSimulationPhaseObservationBoundary boundary,
+		SimulationPhaseId phaseId, unsigned generation, unsigned frame) const;
 	void recordOwnerPhasePerformance(unsigned phaseOrdinalValue,
 		JobMetricCounter elapsedNanoseconds);
 	void recordFramePerformance(JobMetricCounter elapsedNanoseconds);
