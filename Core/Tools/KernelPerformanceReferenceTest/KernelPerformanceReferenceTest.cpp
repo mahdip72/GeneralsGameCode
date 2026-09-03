@@ -522,6 +522,327 @@ void canonicalBufferedHashWithoutTransport()
 		memcmp(sink.bytes.data(), canonicalHeader, sizeof(canonicalHeader)) == 0,
 		"an explicitly sealed zero-field stream still binds its exact domain and schema");
 }
+
+// Independent released-source fixture, never derived by the probe under test.
+KernelPerformanceCheckpointProgress cancelledSourceProgress()
+{
+	KernelPerformanceCheckpointProgress source = {};
+	source.entered = true;
+	source.pollCount = 3;
+	source.firstTruePoll = 3;
+	source.firstTrueCheckpoint = { 12, 128, 0 };
+	source.finalCheckpoint = { 12, 128, 0 };
+	source.completedWorkUnits = 128;
+	source.terminal = KERNEL_RANGE_CANCELLED;
+	return source;
+}
+
+bool checkpointIs(const KernelPerformanceCheckpoint &actual,
+	unsigned site, JobMetricCounter first, JobMetricCounter second)
+{
+	return actual.site == site && actual.first == first && actual.second == second;
+}
+
+void checkpointRecordPreservesSourcePredicateAndPrefix()
+{
+	// Break caught: recording changes cancellation or loses its ordinal/key/prefix.
+	const unsigned clocksBefore = clocks, writesBefore = writes, computesBefore = computes;
+	KernelPerformanceCheckpointProbe disabled;
+	const bool disabledFalse = disabled.cancelled({ 11, 0, 0 }, false);
+	const bool disabledTrue = disabled.cancelled({ 12, 64, 0 }, true);
+	const auto empty = disabled.snapshot();
+	check(!disabledFalse && disabledTrue && !empty.entered && empty.errors == 0 &&
+		empty.pollCount == 0 && empty.firstTruePoll == 0 && empty.completedWorkUnits == 0 &&
+		empty.terminal == KERNEL_RANGE_NEVER_ENTERED &&
+		checkpointIs(empty.firstTrueCheckpoint, 0, 0, 0) && checkpointIs(empty.finalCheckpoint, 0, 0, 0),
+		"disabled checkpoint probe preserves the source predicate without recording progress");
+	KernelPerformanceCheckpointProbe recorded;
+	check(recorded.beginRecord(), "checkpoint record enters one real range");
+	const bool first = recorded.cancelled({ 11, 0, 0 }, false);
+	const bool second = recorded.cancelled({ 12, 64, 0 }, false);
+	const bool third = recorded.cancelled({ 12, 128, 0 }, true);
+	check(!first && !second && third, "checkpoint recording returns each actual cancellation predicate unchanged");
+	check(recorded.finish({ 12, 128, 0 }, 128, KERNEL_RANGE_CANCELLED),
+		"checkpoint record closes the observed cancelled prefix");
+	const auto actual = recorded.snapshot();
+	check(actual.entered && actual.errors == 0 && actual.pollCount == 3 && actual.firstTruePoll == 3 &&
+		actual.completedWorkUnits == 128 && actual.terminal == KERNEL_RANGE_CANCELLED &&
+		checkpointIs(actual.firstTrueCheckpoint, 12, 128, 0) && checkpointIs(actual.finalCheckpoint, 12, 128, 0),
+		"checkpoint record retains the literal three-poll cut and 128-unit prefix");
+	struct TerminalCase { KernelPerformanceRangeTerminal terminal; bool cancel; const char *message; };
+	const TerminalCase terminalCases[] = {
+		{ KERNEL_RANGE_COMPLETED, false, "completed record without cancellation retains an absent cut" },
+		{ KERNEL_RANGE_FAILED, false, "failed record without cancellation retains its real failure" },
+		{ KERNEL_RANGE_FAILED, true, "failed record after cancellation retains both facts" }
+	};
+	for (const auto &test : terminalCases)
+	{
+		KernelPerformanceCheckpointProbe probe;
+		const bool started = probe.beginRecord();
+		const bool cancelled = probe.cancelled({ 21, 9, 4 }, test.cancel);
+		const bool finished = probe.finish({ 21, 9, 4 }, 9, test.terminal);
+		const auto progress = probe.snapshot();
+		check(started && cancelled == test.cancel && finished && progress.entered && progress.errors == 0 &&
+			progress.pollCount == 1 && progress.firstTruePoll == (test.cancel ? 1 : 0) &&
+			progress.completedWorkUnits == 9 && progress.terminal == test.terminal &&
+			checkpointIs(progress.firstTrueCheckpoint, test.cancel ? 21 : 0, test.cancel ? 9 : 0, test.cancel ? 4 : 0) &&
+			checkpointIs(progress.finalCheckpoint, 21, 9, 4), test.message);
+	}
+	check(clocks == clocksBefore && writes == writesBefore && computes == computesBefore,
+		"range-local checkpoint recording invokes no ledger clock or canonical or compute callback");
+}
+
+void checkpointReplayUsesSourceCutNotActualCancellation()
+{
+	// Break caught: replay still obeys actual cancellation or borrows mutable source progress.
+	const unsigned clocksBefore = clocks, writesBefore = writes, computesBefore = computes;
+	auto source = cancelledSourceProgress();
+	KernelPerformanceCheckpointProbe replay;
+	check(replay.beginReplay(source), "checkpoint replay accepts the literal released-source cut");
+	source = {}; // Initialization must have copied the released value, not retained this reference.
+	const bool first = replay.cancelled({ 11, 0, 0 }, true);
+	const bool second = replay.cancelled({ 12, 64, 0 }, true);
+	const bool third = replay.cancelled({ 12, 128, 0 }, false);
+	check(!first && !second && third, "checkpoint replay uses the source cut despite opposite actual predicates");
+	check(replay.finish({ 12, 128, 0 }, 128, KERNEL_RANGE_CANCELLED),
+		"checkpoint replay closes only the exact source terminal and work prefix");
+	const auto actual = replay.snapshot();
+	check(actual.entered && actual.errors == 0 && actual.pollCount == 3 && actual.firstTruePoll == 3 &&
+		actual.completedWorkUnits == 128 && actual.terminal == KERNEL_RANGE_CANCELLED &&
+		checkpointIs(actual.firstTrueCheckpoint, 12, 128, 0) && checkpointIs(actual.finalCheckpoint, 12, 128, 0),
+		"checkpoint replay reports independently observed progress equal to the literal source");
+	KernelPerformanceCheckpointProgress noPollSource = {};
+	noPollSource.entered = true;
+	noPollSource.finalCheckpoint = { 21, 0, 7 };
+	noPollSource.terminal = KERNEL_RANGE_COMPLETED;
+	KernelPerformanceCheckpointProbe noPoll;
+	const bool noPollStarted = noPoll.beginReplay(noPollSource);
+	const bool noPollFinished = noPoll.finish({ 21, 0, 7 }, 0, KERNEL_RANGE_COMPLETED);
+	const auto noPollActual = noPoll.snapshot();
+	check(noPollStarted && noPollFinished && noPollActual.entered && noPollActual.errors == 0 &&
+		noPollActual.pollCount == 0 && noPollActual.firstTruePoll == 0 && noPollActual.completedWorkUnits == 0 &&
+		noPollActual.terminal == KERNEL_RANGE_COMPLETED && checkpointIs(noPollActual.firstTrueCheckpoint, 0, 0, 0) &&
+		checkpointIs(noPollActual.finalCheckpoint, 21, 0, 7),
+		"checkpoint replay can complete a genuinely entered zero-poll zero-work body");
+	const KernelPerformanceRangeTerminal terminals[] = { KERNEL_RANGE_COMPLETED, KERNEL_RANGE_FAILED };
+	for (const auto terminal : terminals)
+	{
+		KernelPerformanceCheckpointProgress noCutSource = {};
+		noCutSource.entered = true;
+		noCutSource.pollCount = 2;
+		noCutSource.completedWorkUnits = 17;
+		noCutSource.finalCheckpoint = { 22, 17, 3 };
+		noCutSource.terminal = terminal;
+		KernelPerformanceCheckpointProbe noCut;
+		const bool started = noCut.beginReplay(noCutSource);
+		const bool before = noCut.cancelled({ 21, 0, 3 }, true);
+		const bool after = noCut.cancelled({ 21, 16, 3 }, true);
+		const bool finished = noCut.finish({ 22, 17, 3 }, 17, terminal);
+		const auto progress = noCut.snapshot();
+		check(started && !before && !after && finished && progress.errors == 0 && progress.pollCount == 2 &&
+			progress.firstTruePoll == 0 && checkpointIs(progress.firstTrueCheckpoint, 0, 0, 0) &&
+			progress.completedWorkUnits == 17 && progress.terminal == terminal,
+			"checkpoint replay preserves a recorded no-cut completed or failed terminal");
+	}
+	auto failedSource = cancelledSourceProgress();
+	failedSource.terminal = KERNEL_RANGE_FAILED;
+	KernelPerformanceCheckpointProbe failed;
+	const bool failedStarted = failed.beginReplay(failedSource);
+	const bool failedFirst = failed.cancelled({ 11, 0, 0 }, true);
+	const bool failedSecond = failed.cancelled({ 12, 64, 0 }, true);
+	const bool failedThird = failed.cancelled({ 12, 128, 0 }, false);
+	const bool failedFinished = failed.finish({ 12, 128, 0 }, 128, KERNEL_RANGE_FAILED);
+	check(failedStarted && !failedFirst && !failedSecond && failedThird && failedFinished &&
+		failed.snapshot().errors == 0 && failed.snapshot().firstTruePoll == 3 &&
+		failed.snapshot().terminal == KERNEL_RANGE_FAILED,
+		"checkpoint replay preserves a failed terminal even when the source also cancelled");
+	check(clocks == clocksBefore && writes == writesBefore && computes == computesBefore,
+		"range-local checkpoint replay invokes no ledger clock or canonical or compute callback");
+}
+
+void checkpointReplayRejectsChangedCutAndTerminal()
+{
+	// Break caught: trusting only a count or expected terminal hides actual replay divergence.
+	enum Mutation { CutSite, CutFirst, CutSecond, MissingPoll, ExtraPoll, Prefix,
+		FinalSite, FinalFirst, FinalSecond, Terminal, MutationCount };
+	const char *messages[] = {
+		"checkpoint replay rejects a changed cancellation site",
+		"checkpoint replay rejects a changed cancellation first index",
+		"checkpoint replay rejects a changed cancellation second index",
+		"checkpoint replay rejects a missing cancellation poll",
+		"checkpoint replay rejects an extra poll after the source cut",
+		"checkpoint replay rejects a changed completed prefix",
+		"checkpoint replay rejects a changed final site",
+		"checkpoint replay rejects a changed final first index",
+		"checkpoint replay rejects a changed final second index",
+		"checkpoint replay rejects a changed terminal disposition"
+	};
+	for (unsigned mutation = 0; mutation != MutationCount; ++mutation)
+	{
+		KernelPerformanceCheckpointProbe replay;
+		check(replay.beginReplay(cancelledSourceProgress()), "changed-cut fixture starts from a valid literal source");
+		replay.cancelled({ 11, 0, 0 }, false);
+		replay.cancelled({ 12, 64, 0 }, false);
+		KernelPerformanceCheckpoint cut = { 12, 128, 0 };
+		if (mutation == CutSite) cut.site = 13;
+		if (mutation == CutFirst) cut.first = 129;
+		if (mutation == CutSecond) cut.second = 1;
+		if (mutation != MissingPoll) replay.cancelled(cut, false);
+		if (mutation == ExtraPoll) replay.cancelled({ 12, 192, 0 }, false);
+		KernelPerformanceCheckpoint final = { 12, 128, 0 };
+		if (mutation == FinalSite) final.site = 13;
+		if (mutation == FinalFirst) final.first = 129;
+		if (mutation == FinalSecond) final.second = 1;
+		const bool finished = replay.finish(final, mutation == Prefix ? 127 : 128,
+			mutation == Terminal ? KERNEL_RANGE_COMPLETED : KERNEL_RANGE_CANCELLED);
+		check(!finished && (replay.snapshot().errors & KERNEL_REFERENCE_ERROR_CHECKPOINT) != 0, messages[mutation]);
+		const unsigned errors = replay.snapshot().errors;
+		const bool stopped = replay.cancelled({ 12, 128, 0 }, false);
+		const bool retried = replay.finish({ 12, 128, 0 }, 128, KERNEL_RANGE_CANCELLED);
+		check(stopped && !retried && (replay.snapshot().errors & errors) == errors,
+			"checkpoint replay mismatch remains sticky and cannot be replaced by a matching retry");
+	}
+}
+
+void checkpointNeverEnteredAndMalformedSourceCannotExecute()
+{
+	// Break caught: malformed or default source progress authorizes phantom execution.
+	enum Mutation { NeverEntered, UnenteredWithProgress, CutBeyondPolls, AbsentOrdinalWithKey,
+		CancelledWithoutCut, CompletedWithCut, SourceError, UnknownTerminal, EnteredNeverTerminal,
+		MissingCutSite, MissingFinalSite, CutWithoutPolls, HiddenAbsentIndex, PollAfterCut, MutationCount };
+	for (unsigned mutation = 0; mutation != MutationCount; ++mutation)
+	{
+		auto source = cancelledSourceProgress();
+		switch (mutation)
+		{
+		case NeverEntered: source = {}; break;
+		case UnenteredWithProgress: source.entered = false; break;
+		case CutBeyondPolls: source.firstTruePoll = 4; break;
+		case AbsentOrdinalWithKey: source.firstTruePoll = 0; break;
+		case CancelledWithoutCut: source.firstTruePoll = 0; source.firstTrueCheckpoint = {}; break;
+		case CompletedWithCut: source.terminal = KERNEL_RANGE_COMPLETED; break;
+		case SourceError: source.errors = KERNEL_REFERENCE_ERROR_CHECKPOINT; break;
+		case UnknownTerminal: source.terminal = static_cast<KernelPerformanceRangeTerminal>(99); break;
+		case EnteredNeverTerminal: source.terminal = KERNEL_RANGE_NEVER_ENTERED; break;
+		case MissingCutSite: source.firstTrueCheckpoint.site = 0; break;
+		case MissingFinalSite: source.finalCheckpoint.site = 0; break;
+		case CutWithoutPolls: source.pollCount = 0; break;
+		case HiddenAbsentIndex:
+			source.firstTruePoll = 0; source.firstTrueCheckpoint = { 0, 0, 1 };
+			source.terminal = KERNEL_RANGE_COMPLETED; break;
+		case PollAfterCut: source.firstTruePoll = 2; break;
+		}
+		KernelPerformanceCheckpointProbe replay;
+		const bool started = replay.beginReplay(source);
+		const unsigned errors = replay.snapshot().errors;
+		const bool stopped = replay.cancelled({ 11, 0, 0 }, false);
+		const bool finished = replay.finish({ 12, 128, 0 }, 128, KERNEL_RANGE_CANCELLED);
+		const bool recordRetry = replay.beginRecord();
+		const bool sourceRetry = replay.beginReplay(cancelledSourceProgress());
+		check(!started && (errors & KERNEL_REFERENCE_ERROR_CHECKPOINT) != 0 && stopped && !finished &&
+			!recordRetry && !sourceRetry && (replay.snapshot().errors & errors) == errors &&
+			replay.cancelled({ 11, 0, 0 }, false),
+			"malformed or never-entered source stays non-executable after attempted mode or source replacement");
+	}
+}
+
+void checkpointLocalLifecycleCannotEraseFailure()
+{
+	// Break caught: lifecycle reset or shared current-range state hides a failed range.
+	KernelPerformanceCheckpointProbe doubleRecord;
+	check(doubleRecord.beginRecord(), "record lifecycle fixture enters its first range");
+	const bool recordRestart = doubleRecord.beginRecord();
+	const bool afterRecordErrorFalse = doubleRecord.cancelled({ 11, 0, 0 }, false);
+	const bool afterRecordErrorTrue = doubleRecord.cancelled({ 11, 0, 0 }, true);
+	check(!recordRestart && !afterRecordErrorFalse && afterRecordErrorTrue &&
+		(doubleRecord.snapshot().errors & KERNEL_REFERENCE_ERROR_CHECKPOINT) != 0 &&
+		!doubleRecord.beginReplay(cancelledSourceProgress()) &&
+		!doubleRecord.cancelled({ 11, 0, 0 }, false) &&
+		!doubleRecord.finish({ 11, 0, 0 }, 0, KERNEL_RANGE_CANCELLED),
+		"record lifecycle failure remains sticky without changing subsequent actual predicates");
+	KernelPerformanceCheckpointProbe doubleReplay;
+	check(doubleReplay.beginReplay(cancelledSourceProgress()), "replay lifecycle fixture enters its first range");
+	check(!doubleReplay.beginRecord() && !doubleReplay.beginReplay(cancelledSourceProgress()) &&
+		doubleReplay.cancelled({ 11, 0, 0 }, false) &&
+		(doubleReplay.snapshot().errors & KERNEL_REFERENCE_ERROR_CHECKPOINT) != 0,
+		"replay lifecycle failure cannot reset into source-record or a fresh replay mode");
+	KernelPerformanceCheckpointProbe finished;
+	check(finished.beginRecord(), "finish lifecycle fixture enters its first range");
+	check(finished.finish({ 21, 9, 4 }, 9, KERNEL_RANGE_COMPLETED),
+		"entered record can finish with no cancellation polls");
+	const auto before = finished.snapshot();
+	check(!finished.finish({ 22, 99, 5 }, 99, KERNEL_RANGE_FAILED),
+		"checkpoint body cannot finish twice with replacement progress");
+	const auto after = finished.snapshot();
+	check((after.errors & KERNEL_REFERENCE_ERROR_CHECKPOINT) != 0 &&
+		after.entered == before.entered && after.pollCount == before.pollCount &&
+		after.firstTruePoll == before.firstTruePoll && after.completedWorkUnits == before.completedWorkUnits &&
+		after.terminal == before.terminal && checkpointIs(after.finalCheckpoint, 21, 9, 4),
+		"duplicate finish poisons but never rewrites the original completed body facts");
+	KernelPerformanceCheckpointProbe postFinish;
+	check(postFinish.beginRecord() && postFinish.finish({ 21, 9, 4 }, 9, KERNEL_RANGE_COMPLETED),
+		"post-finish fixture closes one real body");
+	const bool postFalse = postFinish.cancelled({ 21, 9, 4 }, false);
+	const bool postTrue = postFinish.cancelled({ 21, 9, 4 }, true);
+	check(!postFalse && postTrue && (postFinish.snapshot().errors & KERNEL_REFERENCE_ERROR_CHECKPOINT) != 0 &&
+		postFinish.snapshot().pollCount == 0 && postFinish.snapshot().completedWorkUnits == 9,
+		"polling after finish fails recording without changing predicates or extending the completed body");
+	KernelPerformanceCheckpointProbe invalidPoll;
+	check(invalidPoll.beginRecord(), "invalid-site fixture enters one record range");
+	const bool invalidFalse = invalidPoll.cancelled({ 0, 0, 0 }, false);
+	const bool invalidTrue = invalidPoll.cancelled({ 11, 1, 0 }, true);
+	check(!invalidFalse && invalidTrue && (invalidPoll.snapshot().errors & KERNEL_REFERENCE_ERROR_CHECKPOINT) != 0 &&
+		!invalidPoll.finish({ 11, 1, 0 }, 1, KERNEL_RANGE_CANCELLED),
+		"invalid recording site fails the trace while preserving real cancellation");
+	KernelPerformanceCheckpointProbe afterCut;
+	const bool afterCutStarted = afterCut.beginRecord();
+	const bool cut = afterCut.cancelled({ 11, 0, 0 }, true);
+	const bool laterFalse = afterCut.cancelled({ 12, 64, 0 }, false);
+	const bool laterTrue = afterCut.cancelled({ 12, 128, 0 }, true);
+	check(afterCutStarted && cut && !laterFalse && laterTrue &&
+		(afterCut.snapshot().errors & KERNEL_REFERENCE_ERROR_CHECKPOINT) != 0 &&
+		afterCut.snapshot().firstTruePoll == 1 && checkpointIs(afterCut.snapshot().firstTrueCheckpoint, 11, 0, 0) &&
+		!afterCut.finish({ 12, 128, 0 }, 128, KERNEL_RANGE_CANCELLED),
+		"source polls after the first true cut fail V1 recording without changing predicates or replacing the cut");
+	KernelPerformanceCheckpointProbe unclosed;
+	check(unclosed.beginRecord(), "unclosed fixture enters one record range");
+	unclosed.cancelled({ 11, 0, 0 }, false);
+	const auto unfinished = unclosed.snapshot();
+	KernelPerformanceCheckpointProbe cannotReplayUnfinished;
+	check(unfinished.entered && unfinished.terminal == KERNEL_RANGE_NEVER_ENTERED &&
+		!cannotReplayUnfinished.beginReplay(unfinished),
+		"missing finish cannot publish executable completed source progress");
+	struct BadFinish { unsigned site; KernelPerformanceRangeTerminal terminal; bool cancel; };
+	const BadFinish badFinishes[] = {
+		{ 0, KERNEL_RANGE_COMPLETED, false },
+		{ 21, KERNEL_RANGE_CANCELLED, false },
+		{ 21, KERNEL_RANGE_COMPLETED, true },
+		{ 21, KERNEL_RANGE_NEVER_ENTERED, false },
+		{ 21, static_cast<KernelPerformanceRangeTerminal>(99), false }
+	};
+	for (const auto &test : badFinishes)
+	{
+		KernelPerformanceCheckpointProbe probe;
+		check(probe.beginRecord(), "invalid-terminal fixture enters one real record range");
+		probe.cancelled({ 21, 9, 4 }, test.cancel);
+		check(!probe.finish({ test.site, 9, 4 }, 9, test.terminal) &&
+			(probe.snapshot().errors & KERNEL_REFERENCE_ERROR_CHECKPOINT) != 0,
+			"invalid final site or impossible source terminal cannot become released valid progress");
+	}
+	KernelPerformanceCheckpointProbe first, second;
+	const bool firstStarted = first.beginRecord(), secondStarted = second.beginRecord();
+	const bool firstCut = first.cancelled({ 31, 8, 2 }, false);
+	const bool secondCut = second.cancelled({ 31, 8, 2 }, true);
+	const bool secondFinished = second.finish({ 31, 8, 2 }, 8, KERNEL_RANGE_CANCELLED);
+	const bool firstFinished = first.finish({ 31, 8, 2 }, 8, KERNEL_RANGE_COMPLETED);
+	const auto firstProgress = first.snapshot(), secondProgress = second.snapshot();
+	check(firstStarted && secondStarted && !firstCut && secondCut && firstFinished && secondFinished &&
+		firstProgress.errors == 0 && secondProgress.errors == 0 && firstProgress.pollCount == 1 &&
+		secondProgress.pollCount == 1 && firstProgress.firstTruePoll == 0 && secondProgress.firstTruePoll == 1 &&
+		firstProgress.terminal == KERNEL_RANGE_COMPLETED && secondProgress.terminal == KERNEL_RANGE_CANCELLED &&
+		checkpointIs(firstProgress.firstTrueCheckpoint, 0, 0, 0) && checkpointIs(secondProgress.firstTrueCheckpoint, 31, 8, 2),
+		"independent range probes may reuse checkpoint keys without sharing cut or terminal state");
+}
 }
 int main()
 {
@@ -536,5 +857,10 @@ int main()
 	canonicalTransportFailuresStayPoisoned();
 	canonicalTransportReentryIsRejected();
 	canonicalBufferedHashWithoutTransport();
+	checkpointRecordPreservesSourcePredicateAndPrefix();
+	checkpointReplayUsesSourceCutNotActualCancellation();
+	checkpointReplayRejectsChangedCutAndTerminal();
+	checkpointNeverEnteredAndMalformedSourceCannotExecute();
+	checkpointLocalLifecycleCannotEraseFailure();
 	return failures == 0 ? 0 : 1;
 }

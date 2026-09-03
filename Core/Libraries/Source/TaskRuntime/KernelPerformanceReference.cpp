@@ -10,6 +10,103 @@ KernelPerformanceDigest::KernelPerformanceDigest() : valid(false) { memset(bytes
 bool KernelPerformanceDigest::equals(const KernelPerformanceDigest &other) const
 { return valid && other.valid && memcmp(bytes, other.bytes, sizeof(bytes)) == 0; }
 
+namespace {
+bool sameCheckpoint(const KernelPerformanceCheckpoint &first, const KernelPerformanceCheckpoint &second)
+{
+	return first.site == second.site && first.first == second.first && first.second == second.second;
+}
+bool checkpointTerminalMatchesCut(KernelPerformanceRangeTerminal terminal, bool hasCut)
+{
+	if (terminal == KERNEL_RANGE_COMPLETED) return !hasCut;
+	if (terminal == KERNEL_RANGE_CANCELLED) return hasCut;
+	return terminal == KERNEL_RANGE_FAILED;
+}
+bool releasedCheckpointProgressValid(const KernelPerformanceCheckpointProgress &source)
+{
+	if (!source.entered || source.errors != 0 || source.finalCheckpoint.site == 0 ||
+		!checkpointTerminalMatchesCut(source.terminal, source.firstTruePoll != 0)) return false;
+	if (source.firstTruePoll == 0)
+		return source.firstTrueCheckpoint.site == 0 && source.firstTrueCheckpoint.first == 0 &&
+			source.firstTrueCheckpoint.second == 0;
+	// V1 stops at the first true predicate; a later poll is not representable.
+	return source.firstTruePoll == source.pollCount && source.firstTrueCheckpoint.site != 0;
+}
+}
+
+KernelPerformanceCheckpointProbe::KernelPerformanceCheckpointProbe() : m_mode(Disabled), m_finished(false),
+	m_progress(), m_source() {}
+bool KernelPerformanceCheckpointProbe::fail() noexcept
+{
+	m_progress.errors |= KERNEL_REFERENCE_ERROR_CHECKPOINT;
+	return false;
+}
+bool KernelPerformanceCheckpointProbe::beginRecord() noexcept
+{
+	if (m_mode != Disabled) return fail();
+	m_mode = Record;
+	if (m_progress.errors != 0) return false;
+	m_progress.entered = true;
+	return true;
+}
+bool KernelPerformanceCheckpointProbe::beginReplay(const KernelPerformanceCheckpointProgress &source) noexcept
+{
+	if (m_mode != Disabled) return fail();
+	// Latch replay before validation so malformed input cannot restore ordinary
+	// cancellation policy or reset into recording after a failed initialization.
+	m_mode = Replay;
+	if (m_progress.errors != 0 || !releasedCheckpointProgressValid(source)) return fail();
+	m_source = source;
+	m_progress.entered = true;
+	return true;
+}
+bool KernelPerformanceCheckpointProbe::cancelled(const KernelPerformanceCheckpoint &at, bool actualCancel) noexcept
+{
+	if (m_mode == Disabled) return actualCancel;
+	if (m_finished || m_progress.errors != 0 || at.site == 0 || m_progress.firstTruePoll != 0 ||
+		m_progress.pollCount == ~static_cast<JobMetricCounter>(0))
+	{
+		fail();
+		return m_mode == Replay ? true : actualCancel;
+	}
+	++m_progress.pollCount;
+	bool cancelled = actualCancel;
+	if (m_mode == Replay)
+	{
+		if (m_progress.pollCount > m_source.pollCount)
+		{ fail(); return true; }
+		cancelled = m_source.firstTruePoll != 0 && m_progress.pollCount == m_source.firstTruePoll;
+		if (cancelled && !sameCheckpoint(at, m_source.firstTrueCheckpoint))
+		{ fail(); return true; }
+	}
+	if (cancelled)
+	{
+		m_progress.firstTruePoll = m_progress.pollCount;
+		m_progress.firstTrueCheckpoint = at;
+	}
+	return cancelled;
+}
+bool KernelPerformanceCheckpointProbe::finish(const KernelPerformanceCheckpoint &at,
+	JobMetricCounter completedWorkUnits, KernelPerformanceRangeTerminal terminal) noexcept
+{
+	if (m_mode == Disabled || m_finished) return fail();
+	m_finished = true;
+	if (m_progress.errors != 0 || at.site == 0 ||
+		!checkpointTerminalMatchesCut(terminal, m_progress.firstTruePoll != 0)) return fail();
+	if (m_mode == Replay && (m_progress.pollCount != m_source.pollCount ||
+		m_progress.firstTruePoll != m_source.firstTruePoll ||
+		!sameCheckpoint(m_progress.firstTrueCheckpoint, m_source.firstTrueCheckpoint) ||
+		!sameCheckpoint(at, m_source.finalCheckpoint) ||
+		completedWorkUnits != m_source.completedWorkUnits || terminal != m_source.terminal)) return fail();
+	m_progress.finalCheckpoint = at;
+	m_progress.completedWorkUnits = completedWorkUnits;
+	m_progress.terminal = terminal;
+	return true;
+}
+KernelPerformanceCheckpointProgress KernelPerformanceCheckpointProbe::snapshot() const noexcept
+{
+	return m_progress;
+}
+
 struct KernelPerformanceCanonicalWriter::State
 {
 	enum { BufferCapacity = 65536 };

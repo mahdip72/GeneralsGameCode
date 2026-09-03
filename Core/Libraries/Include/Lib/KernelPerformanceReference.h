@@ -20,7 +20,53 @@ enum
 {
 	KERNEL_REFERENCE_ERROR_HASH = 256,
 	KERNEL_REFERENCE_ERROR_CALLBACK = 512,
-	KERNEL_REFERENCE_ERROR_MISMATCH = 1024
+	KERNEL_REFERENCE_ERROR_MISMATCH = 1024,
+	KERNEL_REFERENCE_ERROR_CHECKPOINT = 16384
+};
+
+struct KernelPerformanceCheckpoint
+{
+	unsigned site;
+	JobMetricCounter first, second;
+};
+
+enum KernelPerformanceRangeTerminal
+{
+	KERNEL_RANGE_NEVER_ENTERED = 0,
+	KERNEL_RANGE_COMPLETED,
+	KERNEL_RANGE_CANCELLED,
+	KERNEL_RANGE_FAILED
+};
+
+// Range-local body facts, copied by the owner only after the real job release.
+// Publication disposition is separate owner-side state, not probe authority.
+struct KernelPerformanceCheckpointProgress
+{
+	bool entered;
+	unsigned errors;
+	JobMetricCounter pollCount, firstTruePoll, completedWorkUnits;
+	KernelPerformanceCheckpoint firstTrueCheckpoint, finalCheckpoint;
+	KernelPerformanceRangeTerminal terminal;
+};
+
+// No clock, transport, allocation, scheduler, or pure-execution authority.
+// One executing body owns mutation; this object is not internally synchronized.
+class KernelPerformanceCheckpointProbe
+{
+public:
+	KernelPerformanceCheckpointProbe();
+	bool beginRecord() noexcept;
+	bool beginReplay(const KernelPerformanceCheckpointProgress &source) noexcept;
+	bool cancelled(const KernelPerformanceCheckpoint &at, bool actualCancel) noexcept;
+	bool finish(const KernelPerformanceCheckpoint &at, JobMetricCounter completedWorkUnits,
+		KernelPerformanceRangeTerminal terminal) noexcept;
+	KernelPerformanceCheckpointProgress snapshot() const noexcept;
+private:
+	enum Mode { Disabled, Record, Replay };
+	Mode m_mode;
+	bool m_finished;
+	KernelPerformanceCheckpointProgress m_progress, m_source;
+	bool fail() noexcept;
 };
 
 struct KernelPerformanceDigest
