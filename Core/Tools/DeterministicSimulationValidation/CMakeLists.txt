@@ -35,8 +35,13 @@ if(WIN32)
         set_tests_properties(core_installed_lockstep_v2_host_self_test
             PROPERTIES TIMEOUT 30)
     endif()
+    # Complete Windows PowerShell 5.1 runs take about 161 seconds for the
+    # evidence suite and 147 seconds for the expanded paired-host suite.
+    # Retain all independent provenance rereads and negative fixtures, with
+    # bounded headroom for hosted-runner contention (the old 180-second
+    # evidence budget timed out in CI).
     set_tests_properties(core_deterministic_simulation_validation_script_tests
-        PROPERTIES TIMEOUT 180
+        PROPERTIES TIMEOUT 300
             ENVIRONMENT
                 "RTS_STAGE5_VALIDATION_SCRATCH_ROOT=${_stage5_validation_test_scratch_root}")
     set_tests_properties(core_stage5_validation_runner_safety_tests
@@ -44,7 +49,7 @@ if(WIN32)
             ENVIRONMENT
                 "RTS_STAGE5_VALIDATION_SCRATCH_ROOT=${_stage5_validation_test_scratch_root}")
     set_tests_properties(core_stage5_performance_scaling_host_validation_tests
-        PROPERTIES TIMEOUT 120
+        PROPERTIES TIMEOUT 300
             ENVIRONMENT
                 "RTS_STAGE5_VALIDATION_SCRATCH_ROOT=${_stage5_validation_test_scratch_root}")
     set_tests_properties(

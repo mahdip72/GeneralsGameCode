@@ -7,7 +7,8 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4)
         LegacyResetResourceTest.cpp
         LegacyAsyncFramePolicyTest.cpp
         LegacyAsyncBridgeCompletionTest.cpp
-        LegacyWaveShaderContractTest.cpp)
+        LegacyWaveShaderContractTest.cpp
+        LegacyShaderAssetContractTest.cpp)
 
     # Compile the actual reset/publication methods against device-free doubles
     # so failed HRESULTs and retained COM references are exercised, not
@@ -83,6 +84,19 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4)
         "\n\t\tREF_PTR_RELEASE(m_pReflectionTexture);")
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/LegacyWaveShaderCalls.inc"
         "${wave_shader_calls}\n")
+
+    # Run both title loaders with controlled provider/device failures. These
+    # are the production definitions, not a reimplementation of the loader.
+    renderer_reset_source_fragment(generals_shader_asset_method
+        Core/LegacyRenderer/Generals/WW3D2/RenderGameClientLegacy.cpp
+        "HRESULT CreateLegacyD3DShader(" "RenderResult SetGameShaderCullInverted(")
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/GeneralsLegacyShaderAssetMethods.inc"
+        "${generals_shader_asset_method}\n")
+    renderer_reset_source_fragment(zerohour_shader_asset_method
+        Core/LegacyRenderer/GeneralsMD/WW3D2/RenderGameClientLegacy.cpp
+        "HRESULT CreateLegacyD3DShader(" "RenderResult SetGameShaderCullInverted(")
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ZeroHourLegacyShaderAssetMethods.inc"
+        "${zerohour_shader_asset_method}\n")
 endif()
 
 target_link_libraries(core_renderer_contract_tests PRIVATE core_renderer)
@@ -92,7 +106,8 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4)
     target_link_libraries(core_renderer_contract_tests PRIVATE d3d8lib)
     target_compile_definitions(core_renderer_contract_tests PRIVATE
         RTS_RENDERER_RESET_TEST_LEGACY_FRAGMENT=1
-        RTS_RENDERER_WAVE_SHADER_CONTRACT_TEST=1)
+        RTS_RENDERER_WAVE_SHADER_CONTRACT_TEST=1
+        RTS_RENDERER_SHADER_ASSET_CONTRACT_TEST=1)
     target_include_directories(core_renderer_contract_tests BEFORE PRIVATE
         ${CMAKE_SOURCE_DIR}/Core/LegacyRenderer/WWVegas
         ${CMAKE_SOURCE_DIR}/Core/LegacyRenderer/WWVegas/WW3D2
@@ -116,6 +131,7 @@ target_include_directories(core_renderer_contract_tests PRIVATE
 )
 
 if(IS_VS6_BUILD)
+    target_link_libraries(core_renderer_contract_tests PRIVATE stlport)
     set_target_properties(core_renderer_contract_tests PROPERTIES
         CXX_STANDARD 98
         CXX_STANDARD_REQUIRED YES

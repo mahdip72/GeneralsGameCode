@@ -6497,6 +6497,9 @@ int TestLegacyAsyncBridgeCompletion();
 #if defined(RTS_RENDERER_WAVE_SHADER_CONTRACT_TEST)
 int RunLegacyWaveShaderContractTests();
 #endif
+#if defined(RTS_RENDERER_SHADER_ASSET_CONTRACT_TEST)
+int RunLegacyShaderAssetContractTests();
+#endif
 #endif
 
 int main()
@@ -6508,6 +6511,9 @@ int main()
 	result |= TestLegacyAsyncBridgeCompletion();
 #if defined(RTS_RENDERER_WAVE_SHADER_CONTRACT_TEST)
 	result |= RunLegacyWaveShaderContractTests();
+#endif
+#if defined(RTS_RENDERER_SHADER_ASSET_CONTRACT_TEST)
+	result |= RunLegacyShaderAssetContractTests();
 #endif
 #endif
 	result |= testBackendNames();

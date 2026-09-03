@@ -22,8 +22,7 @@
 #include "ww3d.h"
 #include "W3DDevice/GameClient/W3DShaderManager.h"
 #include "W3DDevice/Common/LegacyPixelShaderBytecode.h"
-#include "Common/file.h"
-#include "Common/FileSystem.h"
+#include "WWLib/ffactory.h"
 #include "WWMath/matrix3d.h"
 #include "WWMath/matrix4.h"
 #include "WWMath/sphere.h"
@@ -1979,37 +1978,32 @@ HRESULT CreateLegacyD3DShader(const char *assetPath,
 		return E_INVALIDARG;
 	}
 
-	File *file = 0;
+	DWORD *shader = 0;
 	try
 	{
-		if (TheFileSystem == 0)
+		FileFactoryClass *factory = _TheFileFactory;
+		if (factory == 0)
 			return E_FAIL;
-		file = TheFileSystem->openFile(assetPath, File::READ | File::BINARY);
-		if (file == 0)
+		// Games install their archive-aware W3D provider; authoring tools use
+		// the normal WWLib provider without linking the gameplay filesystem.
+		file_auto_ptr file(factory, assetPath);
+		if (file.get() == 0 || !file->Open(FileClass::READ))
 			return E_FAIL;
 
-		FileInfo fileInfo;
-		if (!TheFileSystem->getFileInfo(AsciiString(assetPath), &fileInfo) ||
-			fileInfo.sizeLow <= 0)
-		{
-			file->close();
+		const int fileSize = file->Size();
+		if (fileSize <= 0)
 			return E_FAIL;
-		}
-		const DWORD fileSize = static_cast<DWORD>(fileInfo.sizeLow);
-		DWORD *shader = reinterpret_cast<DWORD *>(HeapAlloc(
-			GetProcessHeap(), HEAP_ZERO_MEMORY, fileSize));
+		shader = reinterpret_cast<DWORD *>(HeapAlloc(
+			GetProcessHeap(), HEAP_ZERO_MEMORY, static_cast<DWORD>(fileSize)));
 		if (shader == 0)
-		{
-			file->close();
 			return E_OUTOFMEMORY;
-		}
 
-		const Int bytesRead = file->read(shader, static_cast<Int>(fileSize));
-		file->close();
-		file = 0;
-		if (bytesRead != static_cast<Int>(fileSize))
+		const int bytesRead = file->Read(shader, fileSize);
+		file->Close();
+		if (bytesRead != fileSize)
 		{
 			HeapFree(GetProcessHeap(), 0, shader);
+			shader = 0;
 			return E_FAIL;
 		}
 
@@ -2025,12 +2019,13 @@ HRESULT CreateLegacyD3DShader(const char *assetPath,
 				shader, handle);
 		}
 		HeapFree(GetProcessHeap(), 0, shader);
+		shader = 0;
 		return result;
 	}
 	catch (...)
 	{
-		if (file != 0)
-			file->close();
+		if (shader != 0)
+			HeapFree(GetProcessHeap(), 0, shader);
 		return E_FAIL;
 	}
 }
