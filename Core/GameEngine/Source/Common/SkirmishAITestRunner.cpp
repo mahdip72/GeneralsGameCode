@@ -363,19 +363,41 @@ Bool HashSkirmishAITestFile(const char *path,
 }
 
 Bool CommitSkirmishAITestReplay(const char *temporaryPath,
-	const char *destinationPath)
+	const char *destinationPath,
+	SkirmishAITestDetail::ReplayCommitCallback commitCallback,
+	void *commitContext)
 {
 #if defined(_WIN32)
-	return MoveFileExA(temporaryPath, destinationPath, MOVEFILE_WRITE_THROUGH)
-		? TRUE : FALSE;
+	const UnsignedInt maxAttempts = 8;
+	for (UnsignedInt attempt = 0; attempt < maxAttempts; ++attempt)
+	{
+		Bool committed = FALSE;
+		if (commitCallback != nullptr)
+			committed = commitCallback(temporaryPath, destinationPath,
+				commitContext);
+		else
+			committed = MoveFileExA(temporaryPath, destinationPath,
+				MOVEFILE_WRITE_THROUGH) ? TRUE : FALSE;
+		if (committed)
+			return TRUE;
+		const DWORD error = GetLastError();
+		if (error != ERROR_SHARING_VIOLATION || attempt + 1 >= maxAttempts)
+			return FALSE;
+		Sleep(10);
+	}
+	return FALSE;
 #else
+	if (commitCallback != nullptr)
+		return commitCallback(temporaryPath, destinationPath, commitContext);
 	return rename(temporaryPath, destinationPath) == 0;
 #endif
 }
 
 Bool RetainSkirmishAITestReplayAtomicallyInternal(const char *sourcePath,
 	const char *destinationPath,
-	char sha256[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1])
+	char sha256[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1],
+	SkirmishAITestDetail::ReplayCommitCallback commitCallback,
+	void *commitContext)
 {
 	if (sourcePath == nullptr || destinationPath == nullptr || sha256 == nullptr ||
 		!HasBoundedString(sourcePath, SKIRMISH_AI_TEST_RECEIPT_PATH_LENGTH) ||
@@ -441,7 +463,11 @@ Bool RetainSkirmishAITestReplayAtomicallyInternal(const char *sourcePath,
 		success = FALSE;
 	if (fclose(temporary) != 0)
 		success = FALSE;
-	if (!success || !CommitSkirmishAITestReplay(temporaryPath, destinationPath))
+	Bool committed = FALSE;
+	if (success)
+		committed = CommitSkirmishAITestReplay(temporaryPath, destinationPath,
+			commitCallback, commitContext);
+	if (!success || !committed)
 	{
 		remove(temporaryPath);
 		return FALSE;
@@ -566,8 +592,23 @@ Bool RetainSkirmishAITestReplayAtomically(const char *sourcePath,
 	const char *destinationPath,
 	char sha256[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1])
 {
+	return SkirmishAITestDetail::RetainSkirmishAITestReplayAtomically(
+		sourcePath, destinationPath, sha256, nullptr, nullptr);
+}
+
+namespace SkirmishAITestDetail
+{
+Bool RetainSkirmishAITestReplayAtomically(const char *sourcePath,
+	const char *destinationPath,
+	char sha256[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1],
+	ReplayCommitCallback commitCallback, void *commitContext)
+{
+	if (commitCallback == nullptr)
+		return RetainSkirmishAITestReplayAtomicallyInternal(sourcePath,
+			destinationPath, sha256, nullptr, nullptr);
 	return RetainSkirmishAITestReplayAtomicallyInternal(sourcePath,
-		destinationPath, sha256);
+		destinationPath, sha256, commitCallback, commitContext);
+}
 }
 
 Bool HashSkirmishAITestBytes(const void *bytes, size_t byteCount,
@@ -1593,8 +1634,15 @@ Bool IsSkirmishAITest4v2(SkirmishAITestScenario scenario)
 	return scenario == SKIRMISH_AI_TEST_SCENARIO_4V2;
 }
 
+Bool IsSkirmishAITestHardAI2v6(SkirmishAITestScenario scenario)
+{
+	return scenario == SKIRMISH_AI_TEST_SCENARIO_HARD_AI_2V6;
+}
+
 Int ExpectedSkirmishAITestAiCount(SkirmishAITestScenario scenario)
 {
+	if (IsSkirmishAITestHardAI2v6(scenario))
+		return SKIRMISH_AI_TEST_SLOT_COUNT;
 	return IsSkirmishAITest4v2(scenario) ? 6 : 7;
 }
 
@@ -1604,6 +1652,8 @@ const char *SkirmishAITestScenarioName(SkirmishAITestScenario scenario)
 		return "4v2";
 	if (scenario == SKIRMISH_AI_TEST_SCENARIO_PRACTICAL_1V7)
 		return "practical-1v7";
+	if (IsSkirmishAITestHardAI2v6(scenario))
+		return "hard-ai-2v6";
 	return "4v3";
 }
 
@@ -1664,7 +1714,8 @@ Bool IsValidSkirmishAITestReplayReceipt(
 	}
 	if (strcmp(receipt.scenario, "4v3") != 0 &&
 		strcmp(receipt.scenario, "4v2") != 0 &&
-		strcmp(receipt.scenario, "practical-1v7") != 0)
+		strcmp(receipt.scenario, "practical-1v7") != 0 &&
+		strcmp(receipt.scenario, "hard-ai-2v6") != 0)
 	{
 		return FALSE;
 	}
@@ -1756,16 +1807,25 @@ void BuildSkirmishAITestPlan(Int seed, SkirmishAITestScenario scenario,
 	if (plan == nullptr)
 		return;
 	if (scenario != SKIRMISH_AI_TEST_SCENARIO_4V2 &&
-		scenario != SKIRMISH_AI_TEST_SCENARIO_PRACTICAL_1V7)
+		scenario != SKIRMISH_AI_TEST_SCENARIO_PRACTICAL_1V7 &&
+		!IsSkirmishAITestHardAI2v6(scenario))
 		scenario = SKIRMISH_AI_TEST_SCENARIO_4V3;
 
 	plan->seed = seed;
 	plan->mapName = "Maps\\Twilight Flame\\Twilight Flame.map";
 
+	const Bool hardAI2v6 = IsSkirmishAITestHardAI2v6(scenario);
 	SkirmishAITestSlotPlan &localSlot = plan->slots[0];
-	localSlot.state = SLOT_PLAYER;
+	localSlot.state = hardAI2v6 ? SLOT_BRUTAL_AI : SLOT_PLAYER;
 	localSlot.isController = IsSkirmishAITestPracticalControllerScenario(scenario);
-	if (localSlot.isController)
+	if (hardAI2v6)
+	{
+		localSlot.playerTemplate = PLAYERTEMPLATE_RANDOM;
+		localSlot.color = 0;
+		localSlot.startPosition = 0;
+		localSlot.teamNumber = 0;
+	}
+	else if (localSlot.isController)
 	{
 		localSlot.playerTemplate = PLAYERTEMPLATE_RANDOM;
 		localSlot.color = 0;
@@ -1795,7 +1855,13 @@ void BuildSkirmishAITestPlan(Int seed, SkirmishAITestScenario scenario,
 		}
 		slot.state = SLOT_BRUTAL_AI;
 		slot.playerTemplate = PLAYERTEMPLATE_RANDOM;
-		if (IsSkirmishAITestPracticalControllerScenario(scenario))
+		if (hardAI2v6)
+		{
+			slot.color = i;
+			slot.startPosition = i;
+			slot.teamNumber = i < 2 ? 0 : 1;
+		}
+		else if (IsSkirmishAITestPracticalControllerScenario(scenario))
 		{
 			slot.color = i;
 			slot.startPosition = i;
@@ -1867,7 +1933,8 @@ Bool IsSkirmishAITestProgressStalled(UnsignedInt elapsedMilliseconds)
 void ArmSkirmishAITestRunner(Int seed, SkirmishAITestScenario scenario)
 {
 	if (scenario != SKIRMISH_AI_TEST_SCENARIO_4V2 &&
-		scenario != SKIRMISH_AI_TEST_SCENARIO_PRACTICAL_1V7)
+		scenario != SKIRMISH_AI_TEST_SCENARIO_PRACTICAL_1V7 &&
+		!IsSkirmishAITestHardAI2v6(scenario))
 		scenario = SKIRMISH_AI_TEST_SCENARIO_4V3;
 	s_runner.armed = TRUE;
 	s_runner.started = FALSE;
@@ -1972,8 +2039,10 @@ Bool StartSkirmishAITestRunner()
 	SkirmishAITestPlan plan;
 	BuildSkirmishAITestPlan(s_runner.seed, s_runner.scenario, &plan);
 	const MapMetaData *map = TheMapCache->findMap(plan.mapName);
+	const Int expectedMapPlayers = ExpectedSkirmishAITestAiCount(s_runner.scenario) +
+		(IsSkirmishAITestHardAI2v6(s_runner.scenario) ? 0 : 1);
 	if (!map || !map->m_doesExist || !map->m_isMultiplayer ||
-		map->m_numPlayers < ExpectedSkirmishAITestAiCount(s_runner.scenario) + 1)
+		map->m_numPlayers < expectedMapPlayers)
 	{
 		FailSkirmishAITest("twilight_flame_unavailable");
 		return FALSE;
@@ -2020,16 +2089,16 @@ Bool StartSkirmishAITestRunner()
 	DEBUG_LOG(("SkirmishAITestRunner::start phase=start_game_complete"));
 
 	TheWritableGlobalData->m_mapName = plan.mapName;
-	// The practical controller lane is intentionally interactive.  The two
-	// automated lanes remain headless and continue to be the only replay-gate
-	// scenarios.
+	// The practical controller lane is intentionally interactive.  Automated
+	// lanes remain headless and continue to be the replay-gate scenarios.
 	TheWritableGlobalData->m_headless =
 		IsSkirmishAITestPracticalControllerScenario(s_runner.scenario) ? FALSE : TRUE;
 	TheWritableGlobalData->m_shellMapOn = FALSE;
 	if (!IsSkirmishAITestPracticalControllerScenario(s_runner.scenario))
 		TheWritableGlobalData->m_useFpsLimit = FALSE;
-	// The automated observer owns no units. Keep its logical and local retaliation modes disabled
-	// so the recorder does not capture an irrelevant frame-zero preference synchronization command.
+	// Automated lanes keep logical and local retaliation modes disabled so the
+	// recorder does not capture an irrelevant frame-zero preference
+	// synchronization command.
 	if (!IsSkirmishAITestPracticalControllerScenario(s_runner.scenario))
 		TheWritableGlobalData->m_clientRetaliationModeEnabled = FALSE;
 	TheRecorder->setArchiveEnabled(FALSE);
@@ -2058,6 +2127,11 @@ Bool StartSkirmishAITestRunner()
 	else if (IsSkirmishAITestPracticalControllerScenario(s_runner.scenario))
 	{
 		printf("SKIRMISH_AI_TEST_START seed=%d scenario=%s map=\"%s\" expected_ai=7 expected_teams=1-controller+3v4-ai\n",
+			plan.seed, SkirmishAITestScenarioName(s_runner.scenario), plan.mapName);
+	}
+	else if (IsSkirmishAITestHardAI2v6(s_runner.scenario))
+	{
+		printf("SKIRMISH_AI_TEST_START seed=%d scenario=%s map=\"%s\" expected_ai=8 expected_teams=2v6\n",
 			plan.seed, SkirmishAITestScenarioName(s_runner.scenario), plan.mapName);
 	}
 	else
@@ -2209,9 +2283,23 @@ void UpdateSkirmishAITestRunner()
 	}
 
 	const GameSlot *localSlot = TheGameInfo->getConstSlot(0);
-	Player *localPlayer = ThePlayerList->findPlayerWithNameKey(NAMEKEY("player0"));
+	const Bool hardAI2v6 = IsSkirmishAITestHardAI2v6(s_runner.scenario);
+	Player *localPlayer = hardAI2v6
+		? ThePlayerList->findPlayerWithNameKey(NAMEKEY("ReplayObserver"))
+		: ThePlayerList->findPlayerWithNameKey(NAMEKEY("player0"));
 	Bool validMatch = FALSE;
-	if (IsSkirmishAITestPracticalControllerScenario(s_runner.scenario))
+	if (hardAI2v6)
+	{
+		// An all-AI run has no GameInfo human slot. GameLogic creates the
+		// permanent ReplayObserver player outside those eight occupied slots.
+		validMatch = localSlot && localSlot->isAI() && localPlayer &&
+			localPlayer->isPlayerObserver() &&
+			ThePlayerList->getLocalPlayer() == localPlayer &&
+			TheGameInfo->getLocalSlotNum() == -1 &&
+			TheGameInfo->getNumPlayers() == SKIRMISH_AI_TEST_SLOT_COUNT &&
+			TheGameInfo->getNumNonObserverPlayers() == SKIRMISH_AI_TEST_SLOT_COUNT;
+	}
+	else if (IsSkirmishAITestPracticalControllerScenario(s_runner.scenario))
 	{
 		// A practical run must own a normal player slot.  An observer is not a
 		// substitute for controller coverage and is rejected explicitly here.
@@ -2227,7 +2315,8 @@ void UpdateSkirmishAITestRunner()
 	}
 	Int expectedAiCount = 0;
 	Int expectedTeamCounts[2] = { 0, 0 };
-	for (Int i = 1; i < SKIRMISH_AI_TEST_SLOT_COUNT; ++i)
+	const Int firstAiSlot = hardAI2v6 ? 0 : 1;
+	for (Int i = firstAiSlot; i < SKIRMISH_AI_TEST_SLOT_COUNT; ++i)
 	{
 		const SkirmishAITestSlotPlan &slotPlan = expectedPlan.slots[i];
 		if (slotPlan.state == SLOT_BRUTAL_AI)
@@ -2239,7 +2328,7 @@ void UpdateSkirmishAITestRunner()
 	}
 	Int actualAiCount = 0;
 	Int actualTeamCounts[2] = { 0, 0 };
-	for (Int slotIndex = 1; slotIndex < SKIRMISH_AI_TEST_SLOT_COUNT; ++slotIndex)
+	for (Int slotIndex = firstAiSlot; slotIndex < SKIRMISH_AI_TEST_SLOT_COUNT; ++slotIndex)
 	{
 		const SkirmishAITestSlotPlan &expectedSlot = expectedPlan.slots[slotIndex];
 		const GameSlot *slot = TheGameInfo->getConstSlot(slotIndex);
@@ -2288,6 +2377,8 @@ void UpdateSkirmishAITestRunner()
 			failureReason = "invalid_4v2_setup";
 		else if (IsSkirmishAITestPracticalControllerScenario(s_runner.scenario))
 			failureReason = "invalid_practical_1v7_setup";
+		else if (hardAI2v6)
+			failureReason = "invalid_hard_ai_2v6_setup";
 		FailSkirmishAITest(failureReason);
 		RequestSkirmishAITestStop();
 		return;

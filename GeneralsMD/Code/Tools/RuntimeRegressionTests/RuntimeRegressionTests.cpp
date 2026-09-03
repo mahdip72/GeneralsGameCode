@@ -21,6 +21,7 @@
 #include "Common/PerformanceReceiptRuntime.h"
 #include "Common/SkirmishAIReplayEpoch.h"
 #include "Common/PathfindQueueReplayEpoch.h"
+#include "GameClient/GameText.h"
 #include "GameLogic/AIPathfind.h"
 #include "Lib/SimulationPhaseGraphOwnerAdapter.h"
 #include "XferCrcSnapshotTest.h"
@@ -85,6 +86,51 @@ static void Check(Bool result, const char *expression, Int line)
 		++s_failures;
 	}
 }
+
+class SkirmishAITestGameText : public GameTextInterface
+{
+public:
+	virtual void init() {}
+	virtual void reset() {}
+	virtual void update() {}
+
+	virtual UnicodeString fetch(const Char *, Bool *exists = nullptr)
+	{
+		if (exists)
+			*exists = FALSE;
+		return UnicodeString();
+	}
+	virtual UnicodeString fetch(AsciiString, Bool *exists = nullptr)
+	{
+		if (exists)
+			*exists = FALSE;
+		return UnicodeString();
+	}
+	virtual UnicodeString fetchFormat(const Char *, ...)
+	{
+		return UnicodeString();
+	}
+	virtual UnicodeString fetchOrSubstitute(const Char *, const WideChar *)
+	{
+		return UnicodeString();
+	}
+	virtual UnicodeString fetchOrSubstituteFormat(const Char *, const WideChar *, ...)
+	{
+		return UnicodeString();
+	}
+	virtual UnicodeString fetchOrSubstituteFormatVA(const Char *, const WideChar *, va_list)
+	{
+		return UnicodeString();
+	}
+	virtual AsciiStringVec& getStringsWithLabelPrefix(AsciiString)
+	{
+		return m_strings;
+	}
+	virtual void initMapStringFile(const AsciiString&) {}
+
+private:
+	AsciiStringVec m_strings;
+};
 
 #if defined(_WIN64)
 class TerminalReceiptTestEnvironment
@@ -1658,6 +1704,198 @@ static void TestSkirmishAIFeedbackPolicies()
 	CHECK(newState.hasPathFailureFrame);
 }
 
+#if defined(_WIN32)
+struct SkirmishAITestReplayCommitProbe
+{
+	Int callCount;
+	Int sharingFailures;
+	Bool persistentSharing;
+	DWORD terminalError;
+	Bool temporaryMissingDuringFailure;
+};
+
+static Bool SkirmishAITestReplayFileExists(const char *path)
+{
+	FILE *file = fopen(path, "rb");
+	if (file == nullptr)
+		return FALSE;
+	return fclose(file) == 0;
+}
+
+static Bool WriteSkirmishAITestReplayFile(const char *path,
+	const char *contents)
+{
+	if (path == nullptr || contents == nullptr)
+		return FALSE;
+	FILE *file = fopen(path, "wb");
+	if (file == nullptr)
+		return FALSE;
+	const size_t length = strlen(contents);
+	const Bool written = fwrite(contents, 1, length, file) == length;
+	const int closeResult = fclose(file);
+	return written && closeResult == 0;
+}
+
+static Bool SkirmishAITestReplayFileHasContents(const char *path,
+	const char *expectedContents)
+{
+	if (path == nullptr || expectedContents == nullptr)
+		return FALSE;
+	const size_t expectedLength = strlen(expectedContents);
+	char contents[128];
+	if (expectedLength >= sizeof(contents))
+		return FALSE;
+	FILE *file = fopen(path, "rb");
+	if (file == nullptr)
+		return FALSE;
+	const size_t readCount = fread(contents, 1, expectedLength, file);
+	const Bool matches = readCount == expectedLength &&
+		memcmp(contents, expectedContents, expectedLength) == 0 &&
+		fgetc(file) == EOF;
+	const int closeResult = fclose(file);
+	return matches && closeResult == 0;
+}
+
+static Bool CommitSkirmishAITestReplayUsingProbe(const char *temporaryPath,
+	const char *destinationPath, void *context)
+{
+	SkirmishAITestReplayCommitProbe *probe =
+		static_cast<SkirmishAITestReplayCommitProbe *>(context);
+	if (probe == nullptr)
+	{
+		SetLastError(ERROR_INVALID_PARAMETER);
+		return FALSE;
+	}
+	++probe->callCount;
+	if (probe->persistentSharing ||
+		probe->callCount <= probe->sharingFailures)
+	{
+		if (!SkirmishAITestReplayFileExists(temporaryPath))
+			probe->temporaryMissingDuringFailure = TRUE;
+		SetLastError(ERROR_SHARING_VIOLATION);
+		return FALSE;
+	}
+	if (probe->terminalError != ERROR_SUCCESS)
+	{
+		SetLastError(probe->terminalError);
+		return FALSE;
+	}
+	return MoveFileExA(temporaryPath, destinationPath,
+		MOVEFILE_WRITE_THROUGH) ? TRUE : FALSE;
+}
+
+static void TestSkirmishAITestReplayRetentionCommitPolicy()
+{
+	char currentDirectory[SKIRMISH_AI_TEST_RECEIPT_PATH_LENGTH];
+	const DWORD directoryLength = GetCurrentDirectoryA(
+		static_cast<DWORD>(sizeof(currentDirectory)), currentDirectory);
+	CHECK(directoryLength != 0 && directoryLength < sizeof(currentDirectory));
+	if (directoryLength == 0 || directoryLength >= sizeof(currentDirectory))
+		return;
+	const unsigned long processId =
+		static_cast<unsigned long>(GetCurrentProcessId());
+	char sourcePath[SKIRMISH_AI_TEST_RECEIPT_PATH_LENGTH];
+	char destinationPath[SKIRMISH_AI_TEST_RECEIPT_PATH_LENGTH];
+	char temporaryPath[SKIRMISH_AI_TEST_RECEIPT_PATH_LENGTH];
+	_snprintf(sourcePath, sizeof(sourcePath),
+		"%s\\SkirmishAITestRetentionPolicy-%lu-source.rep",
+		currentDirectory, processId);
+	_snprintf(destinationPath, sizeof(destinationPath),
+		"%s\\SkirmishAITestRetentionPolicy-%lu-retained.rep",
+		currentDirectory, processId);
+	_snprintf(temporaryPath, sizeof(temporaryPath),
+		"%s\\SkirmishAITestRetentionPolicy-%lu-retained.rep.tmp",
+		currentDirectory, processId);
+	sourcePath[sizeof(sourcePath) - 1] = '\0';
+	destinationPath[sizeof(destinationPath) - 1] = '\0';
+	temporaryPath[sizeof(temporaryPath) - 1] = '\0';
+
+	remove(sourcePath);
+	remove(destinationPath);
+	remove(temporaryPath);
+	char digest[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1];
+	strcpy(digest, "unchanged");
+	SkirmishAITestReplayCommitProbe sourceFailure =
+		{ 0, 0, TRUE, ERROR_SUCCESS, FALSE };
+	CHECK(!SkirmishAITestDetail::RetainSkirmishAITestReplayAtomically(sourcePath,
+		destinationPath, digest, CommitSkirmishAITestReplayUsingProbe,
+		&sourceFailure));
+	CHECK(sourceFailure.callCount == 0);
+	CHECK(strcmp(digest, "unchanged") == 0);
+
+	CHECK(WriteSkirmishAITestReplayFile(sourcePath, "replay-fixture"));
+	SkirmishAITestReplayCommitProbe sharingThenSuccess =
+		{ 0, 1, FALSE, ERROR_SUCCESS, FALSE };
+	strcpy(digest, "unchanged");
+	CHECK(SkirmishAITestDetail::RetainSkirmishAITestReplayAtomically(sourcePath,
+		destinationPath, digest, CommitSkirmishAITestReplayUsingProbe,
+		&sharingThenSuccess));
+	CHECK(sharingThenSuccess.callCount == 2);
+	CHECK(strcmp(digest,
+		"8742EBC99881266FF5BADEDD521E1CD24066EAD2E88A9D544C3C1F466AE534DA") == 0);
+	CHECK(SkirmishAITestReplayFileHasContents(destinationPath,
+		"replay-fixture"));
+	CHECK(SkirmishAITestReplayFileExists(sourcePath));
+
+	remove(sourcePath);
+	remove(destinationPath);
+	remove(temporaryPath);
+	CHECK(WriteSkirmishAITestReplayFile(sourcePath, "replay-fixture"));
+	SkirmishAITestReplayCommitProbe persistentSharing =
+		{ 0, 0, TRUE, ERROR_SUCCESS, FALSE };
+	strcpy(digest, "unchanged");
+	CHECK(!SkirmishAITestDetail::RetainSkirmishAITestReplayAtomically(sourcePath,
+		destinationPath, digest, CommitSkirmishAITestReplayUsingProbe,
+		&persistentSharing));
+	CHECK(persistentSharing.callCount ==
+		8);
+	CHECK(!persistentSharing.temporaryMissingDuringFailure);
+	CHECK(strcmp(digest, "unchanged") == 0);
+	CHECK(SkirmishAITestReplayFileExists(sourcePath));
+	CHECK(!SkirmishAITestReplayFileExists(destinationPath));
+	CHECK(!SkirmishAITestReplayFileExists(temporaryPath));
+
+	remove(sourcePath);
+	remove(destinationPath);
+	remove(temporaryPath);
+	CHECK(WriteSkirmishAITestReplayFile(sourcePath, "replay-fixture"));
+	SkirmishAITestReplayCommitProbe nonSharingFailure =
+		{ 0, 0, FALSE, ERROR_ACCESS_DENIED, FALSE };
+	strcpy(digest, "unchanged");
+	CHECK(!SkirmishAITestDetail::RetainSkirmishAITestReplayAtomically(sourcePath,
+		destinationPath, digest, CommitSkirmishAITestReplayUsingProbe,
+		&nonSharingFailure));
+	CHECK(nonSharingFailure.callCount == 1);
+	CHECK(strcmp(digest, "unchanged") == 0);
+	CHECK(SkirmishAITestReplayFileExists(sourcePath));
+	CHECK(!SkirmishAITestReplayFileExists(destinationPath));
+	CHECK(!SkirmishAITestReplayFileExists(temporaryPath));
+
+	remove(sourcePath);
+	remove(destinationPath);
+	remove(temporaryPath);
+	CHECK(WriteSkirmishAITestReplayFile(sourcePath, "replay-fixture"));
+	CHECK(WriteSkirmishAITestReplayFile(destinationPath,
+		"destination-sentinel"));
+	SkirmishAITestReplayCommitProbe existingDestination =
+		{ 0, 0, FALSE, ERROR_SUCCESS, FALSE };
+	strcpy(digest, "unchanged");
+	CHECK(!SkirmishAITestDetail::RetainSkirmishAITestReplayAtomically(sourcePath,
+		destinationPath, digest, CommitSkirmishAITestReplayUsingProbe,
+		&existingDestination));
+	CHECK(existingDestination.callCount == 1);
+	CHECK(strcmp(digest, "unchanged") == 0);
+	CHECK(SkirmishAITestReplayFileHasContents(destinationPath,
+		"destination-sentinel"));
+	CHECK(SkirmishAITestReplayFileExists(sourcePath));
+	CHECK(!SkirmishAITestReplayFileExists(temporaryPath));
+
+	remove(sourcePath);
+	remove(destinationPath);
+	remove(temporaryPath);
+}
+#endif
+
 static void TestSkirmishAITestReceiptContract()
 {
 	SkirmishAITestPlan practicalPlan;
@@ -1735,12 +1973,96 @@ static void TestSkirmishAITestReceiptContract()
 	remove(destinationPath);
 }
 
+static void TestSkirmishAITestHardAI2v6Contract()
+{
+	SkirmishAITestPlan plan;
+	BuildSkirmishAITestPlan(1733,
+		SKIRMISH_AI_TEST_SCENARIO_HARD_AI_2V6, &plan);
+	CHECK(plan.seed == 1733);
+	CHECK(!plan.slots[0].isController);
+
+	Int plannedAiCount = 0;
+	Int plannedTeamCounts[2] = { 0, 0 };
+	for (Int slotIndex = 0; slotIndex < SKIRMISH_AI_TEST_SLOT_COUNT; ++slotIndex)
+	{
+		const SkirmishAITestSlotPlan &slot = plan.slots[slotIndex];
+		CHECK(slot.state == SLOT_BRUTAL_AI);
+		CHECK(slot.playerTemplate == PLAYERTEMPLATE_RANDOM);
+		CHECK(slot.color == slotIndex);
+		CHECK(slot.startPosition == slotIndex);
+		CHECK(slot.teamNumber == (slotIndex < 2 ? 0 : 1));
+		CHECK(!slot.isController);
+		if (slot.state == SLOT_BRUTAL_AI)
+		{
+			++plannedAiCount;
+			if (slot.teamNumber >= 0 && slot.teamNumber < 2)
+				++plannedTeamCounts[slot.teamNumber];
+		}
+	}
+	CHECK(plannedAiCount == 8);
+	CHECK(plannedTeamCounts[0] == 2 && plannedTeamCounts[1] == 6);
+
+	// Exercise the actual GameInfo slot semantics: all eight slots are hard AI,
+	// there is no human controller, and the local slot remains -1.
+	GlobalData *previousGlobalData = TheWritableGlobalData;
+	GameTextInterface *previousGameText = TheGameText;
+	SkirmishAITestGameText testGameText;
+	TheGameText = &testGameText;
+	GlobalData *testGlobalData = new GlobalData;
+	TheWritableGlobalData = testGlobalData;
+	GameInfo *actualGameInfo = new GameInfo;
+	GameSlot actualSlots[SKIRMISH_AI_TEST_SLOT_COUNT];
+	for (Int slotIndex = 0; slotIndex < SKIRMISH_AI_TEST_SLOT_COUNT; ++slotIndex)
+		actualGameInfo->setSlotPointer(slotIndex, &actualSlots[slotIndex]);
+	actualGameInfo->enterGame();
+	actualGameInfo->setLocalIP(0);
+	for (Int slotIndex = 0; slotIndex < SKIRMISH_AI_TEST_SLOT_COUNT; ++slotIndex)
+	{
+		const SkirmishAITestSlotPlan &expected = plan.slots[slotIndex];
+		GameSlot *actual = actualGameInfo->getSlot(slotIndex);
+		actual->setState(expected.state);
+		actual->setPlayerTemplate(expected.playerTemplate);
+		actual->setColor(expected.color);
+		actual->setStartPos(expected.startPosition);
+		actual->setTeamNumber(expected.teamNumber);
+	}
+	CHECK(actualGameInfo->getNumPlayers() == 8);
+	CHECK(actualGameInfo->getNumNonObserverPlayers() == 8);
+	CHECK(actualGameInfo->getLocalSlotNum() == -1);
+
+	Int actualAiCount = 0;
+	Int actualTeamCounts[2] = { 0, 0 };
+	for (Int slotIndex = 0; slotIndex < SKIRMISH_AI_TEST_SLOT_COUNT; ++slotIndex)
+	{
+		const GameSlot *actual = actualGameInfo->getConstSlot(slotIndex);
+		CHECK(actual->isAI() && !actual->isHuman());
+		if (actual->isAI())
+		{
+			++actualAiCount;
+			if (actual->getTeamNumber() >= 0 && actual->getTeamNumber() < 2)
+				++actualTeamCounts[actual->getTeamNumber()];
+		}
+	}
+	CHECK(actualAiCount == 8);
+	CHECK(actualTeamCounts[0] == 2 && actualTeamCounts[1] == 6);
+	delete actualGameInfo;
+	TheWritableGlobalData = testGlobalData;
+	delete testGlobalData;
+	TheWritableGlobalData = previousGlobalData;
+	TheGameText = previousGameText;
+}
+
+
 static void TestSkirmishAITestRunnerContract()
 {
 #if defined(_WIN64)
 	TestPerformanceReceiptOwnerLifecycle();
 #endif
 	TestSkirmishAITestReceiptContract();
+#if defined(_WIN32)
+	TestSkirmishAITestReplayRetentionCommitPolicy();
+#endif
+	TestSkirmishAITestHardAI2v6Contract();
 	CHECK(!rts::ShouldUseLiveSimulationPhaseGraph(false, false, 0, 3));
 	CHECK(rts::ShouldUseLiveSimulationPhaseGraph(true, false, 0, 3));
 	CHECK(!rts::ShouldUseLiveSimulationPhaseGraph(true, true, 2, 3));

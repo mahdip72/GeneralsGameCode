@@ -42,7 +42,10 @@ enum SkirmishAITestScenario
 	// the observer-backed automated lanes and is not a replay gate scenario.
 	SKIRMISH_AI_TEST_SCENARIO_PRACTICAL_1V7,
 	SKIRMISH_AI_TEST_SCENARIO_ONE_CONTROLLER_7_AI =
-		SKIRMISH_AI_TEST_SCENARIO_PRACTICAL_1V7
+		SKIRMISH_AI_TEST_SCENARIO_PRACTICAL_1V7,
+	// Eight occupied hard-AI slots: two allied against six. The local player
+	// is the engine-created replay observer, not a GameInfo slot.
+	SKIRMISH_AI_TEST_SCENARIO_HARD_AI_2V6
 };
 
 enum SkirmishAITestProgress
@@ -137,6 +140,18 @@ Bool IsSkirmishAITestShutdownTimedOut(UnsignedInt elapsedMilliseconds);
 Bool IsSkirmishAITestPracticalControllerScenario(SkirmishAITestScenario scenario);
 Bool IsValidSkirmishAITestPracticalControllerPlan(
 	const SkirmishAITestPlan &plan);
+
+// Narrow per-invocation seam for retention commit-policy tests. Production
+// callers use the ordinary three-argument wrapper below.
+namespace SkirmishAITestDetail
+{
+typedef Bool (*ReplayCommitCallback)(
+	const char *temporaryPath, const char *destinationPath, void *context);
+Bool RetainSkirmishAITestReplayAtomically(
+	const char *sourcePath, const char *destinationPath,
+	char sha256[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1],
+	ReplayCommitCallback commitCallback, void *context);
+}
 
 Bool SetSkirmishAITestExecutableHashInput(const char *sha256);
 // Shared validation hashing; these do not arm or alter any AI-test scenario.
