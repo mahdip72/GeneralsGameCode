@@ -73,3 +73,36 @@ if(TARGET simulation_phase_graph_owner_adapter_tests)
         COMMAND simulation_phase_graph_owner_adapter_tests
     )
 endif()
+
+# Compile the actual title predicates and commit/retarget calls against a
+# controlled owner shell. The phase bodies remain fixture-controlled so late
+# intake resets can be reproduced without initializing either game runtime.
+get_filename_component(_phase_title_repository_root "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
+foreach(_phase_title IN ITEMS Generals GeneralsMD)
+    set(_phase_title_source "${_phase_title_repository_root}/${_phase_title}/Code/GameEngine/Source/GameLogic/System/GameLogic.cpp")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_phase_title_source}")
+    file(READ "${_phase_title_source}" _phase_title_text)
+    string(FIND "${_phase_title_text}" "bool GameLogic::validateStage5PhaseGraphCommit(" _phase_title_start)
+    string(FIND "${_phase_title_text}" "Bool GameLogic::runOwnerIntakePhase(" _phase_title_end)
+    if(_phase_title_start LESS 0 OR _phase_title_end LESS_EQUAL _phase_title_start)
+        message(FATAL_ERROR "Cannot locate the ${_phase_title} owner phase contract methods")
+    endif()
+    math(EXPR _phase_title_length "${_phase_title_end} - ${_phase_title_start}")
+    string(SUBSTRING "${_phase_title_text}" ${_phase_title_start} ${_phase_title_length} _phase_title_methods)
+    set(_phase_title_generated "${CMAKE_CURRENT_BINARY_DIR}/${_phase_title}")
+    file(GENERATE OUTPUT "${_phase_title_generated}/SimulationPhaseGraphOwnerTitleMethods.inc"
+        CONTENT "${_phase_title_methods}")
+    if(_phase_title STREQUAL "Generals")
+        set(_phase_title_target g_simulation_phase_owner_title_frame_tests)
+    else()
+        set(_phase_title_target z_simulation_phase_owner_title_frame_tests)
+    endif()
+    add_executable(${_phase_title_target} SimulationPhaseGraphOwnerTitleFrameTest.cpp)
+    target_link_libraries(${_phase_title_target} PRIVATE simulation_phase_graph_owner_adapter_core)
+    target_include_directories(${_phase_title_target} PRIVATE "${_phase_title_generated}")
+    target_compile_definitions(${_phase_title_target} PRIVATE "RTS_PHASE_GRAPH_TITLE_NAME=\"${_phase_title}\"")
+    set_target_properties(${_phase_title_target} PROPERTIES
+        CXX_STANDARD 98 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    add_test(NAME ${_phase_title_target} COMMAND ${_phase_title_target})
+    set_tests_properties(${_phase_title_target} PROPERTIES TIMEOUT 30)
+endforeach()

@@ -4659,9 +4659,7 @@ bool GameLogic::validateStage5PhaseGraphCommit( unsigned phaseId,
 		phaseId == logic->m_stage5PhaseCursor + 1;
 	if (valid)
 	{
-		valid = phaseId == rts::LIVE_SIMULATION_PHASE_OWNER_INTAKE ?
-			logic->getFrame() == frame :
-			logic->m_stage5PhaseNow == frame && logic->getFrame() == frame;
+		valid = logic->getFrame() == frame;
 	}
 	if (!valid && owner)
 		logic->m_stage5PhaseGraph.annotateOwnerFailure(logic->getFrame(),
@@ -4683,9 +4681,11 @@ bool GameLogic::commitStage5PhaseGraphPhase( unsigned phaseId,
 		case rts::LIVE_SIMULATION_PHASE_OWNER_INTAKE:
 			logic->m_stage5PhaseNow = frame;
 			continueFrame = logic->runOwnerIntakePhase(logic->m_stage5PhaseNow);
+			// Commands can reset the world after legacy scheduling time was
+			// captured. Only authority adopts the post-intake world identity.
 			if (continueFrame &&
 				!logic->m_stage5PhaseGraph.retargetPendingFrameAfterIntake(
-					logic->m_stage5PhaseNow))
+					logic->getFrame()))
 			{
 				RELEASE_CRASH(("Stage5 phase graph could not publish the post-intake frame identity."));
 				return false;
