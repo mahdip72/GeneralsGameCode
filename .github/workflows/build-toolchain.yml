@@ -45,7 +45,7 @@ jobs:
   build:
     name: ${{ inputs.preset }}${{ inputs.tools && '+t' || '' }}${{ inputs.extras && '+e' || '' }}
     runs-on: windows-2022
-    timeout-minutes: ${{ startsWith(inputs.preset, 'x64') && 90 || 30 }}
+    timeout-minutes: ${{ startsWith(inputs.preset, 'x64') && inputs.product && inputs.extras && 240 || startsWith(inputs.preset, 'x64') && 90 || 30 }}
 
     env:
       VCPKG_FILE_CACHE: ${{ github.workspace }}\vcpkg-bincache

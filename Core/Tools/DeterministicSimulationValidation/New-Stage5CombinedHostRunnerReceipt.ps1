@@ -708,6 +708,60 @@ function Get-CombinedChildStream {
     return $stream
 }
 
+function Get-CombinedSourceEnvelopePreflight {
+    param(
+        [Parameter(Mandatory = $true)][object]$Snapshot,
+        [Parameter(Mandatory = $true)][string]$ExpectedTitle,
+        [Parameter(Mandatory = $true)][string]$ExpectedSourceCommit,
+        [Parameter(Mandatory = $true)][string]$ExpectedArtifactSetSha256,
+        [Parameter(Mandatory = $true)][string]$ExpectedExecutableSha256,
+        [Parameter(Mandatory = $true)][string]$ExpectedCohortNonce,
+        [Parameter(Mandatory = $true)][string]$Context
+    )
+    $context = "$Context source receipt preflight"
+    $document = ConvertFrom-CombinedJsonSnapshot $Snapshot $context
+    Assert-Stage5JsonShape $document @(
+        'schemaVersion', 'evidenceKind', 'status', 'role', 'trustDomain',
+        'producer', 'producerVersion', 'sourceCommit', 'title', 'architecture',
+        'artifactSetSha256', 'recordedUtc', 'cohortNonce', 'runtimeClosure', 'runNonce',
+        'executableSha256', 'rawLogs', 'provenance', 'details') $context
+
+    $producer = [string](Get-Stage5JsonValue $document 'producer' $context)
+    Assert-CombinedCondition ($producer -ceq 'installed-runtime-validation-results-v2') `
+        "$Context source receipt is not the allowlisted host-runner v2 producer."
+    Assert-CombinedCondition (
+        [string](Get-Stage5JsonValue $document 'title' $context) -ceq $ExpectedTitle) `
+        "$Context title scope is substituted; expected '$ExpectedTitle'."
+    Assert-CombinedCondition (
+        [string](Get-Stage5JsonValue $document 'sourceCommit' $context) -ceq
+            $ExpectedSourceCommit) `
+        "$Context source receipt is stale or does not match the final acceptance commit."
+    $artifactSetSha256 = [string](Get-Stage5JsonValue $document `
+        'artifactSetSha256' $context)
+    Assert-CombinedCondition ($artifactSetSha256 -cmatch '^[0-9A-Fa-f]{64}$' -and
+        $artifactSetSha256.ToUpperInvariant() -ceq
+            $ExpectedArtifactSetSha256.ToUpperInvariant()) `
+        "$Context artifact-set SHA-256 binding differs from the final acceptance artifact."
+    $executableSha256 = [string](Get-Stage5JsonValue $document `
+        'executableSha256' $context)
+    Assert-CombinedCondition ($executableSha256 -cmatch '^[0-9A-Fa-f]{64}$' -and
+        $executableSha256.ToUpperInvariant() -ceq
+            $ExpectedExecutableSha256.ToUpperInvariant()) `
+        "$Context executable SHA-256 binding differs from the expected artifact."
+    Assert-CombinedCondition (
+        [string](Get-Stage5JsonValue $document 'cohortNonce' $context) -ceq
+            $ExpectedCohortNonce) `
+        "$Context source receipt cohort is stale or detached from the execution cohort."
+    $runNonce = [string](Get-Stage5JsonValue $document 'runNonce' $context)
+    Assert-CombinedCondition ($runNonce -match
+        '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-5][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$') `
+        "$Context source receipt nonce is not canonical."
+    return [pscustomobject]@{
+        document = $document
+        runNonce = $runNonce
+    }
+}
+
 $sourceCommit = $ExpectedSourceCommit.ToLowerInvariant()
 Assert-CombinedCondition ($sourceCommit -cmatch '^[0-9a-f]{40}$') `
     'ExpectedSourceCommit must be a lowercase 40-hex commit.'
@@ -761,6 +815,23 @@ $generalsSnapshot = Get-CombinedFileSnapshot $generalsFull 'Generals source rece
 $zeroHourSnapshot = Get-CombinedFileSnapshot $zeroHourFull 'Zero Hour source receipt'
 $generalsHash = [string]$generalsSnapshot.sha256
 $zeroHourHash = [string]$zeroHourSnapshot.sha256
+$generalsPreflight = Get-CombinedSourceEnvelopePreflight `
+    -Snapshot $generalsSnapshot -ExpectedTitle 'Generals' `
+    -ExpectedSourceCommit $sourceCommit `
+    -ExpectedArtifactSetSha256 $ExpectedArtifactSetSha256 `
+    -ExpectedExecutableSha256 $ExpectedGeneralsExecutableSha256 `
+    -ExpectedCohortNonce $ExpectedCohortNonce `
+    -Context 'Generals'
+$zeroHourPreflight = Get-CombinedSourceEnvelopePreflight `
+    -Snapshot $zeroHourSnapshot -ExpectedTitle 'ZeroHour' `
+    -ExpectedSourceCommit $sourceCommit `
+    -ExpectedArtifactSetSha256 $ExpectedArtifactSetSha256 `
+    -ExpectedExecutableSha256 $ExpectedZeroHourExecutableSha256 `
+    -ExpectedCohortNonce $ExpectedCohortNonce `
+    -Context 'Zero Hour'
+Assert-CombinedCondition ([string]$generalsPreflight.runNonce -cne
+        [string]$zeroHourPreflight.runNonce) `
+    'Generals and Zero Hour source receipts must have distinct run nonces.'
 $generalsSourceBase = Split-Path -Parent $generalsFull
 $zeroHourSourceBase = Split-Path -Parent $zeroHourFull
 Write-CombinedPhaseTiming 'generals-native-closure' 'start'

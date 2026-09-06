@@ -145,8 +145,8 @@ function Test-NativeX64CIWorkflow {
         "inputs\.game == 'Generals' && inputs\.preset == 'x64-generals-vcpkg-product'" `
         'no active native x64 job can save the vcpkg binary cache'
     Assert-Contains $BuildWorkflow `
-        "timeout-minutes: \$\{\{ startsWith\(inputs\.preset, 'x64'\) && 90 \|\| 30 \}\}" `
-        'native dependency builds retain the legacy 30-minute timeout'
+        "timeout-minutes: \$\{\{ startsWith\(inputs\.preset, 'x64'\) && inputs\.product && inputs\.extras && 240 \|\| startsWith\(inputs\.preset, 'x64'\) && 90 \|\| 30 \}\}" `
+        'native x64 product extras builds receive the bounded extended timeout'
     Assert-Contains $BuildWorkflow `
         '\$buildProduct = ''\$\{\{ inputs\.product \}\}'' -eq ''true''' `
         'the reusable workflow does not resolve its product-build predicate'
@@ -429,7 +429,7 @@ jobs:
     $goodBuild = @'
 if: startsWith(inputs.preset, 'win32') || startsWith(inputs.preset, 'x64')
 arch: ${{ startsWith(inputs.preset, 'x64') && 'x64' || 'x86' }}
-timeout-minutes: ${{ startsWith(inputs.preset, 'x64') && 90 || 30 }}
+timeout-minutes: ${{ startsWith(inputs.preset, 'x64') && inputs.product && inputs.extras && 240 || startsWith(inputs.preset, 'x64') && 90 || 30 }}
 key: cmake-deps-${{ hashFiles('cmake/patches/*.patch') }}
 if: inputs.game == 'Generals' && inputs.preset == 'x64-generals-vcpkg-product'
 $buildProduct = '${{ inputs.product }}' -eq 'true'

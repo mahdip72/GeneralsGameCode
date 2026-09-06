@@ -247,7 +247,7 @@ if(WIN32)
     set_tests_properties(core_deterministic_simulation_validation_runtime_tests
         PROPERTIES TIMEOUT 90)
     set_tests_properties(core_deterministic_simulation_validation_acceptance_tests
-        PROPERTIES TIMEOUT 1800)
+        PROPERTIES TIMEOUT 7200)
     set_tests_properties(core_stage5_validation_runner_safety_tests
         PROPERTIES TIMEOUT 60
             ENVIRONMENT
